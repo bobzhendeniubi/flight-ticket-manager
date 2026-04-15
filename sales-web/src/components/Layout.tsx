@@ -15,13 +15,8 @@ const frontNav = [
   { to: '/visas', label: '签证' },
 ];
 
-const adminNav = [
-  { to: '/admin/dashboard', label: '仪表盘' },
-  { to: '/admin/orders', label: '订单' },
-  { to: '/admin/flights', label: '航班' },
-  { to: '/admin/pricing', label: '定价' },
-  { to: '/team', label: '代理' },
-];
+// 管理后台已拆分到 admin-web (:5174)。前台不再展示后台入口。
+// /admin/* 路由仍保留可访问（向后兼容旧链接），但不在 nav 中显示。
 
 export function Layout() {
   const user = useAuth((s) => s.user);
@@ -103,28 +98,19 @@ export function Layout() {
           </nav>
         </div>
 
-        {/* 管理员专用二级导航条 */}
+        {/* 管理员登录在前台时，显示提示去后台 */}
         {isAdmin && (
-          <div className="border-t border-slate-200 bg-slate-50">
-            <div className="mx-auto max-w-7xl px-4 py-2">
-              <nav className="flex flex-wrap items-center gap-1 text-xs">
-                <span className="text-slate-400 mr-2">后台：</span>
-                {adminNav.map((n) => (
-                  <NavLink
-                    key={n.to}
-                    to={n.to}
-                    className={({ isActive }) =>
-                      `px-3 py-1 rounded ${
-                        isActive
-                          ? 'bg-brand text-white'
-                          : 'text-slate-600 hover:bg-white hover:text-brand'
-                      }`
-                    }
-                  >
-                    {n.label}
-                  </NavLink>
-                ))}
-              </nav>
+          <div className="border-t border-slate-200 bg-amber-50">
+            <div className="mx-auto max-w-7xl px-4 py-2 text-xs text-amber-800 flex items-center justify-between">
+              <span>
+                ⓘ 您是管理员/运营，前台仅供浏览。后台操作请到{' '}
+                <a href="http://localhost:5174" className="font-semibold underline" target="_blank" rel="noreferrer">
+                  http://localhost:5174
+                </a>
+              </span>
+              <a href="http://localhost:5174" target="_blank" rel="noreferrer" className="rounded bg-amber-600 px-2 py-1 text-white hover:bg-amber-700">
+                进入后台 →
+              </a>
             </div>
           </div>
         )}

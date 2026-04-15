@@ -12,11 +12,14 @@
   "scripts": {
     "dev:backend": "npm run dev --workspace=backend",
     "dev:web": "npm run dev --workspace=sales-web",
+    "dev:admin": "npm run dev --workspace=admin-web",
     "db:up": "docker compose up -d postgres redis",
     "db:down": "docker compose down",
     "db:logs": "docker compose logs -f postgres redis",
     "prisma:migrate": "npm run prisma:migrate --workspace=backend",
-    "prisma:generate": "npm run prisma:generate --workspace=backend"
+    "prisma:generate": "npm run prisma:generate --workspace=backend",
+    "prisma:seed": "npm run prisma:seed --workspace=backend",
+    "typecheck": "npm run typecheck --workspaces --if-present"
   },
   "engines": {
     "node": ">=20.0.0"

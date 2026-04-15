@@ -1,25 +1,18 @@
 /**
- * SHARED with admin-web/src/lib/airports.ts — keep them in sync.
- *
- * 公司主营：港澳客户 → 岘港。仅显示这条业务航线相关的机场。
- * 不要加中国大陆机场（PEK/PVG/CAN/SZX 等），避免 demo 时误导业务范围。
+ * SHARED with sales-web/src/lib/airports.ts — keep them in sync.
  */
 export interface AirportInfo {
   code: string;
-  name: string; // 中文名
-  tz: string; // IANA 时区
+  name: string;
+  tz: string;
   country: '越南' | '中国香港' | '中国澳门';
-  /** 是否是当前在售航线的机场（true = 现在就在卖，false = 规划中） */
   active: boolean;
 }
 
 export const AIRPORTS: Record<string, AirportInfo> = {
-  // 主力航线 — QH9588/9589
   DAD: { code: 'DAD', name: '岘港', tz: 'Asia/Ho_Chi_Minh', country: '越南', active: true },
   MFM: { code: 'MFM', name: '澳门', tz: 'Asia/Macau', country: '中国澳门', active: true },
-  // 港澳出发地扩展
   HKG: { code: 'HKG', name: '香港', tz: 'Asia/Hong_Kong', country: '中国香港', active: false },
-  // 越南目的地扩展
   HAN: { code: 'HAN', name: '河内', tz: 'Asia/Ho_Chi_Minh', country: '越南', active: false },
   SGN: { code: 'SGN', name: '胡志明', tz: 'Asia/Ho_Chi_Minh', country: '越南', active: false },
   CXR: { code: 'CXR', name: '芽庄', tz: 'Asia/Ho_Chi_Minh', country: '越南', active: false },
@@ -38,7 +31,6 @@ export function airportLabel(code: string): string {
   return a ? `${a.name} (${code})` : code;
 }
 
-/** 舱等中文名 */
 export const CABIN_LABEL: Record<string, string> = {
   ECONOMY: '经济舱',
   PREMIUM_ECONOMY: '超级经济舱',
@@ -46,7 +38,6 @@ export const CABIN_LABEL: Record<string, string> = {
   FIRST: '头等舱',
 };
 
-/** 格式化时间（按机场本地时区） */
 export function formatLocalTime(iso: string, tz: string): string {
   try {
     return new Intl.DateTimeFormat('zh-CN', {
