@@ -32,7 +32,7 @@ export const useAuth = create<AuthState>()(
         } catch (err) {
           set({
             isLoading: false,
-            error: err instanceof ApiError ? err.message : 'Registration failed',
+            error: err instanceof ApiError ? err.message : '注册失败，请重试',
           });
           throw err;
         }
@@ -46,7 +46,7 @@ export const useAuth = create<AuthState>()(
         } catch (err) {
           set({
             isLoading: false,
-            error: err instanceof ApiError ? err.message : 'Login failed',
+            error: err instanceof ApiError ? err.message : '登录失败，请重试',
           });
           throw err;
         }

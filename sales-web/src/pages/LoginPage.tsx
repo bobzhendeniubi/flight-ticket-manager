@@ -25,19 +25,19 @@ export function LoginPage() {
       await login(email, password);
       navigate('/me', { replace: true });
     } catch {
-      // error surfaced via store
+      // 错误通过 store 显示
     }
   };
 
   return (
     <div className="mx-auto max-w-sm">
       <div className="card">
-        <h1 className="text-xl font-semibold text-slate-900">Sign in</h1>
-        <p className="mt-1 text-sm text-slate-600">Welcome back. Enter your credentials to continue.</p>
+        <h1 className="text-xl font-semibold text-slate-900">账号登录</h1>
+        <p className="mt-1 text-sm text-slate-600">欢迎回来，请输入登录信息。</p>
 
         <form className="mt-5 space-y-4" onSubmit={onSubmit}>
           <div>
-            <label className="label" htmlFor="email">Email</label>
+            <label className="label" htmlFor="email">邮箱</label>
             <input
               id="email"
               type="email"
@@ -49,7 +49,7 @@ export function LoginPage() {
             />
           </div>
           <div>
-            <label className="label" htmlFor="password">Password</label>
+            <label className="label" htmlFor="password">密码</label>
             <input
               id="password"
               type="password"
@@ -67,21 +67,28 @@ export function LoginPage() {
             </p>
           )}
           <button type="submit" className="btn-primary w-full" disabled={isLoading}>
-            {isLoading ? 'Signing in…' : 'Sign in'}
+            {isLoading ? '登录中…' : '登录'}
           </button>
         </form>
 
         <p className="mt-4 text-center text-sm text-slate-600">
-          No account?{' '}
+          还没有账号？{' '}
           <Link to="/register" className="font-medium text-brand hover:text-brand-dark">
-            Create one
+            注册一个
           </Link>
         </p>
       </div>
 
-      <p className="mt-4 text-center text-xs text-slate-400">
-        Dev seed: <code>admin@ftm.local</code> / <code>Password123!</code>
-      </p>
+      <div className="mt-4 rounded-md bg-slate-50 p-3 text-xs text-slate-600">
+        <p className="font-medium text-slate-700">开发环境演示账号（密码均为 <code>Password123!</code>）</p>
+        <ul className="mt-1 space-y-0.5">
+          <li>管理员：<code>admin@ftm.local</code></li>
+          <li>1级代理：<code>agent1@ftm.local</code></li>
+          <li>2级代理：<code>agent2@ftm.local</code></li>
+          <li>3级代理：<code>agent3@ftm.local</code></li>
+          <li>客户：<code>customer@ftm.local</code></li>
+        </ul>
+      </div>
     </div>
   );
 }

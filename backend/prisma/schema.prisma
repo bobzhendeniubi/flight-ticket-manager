@@ -105,16 +105,23 @@ model Agent {
   prepaymentBalance  Decimal  @default(0) @db.Decimal(14, 2) // CNY, can be negative only by admin override
   isActive           Boolean  @default(true)
   notes              String?
+  // 代理层级 — 1 级代理 parentAgentId = null；上级创建下级时 tier = parent.tier + 1
+  parentAgentId      String?
+  tier               Int      @default(1)
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
 
   user                   User                    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  parentAgent            Agent?                  @relation("AgentHierarchy", fields: [parentAgentId], references: [id])
+  childAgents            Agent[]                 @relation("AgentHierarchy")
   prepaymentTransactions PrepaymentTransaction[]
   commissionRules        CommissionRule[]
   commissionRecords      CommissionRecord[]
   orders                 Order[]
 
   @@index([isActive])
+  @@index([parentAgentId])
+  @@index([tier])
 }
 
 enum PrepaymentTxType {

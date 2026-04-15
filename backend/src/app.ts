@@ -10,6 +10,8 @@ import { authPlugin } from './plugins/auth.js';
 import { healthRoutes } from './modules/health/health.routes.js';
 import { authRoutes } from './modules/auth/auth.routes.js';
 import { userRoutes } from './modules/users/users.routes.js';
+import { flightRoutes } from './modules/flights/flights.routes.js';
+import { agentRoutes } from './modules/agents/agents.routes.js';
 import { redis } from './db/redis.js';
 
 export async function buildApp(): Promise<FastifyInstance> {
@@ -49,6 +51,8 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(healthRoutes);
   await app.register(authRoutes, { prefix: '/auth' });
   await app.register(userRoutes, { prefix: '/users' });
+  await app.register(flightRoutes, { prefix: '/flights' });
+  await app.register(agentRoutes, { prefix: '/agents' });
 
   // Root
   app.get('/', async () => ({

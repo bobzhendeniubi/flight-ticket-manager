@@ -1,6 +1,6 @@
 /**
- * Thin fetch wrapper around the backend REST API.
- * All endpoints are under /api which vite-dev proxies to http://localhost:4000.
+ * 后端 REST API 的轻量 fetch 封装。
+ * 所有端点都在 /api 下，由 vite-dev 代理到 http://localhost:4000。
  */
 export interface ApiErrorBody {
   error: { code: string; message: string; details?: unknown };
@@ -50,12 +50,15 @@ export async function apiFetch<T>(path: string, init: ApiRequestInit = {}): Prom
   return parsed as T;
 }
 
-// ── Typed endpoints ──
+// ── 类型 ──────────────────────────────────────────────────────────────────
+
+export type UserRole = 'CUSTOMER' | 'AGENT' | 'STAFF' | 'ADMIN';
+export type CabinClass = 'ECONOMY' | 'PREMIUM_ECONOMY' | 'BUSINESS' | 'FIRST';
 
 export interface AuthUser {
   id: string;
   email: string | null;
-  role: 'CUSTOMER' | 'AGENT' | 'STAFF' | 'ADMIN';
+  role: UserRole;
   displayName: string | null;
 }
 
@@ -71,7 +74,81 @@ export interface AuthResult {
   tokens: AuthTokens;
 }
 
+export interface FlightSeatAvailability {
+  cabin: CabinClass;
+  capacity: number;
+  sold: number;
+  available: number;
+  basePrice: string;
+}
+
+export interface FlightSearchResult {
+  scheduleId: string;
+  flightId: string;
+  flightNumber: string;
+  originCode: string;
+  destinationCode: string;
+  aircraftType: string | null;
+  departureTime: string;
+  arrivalTime: string;
+  departureTz: string;
+  arrivalTz: string;
+  durationMinutes: number;
+  seatClasses: FlightSeatAvailability[];
+  hasSpace: boolean;
+}
+
+export interface AdminFlight {
+  id: string;
+  flightNumber: string;
+  originCode: string;
+  destinationCode: string;
+  aircraftType: string | null;
+  isActive: boolean;
+  scheduleCount: number;
+  createdAt: string;
+}
+
+export interface AgentListItem {
+  id: string;
+  userId: string;
+  tier: number;
+  parentAgentId: string | null;
+  parent: {
+    id: string;
+    companyName: string | null;
+    contactName: string;
+    tier: number;
+  } | null;
+  companyName: string | null;
+  contactName: string;
+  contactPhone: string;
+  prepaymentBalance: string;
+  isActive: boolean;
+  notes: string | null;
+  email: string | null;
+  displayName: string | null;
+  lastLoginAt: string | null;
+  createdAt: string;
+  childCount: number;
+  orderCount: number;
+}
+
+export interface CreateChildAgentInput {
+  email: string;
+  password: string;
+  displayName: string;
+  contactName: string;
+  contactPhone: string;
+  companyName?: string;
+  prepaymentBalance?: number;
+  notes?: string;
+}
+
+// ── Typed endpoints ───────────────────────────────────────────────────────
+
 export const api = {
+  // 认证
   register: (email: string, password: string, displayName?: string) =>
     apiFetch<AuthResult>('/auth/register', {
       method: 'POST',
@@ -93,8 +170,60 @@ export const api = {
       body: { refreshToken },
     }),
   me: (token: string) =>
-    apiFetch<{ user: AuthUser & { phone: string | null; emailVerified: boolean; phoneVerified: boolean; createdAt: string; lastLoginAt: string | null } }>(
-      '/users/me',
-      { token },
+    apiFetch<{
+      user: AuthUser & {
+        phone: string | null;
+        emailVerified: boolean;
+        phoneVerified: boolean;
+        createdAt: string;
+        lastLoginAt: string | null;
+      };
+    }>('/users/me', { token }),
+
+  // 航班搜索（公开）
+  searchFlights: (params: {
+    origin?: string;
+    destination?: string;
+    date?: string;
+    cabin?: CabinClass;
+    passengers?: number;
+  }) => {
+    const qs = new URLSearchParams();
+    for (const [k, v] of Object.entries(params)) {
+      if (v !== undefined && v !== '') qs.set(k, String(v));
+    }
+    return apiFetch<{ results: FlightSearchResult[] }>(`/flights/search?${qs.toString()}`);
+  },
+
+  // 管理员航班
+  listAllFlights: (token: string) =>
+    apiFetch<{ flights: AdminFlight[] }>('/flights/', { token }),
+  createFlight: (
+    token: string,
+    body: { flightNumber: string; originCode: string; destinationCode: string; aircraftType?: string },
+  ) => apiFetch<{ flight: AdminFlight }>('/flights/', { method: 'POST', token, body }),
+  toggleFlight: (token: string, flightId: string) =>
+    apiFetch<{ flight: AdminFlight }>(`/flights/${flightId}/toggle`, { method: 'POST', token }),
+  listSchedules: (token: string, flightId: string) =>
+    apiFetch<{ schedules: unknown[] }>(`/flights/${flightId}/schedules`, { token }),
+  createSchedule: (
+    token: string,
+    body: {
+      flightId: string;
+      departureTime: string;
+      arrivalTime: string;
+      departureTz?: string;
+      arrivalTz?: string;
+      seatClasses: Array<{ cabin: CabinClass; capacity: number; basePrice: number }>;
+    },
+  ) => apiFetch<{ schedule: unknown }>('/flights/schedules', { method: 'POST', token, body }),
+
+  // 代理
+  listAgents: (token: string) =>
+    apiFetch<{ agents: AgentListItem[] }>('/agents/', { token }),
+  createChildAgent: (token: string, body: CreateChildAgentInput, parentId?: string) =>
+    apiFetch<{ user: { id: string; email: string | null }; agent: { id: string; tier: number } }>(
+      parentId ? `/agents/children?parentId=${encodeURIComponent(parentId)}` : '/agents/children',
+      { method: 'POST', token, body },
     ),
 };
