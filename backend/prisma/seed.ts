@@ -1,6 +1,6 @@
 /**
- * 开发环境 seed：创建管理员、多层代理、客户，以及若干示例航班。
- * 幂等 — 可重复运行。
+ * 开发环境 seed：管理员、多层代理、客户，以及 QH9588/QH9589 两条自营航班的未来 14 天班次。
+ * 幂等 — 可重复运行（会清理掉不在列表里的历史航班，保持 DB 和代码一致）。
  *
  * Run: npm run prisma:seed  (from backend/)
  */
@@ -9,27 +9,40 @@ import argon2 from 'argon2';
 
 const prisma = new PrismaClient();
 
-// 8 条示例航班：京沪、京广、沪广、沪厦、京深、广深 等自营航线
-const FLIGHT_SEED: Array<{
-  flightNumber: string;
-  origin: string;
-  dest: string;
-  departHour: number; // 本地时间
-  durationHrs: number;
-  aircraft: string;
-  econPrice: number;
-  bizPrice: number;
-  offsetDays: number; // 离今天第几天
-}> = [
-  { flightNumber: 'FT1001', origin: 'PEK', dest: 'PVG', departHour: 9,  durationHrs: 2,   aircraft: 'A320', econPrice: 850,  bizPrice: 3200, offsetDays: 3 },
-  { flightNumber: 'FT1002', origin: 'PVG', dest: 'PEK', departHour: 18, durationHrs: 2,   aircraft: 'A320', econPrice: 880,  bizPrice: 3300, offsetDays: 5 },
-  { flightNumber: 'FT1003', origin: 'PEK', dest: 'CAN', departHour: 8,  durationHrs: 3.5, aircraft: 'B737', econPrice: 1100, bizPrice: 4200, offsetDays: 4 },
-  { flightNumber: 'FT1004', origin: 'CAN', dest: 'PEK', departHour: 20, durationHrs: 3.5, aircraft: 'B737', econPrice: 1150, bizPrice: 4300, offsetDays: 7 },
-  { flightNumber: 'FT1005', origin: 'PVG', dest: 'CAN', departHour: 14, durationHrs: 2.5, aircraft: 'A320', econPrice: 780,  bizPrice: 2900, offsetDays: 4 },
-  { flightNumber: 'FT1006', origin: 'PVG', dest: 'XMN', departHour: 11, durationHrs: 1.5, aircraft: 'A319', econPrice: 620,  bizPrice: 2200, offsetDays: 6 },
-  { flightNumber: 'FT1007', origin: 'PEK', dest: 'SZX', departHour: 7,  durationHrs: 3,   aircraft: 'A321', econPrice: 1050, bizPrice: 3900, offsetDays: 5 },
-  { flightNumber: 'FT1008', origin: 'CAN', dest: 'SZX', departHour: 16, durationHrs: 1,   aircraft: 'A319', econPrice: 480,  bizPrice: 1600, offsetDays: 3 },
-];
+// ── 我们目前自营的两条航班 ─────────────────────────────────────────────
+// QH9588  北京首都 → 上海浦东  09:00 起飞
+// QH9589  上海浦东 → 北京首都  18:30 起飞
+const FLIGHT_SEED = [
+  {
+    flightNumber: 'QH9588',
+    origin: 'PEK',
+    dest: 'PVG',
+    departHour: 9,
+    departMinute: 0,
+    durationMinutes: 120,
+    aircraft: 'Airbus A320',
+    econCapacity: 150,
+    econPrice: 1180,
+    bizCapacity: 20,
+    bizPrice: 3980,
+  },
+  {
+    flightNumber: 'QH9589',
+    origin: 'PVG',
+    dest: 'PEK',
+    departHour: 18,
+    departMinute: 30,
+    durationMinutes: 120,
+    aircraft: 'Airbus A320',
+    econCapacity: 150,
+    econPrice: 1280,
+    bizCapacity: 20,
+    bizPrice: 3980,
+  },
+] as const;
+
+// 未来多少天每天各一班
+const DAYS_OUT = 14;
 
 async function main() {
   const password = 'Password123!';
@@ -126,7 +139,7 @@ async function main() {
     },
   });
 
-  const agent3 = await prisma.agent.upsert({
+  await prisma.agent.upsert({
     where: { userId: agent3User.id },
     update: {},
     create: {
@@ -140,15 +153,38 @@ async function main() {
     },
   });
 
+  // ── 清理不在列表里的历史航班（只在没有订单关联时） ──
+  const keepFlightNumbers = FLIGHT_SEED.map((f) => f.flightNumber);
+  const toRemove = await prisma.flight.findMany({
+    where: { flightNumber: { notIn: keepFlightNumbers } },
+    include: {
+      schedules: { include: { orderItems: { take: 1 } } },
+    },
+  });
+  let removedFlights = 0;
+  for (const f of toRemove) {
+    const hasOrders = f.schedules.some((s) => s.orderItems.length > 0);
+    if (hasOrders) continue; // 保留有订单的
+    // cascade: delete schedules (which cascade-deletes seat classes)
+    await prisma.flightSchedule.deleteMany({ where: { flightId: f.id } });
+    await prisma.flight.delete({ where: { id: f.id } });
+    removedFlights++;
+  }
+
   // ── 航班 ──
   const today = new Date();
   today.setUTCHours(0, 0, 0, 0);
-  let scheduleCount = 0;
+  let newSchedules = 0;
 
   for (const f of FLIGHT_SEED) {
     const flight = await prisma.flight.upsert({
       where: { flightNumber: f.flightNumber },
-      update: {},
+      update: {
+        originCode: f.origin,
+        destinationCode: f.dest,
+        aircraftType: f.aircraft,
+        isActive: true,
+      },
       create: {
         flightNumber: f.flightNumber,
         originCode: f.origin,
@@ -157,16 +193,18 @@ async function main() {
       },
     });
 
-    const dep = new Date(today);
-    dep.setUTCDate(dep.getUTCDate() + f.offsetDays);
-    // Asia/Shanghai 是 UTC+8，所以本地 hour -> UTC hour = hour - 8
-    dep.setUTCHours(f.departHour - 8, 0, 0, 0);
-    const arr = new Date(dep.getTime() + f.durationHrs * 60 * 60 * 1000);
+    for (let offset = 1; offset <= DAYS_OUT; offset++) {
+      const dep = new Date(today);
+      dep.setUTCDate(dep.getUTCDate() + offset);
+      // 本地 Asia/Shanghai (UTC+8) → UTC hour = local hour - 8
+      dep.setUTCHours(f.departHour - 8, f.departMinute, 0, 0);
+      const arr = new Date(dep.getTime() + f.durationMinutes * 60 * 1000);
 
-    const existing = await prisma.flightSchedule.findFirst({
-      where: { flightId: flight.id, departureTime: dep },
-    });
-    if (!existing) {
+      const existing = await prisma.flightSchedule.findFirst({
+        where: { flightId: flight.id, departureTime: dep },
+      });
+      if (existing) continue;
+
       await prisma.flightSchedule.create({
         data: {
           flightId: flight.id,
@@ -176,13 +214,13 @@ async function main() {
           arrivalTz: 'Asia/Shanghai',
           seatClasses: {
             create: [
-              { cabin: CabinClass.ECONOMY,  capacity: 150, basePrice: f.econPrice },
-              { cabin: CabinClass.BUSINESS, capacity: 20,  basePrice: f.bizPrice },
+              { cabin: CabinClass.ECONOMY, capacity: f.econCapacity, basePrice: f.econPrice },
+              { cabin: CabinClass.BUSINESS, capacity: f.bizCapacity, basePrice: f.bizPrice },
             ],
           },
         },
       });
-      scheduleCount++;
+      newSchedules++;
     }
   }
 
@@ -193,8 +231,9 @@ async function main() {
     '1级代理': agent1User.email,
     '2级代理(父=1级)': agent2User.email,
     '3级代理(父=2级)': agent3User.email,
-    航班数: FLIGHT_SEED.length,
-    新增班次: scheduleCount,
+    航班: FLIGHT_SEED.map((f) => `${f.flightNumber} (${f.origin}→${f.dest})`).join(', '),
+    新增班次: newSchedules,
+    清理旧航班: removedFlights,
     开发密码: password,
   });
 }

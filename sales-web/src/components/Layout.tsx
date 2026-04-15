@@ -8,6 +8,21 @@ const ROLE_LABEL: Record<string, string> = {
   ADMIN: '管理员',
 };
 
+const frontNav = [
+  { to: '/', label: '机票', exact: true },
+  { to: '/hotels', label: '酒店' },
+  { to: '/transfers', label: '机场接送' },
+  { to: '/visas', label: '签证' },
+];
+
+const adminNav = [
+  { to: '/admin/dashboard', label: '仪表盘' },
+  { to: '/admin/orders', label: '订单' },
+  { to: '/admin/flights', label: '航班' },
+  { to: '/admin/pricing', label: '定价' },
+  { to: '/team', label: '代理' },
+];
+
 export function Layout() {
   const user = useAuth((s) => s.user);
   const logout = useAuth((s) => s.logout);
@@ -18,41 +33,39 @@ export function Layout() {
 
   return (
     <div className="min-h-screen flex flex-col">
+      {/* 顶部：品牌 + 前台导航 + 用户菜单 */}
       <header className="border-b border-slate-200 bg-white">
-        <div className="mx-auto flex max-w-6xl items-center justify-between gap-4 px-4 py-3">
+        <div className="mx-auto flex max-w-7xl items-center justify-between gap-4 px-4 py-3">
           <Link to="/" className="flex items-center gap-2 text-lg font-semibold text-slate-900">
             <span aria-hidden className="text-brand">✈︎</span>
             <span>机票管家</span>
           </Link>
 
           <nav className="hidden md:flex items-center gap-1 text-sm">
-            <NavLink
-              to="/"
-              end
-              className={({ isActive }) =>
-                `px-3 py-1.5 rounded-md ${isActive ? 'bg-brand/10 text-brand' : 'text-slate-700 hover:text-brand'}`
-              }
-            >
-              搜索航班
-            </NavLink>
-            {(isAgent || isAdmin) && (
+            {frontNav.map((n) => (
+              <NavLink
+                key={n.to}
+                to={n.to}
+                end={n.exact}
+                className={({ isActive }) =>
+                  `px-3 py-1.5 rounded-md ${
+                    isActive ? 'bg-brand/10 text-brand' : 'text-slate-700 hover:text-brand'
+                  }`
+                }
+              >
+                {n.label}
+              </NavLink>
+            ))}
+            {isAgent && (
               <NavLink
                 to="/team"
                 className={({ isActive }) =>
-                  `px-3 py-1.5 rounded-md ${isActive ? 'bg-brand/10 text-brand' : 'text-slate-700 hover:text-brand'}`
+                  `px-3 py-1.5 rounded-md ${
+                    isActive ? 'bg-brand/10 text-brand' : 'text-slate-700 hover:text-brand'
+                  }`
                 }
               >
-                {isAdmin ? '代理管理' : '我的团队'}
-              </NavLink>
-            )}
-            {isAdmin && (
-              <NavLink
-                to="/admin/flights"
-                className={({ isActive }) =>
-                  `px-3 py-1.5 rounded-md ${isActive ? 'bg-brand/10 text-brand' : 'text-slate-700 hover:text-brand'}`
-                }
-              >
-                航班管理
+                我的团队
               </NavLink>
             )}
           </nav>
@@ -89,17 +102,43 @@ export function Layout() {
             )}
           </nav>
         </div>
+
+        {/* 管理员专用二级导航条 */}
+        {isAdmin && (
+          <div className="border-t border-slate-200 bg-slate-50">
+            <div className="mx-auto max-w-7xl px-4 py-2">
+              <nav className="flex flex-wrap items-center gap-1 text-xs">
+                <span className="text-slate-400 mr-2">后台：</span>
+                {adminNav.map((n) => (
+                  <NavLink
+                    key={n.to}
+                    to={n.to}
+                    className={({ isActive }) =>
+                      `px-3 py-1 rounded ${
+                        isActive
+                          ? 'bg-brand text-white'
+                          : 'text-slate-600 hover:bg-white hover:text-brand'
+                      }`
+                    }
+                  >
+                    {n.label}
+                  </NavLink>
+                ))}
+              </nav>
+            </div>
+          </div>
+        )}
       </header>
 
       <main className="flex-1">
-        <div className="mx-auto w-full max-w-6xl px-4 py-8">
+        <div className="mx-auto w-full max-w-7xl px-4 py-8">
           <Outlet />
         </div>
       </main>
 
       <footer className="border-t border-slate-200 bg-white text-xs text-slate-500">
-        <div className="mx-auto max-w-6xl px-4 py-4">
-          机票管家 · M2 迭代 · © {new Date().getFullYear()}
+        <div className="mx-auto max-w-7xl px-4 py-4">
+          机票管家 · M2-M5 演示版 · © {new Date().getFullYear()}
         </div>
       </footer>
     </div>

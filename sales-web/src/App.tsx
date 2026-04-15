@@ -5,7 +5,13 @@ import { LoginPage } from './pages/LoginPage';
 import { RegisterPage } from './pages/RegisterPage';
 import { ProfilePage } from './pages/ProfilePage';
 import { TeamPage } from './pages/TeamPage';
+import { HotelsPage } from './pages/HotelsPage';
+import { TransfersPage } from './pages/TransfersPage';
+import { VisasPage } from './pages/VisasPage';
 import { AdminFlightsPage } from './pages/AdminFlightsPage';
+import { AdminDashboardPage } from './pages/admin/DashboardPage';
+import { AdminOrdersPage } from './pages/admin/OrdersPage';
+import { AdminPricingPage } from './pages/admin/PricingPage';
 import { useAuth } from './stores/auth';
 import type { UserRole } from './lib/api';
 
@@ -26,7 +32,13 @@ export function App() {
   return (
     <Routes>
       <Route element={<Layout />}>
+        {/* 前台 — 所有人可见 */}
         <Route index element={<HomePage />} />
+        <Route path="hotels" element={<HotelsPage />} />
+        <Route path="transfers" element={<TransfersPage />} />
+        <Route path="visas" element={<VisasPage />} />
+
+        {/* 认证 */}
         <Route path="login" element={<LoginPage />} />
         <Route path="register" element={<RegisterPage />} />
         <Route
@@ -37,11 +49,31 @@ export function App() {
             </Protected>
           }
         />
+
+        {/* 代理 */}
         <Route
           path="team"
           element={
             <Protected roles={['AGENT', 'ADMIN', 'STAFF']}>
               <TeamPage />
+            </Protected>
+          }
+        />
+
+        {/* 后台 admin */}
+        <Route
+          path="admin/dashboard"
+          element={
+            <Protected roles={['ADMIN', 'STAFF']}>
+              <AdminDashboardPage />
+            </Protected>
+          }
+        />
+        <Route
+          path="admin/orders"
+          element={
+            <Protected roles={['ADMIN', 'STAFF']}>
+              <AdminOrdersPage />
             </Protected>
           }
         />
@@ -53,6 +85,15 @@ export function App() {
             </Protected>
           }
         />
+        <Route
+          path="admin/pricing"
+          element={
+            <Protected roles={['ADMIN', 'STAFF']}>
+              <AdminPricingPage />
+            </Protected>
+          }
+        />
+
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>
