@@ -196,12 +196,51 @@ function SchedulesList({
   schedules: AdminSchedule[] | null;
   originTz: string | null;
 }) {
+  const [monthFilter, setMonthFilter] = useState<string>('upcoming30');
+
   if (schedules === null) return <div className="mt-3 text-sm text-slate-500">加载班次中…</div>;
   if (schedules.length === 0) return <div className="mt-3 text-sm text-slate-500">还没有班次。</div>;
 
+  // 构造可筛选的月份列表 (YYYY-MM)
+  const months = Array.from(
+    new Set(schedules.map((s) => s.departureTime.slice(0, 7))),
+  ).sort();
+
+  const now = new Date();
+  const thirtyDaysLater = new Date(now.getTime() + 30 * 86400000);
+
+  const filtered = schedules.filter((s) => {
+    if (monthFilter === 'all') return true;
+    if (monthFilter === 'upcoming30') {
+      const d = new Date(s.departureTime);
+      return d >= now && d <= thirtyDaysLater;
+    }
+    return s.departureTime.startsWith(monthFilter);
+  });
+
   return (
-    <div className="mt-4 overflow-x-auto">
-      <table className="min-w-full divide-y divide-slate-200 text-sm">
+    <div className="mt-4 space-y-3">
+      <div className="flex flex-wrap items-center gap-3">
+        <span className="text-sm text-slate-600">共 {schedules.length} 个班次</span>
+        <span className="text-slate-300">·</span>
+        <label className="text-sm text-slate-600">筛选:</label>
+        <select
+          className="input max-w-[200px]"
+          value={monthFilter}
+          onChange={(e) => setMonthFilter(e.target.value)}
+        >
+          <option value="upcoming30">未来 30 天</option>
+          <option value="all">全部（共 {schedules.length} 条）</option>
+          {months.map((m) => (
+            <option key={m} value={m}>
+              {m} ({schedules.filter((s) => s.departureTime.startsWith(m)).length} 条)
+            </option>
+          ))}
+        </select>
+        <span className="text-xs text-slate-500">显示 {filtered.length} 条</span>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="min-w-full divide-y divide-slate-200 text-sm">
         <thead className="bg-slate-50 text-left text-xs font-medium uppercase text-slate-500">
           <tr>
             <th className="px-3 py-2">出发</th>
@@ -211,7 +250,7 @@ function SchedulesList({
           </tr>
         </thead>
         <tbody className="divide-y divide-slate-200">
-          {schedules.map((s) => (
+          {filtered.map((s) => (
             <tr key={s.id}>
               <td className="px-3 py-2">
                 <div className="font-medium text-slate-900">
@@ -245,6 +284,7 @@ function SchedulesList({
           ))}
         </tbody>
       </table>
+      </div>
     </div>
   );
 }

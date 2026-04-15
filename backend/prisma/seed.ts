@@ -47,7 +47,7 @@ const FLIGHT_SEED = [
   },
 ] as const;
 
-const DAYS_OUT = 14;
+const DAYS_OUT = 365;
 
 /** 把"出发地本地时间"转为 UTC Date。只支持整小时偏移（Asia/Ho_Chi_Minh=+7, Asia/Macau=+8）。 */
 function localToUtc(year: number, month: number, day: number, hour: number, minute: number, tz: string): Date {
@@ -215,6 +215,16 @@ async function main() {
       }
     }
 
+    // 批量预取已存在的出发时间，避免 365 次 findFirst 往返
+    const existingTimes = new Set(
+      (
+        await prisma.flightSchedule.findMany({
+          where: { flightId: flight.id },
+          select: { departureTime: true },
+        })
+      ).map((s) => s.departureTime.getTime()),
+    );
+
     for (let offset = 1; offset <= DAYS_OUT; offset++) {
       const base = new Date(today);
       base.setUTCDate(base.getUTCDate() + offset);
@@ -225,10 +235,7 @@ async function main() {
       const dep = localToUtc(y, m, d, f.departHourLocal, f.departMinuteLocal, f.departTz);
       const arr = new Date(dep.getTime() + f.durationMinutes * 60 * 1000);
 
-      const existing = await prisma.flightSchedule.findFirst({
-        where: { flightId: flight.id, departureTime: dep },
-      });
-      if (existing) continue;
+      if (existingTimes.has(dep.getTime())) continue;
 
       await prisma.flightSchedule.create({
         data: {
@@ -246,6 +253,10 @@ async function main() {
         },
       });
       newSchedules++;
+      if (newSchedules % 100 === 0) {
+        // eslint-disable-next-line no-console
+        console.log(`  …已创建 ${newSchedules} 个班次`);
+      }
     }
   }
 
