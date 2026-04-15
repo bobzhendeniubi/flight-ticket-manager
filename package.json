@@ -1,0 +1,24 @@
+{
+  "name": "flight-ticket-manager",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Flight Ticket Manager monorepo (sales-web, miniprogram, admin-web, backend, ml-pricing, infra)",
+  "workspaces": [
+    "backend",
+    "sales-web",
+    "admin-web",
+    "miniprogram"
+  ],
+  "scripts": {
+    "dev:backend": "npm run dev --workspace=backend",
+    "dev:web": "npm run dev --workspace=sales-web",
+    "db:up": "docker compose up -d postgres redis",
+    "db:down": "docker compose down",
+    "db:logs": "docker compose logs -f postgres redis",
+    "prisma:migrate": "npm run prisma:migrate --workspace=backend",
+    "prisma:generate": "npm run prisma:generate --workspace=backend"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

@@ -1,0 +1,627 @@
+// Flight Ticket Manager — Prisma schema
+// Covers M1 issue #1: PostgreSQL multi-schema design (Redis/OpenSearch handled at app layer).
+// All ids are cuid() strings; timestamps are UTC; monetary amounts are Decimal(12, 2) CNY.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Users & Auth
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum UserRole {
+  CUSTOMER
+  AGENT
+  STAFF
+  ADMIN
+}
+
+enum DocumentType {
+  ID_CARD // 居民身份证
+  PASSPORT
+}
+
+enum PassengerType {
+  ADULT
+  CHILD
+  INFANT
+}
+
+model User {
+  id             String    @id @default(cuid())
+  email          String?   @unique
+  phone          String?   @unique
+  passwordHash   String?   // null for WeChat-only users
+  role           UserRole  @default(CUSTOMER)
+  displayName    String?
+  emailVerified  Boolean   @default(false)
+  phoneVerified  Boolean   @default(false)
+  wechatOpenId   String?   @unique
+  wechatUnionId  String?   @unique
+  lastLoginAt    DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  refreshTokens    RefreshToken[]
+  savedPassengers  SavedPassenger[]
+  orders           Order[]
+  agentProfile     Agent?
+  orderEvents      OrderStatusEvent[]
+
+  @@index([role])
+  @@index([createdAt])
+}
+
+model RefreshToken {
+  id          String    @id @default(cuid())
+  userId      String
+  tokenHash   String    @unique // sha256 of the refresh token
+  expiresAt   DateTime
+  revokedAt   DateTime?
+  userAgent   String?
+  ipAddress   String?
+  createdAt   DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model SavedPassenger {
+  id             String        @id @default(cuid())
+  userId         String
+  fullName       String
+  documentType   DocumentType
+  documentNumber String
+  dateOfBirth    DateTime
+  nationality    String        // ISO 3166-1 alpha-2 (e.g., CN, US)
+  passengerType  PassengerType @default(ADULT)
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, documentType, documentNumber])
+  @@index([userId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Agents
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Agent {
+  id                 String   @id @default(cuid())
+  userId             String   @unique
+  companyName        String?
+  contactName        String
+  contactPhone       String
+  prepaymentBalance  Decimal  @default(0) @db.Decimal(14, 2) // CNY, can be negative only by admin override
+  isActive           Boolean  @default(true)
+  notes              String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  user                   User                    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  prepaymentTransactions PrepaymentTransaction[]
+  commissionRules        CommissionRule[]
+  commissionRecords      CommissionRecord[]
+  orders                 Order[]
+
+  @@index([isActive])
+}
+
+enum PrepaymentTxType {
+  TOP_UP
+  OFFSET // used on an order
+  ADJUSTMENT // admin manual adjustment
+  REFUND // returned from a cancelled order
+}
+
+model PrepaymentTransaction {
+  id          String           @id @default(cuid())
+  agentId     String
+  amount      Decimal          @db.Decimal(14, 2) // positive = credit, negative = debit
+  balanceAfter Decimal         @db.Decimal(14, 2)
+  type        PrepaymentTxType
+  orderId     String?          // set when tied to an order
+  description String?
+  createdById String           // user id of the admin/agent/system actor
+  createdAt   DateTime         @default(now())
+
+  agent Agent @relation(fields: [agentId], references: [id], onDelete: Cascade)
+
+  @@index([agentId, createdAt])
+  @@index([orderId])
+}
+
+enum ProductKind {
+  FLIGHT
+  HOTEL
+  TRANSFER
+  VISA
+}
+
+model CommissionRule {
+  id          String      @id @default(cuid())
+  agentId     String
+  productKind ProductKind
+  // commission rate as a decimal fraction, e.g. 0.0500 = 5.00%
+  rate        Decimal     @db.Decimal(6, 4)
+  effectiveFrom DateTime  @default(now())
+  effectiveTo   DateTime?
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  agent Agent @relation(fields: [agentId], references: [id], onDelete: Cascade)
+
+  @@unique([agentId, productKind, effectiveFrom])
+  @@index([agentId])
+}
+
+enum CommissionStatus {
+  ACCRUED
+  SETTLEMENT_REQUESTED
+  SETTLED
+  REVERSED
+}
+
+model CommissionRecord {
+  id          String           @id @default(cuid())
+  agentId     String
+  orderId     String
+  productKind ProductKind
+  baseAmount  Decimal          @db.Decimal(12, 2) // the order item amount commission is computed on
+  rate        Decimal          @db.Decimal(6, 4)
+  amount      Decimal          @db.Decimal(12, 2) // baseAmount * rate
+  status      CommissionStatus @default(ACCRUED)
+  settledAt   DateTime?
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  agent Agent @relation(fields: [agentId], references: [id])
+  order Order @relation(fields: [orderId], references: [id])
+
+  @@index([agentId, status])
+  @@index([orderId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Products — Flights
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum CabinClass {
+  ECONOMY
+  PREMIUM_ECONOMY
+  BUSINESS
+  FIRST
+}
+
+model Flight {
+  id              String    @id @default(cuid())
+  flightNumber    String    // e.g., "CA1234"
+  originCode      String    // IATA code, e.g., "PEK"
+  destinationCode String    // IATA code
+  originTerminal  String?
+  destTerminal    String?
+  aircraftType    String?
+  isActive        Boolean   @default(true)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  schedules FlightSchedule[]
+
+  @@unique([flightNumber])
+  @@index([originCode, destinationCode])
+}
+
+model FlightSchedule {
+  id              String    @id @default(cuid())
+  flightId        String
+  departureTime   DateTime  // UTC
+  arrivalTime     DateTime  // UTC
+  departureTz     String    // IANA tz, e.g., "Asia/Shanghai"
+  arrivalTz       String
+  isActive        Boolean   @default(true)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  flight       Flight             @relation(fields: [flightId], references: [id], onDelete: Cascade)
+  seatClasses  FlightSeatClass[]
+  orderItems   OrderItem[]
+  pricingConfig PricingConfig?
+
+  @@index([flightId, departureTime])
+  @@index([departureTime])
+}
+
+model FlightSeatClass {
+  id          String     @id @default(cuid())
+  scheduleId  String
+  cabin       CabinClass
+  capacity    Int        // base capacity
+  sold        Int        @default(0) // source of truth; Redis is cache
+  basePrice   Decimal    @db.Decimal(10, 2) // CNY
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  schedule FlightSchedule @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
+
+  @@unique([scheduleId, cabin])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Products — Hotels
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Hotel {
+  id          String    @id @default(cuid())
+  name        String
+  cityCode    String    // IATA or internal city code
+  address     String
+  starRating  Int       // 1..5
+  latitude    Decimal?  @db.Decimal(9, 6)
+  longitude   Decimal?  @db.Decimal(9, 6)
+  amenities   String[]  // e.g., ["wifi", "breakfast", "pool"]
+  photos      String[]  // S3 URLs
+  isActive    Boolean   @default(true)
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  roomTypes HotelRoomType[]
+
+  @@index([cityCode])
+}
+
+model HotelRoomType {
+  id          String   @id @default(cuid())
+  hotelId     String
+  name        String   // e.g., "Deluxe King"
+  capacity    Int      // max guests
+  basePrice   Decimal  @db.Decimal(10, 2)
+  photos      String[]
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  hotel       Hotel                 @relation(fields: [hotelId], references: [id], onDelete: Cascade)
+  inventory   HotelRoomInventory[]
+  orderItems  OrderItem[]
+
+  @@unique([hotelId, name])
+}
+
+model HotelRoomInventory {
+  id          String   @id @default(cuid())
+  roomTypeId  String
+  date        DateTime @db.Date
+  available   Int
+  price       Decimal  @db.Decimal(10, 2) // may override basePrice for this date
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  roomType HotelRoomType @relation(fields: [roomTypeId], references: [id], onDelete: Cascade)
+
+  @@unique([roomTypeId, date])
+  @@index([date])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Products — Transfers & Visas
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Transfer {
+  id            String   @id @default(cuid())
+  name          String
+  vehicleType   String   // e.g., "sedan", "suv", "van"
+  capacity      Int
+  originArea    String
+  destArea      String
+  basePrice     Decimal  @db.Decimal(10, 2)
+  isActive      Boolean  @default(true)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  orderItems OrderItem[]
+}
+
+model Visa {
+  id                 String   @id @default(cuid())
+  destinationCountry String   // ISO 3166-1 alpha-2
+  visaType           String   // e.g., "tourist", "business"
+  processingDays     Int
+  basePrice          Decimal  @db.Decimal(10, 2)
+  expressSurcharge   Decimal? @db.Decimal(10, 2)
+  requiredDocs       String[] // e.g., ["passport_scan", "photo", "itinerary"]
+  isActive           Boolean  @default(true)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  orderItems OrderItem[]
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Orders
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum OrderStatus {
+  DRAFT
+  PENDING_PAYMENT
+  PAID
+  PROCESSING
+  TICKETED
+  COMPLETED
+  PAYMENT_TIMEOUT
+  CANCELLED
+  REFUND_REQUESTED
+  REFUNDED
+  CHANGE_REQUESTED
+  CHANGED
+  FAILED
+}
+
+enum OrderItemKind {
+  FLIGHT
+  HOTEL
+  TRANSFER
+  VISA
+  INSURANCE
+  FEE // airport construction / fuel surcharge
+  DISCOUNT
+}
+
+model Order {
+  id              String      @id @default(cuid())
+  orderNumber     String      @unique // human-friendly, e.g., "FTM2026041400001"
+  userId          String
+  agentId         String?     // non-null when placed by an agent
+  status          OrderStatus @default(DRAFT)
+  currency        String      @default("CNY")
+  subtotal        Decimal     @db.Decimal(12, 2)
+  taxesAndFees    Decimal     @db.Decimal(12, 2) @default(0)
+  discountTotal   Decimal     @db.Decimal(12, 2) @default(0)
+  total           Decimal     @db.Decimal(12, 2)
+  paidAmount      Decimal     @db.Decimal(12, 2) @default(0)
+  prepaymentOffset Decimal    @db.Decimal(12, 2) @default(0)
+  contactName     String
+  contactPhone    String
+  contactEmail    String?
+  paymentExpiresAt DateTime?
+  idempotencyKey  String?     @unique
+  notes           String?
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  user              User               @relation(fields: [userId], references: [id])
+  agent             Agent?             @relation(fields: [agentId], references: [id])
+  items             OrderItem[]
+  passengers        Passenger[]
+  payments          Payment[]
+  refunds           Refund[]
+  statusEvents      OrderStatusEvent[]
+  commissionRecords CommissionRecord[]
+  notifications     NotificationLog[]
+
+  @@index([userId, createdAt])
+  @@index([agentId, createdAt])
+  @@index([status])
+  @@index([createdAt])
+}
+
+model OrderItem {
+  id          String         @id @default(cuid())
+  orderId     String
+  kind        OrderItemKind
+  description String
+  quantity    Int            @default(1)
+  unitPrice   Decimal        @db.Decimal(10, 2)
+  amount      Decimal        @db.Decimal(12, 2)
+  // Optional links — exactly one set depending on kind.
+  flightScheduleId String?
+  flightCabin      CabinClass?
+  hotelRoomTypeId  String?
+  hotelCheckIn     DateTime?   @db.Date
+  hotelCheckOut    DateTime?   @db.Date
+  transferId       String?
+  visaId           String?
+  metadata         Json?
+  createdAt        DateTime    @default(now())
+
+  order          Order            @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  flightSchedule FlightSchedule?  @relation(fields: [flightScheduleId], references: [id])
+  hotelRoomType  HotelRoomType?   @relation(fields: [hotelRoomTypeId], references: [id])
+  transfer       Transfer?        @relation(fields: [transferId], references: [id])
+  visa           Visa?            @relation(fields: [visaId], references: [id])
+
+  @@index([orderId])
+}
+
+model Passenger {
+  id             String        @id @default(cuid())
+  orderId        String
+  fullName       String
+  documentType   DocumentType
+  documentNumber String
+  dateOfBirth    DateTime
+  nationality    String
+  passengerType  PassengerType @default(ADULT)
+  mealPreference String?
+  needsWheelchair Boolean      @default(false)
+  needsInfantBassinet Boolean  @default(false)
+  pnr            String?       // booked PNR from airline
+  eticketNumber  String?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+}
+
+model OrderStatusEvent {
+  id          String      @id @default(cuid())
+  orderId     String
+  fromStatus  OrderStatus?
+  toStatus    OrderStatus
+  actorUserId String?
+  reason      String?
+  metadata    Json?
+  createdAt   DateTime    @default(now())
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  actor User? @relation(fields: [actorUserId], references: [id])
+
+  @@index([orderId, createdAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Payments
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum PaymentMethod {
+  WECHAT_PAY
+  ALIPAY
+  BANK_CARD
+  AGENT_PREPAYMENT
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+  REFUNDED
+}
+
+model Payment {
+  id             String        @id @default(cuid())
+  orderId        String
+  method         PaymentMethod
+  amount         Decimal       @db.Decimal(12, 2)
+  status         PaymentStatus @default(PENDING)
+  transactionId  String?       @unique // gateway transaction id
+  gatewayPayload Json?
+  paidAt         DateTime?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@index([status])
+}
+
+enum RefundStatus {
+  REQUESTED
+  APPROVED
+  PROCESSING
+  COMPLETED
+  REJECTED
+}
+
+model Refund {
+  id            String       @id @default(cuid())
+  orderId       String
+  amount        Decimal      @db.Decimal(12, 2)
+  reason        String?
+  status        RefundStatus @default(REQUESTED)
+  processedAt   DateTime?
+  gatewayPayload Json?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+  @@index([status])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pricing
+// ─────────────────────────────────────────────────────────────────────────────
+
+model PricingConfig {
+  id                  String   @id @default(cuid())
+  flightScheduleId    String   @unique
+  // JSON: [{tier: "A", minDaysOut: 30, minLoadFactor: 0, multiplier: 1.0}, ...]
+  tiers               Json
+  // optional ML-derived demand multiplier, refreshed weekly
+  mlDemandMultiplier  Decimal? @db.Decimal(6, 4)
+  updatedAt           DateTime @updatedAt
+
+  flightSchedule FlightSchedule @relation(fields: [flightScheduleId], references: [id], onDelete: Cascade)
+  overrides      TierOverride[]
+  priceHistory   PriceHistory[]
+}
+
+model TierOverride {
+  id              String   @id @default(cuid())
+  pricingConfigId String
+  tier            String   // "A" | "B" | "C" | "D"
+  multiplier      Decimal  @db.Decimal(6, 4)
+  reason          String?
+  effectiveFrom   DateTime
+  effectiveTo     DateTime?
+  createdById     String
+  createdAt       DateTime @default(now())
+
+  pricingConfig PricingConfig @relation(fields: [pricingConfigId], references: [id], onDelete: Cascade)
+
+  @@index([pricingConfigId, effectiveFrom])
+}
+
+model PriceHistory {
+  id              String   @id @default(cuid())
+  pricingConfigId String
+  cabin           CabinClass
+  price           Decimal  @db.Decimal(10, 2)
+  tier            String
+  observedAt      DateTime @default(now())
+
+  pricingConfig PricingConfig @relation(fields: [pricingConfigId], references: [id], onDelete: Cascade)
+
+  @@index([pricingConfigId, observedAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Notifications
+// ─────────────────────────────────────────────────────────────────────────────
+
+enum NotificationChannel {
+  SMS
+  EMAIL
+  WECHAT
+}
+
+enum NotificationStatus {
+  QUEUED
+  SENT
+  FAILED
+  RETRYING
+}
+
+model NotificationLog {
+  id          String              @id @default(cuid())
+  orderId     String?
+  userId      String?
+  channel     NotificationChannel
+  recipient   String              // phone, email, or openid
+  template    String              // template key
+  payload     Json
+  status      NotificationStatus  @default(QUEUED)
+  attemptCount Int                @default(0)
+  lastError   String?
+  sentAt      DateTime?
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
+
+  order Order? @relation(fields: [orderId], references: [id])
+
+  @@index([orderId])
+  @@index([status])
+  @@index([createdAt])
+}

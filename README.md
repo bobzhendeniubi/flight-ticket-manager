@@ -56,6 +56,27 @@ flight-ticket-manager/
 - [PRD — Product Requirements](docs/PRD.md)
 - [System Architecture](docs/architecture.md)
 - [Open Questions Tracker](docs/open-questions.md)
+- [Backend README](backend/README.md)
+- [Sales-web README](sales-web/README.md)
+
+## Quick start (M1 Foundation)
+
+```bash
+# One-time
+npm install                          # installs all workspaces
+docker compose up -d postgres redis  # local Postgres + Redis
+cp backend/.env.example backend/.env
+
+cd backend
+npx prisma migrate dev               # apply schema
+npm run prisma:seed                  # admin/customer/agent + sample flights
+
+# Two terminals:
+cd backend && npm run dev            # :4000
+cd sales-web && npm run dev          # :5173 (proxies /api → :4000)
+```
+
+Log in at http://localhost:5173/login with `admin@ftm.local` / `Password123!`.
 
 ## Development Phases
 

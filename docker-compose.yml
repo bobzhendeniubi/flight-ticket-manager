@@ -1,0 +1,53 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ftm-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ftm
+      POSTGRES_PASSWORD: ftm_dev_password
+      POSTGRES_DB: ftm
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ftm -d ftm"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: ftm-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Optional: OpenSearch for flight/hotel search (M2+)
+  # Uncomment when implementing search features.
+  # opensearch:
+  #   image: opensearchproject/opensearch:2.13.0
+  #   container_name: ftm-opensearch
+  #   environment:
+  #     - discovery.type=single-node
+  #     - plugins.security.disabled=true
+  #     - OPENSEARCH_INITIAL_ADMIN_PASSWORD=OpenSearch_dev_1!
+  #     - bootstrap.memory_lock=true
+  #     - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+  #   ports:
+  #     - "9200:9200"
+  #   volumes:
+  #     - opensearch_data:/usr/share/opensearch/data
+
+volumes:
+  postgres_data:
+  redis_data:
+  # opensearch_data:
