@@ -1,25 +1,37 @@
-/** 自营航线常用机场 — 三字码 → 中文名 */
-export const AIRPORTS: Record<string, string> = {
-  PEK: '北京首都',
-  PKX: '北京大兴',
-  PVG: '上海浦东',
-  SHA: '上海虹桥',
-  CAN: '广州白云',
-  SZX: '深圳宝安',
-  CTU: '成都天府',
-  XMN: '厦门高崎',
-  HGH: '杭州萧山',
-  KMG: '昆明长水',
-  XIY: '西安咸阳',
-  HRB: '哈尔滨太平',
+/**
+ * 我们主营的目的地：岘港。核心航线 澳门 ↔ 岘港 (QH9588/9589)。
+ * 其他机场为未来扩展（港澳/大湾区 ↔ 越南主要城市）。
+ */
+export interface AirportInfo {
+  code: string;
+  name: string; // 中文名
+  tz: string; // IANA 时区
+  country: '越南' | '中国' | '';
+}
+
+export const AIRPORTS: Record<string, AirportInfo> = {
+  DAD: { code: 'DAD', name: '岘港', tz: 'Asia/Ho_Chi_Minh', country: '越南' },
+  MFM: { code: 'MFM', name: '澳门', tz: 'Asia/Macau', country: '中国' },
+  HKG: { code: 'HKG', name: '香港', tz: 'Asia/Hong_Kong', country: '中国' },
+  SGN: { code: 'SGN', name: '胡志明', tz: 'Asia/Ho_Chi_Minh', country: '越南' },
+  HAN: { code: 'HAN', name: '河内', tz: 'Asia/Ho_Chi_Minh', country: '越南' },
+  CXR: { code: 'CXR', name: '芽庄', tz: 'Asia/Ho_Chi_Minh', country: '越南' },
+  PQC: { code: 'PQC', name: '富国岛', tz: 'Asia/Ho_Chi_Minh', country: '越南' },
+  PEK: { code: 'PEK', name: '北京首都', tz: 'Asia/Shanghai', country: '中国' },
+  CAN: { code: 'CAN', name: '广州', tz: 'Asia/Shanghai', country: '中国' },
+  SZX: { code: 'SZX', name: '深圳', tz: 'Asia/Shanghai', country: '中国' },
+  PVG: { code: 'PVG', name: '上海浦东', tz: 'Asia/Shanghai', country: '中国' },
 };
 
-export const AIRPORT_OPTIONS: Array<{ code: string; name: string }> = Object.entries(AIRPORTS).map(
-  ([code, name]) => ({ code, name }),
-);
+export const AIRPORT_OPTIONS = Object.values(AIRPORTS).map((a) => ({
+  code: a.code,
+  name: a.name,
+  country: a.country,
+}));
 
 export function airportLabel(code: string): string {
-  return AIRPORTS[code] ? `${AIRPORTS[code]} (${code})` : code;
+  const a = AIRPORTS[code];
+  return a ? `${a.name} (${code})` : code;
 }
 
 /** 舱等中文名 */

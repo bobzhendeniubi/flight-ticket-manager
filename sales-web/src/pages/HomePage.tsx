@@ -9,6 +9,7 @@ import {
   formatLocalDate,
   formatLocalTime,
 } from '../lib/airports';
+import { DANANG_HIGHLIGHTS } from '../lib/mockData';
 import { useAuth } from '../stores/auth';
 
 function todayISO(offsetDays = 1): string {
@@ -20,8 +21,9 @@ function todayISO(offsetDays = 1): string {
 export function HomePage() {
   const user = useAuth((s) => s.user);
 
-  const [origin, setOrigin] = useState('PEK');
-  const [destination, setDestination] = useState('PVG');
+  // 默认主航线：澳门 → 岘港
+  const [origin, setOrigin] = useState('MFM');
+  const [destination, setDestination] = useState('DAD');
   const [date, setDate] = useState(todayISO(3));
   const [cabin, setCabin] = useState<'' | CabinClass>('');
   const [passengers, setPassengers] = useState(1);
@@ -31,14 +33,13 @@ export function HomePage() {
   const [error, setError] = useState<string | null>(null);
   const [hasSearched, setHasSearched] = useState(false);
 
-  // 首次加载：用默认条件预热一下 UI（不阻塞）
   useEffect(() => {
     (async () => {
       try {
         const res = await api.searchFlights({ passengers: 1 });
         setResults(res.results);
       } catch {
-        // 静默，进页面再重新搜
+        // 静默
       }
     })();
   }, []);
@@ -72,30 +73,40 @@ export function HomePage() {
 
   return (
     <div className="space-y-6">
-      <section className="card">
-        <h1 className="text-2xl font-bold text-slate-900">
-          {user ? `${user.displayName ?? user.email}，您好` : '机票管家'}
-        </h1>
-        <p className="mt-2 text-slate-600">
-          搜索我们自营的国内航线，支持多级代理下单、预付款抵扣和管理员实时调价。
-        </p>
+      {/* Hero */}
+      <section className="rounded-xl bg-gradient-to-br from-sky-500 to-emerald-500 p-8 text-white shadow-sm">
+        <div className="max-w-2xl">
+          <div className="flex items-center gap-2 text-sm text-sky-50">
+            <span>✈️ 澳门/香港出发</span>
+            <span>·</span>
+            <span>🇻🇳 岘港专线</span>
+          </div>
+          <h1 className="mt-2 text-3xl font-bold md:text-4xl">
+            {user ? `${user.displayName ?? user.email}，您好` : '港澳直飞岘港 · 一站式度假管家'}
+          </h1>
+          <p className="mt-2 text-sky-50">
+            自营 QH9588 / QH9589 澳门 ↔ 岘港直飞航班，每天 1 班，机票 + 酒店 + 接送 + 签证一站搞定。
+          </p>
+          <div className="mt-4 flex flex-wrap gap-2 text-sm">
+            <span className="rounded-full bg-white/20 px-3 py-1 backdrop-blur">🏝️ 美溪海滩</span>
+            <span className="rounded-full bg-white/20 px-3 py-1 backdrop-blur">🌉 巴拿山</span>
+            <span className="rounded-full bg-white/20 px-3 py-1 backdrop-blur">🏮 会安古城</span>
+            <span className="rounded-full bg-white/20 px-3 py-1 backdrop-blur">💆 全别墅度假</span>
+          </div>
+        </div>
       </section>
 
+      {/* 搜索表单 */}
       <section className="card">
         <h2 className="text-lg font-semibold text-slate-900">航班搜索</h2>
         <form className="mt-4 grid gap-4 md:grid-cols-12" onSubmit={onSubmit}>
           <div className="md:col-span-3">
             <label className="label" htmlFor="origin">出发</label>
-            <select
-              id="origin"
-              className="input"
-              value={origin}
-              onChange={(e) => setOrigin(e.target.value)}
-            >
+            <select id="origin" className="input" value={origin} onChange={(e) => setOrigin(e.target.value)}>
               <option value="">全部</option>
               {AIRPORT_OPTIONS.map((a) => (
                 <option key={a.code} value={a.code}>
-                  {a.name} ({a.code})
+                  {a.name} ({a.code}){a.country ? ` · ${a.country}` : ''}
                 </option>
               ))}
             </select>
@@ -122,20 +133,14 @@ export function HomePage() {
               <option value="">全部</option>
               {AIRPORT_OPTIONS.map((a) => (
                 <option key={a.code} value={a.code}>
-                  {a.name} ({a.code})
+                  {a.name} ({a.code}){a.country ? ` · ${a.country}` : ''}
                 </option>
               ))}
             </select>
           </div>
           <div className="md:col-span-2">
             <label className="label" htmlFor="date">出发日期</label>
-            <input
-              id="date"
-              type="date"
-              className="input"
-              value={date}
-              onChange={(e) => setDate(e.target.value)}
-            />
+            <input id="date" type="date" className="input" value={date} onChange={(e) => setDate(e.target.value)} />
           </div>
           <div className="md:col-span-2">
             <label className="label" htmlFor="cabin">舱等</label>
@@ -171,6 +176,7 @@ export function HomePage() {
         </form>
       </section>
 
+      {/* 航班结果 */}
       <section className="space-y-3">
         {error && (
           <div className="card border-red-200 bg-red-50 text-sm text-red-700">{error}</div>
@@ -193,9 +199,54 @@ export function HomePage() {
           </>
         )}
 
-        {results === null && (
-          <div className="card text-slate-500">正在加载…</div>
-        )}
+        {results === null && <div className="card text-slate-500">正在加载…</div>}
+      </section>
+
+      {/* 岘港亮点 */}
+      <section>
+        <div className="flex items-end justify-between">
+          <h2 className="text-xl font-bold text-slate-900">岘港必玩</h2>
+          <p className="text-xs text-slate-500">一个行程一次打卡</p>
+        </div>
+        <div className="mt-4 grid gap-4 md:grid-cols-2 lg:grid-cols-4">
+          {DANANG_HIGHLIGHTS.map((h) => (
+            <div key={h.title} className="card hover:shadow-md transition">
+              <div className="text-4xl">{h.emoji}</div>
+              <h3 className="mt-2 font-semibold text-slate-900">{h.title}</h3>
+              <p className="mt-1 text-sm text-slate-600">{h.description}</p>
+              <span className="mt-3 inline-block rounded bg-emerald-100 px-2 py-0.5 text-xs text-emerald-700">
+                {h.tag}
+              </span>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      {/* 打包优势 */}
+      <section className="card bg-slate-50">
+        <h2 className="text-lg font-bold text-slate-900">为什么选我们</h2>
+        <div className="mt-4 grid gap-4 md:grid-cols-4 text-sm">
+          <div>
+            <div className="text-3xl">✈️</div>
+            <h3 className="mt-1 font-semibold text-slate-900">自营直飞航班</h3>
+            <p className="mt-1 text-slate-600">QH9588/9589 澳门 ↔ 岘港直飞 1h45m，每天 1 班</p>
+          </div>
+          <div>
+            <div className="text-3xl">🏨</div>
+            <h3 className="mt-1 font-semibold text-slate-900">签约精选酒店</h3>
+            <p className="mt-1 text-slate-600">四季 / 洲际 / 凯悦 / 铂尔曼，8 家核心酒店直签价</p>
+          </div>
+          <div>
+            <div className="text-3xl">🚘</div>
+            <h3 className="mt-1 font-semibold text-slate-900">中文司机接送</h3>
+            <p className="mt-1 text-slate-600">机场接送、会安 / 巴拿山 / 顺化包车，沟通无忧</p>
+          </div>
+          <div>
+            <div className="text-3xl">🛂</div>
+            <h3 className="mt-1 font-semibold text-slate-900">越南签证代办</h3>
+            <p className="mt-1 text-slate-600">E-visa / 落地签 / 1 年多次商务签，3–5 天出签</p>
+          </div>
+        </div>
       </section>
     </div>
   );
@@ -257,7 +308,7 @@ function FlightCard({
             </div>
           )}
           {isLoggedIn ? (
-            <button className="btn-primary mt-2 text-sm" disabled title="下单流程将在 M2 后续迭代中开放">
+            <button className="btn-primary mt-2 text-sm" disabled title="下单流程将在后续迭代中开放">
               选择舱位
             </button>
           ) : (

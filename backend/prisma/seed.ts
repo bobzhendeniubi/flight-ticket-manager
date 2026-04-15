@@ -1,6 +1,10 @@
 /**
- * 开发环境 seed：管理员、多层代理、客户，以及 QH9588/QH9589 两条自营航班的未来 14 天班次。
- * 幂等 — 可重复运行（会清理掉不在列表里的历史航班，保持 DB 和代码一致）。
+ * 开发环境 seed：管理员、多层代理、客户，以及 QH9588/QH9589（澳门↔岘港）两条
+ * 自营航班的未来 14 天班次。幂等 — 可重复运行。
+ *
+ * 航班信息参考 Bamboo Airways 公开时刻表（2026 春夏表）:
+ *   QH9588  DAD → MFM  11:40 起飞（DAD GMT+7）→ 14:25 到达（MFM GMT+8）  A321
+ *   QH9589  MFM → DAD  15:25 起飞（MFM GMT+8）→ 16:10 到达（DAD GMT+7）  A321
  *
  * Run: npm run prisma:seed  (from backend/)
  */
@@ -9,40 +13,47 @@ import argon2 from 'argon2';
 
 const prisma = new PrismaClient();
 
-// ── 我们目前自营的两条航班 ─────────────────────────────────────────────
-// QH9588  北京首都 → 上海浦东  09:00 起飞
-// QH9589  上海浦东 → 北京首都  18:30 起飞
+// 航班配置：时间都用「出发地本地」表达，下面会按 IANA tz 折算到 UTC。
 const FLIGHT_SEED = [
   {
     flightNumber: 'QH9588',
-    origin: 'PEK',
-    dest: 'PVG',
-    departHour: 9,
-    departMinute: 0,
-    durationMinutes: 120,
-    aircraft: 'Airbus A320',
-    econCapacity: 150,
-    econPrice: 1180,
+    origin: 'DAD', // 岘港
+    dest: 'MFM', // 澳门
+    departTz: 'Asia/Ho_Chi_Minh', // GMT+7
+    arrivalTz: 'Asia/Macau', // GMT+8
+    departHourLocal: 11,
+    departMinuteLocal: 40,
+    durationMinutes: 105, // 1h 45m
+    aircraft: 'Airbus A321-211',
+    econCapacity: 180,
+    econPrice: 1380,
     bizCapacity: 20,
-    bizPrice: 3980,
+    bizPrice: 4280,
   },
   {
     flightNumber: 'QH9589',
-    origin: 'PVG',
-    dest: 'PEK',
-    departHour: 18,
-    departMinute: 30,
-    durationMinutes: 120,
-    aircraft: 'Airbus A320',
-    econCapacity: 150,
-    econPrice: 1280,
+    origin: 'MFM',
+    dest: 'DAD',
+    departTz: 'Asia/Macau',
+    arrivalTz: 'Asia/Ho_Chi_Minh',
+    departHourLocal: 15,
+    departMinuteLocal: 25,
+    durationMinutes: 105,
+    aircraft: 'Airbus A321-211',
+    econCapacity: 180,
+    econPrice: 1480,
     bizCapacity: 20,
-    bizPrice: 3980,
+    bizPrice: 4380,
   },
 ] as const;
 
-// 未来多少天每天各一班
 const DAYS_OUT = 14;
+
+/** 把"出发地本地时间"转为 UTC Date。只支持整小时偏移（Asia/Ho_Chi_Minh=+7, Asia/Macau=+8）。 */
+function localToUtc(year: number, month: number, day: number, hour: number, minute: number, tz: string): Date {
+  const offsetHours = tz === 'Asia/Macau' ? 8 : tz === 'Asia/Ho_Chi_Minh' ? 7 : 8;
+  return new Date(Date.UTC(year, month, day, hour - offsetHours, minute, 0));
+}
 
 async function main() {
   const password = 'Password123!';
@@ -81,7 +92,7 @@ async function main() {
       email: 'agent1@ftm.local',
       passwordHash: hash,
       role: UserRole.AGENT,
-      displayName: '1级代理 · 总代',
+      displayName: '1级代理 · 港澳总代',
       emailVerified: true,
     },
   });
@@ -91,10 +102,10 @@ async function main() {
     update: {},
     create: {
       userId: agent1User.id,
-      companyName: '总代旅行社',
+      companyName: '港澳岘港旅游总代',
       contactName: '王总代',
-      contactPhone: '+8613800000001',
-      prepaymentBalance: 50000,
+      contactPhone: '+85290000001',
+      prepaymentBalance: 80000,
       tier: 1,
     },
   });
@@ -107,7 +118,7 @@ async function main() {
       email: 'agent2@ftm.local',
       passwordHash: hash,
       role: UserRole.AGENT,
-      displayName: '2级代理 · 区代',
+      displayName: '2级代理 · 澳门区代',
       emailVerified: true,
     },
   });
@@ -117,10 +128,10 @@ async function main() {
     update: {},
     create: {
       userId: agent2User.id,
-      companyName: '区代旅行社',
+      companyName: '澳门欢乐旅行社',
       contactName: '李区代',
-      contactPhone: '+8613800000002',
-      prepaymentBalance: 10000,
+      contactPhone: '+85366000002',
+      prepaymentBalance: 20000,
       parentAgentId: agent1.id,
       tier: 2,
     },
@@ -144,10 +155,10 @@ async function main() {
     update: {},
     create: {
       userId: agent3User.id,
-      companyName: '门店旅行社',
+      companyName: '澳门威尼斯人门店',
       contactName: '张门店',
-      contactPhone: '+8613800000003',
-      prepaymentBalance: 3000,
+      contactPhone: '+85366000003',
+      prepaymentBalance: 5000,
       parentAgentId: agent2.id,
       tier: 3,
     },
@@ -157,15 +168,12 @@ async function main() {
   const keepFlightNumbers = FLIGHT_SEED.map((f) => f.flightNumber);
   const toRemove = await prisma.flight.findMany({
     where: { flightNumber: { notIn: keepFlightNumbers } },
-    include: {
-      schedules: { include: { orderItems: { take: 1 } } },
-    },
+    include: { schedules: { include: { orderItems: { take: 1 } } } },
   });
   let removedFlights = 0;
   for (const f of toRemove) {
     const hasOrders = f.schedules.some((s) => s.orderItems.length > 0);
-    if (hasOrders) continue; // 保留有订单的
-    // cascade: delete schedules (which cascade-deletes seat classes)
+    if (hasOrders) continue;
     await prisma.flightSchedule.deleteMany({ where: { flightId: f.id } });
     await prisma.flight.delete({ where: { id: f.id } });
     removedFlights++;
@@ -193,11 +201,28 @@ async function main() {
       },
     });
 
+    // 清理当前航班上时区已变更的旧班次（例如 QH 从国内航线改到澳门↔岘港）
+    const stale = await prisma.flightSchedule.findMany({
+      where: {
+        flightId: flight.id,
+        OR: [{ departureTz: { not: f.departTz } }, { arrivalTz: { not: f.arrivalTz } }],
+      },
+      include: { orderItems: { take: 1 } },
+    });
+    for (const s of stale) {
+      if (s.orderItems.length === 0) {
+        await prisma.flightSchedule.delete({ where: { id: s.id } });
+      }
+    }
+
     for (let offset = 1; offset <= DAYS_OUT; offset++) {
-      const dep = new Date(today);
-      dep.setUTCDate(dep.getUTCDate() + offset);
-      // 本地 Asia/Shanghai (UTC+8) → UTC hour = local hour - 8
-      dep.setUTCHours(f.departHour - 8, f.departMinute, 0, 0);
+      const base = new Date(today);
+      base.setUTCDate(base.getUTCDate() + offset);
+      const y = base.getUTCFullYear();
+      const m = base.getUTCMonth();
+      const d = base.getUTCDate();
+
+      const dep = localToUtc(y, m, d, f.departHourLocal, f.departMinuteLocal, f.departTz);
       const arr = new Date(dep.getTime() + f.durationMinutes * 60 * 1000);
 
       const existing = await prisma.flightSchedule.findFirst({
@@ -210,8 +235,8 @@ async function main() {
           flightId: flight.id,
           departureTime: dep,
           arrivalTime: arr,
-          departureTz: 'Asia/Shanghai',
-          arrivalTz: 'Asia/Shanghai',
+          departureTz: f.departTz,
+          arrivalTz: f.arrivalTz,
           seatClasses: {
             create: [
               { cabin: CabinClass.ECONOMY, capacity: f.econCapacity, basePrice: f.econPrice },

@@ -17,9 +17,9 @@ export function VisasPage() {
   return (
     <div className="space-y-6">
       <section className="card">
-        <h1 className="text-2xl font-bold text-slate-900">签证办理</h1>
+        <h1 className="text-2xl font-bold text-slate-900">越南及周边签证代办</h1>
         <p className="mt-1 text-sm text-slate-600">
-          覆盖主流出境目的地，支持加急办理，材料上传后由专员审核。
+          主打越南 E-visa / 落地签 / 商务签，最快 2 天出签。另代办东南亚常用签证。
         </p>
         <div className="mt-5 grid gap-4 md:grid-cols-3">
           <div>
@@ -61,6 +61,9 @@ export function VisasPage() {
             </div>
             <h3 className="mt-3 font-semibold text-slate-900">{v.country}</h3>
             <p className="mt-0.5 text-sm text-slate-600">{v.type}</p>
+            {v.highlight && (
+              <p className="mt-1 text-xs font-medium text-emerald-700">★ {v.highlight}</p>
+            )}
             <p className="mt-2 text-xs text-slate-500">有效期 {v.validityMonths} 个月 · 需材料 {v.requiredDocs.length} 项</p>
             <div className="mt-4 flex items-end justify-between">
               <div>

@@ -17,9 +17,9 @@ export function TransfersPage() {
   return (
     <div className="space-y-6">
       <section className="card">
-        <h1 className="text-2xl font-bold text-slate-900">机场接送</h1>
+        <h1 className="text-2xl font-bold text-slate-900">岘港当地用车</h1>
         <p className="mt-1 text-sm text-slate-600">
-          专车接送机服务，含专职司机 + 免费等候，航班延误自动顺延。
+          岘港机场 ↔ 酒店专车、会安 / 巴拿山 / 顺化一日包车，全部配中文司机，航班延误自动顺延。
         </p>
 
         <div className="mt-5 grid gap-4 md:grid-cols-4">
@@ -71,7 +71,7 @@ export function TransfersPage() {
                   ))}
                 </div>
                 <p className="mt-2 text-xs text-slate-500">
-                  {t.originArea} → {t.destArea} · 最多 {t.capacity} 人
+                  {t.originArea} → {t.destArea} · 最多 {t.capacity} 人 · {t.duration}
                 </p>
               </div>
               <div className="text-right">

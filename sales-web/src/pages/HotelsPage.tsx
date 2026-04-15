@@ -10,7 +10,7 @@ function todayISO(offsetDays = 0) {
 export function HotelsPage() {
   const [city, setCity] = useState('');
   const [stars, setStars] = useState<'' | '3' | '4' | '5'>('');
-  const [maxPrice, setMaxPrice] = useState(3000);
+  const [maxPrice, setMaxPrice] = useState(4000);
   const [checkIn, setCheckIn] = useState(todayISO(3));
   const [checkOut, setCheckOut] = useState(todayISO(5));
   const [selected, setSelected] = useState<MockHotel | null>(null);
@@ -32,20 +32,18 @@ export function HotelsPage() {
   return (
     <div className="space-y-6">
       <section className="card">
-        <h1 className="text-2xl font-bold text-slate-900">酒店预订</h1>
-        <p className="mt-1 text-sm text-slate-600">精选合作酒店，支持与机票打包下单享折扣。</p>
+        <h1 className="text-2xl font-bold text-slate-900">岘港酒店预订</h1>
+        <p className="mt-1 text-sm text-slate-600">
+          8 家直签合作酒店，覆盖美溪海滩 / 山茶半岛 / 会安，与 QH9588/9589 航班打包享额外折扣。
+        </p>
 
         <div className="mt-5 grid gap-4 md:grid-cols-5">
           <div>
-            <label className="label">城市</label>
+            <label className="label">目的地</label>
             <select className="input" value={city} onChange={(e) => setCity(e.target.value)}>
-              <option value="">全部</option>
-              <option value="PEK">北京</option>
-              <option value="PVG">上海</option>
-              <option value="CAN">广州</option>
-              <option value="SZX">深圳</option>
-              <option value="CTU">成都</option>
-              <option value="XMN">厦门</option>
+              <option value="">全部（岘港 + 会安）</option>
+              <option value="DAD">岘港</option>
+              <option value="HOA">会安</option>
             </select>
           </div>
           <div>
@@ -69,8 +67,8 @@ export function HotelsPage() {
             <label className="label">价格上限 ¥{maxPrice}</label>
             <input
               type="range"
-              min={200}
-              max={3000}
+              min={500}
+              max={4000}
               step={100}
               className="w-full"
               value={maxPrice}
@@ -92,14 +90,16 @@ export function HotelsPage() {
                 </span>
               </div>
               <h3 className="mt-3 font-semibold text-slate-900">{h.name}</h3>
-              <p className="mt-1 text-xs text-slate-500">{h.location}</p>
+              <p className="text-xs text-slate-400">{h.nameEn}</p>
+              <p className="mt-1 text-xs text-slate-500">📍 {h.area}</p>
               <div className="mt-2 flex items-center gap-2">
                 <span className="rounded bg-green-100 px-1.5 py-0.5 text-xs font-semibold text-green-700">
                   {h.rating}
                 </span>
                 <span className="text-xs text-slate-500">{h.reviewCount} 条评价</span>
               </div>
-              <div className="mt-3 flex flex-wrap gap-1">
+              <p className="mt-2 text-xs text-slate-600 italic line-clamp-2">{h.highlight}</p>
+              <div className="mt-2 flex flex-wrap gap-1">
                 {h.amenities.slice(0, 3).map((a) => (
                   <span key={a} className="rounded bg-slate-100 px-2 py-0.5 text-xs text-slate-600">
                     {a}
@@ -176,8 +176,9 @@ function HotelDetailModal({
                 <span className="text-xs text-slate-500">{hotel.reviewCount} 条评价</span>
               </div>
               <div>
-                <h3 className="font-medium text-slate-900">位置</h3>
-                <p className="mt-1 text-sm text-slate-600">{hotel.location}</p>
+                <h3 className="font-medium text-slate-900">位置与卖点</h3>
+                <p className="mt-1 text-sm text-slate-600">📍 {hotel.area}</p>
+                <p className="mt-1 text-sm text-slate-700 italic">{hotel.highlight}</p>
               </div>
               <div>
                 <h3 className="font-medium text-slate-900">设施服务</h3>
