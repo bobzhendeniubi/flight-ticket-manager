@@ -1,6 +1,8 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { UserRole } from '@prisma/client';
 import { FlightService } from './flights.service.js';
+import { PricingService } from '../pricing/pricing.service.js';
+import { priceQuerySchema } from '../pricing/pricing.schemas.js';
 import {
   createFlightBodySchema,
   createScheduleBodySchema,
@@ -9,12 +11,20 @@ import {
 
 export const flightRoutes: FastifyPluginAsync = async (app) => {
   const service = new FlightService();
+  const pricingService = new PricingService();
 
   // ── 公共搜索 ──
   app.get('/search', async (req) => {
     const q = flightSearchQuerySchema.parse(req.query);
     const results = await service.search(q);
     return { query: q, results };
+  });
+
+  // ── 动态定价查询（公共） ──
+  app.get('/price', async (req) => {
+    const q = priceQuerySchema.parse(req.query);
+    const pricing = await pricingService.calculatePrice(q.scheduleId, q.cabin, q.qty);
+    return { pricing };
   });
 
   // ── 管理员航班 CRUD ──

@@ -44,6 +44,12 @@ export function CheckoutPage() {
   const [submitting, setSubmitting] = useState(false);
   const [done, setDone] = useState<{ orderNumber: string } | null>(null);
 
+  // 机票总人数 — 结账时必须 == passengers.length
+  const flightTicketCount = items
+    .filter((i) => i.kind === 'FLIGHT')
+    .reduce((sum, i) => sum + i.qty, 0);
+  const paxMismatch = flightTicketCount > 0 && passengers.length !== flightTicketCount;
+
   if (items.length === 0 && !done) {
     return (
       <div className="card text-center py-16">
@@ -87,7 +93,11 @@ export function CheckoutPage() {
 
   const onSubmit = async (e: FormEvent) => {
     e.preventDefault();
-    // Invariant: 至少 1 位出行人；姓名和护照号必填
+    // Invariant: 买几张票就填几个人
+    if (flightTicketCount > 0 && passengers.length !== flightTicketCount) {
+      alert(`机票 ${flightTicketCount} 张，需要 ${flightTicketCount} 位出行人，当前填了 ${passengers.length} 位`);
+      return;
+    }
     if (passengers.length === 0) {
       alert('至少需要 1 位出行人');
       return;
@@ -199,12 +209,21 @@ export function CheckoutPage() {
         {/* 乘客 / 出行人 */}
         <section className="card">
           <div className="flex items-center justify-between">
-            <h2 className="font-semibold text-slate-900">出行人信息（{passengers.length} 人）</h2>
+            <h2 className="font-semibold text-slate-900">
+              出行人信息（{passengers.length} 人
+              {flightTicketCount > 0 && ` / 机票 ${flightTicketCount} 张`}）
+            </h2>
             <button type="button" className="text-sm text-brand hover:text-brand-dark" onClick={addPassenger}>
               + 增加出行人
             </button>
           </div>
           <p className="mt-1 text-xs text-slate-500">机票、签证按出行人开票/办证。每位都需提供护照信息。</p>
+          {paxMismatch && (
+            <div className="mt-2 rounded-md bg-amber-50 border border-amber-200 px-4 py-3 text-sm text-amber-800">
+              ⚠ 机票数量 ({flightTicketCount} 张) 与出行人数 ({passengers.length} 人) 不匹配。
+              请{passengers.length < flightTicketCount ? '增加出行人' : '减少出行人或返回购物车调整机票数量'}。
+            </div>
+          )}
 
           <div className="mt-4 space-y-4">
             {passengers.map((p, idx) => (
@@ -257,7 +276,7 @@ export function CheckoutPage() {
             <span>
               合计 <span className="text-2xl font-bold text-red-600">¥{total.toLocaleString()}</span>
             </span>
-            <button type="submit" className="btn-primary" disabled={submitting}>
+            <button type="submit" className="btn-primary" disabled={submitting || paxMismatch}>
               {submitting ? '提交中…' : '提交订单'}
             </button>
           </div>

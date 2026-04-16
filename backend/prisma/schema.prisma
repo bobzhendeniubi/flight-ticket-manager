@@ -632,3 +632,20 @@ model NotificationLog {
   @@index([status])
   @@index([createdAt])
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Dynamic Pricing — Date Ranking
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 日期等级表 — 每天一行 (A/B/C/D)。Seed 自动按 DOW 填充，admin 可手动 override。
+model DateRanking {
+  id       String   @id @default(cuid())
+  date     DateTime @unique @db.Date // 出发本地日期（UTC midnight 存）
+  rank     String   // "A" | "B" | "C" | "D"
+  reason   String?  // "春节" | "default:Friday" | "manual override"
+  isManual Boolean  @default(false) // true = admin 手动覆盖
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([date])
+}

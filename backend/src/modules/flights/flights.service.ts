@@ -1,7 +1,10 @@
 import { CabinClass, Prisma } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { BadRequestError, ConflictError, NotFoundError } from '../../lib/errors.js';
+import { PricingService } from '../pricing/pricing.service.js';
 import type { CreateFlightBody, CreateScheduleBody, FlightSearchQuery } from './flights.schemas.js';
+
+const pricingService = new PricingService();
 
 export class FlightService {
   /** 面向销售端的航班搜索 — 仅返回自营、激活且未来出发、且可售座位 > 0 的班次 */
@@ -41,16 +44,42 @@ export class FlightService {
       take: 50,
     });
 
-    return schedules
-      .map((s) => {
+    // 异步 map — 每个班次的每个舱位都要算动态价
+    const mapped = await Promise.all(
+      schedules.map(async (s) => {
         const seats = q.cabin ? s.seatClasses.filter((c) => c.cabin === q.cabin) : s.seatClasses;
-        const availableSeats = seats.map((c) => ({
-          cabin: c.cabin,
-          capacity: c.capacity,
-          sold: c.sold,
-          available: c.capacity - c.sold,
-          basePrice: c.basePrice.toString(),
-        }));
+        const availableSeats = await Promise.all(
+          seats.map(async (c) => {
+            const avail = c.capacity - c.sold;
+            // 动态价：为请求人数算平均单价
+            let dynamicPrice: string = c.basePrice.toString();
+            let dateRank = 'C';
+            let dateMultiplier = 1.0;
+            let totalForQty = Number(c.basePrice) * q.passengers;
+            try {
+              if (avail >= q.passengers) {
+                const pr = await pricingService.calculatePrice(s.id, c.cabin, q.passengers);
+                dynamicPrice = pr.averageUnitPrice.toString();
+                dateRank = pr.dateRank;
+                dateMultiplier = pr.dateMultiplier;
+                totalForQty = pr.totalPrice;
+              }
+            } catch {
+              // fallback to basePrice
+            }
+            return {
+              cabin: c.cabin,
+              capacity: c.capacity,
+              sold: c.sold,
+              available: avail,
+              basePrice: c.basePrice.toString(),
+              dynamicPrice,
+              dateRank,
+              dateMultiplier,
+              totalForQty,
+            };
+          }),
+        );
         const hasSpace = availableSeats.some((c) => c.available >= q.passengers);
         return {
           scheduleId: s.id,
@@ -67,7 +96,9 @@ export class FlightService {
           seatClasses: availableSeats,
           hasSpace,
         };
-      })
+      }),
+    );
+    return mapped
       .filter((s) => s.hasSpace && s.seatClasses.length > 0);
   }
 

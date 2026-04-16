@@ -260,6 +260,84 @@ async function main() {
     }
   }
 
+  // ── 日期等级 (DateRanking) — 365 天 ────────────────────────────────
+  // DOW 默认：Sun=A, Mon=C, Tue=D, Wed=D, Thu=C, Fri=B, Sat=B
+  const DOW_RANK: Record<number, string> = {
+    0: 'A', // Sunday
+    1: 'C', // Monday
+    2: 'D', // Tuesday
+    3: 'D', // Wednesday
+    4: 'C', // Thursday
+    5: 'B', // Friday
+    6: 'B', // Saturday
+  };
+  const DOW_REASON: Record<number, string> = {
+    0: 'default:Sunday', 1: 'default:Monday', 2: 'default:Tuesday',
+    3: 'default:Wednesday', 4: 'default:Thursday', 5: 'default:Friday', 6: 'default:Saturday',
+  };
+
+  // 2026 中国节假日 (近似)
+  const HOLIDAYS_2026: Array<{ start: string; end: string; name: string }> = [
+    { start: '2026-01-26', end: '2026-02-01', name: '春节' },
+    { start: '2026-04-04', end: '2026-04-06', name: '清明' },
+    { start: '2026-05-01', end: '2026-05-05', name: '五一' },
+    { start: '2026-05-31', end: '2026-05-31', name: '端午' },
+    { start: '2026-10-01', end: '2026-10-07', name: '国庆' },
+    { start: '2026-10-06', end: '2026-10-06', name: '中秋' },
+    { start: '2026-07-01', end: '2026-08-31', name: '暑期旺季' }, // rank B
+    { start: '2026-12-24', end: '2027-01-02', name: '圣诞/元旦' },
+  ];
+
+  // 构建 holiday lookup
+  const holidayMap = new Map<string, { name: string; rank: string }>();
+  for (const h of HOLIDAYS_2026) {
+    const s = new Date(h.start);
+    const e = new Date(h.end);
+    for (let d = new Date(s); d <= e; d.setDate(d.getDate() + 1)) {
+      const key = d.toISOString().slice(0, 10);
+      // 暑期旺季 = B，其他节假日 = A
+      const rank = h.name === '暑期旺季' ? 'B' : 'A';
+      // 节假日覆盖暑期
+      if (!holidayMap.has(key) || rank === 'A') {
+        holidayMap.set(key, { name: h.name, rank });
+      }
+    }
+  }
+
+  // 批量预取已存在的 DateRanking
+  const existingDates = new Set(
+    (await prisma.dateRanking.findMany({ select: { date: true } })).map(
+      (r) => r.date.toISOString().slice(0, 10),
+    ),
+  );
+
+  let newRankings = 0;
+  for (let offset = 0; offset < 365; offset++) {
+    const d = new Date(today);
+    d.setUTCDate(d.getUTCDate() + offset);
+    const key = d.toISOString().slice(0, 10);
+    if (existingDates.has(key)) continue;
+
+    const holiday = holidayMap.get(key);
+    const dow = d.getUTCDay();
+    const rank = holiday?.rank ?? DOW_RANK[dow];
+    const reason = holiday?.name ?? DOW_REASON[dow];
+
+    await prisma.dateRanking.create({
+      data: {
+        date: d,
+        rank,
+        reason,
+        isManual: false,
+      },
+    });
+    newRankings++;
+    if (newRankings % 100 === 0) {
+      // eslint-disable-next-line no-console
+      console.log(`  …已创建 ${newRankings} 个日期等级`);
+    }
+  }
+
   // eslint-disable-next-line no-console
   console.log('✅ seed 完成', {
     admin: admin.email,
@@ -269,6 +347,7 @@ async function main() {
     '3级代理(父=2级)': agent3User.email,
     航班: FLIGHT_SEED.map((f) => `${f.flightNumber} (${f.origin}→${f.dest})`).join(', '),
     新增班次: newSchedules,
+    新增日期等级: newRankings,
     清理旧航班: removedFlights,
     开发密码: password,
   });

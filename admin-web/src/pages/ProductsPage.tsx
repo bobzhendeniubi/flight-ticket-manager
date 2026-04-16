@@ -169,6 +169,7 @@ function NewHotelForm({
             rating: 4.5,
             reviewCount: 0,
             emoji: '🏨',
+            photo: 'https://images.unsplash.com/photo-1566073771259-6a8506099945?w=600&h=400&fit=crop',
             amenities: ['免费 WiFi', '含早餐'],
             highlight: '新增酒店（demo）',
           });
@@ -239,6 +240,7 @@ function TransfersSection({ items, onChange }: { items: MockTransfer[]; onChange
               originArea: '岘港机场 (DAD)',
               destArea: '美溪海滩',
               emoji: '🚗',
+              photo: 'https://images.unsplash.com/photo-1549317661-bd32c8ce0afa?w=600&h=400&fit=crop',
               features: ['含中文司机'],
               duration: '约 15 分钟',
             },

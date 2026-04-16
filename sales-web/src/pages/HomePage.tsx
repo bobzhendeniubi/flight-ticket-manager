@@ -266,7 +266,8 @@ function FlightCard({
 }) {
   const minPrice = flight.seatClasses
     .filter((c) => c.available >= passengers)
-    .reduce((m, c) => (m === null || Number(c.basePrice) < m ? Number(c.basePrice) : m), null as number | null);
+    .reduce((m, c) => (m === null || Number(c.dynamicPrice) < m ? Number(c.dynamicPrice) : m), null as number | null);
+  const dateRank = flight.seatClasses[0]?.dateRank ?? 'C';
 
   return (
     <article className="card hover:shadow-md transition">
@@ -305,12 +306,17 @@ function FlightCard({
         </div>
 
         <div className="ml-auto text-right">
+          <span className={`rounded px-1.5 py-0.5 text-xs font-bold mr-1 ${
+            dateRank === 'A' ? 'bg-red-100 text-red-700' :
+            dateRank === 'B' ? 'bg-amber-100 text-amber-700' :
+            dateRank === 'C' ? 'bg-blue-100 text-blue-700' : 'bg-green-100 text-green-700'
+          }`}>{dateRank}</span>
           {minPrice !== null && (
-            <div className="text-lg font-semibold text-red-600">
+            <div className="mt-1 text-lg font-semibold text-red-600">
               ¥{minPrice.toFixed(0)} <span className="text-xs text-slate-500 font-normal">起</span>
             </div>
           )}
-          <div className="mt-2 text-xs text-slate-500">↓ 选舱位加入购物车</div>
+          <div className="mt-1 text-xs text-slate-500">↓ 选舱位加入购物车</div>
         </div>
       </div>
 
@@ -350,25 +356,34 @@ function FlightSeatCard({
     >
       <div className="flex items-center justify-between">
         <span className="font-medium text-slate-700">{CABIN_LABEL[cabin.cabin] ?? cabin.cabin}</span>
-        <span className="font-semibold text-slate-900">¥{Number(cabin.basePrice).toFixed(0)}</span>
+        <div className="text-right">
+          {Number(cabin.dynamicPrice) !== Number(cabin.basePrice) && (
+            <span className="text-xs text-slate-400 line-through mr-1">¥{Number(cabin.basePrice).toFixed(0)}</span>
+          )}
+          <span className="font-semibold text-red-600">¥{Number(cabin.dynamicPrice).toFixed(0)}</span>
+        </div>
       </div>
       <div className="mt-1 text-xs text-slate-500">余票 {cabin.available} / {cabin.capacity}</div>
       <button
         className="btn-primary mt-2 w-full text-xs py-1"
         disabled={!enough}
         onClick={() => {
+          // 使用 totalForQty 精确总价（服务端 per-seat 累加），避免 round(avg)*qty 造成 1-2 元舍入差
           add({
             kind: 'FLIGHT',
             productId: flight.scheduleId,
-            name: `${flight.flightNumber} ${flight.originCode}→${flight.destinationCode} · ${CABIN_LABEL[cabin.cabin]}`,
+            name: `${flight.flightNumber} ${flight.originCode}→${flight.destinationCode} · ${CABIN_LABEL[cabin.cabin]} × ${passengers}`,
             description: `${formatLocalDate(flight.departureTime, flight.departureTz)} ${formatLocalTime(flight.departureTime, flight.departureTz)}`,
             emoji: '✈️',
-            unitPrice: Number(cabin.basePrice),
-            qty: passengers,
+            unitPrice: cabin.totalForQty,
+            qty: 1, // 用 qty=1 + unitPrice=totalForQty 保证精确金额
             meta: {
               departureTime: flight.departureTime,
               cabin: cabin.cabin,
               passengers,
+              dateRank: cabin.dateRank,
+              basePrice: Number(cabin.basePrice),
+              totalForQty: cabin.totalForQty,
             },
           });
         }}

@@ -80,6 +80,10 @@ export interface FlightSeatAvailability {
   sold: number;
   available: number;
   basePrice: string;
+  dynamicPrice: string;
+  dateRank: string;
+  dateMultiplier: number;
+  totalForQty: number;
 }
 
 export interface FlightSearchResult {

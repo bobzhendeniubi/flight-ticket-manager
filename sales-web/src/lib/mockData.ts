@@ -16,6 +16,7 @@ export interface MockHotel {
   rating: number;
   reviewCount: number;
   emoji: string;
+  photo: string;
   amenities: string[];
   highlight: string;
 }
@@ -32,6 +33,7 @@ export const MOCK_HOTELS: MockHotel[] = [
     rating: 4.9,
     reviewCount: 2891,
     emoji: '🏝️',
+    photo: 'https://images.unsplash.com/photo-1582719508461-905c673771fd?w=600&h=400&fit=crop',
     amenities: ['私人海滩', '全海景别墅', '3 个无边泳池', '含自助早餐', '免费班车', 'SPA'],
     highlight: '全别墅式私密度假，The Nam Hai 独家 1km 海岸线',
   },
@@ -46,6 +48,7 @@ export const MOCK_HOTELS: MockHotel[] = [
     rating: 4.9,
     reviewCount: 3421,
     emoji: '🌊',
+    photo: 'https://images.unsplash.com/photo-1520250497591-112f2f40a3f4?w=600&h=400&fit=crop',
     amenities: ['私人海湾', '缆车', '米其林餐厅 La Maison 1888', '日落无敌海景', '豪华 SPA'],
     highlight: 'Bill Bensley 设计，山茶半岛独占海湾，明星度假首选',
   },
@@ -60,6 +63,7 @@ export const MOCK_HOTELS: MockHotel[] = [
     rating: 4.7,
     reviewCount: 4215,
     emoji: '🏖️',
+    photo: 'https://images.unsplash.com/photo-1571896349842-33c89424de2d?w=600&h=400&fit=crop',
     amenities: ['5 个泳池', '直通海滩', '儿童俱乐部', '含早餐', '免费机场班车'],
     highlight: '美溪海滩热门家庭首选，亲子设施完善',
   },
@@ -74,6 +78,7 @@ export const MOCK_HOTELS: MockHotel[] = [
     rating: 4.6,
     reviewCount: 2103,
     emoji: '🏖️',
+    photo: 'https://images.unsplash.com/photo-1564501049412-61c2a3083791?w=600&h=400&fit=crop',
     amenities: ['私人沙滩', '无边泳池', '含早餐', '水上运动', '健身房'],
     highlight: '法式度假风，步行 3 分钟到美溪海滩',
   },
@@ -88,6 +93,7 @@ export const MOCK_HOTELS: MockHotel[] = [
     rating: 4.8,
     reviewCount: 1576,
     emoji: '💆',
+    photo: 'https://images.unsplash.com/photo-1540541338287-41700207dee6?w=600&h=400&fit=crop',
     amenities: ['每日 2 次 SPA 免费', '私人泳池别墅', '养生健康餐', '瑜伽课程'],
     highlight: '全别墅 All-SPA-Inclusive，越南养生度假代表',
   },
@@ -102,6 +108,7 @@ export const MOCK_HOTELS: MockHotel[] = [
     rating: 4.5,
     reviewCount: 1890,
     emoji: '🌅',
+    photo: 'https://images.unsplash.com/photo-1566073771259-6a8506099945?w=600&h=400&fit=crop',
     amenities: ['海滩直通', '泳池', '健身房', '含早餐'],
     highlight: '性价比之选，美溪核心段，离酒吧街 5 分钟',
   },
@@ -116,6 +123,7 @@ export const MOCK_HOTELS: MockHotel[] = [
     rating: 4.7,
     reviewCount: 1104,
     emoji: '🌴',
+    photo: 'https://images.unsplash.com/photo-1578683010236-d716f9a3f461?w=600&h=400&fit=crop',
     amenities: ['私人海滩', '全日 SPA 免费', '瑜伽', '含早餐'],
     highlight: '岘港-会安黄金地段，15 分钟到会安古城',
   },
@@ -130,6 +138,7 @@ export const MOCK_HOTELS: MockHotel[] = [
     rating: 4.4,
     reviewCount: 876,
     emoji: '🏙️',
+    photo: 'https://images.unsplash.com/photo-1551882547-ff40c63fe5fa?w=600&h=400&fit=crop',
     amenities: ['厨房 / 洗衣机', '韩江景观', '免费 WiFi', '靠近龙桥'],
     highlight: '市区公寓式酒店，适合长住和家庭，近龙桥',
   },
@@ -144,6 +153,7 @@ export const MOCK_HOTELS: MockHotel[] = [
     rating: 4.8,
     reviewCount: 932,
     emoji: '🧘',
+    photo: 'https://images.unsplash.com/photo-1600596542815-ffad4c1539a9?w=600&h=400&fit=crop',
     amenities: ['全日 SPA 免费', '私人泳池别墅', '养生餐', '禅修花园'],
     highlight: '越南顶级 Wellness 概念，每日 2 次免费 SPA',
   },
@@ -158,6 +168,7 @@ export const MOCK_HOTELS: MockHotel[] = [
     rating: 4.7,
     reviewCount: 2104,
     emoji: '⭐',
+    photo: 'https://images.unsplash.com/photo-1542314831-068cd1dbfeeb?w=600&h=400&fit=crop',
     amenities: ['250m 海岸线', '5 个泳池', '万豪会员积分', '含早餐'],
     highlight: '万豪集团旗下，会员积分 + 升房稳定',
   },
@@ -172,6 +183,7 @@ export const MOCK_HOTELS: MockHotel[] = [
     rating: 4.6,
     reviewCount: 1843,
     emoji: '🌺',
+    photo: 'https://images.unsplash.com/photo-1584132967334-10e028bd69f7?w=600&h=400&fit=crop',
     amenities: ['私人沙滩', '免费班车去 Vinpearl Land', '亲子俱乐部'],
     highlight: '越南本土豪牌 Vingroup，含 Vinpearl Land 主题公园门票',
   },
@@ -186,6 +198,7 @@ export const MOCK_HOTELS: MockHotel[] = [
     rating: 4.8,
     reviewCount: 1267,
     emoji: '🏯',
+    photo: 'https://images.unsplash.com/photo-1596178065887-1198b6148b2b?w=600&h=400&fit=crop',
     amenities: ['秋盆河景', '步行 10 分钟到古城', 'SPA', '含早餐'],
     highlight: '安岚集团 · 古城唯一河景五星，灯笼之夜步行可达',
   },
@@ -201,6 +214,7 @@ export interface MockTransfer {
   originArea: string;
   destArea: string;
   emoji: string;
+  photo: string;
   features: string[];
   duration: string;
 }
@@ -215,6 +229,7 @@ export const MOCK_TRANSFERS: MockTransfer[] = [
     originArea: '岘港机场 (DAD)',
     destArea: '美溪海滩 / 市区任一酒店',
     emoji: '🚗',
+    photo: 'https://images.unsplash.com/photo-1549317661-bd32c8ce0afa?w=600&h=400&fit=crop',
     features: ['含中文司机', '免费等候 60 分钟', '含儿童安全座椅', '矿泉水'],
     duration: '约 15 分钟',
   },
@@ -227,6 +242,7 @@ export const MOCK_TRANSFERS: MockTransfer[] = [
     originArea: '岘港机场 (DAD)',
     destArea: '美溪海滩 / 山茶半岛 / 市区',
     emoji: '🚐',
+    photo: 'https://images.unsplash.com/photo-1544620347-c4fd4a3d5957?w=600&h=400&fit=crop',
     features: ['家庭首选', '6 大件行李空间', '中文司机', '免费等候 60 分钟'],
     duration: '约 15–30 分钟',
   },
@@ -239,6 +255,7 @@ export const MOCK_TRANSFERS: MockTransfer[] = [
     originArea: '岘港酒店',
     destArea: '会安古城',
     emoji: '🏮',
+    photo: 'https://images.unsplash.com/photo-1519641471654-76ce0107ad1b?w=600&h=400&fit=crop',
     features: ['单程约 45 分钟', '可中途停美溪海滩拍照', '含中文司机'],
     duration: '约 45 分钟',
   },
@@ -251,6 +268,7 @@ export const MOCK_TRANSFERS: MockTransfer[] = [
     originArea: '岘港酒店',
     destArea: '巴拿山法国小镇 + 佛手黄金桥',
     emoji: '🌉',
+    photo: 'https://images.unsplash.com/photo-1506905925346-21bda4d32df4?w=600&h=400&fit=crop',
     features: ['8 小时包车', '含门票预订代购', '含中文司机', '可加购法式小镇午餐'],
     duration: '单程约 40 分钟',
   },
@@ -263,6 +281,7 @@ export const MOCK_TRANSFERS: MockTransfer[] = [
     originArea: '岘港酒店',
     destArea: '海云岭 → 顺化皇城 → 返回',
     emoji: '🏯',
+    photo: 'https://images.unsplash.com/photo-1469854523086-cc02fe5d8800?w=600&h=400&fit=crop',
     features: ['途经海云岭观景台', '包含顺化景点解说', '10 小时包车', '中文司机'],
     duration: '全程约 10 小时',
   },
@@ -275,6 +294,7 @@ export const MOCK_TRANSFERS: MockTransfer[] = [
     originArea: '岘港酒店',
     destArea: '美山遗址（UNESCO）→ 返回',
     emoji: '🛕',
+    photo: 'https://images.unsplash.com/photo-1545569341-9eb8b30979d9?w=600&h=400&fit=crop',
     features: ['UNESCO 占婆遗址', '5 小时包车', '中文司机', '含矿泉水'],
     duration: '约 5 小时',
   },
@@ -287,6 +307,7 @@ export const MOCK_TRANSFERS: MockTransfer[] = [
     originArea: '岘港酒店',
     destArea: '龙桥 → 韩江夜景 → 山茶半岛灵应寺',
     emoji: '🌃',
+    photo: 'https://images.unsplash.com/photo-1514282401047-d79a71a590e8?w=600&h=400&fit=crop',
     features: ['4 小时包车', '含中文导游', '龙桥喷火表演（周末）'],
     duration: '约 4 小时',
   },
@@ -299,6 +320,7 @@ export const MOCK_TRANSFERS: MockTransfer[] = [
     originArea: '岘港酒店',
     destArea: '岘港湾外海',
     emoji: '🎣',
+    photo: 'https://images.unsplash.com/photo-1544551763-46a013bb70d5?w=600&h=400&fit=crop',
     features: ['含钓具/船餐/啤酒', '渔夫教学', '英文+中文船长'],
     duration: '约 5 小时',
   },

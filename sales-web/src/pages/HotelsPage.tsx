@@ -88,7 +88,7 @@ export function HotelsPage() {
           {filtered.map((h) => (
             <article key={h.id} className="card hover:shadow-md transition cursor-pointer" onClick={() => setSelected(h)}>
               <div className="flex items-start justify-between">
-                <div className="text-4xl">{h.emoji}</div>
+                <img src={h.photo} alt={h.name} className="w-full h-36 object-cover rounded-md" onError={(e) => { e.currentTarget.style.display = 'none'; }} />
                 <span className="rounded bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-700">
                   {'★'.repeat(h.stars)}
                 </span>

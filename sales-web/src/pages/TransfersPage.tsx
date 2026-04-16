@@ -61,7 +61,7 @@ export function TransfersPage() {
         <div className="space-y-3">
           {MOCK_TRANSFERS.filter((t) => t.capacity >= passengers).map((t) => (
             <article key={t.id} className="card flex items-center gap-6 hover:shadow-md transition">
-              <div className="text-5xl">{t.emoji}</div>
+              <img src={t.photo} alt={t.name} className="w-28 h-20 object-cover rounded-md flex-shrink-0" onError={(e) => { e.currentTarget.outerHTML = `<div class="text-5xl">${t.emoji}</div>`; }} />
               <div className="flex-1 min-w-0">
                 <h3 className="font-semibold text-slate-900">{t.name}</h3>
                 <p className="mt-1 text-sm text-slate-600">{t.vehicleType}</p>
