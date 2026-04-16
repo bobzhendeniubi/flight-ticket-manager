@@ -6,6 +6,7 @@ import { OrdersPage } from './pages/OrdersPage';
 import { FlightsPage } from './pages/FlightsPage';
 import { SeatStatsPage } from './pages/SeatStatsPage';
 import { SeatAllocationPage } from './pages/SeatAllocationPage';
+import { ProductsPage } from './pages/ProductsPage';
 import { PricingPage } from './pages/PricingPage';
 import { AgentsPage } from './pages/AgentsPage';
 import { useAuth } from './stores/auth';
@@ -66,6 +67,14 @@ export function App() {
           element={
             <Protected>
               <SeatAllocationPage />
+            </Protected>
+          }
+        />
+        <Route
+          path="/products"
+          element={
+            <Protected>
+              <ProductsPage />
             </Protected>
           }
         />

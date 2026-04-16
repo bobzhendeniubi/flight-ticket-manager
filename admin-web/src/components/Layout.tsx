@@ -14,6 +14,7 @@ const NAV = [
   { to: '/flights', label: '航班管理' },
   { to: '/seat-stats', label: '座位统计' },
   { to: '/seat-allocation', label: '切位（包位）' },
+  { to: '/products', label: '产品管理' },
   { to: '/pricing', label: '动态定价' },
   { to: '/agents', label: '代理管理' },
 ];

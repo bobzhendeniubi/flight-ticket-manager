@@ -27,8 +27,8 @@ function mockSchedules(): PricingSchedule[] {
     return {
       id: `${flight}-${offset}`,
       flightNumber: flight,
-      origin: flight === 'QH9588' ? 'PEK' : 'PVG',
-      dest: flight === 'QH9588' ? 'PVG' : 'PEK',
+      origin: flight === 'QH9588' ? 'DAD' : 'MFM',
+      dest: flight === 'QH9588' ? 'MFM' : 'DAD',
       date: d.toISOString().slice(0, 10),
       basePrice: base,
       currentTier: tier,

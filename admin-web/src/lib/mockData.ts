@@ -579,6 +579,124 @@ export const DASHBOARD_WEEKLY: Array<{ date: string; revenue: number; orders: nu
   { date: '04-15', revenue: 148540, orders: 52 },
 ];
 
+// ── 套餐 / Bundle (M3 后台产品管理) ─────────────────────────────────
+export type BundleItemKind = 'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA';
+
+export interface BundleItem {
+  kind: BundleItemKind;
+  /** 显示用名称；真接 API 后改为 productId 引用 */
+  productName: string;
+  /** 数量或晚数 */
+  qty: number;
+  /** 单价，¥ */
+  unitPrice: number;
+}
+
+export interface MockBundle {
+  id: string;
+  name: string;
+  tagline: string;
+  emoji: string;
+  /** 含哪些产品 */
+  items: BundleItem[];
+  /** 单卖总价（计算自 items） */
+  listPrice: number;
+  /** 套餐价（已让利） */
+  bundlePrice: number;
+  /** 适合人数 */
+  suitableFor: string;
+  /** 当前状态 */
+  active: boolean;
+}
+
+function sumItems(items: BundleItem[]): number {
+  return items.reduce((s, i) => s + i.unitPrice * i.qty, 0);
+}
+
+export const MOCK_BUNDLES: MockBundle[] = [
+  (() => {
+    const items: BundleItem[] = [
+      { kind: 'FLIGHT', productName: 'QH9588/9589 来回机票（经济舱）', qty: 2, unitPrice: 2860 },
+      { kind: 'HOTEL', productName: '岘港凯悦度假村 美溪海景房', qty: 3, unitPrice: 1880 },
+      { kind: 'TRANSFER', productName: '岘港机场接送（来回 7 座商务车）', qty: 2, unitPrice: 188 },
+    ];
+    const list = sumItems(items);
+    return {
+      id: 'b1',
+      name: '岘港 4 天 3 晚 · 经典度假',
+      tagline: '机票 + 凯悦海景 3 晚 + 来回接送，最热销组合',
+      emoji: '🏖️',
+      items,
+      listPrice: list,
+      bundlePrice: list - 660,
+      suitableFor: '2 大人 · 情侣/家庭',
+      active: true,
+    };
+  })(),
+  (() => {
+    const items: BundleItem[] = [
+      { kind: 'FLIGHT', productName: 'QH9588/9589 来回机票（经济舱）', qty: 2, unitPrice: 2860 },
+      { kind: 'HOTEL', productName: '岘港洲际半岛度假村 山景房', qty: 4, unitPrice: 3680 },
+      { kind: 'TRANSFER', productName: '岘港机场接送（豪华轿车 来回）', qty: 2, unitPrice: 388 },
+      { kind: 'TRANSFER', productName: '巴拿山 1 日包车', qty: 1, unitPrice: 588 },
+      { kind: 'VISA', productName: '越南 E-visa 30 天 × 2', qty: 2, unitPrice: 280 },
+    ];
+    const list = sumItems(items);
+    return {
+      id: 'b2',
+      name: '岘港 5 天 4 晚 · 蜜月豪华',
+      tagline: '洲际半岛 + 巴拿山佛手桥 + 签证全包，一价全含',
+      emoji: '💍',
+      items,
+      listPrice: list,
+      bundlePrice: list - 1880,
+      suitableFor: '2 大人 · 蜜月/纪念日',
+      active: true,
+    };
+  })(),
+  (() => {
+    const items: BundleItem[] = [
+      { kind: 'FLIGHT', productName: 'QH9588/9589 来回机票（商务舱）', qty: 1, unitPrice: 8660 },
+      { kind: 'HOTEL', productName: '馨乐庭蓝湾公寓 市区 1 晚', qty: 1, unitPrice: 580 },
+      { kind: 'TRANSFER', productName: '岘港机场接送（豪华轿车 来回）', qty: 2, unitPrice: 388 },
+      { kind: 'VISA', productName: '越南落地签批文', qty: 1, unitPrice: 180 },
+    ];
+    const list = sumItems(items);
+    return {
+      id: 'b3',
+      name: '岘港商务快闪 2 天',
+      tagline: '商务舱来回 + 市区公寓 + 签证 + 接送，48 小时往返',
+      emoji: '💼',
+      items,
+      listPrice: list,
+      bundlePrice: list - 380,
+      suitableFor: '1 商务客',
+      active: true,
+    };
+  })(),
+  (() => {
+    const items: BundleItem[] = [
+      { kind: 'FLIGHT', productName: 'QH9588/9589 来回机票（经济舱）', qty: 4, unitPrice: 2860 },
+      { kind: 'HOTEL', productName: '岘港太阳豪庭度假村 双房 4 晚', qty: 4, unitPrice: 1760 },
+      { kind: 'TRANSFER', productName: '岘港机场接送（7 座商务车 来回）', qty: 2, unitPrice: 188 },
+      { kind: 'TRANSFER', productName: '会安古城 1 日包车', qty: 1, unitPrice: 248 },
+      { kind: 'VISA', productName: '越南 E-visa 30 天 × 4', qty: 4, unitPrice: 280 },
+    ];
+    const list = sumItems(items);
+    return {
+      id: 'b4',
+      name: '岘港亲子 5 天 4 晚（4 大）',
+      tagline: '4 人成行 + 会安古城 + 签证全办，亲子家庭首选',
+      emoji: '👨‍👩‍👧‍👦',
+      items,
+      listPrice: list,
+      bundlePrice: list - 2400,
+      suitableFor: '4 大人 · 全家出游',
+      active: true,
+    };
+  })(),
+];
+
 // ── 岘港景点亮点（首页展示） ─────────────────────────────────────
 export interface DanangHighlight {
   emoji: string;

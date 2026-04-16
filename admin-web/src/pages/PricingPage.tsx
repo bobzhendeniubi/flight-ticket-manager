@@ -1,73 +1,128 @@
-import { useMemo, useState } from 'react';
+/**
+ * 动态定价 — 拉真后端的 QH9588/QH9589 班次，叠加本地 mock 的等级倍率 + ML 需求。
+ * 业务背景：港澳→岘港，定价基础是 FlightSeatClass.basePrice。
+ */
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { api, type AdminFlight, type AdminSchedule } from '../lib/api';
 import { DEFAULT_TIERS, generatePriceHistory } from '../lib/mockData';
-import { airportLabel } from '../lib/airports';
+import { airportLabel, formatLocalDate } from '../lib/airports';
+import { useAuth } from '../stores/auth';
 
 interface PricingSchedule {
   id: string;
   flightNumber: string;
   origin: string;
   dest: string;
-  date: string;
-  basePrice: number;
+  date: string; // 出发本地日期
+  basePrice: number; // 经济舱基础价
   currentMultiplier: number;
   currentTier: 'A' | 'B' | 'C' | 'D';
   loadFactor: number;
   mlDemand: number;
 }
 
-// Mock 出几个未来班次
-function mockSchedules(): PricingSchedule[] {
-  const today = new Date();
-  const mk = (offset: number, flight: 'QH9588' | 'QH9589', base: number): PricingSchedule => {
-    const d = new Date(today);
-    d.setDate(d.getDate() + offset);
-    const dow = d.getDay();
-    const tier: PricingSchedule['currentTier'] = dow === 5 || dow === 0 ? 'B' : dow === 6 ? 'A' : 'C';
-    const multMap = { A: 1.5, B: 1.2, C: 1.0, D: 0.8 };
-    return {
-      id: `${flight}-${offset}`,
-      flightNumber: flight,
-      origin: flight === 'QH9588' ? 'PEK' : 'PVG',
-      dest: flight === 'QH9588' ? 'PVG' : 'PEK',
-      date: d.toISOString().slice(0, 10),
-      basePrice: base,
-      currentTier: tier,
-      currentMultiplier: multMap[tier],
-      loadFactor: 0.35 + (offset % 5) * 0.12,
-      mlDemand: 1 + (Math.sin(offset) * 0.15 + 0.05),
-    };
-  };
-  const out: PricingSchedule[] = [];
-  for (let i = 1; i <= 7; i++) {
-    out.push(mk(i, 'QH9588', 1180));
-    out.push(mk(i, 'QH9589', 1280));
-  }
-  return out;
+const TIER_MULT = { A: 1.5, B: 1.2, C: 1.0, D: 0.8 } as const;
+
+/** 简单的 demo 等级规则：周末/周一为高峰，工作日为平峰 */
+function pickTier(date: Date, offset: number): 'A' | 'B' | 'C' | 'D' {
+  const dow = date.getDay(); // 0=Sun
+  if (offset === 0 || offset === 7) return 'A'; // 模拟"今天/下周同一天"是节假日
+  if (dow === 5 || dow === 0) return 'B';
+  if (dow === 6 || dow === 1) return 'C';
+  return 'D';
 }
 
 export function PricingPage() {
-  const [schedules] = useState<PricingSchedule[]>(mockSchedules());
-  const [selectedId, setSelectedId] = useState<string>(schedules[0]?.id ?? '');
-  const selected = schedules.find((s) => s.id === selectedId) ?? schedules[0];
-
+  const tokens = useAuth((s) => s.tokens);
+  const [schedules, setSchedules] = useState<PricingSchedule[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState<string>('');
   const [tiers, setTiers] = useState(DEFAULT_TIERS);
   const [savedAt, setSavedAt] = useState<string | null>(null);
 
+  const load = useCallback(async () => {
+    if (!tokens) {
+      setLoading(false);
+      return;
+    }
+    try {
+      const r = await api.listAllFlights(tokens.accessToken);
+      const allSchedules: PricingSchedule[] = [];
+      const now = Date.now();
+      const horizon = now + 7 * 86400000; // 未来 7 天
+      await Promise.all(
+        r.flights.map(async (f: AdminFlight) => {
+          const s = await api.listSchedules(tokens.accessToken, f.id);
+          for (const sch of s.schedules as AdminSchedule[]) {
+            const t = new Date(sch.departureTime).getTime();
+            if (t < now || t > horizon) continue;
+            const econ = sch.seatClasses.find((c) => c.cabin === 'ECONOMY');
+            if (!econ) continue;
+            const totalCap = sch.seatClasses.reduce((sum, c) => sum + c.capacity, 0);
+            const totalSold = sch.seatClasses.reduce((sum, c) => sum + c.sold, 0);
+            const offset = Math.round((t - now) / 86400000);
+            const tier = pickTier(new Date(sch.departureTime), offset);
+            allSchedules.push({
+              id: sch.id,
+              flightNumber: f.flightNumber,
+              origin: f.originCode,
+              dest: f.destinationCode,
+              date: formatLocalDate(sch.departureTime, sch.departureTz),
+              basePrice: Number(econ.basePrice),
+              currentTier: tier,
+              currentMultiplier: TIER_MULT[tier],
+              loadFactor: totalCap > 0 ? totalSold / totalCap : 0,
+              mlDemand: 1 + Math.sin(offset) * 0.15 + 0.05,
+            });
+          }
+        }),
+      );
+      allSchedules.sort((a, b) => a.date.localeCompare(b.date));
+      setSchedules(allSchedules);
+      // 只在「还没选中」或「之前选中的不在新列表里」时，才回退到第一条
+      setSelectedId((prev) => {
+        if (allSchedules.length === 0) return '';
+        if (prev && allSchedules.some((s) => s.id === prev)) return prev;
+        return allSchedules[0].id;
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '加载失败');
+    } finally {
+      setLoading(false);
+    }
+  }, [tokens]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  // 严格按 selectedId 找；找不到不要静默 fallback，避免左侧高亮和右侧详情不同步
+  const selected = schedules.find((s) => s.id === selectedId) ?? null;
   const history = useMemo(
     () => (selected ? generatePriceHistory(selected.basePrice) : []),
     [selected],
   );
 
-  if (!selected) return <div className="card text-slate-500">没有待定价的班次</div>;
+  if (error) return <div className="card border-red-200 bg-red-50 text-red-700">{error}</div>;
+  if (loading) return <div className="card text-slate-500">加载中…</div>;
+  if (schedules.length === 0) return <div className="card text-slate-500">未来 7 天没有班次</div>;
+  if (!selected) {
+    return (
+      <div className="card text-slate-500">
+        请从左侧列表选择一个班次查看定价配置
+      </div>
+    );
+  }
 
   const finalPrice = Math.round(selected.basePrice * selected.currentMultiplier * selected.mlDemand);
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-5">
       <section>
         <h1 className="text-2xl font-bold text-slate-900">动态定价</h1>
         <p className="mt-1 text-sm text-slate-600">
-          基于时段 / 上座率 / ML 需求预测的 ABCD 等级定价引擎。支持手工覆盖单班次倍率。
+          基于时段 / 上座率 / ML 需求预测的 ABCD 等级定价引擎。当前 demo 数据：QH9588/9589 未来 7 天班次。
         </p>
       </section>
 
@@ -75,7 +130,7 @@ export function PricingPage() {
         {/* 班次列表 */}
         <div className="card p-0 overflow-hidden">
           <div className="border-b border-slate-200 bg-slate-50 px-4 py-3 text-xs font-medium uppercase text-slate-500">
-            未来 7 天班次
+            未来 7 天班次（{schedules.length} 个）
           </div>
           <ul className="divide-y divide-slate-100 max-h-[560px] overflow-auto">
             {schedules.map((s) => {
@@ -139,13 +194,9 @@ export function PricingPage() {
               <Metric
                 label="ML 需求预测"
                 value={`×${selected.mlDemand.toFixed(3)}`}
-                sub="Prophet 模型 · 昨晚更新"
+                sub="Prophet 模型 · mock"
               />
-              <Metric
-                label="最终售价"
-                value={`¥${finalPrice}`}
-                sub={`基础 × 等级 × 需求`}
-              />
+              <Metric label="最终售价" value={`¥${finalPrice}`} sub="基础 × 等级 × 需求" />
             </div>
           </div>
 
@@ -155,20 +206,18 @@ export function PricingPage() {
               <h3 className="font-semibold text-slate-900">ABCD 等级配置</h3>
               <button
                 className="btn-primary text-sm"
-                onClick={() => {
-                  setSavedAt(new Date().toLocaleTimeString('zh-CN'));
-                }}
+                onClick={() => setSavedAt(new Date().toLocaleTimeString('zh-CN'))}
               >
                 保存调整
               </button>
             </div>
-            <p className="mt-1 text-xs text-slate-500">拖动倍率调节各等级的加价幅度，保存后对后续班次立即生效。</p>
+            <p className="mt-1 text-xs text-slate-500">
+              拖动倍率调节各等级的加价幅度，保存后对后续班次立即生效。
+            </p>
             <div className="mt-4 space-y-4">
               {tiers.map((t, idx) => (
                 <div key={t.tier} className="grid grid-cols-[auto_1fr_auto] items-center gap-4">
-                  <span className={`rounded px-2 py-1 text-sm font-bold ${tierBadgeColor(t.tier)}`}>
-                    {t.tier}
-                  </span>
+                  <span className={`rounded px-2 py-1 text-sm font-bold ${tierBadgeColor(t.tier)}`}>{t.tier}</span>
                   <div>
                     <div className="font-medium text-slate-900">{t.label}</div>
                     <div className="text-xs text-slate-500">{t.description}</div>
@@ -196,7 +245,7 @@ export function PricingPage() {
             </div>
             {savedAt && (
               <div className="mt-4 rounded-md bg-green-50 px-3 py-2 text-sm text-green-700">
-                ✅ 已保存（demo）· {savedAt}
+                ✅ 已保存（demo） · {savedAt}
               </div>
             )}
           </div>
@@ -248,26 +297,18 @@ function Metric({ label, value, sub }: { label: string; value: React.ReactNode; 
 
 function tierBadgeColor(tier: 'A' | 'B' | 'C' | 'D') {
   switch (tier) {
-    case 'A':
-      return 'bg-red-100 text-red-700';
-    case 'B':
-      return 'bg-amber-100 text-amber-700';
-    case 'C':
-      return 'bg-blue-100 text-blue-700';
-    case 'D':
-      return 'bg-green-100 text-green-700';
+    case 'A': return 'bg-red-100 text-red-700';
+    case 'B': return 'bg-amber-100 text-amber-700';
+    case 'C': return 'bg-blue-100 text-blue-700';
+    case 'D': return 'bg-green-100 text-green-700';
   }
 }
 
 function tierBarColor(tier: 'A' | 'B' | 'C' | 'D') {
   switch (tier) {
-    case 'A':
-      return 'bg-red-400';
-    case 'B':
-      return 'bg-amber-400';
-    case 'C':
-      return 'bg-blue-400';
-    case 'D':
-      return 'bg-green-400';
+    case 'A': return 'bg-red-400';
+    case 'B': return 'bg-amber-400';
+    case 'C': return 'bg-blue-400';
+    case 'D': return 'bg-green-400';
   }
 }

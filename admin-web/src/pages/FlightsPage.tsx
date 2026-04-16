@@ -293,9 +293,9 @@ function SchedulesList({
 function NewFlightForm({ onCancel, onCreated }: { onCancel: () => void; onCreated: () => void }) {
   const tokens = useAuth((s) => s.tokens);
   const [flightNumber, setFlightNumber] = useState('');
-  const [originCode, setOriginCode] = useState('PEK');
-  const [destinationCode, setDestinationCode] = useState('PVG');
-  const [aircraftType, setAircraftType] = useState('A320');
+  const [originCode, setOriginCode] = useState('DAD');
+  const [destinationCode, setDestinationCode] = useState('MFM');
+  const [aircraftType, setAircraftType] = useState('Airbus A321-211');
   const [err, setErr] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
