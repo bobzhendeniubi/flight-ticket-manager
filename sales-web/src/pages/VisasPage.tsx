@@ -1,5 +1,7 @@
 import { useMemo, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { MOCK_VISAS, type MockVisa } from '../lib/mockData';
+import { useCart } from '../stores/cart';
 
 export function VisasPage() {
   const [search, setSearch] = useState('');
@@ -91,9 +93,26 @@ export function VisasPage() {
 function VisaDetailModal({ visa, onClose }: { visa: MockVisa; onClose: () => void }) {
   const [express, setExpress] = useState(false);
   const [count, setCount] = useState(1);
-  const [submitted, setSubmitted] = useState(false);
+  const add = useCart((s) => s.add);
+  const navigate = useNavigate();
 
-  const total = (visa.basePrice + (express ? visa.expressSurcharge : 0)) * count;
+  const unitPrice = visa.basePrice + (express ? visa.expressSurcharge : 0);
+  const total = unitPrice * count;
+
+  const addToCart = (goCart: boolean) => {
+    add({
+      kind: 'VISA',
+      productId: visa.id + (express ? '-express' : ''),
+      name: `${visa.country} · ${visa.type}${express ? ' (加急)' : ''} × ${count}`,
+      description: `${visa.flag} ${express ? visa.processingDays - 2 : visa.processingDays} 天出签 · 有效期 ${visa.validityMonths} 个月`,
+      emoji: visa.flag,
+      unitPrice,
+      qty: count,
+      meta: { express, processingDays: express ? visa.processingDays - 2 : visa.processingDays },
+    });
+    onClose();
+    if (goCart) navigate('/cart');
+  };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" onClick={onClose}>
@@ -108,16 +127,7 @@ function VisaDetailModal({ visa, onClose }: { visa: MockVisa; onClose: () => voi
           <button className="text-slate-400 hover:text-slate-700 text-xl" onClick={onClose}>×</button>
         </div>
         <div className="px-6 py-5 space-y-4">
-          {submitted ? (
-            <div className="rounded-md bg-green-50 p-5 text-green-700">
-              <div className="text-2xl">✅</div>
-              <h3 className="mt-2 text-lg font-semibold">签证订单已创建（demo）</h3>
-              <p className="mt-1 text-sm">
-                请登录小程序或网页「我的订单」上传材料。预计 {express ? visa.processingDays - 2 : visa.processingDays} 天出签。
-              </p>
-              <button className="btn-secondary mt-4" onClick={onClose}>关闭</button>
-            </div>
-          ) : (
+          {(
             <>
               <div>
                 <h3 className="font-medium text-slate-900">所需材料</h3>
@@ -152,9 +162,8 @@ function VisaDetailModal({ visa, onClose }: { visa: MockVisa; onClose: () => voi
               </div>
               <div className="flex justify-end gap-3">
                 <button className="btn-secondary" onClick={onClose}>取消</button>
-                <button className="btn-primary" onClick={() => setSubmitted(true)}>
-                  创建订单
-                </button>
+                <button className="btn-secondary" onClick={() => addToCart(false)}>🛒 加入购物车</button>
+                <button className="btn-primary" onClick={() => addToCart(true)}>立即购买 →</button>
               </div>
             </>
           )}

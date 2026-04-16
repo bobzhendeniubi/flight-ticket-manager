@@ -1,5 +1,7 @@
+import { useEffect, useState } from 'react';
 import { Link, NavLink, Outlet, useNavigate } from 'react-router-dom';
 import { useAuth } from '../stores/auth';
+import { useCart } from '../stores/cart';
 
 const ROLE_LABEL: Record<string, string> = {
   CUSTOMER: '客户',
@@ -11,8 +13,9 @@ const ROLE_LABEL: Record<string, string> = {
 const frontNav = [
   { to: '/', label: '机票', exact: true },
   { to: '/hotels', label: '酒店' },
-  { to: '/transfers', label: '机场接送' },
+  { to: '/transfers', label: '接送' },
   { to: '/visas', label: '签证' },
+  { to: '/bundles', label: '套餐' },
 ];
 
 // 管理后台已拆分到 admin-web (:5174)。前台不再展示后台入口。
@@ -66,6 +69,7 @@ export function Layout() {
           </nav>
 
           <nav className="flex items-center gap-3 text-sm">
+            <CartButton />
             {user ? (
               <>
                 <Link to="/me" className="flex items-center gap-2 text-slate-700 hover:text-brand">
@@ -127,6 +131,49 @@ export function Layout() {
           机票管家 · M2-M5 演示版 · © {new Date().getFullYear()}
         </div>
       </footer>
+
+      <AddToCartToast />
+    </div>
+  );
+}
+
+/** 顶部购物车按钮 — 显示数量徽章，链到 /cart */
+function CartButton() {
+  const count = useCart((s) => s.items.reduce((sum, i) => sum + i.qty, 0));
+  return (
+    <Link
+      to="/cart"
+      className="relative inline-flex items-center gap-1 rounded-md border border-slate-200 px-3 py-1.5 text-slate-700 hover:border-brand hover:text-brand"
+    >
+      <span aria-hidden>🛒</span>
+      <span className="hidden md:inline">购物车</span>
+      {count > 0 && (
+        <span className="absolute -top-1.5 -right-1.5 inline-flex h-5 min-w-[20px] items-center justify-center rounded-full bg-red-500 px-1 text-[11px] font-bold text-white">
+          {count > 99 ? '99+' : count}
+        </span>
+      )}
+    </Link>
+  );
+}
+
+/** 加入购物车的飘字提示（监听 ftm-cart-add 事件） */
+function AddToCartToast() {
+  const [msg, setMsg] = useState<string | null>(null);
+  useEffect(() => {
+    const onAdd = (e: Event) => {
+      const detail = (e as CustomEvent<{ name: string }>).detail;
+      if (detail?.name) {
+        setMsg(`✅ 已加入购物车：${detail.name}`);
+        setTimeout(() => setMsg(null), 1800);
+      }
+    };
+    window.addEventListener('ftm-cart-add', onAdd);
+    return () => window.removeEventListener('ftm-cart-add', onAdd);
+  }, []);
+  if (!msg) return null;
+  return (
+    <div className="fixed bottom-6 right-6 z-50 rounded-md bg-slate-900 px-4 py-2 text-sm text-white shadow-lg">
+      {msg}
     </div>
   );
 }

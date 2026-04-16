@@ -1,5 +1,7 @@
 import { useMemo, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { MOCK_HOTELS, type MockHotel } from '../lib/mockData';
+import { useCart } from '../stores/cart';
 
 function todayISO(offsetDays = 0) {
   const d = new Date();
@@ -14,6 +16,8 @@ export function HotelsPage() {
   const [checkIn, setCheckIn] = useState(todayISO(3));
   const [checkOut, setCheckOut] = useState(todayISO(5));
   const [selected, setSelected] = useState<MockHotel | null>(null);
+  const add = useCart((s) => s.add);
+  const navigate = useNavigate();
 
   const filtered = useMemo(() => {
     return MOCK_HOTELS.filter((h) => {
@@ -122,7 +126,40 @@ export function HotelsPage() {
         )}
       </section>
 
-      {selected && <HotelDetailModal hotel={selected} nights={nights} onClose={() => setSelected(null)} />}
+      {selected && (
+        <HotelDetailModal
+          hotel={selected}
+          nights={nights}
+          onClose={() => setSelected(null)}
+          onAddToCart={() => {
+            add({
+              kind: 'HOTEL',
+              productId: selected.id,
+              name: `${selected.name} × ${nights} 晚`,
+              description: `${selected.area} · ${'★'.repeat(selected.stars)}`,
+              emoji: selected.emoji,
+              unitPrice: selected.basePrice * nights,
+              qty: 1,
+              meta: { checkIn, checkOut, nights },
+            });
+            setSelected(null);
+          }}
+          onBuyNow={() => {
+            add({
+              kind: 'HOTEL',
+              productId: selected.id,
+              name: `${selected.name} × ${nights} 晚`,
+              description: `${selected.area} · ${'★'.repeat(selected.stars)}`,
+              emoji: selected.emoji,
+              unitPrice: selected.basePrice * nights,
+              qty: 1,
+              meta: { checkIn, checkOut, nights },
+            });
+            setSelected(null);
+            navigate('/cart');
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -131,12 +168,15 @@ function HotelDetailModal({
   hotel,
   nights,
   onClose,
+  onAddToCart,
+  onBuyNow,
 }: {
   hotel: MockHotel;
   nights: number;
   onClose: () => void;
+  onAddToCart: () => void;
+  onBuyNow: () => void;
 }) {
-  const [booked, setBooked] = useState(false);
   const total = hotel.basePrice * nights;
 
   return (
@@ -154,17 +194,7 @@ function HotelDetailModal({
         </div>
 
         <div className="px-6 py-5 space-y-4">
-          {booked ? (
-            <div className="rounded-md bg-green-50 p-5 text-green-700">
-              <div className="text-2xl">✅</div>
-              <h3 className="mt-2 text-lg font-semibold">预订已提交（demo）</h3>
-              <p className="mt-1 text-sm">
-                订单号：FTM{Date.now().toString().slice(-10)}<br />
-                我们会在 10 分钟内发送确认短信到您的手机。
-              </p>
-              <button className="btn-secondary mt-4" onClick={onClose}>关闭</button>
-            </div>
-          ) : (
+          {(
             <>
               <div className="flex items-center gap-3">
                 <span className="rounded bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-700">
@@ -206,7 +236,8 @@ function HotelDetailModal({
               </div>
               <div className="flex justify-end gap-3">
                 <button className="btn-secondary" onClick={onClose}>取消</button>
-                <button className="btn-primary" onClick={() => setBooked(true)}>确认预订</button>
+                <button className="btn-secondary" onClick={onAddToCart}>🛒 加入购物车</button>
+                <button className="btn-primary" onClick={onBuyNow}>立即购买 →</button>
               </div>
             </>
           )}

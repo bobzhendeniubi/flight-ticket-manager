@@ -28,8 +28,8 @@ interface SeatAllocation {
 
 // 默认 demo 切位数据（每个班次都套用一份）
 const DEFAULT_ALLOCATIONS = (): SeatAllocation[] => [
-  { id: 'a1', agentName: '港澳岘港旅游总代', agentTier: 1, cabin: 'ECONOMY', allocated: 50, sold: 35, releaseAt: addDays(7) },
-  { id: 'a2', agentName: '港澳岘港旅游总代', agentTier: 1, cabin: 'BUSINESS', allocated: 8, sold: 5, releaseAt: addDays(7) },
+  { id: 'a1', agentName: '澳门岘港旅游总代', agentTier: 1, cabin: 'ECONOMY', allocated: 50, sold: 35, releaseAt: addDays(7) },
+  { id: 'a2', agentName: '澳门岘港旅游总代', agentTier: 1, cabin: 'BUSINESS', allocated: 8, sold: 5, releaseAt: addDays(7) },
   { id: 'a3', agentName: '澳门欢乐旅行社', agentTier: 2, cabin: 'ECONOMY', allocated: 30, sold: 28, releaseAt: addDays(5) },
   { id: 'a4', agentName: '澳门威尼斯人门店', agentTier: 3, cabin: 'ECONOMY', allocated: 20, sold: 12, releaseAt: addDays(3) },
 ];
@@ -45,7 +45,7 @@ function daysUntil(iso: string): number {
 }
 
 const DEMO_AGENTS = [
-  { name: '港澳岘港旅游总代', tier: 1 },
+  { name: '澳门岘港旅游总代', tier: 1 },
   { name: '澳门欢乐旅行社', tier: 2 },
   { name: '澳门威尼斯人门店', tier: 3 },
 ];

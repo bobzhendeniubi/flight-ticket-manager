@@ -1,5 +1,7 @@
 import { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { MOCK_TRANSFERS, type MockTransfer } from '../lib/mockData';
+import { useCart } from '../stores/cart';
 
 function todayISO(offsetDays = 0) {
   const d = new Date();
@@ -113,7 +115,23 @@ function BookModal(props: {
   onClose: () => void;
 }) {
   const { transfer, pickupAddress, pickupDate, pickupTime, passengers, onClose } = props;
-  const [booked, setBooked] = useState(false);
+  const add = useCart((s) => s.add);
+  const navigate = useNavigate();
+
+  const addToCart = (goCart: boolean) => {
+    add({
+      kind: 'TRANSFER',
+      productId: transfer.id,
+      name: transfer.name,
+      description: `${pickupDate} ${pickupTime} · ${pickupAddress} → ${transfer.destArea} · ${passengers} 人`,
+      emoji: transfer.emoji,
+      unitPrice: transfer.basePrice,
+      qty: 1,
+      meta: { pickupDate, pickupTime, passengers, destArea: transfer.destArea },
+    });
+    onClose();
+    if (goCart) navigate('/cart');
+  };
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" onClick={onClose}>
@@ -123,51 +141,37 @@ function BookModal(props: {
           <button className="text-slate-400 hover:text-slate-700 text-xl" onClick={onClose}>×</button>
         </div>
         <div className="px-6 py-5">
-          {booked ? (
-            <div className="rounded-md bg-green-50 p-5 text-green-700">
-              <div className="text-2xl">✅</div>
-              <h3 className="mt-2 text-lg font-semibold">用车已下单（demo）</h3>
-              <p className="mt-1 text-sm">
-                司机将于上车前 30 分钟联系您。订单号：FTM{Date.now().toString().slice(-10)}
-              </p>
-              <button className="btn-secondary mt-4" onClick={onClose}>关闭</button>
+          <dl className="space-y-2 text-sm">
+            <div className="flex justify-between">
+              <dt className="text-slate-600">车型</dt>
+              <dd className="text-slate-900">{transfer.emoji} {transfer.name}</dd>
             </div>
-          ) : (
-            <>
-              <dl className="space-y-2 text-sm">
-                <div className="flex justify-between">
-                  <dt className="text-slate-600">车型</dt>
-                  <dd className="text-slate-900">{transfer.emoji} {transfer.name}</dd>
-                </div>
-                <div className="flex justify-between">
-                  <dt className="text-slate-600">上车地址</dt>
-                  <dd className="text-slate-900">{pickupAddress}</dd>
-                </div>
-                <div className="flex justify-between">
-                  <dt className="text-slate-600">目的地</dt>
-                  <dd className="text-slate-900">{transfer.destArea}</dd>
-                </div>
-                <div className="flex justify-between">
-                  <dt className="text-slate-600">用车时间</dt>
-                  <dd className="text-slate-900">{pickupDate} {pickupTime}</dd>
-                </div>
-                <div className="flex justify-between">
-                  <dt className="text-slate-600">乘车人数</dt>
-                  <dd className="text-slate-900">{passengers} 人</dd>
-                </div>
-                <div className="flex justify-between border-t border-slate-200 pt-2">
-                  <dt className="text-slate-600">应付</dt>
-                  <dd className="text-xl font-bold text-red-600">¥{transfer.basePrice}</dd>
-                </div>
-              </dl>
-              <div className="mt-5 flex justify-end gap-3">
-                <button className="btn-secondary" onClick={onClose}>取消</button>
-                <button className="btn-primary" onClick={() => setBooked(true)}>
-                  确认下单
-                </button>
-              </div>
-            </>
-          )}
+            <div className="flex justify-between">
+              <dt className="text-slate-600">上车地址</dt>
+              <dd className="text-slate-900">{pickupAddress}</dd>
+            </div>
+            <div className="flex justify-between">
+              <dt className="text-slate-600">目的地</dt>
+              <dd className="text-slate-900">{transfer.destArea}</dd>
+            </div>
+            <div className="flex justify-between">
+              <dt className="text-slate-600">用车时间</dt>
+              <dd className="text-slate-900">{pickupDate} {pickupTime}</dd>
+            </div>
+            <div className="flex justify-between">
+              <dt className="text-slate-600">乘车人数</dt>
+              <dd className="text-slate-900">{passengers} 人</dd>
+            </div>
+            <div className="flex justify-between border-t border-slate-200 pt-2">
+              <dt className="text-slate-600">应付</dt>
+              <dd className="text-xl font-bold text-red-600">¥{transfer.basePrice}</dd>
+            </div>
+          </dl>
+          <div className="mt-5 flex justify-end gap-3">
+            <button className="btn-secondary" onClick={onClose}>取消</button>
+            <button className="btn-secondary" onClick={() => addToCart(false)}>🛒 加入购物车</button>
+            <button className="btn-primary" onClick={() => addToCart(true)}>立即购买 →</button>
+          </div>
         </div>
       </div>
     </div>

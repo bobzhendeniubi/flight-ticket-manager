@@ -1,7 +1,7 @@
 /**
  * SHARED with admin-web/src/lib/airports.ts — keep them in sync.
  *
- * 公司主营：港澳客户 → 岘港。仅显示这条业务航线相关的机场。
+ * 公司主营：澳门客户 → 岘港。仅显示这条业务航线相关的机场。
  * 不要加中国大陆机场（PEK/PVG/CAN/SZX 等），避免 demo 时误导业务范围。
  */
 export interface AirportInfo {
@@ -17,7 +17,7 @@ export const AIRPORTS: Record<string, AirportInfo> = {
   // 主力航线 — QH9588/9589
   DAD: { code: 'DAD', name: '岘港', tz: 'Asia/Ho_Chi_Minh', country: '越南', active: true },
   MFM: { code: 'MFM', name: '澳门', tz: 'Asia/Macau', country: '中国澳门', active: true },
-  // 港澳出发地扩展
+  // 澳门出发地扩展
   HKG: { code: 'HKG', name: '香港', tz: 'Asia/Hong_Kong', country: '中国香港', active: false },
   // 越南目的地扩展
   HAN: { code: 'HAN', name: '河内', tz: 'Asia/Ho_Chi_Minh', country: '越南', active: false },

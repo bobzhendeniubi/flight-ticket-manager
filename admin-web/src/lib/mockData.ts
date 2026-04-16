@@ -1,6 +1,6 @@
 /**
  * SHARED with sales-web/src/lib/mockData.ts — keep in sync. Demo-only 数据。M3-M5 前端页面直接渲染，没接后端。
- * 业务聚焦：港澳客户 → 岘港的旅行打包服务。
+ * 业务聚焦：澳门客户 → 岘港的旅行打包服务。
  * 所有金额单位：人民币 (CNY)。
  */
 
@@ -133,6 +133,62 @@ export const MOCK_HOTELS: MockHotel[] = [
     amenities: ['厨房 / 洗衣机', '韩江景观', '免费 WiFi', '靠近龙桥'],
     highlight: '市区公寓式酒店，适合长住和家庭，近龙桥',
   },
+  {
+    id: 'h9',
+    name: '岘港 TIA Wellness 度假村',
+    nameEn: 'TIA Wellness Resort',
+    cityCode: 'DAD',
+    area: '美溪海滩 北段',
+    stars: 5,
+    basePrice: 2880,
+    rating: 4.8,
+    reviewCount: 932,
+    emoji: '🧘',
+    amenities: ['全日 SPA 免费', '私人泳池别墅', '养生餐', '禅修花园'],
+    highlight: '越南顶级 Wellness 概念，每日 2 次免费 SPA',
+  },
+  {
+    id: 'h10',
+    name: '岘港喜来登大酒店',
+    nameEn: 'Sheraton Grand Danang Resort',
+    cityCode: 'DAD',
+    area: '非水庄 / 美溪南段',
+    stars: 5,
+    basePrice: 1680,
+    rating: 4.7,
+    reviewCount: 2104,
+    emoji: '⭐',
+    amenities: ['250m 海岸线', '5 个泳池', '万豪会员积分', '含早餐'],
+    highlight: '万豪集团旗下，会员积分 + 升房稳定',
+  },
+  {
+    id: 'h11',
+    name: '岘港 Vinpearl 度假村',
+    nameEn: 'Vinpearl Luxury Da Nang',
+    cityCode: 'DAD',
+    area: '美溪海滩 南段',
+    stars: 5,
+    basePrice: 1480,
+    rating: 4.6,
+    reviewCount: 1843,
+    emoji: '🌺',
+    amenities: ['私人沙滩', '免费班车去 Vinpearl Land', '亲子俱乐部'],
+    highlight: '越南本土豪牌 Vingroup，含 Vinpearl Land 主题公园门票',
+  },
+  {
+    id: 'h12',
+    name: '会安水疗安岚度假村',
+    nameEn: 'Anantara Hoi An Resort',
+    cityCode: 'HOA',
+    area: '会安古城旁',
+    stars: 5,
+    basePrice: 1980,
+    rating: 4.8,
+    reviewCount: 1267,
+    emoji: '🏯',
+    amenities: ['秋盆河景', '步行 10 分钟到古城', 'SPA', '含早餐'],
+    highlight: '安岚集团 · 古城唯一河景五星，灯笼之夜步行可达',
+  },
 ];
 
 // ── 岘港当地接送/包车 ────────────────────────────────────────────
@@ -209,6 +265,42 @@ export const MOCK_TRANSFERS: MockTransfer[] = [
     emoji: '🏯',
     features: ['途经海云岭观景台', '包含顺化景点解说', '10 小时包车', '中文司机'],
     duration: '全程约 10 小时',
+  },
+  {
+    id: 't6',
+    name: '岘港 → 美山圣地 半日包车',
+    vehicleType: '舒适型轿车 / 商务车',
+    capacity: 6,
+    basePrice: 488,
+    originArea: '岘港酒店',
+    destArea: '美山遗址（UNESCO）→ 返回',
+    emoji: '🛕',
+    features: ['UNESCO 占婆遗址', '5 小时包车', '中文司机', '含矿泉水'],
+    duration: '约 5 小时',
+  },
+  {
+    id: 't7',
+    name: '岘港市内夜游包车',
+    vehicleType: '舒适型轿车',
+    capacity: 3,
+    basePrice: 268,
+    originArea: '岘港酒店',
+    destArea: '龙桥 → 韩江夜景 → 山茶半岛灵应寺',
+    emoji: '🌃',
+    features: ['4 小时包车', '含中文导游', '龙桥喷火表演（周末）'],
+    duration: '约 4 小时',
+  },
+  {
+    id: 't8',
+    name: '海上钓鱼半日团（含船）',
+    vehicleType: '专属钓鱼快艇 + 接送',
+    capacity: 6,
+    basePrice: 988,
+    originArea: '岘港酒店',
+    destArea: '岘港湾外海',
+    emoji: '🎣',
+    features: ['含钓具/船餐/啤酒', '渔夫教学', '英文+中文船长'],
+    duration: '约 5 小时',
   },
 ];
 
@@ -329,6 +421,30 @@ export const MOCK_VISAS: MockVisa[] = [
     requiredDocs: ['护照扫描件', '照片'],
     validityMonths: 1,
   },
+  {
+    id: 'v9',
+    country: '马来西亚',
+    countryCode: 'MY',
+    flag: '🇲🇾',
+    type: '电子签证 eVISA',
+    processingDays: 3,
+    basePrice: 240,
+    expressSurcharge: 80,
+    requiredDocs: ['护照扫描件', '照片', '行程单'],
+    validityMonths: 3,
+  },
+  {
+    id: 'v10',
+    country: '印度尼西亚',
+    countryCode: 'ID',
+    flag: '🇮🇩',
+    type: '电子落地签 e-VOA',
+    processingDays: 2,
+    basePrice: 280,
+    expressSurcharge: 100,
+    requiredDocs: ['护照扫描件'],
+    validityMonths: 1,
+  },
 ];
 
 // ── 订单 (admin view) ────────────────────────────────────────────
@@ -376,7 +492,7 @@ export const MOCK_ORDERS: MockOrder[] = [
     orderNumber: 'FTM20260415002',
     customerName: '李娜',
     contactPhone: '+852 9012 ****',
-    agentName: '港澳岘港旅游总代',
+    agentName: '澳门岘港旅游总代',
     itemSummary: 'QH9589 澳门→岘港 · 商务舱 × 1',
     itemKind: 'FLIGHT',
     total: 4380,
@@ -460,7 +576,7 @@ export const MOCK_ORDERS: MockOrder[] = [
     orderNumber: 'FTM20260415008',
     customerName: '孙悦',
     contactPhone: '+852 5432 ****',
-    agentName: '港澳岘港旅游总代',
+    agentName: '澳门岘港旅游总代',
     itemSummary: '巴拿山 1 日包车 × 4',
     itemKind: 'TRANSFER',
     total: 588,
@@ -692,6 +808,48 @@ export const MOCK_BUNDLES: MockBundle[] = [
       listPrice: list,
       bundlePrice: list - 2400,
       suitableFor: '4 大人 · 全家出游',
+      active: true,
+    };
+  })(),
+  (() => {
+    const items: BundleItem[] = [
+      { kind: 'FLIGHT', productName: 'QH9588/9589 来回机票（经济舱）', qty: 2, unitPrice: 2860 },
+      { kind: 'HOTEL', productName: '岘港 TIA Wellness 度假村 5 晚', qty: 5, unitPrice: 2880 },
+      { kind: 'TRANSFER', productName: '岘港机场接送（豪华轿车 来回）', qty: 2, unitPrice: 388 },
+      { kind: 'TRANSFER', productName: '海上钓鱼半日团', qty: 1, unitPrice: 988 },
+      { kind: 'VISA', productName: '越南 E-visa 30 天', qty: 2, unitPrice: 280 },
+    ];
+    const list = sumItems(items);
+    return {
+      id: 'b5',
+      name: '岘港养生 6 天 5 晚 · 全 SPA 套餐',
+      tagline: 'TIA Wellness 全日 SPA 免费 + 海钓体验，深度疗愈之旅',
+      emoji: '🧘',
+      items,
+      listPrice: list,
+      bundlePrice: list - 2200,
+      suitableFor: '2 大人 · 减压度假',
+      active: true,
+    };
+  })(),
+  (() => {
+    const items: BundleItem[] = [
+      { kind: 'FLIGHT', productName: 'QH9588/9589 来回机票（经济舱）', qty: 2, unitPrice: 2860 },
+      { kind: 'HOTEL', productName: '会安水疗安岚度假村 古城河景房 4 晚', qty: 4, unitPrice: 1980 },
+      { kind: 'TRANSFER', productName: '岘港机场接送 + 会安专车', qty: 2, unitPrice: 248 },
+      { kind: 'TRANSFER', productName: '美山圣地半日包车', qty: 1, unitPrice: 488 },
+      { kind: 'VISA', productName: '越南 E-visa 30 天', qty: 2, unitPrice: 280 },
+    ];
+    const list = sumItems(items);
+    return {
+      id: 'b6',
+      name: '会安文化 5 天 4 晚 · 古城深度',
+      tagline: '会安古城 + 美山遗址 UNESCO 双世遗，文艺青年首选',
+      emoji: '🏮',
+      items,
+      listPrice: list,
+      bundlePrice: list - 1500,
+      suitableFor: '2 大人 · 文化探索',
       active: true,
     };
   })(),

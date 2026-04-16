@@ -6,6 +6,7 @@ import {
   STATUS_COLOR,
   STATUS_LABEL,
 } from '../lib/mockData';
+import { RealtimeActivity } from '../components/RealtimeActivity';
 
 export function DashboardPage() {
   const maxRevenue = Math.max(...DASHBOARD_WEEKLY.map((d) => d.revenue));
@@ -96,6 +97,8 @@ export function DashboardPage() {
           </div>
         </div>
       </section>
+
+      <RealtimeActivity />
 
       <section className="card">
         <div className="flex items-center justify-between">

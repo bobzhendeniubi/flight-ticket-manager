@@ -1,6 +1,6 @@
 /**
  * 动态定价 — 拉真后端的 QH9588/QH9589 班次，叠加本地 mock 的等级倍率 + ML 需求。
- * 业务背景：港澳→岘港，定价基础是 FlightSeatClass.basePrice。
+ * 业务背景：澳门→岘港，定价基础是 FlightSeatClass.basePrice。
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, type AdminFlight, type AdminSchedule } from '../lib/api';

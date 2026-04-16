@@ -8,6 +8,9 @@ import { TeamPage } from './pages/TeamPage';
 import { HotelsPage } from './pages/HotelsPage';
 import { TransfersPage } from './pages/TransfersPage';
 import { VisasPage } from './pages/VisasPage';
+import { BundlesPage } from './pages/BundlesPage';
+import { CartPage } from './pages/CartPage';
+import { CheckoutPage } from './pages/CheckoutPage';
 import { AdminFlightsPage } from './pages/AdminFlightsPage';
 import { AdminDashboardPage } from './pages/admin/DashboardPage';
 import { AdminOrdersPage } from './pages/admin/OrdersPage';
@@ -37,6 +40,9 @@ export function App() {
         <Route path="hotels" element={<HotelsPage />} />
         <Route path="transfers" element={<TransfersPage />} />
         <Route path="visas" element={<VisasPage />} />
+        <Route path="bundles" element={<BundlesPage />} />
+        <Route path="cart" element={<CartPage />} />
+        <Route path="checkout" element={<CheckoutPage />} />
 
         {/* 认证 */}
         <Route path="login" element={<LoginPage />} />

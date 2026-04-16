@@ -92,7 +92,7 @@ async function main() {
       email: 'agent1@ftm.local',
       passwordHash: hash,
       role: UserRole.AGENT,
-      displayName: '1级代理 · 港澳总代',
+      displayName: '1级代理 · 澳门总代',
       emailVerified: true,
     },
   });
@@ -102,7 +102,7 @@ async function main() {
     update: {},
     create: {
       userId: agent1User.id,
-      companyName: '港澳岘港旅游总代',
+      companyName: '澳门岘港旅游总代',
       contactName: '王总代',
       contactPhone: '+85290000001',
       prepaymentBalance: 80000,

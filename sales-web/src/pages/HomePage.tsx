@@ -1,5 +1,4 @@
 import { FormEvent, useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
 import { api, ApiError, type CabinClass, type FlightSearchResult } from '../lib/api';
 import {
   AIRPORT_OPTIONS,
@@ -11,6 +10,7 @@ import {
 } from '../lib/airports';
 import { DANANG_HIGHLIGHTS } from '../lib/mockData';
 import { useAuth } from '../stores/auth';
+import { useCart } from '../stores/cart';
 
 function todayISO(offsetDays = 1): string {
   const d = new Date();
@@ -77,15 +77,18 @@ export function HomePage() {
       <section className="rounded-xl bg-gradient-to-br from-sky-500 to-emerald-500 p-8 text-white shadow-sm">
         <div className="max-w-2xl">
           <div className="flex items-center gap-2 text-sm text-sky-50">
-            <span>✈️ 澳门/香港出发</span>
+            <span>✈️ 澳门出发</span>
             <span>·</span>
             <span>🇻🇳 岘港专线</span>
           </div>
           <h1 className="mt-2 text-3xl font-bold md:text-4xl">
-            {user ? `${user.displayName ?? user.email}，您好` : '港澳直飞岘港 · 一站式度假管家'}
+            {user ? `${user.displayName ?? user.email}，您好` : '澳门直飞岘港 · 一站式度假管家'}
           </h1>
           <p className="mt-2 text-sky-50">
             自营 QH9588 / QH9589 澳门 ↔ 岘港直飞航班，每天 1 班，机票 + 酒店 + 接送 + 签证一站搞定。
+          </p>
+          <p className="mt-1 text-xs text-sky-100/80">
+            * 内地及香港旅客可经珠海/深圳口岸 30 分钟巴士抵达澳门机场出发
           </p>
           <div className="mt-4 flex flex-wrap gap-2 text-sm">
             <span className="rounded-full bg-white/20 px-3 py-1 backdrop-blur">🏝️ 美溪海滩</span>
@@ -104,7 +107,7 @@ export function HomePage() {
             <label className="label" htmlFor="origin">出发</label>
             <select id="origin" className="input" value={origin} onChange={(e) => setOrigin(e.target.value)}>
               <option value="">全部</option>
-              {AIRPORT_OPTIONS.map((a) => (
+              {AIRPORT_OPTIONS.filter((a) => a.active).map((a) => (
                 <option key={a.code} value={a.code}>
                   {a.name} ({a.code}){a.country ? ` · ${a.country}` : ''}
                 </option>
@@ -131,7 +134,7 @@ export function HomePage() {
               onChange={(e) => setDestination(e.target.value)}
             >
               <option value="">全部</option>
-              {AIRPORT_OPTIONS.map((a) => (
+              {AIRPORT_OPTIONS.filter((a) => a.active).map((a) => (
                 <option key={a.code} value={a.code}>
                   {a.name} ({a.code}){a.country ? ` · ${a.country}` : ''}
                 </option>
@@ -307,36 +310,71 @@ function FlightCard({
               ¥{minPrice.toFixed(0)} <span className="text-xs text-slate-500 font-normal">起</span>
             </div>
           )}
-          {isLoggedIn ? (
-            <button className="btn-primary mt-2 text-sm" disabled title="下单流程将在后续迭代中开放">
-              选择舱位
-            </button>
-          ) : (
-            <Link to="/login" className="btn-secondary mt-2 text-sm">
-              登录后预订
-            </Link>
-          )}
+          <div className="mt-2 text-xs text-slate-500">↓ 选舱位加入购物车</div>
         </div>
       </div>
 
       <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
         {flight.seatClasses.map((c) => (
-          <div
+          <FlightSeatCard
             key={c.cabin}
-            className={`rounded-md border px-3 py-2 text-sm ${
-              c.available >= passengers
-                ? 'border-slate-200 bg-white'
-                : 'border-slate-100 bg-slate-50 text-slate-400'
-            }`}
-          >
-            <div className="flex items-center justify-between">
-              <span className="font-medium text-slate-700">{CABIN_LABEL[c.cabin] ?? c.cabin}</span>
-              <span className="font-semibold text-slate-900">¥{Number(c.basePrice).toFixed(0)}</span>
-            </div>
-            <div className="mt-1 text-xs text-slate-500">余票 {c.available} / {c.capacity}</div>
-          </div>
+            flight={flight}
+            cabin={c}
+            passengers={passengers}
+            isLoggedIn={isLoggedIn}
+          />
         ))}
       </div>
     </article>
+  );
+}
+
+function FlightSeatCard({
+  flight,
+  cabin,
+  passengers,
+  isLoggedIn: _isLoggedIn,
+}: {
+  flight: FlightSearchResult;
+  cabin: FlightSearchResult['seatClasses'][number];
+  passengers: number;
+  isLoggedIn: boolean;
+}) {
+  const add = useCart((s) => s.add);
+  const enough = cabin.available >= passengers;
+  return (
+    <div
+      className={`rounded-md border px-3 py-2 text-sm ${
+        enough ? 'border-slate-200 bg-white' : 'border-slate-100 bg-slate-50 text-slate-400'
+      }`}
+    >
+      <div className="flex items-center justify-between">
+        <span className="font-medium text-slate-700">{CABIN_LABEL[cabin.cabin] ?? cabin.cabin}</span>
+        <span className="font-semibold text-slate-900">¥{Number(cabin.basePrice).toFixed(0)}</span>
+      </div>
+      <div className="mt-1 text-xs text-slate-500">余票 {cabin.available} / {cabin.capacity}</div>
+      <button
+        className="btn-primary mt-2 w-full text-xs py-1"
+        disabled={!enough}
+        onClick={() => {
+          add({
+            kind: 'FLIGHT',
+            productId: flight.scheduleId,
+            name: `${flight.flightNumber} ${flight.originCode}→${flight.destinationCode} · ${CABIN_LABEL[cabin.cabin]}`,
+            description: `${formatLocalDate(flight.departureTime, flight.departureTz)} ${formatLocalTime(flight.departureTime, flight.departureTz)}`,
+            emoji: '✈️',
+            unitPrice: Number(cabin.basePrice),
+            qty: passengers,
+            meta: {
+              departureTime: flight.departureTime,
+              cabin: cabin.cabin,
+              passengers,
+            },
+          });
+        }}
+      >
+        {enough ? `+ 加购 ${passengers} 张` : '余票不足'}
+      </button>
+    </div>
   );
 }
