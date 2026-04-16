@@ -465,7 +465,7 @@ function NewBundleWizard({
   const [emoji, setEmoji] = useState('🎁');
   const [suitableFor, setSuitableFor] = useState('2 大人');
   const [items, setItems] = useState<BundleItem[]>([
-    { kind: 'FLIGHT', productName: 'QH9588/9589 来回机票（经济舱）', qty: 2, unitPrice: 2860 },
+    { kind: 'HOTEL', productName: '岘港凯悦度假村 3 晚', qty: 3, unitPrice: 1880 },
   ]);
   const [discount, setDiscount] = useState(500);
 
@@ -475,7 +475,7 @@ function NewBundleWizard({
 
   const addItem = (kind: BundleItem['kind']) => {
     const presets: Record<BundleItem['kind'], BundleItem> = {
-      FLIGHT: { kind: 'FLIGHT', productName: 'QH9589 单程经济舱', qty: 2, unitPrice: 1480 },
+      FLIGHT: { kind: 'HOTEL', productName: '（请从下方添加）', qty: 1, unitPrice: 0 },
       HOTEL: { kind: 'HOTEL', productName: '岘港凯悦度假村 1 晚', qty: 3, unitPrice: 1880 },
       TRANSFER: { kind: 'TRANSFER', productName: '岘港机场接送 商务车', qty: 2, unitPrice: 188 },
       VISA: { kind: 'VISA', productName: '越南 E-visa 30 天', qty: 2, unitPrice: 280 },
@@ -517,7 +517,7 @@ function NewBundleWizard({
             <div className="flex items-center justify-between">
               <label className="label !mb-0">套餐内容</label>
               <div className="flex gap-2">
-                {(['FLIGHT', 'HOTEL', 'TRANSFER', 'VISA'] as const).map((k) => (
+                {(['HOTEL', 'TRANSFER', 'VISA'] as const).map((k) => (
                   <button
                     key={k}
                     type="button"

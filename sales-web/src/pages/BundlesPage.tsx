@@ -20,10 +20,11 @@ export function BundlesPage() {
   return (
     <div className="space-y-5">
       <section className="rounded-xl bg-gradient-to-br from-emerald-500 to-teal-500 p-6 text-white">
-        <h1 className="text-2xl font-bold">岘港主题套餐</h1>
+        <h1 className="text-2xl font-bold">岘港地面套餐</h1>
         <p className="mt-1 text-sm text-emerald-50">
-          机票 + 酒店 + 接送 + 签证打包，比单独购买省更多。{visible.length} 个套餐供选择。
+          酒店 + 接送 + 签证 一站式地面服务包，搭配自选航班，{visible.length} 个套餐供选择。
         </p>
+        <p className="mt-1 text-xs text-emerald-100/80">* 机票请在首页单独选购，套餐不含机票</p>
       </section>
 
       <section className="grid gap-4 md:grid-cols-2">

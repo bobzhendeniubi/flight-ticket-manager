@@ -755,27 +755,25 @@ function sumItems(items: BundleItem[]): number {
 export const MOCK_BUNDLES: MockBundle[] = [
   (() => {
     const items: BundleItem[] = [
-      { kind: 'FLIGHT', productName: 'QH9588/9589 来回机票（经济舱）', qty: 2, unitPrice: 2860 },
-      { kind: 'HOTEL', productName: '岘港凯悦度假村 美溪海景房', qty: 3, unitPrice: 1880 },
+      { kind: 'HOTEL', productName: '岘港凯悦度假村 美溪海景房 3 晚', qty: 3, unitPrice: 1880 },
       { kind: 'TRANSFER', productName: '岘港机场接送（来回 7 座商务车）', qty: 2, unitPrice: 188 },
     ];
     const list = sumItems(items);
     return {
       id: 'b1',
-      name: '岘港 4 天 3 晚 · 经典度假',
-      tagline: '机票 + 凯悦海景 3 晚 + 来回接送，最热销组合',
+      name: '经典度假 3 晚 · 凯悦海景',
+      tagline: '凯悦海景 3 晚 + 来回接送，最热销地面包',
       emoji: '🏖️',
       items,
       listPrice: list,
-      bundlePrice: list - 660,
-      suitableFor: '2 大人 · 情侣/家庭',
+      bundlePrice: list - 380,
+      suitableFor: '2 人起 · 情侣/家庭',
       active: true,
     };
   })(),
   (() => {
     const items: BundleItem[] = [
-      { kind: 'FLIGHT', productName: 'QH9588/9589 来回机票（经济舱）', qty: 2, unitPrice: 2860 },
-      { kind: 'HOTEL', productName: '岘港洲际半岛度假村 山景房', qty: 4, unitPrice: 3680 },
+      { kind: 'HOTEL', productName: '岘港洲际半岛度假村 山景房 4 晚', qty: 4, unitPrice: 3680 },
       { kind: 'TRANSFER', productName: '岘港机场接送（豪华轿车 来回）', qty: 2, unitPrice: 388 },
       { kind: 'TRANSFER', productName: '巴拿山 1 日包车', qty: 1, unitPrice: 588 },
       { kind: 'VISA', productName: '越南 E-visa 30 天 × 2', qty: 2, unitPrice: 280 },
@@ -783,19 +781,18 @@ export const MOCK_BUNDLES: MockBundle[] = [
     const list = sumItems(items);
     return {
       id: 'b2',
-      name: '岘港 5 天 4 晚 · 蜜月豪华',
+      name: '蜜月豪华 4 晚 · 洲际半岛',
       tagline: '洲际半岛 + 巴拿山佛手桥 + 签证全包，一价全含',
       emoji: '💍',
       items,
       listPrice: list,
-      bundlePrice: list - 1880,
-      suitableFor: '2 大人 · 蜜月/纪念日',
+      bundlePrice: list - 1200,
+      suitableFor: '2 人 · 蜜月/纪念日',
       active: true,
     };
   })(),
   (() => {
     const items: BundleItem[] = [
-      { kind: 'FLIGHT', productName: 'QH9588/9589 来回机票（商务舱）', qty: 1, unitPrice: 8660 },
       { kind: 'HOTEL', productName: '馨乐庭蓝湾公寓 市区 1 晚', qty: 1, unitPrice: 580 },
       { kind: 'TRANSFER', productName: '岘港机场接送（豪华轿车 来回）', qty: 2, unitPrice: 388 },
       { kind: 'VISA', productName: '越南落地签批文', qty: 1, unitPrice: 180 },
@@ -803,19 +800,18 @@ export const MOCK_BUNDLES: MockBundle[] = [
     const list = sumItems(items);
     return {
       id: 'b3',
-      name: '岘港商务快闪 2 天',
-      tagline: '商务舱来回 + 市区公寓 + 签证 + 接送，48 小时往返',
+      name: '商务快闪 1 晚 · 市区公寓',
+      tagline: '市区公寓 + 豪华接送 + 落地签，48 小时高效出差',
       emoji: '💼',
       items,
       listPrice: list,
-      bundlePrice: list - 380,
-      suitableFor: '1 商务客',
+      bundlePrice: list - 200,
+      suitableFor: '1 人 · 商务',
       active: true,
     };
   })(),
   (() => {
     const items: BundleItem[] = [
-      { kind: 'FLIGHT', productName: 'QH9588/9589 来回机票（经济舱）', qty: 4, unitPrice: 2860 },
       { kind: 'HOTEL', productName: '岘港太阳豪庭度假村 双房 4 晚', qty: 4, unitPrice: 1760 },
       { kind: 'TRANSFER', productName: '岘港机场接送（7 座商务车 来回）', qty: 2, unitPrice: 188 },
       { kind: 'TRANSFER', productName: '会安古城 1 日包车', qty: 1, unitPrice: 248 },
@@ -824,55 +820,53 @@ export const MOCK_BUNDLES: MockBundle[] = [
     const list = sumItems(items);
     return {
       id: 'b4',
-      name: '岘港亲子 5 天 4 晚（4 大）',
-      tagline: '4 人成行 + 会安古城 + 签证全办，亲子家庭首选',
+      name: '亲子 4 晚 · 太阳豪庭双房',
+      tagline: '太阳豪庭双房 + 会安古城 + 签证全办，全家出游',
       emoji: '👨‍👩‍👧‍👦',
       items,
       listPrice: list,
-      bundlePrice: list - 2400,
-      suitableFor: '4 大人 · 全家出游',
+      bundlePrice: list - 800,
+      suitableFor: '4 人 · 全家出游',
       active: true,
     };
   })(),
   (() => {
     const items: BundleItem[] = [
-      { kind: 'FLIGHT', productName: 'QH9588/9589 来回机票（经济舱）', qty: 2, unitPrice: 2860 },
       { kind: 'HOTEL', productName: '岘港 TIA Wellness 度假村 5 晚', qty: 5, unitPrice: 2880 },
       { kind: 'TRANSFER', productName: '岘港机场接送（豪华轿车 来回）', qty: 2, unitPrice: 388 },
       { kind: 'TRANSFER', productName: '海上钓鱼半日团', qty: 1, unitPrice: 988 },
-      { kind: 'VISA', productName: '越南 E-visa 30 天', qty: 2, unitPrice: 280 },
+      { kind: 'VISA', productName: '越南 E-visa 30 天 × 2', qty: 2, unitPrice: 280 },
     ];
     const list = sumItems(items);
     return {
       id: 'b5',
-      name: '岘港养生 6 天 5 晚 · 全 SPA 套餐',
-      tagline: 'TIA Wellness 全日 SPA 免费 + 海钓体验，深度疗愈之旅',
+      name: '养生 5 晚 · TIA Wellness 全 SPA',
+      tagline: 'TIA 全日 SPA 免费 + 海钓体验，深度疗愈之旅',
       emoji: '🧘',
       items,
       listPrice: list,
-      bundlePrice: list - 2200,
-      suitableFor: '2 大人 · 减压度假',
+      bundlePrice: list - 1000,
+      suitableFor: '2 人 · 减压度假',
       active: true,
     };
   })(),
   (() => {
     const items: BundleItem[] = [
-      { kind: 'FLIGHT', productName: 'QH9588/9589 来回机票（经济舱）', qty: 2, unitPrice: 2860 },
       { kind: 'HOTEL', productName: '会安水疗安岚度假村 古城河景房 4 晚', qty: 4, unitPrice: 1980 },
       { kind: 'TRANSFER', productName: '岘港机场接送 + 会安专车', qty: 2, unitPrice: 248 },
       { kind: 'TRANSFER', productName: '美山圣地半日包车', qty: 1, unitPrice: 488 },
-      { kind: 'VISA', productName: '越南 E-visa 30 天', qty: 2, unitPrice: 280 },
+      { kind: 'VISA', productName: '越南 E-visa 30 天 × 2', qty: 2, unitPrice: 280 },
     ];
     const list = sumItems(items);
     return {
       id: 'b6',
-      name: '会安文化 5 天 4 晚 · 古城深度',
+      name: '会安文化 4 晚 · 安岚古城',
       tagline: '会安古城 + 美山遗址 UNESCO 双世遗，文艺青年首选',
       emoji: '🏮',
       items,
       listPrice: list,
-      bundlePrice: list - 1500,
-      suitableFor: '2 大人 · 文化探索',
+      bundlePrice: list - 680,
+      suitableFor: '2 人 · 文化探索',
       active: true,
     };
   })(),
