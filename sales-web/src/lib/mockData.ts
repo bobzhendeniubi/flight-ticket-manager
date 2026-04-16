@@ -741,130 +741,149 @@ export interface MockBundle {
   listPrice: number;
   /** 套餐价（已让利） */
   bundlePrice: number;
+  /** 地面服务让利金额 */
+  groundDiscount: number;
+  /** 机票对应人数（用于调 /flights/price） */
+  flightPax: number;
   /** 适合人数 */
   suitableFor: string;
   /** 当前状态 */
   active: boolean;
 }
 
-function sumItems(items: BundleItem[]): number {
-  return items.reduce((s, i) => s + i.unitPrice * i.qty, 0);
-}
 
 export const MOCK_BUNDLES: MockBundle[] = [
   (() => {
     const items: BundleItem[] = [
+      { kind: 'FLIGHT', productName: 'QH 澳门↔岘港 来回经济舱 × 2 人', qty: 1, unitPrice: 0 },
       { kind: 'HOTEL', productName: '岘港凯悦度假村 美溪海景房 3 晚', qty: 3, unitPrice: 1880 },
       { kind: 'TRANSFER', productName: '岘港机场接送（来回 7 座商务车）', qty: 2, unitPrice: 188 },
     ];
-    const list = sumItems(items);
+    const groundTotal = items.filter(i => i.kind !== 'FLIGHT').reduce((s, i) => s + i.unitPrice * i.qty, 0);
     return {
       id: 'b1',
       name: '经典度假 3 晚 · 凯悦海景',
-      tagline: '凯悦海景 3 晚 + 来回接送，最热销地面包',
+      tagline: '来回机票 + 凯悦海景 3 晚 + 来回接送',
       emoji: '🏖️',
       items,
-      listPrice: list,
-      bundlePrice: list - 380,
-      suitableFor: '2 人起 · 情侣/家庭',
+      listPrice: groundTotal,
+      bundlePrice: groundTotal,
+      groundDiscount: 380,
+      flightPax: 2,
+      suitableFor: '2 人 · 情侣/家庭',
       active: true,
     };
   })(),
   (() => {
     const items: BundleItem[] = [
+      { kind: 'FLIGHT', productName: 'QH 澳门↔岘港 来回经济舱 × 2 人', qty: 1, unitPrice: 0 },
       { kind: 'HOTEL', productName: '岘港洲际半岛度假村 山景房 4 晚', qty: 4, unitPrice: 3680 },
       { kind: 'TRANSFER', productName: '岘港机场接送（豪华轿车 来回）', qty: 2, unitPrice: 388 },
       { kind: 'TRANSFER', productName: '巴拿山 1 日包车', qty: 1, unitPrice: 588 },
       { kind: 'VISA', productName: '越南 E-visa 30 天 × 2', qty: 2, unitPrice: 280 },
     ];
-    const list = sumItems(items);
+    const groundTotal = items.filter(i => i.kind !== 'FLIGHT').reduce((s, i) => s + i.unitPrice * i.qty, 0);
     return {
       id: 'b2',
       name: '蜜月豪华 4 晚 · 洲际半岛',
-      tagline: '洲际半岛 + 巴拿山佛手桥 + 签证全包，一价全含',
+      tagline: '来回机票 + 洲际半岛 + 巴拿山佛手桥 + 签证全包',
       emoji: '💍',
       items,
-      listPrice: list,
-      bundlePrice: list - 1200,
+      listPrice: groundTotal,
+      bundlePrice: groundTotal,
+      groundDiscount: 1200,
+      flightPax: 2,
       suitableFor: '2 人 · 蜜月/纪念日',
       active: true,
     };
   })(),
   (() => {
     const items: BundleItem[] = [
+      { kind: 'FLIGHT', productName: 'QH 澳门↔岘港 来回商务舱 × 1 人', qty: 1, unitPrice: 0 },
       { kind: 'HOTEL', productName: '馨乐庭蓝湾公寓 市区 1 晚', qty: 1, unitPrice: 580 },
       { kind: 'TRANSFER', productName: '岘港机场接送（豪华轿车 来回）', qty: 2, unitPrice: 388 },
       { kind: 'VISA', productName: '越南落地签批文', qty: 1, unitPrice: 180 },
     ];
-    const list = sumItems(items);
+    const groundTotal = items.filter(i => i.kind !== 'FLIGHT').reduce((s, i) => s + i.unitPrice * i.qty, 0);
     return {
       id: 'b3',
-      name: '商务快闪 1 晚 · 市区公寓',
-      tagline: '市区公寓 + 豪华接送 + 落地签，48 小时高效出差',
+      name: '商务快闪 1 晚 · 商务舱',
+      tagline: '商务舱来回 + 市区公寓 + 签证 + 豪华接送',
       emoji: '💼',
       items,
-      listPrice: list,
-      bundlePrice: list - 200,
+      listPrice: groundTotal,
+      bundlePrice: groundTotal,
+      groundDiscount: 200,
+      flightPax: 1,
       suitableFor: '1 人 · 商务',
       active: true,
     };
   })(),
   (() => {
     const items: BundleItem[] = [
+      { kind: 'FLIGHT', productName: 'QH 澳门↔岘港 来回经济舱 × 4 人', qty: 1, unitPrice: 0 },
       { kind: 'HOTEL', productName: '岘港太阳豪庭度假村 双房 4 晚', qty: 4, unitPrice: 1760 },
       { kind: 'TRANSFER', productName: '岘港机场接送（7 座商务车 来回）', qty: 2, unitPrice: 188 },
       { kind: 'TRANSFER', productName: '会安古城 1 日包车', qty: 1, unitPrice: 248 },
       { kind: 'VISA', productName: '越南 E-visa 30 天 × 4', qty: 4, unitPrice: 280 },
     ];
-    const list = sumItems(items);
+    const groundTotal = items.filter(i => i.kind !== 'FLIGHT').reduce((s, i) => s + i.unitPrice * i.qty, 0);
     return {
       id: 'b4',
-      name: '亲子 4 晚 · 太阳豪庭双房',
-      tagline: '太阳豪庭双房 + 会安古城 + 签证全办，全家出游',
+      name: '亲子 4 晚 · 太阳豪庭',
+      tagline: '来回机票 4 人 + 太阳豪庭双房 + 会安古城 + 签证',
       emoji: '👨‍👩‍👧‍👦',
       items,
-      listPrice: list,
-      bundlePrice: list - 800,
+      listPrice: groundTotal,
+      bundlePrice: groundTotal,
+      groundDiscount: 800,
+      flightPax: 4,
       suitableFor: '4 人 · 全家出游',
       active: true,
     };
   })(),
   (() => {
     const items: BundleItem[] = [
+      { kind: 'FLIGHT', productName: 'QH 澳门↔岘港 来回经济舱 × 2 人', qty: 1, unitPrice: 0 },
       { kind: 'HOTEL', productName: '岘港 TIA Wellness 度假村 5 晚', qty: 5, unitPrice: 2880 },
       { kind: 'TRANSFER', productName: '岘港机场接送（豪华轿车 来回）', qty: 2, unitPrice: 388 },
       { kind: 'TRANSFER', productName: '海上钓鱼半日团', qty: 1, unitPrice: 988 },
       { kind: 'VISA', productName: '越南 E-visa 30 天 × 2', qty: 2, unitPrice: 280 },
     ];
-    const list = sumItems(items);
+    const groundTotal = items.filter(i => i.kind !== 'FLIGHT').reduce((s, i) => s + i.unitPrice * i.qty, 0);
     return {
       id: 'b5',
-      name: '养生 5 晚 · TIA Wellness 全 SPA',
-      tagline: 'TIA 全日 SPA 免费 + 海钓体验，深度疗愈之旅',
+      name: '养生 5 晚 · TIA 全 SPA',
+      tagline: '来回机票 + TIA 全日 SPA 免费 + 海钓',
       emoji: '🧘',
       items,
-      listPrice: list,
-      bundlePrice: list - 1000,
+      listPrice: groundTotal,
+      bundlePrice: groundTotal,
+      groundDiscount: 1000,
+      flightPax: 2,
       suitableFor: '2 人 · 减压度假',
       active: true,
     };
   })(),
   (() => {
     const items: BundleItem[] = [
+      { kind: 'FLIGHT', productName: 'QH 澳门↔岘港 来回经济舱 × 2 人', qty: 1, unitPrice: 0 },
       { kind: 'HOTEL', productName: '会安水疗安岚度假村 古城河景房 4 晚', qty: 4, unitPrice: 1980 },
       { kind: 'TRANSFER', productName: '岘港机场接送 + 会安专车', qty: 2, unitPrice: 248 },
       { kind: 'TRANSFER', productName: '美山圣地半日包车', qty: 1, unitPrice: 488 },
       { kind: 'VISA', productName: '越南 E-visa 30 天 × 2', qty: 2, unitPrice: 280 },
     ];
-    const list = sumItems(items);
+    const groundTotal = items.filter(i => i.kind !== 'FLIGHT').reduce((s, i) => s + i.unitPrice * i.qty, 0);
     return {
       id: 'b6',
       name: '会安文化 4 晚 · 安岚古城',
-      tagline: '会安古城 + 美山遗址 UNESCO 双世遗，文艺青年首选',
+      tagline: '来回机票 + 会安古城 + 美山遗址 UNESCO 双世遗',
       emoji: '🏮',
       items,
-      listPrice: list,
-      bundlePrice: list - 680,
+      listPrice: groundTotal,
+      bundlePrice: groundTotal,
+      groundDiscount: 680,
+      flightPax: 2,
       suitableFor: '2 人 · 文化探索',
       active: true,
     };

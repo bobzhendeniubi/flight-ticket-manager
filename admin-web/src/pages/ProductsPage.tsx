@@ -620,6 +620,8 @@ function NewBundleWizard({
                   items,
                   listPrice,
                   bundlePrice,
+                  groundDiscount: discount,
+                  flightPax: 2,
                   suitableFor,
                   active: true,
                 })
