@@ -47,6 +47,26 @@ export function CartPage() {
                 {i.description && (
                   <p className="mt-0.5 text-xs text-slate-500 truncate">{i.description}</p>
                 )}
+                {/* 套餐: 显示航班明细 */}
+                {i.kind === 'BUNDLE' && i.meta && (
+                  <div className="mt-1 text-xs text-slate-500 space-y-0.5">
+                    <div>✈ QH9589 澳门→岘港 {String(i.meta.goDate)} + QH9588 回程 {String(i.meta.returnDate)}</div>
+                    <div>
+                      {Number(i.meta.pax) || 0} 人 · {Number(i.meta.rooms) || 1} 房 ·
+                      机票 ¥{Number(i.meta.flightTotal || 0).toLocaleString()} +
+                      地面 ¥{Number(i.meta.hotelTotal || 0).toLocaleString()} +
+                      其他 ¥{Number(i.meta.otherTotal || 0).toLocaleString()}
+                      {Number(i.meta.discount) > 0 && ` − 让利 ¥${Number(i.meta.discount).toLocaleString()}`}
+                    </div>
+                  </div>
+                )}
+                {/* 机票: 显示舱等+日期 */}
+                {i.kind === 'FLIGHT' && i.meta && (
+                  <div className="mt-1 text-xs text-slate-500">
+                    {String(i.meta.cabin) === 'BUSINESS' ? '商务舱' : '经济舱'} · {String(i.meta.departureTime).slice(0, 10)} ·
+                    日期等级 {String(i.meta.dateRank)} · {Number(i.meta.passengers)} 人
+                  </div>
+                )}
                 <p className="mt-0.5 text-xs text-slate-400">
                   加入时间 {new Date(i.addedAt).toLocaleString('zh-CN')}
                 </p>

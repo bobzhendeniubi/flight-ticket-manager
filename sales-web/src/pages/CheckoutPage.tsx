@@ -7,6 +7,7 @@
 import { FormEvent, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useCart, KIND_INFO } from '../stores/cart';
+import { useAuth } from '../stores/auth';
 
 interface PassengerForm {
   fullName: string;
@@ -32,6 +33,8 @@ const MOCK_OCR_RESULTS = [
 ];
 
 export function CheckoutPage() {
+  const user = useAuth((s) => s.user);
+  const isAgent = user?.role === 'AGENT';
   const items = useCart((s) => s.items);
   const total = useCart((s) => s.items.reduce((sum, i) => sum + i.unitPrice * i.qty, 0));
   const clear = useCart((s) => s.clear);
@@ -44,11 +47,16 @@ export function CheckoutPage() {
   const [submitting, setSubmitting] = useState(false);
   const [done, setDone] = useState<{ orderNumber: string } | null>(null);
 
-  // 机票总人数 — 结账时必须 == passengers.length
+  // 需要出行人的总人数 = 机票张数 + 套餐里的人数
   const flightTicketCount = items
     .filter((i) => i.kind === 'FLIGHT')
     .reduce((sum, i) => sum + i.qty, 0);
-  const paxMismatch = flightTicketCount > 0 && passengers.length !== flightTicketCount;
+  const bundlePaxCount = items
+    .filter((i) => i.kind === 'BUNDLE')
+    .reduce((sum, i) => sum + (Number(i.meta?.pax) || 0), 0);
+  // 如果同时买了散票和套餐，取较大值（套餐含机票，乘客是同一批人）
+  const effectivePax = bundlePaxCount > 0 ? bundlePaxCount : flightTicketCount;
+  const paxMismatch = effectivePax > 0 && passengers.length !== effectivePax;
 
   if (items.length === 0 && !done) {
     return (
@@ -93,9 +101,9 @@ export function CheckoutPage() {
 
   const onSubmit = async (e: FormEvent) => {
     e.preventDefault();
-    // Invariant: 买几张票就填几个人
-    if (flightTicketCount > 0 && passengers.length !== flightTicketCount) {
-      alert(`机票 ${flightTicketCount} 张，需要 ${flightTicketCount} 位出行人，当前填了 ${passengers.length} 位`);
+    // Invariant: 买几张票/套餐几人就填几个出行人
+    if (effectivePax > 0 && passengers.length !== effectivePax) {
+      alert(`需要 ${effectivePax} 位出行人（${flightTicketCount > 0 ? `机票 ${flightTicketCount} 张` : ''}${bundlePaxCount > 0 ? `套餐 ${bundlePaxCount} 人` : ''}），当前填了 ${passengers.length} 位`);
       return;
     }
     if (passengers.length === 0) {
@@ -211,7 +219,7 @@ export function CheckoutPage() {
           <div className="flex items-center justify-between">
             <h2 className="font-semibold text-slate-900">
               出行人信息（{passengers.length} 人
-              {flightTicketCount > 0 && ` / 机票 ${flightTicketCount} 张`}）
+              {effectivePax > 0 && ` / 需要 ${effectivePax} 人`}）
             </h2>
             <button type="button" className="text-sm text-brand hover:text-brand-dark" onClick={addPassenger}>
               + 增加出行人
@@ -220,8 +228,8 @@ export function CheckoutPage() {
           <p className="mt-1 text-xs text-slate-500">机票、签证按出行人开票/办证。每位都需提供护照信息。</p>
           {paxMismatch && (
             <div className="mt-2 rounded-md bg-amber-50 border border-amber-200 px-4 py-3 text-sm text-amber-800">
-              ⚠ 机票数量 ({flightTicketCount} 张) 与出行人数 ({passengers.length} 人) 不匹配。
-              请{passengers.length < flightTicketCount ? '增加出行人' : '减少出行人或返回购物车调整机票数量'}。
+              ⚠ 需要 {effectivePax} 位出行人，当前填了 {passengers.length} 位。
+              请{passengers.length < effectivePax ? '增加出行人' : '减少出行人或返回购物车调整数量'}。
             </div>
           )}
 
@@ -241,12 +249,13 @@ export function CheckoutPage() {
         {/* 支付方式 */}
         <section className="card">
           <h2 className="font-semibold text-slate-900">支付方式</h2>
-          <div className="mt-3 grid gap-2 md:grid-cols-3">
+          <div className="mt-3 grid gap-2 md:grid-cols-2 lg:grid-cols-4">
             {[
-              { v: 'WECHAT_PAY', label: '微信支付', emoji: '💚' },
-              { v: 'ALIPAY', label: '支付宝', emoji: '💙' },
-              { v: 'BANK_CARD', label: '信用卡', emoji: '💳' },
-            ].map((p) => (
+              { v: 'WECHAT_PAY', label: '微信支付', emoji: '💚', show: true },
+              { v: 'ALIPAY', label: '支付宝', emoji: '💙', show: true },
+              { v: 'BANK_CARD', label: '信用卡', emoji: '💳', show: true },
+              { v: 'AGENT_PREPAYMENT', label: '代理预付余额', emoji: '💰', show: isAgent },
+            ].filter((p) => p.show).map((p) => (
               <label
                 key={p.v}
                 className={`cursor-pointer rounded-md border-2 p-3 text-center ${
@@ -266,6 +275,25 @@ export function CheckoutPage() {
               </label>
             ))}
           </div>
+          {paymentMethod === 'AGENT_PREPAYMENT' && isAgent && (
+            <div className="mt-3 rounded-md bg-emerald-50 border border-emerald-200 px-4 py-3 text-sm">
+              <div className="flex items-center justify-between">
+                <span className="text-emerald-800">代理预付余额（demo 模拟）</span>
+                <span className="font-semibold text-emerald-700">¥80,000.00</span>
+              </div>
+              <div className="mt-1 flex items-center justify-between text-xs text-emerald-600">
+                <span>本单抵扣</span>
+                <span>−¥{total.toLocaleString()}</span>
+              </div>
+              <div className="mt-1 flex items-center justify-between text-xs text-emerald-600">
+                <span>支付后余额</span>
+                <span>¥{(80000 - total).toLocaleString()}</span>
+              </div>
+              {total > 80000 && (
+                <div className="mt-2 text-xs text-red-600">⚠ 余额不足，请联系管理员充值或选择其他支付方式</div>
+              )}
+            </div>
+          )}
         </section>
 
         <div className="flex items-center justify-between sticky bottom-0 bg-white border border-slate-200 rounded-md px-4 py-3 shadow-lg">
