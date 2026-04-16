@@ -57,7 +57,7 @@ export function Layout() {
         <div className="mx-auto flex max-w-[1400px] items-center justify-between px-5 py-3">
           <Link to="/dashboard" className="flex items-center gap-2 text-lg font-semibold">
             <span aria-hidden className="text-brand">⚙</span>
-            <span>机票管家 · 后台</span>
+            <span>世途旅行 · 后台</span>
             <span className="ml-2 rounded bg-brand/20 px-2 py-0.5 text-xs text-brand">运营端</span>
           </Link>
           <div className="flex items-center gap-3 text-sm">
@@ -120,7 +120,7 @@ export function Layout() {
 
       <footer className="border-t border-slate-200 bg-white text-xs text-slate-500">
         <div className="mx-auto max-w-[1400px] px-5 py-3 flex justify-between">
-          <span>机票管家后台 · M2-M5 演示版 · © {new Date().getFullYear()}</span>
+          <span>世途旅行后台 · M2-M5 演示版 · © {new Date().getFullYear()}</span>
           <span className="text-slate-400">前台入口：http://localhost:5173</span>
         </div>
       </footer>

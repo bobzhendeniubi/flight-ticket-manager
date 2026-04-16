@@ -33,7 +33,7 @@ export function LoginPage() {
     <div className="min-h-screen flex items-center justify-center bg-slate-900 px-4">
       <div className="w-full max-w-sm">
         <div className="text-center text-white mb-6">
-          <h1 className="text-2xl font-bold">机票管家 · 后台</h1>
+          <h1 className="text-2xl font-bold">世途旅行 · 后台</h1>
           <p className="mt-2 text-sm text-slate-400">运营端 / 管理员入口</p>
         </div>
         <div className="rounded-lg bg-white p-6 shadow-xl">

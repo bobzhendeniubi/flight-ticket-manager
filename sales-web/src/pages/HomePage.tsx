@@ -22,13 +22,16 @@ export function HomePage() {
   const user = useAuth((s) => s.user);
 
   // 默认主航线：澳门 → 岘港
+  const [tripType, setTripType] = useState<'oneway' | 'roundtrip'>('roundtrip');
   const [origin, setOrigin] = useState('MFM');
   const [destination, setDestination] = useState('DAD');
   const [date, setDate] = useState(todayISO(3));
+  const [returnDate, setReturnDate] = useState(todayISO(7));
   const [cabin, setCabin] = useState<'' | CabinClass>('');
   const [passengers, setPassengers] = useState(1);
 
-  const [results, setResults] = useState<FlightSearchResult[] | null>(null);
+  type SearchResultWithLeg = FlightSearchResult & { _leg?: '去程' | '回程' };
+  const [results, setResults] = useState<SearchResultWithLeg[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [hasSearched, setHasSearched] = useState(false);
@@ -50,14 +53,28 @@ export function HomePage() {
     setError(null);
     setHasSearched(true);
     try {
-      const res = await api.searchFlights({
+      // 去程
+      const outbound = await api.searchFlights({
         origin: origin || undefined,
         destination: destination || undefined,
         date: date || undefined,
         cabin: cabin || undefined,
         passengers,
       });
-      setResults(res.results);
+      const combined: SearchResultWithLeg[] = outbound.results.map((r) => ({ ...r, _leg: '去程' }));
+
+      // 往返 → 也搜回程
+      if (tripType === 'roundtrip' && returnDate) {
+        const inbound = await api.searchFlights({
+          origin: destination || undefined,
+          destination: origin || undefined,
+          date: returnDate,
+          cabin: cabin || undefined,
+          passengers,
+        });
+        combined.push(...inbound.results.map((r) => ({ ...r, _leg: '回程' as const })));
+      }
+      setResults(combined);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : '搜索失败');
       setResults([]);
@@ -82,7 +99,7 @@ export function HomePage() {
             <span>🇻🇳 岘港专线</span>
           </div>
           <h1 className="mt-2 text-3xl font-bold md:text-4xl">
-            {user ? `${user.displayName ?? user.email}，您好` : '澳门直飞岘港 · 一站式度假管家'}
+            {user ? `${user.displayName ?? user.email}，您好` : '世途旅行 Citur Travel · 澳门直飞岘港'}
           </h1>
           <p className="mt-2 text-sky-50">
             自营 QH9588 / QH9589 澳门 ↔ 岘港直飞航班，每天 1 班，机票 + 酒店 + 接送 + 签证一站搞定。
@@ -101,7 +118,25 @@ export function HomePage() {
 
       {/* 搜索表单 */}
       <section className="card">
-        <h2 className="text-lg font-semibold text-slate-900">航班搜索</h2>
+        <div className="flex items-center gap-4">
+          <h2 className="text-lg font-semibold text-slate-900">航班搜索</h2>
+          <div className="flex rounded-md border border-slate-300 overflow-hidden text-sm">
+            <button
+              type="button"
+              className={`px-3 py-1.5 ${tripType === 'roundtrip' ? 'bg-brand text-white' : 'bg-white text-slate-600 hover:bg-slate-50'}`}
+              onClick={() => setTripType('roundtrip')}
+            >
+              往返
+            </button>
+            <button
+              type="button"
+              className={`px-3 py-1.5 ${tripType === 'oneway' ? 'bg-brand text-white' : 'bg-white text-slate-600 hover:bg-slate-50'}`}
+              onClick={() => setTripType('oneway')}
+            >
+              单程
+            </button>
+          </div>
+        </div>
         <form className="mt-4 grid gap-4 md:grid-cols-12" onSubmit={onSubmit}>
           <div className="md:col-span-3">
             <label className="label" htmlFor="origin">出发</label>
@@ -141,11 +176,26 @@ export function HomePage() {
               ))}
             </select>
           </div>
-          <div className="md:col-span-2">
-            <label className="label" htmlFor="date">出发日期</label>
+          <div className={tripType === 'roundtrip' ? 'md:col-span-2' : 'md:col-span-2'}>
+            <label className="label" htmlFor="date">
+              {tripType === 'roundtrip' ? '去程日期' : '出发日期'}
+            </label>
             <input id="date" type="date" className="input" value={date} onChange={(e) => setDate(e.target.value)} />
           </div>
-          <div className="md:col-span-2">
+          {tripType === 'roundtrip' && (
+            <div className="md:col-span-2">
+              <label className="label" htmlFor="returnDate">回程日期</label>
+              <input
+                id="returnDate"
+                type="date"
+                className="input"
+                value={returnDate}
+                min={date}
+                onChange={(e) => setReturnDate(e.target.value)}
+              />
+            </div>
+          )}
+          <div className={tripType === 'roundtrip' ? 'md:col-span-1' : 'md:col-span-2'}>
             <label className="label" htmlFor="cabin">舱等</label>
             <select
               id="cabin"
@@ -193,11 +243,31 @@ export function HomePage() {
 
         {results && results.length > 0 && (
           <>
-            <p className="text-sm text-slate-500">共 {results.length} 个班次</p>
+            <p className="text-sm text-slate-500">
+              {tripType === 'roundtrip' ? '往返' : '单程'} · 共 {results.length} 个班次
+            </p>
             <div className="space-y-3">
-              {results.map((r) => (
+              {/* 按去程/回程分组显示 */}
+              {tripType === 'roundtrip' && results.some((r) => r._leg === '去程') && (
+                <div className="flex items-center gap-2 text-sm font-semibold text-brand mt-2">
+                  <span className="rounded bg-brand/10 px-2 py-0.5">✈ 去程</span>
+                  <span className="text-slate-500 font-normal">{origin} → {destination} · {date}</span>
+                </div>
+              )}
+              {results.filter((r) => r._leg !== '回程').map((r) => (
                 <FlightCard key={r.scheduleId} flight={r} passengers={passengers} isLoggedIn={!!user} />
               ))}
+              {tripType === 'roundtrip' && results.some((r) => r._leg === '回程') && (
+                <>
+                  <div className="flex items-center gap-2 text-sm font-semibold text-brand mt-4">
+                    <span className="rounded bg-brand/10 px-2 py-0.5">✈ 回程</span>
+                    <span className="text-slate-500 font-normal">{destination} → {origin} · {returnDate}</span>
+                  </div>
+                  {results.filter((r) => r._leg === '回程').map((r) => (
+                    <FlightCard key={r.scheduleId} flight={r} passengers={passengers} isLoggedIn={!!user} />
+                  ))}
+                </>
+              )}
             </div>
           </>
         )}

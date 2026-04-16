@@ -36,7 +36,7 @@ export function Layout() {
         <div className="mx-auto flex max-w-7xl items-center justify-between gap-4 px-4 py-3">
           <Link to="/" className="flex items-center gap-2 text-lg font-semibold text-slate-900">
             <span aria-hidden className="text-brand">✈︎</span>
-            <span>机票管家</span>
+            <span>世途旅行</span>
           </Link>
 
           <nav className="hidden md:flex items-center gap-1 text-sm">
@@ -128,7 +128,7 @@ export function Layout() {
 
       <footer className="border-t border-slate-200 bg-white text-xs text-slate-500">
         <div className="mx-auto max-w-7xl px-4 py-4">
-          机票管家 · M2-M5 演示版 · © {new Date().getFullYear()}
+          世途旅行 · M2-M5 演示版 · © {new Date().getFullYear()}
         </div>
       </footer>
 
