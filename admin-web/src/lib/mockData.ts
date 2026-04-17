@@ -1003,3 +1003,62 @@ export const DANANG_HIGHLIGHTS: DanangHighlight[] = [
     tag: '自然秘境',
   },
 ];
+
+// ── 散客管理 ──────────────────────────────────────────────────────
+export interface MockCustomer {
+  id: string;
+  name: string;
+  phone: string;
+  email: string | null;
+  idNumber: string | null;
+  /** 归属代理 id（null = 直销散客） */
+  agentId: string | null;
+  agentName: string | null;
+  createdAt: string;
+  totalOrders: number;
+  totalSpent: number;
+  lastOrderAt: string | null;
+  tags: string[];
+}
+
+export const MOCK_CUSTOMERS: MockCustomer[] = [
+  { id: 'cust1', name: '陈文豪', phone: '+853 6234 5678', email: 'chan@example.com', idNumber: 'MA1234567', agentId: 'a1', agentName: '澳门岘港旅游总代', createdAt: '2026-02-10T10:00:00+08:00', totalOrders: 3, totalSpent: 28560, lastOrderAt: '2026-04-14T14:23:00+08:00', tags: ['VIP', '回头客'] },
+  { id: 'cust2', name: '王美玲', phone: '+852 9012 3456', email: 'wong@example.com', idNumber: 'HK5566778', agentId: null, agentName: null, createdAt: '2026-03-05T09:15:00+08:00', totalOrders: 1, totalSpent: 4380, lastOrderAt: '2026-04-14T16:05:00+08:00', tags: ['新客'] },
+  { id: 'cust3', name: '李嘉欣', phone: '+853 6654 0001', email: null, idNumber: 'MA2345678', agentId: 'a2', agentName: '澳门欢乐旅行社', createdAt: '2026-01-20T15:30:00+08:00', totalOrders: 5, totalSpent: 52300, lastOrderAt: '2026-04-15T09:12:00+08:00', tags: ['VIP'] },
+  { id: 'cust4', name: '张伟', phone: '+853 6023 7788', email: 'zhangwei@mo.com', idNumber: 'MA3456789', agentId: null, agentName: null, createdAt: '2026-04-02T11:00:00+08:00', totalOrders: 2, totalSpent: 11200, lastOrderAt: '2026-04-15T10:48:00+08:00', tags: [] },
+  { id: 'cust5', name: '黄太太', phone: '+853 6876 1122', email: 'huang@mo.com', idNumber: 'MA4567890', agentId: 'a1', agentName: '澳门岘港旅游总代', createdAt: '2025-12-15T13:45:00+08:00', totalOrders: 8, totalSpent: 96400, lastOrderAt: '2026-04-15T11:30:00+08:00', tags: ['VIP', '回头客', '蜜月'] },
+  { id: 'cust6', name: '刘洋', phone: '+852 9234 5566', email: null, idNumber: null, agentId: 'a3', agentName: '澳门威尼斯人门店', createdAt: '2026-03-22T17:20:00+08:00', totalOrders: 1, totalSpent: 588, lastOrderAt: '2026-04-12T14:00:00+08:00', tags: ['新客'] },
+  { id: 'cust7', name: '周芳', phone: '+853 6123 3344', email: 'zhou@example.com', idNumber: 'MA5678901', agentId: null, agentName: null, createdAt: '2026-02-28T08:00:00+08:00', totalOrders: 1, totalSpent: 1380, lastOrderAt: '2026-04-13T18:40:00+08:00', tags: ['退款历史'] },
+  { id: 'cust8', name: '孙悦', phone: '+852 5432 6677', email: 'sun@example.com', idNumber: 'HK7788990', agentId: 'a1', agentName: '澳门岘港旅游总代', createdAt: '2026-01-08T12:00:00+08:00', totalOrders: 4, totalSpent: 22180, lastOrderAt: '2026-04-12T14:00:00+08:00', tags: ['回头客'] },
+];
+
+// ── 旅客管理（订单里的实际出行人）─────────────────────────────────
+export interface MockTraveler {
+  id: string;
+  fullName: string;
+  passportNumber: string;
+  dateOfBirth: string; // YYYY-MM-DD
+  nationality: string;
+  phone: string | null;
+  /** 关联的客户 id（散客本人可能是旅客之一，或代订） */
+  customerIds: string[];
+  /** 出行次数 */
+  tripCount: number;
+  lastTripAt: string | null;
+  notes: string | null;
+}
+
+export const MOCK_TRAVELERS: MockTraveler[] = [
+  { id: 't1', fullName: 'CHAN MAN HO 陈文豪', passportNumber: 'MA1234567', dateOfBirth: '1985-06-15', nationality: 'MO', phone: '+853 6234 5678', customerIds: ['cust1'], tripCount: 3, lastTripAt: '2026-04-14', notes: 'VIP 客户' },
+  { id: 't2', fullName: 'CHAN WAI LING 陈惠玲', passportNumber: 'MA1234568', dateOfBirth: '1987-03-22', nationality: 'MO', phone: null, customerIds: ['cust1'], tripCount: 3, lastTripAt: '2026-04-14', notes: '陈文豪配偶' },
+  { id: 't3', fullName: 'WONG MEI LING 王美玲', passportNumber: 'HK5566778', dateOfBirth: '1990-11-08', nationality: 'HK', phone: '+852 9012 3456', customerIds: ['cust2'], tripCount: 1, lastTripAt: '2026-04-14', notes: null },
+  { id: 't4', fullName: 'LEE KA YIN 李嘉欣', passportNumber: 'MA2345678', dateOfBirth: '1988-11-09', nationality: 'MO', phone: '+853 6654 0001', customerIds: ['cust3'], tripCount: 5, lastTripAt: '2026-04-15', notes: 'VIP · 偏好海景房' },
+  { id: 't5', fullName: 'LEE KA FAI 李家辉', passportNumber: 'MA2345679', dateOfBirth: '1986-05-17', nationality: 'MO', phone: null, customerIds: ['cust3'], tripCount: 5, lastTripAt: '2026-04-15', notes: '李嘉欣丈夫' },
+  { id: 't6', fullName: 'LEE SIN YAN 李善恩', passportNumber: 'MA2345680', dateOfBirth: '2018-09-03', nationality: 'MO', phone: null, customerIds: ['cust3'], tripCount: 2, lastTripAt: '2026-04-15', notes: '儿童 · 需要儿童安全座椅' },
+  { id: 't7', fullName: 'ZHANG WEI 张伟', passportNumber: 'MA3456789', dateOfBirth: '1982-04-20', nationality: 'MO', phone: '+853 6023 7788', customerIds: ['cust4'], tripCount: 2, lastTripAt: '2026-04-15', notes: null },
+  { id: 't8', fullName: 'HUANG LING YUN 黄凌云', passportNumber: 'MA4567890', dateOfBirth: '1975-08-11', nationality: 'MO', phone: '+853 6876 1122', customerIds: ['cust5'], tripCount: 8, lastTripAt: '2026-04-15', notes: 'VIP · 年消费¥96K+' },
+  { id: 't9', fullName: 'HUANG YUE 黄悦', passportNumber: 'MA4567891', dateOfBirth: '2015-02-14', nationality: 'MO', phone: null, customerIds: ['cust5'], tripCount: 4, lastTripAt: '2026-04-15', notes: '黄太太女儿 · 蜜月套餐记录' },
+  { id: 't10', fullName: 'LIU YANG 刘洋', passportNumber: 'HK3344556', dateOfBirth: '1995-07-28', nationality: 'HK', phone: '+852 9234 5566', customerIds: ['cust6'], tripCount: 1, lastTripAt: '2026-04-12', notes: null },
+  { id: 't11', fullName: 'ZHOU FANG 周芳', passportNumber: 'MA5678901', dateOfBirth: '1992-12-30', nationality: 'MO', phone: '+853 6123 3344', customerIds: ['cust7'], tripCount: 1, lastTripAt: '2026-04-13', notes: '有退款记录' },
+  { id: 't12', fullName: 'SUN YUE 孙悦', passportNumber: 'HK7788990', dateOfBirth: '1991-06-10', nationality: 'HK', phone: '+852 5432 6677', customerIds: ['cust8'], tripCount: 4, lastTripAt: '2026-04-12', notes: null },
+];

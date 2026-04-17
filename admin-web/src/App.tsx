@@ -9,6 +9,8 @@ import { SeatAllocationPage } from './pages/SeatAllocationPage';
 import { ProductsPage } from './pages/ProductsPage';
 import { PricingPage } from './pages/PricingPage';
 import { AgentsPage } from './pages/AgentsPage';
+import { CustomersPage } from './pages/CustomersPage';
+import { TravelersPage } from './pages/TravelersPage';
 import { useAuth } from './stores/auth';
 
 function Protected({ children }: { children: React.ReactNode }) {
@@ -91,6 +93,22 @@ export function App() {
           element={
             <Protected>
               <AgentsPage />
+            </Protected>
+          }
+        />
+        <Route
+          path="/customers"
+          element={
+            <Protected>
+              <CustomersPage />
+            </Protected>
+          }
+        />
+        <Route
+          path="/travelers"
+          element={
+            <Protected>
+              <TravelersPage />
             </Protected>
           }
         />

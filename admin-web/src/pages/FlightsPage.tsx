@@ -1,4 +1,4 @@
-import { FormEvent, useCallback, useEffect, useState } from 'react';
+import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import { api, ApiError, type AdminFlight, type CabinClass } from '../lib/api';
 import { AIRPORT_OPTIONS, CABIN_LABEL, airportLabel, formatLocalDate, formatLocalTime } from '../lib/airports';
 import { useAuth } from '../stores/auth';
@@ -32,6 +32,7 @@ export function FlightsPage() {
   const [schedulesByFlight, setSchedulesByFlight] = useState<Record<string, AdminSchedule[]>>({});
   const [showNewFlight, setShowNewFlight] = useState(false);
   const [addingScheduleFor, setAddingScheduleFor] = useState<string | null>(null);
+  const [bulkAddingFor, setBulkAddingFor] = useState<string | null>(null);
 
   const reload = useCallback(async () => {
     if (!tokens) return;
@@ -155,6 +156,13 @@ export function FlightsPage() {
                     </button>
                     <button
                       type="button"
+                      className="btn-primary text-sm"
+                      onClick={() => setBulkAddingFor(f.id)}
+                    >
+                      📅 批量加班次
+                    </button>
+                    <button
+                      type="button"
                       className="btn-secondary text-sm"
                       onClick={() => onToggleFlight(f.id)}
                     >
@@ -171,6 +179,18 @@ export function FlightsPage() {
                 onCancel={() => setAddingScheduleFor(null)}
                 onCreated={async () => {
                   setAddingScheduleFor(null);
+                  await reload();
+                  if (expanded === f.id) await refreshSchedules(f.id);
+                }}
+              />
+            )}
+
+            {bulkAddingFor === f.id && (
+              <BulkScheduleForm
+                flight={f}
+                onCancel={() => setBulkAddingFor(null)}
+                onCreated={async () => {
+                  setBulkAddingFor(null);
                   await reload();
                   if (expanded === f.id) await refreshSchedules(f.id);
                 }}
@@ -507,6 +527,191 @@ function NewScheduleForm({
           <button type="button" className="btn-secondary" onClick={onCancel}>取消</button>
           <button type="submit" className="btn-primary" disabled={submitting}>
             {submitting ? '创建中…' : '添加班次'}
+          </button>
+        </div>
+      </form>
+    </section>
+  );
+}
+
+// ── 批量创建班次 ────────────────────────────────────────────────
+function BulkScheduleForm({
+  flight,
+  onCancel,
+  onCreated,
+}: {
+  flight: AdminFlight;
+  onCancel: () => void;
+  onCreated: () => void;
+}) {
+  const tokens = useAuth((s) => s.tokens);
+
+  function addDays(offset: number): string {
+    const d = new Date();
+    d.setDate(d.getDate() + offset);
+    return d.toISOString().slice(0, 10);
+  }
+
+  const [startDate, setStartDate] = useState(addDays(30));
+  const [endDate, setEndDate] = useState(addDays(90));
+  const [weekdays, setWeekdays] = useState<Set<number>>(new Set([0, 1, 2, 3, 4, 5, 6])); // 全选
+  const [departTime, setDepartTime] = useState('11:40');
+  const [durationMinutes, setDurationMinutes] = useState(105);
+  const [econCapacity, setEconCapacity] = useState(180);
+  const [econPrice, setEconPrice] = useState(1380);
+  const [bizCapacity, setBizCapacity] = useState(20);
+  const [bizPrice, setBizPrice] = useState(4280);
+  const [submitting, setSubmitting] = useState(false);
+  const [progress, setProgress] = useState({ done: 0, total: 0, errors: 0 });
+  const [result, setResult] = useState<string | null>(null);
+
+  // 预估将创建的班次数
+  const previewCount = useMemo(() => {
+    if (!startDate || !endDate) return 0;
+    const s = new Date(startDate);
+    const e = new Date(endDate);
+    if (e < s) return 0;
+    let count = 0;
+    for (let d = new Date(s); d <= e; d.setDate(d.getDate() + 1)) {
+      if (weekdays.has(d.getDay())) count++;
+    }
+    return count;
+  }, [startDate, endDate, weekdays]);
+
+  const toggleWeekday = (day: number) => {
+    setWeekdays((prev) => {
+      const next = new Set(prev);
+      if (next.has(day)) next.delete(day);
+      else next.add(day);
+      return next;
+    });
+  };
+
+  const onSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!tokens) return;
+    if (previewCount === 0) { alert('没有日期可创建，检查日期范围和星期几'); return; }
+    if (!confirm(`将创建 ${previewCount} 个班次，确认？`)) return;
+
+    setSubmitting(true);
+    setProgress({ done: 0, total: previewCount, errors: 0 });
+
+    const s = new Date(startDate);
+    const e2 = new Date(endDate);
+    let done = 0, errors = 0;
+
+    const depTz = flight.originCode === 'DAD' ? 'Asia/Ho_Chi_Minh' : 'Asia/Macau';
+    const arrTz = flight.destinationCode === 'DAD' ? 'Asia/Ho_Chi_Minh' : 'Asia/Macau';
+    const [hour, minute] = departTime.split(':').map(Number);
+    const offsetHours = depTz === 'Asia/Macau' ? 8 : 7;
+
+    for (let d = new Date(s); d <= e2; d.setDate(d.getDate() + 1)) {
+      if (!weekdays.has(d.getDay())) continue;
+      try {
+        const y = d.getFullYear();
+        const m = d.getMonth();
+        const day = d.getDate();
+        const depUTC = new Date(Date.UTC(y, m, day, hour - offsetHours, minute, 0)).toISOString();
+        const arrUTC = new Date(Date.UTC(y, m, day, hour - offsetHours, minute, 0) + durationMinutes * 60 * 1000).toISOString();
+        await api.createSchedule(tokens.accessToken, {
+          flightId: flight.id,
+          departureTime: depUTC,
+          arrivalTime: arrUTC,
+          departureTz: depTz,
+          arrivalTz: arrTz,
+          seatClasses: [
+            { cabin: 'ECONOMY', capacity: econCapacity, basePrice: econPrice },
+            ...(bizCapacity > 0 ? [{ cabin: 'BUSINESS' as const, capacity: bizCapacity, basePrice: bizPrice }] : []),
+          ],
+        });
+        done++;
+      } catch {
+        errors++;
+      }
+      setProgress({ done: done + errors, total: previewCount, errors });
+    }
+
+    setSubmitting(false);
+    setResult(`✅ 完成：成功 ${done} 个${errors > 0 ? ` · 失败 ${errors} 个（已存在或冲突）` : ''}`);
+    if (errors < previewCount) setTimeout(onCreated, 2000);
+  };
+
+  const DOW_LABEL = ['日', '一', '二', '三', '四', '五', '六'];
+
+  return (
+    <section className="mt-4 rounded-lg border-2 border-brand/50 bg-brand/5 p-4">
+      <h3 className="font-semibold text-slate-900">
+        📅 批量添加 <span className="text-brand">{flight.flightNumber}</span> 班次
+      </h3>
+      <p className="text-xs text-slate-500 mt-0.5">按日期范围 + 星期几，批量生成相同时刻的班次</p>
+
+      <form className="mt-4 grid gap-3 md:grid-cols-4" onSubmit={onSubmit}>
+        <div>
+          <label className="label">起始日期</label>
+          <input type="date" className="input" value={startDate} onChange={(e) => setStartDate(e.target.value)} />
+        </div>
+        <div>
+          <label className="label">结束日期</label>
+          <input type="date" className="input" value={endDate} min={startDate} onChange={(e) => setEndDate(e.target.value)} />
+        </div>
+        <div className="md:col-span-2">
+          <label className="label">适用星期</label>
+          <div className="flex gap-1">
+            {DOW_LABEL.map((d, i) => (
+              <button
+                key={i}
+                type="button"
+                className={`flex-1 py-2 rounded text-sm ${weekdays.has(i) ? 'bg-brand text-white' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'}`}
+                onClick={() => toggleWeekday(i)}
+              >
+                {d}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div>
+          <label className="label">出发时间（本地）</label>
+          <input type="time" className="input" value={departTime} onChange={(e) => setDepartTime(e.target.value)} />
+        </div>
+        <div>
+          <label className="label">飞行时长（分钟）</label>
+          <input type="number" min={30} max={600} className="input" value={durationMinutes} onChange={(e) => setDurationMinutes(Number(e.target.value) || 0)} />
+        </div>
+        <div>
+          <label className="label">经济座位 / 单价</label>
+          <div className="flex gap-1">
+            <input type="number" min={0} className="input" value={econCapacity} onChange={(e) => setEconCapacity(Number(e.target.value) || 0)} />
+            <input type="number" min={0} className="input" placeholder="¥" value={econPrice} onChange={(e) => setEconPrice(Number(e.target.value) || 0)} />
+          </div>
+        </div>
+        <div>
+          <label className="label">商务座位 / 单价</label>
+          <div className="flex gap-1">
+            <input type="number" min={0} className="input" value={bizCapacity} onChange={(e) => setBizCapacity(Number(e.target.value) || 0)} />
+            <input type="number" min={0} className="input" placeholder="¥" value={bizPrice} onChange={(e) => setBizPrice(Number(e.target.value) || 0)} />
+          </div>
+        </div>
+
+        <div className="md:col-span-4 rounded-md bg-white border border-slate-200 p-3">
+          <div className="flex items-center justify-between text-sm">
+            <span className="text-slate-600">预计创建班次数</span>
+            <span className="text-2xl font-bold text-brand">{previewCount} 个</span>
+          </div>
+          {submitting && (
+            <div className="mt-2">
+              <div className="h-2 bg-slate-200 rounded-full overflow-hidden">
+                <div className="h-full bg-brand transition-all" style={{ width: `${(progress.done / Math.max(1, progress.total)) * 100}%` }} />
+              </div>
+              <div className="text-xs text-slate-500 mt-1">进度: {progress.done} / {progress.total} · 失败 {progress.errors}</div>
+            </div>
+          )}
+          {result && <div className="mt-2 text-sm text-green-700">{result}</div>}
+        </div>
+
+        <div className="md:col-span-4 flex justify-end gap-3">
+          <button type="button" className="btn-secondary" onClick={onCancel}>取消</button>
+          <button type="submit" className="btn-primary" disabled={submitting || previewCount === 0}>
+            {submitting ? `创建中 ${progress.done}/${progress.total}...` : `批量创建 ${previewCount} 个班次`}
           </button>
         </div>
       </form>

@@ -17,6 +17,8 @@ const NAV = [
   { to: '/products', label: '产品管理' },
   { to: '/pricing', label: '动态定价' },
   { to: '/agents', label: '代理管理' },
+  { to: '/customers', label: '散客管理' },
+  { to: '/travelers', label: '旅客管理' },
 ];
 
 export function Layout() {

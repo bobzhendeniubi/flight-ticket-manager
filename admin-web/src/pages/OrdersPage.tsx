@@ -6,6 +6,7 @@ import {
   type MockOrder,
   type MockOrderStatus,
 } from '../lib/mockData';
+import { exportToCSV } from '../lib/csvExport';
 
 const ALL_STATUSES: MockOrderStatus[] = [
   'PENDING_PAYMENT',
@@ -106,7 +107,29 @@ export function OrdersPage() {
             全渠道订单实时视图，可按状态和产品筛选，点击订单查看详情并操作状态流转。
           </p>
         </div>
-        <span className="rounded bg-slate-100 px-3 py-1 text-xs text-slate-600">共 {filtered.length} 条</span>
+        <div className="flex items-center gap-2">
+          <span className="rounded bg-slate-100 px-3 py-1 text-xs text-slate-600">共 {filtered.length} 条</span>
+          <button
+            className="btn-secondary text-sm"
+            onClick={() =>
+              exportToCSV('订单列表', filtered, [
+                { key: 'orderNumber', label: '订单号' },
+                { key: 'customerName', label: '客户' },
+                { key: 'contactPhone', label: '电话' },
+                { key: 'agentName', label: '归属代理', format: (v) => String(v ?? '直销') },
+                { key: 'itemKind', label: '产品类型', format: (v) => KIND_LABEL[v as MockOrder['itemKind']] },
+                { key: 'itemSummary', label: '订单内容' },
+                { key: 'passengerCount', label: '人数' },
+                { key: 'total', label: '金额', format: (v) => `¥${Number(v).toLocaleString()}` },
+                { key: 'paymentMethod', label: '支付方式', format: (v) => String(v ?? '—') },
+                { key: 'status', label: '状态', format: (v) => STATUS_LABEL[v as MockOrderStatus] },
+                { key: 'createdAt', label: '下单时间', format: (v) => new Date(String(v)).toLocaleString('zh-CN') },
+              ])
+            }
+          >
+            📥 导出 CSV
+          </button>
+        </div>
       </section>
 
       {/* 代理维度统计 */}
