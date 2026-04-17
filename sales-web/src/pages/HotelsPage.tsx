@@ -130,33 +130,23 @@ export function HotelsPage() {
         <HotelDetailModal
           hotel={selected}
           nights={nights}
+          checkIn={checkIn}
+          checkOut={checkOut}
           onClose={() => setSelected(null)}
-          onAddToCart={() => {
+          onAdd={(room, rooms, goCart) => {
+            const unitPrice = Math.round(selected.basePrice * room.priceMult * nights) * rooms;
             add({
               kind: 'HOTEL',
-              productId: selected.id,
-              name: `${selected.name} × ${nights} 晚`,
-              description: `${selected.area} · ${'★'.repeat(selected.stars)}`,
+              productId: `${selected.id}-${room.name}`,
+              name: `${selected.name} · ${room.name} × ${rooms} 房 · ${nights} 晚`,
+              description: `${selected.area} · ${'★'.repeat(selected.stars)} · ${room.bedType}`,
               emoji: selected.emoji,
-              unitPrice: selected.basePrice * nights,
+              unitPrice,
               qty: 1,
-              meta: { checkIn, checkOut, nights },
+              meta: { checkIn, checkOut, nights, roomType: room.name, rooms },
             });
             setSelected(null);
-          }}
-          onBuyNow={() => {
-            add({
-              kind: 'HOTEL',
-              productId: selected.id,
-              name: `${selected.name} × ${nights} 晚`,
-              description: `${selected.area} · ${'★'.repeat(selected.stars)}`,
-              emoji: selected.emoji,
-              unitPrice: selected.basePrice * nights,
-              qty: 1,
-              meta: { checkIn, checkOut, nights },
-            });
-            setSelected(null);
-            navigate('/cart');
+            if (goCart) navigate('/cart');
           }}
         />
       )}
@@ -167,17 +157,30 @@ export function HotelsPage() {
 function HotelDetailModal({
   hotel,
   nights,
+  checkIn,
+  checkOut,
   onClose,
-  onAddToCart,
-  onBuyNow,
+  onAdd,
 }: {
   hotel: MockHotel;
   nights: number;
+  checkIn: string;
+  checkOut: string;
   onClose: () => void;
-  onAddToCart: () => void;
-  onBuyNow: () => void;
+  onAdd: (room: import('../lib/mockData').HotelRoomType, rooms: number, goCart: boolean) => void;
 }) {
-  const total = hotel.basePrice * nights;
+  const [selectedRoomIdx, setSelectedRoomIdx] = useState(0);
+  const [rooms, setRooms] = useState(1);
+  const [selectedCheckIn, setSelectedCheckIn] = useState(checkIn);
+  const [selectedCheckOut, setSelectedCheckOut] = useState(checkOut);
+  const room = hotel.roomTypes[selectedRoomIdx];
+  const actualNights = Math.max(
+    1,
+    Math.round((new Date(selectedCheckOut).getTime() - new Date(selectedCheckIn).getTime()) / 86400000),
+  );
+  const _unused = nights; void _unused;
+  const unitPrice = Math.round(hotel.basePrice * room.priceMult);
+  const total = unitPrice * actualNights * rooms;
 
   return (
     <div
@@ -185,7 +188,7 @@ function HotelDetailModal({
       onClick={onClose}
     >
       <div
-        className="max-h-[90vh] w-full max-w-2xl overflow-auto rounded-lg bg-white shadow-xl"
+        className="max-h-[90vh] w-full max-w-3xl overflow-auto rounded-lg bg-white shadow-xl"
         onClick={(e) => e.stopPropagation()}
       >
         <div className="sticky top-0 flex items-center justify-between border-b border-slate-200 bg-white px-6 py-4">
@@ -194,53 +197,119 @@ function HotelDetailModal({
         </div>
 
         <div className="px-6 py-5 space-y-4">
-          {(
-            <>
-              <div className="flex items-center gap-3">
-                <span className="rounded bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-700">
-                  {'★'.repeat(hotel.stars)}
-                </span>
-                <span className="rounded bg-green-100 px-2 py-0.5 text-xs font-semibold text-green-700">
-                  {hotel.rating} / 5
-                </span>
-                <span className="text-xs text-slate-500">{hotel.reviewCount} 条评价</span>
+          <img src={hotel.photo} alt={hotel.name} className="w-full h-52 object-cover rounded-md" />
+
+          <div className="flex items-center gap-3">
+            <span className="rounded bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-700">
+              {'★'.repeat(hotel.stars)}
+            </span>
+            <span className="rounded bg-green-100 px-2 py-0.5 text-xs font-semibold text-green-700">
+              {hotel.rating} / 5
+            </span>
+            <span className="text-xs text-slate-500">{hotel.reviewCount} 条评价</span>
+            <span className="text-xs text-slate-500">· 📍 {hotel.area}</span>
+          </div>
+          <p className="text-sm text-slate-700 italic">{hotel.highlight}</p>
+
+          {/* 入住日期调整 */}
+          <div className="grid gap-3 md:grid-cols-3">
+            <div>
+              <label className="label text-xs">入住</label>
+              <input
+                type="date"
+                className="input"
+                value={selectedCheckIn}
+                onChange={(e) => setSelectedCheckIn(e.target.value)}
+              />
+            </div>
+            <div>
+              <label className="label text-xs">退房</label>
+              <input
+                type="date"
+                className="input"
+                value={selectedCheckOut}
+                min={selectedCheckIn}
+                onChange={(e) => setSelectedCheckOut(e.target.value)}
+              />
+            </div>
+            <div>
+              <label className="label text-xs">房间数</label>
+              <div className="flex items-center rounded-md border border-slate-300 overflow-hidden h-9">
+                <button
+                  type="button"
+                  className="px-3 hover:bg-slate-50 disabled:text-slate-300 h-full"
+                  disabled={rooms <= 1}
+                  onClick={() => setRooms(rooms - 1)}
+                >−</button>
+                <span className="flex-1 text-center tabular-nums font-medium">{rooms}</span>
+                <button
+                  type="button"
+                  className="px-3 hover:bg-slate-50 disabled:text-slate-300 h-full"
+                  disabled={rooms >= 5}
+                  onClick={() => setRooms(rooms + 1)}
+                >+</button>
               </div>
-              <div>
-                <h3 className="font-medium text-slate-900">位置与卖点</h3>
-                <p className="mt-1 text-sm text-slate-600">📍 {hotel.area}</p>
-                <p className="mt-1 text-sm text-slate-700 italic">{hotel.highlight}</p>
-              </div>
-              <div>
-                <h3 className="font-medium text-slate-900">设施服务</h3>
-                <div className="mt-2 flex flex-wrap gap-2">
-                  {hotel.amenities.map((a) => (
-                    <span key={a} className="rounded-md bg-slate-100 px-3 py-1 text-sm text-slate-700">
-                      {a}
-                    </span>
-                  ))}
-                </div>
-              </div>
-              <div className="rounded-md border border-slate-200 bg-slate-50 p-4">
-                <div className="flex justify-between text-sm">
-                  <span className="text-slate-600">房价（每晚）</span>
-                  <span className="font-medium text-slate-900">¥{hotel.basePrice}</span>
-                </div>
-                <div className="mt-1 flex justify-between text-sm">
-                  <span className="text-slate-600">入住 × {nights} 晚</span>
-                  <span className="font-medium text-slate-900">¥{total}</span>
-                </div>
-                <div className="mt-3 flex items-end justify-between border-t border-slate-200 pt-3">
-                  <span className="text-sm text-slate-600">合计</span>
-                  <span className="text-2xl font-bold text-red-600">¥{total}</span>
-                </div>
-              </div>
-              <div className="flex justify-end gap-3">
-                <button className="btn-secondary" onClick={onClose}>取消</button>
-                <button className="btn-secondary" onClick={onAddToCart}>🛒 加入购物车</button>
-                <button className="btn-primary" onClick={onBuyNow}>立即购买 →</button>
-              </div>
-            </>
-          )}
+            </div>
+          </div>
+
+          {/* 房型选择 */}
+          <div>
+            <h3 className="font-medium text-slate-900">选择房型（{hotel.roomTypes.length} 种）</h3>
+            <div className="mt-2 space-y-2">
+              {hotel.roomTypes.map((r, idx) => {
+                const rPrice = Math.round(hotel.basePrice * r.priceMult);
+                const selected = idx === selectedRoomIdx;
+                return (
+                  <button
+                    key={r.name}
+                    type="button"
+                    onClick={() => setSelectedRoomIdx(idx)}
+                    className={`w-full text-left rounded-md border-2 p-3 transition ${
+                      selected ? 'border-brand bg-brand/5' : 'border-slate-200 hover:border-slate-300'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <span className="font-semibold text-slate-900">{r.name}</span>
+                          {selected && <span className="rounded bg-brand px-1.5 py-0.5 text-xs text-white">已选</span>}
+                        </div>
+                        <div className="mt-0.5 text-xs text-slate-500">
+                          {r.bedType} · 可住 {r.sleeps} 人
+                        </div>
+                      </div>
+                      <div className="text-right">
+                        <div className="text-lg font-bold text-red-600">¥{rPrice}</div>
+                        <div className="text-xs text-slate-400">每晚</div>
+                      </div>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* 价格汇总 */}
+          <div className="rounded-md border border-slate-200 bg-slate-50 p-4">
+            <div className="flex justify-between text-sm">
+              <span className="text-slate-600">{room.name} · ¥{unitPrice}/晚</span>
+              <span className="font-medium text-slate-900">¥{unitPrice}</span>
+            </div>
+            <div className="mt-1 flex justify-between text-sm">
+              <span className="text-slate-600">{actualNights} 晚 × {rooms} 房</span>
+              <span className="font-medium text-slate-900">¥{unitPrice * actualNights * rooms}</span>
+            </div>
+            <div className="mt-3 flex items-end justify-between border-t border-slate-200 pt-3">
+              <span className="text-sm text-slate-600">合计</span>
+              <span className="text-2xl font-bold text-red-600">¥{total.toLocaleString()}</span>
+            </div>
+          </div>
+
+          <div className="flex justify-end gap-3">
+            <button className="btn-secondary" onClick={onClose}>取消</button>
+            <button className="btn-secondary" onClick={() => onAdd(room, rooms, false)}>🛒 加入购物车</button>
+            <button className="btn-primary" onClick={() => onAdd(room, rooms, true)}>立即购买 →</button>
+          </div>
         </div>
       </div>
     </div>

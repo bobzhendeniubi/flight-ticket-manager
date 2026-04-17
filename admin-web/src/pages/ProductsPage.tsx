@@ -172,6 +172,10 @@ function NewHotelForm({
             photo: 'https://images.unsplash.com/photo-1566073771259-6a8506099945?w=600&h=400&fit=crop',
             amenities: ['免费 WiFi', '含早餐'],
             highlight: '新增酒店（demo）',
+            roomTypes: [
+              { name: '标准房', priceMult: 1.0, sleeps: 2, bedType: '双床或大床' },
+              { name: '豪华房', priceMult: 1.3, sleeps: 2, bedType: '1 大床' },
+            ],
           });
         }}
       >

@@ -6,6 +6,13 @@
  */
 
 // ── 岘港酒店 ───────────────────────────────────────────────────────
+export interface HotelRoomType {
+  name: string;
+  priceMult: number; // 倍率相对于 basePrice
+  sleeps: number;
+  bedType: string;
+}
+
 export interface MockHotel {
   id: string;
   name: string; // 中文名
@@ -20,6 +27,7 @@ export interface MockHotel {
   photo: string;
   amenities: string[];
   highlight: string;
+  roomTypes: HotelRoomType[];
 }
 
 export const MOCK_HOTELS: MockHotel[] = [
@@ -37,6 +45,12 @@ export const MOCK_HOTELS: MockHotel[] = [
     photo: 'https://images.unsplash.com/photo-1582719508461-905c673771fd?w=600&h=400&fit=crop',
     amenities: ['私人海滩', '全海景别墅', '3 个无边泳池', '含自助早餐', '免费班车', 'SPA'],
     highlight: '全别墅式私密度假，The Nam Hai 独家 1km 海岸线',
+    roomTypes: [
+      { name: '豪华双床房', priceMult: 1, sleeps: 2, bedType: '2 张单人床' },
+      { name: '海景大床房', priceMult: 1.15, sleeps: 2, bedType: '1 张大床 · 海景' },
+      { name: '行政套房', priceMult: 1.45, sleeps: 3, bedType: '1 张大床 + 客厅' },
+      { name: '别墅套房', priceMult: 1.85, sleeps: 4, bedType: '2 卧室 + 私人泳池' },
+    ],
   },
   {
     id: 'h2',
@@ -52,6 +66,12 @@ export const MOCK_HOTELS: MockHotel[] = [
     photo: 'https://images.unsplash.com/photo-1520250497591-112f2f40a3f4?w=600&h=400&fit=crop',
     amenities: ['私人海湾', '缆车', '米其林餐厅 La Maison 1888', '日落无敌海景', '豪华 SPA'],
     highlight: 'Bill Bensley 设计，山茶半岛独占海湾，明星度假首选',
+    roomTypes: [
+      { name: '豪华双床房', priceMult: 1, sleeps: 2, bedType: '2 张单人床' },
+      { name: '海景大床房', priceMult: 1.15, sleeps: 2, bedType: '1 张大床 · 海景' },
+      { name: '行政套房', priceMult: 1.45, sleeps: 3, bedType: '1 张大床 + 客厅' },
+      { name: '别墅套房', priceMult: 1.85, sleeps: 4, bedType: '2 卧室 + 私人泳池' },
+    ],
   },
   {
     id: 'h3',
@@ -67,6 +87,12 @@ export const MOCK_HOTELS: MockHotel[] = [
     photo: 'https://images.unsplash.com/photo-1571896349842-33c89424de2d?w=600&h=400&fit=crop',
     amenities: ['5 个泳池', '直通海滩', '儿童俱乐部', '含早餐', '免费机场班车'],
     highlight: '美溪海滩热门家庭首选，亲子设施完善',
+    roomTypes: [
+      { name: '豪华双床房', priceMult: 1, sleeps: 2, bedType: '2 张单人床' },
+      { name: '海景大床房', priceMult: 1.15, sleeps: 2, bedType: '1 张大床 · 海景' },
+      { name: '行政套房', priceMult: 1.45, sleeps: 3, bedType: '1 张大床 + 客厅' },
+      { name: '别墅套房', priceMult: 1.85, sleeps: 4, bedType: '2 卧室 + 私人泳池' },
+    ],
   },
   {
     id: 'h4',
@@ -82,6 +108,12 @@ export const MOCK_HOTELS: MockHotel[] = [
     photo: 'https://images.unsplash.com/photo-1564501049412-61c2a3083791?w=600&h=400&fit=crop',
     amenities: ['私人沙滩', '无边泳池', '含早餐', '水上运动', '健身房'],
     highlight: '法式度假风，步行 3 分钟到美溪海滩',
+    roomTypes: [
+      { name: '豪华双床房', priceMult: 1, sleeps: 2, bedType: '2 张单人床' },
+      { name: '海景大床房', priceMult: 1.15, sleeps: 2, bedType: '1 张大床 · 海景' },
+      { name: '行政套房', priceMult: 1.45, sleeps: 3, bedType: '1 张大床 + 客厅' },
+      { name: '别墅套房', priceMult: 1.85, sleeps: 4, bedType: '2 卧室 + 私人泳池' },
+    ],
   },
   {
     id: 'h5',
@@ -97,6 +129,12 @@ export const MOCK_HOTELS: MockHotel[] = [
     photo: 'https://images.unsplash.com/photo-1540541338287-41700207dee6?w=600&h=400&fit=crop',
     amenities: ['每日 2 次 SPA 免费', '私人泳池别墅', '养生健康餐', '瑜伽课程'],
     highlight: '全别墅 All-SPA-Inclusive，越南养生度假代表',
+    roomTypes: [
+      { name: '豪华双床房', priceMult: 1, sleeps: 2, bedType: '2 张单人床' },
+      { name: '海景大床房', priceMult: 1.15, sleeps: 2, bedType: '1 张大床 · 海景' },
+      { name: '行政套房', priceMult: 1.45, sleeps: 3, bedType: '1 张大床 + 客厅' },
+      { name: '别墅套房', priceMult: 1.85, sleeps: 4, bedType: '2 卧室 + 私人泳池' },
+    ],
   },
   {
     id: 'h6',
@@ -112,6 +150,11 @@ export const MOCK_HOTELS: MockHotel[] = [
     photo: 'https://images.unsplash.com/photo-1566073771259-6a8506099945?w=600&h=400&fit=crop',
     amenities: ['海滩直通', '泳池', '健身房', '含早餐'],
     highlight: '性价比之选，美溪核心段，离酒吧街 5 分钟',
+    roomTypes: [
+      { name: '标准双床房', priceMult: 1, sleeps: 2, bedType: '2 张单人床' },
+      { name: '豪华大床房', priceMult: 1.15, sleeps: 2, bedType: '1 张大床' },
+      { name: '家庭房', priceMult: 1.4, sleeps: 4, bedType: '1 大床 + 2 单人床' },
+    ],
   },
   {
     id: 'h7',
@@ -127,6 +170,12 @@ export const MOCK_HOTELS: MockHotel[] = [
     photo: 'https://images.unsplash.com/photo-1578683010236-d716f9a3f461?w=600&h=400&fit=crop',
     amenities: ['私人海滩', '全日 SPA 免费', '瑜伽', '含早餐'],
     highlight: '岘港-会安黄金地段，15 分钟到会安古城',
+    roomTypes: [
+      { name: '豪华双床房', priceMult: 1, sleeps: 2, bedType: '2 张单人床' },
+      { name: '海景大床房', priceMult: 1.15, sleeps: 2, bedType: '1 张大床 · 海景' },
+      { name: '行政套房', priceMult: 1.45, sleeps: 3, bedType: '1 张大床 + 客厅' },
+      { name: '别墅套房', priceMult: 1.85, sleeps: 4, bedType: '2 卧室 + 私人泳池' },
+    ],
   },
   {
     id: 'h8',
@@ -142,6 +191,11 @@ export const MOCK_HOTELS: MockHotel[] = [
     photo: 'https://images.unsplash.com/photo-1551882547-ff40c63fe5fa?w=600&h=400&fit=crop',
     amenities: ['厨房 / 洗衣机', '韩江景观', '免费 WiFi', '靠近龙桥'],
     highlight: '市区公寓式酒店，适合长住和家庭，近龙桥',
+    roomTypes: [
+      { name: '标准双床房', priceMult: 1, sleeps: 2, bedType: '2 张单人床' },
+      { name: '豪华大床房', priceMult: 1.15, sleeps: 2, bedType: '1 张大床' },
+      { name: '家庭房', priceMult: 1.4, sleeps: 4, bedType: '1 大床 + 2 单人床' },
+    ],
   },
   {
     id: 'h9',
@@ -157,6 +211,12 @@ export const MOCK_HOTELS: MockHotel[] = [
     photo: 'https://images.unsplash.com/photo-1600596542815-ffad4c1539a9?w=600&h=400&fit=crop',
     amenities: ['全日 SPA 免费', '私人泳池别墅', '养生餐', '禅修花园'],
     highlight: '越南顶级 Wellness 概念，每日 2 次免费 SPA',
+    roomTypes: [
+      { name: '豪华双床房', priceMult: 1, sleeps: 2, bedType: '2 张单人床' },
+      { name: '海景大床房', priceMult: 1.15, sleeps: 2, bedType: '1 张大床 · 海景' },
+      { name: '行政套房', priceMult: 1.45, sleeps: 3, bedType: '1 张大床 + 客厅' },
+      { name: '别墅套房', priceMult: 1.85, sleeps: 4, bedType: '2 卧室 + 私人泳池' },
+    ],
   },
   {
     id: 'h10',
@@ -172,6 +232,12 @@ export const MOCK_HOTELS: MockHotel[] = [
     photo: 'https://images.unsplash.com/photo-1542314831-068cd1dbfeeb?w=600&h=400&fit=crop',
     amenities: ['250m 海岸线', '5 个泳池', '万豪会员积分', '含早餐'],
     highlight: '万豪集团旗下，会员积分 + 升房稳定',
+    roomTypes: [
+      { name: '豪华双床房', priceMult: 1, sleeps: 2, bedType: '2 张单人床' },
+      { name: '海景大床房', priceMult: 1.15, sleeps: 2, bedType: '1 张大床 · 海景' },
+      { name: '行政套房', priceMult: 1.45, sleeps: 3, bedType: '1 张大床 + 客厅' },
+      { name: '别墅套房', priceMult: 1.85, sleeps: 4, bedType: '2 卧室 + 私人泳池' },
+    ],
   },
   {
     id: 'h11',
@@ -187,6 +253,12 @@ export const MOCK_HOTELS: MockHotel[] = [
     photo: 'https://images.unsplash.com/photo-1584132967334-10e028bd69f7?w=600&h=400&fit=crop',
     amenities: ['私人沙滩', '免费班车去 Vinpearl Land', '亲子俱乐部'],
     highlight: '越南本土豪牌 Vingroup，含 Vinpearl Land 主题公园门票',
+    roomTypes: [
+      { name: '豪华双床房', priceMult: 1, sleeps: 2, bedType: '2 张单人床' },
+      { name: '海景大床房', priceMult: 1.15, sleeps: 2, bedType: '1 张大床 · 海景' },
+      { name: '行政套房', priceMult: 1.45, sleeps: 3, bedType: '1 张大床 + 客厅' },
+      { name: '别墅套房', priceMult: 1.85, sleeps: 4, bedType: '2 卧室 + 私人泳池' },
+    ],
   },
   {
     id: 'h12',
@@ -202,6 +274,12 @@ export const MOCK_HOTELS: MockHotel[] = [
     photo: 'https://images.unsplash.com/photo-1596178065887-1198b6148b2b?w=600&h=400&fit=crop',
     amenities: ['秋盆河景', '步行 10 分钟到古城', 'SPA', '含早餐'],
     highlight: '安岚集团 · 古城唯一河景五星，灯笼之夜步行可达',
+    roomTypes: [
+      { name: '豪华双床房', priceMult: 1, sleeps: 2, bedType: '2 张单人床' },
+      { name: '海景大床房', priceMult: 1.15, sleeps: 2, bedType: '1 张大床 · 海景' },
+      { name: '行政套房', priceMult: 1.45, sleeps: 3, bedType: '1 张大床 + 客厅' },
+      { name: '别墅套房', priceMult: 1.85, sleeps: 4, bedType: '2 卧室 + 私人泳池' },
+    ],
   },
 ];
 
