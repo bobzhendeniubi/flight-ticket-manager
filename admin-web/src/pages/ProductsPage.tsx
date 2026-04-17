@@ -88,9 +88,17 @@ export function ProductsPage() {
 // ─── 酒店 ───────────────────────────────────────────────────────────
 function HotelsSection({ items, onChange }: { items: MockHotel[]; onChange: (v: MockHotel[]) => void }) {
   const [showForm, setShowForm] = useState(false);
+  const [editing, setEditing] = useState<MockHotel | null>(null);
   return (
     <div className="space-y-3">
       <ActionBar active={items.length} onAdd={() => setShowForm(true)} addLabel="+ 新增酒店" />
+      {editing && (
+        <EditHotelForm
+          hotel={editing}
+          onCancel={() => setEditing(null)}
+          onSave={(h) => { onChange(items.map((x) => x.id === h.id ? h : x)); setEditing(null); }}
+        />
+      )}
       {showForm && (
         <NewHotelForm
           onCancel={() => setShowForm(false)}
@@ -124,12 +132,15 @@ function HotelsSection({ items, onChange }: { items: MockHotel[]; onChange: (v: 
                 <div className="text-xs text-slate-500">每晚起</div>
                 <div className="text-lg font-semibold text-red-600">¥{h.basePrice}</div>
               </div>
-              <button
-                className="text-xs text-slate-500 hover:text-red-600"
-                onClick={() => onChange(items.filter((x) => x.id !== h.id))}
-              >
-                删除
-              </button>
+              <div className="flex gap-2 text-xs">
+                <button className="text-brand hover:text-brand-dark" onClick={() => setEditing(h)}>✏️ 编辑</button>
+                <button
+                  className="text-slate-500 hover:text-red-600"
+                  onClick={() => { if (confirm(`删除 ${h.name}？`)) onChange(items.filter((x) => x.id !== h.id)); }}
+                >
+                  删除
+                </button>
+              </div>
             </div>
           </div>
         ))}
@@ -229,8 +240,16 @@ function NewHotelForm({
 
 // ─── 接送 ───────────────────────────────────────────────────────────
 function TransfersSection({ items, onChange }: { items: MockTransfer[]; onChange: (v: MockTransfer[]) => void }) {
+  const [editing, setEditing] = useState<MockTransfer | null>(null);
   return (
     <div className="space-y-3">
+      {editing && (
+        <EditTransferForm
+          transfer={editing}
+          onCancel={() => setEditing(null)}
+          onSave={(t) => { onChange(items.map((x) => x.id === t.id ? t : x)); setEditing(null); }}
+        />
+      )}
       <ActionBar
         active={items.length}
         onAdd={() =>
@@ -267,12 +286,15 @@ function TransfersSection({ items, onChange }: { items: MockTransfer[]; onChange
             <div className="text-right">
               <div className="text-xs text-slate-500">起步价</div>
               <div className="text-xl font-bold text-red-600">¥{t.basePrice}</div>
-              <button
-                className="mt-1 text-xs text-slate-500 hover:text-red-600"
-                onClick={() => onChange(items.filter((x) => x.id !== t.id))}
-              >
-                删除
-              </button>
+              <div className="mt-1 flex gap-2 text-xs">
+                <button className="text-brand hover:text-brand-dark" onClick={() => setEditing(t)}>✏️ 编辑</button>
+                <button
+                  className="text-slate-500 hover:text-red-600"
+                  onClick={() => { if (confirm(`删除 ${t.name}？`)) onChange(items.filter((x) => x.id !== t.id)); }}
+                >
+                  删除
+                </button>
+              </div>
             </div>
           </article>
         ))}
@@ -283,8 +305,16 @@ function TransfersSection({ items, onChange }: { items: MockTransfer[]; onChange
 
 // ─── 签证 ───────────────────────────────────────────────────────────
 function VisasSection({ items, onChange }: { items: MockVisa[]; onChange: (v: MockVisa[]) => void }) {
+  const [editing, setEditing] = useState<MockVisa | null>(null);
   return (
     <div className="space-y-3">
+      {editing && (
+        <EditVisaForm
+          visa={editing}
+          onCancel={() => setEditing(null)}
+          onSave={(v) => { onChange(items.map((x) => x.id === v.id ? v : x)); setEditing(null); }}
+        />
+      )}
       <ActionBar
         active={items.length}
         onAdd={() =>
@@ -329,12 +359,15 @@ function VisasSection({ items, onChange }: { items: MockVisa[]; onChange: (v: Mo
                 <div className="text-xs text-slate-500">办理费</div>
                 <div className="text-lg font-semibold text-red-600">¥{v.basePrice}</div>
               </div>
-              <button
-                className="text-xs text-slate-500 hover:text-red-600"
-                onClick={() => onChange(items.filter((x) => x.id !== v.id))}
-              >
-                删除
-              </button>
+              <div className="flex gap-2 text-xs">
+                <button className="text-brand hover:text-brand-dark" onClick={() => setEditing(v)}>✏️ 编辑</button>
+                <button
+                  className="text-slate-500 hover:text-red-600"
+                  onClick={() => { if (confirm(`删除 ${v.country} · ${v.type}？`)) onChange(items.filter((x) => x.id !== v.id)); }}
+                >
+                  删除
+                </button>
+              </div>
             </div>
           </div>
         ))}
@@ -647,5 +680,239 @@ function ActionBar({ active, onAdd, addLabel }: { active: number; onAdd: () => v
       <p className="text-sm text-slate-500">共 {active} 项</p>
       <button className="btn-primary text-sm" onClick={onAdd}>{addLabel}</button>
     </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 编辑表单：酒店 / 接送 / 签证
+// ═══════════════════════════════════════════════════════════════
+
+function EditHotelForm({ hotel, onCancel, onSave }: { hotel: MockHotel; onCancel: () => void; onSave: (h: MockHotel) => void }) {
+  const [form, setForm] = useState({ ...hotel });
+  const [amenitiesText, setAmenitiesText] = useState(hotel.amenities.join(', '));
+  const [saved, setSaved] = useState(false);
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const updated: MockHotel = {
+      ...form,
+      amenities: amenitiesText.split(',').map(s => s.trim()).filter(Boolean),
+    };
+    setSaved(true);
+    setTimeout(() => onSave(updated), 800);
+  };
+
+  return (
+    <section className="card border-2 border-brand/50 bg-brand/5">
+      <div className="flex items-center justify-between">
+        <h3 className="font-semibold text-slate-900">✏️ 编辑酒店 · {hotel.name}</h3>
+        <button type="button" className="text-slate-400 hover:text-slate-700 text-xl" onClick={onCancel}>×</button>
+      </div>
+      <form className="mt-3 grid gap-3 md:grid-cols-3" onSubmit={handleSubmit}>
+        <div>
+          <label className="label text-xs">中文名 *</label>
+          <input required className="input" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
+        </div>
+        <div>
+          <label className="label text-xs">英文名</label>
+          <input className="input" value={form.nameEn} onChange={(e) => setForm({ ...form, nameEn: e.target.value })} />
+        </div>
+        <div>
+          <label className="label text-xs">区域</label>
+          <input className="input" value={form.area} onChange={(e) => setForm({ ...form, area: e.target.value })} />
+        </div>
+        <div>
+          <label className="label text-xs">星级</label>
+          <select className="input" value={form.stars} onChange={(e) => setForm({ ...form, stars: Number(e.target.value) as 3 | 4 | 5 })}>
+            <option value={3}>三星</option>
+            <option value={4}>四星</option>
+            <option value={5}>五星</option>
+          </select>
+        </div>
+        <div>
+          <label className="label text-xs">每晚起价 (¥)</label>
+          <input type="number" min={0} className="input" value={form.basePrice} onChange={(e) => setForm({ ...form, basePrice: Number(e.target.value) || 0 })} />
+        </div>
+        <div>
+          <label className="label text-xs">城市代码</label>
+          <select className="input" value={form.cityCode} onChange={(e) => setForm({ ...form, cityCode: e.target.value })}>
+            <option value="DAD">DAD 岘港</option>
+            <option value="HOA">HOA 会安</option>
+          </select>
+        </div>
+        <div className="md:col-span-3">
+          <label className="label text-xs">卖点亮点</label>
+          <input className="input" value={form.highlight} onChange={(e) => setForm({ ...form, highlight: e.target.value })} />
+        </div>
+        <div className="md:col-span-3">
+          <label className="label text-xs">设施（逗号分隔）</label>
+          <input className="input" value={amenitiesText} onChange={(e) => setAmenitiesText(e.target.value)} placeholder="私人海滩, 泳池, 含早餐" />
+        </div>
+        <div className="md:col-span-2">
+          <label className="label text-xs">图片 URL</label>
+          <input className="input" value={form.photo} onChange={(e) => setForm({ ...form, photo: e.target.value })} />
+        </div>
+        <div>
+          <label className="label text-xs">Emoji 图标</label>
+          <input className="input" maxLength={4} value={form.emoji} onChange={(e) => setForm({ ...form, emoji: e.target.value })} />
+        </div>
+
+        {saved && <div className="md:col-span-3 rounded bg-green-50 px-3 py-2 text-sm text-green-700">✅ 保存中…</div>}
+
+        <div className="md:col-span-3 flex justify-end gap-3">
+          <button type="button" className="btn-secondary" onClick={onCancel}>取消</button>
+          <button type="submit" className="btn-primary">保存修改</button>
+        </div>
+      </form>
+    </section>
+  );
+}
+
+function EditTransferForm({ transfer, onCancel, onSave }: { transfer: MockTransfer; onCancel: () => void; onSave: (t: MockTransfer) => void }) {
+  const [form, setForm] = useState({ ...transfer });
+  const [featuresText, setFeaturesText] = useState(transfer.features.join(', '));
+  const [saved, setSaved] = useState(false);
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const updated: MockTransfer = {
+      ...form,
+      features: featuresText.split(',').map(s => s.trim()).filter(Boolean),
+    };
+    setSaved(true);
+    setTimeout(() => onSave(updated), 800);
+  };
+
+  return (
+    <section className="card border-2 border-brand/50 bg-brand/5">
+      <div className="flex items-center justify-between">
+        <h3 className="font-semibold text-slate-900">✏️ 编辑接送 · {transfer.name}</h3>
+        <button type="button" className="text-slate-400 hover:text-slate-700 text-xl" onClick={onCancel}>×</button>
+      </div>
+      <form className="mt-3 grid gap-3 md:grid-cols-3" onSubmit={handleSubmit}>
+        <div className="md:col-span-2">
+          <label className="label text-xs">服务名称 *</label>
+          <input required className="input" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
+        </div>
+        <div>
+          <label className="label text-xs">起步价 (¥)</label>
+          <input type="number" min={0} className="input" value={form.basePrice} onChange={(e) => setForm({ ...form, basePrice: Number(e.target.value) || 0 })} />
+        </div>
+        <div className="md:col-span-2">
+          <label className="label text-xs">车型描述</label>
+          <input className="input" value={form.vehicleType} onChange={(e) => setForm({ ...form, vehicleType: e.target.value })} />
+        </div>
+        <div>
+          <label className="label text-xs">最大乘客数</label>
+          <input type="number" min={1} max={20} className="input" value={form.capacity} onChange={(e) => setForm({ ...form, capacity: Number(e.target.value) || 1 })} />
+        </div>
+        <div>
+          <label className="label text-xs">出发区域</label>
+          <input className="input" value={form.originArea} onChange={(e) => setForm({ ...form, originArea: e.target.value })} />
+        </div>
+        <div>
+          <label className="label text-xs">目的区域</label>
+          <input className="input" value={form.destArea} onChange={(e) => setForm({ ...form, destArea: e.target.value })} />
+        </div>
+        <div>
+          <label className="label text-xs">行程时长</label>
+          <input className="input" value={form.duration} onChange={(e) => setForm({ ...form, duration: e.target.value })} />
+        </div>
+        <div className="md:col-span-3">
+          <label className="label text-xs">卖点（逗号分隔）</label>
+          <input className="input" value={featuresText} onChange={(e) => setFeaturesText(e.target.value)} placeholder="中文司机, 免费等候 60 分钟" />
+        </div>
+        <div className="md:col-span-2">
+          <label className="label text-xs">图片 URL</label>
+          <input className="input" value={form.photo} onChange={(e) => setForm({ ...form, photo: e.target.value })} />
+        </div>
+        <div>
+          <label className="label text-xs">Emoji</label>
+          <input className="input" maxLength={4} value={form.emoji} onChange={(e) => setForm({ ...form, emoji: e.target.value })} />
+        </div>
+
+        {saved && <div className="md:col-span-3 rounded bg-green-50 px-3 py-2 text-sm text-green-700">✅ 保存中…</div>}
+
+        <div className="md:col-span-3 flex justify-end gap-3">
+          <button type="button" className="btn-secondary" onClick={onCancel}>取消</button>
+          <button type="submit" className="btn-primary">保存修改</button>
+        </div>
+      </form>
+    </section>
+  );
+}
+
+function EditVisaForm({ visa, onCancel, onSave }: { visa: MockVisa; onCancel: () => void; onSave: (v: MockVisa) => void }) {
+  const [form, setForm] = useState({ ...visa, highlight: visa.highlight ?? '' });
+  const [docsText, setDocsText] = useState(visa.requiredDocs.join(', '));
+  const [saved, setSaved] = useState(false);
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const updated: MockVisa = {
+      ...form,
+      highlight: form.highlight || undefined,
+      requiredDocs: docsText.split(',').map(s => s.trim()).filter(Boolean),
+    };
+    setSaved(true);
+    setTimeout(() => onSave(updated), 800);
+  };
+
+  return (
+    <section className="card border-2 border-brand/50 bg-brand/5">
+      <div className="flex items-center justify-between">
+        <h3 className="font-semibold text-slate-900">✏️ 编辑签证 · {visa.country} {visa.type}</h3>
+        <button type="button" className="text-slate-400 hover:text-slate-700 text-xl" onClick={onCancel}>×</button>
+      </div>
+      <form className="mt-3 grid gap-3 md:grid-cols-3" onSubmit={handleSubmit}>
+        <div>
+          <label className="label text-xs">目的国 *</label>
+          <input required className="input" value={form.country} onChange={(e) => setForm({ ...form, country: e.target.value })} />
+        </div>
+        <div>
+          <label className="label text-xs">国家代码</label>
+          <input className="input" value={form.countryCode} onChange={(e) => setForm({ ...form, countryCode: e.target.value })} maxLength={3} />
+        </div>
+        <div>
+          <label className="label text-xs">国旗 Emoji</label>
+          <input className="input" maxLength={4} value={form.flag} onChange={(e) => setForm({ ...form, flag: e.target.value })} />
+        </div>
+        <div className="md:col-span-3">
+          <label className="label text-xs">签证类型 *</label>
+          <input required className="input" value={form.type} onChange={(e) => setForm({ ...form, type: e.target.value })} placeholder="如 电子签证 E-visa · 30 天单次" />
+        </div>
+        <div>
+          <label className="label text-xs">办理费 (¥)</label>
+          <input type="number" min={0} className="input" value={form.basePrice} onChange={(e) => setForm({ ...form, basePrice: Number(e.target.value) || 0 })} />
+        </div>
+        <div>
+          <label className="label text-xs">加急附加费 (¥)</label>
+          <input type="number" min={0} className="input" value={form.expressSurcharge} onChange={(e) => setForm({ ...form, expressSurcharge: Number(e.target.value) || 0 })} />
+        </div>
+        <div>
+          <label className="label text-xs">出签天数</label>
+          <input type="number" min={1} max={60} className="input" value={form.processingDays} onChange={(e) => setForm({ ...form, processingDays: Number(e.target.value) || 1 })} />
+        </div>
+        <div>
+          <label className="label text-xs">有效期 (月)</label>
+          <input type="number" min={1} max={120} className="input" value={form.validityMonths} onChange={(e) => setForm({ ...form, validityMonths: Number(e.target.value) || 1 })} />
+        </div>
+        <div className="md:col-span-2">
+          <label className="label text-xs">卖点（如"最热销"）</label>
+          <input className="input" value={form.highlight} onChange={(e) => setForm({ ...form, highlight: e.target.value })} />
+        </div>
+        <div className="md:col-span-3">
+          <label className="label text-xs">所需材料（逗号分隔）</label>
+          <input className="input" value={docsText} onChange={(e) => setDocsText(e.target.value)} placeholder="护照首页扫描件, 2寸白底照片" />
+        </div>
+
+        {saved && <div className="md:col-span-3 rounded bg-green-50 px-3 py-2 text-sm text-green-700">✅ 保存中…</div>}
+
+        <div className="md:col-span-3 flex justify-end gap-3">
+          <button type="button" className="btn-secondary" onClick={onCancel}>取消</button>
+          <button type="submit" className="btn-primary">保存修改</button>
+        </div>
+      </form>
+    </section>
   );
 }

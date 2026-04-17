@@ -195,13 +195,39 @@ function Kpi({ label, value, sub, color }: { label: string; value: string; sub: 
 }
 
 function CustomerDrawer({ customer, onClose }: { customer: MockCustomer; onClose: () => void }) {
+  const [editing, setEditing] = useState(false);
+  const [form, setForm] = useState({
+    name: customer.name,
+    phone: customer.phone,
+    email: customer.email ?? '',
+    idNumber: customer.idNumber ?? '',
+    tags: customer.tags.join(', '),
+    notes: '',
+  });
+  const [saved, setSaved] = useState(false);
+
+  const save = () => {
+    setSaved(true);
+    setTimeout(() => { setEditing(false); setSaved(false); }, 1500);
+  };
+
+  const addTag = (tag: string) => {
+    const tags = form.tags.split(',').map(t => t.trim()).filter(Boolean);
+    if (!tags.includes(tag)) setForm({ ...form, tags: [...tags, tag].join(', ') });
+  };
+
   return (
     <div className="fixed inset-0 z-50 flex justify-end bg-slate-900/50" onClick={onClose}>
       <div className="h-full w-full max-w-md overflow-auto bg-white shadow-xl" onClick={(e) => e.stopPropagation()}>
-        <div className="sticky top-0 bg-white border-b border-slate-200 px-6 py-4">
+        <div className="sticky top-0 bg-white border-b border-slate-200 px-6 py-4 z-10">
           <div className="flex items-center justify-between">
             <h2 className="text-lg font-semibold text-slate-900">{customer.name}</h2>
-            <button className="text-slate-400 hover:text-slate-700 text-xl" onClick={onClose}>×</button>
+            <div className="flex items-center gap-2">
+              {!editing && (
+                <button className="text-sm text-brand hover:text-brand-dark" onClick={() => setEditing(true)}>✏️ 编辑</button>
+              )}
+              <button className="text-slate-400 hover:text-slate-700 text-xl" onClick={onClose}>×</button>
+            </div>
           </div>
           <div className="mt-1 flex flex-wrap gap-1">
             {customer.tags.map((t) => (
@@ -210,43 +236,94 @@ function CustomerDrawer({ customer, onClose }: { customer: MockCustomer; onClose
           </div>
         </div>
         <div className="px-6 py-5 space-y-4 text-sm">
-          <section>
-            <h3 className="text-xs font-semibold text-slate-500 uppercase mb-2">联系方式</h3>
-            <dl className="space-y-1">
-              <Row label="姓名" value={customer.name} />
-              <Row label="手机" value={customer.phone} />
-              <Row label="邮箱" value={customer.email ?? '—'} />
-              <Row label="证件号" value={customer.idNumber ?? '—'} />
-            </dl>
-          </section>
-          <section>
-            <h3 className="text-xs font-semibold text-slate-500 uppercase mb-2">归属</h3>
-            <dl className="space-y-1">
-              <Row label="销售渠道" value={customer.agentName ? `🤝 ${customer.agentName}` : '🏢 直销'} />
-              <Row label="注册时间" value={new Date(customer.createdAt).toLocaleString('zh-CN')} />
-            </dl>
-          </section>
-          <section>
-            <h3 className="text-xs font-semibold text-slate-500 uppercase mb-2">消费统计</h3>
-            <div className="grid grid-cols-2 gap-2">
-              <div className="rounded bg-slate-50 p-3 text-center">
-                <div className="text-xs text-slate-500">总订单</div>
-                <div className="text-2xl font-bold text-amber-600">{customer.totalOrders}</div>
-              </div>
-              <div className="rounded bg-slate-50 p-3 text-center">
-                <div className="text-xs text-slate-500">累计消费</div>
-                <div className="text-2xl font-bold text-green-600">¥{customer.totalSpent.toLocaleString()}</div>
-              </div>
-            </div>
-            <div className="mt-2 text-xs text-slate-500">
-              最近下单: {customer.lastOrderAt ? new Date(customer.lastOrderAt).toLocaleString('zh-CN') : '—'}
-            </div>
-          </section>
-          <section className="pt-3 border-t border-slate-200">
-            <button className="btn-secondary w-full text-sm" onClick={() => alert('跳转订单列表 (demo) - 真环境过滤 customerId=' + customer.id)}>
-              查看该散客所有订单 →
-            </button>
-          </section>
+          {!editing ? (
+            // ── 查看模式 ──
+            <>
+              <section>
+                <h3 className="text-xs font-semibold text-slate-500 uppercase mb-2">联系方式</h3>
+                <dl className="space-y-1">
+                  <Row label="姓名" value={customer.name} />
+                  <Row label="手机" value={customer.phone} />
+                  <Row label="邮箱" value={customer.email ?? '—'} />
+                  <Row label="证件号" value={customer.idNumber ?? '—'} />
+                </dl>
+              </section>
+              <section>
+                <h3 className="text-xs font-semibold text-slate-500 uppercase mb-2">归属</h3>
+                <dl className="space-y-1">
+                  <Row label="销售渠道" value={customer.agentName ? `🤝 ${customer.agentName}` : '🏢 直销'} />
+                  <Row label="注册时间" value={new Date(customer.createdAt).toLocaleString('zh-CN')} />
+                </dl>
+              </section>
+              <section>
+                <h3 className="text-xs font-semibold text-slate-500 uppercase mb-2">消费统计</h3>
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="rounded bg-slate-50 p-3 text-center">
+                    <div className="text-xs text-slate-500">总订单</div>
+                    <div className="text-2xl font-bold text-amber-600">{customer.totalOrders}</div>
+                  </div>
+                  <div className="rounded bg-slate-50 p-3 text-center">
+                    <div className="text-xs text-slate-500">累计消费</div>
+                    <div className="text-2xl font-bold text-green-600">¥{customer.totalSpent.toLocaleString()}</div>
+                  </div>
+                </div>
+                <div className="mt-2 text-xs text-slate-500">
+                  最近下单: {customer.lastOrderAt ? new Date(customer.lastOrderAt).toLocaleString('zh-CN') : '—'}
+                </div>
+              </section>
+              <section className="pt-3 border-t border-slate-200">
+                <button className="btn-secondary w-full text-sm" onClick={() => alert('跳转订单列表 (demo) - 真环境过滤 customerId=' + customer.id)}>
+                  查看该散客所有订单 →
+                </button>
+              </section>
+            </>
+          ) : (
+            // ── 编辑模式 ──
+            <>
+              <section className="space-y-3">
+                <h3 className="text-xs font-semibold text-slate-500 uppercase">编辑信息</h3>
+                <div>
+                  <label className="label text-xs">姓名 *</label>
+                  <input className="input" required value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
+                </div>
+                <div>
+                  <label className="label text-xs">手机 *</label>
+                  <input className="input" required value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} />
+                </div>
+                <div>
+                  <label className="label text-xs">邮箱</label>
+                  <input type="email" className="input" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} />
+                </div>
+                <div>
+                  <label className="label text-xs">证件号 / 护照号</label>
+                  <input className="input" placeholder="如 MA1234567" value={form.idNumber} onChange={(e) => setForm({ ...form, idNumber: e.target.value })} />
+                </div>
+                <div>
+                  <label className="label text-xs">标签（逗号分隔）</label>
+                  <input className="input" placeholder="如 VIP, 回头客" value={form.tags} onChange={(e) => setForm({ ...form, tags: e.target.value })} />
+                  <div className="mt-1 flex flex-wrap gap-1">
+                    {['VIP', '回头客', '新客', '蜜月', '商务', '黑名单'].map((t) => (
+                      <button key={t} type="button" className="text-[10px] rounded bg-slate-100 px-2 py-0.5 hover:bg-slate-200" onClick={() => addTag(t)}>
+                        + {t}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+                <div>
+                  <label className="label text-xs">备注 Notes</label>
+                  <textarea className="input" rows={4} value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} placeholder="内部备注，例如饮食偏好、特殊要求、投诉历史等" />
+                </div>
+              </section>
+
+              {saved && (
+                <div className="rounded bg-green-50 px-3 py-2 text-sm text-green-700">✅ 已保存（demo，真环境走 PUT /customers/:id）</div>
+              )}
+              <section className="pt-3 border-t border-slate-200 flex gap-3">
+                <button className="btn-secondary flex-1" onClick={() => setEditing(false)}>取消</button>
+                <button className="btn-primary flex-1" onClick={save}>保存修改</button>
+              </section>
+            </>
+          )}
         </div>
       </div>
     </div>

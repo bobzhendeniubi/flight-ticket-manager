@@ -215,6 +215,17 @@ function Kpi({ label, value, sub, color }: { label: string; value: string; sub: 
 }
 
 function TravelerDrawer({ traveler, onClose }: { traveler: MockTraveler; onClose: () => void }) {
+  const [editing, setEditing] = useState(false);
+  const [form, setForm] = useState({
+    fullName: traveler.fullName,
+    passportNumber: traveler.passportNumber,
+    dateOfBirth: traveler.dateOfBirth,
+    nationality: traveler.nationality,
+    phone: traveler.phone ?? '',
+    notes: traveler.notes ?? '',
+  });
+  const [saved, setSaved] = useState(false);
+
   const customers = traveler.customerIds
     .map((id) => MOCK_CUSTOMERS.find((c) => c.id === id))
     .filter((c): c is NonNullable<typeof c> => c !== undefined);
@@ -222,56 +233,110 @@ function TravelerDrawer({ traveler, onClose }: { traveler: MockTraveler; onClose
   return (
     <div className="fixed inset-0 z-50 flex justify-end bg-slate-900/50" onClick={onClose}>
       <div className="h-full w-full max-w-md overflow-auto bg-white shadow-xl" onClick={(e) => e.stopPropagation()}>
-        <div className="sticky top-0 bg-white border-b border-slate-200 px-6 py-4 flex items-center justify-between">
+        <div className="sticky top-0 bg-white border-b border-slate-200 px-6 py-4 flex items-center justify-between z-10">
           <h2 className="text-lg font-semibold text-slate-900">{traveler.fullName}</h2>
-          <button className="text-slate-400 hover:text-slate-700 text-xl" onClick={onClose}>×</button>
+          <div className="flex items-center gap-2">
+            {!editing && (
+              <button className="text-sm text-brand hover:text-brand-dark" onClick={() => setEditing(true)}>✏️ 编辑</button>
+            )}
+            <button className="text-slate-400 hover:text-slate-700 text-xl" onClick={onClose}>×</button>
+          </div>
         </div>
         <div className="px-6 py-5 space-y-4 text-sm">
-          <section>
-            <h3 className="text-xs font-semibold text-slate-500 uppercase mb-2">身份信息</h3>
-            <dl className="space-y-1">
-              <Row label="护照拼音姓名" value={traveler.fullName} />
-              <Row label="护照号" value={<span className="font-mono">{traveler.passportNumber}</span>} />
-              <Row label="生日" value={traveler.dateOfBirth} />
-              <Row label="国籍" value={traveler.nationality} />
-              <Row label="电话" value={traveler.phone ?? '—'} />
-            </dl>
-          </section>
-          <section>
-            <h3 className="text-xs font-semibold text-slate-500 uppercase mb-2">出行历史</h3>
-            <div className="rounded bg-slate-50 p-3 text-center">
-              <div className="text-xs text-slate-500">累计出行次数</div>
-              <div className="text-3xl font-bold text-indigo-600 mt-1">{traveler.tripCount}</div>
-              <div className="text-xs text-slate-500 mt-1">
-                最近: {traveler.lastTripAt ?? '—'}
-              </div>
-            </div>
-          </section>
-          <section>
-            <h3 className="text-xs font-semibold text-slate-500 uppercase mb-2">关联客户（下单人）</h3>
-            <ul className="space-y-1.5">
-              {customers.map((c) => (
-                <li key={c.id} className="rounded border border-slate-200 p-2 flex items-center justify-between text-xs">
-                  <div>
-                    <div className="font-medium text-slate-900">{c.name}</div>
-                    <div className="text-slate-500">{c.phone}</div>
+          {!editing ? (
+            <>
+              <section>
+                <h3 className="text-xs font-semibold text-slate-500 uppercase mb-2">身份信息</h3>
+                <dl className="space-y-1">
+                  <Row label="护照拼音姓名" value={traveler.fullName} />
+                  <Row label="护照号" value={<span className="font-mono">{traveler.passportNumber}</span>} />
+                  <Row label="生日" value={traveler.dateOfBirth} />
+                  <Row label="国籍" value={traveler.nationality} />
+                  <Row label="电话" value={traveler.phone ?? '—'} />
+                </dl>
+              </section>
+              <section>
+                <h3 className="text-xs font-semibold text-slate-500 uppercase mb-2">出行历史</h3>
+                <div className="rounded bg-slate-50 p-3 text-center">
+                  <div className="text-xs text-slate-500">累计出行次数</div>
+                  <div className="text-3xl font-bold text-indigo-600 mt-1">{traveler.tripCount}</div>
+                  <div className="text-xs text-slate-500 mt-1">
+                    最近: {traveler.lastTripAt ?? '—'}
                   </div>
-                  {c.agentName && <span className="rounded bg-amber-100 px-1.5 py-0.5 text-amber-700">🤝</span>}
-                </li>
-              ))}
-            </ul>
-          </section>
-          {traveler.notes && (
-            <section>
-              <h3 className="text-xs font-semibold text-slate-500 uppercase mb-2">备注</h3>
-              <p className="text-sm text-slate-700">{traveler.notes}</p>
-            </section>
+                </div>
+              </section>
+              <section>
+                <h3 className="text-xs font-semibold text-slate-500 uppercase mb-2">关联客户（下单人）</h3>
+                <ul className="space-y-1.5">
+                  {customers.map((c) => (
+                    <li key={c.id} className="rounded border border-slate-200 p-2 flex items-center justify-between text-xs">
+                      <div>
+                        <div className="font-medium text-slate-900">{c.name}</div>
+                        <div className="text-slate-500">{c.phone}</div>
+                      </div>
+                      {c.agentName && <span className="rounded bg-amber-100 px-1.5 py-0.5 text-amber-700">🤝</span>}
+                    </li>
+                  ))}
+                </ul>
+              </section>
+              {traveler.notes && (
+                <section>
+                  <h3 className="text-xs font-semibold text-slate-500 uppercase mb-2">备注</h3>
+                  <p className="text-sm text-slate-700">{traveler.notes}</p>
+                </section>
+              )}
+              <section className="pt-3 border-t border-slate-200">
+                <button className="btn-secondary w-full text-sm" onClick={() => alert('跳转订单列表 (demo) - 真环境过滤 passengerId=' + traveler.id)}>
+                  查看该旅客所有行程 →
+                </button>
+              </section>
+            </>
+          ) : (
+            <>
+              <section className="space-y-3">
+                <h3 className="text-xs font-semibold text-slate-500 uppercase">编辑旅客档案</h3>
+                <div>
+                  <label className="label text-xs">护照拼音姓名 *（与护照一致）</label>
+                  <input required className="input" value={form.fullName} onChange={(e) => setForm({ ...form, fullName: e.target.value })} />
+                </div>
+                <div>
+                  <label className="label text-xs">护照号 *</label>
+                  <input required className="input font-mono" value={form.passportNumber} onChange={(e) => setForm({ ...form, passportNumber: e.target.value })} />
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <div>
+                    <label className="label text-xs">生日 *</label>
+                    <input type="date" required className="input" value={form.dateOfBirth} onChange={(e) => setForm({ ...form, dateOfBirth: e.target.value })} />
+                  </div>
+                  <div>
+                    <label className="label text-xs">国籍</label>
+                    <select className="input" value={form.nationality} onChange={(e) => setForm({ ...form, nationality: e.target.value })}>
+                      <option value="MO">MO 澳门</option>
+                      <option value="HK">HK 香港</option>
+                      <option value="CN">CN 中国</option>
+                      <option value="TW">TW 台湾</option>
+                    </select>
+                  </div>
+                </div>
+                <div>
+                  <label className="label text-xs">电话</label>
+                  <input className="input" value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} />
+                </div>
+                <div>
+                  <label className="label text-xs">备注 Notes</label>
+                  <textarea className="input" rows={4} value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} placeholder="例如：VIP 客户 / 需要儿童安全座椅 / 素食要求" />
+                </div>
+              </section>
+
+              {saved && (
+                <div className="rounded bg-green-50 px-3 py-2 text-sm text-green-700">✅ 已保存（demo，真环境 PUT /travelers/:id）</div>
+              )}
+              <section className="pt-3 border-t border-slate-200 flex gap-3">
+                <button className="btn-secondary flex-1" onClick={() => setEditing(false)}>取消</button>
+                <button className="btn-primary flex-1" onClick={() => { setSaved(true); setTimeout(() => { setEditing(false); setSaved(false); }, 1500); }}>保存修改</button>
+              </section>
+            </>
           )}
-          <section className="pt-3 border-t border-slate-200">
-            <button className="btn-secondary w-full text-sm" onClick={() => alert('跳转订单列表 (demo) - 真环境过滤 passengerId=' + traveler.id)}>
-              查看该旅客所有行程 →
-            </button>
-          </section>
         </div>
       </div>
     </div>
