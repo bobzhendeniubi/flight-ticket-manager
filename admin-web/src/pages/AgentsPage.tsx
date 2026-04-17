@@ -435,49 +435,134 @@ function InfoTab({ agent }: { agent: AgentListItem }) {
   );
 }
 
+// ═══════════════════════════════════════════════════════════════
+// 佣金模型（嵌套切分）
+// ───────────────────────────────────────────────────────────────
+// Admin 给 1 级代理设佣金率（如机票 10%，即每订单抽 10% 给 1 级）
+// 1 级再从这 10% 里切部分给 2 级（如 40% of 10% = 4%）
+// 2 级再切部分给 3 级（如 30% of 4% = 1.2%）
+// 规则：每级的「本级实际佣金率」= 从上级继承的率 × (1 - 给下级分成比例)
+//      下级只能从父级分下来的池子里再切，不能超过父级
+// ═══════════════════════════════════════════════════════════════
+
+// 父级给本级的率（按 tier 和产品类型）— Demo 用本地 mock，真实接 API
+const PARENT_RATES: Record<number, Record<string, number>> = {
+  1: { FLIGHT: 10, HOTEL: 8, TRANSFER: 15, VISA: 12, BUNDLE: 10 }, // admin → 1级
+  2: { FLIGHT: 4, HOTEL: 3.2, TRANSFER: 6, VISA: 4.8, BUNDLE: 4 }, // 1级 → 2级
+  3: { FLIGHT: 1.2, HOTEL: 0.96, TRANSFER: 1.8, VISA: 1.44, BUNDLE: 1.2 }, // 2级 → 3级
+  4: { FLIGHT: 0, HOTEL: 0, TRANSFER: 0, VISA: 0, BUNDLE: 0 },
+  5: { FLIGHT: 0, HOTEL: 0, TRANSFER: 0, VISA: 0, BUNDLE: 0 },
+};
+
+const PRODUCT_LABEL = {
+  FLIGHT: '✈️ 机票', HOTEL: '🏨 酒店', TRANSFER: '🚐 接送', VISA: '🛂 签证', BUNDLE: '🎁 套餐',
+} as const;
+
 function CommissionTab({ agent }: { agent: AgentListItem }) {
-  const [rates, setRates] = useState({ FLIGHT: 10, HOTEL: 8, TRANSFER: 15, VISA: 12, BUNDLE: 10 });
-  const [childRate, setChildRate] = useState(10);
+  // 本级从父级继承的最高率（上限）
+  const parentRate = PARENT_RATES[agent.tier] ?? PARENT_RATES[1];
+  const parentLabel = agent.tier === 1 ? '平台（世途旅行）' : `${agent.tier - 1} 级代理`;
+
+  // 本级决定给下级分多少百分比（0-100%，即"我拿到的里面给下级分几成"）
+  const [childSharePct, setChildSharePct] = useState({
+    FLIGHT: 40, HOTEL: 40, TRANSFER: 30, VISA: 40, BUNDLE: 40,
+  });
   const [saved, setSaved] = useState(false);
+
+  const isLeaf = agent.tier >= 5; // 最底层，没有下级
 
   return (
     <div className="space-y-4">
-      <div className="rounded-md bg-blue-50 border border-blue-200 px-3 py-2 text-xs text-blue-800">
-        💡 <strong>{TIER_LABEL[agent.tier]}</strong> 从订单金额抽取佣金，再按"给下级分成"比例分给 {agent.tier + 1} 级代理
+      <div className="rounded-md bg-blue-50 border border-blue-200 p-3 text-xs text-blue-800 space-y-1">
+        <div>💡 <strong>佣金规则（嵌套切分）</strong></div>
+        <div>1. <strong>{parentLabel}</strong> 给本级定佣金率</div>
+        <div>2. 本级（{TIER_LABEL[agent.tier]}）从这个率里切一部分给下级</div>
+        <div>3. <strong className="text-red-600">下级的率不能超过本级从上级拿到的率</strong>（都是从同一个池子分）</div>
       </div>
 
+      {/* 父级给本级的率（只读） */}
       <div>
-        <h3 className="text-sm font-medium text-slate-700 mb-2">本级佣金率（按产品类型）</h3>
-        <div className="space-y-2">
-          {(Object.entries(rates) as [keyof typeof rates, number][]).map(([k, v]) => (
-            <div key={k} className="flex items-center gap-3 text-sm">
-              <span className="w-16 text-slate-600">
-                {k === 'FLIGHT' ? '✈️ 机票' : k === 'HOTEL' ? '🏨 酒店' : k === 'TRANSFER' ? '🚐 接送' : k === 'VISA' ? '🛂 签证' : '🎁 套餐'}
-              </span>
-              <input type="range" min={0} max={25} value={v} onChange={(e) => setRates({ ...rates, [k]: Number(e.target.value) })} className="flex-1" />
-              <span className="w-12 text-right font-semibold text-brand">{v}%</span>
+        <h3 className="text-sm font-medium text-slate-700 mb-2">
+          本级继承自「{parentLabel}」的佣金率（只读）
+        </h3>
+        <div className="rounded-md bg-slate-50 p-3 space-y-1.5">
+          {(Object.entries(parentRate) as [string, number][]).map(([k, v]) => (
+            <div key={k} className="flex items-center justify-between text-sm">
+              <span className="text-slate-700">{PRODUCT_LABEL[k as keyof typeof PRODUCT_LABEL]}</span>
+              <span className="font-semibold text-indigo-700">{v.toFixed(2)}%</span>
             </div>
           ))}
         </div>
       </div>
 
-      <div className="rounded-md bg-amber-50 border border-amber-200 p-3">
-        <h3 className="text-sm font-medium text-slate-700 mb-2">分给下级代理</h3>
-        <div className="flex items-center gap-3 text-sm">
-          <span className="text-slate-600">分成比例</span>
-          <input type="range" min={0} max={50} value={childRate} onChange={(e) => setChildRate(Number(e.target.value))} className="flex-1" />
-          <span className="w-12 text-right font-semibold text-amber-700">{childRate}%</span>
+      {/* 本级决定给下级分多少 */}
+      {!isLeaf ? (
+        <div className="rounded-md bg-amber-50 border border-amber-200 p-3">
+          <h3 className="text-sm font-medium text-slate-700 mb-2">
+            分给 {agent.tier + 1} 级代理的比例
+          </h3>
+          <p className="text-xs text-slate-600 mb-3">
+            从「本级拿到的佣金」里切给下级（0-100%）。下级拿到的实际率 = 本级率 × 此比例。
+          </p>
+          <div className="space-y-2">
+            {(Object.entries(childSharePct) as [keyof typeof childSharePct, number][]).map(([k, v]) => {
+              const parentOfThis = parentRate[k] ?? 0;
+              const childActual = parentOfThis * v / 100;
+              const selfKeep = parentOfThis - childActual;
+              return (
+                <div key={k} className="space-y-1">
+                  <div className="flex items-center gap-3 text-sm">
+                    <span className="w-16 text-slate-600">{PRODUCT_LABEL[k]}</span>
+                    <input
+                      type="range" min={0} max={100} step={5}
+                      value={v}
+                      onChange={(e) => setChildSharePct({ ...childSharePct, [k]: Number(e.target.value) })}
+                      className="flex-1"
+                    />
+                    <span className="w-14 text-right font-semibold text-amber-700">{v}%</span>
+                  </div>
+                  <div className="ml-16 text-[11px] text-slate-500">
+                    本级率 {parentOfThis.toFixed(2)}% → 分给下级 <strong className="text-amber-700">{childActual.toFixed(2)}%</strong> · 自己留 <strong className="text-green-700">{selfKeep.toFixed(2)}%</strong>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
         </div>
-        <div className="mt-2 text-xs text-slate-600">
-          例：下级卖出机票 ¥1,000 → 本级抽 ¥{rates.FLIGHT * 10} → 其中 ¥{(rates.FLIGHT * 10 * childRate / 100).toFixed(0)} 归下级
+      ) : (
+        <div className="rounded-md bg-slate-50 border border-slate-200 p-3 text-xs text-slate-500">
+          本级为末级代理（{TIER_LABEL[agent.tier]}），无下级，全部佣金归本级
         </div>
+      )}
+
+      {/* 级联示例（机票） */}
+      <div className="rounded-md bg-slate-50 p-3 space-y-1.5 text-xs">
+        <div className="font-semibold text-slate-700 mb-1">💰 示例：机票 ¥1,000 订单的佣金分配</div>
+        {(() => {
+          const order = 1000;
+          const tier1 = 10;
+          const t1ChildShare = 40;
+          const tier2 = tier1 * t1ChildShare / 100;
+          const t2ChildShare = 30;
+          const tier3 = tier2 * t2ChildShare / 100;
+          const platform = order * (100 - tier1) / 100;
+          return (
+            <div className="space-y-0.5 font-mono text-slate-600">
+              <div>订单金额 ¥{order} × 佣金 {tier1}% = 佣金池 <strong className="text-brand">¥{order * tier1 / 100}</strong></div>
+              <div className="ml-4">├ 1 级总代抽 <strong className="text-green-700">¥{order * tier1 / 100 - tier2 * order / 100}</strong>（{(tier1 - tier2).toFixed(1)}%）</div>
+              <div className="ml-4">├ 2 级区代抽 <strong className="text-green-700">¥{(tier2 - tier3) * order / 100}</strong>（{(tier2 - tier3).toFixed(1)}%）</div>
+              <div className="ml-4">└ 3 级门店抽 <strong className="text-green-700">¥{tier3 * order / 100}</strong>（{tier3.toFixed(1)}%）</div>
+              <div className="mt-1 text-slate-500">平台（世途）留 ¥{platform}（{100 - tier1}%）</div>
+            </div>
+          );
+        })()}
       </div>
 
       {saved ? (
-        <div className="rounded-md bg-green-50 px-3 py-2 text-sm text-green-700">✅ 已保存佣金规则（demo）</div>
+        <div className="rounded-md bg-green-50 px-3 py-2 text-sm text-green-700">✅ 已保存分成规则（demo）</div>
       ) : (
         <button className="btn-primary w-full" onClick={() => { setSaved(true); setTimeout(() => setSaved(false), 2000); }}>
-          保存佣金规则
+          保存分成规则
         </button>
       )}
     </div>
