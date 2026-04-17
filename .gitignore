@@ -1,58 +1,50 @@
+
+!.env.example
+# Build outputs
+# CDK
+# Coverage
 # Dependencies
-node_modules/
+# Docker
+# Environment
+# IDE
+# Logs
+# Misc
+# OS
+# Prisma
+# Python
+*.egg-info/
+*.log
+*.pptx~
+*.py[cod]
+*.swo
+*.swp
+*.tsbuildinfo
+.DS_Store
+.cache/
+.docker/
+.env
+.env.*.local
+.env.local
+.idea/
+.next/
+.nyc_output/
 .pnp
 .pnp.js
-
-# Build outputs
-dist/
+.turbo/
+.venv/
+.vscode/
+Thumbs.db
+__pycache__/
+backend/prisma/migrations/dev/
 build/
-.next/
-out/
-*.tsbuildinfo
-
-# Environment
-.env
-.env.local
-.env.*.local
-!.env.example
-
-# Logs
-*.log
+coverage/
+dist/
+infra/cdk.out/
+node_modules/
 npm-debug.log*
+out/
+pnpm-debug.log*
+venv/
 yarn-debug.log*
 yarn-error.log*
-pnpm-debug.log*
-
-# Coverage
-coverage/
-.nyc_output/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# Prisma
-backend/prisma/migrations/dev/
-
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-.venv/
-venv/
-
-# CDK
-infra/cdk.out/
-
-# Docker
-.docker/
-
-# Misc
-.turbo/
-.cache/
+~$*.pptx
