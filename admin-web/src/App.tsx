@@ -11,7 +11,6 @@ import { PricingPage } from './pages/PricingPage';
 import { AgentsPage } from './pages/AgentsPage';
 import { CustomersPage } from './pages/CustomersPage';
 import { TravelersPage } from './pages/TravelersPage';
-import { TenantsPage } from './pages/TenantsPage';
 import { AuditLogsPage } from './pages/AuditLogsPage';
 import { SettlementsPage } from './pages/SettlementsPage';
 import { useAuth } from './stores/auth';
@@ -112,14 +111,6 @@ export function App() {
           element={
             <Protected>
               <TravelersPage />
-            </Protected>
-          }
-        />
-        <Route
-          path="/tenants"
-          element={
-            <Protected>
-              <TenantsPage />
             </Protected>
           }
         />
