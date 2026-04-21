@@ -1,103 +1,177 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
+import { api, ApiError, type OrderSummary, type OrderItem, type OrderStatus } from '../lib/api';
+import { useAuth } from '../stores/auth';
 import {
-  MOCK_ORDERS,
   MOCK_FULFILLMENTS,
-  STATUS_COLOR,
-  STATUS_LABEL,
-  type MockOrder,
-  type MockOrderStatus,
   type FulfillmentStatus,
 } from '../lib/mockData';
 import { exportToCSV } from '../lib/csvExport';
 
-const ALL_STATUSES: MockOrderStatus[] = [
-  'PENDING_PAYMENT',
-  'PAID',
-  'PROCESSING',
-  'TICKETED',
-  'COMPLETED',
-  'CANCELLED',
-  'REFUND_REQUESTED',
+// 本地可视化用的状态子集（后端 OrderStatus 更全，这里只列出常用 7 个做 filter）
+const STATUS_LABEL: Record<OrderStatus, string> = {
+  DRAFT: '草稿',
+  PENDING_PAYMENT: '待支付',
+  PAID: '已支付',
+  PROCESSING: '处理中',
+  TICKETED: '已出票',
+  COMPLETED: '已完成',
+  PAYMENT_TIMEOUT: '超时',
+  CANCELLED: '已取消',
+  REFUND_REQUESTED: '退款申请中',
+  REFUNDED: '已退款',
+  CHANGE_REQUESTED: '改期申请中',
+  CHANGED: '已改期',
+  FAILED: '出票失败',
+};
+
+const STATUS_COLOR: Record<OrderStatus, string> = {
+  DRAFT: 'bg-slate-100 text-slate-600',
+  PENDING_PAYMENT: 'bg-amber-100 text-amber-700',
+  PAID: 'bg-blue-100 text-blue-700',
+  PROCESSING: 'bg-indigo-100 text-indigo-700',
+  TICKETED: 'bg-green-100 text-green-700',
+  COMPLETED: 'bg-slate-100 text-slate-700',
+  PAYMENT_TIMEOUT: 'bg-orange-100 text-orange-700',
+  CANCELLED: 'bg-slate-200 text-slate-500',
+  REFUND_REQUESTED: 'bg-red-100 text-red-700',
+  REFUNDED: 'bg-red-200 text-red-800',
+  CHANGE_REQUESTED: 'bg-violet-100 text-violet-700',
+  CHANGED: 'bg-violet-200 text-violet-800',
+  FAILED: 'bg-rose-100 text-rose-700',
+};
+
+const FILTER_STATUSES: OrderStatus[] = [
+  'PENDING_PAYMENT', 'PAID', 'PROCESSING', 'TICKETED', 'COMPLETED', 'CANCELLED', 'REFUND_REQUESTED',
 ];
 
-const KIND_LABEL: Record<MockOrder['itemKind'], string> = {
+type OrderItemKindLabel = OrderItem['kind'];
+const KIND_LABEL: Record<OrderItemKindLabel, string> = {
   FLIGHT: '机票',
   HOTEL: '酒店',
   TRANSFER: '接送',
   VISA: '签证',
-  COMBO: '打包',
+  INSURANCE: '保险',
+  FEE: '附加费',
+  DISCOUNT: '折扣',
 };
 
-// 佣金率（按产品类型）
-const COMMISSION_RATE: Record<MockOrder['itemKind'], number> = {
-  FLIGHT: 0.10,
-  HOTEL: 0.08,
-  TRANSFER: 0.15,
-  VISA: 0.12,
-  COMBO: 0.10,
+// 佣金率（按产品类型，简化版 — 真实佣金由 CommissionRecord 表算）
+const COMMISSION_RATE: Partial<Record<OrderItemKindLabel, number>> = {
+  FLIGHT: 0.10, HOTEL: 0.08, TRANSFER: 0.15, VISA: 0.12,
 };
+
+// ── 辅助：从 OrderSummary 派生视图字段 ──────────────────────────────
+function deriveView(o: OrderSummary) {
+  const first = o.items[0];
+  const itemKind: OrderItemKindLabel = first?.kind ?? 'FLIGHT';
+  const summaryParts = o.items.map((it) =>
+    it.quantity > 1 ? `${it.description} × ${it.quantity}` : it.description,
+  );
+  const itemSummary = summaryParts.join(' + ');
+  const customerName = o.user.displayName ?? o.contactName;
+  const agentName = o.agent?.companyName ?? o.agent?.contactName ?? null;
+  const totalNum = Number(o.total);
+  return { itemKind, itemSummary, customerName, agentName, totalNum };
+}
 
 export function OrdersPage() {
-  const [orders, setOrders] = useState<MockOrder[]>(MOCK_ORDERS);
-  const [statusFilter, setStatusFilter] = useState<'' | MockOrderStatus>('');
-  const [kindFilter, setKindFilter] = useState<'' | MockOrder['itemKind']>('');
+  const tokens = useAuth((s) => s.tokens);
+  const [orders, setOrders] = useState<OrderSummary[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [statusFilter, setStatusFilter] = useState<'' | OrderStatus>('');
+  const [kindFilter, setKindFilter] = useState<'' | OrderItemKindLabel>('');
   const [channelFilter, setChannelFilter] = useState<'' | 'direct' | 'agent'>('');
   const [agentFilter, setAgentFilter] = useState<string>('');
   const [search, setSearch] = useState('');
-  const [selected, setSelected] = useState<MockOrder | null>(null);
+  const [selected, setSelected] = useState<OrderSummary | null>(null);
+
+  // 拉取订单
+  useEffect(() => {
+    if (!tokens?.accessToken) return;
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    api.listOrders(tokens.accessToken, { pageSize: 200 })
+      .then((res) => {
+        if (cancelled) return;
+        setOrders(res.orders);
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        setError(err instanceof ApiError ? err.message : '加载订单失败');
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => { cancelled = true; };
+  }, [tokens?.accessToken]);
+
+  // 视图层把 OrderSummary 映射成便于筛选/展示的数据
+  const ordersView = useMemo(
+    () => orders.map((o) => ({ order: o, view: deriveView(o) })),
+    [orders],
+  );
 
   // 所有代理名（去重）
   const agentNames = useMemo(() => {
     const set = new Set<string>();
-    orders.forEach((o) => { if (o.agentName) set.add(o.agentName); });
+    ordersView.forEach(({ view }) => { if (view.agentName) set.add(view.agentName); });
     return Array.from(set).sort();
-  }, [orders]);
+  }, [ordersView]);
 
   const filtered = useMemo(() => {
-    return orders.filter((o) => {
-      if (statusFilter && o.status !== statusFilter) return false;
-      if (kindFilter && o.itemKind !== kindFilter) return false;
-      if (channelFilter === 'direct' && o.agentName) return false;
-      if (channelFilter === 'agent' && !o.agentName) return false;
-      if (agentFilter && o.agentName !== agentFilter) return false;
+    return ordersView.filter(({ order, view }) => {
+      if (statusFilter && order.status !== statusFilter) return false;
+      if (kindFilter && view.itemKind !== kindFilter) return false;
+      if (channelFilter === 'direct' && view.agentName) return false;
+      if (channelFilter === 'agent' && !view.agentName) return false;
+      if (agentFilter && view.agentName !== agentFilter) return false;
       if (search) {
         const q = search.toLowerCase();
         if (
-          !o.orderNumber.toLowerCase().includes(q) &&
-          !o.customerName.toLowerCase().includes(q) &&
-          !(o.agentName?.toLowerCase().includes(q) ?? false)
+          !order.orderNumber.toLowerCase().includes(q) &&
+          !view.customerName.toLowerCase().includes(q) &&
+          !(view.agentName?.toLowerCase().includes(q) ?? false)
         )
           return false;
       }
       return true;
     });
-  }, [orders, statusFilter, kindFilter, channelFilter, agentFilter, search]);
+  }, [ordersView, statusFilter, kindFilter, channelFilter, agentFilter, search]);
 
-  // 汇总：代理维度统计
+  // 代理维度统计
   const agentStats = useMemo(() => {
     const map = new Map<string, { orders: number; revenue: number; commission: number }>();
     const directStats = { orders: 0, revenue: 0, commission: 0 };
-    filtered.forEach((o) => {
-      const paid = o.status === 'PAID' || o.status === 'TICKETED' || o.status === 'COMPLETED';
+    filtered.forEach(({ order, view }) => {
+      const paid = order.status === 'PAID' || order.status === 'TICKETED' || order.status === 'COMPLETED';
       if (!paid) return;
-      const commission = o.total * COMMISSION_RATE[o.itemKind];
-      if (o.agentName) {
-        const cur = map.get(o.agentName) ?? { orders: 0, revenue: 0, commission: 0 };
+      const rate = COMMISSION_RATE[view.itemKind] ?? 0;
+      const commission = view.totalNum * rate;
+      if (view.agentName) {
+        const cur = map.get(view.agentName) ?? { orders: 0, revenue: 0, commission: 0 };
         cur.orders++;
-        cur.revenue += o.total;
+        cur.revenue += view.totalNum;
         cur.commission += commission;
-        map.set(o.agentName, cur);
+        map.set(view.agentName, cur);
       } else {
         directStats.orders++;
-        directStats.revenue += o.total;
+        directStats.revenue += view.totalNum;
       }
     });
     return { byAgent: map, direct: directStats };
   }, [filtered]);
 
-  const advance = (order: MockOrder, next: MockOrderStatus) => {
-    setOrders((prev) => prev.map((o) => (o.id === order.id ? { ...o, status: next } : o)));
-    setSelected((prev) => (prev && prev.id === order.id ? { ...prev, status: next } : prev));
+  const advance = async (order: OrderSummary, next: OrderStatus, reason?: string) => {
+    if (!tokens?.accessToken) return;
+    try {
+      const res = await api.updateOrderStatus(tokens.accessToken, order.id, next, reason);
+      setOrders((prev) => prev.map((o) => (o.id === order.id ? res.order : o)));
+      setSelected((prev) => (prev && prev.id === order.id ? res.order : prev));
+    } catch (err) {
+      alert(err instanceof ApiError ? `操作失败：${err.message}` : '操作失败');
+    }
   };
 
   return (
@@ -110,29 +184,52 @@ export function OrdersPage() {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <span className="rounded bg-slate-100 px-3 py-1 text-xs text-slate-600">共 {filtered.length} 条</span>
+          <span className="rounded bg-slate-100 px-3 py-1 text-xs text-slate-600">
+            {loading ? '加载中…' : `共 ${filtered.length} 条`}
+          </span>
           <button
             className="btn-secondary text-sm"
+            disabled={loading}
             onClick={() =>
-              exportToCSV('订单列表', filtered, [
-                { key: 'orderNumber', label: '订单号' },
-                { key: 'customerName', label: '客户' },
-                { key: 'contactPhone', label: '电话' },
-                { key: 'agentName', label: '归属代理', format: (v) => String(v ?? '直销') },
-                { key: 'itemKind', label: '产品类型', format: (v) => KIND_LABEL[v as MockOrder['itemKind']] },
-                { key: 'itemSummary', label: '订单内容' },
-                { key: 'passengerCount', label: '人数' },
-                { key: 'total', label: '金额', format: (v) => `¥${Number(v).toLocaleString()}` },
-                { key: 'paymentMethod', label: '支付方式', format: (v) => String(v ?? '—') },
-                { key: 'status', label: '状态', format: (v) => STATUS_LABEL[v as MockOrderStatus] },
-                { key: 'createdAt', label: '下单时间', format: (v) => new Date(String(v)).toLocaleString('zh-CN') },
-              ])
+              exportToCSV(
+                '订单列表',
+                filtered.map(({ order, view }) => ({
+                  orderNumber: order.orderNumber,
+                  customerName: view.customerName,
+                  contactPhone: order.contactPhone,
+                  agentName: view.agentName ?? '直销',
+                  itemKind: KIND_LABEL[view.itemKind],
+                  itemSummary: view.itemSummary,
+                  passengerCount: order.passengers.length,
+                  total: view.totalNum,
+                  status: STATUS_LABEL[order.status],
+                  createdAt: new Date(order.createdAt).toLocaleString('zh-CN'),
+                })),
+                [
+                  { key: 'orderNumber', label: '订单号' },
+                  { key: 'customerName', label: '客户' },
+                  { key: 'contactPhone', label: '电话' },
+                  { key: 'agentName', label: '归属代理' },
+                  { key: 'itemKind', label: '产品类型' },
+                  { key: 'itemSummary', label: '订单内容' },
+                  { key: 'passengerCount', label: '人数' },
+                  { key: 'total', label: '金额', format: (v) => `¥${Number(v).toLocaleString()}` },
+                  { key: 'status', label: '状态' },
+                  { key: 'createdAt', label: '下单时间' },
+                ],
+              )
             }
           >
             📥 导出 CSV
           </button>
         </div>
       </section>
+
+      {error && (
+        <div className="rounded-md bg-red-50 border border-red-200 px-4 py-3 text-sm text-red-800">
+          ❌ {error}
+        </div>
+      )}
 
       {/* 代理维度统计 */}
       <section className="card">
@@ -176,13 +273,11 @@ export function OrdersPage() {
             <select
               className="input"
               value={statusFilter}
-              onChange={(e) => setStatusFilter(e.target.value as '' | MockOrderStatus)}
+              onChange={(e) => setStatusFilter(e.target.value as '' | OrderStatus)}
             >
               <option value="">全部状态</option>
-              {ALL_STATUSES.map((s) => (
-                <option key={s} value={s}>
-                  {STATUS_LABEL[s]}
-                </option>
+              {FILTER_STATUSES.map((s) => (
+                <option key={s} value={s}>{STATUS_LABEL[s]}</option>
               ))}
             </select>
           </div>
@@ -191,11 +286,11 @@ export function OrdersPage() {
             <select
               className="input"
               value={kindFilter}
-              onChange={(e) => setKindFilter(e.target.value as '' | MockOrder['itemKind'])}
+              onChange={(e) => setKindFilter(e.target.value as '' | OrderItemKindLabel)}
             >
               <option value="">全部类型</option>
-              {Object.entries(KIND_LABEL).map(([k, v]) => (
-                <option key={k} value={k}>{v}</option>
+              {(['FLIGHT', 'HOTEL', 'TRANSFER', 'VISA'] as OrderItemKindLabel[]).map((k) => (
+                <option key={k} value={k}>{KIND_LABEL[k]}</option>
               ))}
             </select>
           </div>
@@ -258,59 +353,63 @@ export function OrdersPage() {
                 <th className="px-4 py-3 text-left">客户 / 代理</th>
                 <th className="px-4 py-3 text-left">内容</th>
                 <th className="px-4 py-3 text-right">金额</th>
-                <th className="px-4 py-3 text-center">支付方式</th>
                 <th className="px-4 py-3 text-center">状态</th>
                 <th className="px-4 py-3 text-left">下单时间</th>
                 <th className="px-4 py-3"></th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {filtered.map((o) => (
-                <tr key={o.id} className="hover:bg-slate-50">
-                  <td className="px-4 py-3 font-mono text-xs text-slate-700">{o.orderNumber}</td>
+              {filtered.map(({ order, view }) => (
+                <tr key={order.id} className="hover:bg-slate-50">
+                  <td className="px-4 py-3 font-mono text-xs text-slate-700">{order.orderNumber}</td>
                   <td className="px-4 py-3">
-                    <div className="font-medium text-slate-900">{o.customerName}</div>
-                    <div className="text-xs text-slate-500">{o.contactPhone}</div>
-                    {o.agentName && (
+                    <div className="font-medium text-slate-900">{view.customerName}</div>
+                    <div className="text-xs text-slate-500">{order.contactPhone}</div>
+                    {view.agentName && (
                       <div className="mt-0.5 inline-block rounded bg-brand/10 px-1.5 py-0.5 text-xs text-brand">
-                        {o.agentName}
+                        {view.agentName}
                       </div>
                     )}
                   </td>
                   <td className="px-4 py-3">
-                    <div className="text-slate-900">{o.itemSummary}</div>
+                    <div className="text-slate-900 max-w-xs truncate" title={view.itemSummary}>
+                      {view.itemSummary}
+                    </div>
                     <div className="mt-0.5 text-xs text-slate-500">
-                      <span className="rounded bg-slate-100 px-1.5 py-0.5">{KIND_LABEL[o.itemKind]}</span>
-                      <span className="ml-2">{o.passengerCount} 人</span>
+                      <span className="rounded bg-slate-100 px-1.5 py-0.5">{KIND_LABEL[view.itemKind]}</span>
+                      <span className="ml-2">{order.passengers.length} 人</span>
                     </div>
                   </td>
-                  <td className="px-4 py-3 text-right font-medium text-slate-900">¥{o.total.toLocaleString()}</td>
-                  <td className="px-4 py-3 text-center text-xs text-slate-600">{o.paymentMethod ?? '—'}</td>
+                  <td className="px-4 py-3 text-right font-medium text-slate-900">
+                    ¥{view.totalNum.toLocaleString()}
+                  </td>
                   <td className="px-4 py-3 text-center">
-                    <span className={`rounded px-2 py-0.5 text-xs ${STATUS_COLOR[o.status]}`}>
-                      {STATUS_LABEL[o.status]}
+                    <span className={`rounded px-2 py-0.5 text-xs ${STATUS_COLOR[order.status]}`}>
+                      {STATUS_LABEL[order.status]}
                     </span>
                   </td>
                   <td className="px-4 py-3 text-xs text-slate-500">
-                    {new Date(o.createdAt).toLocaleString('zh-CN', {
-                      month: '2-digit',
-                      day: '2-digit',
-                      hour: '2-digit',
-                      minute: '2-digit',
+                    {new Date(order.createdAt).toLocaleString('zh-CN', {
+                      month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
                     })}
                   </td>
                   <td className="px-4 py-3 text-right">
-                    <button className="text-sm text-brand hover:text-brand-dark" onClick={() => setSelected(o)}>
+                    <button className="text-sm text-brand hover:text-brand-dark" onClick={() => setSelected(order)}>
                       详情
                     </button>
                   </td>
                 </tr>
               ))}
-              {filtered.length === 0 && (
+              {!loading && filtered.length === 0 && (
                 <tr>
-                  <td colSpan={8} className="px-4 py-8 text-center text-slate-500">
+                  <td colSpan={7} className="px-4 py-8 text-center text-slate-500">
                     没有符合条件的订单
                   </td>
+                </tr>
+              )}
+              {loading && (
+                <tr>
+                  <td colSpan={7} className="px-4 py-8 text-center text-slate-400">加载中…</td>
                 </tr>
               )}
             </tbody>
@@ -322,24 +421,26 @@ export function OrdersPage() {
         <OrderDrawer
           order={selected}
           onClose={() => setSelected(null)}
-          onAdvance={(next) => advance(selected, next)}
+          onAdvance={(next, reason) => advance(selected, next, reason)}
         />
       )}
     </div>
   );
 }
 
+// ── Drawer ─────────────────────────────────────────────────────────────
 function OrderDrawer({
   order,
   onClose,
   onAdvance,
 }: {
-  order: MockOrder;
+  order: OrderSummary;
   onClose: () => void;
-  onAdvance: (next: MockOrderStatus) => void;
+  onAdvance: (next: OrderStatus, reason?: string) => void;
 }) {
-  // 可行的下一步状态（demo 逻辑）
-  const nextSteps: Array<{ label: string; to: MockOrderStatus; style: string }> = (() => {
+  const view = deriveView(order);
+  // 可行的下一步状态（与 backend orders.service ALLOWED_TRANSITIONS 保持一致的子集）
+  const nextSteps: Array<{ label: string; to: OrderStatus; style: string }> = (() => {
     switch (order.status) {
       case 'PENDING_PAYMENT':
         return [
@@ -347,15 +448,24 @@ function OrderDrawer({
           { label: '取消订单', to: 'CANCELLED', style: 'btn-secondary' },
         ];
       case 'PAID':
-        return [{ label: '进入处理', to: 'PROCESSING', style: 'btn-primary' }];
+        return [
+          { label: '进入处理', to: 'PROCESSING', style: 'btn-primary' },
+          { label: '直接出票', to: 'TICKETED', style: 'btn-secondary' },
+        ];
       case 'PROCESSING':
-        return [{ label: '出票完成', to: 'TICKETED', style: 'btn-primary' }];
+        return [
+          { label: '出票完成', to: 'TICKETED', style: 'btn-primary' },
+          { label: '出票失败', to: 'FAILED', style: 'btn-secondary' },
+        ];
       case 'TICKETED':
-        return [{ label: '订单完结', to: 'COMPLETED', style: 'btn-primary' }];
+        return [
+          { label: '订单完结', to: 'COMPLETED', style: 'btn-primary' },
+          { label: '申请退款', to: 'REFUND_REQUESTED', style: 'btn-secondary' },
+        ];
       case 'REFUND_REQUESTED':
         return [
-          { label: '同意退款', to: 'CANCELLED', style: 'btn-primary' },
-          { label: '驳回退款', to: 'TICKETED', style: 'btn-secondary' },
+          { label: '同意退款', to: 'REFUNDED', style: 'btn-primary' },
+          { label: '驳回回退处理', to: 'PROCESSING', style: 'btn-secondary' },
         ];
       default:
         return [];
@@ -381,42 +491,69 @@ function OrderDrawer({
                 {STATUS_LABEL[order.status]}
               </span>
               <span className="rounded bg-slate-100 px-2 py-0.5 text-xs text-slate-600">
-                {order.itemKind}
+                {KIND_LABEL[view.itemKind]}
               </span>
             </div>
           </section>
 
           <section>
             <h3 className="text-sm font-medium text-slate-700">产品内容</h3>
-            <div className="mt-2 rounded-md border border-slate-200 bg-slate-50 p-3 text-sm">
-              <p className="text-slate-900">{order.itemSummary}</p>
-              <p className="mt-1 text-xs text-slate-500">{order.passengerCount} 人</p>
-            </div>
+            <ul className="mt-2 space-y-2 text-sm">
+              {order.items.map((it) => (
+                <li key={it.id} className="rounded-md border border-slate-200 bg-slate-50 p-3">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="flex-1">
+                      <div className="text-slate-900">{it.description}</div>
+                      <div className="mt-0.5 text-xs text-slate-500">
+                        {KIND_LABEL[it.kind]} · 数量 {it.quantity} · 单价 ¥{Number(it.unitPrice).toLocaleString()}
+                      </div>
+                    </div>
+                    <div className="text-sm font-medium text-slate-900">
+                      ¥{Number(it.amount).toLocaleString()}
+                    </div>
+                  </div>
+                </li>
+              ))}
+            </ul>
+            <p className="mt-2 text-xs text-slate-500">共 {order.passengers.length} 位乘客</p>
+          </section>
+
+          <section>
+            <h3 className="text-sm font-medium text-slate-700">乘客</h3>
+            <ul className="mt-2 space-y-1 text-sm text-slate-700">
+              {order.passengers.map((p) => (
+                <li key={p.id} className="flex justify-between">
+                  <span>{p.fullName}</span>
+                  <span className="font-mono text-xs text-slate-500">{p.documentNumber}</span>
+                </li>
+              ))}
+            </ul>
           </section>
 
           <section>
             <h3 className="text-sm font-medium text-slate-700">客户信息</h3>
             <dl className="mt-2 space-y-1 text-sm">
-              <Row label="姓名" value={order.customerName} />
+              <Row label="联系人" value={order.contactName} />
               <Row label="联系电话" value={order.contactPhone} />
-              {order.agentName && <Row label="归属代理" value={order.agentName} />}
+              {order.contactEmail && <Row label="邮箱" value={order.contactEmail} />}
+              {view.agentName && <Row label="归属代理" value={view.agentName} />}
             </dl>
           </section>
 
           <section>
             <h3 className="text-sm font-medium text-slate-700">支付</h3>
             <dl className="mt-2 space-y-1 text-sm">
-              <Row label="支付方式" value={order.paymentMethod ?? '—'} />
               <Row
                 label="订单金额"
-                value={<span className="text-lg font-bold text-red-600">¥{order.total.toLocaleString()}</span>}
+                value={<span className="text-lg font-bold text-red-600">¥{view.totalNum.toLocaleString()}</span>}
               />
+              <Row label="已付" value={`¥${Number(order.paidAmount).toLocaleString()}`} />
               <Row label="下单时间" value={new Date(order.createdAt).toLocaleString('zh-CN')} />
             </dl>
           </section>
 
-          {/* 履约 Fulfillment */}
-          <FulfillmentSection order={order} />
+          {/* 履约 Fulfillment — 目前仍 mock，M6 接真实 FulfillmentTask 表 */}
+          <FulfillmentSection orderId={order.id} />
 
           <section>
             <h3 className="text-sm font-medium text-slate-700">状态流转</h3>
@@ -433,7 +570,7 @@ function OrderDrawer({
               ))}
             </div>
             <p className="mt-3 text-xs text-slate-400">
-              ⓘ demo 模式：状态变更仅在当前会话生效，刷新后复原。
+              ⓘ 状态变更会真实写入数据库并记录操作事件。
             </p>
           </section>
         </div>
@@ -452,7 +589,7 @@ function Row({ label, value }: { label: string; value: React.ReactNode }) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 履约 Fulfillment — PNR / 酒店确认号 / 签证进度 / 接送司机
+// 履约 Fulfillment — 目前还是 mock（M6 接真实 FulfillmentTask）
 // ═══════════════════════════════════════════════════════════════
 
 const FF_STATUS_COLOR: Record<FulfillmentStatus, string> = {
@@ -467,14 +604,15 @@ const FF_STATUS_LABEL: Record<FulfillmentStatus, string> = {
   PENDING: '待处理', IN_PROGRESS: '处理中', CONFIRMED: '已确认', CANCELLED: '已取消', FAILED: '失败',
 };
 
-function FulfillmentSection({ order }: { order: MockOrder }) {
-  const ff = MOCK_FULFILLMENTS[order.id];
+function FulfillmentSection({ orderId }: { orderId: string }) {
+  // 真实订单 id 跟 mock 对不上，所以这里 demo 展示空态；M6 加真 API
+  const ff = MOCK_FULFILLMENTS[orderId];
   if (!ff) {
     return (
       <section>
         <h3 className="text-sm font-medium text-slate-700">🚚 履约进度</h3>
         <div className="mt-2 rounded-md bg-slate-50 p-3 text-xs text-slate-500">
-          暂无履约记录 · 真环境订单付款后自动触发 fulfillment 工作流
+          暂无履约记录 · 真环境订单付款后自动触发 fulfillment 工作流（M6 接入）
         </div>
       </section>
     );
@@ -484,43 +622,29 @@ function FulfillmentSection({ order }: { order: MockOrder }) {
     <section>
       <div className="flex items-center justify-between">
         <h3 className="text-sm font-medium text-slate-700">🚚 履约进度</h3>
-        <button className="text-xs text-brand hover:text-brand-dark" onClick={() => alert('刷新履约状态 (demo) - 真环境会轮询供应商 API')}>🔄 刷新</button>
       </div>
       <div className="mt-2 space-y-2">
         {ff.flight && (
           <FfCard icon="✈️" label="机票出票" status={ff.flight.status}>
             <Row label="PNR" value={<span className="font-mono">{ff.flight.pnr ?? '（未生成）'}</span>} />
             <Row label="电子票号" value={<span className="font-mono">{ff.flight.eTicketNumber ?? '—'}</span>} />
-            {ff.flight.status === 'CONFIRMED' && (
-              <button className="mt-2 text-xs text-brand hover:text-brand-dark" onClick={() => alert('下载 e-ticket PDF (demo)')}>📄 下载电子行程单</button>
-            )}
-            {ff.flight.status === 'IN_PROGRESS' && (
-              <div className="mt-2 text-xs text-blue-700">⏳ 正在向 Bamboo Airways 出票…</div>
-            )}
           </FfCard>
         )}
         {ff.hotel && (
           <FfCard icon="🏨" label="酒店确认" status={ff.hotel.status}>
-            <Row label="确认号" value={<span className="font-mono">{ff.hotel.confirmationNumber ?? '（等待 PMS 回传）'}</span>} />
-            {ff.hotel.status === 'CONFIRMED' && (
-              <div className="mt-1 text-xs text-green-700">✓ 已发送预订凭证到客户邮箱</div>
-            )}
+            <Row label="确认号" value={<span className="font-mono">{ff.hotel.confirmationNumber ?? '—'}</span>} />
           </FfCard>
         )}
         {ff.visa && (
           <FfCard icon="🛂" label="签证办理" status={ff.visa.status}>
             <Row label="申请号" value={<span className="font-mono">{ff.visa.applicationNumber ?? '—'}</span>} />
             <Row label="当前进度" value={ff.visa.progress} />
-            <button className="mt-2 text-xs text-brand hover:text-brand-dark" onClick={() => alert('查看材料清单 (demo)')}>📋 查看材料</button>
           </FfCard>
         )}
         {ff.transfer && (
           <FfCard icon="🚐" label="接送调度" status={ff.transfer.status}>
             <Row label="司机" value={ff.transfer.driverName ?? '（未分配）'} />
             <Row label="车牌" value={<span className="font-mono">{ff.transfer.vehicleNumber ?? '—'}</span>} />
-            {ff.transfer.status === 'CONFIRMED' && ff.transfer.driverName && (
-              <div className="mt-1 text-xs text-green-700">✓ 司机已联系客户</div>
-            )}
           </FfCard>
         )}
       </div>

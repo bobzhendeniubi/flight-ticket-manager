@@ -1,14 +1,14 @@
 /**
- * 结账页 — 输入乘客信息（姓名、护照号、电话），可上传护照走 OCR mock 自动填表。
+ * 结账页 — 输入乘客信息（姓名、护照号、电话），可上传护照走 tesseract.js OCR 自动填表。
  *
- * Mock OCR 行为：用户选任意图片文件 → 1.5 秒延时假装识别 → 自动填入 demo 数据。
- * 真接 API 后会调 backend POST /ocr/passport（Tesseract → AWS Textract）。
+ * 下单流程：POST /orders → 服务端重算价格 + 扣座位 + 生成订单号 → 跳完成页。
  */
-import { FormEvent, useState } from 'react';
+import { FormEvent, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useCart, KIND_INFO } from '../stores/cart';
 import { useAuth } from '../stores/auth';
 import { ocrPassport } from '../lib/passportOcr';
+import { api, ApiError, type CreateOrderInput } from '../lib/api';
 
 interface PassengerForm {
   fullName: string;
@@ -31,6 +31,7 @@ const EMPTY_PASSENGER: PassengerForm = {
 
 export function CheckoutPage() {
   const user = useAuth((s) => s.user);
+  const tokens = useAuth((s) => s.tokens);
   const isAgent = user?.role === 'AGENT';
   const items = useCart((s) => s.items);
   const total = useCart((s) => s.items.reduce((sum, i) => sum + i.unitPrice * i.qty, 0));
@@ -40,20 +41,26 @@ export function CheckoutPage() {
   const [contactPhone, setContactPhone] = useState('');
   const [contactEmail, setContactEmail] = useState('');
   const [passengers, setPassengers] = useState<PassengerForm[]>([{ ...EMPTY_PASSENGER }]);
-  const [paymentMethod, setPaymentMethod] = useState('WECHAT_PAY');
+  const [paymentMethod, setPaymentMethod] = useState<CreateOrderInput['paymentMethod']>('WECHAT_PAY');
   const [submitting, setSubmitting] = useState(false);
-  const [done, setDone] = useState<{ orderNumber: string } | null>(null);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [done, setDone] = useState<{ orderNumber: string; total: string } | null>(null);
 
-  // 需要出行人的总人数 = 机票张数 + 套餐里的人数
-  const flightTicketCount = items
-    .filter((i) => i.kind === 'FLIGHT')
-    .reduce((sum, i) => sum + i.qty, 0);
+  // 需要出行人的总人数 = 机票张数（取 meta.passengers，因 FLIGHT 购物车 qty=1 是技巧）
+  const flightTicketCount = useMemo(
+    () =>
+      items
+        .filter((i) => i.kind === 'FLIGHT')
+        .reduce((sum, i) => sum + (Number(i.meta?.passengers) || i.qty), 0),
+    [items],
+  );
   const bundlePaxCount = items
     .filter((i) => i.kind === 'BUNDLE')
     .reduce((sum, i) => sum + (Number(i.meta?.pax) || 0), 0);
   // 如果同时买了散票和套餐，取较大值（套餐含机票，乘客是同一批人）
   const effectivePax = bundlePaxCount > 0 ? bundlePaxCount : flightTicketCount;
   const paxMismatch = effectivePax > 0 && passengers.length !== effectivePax;
+  const hasBundle = items.some((i) => i.kind === 'BUNDLE');
 
   if (items.length === 0 && !done) {
     return (
@@ -70,11 +77,15 @@ export function CheckoutPage() {
     return (
       <div className="card max-w-lg mx-auto text-center py-12">
         <div className="text-5xl">🎉</div>
-        <h1 className="mt-3 text-2xl font-bold text-slate-900">下单成功（demo）</h1>
+        <h1 className="mt-3 text-2xl font-bold text-slate-900">下单成功</h1>
         <p className="mt-2 text-sm text-slate-600">订单号</p>
         <p className="font-mono text-lg text-slate-900">{done.orderNumber}</p>
+        <p className="mt-2 text-sm text-slate-700">
+          应付 <span className="text-lg font-bold text-red-600">¥{Number(done.total).toLocaleString()}</span>
+        </p>
         <p className="mt-3 text-sm text-slate-500">
-          运营会在 10 分钟内确认订单，已发短信至 {contactPhone}
+          订单已创建，状态为 <span className="font-medium">待支付</span>。
+          运营会在 10 分钟内确认，已发短信至 {contactPhone}
         </p>
         <div className="mt-6 flex justify-center gap-3">
           <Link to="/" className="btn-secondary">
@@ -98,48 +109,111 @@ export function CheckoutPage() {
 
   const onSubmit = async (e: FormEvent) => {
     e.preventDefault();
+    setErrorMsg(null);
+
     // Invariant: 买几张票/套餐几人就填几个出行人
     if (effectivePax > 0 && passengers.length !== effectivePax) {
-      alert(`需要 ${effectivePax} 位出行人（${flightTicketCount > 0 ? `机票 ${flightTicketCount} 张` : ''}${bundlePaxCount > 0 ? `套餐 ${bundlePaxCount} 人` : ''}），当前填了 ${passengers.length} 位`);
+      setErrorMsg(
+        `需要 ${effectivePax} 位出行人（${flightTicketCount > 0 ? `机票 ${flightTicketCount} 张` : ''}${bundlePaxCount > 0 ? ` 套餐 ${bundlePaxCount} 人` : ''}），当前填了 ${passengers.length} 位`,
+      );
       return;
     }
     if (passengers.length === 0) {
-      alert('至少需要 1 位出行人');
+      setErrorMsg('至少需要 1 位出行人');
       return;
     }
-    if (passengers.some((p) => !p.fullName.trim() || !p.passportNumber.trim())) {
-      alert('请填写所有出行人的姓名和护照号');
+    if (passengers.some((p) => !p.fullName.trim() || !p.passportNumber.trim() || !p.dateOfBirth)) {
+      setErrorMsg('请填写所有出行人的姓名、护照号和出生日期');
       return;
     }
     if (!contactName.trim() || !contactPhone.trim()) {
-      alert('请填写联系人姓名和手机号');
+      setErrorMsg('请填写联系人姓名和手机号');
       return;
     }
-    setSubmitting(true);
-    // 模拟下单延时
-    await new Promise((r) => setTimeout(r, 800));
-    const orderNumber = 'FTM' + new Date().toISOString().replace(/\D/g, '').slice(0, 14);
-    // 写到 localStorage 模拟"已下单"动态（admin 仪表盘可能会读这里）
-    try {
-      const existing = JSON.parse(localStorage.getItem('ftm-recent-orders') || '[]');
-      // contactName 上面已经校验非空，passengers[0] 也已经校验存在
-      existing.unshift({
-        orderNumber,
-        customerName: contactName.trim(),
-        contactPhone,
-        items: items.map((i) => ({ kind: i.kind, name: i.name, qty: i.qty, unitPrice: i.unitPrice })),
-        total,
-        paymentMethod,
-        passengerCount: passengers.length,
-        createdAt: new Date().toISOString(),
-      });
-      localStorage.setItem('ftm-recent-orders', JSON.stringify(existing.slice(0, 20)));
-    } catch {
-      // ignore
+    if (hasBundle) {
+      setErrorMsg('套餐产品暂未接入后端（等 M6 产品模块上线）。请先把套餐从购物车移除，或单独购买组件。');
+      return;
     }
-    clear();
-    setSubmitting(false);
-    setDone({ orderNumber });
+    if (!tokens?.accessToken) {
+      setErrorMsg('登录已失效，请重新登录后再下单');
+      return;
+    }
+
+    // 购物车 → CreateOrderInput.items
+    const body: CreateOrderInput = {
+      contactName: contactName.trim(),
+      contactPhone: contactPhone.trim(),
+      contactEmail: contactEmail.trim() || undefined,
+      paymentMethod,
+      passengers: passengers.map((p) => ({
+        fullName: p.fullName.trim(),
+        documentType: 'PASSPORT',
+        documentNumber: p.passportNumber.trim(),
+        dateOfBirth: p.dateOfBirth,
+        nationality: p.nationality || 'CN',
+        passengerType: 'ADULT',
+      })),
+      items: items.flatMap((i): CreateOrderInput['items'] => {
+        if (i.kind === 'FLIGHT') {
+          const qty = Number(i.meta?.passengers) || 1;
+          const cabin = (String(i.meta?.cabin ?? 'ECONOMY')) as
+            | 'ECONOMY' | 'PREMIUM_ECONOMY' | 'BUSINESS' | 'FIRST';
+          return [{
+            kind: 'FLIGHT',
+            description: i.name,
+            quantity: qty,
+            flightScheduleId: i.productId,
+            flightCabin: cabin,
+          }];
+        }
+        if (i.kind === 'HOTEL') {
+          return [{
+            kind: 'HOTEL',
+            description: i.name,
+            quantity: i.qty,
+            unitPrice: i.unitPrice,
+            checkIn: i.meta?.checkIn ? String(i.meta.checkIn) : undefined,
+            checkOut: i.meta?.checkOut ? String(i.meta.checkOut) : undefined,
+          }];
+        }
+        if (i.kind === 'TRANSFER') {
+          return [{
+            kind: 'TRANSFER',
+            description: i.name,
+            quantity: i.qty,
+            unitPrice: i.unitPrice,
+          }];
+        }
+        if (i.kind === 'VISA') {
+          return [{
+            kind: 'VISA',
+            description: i.name,
+            quantity: i.qty,
+            unitPrice: i.unitPrice,
+          }];
+        }
+        return []; // BUNDLE 已上面拒绝，不会到这里
+      }),
+      idempotencyKey:
+        typeof crypto !== 'undefined' && 'randomUUID' in crypto
+          ? crypto.randomUUID()
+          : `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    };
+
+    setSubmitting(true);
+    try {
+      const { order } = await api.createOrder(tokens.accessToken, body);
+      clear();
+      setDone({ orderNumber: order.orderNumber, total: order.total });
+    } catch (err) {
+      if (err instanceof ApiError) {
+        setErrorMsg(`下单失败：${err.message}`);
+      } else {
+        setErrorMsg('下单失败，请稍后重试');
+      }
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   return (
@@ -149,6 +223,11 @@ export function CheckoutPage() {
         <p className="mt-1 text-sm text-slate-600">
           请填写联系人信息和每位乘客的护照信息。可上传护照照片自动识别（OCR）。
         </p>
+        {errorMsg && (
+          <div className="mt-3 rounded-md bg-red-50 border border-red-200 px-4 py-3 text-sm text-red-800">
+            ❌ {errorMsg}
+          </div>
+        )}
       </section>
 
       <form onSubmit={onSubmit} className="space-y-5">
@@ -265,7 +344,7 @@ export function CheckoutPage() {
                   name="payment"
                   value={p.v}
                   checked={paymentMethod === p.v}
-                  onChange={(e) => setPaymentMethod(e.target.value)}
+                  onChange={(e) => setPaymentMethod(e.target.value as CreateOrderInput['paymentMethod'])}
                 />
                 <div className="text-2xl">{p.emoji}</div>
                 <div className="mt-1 text-sm font-medium text-slate-900">{p.label}</div>

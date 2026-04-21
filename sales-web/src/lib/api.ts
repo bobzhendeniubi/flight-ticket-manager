@@ -149,6 +149,129 @@ export interface CreateChildAgentInput {
   notes?: string;
 }
 
+// ── Orders ────────────────────────────────────────────────────────────────
+export type OrderStatus =
+  | 'DRAFT'
+  | 'PENDING_PAYMENT'
+  | 'PAID'
+  | 'PROCESSING'
+  | 'TICKETED'
+  | 'COMPLETED'
+  | 'PAYMENT_TIMEOUT'
+  | 'CANCELLED'
+  | 'REFUND_REQUESTED'
+  | 'REFUNDED'
+  | 'CHANGE_REQUESTED'
+  | 'CHANGED'
+  | 'FAILED';
+
+export type OrderItemKind = 'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA' | 'INSURANCE' | 'FEE' | 'DISCOUNT';
+export type DocumentType = 'PASSPORT' | 'ID_CARD' | 'OTHER';
+export type PassengerType = 'ADULT' | 'CHILD' | 'INFANT';
+export type PaymentMethod = 'WECHAT_PAY' | 'ALIPAY' | 'BANK_CARD' | 'AGENT_PREPAYMENT';
+
+export interface OrderItem {
+  id: string;
+  kind: OrderItemKind;
+  description: string;
+  quantity: number;
+  unitPrice: string;
+  amount: string;
+  flightScheduleId: string | null;
+  flightCabin: CabinClass | null;
+  hotelRoomTypeId: string | null;
+  hotelCheckIn: string | null;
+  hotelCheckOut: string | null;
+  transferId: string | null;
+  visaId: string | null;
+  metadata: unknown;
+  createdAt: string;
+}
+
+export interface OrderPassenger {
+  id: string;
+  fullName: string;
+  documentType?: DocumentType;
+  documentNumber?: string;
+  dateOfBirth?: string;
+  nationality?: string;
+  passengerType?: PassengerType;
+}
+
+export interface OrderSummary {
+  id: string;
+  orderNumber: string;
+  userId: string;
+  agentId: string | null;
+  status: OrderStatus;
+  currency: string;
+  subtotal: string;
+  total: string;
+  paidAmount: string;
+  contactName: string;
+  contactPhone: string;
+  contactEmail: string | null;
+  createdAt: string;
+  updatedAt: string;
+  items: OrderItem[];
+  passengers: OrderPassenger[];
+  agent: { id: string; companyName: string | null; contactName: string } | null;
+  user: { id: string; displayName: string | null; email: string | null };
+}
+
+export interface CreateOrderInput {
+  contactName: string;
+  contactPhone: string;
+  contactEmail?: string;
+  paymentMethod?: PaymentMethod;
+  items: Array<
+    | {
+        kind: 'FLIGHT';
+        description: string;
+        quantity: number;
+        flightScheduleId: string;
+        flightCabin: CabinClass;
+        metadata?: Record<string, unknown>;
+      }
+    | {
+        kind: 'HOTEL';
+        description: string;
+        quantity: number;
+        unitPrice: number;
+        hotelRoomTypeId?: string;
+        checkIn?: string;
+        checkOut?: string;
+        metadata?: Record<string, unknown>;
+      }
+    | {
+        kind: 'TRANSFER';
+        description: string;
+        quantity: number;
+        unitPrice: number;
+        transferId?: string;
+        metadata?: Record<string, unknown>;
+      }
+    | {
+        kind: 'VISA';
+        description: string;
+        quantity: number;
+        unitPrice: number;
+        visaId?: string;
+        metadata?: Record<string, unknown>;
+      }
+  >;
+  passengers: Array<{
+    fullName: string;
+    documentType?: DocumentType;
+    documentNumber: string;
+    dateOfBirth: string;
+    nationality?: string;
+    passengerType?: PassengerType;
+  }>;
+  notes?: string;
+  idempotencyKey?: string;
+}
+
 // ── Typed endpoints ───────────────────────────────────────────────────────
 
 export const api = {
@@ -230,4 +353,28 @@ export const api = {
       parentId ? `/agents/children?parentId=${encodeURIComponent(parentId)}` : '/agents/children',
       { method: 'POST', token, body },
     ),
+
+  // 订单
+  createOrder: (token: string, body: CreateOrderInput) =>
+    apiFetch<{ order: OrderSummary }>('/orders/', { method: 'POST', token, body }),
+  listOrders: (token: string, query?: Record<string, string | number | undefined>) => {
+    const qs = new URLSearchParams();
+    if (query) {
+      for (const [k, v] of Object.entries(query)) {
+        if (v !== undefined && v !== '') qs.set(k, String(v));
+      }
+    }
+    return apiFetch<{
+      orders: OrderSummary[];
+      pagination: { page: number; pageSize: number; total: number };
+    }>(`/orders/${qs.toString() ? '?' + qs.toString() : ''}`, { token });
+  },
+  getOrder: (token: string, id: string) =>
+    apiFetch<{ order: OrderSummary }>(`/orders/${id}`, { token }),
+  updateOrderStatus: (token: string, id: string, toStatus: OrderStatus, reason?: string) =>
+    apiFetch<{ order: OrderSummary }>(`/orders/${id}/status`, {
+      method: 'PATCH',
+      token,
+      body: { toStatus, reason },
+    }),
 };

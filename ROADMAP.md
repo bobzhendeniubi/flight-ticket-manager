@@ -285,20 +285,24 @@ Tenant (licensee)
 | 缺失项 | 状态 | 说明 |
 |---|---|---|
 | 多租户 / License | ⏸️ 已移除 | 2026-04-20 产品决策 "先做一家"，`/tenants` 页已删、MOCK_TENANTS 已清，等有第 2 家客户再重做 |
-| 财务结算内核 | ✅ UI 骨架 | `/settlements` 页 · 月度结算单 · GMV→佣金→分下级→预付抵扣→应付 · CSV 导出 · PDF 占位 |
-| 运营治理 - 审计 | ✅ UI 骨架 | `/audit-logs` 页 · 12 条 mock 日志 · 谁/何时/哪 IP/改了什么 · 严重度分级 · CSV 导出 |
-| 履约 (订单 drawer) | ✅ UI 骨架 | OrdersPage 订单详情新增 🚚 履约进度：PNR / 酒店确认号 / 签证进度 / 司机调度 · 5 种状态 |
+| **订单系统** | ✅ **真后端** | `orders` 模块 4 端点：`POST/GET/GET/:id/PATCH/:id/status` · 动态定价重算 · 座位事务扣/退 · 状态机 + RBAC + 幂等 key + 乘客数校验 · sales CheckoutPage 接通 · admin OrdersPage 接通 |
+| 财务结算内核 | 🟡 UI 骨架 | `/settlements` 页 · 月度结算单 · GMV→佣金→分下级→预付抵扣→应付 · CSV 导出 · PDF 占位（后端未接） |
+| 运营治理 - 审计 | 🟡 UI 骨架 | `/audit-logs` 页 · 12 条 mock 日志 · 谁/何时/哪 IP/改了什么 · 严重度分级 · CSV 导出（后端未接） |
+| 履约 (订单 drawer) | 🟡 UI 骨架 | OrdersPage 订单详情 🚚 履约进度：PNR / 酒店确认号 / 签证进度 / 司机调度 · 5 种状态（后端未接） |
 | **OCR 真实实现** | ✅ 真功能 | tesseract.js `chi_sim+eng` + MRZ 解析 · 进度条 · 图片预览 · 识别原文可展开 · 中国护照号 `[EGSDPH]\d{8}` 正则兜底 |
 
 ### 🔴 还欠 —— 后端架构债（按 M6 里程碑 · 单租户版本）
 
-1. **Prisma 重构**：拆 OrderItem / 统一 PricingRule（不做 tenantId filter）
-2. **财务账本**：真双式记账表 + 交易流水
-3. **异步队列**：BullMQ 承载出票 / OCR / 对账
-4. **Webhook + 对外 API**：给世途自身 ERP / 供应商对接（不是给"租户"）
-5. ~~多租户数据隔离~~ —— 已 defer
+1. ~~**订单系统**~~ ✅ **已完成**（2026-04-20）
+2. **结算模块**：Settlement 表 + 月度结算单生成 + 佣金链路 + 代理预付抵扣
+3. **产品 CRUD**：Hotels / Visas / Transfers / Bundles 四类产品的后端 CRUD
+4. **Dashboard KPI**：真实 SQL 聚合营收/订单数/活跃代理等
+5. **审计日志**：操作日志写入中间件 + 查询 API
+6. **履约任务**：FulfillmentTask 表 + 状态机 + 异步队列（BullMQ）
+7. **Prisma 重构**：统一 PricingRule（目前 DateRanking + 默认 bucket 两处配置）
+8. ~~多租户数据隔离~~ —— 已 defer
 
 ---
 
-**最后更新**：2026-04-20（产品决策：先做一家，移除 License 管理；多租户延期到 V2）
-**下一次架构 review**：完成 M6 履约 + 财务账本后
+**最后更新**：2026-04-20（订单系统后端上线 + sales/admin 前端接通）
+**下一次架构 review**：完成 M6 结算 + 产品 CRUD 后
