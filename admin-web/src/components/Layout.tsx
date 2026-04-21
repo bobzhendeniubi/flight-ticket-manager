@@ -19,6 +19,9 @@ const NAV = [
   { to: '/agents', label: '代理管理' },
   { to: '/customers', label: '散客管理' },
   { to: '/travelers', label: '旅客管理' },
+  { to: '/settlements', label: '结算单' },
+  { to: '/tenants', label: '租户/License' },
+  { to: '/audit-logs', label: '审计日志' },
 ];
 
 export function Layout() {

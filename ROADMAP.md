@@ -281,5 +281,31 @@ Tenant (licensee)
 
 ---
 
-**最后更新**：2026-04-16（Codex GPT-5 review 后）
-**下一次架构 review**：完成多租户重构后
+---
+
+## 📝 2026-04-20 更新 · Codex 反馈采纳进度
+
+针对 Codex CTO review 的 5 类生产级缺失，我们在**前端 UI 层面**先把骨架搭起来（真后端按 M6-M7 里程碑做）。当前进度：
+
+### ✅ 已做（UI scaffolding + 部分真功能）
+
+| 缺失项 | 状态 | 说明 |
+|---|---|---|
+| 多租户 / License | ✅ UI 骨架 | `/tenants` 页 · 5 家 mock 租户 · 档位/配额/品牌/域名 · 可编辑抽屉 |
+| 财务结算内核 | ✅ UI 骨架 | `/settlements` 页 · 月度结算单 · GMV→佣金→分下级→预付抵扣→应付 · CSV 导出 · PDF 占位 |
+| 运营治理 - 审计 | ✅ UI 骨架 | `/audit-logs` 页 · 12 条 mock 日志 · 谁/何时/哪 IP/改了什么 · 严重度分级 · CSV 导出 |
+| 履约 (订单 drawer) | ✅ UI 骨架 | OrdersPage 订单详情新增 🚚 履约进度：PNR / 酒店确认号 / 签证进度 / 司机调度 · 5 种状态 |
+| **OCR 真实实现** | ✅ 真功能 | tesseract.js `chi_sim+eng` + MRZ 解析 · 进度条 · 图片预览 · 识别原文可展开 · 中国护照号 `[EGSDPH]\d{8}` 正则兜底 |
+
+### 🔴 还欠 —— 后端架构债（按 M6 里程碑）
+
+1. **多租户数据隔离**：现在 UI 有 tenant 概念，但后端所有查询还没加 tenantId filter
+2. **Prisma 重构**：Organization 树 / 拆 OrderItem / 统一 PricingRule
+3. **财务账本**：真双式记账表 + 交易流水
+4. **异步队列**：BullMQ 承载出票 / OCR / 对账
+5. **Webhook + 对外 API**：给租户 ERP 对接
+
+---
+
+**最后更新**：2026-04-20（补 OCR + 租户/审计/结算/履约 UI 骨架）
+**下一次架构 review**：完成 M6 多租户后端隔离 + 财务账本后

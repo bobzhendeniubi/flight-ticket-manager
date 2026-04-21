@@ -8,6 +8,7 @@ import { FormEvent, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useCart, KIND_INFO } from '../stores/cart';
 import { useAuth } from '../stores/auth';
+import { ocrPassport } from '../lib/passportOcr';
 
 interface PassengerForm {
   fullName: string;
@@ -25,12 +26,8 @@ const EMPTY_PASSENGER: PassengerForm = {
   nationality: 'CN',
 };
 
-// Mock OCR — 这是真实 Tesseract 会从澳门居民身份证 / 护照识别出的字段
-const MOCK_OCR_RESULTS = [
-  { fullName: 'CHAN MAN HO 陈文豪', passportNumber: 'MA1234567', dateOfBirth: '1985-06-15', nationality: 'MO' },
-  { fullName: 'WONG MEI LING 王美玲', passportNumber: 'MA2345678', dateOfBirth: '1990-03-22', nationality: 'MO' },
-  { fullName: 'LEE KA YIN 李嘉欣', passportNumber: 'MA3456789', dateOfBirth: '1988-11-09', nationality: 'MO' },
-];
+// Real OCR 走 Tesseract.js（chi_sim + eng 语言包 + MRZ 解析）
+// 见 lib/passportOcr.ts
 
 export function CheckoutPage() {
   const user = useAuth((s) => s.user);
@@ -326,20 +323,61 @@ function PassengerCard({
   onRemove?: () => void;
 }) {
   const [ocring, setOcring] = useState(false);
-  const [ocrSuccess, setOcrSuccess] = useState(false);
+  const [ocrStage, setOcrStage] = useState<{ pct: number; label: string } | null>(null);
+  const [ocrResult, setOcrResult] = useState<{ ok: boolean; msg: string; preview?: string } | null>(null);
+  const [imagePreview, setImagePreview] = useState<string | null>(null);
 
   const handleOcr = async (file: File) => {
     setOcring(true);
-    setOcrSuccess(false);
-    // mock OCR — 1.5s 延时
-    await new Promise((r) => setTimeout(r, 1500));
-    const result = MOCK_OCR_RESULTS[idx % MOCK_OCR_RESULTS.length];
-    onChange(result);
-    setOcring(false);
-    setOcrSuccess(true);
-    setTimeout(() => setOcrSuccess(false), 2500);
-    // 文件不真上传 — demo
-    void file;
+    setOcrResult(null);
+
+    // 图片预览
+    const reader = new FileReader();
+    reader.onload = (e) => setImagePreview(e.target?.result as string);
+    reader.readAsDataURL(file);
+
+    try {
+      const result = await ocrPassport(file, (pct, label) => {
+        setOcrStage({ pct, label });
+      });
+
+      if (result.success) {
+        // 填入识别结果
+        onChange({
+          fullName: result.suggested.fullName || passenger.fullName,
+          passportNumber: result.suggested.passportNumber || passenger.passportNumber,
+          dateOfBirth: result.suggested.dateOfBirth || passenger.dateOfBirth,
+          nationality: result.suggested.nationality || passenger.nationality,
+        });
+        setOcrResult({
+          ok: true,
+          msg: `✅ OCR 识别成功（${(result.elapsedMs / 1000).toFixed(1)}s · 置信度 ${result.confidence.toFixed(0)}%${result.mrz ? ' · MRZ 命中' : ''}）— 请核对关键字段`,
+          preview: result.rawText.slice(0, 120),
+        });
+      } else {
+        // 识别失败，但给出部分兜底结果
+        if (result.fallback?.passportNumber || result.fallback?.chineseName) {
+          onChange({
+            fullName: result.fallback.englishName || result.fallback.chineseName || passenger.fullName,
+            passportNumber: result.fallback.passportNumber || passenger.passportNumber,
+            dateOfBirth: result.fallback.dateOfBirth || passenger.dateOfBirth,
+          });
+        }
+        setOcrResult({
+          ok: false,
+          msg: '⚠️ OCR 部分识别（未匹配 MRZ 标准），请手工核对并补全字段',
+          preview: result.rawText.slice(0, 120) || result.error,
+        });
+      }
+    } catch (err) {
+      setOcrResult({
+        ok: false,
+        msg: `❌ 识别失败：${err instanceof Error ? err.message : '未知错误'}。请手工填写。`,
+      });
+    } finally {
+      setOcring(false);
+      setOcrStage(null);
+    }
   };
 
   return (
@@ -348,7 +386,7 @@ function PassengerCard({
         <h3 className="text-sm font-medium text-slate-700">出行人 #{idx + 1}</h3>
         <div className="flex items-center gap-3">
           <label className="cursor-pointer text-xs text-brand hover:text-brand-dark">
-            {ocring ? '识别中…' : '📷 上传护照自动填表'}
+            {ocring ? `识别中… ${ocrStage?.pct.toFixed(0) ?? 0}%` : '📷 上传护照 OCR'}
             <input
               type="file"
               accept="image/*,.pdf"
@@ -367,9 +405,31 @@ function PassengerCard({
           )}
         </div>
       </div>
-      {ocrSuccess && (
-        <div className="mt-2 rounded bg-green-50 px-2 py-1 text-xs text-green-700">
-          ✅ OCR 识别成功，已自动填表（demo 模式 — 真上线对接 AWS Textract）
+      {ocring && ocrStage && (
+        <div className="mt-2 rounded bg-blue-50 border border-blue-200 px-3 py-2 text-xs text-blue-800">
+          <div className="flex items-center justify-between mb-1">
+            <span>{ocrStage.label}</span>
+            <span className="font-semibold">{ocrStage.pct.toFixed(0)}%</span>
+          </div>
+          <div className="h-1.5 bg-blue-100 rounded-full overflow-hidden">
+            <div className="h-full bg-blue-500 transition-all" style={{ width: `${ocrStage.pct}%` }} />
+          </div>
+        </div>
+      )}
+      {ocrResult && (
+        <div className={`mt-2 rounded px-3 py-2 text-xs ${ocrResult.ok ? 'bg-green-50 text-green-700' : 'bg-amber-50 text-amber-800 border border-amber-200'}`}>
+          <div className="font-medium">{ocrResult.msg}</div>
+          {ocrResult.preview && (
+            <details className="mt-1 text-[10px] opacity-70">
+              <summary className="cursor-pointer">查看识别原文</summary>
+              <pre className="mt-1 whitespace-pre-wrap font-mono">{ocrResult.preview}</pre>
+            </details>
+          )}
+        </div>
+      )}
+      {imagePreview && (
+        <div className="mt-2">
+          <img src={imagePreview} alt="护照预览" className="max-h-24 rounded border border-slate-200" />
         </div>
       )}
       <div className="mt-3 grid gap-3 md:grid-cols-3">

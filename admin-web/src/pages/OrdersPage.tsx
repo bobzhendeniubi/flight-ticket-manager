@@ -1,10 +1,12 @@
 import { useMemo, useState } from 'react';
 import {
   MOCK_ORDERS,
+  MOCK_FULFILLMENTS,
   STATUS_COLOR,
   STATUS_LABEL,
   type MockOrder,
   type MockOrderStatus,
+  type FulfillmentStatus,
 } from '../lib/mockData';
 import { exportToCSV } from '../lib/csvExport';
 
@@ -413,6 +415,9 @@ function OrderDrawer({
             </dl>
           </section>
 
+          {/* 履约 Fulfillment */}
+          <FulfillmentSection order={order} />
+
           <section>
             <h3 className="text-sm font-medium text-slate-700">状态流转</h3>
             <div className="mt-3 flex flex-col gap-2">
@@ -442,6 +447,100 @@ function Row({ label, value }: { label: string; value: React.ReactNode }) {
     <div className="flex justify-between gap-4">
       <dt className="text-slate-500">{label}</dt>
       <dd className="text-right text-slate-900">{value}</dd>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 履约 Fulfillment — PNR / 酒店确认号 / 签证进度 / 接送司机
+// ═══════════════════════════════════════════════════════════════
+
+const FF_STATUS_COLOR: Record<FulfillmentStatus, string> = {
+  PENDING: 'bg-slate-100 text-slate-600',
+  IN_PROGRESS: 'bg-blue-100 text-blue-700',
+  CONFIRMED: 'bg-green-100 text-green-700',
+  CANCELLED: 'bg-slate-200 text-slate-500',
+  FAILED: 'bg-red-100 text-red-700',
+};
+
+const FF_STATUS_LABEL: Record<FulfillmentStatus, string> = {
+  PENDING: '待处理', IN_PROGRESS: '处理中', CONFIRMED: '已确认', CANCELLED: '已取消', FAILED: '失败',
+};
+
+function FulfillmentSection({ order }: { order: MockOrder }) {
+  const ff = MOCK_FULFILLMENTS[order.id];
+  if (!ff) {
+    return (
+      <section>
+        <h3 className="text-sm font-medium text-slate-700">🚚 履约进度</h3>
+        <div className="mt-2 rounded-md bg-slate-50 p-3 text-xs text-slate-500">
+          暂无履约记录 · 真环境订单付款后自动触发 fulfillment 工作流
+        </div>
+      </section>
+    );
+  }
+
+  return (
+    <section>
+      <div className="flex items-center justify-between">
+        <h3 className="text-sm font-medium text-slate-700">🚚 履约进度</h3>
+        <button className="text-xs text-brand hover:text-brand-dark" onClick={() => alert('刷新履约状态 (demo) - 真环境会轮询供应商 API')}>🔄 刷新</button>
+      </div>
+      <div className="mt-2 space-y-2">
+        {ff.flight && (
+          <FfCard icon="✈️" label="机票出票" status={ff.flight.status}>
+            <Row label="PNR" value={<span className="font-mono">{ff.flight.pnr ?? '（未生成）'}</span>} />
+            <Row label="电子票号" value={<span className="font-mono">{ff.flight.eTicketNumber ?? '—'}</span>} />
+            {ff.flight.status === 'CONFIRMED' && (
+              <button className="mt-2 text-xs text-brand hover:text-brand-dark" onClick={() => alert('下载 e-ticket PDF (demo)')}>📄 下载电子行程单</button>
+            )}
+            {ff.flight.status === 'IN_PROGRESS' && (
+              <div className="mt-2 text-xs text-blue-700">⏳ 正在向 Bamboo Airways 出票…</div>
+            )}
+          </FfCard>
+        )}
+        {ff.hotel && (
+          <FfCard icon="🏨" label="酒店确认" status={ff.hotel.status}>
+            <Row label="确认号" value={<span className="font-mono">{ff.hotel.confirmationNumber ?? '（等待 PMS 回传）'}</span>} />
+            {ff.hotel.status === 'CONFIRMED' && (
+              <div className="mt-1 text-xs text-green-700">✓ 已发送预订凭证到客户邮箱</div>
+            )}
+          </FfCard>
+        )}
+        {ff.visa && (
+          <FfCard icon="🛂" label="签证办理" status={ff.visa.status}>
+            <Row label="申请号" value={<span className="font-mono">{ff.visa.applicationNumber ?? '—'}</span>} />
+            <Row label="当前进度" value={ff.visa.progress} />
+            <button className="mt-2 text-xs text-brand hover:text-brand-dark" onClick={() => alert('查看材料清单 (demo)')}>📋 查看材料</button>
+          </FfCard>
+        )}
+        {ff.transfer && (
+          <FfCard icon="🚐" label="接送调度" status={ff.transfer.status}>
+            <Row label="司机" value={ff.transfer.driverName ?? '（未分配）'} />
+            <Row label="车牌" value={<span className="font-mono">{ff.transfer.vehicleNumber ?? '—'}</span>} />
+            {ff.transfer.status === 'CONFIRMED' && ff.transfer.driverName && (
+              <div className="mt-1 text-xs text-green-700">✓ 司机已联系客户</div>
+            )}
+          </FfCard>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function FfCard({ icon, label, status, children }: { icon: string; label: string; status: FulfillmentStatus; children: React.ReactNode }) {
+  return (
+    <div className="rounded-md border border-slate-200 bg-white p-3">
+      <div className="flex items-center justify-between mb-2">
+        <div className="flex items-center gap-2">
+          <span className="text-xl">{icon}</span>
+          <span className="text-sm font-medium text-slate-900">{label}</span>
+        </div>
+        <span className={`rounded px-2 py-0.5 text-xs font-medium ${FF_STATUS_COLOR[status]}`}>
+          {FF_STATUS_LABEL[status]}
+        </span>
+      </div>
+      <dl className="space-y-0.5 text-xs">{children}</dl>
     </div>
   );
 }

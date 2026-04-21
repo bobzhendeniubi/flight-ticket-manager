@@ -1062,3 +1062,188 @@ export const MOCK_TRAVELERS: MockTraveler[] = [
   { id: 't11', fullName: 'ZHOU FANG 周芳', passportNumber: 'MA5678901', dateOfBirth: '1992-12-30', nationality: 'MO', phone: '+853 6123 3344', customerIds: ['cust7'], tripCount: 1, lastTripAt: '2026-04-13', notes: '有退款记录' },
   { id: 't12', fullName: 'SUN YUE 孙悦', passportNumber: 'HK7788990', dateOfBirth: '1991-06-10', nationality: 'HK', phone: '+852 5432 6677', customerIds: ['cust8'], tripCount: 4, lastTripAt: '2026-04-12', notes: null },
 ];
+
+// ═══════════════════════════════════════════════════════════════
+// 多租户 / License 管理
+// ═══════════════════════════════════════════════════════════════
+
+export type LicenseTier = 'STANDARD' | 'PROFESSIONAL' | 'ENTERPRISE';
+
+export interface MockTenant {
+  id: string;
+  companyName: string;
+  contactName: string;
+  contactPhone: string;
+  contactEmail: string;
+  licenseTier: LicenseTier;
+  licenseStartDate: string;
+  licenseEndDate: string;
+  isActive: boolean;
+  /** 用量配额 */
+  quotas: {
+    maxAdmins: number;
+    adminUsed: number;
+    maxMonthlyOrders: number;
+    ordersUsedThisMonth: number;
+    maxStorageGB: number;
+    storageUsedGB: number;
+  };
+  /** 启用的功能 */
+  features: string[];
+  /** 品牌定制 */
+  brand: {
+    logoUrl: string | null;
+    primaryColor: string;
+    domain: string | null;
+  };
+  /** 本月累计 */
+  monthlyRevenue: number;
+  monthlyOrders: number;
+}
+
+const LICENSE_FEATURES: Record<LicenseTier, string[]> = {
+  STANDARD: ['前台购买', '后台订单管理', '基础航班管理', '3个管理员'],
+  PROFESSIONAL: ['前台购买', '后台订单管理', '基础航班管理', '动态定价', '切位/包位', '多级代理', '10个管理员', '微信小程序'],
+  ENTERPRISE: ['前台购买', '后台订单管理', '基础航班管理', '动态定价', '切位/包位', '多级代理', 'ML需求预测', '护照 OCR', 'API对接', '不限管理员', '7×24技术支持'],
+};
+
+export const MOCK_TENANTS: MockTenant[] = [
+  {
+    id: 'tenant1', companyName: '世途旅行 Citur Travel', contactName: '王经理', contactPhone: '+853 6666 0001', contactEmail: 'ops@citur.mo',
+    licenseTier: 'ENTERPRISE', licenseStartDate: '2026-01-01', licenseEndDate: '2027-01-01', isActive: true,
+    quotas: { maxAdmins: 999, adminUsed: 8, maxMonthlyOrders: 999999, ordersUsedThisMonth: 1186, maxStorageGB: 500, storageUsedGB: 34 },
+    features: LICENSE_FEATURES.ENTERPRISE,
+    brand: { logoUrl: null, primaryColor: '#0EA5E9', domain: 'citur.mo' },
+    monthlyRevenue: 3250400, monthlyOrders: 1186,
+  },
+  {
+    id: 'tenant2', companyName: '港游旅游社 HK Voyage', contactName: '李总', contactPhone: '+852 2345 6789', contactEmail: 'admin@hkvoyage.com',
+    licenseTier: 'PROFESSIONAL', licenseStartDate: '2026-03-15', licenseEndDate: '2027-03-15', isActive: true,
+    quotas: { maxAdmins: 10, adminUsed: 6, maxMonthlyOrders: 2000, ordersUsedThisMonth: 847, maxStorageGB: 100, storageUsedGB: 12 },
+    features: LICENSE_FEATURES.PROFESSIONAL,
+    brand: { logoUrl: null, primaryColor: '#DC2626', domain: 'hkvoyage.com' },
+    monthlyRevenue: 1820600, monthlyOrders: 847,
+  },
+  {
+    id: 'tenant3', companyName: '珠海飞扬旅行社', contactName: '张经理', contactPhone: '+86 138 0000 1234', contactEmail: 'contact@feiyang.cn',
+    licenseTier: 'STANDARD', licenseStartDate: '2026-04-01', licenseEndDate: '2027-04-01', isActive: true,
+    quotas: { maxAdmins: 3, adminUsed: 3, maxMonthlyOrders: 500, ordersUsedThisMonth: 234, maxStorageGB: 20, storageUsedGB: 5 },
+    features: LICENSE_FEATURES.STANDARD,
+    brand: { logoUrl: null, primaryColor: '#F59E0B', domain: null },
+    monthlyRevenue: 480200, monthlyOrders: 234,
+  },
+  {
+    id: 'tenant4', companyName: '深湾出境游 (试用)', contactName: '陈总', contactPhone: '+86 135 9999 0000', contactEmail: 'trial@shenwan.cn',
+    licenseTier: 'STANDARD', licenseStartDate: '2026-04-10', licenseEndDate: '2026-05-10', isActive: true,
+    quotas: { maxAdmins: 3, adminUsed: 1, maxMonthlyOrders: 500, ordersUsedThisMonth: 23, maxStorageGB: 20, storageUsedGB: 1 },
+    features: LICENSE_FEATURES.STANDARD,
+    brand: { logoUrl: null, primaryColor: '#10B981', domain: null },
+    monthlyRevenue: 38900, monthlyOrders: 23,
+  },
+  {
+    id: 'tenant5', companyName: '南洋旅游（已停用）', contactName: '黄经理', contactPhone: '+65 9012 3456', contactEmail: 'info@nanyang.sg',
+    licenseTier: 'PROFESSIONAL', licenseStartDate: '2025-10-01', licenseEndDate: '2026-04-01', isActive: false,
+    quotas: { maxAdmins: 10, adminUsed: 4, maxMonthlyOrders: 2000, ordersUsedThisMonth: 0, maxStorageGB: 100, storageUsedGB: 8 },
+    features: LICENSE_FEATURES.PROFESSIONAL,
+    brand: { logoUrl: null, primaryColor: '#6366F1', domain: null },
+    monthlyRevenue: 0, monthlyOrders: 0,
+  },
+];
+
+// ═══════════════════════════════════════════════════════════════
+// 审计日志
+// ═══════════════════════════════════════════════════════════════
+
+export interface MockAuditLog {
+  id: string;
+  timestamp: string;
+  actor: string; // 操作人 email
+  actorRole: string;
+  action: string; // CREATE_AGENT / UPDATE_PRICING / ADJUST_BALANCE...
+  target: string; // 操作对象
+  targetType: 'AGENT' | 'ORDER' | 'FLIGHT' | 'CUSTOMER' | 'PRICING' | 'COMMISSION' | 'TENANT';
+  before: string | null;
+  after: string;
+  ip: string;
+  severity: 'INFO' | 'WARNING' | 'CRITICAL';
+}
+
+export const MOCK_AUDIT_LOGS: MockAuditLog[] = [
+  { id: 'log1', timestamp: '2026-04-16T09:12:33+08:00', actor: 'admin@ftm.local', actorRole: 'ADMIN', action: 'UPDATE_PRICING_RULE', target: 'QH9589 日期等级 2026-05-01', targetType: 'PRICING', before: 'rank=C', after: 'rank=A (五一假期)', ip: '192.168.1.10', severity: 'WARNING' },
+  { id: 'log2', timestamp: '2026-04-16T08:45:12+08:00', actor: 'admin@ftm.local', actorRole: 'ADMIN', action: 'ADJUST_BALANCE', target: '澳门岘港旅游总代 (agent1)', targetType: 'AGENT', before: '¥80,000', after: '¥100,000 (+¥20,000 充值)', ip: '192.168.1.10', severity: 'CRITICAL' },
+  { id: 'log3', timestamp: '2026-04-15T17:23:01+08:00', actor: 'staff@ftm.local', actorRole: 'STAFF', action: 'ADVANCE_ORDER_STATUS', target: 'FTM20260415003', targetType: 'ORDER', before: 'PROCESSING', after: 'TICKETED', ip: '192.168.1.15', severity: 'INFO' },
+  { id: 'log4', timestamp: '2026-04-15T16:02:45+08:00', actor: 'admin@ftm.local', actorRole: 'ADMIN', action: 'CREATE_AGENT', target: '澳门威尼斯人门店 (tier=3)', targetType: 'AGENT', before: null, after: 'parent=澳门欢乐旅行社, balance=¥5,000', ip: '192.168.1.10', severity: 'INFO' },
+  { id: 'log5', timestamp: '2026-04-15T15:30:18+08:00', actor: 'admin@ftm.local', actorRole: 'ADMIN', action: 'UPDATE_COMMISSION', target: '澳门岘港旅游总代 - FLIGHT', targetType: 'COMMISSION', before: '10% · 给下级 40%', after: '10% · 给下级 45%', ip: '192.168.1.10', severity: 'WARNING' },
+  { id: 'log6', timestamp: '2026-04-15T14:23:00+08:00', actor: 'customer@ftm.local', actorRole: 'CUSTOMER', action: 'CREATE_ORDER', target: 'FTM20260415001 · QH9589 × 2', targetType: 'ORDER', before: null, after: 'total=¥5,720, paymentMethod=微信支付', ip: '203.xx.xx.xx', severity: 'INFO' },
+  { id: 'log7', timestamp: '2026-04-15T12:15:00+08:00', actor: 'admin@ftm.local', actorRole: 'ADMIN', action: 'BULK_CREATE_SCHEDULES', target: 'QH9589', targetType: 'FLIGHT', before: null, after: '批量创建 90 个班次（2026-05-01 ~ 2026-07-31 每日）', ip: '192.168.1.10', severity: 'INFO' },
+  { id: 'log8', timestamp: '2026-04-14T18:40:00+08:00', actor: 'staff@ftm.local', actorRole: 'STAFF', action: 'APPROVE_REFUND', target: 'FTM20260413007 · ¥1,380', targetType: 'ORDER', before: 'REFUND_REQUESTED', after: 'REFUNDED', ip: '192.168.1.15', severity: 'WARNING' },
+  { id: 'log9', timestamp: '2026-04-14T14:05:00+08:00', actor: 'admin@ftm.local', actorRole: 'ADMIN', action: 'UPDATE_CUSTOMER', target: '陈文豪 (cust1)', targetType: 'CUSTOMER', before: 'tags=[回头客]', after: 'tags=[VIP, 回头客]', ip: '192.168.1.10', severity: 'INFO' },
+  { id: 'log10', timestamp: '2026-04-14T11:00:00+08:00', actor: 'system', actorRole: 'SYSTEM', action: 'DAILY_PRICING_REFRESH', target: '全部班次', targetType: 'PRICING', before: null, after: 'ML 需求预测更新 · 730 个班次重算动态价', ip: 'system', severity: 'INFO' },
+  { id: 'log11', timestamp: '2026-04-14T09:33:00+08:00', actor: 'admin@ftm.local', actorRole: 'ADMIN', action: 'CREATE_TENANT', target: '港游旅游社 HK Voyage', targetType: 'TENANT', before: null, after: 'tier=PROFESSIONAL, license ends 2027-03-15', ip: '192.168.1.10', severity: 'CRITICAL' },
+  { id: 'log12', timestamp: '2026-04-13T22:15:00+08:00', actor: 'admin@ftm.local', actorRole: 'ADMIN', action: 'LOGIN', target: 'admin-web', targetType: 'TENANT', before: null, after: '成功登录', ip: '192.168.1.10', severity: 'INFO' },
+];
+
+// ═══════════════════════════════════════════════════════════════
+// 结算单
+// ═══════════════════════════════════════════════════════════════
+
+export interface MockSettlement {
+  id: string;
+  period: string; // YYYY-MM
+  agentId: string;
+  agentName: string;
+  agentTier: number;
+  /** 本月完成订单数 */
+  orderCount: number;
+  /** 本月订单总额（GMV） */
+  grossRevenue: number;
+  /** 应得佣金 */
+  commissionEarned: number;
+  /** 已扣除的给下级分成 */
+  commissionPaidToChildren: number;
+  /** 本级净佣金 */
+  netCommission: number;
+  /** 预付余额抵扣 */
+  prepaymentOffset: number;
+  /** 应支付给代理 */
+  payableToAgent: number;
+  status: 'DRAFT' | 'PENDING_APPROVAL' | 'APPROVED' | 'PAID';
+  generatedAt: string;
+  paidAt: string | null;
+}
+
+export const MOCK_SETTLEMENTS: MockSettlement[] = [
+  { id: 's1', period: '2026-03', agentId: 'a1', agentName: '澳门岘港旅游总代', agentTier: 1, orderCount: 48, grossRevenue: 286400, commissionEarned: 28640, commissionPaidToChildren: 11456, netCommission: 17184, prepaymentOffset: 12000, payableToAgent: 5184, status: 'PAID', generatedAt: '2026-04-01T00:00:00+08:00', paidAt: '2026-04-05T14:30:00+08:00' },
+  { id: 's2', period: '2026-03', agentId: 'a2', agentName: '澳门欢乐旅行社', agentTier: 2, orderCount: 23, grossRevenue: 156800, commissionEarned: 6272, commissionPaidToChildren: 1882, netCommission: 4390, prepaymentOffset: 3000, payableToAgent: 1390, status: 'PAID', generatedAt: '2026-04-01T00:00:00+08:00', paidAt: '2026-04-05T14:45:00+08:00' },
+  { id: 's3', period: '2026-03', agentId: 'a3', agentName: '澳门威尼斯人门店', agentTier: 3, orderCount: 12, grossRevenue: 48200, commissionEarned: 578, commissionPaidToChildren: 0, netCommission: 578, prepaymentOffset: 200, payableToAgent: 378, status: 'PAID', generatedAt: '2026-04-01T00:00:00+08:00', paidAt: '2026-04-05T15:00:00+08:00' },
+  { id: 's4', period: '2026-04', agentId: 'a1', agentName: '澳门岘港旅游总代', agentTier: 1, orderCount: 31, grossRevenue: 192600, commissionEarned: 19260, commissionPaidToChildren: 7704, netCommission: 11556, prepaymentOffset: 8000, payableToAgent: 3556, status: 'APPROVED', generatedAt: '2026-04-16T00:00:00+08:00', paidAt: null },
+  { id: 's5', period: '2026-04', agentId: 'a2', agentName: '澳门欢乐旅行社', agentTier: 2, orderCount: 16, grossRevenue: 103200, commissionEarned: 4128, commissionPaidToChildren: 1238, netCommission: 2890, prepaymentOffset: 2000, payableToAgent: 890, status: 'PENDING_APPROVAL', generatedAt: '2026-04-16T00:00:00+08:00', paidAt: null },
+  { id: 's6', period: '2026-04', agentId: 'a3', agentName: '澳门威尼斯人门店', agentTier: 3, orderCount: 8, grossRevenue: 32400, commissionEarned: 389, commissionPaidToChildren: 0, netCommission: 389, prepaymentOffset: 100, payableToAgent: 289, status: 'DRAFT', generatedAt: '2026-04-16T00:00:00+08:00', paidAt: null },
+];
+
+// ═══════════════════════════════════════════════════════════════
+// 订单履约 (Fulfillment) 扩展
+// ═══════════════════════════════════════════════════════════════
+
+export type FulfillmentStatus = 'PENDING' | 'IN_PROGRESS' | 'CONFIRMED' | 'CANCELLED' | 'FAILED';
+
+export interface MockFulfillment {
+  orderId: string;
+  flight?: { pnr: string | null; eTicketNumber: string | null; status: FulfillmentStatus };
+  hotel?: { confirmationNumber: string | null; status: FulfillmentStatus };
+  visa?: { applicationNumber: string | null; progress: string; status: FulfillmentStatus };
+  transfer?: { driverName: string | null; vehicleNumber: string | null; status: FulfillmentStatus };
+}
+
+export const MOCK_FULFILLMENTS: Record<string, MockFulfillment> = {
+  o1: { orderId: 'o1', flight: { pnr: 'BAV7X9A', eTicketNumber: '738-2145678901', status: 'CONFIRMED' } },
+  o2: { orderId: 'o2', flight: { pnr: 'BAV8M2C', eTicketNumber: '738-2145678902', status: 'CONFIRMED' } },
+  o3: { orderId: 'o3', flight: { pnr: 'BAV9K3D', eTicketNumber: null, status: 'IN_PROGRESS' }, hotel: { confirmationNumber: 'HYT-890123', status: 'CONFIRMED' } },
+  o4: { orderId: 'o4', visa: { applicationNumber: 'VN-EVSA-2026-00789', progress: '材料审核中（2/5步）', status: 'IN_PROGRESS' } },
+  o5: { orderId: 'o5', transfer: { driverName: 'Nguyen Van A', vehicleNumber: '43A-12345', status: 'CONFIRMED' } },
+  o6: { orderId: 'o6', flight: { pnr: null, eTicketNumber: null, status: 'PENDING' } },
+  o7: { orderId: 'o7', flight: { pnr: 'BAV5H1P', eTicketNumber: '738-2145678907', status: 'CANCELLED' } },
+  o8: { orderId: 'o8', transfer: { driverName: 'Tran Duc B', vehicleNumber: '43A-67890', status: 'CONFIRMED' } },
+  o9: { orderId: 'o9', hotel: { confirmationNumber: 'FSR-445566', status: 'CONFIRMED' } },
+  o10: { orderId: 'o10', flight: { pnr: null, eTicketNumber: null, status: 'CANCELLED' } },
+};
