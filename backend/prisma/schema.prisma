@@ -117,6 +117,7 @@ model Agent {
   prepaymentTransactions PrepaymentTransaction[]
   commissionRules        CommissionRule[]
   commissionRecords      CommissionRecord[]
+  settlements            Settlement[]
   orders                 Order[]
 
   @@index([isActive])
@@ -185,18 +186,61 @@ model CommissionRecord {
   orderId     String
   productKind ProductKind
   baseAmount  Decimal          @db.Decimal(12, 2) // the order item amount commission is computed on
-  rate        Decimal          @db.Decimal(6, 4)
+  rate        Decimal          @db.Decimal(6, 4)  // net rate (this_agent.rate - child.rate if in chain)
   amount      Decimal          @db.Decimal(12, 2) // baseAmount * rate
   status      CommissionStatus @default(ACCRUED)
+  // 0=seller, 1=seller's parent, 2=grandparent ... 用于结算时计算 "commissionPaidToChildren"
+  chainDepth  Int              @default(0)
+  settlementId String?         // nullable until included in a settlement
   settledAt   DateTime?
   createdAt   DateTime         @default(now())
   updatedAt   DateTime         @updatedAt
 
-  agent Agent @relation(fields: [agentId], references: [id])
-  order Order @relation(fields: [orderId], references: [id])
+  agent      Agent       @relation(fields: [agentId], references: [id])
+  order      Order       @relation(fields: [orderId], references: [id])
+  settlement Settlement? @relation(fields: [settlementId], references: [id])
 
   @@index([agentId, status])
   @@index([orderId])
+  @@index([settlementId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Settlement — 月度结算单，每个代理每月 1 张
+// ─────────────────────────────────────────────────────────────────────────────
+enum SettlementStatus {
+  DRAFT              // 生成后的初始状态
+  PENDING_APPROVAL   // 提交审核
+  APPROVED           // 管理员核准，待支付
+  PAID               // 已支付给代理（CommissionRecord → SETTLED，prepaymentOffset 已扣）
+  VOIDED             // 作废（比如重算）
+}
+
+model Settlement {
+  id                        String           @id @default(cuid())
+  period                    String           // YYYY-MM
+  agentId                   String
+  orderCount                Int              @default(0)
+  grossRevenue              Decimal          @db.Decimal(14, 2) @default(0)
+  commissionEarned          Decimal          @db.Decimal(14, 2) @default(0)
+  commissionPaidToChildren  Decimal          @db.Decimal(14, 2) @default(0)
+  netCommission             Decimal          @db.Decimal(14, 2) @default(0)
+  prepaymentOffset          Decimal          @db.Decimal(14, 2) @default(0)
+  payableToAgent            Decimal          @db.Decimal(14, 2) @default(0)
+  status                    SettlementStatus @default(DRAFT)
+  generatedAt               DateTime         @default(now())
+  approvedAt                DateTime?
+  paidAt                    DateTime?
+  notes                     String?
+  updatedAt                 DateTime         @updatedAt
+
+  agent       Agent              @relation(fields: [agentId], references: [id])
+  commissions CommissionRecord[]
+
+  @@unique([period, agentId])
+  @@index([period])
+  @@index([status])
+  @@index([agentId, period])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

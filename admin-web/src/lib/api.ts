@@ -205,6 +205,51 @@ export interface OrderSummary {
   user: { id: string; displayName: string | null; email: string | null };
 }
 
+// ── Settlements ──────────────────────────────────────────────────────────
+export type SettlementStatus = 'DRAFT' | 'PENDING_APPROVAL' | 'APPROVED' | 'PAID' | 'VOIDED';
+
+export interface SettlementSummary {
+  id: string;
+  period: string; // YYYY-MM
+  agentId: string;
+  orderCount: number;
+  grossRevenue: string;
+  commissionEarned: string;
+  commissionPaidToChildren: string;
+  netCommission: string;
+  prepaymentOffset: string;
+  payableToAgent: string;
+  status: SettlementStatus;
+  generatedAt: string;
+  approvedAt: string | null;
+  paidAt: string | null;
+  notes: string | null;
+  agent: {
+    id: string;
+    companyName: string | null;
+    contactName: string;
+    tier: number;
+    displayName: string | null;
+    email: string | null;
+  };
+}
+
+export interface SettlementCommissionRecord {
+  id: string;
+  productKind: 'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA';
+  baseAmount: string;
+  rate: string;
+  amount: string;
+  chainDepth: number;
+  status: string;
+  createdAt: string;
+  order: { id: string; orderNumber: string; total: string };
+}
+
+export interface SettlementDetail extends SettlementSummary {
+  commissions: SettlementCommissionRecord[];
+}
+
 export const api = {
   login: (email: string, password: string) =>
     apiFetch<AuthResult>('/auth/login', {
@@ -270,5 +315,32 @@ export const api = {
       method: 'PATCH',
       token,
       body: { toStatus, reason },
+    }),
+
+  // Settlements
+  listSettlements: (token: string, query?: { period?: string; agentId?: string; status?: SettlementStatus; page?: number; pageSize?: number }) => {
+    const qs = new URLSearchParams();
+    if (query) {
+      for (const [k, v] of Object.entries(query)) {
+        if (v !== undefined && v !== '') qs.set(k, String(v));
+      }
+    }
+    return apiFetch<{
+      settlements: SettlementSummary[];
+      pagination: { page: number; pageSize: number; total: number };
+    }>(`/settlements/${qs.toString() ? '?' + qs.toString() : ''}`, { token });
+  },
+  getSettlement: (token: string, id: string) =>
+    apiFetch<{ settlement: SettlementDetail }>(`/settlements/${id}`, { token }),
+  generateSettlements: (token: string, body: { period: string; agentId?: string; overwrite?: boolean }) =>
+    apiFetch<{ period: string; generated: Array<{ agentId: string; settlementId: string; status: SettlementStatus; action: string }> }>(
+      '/settlements/generate',
+      { method: 'POST', token, body },
+    ),
+  updateSettlementStatus: (token: string, id: string, toStatus: SettlementStatus, notes?: string) =>
+    apiFetch<{ settlement: SettlementDetail }>(`/settlements/${id}/status`, {
+      method: 'PATCH',
+      token,
+      body: { toStatus, notes },
     }),
 };

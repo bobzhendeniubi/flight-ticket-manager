@@ -12,10 +12,12 @@
  * 4. 幂等：idempotencyKey 存在则直接返回已有订单（保护客户端重试）
  */
 import {
+  CommissionStatus,
   OrderItemKind,
   OrderStatus,
   PaymentMethod,
   Prisma,
+  ProductKind,
   UserRole,
 } from '@prisma/client';
 import { randomInt } from 'node:crypto';
@@ -377,7 +379,6 @@ export class OrderService {
     // 事务：写 Order + 写事件 + 按需调整库存
     const updated = await prisma.$transaction(async (tx) => {
       const wasHolding = SEAT_HOLDING_STATUSES.includes(order.status);
-      const willHold = SEAT_HOLDING_STATUSES.includes(toStatus);
       const isReleasing = SEAT_RELEASING_STATUSES.includes(toStatus);
 
       // 如果从"占用"转到"释放"，退库存
@@ -391,10 +392,23 @@ export class OrderService {
         }
       }
 
-      // PAID 时补 paidAmount（简化：一次性付清；真支付网关接入后走 Payment 表）
+      // PAID 时补 paidAmount + 自动生成 CommissionRecord（代理层级）
       const extraData: Prisma.OrderUpdateInput = {};
       if (toStatus === 'PAID') {
         extraData.paidAmount = order.total;
+      }
+
+      // 转到 PAID：创建佣金记录（若有代理）
+      if (toStatus === 'PAID' && order.agentId) {
+        await createCommissionsForOrder(tx, order.id, order.agentId);
+      }
+
+      // 从 PAID 走到释放态（CANCELLED/REFUNDED/PAYMENT_TIMEOUT/FAILED）：撤销佣金
+      if (isReleasing && wasHolding && order.status !== 'PENDING_PAYMENT') {
+        await tx.commissionRecord.updateMany({
+          where: { orderId: order.id, status: CommissionStatus.ACCRUED },
+          data: { status: CommissionStatus.REVERSED },
+        });
       }
 
       return tx.order.update({
@@ -543,3 +557,98 @@ function serializeOrder<T extends OrderLike>(order: T) {
 
 // 避免 PaymentMethod 未使用告警（未来接支付时会用到）
 void PaymentMethod;
+
+// ════════════════════════════════════════════════════════════════════
+// 佣金链路计算 — 当订单转 PAID 时调用，为卖家代理 + 所有上级代理创建 CommissionRecord
+//
+// 级联模型（child rate ≤ parent rate 不变式）：
+//   - 卖家代理（链底）拿: seller.rate × baseAmount
+//   - 卖家上级拿: (parent.rate - seller.rate) × baseAmount（即 spread）
+//   - 再上级拿: (grandparent.rate - parent.rate) × baseAmount
+//   - ...一直走到根代理或没规则的代理
+//
+// 如果某代理对该 productKind 没有 CommissionRule，视作 rate=0（父级会继续"吃"这部分）。
+// 每条 OrderItem 单独走一次链路（因为 productKind 可能不同）。
+// ════════════════════════════════════════════════════════════════════
+const ORDER_ITEM_KIND_TO_PRODUCT_KIND: Partial<Record<OrderItemKind, ProductKind>> = {
+  FLIGHT: ProductKind.FLIGHT,
+  HOTEL: ProductKind.HOTEL,
+  TRANSFER: ProductKind.TRANSFER,
+  VISA: ProductKind.VISA,
+};
+
+async function createCommissionsForOrder(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+  sellerAgentId: string,
+) {
+  // 1. 拉订单项
+  const items = await tx.orderItem.findMany({ where: { orderId } });
+  if (items.length === 0) return;
+
+  // 2. 算链路（seller → parent → grandparent ...）
+  const chain: Array<{ agentId: string; depth: number }> = [];
+  let cur: string | null = sellerAgentId;
+  let depth = 0;
+  while (cur) {
+    chain.push({ agentId: cur, depth });
+    const parentRow: { parentAgentId: string | null } | null = await tx.agent.findUnique({
+      where: { id: cur },
+      select: { parentAgentId: true },
+    });
+    cur = parentRow?.parentAgentId ?? null;
+    depth++;
+    if (depth > 10) break; // 防御：层级超 10 级直接断
+  }
+
+  // 3. 为每个 item 按 productKind 生成 records
+  for (const item of items) {
+    const productKind = ORDER_ITEM_KIND_TO_PRODUCT_KIND[item.kind];
+    if (!productKind) continue; // INSURANCE/FEE/DISCOUNT 不算佣金
+
+    // 取链路上每个代理对该 productKind 的 rate（有效期内）
+    const rules = await tx.commissionRule.findMany({
+      where: {
+        agentId: { in: chain.map((c) => c.agentId) },
+        productKind,
+        effectiveFrom: { lte: new Date() },
+        OR: [{ effectiveTo: null }, { effectiveTo: { gte: new Date() } }],
+      },
+    });
+    const rateByAgent = new Map<string, number>();
+    for (const r of rules) {
+      // 同一 agent 可能多条规则（不同 effectiveFrom），取最新的
+      const existing = rateByAgent.get(r.agentId);
+      if (existing === undefined || Number(r.rate) > existing) {
+        rateByAgent.set(r.agentId, Number(r.rate));
+      }
+    }
+
+    // 沿着链路从底向上，每个代理拿 (自己 rate - 下级 rate) × baseAmount
+    const baseAmount = Number(item.amount);
+    let lowerRate = 0; // 下级代理的 rate（seller 的 "下级" 是 0，表示没有）
+    for (let i = 0; i < chain.length; i++) {
+      const { agentId, depth: d } = chain[i];
+      const thisRate = rateByAgent.get(agentId) ?? 0;
+      // 不变式：child rate ≤ parent rate — 若违反，spread 为负，跳过
+      const netRate = thisRate - lowerRate;
+      if (netRate > 0.00005) {
+        const amt = Math.round(baseAmount * netRate * 100) / 100;
+        await tx.commissionRecord.create({
+          data: {
+            agentId,
+            orderId,
+            productKind,
+            baseAmount: new Prisma.Decimal(baseAmount),
+            rate: new Prisma.Decimal(netRate),
+            amount: new Prisma.Decimal(amt),
+            chainDepth: d,
+            status: CommissionStatus.ACCRUED,
+          },
+        });
+      }
+      // 下一轮循环：上一级代理看本级作为"下级"
+      if (thisRate > lowerRate) lowerRate = thisRate;
+    }
+  }
+}

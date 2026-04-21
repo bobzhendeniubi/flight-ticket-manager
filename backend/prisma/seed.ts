@@ -150,7 +150,7 @@ async function main() {
     },
   });
 
-  await prisma.agent.upsert({
+  const agent3 = await prisma.agent.upsert({
     where: { userId: agent3User.id },
     update: {},
     create: {
@@ -163,6 +163,39 @@ async function main() {
       tier: 3,
     },
   });
+
+  // ── CommissionRule 默认费率（按产品类型 + 层级） ──
+  // 不变式：child rate ≤ parent rate
+  // 1 级 FLIGHT 10% / HOTEL 8% / TRANSFER 15% / VISA 12%
+  // 2 级 FLIGHT 6%  / HOTEL 5% / TRANSFER 10% / VISA 8%
+  // 3 级 FLIGHT 3%  / HOTEL 3% / TRANSFER 6%  / VISA 5%
+  const commissionSeed: Array<{ agentId: string; rates: Record<'FLIGHT'|'HOTEL'|'TRANSFER'|'VISA', number> }> = [
+    { agentId: agent1.id, rates: { FLIGHT: 0.10, HOTEL: 0.08, TRANSFER: 0.15, VISA: 0.12 } },
+    { agentId: agent2.id, rates: { FLIGHT: 0.06, HOTEL: 0.05, TRANSFER: 0.10, VISA: 0.08 } },
+    { agentId: agent3.id, rates: { FLIGHT: 0.03, HOTEL: 0.03, TRANSFER: 0.06, VISA: 0.05 } },
+  ];
+  for (const { agentId, rates } of commissionSeed) {
+    for (const [productKind, rate] of Object.entries(rates)) {
+      // effectiveFrom 取固定值（非 now()），避免每次 seed 创建新规则
+      const effectiveFrom = new Date('2026-01-01T00:00:00Z');
+      await prisma.commissionRule.upsert({
+        where: {
+          agentId_productKind_effectiveFrom: {
+            agentId,
+            productKind: productKind as 'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA',
+            effectiveFrom,
+          },
+        },
+        update: { rate },
+        create: {
+          agentId,
+          productKind: productKind as 'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA',
+          rate,
+          effectiveFrom,
+        },
+      });
+    }
+  }
 
   // ── 清理不在列表里的历史航班（只在没有订单关联时） ──
   const keepFlightNumbers = FLIGHT_SEED.map((f) => f.flightNumber);
