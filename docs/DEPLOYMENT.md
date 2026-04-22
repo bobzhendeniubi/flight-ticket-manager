@@ -100,7 +100,20 @@ admin.citur.com {
   # 或独立 API 域名
   VITE_API_BASE=https://api.citur.com docker-compose build sales-web admin-web
   ```
-- [ ] 切 `PAYMENT_MODE=live`，配 WeChat/Alipay 真实 key
+- [ ] 切 `PAYMENT_MODE=live`，配 WeChat/Alipay 真实 key 并挂载证书：
+  ```bash
+  # 宿主机准备 secrets 目录（注意权限 600）
+  mkdir -p secrets/wechat secrets/alipay
+  # 从微信支付商户平台下载 apiclient_key.pem + 平台证书放入 secrets/wechat/
+  # 从蚂蚁开放平台生成应用私钥 + 下载支付宝公钥放入 secrets/alipay/
+  chmod 600 secrets/wechat/* secrets/alipay/*
+  # docker-compose 会以 :ro 方式挂载到 /secrets
+  ```
+  env 设：
+  - `WECHAT_APPID` / `WECHAT_MCH_ID` / `WECHAT_API_V3_KEY` / `WECHAT_SERIAL_NO`
+  - `ALIPAY_APPID` 其余用默认路径 `/secrets/{wechat,alipay}/*.pem`
+  - 只接一家（只 WeChat 或只 Alipay）也允许，另一家 env 留空即可
+  - 启动时 backend 会 validate，配置不全会 refuse to start
 - [ ] 外层 HTTPS（Caddy 或云 LB）
 - [ ] DB 备份脚本 + off-site 存储（S3 / COS）
 - [ ] 日志收集（CloudWatch / Loki / 阿里云 SLS）

@@ -28,9 +28,42 @@ const EnvSchema = z.object({
   // 默认 /sandbox-pay（同域相对路径，前端 nginx 提供静态页或路由）
   SANDBOX_PAY_URL_PATH: z.string().default('/sandbox-pay'),
 
-  WECHAT_APP_ID: z.string().optional(),
+  // ═══════════════════════════════════════════════════════════
+  // 支付网关：WeChat Pay v3
+  // 生产 PAYMENT_MODE=live 时必填；sandbox 下可全空
+  // ═══════════════════════════════════════════════════════════
+  // 公众号/小程序/APP AppID（微信开放平台分配）
+  WECHAT_APPID: z.string().optional(),
+  // 商户号（mch_id，微信支付商户平台分配）
+  WECHAT_MCH_ID: z.string().optional(),
+  // API v3 密钥（微信支付商户平台 → API 安全 → 设置 APIv3 密钥，32 字符）
+  WECHAT_API_V3_KEY: z.string().optional(),
+  // 商户 API 证书序列号（cert serial no）
+  WECHAT_SERIAL_NO: z.string().optional(),
+  // 商户 API 私钥文件路径（apiclient_key.pem）
+  WECHAT_PRIVATE_KEY_PATH: z.string().optional(),
+  // 微信支付平台证书路径（平台证书，用于校验回调签名；可从平台下载或 SDK 自动拉取）
+  WECHAT_PLATFORM_CERT_PATH: z.string().optional(),
+  // 向后兼容：旧的 OAuth 流程 secret（扫码登录用，非支付）
   WECHAT_APP_SECRET: z.string().optional(),
 
+  // ═══════════════════════════════════════════════════════════
+  // 支付网关：支付宝
+  // ═══════════════════════════════════════════════════════════
+  // 开放平台 App ID（16 位数字）
+  ALIPAY_APPID: z.string().optional(),
+  // 应用私钥路径（PKCS#1 或 PKCS#8 PEM）
+  ALIPAY_PRIVATE_KEY_PATH: z.string().optional(),
+  // 支付宝公钥路径（用于校验回调签名）
+  ALIPAY_PUBLIC_KEY_PATH: z.string().optional(),
+  // 签名算法（RSA2 推荐）
+  ALIPAY_SIGN_TYPE: z.enum(['RSA', 'RSA2']).default('RSA2'),
+  // 支付宝网关 URL（生产 / 沙箱不同）
+  ALIPAY_GATEWAY: z.string().url().default('https://openapi.alipay.com/gateway.do'),
+
+  // ═══════════════════════════════════════════════════════════
+  // AWS（未来接 S3 上传证件照）
+  // ═══════════════════════════════════════════════════════════
   AWS_REGION: z.string().optional(),
   S3_BUCKET_UPLOADS: z.string().optional(),
 });
@@ -72,3 +105,50 @@ if (env.NODE_ENV === 'production' && !appPublicUrl) {
   console.error('❌ APP_PUBLIC_URL must be set in production (used for payment webhooks)');
   process.exit(1);
 }
+
+/** PAYMENT_MODE=live 下验证支付渠道凭证齐全 */
+const paymentMode = process.env.PAYMENT_MODE ?? 'sandbox';
+if (paymentMode === 'live') {
+  const wechatMissing = [
+    'WECHAT_APPID',
+    'WECHAT_MCH_ID',
+    'WECHAT_API_V3_KEY',
+    'WECHAT_SERIAL_NO',
+    'WECHAT_PRIVATE_KEY_PATH',
+  ].filter((k) => !env[k as keyof typeof env]);
+  const alipayMissing = [
+    'ALIPAY_APPID',
+    'ALIPAY_PRIVATE_KEY_PATH',
+    'ALIPAY_PUBLIC_KEY_PATH',
+  ].filter((k) => !env[k as keyof typeof env]);
+  // 允许只启用一家（例如只接微信）；但一家都没配等于 live 模式没意义
+  if (wechatMissing.length > 0 && alipayMissing.length > 0) {
+    // eslint-disable-next-line no-console
+    console.error(
+      '❌ PAYMENT_MODE=live but no complete payment channel configured.\n' +
+        `   WeChat missing: ${wechatMissing.join(', ')}\n` +
+        `   Alipay missing: ${alipayMissing.join(', ')}`,
+    );
+    process.exit(1);
+  }
+}
+
+/** 支付渠道配置便利访问器（adapter 用） */
+export const paymentConfig = {
+  mode: paymentMode as 'sandbox' | 'live',
+  wechat: {
+    appid: env.WECHAT_APPID,
+    mchId: env.WECHAT_MCH_ID,
+    apiV3Key: env.WECHAT_API_V3_KEY,
+    serialNo: env.WECHAT_SERIAL_NO,
+    privateKeyPath: env.WECHAT_PRIVATE_KEY_PATH,
+    platformCertPath: env.WECHAT_PLATFORM_CERT_PATH,
+  },
+  alipay: {
+    appid: env.ALIPAY_APPID,
+    privateKeyPath: env.ALIPAY_PRIVATE_KEY_PATH,
+    publicKeyPath: env.ALIPAY_PUBLIC_KEY_PATH,
+    signType: env.ALIPAY_SIGN_TYPE,
+    gateway: env.ALIPAY_GATEWAY,
+  },
+};

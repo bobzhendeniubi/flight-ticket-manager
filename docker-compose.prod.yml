@@ -80,6 +80,22 @@ services:
       # 必须显式设置（生产 sandbox 等于公开伪造支付接口，拒绝默认值）
       PAYMENT_MODE: ${PAYMENT_MODE:?must set PAYMENT_MODE (live|sandbox — live for production)}
       APP_PUBLIC_URL: ${APP_PUBLIC_URL:?must set APP_PUBLIC_URL for payment webhooks (e.g. https://api.citur.com)}
+      # ── WeChat Pay (PAYMENT_MODE=live 时必填) ──
+      WECHAT_APPID: ${WECHAT_APPID:-}
+      WECHAT_MCH_ID: ${WECHAT_MCH_ID:-}
+      WECHAT_API_V3_KEY: ${WECHAT_API_V3_KEY:-}
+      WECHAT_SERIAL_NO: ${WECHAT_SERIAL_NO:-}
+      WECHAT_PRIVATE_KEY_PATH: ${WECHAT_PRIVATE_KEY_PATH:-/secrets/wechat/apiclient_key.pem}
+      WECHAT_PLATFORM_CERT_PATH: ${WECHAT_PLATFORM_CERT_PATH:-}
+      # ── Alipay (PAYMENT_MODE=live 时必填) ──
+      ALIPAY_APPID: ${ALIPAY_APPID:-}
+      ALIPAY_PRIVATE_KEY_PATH: ${ALIPAY_PRIVATE_KEY_PATH:-/secrets/alipay/app_private_key.pem}
+      ALIPAY_PUBLIC_KEY_PATH: ${ALIPAY_PUBLIC_KEY_PATH:-/secrets/alipay/alipay_public_key.pem}
+      ALIPAY_SIGN_TYPE: ${ALIPAY_SIGN_TYPE:-RSA2}
+      ALIPAY_GATEWAY: ${ALIPAY_GATEWAY:-https://openapi.alipay.com/gateway.do}
+    volumes:
+      # 证书/私钥 只读挂载（不写进镜像）
+      - ./secrets:/secrets:ro
       SANDBOX_WEBHOOK_SECRET: ${SANDBOX_WEBHOOK_SECRET:-sandbox-test-secret}
       ENABLE_AUTO_FULFILLMENT: ${ENABLE_AUTO_FULFILLMENT:-true}
     # 启动前自动跑 migration
@@ -105,6 +121,7 @@ services:
       DATABASE_URL: postgresql://ftm:${POSTGRES_PASSWORD}@postgres:5432/ftm?schema=public
       REDIS_URL: redis://redis:6379
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      # worker 如需发通知 / 触发支付退款时也可能要支付 env；按需加
     command: ["node", "dist/queues/worker.js"]
     logging:
       driver: "json-file"

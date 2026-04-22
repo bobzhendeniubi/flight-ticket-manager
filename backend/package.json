@@ -28,6 +28,7 @@
     "@fastify/rate-limit": "^10.1.1",
     "@fastify/sensible": "^6.0.1",
     "@prisma/client": "^5.22.0",
+    "alipay-sdk": "^4.14.0",
     "argon2": "^0.41.1",
     "bullmq": "^5.75.2",
     "dotenv": "^16.4.5",
@@ -35,6 +36,7 @@
     "fastify-plugin": "^5.0.1",
     "ioredis": "^5.4.1",
     "pino": "^9.5.0",
+    "wechatpay-node-v3": "^2.2.1",
     "zod": "^3.23.8"
   },
   "devDependencies": {
