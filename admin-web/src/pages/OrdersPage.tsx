@@ -1,8 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
-import { api, ApiError, type OrderSummary, type OrderItem, type OrderStatus } from '../lib/api';
+import { api, ApiError, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import {
-  MOCK_FULFILLMENTS,
   type FulfillmentStatus,
 } from '../lib/mockData';
 import { exportToCSV } from '../lib/csvExport';
@@ -604,15 +603,59 @@ const FF_STATUS_LABEL: Record<FulfillmentStatus, string> = {
   PENDING: '待处理', IN_PROGRESS: '处理中', CONFIRMED: '已确认', CANCELLED: '已取消', FAILED: '失败',
 };
 
+const FF_TYPE_LABEL: Record<FulfillmentTask['type'], { icon: string; label: string }> = {
+  FLIGHT_TICKETING: { icon: '✈️', label: '机票出票' },
+  HOTEL_BOOKING: { icon: '🏨', label: '酒店确认' },
+  VISA_APPLICATION: { icon: '🛂', label: '签证办理' },
+  TRANSFER_DISPATCH: { icon: '🚐', label: '接送调度' },
+  BUNDLE_COMPOSITE: { icon: '🎁', label: '套餐履约' },
+};
+
 function FulfillmentSection({ orderId }: { orderId: string }) {
-  // 真实订单 id 跟 mock 对不上，所以这里 demo 展示空态；M6 加真 API
-  const ff = MOCK_FULFILLMENTS[orderId];
-  if (!ff) {
+  const tokens = useAuth((s) => s.tokens);
+  const [tasks, setTasks] = useState<FulfillmentTask[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [editing, setEditing] = useState<string | null>(null);
+  const [draft, setDraft] = useState<Record<string, string>>({});
+
+  useEffect(() => {
+    if (!tokens?.accessToken) return;
+    let cancelled = false;
+    setLoading(true);
+    api.listFulfillmentByOrder(tokens.accessToken, orderId)
+      .then((r) => { if (!cancelled) setTasks(r.tasks); })
+      .catch(() => {/* 忽略 */})
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [tokens?.accessToken, orderId]);
+
+  const updateStatus = async (task: FulfillmentTask, status: ApiFfStatus, data?: Record<string, unknown>) => {
+    if (!tokens?.accessToken) return;
+    try {
+      const body: Record<string, unknown> = { status };
+      if (data) body.data = data;
+      const res = await api.updateFulfillmentTask(tokens.accessToken, task.id, body);
+      setTasks((prev) => prev.map((t) => (t.id === task.id ? res.task : t)));
+      setEditing(null);
+    } catch (e) {
+      alert(e instanceof ApiError ? `操作失败：${e.message}` : '操作失败');
+    }
+  };
+
+  if (loading) {
+    return (
+      <section>
+        <h3 className="text-sm font-medium text-slate-700">🚚 履约进度</h3>
+        <div className="mt-2 rounded-md bg-slate-50 p-3 text-xs text-slate-400">加载中…</div>
+      </section>
+    );
+  }
+  if (tasks.length === 0) {
     return (
       <section>
         <h3 className="text-sm font-medium text-slate-700">🚚 履约进度</h3>
         <div className="mt-2 rounded-md bg-slate-50 p-3 text-xs text-slate-500">
-          暂无履约记录 · 真环境订单付款后自动触发 fulfillment 工作流（M6 接入）
+          暂无履约任务 · 订单转 PAID 时自动生成（按产品类型）
         </div>
       </section>
     );
@@ -624,31 +667,105 @@ function FulfillmentSection({ orderId }: { orderId: string }) {
         <h3 className="text-sm font-medium text-slate-700">🚚 履约进度</h3>
       </div>
       <div className="mt-2 space-y-2">
-        {ff.flight && (
-          <FfCard icon="✈️" label="机票出票" status={ff.flight.status}>
-            <Row label="PNR" value={<span className="font-mono">{ff.flight.pnr ?? '（未生成）'}</span>} />
-            <Row label="电子票号" value={<span className="font-mono">{ff.flight.eTicketNumber ?? '—'}</span>} />
-          </FfCard>
-        )}
-        {ff.hotel && (
-          <FfCard icon="🏨" label="酒店确认" status={ff.hotel.status}>
-            <Row label="确认号" value={<span className="font-mono">{ff.hotel.confirmationNumber ?? '—'}</span>} />
-          </FfCard>
-        )}
-        {ff.visa && (
-          <FfCard icon="🛂" label="签证办理" status={ff.visa.status}>
-            <Row label="申请号" value={<span className="font-mono">{ff.visa.applicationNumber ?? '—'}</span>} />
-            <Row label="当前进度" value={ff.visa.progress} />
-          </FfCard>
-        )}
-        {ff.transfer && (
-          <FfCard icon="🚐" label="接送调度" status={ff.transfer.status}>
-            <Row label="司机" value={ff.transfer.driverName ?? '（未分配）'} />
-            <Row label="车牌" value={<span className="font-mono">{ff.transfer.vehicleNumber ?? '—'}</span>} />
-          </FfCard>
-        )}
+        {tasks.map((t) => {
+          const meta = FF_TYPE_LABEL[t.type];
+          const data = (t.data as Record<string, string> | null) ?? {};
+          const isEditing = editing === t.id;
+          return (
+            <FfCard key={t.id} icon={meta.icon} label={meta.label} status={t.status as FulfillmentStatus}>
+              {t.type === 'FLIGHT_TICKETING' && !isEditing && (
+                <>
+                  <Row label="PNR" value={<span className="font-mono">{data.pnr ?? '（未生成）'}</span>} />
+                  <Row label="电子票号" value={<span className="font-mono">{data.eTicketNumber ?? '—'}</span>} />
+                </>
+              )}
+              {t.type === 'HOTEL_BOOKING' && !isEditing && (
+                <Row label="确认号" value={<span className="font-mono">{data.confirmationNumber ?? '—'}</span>} />
+              )}
+              {t.type === 'VISA_APPLICATION' && !isEditing && (
+                <>
+                  <Row label="申请号" value={<span className="font-mono">{data.applicationNumber ?? '—'}</span>} />
+                  <Row label="进度" value={data.progress ?? '—'} />
+                </>
+              )}
+              {t.type === 'TRANSFER_DISPATCH' && !isEditing && (
+                <>
+                  <Row label="司机" value={data.driverName ?? '（未分配）'} />
+                  <Row label="车牌" value={<span className="font-mono">{data.vehicleNumber ?? '—'}</span>} />
+                </>
+              )}
+              {isEditing && (
+                <FfEditForm
+                  type={t.type}
+                  initial={data}
+                  onCancel={() => setEditing(null)}
+                  onSave={(d) => updateStatus(t, 'CONFIRMED' as ApiFfStatus, d)}
+                  draft={draft}
+                  setDraft={setDraft}
+                />
+              )}
+              {!isEditing && (
+                <div className="mt-2 flex flex-wrap gap-1">
+                  {t.status === 'PENDING' && (
+                    <button className="text-xs rounded bg-blue-100 px-2 py-0.5 text-blue-700 hover:bg-blue-200" onClick={() => updateStatus(t, 'IN_PROGRESS' as ApiFfStatus)}>▶ 开始处理</button>
+                  )}
+                  {(t.status === 'PENDING' || t.status === 'IN_PROGRESS') && (
+                    <button className="text-xs rounded bg-green-100 px-2 py-0.5 text-green-700 hover:bg-green-200"
+                      onClick={() => { setDraft(data); setEditing(t.id); }}>
+                      ✓ 填数据并确认
+                    </button>
+                  )}
+                  {t.status === 'IN_PROGRESS' && (
+                    <button className="text-xs rounded bg-red-100 px-2 py-0.5 text-red-700 hover:bg-red-200" onClick={() => {
+                      const reason = prompt('失败原因？');
+                      if (reason !== null) updateStatus(t, 'FAILED' as ApiFfStatus);
+                    }}>✗ 失败</button>
+                  )}
+                </div>
+              )}
+            </FfCard>
+          );
+        })}
       </div>
     </section>
+  );
+}
+
+function FfEditForm({ type, initial, onCancel, onSave, draft, setDraft }: {
+  type: FulfillmentTask['type'];
+  initial: Record<string, string>;
+  onCancel: () => void;
+  onSave: (data: Record<string, string>) => void;
+  draft: Record<string, string>;
+  setDraft: (d: Record<string, string>) => void;
+}) {
+  const fields: Array<{ key: string; label: string }> = type === 'FLIGHT_TICKETING'
+    ? [{ key: 'pnr', label: 'PNR' }, { key: 'eTicketNumber', label: '电子票号' }]
+    : type === 'HOTEL_BOOKING'
+    ? [{ key: 'confirmationNumber', label: '酒店确认号' }]
+    : type === 'VISA_APPLICATION'
+    ? [{ key: 'applicationNumber', label: '签证申请号' }, { key: 'progress', label: '当前进度' }]
+    : type === 'TRANSFER_DISPATCH'
+    ? [{ key: 'driverName', label: '司机姓名' }, { key: 'vehicleNumber', label: '车牌' }]
+    : [];
+
+  return (
+    <div className="mt-1 space-y-1">
+      {fields.map((f) => (
+        <div key={f.key} className="flex items-center gap-1">
+          <label className="text-[10px] text-slate-500 w-16">{f.label}</label>
+          <input
+            className="flex-1 rounded border border-slate-300 px-1.5 py-0.5 text-xs"
+            defaultValue={initial[f.key] ?? ''}
+            onChange={(e) => setDraft({ ...draft, [f.key]: e.target.value })}
+          />
+        </div>
+      ))}
+      <div className="mt-1 flex gap-1">
+        <button className="flex-1 text-xs rounded bg-brand px-2 py-1 text-white" onClick={() => onSave(draft)}>保存并确认</button>
+        <button className="text-xs rounded bg-slate-100 px-2 py-1 text-slate-700" onClick={onCancel}>取消</button>
+      </div>
+    </div>
   );
 }
 

@@ -205,6 +205,90 @@ export interface OrderSummary {
   user: { id: string; displayName: string | null; email: string | null };
 }
 
+// ── Audit / Customers / Travelers / Fulfillment ──────────────────────────
+export type AuditSeverity = 'INFO' | 'WARNING' | 'CRITICAL';
+export type AuditTargetType = 'AGENT' | 'ORDER' | 'FLIGHT' | 'CUSTOMER' | 'TRAVELER' | 'PRICING' | 'COMMISSION' | 'SETTLEMENT' | 'PRODUCT' | 'AUTH' | 'SYSTEM';
+
+export interface AuditLog {
+  id: string;
+  actorUserId: string | null;
+  actorLabel: string | null;
+  actorRole: string | null;
+  action: string;
+  targetType: AuditTargetType;
+  targetId: string | null;
+  targetLabel: string | null;
+  before: unknown;
+  after: unknown;
+  severity: AuditSeverity;
+  ipAddress: string | null;
+  userAgent: string | null;
+  createdAt: string;
+}
+
+export interface CustomerSummary {
+  id: string;
+  displayName: string | null;
+  email: string | null;
+  phone: string | null;
+  createdAt: string;
+  lastLoginAt: string | null;
+  profile: {
+    idNumber: string | null;
+    primaryAgentId: string | null;
+    primaryAgent: { id: string; companyName: string | null; contactName: string; tier: number } | null;
+    tags: string[];
+    notes: string | null;
+  };
+  totalOrders: number;
+  totalSpent: number;
+  lastOrderAt: string | null;
+}
+
+export interface CustomerDetail extends CustomerSummary {
+  recentOrders: Array<{ id: string; orderNumber: string; status: OrderStatus; total: string; createdAt: string; summary: string }>;
+  travelers: Array<{ id: string; fullName: string; documentNumber: string; dateOfBirth: string; nationality: string; phone: string | null; notes: string | null }>;
+}
+
+export interface Traveler {
+  id: string;
+  userId: string;
+  customer: { id: string; displayName: string | null; email: string | null; phone: string | null } | null;
+  fullName: string;
+  documentType: DocumentType;
+  documentNumber: string;
+  dateOfBirth: string;
+  nationality: string;
+  passengerType: PassengerType;
+  phone: string | null;
+  notes: string | null;
+  tripCount: number;
+  lastTripAt: string | null;
+  createdAt: string;
+}
+
+export type FulfillmentType = 'FLIGHT_TICKETING' | 'HOTEL_BOOKING' | 'VISA_APPLICATION' | 'TRANSFER_DISPATCH' | 'BUNDLE_COMPOSITE';
+export type FulfillmentStatus = 'PENDING' | 'IN_PROGRESS' | 'CONFIRMED' | 'CANCELLED' | 'FAILED';
+
+export interface FulfillmentTask {
+  id: string;
+  orderItemId: string;
+  type: FulfillmentType;
+  status: FulfillmentStatus;
+  data: unknown;
+  notes: string | null;
+  attempts: number;
+  scheduledAt: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  failureReason: string | null;
+  assigneeUserId: string | null;
+  createdAt: string;
+  updatedAt: string;
+  item: { id: string; kind: OrderItemKind; description: string; quantity: number; orderId: string };
+  order?: { id: string; orderNumber: string; contactName: string; contactPhone: string; status: OrderStatus };
+}
+
 // ── Products ─────────────────────────────────────────────────────────────
 export interface HotelRoomType {
   id: string;
@@ -500,4 +584,50 @@ export const api = {
     apiFetch<{ series: DashboardWeeklyPoint[] }>(`/dashboard/weekly?days=${days}`, { token }),
   getDashboardTopAgents: (token: string) =>
     apiFetch<{ agents: DashboardTopAgent[] }>('/dashboard/top-agents', { token }),
+
+  // Audit
+  listAuditLogs: (token: string, query?: Record<string, string | number | undefined>) => {
+    const qs = new URLSearchParams();
+    if (query) for (const [k, v] of Object.entries(query)) if (v !== undefined && v !== '') qs.set(k, String(v));
+    return apiFetch<{ logs: AuditLog[]; pagination: { page: number; pageSize: number; total: number } }>(
+      `/audit-logs/${qs.toString() ? '?' + qs.toString() : ''}`,
+      { token },
+    );
+  },
+
+  // Customers
+  listCustomers: (token: string, query?: Record<string, string | number | undefined>) => {
+    const qs = new URLSearchParams();
+    if (query) for (const [k, v] of Object.entries(query)) if (v !== undefined && v !== '') qs.set(k, String(v));
+    return apiFetch<{ customers: CustomerSummary[]; pagination: { page: number; pageSize: number; total: number } }>(
+      `/customers/${qs.toString() ? '?' + qs.toString() : ''}`,
+      { token },
+    );
+  },
+  getCustomer: (token: string, id: string) =>
+    apiFetch<{ customer: CustomerDetail }>(`/customers/${id}`, { token }),
+  updateCustomer: (token: string, id: string, body: Record<string, unknown>) =>
+    apiFetch<{ customer: CustomerSummary }>(`/customers/${id}`, { method: 'PATCH', token, body }),
+
+  // Travelers
+  listTravelers: (token: string, query?: Record<string, string | number | undefined>) => {
+    const qs = new URLSearchParams();
+    if (query) for (const [k, v] of Object.entries(query)) if (v !== undefined && v !== '') qs.set(k, String(v));
+    return apiFetch<{ travelers: Traveler[]; pagination: { page: number; pageSize: number; total: number } }>(
+      `/travelers/${qs.toString() ? '?' + qs.toString() : ''}`,
+      { token },
+    );
+  },
+  createTraveler: (token: string, body: Record<string, unknown>) =>
+    apiFetch<{ traveler: Traveler }>('/travelers/', { method: 'POST', token, body }),
+  updateTraveler: (token: string, id: string, body: Record<string, unknown>) =>
+    apiFetch<{ traveler: Traveler }>(`/travelers/${id}`, { method: 'PATCH', token, body }),
+  deleteTraveler: (token: string, id: string) =>
+    apiFetch<{ result: { id: string } }>(`/travelers/${id}`, { method: 'DELETE', token }),
+
+  // Fulfillment
+  listFulfillmentByOrder: (token: string, orderId: string) =>
+    apiFetch<{ tasks: FulfillmentTask[] }>(`/fulfillment-tasks/by-order/${orderId}`, { token }),
+  updateFulfillmentTask: (token: string, id: string, body: Record<string, unknown>) =>
+    apiFetch<{ task: FulfillmentTask }>(`/fulfillment-tasks/${id}`, { method: 'PATCH', token, body }),
 };

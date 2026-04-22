@@ -2,22 +2,56 @@
  * 旅客管理 — 所有订单里出现的出行人（去重）
  * 关键 query: 姓名 + 生日（核实身份常用组合）
  */
-import { useMemo, useState } from 'react';
-import { MOCK_TRAVELERS, MOCK_CUSTOMERS, type MockTraveler } from '../lib/mockData';
+import { useEffect, useMemo, useState } from 'react';
+import { type MockTraveler } from '../lib/mockData';
 import { exportToCSV } from '../lib/csvExport';
+import { api, ApiError, type Traveler } from '../lib/api';
+import { useAuth } from '../stores/auth';
+
+function travelerApiToMock(t: Traveler): MockTraveler {
+  return {
+    id: t.id,
+    fullName: t.fullName,
+    passportNumber: t.documentNumber,
+    dateOfBirth: typeof t.dateOfBirth === 'string' ? t.dateOfBirth.slice(0, 10) : t.dateOfBirth,
+    nationality: t.nationality,
+    phone: t.phone,
+    customerIds: t.customer ? [t.customer.id] : [],
+    tripCount: t.tripCount,
+    lastTripAt: t.lastTripAt ? (typeof t.lastTripAt === 'string' ? t.lastTripAt.slice(0, 10) : t.lastTripAt) : null,
+    notes: t.notes,
+  };
+}
 
 export function TravelersPage() {
+  const tokens = useAuth((s) => s.tokens);
+  const [travelers, setTravelers] = useState<MockTraveler[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [nameQuery, setNameQuery] = useState('');
   const [birthdayQuery, setBirthdayQuery] = useState('');
   const [nationalityFilter, setNationalityFilter] = useState('');
   const [ageRange, setAgeRange] = useState<'' | 'child' | 'adult' | 'senior'>('');
   const [selected, setSelected] = useState<MockTraveler | null>(null);
 
+  useEffect(() => {
+    if (!tokens?.accessToken) return;
+    let cancelled = false;
+    setLoading(true);
+    api.listTravelers(tokens.accessToken, { pageSize: 500 })
+      .then((r) => { if (!cancelled) setTravelers(r.travelers.map(travelerApiToMock)); })
+      .catch((e) => { if (!cancelled) setError(e instanceof ApiError ? e.message : '加载失败'); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [tokens?.accessToken]);
+
   const nationalities = useMemo(() => {
     const set = new Set<string>();
-    MOCK_TRAVELERS.forEach((t) => set.add(t.nationality));
+    travelers.forEach((t) => set.add(t.nationality));
     return Array.from(set).sort();
-  }, []);
+  }, [travelers]);
+
+  void loading; void error;
 
   const today = new Date();
   const calcAge = (dob: string): number => {
@@ -29,7 +63,7 @@ export function TravelersPage() {
   };
 
   const filtered = useMemo(() => {
-    return MOCK_TRAVELERS.filter((t) => {
+    return travelers.filter((t) => {
       if (nameQuery) {
         const q = nameQuery.toLowerCase();
         if (!t.fullName.toLowerCase().includes(q)) return false;
@@ -47,13 +81,13 @@ export function TravelersPage() {
   }, [nameQuery, birthdayQuery, nationalityFilter, ageRange]);
 
   const kpi = useMemo(() => {
-    const ages = MOCK_TRAVELERS.map((t) => calcAge(t.dateOfBirth));
+    const ages = travelers.map((t) => calcAge(t.dateOfBirth));
     return {
-      total: MOCK_TRAVELERS.length,
+      total: travelers.length,
       children: ages.filter((a) => a < 12).length,
       adults: ages.filter((a) => a >= 12 && a < 60).length,
       seniors: ages.filter((a) => a >= 60).length,
-      totalTrips: MOCK_TRAVELERS.reduce((s, t) => s + t.tripCount, 0),
+      totalTrips: travelers.reduce((s, t) => s + t.tripCount, 0),
     };
   }, []);
 
@@ -226,9 +260,8 @@ function TravelerDrawer({ traveler, onClose }: { traveler: MockTraveler; onClose
   });
   const [saved, setSaved] = useState(false);
 
-  const customers = traveler.customerIds
-    .map((id) => MOCK_CUSTOMERS.find((c) => c.id === id))
-    .filter((c): c is NonNullable<typeof c> => c !== undefined);
+  // customerIds 仍保留（后端适配时会填 1 个 user id），UI 展示"已关联 N 位客户"即可
+  const customers = traveler.customerIds.map((id) => ({ id, name: '客户 #' + id.slice(0, 8) }));
 
   return (
     <div className="fixed inset-0 z-50 flex justify-end bg-slate-900/50" onClick={onClose}>
@@ -272,9 +305,7 @@ function TravelerDrawer({ traveler, onClose }: { traveler: MockTraveler; onClose
                     <li key={c.id} className="rounded border border-slate-200 p-2 flex items-center justify-between text-xs">
                       <div>
                         <div className="font-medium text-slate-900">{c.name}</div>
-                        <div className="text-slate-500">{c.phone}</div>
                       </div>
-                      {c.agentName && <span className="rounded bg-amber-100 px-1.5 py-0.5 text-amber-700">🤝</span>}
                     </li>
                   ))}
                 </ul>

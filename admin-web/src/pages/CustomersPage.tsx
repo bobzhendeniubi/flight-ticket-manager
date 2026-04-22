@@ -1,30 +1,66 @@
 /**
  * 散客管理 — 所有下单的散客（含直销 + 代理归属）
  */
-import { useMemo, useState } from 'react';
-import { MOCK_CUSTOMERS, type MockCustomer } from '../lib/mockData';
+import { useEffect, useMemo, useState } from 'react';
+import { type MockCustomer } from '../lib/mockData';
 import { exportToCSV } from '../lib/csvExport';
+import { api, ApiError, type CustomerSummary } from '../lib/api';
+import { useAuth } from '../stores/auth';
+
+function customerApiToMock(c: CustomerSummary): MockCustomer {
+  return {
+    id: c.id,
+    name: c.displayName ?? c.email ?? c.phone ?? '未命名客户',
+    phone: c.phone ?? '',
+    email: c.email,
+    idNumber: c.profile.idNumber,
+    agentId: c.profile.primaryAgentId,
+    agentName: c.profile.primaryAgent
+      ? (c.profile.primaryAgent.companyName ?? c.profile.primaryAgent.contactName)
+      : null,
+    createdAt: c.createdAt,
+    totalOrders: c.totalOrders,
+    totalSpent: c.totalSpent,
+    lastOrderAt: c.lastOrderAt,
+    tags: c.profile.tags,
+  };
+}
 
 export function CustomersPage() {
+  const tokens = useAuth((s) => s.tokens);
+  const [customers, setCustomers] = useState<MockCustomer[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState('');
   const [agentFilter, setAgentFilter] = useState<string>('');
   const [tagFilter, setTagFilter] = useState<string>('');
   const [selected, setSelected] = useState<MockCustomer | null>(null);
 
+  useEffect(() => {
+    if (!tokens?.accessToken) return;
+    let cancelled = false;
+    setLoading(true);
+    api.listCustomers(tokens.accessToken, { pageSize: 200 })
+      .then((r) => { if (!cancelled) setCustomers(r.customers.map(customerApiToMock)); })
+      .catch((e) => { if (!cancelled) setError(e instanceof ApiError ? e.message : '加载失败'); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [tokens?.accessToken]);
+
   const agentNames = useMemo(() => {
     const set = new Set<string>();
-    MOCK_CUSTOMERS.forEach((c) => { if (c.agentName) set.add(c.agentName); });
+    customers.forEach((c) => { if (c.agentName) set.add(c.agentName); });
     return Array.from(set).sort();
-  }, []);
+  }, [customers]);
 
   const allTags = useMemo(() => {
     const set = new Set<string>();
-    MOCK_CUSTOMERS.forEach((c) => c.tags.forEach((t) => set.add(t)));
+    customers.forEach((c) => c.tags.forEach((t) => set.add(t)));
     return Array.from(set).sort();
-  }, []);
+  }, [customers]);
 
   const filtered = useMemo(() => {
-    return MOCK_CUSTOMERS.filter((c) => {
+    return customers.filter((c) => {
       if (search) {
         const q = search.toLowerCase();
         if (!c.name.toLowerCase().includes(q) && !c.phone.includes(q) && !(c.email?.toLowerCase().includes(q) ?? false)) return false;
@@ -35,15 +71,17 @@ export function CustomersPage() {
       if (tagFilter && !c.tags.includes(tagFilter)) return false;
       return true;
     });
-  }, [search, agentFilter, tagFilter]);
+  }, [customers, search, agentFilter, tagFilter]);
 
   const kpi = useMemo(() => ({
-    total: MOCK_CUSTOMERS.length,
-    direct: MOCK_CUSTOMERS.filter((c) => !c.agentName).length,
-    viaAgent: MOCK_CUSTOMERS.filter((c) => c.agentName).length,
-    totalSpent: MOCK_CUSTOMERS.reduce((s, c) => s + c.totalSpent, 0),
-    vip: MOCK_CUSTOMERS.filter((c) => c.tags.includes('VIP')).length,
-  }), []);
+    total: customers.length,
+    direct: customers.filter((c) => !c.agentName).length,
+    viaAgent: customers.filter((c) => c.agentName).length,
+    totalSpent: customers.reduce((s, c) => s + c.totalSpent, 0),
+    vip: customers.filter((c) => c.tags.includes('VIP')).length,
+  }), [customers]);
+
+  void loading; void error;
 
   const handleExport = () => {
     exportToCSV('散客名单', filtered, [
@@ -105,7 +143,7 @@ export function CustomersPage() {
             </select>
           </div>
           <div className="flex items-end text-sm text-slate-500">
-            显示 {filtered.length} / {MOCK_CUSTOMERS.length}
+            显示 {filtered.length} / {customers.length}
           </div>
         </div>
       </section>

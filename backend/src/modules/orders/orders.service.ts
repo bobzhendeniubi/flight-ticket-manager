@@ -410,9 +410,12 @@ export class OrderService {
         extraData.paidAmount = order.total;
       }
 
-      // 转到 PAID：创建佣金记录（若有代理）
-      if (toStatus === 'PAID' && order.agentId) {
-        await createCommissionsForOrder(tx, order.id, order.agentId);
+      // 转到 PAID：创建佣金记录（若有代理）+ 创建 Fulfillment tasks
+      if (toStatus === 'PAID') {
+        if (order.agentId) {
+          await createCommissionsForOrder(tx, order.id, order.agentId);
+        }
+        await createFulfillmentTasks(tx, order.id);
       }
 
       // 从 PAID 走到释放态（CANCELLED/REFUNDED/PAYMENT_TIMEOUT/FAILED）：撤销佣金
@@ -569,6 +572,36 @@ function serializeOrder<T extends OrderLike>(order: T) {
 
 // 避免 PaymentMethod 未使用告警（未来接支付时会用到）
 void PaymentMethod;
+
+// ── Fulfillment 任务生成（PAID 时触发） ─────────────────────────
+import { FulfillmentStatus, FulfillmentType } from '@prisma/client';
+
+const KIND_TO_FULFILLMENT_TYPE: Partial<Record<OrderItemKind, FulfillmentType>> = {
+  FLIGHT: FulfillmentType.FLIGHT_TICKETING,
+  HOTEL: FulfillmentType.HOTEL_BOOKING,
+  VISA: FulfillmentType.VISA_APPLICATION,
+  TRANSFER: FulfillmentType.TRANSFER_DISPATCH,
+  BUNDLE: FulfillmentType.BUNDLE_COMPOSITE,
+};
+
+async function createFulfillmentTasks(tx: Prisma.TransactionClient, orderId: string) {
+  const items = await tx.orderItem.findMany({
+    where: { orderId },
+    select: { id: true, kind: true, fulfillmentTasks: { select: { id: true } } },
+  });
+  for (const item of items) {
+    const type = KIND_TO_FULFILLMENT_TYPE[item.kind];
+    if (!type) continue;
+    if (item.fulfillmentTasks.length > 0) continue;
+    await tx.fulfillmentTask.create({
+      data: {
+        orderItemId: item.id,
+        type,
+        status: FulfillmentStatus.PENDING,
+      },
+    });
+  }
+}
 
 // ════════════════════════════════════════════════════════════════════
 // 佣金链路计算 — 当订单转 PAID 时调用，为卖家代理 + 所有上级代理创建 CommissionRecord

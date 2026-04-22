@@ -15,6 +15,7 @@ import {
   updateStatusBodySchema,
 } from './orders.schemas.js';
 import { prisma } from '../../db/prisma.js';
+import { actorFromRequest, writeAudit } from '../../lib/audit.js';
 
 export const orderRoutes: FastifyPluginAsync = async (app) => {
   const service = new OrderService();
@@ -27,6 +28,14 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       const body = createOrderBodySchema.parse(req.body);
       const requester = await buildRequester(req.user.sub, req.user.role);
       const order = await service.createOrder(body, requester);
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'CREATE_ORDER',
+        targetType: 'ORDER',
+        targetId: order.id,
+        targetLabel: order.orderNumber,
+        after: { total: order.total.toString(), itemCount: order.items.length, passengerCount: order.passengers.length },
+      });
       return reply.status(201).send({ order });
     },
   );
@@ -63,6 +72,15 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       const body = updateStatusBodySchema.parse(req.body);
       const requester = await buildRequester(req.user.sub, req.user.role);
       const order = await service.updateStatus(id, body.toStatus, requester, body.reason);
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'ADVANCE_ORDER_STATUS',
+        targetType: 'ORDER',
+        targetId: order.id,
+        targetLabel: order.orderNumber,
+        after: { toStatus: body.toStatus, reason: body.reason },
+        severity: body.toStatus === 'CANCELLED' || body.toStatus === 'REFUNDED' ? 'WARNING' : 'INFO',
+      });
       return { order };
     },
   );

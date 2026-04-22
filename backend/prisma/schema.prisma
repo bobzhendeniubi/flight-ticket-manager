@@ -53,6 +53,8 @@ model User {
   orders           Order[]
   agentProfile     Agent?
   orderEvents      OrderStatusEvent[]
+  customerProfile  CustomerProfile?
+  auditLogs        AuditLog[]
 
   @@index([role])
   @@index([createdAt])
@@ -83,6 +85,8 @@ model SavedPassenger {
   dateOfBirth    DateTime
   nationality    String        // ISO 3166-1 alpha-2 (e.g., CN, US)
   passengerType  PassengerType @default(ADULT)
+  phone          String?
+  notes          String?
   createdAt      DateTime      @default(now())
   updatedAt      DateTime      @updatedAt
 
@@ -90,6 +94,74 @@ model SavedPassenger {
 
   @@unique([userId, documentType, documentNumber])
   @@index([userId])
+  @@index([fullName])
+  @@index([dateOfBirth])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Customer Profile — 客户画像（User.role=CUSTOMER 的扩展信息）
+// ─────────────────────────────────────────────────────────────────────────────
+model CustomerProfile {
+  id             String   @id @default(cuid())
+  userId         String   @unique
+  idNumber       String?  // 身份证/护照号
+  primaryAgentId String?  // 归属代理（null = 直销散客）
+  tags           String[] // ["VIP", "回头客", "蜜月"]
+  notes          String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  user         User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  primaryAgent Agent? @relation(fields: [primaryAgentId], references: [id])
+
+  @@index([primaryAgentId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Audit Log — 全站敏感操作留痕
+// ─────────────────────────────────────────────────────────────────────────────
+enum AuditSeverity {
+  INFO
+  WARNING
+  CRITICAL
+}
+
+enum AuditTargetType {
+  AGENT
+  ORDER
+  FLIGHT
+  CUSTOMER
+  TRAVELER
+  PRICING
+  COMMISSION
+  SETTLEMENT
+  PRODUCT
+  AUTH
+  SYSTEM
+}
+
+model AuditLog {
+  id          String           @id @default(cuid())
+  actorUserId String?          // null = 系统操作（定时任务等）
+  actorLabel  String?          // 缓存的 email/displayName（防用户删除后丢信息）
+  actorRole   String?
+  action      String           // CREATE_AGENT / UPDATE_PRICING / ADVANCE_ORDER_STATUS ...
+  targetType  AuditTargetType
+  targetId    String?
+  targetLabel String?          // 人类可读的对象名称
+  before      Json?
+  after       Json?
+  severity    AuditSeverity    @default(INFO)
+  ipAddress   String?
+  userAgent   String?
+  createdAt   DateTime         @default(now())
+
+  actor User? @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([createdAt])
+  @@index([actorUserId, createdAt])
+  @@index([targetType, targetId])
+  @@index([severity])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -119,6 +191,7 @@ model Agent {
   commissionRecords      CommissionRecord[]
   settlements            Settlement[]
   orders                 Order[]
+  customers              CustomerProfile[]
 
   @@index([isActive])
   @@index([parentAgentId])
@@ -527,14 +600,61 @@ model OrderItem {
   metadata         Json?
   createdAt        DateTime    @default(now())
 
-  order          Order            @relation(fields: [orderId], references: [id], onDelete: Cascade)
-  flightSchedule FlightSchedule?  @relation(fields: [flightScheduleId], references: [id])
-  hotelRoomType  HotelRoomType?   @relation(fields: [hotelRoomTypeId], references: [id])
-  transfer       Transfer?        @relation(fields: [transferId], references: [id])
-  visa           Visa?            @relation(fields: [visaId], references: [id])
-  bundle         Bundle?          @relation(fields: [bundleId], references: [id])
+  order            Order              @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  flightSchedule   FlightSchedule?    @relation(fields: [flightScheduleId], references: [id])
+  hotelRoomType    HotelRoomType?     @relation(fields: [hotelRoomTypeId], references: [id])
+  transfer         Transfer?          @relation(fields: [transferId], references: [id])
+  visa             Visa?              @relation(fields: [visaId], references: [id])
+  bundle           Bundle?            @relation(fields: [bundleId], references: [id])
+  fulfillmentTasks FulfillmentTask[]
 
   @@index([orderId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Fulfillment Tasks — 出票 / 酒店确认 / 签证进度 / 司机调度
+// ─────────────────────────────────────────────────────────────────────────────
+enum FulfillmentType {
+  FLIGHT_TICKETING   // 出票（PNR + e-ticket number）
+  HOTEL_BOOKING      // 酒店预订（confirmation number）
+  VISA_APPLICATION   // 签证申请（application number + progress）
+  TRANSFER_DISPATCH  // 接送调度（driver + vehicle）
+  BUNDLE_COMPOSITE   // 套餐：需拆解为多个子任务
+}
+
+enum FulfillmentStatus {
+  PENDING
+  IN_PROGRESS
+  CONFIRMED
+  CANCELLED
+  FAILED
+}
+
+model FulfillmentTask {
+  id           String              @id @default(cuid())
+  orderItemId  String
+  type         FulfillmentType
+  status       FulfillmentStatus   @default(PENDING)
+  // 多态 data：FLIGHT → {pnr, eTicketNumber}
+  //            HOTEL  → {confirmationNumber}
+  //            VISA   → {applicationNumber, progress}
+  //            TRANSFER → {driverName, vehicleNumber}
+  data         Json?
+  notes        String?
+  attempts     Int                 @default(0)
+  scheduledAt  DateTime?
+  startedAt    DateTime?
+  completedAt  DateTime?
+  failureReason String?
+  assigneeUserId String?           // 谁负责这条任务
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+
+  orderItem OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+
+  @@index([orderItemId])
+  @@index([status])
+  @@index([type, status])
 }
 
 model Passenger {

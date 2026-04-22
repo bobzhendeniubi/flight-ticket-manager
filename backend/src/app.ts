@@ -16,6 +16,10 @@ import { orderRoutes } from './modules/orders/orders.routes.js';
 import { settlementRoutes } from './modules/settlements/settlements.routes.js';
 import { productRoutes } from './modules/products/products.routes.js';
 import { dashboardRoutes } from './modules/dashboard/dashboard.routes.js';
+import { auditRoutes } from './modules/audit/audit.routes.js';
+import { customerRoutes } from './modules/customers/customers.routes.js';
+import { travelerRoutes } from './modules/travelers/travelers.routes.js';
+import { fulfillmentRoutes } from './modules/fulfillment/fulfillment.routes.js';
 import { redis } from './db/redis.js';
 
 export async function buildApp(): Promise<FastifyInstance> {
@@ -61,6 +65,10 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(settlementRoutes, { prefix: '/settlements' });
   await app.register(productRoutes, { prefix: '/products' });
   await app.register(dashboardRoutes, { prefix: '/dashboard' });
+  await app.register(auditRoutes, { prefix: '/audit-logs' });
+  await app.register(customerRoutes, { prefix: '/customers' });
+  await app.register(travelerRoutes, { prefix: '/travelers' });
+  await app.register(fulfillmentRoutes, { prefix: '/fulfillment-tasks' });
 
   // Root
   app.get('/', async () => ({

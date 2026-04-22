@@ -1,0 +1,183 @@
+/**
+ * 履约任务服务
+ *
+ * 任务由 orders.service 在订单 PAID 时自动创建（每个 OrderItem 一条）：
+ *   FLIGHT  → FLIGHT_TICKETING
+ *   HOTEL   → HOTEL_BOOKING
+ *   VISA    → VISA_APPLICATION
+ *   TRANSFER → TRANSFER_DISPATCH
+ *   BUNDLE  → BUNDLE_COMPOSITE（简化：整条任务，未来拆子任务）
+ *
+ * MVP 同步实现：运营手动在 admin 里更新状态 + 数据。
+ * V2 引入 BullMQ 后会变成自动触发供应商 API。
+ */
+import { FulfillmentStatus, FulfillmentType, OrderItemKind, Prisma } from '@prisma/client';
+import { prisma } from '../../db/prisma.js';
+import { NotFoundError } from '../../lib/errors.js';
+import type { ListFulfillmentQuery, UpdateFulfillmentBody } from './fulfillment.schemas.js';
+
+const KIND_TO_TYPE: Record<OrderItemKind, FulfillmentType | null> = {
+  FLIGHT: FulfillmentType.FLIGHT_TICKETING,
+  HOTEL: FulfillmentType.HOTEL_BOOKING,
+  VISA: FulfillmentType.VISA_APPLICATION,
+  TRANSFER: FulfillmentType.TRANSFER_DISPATCH,
+  BUNDLE: FulfillmentType.BUNDLE_COMPOSITE,
+  INSURANCE: null,
+  FEE: null,
+  DISCOUNT: null,
+};
+
+export class FulfillmentService {
+  /**
+   * 为订单的每个 item 创建任务（幂等 — 已有则跳过）。
+   * 由 orders.service 在转 PAID 时调用。
+   */
+  async createTasksForOrder(tx: Prisma.TransactionClient, orderId: string): Promise<number> {
+    const items = await tx.orderItem.findMany({
+      where: { orderId },
+      select: { id: true, kind: true, fulfillmentTasks: { select: { id: true } } },
+    });
+    let created = 0;
+    for (const item of items) {
+      const type = KIND_TO_TYPE[item.kind];
+      if (!type) continue;
+      if (item.fulfillmentTasks.length > 0) continue; // 已有
+      await tx.fulfillmentTask.create({
+        data: {
+          orderItemId: item.id,
+          type,
+          status: FulfillmentStatus.PENDING,
+        },
+      });
+      created++;
+    }
+    return created;
+  }
+
+  async listByOrder(orderId: string) {
+    const items = await prisma.orderItem.findMany({
+      where: { orderId },
+      include: { fulfillmentTasks: { orderBy: { createdAt: 'asc' } } },
+    });
+    return items.flatMap((it) =>
+      it.fulfillmentTasks.map((t) => serializeTask(t, it)),
+    );
+  }
+
+  async list(query: ListFulfillmentQuery) {
+    const where: Prisma.FulfillmentTaskWhereInput = {};
+    if (query.type) where.type = query.type;
+    if (query.status) where.status = query.status;
+    if (query.assigneeUserId) where.assigneeUserId = query.assigneeUserId;
+    if (query.orderItemId) where.orderItemId = query.orderItemId;
+    if (query.orderId) where.orderItem = { orderId: query.orderId };
+
+    const [rows, total] = await prisma.$transaction([
+      prisma.fulfillmentTask.findMany({
+        where,
+        include: { orderItem: { include: { order: { select: { id: true, orderNumber: true, contactName: true, contactPhone: true, status: true } } } } },
+        orderBy: { createdAt: 'desc' },
+        take: query.pageSize,
+        skip: (query.page - 1) * query.pageSize,
+      }),
+      prisma.fulfillmentTask.count({ where }),
+    ]);
+
+    return {
+      tasks: rows.map((t) => ({
+        ...serializeTask(t, t.orderItem),
+        order: t.orderItem.order,
+      })),
+      pagination: { page: query.page, pageSize: query.pageSize, total },
+    };
+  }
+
+  async update(id: string, body: UpdateFulfillmentBody) {
+    const existing = await prisma.fulfillmentTask.findUnique({
+      where: { id },
+      include: { orderItem: true },
+    });
+    if (!existing) throw new NotFoundError('履约任务不存在');
+
+    const data: Prisma.FulfillmentTaskUpdateInput = {};
+    if (body.status !== undefined) {
+      data.status = body.status;
+      if (body.status === FulfillmentStatus.IN_PROGRESS && !existing.startedAt) {
+        data.startedAt = new Date();
+      }
+      if (body.status === FulfillmentStatus.CONFIRMED || body.status === FulfillmentStatus.FAILED || body.status === FulfillmentStatus.CANCELLED) {
+        data.completedAt = new Date();
+      }
+      if (body.status === FulfillmentStatus.IN_PROGRESS) {
+        data.attempts = { increment: 1 };
+      }
+    }
+    if (body.data !== undefined) {
+      data.data = body.data as Prisma.InputJsonValue;
+    }
+    if (body.notes !== undefined) data.notes = body.notes;
+    if (body.assigneeUserId !== undefined) data.assigneeUserId = body.assigneeUserId;
+    if (body.failureReason !== undefined) data.failureReason = body.failureReason;
+
+    const updated = await prisma.fulfillmentTask.update({
+      where: { id },
+      data,
+      include: { orderItem: { include: { order: { select: { id: true, orderNumber: true, contactName: true, contactPhone: true, status: true } } } } },
+    });
+
+    // FLIGHT 完成时，把 PNR / e-ticket 同步到 Passenger（全订单的乘客都标）
+    if (updated.type === FulfillmentType.FLIGHT_TICKETING && updated.status === FulfillmentStatus.CONFIRMED && updated.data) {
+      const d = updated.data as { pnr?: string; eTicketNumber?: string };
+      if (d.pnr || d.eTicketNumber) {
+        await prisma.passenger.updateMany({
+          where: { orderId: updated.orderItem.orderId },
+          data: {
+            pnr: d.pnr ?? undefined,
+            eticketNumber: d.eTicketNumber ?? undefined,
+          },
+        });
+      }
+    }
+
+    return {
+      ...serializeTask(updated, updated.orderItem),
+      order: updated.orderItem.order,
+    };
+  }
+}
+
+// ── Serializer ──────────────────────────────────────────────────
+function serializeTask(
+  t: {
+    id: string; orderItemId: string; type: FulfillmentType; status: FulfillmentStatus;
+    data: unknown; notes: string | null; attempts: number;
+    scheduledAt: Date | null; startedAt: Date | null; completedAt: Date | null;
+    failureReason: string | null; assigneeUserId: string | null;
+    createdAt: Date; updatedAt: Date;
+  },
+  item: { id: string; kind: OrderItemKind; description: string; quantity: number; orderId: string },
+) {
+  return {
+    id: t.id,
+    orderItemId: t.orderItemId,
+    type: t.type,
+    status: t.status,
+    data: t.data,
+    notes: t.notes,
+    attempts: t.attempts,
+    scheduledAt: t.scheduledAt,
+    startedAt: t.startedAt,
+    completedAt: t.completedAt,
+    failureReason: t.failureReason,
+    assigneeUserId: t.assigneeUserId,
+    createdAt: t.createdAt,
+    updatedAt: t.updatedAt,
+    item: {
+      id: item.id,
+      kind: item.kind,
+      description: item.description,
+      quantity: item.quantity,
+      orderId: item.orderId,
+    },
+  };
+}

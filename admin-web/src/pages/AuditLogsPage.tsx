@@ -2,9 +2,36 @@
  * 审计日志 — 运营治理核心
  * 记录所有敏感操作：谁什么时候在哪个 IP 改了什么
  */
-import { useMemo, useState } from 'react';
-import { MOCK_AUDIT_LOGS, type MockAuditLog } from '../lib/mockData';
+import { useEffect, useMemo, useState } from 'react';
+import { type MockAuditLog } from '../lib/mockData';
 import { exportToCSV } from '../lib/csvExport';
+import { api, ApiError, type AuditLog } from '../lib/api';
+import { useAuth } from '../stores/auth';
+
+// 真 API 日志 → MockAuditLog 形状适配器（保留现有 UI）
+function logApiToMock(l: AuditLog): MockAuditLog {
+  const beforeStr = l.before ? (typeof l.before === 'string' ? l.before : JSON.stringify(l.before)) : null;
+  const afterStr = l.after ? (typeof l.after === 'string' ? l.after : JSON.stringify(l.after)) : '';
+  const tt = l.targetType;
+  // 新增类型向旧展示映射
+  const targetType: MockAuditLog['targetType'] =
+    tt === 'TRAVELER' || tt === 'PRODUCT' || tt === 'AUTH' || tt === 'SYSTEM' || tt === 'SETTLEMENT'
+      ? 'CUSTOMER'
+      : (tt as MockAuditLog['targetType']);
+  return {
+    id: l.id,
+    timestamp: l.createdAt,
+    actor: l.actorLabel ?? 'system',
+    actorRole: l.actorRole ?? 'SYSTEM',
+    action: l.action,
+    target: l.targetLabel ?? l.targetId ?? '—',
+    targetType,
+    before: beforeStr,
+    after: afterStr,
+    ip: l.ipAddress ?? 'system',
+    severity: l.severity,
+  };
+}
 
 const SEVERITY_COLOR: Record<MockAuditLog['severity'], string> = {
   INFO: 'bg-slate-100 text-slate-600',
@@ -17,20 +44,35 @@ const TARGET_ICON: Record<MockAuditLog['targetType'], string> = {
 };
 
 export function AuditLogsPage() {
+  const tokens = useAuth((s) => s.tokens);
+  const [logs, setLogs] = useState<MockAuditLog[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState('');
   const [actorFilter, setActorFilter] = useState('');
   const [targetFilter, setTargetFilter] = useState<'' | MockAuditLog['targetType']>('');
   const [severityFilter, setSeverityFilter] = useState<'' | MockAuditLog['severity']>('');
   const [selected, setSelected] = useState<MockAuditLog | null>(null);
 
+  useEffect(() => {
+    if (!tokens?.accessToken) return;
+    let cancelled = false;
+    setLoading(true);
+    api.listAuditLogs(tokens.accessToken, { pageSize: 200 })
+      .then((r) => { if (!cancelled) setLogs(r.logs.map(logApiToMock)); })
+      .catch((e) => { if (!cancelled) setError(e instanceof ApiError ? e.message : '加载失败'); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [tokens?.accessToken]);
+
   const actors = useMemo(() => {
     const set = new Set<string>();
-    MOCK_AUDIT_LOGS.forEach((l) => set.add(l.actor));
+    logs.forEach((l) => set.add(l.actor));
     return Array.from(set).sort();
-  }, []);
+  }, [logs]);
 
   const filtered = useMemo(() => {
-    return MOCK_AUDIT_LOGS.filter((l) => {
+    return logs.filter((l) => {
       if (search) {
         const q = search.toLowerCase();
         if (!l.action.toLowerCase().includes(q) && !l.target.toLowerCase().includes(q) && !l.after.toLowerCase().includes(q)) return false;
@@ -40,13 +82,13 @@ export function AuditLogsPage() {
       if (severityFilter && l.severity !== severityFilter) return false;
       return true;
     }).sort((a, b) => b.timestamp.localeCompare(a.timestamp));
-  }, [search, actorFilter, targetFilter, severityFilter]);
+  }, [logs, search, actorFilter, targetFilter, severityFilter]);
 
   const kpi = useMemo(() => ({
-    total: MOCK_AUDIT_LOGS.length,
-    critical: MOCK_AUDIT_LOGS.filter((l) => l.severity === 'CRITICAL').length,
-    warning: MOCK_AUDIT_LOGS.filter((l) => l.severity === 'WARNING').length,
-    today: MOCK_AUDIT_LOGS.filter((l) => l.timestamp.startsWith(new Date().toISOString().slice(0, 10))).length,
+    total: logs.length,
+    critical: logs.filter((l) => l.severity === 'CRITICAL').length,
+    warning: logs.filter((l) => l.severity === 'WARNING').length,
+    today: logs.filter((l) => l.timestamp.startsWith(new Date().toISOString().slice(0, 10))).length,
   }), []);
 
   return (
@@ -81,6 +123,8 @@ export function AuditLogsPage() {
       <section>
         <h1 className="text-2xl font-bold text-slate-900">审计日志</h1>
         <p className="mt-1 text-sm text-slate-600">所有敏感操作留痕 · 谁 / 何时 / 在哪 / 改了什么。合规与纠纷追责的基础。</p>
+        {loading && <div className="mt-2 rounded-md bg-slate-50 px-3 py-2 text-xs text-slate-500">加载中…</div>}
+        {error && <div className="mt-2 rounded-md bg-red-50 px-3 py-2 text-xs text-red-700">❌ {error}</div>}
       </section>
 
       <section className="card">

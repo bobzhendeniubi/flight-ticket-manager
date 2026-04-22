@@ -14,6 +14,7 @@ import {
   updateSettlementStatusBodySchema,
 } from './settlements.schemas.js';
 import { prisma } from '../../db/prisma.js';
+import { actorFromRequest, writeAudit } from '../../lib/audit.js';
 
 export const settlementRoutes: FastifyPluginAsync = async (app) => {
   const service = new SettlementService();
@@ -58,6 +59,16 @@ export const settlementRoutes: FastifyPluginAsync = async (app) => {
       const body = updateSettlementStatusBodySchema.parse(req.body);
       const requester = await buildRequester(req.user.sub, req.user.role);
       const settlement = await service.updateStatus(id, body.toStatus, requester, body.notes);
+      const s = settlement as { period: string; agentId: string; payableToAgent: string };
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'ADVANCE_SETTLEMENT_STATUS',
+        targetType: 'SETTLEMENT',
+        targetId: id,
+        targetLabel: `${s.period} · agent=${s.agentId.slice(0, 8)}`,
+        after: { toStatus: body.toStatus, payable: s.payableToAgent },
+        severity: body.toStatus === 'PAID' ? 'CRITICAL' : body.toStatus === 'VOIDED' ? 'WARNING' : 'INFO',
+      });
       return { settlement };
     },
   );
