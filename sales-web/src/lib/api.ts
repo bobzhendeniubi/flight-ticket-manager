@@ -92,6 +92,29 @@ export interface FlightSeatAvailability {
   totalForQty: number;
 }
 
+export interface SeatBreakdown {
+  seatIndex: number;
+  bucket: number;
+  bucketMultiplier: number;
+  unitPrice: number;
+}
+
+export interface PriceResult {
+  scheduleId: string;
+  cabin: CabinClass;
+  qty: number;
+  basePrice: number;
+  dateRank: string;
+  dateMultiplier: number;
+  bucketSize: number;
+  totalBuckets: number;
+  currentBucket: number;
+  currentBucketRemaining: number;
+  perSeatBreakdown: SeatBreakdown[];
+  totalPrice: number;
+  averageUnitPrice: number;
+}
+
 export interface FlightSearchResult {
   scheduleId: string;
   flightId: string;
@@ -339,6 +362,7 @@ export interface Visa {
   visaType: string;
   visaName: string | null;
   flag: string | null;
+  photo: string | null;
   processingDays: number;
   basePrice: string;
   expressSurcharge: string | null;
@@ -416,6 +440,16 @@ export const api = {
       if (v !== undefined && v !== '') qs.set(k, String(v));
     }
     return apiFetch<{ results: FlightSearchResult[] }>(`/flights/search?${qs.toString()}`);
+  },
+
+  // 动态定价查询（公开，不改 sold）
+  getFlightPrice: (params: { scheduleId: string; cabin: CabinClass; qty: number }) => {
+    const qs = new URLSearchParams({
+      scheduleId: params.scheduleId,
+      cabin: params.cabin,
+      qty: String(params.qty),
+    });
+    return apiFetch<{ pricing: PriceResult }>(`/flights/price?${qs.toString()}`);
   },
 
   // 管理员航班

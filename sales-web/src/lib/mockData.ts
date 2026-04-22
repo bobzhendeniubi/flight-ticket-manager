@@ -411,6 +411,7 @@ export interface MockVisa {
   country: string;
   countryCode: string;
   flag: string;
+  photo: string;
   type: string;
   processingDays: number;
   basePrice: number;
@@ -427,6 +428,7 @@ export const MOCK_VISAS: MockVisa[] = [
     country: '越南',
     countryCode: 'VN',
     flag: '🇻🇳',
+    photo: 'https://images.unsplash.com/photo-1559592413-7cec4d0cae2b?w=600&h=400&fit=crop',
     type: '电子签证 E-visa · 30 天单次',
     processingDays: 3,
     basePrice: 280,
@@ -440,6 +442,7 @@ export const MOCK_VISAS: MockVisa[] = [
     country: '越南',
     countryCode: 'VN',
     flag: '🇻🇳',
+    photo: 'https://images.unsplash.com/photo-1557750255-c76072a7fdf1?w=600&h=400&fit=crop',
     type: '电子签证 E-visa · 90 天多次',
     processingDays: 5,
     basePrice: 680,
@@ -453,6 +456,7 @@ export const MOCK_VISAS: MockVisa[] = [
     country: '越南',
     countryCode: 'VN',
     flag: '🇻🇳',
+    photo: 'https://images.unsplash.com/photo-1583417319070-4a69db38a482?w=600&h=400&fit=crop',
     type: '落地签批文（持护照到机场办）',
     processingDays: 2,
     basePrice: 180,
@@ -466,6 +470,7 @@ export const MOCK_VISAS: MockVisa[] = [
     country: '越南',
     countryCode: 'VN',
     flag: '🇻🇳',
+    photo: 'https://images.unsplash.com/photo-1528127269322-539801943592?w=600&h=400&fit=crop',
     type: '商务邀请函签证（1 年多次）',
     processingDays: 10,
     basePrice: 980,
@@ -479,6 +484,7 @@ export const MOCK_VISAS: MockVisa[] = [
     country: '柬埔寨',
     countryCode: 'KH',
     flag: '🇰🇭',
+    photo: 'https://images.unsplash.com/photo-1563492065599-3520f775eeed?w=600&h=400&fit=crop',
     type: '电子签证 E-visa',
     processingDays: 3,
     basePrice: 320,
@@ -491,6 +497,7 @@ export const MOCK_VISAS: MockVisa[] = [
     country: '泰国',
     countryCode: 'TH',
     flag: '🇹🇭',
+    photo: 'https://images.unsplash.com/photo-1508009603885-50cf7c579365?w=600&h=400&fit=crop',
     type: '单次旅游签证',
     processingDays: 5,
     basePrice: 280,
@@ -503,6 +510,7 @@ export const MOCK_VISAS: MockVisa[] = [
     country: '新加坡',
     countryCode: 'SG',
     flag: '🇸🇬',
+    photo: 'https://images.unsplash.com/photo-1525625293386-3f8f99389edd?w=600&h=400&fit=crop',
     type: '电子旅游签',
     processingDays: 3,
     basePrice: 280,
@@ -515,6 +523,7 @@ export const MOCK_VISAS: MockVisa[] = [
     country: '老挝',
     countryCode: 'LA',
     flag: '🇱🇦',
+    photo: 'https://images.unsplash.com/photo-1601040532080-8773f1c3289e?w=600&h=400&fit=crop',
     type: '落地签 / 电子签',
     processingDays: 3,
     basePrice: 260,
@@ -527,6 +536,7 @@ export const MOCK_VISAS: MockVisa[] = [
     country: '马来西亚',
     countryCode: 'MY',
     flag: '🇲🇾',
+    photo: 'https://images.unsplash.com/photo-1596422846543-75c6fc197f11?w=600&h=400&fit=crop',
     type: '电子签证 eVISA',
     processingDays: 3,
     basePrice: 240,
@@ -539,6 +549,7 @@ export const MOCK_VISAS: MockVisa[] = [
     country: '印度尼西亚',
     countryCode: 'ID',
     flag: '🇮🇩',
+    photo: 'https://images.unsplash.com/photo-1537996194471-76f2285ba9a4?w=600&h=400&fit=crop',
     type: '电子落地签 e-VOA',
     processingDays: 2,
     basePrice: 280,
@@ -814,6 +825,7 @@ export interface MockBundle {
   name: string;
   tagline: string;
   emoji: string;
+  photo: string;
   /** 含哪些产品 */
   items: BundleItem[];
   /** 单卖总价（计算自 items） */
@@ -844,6 +856,7 @@ export const MOCK_BUNDLES: MockBundle[] = [
       name: '经典度假 3 晚 · 凯悦海景',
       tagline: '来回机票 + 凯悦海景 3 晚 + 来回接送',
       emoji: '🏖️',
+      photo: 'https://images.unsplash.com/photo-1582719508461-905c673771fd?w=600&h=400&fit=crop',
       items,
       listPrice: groundTotal,
       bundlePrice: groundTotal,
@@ -867,6 +880,7 @@ export const MOCK_BUNDLES: MockBundle[] = [
       name: '蜜月豪华 4 晚 · 洲际半岛',
       tagline: '来回机票 + 洲际半岛 + 巴拿山佛手桥 + 签证全包',
       emoji: '💍',
+      photo: 'https://images.unsplash.com/photo-1520250497591-112f2f40a3f4?w=600&h=400&fit=crop',
       items,
       listPrice: groundTotal,
       bundlePrice: groundTotal,
@@ -889,6 +903,7 @@ export const MOCK_BUNDLES: MockBundle[] = [
       name: '商务快闪 1 晚 · 商务舱',
       tagline: '商务舱来回 + 市区公寓 + 签证 + 豪华接送',
       emoji: '💼',
+      photo: 'https://images.unsplash.com/photo-1551882547-ff40c63fe5fa?w=600&h=400&fit=crop',
       items,
       listPrice: groundTotal,
       bundlePrice: groundTotal,
@@ -912,6 +927,7 @@ export const MOCK_BUNDLES: MockBundle[] = [
       name: '亲子 4 晚 · 太阳豪庭',
       tagline: '来回机票 4 人 + 太阳豪庭双房 + 会安古城 + 签证',
       emoji: '👨‍👩‍👧‍👦',
+      photo: 'https://images.unsplash.com/photo-1564501049412-61c2a3083791?w=600&h=400&fit=crop',
       items,
       listPrice: groundTotal,
       bundlePrice: groundTotal,
@@ -935,6 +951,7 @@ export const MOCK_BUNDLES: MockBundle[] = [
       name: '养生 5 晚 · TIA 全 SPA',
       tagline: '来回机票 + TIA 全日 SPA 免费 + 海钓',
       emoji: '🧘',
+      photo: 'https://images.unsplash.com/photo-1540541338287-41700207dee6?w=600&h=400&fit=crop',
       items,
       listPrice: groundTotal,
       bundlePrice: groundTotal,
@@ -958,6 +975,7 @@ export const MOCK_BUNDLES: MockBundle[] = [
       name: '会安文化 4 晚 · 安岚古城',
       tagline: '来回机票 + 会安古城 + 美山遗址 UNESCO 双世遗',
       emoji: '🏮',
+      photo: 'https://images.unsplash.com/photo-1558005137-d9619a5c539f?w=600&h=400&fit=crop',
       items,
       listPrice: groundTotal,
       bundlePrice: groundTotal,

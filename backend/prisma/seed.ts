@@ -527,12 +527,12 @@ async function seedTransfers() {
 
 async function seedVisas() {
   const VISAS = [
-    { destinationCountry: 'VN', country: '越南', flag: '🇻🇳', visaType: 'e_visa', visaName: '电子签证 E-visa · 30 天单次', processingDays: 3, basePrice: 280, expressSurcharge: 150, validityMonths: 1, highlight: '最热销 · 全流程线上', requiredDocs: ['护照首页扫描件', '2 寸白底照片电子版'] },
-    { destinationCountry: 'VN', country: '越南', flag: '🇻🇳', visaType: 'e_visa_90d', visaName: '电子签证 E-visa · 90 天多次', processingDays: 5, basePrice: 680, expressSurcharge: 300, validityMonths: 3, highlight: '适合多次往返商务旅客', requiredDocs: ['护照首页扫描件', '2 寸白底照片电子版', '行程单'] },
-    { destinationCountry: 'VN', country: '越南', flag: '🇻🇳', visaType: 'visa_on_arrival', visaName: '落地签批文', processingDays: 2, basePrice: 180, expressSurcharge: 80, validityMonths: 1, highlight: '最快办理，适合临时出行', requiredDocs: ['护照首页扫描件'] },
-    { destinationCountry: 'VN', country: '越南', flag: '🇻🇳', visaType: 'business_1y', visaName: '商务邀请函签证（1 年多次）', processingDays: 10, basePrice: 980, expressSurcharge: 500, validityMonths: 12, highlight: '需我方协助发邀请函', requiredDocs: ['护照首页扫描件', '照片', '在职证明', '越南公司邀请函'] },
-    { destinationCountry: 'KH', country: '柬埔寨', flag: '🇰🇭', visaType: 'e_visa', visaName: '电子签证 E-visa', processingDays: 3, basePrice: 320, expressSurcharge: 120, validityMonths: 3, requiredDocs: ['护照扫描件', '照片'] },
-    { destinationCountry: 'TH', country: '泰国', flag: '🇹🇭', visaType: 'tourist', visaName: '单次旅游签证', processingDays: 5, basePrice: 280, expressSurcharge: 150, validityMonths: 3, requiredDocs: ['护照原件', '2 寸白底照片', '身份证复印件', '在职证明'] },
+    { destinationCountry: 'VN', country: '越南', flag: '🇻🇳', photo: 'https://images.unsplash.com/photo-1559592413-7cec4d0cae2b?w=600&h=400&fit=crop', visaType: 'e_visa', visaName: '电子签证 E-visa · 30 天单次', processingDays: 3, basePrice: 280, expressSurcharge: 150, validityMonths: 1, highlight: '最热销 · 全流程线上', requiredDocs: ['护照首页扫描件', '2 寸白底照片电子版'] },
+    { destinationCountry: 'VN', country: '越南', flag: '🇻🇳', photo: 'https://images.unsplash.com/photo-1557750255-c76072a7fdf1?w=600&h=400&fit=crop', visaType: 'e_visa_90d', visaName: '电子签证 E-visa · 90 天多次', processingDays: 5, basePrice: 680, expressSurcharge: 300, validityMonths: 3, highlight: '适合多次往返商务旅客', requiredDocs: ['护照首页扫描件', '2 寸白底照片电子版', '行程单'] },
+    { destinationCountry: 'VN', country: '越南', flag: '🇻🇳', photo: 'https://images.unsplash.com/photo-1583417319070-4a69db38a482?w=600&h=400&fit=crop', visaType: 'visa_on_arrival', visaName: '落地签批文', processingDays: 2, basePrice: 180, expressSurcharge: 80, validityMonths: 1, highlight: '最快办理，适合临时出行', requiredDocs: ['护照首页扫描件'] },
+    { destinationCountry: 'VN', country: '越南', flag: '🇻🇳', photo: 'https://images.unsplash.com/photo-1528127269322-539801943592?w=600&h=400&fit=crop', visaType: 'business_1y', visaName: '商务邀请函签证（1 年多次）', processingDays: 10, basePrice: 980, expressSurcharge: 500, validityMonths: 12, highlight: '需我方协助发邀请函', requiredDocs: ['护照首页扫描件', '照片', '在职证明', '越南公司邀请函'] },
+    { destinationCountry: 'KH', country: '柬埔寨', flag: '🇰🇭', photo: 'https://images.unsplash.com/photo-1563492065599-3520f775eeed?w=600&h=400&fit=crop', visaType: 'e_visa', visaName: '电子签证 E-visa', processingDays: 3, basePrice: 320, expressSurcharge: 120, validityMonths: 3, requiredDocs: ['护照扫描件', '照片'] },
+    { destinationCountry: 'TH', country: '泰国', flag: '🇹🇭', photo: 'https://images.unsplash.com/photo-1508009603885-50cf7c579365?w=600&h=400&fit=crop', visaType: 'tourist', visaName: '单次旅游签证', processingDays: 5, basePrice: 280, expressSurcharge: 150, validityMonths: 3, requiredDocs: ['护照原件', '2 寸白底照片', '身份证复印件', '在职证明'] },
   ];
 
   for (const v of VISAS) {

@@ -7,7 +7,7 @@ import { useCart } from '../stores/cart';
 function visaApiToMock(v: Visa): MockVisa {
   return {
     id: v.id, country: v.country ?? v.destinationCountry, countryCode: v.destinationCountry,
-    flag: v.flag ?? '🌐', type: v.visaName ?? v.visaType,
+    flag: v.flag ?? '🌐', photo: v.photo ?? '', type: v.visaName ?? v.visaType,
     processingDays: v.processingDays, basePrice: Number(v.basePrice),
     expressSurcharge: v.expressSurcharge ? Number(v.expressSurcharge) : 0,
     requiredDocs: v.requiredDocs, validityMonths: v.validityMonths ?? 1,
@@ -73,14 +73,23 @@ export function VisasPage() {
 
       <section className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
         {filtered.map((v) => (
-          <article key={v.id} className="card hover:shadow-md transition cursor-pointer" onClick={() => setSelected(v)}>
-            <div className="flex items-start justify-between">
-              <span className="text-5xl">{v.flag}</span>
-              <span className="rounded bg-blue-100 px-2 py-0.5 text-xs font-semibold text-blue-700">
+          <article key={v.id} className="card hover:shadow-md transition cursor-pointer overflow-hidden p-0" onClick={() => setSelected(v)}>
+            <div className="relative h-40 w-full overflow-hidden bg-slate-100">
+              {v.photo ? (
+                <img
+                  src={v.photo}
+                  alt={v.country}
+                  className="h-full w-full object-cover"
+                  onError={(e) => { e.currentTarget.style.display = 'none'; }}
+                />
+              ) : null}
+              <span className="absolute left-3 top-3 text-3xl drop-shadow">{v.flag}</span>
+              <span className="absolute right-3 top-3 rounded bg-blue-100 px-2 py-0.5 text-xs font-semibold text-blue-700">
                 {v.processingDays} 天出签
               </span>
             </div>
-            <h3 className="mt-3 font-semibold text-slate-900">{v.country}</h3>
+            <div className="p-4">
+            <h3 className="mt-0 font-semibold text-slate-900">{v.country}</h3>
             <p className="mt-0.5 text-sm text-slate-600">{v.type}</p>
             {v.highlight && (
               <p className="mt-1 text-xs font-medium text-emerald-700">★ {v.highlight}</p>
@@ -95,6 +104,7 @@ export function VisasPage() {
                 )}
               </div>
               <button className="btn-primary text-sm py-1.5">立即办理</button>
+            </div>
             </div>
           </article>
         ))}

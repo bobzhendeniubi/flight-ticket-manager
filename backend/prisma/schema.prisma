@@ -476,6 +476,7 @@ model Visa {
   visaType           String   // e.g., "tourist", "business"
   visaName           String?  // 完整签证名称（"电子签证 E-visa · 30 天单次"）
   flag               String?  // emoji flag
+  photo              String?  // 卡片展示图（URL）
   processingDays     Int
   basePrice          Decimal  @db.Decimal(10, 2)
   expressSurcharge   Decimal? @db.Decimal(10, 2)

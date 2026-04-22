@@ -55,6 +55,7 @@ export const createVisaBodySchema = z.object({
   visaType: z.string().min(1).max(100),
   visaName: z.string().max(200).optional(),
   flag: z.string().max(10).optional(),
+  photo: z.string().url().optional(),
   processingDays: z.number().int().min(0).max(365),
   basePrice: z.number().nonnegative(),
   expressSurcharge: z.number().nonnegative().optional(),

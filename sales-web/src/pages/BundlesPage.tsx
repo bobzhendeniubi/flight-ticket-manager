@@ -17,6 +17,7 @@ function bundleApiToMock(b: ApiBundle): MockBundle {
   const groundTotal = items.filter((i) => i.kind !== 'FLIGHT').reduce((s, i) => s + i.unitPrice * i.qty, 0);
   return {
     id: b.id, name: b.name, tagline: b.tagline ?? '', emoji: b.emoji ?? '🎁',
+    photo: b.photo ?? '',
     items, listPrice: groundTotal, bundlePrice: groundTotal,
     groundDiscount: Number(b.groundDiscount), flightPax: b.flightPax,
     suitableFor: b.suitableFor ?? '', active: b.isActive,
@@ -193,9 +194,21 @@ function ConfigurableBundleCard({
   const total = listTotal - b.groundDiscount;
 
   return (
-    <article className="card">
+    <article className="card overflow-hidden p-0">
+      {b.photo ? (
+        <div className="relative h-44 w-full overflow-hidden bg-slate-100">
+          <img
+            src={b.photo}
+            alt={b.name}
+            className="h-full w-full object-cover"
+            onError={(e) => { e.currentTarget.style.display = 'none'; }}
+          />
+          <span className="absolute left-3 top-3 text-3xl drop-shadow">{b.emoji}</span>
+        </div>
+      ) : null}
+      <div className="p-5">
       <div className="flex flex-wrap items-start gap-4">
-        <span className="text-4xl">{b.emoji}</span>
+        {!b.photo && <span className="text-4xl">{b.emoji}</span>}
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
             <h3 className="font-semibold text-slate-900">{b.name}</h3>
@@ -263,6 +276,7 @@ function ConfigurableBundleCard({
         >
           加入购物车
         </button>
+      </div>
       </div>
     </article>
   );
