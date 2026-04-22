@@ -68,13 +68,30 @@ npm run dev:admin
 
 **演示账号**（密码全部 `Password123!`）：
 
-| 角色 | 邮箱 | 能登录哪 |
-|---|---|---|
-| 管理员 | `admin@ftm.local` | 后台 5174 ✓ + 前台 5173（只浏览，banner 提示去后台） |
-| 1 级代理 | `agent1@ftm.local` | 前台 5173 ✓ |
-| 2 级代理 | `agent2@ftm.local` | 前台 5173 ✓ |
-| 3 级代理 | `agent3@ftm.local` | 前台 5173 ✓ |
-| 客户 | `customer@ftm.local` | 前台 5173 ✓ |
+| 角色 | 邮箱 | 公司 | 归属父级 | 能登录哪 |
+|---|---|---|---|---|
+| 管理员 | `admin@ftm.local` | 世途旅行 | — | 后台 5174 ✓ + 前台 5173 |
+| 1 级代理 | `agent1@ftm.local` | 澳门岘港旅游总代 | 根 | 前台 5173 ✓ |
+| 2 级代理 A | `agent2@ftm.local` | 澳门欢乐旅行社 | 1 级代理 | 前台 5173 ✓ |
+| 2 级代理 B | `agent2b@ftm.local` | 澳门珠江旅行社 | 1 级代理 | 前台 5173 ✓ |
+| 3 级代理 A | `agent3@ftm.local` | 澳门威尼斯人门店 | 2 级代理 A | 前台 5173 ✓ |
+| 3 级代理 B | `agent3b@ftm.local` | 澳门新口岸营业部 | 2 级代理 A | 前台 5173 ✓ |
+| 3 级代理 C | `agent3c@ftm.local` | 氹仔旅游服务中心 | 2 级代理 B | 前台 5173 ✓ |
+| 客户 | `customer@ftm.local` | — | — | 前台 5173 ✓ |
+
+**代理树拓扑**：
+```
+admin (世途)
+└── agent1 (1 级 · 岘港总代)
+    ├── agent2 (2A · 欢乐)
+    │   ├── agent3 (3A · 威尼斯人)
+    │   └── agent3b (3B · 新口岸)
+    └── agent2b (2B · 珠江)
+        └── agent3c (3C · 氹仔)
+```
+
+**演示 RBAC 建议**：用 agent1 登录 → 看到全部 5 个下级的订单/结算；
+用 agent2 → 只看自己 + agent3 + agent3b（不能看 agent2b 那一支）。
 
 ---
 

@@ -164,15 +164,70 @@ async function main() {
     },
   });
 
+  // ── 更多 demo 代理（扩展树，展示多分支结构）──
+  //  agent1 (tier1)
+  //   ├── agent2 (tier2)  → agent3 / agent3b
+  //   └── agent2b (tier2) → agent3c
+  const demoAgents: Array<{
+    email: string;
+    displayName: string;
+    companyName: string;
+    contactName: string;
+    contactPhone: string;
+    prepaymentBalance: number;
+    tier: number;
+    parentAgentId: string | null;
+  }> = [
+    // 2 级分支 B — 独立 2 级代理（agent1 的另一下级）
+    { email: 'agent2b@ftm.local', displayName: '2级代理 · 分店 B', companyName: '澳门珠江旅行社', contactName: '林经理', contactPhone: '+85366000012', prepaymentBalance: 18000, tier: 2, parentAgentId: agent1.id },
+    // 3 级分支 B — agent2 的另一下级
+    { email: 'agent3b@ftm.local', displayName: '3级代理 · 新口岸门店', companyName: '澳门新口岸营业部', contactName: '王店长', contactPhone: '+85366000013', prepaymentBalance: 4000, tier: 3, parentAgentId: agent2.id },
+    // 3 级分支 C — agent2b 的下级
+    { email: 'agent3c@ftm.local', displayName: '3级代理 · 氹仔门店', companyName: '氹仔旅游服务中心', contactName: '陈主任', contactPhone: '+85366000014', prepaymentBalance: 3500, tier: 3, parentAgentId: null /* 填在下方 */ },
+  ];
+
+  // 先建 2 级代理，再建 3 级（3 级需要引用 2 级 id）
+  const agent2b = await upsertAgent(demoAgents[0]);
+  const agent3b = await upsertAgent(demoAgents[1]);
+  demoAgents[2].parentAgentId = agent2b.id;
+  const agent3c = await upsertAgent(demoAgents[2]);
+
+  async function upsertAgent(cfg: typeof demoAgents[0]) {
+    const u = await prisma.user.upsert({
+      where: { email: cfg.email },
+      update: {},
+      create: {
+        email: cfg.email, passwordHash: hash, role: UserRole.AGENT,
+        displayName: cfg.displayName, emailVerified: true,
+      },
+    });
+    return prisma.agent.upsert({
+      where: { userId: u.id },
+      update: {},
+      create: {
+        userId: u.id,
+        companyName: cfg.companyName,
+        contactName: cfg.contactName,
+        contactPhone: cfg.contactPhone,
+        prepaymentBalance: cfg.prepaymentBalance,
+        parentAgentId: cfg.parentAgentId,
+        tier: cfg.tier,
+      },
+    });
+  }
+
   // ── CommissionRule 默认费率（按产品类型 + 层级） ──
   // 不变式：child rate ≤ parent rate
   // 1 级 FLIGHT 10% / HOTEL 8% / TRANSFER 15% / VISA 12%
   // 2 级 FLIGHT 6%  / HOTEL 5% / TRANSFER 10% / VISA 8%
   // 3 级 FLIGHT 3%  / HOTEL 3% / TRANSFER 6%  / VISA 5%
   const commissionSeed: Array<{ agentId: string; rates: Record<'FLIGHT'|'HOTEL'|'TRANSFER'|'VISA', number> }> = [
-    { agentId: agent1.id, rates: { FLIGHT: 0.10, HOTEL: 0.08, TRANSFER: 0.15, VISA: 0.12 } },
-    { agentId: agent2.id, rates: { FLIGHT: 0.06, HOTEL: 0.05, TRANSFER: 0.10, VISA: 0.08 } },
-    { agentId: agent3.id, rates: { FLIGHT: 0.03, HOTEL: 0.03, TRANSFER: 0.06, VISA: 0.05 } },
+    { agentId: agent1.id,  rates: { FLIGHT: 0.10, HOTEL: 0.08, TRANSFER: 0.15, VISA: 0.12 } },
+    { agentId: agent2.id,  rates: { FLIGHT: 0.06, HOTEL: 0.05, TRANSFER: 0.10, VISA: 0.08 } },
+    { agentId: agent2b.id, rates: { FLIGHT: 0.06, HOTEL: 0.05, TRANSFER: 0.10, VISA: 0.08 } },
+    { agentId: agent3.id,  rates: { FLIGHT: 0.03, HOTEL: 0.03, TRANSFER: 0.06, VISA: 0.05 } },
+    { agentId: agent3b.id, rates: { FLIGHT: 0.03, HOTEL: 0.03, TRANSFER: 0.06, VISA: 0.05 } },
+    { agentId: agent3c.id, rates: { FLIGHT: 0.03, HOTEL: 0.03, TRANSFER: 0.06, VISA: 0.05 } },
   ];
   for (const { agentId, rates } of commissionSeed) {
     for (const [productKind, rate] of Object.entries(rates)) {
@@ -382,8 +437,11 @@ async function main() {
     admin: admin.email,
     customer: customer.email,
     '1级代理': agent1User.email,
-    '2级代理(父=1级)': agent2User.email,
-    '3级代理(父=2级)': agent3User.email,
+    '2级代理 A (父=1级)': agent2User.email,
+    '2级代理 B (父=1级)': 'agent2b@ftm.local',
+    '3级代理 A (父=2A)': agent3User.email,
+    '3级代理 B (父=2A)': 'agent3b@ftm.local',
+    '3级代理 C (父=2B)': 'agent3c@ftm.local',
     航班: FLIGHT_SEED.map((f) => `${f.flightNumber} (${f.origin}→${f.dest})`).join(', '),
     新增班次: newSchedules,
     新增日期等级: newRankings,
