@@ -248,16 +248,22 @@ export class SettlementService {
   async list(query: ListSettlementsQuery, requester: SettlementRequester) {
     const where: Prisma.SettlementWhereInput = {};
 
+    let visibleAgentIds: string[] | null = null;
     if (requester.role === 'AGENT') {
-      // 代理仅看自己 + 下级的结算单
-      const ids = await getDescendantAgentIds(requester.agentId);
-      where.agentId = { in: ids };
+      visibleAgentIds = await getDescendantAgentIds(requester.agentId);
+      where.agentId = { in: visibleAgentIds };
     } else if (requester.role === 'CUSTOMER') {
       throw new ForbiddenError('客户无权查看结算单');
     }
 
     if (query.period) where.period = query.period;
-    if (query.agentId) where.agentId = query.agentId;
+    if (query.agentId) {
+      // 防横向越权：query.agentId 必须在可见集合内
+      if (visibleAgentIds !== null && !visibleAgentIds.includes(query.agentId)) {
+        throw new ForbiddenError('无权查看该代理的结算单');
+      }
+      where.agentId = query.agentId;
+    }
     if (query.status) where.status = query.status;
 
     const [rows, total] = await prisma.$transaction([

@@ -26,6 +26,10 @@ import { OrderService } from '../orders/orders.service.js';
 export interface PaymentRequester {
   userId: string;
   role: string;
+  /** 当前登录代理的 agentId（如果是 AGENT） */
+  agentId?: string;
+  /** 系统操作（支付回调）vs 真实用户 */
+  actorType?: 'USER' | 'SYSTEM';
 }
 
 export class PaymentsService {
@@ -42,9 +46,16 @@ export class PaymentsService {
     const order = await prisma.order.findUnique({ where: { id: body.orderId } });
     if (!order) throw new NotFoundError('订单不存在');
 
-    // 权限：客户只能付自己的单；ADMIN/STAFF 全部
+    // 权限：客户只能付自己的单；代理只能付自己+下级的单；ADMIN/STAFF 全部
     if (requester.role === 'CUSTOMER' && order.userId !== requester.userId) {
       throw new ForbiddenError('无权支付该订单');
+    }
+    if (requester.role === 'AGENT') {
+      if (!order.agentId) throw new ForbiddenError('无权支付该订单（非代理单）');
+      const descendantIds = await getDescendantAgentIds(requester.agentId);
+      if (!descendantIds.includes(order.agentId)) {
+        throw new ForbiddenError('无权支付该订单');
+      }
     }
 
     if (order.status !== OrderStatus.PENDING_PAYMENT) {
@@ -142,7 +153,7 @@ export class PaymentsService {
       return { ok: false, reason: `payment already ${payment.status}` };
     }
 
-    // 金额校验
+    // 金额校验（不匹配直接拒，不落 FAILED —— 外部可能重试）
     if (verification.amountYuan !== undefined && Math.abs(Number(payment.amount) - verification.amountYuan) > 0.01) {
       await prisma.payment.update({
         where: { id: payment.id },
@@ -151,39 +162,64 @@ export class PaymentsService {
       return { ok: false, reason: `amount mismatch (expected ${payment.amount}, got ${verification.amountYuan})` };
     }
 
-    // 订单状态：如果已 CANCELLED，资金要退回（暂先标 REFUNDED 不继续）
+    // 订单已 CANCELLED/PAYMENT_TIMEOUT：资金要退回
     if (payment.order.status === OrderStatus.CANCELLED || payment.order.status === OrderStatus.PAYMENT_TIMEOUT) {
       await prisma.payment.update({
         where: { id: payment.id },
-        data: { status: PaymentStatus.REFUNDED, paidAt: new Date(), gatewayPayload: (verification.rawPayload ?? null) as Prisma.InputJsonValue },
+        data: {
+          status: PaymentStatus.REFUNDED,
+          paidAt: new Date(),
+          gatewayPayload: (verification.rawPayload ?? null) as Prisma.InputJsonValue,
+        },
       });
       throw new ConflictError(`订单已 ${payment.order.status}，资金将原路退回`);
     }
 
-    // 标 Payment → SUCCEEDED，然后转 Order → PAID
-    await prisma.payment.update({
-      where: { id: payment.id },
-      data: {
-        status: PaymentStatus.SUCCEEDED,
-        paidAt: verification.paidAt ?? new Date(),
-        transactionId: verification.transactionId ?? payment.transactionId,
-        gatewayPayload: (verification.rawPayload ?? null) as Prisma.InputJsonValue,
-      },
-    });
+    // ── 原子事务：Payment SUCCEEDED + Order PAID + 佣金 + 履约任务 一起成功或一起回滚 ──
+    const pendingFulfillmentTaskIds: string[] = [];
+    try {
+      await prisma.$transaction(async (tx) => {
+        // 1. Payment → SUCCEEDED (CAS 防并发)
+        const casPayment = await tx.payment.updateMany({
+          where: { id: payment.id, status: PaymentStatus.PENDING },
+          data: {
+            status: PaymentStatus.SUCCEEDED,
+            paidAt: verification.paidAt ?? new Date(),
+            transactionId: verification.transactionId ?? payment.transactionId,
+            gatewayPayload: (verification.rawPayload ?? null) as Prisma.InputJsonValue,
+          },
+        });
+        if (casPayment.count !== 1) {
+          throw new ConflictError('payment status changed during callback');
+        }
 
-    // 订单流转：用 SYSTEM 身份操作
-    if (payment.order.status === OrderStatus.PENDING_PAYMENT) {
-      try {
-        await this.orderService.updateStatus(
-          payment.orderId,
-          OrderStatus.PAID,
-          { userId: 'system-payment-gateway', role: 'ADMIN' },
-          `支付成功（${method}，txId=${verification.transactionId}）`,
-        );
-      } catch (e) {
-        // 已扣款但订单无法转 PAID（罕见；可能是并发）：运营需要手工介入
-        // eslint-disable-next-line no-console
-        console.error('[payments] payment SUCCEEDED but order advance failed:', e);
+        // 2. Order → PAID（若仍在 PENDING_PAYMENT；共用同一事务）
+        if (payment.order.status === OrderStatus.PENDING_PAYMENT) {
+          await this.orderService._updateStatusWithinTx(
+            tx,
+            payment.orderId,
+            OrderStatus.PAID,
+            { userId: 'system-payment-gateway', role: 'ADMIN', actorType: 'SYSTEM' },
+            `支付成功（${method}，txId=${verification.transactionId}）`,
+            pendingFulfillmentTaskIds,
+          );
+        }
+      });
+    } catch (e) {
+      // 事务回滚：Payment 仍 PENDING，不会出现"已扣款但订单未推进"的状态分叉
+      // eslint-disable-next-line no-console
+      console.error('[payments] atomic callback transaction failed:', e);
+      throw e; // 让网关看到 5xx 以便重试；或上游视情况兜底
+    }
+
+    // 事务外 enqueue fulfillment（jobId 用 taskId 做去重）
+    if (pendingFulfillmentTaskIds.length > 0 && process.env.ENABLE_AUTO_FULFILLMENT === 'true') {
+      const { fulfillmentQueue } = await import('../../queues/queue.js');
+      for (const taskId of pendingFulfillmentTaskIds) {
+        void fulfillmentQueue.add('auto-fulfill', { taskId }, { jobId: taskId, delay: 1000 }).catch((e) => {
+          // eslint-disable-next-line no-console
+          console.error('[payments] failed to enqueue fulfillment task:', e);
+        });
       }
     }
 
@@ -198,4 +234,20 @@ function adapterSlug(method: PaymentMethod): string {
     case PaymentMethod.BANK_CARD: return 'bankcard';
     case PaymentMethod.AGENT_PREPAYMENT: return 'prepayment';
   }
+}
+
+// 查自己 + 所有后代代理 id（递归 BFS）
+async function getDescendantAgentIds(agentId: string | undefined): Promise<string[]> {
+  if (!agentId) return [];
+  const ids = new Set<string>([agentId]);
+  let frontier: string[] = [agentId];
+  while (frontier.length) {
+    const children = await prisma.agent.findMany({
+      where: { parentAgentId: { in: frontier } },
+      select: { id: true },
+    });
+    frontier = children.map((c) => c.id).filter((id) => !ids.has(id));
+    frontier.forEach((id) => ids.add(id));
+  }
+  return Array.from(ids);
 }

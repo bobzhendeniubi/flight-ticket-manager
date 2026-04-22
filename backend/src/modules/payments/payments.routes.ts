@@ -6,7 +6,7 @@
  *   GET  /payments/:id                      查询支付状态（登录用户）
  */
 import type { FastifyPluginAsync } from 'fastify';
-import { PaymentMethod } from '@prisma/client';
+import { PaymentMethod, UserRole } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import {
   BadRequestError,
@@ -53,13 +53,38 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
     const { id } = req.params as { id: string };
     const p = await prisma.payment.findUnique({
       where: { id },
-      include: { order: { select: { id: true, orderNumber: true, userId: true, status: true } } },
+      include: {
+        order: { select: { id: true, orderNumber: true, userId: true, agentId: true, status: true } },
+      },
     });
     if (!p) throw new NotFoundError('支付不存在');
 
-    // 权限：客户只能看自己的
+    // 权限：客户只能看自己的；代理只能看自己+下级的；ADMIN/STAFF 全部
     if (req.user.role === 'CUSTOMER' && p.order.userId !== req.user.sub) {
       throw new NotFoundError('支付不存在');
+    }
+    if (req.user.role === 'AGENT') {
+      const agent = await prisma.agent.findUnique({
+        where: { userId: req.user.sub },
+        select: { id: true },
+      });
+      if (!agent || !p.order.agentId) {
+        throw new NotFoundError('支付不存在');
+      }
+      // 递归查可见代理集合
+      const visible = new Set<string>([agent.id]);
+      let frontier = [agent.id];
+      while (frontier.length) {
+        const kids = await prisma.agent.findMany({
+          where: { parentAgentId: { in: frontier } },
+          select: { id: true },
+        });
+        frontier = kids.map((k) => k.id).filter((id) => !visible.has(id));
+        frontier.forEach((id) => visible.add(id));
+      }
+      if (!visible.has(p.order.agentId)) {
+        throw new NotFoundError('支付不存在');
+      }
     }
 
     return {
@@ -111,33 +136,39 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
     return reply.send({ code: 'SUCCESS' });
   });
 
-  // ── 沙箱测试口（仅 PAYMENT_MODE != live 时启用）─────────
-  app.post('/sandbox-confirm', async (req, reply) => {
-    if ((process.env.PAYMENT_MODE ?? 'sandbox') === 'live') {
-      throw new NotFoundError(); // 生产环境 404
-    }
-    const body = sandboxConfirmBodySchema.parse(req.body);
+  // ── 沙箱测试口 — 仅 development 环境 + ADMIN，生产一律 404 ─────
+  app.post(
+    '/sandbox-confirm',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN)] },
+    async (req, reply) => {
+      // 生产环境（NODE_ENV=production）一律 404 — 防止部署时 PAYMENT_MODE 忘改
+      if (process.env.NODE_ENV === 'production') {
+        throw new NotFoundError();
+      }
+      if ((process.env.PAYMENT_MODE ?? 'sandbox') === 'live') {
+        throw new NotFoundError();
+      }
+      const body = sandboxConfirmBodySchema.parse(req.body);
 
-    if (body.shouldFail) {
-      // 直接标 FAILED
-      await prisma.payment.update({
-        where: { id: body.paymentId },
-        data: { status: 'FAILED' },
+      if (body.shouldFail) {
+        await prisma.payment.update({
+          where: { id: body.paymentId },
+          data: { status: 'FAILED' },
+        });
+        return reply.send({ ok: false, message: 'marked FAILED' });
+      }
+
+      const fakeHeaders = { 'x-sandbox-secret': process.env.SANDBOX_WEBHOOK_SECRET ?? 'sandbox-test-secret' };
+      const p = await prisma.payment.findUnique({ where: { id: body.paymentId } });
+      if (!p) throw new NotFoundError('支付不存在');
+
+      const result = await service.handleCallback(p.method, fakeHeaders, {
+        paymentId: body.paymentId,
+        transactionId: body.transactionId ?? p.transactionId,
+        amountYuan: body.amountYuan ?? Number(p.amount),
       });
-      return reply.send({ ok: false, message: 'marked FAILED' });
-    }
 
-    // 注入 sandbox 签名让 adapter 通过验签
-    const fakeHeaders = { 'x-sandbox-secret': process.env.SANDBOX_WEBHOOK_SECRET ?? 'sandbox-test-secret' };
-    const p = await prisma.payment.findUnique({ where: { id: body.paymentId } });
-    if (!p) throw new NotFoundError('支付不存在');
-
-    const result = await service.handleCallback(p.method, fakeHeaders, {
-      paymentId: body.paymentId,
-      transactionId: body.transactionId ?? p.transactionId,
-      amountYuan: body.amountYuan ?? Number(p.amount),
-    });
-
-    return reply.send(result);
-  });
+      return reply.send(result);
+    },
+  );
 };

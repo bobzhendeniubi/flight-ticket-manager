@@ -15,7 +15,10 @@ const EnvSchema = z.object({
   JWT_ACCESS_TTL: z.coerce.number().int().positive().default(3600), // seconds
   JWT_REFRESH_TTL: z.coerce.number().int().positive().default(60 * 60 * 24 * 30),
 
-  CORS_ORIGIN: z.string().default('*'),
+  // CORS_ORIGINS (plural) — 逗号分隔列表；生产禁止 * 通配符
+  // 向后兼容：优先读 CORS_ORIGINS，回退读 CORS_ORIGIN
+  CORS_ORIGINS: z.string().optional(),
+  CORS_ORIGIN: z.string().optional(),
 
   WECHAT_APP_ID: z.string().optional(),
   WECHAT_APP_SECRET: z.string().optional(),
@@ -40,7 +43,13 @@ function loadEnv(): Env {
 
 export const env = loadEnv();
 
+const rawCorsOrigins = env.CORS_ORIGINS ?? env.CORS_ORIGIN ?? (env.NODE_ENV === 'production' ? '' : '*');
+if (env.NODE_ENV === 'production' && (rawCorsOrigins === '*' || !rawCorsOrigins.trim())) {
+  // eslint-disable-next-line no-console
+  console.error('❌ CORS_ORIGINS must be set to explicit origins in production (wildcard denied)');
+  process.exit(1);
+}
 export const corsOrigins =
-  env.CORS_ORIGIN === '*'
+  rawCorsOrigins === '*'
     ? true
-    : env.CORS_ORIGIN.split(',').map((s) => s.trim()).filter(Boolean);
+    : rawCorsOrigins.split(',').map((s) => s.trim()).filter(Boolean);

@@ -78,6 +78,8 @@ export interface OrderRequester {
   role: UserRole;
   /** 当前登录代理的 agentId（如果是 AGENT） */
   agentId?: string;
+  /** 显式区分系统操作（支付回调 / cron）与真实用户，而非靠 userId 字符串前缀 */
+  actorType?: 'USER' | 'SYSTEM';
 }
 
 export class OrderService {
@@ -118,17 +120,30 @@ export class OrderService {
     // 生成订单号（有极小概率撞 unique，重试 3 次）
     const orderNumber = await generateOrderNumber();
 
-    // 事务：写订单 + 扣座位 + 写状态事件
+    // 事务：原子扣座位（CAS 防超卖）→ 写订单 → 写事件
     const order = await prisma.$transaction(async (tx) => {
-      // 再次 double-check 余票（防并发）
+      // 用 updateMany 的 where 条件做原子"检查+扣减"一步到位，避免 TOCTOU
+      // where: `sold + qty <= capacity` 等价于 Prisma-expressible `capacity - qty >= sold`
+      // 但 Prisma raw 不支持这种 cross-column where；用 sold + qty <= capacity 需要
+      // SQL 函数，改用 raw SQL 保证原子性。
       for (const p of pricedItems) {
         if (p.kind !== 'FLIGHT') continue;
-        const sc = await tx.flightSeatClass.findFirstOrThrow({
-          where: { scheduleId: p.flightScheduleId!, cabin: p.flightCabin! },
-        });
-        if (sc.capacity - sc.sold < p.quantity) {
+        const affected = await tx.$executeRaw`
+          UPDATE "FlightSeatClass"
+          SET sold = sold + ${p.quantity}, "updatedAt" = NOW()
+          WHERE "scheduleId" = ${p.flightScheduleId}
+            AND cabin = ${p.flightCabin}::"CabinClass"
+            AND sold + ${p.quantity} <= capacity
+        `;
+        if (affected !== 1) {
+          // 查当前库存给更友好的错误消息
+          const sc = await tx.flightSeatClass.findFirst({
+            where: { scheduleId: p.flightScheduleId!, cabin: p.flightCabin! },
+            select: { capacity: true, sold: true },
+          });
+          const available = sc ? sc.capacity - sc.sold : 0;
           throw new ConflictError(
-            `${p.flightCabin} 余票不足：需要 ${p.quantity} 张，仅剩 ${sc.capacity - sc.sold} 张`,
+            `${p.flightCabin} 余票不足：需要 ${p.quantity} 张，仅剩 ${available} 张（并发抢占）`,
           );
         }
       }
@@ -182,15 +197,7 @@ export class OrderService {
         include: { items: true, passengers: true, statusEvents: true },
       });
 
-      // 扣座位
-      for (const p of pricedItems) {
-        if (p.kind !== 'FLIGHT') continue;
-        await tx.flightSeatClass.updateMany({
-          where: { scheduleId: p.flightScheduleId!, cabin: p.flightCabin! },
-          data: { sold: { increment: p.quantity } },
-        });
-      }
-
+      // 座位已在订单 create 之前原子扣减；此处无需再动库存
       return created;
     });
 
@@ -242,44 +249,93 @@ export class OrderService {
           },
         });
       } else if (item.kind === 'HOTEL') {
+        // 服务端权威定价：有 hotelRoomTypeId 就从 DB 查，不信任前端 unitPrice
+        let unitPrice = item.unitPrice;
+        if (item.hotelRoomTypeId) {
+          const rt = await prisma.hotelRoomType.findUnique({
+            where: { id: item.hotelRoomTypeId },
+            select: { basePrice: true, hotel: { select: { isActive: true } } },
+          });
+          if (!rt) throw new NotFoundError(`酒店房型 ${item.hotelRoomTypeId} 不存在`);
+          if (!rt.hotel.isActive) throw new BadRequestError('酒店已下架');
+          unitPrice = Number(rt.basePrice);
+        }
         priced.push({
           kind: 'HOTEL',
           description: item.description,
           quantity: item.quantity,
-          unitPrice: item.unitPrice,
-          amount: Math.round(item.unitPrice * item.quantity),
+          unitPrice,
+          amount: Math.round(unitPrice * item.quantity),
           hotelRoomTypeId: item.hotelRoomTypeId,
           hotelCheckIn: item.checkIn ? new Date(item.checkIn) : undefined,
           hotelCheckOut: item.checkOut ? new Date(item.checkOut) : undefined,
           metadata: item.metadata,
         });
       } else if (item.kind === 'TRANSFER') {
+        let unitPrice = item.unitPrice;
+        if (item.transferId) {
+          const t = await prisma.transfer.findUnique({
+            where: { id: item.transferId },
+            select: { basePrice: true, isActive: true },
+          });
+          if (!t) throw new NotFoundError(`接送产品 ${item.transferId} 不存在`);
+          if (!t.isActive) throw new BadRequestError('接送产品已下架');
+          unitPrice = Number(t.basePrice);
+        }
         priced.push({
           kind: 'TRANSFER',
           description: item.description,
           quantity: item.quantity,
-          unitPrice: item.unitPrice,
-          amount: Math.round(item.unitPrice * item.quantity),
+          unitPrice,
+          amount: Math.round(unitPrice * item.quantity),
           transferId: item.transferId,
           metadata: item.metadata,
         });
       } else if (item.kind === 'VISA') {
+        let unitPrice = item.unitPrice;
+        if (item.visaId) {
+          const v = await prisma.visa.findUnique({
+            where: { id: item.visaId },
+            select: { basePrice: true, expressSurcharge: true, isActive: true },
+          });
+          if (!v) throw new NotFoundError(`签证产品 ${item.visaId} 不存在`);
+          if (!v.isActive) throw new BadRequestError('签证产品已下架');
+          const baseUnitPrice = Number(v.basePrice);
+          const express = Boolean(item.metadata?.express);
+          unitPrice = express && v.expressSurcharge
+            ? baseUnitPrice + Number(v.expressSurcharge)
+            : baseUnitPrice;
+        }
         priced.push({
           kind: 'VISA',
           description: item.description,
           quantity: item.quantity,
-          unitPrice: item.unitPrice,
-          amount: Math.round(item.unitPrice * item.quantity),
+          unitPrice,
+          amount: Math.round(unitPrice * item.quantity),
           visaId: item.visaId,
           metadata: item.metadata,
         });
       } else if (item.kind === 'BUNDLE') {
+        // BUNDLE：服务端重算套餐价（items 从 DB 取 + groundDiscount）
+        const bundle = await prisma.bundle.findUnique({
+          where: { id: item.bundleId },
+          select: { items: true, groundDiscount: true, isActive: true },
+        });
+        if (!bundle) throw new NotFoundError(`套餐 ${item.bundleId} 不存在`);
+        if (!bundle.isActive) throw new BadRequestError('套餐已下架');
+        // 地面部分价：sum(items[kind!==FLIGHT].qty * unitPrice) - groundDiscount
+        // （机票部分留给 FLIGHT item 单独动态定价）
+        const bundleItems = (bundle.items as Array<{ kind: string; qty: number; unitPrice: number }>) ?? [];
+        const groundTotal = bundleItems
+          .filter((b) => b.kind !== 'FLIGHT')
+          .reduce((s, b) => s + b.qty * b.unitPrice, 0);
+        const bundleUnitPrice = Math.max(0, Math.round(groundTotal - Number(bundle.groundDiscount)));
         priced.push({
           kind: 'BUNDLE',
           description: item.description,
           quantity: item.quantity,
-          unitPrice: item.unitPrice,
-          amount: Math.round(item.unitPrice * item.quantity),
+          unitPrice: bundleUnitPrice,
+          amount: bundleUnitPrice * item.quantity,
           bundleId: item.bundleId,
           metadata: item.metadata,
         });
@@ -295,18 +351,24 @@ export class OrderService {
   async listOrders(query: ListOrdersQuery, requester: OrderRequester) {
     const where: Prisma.OrderWhereInput = {};
 
-    // RBAC 过滤
+    // RBAC 过滤 — 先建基准可见集合，再按 query 过滤（但 query.agentId 不能覆盖可见集合）
+    let visibleAgentIds: string[] | null = null; // null = 无限制（ADMIN/STAFF）
     if (requester.role === 'CUSTOMER') {
       where.userId = requester.userId;
     } else if (requester.role === 'AGENT') {
-      // 本人 + 所有下级代理
-      const descendantIds = await this.getDescendantAgentIds(requester.agentId);
-      where.agentId = { in: descendantIds };
+      visibleAgentIds = await this.getDescendantAgentIds(requester.agentId);
+      where.agentId = { in: visibleAgentIds };
     }
-    // ADMIN/STAFF: 无额外过滤
+    // ADMIN/STAFF: visibleAgentIds 保持 null，无额外过滤
 
     if (query.status) where.status = query.status;
-    if (query.agentId) where.agentId = query.agentId;
+    if (query.agentId) {
+      // agentId 过滤 — 必须在可见集合内才生效，否则 403（防横向越权）
+      if (visibleAgentIds !== null && !visibleAgentIds.includes(query.agentId)) {
+        throw new ForbiddenError('无权查看该代理的订单');
+      }
+      where.agentId = query.agentId;
+    }
     if (query.kind) where.items = { some: { kind: query.kind } };
     if (query.from || query.to) {
       where.createdAt = {
@@ -374,7 +436,41 @@ export class OrderService {
     requester: OrderRequester,
     reason?: string,
   ) {
-    const order = await prisma.order.findUnique({
+    // 收集事务里创建的任务 id，提交后再入队（避免 worker 在 tx 提交前查不到）
+    const pendingFulfillmentTaskIds: string[] = [];
+
+    const updated = await prisma.$transaction(async (tx) => {
+      return this._updateStatusWithinTx(tx, id, toStatus, requester, reason, pendingFulfillmentTaskIds);
+    });
+
+    // 事务提交后 enqueue fulfillment jobs（若有）
+    if (pendingFulfillmentTaskIds.length > 0 && process.env.ENABLE_AUTO_FULFILLMENT === 'true') {
+      const { fulfillmentQueue } = await import('../../queues/queue.js');
+      for (const taskId of pendingFulfillmentTaskIds) {
+        // 确定性 jobId = taskId 做去重，防重复 enqueue
+        void fulfillmentQueue.add('auto-fulfill', { taskId }, { jobId: taskId, delay: 1000 }).catch((e) => {
+          // eslint-disable-next-line no-console
+          console.error('[orders] failed to enqueue fulfillment task:', e);
+        });
+      }
+    }
+
+    return serializeOrder(updated);
+  }
+
+  /**
+   * 事务内执行状态流转 —— 供 payments.handleCallback 等外部事务复用。
+   * 调用方负责包 $transaction 且提交后 enqueue newTaskIdsOut 里的任务。
+   */
+  async _updateStatusWithinTx(
+    tx: Prisma.TransactionClient,
+    id: string,
+    toStatus: OrderStatus,
+    requester: OrderRequester,
+    reason: string | undefined,
+    newTaskIdsOut: string[],
+  ) {
+    const order = await tx.order.findUnique({
       where: { id },
       include: { items: true },
     });
@@ -388,89 +484,70 @@ export class OrderService {
       );
     }
 
-    // 收集事务里创建的任务 id，提交后再入队（避免 worker 在 tx 提交前查不到）
-    const pendingFulfillmentTaskIds: string[] = [];
+    const wasHolding = SEAT_HOLDING_STATUSES.includes(order.status);
+    const isReleasing = SEAT_RELEASING_STATUSES.includes(toStatus);
 
-    // 事务：写 Order + 写事件 + 按需调整库存
-    const updated = await prisma.$transaction(async (tx) => {
-      const wasHolding = SEAT_HOLDING_STATUSES.includes(order.status);
-      const isReleasing = SEAT_RELEASING_STATUSES.includes(toStatus);
+    const isSystemActor = requester.actorType === 'SYSTEM' || requester.userId.startsWith('system-');
 
-      // 如果从"占用"转到"释放"，退库存
-      if (wasHolding && isReleasing) {
-        for (const item of order.items) {
-          if (item.kind !== 'FLIGHT' || !item.flightScheduleId || !item.flightCabin) continue;
-          await tx.flightSeatClass.updateMany({
-            where: { scheduleId: item.flightScheduleId, cabin: item.flightCabin },
-            data: { sold: { decrement: item.quantity } },
-          });
-        }
-      }
+    // ── 原子 CAS：where 附加当前状态，防并发重复转移（如两个支付回调同时来）──
+    const extraData: Record<string, unknown> = { status: toStatus };
+    if (toStatus === 'PAID') extraData.paidAmount = order.total;
 
-      // PAID 时补 paidAmount + 自动生成 CommissionRecord（代理层级）
-      const extraData: Prisma.OrderUpdateInput = {};
-      if (toStatus === 'PAID') {
-        extraData.paidAmount = order.total;
-      }
+    const casResult = await tx.order.updateMany({
+      where: { id, status: order.status },
+      data: extraData,
+    });
+    if (casResult.count !== 1) {
+      throw new ConflictError(`订单状态已被并发修改（期望 ${order.status}，请重试）`);
+    }
 
-      // 转到 PAID：创建佣金记录（若有代理）+ 创建 Fulfillment tasks
-      if (toStatus === 'PAID') {
-        if (order.agentId) {
-          await createCommissionsForOrder(tx, order.id, order.agentId);
-        }
-        const newIds = await createFulfillmentTasks(tx, order.id);
-        pendingFulfillmentTaskIds.push(...newIds);
-      }
-
-      // 从 PAID 走到释放态（CANCELLED/REFUNDED/PAYMENT_TIMEOUT/FAILED）：撤销佣金
-      if (isReleasing && wasHolding && order.status !== 'PENDING_PAYMENT') {
-        await tx.commissionRecord.updateMany({
-          where: { orderId: order.id, status: CommissionStatus.ACCRUED },
-          data: { status: CommissionStatus.REVERSED },
-        });
-      }
-
-      // actorUserId 只记录真实用户 id；系统操作（支付网关等）设 null
-      const isSystemActor = requester.userId.startsWith('system-');
-
-      return tx.order.update({
-        where: { id },
-        data: {
-          status: toStatus,
-          ...extraData,
-          statusEvents: {
-            create: {
-              fromStatus: order.status,
-              toStatus,
-              actorUserId: isSystemActor ? null : requester.userId,
-              reason,
-            },
-          },
-        },
-        include: {
-          items: true,
-          passengers: true,
-          payments: true,
-          refunds: true,
-          statusEvents: { orderBy: { createdAt: 'asc' } },
-          agent: { select: { id: true, companyName: true, contactName: true } },
-          user: { select: { id: true, displayName: true, email: true } },
-        },
-      });
+    await tx.orderStatusEvent.create({
+      data: {
+        orderId: id,
+        fromStatus: order.status,
+        toStatus,
+        actorUserId: isSystemActor ? null : requester.userId,
+        reason,
+      },
     });
 
-    // 事务提交后 enqueue fulfillment jobs（若有）
-    if (pendingFulfillmentTaskIds.length > 0 && process.env.ENABLE_AUTO_FULFILLMENT === 'true') {
-      const { fulfillmentQueue } = await import('../../queues/queue.js');
-      for (const taskId of pendingFulfillmentTaskIds) {
-        void fulfillmentQueue.add('auto-fulfill', { taskId }, { delay: 1000 }).catch((e) => {
-          // eslint-disable-next-line no-console
-          console.error('[orders] failed to enqueue fulfillment task:', e);
+    if (wasHolding && isReleasing) {
+      for (const item of order.items) {
+        if (item.kind !== 'FLIGHT' || !item.flightScheduleId || !item.flightCabin) continue;
+        await tx.flightSeatClass.updateMany({
+          where: { scheduleId: item.flightScheduleId, cabin: item.flightCabin },
+          data: { sold: { decrement: item.quantity } },
         });
       }
     }
 
-    return serializeOrder(updated);
+    if (toStatus === 'PAID') {
+      if (order.agentId) {
+        await createCommissionsForOrder(tx, order.id, order.agentId);
+      }
+      const newIds = await createFulfillmentTasks(tx, order.id);
+      newTaskIdsOut.push(...newIds);
+    }
+
+    if (isReleasing && wasHolding && order.status !== 'PENDING_PAYMENT') {
+      await tx.commissionRecord.updateMany({
+        where: { orderId: order.id, status: CommissionStatus.ACCRUED },
+        data: { status: CommissionStatus.REVERSED },
+      });
+    }
+
+    return tx.order.findUniqueOrThrow({
+      where: { id },
+      include: {
+        items: true,
+        passengers: true,
+        payments: true,
+        refunds: true,
+        statusEvents: { orderBy: { createdAt: 'asc' } },
+        agent: { select: { id: true, companyName: true, contactName: true } },
+        user: { select: { id: true, displayName: true, email: true } },
+      },
+    });
   }
 
   // ════════════════════════════════════════════════════════════════════

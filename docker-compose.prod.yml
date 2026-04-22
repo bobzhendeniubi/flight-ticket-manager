@@ -77,7 +77,8 @@ services:
       JWT_REFRESH_TTL: ${JWT_REFRESH_TTL:-604800}
       CORS_ORIGINS: ${CORS_ORIGINS:-https://sales.citur.com,https://admin.citur.com}
       LOG_LEVEL: ${LOG_LEVEL:-info}
-      PAYMENT_MODE: ${PAYMENT_MODE:-sandbox}
+      # 必须显式设置（生产 sandbox 等于公开伪造支付接口，拒绝默认值）
+      PAYMENT_MODE: ${PAYMENT_MODE:?must set PAYMENT_MODE (live|sandbox — live for production)}
       SANDBOX_WEBHOOK_SECRET: ${SANDBOX_WEBHOOK_SECRET:-sandbox-test-secret}
       ENABLE_AUTO_FULFILLMENT: ${ENABLE_AUTO_FULFILLMENT:-true}
     # 启动前自动跑 migration
