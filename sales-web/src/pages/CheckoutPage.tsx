@@ -60,7 +60,6 @@ export function CheckoutPage() {
   // 如果同时买了散票和套餐，取较大值（套餐含机票，乘客是同一批人）
   const effectivePax = bundlePaxCount > 0 ? bundlePaxCount : flightTicketCount;
   const paxMismatch = effectivePax > 0 && passengers.length !== effectivePax;
-  const hasBundle = items.some((i) => i.kind === 'BUNDLE');
 
   if (items.length === 0 && !done) {
     return (
@@ -130,10 +129,6 @@ export function CheckoutPage() {
       setErrorMsg('请填写联系人姓名和手机号');
       return;
     }
-    if (hasBundle) {
-      setErrorMsg('套餐产品暂未接入后端（等 M6 产品模块上线）。请先把套餐从购物车移除，或单独购买组件。');
-      return;
-    }
     if (!tokens?.accessToken) {
       setErrorMsg('登录已失效，请重新登录后再下单');
       return;
@@ -192,7 +187,16 @@ export function CheckoutPage() {
             unitPrice: i.unitPrice,
           }];
         }
-        return []; // BUNDLE 已上面拒绝，不会到这里
+        if (i.kind === 'BUNDLE') {
+          return [{
+            kind: 'BUNDLE',
+            description: i.name,
+            quantity: i.qty,
+            unitPrice: i.unitPrice,
+            bundleId: i.productId,
+          }];
+        }
+        return [];
       }),
       idempotencyKey:
         typeof crypto !== 'undefined' && 'randomUUID' in crypto

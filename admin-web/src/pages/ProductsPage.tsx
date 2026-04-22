@@ -1,22 +1,19 @@
 /**
  * 产品管理 — 4 个 section（酒店 / 接送 / 签证 / 套餐）。
  *
- * 当前数据源：lib/mockData.ts 里的 MOCK_HOTELS / MOCK_TRANSFERS / MOCK_VISAS / MOCK_BUNDLES。
- * 操作（启停 / 新建 / 编辑）只在当前会话生效，刷新后回到默认值。
- * 真接 API 后会改为 backend `/admin/hotels` `/admin/transfers` `/admin/visas` `/admin/bundles`。
+ * 数据源：`/products/{hotels,transfers,visas,bundles}` 真后端。
+ * 所有 CRUD 操作真写入数据库。删除走软删除（isActive=false）。
  */
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
-  MOCK_HOTELS,
-  MOCK_TRANSFERS,
-  MOCK_VISAS,
-  MOCK_BUNDLES,
   type MockHotel,
   type MockTransfer,
   type MockVisa,
   type MockBundle,
   type BundleItem,
 } from '../lib/mockData';
+import { api, ApiError, type Hotel, type Transfer as ApiTransfer, type Visa as ApiVisa, type Bundle as ApiBundle } from '../lib/api';
+import { useAuth } from '../stores/auth';
 
 type Section = 'hotels' | 'transfers' | 'visas' | 'bundles';
 
@@ -27,12 +24,243 @@ const SECTIONS: { key: Section; label: string; emoji: string }[] = [
   { key: 'bundles', label: '套餐 / Bundle', emoji: '🎁' },
 ];
 
+// ─── API → Mock 适配器（保留现有 UI，不改子组件） ───────────────────
+function hotelApiToMock(h: Hotel): MockHotel {
+  return {
+    id: h.id,
+    name: h.name,
+    nameEn: h.nameEn ?? h.name,
+    cityCode: h.cityCode,
+    area: h.area ?? h.address,
+    stars: (h.starRating as 3 | 4 | 5) ?? 4,
+    basePrice: Number(h.basePrice ?? 0),
+    rating: h.rating ? Number(h.rating) : 4.5,
+    reviewCount: h.reviewCount ?? 0,
+    emoji: h.emoji ?? '🏨',
+    photo: h.photos[0] ?? '',
+    amenities: h.amenities,
+    highlight: h.highlight ?? '',
+    roomTypes: h.roomTypes.map((rt) => ({
+      name: rt.name,
+      priceMult: rt.priceMultiplier ? Number(rt.priceMultiplier) : 1,
+      sleeps: rt.capacity,
+      bedType: rt.bedType ?? '',
+    })),
+  };
+}
+
+function transferApiToMock(t: ApiTransfer): MockTransfer {
+  return {
+    id: t.id,
+    name: t.name,
+    vehicleType: t.vehicleType,
+    capacity: t.capacity,
+    basePrice: Number(t.basePrice),
+    originArea: t.originArea,
+    destArea: t.destArea,
+    emoji: t.emoji ?? '🚗',
+    photo: t.photo ?? '',
+    features: t.features,
+    duration: t.duration ?? '',
+  };
+}
+
+function visaApiToMock(v: ApiVisa): MockVisa {
+  return {
+    id: v.id,
+    country: v.country ?? v.destinationCountry,
+    countryCode: v.destinationCountry,
+    flag: v.flag ?? '🌐',
+    type: v.visaName ?? v.visaType,
+    processingDays: v.processingDays,
+    basePrice: Number(v.basePrice),
+    expressSurcharge: v.expressSurcharge ? Number(v.expressSurcharge) : 0,
+    requiredDocs: v.requiredDocs,
+    validityMonths: v.validityMonths ?? 1,
+    highlight: v.highlight ?? undefined,
+  };
+}
+
+function bundleApiToMock(b: ApiBundle): MockBundle {
+  const items = (b.items as BundleItem[]) ?? [];
+  const groundTotal = items.filter((i) => i.kind !== 'FLIGHT').reduce((s, i) => s + i.unitPrice * i.qty, 0);
+  return {
+    id: b.id,
+    name: b.name,
+    tagline: b.tagline ?? '',
+    emoji: b.emoji ?? '🎁',
+    items,
+    listPrice: groundTotal,
+    bundlePrice: groundTotal,
+    groundDiscount: Number(b.groundDiscount),
+    flightPax: b.flightPax,
+    suitableFor: b.suitableFor ?? '',
+    active: b.isActive,
+  };
+}
+
 export function ProductsPage() {
+  const tokens = useAuth((s) => s.tokens);
   const [section, setSection] = useState<Section>('hotels');
-  const [hotels, setHotels] = useState<MockHotel[]>(MOCK_HOTELS);
-  const [transfers, setTransfers] = useState<MockTransfer[]>(MOCK_TRANSFERS);
-  const [visas, setVisas] = useState<MockVisa[]>(MOCK_VISAS);
-  const [bundles, setBundles] = useState<MockBundle[]>(MOCK_BUNDLES);
+  const [hotels, setHotels] = useState<MockHotel[]>([]);
+  const [transfers, setTransfers] = useState<MockTransfer[]>([]);
+  const [visas, setVisas] = useState<MockVisa[]>([]);
+  const [bundles, setBundles] = useState<MockBundle[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    Promise.all([api.listHotels(false), api.listTransfers(false), api.listVisas(false), api.listBundles(false)])
+      .then(([h, t, v, b]) => {
+        if (cancelled) return;
+        setHotels(h.hotels.map(hotelApiToMock));
+        setTransfers(t.transfers.map(transferApiToMock));
+        setVisas(v.visas.map(visaApiToMock));
+        setBundles(b.bundles.map(bundleApiToMock));
+      })
+      .catch((e) => {
+        if (!cancelled) setError(e instanceof ApiError ? e.message : '加载失败');
+      })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, []);
+
+  const tk = tokens?.accessToken ?? '';
+
+  async function persistHotels(next: MockHotel[]) {
+    const prev = hotels;
+    setHotels(next);
+    try {
+      for (const old of prev) if (!next.find((n) => n.id === old.id)) await api.deleteHotel(tk, old.id);
+      for (const n of next) if (!prev.find((p) => p.id === n.id)) {
+        await api.createHotel(tk, {
+          name: n.name, nameEn: n.nameEn, cityCode: n.cityCode, area: n.area,
+          address: n.area, starRating: n.stars, basePrice: n.basePrice,
+          rating: n.rating, reviewCount: n.reviewCount, emoji: n.emoji,
+          highlight: n.highlight, amenities: n.amenities, photos: n.photo ? [n.photo] : [],
+          roomTypes: n.roomTypes.map((rt) => ({
+            name: rt.name, bedType: rt.bedType, capacity: rt.sleeps,
+            basePrice: n.basePrice * rt.priceMult, priceMultiplier: rt.priceMult,
+          })),
+        });
+      }
+      for (const n of next) {
+        const old = prev.find((p) => p.id === n.id);
+        if (old && JSON.stringify(old) !== JSON.stringify(n)) {
+          await api.updateHotel(tk, n.id, {
+            name: n.name, nameEn: n.nameEn, area: n.area, starRating: n.stars,
+            basePrice: n.basePrice, rating: n.rating, reviewCount: n.reviewCount,
+            emoji: n.emoji, highlight: n.highlight, amenities: n.amenities,
+            photos: n.photo ? [n.photo] : [],
+            roomTypes: n.roomTypes.map((rt) => ({
+              name: rt.name, bedType: rt.bedType, capacity: rt.sleeps,
+              basePrice: n.basePrice * rt.priceMult, priceMultiplier: rt.priceMult,
+            })),
+          });
+        }
+      }
+      const fresh = await api.listHotels(false);
+      setHotels(fresh.hotels.map(hotelApiToMock));
+    } catch (e) {
+      alert(e instanceof ApiError ? `保存失败：${e.message}` : '保存失败');
+      setHotels(prev);
+    }
+  }
+
+  async function persistTransfers(next: MockTransfer[]) {
+    const prev = transfers;
+    setTransfers(next);
+    try {
+      for (const old of prev) if (!next.find((n) => n.id === old.id)) await api.deleteTransfer(tk, old.id);
+      for (const n of next) if (!prev.find((p) => p.id === n.id)) {
+        await api.createTransfer(tk, {
+          name: n.name, vehicleType: n.vehicleType, capacity: n.capacity,
+          originArea: n.originArea, destArea: n.destArea, basePrice: n.basePrice,
+          features: n.features, duration: n.duration, emoji: n.emoji, photo: n.photo,
+        });
+      }
+      for (const n of next) {
+        const old = prev.find((p) => p.id === n.id);
+        if (old && JSON.stringify(old) !== JSON.stringify(n)) {
+          await api.updateTransfer(tk, n.id, {
+            name: n.name, vehicleType: n.vehicleType, capacity: n.capacity,
+            originArea: n.originArea, destArea: n.destArea,
+            features: n.features, duration: n.duration, emoji: n.emoji, photo: n.photo,
+          });
+        }
+      }
+      const fresh = await api.listTransfers(false);
+      setTransfers(fresh.transfers.map(transferApiToMock));
+    } catch (e) {
+      alert(e instanceof ApiError ? `保存失败：${e.message}` : '保存失败');
+      setTransfers(prev);
+    }
+  }
+
+  async function persistVisas(next: MockVisa[]) {
+    const prev = visas;
+    setVisas(next);
+    try {
+      for (const old of prev) if (!next.find((n) => n.id === old.id)) await api.deleteVisa(tk, old.id);
+      for (const n of next) if (!prev.find((p) => p.id === n.id)) {
+        await api.createVisa(tk, {
+          destinationCountry: n.countryCode, country: n.country, flag: n.flag,
+          visaType: n.type, visaName: n.type, processingDays: n.processingDays,
+          basePrice: n.basePrice, expressSurcharge: n.expressSurcharge,
+          validityMonths: n.validityMonths, highlight: n.highlight, requiredDocs: n.requiredDocs,
+        });
+      }
+      for (const n of next) {
+        const old = prev.find((p) => p.id === n.id);
+        if (old && JSON.stringify(old) !== JSON.stringify(n)) {
+          await api.updateVisa(tk, n.id, {
+            country: n.country, flag: n.flag, visaName: n.type,
+            processingDays: n.processingDays, expressSurcharge: n.expressSurcharge,
+            validityMonths: n.validityMonths, highlight: n.highlight,
+            requiredDocs: n.requiredDocs,
+          });
+        }
+      }
+      const fresh = await api.listVisas(false);
+      setVisas(fresh.visas.map(visaApiToMock));
+    } catch (e) {
+      alert(e instanceof ApiError ? `保存失败：${e.message}` : '保存失败');
+      setVisas(prev);
+    }
+  }
+
+  async function persistBundles(next: MockBundle[]) {
+    const prev = bundles;
+    setBundles(next);
+    try {
+      for (const old of prev) if (!next.find((n) => n.id === old.id)) await api.deleteBundle(tk, old.id);
+      for (const n of next) if (!prev.find((p) => p.id === n.id)) {
+        await api.createBundle(tk, {
+          name: n.name, tagline: n.tagline, emoji: n.emoji,
+          items: n.items, flightPax: n.flightPax,
+          groundDiscount: n.groundDiscount, suitableFor: n.suitableFor,
+        });
+      }
+      for (const n of next) {
+        const old = prev.find((p) => p.id === n.id);
+        if (old && JSON.stringify(old) !== JSON.stringify(n)) {
+          await api.updateBundle(tk, n.id, {
+            name: n.name, tagline: n.tagline, emoji: n.emoji,
+            items: n.items, flightPax: n.flightPax,
+            groundDiscount: n.groundDiscount, suitableFor: n.suitableFor,
+            isActive: n.active,
+          });
+        }
+      }
+      const fresh = await api.listBundles(false);
+      setBundles(fresh.bundles.map(bundleApiToMock));
+    } catch (e) {
+      alert(e instanceof ApiError ? `保存失败：${e.message}` : '保存失败');
+      setBundles(prev);
+    }
+  }
 
   return (
     <div className="space-y-5">
@@ -42,9 +270,8 @@ export function ProductsPage() {
           维护酒店、机场接送、签证三大基础产品，组合成套餐 (Bundle) 销售。
           套餐可让利定价，提升客单价和打包销售率。
         </p>
-        <div className="mt-2 rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-700">
-          ⓘ Demo 模式：所有变更仅在当前会话生效。真实环境会写入 backend `/admin/{`hotels|transfers|visas|bundles`}`。
-        </div>
+        {loading && <div className="mt-2 rounded-md bg-slate-50 px-3 py-2 text-xs text-slate-500">加载中…</div>}
+        {error && <div className="mt-2 rounded-md bg-red-50 px-3 py-2 text-xs text-red-700">❌ {error}</div>}
       </section>
 
       {/* Tabs */}
@@ -75,11 +302,11 @@ export function ProductsPage() {
         })}
       </nav>
 
-      {section === 'hotels' && <HotelsSection items={hotels} onChange={setHotels} />}
-      {section === 'transfers' && <TransfersSection items={transfers} onChange={setTransfers} />}
-      {section === 'visas' && <VisasSection items={visas} onChange={setVisas} />}
+      {section === 'hotels' && <HotelsSection items={hotels} onChange={persistHotels} />}
+      {section === 'transfers' && <TransfersSection items={transfers} onChange={persistTransfers} />}
+      {section === 'visas' && <VisasSection items={visas} onChange={persistVisas} />}
       {section === 'bundles' && (
-        <BundlesSection items={bundles} onChange={setBundles} />
+        <BundlesSection items={bundles} onChange={persistBundles} />
       )}
     </div>
   );

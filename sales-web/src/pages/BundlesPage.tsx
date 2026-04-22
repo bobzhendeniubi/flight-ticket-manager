@@ -8,9 +8,20 @@
  */
 import { useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { MOCK_BUNDLES, type MockBundle, type BundleItem } from '../lib/mockData';
-import { api } from '../lib/api';
+import { type MockBundle, type BundleItem } from '../lib/mockData';
+import { api, type Bundle as ApiBundle } from '../lib/api';
 import { useCart } from '../stores/cart';
+
+function bundleApiToMock(b: ApiBundle): MockBundle {
+  const items = (b.items as BundleItem[]) ?? [];
+  const groundTotal = items.filter((i) => i.kind !== 'FLIGHT').reduce((s, i) => s + i.unitPrice * i.qty, 0);
+  return {
+    id: b.id, name: b.name, tagline: b.tagline ?? '', emoji: b.emoji ?? '🎁',
+    items, listPrice: groundTotal, bundlePrice: groundTotal,
+    groundDiscount: Number(b.groundDiscount), flightPax: b.flightPax,
+    suitableFor: b.suitableFor ?? '', active: b.isActive,
+  };
+}
 
 function todayISO(offset = 3) {
   const d = new Date();
@@ -27,6 +38,13 @@ const KIND_LABEL: Record<BundleItem['kind'], { label: string; color: string }> =
 
 export function BundlesPage() {
   const add = useCart((s) => s.add);
+  const [bundles, setBundles] = useState<MockBundle[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    api.listBundles().then((r) => { if (!cancelled) setBundles(r.bundles.map(bundleApiToMock)); }).catch(() => {/* 静默 */});
+    return () => { cancelled = true; };
+  }, []);
 
   const [goDate, setGoDate] = useState(todayISO(3));
   const [returnDate, setReturnDate] = useState(todayISO(7));
@@ -62,7 +80,7 @@ export function BundlesPage() {
 
   useEffect(() => { loadPrices(); }, [loadPrices]);
 
-  const visible = MOCK_BUNDLES.filter((b) => b.active);
+  const visible = bundles.filter((b) => b.active);
 
   return (
     <div className="space-y-5">

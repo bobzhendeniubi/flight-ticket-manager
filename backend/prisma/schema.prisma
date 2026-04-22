@@ -314,9 +314,16 @@ model FlightSeatClass {
 model Hotel {
   id          String    @id @default(cuid())
   name        String
+  nameEn      String?
   cityCode    String    // IATA or internal city code
+  area        String?   // 区域描述（如"美溪海滩"）
   address     String
   starRating  Int       // 1..5
+  basePrice   Decimal?  @db.Decimal(10, 2) // 起步价（展示用）
+  rating      Decimal?  @db.Decimal(3, 2)  // 客户评分 0-5
+  reviewCount Int?
+  emoji       String?
+  highlight   String?   // 一句话卖点
   latitude    Decimal?  @db.Decimal(9, 6)
   longitude   Decimal?  @db.Decimal(9, 6)
   amenities   String[]  // e.g., ["wifi", "breakfast", "pool"]
@@ -331,14 +338,16 @@ model Hotel {
 }
 
 model HotelRoomType {
-  id          String   @id @default(cuid())
-  hotelId     String
-  name        String   // e.g., "Deluxe King"
-  capacity    Int      // max guests
-  basePrice   Decimal  @db.Decimal(10, 2)
-  photos      String[]
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id              String   @id @default(cuid())
+  hotelId         String
+  name            String   // e.g., "Deluxe King"
+  bedType         String?  // "1 张大床 · 海景"
+  capacity        Int      // max guests
+  basePrice       Decimal  @db.Decimal(10, 2)
+  priceMultiplier Decimal? @db.Decimal(5, 2)  // 相对 hotel.basePrice 的倍率（可选，用于 UI 快速报价）
+  photos          String[]
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
 
   hotel       Hotel                 @relation(fields: [hotelId], references: [id], onDelete: Cascade)
   inventory   HotelRoomInventory[]
@@ -374,6 +383,10 @@ model Transfer {
   originArea    String
   destArea      String
   basePrice     Decimal  @db.Decimal(10, 2)
+  features      String[] // e.g., ["中文司机", "免费等候 60 分钟"]
+  duration      String?  // "约 15 分钟"
+  emoji         String?
+  photo         String?
   isActive      Boolean  @default(true)
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
@@ -383,17 +396,46 @@ model Transfer {
 
 model Visa {
   id                 String   @id @default(cuid())
-  destinationCountry String   // ISO 3166-1 alpha-2
+  destinationCountry String   // ISO 3166-1 alpha-2 (e.g., "VN")
+  country            String?  // 中文国名（"越南"）
   visaType           String   // e.g., "tourist", "business"
+  visaName           String?  // 完整签证名称（"电子签证 E-visa · 30 天单次"）
+  flag               String?  // emoji flag
   processingDays     Int
   basePrice          Decimal  @db.Decimal(10, 2)
   expressSurcharge   Decimal? @db.Decimal(10, 2)
+  validityMonths     Int?     // 签证有效期（月）
+  highlight          String?  // "最热销 · 全流程线上"
   requiredDocs       String[] // e.g., ["passport_scan", "photo", "itinerary"]
   isActive           Boolean  @default(true)
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
 
   orderItems OrderItem[]
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Products — Bundles (打包套餐)
+// ─────────────────────────────────────────────────────────────────────────────
+model Bundle {
+  id              String   @id @default(cuid())
+  name            String
+  tagline         String?
+  emoji           String?
+  photo           String?
+  // 套餐组件列表（JSON）: [{kind: 'HOTEL', productName, qty, unitPrice}, ...]
+  // 注意：FLIGHT 组件的 unitPrice=0，客户端选日期后调 /flights/price 实时取价
+  items           Json
+  flightPax       Int      @default(1)   // 机票组件含多少人
+  groundDiscount  Decimal  @db.Decimal(10, 2) @default(0) // 地面部分让利（套餐专享优惠）
+  suitableFor     String?  // "2 人 · 情侣/家庭"
+  isActive        Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  orderItems OrderItem[]
+
+  @@index([isActive])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -421,6 +463,7 @@ enum OrderItemKind {
   HOTEL
   TRANSFER
   VISA
+  BUNDLE
   INSURANCE
   FEE // airport construction / fuel surcharge
   DISCOUNT
@@ -480,6 +523,7 @@ model OrderItem {
   hotelCheckOut    DateTime?   @db.Date
   transferId       String?
   visaId           String?
+  bundleId         String?
   metadata         Json?
   createdAt        DateTime    @default(now())
 
@@ -488,6 +532,7 @@ model OrderItem {
   hotelRoomType  HotelRoomType?   @relation(fields: [hotelRoomTypeId], references: [id])
   transfer       Transfer?        @relation(fields: [transferId], references: [id])
   visa           Visa?            @relation(fields: [visaId], references: [id])
+  bundle         Bundle?          @relation(fields: [bundleId], references: [id])
 
   @@index([orderId])
 }

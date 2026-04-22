@@ -1,7 +1,17 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { MOCK_TRANSFERS, type MockTransfer } from '../lib/mockData';
+import { type MockTransfer } from '../lib/mockData';
+import { api, type Transfer as ApiTransfer } from '../lib/api';
 import { useCart } from '../stores/cart';
+
+function transferApiToMock(t: ApiTransfer): MockTransfer {
+  return {
+    id: t.id, name: t.name, vehicleType: t.vehicleType, capacity: t.capacity,
+    basePrice: Number(t.basePrice), originArea: t.originArea, destArea: t.destArea,
+    emoji: t.emoji ?? '🚗', photo: t.photo ?? '',
+    features: t.features, duration: t.duration ?? '',
+  };
+}
 
 function todayISO(offsetDays = 0) {
   const d = new Date();
@@ -10,11 +20,18 @@ function todayISO(offsetDays = 0) {
 }
 
 export function TransfersPage() {
+  const [transfers, setTransfers] = useState<MockTransfer[]>([]);
   const [pickupAddress, setPickupAddress] = useState('');
   const [pickupDate, setPickupDate] = useState(todayISO(3));
   const [pickupTime, setPickupTime] = useState('07:00');
   const [passengers, setPassengers] = useState(1);
   const [selected, setSelected] = useState<MockTransfer | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    api.listTransfers().then((r) => { if (!cancelled) setTransfers(r.transfers.map(transferApiToMock)); }).catch(() => {/* 静默 */});
+    return () => { cancelled = true; };
+  }, []);
 
   return (
     <div className="space-y-6">
@@ -57,9 +74,9 @@ export function TransfersPage() {
       </section>
 
       <section>
-        <p className="text-sm text-slate-500 mb-3">推荐 {MOCK_TRANSFERS.length} 种车型</p>
+        <p className="text-sm text-slate-500 mb-3">推荐 {transfers.length} 种车型</p>
         <div className="space-y-3">
-          {MOCK_TRANSFERS.filter((t) => t.capacity >= passengers).map((t) => (
+          {transfers.filter((t) => t.capacity >= passengers).map((t) => (
             <article key={t.id} className="card flex items-center gap-6 hover:shadow-md transition">
               <img src={t.photo} alt={t.name} className="w-28 h-20 object-cover rounded-md flex-shrink-0" onError={(e) => { e.currentTarget.outerHTML = `<div class="text-5xl">${t.emoji}</div>`; }} />
               <div className="flex-1 min-w-0">
@@ -87,7 +104,7 @@ export function TransfersPage() {
           ))}
         </div>
 
-        {MOCK_TRANSFERS.filter((t) => t.capacity >= passengers).length === 0 && (
+        {transfers.filter((t) => t.capacity >= passengers).length === 0 && (
           <div className="card text-slate-500">没有足够大的车型，请减少乘车人数。</div>
         )}
       </section>

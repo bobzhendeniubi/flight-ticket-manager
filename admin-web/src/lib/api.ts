@@ -205,6 +205,115 @@ export interface OrderSummary {
   user: { id: string; displayName: string | null; email: string | null };
 }
 
+// ── Products ─────────────────────────────────────────────────────────────
+export interface HotelRoomType {
+  id: string;
+  hotelId: string;
+  name: string;
+  bedType: string | null;
+  capacity: number;
+  basePrice: string;
+  priceMultiplier: string | null;
+}
+
+export interface Hotel {
+  id: string;
+  name: string;
+  nameEn: string | null;
+  cityCode: string;
+  area: string | null;
+  address: string;
+  starRating: number;
+  basePrice: string | null;
+  rating: string | null;
+  reviewCount: number | null;
+  emoji: string | null;
+  highlight: string | null;
+  amenities: string[];
+  photos: string[];
+  isActive: boolean;
+  roomTypes: HotelRoomType[];
+  createdAt: string;
+}
+
+export interface Transfer {
+  id: string;
+  name: string;
+  vehicleType: string;
+  capacity: number;
+  originArea: string;
+  destArea: string;
+  basePrice: string;
+  features: string[];
+  duration: string | null;
+  emoji: string | null;
+  photo: string | null;
+  isActive: boolean;
+  createdAt: string;
+}
+
+export interface Visa {
+  id: string;
+  destinationCountry: string;
+  country: string | null;
+  visaType: string;
+  visaName: string | null;
+  flag: string | null;
+  processingDays: number;
+  basePrice: string;
+  expressSurcharge: string | null;
+  validityMonths: number | null;
+  highlight: string | null;
+  requiredDocs: string[];
+  isActive: boolean;
+  createdAt: string;
+}
+
+export interface BundleItemData {
+  kind: 'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA';
+  productName: string;
+  qty: number;
+  unitPrice: number;
+}
+
+export interface Bundle {
+  id: string;
+  name: string;
+  tagline: string | null;
+  emoji: string | null;
+  photo: string | null;
+  items: BundleItemData[];
+  flightPax: number;
+  groundDiscount: string;
+  suitableFor: string | null;
+  isActive: boolean;
+  createdAt: string;
+}
+
+// ── Dashboard ─────────────────────────────────────────────────────────────
+export interface DashboardKpi {
+  todayRevenue: number;
+  todayOrders: number;
+  pendingOrders: number;
+  activeAgents: number;
+  monthRevenue: number;
+  monthOrders: number;
+  revenueChangePct: number;
+  ordersChangePct: number;
+  monthRevenueChangePct: number;
+  asOf: string;
+}
+
+export interface DashboardWeeklyPoint { date: string; revenue: number; orders: number }
+export interface DashboardTopAgent {
+  agentId: string;
+  companyName: string | null;
+  contactName: string;
+  tier: number;
+  orderCount: number;
+  revenue: number;
+}
+
 // ── Settlements ──────────────────────────────────────────────────────────
 export type SettlementStatus = 'DRAFT' | 'PENDING_APPROVAL' | 'APPROVED' | 'PAID' | 'VOIDED';
 
@@ -343,4 +452,52 @@ export const api = {
       token,
       body: { toStatus, notes },
     }),
+
+  // Products — Hotels
+  listHotels: (activeOnly = false) =>
+    apiFetch<{ hotels: Hotel[] }>(`/products/hotels${activeOnly ? '?active=1' : ''}`),
+  createHotel: (token: string, body: Record<string, unknown>) =>
+    apiFetch<{ hotel: Hotel }>('/products/hotels', { method: 'POST', token, body }),
+  updateHotel: (token: string, id: string, body: Record<string, unknown>) =>
+    apiFetch<{ hotel: Hotel }>(`/products/hotels/${id}`, { method: 'PATCH', token, body }),
+  deleteHotel: (token: string, id: string) =>
+    apiFetch<{ result: { id: string; isActive: boolean } }>(`/products/hotels/${id}`, { method: 'DELETE', token }),
+
+  // Products — Transfers
+  listTransfers: (activeOnly = false) =>
+    apiFetch<{ transfers: Transfer[] }>(`/products/transfers${activeOnly ? '?active=1' : ''}`),
+  createTransfer: (token: string, body: Record<string, unknown>) =>
+    apiFetch<{ transfer: Transfer }>('/products/transfers', { method: 'POST', token, body }),
+  updateTransfer: (token: string, id: string, body: Record<string, unknown>) =>
+    apiFetch<{ transfer: Transfer }>(`/products/transfers/${id}`, { method: 'PATCH', token, body }),
+  deleteTransfer: (token: string, id: string) =>
+    apiFetch<{ result: { id: string; isActive: boolean } }>(`/products/transfers/${id}`, { method: 'DELETE', token }),
+
+  // Products — Visas
+  listVisas: (activeOnly = false) =>
+    apiFetch<{ visas: Visa[] }>(`/products/visas${activeOnly ? '?active=1' : ''}`),
+  createVisa: (token: string, body: Record<string, unknown>) =>
+    apiFetch<{ visa: Visa }>('/products/visas', { method: 'POST', token, body }),
+  updateVisa: (token: string, id: string, body: Record<string, unknown>) =>
+    apiFetch<{ visa: Visa }>(`/products/visas/${id}`, { method: 'PATCH', token, body }),
+  deleteVisa: (token: string, id: string) =>
+    apiFetch<{ result: { id: string; isActive: boolean } }>(`/products/visas/${id}`, { method: 'DELETE', token }),
+
+  // Products — Bundles
+  listBundles: (activeOnly = false) =>
+    apiFetch<{ bundles: Bundle[] }>(`/products/bundles${activeOnly ? '?active=1' : ''}`),
+  createBundle: (token: string, body: Record<string, unknown>) =>
+    apiFetch<{ bundle: Bundle }>('/products/bundles', { method: 'POST', token, body }),
+  updateBundle: (token: string, id: string, body: Record<string, unknown>) =>
+    apiFetch<{ bundle: Bundle }>(`/products/bundles/${id}`, { method: 'PATCH', token, body }),
+  deleteBundle: (token: string, id: string) =>
+    apiFetch<{ result: { id: string; isActive: boolean } }>(`/products/bundles/${id}`, { method: 'DELETE', token }),
+
+  // Dashboard
+  getDashboardKpi: (token: string) =>
+    apiFetch<{ kpi: DashboardKpi }>('/dashboard/kpi', { token }),
+  getDashboardWeekly: (token: string, days = 7) =>
+    apiFetch<{ series: DashboardWeeklyPoint[] }>(`/dashboard/weekly?days=${days}`, { token }),
+  getDashboardTopAgents: (token: string) =>
+    apiFetch<{ agents: DashboardTopAgent[] }>('/dashboard/top-agents', { token }),
 };

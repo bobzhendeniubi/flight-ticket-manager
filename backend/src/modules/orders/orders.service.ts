@@ -163,6 +163,7 @@ export class OrderService {
               hotelCheckOut: p.hotelCheckOut ?? null,
               transferId: p.transferId ?? null,
               visaId: p.visaId ?? null,
+              bundleId: p.bundleId ?? null,
               metadata: (p.metadata ?? undefined) as Prisma.InputJsonValue | undefined,
             })),
           },
@@ -213,6 +214,7 @@ export class OrderService {
       hotelCheckOut?: Date;
       transferId?: string;
       visaId?: string;
+      bundleId?: string;
       metadata?: Record<string, unknown>;
     }> = [];
 
@@ -269,6 +271,16 @@ export class OrderService {
           unitPrice: item.unitPrice,
           amount: Math.round(item.unitPrice * item.quantity),
           visaId: item.visaId,
+          metadata: item.metadata,
+        });
+      } else if (item.kind === 'BUNDLE') {
+        priced.push({
+          kind: 'BUNDLE',
+          description: item.description,
+          quantity: item.quantity,
+          unitPrice: item.unitPrice,
+          amount: Math.round(item.unitPrice * item.quantity),
+          bundleId: item.bundleId,
           metadata: item.metadata,
         });
       }

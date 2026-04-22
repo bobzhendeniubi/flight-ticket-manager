@@ -14,6 +14,8 @@ import { flightRoutes } from './modules/flights/flights.routes.js';
 import { agentRoutes } from './modules/agents/agents.routes.js';
 import { orderRoutes } from './modules/orders/orders.routes.js';
 import { settlementRoutes } from './modules/settlements/settlements.routes.js';
+import { productRoutes } from './modules/products/products.routes.js';
+import { dashboardRoutes } from './modules/dashboard/dashboard.routes.js';
 import { redis } from './db/redis.js';
 
 export async function buildApp(): Promise<FastifyInstance> {
@@ -57,6 +59,8 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(agentRoutes, { prefix: '/agents' });
   await app.register(orderRoutes, { prefix: '/orders' });
   await app.register(settlementRoutes, { prefix: '/settlements' });
+  await app.register(productRoutes, { prefix: '/products' });
+  await app.register(dashboardRoutes, { prefix: '/dashboard' });
 
   // Root
   app.get('/', async () => ({

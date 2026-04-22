@@ -259,6 +259,14 @@ export interface CreateOrderInput {
         visaId?: string;
         metadata?: Record<string, unknown>;
       }
+    | {
+        kind: 'BUNDLE';
+        description: string;
+        quantity: number;
+        unitPrice: number;
+        bundleId: string;
+        metadata?: Record<string, unknown>;
+      }
   >;
   passengers: Array<{
     fullName: string;
@@ -270,6 +278,88 @@ export interface CreateOrderInput {
   }>;
   notes?: string;
   idempotencyKey?: string;
+}
+
+// ── Products ─────────────────────────────────────────────────────────────
+export interface HotelRoomType {
+  id: string;
+  hotelId: string;
+  name: string;
+  bedType: string | null;
+  capacity: number;
+  basePrice: string;
+  priceMultiplier: string | null;
+}
+
+export interface Hotel {
+  id: string;
+  name: string;
+  nameEn: string | null;
+  cityCode: string;
+  area: string | null;
+  address: string;
+  starRating: number;
+  basePrice: string | null;
+  rating: string | null;
+  reviewCount: number | null;
+  emoji: string | null;
+  highlight: string | null;
+  amenities: string[];
+  photos: string[];
+  isActive: boolean;
+  roomTypes: HotelRoomType[];
+  createdAt: string;
+}
+
+export interface Transfer {
+  id: string;
+  name: string;
+  vehicleType: string;
+  capacity: number;
+  originArea: string;
+  destArea: string;
+  basePrice: string;
+  features: string[];
+  duration: string | null;
+  emoji: string | null;
+  photo: string | null;
+  isActive: boolean;
+}
+
+export interface Visa {
+  id: string;
+  destinationCountry: string;
+  country: string | null;
+  visaType: string;
+  visaName: string | null;
+  flag: string | null;
+  processingDays: number;
+  basePrice: string;
+  expressSurcharge: string | null;
+  validityMonths: number | null;
+  highlight: string | null;
+  requiredDocs: string[];
+  isActive: boolean;
+}
+
+export interface BundleItemData {
+  kind: 'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA';
+  productName: string;
+  qty: number;
+  unitPrice: number;
+}
+
+export interface Bundle {
+  id: string;
+  name: string;
+  tagline: string | null;
+  emoji: string | null;
+  photo: string | null;
+  items: BundleItemData[];
+  flightPax: number;
+  groundDiscount: string;
+  suitableFor: string | null;
+  isActive: boolean;
 }
 
 // ── Typed endpoints ───────────────────────────────────────────────────────
@@ -377,4 +467,10 @@ export const api = {
       token,
       body: { toStatus, reason },
     }),
+
+  // 产品（公开）
+  listHotels: () => apiFetch<{ hotels: Hotel[] }>('/products/hotels?active=1'),
+  listTransfers: () => apiFetch<{ transfers: Transfer[] }>('/products/transfers?active=1'),
+  listVisas: () => apiFetch<{ visas: Visa[] }>('/products/visas?active=1'),
+  listBundles: () => apiFetch<{ bundles: Bundle[] }>('/products/bundles?active=1'),
 };

@@ -58,11 +58,18 @@ export const visaItemSchema = baseItemSchema.extend({
   unitPrice: z.number().nonnegative(),
 });
 
+export const bundleItemSchema = baseItemSchema.extend({
+  kind: z.literal('BUNDLE'),
+  bundleId: z.string().min(1),
+  unitPrice: z.number().nonnegative(),
+});
+
 export const orderItemInputSchema = z.discriminatedUnion('kind', [
   flightItemSchema,
   hotelItemSchema,
   transferItemSchema,
   visaItemSchema,
+  bundleItemSchema,
 ]);
 export type OrderItemInput = z.infer<typeof orderItemInputSchema>;
 

@@ -287,6 +287,8 @@ Tenant (licensee)
 | 多租户 / License | ⏸️ 已移除 | 2026-04-20 产品决策 "先做一家"，`/tenants` 页已删、MOCK_TENANTS 已清，等有第 2 家客户再重做 |
 | **订单系统** | ✅ **真后端** | `orders` 模块 4 端点：`POST/GET/GET/:id/PATCH/:id/status` · 动态定价重算 · 座位事务扣/退 · 状态机 + RBAC + 幂等 key + 乘客数校验 · sales CheckoutPage 接通 · admin OrdersPage 接通 |
 | **结算模块** | ✅ **真后端** | `settlements` 模块 4 端点 · CommissionRecord 自动生成（PAID 时按代理层级走链路，child.rate≤parent.rate 的 spread 模型）· 月度结算单：GMV/earned/paidToChildren/offset/payable · 状态机 DRAFT→审核→核准→PAID · PAID 时触发 SETTLED + 预付余额 OFFSET 扣减 · admin SettlementsPage 接通 |
+| **产品 CRUD** | ✅ **真后端** | `products` 模块 4 子资源（hotels/transfers/visas/bundles）· 公共 GET 无需登录 + 管理员写 · 软删除（isActive=false）· Hotel 嵌套 roomTypes 替换式更新 · BUNDLE 订单闭环（OrderItemKind.BUNDLE + bundleId FK）· admin ProductsPage + sales HotelsPage/VisasPage/TransfersPage/BundlesPage 全接通 |
+| **Dashboard KPI** | ✅ **真后端** | `dashboard` 模块 3 端点 · 今日/本月营收 + 变化率（vs 昨日/上月）· 待支付/活跃代理统计 · 近 7 天时间序列 · Top 5 代理 by GMV · admin DashboardPage 接通真数据 |
 | 运营治理 - 审计 | 🟡 UI 骨架 | `/audit-logs` 页 · 12 条 mock 日志 · 谁/何时/哪 IP/改了什么 · 严重度分级 · CSV 导出（后端未接） |
 | 履约 (订单 drawer) | 🟡 UI 骨架 | OrdersPage 订单详情 🚚 履约进度：PNR / 酒店确认号 / 签证进度 / 司机调度 · 5 种状态（后端未接） |
 | **OCR 真实实现** | ✅ 真功能 | tesseract.js `chi_sim+eng` + MRZ 解析 · 进度条 · 图片预览 · 识别原文可展开 · 中国护照号 `[EGSDPH]\d{8}` 正则兜底 |
@@ -295,14 +297,15 @@ Tenant (licensee)
 
 1. ~~**订单系统**~~ ✅ **已完成**（2026-04-20）
 2. ~~**结算模块**~~ ✅ **已完成**（2026-04-20）—— CommissionRecord 自动生成 + 月度 Settlement + 预付抵扣
-3. **产品 CRUD**：Hotels / Visas / Transfers / Bundles 四类产品的后端 CRUD
-4. **Dashboard KPI**：真实 SQL 聚合营收/订单数/活跃代理等
+3. ~~**产品 CRUD**~~ ✅ **已完成**（2026-04-21）—— Hotels/Transfers/Visas/Bundles + BUNDLE 订单闭环
+4. ~~**Dashboard KPI**~~ ✅ **已完成**（2026-04-21）—— 真 SQL 聚合 + Top 代理 + 7 天时间序列
 5. **审计日志**：操作日志写入中间件 + 查询 API
 6. **履约任务**：FulfillmentTask 表 + 状态机 + 异步队列（BullMQ）
-7. **Prisma 重构**：统一 PricingRule（目前 DateRanking + 默认 bucket 两处配置）
-8. ~~多租户数据隔离~~ —— 已 defer
+7. **支付网关**：微信/支付宝对接（目前 PAID 是管理员手动标记）
+8. **Prisma 重构**：统一 PricingRule（目前 DateRanking + 默认 bucket 两处配置）
+9. ~~多租户数据隔离~~ —— 已 defer
 
 ---
 
-**最后更新**：2026-04-20（结算模块上线：佣金链路 + 月结 + 预付抵扣）
-**下一次架构 review**：完成产品 CRUD + Dashboard KPI 后
+**最后更新**：2026-04-21（产品 CRUD + Dashboard 真数据上线；BUNDLE 订单打通）
+**下一次架构 review**：审计 + 履约 + 支付网关齐活后

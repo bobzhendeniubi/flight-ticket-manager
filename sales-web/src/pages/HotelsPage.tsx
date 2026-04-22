@@ -1,7 +1,22 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { MOCK_HOTELS, type MockHotel } from '../lib/mockData';
+import { type MockHotel } from '../lib/mockData';
+import { api, type Hotel } from '../lib/api';
 import { useCart } from '../stores/cart';
+
+function hotelApiToMock(h: Hotel): MockHotel {
+  return {
+    id: h.id, name: h.name, nameEn: h.nameEn ?? h.name, cityCode: h.cityCode,
+    area: h.area ?? h.address, stars: (h.starRating as 3 | 4 | 5),
+    basePrice: Number(h.basePrice ?? 0), rating: h.rating ? Number(h.rating) : 4.5,
+    reviewCount: h.reviewCount ?? 0, emoji: h.emoji ?? '🏨',
+    photo: h.photos[0] ?? '', amenities: h.amenities, highlight: h.highlight ?? '',
+    roomTypes: h.roomTypes.map((rt) => ({
+      name: rt.name, priceMult: rt.priceMultiplier ? Number(rt.priceMultiplier) : 1,
+      sleeps: rt.capacity, bedType: rt.bedType ?? '',
+    })),
+  };
+}
 
 function todayISO(offsetDays = 0) {
   const d = new Date();
@@ -10,6 +25,7 @@ function todayISO(offsetDays = 0) {
 }
 
 export function HotelsPage() {
+  const [hotels, setHotels] = useState<MockHotel[]>([]);
   const [city, setCity] = useState('');
   const [stars, setStars] = useState<'' | '3' | '4' | '5'>('');
   const [maxPrice, setMaxPrice] = useState(4000);
@@ -19,14 +35,20 @@ export function HotelsPage() {
   const add = useCart((s) => s.add);
   const navigate = useNavigate();
 
+  useEffect(() => {
+    let cancelled = false;
+    api.listHotels().then((r) => { if (!cancelled) setHotels(r.hotels.map(hotelApiToMock)); }).catch(() => {/* 静默失败 */});
+    return () => { cancelled = true; };
+  }, []);
+
   const filtered = useMemo(() => {
-    return MOCK_HOTELS.filter((h) => {
+    return hotels.filter((h) => {
       if (city && h.cityCode !== city) return false;
       if (stars && h.stars !== Number(stars)) return false;
       if (h.basePrice > maxPrice) return false;
       return true;
     });
-  }, [city, stars, maxPrice]);
+  }, [hotels, city, stars, maxPrice]);
 
   const nights = Math.max(
     1,

@@ -1,20 +1,39 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { MOCK_VISAS, type MockVisa } from '../lib/mockData';
+import { type MockVisa } from '../lib/mockData';
+import { api, type Visa } from '../lib/api';
 import { useCart } from '../stores/cart';
 
+function visaApiToMock(v: Visa): MockVisa {
+  return {
+    id: v.id, country: v.country ?? v.destinationCountry, countryCode: v.destinationCountry,
+    flag: v.flag ?? '🌐', type: v.visaName ?? v.visaType,
+    processingDays: v.processingDays, basePrice: Number(v.basePrice),
+    expressSurcharge: v.expressSurcharge ? Number(v.expressSurcharge) : 0,
+    requiredDocs: v.requiredDocs, validityMonths: v.validityMonths ?? 1,
+    highlight: v.highlight ?? undefined,
+  };
+}
+
 export function VisasPage() {
+  const [visas, setVisas] = useState<MockVisa[]>([]);
   const [search, setSearch] = useState('');
   const [maxDays, setMaxDays] = useState<'' | '7' | '15' | '30'>('');
   const [selected, setSelected] = useState<MockVisa | null>(null);
 
+  useEffect(() => {
+    let cancelled = false;
+    api.listVisas().then((r) => { if (!cancelled) setVisas(r.visas.map(visaApiToMock)); }).catch(() => {/* 静默 */});
+    return () => { cancelled = true; };
+  }, []);
+
   const filtered = useMemo(() => {
-    return MOCK_VISAS.filter((v) => {
+    return visas.filter((v) => {
       if (search && !v.country.includes(search)) return false;
       if (maxDays && v.processingDays > Number(maxDays)) return false;
       return true;
     });
-  }, [search, maxDays]);
+  }, [visas, search, maxDays]);
 
   return (
     <div className="space-y-6">
