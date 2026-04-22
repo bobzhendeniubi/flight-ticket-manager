@@ -1,0 +1,39 @@
+# 排除 node_modules — 镜像内重装
+**/node_modules
+**/dist
+**/.next
+**/build
+**/.turbo
+**/.cache
+
+# 日志与临时
+*.log
+npm-debug.log*
+.DS_Store
+.env.local
+.env.*.local
+
+# 开发文件
+.vscode
+.idea
+*.swp
+
+# Git
+.git
+.gitignore
+.gitattributes
+
+# 测试覆盖率
+coverage/
+.nyc_output/
+
+# 文档（按需保留）
+docs/
+*.md
+!README.md
+
+# 工具产物
+*.pptx
+*.pdf
+miniprogram/
+ml-pricing/

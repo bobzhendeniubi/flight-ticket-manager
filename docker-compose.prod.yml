@@ -1,0 +1,139 @@
+# 世途旅行 · 生产级 docker-compose
+#
+# 启动：docker-compose -f docker-compose.prod.yml up -d
+#
+# 必填 env（.env.prod）：
+#   POSTGRES_PASSWORD       数据库密码
+#   JWT_ACCESS_SECRET       JWT access 令牌密钥（>32 字符）
+#   JWT_REFRESH_SECRET      JWT refresh 密钥
+#   SANDBOX_WEBHOOK_SECRET  支付沙箱 secret
+#   PAYMENT_MODE            sandbox | live
+#   CORS_ORIGINS            https://sales.citur.com,https://admin.citur.com
+#
+# 生产前必做 checklist：
+#   [ ] 生成强随机密钥（openssl rand -base64 48）
+#   [ ] POSTGRES_PASSWORD 不用 dev 值
+#   [ ] PAYMENT_MODE=live + 配 WECHAT/ALIPAY 真 key
+#   [ ] 备份策略：pg_dump + Redis RDB/AOF
+#   [ ] 监控：Prometheus + Grafana（/metrics 暂未实现）
+#   [ ] HTTPS：外层 nginx / Caddy 或云厂商 LB 终结 SSL
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: ftm-postgres-prod
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ftm
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?must set POSTGRES_PASSWORD}
+      POSTGRES_DB: ftm
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backups:/backups:ro
+    # 不暴露端口到宿主（只在 docker 内网）
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ftm -d ftm"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    logging:
+      driver: "json-file"
+      options: { max-size: "50m", max-file: "3" }
+
+  redis:
+    image: redis:7-alpine
+    container_name: ftm-redis-prod
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    expose:
+      - "6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: ftm-backend-prod
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis:    { condition: service_healthy }
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      DATABASE_URL: postgresql://ftm:${POSTGRES_PASSWORD}@postgres:5432/ftm?schema=public
+      REDIS_URL: redis://redis:6379
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?must set JWT_ACCESS_SECRET}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?must set JWT_REFRESH_SECRET}
+      JWT_ACCESS_TTL: ${JWT_ACCESS_TTL:-900}
+      JWT_REFRESH_TTL: ${JWT_REFRESH_TTL:-604800}
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://sales.citur.com,https://admin.citur.com}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      PAYMENT_MODE: ${PAYMENT_MODE:-sandbox}
+      SANDBOX_WEBHOOK_SECRET: ${SANDBOX_WEBHOOK_SECRET:-sandbox-test-secret}
+      ENABLE_AUTO_FULFILLMENT: ${ENABLE_AUTO_FULFILLMENT:-true}
+    # 启动前自动跑 migration
+    command: >
+      sh -c "npx prisma migrate deploy && node dist/index.js"
+    expose:
+      - "4000"
+    logging:
+      driver: "json-file"
+      options: { max-size: "100m", max-file: "5" }
+
+  worker:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: ftm-worker-prod
+    restart: unless-stopped
+    depends_on:
+      backend: { condition: service_started }
+      redis:   { condition: service_healthy }
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://ftm:${POSTGRES_PASSWORD}@postgres:5432/ftm?schema=public
+      REDIS_URL: redis://redis:6379
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    command: ["node", "dist/queues/worker.js"]
+    logging:
+      driver: "json-file"
+      options: { max-size: "100m", max-file: "5" }
+
+  sales-web:
+    build:
+      context: .
+      dockerfile: sales-web/Dockerfile
+      args:
+        VITE_API_BASE: /api
+    container_name: ftm-sales-web-prod
+    restart: unless-stopped
+    depends_on:
+      backend: { condition: service_started }
+    ports:
+      - "80:80"        # 生产一般走 reverse proxy；这里直接映射 80 便于单机部署
+
+  admin-web:
+    build:
+      context: .
+      dockerfile: admin-web/Dockerfile
+      args:
+        VITE_API_BASE: /api
+    container_name: ftm-admin-web-prod
+    restart: unless-stopped
+    depends_on:
+      backend: { condition: service_started }
+    ports:
+      - "8080:80"      # admin 走 8080；生产建议放到独立子域名 admin.xxx.com
+
+volumes:
+  postgres_data:
+  redis_data:

@@ -293,6 +293,9 @@ Tenant (licensee)
 | **客户管理** | ✅ **真后端** | 新 `CustomerProfile` 表扩展 User · `/customers` 模块 3 端点 · 聚合 totalOrders/totalSpent/lastOrderAt 实时查 · 详情含 recentOrders + travelers · admin CustomersPage 接通 |
 | **旅客管理** | ✅ **真后端** | 基于 SavedPassenger 加 phone/notes · `/travelers` CRUD · tripCount/lastTripAt 从 Passenger 表聚合 · 详情含 trips 历史（PNR/e-ticket）· admin TravelersPage 接通 |
 | **履约任务** | ✅ **真后端** | 新 `FulfillmentTask` 表 · 订单 PAID 时按 OrderItem.kind 自动生成任务（FLIGHT_TICKETING / HOTEL_BOOKING / VISA_APPLICATION / TRANSFER_DISPATCH / BUNDLE_COMPOSITE）· FLIGHT 确认时 PNR/e-ticket 自动回填 Passenger · admin OrdersPage drawer 可填数据 + 流转状态 |
+| **支付网关** | ✅ **真后端（沙箱）** | `payments` 模块 · PaymentAdapter 抽象（Sandbox/WeChat/Alipay 可插拔）· `POST /payments` 创建 · `POST /payments/webhook/:provider` 回调验签 · 成功后自动 Order → PAID 联动状态机（含 actorUserId FK 防呆）· `/sandbox-confirm` 开发测试口 · 金额校验防串改 · 幂等复用 Pending Payment |
+| **BullMQ 异步队列** | ✅ **真实现** | `queues/queue.ts` 复用 Redis 连接 · fulfillment/notification 双队列 · worker 独立进程（`npm run worker`）· 3 次重试指数退避 · 任务事务后 enqueue（修 race）· CONFIRMED 后 PNR 回写 Passenger |
+| **生产部署** | ✅ **真骨架** | 3 个 Dockerfile（backend 多阶段 + 2 前端 nginx）· `docker-compose.prod.yml` 5 服务（postgres/redis/backend/worker/nginx×2）+ 2 数据卷 · nginx `/api` 反代 + 安全头 + SPA fallback · `docs/DEPLOYMENT.md` 含单机/云/K8s 3 套方案 + 备份脚本 + 安全 checklist |
 | 运营治理 - 审计 | 🟡 UI 骨架 | `/audit-logs` 页 · 12 条 mock 日志 · 谁/何时/哪 IP/改了什么 · 严重度分级 · CSV 导出（后端未接） |
 | 履约 (订单 drawer) | 🟡 UI 骨架 | OrdersPage 订单详情 🚚 履约进度：PNR / 酒店确认号 / 签证进度 / 司机调度 · 5 种状态（后端未接） |
 | **OCR 真实实现** | ✅ 真功能 | tesseract.js `chi_sim+eng` + MRZ 解析 · 进度条 · 图片预览 · 识别原文可展开 · 中国护照号 `[EGSDPH]\d{8}` 正则兜底 |
@@ -305,14 +308,17 @@ Tenant (licensee)
 4. ~~**Dashboard KPI**~~ ✅ **已完成**（2026-04-21）—— 真 SQL 聚合 + Top 代理 + 7 天时间序列
 5. ~~**审计日志**~~ ✅ **已完成**（2026-04-22）—— AuditLog 表 + writeAudit 助手 + 关键路径埋点
 6. ~~**客户/旅客管理**~~ ✅ **已完成**（2026-04-22）—— CustomerProfile + SavedPassenger 扩展 + CRUD API
-7. ~~**履约任务**~~ ✅ **已完成**（2026-04-22）—— FulfillmentTask 同步实现（BullMQ 异步队列延后到 V2）
-8. **支付网关**：微信/支付宝对接（目前 PAID 是管理员手动标记）
-9. **Prisma 重构**：统一 PricingRule（目前 DateRanking + 默认 bucket 两处配置）
-10. **BullMQ 异步队列**：出票 / OCR / 对账搬到后台 job
-11. ~~多租户数据隔离~~ —— 已 defer
+7. ~~**履约任务**~~ ✅ **已完成**（2026-04-22）—— FulfillmentTask 同步 + 异步 worker 双实现
+8. ~~**支付网关**~~ ✅ **已完成**（2026-04-22）—— PaymentAdapter 抽象 + 沙箱回调闭环（WeChat/Alipay 骨架待真 SDK）
+9. ~~**BullMQ 异步队列**~~ ✅ **已完成**（2026-04-22）—— fulfillment/notification 双队列 + 独立 worker
+10. ~~**生产部署**~~ ✅ **已完成**（2026-04-22）—— Dockerfile×3 + docker-compose.prod + DEPLOYMENT.md
+11. **Prisma 重构**：统一 PricingRule（目前 DateRanking + 默认 bucket 两处配置）
+12. **真实微信/支付宝 SDK**：替换 WeChatPayAdapter/AlipayAdapter 骨架
+13. **微信小程序**：mini-program/ 目录接 API
+14. ~~多租户数据隔离~~ —— 已 defer
 
 ---
 
-**最后更新**：2026-04-22（审计 + 客户/旅客 + 履约任务上线；P2 治理层打通）
+**最后更新**：2026-04-22（P3 生产级上线：支付 + BullMQ + 生产部署）
 **前端 mock 占比**：~5%（只剩 DashboardPage 的静态"产品结构"饼图）
-**下一次架构 review**：支付网关 + BullMQ 齐活后
+**下一次架构 review**：真实支付 SDK + 监控指标 + 渗透测试后

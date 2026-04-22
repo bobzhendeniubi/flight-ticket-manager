@@ -7,6 +7,8 @@
   "main": "dist/index.js",
   "scripts": {
     "dev": "tsx watch src/index.ts",
+    "worker": "tsx watch src/queues/worker.ts",
+    "worker:prod": "node dist/queues/worker.js",
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
@@ -27,6 +29,7 @@
     "@fastify/sensible": "^6.0.1",
     "@prisma/client": "^5.22.0",
     "argon2": "^0.41.1",
+    "bullmq": "^5.75.2",
     "dotenv": "^16.4.5",
     "fastify": "^5.1.0",
     "fastify-plugin": "^5.0.1",

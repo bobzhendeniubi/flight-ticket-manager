@@ -388,6 +388,9 @@ export class OrderService {
       );
     }
 
+    // 收集事务里创建的任务 id，提交后再入队（避免 worker 在 tx 提交前查不到）
+    const pendingFulfillmentTaskIds: string[] = [];
+
     // 事务：写 Order + 写事件 + 按需调整库存
     const updated = await prisma.$transaction(async (tx) => {
       const wasHolding = SEAT_HOLDING_STATUSES.includes(order.status);
@@ -415,7 +418,8 @@ export class OrderService {
         if (order.agentId) {
           await createCommissionsForOrder(tx, order.id, order.agentId);
         }
-        await createFulfillmentTasks(tx, order.id);
+        const newIds = await createFulfillmentTasks(tx, order.id);
+        pendingFulfillmentTaskIds.push(...newIds);
       }
 
       // 从 PAID 走到释放态（CANCELLED/REFUNDED/PAYMENT_TIMEOUT/FAILED）：撤销佣金
@@ -426,6 +430,9 @@ export class OrderService {
         });
       }
 
+      // actorUserId 只记录真实用户 id；系统操作（支付网关等）设 null
+      const isSystemActor = requester.userId.startsWith('system-');
+
       return tx.order.update({
         where: { id },
         data: {
@@ -435,7 +442,7 @@ export class OrderService {
             create: {
               fromStatus: order.status,
               toStatus,
-              actorUserId: requester.userId,
+              actorUserId: isSystemActor ? null : requester.userId,
               reason,
             },
           },
@@ -451,6 +458,17 @@ export class OrderService {
         },
       });
     });
+
+    // 事务提交后 enqueue fulfillment jobs（若有）
+    if (pendingFulfillmentTaskIds.length > 0 && process.env.ENABLE_AUTO_FULFILLMENT === 'true') {
+      const { fulfillmentQueue } = await import('../../queues/queue.js');
+      for (const taskId of pendingFulfillmentTaskIds) {
+        void fulfillmentQueue.add('auto-fulfill', { taskId }, { delay: 1000 }).catch((e) => {
+          // eslint-disable-next-line no-console
+          console.error('[orders] failed to enqueue fulfillment task:', e);
+        });
+      }
+    }
 
     return serializeOrder(updated);
   }
@@ -584,23 +602,26 @@ const KIND_TO_FULFILLMENT_TYPE: Partial<Record<OrderItemKind, FulfillmentType>> 
   BUNDLE: FulfillmentType.BUNDLE_COMPOSITE,
 };
 
-async function createFulfillmentTasks(tx: Prisma.TransactionClient, orderId: string) {
+async function createFulfillmentTasks(tx: Prisma.TransactionClient, orderId: string): Promise<string[]> {
   const items = await tx.orderItem.findMany({
     where: { orderId },
     select: { id: true, kind: true, fulfillmentTasks: { select: { id: true } } },
   });
+  const newTaskIds: string[] = [];
   for (const item of items) {
     const type = KIND_TO_FULFILLMENT_TYPE[item.kind];
     if (!type) continue;
     if (item.fulfillmentTasks.length > 0) continue;
-    await tx.fulfillmentTask.create({
+    const task = await tx.fulfillmentTask.create({
       data: {
         orderItemId: item.id,
         type,
         status: FulfillmentStatus.PENDING,
       },
     });
+    newTaskIds.push(task.id);
   }
+  return newTaskIds;
 }
 
 // ════════════════════════════════════════════════════════════════════
