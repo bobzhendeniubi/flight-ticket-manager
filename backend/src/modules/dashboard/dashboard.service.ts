@@ -66,17 +66,42 @@ export class DashboardService {
     };
   }
 
-  /** 最近 N 天时间序列（N 默认 7） */
+  /** 最近 N 天时间序列（N 默认 7）— 一次 SQL groupBy 完成，无 N+1 */
   async getDailySeries(days = 7) {
     const now = new Date();
     const todayStart = startOfDayUtc(now);
+    const windowStart = new Date(todayStart.getTime() - (days - 1) * 86400000);
+    const windowEnd = new Date(todayStart.getTime() + 86400000);
+
+    // 按 UTC 日期聚合（date_trunc）
+    const rows = await prisma.$queryRaw<Array<{ day: Date; revenue: string; orders: bigint }>>`
+      SELECT
+        date_trunc('day', "createdAt" AT TIME ZONE 'UTC')::date AS day,
+        COALESCE(SUM(total), 0)::text AS revenue,
+        COUNT(*)::bigint AS orders
+      FROM "Order"
+      WHERE "createdAt" >= ${windowStart}
+        AND "createdAt" < ${windowEnd}
+        AND status IN ('PAID','PROCESSING','TICKETED','COMPLETED','CHANGE_REQUESTED','CHANGED')
+      GROUP BY day
+      ORDER BY day ASC
+    `;
+
+    // 把 SQL 结果索引化
+    const byDate = new Map<string, { revenue: number; orders: number }>();
+    rows.forEach((r) => {
+      const key = r.day.toISOString().slice(0, 10); // YYYY-MM-DD
+      byDate.set(key, { revenue: Number(r.revenue), orders: Number(r.orders) });
+    });
+
+    // 填充所有 N 天（包括无订单的零值日）
     const series: Array<{ date: string; revenue: number; orders: number }> = [];
     for (let i = days - 1; i >= 0; i--) {
       const dayStart = new Date(todayStart.getTime() - i * 86400000);
-      const dayEnd = new Date(dayStart.getTime() + 86400000);
-      const agg = await revenueAndCount(dayStart, dayEnd);
+      const iso = dayStart.toISOString().slice(0, 10);
       const mm = String(dayStart.getUTCMonth() + 1).padStart(2, '0');
       const dd = String(dayStart.getUTCDate()).padStart(2, '0');
+      const agg = byDate.get(iso) ?? { revenue: 0, orders: 0 };
       series.push({ date: `${mm}-${dd}`, revenue: agg.revenue, orders: agg.orders });
     }
     return series;

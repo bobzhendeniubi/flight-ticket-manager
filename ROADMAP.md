@@ -319,6 +319,14 @@ Tenant (licensee)
 
 ---
 
-**最后更新**：2026-04-22（P3 生产级上线：支付 + BullMQ + 生产部署）
+**最后更新**：2026-04-22（Codex GPT-5.4 架构审查 + 22 个 findings 全部修复：P1 并发/RBAC/支付原子/定价权威 + P2 索引/CTE/refresh 原子/CORS 等）
 **前端 mock 占比**：~5%（只剩 DashboardPage 的静态"产品结构"饼图）
 **下一次架构 review**：真实支付 SDK + 监控指标 + 渗透测试后
+
+## 🔴 Codex GPT-5.4 审查后续 TODO（低优先，已文档化）
+
+以下 4 项 P2 因工程量较大延后，不影响上生产核心流程：
+1. **Refresh token HttpOnly cookie** — 改防 XSS token 泄露；要改双端 auth flow + CSRF token（V2）
+2. **Settlement 批量聚合查询** — 当前按 agent 串行；规模 >50 agent/月才明显（V2）
+3. **OpenAPI / Zod → 共享类型生成** — 前后端类型手抄 drift 风险（V2）
+4. **后端核心测试覆盖** — orders/payments/settlements 并发与状态机 vitest 套件（M6.5）

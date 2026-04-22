@@ -430,17 +430,17 @@ function round2(n: number): number {
 
 async function getDescendantAgentIds(agentId: string | undefined): Promise<string[]> {
   if (!agentId) return [];
-  const ids = new Set<string>([agentId]);
-  let frontier: string[] = [agentId];
-  while (frontier.length) {
-    const children = await prisma.agent.findMany({
-      where: { parentAgentId: { in: frontier } },
-      select: { id: true },
-    });
-    frontier = children.map((c) => c.id).filter((id) => !ids.has(id));
-    frontier.forEach((id) => ids.add(id));
-  }
-  return Array.from(ids);
+  // PostgreSQL 递归 CTE 一次查完（避免每层 findMany 放大）
+  const rows = await prisma.$queryRaw<Array<{ id: string }>>`
+    WITH RECURSIVE agent_tree AS (
+      SELECT id FROM "Agent" WHERE id = ${agentId}
+      UNION ALL
+      SELECT a.id FROM "Agent" a
+      INNER JOIN agent_tree t ON a."parentAgentId" = t.id
+    )
+    SELECT id FROM agent_tree
+  `;
+  return rows.map((r) => r.id);
 }
 
 // ── Serializer ───────────────────────────────────────────────────────

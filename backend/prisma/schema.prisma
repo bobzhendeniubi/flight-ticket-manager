@@ -276,6 +276,8 @@ model CommissionRecord {
   @@index([agentId, status])
   @@index([orderId])
   @@index([settlementId])
+  // 结算热路径：按 (agentId, status, createdAt) 查本期 ACCRUED
+  @@index([agentId, status, createdAt])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -591,20 +591,20 @@ export class OrderService {
     }
   }
 
-  // 查自己 + 所有后代代理 id（递归 BFS）
+  // 查自己 + 所有后代代理 id — 用 PostgreSQL 递归 CTE 一次查完
+  // 之前是按层 BFS 每层一次 findMany，代理树深就会放大 N 倍
   private async getDescendantAgentIds(agentId: string | undefined): Promise<string[]> {
     if (!agentId) return [];
-    const ids = new Set<string>([agentId]);
-    let frontier: string[] = [agentId];
-    while (frontier.length) {
-      const children = await prisma.agent.findMany({
-        where: { parentAgentId: { in: frontier } },
-        select: { id: true },
-      });
-      frontier = children.map((c) => c.id).filter((id) => !ids.has(id));
-      frontier.forEach((id) => ids.add(id));
-    }
-    return Array.from(ids);
+    const rows = await prisma.$queryRaw<Array<{ id: string }>>`
+      WITH RECURSIVE agent_tree AS (
+        SELECT id FROM "Agent" WHERE id = ${agentId}
+        UNION ALL
+        SELECT a.id FROM "Agent" a
+        INNER JOIN agent_tree t ON a."parentAgentId" = t.id
+      )
+      SELECT id FROM agent_tree
+    `;
+    return rows.map((r) => r.id);
   }
 }
 
@@ -750,6 +750,8 @@ async function createCommissionsForOrder(
     if (!productKind) continue; // INSURANCE/FEE/DISCOUNT 不算佣金
 
     // 取链路上每个代理对该 productKind 的 rate（有效期内）
+    // 按 effectiveFrom DESC 排序，每个 agent 取第一条 = 最新生效的规则
+    // （之前是"取最大 rate"，降档后还按高佣跑，是 bug）
     const rules = await tx.commissionRule.findMany({
       where: {
         agentId: { in: chain.map((c) => c.agentId) },
@@ -757,12 +759,11 @@ async function createCommissionsForOrder(
         effectiveFrom: { lte: new Date() },
         OR: [{ effectiveTo: null }, { effectiveTo: { gte: new Date() } }],
       },
+      orderBy: { effectiveFrom: 'desc' },
     });
     const rateByAgent = new Map<string, number>();
     for (const r of rules) {
-      // 同一 agent 可能多条规则（不同 effectiveFrom），取最新的
-      const existing = rateByAgent.get(r.agentId);
-      if (existing === undefined || Number(r.rate) > existing) {
+      if (!rateByAgent.has(r.agentId)) {
         rateByAgent.set(r.agentId, Number(r.rate));
       }
     }

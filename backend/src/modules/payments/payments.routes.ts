@@ -30,9 +30,18 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
   app.post('/', { preHandler: [app.authenticate] }, async (req, reply) => {
     const body = createPaymentBodySchema.parse(req.body);
     const baseUrl = `${req.protocol}://${req.headers.host}/api`;
+    // AGENT 角色需补 agentId 做权限校验
+    let agentId: string | undefined;
+    if (req.user.role === 'AGENT') {
+      const agent = await prisma.agent.findUnique({
+        where: { userId: req.user.sub },
+        select: { id: true },
+      });
+      agentId = agent?.id;
+    }
     const result = await service.createPayment(
       body,
-      { userId: req.user.sub, role: req.user.role },
+      { userId: req.user.sub, role: req.user.role, agentId, actorType: 'USER' },
       baseUrl,
     );
 

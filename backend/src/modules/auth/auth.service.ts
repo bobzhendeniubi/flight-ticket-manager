@@ -80,11 +80,19 @@ export class AuthService {
       throw new UnauthorizedError('Invalid or expired refresh token');
     }
 
-    // Rotate: revoke old, issue new.
-    await prisma.refreshToken.update({
-      where: { id: record.id },
+    // ── 原子轮换：CAS revoke — 并发两个 refresh 只会有一个成功 ──
+    // 若已被撤销（count=0），视为 token 重放，撤销该用户所有 token 强制重登录
+    const cas = await prisma.refreshToken.updateMany({
+      where: { id: record.id, revokedAt: null },
       data: { revokedAt: new Date() },
     });
+    if (cas.count !== 1) {
+      await prisma.refreshToken.updateMany({
+        where: { userId: record.userId, revokedAt: null },
+        data: { revokedAt: new Date() },
+      });
+      throw new UnauthorizedError('Refresh token reuse detected, please login again');
+    }
 
     return this.issueTokens(record.user, ctx);
   }

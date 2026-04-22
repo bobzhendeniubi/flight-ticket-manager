@@ -29,6 +29,12 @@ export interface AuditEntry {
   severity?: AuditSeverity;
 }
 
+// 审计失败计数器（给监控系统抓取 /metrics 用）
+let auditWriteFailureCount = 0;
+export function getAuditFailureCount(): number {
+  return auditWriteFailureCount;
+}
+
 export async function writeAudit(entry: AuditEntry): Promise<void> {
   try {
     await prisma.auditLog.create({
@@ -48,9 +54,29 @@ export async function writeAudit(entry: AuditEntry): Promise<void> {
       },
     });
   } catch (err) {
-    // 审计写失败不应影响主流程；只记日志
+    // 审计写失败不应影响主流程；但必须留有迹可循：
+    // 1) 结构化 JSON log 方便日志收集（Loki/CloudWatch 抓 level=error + type=audit_write_failed）
+    // 2) 内存计数器 + /metrics 端点可读（未来接 Prometheus）
+    // 3) CRITICAL 级审计（支付 / 结算 PAID）失败时抛到主流程让调用方决定
+    auditWriteFailureCount++;
+    const structured = {
+      level: 'error',
+      type: 'audit_write_failed',
+      action: entry.action,
+      targetType: entry.targetType,
+      targetId: entry.targetId ?? null,
+      severity: entry.severity ?? 'INFO',
+      actorUserId: entry.actor.userId ?? null,
+      error: err instanceof Error ? err.message : String(err),
+      at: new Date().toISOString(),
+    };
     // eslint-disable-next-line no-console
-    console.error('[audit] failed to write:', err, entry);
+    console.error(JSON.stringify(structured));
+
+    // 关键操作审计失败要上抛 — 调用方可选择重试或回滚
+    if (entry.severity === AuditSeverity.CRITICAL) {
+      throw err;
+    }
   }
 }
 
