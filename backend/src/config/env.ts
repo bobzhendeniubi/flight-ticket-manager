@@ -20,6 +20,14 @@ const EnvSchema = z.object({
   CORS_ORIGINS: z.string().optional(),
   CORS_ORIGIN: z.string().optional(),
 
+  // 公网基准 URL — 用于生成支付回调 notifyUrl / sandbox paymentUrl / 邮件/短信里的跳转链接
+  // 生产必须显式设（例如 https://api.citur.com）；开发默认 http://localhost:4000
+  APP_PUBLIC_URL: z.string().url().optional(),
+
+  // 支付沙箱前端跳转页 — SandboxAdapter 生成的付款 URL 基准
+  // 默认 /sandbox-pay（同域相对路径，前端 nginx 提供静态页或路由）
+  SANDBOX_PAY_URL_PATH: z.string().default('/sandbox-pay'),
+
   WECHAT_APP_ID: z.string().optional(),
   WECHAT_APP_SECRET: z.string().optional(),
 
@@ -53,3 +61,14 @@ export const corsOrigins =
   rawCorsOrigins === '*'
     ? true
     : rawCorsOrigins.split(',').map((s) => s.trim()).filter(Boolean);
+
+/** 公网基准 URL — 用于生成 webhook callback、跳转链接 */
+export const appPublicUrl: string =
+  env.APP_PUBLIC_URL ??
+  (env.NODE_ENV === 'production' ? '' : `http://localhost:${env.PORT}`);
+
+if (env.NODE_ENV === 'production' && !appPublicUrl) {
+  // eslint-disable-next-line no-console
+  console.error('❌ APP_PUBLIC_URL must be set in production (used for payment webhooks)');
+  process.exit(1);
+}

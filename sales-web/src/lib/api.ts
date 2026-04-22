@@ -1,7 +1,13 @@
 /**
  * 后端 REST API 的轻量 fetch 封装。
- * 所有端点都在 /api 下，由 vite-dev 代理到 http://localhost:4000。
+ *
+ * API base URL 可通过构建时 env 注入（Vite 约定 VITE_ 前缀）：
+ *   - 开发：默认 /api（vite-dev 代理到 http://localhost:4000）
+ *   - 生产：例如 VITE_API_BASE=https://api.citur.com 或保留 /api（前端 nginx 反代）
+ *
+ * 运行时 env 不可用（静态 HTML 已编译）；若要切域名必须重新构建镜像。
  */
+const API_BASE: string = (import.meta.env?.VITE_API_BASE as string | undefined)?.trim() || '/api';
 export interface ApiErrorBody {
   error: { code: string; message: string; details?: unknown };
 }
@@ -29,7 +35,7 @@ export async function apiFetch<T>(path: string, init: ApiRequestInit = {}): Prom
   if (init.body !== undefined) headers.set('Content-Type', 'application/json');
   if (init.token) headers.set('Authorization', `Bearer ${init.token}`);
 
-  const res = await fetch(`/api${path}`, {
+  const res = await fetch(`${API_BASE}${path}`, {
     ...init,
     headers,
     body: init.body !== undefined ? JSON.stringify(init.body) : undefined,

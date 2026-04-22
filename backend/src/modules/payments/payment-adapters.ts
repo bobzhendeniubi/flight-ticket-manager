@@ -58,10 +58,11 @@ export class SandboxAdapter implements PaymentAdapter {
   }
 
   async createPayment(input: CreatePaymentInput): Promise<CreatePaymentResult> {
-    // 模拟一个可跳转的付款页
+    // 模拟一个可跳转的付款页。路径由 SANDBOX_PAY_URL_PATH env 控制（默认 /sandbox-pay）
     const fakeTxId = 'SBX' + Date.now() + crypto.randomBytes(4).toString('hex');
+    const sandboxPath = process.env.SANDBOX_PAY_URL_PATH || '/sandbox-pay';
     return {
-      paymentUrl: `/sandbox-pay?paymentId=${encodeURIComponent(input.paymentId)}&amount=${input.amountYuan}`,
+      paymentUrl: `${sandboxPath}?paymentId=${encodeURIComponent(input.paymentId)}&amount=${input.amountYuan}`,
       transactionId: fakeTxId,
       needsPolling: false,
       raw: { provider: 'sandbox', fakeTxId },

@@ -79,6 +79,7 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-info}
       # 必须显式设置（生产 sandbox 等于公开伪造支付接口，拒绝默认值）
       PAYMENT_MODE: ${PAYMENT_MODE:?must set PAYMENT_MODE (live|sandbox — live for production)}
+      APP_PUBLIC_URL: ${APP_PUBLIC_URL:?must set APP_PUBLIC_URL for payment webhooks (e.g. https://api.citur.com)}
       SANDBOX_WEBHOOK_SECRET: ${SANDBOX_WEBHOOK_SECRET:-sandbox-test-secret}
       ENABLE_AUTO_FULFILLMENT: ${ENABLE_AUTO_FULFILLMENT:-true}
     # 启动前自动跑 migration
@@ -114,7 +115,8 @@ services:
       context: .
       dockerfile: sales-web/Dockerfile
       args:
-        VITE_API_BASE: /api
+        # 浏览器运行时访问后端的 URL。同域反代保留 /api；独立域名改成完整 URL
+        VITE_API_BASE: ${VITE_API_BASE:-/api}
     container_name: ftm-sales-web-prod
     restart: unless-stopped
     depends_on:
@@ -127,7 +129,7 @@ services:
       context: .
       dockerfile: admin-web/Dockerfile
       args:
-        VITE_API_BASE: /api
+        VITE_API_BASE: ${VITE_API_BASE:-/api}
     container_name: ftm-admin-web-prod
     restart: unless-stopped
     depends_on:

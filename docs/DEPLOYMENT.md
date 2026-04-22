@@ -91,7 +91,15 @@ admin.citur.com {
   openssl rand -base64 32   # SANDBOX_WEBHOOK_SECRET
   openssl rand -base64 24   # POSTGRES_PASSWORD
   ```
-- [ ] 配置 `CORS_ORIGINS` 为真实域名（不要 *）
+- [ ] 配置 `CORS_ORIGINS` 为真实域名（不要 *；backend 生产会 refuse *）
+- [ ] 配置 `APP_PUBLIC_URL`（例 `https://api.citur.com`）— 支付回调、邮件链接都基于此，不能用 Host header
+- [ ] 构建前端镜像时传 `VITE_API_BASE`：
+  ```bash
+  # 同域反代（推荐）
+  VITE_API_BASE=/api docker-compose -f docker-compose.prod.yml build sales-web admin-web
+  # 或独立 API 域名
+  VITE_API_BASE=https://api.citur.com docker-compose build sales-web admin-web
+  ```
 - [ ] 切 `PAYMENT_MODE=live`，配 WeChat/Alipay 真实 key
 - [ ] 外层 HTTPS（Caddy 或云 LB）
 - [ ] DB 备份脚本 + off-site 存储（S3 / COS）

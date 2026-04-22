@@ -15,6 +15,7 @@ import {
 import { PaymentsService } from './payments.service.js';
 import { createPaymentBodySchema, sandboxConfirmBodySchema } from './payments.schemas.js';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
+import { appPublicUrl } from '../../config/env.js';
 
 const PROVIDER_TO_METHOD: Record<string, PaymentMethod> = {
   wechat: PaymentMethod.WECHAT_PAY,
@@ -29,7 +30,9 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
   // ── 创建支付 ───────────────────────────────────────
   app.post('/', { preHandler: [app.authenticate] }, async (req, reply) => {
     const body = createPaymentBodySchema.parse(req.body);
-    const baseUrl = `${req.protocol}://${req.headers.host}/api`;
+    // baseUrl 必须从 env 读，不能用 req.headers.host（可被 Host header 伪造）
+    // 用户侧看到的域名可能和后端公网域名不同；webhook 走后端真实公网 URL
+    const baseUrl = `${appPublicUrl.replace(/\/$/, '')}/api`;
     // AGENT 角色需补 agentId 做权限校验
     let agentId: string | undefined;
     if (req.user.role === 'AGENT') {

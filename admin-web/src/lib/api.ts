@@ -1,7 +1,12 @@
 /**
  * SHARED with sales-web/src/lib/api.ts — keep them in sync (admin-web subset).
- * 后端 REST API 封装。所有端点都在 /api 下，由 vite-dev 代理到 :4000。
+ *
+ * API base URL 通过构建时 env 注入：
+ *   - 开发：默认 /api（vite-dev 代理到 http://localhost:4000）
+ *   - 生产：VITE_API_BASE=https://api.citur.com（或 /api 走前端 nginx 反代）
  */
+const API_BASE: string = (import.meta.env?.VITE_API_BASE as string | undefined)?.trim() || '/api';
+
 export interface ApiErrorBody {
   error: { code: string; message: string; details?: unknown };
 }
@@ -29,7 +34,7 @@ export async function apiFetch<T>(path: string, init: ApiRequestInit = {}): Prom
   if (init.body !== undefined) headers.set('Content-Type', 'application/json');
   if (init.token) headers.set('Authorization', `Bearer ${init.token}`);
 
-  const res = await fetch(`/api${path}`, {
+  const res = await fetch(`${API_BASE}${path}`, {
     ...init,
     headers,
     body: init.body !== undefined ? JSON.stringify(init.body) : undefined,
