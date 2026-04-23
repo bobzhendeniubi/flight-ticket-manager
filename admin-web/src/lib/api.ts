@@ -635,4 +635,37 @@ export const api = {
     apiFetch<{ tasks: FulfillmentTask[] }>(`/fulfillment-tasks/by-order/${orderId}`, { token }),
   updateFulfillmentTask: (token: string, id: string, body: Record<string, unknown>) =>
     apiFetch<{ task: FulfillmentTask }>(`/fulfillment-tasks/${id}`, { method: 'PATCH', token, body }),
+  reissueFulfillmentTask: (token: string, id: string) =>
+    apiFetch<{ task: FulfillmentTask }>(`/fulfillment-tasks/${id}/reissue`, { method: 'POST', token }),
+  resendItineraryEmail: (token: string, orderId: string) =>
+    apiFetch<{
+      orderNumber: string;
+      result:
+        | { status: 'sent'; sentTo: string; messageId?: string }
+        | { status: 'no_email' }
+        | { status: 'not_all_ticketed'; ticketedCount: number; totalCount: number }
+        | { status: 'smtp_disabled'; wouldSendTo: string }
+        | { status: 'no_flights' };
+    }>(`/fulfillment-tasks/by-order/${orderId}/resend-itinerary`, { method: 'POST', token }),
+
+  // Pricing — 日期等级
+  listDateRankings: (token: string, from: string, to: string) =>
+    apiFetch<{
+      rankings: Array<{
+        date: string;
+        rank: 'A' | 'B' | 'C' | 'D';
+        reason: string | null;
+        isManual: boolean;
+        source: 'db' | 'default';
+      }>;
+    }>(`/pricing/date-rankings?from=${from}&to=${to}`, { token }),
+  overrideDateRanking: (
+    token: string,
+    date: string,
+    body: { rank: 'A' | 'B' | 'C' | 'D'; reason?: string },
+  ) => apiFetch<{ ranking: unknown }>(`/pricing/date-rankings/${date}`, {
+    method: 'PATCH', token, body,
+  }),
+  resetDateRanking: (token: string, date: string) =>
+    apiFetch<{ ok: boolean }>(`/pricing/date-rankings/${date}`, { method: 'DELETE', token }),
 };

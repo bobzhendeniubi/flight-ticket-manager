@@ -661,10 +661,39 @@ function FulfillmentSection({ orderId }: { orderId: string }) {
     );
   }
 
+  const hasTicketed = tasks.some((t) => t.type === 'FLIGHT_TICKETING' && t.status === 'CONFIRMED');
+
   return (
     <section>
       <div className="flex items-center justify-between">
         <h3 className="text-sm font-medium text-slate-700">🚚 履约进度</h3>
+        {hasTicketed && (
+          <button
+            className="text-xs rounded bg-blue-100 px-2 py-0.5 text-blue-700 hover:bg-blue-200"
+            onClick={async () => {
+              if (!tokens?.accessToken) return;
+              try {
+                const r = await api.resendItineraryEmail(tokens.accessToken, orderId);
+                const res = r.result;
+                if (res.status === 'sent') {
+                  alert(`✓ 行程单已发送至 ${res.sentTo}`);
+                } else if (res.status === 'not_all_ticketed') {
+                  alert(`⚠ 还有 ${res.totalCount - res.ticketedCount} 段航班未出票，无法生成完整行程单。请等所有航段出票后再重发。`);
+                } else if (res.status === 'smtp_disabled') {
+                  alert(`⚠ SMTP 未配置，邮件未真发送（应发至 ${res.wouldSendTo}）。请联系运维配置 SMTP_HOST。`);
+                } else if (res.status === 'no_flights') {
+                  alert('该订单没有机票段，无行程单可发');
+                } else {
+                  alert('该订单没有联系邮箱，无法发送');
+                }
+              } catch (e) {
+                alert(e instanceof ApiError ? `重发失败：${e.message}` : '重发失败');
+              }
+            }}
+          >
+            📧 重发行程单邮件
+          </button>
+        )}
       </div>
       <div className="mt-2 space-y-2">
         {tasks.map((t) => {
@@ -720,6 +749,24 @@ function FulfillmentSection({ orderId }: { orderId: string }) {
                       const reason = prompt('失败原因？');
                       if (reason !== null) updateStatus(t, 'FAILED' as ApiFfStatus);
                     }}>✗ 失败</button>
+                  )}
+                  {t.type === 'FLIGHT_TICKETING' && (t.status === 'CONFIRMED' || t.status === 'FAILED') && (
+                    <button
+                      className="text-xs rounded bg-amber-100 px-2 py-0.5 text-amber-700 hover:bg-amber-200"
+                      onClick={async () => {
+                        if (!tokens?.accessToken) return;
+                        if (!confirm('强制重新出票？当前 PNR 会清空，任务重新排队执行。')) return;
+                        try {
+                          const res = await api.reissueFulfillmentTask(tokens.accessToken, t.id);
+                          setTasks((prev) => prev.map((x) => (x.id === t.id ? res.task : x)));
+                          alert('已重新排队，稍后刷新查看新 PNR');
+                        } catch (e) {
+                          alert(e instanceof ApiError ? `重出票失败：${e.message}` : '重出票失败');
+                        }
+                      }}
+                    >
+                      🔄 重新出票
+                    </button>
                   )}
                 </div>
               )}

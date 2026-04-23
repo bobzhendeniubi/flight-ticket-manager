@@ -13,7 +13,7 @@
  */
 import { FulfillmentStatus, FulfillmentType, OrderItemKind, Prisma } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
-import { NotFoundError } from '../../lib/errors.js';
+import { ConflictError, NotFoundError } from '../../lib/errors.js';
 import type { ListFulfillmentQuery, UpdateFulfillmentBody } from './fulfillment.schemas.js';
 
 const KIND_TO_TYPE: Record<OrderItemKind, FulfillmentType | null> = {
@@ -142,6 +142,101 @@ export class FulfillmentService {
     return {
       ...serializeTask(updated, updated.orderItem),
       order: updated.orderItem.order,
+    };
+  }
+
+  /**
+   * 强制重新出票 — 清空结果数据、重置为 PENDING、重新 enqueue BullMQ。
+   *
+   * 只允许从 CONFIRMED / FAILED 发起（对应出了票想改座，或失败想重试）。
+   * PENDING / IN_PROGRESS / CANCELLED 拒绝：前者说明还没到终态不需要 reissue；
+   * IN_PROGRESS 若允许，会和当前正在跑的 worker job 并发出 2 个不同 PNR（重复出票风险）。
+   */
+  async reissue(id: string) {
+    const existing = await prisma.fulfillmentTask.findUnique({
+      where: { id },
+      include: { orderItem: true },
+    });
+    if (!existing) throw new NotFoundError('履约任务不存在');
+    if (existing.type !== FulfillmentType.FLIGHT_TICKETING) {
+      throw new NotFoundError('reissue 仅支持 FLIGHT_TICKETING 任务');
+    }
+    if (
+      existing.status !== FulfillmentStatus.CONFIRMED &&
+      existing.status !== FulfillmentStatus.FAILED
+    ) {
+      throw new ConflictError(
+        `任务当前状态 ${existing.status} 不可 reissue（仅 CONFIRMED / FAILED 允许重出票）`,
+      );
+    }
+
+    // CAS — 只在状态仍是 CONFIRMED/FAILED 时清空并重排（防并发 reissue 造双 PNR）
+    const upd = await prisma.fulfillmentTask.updateMany({
+      where: {
+        id,
+        status: { in: [FulfillmentStatus.CONFIRMED, FulfillmentStatus.FAILED] },
+      },
+      data: {
+        status: FulfillmentStatus.PENDING,
+        startedAt: null,
+        completedAt: null,
+        failureReason: null,
+        data: Prisma.JsonNull,
+      },
+    });
+    if (upd.count === 0) {
+      throw new ConflictError('并发 reissue 冲突，请刷新后重试');
+    }
+
+    const updated = await prisma.fulfillmentTask.findUniqueOrThrow({
+      where: { id },
+      include: { orderItem: { include: { order: { select: { id: true, orderNumber: true, contactName: true, contactPhone: true, status: true } } } } },
+    });
+
+    // 同步清空本订单乘客的 PNR（出票成功后会重新写回）
+    await prisma.passenger.updateMany({
+      where: { orderId: updated.orderItem.orderId },
+      data: { pnr: null, eticketNumber: null },
+    });
+
+    // 重新排队 — 用 jobId=taskId+时间戳 防和旧 job 碰撞
+    const { fulfillmentQueue } = await import('../../queues/queue.js');
+    await fulfillmentQueue.add(
+      'auto-fulfill',
+      { taskId: id },
+      { jobId: `${id}:${Date.now()}`, delay: 500 },
+    );
+
+    return {
+      ...serializeTask(updated, updated.orderItem),
+      order: updated.orderItem.order,
+    };
+  }
+
+  /**
+   * 重发电子行程单。
+   *
+   * 返回结构化结果 —— UI 能准确告诉用户实际发生了什么：
+   *   sent              : 邮件已真发送
+   *   not_all_ticketed  : 多段订单部分未出票（运营需等全部出完再重发）
+   *   smtp_disabled     : SMTP 未配置（demo/本地）—— 生产应告警
+   *   no_email / no_flights : 订单状态不合法 —— 抛 400
+   */
+  async resendItinerary(orderId: string) {
+    const order = await prisma.order.findUnique({
+      where: { id: orderId },
+      select: { id: true, orderNumber: true, contactEmail: true },
+    });
+    if (!order) throw new NotFoundError('订单不存在');
+    if (!order.contactEmail) {
+      throw new NotFoundError('订单没有联系邮箱，无法发送行程单');
+    }
+
+    const { sendItineraryEmail } = await import('../../lib/itinerary-email.js');
+    const result = await sendItineraryEmail(orderId);
+    return {
+      orderNumber: order.orderNumber,
+      result,
     };
   }
 }

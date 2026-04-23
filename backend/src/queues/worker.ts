@@ -11,8 +11,15 @@
 import { Worker } from 'bullmq';
 import { prisma } from '../db/prisma.js';
 import { env } from '../config/env.js';
-import { FulfillmentStatus, FulfillmentType, Prisma } from '@prisma/client';
-import { bullRedis, type FulfillmentJobData, type NotificationJobData } from './queue.js';
+import { FulfillmentStatus, FulfillmentType, OrderStatus, Prisma } from '@prisma/client';
+import {
+  bullRedis,
+  type FulfillmentJobData,
+  type NotificationJobData,
+  type SeatHoldJobData,
+} from './queue.js';
+import { closeMailer } from '../lib/mailer.js';
+import { sendItineraryEmail } from '../lib/itinerary-email.js';
 
 // ══════════════════════════════════════════════════════════════════
 // Fulfillment Worker — 处理出票 / 酒店预订 / 签证 / 接送
@@ -38,15 +45,20 @@ const fulfillmentWorker = new Worker<FulfillmentJobData>(
       return { skipped: true, status: task.status };
     }
 
-    // 标 IN_PROGRESS
-    await prisma.fulfillmentTask.update({
-      where: { id: taskId },
+    // CAS 标 IN_PROGRESS —— 只在当前还是 PENDING 时抢占
+    // 防止 reissue 并发、或 BullMQ retry 抖动造成两个 worker 同时执行 → 出双 PNR。
+    const claimed = await prisma.fulfillmentTask.updateMany({
+      where: { id: taskId, status: FulfillmentStatus.PENDING },
       data: {
         status: FulfillmentStatus.IN_PROGRESS,
         startedAt: task.startedAt ?? new Date(),
         attempts: { increment: 1 },
       },
     });
+    if (claimed.count === 0) {
+      // 别的 worker 抢到了；直接退出（幂等）
+      return { skipped: true, reason: 'claim race lost' };
+    }
 
     // 模拟 2-5 秒供应商 API 调用
     const simulateDelay = job.data.simulateDelay ?? 2000 + Math.random() * 3000;
@@ -91,6 +103,12 @@ const fulfillmentWorker = new Worker<FulfillmentJobData>(
         where: { orderId: task.orderItem.orderId },
         data: { pnr: data.pnr, eticketNumber: data.eTicketNumber },
       });
+
+      // 渲染 PDF + 发邮件（非阻塞主流程，失败进 catch）
+      void sendItineraryEmail(task.orderItem.orderId).catch((e) => {
+        // eslint-disable-next-line no-console
+        console.error(`[worker:fulfillment] itinerary email failed for order ${task.orderItem.orderId}:`, e);
+      });
     }
 
     // eslint-disable-next-line no-console
@@ -113,6 +131,90 @@ fulfillmentWorker.on('failed', (job, err) => {
       data: { status: FulfillmentStatus.FAILED, failureReason: err.message, completedAt: new Date() },
     }).catch(() => {/* best-effort */});
   }
+});
+
+// ══════════════════════════════════════════════════════════════════
+// Seat-Hold Expiry Worker — 订单超时未支付自动取消并释放座位
+//
+// 触发：createOrder 时排队 delay = paymentExpiresAt - now（~30 min）。
+// 执行：
+//   1. 查订单；若已 PAID / CANCELLED / PAYMENT_TIMEOUT 直接退出（幂等）
+//   2. 对每个 FLIGHT item 做 `UPDATE sold = sold - qty WHERE sold >= qty`（CAS 防负值）
+//   3. 订单状态 → PAYMENT_TIMEOUT + 写 OrderStatusEvent
+// ══════════════════════════════════════════════════════════════════
+const seatHoldWorker = new Worker<SeatHoldJobData>(
+  'seat-hold',
+  async (job) => {
+    const { orderId } = job.data;
+    // eslint-disable-next-line no-console
+    console.log(`[worker:seat-hold] checking expiry for order ${orderId}`);
+
+    const order = await prisma.order.findUnique({
+      where: { id: orderId },
+      include: { items: true },
+    });
+    if (!order) return { skipped: true, reason: 'order not found' };
+
+    // 幂等：非 PENDING_PAYMENT 直接跳过
+    if (order.status !== OrderStatus.PENDING_PAYMENT) {
+      return { skipped: true, reason: `status=${order.status}` };
+    }
+
+    // 已手动延长过期时间（e.g. 客户协商）→ 重新排队剩余时长
+    if (order.paymentExpiresAt && order.paymentExpiresAt.getTime() > Date.now()) {
+      return { skipped: true, reason: 'expiresAt extended', requeueSuggested: true };
+    }
+
+    // 事务：释放座位 + 标订单 PAYMENT_TIMEOUT
+    await prisma.$transaction(async (tx) => {
+      for (const item of order.items) {
+        if (item.kind !== 'FLIGHT' || !item.flightScheduleId || !item.flightCabin) continue;
+        await tx.$executeRaw`
+          UPDATE "FlightSeatClass"
+          SET sold = sold - ${item.quantity}, "updatedAt" = NOW()
+          WHERE "scheduleId" = ${item.flightScheduleId}
+            AND cabin = ${item.flightCabin}::"CabinClass"
+            AND sold >= ${item.quantity}
+        `;
+      }
+
+      // 二次 CAS — 只在状态仍是 PENDING_PAYMENT 时更新
+      // 如果别人刚刚改了状态（e.g. 支付到达），抛错让整个 tx 回滚（包括座位释放）
+      const upd = await tx.order.updateMany({
+        where: { id: orderId, status: OrderStatus.PENDING_PAYMENT },
+        data: { status: OrderStatus.PAYMENT_TIMEOUT },
+      });
+      if (upd.count === 0) {
+        throw new Error('ORDER_STATUS_CHANGED_DURING_EXPIRY');
+      }
+
+      await tx.orderStatusEvent.create({
+        data: {
+          orderId,
+          fromStatus: OrderStatus.PENDING_PAYMENT,
+          toStatus: OrderStatus.PAYMENT_TIMEOUT,
+          reason: '支付超时自动取消 — 释放座位',
+        },
+      });
+    });
+
+    // eslint-disable-next-line no-console
+    console.log(`[worker:seat-hold] ✓ order ${orderId} expired + seats released`);
+    return { orderId, released: true };
+  },
+  { connection: bullRedis, concurrency: 5 },
+);
+
+seatHoldWorker.on('failed', (job, err) => {
+  // 正常情况（支付刚到达）我们主动抛 ORDER_STATUS_CHANGED_DURING_EXPIRY 让 tx 回滚，
+  // 这不算真故障。其他错误才告警。
+  if (err.message === 'ORDER_STATUS_CHANGED_DURING_EXPIRY') {
+    // eslint-disable-next-line no-console
+    console.log(`[worker:seat-hold] ○ order ${job?.data.orderId} paid or cancelled during expiry race`);
+    return;
+  }
+  // eslint-disable-next-line no-console
+  console.error(`[worker:seat-hold] ✗ job ${job?.id} failed:`, err.message);
 });
 
 // ══════════════════════════════════════════════════════════════════
@@ -140,8 +242,10 @@ async function shutdown() {
   console.log('[worker] shutting down…');
   await Promise.all([
     fulfillmentWorker.close(),
+    seatHoldWorker.close(),
     notificationWorker.close(),
   ]);
+  await closeMailer();
   await prisma.$disconnect();
   await bullRedis.quit();
   process.exit(0);
@@ -151,6 +255,7 @@ process.on('SIGINT', shutdown);
 
 // eslint-disable-next-line no-console
 console.log(`[worker] started · NODE_ENV=${env.NODE_ENV} · redis=${env.REDIS_URL.split('@').pop()}`);
+
 
 // ── helpers ──
 function genPnr(): string {

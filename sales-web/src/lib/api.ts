@@ -240,6 +240,7 @@ export interface OrderSummary {
   contactName: string;
   contactPhone: string;
   contactEmail: string | null;
+  paymentExpiresAt: string | null;
   createdAt: string;
   updatedAt: string;
   items: OrderItem[];

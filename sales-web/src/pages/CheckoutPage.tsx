@@ -3,7 +3,7 @@
  *
  * 下单流程：POST /orders → 服务端重算价格 + 扣座位 + 生成订单号 → 跳完成页。
  */
-import { FormEvent, useMemo, useState } from 'react';
+import { FormEvent, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useCart, KIND_INFO } from '../stores/cart';
 import { useAuth } from '../stores/auth';
@@ -44,7 +44,21 @@ export function CheckoutPage() {
   const [paymentMethod, setPaymentMethod] = useState<CreateOrderInput['paymentMethod']>('WECHAT_PAY');
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  const [done, setDone] = useState<{ orderNumber: string; total: string } | null>(null);
+  const [done, setDone] = useState<{
+    orderNumber: string;
+    total: string;
+    paymentExpiresAt: string | null;
+  } | null>(null);
+
+  // 幂等 key：整个结账会话一个，重试 / 重提交复用（防止双击造两单）
+  // useMemo 只跑一次；重新下单（done 后换页）会自然创建新组件 → 新 key
+  const idempotencyKey = useMemo(
+    () =>
+      typeof crypto !== 'undefined' && 'randomUUID' in crypto
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    [],
+  );
 
   // 需要出行人的总人数 = 机票张数（取 meta.passengers，因 FLIGHT 购物车 qty=1 是技巧）
   const flightTicketCount = useMemo(
@@ -82,6 +96,9 @@ export function CheckoutPage() {
         <p className="mt-2 text-sm text-slate-700">
           应付 <span className="text-lg font-bold text-red-600">¥{Number(done.total).toLocaleString()}</span>
         </p>
+        {done.paymentExpiresAt && (
+          <HoldCountdown expiresAt={done.paymentExpiresAt} />
+        )}
         <p className="mt-3 text-sm text-slate-500">
           订单已创建，状态为 <span className="font-medium">待支付</span>。
           运营会在 10 分钟内确认，已发短信至 {contactPhone}
@@ -198,17 +215,18 @@ export function CheckoutPage() {
         }
         return [];
       }),
-      idempotencyKey:
-        typeof crypto !== 'undefined' && 'randomUUID' in crypto
-          ? crypto.randomUUID()
-          : `${Date.now()}-${Math.random().toString(36).slice(2)}`,
+      idempotencyKey,
     };
 
     setSubmitting(true);
     try {
       const { order } = await api.createOrder(tokens.accessToken, body);
       clear();
-      setDone({ orderNumber: order.orderNumber, total: order.total });
+      setDone({
+        orderNumber: order.orderNumber,
+        total: order.total,
+        paymentExpiresAt: order.paymentExpiresAt ?? null,
+      });
     } catch (err) {
       if (err instanceof ApiError) {
         setErrorMsg(`下单失败：${err.message}`);
@@ -572,3 +590,34 @@ function PassengerCard({
     </div>
   );
 }
+
+// ─────────────────────────────────────────────────────────────────
+// HoldCountdown — 展示座位保留倒计时 (mm:ss)。超时提示：订单作废，需重新下单。
+// ─────────────────────────────────────────────────────────────────
+function HoldCountdown({ expiresAt }: { expiresAt: string }) {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+  const endMs = new Date(expiresAt).getTime();
+  const leftMs = Math.max(0, endMs - now);
+  const mm = Math.floor(leftMs / 60000);
+  const ss = Math.floor((leftMs % 60000) / 1000);
+  const expired = leftMs === 0;
+
+  return (
+    <div className={`mt-3 rounded-md px-3 py-2 text-sm ${
+      expired ? 'bg-red-50 text-red-700'
+        : leftMs < 5 * 60 * 1000 ? 'bg-amber-50 text-amber-700'
+        : 'bg-slate-50 text-slate-700'
+    }`}>
+      {expired ? (
+        <>⚠ 支付超时，座位已自动释放。请返回购物车重新下单。</>
+      ) : (
+        <>⏱️ 座位保留中 · 剩余 <strong className="font-mono tabular-nums">{String(mm).padStart(2, '0')}:{String(ss).padStart(2, '0')}</strong> 完成支付，否则座位释放回库存</>
+      )}
+    </div>
+  );
+}
+

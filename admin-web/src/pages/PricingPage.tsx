@@ -1,6 +1,9 @@
 /**
  * 动态定价 — 拉真后端的 QH9588/QH9589 班次，叠加本地 mock 的等级倍率 + ML 需求。
  * 业务背景：澳门→岘港，定价基础是 FlightSeatClass.basePrice。
+ *
+ * 顶部 DateRankingCalendar = 真 API（/pricing/date-rankings），admin 可点单元格改等级；
+ * 底部班次定价视图仍是 mock（per-flight 可视化），不写回 DB。
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, type AdminFlight, type AdminSchedule } from '../lib/api';
@@ -125,6 +128,9 @@ export function PricingPage() {
           基于时段 / 上座率 / ML 需求预测的 ABCD 等级定价引擎。当前 demo 数据：QH9588/9589 未来 7 天班次。
         </p>
       </section>
+
+      <DateRankingCalendar />
+
 
       <section className="grid gap-4 lg:grid-cols-[320px_1fr]">
         {/* 班次列表 */}
@@ -312,3 +318,214 @@ function tierBarColor(tier: 'A' | 'B' | 'C' | 'D') {
     case 'D': return 'bg-green-400';
   }
 }
+
+// ─────────────────────────────────────────────────────────────────
+// DateRankingCalendar — 真 API 驱动的日期等级日历
+//   - 显示从今天起 90 天（13 周 × 7 列 = ~90 个方块）
+//   - 点单元格 → 弹小菜单改 A/B/C/D 或 reset-to-default
+//   - DB override 有粗边框 + 小圆点标记
+// ─────────────────────────────────────────────────────────────────
+
+type Rank = 'A' | 'B' | 'C' | 'D';
+
+interface RankingCell {
+  date: string;
+  rank: Rank;
+  reason: string | null;
+  isManual: boolean;
+  source: 'db' | 'default';
+}
+
+const RANK_MULT: Record<Rank, number> = { A: 1.5, B: 1.2, C: 1.0, D: 0.8 };
+
+function DateRankingCalendar() {
+  const tokens = useAuth((s) => s.tokens);
+  const [rows, setRows] = useState<RankingCell[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState<string | null>(null);
+  const [editing, setEditing] = useState<string | null>(null); // YYYY-MM-DD being edited
+
+  // 区间：今天 → 今天+90 天
+  const { fromDate, toDate } = useMemo(() => {
+    const f = new Date();
+    f.setUTCHours(0, 0, 0, 0);
+    const t = new Date(f.getTime() + 90 * 86400000);
+    return {
+      fromDate: f.toISOString().slice(0, 10),
+      toDate: t.toISOString().slice(0, 10),
+    };
+  }, []);
+
+  const load = useCallback(async () => {
+    if (!tokens) return;
+    setLoading(true);
+    setErr(null);
+    try {
+      const r = await api.listDateRankings(tokens.accessToken, fromDate, toDate);
+      setRows(r.rankings);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : '加载失败');
+    } finally {
+      setLoading(false);
+    }
+  }, [tokens, fromDate, toDate]);
+
+  useEffect(() => {
+    void load();
+  }, [load]);
+
+  const onOverride = async (date: string, rank: Rank) => {
+    if (!tokens) return;
+    try {
+      await api.overrideDateRanking(tokens.accessToken, date, { rank });
+      setEditing(null);
+      await load();
+    } catch (e) {
+      alert(e instanceof Error ? e.message : '保存失败');
+    }
+  };
+
+  const onReset = async (date: string) => {
+    if (!tokens) return;
+    if (!confirm(`重置 ${date} 为默认（按星期几）？`)) return;
+    try {
+      await api.resetDateRanking(tokens.accessToken, date);
+      setEditing(null);
+      await load();
+    } catch (e) {
+      alert(e instanceof Error ? e.message : '重置失败');
+    }
+  };
+
+  if (loading) return <div className="card text-slate-500">日期等级加载中…</div>;
+  if (err) return <div className="card border-red-200 bg-red-50 text-red-700">{err}</div>;
+  if (rows.length === 0) return null;
+
+  // 按周分组显示：每行 7 个 = 一周
+  const weeks: RankingCell[][] = [];
+  for (let i = 0; i < rows.length; i += 7) weeks.push(rows.slice(i, i + 7));
+
+  const manualCount = rows.filter((r) => r.isManual).length;
+
+  return (
+    <section className="card">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 className="text-lg font-semibold text-slate-900">日期等级日历（未来 90 天）</h2>
+          <p className="mt-1 text-xs text-slate-500">
+            点击任一单元格可手动覆盖当日等级。A×1.5 / B×1.2 / C×1.0 / D×0.8 —
+            修改后前台 /flights/price 立即生效。
+            <br />
+            <span className="text-slate-400">
+              共 {rows.length} 天，其中 {manualCount} 天被手动覆盖（有蓝色小点）。
+            </span>
+          </p>
+        </div>
+        <div className="flex gap-2 text-xs">
+          <LegendDot rank="A" /> <LegendDot rank="B" /> <LegendDot rank="C" /> <LegendDot rank="D" />
+        </div>
+      </div>
+
+      <div className="mt-4 space-y-1">
+        {weeks.map((wk, wi) => (
+          <div key={wi} className="grid grid-cols-7 gap-1">
+            {wk.map((c) => (
+              <RankCell
+                key={c.date}
+                cell={c}
+                isEditing={editing === c.date}
+                onClick={() => setEditing(editing === c.date ? null : c.date)}
+                onPick={(rank) => onOverride(c.date, rank)}
+                onReset={() => onReset(c.date)}
+              />
+            ))}
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function RankCell({
+  cell, isEditing, onClick, onPick, onReset,
+}: {
+  cell: RankingCell;
+  isEditing: boolean;
+  onClick: () => void;
+  onPick: (rank: Rank) => void;
+  onReset: () => void;
+}) {
+  const d = new Date(cell.date);
+  const dayNum = d.getUTCDate();
+  const dow = d.getUTCDay();
+  const dowLabel = ['日', '一', '二', '三', '四', '五', '六'][dow];
+
+  return (
+    <div className="relative">
+      <button
+        type="button"
+        onClick={onClick}
+        className={`w-full text-left rounded p-1.5 text-xs transition
+          ${tierBadgeColor(cell.rank)}
+          ${cell.isManual ? 'ring-2 ring-slate-900/60' : 'ring-1 ring-transparent'}
+          hover:scale-[1.02] hover:ring-slate-400`}
+        title={`${cell.date} ${dowLabel} · ${cell.reason ?? ''}`}
+      >
+        <div className="flex items-center justify-between">
+          <span className="text-[10px] opacity-70">{dowLabel}</span>
+          <span className="font-bold text-sm">{cell.rank}</span>
+        </div>
+        <div className="mt-0.5 flex items-end justify-between">
+          <span className="text-[10px] font-semibold">{dayNum}</span>
+          <span className="text-[9px] opacity-60">×{RANK_MULT[cell.rank]}</span>
+        </div>
+        {cell.isManual && (
+          <span className="absolute top-0.5 left-0.5 w-1.5 h-1.5 rounded-full bg-blue-600" />
+        )}
+      </button>
+      {isEditing && (
+        <div
+          className="absolute top-full left-0 z-10 mt-1 w-36 rounded-md border border-slate-300 bg-white p-1 text-xs shadow-lg"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <div className="px-2 py-1 text-slate-500 text-[10px]">
+            改 {cell.date} 为：
+          </div>
+          {(['A', 'B', 'C', 'D'] as const).map((r) => (
+            <button
+              key={r}
+              type="button"
+              onClick={() => onPick(r)}
+              className={`block w-full text-left rounded px-2 py-1 hover:bg-slate-100
+                ${cell.rank === r ? 'font-bold' : ''}`}
+            >
+              <span className={`inline-block w-5 rounded text-center ${tierBadgeColor(r)}`}>{r}</span>
+              <span className="ml-2">×{RANK_MULT[r]}</span>
+            </button>
+          ))}
+          {cell.isManual && (
+            <>
+              <hr className="my-1 border-slate-200" />
+              <button
+                type="button"
+                onClick={onReset}
+                className="block w-full text-left rounded px-2 py-1 text-red-600 hover:bg-red-50"
+              >
+                重置为默认
+              </button>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function LegendDot({ rank }: { rank: Rank }) {
+  return (
+    <span className={`inline-flex items-center rounded px-1.5 py-0.5 font-medium ${tierBadgeColor(rank)}`}>
+      {rank} ×{RANK_MULT[rank]}
+    </span>
+  );
+}
+

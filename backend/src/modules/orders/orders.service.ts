@@ -201,6 +201,19 @@ export class OrderService {
       return created;
     });
 
+    // 事务成功后：排队 seat-hold 自动释放任务（订单未在 paymentExpiresAt 内支付则取消）
+    const holdMs = order.paymentExpiresAt
+      ? Math.max(0, order.paymentExpiresAt.getTime() - Date.now())
+      : 30 * 60 * 1000;
+    try {
+      const { scheduleSeatHoldRelease } = await import('../../queues/queue.js');
+      await scheduleSeatHoldRelease(order.id, holdMs);
+    } catch (err) {
+      // 排队失败不阻塞下单 —— 但记录到日志，值班可能要手动兜底
+      // eslint-disable-next-line no-console
+      console.error('[orders] failed to schedule seat-hold release for', order.id, err);
+    }
+
     return order;
   }
 
@@ -452,6 +465,17 @@ export class OrderService {
           // eslint-disable-next-line no-console
           console.error('[orders] failed to enqueue fulfillment task:', e);
         });
+      }
+    }
+
+    // 终态（PAID / CANCELLED / PAYMENT_TIMEOUT）都不再需要 seat-hold 兜底
+    if (toStatus === 'PAID' || toStatus === 'CANCELLED' || toStatus === 'PAYMENT_TIMEOUT') {
+      try {
+        const { cancelSeatHoldRelease } = await import('../../queues/queue.js');
+        await cancelSeatHoldRelease(id);
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error('[orders] failed to cancel seat-hold job for', id, err);
       }
     }
 

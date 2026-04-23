@@ -44,6 +44,46 @@ export const fulfillmentQueue = new Queue<FulfillmentJobData>('fulfillment', {
 
 export const fulfillmentQueueEvents = new QueueEvents('fulfillment', { connection: bullRedis });
 
+// ── Seat Hold 队列 — 订单 30 分钟未支付自动释放座位 ───────────────
+export interface SeatHoldJobData {
+  orderId: string;
+}
+
+export const seatHoldQueue = new Queue<SeatHoldJobData>('seat-hold', {
+  connection: bullRedis,
+  defaultJobOptions: {
+    attempts: 2, // 幂等：worker 自己判断 order 状态
+    backoff: { type: 'exponential', delay: 5000 },
+    removeOnComplete: { age: 7 * 24 * 3600 },
+    removeOnFail: { age: 30 * 24 * 3600 },
+  },
+});
+
+/**
+ * 订单创建时排队：delay 毫秒后如果订单仍是 PENDING_PAYMENT 则取消 + 释放座位。
+ * jobId 用 `hold:<orderId>`，方便支付成功时 remove() 取消。
+ */
+export async function scheduleSeatHoldRelease(orderId: string, delayMs: number): Promise<void> {
+  await seatHoldQueue.add(
+    'release-seat-hold',
+    { orderId },
+    {
+      jobId: `hold:${orderId}`,
+      delay: delayMs,
+    },
+  );
+}
+
+/** 支付成功或手动取消时调用；若任务已执行（订单已自动取消）则静默返回。 */
+export async function cancelSeatHoldRelease(orderId: string): Promise<void> {
+  try {
+    const job = await seatHoldQueue.getJob(`hold:${orderId}`);
+    if (job) await job.remove();
+  } catch {
+    /* best-effort */
+  }
+}
+
 // ── Notification 队列（预留）──────────────────────────────────────
 export interface NotificationJobData {
   type: 'SMS' | 'EMAIL' | 'WECHAT_TEMPLATE';
@@ -62,6 +102,7 @@ export async function closeQueues(): Promise<void> {
   await Promise.all([
     fulfillmentQueue.close(),
     notificationQueue.close(),
+    seatHoldQueue.close(),
     fulfillmentQueueEvents.close(),
   ]);
   await bullRedis.quit();

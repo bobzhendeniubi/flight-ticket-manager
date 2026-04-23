@@ -66,6 +66,18 @@ const EnvSchema = z.object({
   // ═══════════════════════════════════════════════════════════
   AWS_REGION: z.string().optional(),
   S3_BUCKET_UPLOADS: z.string().optional(),
+
+  // ═══════════════════════════════════════════════════════════
+  // 邮件（SMTP，发送电子行程单）
+  // 没配置时 worker 静默跳过邮件发送（只写日志）。
+  // 沙箱推荐 Mailtrap / Ethereal；生产可用 Alibaba DirectMail / AWS SES。
+  // ═══════════════════════════════════════════════════════════
+  SMTP_HOST: z.string().optional(),
+  SMTP_PORT: z.coerce.number().int().min(1).max(65535).optional(),
+  SMTP_SECURE: z.coerce.boolean().default(false),
+  SMTP_USER: z.string().optional(),
+  SMTP_PASS: z.string().optional(),
+  SMTP_FROM: z.string().default('Citur Travel <no-reply@citur.com>'),
 });
 
 export type Env = z.infer<typeof EnvSchema>;
