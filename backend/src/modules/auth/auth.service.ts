@@ -116,10 +116,22 @@ export class AuthService {
     let openid: string;
     let unionid: string | undefined;
 
-    const isDev =
-      input.code.startsWith('dev:') ||
-      !env.WECHAT_MP_APPID ||
-      !env.WECHAT_MP_APPSECRET;
+    const hasWxCreds = !!env.WECHAT_MP_APPID && !!env.WECHAT_MP_APPSECRET;
+    const devCode = input.code.startsWith('dev:');
+    const isDev = devCode || !hasWxCreds;
+
+    // 生产环境 fail-closed：NODE_ENV=production 下必须有真凭证且拒绝 dev: 前缀
+    // （避免 env 漏配导致接受任意 code 以合成 openid 登录）
+    if (env.NODE_ENV === 'production') {
+      if (!hasWxCreds) {
+        throw new UnauthorizedError(
+          '微信登录不可用：WECHAT_MP_APPID / WECHAT_MP_APPSECRET 未配置',
+        );
+      }
+      if (devCode) {
+        throw new UnauthorizedError('生产环境不接受 dev: 前缀的测试 code');
+      }
+    }
 
     if (isDev) {
       // eslint-disable-next-line no-console
@@ -127,7 +139,20 @@ export class AuthService {
       openid = `dev_${input.code.replace(/^dev:/, '')}`;
     } else {
       const url = `https://api.weixin.qq.com/sns/jscode2session?appid=${encodeURIComponent(env.WECHAT_MP_APPID!)}&secret=${encodeURIComponent(env.WECHAT_MP_APPSECRET!)}&js_code=${encodeURIComponent(input.code)}&grant_type=authorization_code`;
-      const resp = await fetch(url);
+      // P3 修复：8s 硬超时（移动网络 + 微信接口偶发 stall 不应 block worker）
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 8000);
+      let resp: Response;
+      try {
+        resp = await fetch(url, { signal: controller.signal });
+      } catch (err) {
+        if ((err as { name?: string })?.name === 'AbortError') {
+          throw new UnauthorizedError('微信登录超时：jscode2session 8 秒未响应');
+        }
+        throw err;
+      } finally {
+        clearTimeout(timeoutId);
+      }
       const body = (await resp.json()) as {
         openid?: string;
         session_key?: string;
@@ -144,17 +169,29 @@ export class AuthService {
       unionid = body.unionid;
     }
 
-    // find or create
+    // find or create — 处理并发首次登录的 race condition
     let user = await prisma.user.findUnique({ where: { wechatOpenId: openid } });
     if (!user) {
-      user = await prisma.user.create({
-        data: {
-          wechatOpenId: openid,
-          wechatUnionId: unionid,
-          displayName: input.userInfo?.nickName ?? '微信用户',
-          role: UserRole.CUSTOMER,
-        },
-      });
+      try {
+        user = await prisma.user.create({
+          data: {
+            wechatOpenId: openid,
+            wechatUnionId: unionid,
+            displayName: input.userInfo?.nickName ?? '微信用户',
+            role: UserRole.CUSTOMER,
+          },
+        });
+      } catch (err) {
+        // P2002 = Unique constraint violation；说明另一个并发请求刚创建了同 openid 用户
+        // 重新读一次拿到那条记录即可（幂等）
+        const code = (err as { code?: string })?.code;
+        if (code === 'P2002') {
+          user = await prisma.user.findUnique({ where: { wechatOpenId: openid } });
+          if (!user) throw err; // 理论不可达
+        } else {
+          throw err;
+        }
+      }
     } else if (input.userInfo?.nickName && user.displayName !== input.userInfo.nickName) {
       // 昵称刷新
       await prisma.user.update({

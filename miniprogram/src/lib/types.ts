@@ -18,7 +18,10 @@ export type OrderStatus =
   | 'CANCELLED'
   | 'PAYMENT_TIMEOUT'
   | 'REFUND_REQUESTED'
-  | 'REFUNDED';
+  | 'REFUNDED'
+  | 'CHANGE_REQUESTED'
+  | 'CHANGED'
+  | 'FAILED';
 
 export type PaymentMethod =
   | 'WECHAT_PAY'

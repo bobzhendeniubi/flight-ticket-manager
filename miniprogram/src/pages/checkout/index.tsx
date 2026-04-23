@@ -6,7 +6,7 @@
  *   - 只支持 WECHAT_PAY 方式
  *   - 创建订单成功后跳转到订单详情 → 付款按钮触发 wx.requestPayment
  */
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
 import Taro from '@tarojs/taro';
 import { View, Text, Input, ScrollView } from '@tarojs/components';
 import { api, ApiError } from '../../lib/api';
@@ -29,7 +29,7 @@ const EMPTY: PassengerForm = {
 };
 
 export default function CheckoutPage() {
-  const { items, hydrate, hydrated, clear } = useCart();
+  const { items, hydrate, hydrated, clear, ensureIdempotencyKey } = useCart();
   const { user, tokens, hydrate: hydrateAuth } = useAuth();
 
   const [contactName, setContactName] = useState('');
@@ -37,10 +37,6 @@ export default function CheckoutPage() {
   const [contactEmail, setContactEmail] = useState('');
   const [passengers, setPassengers] = useState<PassengerForm[]>([{ ...EMPTY }]);
   const [submitting, setSubmitting] = useState(false);
-
-  const idempotencyKey = useMemo(() => {
-    return `mp_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
-  }, []);
 
   useEffect(() => {
     hydrateAuth();
@@ -86,6 +82,9 @@ export default function CheckoutPage() {
     }
 
     setSubmitting(true);
+    // 从 store 拿持久化的 key（跨 remount / 导航 / 小程序重启仍稳定）
+    // 只有 clear() 后才会换新 key —— 这样网络抖动导致的客户端重试永远用同一把锁
+    const idempotencyKey = ensureIdempotencyKey();
     try {
       const { order } = await api.createOrder(tokens.accessToken, {
         contactName,

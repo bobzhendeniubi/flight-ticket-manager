@@ -346,6 +346,13 @@ export async function createMiniappJsapiPayment(input: {
   const mode = process.env.PAYMENT_MODE ?? 'sandbox';
 
   if (mode !== 'live') {
+    // P1 fail-closed：生产环境绝对不允许回 mock 参数
+    // 即使 PAYMENT_MODE 被意外设成 sandbox，也不能在 NODE_ENV=production 下放行
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error(
+        'PAYMENT_MODE != "live" 但 NODE_ENV=production — 拒绝返回 mock 支付参数',
+      );
+    }
     // Sandbox / dev —— 返回假参数
     // 前端调 wx.requestPayment 会 fail，但后端订单状态机可以走 sandbox webhook 强推
     return {

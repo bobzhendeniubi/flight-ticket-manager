@@ -20,7 +20,11 @@ const STATUS_LABEL: Record<OrderStatus, { label: string; color: string }> = {
   PAYMENT_TIMEOUT: { label: '支付超时', color: '#dc2626' },
   REFUND_REQUESTED: { label: '退款中', color: '#d97706' },
   REFUNDED: { label: '已退款', color: '#6b7280' },
+  CHANGE_REQUESTED: { label: '改签中', color: '#d97706' },
+  CHANGED: { label: '已改签', color: '#16a34a' },
+  FAILED: { label: '出票失败', color: '#dc2626' },
 };
+const STATUS_FALLBACK = { label: '未知状态', color: '#64748b' } as const;
 
 export default function OrdersPage() {
   const { user, tokens, hydrate, hydrated } = useAuth();
@@ -86,7 +90,7 @@ export default function OrdersPage() {
   return (
     <ScrollView className='orders-page' scrollY>
       {orders.map((o) => {
-        const st = STATUS_LABEL[o.status] ?? { label: o.status, color: '#64748b' };
+        const st = STATUS_LABEL[o.status] ?? STATUS_FALLBACK;
         return (
           <View
             key={o.id}

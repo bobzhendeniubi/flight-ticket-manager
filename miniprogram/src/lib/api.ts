@@ -14,6 +14,24 @@ import type {
 
 const API_URL: string = typeof API_BASE !== 'undefined' ? API_BASE : 'http://localhost:4000';
 
+// access token 大概 15 分钟，小程序常驻后台会过期 —— 引入一个全局刷新 helper
+// 延迟 import auth store 避免循环依赖
+type AuthStoreApi = {
+  getState: () => {
+    tokens: { accessToken: string; refreshToken: string } | null;
+    setTokens: (t: { accessToken: string; refreshToken: string; accessTokenExpiresIn: number; refreshTokenExpiresIn: number }) => void;
+    clear: () => void;
+  };
+};
+let _authStore: AuthStoreApi | null = null;
+async function getAuthStore(): Promise<AuthStoreApi> {
+  if (_authStore) return _authStore;
+  // 动态 import 避免 api.ts ↔ stores/auth.ts 循环
+  const mod = (await import('../stores/auth')) as unknown as { useAuth: AuthStoreApi };
+  _authStore = mod.useAuth;
+  return _authStore;
+}
+
 export class ApiError extends Error {
   readonly status: number;
   readonly code: string;
@@ -33,6 +51,43 @@ interface RequestInit<TBody = unknown> {
   token?: string | null;
   /** 不抛错，直接返回 response（供调用方自己判断） */
   raw?: boolean;
+  /** 内部标志：refresh 重试标记，防循环 */
+  __isRetry?: boolean;
+}
+
+// 多个并发请求同时 401 时，只做一次 refresh
+let _refreshingPromise: Promise<string | null> | null = null;
+
+async function refreshAccessToken(): Promise<string | null> {
+  if (_refreshingPromise) return _refreshingPromise;
+  _refreshingPromise = (async () => {
+    try {
+      const store = await getAuthStore();
+      const state = store.getState();
+      if (!state.tokens?.refreshToken) return null;
+      const url = `${API_URL}/auth/refresh`;
+      const res = await Taro.request({
+        url,
+        method: 'POST',
+        header: { 'content-type': 'application/json' },
+        data: { refreshToken: state.tokens.refreshToken },
+      });
+      if (res.statusCode < 200 || res.statusCode >= 300) {
+        // refresh token 也失效了 —— 踢出登录
+        state.clear();
+        return null;
+      }
+      const body = res.data as { tokens: { accessToken: string; refreshToken: string; accessTokenExpiresIn: number; refreshTokenExpiresIn: number } };
+      state.setTokens(body.tokens);
+      return body.tokens.accessToken;
+    } catch {
+      return null;
+    } finally {
+      // 下一波 401 可以再试
+      setTimeout(() => { _refreshingPromise = null; }, 0);
+    }
+  })();
+  return _refreshingPromise;
 }
 
 export async function apiFetch<TResp, TBody = unknown>(
@@ -55,6 +110,15 @@ export async function apiFetch<TResp, TBody = unknown>(
   // Taro 的 request 不会因 4xx/5xx reject —— 我们自己判断
   if (res.statusCode >= 200 && res.statusCode < 300) {
     return res.data as TResp;
+  }
+
+  // 401 + 带 token + 非 auth 路径 + 未重试过 → 自动 refresh 重试一次
+  const isAuthPath = path.startsWith('/auth/');
+  if (res.statusCode === 401 && init.token && !isAuthPath && !init.__isRetry) {
+    const newToken = await refreshAccessToken();
+    if (newToken) {
+      return apiFetch<TResp, TBody>(path, { ...init, token: newToken, __isRetry: true });
+    }
   }
 
   const body = res.data as { error?: { code?: string; message?: string; details?: unknown } };

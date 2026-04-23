@@ -20,33 +20,59 @@ export interface CartItem {
 
 interface CartState {
   items: CartItem[];
+  /** 幂等 key —— 和当前购物车内容绑定，跨组件 remount 稳定，clear() 时重置 */
+  idempotencyKey: string | null;
   hydrated: boolean;
   hydrate: () => void;
   add: (item: CartItem) => void;
   remove: (index: number) => void;
   clear: () => void;
+  /** 获取（或延迟生成）本次 checkout session 的 idempotency key */
+  ensureIdempotencyKey: () => string;
 }
 
 const STORAGE_KEY = 'ftm_cart';
 
-function persist(items: CartItem[]) {
+interface PersistedShape {
+  items: CartItem[];
+  idempotencyKey: string | null;
+}
+
+function persist(items: CartItem[], idempotencyKey: string | null) {
   try {
-    Taro.setStorageSync(STORAGE_KEY, JSON.stringify(items));
+    const payload: PersistedShape = { items, idempotencyKey };
+    Taro.setStorageSync(STORAGE_KEY, JSON.stringify(payload));
   } catch {
     /* noop — 小程序 storage 上限 10MB */
   }
 }
 
+function genIdempotencyKey(): string {
+  return `mp_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
 export const useCart = create<CartState>((set, get) => ({
   items: [],
+  idempotencyKey: null,
   hydrated: false,
 
   hydrate: () => {
     try {
       const raw = Taro.getStorageSync(STORAGE_KEY) as string | undefined;
       if (raw) {
-        const items = JSON.parse(raw) as CartItem[];
-        set({ items, hydrated: true });
+        // 兼容旧格式（直接是 CartItem[]）
+        let parsed: PersistedShape;
+        const json = JSON.parse(raw);
+        if (Array.isArray(json)) {
+          parsed = { items: json as CartItem[], idempotencyKey: null };
+        } else {
+          parsed = json as PersistedShape;
+        }
+        set({
+          items: parsed.items ?? [],
+          idempotencyKey: parsed.idempotencyKey ?? null,
+          hydrated: true,
+        });
       } else {
         set({ hydrated: true });
       }
@@ -57,18 +83,28 @@ export const useCart = create<CartState>((set, get) => ({
 
   add: (item) => {
     const items = [...get().items, item];
-    persist(items);
+    persist(items, get().idempotencyKey);
     set({ items });
   },
 
   remove: (index) => {
     const items = get().items.filter((_, i) => i !== index);
-    persist(items);
+    persist(items, get().idempotencyKey);
     set({ items });
   },
 
   clear: () => {
-    persist([]);
-    set({ items: [] });
+    // clear 既发生在下单成功、也可能是手动清空 —— 都该重置 idempotency key
+    persist([], null);
+    set({ items: [], idempotencyKey: null });
+  },
+
+  ensureIdempotencyKey: () => {
+    const current = get().idempotencyKey;
+    if (current) return current;
+    const next = genIdempotencyKey();
+    persist(get().items, next);
+    set({ idempotencyKey: next });
+    return next;
   },
 }));
