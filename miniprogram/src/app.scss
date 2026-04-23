@@ -1,0 +1,85 @@
+/* 全局样式 — 小程序 rpx 单位（750rpx = 屏宽） */
+
+page {
+  background: #f1f5f9;
+  color: #0f172a;
+  font-size: 28rpx;
+  line-height: 1.5;
+}
+
+.btn-primary {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #1e40af;
+  color: #fff;
+  border-radius: 12rpx;
+  padding: 20rpx 40rpx;
+  font-size: 30rpx;
+  font-weight: 600;
+
+  &[disabled] {
+    background: #94a3b8;
+  }
+}
+
+.btn-secondary {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #f1f5f9;
+  color: #0f172a;
+  border-radius: 12rpx;
+  padding: 20rpx 40rpx;
+  font-size: 30rpx;
+  border: 2rpx solid #e2e8f0;
+}
+
+.card {
+  background: #fff;
+  border-radius: 16rpx;
+  padding: 24rpx;
+  margin-bottom: 24rpx;
+  box-shadow: 0 2rpx 8rpx rgba(15, 23, 42, 0.04);
+}
+
+.badge {
+  display: inline-block;
+  padding: 4rpx 16rpx;
+  border-radius: 8rpx;
+  font-size: 22rpx;
+  font-weight: 600;
+}
+.badge-A { background: #fee2e2; color: #b91c1c; }
+.badge-B { background: #fef3c7; color: #b45309; }
+.badge-C { background: #dbeafe; color: #1d4ed8; }
+.badge-D { background: #dcfce7; color: #15803d; }
+
+.text-price {
+  color: #dc2626;
+  font-size: 36rpx;
+  font-weight: 700;
+}
+.text-price-line {
+  color: #94a3b8;
+  font-size: 24rpx;
+  text-decoration: line-through;
+  margin-right: 8rpx;
+}
+
+.input {
+  background: #f8fafc;
+  border-radius: 8rpx;
+  padding: 16rpx 20rpx;
+  font-size: 28rpx;
+  border: 2rpx solid #e2e8f0;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.label {
+  display: block;
+  color: #64748b;
+  font-size: 24rpx;
+  margin: 16rpx 0 8rpx;
+}

@@ -6,6 +6,7 @@
  *   GET  /payments/:id                      查询支付状态（登录用户）
  */
 import type { FastifyPluginAsync } from 'fastify';
+import { z } from 'zod';
 import { PaymentMethod, UserRole } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import {
@@ -58,6 +59,35 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
     });
 
     return reply.status(201).send(result);
+  });
+
+  // ── 小程序 JSAPI 支付（生成 wx.requestPayment 参数） ─────
+  app.post('/wechat/miniapp-prepay', { preHandler: [app.authenticate] }, async (req) => {
+    const body = z.object({ orderId: z.string().min(1) }).parse(req.body);
+    const baseUrl = `${appPublicUrl.replace(/\/$/, '')}/api`;
+    let agentId: string | undefined;
+    if (req.user.role === 'AGENT') {
+      const agent = await prisma.agent.findUnique({
+        where: { userId: req.user.sub },
+        select: { id: true },
+      });
+      agentId = agent?.id;
+    }
+    const params = await service.createMiniappPayment(
+      { orderId: body.orderId },
+      { userId: req.user.sub, role: req.user.role, agentId, actorType: 'USER' },
+      baseUrl,
+    );
+
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'MINIAPP_PREPAY',
+      targetType: 'ORDER',
+      targetId: body.orderId,
+      targetLabel: body.orderId,
+    });
+
+    return params;
   });
 
   // ── 查询支付状态 ────────────────────────────────────

@@ -97,6 +97,81 @@ export class AuthService {
     return this.issueTokens(record.user, ctx);
   }
 
+  /**
+   * 微信小程序登录：wx.login → code → 换 openid + unionId
+   *
+   * 开发模式（WECHAT_MP_APPID / _APPSECRET 未配置 或 code 以 `dev:` 开头）：
+   *   - 直接用 code 作为 "openid"，跳过 jscode2session 调用
+   *   - 让小程序在本地 Taro 开发者工具里也能跑完整登录流程
+   *
+   * 生产：
+   *   - GET https://api.weixin.qq.com/sns/jscode2session?appid=X&secret=Y&js_code=Z&grant_type=authorization_code
+   *   - 返回 { openid, session_key, unionid? }
+   *   - 找/建 User + 发 JWT
+   */
+  async loginWithWechat(
+    input: { code: string; userInfo?: { nickName?: string; avatarUrl?: string } },
+    ctx: IssueTokensContext = {},
+  ): Promise<AuthResult> {
+    let openid: string;
+    let unionid: string | undefined;
+
+    const isDev =
+      input.code.startsWith('dev:') ||
+      !env.WECHAT_MP_APPID ||
+      !env.WECHAT_MP_APPSECRET;
+
+    if (isDev) {
+      // eslint-disable-next-line no-console
+      console.log(`[auth:wechat] DEV mode — using code=${input.code} as synthetic openid`);
+      openid = `dev_${input.code.replace(/^dev:/, '')}`;
+    } else {
+      const url = `https://api.weixin.qq.com/sns/jscode2session?appid=${encodeURIComponent(env.WECHAT_MP_APPID!)}&secret=${encodeURIComponent(env.WECHAT_MP_APPSECRET!)}&js_code=${encodeURIComponent(input.code)}&grant_type=authorization_code`;
+      const resp = await fetch(url);
+      const body = (await resp.json()) as {
+        openid?: string;
+        session_key?: string;
+        unionid?: string;
+        errcode?: number;
+        errmsg?: string;
+      };
+      if (!body.openid || body.errcode) {
+        throw new UnauthorizedError(
+          `微信登录失败：${body.errmsg ?? 'jscode2session 无 openid'} (code=${body.errcode ?? '-'})`,
+        );
+      }
+      openid = body.openid;
+      unionid = body.unionid;
+    }
+
+    // find or create
+    let user = await prisma.user.findUnique({ where: { wechatOpenId: openid } });
+    if (!user) {
+      user = await prisma.user.create({
+        data: {
+          wechatOpenId: openid,
+          wechatUnionId: unionid,
+          displayName: input.userInfo?.nickName ?? '微信用户',
+          role: UserRole.CUSTOMER,
+        },
+      });
+    } else if (input.userInfo?.nickName && user.displayName !== input.userInfo.nickName) {
+      // 昵称刷新
+      await prisma.user.update({
+        where: { id: user.id },
+        data: { displayName: input.userInfo.nickName },
+      });
+    }
+
+    await prisma.user.update({ where: { id: user.id }, data: { lastLoginAt: new Date() } });
+
+    const tokens = await this.issueTokens(user, ctx);
+    return {
+      user: { id: user.id, email: user.email, role: user.role, displayName: user.displayName },
+      tokens,
+    };
+  }
+
   async logout(refreshToken: string): Promise<void> {
     const tokenHash = hashToken(refreshToken);
     // Idempotent: don't error if the token doesn't exist.

@@ -46,6 +46,10 @@ const EnvSchema = z.object({
   WECHAT_PLATFORM_CERT_PATH: z.string().optional(),
   // 向后兼容：旧的 OAuth 流程 secret（扫码登录用，非支付）
   WECHAT_APP_SECRET: z.string().optional(),
+  // ── 微信小程序登录（不同于公众号/APP）──
+  // 在 https://mp.weixin.qq.com 申请小程序后，设置 → 开发设置 → AppID/AppSecret
+  WECHAT_MP_APPID: z.string().optional(),
+  WECHAT_MP_APPSECRET: z.string().optional(),
 
   // ═══════════════════════════════════════════════════════════
   // 支付网关：支付宝

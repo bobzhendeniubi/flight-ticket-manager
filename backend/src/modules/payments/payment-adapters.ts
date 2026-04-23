@@ -320,6 +320,81 @@ export class AlipayAdapter implements PaymentAdapter {
 }
 
 // ══════════════════════════════════════════════════════════════════
+// WeChat Miniapp JSAPI 支付
+//
+// 和 Native（扫码）不同：
+//   - transactions_jsapi 需要 payer.openid
+//   - 返回 prepay_id，需要再签一次才能给 wx.requestPayment
+//
+// 生产：真跑 transactions_jsapi + RSA 签名
+// Sandbox（PAYMENT_MODE != 'live'）：返回 mock 参数，让前端流程跑通 —— 实际不会拉起付款面板
+// ══════════════════════════════════════════════════════════════════
+export async function createMiniappJsapiPayment(input: {
+  paymentId: string;
+  orderNumber: string;
+  amountYuan: number;
+  title: string;
+  notifyUrl: string;
+  openid: string;
+}): Promise<{
+  timeStamp: string;
+  nonceStr: string;
+  package: string;
+  signType: 'RSA' | 'MD5' | 'HMAC-SHA256';
+  paySign: string;
+}> {
+  const mode = process.env.PAYMENT_MODE ?? 'sandbox';
+
+  if (mode !== 'live') {
+    // Sandbox / dev —— 返回假参数
+    // 前端调 wx.requestPayment 会 fail，但后端订单状态机可以走 sandbox webhook 强推
+    return {
+      timeStamp: String(Math.floor(Date.now() / 1000)),
+      nonceStr: genNonce(),
+      package: `prepay_id=sandbox_${input.paymentId}`,
+      signType: 'RSA',
+      paySign: 'SANDBOX_MOCK_SIGN',
+    };
+  }
+
+  // Production — 真调 SDK
+  const client = (await getWxClient()) as {
+    transactions_jsapi: (params: unknown) => Promise<{ prepay_id?: string; status: number; message?: string }>;
+    rsaSign?: (message: string) => string;
+  };
+  const res = await client.transactions_jsapi({
+    description: input.title,
+    out_trade_no: input.paymentId,
+    notify_url: input.notifyUrl,
+    amount: { total: Math.round(input.amountYuan * 100), currency: 'CNY' },
+    payer: { openid: input.openid },
+  });
+  if (res.status !== 200 || !res.prepay_id) {
+    throw new Error(`WeChat JSAPI prepay failed: ${res.message ?? 'no prepay_id'}`);
+  }
+
+  const { wechat } = paymentConfig;
+  const timeStamp = String(Math.floor(Date.now() / 1000));
+  const nonceStr = genNonce();
+  const pkg = `prepay_id=${res.prepay_id}`;
+  // wx.requestPayment 签名串：appId\ntimeStamp\nnonceStr\npackage\n
+  const signMessage = `${wechat.appid}\n${timeStamp}\n${nonceStr}\n${pkg}\n`;
+  if (!client.rsaSign) throw new Error('SDK 不支持 rsaSign；检查 wechatpay-node-v3 版本');
+  const paySign = client.rsaSign(signMessage);
+  return {
+    timeStamp,
+    nonceStr,
+    package: pkg,
+    signType: 'RSA',
+    paySign,
+  };
+}
+
+function genNonce(): string {
+  return Math.random().toString(36).slice(2, 18) + Math.random().toString(36).slice(2, 18);
+}
+
+// ══════════════════════════════════════════════════════════════════
 // Registry — 根据 env.PAYMENT_MODE 切换
 // ══════════════════════════════════════════════════════════════════
 export function getPaymentAdapter(method: PaymentMethod): PaymentAdapter {

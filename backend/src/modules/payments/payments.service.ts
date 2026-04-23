@@ -225,6 +225,79 @@ export class PaymentsService {
 
     return { ok: true, paymentId: payment.id, orderId: payment.orderId };
   }
+
+  /**
+   * 微信小程序 JSAPI 支付 — 生成 wx.requestPayment 所需参数。
+   *
+   * 和 createPayment(method=WECHAT_PAY) 的区别：Native 走 transactions_native → 扫码
+   * 这里走 transactions_jsapi → 返回 prepay_id + 签名后的客户端参数
+   *
+   * 开发模式（无 WECHAT_APPID 或 user 没 openid）：
+   *   - 返回 mock 参数，前端在 DevTools 里 wx.requestPayment 会失败但不会崩
+   *   - 本机测试走 sandbox webhook 强推 PAID
+   */
+  async createMiniappPayment(
+    body: { orderId: string },
+    requester: PaymentRequester,
+    baseUrl: string,
+  ): Promise<{
+    timeStamp: string;
+    nonceStr: string;
+    package: string;
+    signType: 'RSA' | 'MD5' | 'HMAC-SHA256';
+    paySign: string;
+  }> {
+    const order = await prisma.order.findUnique({ where: { id: body.orderId } });
+    if (!order) throw new NotFoundError('订单不存在');
+
+    // 只有订单本人 / 代理链上层 / staff 可付
+    if (requester.role === 'CUSTOMER' && order.userId !== requester.userId) {
+      throw new ForbiddenError('无权支付该订单');
+    }
+    if (requester.role === 'AGENT') {
+      if (!order.agentId) throw new ForbiddenError('无权支付该订单');
+      const descendantIds = await getDescendantAgentIds(requester.agentId);
+      if (!descendantIds.includes(order.agentId)) {
+        throw new ForbiddenError('无权支付该订单');
+      }
+    }
+    if (order.status !== OrderStatus.PENDING_PAYMENT) {
+      throw new BadRequestError(`订单状态 ${order.status}，无法发起支付`);
+    }
+
+    // 需要用户的 openid（wx.login 注册时写入）
+    const user = await prisma.user.findUnique({ where: { id: order.userId } });
+    const openid = user?.wechatOpenId;
+    if (!openid) {
+      throw new BadRequestError('该用户未绑定微信 openid，不能走小程序 JSAPI 支付');
+    }
+
+    // 幂等：同订单已有 PENDING wx 支付就复用
+    let payment = await prisma.payment.findFirst({
+      where: { orderId: order.id, status: PaymentStatus.PENDING, method: PaymentMethod.WECHAT_PAY },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (!payment) {
+      payment = await prisma.payment.create({
+        data: {
+          orderId: order.id,
+          method: PaymentMethod.WECHAT_PAY,
+          amount: order.total,
+          status: PaymentStatus.PENDING,
+        },
+      });
+    }
+
+    const { createMiniappJsapiPayment } = await import('./payment-adapters.js');
+    return createMiniappJsapiPayment({
+      paymentId: payment.id,
+      orderNumber: order.orderNumber,
+      amountYuan: Number(order.total),
+      title: `世途旅行 订单 ${order.orderNumber}`,
+      notifyUrl: `${baseUrl}/payments/webhook/wechat`,
+      openid,
+    });
+  }
 }
 
 function adapterSlug(method: PaymentMethod): string {

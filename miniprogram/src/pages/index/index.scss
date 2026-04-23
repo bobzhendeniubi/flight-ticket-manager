@@ -1,0 +1,100 @@
+.home-page {
+  padding: 24rpx;
+  box-sizing: border-box;
+  min-height: 100vh;
+}
+
+.search-card {
+  background: linear-gradient(135deg, #1e40af, #3b82f6);
+  color: #fff;
+
+  .label { color: rgba(255, 255, 255, 0.8); }
+  .input {
+    background: rgba(255, 255, 255, 0.15);
+    color: #fff;
+    border: 2rpx solid rgba(255, 255, 255, 0.3);
+  }
+}
+
+.row {
+  display: flex;
+  gap: 20rpx;
+  margin-bottom: 16rpx;
+  &:last-child { margin-bottom: 0; }
+}
+.col { flex: 1; }
+
+.text-muted { color: #64748b; text-align: center; padding: 40rpx 0; }
+.error { color: #b91c1c; background: #fee2e2; }
+
+.flight-card {
+  .flight-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 16rpx;
+    .flight-number {
+      font-size: 36rpx;
+      font-weight: 700;
+      color: #0f172a;
+    }
+  }
+
+  .flight-route {
+    display: flex;
+    align-items: center;
+    gap: 20rpx;
+    padding: 16rpx 0;
+    .route-side {
+      flex: 0 0 auto;
+      text-align: center;
+      .time { font-size: 40rpx; font-weight: 700; display: block; }
+      .airport { font-size: 28rpx; color: #475569; display: block; }
+      .date { font-size: 22rpx; color: #94a3b8; display: block; }
+    }
+    .route-arrow {
+      flex: 1;
+      text-align: center;
+      .duration { font-size: 22rpx; color: #94a3b8; display: block; }
+      .line {
+        height: 2rpx;
+        background: linear-gradient(90deg, transparent, #cbd5e1 30%, #cbd5e1 70%, transparent);
+        margin-top: 4rpx;
+      }
+    }
+  }
+
+  .cabin-list {
+    border-top: 2rpx solid #f1f5f9;
+    margin-top: 12rpx;
+    padding-top: 12rpx;
+  }
+  .cabin-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 16rpx 0;
+    border-bottom: 2rpx solid #f1f5f9;
+    &:last-child { border-bottom: none; }
+    &.disabled { opacity: 0.4; }
+    &:active:not(.disabled) { background: #f8fafc; }
+    .cabin-info {
+      .cabin-name { font-size: 30rpx; color: #0f172a; font-weight: 600; }
+      .avail { font-size: 22rpx; color: #94a3b8; display: block; }
+    }
+    .cabin-price {
+      display: flex;
+      align-items: baseline;
+    }
+  }
+
+  .footer {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 16rpx;
+    padding-top: 16rpx;
+    border-top: 2rpx solid #f1f5f9;
+    .footer-label { color: #64748b; font-size: 24rpx; }
+  }
+}

@@ -1,0 +1,71 @@
+.me-page {
+  min-height: 100vh;
+  padding: 0 24rpx 24rpx;
+  box-sizing: border-box;
+
+  .hero {
+    background: linear-gradient(135deg, #1e40af, #3b82f6);
+    color: #fff;
+    text-align: center;
+    padding: 60rpx 24rpx;
+    border-radius: 0 0 24rpx 24rpx;
+    margin: 0 -24rpx 24rpx;
+
+    .avatar {
+      width: 120rpx;
+      height: 120rpx;
+      background: rgba(255, 255, 255, 0.2);
+      border-radius: 50%;
+      margin: 0 auto 20rpx;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 56rpx;
+    }
+    .nickname {
+      font-size: 36rpx;
+      font-weight: 600;
+      display: block;
+    }
+    .sub {
+      font-size: 24rpx;
+      opacity: 0.8;
+      display: block;
+      margin-top: 4rpx;
+    }
+    .btn-primary.small {
+      display: inline-flex;
+      margin-top: 16rpx;
+      padding: 12rpx 40rpx;
+      font-size: 26rpx;
+      background: rgba(255, 255, 255, 0.2);
+      border: 2rpx solid #fff;
+    }
+  }
+
+  .menu {
+    padding: 0;
+    overflow: hidden;
+    .row {
+      display: flex;
+      align-items: center;
+      padding: 28rpx 24rpx;
+      border-bottom: 2rpx solid #f1f5f9;
+      &:last-child { border-bottom: none; }
+      &:active { background: #f8fafc; }
+      .icon { font-size: 36rpx; margin-right: 16rpx; }
+      .label { flex: 1; font-size: 28rpx; color: #0f172a; }
+      .arr { color: #cbd5e1; font-size: 32rpx; }
+    }
+  }
+
+  .logout {
+    margin-top: 24rpx;
+    text-align: center;
+    padding: 24rpx;
+    background: #fff;
+    border-radius: 12rpx;
+    color: #dc2626;
+    font-size: 28rpx;
+  }
+}

@@ -1,4 +1,5 @@
 import type { FastifyPluginAsync } from 'fastify';
+import { z } from 'zod';
 import {
   loginBodySchema,
   logoutBodySchema,
@@ -6,6 +7,16 @@ import {
   registerBodySchema,
 } from './auth.schemas.js';
 import { AuthService } from './auth.service.js';
+
+const wechatLoginBodySchema = z.object({
+  code: z.string().min(1, 'code 必填'),
+  userInfo: z
+    .object({
+      nickName: z.string().max(100).optional(),
+      avatarUrl: z.string().max(500).optional(),
+    })
+    .optional(),
+});
 
 export const authRoutes: FastifyPluginAsync = async (app) => {
   const service = new AuthService(app);
@@ -34,6 +45,19 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
       ipAddress: req.ip,
     });
     return { tokens };
+  });
+
+  /**
+   * 微信小程序登录
+   * body: { code: wx.login 返回的 code, userInfo?: { nickName, avatarUrl } }
+   * 返回: { user, tokens } —— 同 /login 结构
+   */
+  app.post('/wechat', async (req) => {
+    const body = wechatLoginBodySchema.parse(req.body);
+    return service.loginWithWechat(body, {
+      userAgent: req.headers['user-agent'],
+      ipAddress: req.ip,
+    });
   });
 
   app.post('/logout', async (req, reply) => {

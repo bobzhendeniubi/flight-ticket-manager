@@ -13,6 +13,7 @@
     "dev:backend": "npm run dev --workspace=backend",
     "dev:web": "npm run dev --workspace=sales-web",
     "dev:admin": "npm run dev --workspace=admin-web",
+    "dev:mp": "npm run dev:weapp --workspace=miniprogram",
     "db:up": "docker compose up -d postgres redis",
     "db:down": "docker compose down",
     "db:logs": "docker compose logs -f postgres redis",

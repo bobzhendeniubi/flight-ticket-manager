@@ -1,0 +1,71 @@
+.cart-page {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+
+  .scroll {
+    flex: 1;
+    padding: 24rpx;
+    box-sizing: border-box;
+  }
+
+  .empty {
+    text-align: center;
+    padding: 80rpx 40rpx;
+    .emoji { font-size: 80rpx; display: block; margin-bottom: 16rpx; }
+    .title { font-size: 32rpx; color: #0f172a; display: block; font-weight: 600; }
+    .sub { color: #94a3b8; font-size: 26rpx; display: block; margin-bottom: 32rpx; }
+  }
+
+  .item {
+    .item-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12rpx;
+    }
+    .kind {
+      background: #e0f2fe;
+      color: #0369a1;
+    }
+    .del {
+      color: #dc2626;
+      font-size: 24rpx;
+    }
+    .name {
+      font-size: 28rpx;
+      color: #0f172a;
+      font-weight: 600;
+      display: block;
+    }
+    .desc {
+      font-size: 24rpx;
+      color: #64748b;
+      display: block;
+      margin-top: 4rpx;
+    }
+    .footer {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-top: 12rpx;
+      padding-top: 12rpx;
+      border-top: 2rpx solid #f1f5f9;
+      .qty { color: #64748b; font-size: 24rpx; }
+    }
+  }
+
+  .summary {
+    background: #fff;
+    padding: 24rpx;
+    border-top: 2rpx solid #e2e8f0;
+    box-shadow: 0 -4rpx 12rpx rgba(15, 23, 42, 0.04);
+    .total {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      margin-bottom: 16rpx;
+      .text-price.big { font-size: 44rpx; }
+    }
+  }
+}
