@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
-import { Link, NavLink, Outlet, useNavigate } from 'react-router-dom';
+import { Link, NavLink, Outlet, useNavigate, useSearchParams } from 'react-router-dom';
 import { useAuth } from '../stores/auth';
 import { useCart } from '../stores/cart';
+import { MobilePreviewFrame } from './MobilePreviewFrame';
 
 const ROLE_LABEL: Record<string, string> = {
   CUSTOMER: '客户',
@@ -25,9 +26,17 @@ export function Layout() {
   const user = useAuth((s) => s.user);
   const logout = useAuth((s) => s.logout);
   const navigate = useNavigate();
+  const [searchParams] = useSearchParams();
 
   const isAgent = user?.role === 'AGENT';
   const isAdmin = user?.role === 'ADMIN' || user?.role === 'STAFF';
+
+  // ?preview=mobile → 把页面包进 375×812 的手机壳，模拟小程序 UI
+  // 在电脑浏览器里开演示 / 录屏 / 给客户展示效果时很方便
+  const mobilePreview = searchParams.get('preview') === 'mobile';
+  if (mobilePreview) {
+    return <MobilePreviewFrame />;
+  }
 
   return (
     <div className="min-h-screen flex flex-col">
@@ -69,6 +78,14 @@ export function Layout() {
           </nav>
 
           <nav className="flex items-center gap-3 text-sm">
+            {/* 小程序预览：在桌面浏览器里用手机壳看页面，免开微信开发者工具 */}
+            <a
+              href="/?preview=mobile"
+              className="hidden md:inline-flex items-center gap-1 rounded-md border border-slate-200 bg-slate-50 px-2 py-1 text-xs text-slate-600 hover:border-brand hover:text-brand"
+              title="以移动端视口预览（小程序端测试）"
+            >
+              📱 小程序预览
+            </a>
             <CartButton />
             {user ? (
               <>

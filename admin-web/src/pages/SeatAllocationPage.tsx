@@ -18,6 +18,7 @@ import { useAuth } from '../stores/auth';
 
 interface SeatAllocation {
   id: string;
+  scheduleId: string;         // 新增：关联班次
   agentName: string;
   agentTier: number;
   cabin: 'ECONOMY' | 'BUSINESS';
@@ -27,11 +28,11 @@ interface SeatAllocation {
 }
 
 // 默认 demo 切位数据（每个班次都套用一份）
-const DEFAULT_ALLOCATIONS = (): SeatAllocation[] => [
-  { id: 'a1', agentName: '澳门岘港旅游总代', agentTier: 1, cabin: 'ECONOMY', allocated: 50, sold: 35, releaseAt: addDays(7) },
-  { id: 'a2', agentName: '澳门岘港旅游总代', agentTier: 1, cabin: 'BUSINESS', allocated: 8, sold: 5, releaseAt: addDays(7) },
-  { id: 'a3', agentName: '澳门欢乐旅行社', agentTier: 2, cabin: 'ECONOMY', allocated: 30, sold: 28, releaseAt: addDays(5) },
-  { id: 'a4', agentName: '澳门威尼斯人门店', agentTier: 3, cabin: 'ECONOMY', allocated: 20, sold: 12, releaseAt: addDays(3) },
+const defaultAllocationsFor = (scheduleId: string): SeatAllocation[] => [
+  { id: `${scheduleId}-a1`, scheduleId, agentName: '澳门岘港旅游总代', agentTier: 1, cabin: 'ECONOMY', allocated: 50, sold: 35, releaseAt: addDays(7) },
+  { id: `${scheduleId}-a2`, scheduleId, agentName: '澳门岘港旅游总代', agentTier: 1, cabin: 'BUSINESS', allocated: 8, sold: 5, releaseAt: addDays(7) },
+  { id: `${scheduleId}-a3`, scheduleId, agentName: '澳门欢乐旅行社', agentTier: 2, cabin: 'ECONOMY', allocated: 30, sold: 28, releaseAt: addDays(5) },
+  { id: `${scheduleId}-a4`, scheduleId, agentName: '澳门威尼斯人门店', agentTier: 3, cabin: 'ECONOMY', allocated: 20, sold: 12, releaseAt: addDays(3) },
 ];
 
 function addDays(days: number): string {
@@ -55,9 +56,12 @@ export function SeatAllocationPage() {
   const [flights, setFlights] = useState<AdminFlight[]>([]);
   const [allSchedules, setAllSchedules] = useState<Record<string, AdminSchedule[]>>({});
   const [selectedScheduleId, setSelectedScheduleId] = useState<string>('');
+  // 所有班次的切位都放同一个扁平数组；selected schedule 只是过滤出其中一部分。
+  // 这样 bulk 批量创建可以跨班次生效 + 切回原班次仍看得到。
   const [allocations, setAllocations] = useState<SeatAllocation[]>([]);
   const [loading, setLoading] = useState(true);
   const [showForm, setShowForm] = useState(false);
+  const [showBulk, setShowBulk] = useState(false);
   const [savedFlash, setSavedFlash] = useState<string | null>(null);
 
   const [error, setError] = useState<string | null>(null);
@@ -83,11 +87,14 @@ export function SeatAllocationPage() {
           }),
         );
         setAllSchedules(map);
-        // 自动选第一个班次
-        const first = Object.values(map).flat()[0];
+        // 自动选第一个班次，并给所有班次套 demo 默认切位
+        const flat = Object.values(map).flat();
+        const first = flat[0];
         if (first) {
           setSelectedScheduleId(first.id);
-          setAllocations(DEFAULT_ALLOCATIONS());
+          // 只给前 10 个班次预填默认切位（避免一上来 500 条记录）
+          const seeded = flat.slice(0, 10).flatMap((s) => defaultAllocationsFor(s.id));
+          setAllocations(seeded);
         }
       } catch (err) {
         setError(err instanceof Error ? err.message : '加载航班失败');
@@ -109,12 +116,13 @@ export function SeatAllocationPage() {
     return null;
   }, [allSchedules, selectedScheduleId, flights]);
 
-  // 切换班次时，重置 demo 切位
-  useEffect(() => {
-    if (selectedScheduleId) setAllocations(DEFAULT_ALLOCATIONS());
-  }, [selectedScheduleId]);
+  // 当前班次的切位（从总列表过滤）
+  const currentAllocations = useMemo(
+    () => allocations.filter((a) => a.scheduleId === selectedScheduleId),
+    [allocations, selectedScheduleId],
+  );
 
-  // 各舱位的切位汇总
+  // 各舱位的切位汇总（只算当前班次）
   const cabinSummary = useMemo(() => {
     if (!selected) return null;
     const result: Record<'ECONOMY' | 'BUSINESS', { capacity: number; soldTotal: number; allocated: number; allocatedSold: number; pool: number }> = {
@@ -126,7 +134,7 @@ export function SeatAllocationPage() {
       result[c.cabin].capacity = c.capacity;
       result[c.cabin].soldTotal = c.sold;
     }
-    for (const a of allocations) {
+    for (const a of currentAllocations) {
       result[a.cabin].allocated += a.allocated;
       result[a.cabin].allocatedSold += a.sold;
     }
@@ -134,7 +142,7 @@ export function SeatAllocationPage() {
       result[cabin].pool = result[cabin].capacity - result[cabin].allocated;
     }
     return result;
-  }, [selected, allocations]);
+  }, [selected, currentAllocations]);
 
   if (loading) return <div className="card text-slate-500">加载中…</div>;
   if (error) return <div className="card border-red-200 bg-red-50 text-red-700">{error}</div>;
@@ -224,9 +232,15 @@ export function SeatAllocationPage() {
               })}
             </select>
           </div>
-          <div className="flex items-end gap-2">
+          <div className="flex items-end gap-2 flex-wrap">
             <button className="btn-secondary text-sm" onClick={recycleExpired}>
               一键回收过期切位
+            </button>
+            <button
+              className="text-sm px-4 py-2 rounded-md border border-purple-300 bg-purple-50 text-purple-700 hover:bg-purple-100"
+              onClick={() => setShowBulk(true)}
+            >
+              📦 批量切位
             </button>
             <button className="btn-primary text-sm" onClick={() => setShowForm(true)}>
               + 新建切位
@@ -292,7 +306,7 @@ export function SeatAllocationPage() {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {allocations.map((a) => {
+              {currentAllocations.map((a) => {
                 const remaining = a.allocated - a.sold;
                 const days = daysUntil(a.releaseAt);
                 const overSold = a.sold > a.allocated;
@@ -370,15 +384,30 @@ export function SeatAllocationPage() {
         )}
       </section>
 
-      {showForm && cabinSummary && (
+      {showForm && cabinSummary && selected && (
         <NewAllocationForm
           cabinSummary={cabinSummary}
+          scheduleId={selected.schedule.id}
           onCancel={() => setShowForm(false)}
           onSubmit={(alloc) => {
             setAllocations((prev) => [...prev, { ...alloc, id: 'new-' + Date.now() }]);
             setShowForm(false);
             setSavedFlash('已新增切位（demo）');
             setTimeout(() => setSavedFlash(null), 2500);
+          }}
+        />
+      )}
+
+      {showBulk && (
+        <BulkAllocationModal
+          flights={flights}
+          allSchedules={allSchedules}
+          onCancel={() => setShowBulk(false)}
+          onApply={(newRecords) => {
+            setAllocations((prev) => [...prev, ...newRecords]);
+            setShowBulk(false);
+            setSavedFlash(`批量切位成功：共创建 ${newRecords.length} 条记录（demo）`);
+            setTimeout(() => setSavedFlash(null), 4000);
           }}
         />
       )}
@@ -389,10 +418,12 @@ export function SeatAllocationPage() {
 // ── 新建切位表单 ──
 function NewAllocationForm({
   cabinSummary,
+  scheduleId,
   onCancel,
   onSubmit,
 }: {
   cabinSummary: Record<'ECONOMY' | 'BUSINESS', { capacity: number; allocated: number; pool: number }>;
+  scheduleId: string;
   onCancel: () => void;
   onSubmit: (a: Omit<SeatAllocation, 'id'>) => void;
 }) {
@@ -464,6 +495,7 @@ function NewAllocationForm({
               disabled={!valid}
               onClick={() =>
                 onSubmit({
+                  scheduleId,
                   agentName: agent.name,
                   agentTier: agent.tier,
                   cabin,
@@ -474,6 +506,323 @@ function NewAllocationForm({
               }
             >
               确认切位
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────
+// BulkAllocationModal — 批量切位（跨班次 × 跨日期 × 跨星期几）
+//
+// 使用场景：客服给某代理"每周五周六 MFM→DAD 经济舱切 30 座，为期 2 个月"。
+// 传统单条新建要点 40+ 次；批量一次搞定。
+//
+// 选择维度：
+//   1. 代理（从 DEMO_AGENTS 单选）
+//   2. 航班（多选；默认全选）
+//   3. 日期范围（from / to）
+//   4. 星期几过滤（周一-周日多选；默认全选）
+//   5. 舱位（经济 / 商务 / 两者）
+//   6. 每班切多少座
+//   7. 回收时机（出发前 N 天）
+//
+// 应用前先 preview：显示将匹配的班次数 + 总切位记录数。
+// ─────────────────────────────────────────────────────────────────
+function BulkAllocationModal({
+  flights,
+  allSchedules,
+  onCancel,
+  onApply,
+}: {
+  flights: AdminFlight[];
+  allSchedules: Record<string, AdminSchedule[]>;
+  onCancel: () => void;
+  onApply: (records: SeatAllocation[]) => void;
+}) {
+  const [agentIdx, setAgentIdx] = useState(0);
+  const [flightIds, setFlightIds] = useState<Set<string>>(() => new Set(flights.map((f) => f.id)));
+  const todayStr = new Date().toISOString().slice(0, 10);
+  const toDefault = new Date(Date.now() + 30 * 86400000).toISOString().slice(0, 10);
+  const [fromDate, setFromDate] = useState(todayStr);
+  const [toDate, setToDate] = useState(toDefault);
+  const [dowSet, setDowSet] = useState<Set<number>>(() => new Set([0, 1, 2, 3, 4, 5, 6]));
+  const [econSeats, setEconSeats] = useState(20);
+  const [bizSeats, setBizSeats] = useState(3);
+  const [cabinMode, setCabinMode] = useState<'ECONOMY' | 'BUSINESS' | 'BOTH'>('ECONOMY');
+  const [releaseDays, setReleaseDays] = useState(7);
+
+  const agent = DEMO_AGENTS[agentIdx];
+  const DOW_LABELS = ['日', '一', '二', '三', '四', '五', '六'];
+
+  // 预览：匹配的班次 + 将生成的记录
+  const preview = useMemo(() => {
+    const fromMs = new Date(`${fromDate}T00:00:00`).getTime();
+    const toMs = new Date(`${toDate}T23:59:59`).getTime();
+
+    const matchedSchedules: AdminSchedule[] = [];
+    for (const fid of flightIds) {
+      const list = allSchedules[fid] ?? [];
+      for (const s of list) {
+        const t = new Date(s.departureTime).getTime();
+        if (t < fromMs || t > toMs) continue;
+        const dow = new Date(s.departureTime).getDay();
+        if (!dowSet.has(dow)) continue;
+        matchedSchedules.push(s);
+      }
+    }
+
+    const records: SeatAllocation[] = [];
+    const cabins: Array<'ECONOMY' | 'BUSINESS'> =
+      cabinMode === 'BOTH' ? ['ECONOMY', 'BUSINESS'] : [cabinMode];
+    const now = Date.now();
+    for (const s of matchedSchedules) {
+      for (const c of cabins) {
+        const seats = c === 'ECONOMY' ? econSeats : bizSeats;
+        if (seats <= 0) continue;
+        // releaseAt = 班次出发前 releaseDays 天（不能早于 now）
+        const depMs = new Date(s.departureTime).getTime();
+        const releaseMs = Math.max(now + 60000, depMs - releaseDays * 86400000);
+        records.push({
+          id: `bulk-${s.id}-${c}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+          scheduleId: s.id,
+          agentName: agent.name,
+          agentTier: agent.tier,
+          cabin: c,
+          allocated: seats,
+          sold: 0,
+          releaseAt: new Date(releaseMs).toISOString(),
+        });
+      }
+    }
+    return { matchedSchedules, records };
+  }, [flightIds, fromDate, toDate, dowSet, cabinMode, econSeats, bizSeats, releaseDays, agent]);
+
+  const valid = preview.records.length > 0 && new Date(fromDate) <= new Date(toDate);
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4"
+      onClick={onCancel}
+    >
+      <div
+        className="w-full max-w-2xl max-h-[90vh] overflow-auto rounded-lg bg-white shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="sticky top-0 border-b border-slate-200 bg-white px-5 py-3 flex items-center justify-between">
+          <h2 className="text-lg font-semibold text-slate-900">📦 批量切位</h2>
+          <button className="text-slate-400 hover:text-slate-700 text-xl" onClick={onCancel}>
+            ×
+          </button>
+        </div>
+        <div className="px-5 py-4 space-y-4">
+          {/* 代理 */}
+          <div>
+            <label className="label">代理</label>
+            <select
+              className="input"
+              value={agentIdx}
+              onChange={(e) => setAgentIdx(Number(e.target.value))}
+            >
+              {DEMO_AGENTS.map((a, i) => (
+                <option key={a.name} value={i}>
+                  [{a.tier} 级] {a.name}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {/* 航班多选 */}
+          <div>
+            <label className="label">航班（可多选）</label>
+            <div className="flex flex-wrap gap-2">
+              {flights.map((f) => {
+                const checked = flightIds.has(f.id);
+                return (
+                  <label
+                    key={f.id}
+                    className={`flex items-center gap-1 px-3 py-1 rounded-md border cursor-pointer text-sm ${
+                      checked ? 'border-brand bg-brand/10 text-brand' : 'border-slate-300'
+                    }`}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      onChange={() => {
+                        setFlightIds((prev) => {
+                          const next = new Set(prev);
+                          if (next.has(f.id)) next.delete(f.id);
+                          else next.add(f.id);
+                          return next;
+                        });
+                      }}
+                    />
+                    {f.flightNumber} {f.originCode}→{f.destinationCode}
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* 日期范围 */}
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="label">起始日期</label>
+              <input
+                type="date"
+                className="input"
+                value={fromDate}
+                onChange={(e) => setFromDate(e.target.value)}
+              />
+            </div>
+            <div>
+              <label className="label">结束日期</label>
+              <input
+                type="date"
+                className="input"
+                value={toDate}
+                onChange={(e) => setToDate(e.target.value)}
+                min={fromDate}
+              />
+            </div>
+          </div>
+
+          {/* 星期几 */}
+          <div>
+            <label className="label">只匹配星期几（默认全选）</label>
+            <div className="flex gap-2">
+              {DOW_LABELS.map((label, i) => {
+                const checked = dowSet.has(i);
+                return (
+                  <label
+                    key={i}
+                    className={`flex flex-col items-center justify-center w-12 h-12 rounded-md border cursor-pointer ${
+                      checked ? 'border-brand bg-brand/10 text-brand font-semibold' : 'border-slate-300 text-slate-500'
+                    }`}
+                  >
+                    <input
+                      type="checkbox"
+                      className="hidden"
+                      checked={checked}
+                      onChange={() => {
+                        setDowSet((prev) => {
+                          const next = new Set(prev);
+                          if (next.has(i)) next.delete(i);
+                          else next.add(i);
+                          return next;
+                        });
+                      }}
+                    />
+                    {label}
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* 舱位模式 */}
+          <div>
+            <label className="label">舱位</label>
+            <div className="flex gap-2">
+              {(['ECONOMY', 'BUSINESS', 'BOTH'] as const).map((m) => (
+                <label
+                  key={m}
+                  className={`flex-1 text-center px-3 py-2 rounded-md border cursor-pointer text-sm ${
+                    cabinMode === m ? 'border-brand bg-brand/10 text-brand' : 'border-slate-300'
+                  }`}
+                >
+                  <input
+                    type="radio"
+                    className="hidden"
+                    checked={cabinMode === m}
+                    onChange={() => setCabinMode(m)}
+                  />
+                  {m === 'ECONOMY' ? '仅经济舱' : m === 'BUSINESS' ? '仅商务舱' : '经济 + 商务'}
+                </label>
+              ))}
+            </div>
+          </div>
+
+          {/* 每班切几座 */}
+          <div className="grid grid-cols-2 gap-3">
+            {(cabinMode === 'ECONOMY' || cabinMode === 'BOTH') && (
+              <div>
+                <label className="label">经济舱每班切</label>
+                <input
+                  type="number"
+                  min={0}
+                  max={180}
+                  className="input"
+                  value={econSeats}
+                  onChange={(e) => setEconSeats(Number(e.target.value) || 0)}
+                />
+              </div>
+            )}
+            {(cabinMode === 'BUSINESS' || cabinMode === 'BOTH') && (
+              <div>
+                <label className="label">商务舱每班切</label>
+                <input
+                  type="number"
+                  min={0}
+                  max={20}
+                  className="input"
+                  value={bizSeats}
+                  onChange={(e) => setBizSeats(Number(e.target.value) || 0)}
+                />
+              </div>
+            )}
+          </div>
+
+          {/* 回收时机 */}
+          <div>
+            <label className="label">回收时机</label>
+            <select
+              className="input"
+              value={releaseDays}
+              onChange={(e) => setReleaseDays(Number(e.target.value))}
+            >
+              <option value={3}>出发前 3 天回收</option>
+              <option value={5}>出发前 5 天回收</option>
+              <option value={7}>出发前 7 天回收</option>
+              <option value={14}>出发前 14 天回收</option>
+              <option value={30}>出发前 30 天回收</option>
+            </select>
+          </div>
+
+          {/* 预览 */}
+          <div className="rounded-md bg-purple-50 border border-purple-200 px-4 py-3 text-sm">
+            <div className="font-medium text-purple-900">预览</div>
+            <div className="mt-1 text-purple-800">
+              将匹配 <strong>{preview.matchedSchedules.length}</strong> 个班次，创建{' '}
+              <strong>{preview.records.length}</strong> 条切位记录
+            </div>
+            {preview.matchedSchedules.length > 0 && (
+              <div className="mt-1 text-xs text-purple-700">
+                首班：{formatLocalDate(preview.matchedSchedules[0].departureTime, preview.matchedSchedules[0].departureTz)} · 末班：
+                {formatLocalDate(
+                  preview.matchedSchedules[preview.matchedSchedules.length - 1].departureTime,
+                  preview.matchedSchedules[preview.matchedSchedules.length - 1].departureTz,
+                )}
+              </div>
+            )}
+            {!valid && preview.records.length === 0 && (
+              <div className="mt-1 text-xs text-amber-700">⚠️ 当前条件没有匹配到任何班次</div>
+            )}
+          </div>
+
+          {/* 按钮 */}
+          <div className="flex justify-end gap-3 pt-2 border-t border-slate-200">
+            <button className="btn-secondary" onClick={onCancel}>
+              取消
+            </button>
+            <button
+              className="btn-primary"
+              disabled={!valid}
+              onClick={() => onApply(preview.records)}
+            >
+              应用到 {preview.records.length} 条记录
             </button>
           </div>
         </div>
