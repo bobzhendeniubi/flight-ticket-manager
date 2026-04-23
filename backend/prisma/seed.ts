@@ -83,6 +83,31 @@ async function main() {
       emailVerified: true,
     },
   });
+  // 再造 2 个散客让 AGENT 视图有数据可看
+  const customer2 = await prisma.user.upsert({
+    where: { email: 'customer2@ftm.local' },
+    update: {},
+    create: {
+      email: 'customer2@ftm.local',
+      passwordHash: hash,
+      role: UserRole.CUSTOMER,
+      displayName: '张三（代理 A 名下）',
+      phone: '+85290000101',
+      emailVerified: true,
+    },
+  });
+  const customer3 = await prisma.user.upsert({
+    where: { email: 'customer3@ftm.local' },
+    update: {},
+    create: {
+      email: 'customer3@ftm.local',
+      passwordHash: hash,
+      role: UserRole.CUSTOMER,
+      displayName: '李四（代理 A 名下）',
+      phone: '+85290000102',
+      emailVerified: true,
+    },
+  });
 
   // 1 级代理
   const agent1User = await prisma.user.upsert({
@@ -191,6 +216,28 @@ async function main() {
   const agent3b = await upsertAgent(demoAgents[1]);
   demoAgents[2].parentAgentId = agent2b.id;
   const agent3c = await upsertAgent(demoAgents[2]);
+
+  // ── CustomerProfile 把演示散客挂到 agent1（让 AGENT 后台有数据）──
+  await prisma.customerProfile.upsert({
+    where: { userId: customer2.id },
+    update: { primaryAgentId: agent1.id },
+    create: {
+      userId: customer2.id,
+      primaryAgentId: agent1.id,
+      tags: ['vip'],
+      notes: '代理 A 长期合作客户',
+    },
+  });
+  await prisma.customerProfile.upsert({
+    where: { userId: customer3.id },
+    update: { primaryAgentId: agent2.id },
+    create: {
+      userId: customer3.id,
+      primaryAgentId: agent2.id, // 挂到下级 2A —— 验证 agent1 能看到下级的客户
+      tags: ['新客'],
+      notes: '代理 2A 门店客户',
+    },
+  });
 
   async function upsertAgent(cfg: typeof demoAgents[0]) {
     const u = await prisma.user.upsert({

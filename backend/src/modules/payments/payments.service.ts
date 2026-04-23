@@ -22,6 +22,7 @@ import {
 } from '../../lib/errors.js';
 import { getPaymentAdapter } from './payment-adapters.js';
 import { OrderService } from '../orders/orders.service.js';
+import { getDescendantAgentIds } from '../../lib/agent-tree.js';
 
 export interface PaymentRequester {
   userId: string;
@@ -300,6 +301,8 @@ export class PaymentsService {
   }
 }
 
+// getDescendantAgentIds — 已抽到 lib/agent-tree.ts
+
 function adapterSlug(method: PaymentMethod): string {
   switch (method) {
     case PaymentMethod.WECHAT_PAY: return 'wechat';
@@ -309,17 +312,3 @@ function adapterSlug(method: PaymentMethod): string {
   }
 }
 
-// 查自己 + 所有后代代理 id — PostgreSQL 递归 CTE 一次查完
-async function getDescendantAgentIds(agentId: string | undefined): Promise<string[]> {
-  if (!agentId) return [];
-  const rows = await prisma.$queryRaw<Array<{ id: string }>>`
-    WITH RECURSIVE agent_tree AS (
-      SELECT id FROM "Agent" WHERE id = ${agentId}
-      UNION ALL
-      SELECT a.id FROM "Agent" a
-      INNER JOIN agent_tree t ON a."parentAgentId" = t.id
-    )
-    SELECT id FROM agent_tree
-  `;
-  return rows.map((r) => r.id);
-}

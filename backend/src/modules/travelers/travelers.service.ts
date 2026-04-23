@@ -9,7 +9,7 @@ import { NotFoundError } from '../../lib/errors.js';
 import type { CreateTravelerBody, ListTravelersQuery, UpdateTravelerBody } from './travelers.schemas.js';
 
 export class TravelersService {
-  async list(query: ListTravelersQuery) {
+  async list(query: ListTravelersQuery & { agentTreeIds?: string[] }) {
     const where: Prisma.SavedPassengerWhereInput = {};
     if (query.userId) where.userId = query.userId;
     if (query.search) {
@@ -19,6 +19,12 @@ export class TravelersService {
       ];
     }
     if (query.dob) where.dateOfBirth = new Date(`${query.dob}T00:00:00Z`);
+    // AGENT 作用域：旅客的 user.customerProfile.primaryAgentId ∈ 自己树
+    if (query.agentTreeIds) {
+      where.user = {
+        customerProfile: { is: { primaryAgentId: { in: query.agentTreeIds } } },
+      };
+    }
 
     const [rows, total] = await prisma.$transaction([
       prisma.savedPassenger.findMany({

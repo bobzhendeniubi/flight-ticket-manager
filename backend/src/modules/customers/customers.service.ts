@@ -17,7 +17,11 @@ const PAID_STATUSES: OrderStatus[] = [
 ];
 
 export class CustomersService {
-  async list(query: ListCustomersQuery) {
+  /**
+   * query.agentTreeIds —— AGENT 调用时传入自己 + 后代 agent 的 id 集合；
+   * 服务强制按 primaryAgentId IN (tree) 过滤，防止代理看到不属于自己树的客户。
+   */
+  async list(query: ListCustomersQuery & { agentTreeIds?: string[] }) {
     const where: Prisma.UserWhereInput = { role: 'CUSTOMER' };
     if (query.search) {
       where.OR = [
@@ -29,7 +33,11 @@ export class CustomersService {
     const profileFilter: Prisma.CustomerProfileWhereInput = {};
     if (query.agentId) profileFilter.primaryAgentId = query.agentId;
     if (query.tag) profileFilter.tags = { has: query.tag };
-    if (query.agentId || query.tag) {
+    // AGENT 强制作用域：只看自己树里的客户
+    if (query.agentTreeIds) {
+      profileFilter.primaryAgentId = { in: query.agentTreeIds };
+    }
+    if (query.agentId || query.tag || query.agentTreeIds) {
       where.customerProfile = { is: profileFilter };
     }
 
@@ -72,7 +80,8 @@ export class CustomersService {
     };
   }
 
-  async getById(id: string) {
+  /** agentTreeIds 传入 → AGENT 只能看自己树里的客户，否则 404（保护 id 不暴露） */
+  async getById(id: string, agentTreeIds?: string[]) {
     const u = await prisma.user.findUnique({
       where: { id },
       include: {
@@ -80,6 +89,10 @@ export class CustomersService {
       },
     });
     if (!u || u.role !== 'CUSTOMER') throw new NotFoundError('客户不存在');
+    if (agentTreeIds) {
+      const pid = u.customerProfile?.primaryAgentId;
+      if (!pid || !agentTreeIds.includes(pid)) throw new NotFoundError('客户不存在');
+    }
 
     const agg = await prisma.order.aggregate({
       where: { userId: id, status: { in: PAID_STATUSES } },

@@ -27,13 +27,13 @@ export const useAuth = create<AuthState>()(
         set({ isLoading: true, error: null });
         try {
           const res = await api.login(email, password);
-          // 后台只允许 ADMIN/STAFF。CUSTOMER/AGENT 拒绝并提示去前台。
-          if (res.user.role !== 'ADMIN' && res.user.role !== 'STAFF') {
-            // 已登录但角色不对 — 立刻撤销 token
+          // 后台允许 ADMIN/STAFF/AGENT（代理可进但只看自己树内数据）
+          // CUSTOMER 仍拒绝 —— 他们有专用前台 5173
+          if (res.user.role === 'CUSTOMER') {
             api.logout(res.tokens.refreshToken).catch(() => undefined);
             throw new ApiError(403, {
               code: 'WRONG_PORTAL',
-              message: `当前账号是「${roleLabel(res.user.role)}」，无权登录后台。请到前台 http://localhost:5173 登录。`,
+              message: '客户账号请到前台 http://localhost:5173 登录',
             });
           }
           set({ user: res.user, tokens: res.tokens, isLoading: false });
@@ -61,6 +61,3 @@ export const useAuth = create<AuthState>()(
   ),
 );
 
-function roleLabel(role: string): string {
-  return { CUSTOMER: '客户', AGENT: '代理', STAFF: '运营', ADMIN: '管理员' }[role] ?? role;
-}

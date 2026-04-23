@@ -1,24 +1,52 @@
 /**
- * 客户管理（ADMIN/STAFF）
+ * 客户管理
+ * - ADMIN/STAFF: 全部客户
+ * - AGENT: 自己树内的客户（primaryAgentId ∈ 自己 + 后代）
  */
 import type { FastifyPluginAsync } from 'fastify';
 import { UserRole } from '@prisma/client';
+import { prisma } from '../../db/prisma.js';
 import { CustomersService } from './customers.service.js';
 import { listCustomersQuerySchema, updateCustomerBodySchema } from './customers.schemas.js';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
+import { getDescendantAgentIds } from '../../lib/agent-tree.js';
+import { ForbiddenError } from '../../lib/errors.js';
 
 export const customerRoutes: FastifyPluginAsync = async (app) => {
   const service = new CustomersService();
-  const pre = { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] };
+  const pre = {
+    preHandler: [
+      app.authenticate,
+      app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT),
+    ],
+  };
+
+  /**
+   * AGENT 访问时自动注入 agentTreeIds —— service 层强制过滤。
+   * 返回 undefined 表示 ADMIN/STAFF（不限制）。
+   */
+  async function resolveAgentScope(
+    req: { user: { sub: string; role: UserRole } },
+  ): Promise<string[] | undefined> {
+    if (req.user.role !== UserRole.AGENT) return undefined;
+    const agent = await prisma.agent.findUnique({
+      where: { userId: req.user.sub },
+      select: { id: true },
+    });
+    if (!agent) throw new ForbiddenError('AGENT 账号没有关联 Agent 档案');
+    return getDescendantAgentIds(agent.id);
+  }
 
   app.get('/', pre, async (req) => {
     const q = listCustomersQuerySchema.parse(req.query);
-    return service.list(q);
+    const agentTreeIds = await resolveAgentScope(req);
+    return service.list({ ...q, agentTreeIds });
   });
 
   app.get('/:id', pre, async (req) => {
     const { id } = req.params as { id: string };
-    const customer = await service.getById(id);
+    const agentTreeIds = await resolveAgentScope(req);
+    const customer = await service.getById(id, agentTreeIds);
     return { customer };
   });
 
@@ -26,7 +54,9 @@ export const customerRoutes: FastifyPluginAsync = async (app) => {
     const { id } = req.params as { id: string };
     const body = updateCustomerBodySchema.parse(req.body);
 
-    const before = await service.getById(id);
+    // AGENT 只能改自己树里的客户
+    const agentTreeIds = await resolveAgentScope(req);
+    const before = await service.getById(id, agentTreeIds);
     const customer = await service.update(id, body);
 
     void writeAudit({

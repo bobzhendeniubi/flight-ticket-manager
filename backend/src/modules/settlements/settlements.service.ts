@@ -30,6 +30,7 @@ import {
   ForbiddenError,
   NotFoundError,
 } from '../../lib/errors.js';
+import { getDescendantAgentIds } from '../../lib/agent-tree.js';
 import type {
   GenerateSettlementsBody,
   ListSettlementsQuery,
@@ -428,20 +429,7 @@ function round2(n: number): number {
   return Math.round(n * 100) / 100;
 }
 
-async function getDescendantAgentIds(agentId: string | undefined): Promise<string[]> {
-  if (!agentId) return [];
-  // PostgreSQL 递归 CTE 一次查完（避免每层 findMany 放大）
-  const rows = await prisma.$queryRaw<Array<{ id: string }>>`
-    WITH RECURSIVE agent_tree AS (
-      SELECT id FROM "Agent" WHERE id = ${agentId}
-      UNION ALL
-      SELECT a.id FROM "Agent" a
-      INNER JOIN agent_tree t ON a."parentAgentId" = t.id
-    )
-    SELECT id FROM agent_tree
-  `;
-  return rows.map((r) => r.id);
-}
+// getDescendantAgentIds — 已抽到 lib/agent-tree.ts
 
 // ── Serializer ───────────────────────────────────────────────────────
 type SettlementWithAgent = Prisma.SettlementGetPayload<{

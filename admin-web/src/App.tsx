@@ -15,19 +15,44 @@ import { AuditLogsPage } from './pages/AuditLogsPage';
 import { SettlementsPage } from './pages/SettlementsPage';
 import { useAuth } from './stores/auth';
 
-function Protected({ children }: { children: React.ReactNode }) {
+// AGENT 可访问的页面集合（其他页面默认 ADMIN/STAFF 专属）
+// 真实 RBAC 仍由后端 requireRole 兜底 —— 前端只做导航 UX
+const AGENT_ALLOWED_PATHS = new Set([
+  '/orders',
+  '/customers',
+  '/travelers',
+  '/agents',
+  '/settlements',
+]);
+
+function Protected({
+  children,
+  adminOnly = false,
+}: {
+  children: React.ReactNode;
+  /** 只允许 ADMIN/STAFF；AGENT 重定向到自己的 landing 页 */
+  adminOnly?: boolean;
+}) {
   const user = useAuth((s) => s.user);
   const tokens = useAuth((s) => s.tokens);
-  // 同时要求 user 和 tokens 都存在 — 防止有人篡改 localStorage 只伪造 user 而无 token
   if (!user || !tokens) return <Navigate to="/login" replace />;
-  // 后台严格 ADMIN/STAFF
-  if (user.role !== 'ADMIN' && user.role !== 'STAFF') {
-    return <Navigate to="/login" replace />;
+  if (user.role === 'CUSTOMER') return <Navigate to="/login" replace />;
+
+  // AGENT 禁入 admin-only 页 —— 落到默认 landing (/orders)
+  if (adminOnly && user.role === 'AGENT') {
+    return <Navigate to="/orders" replace />;
   }
-  // 注意：前端路由保护是 UX 层面，真正的 RBAC 由后端 requireRole(ADMIN) 在 API 层兜底。
-  // 即使有人篡改 localStorage 进入这些页面，他们调任何 API 都会被后端拒绝。
   return <>{children}</>;
 }
+
+function AgentLanding() {
+  const user = useAuth((s) => s.user);
+  if (!user) return <Navigate to="/login" replace />;
+  // AGENT 默认落地到订单页（没有 dashboard 权限）；ADMIN/STAFF 走 dashboard
+  return <Navigate to={user.role === 'AGENT' ? '/orders' : '/dashboard'} replace />;
+}
+
+void AGENT_ALLOWED_PATHS; // 将来可用于中间件白名单，目前通过 adminOnly 显式标注
 
 export function App() {
   return (
@@ -37,7 +62,7 @@ export function App() {
         <Route
           path="/dashboard"
           element={
-            <Protected>
+            <Protected adminOnly>
               <DashboardPage />
             </Protected>
           }
@@ -53,7 +78,7 @@ export function App() {
         <Route
           path="/flights"
           element={
-            <Protected>
+            <Protected adminOnly>
               <FlightsPage />
             </Protected>
           }
@@ -61,7 +86,7 @@ export function App() {
         <Route
           path="/seat-stats"
           element={
-            <Protected>
+            <Protected adminOnly>
               <SeatStatsPage />
             </Protected>
           }
@@ -69,7 +94,7 @@ export function App() {
         <Route
           path="/seat-allocation"
           element={
-            <Protected>
+            <Protected adminOnly>
               <SeatAllocationPage />
             </Protected>
           }
@@ -77,7 +102,7 @@ export function App() {
         <Route
           path="/products"
           element={
-            <Protected>
+            <Protected adminOnly>
               <ProductsPage />
             </Protected>
           }
@@ -85,7 +110,7 @@ export function App() {
         <Route
           path="/pricing"
           element={
-            <Protected>
+            <Protected adminOnly>
               <PricingPage />
             </Protected>
           }
@@ -117,7 +142,7 @@ export function App() {
         <Route
           path="/audit-logs"
           element={
-            <Protected>
+            <Protected adminOnly>
               <AuditLogsPage />
             </Protected>
           }
@@ -131,7 +156,7 @@ export function App() {
           }
         />
       </Route>
-      <Route path="*" element={<Navigate to="/dashboard" replace />} />
+      <Route path="*" element={<AgentLanding />} />
     </Routes>
   );
 }

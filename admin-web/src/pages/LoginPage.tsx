@@ -34,11 +34,13 @@ export function LoginPage() {
       <div className="w-full max-w-sm">
         <div className="text-center text-white mb-6">
           <h1 className="text-2xl font-bold">世途旅行 · 后台</h1>
-          <p className="mt-2 text-sm text-slate-400">运营端 / 管理员入口</p>
+          <p className="mt-2 text-sm text-slate-400">运营 / 管理员 / 代理 入口</p>
         </div>
         <div className="rounded-lg bg-white p-6 shadow-xl">
           <h2 className="text-lg font-semibold text-slate-900">账号登录</h2>
-          <p className="mt-1 text-xs text-slate-500">仅 ADMIN / STAFF 角色可登录后台</p>
+          <p className="mt-1 text-xs text-slate-500">
+            ADMIN / STAFF 见全部数据；AGENT 只能看自己树内的订单、客户、结算
+          </p>
 
           <form className="mt-5 space-y-4" onSubmit={onSubmit}>
             <div>
@@ -77,10 +79,11 @@ export function LoginPage() {
           </form>
 
           <div className="mt-5 rounded-md bg-slate-50 p-3 text-xs text-slate-600">
-            <p className="font-medium text-slate-700">开发管理员账号（密码 <code>Password123!</code>）</p>
-            <p className="mt-1 font-mono">admin@ftm.local</p>
+            <p className="font-medium text-slate-700">开发账号（密码 <code>Password123!</code>）</p>
+            <p className="mt-1 font-mono">admin@ftm.local · <span className="text-slate-400">运营全权限</span></p>
+            <p className="mt-1 font-mono">agent1@ftm.local · <span className="text-slate-400">代理端（只看自己树）</span></p>
             <p className="mt-2 text-slate-500">
-              代理或客户请到{' '}
+              客户请到{' '}
               <a href="http://localhost:5173" className="text-brand hover:underline">
                 前台 :5173
               </a>{' '}

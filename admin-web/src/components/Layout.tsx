@@ -6,21 +6,23 @@ import { api, ApiError } from '../lib/api';
 const ROLE_LABEL: Record<string, string> = {
   STAFF: '运营',
   ADMIN: '管理员',
+  AGENT: '代理',
 };
 
-const NAV = [
-  { to: '/dashboard', label: '仪表盘' },
-  { to: '/orders', label: '订单管理' },
-  { to: '/flights', label: '航班管理' },
-  { to: '/seat-stats', label: '座位统计' },
-  { to: '/seat-allocation', label: '切位（包位）' },
-  { to: '/products', label: '产品管理' },
-  { to: '/pricing', label: '动态定价' },
-  { to: '/agents', label: '代理管理' },
-  { to: '/customers', label: '散客管理' },
-  { to: '/travelers', label: '旅客管理' },
-  { to: '/settlements', label: '结算单' },
-  { to: '/audit-logs', label: '审计日志' },
+// roles: 允许访问该导航的角色集合
+const NAV: Array<{ to: string; label: string; roles: Array<'ADMIN' | 'STAFF' | 'AGENT'> }> = [
+  { to: '/dashboard',       label: '仪表盘',      roles: ['ADMIN', 'STAFF'] },
+  { to: '/orders',          label: '订单管理',    roles: ['ADMIN', 'STAFF', 'AGENT'] },
+  { to: '/flights',         label: '航班管理',    roles: ['ADMIN', 'STAFF'] },
+  { to: '/seat-stats',      label: '座位统计',    roles: ['ADMIN', 'STAFF'] },
+  { to: '/seat-allocation', label: '切位（包位）', roles: ['ADMIN', 'STAFF'] },
+  { to: '/products',        label: '产品管理',    roles: ['ADMIN', 'STAFF'] },
+  { to: '/pricing',         label: '动态定价',    roles: ['ADMIN', 'STAFF'] },
+  { to: '/agents',          label: '代理管理',    roles: ['ADMIN', 'STAFF', 'AGENT'] },
+  { to: '/customers',       label: '散客管理',    roles: ['ADMIN', 'STAFF', 'AGENT'] },
+  { to: '/travelers',       label: '旅客管理',    roles: ['ADMIN', 'STAFF', 'AGENT'] },
+  { to: '/settlements',     label: '结算单',      roles: ['ADMIN', 'STAFF', 'AGENT'] },
+  { to: '/audit-logs',      label: '审计日志',    roles: ['ADMIN', 'STAFF'] },
 ];
 
 export function Layout() {
@@ -41,7 +43,8 @@ export function Layout() {
     api.me(tokens.accessToken)
       .then((res) => {
         if (cancelled) return;
-        if (res.user.role !== 'ADMIN' && res.user.role !== 'STAFF') {
+        // 后台允许 ADMIN/STAFF/AGENT；CUSTOMER 踢出
+        if (res.user.role === 'CUSTOMER') {
           logout().then(() => navigate('/login', { replace: true }));
         }
       })
@@ -59,10 +62,15 @@ export function Layout() {
       {/* 顶部品牌 + 用户 */}
       <header className="bg-slate-900 text-white">
         <div className="mx-auto flex max-w-[1400px] items-center justify-between px-5 py-3">
-          <Link to="/dashboard" className="flex items-center gap-2 text-lg font-semibold">
+          <Link
+            to={user?.role === 'AGENT' ? '/orders' : '/dashboard'}
+            className="flex items-center gap-2 text-lg font-semibold"
+          >
             <span aria-hidden className="text-brand">⚙</span>
             <span>世途旅行 · 后台</span>
-            <span className="ml-2 rounded bg-brand/20 px-2 py-0.5 text-xs text-brand">运营端</span>
+            <span className="ml-2 rounded bg-brand/20 px-2 py-0.5 text-xs text-brand">
+              {user?.role === 'AGENT' ? '代理端' : '运营端'}
+            </span>
           </Link>
           <div className="flex items-center gap-3 text-sm">
             {user ? (
@@ -95,7 +103,9 @@ export function Layout() {
         <nav className="border-b border-slate-200 bg-white">
           <div className="mx-auto max-w-[1400px] px-5">
             <ul className="flex flex-wrap gap-1 text-sm">
-              {NAV.map((n) => (
+              {NAV.filter((n) =>
+                n.roles.includes(user.role as 'ADMIN' | 'STAFF' | 'AGENT'),
+              ).map((n) => (
                 <li key={n.to}>
                   <NavLink
                     to={n.to}
