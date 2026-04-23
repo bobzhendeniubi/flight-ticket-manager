@@ -140,26 +140,27 @@ export class AuthService {
     } else {
       const url = `https://api.weixin.qq.com/sns/jscode2session?appid=${encodeURIComponent(env.WECHAT_MP_APPID!)}&secret=${encodeURIComponent(env.WECHAT_MP_APPSECRET!)}&js_code=${encodeURIComponent(input.code)}&grant_type=authorization_code`;
       // P3 修复：8s 硬超时（移动网络 + 微信接口偶发 stall 不应 block worker）
+      // 超时要覆盖 fetch + body 读；headers 到了但 body 卡住也应触发 abort
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 8000);
-      let resp: Response;
-      try {
-        resp = await fetch(url, { signal: controller.signal });
-      } catch (err) {
-        if ((err as { name?: string })?.name === 'AbortError') {
-          throw new UnauthorizedError('微信登录超时：jscode2session 8 秒未响应');
-        }
-        throw err;
-      } finally {
-        clearTimeout(timeoutId);
-      }
-      const body = (await resp.json()) as {
+      let body: {
         openid?: string;
         session_key?: string;
         unionid?: string;
         errcode?: number;
         errmsg?: string;
       };
+      try {
+        const resp = await fetch(url, { signal: controller.signal });
+        body = (await resp.json()) as typeof body; // 也被 signal 控制（stream 断 → json 抛）
+      } catch (err) {
+        if ((err as { name?: string })?.name === 'AbortError') {
+          throw new UnauthorizedError('微信登录超时：jscode2session 8 秒未响应或 body 读取超时');
+        }
+        throw err;
+      } finally {
+        clearTimeout(timeoutId);
+      }
       if (!body.openid || body.errcode) {
         throw new UnauthorizedError(
           `微信登录失败：${body.errmsg ?? 'jscode2session 无 openid'} (code=${body.errcode ?? '-'})`,

@@ -81,16 +81,19 @@ export const useCart = create<CartState>((set, get) => ({
     }
   },
 
+  // add/remove 都视为"购物车内容变化"→ rotate key
+  // 场景：客户端下单成功但没拿到响应 → 用户以为失败、修改购物车再试 →
+  // 必须是新 key，否则后端按旧 key 返回旧订单（和新购物车内容不符）
   add: (item) => {
     const items = [...get().items, item];
-    persist(items, get().idempotencyKey);
-    set({ items });
+    persist(items, null);
+    set({ items, idempotencyKey: null });
   },
 
   remove: (index) => {
     const items = get().items.filter((_, i) => i !== index);
-    persist(items, get().idempotencyKey);
-    set({ items });
+    persist(items, null);
+    set({ items, idempotencyKey: null });
   },
 
   clear: () => {

@@ -72,15 +72,19 @@ async function refreshAccessToken(): Promise<string | null> {
         header: { 'content-type': 'application/json' },
         data: { refreshToken: state.tokens.refreshToken },
       });
-      if (res.statusCode < 200 || res.statusCode >= 300) {
-        // refresh token 也失效了 —— 踢出登录
-        state.clear();
-        return null;
+      if (res.statusCode >= 200 && res.statusCode < 300) {
+        const body = res.data as { tokens: { accessToken: string; refreshToken: string; accessTokenExpiresIn: number; refreshTokenExpiresIn: number } };
+        state.setTokens(body.tokens);
+        return body.tokens.accessToken;
       }
-      const body = res.data as { tokens: { accessToken: string; refreshToken: string; accessTokenExpiresIn: number; refreshTokenExpiresIn: number } };
-      state.setTokens(body.tokens);
-      return body.tokens.accessToken;
+      // 只有 401/403（refresh token 真的无效）才踢出登录。
+      // 429（rate-limit）或 5xx 是瞬时故障 —— 让调用方拿到原始 401 再试即可。
+      if (res.statusCode === 401 || res.statusCode === 403) {
+        state.clear();
+      }
+      return null;
     } catch {
+      // 网络异常 —— 不踢出，让调用方按原 401 上报
       return null;
     } finally {
       // 下一波 401 可以再试
