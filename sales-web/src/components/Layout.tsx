@@ -152,8 +152,9 @@ export function Layout() {
 
       <AddToCartToast />
 
-      {/* 浮动 AI 助手 — 客户没登录也能用，下单时才跳登录 */}
-      {!isAdmin && <AiAssistant />}
+      {/* 浮动 AI 助手 — 任何角色都看得到（admin 也能测试 demo）；
+          下单时才跳登录 */}
+      <AiAssistant />
     </div>
   );
 }
