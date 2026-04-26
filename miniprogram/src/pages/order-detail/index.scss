@@ -54,4 +54,19 @@
     padding: 28rpx;
     &.disabled { opacity: 0.5; pointer-events: none; }
   }
+
+  .cancel-btn {
+    margin-top: 16rpx;
+    color: #b91c1c;
+    border: 2rpx solid #fecaca;
+    background: #fef2f2;
+  }
+
+  .refund-status {
+    margin-top: 16rpx;
+    text-align: center;
+    color: #b45309;
+    background: #fef3c7;
+    border: 2rpx solid #fde68a;
+  }
 }

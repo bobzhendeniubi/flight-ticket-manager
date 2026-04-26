@@ -13,6 +13,7 @@ import { CustomersPage } from './pages/CustomersPage';
 import { TravelersPage } from './pages/TravelersPage';
 import { AuditLogsPage } from './pages/AuditLogsPage';
 import { SettlementsPage } from './pages/SettlementsPage';
+import { CancellationPoliciesPage } from './pages/CancellationPoliciesPage';
 import { useAuth } from './stores/auth';
 
 // AGENT 可访问的页面集合（其他页面默认 ADMIN/STAFF 专属）
@@ -136,6 +137,14 @@ export function App() {
           element={
             <Protected>
               <TravelersPage />
+            </Protected>
+          }
+        />
+        <Route
+          path="/cancellation-policies"
+          element={
+            <Protected adminOnly>
+              <CancellationPoliciesPage />
             </Protected>
           }
         />

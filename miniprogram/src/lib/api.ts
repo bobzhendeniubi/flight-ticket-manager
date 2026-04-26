@@ -9,6 +9,7 @@
 import Taro from '@tarojs/taro';
 import type {
   AuthResult, AuthTokens, CabinClass,
+  CancellationQuote,
   FlightSearchResult, OrderSummary, PaymentMethod,
 } from './types';
 
@@ -193,6 +194,21 @@ export const api = {
 
   getOrder: (token: string, id: string) =>
     apiFetch<{ order: OrderSummary }>(`/orders/${id}`, { token }),
+
+  // 取消订单：先 quote 看应退多少，再 cancel 真触发
+  refundQuote: (token: string, orderId: string) =>
+    apiFetch<{ quote: CancellationQuote }>(`/orders/${orderId}/refund-quote`, { token }),
+  cancelOrder: (token: string, orderId: string, reason?: string) =>
+    apiFetch<{
+      order: OrderSummary;
+      refund: { id: string; amount: string; status: string };
+      quote: CancellationQuote;
+      isNew: boolean;
+    }>(`/orders/${orderId}/cancel`, {
+      method: 'POST',
+      token,
+      body: { reason },
+    }),
 
   // 微信支付 JSAPI prepay — 返回给 wx.requestPayment 的参数
   wechatMiniappPrepay: (token: string, orderId: string) =>

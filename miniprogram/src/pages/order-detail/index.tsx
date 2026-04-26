@@ -180,6 +180,54 @@ export default function OrderDetailPage() {
           {paying ? '支付中…' : `立即支付 ¥${Number(order.total).toLocaleString()}`}
         </View>
       )}
+
+      {/* 取消订单 — PAID/PROCESSING/TICKETED 状态可申请，按规则计算手续费 */}
+      {(order.status === 'PAID' || order.status === 'PROCESSING' || order.status === 'TICKETED') && (
+        <View
+          className='btn-secondary cancel-btn'
+          onClick={async () => {
+            if (!tokens || !orderId) return;
+            try {
+              const { quote } = await api.refundQuote(tokens.accessToken, orderId);
+              const text = quote.items
+                .map((i) => `${i.kind}: ¥${i.amount} → 退 ¥${i.refundAmount} (扣 ${i.feePercent}%)`)
+                .join('\n');
+              Taro.showModal({
+                title: `预计退款 ¥${quote.totalRefund}`,
+                content: `已付 ¥${quote.paidAmount}，手续费 ¥${quote.totalFee}\n\n${text}\n\n确认申请取消？`,
+                confirmText: '确认取消',
+                cancelText: '再想想',
+                success: async (r) => {
+                  if (!r.confirm) return;
+                  try {
+                    await api.cancelOrder(tokens.accessToken, orderId, '用户在小程序申请取消');
+                    Taro.showToast({ title: '已申请取消，等待审批', icon: 'success' });
+                    setTimeout(load, 500);
+                  } catch (e) {
+                    Taro.showToast({
+                      title: e instanceof ApiError ? e.message : '取消失败',
+                      icon: 'none',
+                    });
+                  }
+                },
+              });
+            } catch (e) {
+              Taro.showToast({
+                title: e instanceof ApiError ? e.message : '查询退款金额失败',
+                icon: 'none',
+              });
+            }
+          }}
+        >
+          申请取消订单
+        </View>
+      )}
+
+      {order.status === 'REFUND_REQUESTED' && (
+        <View className='card refund-status'>
+          <Text>⏳ 已提交取消申请，等待客服审批退款</Text>
+        </View>
+      )}
     </ScrollView>
   );
 }

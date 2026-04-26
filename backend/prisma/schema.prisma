@@ -807,6 +807,42 @@ model PriceHistory {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Cancellation policies — 取消订单的退款手续费阶梯
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// tiers JSON 形如：
+//   [
+//     { "hoursBeforeDeparture": 168, "feePercent": 0   },  // 7+ 天，免费
+//     { "hoursBeforeDeparture": 72,  "feePercent": 20  },  // 3-7 天，20% 手续费
+//     { "hoursBeforeDeparture": 24,  "feePercent": 50  },  // 1-3 天，50%
+//     { "hoursBeforeDeparture": 0,   "feePercent": 80  },  // <1 天，80%
+//     { "hoursBeforeDeparture": -1,  "feePercent": 100 }   // 已起飞 / 已入住，100%
+//   ]
+//
+// 找匹配 tier 算法：取 hoursLeft >= tier.hoursBeforeDeparture 中 hoursBeforeDeparture 最大的一档；
+// 都不满足（i.e. 已过 0 小时）→ 取 hoursBeforeDeparture = -1 那条（"已履约"档）。
+//
+// 优先级：scope 精确匹配 > 同 productKind 的 isDefault=true。
+//
+model CancellationPolicy {
+  id          String        @id @default(cuid())
+  productKind OrderItemKind
+  // 可选范围限定（null = 该 kind 的通用策略；非 null = 针对特定班次/酒店房型/套餐）
+  // scope 是 polymorphic，按 productKind 解释：FLIGHT→FlightSchedule.id, HOTEL→HotelRoomType.id, BUNDLE→Bundle.id ...
+  scope       String?
+  name        String        // 人类可读，例 "默认机票退订" / "国庆班次特殊政策"
+  tiers       Json          // 见上方注释；运行时校验 hoursBeforeDeparture 单调递减、feePercent 0-100
+  isDefault   Boolean       @default(false) // true = 该 kind 的兜底；同 kind 只允许一条 isDefault
+  isActive    Boolean       @default(true)
+  notes       String?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  @@unique([productKind, scope]) // 同 kind+scope 唯一
+  @@index([productKind, isDefault])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Notifications
 // ─────────────────────────────────────────────────────────────────────────────
 

@@ -96,6 +96,32 @@ export interface OrderPassenger {
   eticketNumber: string | null;
 }
 
+// ── 取消订单 quote ───────────────────────────────────────────
+export interface CancellationItemQuote {
+  itemId: string;
+  kind: string;
+  description: string;
+  amount: number;
+  hoursLeft: number | null;
+  policyName: string;
+  feePercent: number;
+  feeAmount: number;
+  refundAmount: number;
+  reason: string;
+  fulfilled: boolean;
+}
+
+export interface CancellationQuote {
+  orderId: string;
+  orderNumber: string;
+  paidAmount: number;
+  totalFee: number;
+  totalRefund: number;
+  items: CancellationItemQuote[];
+  cancellable: boolean;
+  cancellableReason?: string;
+}
+
 export interface OrderSummary {
   id: string;
   orderNumber: string;

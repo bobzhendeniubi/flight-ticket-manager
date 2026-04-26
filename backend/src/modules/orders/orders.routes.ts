@@ -7,6 +7,7 @@
  * PATCH  /orders/:id/status    状态流转（ADMIN/STAFF；客户可取消待支付）
  */
 import type { FastifyPluginAsync } from 'fastify';
+import { z } from 'zod';
 import { UserRole } from '@prisma/client';
 import { OrderService, type OrderRequester } from './orders.service.js';
 import {
@@ -16,6 +17,7 @@ import {
 } from './orders.schemas.js';
 import { prisma } from '../../db/prisma.js';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
+import { computeCancellationQuote } from '../../lib/cancellation.js';
 
 export const orderRoutes: FastifyPluginAsync = async (app) => {
   const service = new OrderService();
@@ -82,6 +84,57 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         severity: body.toStatus === 'CANCELLED' || body.toStatus === 'REFUNDED' ? 'WARNING' : 'INFO',
       });
       return { order };
+    },
+  );
+
+  /**
+   * GET /orders/:id/refund-quote
+   * 预览取消订单的退款明细（只读，不改任何状态）
+   * 客户/代理/管理员都能调（service.assertCanView 兜底权限）
+   */
+  app.get(
+    '/:id/refund-quote',
+    { preHandler: [app.authenticate] },
+    async (req) => {
+      const { id } = req.params as { id: string };
+      const requester = await buildRequester(req.user.sub, req.user.role);
+      // 复用 service 的权限校验：能 getOrder 就能看 quote
+      await service.getOrder(id, requester);
+      const quote = await computeCancellationQuote(id);
+      return { quote };
+    },
+  );
+
+  /**
+   * POST /orders/:id/cancel
+   * 客户/代理 主动申请取消 → 创建 Refund(amount=应退) + Order 转 REFUND_REQUESTED
+   * ADMIN/STAFF 后续审批（POST /refunds/:id/approve）
+   */
+  app.post(
+    '/:id/cancel',
+    { preHandler: [app.authenticate] },
+    async (req) => {
+      const { id } = req.params as { id: string };
+      const body = z.object({ reason: z.string().max(500).optional() }).parse(req.body ?? {});
+      const requester = await buildRequester(req.user.sub, req.user.role);
+      const result = await service.requestCancellation(id, body.reason, requester);
+
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'REQUEST_CANCELLATION',
+        targetType: 'ORDER',
+        targetId: result.order.id,
+        targetLabel: result.order.orderNumber,
+        after: {
+          totalFee: result.quote.totalFee,
+          totalRefund: result.quote.totalRefund,
+          reason: body.reason,
+          isNew: result.isNew,
+        },
+        severity: 'WARNING',
+      });
+
+      return result;
     },
   );
 };

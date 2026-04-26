@@ -560,6 +560,23 @@ export class OrderService {
       });
     }
 
+    // 同步 Refund 状态：当订单走到终态时，关联的 REQUESTED Refund 应该相应推进
+    //   REFUNDED   → Refund.COMPLETED + processedAt（管理员批准退款）
+    //   CANCELLED  → Refund.REJECTED（管理员拒绝退款，订单回滚到取消但不退）
+    // （这是给 admin PATCH /orders/:id/status 兜底；前面 requestCancellation 创建的 Refund
+    //  停在 REQUESTED 等待这一步推进）
+    if (toStatus === 'REFUNDED') {
+      await tx.refund.updateMany({
+        where: { orderId: id, status: 'REQUESTED' },
+        data: { status: 'COMPLETED', processedAt: new Date() },
+      });
+    } else if (toStatus === 'CANCELLED') {
+      await tx.refund.updateMany({
+        where: { orderId: id, status: 'REQUESTED' },
+        data: { status: 'REJECTED', processedAt: new Date() },
+      });
+    }
+
     return tx.order.findUniqueOrThrow({
       where: { id },
       include: {
@@ -599,9 +616,17 @@ export class OrderService {
     if (requester.role === 'ADMIN' || requester.role === 'STAFF') return;
     if (requester.role === 'CUSTOMER') {
       if (order.userId !== requester.userId) throw new ForbiddenError('无权操作该订单');
-      // 客户只能取消待支付订单
-      if (toStatus !== 'CANCELLED' || order.status !== 'PENDING_PAYMENT') {
-        throw new ForbiddenError('客户仅可取消待支付订单');
+      // 客户允许的状态流转：
+      //   1. PENDING_PAYMENT → CANCELLED （直接取消未支付订单）
+      //   2. PAID / PROCESSING / TICKETED → REFUND_REQUESTED （申请取消已支付订单）
+      const allowed =
+        (toStatus === 'CANCELLED' && order.status === 'PENDING_PAYMENT') ||
+        (toStatus === 'REFUND_REQUESTED' &&
+          (order.status === 'PAID' || order.status === 'PROCESSING' || order.status === 'TICKETED'));
+      if (!allowed) {
+        throw new ForbiddenError(
+          `客户不可将订单 ${order.status} → ${toStatus}（仅允许取消待支付订单 / 申请已支付订单退款）`,
+        );
       }
       return;
     }
@@ -610,8 +635,12 @@ export class OrderService {
       if (!order.agentId || !ids.includes(order.agentId)) {
         throw new ForbiddenError('无权操作该订单');
       }
-      // 代理暂时不许改状态（未来可放开"确认出票"）
-      throw new ForbiddenError('代理暂无状态流转权限，请联系运营');
+      // 代理替自己树内客户申请退款
+      if (toStatus === 'REFUND_REQUESTED' &&
+          (order.status === 'PAID' || order.status === 'PROCESSING' || order.status === 'TICKETED')) {
+        return;
+      }
+      throw new ForbiddenError('代理仅可代客户申请取消（其他状态流转请联系运营）');
     }
   }
 
@@ -630,7 +659,110 @@ export class OrderService {
     `;
     return rows.map((r) => r.id);
   }
+
+  // ════════════════════════════════════════════════════════════════════
+  // 取消订单（客户/代理 主动申请）
+  // ════════════════════════════════════════════════════════════════════
+  /**
+   * 申请取消订单：
+   *   1. 算 cancellation quote
+   *   2. 创建 Refund 行（amount=应退）；状态 REQUESTED 等管理员审批
+   *   3. Order 状态 → REFUND_REQUESTED + 写 OrderStatusEvent
+   *   4. （注意：这里不真退款 / 不释放座位 / 不冲销佣金 — 等 admin approve 后才做）
+   *
+   * 失败场景：
+   *   - 订单状态不可取消 → BadRequestError
+   *   - 已存在 REQUESTED 状态的 Refund → 返回那条（幂等）
+   */
+  async requestCancellation(
+    id: string,
+    reason: string | undefined,
+    requester: OrderRequester,
+  ) {
+    const order = await prisma.order.findUnique({
+      where: { id },
+      include: { refunds: { where: { status: 'REQUESTED' }, take: 1 } },
+    });
+    if (!order) throw new NotFoundError('订单不存在');
+    await this.assertCanView(order, requester);
+
+    // 已有 pending 退款 → 幂等返回（先于可取消性判断，避免再点报错）
+    if (order.refunds.length > 0) {
+      const { computeCancellationQuote } = await import('../../lib/cancellation.js');
+      const existing = order.refunds[0];
+      const updated = await prisma.order.findUniqueOrThrow({
+        where: { id },
+        include: ORDER_FULL_INCLUDE,
+      });
+      // 始终重算最新 quote（不用 snapshot），保证客户端拿到的 shape 一致 + 费率最新
+      // 历史 snapshot 留在 refund.gatewayPayload.quoteSnapshot 供审计追溯
+      const quote = await computeCancellationQuote(id);
+      return { order: serializeOrder(updated), refund: existing, quote, isNew: false };
+    }
+
+    // 计算 quote（包含可取消性判断）
+    const { computeCancellationQuote } = await import('../../lib/cancellation.js');
+    const quote = await computeCancellationQuote(id);
+    if (!quote.cancellable) {
+      throw new BadRequestError(quote.cancellableReason ?? '订单不可取消');
+    }
+
+    // 事务：创建 Refund + 流转 Order 状态
+    const result = await prisma.$transaction(async (tx) => {
+      const refund = await tx.refund.create({
+        data: {
+          orderId: id,
+          amount: new Prisma.Decimal(quote.totalRefund),
+          reason: reason ?? null,
+          status: 'REQUESTED',
+          gatewayPayload: {
+            quoteSnapshot: {
+              totalFee: quote.totalFee,
+              totalRefund: quote.totalRefund,
+              items: quote.items.map((i) => ({
+                itemId: i.itemId,
+                kind: i.kind,
+                feePercent: i.feePercent,
+                feeAmount: i.feeAmount,
+                refundAmount: i.refundAmount,
+                reason: i.reason,
+              })),
+            },
+          } as Prisma.InputJsonValue,
+        },
+      });
+
+      const taskIds: string[] = [];
+      await this._updateStatusWithinTx(
+        tx,
+        id,
+        OrderStatus.REFUND_REQUESTED,
+        requester,
+        reason ?? `申请取消（应退 ¥${quote.totalRefund}）`,
+        taskIds,
+      );
+
+      return { refund };
+    });
+
+    const finalOrder = await prisma.order.findUniqueOrThrow({
+      where: { id },
+      include: ORDER_FULL_INCLUDE,
+    });
+    return { order: serializeOrder(finalOrder), refund: result.refund, quote, isNew: true };
+  }
 }
+
+// 完整 include 给 serializeOrder 用
+const ORDER_FULL_INCLUDE = {
+  items: true,
+  passengers: true,
+  payments: true,
+  refunds: true,
+  statusEvents: { orderBy: { createdAt: 'asc' } },
+  agent: { select: { id: true, companyName: true, contactName: true } },
+  user: { select: { id: true, displayName: true, email: true } },
+} as const;
 
 // ── Helpers ────────────────────────────────────────────────────────────
 function passengerToData(p: PassengerInput) {

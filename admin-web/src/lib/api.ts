@@ -668,4 +668,38 @@ export const api = {
   }),
   resetDateRanking: (token: string, date: string) =>
     apiFetch<{ ok: boolean }>(`/pricing/date-rankings/${date}`, { method: 'DELETE', token }),
+
+  // Cancellation policies
+  listCancellationPolicies: (token: string) =>
+    apiFetch<{ policies: CancellationPolicy[] }>('/cancellation-policies/', { token }),
+  createCancellationPolicy: (token: string, body: Record<string, unknown>) =>
+    apiFetch<{ policy: CancellationPolicy }>('/cancellation-policies/', {
+      method: 'POST', token, body,
+    }),
+  updateCancellationPolicy: (token: string, id: string, body: Record<string, unknown>) =>
+    apiFetch<{ policy: CancellationPolicy }>(`/cancellation-policies/${id}`, {
+      method: 'PATCH', token, body,
+    }),
+  deleteCancellationPolicy: (token: string, id: string) =>
+    apiFetch<{ ok: boolean }>(`/cancellation-policies/${id}`, { method: 'DELETE', token }),
 };
+
+export type ProductKind = 'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA' | 'BUNDLE' | 'INSURANCE';
+
+export interface CancellationTier {
+  hoursBeforeDeparture: number;
+  feePercent: number;
+}
+
+export interface CancellationPolicy {
+  id: string;
+  productKind: ProductKind;
+  scope: string | null;
+  name: string;
+  tiers: CancellationTier[];
+  isDefault: boolean;
+  isActive: boolean;
+  notes: string | null;
+  createdAt: string;
+  updatedAt: string;
+}

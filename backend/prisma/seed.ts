@@ -305,6 +305,9 @@ async function main() {
   await seedVisas();
   await seedBundles();
 
+  // ── 取消订单费率（默认每个 kind 一条 isDefault 兜底）──
+  await seedCancellationPolicies();
+
   // ── 清理不在列表里的历史航班（只在没有订单关联时） ──
   const keepFlightNumbers = FLIGHT_SEED.map((f) => f.flightNumber);
   const toRemove = await prisma.flight.findMany({
@@ -650,6 +653,88 @@ async function seedBundles() {
     } else {
       await prisma.bundle.create({ data: { ...b, items: b.items, isActive: true } });
     }
+  }
+}
+
+async function seedCancellationPolicies() {
+  // 业界常见的退订手续费阶梯
+  // hoursBeforeDeparture = -1 表示"已起飞 / 已入住 / 已履约" — 100%
+  const POLICIES = [
+    {
+      productKind: 'FLIGHT' as const,
+      name: '默认机票退订规则',
+      tiers: [
+        { hoursBeforeDeparture: 168, feePercent: 5 },   // 7+ 天
+        { hoursBeforeDeparture: 72,  feePercent: 20 },  // 3-7 天
+        { hoursBeforeDeparture: 24,  feePercent: 50 },  // 1-3 天
+        { hoursBeforeDeparture: 0,   feePercent: 80 },  // < 24 h
+        { hoursBeforeDeparture: -1,  feePercent: 100 }, // 已起飞
+      ],
+      notes: '可在后台「取消政策」页修改',
+    },
+    {
+      productKind: 'HOTEL' as const,
+      name: '默认酒店退订规则',
+      tiers: [
+        { hoursBeforeDeparture: 72, feePercent: 0 },    // 3+ 天免费
+        { hoursBeforeDeparture: 24, feePercent: 50 },   // 24-72h 收首晚 50%
+        { hoursBeforeDeparture: 0,  feePercent: 100 },  // < 24h 全额
+        { hoursBeforeDeparture: -1, feePercent: 100 },  // 已入住
+      ],
+    },
+    {
+      productKind: 'TRANSFER' as const,
+      name: '默认接送退订规则',
+      tiers: [
+        { hoursBeforeDeparture: 24, feePercent: 0 },    // 24+ 小时免费
+        { hoursBeforeDeparture: 6,  feePercent: 30 },   // 6-24h 30%
+        { hoursBeforeDeparture: 0,  feePercent: 80 },   // < 6h 80%
+        { hoursBeforeDeparture: -1, feePercent: 100 },
+      ],
+    },
+    {
+      productKind: 'VISA' as const,
+      name: '默认签证退订规则',
+      tiers: [
+        // 签证一旦提交使馆就基本无法退；这里以"是否已提交"作为分界
+        { hoursBeforeDeparture: 9999, feePercent: 50 }, // 提交前（demo: 大数字代表未提交）
+        { hoursBeforeDeparture: -1,   feePercent: 100 }, // 已提交使馆
+      ],
+      notes: 'Visa 比较特殊：实际应根据使馆受理状态算费率',
+    },
+    {
+      productKind: 'BUNDLE' as const,
+      name: '默认套餐退订规则',
+      tiers: [
+        { hoursBeforeDeparture: 168, feePercent: 10 },
+        { hoursBeforeDeparture: 72,  feePercent: 30 },
+        { hoursBeforeDeparture: 24,  feePercent: 60 },
+        { hoursBeforeDeparture: 0,   feePercent: 90 },
+        { hoursBeforeDeparture: -1,  feePercent: 100 },
+      ],
+    },
+  ];
+
+  for (const p of POLICIES) {
+    await prisma.cancellationPolicy.upsert({
+      where: { productKind_scope: { productKind: p.productKind, scope: '__DEFAULT__' } },
+      update: {
+        name: p.name,
+        tiers: p.tiers,
+        isDefault: true,
+        isActive: true,
+        notes: p.notes ?? null,
+      },
+      create: {
+        productKind: p.productKind,
+        scope: '__DEFAULT__', // 占位，避免 unique([kind, null]) 在 Prisma 里不生效
+        name: p.name,
+        tiers: p.tiers,
+        isDefault: true,
+        isActive: true,
+        notes: p.notes ?? null,
+      },
+    });
   }
 }
 
