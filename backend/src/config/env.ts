@@ -72,11 +72,13 @@ const EnvSchema = z.object({
   S3_BUCKET_UPLOADS: z.string().optional(),
 
   // ═══════════════════════════════════════════════════════════
-  // Anthropic API（AI 助手 chat）
-  // 未配时 /ai/chat 返 503 + 降级提示；不影响其他功能
-  // 模型固定 sonnet-4-6（每 1M token: $3 input / $15 output；带 prompt cache 后实际 << $1/会话）
+  // OpenAI API（AI 助手 chat）
+  // 未配时 /ai/chat 走 mock；不影响其他功能
+  // 默认模型 gpt-5-mini（便宜 + 支持 tool use）；可改 OPENAI_MODEL 切到 gpt-5 / gpt-4o / gpt-4.1-mini 等
   // ═══════════════════════════════════════════════════════════
-  ANTHROPIC_API_KEY: z.string().optional(),
+  OPENAI_API_KEY: z.string().optional(),
+  OPENAI_MODEL: z.string().default('gpt-5-mini'),
+  OPENAI_BASE_URL: z.string().url().optional(), // 可指向 Azure / 代理
 
   // ═══════════════════════════════════════════════════════════
   // 邮件（SMTP，发送电子行程单）

@@ -13,13 +13,8 @@ import { runChatTurn, type ChatMessage } from '../../lib/ai-assistant.js';
 
 const chatBodySchema = z.object({
   // 历史 messages 让前端管理（无服务端 session 状态）
-  // 形状很灵活（用户文本 / 助手 content blocks），运行时校验由 Anthropic SDK 兜底
-  messages: z.array(
-    z.object({
-      role: z.enum(['user', 'assistant']),
-      content: z.unknown(),
-    }),
-  ).max(40, '对话太长了，请清空重开'),
+  // 形状很灵活（user / assistant / tool / system 四种 role），运行时校验由 OpenAI SDK 兜底
+  messages: z.array(z.unknown()).max(40, '对话太长了，请清空重开'),
   userMessage: z.string().min(1).max(2000, '消息太长'),
 });
 

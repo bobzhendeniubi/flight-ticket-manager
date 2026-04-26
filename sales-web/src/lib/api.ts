@@ -521,10 +521,9 @@ export const api = {
 };
 
 // ── AI 助手类型 ─────────────────────────────────────────────
-export interface AiChatMessage {
-  role: 'user' | 'assistant';
-  content: unknown; // 字符串或 content blocks 数组（前端不解读，原样回传）
-}
+// OpenAI Chat Completions 消息形状（前端不解读，原样回传维持上下文）
+// role: system | user | assistant | tool；content / tool_calls / tool_call_id 都可能有
+export type AiChatMessage = Record<string, unknown>;
 
 export interface AiProposal {
   kind: 'PROPOSAL';
@@ -558,9 +557,10 @@ export interface AiChatResponse {
   messages: AiChatMessage[];
   debug: {
     toolCalls: number;
-    inputTokens: number;
-    outputTokens: number;
-    cacheReadTokens: number;
+    promptTokens: number;
+    completionTokens: number;
+    totalTokens: number;
+    model: string;
   };
   mocked: boolean;
 }

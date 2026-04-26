@@ -22,7 +22,6 @@
     "prisma:seed": "tsx prisma/seed.ts"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.91.1",
     "@fastify/cors": "^10.0.1",
     "@fastify/helmet": "^12.0.1",
     "@fastify/jwt": "^9.0.1",
@@ -39,6 +38,7 @@
     "fastify-plugin": "^5.0.1",
     "ioredis": "^5.4.1",
     "nodemailer": "^8.0.5",
+    "openai": "^6.34.0",
     "pdfkit": "^0.18.0",
     "pino": "^9.5.0",
     "wechatpay-node-v3": "^2.2.1",
