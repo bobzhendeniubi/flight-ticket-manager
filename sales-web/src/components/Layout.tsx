@@ -3,6 +3,7 @@ import { Link, NavLink, Outlet, useNavigate, useSearchParams } from 'react-route
 import { useAuth } from '../stores/auth';
 import { useCart } from '../stores/cart';
 import { MobilePreviewFrame } from './MobilePreviewFrame';
+import { AiAssistant } from './AiAssistant';
 
 const ROLE_LABEL: Record<string, string> = {
   CUSTOMER: '客户',
@@ -150,6 +151,9 @@ export function Layout() {
       </footer>
 
       <AddToCartToast />
+
+      {/* 浮动 AI 助手 — 客户没登录也能用，下单时才跳登录 */}
+      {!isAdmin && <AiAssistant />}
     </div>
   );
 }

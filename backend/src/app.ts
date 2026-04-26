@@ -23,6 +23,7 @@ import { fulfillmentRoutes } from './modules/fulfillment/fulfillment.routes.js';
 import { paymentRoutes } from './modules/payments/payments.routes.js';
 import { pricingRoutes } from './modules/pricing/pricing.routes.js';
 import { cancellationRoutes } from './modules/cancellation/cancellation.routes.js';
+import { aiRoutes } from './modules/ai/ai.routes.js';
 import { redis } from './db/redis.js';
 
 export async function buildApp(): Promise<FastifyInstance> {
@@ -75,6 +76,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(paymentRoutes, { prefix: '/payments' });
   await app.register(pricingRoutes, { prefix: '/pricing' });
   await app.register(cancellationRoutes, { prefix: '/cancellation-policies' });
+  await app.register(aiRoutes, { prefix: '/ai' });
 
   // Root
   app.get('/', async () => ({

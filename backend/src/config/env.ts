@@ -72,6 +72,13 @@ const EnvSchema = z.object({
   S3_BUCKET_UPLOADS: z.string().optional(),
 
   // ═══════════════════════════════════════════════════════════
+  // Anthropic API（AI 助手 chat）
+  // 未配时 /ai/chat 返 503 + 降级提示；不影响其他功能
+  // 模型固定 sonnet-4-6（每 1M token: $3 input / $15 output；带 prompt cache 后实际 << $1/会话）
+  // ═══════════════════════════════════════════════════════════
+  ANTHROPIC_API_KEY: z.string().optional(),
+
+  // ═══════════════════════════════════════════════════════════
   // 邮件（SMTP，发送电子行程单）
   // 没配置时 worker 静默跳过邮件发送（只写日志）。
   // 沙箱推荐 Mailtrap / Ethereal；生产可用 Alibaba DirectMail / AWS SES。

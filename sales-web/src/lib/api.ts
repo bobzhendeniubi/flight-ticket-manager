@@ -514,4 +514,53 @@ export const api = {
   listTransfers: () => apiFetch<{ transfers: Transfer[] }>('/products/transfers?active=1'),
   listVisas: () => apiFetch<{ visas: Visa[] }>('/products/visas?active=1'),
   listBundles: () => apiFetch<{ bundles: Bundle[] }>('/products/bundles?active=1'),
+
+  // AI 助手（公开 — 任何人可聊；下单时才要登录）
+  aiChat: (body: { messages: AiChatMessage[]; userMessage: string }) =>
+    apiFetch<AiChatResponse>('/ai/chat', { method: 'POST', body }),
 };
+
+// ── AI 助手类型 ─────────────────────────────────────────────
+export interface AiChatMessage {
+  role: 'user' | 'assistant';
+  content: unknown; // 字符串或 content blocks 数组（前端不解读，原样回传）
+}
+
+export interface AiProposal {
+  kind: 'PROPOSAL';
+  scheduleId: string;
+  cabin: string;
+  passengers: number;
+  flightNumber: string;
+  origin: string;
+  destination: string;
+  departureTime: string;
+  arrivalTime: string;
+  pricing: {
+    unitPrice: number;
+    totalPrice: number;
+    dateRank: string;
+  };
+  cartItem: {
+    kind: 'FLIGHT';
+    productId: string;
+    name: string;
+    unitPrice: number;
+    qty: number;
+    meta?: Record<string, unknown>;
+  };
+  note: string;
+}
+
+export interface AiChatResponse {
+  reply: string;
+  proposals: AiProposal[];
+  messages: AiChatMessage[];
+  debug: {
+    toolCalls: number;
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+  };
+  mocked: boolean;
+}
