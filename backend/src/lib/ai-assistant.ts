@@ -19,21 +19,33 @@ import { CabinClass } from '@prisma/client';
 const MAX_TOOL_ITERATIONS = 8; // 防止 loop 失控
 
 // ── 系统提示词 ───────────────────────────────────────────────
-const SYSTEM_PROMPT = `你是「世途旅行」的客服 AI 助手，帮客户预订澳门 ⇌ 岘港的机票。
+const SYSTEM_PROMPT = `你是「世途旅行」的客服 AI 助手，帮客户预订澳门 ⇌ 岘港的机票（顺带配签证）。
 
 # 你的工作流程
 1. 听用户说想要什么（日期 / 目的地 / 人数 / 舱位）
 2. 调 search_flights 找航班
 3. 用人话总结 2-3 个选项给用户（包括动态价 + 日期等级）
-4. 用户选了具体航班后，调 get_flight_price 算精确价
-5. 调 propose_order 生成"订单草稿"
+4. 用户选了具体航班后：
+   - **主动询问需不需要配越南签证**（去越南必需，除非用户已有）
+   - 如果要 → 调 search_visas 查可选签证
+5. 调 propose_order 生成"订单草稿"（**优先用新的 items 数组方式**，可以同时含机票 + 签证）
 6. 让 UI 展示草稿卡片，提示用户点「确认下单」
 
+# propose_order 用法
+- 单买机票：items=[{kind:'FLIGHT', scheduleId, cabin, passengers}]
+- 机票 + 签证：items=[{kind:'FLIGHT',...}, {kind:'VISA', visaId, qty:N, express?:bool}]
+- VISA qty 一般 = 机票乘客数（每个人都要签证）
+- 暂不支持 HOTEL/TRANSFER/BUNDLE — 用户问就说"酒店/接送/套餐请去前台首页购买"
+
 # 严格不能做的事
-- 绝对不能编造航班 / 价格 / 旅客信息（必须从工具返回值读）
+- 绝对不能编造航班 / 价格 / 签证 / 旅客信息（必须从工具返回值读）
 - 绝对不能跳过用户确认就下单（你只能 propose_order，不能真创建订单）
-- 不能填假的护照号 / 出生日期；旅客信息必须用户在结账页自己填
+- 不能填假的护照号 / 出生日期；旅客信息用户自己填或 OCR 上传
 - 不能讨论政治、暴力、医疗等无关话题
+
+# 关于护照 OCR
+- 用户可能上传护照照片，前端 OCR 后把识别结果作为 \`[系统提示]\` 消息发给你
+- 看到时简短确认（"收到了，张三的护照已登记"），告诉用户在结账页自动填好；不要追问已识别的字段
 
 # 关于价格
 - basePrice = 标价；dynamicPrice = 实际成交价
@@ -42,8 +54,8 @@ const SYSTEM_PROMPT = `你是「世途旅行」的客服 AI 助手，帮客户�
 
 # 对话风格
 - 简洁，不啰嗦
-- 每次最多介绍 3 个航班选项；多了用户记不住
-- 主动追问关键缺失信息（出发日期 / 人数 / 舱位偏好）
+- 每次最多介绍 3 个选项；多了用户记不住
+- 主动追问关键缺失信息（出发日期 / 人数 / 舱位偏好 / 是否需要签证）
 - 用 ¥ 而不是 RMB
 - 出发地默认澳门 (MFM)，目的地默认岘港 (DAD)
 
@@ -98,19 +110,63 @@ const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
   {
     type: 'function',
     function: {
+      name: 'search_visas',
+      description:
+        '搜索可办理的签证（用户去越南/东南亚需要签证时调）。返回签证列表，含办理时长、价格、加急选项。' +
+        'country 可省略（返回所有国家）；常见 countryCode：VN(越南) KH(柬埔寨) TH(泰国) SG(新加坡) LA(老挝) MY(马来) ID(印尼)',
+      parameters: {
+        type: 'object',
+        properties: {
+          countryCode: {
+            type: 'string',
+            description: '目的地国家 ISO 代码，例 VN；省略 = 所有国家',
+          },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
       name: 'propose_order',
       description:
         '生成"订单草稿"（dry-run，不真扣库存、不真扣钱）。' +
         '调完返回订单摘要 → 前端会渲染一张确认卡片让用户点「确认下单」。' +
-        '只有用户在卡片上点了确认，才会真正创建订单。',
+        '只有用户在卡片上点了确认，才会真正创建订单。\n\n' +
+        '支持多产品组合（机票 + 签证）：把 items 数组传进来。\n' +
+        '老的单航班调用方式（顶层 scheduleId/cabin/passengers）仍兼容。',
       parameters: {
         type: 'object',
         properties: {
-          scheduleId: { type: 'string' },
+          // 新方式：items 数组，混合多种产品
+          items: {
+            type: 'array',
+            description: '订单包含的产品列表（混合机票 + 签证）',
+            items: {
+              type: 'object',
+              properties: {
+                kind: {
+                  type: 'string',
+                  enum: ['FLIGHT', 'VISA'],
+                  description: 'FLIGHT=机票, VISA=签证（HOTEL/TRANSFER/BUNDLE 暂不支持，请引导用户去前台单独下单）',
+                },
+                // FLIGHT
+                scheduleId: { type: 'string', description: 'kind=FLIGHT 时必填，从 search_flights 拿' },
+                cabin: { type: 'string', enum: ['ECONOMY', 'BUSINESS'] },
+                passengers: { type: 'integer', minimum: 1, maximum: 9 },
+                // VISA
+                visaId: { type: 'string', description: 'kind=VISA 时必填，从 search_visas 拿' },
+                qty: { type: 'integer', minimum: 1, maximum: 9, description: 'VISA 申请人数' },
+                express: { type: 'boolean', description: 'VISA 是否加急（贵但快）' },
+              },
+              required: ['kind'],
+            },
+          },
+          // 老方式：单航班（向后兼容老对话）
+          scheduleId: { type: 'string', description: '（兼容）单航班时的 scheduleId' },
           cabin: { type: 'string', enum: ['ECONOMY', 'BUSINESS'] },
           passengers: { type: 'integer', minimum: 1, maximum: 9 },
         },
-        required: ['scheduleId', 'cabin', 'passengers'],
       },
     },
   },
@@ -211,45 +267,198 @@ async function executeGetFlightPrice(input: Record<string, unknown>): Promise<To
   }
 }
 
-async function executeProposeOrder(input: Record<string, unknown>): Promise<ToolExecutionResult> {
+async function executeSearchVisas(input: Record<string, unknown>): Promise<ToolExecutionResult> {
   try {
-    const scheduleId = input.scheduleId as string;
-    const cabin = input.cabin as CabinClass;
-    const passengers = input.passengers as number;
+    const countryCode = input.countryCode as string | undefined;
+    const where: Record<string, unknown> = { isActive: true };
+    if (countryCode) where.destinationCountry = countryCode;
+    const visas = await prisma.visa.findMany({ where, take: 30 });
+    return {
+      ok: true,
+      data: {
+        count: visas.length,
+        visas: visas.map((v) => ({
+          visaId: v.id,
+          country: v.country,
+          countryCode: v.destinationCountry,
+          name: v.visaName ?? v.visaType,
+          processingDays: v.processingDays,
+          basePrice: Number(v.basePrice),
+          expressSurcharge: v.expressSurcharge ? Number(v.expressSurcharge) : null,
+          validityMonths: v.validityMonths,
+          highlight: v.highlight,
+        })),
+      },
+    };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : 'search_visas failed' };
+  }
+}
 
-    const pricing = await pricingService.calculatePrice(scheduleId, cabin, passengers);
-    const schedule = await prisma.flightSchedule.findUnique({
-      where: { id: scheduleId },
-      include: { flight: true },
-    });
-    if (!schedule) {
-      return { ok: false, error: '该班次不存在' };
-    }
+interface ProposalItemInput {
+  kind: 'FLIGHT' | 'VISA';
+  scheduleId?: string;
+  cabin?: CabinClass;
+  passengers?: number;
+  visaId?: string;
+  qty?: number;
+  express?: boolean;
+}
 
-    const proposal = {
-      kind: 'PROPOSAL' as const,
-      scheduleId,
-      cabin,
-      passengers,
+interface ProposalItemOut {
+  kind: 'FLIGHT' | 'VISA';
+  name: string;
+  qty: number;
+  unitPrice: number;
+  total: number;
+  detail: Record<string, unknown>;
+  cartItem: {
+    kind: string;
+    productId: string;
+    name: string;
+    emoji?: string;
+    unitPrice: number;
+    qty: number;
+    meta?: Record<string, unknown>;
+  };
+}
+
+async function priceFlightItem(item: ProposalItemInput): Promise<ProposalItemOut | { error: string }> {
+  if (!item.scheduleId || !item.cabin || !item.passengers) {
+    return { error: 'FLIGHT item 需要 scheduleId / cabin / passengers' };
+  }
+  const pricing = await pricingService.calculatePrice(
+    item.scheduleId,
+    item.cabin,
+    item.passengers,
+  );
+  const schedule = await prisma.flightSchedule.findUnique({
+    where: { id: item.scheduleId },
+    include: { flight: true },
+  });
+  if (!schedule) return { error: `班次 ${item.scheduleId} 不存在` };
+  const name = `${schedule.flight.flightNumber} ${schedule.flight.originCode}→${schedule.flight.destinationCode} · ${item.cabin} × ${item.passengers}`;
+  return {
+    kind: 'FLIGHT',
+    name,
+    qty: item.passengers,
+    unitPrice: pricing.averageUnitPrice,
+    total: pricing.totalPrice,
+    detail: {
       flightNumber: schedule.flight.flightNumber,
       origin: schedule.flight.originCode,
       destination: schedule.flight.destinationCode,
       departureTime: schedule.departureTime.toISOString(),
       arrivalTime: schedule.arrivalTime.toISOString(),
-      pricing: {
-        unitPrice: pricing.averageUnitPrice,
-        totalPrice: pricing.totalPrice,
+      cabin: item.cabin,
+      passengers: item.passengers,
+      dateRank: pricing.dateRank,
+      basePrice: pricing.basePrice,
+    },
+    cartItem: {
+      kind: 'FLIGHT',
+      productId: item.scheduleId,
+      name,
+      emoji: '✈️',
+      unitPrice: pricing.totalPrice,
+      qty: 1,
+      meta: {
+        cabin: item.cabin,
+        passengers: item.passengers,
         dateRank: pricing.dateRank,
-        bucketBreakdown: pricing.perSeatBreakdown,
+        totalForQty: pricing.totalPrice,
       },
-      cartItem: {
-        kind: 'FLIGHT',
-        productId: scheduleId,
-        name: `${schedule.flight.flightNumber} ${schedule.flight.originCode}→${schedule.flight.destinationCode} · ${cabin} × ${passengers}`,
-        unitPrice: pricing.totalPrice,
-        qty: 1,
-        meta: { cabin, passengers, dateRank: pricing.dateRank, totalForQty: pricing.totalPrice },
+    },
+  };
+}
+
+async function priceVisaItem(item: ProposalItemInput): Promise<ProposalItemOut | { error: string }> {
+  if (!item.visaId || !item.qty) {
+    return { error: 'VISA item 需要 visaId / qty' };
+  }
+  const visa = await prisma.visa.findUnique({ where: { id: item.visaId } });
+  if (!visa) return { error: `签证 ${item.visaId} 不存在` };
+  const base = Number(visa.basePrice);
+  const surcharge = item.express && visa.expressSurcharge ? Number(visa.expressSurcharge) : 0;
+  const unitPrice = base + surcharge;
+  const total = unitPrice * item.qty;
+  const expressLabel = item.express ? ' (加急)' : '';
+  const name = `${visa.country} · ${visa.visaName ?? visa.visaType}${expressLabel} × ${item.qty}`;
+  return {
+    kind: 'VISA',
+    name,
+    qty: item.qty,
+    unitPrice,
+    total,
+    detail: {
+      country: visa.country,
+      type: visa.visaName ?? visa.visaType,
+      processingDays: item.express
+        ? Math.max(visa.processingDays - 2, 1)
+        : visa.processingDays,
+      validityMonths: visa.validityMonths,
+      requiredDocs: visa.requiredDocs,
+      express: !!item.express,
+    },
+    cartItem: {
+      kind: 'VISA',
+      productId: visa.id + (item.express ? '-express' : ''),
+      name,
+      emoji: visa.flag ?? '🛂',
+      unitPrice,
+      qty: item.qty,
+      meta: {
+        express: !!item.express,
+        processingDays: item.express
+          ? Math.max(visa.processingDays - 2, 1)
+          : visa.processingDays,
       },
+    },
+  };
+}
+
+async function executeProposeOrder(input: Record<string, unknown>): Promise<ToolExecutionResult> {
+  try {
+    // 兼容老调用：顶层 scheduleId/cabin/passengers → 转成 single FLIGHT item
+    let items: ProposalItemInput[];
+    if (Array.isArray(input.items) && input.items.length > 0) {
+      items = input.items as ProposalItemInput[];
+    } else if (input.scheduleId && input.cabin && input.passengers) {
+      items = [
+        {
+          kind: 'FLIGHT',
+          scheduleId: input.scheduleId as string,
+          cabin: input.cabin as CabinClass,
+          passengers: input.passengers as number,
+        },
+      ];
+    } else {
+      return { ok: false, error: 'propose_order 需要 items 数组，或顶层 scheduleId+cabin+passengers' };
+    }
+
+    const priced: ProposalItemOut[] = [];
+    for (const it of items) {
+      let result: ProposalItemOut | { error: string };
+      if (it.kind === 'FLIGHT') result = await priceFlightItem(it);
+      else if (it.kind === 'VISA') result = await priceVisaItem(it);
+      else {
+        return { ok: false, error: `暂不支持的 item kind: ${it.kind}（HOTEL/TRANSFER/BUNDLE 请引导用户在前台单独下单）` };
+      }
+      if ('error' in result) return { ok: false, error: result.error };
+      priced.push(result);
+    }
+
+    const totalPrice = priced.reduce((s, p) => s + p.total, 0);
+
+    const proposal = {
+      kind: 'PROPOSAL' as const,
+      items: priced,
+      totalPrice,
+      summary:
+        priced
+          .map((p) => `${p.kind === 'FLIGHT' ? '✈️' : '🛂'} ${p.name}`)
+          .join(' + ') + ` = ¥${totalPrice}`,
+      cartItems: priced.map((p) => p.cartItem),
       note: '此为草稿（dry-run），未扣库存未扣款。前端会展示确认卡，用户点「确认下单」才真正提交。',
     };
     return { ok: true, data: proposal };
@@ -264,6 +473,8 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
       return executeSearchFlights(input);
     case 'get_flight_price':
       return executeGetFlightPrice(input);
+    case 'search_visas':
+      return executeSearchVisas(input);
     case 'propose_order':
       return executeProposeOrder(input);
     default:

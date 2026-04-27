@@ -40,7 +40,31 @@ export function CheckoutPage() {
   const [contactName, setContactName] = useState('');
   const [contactPhone, setContactPhone] = useState('');
   const [contactEmail, setContactEmail] = useState('');
-  const [passengers, setPassengers] = useState<PassengerForm[]>([{ ...EMPTY_PASSENGER }]);
+  // 初始化 passengers：如果 AI 助手在聊天里 OCR 过护照，从 sessionStorage 拉出来预填
+  // （usePassengers 的 hydrate 已在 AiAssistant 里跑过；这里再 hydrate 一次拿最新值）
+  const [passengers, setPassengers] = useState<PassengerForm[]>(() => {
+    try {
+      const raw = sessionStorage.getItem('ai_pending_passengers');
+      if (raw) {
+        const ocrList = JSON.parse(raw) as Array<{
+          fullName: string;
+          passportNumber: string;
+          dateOfBirth?: string;
+          nationality?: string;
+        }>;
+        if (ocrList.length > 0) {
+          return ocrList.map((p) => ({
+            fullName: p.fullName ?? '',
+            passportNumber: p.passportNumber ?? '',
+            phone: '',
+            dateOfBirth: p.dateOfBirth ?? '',
+            nationality: p.nationality ?? 'CN',
+          }));
+        }
+      }
+    } catch { /* noop */ }
+    return [{ ...EMPTY_PASSENGER }];
+  });
   const [paymentMethod, setPaymentMethod] = useState<CreateOrderInput['paymentMethod']>('WECHAT_PAY');
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);

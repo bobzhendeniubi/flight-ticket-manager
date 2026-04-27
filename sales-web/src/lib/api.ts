@@ -525,29 +525,30 @@ export const api = {
 // role: system | user | assistant | tool；content / tool_calls / tool_call_id 都可能有
 export type AiChatMessage = Record<string, unknown>;
 
-export interface AiProposal {
-  kind: 'PROPOSAL';
-  scheduleId: string;
-  cabin: string;
-  passengers: number;
-  flightNumber: string;
-  origin: string;
-  destination: string;
-  departureTime: string;
-  arrivalTime: string;
-  pricing: {
-    unitPrice: number;
-    totalPrice: number;
-    dateRank: string;
-  };
+export interface AiProposalItem {
+  kind: 'FLIGHT' | 'VISA';
+  name: string;
+  qty: number;
+  unitPrice: number;
+  total: number;
+  detail: Record<string, unknown>;
   cartItem: {
-    kind: 'FLIGHT';
+    kind: string;
     productId: string;
     name: string;
+    emoji?: string;
     unitPrice: number;
     qty: number;
     meta?: Record<string, unknown>;
   };
+}
+
+export interface AiProposal {
+  kind: 'PROPOSAL';
+  items: AiProposalItem[];
+  totalPrice: number;
+  summary: string;
+  cartItems: Array<AiProposalItem['cartItem']>;
   note: string;
 }
 

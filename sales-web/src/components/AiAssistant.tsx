@@ -12,9 +12,12 @@
  */
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import ReactMarkdown from 'react-markdown';
 import { api, type AiChatMessage, type AiProposal } from '../lib/api';
 import { useCart } from '../stores/cart';
 import { useAuth } from '../stores/auth';
+import { usePassengers, type OcrPassenger } from '../stores/passengers';
+import { ocrPassport } from '../lib/passportOcr';
 
 interface DisplayMessage {
   role: 'user' | 'assistant';
@@ -34,7 +37,7 @@ export function AiAssistant() {
   const [messages, setMessages] = useState<DisplayMessage[]>([
     {
       role: 'assistant',
-      text: '你好！我是世途旅行 AI 助手 ✈️\n说一下你想要什么样的机票（日期/人数/舱位），我帮你找。',
+      text: '你好！我是世途旅行 AI 助手 ✈️\n\n你可以：\n- 用人话告诉我你想要什么机票（日期/人数/舱位）\n- 点 📎 上传护照照片，我帮你 OCR 提取信息',
     },
   ]);
   // 后端真正记忆 = aiHistory（包含 tool_use / tool_result blocks）
@@ -42,10 +45,18 @@ export function AiAssistant() {
   const [aiHistory, setAiHistory] = useState<AiChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
+  const [ocrProgress, setOcrProgress] = useState<{ pct: number; stage: string } | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
   const navigate = useNavigate();
   const addToCart = useCart((s) => s.add);
   const user = useAuth((s) => s.user);
+  const addPassenger = usePassengers((s) => s.add);
+  const hydratePassengers = usePassengers((s) => s.hydrate);
+
+  useEffect(() => {
+    hydratePassengers();
+  }, [hydratePassengers]);
 
   useEffect(() => {
     if (scrollRef.current) {
@@ -53,11 +64,86 @@ export function AiAssistant() {
     }
   }, [messages, loading]);
 
-  const send = async (text: string) => {
+  // 护照 OCR — 选了文件后浏览器跑 tesseract.js（中文护照精度 60-75%；
+  // 失败时引导用户手填，不阻断流程）
+  const handleFile = async (file: File) => {
+    if (loading) return;
+    setMessages((prev) => [
+      ...prev,
+      { role: 'user', text: `📎 上传了护照：${file.name}` },
+    ]);
+    setOcrProgress({ pct: 0, stage: '准备识别…' });
+    try {
+      const result = await ocrPassport(file, (pct, stage) => {
+        setOcrProgress({ pct, stage });
+      });
+      setOcrProgress(null);
+
+      if (!result.success || !result.suggested.passportNumber) {
+        setMessages((prev) => [
+          ...prev,
+          {
+            role: 'assistant',
+            text:
+              `**OCR 识别失败 😅**\n\n` +
+              `中文护照在浏览器端 tesseract.js 准确率约 60-75%，可能因为：\n` +
+              `- 拍照反光/倾斜\n- 字迹被压痕遮挡\n- 不是标准 ICAO 9303 格式\n\n` +
+              `**麻烦你结账时手动填一下姓名/护照号/出生日期。**`,
+          },
+        ]);
+        return;
+      }
+
+      const ocr: OcrPassenger = {
+        fullName: result.suggested.fullName ?? '（未识别）',
+        passportNumber: result.suggested.passportNumber,
+        dateOfBirth: result.suggested.dateOfBirth,
+        nationality: result.suggested.nationality,
+        capturedAt: Date.now(),
+      };
+      addPassenger(ocr);
+
+      // 给 AI 一条系统级提示（说"用户上传了护照"），让它在后续对话中用
+      const sysHint =
+        `[系统提示] 用户刚刚上传了护照照片，OCR 识别出以下旅客信息（已暂存到结账队列）：\n` +
+        `- 姓名: ${ocr.fullName}\n- 护照号: ${ocr.passportNumber}\n` +
+        `- 出生日期: ${ocr.dateOfBirth ?? '?'}\n- 国籍: ${ocr.nationality ?? '?'}\n\n` +
+        `请友好地确认你看到了，告诉用户在结账页这些字段会自动填好。不要追问。`;
+      // 直接走 send 让 AI 知道；再展示 OCR 结果给用户看
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: 'assistant',
+          text:
+            `✅ **OCR 识别成功**（置信度 ${Math.round(result.confidence)}%，耗时 ${(result.elapsedMs / 1000).toFixed(1)}s）\n\n` +
+            `- **姓名**：${ocr.fullName}\n` +
+            `- **护照号**：\`${ocr.passportNumber}\`\n` +
+            `- **出生日期**：${ocr.dateOfBirth ?? '（未识别，结账时手填）'}\n` +
+            `- **国籍**：${ocr.nationality ?? '（未识别）'}\n\n` +
+            `已暂存。下单时这些字段会自动填进结账页。`,
+        },
+      ]);
+      // 顺便发给 AI（隐形 system prompt 形式）让它知道用户已上传
+      await send(sysHint, { hideUserBubble: true });
+    } catch (err) {
+      setOcrProgress(null);
+      setMessages((prev) => [
+        ...prev,
+        {
+          role: 'assistant',
+          text: `OCR 出错了：${err instanceof Error ? err.message : '未知错误'}`,
+        },
+      ]);
+    }
+  };
+
+  const send = async (text: string, opts?: { hideUserBubble?: boolean }) => {
     const trimmed = text.trim();
     if (!trimmed || loading) return;
 
-    setMessages((prev) => [...prev, { role: 'user', text: trimmed }]);
+    if (!opts?.hideUserBubble) {
+      setMessages((prev) => [...prev, { role: 'user', text: trimmed }]);
+    }
     setInput('');
     setLoading(true);
 
@@ -91,25 +177,27 @@ export function AiAssistant() {
 
   const handleConfirmProposal = (p: AiProposal) => {
     if (!user) {
-      // 未登录：先把 proposal 暂存，登录回来后看到提示
       navigate('/login?redirect=/');
       return;
     }
-    // 加购物车 → 跳结账
-    addToCart({
-      kind: p.cartItem.kind,
-      productId: p.cartItem.productId,
-      name: p.cartItem.name,
-      emoji: '✈️',
-      unitPrice: p.cartItem.unitPrice,
-      qty: p.cartItem.qty,
-      meta: p.cartItem.meta as Record<string, string | number | boolean> | undefined,
-    });
+    // 把草稿里的每一项都加进购物车（机票 + 签证可能并存）
+    const cartItems = p.cartItems ?? [];
+    for (const ci of cartItems) {
+      addToCart({
+        kind: ci.kind as 'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA' | 'BUNDLE',
+        productId: ci.productId,
+        name: ci.name,
+        emoji: ci.emoji ?? '🎫',
+        unitPrice: ci.unitPrice,
+        qty: ci.qty,
+        meta: ci.meta as Record<string, string | number | boolean> | undefined,
+      });
+    }
     setMessages((prev) => [
       ...prev,
       {
         role: 'assistant',
-        text: `✓ 已加入购物车。下一步去填乘客信息 → [跳到结账]`,
+        text: `✓ **已加入购物车 ${cartItems.length} 项**\n\n下一步：填乘客信息 → 提交订单 → 支付。马上跳到结账页…`,
       },
     ]);
     setTimeout(() => {
@@ -180,15 +268,40 @@ export function AiAssistant() {
             {messages.map((m, i) => (
               <div key={i}>
                 <div
-                  className={`max-w-[85%] rounded-lg px-3 py-2 text-sm whitespace-pre-wrap ${
+                  className={`max-w-[85%] rounded-lg px-3 py-2 text-sm ${
                     m.role === 'user'
-                      ? 'ml-auto bg-blue-600 text-white'
-                      : 'bg-white border border-slate-200 text-slate-800'
+                      ? 'ml-auto bg-blue-600 text-white whitespace-pre-wrap'
+                      : 'bg-white border border-slate-200 text-slate-800 ai-md'
                   }`}
                 >
-                  {m.text}
+                  {m.role === 'assistant' ? (
+                    <ReactMarkdown
+                      components={{
+                        // 用 <p> 但去掉默认的大 margin，让聊天气泡紧凑
+                        p: ({ children }) => <p className="mb-1 last:mb-0">{children}</p>,
+                        ul: ({ children }) => <ul className="my-1 ml-4 list-disc">{children}</ul>,
+                        ol: ({ children }) => <ol className="my-1 ml-4 list-decimal">{children}</ol>,
+                        li: ({ children }) => <li className="my-0.5">{children}</li>,
+                        strong: ({ children }) => <strong className="font-semibold text-slate-900">{children}</strong>,
+                        em: ({ children }) => <em className="italic">{children}</em>,
+                        code: ({ children }) => (
+                          <code className="bg-slate-100 px-1 py-0.5 rounded text-xs font-mono">{children}</code>
+                        ),
+                        h1: ({ children }) => <div className="text-base font-semibold mb-1">{children}</div>,
+                        h2: ({ children }) => <div className="text-sm font-semibold mb-1">{children}</div>,
+                        h3: ({ children }) => <div className="text-sm font-semibold mb-1">{children}</div>,
+                        a: ({ href, children }) => (
+                          <a href={href} target="_blank" rel="noreferrer" className="text-blue-600 underline">{children}</a>
+                        ),
+                      }}
+                    >
+                      {m.text}
+                    </ReactMarkdown>
+                  ) : (
+                    <div className="whitespace-pre-wrap">{m.text}</div>
+                  )}
                   {m.mocked && (
-                    <div className="mt-1 text-xs opacity-70">(运维未配 ANTHROPIC_API_KEY，AI 走 mock 模式)</div>
+                    <div className="mt-1 text-xs opacity-70">(运维未配 OPENAI_API_KEY，AI 走 mock 模式)</div>
                   )}
                 </div>
                 {m.proposals?.map((p, pi) => (
@@ -226,6 +339,22 @@ export function AiAssistant() {
             </div>
           )}
 
+          {/* OCR 进度条（OCR 中显示）*/}
+          {ocrProgress && (
+            <div className="px-3 py-2 border-t border-slate-100 bg-amber-50 text-xs">
+              <div className="flex justify-between mb-1 text-amber-900">
+                <span>{ocrProgress.stage}</span>
+                <span>{Math.round(ocrProgress.pct)}%</span>
+              </div>
+              <div className="h-1 bg-amber-100 rounded">
+                <div
+                  className="h-full bg-amber-500 rounded transition-all"
+                  style={{ width: `${ocrProgress.pct}%` }}
+                />
+              </div>
+            </div>
+          )}
+
           {/* Input */}
           <form
             onSubmit={(e) => {
@@ -234,6 +363,27 @@ export function AiAssistant() {
             }}
             className="flex gap-2 border-t border-slate-200 bg-white p-3 rounded-b-lg"
           >
+            {/* 隐藏文件 input + 可见 📎 按钮 */}
+            <input
+              ref={fileRef}
+              type="file"
+              accept="image/*"
+              className="hidden"
+              onChange={(e) => {
+                const f = e.target.files?.[0];
+                if (f) handleFile(f);
+                e.target.value = ''; // reset 让用户能再传同一文件
+              }}
+            />
+            <button
+              type="button"
+              onClick={() => fileRef.current?.click()}
+              disabled={loading || !!ocrProgress}
+              title="上传护照照片自动识别"
+              className="rounded-md border border-slate-300 px-2.5 py-2 text-sm hover:bg-slate-50 disabled:opacity-40"
+            >
+              📎
+            </button>
             <input
               type="text"
               value={input}
@@ -262,7 +412,7 @@ export function AiAssistant() {
   );
 }
 
-// ── 订单草稿确认卡 ──────────────────────────────────────────
+// ── 订单草稿确认卡（multi-item，可展开）─────────────────────
 function ProposalCard({
   proposal,
   onConfirm,
@@ -270,31 +420,49 @@ function ProposalCard({
   proposal: AiProposal;
   onConfirm: () => void;
 }) {
-  const dep = new Date(proposal.departureTime);
-  const arr = new Date(proposal.arrivalTime);
-  const fmt = (d: Date) =>
-    `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  const [expanded, setExpanded] = useState(true); // 默认展开（项数少没必要折）
+  const items = proposal.items ?? [];
+  const summaryText =
+    items.length === 0
+      ? '空草稿'
+      : items
+          .map((i) => `${i.kind === 'FLIGHT' ? '✈️' : '🛂'} ${shortItemLabel(i)}`)
+          .join(' + ');
 
   return (
     <div className="mt-2 max-w-[85%] rounded-lg border-2 border-purple-300 bg-gradient-to-br from-purple-50 to-blue-50 p-3 shadow-sm">
-      <div className="flex items-center gap-2 mb-2">
-        <span className="text-xs font-semibold text-purple-700 bg-purple-100 px-2 py-0.5 rounded">
-          📋 订单草稿
-        </span>
-        <span className="text-xs text-slate-500">需要你确认</span>
+      <div className="flex items-center justify-between mb-2">
+        <div className="flex items-center gap-2">
+          <span className="text-xs font-semibold text-purple-700 bg-purple-100 px-2 py-0.5 rounded">
+            📋 订单草稿
+          </span>
+          <span className="text-xs text-slate-500">需要你确认</span>
+        </div>
+        <button
+          type="button"
+          onClick={() => setExpanded((v) => !v)}
+          className="text-xs text-purple-700 hover:underline"
+        >
+          {expanded ? '收起 ▲' : `展开 ▼（${items.length} 项）`}
+        </button>
       </div>
-      <div className="font-semibold text-slate-900 text-sm">
-        {proposal.flightNumber} {proposal.origin} → {proposal.destination}
-      </div>
-      <div className="text-xs text-slate-600 mt-1">
-        {fmt(dep)} → {fmt(arr)} · {proposal.cabin} × {proposal.passengers} 人
-      </div>
-      <div className="mt-2 flex items-baseline justify-between">
-        <span className="text-xs text-slate-500">
-          单价 ¥{proposal.pricing.unitPrice.toLocaleString()}（rank {proposal.pricing.dateRank}）
-        </span>
-        <span className="text-lg font-bold text-red-600">
-          ¥{proposal.pricing.totalPrice.toLocaleString()}
+
+      {/* 折叠时显示一行 summary，展开时显示每项详情 */}
+      {!expanded ? (
+        <div className="text-xs text-slate-700">{summaryText}</div>
+      ) : (
+        <div className="space-y-2">
+          {items.map((item, i) => (
+            <ProposalItemRow key={i} item={item} />
+          ))}
+        </div>
+      )}
+
+      {/* 总价 + 确认按钮（永远显示） */}
+      <div className="mt-3 flex items-baseline justify-between border-t border-purple-200 pt-2">
+        <span className="text-xs text-slate-500">合计</span>
+        <span className="text-xl font-bold text-red-600">
+          ¥{proposal.totalPrice.toLocaleString()}
         </span>
       </div>
       <button
@@ -307,6 +475,90 @@ function ProposalCard({
       <div className="mt-1 text-[10px] text-slate-400 text-center">
         加购后可改人数 / 填乘客 / 支付
       </div>
+    </div>
+  );
+}
+
+function shortItemLabel(item: { kind: 'FLIGHT' | 'VISA'; detail: Record<string, unknown> }): string {
+  if (item.kind === 'FLIGHT') {
+    const d = item.detail;
+    return `${d.flightNumber as string ?? '机票'} ${d.origin}→${d.destination} ${d.cabin}`;
+  }
+  return `${(item.detail.country as string) ?? '签证'}签证`;
+}
+
+function ProposalItemRow({ item }: { item: AiProposal['items'][number] }) {
+  if (item.kind === 'FLIGHT') {
+    const d = item.detail as {
+      flightNumber: string;
+      origin: string;
+      destination: string;
+      departureTime: string;
+      arrivalTime: string;
+      cabin: string;
+      passengers: number;
+      dateRank: string;
+      basePrice: number;
+    };
+    const dep = new Date(d.departureTime);
+    const arr = new Date(d.arrivalTime);
+    const fmt = (x: Date) =>
+      `${String(x.getMonth() + 1).padStart(2, '0')}-${String(x.getDate()).padStart(2, '0')} ${String(x.getHours()).padStart(2, '0')}:${String(x.getMinutes()).padStart(2, '0')}`;
+    return (
+      <div className="rounded-md bg-white/70 px-3 py-2 border border-purple-100">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-1">
+            <span className="text-xs">✈️</span>
+            <span className="font-semibold text-slate-900 text-sm">
+              {d.flightNumber} {d.origin}→{d.destination}
+            </span>
+            <span className={`text-xs px-1.5 rounded ${
+              d.dateRank === 'A' ? 'bg-red-100 text-red-700' :
+              d.dateRank === 'B' ? 'bg-amber-100 text-amber-700' :
+              d.dateRank === 'C' ? 'bg-blue-100 text-blue-700' :
+              'bg-emerald-100 text-emerald-700'
+            }`}>{d.dateRank}</span>
+          </div>
+          <span className="text-sm font-bold text-red-600">¥{item.total.toLocaleString()}</span>
+        </div>
+        <div className="text-xs text-slate-600 mt-1">
+          {fmt(dep)} → {fmt(arr)} · {d.cabin} × {d.passengers} 人 · ¥{item.unitPrice}/人
+          {item.unitPrice !== d.basePrice && (
+            <span className="text-slate-400 line-through ml-1">¥{d.basePrice}</span>
+          )}
+        </div>
+      </div>
+    );
+  }
+  // VISA
+  const d = item.detail as {
+    country: string;
+    type: string;
+    processingDays: number;
+    validityMonths: number;
+    requiredDocs: string[];
+    express: boolean;
+  };
+  return (
+    <div className="rounded-md bg-white/70 px-3 py-2 border border-purple-100">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-1">
+          <span className="text-xs">🛂</span>
+          <span className="font-semibold text-slate-900 text-sm">
+            {d.country} · {d.type}
+          </span>
+          {d.express && <span className="text-xs px-1.5 rounded bg-amber-100 text-amber-700">加急</span>}
+        </div>
+        <span className="text-sm font-bold text-red-600">¥{item.total.toLocaleString()}</span>
+      </div>
+      <div className="text-xs text-slate-600 mt-1">
+        {d.processingDays} 天出签 · 有效期 {d.validityMonths} 个月 · {item.qty} 人 · ¥{item.unitPrice}/人
+      </div>
+      {d.requiredDocs?.length > 0 && (
+        <div className="text-[10px] text-slate-400 mt-1">
+          需材料：{d.requiredDocs.join(' / ')}
+        </div>
+      )}
     </div>
   );
 }
