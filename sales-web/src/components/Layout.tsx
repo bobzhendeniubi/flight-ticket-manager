@@ -39,16 +39,31 @@ export function Layout() {
     return <MobilePreviewFrame />;
   }
 
+  // 手机端汉堡菜单展开状态
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const closeMenu = () => setMobileMenuOpen(false);
+
   return (
     <div className="min-h-screen flex flex-col">
       {/* 顶部：品牌 + 前台导航 + 用户菜单 */}
       <header className="border-b border-slate-200 bg-white">
-        <div className="mx-auto flex max-w-7xl items-center justify-between gap-4 px-4 py-3">
-          <Link to="/" className="flex items-center gap-2 text-lg font-semibold text-slate-900">
+        <div className="mx-auto flex max-w-7xl items-center justify-between gap-2 px-3 py-3 md:gap-4 md:px-4">
+          {/* 手机端：左侧汉堡按钮 */}
+          <button
+            type="button"
+            className="md:hidden flex h-9 w-9 items-center justify-center rounded-md border border-slate-200 text-slate-700"
+            onClick={() => setMobileMenuOpen(true)}
+            aria-label="打开菜单"
+          >
+            <span className="text-lg">☰</span>
+          </button>
+
+          <Link to="/" className="flex items-center gap-2 text-base md:text-lg font-semibold text-slate-900 truncate">
             <span aria-hidden className="text-brand">✈︎</span>
             <span>世途旅行</span>
           </Link>
 
+          {/* 桌面端：主导航 */}
           <nav className="hidden md:flex items-center gap-1 text-sm">
             {frontNav.map((n) => (
               <NavLink
@@ -78,8 +93,8 @@ export function Layout() {
             )}
           </nav>
 
-          <nav className="flex items-center gap-3 text-sm">
-            {/* 小程序预览：在桌面浏览器里用手机壳看页面，免开微信开发者工具 */}
+          {/* 右侧用户菜单：手机端只保留购物车，其他进汉堡 */}
+          <nav className="flex items-center gap-2 md:gap-3 text-sm">
             <a
               href="/?preview=mobile"
               className="hidden md:inline-flex items-center gap-1 rounded-md border border-slate-200 bg-slate-50 px-2 py-1 text-xs text-slate-600 hover:border-brand hover:text-brand"
@@ -88,8 +103,9 @@ export function Layout() {
               📱 小程序预览
             </a>
             <CartButton />
+            {/* 桌面端：完整用户区 */}
             {user ? (
-              <>
+              <div className="hidden md:flex items-center gap-3">
                 <Link to="/orders" className="text-sm text-slate-700 hover:text-brand">
                   我的订单
                 </Link>
@@ -109,19 +125,102 @@ export function Layout() {
                 >
                   退出
                 </button>
-              </>
+              </div>
             ) : (
-              <>
+              <div className="hidden md:flex items-center gap-3">
                 <Link to="/login" className="text-slate-700 hover:text-brand">
                   登录
                 </Link>
                 <Link to="/register" className="btn-primary text-sm py-1.5">
                   注册账号
                 </Link>
-              </>
+              </div>
             )}
           </nav>
         </div>
+
+        {/* 手机端：汉堡菜单抽屉 */}
+        {mobileMenuOpen && (
+          <div className="md:hidden fixed inset-0 z-50 bg-black/40" onClick={closeMenu}>
+            <div
+              className="absolute left-0 top-0 h-full w-72 max-w-[80vw] bg-white shadow-xl flex flex-col"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
+                <span className="font-semibold">菜单</span>
+                <button onClick={closeMenu} className="text-slate-400 hover:text-slate-700 text-xl" aria-label="关闭">×</button>
+              </div>
+              <div className="flex-1 overflow-y-auto py-2">
+                {/* 主导航 */}
+                {frontNav.map((n) => (
+                  <NavLink
+                    key={n.to}
+                    to={n.to}
+                    end={n.exact}
+                    onClick={closeMenu}
+                    className={({ isActive }) =>
+                      `block px-4 py-3 text-sm border-l-4 ${
+                        isActive ? 'border-brand bg-brand/5 text-brand font-semibold' : 'border-transparent text-slate-700 hover:bg-slate-50'
+                      }`
+                    }
+                  >
+                    {n.label}
+                  </NavLink>
+                ))}
+                {isAgent && (
+                  <NavLink
+                    to="/team"
+                    onClick={closeMenu}
+                    className={({ isActive }) =>
+                      `block px-4 py-3 text-sm border-l-4 ${
+                        isActive ? 'border-brand bg-brand/5 text-brand font-semibold' : 'border-transparent text-slate-700 hover:bg-slate-50'
+                      }`
+                    }
+                  >
+                    我的团队
+                  </NavLink>
+                )}
+
+                <div className="my-2 border-t border-slate-100" />
+
+                {/* 用户区 */}
+                {user ? (
+                  <>
+                    <Link to="/orders" onClick={closeMenu} className="block px-4 py-3 text-sm text-slate-700 hover:bg-slate-50">
+                      📋 我的订单
+                    </Link>
+                    <Link to="/me" onClick={closeMenu} className="block px-4 py-3 text-sm text-slate-700 hover:bg-slate-50">
+                      👤 {user.displayName ?? user.email}
+                      <span className="ml-2 rounded bg-slate-100 px-1.5 py-0.5 text-xs text-slate-600">
+                        {ROLE_LABEL[user.role] ?? user.role}
+                      </span>
+                    </Link>
+                    <button
+                      type="button"
+                      className="w-full text-left block px-4 py-3 text-sm text-rose-700 hover:bg-rose-50"
+                      onClick={async () => {
+                        closeMenu();
+                        await logout();
+                        navigate('/');
+                      }}
+                    >
+                      退出登录
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <Link to="/login" onClick={closeMenu} className="block px-4 py-3 text-sm text-slate-700 hover:bg-slate-50">
+                      登录
+                    </Link>
+                    <Link to="/register" onClick={closeMenu} className="block px-4 py-3 text-sm font-semibold text-brand hover:bg-brand/5">
+                      注册账号
+                    </Link>
+                  </>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* 管理员登录在前台时，显示提示去后台 */}
         {isAdmin && (

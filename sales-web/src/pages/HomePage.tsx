@@ -346,15 +346,17 @@ function FlightCard({
 
   return (
     <article className="card hover:shadow-md transition">
-      <div className="flex flex-wrap items-center gap-6">
-        <div className="flex items-center gap-3">
+      {/* 顶部行：航班号 + 价格（手机端两端对齐，桌面端航班号靠左、其它信息后面跟） */}
+      <div className="flex items-start justify-between gap-3 sm:flex-wrap sm:items-center sm:gap-6">
+        <div className="flex items-center gap-2 sm:gap-3 flex-shrink-0">
           <span className="inline-flex items-center rounded bg-brand/10 px-2 py-0.5 text-sm font-semibold text-brand">
             {flight.flightNumber}
           </span>
-          <span className="text-xs text-slate-500">{flight.aircraftType ?? ''}</span>
+          <span className="hidden sm:inline text-xs text-slate-500">{flight.aircraftType ?? ''}</span>
         </div>
 
-        <div className="flex items-center gap-4">
+        {/* 时间块：手机端单独占一行（在下面），桌面端在中间 */}
+        <div className="hidden sm:flex items-center gap-4">
           <div>
             <div className="text-2xl font-semibold text-slate-900">
               {formatLocalTime(flight.departureTime, flight.departureTz)}
@@ -380,7 +382,7 @@ function FlightCard({
           </div>
         </div>
 
-        <div className="ml-auto text-right">
+        <div className="sm:ml-auto text-right flex-shrink-0">
           {isDeal && (
             <span className="inline-block rounded bg-emerald-100 px-1.5 py-0.5 text-xs font-semibold text-emerald-700">
               限时优惠
@@ -391,11 +393,36 @@ function FlightCard({
               ¥{minPrice.toFixed(0)} <span className="text-xs text-slate-500 font-normal">起</span>
             </div>
           )}
-          <div className="mt-1 text-xs text-slate-500">↓ 选舱位加入购物车</div>
+          <div className="mt-1 text-xs text-slate-500 hidden sm:block">↓ 选舱位加入购物车</div>
         </div>
       </div>
 
-      <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+      {/* 手机端时间行：DEP — DUR — ARR 紧凑布局 */}
+      <div className="sm:hidden mt-3 flex items-center justify-between gap-2">
+        <div className="text-left">
+          <div className="text-xl font-semibold text-slate-900">
+            {formatLocalTime(flight.departureTime, flight.departureTz)}
+          </div>
+          <div className="text-[10px] text-slate-500">
+            {airportLabel(flight.originCode)}
+          </div>
+        </div>
+        <div className="flex-1 text-center text-[10px] text-slate-400">
+          <div>{formatDuration(flight.durationMinutes)}</div>
+          <div className="my-1 h-px bg-slate-200" />
+          <div>直飞</div>
+        </div>
+        <div className="text-right">
+          <div className="text-xl font-semibold text-slate-900">
+            {formatLocalTime(flight.arrivalTime, flight.arrivalTz)}
+          </div>
+          <div className="text-[10px] text-slate-500">
+            {airportLabel(flight.destinationCode)}
+          </div>
+        </div>
+      </div>
+
+      <div className="mt-4 grid gap-2 grid-cols-2 lg:grid-cols-4">
         {flight.seatClasses.map((c) => (
           <FlightSeatCard
             key={c.cabin}

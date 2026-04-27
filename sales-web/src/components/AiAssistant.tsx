@@ -292,25 +292,25 @@ export function AiAssistant() {
 
   return (
     <>
-      {/* 浮动按钮 */}
+      {/* 浮动按钮 — 手机端只显示图标圆形，桌面显示完整文字 */}
       {!open && (
         <button
           type="button"
           onClick={() => setOpen(true)}
-          className="fixed bottom-6 right-6 z-40 flex items-center gap-2 rounded-full bg-gradient-to-br from-blue-600 to-purple-600 px-5 py-3 text-white shadow-lg hover:shadow-xl transition"
+          className="fixed bottom-4 right-4 sm:bottom-6 sm:right-6 z-40 flex items-center gap-2 rounded-full bg-gradient-to-br from-blue-600 to-purple-600 p-3 sm:px-5 sm:py-3 text-white shadow-lg hover:shadow-xl transition"
           aria-label="AI 助手"
         >
           <span className="text-xl">🤖</span>
-          <span className="text-sm font-medium">AI 帮我订票</span>
-          <span className="rounded-full bg-white/20 px-2 py-0.5 text-xs">Beta</span>
+          <span className="hidden sm:inline text-sm font-medium">AI 帮我订票</span>
+          <span className="hidden sm:inline rounded-full bg-white/20 px-2 py-0.5 text-xs">Beta</span>
         </button>
       )}
 
-      {/* 聊天窗口 */}
+      {/* 聊天窗口 — 手机端全屏，桌面端右下浮窗 */}
       {open && (
-        <div className="fixed bottom-6 right-6 z-40 flex h-[600px] w-[380px] max-w-[calc(100vw-3rem)] max-h-[calc(100vh-3rem)] flex-col rounded-lg bg-white shadow-2xl border border-slate-200">
+        <div className="fixed inset-0 sm:inset-auto sm:bottom-6 sm:right-6 z-40 flex sm:h-[600px] sm:w-[380px] sm:max-h-[calc(100vh-3rem)] flex-col bg-white sm:rounded-lg shadow-2xl border-0 sm:border border-slate-200">
           {/* Header */}
-          <div className="flex items-center justify-between rounded-t-lg bg-gradient-to-br from-blue-600 to-purple-600 px-4 py-3 text-white">
+          <div className="flex items-center justify-between sm:rounded-t-lg bg-gradient-to-br from-blue-600 to-purple-600 px-4 py-3 text-white">
             <div className="flex items-center gap-2">
               <span className="text-lg">🤖</span>
               <div>
@@ -578,7 +578,7 @@ export function AiAssistant() {
               e.preventDefault();
               send(input);
             }}
-            className="flex gap-2 border-t border-slate-200 bg-white p-3 rounded-b-lg"
+            className="flex gap-2 border-t border-slate-200 bg-white p-3 sm:rounded-b-lg"
           >
             {/* 隐藏文件 input + 可见 📎 按钮 */}
             <input
@@ -620,7 +620,7 @@ export function AiAssistant() {
           </form>
 
           {/* 安全提示 */}
-          <div className="px-3 pb-2 text-[10px] text-slate-400 text-center bg-white rounded-b-lg">
+          <div className="px-3 pb-2 text-[10px] text-slate-400 text-center bg-white sm:rounded-b-lg">
             ⚠️ AI 只能给你提议；真正下单需要你点确认按钮 → 填乘客信息 → 支付
           </div>
         </div>
