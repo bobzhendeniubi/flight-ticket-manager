@@ -50,11 +50,10 @@ export function BundlesPage() {
   const [goDate, setGoDate] = useState(todayISO(3));
   const [returnDate, setReturnDate] = useState(todayISO(7));
 
-  // 动态机票价（单人来回）
+  // 动态机票价（单人来回）— dateRank 不展示给客户，所以不存进 state
   const [flightPrices, setFlightPrices] = useState({
     econPerPerson: 0,
     bizPerPerson: 0,
-    dateRank: 'C',
     loaded: false,
   });
 
@@ -71,11 +70,10 @@ export function BundlesPage() {
       setFlightPrices({
         econPerPerson: (goE ? Number(goE.dynamicPrice) : 1480) + (retE ? Number(retE.dynamicPrice) : 1380),
         bizPerPerson: (goB ? Number(goB.dynamicPrice) : 4380) + (retB ? Number(retB.dynamicPrice) : 4280),
-        dateRank: goE?.dateRank ?? 'C',
         loaded: true,
       });
     } catch {
-      setFlightPrices({ econPerPerson: 2860, bizPerPerson: 8660, dateRank: 'C', loaded: true });
+      setFlightPrices({ econPerPerson: 2860, bizPerPerson: 8660, loaded: true });
     }
   }, [goDate, returnDate]);
 
@@ -105,8 +103,7 @@ export function BundlesPage() {
           <div className="flex items-end">
             {flightPrices.loaded ? (
               <div className="text-sm">
-                <RankBadge rank={flightPrices.dateRank} />
-                <span className="ml-2 text-slate-600">
+                <span className="text-slate-600">
                   经济舱来回 <strong className="text-red-600">¥{flightPrices.econPerPerson.toLocaleString()}</strong>/人
                 </span>
               </div>
@@ -161,7 +158,7 @@ function ConfigurableBundleCard({
   onAdd,
 }: {
   bundle: MockBundle;
-  flightPrices: { econPerPerson: number; bizPerPerson: number; dateRank: string };
+  flightPrices: { econPerPerson: number; bizPerPerson: number };
   goDate: string;
   returnDate: string;
   onAdd: (cfg: { pax: number; rooms: number; total: number; flightTotal: number; hotelTotal: number; otherTotal: number }) => void;
@@ -212,7 +209,6 @@ function ConfigurableBundleCard({
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
             <h3 className="font-semibold text-slate-900">{b.name}</h3>
-            <RankBadge rank={flightPrices.dateRank} />
           </div>
           <p className="mt-0.5 text-sm text-slate-600">{b.tagline}</p>
         </div>
@@ -320,10 +316,4 @@ function Stepper({
   );
 }
 
-function RankBadge({ rank }: { rank: string }) {
-  const cls =
-    rank === 'A' ? 'bg-red-100 text-red-700' :
-    rank === 'B' ? 'bg-amber-100 text-amber-700' :
-    rank === 'C' ? 'bg-blue-100 text-blue-700' : 'bg-green-100 text-green-700';
-  return <span className={`rounded px-1.5 py-0.5 text-xs font-bold ${cls}`}>{rank}</span>;
-}
+// RankBadge 已移除：dateRank A/B/C/D 是公司内部日期等级，不对客户展示

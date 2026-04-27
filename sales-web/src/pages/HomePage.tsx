@@ -337,7 +337,12 @@ function FlightCard({
   const minPrice = flight.seatClasses
     .filter((c) => c.available >= passengers)
     .reduce((m, c) => (m === null || Number(c.dynamicPrice) < m ? Number(c.dynamicPrice) : m), null as number | null);
-  const dateRank = flight.seatClasses[0]?.dateRank ?? 'C';
+  // dateRank A/B/C/D 是公司内部日期等级，绝不展示给客户。仅用 basePrice 与 dynamicPrice 的差额
+  // 反映"相对优惠"。
+  const baseMin = flight.seatClasses
+    .filter((c) => c.available >= passengers)
+    .reduce((m, c) => (m === null || Number(c.basePrice) < m ? Number(c.basePrice) : m), null as number | null);
+  const isDeal = baseMin !== null && minPrice !== null && minPrice < baseMin * 0.95;
 
   return (
     <article className="card hover:shadow-md transition">
@@ -376,11 +381,11 @@ function FlightCard({
         </div>
 
         <div className="ml-auto text-right">
-          <span className={`rounded px-1.5 py-0.5 text-xs font-bold mr-1 ${
-            dateRank === 'A' ? 'bg-red-100 text-red-700' :
-            dateRank === 'B' ? 'bg-amber-100 text-amber-700' :
-            dateRank === 'C' ? 'bg-blue-100 text-blue-700' : 'bg-green-100 text-green-700'
-          }`}>{dateRank}</span>
+          {isDeal && (
+            <span className="inline-block rounded bg-emerald-100 px-1.5 py-0.5 text-xs font-semibold text-emerald-700">
+              限时优惠
+            </span>
+          )}
           {minPrice !== null && (
             <div className="mt-1 text-lg font-semibold text-red-600">
               ¥{minPrice.toFixed(0)} <span className="text-xs text-slate-500 font-normal">起</span>
@@ -451,7 +456,7 @@ function FlightSeatCard({
               departureTime: flight.departureTime,
               cabin: cabin.cabin,
               passengers,
-              dateRank: cabin.dateRank,
+              // dateRank 是内部字段，不放进 cart meta（之前 CartPage 曾把它显示给客户）
               basePrice: Number(cabin.basePrice),
               totalForQty: cabin.totalForQty,
             },

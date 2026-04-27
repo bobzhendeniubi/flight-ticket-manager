@@ -60,11 +60,10 @@ export function CartPage() {
                     </div>
                   </div>
                 )}
-                {/* 机票: 显示舱等+日期 */}
+                {/* 机票: 显示舱等+日期+人数（dateRank 是内部字段，不展示给客户） */}
                 {i.kind === 'FLIGHT' && i.meta && (
                   <div className="mt-1 text-xs text-slate-500">
-                    {String(i.meta.cabin) === 'BUSINESS' ? '商务舱' : '经济舱'} · {String(i.meta.departureTime).slice(0, 10)} ·
-                    日期等级 {String(i.meta.dateRank)} · {Number(i.meta.passengers)} 人
+                    {String(i.meta.cabin) === 'BUSINESS' ? '商务舱' : '经济舱'} · {String(i.meta.departureTime).slice(0, 10)} · {Number(i.meta.passengers)} 人
                   </div>
                 )}
                 <p className="mt-0.5 text-xs text-slate-400">
