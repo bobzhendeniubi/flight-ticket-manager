@@ -206,6 +206,14 @@ export function AiAssistant() {
     }, 800);
   };
 
+  // 快捷动作下拉的展开状态：null = 全收起，'add' = 加产品菜单展开，'modify' = 修改菜单展开
+  const [actionMenu, setActionMenu] = useState<null | 'add' | 'modify'>(null);
+
+  const quickAction = (text: string) => {
+    setActionMenu(null);
+    void send(text);
+  };
+
   const reset = () => {
     setMessages([
       {
@@ -336,6 +344,80 @@ export function AiAssistant() {
                   </button>
                 ))}
               </div>
+            </div>
+          )}
+
+          {/* 快捷动作（在 AI 回复后显示，引导客户下一步）— 只在最近一条是 assistant 时出现 */}
+          {messages.length > 1 &&
+            messages[messages.length - 1].role === 'assistant' &&
+            !loading &&
+            !ocrProgress && (
+            <div className="px-3 py-2 border-t border-slate-100 bg-slate-50/60">
+              {actionMenu === null && (
+                <div className="flex flex-wrap gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => quickAction('好的，给我详细信息（出发到达时间、行李、退改条款都给我说一下）')}
+                    className="flex-1 min-w-[80px] text-xs rounded-md border border-emerald-300 bg-emerald-50 px-2 py-1.5 text-emerald-800 hover:bg-emerald-100"
+                  >
+                    👌 OK · 看详情
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setActionMenu('add')}
+                    className="flex-1 min-w-[80px] text-xs rounded-md border border-blue-300 bg-blue-50 px-2 py-1.5 text-blue-800 hover:bg-blue-100"
+                  >
+                    ➕ 再加点
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setActionMenu('modify')}
+                    className="flex-1 min-w-[80px] text-xs rounded-md border border-amber-300 bg-amber-50 px-2 py-1.5 text-amber-800 hover:bg-amber-100"
+                  >
+                    ✏️ 要改
+                  </button>
+                </div>
+              )}
+              {actionMenu === 'add' && (
+                <div>
+                  <div className="text-xs text-slate-500 mb-1 flex items-center justify-between">
+                    <span>加点什么：</span>
+                    <button
+                      type="button"
+                      onClick={() => setActionMenu(null)}
+                      className="text-slate-400 hover:text-slate-700"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    <button type="button" onClick={() => quickAction('帮我加越南签证（每个出行人都要）')} className="text-xs rounded-md border border-blue-200 bg-white px-2 py-1.5 hover:bg-blue-50">🛂 加签证</button>
+                    <button type="button" onClick={() => quickAction('再帮我加岘港 3 晚酒店')} className="text-xs rounded-md border border-blue-200 bg-white px-2 py-1.5 hover:bg-blue-50">🏨 加酒店</button>
+                    <button type="button" onClick={() => quickAction('再帮我加机场接机一趟')} className="text-xs rounded-md border border-blue-200 bg-white px-2 py-1.5 hover:bg-blue-50">🚗 加接机</button>
+                    <button type="button" onClick={() => quickAction('有什么一价全包套餐推荐？')} className="text-xs rounded-md border border-blue-200 bg-white px-2 py-1.5 hover:bg-blue-50">🎁 看套餐</button>
+                  </div>
+                </div>
+              )}
+              {actionMenu === 'modify' && (
+                <div>
+                  <div className="text-xs text-slate-500 mb-1 flex items-center justify-between">
+                    <span>改什么：</span>
+                    <button
+                      type="button"
+                      onClick={() => setActionMenu(null)}
+                      className="text-slate-400 hover:text-slate-700"
+                    >
+                      ✕
+                    </button>
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    <button type="button" onClick={() => quickAction('改人数（请问当前是几人？我想改成 ___ 人）')} className="text-xs rounded-md border border-amber-200 bg-white px-2 py-1.5 hover:bg-amber-50">👥 改人数</button>
+                    <button type="button" onClick={() => quickAction('改日期，我想换一天看看')} className="text-xs rounded-md border border-amber-200 bg-white px-2 py-1.5 hover:bg-amber-50">📅 改日期</button>
+                    <button type="button" onClick={() => quickAction('我想换商务舱看看价格')} className="text-xs rounded-md border border-amber-200 bg-white px-2 py-1.5 hover:bg-amber-50">💺 换舱位</button>
+                    <button type="button" onClick={() => quickAction('再给我看看其他选项')} className="text-xs rounded-md border border-amber-200 bg-white px-2 py-1.5 hover:bg-amber-50">🔄 看别的</button>
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
@@ -507,7 +589,7 @@ function ProposalItemRow({ item }: { item: AiProposal['items'][number] }) {
       arrivalTime: string;
       cabin: string;
       passengers: number;
-      dateRank: string;
+      dateRank: string; // 内部字段，不渲染给客户
       basePrice: number;
     };
     const dep = new Date(d.departureTime);
@@ -522,12 +604,6 @@ function ProposalItemRow({ item }: { item: AiProposal['items'][number] }) {
             <span className="font-semibold text-slate-900 text-sm">
               {d.flightNumber} {d.origin}→{d.destination}
             </span>
-            <span className={`text-xs px-1.5 rounded ${
-              d.dateRank === 'A' ? 'bg-red-100 text-red-700' :
-              d.dateRank === 'B' ? 'bg-amber-100 text-amber-700' :
-              d.dateRank === 'C' ? 'bg-blue-100 text-blue-700' :
-              'bg-emerald-100 text-emerald-700'
-            }`}>{d.dateRank}</span>
           </div>
           <span className="text-sm font-bold text-red-600">¥{item.total.toLocaleString()}</span>
         </div>
