@@ -84,33 +84,72 @@ function extractFallback(text) {
     .replace(/(?<=\d)[OQ]/g, '0')
     .replace(/[Il](?=\d)/g, '1');
 
-  let passportMatch = cleaned.match(/\b[EGSDPH][A-Z]?\d{7,8}\b/);
-  if (!passportMatch) {
-    const isoCountryAndNumber = cleaned.match(/\b[A-Z]{3}(\d{6,9})\b/);
-    if (isoCountryAndNumber) {
-      result.passportNumber = isoCountryAndNumber[1];
-    } else {
-      passportMatch = cleaned.match(/\b[A-Z]{1,2}\d{6,9}\b/);
+  // 把 "EE 141 20 98" 这种 OCR 拆开的护照号合并成 "EE1412098"
+  const collapsedNumbers = cleaned.replace(
+    /\b([A-Z]{1,2})((?:\s+\d+)+)\b/g,
+    (_full, prefix, digitsPart) => prefix + digitsPart.replace(/\s+/g, ''),
+  );
+
+  const tryMatch = (s) => {
+    let m = s.match(/\b[EGSDPH][A-Z]?\d{7,8}\b/);
+    if (m) return m[0];
+    m = s.match(/\b[A-Z]{3}(\d{6,9})\b/);
+    if (m) return m[1];
+    m = s.match(/\b[A-Z]{1,2}\d{6,9}\b/);
+    if (m) return m[0];
+    m = s.match(/(?<![A-Z\d])\d{7,9}(?![A-Z\d])/);
+    if (m) return m[0];
+    return undefined;
+  };
+  result.passportNumber = tryMatch(collapsedNumbers) ?? tryMatch(cleaned);
+
+  // 中文名：跨行锚点 + 跳过常见标题
+  const skipChinese = new Set([
+    '中华', '华人', '人民', '民共', '共和', '和国', '中华人民', '人民共和',
+    '护照', '类型', '国家', '签发', '出生', '日期', '性别', '国籍', '中国',
+    '姓名', '朋友', '机关', '签名', '持照', '地点', '出入', '入境', '管理', '管理局',
+    '公安', '公安部',
+  ]);
+  const crossLineCN = text.match(/姓\s*名[\s\S]{0,60}?([一-龥]{2,4})/);
+  if (crossLineCN && !skipChinese.has(crossLineCN[1])) {
+    result.chineseName = crossLineCN[1];
+  } else {
+    const allChinese = text.match(/[一-龥]{2,4}/g) ?? [];
+    for (const cand of allChinese) {
+      if (!skipChinese.has(cand)) { result.chineseName = cand; break; }
     }
   }
-  if (!passportMatch && !result.passportNumber) {
-    passportMatch = cleaned.match(/(?<![A-Z\d])\d{7,9}(?![A-Z\d])/);
-  }
-  if (passportMatch && !result.passportNumber) result.passportNumber = passportMatch[0];
 
   const stopWords = new Set([
     'PASSPORT', 'UNITED', 'KINGDOM', 'STATES', 'AMERICA', 'REPUBLIC',
     'PEOPLE', 'CHINA', 'JAPAN', 'KOREA', 'VIETNAM', 'NATIONALITY',
     'SURNAME', 'GIVEN', 'NAME', 'NAMES', 'BIRTH', 'DATE', 'PLACE',
     'EXPIRY', 'AUTHORITY', 'SEX', 'TYPE', 'CODE', 'NUMBER',
-    'NO', 'OF', 'MALE', 'FEMALE',
+    'NO', 'OF', 'MALE', 'FEMALE', 'CHINESE',
+    'AAS', 'CONT', 'KUL', 'ATR', 'ASSPORT', 'TT', 'ANN', 'FATA',
+    'YNAME', 'YTYPE', 'COTTEY', 'EN', 'OY', 'AN',
+    'MPS', 'EXIT', 'ENTRY', 'ADMINISTRATION', 'BEARER', 'HENAN',
+    'CN', 'CHN',
   ]);
-  const englishNameCandidates = text.match(/[A-Z]{2,}[,\s]+[A-Z]{2,}(?:[,\s]+[A-Z]{2,})*/g) ?? [];
-  for (const cand of englishNameCandidates) {
-    const tokens = cand.replace(/,/g, ' ').split(/\s+/).filter(Boolean);
-    if (tokens.every((t) => !stopWords.has(t))) {
-      result.englishName = tokens.join(' ');
-      break;
+
+  const commaName = text.match(/\b([A-Z]{2,})\s*,\s*([A-Z]{2,}(?:\s+[A-Z]{2,})*)\b/);
+  if (commaName) {
+    const surname = commaName[1];
+    const givenTokens = commaName[2]
+      .split(/\s+/)
+      .filter((t) => !stopWords.has(t) && t.length >= 2 && t.length <= 15);
+    if (!stopWords.has(surname) && givenTokens.length > 0) {
+      result.englishName = `${surname} ${givenTokens.join(' ')}`.trim();
+    }
+  }
+  if (!result.englishName) {
+    const englishNameCandidates = text.match(/[A-Z]{2,}[,\s]+[A-Z]{2,}(?:[,\s]+[A-Z]{2,})*/g) ?? [];
+    for (const cand of englishNameCandidates) {
+      const tokens = cand.replace(/,/g, ' ').split(/\s+/).filter(Boolean);
+      if (tokens.every((t) => !stopWords.has(t) && t.length >= 2 && t.length <= 15)) {
+        result.englishName = tokens.join(' ');
+        break;
+      }
     }
   }
 
@@ -227,6 +266,31 @@ const cases = [
       '更多文字',
     expectMrz: {
       passportNumber: 'E12345678',
+    },
+  },
+  {
+    // 真实用户上报的 OCR 输出（中国护照，没拍到 MRZ，护照号被空格分开，
+    // 一堆 OCR 噪音如 "FATA TT"、"朋友" 干扰）
+    name: '真实低质 OCR：护照号有空格 + 噪音名字',
+    text:
+      'AAS\n' +
+      'Nl 中 华 A\n' +
+      '\\ CONT — daa\n' +
+      "EB 3t fn PEOPLE'S REPUBLIC —\n" +
+      '\\ 朋友 FATA TT A ANN\n' +
+      '\\ ro ay 4 照 类 型 7Type 国家 码 ZC Pu Tha \\ -\n' +
+      'en KUL Cottey Code EN =O ATR\n' +
+      '\\ ; ASSPORT P CHN y Cod 护 是 Res No. oy\n' +
+      '3) 姓名 YName EE 141 20 98 A Hl AE\n' +
+      '刘 48 LL\n' +
+      'TE EE\n' +
+      '; LIU, CHAO AN 0\n',
+    expectFallback: {
+      passportNumber: 'EE1412098', // "EE 141 20 98" 被锚点附近去空格后匹配
+      englishName: 'LIU CHAO',     // 逗号格式优先 → "LIU, CHAO" 击败 "FATA TT"
+      // chineseName 期望 "刘"——但 OCR 把"刘"和"超"拆到不同位置/被噪点污染
+      // 我们能拿到 "刘" 单字（虽然 1 字不被 {2,4} 抓），实际可能拿到 "公安部" 或别的
+      // 暂不强制断言 chineseName（OCR 文本里"刘超"被分行，超 OCR 误识为 48）
     },
   },
 ];

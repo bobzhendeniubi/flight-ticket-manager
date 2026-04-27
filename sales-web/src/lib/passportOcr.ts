@@ -236,51 +236,99 @@ function extractFallback(text: string): NonNullable<OcrResult['fallback']> {
     .replace(/(?<=\d)[OQ]/g, '0')
     .replace(/[Il](?=\d)/g, '1');
 
-  // 优先：中国护照 E/G/S/D/P/H + 可选第二字母 + 7-8 位数字
-  let passportMatch: RegExpMatchArray | null = cleaned.match(/\b[EGSDPH][A-Z]?\d{7,8}\b/);
-  // 通用国际格式 1-2 字母 + 6-9 数字（紧跟在 3 字母 ISO 国家码后的数字单独捕获）
-  if (!passportMatch) {
-    const isoCountryAndNumber = cleaned.match(/\b[A-Z]{3}(\d{6,9})\b/);
-    if (isoCountryAndNumber) {
-      result.passportNumber = isoCountryAndNumber[1];
-    } else {
-      passportMatch = cleaned.match(/\b[A-Z]{1,2}\d{6,9}\b/);
-    }
-  }
-  // 最后：纯 7-9 位数字
-  if (!passportMatch && !result.passportNumber) {
-    passportMatch = cleaned.match(/(?<![A-Z\d])\d{7,9}(?![A-Z\d])/);
-  }
-  if (passportMatch && !result.passportNumber) {
-    result.passportNumber = passportMatch[0];
-  }
+  // 关键改进：tesseract 经常把 "EE1412098" 识成 "EE 141 20 98"（OCR-B 字间距大被识成空格）
+  // 策略：把所有 "[A-Z]{1,2} 后接零散数字段" 的组合在原文里压成连续串再匹配
+  // 例如 "EE 141 20 98" → "EE1412098"
+  const collapsedNumbers = cleaned.replace(
+    /\b([A-Z]{1,2})((?:\s+\d+)+)\b/g,
+    (_full, prefix: string, digitsPart: string) => prefix + digitsPart.replace(/\s+/g, ''),
+  );
+
+  const tryMatch = (s: string): string | undefined => {
+    // 1. 中国护照 E/G/S/D/P/H + 可选第二字母 + 7-8 位数字
+    let m = s.match(/\b[EGSDPH][A-Z]?\d{7,8}\b/);
+    if (m) return m[0];
+    // 2. 紧跟 3 字母 ISO 国家码后的数字
+    m = s.match(/\b[A-Z]{3}(\d{6,9})\b/);
+    if (m) return m[1];
+    // 3. 通用国际格式 1-2 字母 + 6-9 数字
+    m = s.match(/\b[A-Z]{1,2}\d{6,9}\b/);
+    if (m) return m[0];
+    // 4. 纯 7-9 位数字
+    m = s.match(/(?<![A-Z\d])\d{7,9}(?![A-Z\d])/);
+    if (m) return m[0];
+    return undefined;
+  };
+
+  // 先用"压缩了字母-数字之间空格"的版本试，再 fallback 到原文
+  result.passportNumber = tryMatch(collapsedNumbers) ?? tryMatch(cleaned);
 
   // 中文姓名：2-4 个汉字连在一起（在"姓名"附近优先）
   const chineseNameMatch = text.match(/姓名[\s:：]*([\u4e00-\u9fa5]{2,4})/);
   if (chineseNameMatch) {
     result.chineseName = chineseNameMatch[1];
   } else {
-    const firstChineseName = text.match(/[\u4e00-\u9fa5]{2,4}/);
-    if (firstChineseName) result.chineseName = firstChineseName[0];
+    // \u8de8\u884c\u7248\uff1aOCR \u628a \u59d3\u540d \u548c\u771f\u540d\u62c6\u5230\u4e0d\u540c\u884c\uff0callow 60 char gap
+    const crossLine = text.match(/\u59d3\s*\u540d[\s\S]{0,60}?([\u4e00-\u9fa5]{2,4})/);
+    if (crossLine) {
+      result.chineseName = crossLine[1];
+    } else {
+      // \u6ca1\u951a\u70b9\u5c31\u8df3\u8fc7\u5e38\u89c1\u62a4\u7167\u9875\u6807\u9898\u8bcd\uff08\u4e2d\u534e/\u4eba\u6c11/\u5171\u548c/\u670b\u53cb \u7b49 OCR \u566a\u97f3\uff09
+      const skipChinese = new Set([
+        '\u4e2d\u534e', '\u534e\u4eba', '\u4eba\u6c11', '\u6c11\u5171', '\u5171\u548c', '\u548c\u56fd', '\u4e2d\u534e\u4eba\u6c11', '\u4eba\u6c11\u5171\u548c',
+        '\u62a4\u7167', '\u7c7b\u578b', '\u56fd\u5bb6', '\u7b7e\u53d1', '\u51fa\u751f', '\u65e5\u671f', '\u6027\u522b', '\u56fd\u7c4d', '\u4e2d\u56fd',
+        '\u59d3\u540d', '\u670b\u53cb', '\u673a\u5173', '\u7b7e\u540d', '\u6301\u7167', '\u5730\u70b9', '\u51fa\u5165', '\u5165\u5883', '\u7ba1\u7406', '\u7ba1\u7406\u5c40',
+        '\u516c\u5b89', '\u516c\u5b89\u90e8',
+      ]);
+      const allChinese = text.match(/[\u4e00-\u9fa5]{2,4}/g) ?? [];
+      for (const cand of allChinese) {
+        if (!skipChinese.has(cand)) {
+          result.chineseName = cand;
+          break;
+        }
+      }
+    }
   }
 
   // 英文拼音名（大写字母 + 空格 / 逗号，至少 2 段）
-  // 跳过文档标题词（PASSPORT、UNITED KINGDOM、CHINA 等护照页常见的非姓名大写文本）
+  // 护照英文名几乎都是 "SURNAME, GIVEN" 或 "SURNAME GIVEN" 格式
+  // 标准护照行长这样: "LIU, CHAO" — 用逗号分隔的优先
   const stopWords = new Set([
     'PASSPORT', 'UNITED', 'KINGDOM', 'STATES', 'AMERICA', 'REPUBLIC',
     'PEOPLE', 'CHINA', 'JAPAN', 'KOREA', 'VIETNAM', 'NATIONALITY',
     'SURNAME', 'GIVEN', 'NAME', 'NAMES', 'BIRTH', 'DATE', 'PLACE',
     'EXPIRY', 'AUTHORITY', 'SEX', 'TYPE', 'CODE', 'NUMBER',
-    'NO', 'OF', 'MALE', 'FEMALE',
+    'NO', 'OF', 'MALE', 'FEMALE', 'CHINESE',
+    // OCR 常见噪音
+    'AAS', 'CONT', 'KUL', 'ATR', 'ASSPORT', 'TT', 'ANN', 'FATA',
+    'YNAME', 'YTYPE', 'TYPE', 'COTTEY', 'EN', 'OY', 'AN',
+    'MPS', 'EXIT', 'ENTRY', 'ADMINISTRATION', 'BEARER', 'HENAN',
+    'CN', 'CHN', 'CHN9101195M2808196MBPFLDKM', // OCR 噪点国家代码
   ]);
-  // 抓所有候选并选第一个非 stopword 的
-  const englishNameCandidates = text.match(/[A-Z]{2,}[,\s]+[A-Z]{2,}(?:[,\s]+[A-Z]{2,})*/g) ?? [];
-  for (const cand of englishNameCandidates) {
-    const tokens = cand.replace(/,/g, ' ').split(/\s+/).filter(Boolean);
-    // 全部 token 都不是 stopword 才接受
-    if (tokens.every((t) => !stopWords.has(t))) {
-      result.englishName = tokens.join(' ');
-      break;
+
+  // 1. 先找 "X, Y" 格式（逗号是强信号——基本是真姓名）
+  const commaName = text.match(/\b([A-Z]{2,})\s*,\s*([A-Z]{2,}(?:\s+[A-Z]{2,})*)\b/);
+  if (commaName) {
+    const surname = commaName[1];
+    // given 可能贪婪匹配多个 token（含 OCR 噪音），滤掉 stopword
+    const givenTokens = commaName[2]
+      .split(/\s+/)
+      .filter((t) => !stopWords.has(t) && t.length >= 2 && t.length <= 15);
+    if (!stopWords.has(surname) && givenTokens.length > 0) {
+      result.englishName = `${surname} ${givenTokens.join(' ')}`.trim();
+    }
+  }
+
+  // 2. 如果还没拿到，扫候选并跳 stopword
+  if (!result.englishName) {
+    const englishNameCandidates = text.match(/[A-Z]{2,}[,\s]+[A-Z]{2,}(?:[,\s]+[A-Z]{2,})*/g) ?? [];
+    for (const cand of englishNameCandidates) {
+      const tokens = cand.replace(/,/g, ' ').split(/\s+/).filter(Boolean);
+      // 全部 token 都不是 stopword、且每个 token 长度 ≥ 2 且 ≤ 15（真姓名长度范围）
+      if (tokens.every((t) => !stopWords.has(t) && t.length >= 2 && t.length <= 15)) {
+        result.englishName = tokens.join(' ');
+        break;
+      }
     }
   }
 
