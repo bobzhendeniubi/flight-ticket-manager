@@ -1,0 +1,100 @@
+{
+  "nav": {
+    "brand": "Citur Travel",
+    "flights": "Flights",
+    "hotels": "Hotels",
+    "transfers": "Transfers",
+    "visas": "Visas",
+    "bundles": "Bundles",
+    "team": "My Team",
+    "myOrders": "My Orders",
+    "login": "Sign in",
+    "register": "Sign up",
+    "logout": "Sign out",
+    "profile": "Profile",
+    "menu": "Menu",
+    "miniprogramPreview": "📱 Mobile preview"
+  },
+  "common": {
+    "loading": "Loading…",
+    "error": "Something went wrong",
+    "save": "Save",
+    "cancel": "Cancel",
+    "confirm": "Confirm",
+    "submit": "Submit",
+    "back": "Back",
+    "close": "Close",
+    "delete": "Delete",
+    "edit": "Edit",
+    "viewDetail": "View detail",
+    "collapse": "Collapse",
+    "search": "Search",
+    "loadFailed": "Failed to load",
+    "tryAgain": "Please try again later"
+  },
+  "home": {
+    "searchTitle": "Find a flight",
+    "origin": "From",
+    "destination": "To",
+    "departureDate": "Departure date",
+    "cabin": "Cabin",
+    "passengers": "Passengers",
+    "searchButton": "Search flights",
+    "searching": "Searching…",
+    "noResults": "No flights found",
+    "limitedDeal": "Limited deal",
+    "fromPrice": "from",
+    "directFlight": "Direct",
+    "selectCabin": "↓ Pick a cabin to add to cart"
+  },
+  "cabin": {
+    "ECONOMY": "Economy",
+    "PREMIUM_ECONOMY": "Premium Economy",
+    "BUSINESS": "Business",
+    "FIRST": "First",
+    "all": "Any"
+  },
+  "cart": {
+    "title": "Cart",
+    "empty": "Your cart is empty",
+    "subtotal": "Subtotal",
+    "checkout": "Checkout",
+    "clear": "Clear cart",
+    "addedAt": "Added at"
+  },
+  "checkout": {
+    "title": "Checkout",
+    "submitOrder": "Place order",
+    "submitting": "Submitting…",
+    "backToCart": "← Back to cart",
+    "totalAmount": "Total"
+  },
+  "orders": {
+    "title": "My Orders",
+    "noOrders": "No orders yet",
+    "browseFlights": "Browse flights",
+    "continueShopping": "← Keep shopping",
+    "applyCancel": "Request cancel"
+  },
+  "orderStatus": {
+    "DRAFT": "Draft",
+    "PENDING_PAYMENT": "Awaiting payment",
+    "PAID": "Paid",
+    "PROCESSING": "Processing",
+    "TICKETED": "Ticketed",
+    "COMPLETED": "Completed",
+    "PAYMENT_TIMEOUT": "Payment timeout",
+    "CANCELLED": "Cancelled",
+    "REFUND_REQUESTED": "Refund pending",
+    "REFUNDED": "Refunded",
+    "CHANGE_REQUESTED": "Change pending",
+    "CHANGED": "Changed",
+    "FAILED": "Failed"
+  },
+  "language": {
+    "label": "Language",
+    "zh-CN": "中文",
+    "en": "English",
+    "vi": "Tiếng Việt"
+  }
+}

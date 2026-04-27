@@ -1,0 +1,100 @@
+{
+  "nav": {
+    "brand": "Citur Travel",
+    "flights": "Vé máy bay",
+    "hotels": "Khách sạn",
+    "transfers": "Đưa đón",
+    "visas": "Visa",
+    "bundles": "Trọn gói",
+    "team": "Nhóm của tôi",
+    "myOrders": "Đơn của tôi",
+    "login": "Đăng nhập",
+    "register": "Đăng ký",
+    "logout": "Đăng xuất",
+    "profile": "Hồ sơ",
+    "menu": "Menu",
+    "miniprogramPreview": "📱 Xem trên điện thoại"
+  },
+  "common": {
+    "loading": "Đang tải…",
+    "error": "Có lỗi xảy ra",
+    "save": "Lưu",
+    "cancel": "Hủy",
+    "confirm": "Xác nhận",
+    "submit": "Gửi",
+    "back": "Quay lại",
+    "close": "Đóng",
+    "delete": "Xóa",
+    "edit": "Sửa",
+    "viewDetail": "Xem chi tiết",
+    "collapse": "Thu gọn",
+    "search": "Tìm kiếm",
+    "loadFailed": "Tải thất bại",
+    "tryAgain": "Vui lòng thử lại sau"
+  },
+  "home": {
+    "searchTitle": "Tìm chuyến bay",
+    "origin": "Điểm đi",
+    "destination": "Điểm đến",
+    "departureDate": "Ngày khởi hành",
+    "cabin": "Hạng vé",
+    "passengers": "Số khách",
+    "searchButton": "Tìm chuyến bay",
+    "searching": "Đang tìm…",
+    "noResults": "Không tìm thấy chuyến bay",
+    "limitedDeal": "Ưu đãi có hạn",
+    "fromPrice": "từ",
+    "directFlight": "Bay thẳng",
+    "selectCabin": "↓ Chọn hạng vé để thêm vào giỏ"
+  },
+  "cabin": {
+    "ECONOMY": "Phổ thông",
+    "PREMIUM_ECONOMY": "Phổ thông Đặc biệt",
+    "BUSINESS": "Thương gia",
+    "FIRST": "Hạng nhất",
+    "all": "Bất kỳ"
+  },
+  "cart": {
+    "title": "Giỏ hàng",
+    "empty": "Giỏ hàng trống",
+    "subtotal": "Tạm tính",
+    "checkout": "Thanh toán",
+    "clear": "Xóa giỏ",
+    "addedAt": "Thêm lúc"
+  },
+  "checkout": {
+    "title": "Thanh toán",
+    "submitOrder": "Đặt vé",
+    "submitting": "Đang gửi…",
+    "backToCart": "← Quay lại giỏ",
+    "totalAmount": "Tổng cộng"
+  },
+  "orders": {
+    "title": "Đơn của tôi",
+    "noOrders": "Chưa có đơn",
+    "browseFlights": "Xem vé máy bay",
+    "continueShopping": "← Tiếp tục",
+    "applyCancel": "Yêu cầu hủy"
+  },
+  "orderStatus": {
+    "DRAFT": "Nháp",
+    "PENDING_PAYMENT": "Chờ thanh toán",
+    "PAID": "Đã thanh toán",
+    "PROCESSING": "Đang xử lý",
+    "TICKETED": "Đã xuất vé",
+    "COMPLETED": "Hoàn tất",
+    "PAYMENT_TIMEOUT": "Quá hạn thanh toán",
+    "CANCELLED": "Đã hủy",
+    "REFUND_REQUESTED": "Chờ hoàn tiền",
+    "REFUNDED": "Đã hoàn tiền",
+    "CHANGE_REQUESTED": "Chờ đổi vé",
+    "CHANGED": "Đã đổi vé",
+    "FAILED": "Thất bại"
+  },
+  "language": {
+    "label": "Ngôn ngữ",
+    "zh-CN": "中文",
+    "en": "English",
+    "vi": "Tiếng Việt"
+  }
+}

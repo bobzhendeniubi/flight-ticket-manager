@@ -1,9 +1,11 @@
 import { useEffect, useState } from 'react';
 import { Link, NavLink, Outlet, useNavigate, useSearchParams } from 'react-router-dom';
+import { useTranslation } from 'react-i18next';
 import { useAuth } from '../stores/auth';
 import { useCart } from '../stores/cart';
 import { MobilePreviewFrame } from './MobilePreviewFrame';
 import { AiAssistant } from './AiAssistant';
+import { SUPPORTED_LANGUAGES, type SupportedLanguage } from '../i18n';
 
 const ROLE_LABEL: Record<string, string> = {
   CUSTOMER: '客户',
@@ -12,22 +14,24 @@ const ROLE_LABEL: Record<string, string> = {
   ADMIN: '管理员',
 };
 
-const frontNav = [
-  { to: '/', label: '机票', exact: true },
-  { to: '/hotels', label: '酒店' },
-  { to: '/transfers', label: '接送' },
-  { to: '/visas', label: '签证' },
-  { to: '/bundles', label: '套餐' },
-];
-
 // 管理后台已拆分到 admin-web (:5174)。前台不再展示后台入口。
 // /admin/* 路由仍保留可访问（向后兼容旧链接），但不在 nav 中显示。
 
 export function Layout() {
+  const { t, i18n } = useTranslation();
   const user = useAuth((s) => s.user);
   const logout = useAuth((s) => s.logout);
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
+
+  // 主导航：用 t() 而不是硬编码文字
+  const frontNav = [
+    { to: '/', label: t('nav.flights'), exact: true },
+    { to: '/hotels', label: t('nav.hotels') },
+    { to: '/transfers', label: t('nav.transfers') },
+    { to: '/visas', label: t('nav.visas') },
+    { to: '/bundles', label: t('nav.bundles') },
+  ];
 
   const isAgent = user?.role === 'AGENT';
   const isAdmin = user?.role === 'ADMIN' || user?.role === 'STAFF';
@@ -53,7 +57,7 @@ export function Layout() {
             type="button"
             className="md:hidden flex h-9 w-9 items-center justify-center rounded-md border border-slate-200 text-slate-700"
             onClick={() => setMobileMenuOpen(true)}
-            aria-label="打开菜单"
+            aria-label={t('nav.menu')}
           >
             <span className="text-lg">☰</span>
           </button>
@@ -88,26 +92,39 @@ export function Layout() {
                   }`
                 }
               >
-                我的团队
+                {t('nav.team')}
               </NavLink>
             )}
           </nav>
 
           {/* 右侧用户菜单：手机端只保留购物车，其他进汉堡 */}
           <nav className="flex items-center gap-2 md:gap-3 text-sm">
+            {/* 语言切换器 — zh-CN / en / vi */}
+            <select
+              value={i18n.language.startsWith('zh') ? 'zh-CN' : i18n.language.startsWith('en') ? 'en' : i18n.language.startsWith('vi') ? 'vi' : 'zh-CN'}
+              onChange={(e) => void i18n.changeLanguage(e.target.value)}
+              className="hidden md:inline-block rounded-md border border-slate-200 bg-white px-2 py-1 text-xs text-slate-700 hover:border-brand"
+              aria-label={t('language.label')}
+            >
+              {SUPPORTED_LANGUAGES.map((lng: SupportedLanguage) => (
+                <option key={lng} value={lng}>
+                  {t(`language.${lng}`)}
+                </option>
+              ))}
+            </select>
             <a
               href="/?preview=mobile"
               className="hidden md:inline-flex items-center gap-1 rounded-md border border-slate-200 bg-slate-50 px-2 py-1 text-xs text-slate-600 hover:border-brand hover:text-brand"
               title="以移动端视口预览（小程序端测试）"
             >
-              📱 小程序预览
+              {t('nav.miniprogramPreview')}
             </a>
             <CartButton />
             {/* 桌面端：完整用户区 */}
             {user ? (
               <div className="hidden md:flex items-center gap-3">
                 <Link to="/orders" className="text-sm text-slate-700 hover:text-brand">
-                  我的订单
+                  {t('nav.myOrders')}
                 </Link>
                 <Link to="/me" className="flex items-center gap-2 text-slate-700 hover:text-brand">
                   <span>{user.displayName ?? user.email}</span>
@@ -123,16 +140,16 @@ export function Layout() {
                     navigate('/');
                   }}
                 >
-                  退出
+                  {t('nav.logout')}
                 </button>
               </div>
             ) : (
               <div className="hidden md:flex items-center gap-3">
                 <Link to="/login" className="text-slate-700 hover:text-brand">
-                  登录
+                  {t('nav.login')}
                 </Link>
                 <Link to="/register" className="btn-primary text-sm py-1.5">
-                  注册账号
+                  {t('nav.register')}
                 </Link>
               </div>
             )}
@@ -147,7 +164,7 @@ export function Layout() {
               onClick={(e) => e.stopPropagation()}
             >
               <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
-                <span className="font-semibold">菜单</span>
+                <span className="font-semibold">{t('nav.menu')}</span>
                 <button onClick={closeMenu} className="text-slate-400 hover:text-slate-700 text-xl" aria-label="关闭">×</button>
               </div>
               <div className="flex-1 overflow-y-auto py-2">
@@ -177,7 +194,7 @@ export function Layout() {
                       }`
                     }
                   >
-                    我的团队
+                    {t('nav.team')}
                   </NavLink>
                 )}
 
@@ -187,7 +204,7 @@ export function Layout() {
                 {user ? (
                   <>
                     <Link to="/orders" onClick={closeMenu} className="block px-4 py-3 text-sm text-slate-700 hover:bg-slate-50">
-                      📋 我的订单
+                      📋 {t('nav.myOrders')}
                     </Link>
                     <Link to="/me" onClick={closeMenu} className="block px-4 py-3 text-sm text-slate-700 hover:bg-slate-50">
                       👤 {user.displayName ?? user.email}
@@ -204,17 +221,30 @@ export function Layout() {
                         navigate('/');
                       }}
                     >
-                      退出登录
+                      {t('nav.logout')}
                     </button>
                   </>
                 ) : (
                   <>
                     <Link to="/login" onClick={closeMenu} className="block px-4 py-3 text-sm text-slate-700 hover:bg-slate-50">
-                      登录
+                      {t('nav.login')}
                     </Link>
                     <Link to="/register" onClick={closeMenu} className="block px-4 py-3 text-sm font-semibold text-brand hover:bg-brand/5">
-                      注册账号
+                      {t('nav.register')}
                     </Link>
+                    {/* 手机抽屉里的语言切换 */}
+                    <div className="mt-2 px-4 py-2 border-t border-slate-100">
+                      <label className="text-xs text-slate-500 mb-1 block">{t('language.label')}</label>
+                      <select
+                        value={i18n.language.startsWith('zh') ? 'zh-CN' : i18n.language.startsWith('en') ? 'en' : i18n.language.startsWith('vi') ? 'vi' : 'zh-CN'}
+                        onChange={(e) => void i18n.changeLanguage(e.target.value)}
+                        className="w-full rounded-md border border-slate-300 px-2 py-1 text-sm"
+                      >
+                        {SUPPORTED_LANGUAGES.map((lng: SupportedLanguage) => (
+                          <option key={lng} value={lng}>{t(`language.${lng}`)}</option>
+                        ))}
+                      </select>
+                    </div>
                   </>
                 )}
               </div>

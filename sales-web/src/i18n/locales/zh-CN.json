@@ -1,0 +1,100 @@
+{
+  "nav": {
+    "brand": "世途旅行",
+    "flights": "机票",
+    "hotels": "酒店",
+    "transfers": "接送",
+    "visas": "签证",
+    "bundles": "套餐",
+    "team": "我的团队",
+    "myOrders": "我的订单",
+    "login": "登录",
+    "register": "注册账号",
+    "logout": "退出",
+    "profile": "我的资料",
+    "menu": "菜单",
+    "miniprogramPreview": "📱 小程序预览"
+  },
+  "common": {
+    "loading": "加载中…",
+    "error": "出错了",
+    "save": "保存",
+    "cancel": "取消",
+    "confirm": "确认",
+    "submit": "提交",
+    "back": "返回",
+    "close": "关闭",
+    "delete": "删除",
+    "edit": "编辑",
+    "viewDetail": "查看详情",
+    "collapse": "收起",
+    "search": "搜索",
+    "loadFailed": "加载失败",
+    "tryAgain": "请稍后再试"
+  },
+  "home": {
+    "searchTitle": "找航班",
+    "origin": "出发地",
+    "destination": "目的地",
+    "departureDate": "出发日期",
+    "cabin": "舱位",
+    "passengers": "人数",
+    "searchButton": "搜索航班",
+    "searching": "搜索中…",
+    "noResults": "没找到航班",
+    "limitedDeal": "限时优惠",
+    "fromPrice": "起",
+    "directFlight": "直飞",
+    "selectCabin": "↓ 选舱位加入购物车"
+  },
+  "cabin": {
+    "ECONOMY": "经济舱",
+    "PREMIUM_ECONOMY": "超级经济舱",
+    "BUSINESS": "商务舱",
+    "FIRST": "头等舱",
+    "all": "不限"
+  },
+  "cart": {
+    "title": "购物车",
+    "empty": "购物车是空的",
+    "subtotal": "合计",
+    "checkout": "去结账",
+    "clear": "清空购物车",
+    "addedAt": "加入时间"
+  },
+  "checkout": {
+    "title": "结账",
+    "submitOrder": "提交订单",
+    "submitting": "提交中…",
+    "backToCart": "← 返回购物车",
+    "totalAmount": "合计"
+  },
+  "orders": {
+    "title": "我的订单",
+    "noOrders": "还没有订单",
+    "browseFlights": "去看看机票",
+    "continueShopping": "← 继续逛",
+    "applyCancel": "申请取消"
+  },
+  "orderStatus": {
+    "DRAFT": "草稿",
+    "PENDING_PAYMENT": "待支付",
+    "PAID": "已支付",
+    "PROCESSING": "处理中",
+    "TICKETED": "已出票",
+    "COMPLETED": "已完成",
+    "PAYMENT_TIMEOUT": "支付超时",
+    "CANCELLED": "已取消",
+    "REFUND_REQUESTED": "退款审核中",
+    "REFUNDED": "已退款",
+    "CHANGE_REQUESTED": "改签审核中",
+    "CHANGED": "已改签",
+    "FAILED": "失败"
+  },
+  "language": {
+    "label": "语言",
+    "zh-CN": "中文",
+    "en": "English",
+    "vi": "Tiếng Việt"
+  }
+}
