@@ -421,17 +421,20 @@ export function CheckoutPage() {
           )}
         </section>
 
-        <div className="flex items-center justify-between sticky bottom-0 bg-white border border-slate-200 rounded-md px-4 py-3 shadow-lg">
-          <Link to="/cart" className="text-sm text-slate-500 hover:text-brand">
-            ← 返回购物车
-          </Link>
-          <div className="flex items-center gap-4">
-            <span>
-              合计 <span className="text-2xl font-bold text-red-600">¥{total.toLocaleString()}</span>
-            </span>
-            <button type="submit" className="btn-primary" disabled={submitting || paxMismatch}>
-              {submitting ? '提交中…' : '提交订单'}
-            </button>
+        {/* 手机端紧凑：返回 / 合计 + 按钮 在 360px 屏幕也不挤 */}
+        <div className="sticky bottom-0 bg-white border border-slate-200 rounded-md px-3 py-3 sm:px-4 shadow-lg">
+          <div className="flex items-center justify-between gap-2 sm:gap-4">
+            <Link to="/cart" className="text-xs sm:text-sm text-slate-500 hover:text-brand whitespace-nowrap">
+              ← <span className="hidden sm:inline">返回</span>购物车
+            </Link>
+            <div className="flex items-center gap-2 sm:gap-4 flex-1 sm:flex-none justify-end">
+              <span className="text-sm sm:text-base whitespace-nowrap">
+                合计 <span className="text-xl sm:text-2xl font-bold text-red-600">¥{total.toLocaleString()}</span>
+              </span>
+              <button type="submit" className="btn-primary text-sm sm:text-base px-4 sm:px-6 whitespace-nowrap" disabled={submitting || paxMismatch}>
+                {submitting ? '提交中…' : '提交订单'}
+              </button>
+            </div>
           </div>
         </div>
       </form>

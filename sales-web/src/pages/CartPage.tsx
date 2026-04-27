@@ -33,9 +33,9 @@ export function CartPage() {
       <section className="card p-0 overflow-hidden">
         <ul className="divide-y divide-slate-200">
           {items.map((i) => (
-            <li key={i.id} className="flex items-center gap-4 p-4">
-              <div className="text-3xl">{i.emoji}</div>
-              <div className="flex-1 min-w-0">
+            <li key={i.id} className="flex flex-wrap items-center gap-3 sm:gap-4 p-3 sm:p-4">
+              <div className="text-2xl sm:text-3xl flex-shrink-0">{i.emoji}</div>
+              <div className="flex-1 min-w-[60%] sm:min-w-0">
                 <div className="flex items-center gap-2">
                   <span
                     className={`rounded px-1.5 py-0.5 text-xs font-medium ${KIND_INFO[i.kind].color}`}
@@ -70,34 +70,37 @@ export function CartPage() {
                   加入时间 {new Date(i.addedAt).toLocaleString('zh-CN')}
                 </p>
               </div>
-              <div className="flex items-center gap-2">
-                <button
-                  className="rounded border border-slate-300 px-2 py-0.5 hover:bg-slate-50"
-                  onClick={() => updateQty(i.id, i.qty - 1)}
-                  disabled={i.qty <= 1}
-                >
-                  −
-                </button>
-                <span className="w-8 text-center tabular-nums">{i.qty}</span>
-                <button
-                  className="rounded border border-slate-300 px-2 py-0.5 hover:bg-slate-50"
-                  onClick={() => updateQty(i.id, i.qty + 1)}
-                >
-                  +
-                </button>
-              </div>
-              <div className="w-24 text-right">
-                <div className="text-sm text-slate-500">¥{i.unitPrice}</div>
-                <div className="text-base font-semibold text-red-600">
-                  ¥{(i.unitPrice * i.qty).toLocaleString()}
+              {/* 手机端：qty/价格/删除 整体换到下一行（占满宽度，end 对齐） */}
+              <div className="flex items-center gap-3 ml-auto w-full sm:w-auto justify-end mt-2 sm:mt-0 pt-2 sm:pt-0 border-t sm:border-t-0 border-slate-100">
+                <div className="flex items-center gap-2">
+                  <button
+                    className="rounded border border-slate-300 w-7 h-7 hover:bg-slate-50 leading-none"
+                    onClick={() => updateQty(i.id, i.qty - 1)}
+                    disabled={i.qty <= 1}
+                  >
+                    −
+                  </button>
+                  <span className="w-7 text-center tabular-nums">{i.qty}</span>
+                  <button
+                    className="rounded border border-slate-300 w-7 h-7 hover:bg-slate-50 leading-none"
+                    onClick={() => updateQty(i.id, i.qty + 1)}
+                  >
+                    +
+                  </button>
                 </div>
+                <div className="text-right min-w-[80px] sm:w-24">
+                  <div className="text-xs text-slate-500 hidden sm:block">¥{i.unitPrice}</div>
+                  <div className="text-sm sm:text-base font-semibold text-red-600">
+                    ¥{(i.unitPrice * i.qty).toLocaleString()}
+                  </div>
+                </div>
+                <button
+                  className="text-xs text-slate-400 hover:text-red-600"
+                  onClick={() => remove(i.id)}
+                >
+                  删除
+                </button>
               </div>
-              <button
-                className="text-xs text-slate-400 hover:text-red-600"
-                onClick={() => remove(i.id)}
-              >
-                删除
-              </button>
             </li>
           ))}
         </ul>
