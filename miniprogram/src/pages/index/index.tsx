@@ -2,7 +2,8 @@
  * 首页 — 航班搜索 + 结果列表。
  *
  * Demo 默认：MFM → DAD，不限日期，1 人。
- * 用户可改出发地/目的地/日期/人数，显示动态价 + 日期等级徽章。
+ * 用户可改出发地/目的地/日期/人数，显示动态价 + 限时优惠徽章（dynamicPrice<basePrice×0.95 时）。
+ * 注意：dateRank A/B/C/D 是公司内部日期等级，绝不暴露给客户。
  */
 import { useEffect, useState, useCallback } from 'react';
 import Taro, { useDidShow } from '@tarojs/taro';
@@ -125,13 +126,22 @@ function FlightCard({ flight, passengers }: { flight: FlightSearchResult; passen
       (m, c) => (m === null || Number(c.dynamicPrice) < Number(m.dynamicPrice) ? c : m),
       null as typeof flight.seatClasses[number] | null,
     );
-  const dateRank = flight.seatClasses[0]?.dateRank ?? 'C';
+  // dateRank A/B/C/D 是公司内部日期等级，绝不展示给客户。
+  // 用 dynamicPrice < basePrice × 0.95 反映"相对优惠"。
+  const baseMin = flight.seatClasses
+    .filter((c) => c.available >= passengers)
+    .reduce(
+      (m, c) => (m === null || Number(c.basePrice) < m ? Number(c.basePrice) : m),
+      null as number | null,
+    );
+  const dynMin = minCabin ? Number(minCabin.dynamicPrice) : null;
+  const isDeal = baseMin !== null && dynMin !== null && dynMin < baseMin * 0.95;
 
   return (
     <View className='card flight-card'>
       <View className='flight-header'>
         <Text className='flight-number'>{flight.flightNumber}</Text>
-        <View className={`badge badge-${dateRank}`}>{dateRank}</View>
+        {isDeal && <View className='badge badge-deal'>限时优惠</View>}
       </View>
       <View className='flight-route'>
         <View className='route-side'>
@@ -171,7 +181,7 @@ function FlightCard({ flight, passengers }: { flight: FlightSearchResult; passen
                     departureTime: flight.departureTime,
                     cabin: c.cabin,
                     passengers,
-                    dateRank: c.dateRank,
+                    // dateRank 是内部字段，不放进 cart meta（之前订单页/购物车显示给客户）
                     basePrice: Number(c.basePrice),
                     totalForQty: c.totalForQty,
                   },

@@ -50,10 +50,8 @@ page {
   font-size: 22rpx;
   font-weight: 600;
 }
-.badge-A { background: #fee2e2; color: #b91c1c; }
-.badge-B { background: #fef3c7; color: #b45309; }
-.badge-C { background: #dbeafe; color: #1d4ed8; }
-.badge-D { background: #dcfce7; color: #15803d; }
+// .badge-A/B/C/D 已移除：dateRank 是公司内部日期等级，不对客户展示
+.badge-deal { background: #dcfce7; color: #15803d; }
 
 .text-price {
   color: #dc2626;
