@@ -11,6 +11,7 @@ import { VisasPage } from './pages/VisasPage';
 import { BundlesPage } from './pages/BundlesPage';
 import { CartPage } from './pages/CartPage';
 import { CheckoutPage } from './pages/CheckoutPage';
+import { MyOrdersPage } from './pages/MyOrdersPage';
 import { AdminFlightsPage } from './pages/AdminFlightsPage';
 import { AdminDashboardPage } from './pages/admin/DashboardPage';
 import { AdminOrdersPage } from './pages/admin/OrdersPage';
@@ -52,6 +53,14 @@ export function App() {
           element={
             <Protected>
               <ProfilePage />
+            </Protected>
+          }
+        />
+        <Route
+          path="orders"
+          element={
+            <Protected>
+              <MyOrdersPage />
             </Protected>
           }
         />

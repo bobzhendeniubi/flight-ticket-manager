@@ -90,6 +90,9 @@ export function Layout() {
             <CartButton />
             {user ? (
               <>
+                <Link to="/orders" className="text-sm text-slate-700 hover:text-brand">
+                  我的订单
+                </Link>
                 <Link to="/me" className="flex items-center gap-2 text-slate-700 hover:text-brand">
                   <span>{user.displayName ?? user.email}</span>
                   <span className="rounded bg-slate-100 px-1.5 py-0.5 text-xs text-slate-600">

@@ -249,6 +249,36 @@ export interface OrderSummary {
   user: { id: string; displayName: string | null; email: string | null };
 }
 
+/**
+ * 取消订单的退款报价
+ * 后端 lib/cancellation.ts 的 CancellationQuote 镜像（保持字段同步）
+ */
+export interface RefundQuoteItem {
+  itemId: string;
+  kind: string;
+  description: string;
+  amount: number;
+  hoursLeft: number | null;
+  policyId: string | null;
+  policyName: string;
+  feePercent: number;
+  feeAmount: number;
+  refundAmount: number;
+  reason: string;
+  fulfilled: boolean;
+}
+
+export interface RefundQuote {
+  orderId: string;
+  orderNumber: string;
+  paidAmount: number;
+  totalFee: number;
+  totalRefund: number;
+  items: RefundQuoteItem[];
+  cancellable: boolean;
+  cancellableReason?: string;
+}
+
 export interface CreateOrderInput {
   contactName: string;
   contactPhone: string;
@@ -508,6 +538,15 @@ export const api = {
       token,
       body: { toStatus, reason },
     }),
+  /** 取消报价：起飞前几小时×费率，看一眼能退多少 */
+  getRefundQuote: (token: string, id: string) =>
+    apiFetch<{ quote: RefundQuote }>(`/orders/${id}/refund-quote`, { token }),
+  /** 客户/代理 主动申请取消 → 进退款审核流 */
+  cancelOrder: (token: string, id: string, reason?: string) =>
+    apiFetch<{ order: OrderSummary; quote: RefundQuote; isNew: boolean }>(
+      `/orders/${id}/cancel`,
+      { method: 'POST', token, body: { reason } },
+    ),
 
   // 产品（公开）
   listHotels: () => apiFetch<{ hotels: Hotel[] }>('/products/hotels?active=1'),
