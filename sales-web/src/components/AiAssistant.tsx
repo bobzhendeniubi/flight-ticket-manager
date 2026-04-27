@@ -479,12 +479,22 @@ function ProposalCard({
   );
 }
 
-function shortItemLabel(item: { kind: 'FLIGHT' | 'VISA'; detail: Record<string, unknown> }): string {
-  if (item.kind === 'FLIGHT') {
-    const d = item.detail;
-    return `${d.flightNumber as string ?? '机票'} ${d.origin}→${d.destination} ${d.cabin}`;
+function shortItemLabel(item: AiProposal['items'][number]): string {
+  const d = item.detail;
+  switch (item.kind) {
+    case 'FLIGHT':
+      return `${d.flightNumber as string ?? '机票'} ${d.origin}→${d.destination} ${d.cabin}`;
+    case 'VISA':
+      return `${(d.country as string) ?? '签证'}签证`;
+    case 'HOTEL':
+      return `${(d.hotelName as string) ?? '酒店'} × ${d.nights as number} 晚`;
+    case 'TRANSFER':
+      return `${(d.vehicleType as string) ?? '接送'} × ${item.qty}`;
+    case 'BUNDLE':
+      return `${(d.bundleName as string) ?? '套餐'} × ${d.pax as number} 人`;
+    default:
+      return item.name;
   }
-  return `${(item.detail.country as string) ?? '签证'}签证`;
 }
 
 function ProposalItemRow({ item }: { item: AiProposal['items'][number] }) {
@@ -530,35 +540,141 @@ function ProposalItemRow({ item }: { item: AiProposal['items'][number] }) {
       </div>
     );
   }
-  // VISA
+  if (item.kind === 'VISA') {
+    const d = item.detail as {
+      country: string;
+      type: string;
+      processingDays: number;
+      validityMonths: number;
+      requiredDocs: string[];
+      express: boolean;
+    };
+    return (
+      <div className="rounded-md bg-white/70 px-3 py-2 border border-purple-100">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-1">
+            <span className="text-xs">🛂</span>
+            <span className="font-semibold text-slate-900 text-sm">
+              {d.country} · {d.type}
+            </span>
+            {d.express && <span className="text-xs px-1.5 rounded bg-amber-100 text-amber-700">加急</span>}
+          </div>
+          <span className="text-sm font-bold text-red-600">¥{item.total.toLocaleString()}</span>
+        </div>
+        <div className="text-xs text-slate-600 mt-1">
+          {d.processingDays} 天出签 · 有效期 {d.validityMonths} 个月 · {item.qty} 人 · ¥{item.unitPrice}/人
+        </div>
+        {d.requiredDocs?.length > 0 && (
+          <div className="text-[10px] text-slate-400 mt-1">
+            需材料：{d.requiredDocs.join(' / ')}
+          </div>
+        )}
+      </div>
+    );
+  }
+  if (item.kind === 'HOTEL') {
+    const d = item.detail as {
+      hotelName: string;
+      roomTypeName: string;
+      bedType?: string;
+      starRating?: number;
+      area?: string;
+      checkIn: string;
+      checkOut: string;
+      nights: number;
+      rooms: number;
+      pricePerNight: number;
+      amenities?: string[];
+    };
+    return (
+      <div className="rounded-md bg-white/70 px-3 py-2 border border-purple-100">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-1 min-w-0">
+            <span className="text-xs">🏨</span>
+            <span className="font-semibold text-slate-900 text-sm truncate">{d.hotelName}</span>
+            {d.starRating && (
+              <span className="text-xs text-amber-500 flex-shrink-0">{'★'.repeat(d.starRating)}</span>
+            )}
+          </div>
+          <span className="text-sm font-bold text-red-600 flex-shrink-0 ml-2">
+            ¥{item.total.toLocaleString()}
+          </span>
+        </div>
+        <div className="text-xs text-slate-600 mt-1">
+          {d.roomTypeName}{d.bedType ? ` · ${d.bedType}` : ''}{d.area ? ` · ${d.area}` : ''}
+        </div>
+        <div className="text-xs text-slate-500 mt-0.5">
+          {d.checkIn} → {d.checkOut} · {d.nights} 晚 × {d.rooms} 间 · ¥{d.pricePerNight}/晚
+        </div>
+      </div>
+    );
+  }
+  if (item.kind === 'TRANSFER') {
+    const d = item.detail as {
+      vehicleType: string;
+      capacity: number;
+      originArea: string;
+      destArea: string;
+      duration?: string;
+      features?: string[];
+    };
+    return (
+      <div className="rounded-md bg-white/70 px-3 py-2 border border-purple-100">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-1 min-w-0">
+            <span className="text-xs">🚗</span>
+            <span className="font-semibold text-slate-900 text-sm truncate">{item.name}</span>
+          </div>
+          <span className="text-sm font-bold text-red-600 flex-shrink-0 ml-2">
+            ¥{item.total.toLocaleString()}
+          </span>
+        </div>
+        <div className="text-xs text-slate-600 mt-1">
+          {d.vehicleType} · 可乘 {d.capacity} 人 · {d.originArea} → {d.destArea}
+          {d.duration ? ` · ${d.duration}` : ''}
+        </div>
+        {d.features && d.features.length > 0 && (
+          <div className="text-[10px] text-slate-400 mt-0.5">
+            {d.features.slice(0, 3).join(' / ')}
+          </div>
+        )}
+      </div>
+    );
+  }
+  // BUNDLE
   const d = item.detail as {
-    country: string;
-    type: string;
-    processingDays: number;
-    validityMonths: number;
-    requiredDocs: string[];
-    express: boolean;
+    bundleName: string;
+    tagline?: string;
+    pax: number;
+    rooms: number;
+    components: Array<{ kind: string; productName?: string; qty: number }>;
+    groundDiscount: number;
+    note?: string;
   };
   return (
     <div className="rounded-md bg-white/70 px-3 py-2 border border-purple-100">
       <div className="flex items-center justify-between">
-        <div className="flex items-center gap-1">
-          <span className="text-xs">🛂</span>
-          <span className="font-semibold text-slate-900 text-sm">
-            {d.country} · {d.type}
-          </span>
-          {d.express && <span className="text-xs px-1.5 rounded bg-amber-100 text-amber-700">加急</span>}
+        <div className="flex items-center gap-1 min-w-0">
+          <span className="text-xs">🎁</span>
+          <span className="font-semibold text-slate-900 text-sm truncate">{d.bundleName}</span>
         </div>
-        <span className="text-sm font-bold text-red-600">¥{item.total.toLocaleString()}</span>
+        <span className="text-sm font-bold text-red-600 flex-shrink-0 ml-2">
+          ¥{item.total.toLocaleString()}
+        </span>
       </div>
-      <div className="text-xs text-slate-600 mt-1">
-        {d.processingDays} 天出签 · 有效期 {d.validityMonths} 个月 · {item.qty} 人 · ¥{item.unitPrice}/人
+      {d.tagline && <div className="text-xs text-slate-600 mt-1">{d.tagline}</div>}
+      <div className="text-xs text-slate-500 mt-0.5">
+        {d.pax} 人{d.rooms > 1 ? ` · ${d.rooms} 间房` : ''}
+        {d.groundDiscount > 0 && (
+          <span className="ml-1 text-emerald-600">已让利 ¥{d.groundDiscount}</span>
+        )}
       </div>
-      {d.requiredDocs?.length > 0 && (
+      {d.components && d.components.length > 0 && (
         <div className="text-[10px] text-slate-400 mt-1">
-          需材料：{d.requiredDocs.join(' / ')}
+          含：{d.components.map((c) => c.productName ?? c.kind).slice(0, 4).join(' / ')}
         </div>
       )}
+      {d.note && <div className="text-[10px] text-amber-600 mt-1 italic">⚠ {d.note}</div>}
     </div>
   );
 }

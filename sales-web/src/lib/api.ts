@@ -525,8 +525,10 @@ export const api = {
 // role: system | user | assistant | tool；content / tool_calls / tool_call_id 都可能有
 export type AiChatMessage = Record<string, unknown>;
 
+export type AiProposalItemKind = 'FLIGHT' | 'VISA' | 'HOTEL' | 'TRANSFER' | 'BUNDLE';
+
 export interface AiProposalItem {
-  kind: 'FLIGHT' | 'VISA';
+  kind: AiProposalItemKind;
   name: string;
   qty: number;
   unitPrice: number;

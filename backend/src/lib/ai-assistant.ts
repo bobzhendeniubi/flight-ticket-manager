@@ -19,26 +19,44 @@ import { CabinClass } from '@prisma/client';
 const MAX_TOOL_ITERATIONS = 8; // 防止 loop 失控
 
 // ── 系统提示词 ───────────────────────────────────────────────
-const SYSTEM_PROMPT = `你是「世途旅行」的客服 AI 助手，帮客户预订澳门 ⇌ 岘港的机票（顺带配签证）。
+const SYSTEM_PROMPT = `你是「世途旅行」的客服 AI 助手，帮客户预订澳门 ⇌ 岘港旅行的全套产品。
 
-# 你的工作流程
-1. 听用户说想要什么（日期 / 目的地 / 人数 / 舱位）
-2. 调 search_flights 找航班
-3. 用人话总结 2-3 个选项给用户（包括动态价 + 日期等级）
-4. 用户选了具体航班后：
-   - **主动询问需不需要配越南签证**（去越南必需，除非用户已有）
-   - 如果要 → 调 search_visas 查可选签证
-5. 调 propose_order 生成"订单草稿"（**优先用新的 items 数组方式**，可以同时含机票 + 签证）
-6. 让 UI 展示草稿卡片，提示用户点「确认下单」
+# 你能搜的 5 类产品（都通过 tool 调用，不要凭记忆）
+- ✈️ **机票** — search_flights / get_flight_price（只有 MFM ⇌ DAD 这条线）
+- 🛂 **签证** — search_visas（越南最常用；东南亚 7 国都有）
+- 🏨 **酒店** — search_hotels（岘港多家；返回各房型 ¥/晚）
+- 🚗 **接送** — search_transfers（机场接送 / 包车）
+- 🎁 **套餐** — search_bundles（一价全包：机票+酒店+接送+签证 + 让利）
 
-# propose_order 用法
-- 单买机票：items=[{kind:'FLIGHT', scheduleId, cabin, passengers}]
-- 机票 + 签证：items=[{kind:'FLIGHT',...}, {kind:'VISA', visaId, qty:N, express?:bool}]
-- VISA qty 一般 = 机票乘客数（每个人都要签证）
-- 暂不支持 HOTEL/TRANSFER/BUNDLE — 用户问就说"酒店/接送/套餐请去前台首页购买"
+# 工作流程
+1. 听用户说想要什么（日期 / 人数 / 是否含酒店签证接送 / 是否要套餐）
+2. 调对应的 search_* 工具找产品
+3. 用人话总结 2-3 个选项（不要把每个 ID 列出来；让用户挑）
+4. 用户选定后用 propose_order 生成"订单草稿"（items 数组混合多类产品）
+5. UI 展示卡片 → 用户点「确认下单」
+
+# propose_order items 用法（必看）
+- FLIGHT: { kind:'FLIGHT', scheduleId, cabin: 'ECONOMY'|'BUSINESS', passengers }
+- VISA: { kind:'VISA', visaId, qty (一般=机票乘客数), express?:bool }
+- HOTEL: { kind:'HOTEL', hotelRoomTypeId, checkIn:'YYYY-MM-DD', checkOut:'YYYY-MM-DD', rooms? (默认 1) }
+- TRANSFER: { kind:'TRANSFER', transferId, qty (车次/趟数) }
+- BUNDLE: { kind:'BUNDLE', bundleId, pax (人数), rooms? }
+
+混搭例：用户要"5 月 1 号 2 人去岘港 3 晚 + 越南签证 + 接机"
+items=[
+  {kind:'FLIGHT', scheduleId:'...', cabin:'ECONOMY', passengers:2},
+  {kind:'HOTEL', hotelRoomTypeId:'...', checkIn:'2026-05-01', checkOut:'2026-05-04', rooms:1},
+  {kind:'TRANSFER', transferId:'...', qty:1},
+  {kind:'VISA', visaId:'...', qty:2}
+]
+
+# 套餐 vs 自由组合
+- 用户犹豫不决或想"一价全包" → 推套餐（search_bundles → propose_order BUNDLE 单 item）
+- 用户已经知道要哪班机票/哪家酒店 → 自由组合
+- 套餐价是估算（最终下单按当日动态价重算）—— 主动告诉用户
 
 # 严格不能做的事
-- 绝对不能编造航班 / 价格 / 签证 / 旅客信息（必须从工具返回值读）
+- 绝对不能编造航班 / 价格 / 签证 / 酒店 / 旅客信息（必须从工具返回值读）
 - 绝对不能跳过用户确认就下单（你只能 propose_order，不能真创建订单）
 - 不能填假的护照号 / 出生日期；旅客信息用户自己填或 OCR 上传
 - 不能讨论政治、暴力、医疗等无关话题
@@ -113,15 +131,56 @@ const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
       name: 'search_visas',
       description:
         '搜索可办理的签证（用户去越南/东南亚需要签证时调）。返回签证列表，含办理时长、价格、加急选项。' +
-        'country 可省略（返回所有国家）；常见 countryCode：VN(越南) KH(柬埔寨) TH(泰国) SG(新加坡) LA(老挝) MY(马来) ID(印尼)',
+        'countryCode 可省略（返回所有国家）；常见：VN(越南) KH(柬埔寨) TH(泰国) SG(新加坡) LA(老挝) MY(马来) ID(印尼)',
       parameters: {
         type: 'object',
         properties: {
-          countryCode: {
+          countryCode: { type: 'string', description: '目的地国家 ISO 代码，例 VN；省略 = 所有国家' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'search_hotels',
+      description:
+        '搜索酒店（含每个酒店的多种房型）。用户问酒店或想要"机票+酒店"组合时调。返回酒店列表 + rooms 数组（每房型有 hotelRoomTypeId / 床型 / 容量 / ¥/晚）。',
+      parameters: {
+        type: 'object',
+        properties: {
+          cityCode: { type: 'string', description: '城市代码，例 DAD(岘港)；省略 = 所有城市' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'search_transfers',
+      description:
+        '搜索机场接送 / 包车服务。用户问"接机/包车/巴拿山一日游/会安专车"等都调这个。' +
+        '不传 query 返回全部 6 个产品（推荐：直接不传，让用户挑）。',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: {
             type: 'string',
-            description: '目的地国家 ISO 代码，例 VN；省略 = 所有国家',
+            description: '可选模糊关键词，跨 name/origin/dest 匹配（如 "机场" / "巴拿山" / "会安"）。不传 = 全部',
           },
         },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'search_bundles',
+      description:
+        '查全部"一价全包"套餐（机票+酒店+接送+签证打包）。用户问"套餐"或"打包优惠"时调。注意：套餐价是估算值，最终下单按当日动态价重算。',
+      parameters: {
+        type: 'object',
+        properties: {},
       },
     },
   },
@@ -133,31 +192,40 @@ const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
         '生成"订单草稿"（dry-run，不真扣库存、不真扣钱）。' +
         '调完返回订单摘要 → 前端会渲染一张确认卡片让用户点「确认下单」。' +
         '只有用户在卡片上点了确认，才会真正创建订单。\n\n' +
-        '支持多产品组合（机票 + 签证）：把 items 数组传进来。\n' +
+        '支持多产品组合：items 数组里混合 FLIGHT / VISA / HOTEL / TRANSFER / BUNDLE。\n' +
         '老的单航班调用方式（顶层 scheduleId/cabin/passengers）仍兼容。',
       parameters: {
         type: 'object',
         properties: {
-          // 新方式：items 数组，混合多种产品
           items: {
             type: 'array',
-            description: '订单包含的产品列表（混合机票 + 签证）',
+            description:
+              '订单产品列表。每个 item 必填字段不同：\n' +
+              '- FLIGHT: scheduleId, cabin, passengers\n' +
+              '- VISA: visaId, qty (一般=机票乘客数), express? (加急)\n' +
+              '- HOTEL: hotelRoomTypeId, checkIn (YYYY-MM-DD), checkOut, rooms? (默认1)\n' +
+              '- TRANSFER: transferId, qty (车次)\n' +
+              '- BUNDLE: bundleId, pax (人数), rooms? (默认1)',
             items: {
               type: 'object',
               properties: {
                 kind: {
                   type: 'string',
-                  enum: ['FLIGHT', 'VISA'],
-                  description: 'FLIGHT=机票, VISA=签证（HOTEL/TRANSFER/BUNDLE 暂不支持，请引导用户去前台单独下单）',
+                  enum: ['FLIGHT', 'VISA', 'HOTEL', 'TRANSFER', 'BUNDLE'],
                 },
-                // FLIGHT
-                scheduleId: { type: 'string', description: 'kind=FLIGHT 时必填，从 search_flights 拿' },
+                scheduleId: { type: 'string' },
                 cabin: { type: 'string', enum: ['ECONOMY', 'BUSINESS'] },
                 passengers: { type: 'integer', minimum: 1, maximum: 9 },
-                // VISA
-                visaId: { type: 'string', description: 'kind=VISA 时必填，从 search_visas 拿' },
-                qty: { type: 'integer', minimum: 1, maximum: 9, description: 'VISA 申请人数' },
-                express: { type: 'boolean', description: 'VISA 是否加急（贵但快）' },
+                visaId: { type: 'string' },
+                qty: { type: 'integer', minimum: 1, maximum: 20 },
+                express: { type: 'boolean' },
+                hotelRoomTypeId: { type: 'string' },
+                checkIn: { type: 'string', description: 'YYYY-MM-DD' },
+                checkOut: { type: 'string', description: 'YYYY-MM-DD' },
+                rooms: { type: 'integer', minimum: 1, maximum: 10 },
+                transferId: { type: 'string' },
+                bundleId: { type: 'string' },
+                pax: { type: 'integer', minimum: 1, maximum: 9 },
               },
               required: ['kind'],
             },
@@ -295,18 +363,127 @@ async function executeSearchVisas(input: Record<string, unknown>): Promise<ToolE
   }
 }
 
+async function executeSearchHotels(input: Record<string, unknown>): Promise<ToolExecutionResult> {
+  try {
+    const cityCode = input.cityCode as string | undefined;
+    const where: Record<string, unknown> = { isActive: true };
+    if (cityCode) where.cityCode = cityCode;
+    const hotels = await prisma.hotel.findMany({
+      where,
+      include: { roomTypes: true },
+      take: 15,
+    });
+    return {
+      ok: true,
+      data: {
+        count: hotels.length,
+        hotels: hotels.map((h) => ({
+          hotelId: h.id,
+          name: h.name,
+          cityCode: h.cityCode,
+          area: h.area,
+          starRating: h.starRating,
+          rating: h.rating ? Number(h.rating) : null,
+          highlight: h.highlight,
+          amenities: h.amenities,
+          rooms: h.roomTypes.map((rt) => ({
+            hotelRoomTypeId: rt.id,
+            name: rt.name,
+            bedType: rt.bedType,
+            capacity: rt.capacity,
+            basePrice: Number(rt.basePrice), // ¥/晚
+          })),
+        })),
+      },
+    };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : 'search_hotels failed' };
+  }
+}
+
+async function executeSearchTransfers(input: Record<string, unknown>): Promise<ToolExecutionResult> {
+  try {
+    const query = input.query as string | undefined;
+    const where: Record<string, unknown> = { isActive: true };
+    if (query) {
+      // 跨 name / originArea / destArea 模糊匹配（OR）
+      where.OR = [
+        { name: { contains: query, mode: 'insensitive' } },
+        { originArea: { contains: query, mode: 'insensitive' } },
+        { destArea: { contains: query, mode: 'insensitive' } },
+      ];
+    }
+    const transfers = await prisma.transfer.findMany({ where, take: 20 });
+    return {
+      ok: true,
+      data: {
+        count: transfers.length,
+        transfers: transfers.map((t) => ({
+          transferId: t.id,
+          name: t.name,
+          vehicleType: t.vehicleType,
+          capacity: t.capacity,
+          originArea: t.originArea,
+          destArea: t.destArea,
+          basePrice: Number(t.basePrice),
+          duration: t.duration,
+          features: t.features,
+        })),
+      },
+    };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : 'search_transfers failed' };
+  }
+}
+
+async function executeSearchBundles(): Promise<ToolExecutionResult> {
+  try {
+    const bundles = await prisma.bundle.findMany({ where: { isActive: true }, take: 20 });
+    return {
+      ok: true,
+      data: {
+        count: bundles.length,
+        bundles: bundles.map((b) => ({
+          bundleId: b.id,
+          name: b.name,
+          tagline: b.tagline,
+          flightPax: b.flightPax, // 套餐内含的机票人数（不含税前）
+          groundDiscount: Number(b.groundDiscount),
+          suitableFor: b.suitableFor,
+          // items 字段是 [{kind, productName, qty, unitPrice}] 的 JSON，给 AI 看大致组成
+          components: b.items,
+        })),
+      },
+    };
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : 'search_bundles failed' };
+  }
+}
+
 interface ProposalItemInput {
-  kind: 'FLIGHT' | 'VISA';
+  kind: 'FLIGHT' | 'VISA' | 'HOTEL' | 'TRANSFER' | 'BUNDLE';
+  // FLIGHT
   scheduleId?: string;
   cabin?: CabinClass;
   passengers?: number;
+  // VISA
   visaId?: string;
   qty?: number;
   express?: boolean;
+  // HOTEL
+  hotelRoomTypeId?: string;
+  checkIn?: string;
+  checkOut?: string;
+  rooms?: number;
+  // TRANSFER
+  transferId?: string;
+  // BUNDLE
+  bundleId?: string;
+  pax?: number;
 }
 
 interface ProposalItemOut {
-  kind: 'FLIGHT' | 'VISA';
+  kind: 'FLIGHT' | 'VISA' | 'HOTEL' | 'TRANSFER' | 'BUNDLE';
   name: string;
   qty: number;
   unitPrice: number;
@@ -417,6 +594,167 @@ async function priceVisaItem(item: ProposalItemInput): Promise<ProposalItemOut |
   };
 }
 
+async function priceHotelItem(item: ProposalItemInput): Promise<ProposalItemOut | { error: string }> {
+  if (!item.hotelRoomTypeId || !item.checkIn || !item.checkOut) {
+    return { error: 'HOTEL item 需要 hotelRoomTypeId / checkIn / checkOut（YYYY-MM-DD）' };
+  }
+  const rooms = item.rooms && item.rooms > 0 ? item.rooms : 1;
+  const ci = new Date(`${item.checkIn}T00:00:00Z`);
+  const co = new Date(`${item.checkOut}T00:00:00Z`);
+  const nights = Math.round((co.getTime() - ci.getTime()) / 86_400_000);
+  if (Number.isNaN(nights) || nights <= 0) {
+    return { error: 'checkOut 必须晚于 checkIn' };
+  }
+  const roomType = await prisma.hotelRoomType.findUnique({
+    where: { id: item.hotelRoomTypeId },
+    include: { hotel: true },
+  });
+  if (!roomType) return { error: `房型 ${item.hotelRoomTypeId} 不存在` };
+  const unitPrice = Number(roomType.basePrice); // ¥/晚/间
+  const total = unitPrice * nights * rooms;
+  const name = `${roomType.hotel.name} · ${roomType.name} × ${rooms} 间 × ${nights} 晚`;
+  return {
+    kind: 'HOTEL',
+    name,
+    qty: rooms * nights,
+    unitPrice,
+    total,
+    detail: {
+      hotelName: roomType.hotel.name,
+      roomTypeName: roomType.name,
+      bedType: roomType.bedType,
+      capacity: roomType.capacity,
+      starRating: roomType.hotel.starRating,
+      area: roomType.hotel.area,
+      checkIn: item.checkIn,
+      checkOut: item.checkOut,
+      nights,
+      rooms,
+      pricePerNight: unitPrice,
+      amenities: roomType.hotel.amenities,
+    },
+    cartItem: {
+      kind: 'HOTEL',
+      productId: roomType.id,
+      name,
+      emoji: '🏨',
+      unitPrice,
+      qty: nights * rooms, // 用 qty 表达"间夜数"，与 sales-web cart 习惯对齐
+      meta: {
+        hotelName: roomType.hotel.name,
+        roomTypeName: roomType.name,
+        checkIn: item.checkIn,
+        checkOut: item.checkOut,
+        nights,
+        rooms,
+      },
+    },
+  };
+}
+
+async function priceTransferItem(item: ProposalItemInput): Promise<ProposalItemOut | { error: string }> {
+  if (!item.transferId || !item.qty) {
+    return { error: 'TRANSFER item 需要 transferId / qty' };
+  }
+  const transfer = await prisma.transfer.findUnique({ where: { id: item.transferId } });
+  if (!transfer) return { error: `接送服务 ${item.transferId} 不存在` };
+  const unitPrice = Number(transfer.basePrice);
+  const total = unitPrice * item.qty;
+  const name = `${transfer.name} × ${item.qty}`;
+  return {
+    kind: 'TRANSFER',
+    name,
+    qty: item.qty,
+    unitPrice,
+    total,
+    detail: {
+      vehicleType: transfer.vehicleType,
+      capacity: transfer.capacity,
+      originArea: transfer.originArea,
+      destArea: transfer.destArea,
+      duration: transfer.duration,
+      features: transfer.features,
+    },
+    cartItem: {
+      kind: 'TRANSFER',
+      productId: transfer.id,
+      name,
+      emoji: transfer.emoji ?? '🚗',
+      unitPrice,
+      qty: item.qty,
+      meta: {
+        vehicleType: transfer.vehicleType,
+        capacity: transfer.capacity,
+      },
+    },
+  };
+}
+
+async function priceBundleItem(item: ProposalItemInput): Promise<ProposalItemOut | { error: string }> {
+  if (!item.bundleId) {
+    return { error: 'BUNDLE item 需要 bundleId' };
+  }
+  const pax = item.pax && item.pax > 0 ? item.pax : 1;
+  const rooms = item.rooms && item.rooms > 0 ? item.rooms : 1;
+  const bundle = await prisma.bundle.findUnique({ where: { id: item.bundleId } });
+  if (!bundle) return { error: `套餐 ${item.bundleId} 不存在` };
+
+  // 套餐定价：照搬 BundlesPage 的简化模型 — 地面组件用 unitPrice * qty，按 pax/rooms 缩放，
+  // 减去 groundDiscount 拿地面价；再加上 ¥1480 × pax 估算机票（避免再调 pricing service）
+  // 注意：真下单时 createOrder 会重新算价，这里只是给 AI 一个 quote 让用户决定
+  type BundleComponent = { kind: string; qty: number; unitPrice: number; productName?: string };
+  const components = (bundle.items as unknown as BundleComponent[]) ?? [];
+  let groundTotal = 0;
+  const ITEMS_PER_PAX = new Set(['VISA']); // 按人数缩放
+  const ITEMS_PER_ROOM = new Set(['HOTEL']); // 按房间数缩放
+  for (const c of components) {
+    if (c.kind === 'FLIGHT') continue; // 机票单独算
+    const scale =
+      ITEMS_PER_PAX.has(c.kind) ? pax :
+      ITEMS_PER_ROOM.has(c.kind) ? rooms :
+      1;
+    groundTotal += c.unitPrice * c.qty * scale;
+  }
+  const flightEstimate = 1480 * pax * 2; // 来回 × pax，估算占位
+  const grossTotal = groundTotal + flightEstimate;
+  const discount = Number(bundle.groundDiscount);
+  const total = Math.max(0, grossTotal - discount);
+  const unitPrice = Math.round(total / pax);
+  const name = `${bundle.name} · ${pax} 人${rooms !== 1 ? ` · ${rooms} 间` : ''}`;
+
+  return {
+    kind: 'BUNDLE',
+    name,
+    qty: pax,
+    unitPrice,
+    total,
+    detail: {
+      bundleName: bundle.name,
+      tagline: bundle.tagline,
+      pax,
+      rooms,
+      components: components.map((c) => ({
+        kind: c.kind,
+        productName: c.productName,
+        qty: c.qty,
+      })),
+      groundDiscount: discount,
+      flightEstimate,
+      groundTotal,
+      note: '套餐价含来回机票估算 + 地面组件（让利后）。真下单时按当日动态价重算。',
+    },
+    cartItem: {
+      kind: 'BUNDLE',
+      productId: bundle.id,
+      name,
+      emoji: bundle.emoji ?? '🎁',
+      unitPrice: total, // BUNDLE 用 unitPrice=total + qty=1（与 sales-web BundleCard 习惯对齐）
+      qty: 1,
+      meta: { pax, rooms, groundDiscount: discount },
+    },
+  };
+}
+
 async function executeProposeOrder(input: Record<string, unknown>): Promise<ToolExecutionResult> {
   try {
     // 兼容老调用：顶层 scheduleId/cabin/passengers → 转成 single FLIGHT item
@@ -439,10 +777,14 @@ async function executeProposeOrder(input: Record<string, unknown>): Promise<Tool
     const priced: ProposalItemOut[] = [];
     for (const it of items) {
       let result: ProposalItemOut | { error: string };
-      if (it.kind === 'FLIGHT') result = await priceFlightItem(it);
-      else if (it.kind === 'VISA') result = await priceVisaItem(it);
-      else {
-        return { ok: false, error: `暂不支持的 item kind: ${it.kind}（HOTEL/TRANSFER/BUNDLE 请引导用户在前台单独下单）` };
+      switch (it.kind) {
+        case 'FLIGHT':   result = await priceFlightItem(it); break;
+        case 'VISA':     result = await priceVisaItem(it); break;
+        case 'HOTEL':    result = await priceHotelItem(it); break;
+        case 'TRANSFER': result = await priceTransferItem(it); break;
+        case 'BUNDLE':   result = await priceBundleItem(it); break;
+        default:
+          return { ok: false, error: `Unknown item kind: ${(it as ProposalItemInput).kind}` };
       }
       if ('error' in result) return { ok: false, error: result.error };
       priced.push(result);
@@ -450,13 +792,20 @@ async function executeProposeOrder(input: Record<string, unknown>): Promise<Tool
 
     const totalPrice = priced.reduce((s, p) => s + p.total, 0);
 
+    const KIND_EMOJI: Record<string, string> = {
+      FLIGHT: '✈️',
+      VISA: '🛂',
+      HOTEL: '🏨',
+      TRANSFER: '🚗',
+      BUNDLE: '🎁',
+    };
     const proposal = {
       kind: 'PROPOSAL' as const,
       items: priced,
       totalPrice,
       summary:
         priced
-          .map((p) => `${p.kind === 'FLIGHT' ? '✈️' : '🛂'} ${p.name}`)
+          .map((p) => `${KIND_EMOJI[p.kind] ?? ''} ${p.name}`)
           .join(' + ') + ` = ¥${totalPrice}`,
       cartItems: priced.map((p) => p.cartItem),
       note: '此为草稿（dry-run），未扣库存未扣款。前端会展示确认卡，用户点「确认下单」才真正提交。',
@@ -475,6 +824,12 @@ async function executeTool(name: string, input: Record<string, unknown>): Promis
       return executeGetFlightPrice(input);
     case 'search_visas':
       return executeSearchVisas(input);
+    case 'search_hotels':
+      return executeSearchHotels(input);
+    case 'search_transfers':
+      return executeSearchTransfers(input);
+    case 'search_bundles':
+      return executeSearchBundles();
     case 'propose_order':
       return executeProposeOrder(input);
     default:
