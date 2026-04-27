@@ -1,0 +1,27 @@
+# Test-only postgres，端口与 dev 不冲突
+#
+# 启动: docker compose -f docker-compose.test.yml up -d
+# 停止: docker compose -f docker-compose.test.yml down -v   (含 -v 清数据)
+#
+# 然后跑测试:
+#   cd backend
+#   npm run test:integration
+services:
+  postgres-test:
+    image: postgres:16-alpine
+    container_name: ftm-postgres-test
+    restart: 'no'
+    environment:
+      POSTGRES_USER: ftm_test
+      POSTGRES_PASSWORD: ftm_test
+      POSTGRES_DB: ftm_test
+    ports:
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ftm_test -d ftm_test"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+    tmpfs:
+      # 数据放 tmpfs（内存）— 测试快 + 不留垃圾
+      - /var/lib/postgresql/data
