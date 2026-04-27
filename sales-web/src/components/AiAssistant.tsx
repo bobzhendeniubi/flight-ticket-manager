@@ -80,15 +80,33 @@ export function AiAssistant() {
       setOcrProgress(null);
 
       if (!result.success || !result.suggested.passportNumber) {
+        // 把原始 OCR 文字 dump 出来 — 既能让用户看出哪里识错，也方便我们调正则
+        const rawSnippet = (result.rawText || '')
+          .split(/\r?\n/)
+          .map((l) => l.trim())
+          .filter((l) => l.length > 0)
+          .slice(0, 12)
+          .join('\n');
+        const partial: string[] = [];
+        if (result.fallback?.englishName) partial.push(`姓名（候选）: ${result.fallback.englishName}`);
+        if (result.fallback?.chineseName) partial.push(`中文名（候选）: ${result.fallback.chineseName}`);
+        if (result.fallback?.passportNumber) partial.push(`护照号（候选）: ${result.fallback.passportNumber}`);
+        if (result.fallback?.dateOfBirth) partial.push(`出生日期（候选）: ${result.fallback.dateOfBirth}`);
+
         setMessages((prev) => [
           ...prev,
           {
             role: 'assistant',
             text:
-              `**OCR 识别失败 😅**\n\n` +
-              `中文护照在浏览器端 tesseract.js 准确率约 60-75%，可能因为：\n` +
-              `- 拍照反光/倾斜\n- 字迹被压痕遮挡\n- 不是标准 ICAO 9303 格式\n\n` +
-              `**麻烦你结账时手动填一下姓名/护照号/出生日期。**`,
+              `**OCR 没完全识别成功 😅**（置信度 ${Math.round(result.confidence)}%，耗时 ${(result.elapsedMs / 1000).toFixed(1)}s）\n\n` +
+              (partial.length > 0
+                ? `**部分字段拿到了：**\n${partial.map((p) => `- ${p}`).join('\n')}\n\n但护照号没匹配上正则，需要手填。\n\n`
+                : `没匹配到护照号 / 姓名。\n\n`) +
+              `常见原因：拍照反光、倾斜、低分辨率、字体被压痕遮挡。\n\n` +
+              (rawSnippet
+                ? `**OCR 原始文字（前 12 行，调试用）：**\n\`\`\`\n${rawSnippet}\n\`\`\`\n\n`
+                : '') +
+              `**麻烦你结账时手填一下姓名/护照号/出生日期。**`,
           },
         ]);
         return;
@@ -351,16 +369,33 @@ export function AiAssistant() {
           {messages.length > 1 &&
             messages[messages.length - 1].role === 'assistant' &&
             !loading &&
-            !ocrProgress && (
+            !ocrProgress && (() => {
+              // 看最近这条助手消息有没有 proposal — 有就把"OK"按钮变成「直接下单」
+              const lastMsg = messages[messages.length - 1];
+              const lastProposal = lastMsg.proposals?.[0];
+              return (
             <div className="px-3 py-2 border-t border-slate-100 bg-slate-50/60">
               {actionMenu === null && (
                 <div className="flex flex-wrap gap-1.5">
                   <button
                     type="button"
-                    onClick={() => quickAction('好的，给我详细信息（出发到达时间、行李、退改条款都给我说一下）')}
-                    className="flex-1 min-w-[80px] text-xs rounded-md border border-emerald-300 bg-emerald-50 px-2 py-1.5 text-emerald-800 hover:bg-emerald-100"
+                    onClick={() => {
+                      if (lastProposal) {
+                        // 已有订单草稿 → 直接确认下单（与卡片紫色按钮等效）
+                        setActionMenu(null);
+                        handleConfirmProposal(lastProposal);
+                      } else {
+                        // 没草稿 → 让 AI 给详情
+                        quickAction('好的，给我详细信息（出发到达时间、行李、退改条款都给我说一下）');
+                      }
+                    }}
+                    className={`flex-1 min-w-[80px] text-xs rounded-md border px-2 py-1.5 ${
+                      lastProposal
+                        ? 'border-emerald-500 bg-emerald-600 text-white hover:bg-emerald-700'
+                        : 'border-emerald-300 bg-emerald-50 text-emerald-800 hover:bg-emerald-100'
+                    }`}
                   >
-                    👌 OK · 看详情
+                    {lastProposal ? '✅ 确认下单' : '👌 OK · 看详情'}
                   </button>
                   <button
                     type="button"
@@ -419,7 +454,8 @@ export function AiAssistant() {
                 </div>
               )}
             </div>
-          )}
+              );
+            })()}
 
           {/* OCR 进度条（OCR 中显示）*/}
           {ocrProgress && (
