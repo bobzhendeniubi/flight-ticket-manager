@@ -84,12 +84,15 @@ export function CheckoutPage() {
     [],
   );
 
-  // 需要出行人的总人数 = 机票张数（取 meta.passengers，因 FLIGHT 购物车 qty=1 是技巧）
+  // 需要出行人的总人数 = 一次行程的最多人数
+  // 关键：往返机票会有 2 个 FLIGHT items（去程 + 回程），都是同一批人 ——
+  // 所以取 MAX 不取 SUM，否则 2 人往返会要求 4 本护照
   const flightTicketCount = useMemo(
-    () =>
-      items
-        .filter((i) => i.kind === 'FLIGHT')
-        .reduce((sum, i) => sum + (Number(i.meta?.passengers) || i.qty), 0),
+    () => {
+      const flights = items.filter((i) => i.kind === 'FLIGHT');
+      if (flights.length === 0) return 0;
+      return Math.max(...flights.map((i) => Number(i.meta?.passengers) || i.qty));
+    },
     [items],
   );
   const bundlePaxCount = items

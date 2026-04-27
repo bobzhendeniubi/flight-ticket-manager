@@ -53,6 +53,8 @@ export function AiAssistant() {
   const user = useAuth((s) => s.user);
   const addPassenger = usePassengers((s) => s.add);
   const hydratePassengers = usePassengers((s) => s.hydrate);
+  // 已经 OCR'd 但还没下单的护照队列（subscribed → 上传一本就重渲染面板进度条）
+  const pendingPassengers = usePassengers((s) => s.pending);
 
   useEffect(() => {
     hydratePassengers();
@@ -207,6 +209,11 @@ export function AiAssistant() {
     }
   };
 
+  // 已加购但还没传完护照 — 一旦设置就在聊天里显示一个醒目的"上传护照"面板
+  const [pendingPassportPrompt, setPendingPassportPrompt] = useState<{
+    needed: number; // 需要 N 本护照
+  } | null>(null);
+
   const handleConfirmProposal = (p: AiProposal) => {
     if (!user) {
       navigate('/login?redirect=/');
@@ -225,17 +232,44 @@ export function AiAssistant() {
         meta: ci.meta as Record<string, string | number | boolean> | undefined,
       });
     }
+
+    // 算一下需要几本护照：取 FLIGHT items 里 passengers 的最大值，往返同一批人
+    const flightItems = cartItems.filter((ci) => ci.kind === 'FLIGHT');
+    const flightPax = flightItems.length > 0
+      ? Math.max(...flightItems.map((ci) => {
+          const m = ci.meta as Record<string, unknown> | undefined;
+          return Number(m?.passengers) || ci.qty;
+        }))
+      : 0;
+    const bundleItems = cartItems.filter((ci) => ci.kind === 'BUNDLE');
+    const bundlePax = bundleItems.length > 0
+      ? Math.max(...bundleItems.map((ci) => {
+          const m = ci.meta as Record<string, unknown> | undefined;
+          return Number(m?.pax) || 0;
+        }))
+      : 0;
+    const needPassports = Math.max(flightPax, bundlePax);
+
     setMessages((prev) => [
       ...prev,
       {
         role: 'assistant',
-        text: `✓ **已加入购物车 ${cartItems.length} 项**\n\n下一步：填乘客信息 → 提交订单 → 支付。马上跳到结账页…`,
+        text: needPassports > 0
+          ? `✓ **已加入购物车 ${cartItems.length} 项**\n\n下一步：上传 **${needPassports} 位** 出行人的护照（每张机票一个人，照片就行，OCR 自动填表）。\n\n下面那个红色 📷 按钮上传，传完点"去结账"。`
+          : `✓ **已加入购物车 ${cartItems.length} 项**\n\n下一步：去结账 → 支付。`,
       },
     ]);
-    setTimeout(() => {
-      setOpen(false);
-      navigate('/cart');
-    }, 800);
+
+    if (needPassports > 0) {
+      // 触发醒目的"上传护照"面板
+      setPendingPassportPrompt({ needed: needPassports });
+    } else {
+      // 没机票（纯酒店/接送/签证）— 直接跳结账
+      setTimeout(() => {
+        setOpen(false);
+        navigate('/cart');
+      }, 800);
+    }
   };
 
   // 快捷动作下拉的展开状态：null = 全收起，'add' = 加产品菜单展开，'modify' = 修改菜单展开
@@ -486,6 +520,57 @@ export function AiAssistant() {
               </div>
             </div>
           )}
+
+          {/* 已加购后醒目的"上传 N 本护照"面板 — 加购后只显示这个，覆盖快捷动作 */}
+          {pendingPassportPrompt && !ocrProgress && (() => {
+            const uploaded = pendingPassengers.length;
+            const need = pendingPassportPrompt.needed;
+            const done = uploaded >= need;
+            return (
+              <div className="px-3 py-2 border-t-2 border-rose-400 bg-rose-50">
+                <div className="flex items-center justify-between mb-1.5">
+                  <div className="text-xs font-semibold text-rose-900">
+                    {done ? '✅ 护照已齐' : `📷 还需 ${need - uploaded} 本护照`}
+                  </div>
+                  <div className="text-xs text-rose-700">
+                    已上传 <strong>{uploaded}</strong> / {need}
+                  </div>
+                </div>
+                <div className="h-1.5 bg-rose-100 rounded mb-2">
+                  <div
+                    className="h-full bg-rose-500 rounded transition-all"
+                    style={{ width: `${Math.min(100, (uploaded / need) * 100)}%` }}
+                  />
+                </div>
+                <div className="flex gap-1.5">
+                  {!done && (
+                    <button
+                      type="button"
+                      onClick={() => fileRef.current?.click()}
+                      className="flex-1 rounded-md bg-rose-600 px-3 py-2 text-sm font-semibold text-white hover:bg-rose-700"
+                    >
+                      📷 上传第 {uploaded + 1} 本护照
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setPendingPassportPrompt(null);
+                      setOpen(false);
+                      navigate('/cart');
+                    }}
+                    className={`rounded-md px-3 py-2 text-sm ${
+                      done
+                        ? 'flex-1 bg-emerald-600 font-semibold text-white hover:bg-emerald-700'
+                        : 'border border-slate-300 bg-white text-slate-600 hover:bg-slate-50'
+                    }`}
+                  >
+                    {done ? '✓ 去结账' : '稍后填'}
+                  </button>
+                </div>
+              </div>
+            );
+          })()}
 
           {/* Input */}
           <form
