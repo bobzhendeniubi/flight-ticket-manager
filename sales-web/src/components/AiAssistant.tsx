@@ -127,6 +127,17 @@ export function AiAssistant() {
         `- 姓名: ${ocr.fullName}\n- 护照号: ${ocr.passportNumber}\n` +
         `- 出生日期: ${ocr.dateOfBirth ?? '?'}\n- 国籍: ${ocr.nationality ?? '?'}\n\n` +
         `请友好地确认你看到了，告诉用户在结账页这些字段会自动填好。不要追问。`;
+      // 部分字段缺失时（DOB/国籍）— dump raw OCR 让用户能看 tesseract 实际抓到啥
+      const hasMissingField = !ocr.dateOfBirth || !ocr.nationality;
+      const debugSnippet = hasMissingField
+        ? (result.rawText || '')
+            .split(/\r?\n/)
+            .map((l) => l.trim())
+            .filter((l) => l.length > 0)
+            .slice(0, 15)
+            .join('\n')
+        : '';
+
       // 直接走 send 让 AI 知道；再展示 OCR 结果给用户看
       setMessages((prev) => [
         ...prev,
@@ -138,6 +149,9 @@ export function AiAssistant() {
             `- **护照号**：\`${ocr.passportNumber}\`\n` +
             `- **出生日期**：${ocr.dateOfBirth ?? '（未识别，结账时手填）'}\n` +
             `- **国籍**：${ocr.nationality ?? '（未识别）'}\n\n` +
+            (debugSnippet
+              ? `📋 **OCR 抓到的前 15 行**（部分字段没识别上时给你看）：\n\`\`\`\n${debugSnippet}\n\`\`\`\n\n`
+              : '') +
             `已暂存。下单时这些字段会自动填进结账页。`,
         },
       ]);

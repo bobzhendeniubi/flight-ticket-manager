@@ -33,6 +33,8 @@ export interface OcrResult {
     chineseName?: string;
     englishName?: string;
     dateOfBirth?: string;
+    /** ISO-2 国家码（CN/HK/MO/US/...）从 OCR 文本里抓 */
+    nationality?: string;
   };
   /** 整体置信度 0-100 */
   confidence: number;
@@ -97,7 +99,8 @@ export async function ocrPassport(
           fullName: fallback.englishName || fallback.chineseName,
           passportNumber: fallback.passportNumber,
           dateOfBirth: fallback.dateOfBirth,
-          nationality: 'MO', // 默认澳门（业务场景）
+          // 优先：OCR 文本里抓到的国籍；fallback 默认澳门（业务最常见）
+          nationality: fallback.nationality ?? 'MO',
         };
 
     onProgress?.(100, '完成');
@@ -236,6 +239,26 @@ function extractFallback(text: string): NonNullable<OcrResult['fallback']> {
     .replace(/(?<=\d)[OQ]/g, '0')
     .replace(/[Il](?=\d)/g, '1');
 
+  // 国籍：从 OCR 文本抓 ISO-3 国家码或常见英文/中文名
+  // 顺序按"业务最可能"排（中国 > 港澳台 > 越南 > 美/英/日/韩）
+  const nationalityPatterns: Array<[RegExp, string]> = [
+    [/\bCHN\b|\bCHINESE\b|中华人民共和国|中国/i, 'CN'],
+    [/\bHKG\b|香港/i, 'HK'],
+    [/\bMAC\b|澳门/i, 'MO'],
+    [/\bTWN\b|台湾/i, 'TW'],
+    [/\bVNM\b|VIETNAM/i, 'VN'],
+    [/\bUSA\b|UNITED\s+STATES/i, 'US'],
+    [/\bGBR\b|UNITED\s+KINGDOM/i, 'GB'],
+    [/\bJPN\b|JAPAN/i, 'JP'],
+    [/\bKOR\b|KOREA/i, 'KR'],
+  ];
+  for (const [pattern, iso2] of nationalityPatterns) {
+    if (pattern.test(text)) {
+      result.nationality = iso2;
+      break;
+    }
+  }
+
   // 关键改进：tesseract 经常把 "EE1412098" 识成 "EE 141 20 98"（OCR-B 字间距大被识成空格）
   // 策略：把所有 "[A-Z]{1,2} 后接零散数字段" 的组合在原文里压成连续串再匹配
   // 例如 "EE 141 20 98" → "EE1412098"
@@ -333,20 +356,44 @@ function extractFallback(text: string): NonNullable<OcrResult['fallback']> {
   }
 
   // 出生日期 多种格式
-  // YYYY-MM-DD / YYYY/MM/DD / YYYY年MM月DD日
-  let dobMatch = text.match(/(19\d{2}|20[01]\d)[-\s/年](\d{1,2})[-\s/月](\d{1,2})/);
+  const monthMap: Record<string, string> = {
+    JAN: '01', FEB: '02', MAR: '03', APR: '04', MAY: '05', JUN: '06',
+    JUL: '07', AUG: '08', SEP: '09', OCT: '10', NOV: '11', DEC: '12',
+  };
+
+  // 1. YYYY-MM-DD / YYYY/MM/DD / YYYY年MM月DD日
+  let dobMatch: RegExpMatchArray | null = text.match(/(19\d{2}|20[01]\d)[-\s/年](\d{1,2})[-\s/月](\d{1,2})/);
   if (dobMatch) {
     result.dateOfBirth = `${dobMatch[1]}-${dobMatch[2].padStart(2, '0')}-${dobMatch[3].padStart(2, '0')}`;
-  } else {
-    // DD MMM YYYY (e.g., "15 JAN 1990") — 国际护照常见
-    const monthMap: Record<string, string> = {
-      JAN: '01', FEB: '02', MAR: '03', APR: '04', MAY: '05', JUN: '06',
-      JUL: '07', AUG: '08', SEP: '09', OCT: '10', NOV: '11', DEC: '12',
-    };
-    dobMatch = text.match(/\b(\d{1,2})[\s-]+(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[\s-]+(19\d{2}|20[01]\d)\b/i);
+  }
+
+  // 2. DD MMM YYYY (e.g., "15 JAN 1990") — 国际护照常见
+  if (!result.dateOfBirth) {
+    dobMatch = text.match(/\b(\d{1,2})[\s\-_·]+(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[\s\-_·]+(19\d{2}|20[01]\d)\b/i);
     if (dobMatch) {
       const mm = monthMap[dobMatch[2].toUpperCase()];
       result.dateOfBirth = `${dobMatch[3]}-${mm}-${dobMatch[1].padStart(2, '0')}`;
+    }
+  }
+
+  // 3. 中国护照格式 "DD M月/MMM YYYY"（如 "19 8月/AUG 2018"）
+  if (!result.dateOfBirth) {
+    dobMatch = text.match(/\b(\d{1,2})[\s\-_·]+\d{1,2}\s*月\s*\/?\s*(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[\s\-_·]+(19\d{2}|20[01]\d)\b/i);
+    if (dobMatch) {
+      const mm = monthMap[dobMatch[2].toUpperCase()];
+      result.dateOfBirth = `${dobMatch[3]}-${mm}-${dobMatch[1].padStart(2, '0')}`;
+    }
+  }
+
+  // 4. 容噪版：OCR 把 JAN/FEB 等识错（如 ;AN, F8, FAN），但前后是 "数字 ... 年份" 格式
+  // 退而求其次：找 "DD ... YYYY" 模式 + 月份关键词被 OCR 弄花了
+  // 这种容易误匹配，只取 1 次（first match）
+  if (!result.dateOfBirth) {
+    dobMatch = text.match(/\b(\d{1,2})[\s\S]{1,12}?(19\d{2}|20[01]\d)\b/);
+    // 但要求中间至少出现一个像月份的字母组合（不然纯数字会瞎抓）
+    if (dobMatch && /(?:[A-Z]{2,3}|月)/i.test(dobMatch[0])) {
+      // 没法可靠拿到月份，跳过 — 更保险让用户手填
+      // 这一档其实是 "可能是日期" 警告，不强写入
     }
   }
 

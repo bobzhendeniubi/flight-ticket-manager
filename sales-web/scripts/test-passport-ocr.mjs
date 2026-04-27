@@ -153,15 +153,41 @@ function extractFallback(text) {
     }
   }
 
-  let dobMatch = text.match(/(19\d{2}|20[01]\d)[-\s/](\d{1,2})[-\s/](\d{1,2})/);
+  // 国籍 fallback
+  const nationalityPatterns = [
+    [/\bCHN\b|\bCHINESE\b|中华人民共和国|中国/i, 'CN'],
+    [/\bHKG\b|香港/i, 'HK'],
+    [/\bMAC\b|澳门/i, 'MO'],
+    [/\bTWN\b|台湾/i, 'TW'],
+    [/\bVNM\b|VIETNAM/i, 'VN'],
+    [/\bUSA\b|UNITED\s+STATES/i, 'US'],
+    [/\bGBR\b|UNITED\s+KINGDOM/i, 'GB'],
+    [/\bJPN\b|JAPAN/i, 'JP'],
+    [/\bKOR\b|KOREA/i, 'KR'],
+  ];
+  for (const [pattern, iso2] of nationalityPatterns) {
+    if (pattern.test(text)) { result.nationality = iso2; break; }
+  }
+
+  const monthMap = {
+    JAN: '01', FEB: '02', MAR: '03', APR: '04', MAY: '05', JUN: '06',
+    JUL: '07', AUG: '08', SEP: '09', OCT: '10', NOV: '11', DEC: '12',
+  };
+
+  let dobMatch = text.match(/(19\d{2}|20[01]\d)[-\s/年](\d{1,2})[-\s/月](\d{1,2})/);
   if (dobMatch) {
     result.dateOfBirth = `${dobMatch[1]}-${dobMatch[2].padStart(2, '0')}-${dobMatch[3].padStart(2, '0')}`;
-  } else {
-    const monthMap = {
-      JAN: '01', FEB: '02', MAR: '03', APR: '04', MAY: '05', JUN: '06',
-      JUL: '07', AUG: '08', SEP: '09', OCT: '10', NOV: '11', DEC: '12',
-    };
-    dobMatch = text.match(/\b(\d{1,2})[\s-]+(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[\s-]+(19\d{2}|20[01]\d)\b/i);
+  }
+  if (!result.dateOfBirth) {
+    dobMatch = text.match(/\b(\d{1,2})[\s\-_·]+(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[\s\-_·]+(19\d{2}|20[01]\d)\b/i);
+    if (dobMatch) {
+      const mm = monthMap[dobMatch[2].toUpperCase()];
+      result.dateOfBirth = `${dobMatch[3]}-${mm}-${dobMatch[1].padStart(2, '0')}`;
+    }
+  }
+  // 中国护照混合格式 "19 8月/AUG 2018"
+  if (!result.dateOfBirth) {
+    dobMatch = text.match(/\b(\d{1,2})[\s\-_·]+\d{1,2}\s*月\s*\/?\s*(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[\s\-_·]+(19\d{2}|20[01]\d)\b/i);
     if (dobMatch) {
       const mm = monthMap[dobMatch[2].toUpperCase()];
       result.dateOfBirth = `${dobMatch[3]}-${mm}-${dobMatch[1].padStart(2, '0')}`;
@@ -286,11 +312,37 @@ const cases = [
       'TE EE\n' +
       '; LIU, CHAO AN 0\n',
     expectFallback: {
-      passportNumber: 'EE1412098', // "EE 141 20 98" 被锚点附近去空格后匹配
-      englishName: 'LIU CHAO',     // 逗号格式优先 → "LIU, CHAO" 击败 "FATA TT"
-      // chineseName 期望 "刘"——但 OCR 把"刘"和"超"拆到不同位置/被噪点污染
-      // 我们能拿到 "刘" 单字（虽然 1 字不被 {2,4} 抓），实际可能拿到 "公安部" 或别的
-      // 暂不强制断言 chineseName（OCR 文本里"刘超"被分行，超 OCR 误识为 48）
+      passportNumber: 'EE1412098',
+      englishName: 'LIU CHAO',
+      nationality: 'CN', // OCR 抓到 "P CHN" → 国籍应是 CN，不是默认 MO
+    },
+  },
+  {
+    // 真实用户的护照（如果 OCR 拍到 DOB 行）
+    name: '中国护照中英混合日期 "19 8月/AUG 1991"',
+    text:
+      '中华人民共和国 PASSPORT\n' +
+      '出生日期 Date of birth: 19 1月/JAN 1991\n' +
+      '签发日期 Date of issue: 20 8月/AUG 2018\n' +
+      'P CHN E12345678\n',
+    expectFallback: {
+      passportNumber: 'E12345678',
+      nationality: 'CN',
+      dateOfBirth: '1991-01-19', // "19 1月/JAN 1991" 应该被新规则抓出来
+    },
+  },
+  {
+    // 同样的护照内容但 OCR 没识别到中文"月"标志，只剩 "19 JAN 1991"
+    name: '出生日期标准 "19 JAN 1991"',
+    text:
+      'PEOPLE REPUBLIC OF CHINA\n' +
+      'Date of birth: 19 JAN 1991\n' +
+      'Passport: E12345678\n' +
+      'CHINESE\n',
+    expectFallback: {
+      passportNumber: 'E12345678',
+      nationality: 'CN',
+      dateOfBirth: '1991-01-19',
     },
   },
 ];
