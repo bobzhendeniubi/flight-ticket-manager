@@ -61,9 +61,19 @@ items=[
 ]
 
 # 套餐 vs 自由组合
-- 用户犹豫不决或想"一价全包" → 推套餐（search_bundles → propose_order BUNDLE 单 item）
+- 用户犹豫不决或想"一价全包" → 推套餐
 - 用户已经知道要哪班机票/哪家酒店 → 自由组合
 - 套餐价是估算（最终下单按当日动态价重算）—— 主动告诉用户
+
+# 【重要】BUNDLE 定价规则（避免漏付）
+- BUNDLE 单 item **只含地面服务**（酒店/接送/签证）的让利价，**不含机票**
+- 推 BUNDLE 时 propose_order 必须同时加 **2 个 FLIGHT items**（去程 + 回程）才算完整
+- 例：用户要"5/1-5/4 2 人岘港全包套餐"，items 应该是：
+  · BUNDLE { bundleId, pax: 2, rooms: 1 }
+  · FLIGHT { scheduleId: 去程, cabin: 'ECONOMY', passengers: 2 }
+  · FLIGHT { scheduleId: 回程, cabin: 'ECONOMY', passengers: 2 }
+- 客户最终付款 = BUNDLE 地面价 + 2×FLIGHT 动态价
+- detail.grossTotalEstimate 是含机票估算的"全包价感觉"仅供口头展示
 
 # 严格不能做的事
 - 绝对不能编造航班 / 价格 / 签证 / 酒店 / 旅客信息（必须从工具返回值读）
@@ -729,19 +739,22 @@ async function priceBundleItem(item: ProposalItemInput): Promise<ProposalItemOut
       1;
     groundTotal += c.unitPrice * c.qty * scale;
   }
-  const flightEstimate = 1480 * pax * 2; // 来回 × pax，估算占位
-  const grossTotal = groundTotal + flightEstimate;
+  const flightEstimate = 1480 * pax * 2; // 来回 × pax，估算占位（仅展示用）
   const discount = Number(bundle.groundDiscount);
-  const total = Math.max(0, grossTotal - discount);
-  const unitPrice = Math.round(total / pax);
-  const name = `${bundle.name} · ${pax} 人${rooms !== 1 ? ` · ${rooms} 间` : ''}`;
+  // CRITICAL: cartItem.unitPrice 必须与 backend createOrder 重算的 BUNDLE 价一致
+  // backend BUNDLE = ground - discount（飞机另算成 FLIGHT items）。
+  // 之前 bug：cartItem.unitPrice 含 flightEstimate → 客户少付 ¥flightEstimate（Codex P1 review）
+  // 修复：cartItem 只算 ground 部分；客户想含飞机要 AI 额外加 2 个 FLIGHT items
+  const bundleGroundPrice = Math.max(0, Math.round(groundTotal - discount));
+  const grossTotalEstimate = bundleGroundPrice + flightEstimate;
+  const name = `${bundle.name} 地面服务 · ${pax} 人${rooms !== 1 ? ` · ${rooms} 间` : ''}`;
 
   return {
     kind: 'BUNDLE',
     name,
     qty: pax,
-    unitPrice,
-    total,
+    unitPrice: Math.round(bundleGroundPrice / pax),
+    total: bundleGroundPrice, // 与实际入车的钱一致（不含机票）
     detail: {
       bundleName: bundle.name,
       tagline: bundle.tagline,
@@ -755,14 +768,15 @@ async function priceBundleItem(item: ProposalItemInput): Promise<ProposalItemOut
       groundDiscount: discount,
       flightEstimate,
       groundTotal,
-      note: '套餐价含来回机票估算 + 地面组件（让利后）。真下单时按当日动态价重算。',
+      grossTotalEstimate,
+      note: '⚠️ BUNDLE 只含地面服务（酒店/接送/签证）让利价；机票需 AI 另外用 FLIGHT items 加（否则漏付）。grossTotalEstimate 是含机票估算的全包价，仅供向客户展示参考。',
     },
     cartItem: {
       kind: 'BUNDLE',
       productId: bundle.id,
       name,
       emoji: bundle.emoji ?? '🎁',
-      unitPrice: total, // BUNDLE 用 unitPrice=total + qty=1（与 sales-web BundleCard 习惯对齐）
+      unitPrice: bundleGroundPrice, // 地面价（与 backend createOrder 同步）
       qty: 1,
       meta: { pax, rooms, groundDiscount: discount },
     },

@@ -24,10 +24,12 @@ const STATUS_LABEL: Record<OrderStatus, string> = {
   PROCESSING: '处理中',
   TICKETED: '已出票',
   COMPLETED: '已完成',
+  PAYMENT_TIMEOUT: '支付超时',
   CANCELLED: '已取消',
   REFUND_REQUESTED: '退款审核中',
-  REFUNDING: '退款中',
   REFUNDED: '已退款',
+  CHANGE_REQUESTED: '改签审核中',
+  CHANGED: '已改签',
   FAILED: '失败',
 };
 
@@ -38,10 +40,12 @@ const STATUS_CLASS: Record<OrderStatus, string> = {
   PROCESSING: 'bg-sky-100 text-sky-700',
   TICKETED: 'bg-emerald-100 text-emerald-700',
   COMPLETED: 'bg-slate-100 text-slate-700',
+  PAYMENT_TIMEOUT: 'bg-rose-100 text-rose-700',
   CANCELLED: 'bg-rose-100 text-rose-700',
   REFUND_REQUESTED: 'bg-amber-100 text-amber-800',
-  REFUNDING: 'bg-amber-100 text-amber-800',
   REFUNDED: 'bg-slate-100 text-slate-600',
+  CHANGE_REQUESTED: 'bg-amber-100 text-amber-800',
+  CHANGED: 'bg-sky-100 text-sky-700',
   FAILED: 'bg-rose-100 text-rose-700',
 };
 
@@ -64,6 +68,9 @@ export function MyOrdersPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  // 详情缓存：listOrders 返回的 passenger 只有 {id, fullName}，
+  // 展开时拉 GET /orders/:id 拿完整 documentType / documentNumber
+  const [detailCache, setDetailCache] = useState<Record<string, OrderSummary>>({});
 
   // 取消流程状态
   const [cancelTarget, setCancelTarget] = useState<OrderSummary | null>(null);
@@ -81,6 +88,23 @@ export function MyOrdersPage() {
       .catch((e) => setError(e instanceof Error ? e.message : '加载失败'))
       .finally(() => setLoading(false));
   }, [token]);
+
+  const toggleExpand = async (order: OrderSummary) => {
+    if (expandedId === order.id) {
+      setExpandedId(null);
+      return;
+    }
+    setExpandedId(order.id);
+    // 拉一次详情（拿完整 passengers.documentType/Number）— 已缓存就跳过
+    if (!detailCache[order.id]) {
+      try {
+        const r = await api.getOrder(token, order.id);
+        setDetailCache((prev) => ({ ...prev, [order.id]: r.order }));
+      } catch {
+        // 详情拉不到就用列表数据 fallback（passenger 只有 fullName）
+      }
+    }
+  };
 
   const startCancel = async (order: OrderSummary) => {
     setCancelTarget(order);
@@ -156,6 +180,8 @@ export function MyOrdersPage() {
       {orders.map((o) => {
         const expanded = expandedId === o.id;
         const cancellable = CANCELLABLE.has(o.status);
+        // 展开后用 detail（详情拉到的完整 passenger）；详情没拿到时 fallback 到列表
+        const detail = detailCache[o.id] ?? o;
         return (
           <article key={o.id} className="card space-y-2">
             <header className="flex flex-wrap items-center justify-between gap-2">
@@ -169,7 +195,7 @@ export function MyOrdersPage() {
               </div>
               <div className="text-right">
                 <div className="text-lg font-semibold text-red-600">
-                  ¥{Number(o.totalAmount).toLocaleString()}
+                  ¥{Number(o.total).toLocaleString()}
                 </div>
                 <div className="text-xs text-slate-500">
                   {new Date(o.createdAt).toLocaleString('zh-CN')}
@@ -190,7 +216,7 @@ export function MyOrdersPage() {
             <footer className="flex items-center justify-between border-t border-slate-100 pt-2">
               <button
                 type="button"
-                onClick={() => setExpandedId(expanded ? null : o.id)}
+                onClick={() => toggleExpand(o)}
                 className="text-sm text-blue-600 hover:underline"
               >
                 {expanded ? '收起' : '查看详情'}
@@ -227,21 +253,27 @@ export function MyOrdersPage() {
                           {it.quantity > 1 && <span className="text-slate-400"> × {it.quantity}</span>}
                         </div>
                         <div className="font-medium text-slate-700">
-                          ¥{Number(it.totalPrice).toLocaleString()}
+                          ¥{Number(it.amount).toLocaleString()}
                         </div>
                       </li>
                     ))}
                   </ul>
                 </div>
 
-                {/* 出行人 */}
-                {o.passengers.length > 0 && (
+                {/* 出行人（用 detail，因为列表只 select fullName，没有 documentType/Number） */}
+                {detail.passengers.length > 0 && (
                   <div>
                     <div className="text-xs font-semibold text-slate-500 mb-1">出行人</div>
                     <ul className="space-y-1">
-                      {o.passengers.map((p) => (
+                      {detail.passengers.map((p) => (
                         <li key={p.id} className="text-slate-700">
-                          {p.fullName} · {p.documentType === 'PASSPORT' ? '护照' : p.documentType} {p.documentNumber}
+                          {p.fullName}
+                          {p.documentNumber && (
+                            <>
+                              {' · '}
+                              {p.documentType === 'PASSPORT' ? '护照' : p.documentType ?? '证件'} {p.documentNumber}
+                            </>
+                          )}
                         </li>
                       ))}
                     </ul>

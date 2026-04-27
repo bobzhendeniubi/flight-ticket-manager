@@ -7,6 +7,7 @@ import { FormEvent, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { useCart, KIND_INFO } from '../stores/cart';
 import { useAuth } from '../stores/auth';
+import { usePassengers } from '../stores/passengers';
 import { ocrPassport } from '../lib/passportOcr';
 import { api, ApiError, type CreateOrderInput } from '../lib/api';
 
@@ -36,6 +37,7 @@ export function CheckoutPage() {
   const items = useCart((s) => s.items);
   const total = useCart((s) => s.items.reduce((sum, i) => sum + i.unitPrice * i.qty, 0));
   const clear = useCart((s) => s.clear);
+  const clearPassengers = usePassengers((s) => s.clear);
 
   const [contactName, setContactName] = useState('');
   const [contactPhone, setContactPhone] = useState('');
@@ -249,6 +251,7 @@ export function CheckoutPage() {
     try {
       const { order } = await api.createOrder(tokens.accessToken, body);
       clear();
+      clearPassengers(); // 防止下单成功后下次开新单沿用旧 OCR 缓存（Codex P2 反馈）
       setDone({
         orderNumber: order.orderNumber,
         total: order.total,
