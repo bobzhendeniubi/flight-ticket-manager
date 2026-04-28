@@ -43,6 +43,9 @@ void i18n
       lookupLocalStorage: 'ftm_i18n_lng',
       caches: ['localStorage'],
     },
+    // App 没用 <Suspense> 包，禁用 suspense 让组件在 resources ready 后自动 re-render
+    // 否则首次渲染会拿到 raw key（'nav.flights' 字面量），切语言才显示翻译
+    react: { useSuspense: false },
   });
 
 export default i18n;
