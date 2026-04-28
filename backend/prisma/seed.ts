@@ -936,7 +936,7 @@ async function seedDemoOrders(customerId: string) {
                   status: PaymentStatus.SUCCEEDED,
                   paidAt: new Date(createdAt.getTime() + 5 * 60_000),
                   transactionId: `SBX-DEMO-${d.orderNumber}`,
-                  gateway: 'sandbox',
+                  gatewayPayload: { provider: 'sandbox', demo: true },
                 },
               },
             }
