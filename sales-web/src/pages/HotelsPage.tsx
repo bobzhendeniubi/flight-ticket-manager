@@ -58,9 +58,9 @@ export function HotelsPage() {
   return (
     <div className="space-y-6">
       <section className="card">
-        <h1 className="text-2xl font-bold text-slate-900">岘港酒店预订</h1>
+        <h1 className="text-2xl font-bold text-slate-900">酒店预订</h1>
         <p className="mt-1 text-sm text-slate-600">
-          8 家直签合作酒店，覆盖美溪海滩 / 山茶半岛 / 会安，与 QH9588/9589 航班打包享额外折扣。
+          覆盖东南亚 / 中国港澳 / 全球主要城市，与航班打包可享额外折扣。下方为本月精选房型。
         </p>
 
         <div className="mt-5 grid gap-4 md:grid-cols-5">

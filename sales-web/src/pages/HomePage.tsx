@@ -306,18 +306,18 @@ export function HomePage() {
           </div>
           <div>
             <div className="text-3xl">🏨</div>
-            <h3 className="mt-1 font-semibold text-slate-900">签约精选酒店</h3>
-            <p className="mt-1 text-slate-600">四季 / 洲际 / 凯悦 / 铂尔曼，8 家核心酒店直签价</p>
+            <h3 className="mt-1 font-semibold text-slate-900">酒店预订</h3>
+            <p className="mt-1 text-slate-600">直签合作酒店覆盖东南亚 / 中国港澳 / 全球主要城市</p>
           </div>
           <div>
             <div className="text-3xl">🚘</div>
-            <h3 className="mt-1 font-semibold text-slate-900">中文司机接送</h3>
-            <p className="mt-1 text-slate-600">机场接送、会安 / 巴拿山 / 顺化包车，沟通无忧</p>
+            <h3 className="mt-1 font-semibold text-slate-900">机场接送 / 包车</h3>
+            <p className="mt-1 text-slate-600">中文司机点对点、一日游包车，航班延误自动顺延</p>
           </div>
           <div>
             <div className="text-3xl">🛂</div>
-            <h3 className="mt-1 font-semibold text-slate-900">越南签证代办</h3>
-            <p className="mt-1 text-slate-600">E-visa / 落地签 / 1 年多次商务签，3–5 天出签</p>
+            <h3 className="mt-1 font-semibold text-slate-900">签证代办</h3>
+            <p className="mt-1 text-slate-600">东南亚 / 东北亚 / 申根，全程线上提交，最快 2 天出签</p>
           </div>
         </div>
       </section>

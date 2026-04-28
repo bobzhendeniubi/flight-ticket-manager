@@ -38,9 +38,9 @@ export function VisasPage() {
   return (
     <div className="space-y-6">
       <section className="card">
-        <h1 className="text-2xl font-bold text-slate-900">越南及周边签证代办</h1>
+        <h1 className="text-2xl font-bold text-slate-900">签证代办</h1>
         <p className="mt-1 text-sm text-slate-600">
-          主打越南 E-visa / 落地签 / 商务签，最快 2 天出签。另代办东南亚常用签证。
+          覆盖东南亚 / 东北亚 / 申根等主要目的地，全程线上提交，最快 2 天出签。
         </p>
         <div className="mt-5 grid gap-4 md:grid-cols-3">
           <div>
