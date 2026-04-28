@@ -448,12 +448,13 @@ export class OrderService {
     toStatus: OrderStatus,
     requester: OrderRequester,
     reason?: string,
+    force?: boolean,
   ) {
     // 收集事务里创建的任务 id，提交后再入队（避免 worker 在 tx 提交前查不到）
     const pendingFulfillmentTaskIds: string[] = [];
 
     const updated = await prisma.$transaction(async (tx) => {
-      return this._updateStatusWithinTx(tx, id, toStatus, requester, reason, pendingFulfillmentTaskIds);
+      return this._updateStatusWithinTx(tx, id, toStatus, requester, reason, pendingFulfillmentTaskIds, force);
     });
 
     // 事务提交后 enqueue fulfillment jobs（若有）
@@ -483,6 +484,38 @@ export class OrderService {
   }
 
   /**
+   * 批量状态流转（ADMIN/STAFF 后台用）。
+   * 每个 id 独立 transaction，partial failure 不回滚成功项；返回 per-id 结果。
+   */
+  async batchUpdateStatus(
+    ids: string[],
+    toStatus: OrderStatus,
+    requester: OrderRequester,
+    reason?: string,
+    force?: boolean,
+  ): Promise<{
+    successCount: number;
+    failureCount: number;
+    results: Array<{ id: string; success: boolean; orderNumber?: string; error?: string }>;
+  }> {
+    const results: Array<{ id: string; success: boolean; orderNumber?: string; error?: string }> = [];
+    let successCount = 0;
+    let failureCount = 0;
+    for (const id of ids) {
+      try {
+        const order = await this.updateStatus(id, toStatus, requester, reason, force);
+        results.push({ id, success: true, orderNumber: order.orderNumber });
+        successCount += 1;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : '未知错误';
+        results.push({ id, success: false, error: message });
+        failureCount += 1;
+      }
+    }
+    return { successCount, failureCount, results };
+  }
+
+  /**
    * 事务内执行状态流转 —— 供 payments.handleCallback 等外部事务复用。
    * 调用方负责包 $transaction 且提交后 enqueue newTaskIdsOut 里的任务。
    */
@@ -493,6 +526,7 @@ export class OrderService {
     requester: OrderRequester,
     reason: string | undefined,
     newTaskIdsOut: string[],
+    force?: boolean,
   ) {
     const order = await tx.order.findUnique({
       where: { id },
@@ -502,7 +536,9 @@ export class OrderService {
     await this.assertCanTransition(order, toStatus, requester);
 
     const allowed = ALLOWED_TRANSITIONS[order.status];
-    if (!allowed.includes(toStatus)) {
+    // ADMIN 可用 force=true 跳过状态机；其他角色或非 force 调用走标准检查
+    const isAdminForce = force === true && requester.role === 'ADMIN';
+    if (!allowed.includes(toStatus) && !isAdminForce) {
       throw new BadRequestError(
         `不允许从 ${order.status} 转移到 ${toStatus}（允许：${allowed.join(', ') || '无'}）`,
       );

@@ -102,5 +102,16 @@ export type ListOrdersQuery = z.infer<typeof listOrdersQuerySchema>;
 export const updateStatusBodySchema = z.object({
   toStatus: z.nativeEnum(OrderStatus),
   reason: z.string().max(500).optional(),
+  // ADMIN 强制覆盖：跳过 ALLOWED_TRANSITIONS 检查（仅 ADMIN 生效；STAFF/CUSTOMER 忽略）
+  force: z.boolean().optional(),
 });
 export type UpdateStatusBody = z.infer<typeof updateStatusBodySchema>;
+
+// ── 批量状态流转（ADMIN/STAFF）──────────────────────────────────────────
+export const batchUpdateStatusBodySchema = z.object({
+  ids: z.array(z.string().min(1)).min(1).max(100),
+  toStatus: z.nativeEnum(OrderStatus),
+  reason: z.string().max(500).optional(),
+  force: z.boolean().optional(),
+});
+export type BatchUpdateStatusBody = z.infer<typeof batchUpdateStatusBodySchema>;

@@ -508,11 +508,27 @@ export const api = {
   },
   getOrder: (token: string, id: string) =>
     apiFetch<{ order: OrderSummary }>(`/orders/${id}`, { token }),
-  updateOrderStatus: (token: string, id: string, toStatus: OrderStatus, reason?: string) =>
+  updateOrderStatus: (token: string, id: string, toStatus: OrderStatus, reason?: string, force?: boolean) =>
     apiFetch<{ order: OrderSummary }>(`/orders/${id}/status`, {
       method: 'PATCH',
       token,
-      body: { toStatus, reason },
+      body: { toStatus, reason, force },
+    }),
+  batchUpdateOrderStatus: (
+    token: string,
+    ids: string[],
+    toStatus: OrderStatus,
+    reason?: string,
+    force?: boolean,
+  ) =>
+    apiFetch<{
+      successCount: number;
+      failureCount: number;
+      results: Array<{ id: string; success: boolean; orderNumber?: string; error?: string }>;
+    }>(`/orders/batch-status`, {
+      method: 'POST',
+      token,
+      body: { ids, toStatus, reason, force },
     }),
 
   // Settlements

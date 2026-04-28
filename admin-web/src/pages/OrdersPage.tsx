@@ -84,6 +84,17 @@ export function OrdersPage() {
   const [agentFilter, setAgentFilter] = useState<string>('');
   const [search, setSearch] = useState('');
   const [selected, setSelected] = useState<OrderSummary | null>(null);
+  // ── 批量管理状态 ─────────────────────────────────────
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [bulkStatus, setBulkStatus] = useState<OrderStatus | ''>('');
+  const [bulkSubmitting, setBulkSubmitting] = useState(false);
+  const [bulkResult, setBulkResult] = useState<{
+    successCount: number;
+    failureCount: number;
+    failures: Array<{ id: string; error?: string }>;
+  } | null>(null);
+  // 强制模式默认开（管理员手动改状态的核心场景就是绕开标准流转）
+  const [forceMode, setForceMode] = useState(true);
 
   // 拉取订单
   useEffect(() => {
@@ -162,14 +173,71 @@ export function OrdersPage() {
     return { byAgent: map, direct: directStats };
   }, [filtered]);
 
-  const advance = async (order: OrderSummary, next: OrderStatus, reason?: string) => {
+  const advance = async (order: OrderSummary, next: OrderStatus, reason?: string, force?: boolean) => {
     if (!tokens?.accessToken) return;
     try {
-      const res = await api.updateOrderStatus(tokens.accessToken, order.id, next, reason);
+      const res = await api.updateOrderStatus(tokens.accessToken, order.id, next, reason, force);
       setOrders((prev) => prev.map((o) => (o.id === order.id ? res.order : o)));
       setSelected((prev) => (prev && prev.id === order.id ? res.order : prev));
     } catch (err) {
       alert(err instanceof ApiError ? `操作失败：${err.message}` : '操作失败');
+    }
+  };
+
+  // ── 批量管理 helpers ─────────────────────────────────
+  const visibleIds = useMemo(() => filtered.map(({ order }) => order.id), [filtered]);
+  const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.has(id));
+  const someVisibleSelected = !allVisibleSelected && visibleIds.some((id) => selectedIds.has(id));
+
+  const toggleRow = (id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+  const toggleAllVisible = () => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (allVisibleSelected) visibleIds.forEach((id) => next.delete(id));
+      else visibleIds.forEach((id) => next.add(id));
+      return next;
+    });
+  };
+  const clearSelection = () => { setSelectedIds(new Set()); setBulkResult(null); };
+
+  const applyBulkStatus = async () => {
+    if (!tokens?.accessToken || !bulkStatus || selectedIds.size === 0) return;
+    const confirmMsg = forceMode
+      ? `强制将 ${selectedIds.size} 条订单改为「${STATUS_LABEL[bulkStatus as OrderStatus]}」？此操作绕过状态机校验。`
+      : `按标准流转将 ${selectedIds.size} 条订单改为「${STATUS_LABEL[bulkStatus as OrderStatus]}」？不在允许路径的订单会失败。`;
+    if (!window.confirm(confirmMsg)) return;
+    setBulkSubmitting(true);
+    setBulkResult(null);
+    try {
+      const ids = Array.from(selectedIds);
+      const res = await api.batchUpdateOrderStatus(
+        tokens.accessToken,
+        ids,
+        bulkStatus as OrderStatus,
+        undefined,
+        forceMode,
+      );
+      const updated = await api.listOrders(tokens.accessToken, { pageSize: 200 });
+      setOrders(updated.orders);
+      setBulkResult({
+        successCount: res.successCount,
+        failureCount: res.failureCount,
+        failures: res.results.filter((r) => !r.success).map((r) => ({ id: r.id, error: r.error })),
+      });
+      if (res.failureCount === 0) {
+        setSelectedIds(new Set());
+        setBulkStatus('');
+      }
+    } catch (err) {
+      alert(err instanceof ApiError ? `批量操作失败：${err.message}` : '批量操作失败');
+    } finally {
+      setBulkSubmitting(false);
     }
   };
 
@@ -343,23 +411,104 @@ export function OrdersPage() {
         )}
       </section>
 
+      {/* ── 批量管理工具条 ───────────────────────────────────── */}
+      {selectedIds.size > 0 && (
+        <section className="card border-2 border-brand bg-brand/5">
+          <div className="flex flex-wrap items-center gap-3">
+            <span className="text-sm font-semibold text-slate-900">
+              已选 <span className="text-brand">{selectedIds.size}</span> 条订单
+            </span>
+            <span className="text-slate-300">|</span>
+            <label className="text-sm text-slate-600">改为：</label>
+            <select
+              className="input max-w-[10rem] py-1.5"
+              value={bulkStatus}
+              onChange={(e) => setBulkStatus(e.target.value as OrderStatus | '')}
+              disabled={bulkSubmitting}
+            >
+              <option value="">选择目标状态…</option>
+              {(Object.keys(STATUS_LABEL) as OrderStatus[]).map((s) => (
+                <option key={s} value={s}>{STATUS_LABEL[s]}</option>
+              ))}
+            </select>
+            <label className="flex items-center gap-1.5 text-sm text-slate-600">
+              <input
+                type="checkbox"
+                checked={forceMode}
+                onChange={(e) => setForceMode(e.target.checked)}
+                disabled={bulkSubmitting}
+              />
+              <span>强制（绕过状态机校验）</span>
+            </label>
+            <button
+              className="btn-primary text-sm py-1.5 disabled:opacity-50"
+              onClick={() => void applyBulkStatus()}
+              disabled={!bulkStatus || bulkSubmitting}
+            >
+              {bulkSubmitting ? '处理中…' : `应用到 ${selectedIds.size} 条`}
+            </button>
+            <button
+              className="text-sm text-slate-600 hover:text-slate-900"
+              onClick={clearSelection}
+              disabled={bulkSubmitting}
+            >
+              清除选择
+            </button>
+          </div>
+          {bulkResult && (
+            <div className="mt-3 rounded-md bg-white px-3 py-2 text-xs">
+              <div className="text-slate-700">
+                ✓ 成功 {bulkResult.successCount} 条
+                {bulkResult.failureCount > 0 && (
+                  <span className="ml-3 text-red-600">✗ 失败 {bulkResult.failureCount} 条</span>
+                )}
+              </div>
+              {bulkResult.failures.length > 0 && (
+                <ul className="mt-1 max-h-32 overflow-auto text-red-600">
+                  {bulkResult.failures.map((f) => (
+                    <li key={f.id} className="font-mono text-[11px]">· {f.id.slice(0, 8)}…：{f.error ?? '未知'}</li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+        </section>
+      )}
+
       <section className="card p-0 overflow-hidden">
         <div className="overflow-x-auto">
           <table className="min-w-full divide-y divide-slate-200 text-sm">
             <thead className="bg-slate-50 text-xs uppercase text-slate-500">
               <tr>
+                <th className="px-4 py-3 text-center w-10">
+                  <input
+                    type="checkbox"
+                    aria-label="全选当前页"
+                    checked={allVisibleSelected}
+                    ref={(el) => { if (el) el.indeterminate = someVisibleSelected; }}
+                    onChange={toggleAllVisible}
+                  />
+                </th>
                 <th className="px-4 py-3 text-left">订单号</th>
                 <th className="px-4 py-3 text-left">客户 / 代理</th>
                 <th className="px-4 py-3 text-left">内容</th>
                 <th className="px-4 py-3 text-right">金额</th>
                 <th className="px-4 py-3 text-center">状态</th>
                 <th className="px-4 py-3 text-left">下单时间</th>
-                <th className="px-4 py-3"></th>
+                <th className="px-4 py-3 text-center">操作</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
               {filtered.map(({ order, view }) => (
-                <tr key={order.id} className="hover:bg-slate-50">
+                <tr key={order.id} className={`hover:bg-slate-50 ${selectedIds.has(order.id) ? 'bg-brand/5' : ''}`}>
+                  <td className="px-4 py-3 text-center">
+                    <input
+                      type="checkbox"
+                      aria-label={`选择订单 ${order.orderNumber}`}
+                      checked={selectedIds.has(order.id)}
+                      onChange={() => toggleRow(order.id)}
+                    />
+                  </td>
                   <td className="px-4 py-3 font-mono text-xs text-slate-700">{order.orderNumber}</td>
                   <td className="px-4 py-3">
                     <div className="font-medium text-slate-900">{view.customerName}</div>
@@ -392,23 +541,46 @@ export function OrdersPage() {
                       month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
                     })}
                   </td>
-                  <td className="px-4 py-3 text-right">
-                    <button className="text-sm text-brand hover:text-brand-dark" onClick={() => setSelected(order)}>
-                      详情
-                    </button>
+                  <td className="px-4 py-3">
+                    <div className="flex items-center justify-end gap-2">
+                      <select
+                        className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs disabled:opacity-50"
+                        value=""
+                        onChange={(e) => {
+                          const next = e.target.value as OrderStatus;
+                          if (!next) return;
+                          const msg = forceMode
+                            ? `强制将 ${order.orderNumber} 改为「${STATUS_LABEL[next]}」？此操作绕过状态机校验。`
+                            : `将 ${order.orderNumber} 改为「${STATUS_LABEL[next]}」？`;
+                          if (window.confirm(msg)) void advance(order, next, undefined, forceMode);
+                          e.target.value = '';
+                        }}
+                        title={forceMode ? '管理员强制改状态（绕过状态机）' : '按标准流转改状态'}
+                      >
+                        <option value="">改状态…</option>
+                        {(Object.keys(STATUS_LABEL) as OrderStatus[])
+                          .filter((s) => s !== order.status)
+                          .map((s) => (
+                            <option key={s} value={s}>{STATUS_LABEL[s]}</option>
+                          ))}
+                      </select>
+                      <button className="text-sm text-brand hover:text-brand-dark" onClick={() => setSelected(order)}>
+                        详情
+                      </button>
+                    </div>
                   </td>
                 </tr>
               ))}
               {!loading && filtered.length === 0 && (
                 <tr>
-                  <td colSpan={7} className="px-4 py-8 text-center text-slate-500">
+                  <td colSpan={8} className="px-4 py-8 text-center text-slate-500">
                     没有符合条件的订单
                   </td>
                 </tr>
               )}
               {loading && (
                 <tr>
-                  <td colSpan={7} className="px-4 py-8 text-center text-slate-400">加载中…</td>
+                  <td colSpan={8} className="px-4 py-8 text-center text-slate-400">加载中…</td>
                 </tr>
               )}
             </tbody>

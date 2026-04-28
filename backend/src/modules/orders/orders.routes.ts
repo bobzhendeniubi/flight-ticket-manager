@@ -11,6 +11,7 @@ import { z } from 'zod';
 import { UserRole } from '@prisma/client';
 import { OrderService, type OrderRequester } from './orders.service.js';
 import {
+  batchUpdateStatusBodySchema,
   createOrderBodySchema,
   listOrdersQuerySchema,
   updateStatusBodySchema,
@@ -73,17 +74,57 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       const { id } = req.params as { id: string };
       const body = updateStatusBodySchema.parse(req.body);
       const requester = await buildRequester(req.user.sub, req.user.role);
-      const order = await service.updateStatus(id, body.toStatus, requester, body.reason);
+      const order = await service.updateStatus(id, body.toStatus, requester, body.reason, body.force);
       void writeAudit({
         actor: actorFromRequest(req),
-        action: 'ADVANCE_ORDER_STATUS',
+        action: body.force ? 'FORCE_ORDER_STATUS' : 'ADVANCE_ORDER_STATUS',
         targetType: 'ORDER',
         targetId: order.id,
         targetLabel: order.orderNumber,
-        after: { toStatus: body.toStatus, reason: body.reason },
-        severity: body.toStatus === 'CANCELLED' || body.toStatus === 'REFUNDED' ? 'WARNING' : 'INFO',
+        after: { toStatus: body.toStatus, reason: body.reason, force: body.force ?? false },
+        severity:
+          body.force || body.toStatus === 'CANCELLED' || body.toStatus === 'REFUNDED' ? 'WARNING' : 'INFO',
       });
       return { order };
+    },
+  );
+
+  // ── 批量状态流转 ────────────────────────────────────────────────
+  // POST /orders/batch-status — ADMIN/STAFF 在订单管理页一次改多条
+  app.post(
+    '/batch-status',
+    { preHandler: [app.authenticate] },
+    async (req, reply) => {
+      const role = req.user.role;
+      if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+        return reply.status(403).send({ error: '仅管理员可批量改状态' });
+      }
+      const body = batchUpdateStatusBodySchema.parse(req.body);
+      const requester = await buildRequester(req.user.sub, role);
+      const result = await service.batchUpdateStatus(
+        body.ids,
+        body.toStatus,
+        requester,
+        body.reason,
+        body.force,
+      );
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: body.force ? 'BATCH_FORCE_ORDER_STATUS' : 'BATCH_ADVANCE_ORDER_STATUS',
+        targetType: 'ORDER',
+        targetId: 'batch',
+        targetLabel: `${result.successCount}/${body.ids.length} orders → ${body.toStatus}`,
+        after: {
+          toStatus: body.toStatus,
+          requestedCount: body.ids.length,
+          successCount: result.successCount,
+          failureCount: result.failureCount,
+          force: body.force ?? false,
+          reason: body.reason,
+        },
+        severity: result.failureCount > 0 || body.force ? 'WARNING' : 'INFO',
+      });
+      return result;
     },
   );
 
