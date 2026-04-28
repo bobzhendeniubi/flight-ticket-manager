@@ -1,0 +1,48 @@
+# Caddy 反向代理 + 自动 HTTPS
+# 用法：
+#   cp Caddyfile.example /etc/caddy/Caddyfile
+#   sed -i 's/your-domain.com/真域名.com/g' /etc/caddy/Caddyfile
+#   systemctl restart caddy
+#
+# Caddy 会自动签 Let's Encrypt 证书 + 自动续期，零配置 HTTPS。
+# 前提：3 个子域名的 A 记录已经指向本服务器 IP。
+
+# === 客户前台（销售网站）=================================
+sales.your-domain.com {
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Permissions-Policy "geolocation=(), microphone=(), camera=()"
+    }
+    reverse_proxy localhost:80
+    encode gzip zstd
+}
+
+# === 客服后台（管理面板）=================================
+admin.your-domain.com {
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+    # 可选：IP 白名单（只让公司 IP 访问）
+    # @block_admin not remote_ip 1.2.3.4 5.6.7.0/24
+    # respond @block_admin 403
+    reverse_proxy localhost:8080
+    encode gzip zstd
+}
+
+# === API 后端（手机 app / 小程序 / 第三方对接用）===========
+api.your-domain.com {
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        X-Frame-Options "DENY"
+    }
+    reverse_proxy localhost:4000
+    encode gzip zstd
+}
