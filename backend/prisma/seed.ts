@@ -8,7 +8,17 @@
  *
  * Run: npm run prisma:seed  (from backend/)
  */
-import { PrismaClient, UserRole, CabinClass } from '@prisma/client';
+import {
+  PrismaClient,
+  UserRole,
+  CabinClass,
+  OrderStatus,
+  OrderItemKind,
+  PaymentMethod,
+  PaymentStatus,
+  DocumentType,
+  Prisma,
+} from '@prisma/client';
 import argon2 from 'argon2';
 
 const prisma = new PrismaClient();
@@ -307,6 +317,9 @@ async function main() {
 
   // ── 取消订单费率（默认每个 kind 一条 isDefault 兜底）──
   await seedCancellationPolicies();
+
+  // ── Demo 订单（演示后台用：6 条不同状态的样例订单）──
+  await seedDemoOrders(customer.id);
 
   // ── 清理不在列表里的历史航班（只在没有订单关联时） ──
   const keepFlightNumbers = FLIGHT_SEED.map((f) => f.flightNumber);
@@ -736,6 +749,204 @@ async function seedCancellationPolicies() {
       },
     });
   }
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Demo 订单 seed（让客服后台一打开就有数据）
+// 6 条不同状态：PAID / TICKETED / COMPLETED / REFUND_REQUESTED / CANCELLED / PENDING_PAYMENT
+// 全部用 customer@ftm.local，FLIGHT items 指 QH9588/QH9589 现成班次
+// 幂等：orderNumber 已存在就跳过
+// ════════════════════════════════════════════════════════════════════
+async function seedDemoOrders(customerId: string) {
+  // 找未来一周内 + 上周内的班次（pat trip 用 past schedule，未来订单用 future）
+  const now = new Date();
+  const futureSchedules = await prisma.flightSchedule.findMany({
+    where: { departureTime: { gt: now }, isActive: true },
+    include: { flight: true, seatClasses: true },
+    orderBy: { departureTime: 'asc' },
+    take: 30,
+  });
+  const pastSchedules = await prisma.flightSchedule.findMany({
+    where: { departureTime: { lt: now } },
+    include: { flight: true, seatClasses: true },
+    orderBy: { departureTime: 'desc' },
+    take: 5,
+  });
+
+  if (futureSchedules.length === 0) {
+    // eslint-disable-next-line no-console
+    console.log('  ⚠️  没找到未来班次，跳过 demo orders');
+    return;
+  }
+
+  // 找去程 + 回程一对（同一天附近）
+  const goSchedule = futureSchedules.find((s) => s.flight.flightNumber === 'QH9589');
+  const retSchedule = futureSchedules.find((s) => s.flight.flightNumber === 'QH9588');
+  if (!goSchedule || !retSchedule) {
+    // eslint-disable-next-line no-console
+    console.log('  ⚠️  缺去程或回程班次，跳过 demo orders');
+    return;
+  }
+
+  const econ = goSchedule.seatClasses.find((c) => c.cabin === CabinClass.ECONOMY);
+  if (!econ) return;
+  const econPrice = Number(econ.basePrice);
+
+  // 通用乘客 fixture
+  const PASSENGER_LIU = {
+    fullName: 'LIU CHAO',
+    documentType: DocumentType.PASSPORT,
+    documentNumber: 'EE1412098',
+    nationality: 'CN',
+    dateOfBirth: new Date('1991-01-19'),
+  };
+  const PASSENGER_WANG = {
+    fullName: 'WANG MEI',
+    documentType: DocumentType.PASSPORT,
+    documentNumber: 'EH8765432',
+    nationality: 'CN',
+    dateOfBirth: new Date('1993-05-22'),
+  };
+
+  const DEMO_ORDERS: Array<{
+    orderNumber: string;
+    status: OrderStatus;
+    paid: boolean; // 是否生成已支付的 Payment 行
+    pax: number;
+    schedules: typeof futureSchedules; // 关联航班（去程、可选回程）
+    note: string;
+    createdDaysAgo?: number; // 假装多少天前下单
+  }> = [
+    {
+      orderNumber: 'DEMO-001',
+      status: OrderStatus.PAID,
+      paid: true,
+      pax: 2,
+      schedules: [goSchedule, retSchedule],
+      note: '已支付待出票（往返 2 人）',
+      createdDaysAgo: 1,
+    },
+    {
+      orderNumber: 'DEMO-002',
+      status: OrderStatus.TICKETED,
+      paid: true,
+      pax: 1,
+      schedules: [goSchedule],
+      note: '已出票（单程）',
+      createdDaysAgo: 3,
+    },
+    {
+      orderNumber: 'DEMO-003',
+      status: OrderStatus.COMPLETED,
+      paid: true,
+      pax: 2,
+      schedules: pastSchedules.length > 0 ? [pastSchedules[0]] : [goSchedule],
+      note: '已完成（past trip）',
+      createdDaysAgo: 14,
+    },
+    {
+      orderNumber: 'DEMO-004',
+      status: OrderStatus.REFUND_REQUESTED,
+      paid: true,
+      pax: 1,
+      schedules: [goSchedule, retSchedule],
+      note: '退款审核中（客户申请取消）',
+      createdDaysAgo: 2,
+    },
+    {
+      orderNumber: 'DEMO-005',
+      status: OrderStatus.CANCELLED,
+      paid: false,
+      pax: 1,
+      schedules: [goSchedule],
+      note: '已取消（未支付超时）',
+      createdDaysAgo: 5,
+    },
+    {
+      orderNumber: 'DEMO-006',
+      status: OrderStatus.PENDING_PAYMENT,
+      paid: false,
+      pax: 2,
+      schedules: [goSchedule, retSchedule],
+      note: '待支付（刚下单 5 分钟内）',
+      createdDaysAgo: 0,
+    },
+  ];
+
+  let created = 0;
+  let skipped = 0;
+  for (const d of DEMO_ORDERS) {
+    const existing = await prisma.order.findUnique({ where: { orderNumber: d.orderNumber } });
+    if (existing) {
+      skipped++;
+      continue;
+    }
+
+    const itemsTotal = d.schedules.length * d.pax * econPrice;
+    const subtotal = new Prisma.Decimal(itemsTotal);
+    const total = subtotal;
+    const paidAmount = d.paid ? total : new Prisma.Decimal(0);
+    const createdAt = new Date(now.getTime() - (d.createdDaysAgo ?? 0) * 86400_000);
+
+    await prisma.order.create({
+      data: {
+        orderNumber: d.orderNumber,
+        userId: customerId,
+        status: d.status,
+        currency: 'CNY',
+        subtotal,
+        taxesAndFees: new Prisma.Decimal(0),
+        discountTotal: new Prisma.Decimal(0),
+        total,
+        paidAmount,
+        prepaymentOffset: new Prisma.Decimal(0),
+        contactName: '演示客户',
+        contactPhone: '13800138000',
+        contactEmail: 'customer@ftm.local',
+        notes: `Demo 订单 — ${d.note}`,
+        createdAt,
+        updatedAt: createdAt,
+        items: {
+          create: d.schedules.map((s) => ({
+            kind: OrderItemKind.FLIGHT,
+            description: `${s.flight.flightNumber} ${s.flight.originCode}→${s.flight.destinationCode}`,
+            quantity: d.pax,
+            unitPrice: new Prisma.Decimal(econPrice),
+            amount: new Prisma.Decimal(econPrice * d.pax),
+            flightScheduleId: s.id,
+            flightCabin: CabinClass.ECONOMY,
+          })),
+        },
+        passengers: {
+          create: [PASSENGER_LIU, ...(d.pax >= 2 ? [PASSENGER_WANG] : [])].map((p) => ({
+            fullName: p.fullName,
+            documentType: p.documentType,
+            documentNumber: p.documentNumber,
+            nationality: p.nationality,
+            dateOfBirth: p.dateOfBirth,
+          })),
+        },
+        // 已支付订单：建一条 Payment 行
+        ...(d.paid
+          ? {
+              payments: {
+                create: {
+                  method: PaymentMethod.WECHAT_PAY,
+                  amount: total,
+                  status: PaymentStatus.SUCCEEDED,
+                  paidAt: new Date(createdAt.getTime() + 5 * 60_000),
+                  transactionId: `SBX-DEMO-${d.orderNumber}`,
+                  gateway: 'sandbox',
+                },
+              },
+            }
+          : {}),
+      },
+    });
+    created++;
+  }
+  // eslint-disable-next-line no-console
+  console.log(`  …Demo 订单：新增 ${created} 条，跳过 ${skipped} 条（共 ${DEMO_ORDERS.length}）`);
 }
 
 main()
