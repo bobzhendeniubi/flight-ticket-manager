@@ -49,10 +49,20 @@ fi
 # ── 2. 装 Docker ─────────────────────────────────────────────────
 log "2/8 装 Docker"
 if ! command -v docker &>/dev/null; then
-  curl -fsSL https://get.docker.com | sh
+  if command -v dnf &>/dev/null; then
+    # Alibaba Cloud Linux 3 / CentOS 系 — 用阿里云 docker-ce 镜像源
+    # （get.docker.com 脚本会拒绝 alinux 报 "Unsupported distribution 'alinux'"）
+    dnf config-manager --add-repo https://mirrors.aliyun.com/docker-ce/linux/centos/docker-ce.repo
+    sed -i 's|https://download.docker.com|https://mirrors.aliyun.com/docker-ce|g' /etc/yum.repos.d/docker-ce.repo
+    sed -i 's|\$releasever|8|g' /etc/yum.repos.d/docker-ce.repo
+    dnf install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+  else
+    curl -fsSL https://get.docker.com | sh
+  fi
 fi
 systemctl enable --now docker
 docker --version
+docker compose version
 
 # ── 3. 装 Caddy（自动 HTTPS + Let's Encrypt）─────────────────────
 log "3/8 装 Caddy"

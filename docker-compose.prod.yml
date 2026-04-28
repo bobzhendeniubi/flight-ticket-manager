@@ -93,11 +93,11 @@ services:
       ALIPAY_PUBLIC_KEY_PATH: ${ALIPAY_PUBLIC_KEY_PATH:-/secrets/alipay/alipay_public_key.pem}
       ALIPAY_SIGN_TYPE: ${ALIPAY_SIGN_TYPE:-RSA2}
       ALIPAY_GATEWAY: ${ALIPAY_GATEWAY:-https://openapi.alipay.com/gateway.do}
+      SANDBOX_WEBHOOK_SECRET: ${SANDBOX_WEBHOOK_SECRET:-sandbox-test-secret}
+      ENABLE_AUTO_FULFILLMENT: ${ENABLE_AUTO_FULFILLMENT:-true}
     volumes:
       # 证书/私钥 只读挂载（不写进镜像）
       - ./secrets:/secrets:ro
-      SANDBOX_WEBHOOK_SECRET: ${SANDBOX_WEBHOOK_SECRET:-sandbox-test-secret}
-      ENABLE_AUTO_FULFILLMENT: ${ENABLE_AUTO_FULFILLMENT:-true}
     # 启动前自动跑 migration
     command: >
       sh -c "npx prisma migrate deploy && node dist/index.js"
@@ -121,7 +121,16 @@ services:
       DATABASE_URL: postgresql://ftm:${POSTGRES_PASSWORD}@postgres:5432/ftm?schema=public
       REDIS_URL: redis://redis:6379
       LOG_LEVEL: ${LOG_LEVEL:-info}
-      # worker 如需发通知 / 触发支付退款时也可能要支付 env；按需加
+      # 中央 env validator 也对 worker 生效，下面这些是它强制要求的（即使 worker 不直接用 JWT/CORS）
+      CORS_ORIGINS: ${CORS_ORIGINS}
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET}
+      JWT_ACCESS_TTL: ${JWT_ACCESS_TTL:-900}
+      JWT_REFRESH_TTL: ${JWT_REFRESH_TTL:-604800}
+      APP_PUBLIC_URL: ${APP_PUBLIC_URL:?must set APP_PUBLIC_URL}
+      PAYMENT_MODE: ${PAYMENT_MODE:?must set PAYMENT_MODE}
+      SANDBOX_WEBHOOK_SECRET: ${SANDBOX_WEBHOOK_SECRET:-sandbox-test-secret}
+      ENABLE_AUTO_FULFILLMENT: ${ENABLE_AUTO_FULFILLMENT:-true}
     command: ["node", "dist/queues/worker.js"]
     logging:
       driver: "json-file"
