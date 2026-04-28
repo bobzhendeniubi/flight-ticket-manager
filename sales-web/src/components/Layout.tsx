@@ -145,11 +145,8 @@ export function Layout() {
               </div>
             ) : (
               <div className="hidden md:flex items-center gap-3">
-                <Link to="/login" className="text-slate-700 hover:text-brand">
+                <Link to="/login" className="btn-primary text-sm py-1.5">
                   {t('nav.login')}
-                </Link>
-                <Link to="/register" className="btn-primary text-sm py-1.5">
-                  {t('nav.register')}
                 </Link>
               </div>
             )}
@@ -226,11 +223,8 @@ export function Layout() {
                   </>
                 ) : (
                   <>
-                    <Link to="/login" onClick={closeMenu} className="block px-4 py-3 text-sm text-slate-700 hover:bg-slate-50">
+                    <Link to="/login" onClick={closeMenu} className="block px-4 py-3 text-sm font-semibold text-brand hover:bg-brand/5">
                       {t('nav.login')}
-                    </Link>
-                    <Link to="/register" onClick={closeMenu} className="block px-4 py-3 text-sm font-semibold text-brand hover:bg-brand/5">
-                      {t('nav.register')}
                     </Link>
                     {/* 手机抽屉里的语言切换 */}
                     <div className="mt-2 px-4 py-2 border-t border-slate-100">

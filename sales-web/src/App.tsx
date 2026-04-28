@@ -2,7 +2,6 @@ import { Navigate, Route, Routes } from 'react-router-dom';
 import { Layout } from './components/Layout';
 import { HomePage } from './pages/HomePage';
 import { LoginPage } from './pages/LoginPage';
-import { RegisterPage } from './pages/RegisterPage';
 import { ProfilePage } from './pages/ProfilePage';
 import { TeamPage } from './pages/TeamPage';
 import { HotelsPage } from './pages/HotelsPage';
@@ -47,7 +46,8 @@ export function App() {
 
         {/* 认证 */}
         <Route path="login" element={<LoginPage />} />
-        <Route path="register" element={<RegisterPage />} />
+        {/* 注册由销售代理后台为客户开通，前台不再开放自助注册 */}
+        <Route path="register" element={<Navigate to="/login" replace />} />
         <Route
           path="me"
           element={

@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
+import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../stores/auth';
 
 export function LoginPage() {
@@ -72,10 +72,7 @@ export function LoginPage() {
         </form>
 
         <p className="mt-4 text-center text-sm text-slate-600">
-          还没有账号？{' '}
-          <Link to="/register" className="font-medium text-brand hover:text-brand-dark">
-            注册一个
-          </Link>
+          还没有账号？请联系您的销售代理为您开通。
         </p>
       </div>
 
