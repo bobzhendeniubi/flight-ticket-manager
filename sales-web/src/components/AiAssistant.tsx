@@ -474,8 +474,8 @@ export function AiAssistant() {
                     </button>
                   </div>
                   <div className="flex flex-wrap gap-1.5">
-                    <button type="button" onClick={() => quickAction('帮我加越南签证（每个出行人都要）')} className="text-xs rounded-md border border-blue-200 bg-white px-2 py-1.5 hover:bg-blue-50">🛂 加签证</button>
-                    <button type="button" onClick={() => quickAction('再帮我加岘港 3 晚酒店')} className="text-xs rounded-md border border-blue-200 bg-white px-2 py-1.5 hover:bg-blue-50">🏨 加酒店</button>
+                    <button type="button" onClick={() => quickAction('帮我加目的地签证（每个出行人都要）')} className="text-xs rounded-md border border-blue-200 bg-white px-2 py-1.5 hover:bg-blue-50">🛂 加签证</button>
+                    <button type="button" onClick={() => quickAction('再帮我加目的地 3 晚酒店')} className="text-xs rounded-md border border-blue-200 bg-white px-2 py-1.5 hover:bg-blue-50">🏨 加酒店</button>
                     <button type="button" onClick={() => quickAction('再帮我加机场接机一趟')} className="text-xs rounded-md border border-blue-200 bg-white px-2 py-1.5 hover:bg-blue-50">🚗 加接机</button>
                     <button type="button" onClick={() => quickAction('有什么一价全包套餐推荐？')} className="text-xs rounded-md border border-blue-200 bg-white px-2 py-1.5 hover:bg-blue-50">🎁 看套餐</button>
                   </div>

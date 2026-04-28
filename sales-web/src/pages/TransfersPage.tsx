@@ -46,7 +46,7 @@ export function TransfersPage() {
             <label className="label">上车地址</label>
             <input
               className="input"
-              placeholder="如：朝阳区建外 SOHO"
+              placeholder="如：酒店名称 / 机场航站楼"
               value={pickupAddress}
               onChange={(e) => setPickupAddress(e.target.value)}
             />
