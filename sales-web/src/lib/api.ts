@@ -554,6 +554,46 @@ export const api = {
   listVisas: () => apiFetch<{ visas: Visa[] }>('/products/visas?active=1'),
   listBundles: () => apiFetch<{ bundles: Bundle[] }>('/products/bundles?active=1'),
 
+  // 结算 / 佣金 — 代理在自己的 dashboard 看分成
+  // 后端 RBAC：AGENT 看自己 + 下级；ADMIN/STAFF 看全部
+  listSettlements: (
+    token: string,
+    query?: { period?: string; agentId?: string; status?: SettlementStatus; page?: number; pageSize?: number },
+  ) => {
+    const qs = new URLSearchParams();
+    if (query) {
+      for (const [k, v] of Object.entries(query)) {
+        if (v !== undefined && v !== '') qs.set(k, String(v));
+      }
+    }
+    return apiFetch<{
+      settlements: SettlementSummary[];
+      pagination: { page: number; pageSize: number; total: number };
+    }>(`/settlements/${qs.toString() ? '?' + qs.toString() : ''}`, { token });
+  },
+  getSettlement: (token: string, id: string) =>
+    apiFetch<{ settlement: SettlementDetail }>(`/settlements/${id}`, { token }),
+
+  // 结算 / 佣金 — 代理在自己的 dashboard 看分成
+  // 后端 RBAC：AGENT 看自己 + 下级；ADMIN/STAFF 看全部
+  listSettlements: (
+    token: string,
+    query?: { period?: string; agentId?: string; status?: SettlementStatus; page?: number; pageSize?: number },
+  ) => {
+    const qs = new URLSearchParams();
+    if (query) {
+      for (const [k, v] of Object.entries(query)) {
+        if (v !== undefined && v !== '') qs.set(k, String(v));
+      }
+    }
+    return apiFetch<{
+      settlements: SettlementSummary[];
+      pagination: { page: number; pageSize: number; total: number };
+    }>(`/settlements/${qs.toString() ? '?' + qs.toString() : ''}`, { token });
+  },
+  getSettlement: (token: string, id: string) =>
+    apiFetch<{ settlement: SettlementDetail }>(`/settlements/${id}`, { token }),
+
   // AI 助手（公开 — 任何人可聊；下单时才要登录）
   aiChat: (body: { messages: AiChatMessage[]; userMessage: string }) =>
     apiFetch<AiChatResponse>('/ai/chat', { method: 'POST', body }),

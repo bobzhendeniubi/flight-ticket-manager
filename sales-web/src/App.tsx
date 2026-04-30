@@ -74,6 +74,22 @@ export function App() {
             </Protected>
           }
         />
+        <Route
+          path="my-commissions"
+          element={
+            <Protected roles={['AGENT', 'ADMIN', 'STAFF']}>
+              <MyCommissionsPage />
+            </Protected>
+          }
+        />
+        <Route
+          path="my-commissions"
+          element={
+            <Protected roles={['AGENT', 'ADMIN', 'STAFF']}>
+              <MyCommissionsPage />
+            </Protected>
+          }
+        />
 
         {/* 后台 admin */}
         <Route

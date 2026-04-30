@@ -84,16 +84,28 @@ export function Layout() {
               </NavLink>
             ))}
             {isAgent && (
-              <NavLink
-                to="/team"
-                className={({ isActive }) =>
-                  `px-3 py-1.5 rounded-md ${
-                    isActive ? 'bg-brand/10 text-brand' : 'text-slate-700 hover:text-brand'
-                  }`
-                }
-              >
-                {t('nav.team')}
-              </NavLink>
+              <>
+                <NavLink
+                  to="/team"
+                  className={({ isActive }) =>
+                    `px-3 py-1.5 rounded-md ${
+                      isActive ? 'bg-brand/10 text-brand' : 'text-slate-700 hover:text-brand'
+                    }`
+                  }
+                >
+                  {t('nav.team')}
+                </NavLink>
+                <NavLink
+                  to="/my-commissions"
+                  className={({ isActive }) =>
+                    `px-3 py-1.5 rounded-md ${
+                      isActive ? 'bg-brand/10 text-brand' : 'text-slate-700 hover:text-brand'
+                    }`
+                  }
+                >
+                  {t('nav.commissions')}
+                </NavLink>
+              </>
             )}
           </nav>
 
@@ -182,17 +194,30 @@ export function Layout() {
                   </NavLink>
                 ))}
                 {isAgent && (
-                  <NavLink
-                    to="/team"
-                    onClick={closeMenu}
-                    className={({ isActive }) =>
-                      `block px-4 py-3 text-sm border-l-4 ${
-                        isActive ? 'border-brand bg-brand/5 text-brand font-semibold' : 'border-transparent text-slate-700 hover:bg-slate-50'
-                      }`
-                    }
-                  >
-                    {t('nav.team')}
-                  </NavLink>
+                  <>
+                    <NavLink
+                      to="/team"
+                      onClick={closeMenu}
+                      className={({ isActive }) =>
+                        `block px-4 py-3 text-sm border-l-4 ${
+                          isActive ? 'border-brand bg-brand/5 text-brand font-semibold' : 'border-transparent text-slate-700 hover:bg-slate-50'
+                        }`
+                      }
+                    >
+                      {t('nav.team')}
+                    </NavLink>
+                    <NavLink
+                      to="/my-commissions"
+                      onClick={closeMenu}
+                      className={({ isActive }) =>
+                        `block px-4 py-3 text-sm border-l-4 ${
+                          isActive ? 'border-brand bg-brand/5 text-brand font-semibold' : 'border-transparent text-slate-700 hover:bg-slate-50'
+                        }`
+                      }
+                    >
+                      {t('nav.commissions')}
+                    </NavLink>
+                  </>
                 )}
 
                 <div className="my-2 border-t border-slate-100" />
