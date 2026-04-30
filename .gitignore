@@ -48,3 +48,8 @@ venv/
 yarn-debug.log*
 yarn-error.log*
 ~$*.pptx
+
+# Office lock files
+~$*.xlsx
+~$*.docx
+~$*.pptx
