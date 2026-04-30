@@ -4,6 +4,7 @@ import { HomePage } from './pages/HomePage';
 import { LoginPage } from './pages/LoginPage';
 import { ProfilePage } from './pages/ProfilePage';
 import { TeamPage } from './pages/TeamPage';
+import { MyCommissionsPage } from './pages/MyCommissionsPage';
 import { HotelsPage } from './pages/HotelsPage';
 import { TransfersPage } from './pages/TransfersPage';
 import { VisasPage } from './pages/VisasPage';
@@ -71,14 +72,6 @@ export function App() {
           element={
             <Protected roles={['AGENT', 'ADMIN', 'STAFF']}>
               <TeamPage />
-            </Protected>
-          }
-        />
-        <Route
-          path="my-commissions"
-          element={
-            <Protected roles={['AGENT', 'ADMIN', 'STAFF']}>
-              <MyCommissionsPage />
             </Protected>
           }
         />
