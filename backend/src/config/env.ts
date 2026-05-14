@@ -78,7 +78,11 @@ const EnvSchema = z.object({
   // ═══════════════════════════════════════════════════════════
   OPENAI_API_KEY: z.string().optional(),
   OPENAI_MODEL: z.string().default('gpt-5-mini'),
-  OPENAI_BASE_URL: z.string().url().optional(), // 可指向 Azure / 代理
+  // 可指向 Azure / 代理；空字符串（docker compose ${VAR:-} 默认值）当 undefined 处理
+  OPENAI_BASE_URL: z.preprocess(
+    (v) => (typeof v === 'string' && v.trim() === '' ? undefined : v),
+    z.string().url().optional(),
+  ),
 
   // ═══════════════════════════════════════════════════════════
   // 邮件（SMTP，发送电子行程单）
