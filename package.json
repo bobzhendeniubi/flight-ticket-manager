@@ -22,6 +22,10 @@
     "prisma:seed": "npm run prisma:seed --workspace=backend",
     "typecheck": "npm run typecheck --workspaces --if-present"
   },
+  "//overrides_note": "Taro 4.0.9 peerDep 锁定 webpack@5.91.0；hoist 解析到 5.106.x 会触发 ProgressPlugin schema 校验失败，所以 pin 住",
+  "overrides": {
+    "webpack": "5.91.0"
+  },
   "engines": {
     "node": ">=20.0.0"
   }
