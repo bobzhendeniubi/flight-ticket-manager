@@ -95,6 +95,10 @@ services:
       ALIPAY_GATEWAY: ${ALIPAY_GATEWAY:-https://openapi.alipay.com/gateway.do}
       SANDBOX_WEBHOOK_SECRET: ${SANDBOX_WEBHOOK_SECRET:-sandbox-test-secret}
       ENABLE_AUTO_FULFILLMENT: ${ENABLE_AUTO_FULFILLMENT:-true}
+      # ── OpenAI（AI 助手）── 没设 OPENAI_API_KEY 时 backend 自动 mock 模式
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5-mini}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
     volumes:
       # 证书/私钥 只读挂载（不写进镜像）
       - ./secrets:/secrets:ro
