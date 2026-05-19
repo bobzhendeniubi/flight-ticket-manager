@@ -1015,8 +1015,8 @@ async function mockTurn(history: ChatMessage[], userMessage: string): Promise<Ch
         cabin: intent.cabin,
         passengers: intent.passengers,
       });
-      if (flights.ok && Array.isArray((flights.data as Record<string, unknown>)?.results)) {
-        const results = (flights.data as { results: Array<Record<string, unknown>> }).results;
+      if (flights.ok && Array.isArray((flights.data as Record<string, unknown>)?.flights)) {
+        const results = (flights.data as { flights: Array<Record<string, unknown>> }).flights;
         if (results.length > 0) {
           const f = results[0];
           const scheduleId = f.scheduleId as string;
@@ -1041,8 +1041,13 @@ async function mockTurn(history: ChatMessage[], userMessage: string): Promise<Ch
       const hotels = await executeSearchHotels({});
       if (hotels.ok && Array.isArray((hotels.data as Record<string, unknown>)?.hotels)) {
         const hs = (hotels.data as { hotels: Array<Record<string, unknown>> }).hotels;
-        reply = `岘港和会安一带我们直签了 ${hs.length} 家酒店，价格从 ¥${hs[hs.length - 1]?.basePrice ?? 1480} / 晚起：\n` +
-          hs.slice(0, 3).map((h, i) => `${i + 1}. ${h.name} — ¥${h.basePrice}/晚 · ${h.highlight ?? ''}`).join('\n') +
+        const cheapest = hs.reduce((acc: number, h) => {
+          const rooms = (h.rooms as Array<Record<string, unknown>>) ?? [];
+          const r = rooms[0]?.basePrice as number | undefined;
+          return r && (!acc || r < acc) ? r : acc;
+        }, 0);
+        reply = `岘港和会安一带我们直签了 ${hs.length} 家酒店${cheapest ? `，价格从 ¥${cheapest}/晚起` : ''}：\n` +
+          hs.slice(0, 3).map((h, i) => `${i + 1}. ${h.name} — ${h.starRating}★ · ${h.highlight ?? ''}`).join('\n') +
           '\n\n告诉我哪家 + 几晚，我帮你算总价。';
       } else {
         reply = '酒店列表加载失败，请稍后重试。';
@@ -1051,10 +1056,10 @@ async function mockTurn(history: ChatMessage[], userMessage: string): Promise<Ch
       const visas = await executeSearchVisas({});
       if (visas.ok && Array.isArray((visas.data as Record<string, unknown>)?.visas)) {
         const vs = (visas.data as { visas: Array<Record<string, unknown>> }).visas;
-        const vn = vs.find((v) => (v.destinationCountry as string) === 'VN') ?? vs[0];
-        reply = `越南签证我们能办几种：\n` +
-          vs.filter((v) => (v.destinationCountry as string) === 'VN').slice(0, 3).map((v, i) => `${i + 1}. ${v.visaName ?? v.visaType} — ¥${v.basePrice} · ${v.processingDays} 个工作日`).join('\n') +
-          (vn ? `\n\n最常用的是 ${vn.visaName ?? 'E-visa'}，需要护照首页 + 证件照。要办几位？` : '');
+        const vn = vs.filter((v) => (v.countryCode as string) === 'VN');
+        reply = (vn.length ? `越南签证我们能办几种：\n` : `常见签证产品：\n`) +
+          (vn.length ? vn : vs).slice(0, 4).map((v, i) => `${i + 1}. ${v.country} ${v.name} — ¥${v.basePrice} · ${v.processingDays} 个工作日`).join('\n') +
+          (vn[0] ? `\n\n最常用的是 ${vn[0].name}，需要护照首页 + 证件照。要办几位？` : '');
       } else {
         reply = '签证产品加载失败。常用的：越南 E-visa ¥280/人，5 个工作日出。';
       }
