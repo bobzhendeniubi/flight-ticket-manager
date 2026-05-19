@@ -570,7 +570,7 @@ async function seedHotels() {
 
 async function seedTransfers() {
   const TRANSFERS = [
-    { name: '岘港机场接送 · 经济轿车', vehicleType: '舒适型轿车（4 座）', capacity: 3, basePrice: 98, originArea: '岘港机场 (DAD)', destArea: '美溪海滩 / 市区任一酒店', emoji: '🚗', photo: 'https://images.unsplash.com/photo-1549317661-bd32c8ce0afa?w=600&h=400&fit=crop', features: ['含中文司机', '免费等候 60 分钟', '含儿童安全座椅', '矿泉水'], duration: '约 15 分钟' },
+    { name: '岘港机场接送 · 经济轿车', vehicleType: '舒适型轿车（4 座）', capacity: 3, basePrice: 98, originArea: '岘港机场 (DAD)', destArea: '美溪海滩 / 市区任一酒店', emoji: '🚗', photo: 'https://images.unsplash.com/photo-1502877338535-766e1452684a?w=600&h=400&fit=crop', features: ['含中文司机', '免费等候 60 分钟', '含儿童安全座椅', '矿泉水'], duration: '约 15 分钟' },
     { name: '岘港机场接送 · 7 座商务车', vehicleType: '7 座 MPV（如丰田 Innova）', capacity: 6, basePrice: 188, originArea: '岘港机场 (DAD)', destArea: '美溪海滩 / 山茶半岛 / 市区', emoji: '🚐', photo: 'https://images.unsplash.com/photo-1544620347-c4fd4a3d5957?w=600&h=400&fit=crop', features: ['家庭首选', '6 大件行李空间', '中文司机', '免费等候 60 分钟'], duration: '约 15–30 分钟' },
     { name: '岘港 → 会安古城 专车', vehicleType: '舒适型轿车 / 商务车', capacity: 6, basePrice: 248, originArea: '岘港酒店', destArea: '会安古城', emoji: '🏮', photo: 'https://images.unsplash.com/photo-1519641471654-76ce0107ad1b?w=600&h=400&fit=crop', features: ['单程约 45 分钟', '可中途停美溪海滩拍照', '含中文司机'], duration: '约 45 分钟' },
     { name: '巴拿山 1 日包车', vehicleType: '7 座商务车', capacity: 6, basePrice: 588, originArea: '岘港酒店', destArea: '巴拿山法国小镇 + 佛手黄金桥', emoji: '🌉', photo: 'https://images.unsplash.com/photo-1506905925346-21bda4d32df4?w=600&h=400&fit=crop', features: ['8 小时包车', '含门票预订代购', '含中文司机', '可加购法式小镇午餐'], duration: '单程约 40 分钟' },
@@ -591,7 +591,7 @@ async function seedTransfers() {
 async function seedVisas() {
   const VISAS = [
     { destinationCountry: 'VN', country: '越南', flag: '🇻🇳', photo: 'https://images.unsplash.com/photo-1559592413-7cec4d0cae2b?w=600&h=400&fit=crop', visaType: 'e_visa', visaName: '电子签证 E-visa · 30 天单次', processingDays: 3, basePrice: 280, expressSurcharge: 150, validityMonths: 1, highlight: '最热销 · 全流程线上', requiredDocs: ['护照首页扫描件', '2 寸白底照片电子版'] },
-    { destinationCountry: 'VN', country: '越南', flag: '🇻🇳', photo: 'https://images.unsplash.com/photo-1557750255-c76072a7fdf1?w=600&h=400&fit=crop', visaType: 'e_visa_90d', visaName: '电子签证 E-visa · 90 天多次', processingDays: 5, basePrice: 680, expressSurcharge: 300, validityMonths: 3, highlight: '适合多次往返商务旅客', requiredDocs: ['护照首页扫描件', '2 寸白底照片电子版', '行程单'] },
+    { destinationCountry: 'VN', country: '越南', flag: '🇻🇳', photo: 'https://images.unsplash.com/photo-1488646953014-85cb44e25828?w=600&h=400&fit=crop', visaType: 'e_visa_90d', visaName: '电子签证 E-visa · 90 天多次', processingDays: 5, basePrice: 680, expressSurcharge: 300, validityMonths: 3, highlight: '适合多次往返商务旅客', requiredDocs: ['护照首页扫描件', '2 寸白底照片电子版', '行程单'] },
     { destinationCountry: 'VN', country: '越南', flag: '🇻🇳', photo: 'https://images.unsplash.com/photo-1583417319070-4a69db38a482?w=600&h=400&fit=crop', visaType: 'visa_on_arrival', visaName: '落地签批文', processingDays: 2, basePrice: 180, expressSurcharge: 80, validityMonths: 1, highlight: '最快办理，适合临时出行', requiredDocs: ['护照首页扫描件'] },
     { destinationCountry: 'VN', country: '越南', flag: '🇻🇳', photo: 'https://images.unsplash.com/photo-1528127269322-539801943592?w=600&h=400&fit=crop', visaType: 'business_1y', visaName: '商务邀请函签证（1 年多次）', processingDays: 10, basePrice: 980, expressSurcharge: 500, validityMonths: 12, highlight: '需我方协助发邀请函', requiredDocs: ['护照首页扫描件', '照片', '在职证明', '越南公司邀请函'] },
     { destinationCountry: 'KH', country: '柬埔寨', flag: '🇰🇭', photo: 'https://images.unsplash.com/photo-1563492065599-3520f775eeed?w=600&h=400&fit=crop', visaType: 'e_visa', visaName: '电子签证 E-visa', processingDays: 3, basePrice: 320, expressSurcharge: 120, validityMonths: 3, requiredDocs: ['护照扫描件', '照片'] },
@@ -616,6 +616,7 @@ async function seedBundles() {
       name: '经典度假 3 晚 · 凯悦海景',
       tagline: '来回机票 + 凯悦海景 3 晚 + 来回接送',
       emoji: '🏖️',
+      photo: 'https://images.unsplash.com/photo-1540541338287-41700207dee6?w=600&h=400&fit=crop',
       flightPax: 2,
       groundDiscount: 380,
       suitableFor: '2 人 · 情侣/家庭',
@@ -629,6 +630,7 @@ async function seedBundles() {
       name: '蜜月豪华 4 晚 · 洲际半岛',
       tagline: '来回机票 + 洲际半岛 + 巴拿山佛手桥 + 签证全包',
       emoji: '💍',
+      photo: 'https://images.unsplash.com/photo-1564501049412-61c2a3083791?w=600&h=400&fit=crop',
       flightPax: 2,
       groundDiscount: 1200,
       suitableFor: '2 人 · 蜜月/纪念日',
@@ -644,6 +646,7 @@ async function seedBundles() {
       name: '商务快闪 1 晚 · 商务舱',
       tagline: '商务舱来回 + 市区公寓 + 签证 + 豪华接送',
       emoji: '💼',
+      photo: 'https://images.unsplash.com/photo-1571003123894-1f0594d2b5d9?w=600&h=400&fit=crop',
       flightPax: 1,
       groundDiscount: 200,
       suitableFor: '1 人 · 商务',

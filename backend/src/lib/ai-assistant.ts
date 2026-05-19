@@ -988,24 +988,198 @@ export async function runChatTurn(
 }
 
 // ── Mock 模式（没 API key 时也能 demo）──────────────────────
-function mockTurn(history: ChatMessage[], userMessage: string): ChatTurnResult {
-  const reply = `[Mock 模式 · OPENAI_API_KEY 未配置]
-我会建议你试着说："明天去岘港的机票，2 个人，经济舱"。
-真正接入 OpenAI 后，我会自动调 search_flights / propose_order 把订单草稿生成给你确认。
+// 启发式规则解析常见意图（机票/酒店/签证/接送/套餐 + 日期 + 人数 + 舱位），
+// 调真实 tool executor 取库存数据 + 用 propose_order 生成订单草稿。
+// 适合：没 AI API key 时演示完整下单流程；OpenAI 被地区屏蔽时兜底。
+async function mockTurn(history: ChatMessage[], userMessage: string): Promise<ChatTurnResult> {
+  const intent = parseUserIntent(userMessage);
+  const proposals: Array<Record<string, unknown>> = [];
+  let reply = '';
 
-配置方式：
-  export OPENAI_API_KEY=sk-...
-  export OPENAI_MODEL=gpt-5-mini   # 可选，默认 gpt-5-mini
-  cd backend && npm run dev`;
+  try {
+    if (intent.kind === 'greeting') {
+      reply = '你好！我可以帮你订澳门 ↔ 岘港的机票、岘港酒店、接送、越南签证，或者一价全包套餐。\n\n你可以这样说：\n· "明天去岘港，2 人经济舱"\n· "下周三去岘港，3 晚海景酒店"\n· "越南签证，急加"\n· "看下套餐推荐"';
+    } else if (intent.kind === 'flight') {
+      const flights = await executeSearchFlights({
+        origin: 'MFM',
+        destination: 'DAD',
+        date: intent.date,
+        cabin: intent.cabin,
+        passengers: intent.passengers,
+      });
+      if (flights.ok && Array.isArray((flights.data as Record<string, unknown>)?.results)) {
+        const results = (flights.data as { results: Array<Record<string, unknown>> }).results;
+        if (results.length > 0) {
+          const f = results[0];
+          const scheduleId = f.scheduleId as string;
+          const selectedCabin = intent.cabin ?? 'ECONOMY';
+          const prop = await executeProposeOrder({
+            items: [{ kind: 'FLIGHT', scheduleId, cabin: selectedCabin, passengers: intent.passengers }],
+          });
+          if (prop.ok && prop.data) {
+            proposals.push(prop.data as Record<string, unknown>);
+            const dateLabel = intent.date ?? '最近一天';
+            reply = `好的，给你找到 ${dateLabel} 澳门 → 岘港的航班，${intent.passengers} 人 ${cabinLabel(selectedCabin)}。\n方案已经准备好，确认下单点 "确认" 即可。`;
+          } else {
+            reply = `找到航班但生成方案时出错了：${prop.ok ? '未知错误' : prop.error}。可以试着说 "${results[0].flightNumber} ${intent.passengers} 人经济舱" 让我再试一次。`;
+          }
+        } else {
+          reply = `${intent.date ? intent.date : '该日期'} 暂时没有符合条件的航班。我们的 QH9588/9589 每天 1 班，可以换个日期试试。`;
+        }
+      } else {
+        reply = '航班查询失败，请稍后重试。或者直接说 "明天去岘港 2 人经济舱"。';
+      }
+    } else if (intent.kind === 'hotel') {
+      const hotels = await executeSearchHotels({});
+      if (hotels.ok && Array.isArray((hotels.data as Record<string, unknown>)?.hotels)) {
+        const hs = (hotels.data as { hotels: Array<Record<string, unknown>> }).hotels;
+        reply = `岘港和会安一带我们直签了 ${hs.length} 家酒店，价格从 ¥${hs[hs.length - 1]?.basePrice ?? 1480} / 晚起：\n` +
+          hs.slice(0, 3).map((h, i) => `${i + 1}. ${h.name} — ¥${h.basePrice}/晚 · ${h.highlight ?? ''}`).join('\n') +
+          '\n\n告诉我哪家 + 几晚，我帮你算总价。';
+      } else {
+        reply = '酒店列表加载失败，请稍后重试。';
+      }
+    } else if (intent.kind === 'visa') {
+      const visas = await executeSearchVisas({});
+      if (visas.ok && Array.isArray((visas.data as Record<string, unknown>)?.visas)) {
+        const vs = (visas.data as { visas: Array<Record<string, unknown>> }).visas;
+        const vn = vs.find((v) => (v.destinationCountry as string) === 'VN') ?? vs[0];
+        reply = `越南签证我们能办几种：\n` +
+          vs.filter((v) => (v.destinationCountry as string) === 'VN').slice(0, 3).map((v, i) => `${i + 1}. ${v.visaName ?? v.visaType} — ¥${v.basePrice} · ${v.processingDays} 个工作日`).join('\n') +
+          (vn ? `\n\n最常用的是 ${vn.visaName ?? 'E-visa'}，需要护照首页 + 证件照。要办几位？` : '');
+      } else {
+        reply = '签证产品加载失败。常用的：越南 E-visa ¥280/人，5 个工作日出。';
+      }
+    } else if (intent.kind === 'transfer') {
+      const ts = await executeSearchTransfers({});
+      if (ts.ok && Array.isArray((ts.data as Record<string, unknown>)?.transfers)) {
+        const tr = (ts.data as { transfers: Array<Record<string, unknown>> }).transfers;
+        reply = `岘港接送/包车有 ${tr.length} 种车型：\n` +
+          tr.slice(0, 4).map((t, i) => `${i + 1}. ${t.name} — ¥${t.basePrice}起`).join('\n') +
+          '\n\n说一下日期 + 起止地点，我帮你算价。';
+      } else {
+        reply = '接送产品加载失败。';
+      }
+    } else if (intent.kind === 'bundle') {
+      const bd = await executeSearchBundles();
+      if (bd.ok && Array.isArray((bd.data as Record<string, unknown>)?.bundles)) {
+        const bs = (bd.data as { bundles: Array<Record<string, unknown>> }).bundles;
+        reply = `我们有 ${bs.length} 个套餐：\n` +
+          bs.map((b, i) => `${i + 1}. ${b.name} — ${b.tagline}（地面省 ¥${b.groundDiscount}）`).join('\n') +
+          '\n\n哪个套餐适合你？告诉我出行日期和人数。';
+      } else {
+        reply = '套餐列表加载失败。';
+      }
+    } else {
+      reply = `我没完全 get 到你的意思。你可以试着说：\n· "明天 2 人去岘港，经济舱"\n· "推荐岘港 3 晚海景酒店"\n· "越南签证"\n· "套餐推荐"`;
+    }
+  } catch (err) {
+    reply = `本地演示遇到点小问题：${err instanceof Error ? err.message : String(err)}\n可以稍等再试。`;
+  }
+
   return {
     reply,
-    proposals: [],
+    proposals,
     messages: [
       ...history,
       { role: 'user', content: userMessage },
       { role: 'assistant', content: reply },
     ],
-    debug: { toolCalls: 0, promptTokens: 0, completionTokens: 0, totalTokens: 0, model: env.OPENAI_MODEL },
+    debug: { toolCalls: proposals.length, promptTokens: 0, completionTokens: 0, totalTokens: 0, model: env.OPENAI_MODEL },
     mocked: true,
   };
+}
+
+// 启发式解析用户消息：抓意图 + 日期 + 人数 + 舱位
+interface ParsedIntent {
+  kind: 'greeting' | 'flight' | 'hotel' | 'visa' | 'transfer' | 'bundle' | 'unknown';
+  date?: string;
+  passengers: number;
+  cabin?: CabinClass;
+}
+
+function parseUserIntent(msg: string): ParsedIntent {
+  const m = msg.trim().toLowerCase();
+  const passengers = parsePassengers(msg);
+  const cabin = parseCabin(m);
+  const date = parseDate(m);
+
+  if (/^(hi|hello|你好|您好|hey)\s*[，,。.！!？?]*$/.test(m) || m.length < 3) {
+    return { kind: 'greeting', passengers, cabin, date };
+  }
+  if (/机票|航班|飞机|flight|airline|tickets?|经济舱|商务舱|头等舱|business|economy/.test(m)) {
+    return { kind: 'flight', passengers, cabin, date };
+  }
+  if (/酒店|住|宿|入住|hotel|resort|stay/.test(m)) {
+    return { kind: 'hotel', passengers, cabin, date };
+  }
+  if (/签证|visa|出签|护照|passport/.test(m) && !/送/.test(m)) {
+    return { kind: 'visa', passengers, cabin, date };
+  }
+  if (/接送|包车|接机|送机|transfer|车|taxi|driver|chauffeur/.test(m)) {
+    return { kind: 'transfer', passengers, cabin, date };
+  }
+  if (/套餐|bundle|package|combo|deal/.test(m)) {
+    return { kind: 'bundle', passengers, cabin, date };
+  }
+  if (date || passengers > 1) {
+    return { kind: 'flight', passengers, cabin, date };
+  }
+  return { kind: 'unknown', passengers, cabin, date };
+}
+
+function parsePassengers(msg: string): number {
+  const m = msg.match(/(\d+)\s*(?:个人|个|人|大人|位|pax|people|adults?|persons?|名)/i);
+  if (m) return Math.min(Math.max(parseInt(m[1], 10), 1), 9);
+  return 1;
+}
+
+function parseCabin(msg: string): CabinClass | undefined {
+  if (/头等舱|first[\s-]?class/.test(msg)) return 'FIRST' as CabinClass;
+  if (/商务舱|business[\s-]?class/.test(msg)) return 'BUSINESS' as CabinClass;
+  if (/超级经济舱|premium[\s-]?economy/.test(msg)) return 'PREMIUM_ECONOMY' as CabinClass;
+  if (/经济舱|economy/.test(msg)) return 'ECONOMY' as CabinClass;
+  return undefined;
+}
+
+function parseDate(msg: string): string | undefined {
+  const now = new Date();
+  const y = now.getFullYear();
+  if (/明天|tomorrow|tmr/i.test(msg)) return offsetDate(now, 1);
+  if (/后天|day after tomorrow/i.test(msg)) return offsetDate(now, 2);
+  if (/大后天/.test(msg)) return offsetDate(now, 3);
+  const weekdayMap: Record<string, number> = {
+    一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 日: 0, 天: 0,
+    monday: 1, tuesday: 2, wednesday: 3, thursday: 4, friday: 5, saturday: 6, sunday: 0,
+  };
+  const nextWeek = msg.match(/下周([一二三四五六日天])|next\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)/i);
+  if (nextWeek) {
+    const key = (nextWeek[1] || nextWeek[2]).toLowerCase();
+    const target = weekdayMap[key];
+    if (target !== undefined) {
+      const today = now.getDay();
+      const diff = (7 - today + target) % 7 || 7;
+      return offsetDate(now, diff);
+    }
+  }
+  let m = msg.match(/(\d{4})[-/](\d{1,2})[-/](\d{1,2})/);
+  if (m) return `${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}`;
+  m = msg.match(/(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]?/);
+  if (m) return `${y}-${m[1].padStart(2, '0')}-${m[2].padStart(2, '0')}`;
+  m = msg.match(/\b(\d{1,2})[-/](\d{1,2})\b/);
+  if (m) return `${y}-${m[1].padStart(2, '0')}-${m[2].padStart(2, '0')}`;
+  return undefined;
+}
+
+function offsetDate(base: Date, days: number): string {
+  const d = new Date(base);
+  d.setDate(d.getDate() + days);
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const dd = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${dd}`;
+}
+
+function cabinLabel(c: CabinClass): string {
+  return { ECONOMY: '经济舱', PREMIUM_ECONOMY: '超级经济舱', BUSINESS: '商务舱', FIRST: '头等舱' }[c] ?? c;
 }

@@ -375,7 +375,7 @@ export function AiAssistant() {
                     <div className="whitespace-pre-wrap">{m.text}</div>
                   )}
                   {m.mocked && (
-                    <div className="mt-1 text-xs opacity-70">(运维未配 OPENAI_API_KEY，AI 走 mock 模式)</div>
+                    <div className="mt-1 text-xs opacity-70">⚙ 本地演示模式（基于规则匹配，未接 LLM）</div>
                   )}
                 </div>
                 {m.proposals?.map((p, pi) => (
