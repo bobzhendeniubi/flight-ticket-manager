@@ -923,6 +923,7 @@ export async function runChatTurn(
   const proposals: Array<Record<string, unknown>> = [];
   let finalReply = '';
 
+  try {
   for (let iter = 0; iter < MAX_TOOL_ITERATIONS; iter++) {
     const response = await client.chat.completions.create({
       model: env.OPENAI_MODEL,
@@ -970,6 +971,13 @@ export async function runChatTurn(
 
   if (!finalReply) {
     finalReply = '（达到工具调用上限，请重新组织你的需求再试一次）';
+  }
+  } catch (err) {
+    // LLM 调用失败（403 region-blocked / 401 bad key / rate limit / network）
+    // 自动 fallback 到本地智能 mock，让 demo 不中断
+    // eslint-disable-next-line no-console
+    console.warn('[ai] LLM call failed, falling back to mock:', err instanceof Error ? err.message : String(err));
+    return mockTurn(history, userMessage);
   }
 
   return {
