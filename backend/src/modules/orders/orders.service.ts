@@ -389,6 +389,34 @@ export class OrderService {
         ...(query.to ? { lte: new Date(`${query.to}T23:59:59Z`) } : {}),
       };
     }
+    // 按出行日期筛选 — 跨 OrderItem 多种字段
+    // FLIGHT: 取 schedule.departureTime；HOTEL: hotelCheckIn；其他暂时用 createdAt 兜底
+    if (query.travelFrom || query.travelTo) {
+      const start = query.travelFrom ? new Date(`${query.travelFrom}T00:00:00Z`) : undefined;
+      const end = query.travelTo ? new Date(`${query.travelTo}T23:59:59Z`) : undefined;
+      where.items = {
+        some: {
+          OR: [
+            {
+              flightSchedule: {
+                departureTime: {
+                  ...(start ? { gte: start } : {}),
+                  ...(end ? { lte: end } : {}),
+                },
+              },
+            },
+            {
+              hotelCheckIn: {
+                ...(start ? { gte: start } : {}),
+                ...(end ? { lte: end } : {}),
+              },
+            },
+          ],
+        },
+      };
+    }
+    if (query.claimedById) where.claimedById = query.claimedById;
+    if (query.unclaimedOnly) where.claimedById = null;
     if (query.search) {
       where.OR = [
         { orderNumber: { contains: query.search, mode: 'insensitive' } },
@@ -405,6 +433,7 @@ export class OrderService {
           passengers: { select: { id: true, fullName: true } },
           agent: { select: { id: true, companyName: true, contactName: true } },
           user: { select: { id: true, displayName: true, email: true } },
+          claimedBy: { select: { id: true, displayName: true, email: true } },
         },
         orderBy: { createdAt: 'desc' },
         take: query.pageSize,
@@ -427,12 +456,17 @@ export class OrderService {
       where: { id },
       include: {
         items: true,
-        passengers: true,
+        passengers: true, // 含护照/签证/地址全部新字段
         payments: true,
         refunds: true,
         statusEvents: { orderBy: { createdAt: 'asc' } },
         agent: { select: { id: true, companyName: true, contactName: true } },
         user: { select: { id: true, displayName: true, email: true } },
+        claimedBy: { select: { id: true, displayName: true, email: true } },
+        reminders: {
+          orderBy: [{ status: 'asc' }, { priority: 'desc' }, { createdAt: 'desc' }],
+          include: { createdBy: { select: { id: true, displayName: true } } },
+        },
       },
     });
     if (!order) throw new NotFoundError('订单不存在');
@@ -802,16 +836,40 @@ const ORDER_FULL_INCLUDE = {
 
 // ── Helpers ────────────────────────────────────────────────────────────
 function passengerToData(p: PassengerInput) {
+  // 自动拆 fullName → lastName/firstName，如果客户端没传
+  const [autoLast, ...rest] = (p.fullName || '').trim().split(/\s+/);
+  const autoFirst = rest.join(' ');
   return {
     fullName: p.fullName,
+    lastName: p.lastName ?? autoLast ?? null,
+    firstName: p.firstName ?? autoFirst ?? null,
+    title: p.title ?? null,
+    gender: p.gender ?? null,
     documentType: p.documentType,
     documentNumber: p.documentNumber,
     dateOfBirth: new Date(p.dateOfBirth),
+    placeOfBirth: p.placeOfBirth ?? null,
     nationality: p.nationality,
     passengerType: p.passengerType,
+    passportIssueCountry: p.passportIssueCountry ?? null,
+    passportExpiry: p.passportExpiry ? new Date(p.passportExpiry) : null,
+    visaNumber: p.visaNumber ?? null,
+    visaType: p.visaType ?? null,
+    visaIssueDate: p.visaIssueDate ? new Date(p.visaIssueDate) : null,
+    visaExpiry: p.visaExpiry ? new Date(p.visaExpiry) : null,
+    visaPlaceOfIssue: p.visaPlaceOfIssue ?? null,
+    visaCountryOfApplication: p.visaCountryOfApplication ?? null,
+    addressType: p.addressType ?? null,
+    addressDetails: p.addressDetails ?? null,
+    addressCity: p.addressCity ?? null,
+    addressState: p.addressState ?? null,
+    addressCountry: p.addressCountry ?? null,
+    addressZip: p.addressZip ?? null,
     mealPreference: p.mealPreference,
     needsWheelchair: p.needsWheelchair ?? false,
     needsInfantBassinet: p.needsInfantBassinet ?? false,
+    bedPref: p.bedPref ?? null,
+    passportPhotoUrl: p.passportPhotoUrl ?? null,
   };
 }
 

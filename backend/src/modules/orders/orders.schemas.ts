@@ -9,17 +9,46 @@ import {
 } from '@prisma/client';
 
 // ── 下单 ─────────────────────────────────────────────────────────────────
-// 乘客信息
+// 乘客信息 — 注：所有新字段都是 optional，老客户端可继续工作
 export const passengerInputSchema = z.object({
   fullName: z.string().min(1).max(120),
+  // 航司 PNR 拆分姓/名（fullName 仍必填做兼容）
+  lastName: z.string().max(60).optional(),
+  firstName: z.string().max(80).optional(),
+  title: z.enum(['MR', 'MRS', 'MS', 'MSTR', 'MISS', 'DR']).optional(),
+  gender: z.enum(['M', 'F', 'X']).optional(),
   documentType: z.nativeEnum(DocumentType).default('PASSPORT'),
   documentNumber: z.string().min(3).max(40),
   dateOfBirth: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  placeOfBirth: z.string().max(60).optional(),
   nationality: z.string().length(2).default('CN'),
   passengerType: z.nativeEnum(PassengerType).default('ADULT'),
+
+  // 护照扩展
+  passportIssueCountry: z.string().length(2).optional(),
+  passportExpiry: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+
+  // 签证
+  visaNumber: z.string().max(40).optional(),
+  visaType: z.string().max(40).optional(),
+  visaIssueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  visaExpiry: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  visaPlaceOfIssue: z.string().max(60).optional(),
+  visaCountryOfApplication: z.string().length(2).optional(),
+
+  // 地址（航司提交格式）
+  addressType: z.enum(['BUSINESS', 'RESIDENTIAL']).optional(),
+  addressDetails: z.string().max(200).optional(),
+  addressCity: z.string().max(60).optional(),
+  addressState: z.string().max(60).optional(),
+  addressCountry: z.string().length(2).optional(),
+  addressZip: z.string().max(20).optional(),
+
   mealPreference: z.string().max(40).optional(),
   needsWheelchair: z.boolean().optional(),
   needsInfantBassinet: z.boolean().optional(),
+  bedPref: z.enum(['SINGLE', 'DOUBLE', 'TWIN', 'SHARE_OK']).optional(),
+  passportPhotoUrl: z.string().url().optional(),
 });
 export type PassengerInput = z.infer<typeof passengerInputSchema>;
 
@@ -91,8 +120,14 @@ export const listOrdersQuerySchema = z.object({
   agentId: z.string().optional(),
   kind: z.nativeEnum(OrderItemKind).optional(),
   search: z.string().max(120).optional(), // 订单号/姓名/电话
-  from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
-  to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),  // 下单日期起
+  to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),    // 下单日期止
+  // 按出行日期筛选（票务/签证流程按日期批量处理，反馈高优需求）
+  travelFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  travelTo: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  // 接单状态过滤
+  claimedById: z.string().optional(),   // 指定 ops
+  unclaimedOnly: z.coerce.boolean().optional(),
   page: z.coerce.number().int().min(1).default(1),
   pageSize: z.coerce.number().int().min(1).max(200).default(50),
 });

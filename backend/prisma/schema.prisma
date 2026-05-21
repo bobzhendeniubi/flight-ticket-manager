@@ -33,6 +33,28 @@ enum PassengerType {
   INFANT
 }
 
+// 航司提交格式需要：M/F；X 留给非常规护照
+enum Gender {
+  M
+  F
+  X
+}
+
+// 操作部待办状态机
+enum ReminderStatus {
+  OPEN          // 新建待处理
+  IN_PROGRESS   // 已认领处理中
+  DONE          // 完成
+  SKIPPED       // 不处理（含原因）
+}
+
+enum ReminderPriority {
+  LOW
+  NORMAL
+  HIGH
+  CRITICAL      // 签证截止/航班延误等
+}
+
 model User {
   id             String    @id @default(cuid())
   email          String?   @unique
@@ -50,11 +72,14 @@ model User {
 
   refreshTokens    RefreshToken[]
   savedPassengers  SavedPassenger[]
-  orders           Order[]
+  orders           Order[]                @relation("OrderUser")
+  claimedOrders    Order[]                @relation("OrderClaimedBy")
   agentProfile     Agent?
   orderEvents      OrderStatusEvent[]
   customerProfile  CustomerProfile?
   auditLogs        AuditLog[]
+  remindersCreated OperationalReminder[]  @relation("ReminderCreator")
+  remindersClaimed OperationalReminder[]  @relation("ReminderClaimedBy")
 
   @@index([role])
   @@index([createdAt])
@@ -563,12 +588,19 @@ model Order {
   contactEmail    String?
   paymentExpiresAt DateTime?
   idempotencyKey  String?     @unique
-  notes           String?
+  notes           String?     // 客户填写的特殊说明
+  internalNotes   String?     // 运营/客服内部备忘（客户看不到）
+  // 防漏单：哪位运营接的单 + 接单时间
+  claimedById     String?
+  claimedAt       DateTime?
+  // 套票拼房分配 — { roomGroups: [{ id, hotelName, roomType, passengerIds: [], notes }] }
+  roomAssignment  Json?
   createdAt       DateTime    @default(now())
   updatedAt       DateTime    @updatedAt
 
-  user              User               @relation(fields: [userId], references: [id])
+  user              User               @relation("OrderUser", fields: [userId], references: [id])
   agent             Agent?             @relation(fields: [agentId], references: [id])
+  claimedBy         User?              @relation("OrderClaimedBy", fields: [claimedById], references: [id], onDelete: SetNull)
   items             OrderItem[]
   passengers        Passenger[]
   payments          Payment[]
@@ -576,11 +608,13 @@ model Order {
   statusEvents      OrderStatusEvent[]
   commissionRecords CommissionRecord[]
   notifications     NotificationLog[]
+  reminders         OperationalReminder[]
 
   @@index([userId, createdAt])
   @@index([agentId, createdAt])
   @@index([status])
   @@index([createdAt])
+  @@index([claimedById])
 }
 
 model OrderItem {
@@ -664,14 +698,46 @@ model Passenger {
   id             String        @id @default(cuid())
   orderId        String
   fullName       String
+  // 航司 PNR 标准字段：姓 / 名 拆开（fullName 仍保留兼容）
+  lastName       String?
+  firstName      String?
+  title          String?       // MR / MRS / MS / MSTR / MISS
+  gender         Gender?
   documentType   DocumentType
   documentNumber String
   dateOfBirth    DateTime
+  placeOfBirth   String?
   nationality    String
   passengerType  PassengerType @default(ADULT)
+
+  // ── 护照扩展（出票 + 签证用）──
+  passportIssueCountry String?     // 颁发国 ISO-2，如 CHN
+  passportExpiry       DateTime?   @db.Date
+
+  // ── 签证（已签发的，给出票/接送参考）──
+  visaNumber                 String?
+  visaType                   String?    // E-visa / Sticker / Approval letter
+  visaIssueDate              DateTime?  @db.Date
+  visaExpiry                 DateTime?  @db.Date
+  visaPlaceOfIssue           String?
+  visaCountryOfApplication   String?
+
+  // ── 地址（航司提交格式需要）──
+  addressType    String?    // BUSINESS / RESIDENTIAL
+  addressDetails String?    // 详细地址
+  addressCity    String?
+  addressState   String?
+  addressCountry String?    // ISO-2
+  addressZip     String?
+
   mealPreference String?
   needsWheelchair Boolean      @default(false)
   needsInfantBassinet Boolean  @default(false)
+  // 拼房用 — 客人偏好：SINGLE/DOUBLE/TWIN/SHARE_OK
+  bedPref        String?
+  // 护照照片（OCR 上传或人工补传）
+  passportPhotoUrl String?
+
   pnr            String?       // booked PNR from airline
   eticketNumber  String?
   createdAt      DateTime      @default(now())
@@ -896,4 +962,33 @@ model DateRanking {
   updatedAt DateTime @updatedAt
 
   @@index([date])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Operational Reminders（操作部待办/特殊提醒）
+// 用户场景：签证截止前要送批文；出票前要拿酒店单过海关；客人特殊改期
+// ─────────────────────────────────────────────────────────────────────────────
+model OperationalReminder {
+  id           String           @id @default(cuid())
+  orderId      String?          // 可选关联订单（独立待办则为 null）
+  createdById  String           // 提单人
+  claimedById  String?          // 认领人（null = 未认领）
+  title        String           // 一句话标题
+  body         String?          // 详细说明
+  dueAt        DateTime?        @db.Date
+  priority     ReminderPriority @default(NORMAL)
+  status       ReminderStatus   @default(OPEN)
+  attachmentUrl String?         // 截图 / 文件链接（小程序/客人发来的）
+  resolvedAt   DateTime?
+  resolvedNote String?          // 完成或跳过的说明
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+
+  order      Order? @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  createdBy  User   @relation("ReminderCreator", fields: [createdById], references: [id])
+  claimedBy  User?  @relation("ReminderClaimedBy", fields: [claimedById], references: [id], onDelete: SetNull)
+
+  @@index([orderId])
+  @@index([status, priority, dueAt])
+  @@index([claimedById, status])
 }
