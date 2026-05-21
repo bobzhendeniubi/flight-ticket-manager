@@ -83,6 +83,10 @@ export function OrdersPage() {
   const [channelFilter, setChannelFilter] = useState<'' | 'direct' | 'agent'>('');
   const [agentFilter, setAgentFilter] = useState<string>('');
   const [search, setSearch] = useState('');
+  // 5/20 反馈：按出行日期筛 + 是否已认领
+  const [travelFrom, setTravelFrom] = useState('');
+  const [travelTo, setTravelTo] = useState('');
+  const [claimFilter, setClaimFilter] = useState<'' | 'unclaimed' | 'mine'>('');
   const [selected, setSelected] = useState<OrderSummary | null>(null);
   // ── 批量管理状态 ─────────────────────────────────────
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -96,13 +100,17 @@ export function OrdersPage() {
   // 强制模式默认开（管理员手动改状态的核心场景就是绕开标准流转）
   const [forceMode, setForceMode] = useState(true);
 
-  // 拉取订单
+  // 拉取订单 — travelFrom/To/claimFilter 变化时重拉（后端按出行日期 + 接单状态过滤）
   useEffect(() => {
     if (!tokens?.accessToken) return;
     let cancelled = false;
     setLoading(true);
     setError(null);
-    api.listOrders(tokens.accessToken, { pageSize: 200 })
+    const query: Record<string, string | number | undefined> = { pageSize: 200 };
+    if (travelFrom) query.travelFrom = travelFrom;
+    if (travelTo) query.travelTo = travelTo;
+    if (claimFilter === 'unclaimed') query.unclaimedOnly = '1';
+    api.listOrders(tokens.accessToken, query)
       .then((res) => {
         if (cancelled) return;
         setOrders(res.orders);
@@ -115,7 +123,7 @@ export function OrdersPage() {
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [tokens?.accessToken]);
+  }, [tokens?.accessToken, travelFrom, travelTo, claimFilter]);
 
   // 视图层把 OrderSummary 映射成便于筛选/展示的数据
   const ordersView = useMemo(
@@ -346,6 +354,35 @@ export function OrdersPage() {
               {FILTER_STATUSES.map((s) => (
                 <option key={s} value={s}>{STATUS_LABEL[s]}</option>
               ))}
+            </select>
+          </div>
+          <div>
+            <label className="label">出行起始</label>
+            <input
+              type="date"
+              className="input"
+              value={travelFrom}
+              onChange={(e) => setTravelFrom(e.target.value)}
+            />
+          </div>
+          <div>
+            <label className="label">出行截止</label>
+            <input
+              type="date"
+              className="input"
+              value={travelTo}
+              onChange={(e) => setTravelTo(e.target.value)}
+            />
+          </div>
+          <div>
+            <label className="label">接单状态</label>
+            <select
+              className="input"
+              value={claimFilter}
+              onChange={(e) => setClaimFilter(e.target.value as '' | 'unclaimed' | 'mine')}
+            >
+              <option value="">全部</option>
+              <option value="unclaimed">🆕 未接单</option>
             </select>
           </div>
           <div>
@@ -689,17 +726,13 @@ function OrderDrawer({
             <p className="mt-2 text-xs text-slate-500">共 {order.passengers.length} 位乘客</p>
           </section>
 
-          <section>
-            <h3 className="text-sm font-medium text-slate-700">乘客</h3>
-            <ul className="mt-2 space-y-1 text-sm text-slate-700">
-              {order.passengers.map((p) => (
-                <li key={p.id} className="flex justify-between">
-                  <span>{p.fullName}</span>
-                  <span className="font-mono text-xs text-slate-500">{p.documentNumber}</span>
-                </li>
-              ))}
-            </ul>
-          </section>
+          <PassengersSection order={order} />
+
+          <OpsToolbar order={order} onAdvance={onAdvance} />
+
+          <NotesSection order={order} />
+
+          <RemindersSection order={order} />
 
           <section>
             <h3 className="text-sm font-medium text-slate-700">客户信息</h3>
@@ -1002,5 +1035,351 @@ function FfCard({ icon, label, status, children }: { icon: string; label: string
       </div>
       <dl className="space-y-0.5 text-xs">{children}</dl>
     </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 5/20 反馈新增组件
+// ═══════════════════════════════════════════════════════════════════════════
+
+function daysUntil(dateStr: string | null | undefined): number | null {
+  if (!dateStr) return null;
+  const target = new Date(dateStr);
+  const today = new Date();
+  return Math.floor((target.getTime() - today.getTime()) / 86400_000);
+}
+
+function PassengersSection({ order }: { order: OrderSummary }) {
+  return (
+    <section>
+      <h3 className="text-sm font-medium text-slate-700">乘客 ({order.passengers.length})</h3>
+      <ul className="mt-2 space-y-2 text-xs">
+        {order.passengers.map((p) => {
+          const passDaysLeft = daysUntil(p.passportExpiry);
+          const passWarn = passDaysLeft !== null && passDaysLeft < 180;
+          const passBlock = passDaysLeft !== null && passDaysLeft < 90;
+          return (
+            <li key={p.id} className="rounded-md border border-slate-200 bg-white p-3">
+              <div className="flex items-start justify-between gap-2">
+                <div className="flex-1">
+                  <div className="font-medium text-slate-900">
+                    {p.fullName}
+                    {p.gender && <span className="ml-2 text-xs text-slate-500">{p.gender === 'M' ? '男' : p.gender === 'F' ? '女' : '其他'}</span>}
+                  </div>
+                  <dl className="mt-1 grid grid-cols-2 gap-x-3 gap-y-0.5 text-[11px] text-slate-600">
+                    <dt>护照号</dt><dd className="font-mono">{p.documentNumber ?? '—'}</dd>
+                    <dt>出生日期</dt><dd className="font-mono">{p.dateOfBirth?.slice(0, 10) ?? '—'}</dd>
+                    <dt>国籍</dt><dd>{p.nationality ?? '—'}</dd>
+                    <dt>类型</dt><dd>{p.passengerType ?? '—'}</dd>
+                    {p.passportExpiry && (
+                      <>
+                        <dt>护照有效期</dt>
+                        <dd className={`font-mono ${passBlock ? 'text-red-600 font-bold' : passWarn ? 'text-amber-600' : ''}`}>
+                          {p.passportExpiry.slice(0, 10)}
+                          {passDaysLeft !== null && (
+                            <span className="ml-1 text-[10px]">
+                              （剩 {passDaysLeft} 天{passBlock ? ' · 不足 3 月' : passWarn ? ' · 不足 6 月' : ''}）
+                            </span>
+                          )}
+                        </dd>
+                      </>
+                    )}
+                    {p.visaNumber && (
+                      <>
+                        <dt>签证号</dt><dd className="font-mono">{p.visaNumber}</dd>
+                      </>
+                    )}
+                    {p.visaExpiry && (
+                      <>
+                        <dt>签证有效期</dt><dd className="font-mono">{p.visaExpiry.slice(0, 10)}</dd>
+                      </>
+                    )}
+                  </dl>
+                </div>
+                {p.passportPhotoUrl && (
+                  <a href={p.passportPhotoUrl} target="_blank" rel="noreferrer" className="shrink-0">
+                    <img src={p.passportPhotoUrl} alt="passport" className="h-14 w-14 rounded border border-slate-300 object-cover" />
+                  </a>
+                )}
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+    </section>
+  );
+}
+
+function OpsToolbar({ order }: { order: OrderSummary; onAdvance: (next: OrderStatus, reason?: string) => void }) {
+  const tokens = useAuth((s) => s.tokens);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [claimed, setClaimed] = useState(order.claimedBy ?? null);
+
+  const downloadBlob = (blob: Blob, filename: string) => {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  const handlePnr = async () => {
+    if (!tokens?.accessToken) return;
+    setBusy('pnr');
+    try {
+      const blob = await api.exportPnr(tokens.accessToken, order.id);
+      downloadBlob(blob, `PNR_${order.orderNumber}.xlsx`);
+    } catch (e) {
+      alert(`导出失败：${e instanceof Error ? e.message : '未知错误'}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const handleZip = async () => {
+    if (!tokens?.accessToken) return;
+    setBusy('zip');
+    try {
+      const blob = await api.downloadPassportsZip(tokens.accessToken, order.id);
+      downloadBlob(blob, `${order.orderNumber}-passports.zip`);
+    } catch (e) {
+      alert(`下载失败：${e instanceof Error ? e.message : '未知错误'}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const handleClaim = async () => {
+    if (!tokens?.accessToken) return;
+    setBusy('claim');
+    try {
+      const res = await api.claimOrder(tokens.accessToken, order.id);
+      setClaimed(res.claimedBy);
+    } catch (e) {
+      alert(`认领失败：${e instanceof Error ? e.message : '未知错误'}`);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <section className="rounded-md border-2 border-brand/30 bg-brand/5 p-3">
+      <div className="flex items-center justify-between mb-2">
+        <h3 className="text-sm font-semibold text-brand">运营工具</h3>
+        {claimed ? (
+          <span className="text-xs text-slate-600">
+            🤝 已认领 · {claimed.displayName ?? claimed.email ?? claimed.id}
+          </span>
+        ) : (
+          <button
+            className="rounded bg-amber-500 px-2 py-0.5 text-xs text-white hover:bg-amber-600 disabled:opacity-50"
+            onClick={handleClaim}
+            disabled={busy !== null}
+          >
+            {busy === 'claim' ? '认领中…' : '🙋 我接这单'}
+          </button>
+        )}
+      </div>
+      <div className="grid grid-cols-2 gap-2">
+        <button
+          className="rounded bg-blue-600 px-2 py-1.5 text-xs text-white hover:bg-blue-700 disabled:opacity-50"
+          onClick={handlePnr}
+          disabled={busy !== null}
+        >
+          {busy === 'pnr' ? '生成中…' : '📄 导出 PNR Excel'}
+        </button>
+        <button
+          className="rounded bg-emerald-600 px-2 py-1.5 text-xs text-white hover:bg-emerald-700 disabled:opacity-50"
+          onClick={handleZip}
+          disabled={busy !== null}
+        >
+          {busy === 'zip' ? '打包中…' : '📦 打包护照图片'}
+        </button>
+      </div>
+      <p className="mt-2 text-[10px] text-slate-500">
+        PNR Excel = 航司提交格式（25 列）；护照 zip 含 README 列出缺照片的乘客。
+      </p>
+    </section>
+  );
+}
+
+function NotesSection({ order }: { order: OrderSummary }) {
+  const tokens = useAuth((s) => s.tokens);
+  const [customerNotes, setCustomerNotes] = useState(order.notes ?? '');
+  const [internalNotes, setInternalNotes] = useState(order.internalNotes ?? '');
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+
+  const dirty = customerNotes !== (order.notes ?? '') || internalNotes !== (order.internalNotes ?? '');
+
+  const save = async () => {
+    if (!tokens?.accessToken) return;
+    setSaving(true);
+    try {
+      await api.updateOrderNotes(tokens.accessToken, order.id, { notes: customerNotes, internalNotes });
+      setSaved(true);
+      setTimeout(() => setSaved(false), 2000);
+    } catch (e) {
+      alert(`保存失败：${e instanceof Error ? e.message : '未知错误'}`);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <section>
+      <h3 className="text-sm font-medium text-slate-700">备注</h3>
+      <div className="mt-2 space-y-2">
+        <div>
+          <label className="text-xs text-slate-500">客户备注（客户可见）</label>
+          <textarea
+            className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 text-xs"
+            rows={2}
+            value={customerNotes}
+            onChange={(e) => setCustomerNotes(e.target.value)}
+            placeholder="客户的特殊要求（如先发批文、酒店单过海关）"
+          />
+        </div>
+        <div>
+          <label className="text-xs text-slate-500">内部备注（仅运营可见）</label>
+          <textarea
+            className="mt-1 w-full rounded-md border border-amber-300 bg-amber-50 px-2 py-1.5 text-xs"
+            rows={2}
+            value={internalNotes}
+            onChange={(e) => setInternalNotes(e.target.value)}
+            placeholder="跨班次/跨部门的私下备忘"
+          />
+        </div>
+        {dirty && (
+          <div className="flex items-center gap-2">
+            <button
+              className="rounded bg-brand px-3 py-1 text-xs text-white disabled:opacity-50"
+              onClick={save}
+              disabled={saving}
+            >
+              {saving ? '保存中…' : '保存备注'}
+            </button>
+            {saved && <span className="text-xs text-green-600">✓ 已保存</span>}
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function RemindersSection({ order }: { order: OrderSummary }) {
+  const tokens = useAuth((s) => s.tokens);
+  const [reminders, setReminders] = useState(order.reminders ?? []);
+  const [newTitle, setNewTitle] = useState('');
+  const [newPriority, setNewPriority] = useState<'LOW' | 'NORMAL' | 'HIGH' | 'CRITICAL'>('NORMAL');
+  const [newDueAt, setNewDueAt] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const addReminder = async () => {
+    if (!tokens?.accessToken || !newTitle.trim()) return;
+    setBusy(true);
+    try {
+      const res = await api.createReminder(tokens.accessToken, {
+        orderId: order.id,
+        title: newTitle.trim(),
+        priority: newPriority,
+        dueAt: newDueAt || undefined,
+      });
+      setReminders((prev) => [...prev, res.reminder]);
+      setNewTitle('');
+      setNewDueAt('');
+    } catch (e) {
+      alert(`新建失败：${e instanceof Error ? e.message : '未知错误'}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const resolve = async (id: string, status: 'DONE' | 'SKIPPED') => {
+    if (!tokens?.accessToken) return;
+    try {
+      const res = await api.resolveReminder(tokens.accessToken, id, { status });
+      setReminders((prev) => prev.map((r) => (r.id === id ? { ...r, ...res.reminder } : r)));
+    } catch (e) {
+      alert(`操作失败：${e instanceof Error ? e.message : '未知错误'}`);
+    }
+  };
+
+  const PRIORITY_LABEL: Record<string, string> = { LOW: '低', NORMAL: '中', HIGH: '高', CRITICAL: '🔴 紧急' };
+  const STATUS_LABEL: Record<string, string> = { OPEN: '未处理', IN_PROGRESS: '处理中', DONE: '✓ 完成', SKIPPED: '⊘ 跳过' };
+
+  return (
+    <section>
+      <h3 className="text-sm font-medium text-slate-700">待办 / 特殊提醒</h3>
+      <ul className="mt-2 space-y-1">
+        {reminders.length === 0 && <li className="text-xs text-slate-400">暂无待办</li>}
+        {reminders.map((r) => (
+          <li key={r.id} className="rounded border border-slate-200 bg-white px-2 py-1.5 text-xs">
+            <div className="flex items-start justify-between gap-2">
+              <div className="flex-1">
+                <span className={`mr-1 ${r.priority === 'CRITICAL' ? 'text-red-600 font-bold' : r.priority === 'HIGH' ? 'text-amber-600' : ''}`}>
+                  [{PRIORITY_LABEL[r.priority]}]
+                </span>
+                <span>{r.title}</span>
+                {r.dueAt && <span className="ml-1 text-[10px] text-slate-500">截止 {r.dueAt.slice(0, 10)}</span>}
+                <div className="text-[10px] text-slate-400">{STATUS_LABEL[r.status]}</div>
+              </div>
+              {(r.status === 'OPEN' || r.status === 'IN_PROGRESS') && (
+                <div className="flex gap-1">
+                  <button
+                    className="rounded bg-green-600 px-1.5 py-0.5 text-[10px] text-white hover:bg-green-700"
+                    onClick={() => resolve(r.id, 'DONE')}
+                  >
+                    ✓ 完成
+                  </button>
+                  <button
+                    className="rounded bg-slate-400 px-1.5 py-0.5 text-[10px] text-white hover:bg-slate-500"
+                    onClick={() => resolve(r.id, 'SKIPPED')}
+                  >
+                    ⊘ 跳过
+                  </button>
+                </div>
+              )}
+            </div>
+          </li>
+        ))}
+      </ul>
+      <div className="mt-2 rounded-md border border-dashed border-slate-300 p-2 space-y-1">
+        <input
+          className="w-full rounded border border-slate-300 px-2 py-1 text-xs"
+          placeholder="加一条待办，比如「2 日内拿批文」"
+          value={newTitle}
+          onChange={(e) => setNewTitle(e.target.value)}
+        />
+        <div className="flex gap-1">
+          <select
+            className="rounded border border-slate-300 px-1.5 py-1 text-xs"
+            value={newPriority}
+            onChange={(e) => setNewPriority(e.target.value as 'LOW' | 'NORMAL' | 'HIGH' | 'CRITICAL')}
+          >
+            <option value="LOW">低</option>
+            <option value="NORMAL">中</option>
+            <option value="HIGH">高</option>
+            <option value="CRITICAL">🔴 紧急</option>
+          </select>
+          <input
+            type="date"
+            className="flex-1 rounded border border-slate-300 px-1.5 py-1 text-xs"
+            value={newDueAt}
+            onChange={(e) => setNewDueAt(e.target.value)}
+          />
+          <button
+            className="rounded bg-brand px-2 py-1 text-xs text-white disabled:opacity-50"
+            onClick={addReminder}
+            disabled={!newTitle.trim() || busy}
+          >
+            + 加待办
+          </button>
+        </div>
+      </div>
+    </section>
   );
 }

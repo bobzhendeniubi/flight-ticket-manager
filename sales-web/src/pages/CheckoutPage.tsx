@@ -42,6 +42,8 @@ export function CheckoutPage() {
   const [contactName, setContactName] = useState('');
   const [contactPhone, setContactPhone] = useState('');
   const [contactEmail, setContactEmail] = useState('');
+  // 5/20 反馈：客人特殊要求（如先办批文、酒店单过海关）
+  const [orderNotes, setOrderNotes] = useState('');
   // 初始化 passengers：如果 AI 助手在聊天里 OCR 过护照，从 sessionStorage 拉出来预填
   // （usePassengers 的 hydrate 已在 AiAssistant 里跑过；这里再 hydrate 一次拿最新值）
   const [passengers, setPassengers] = useState<PassengerForm[]>(() => {
@@ -185,6 +187,7 @@ export function CheckoutPage() {
       contactName: contactName.trim(),
       contactPhone: contactPhone.trim(),
       contactEmail: contactEmail.trim() || undefined,
+      notes: orderNotes.trim() || undefined,
       paymentMethod,
       passengers: passengers.map((p) => ({
         fullName: p.fullName.trim(),
@@ -338,6 +341,19 @@ export function CheckoutPage() {
                 value={contactEmail}
                 onChange={(e) => setContactEmail(e.target.value)}
               />
+            </div>
+            <div className="md:col-span-2">
+              <label className="label">特殊说明（选填）</label>
+              <textarea
+                className="input"
+                rows={2}
+                placeholder="比如：需要提前拿到签证批文 + 酒店单过海关；或者有任何饮食/无障碍/接送需求"
+                value={orderNotes}
+                onChange={(e) => setOrderNotes(e.target.value)}
+              />
+              <p className="mt-1 text-xs text-slate-500">
+                运营会在订单详情里看到，按需安排。
+              </p>
             </div>
           </div>
         </section>

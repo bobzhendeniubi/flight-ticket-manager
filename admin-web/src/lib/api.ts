@@ -182,11 +182,74 @@ export interface OrderItem {
 export interface OrderPassenger {
   id: string;
   fullName: string;
+  lastName?: string | null;
+  firstName?: string | null;
+  title?: string | null;
+  gender?: 'M' | 'F' | 'X' | null;
   documentType?: DocumentType;
   documentNumber?: string;
   dateOfBirth?: string;
+  placeOfBirth?: string | null;
   nationality?: string;
   passengerType?: PassengerType;
+
+  // 护照扩展
+  passportIssueCountry?: string | null;
+  passportExpiry?: string | null;
+
+  // 签证
+  visaNumber?: string | null;
+  visaType?: string | null;
+  visaIssueDate?: string | null;
+  visaExpiry?: string | null;
+  visaPlaceOfIssue?: string | null;
+  visaCountryOfApplication?: string | null;
+
+  // 地址
+  addressType?: string | null;
+  addressDetails?: string | null;
+  addressCity?: string | null;
+  addressState?: string | null;
+  addressCountry?: string | null;
+  addressZip?: string | null;
+
+  bedPref?: string | null;
+  passportPhotoUrl?: string | null;
+  pnr?: string | null;
+  eticketNumber?: string | null;
+}
+
+export type ReminderStatus = 'OPEN' | 'IN_PROGRESS' | 'DONE' | 'SKIPPED';
+export type ReminderPriority = 'LOW' | 'NORMAL' | 'HIGH' | 'CRITICAL';
+
+export interface OperationalReminder {
+  id: string;
+  orderId: string | null;
+  title: string;
+  body: string | null;
+  dueAt: string | null;
+  priority: ReminderPriority;
+  status: ReminderStatus;
+  attachmentUrl: string | null;
+  resolvedAt: string | null;
+  resolvedNote: string | null;
+  createdAt: string;
+  updatedAt: string;
+  createdBy: { id: string; email: string | null; displayName: string | null };
+  claimedBy: { id: string; email: string | null; displayName: string | null } | null;
+  order?: { id: string; orderNumber: string; status: OrderStatus; contactName: string } | null;
+}
+
+export interface RoomGroup {
+  id: string;
+  hotelName: string;
+  roomType: string;
+  passengerIds: string[];
+  notes?: string;
+}
+
+export interface RoomAssignment {
+  roomGroups: RoomGroup[];
 }
 
 export interface OrderSummary {
@@ -208,6 +271,15 @@ export interface OrderSummary {
   passengers: OrderPassenger[];
   agent: { id: string; companyName: string | null; contactName: string } | null;
   user: { id: string; displayName: string | null; email: string | null };
+
+  // 新增字段（5/20 反馈）
+  notes?: string | null;
+  internalNotes?: string | null;
+  claimedById?: string | null;
+  claimedAt?: string | null;
+  claimedBy?: { id: string; displayName: string | null; email: string | null } | null;
+  roomAssignment?: RoomAssignment | null;
+  reminders?: OperationalReminder[];
 }
 
 // ── Audit / Customers / Travelers / Fulfillment ──────────────────────────
@@ -529,6 +601,126 @@ export const api = {
       method: 'POST',
       token,
       body: { ids, toStatus, reason, force },
+    }),
+
+  // ── 5/20 反馈新增 API ──────────────────────────────────────────────────
+  // 一键导出 PNR Excel；返回 Blob 直接下载
+  exportPnr: async (token: string, orderId: string): Promise<Blob> => {
+    const res = await fetch(`${API_BASE}/orders/${orderId}/pnr-export`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) throw new ApiError(res.status, { code: 'EXPORT_FAILED', message: await res.text() });
+    return res.blob();
+  },
+  // 一键打包护照图片 zip
+  downloadPassportsZip: async (token: string, orderId: string): Promise<Blob> => {
+    const res = await fetch(`${API_BASE}/orders/${orderId}/passport-photos.zip`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) throw new ApiError(res.status, { code: 'ZIP_FAILED', message: await res.text() });
+    return res.blob();
+  },
+  // 认领订单（防漏单）
+  claimOrder: (token: string, orderId: string) =>
+    apiFetch<{ ok: boolean; claimedBy: { id: string; displayName: string | null; email: string | null } }>(
+      `/orders/${orderId}/claim`,
+      { method: 'POST', token, body: {} },
+    ),
+  // 套票分房
+  updateRoomAssignment: (token: string, orderId: string, roomGroups: RoomGroup[]) =>
+    apiFetch<{ ok: boolean }>(`/orders/${orderId}/room-assignment`, {
+      method: 'PUT',
+      token,
+      body: { roomGroups },
+    }),
+  // 修改订单备注
+  updateOrderNotes: (
+    token: string,
+    orderId: string,
+    body: { notes?: string; internalNotes?: string },
+  ) =>
+    apiFetch<{ ok: boolean }>(`/orders/${orderId}/notes`, {
+      method: 'PATCH',
+      token,
+      body,
+    }),
+
+  // ── 操作部待办 ───────────────────────────────────────────────────────
+  listReminders: (
+    token: string,
+    query?: {
+      status?: ReminderStatus;
+      priority?: ReminderPriority;
+      orderId?: string;
+      mine?: boolean;
+      page?: number;
+      pageSize?: number;
+    },
+  ) => {
+    const qs = new URLSearchParams();
+    if (query) {
+      for (const [k, v] of Object.entries(query)) {
+        if (v !== undefined && v !== '') qs.set(k, String(v));
+      }
+    }
+    return apiFetch<{
+      reminders: OperationalReminder[];
+      pagination: { page: number; pageSize: number; total: number };
+    }>(`/reminders/${qs.toString() ? '?' + qs.toString() : ''}`, { token });
+  },
+  createReminder: (
+    token: string,
+    body: {
+      orderId?: string;
+      title: string;
+      body?: string;
+      dueAt?: string;
+      priority?: ReminderPriority;
+      attachmentUrl?: string;
+    },
+  ) =>
+    apiFetch<{ reminder: OperationalReminder }>(`/reminders/`, {
+      method: 'POST',
+      token,
+      body,
+    }),
+  updateReminder: (
+    token: string,
+    id: string,
+    body: {
+      title?: string;
+      body?: string;
+      dueAt?: string | null;
+      priority?: ReminderPriority;
+      attachmentUrl?: string | null;
+    },
+  ) =>
+    apiFetch<{ reminder: OperationalReminder }>(`/reminders/${id}`, {
+      method: 'PATCH',
+      token,
+      body,
+    }),
+  claimReminder: (token: string, id: string) =>
+    apiFetch<{ reminder: OperationalReminder }>(`/reminders/${id}/claim`, {
+      method: 'POST',
+      token,
+      body: {},
+    }),
+  releaseReminder: (token: string, id: string) =>
+    apiFetch<{ reminder: OperationalReminder }>(`/reminders/${id}/release`, {
+      method: 'POST',
+      token,
+      body: {},
+    }),
+  resolveReminder: (
+    token: string,
+    id: string,
+    body: { status: 'DONE' | 'SKIPPED'; resolvedNote?: string },
+  ) =>
+    apiFetch<{ reminder: OperationalReminder }>(`/reminders/${id}/resolve`, {
+      method: 'POST',
+      token,
+      body,
     }),
 
   // Settlements
