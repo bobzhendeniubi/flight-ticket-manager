@@ -890,7 +890,50 @@ export const api = {
     }),
   deleteCancellationPolicy: (token: string, id: string) =>
     apiFetch<{ ok: boolean }>(`/cancellation-policies/${id}`, { method: 'DELETE', token }),
+
+  // 财务账本（ADMIN-only）
+  getFinances: (token: string) => apiFetch<CostsData>('/finances/costs', { token }),
 };
+
+// ── 财务账本类型（与 backend/src/modules/finances/costs-data.ts 对齐）──
+export interface CostCategory { label: string; usd: number; note: string; }
+export interface CostDetailRow {
+  isSection: boolean;
+  label?: string;
+  date?: string;
+  category?: string;
+  vendor?: string;
+  usd?: number;
+  what?: string;
+  hours?: string;
+}
+export interface MonthlyForecastRow {
+  category: string;
+  testing: number;
+  beta: number;
+  stable: number;
+  note: string;
+}
+export interface UnitEconStage {
+  stage: string;
+  orders: number;
+  aovCny: number;
+  gmvCny: number;
+  profitCny: number;
+  profitUsd: number;
+}
+export interface CostsData {
+  asOf: string;
+  title: string;
+  totalUsd: number;
+  categories: CostCategory[];
+  detail: { rows: CostDetailRow[]; totalUsd: number };
+  monthly: {
+    rows: MonthlyForecastRow[];
+    totals: { testing: number; beta: number; stable: number };
+  };
+  unitEcon: { stages: UnitEconStage[] };
+}
 
 export type ProductKind = 'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA' | 'BUNDLE' | 'INSURANCE';
 

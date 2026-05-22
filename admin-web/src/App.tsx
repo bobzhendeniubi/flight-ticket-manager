@@ -14,6 +14,7 @@ import { TravelersPage } from './pages/TravelersPage';
 import { AuditLogsPage } from './pages/AuditLogsPage';
 import { SettlementsPage } from './pages/SettlementsPage';
 import { CancellationPoliciesPage } from './pages/CancellationPoliciesPage';
+import { FinancesPage } from './pages/FinancesPage';
 import { useAuth } from './stores/auth';
 
 // AGENT 可访问的页面集合（其他页面默认 ADMIN/STAFF 专属）
@@ -161,6 +162,14 @@ export function App() {
           element={
             <Protected>
               <SettlementsPage />
+            </Protected>
+          }
+        />
+        <Route
+          path="/finances"
+          element={
+            <Protected adminOnly>
+              <FinancesPage />
             </Protected>
           }
         />

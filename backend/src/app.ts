@@ -24,6 +24,7 @@ import { paymentRoutes } from './modules/payments/payments.routes.js';
 import { pricingRoutes } from './modules/pricing/pricing.routes.js';
 import { cancellationRoutes } from './modules/cancellation/cancellation.routes.js';
 import { reminderRoutes } from './modules/reminders/reminders.routes.js';
+import { financesRoutes } from './modules/finances/finances.routes.js';
 import { aiRoutes } from './modules/ai/ai.routes.js';
 import { redis } from './db/redis.js';
 
@@ -78,6 +79,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(pricingRoutes, { prefix: '/pricing' });
   await app.register(cancellationRoutes, { prefix: '/cancellation-policies' });
   await app.register(reminderRoutes, { prefix: '/reminders' });
+  await app.register(financesRoutes, { prefix: '/finances' });
   await app.register(aiRoutes, { prefix: '/ai' });
 
   // Root
