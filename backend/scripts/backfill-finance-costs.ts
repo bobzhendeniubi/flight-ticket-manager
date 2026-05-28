@@ -26,48 +26,116 @@ function round2(n: number): number {
   return Math.round(n * 100) / 100;
 }
 
+// 默认汇率（2026 估算）— 仅当库里没有该 (currency,kind) 时插入
+const FX_DEFAULTS: Array<{ currency: string; kind: string; rate: number }> = [
+  { currency: 'USD', kind: 'FLIGHT', rate: 7.1 },
+  { currency: 'USD', kind: 'AIRPORT_TAX', rate: 7.1 },
+  { currency: 'USD', kind: 'VISA', rate: 7.1 },
+  { currency: 'USD', kind: 'GENERAL', rate: 7.1 },
+  { currency: 'VND', kind: 'HOTEL', rate: 0.000292 },
+  { currency: 'VND', kind: 'GENERAL', rate: 0.000292 },
+];
+const FX_FLIGHT = 7.1;
+const FX_VISA = 7.1;
+const FX_HOTEL_VND = 0.000292;
+
+async function seedExchangeRates(): Promise<number> {
+  let n = 0;
+  for (const f of FX_DEFAULTS) {
+    const existing = await prisma.exchangeRate.findUnique({
+      where: { currency_kind: { currency: f.currency, kind: f.kind } },
+    });
+    if (existing) continue;
+    await prisma.exchangeRate.create({
+      data: { currency: f.currency, kind: f.kind, rateToCny: f.rate, note: 'backfill 默认值' },
+    });
+    n += 1;
+  }
+  return n;
+}
+
 async function backfillFlightSchedules(): Promise<number> {
-  const schedules = await prisma.flightSchedule.findMany({
+  // charterCostCny 回填（老逻辑）
+  const needCharter = await prisma.flightSchedule.findMany({
     where: { charterCostCny: null },
     include: { seatClasses: { select: { capacity: true, basePrice: true } } },
   });
   let updated = 0;
-  for (const s of schedules) {
+  for (const s of needCharter) {
     const fullSellThrough = s.seatClasses.reduce(
       (acc, c) => acc + c.capacity * dec(c.basePrice),
       0,
     );
     if (fullSellThrough === 0) continue;
-    const charter = round2(fullSellThrough * 0.7);
     await prisma.flightSchedule.update({
       where: { id: s.id },
-      data: { charterCostCny: charter },
+      data: { charterCostCny: round2(fullSellThrough * 0.7) },
     });
     updated += 1;
   }
+
+  // ticketCostUsd / airportTax 回填（按已填的 charterCostCny 折算 + demo 机场税）
+  const needUsd = await prisma.flightSchedule.findMany({
+    where: { ticketCostUsd: null, charterCostCny: { not: null } },
+    include: { seatClasses: { select: { capacity: true } } },
+  });
+  for (const s of needUsd) {
+    const totalSeats = s.seatClasses.reduce((a, c) => a + c.capacity, 0);
+    if (totalSeats === 0) continue;
+    const perSeatCny = dec(s.charterCostCny) / totalSeats;
+    await prisma.flightSchedule.update({
+      where: { id: s.id },
+      data: {
+        ticketCostUsd: round2(perSeatCny / FX_FLIGHT),
+        airportTaxDepUsd: 18, // demo：出发地机场税
+        airportTaxArrUsd: 25, // demo：目的地机场税
+      },
+    });
+  }
+
   return updated;
 }
 
 async function backfillHotelRoomTypes(): Promise<number> {
-  const rows = await prisma.hotelRoomType.findMany({ where: { costPriceCny: null } });
   let updated = 0;
-  for (const r of rows) {
+  // costPriceCny
+  const needCny = await prisma.hotelRoomType.findMany({ where: { costPriceCny: null } });
+  for (const r of needCny) {
     const cost = round2(dec(r.basePrice) * 0.7);
     if (cost <= 0) continue;
     await prisma.hotelRoomType.update({ where: { id: r.id }, data: { costPriceCny: cost } });
     updated += 1;
   }
+  // costPriceVnd（按 costPriceCny / 汇率 折成原币）
+  const needVnd = await prisma.hotelRoomType.findMany({
+    where: { costPriceVnd: null, costPriceCny: { not: null } },
+  });
+  for (const r of needVnd) {
+    await prisma.hotelRoomType.update({
+      where: { id: r.id },
+      data: { costPriceVnd: round2(dec(r.costPriceCny) / FX_HOTEL_VND) },
+    });
+  }
   return updated;
 }
 
 async function backfillVisas(): Promise<number> {
-  const rows = await prisma.visa.findMany({ where: { costPriceCny: null } });
   let updated = 0;
-  for (const r of rows) {
+  const needCny = await prisma.visa.findMany({ where: { costPriceCny: null } });
+  for (const r of needCny) {
     const cost = round2(dec(r.basePrice) * 0.55);
     if (cost <= 0) continue;
     await prisma.visa.update({ where: { id: r.id }, data: { costPriceCny: cost } });
     updated += 1;
+  }
+  const needUsd = await prisma.visa.findMany({
+    where: { costPriceUsd: null, costPriceCny: { not: null } },
+  });
+  for (const r of needUsd) {
+    await prisma.visa.update({
+      where: { id: r.id },
+      data: { costPriceUsd: round2(dec(r.costPriceCny) / FX_VISA) },
+    });
   }
   return updated;
 }
@@ -159,6 +227,7 @@ async function backfillOrderItems(): Promise<number> {
 async function main(): Promise<void> {
   // eslint-disable-next-line no-console
   console.log('[backfill] 开始回填财务成本字段（仅 NULL 值）…');
+  const fx = await seedExchangeRates();
   const f = await backfillFlightSchedules();
   const h = await backfillHotelRoomTypes();
   const v = await backfillVisas();
@@ -166,7 +235,7 @@ async function main(): Promise<void> {
   const o = await backfillOrderItems();
   // eslint-disable-next-line no-console
   console.log(
-    `[backfill] 完成 — FlightSchedule:${f} HotelRoomType:${h} Visa:${v} Transfer:${t} OrderItem:${o}`,
+    `[backfill] 完成 — ExchangeRate:${fx} FlightSchedule:${f} HotelRoomType:${h} Visa:${v} Transfer:${t} OrderItem:${o}`,
   );
 }
 

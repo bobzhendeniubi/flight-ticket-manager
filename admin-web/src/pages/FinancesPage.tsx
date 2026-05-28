@@ -19,10 +19,23 @@ import {
   type FlightPnlRow,
   type OrderPnlRow,
   type MonthlyPoint,
+  type ExchangeRate,
+  type Hotel,
+  type Visa,
+  type Transfer,
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
 
-type Tab = 'summary' | 'flights' | 'orders' | 'monthly';
+type Tab = 'summary' | 'flights' | 'orders' | 'monthly' | 'costs';
+
+const FX_KINDS: Array<{ currency: string; kind: string; label: string }> = [
+  { currency: 'USD', kind: 'FLIGHT', label: '机票 USD→CNY' },
+  { currency: 'USD', kind: 'AIRPORT_TAX', label: '机场税 USD→CNY' },
+  { currency: 'USD', kind: 'VISA', label: '签证 USD→CNY' },
+  { currency: 'VND', kind: 'HOTEL', label: '酒店 VND→CNY' },
+  { currency: 'USD', kind: 'GENERAL', label: '通用 USD→CNY' },
+  { currency: 'VND', kind: 'GENERAL', label: '通用 VND→CNY' },
+];
 
 const KIND_LABEL: Record<string, string> = {
   FLIGHT: '机票',
@@ -200,6 +213,7 @@ export function FinancesPage() {
               最近 90 天
             </button>
           </div>
+          <ExportButton token={token} range={range} />
         </div>
       </header>
 
@@ -216,13 +230,378 @@ export function FinancesPage() {
         <TabBtn active={tab === 'monthly'} onClick={() => setTab('monthly')}>
           月度趋势
         </TabBtn>
+        <TabBtn active={tab === 'costs'} onClick={() => setTab('costs')}>
+          成本维护
+        </TabBtn>
       </nav>
 
       {tab === 'summary' && <SummaryTab token={token} range={range} />}
       {tab === 'flights' && <FlightsTab token={token} range={range} />}
       {tab === 'orders' && <OrdersTab token={token} range={range} />}
       {tab === 'monthly' && <MonthlyTab token={token} />}
+      {tab === 'costs' && <CostsTab token={token} />}
     </div>
+  );
+}
+
+// ── Export button ──────────────────────────────────────────────────────────
+function ExportButton({ token, range }: { token: string; range: { from: string; to: string } }) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function onClick(): Promise<void> {
+    if (!token || busy) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      const blob = await api.downloadFinanceExport(token, range);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `财务核对_${range.from}_${range.to}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e: unknown) {
+      setErr(e instanceof ApiError ? e.message : '导出失败');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="flex flex-col items-end gap-1">
+      <button
+        type="button"
+        onClick={onClick}
+        disabled={busy}
+        className="rounded-md bg-emerald-600 px-3 py-2 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+      >
+        {busy ? '导出中…' : '⬇ 导出 xlsx'}
+      </button>
+      {err && <span className="text-xs text-rose-600">{err}</span>}
+    </div>
+  );
+}
+
+// ── Costs / FX maintenance tab ───────────────────────────────────────────────
+function CostsTab({ token }: { token: string }) {
+  const [rates, setRates] = useState<ExchangeRate[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState<string | null>(null);
+  const [draft, setDraft] = useState<Record<string, string>>({});
+  const [savingKey, setSavingKey] = useState<string | null>(null);
+
+  const load = useCallback(() => {
+    if (!token) return;
+    let cancelled = false;
+    setLoading(true);
+    api
+      .getExchangeRates(token)
+      .then((d) => {
+        if (cancelled) return;
+        setRates(d.rates);
+        const next: Record<string, string> = {};
+        for (const r of d.rates) next[`${r.currency}:${r.kind}`] = String(r.rateToCny);
+        setDraft(next);
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) setErr(e instanceof ApiError ? e.message : '加载失败');
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [token]);
+
+  useEffect(() => load(), [load]);
+
+  async function save(currency: string, kind: string): Promise<void> {
+    const key = `${currency}:${kind}`;
+    const val = parseFloat(draft[key] ?? '');
+    if (!Number.isFinite(val) || val <= 0) {
+      setErr(`${key} 汇率需为正数`);
+      return;
+    }
+    setSavingKey(key);
+    setErr(null);
+    try {
+      await api.upsertExchangeRate(token, { currency, kind, rateToCny: val });
+      load();
+    } catch (e: unknown) {
+      setErr(e instanceof ApiError ? e.message : '保存失败');
+    } finally {
+      setSavingKey(null);
+    }
+  }
+
+  if (loading) return <div className="text-sm text-slate-500">加载中…</div>;
+
+  return (
+    <section className="space-y-5">
+      <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+        <h2 className="text-sm font-medium text-slate-700">汇率（外币 → 人民币）</h2>
+        <p className="mt-1 text-xs text-slate-500">
+          导出 xlsx 时用这些汇率把 USD / VND 成本折算成 RMB。同一币种不同用途可设不同汇率（机票 vs 机场税）。
+        </p>
+        {err && <div className="mt-2 text-xs text-rose-600">{err}</div>}
+        <table className="mt-3 w-full text-sm">
+          <thead className="text-xs text-slate-500">
+            <tr className="border-b border-slate-200">
+              <th className="py-2 text-left font-normal">用途</th>
+              <th className="py-2 text-left font-normal">币种</th>
+              <th className="py-2 text-right font-normal">1 外币 = ? 人民币</th>
+              <th className="py-2 text-right font-normal">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {FX_KINDS.map(({ currency, kind, label }) => {
+              const key = `${currency}:${kind}`;
+              const existing = rates.find((r) => r.currency === currency && r.kind === kind);
+              return (
+                <tr key={key} className="border-b border-slate-100 last:border-0">
+                  <td className="py-2 text-slate-900">{label}</td>
+                  <td className="py-2 text-slate-500">{currency}</td>
+                  <td className="py-2 text-right">
+                    <input
+                      type="number"
+                      step="0.0001"
+                      value={draft[key] ?? ''}
+                      placeholder={existing ? '' : '未设置（用默认）'}
+                      onChange={(e) => setDraft((d) => ({ ...d, [key]: e.target.value }))}
+                      className="w-32 rounded-md border border-slate-300 px-2 py-1 text-right text-sm"
+                    />
+                  </td>
+                  <td className="py-2 text-right">
+                    <button
+                      type="button"
+                      onClick={() => save(currency, kind)}
+                      disabled={savingKey === key}
+                      className="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+                    >
+                      {savingKey === key ? '保存中…' : '保存'}
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      <ProductCostEditors token={token} />
+
+      <p className="text-xs text-slate-400">
+        说明：成本只填 CNY 也能导出；填了 USD/VND 则按上面汇率折算，xlsx 里原币列也带出来。
+        航班「包机成本 / 单票成本(USD) / 机场税」在航班管理页按班次编辑。
+      </p>
+    </section>
+  );
+}
+
+// ── 产品成本编辑（酒店 / 签证 / 接送）──────────────────────────────────────────
+function ProductCostEditors({ token }: { token: string }) {
+  const [hotels, setHotels] = useState<Hotel[]>([]);
+  const [visas, setVisas] = useState<Visa[]>([]);
+  const [transfers, setTransfers] = useState<Transfer[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  const load = useCallback(() => {
+    let cancelled = false;
+    setLoading(true);
+    Promise.all([api.listHotels(false), api.listVisas(false), api.listTransfers(false)])
+      .then(([h, v, t]) => {
+        if (cancelled) return;
+        setHotels(h.hotels);
+        setVisas(v.visas);
+        setTransfers(t.transfers);
+      })
+      .catch(() => {
+        if (!cancelled) setMsg('产品列表加载失败');
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => load(), [load]);
+
+  if (loading) return <div className="text-sm text-slate-500">加载产品成本…</div>;
+
+  return (
+    <div className="space-y-4">
+      {msg && <div className="text-xs text-rose-600">{msg}</div>}
+
+      {/* 酒店房型 */}
+      <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+        <h2 className="text-sm font-medium text-slate-700">酒店净房价（按房型）</h2>
+        <table className="mt-3 w-full text-sm">
+          <thead className="text-xs text-slate-500">
+            <tr className="border-b border-slate-200">
+              <th className="py-2 text-left font-normal">酒店 / 房型</th>
+              <th className="py-2 text-right font-normal">挂牌价(CNY)</th>
+              <th className="py-2 text-right font-normal">净房价(CNY/晚)</th>
+              <th className="py-2 text-right font-normal">净房价(VND/晚)</th>
+              <th className="py-2 text-right font-normal"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {hotels.flatMap((h) =>
+              h.roomTypes.map((rt) => (
+                <CostRow
+                  key={rt.id}
+                  label={`${h.name} · ${rt.name}`}
+                  basePrice={rt.basePrice}
+                  fields={[
+                    { key: 'costPriceCny', value: rt.costPriceCny },
+                    { key: 'costPriceVnd', value: rt.costPriceVnd },
+                  ]}
+                  onSave={async (vals) => {
+                    await api.patchHotelRoomTypeCost(token, rt.id, vals);
+                    load();
+                  }}
+                />
+              )),
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      {/* 签证 */}
+      <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+        <h2 className="text-sm font-medium text-slate-700">签证成本</h2>
+        <table className="mt-3 w-full text-sm">
+          <thead className="text-xs text-slate-500">
+            <tr className="border-b border-slate-200">
+              <th className="py-2 text-left font-normal">签证</th>
+              <th className="py-2 text-right font-normal">挂牌价(CNY)</th>
+              <th className="py-2 text-right font-normal">成本(CNY)</th>
+              <th className="py-2 text-right font-normal">成本(USD)</th>
+              <th className="py-2 text-right font-normal"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {visas.map((v) => (
+              <CostRow
+                key={v.id}
+                label={`${v.flag ?? ''} ${v.country ?? v.destinationCountry} · ${v.visaName ?? v.visaType}`}
+                basePrice={v.basePrice}
+                fields={[
+                  { key: 'costPriceCny', value: v.costPriceCny },
+                  { key: 'costPriceUsd', value: v.costPriceUsd },
+                ]}
+                onSave={async (vals) => {
+                  await api.patchVisaCost(token, v.id, vals);
+                  load();
+                }}
+              />
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {/* 接送 */}
+      <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+        <h2 className="text-sm font-medium text-slate-700">接送车队结算价</h2>
+        <table className="mt-3 w-full text-sm">
+          <thead className="text-xs text-slate-500">
+            <tr className="border-b border-slate-200">
+              <th className="py-2 text-left font-normal">车型 / 线路</th>
+              <th className="py-2 text-right font-normal">挂牌价(CNY)</th>
+              <th className="py-2 text-right font-normal">结算价(CNY)</th>
+              <th className="py-2 text-right font-normal"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {transfers.map((t) => (
+              <CostRow
+                key={t.id}
+                label={`${t.name} · ${t.originArea}→${t.destArea}`}
+                basePrice={t.basePrice}
+                fields={[{ key: 'costPriceCny', value: t.costPriceCny }]}
+                onSave={async (vals) => {
+                  await api.patchTransferCost(token, t.id, vals);
+                  load();
+                }}
+              />
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+interface CostField {
+  key: string;
+  value: string | null;
+}
+
+function CostRow({
+  label,
+  basePrice,
+  fields,
+  onSave,
+}: {
+  label: string;
+  basePrice: string | null;
+  fields: CostField[];
+  onSave: (vals: Record<string, number | null>) => Promise<void>;
+}) {
+  const [draft, setDraft] = useState<Record<string, string>>(
+    Object.fromEntries(fields.map((f) => [f.key, f.value ?? ''])),
+  );
+  const [saving, setSaving] = useState(false);
+
+  async function save(): Promise<void> {
+    setSaving(true);
+    try {
+      const vals: Record<string, number | null> = {};
+      for (const f of fields) {
+        const raw = draft[f.key];
+        vals[f.key] = raw === '' ? null : Number(raw);
+      }
+      await onSave(vals);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <tr className="border-b border-slate-100 last:border-0">
+      <td className="py-2 text-slate-900">{label}</td>
+      <td className="py-2 text-right tabular-nums text-slate-500">
+        {basePrice ? `¥${Number(basePrice).toLocaleString('zh-CN')}` : '—'}
+      </td>
+      {fields.map((f) => (
+        <td key={f.key} className="py-2 text-right">
+          <input
+            type="number"
+            step="0.01"
+            value={draft[f.key] ?? ''}
+            onChange={(e) => setDraft((d) => ({ ...d, [f.key]: e.target.value }))}
+            className="w-28 rounded-md border border-slate-300 px-2 py-1 text-right text-sm"
+          />
+        </td>
+      ))}
+      <td className="py-2 text-right">
+        <button
+          type="button"
+          onClick={save}
+          disabled={saving}
+          className="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+        >
+          {saving ? '…' : '保存'}
+        </button>
+      </td>
+    </tr>
   );
 }
 

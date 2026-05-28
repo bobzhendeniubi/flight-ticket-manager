@@ -311,12 +311,18 @@ function serializeHotel(h: HotelWithRooms) {
       ...rt,
       basePrice: rt.basePrice.toString(),
       priceMultiplier: rt.priceMultiplier?.toString() ?? null,
+      costPriceCny: rt.costPriceCny?.toString() ?? null,
+      costPriceVnd: rt.costPriceVnd?.toString() ?? null,
     })),
   };
 }
 
 function serializeTransfer(t: Prisma.TransferGetPayload<Record<string, never>>) {
-  return { ...t, basePrice: t.basePrice.toString() };
+  return {
+    ...t,
+    basePrice: t.basePrice.toString(),
+    costPriceCny: t.costPriceCny?.toString() ?? null,
+  };
 }
 
 function serializeVisa(v: Prisma.VisaGetPayload<Record<string, never>>) {
@@ -324,6 +330,8 @@ function serializeVisa(v: Prisma.VisaGetPayload<Record<string, never>>) {
     ...v,
     basePrice: v.basePrice.toString(),
     expressSurcharge: v.expressSurcharge?.toString() ?? null,
+    costPriceCny: v.costPriceCny?.toString() ?? null,
+    costPriceUsd: v.costPriceUsd?.toString() ?? null,
   };
 }
 

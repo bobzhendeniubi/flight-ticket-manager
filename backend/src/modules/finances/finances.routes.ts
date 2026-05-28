@@ -19,6 +19,15 @@ import {
   getOrderPnl,
   getMonthlyTrend,
 } from './finances.service.js';
+import {
+  listExchangeRates,
+  upsertExchangeRate,
+  patchFlightScheduleCost,
+  patchHotelRoomTypeCost,
+  patchVisaCost,
+  patchTransferCost,
+} from './finances.cost.service.js';
+import { buildFinanceExportWorkbook, financeExportFilename } from './finances.export.js';
 
 const dateStr = z
   .string()
@@ -33,6 +42,25 @@ const rangeSchema = z.object({
 const monthlySchema = z.object({
   months: z.coerce.number().int().positive().max(36).optional(),
 });
+
+const fxUpsertSchema = z.object({
+  currency: z.enum(['USD', 'VND']),
+  kind: z.enum(['FLIGHT', 'AIRPORT_TAX', 'HOTEL', 'VISA', 'GENERAL']),
+  rateToCny: z.number().positive(),
+  note: z.string().max(200).optional(),
+});
+
+// 成本字段：number 或 null（清空）；缺省 = 不改
+const costNum = z.number().nonnegative().nullable().optional();
+const flightCostSchema = z.object({
+  charterCostCny: costNum,
+  ticketCostUsd: costNum,
+  airportTaxDepUsd: costNum,
+  airportTaxArrUsd: costNum,
+});
+const hotelCostSchema = z.object({ costPriceCny: costNum, costPriceVnd: costNum });
+const visaCostSchema = z.object({ costPriceCny: costNum, costPriceUsd: costNum });
+const transferCostSchema = z.object({ costPriceCny: costNum });
 
 function defaultRange(): { from: string; to: string } {
   const now = new Date();
@@ -95,5 +123,88 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
     logView(req, { route: 'monthly', months });
     const points = await getMonthlyTrend(months);
     return { months, points };
+  });
+
+  // ── xlsx 导出（一行/乘客）──
+  app.get('/export', requireAdmin, async (req, reply) => {
+    const q = rangeSchema.parse(req.query);
+    const def = defaultRange();
+    const range = { from: q.from ?? def.from, to: q.to ?? def.to };
+    logView(req, { route: 'export', range });
+    const buf = await buildFinanceExportWorkbook(range);
+    return reply
+      .header(
+        'Content-Type',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      )
+      .header(
+        'Content-Disposition',
+        `attachment; filename="${encodeURIComponent(financeExportFilename(range))}"`,
+      )
+      .send(buf);
+  });
+
+  // ── 汇率管理 ──────────────────────────────────────────────────────────────
+  app.get('/exchange-rates', requireAdmin, async () => {
+    const rates = await listExchangeRates();
+    return { rates };
+  });
+
+  app.put('/exchange-rates', requireAdmin, async (req) => {
+    const body = fxUpsertSchema.parse(req.body);
+    const rate = await upsertExchangeRate(body);
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'UPDATE_EXCHANGE_RATE',
+      targetType: 'SYSTEM',
+      targetId: `${body.currency}:${body.kind}`,
+      targetLabel: '汇率',
+      after: { rateToCny: body.rateToCny },
+    });
+    return { rate };
+  });
+
+  // ── 产品成本编辑 ──────────────────────────────────────────────────────────
+  function auditCost(req: FastifyRequest, target: string, after: unknown): void {
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'UPDATE_FINANCE_COST',
+      targetType: 'PRODUCT',
+      targetId: target,
+      targetLabel: '产品成本',
+      after,
+    });
+  }
+
+  app.patch('/cost/flight-schedule/:id', requireAdmin, async (req) => {
+    const { id } = req.params as { id: string };
+    const data = flightCostSchema.parse(req.body);
+    const result = await patchFlightScheduleCost(id, data);
+    auditCost(req, `flight-schedule:${id}`, data);
+    return result;
+  });
+
+  app.patch('/cost/hotel-room-type/:id', requireAdmin, async (req) => {
+    const { id } = req.params as { id: string };
+    const data = hotelCostSchema.parse(req.body);
+    const result = await patchHotelRoomTypeCost(id, data);
+    auditCost(req, `hotel-room-type:${id}`, data);
+    return result;
+  });
+
+  app.patch('/cost/visa/:id', requireAdmin, async (req) => {
+    const { id } = req.params as { id: string };
+    const data = visaCostSchema.parse(req.body);
+    const result = await patchVisaCost(id, data);
+    auditCost(req, `visa:${id}`, data);
+    return result;
+  });
+
+  app.patch('/cost/transfer/:id', requireAdmin, async (req) => {
+    const { id } = req.params as { id: string };
+    const data = transferCostSchema.parse(req.body);
+    const result = await patchTransferCost(id, data);
+    auditCost(req, `transfer:${id}`, data);
+    return result;
   });
 };

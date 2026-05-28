@@ -375,6 +375,8 @@ export interface HotelRoomType {
   capacity: number;
   basePrice: string;
   priceMultiplier: string | null;
+  costPriceCny: string | null;
+  costPriceVnd: string | null;
 }
 
 export interface Hotel {
@@ -410,6 +412,7 @@ export interface Transfer {
   emoji: string | null;
   photo: string | null;
   isActive: boolean;
+  costPriceCny: string | null;
   createdAt: string;
 }
 
@@ -427,6 +430,8 @@ export interface Visa {
   highlight: string | null;
   requiredDocs: string[];
   isActive: boolean;
+  costPriceCny: string | null;
+  costPriceUsd: string | null;
   createdAt: string;
 }
 
@@ -912,7 +917,64 @@ export const api = {
       `/finances/monthly?months=${months}`,
       { token },
     ),
+
+  // 汇率管理
+  getExchangeRates: (token: string) =>
+    apiFetch<{ rates: ExchangeRate[] }>('/finances/exchange-rates', { token }),
+  upsertExchangeRate: (
+    token: string,
+    body: { currency: string; kind: string; rateToCny: number; note?: string },
+  ) => apiFetch<{ rate: ExchangeRate }>('/finances/exchange-rates', { method: 'PUT', token, body }),
+
+  // 产品成本编辑
+  patchFlightScheduleCost: (
+    token: string,
+    id: string,
+    body: Partial<{
+      charterCostCny: number | null;
+      ticketCostUsd: number | null;
+      airportTaxDepUsd: number | null;
+      airportTaxArrUsd: number | null;
+    }>,
+  ) => apiFetch<{ id: string }>(`/finances/cost/flight-schedule/${id}`, { method: 'PATCH', token, body }),
+  patchHotelRoomTypeCost: (
+    token: string,
+    id: string,
+    body: Partial<{ costPriceCny: number | null; costPriceVnd: number | null }>,
+  ) => apiFetch<{ id: string }>(`/finances/cost/hotel-room-type/${id}`, { method: 'PATCH', token, body }),
+  patchVisaCost: (
+    token: string,
+    id: string,
+    body: Partial<{ costPriceCny: number | null; costPriceUsd: number | null }>,
+  ) => apiFetch<{ id: string }>(`/finances/cost/visa/${id}`, { method: 'PATCH', token, body }),
+  patchTransferCost: (
+    token: string,
+    id: string,
+    body: Partial<{ costPriceCny: number | null }>,
+  ) => apiFetch<{ id: string }>(`/finances/cost/transfer/${id}`, { method: 'PATCH', token, body }),
+
+  // 财务核对 xlsx 导出（Blob 直接下载）
+  downloadFinanceExport: async (
+    token: string,
+    range: { from: string; to: string },
+  ): Promise<Blob> => {
+    const res = await fetch(
+      `${API_BASE}/finances/export?from=${encodeURIComponent(range.from)}&to=${encodeURIComponent(range.to)}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) throw new ApiError(res.status, '导出失败');
+    return res.blob();
+  },
 };
+
+export interface ExchangeRate {
+  id: string;
+  currency: string;
+  kind: string;
+  rateToCny: number;
+  note: string | null;
+  updatedAt: string;
+}
 
 // ── 财务模块类型（与 backend/src/modules/finances/finances.service.ts 对齐）──
 export interface CategoryBreakdown {

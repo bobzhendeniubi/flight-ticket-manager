@@ -20,6 +20,10 @@ interface AdminSchedule {
   arrivalTz: string;
   isActive: boolean;
   seatClasses: ScheduleSeat[];
+  charterCostCny: string | null;
+  ticketCostUsd: string | null;
+  airportTaxDepUsd: string | null;
+  airportTaxArrUsd: string | null;
 }
 
 export function FlightsPage() {
@@ -266,6 +270,7 @@ function SchedulesList({
             <th className="px-3 py-2">出发</th>
             <th className="px-3 py-2">到达</th>
             <th className="px-3 py-2">舱位 / 余票 / 价格</th>
+            <th className="px-3 py-2">成本（包机 / 单票USD / 机场税USD）</th>
             <th className="px-3 py-2">状态</th>
           </tr>
         </thead>
@@ -294,6 +299,9 @@ function SchedulesList({
                 </ul>
               </td>
               <td className="px-3 py-2">
+                <ScheduleCostEditor schedule={s} />
+              </td>
+              <td className="px-3 py-2">
                 {s.isActive ? (
                   <span className="rounded bg-green-100 px-2 py-0.5 text-xs text-green-700">在售</span>
                 ) : (
@@ -305,6 +313,64 @@ function SchedulesList({
         </tbody>
       </table>
       </div>
+    </div>
+  );
+}
+
+// ── 班次成本内联编辑（包机总成本 / 单票 USD / 机场税 USD）──
+function ScheduleCostEditor({ schedule }: { schedule: AdminSchedule }) {
+  const tokens = useAuth((s) => s.tokens);
+  const [charter, setCharter] = useState(schedule.charterCostCny ?? '');
+  const [ticket, setTicket] = useState(schedule.ticketCostUsd ?? '');
+  const [taxDep, setTaxDep] = useState(schedule.airportTaxDepUsd ?? '');
+  const [taxArr, setTaxArr] = useState(schedule.airportTaxArrUsd ?? '');
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const toNum = (v: string): number | null => (v.trim() === '' ? null : Number(v));
+
+  async function save(): Promise<void> {
+    if (!tokens) return;
+    setSaving(true);
+    setErr(null);
+    setSaved(false);
+    try {
+      await api.patchFlightScheduleCost(tokens.accessToken, schedule.id, {
+        charterCostCny: toNum(charter),
+        ticketCostUsd: toNum(ticket),
+        airportTaxDepUsd: toNum(taxDep),
+        airportTaxArrUsd: toNum(taxArr),
+      });
+      setSaved(true);
+      setTimeout(() => setSaved(false), 1500);
+    } catch (e: unknown) {
+      setErr(e instanceof ApiError ? e.message : '保存失败');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const inputCls = 'w-24 rounded border border-slate-300 px-1.5 py-0.5 text-right text-xs';
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex flex-wrap items-center gap-1">
+        <span className="text-xs text-slate-400">¥</span>
+        <input className={inputCls} type="number" step="1" placeholder="包机总成本" value={charter} onChange={(e) => setCharter(e.target.value)} />
+        <span className="text-xs text-slate-400">$</span>
+        <input className={inputCls} type="number" step="0.01" placeholder="单票" value={ticket} onChange={(e) => setTicket(e.target.value)} />
+        <input className={inputCls} type="number" step="0.01" placeholder="出发税$" value={taxDep} onChange={(e) => setTaxDep(e.target.value)} />
+        <input className={inputCls} type="number" step="0.01" placeholder="到达税$" value={taxArr} onChange={(e) => setTaxArr(e.target.value)} />
+        <button
+          type="button"
+          onClick={save}
+          disabled={saving}
+          className="rounded border border-slate-300 px-2 py-0.5 text-xs text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+        >
+          {saving ? '…' : saved ? '✓' : '保存'}
+        </button>
+      </div>
+      {err && <span className="text-xs text-rose-600">{err}</span>}
     </div>
   );
 }
