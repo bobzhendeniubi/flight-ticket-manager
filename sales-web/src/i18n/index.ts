@@ -17,7 +17,6 @@
  */
 import i18n from 'i18next';
 import { initReactI18next } from 'react-i18next';
-import LanguageDetector from 'i18next-browser-languagedetector';
 import zhCN from './locales/zh-CN.json';
 import en from './locales/en.json';
 import vi from './locales/vi.json';
@@ -25,27 +24,21 @@ import vi from './locales/vi.json';
 export const SUPPORTED_LANGUAGES = ['zh-CN', 'en', 'vi'] as const;
 export type SupportedLanguage = (typeof SUPPORTED_LANGUAGES)[number];
 
-void i18n
-  .use(LanguageDetector)
-  .use(initReactI18next)
-  .init({
-    resources: {
-      'zh-CN': { translation: zhCN },
-      en: { translation: en },
-      vi: { translation: vi },
-    },
-    fallbackLng: 'zh-CN',
-    supportedLngs: SUPPORTED_LANGUAGES,
-    nonExplicitSupportedLngs: true, // en-US → en
-    interpolation: { escapeValue: false }, // React 已经 escape，不重复
-    detection: {
-      order: ['localStorage', 'navigator', 'htmlTag'],
-      lookupLocalStorage: 'ftm_i18n_lng',
-      caches: ['localStorage'],
-    },
-    // App 没用 <Suspense> 包，禁用 suspense 让组件在 resources ready 后自动 re-render
-    // 否则首次渲染会拿到 raw key（'nav.flights' 字面量），切语言才显示翻译
-    react: { useSuspense: false },
-  });
+// 全站锁定中文：页面文案目前全是硬编码中文，en/vi 未完整翻译。
+// 之前用浏览器语言检测 → 英文浏览器的用户首屏导航变英文、页面仍中文 = 一直混着。
+// 强制 lng='zh-CN'，不再按浏览器语言切换。（未来要真多语言：把所有页面文案接进 t() 后再恢复检测）
+void i18n.use(initReactI18next).init({
+  resources: {
+    'zh-CN': { translation: zhCN },
+    en: { translation: en },
+    vi: { translation: vi },
+  },
+  lng: 'zh-CN',
+  fallbackLng: 'zh-CN',
+  supportedLngs: SUPPORTED_LANGUAGES,
+  nonExplicitSupportedLngs: true,
+  interpolation: { escapeValue: false }, // React 已经 escape，不重复
+  react: { useSuspense: false },
+});
 
 export default i18n;

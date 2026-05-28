@@ -5,7 +5,6 @@ import { useAuth } from '../stores/auth';
 import { useCart } from '../stores/cart';
 import { MobilePreviewFrame } from './MobilePreviewFrame';
 import { AiAssistant } from './AiAssistant';
-import { SUPPORTED_LANGUAGES, type SupportedLanguage } from '../i18n';
 
 const ROLE_LABEL: Record<string, string> = {
   CUSTOMER: '客户',
@@ -18,7 +17,7 @@ const ROLE_LABEL: Record<string, string> = {
 // /admin/* 路由仍保留可访问（向后兼容旧链接），但不在 nav 中显示。
 
 export function Layout() {
-  const { t, i18n } = useTranslation();
+  const { t } = useTranslation();
   const user = useAuth((s) => s.user);
   const logout = useAuth((s) => s.logout);
   const navigate = useNavigate();
@@ -111,19 +110,6 @@ export function Layout() {
 
           {/* 右侧用户菜单：手机端只保留购物车，其他进汉堡 */}
           <nav className="flex items-center gap-2 md:gap-3 text-sm">
-            {/* 语言切换器 — zh-CN / en / vi */}
-            <select
-              value={i18n.language.startsWith('zh') ? 'zh-CN' : i18n.language.startsWith('en') ? 'en' : i18n.language.startsWith('vi') ? 'vi' : 'zh-CN'}
-              onChange={(e) => void i18n.changeLanguage(e.target.value)}
-              className="hidden md:inline-block rounded-md border border-slate-200 bg-white px-2 py-1 text-xs text-slate-700 hover:border-brand"
-              aria-label={t('language.label')}
-            >
-              {SUPPORTED_LANGUAGES.map((lng: SupportedLanguage) => (
-                <option key={lng} value={lng}>
-                  {t(`language.${lng}`)}
-                </option>
-              ))}
-            </select>
             <a
               href="/?preview=mobile"
               className="hidden md:inline-flex items-center gap-1 rounded-md border border-slate-200 bg-slate-50 px-2 py-1 text-xs text-slate-600 hover:border-brand hover:text-brand"
@@ -251,19 +237,6 @@ export function Layout() {
                     <Link to="/login" onClick={closeMenu} className="block px-4 py-3 text-sm font-semibold text-brand hover:bg-brand/5">
                       {t('nav.login')}
                     </Link>
-                    {/* 手机抽屉里的语言切换 */}
-                    <div className="mt-2 px-4 py-2 border-t border-slate-100">
-                      <label className="text-xs text-slate-500 mb-1 block">{t('language.label')}</label>
-                      <select
-                        value={i18n.language.startsWith('zh') ? 'zh-CN' : i18n.language.startsWith('en') ? 'en' : i18n.language.startsWith('vi') ? 'vi' : 'zh-CN'}
-                        onChange={(e) => void i18n.changeLanguage(e.target.value)}
-                        className="w-full rounded-md border border-slate-300 px-2 py-1 text-sm"
-                      >
-                        {SUPPORTED_LANGUAGES.map((lng: SupportedLanguage) => (
-                          <option key={lng} value={lng}>{t(`language.${lng}`)}</option>
-                        ))}
-                      </select>
-                    </div>
                   </>
                 )}
               </div>
