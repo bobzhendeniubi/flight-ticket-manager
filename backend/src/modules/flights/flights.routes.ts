@@ -67,11 +67,10 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
       // 代理可读班次（批量创单需要），但不可见成本字段 —— 剥离防泄露毛利
       if (req.user.role === UserRole.AGENT) {
         const sanitized = schedules.map((s) => {
-          const { charterCostCny, ticketCostUsd, airportTaxDepUsd, airportTaxArrUsd, ...rest } = s;
+          const { charterCostCny, airportTaxDepCny, airportTaxArrCny, ...rest } = s;
           void charterCostCny;
-          void ticketCostUsd;
-          void airportTaxDepUsd;
-          void airportTaxArrUsd;
+          void airportTaxDepCny;
+          void airportTaxArrCny;
           return rest;
         });
         return { schedules: sanitized };

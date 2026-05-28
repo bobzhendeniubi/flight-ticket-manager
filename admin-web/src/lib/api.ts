@@ -423,7 +423,6 @@ export interface HotelRoomType {
   basePrice: string;
   priceMultiplier: string | null;
   costPriceCny: string | null;
-  costPriceVnd: string | null;
 }
 
 export interface Hotel {
@@ -478,7 +477,6 @@ export interface Visa {
   requiredDocs: string[];
   isActive: boolean;
   costPriceCny: string | null;
-  costPriceUsd: string | null;
   createdAt: string;
 }
 
@@ -996,34 +994,25 @@ export const api = {
       { token },
     ),
 
-  // 汇率管理
-  getExchangeRates: (token: string) =>
-    apiFetch<{ rates: ExchangeRate[] }>('/finances/exchange-rates', { token }),
-  upsertExchangeRate: (
-    token: string,
-    body: { currency: string; kind: string; rateToCny: number; note?: string },
-  ) => apiFetch<{ rate: ExchangeRate }>('/finances/exchange-rates', { method: 'PUT', token, body }),
-
   // 产品成本编辑
   patchFlightScheduleCost: (
     token: string,
     id: string,
     body: Partial<{
       charterCostCny: number | null;
-      ticketCostUsd: number | null;
-      airportTaxDepUsd: number | null;
-      airportTaxArrUsd: number | null;
+      airportTaxDepCny: number | null;
+      airportTaxArrCny: number | null;
     }>,
   ) => apiFetch<{ id: string }>(`/finances/cost/flight-schedule/${id}`, { method: 'PATCH', token, body }),
   patchHotelRoomTypeCost: (
     token: string,
     id: string,
-    body: Partial<{ costPriceCny: number | null; costPriceVnd: number | null }>,
+    body: Partial<{ costPriceCny: number | null }>,
   ) => apiFetch<{ id: string }>(`/finances/cost/hotel-room-type/${id}`, { method: 'PATCH', token, body }),
   patchVisaCost: (
     token: string,
     id: string,
-    body: Partial<{ costPriceCny: number | null; costPriceUsd: number | null }>,
+    body: Partial<{ costPriceCny: number | null }>,
   ) => apiFetch<{ id: string }>(`/finances/cost/visa/${id}`, { method: 'PATCH', token, body }),
   patchTransferCost: (
     token: string,
@@ -1044,15 +1033,6 @@ export const api = {
     return res.blob();
   },
 };
-
-export interface ExchangeRate {
-  id: string;
-  currency: string;
-  kind: string;
-  rateToCny: number;
-  note: string | null;
-  updatedAt: string;
-}
 
 // ── 财务模块类型（与 backend/src/modules/finances/finances.service.ts 对齐）──
 export interface CategoryBreakdown {

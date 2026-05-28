@@ -19,7 +19,6 @@ import {
   type FlightPnlRow,
   type OrderPnlRow,
   type MonthlyPoint,
-  type ExchangeRate,
   type Hotel,
   type Visa,
   type Transfer,
@@ -27,15 +26,6 @@ import {
 import { useAuth } from '../stores/auth';
 
 type Tab = 'summary' | 'flights' | 'orders' | 'monthly' | 'costs';
-
-const FX_KINDS: Array<{ currency: string; kind: string; label: string }> = [
-  { currency: 'USD', kind: 'FLIGHT', label: '机票 USD→CNY' },
-  { currency: 'USD', kind: 'AIRPORT_TAX', label: '机场税 USD→CNY' },
-  { currency: 'USD', kind: 'VISA', label: '签证 USD→CNY' },
-  { currency: 'VND', kind: 'HOTEL', label: '酒店 VND→CNY' },
-  { currency: 'USD', kind: 'GENERAL', label: '通用 USD→CNY' },
-  { currency: 'VND', kind: 'GENERAL', label: '通用 VND→CNY' },
-];
 
 const KIND_LABEL: Record<string, string> = {
   FLIGHT: '机票',
@@ -285,118 +275,14 @@ function ExportButton({ token, range }: { token: string; range: { from: string; 
   );
 }
 
-// ── Costs / FX maintenance tab ───────────────────────────────────────────────
+// ── Costs maintenance tab ────────────────────────────────────────────────────
 function CostsTab({ token }: { token: string }) {
-  const [rates, setRates] = useState<ExchangeRate[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [err, setErr] = useState<string | null>(null);
-  const [draft, setDraft] = useState<Record<string, string>>({});
-  const [savingKey, setSavingKey] = useState<string | null>(null);
-
-  const load = useCallback(() => {
-    if (!token) return;
-    let cancelled = false;
-    setLoading(true);
-    api
-      .getExchangeRates(token)
-      .then((d) => {
-        if (cancelled) return;
-        setRates(d.rates);
-        const next: Record<string, string> = {};
-        for (const r of d.rates) next[`${r.currency}:${r.kind}`] = String(r.rateToCny);
-        setDraft(next);
-      })
-      .catch((e: unknown) => {
-        if (!cancelled) setErr(e instanceof ApiError ? e.message : '加载失败');
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [token]);
-
-  useEffect(() => load(), [load]);
-
-  async function save(currency: string, kind: string): Promise<void> {
-    const key = `${currency}:${kind}`;
-    const val = parseFloat(draft[key] ?? '');
-    if (!Number.isFinite(val) || val <= 0) {
-      setErr(`${key} 汇率需为正数`);
-      return;
-    }
-    setSavingKey(key);
-    setErr(null);
-    try {
-      await api.upsertExchangeRate(token, { currency, kind, rateToCny: val });
-      load();
-    } catch (e: unknown) {
-      setErr(e instanceof ApiError ? e.message : '保存失败');
-    } finally {
-      setSavingKey(null);
-    }
-  }
-
-  if (loading) return <div className="text-sm text-slate-500">加载中…</div>;
-
   return (
     <section className="space-y-5">
-      <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-        <h2 className="text-sm font-medium text-slate-700">汇率（外币 → 人民币）</h2>
-        <p className="mt-1 text-xs text-slate-500">
-          导出 xlsx 时用这些汇率把 USD / VND 成本折算成 RMB。同一币种不同用途可设不同汇率（机票 vs 机场税）。
-        </p>
-        {err && <div className="mt-2 text-xs text-rose-600">{err}</div>}
-        <table className="mt-3 w-full text-sm">
-          <thead className="text-xs text-slate-500">
-            <tr className="border-b border-slate-200">
-              <th className="py-2 text-left font-normal">用途</th>
-              <th className="py-2 text-left font-normal">币种</th>
-              <th className="py-2 text-right font-normal">1 外币 = ? 人民币</th>
-              <th className="py-2 text-right font-normal">操作</th>
-            </tr>
-          </thead>
-          <tbody>
-            {FX_KINDS.map(({ currency, kind, label }) => {
-              const key = `${currency}:${kind}`;
-              const existing = rates.find((r) => r.currency === currency && r.kind === kind);
-              return (
-                <tr key={key} className="border-b border-slate-100 last:border-0">
-                  <td className="py-2 text-slate-900">{label}</td>
-                  <td className="py-2 text-slate-500">{currency}</td>
-                  <td className="py-2 text-right">
-                    <input
-                      type="number"
-                      step="0.0001"
-                      value={draft[key] ?? ''}
-                      placeholder={existing ? '' : '未设置（用默认）'}
-                      onChange={(e) => setDraft((d) => ({ ...d, [key]: e.target.value }))}
-                      className="w-32 rounded-md border border-slate-300 px-2 py-1 text-right text-sm"
-                    />
-                  </td>
-                  <td className="py-2 text-right">
-                    <button
-                      type="button"
-                      onClick={() => save(currency, kind)}
-                      disabled={savingKey === key}
-                      className="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-50 disabled:opacity-50"
-                    >
-                      {savingKey === key ? '保存中…' : '保存'}
-                    </button>
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
-
       <ProductCostEditors token={token} />
 
       <p className="text-xs text-slate-400">
-        说明：成本只填 CNY 也能导出；填了 USD/VND 则按上面汇率折算，xlsx 里原币列也带出来。
-        航班「包机成本 / 单票成本(USD) / 机场税」在航班管理页按班次编辑。
+        说明：成本统一人民币；航班「包机成本 / 机场税」在航班管理页按班次编辑。
       </p>
     </section>
   );
@@ -448,7 +334,6 @@ function ProductCostEditors({ token }: { token: string }) {
               <th className="py-2 text-left font-normal">酒店 / 房型</th>
               <th className="py-2 text-right font-normal">挂牌价(CNY)</th>
               <th className="py-2 text-right font-normal">净房价(CNY/晚)</th>
-              <th className="py-2 text-right font-normal">净房价(VND/晚)</th>
               <th className="py-2 text-right font-normal"></th>
             </tr>
           </thead>
@@ -461,7 +346,6 @@ function ProductCostEditors({ token }: { token: string }) {
                   basePrice={rt.basePrice}
                   fields={[
                     { key: 'costPriceCny', value: rt.costPriceCny },
-                    { key: 'costPriceVnd', value: rt.costPriceVnd },
                   ]}
                   onSave={async (vals) => {
                     await api.patchHotelRoomTypeCost(token, rt.id, vals);
@@ -483,7 +367,6 @@ function ProductCostEditors({ token }: { token: string }) {
               <th className="py-2 text-left font-normal">签证</th>
               <th className="py-2 text-right font-normal">挂牌价(CNY)</th>
               <th className="py-2 text-right font-normal">成本(CNY)</th>
-              <th className="py-2 text-right font-normal">成本(USD)</th>
               <th className="py-2 text-right font-normal"></th>
             </tr>
           </thead>
@@ -495,7 +378,6 @@ function ProductCostEditors({ token }: { token: string }) {
                 basePrice={v.basePrice}
                 fields={[
                   { key: 'costPriceCny', value: v.costPriceCny },
-                  { key: 'costPriceUsd', value: v.costPriceUsd },
                 ]}
                 onSave={async (vals) => {
                   await api.patchVisaCost(token, v.id, vals);

@@ -381,11 +381,9 @@ model FlightSchedule {
   arrivalTz        String
   // 包机总成本（CNY）— 整班次付给航司的包机价；按"卖出座位 / 总成本"算单座分摊
   charterCostCny   Decimal? @db.Decimal(12, 2)
-  // 单票机票成本（USD/座）— 财务对账口径：每张票固定 USD 成本（与包机分摊互补）
-  ticketCostUsd    Decimal? @db.Decimal(10, 2)
-  // 机场税（USD/人）— 出发地 / 目的地分开（岘港、澳门税率不同）
-  airportTaxDepUsd Decimal? @db.Decimal(10, 2)
-  airportTaxArrUsd Decimal? @db.Decimal(10, 2)
+  // 机场税（CNY/人）— 出发地 / 目的地分开（岘港、澳门税率不同）
+  airportTaxDepCny Decimal? @db.Decimal(10, 2)
+  airportTaxArrCny Decimal? @db.Decimal(10, 2)
   isActive         Boolean  @default(true)
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt
@@ -453,8 +451,6 @@ model HotelRoomType {
   basePrice       Decimal  @db.Decimal(10, 2)
   // 净房价（CNY/晚）— 付给酒店的真实成本；NULL 时按 basePrice × 0.70 估算
   costPriceCny    Decimal? @db.Decimal(10, 2)
-  // 净房价（VND/晚）— 财务对账原币口径；导出时按 HOTEL 汇率折 CNY
-  costPriceVnd    Decimal? @db.Decimal(14, 2)
   priceMultiplier Decimal? @db.Decimal(5, 2) // 相对 hotel.basePrice 的倍率（可选，用于 UI 快速报价）
   photos          String[]
   createdAt       DateTime @default(now())
@@ -520,8 +516,6 @@ model Visa {
   expressSurcharge   Decimal? @db.Decimal(10, 2)
   // 使馆/代办成本（CNY）— NULL 时按 basePrice × 0.55 估算（签证毛利通常更高）
   costPriceCny       Decimal? @db.Decimal(10, 2)
-  // 签证成本（USD）— 财务对账原币口径；导出时按 VISA 汇率折 CNY
-  costPriceUsd       Decimal? @db.Decimal(10, 2)
   validityMonths     Int? // 签证有效期（月）
   highlight          String? // "最热销 · 全流程线上"
   requiredDocs       String[] // e.g., ["passport_scan", "photo", "itinerary"]
@@ -530,22 +524,6 @@ model Visa {
   updatedAt          DateTime @updatedAt
 
   orderItems OrderItem[]
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// 汇率表 — 财务对账多币种折算（USD/VND → CNY）
-// 同一币种不同用途可有不同汇率（机票 vs 机场税 vs 酒店）
-// ─────────────────────────────────────────────────────────────────────────────
-model ExchangeRate {
-  id        String   @id @default(cuid())
-  currency  String // 'USD' | 'VND'
-  kind      String // 'FLIGHT' | 'AIRPORT_TAX' | 'HOTEL' | 'VISA' | 'GENERAL'
-  rateToCny Decimal  @db.Decimal(14, 6) // 1 单位外币 = X 人民币
-  note      String?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  @@unique([currency, kind])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

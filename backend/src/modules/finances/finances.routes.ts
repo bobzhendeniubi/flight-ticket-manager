@@ -20,8 +20,6 @@ import {
   getMonthlyTrend,
 } from './finances.service.js';
 import {
-  listExchangeRates,
-  upsertExchangeRate,
   patchFlightScheduleCost,
   patchHotelRoomTypeCost,
   patchVisaCost,
@@ -43,23 +41,15 @@ const monthlySchema = z.object({
   months: z.coerce.number().int().positive().max(36).optional(),
 });
 
-const fxUpsertSchema = z.object({
-  currency: z.enum(['USD', 'VND']),
-  kind: z.enum(['FLIGHT', 'AIRPORT_TAX', 'HOTEL', 'VISA', 'GENERAL']),
-  rateToCny: z.number().positive(),
-  note: z.string().max(200).optional(),
-});
-
-// 成本字段：number 或 null（清空）；缺省 = 不改
+// 成本字段：number 或 null（清空）；缺省 = 不改（统一 CNY，无汇率）
 const costNum = z.number().nonnegative().nullable().optional();
 const flightCostSchema = z.object({
   charterCostCny: costNum,
-  ticketCostUsd: costNum,
-  airportTaxDepUsd: costNum,
-  airportTaxArrUsd: costNum,
+  airportTaxDepCny: costNum,
+  airportTaxArrCny: costNum,
 });
-const hotelCostSchema = z.object({ costPriceCny: costNum, costPriceVnd: costNum });
-const visaCostSchema = z.object({ costPriceCny: costNum, costPriceUsd: costNum });
+const hotelCostSchema = z.object({ costPriceCny: costNum });
+const visaCostSchema = z.object({ costPriceCny: costNum });
 const transferCostSchema = z.object({ costPriceCny: costNum });
 
 function defaultRange(): { from: string; to: string } {
@@ -142,26 +132,6 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
         `attachment; filename="${encodeURIComponent(financeExportFilename(range))}"`,
       )
       .send(buf);
-  });
-
-  // ── 汇率管理 ──────────────────────────────────────────────────────────────
-  app.get('/exchange-rates', requireAdmin, async () => {
-    const rates = await listExchangeRates();
-    return { rates };
-  });
-
-  app.put('/exchange-rates', requireAdmin, async (req) => {
-    const body = fxUpsertSchema.parse(req.body);
-    const rate = await upsertExchangeRate(body);
-    void writeAudit({
-      actor: actorFromRequest(req),
-      action: 'UPDATE_EXCHANGE_RATE',
-      targetType: 'SYSTEM',
-      targetId: `${body.currency}:${body.kind}`,
-      targetLabel: '汇率',
-      after: { rateToCny: body.rateToCny },
-    });
-    return { rate };
   });
 
   // ── 产品成本编辑 ──────────────────────────────────────────────────────────

@@ -1,23 +1,19 @@
 /**
  * 财务核对明细 xlsx 导出 — 一行/乘客
  *
- * 对齐用户提供的「财务核对收入明细」格式（精简到可自动算的 ~40 列；
- * 人工对账列如收款方/抵扣/退款留空给会计补）。
- *
- * 成本口径：
- *   机票成本(RMB)  = ticketCostUsd × FX[USD:FLIGHT]
- *   机场税(RMB)    = (airportTaxDep+airportTaxArr)USD × FX[USD:AIRPORT_TAX]
- *   签证成本(RMB)  = visa.costPriceUsd × FX[USD:VISA]（无 USD 时用 costPriceCny）
- *   房费(RMB)      = hotel.costPriceCny（无则 costPriceVnd × FX[VND:HOTEL]）
+ * 成本口径（统一人民币，无汇率）：
+ *   机票成本(RMB)  = 该班次包机总成本 ÷ 总座位数（单座分摊）— 每位乘客占 1 座
+ *   机场税(RMB)    = airportTaxDepCny + airportTaxArrCny
+ *   房费(RMB)      = hotel.costPriceCny
  *   车费(RMB)      = transfer.costPriceCny
- * 机票成本按"每位乘客一张票"算；酒店/车费/签证按订单总额 ÷ 人数 均摊。
+ *   签证成本(RMB)  = visa.costPriceCny
+ * 机票成本按"包机单座成本"算（与航班毛利视图一致）；酒店/车费/签证按订单总额 ÷ 人数 均摊。
  * 收入按 order.total ÷ 人数 均摊到每位乘客。
  */
 import ExcelJS from 'exceljs';
 import type { Prisma, PrismaClient } from '@prisma/client';
 import { OrderStatus } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
-import { loadFxMap } from './finances.cost.service.js';
 
 const COUNTED_STATUSES: OrderStatus[] = [
   OrderStatus.PENDING_PAYMENT,
@@ -63,17 +59,12 @@ interface FinanceRow {
   status: string;
   settledStatus: string;
   recordedAt: string;
-  ticketCostUsd: number;
-  airportTaxUsd: number;
-  fxFlight: number;
-  fxAirportTax: number;
-  ticketCostCny: number;
+  flightCostCny: number; // 机票成本(RMB) — 包机单座分摊
   airportTaxCny: number;
   hotelName: string;
   hotelNights: number;
   hotelCostCny: number;
   transferCostCny: number;
-  visaCostUsd: number;
   visaCostCny: number;
   unitCostTotal: number;
   unitRevenue: number;
@@ -105,17 +96,12 @@ const COLUMNS: Array<{ header: string; key: keyof FinanceRow; width: number }> =
   { header: '订单状态', key: 'status', width: 10 },
   { header: '是否清账', key: 'settledStatus', width: 8 },
   { header: '录入时间', key: 'recordedAt', width: 18 },
-  { header: '机票成本(USD)', key: 'ticketCostUsd', width: 14 },
-  { header: '机场税(USD)', key: 'airportTaxUsd', width: 12 },
-  { header: '机票汇率', key: 'fxFlight', width: 10 },
-  { header: '机场税汇率', key: 'fxAirportTax', width: 10 },
-  { header: '机票成本(RMB)', key: 'ticketCostCny', width: 14 },
+  { header: '机票成本(RMB)', key: 'flightCostCny', width: 14 },
   { header: '机场税成本(RMB)', key: 'airportTaxCny', width: 14 },
   { header: '入住酒店', key: 'hotelName', width: 18 },
   { header: '入住天数', key: 'hotelNights', width: 8 },
   { header: '房费(RMB)', key: 'hotelCostCny', width: 12 },
   { header: '车费(RMB)', key: 'transferCostCny', width: 12 },
-  { header: '签证成本(USD)', key: 'visaCostUsd', width: 14 },
   { header: '签证成本(RMB)', key: 'visaCostCny', width: 14 },
   { header: '客单成本合计', key: 'unitCostTotal', width: 14 },
   { header: '客单收入', key: 'unitRevenue', width: 12 },
@@ -162,10 +148,11 @@ type OrderForExport = Prisma.OrderGetPayload<{
         flightSchedule: {
           include: {
             flight: { select: { flightNumber: true; originCode: true; destinationCode: true } };
+            seatClasses: { select: { capacity: true } };
           };
         };
-        hotelRoomType: { select: { name: true; costPriceCny: true; costPriceVnd: true } };
-        visa: { select: { costPriceCny: true; costPriceUsd: true } };
+        hotelRoomType: { select: { name: true; costPriceCny: true } };
+        visa: { select: { costPriceCny: true } };
         transfer: { select: { costPriceCny: true } };
       };
     };
@@ -173,31 +160,28 @@ type OrderForExport = Prisma.OrderGetPayload<{
 }>;
 
 /** 把一张订单展开成 N 行（每位乘客一行）*/
-function orderToRows(order: OrderForExport, fx: Record<string, number>): FinanceRow[] {
-  const fxFlight = fx['USD:FLIGHT'] ?? 7.1;
-  const fxTax = fx['USD:AIRPORT_TAX'] ?? 7.1;
-  const fxVisa = fx['USD:VISA'] ?? 7.1;
-  const fxHotelVnd = fx['VND:HOTEL'] ?? 0.000292;
-
+function orderToRows(order: OrderForExport): FinanceRow[] {
   const paxCount = Math.max(1, order.passengers.length);
 
-  // ── 机票（可能去程+回程多段）──
-  let ticketCostUsd = 0;
-  let airportTaxUsd = 0;
+  // ── 机票：包机单座分摊（charter / 总座位）+ 机场税(CNY)，可能去程+回程多段 ──
+  let flightCostPerSeat = 0; // 每位乘客占 1 座的包机分摊成本
+  let airportTaxCny = 0;
   const flightNumbers: string[] = [];
   const departDates: Date[] = [];
   for (const it of order.items) {
     if (it.kind === 'FLIGHT' && it.flightSchedule) {
-      ticketCostUsd += dec(it.flightSchedule.ticketCostUsd);
-      airportTaxUsd +=
-        dec(it.flightSchedule.airportTaxDepUsd) + dec(it.flightSchedule.airportTaxArrUsd);
+      const totalSeats = it.flightSchedule.seatClasses.reduce((a, c) => a + c.capacity, 0);
+      const charter = dec(it.flightSchedule.charterCostCny);
+      if (totalSeats > 0 && charter > 0) {
+        flightCostPerSeat += charter / totalSeats;
+      }
+      airportTaxCny +=
+        dec(it.flightSchedule.airportTaxDepCny) + dec(it.flightSchedule.airportTaxArrCny);
       flightNumbers.push(it.flightSchedule.flight.flightNumber);
       departDates.push(it.flightSchedule.departureTime);
     }
   }
   departDates.sort((a, b) => a.getTime() - b.getTime());
-  const ticketCostCny = ticketCostUsd * fxFlight;
-  const airportTaxCny = airportTaxUsd * fxTax;
 
   // ── 酒店 ──
   let hotelCostCnyOrder = 0;
@@ -205,10 +189,7 @@ function orderToRows(order: OrderForExport, fx: Record<string, number>): Finance
   let hotelNights = 0;
   for (const it of order.items) {
     if (it.kind === 'HOTEL' && it.hotelRoomType) {
-      const perNight =
-        it.hotelRoomType.costPriceCny != null
-          ? dec(it.hotelRoomType.costPriceCny)
-          : dec(it.hotelRoomType.costPriceVnd) * fxHotelVnd;
+      const perNight = dec(it.hotelRoomType.costPriceCny);
       let nights = 1;
       if (it.hotelCheckIn && it.hotelCheckOut) {
         nights = Math.max(
@@ -225,17 +206,11 @@ function orderToRows(order: OrderForExport, fx: Record<string, number>): Finance
   }
 
   // ── 签证 / 车费 ──
-  let visaCostUsdOrder = 0;
   let visaCostCnyOrder = 0;
   let transferCostCnyOrder = 0;
   for (const it of order.items) {
     if (it.kind === 'VISA' && it.visa) {
-      if (it.visa.costPriceUsd != null) {
-        visaCostUsdOrder += dec(it.visa.costPriceUsd) * it.quantity;
-        visaCostCnyOrder += dec(it.visa.costPriceUsd) * fxVisa * it.quantity;
-      } else {
-        visaCostCnyOrder += dec(it.visa.costPriceCny) * it.quantity;
-      }
+      visaCostCnyOrder += dec(it.visa.costPriceCny) * it.quantity;
     }
     if (it.kind === 'TRANSFER' && it.transfer) {
       transferCostCnyOrder += dec(it.transfer.costPriceCny) * it.quantity;
@@ -261,17 +236,17 @@ function orderToRows(order: OrderForExport, fx: Record<string, number>): Finance
 
   const hotelPerPax = hotelCostCnyOrder / paxCount;
   const transferPerPax = transferCostCnyOrder / paxCount;
-  const visaUsdPerPax = visaCostUsdOrder / paxCount;
   const visaCnyPerPax = visaCostCnyOrder / paxCount;
   const revenuePerPax = totalRevenue / paxCount;
 
-  const flightCostOrder = (ticketCostCny + airportTaxCny) * paxCount;
+  // 机票成本：每位乘客占 1 座 → flightCostPerSeat；整单 = 单座成本 × 人数
+  const flightCostOrder = (flightCostPerSeat + airportTaxCny) * paxCount;
   const totalCostOrder =
     flightCostOrder + hotelCostCnyOrder + transferCostCnyOrder + visaCostCnyOrder;
 
   const baseRows = order.passengers.map<FinanceRow>((p) => {
     const unitCostTotal =
-      ticketCostCny + airportTaxCny + hotelPerPax + transferPerPax + visaCnyPerPax;
+      flightCostPerSeat + airportTaxCny + hotelPerPax + transferPerPax + visaCnyPerPax;
     return {
       agency,
       orderNumber: order.orderNumber,
@@ -286,17 +261,12 @@ function orderToRows(order: OrderForExport, fx: Record<string, number>): Finance
       status: STATUS_LABEL[order.status] ?? order.status,
       settledStatus: settled,
       recordedAt: fmtDateTime(order.createdAt),
-      ticketCostUsd: round2(ticketCostUsd),
-      airportTaxUsd: round2(airportTaxUsd),
-      fxFlight: round2(fxFlight),
-      fxAirportTax: round2(fxTax),
-      ticketCostCny: round2(ticketCostCny),
+      flightCostCny: round2(flightCostPerSeat),
       airportTaxCny: round2(airportTaxCny),
       hotelName,
       hotelNights,
       hotelCostCny: round2(hotelPerPax),
       transferCostCny: round2(transferPerPax),
-      visaCostUsd: round2(visaUsdPerPax),
       visaCostCny: round2(visaCnyPerPax),
       unitCostTotal: round2(unitCostTotal),
       unitRevenue: round2(revenuePerPax),
@@ -346,8 +316,6 @@ export async function buildFinanceExportWorkbook(
   const fromD = new Date(Date.UTC(y1, m1 - 1, d1, 0, 0, 0, 0));
   const toD = new Date(Date.UTC(y2, m2 - 1, d2, 23, 59, 59, 999));
 
-  const fx = await loadFxMap(client);
-
   const orders = (await client.order.findMany({
     where: { createdAt: { gte: fromD, lte: toD }, status: { in: COUNTED_STATUSES } },
     orderBy: { createdAt: 'asc' },
@@ -359,10 +327,11 @@ export async function buildFinanceExportWorkbook(
           flightSchedule: {
             include: {
               flight: { select: { flightNumber: true, originCode: true, destinationCode: true } },
+              seatClasses: { select: { capacity: true } },
             },
           },
-          hotelRoomType: { select: { name: true, costPriceCny: true, costPriceVnd: true } },
-          visa: { select: { costPriceCny: true, costPriceUsd: true } },
+          hotelRoomType: { select: { name: true, costPriceCny: true } },
+          visa: { select: { costPriceCny: true } },
           transfer: { select: { costPriceCny: true } },
         },
       },
@@ -372,7 +341,7 @@ export async function buildFinanceExportWorkbook(
   const rows: FinanceRow[] = [];
   for (const o of orders) {
     if (o.passengers.length === 0) continue;
-    rows.push(...orderToRows(o, fx));
+    rows.push(...orderToRows(o));
   }
 
   const wb = new ExcelJS.Workbook();

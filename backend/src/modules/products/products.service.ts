@@ -312,7 +312,6 @@ function serializeHotel(h: HotelWithRooms) {
       basePrice: rt.basePrice.toString(),
       priceMultiplier: rt.priceMultiplier?.toString() ?? null,
       costPriceCny: rt.costPriceCny?.toString() ?? null,
-      costPriceVnd: rt.costPriceVnd?.toString() ?? null,
     })),
   };
 }
@@ -331,7 +330,6 @@ function serializeVisa(v: Prisma.VisaGetPayload<Record<string, never>>) {
     basePrice: v.basePrice.toString(),
     expressSurcharge: v.expressSurcharge?.toString() ?? null,
     costPriceCny: v.costPriceCny?.toString() ?? null,
-    costPriceUsd: v.costPriceUsd?.toString() ?? null,
   };
 }
 
