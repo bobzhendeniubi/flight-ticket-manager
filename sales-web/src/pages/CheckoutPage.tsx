@@ -5,7 +5,7 @@
  */
 import { FormEvent, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { useCart, KIND_INFO } from '../stores/cart';
+import { useCart, KIND_INFO, isSelected } from '../stores/cart';
 import { useAuth } from '../stores/auth';
 import { usePassengers } from '../stores/passengers';
 import { ocrPassport } from '../lib/passportOcr';
@@ -34,9 +34,10 @@ export function CheckoutPage() {
   const user = useAuth((s) => s.user);
   const tokens = useAuth((s) => s.tokens);
   const isAgent = user?.role === 'AGENT';
-  const items = useCart((s) => s.items);
-  const total = useCart((s) => s.items.reduce((sum, i) => sum + i.unitPrice * i.qty, 0));
-  const clear = useCart((s) => s.clear);
+  // 只结算购物车里"勾选"的产品（CartPage 勾选 → 这里结算 → 成功后只移除已结的）
+  const items = useCart((s) => s.items.filter(isSelected));
+  const total = items.reduce((sum, i) => sum + i.unitPrice * i.qty, 0);
+  const removeMany = useCart((s) => s.removeMany);
   const clearPassengers = usePassengers((s) => s.clear);
 
   const [contactName, setContactName] = useState('');
@@ -105,6 +106,16 @@ export function CheckoutPage() {
   // 如果同时买了散票和套餐，取较大值（套餐含机票，乘客是同一批人）
   const effectivePax = bundlePaxCount > 0 ? bundlePaxCount : flightTicketCount;
   const paxMismatch = effectivePax > 0 && passengers.length !== effectivePax;
+
+  // 自动把出行人行数补齐到所需人数 —— 避免"少填一位 → 提交键灰着点不动"（前台反馈：下一步走不下去）
+  useEffect(() => {
+    if (effectivePax <= 0) return;
+    setPassengers((prev) => {
+      if (prev.length >= effectivePax) return prev;
+      const pad = Array.from({ length: effectivePax - prev.length }, () => ({ ...EMPTY_PASSENGER }));
+      return [...prev, ...pad];
+    });
+  }, [effectivePax]);
 
   if (items.length === 0 && !done) {
     return (
@@ -250,10 +261,11 @@ export function CheckoutPage() {
       idempotencyKey,
     };
 
+    const orderedIds = items.map((i) => i.id);
     setSubmitting(true);
     try {
       const { order } = await api.createOrder(tokens.accessToken, body);
-      clear();
+      removeMany(orderedIds); // 只移除本次结算的产品，未勾选的留在购物车
       clearPassengers(); // 防止下单成功后下次开新单沿用旧 OCR 缓存（Codex P2 反馈）
       setDone({
         orderNumber: order.orderNumber,
@@ -450,7 +462,7 @@ export function CheckoutPage() {
               <span className="text-sm sm:text-base whitespace-nowrap">
                 合计 <span className="text-xl sm:text-2xl font-bold text-red-600">¥{total.toLocaleString()}</span>
               </span>
-              <button type="submit" className="btn-primary text-sm sm:text-base px-4 sm:px-6 whitespace-nowrap" disabled={submitting || paxMismatch}>
+              <button type="submit" className="btn-primary text-sm sm:text-base px-4 sm:px-6 whitespace-nowrap" disabled={submitting}>
                 {submitting ? '提交中…' : '提交订单'}
               </button>
             </div>

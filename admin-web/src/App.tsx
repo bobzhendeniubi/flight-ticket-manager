@@ -1,3 +1,4 @@
+import { useEffect } from 'react';
 import { Navigate, Route, Routes } from 'react-router-dom';
 import { Layout } from './components/Layout';
 import { LoginPage } from './pages/LoginPage';
@@ -56,7 +57,20 @@ function AgentLanding() {
 
 void AGENT_ALLOWED_PATHS; // 将来可用于中间件白名单，目前通过 adminOnly 显式标注
 
+// access token TTL=1h；提前到 50 分钟续期，避免后台闲置掉登录
+const REFRESH_INTERVAL_MS = 50 * 60 * 1000;
+
 export function App() {
+  const hasSession = useAuth((s) => Boolean(s.tokens?.refreshToken));
+  const refreshSession = useAuth((s) => s.refreshSession);
+
+  useEffect(() => {
+    if (!hasSession) return;
+    void refreshSession();
+    const id = setInterval(() => void refreshSession(), REFRESH_INTERVAL_MS);
+    return () => clearInterval(id);
+  }, [hasSession, refreshSession]);
+
   return (
     <Routes>
       <Route path="/login" element={<LoginPage />} />

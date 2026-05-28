@@ -1,13 +1,20 @@
 import { Link, useNavigate } from 'react-router-dom';
-import { useCart, KIND_INFO } from '../stores/cart';
+import { useCart, KIND_INFO, isSelected } from '../stores/cart';
 
 export function CartPage() {
   const items = useCart((s) => s.items);
   const remove = useCart((s) => s.remove);
   const updateQty = useCart((s) => s.updateQty);
+  const toggleSelected = useCart((s) => s.toggleSelected);
+  const setAllSelected = useCart((s) => s.setAllSelected);
   const clear = useCart((s) => s.clear);
-  const total = useCart((s) => s.items.reduce((sum, i) => sum + i.unitPrice * i.qty, 0));
   const navigate = useNavigate();
+
+  // 只结算勾选的产品（代理可挑着付，剩下的留在车里）
+  const selectedItems = items.filter(isSelected);
+  const selectedTotal = selectedItems.reduce((sum, i) => sum + i.unitPrice * i.qty, 0);
+  const selectedCount = selectedItems.reduce((s, i) => s + i.qty, 0);
+  const allSelected = items.length > 0 && selectedItems.length === items.length;
 
   if (items.length === 0) {
     return (
@@ -26,14 +33,34 @@ export function CartPage() {
       <section>
         <h1 className="text-2xl font-bold text-slate-900">购物车</h1>
         <p className="mt-1 text-sm text-slate-600">
-          共 {items.reduce((s, i) => s + i.qty, 0)} 件商品 · 总价 ¥{total.toLocaleString()}
+          共 {items.reduce((s, i) => s + i.qty, 0)} 件商品 · 已选 {selectedCount} 件 · 已选合计 ¥{selectedTotal.toLocaleString()}
         </p>
       </section>
 
       <section className="card p-0 overflow-hidden">
+        {/* 全选 / 全不选 */}
+        <div className="flex items-center gap-2 border-b border-slate-200 bg-slate-50 px-4 py-2.5">
+          <input
+            type="checkbox"
+            className="h-4 w-4 accent-brand"
+            checked={allSelected}
+            onChange={(e) => setAllSelected(e.target.checked)}
+          />
+          <span className="text-sm text-slate-600">全选（勾选要结账的产品，未勾的留在车里）</span>
+        </div>
         <ul className="divide-y divide-slate-200">
           {items.map((i) => (
-            <li key={i.id} className="flex flex-wrap items-center gap-3 sm:gap-4 p-3 sm:p-4">
+            <li
+              key={i.id}
+              className={`flex flex-wrap items-center gap-3 sm:gap-4 p-3 sm:p-4 ${isSelected(i) ? '' : 'opacity-50'}`}
+            >
+              <input
+                type="checkbox"
+                className="h-5 w-5 flex-shrink-0 accent-brand"
+                checked={isSelected(i)}
+                onChange={() => toggleSelected(i.id)}
+                aria-label="选择结账"
+              />
               <div className="text-2xl sm:text-3xl flex-shrink-0">{i.emoji}</div>
               <div className="flex-1 min-w-[60%] sm:min-w-0">
                 <div className="flex items-center gap-2">
@@ -95,10 +122,10 @@ export function CartPage() {
                   </div>
                 </div>
                 <button
-                  className="text-xs text-slate-400 hover:text-red-600"
+                  className="flex-shrink-0 rounded-md border border-slate-300 px-2.5 py-1 text-xs font-medium text-slate-600 hover:border-red-400 hover:bg-red-50 hover:text-red-600"
                   onClick={() => remove(i.id)}
                 >
-                  删除
+                  🗑 删除
                 </button>
               </div>
             </li>
@@ -110,11 +137,15 @@ export function CartPage() {
           </button>
           <div className="flex items-center gap-4">
             <div>
-              <span className="text-sm text-slate-600">合计：</span>
-              <span className="text-2xl font-bold text-red-600">¥{total.toLocaleString()}</span>
+              <span className="text-sm text-slate-600">已选合计：</span>
+              <span className="text-2xl font-bold text-red-600">¥{selectedTotal.toLocaleString()}</span>
             </div>
-            <button className="btn-primary" onClick={() => navigate('/checkout')}>
-              去结账 →
+            <button
+              className="btn-primary disabled:opacity-50"
+              disabled={selectedItems.length === 0}
+              onClick={() => navigate('/checkout')}
+            >
+              结算所选 {selectedCount} 件 →
             </button>
           </div>
         </div>

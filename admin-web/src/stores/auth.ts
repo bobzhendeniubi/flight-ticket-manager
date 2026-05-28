@@ -10,6 +10,8 @@ interface AuthState {
 
   login: (email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
+  /** 用 refreshToken 换新 accessToken，保持后台会话不掉线。返回是否成功。 */
+  refreshSession: () => Promise<boolean>;
   clearError: () => void;
 }
 
@@ -52,6 +54,19 @@ export const useAuth = create<AuthState>()(
           api.logout(tokens.refreshToken).catch(() => undefined);
         }
         set({ user: null, tokens: null, error: null });
+      },
+
+      refreshSession: async () => {
+        const { tokens } = get();
+        if (!tokens?.refreshToken) return false;
+        try {
+          const res = await api.refresh(tokens.refreshToken);
+          set({ tokens: res.tokens });
+          return true;
+        } catch {
+          set({ user: null, tokens: null });
+          return false;
+        }
       },
     }),
     {

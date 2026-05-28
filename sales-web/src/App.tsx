@@ -1,3 +1,4 @@
+import { useEffect } from 'react';
 import { Navigate, Route, Routes } from 'react-router-dom';
 import { Layout } from './components/Layout';
 import { HomePage } from './pages/HomePage';
@@ -32,7 +33,21 @@ function Protected({
   return <>{children}</>;
 }
 
+// access token TTL=1h；提前到 50 分钟续期，避免闲置掉登录
+const REFRESH_INTERVAL_MS = 50 * 60 * 1000;
+
 export function App() {
+  const hasSession = useAuth((s) => Boolean(s.tokens?.refreshToken));
+  const refreshSession = useAuth((s) => s.refreshSession);
+
+  useEffect(() => {
+    if (!hasSession) return;
+    // 刷新进页面（重载/久置回来）先续一次，再定时续
+    void refreshSession();
+    const id = setInterval(() => void refreshSession(), REFRESH_INTERVAL_MS);
+    return () => clearInterval(id);
+  }, [hasSession, refreshSession]);
+
   return (
     <Routes>
       <Route element={<Layout />}>

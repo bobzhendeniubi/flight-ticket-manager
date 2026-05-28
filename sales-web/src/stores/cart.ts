@@ -21,13 +21,23 @@ export interface CartItem {
   qty: number;
   meta?: Record<string, string | number | boolean>;
   addedAt: string; // ISO 时间，用于"实时动态"展示
+  // 结账勾选 —— 代理可只结一部分，剩下的留在车里。老数据无此字段时按"已勾选"处理。
+  selected?: boolean;
+}
+
+/** 是否参与本次结账（兼容老数据：未定义 = 选中）*/
+export function isSelected(i: CartItem): boolean {
+  return i.selected !== false;
 }
 
 interface CartState {
   items: CartItem[];
   add: (item: Omit<CartItem, 'id' | 'addedAt'>) => void;
   remove: (id: string) => void;
+  removeMany: (ids: string[]) => void;
   updateQty: (id: string, qty: number) => void;
+  toggleSelected: (id: string) => void;
+  setAllSelected: (val: boolean) => void;
   clear: () => void;
   total: () => number;
   count: () => number;
@@ -52,6 +62,7 @@ export const useCart = create<CartState>()(
               ...item,
               id,
               addedAt: new Date().toISOString(),
+              selected: true,
             },
           ],
         }));
@@ -64,10 +75,23 @@ export const useCart = create<CartState>()(
 
       remove: (id) => set((state) => ({ items: state.items.filter((i) => i.id !== id) })),
 
+      removeMany: (ids) =>
+        set((state) => ({ items: state.items.filter((i) => !ids.includes(i.id)) })),
+
       updateQty: (id, qty) =>
         set((state) => ({
           items: state.items.map((i) => (i.id === id ? { ...i, qty: Math.max(1, qty) } : i)),
         })),
+
+      toggleSelected: (id) =>
+        set((state) => ({
+          items: state.items.map((i) =>
+            i.id === id ? { ...i, selected: i.selected === false } : i,
+          ),
+        })),
+
+      setAllSelected: (val) =>
+        set((state) => ({ items: state.items.map((i) => ({ ...i, selected: val })) })),
 
       clear: () => set({ items: [] }),
 

@@ -536,6 +536,11 @@ export const api = {
       method: 'POST',
       body: { refreshToken },
     }),
+  refresh: (refreshToken: string) =>
+    apiFetch<{ tokens: AuthTokens }>('/auth/refresh', {
+      method: 'POST',
+      body: { refreshToken },
+    }),
   me: (token: string) =>
     apiFetch<{ user: AuthUser & { phone: string | null; createdAt: string; lastLoginAt: string | null } }>('/users/me', { token }),
 
