@@ -962,7 +962,7 @@ export const api = {
       `${API_BASE}/finances/export?from=${encodeURIComponent(range.from)}&to=${encodeURIComponent(range.to)}`,
       { headers: { Authorization: `Bearer ${token}` } },
     );
-    if (!res.ok) throw new ApiError(res.status, '导出失败');
+    if (!res.ok) throw new ApiError(res.status, { code: 'EXPORT_FAILED', message: await res.text() });
     return res.blob();
   },
 };
