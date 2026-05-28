@@ -12,7 +12,7 @@
  *   - 金额不匹配：标记 FAILED，审计告警
  *   - 订单已 CANCELLED：标记 REFUNDED（资金原路退回）
  */
-import { OrderStatus, PaymentMethod, PaymentStatus, Prisma } from '@prisma/client';
+import { OrderStatus, PaymentMethod, PaymentStatus, Prisma, UserRole } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import {
   BadRequestError,
@@ -225,6 +225,98 @@ export class PaymentsService {
     }
 
     return { ok: true, paymentId: payment.id, orderId: payment.orderId };
+  }
+
+  /**
+   * 人工确认收款（线下收款 → 后台标记）。ADMIN/STAFF 用。
+   * 建 Payment(SUCCEEDED, proofUrl) → 累加 paidAmount → 全额则 Order→PAID
+   * （同一事务，复用 _updateStatusWithinTx 生成佣金/履约任务）。
+   */
+  async confirmManualPayment(
+    orderId: string,
+    input: { amount?: number; method: PaymentMethod; proofUrl?: string; note?: string },
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
+    ok: true;
+    paymentId: string;
+    paidAmount: number;
+    total: number;
+    fullyPaid: boolean;
+    orderNumber: string;
+    status: OrderStatus;
+  }> {
+    const order = await prisma.order.findUnique({
+      where: { id: orderId },
+      select: { id: true, orderNumber: true, total: true, paidAmount: true, status: true },
+    });
+    if (!order) throw new NotFoundError('订单不存在');
+
+    const total = Number(order.total);
+    const already = Number(order.paidAmount);
+    const remaining = Math.max(0, total - already);
+    const amount = input.amount ?? remaining;
+    if (amount <= 0) throw new BadRequestError('收款金额必须大于 0');
+    if (amount > remaining + 0.001) {
+      throw new BadRequestError(`收款金额超过应收余额（应收 ¥${remaining.toFixed(2)}）`);
+    }
+
+    const newPaid = already + amount;
+    const fullyPaid = newPaid + 0.001 >= total;
+    const pendingFulfillmentTaskIds: string[] = [];
+    let paymentId = '';
+
+    await prisma.$transaction(async (tx) => {
+      const payment = await tx.payment.create({
+        data: {
+          orderId,
+          method: input.method,
+          amount: new Prisma.Decimal(amount),
+          status: PaymentStatus.SUCCEEDED,
+          paidAt: new Date(),
+          proofUrl: input.proofUrl ?? null,
+          gatewayPayload: {
+            manual: true,
+            note: input.note ?? null,
+            confirmedBy: actor.userId,
+          } as Prisma.InputJsonValue,
+        },
+      });
+      paymentId = payment.id;
+      await tx.order.update({
+        where: { id: orderId },
+        data: { paidAmount: new Prisma.Decimal(newPaid) },
+      });
+      if (fullyPaid && order.status === OrderStatus.PENDING_PAYMENT) {
+        await this.orderService._updateStatusWithinTx(
+          tx,
+          orderId,
+          OrderStatus.PAID,
+          { userId: actor.userId, role: actor.role, actorType: 'USER' },
+          `人工确认收款（${input.method}，¥${amount.toFixed(2)}）`,
+          pendingFulfillmentTaskIds,
+        );
+      }
+    });
+
+    if (pendingFulfillmentTaskIds.length > 0 && process.env.ENABLE_AUTO_FULFILLMENT === 'true') {
+      const { fulfillmentQueue } = await import('../../queues/queue.js');
+      for (const taskId of pendingFulfillmentTaskIds) {
+        void fulfillmentQueue.add('auto-fulfill', { taskId }, { jobId: taskId, delay: 1000 }).catch((e) => {
+          // eslint-disable-next-line no-console
+          console.error('[payments] failed to enqueue fulfillment task:', e);
+        });
+      }
+    }
+
+    return {
+      ok: true,
+      paymentId,
+      paidAmount: newPaid,
+      total,
+      fullyPaid,
+      orderNumber: order.orderNumber,
+      status: fullyPaid ? OrderStatus.PAID : order.status,
+    };
   }
 
   /**

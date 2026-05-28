@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { api, ApiError, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceStatus } from '../lib/api';
+import { api, ApiError, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceStatus, type PaymentMethod, type OrderPayment } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import {
   type FulfillmentStatus,
@@ -66,6 +66,11 @@ const INVOICE_COLOR: Record<string, string> = {
   REQUESTED: 'bg-amber-100 text-amber-700',
   ISSUED: 'bg-emerald-100 text-emerald-700',
 };
+// 收款方式标签（线下确认收款用）
+const PAYMENT_METHOD_LABEL: Record<string, string> = {
+  WECHAT_PAY: '微信', ALIPAY: '支付宝', BANK_CARD: '银行转账', AGENT_PREPAYMENT: '代理预付',
+};
+
 // 签证状态复用下方 FF_STATUS_LABEL / FF_STATUS_COLOR（履约任务状态映射）
 
 // 派生「签证状态」：订单有 VISA 项时，取其 VISA_APPLICATION 履约任务状态；无签证则 null
@@ -692,6 +697,7 @@ export function OrdersPage() {
           order={selected}
           onClose={() => setSelected(null)}
           onAdvance={(next, reason) => advance(selected, next, reason)}
+          onChanged={() => setRefreshNonce((n) => n + 1)}
         />
       )}
 
@@ -710,10 +716,12 @@ function OrderDrawer({
   order,
   onClose,
   onAdvance,
+  onChanged,
 }: {
   order: OrderSummary;
   onClose: () => void;
   onAdvance: (next: OrderStatus, reason?: string) => void;
+  onChanged?: () => void;
 }) {
   const view = deriveView(order);
   // 可行的下一步状态（与 backend orders.service ALLOWED_TRANSITIONS 保持一致的子集）
@@ -824,6 +832,14 @@ function OrderDrawer({
               <Row label="下单时间" value={new Date(order.createdAt).toLocaleString('zh-CN')} />
             </dl>
           </section>
+
+          {/* 确认收款（线下收款 → 标记已付 + 上传截图）*/}
+          <ConfirmPaymentSection
+            orderId={order.id}
+            total={view.totalNum}
+            paidAmount={Number(order.paidAmount)}
+            onChanged={onChanged}
+          />
 
           {/* 履约 Fulfillment — 目前仍 mock，M6 接真实 FulfillmentTask 表 */}
           <FulfillmentSection orderId={order.id} />
@@ -1751,5 +1767,186 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
         )}
       </div>
     </div>
+  );
+}
+
+// ── 确认收款（线下收款 → 标记已付 + 上传截图）────────────────────────
+function ConfirmPaymentSection({
+  orderId,
+  total,
+  paidAmount,
+  onChanged,
+}: {
+  orderId: string;
+  total: number;
+  paidAmount: number;
+  onChanged?: () => void;
+}) {
+  const tokens = useAuth((s) => s.tokens);
+  const token = tokens?.accessToken ?? '';
+  const [payments, setPayments] = useState<OrderPayment[]>([]);
+  const [paid, setPaid] = useState(paidAmount);
+  const [amount, setAmount] = useState('');
+  const [method, setMethod] = useState<PaymentMethod>('BANK_CARD');
+  const [proofUrl, setProofUrl] = useState<string | null>(null);
+  const [note, setNote] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const remaining = Math.max(0, Math.round((total - paid) * 100) / 100);
+
+  // 拉订单详情拿现有收款记录 + 最新已付
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    api
+      .getOrder(token, orderId)
+      .then((r) => {
+        if (cancelled) return;
+        setPayments(r.order.payments ?? []);
+        const p = Number(r.order.paidAmount);
+        setPaid(p);
+        setAmount(Math.max(0, Math.round((total - p) * 100) / 100) > 0 ? String(Math.round((total - p) * 100) / 100) : '');
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [token, orderId, total]);
+
+  function onFile(e: React.ChangeEvent<HTMLInputElement>): void {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    if (f.size > 4 * 1024 * 1024) {
+      setErr('截图过大（>4MB），请压缩后再传');
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => setProofUrl(typeof reader.result === 'string' ? reader.result : null);
+    reader.readAsDataURL(f);
+  }
+
+  async function confirm(): Promise<void> {
+    if (!token || submitting) return;
+    setErr(null);
+    const amt = amount.trim() === '' ? undefined : Number(amount);
+    if (amt !== undefined && (!Number.isFinite(amt) || amt <= 0)) {
+      setErr('金额需为正数');
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const res = await api.confirmPayment(token, {
+        orderId,
+        amount: amt,
+        method,
+        proofUrl: proofUrl ?? undefined,
+        note: note.trim() || undefined,
+      });
+      setPaid(res.paidAmount);
+      setProofUrl(null);
+      setNote('');
+      const r = await api.getOrder(token, orderId);
+      setPayments(r.order.payments ?? []);
+      onChanged?.();
+    } catch (e: unknown) {
+      setErr(e instanceof ApiError ? e.message : '确认收款失败');
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  const settled = remaining <= 0;
+
+  return (
+    <section>
+      <h3 className="text-sm font-medium text-slate-700">收款</h3>
+      <div className="mt-2 rounded-md border border-slate-200 p-3 text-sm">
+        <div className="flex items-center justify-between">
+          <span className="text-slate-500">已付 / 应收</span>
+          <span>
+            <b className="text-emerald-700">¥{paid.toLocaleString()}</b>
+            <span className="text-slate-400"> / ¥{total.toLocaleString()}</span>
+            {settled ? (
+              <span className="ml-2 rounded bg-emerald-100 px-1.5 py-0.5 text-xs text-emerald-700">已结清</span>
+            ) : (
+              <span className="ml-2 rounded bg-amber-100 px-1.5 py-0.5 text-xs text-amber-700">应收 ¥{remaining.toLocaleString()}</span>
+            )}
+          </span>
+        </div>
+
+        {/* 已记录收款 */}
+        {payments.length > 0 && (
+          <ul className="mt-2 space-y-1 border-t border-slate-100 pt-2">
+            {payments.map((p) => (
+              <li key={p.id} className="flex items-center gap-2 text-xs text-slate-600">
+                <span>{PAYMENT_METHOD_LABEL[p.method] ?? p.method}</span>
+                <span className="font-medium">¥{Number(p.amount).toLocaleString()}</span>
+                <span className="text-slate-400">{p.paidAt ? new Date(p.paidAt).toLocaleDateString('zh-CN') : ''}</span>
+                {p.proofUrl && (
+                  <a href={p.proofUrl} target="_blank" rel="noreferrer" className="ml-auto">
+                    <img src={p.proofUrl} alt="收款截图" className="h-8 w-8 rounded border border-slate-300 object-cover" />
+                  </a>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+
+        {/* 确认收款表单 */}
+        {!settled && (
+          <div className="mt-3 space-y-2 border-t border-slate-100 pt-3">
+            {err && <div className="rounded bg-rose-50 px-2 py-1 text-xs text-rose-700">{err}</div>}
+            <div className="flex gap-2">
+              <label className="flex-1 text-xs text-slate-500">
+                收款金额
+                <input
+                  type="number"
+                  step="0.01"
+                  className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1 text-sm"
+                  value={amount}
+                  onChange={(e) => setAmount(e.target.value)}
+                  placeholder={`默认应收 ¥${remaining}`}
+                />
+              </label>
+              <label className="flex-1 text-xs text-slate-500">
+                收款方式
+                <select
+                  className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1 text-sm"
+                  value={method}
+                  onChange={(e) => setMethod(e.target.value as PaymentMethod)}
+                >
+                  {(['BANK_CARD', 'WECHAT_PAY', 'ALIPAY', 'AGENT_PREPAYMENT'] as PaymentMethod[]).map((m) => (
+                    <option key={m} value={m}>{PAYMENT_METHOD_LABEL[m]}</option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <label className="block text-xs text-slate-500">
+              备注（选填）
+              <input
+                className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1 text-sm"
+                value={note}
+                onChange={(e) => setNote(e.target.value)}
+              />
+            </label>
+            <div className="flex items-center justify-between gap-2">
+              <label className="flex items-center gap-2 text-xs text-slate-600">
+                <span className="rounded-md border border-slate-300 px-2 py-1 cursor-pointer hover:bg-slate-50">📷 上传收款截图</span>
+                <input type="file" accept="image/*" className="hidden" onChange={onFile} />
+                {proofUrl && <img src={proofUrl} alt="预览" className="h-8 w-8 rounded border border-slate-300 object-cover" />}
+              </label>
+              <button
+                className="btn-primary text-sm disabled:opacity-50"
+                onClick={confirm}
+                disabled={submitting}
+              >
+                {submitting ? '确认中…' : '确认收款'}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+    </section>
   );
 }

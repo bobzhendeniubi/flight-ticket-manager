@@ -315,6 +315,18 @@ export interface OrderSummary {
   claimedBy?: { id: string; displayName: string | null; email: string | null } | null;
   roomAssignment?: RoomAssignment | null;
   reminders?: OperationalReminder[];
+  // 订单详情(getOrder)带出的收款记录（列表不含，避免 proof 数据膨胀）
+  payments?: OrderPayment[];
+}
+
+export interface OrderPayment {
+  id: string;
+  method: PaymentMethod;
+  amount: string;
+  status: string;
+  proofUrl: string | null;
+  paidAt: string | null;
+  createdAt: string;
 }
 
 // ── Audit / Customers / Travelers / Fulfillment ──────────────────────────
@@ -658,6 +670,21 @@ export const api = {
       `/orders/${id}/invoice-status`,
       { method: 'PATCH', token, body: { invoiceStatus } },
     ),
+
+  // 人工确认收款（线下收款 → 标记已付 + 上传截图）ADMIN/STAFF
+  confirmPayment: (
+    token: string,
+    body: { orderId: string; amount?: number; method: PaymentMethod; proofUrl?: string; note?: string },
+  ) =>
+    apiFetch<{
+      ok: true;
+      paymentId: string;
+      paidAmount: number;
+      total: number;
+      fullyPaid: boolean;
+      orderNumber: string;
+      status: OrderStatus;
+    }>('/payments/manual-confirm', { method: 'POST', token, body }),
 
   // ── 5/20 反馈新增 API ──────────────────────────────────────────────────
   // 一键导出 PNR Excel；返回 Blob 直接下载

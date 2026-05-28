@@ -835,6 +835,8 @@ model Payment {
   status         PaymentStatus @default(PENDING)
   transactionId  String?       @unique // gateway transaction id
   gatewayPayload Json?
+  // 人工确认收款上传的截图（data URL；线下收款凭证）
+  proofUrl       String?
   paidAt         DateTime?
   createdAt      DateTime      @default(now())
   updatedAt      DateTime      @updatedAt

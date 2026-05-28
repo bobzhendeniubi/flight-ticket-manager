@@ -61,6 +61,36 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
     return reply.status(201).send(result);
   });
 
+  // ── 人工确认收款（线下收款 → 后台标记 + 上传截图）ADMIN/STAFF ──
+  // POST /payments/manual-confirm
+  const manualConfirmSchema = z.object({
+    orderId: z.string().min(1),
+    amount: z.number().positive().optional(),
+    method: z.nativeEnum(PaymentMethod),
+    proofUrl: z.string().max(6_000_000).optional(), // data URL（截图）
+    note: z.string().max(500).optional(),
+  });
+  app.post('/manual-confirm', { preHandler: [app.authenticate] }, async (req, reply) => {
+    if (req.user.role !== UserRole.ADMIN && req.user.role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅运营/管理员可确认收款' });
+    }
+    const body = manualConfirmSchema.parse(req.body);
+    const result = await service.confirmManualPayment(
+      body.orderId,
+      { amount: body.amount, method: body.method, proofUrl: body.proofUrl, note: body.note },
+      { userId: req.user.sub, role: req.user.role },
+    );
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'CONFIRM_MANUAL_PAYMENT',
+      targetType: 'ORDER',
+      targetId: body.orderId,
+      targetLabel: result.orderNumber,
+      after: { amount: body.amount ?? null, method: body.method, fullyPaid: result.fullyPaid, hasProof: Boolean(body.proofUrl) },
+    });
+    return result;
+  });
+
   // ── 小程序 JSAPI 支付（生成 wx.requestPayment 参数） ─────
   app.post('/wechat/miniapp-prepay', { preHandler: [app.authenticate] }, async (req) => {
     const body = z.object({ orderId: z.string().min(1) }).parse(req.body);
