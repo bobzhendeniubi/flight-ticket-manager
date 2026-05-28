@@ -1,19 +1,18 @@
 /**
  * i18next 初始化
  *
- * 支持 zh-CN（默认）/ en / vi 三种语言。
- * - 首次访问根据浏览器语言自动选择
- * - 切换后存 localStorage（key: ftm_i18n_lng）
- * - 没翻译的 key fallback 到 zh-CN
+ * 当前全站锁定中文（lng='zh-CN'）。页面文案目前全是硬编码中文、en/vi 未完整翻译，
+ * 之前按浏览器语言自动切换会导致"导航英文 + 页面中文"一直混着，故关闭。
+ *
+ * 注意：不要加 supportedLngs + nonExplicitSupportedLngs —— 二者会把 'zh-CN' 归一到 'zh'
+ * 去查 resource（resource 是按 'zh-CN' 存的），导致 t() 找不到 key、直接吐出原始 key。
  *
  * 用法：
  *   import { useTranslation } from 'react-i18next';
  *   const { t } = useTranslation();
  *   <button>{t('nav.login')}</button>
  *
- * 添加新文案：
- *   1. 编辑 locales/zh-CN.json 加 key
- *   2. 编辑 en.json 和 vi.json 同步翻译（缺的会 fallback）
+ * 未来要真多语言：先把所有页面文案接进 t()，补齐 en/vi.json，再恢复语言检测 + 切换器。
  */
 import i18n from 'i18next';
 import { initReactI18next } from 'react-i18next';
@@ -27,7 +26,10 @@ export type SupportedLanguage = (typeof SUPPORTED_LANGUAGES)[number];
 // 全站锁定中文：页面文案目前全是硬编码中文，en/vi 未完整翻译。
 // 之前用浏览器语言检测 → 英文浏览器的用户首屏导航变英文、页面仍中文 = 一直混着。
 // 强制 lng='zh-CN'，不再按浏览器语言切换。（未来要真多语言：把所有页面文案接进 t() 后再恢复检测）
-void i18n.use(initReactI18next).init({
+//
+// 导出 init promise —— main.tsx 等它 resolve 后再渲染，
+// 保证首屏 i18n 已 ready，否则 t() 会输出原始 key（nav.flights 字面量）。
+export const i18nReady = i18n.use(initReactI18next).init({
   resources: {
     'zh-CN': { translation: zhCN },
     en: { translation: en },
@@ -35,8 +37,6 @@ void i18n.use(initReactI18next).init({
   },
   lng: 'zh-CN',
   fallbackLng: 'zh-CN',
-  supportedLngs: SUPPORTED_LANGUAGES,
-  nonExplicitSupportedLngs: true,
   interpolation: { escapeValue: false }, // React 已经 escape，不重复
   react: { useSuspense: false },
 });
