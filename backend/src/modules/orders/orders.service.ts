@@ -13,6 +13,7 @@
  */
 import {
   CommissionStatus,
+  InvoiceStatus,
   OrderItemKind,
   OrderStatus,
   PaymentMethod,
@@ -73,6 +74,11 @@ const SEAT_RELEASING_STATUSES: OrderStatus[] = [
   'FAILED',
 ];
 
+// 护照有效期规则（相对出发日）— 反馈：李萍
+const PASSPORT_EXPIRY_BLOCK_DAYS = 90; // 不足 90 天禁止下单
+const PASSPORT_EXPIRY_SURCHARGE_DAYS = 180; // 不足 6 个月加收附加费
+const NEAR_EXPIRY_SURCHARGE_CNY = 200; // 每位临期乘客附加费
+
 // ── 类型 ────────────────────────────────────────────────────────────────
 export interface OrderRequester {
   userId: string;
@@ -111,6 +117,9 @@ export class OrderService {
 
     // 先查所有 FLIGHT item 对应的 FlightSeatClass + 计算动态价（在事务外查，避免长事务）
     const pricedItems = await this.priceAndValidateItems(body.items);
+
+    // 护照有效期规则（相对出发日）：<90 天禁止下单；不足 6 个月每人 +200 临期附加费
+    await this.applyPassportExpiryRule(body, pricedItems);
 
     const subtotal = pricedItems.reduce((sum, p) => sum + p.amount, 0);
     const total = subtotal; // 目前没有 taxes / discount，直接等于 subtotal
@@ -221,6 +230,60 @@ export class OrderService {
   // ════════════════════════════════════════════════════════════════════
   // 定价 + 校验（事务外，节省行锁时间）
   // ════════════════════════════════════════════════════════════════════
+  /**
+   * 护照有效期业务规则（反馈：李萍）。仅对有出发日的订单（含 FLIGHT）生效，
+   * 且只检查填了 passportExpiry 的乘客（OCR/手填得到）。
+   *   - 距出发日不足 90 天 → 禁止下单（抛 BadRequestError）
+   *   - 距出发日不足 6 个月（180 天）→ 每位 +200 临期附加费（FEE 行）
+   * 通过 push 到 pricedItems 让附加费自然进入 subtotal/total/items。
+   */
+  private async applyPassportExpiryRule(
+    body: CreateOrderBody,
+    pricedItems: Array<{ kind: OrderItemKind; description: string; quantity: number; unitPrice: number; amount: number }>,
+  ): Promise<void> {
+    const scheduleIds = body.items
+      .filter((i): i is Extract<OrderItemInput, { kind: 'FLIGHT' }> => i.kind === 'FLIGHT')
+      .map((i) => i.flightScheduleId);
+    if (scheduleIds.length === 0) return; // 无航班 → 无出发日 → 跳过
+
+    const scheds = await prisma.flightSchedule.findMany({
+      where: { id: { in: scheduleIds } },
+      select: { departureTime: true },
+    });
+    if (scheds.length === 0) return;
+    // 取最早出发日做基准（行程第一段）
+    const departure = scheds.reduce<Date>(
+      (min, s) => (s.departureTime < min ? s.departureTime : min),
+      scheds[0].departureTime,
+    );
+
+    const DAY = 24 * 60 * 60 * 1000;
+    const blocked: string[] = [];
+    let surchargeCount = 0;
+    for (const px of body.passengers) {
+      if (!px.passportExpiry) continue; // 没填有效期 → 无法判定，跳过
+      const expiry = new Date(px.passportExpiry);
+      const days = Math.floor((expiry.getTime() - departure.getTime()) / DAY);
+      if (days < PASSPORT_EXPIRY_BLOCK_DAYS) blocked.push(px.fullName);
+      else if (days < PASSPORT_EXPIRY_SURCHARGE_DAYS) surchargeCount += 1;
+    }
+
+    if (blocked.length > 0) {
+      throw new BadRequestError(
+        `护照有效期不足 ${PASSPORT_EXPIRY_BLOCK_DAYS} 天（相对出发日），禁止下单：${blocked.join('、')}。请更换护照后再订。`,
+      );
+    }
+    if (surchargeCount > 0) {
+      pricedItems.push({
+        kind: 'FEE',
+        description: `护照临期附加费（有效期不足 6 个月，${surchargeCount} 人）`,
+        quantity: surchargeCount,
+        unitPrice: NEAR_EXPIRY_SURCHARGE_CNY,
+        amount: NEAR_EXPIRY_SURCHARGE_CNY * surchargeCount,
+      });
+    }
+  }
+
   private async priceAndValidateItems(items: OrderItemInput[]) {
     const priced: Array<{
       kind: OrderItemKind;
@@ -430,7 +493,8 @@ export class OrderService {
       prisma.order.findMany({
         where,
         include: {
-          items: true,
+          // 带上 fulfillment 任务(类型+状态)，前端据此派生「签证状态」列
+          items: { include: { fulfillmentTasks: { select: { type: true, status: true } } } },
           passengers: { select: { id: true, fullName: true } },
           agent: { select: { id: true, companyName: true, contactName: true } },
           user: { select: { id: true, displayName: true, email: true } },
@@ -623,6 +687,18 @@ export class OrderService {
     }
 
     return { successCount, failureCount, results };
+  }
+
+  /** 设置开票状态（路由层限 ADMIN/STAFF）。 */
+  async setInvoiceStatus(
+    id: string,
+    invoiceStatus: InvoiceStatus,
+  ): Promise<{ id: string; orderNumber: string; invoiceStatus: InvoiceStatus }> {
+    return prisma.order.update({
+      where: { id },
+      data: { invoiceStatus },
+      select: { id: true, orderNumber: true, invoiceStatus: true },
+    });
   }
 
   /**

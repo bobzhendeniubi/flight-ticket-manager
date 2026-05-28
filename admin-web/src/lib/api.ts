@@ -207,6 +207,8 @@ export interface OrderItem {
   visaId: string | null;
   metadata: unknown;
   createdAt: string;
+  // 列表带出的履约任务（仅 type+status），用于派生「签证状态」「出票状态」
+  fulfillmentTasks?: Array<{ type: string; status: FulfillmentStatus }>;
 }
 
 export interface OrderPassenger {
@@ -282,12 +284,15 @@ export interface RoomAssignment {
   roomGroups: RoomGroup[];
 }
 
+export type InvoiceStatus = 'NONE' | 'REQUESTED' | 'ISSUED';
+
 export interface OrderSummary {
   id: string;
   orderNumber: string;
   userId: string;
   agentId: string | null;
   status: OrderStatus;
+  invoiceStatus?: InvoiceStatus;
   currency: string;
   subtotal: string;
   total: string;
@@ -646,6 +651,13 @@ export const api = {
   // 批量散客建单：一个航班班次+舱位+共享联系人，名单每位乘客一单
   batchCreateOrders: (token: string, body: BatchCreateOrdersInput) =>
     apiFetch<BatchCreateOrdersResult>('/orders/batch', { method: 'POST', token, body }),
+
+  // 设置开票状态（ADMIN/STAFF）
+  setInvoiceStatus: (token: string, id: string, invoiceStatus: InvoiceStatus) =>
+    apiFetch<{ id: string; orderNumber: string; invoiceStatus: InvoiceStatus }>(
+      `/orders/${id}/invoice-status`,
+      { method: 'PATCH', token, body: { invoiceStatus } },
+    ),
 
   // ── 5/20 反馈新增 API ──────────────────────────────────────────────────
   // 一键导出 PNR Excel；返回 Blob 直接下载

@@ -8,7 +8,7 @@
  */
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
-import { UserRole } from '@prisma/client';
+import { InvoiceStatus, UserRole } from '@prisma/client';
 import { OrderService, type OrderRequester } from './orders.service.js';
 import {
   batchCreateOrdersBodySchema,
@@ -380,6 +380,27 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       after: body,
     });
     return { ok: true };
+  });
+
+  // ── 开票状态（ADMIN/STAFF）──
+  // PATCH /orders/:id/invoice-status
+  app.patch('/:id/invoice-status', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅运营/管理员可修改开票状态' });
+    }
+    const { id } = req.params as { id: string };
+    const body = z.object({ invoiceStatus: z.nativeEnum(InvoiceStatus) }).parse(req.body);
+    const result = await service.setInvoiceStatus(id, body.invoiceStatus);
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'UPDATE_INVOICE_STATUS',
+      targetType: 'ORDER',
+      targetId: id,
+      targetLabel: result.orderNumber,
+      after: { invoiceStatus: body.invoiceStatus },
+    });
+    return result;
   });
 };
 

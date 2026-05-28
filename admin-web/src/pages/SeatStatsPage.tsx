@@ -12,6 +12,9 @@ import { api, ApiError, type AdminFlight, type AdminSchedule } from '../lib/api'
 import { airportLabel, CABIN_LABEL, formatLocalDate, formatLocalTime } from '../lib/airports';
 import { useAuth } from '../stores/auth';
 
+// 余位低于此值标红（反馈：李萍 — 方便及时调价 / 关注余位）
+const LOW_SEAT_THRESHOLD = 20;
+
 interface ScheduleStat extends AdminSchedule {
   flightNumber: string;
   origin: string;
@@ -198,7 +201,18 @@ export function SeatStatsPage() {
                   </td>
                   <td className="px-3 py-2 text-right">{s.totalCapacity}</td>
                   <td className="px-3 py-2 text-right">{s.totalSold}</td>
-                  <td className="px-3 py-2 text-right">{s.totalCapacity - s.totalSold}</td>
+                  {(() => {
+                    const avail = s.totalCapacity - s.totalSold;
+                    const low = avail < LOW_SEAT_THRESHOLD;
+                    return (
+                      <td
+                        className={`px-3 py-2 text-right tabular-nums ${low ? 'font-bold text-red-600' : ''}`}
+                        title={low ? `余位不足 ${LOW_SEAT_THRESHOLD}，建议关注/调价` : undefined}
+                      >
+                        {low && '🔴 '}{avail}
+                      </td>
+                    );
+                  })()}
                   <td className="px-3 py-2">
                     <OccupancyBar occupancy={s.occupancy} />
                   </td>

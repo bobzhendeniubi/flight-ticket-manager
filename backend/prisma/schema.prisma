@@ -603,24 +603,32 @@ enum OrderItemKind {
   DISCOUNT
 }
 
+enum InvoiceStatus {
+  NONE // 不需要 / 未申请
+  REQUESTED // 客户已要求开票
+  ISSUED // 已开具
+}
+
 model Order {
-  id               String      @id @default(cuid())
-  orderNumber      String      @unique // human-friendly, e.g., "FTM2026041400001"
+  id               String        @id @default(cuid())
+  orderNumber      String        @unique // human-friendly, e.g., "FTM2026041400001"
   userId           String
   agentId          String? // non-null when placed by an agent
-  status           OrderStatus @default(DRAFT)
-  currency         String      @default("CNY")
-  subtotal         Decimal     @db.Decimal(12, 2)
-  taxesAndFees     Decimal     @default(0) @db.Decimal(12, 2)
-  discountTotal    Decimal     @default(0) @db.Decimal(12, 2)
-  total            Decimal     @db.Decimal(12, 2)
-  paidAmount       Decimal     @default(0) @db.Decimal(12, 2)
-  prepaymentOffset Decimal     @default(0) @db.Decimal(12, 2)
+  status           OrderStatus   @default(DRAFT)
+  // 开票状态（运营在订单管理里维护，反馈：李萍）
+  invoiceStatus    InvoiceStatus @default(NONE)
+  currency         String        @default("CNY")
+  subtotal         Decimal       @db.Decimal(12, 2)
+  taxesAndFees     Decimal       @default(0) @db.Decimal(12, 2)
+  discountTotal    Decimal       @default(0) @db.Decimal(12, 2)
+  total            Decimal       @db.Decimal(12, 2)
+  paidAmount       Decimal       @default(0) @db.Decimal(12, 2)
+  prepaymentOffset Decimal       @default(0) @db.Decimal(12, 2)
   contactName      String
   contactPhone     String
   contactEmail     String?
   paymentExpiresAt DateTime?
-  idempotencyKey   String?     @unique
+  idempotencyKey   String?       @unique
   notes            String? // 客户填写的特殊说明
   internalNotes    String? // 运营/客服内部备忘（客户看不到）
   // 防漏单：哪位运营接的单 + 接单时间
@@ -628,8 +636,8 @@ model Order {
   claimedAt        DateTime?
   // 套票拼房分配 — { roomGroups: [{ id, hotelName, roomType, passengerIds: [], notes }] }
   roomAssignment   Json?
-  createdAt        DateTime    @default(now())
-  updatedAt        DateTime    @updatedAt
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
 
   user              User                  @relation("OrderUser", fields: [userId], references: [id])
   agent             Agent?                @relation(fields: [agentId], references: [id])

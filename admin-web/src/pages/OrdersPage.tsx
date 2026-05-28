@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { api, ApiError, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult } from '../lib/api';
+import { api, ApiError, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceStatus } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import {
   type FulfillmentStatus,
@@ -58,6 +58,23 @@ const KIND_LABEL: Record<OrderItemKindLabel, string> = {
 const COMMISSION_RATE: Partial<Record<OrderItemKindLabel, number>> = {
   FLIGHT: 0.10, HOTEL: 0.08, TRANSFER: 0.15, VISA: 0.12,
 };
+
+// 开票状态（反馈：李萍）
+const INVOICE_LABEL: Record<string, string> = { NONE: '未开', REQUESTED: '待开', ISSUED: '已开' };
+const INVOICE_COLOR: Record<string, string> = {
+  NONE: 'bg-slate-100 text-slate-500',
+  REQUESTED: 'bg-amber-100 text-amber-700',
+  ISSUED: 'bg-emerald-100 text-emerald-700',
+};
+// 签证状态复用下方 FF_STATUS_LABEL / FF_STATUS_COLOR（履约任务状态映射）
+
+// 派生「签证状态」：订单有 VISA 项时，取其 VISA_APPLICATION 履约任务状态；无签证则 null
+function deriveVisaStatus(o: OrderSummary): ApiFfStatus | null {
+  const visaItem = o.items.find((i) => i.kind === 'VISA');
+  if (!visaItem) return null;
+  const task = visaItem.fulfillmentTasks?.find((t) => t.type === 'VISA_APPLICATION');
+  return task?.status ?? 'PENDING';
+}
 
 // ── 辅助：从 OrderSummary 派生视图字段 ──────────────────────────────
 function deriveView(o: OrderSummary) {
@@ -192,6 +209,16 @@ export function OrdersPage() {
       setSelected((prev) => (prev && prev.id === order.id ? res.order : prev));
     } catch (err) {
       alert(err instanceof ApiError ? `操作失败：${err.message}` : '操作失败');
+    }
+  };
+
+  const setInvoice = async (order: OrderSummary, invoiceStatus: InvoiceStatus) => {
+    if (!tokens?.accessToken) return;
+    try {
+      await api.setInvoiceStatus(tokens.accessToken, order.id, invoiceStatus);
+      setOrders((prev) => prev.map((o) => (o.id === order.id ? { ...o, invoiceStatus } : o)));
+    } catch (err) {
+      alert(err instanceof ApiError ? `开票状态更新失败：${err.message}` : '开票状态更新失败');
     }
   };
 
@@ -540,6 +567,8 @@ export function OrdersPage() {
                 <th className="px-4 py-3 text-left">内容</th>
                 <th className="px-4 py-3 text-right">金额</th>
                 <th className="px-4 py-3 text-center">状态</th>
+                <th className="px-4 py-3 text-center">签证</th>
+                <th className="px-4 py-3 text-center">开票</th>
                 <th className="px-4 py-3 text-left">下单时间</th>
                 <th className="px-4 py-3 text-center">操作</th>
               </tr>
@@ -582,6 +611,30 @@ export function OrdersPage() {
                       {STATUS_LABEL[order.status]}
                     </span>
                   </td>
+                  <td className="px-4 py-3 text-center">
+                    {(() => {
+                      const vs = deriveVisaStatus(order);
+                      return vs ? (
+                        <span className={`rounded px-2 py-0.5 text-xs ${FF_STATUS_COLOR[vs]}`}>
+                          {FF_STATUS_LABEL[vs] ?? vs}
+                        </span>
+                      ) : (
+                        <span className="text-xs text-slate-300">—</span>
+                      );
+                    })()}
+                  </td>
+                  <td className="px-4 py-3 text-center">
+                    <select
+                      className={`rounded px-1.5 py-0.5 text-xs border-0 cursor-pointer ${INVOICE_COLOR[order.invoiceStatus ?? 'NONE']}`}
+                      value={order.invoiceStatus ?? 'NONE'}
+                      onChange={(e) => void setInvoice(order, e.target.value as InvoiceStatus)}
+                      title="开票状态（点击切换）"
+                    >
+                      {(['NONE', 'REQUESTED', 'ISSUED'] as InvoiceStatus[]).map((s) => (
+                        <option key={s} value={s}>{INVOICE_LABEL[s]}</option>
+                      ))}
+                    </select>
+                  </td>
                   <td className="px-4 py-3 text-xs text-slate-500">
                     {new Date(order.createdAt).toLocaleString('zh-CN', {
                       month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
@@ -619,14 +672,14 @@ export function OrdersPage() {
               ))}
               {!loading && filtered.length === 0 && (
                 <tr>
-                  <td colSpan={8} className="px-4 py-8 text-center text-slate-500">
+                  <td colSpan={10} className="px-4 py-8 text-center text-slate-500">
                     没有符合条件的订单
                   </td>
                 </tr>
               )}
               {loading && (
                 <tr>
-                  <td colSpan={8} className="px-4 py-8 text-center text-slate-400">加载中…</td>
+                  <td colSpan={10} className="px-4 py-8 text-center text-slate-400">加载中…</td>
                 </tr>
               )}
             </tbody>
