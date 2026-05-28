@@ -42,58 +42,58 @@ enum Gender {
 
 // 操作部待办状态机
 enum ReminderStatus {
-  OPEN          // 新建待处理
-  IN_PROGRESS   // 已认领处理中
-  DONE          // 完成
-  SKIPPED       // 不处理（含原因）
+  OPEN // 新建待处理
+  IN_PROGRESS // 已认领处理中
+  DONE // 完成
+  SKIPPED // 不处理（含原因）
 }
 
 enum ReminderPriority {
   LOW
   NORMAL
   HIGH
-  CRITICAL      // 签证截止/航班延误等
+  CRITICAL // 签证截止/航班延误等
 }
 
 model User {
-  id             String    @id @default(cuid())
-  email          String?   @unique
-  phone          String?   @unique
-  passwordHash   String?   // null for WeChat-only users
-  role           UserRole  @default(CUSTOMER)
-  displayName    String?
-  emailVerified  Boolean   @default(false)
-  phoneVerified  Boolean   @default(false)
-  wechatOpenId   String?   @unique
-  wechatUnionId  String?   @unique
-  lastLoginAt    DateTime?
-  createdAt      DateTime  @default(now())
-  updatedAt      DateTime  @updatedAt
+  id            String    @id @default(cuid())
+  email         String?   @unique
+  phone         String?   @unique
+  passwordHash  String? // null for WeChat-only users
+  role          UserRole  @default(CUSTOMER)
+  displayName   String?
+  emailVerified Boolean   @default(false)
+  phoneVerified Boolean   @default(false)
+  wechatOpenId  String?   @unique
+  wechatUnionId String?   @unique
+  lastLoginAt   DateTime?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
 
   refreshTokens    RefreshToken[]
   savedPassengers  SavedPassenger[]
-  orders           Order[]                @relation("OrderUser")
-  claimedOrders    Order[]                @relation("OrderClaimedBy")
+  orders           Order[]               @relation("OrderUser")
+  claimedOrders    Order[]               @relation("OrderClaimedBy")
   agentProfile     Agent?
   orderEvents      OrderStatusEvent[]
   customerProfile  CustomerProfile?
   auditLogs        AuditLog[]
-  remindersCreated OperationalReminder[]  @relation("ReminderCreator")
-  remindersClaimed OperationalReminder[]  @relation("ReminderClaimedBy")
+  remindersCreated OperationalReminder[] @relation("ReminderCreator")
+  remindersClaimed OperationalReminder[] @relation("ReminderClaimedBy")
 
   @@index([role])
   @@index([createdAt])
 }
 
 model RefreshToken {
-  id          String    @id @default(cuid())
-  userId      String
-  tokenHash   String    @unique // sha256 of the refresh token
-  expiresAt   DateTime
-  revokedAt   DateTime?
-  userAgent   String?
-  ipAddress   String?
-  createdAt   DateTime  @default(now())
+  id        String    @id @default(cuid())
+  userId    String
+  tokenHash String    @unique // sha256 of the refresh token
+  expiresAt DateTime
+  revokedAt DateTime?
+  userAgent String?
+  ipAddress String?
+  createdAt DateTime  @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -108,7 +108,7 @@ model SavedPassenger {
   documentType   DocumentType
   documentNumber String
   dateOfBirth    DateTime
-  nationality    String        // ISO 3166-1 alpha-2 (e.g., CN, US)
+  nationality    String // ISO 3166-1 alpha-2 (e.g., CN, US)
   passengerType  PassengerType @default(ADULT)
   phone          String?
   notes          String?
@@ -129,8 +129,8 @@ model SavedPassenger {
 model CustomerProfile {
   id             String   @id @default(cuid())
   userId         String   @unique
-  idNumber       String?  // 身份证/护照号
-  primaryAgentId String?  // 归属代理（null = 直销散客）
+  idNumber       String? // 身份证/护照号
+  primaryAgentId String? // 归属代理（null = 直销散客）
   tags           String[] // ["VIP", "回头客", "蜜月"]
   notes          String?
   createdAt      DateTime @default(now())
@@ -166,20 +166,20 @@ enum AuditTargetType {
 }
 
 model AuditLog {
-  id          String           @id @default(cuid())
-  actorUserId String?          // null = 系统操作（定时任务等）
-  actorLabel  String?          // 缓存的 email/displayName（防用户删除后丢信息）
+  id          String          @id @default(cuid())
+  actorUserId String? // null = 系统操作（定时任务等）
+  actorLabel  String? // 缓存的 email/displayName（防用户删除后丢信息）
   actorRole   String?
-  action      String           // CREATE_AGENT / UPDATE_PRICING / ADVANCE_ORDER_STATUS ...
+  action      String // CREATE_AGENT / UPDATE_PRICING / ADVANCE_ORDER_STATUS ...
   targetType  AuditTargetType
   targetId    String?
-  targetLabel String?          // 人类可读的对象名称
+  targetLabel String? // 人类可读的对象名称
   before      Json?
   after       Json?
-  severity    AuditSeverity    @default(INFO)
+  severity    AuditSeverity   @default(INFO)
   ipAddress   String?
   userAgent   String?
-  createdAt   DateTime         @default(now())
+  createdAt   DateTime        @default(now())
 
   actor User? @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
 
@@ -194,19 +194,19 @@ model AuditLog {
 // ─────────────────────────────────────────────────────────────────────────────
 
 model Agent {
-  id                 String   @id @default(cuid())
-  userId             String   @unique
-  companyName        String?
-  contactName        String
-  contactPhone       String
-  prepaymentBalance  Decimal  @default(0) @db.Decimal(14, 2) // CNY, can be negative only by admin override
-  isActive           Boolean  @default(true)
-  notes              String?
+  id                String   @id @default(cuid())
+  userId            String   @unique
+  companyName       String?
+  contactName       String
+  contactPhone      String
+  prepaymentBalance Decimal  @default(0) @db.Decimal(14, 2) // CNY, can be negative only by admin override
+  isActive          Boolean  @default(true)
+  notes             String?
   // 代理层级 — 1 级代理 parentAgentId = null；上级创建下级时 tier = parent.tier + 1
-  parentAgentId      String?
-  tier               Int      @default(1)
-  createdAt          DateTime @default(now())
-  updatedAt          DateTime @updatedAt
+  parentAgentId     String?
+  tier              Int      @default(1)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
 
   user                   User                    @relation(fields: [userId], references: [id], onDelete: Cascade)
   parentAgent            Agent?                  @relation("AgentHierarchy", fields: [parentAgentId], references: [id])
@@ -231,15 +231,15 @@ enum PrepaymentTxType {
 }
 
 model PrepaymentTransaction {
-  id          String           @id @default(cuid())
-  agentId     String
-  amount      Decimal          @db.Decimal(14, 2) // positive = credit, negative = debit
-  balanceAfter Decimal         @db.Decimal(14, 2)
-  type        PrepaymentTxType
-  orderId     String?          // set when tied to an order
-  description String?
-  createdById String           // user id of the admin/agent/system actor
-  createdAt   DateTime         @default(now())
+  id           String           @id @default(cuid())
+  agentId      String
+  amount       Decimal          @db.Decimal(14, 2) // positive = credit, negative = debit
+  balanceAfter Decimal          @db.Decimal(14, 2)
+  type         PrepaymentTxType
+  orderId      String? // set when tied to an order
+  description  String?
+  createdById  String // user id of the admin/agent/system actor
+  createdAt    DateTime         @default(now())
 
   agent Agent @relation(fields: [agentId], references: [id], onDelete: Cascade)
 
@@ -255,15 +255,15 @@ enum ProductKind {
 }
 
 model CommissionRule {
-  id          String      @id @default(cuid())
-  agentId     String
-  productKind ProductKind
+  id            String      @id @default(cuid())
+  agentId       String
+  productKind   ProductKind
   // commission rate as a decimal fraction, e.g. 0.0500 = 5.00%
-  rate        Decimal     @db.Decimal(6, 4)
-  effectiveFrom DateTime  @default(now())
+  rate          Decimal     @db.Decimal(6, 4)
+  effectiveFrom DateTime    @default(now())
   effectiveTo   DateTime?
-  createdAt   DateTime    @default(now())
-  updatedAt   DateTime    @updatedAt
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
 
   agent Agent @relation(fields: [agentId], references: [id], onDelete: Cascade)
 
@@ -279,20 +279,20 @@ enum CommissionStatus {
 }
 
 model CommissionRecord {
-  id          String           @id @default(cuid())
-  agentId     String
-  orderId     String
-  productKind ProductKind
-  baseAmount  Decimal          @db.Decimal(12, 2) // the order item amount commission is computed on
-  rate        Decimal          @db.Decimal(6, 4)  // net rate (this_agent.rate - child.rate if in chain)
-  amount      Decimal          @db.Decimal(12, 2) // baseAmount * rate
-  status      CommissionStatus @default(ACCRUED)
+  id           String           @id @default(cuid())
+  agentId      String
+  orderId      String
+  productKind  ProductKind
+  baseAmount   Decimal          @db.Decimal(12, 2) // the order item amount commission is computed on
+  rate         Decimal          @db.Decimal(6, 4) // net rate (this_agent.rate - child.rate if in chain)
+  amount       Decimal          @db.Decimal(12, 2) // baseAmount * rate
+  status       CommissionStatus @default(ACCRUED)
   // 0=seller, 1=seller's parent, 2=grandparent ... 用于结算时计算 "commissionPaidToChildren"
-  chainDepth  Int              @default(0)
-  settlementId String?         // nullable until included in a settlement
-  settledAt   DateTime?
-  createdAt   DateTime         @default(now())
-  updatedAt   DateTime         @updatedAt
+  chainDepth   Int              @default(0)
+  settlementId String? // nullable until included in a settlement
+  settledAt    DateTime?
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
 
   agent      Agent       @relation(fields: [agentId], references: [id])
   order      Order       @relation(fields: [orderId], references: [id])
@@ -309,30 +309,30 @@ model CommissionRecord {
 // Settlement — 月度结算单，每个代理每月 1 张
 // ─────────────────────────────────────────────────────────────────────────────
 enum SettlementStatus {
-  DRAFT              // 生成后的初始状态
-  PENDING_APPROVAL   // 提交审核
-  APPROVED           // 管理员核准，待支付
-  PAID               // 已支付给代理（CommissionRecord → SETTLED，prepaymentOffset 已扣）
-  VOIDED             // 作废（比如重算）
+  DRAFT // 生成后的初始状态
+  PENDING_APPROVAL // 提交审核
+  APPROVED // 管理员核准，待支付
+  PAID // 已支付给代理（CommissionRecord → SETTLED，prepaymentOffset 已扣）
+  VOIDED // 作废（比如重算）
 }
 
 model Settlement {
-  id                        String           @id @default(cuid())
-  period                    String           // YYYY-MM
-  agentId                   String
-  orderCount                Int              @default(0)
-  grossRevenue              Decimal          @db.Decimal(14, 2) @default(0)
-  commissionEarned          Decimal          @db.Decimal(14, 2) @default(0)
-  commissionPaidToChildren  Decimal          @db.Decimal(14, 2) @default(0)
-  netCommission             Decimal          @db.Decimal(14, 2) @default(0)
-  prepaymentOffset          Decimal          @db.Decimal(14, 2) @default(0)
-  payableToAgent            Decimal          @db.Decimal(14, 2) @default(0)
-  status                    SettlementStatus @default(DRAFT)
-  generatedAt               DateTime         @default(now())
-  approvedAt                DateTime?
-  paidAt                    DateTime?
-  notes                     String?
-  updatedAt                 DateTime         @updatedAt
+  id                       String           @id @default(cuid())
+  period                   String // YYYY-MM
+  agentId                  String
+  orderCount               Int              @default(0)
+  grossRevenue             Decimal          @default(0) @db.Decimal(14, 2)
+  commissionEarned         Decimal          @default(0) @db.Decimal(14, 2)
+  commissionPaidToChildren Decimal          @default(0) @db.Decimal(14, 2)
+  netCommission            Decimal          @default(0) @db.Decimal(14, 2)
+  prepaymentOffset         Decimal          @default(0) @db.Decimal(14, 2)
+  payableToAgent           Decimal          @default(0) @db.Decimal(14, 2)
+  status                   SettlementStatus @default(DRAFT)
+  generatedAt              DateTime         @default(now())
+  approvedAt               DateTime?
+  paidAt                   DateTime?
+  notes                    String?
+  updatedAt                DateTime         @updatedAt
 
   agent       Agent              @relation(fields: [agentId], references: [id])
   commissions CommissionRecord[]
@@ -355,16 +355,16 @@ enum CabinClass {
 }
 
 model Flight {
-  id              String    @id @default(cuid())
-  flightNumber    String    // e.g., "CA1234"
-  originCode      String    // IATA code, e.g., "PEK"
-  destinationCode String    // IATA code
+  id              String   @id @default(cuid())
+  flightNumber    String // e.g., "CA1234"
+  originCode      String // IATA code, e.g., "PEK"
+  destinationCode String // IATA code
   originTerminal  String?
   destTerminal    String?
   aircraftType    String?
-  isActive        Boolean   @default(true)
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
+  isActive        Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
 
   schedules FlightSchedule[]
 
@@ -373,19 +373,21 @@ model Flight {
 }
 
 model FlightSchedule {
-  id              String    @id @default(cuid())
-  flightId        String
-  departureTime   DateTime  // UTC
-  arrivalTime     DateTime  // UTC
-  departureTz     String    // IANA tz, e.g., "Asia/Shanghai"
-  arrivalTz       String
-  isActive        Boolean   @default(true)
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @updatedAt
+  id             String   @id @default(cuid())
+  flightId       String
+  departureTime  DateTime // UTC
+  arrivalTime    DateTime // UTC
+  departureTz    String // IANA tz, e.g., "Asia/Shanghai"
+  arrivalTz      String
+  // 包机总成本（CNY）— 整班次付给航司的包机价；按"卖出座位 / 总成本"算单座分摊
+  charterCostCny Decimal? @db.Decimal(12, 2)
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
 
-  flight       Flight             @relation(fields: [flightId], references: [id], onDelete: Cascade)
-  seatClasses  FlightSeatClass[]
-  orderItems   OrderItem[]
+  flight        Flight            @relation(fields: [flightId], references: [id], onDelete: Cascade)
+  seatClasses   FlightSeatClass[]
+  orderItems    OrderItem[]
   pricingConfig PricingConfig?
 
   @@index([flightId, departureTime])
@@ -393,14 +395,14 @@ model FlightSchedule {
 }
 
 model FlightSeatClass {
-  id          String     @id @default(cuid())
-  scheduleId  String
-  cabin       CabinClass
-  capacity    Int        // base capacity
-  sold        Int        @default(0) // source of truth; Redis is cache
-  basePrice   Decimal    @db.Decimal(10, 2) // CNY
-  createdAt   DateTime   @default(now())
-  updatedAt   DateTime   @updatedAt
+  id         String     @id @default(cuid())
+  scheduleId String
+  cabin      CabinClass
+  capacity   Int // base capacity
+  sold       Int        @default(0) // source of truth; Redis is cache
+  basePrice  Decimal    @db.Decimal(10, 2) // CNY
+  createdAt  DateTime   @default(now())
+  updatedAt  DateTime   @updatedAt
 
   schedule FlightSchedule @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
 
@@ -412,25 +414,25 @@ model FlightSeatClass {
 // ─────────────────────────────────────────────────────────────────────────────
 
 model Hotel {
-  id          String    @id @default(cuid())
+  id          String   @id @default(cuid())
   name        String
   nameEn      String?
-  cityCode    String    // IATA or internal city code
-  area        String?   // 区域描述（如"美溪海滩"）
+  cityCode    String // IATA or internal city code
+  area        String? // 区域描述（如"美溪海滩"）
   address     String
-  starRating  Int       // 1..5
-  basePrice   Decimal?  @db.Decimal(10, 2) // 起步价（展示用）
-  rating      Decimal?  @db.Decimal(3, 2)  // 客户评分 0-5
+  starRating  Int // 1..5
+  basePrice   Decimal? @db.Decimal(10, 2) // 起步价（展示用）
+  rating      Decimal? @db.Decimal(3, 2) // 客户评分 0-5
   reviewCount Int?
   emoji       String?
-  highlight   String?   // 一句话卖点
-  latitude    Decimal?  @db.Decimal(9, 6)
-  longitude   Decimal?  @db.Decimal(9, 6)
-  amenities   String[]  // e.g., ["wifi", "breakfast", "pool"]
-  photos      String[]  // S3 URLs
-  isActive    Boolean   @default(true)
-  createdAt   DateTime  @default(now())
-  updatedAt   DateTime  @updatedAt
+  highlight   String? // 一句话卖点
+  latitude    Decimal? @db.Decimal(9, 6)
+  longitude   Decimal? @db.Decimal(9, 6)
+  amenities   String[] // e.g., ["wifi", "breakfast", "pool"]
+  photos      String[] // S3 URLs
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 
   roomTypes HotelRoomType[]
 
@@ -440,30 +442,32 @@ model Hotel {
 model HotelRoomType {
   id              String   @id @default(cuid())
   hotelId         String
-  name            String   // e.g., "Deluxe King"
-  bedType         String?  // "1 张大床 · 海景"
-  capacity        Int      // max guests
+  name            String // e.g., "Deluxe King"
+  bedType         String? // "1 张大床 · 海景"
+  capacity        Int // max guests
   basePrice       Decimal  @db.Decimal(10, 2)
-  priceMultiplier Decimal? @db.Decimal(5, 2)  // 相对 hotel.basePrice 的倍率（可选，用于 UI 快速报价）
+  // 净房价（CNY/晚）— 付给酒店的真实成本；NULL 时按 basePrice × 0.70 估算
+  costPriceCny    Decimal? @db.Decimal(10, 2)
+  priceMultiplier Decimal? @db.Decimal(5, 2) // 相对 hotel.basePrice 的倍率（可选，用于 UI 快速报价）
   photos          String[]
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
-  hotel       Hotel                 @relation(fields: [hotelId], references: [id], onDelete: Cascade)
-  inventory   HotelRoomInventory[]
-  orderItems  OrderItem[]
+  hotel      Hotel                @relation(fields: [hotelId], references: [id], onDelete: Cascade)
+  inventory  HotelRoomInventory[]
+  orderItems OrderItem[]
 
   @@unique([hotelId, name])
 }
 
 model HotelRoomInventory {
-  id          String   @id @default(cuid())
-  roomTypeId  String
-  date        DateTime @db.Date
-  available   Int
-  price       Decimal  @db.Decimal(10, 2) // may override basePrice for this date
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id         String   @id @default(cuid())
+  roomTypeId String
+  date       DateTime @db.Date
+  available  Int
+  price      Decimal  @db.Decimal(10, 2) // may override basePrice for this date
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
 
   roomType HotelRoomType @relation(fields: [roomTypeId], references: [id], onDelete: Cascade)
 
@@ -476,37 +480,41 @@ model HotelRoomInventory {
 // ─────────────────────────────────────────────────────────────────────────────
 
 model Transfer {
-  id            String   @id @default(cuid())
-  name          String
-  vehicleType   String   // e.g., "sedan", "suv", "van"
-  capacity      Int
-  originArea    String
-  destArea      String
-  basePrice     Decimal  @db.Decimal(10, 2)
-  features      String[] // e.g., ["中文司机", "免费等候 60 分钟"]
-  duration      String?  // "约 15 分钟"
-  emoji         String?
-  photo         String?
-  isActive      Boolean  @default(true)
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  id           String   @id @default(cuid())
+  name         String
+  vehicleType  String // e.g., "sedan", "suv", "van"
+  capacity     Int
+  originArea   String
+  destArea     String
+  basePrice    Decimal  @db.Decimal(10, 2)
+  // 司机/车队结算价（CNY）— NULL 时按 basePrice × 0.65 估算
+  costPriceCny Decimal? @db.Decimal(10, 2)
+  features     String[] // e.g., ["中文司机", "免费等候 60 分钟"]
+  duration     String? // "约 15 分钟"
+  emoji        String?
+  photo        String?
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
 
   orderItems OrderItem[]
 }
 
 model Visa {
   id                 String   @id @default(cuid())
-  destinationCountry String   // ISO 3166-1 alpha-2 (e.g., "VN")
-  country            String?  // 中文国名（"越南"）
-  visaType           String   // e.g., "tourist", "business"
-  visaName           String?  // 完整签证名称（"电子签证 E-visa · 30 天单次"）
-  flag               String?  // emoji flag
-  photo              String?  // 卡片展示图（URL）
+  destinationCountry String // ISO 3166-1 alpha-2 (e.g., "VN")
+  country            String? // 中文国名（"越南"）
+  visaType           String // e.g., "tourist", "business"
+  visaName           String? // 完整签证名称（"电子签证 E-visa · 30 天单次"）
+  flag               String? // emoji flag
+  photo              String? // 卡片展示图（URL）
   processingDays     Int
   basePrice          Decimal  @db.Decimal(10, 2)
   expressSurcharge   Decimal? @db.Decimal(10, 2)
-  validityMonths     Int?     // 签证有效期（月）
-  highlight          String?  // "最热销 · 全流程线上"
+  // 使馆/代办成本（CNY）— NULL 时按 basePrice × 0.55 估算（签证毛利通常更高）
+  costPriceCny       Decimal? @db.Decimal(10, 2)
+  validityMonths     Int? // 签证有效期（月）
+  highlight          String? // "最热销 · 全流程线上"
   requiredDocs       String[] // e.g., ["passport_scan", "photo", "itinerary"]
   isActive           Boolean  @default(true)
   createdAt          DateTime @default(now())
@@ -519,20 +527,20 @@ model Visa {
 // Products — Bundles (打包套餐)
 // ─────────────────────────────────────────────────────────────────────────────
 model Bundle {
-  id              String   @id @default(cuid())
-  name            String
-  tagline         String?
-  emoji           String?
-  photo           String?
+  id             String   @id @default(cuid())
+  name           String
+  tagline        String?
+  emoji          String?
+  photo          String?
   // 套餐组件列表（JSON）: [{kind: 'HOTEL', productName, qty, unitPrice}, ...]
   // 注意：FLIGHT 组件的 unitPrice=0，客户端选日期后调 /flights/price 实时取价
-  items           Json
-  flightPax       Int      @default(1)   // 机票组件含多少人
-  groundDiscount  Decimal  @db.Decimal(10, 2) @default(0) // 地面部分让利（套餐专享优惠）
-  suitableFor     String?  // "2 人 · 情侣/家庭"
-  isActive        Boolean  @default(true)
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  items          Json
+  flightPax      Int      @default(1) // 机票组件含多少人
+  groundDiscount Decimal  @default(0) @db.Decimal(10, 2) // 地面部分让利（套餐专享优惠）
+  suitableFor    String? // "2 人 · 情侣/家庭"
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
 
   orderItems OrderItem[]
 
@@ -571,36 +579,36 @@ enum OrderItemKind {
 }
 
 model Order {
-  id              String      @id @default(cuid())
-  orderNumber     String      @unique // human-friendly, e.g., "FTM2026041400001"
-  userId          String
-  agentId         String?     // non-null when placed by an agent
-  status          OrderStatus @default(DRAFT)
-  currency        String      @default("CNY")
-  subtotal        Decimal     @db.Decimal(12, 2)
-  taxesAndFees    Decimal     @db.Decimal(12, 2) @default(0)
-  discountTotal   Decimal     @db.Decimal(12, 2) @default(0)
-  total           Decimal     @db.Decimal(12, 2)
-  paidAmount      Decimal     @db.Decimal(12, 2) @default(0)
-  prepaymentOffset Decimal    @db.Decimal(12, 2) @default(0)
-  contactName     String
-  contactPhone    String
-  contactEmail    String?
+  id               String      @id @default(cuid())
+  orderNumber      String      @unique // human-friendly, e.g., "FTM2026041400001"
+  userId           String
+  agentId          String? // non-null when placed by an agent
+  status           OrderStatus @default(DRAFT)
+  currency         String      @default("CNY")
+  subtotal         Decimal     @db.Decimal(12, 2)
+  taxesAndFees     Decimal     @default(0) @db.Decimal(12, 2)
+  discountTotal    Decimal     @default(0) @db.Decimal(12, 2)
+  total            Decimal     @db.Decimal(12, 2)
+  paidAmount       Decimal     @default(0) @db.Decimal(12, 2)
+  prepaymentOffset Decimal     @default(0) @db.Decimal(12, 2)
+  contactName      String
+  contactPhone     String
+  contactEmail     String?
   paymentExpiresAt DateTime?
-  idempotencyKey  String?     @unique
-  notes           String?     // 客户填写的特殊说明
-  internalNotes   String?     // 运营/客服内部备忘（客户看不到）
+  idempotencyKey   String?     @unique
+  notes            String? // 客户填写的特殊说明
+  internalNotes    String? // 运营/客服内部备忘（客户看不到）
   // 防漏单：哪位运营接的单 + 接单时间
-  claimedById     String?
-  claimedAt       DateTime?
+  claimedById      String?
+  claimedAt        DateTime?
   // 套票拼房分配 — { roomGroups: [{ id, hotelName, roomType, passengerIds: [], notes }] }
-  roomAssignment  Json?
-  createdAt       DateTime    @default(now())
-  updatedAt       DateTime    @updatedAt
+  roomAssignment   Json?
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
 
-  user              User               @relation("OrderUser", fields: [userId], references: [id])
-  agent             Agent?             @relation(fields: [agentId], references: [id])
-  claimedBy         User?              @relation("OrderClaimedBy", fields: [claimedById], references: [id], onDelete: SetNull)
+  user              User                  @relation("OrderUser", fields: [userId], references: [id])
+  agent             Agent?                @relation(fields: [agentId], references: [id])
+  claimedBy         User?                 @relation("OrderClaimedBy", fields: [claimedById], references: [id], onDelete: SetNull)
   items             OrderItem[]
   passengers        Passenger[]
   payments          Payment[]
@@ -618,31 +626,35 @@ model Order {
 }
 
 model OrderItem {
-  id          String         @id @default(cuid())
-  orderId     String
-  kind        OrderItemKind
-  description String
-  quantity    Int            @default(1)
-  unitPrice   Decimal        @db.Decimal(10, 2)
-  amount      Decimal        @db.Decimal(12, 2)
+  id               String        @id @default(cuid())
+  orderId          String
+  kind             OrderItemKind
+  description      String
+  quantity         Int           @default(1)
+  unitPrice        Decimal       @db.Decimal(10, 2)
+  amount           Decimal       @db.Decimal(12, 2)
+  // 成本快照（CNY/件）— 下单时锁定的真实采购成本；NULL = 老数据，未回填
+  unitCostCny      Decimal?      @db.Decimal(10, 2)
+  // 总成本（CNY）= unitCostCny × quantity；NULL = 老数据
+  totalCostCny     Decimal?      @db.Decimal(12, 2)
   // Optional links — exactly one set depending on kind.
   flightScheduleId String?
   flightCabin      CabinClass?
   hotelRoomTypeId  String?
-  hotelCheckIn     DateTime?   @db.Date
-  hotelCheckOut    DateTime?   @db.Date
+  hotelCheckIn     DateTime?     @db.Date
+  hotelCheckOut    DateTime?     @db.Date
   transferId       String?
   visaId           String?
   bundleId         String?
   metadata         Json?
-  createdAt        DateTime    @default(now())
+  createdAt        DateTime      @default(now())
 
-  order            Order              @relation(fields: [orderId], references: [id], onDelete: Cascade)
-  flightSchedule   FlightSchedule?    @relation(fields: [flightScheduleId], references: [id])
-  hotelRoomType    HotelRoomType?     @relation(fields: [hotelRoomTypeId], references: [id])
-  transfer         Transfer?          @relation(fields: [transferId], references: [id])
-  visa             Visa?              @relation(fields: [visaId], references: [id])
-  bundle           Bundle?            @relation(fields: [bundleId], references: [id])
+  order            Order             @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  flightSchedule   FlightSchedule?   @relation(fields: [flightScheduleId], references: [id])
+  hotelRoomType    HotelRoomType?    @relation(fields: [hotelRoomTypeId], references: [id])
+  transfer         Transfer?         @relation(fields: [transferId], references: [id])
+  visa             Visa?             @relation(fields: [visaId], references: [id])
+  bundle           Bundle?           @relation(fields: [bundleId], references: [id])
   fulfillmentTasks FulfillmentTask[]
 
   @@index([orderId])
@@ -652,11 +664,11 @@ model OrderItem {
 // Fulfillment Tasks — 出票 / 酒店确认 / 签证进度 / 司机调度
 // ─────────────────────────────────────────────────────────────────────────────
 enum FulfillmentType {
-  FLIGHT_TICKETING   // 出票（PNR + e-ticket number）
-  HOTEL_BOOKING      // 酒店预订（confirmation number）
-  VISA_APPLICATION   // 签证申请（application number + progress）
-  TRANSFER_DISPATCH  // 接送调度（driver + vehicle）
-  BUNDLE_COMPOSITE   // 套餐：需拆解为多个子任务
+  FLIGHT_TICKETING // 出票（PNR + e-ticket number）
+  HOTEL_BOOKING // 酒店预订（confirmation number）
+  VISA_APPLICATION // 签证申请（application number + progress）
+  TRANSFER_DISPATCH // 接送调度（driver + vehicle）
+  BUNDLE_COMPOSITE // 套餐：需拆解为多个子任务
 }
 
 enum FulfillmentStatus {
@@ -668,24 +680,24 @@ enum FulfillmentStatus {
 }
 
 model FulfillmentTask {
-  id           String              @id @default(cuid())
-  orderItemId  String
-  type         FulfillmentType
-  status       FulfillmentStatus   @default(PENDING)
+  id             String            @id @default(cuid())
+  orderItemId    String
+  type           FulfillmentType
+  status         FulfillmentStatus @default(PENDING)
   // 多态 data：FLIGHT → {pnr, eTicketNumber}
   //            HOTEL  → {confirmationNumber}
   //            VISA   → {applicationNumber, progress}
   //            TRANSFER → {driverName, vehicleNumber}
-  data         Json?
-  notes        String?
-  attempts     Int                 @default(0)
-  scheduledAt  DateTime?
-  startedAt    DateTime?
-  completedAt  DateTime?
-  failureReason String?
-  assigneeUserId String?           // 谁负责这条任务
-  createdAt    DateTime            @default(now())
-  updatedAt    DateTime            @updatedAt
+  data           Json?
+  notes          String?
+  attempts       Int               @default(0)
+  scheduledAt    DateTime?
+  startedAt      DateTime?
+  completedAt    DateTime?
+  failureReason  String?
+  assigneeUserId String? // 谁负责这条任务
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
 
   orderItem OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
 
@@ -701,7 +713,7 @@ model Passenger {
   // 航司 PNR 标准字段：姓 / 名 拆开（fullName 仍保留兼容）
   lastName       String?
   firstName      String?
-  title          String?       // MR / MRS / MS / MSTR / MISS
+  title          String? // MR / MRS / MS / MSTR / MISS
   gender         Gender?
   documentType   DocumentType
   documentNumber String
@@ -711,37 +723,37 @@ model Passenger {
   passengerType  PassengerType @default(ADULT)
 
   // ── 护照扩展（出票 + 签证用）──
-  passportIssueCountry String?     // 颁发国 ISO-2，如 CHN
-  passportExpiry       DateTime?   @db.Date
+  passportIssueCountry String? // 颁发国 ISO-2，如 CHN
+  passportExpiry       DateTime? @db.Date
 
   // ── 签证（已签发的，给出票/接送参考）──
-  visaNumber                 String?
-  visaType                   String?    // E-visa / Sticker / Approval letter
-  visaIssueDate              DateTime?  @db.Date
-  visaExpiry                 DateTime?  @db.Date
-  visaPlaceOfIssue           String?
-  visaCountryOfApplication   String?
+  visaNumber               String?
+  visaType                 String? // E-visa / Sticker / Approval letter
+  visaIssueDate            DateTime? @db.Date
+  visaExpiry               DateTime? @db.Date
+  visaPlaceOfIssue         String?
+  visaCountryOfApplication String?
 
   // ── 地址（航司提交格式需要）──
-  addressType    String?    // BUSINESS / RESIDENTIAL
-  addressDetails String?    // 详细地址
+  addressType    String? // BUSINESS / RESIDENTIAL
+  addressDetails String? // 详细地址
   addressCity    String?
   addressState   String?
-  addressCountry String?    // ISO-2
+  addressCountry String? // ISO-2
   addressZip     String?
 
-  mealPreference String?
-  needsWheelchair Boolean      @default(false)
-  needsInfantBassinet Boolean  @default(false)
+  mealPreference      String?
+  needsWheelchair     Boolean @default(false)
+  needsInfantBassinet Boolean @default(false)
   // 拼房用 — 客人偏好：SINGLE/DOUBLE/TWIN/SHARE_OK
-  bedPref        String?
+  bedPref             String?
   // 护照照片（OCR 上传或人工补传）
-  passportPhotoUrl String?
+  passportPhotoUrl    String?
 
-  pnr            String?       // booked PNR from airline
-  eticketNumber  String?
-  createdAt      DateTime      @default(now())
-  updatedAt      DateTime      @updatedAt
+  pnr           String? // booked PNR from airline
+  eticketNumber String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
 
   order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
 
@@ -749,14 +761,14 @@ model Passenger {
 }
 
 model OrderStatusEvent {
-  id          String      @id @default(cuid())
+  id          String       @id @default(cuid())
   orderId     String
   fromStatus  OrderStatus?
   toStatus    OrderStatus
   actorUserId String?
   reason      String?
   metadata    Json?
-  createdAt   DateTime    @default(now())
+  createdAt   DateTime     @default(now())
 
   order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
   actor User? @relation(fields: [actorUserId], references: [id])
@@ -809,15 +821,15 @@ enum RefundStatus {
 }
 
 model Refund {
-  id            String       @id @default(cuid())
-  orderId       String
-  amount        Decimal      @db.Decimal(12, 2)
-  reason        String?
-  status        RefundStatus @default(REQUESTED)
-  processedAt   DateTime?
+  id             String       @id @default(cuid())
+  orderId        String
+  amount         Decimal      @db.Decimal(12, 2)
+  reason         String?
+  status         RefundStatus @default(REQUESTED)
+  processedAt    DateTime?
   gatewayPayload Json?
-  createdAt     DateTime     @default(now())
-  updatedAt     DateTime     @updatedAt
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
 
   order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
 
@@ -830,13 +842,13 @@ model Refund {
 // ─────────────────────────────────────────────────────────────────────────────
 
 model PricingConfig {
-  id                  String   @id @default(cuid())
-  flightScheduleId    String   @unique
+  id                 String   @id @default(cuid())
+  flightScheduleId   String   @unique
   // JSON: [{tier: "A", minDaysOut: 30, minLoadFactor: 0, multiplier: 1.0}, ...]
-  tiers               Json
+  tiers              Json
   // optional ML-derived demand multiplier, refreshed weekly
-  mlDemandMultiplier  Decimal? @db.Decimal(6, 4)
-  updatedAt           DateTime @updatedAt
+  mlDemandMultiplier Decimal? @db.Decimal(6, 4)
+  updatedAt          DateTime @updatedAt
 
   flightSchedule FlightSchedule @relation(fields: [flightScheduleId], references: [id], onDelete: Cascade)
   overrides      TierOverride[]
@@ -844,15 +856,15 @@ model PricingConfig {
 }
 
 model TierOverride {
-  id              String   @id @default(cuid())
+  id              String    @id @default(cuid())
   pricingConfigId String
-  tier            String   // "A" | "B" | "C" | "D"
-  multiplier      Decimal  @db.Decimal(6, 4)
+  tier            String // "A" | "B" | "C" | "D"
+  multiplier      Decimal   @db.Decimal(6, 4)
   reason          String?
   effectiveFrom   DateTime
   effectiveTo     DateTime?
   createdById     String
-  createdAt       DateTime @default(now())
+  createdAt       DateTime  @default(now())
 
   pricingConfig PricingConfig @relation(fields: [pricingConfigId], references: [id], onDelete: Cascade)
 
@@ -860,12 +872,12 @@ model TierOverride {
 }
 
 model PriceHistory {
-  id              String   @id @default(cuid())
+  id              String     @id @default(cuid())
   pricingConfigId String
   cabin           CabinClass
-  price           Decimal  @db.Decimal(10, 2)
+  price           Decimal    @db.Decimal(10, 2)
   tier            String
-  observedAt      DateTime @default(now())
+  observedAt      DateTime   @default(now())
 
   pricingConfig PricingConfig @relation(fields: [pricingConfigId], references: [id], onDelete: Cascade)
 
@@ -896,8 +908,8 @@ model CancellationPolicy {
   // 可选范围限定（null = 该 kind 的通用策略；非 null = 针对特定班次/酒店房型/套餐）
   // scope 是 polymorphic，按 productKind 解释：FLIGHT→FlightSchedule.id, HOTEL→HotelRoomType.id, BUNDLE→Bundle.id ...
   scope       String?
-  name        String        // 人类可读，例 "默认机票退订" / "国庆班次特殊政策"
-  tiers       Json          // 见上方注释；运行时校验 hoursBeforeDeparture 单调递减、feePercent 0-100
+  name        String // 人类可读，例 "默认机票退订" / "国庆班次特殊政策"
+  tiers       Json // 见上方注释；运行时校验 hoursBeforeDeparture 单调递减、feePercent 0-100
   isDefault   Boolean       @default(false) // true = 该 kind 的兜底；同 kind 只允许一条 isDefault
   isActive    Boolean       @default(true)
   notes       String?
@@ -926,19 +938,19 @@ enum NotificationStatus {
 }
 
 model NotificationLog {
-  id          String              @id @default(cuid())
-  orderId     String?
-  userId      String?
-  channel     NotificationChannel
-  recipient   String              // phone, email, or openid
-  template    String              // template key
-  payload     Json
-  status      NotificationStatus  @default(QUEUED)
-  attemptCount Int                @default(0)
-  lastError   String?
-  sentAt      DateTime?
-  createdAt   DateTime            @default(now())
-  updatedAt   DateTime            @updatedAt
+  id           String              @id @default(cuid())
+  orderId      String?
+  userId       String?
+  channel      NotificationChannel
+  recipient    String // phone, email, or openid
+  template     String // template key
+  payload      Json
+  status       NotificationStatus  @default(QUEUED)
+  attemptCount Int                 @default(0)
+  lastError    String?
+  sentAt       DateTime?
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
 
   order Order? @relation(fields: [orderId], references: [id])
 
@@ -953,11 +965,11 @@ model NotificationLog {
 
 /// 日期等级表 — 每天一行 (A/B/C/D)。Seed 自动按 DOW 填充，admin 可手动 override。
 model DateRanking {
-  id       String   @id @default(cuid())
-  date     DateTime @unique @db.Date // 出发本地日期（UTC midnight 存）
-  rank     String   // "A" | "B" | "C" | "D"
-  reason   String?  // "春节" | "default:Friday" | "manual override"
-  isManual Boolean  @default(false) // true = admin 手动覆盖
+  id        String   @id @default(cuid())
+  date      DateTime @unique @db.Date // 出发本地日期（UTC midnight 存）
+  rank      String // "A" | "B" | "C" | "D"
+  reason    String? // "春节" | "default:Friday" | "manual override"
+  isManual  Boolean  @default(false) // true = admin 手动覆盖
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -969,24 +981,24 @@ model DateRanking {
 // 用户场景：签证截止前要送批文；出票前要拿酒店单过海关；客人特殊改期
 // ─────────────────────────────────────────────────────────────────────────────
 model OperationalReminder {
-  id           String           @id @default(cuid())
-  orderId      String?          // 可选关联订单（独立待办则为 null）
-  createdById  String           // 提单人
-  claimedById  String?          // 认领人（null = 未认领）
-  title        String           // 一句话标题
-  body         String?          // 详细说明
-  dueAt        DateTime?        @db.Date
-  priority     ReminderPriority @default(NORMAL)
-  status       ReminderStatus   @default(OPEN)
-  attachmentUrl String?         // 截图 / 文件链接（小程序/客人发来的）
-  resolvedAt   DateTime?
-  resolvedNote String?          // 完成或跳过的说明
-  createdAt    DateTime         @default(now())
-  updatedAt    DateTime         @updatedAt
+  id            String           @id @default(cuid())
+  orderId       String? // 可选关联订单（独立待办则为 null）
+  createdById   String // 提单人
+  claimedById   String? // 认领人（null = 未认领）
+  title         String // 一句话标题
+  body          String? // 详细说明
+  dueAt         DateTime?        @db.Date
+  priority      ReminderPriority @default(NORMAL)
+  status        ReminderStatus   @default(OPEN)
+  attachmentUrl String? // 截图 / 文件链接（小程序/客人发来的）
+  resolvedAt    DateTime?
+  resolvedNote  String? // 完成或跳过的说明
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
 
-  order      Order? @relation(fields: [orderId], references: [id], onDelete: SetNull)
-  createdBy  User   @relation("ReminderCreator", fields: [createdById], references: [id])
-  claimedBy  User?  @relation("ReminderClaimedBy", fields: [claimedById], references: [id], onDelete: SetNull)
+  order     Order? @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  createdBy User   @relation("ReminderCreator", fields: [createdById], references: [id])
+  claimedBy User?  @relation("ReminderClaimedBy", fields: [claimedById], references: [id], onDelete: SetNull)
 
   @@index([orderId])
   @@index([status, priority, dueAt])

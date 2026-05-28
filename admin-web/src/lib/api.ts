@@ -891,48 +891,85 @@ export const api = {
   deleteCancellationPolicy: (token: string, id: string) =>
     apiFetch<{ ok: boolean }>(`/cancellation-policies/${id}`, { method: 'DELETE', token }),
 
-  // 财务账本（ADMIN-only）
-  getFinances: (token: string) => apiFetch<CostsData>('/finances/costs', { token }),
+  // 财务模块（ADMIN-only）— 业务 P&L
+  getFinanceSummary: (token: string, range: { from: string; to: string }) =>
+    apiFetch<FinanceSummary>(
+      `/finances/summary?from=${encodeURIComponent(range.from)}&to=${encodeURIComponent(range.to)}`,
+      { token },
+    ),
+  getFinanceFlights: (token: string, range: { from: string; to: string }, limit = 100) =>
+    apiFetch<{ range: { from: string; to: string }; rows: FlightPnlRow[] }>(
+      `/finances/flights?from=${encodeURIComponent(range.from)}&to=${encodeURIComponent(range.to)}&limit=${limit}`,
+      { token },
+    ),
+  getFinanceOrders: (token: string, range: { from: string; to: string }, limit = 100) =>
+    apiFetch<{ range: { from: string; to: string }; rows: OrderPnlRow[] }>(
+      `/finances/orders?from=${encodeURIComponent(range.from)}&to=${encodeURIComponent(range.to)}&limit=${limit}`,
+      { token },
+    ),
+  getFinanceMonthly: (token: string, months = 6) =>
+    apiFetch<{ months: number; points: MonthlyPoint[] }>(
+      `/finances/monthly?months=${months}`,
+      { token },
+    ),
 };
 
-// ── 财务账本类型（与 backend/src/modules/finances/costs-data.ts 对齐）──
-export interface CostCategory { label: string; usd: number; note: string; }
-export interface CostDetailRow {
-  isSection: boolean;
-  label?: string;
-  date?: string;
-  category?: string;
-  vendor?: string;
-  usd?: number;
-  what?: string;
-  hours?: string;
+// ── 财务模块类型（与 backend/src/modules/finances/finances.service.ts 对齐）──
+export interface CategoryBreakdown {
+  kind: string;
+  revenueCny: number;
+  costCny: number;
+  grossMarginCny: number;
+  marginPct: number | null;
+  orderItemCount: number;
 }
-export interface MonthlyForecastRow {
-  category: string;
-  testing: number;
-  beta: number;
-  stable: number;
-  note: string;
+export interface FinanceSummary {
+  range: { from: string; to: string };
+  revenueCny: number;
+  costCny: number;
+  grossMarginCny: number;
+  marginPct: number | null;
+  emptySeatSunkCostCny: number;
+  netMarginCny: number;
+  orderCount: number;
+  missingCostItemCount: number;
+  categories: CategoryBreakdown[];
 }
-export interface UnitEconStage {
-  stage: string;
-  orders: number;
-  aovCny: number;
-  gmvCny: number;
-  profitCny: number;
-  profitUsd: number;
+export interface FlightPnlRow {
+  scheduleId: string;
+  flightNumber: string;
+  origin: string;
+  destination: string;
+  departureTime: string;
+  charterCostCny: number | null;
+  totalSeats: number;
+  soldSeats: number;
+  loadPct: number;
+  revenueCny: number;
+  soldSeatAllocCostCny: number | null;
+  emptySeatSunkCostCny: number | null;
+  netMarginCny: number | null;
+  grossOnSoldCny: number | null;
 }
-export interface CostsData {
-  asOf: string;
-  title: string;
-  totalUsd: number;
-  categories: CostCategory[];
-  detail: { rows: CostDetailRow[]; totalUsd: number };
-  monthly: {
-    rows: MonthlyForecastRow[];
-    totals: { testing: number; beta: number; stable: number };
-  };
-  unitEcon: { stages: UnitEconStage[] };
+export interface OrderPnlRow {
+  orderId: string;
+  orderNumber: string;
+  status: string;
+  contactName: string;
+  createdAt: string;
+  totalCny: number;
+  costCny: number | null;
+  grossMarginCny: number | null;
+  marginPct: number | null;
+  itemCount: number;
+  missingCostItemCount: number;
+}
+export interface MonthlyPoint {
+  month: string;
+  revenueCny: number;
+  costCny: number;
+  grossMarginCny: number;
+  orderCount: number;
 }
 
 export type ProductKind = 'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA' | 'BUNDLE' | 'INSURANCE';

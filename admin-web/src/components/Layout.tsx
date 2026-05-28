@@ -24,7 +24,7 @@ const NAV: Array<{ to: string; label: string; roles: Array<'ADMIN' | 'STAFF' | '
   { to: '/travelers',       label: '旅客管理',    roles: ['ADMIN', 'STAFF', 'AGENT'] },
   { to: '/settlements',     label: '结算单',      roles: ['ADMIN', 'STAFF', 'AGENT'] },
   { to: '/audit-logs',      label: '审计日志',    roles: ['ADMIN', 'STAFF'] },
-  { to: '/finances',        label: '财务账本',    roles: ['ADMIN'] },
+  { to: '/finances',        label: '财务',        roles: ['ADMIN'] },
 ];
 
 export function Layout() {
