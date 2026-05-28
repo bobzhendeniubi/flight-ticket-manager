@@ -28,9 +28,10 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
   });
 
   // ── 管理员航班 CRUD ──
+  // 列表：ADMIN/STAFF/AGENT 都可读（代理批量创单要选航班；AdminFlight 不含成本字段，安全）
   app.get(
     '/',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT)] },
     async () => {
       const flights = await service.listFlights();
       return { flights };
@@ -59,10 +60,22 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
 
   app.get(
     '/:flightId/schedules',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT)] },
     async (req) => {
       const { flightId } = req.params as { flightId: string };
       const schedules = await service.listSchedules(flightId);
+      // 代理可读班次（批量创单需要），但不可见成本字段 —— 剥离防泄露毛利
+      if (req.user.role === UserRole.AGENT) {
+        const sanitized = schedules.map((s) => {
+          const { charterCostCny, ticketCostUsd, airportTaxDepUsd, airportTaxArrUsd, ...rest } = s;
+          void charterCostCny;
+          void ticketCostUsd;
+          void airportTaxDepUsd;
+          void airportTaxArrUsd;
+          return rest;
+        });
+        return { schedules: sanitized };
+      }
       return { schedules };
     },
   );
