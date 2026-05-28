@@ -4,19 +4,20 @@ A full-stack travel booking platform — WeChat Mini-Program + responsive web sa
 
 ## What This System Does
 
-Customers book customized flights, hotels, airport transfers, and visa services. Internal staff manage inventory, orders, and agents through a web admin panel. An ML-powered dynamic pricing engine manages ABCD-tier pricing and seasonality.
+Customers book customized flights, hotels, airport transfers, visa services, and bundled packages. Internal staff manage inventory, orders, and agents through a web admin panel. A rule-based dynamic pricing engine applies ABCD date-tier and cabin multipliers.
 
 ## Repository Structure
 
 ```
 flight-ticket-manager/
-├── docs/                   # PRD, architecture, API design, DB schema
-├── sales-web/              # React responsive web app (customer-facing, desktop + mobile)
+├── docs/                   # PRD, architecture, user manual, test guides
+├── sales-web/              # React + Vite web app (customer-facing, desktop + mobile)
 ├── miniprogram/            # WeChat Mini-Program (Taro/React, shares logic with sales-web)
-├── admin-web/              # React + Ant Design admin panel (desktop, staff only)
-├── backend/                # API server (Node.js Fastify or Python FastAPI)
-├── ml-pricing/             # Python dynamic pricing ML module
-└── infra/                  # AWS CDK / Terraform infrastructure as code
+├── admin-web/              # React + Vite + Tailwind admin panel (desktop, staff/agent)
+├── backend/                # API server (Node.js Fastify) + Prisma + BullMQ worker
+├── ml-pricing/             # placeholder — pricing is currently rule-based in backend/
+├── infra/                  # Docker Compose deployment (infra/staging)
+└── scripts/                # ops / deploy helper scripts
 ```
 
 ## User Roles
@@ -24,37 +25,45 @@ flight-ticket-manager/
 | Role | Surface | Capabilities |
 |------|---------|-------------|
 | Guest / Customer | sales-web, mini-program | Search, book, pay, view orders |
-| Agent | sales-web, mini-program | Same as customer + view all own orders, commission reconciliation, prepayment offset |
+| Agent | sales-web, mini-program, admin-web | Customer features + team/sub-agents, commission reconciliation, prepayment, order/customer management (no cost/finance) |
 | Staff / Ops | admin-web | Order processing, ticketing, inventory management |
 | Admin | admin-web | Full access including pricing, agent management, reporting |
 
 ## Product Catalog
 
 - **Flights** — self-managed, own flight numbers and schedules
-- **Hotels** — room inventory with PMS integration
+- **Hotels** — room-type inventory and pricing
 - **Airport Transfers** — vehicle types, pickup logic, pricing
 - **Visas** — document upload, progress tracking, delivery
+- **Bundles** — all-inclusive packages (e.g. Da Nang) with room-sharing allocation
 
 ## Tech Stack
 
 | Layer | Technology |
 |-------|-----------|
-| Sales Web | React + Vite, Tailwind CSS |
+| Sales Web | React 18 + Vite, Tailwind CSS, Zustand, react-i18next |
 | Mini-Program | Taro (React) |
-| Admin Web | React + Ant Design Pro |
-| Backend API | Node.js (Fastify) |
-| Transactional DB | PostgreSQL (AWS RDS) |
-| Cache / Sessions | Redis (AWS ElastiCache) |
-| Search | Elasticsearch (AWS OpenSearch) |
-| File Storage | AWS S3 |
-| Dynamic Pricing ML | Python (scikit-learn, Prophet) |
-| Infrastructure | AWS (ECS, RDS, ElastiCache, CloudFront, S3) |
-| OCR | Tesseract → AWS Textract (v2) |
+| Admin Web | React 18 + Vite, Tailwind CSS |
+| Backend API | Node.js (Fastify 5), Zod validation, Pino logging |
+| ORM / DB | Prisma 5 → PostgreSQL (self-hosted, Docker) |
+| Cache / Sessions / Queue | Redis (ioredis) + BullMQ worker |
+| Auth | JWT access/refresh tokens, argon2 password hashing |
+| Search | PostgreSQL queries (no dedicated search engine) |
+| File Storage | Data-URL in PostgreSQL (passport photos, payment proofs); object storage not yet wired |
+| Dynamic Pricing | Rule-based ABCD date tiers + cabin multipliers (ML pipeline not built) |
+| Excel Export | ExcelJS (PNR + finance reconciliation) |
+| OCR | tesseract.js (in-browser, client-side); server-side OCR planned |
+| AI Assistant | OpenAI-compatible SDK (DeepSeek), offline mock fallback |
+| Infrastructure | Docker Compose (backend / worker / postgres / redis / sales-web / admin-web); staging on Alibaba Cloud HK |
 
 ## Documentation
 
 - [PRD — Product Requirements](docs/PRD.md)
 - [System Architecture](docs/architecture.md)
+- [Deployment Guide](docs/DEPLOYMENT.md)
+- [使用手册 — User Manual (中文)](docs/使用手册.md)
+- [功能清单 — Feature List & Launch Timeline (中文)](docs/功能清单.md)
+- [测试指南 — Beta Test Guides (中文)](docs/测试指南-操作测试.md)
 - [Open Questions Tracker](docs/open-questions.md)
 - [Backend README](backend/README.md)
 - [Sales-web README](sales-web/README.md)
@@ -82,9 +91,9 @@ Log in at http://localhost:5173/login with `admin@ftm.local` / `Password123!`.
 
 | Milestone | Scope |
 |-----------|-------|
-| M1 — Foundation | DB schema, auth, API skeleton, AWS baseline |
+| M1 — Foundation | DB schema, auth, API skeleton, Docker baseline |
 | M2 — Sales MVP | Flight search → order → pay (web + mini-program), OCR |
 | M3 — Product Expansion | Hotels, transfers, visas |
 | M4 — Admin Panel | Order mgmt, inventory, agent reconciliation |
-| M5 — Dynamic Pricing | ML pipeline, ABCD tiers, admin UI |
+| M5 — Dynamic Pricing | Rule-based ABCD date tiers + cabin multipliers, admin UI (ML deferred) |
 | M6 — Polish & Launch | Testing, security audit, CI/CD, go-live |
