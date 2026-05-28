@@ -150,3 +150,18 @@ export const batchUpdateStatusBodySchema = z.object({
   force: z.boolean().optional(),
 });
 export type BatchUpdateStatusBody = z.infer<typeof batchUpdateStatusBodySchema>;
+
+// ── 批量散客建单（后台）─────────────────────────────────────────────────────
+// 选一个航班班次 + 舱位 + 共享联系人 → 名单里每位乘客各成一单（FLIGHT × 1）
+export const batchCreateOrdersBodySchema = z.object({
+  flightScheduleId: z.string().min(1),
+  flightCabin: z.nativeEnum(CabinClass),
+  description: z.string().min(1).max(200), // 航段描述，如 "QH9589 澳门→岘港 2026-06-01 经济舱"
+  contactName: z.string().min(1).max(120), // 全批次共享联系人（一般是代理自己）
+  contactPhone: z.string().min(5).max(40),
+  contactEmail: z.string().email().optional(),
+  paymentMethod: z.nativeEnum(PaymentMethod).optional(),
+  notes: z.string().max(500).optional(),
+  passengers: z.array(passengerInputSchema).min(1).max(100), // 每位 → 一单
+});
+export type BatchCreateOrdersBody = z.infer<typeof batchCreateOrdersBodySchema>;

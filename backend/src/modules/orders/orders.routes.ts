@@ -11,6 +11,7 @@ import { z } from 'zod';
 import { UserRole } from '@prisma/client';
 import { OrderService, type OrderRequester } from './orders.service.js';
 import {
+  batchCreateOrdersBodySchema,
   batchUpdateStatusBodySchema,
   createOrderBodySchema,
   listOrdersQuerySchema,
@@ -42,6 +43,38 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         after: { total: order.total.toString(), itemCount: order.items.length, passengerCount: order.passengers.length },
       });
       return reply.status(201).send({ order });
+    },
+  );
+
+  // ── 批量散客建单（后台）─────────────────────────────────────────
+  // POST /orders/batch — 选一个航班班次+舱位+共享联系人，名单每位乘客各成一单
+  // CUSTOMER 不可用（前台无此入口）；ADMIN/STAFF/AGENT 可用
+  app.post(
+    '/batch',
+    { preHandler: [app.authenticate] },
+    async (req, reply) => {
+      if (req.user.role === UserRole.CUSTOMER) {
+        return reply.status(403).send({ error: '客户不可批量建单' });
+      }
+      const body = batchCreateOrdersBodySchema.parse(req.body);
+      const requester = await buildRequester(req.user.sub, req.user.role);
+      const result = await service.batchCreateOrders(body, requester);
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'BATCH_CREATE_ORDERS',
+        targetType: 'ORDER',
+        targetId: 'batch',
+        targetLabel: `${result.successCount}/${body.passengers.length} 单 · ${body.description}`,
+        after: {
+          flightScheduleId: body.flightScheduleId,
+          flightCabin: body.flightCabin,
+          requestedCount: body.passengers.length,
+          successCount: result.successCount,
+          failureCount: result.failureCount,
+        },
+        severity: result.failureCount > 0 ? 'WARNING' : 'INFO',
+      });
+      return reply.status(201).send(result);
     },
   );
 

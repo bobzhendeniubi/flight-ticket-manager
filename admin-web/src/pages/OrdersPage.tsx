@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { api, ApiError, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus } from '../lib/api';
+import { api, ApiError, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import {
   type FulfillmentStatus,
@@ -99,6 +99,9 @@ export function OrdersPage() {
   } | null>(null);
   // 强制模式默认开（管理员手动改状态的核心场景就是绕开标准流转）
   const [forceMode, setForceMode] = useState(true);
+  // 批量创单弹窗 + 列表刷新计数（建单后 +1 触发重新拉单）
+  const [showBatchCreate, setShowBatchCreate] = useState(false);
+  const [refreshNonce, setRefreshNonce] = useState(0);
 
   // 拉取订单 — travelFrom/To/claimFilter 变化时重拉（后端按出行日期 + 接单状态过滤）
   useEffect(() => {
@@ -123,7 +126,7 @@ export function OrdersPage() {
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [tokens?.accessToken, travelFrom, travelTo, claimFilter]);
+  }, [tokens?.accessToken, travelFrom, travelTo, claimFilter, refreshNonce]);
 
   // 视图层把 OrderSummary 映射成便于筛选/展示的数据
   const ordersView = useMemo(
@@ -262,6 +265,12 @@ export function OrdersPage() {
           <span className="rounded bg-slate-100 px-3 py-1 text-xs text-slate-600">
             {loading ? '加载中…' : `共 ${filtered.length} 条`}
           </span>
+          <button
+            className="btn-primary text-sm"
+            onClick={() => setShowBatchCreate(true)}
+          >
+            ＋ 批量创单
+          </button>
           <button
             className="btn-secondary text-sm"
             disabled={loading}
@@ -630,6 +639,13 @@ export function OrdersPage() {
           order={selected}
           onClose={() => setSelected(null)}
           onAdvance={(next, reason) => advance(selected, next, reason)}
+        />
+      )}
+
+      {showBatchCreate && (
+        <BatchCreateModal
+          onClose={() => setShowBatchCreate(false)}
+          onCreated={() => setRefreshNonce((n) => n + 1)}
         />
       )}
     </div>
@@ -1381,5 +1397,306 @@ function RemindersSection({ order }: { order: OrderSummary }) {
         </div>
       </div>
     </section>
+  );
+}
+
+// ── 批量散客建单弹窗 ────────────────────────────────────────────────
+const CABIN_ZH: Record<string, string> = {
+  ECONOMY: '经济舱',
+  PREMIUM_ECONOMY: '超级经济舱',
+  BUSINESS: '商务舱',
+  FIRST: '头等舱',
+};
+
+interface BatchRow {
+  fullName: string;
+  documentNumber: string;
+  dateOfBirth: string;
+}
+
+function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
+  const tokens = useAuth((s) => s.tokens);
+  const token = tokens?.accessToken ?? '';
+
+  const [flights, setFlights] = useState<AdminFlight[]>([]);
+  const [flightId, setFlightId] = useState('');
+  const [schedules, setSchedules] = useState<AdminSchedule[]>([]);
+  const [scheduleId, setScheduleId] = useState('');
+  const [cabin, setCabin] = useState<CabinClass | ''>('');
+  const [contactName, setContactName] = useState('');
+  const [contactPhone, setContactPhone] = useState('');
+  const [notes, setNotes] = useState('');
+  const [rows, setRows] = useState<BatchRow[]>([{ fullName: '', documentNumber: '', dateOfBirth: '' }]);
+  const [submitting, setSubmitting] = useState(false);
+  const [result, setResult] = useState<BatchCreateOrdersResult | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!token) return;
+    api
+      .listAllFlights(token)
+      .then((r) => setFlights(r.flights))
+      .catch(() => setErr('航班列表加载失败'));
+  }, [token]);
+
+  useEffect(() => {
+    if (!token || !flightId) {
+      setSchedules([]);
+      setScheduleId('');
+      return;
+    }
+    api
+      .listSchedules(token, flightId)
+      .then((r) => setSchedules(r.schedules))
+      .catch(() => setErr('班次加载失败'));
+  }, [token, flightId]);
+
+  const flight = flights.find((f) => f.id === flightId);
+  const schedule = schedules.find((s) => s.id === scheduleId);
+  const cabinOptions = schedule?.seatClasses ?? [];
+  const validRows = rows.filter((r) => r.fullName.trim() && r.documentNumber.trim() && r.dateOfBirth);
+
+  function setRow(i: number, patch: Partial<BatchRow>): void {
+    setRows((prev) => prev.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
+  }
+  function addRow(): void {
+    setRows((prev) => [...prev, { fullName: '', documentNumber: '', dateOfBirth: '' }]);
+  }
+  function removeRow(i: number): void {
+    setRows((prev) => (prev.length > 1 ? prev.filter((_, idx) => idx !== i) : prev));
+  }
+  function pasteNames(text: string): void {
+    const names = text.split('\n').map((s) => s.trim()).filter(Boolean);
+    if (names.length > 0) {
+      setRows(names.map((n) => ({ fullName: n, documentNumber: '', dateOfBirth: '' })));
+    }
+  }
+
+  async function submit(): Promise<void> {
+    setErr(null);
+    if (!scheduleId || !cabin) {
+      setErr('请选择航班班次和舱位');
+      return;
+    }
+    if (!contactName.trim() || !contactPhone.trim()) {
+      setErr('请填联系人姓名和电话（全批次共享）');
+      return;
+    }
+    if (validRows.length === 0) {
+      setErr('至少要有一位完整乘客（姓名 + 护照号 + 出生日期）');
+      return;
+    }
+    const departDate = schedule ? schedule.departureTime.slice(0, 10) : '';
+    const description =
+      `${flight?.flightNumber ?? ''} ${flight?.originCode ?? ''}→${flight?.destinationCode ?? ''} ${departDate} ${CABIN_ZH[cabin] ?? cabin}`.trim();
+    setSubmitting(true);
+    try {
+      const res = await api.batchCreateOrders(token, {
+        flightScheduleId: scheduleId,
+        flightCabin: cabin,
+        description,
+        contactName: contactName.trim(),
+        contactPhone: contactPhone.trim(),
+        notes: notes.trim() || undefined,
+        passengers: validRows.map((r) => ({
+          fullName: r.fullName.trim(),
+          documentNumber: r.documentNumber.trim(),
+          dateOfBirth: r.dateOfBirth,
+          nationality: 'CN',
+        })),
+      });
+      setResult(res);
+      if (res.successCount > 0) onCreated();
+    } catch (e: unknown) {
+      setErr(e instanceof ApiError ? e.message : '批量创建失败');
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 p-4">
+      <div className="my-8 w-full max-w-3xl rounded-xl bg-white shadow-xl">
+        <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3">
+          <h2 className="text-lg font-semibold text-slate-900">批量创单（散客 · 每位乘客一单）</h2>
+          <button className="text-slate-400 hover:text-slate-700" onClick={onClose}>✕</button>
+        </div>
+
+        {result ? (
+          <div className="space-y-4 p-5">
+            <div className="rounded-md bg-slate-50 px-4 py-3 text-sm">
+              成功 <b className="text-emerald-700">{result.successCount}</b> 单 ·
+              失败 <b className="text-rose-700">{result.failureCount}</b> 单
+            </div>
+            <div className="max-h-80 overflow-y-auto">
+              <table className="w-full text-sm">
+                <thead className="text-xs text-slate-500">
+                  <tr className="border-b border-slate-200">
+                    <th className="py-1.5 text-left font-normal">乘客</th>
+                    <th className="py-1.5 text-left font-normal">结果</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {result.results.map((r) => (
+                    <tr key={r.index} className="border-b border-slate-100 last:border-0">
+                      <td className="py-1.5 text-slate-900">{r.passengerName}</td>
+                      <td className="py-1.5">
+                        {r.success ? (
+                          <span className="text-emerald-700">✓ {r.orderNumber}</span>
+                        ) : (
+                          <span className="text-rose-600">✕ {r.error}</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="flex justify-end gap-2">
+              <button
+                className="btn-secondary text-sm"
+                onClick={() => {
+                  setResult(null);
+                  setRows([{ fullName: '', documentNumber: '', dateOfBirth: '' }]);
+                }}
+              >
+                再建一批
+              </button>
+              <button className="btn-primary text-sm" onClick={onClose}>完成</button>
+            </div>
+          </div>
+        ) : (
+          <div className="space-y-4 p-5">
+            {err && <div className="rounded-md bg-rose-50 px-4 py-2 text-sm text-rose-700">{err}</div>}
+
+            {/* 航班 + 班次 + 舱位 */}
+            <div className="grid gap-3 md:grid-cols-3">
+              <label className="text-xs text-slate-500">
+                航班
+                <select
+                  className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                  value={flightId}
+                  onChange={(e) => setFlightId(e.target.value)}
+                >
+                  <option value="">选择航班…</option>
+                  {flights.map((f) => (
+                    <option key={f.id} value={f.id}>
+                      {f.flightNumber} {f.originCode}→{f.destinationCode}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="text-xs text-slate-500">
+                班次（出发日期）
+                <select
+                  className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                  value={scheduleId}
+                  onChange={(e) => { setScheduleId(e.target.value); setCabin(''); }}
+                  disabled={!flightId}
+                >
+                  <option value="">选择班次…</option>
+                  {schedules.map((s) => (
+                    <option key={s.id} value={s.id}>
+                      {s.departureTime.slice(0, 16).replace('T', ' ')}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="text-xs text-slate-500">
+                舱位
+                <select
+                  className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                  value={cabin}
+                  onChange={(e) => setCabin(e.target.value as CabinClass)}
+                  disabled={!scheduleId}
+                >
+                  <option value="">选择舱位…</option>
+                  {cabinOptions.map((c) => (
+                    <option key={c.id} value={c.cabin}>
+                      {CABIN_ZH[c.cabin] ?? c.cabin}（余 {c.capacity - c.sold}）¥{Number(c.basePrice).toFixed(0)}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+
+            {/* 共享联系人 */}
+            <div className="grid gap-3 md:grid-cols-3">
+              <label className="text-xs text-slate-500">
+                联系人姓名（共享）
+                <input className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm" value={contactName} onChange={(e) => setContactName(e.target.value)} />
+              </label>
+              <label className="text-xs text-slate-500">
+                联系电话（共享）
+                <input className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm" value={contactPhone} onChange={(e) => setContactPhone(e.target.value)} />
+              </label>
+              <label className="text-xs text-slate-500">
+                备注（选填，写入每单）
+                <input className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm" value={notes} onChange={(e) => setNotes(e.target.value)} />
+              </label>
+            </div>
+
+            {/* 快速粘贴姓名 */}
+            <details className="text-xs text-slate-500">
+              <summary className="cursor-pointer">快速粘贴姓名（每行一个 → 自动生成行，护照号/生日再补）</summary>
+              <textarea
+                className="mt-2 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                rows={3}
+                placeholder={'张三\n李四\n王五'}
+                onChange={(e) => pasteNames(e.target.value)}
+              />
+            </details>
+
+            {/* 乘客表格 */}
+            <div>
+              <div className="mb-1 flex items-center justify-between">
+                <span className="text-sm font-medium text-slate-700">乘客名单（每位一单 · 共 {validRows.length} 位有效）</span>
+                <button className="text-sm text-brand hover:text-brand-dark" onClick={addRow}>＋ 加一行</button>
+              </div>
+              <div className="max-h-60 overflow-y-auto rounded-md border border-slate-200">
+                <table className="w-full text-sm">
+                  <thead className="sticky top-0 bg-slate-50 text-xs text-slate-500">
+                    <tr>
+                      <th className="px-2 py-1.5 text-left font-normal">姓名</th>
+                      <th className="px-2 py-1.5 text-left font-normal">护照号</th>
+                      <th className="px-2 py-1.5 text-left font-normal">出生日期</th>
+                      <th className="px-2 py-1.5"></th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {rows.map((r, i) => (
+                      <tr key={i} className="border-t border-slate-100">
+                        <td className="px-2 py-1">
+                          <input className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm" value={r.fullName} onChange={(e) => setRow(i, { fullName: e.target.value })} />
+                        </td>
+                        <td className="px-2 py-1">
+                          <input className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm" value={r.documentNumber} onChange={(e) => setRow(i, { documentNumber: e.target.value })} />
+                        </td>
+                        <td className="px-2 py-1">
+                          <input type="date" className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm" value={r.dateOfBirth} onChange={(e) => setRow(i, { dateOfBirth: e.target.value })} />
+                        </td>
+                        <td className="px-2 py-1 text-right">
+                          <button className="text-xs text-slate-400 hover:text-rose-600" onClick={() => removeRow(i)} disabled={rows.length <= 1}>删</button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between border-t border-slate-200 pt-3">
+              <span className="text-xs text-slate-500">将创建 {validRows.length} 张订单（机票 × 1/人）</span>
+              <div className="flex gap-2">
+                <button className="btn-secondary text-sm" onClick={onClose}>取消</button>
+                <button className="btn-primary text-sm disabled:opacity-50" onClick={submit} disabled={submitting}>
+                  {submitting ? '创建中…' : `批量创建 ${validRows.length} 单`}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
   );
 }

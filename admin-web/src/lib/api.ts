@@ -109,6 +109,36 @@ export interface AdminSchedule {
   seatClasses: AdminScheduleSeat[];
 }
 
+// ── 批量散客建单 ──
+export interface BatchOrderPassenger {
+  fullName: string;
+  documentNumber: string;
+  dateOfBirth: string; // YYYY-MM-DD
+  nationality?: string;
+}
+export interface BatchCreateOrdersInput {
+  flightScheduleId: string;
+  flightCabin: CabinClass;
+  description: string;
+  contactName: string;
+  contactPhone: string;
+  contactEmail?: string;
+  notes?: string;
+  passengers: BatchOrderPassenger[];
+}
+export interface BatchCreateOrdersResult {
+  successCount: number;
+  failureCount: number;
+  results: Array<{
+    index: number;
+    passengerName: string;
+    success: boolean;
+    orderId?: string;
+    orderNumber?: string;
+    error?: string;
+  }>;
+}
+
 export interface AgentListItem {
   id: string;
   userId: string;
@@ -612,6 +642,10 @@ export const api = {
       token,
       body: { ids, toStatus, reason, force },
     }),
+
+  // 批量散客建单：一个航班班次+舱位+共享联系人，名单每位乘客一单
+  batchCreateOrders: (token: string, body: BatchCreateOrdersInput) =>
+    apiFetch<BatchCreateOrdersResult>('/orders/batch', { method: 'POST', token, body }),
 
   // ── 5/20 反馈新增 API ──────────────────────────────────────────────────
   // 一键导出 PNR Excel；返回 Blob 直接下载

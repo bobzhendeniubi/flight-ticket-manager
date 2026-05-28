@@ -30,6 +30,7 @@ import {
 } from '../../lib/errors.js';
 import { PricingService } from '../pricing/pricing.service.js';
 import type {
+  BatchCreateOrdersBody,
   CreateOrderBody,
   ListOrdersQuery,
   OrderItemInput,
@@ -546,6 +547,81 @@ export class OrderService {
         failureCount += 1;
       }
     }
+    return { successCount, failureCount, results };
+  }
+
+  /**
+   * 批量散客建单：选一个航班班次 + 舱位 + 共享联系人，名单里每位乘客各成一单（FLIGHT × 1）。
+   * 逐单复用 createOrder（含动态定价 / 原子扣座 / 订单号），单条失败不影响其余，逐行返回结果。
+   */
+  async batchCreateOrders(
+    body: BatchCreateOrdersBody,
+    requester: OrderRequester,
+  ): Promise<{
+    successCount: number;
+    failureCount: number;
+    results: Array<{
+      index: number;
+      passengerName: string;
+      success: boolean;
+      orderId?: string;
+      orderNumber?: string;
+      error?: string;
+    }>;
+  }> {
+    const results: Array<{
+      index: number;
+      passengerName: string;
+      success: boolean;
+      orderId?: string;
+      orderNumber?: string;
+      error?: string;
+    }> = [];
+    let successCount = 0;
+    let failureCount = 0;
+
+    for (let i = 0; i < body.passengers.length; i++) {
+      const passenger = body.passengers[i];
+      try {
+        const order = await this.createOrder(
+          {
+            contactName: body.contactName,
+            contactPhone: body.contactPhone,
+            contactEmail: body.contactEmail,
+            paymentMethod: body.paymentMethod,
+            notes: body.notes,
+            items: [
+              {
+                kind: 'FLIGHT',
+                description: body.description,
+                quantity: 1,
+                flightScheduleId: body.flightScheduleId,
+                flightCabin: body.flightCabin,
+              },
+            ],
+            passengers: [passenger],
+          },
+          requester,
+        );
+        results.push({
+          index: i,
+          passengerName: passenger.fullName,
+          success: true,
+          orderId: order.id,
+          orderNumber: order.orderNumber,
+        });
+        successCount += 1;
+      } catch (err) {
+        results.push({
+          index: i,
+          passengerName: passenger.fullName,
+          success: false,
+          error: err instanceof Error ? err.message : '未知错误',
+        });
+        failureCount += 1;
+      }
+    }
+
     return { successCount, failureCount, results };
   }
 
