@@ -20,6 +20,7 @@ import {
   getMonthlyTrend,
 } from './finances.service.js';
 import {
+  listSchedulesWithCost,
   patchFlightScheduleCost,
   patchHotelRoomTypeCost,
   patchVisaCost,
@@ -132,6 +133,14 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
         `attachment; filename="${encodeURIComponent(financeExportFilename(range))}"`,
       )
       .send(buf);
+  });
+
+  // ── 航班成本列表（财务页用，admin-only）──
+  // GET /finances/cost/schedules?from=YYYY-MM-DD&to=YYYY-MM-DD
+  app.get('/cost/schedules', requireAdmin, async (req) => {
+    const q = z.object({ from: dateStr.optional(), to: dateStr.optional() }).parse(req.query);
+    const schedules = await listSchedulesWithCost(q);
+    return { schedules };
   });
 
   // ── 产品成本编辑 ──────────────────────────────────────────────────────────

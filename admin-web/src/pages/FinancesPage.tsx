@@ -22,6 +22,7 @@ import {
   type Hotel,
   type Visa,
   type Transfer,
+  type FinanceScheduleRow,
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
 
@@ -279,12 +280,200 @@ function ExportButton({ token, range }: { token: string; range: { from: string; 
 function CostsTab({ token }: { token: string }) {
   return (
     <section className="space-y-5">
+      <FlightScheduleCostEditors token={token} />
+
       <ProductCostEditors token={token} />
 
       <p className="text-xs text-slate-400">
-        说明：成本统一人民币；航班「包机成本 / 机场税」在航班管理页按班次编辑。
+        说明：成本统一人民币。航班按班次维护「包机成本 / 机场税」，系统实时算出"单座(已售)成本"供定价参考。
       </p>
     </section>
+  );
+}
+
+// ── 航班成本（按班次）─ 编辑包机/机场税，并实时显示「单座(已售)成本」─────────
+function FlightScheduleCostEditors({ token }: { token: string }) {
+  const [rows, setRows] = useState<FinanceScheduleRow[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState<string | null>(null);
+
+  const load = useCallback(() => {
+    if (!token) return () => {};
+    let cancelled = false;
+    setLoading(true);
+    setErr(null);
+    api
+      .listFinanceSchedules(token)
+      .then((d) => {
+        if (!cancelled) setRows(d.schedules);
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) setErr(e instanceof ApiError ? e.message : '航班成本列表加载失败');
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [token]);
+
+  useEffect(() => load(), [load]);
+
+  return (
+    <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+      <h2 className="text-sm font-medium text-slate-700">航班成本（按班次）</h2>
+      <p className="mt-1 text-xs text-slate-500">
+        编辑包机总成本和机场税。系统会算出"单座(已售)成本 = 包机÷已售"——帮你定价时看保本线。
+      </p>
+
+      {loading ? (
+        <div className="mt-3 text-sm text-slate-500">加载航班成本…</div>
+      ) : err ? (
+        <div className="mt-3 text-sm text-rose-600">{err}</div>
+      ) : (
+        <div className="mt-3 overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="text-xs text-slate-500">
+              <tr className="border-b border-slate-200">
+                <th className="py-2 text-left font-normal">航班号</th>
+                <th className="py-2 text-left font-normal">路线</th>
+                <th className="py-2 text-left font-normal">出发日期</th>
+                <th className="py-2 text-right font-normal">包机成本(¥)</th>
+                <th className="py-2 text-right font-normal">机场税去(¥)</th>
+                <th className="py-2 text-right font-normal">机场税回(¥)</th>
+                <th className="py-2 text-right font-normal">已售/总座</th>
+                <th className="py-2 text-right font-normal text-blue-700">单座(已售)成本(¥)</th>
+                <th className="py-2 text-right font-normal"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.length === 0 && (
+                <tr>
+                  <td colSpan={9} className="py-4 text-center text-slate-400">
+                    暂无班次
+                  </td>
+                </tr>
+              )}
+              {rows.map((r) => (
+                <FlightScheduleCostRow
+                  key={r.scheduleId}
+                  row={r}
+                  token={token}
+                  onSaved={load}
+                />
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function FlightScheduleCostRow({
+  row,
+  token,
+  onSaved,
+}: {
+  row: FinanceScheduleRow;
+  token: string;
+  onSaved: () => void;
+}) {
+  const [charter, setCharter] = useState<string>(row.charterCostCny == null ? '' : String(row.charterCostCny));
+  const [taxDep, setTaxDep] = useState<string>(row.airportTaxDepCny == null ? '' : String(row.airportTaxDepCny));
+  const [taxArr, setTaxArr] = useState<string>(row.airportTaxArrCny == null ? '' : String(row.airportTaxArrCny));
+  const [saving, setSaving] = useState(false);
+  const [saveErr, setSaveErr] = useState<string | null>(null);
+
+  const toNum = (v: string): number | null => (v.trim() === '' ? null : Number(v));
+  const inputCls = 'w-24 rounded border border-slate-300 px-1.5 py-0.5 text-right text-xs tabular-nums';
+
+  async function save(): Promise<void> {
+    if (!token) return;
+    setSaving(true);
+    setSaveErr(null);
+    try {
+      await api.patchFlightScheduleCost(token, row.scheduleId, {
+        charterCostCny: toNum(charter),
+        airportTaxDepCny: toNum(taxDep),
+        airportTaxArrCny: toNum(taxArr),
+      });
+      onSaved();
+    } catch (e: unknown) {
+      setSaveErr(e instanceof ApiError ? e.message : '保存失败');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const perSeatTooltip = row.perSoldSeatCostCny == null
+    ? (row.charterCostCny == null ? '包机成本未填' : '还没卖出')
+    : '';
+
+  return (
+    <tr className="border-b border-slate-100 last:border-0">
+      <td className="py-2 font-medium text-slate-900">{row.flightNumber}</td>
+      <td className="py-2 text-slate-600">
+        {row.origin} → {row.destination}
+      </td>
+      <td className="py-2 text-slate-600 text-xs">
+        {new Date(row.departureTime).toLocaleString('zh-CN', {
+          year: 'numeric',
+          month: '2-digit',
+          day: '2-digit',
+          hour: '2-digit',
+          minute: '2-digit',
+        })}
+      </td>
+      <td className="py-2 text-right">
+        <input
+          className={inputCls}
+          type="number"
+          step="1"
+          value={charter}
+          onChange={(e) => setCharter(e.target.value)}
+        />
+      </td>
+      <td className="py-2 text-right">
+        <input
+          className={inputCls}
+          type="number"
+          step="0.01"
+          value={taxDep}
+          onChange={(e) => setTaxDep(e.target.value)}
+        />
+      </td>
+      <td className="py-2 text-right">
+        <input
+          className={inputCls}
+          type="number"
+          step="0.01"
+          value={taxArr}
+          onChange={(e) => setTaxArr(e.target.value)}
+        />
+      </td>
+      <td className="py-2 text-right tabular-nums text-slate-600">
+        {row.soldSeats} / {row.totalSeats}
+      </td>
+      <td
+        className="py-2 text-right tabular-nums font-semibold text-blue-700"
+        title={perSeatTooltip}
+      >
+        {fmtCny(row.perSoldSeatCostCny)}
+      </td>
+      <td className="py-2 text-right">
+        <button
+          type="button"
+          onClick={save}
+          disabled={saving}
+          className="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+        >
+          {saving ? '…' : '保存'}
+        </button>
+        {saveErr && <div className="text-xs text-rose-600 mt-0.5">{saveErr}</div>}
+      </td>
+    </tr>
   );
 }
 
@@ -648,6 +837,7 @@ function FlightsTab({ token, range }: { token: string; range: { from: string; to
               <th className="py-2 text-right font-normal">载客率</th>
               <th className="py-2 text-right font-normal">收入</th>
               <th className="py-2 text-right font-normal">包机成本</th>
+              <th className="py-2 text-right font-normal text-blue-700">单座(已售)成本</th>
               <th className="py-2 text-right font-normal">空座沉没</th>
               <th className="py-2 text-right font-normal">净利</th>
             </tr>
@@ -655,7 +845,7 @@ function FlightsTab({ token, range }: { token: string; range: { from: string; to
           <tbody>
             {rows.length === 0 && (
               <tr>
-                <td colSpan={8} className="py-4 text-center text-slate-400">
+                <td colSpan={9} className="py-4 text-center text-slate-400">
                   区间内没有航班
                 </td>
               </tr>
@@ -691,6 +881,9 @@ function FlightsTab({ token, range }: { token: string; range: { from: string; to
                   <td className="py-2 text-right tabular-nums">{fmtCny(f.revenueCny)}</td>
                   <td className="py-2 text-right tabular-nums text-slate-600">
                     {fmtCny(f.charterCostCny)}
+                  </td>
+                  <td className="py-2 text-right tabular-nums font-semibold text-blue-700">
+                    {fmtCny(f.perSoldSeatCostCny)}
                   </td>
                   <td className="py-2 text-right tabular-nums text-rose-600">
                     {f.emptySeatSunkCostCny == null ? '—' : `-${fmtCny(f.emptySeatSunkCostCny)}`}

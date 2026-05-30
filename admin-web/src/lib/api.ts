@@ -1004,6 +1004,20 @@ export const api = {
       airportTaxArrCny: number | null;
     }>,
   ) => apiFetch<{ id: string }>(`/finances/cost/flight-schedule/${id}`, { method: 'PATCH', token, body }),
+
+  // 班次成本明细（admin · 用于"航班成本"维护页；带"单座(已售)成本"动态指标）
+  listFinanceSchedules: (
+    token: string,
+    range?: { from?: string; to?: string },
+  ) => {
+    const qs = new URLSearchParams();
+    if (range?.from) qs.set('from', range.from);
+    if (range?.to) qs.set('to', range.to);
+    return apiFetch<{ schedules: FinanceScheduleRow[] }>(
+      `/finances/cost/schedules${qs.toString() ? '?' + qs.toString() : ''}`,
+      { token },
+    );
+  },
   patchHotelRoomTypeCost: (
     token: string,
     id: string,
@@ -1070,6 +1084,28 @@ export interface FlightPnlRow {
   emptySeatSunkCostCny: number | null;
   netMarginCny: number | null;
   grossOnSoldCny: number | null;
+  /** 单座(已售)成本 = charterCostCny ÷ soldSeats；charter 或 sold 为 0 时 null */
+  perSoldSeatCostCny: number | null;
+}
+
+/**
+ * 班次成本明细行（admin-only · 用于"航班成本"维护页）
+ * 来自 GET /finances/cost/schedules
+ */
+export interface FinanceScheduleRow {
+  scheduleId: string;
+  flightId: string;
+  flightNumber: string;
+  origin: string;
+  destination: string;
+  departureTime: string;
+  charterCostCny: number | null;
+  airportTaxDepCny: number | null;
+  airportTaxArrCny: number | null;
+  totalSeats: number;
+  soldSeats: number;
+  /** 单座(已售)成本 = charterCostCny ÷ soldSeats；charter 或 sold 为 0 时 null */
+  perSoldSeatCostCny: number | null;
 }
 export interface OrderPnlRow {
   orderId: string;

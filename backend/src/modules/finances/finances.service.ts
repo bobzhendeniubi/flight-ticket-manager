@@ -75,6 +75,8 @@ export interface FlightPnlRow {
   netMarginCny: number | null;
   /** 已售部分毛利 = revenue - 已售分摊成本 */
   grossOnSoldCny: number | null;
+  /** 单座(已售)成本 = charterCostCny ÷ soldSeats —— 帮定价的"保本线"，每卖一张就下降；charter 缺失或 0 座售出时 null */
+  perSoldSeatCostCny: number | null;
 }
 
 export interface OrderPnlRow {
@@ -273,6 +275,8 @@ export async function getFlightPnl(
     const emptySunk = perSeat == null ? null : perSeat * (totalSeats - soldSeats);
     const netMargin = charter == null ? null : revenue - charter;
     const grossOnSold = soldAlloc == null ? null : revenue - soldAlloc;
+    // 单座(已售)成本：帮定价用的实时"保本线" —— 跟 perSeat 的会计口径不同
+    const perSoldSeat = charter != null && soldSeats > 0 ? charter / soldSeats : null;
     return {
       scheduleId: s.id,
       flightNumber: s.flight.flightNumber,
@@ -288,6 +292,7 @@ export async function getFlightPnl(
       emptySeatSunkCostCny: emptySunk == null ? null : round2(emptySunk),
       netMarginCny: netMargin == null ? null : round2(netMargin),
       grossOnSoldCny: grossOnSold == null ? null : round2(grossOnSold),
+      perSoldSeatCostCny: perSoldSeat == null ? null : round2(perSoldSeat),
     };
   });
 }
