@@ -8,7 +8,7 @@
  */
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
-import { InvoiceStatus, UserRole } from '@prisma/client';
+import { InvoiceStatus, Prisma, UserRole } from '@prisma/client';
 import { OrderService, type OrderRequester } from './orders.service.js';
 import {
   batchCreateOrdersBodySchema,
@@ -454,6 +454,86 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       after: { invoiceStatus: body.invoiceStatus },
     });
     return result;
+  });
+
+  // ── 预期到账金额（ADMIN/STAFF；锁定后仅 ADMIN）──
+  // PATCH /orders/:id/expected-amount  body: { amountCny: number | null }
+  app.patch('/:id/expected-amount', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅运营/管理员可修改预期到账金额' });
+    }
+    const { id } = req.params as { id: string };
+    const body = z.object({ amountCny: z.number().nullable() }).parse(req.body);
+    const order = await prisma.order.findUnique({
+      where: { id },
+      select: { id: true, orderNumber: true, expectedAmountLocked: true, expectedAmountCny: true },
+    });
+    if (!order) return reply.status(404).send({ error: '订单不存在' });
+    if (order.expectedAmountLocked && role !== UserRole.ADMIN) {
+      return reply.status(403).send({ error: '已锁定，请联系管理员' });
+    }
+    const updated = await prisma.order.update({
+      where: { id },
+      data: {
+        expectedAmountCny: body.amountCny === null ? null : new Prisma.Decimal(body.amountCny),
+      },
+      select: { id: true, expectedAmountCny: true, expectedAmountLocked: true },
+    });
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'SET_EXPECTED_AMOUNT',
+      targetType: 'ORDER',
+      targetId: id,
+      targetLabel: order.orderNumber,
+      before: {
+        expectedAmountCny: order.expectedAmountCny ? Number(order.expectedAmountCny.toString()) : null,
+      },
+      after: { expectedAmountCny: body.amountCny },
+    });
+    return {
+      id: updated.id,
+      expectedAmountCny:
+        updated.expectedAmountCny === null ? null : Number(updated.expectedAmountCny.toString()),
+      expectedAmountLocked: updated.expectedAmountLocked,
+    };
+  });
+
+  // ── 预期到账锁定/解锁（仅 ADMIN）──
+  // POST /orders/:id/expected-amount/lock  body: { locked: boolean }
+  app.post('/:id/expected-amount/lock', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (role !== UserRole.ADMIN) {
+      return reply.status(403).send({ error: '仅管理员可锁定/解锁预期到账' });
+    }
+    const { id } = req.params as { id: string };
+    const body = z.object({ locked: z.boolean() }).parse(req.body);
+    const order = await prisma.order.findUnique({
+      where: { id },
+      select: { id: true, orderNumber: true, expectedAmountLocked: true },
+    });
+    if (!order) return reply.status(404).send({ error: '订单不存在' });
+    const updated = await prisma.order.update({
+      where: { id },
+      data: { expectedAmountLocked: body.locked },
+      select: { id: true, expectedAmountCny: true, expectedAmountLocked: true },
+    });
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: body.locked ? 'LOCK_EXPECTED_AMOUNT' : 'UNLOCK_EXPECTED_AMOUNT',
+      targetType: 'ORDER',
+      targetId: id,
+      targetLabel: order.orderNumber,
+      before: { expectedAmountLocked: order.expectedAmountLocked },
+      after: { expectedAmountLocked: body.locked },
+      severity: 'WARNING',
+    });
+    return {
+      id: updated.id,
+      expectedAmountCny:
+        updated.expectedAmountCny === null ? null : Number(updated.expectedAmountCny.toString()),
+      expectedAmountLocked: updated.expectedAmountLocked,
+    };
   });
 };
 

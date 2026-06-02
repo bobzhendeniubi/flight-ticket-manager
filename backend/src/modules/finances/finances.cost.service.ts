@@ -53,9 +53,17 @@ export interface EffectiveCost {
   charterCostCny: number | null;
   airportTaxDepCny: number | null;
   airportTaxArrCny: number | null;
+  fuelCostCny: number | null;
+  peakSurchargeCny: number | null;
+  aircraftAdjustCny: number | null;
+  takeoffDiscountCny: number | null;
   charterCostCnySource: CostSource;
   airportTaxDepCnySource: CostSource;
   airportTaxArrCnySource: CostSource;
+  fuelCostCnySource: CostSource;
+  peakSurchargeCnySource: CostSource;
+  aircraftAdjustCnySource: CostSource;
+  takeoffDiscountCnySource: CostSource;
 }
 
 interface ScheduleCostInputs {
@@ -64,6 +72,10 @@ interface ScheduleCostInputs {
   charterCostCny: Prisma.Decimal | null;
   airportTaxDepCny: Prisma.Decimal | null;
   airportTaxArrCny: Prisma.Decimal | null;
+  fuelCostCny: Prisma.Decimal | null;
+  peakSurchargeCny: Prisma.Decimal | null;
+  aircraftAdjustCny: Prisma.Decimal | null;
+  takeoffDiscountCny: Prisma.Decimal | null;
 }
 
 interface PeriodInputs {
@@ -72,6 +84,10 @@ interface PeriodInputs {
   charterCostCny: Prisma.Decimal | null;
   airportTaxDepCny: Prisma.Decimal | null;
   airportTaxArrCny: Prisma.Decimal | null;
+  fuelCostCny: Prisma.Decimal | null;
+  peakSurchargeCny: Prisma.Decimal | null;
+  aircraftAdjustCny: Prisma.Decimal | null;
+  takeoffDiscountCny: Prisma.Decimal | null;
 }
 
 /** 在给定航班的周期列表里，找覆盖该班次出发日（按航班出发地时区）的那一条。 */
@@ -105,13 +121,25 @@ export function resolveScheduleCost(
   const c = pick(schedule.charterCostCny, matchedPeriod?.charterCostCny);
   const dep = pick(schedule.airportTaxDepCny, matchedPeriod?.airportTaxDepCny);
   const arr = pick(schedule.airportTaxArrCny, matchedPeriod?.airportTaxArrCny);
+  const fuel = pick(schedule.fuelCostCny, matchedPeriod?.fuelCostCny);
+  const peak = pick(schedule.peakSurchargeCny, matchedPeriod?.peakSurchargeCny);
+  const adj = pick(schedule.aircraftAdjustCny, matchedPeriod?.aircraftAdjustCny);
+  const disc = pick(schedule.takeoffDiscountCny, matchedPeriod?.takeoffDiscountCny);
   return {
     charterCostCny: c.value,
     airportTaxDepCny: dep.value,
     airportTaxArrCny: arr.value,
+    fuelCostCny: fuel.value,
+    peakSurchargeCny: peak.value,
+    aircraftAdjustCny: adj.value,
+    takeoffDiscountCny: disc.value,
     charterCostCnySource: c.source,
     airportTaxDepCnySource: dep.source,
     airportTaxArrCnySource: arr.source,
+    fuelCostCnySource: fuel.source,
+    peakSurchargeCnySource: peak.source,
+    aircraftAdjustCnySource: adj.source,
+    takeoffDiscountCnySource: disc.source,
   };
 }
 
@@ -131,6 +159,10 @@ export async function loadPeriodsByFlightIds(
       charterCostCny: true,
       airportTaxDepCny: true,
       airportTaxArrCny: true,
+      fuelCostCny: true,
+      peakSurchargeCny: true,
+      aircraftAdjustCny: true,
+      takeoffDiscountCny: true,
     },
   });
   const map = new Map<string, PeriodInputs[]>();
@@ -155,6 +187,10 @@ export interface CostPeriodDto {
   charterCostCny: number | null;
   airportTaxDepCny: number | null;
   airportTaxArrCny: number | null;
+  fuelCostCny: number | null;
+  peakSurchargeCny: number | null;
+  aircraftAdjustCny: number | null;
+  takeoffDiscountCny: number | null;
   note: string | null;
   updatedAt: string;
 }
@@ -166,6 +202,10 @@ type PeriodWriteInput = {
   charterCostCny?: number | null;
   airportTaxDepCny?: number | null;
   airportTaxArrCny?: number | null;
+  fuelCostCny?: number | null;
+  peakSurchargeCny?: number | null;
+  aircraftAdjustCny?: number | null;
+  takeoffDiscountCny?: number | null;
   note?: string | null;
 };
 
@@ -182,13 +222,18 @@ function toDto(row: {
   charterCostCny: Prisma.Decimal | null;
   airportTaxDepCny: Prisma.Decimal | null;
   airportTaxArrCny: Prisma.Decimal | null;
+  fuelCostCny: Prisma.Decimal | null;
+  peakSurchargeCny: Prisma.Decimal | null;
+  aircraftAdjustCny: Prisma.Decimal | null;
+  takeoffDiscountCny: Prisma.Decimal | null;
   note: string | null;
   updatedAt: Date;
   flight: { flightNumber: string; originCode: string; destinationCode: string };
 }): CostPeriodDto {
-  const charter = dec(row.charterCostCny);
-  const taxDep = dec(row.airportTaxDepCny);
-  const taxArr = dec(row.airportTaxArrCny);
+  const r2 = (v: Prisma.Decimal | null): number | null => {
+    const d = dec(v);
+    return d == null ? null : round2(d);
+  };
   return {
     id: row.id,
     flightId: row.flightId,
@@ -197,9 +242,13 @@ function toDto(row: {
     destination: row.flight.destinationCode,
     effectiveFrom: fmtDateOnly(row.effectiveFrom),
     effectiveTo: fmtDateOnly(row.effectiveTo),
-    charterCostCny: charter == null ? null : round2(charter),
-    airportTaxDepCny: taxDep == null ? null : round2(taxDep),
-    airportTaxArrCny: taxArr == null ? null : round2(taxArr),
+    charterCostCny: r2(row.charterCostCny),
+    airportTaxDepCny: r2(row.airportTaxDepCny),
+    airportTaxArrCny: r2(row.airportTaxArrCny),
+    fuelCostCny: r2(row.fuelCostCny),
+    peakSurchargeCny: r2(row.peakSurchargeCny),
+    aircraftAdjustCny: r2(row.aircraftAdjustCny),
+    takeoffDiscountCny: r2(row.takeoffDiscountCny),
     note: row.note,
     updatedAt: row.updatedAt.toISOString(),
   };
@@ -263,6 +312,10 @@ export async function createCostPeriod(
       charterCostCny: input.charterCostCny ?? null,
       airportTaxDepCny: input.airportTaxDepCny ?? null,
       airportTaxArrCny: input.airportTaxArrCny ?? null,
+      fuelCostCny: input.fuelCostCny ?? null,
+      peakSurchargeCny: input.peakSurchargeCny ?? null,
+      aircraftAdjustCny: input.aircraftAdjustCny ?? null,
+      takeoffDiscountCny: input.takeoffDiscountCny ?? null,
       note: input.note ?? null,
     },
     include: {
@@ -290,6 +343,10 @@ export async function updateCostPeriod(
   if (input.charterCostCny !== undefined) data.charterCostCny = input.charterCostCny ?? null;
   if (input.airportTaxDepCny !== undefined) data.airportTaxDepCny = input.airportTaxDepCny ?? null;
   if (input.airportTaxArrCny !== undefined) data.airportTaxArrCny = input.airportTaxArrCny ?? null;
+  if (input.fuelCostCny !== undefined) data.fuelCostCny = input.fuelCostCny ?? null;
+  if (input.peakSurchargeCny !== undefined) data.peakSurchargeCny = input.peakSurchargeCny ?? null;
+  if (input.aircraftAdjustCny !== undefined) data.aircraftAdjustCny = input.aircraftAdjustCny ?? null;
+  if (input.takeoffDiscountCny !== undefined) data.takeoffDiscountCny = input.takeoffDiscountCny ?? null;
   if (input.note !== undefined) data.note = input.note ?? null;
   const row = await client.flightCostPeriod.update({
     where: { id },
@@ -322,18 +379,34 @@ export interface FinanceScheduleRow {
   charterCostCny: number | null;
   airportTaxDepCny: number | null;
   airportTaxArrCny: number | null;
+  fuelCostCny: number | null;
+  peakSurchargeCny: number | null;
+  aircraftAdjustCny: number | null;
+  takeoffDiscountCny: number | null;
   // 班次自己存的值（即"覆盖"）—— 给编辑输入框绑定用；null = 不覆盖，用周期
   charterCostCnyOverride: number | null;
   airportTaxDepCnyOverride: number | null;
   airportTaxArrCnyOverride: number | null;
+  fuelCostCnyOverride: number | null;
+  peakSurchargeCnyOverride: number | null;
+  aircraftAdjustCnyOverride: number | null;
+  takeoffDiscountCnyOverride: number | null;
   // 命中周期的默认值 —— 给输入框 placeholder 用
   charterCostCnyPeriod: number | null;
   airportTaxDepCnyPeriod: number | null;
   airportTaxArrCnyPeriod: number | null;
+  fuelCostCnyPeriod: number | null;
+  peakSurchargeCnyPeriod: number | null;
+  aircraftAdjustCnyPeriod: number | null;
+  takeoffDiscountCnyPeriod: number | null;
   // 每字段的来源：override / period / none
   charterCostCnySource: CostSource;
   airportTaxDepCnySource: CostSource;
   airportTaxArrCnySource: CostSource;
+  fuelCostCnySource: CostSource;
+  peakSurchargeCnySource: CostSource;
+  aircraftAdjustCnySource: CostSource;
+  takeoffDiscountCnySource: CostSource;
   // 命中周期的信息（命中时非 null）
   matchedPeriodId: string | null;
   matchedPeriodFrom: string | null; // YYYY-MM-DD
@@ -381,6 +454,10 @@ export async function listSchedulesWithCost(
       charterCostCny: true,
       airportTaxDepCny: true,
       airportTaxArrCny: true,
+      fuelCostCny: true,
+      peakSurchargeCny: true,
+      aircraftAdjustCny: true,
+      takeoffDiscountCny: true,
     },
   });
   const fullByFlight = new Map<string, typeof fullPeriods>();
@@ -405,12 +482,10 @@ export async function listSchedulesWithCost(
               p.effectiveFrom.getTime() === matched.effectiveFrom.getTime() &&
               p.effectiveTo.getTime() === matched.effectiveTo.getTime(),
           ) ?? null;
-    const overrideC = dec(s.charterCostCny);
-    const overrideDep = dec(s.airportTaxDepCny);
-    const overrideArr = dec(s.airportTaxArrCny);
-    const periodC = matched ? dec(matched.charterCostCny) : null;
-    const periodDep = matched ? dec(matched.airportTaxDepCny) : null;
-    const periodArr = matched ? dec(matched.airportTaxArrCny) : null;
+    const r2n = (v: Prisma.Decimal | null | undefined): number | null => {
+      const d = dec(v ?? null);
+      return d == null ? null : round2(d);
+    };
     const perSoldSeat =
       eff.charterCostCny != null && soldSeats > 0 ? eff.charterCostCny / soldSeats : null;
     return {
@@ -420,18 +495,38 @@ export async function listSchedulesWithCost(
       origin: s.flight.originCode,
       destination: s.flight.destinationCode,
       departureTime: s.departureTime.toISOString(),
+      // effective
       charterCostCny: eff.charterCostCny,
       airportTaxDepCny: eff.airportTaxDepCny,
       airportTaxArrCny: eff.airportTaxArrCny,
-      charterCostCnyOverride: overrideC == null ? null : round2(overrideC),
-      airportTaxDepCnyOverride: overrideDep == null ? null : round2(overrideDep),
-      airportTaxArrCnyOverride: overrideArr == null ? null : round2(overrideArr),
-      charterCostCnyPeriod: periodC == null ? null : round2(periodC),
-      airportTaxDepCnyPeriod: periodDep == null ? null : round2(periodDep),
-      airportTaxArrCnyPeriod: periodArr == null ? null : round2(periodArr),
+      fuelCostCny: eff.fuelCostCny,
+      peakSurchargeCny: eff.peakSurchargeCny,
+      aircraftAdjustCny: eff.aircraftAdjustCny,
+      takeoffDiscountCny: eff.takeoffDiscountCny,
+      // override (schedule own)
+      charterCostCnyOverride: r2n(s.charterCostCny),
+      airportTaxDepCnyOverride: r2n(s.airportTaxDepCny),
+      airportTaxArrCnyOverride: r2n(s.airportTaxArrCny),
+      fuelCostCnyOverride: r2n(s.fuelCostCny),
+      peakSurchargeCnyOverride: r2n(s.peakSurchargeCny),
+      aircraftAdjustCnyOverride: r2n(s.aircraftAdjustCny),
+      takeoffDiscountCnyOverride: r2n(s.takeoffDiscountCny),
+      // period default
+      charterCostCnyPeriod: r2n(matched?.charterCostCny),
+      airportTaxDepCnyPeriod: r2n(matched?.airportTaxDepCny),
+      airportTaxArrCnyPeriod: r2n(matched?.airportTaxArrCny),
+      fuelCostCnyPeriod: r2n(matched?.fuelCostCny),
+      peakSurchargeCnyPeriod: r2n(matched?.peakSurchargeCny),
+      aircraftAdjustCnyPeriod: r2n(matched?.aircraftAdjustCny),
+      takeoffDiscountCnyPeriod: r2n(matched?.takeoffDiscountCny),
+      // sources
       charterCostCnySource: eff.charterCostCnySource,
       airportTaxDepCnySource: eff.airportTaxDepCnySource,
       airportTaxArrCnySource: eff.airportTaxArrCnySource,
+      fuelCostCnySource: eff.fuelCostCnySource,
+      peakSurchargeCnySource: eff.peakSurchargeCnySource,
+      aircraftAdjustCnySource: eff.aircraftAdjustCnySource,
+      takeoffDiscountCnySource: eff.takeoffDiscountCnySource,
       matchedPeriodId: matchedFull?.id ?? null,
       matchedPeriodFrom: matched ? fmtDateOnly(matched.effectiveFrom) : null,
       matchedPeriodTo: matched ? fmtDateOnly(matched.effectiveTo) : null,
@@ -450,6 +545,10 @@ export async function patchFlightScheduleCost(
     charterCostCny?: number | null;
     airportTaxDepCny?: number | null;
     airportTaxArrCny?: number | null;
+    fuelCostCny?: number | null;
+    peakSurchargeCny?: number | null;
+    aircraftAdjustCny?: number | null;
+    takeoffDiscountCny?: number | null;
   },
   client: PrismaClient = defaultPrisma,
 ): Promise<{ id: string }> {

@@ -14,6 +14,11 @@ import ExcelJS from 'exceljs';
 import type { Prisma, PrismaClient } from '@prisma/client';
 import { OrderStatus } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
+import {
+  findMatchedPeriod,
+  loadPeriodsByFlightIds,
+  resolveScheduleCost,
+} from './finances.cost.service.js';
 
 const COUNTED_STATUSES: OrderStatus[] = [
   OrderStatus.PENDING_PAYMENT,
@@ -61,6 +66,12 @@ interface FinanceRow {
   recordedAt: string;
   flightCostCny: number; // 机票成本(RMB) — 包机单座分摊
   airportTaxCny: number;
+  peakSurchargeCny: number; // 旺季附加
+  fuelCostCny: number; // 燃油
+  aircraftAdjustCny: number; // 机型调整
+  takeoffDiscountCny: number; // 起降折扣
+  guideServiceCny: number; // 导游服务费（订单 costItems 分摊到人）
+  otherOrderCostCny: number; // 杂项：赠送+手续费+其他汇总
   hotelName: string;
   hotelNights: number;
   hotelCostCny: number;
@@ -98,6 +109,12 @@ const COLUMNS: Array<{ header: string; key: keyof FinanceRow; width: number }> =
   { header: '录入时间', key: 'recordedAt', width: 18 },
   { header: '机票成本(RMB)', key: 'flightCostCny', width: 14 },
   { header: '机场税成本(RMB)', key: 'airportTaxCny', width: 14 },
+  { header: '旺季附加(RMB)', key: 'peakSurchargeCny', width: 12 },
+  { header: '燃油(RMB)', key: 'fuelCostCny', width: 12 },
+  { header: '机型调整(RMB)', key: 'aircraftAdjustCny', width: 12 },
+  { header: '起降折扣(RMB)', key: 'takeoffDiscountCny', width: 12 },
+  { header: '导游服务费(RMB)', key: 'guideServiceCny', width: 14 },
+  { header: '杂项(赠送+手续费+其他)(RMB)', key: 'otherOrderCostCny', width: 18 },
   { header: '入住酒店', key: 'hotelName', width: 18 },
   { header: '入住天数', key: 'hotelNights', width: 8 },
   { header: '房费(RMB)', key: 'hotelCostCny', width: 12 },
@@ -143,6 +160,7 @@ type OrderForExport = Prisma.OrderGetPayload<{
   include: {
     agent: { select: { companyName: true; contactName: true } };
     passengers: true;
+    costItems: { select: { category: true; amountCny: true } };
     items: {
       include: {
         flightSchedule: {
@@ -159,29 +177,59 @@ type OrderForExport = Prisma.OrderGetPayload<{
   };
 }>;
 
+type ScheduleForResolution = NonNullable<OrderForExport['items'][number]['flightSchedule']>;
+type PeriodsMap = Awaited<ReturnType<typeof loadPeriodsByFlightIds>>;
+
 /** 把一张订单展开成 N 行（每位乘客一行）*/
-function orderToRows(order: OrderForExport): FinanceRow[] {
+function orderToRows(order: OrderForExport, periodsMap: PeriodsMap): FinanceRow[] {
   const paxCount = Math.max(1, order.passengers.length);
 
-  // ── 机票：包机单座分摊（charter / 总座位）+ 机场税(CNY)，可能去程+回程多段 ──
+  // ── 机票：包机单座分摊（charter / 总座位）+ 机场税 + 4 新成本字段，可能去程+回程多段 ──
+  // 全部用 cost.service.resolveScheduleCost（override → period → null）取生效值
   let flightCostPerSeat = 0; // 每位乘客占 1 座的包机分摊成本
   let airportTaxCny = 0;
+  let peakSurchargePerPax = 0;
+  let fuelPerPax = 0;
+  let aircraftAdjustPerPax = 0;
+  let takeoffDiscountPerPax = 0;
   const flightNumbers: string[] = [];
   const departDates: Date[] = [];
   for (const it of order.items) {
     if (it.kind === 'FLIGHT' && it.flightSchedule) {
-      const totalSeats = it.flightSchedule.seatClasses.reduce((a, c) => a + c.capacity, 0);
-      const charter = dec(it.flightSchedule.charterCostCny);
+      const sched: ScheduleForResolution = it.flightSchedule;
+      const totalSeats = sched.seatClasses.reduce((a, c) => a + c.capacity, 0);
+      const periodsForFlight = periodsMap.get(sched.flightId) ?? [];
+      const matched = findMatchedPeriod(sched, periodsForFlight);
+      const eff = resolveScheduleCost(sched, matched);
+      const charter = eff.charterCostCny ?? 0;
       if (totalSeats > 0 && charter > 0) {
         flightCostPerSeat += charter / totalSeats;
       }
-      airportTaxCny +=
-        dec(it.flightSchedule.airportTaxDepCny) + dec(it.flightSchedule.airportTaxArrCny);
-      flightNumbers.push(it.flightSchedule.flight.flightNumber);
-      departDates.push(it.flightSchedule.departureTime);
+      airportTaxCny += (eff.airportTaxDepCny ?? 0) + (eff.airportTaxArrCny ?? 0);
+      peakSurchargePerPax += eff.peakSurchargeCny ?? 0;
+      fuelPerPax += eff.fuelCostCny ?? 0;
+      aircraftAdjustPerPax += eff.aircraftAdjustCny ?? 0;
+      takeoffDiscountPerPax += eff.takeoffDiscountCny ?? 0;
+      flightNumbers.push(sched.flight.flightNumber);
+      departDates.push(sched.departureTime);
     }
   }
   departDates.sort((a, b) => a.getTime() - b.getTime());
+
+  // ── 订单杂项成本（OrderCostItem）：按 category 汇总，再 ÷ paxCount 摊到人 ──
+  let guideServiceCnyOrder = 0;
+  let otherOrderCostCnyOrder = 0;
+  for (const ci of order.costItems) {
+    const amt = dec(ci.amountCny);
+    if (ci.category === 'GUIDE_SERVICE') {
+      guideServiceCnyOrder += amt;
+    } else {
+      // COMP_GIFT / HANDLING_FEE / OTHER 全部归到"杂项"
+      otherOrderCostCnyOrder += amt;
+    }
+  }
+  const guideServicePerPax = guideServiceCnyOrder / paxCount;
+  const otherOrderCostPerPax = otherOrderCostCnyOrder / paxCount;
 
   // ── 酒店 ──
   let hotelCostCnyOrder = 0;
@@ -239,14 +287,33 @@ function orderToRows(order: OrderForExport): FinanceRow[] {
   const visaCnyPerPax = visaCostCnyOrder / paxCount;
   const revenuePerPax = totalRevenue / paxCount;
 
-  // 机票成本：每位乘客占 1 座 → flightCostPerSeat；整单 = 单座成本 × 人数
-  const flightCostOrder = (flightCostPerSeat + airportTaxCny) * paxCount;
+  // 机票订单级合计：单座包机 + 机场税(段合计) + 4 项 per-pax 字段 + 订单杂项成本，全部 × paxCount
+  // 注：peak/fuel/adj/disc 已是 per-pax 口径；guide/other 是订单级（再均摊回人）
+  const flightPerPaxTotal =
+    flightCostPerSeat +
+    airportTaxCny +
+    peakSurchargePerPax +
+    fuelPerPax +
+    aircraftAdjustPerPax +
+    takeoffDiscountPerPax;
+  const flightCostOrder =
+    flightPerPaxTotal * paxCount + guideServiceCnyOrder + otherOrderCostCnyOrder;
   const totalCostOrder =
     flightCostOrder + hotelCostCnyOrder + transferCostCnyOrder + visaCostCnyOrder;
 
   const baseRows = order.passengers.map<FinanceRow>((p) => {
     const unitCostTotal =
-      flightCostPerSeat + airportTaxCny + hotelPerPax + transferPerPax + visaCnyPerPax;
+      flightCostPerSeat +
+      airportTaxCny +
+      peakSurchargePerPax +
+      fuelPerPax +
+      aircraftAdjustPerPax +
+      takeoffDiscountPerPax +
+      guideServicePerPax +
+      otherOrderCostPerPax +
+      hotelPerPax +
+      transferPerPax +
+      visaCnyPerPax;
     return {
       agency,
       orderNumber: order.orderNumber,
@@ -263,6 +330,12 @@ function orderToRows(order: OrderForExport): FinanceRow[] {
       recordedAt: fmtDateTime(order.createdAt),
       flightCostCny: round2(flightCostPerSeat),
       airportTaxCny: round2(airportTaxCny),
+      peakSurchargeCny: round2(peakSurchargePerPax),
+      fuelCostCny: round2(fuelPerPax),
+      aircraftAdjustCny: round2(aircraftAdjustPerPax),
+      takeoffDiscountCny: round2(takeoffDiscountPerPax),
+      guideServiceCny: round2(guideServicePerPax),
+      otherOrderCostCny: round2(otherOrderCostPerPax),
       hotelName,
       hotelNights,
       hotelCostCny: round2(hotelPerPax),
@@ -322,6 +395,7 @@ export async function buildFinanceExportWorkbook(
     include: {
       agent: { select: { companyName: true, contactName: true } },
       passengers: true,
+      costItems: { select: { category: true, amountCny: true } },
       items: {
         include: {
           flightSchedule: {
@@ -338,10 +412,22 @@ export async function buildFinanceExportWorkbook(
     },
   })) as OrderForExport[];
 
+  // 批量预加载所有相关航班的周期，避免每张订单 N+1
+  const flightIds = Array.from(
+    new Set(
+      orders.flatMap((o) =>
+        o.items
+          .filter((it) => it.kind === 'FLIGHT' && it.flightSchedule)
+          .map((it) => it.flightSchedule!.flightId),
+      ),
+    ),
+  );
+  const periodsMap = await loadPeriodsByFlightIds(flightIds, client);
+
   const rows: FinanceRow[] = [];
   for (const o of orders) {
     if (o.passengers.length === 0) continue;
-    rows.push(...orderToRows(o));
+    rows.push(...orderToRows(o, periodsMap));
   }
 
   const wb = new ExcelJS.Workbook();

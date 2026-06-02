@@ -23,6 +23,8 @@ import {
   type Visa,
   type Transfer,
   type FinanceScheduleRow,
+  type CostPeriodDto,
+  type CostPeriodWriteInput,
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { NumberInput } from '../components/NumberInput';
@@ -206,6 +208,7 @@ export function FinancesPage() {
             </button>
           </div>
           <ExportButton token={token} range={range} />
+          <ExportByFlightButton token={token} range={range} />
         </div>
       </header>
 
@@ -277,18 +280,555 @@ function ExportButton({ token, range }: { token: string; range: { from: string; 
   );
 }
 
+// ── Export by flight button ────────────────────────────────────────────────
+function ExportByFlightButton({ token, range }: { token: string; range: { from: string; to: string } }) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function onClick(): Promise<void> {
+    if (!token || busy) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      const blob = await api.downloadFinanceExportByFlight(token, range);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `按航班_${range.from}_${range.to}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e: unknown) {
+      setErr(e instanceof ApiError ? e.message : '导出失败');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="flex flex-col items-end gap-1">
+      <button
+        type="button"
+        onClick={onClick}
+        disabled={busy}
+        className="rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-700 disabled:opacity-50"
+      >
+        {busy ? '导出中…' : '⬇ 导出 xlsx（按航班）'}
+      </button>
+      {err && <span className="text-xs text-rose-600">{err}</span>}
+    </div>
+  );
+}
+
 // ── Costs maintenance tab ────────────────────────────────────────────────────
 function CostsTab({ token }: { token: string }) {
   return (
     <section className="space-y-5">
+      <FlightCostPeriodsEditor token={token} />
+
       <FlightScheduleCostEditors token={token} />
 
       <ProductCostEditors token={token} />
 
       <p className="text-xs text-slate-400">
-        说明：成本统一人民币。航班按班次维护「包机成本 / 机场税」，系统实时算出"单座(已售)成本"供定价参考。
+        说明：成本统一人民币。航班按班次维护「包机/机场税/燃油/旺季附加/机型调整/起降折扣」，系统实时算出"单座(已售)成本"供定价参考。班次留空则回退到所匹配「周期」的默认值。
       </p>
     </section>
+  );
+}
+
+// ── 航班成本周期 ─────────────────────────────────────────────────────────────
+function FlightCostPeriodsEditor({ token }: { token: string }) {
+  const [periods, setPeriods] = useState<CostPeriodDto[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState<string | null>(null);
+  const [flightOptions, setFlightOptions] = useState<{ id: string; label: string }[]>([]);
+  const [showNew, setShowNew] = useState(false);
+
+  const load = useCallback(() => {
+    if (!token) return () => {};
+    let cancelled = false;
+    setLoading(true);
+    setErr(null);
+    api
+      .listCostPeriods(token)
+      .then((d) => {
+        if (cancelled) return;
+        const sorted = [...d.periods].sort((a, b) => {
+          if (a.flightNumber !== b.flightNumber) return a.flightNumber.localeCompare(b.flightNumber);
+          return a.effectiveFrom.localeCompare(b.effectiveFrom);
+        });
+        setPeriods(sorted);
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) setErr(e instanceof ApiError ? e.message : '周期列表加载失败');
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [token]);
+
+  // 拉航班下拉：用 listFinanceSchedules 提取唯一 flightId/flightNumber
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    api
+      .listFinanceSchedules(token)
+      .then((d) => {
+        if (cancelled) return;
+        const map = new Map<string, string>();
+        for (const r of d.schedules) {
+          if (!map.has(r.flightId)) {
+            map.set(r.flightId, `${r.flightNumber} · ${r.origin}→${r.destination}`);
+          }
+        }
+        const opts = Array.from(map.entries())
+          .map(([id, label]) => ({ id, label }))
+          .sort((a, b) => a.label.localeCompare(b.label));
+        setFlightOptions(opts);
+      })
+      .catch(() => {
+        // 静默：下拉空时表单按钮会禁用
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [token]);
+
+  useEffect(() => load(), [load]);
+
+  async function onDelete(id: string): Promise<void> {
+    if (!confirm('确认删除该周期？删除后该航班该日期段会回退到「无默认」。')) return;
+    try {
+      await api.deleteCostPeriod(token, id);
+      load();
+    } catch (e: unknown) {
+      alert(e instanceof ApiError ? e.message : '删除失败');
+    }
+  }
+
+  return (
+    <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div>
+          <h2 className="text-sm font-medium text-slate-700">
+            航班成本周期（按 航班 × 日期段 定包机/机场税/4 个新成本字段；班次可单独覆盖）
+          </h2>
+          <p className="mt-1 text-xs text-slate-500">
+            为某一航班在某段日期定一组默认成本。班次有自己的「覆盖」值就用覆盖，否则回退到所匹配周期。
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={() => setShowNew((v) => !v)}
+          className="rounded-md bg-slate-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-slate-700"
+        >
+          {showNew ? '× 取消' : '+ 新增周期'}
+        </button>
+      </div>
+
+      {showNew && (
+        <CostPeriodNewForm
+          token={token}
+          flightOptions={flightOptions}
+          onSaved={() => {
+            setShowNew(false);
+            load();
+          }}
+          onCancel={() => setShowNew(false)}
+        />
+      )}
+
+      {loading ? (
+        <div className="mt-3 text-sm text-slate-500">加载周期…</div>
+      ) : err ? (
+        <div className="mt-3 text-sm text-rose-600">{err}</div>
+      ) : (
+        <div className="mt-3 overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead className="text-xs text-slate-500">
+              <tr className="border-b border-slate-200">
+                <th className="py-2 text-left font-normal">航班号</th>
+                <th className="py-2 text-left font-normal">路线</th>
+                <th className="py-2 text-left font-normal">起始</th>
+                <th className="py-2 text-left font-normal">结束</th>
+                <th className="py-2 text-right font-normal">包机</th>
+                <th className="py-2 text-right font-normal">机场税去</th>
+                <th className="py-2 text-right font-normal">机场税回</th>
+                <th className="py-2 text-right font-normal">燃油</th>
+                <th className="py-2 text-right font-normal">旺季附加</th>
+                <th className="py-2 text-right font-normal">机型调整</th>
+                <th className="py-2 text-right font-normal">起降折扣</th>
+                <th className="py-2 text-left font-normal">备注</th>
+                <th className="py-2 text-right font-normal"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {periods.length === 0 && (
+                <tr>
+                  <td colSpan={13} className="py-4 text-center text-slate-400">
+                    暂无周期 · 点击右上「+ 新增周期」开始
+                  </td>
+                </tr>
+              )}
+              {periods.map((p) => (
+                <CostPeriodRow
+                  key={p.id}
+                  period={p}
+                  token={token}
+                  onSaved={load}
+                  onDelete={() => onDelete(p.id)}
+                />
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CostPeriodNewForm({
+  token,
+  flightOptions,
+  onSaved,
+  onCancel,
+}: {
+  token: string;
+  flightOptions: { id: string; label: string }[];
+  onSaved: () => void;
+  onCancel: () => void;
+}) {
+  const [flightId, setFlightId] = useState<string>(flightOptions[0]?.id ?? '');
+  const [from, setFrom] = useState<string>(todayStr());
+  const [to, setTo] = useState<string>(todayStr());
+  const [charter, setCharter] = useState<number | null>(null);
+  const [taxDep, setTaxDep] = useState<number | null>(null);
+  const [taxArr, setTaxArr] = useState<number | null>(null);
+  const [fuel, setFuel] = useState<number | null>(null);
+  const [peak, setPeak] = useState<number | null>(null);
+  const [aircraft, setAircraft] = useState<number | null>(null);
+  const [takeoff, setTakeoff] = useState<number | null>(null);
+  const [note, setNote] = useState<string>('');
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  // 默认下拉同步
+  useEffect(() => {
+    if (!flightId && flightOptions.length > 0) {
+      setFlightId(flightOptions[0]!.id);
+    }
+  }, [flightOptions, flightId]);
+
+  async function submit(): Promise<void> {
+    if (!flightId) {
+      setErr('请选择航班');
+      return;
+    }
+    setSaving(true);
+    setErr(null);
+    try {
+      const body: CostPeriodWriteInput = {
+        flightId,
+        effectiveFrom: from,
+        effectiveTo: to,
+        charterCostCny: charter,
+        airportTaxDepCny: taxDep,
+        airportTaxArrCny: taxArr,
+        fuelCostCny: fuel,
+        peakSurchargeCny: peak,
+        aircraftAdjustCny: aircraft,
+        takeoffDiscountCny: takeoff,
+        note: note.trim() === '' ? null : note.trim(),
+      };
+      await api.createCostPeriod(token, body);
+      onSaved();
+    } catch (e: unknown) {
+      setErr(e instanceof ApiError ? e.message : '创建失败');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const inputCls = 'rounded border border-slate-300 px-2 py-1 text-sm';
+  const numCls = 'w-24 rounded border border-slate-300 px-1.5 py-0.5 text-right text-xs tabular-nums';
+
+  return (
+    <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3">
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-4">
+        <label className="text-xs text-slate-600">
+          航班
+          <select
+            value={flightId}
+            onChange={(e) => setFlightId(e.target.value)}
+            className={`mt-1 block w-full ${inputCls}`}
+          >
+            {flightOptions.length === 0 && <option value="">（无可用航班）</option>}
+            {flightOptions.map((o) => (
+              <option key={o.id} value={o.id}>
+                {o.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="text-xs text-slate-600">
+          起始日
+          <input
+            type="date"
+            value={from}
+            onChange={(e) => setFrom(e.target.value)}
+            className={`mt-1 block w-full ${inputCls}`}
+          />
+        </label>
+        <label className="text-xs text-slate-600">
+          结束日
+          <input
+            type="date"
+            value={to}
+            onChange={(e) => setTo(e.target.value)}
+            className={`mt-1 block w-full ${inputCls}`}
+          />
+        </label>
+        <label className="text-xs text-slate-600">
+          备注
+          <input
+            type="text"
+            value={note}
+            onChange={(e) => setNote(e.target.value)}
+            placeholder="可空"
+            className={`mt-1 block w-full ${inputCls}`}
+          />
+        </label>
+      </div>
+      <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-7">
+        <label className="text-xs text-slate-600">
+          包机(¥)
+          <NumberInput
+            className={`mt-1 block w-full ${numCls}`}
+            step={1}
+            value={charter}
+            onChange={setCharter}
+          />
+        </label>
+        <label className="text-xs text-slate-600">
+          机场税去
+          <NumberInput
+            className={`mt-1 block w-full ${numCls}`}
+            step={0.01}
+            value={taxDep}
+            onChange={setTaxDep}
+          />
+        </label>
+        <label className="text-xs text-slate-600">
+          机场税回
+          <NumberInput
+            className={`mt-1 block w-full ${numCls}`}
+            step={0.01}
+            value={taxArr}
+            onChange={setTaxArr}
+          />
+        </label>
+        <label className="text-xs text-slate-600">
+          燃油
+          <NumberInput
+            className={`mt-1 block w-full ${numCls}`}
+            step={0.01}
+            value={fuel}
+            onChange={setFuel}
+          />
+        </label>
+        <label className="text-xs text-slate-600">
+          旺季附加
+          <NumberInput
+            className={`mt-1 block w-full ${numCls}`}
+            step={0.01}
+            value={peak}
+            onChange={setPeak}
+          />
+        </label>
+        <label className="text-xs text-slate-600">
+          机型调整
+          <NumberInput
+            className={`mt-1 block w-full ${numCls}`}
+            step={0.01}
+            allowNegative
+            value={aircraft}
+            onChange={setAircraft}
+          />
+        </label>
+        <label className="text-xs text-slate-600">
+          起降折扣
+          <NumberInput
+            className={`mt-1 block w-full ${numCls}`}
+            step={0.01}
+            allowNegative
+            value={takeoff}
+            onChange={setTakeoff}
+          />
+        </label>
+      </div>
+      <div className="mt-3 flex items-center gap-2">
+        <button
+          type="button"
+          onClick={submit}
+          disabled={saving || !flightId}
+          className="rounded-md bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+        >
+          {saving ? '保存中…' : '保存'}
+        </button>
+        <button
+          type="button"
+          onClick={onCancel}
+          className="rounded-md border border-slate-300 px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-100"
+        >
+          取消
+        </button>
+        {err && <span className="text-xs text-rose-600">{err}</span>}
+      </div>
+    </div>
+  );
+}
+
+function CostPeriodRow({
+  period,
+  token,
+  onSaved,
+  onDelete,
+}: {
+  period: CostPeriodDto;
+  token: string;
+  onSaved: () => void;
+  onDelete: () => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [from, setFrom] = useState<string>(period.effectiveFrom);
+  const [to, setTo] = useState<string>(period.effectiveTo);
+  const [charter, setCharter] = useState<number | null>(period.charterCostCny);
+  const [taxDep, setTaxDep] = useState<number | null>(period.airportTaxDepCny);
+  const [taxArr, setTaxArr] = useState<number | null>(period.airportTaxArrCny);
+  const [fuel, setFuel] = useState<number | null>(period.fuelCostCny);
+  const [peak, setPeak] = useState<number | null>(period.peakSurchargeCny);
+  const [aircraft, setAircraft] = useState<number | null>(period.aircraftAdjustCny);
+  const [takeoff, setTakeoff] = useState<number | null>(period.takeoffDiscountCny);
+  const [note, setNote] = useState<string>(period.note ?? '');
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  function reset(): void {
+    setFrom(period.effectiveFrom);
+    setTo(period.effectiveTo);
+    setCharter(period.charterCostCny);
+    setTaxDep(period.airportTaxDepCny);
+    setTaxArr(period.airportTaxArrCny);
+    setFuel(period.fuelCostCny);
+    setPeak(period.peakSurchargeCny);
+    setAircraft(period.aircraftAdjustCny);
+    setTakeoff(period.takeoffDiscountCny);
+    setNote(period.note ?? '');
+    setErr(null);
+  }
+
+  async function save(): Promise<void> {
+    setSaving(true);
+    setErr(null);
+    try {
+      await api.updateCostPeriod(token, period.id, {
+        effectiveFrom: from,
+        effectiveTo: to,
+        charterCostCny: charter,
+        airportTaxDepCny: taxDep,
+        airportTaxArrCny: taxArr,
+        fuelCostCny: fuel,
+        peakSurchargeCny: peak,
+        aircraftAdjustCny: aircraft,
+        takeoffDiscountCny: takeoff,
+        note: note.trim() === '' ? null : note.trim(),
+      });
+      setEditing(false);
+      onSaved();
+    } catch (e: unknown) {
+      setErr(e instanceof ApiError ? e.message : '保存失败');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const numCls = 'w-20 rounded border border-slate-300 px-1.5 py-0.5 text-right text-xs tabular-nums';
+  const dateCls = 'w-32 rounded border border-slate-300 px-1.5 py-0.5 text-xs';
+  const textCls = 'w-32 rounded border border-slate-300 px-1.5 py-0.5 text-xs';
+
+  if (!editing) {
+    return (
+      <tr className="border-b border-slate-100 last:border-0">
+        <td className="py-2 font-medium text-slate-900">{period.flightNumber}</td>
+        <td className="py-2 text-slate-600">{period.origin} → {period.destination}</td>
+        <td className="py-2 text-slate-600">{period.effectiveFrom}</td>
+        <td className="py-2 text-slate-600">{period.effectiveTo}</td>
+        <td className="py-2 text-right tabular-nums">{fmtCny(period.charterCostCny)}</td>
+        <td className="py-2 text-right tabular-nums">{fmtCny(period.airportTaxDepCny)}</td>
+        <td className="py-2 text-right tabular-nums">{fmtCny(period.airportTaxArrCny)}</td>
+        <td className="py-2 text-right tabular-nums">{fmtCny(period.fuelCostCny)}</td>
+        <td className="py-2 text-right tabular-nums">{fmtCny(period.peakSurchargeCny)}</td>
+        <td className="py-2 text-right tabular-nums">{fmtCny(period.aircraftAdjustCny)}</td>
+        <td className="py-2 text-right tabular-nums">{fmtCny(period.takeoffDiscountCny)}</td>
+        <td className="py-2 text-xs text-slate-500">{period.note ?? '—'}</td>
+        <td className="py-2 text-right">
+          <button
+            type="button"
+            onClick={() => setEditing(true)}
+            className="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-50"
+          >
+            改
+          </button>{' '}
+          <button
+            type="button"
+            onClick={onDelete}
+            className="rounded-md border border-rose-300 px-2 py-1 text-xs text-rose-600 hover:bg-rose-50"
+          >
+            删
+          </button>
+        </td>
+      </tr>
+    );
+  }
+
+  return (
+    <tr className="border-b border-slate-100 last:border-0 bg-amber-50/40">
+      <td className="py-2 font-medium text-slate-900">{period.flightNumber}</td>
+      <td className="py-2 text-slate-600">{period.origin} → {period.destination}</td>
+      <td className="py-2"><input type="date" value={from} onChange={(e) => setFrom(e.target.value)} className={dateCls} /></td>
+      <td className="py-2"><input type="date" value={to} onChange={(e) => setTo(e.target.value)} className={dateCls} /></td>
+      <td className="py-2 text-right"><NumberInput className={numCls} step={1} value={charter} onChange={setCharter} /></td>
+      <td className="py-2 text-right"><NumberInput className={numCls} step={0.01} value={taxDep} onChange={setTaxDep} /></td>
+      <td className="py-2 text-right"><NumberInput className={numCls} step={0.01} value={taxArr} onChange={setTaxArr} /></td>
+      <td className="py-2 text-right"><NumberInput className={numCls} step={0.01} value={fuel} onChange={setFuel} /></td>
+      <td className="py-2 text-right"><NumberInput className={numCls} step={0.01} value={peak} onChange={setPeak} /></td>
+      <td className="py-2 text-right"><NumberInput className={numCls} step={0.01} allowNegative value={aircraft} onChange={setAircraft} /></td>
+      <td className="py-2 text-right"><NumberInput className={numCls} step={0.01} allowNegative value={takeoff} onChange={setTakeoff} /></td>
+      <td className="py-2"><input type="text" value={note} onChange={(e) => setNote(e.target.value)} className={textCls} placeholder="备注" /></td>
+      <td className="py-2 text-right">
+        <button
+          type="button"
+          onClick={save}
+          disabled={saving}
+          className="rounded-md bg-emerald-600 px-2 py-1 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+        >
+          {saving ? '…' : '保存'}
+        </button>{' '}
+        <button
+          type="button"
+          onClick={() => { reset(); setEditing(false); }}
+          className="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-50"
+        >
+          取消
+        </button>
+        {err && <div className="text-xs text-rose-600 mt-0.5">{err}</div>}
+      </td>
+    </tr>
   );
 }
 
@@ -325,7 +865,7 @@ function FlightScheduleCostEditors({ token }: { token: string }) {
     <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
       <h2 className="text-sm font-medium text-slate-700">航班成本（按班次）</h2>
       <p className="mt-1 text-xs text-slate-500">
-        编辑包机总成本和机场税。系统会算出"单座(已售)成本 = 包机÷已售"——帮你定价时看保本线。
+        编辑包机/机场税/燃油/旺季附加/机型调整/起降折扣。空白时显示周期默认值（灰字 placeholder）。系统会算出"单座(已售)成本 = 包机÷已售"——帮你定价时看保本线。
       </p>
 
       {loading ? (
@@ -340,9 +880,13 @@ function FlightScheduleCostEditors({ token }: { token: string }) {
                 <th className="py-2 text-left font-normal">航班号</th>
                 <th className="py-2 text-left font-normal">路线</th>
                 <th className="py-2 text-left font-normal">出发日期</th>
-                <th className="py-2 text-right font-normal">包机成本(¥)</th>
+                <th className="py-2 text-right font-normal">包机(¥)</th>
                 <th className="py-2 text-right font-normal">机场税去(¥)</th>
                 <th className="py-2 text-right font-normal">机场税回(¥)</th>
+                <th className="py-2 text-right font-normal">燃油(¥)</th>
+                <th className="py-2 text-right font-normal">旺季附加(¥)</th>
+                <th className="py-2 text-right font-normal">机型调整(¥)</th>
+                <th className="py-2 text-right font-normal">起降折扣(¥)</th>
                 <th className="py-2 text-right font-normal">已售/总座</th>
                 <th className="py-2 text-right font-normal text-blue-700">单座(已售)成本(¥)</th>
                 <th className="py-2 text-right font-normal"></th>
@@ -351,7 +895,7 @@ function FlightScheduleCostEditors({ token }: { token: string }) {
             <tbody>
               {rows.length === 0 && (
                 <tr>
-                  <td colSpan={9} className="py-4 text-center text-slate-400">
+                  <td colSpan={13} className="py-4 text-center text-slate-400">
                     暂无班次
                   </td>
                 </tr>
@@ -381,13 +925,17 @@ function FlightScheduleCostRow({
   token: string;
   onSaved: () => void;
 }) {
-  const [charter, setCharter] = useState<number | null>(row.charterCostCny);
-  const [taxDep, setTaxDep] = useState<number | null>(row.airportTaxDepCny);
-  const [taxArr, setTaxArr] = useState<number | null>(row.airportTaxArrCny);
+  const [charter, setCharter] = useState<number | null>(row.charterCostCnyOverride);
+  const [taxDep, setTaxDep] = useState<number | null>(row.airportTaxDepCnyOverride);
+  const [taxArr, setTaxArr] = useState<number | null>(row.airportTaxArrCnyOverride);
+  const [fuel, setFuel] = useState<number | null>(row.fuelCostCnyOverride);
+  const [peak, setPeak] = useState<number | null>(row.peakSurchargeCnyOverride);
+  const [aircraft, setAircraft] = useState<number | null>(row.aircraftAdjustCnyOverride);
+  const [takeoff, setTakeoff] = useState<number | null>(row.takeoffDiscountCnyOverride);
   const [saving, setSaving] = useState(false);
   const [saveErr, setSaveErr] = useState<string | null>(null);
 
-  const inputCls = 'w-24 rounded border border-slate-300 px-1.5 py-0.5 text-right text-xs tabular-nums';
+  const inputCls = 'w-20 rounded border border-slate-300 px-1.5 py-0.5 text-right text-xs tabular-nums';
 
   async function save(): Promise<void> {
     if (!token) return;
@@ -398,6 +946,10 @@ function FlightScheduleCostRow({
         charterCostCny: charter,
         airportTaxDepCny: taxDep,
         airportTaxArrCny: taxArr,
+        fuelCostCny: fuel,
+        peakSurchargeCny: peak,
+        aircraftAdjustCny: aircraft,
+        takeoffDiscountCny: takeoff,
       });
       onSaved();
     } catch (e: unknown) {
@@ -410,6 +962,8 @@ function FlightScheduleCostRow({
   const perSeatTooltip = row.perSoldSeatCostCny == null
     ? (row.charterCostCny == null ? '包机成本未填' : '还没卖出')
     : '';
+
+  const ph = (period: number | null): string => (period == null ? '' : String(period));
 
   return (
     <tr className="border-b border-slate-100 last:border-0">
@@ -431,6 +985,7 @@ function FlightScheduleCostRow({
           className={inputCls}
           step={1}
           value={charter}
+          placeholder={ph(row.charterCostCnyPeriod)}
           onChange={(n) => setCharter(n)}
         />
       </td>
@@ -439,6 +994,7 @@ function FlightScheduleCostRow({
           className={inputCls}
           step={0.01}
           value={taxDep}
+          placeholder={ph(row.airportTaxDepCnyPeriod)}
           onChange={(n) => setTaxDep(n)}
         />
       </td>
@@ -447,7 +1003,46 @@ function FlightScheduleCostRow({
           className={inputCls}
           step={0.01}
           value={taxArr}
+          placeholder={ph(row.airportTaxArrCnyPeriod)}
           onChange={(n) => setTaxArr(n)}
+        />
+      </td>
+      <td className="py-2 text-right">
+        <NumberInput
+          className={inputCls}
+          step={0.01}
+          value={fuel}
+          placeholder={ph(row.fuelCostCnyPeriod)}
+          onChange={(n) => setFuel(n)}
+        />
+      </td>
+      <td className="py-2 text-right">
+        <NumberInput
+          className={inputCls}
+          step={0.01}
+          value={peak}
+          placeholder={ph(row.peakSurchargeCnyPeriod)}
+          onChange={(n) => setPeak(n)}
+        />
+      </td>
+      <td className="py-2 text-right">
+        <NumberInput
+          className={inputCls}
+          step={0.01}
+          allowNegative
+          value={aircraft}
+          placeholder={ph(row.aircraftAdjustCnyPeriod)}
+          onChange={(n) => setAircraft(n)}
+        />
+      </td>
+      <td className="py-2 text-right">
+        <NumberInput
+          className={inputCls}
+          step={0.01}
+          allowNegative
+          value={takeoff}
+          placeholder={ph(row.takeoffDiscountCnyPeriod)}
+          onChange={(n) => setTakeoff(n)}
         />
       </td>
       <td className="py-2 text-right tabular-nums text-slate-600">
@@ -736,8 +1331,15 @@ function SummaryTab({ token, range }: { token: string; range: { from: string; to
         />
       </div>
 
-      <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-        <h2 className="text-sm font-medium text-slate-700">按品类拆分</h2>
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+        <RevenueBreakdownTable data={data} />
+        <CostBreakdownTable data={data} />
+      </div>
+
+      <details className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+        <summary className="cursor-pointer text-sm font-medium text-slate-700">
+          原始视图（按品类 kind 简表）
+        </summary>
         <table className="mt-3 w-full text-sm">
           <thead className="text-xs text-slate-500">
             <tr className="border-b border-slate-200">
@@ -776,13 +1378,127 @@ function SummaryTab({ token, range }: { token: string; range: { from: string; to
             })}
           </tbody>
         </table>
-      </div>
+      </details>
 
       <p className="text-xs text-slate-400">
         说明：收入按 OrderItem.amount 汇总（不含税费/折扣）；成本按 OrderItem.totalCostCny。
         空座沉没成本 = (整包机座位数 − 已售) × 单座分摊成本，仅对填了 charterCostCny 的航班计算。
       </p>
     </section>
+  );
+}
+
+// ── Summary · 收入细分（贺帅口径 10 项）─────────────────────────────────────
+const REVENUE_ITEMS: { key: keyof Omit<FinanceSummary['revenueBreakdown'], 'uncategorized' | 'total'>; label: string }[] = [
+  { key: 'outboundFlight', label: '去程机票收入' },
+  { key: 'returnFlight', label: '返程机票收入' },
+  { key: 'outboundTax', label: '去程机场税(过手)' },
+  { key: 'returnTax', label: '返程机场税(过手)' },
+  { key: 'hotel', label: '房收入' },
+  { key: 'visa', label: '签证收入' },
+  { key: 'transfer', label: '车收入' },
+  { key: 'guide', label: '导游收入' },
+  { key: 'upgradeChange', label: '升舱+改期收入' },
+  { key: 'oversale', label: '超售收入' },
+];
+
+function RevenueBreakdownTable({ data }: { data: FinanceSummary }) {
+  const rb = data.revenueBreakdown;
+  const denom = rb.total || data.revenueCny || 0;
+  const pct = (n: number): number | null => (denom > 0 ? n / denom : null);
+  return (
+    <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+      <h2 className="text-sm font-medium text-slate-700">收入细分（按贺帅口径）</h2>
+      <div className="mt-3 overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead className="text-xs text-slate-500">
+            <tr className="border-b border-slate-200">
+              <th className="py-2 text-left font-normal">项目</th>
+              <th className="py-2 text-right font-normal">金额</th>
+              <th className="py-2 text-right font-normal">占比</th>
+            </tr>
+          </thead>
+          <tbody>
+            {REVENUE_ITEMS.map((it) => (
+              <tr key={it.key} className="border-b border-slate-100">
+                <td className="py-1.5 text-slate-900">{it.label}</td>
+                <td className="py-1.5 text-right tabular-nums">{fmtCny(rb[it.key])}</td>
+                <td className="py-1.5 text-right tabular-nums text-slate-500">{fmtPct(pct(rb[it.key]))}</td>
+              </tr>
+            ))}
+            <tr className="border-b border-slate-100 text-slate-500">
+              <td className="py-1.5 italic">其他/未分类</td>
+              <td className="py-1.5 text-right tabular-nums">{fmtCny(rb.uncategorized)}</td>
+              <td className="py-1.5 text-right tabular-nums">{fmtPct(pct(rb.uncategorized))}</td>
+            </tr>
+            <tr className="border-t-2 border-slate-300 font-semibold text-slate-900">
+              <td className="py-2">合计</td>
+              <td className="py-2 text-right tabular-nums">{fmtCny(rb.total)}</td>
+              <td className="py-2 text-right tabular-nums">100.0%</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ── Summary · 成本细分（贺帅口径 15 项）─────────────────────────────────────
+const COST_ITEMS: { key: keyof Omit<FinanceSummary['costBreakdown'], 'total'>; label: string }[] = [
+  { key: 'outboundCharter', label: '去程包机分摊' },
+  { key: 'returnCharter', label: '返程包机分摊' },
+  { key: 'outboundTax', label: '去程机场税' },
+  { key: 'returnTax', label: '返程机场税' },
+  { key: 'peakSurcharge', label: '旺季附加' },
+  { key: 'fuel', label: '燃油' },
+  { key: 'aircraftAdjust', label: '机型调整' },
+  { key: 'takeoffDiscount', label: '起降折扣' },
+  { key: 'hotel', label: '房费' },
+  { key: 'visa', label: '签证费' },
+  { key: 'transfer', label: '车费' },
+  { key: 'guideService', label: '导游服务费' },
+  { key: 'compGift', label: '赠送费用' },
+  { key: 'handlingFee', label: '手续费' },
+  { key: 'other', label: '其他' },
+];
+
+function CostBreakdownTable({ data }: { data: FinanceSummary }) {
+  const cb = data.costBreakdown;
+  const denom = cb.total || data.costCny || 0;
+  const pct = (n: number): number | null => (denom > 0 ? n / denom : null);
+  return (
+    <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+      <h2 className="text-sm font-medium text-slate-700">成本细分（按贺帅口径）</h2>
+      <div className="mt-3 overflow-x-auto">
+        <table className="w-full text-sm">
+          <thead className="text-xs text-slate-500">
+            <tr className="border-b border-slate-200">
+              <th className="py-2 text-left font-normal">项目</th>
+              <th className="py-2 text-right font-normal">金额</th>
+              <th className="py-2 text-right font-normal">占比</th>
+            </tr>
+          </thead>
+          <tbody>
+            {COST_ITEMS.map((it) => {
+              const v = cb[it.key];
+              const tone = v < 0 ? 'text-emerald-700' : '';
+              return (
+                <tr key={it.key} className="border-b border-slate-100">
+                  <td className="py-1.5 text-slate-900">{it.label}</td>
+                  <td className={`py-1.5 text-right tabular-nums ${tone}`}>{fmtCny(v)}</td>
+                  <td className="py-1.5 text-right tabular-nums text-slate-500">{fmtPct(pct(v))}</td>
+                </tr>
+              );
+            })}
+            <tr className="border-t-2 border-slate-300 font-semibold text-slate-900">
+              <td className="py-2">合计</td>
+              <td className="py-2 text-right tabular-nums">{fmtCny(cb.total)}</td>
+              <td className="py-2 text-right tabular-nums">100.0%</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
   );
 }
 

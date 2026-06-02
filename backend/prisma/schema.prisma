@@ -385,6 +385,11 @@ model FlightSchedule {
   // 机场税（CNY/人）— 出发地 / 目的地分开（岘港、澳门税率不同）
   airportTaxDepCny Decimal? @db.Decimal(10, 2)
   airportTaxArrCny Decimal? @db.Decimal(10, 2)
+  // 财务追加成本（CNY/人；起降折扣可填负数代表减项）—— 都是 per-passenger
+  fuelCostCny        Decimal? @db.Decimal(10, 2)
+  peakSurchargeCny   Decimal? @db.Decimal(10, 2)
+  aircraftAdjustCny  Decimal? @db.Decimal(10, 2)
+  takeoffDiscountCny Decimal? @db.Decimal(10, 2)
   isActive         Boolean  @default(true)
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt
@@ -427,6 +432,11 @@ model FlightCostPeriod {
   charterCostCny   Decimal? @db.Decimal(12, 2)
   airportTaxDepCny Decimal? @db.Decimal(10, 2)
   airportTaxArrCny Decimal? @db.Decimal(10, 2)
+  // 财务追加成本（per-pax CNY；同 FlightSchedule）
+  fuelCostCny        Decimal? @db.Decimal(10, 2)
+  peakSurchargeCny   Decimal? @db.Decimal(10, 2)
+  aircraftAdjustCny  Decimal? @db.Decimal(10, 2)
+  takeoffDiscountCny Decimal? @db.Decimal(10, 2)
   note             String?
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt
@@ -603,6 +613,9 @@ enum OrderItemKind {
   INSURANCE
   FEE // airport construction / fuel surcharge
   DISCOUNT
+  GUIDE          // 导游服务费收入（贺帅细分）
+  UPGRADE_CHANGE // 升舱 / 改期收入
+  OVERSALE       // 超售收入
 }
 
 enum InvoiceStatus {
@@ -638,6 +651,9 @@ model Order {
   claimedAt        DateTime?
   // 套票拼房分配 — { roomGroups: [{ id, hotelName, roomType, passengerIds: [], notes }] }
   roomAssignment   Json?
+  // 出纳：预期到账总额（CNY）+ 锁定标记。锁定后只 ADMIN 能改，避免运营随便改。
+  expectedAmountCny    Decimal? @db.Decimal(12, 2)
+  expectedAmountLocked Boolean  @default(false)
   createdAt        DateTime      @default(now())
   updatedAt        DateTime      @updatedAt
 
@@ -645,6 +661,7 @@ model Order {
   agent             Agent?                @relation(fields: [agentId], references: [id])
   claimedBy         User?                 @relation("OrderClaimedBy", fields: [claimedById], references: [id], onDelete: SetNull)
   items             OrderItem[]
+  costItems         OrderCostItem[]
   passengers        Passenger[]
   payments          Payment[]
   refunds           Refund[]
@@ -693,6 +710,32 @@ model OrderItem {
   fulfillmentTasks FulfillmentTask[]
 
   @@index([orderId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 订单杂项成本 — 财务录入的订单级成本明细（贺帅细分：导游/赠送/手续费/其他）
+// 跟 OrderItem 区分：OrderItem 是面向客户的商品行；OrderCostItem 是后台财务的成本明细
+// 一张订单可有 N 条（一类可多条）
+// ─────────────────────────────────────────────────────────────────────────────
+enum OrderCostCategory {
+  GUIDE_SERVICE // 导游服务费
+  COMP_GIFT     // 赠送费用
+  HANDLING_FEE  // 手续费
+  OTHER         // 其他
+}
+
+model OrderCostItem {
+  id        String            @id @default(cuid())
+  orderId   String
+  category  OrderCostCategory
+  amountCny Decimal           @db.Decimal(12, 2)
+  note      String?
+  createdAt DateTime          @default(now())
+  updatedAt DateTime          @updatedAt
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId, category])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

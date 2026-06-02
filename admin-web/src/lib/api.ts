@@ -186,7 +186,10 @@ export type OrderStatus =
   | 'CHANGED'
   | 'FAILED';
 
-export type OrderItemKind = 'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA' | 'INSURANCE' | 'FEE' | 'DISCOUNT';
+export type OrderItemKind =
+  | 'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA'
+  | 'BUNDLE' | 'INSURANCE' | 'FEE' | 'DISCOUNT'
+  | 'GUIDE' | 'UPGRADE_CHANGE' | 'OVERSALE';
 export type DocumentType = 'PASSPORT' | 'ID_CARD' | 'OTHER';
 export type PassengerType = 'ADULT' | 'CHILD' | 'INFANT';
 export type PaymentMethod = 'WECHAT_PAY' | 'ALIPAY' | 'BANK_CARD' | 'AGENT_PREPAYMENT';
@@ -317,6 +320,11 @@ export interface OrderSummary {
   reminders?: OperationalReminder[];
   // 订单详情(getOrder)带出的收款记录（列表不含，避免 proof 数据膨胀）
   payments?: OrderPayment[];
+
+  // 出纳预期到账金额 + 锁定（仅 ADMIN/STAFF 看；AGENT 不看）
+  // Decimal 在 JSON 里是 string；null 表示未设置
+  expectedAmountCny?: string | null;
+  expectedAmountLocked?: boolean;
 }
 
 export interface OrderPayment {
@@ -1011,8 +1019,55 @@ export const api = {
       charterCostCny: number | null;
       airportTaxDepCny: number | null;
       airportTaxArrCny: number | null;
+      fuelCostCny: number | null;
+      peakSurchargeCny: number | null;
+      aircraftAdjustCny: number | null;
+      takeoffDiscountCny: number | null;
     }>,
   ) => apiFetch<{ id: string }>(`/finances/cost/flight-schedule/${id}`, { method: 'PATCH', token, body }),
+
+  // 航班成本周期 CRUD
+  listCostPeriods: (token: string, flightId?: string) => {
+    const qs = flightId ? `?flightId=${encodeURIComponent(flightId)}` : '';
+    return apiFetch<{ periods: CostPeriodDto[] }>(`/finances/cost/periods${qs}`, { token });
+  },
+  createCostPeriod: (token: string, body: CostPeriodWriteInput) =>
+    apiFetch<{ period: CostPeriodDto }>('/finances/cost/periods', { method: 'POST', token, body }),
+  updateCostPeriod: (
+    token: string,
+    id: string,
+    body: Partial<Omit<CostPeriodWriteInput, 'flightId'>>,
+  ) => apiFetch<{ period: CostPeriodDto }>(`/finances/cost/periods/${id}`, { method: 'PATCH', token, body }),
+  deleteCostPeriod: (token: string, id: string) =>
+    apiFetch<{ id: string }>(`/finances/cost/periods/${id}`, { method: 'DELETE', token }),
+
+  // 订单杂项成本（OrderCostItem）CRUD
+  listOrderCostItems: (token: string, orderId: string) =>
+    apiFetch<{ items: OrderCostItem[] }>(`/orders/${orderId}/cost-items`, { token }),
+  createOrderCostItem: (
+    token: string,
+    orderId: string,
+    body: { category: OrderCostCategory; amountCny: number; note?: string | null },
+  ) => apiFetch<{ item: OrderCostItem }>(`/orders/${orderId}/cost-items`, { method: 'POST', token, body }),
+  updateOrderCostItem: (
+    token: string,
+    id: string,
+    body: Partial<{ category: OrderCostCategory; amountCny: number; note: string | null }>,
+  ) => apiFetch<{ item: OrderCostItem }>(`/orders/cost-items/${id}`, { method: 'PATCH', token, body }),
+  deleteOrderCostItem: (token: string, id: string) =>
+    apiFetch<{ id: string }>(`/orders/cost-items/${id}`, { method: 'DELETE', token }),
+
+  // 订单预期到账金额 + 锁定（出纳）
+  setExpectedAmount: (token: string, orderId: string, amountCny: number | null) =>
+    apiFetch<{ id: string; expectedAmountCny: number | null; expectedAmountLocked: boolean }>(
+      `/orders/${orderId}/expected-amount`,
+      { method: 'PATCH', token, body: { amountCny } },
+    ),
+  lockExpectedAmount: (token: string, orderId: string, locked: boolean) =>
+    apiFetch<{ id: string; expectedAmountCny: number | null; expectedAmountLocked: boolean }>(
+      `/orders/${orderId}/expected-amount/lock`,
+      { method: 'POST', token, body: { locked } },
+    ),
 
   // 班次成本明细（admin · 用于"航班成本"维护页；带"单座(已售)成本"动态指标）
   listFinanceSchedules: (
@@ -1055,6 +1110,19 @@ export const api = {
     if (!res.ok) throw new ApiError(res.status, { code: 'EXPORT_FAILED', message: await res.text() });
     return res.blob();
   },
+
+  // 财务对账 xlsx 按航班维度导出（一行一个班次）
+  downloadFinanceExportByFlight: async (
+    token: string,
+    range: { from: string; to: string },
+  ): Promise<Blob> => {
+    const res = await fetch(
+      `${API_BASE}/finances/export-by-flight?from=${encodeURIComponent(range.from)}&to=${encodeURIComponent(range.to)}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) throw new ApiError(res.status, { code: 'EXPORT_FAILED', message: await res.text() });
+    return res.blob();
+  },
 };
 
 // ── 财务模块类型（与 backend/src/modules/finances/finances.service.ts 对齐）──
@@ -1065,6 +1133,40 @@ export interface CategoryBreakdown {
   grossMarginCny: number;
   marginPct: number | null;
   orderItemCount: number;
+}
+/** 贺帅口径：收入细分（10 项 + 未分类 + 总和） */
+export interface RevenueBreakdown {
+  outboundFlight: number;
+  returnFlight: number;
+  outboundTax: number;
+  returnTax: number;
+  hotel: number;
+  visa: number;
+  transfer: number;
+  guide: number;
+  upgradeChange: number;
+  oversale: number;
+  uncategorized: number;
+  total: number;
+}
+/** 贺帅口径：成本细分（15 项 + 总和） */
+export interface CostBreakdown {
+  outboundCharter: number;
+  returnCharter: number;
+  outboundTax: number;
+  returnTax: number;
+  peakSurcharge: number;
+  fuel: number;
+  aircraftAdjust: number;
+  takeoffDiscount: number;
+  hotel: number;
+  visa: number;
+  transfer: number;
+  guideService: number;
+  compGift: number;
+  handlingFee: number;
+  other: number;
+  total: number;
 }
 export interface FinanceSummary {
   range: { from: string; to: string };
@@ -1077,6 +1179,8 @@ export interface FinanceSummary {
   orderCount: number;
   missingCostItemCount: number;
   categories: CategoryBreakdown[];
+  revenueBreakdown: RevenueBreakdown;
+  costBreakdown: CostBreakdown;
 }
 export interface FlightPnlRow {
   scheduleId: string;
@@ -1097,9 +1201,13 @@ export interface FlightPnlRow {
   perSoldSeatCostCny: number | null;
 }
 
+export type CostSource = 'override' | 'period' | 'none';
+
 /**
  * 班次成本明细行（admin-only · 用于"航班成本"维护页）
  * 来自 GET /finances/cost/schedules
+ * - charterCostCny / airportTax{Dep,Arr}Cny / fuelCostCny / peakSurchargeCny / aircraftAdjustCny / takeoffDiscountCny = 生效值（override → period → null）
+ * - *Override = 班次自己存的（编辑框绑定）；*Period = 命中周期的默认（placeholder）；*Source = override/period/none
  */
 export interface FinanceScheduleRow {
   scheduleId: string;
@@ -1108,13 +1216,92 @@ export interface FinanceScheduleRow {
   origin: string;
   destination: string;
   departureTime: string;
+  // 生效（用于显示）
   charterCostCny: number | null;
   airportTaxDepCny: number | null;
   airportTaxArrCny: number | null;
+  fuelCostCny: number | null;
+  peakSurchargeCny: number | null;
+  aircraftAdjustCny: number | null;
+  takeoffDiscountCny: number | null;
+  // 班次自己（"覆盖"）—— 编辑框绑这个
+  charterCostCnyOverride: number | null;
+  airportTaxDepCnyOverride: number | null;
+  airportTaxArrCnyOverride: number | null;
+  fuelCostCnyOverride: number | null;
+  peakSurchargeCnyOverride: number | null;
+  aircraftAdjustCnyOverride: number | null;
+  takeoffDiscountCnyOverride: number | null;
+  // 周期默认（placeholder 显示）
+  charterCostCnyPeriod: number | null;
+  airportTaxDepCnyPeriod: number | null;
+  airportTaxArrCnyPeriod: number | null;
+  fuelCostCnyPeriod: number | null;
+  peakSurchargeCnyPeriod: number | null;
+  aircraftAdjustCnyPeriod: number | null;
+  takeoffDiscountCnyPeriod: number | null;
+  // 来源
+  charterCostCnySource: CostSource;
+  airportTaxDepCnySource: CostSource;
+  airportTaxArrCnySource: CostSource;
+  fuelCostCnySource: CostSource;
+  peakSurchargeCnySource: CostSource;
+  aircraftAdjustCnySource: CostSource;
+  takeoffDiscountCnySource: CostSource;
+  // 命中周期信息
+  matchedPeriodId: string | null;
+  matchedPeriodFrom: string | null;
+  matchedPeriodTo: string | null;
+  // 座位
   totalSeats: number;
   soldSeats: number;
   /** 单座(已售)成本 = charterCostCny ÷ soldSeats；charter 或 sold 为 0 时 null */
   perSoldSeatCostCny: number | null;
+}
+
+/** 航班成本周期（按 (航班, 日期段) 定包机/机场税/4 个新成本字段） */
+export interface CostPeriodDto {
+  id: string;
+  flightId: string;
+  flightNumber: string;
+  origin: string;
+  destination: string;
+  effectiveFrom: string; // YYYY-MM-DD
+  effectiveTo: string;
+  charterCostCny: number | null;
+  airportTaxDepCny: number | null;
+  airportTaxArrCny: number | null;
+  fuelCostCny: number | null;
+  peakSurchargeCny: number | null;
+  aircraftAdjustCny: number | null;
+  takeoffDiscountCny: number | null;
+  note: string | null;
+  updatedAt: string;
+}
+export interface CostPeriodWriteInput {
+  flightId: string;
+  effectiveFrom: string;
+  effectiveTo: string;
+  charterCostCny?: number | null;
+  airportTaxDepCny?: number | null;
+  airportTaxArrCny?: number | null;
+  fuelCostCny?: number | null;
+  peakSurchargeCny?: number | null;
+  aircraftAdjustCny?: number | null;
+  takeoffDiscountCny?: number | null;
+  note?: string | null;
+}
+
+/** 订单杂项成本（财务录入） */
+export type OrderCostCategory = 'GUIDE_SERVICE' | 'COMP_GIFT' | 'HANDLING_FEE' | 'OTHER';
+export interface OrderCostItem {
+  id: string;
+  orderId: string;
+  category: OrderCostCategory;
+  amountCny: number;
+  note: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 export interface OrderPnlRow {
   orderId: string;

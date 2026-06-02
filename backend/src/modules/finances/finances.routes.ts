@@ -20,13 +20,21 @@ import {
   getMonthlyTrend,
 } from './finances.service.js';
 import {
+  createCostPeriod,
+  deleteCostPeriod,
+  listCostPeriods,
   listSchedulesWithCost,
   patchFlightScheduleCost,
   patchHotelRoomTypeCost,
   patchVisaCost,
   patchTransferCost,
+  updateCostPeriod,
 } from './finances.cost.service.js';
 import { buildFinanceExportWorkbook, financeExportFilename } from './finances.export.js';
+import {
+  buildFinanceExportByFlightWorkbook,
+  financeExportByFlightFilename,
+} from './finances.export-by-flight.js';
 
 const dateStr = z
   .string()
@@ -44,10 +52,16 @@ const monthlySchema = z.object({
 
 // 成本字段：number 或 null（清空）；缺省 = 不改（统一 CNY，无汇率）
 const costNum = z.number().nonnegative().nullable().optional();
+// 起降折扣允许负数（航司给我们的减项）
+const signedCostNum = z.number().nullable().optional();
 const flightCostSchema = z.object({
   charterCostCny: costNum,
   airportTaxDepCny: costNum,
   airportTaxArrCny: costNum,
+  fuelCostCny: costNum,
+  peakSurchargeCny: costNum,
+  aircraftAdjustCny: costNum,
+  takeoffDiscountCny: signedCostNum,
 });
 const hotelCostSchema = z.object({ costPriceCny: costNum });
 const visaCostSchema = z.object({ costPriceCny: costNum });
@@ -135,12 +149,117 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
       .send(buf);
   });
 
+  // ── xlsx 导出（一行/班次，整班 P&L）──
+  app.get('/export-by-flight', requireAdmin, async (req, reply) => {
+    const q = rangeSchema.parse(req.query);
+    const def = defaultRange();
+    const range = { from: q.from ?? def.from, to: q.to ?? def.to };
+    logView(req, { route: 'export-by-flight', range });
+    const buf = await buildFinanceExportByFlightWorkbook(range);
+    return reply
+      .header(
+        'Content-Type',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      )
+      .header(
+        'Content-Disposition',
+        `attachment; filename="${encodeURIComponent(financeExportByFlightFilename(range))}"`,
+      )
+      .send(buf);
+  });
+
   // ── 航班成本列表（财务页用，admin-only）──
   // GET /finances/cost/schedules?from=YYYY-MM-DD&to=YYYY-MM-DD
   app.get('/cost/schedules', requireAdmin, async (req) => {
     const q = z.object({ from: dateStr.optional(), to: dateStr.optional() }).parse(req.query);
     const schedules = await listSchedulesWithCost(q);
     return { schedules };
+  });
+
+  // ── 航班成本周期 CRUD（admin-only）按 (航班, 日期段) 定包机/机场税/4 个新成本字段
+  const periodWriteSchema = z.object({
+    flightId: z.string().min(1),
+    effectiveFrom: dateStr,
+    effectiveTo: dateStr,
+    charterCostCny: costNum,
+    airportTaxDepCny: costNum,
+    airportTaxArrCny: costNum,
+    fuelCostCny: costNum,
+    peakSurchargeCny: costNum,
+    aircraftAdjustCny: costNum,
+    takeoffDiscountCny: signedCostNum,
+    note: z.string().max(200).nullable().optional(),
+  });
+  const periodPatchSchema = z.object({
+    effectiveFrom: dateStr.optional(),
+    effectiveTo: dateStr.optional(),
+    charterCostCny: costNum,
+    airportTaxDepCny: costNum,
+    airportTaxArrCny: costNum,
+    fuelCostCny: costNum,
+    peakSurchargeCny: costNum,
+    aircraftAdjustCny: costNum,
+    takeoffDiscountCny: signedCostNum,
+    note: z.string().max(200).nullable().optional(),
+  });
+
+  app.get('/cost/periods', requireAdmin, async (req) => {
+    const q = z.object({ flightId: z.string().optional() }).parse(req.query);
+    const periods = await listCostPeriods({ flightId: q.flightId });
+    return { periods };
+  });
+
+  app.post('/cost/periods', requireAdmin, async (req, reply) => {
+    try {
+      const body = periodWriteSchema.parse(req.body);
+      const period = await createCostPeriod(body);
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'CREATE_COST_PERIOD',
+        targetType: 'FLIGHT',
+        targetId: body.flightId,
+        targetLabel: `${body.effectiveFrom}→${body.effectiveTo}`,
+        after: body,
+      });
+      return { period };
+    } catch (e) {
+      if (e instanceof Error) return reply.status(400).send({ error: e.message });
+      throw e;
+    }
+  });
+
+  app.patch('/cost/periods/:id', requireAdmin, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    try {
+      const body = periodPatchSchema.parse(req.body);
+      const period = await updateCostPeriod(id, body);
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'UPDATE_COST_PERIOD',
+        targetType: 'FLIGHT',
+        targetId: period.flightId,
+        targetLabel: `${period.effectiveFrom}→${period.effectiveTo}`,
+        after: body,
+      });
+      return { period };
+    } catch (e) {
+      if (e instanceof Error) return reply.status(400).send({ error: e.message });
+      throw e;
+    }
+  });
+
+  app.delete('/cost/periods/:id', requireAdmin, async (req) => {
+    const { id } = req.params as { id: string };
+    const result = await deleteCostPeriod(id);
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'DELETE_COST_PERIOD',
+      targetType: 'FLIGHT',
+      targetId: id,
+      targetLabel: 'period',
+      after: null,
+    });
+    return result;
   });
 
   // ── 产品成本编辑 ──────────────────────────────────────────────────────────

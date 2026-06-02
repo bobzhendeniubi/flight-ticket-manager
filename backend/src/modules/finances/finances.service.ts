@@ -18,6 +18,11 @@
 import type { Prisma, PrismaClient } from '@prisma/client';
 import { OrderStatus } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
+import {
+  findMatchedPeriod,
+  loadPeriodsByFlightIds,
+  resolveScheduleCost,
+} from './finances.cost.service.js';
 
 export interface DateRange {
   /** ISO date 'YYYY-MM-DD'，包含 */
@@ -35,11 +40,47 @@ export interface CategoryBreakdown {
   orderItemCount: number;
 }
 
+/** 收入细分（贺帅口径，10 项；机场税收入按 pass-through = 对应 leg 机场税成本） */
+export interface RevenueBreakdown {
+  outboundFlight: number;     // 去程机票收入
+  returnFlight: number;       // 返程机票收入
+  outboundTax: number;        // 去程机场税收入（pass-through）
+  returnTax: number;          // 返程机场税收入（pass-through）
+  hotel: number;              // 房收入
+  visa: number;               // 签证收入
+  transfer: number;           // 车收入
+  guide: number;              // 导游收入
+  upgradeChange: number;      // 升舱+改期收入
+  oversale: number;           // 超售收入
+  uncategorized: number;      // 上面没归类的（FEE/DISCOUNT/INSURANCE/BUNDLE 等）
+  total: number;              // 总和
+}
+
+/** 成本细分（贺帅口径，15 项） */
+export interface CostBreakdown {
+  outboundCharter: number;    // 去程包机分摊（charter ÷ 总座 × paxCount）
+  returnCharter: number;      // 返程包机分摊
+  outboundTax: number;        // 去程机场税成本
+  returnTax: number;          // 返程机场税成本
+  peakSurcharge: number;      // 旺季附加（各 leg × paxCount）
+  fuel: number;               // 燃油
+  aircraftAdjust: number;     // 机型调整
+  takeoffDiscount: number;    // 起降折扣（可负）
+  hotel: number;              // 房费
+  visa: number;               // 签证费
+  transfer: number;           // 车费
+  guideService: number;       // 导游服务费（OrderCostItem.GUIDE_SERVICE）
+  compGift: number;           // 赠送费用
+  handlingFee: number;        // 手续费
+  other: number;              // 其他
+  total: number;              // 总和
+}
+
 export interface FinancesSummary {
   range: DateRange;
   /** 已下单总收入（OrderItem.amount，未扣税费）— 含尚未支付的订单 */
   revenueCny: number;
-  /** 已锁定成本总额（OrderItem.totalCostCny） */
+  /** 已锁定成本总额 */
   costCny: number;
   /** revenue - cost；不包含空座沉没成本 */
   grossMarginCny: number;
@@ -53,7 +94,11 @@ export interface FinancesSummary {
   orderCount: number;
   /** 该区间内 OrderItem 没填 cost 的条目数（用于提醒补录） */
   missingCostItemCount: number;
+  /** 旧 UI 兼容：按 OrderItem.kind 粗分 */
   categories: CategoryBreakdown[];
+  /** 新：按贺帅口径细分 */
+  revenueBreakdown: RevenueBreakdown;
+  costBreakdown: CostBreakdown;
 }
 
 export interface FlightPnlRow {
@@ -141,7 +186,7 @@ function round2(n: number): number {
   return Math.round(n * 100) / 100;
 }
 
-/** 计算财务概览（KPI + 分类拆分） */
+/** 计算财务概览（KPI + 按 OrderItem.kind 粗分 + 按贺帅口径细分） */
 export async function getFinancesSummary(
   range: DateRange,
   client: PrismaClient = defaultPrisma,
@@ -149,93 +194,279 @@ export async function getFinancesSummary(
   const from = toDateOnlyUtc(range.from);
   const to = toDateOnlyUtc(range.to, true);
 
+  // ── 1) 拉订单 + items（含 flightSchedule 全成本字段、产品成本、座位）+ passengers 数 + costItems ──
   const orders = await client.order.findMany({
-    where: {
-      createdAt: { gte: from, lte: to },
-      status: { in: COUNTED_STATUSES },
-    },
+    where: { createdAt: { gte: from, lte: to }, status: { in: COUNTED_STATUSES } },
     select: {
       id: true,
       total: true,
-      items: { select: { kind: true, amount: true, totalCostCny: true } },
+      passengers: { select: { id: true } },
+      costItems: { select: { category: true, amountCny: true } },
+      items: {
+        select: {
+          kind: true,
+          amount: true,
+          quantity: true,
+          totalCostCny: true,
+          hotelCheckIn: true,
+          hotelCheckOut: true,
+          flightSchedule: {
+            select: {
+              flightId: true,
+              departureTime: true,
+              departureTz: true,
+              charterCostCny: true,
+              airportTaxDepCny: true,
+              airportTaxArrCny: true,
+              fuelCostCny: true,
+              peakSurchargeCny: true,
+              aircraftAdjustCny: true,
+              takeoffDiscountCny: true,
+              seatClasses: { select: { capacity: true } },
+            },
+          },
+          hotelRoomType: { select: { costPriceCny: true } },
+          visa: { select: { costPriceCny: true } },
+          transfer: { select: { costPriceCny: true } },
+        },
+      },
     },
   });
 
+  // ── 2) 批量拉相关航班的成本周期（用于 resolution） ──
+  const flightIds = Array.from(
+    new Set(
+      orders.flatMap((o) => o.items.flatMap((i) => (i.flightSchedule ? [i.flightSchedule.flightId] : []))),
+    ),
+  );
+  const periodsMap = await loadPeriodsByFlightIds(flightIds, client);
+
+  // ── 3) 聚合 ──
   const categoryMap = new Map<string, CategoryBreakdown>();
+  const rev: RevenueBreakdown = {
+    outboundFlight: 0, returnFlight: 0, outboundTax: 0, returnTax: 0,
+    hotel: 0, visa: 0, transfer: 0, guide: 0, upgradeChange: 0, oversale: 0,
+    uncategorized: 0, total: 0,
+  };
+  const cost: CostBreakdown = {
+    outboundCharter: 0, returnCharter: 0, outboundTax: 0, returnTax: 0,
+    peakSurcharge: 0, fuel: 0, aircraftAdjust: 0, takeoffDiscount: 0,
+    hotel: 0, visa: 0, transfer: 0,
+    guideService: 0, compGift: 0, handlingFee: 0, other: 0, total: 0,
+  };
   let revenueCny = 0;
   let costCny = 0;
   let missingCostItemCount = 0;
 
   for (const o of orders) {
+    const paxCount = Math.max(1, o.passengers.length);
+
+    // 旧粗粒度 categoryMap（兼容老 UI）+ 总收入/成本
     for (const item of o.items) {
       const amt = dec(item.amount);
-      const cost = item.totalCostCny == null ? null : dec(item.totalCostCny);
+      const c = item.totalCostCny == null ? null : dec(item.totalCostCny);
       revenueCny += amt;
-      if (cost != null) costCny += cost;
+      if (c != null) costCny += c;
       else missingCostItemCount += 1;
 
       const key = item.kind;
-      const cur =
-        categoryMap.get(key) ??
-        ({
-          kind: key,
-          revenueCny: 0,
-          costCny: 0,
-          grossMarginCny: 0,
-          marginPct: null,
-          orderItemCount: 0,
-        } satisfies CategoryBreakdown);
+      const cur = categoryMap.get(key) ?? {
+        kind: key, revenueCny: 0, costCny: 0, grossMarginCny: 0,
+        marginPct: null, orderItemCount: 0,
+      } as CategoryBreakdown;
       cur.revenueCny += amt;
-      if (cost != null) cur.costCny += cost;
+      if (c != null) cur.costCny += c;
       cur.orderItemCount += 1;
       categoryMap.set(key, cur);
     }
+
+    // 新细分（贺帅口径）
+    // FLIGHT items: 按 departureTime 排序，第一段=去程，其余=返程
+    const flightItems = o.items
+      .filter((i) => i.kind === 'FLIGHT' && i.flightSchedule != null)
+      .sort((a, b) =>
+        a.flightSchedule!.departureTime.getTime() - b.flightSchedule!.departureTime.getTime(),
+      );
+    flightItems.forEach((it, idx) => {
+      const sched = it.flightSchedule!;
+      const isOutbound = idx === 0;
+      const matched = findMatchedPeriod(sched, periodsMap.get(sched.flightId) ?? []);
+      const eff = resolveScheduleCost(sched, matched);
+      const totalSeats = sched.seatClasses.reduce((a, c) => a + c.capacity, 0);
+      // 包机分摊（per pax）= charter ÷ 总座
+      const perSeatCharter = eff.charterCostCny != null && totalSeats > 0
+        ? eff.charterCostCny / totalSeats : 0;
+      const taxDep = eff.airportTaxDepCny ?? 0;
+      const taxArr = eff.airportTaxArrCny ?? 0;
+      const fuel = eff.fuelCostCny ?? 0;
+      const peak = eff.peakSurchargeCny ?? 0;
+      const adj = eff.aircraftAdjustCny ?? 0;
+      const disc = eff.takeoffDiscountCny ?? 0;
+
+      // 该 leg 总成本各项 × paxCount
+      const charterCost = perSeatCharter * paxCount;
+      const taxCost = (taxDep + taxArr) * paxCount;
+      if (isOutbound) {
+        cost.outboundCharter += charterCost;
+        cost.outboundTax += taxCost;
+      } else {
+        cost.returnCharter += charterCost;
+        cost.returnTax += taxCost;
+      }
+      cost.peakSurcharge += peak * paxCount;
+      cost.fuel += fuel * paxCount;
+      cost.aircraftAdjust += adj * paxCount;
+      cost.takeoffDiscount += disc * paxCount;
+
+      // 收入：FLIGHT amount 按 leg 分（去程 / 返程），机场税 pass-through
+      const amt = dec(it.amount);
+      if (isOutbound) {
+        rev.outboundFlight += amt;
+        rev.outboundTax += taxCost;
+      } else {
+        rev.returnFlight += amt;
+        rev.returnTax += taxCost;
+      }
+    });
+
+    // 非 FLIGHT items：按 kind 分到 hotel/visa/transfer/guide/upgradeChange/oversale/uncategorized
+    for (const it of o.items) {
+      if (it.kind === 'FLIGHT') continue;
+      const amt = dec(it.amount);
+      const cSnap = it.totalCostCny == null ? null : dec(it.totalCostCny);
+      switch (it.kind) {
+        case 'HOTEL': {
+          rev.hotel += amt;
+          // 优先用 snapshot；否则按 costPriceCny × nights × quantity 算
+          if (cSnap != null) cost.hotel += cSnap;
+          else if (it.hotelRoomType?.costPriceCny != null) {
+            const perNight = dec(it.hotelRoomType.costPriceCny);
+            let nights = 1;
+            if (it.hotelCheckIn && it.hotelCheckOut) {
+              nights = Math.max(1, Math.round(
+                (it.hotelCheckOut.getTime() - it.hotelCheckIn.getTime()) / (1000 * 60 * 60 * 24),
+              ));
+            }
+            cost.hotel += perNight * nights * it.quantity;
+          }
+          break;
+        }
+        case 'VISA': {
+          rev.visa += amt;
+          if (cSnap != null) cost.visa += cSnap;
+          else if (it.visa?.costPriceCny != null) cost.visa += dec(it.visa.costPriceCny) * it.quantity;
+          break;
+        }
+        case 'TRANSFER': {
+          rev.transfer += amt;
+          if (cSnap != null) cost.transfer += cSnap;
+          else if (it.transfer?.costPriceCny != null) cost.transfer += dec(it.transfer.costPriceCny) * it.quantity;
+          break;
+        }
+        case 'GUIDE':
+          rev.guide += amt;
+          if (cSnap != null) cost.other += cSnap;
+          break;
+        case 'UPGRADE_CHANGE':
+          rev.upgradeChange += amt;
+          if (cSnap != null) cost.other += cSnap;
+          break;
+        case 'OVERSALE':
+          rev.oversale += amt;
+          if (cSnap != null) cost.other += cSnap;
+          break;
+        default:
+          // BUNDLE / INSURANCE / FEE / DISCOUNT
+          rev.uncategorized += amt;
+          if (cSnap != null) cost.other += cSnap;
+      }
+    }
+
+    // OrderCostItem 按 category 拆分
+    for (const ci of o.costItems) {
+      const a = dec(ci.amountCny);
+      switch (ci.category) {
+        case 'GUIDE_SERVICE': cost.guideService += a; break;
+        case 'COMP_GIFT':     cost.compGift += a; break;
+        case 'HANDLING_FEE':  cost.handlingFee += a; break;
+        case 'OTHER':         cost.other += a; break;
+      }
+    }
   }
 
-  const schedules = await client.flightSchedule.findMany({
-    where: {
-      departureTime: { gte: from, lte: to },
-      charterCostCny: { not: null },
-    },
+  // 总计 + 四舍五入
+  const round = (n: number): number => round2(n);
+  for (const k of Object.keys(rev) as (keyof RevenueBreakdown)[]) rev[k] = round(rev[k]);
+  for (const k of Object.keys(cost) as (keyof CostBreakdown)[]) cost[k] = round(cost[k]);
+  rev.total = round(
+    rev.outboundFlight + rev.returnFlight + rev.outboundTax + rev.returnTax +
+    rev.hotel + rev.visa + rev.transfer + rev.guide + rev.upgradeChange + rev.oversale + rev.uncategorized,
+  );
+  cost.total = round(
+    cost.outboundCharter + cost.returnCharter + cost.outboundTax + cost.returnTax +
+    cost.peakSurcharge + cost.fuel + cost.aircraftAdjust + cost.takeoffDiscount +
+    cost.hotel + cost.visa + cost.transfer +
+    cost.guideService + cost.compGift + cost.handlingFee + cost.other,
+  );
+
+  // 空座沉没：仍用班次维度 + resolution（charter 可能来自 period）
+  const schedulesInRange = await client.flightSchedule.findMany({
+    where: { departureTime: { gte: from, lte: to } },
     select: {
+      flightId: true,
+      departureTime: true,
+      departureTz: true,
       charterCostCny: true,
+      airportTaxDepCny: true,
+      airportTaxArrCny: true,
+      fuelCostCny: true,
+      peakSurchargeCny: true,
+      aircraftAdjustCny: true,
+      takeoffDiscountCny: true,
       seatClasses: { select: { capacity: true, sold: true } },
     },
   });
-
+  const sunkFlightIds = Array.from(new Set(schedulesInRange.map((s) => s.flightId)));
+  const sunkPeriodsMap = sunkFlightIds.length > 0
+    ? await loadPeriodsByFlightIds(sunkFlightIds, client)
+    : new Map();
   let emptySeatSunkCostCny = 0;
-  for (const s of schedules) {
+  for (const s of schedulesInRange) {
+    const matched = findMatchedPeriod(s, sunkPeriodsMap.get(s.flightId) ?? []);
+    const eff = resolveScheduleCost(s, matched);
+    if (eff.charterCostCny == null) continue;
     const totalSeats = s.seatClasses.reduce((a, c) => a + c.capacity, 0);
     const soldSeats = s.seatClasses.reduce((a, c) => a + c.sold, 0);
     if (totalSeats === 0) continue;
-    const charter = dec(s.charterCostCny);
-    const perSeat = charter / totalSeats;
+    const perSeat = eff.charterCostCny / totalSeats;
     emptySeatSunkCostCny += (totalSeats - soldSeats) * perSeat;
   }
 
   const categories: CategoryBreakdown[] = Array.from(categoryMap.values())
     .map((c) => ({
       ...c,
-      revenueCny: round2(c.revenueCny),
-      costCny: round2(c.costCny),
-      grossMarginCny: round2(c.revenueCny - c.costCny),
-      marginPct: c.revenueCny > 0 ? round2((c.revenueCny - c.costCny) / c.revenueCny) : null,
+      revenueCny: round(c.revenueCny),
+      costCny: round(c.costCny),
+      grossMarginCny: round(c.revenueCny - c.costCny),
+      marginPct: c.revenueCny > 0 ? round((c.revenueCny - c.costCny) / c.revenueCny) : null,
     }))
     .sort((a, b) => b.revenueCny - a.revenueCny);
 
-  const grossMarginCny = round2(revenueCny - costCny);
+  const grossMarginCny = round(revenueCny - costCny);
 
   return {
     range,
-    revenueCny: round2(revenueCny),
-    costCny: round2(costCny),
+    revenueCny: round(revenueCny),
+    costCny: round(costCny),
     grossMarginCny,
-    marginPct: revenueCny > 0 ? round2(grossMarginCny / revenueCny) : null,
-    emptySeatSunkCostCny: round2(emptySeatSunkCostCny),
-    netMarginCny: round2(grossMarginCny - emptySeatSunkCostCny),
+    marginPct: revenueCny > 0 ? round(grossMarginCny / revenueCny) : null,
+    emptySeatSunkCostCny: round(emptySeatSunkCostCny),
+    netMarginCny: round(grossMarginCny - emptySeatSunkCostCny),
     orderCount: orders.length,
     missingCostItemCount,
     categories,
+    revenueBreakdown: rev,
+    costBreakdown: cost,
   };
 }
 

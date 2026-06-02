@@ -6,6 +6,7 @@ import {
 } from '../lib/mockData';
 import { exportToCSV } from '../lib/csvExport';
 import { NumberInput } from '../components/NumberInput';
+import { OrderFinanceSection } from '../components/OrderFinanceSection';
 
 // 本地可视化用的状态子集（后端 OrderStatus 更全，这里只列出常用 7 个做 filter）
 const STATUS_LABEL: Record<OrderStatus, string> = {
@@ -50,9 +51,13 @@ const KIND_LABEL: Record<OrderItemKindLabel, string> = {
   HOTEL: '酒店',
   TRANSFER: '接送',
   VISA: '签证',
+  BUNDLE: '套餐',
   INSURANCE: '保险',
   FEE: '附加费',
   DISCOUNT: '折扣',
+  GUIDE: '导游',
+  UPGRADE_CHANGE: '升舱/改期',
+  OVERSALE: '超售',
 };
 
 // 佣金率（按产品类型，简化版 — 真实佣金由 CommissionRecord 表算）
@@ -811,6 +816,14 @@ function OrderDrawer({
           <NotesSection order={order} />
 
           <RemindersSection order={order} />
+
+          {/* 财务/出纳：预期到账金额 + 订单杂项成本（仅 ADMIN/STAFF 可见，组件内做权限判断） */}
+          <OrderFinanceSection
+            orderId={order.id}
+            initialExpectedAmountCny={order.expectedAmountCny}
+            initialExpectedAmountLocked={order.expectedAmountLocked}
+            onChanged={onChanged}
+          />
 
           <section>
             <h3 className="text-sm font-medium text-slate-700">客户信息</h3>

@@ -25,6 +25,9 @@ const KIND_TO_TYPE: Record<OrderItemKind, FulfillmentType | null> = {
   INSURANCE: null,
   FEE: null,
   DISCOUNT: null,
+  GUIDE: null, // 导游服务费收入：财务记账类，不触发履约
+  UPGRADE_CHANGE: null, // 升舱/改期收入：财务记账类
+  OVERSALE: null, // 超售收入：财务记账类
 };
 
 export class FulfillmentService {
