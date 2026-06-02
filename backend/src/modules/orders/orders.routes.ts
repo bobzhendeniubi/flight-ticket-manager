@@ -22,6 +22,7 @@ import { actorFromRequest, writeAudit } from '../../lib/audit.js';
 import { computeCancellationQuote } from '../../lib/cancellation.js';
 import { buildPnrWorkbook, pnrExportFilename } from './pnr-export.js';
 import { buildPassportPhotoZip, passportZipFilename } from './passport-zip.js';
+import { buildOrdersBySchedule, ordersExportFilename } from './orders.export.js';
 
 export const orderRoutes: FastifyPluginAsync = async (app) => {
   const service = new OrderService();
@@ -244,6 +245,58 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       )
       .send(buf);
   });
+
+  // ── 整班机订单导出（ops 用，不含成本）──
+  // GET /orders/export-by-schedule?scheduleId=... — ADMIN/STAFF only
+  // 代理不能跨代理看订单，所以 AGENT 不放行；客户更不行
+  app.get(
+    '/export-by-schedule',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    async (req, reply) => {
+      const query = z
+        .object({ scheduleId: z.string().min(1, 'scheduleId 必填') })
+        .parse(req.query);
+
+      // 取班次基本信息用于文件名 + 校验存在
+      const schedule = await prisma.flightSchedule.findUnique({
+        where: { id: query.scheduleId },
+        include: { flight: { select: { flightNumber: true } } },
+      });
+      if (!schedule) {
+        return reply.status(404).send({ error: '班次不存在' });
+      }
+
+      const departureDate = `${schedule.departureTime.getUTCFullYear()}-${String(
+        schedule.departureTime.getUTCMonth() + 1,
+      ).padStart(2, '0')}-${String(schedule.departureTime.getUTCDate()).padStart(2, '0')}`;
+      const flightNumber = schedule.flight.flightNumber;
+
+      const buf = await buildOrdersBySchedule(query.scheduleId);
+
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'EXPORT_ORDERS_BY_SCHEDULE',
+        // schema.AuditTargetType 没有 FLIGHT_SCHEDULE；用 FLIGHT + scheduleId 已经足够定位
+        targetType: 'FLIGHT',
+        targetId: query.scheduleId,
+        targetLabel: `${flightNumber} · ${departureDate}`,
+        after: { scheduleId: query.scheduleId, flightNumber, departureDate },
+      });
+
+      return reply
+        .header(
+          'Content-Type',
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
+        .header(
+          'Content-Disposition',
+          `attachment; filename="${encodeURIComponent(
+            ordersExportFilename(query.scheduleId, { flightNumber, departureDate }),
+          )}"`,
+        )
+        .send(buf);
+    },
+  );
 
   // ── 一键打包护照图片 zip ──
   // GET /orders/:id/passport-photos.zip

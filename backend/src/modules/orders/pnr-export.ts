@@ -6,6 +6,7 @@
  */
 import ExcelJS from 'exceljs';
 import type { Passenger } from '@prisma/client';
+import { toAlpha3 } from './nationality.js';
 
 /** 日期 → DDMmmYY 格式，如 24Oct95 / 12Dec34（航司标准）*/
 function formatPnrDate(d: Date | null | undefined): string {
@@ -94,8 +95,8 @@ function passengerToRow(p: Passenger): PnrRow {
     passportLast: lastName,
     passportFirst: firstName,
     passportNumber: p.documentNumber ?? '',
-    passportNationality: p.nationality ?? '',
-    passportIssueCountry: p.passportIssueCountry ?? '',
+    passportNationality: toAlpha3(p.nationality),
+    passportIssueCountry: toAlpha3(p.passportIssueCountry),
     passportExpiry: formatPnrDate(p.passportExpiry),
     visaNumber: p.visaNumber ?? '',
     visaType: p.visaType ?? '',

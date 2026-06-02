@@ -5,6 +5,7 @@ import {
   type FulfillmentStatus,
 } from '../lib/mockData';
 import { exportToCSV } from '../lib/csvExport';
+import { NumberInput } from '../components/NumberInput';
 
 // 本地可视化用的状态子集（后端 OrderStatus 更全，这里只列出常用 7 个做 filter）
 const STATUS_LABEL: Record<OrderStatus, string> = {
@@ -1786,7 +1787,7 @@ function ConfirmPaymentSection({
   const token = tokens?.accessToken ?? '';
   const [payments, setPayments] = useState<OrderPayment[]>([]);
   const [paid, setPaid] = useState(paidAmount);
-  const [amount, setAmount] = useState('');
+  const [amount, setAmount] = useState<number | null>(null);
   const [method, setMethod] = useState<PaymentMethod>('BANK_CARD');
   const [proofUrl, setProofUrl] = useState<string | null>(null);
   const [note, setNote] = useState('');
@@ -1806,7 +1807,8 @@ function ConfirmPaymentSection({
         setPayments(r.order.payments ?? []);
         const p = Number(r.order.paidAmount);
         setPaid(p);
-        setAmount(Math.max(0, Math.round((total - p) * 100) / 100) > 0 ? String(Math.round((total - p) * 100) / 100) : '');
+        const due = Math.max(0, Math.round((total - p) * 100) / 100);
+        setAmount(due > 0 ? due : null);
       })
       .catch(() => undefined);
     return () => {
@@ -1829,7 +1831,7 @@ function ConfirmPaymentSection({
   async function confirm(): Promise<void> {
     if (!token || submitting) return;
     setErr(null);
-    const amt = amount.trim() === '' ? undefined : Number(amount);
+    const amt = amount ?? undefined;
     if (amt !== undefined && (!Number.isFinite(amt) || amt <= 0)) {
       setErr('金额需为正数');
       return;
@@ -1900,12 +1902,11 @@ function ConfirmPaymentSection({
             <div className="flex gap-2">
               <label className="flex-1 text-xs text-slate-500">
                 收款金额
-                <input
-                  type="number"
-                  step="0.01"
+                <NumberInput
+                  step={0.01}
                   className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1 text-sm"
                   value={amount}
-                  onChange={(e) => setAmount(e.target.value)}
+                  onChange={(n) => setAmount(n)}
                   placeholder={`默认应收 ¥${remaining}`}
                 />
               </label>

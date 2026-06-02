@@ -366,7 +366,8 @@ model Flight {
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
-  schedules FlightSchedule[]
+  schedules   FlightSchedule[]
+  costPeriods FlightCostPeriod[]
 
   @@unique([flightNumber])
   @@index([originCode, destinationCode])
@@ -410,6 +411,29 @@ model FlightSeatClass {
   schedule FlightSchedule @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
 
   @@unique([scheduleId, cabin])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 航班成本周期 — 按 (航班, 日期段) 定包机/机场税；班次的 charterCostCny 等字段
+// 仍存在并作为"单班次 override"优先生效（resolution: schedule ?? period ?? null）
+// ─────────────────────────────────────────────────────────────────────────────
+model FlightCostPeriod {
+  id               String   @id @default(cuid())
+  flightId         String
+  // 周期生效起止日（date-only；按航班出发地时区匹配班次日期）
+  effectiveFrom    DateTime @db.Date
+  effectiveTo      DateTime @db.Date
+  // 周期默认成本（CNY；任一为 null 表示该字段不通过 period 提供，由班次 override 或留空）
+  charterCostCny   Decimal? @db.Decimal(12, 2)
+  airportTaxDepCny Decimal? @db.Decimal(10, 2)
+  airportTaxArrCny Decimal? @db.Decimal(10, 2)
+  note             String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  flight Flight @relation(fields: [flightId], references: [id], onDelete: Cascade)
+
+  @@index([flightId, effectiveFrom, effectiveTo])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -701,6 +701,15 @@ export const api = {
     if (!res.ok) throw new ApiError(res.status, { code: 'ZIP_FAILED', message: await res.text() });
     return res.blob();
   },
+  // 整班机订单导出（ADMIN/STAFF only；ops 用，不含成本）
+  downloadOrdersBySchedule: async (token: string, scheduleId: string): Promise<Blob> => {
+    const res = await fetch(
+      `${API_BASE}/orders/export-by-schedule?scheduleId=${encodeURIComponent(scheduleId)}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) throw new ApiError(res.status, { code: 'EXPORT_FAILED', message: await res.text() });
+    return res.blob();
+  },
   // 认领订单（防漏单）
   claimOrder: (token: string, orderId: string) =>
     apiFetch<{ ok: boolean; claimedBy: { id: string; displayName: string | null; email: string | null } }>(

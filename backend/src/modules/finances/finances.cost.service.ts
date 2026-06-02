@@ -2,12 +2,20 @@
  * 财务成本编辑 service
  *
  * 给 admin-web「成本维护」tab 和产品管理页提供：
- *   - 各产品成本字段的 patch（CNY，已移除汇率/多币种）
- *   - 航班班次成本的 flat 列表（listSchedulesWithCost）—— 让财务能在一个页面集中管所有班次成本
+ *   - 产品成本字段的 patch（CNY，已移除汇率/多币种）
+ *   - 航班班次成本列表（listSchedulesWithCost）
+ *   - 航班成本周期（FlightCostPeriod）CRUD —— 按航班号+日期段定包机/机场税
+ *
+ * 成本解析（每字段独立）：
+ *   effective = schedule.<field>(override) ?? matchedPeriod.<field>(period) ?? null
+ *   班次自己的字段为 null 时落回所在日期段的周期默认。日期匹配按航班出发地时区算。
+ *
  * 所有写操作由 routes 层负责 ADMIN 鉴权 + 审计日志。
  */
-import type { Prisma, PrismaClient } from '@prisma/client';
+import { Prisma, type PrismaClient } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
+
+// ── helpers ──────────────────────────────────────────────────────────────────
 
 function dec(v: Prisma.Decimal | number | null | undefined): number | null {
   if (v == null) return null;
@@ -16,6 +24,289 @@ function dec(v: Prisma.Decimal | number | null | undefined): number | null {
 
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
+}
+
+/** 返回 'YYYY-MM-DD'，按指定 IANA 时区算的日期。tz 不识别时回退 UTC。 */
+export function localDate(d: Date, tz: string): string {
+  try {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: tz,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(d);
+  } catch {
+    return d.toISOString().slice(0, 10);
+  }
+}
+
+/** Prisma DateTime @db.Date 返回 UTC 0:00 的 Date；序列化为 'YYYY-MM-DD'。 */
+export function fmtDateOnly(d: Date): string {
+  return d.toISOString().slice(0, 10);
+}
+
+// ── 成本解析（per-field override → period → null）────────────────────────────
+
+export type CostSource = 'override' | 'period' | 'none';
+
+export interface EffectiveCost {
+  charterCostCny: number | null;
+  airportTaxDepCny: number | null;
+  airportTaxArrCny: number | null;
+  charterCostCnySource: CostSource;
+  airportTaxDepCnySource: CostSource;
+  airportTaxArrCnySource: CostSource;
+}
+
+interface ScheduleCostInputs {
+  departureTime: Date;
+  departureTz: string;
+  charterCostCny: Prisma.Decimal | null;
+  airportTaxDepCny: Prisma.Decimal | null;
+  airportTaxArrCny: Prisma.Decimal | null;
+}
+
+interface PeriodInputs {
+  effectiveFrom: Date;
+  effectiveTo: Date;
+  charterCostCny: Prisma.Decimal | null;
+  airportTaxDepCny: Prisma.Decimal | null;
+  airportTaxArrCny: Prisma.Decimal | null;
+}
+
+/** 在给定航班的周期列表里，找覆盖该班次出发日（按航班出发地时区）的那一条。 */
+export function findMatchedPeriod<P extends PeriodInputs>(
+  schedule: ScheduleCostInputs,
+  periodsForFlight: P[],
+): P | null {
+  const dateStr = localDate(schedule.departureTime, schedule.departureTz);
+  return (
+    periodsForFlight.find(
+      (p) => fmtDateOnly(p.effectiveFrom) <= dateStr && dateStr <= fmtDateOnly(p.effectiveTo),
+    ) ?? null
+  );
+}
+
+/** 把班次 + 命中周期解析为生效成本（每字段独立 override→period→null）。 */
+export function resolveScheduleCost(
+  schedule: ScheduleCostInputs,
+  matchedPeriod: PeriodInputs | null,
+): EffectiveCost {
+  const pick = (
+    override: Prisma.Decimal | null,
+    period: Prisma.Decimal | null | undefined,
+  ): { value: number | null; source: CostSource } => {
+    const o = dec(override);
+    if (o != null) return { value: round2(o), source: 'override' };
+    const p = dec(period ?? null);
+    if (p != null) return { value: round2(p), source: 'period' };
+    return { value: null, source: 'none' };
+  };
+  const c = pick(schedule.charterCostCny, matchedPeriod?.charterCostCny);
+  const dep = pick(schedule.airportTaxDepCny, matchedPeriod?.airportTaxDepCny);
+  const arr = pick(schedule.airportTaxArrCny, matchedPeriod?.airportTaxArrCny);
+  return {
+    charterCostCny: c.value,
+    airportTaxDepCny: dep.value,
+    airportTaxArrCny: arr.value,
+    charterCostCnySource: c.source,
+    airportTaxDepCnySource: dep.source,
+    airportTaxArrCnySource: arr.source,
+  };
+}
+
+/** 给一批 flightIds 批量预加载周期，返回 Map<flightId, periods[]>。用 listSchedulesWithCost/getFlightPnl/export 这种批处理。 */
+export async function loadPeriodsByFlightIds(
+  flightIds: string[],
+  client: PrismaClient = defaultPrisma,
+): Promise<Map<string, PeriodInputs[]>> {
+  if (flightIds.length === 0) return new Map();
+  const periods = await client.flightCostPeriod.findMany({
+    where: { flightId: { in: flightIds } },
+    orderBy: { effectiveFrom: 'desc' },
+    select: {
+      flightId: true,
+      effectiveFrom: true,
+      effectiveTo: true,
+      charterCostCny: true,
+      airportTaxDepCny: true,
+      airportTaxArrCny: true,
+    },
+  });
+  const map = new Map<string, PeriodInputs[]>();
+  for (const p of periods) {
+    const arr = map.get(p.flightId) ?? [];
+    arr.push(p);
+    map.set(p.flightId, arr);
+  }
+  return map;
+}
+
+// ── 航班成本周期（CRUD，admin-only）─────────────────────────────────────────
+
+export interface CostPeriodDto {
+  id: string;
+  flightId: string;
+  flightNumber: string;
+  origin: string;
+  destination: string;
+  effectiveFrom: string; // YYYY-MM-DD
+  effectiveTo: string; // YYYY-MM-DD
+  charterCostCny: number | null;
+  airportTaxDepCny: number | null;
+  airportTaxArrCny: number | null;
+  note: string | null;
+  updatedAt: string;
+}
+
+type PeriodWriteInput = {
+  flightId: string;
+  effectiveFrom: string; // YYYY-MM-DD
+  effectiveTo: string; // YYYY-MM-DD
+  charterCostCny?: number | null;
+  airportTaxDepCny?: number | null;
+  airportTaxArrCny?: number | null;
+  note?: string | null;
+};
+
+function toDateOnly(s: string): Date {
+  // 'YYYY-MM-DD' → UTC midnight. Prisma @db.Date stores date-only, this is the canonical input.
+  return new Date(`${s}T00:00:00.000Z`);
+}
+
+function toDto(row: {
+  id: string;
+  flightId: string;
+  effectiveFrom: Date;
+  effectiveTo: Date;
+  charterCostCny: Prisma.Decimal | null;
+  airportTaxDepCny: Prisma.Decimal | null;
+  airportTaxArrCny: Prisma.Decimal | null;
+  note: string | null;
+  updatedAt: Date;
+  flight: { flightNumber: string; originCode: string; destinationCode: string };
+}): CostPeriodDto {
+  const charter = dec(row.charterCostCny);
+  const taxDep = dec(row.airportTaxDepCny);
+  const taxArr = dec(row.airportTaxArrCny);
+  return {
+    id: row.id,
+    flightId: row.flightId,
+    flightNumber: row.flight.flightNumber,
+    origin: row.flight.originCode,
+    destination: row.flight.destinationCode,
+    effectiveFrom: fmtDateOnly(row.effectiveFrom),
+    effectiveTo: fmtDateOnly(row.effectiveTo),
+    charterCostCny: charter == null ? null : round2(charter),
+    airportTaxDepCny: taxDep == null ? null : round2(taxDep),
+    airportTaxArrCny: taxArr == null ? null : round2(taxArr),
+    note: row.note,
+    updatedAt: row.updatedAt.toISOString(),
+  };
+}
+
+export async function listCostPeriods(
+  filter: { flightId?: string } = {},
+  client: PrismaClient = defaultPrisma,
+): Promise<CostPeriodDto[]> {
+  const rows = await client.flightCostPeriod.findMany({
+    where: filter.flightId ? { flightId: filter.flightId } : undefined,
+    orderBy: [{ flightId: 'asc' }, { effectiveFrom: 'desc' }],
+    include: {
+      flight: { select: { flightNumber: true, originCode: true, destinationCode: true } },
+    },
+  });
+  return rows.map(toDto);
+}
+
+/** 校验：from ≤ to + 同 flightId 不允许跟现有周期重叠（excludeId 用于 update 时排除自己）。抛 Error。 */
+async function assertNoOverlap(
+  flightId: string,
+  from: Date,
+  to: Date,
+  excludeId: string | null,
+  client: PrismaClient,
+): Promise<void> {
+  if (from.getTime() > to.getTime()) {
+    throw new Error('起始日不能晚于结束日');
+  }
+  const overlap = await client.flightCostPeriod.findFirst({
+    where: {
+      flightId,
+      ...(excludeId ? { NOT: { id: excludeId } } : {}),
+      AND: [
+        { effectiveFrom: { lte: to } },
+        { effectiveTo: { gte: from } },
+      ],
+    },
+    select: { id: true, effectiveFrom: true, effectiveTo: true },
+  });
+  if (overlap) {
+    throw new Error(
+      `周期与现有周期重叠（${fmtDateOnly(overlap.effectiveFrom)} → ${fmtDateOnly(overlap.effectiveTo)}）`,
+    );
+  }
+}
+
+export async function createCostPeriod(
+  input: PeriodWriteInput,
+  client: PrismaClient = defaultPrisma,
+): Promise<CostPeriodDto> {
+  const from = toDateOnly(input.effectiveFrom);
+  const to = toDateOnly(input.effectiveTo);
+  await assertNoOverlap(input.flightId, from, to, null, client);
+  const row = await client.flightCostPeriod.create({
+    data: {
+      flightId: input.flightId,
+      effectiveFrom: from,
+      effectiveTo: to,
+      charterCostCny: input.charterCostCny ?? null,
+      airportTaxDepCny: input.airportTaxDepCny ?? null,
+      airportTaxArrCny: input.airportTaxArrCny ?? null,
+      note: input.note ?? null,
+    },
+    include: {
+      flight: { select: { flightNumber: true, originCode: true, destinationCode: true } },
+    },
+  });
+  return toDto(row);
+}
+
+export async function updateCostPeriod(
+  id: string,
+  input: Partial<Omit<PeriodWriteInput, 'flightId'>>,
+  client: PrismaClient = defaultPrisma,
+): Promise<CostPeriodDto> {
+  const existing = await client.flightCostPeriod.findUnique({ where: { id } });
+  if (!existing) throw new Error('周期不存在');
+  const from = input.effectiveFrom ? toDateOnly(input.effectiveFrom) : existing.effectiveFrom;
+  const to = input.effectiveTo ? toDateOnly(input.effectiveTo) : existing.effectiveTo;
+  if (input.effectiveFrom || input.effectiveTo) {
+    await assertNoOverlap(existing.flightId, from, to, id, client);
+  }
+  const data: Prisma.FlightCostPeriodUpdateInput = {};
+  if (input.effectiveFrom) data.effectiveFrom = from;
+  if (input.effectiveTo) data.effectiveTo = to;
+  if (input.charterCostCny !== undefined) data.charterCostCny = input.charterCostCny ?? null;
+  if (input.airportTaxDepCny !== undefined) data.airportTaxDepCny = input.airportTaxDepCny ?? null;
+  if (input.airportTaxArrCny !== undefined) data.airportTaxArrCny = input.airportTaxArrCny ?? null;
+  if (input.note !== undefined) data.note = input.note ?? null;
+  const row = await client.flightCostPeriod.update({
+    where: { id },
+    data,
+    include: {
+      flight: { select: { flightNumber: true, originCode: true, destinationCode: true } },
+    },
+  });
+  return toDto(row);
+}
+
+export async function deleteCostPeriod(
+  id: string,
+  client: PrismaClient = defaultPrisma,
+): Promise<{ id: string }> {
+  await client.flightCostPeriod.delete({ where: { id } });
+  return { id };
 }
 
 // ── 航班成本列表（财务页用，admin-only）──────────────────────────────────────
@@ -27,12 +318,30 @@ export interface FinanceScheduleRow {
   origin: string;
   destination: string;
   departureTime: string; // ISO
+  // 生效值（override → period → null）—— 给显示用
   charterCostCny: number | null;
   airportTaxDepCny: number | null;
   airportTaxArrCny: number | null;
+  // 班次自己存的值（即"覆盖"）—— 给编辑输入框绑定用；null = 不覆盖，用周期
+  charterCostCnyOverride: number | null;
+  airportTaxDepCnyOverride: number | null;
+  airportTaxArrCnyOverride: number | null;
+  // 命中周期的默认值 —— 给输入框 placeholder 用
+  charterCostCnyPeriod: number | null;
+  airportTaxDepCnyPeriod: number | null;
+  airportTaxArrCnyPeriod: number | null;
+  // 每字段的来源：override / period / none
+  charterCostCnySource: CostSource;
+  airportTaxDepCnySource: CostSource;
+  airportTaxArrCnySource: CostSource;
+  // 命中周期的信息（命中时非 null）
+  matchedPeriodId: string | null;
+  matchedPeriodFrom: string | null; // YYYY-MM-DD
+  matchedPeriodTo: string | null;
+  // 座位 + 派生
   totalSeats: number;
   soldSeats: number;
-  /** 单座(已售)成本 = charterCostCny ÷ soldSeats —— "保本线"；charter 缺失或 0 座售出时 null */
+  /** 单座(已售)成本 = 生效 charter ÷ soldSeats —— "保本线"；charter 缺失或 0 座售出时 null */
   perSoldSeatCostCny: number | null;
 }
 
@@ -56,13 +365,54 @@ export async function listSchedulesWithCost(
       seatClasses: { select: { capacity: true, sold: true } },
     },
   });
+
+  // 批量预加载所有相关航班的周期，避免 N+1
+  const flightIds = Array.from(new Set(schedules.map((s) => s.flight.id)));
+  const periodsMap = await loadPeriodsByFlightIds(flightIds, client);
+  // 同时拉一下完整的周期行（含 id/from/to）以便 row 上能带"命中周期"信息
+  const fullPeriods = await client.flightCostPeriod.findMany({
+    where: { flightId: { in: flightIds } },
+    orderBy: { effectiveFrom: 'desc' },
+    select: {
+      id: true,
+      flightId: true,
+      effectiveFrom: true,
+      effectiveTo: true,
+      charterCostCny: true,
+      airportTaxDepCny: true,
+      airportTaxArrCny: true,
+    },
+  });
+  const fullByFlight = new Map<string, typeof fullPeriods>();
+  for (const p of fullPeriods) {
+    const arr = fullByFlight.get(p.flightId) ?? [];
+    arr.push(p);
+    fullByFlight.set(p.flightId, arr);
+  }
+
   return schedules.map<FinanceScheduleRow>((s) => {
     const totalSeats = s.seatClasses.reduce((a, c) => a + c.capacity, 0);
     const soldSeats = s.seatClasses.reduce((a, c) => a + c.sold, 0);
-    const charter = dec(s.charterCostCny);
-    const taxDep = dec(s.airportTaxDepCny);
-    const taxArr = dec(s.airportTaxArrCny);
-    const perSoldSeat = charter != null && soldSeats > 0 ? charter / soldSeats : null;
+    const periodsForFlight = periodsMap.get(s.flight.id) ?? [];
+    const matched = findMatchedPeriod(s, periodsForFlight);
+    const eff = resolveScheduleCost(s, matched);
+    // 找完整的命中周期行（取 id/from/to）
+    const matchedFull =
+      matched == null
+        ? null
+        : (fullByFlight.get(s.flight.id) ?? []).find(
+            (p) =>
+              p.effectiveFrom.getTime() === matched.effectiveFrom.getTime() &&
+              p.effectiveTo.getTime() === matched.effectiveTo.getTime(),
+          ) ?? null;
+    const overrideC = dec(s.charterCostCny);
+    const overrideDep = dec(s.airportTaxDepCny);
+    const overrideArr = dec(s.airportTaxArrCny);
+    const periodC = matched ? dec(matched.charterCostCny) : null;
+    const periodDep = matched ? dec(matched.airportTaxDepCny) : null;
+    const periodArr = matched ? dec(matched.airportTaxArrCny) : null;
+    const perSoldSeat =
+      eff.charterCostCny != null && soldSeats > 0 ? eff.charterCostCny / soldSeats : null;
     return {
       scheduleId: s.id,
       flightId: s.flight.id,
@@ -70,9 +420,21 @@ export async function listSchedulesWithCost(
       origin: s.flight.originCode,
       destination: s.flight.destinationCode,
       departureTime: s.departureTime.toISOString(),
-      charterCostCny: charter == null ? null : round2(charter),
-      airportTaxDepCny: taxDep == null ? null : round2(taxDep),
-      airportTaxArrCny: taxArr == null ? null : round2(taxArr),
+      charterCostCny: eff.charterCostCny,
+      airportTaxDepCny: eff.airportTaxDepCny,
+      airportTaxArrCny: eff.airportTaxArrCny,
+      charterCostCnyOverride: overrideC == null ? null : round2(overrideC),
+      airportTaxDepCnyOverride: overrideDep == null ? null : round2(overrideDep),
+      airportTaxArrCnyOverride: overrideArr == null ? null : round2(overrideArr),
+      charterCostCnyPeriod: periodC == null ? null : round2(periodC),
+      airportTaxDepCnyPeriod: periodDep == null ? null : round2(periodDep),
+      airportTaxArrCnyPeriod: periodArr == null ? null : round2(periodArr),
+      charterCostCnySource: eff.charterCostCnySource,
+      airportTaxDepCnySource: eff.airportTaxDepCnySource,
+      airportTaxArrCnySource: eff.airportTaxArrCnySource,
+      matchedPeriodId: matchedFull?.id ?? null,
+      matchedPeriodFrom: matched ? fmtDateOnly(matched.effectiveFrom) : null,
+      matchedPeriodTo: matched ? fmtDateOnly(matched.effectiveTo) : null,
       totalSeats,
       soldSeats,
       perSoldSeatCostCny: perSoldSeat == null ? null : round2(perSoldSeat),

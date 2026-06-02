@@ -4,6 +4,7 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import { api, ApiError, type AgentListItem, type CreateChildAgentInput } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { NumberInput } from '../components/NumberInput';
 
 const TIER_LABEL = ['', '1级·总代', '2级·区代', '3级·门店', '4级', '5级'];
 const TIER_COLOR = ['', 'bg-red-100 text-red-700', 'bg-amber-100 text-amber-700', 'bg-blue-100 text-blue-700', 'bg-slate-100 text-slate-600', 'bg-slate-100 text-slate-600'];
@@ -611,12 +612,13 @@ function CommissionTab({ agent }: { agent: AgentListItem }) {
 }
 
 function BalanceTab({ agent }: { agent: AgentListItem }) {
-  const [amount, setAmount] = useState(0);
+  const [amount, setAmount] = useState<number | null>(null);
   const [action, setAction] = useState<'TOP_UP' | 'DEDUCT'>('TOP_UP');
   const [note, setNote] = useState('');
   const [saved, setSaved] = useState(false);
   const current = Number(agent.prepaymentBalance);
-  const newBalance = current + (action === 'TOP_UP' ? Math.abs(amount) : -Math.abs(amount));
+  const amt = amount ?? 0;
+  const newBalance = current + (action === 'TOP_UP' ? Math.abs(amt) : -Math.abs(amt));
 
   return (
     <div className="space-y-4">
@@ -646,14 +648,14 @@ function BalanceTab({ agent }: { agent: AgentListItem }) {
 
       <div>
         <label className="label text-xs">金额 (¥)</label>
-        <input type="number" min={0} step={0.01} className="input" value={amount || ''} onChange={(e) => setAmount(Number(e.target.value) || 0)} />
+        <NumberInput min={0} step={0.01} className="input" value={amount} onChange={(n) => setAmount(n)} />
       </div>
       <div>
         <label className="label text-xs">备注（可选）</label>
         <input className="input" value={note} onChange={(e) => setNote(e.target.value)} placeholder="如：月度对账充值 / 退款" />
       </div>
 
-      {amount > 0 && (
+      {amt > 0 && (
         <div className="rounded-md bg-blue-50 border border-blue-200 p-3 text-sm">
           <div className="flex justify-between">
             <span className="text-slate-600">调整后余额</span>
@@ -666,8 +668,8 @@ function BalanceTab({ agent }: { agent: AgentListItem }) {
       {saved ? (
         <div className="rounded-md bg-green-50 px-3 py-2 text-sm text-green-700">✅ 余额已调整（demo）</div>
       ) : (
-        <button className="btn-primary w-full" disabled={amount <= 0} onClick={() => { setSaved(true); setTimeout(() => setSaved(false), 2000); }}>
-          确认{action === 'TOP_UP' ? '充值' : '扣款'} ¥{Math.abs(amount).toFixed(2)}
+        <button className="btn-primary w-full" disabled={amt <= 0} onClick={() => { setSaved(true); setTimeout(() => setSaved(false), 2000); }}>
+          确认{action === 'TOP_UP' ? '充值' : '扣款'} ¥{Math.abs(amt).toFixed(2)}
         </button>
       )}
     </div>
@@ -831,10 +833,11 @@ function CreateAgentForm({
 }) {
   const tokens = useAuth((s) => s.tokens);
   const [parentId, setParentId] = useState(initialParentId ?? '');
-  const [form, setForm] = useState<CreateChildAgentInput>({
+  const [form, setForm] = useState<Omit<CreateChildAgentInput, 'prepaymentBalance'>>({
     email: '', password: '', displayName: '', contactName: '', contactPhone: '',
-    companyName: '', prepaymentBalance: 0, notes: '',
+    companyName: '', notes: '',
   });
+  const [prepaymentBalance, setPrepaymentBalance] = useState<number | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const parentOptions = useMemo(() => agents.filter((a) => a.isActive && a.tier < 5), [agents]);
@@ -844,7 +847,11 @@ function CreateAgentForm({
     if (!tokens) return;
     setSubmitting(true); setErr(null);
     try {
-      await api.createChildAgent(tokens.accessToken, form, parentId || undefined);
+      await api.createChildAgent(
+        tokens.accessToken,
+        { ...form, prepaymentBalance: prepaymentBalance ?? 0 },
+        parentId || undefined,
+      );
       onCreated();
     } catch (error) {
       setErr(error instanceof ApiError ? error.message : '创建失败');
@@ -877,7 +884,7 @@ function CreateAgentForm({
         <div><label className="label">公司名</label><input className="input" value={form.companyName ?? ''} onChange={(e) => setForm({ ...form, companyName: e.target.value })} /></div>
         <div><label className="label">联系人 *</label><input required className="input" value={form.contactName} onChange={(e) => setForm({ ...form, contactName: e.target.value })} /></div>
         <div><label className="label">联系电话 *</label><input required className="input" value={form.contactPhone} onChange={(e) => setForm({ ...form, contactPhone: e.target.value })} /></div>
-        <div><label className="label">初始预付余额（¥）</label><input type="number" min={0} className="input" value={form.prepaymentBalance ?? 0} onChange={(e) => setForm({ ...form, prepaymentBalance: Number(e.target.value) || 0 })} /></div>
+        <div><label className="label">初始预付余额（¥）</label><NumberInput min={0} className="input" value={prepaymentBalance} onChange={(n) => setPrepaymentBalance(n)} /></div>
         <div><label className="label">备注</label><input className="input" value={form.notes ?? ''} onChange={(e) => setForm({ ...form, notes: e.target.value })} /></div>
         {err && <div className="md:col-span-2 rounded-md bg-red-50 px-3 py-2 text-sm text-red-700">{err}</div>}
         <div className="md:col-span-2 flex justify-end gap-3">

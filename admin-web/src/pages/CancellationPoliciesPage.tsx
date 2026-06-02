@@ -7,6 +7,17 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api, ApiError, type CancellationPolicy, type CancellationTier, type ProductKind } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { NumberInput } from '../components/NumberInput';
+
+type DraftTier = { hoursBeforeDeparture: number | null; feePercent: number | null };
+const draftToTier = (t: DraftTier): CancellationTier => ({
+  hoursBeforeDeparture: t.hoursBeforeDeparture ?? 0,
+  feePercent: Math.max(0, Math.min(100, t.feePercent ?? 0)),
+});
+const tierToDraft = (t: CancellationTier): DraftTier => ({
+  hoursBeforeDeparture: t.hoursBeforeDeparture,
+  feePercent: t.feePercent,
+});
 
 const KIND_LABEL: Record<ProductKind, string> = {
   FLIGHT: '机票',
@@ -146,13 +157,13 @@ function PolicyCard({
   onDelete: () => void;
 }) {
   const [name, setName] = useState(policy.name);
-  const [tiers, setTiers] = useState<CancellationTier[]>(policy.tiers);
+  const [tiers, setTiers] = useState<DraftTier[]>(policy.tiers.map(tierToDraft));
   const [notes, setNotes] = useState(policy.notes ?? '');
   const [isDefault, setIsDefault] = useState(policy.isDefault);
 
   useEffect(() => {
     setName(policy.name);
-    setTiers(policy.tiers);
+    setTiers(policy.tiers.map(tierToDraft));
     setNotes(policy.notes ?? '');
     setIsDefault(policy.isDefault);
   }, [policy]);
@@ -213,37 +224,38 @@ function PolicyCard({
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-100">
-            {tiers.map((t, i) => (
+            {tiers.map((t, i) => {
+              const hours = t.hoursBeforeDeparture ?? 0;
+              const fee = t.feePercent ?? 0;
+              return (
               <tr key={i}>
                 <td className="px-3 py-2">
                   {editing ? (
-                    <input
-                      type="number"
+                    <NumberInput
                       className="input w-32"
                       value={t.hoursBeforeDeparture}
-                      onChange={(e) => {
-                        const v = Number(e.target.value);
-                        setTiers((prev) => prev.map((x, j) => j === i ? { ...x, hoursBeforeDeparture: v } : x));
+                      onChange={(n) => {
+                        setTiers((prev) => prev.map((x, j) => j === i ? { ...x, hoursBeforeDeparture: n } : x));
                       }}
+                      allowNegative
+                      integerOnly
                     />
                   ) : (
                     <span className="font-mono">
-                      {t.hoursBeforeDeparture === -1 ? '已履约 / 已起飞' : `${t.hoursBeforeDeparture} 小时`}
+                      {hours === -1 ? '已履约 / 已起飞' : `${hours} 小时`}
                     </span>
                   )}
                 </td>
                 <td className="px-3 py-2">
                   {editing ? (
                     <div className="flex items-center gap-1">
-                      <input
-                        type="number"
+                      <NumberInput
                         min={0}
                         max={100}
                         className="input w-24"
                         value={t.feePercent}
-                        onChange={(e) => {
-                          const v = Math.max(0, Math.min(100, Number(e.target.value)));
-                          setTiers((prev) => prev.map((x, j) => j === i ? { ...x, feePercent: v } : x));
+                        onChange={(n) => {
+                          setTiers((prev) => prev.map((x, j) => j === i ? { ...x, feePercent: n } : x));
                         }}
                       />
                       <span className="text-slate-500">%</span>
@@ -251,12 +263,12 @@ function PolicyCard({
                   ) : (
                     <span
                       className={`font-semibold ${
-                        t.feePercent >= 80 ? 'text-red-600' :
-                        t.feePercent >= 50 ? 'text-amber-600' :
-                        t.feePercent > 0 ? 'text-slate-700' : 'text-emerald-600'
+                        fee >= 80 ? 'text-red-600' :
+                        fee >= 50 ? 'text-amber-600' :
+                        fee > 0 ? 'text-slate-700' : 'text-emerald-600'
                       }`}
                     >
-                      {t.feePercent}% {t.feePercent === 0 && '（免费）'}
+                      {fee}% {fee === 0 && '（免费）'}
                     </span>
                   )}
                 </td>
@@ -271,7 +283,8 @@ function PolicyCard({
                   </td>
                 )}
               </tr>
-            ))}
+              );
+            })}
           </tbody>
         </table>
         {editing && (
@@ -319,7 +332,7 @@ function PolicyCard({
             onClick={() =>
               onSave({
                 name,
-                tiers,
+                tiers: tiers.map(draftToTier),
                 notes: notes || null,
                 isDefault,
               })
@@ -346,7 +359,7 @@ function CreatePolicyModal({
   const [productKind, setProductKind] = useState<ProductKind>(firstAvailable);
   const [name, setName] = useState('');
   const [scope, setScope] = useState('');
-  const [tiers, setTiers] = useState<CancellationTier[]>([
+  const [tiers, setTiers] = useState<DraftTier[]>([
     { hoursBeforeDeparture: 168, feePercent: 5 },
     { hoursBeforeDeparture: 24, feePercent: 50 },
     { hoursBeforeDeparture: -1, feePercent: 100 },
@@ -407,25 +420,23 @@ function CreatePolicyModal({
             <label className="label">阶梯（hours / fee%）</label>
             {tiers.map((t, i) => (
               <div key={i} className="mt-2 flex items-center gap-2">
-                <input
-                  type="number"
+                <NumberInput
                   className="input w-32"
                   value={t.hoursBeforeDeparture}
-                  onChange={(e) => {
-                    const v = Number(e.target.value);
-                    setTiers((prev) => prev.map((x, j) => (j === i ? { ...x, hoursBeforeDeparture: v } : x)));
+                  onChange={(n) => {
+                    setTiers((prev) => prev.map((x, j) => (j === i ? { ...x, hoursBeforeDeparture: n } : x)));
                   }}
+                  allowNegative
+                  integerOnly
                 />
                 <span className="text-xs text-slate-500">小时前</span>
-                <input
-                  type="number"
+                <NumberInput
                   min={0}
                   max={100}
                   className="input w-24"
                   value={t.feePercent}
-                  onChange={(e) => {
-                    const v = Math.max(0, Math.min(100, Number(e.target.value)));
-                    setTiers((prev) => prev.map((x, j) => (j === i ? { ...x, feePercent: v } : x)));
+                  onChange={(n) => {
+                    setTiers((prev) => prev.map((x, j) => (j === i ? { ...x, feePercent: n } : x)));
                   }}
                 />
                 <span className="text-xs text-slate-500">%</span>
@@ -454,7 +465,7 @@ function CreatePolicyModal({
               onSubmit({
                 productKind,
                 name,
-                tiers,
+                tiers: tiers.map(draftToTier),
                 scope: scope.trim() || undefined,
                 isDefault: !isOverride && !existingKinds.has(productKind),
               })

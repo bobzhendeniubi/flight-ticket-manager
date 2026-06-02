@@ -15,6 +15,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { api, type AdminFlight, type AdminSchedule } from '../lib/api';
 import { airportLabel, CABIN_LABEL, formatLocalDate, formatLocalTime } from '../lib/airports';
 import { useAuth } from '../stores/auth';
+import { NumberInput } from '../components/NumberInput';
 
 interface SeatAllocation {
   id: string;
@@ -429,12 +430,13 @@ function NewAllocationForm({
 }) {
   const [agentIdx, setAgentIdx] = useState(0);
   const [cabin, setCabin] = useState<'ECONOMY' | 'BUSINESS'>('ECONOMY');
-  const [seats, setSeats] = useState(20);
+  const [seats, setSeats] = useState<number | null>(20);
   const [days, setDays] = useState(7);
 
   // Invariant: 申请切位 ≤ 散客池剩余
   const max = cabinSummary[cabin]?.pool ?? 0;
-  const valid = seats > 0 && seats <= max;
+  const seatsNum = seats ?? 0;
+  const valid = seatsNum > 0 && seatsNum <= max;
   const agent = DEMO_AGENTS[agentIdx];
 
   return (
@@ -467,13 +469,13 @@ function NewAllocationForm({
           </div>
           <div>
             <label className="label">切位数（≤ 散客池剩余）</label>
-            <input
-              type="number"
+            <NumberInput
+              integerOnly
               min={1}
               max={max}
               className="input"
               value={seats}
-              onChange={(e) => setSeats(Number(e.target.value) || 0)}
+              onChange={(n) => setSeats(n)}
             />
             {!valid && (
               <p className="mt-1 text-xs text-red-600">⚠️ 必须 1 ≤ 切位数 ≤ {max}（散客池上限）</p>
@@ -499,7 +501,7 @@ function NewAllocationForm({
                   agentName: agent.name,
                   agentTier: agent.tier,
                   cabin,
-                  allocated: seats,
+                  allocated: seatsNum,
                   sold: 0,
                   releaseAt: addDays(days),
                 })
@@ -549,8 +551,8 @@ function BulkAllocationModal({
   const [fromDate, setFromDate] = useState(todayStr);
   const [toDate, setToDate] = useState(toDefault);
   const [dowSet, setDowSet] = useState<Set<number>>(() => new Set([0, 1, 2, 3, 4, 5, 6]));
-  const [econSeats, setEconSeats] = useState(20);
-  const [bizSeats, setBizSeats] = useState(3);
+  const [econSeats, setEconSeats] = useState<number | null>(20);
+  const [bizSeats, setBizSeats] = useState<number | null>(3);
   const [cabinMode, setCabinMode] = useState<'ECONOMY' | 'BUSINESS' | 'BOTH'>('ECONOMY');
   const [releaseDays, setReleaseDays] = useState(7);
 
@@ -580,7 +582,7 @@ function BulkAllocationModal({
     const now = Date.now();
     for (const s of matchedSchedules) {
       for (const c of cabins) {
-        const seats = c === 'ECONOMY' ? econSeats : bizSeats;
+        const seats = (c === 'ECONOMY' ? econSeats : bizSeats) ?? 0;
         if (seats <= 0) continue;
         // releaseAt = 班次出发前 releaseDays 天（不能早于 now）
         const depMs = new Date(s.departureTime).getTime();
@@ -750,26 +752,26 @@ function BulkAllocationModal({
             {(cabinMode === 'ECONOMY' || cabinMode === 'BOTH') && (
               <div>
                 <label className="label">经济舱每班切</label>
-                <input
-                  type="number"
+                <NumberInput
+                  integerOnly
                   min={0}
                   max={180}
                   className="input"
                   value={econSeats}
-                  onChange={(e) => setEconSeats(Number(e.target.value) || 0)}
+                  onChange={(n) => setEconSeats(n)}
                 />
               </div>
             )}
             {(cabinMode === 'BUSINESS' || cabinMode === 'BOTH') && (
               <div>
                 <label className="label">商务舱每班切</label>
-                <input
-                  type="number"
+                <NumberInput
+                  integerOnly
                   min={0}
                   max={20}
                   className="input"
                   value={bizSeats}
-                  onChange={(e) => setBizSeats(Number(e.target.value) || 0)}
+                  onChange={(n) => setBizSeats(n)}
                 />
               </div>
             )}

@@ -7,6 +7,7 @@
  */
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
+import { safeRandomUUID } from '../lib/uuid';
 
 export type CartItemKind = 'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA' | 'BUNDLE';
 
@@ -49,12 +50,9 @@ export const useCart = create<CartState>()(
       items: [],
 
       add: (item) => {
-        // 用 crypto.randomUUID 保证唯一性（同一毫秒多次添加不会冲突）
-        const uniq =
-          typeof crypto !== 'undefined' && 'randomUUID' in crypto
-            ? crypto.randomUUID()
-            : `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
-        const id = `${item.kind}-${item.productId}-${uniq}`;
+        // safeRandomUUID 在 insecure context（http）也能用 —— crypto.randomUUID()
+        // 在裸 IP 走 http 时直接调用会抛 DOMException
+        const id = `${item.kind}-${item.productId}-${safeRandomUUID()}`;
         set((state) => ({
           items: [
             ...state.items,

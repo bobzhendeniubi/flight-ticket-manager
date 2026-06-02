@@ -25,6 +25,7 @@ import {
   type FinanceScheduleRow,
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { NumberInput } from '../components/NumberInput';
 
 type Tab = 'summary' | 'flights' | 'orders' | 'monthly' | 'costs';
 
@@ -380,13 +381,12 @@ function FlightScheduleCostRow({
   token: string;
   onSaved: () => void;
 }) {
-  const [charter, setCharter] = useState<string>(row.charterCostCny == null ? '' : String(row.charterCostCny));
-  const [taxDep, setTaxDep] = useState<string>(row.airportTaxDepCny == null ? '' : String(row.airportTaxDepCny));
-  const [taxArr, setTaxArr] = useState<string>(row.airportTaxArrCny == null ? '' : String(row.airportTaxArrCny));
+  const [charter, setCharter] = useState<number | null>(row.charterCostCny);
+  const [taxDep, setTaxDep] = useState<number | null>(row.airportTaxDepCny);
+  const [taxArr, setTaxArr] = useState<number | null>(row.airportTaxArrCny);
   const [saving, setSaving] = useState(false);
   const [saveErr, setSaveErr] = useState<string | null>(null);
 
-  const toNum = (v: string): number | null => (v.trim() === '' ? null : Number(v));
   const inputCls = 'w-24 rounded border border-slate-300 px-1.5 py-0.5 text-right text-xs tabular-nums';
 
   async function save(): Promise<void> {
@@ -395,9 +395,9 @@ function FlightScheduleCostRow({
     setSaveErr(null);
     try {
       await api.patchFlightScheduleCost(token, row.scheduleId, {
-        charterCostCny: toNum(charter),
-        airportTaxDepCny: toNum(taxDep),
-        airportTaxArrCny: toNum(taxArr),
+        charterCostCny: charter,
+        airportTaxDepCny: taxDep,
+        airportTaxArrCny: taxArr,
       });
       onSaved();
     } catch (e: unknown) {
@@ -427,30 +427,27 @@ function FlightScheduleCostRow({
         })}
       </td>
       <td className="py-2 text-right">
-        <input
+        <NumberInput
           className={inputCls}
-          type="number"
-          step="1"
+          step={1}
           value={charter}
-          onChange={(e) => setCharter(e.target.value)}
+          onChange={(n) => setCharter(n)}
         />
       </td>
       <td className="py-2 text-right">
-        <input
+        <NumberInput
           className={inputCls}
-          type="number"
-          step="0.01"
+          step={0.01}
           value={taxDep}
-          onChange={(e) => setTaxDep(e.target.value)}
+          onChange={(n) => setTaxDep(n)}
         />
       </td>
       <td className="py-2 text-right">
-        <input
+        <NumberInput
           className={inputCls}
-          type="number"
-          step="0.01"
+          step={0.01}
           value={taxArr}
-          onChange={(e) => setTaxArr(e.target.value)}
+          onChange={(n) => setTaxArr(n)}
         />
       </td>
       <td className="py-2 text-right tabular-nums text-slate-600">
@@ -626,8 +623,8 @@ function CostRow({
   fields: CostField[];
   onSave: (vals: Record<string, number | null>) => Promise<void>;
 }) {
-  const [draft, setDraft] = useState<Record<string, string>>(
-    Object.fromEntries(fields.map((f) => [f.key, f.value ?? ''])),
+  const [draft, setDraft] = useState<Record<string, number | null>>(
+    Object.fromEntries(fields.map((f) => [f.key, f.value == null || f.value === '' ? null : Number(f.value)])),
   );
   const [saving, setSaving] = useState(false);
 
@@ -636,8 +633,7 @@ function CostRow({
     try {
       const vals: Record<string, number | null> = {};
       for (const f of fields) {
-        const raw = draft[f.key];
-        vals[f.key] = raw === '' ? null : Number(raw);
+        vals[f.key] = draft[f.key] ?? null;
       }
       await onSave(vals);
     } finally {
@@ -653,11 +649,10 @@ function CostRow({
       </td>
       {fields.map((f) => (
         <td key={f.key} className="py-2 text-right">
-          <input
-            type="number"
-            step="0.01"
-            value={draft[f.key] ?? ''}
-            onChange={(e) => setDraft((d) => ({ ...d, [f.key]: e.target.value }))}
+          <NumberInput
+            step={0.01}
+            value={draft[f.key] ?? null}
+            onChange={(n) => setDraft((d) => ({ ...d, [f.key]: n }))}
             className="w-28 rounded-md border border-slate-300 px-2 py-1 text-right text-sm"
           />
         </td>

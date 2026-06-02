@@ -14,6 +14,7 @@ import {
 } from '../lib/mockData';
 import { api, ApiError, type Hotel, type Transfer as ApiTransfer, type Visa as ApiVisa, type Bundle as ApiBundle } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { NumberInput } from '../components/NumberInput';
 
 type Section = 'hotels' | 'transfers' | 'visas' | 'bundles';
 
@@ -387,7 +388,7 @@ function NewHotelForm({
   const [nameEn, setNameEn] = useState('');
   const [area, setArea] = useState('美溪海滩');
   const [stars, setStars] = useState<3 | 4 | 5>(4);
-  const [basePrice, setBasePrice] = useState(880);
+  const [basePrice, setBasePrice] = useState<number | null>(880);
 
   return (
     <section className="card border-brand/30">
@@ -403,7 +404,7 @@ function NewHotelForm({
             cityCode: 'DAD',
             area,
             stars,
-            basePrice,
+            basePrice: basePrice ?? 0,
             rating: 4.5,
             reviewCount: 0,
             emoji: '🏨',
@@ -448,12 +449,11 @@ function NewHotelForm({
         </div>
         <div>
           <label className="label">每晚起价 (¥)</label>
-          <input
-            type="number"
+          <NumberInput
             min={100}
             className="input"
             value={basePrice}
-            onChange={(e) => setBasePrice(Number(e.target.value) || 0)}
+            onChange={(n) => setBasePrice(n)}
           />
         </div>
         <div className="md:col-span-3 flex justify-end gap-3">
@@ -728,17 +728,20 @@ function NewBundleWizard({
   const [tagline, setTagline] = useState('');
   const [emoji, setEmoji] = useState('🎁');
   const [suitableFor, setSuitableFor] = useState('2 大人');
-  const [items, setItems] = useState<BundleItem[]>([
+  // Local draft shape allowing null for in-progress numeric edits
+  type DraftBundleItem = Omit<BundleItem, 'qty' | 'unitPrice'> & { qty: number | null; unitPrice: number | null };
+  const [items, setItems] = useState<DraftBundleItem[]>([
     { kind: 'HOTEL', productName: '岘港凯悦度假村 3 晚', qty: 3, unitPrice: 1880 },
   ]);
-  const [discount, setDiscount] = useState(500);
+  const [discount, setDiscount] = useState<number | null>(500);
 
-  const listPrice = useMemo(() => items.reduce((s, i) => s + i.qty * i.unitPrice, 0), [items]);
-  const bundlePrice = Math.max(0, listPrice - discount);
+  const listPrice = useMemo(() => items.reduce((s, i) => s + (i.qty ?? 0) * (i.unitPrice ?? 0), 0), [items]);
+  const discountValue = Math.min(listPrice, Math.max(0, discount ?? 0));
+  const bundlePrice = Math.max(0, listPrice - discountValue);
   const valid = name.length > 0 && items.length > 0 && bundlePrice > 0;
 
   const addItem = (kind: BundleItem['kind']) => {
-    const presets: Record<BundleItem['kind'], BundleItem> = {
+    const presets: Record<BundleItem['kind'], DraftBundleItem> = {
       FLIGHT: { kind: 'HOTEL', productName: '（请从下方添加）', qty: 1, unitPrice: 0 },
       HOTEL: { kind: 'HOTEL', productName: '岘港凯悦度假村 1 晚', qty: 3, unitPrice: 1880 },
       TRANSFER: { kind: 'TRANSFER', productName: '岘港机场接送 商务车', qty: 2, unitPrice: 188 },
@@ -808,30 +811,29 @@ function NewBundleWizard({
                       setItems(next);
                     }}
                   />
-                  <input
-                    type="number"
+                  <NumberInput
                     min={1}
                     className="input w-16 text-xs"
                     value={it.qty}
-                    onChange={(e) => {
+                    onChange={(n) => {
                       const next = [...items];
-                      next[idx] = { ...it, qty: Math.max(1, Number(e.target.value) || 1) };
+                      next[idx] = { ...it, qty: n };
                       setItems(next);
                     }}
+                    integerOnly
                   />
-                  <input
-                    type="number"
+                  <NumberInput
                     min={0}
                     className="input w-24 text-xs"
                     value={it.unitPrice}
-                    onChange={(e) => {
+                    onChange={(n) => {
                       const next = [...items];
-                      next[idx] = { ...it, unitPrice: Number(e.target.value) || 0 };
+                      next[idx] = { ...it, unitPrice: n };
                       setItems(next);
                     }}
                   />
                   <span className="text-xs text-slate-500 w-20 text-right">
-                    ¥{(it.qty * it.unitPrice).toLocaleString()}
+                    ¥{((it.qty ?? 0) * (it.unitPrice ?? 0)).toLocaleString()}
                   </span>
                   <button
                     type="button"
@@ -852,13 +854,12 @@ function NewBundleWizard({
             </div>
             <div className="flex items-center justify-between text-sm">
               <span className="text-slate-600">让利金额</span>
-              <input
-                type="number"
+              <NumberInput
                 min={0}
                 max={listPrice}
                 className="input w-32 text-right"
                 value={discount}
-                onChange={(e) => setDiscount(Math.min(listPrice, Math.max(0, Number(e.target.value) || 0)))}
+                onChange={(n) => setDiscount(n)}
               />
             </div>
             <div className="flex items-center justify-between border-t border-slate-200 pt-2">
@@ -881,10 +882,14 @@ function NewBundleWizard({
                   name,
                   tagline: tagline || '新建套餐',
                   emoji,
-                  items,
+                  items: items.map((it) => ({
+                    ...it,
+                    qty: Math.max(1, it.qty ?? 1),
+                    unitPrice: it.unitPrice ?? 0,
+                  })),
                   listPrice,
                   bundlePrice,
-                  groundDiscount: discount,
+                  groundDiscount: discountValue,
                   flightPax: 2,
                   suitableFor,
                   active: true,
@@ -916,6 +921,7 @@ function ActionBar({ active, onAdd, addLabel }: { active: number; onAdd: () => v
 
 function EditHotelForm({ hotel, onCancel, onSave }: { hotel: MockHotel; onCancel: () => void; onSave: (h: MockHotel) => void }) {
   const [form, setForm] = useState({ ...hotel });
+  const [basePrice, setBasePrice] = useState<number | null>(hotel.basePrice);
   const [amenitiesText, setAmenitiesText] = useState(hotel.amenities.join(', '));
   const [saved, setSaved] = useState(false);
 
@@ -923,6 +929,7 @@ function EditHotelForm({ hotel, onCancel, onSave }: { hotel: MockHotel; onCancel
     e.preventDefault();
     const updated: MockHotel = {
       ...form,
+      basePrice: basePrice ?? 0,
       amenities: amenitiesText.split(',').map(s => s.trim()).filter(Boolean),
     };
     setSaved(true);
@@ -958,7 +965,7 @@ function EditHotelForm({ hotel, onCancel, onSave }: { hotel: MockHotel; onCancel
         </div>
         <div>
           <label className="label text-xs">每晚起价 (¥)</label>
-          <input type="number" min={0} className="input" value={form.basePrice} onChange={(e) => setForm({ ...form, basePrice: Number(e.target.value) || 0 })} />
+          <NumberInput min={0} className="input" value={basePrice} onChange={(n) => setBasePrice(n)} />
         </div>
         <div>
           <label className="label text-xs">城市代码</label>
@@ -997,6 +1004,8 @@ function EditHotelForm({ hotel, onCancel, onSave }: { hotel: MockHotel; onCancel
 
 function EditTransferForm({ transfer, onCancel, onSave }: { transfer: MockTransfer; onCancel: () => void; onSave: (t: MockTransfer) => void }) {
   const [form, setForm] = useState({ ...transfer });
+  const [basePrice, setBasePrice] = useState<number | null>(transfer.basePrice);
+  const [capacity, setCapacity] = useState<number | null>(transfer.capacity);
   const [featuresText, setFeaturesText] = useState(transfer.features.join(', '));
   const [saved, setSaved] = useState(false);
 
@@ -1004,6 +1013,8 @@ function EditTransferForm({ transfer, onCancel, onSave }: { transfer: MockTransf
     e.preventDefault();
     const updated: MockTransfer = {
       ...form,
+      basePrice: basePrice ?? 0,
+      capacity: capacity ?? 1,
       features: featuresText.split(',').map(s => s.trim()).filter(Boolean),
     };
     setSaved(true);
@@ -1023,7 +1034,7 @@ function EditTransferForm({ transfer, onCancel, onSave }: { transfer: MockTransf
         </div>
         <div>
           <label className="label text-xs">起步价 (¥)</label>
-          <input type="number" min={0} className="input" value={form.basePrice} onChange={(e) => setForm({ ...form, basePrice: Number(e.target.value) || 0 })} />
+          <NumberInput min={0} className="input" value={basePrice} onChange={(n) => setBasePrice(n)} />
         </div>
         <div className="md:col-span-2">
           <label className="label text-xs">车型描述</label>
@@ -1031,7 +1042,7 @@ function EditTransferForm({ transfer, onCancel, onSave }: { transfer: MockTransf
         </div>
         <div>
           <label className="label text-xs">最大乘客数</label>
-          <input type="number" min={1} max={20} className="input" value={form.capacity} onChange={(e) => setForm({ ...form, capacity: Number(e.target.value) || 1 })} />
+          <NumberInput min={1} max={20} className="input" value={capacity} onChange={(n) => setCapacity(n)} integerOnly />
         </div>
         <div>
           <label className="label text-xs">出发区域</label>
@@ -1071,6 +1082,10 @@ function EditTransferForm({ transfer, onCancel, onSave }: { transfer: MockTransf
 
 function EditVisaForm({ visa, onCancel, onSave }: { visa: MockVisa; onCancel: () => void; onSave: (v: MockVisa) => void }) {
   const [form, setForm] = useState({ ...visa, highlight: visa.highlight ?? '' });
+  const [basePrice, setBasePrice] = useState<number | null>(visa.basePrice);
+  const [expressSurcharge, setExpressSurcharge] = useState<number | null>(visa.expressSurcharge);
+  const [processingDays, setProcessingDays] = useState<number | null>(visa.processingDays);
+  const [validityMonths, setValidityMonths] = useState<number | null>(visa.validityMonths);
   const [docsText, setDocsText] = useState(visa.requiredDocs.join(', '));
   const [saved, setSaved] = useState(false);
 
@@ -1078,6 +1093,10 @@ function EditVisaForm({ visa, onCancel, onSave }: { visa: MockVisa; onCancel: ()
     e.preventDefault();
     const updated: MockVisa = {
       ...form,
+      basePrice: basePrice ?? 0,
+      expressSurcharge: expressSurcharge ?? 0,
+      processingDays: processingDays ?? 1,
+      validityMonths: validityMonths ?? 1,
       highlight: form.highlight || undefined,
       requiredDocs: docsText.split(',').map(s => s.trim()).filter(Boolean),
     };
@@ -1110,19 +1129,19 @@ function EditVisaForm({ visa, onCancel, onSave }: { visa: MockVisa; onCancel: ()
         </div>
         <div>
           <label className="label text-xs">办理费 (¥)</label>
-          <input type="number" min={0} className="input" value={form.basePrice} onChange={(e) => setForm({ ...form, basePrice: Number(e.target.value) || 0 })} />
+          <NumberInput min={0} className="input" value={basePrice} onChange={(n) => setBasePrice(n)} />
         </div>
         <div>
           <label className="label text-xs">加急附加费 (¥)</label>
-          <input type="number" min={0} className="input" value={form.expressSurcharge} onChange={(e) => setForm({ ...form, expressSurcharge: Number(e.target.value) || 0 })} />
+          <NumberInput min={0} className="input" value={expressSurcharge} onChange={(n) => setExpressSurcharge(n)} />
         </div>
         <div>
           <label className="label text-xs">出签天数</label>
-          <input type="number" min={1} max={60} className="input" value={form.processingDays} onChange={(e) => setForm({ ...form, processingDays: Number(e.target.value) || 1 })} />
+          <NumberInput min={1} max={60} className="input" value={processingDays} onChange={(n) => setProcessingDays(n)} integerOnly />
         </div>
         <div>
           <label className="label text-xs">有效期 (月)</label>
-          <input type="number" min={1} max={120} className="input" value={form.validityMonths} onChange={(e) => setForm({ ...form, validityMonths: Number(e.target.value) || 1 })} />
+          <NumberInput min={1} max={120} className="input" value={validityMonths} onChange={(n) => setValidityMonths(n)} integerOnly />
         </div>
         <div className="md:col-span-2">
           <label className="label text-xs">卖点（如"最热销"）</label>

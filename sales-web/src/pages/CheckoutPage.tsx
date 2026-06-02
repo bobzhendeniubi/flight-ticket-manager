@@ -10,6 +10,7 @@ import { useAuth } from '../stores/auth';
 import { usePassengers } from '../stores/passengers';
 import { ocrPassport } from '../lib/passportOcr';
 import { api, ApiError, type CreateOrderInput } from '../lib/api';
+import { safeRandomUUID } from '../lib/uuid';
 
 interface PassengerForm {
   fullName: string;
@@ -81,13 +82,9 @@ export function CheckoutPage() {
 
   // 幂等 key：整个结账会话一个，重试 / 重提交复用（防止双击造两单）
   // useMemo 只跑一次；重新下单（done 后换页）会自然创建新组件 → 新 key
-  const idempotencyKey = useMemo(
-    () =>
-      typeof crypto !== 'undefined' && 'randomUUID' in crypto
-        ? crypto.randomUUID()
-        : `${Date.now()}-${Math.random().toString(36).slice(2)}`,
-    [],
-  );
+  // safeRandomUUID：crypto.randomUUID() 在裸 IP http 走 insecure context 时会抛
+  // DOMException，曾导致 CheckoutPage 白屏（5/31 反馈）
+  const idempotencyKey = useMemo(() => safeRandomUUID(), []);
 
   // 需要出行人的总人数 = 一次行程的最多人数
   // 关键：往返机票会有 2 个 FLIGHT items（去程 + 回程），都是同一批人 ——

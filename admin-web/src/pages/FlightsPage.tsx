@@ -2,6 +2,7 @@ import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import { api, ApiError, type AdminFlight, type CabinClass } from '../lib/api';
 import { AIRPORT_OPTIONS, CABIN_LABEL, airportLabel, formatLocalDate, formatLocalTime } from '../lib/airports';
 import { useAuth } from '../stores/auth';
+import { NumberInput } from '../components/NumberInput';
 
 interface ScheduleSeat {
   id: string;
@@ -201,6 +202,7 @@ export function FlightsPage() {
               <SchedulesList
                 schedules={schedulesByFlight[f.id] ?? null}
                 originTz={null}
+                flightNumber={f.flightNumber}
               />
             )}
           </div>
@@ -212,11 +214,41 @@ export function FlightsPage() {
 
 function SchedulesList({
   schedules,
+  flightNumber,
 }: {
   schedules: AdminSchedule[] | null;
   originTz: string | null;
+  flightNumber: string;
 }) {
+  const tokens = useAuth((s) => s.tokens);
   const [monthFilter, setMonthFilter] = useState<string>('upcoming30');
+  const [exporting, setExporting] = useState<string | null>(null);
+  const [exportErr, setExportErr] = useState<string | null>(null);
+
+  async function downloadOrdersBySchedule(
+    scheduleId: string,
+    flightNo: string,
+    departureDate: string,
+  ): Promise<void> {
+    if (!tokens || exporting) return;
+    setExporting(scheduleId);
+    setExportErr(null);
+    try {
+      const blob = await api.downloadOrdersBySchedule(tokens.accessToken, scheduleId);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `订单明细_${flightNo}_${departureDate}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e: unknown) {
+      setExportErr(e instanceof ApiError ? e.message : '导出失败');
+    } finally {
+      setExporting(null);
+    }
+  }
 
   if (schedules === null) return <div className="mt-3 text-sm text-slate-500">加载班次中…</div>;
   if (schedules.length === 0) return <div className="mt-3 text-sm text-slate-500">还没有班次。</div>;
@@ -259,6 +291,11 @@ function SchedulesList({
         </select>
         <span className="text-xs text-slate-500">显示 {filtered.length} 条</span>
       </div>
+      {exportErr && (
+        <div className="rounded border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+          {exportErr}
+        </div>
+      )}
       <div className="overflow-x-auto">
         <table className="min-w-full divide-y divide-slate-200 text-sm">
         <thead className="bg-slate-50 text-left text-xs font-medium uppercase text-slate-500">
@@ -267,41 +304,60 @@ function SchedulesList({
             <th className="px-3 py-2">到达</th>
             <th className="px-3 py-2">舱位 / 余票 / 价格</th>
             <th className="px-3 py-2">状态</th>
+            <th className="px-3 py-2">操作</th>
           </tr>
         </thead>
         <tbody className="divide-y divide-slate-200">
-          {filtered.map((s) => (
-            <tr key={s.id}>
-              <td className="px-3 py-2">
-                <div className="font-medium text-slate-900">
-                  {formatLocalDate(s.departureTime, s.departureTz)} {formatLocalTime(s.departureTime, s.departureTz)}
-                </div>
-                <div className="text-xs text-slate-500">{s.departureTz}</div>
-              </td>
-              <td className="px-3 py-2">
-                <div className="font-medium text-slate-900">
-                  {formatLocalDate(s.arrivalTime, s.arrivalTz)} {formatLocalTime(s.arrivalTime, s.arrivalTz)}
-                </div>
-                <div className="text-xs text-slate-500">{s.arrivalTz}</div>
-              </td>
-              <td className="px-3 py-2">
-                <ul className="space-y-0.5">
-                  {s.seatClasses.map((c) => (
-                    <li key={c.id}>
-                      {CABIN_LABEL[c.cabin] ?? c.cabin}: {c.capacity - c.sold}/{c.capacity} · ¥{Number(c.basePrice).toFixed(0)}
-                    </li>
-                  ))}
-                </ul>
-              </td>
-              <td className="px-3 py-2">
-                {s.isActive ? (
-                  <span className="rounded bg-green-100 px-2 py-0.5 text-xs text-green-700">在售</span>
-                ) : (
-                  <span className="rounded bg-slate-200 px-2 py-0.5 text-xs text-slate-600">已停</span>
-                )}
-              </td>
-            </tr>
-          ))}
+          {filtered.map((s) => {
+            // 用 UTC 拿日期作为文件名（与后端 ordersExportFilename 保持一致；
+            // 班次入库时间是 UTC，按 UTC 转日期即可，跟时区无关）
+            const dep = new Date(s.departureTime);
+            const departureDate = `${dep.getUTCFullYear()}-${String(dep.getUTCMonth() + 1).padStart(2, '0')}-${String(dep.getUTCDate()).padStart(2, '0')}`;
+            const isExporting = exporting === s.id;
+            return (
+              <tr key={s.id}>
+                <td className="px-3 py-2">
+                  <div className="font-medium text-slate-900">
+                    {formatLocalDate(s.departureTime, s.departureTz)} {formatLocalTime(s.departureTime, s.departureTz)}
+                  </div>
+                  <div className="text-xs text-slate-500">{s.departureTz}</div>
+                </td>
+                <td className="px-3 py-2">
+                  <div className="font-medium text-slate-900">
+                    {formatLocalDate(s.arrivalTime, s.arrivalTz)} {formatLocalTime(s.arrivalTime, s.arrivalTz)}
+                  </div>
+                  <div className="text-xs text-slate-500">{s.arrivalTz}</div>
+                </td>
+                <td className="px-3 py-2">
+                  <ul className="space-y-0.5">
+                    {s.seatClasses.map((c) => (
+                      <li key={c.id}>
+                        {CABIN_LABEL[c.cabin] ?? c.cabin}: {c.capacity - c.sold}/{c.capacity} · ¥{Number(c.basePrice).toFixed(0)}
+                      </li>
+                    ))}
+                  </ul>
+                </td>
+                <td className="px-3 py-2">
+                  {s.isActive ? (
+                    <span className="rounded bg-green-100 px-2 py-0.5 text-xs text-green-700">在售</span>
+                  ) : (
+                    <span className="rounded bg-slate-200 px-2 py-0.5 text-xs text-slate-600">已停</span>
+                  )}
+                </td>
+                <td className="px-3 py-2">
+                  <button
+                    type="button"
+                    className="btn-secondary text-xs whitespace-nowrap"
+                    disabled={isExporting}
+                    title="下载该班次的所有订单明细（xlsx，不含成本）"
+                    onClick={() => downloadOrdersBySchedule(s.id, flightNumber, departureDate)}
+                  >
+                    {isExporting ? '导出中…' : '📋 导出整班订单'}
+                  </button>
+                </td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
       </div>
@@ -411,11 +467,11 @@ function NewScheduleForm({
 
   const [date, setDate] = useState(defaultDate());
   const [departTime, setDepartTime] = useState('09:00');
-  const [durationHours, setDurationHours] = useState(2);
-  const [econCapacity, setEconCapacity] = useState(150);
-  const [econPrice, setEconPrice] = useState(800);
-  const [bizCapacity, setBizCapacity] = useState(20);
-  const [bizPrice, setBizPrice] = useState(3000);
+  const [durationHours, setDurationHours] = useState<number | null>(2);
+  const [econCapacity, setEconCapacity] = useState<number | null>(150);
+  const [econPrice, setEconPrice] = useState<number | null>(800);
+  const [bizCapacity, setBizCapacity] = useState<number | null>(20);
+  const [bizPrice, setBizPrice] = useState<number | null>(3000);
   const [err, setErr] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
 
@@ -425,12 +481,17 @@ function NewScheduleForm({
     setErr(null);
     setSubmitting(true);
     try {
+      const dHours = durationHours ?? 1;
+      const econCap = econCapacity ?? 0;
+      const econPr = econPrice ?? 0;
+      const bizCap = bizCapacity ?? 0;
+      const bizPr = bizPrice ?? 0;
       // Asia/Shanghai (UTC+8) — 把本地 date+time 换算到 UTC ISO
       const [y, m, d] = date.split('-').map(Number);
       const [h, mi] = departTime.split(':').map(Number);
       const depUTC = new Date(Date.UTC(y, m - 1, d, h - 8, mi, 0)).toISOString();
       const arrUTC = new Date(
-        Date.UTC(y, m - 1, d, h - 8, mi, 0) + durationHours * 3600 * 1000,
+        Date.UTC(y, m - 1, d, h - 8, mi, 0) + dHours * 3600 * 1000,
       ).toISOString();
 
       await api.createSchedule(tokens.accessToken, {
@@ -440,9 +501,9 @@ function NewScheduleForm({
         departureTz: 'Asia/Shanghai',
         arrivalTz: 'Asia/Shanghai',
         seatClasses: [
-          { cabin: 'ECONOMY', capacity: econCapacity, basePrice: econPrice },
-          ...(bizCapacity > 0
-            ? [{ cabin: 'BUSINESS' as const, capacity: bizCapacity, basePrice: bizPrice }]
+          { cabin: 'ECONOMY', capacity: econCap, basePrice: econPr },
+          ...(bizCap > 0
+            ? [{ cabin: 'BUSINESS' as const, capacity: bizCap, basePrice: bizPr }]
             : []),
         ],
       });
@@ -470,54 +531,51 @@ function NewScheduleForm({
         </div>
         <div>
           <label className="label">飞行时长 (小时)</label>
-          <input
-            type="number"
+          <NumberInput
             step={0.5}
             min={0.5}
             max={20}
             className="input"
             value={durationHours}
-            onChange={(e) => setDurationHours(Number(e.target.value) || 1)}
+            onChange={(n) => setDurationHours(n)}
           />
         </div>
         <div>
           <label className="label">经济舱座位</label>
-          <input
-            type="number"
+          <NumberInput
             min={0}
             className="input"
             value={econCapacity}
-            onChange={(e) => setEconCapacity(Number(e.target.value) || 0)}
+            onChange={(n) => setEconCapacity(n)}
+            integerOnly
           />
         </div>
         <div>
           <label className="label">经济舱价 (¥)</label>
-          <input
-            type="number"
+          <NumberInput
             min={0}
             className="input"
             value={econPrice}
-            onChange={(e) => setEconPrice(Number(e.target.value) || 0)}
+            onChange={(n) => setEconPrice(n)}
           />
         </div>
         <div>
           <label className="label">商务舱座位</label>
-          <input
-            type="number"
+          <NumberInput
             min={0}
             className="input"
             value={bizCapacity}
-            onChange={(e) => setBizCapacity(Number(e.target.value) || 0)}
+            onChange={(n) => setBizCapacity(n)}
+            integerOnly
           />
         </div>
         <div>
           <label className="label">商务舱价 (¥)</label>
-          <input
-            type="number"
+          <NumberInput
             min={0}
             className="input"
             value={bizPrice}
-            onChange={(e) => setBizPrice(Number(e.target.value) || 0)}
+            onChange={(n) => setBizPrice(n)}
           />
         </div>
 
@@ -556,11 +614,11 @@ function BulkScheduleForm({
   const [endDate, setEndDate] = useState(addDays(90));
   const [weekdays, setWeekdays] = useState<Set<number>>(new Set([0, 1, 2, 3, 4, 5, 6])); // 全选
   const [departTime, setDepartTime] = useState('11:40');
-  const [durationMinutes, setDurationMinutes] = useState(105);
-  const [econCapacity, setEconCapacity] = useState(180);
-  const [econPrice, setEconPrice] = useState(1380);
-  const [bizCapacity, setBizCapacity] = useState(20);
-  const [bizPrice, setBizPrice] = useState(4280);
+  const [durationMinutes, setDurationMinutes] = useState<number | null>(105);
+  const [econCapacity, setEconCapacity] = useState<number | null>(180);
+  const [econPrice, setEconPrice] = useState<number | null>(1380);
+  const [bizCapacity, setBizCapacity] = useState<number | null>(20);
+  const [bizPrice, setBizPrice] = useState<number | null>(4280);
   const [submitting, setSubmitting] = useState(false);
   const [progress, setProgress] = useState({ done: 0, total: 0, errors: 0 });
   const [result, setResult] = useState<string | null>(null);
@@ -604,6 +662,11 @@ function BulkScheduleForm({
     const arrTz = flight.destinationCode === 'DAD' ? 'Asia/Ho_Chi_Minh' : 'Asia/Macau';
     const [hour, minute] = departTime.split(':').map(Number);
     const offsetHours = depTz === 'Asia/Macau' ? 8 : 7;
+    const dMin = durationMinutes ?? 0;
+    const econCap = econCapacity ?? 0;
+    const econPr = econPrice ?? 0;
+    const bizCap = bizCapacity ?? 0;
+    const bizPr = bizPrice ?? 0;
 
     for (let d = new Date(s); d <= e2; d.setDate(d.getDate() + 1)) {
       if (!weekdays.has(d.getDay())) continue;
@@ -612,7 +675,7 @@ function BulkScheduleForm({
         const m = d.getMonth();
         const day = d.getDate();
         const depUTC = new Date(Date.UTC(y, m, day, hour - offsetHours, minute, 0)).toISOString();
-        const arrUTC = new Date(Date.UTC(y, m, day, hour - offsetHours, minute, 0) + durationMinutes * 60 * 1000).toISOString();
+        const arrUTC = new Date(Date.UTC(y, m, day, hour - offsetHours, minute, 0) + dMin * 60 * 1000).toISOString();
         await api.createSchedule(tokens.accessToken, {
           flightId: flight.id,
           departureTime: depUTC,
@@ -620,8 +683,8 @@ function BulkScheduleForm({
           departureTz: depTz,
           arrivalTz: arrTz,
           seatClasses: [
-            { cabin: 'ECONOMY', capacity: econCapacity, basePrice: econPrice },
-            ...(bizCapacity > 0 ? [{ cabin: 'BUSINESS' as const, capacity: bizCapacity, basePrice: bizPrice }] : []),
+            { cabin: 'ECONOMY', capacity: econCap, basePrice: econPr },
+            ...(bizCap > 0 ? [{ cabin: 'BUSINESS' as const, capacity: bizCap, basePrice: bizPr }] : []),
           ],
         });
         done++;
@@ -675,20 +738,20 @@ function BulkScheduleForm({
         </div>
         <div>
           <label className="label">飞行时长（分钟）</label>
-          <input type="number" min={30} max={600} className="input" value={durationMinutes} onChange={(e) => setDurationMinutes(Number(e.target.value) || 0)} />
+          <NumberInput min={30} max={600} className="input" value={durationMinutes} onChange={(n) => setDurationMinutes(n)} integerOnly />
         </div>
         <div>
           <label className="label">经济座位 / 单价</label>
           <div className="flex gap-1">
-            <input type="number" min={0} className="input" value={econCapacity} onChange={(e) => setEconCapacity(Number(e.target.value) || 0)} />
-            <input type="number" min={0} className="input" placeholder="¥" value={econPrice} onChange={(e) => setEconPrice(Number(e.target.value) || 0)} />
+            <NumberInput min={0} className="input" value={econCapacity} onChange={(n) => setEconCapacity(n)} integerOnly />
+            <NumberInput min={0} className="input" placeholder="¥" value={econPrice} onChange={(n) => setEconPrice(n)} />
           </div>
         </div>
         <div>
           <label className="label">商务座位 / 单价</label>
           <div className="flex gap-1">
-            <input type="number" min={0} className="input" value={bizCapacity} onChange={(e) => setBizCapacity(Number(e.target.value) || 0)} />
-            <input type="number" min={0} className="input" placeholder="¥" value={bizPrice} onChange={(e) => setBizPrice(Number(e.target.value) || 0)} />
+            <NumberInput min={0} className="input" value={bizCapacity} onChange={(n) => setBizCapacity(n)} integerOnly />
+            <NumberInput min={0} className="input" placeholder="¥" value={bizPrice} onChange={(n) => setBizPrice(n)} />
           </div>
         </div>
 
