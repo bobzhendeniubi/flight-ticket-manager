@@ -126,6 +126,17 @@ export function OrdersPage() {
   const [flightNumberFilter, setFlightNumberFilter] = useState('');
   const [passengerNameFilter, setPassengerNameFilter] = useState('');
   const [invoiceFilter, setInvoiceFilter] = useState<'' | InvoiceStatus>('');
+  // 文本筛选防抖：停止输入 400ms 后才请求后端，避免每个键击打一次接口
+  const [debouncedFlightNumber, setDebouncedFlightNumber] = useState('');
+  const [debouncedPassengerName, setDebouncedPassengerName] = useState('');
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedFlightNumber(flightNumberFilter), 400);
+    return () => clearTimeout(t);
+  }, [flightNumberFilter]);
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedPassengerName(passengerNameFilter), 400);
+    return () => clearTimeout(t);
+  }, [passengerNameFilter]);
   // 三模板筛选导出（全岗可用/票务专用/签证专用）
   const [exportTemplate, setExportTemplate] = useState<OrderExportTemplate>('full');
   const [exporting, setExporting] = useState(false);
@@ -155,8 +166,8 @@ export function OrdersPage() {
     if (travelFrom) query.travelFrom = travelFrom;
     if (travelTo) query.travelTo = travelTo;
     if (claimFilter === 'unclaimed') query.unclaimedOnly = '1';
-    if (flightNumberFilter.trim()) query.flightNumber = flightNumberFilter.trim();
-    if (passengerNameFilter.trim()) query.passengerName = passengerNameFilter.trim();
+    if (debouncedFlightNumber.trim()) query.flightNumber = debouncedFlightNumber.trim();
+    if (debouncedPassengerName.trim()) query.passengerName = debouncedPassengerName.trim();
     if (invoiceFilter) query.invoiceStatus = invoiceFilter;
     api.listOrders(tokens.accessToken, query)
       .then((res) => {
@@ -171,7 +182,7 @@ export function OrdersPage() {
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [tokens?.accessToken, travelFrom, travelTo, claimFilter, flightNumberFilter, passengerNameFilter, invoiceFilter, refreshNonce]);
+  }, [tokens?.accessToken, travelFrom, travelTo, claimFilter, debouncedFlightNumber, debouncedPassengerName, invoiceFilter, refreshNonce]);
 
   // 视图层把 OrderSummary 映射成便于筛选/展示的数据
   const ordersView = useMemo(

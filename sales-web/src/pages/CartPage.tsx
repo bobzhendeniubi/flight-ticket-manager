@@ -1,3 +1,4 @@
+import { useMemo } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useCart, KIND_INFO, isSelected } from '../stores/cart';
 
@@ -17,7 +18,7 @@ export function CartPage() {
   const navigate = useNavigate();
 
   // 只结算勾选的产品（代理可挑着付，剩下的留在车里）
-  const selectedItems = items.filter(isSelected);
+  const selectedItems = useMemo(() => items.filter(isSelected), [items]);
   const selectedTotal = selectedItems.reduce((sum, i) => sum + (Number(i.unitPrice) * Number(i.qty) || 0), 0);
   const selectedCount = selectedItems.reduce((s, i) => s + (Number(i.qty) || 0), 0);
   const allSelected = items.length > 0 && selectedItems.length === items.length;
