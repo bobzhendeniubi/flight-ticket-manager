@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useState } from 'react';
-import { api, ApiError, type CabinClass, type FlightSearchResult } from '../lib/api';
+import { api, ApiError, type AvailabilityTier, type CabinClass, type FlightSearchResult } from '../lib/api';
 import {
   AIRPORT_OPTIONS,
   CABIN_LABEL,
@@ -437,6 +437,26 @@ function FlightCard({
   );
 }
 
+// ─────────────────────────────────────────────────────────────────
+// 余位档位徽章 — 买家只看档位不看精确余票数（档位口径由服务端
+// computeAvailabilityTier 统一；available/capacity 仍在 payload 里，
+// 但仅用于禁用/上限等内部逻辑，绝不渲染给买家）。
+// ─────────────────────────────────────────────────────────────────
+const TIER_LABEL: Record<AvailabilityTier, string> = {
+  AMPLE: '余位充足',
+  TIGHT: '余位紧张',
+  LOW: '余位少量',
+  VERY_LOW: '余位极少量',
+  SOLD_OUT: '已售罄',
+};
+const TIER_CLASS: Record<AvailabilityTier, string> = {
+  AMPLE: 'bg-emerald-100 text-emerald-700',
+  TIGHT: 'bg-sky-100 text-sky-700',
+  LOW: 'bg-amber-100 text-amber-800',
+  VERY_LOW: 'bg-orange-100 text-orange-700',
+  SOLD_OUT: 'bg-slate-100 text-rose-600',
+};
+
 function FlightSeatCard({
   flight,
   cabin,
@@ -451,6 +471,7 @@ function FlightSeatCard({
   const add = useCart((s) => s.add);
   const token = useAuth((s) => s.tokens?.accessToken ?? '');
   const enough = cabin.available >= passengers;
+  const soldOut = cabin.availabilityTier === 'SOLD_OUT' || cabin.available <= 0;
 
   // ── 锁位（下单前临时占座：单次 ≤9 张 / 固定 10 分钟 / 到期自动回收） ──
   const maxLockQty = Math.min(9, cabin.available);
@@ -485,6 +506,43 @@ function FlightSeatCard({
     }
   };
 
+  // ── 候补登记（售罄时替代锁位：1-9 张 + 手机号，有位运营按先来先到通知） ──
+  const [wlOpen, setWlOpen] = useState(false);
+  const [wlQty, setWlQty] = useState(1);
+  const [wlPhone, setWlPhone] = useState('');
+  const [wlSubmitting, setWlSubmitting] = useState(false);
+  const [wlError, setWlError] = useState<string | null>(null);
+  const [wlDone, setWlDone] = useState(false);
+
+  const submitWaitlist = async () => {
+    // seatClassId 老缓存/异常数据可能缺失 —— 缺了直接提示而不是打 API（同锁位）
+    if (!cabin.seatClassId) {
+      setWlError('该舱位暂不支持候补');
+      return;
+    }
+    if (!wlPhone.trim()) {
+      setWlError('请填写联系手机号');
+      return;
+    }
+    setWlSubmitting(true);
+    setWlError(null);
+    try {
+      await api.createWaitlist(token, {
+        flightScheduleId: flight.scheduleId,
+        seatClassId: cabin.seatClassId,
+        qty: wlQty,
+        contactPhone: wlPhone.trim(),
+      });
+      setWlDone(true);
+      setWlOpen(false);
+    } catch (err) {
+      // 409（重复登记）/ 400（余票充足）等 → 原样展示服务端 message
+      setWlError(err instanceof ApiError ? err.message : '候补登记失败，请稍后再试');
+    } finally {
+      setWlSubmitting(false);
+    }
+  };
+
   return (
     <div
       className={`rounded-md border px-3 py-2 text-sm ${
@@ -500,7 +558,14 @@ function FlightSeatCard({
           <span className="font-semibold text-red-600">¥{Number(cabin.dynamicPrice).toFixed(0)}</span>
         </div>
       </div>
-      <div className="mt-1 text-xs text-slate-500">余票 {cabin.available} / {cabin.capacity}</div>
+      {/* 买家只看档位徽章 —— 精确余票数（available/capacity）仅内部用于禁用逻辑 */}
+      <div className="mt-1">
+        <span
+          className={`inline-block rounded px-1.5 py-0.5 text-xs font-medium ${TIER_CLASS[cabin.availabilityTier]}`}
+        >
+          {TIER_LABEL[cabin.availabilityTier]}
+        </span>
+      </div>
       <div className="mt-2 flex gap-1.5">
       <button
         className="btn-primary flex-1 text-xs py-1"
@@ -526,9 +591,9 @@ function FlightSeatCard({
           });
         }}
       >
-        {enough ? `+ 加购 ${passengers} 张` : '余票不足'}
+        {soldOut ? '已售罄' : enough ? `+ 加购 ${passengers} 张` : '余票不足'}
       </button>
-      {isLoggedIn && (
+      {isLoggedIn && !soldOut && (
         <button
           type="button"
           className="rounded-md border border-amber-300 bg-amber-50 px-2 py-1 text-xs text-amber-700 hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-40"
@@ -543,11 +608,25 @@ function FlightSeatCard({
           🔒 锁位
         </button>
       )}
+      {isLoggedIn && soldOut && !wlDone && (
+        <button
+          type="button"
+          className="rounded-md border border-sky-300 bg-sky-50 px-2 py-1 text-xs text-sky-700 hover:bg-sky-100"
+          title="留下手机号，座位释放后按先来先到通知"
+          onClick={() => {
+            setWlError(null);
+            setWlQty(Math.min(Math.max(1, passengers), 9));
+            setWlOpen((v) => !v);
+          }}
+        >
+          🕐 候补登记
+        </button>
+      )}
       </div>
       {isLoggedIn && lockOpen && (
         <div className="mt-1.5 space-y-1.5 rounded-md border border-amber-200 bg-amber-50/60 p-2">
           <div className="flex items-center justify-between text-xs text-slate-600">
-            <span>锁定张数 · 10 分钟</span>
+            <span>锁定张数 · 10 分钟 · 最多可锁 {maxLockQty} 张</span>
             <div className="flex items-center gap-1">
               <button
                 type="button"
@@ -589,6 +668,66 @@ function FlightSeatCard({
               取消
             </button>
           </div>
+        </div>
+      )}
+      {isLoggedIn && soldOut && wlOpen && !wlDone && (
+        <div className="mt-1.5 space-y-1.5 rounded-md border border-sky-200 bg-sky-50/60 p-2">
+          <div className="flex items-center justify-between text-xs text-slate-600">
+            <span>候补张数 · 1-9 张</span>
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                aria-label="减少候补张数"
+                className="h-5 w-5 rounded border border-slate-300 bg-white leading-none text-slate-600 disabled:opacity-40"
+                disabled={wlQty <= 1}
+                onClick={() => setWlQty((q) => Math.max(1, q - 1))}
+              >
+                −
+              </button>
+              <span className="w-5 text-center font-semibold tabular-nums text-slate-800">{wlQty}</span>
+              <button
+                type="button"
+                aria-label="增加候补张数"
+                className="h-5 w-5 rounded border border-slate-300 bg-white leading-none text-slate-600 disabled:opacity-40"
+                disabled={wlQty >= 9}
+                onClick={() => setWlQty((q) => Math.min(9, q + 1))}
+              >
+                +
+              </button>
+            </div>
+          </div>
+          <input
+            type="tel"
+            className="w-full rounded border border-slate-300 bg-white px-2 py-1 text-xs text-slate-800 placeholder:text-slate-400"
+            placeholder="联系手机号（有位通知你）"
+            value={wlPhone}
+            maxLength={32}
+            onChange={(e) => setWlPhone(e.target.value)}
+          />
+          {wlError && <div className="text-xs text-red-600">{wlError}</div>}
+          <div className="flex gap-1.5">
+            <button
+              type="button"
+              className="flex-1 rounded-md bg-sky-500 px-2 py-1 text-xs font-medium text-white hover:bg-sky-600 disabled:opacity-50"
+              disabled={wlSubmitting}
+              onClick={submitWaitlist}
+            >
+              {wlSubmitting ? '提交中…' : `登记候补 ${wlQty} 张`}
+            </button>
+            <button
+              type="button"
+              className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs text-slate-600 hover:bg-slate-50"
+              disabled={wlSubmitting}
+              onClick={() => setWlOpen(false)}
+            >
+              取消
+            </button>
+          </div>
+        </div>
+      )}
+      {wlDone && (
+        <div className="mt-1.5 rounded-md bg-sky-100 px-2 py-1 text-center text-xs font-medium text-sky-800">
+          ✓ 已登记候补，有位会通知你
         </div>
       )}
       {activeLock && (

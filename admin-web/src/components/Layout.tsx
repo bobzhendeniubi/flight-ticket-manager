@@ -17,6 +17,7 @@ const NAV: Array<{ to: string; label: string; roles: Array<'ADMIN' | 'STAFF' | '
   { to: '/seat-stats',      label: '座位统计',    roles: ['ADMIN', 'STAFF'] },
   { to: '/seat-allocation', label: '切位（包位）', roles: ['ADMIN', 'STAFF'] },
   { to: '/hotel-control',   label: '房控',        roles: ['ADMIN', 'STAFF'] },
+  { to: '/visa-desk',       label: '签证台',      roles: ['ADMIN', 'STAFF'] },
   { to: '/products',        label: '产品管理',    roles: ['ADMIN', 'STAFF'] },
   { to: '/pricing',         label: '动态定价',    roles: ['ADMIN', 'STAFF'] },
   { to: '/cancellation-policies', label: '取消政策', roles: ['ADMIN', 'STAFF'] },

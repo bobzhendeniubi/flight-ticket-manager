@@ -173,6 +173,13 @@ export const exportTemplatesQuerySchema = listOrdersQuerySchema
   });
 export type ExportTemplatesQuery = z.infer<typeof exportTemplatesQuerySchema>;
 
+// ── 分房表导出（成都格式：按入住日期分 sheet）────────────────────────────
+export const exportRoomAllocationQuerySchema = z.object({
+  from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, '日期格式应为 YYYY-MM-DD').optional(),
+  to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, '日期格式应为 YYYY-MM-DD').optional(),
+});
+export type ExportRoomAllocationQuery = z.infer<typeof exportRoomAllocationQuerySchema>;
+
 // ── 状态流转 ─────────────────────────────────────────────────────────────
 export const updateStatusBodySchema = z.object({
   toStatus: z.nativeEnum(OrderStatus),

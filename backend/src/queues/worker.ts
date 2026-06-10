@@ -11,13 +11,15 @@
 import { Worker } from 'bullmq';
 import { prisma } from '../db/prisma.js';
 import { env } from '../config/env.js';
-import { FulfillmentStatus, FulfillmentType, OrderStatus, Prisma, SeatLockStatus } from '@prisma/client';
+import { FulfillmentStatus, FulfillmentType, OrderStatus, Prisma, SeatLockStatus, WaitlistStatus } from '@prisma/client';
 import {
   bullRedis,
+  enqueueWaitlistCheck,
   type FulfillmentJobData,
   type NotificationJobData,
   type SeatHoldJobData,
   type SeatLockJobData,
+  type WaitlistCheckJobData,
 } from './queue.js';
 import { closeMailer } from '../lib/mailer.js';
 import { sendItineraryEmail } from '../lib/itinerary-email.js';
@@ -201,6 +203,22 @@ const seatHoldWorker = new Worker<SeatHoldJobData>(
 
     // eslint-disable-next-line no-console
     console.log(`[worker:seat-hold] ✓ order ${orderId} expired + seats released`);
+
+    // 座位已释放 → 排队候补检查（best-effort，失败不影响释放结果）
+    try {
+      for (const item of order.items) {
+        if (item.kind !== 'FLIGHT' || !item.flightScheduleId || !item.flightCabin) continue;
+        const sc = await prisma.flightSeatClass.findFirst({
+          where: { scheduleId: item.flightScheduleId, cabin: item.flightCabin },
+          select: { id: true },
+        });
+        if (sc) await enqueueWaitlistCheck(sc.id);
+      }
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error(`[worker:seat-hold] failed to enqueue waitlist-check for order ${orderId}:`, err);
+    }
+
     return { orderId, released: true };
   },
   { connection: bullRedis, concurrency: 5 },
@@ -237,6 +255,18 @@ const seatLockWorker = new Worker<SeatLockJobData>(
     if (upd.count === 1) {
       // eslint-disable-next-line no-console
       console.log(`[worker:seat-lock] ✓ lock ${lockId} expired`);
+
+      // 锁位过期 → 座位回归可售，排队候补检查（best-effort）
+      try {
+        const lock = await prisma.seatLock.findUnique({
+          where: { id: lockId },
+          select: { seatClassId: true },
+        });
+        if (lock) await enqueueWaitlistCheck(lock.seatClassId);
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error(`[worker:seat-lock] failed to enqueue waitlist-check for lock ${lockId}:`, err);
+      }
     }
     return { lockId, expired: upd.count === 1 };
   },
@@ -250,11 +280,17 @@ seatLockWorker.on('failed', (job, err) => {
 
 // ══════════════════════════════════════════════════════════════════
 // Notification Worker — 发短信/邮件（沙箱只 console.log）
+//
+// 额外承载 'waitlist-check' 任务：座位释放后检查该舱位最早的 ACTIVE 候补，
+// 余量够则 CAS 标 NOTIFIED（真实短信通知后续接入，当前按占位模式只打日志）。
 // ══════════════════════════════════════════════════════════════════
-const notificationWorker = new Worker<NotificationJobData>(
+const notificationWorker = new Worker<NotificationJobData | WaitlistCheckJobData>(
   'notification',
   async (job) => {
-    const { type, to, subject, content } = job.data;
+    if (job.name === 'waitlist-check') {
+      return processWaitlistCheck((job.data as WaitlistCheckJobData).seatClassId);
+    }
+    const { type, to, subject, content } = job.data as NotificationJobData;
     // TODO: 接腾讯云 SMS / 阿里云邮件 / 微信模板消息
     // eslint-disable-next-line no-console
     console.log(`[worker:notification] ${type} → ${to}${subject ? ' · ' + subject : ''}`);
@@ -264,6 +300,49 @@ const notificationWorker = new Worker<NotificationJobData>(
   },
   { connection: bullRedis, concurrency: 10 },
 );
+
+/**
+ * 候补检查：该舱位最早的 ACTIVE 候补，若当前可售余量（capacity - sold -
+ * ACTIVE 未过期锁位）≥ 其登记张数则 CAS 标 NOTIFIED。一次只通知一条 ——
+ * 下一次座位释放再检查下一条（先来先到，避免一次放量引发并发抢座纠纷）。
+ */
+async function processWaitlistCheck(seatClassId: string) {
+  const entry = await prisma.seatWaitlist.findFirst({
+    where: { seatClassId, status: WaitlistStatus.ACTIVE },
+    orderBy: { createdAt: 'asc' },
+    include: {
+      flightSchedule: { select: { flight: { select: { flightNumber: true } } } },
+      seatClass: { select: { cabin: true, capacity: true, sold: true } },
+    },
+  });
+  if (!entry) return { seatClassId, skipped: true, reason: 'no active waitlist' };
+
+  const lockedAgg = await prisma.seatLock.aggregate({
+    _sum: { qty: true },
+    where: { seatClassId, status: SeatLockStatus.ACTIVE, expiresAt: { gt: new Date() } },
+  });
+  const available = entry.seatClass.capacity - entry.seatClass.sold - (lockedAgg._sum.qty ?? 0);
+  if (available < entry.qty) {
+    return { seatClassId, skipped: true, reason: `available=${available} < qty=${entry.qty}` };
+  }
+
+  // 原子 CAS：只在仍 ACTIVE 时标 NOTIFIED（防并发重复通知）
+  const upd = await prisma.seatWaitlist.updateMany({
+    where: { id: entry.id, status: WaitlistStatus.ACTIVE },
+    data: { status: WaitlistStatus.NOTIFIED },
+  });
+  if (upd.count !== 1) {
+    return { seatClassId, skipped: true, reason: 'entry status changed concurrently' };
+  }
+
+  // TODO: 接腾讯云 SMS / 微信模板消息（与上方 notification 占位同批接入）
+  // eslint-disable-next-line no-console
+  console.log(
+    `[worker:notification] SMS → ${entry.contactPhone} · 候补有票提醒 ` +
+      `${entry.flightSchedule.flight.flightNumber} ${entry.seatClass.cabin} ×${entry.qty}（entry ${entry.id} → NOTIFIED）`,
+  );
+  return { seatClassId, notifiedEntryId: entry.id };
+}
 
 // ══════════════════════════════════════════════════════════════════
 // 优雅关闭

@@ -110,14 +110,14 @@ function fmtDateDMYSlash(d: Date | null | undefined): string {
   return `${String(d.getUTCDate()).padStart(2, '0')}/${String(d.getUTCMonth() + 1).padStart(2, '0')}/${d.getUTCFullYear()}`;
 }
 
-/** dd-mm-yyyy（越南签证表护照有效期格式）*/
-function fmtDateDMYDash(d: Date | null | undefined): string {
+/** dd-mm-yyyy（越南签证表护照有效期格式；分房表生日/有效期同款）*/
+export function fmtDateDMYDash(d: Date | null | undefined): string {
   if (!d) return '';
   return `${String(d.getUTCDate()).padStart(2, '0')}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${d.getUTCFullYear()}`;
 }
 
 /** 乘客姓名 LASTNAME/FIRSTNAME（与 orders.export.ts 同款拆分）*/
-function pnrName(p: { lastName: string | null; firstName: string | null; fullName: string }): string {
+export function pnrName(p: { lastName: string | null; firstName: string | null; fullName: string }): string {
   return p.lastName && p.firstName ? `${p.lastName}/${p.firstName}`.toUpperCase() : p.fullName;
 }
 

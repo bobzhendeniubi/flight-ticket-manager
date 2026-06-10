@@ -78,7 +78,7 @@ export class FulfillmentService {
     const [rows, total] = await prisma.$transaction([
       prisma.fulfillmentTask.findMany({
         where,
-        include: { orderItem: { include: { order: { select: { id: true, orderNumber: true, contactName: true, contactPhone: true, status: true } } } } },
+        include: { orderItem: { include: { order: { select: { id: true, orderNumber: true, contactName: true, contactPhone: true, status: true, notes: true } } } } },
         orderBy: { createdAt: 'desc' },
         take: query.pageSize,
         skip: (query.page - 1) * query.pageSize,
@@ -125,7 +125,7 @@ export class FulfillmentService {
     const updated = await prisma.fulfillmentTask.update({
       where: { id },
       data,
-      include: { orderItem: { include: { order: { select: { id: true, orderNumber: true, contactName: true, contactPhone: true, status: true } } } } },
+      include: { orderItem: { include: { order: { select: { id: true, orderNumber: true, contactName: true, contactPhone: true, status: true, notes: true } } } } },
     });
 
     // FLIGHT 完成时，把 PNR / e-ticket 同步到 Passenger（全订单的乘客都标）
@@ -146,6 +146,32 @@ export class FulfillmentService {
       ...serializeTask(updated, updated.orderItem),
       order: updated.orderItem.order,
     };
+  }
+
+  /**
+   * 批量更新任务状态（签证批量标"已送签"等场景）。
+   * 逐条复用 update() 的单任务校验与副作用（startedAt/completedAt/attempts/PNR 同步），
+   * 不另写一套规则；单条失败不影响其余，返回 failures 明细。
+   */
+  async batchUpdateStatus(
+    taskIds: string[],
+    toStatus: FulfillmentStatus,
+  ): Promise<{
+    successCount: number;
+    failureCount: number;
+    failures: Array<{ id: string; error: string }>;
+  }> {
+    let successCount = 0;
+    const failures: Array<{ id: string; error: string }> = [];
+    for (const id of taskIds) {
+      try {
+        await this.update(id, { status: toStatus });
+        successCount += 1;
+      } catch (err) {
+        failures.push({ id, error: err instanceof Error ? err.message : '未知错误' });
+      }
+    }
+    return { successCount, failureCount: failures.length, failures };
   }
 
   /**
@@ -193,7 +219,7 @@ export class FulfillmentService {
 
     const updated = await prisma.fulfillmentTask.findUniqueOrThrow({
       where: { id },
-      include: { orderItem: { include: { order: { select: { id: true, orderNumber: true, contactName: true, contactPhone: true, status: true } } } } },
+      include: { orderItem: { include: { order: { select: { id: true, orderNumber: true, contactName: true, contactPhone: true, status: true, notes: true } } } } },
     });
 
     // 同步清空本订单乘客的 PNR（出票成功后会重新写回）

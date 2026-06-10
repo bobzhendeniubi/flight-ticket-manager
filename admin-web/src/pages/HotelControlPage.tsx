@@ -17,6 +17,7 @@ import {
   ApiError,
   type BlockPeriodWriteInput,
   type HotelBlockPeriod,
+  type HotelControlAlerts,
   type HotelControlBoard,
   type HotelControlForward,
 } from '../lib/api';
@@ -105,6 +106,9 @@ export function HotelControlPage() {
         </div>
       </section>
 
+      {/* ── 提醒线横幅（超卖加房 / 富余退房 / 班次超开票上限）────────── */}
+      <AlertsBanner token={token} />
+
       {error && (
         <div className="rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800">
           ❌ {error}
@@ -115,6 +119,9 @@ export function HotelControlPage() {
           起始日不能晚于截止日
         </div>
       )}
+
+      {/* ── 分房表导出（成都格式 xlsx）──────────────────────────── */}
+      <RoomAllocationExport token={token} />
 
       {/* ── 销控矩阵（按酒店 × 日期）──────────────────────────────── */}
       <section className="card">
@@ -226,6 +233,173 @@ export function HotelControlPage() {
       {/* ── 包房周期管理 ─────────────────────────────────────────── */}
       <BlockPeriodsEditor token={token} onChanged={() => setBoardNonce((n) => n + 1)} />
     </div>
+  );
+}
+
+// ── 提醒线横幅（GET /hotel-control/alerts；可折叠）──────────────────────────
+/** "07-12" → "7/12"（提醒行里的紧凑日期） */
+function fmtMonthDay(date: string): string {
+  const [, m, d] = date.split('-');
+  return `${Number(m)}/${Number(d)}`;
+}
+
+function AlertsBanner({ token }: { token: string }) {
+  const [alerts, setAlerts] = useState<HotelControlAlerts | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [open, setOpen] = useState(true);
+
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    api
+      .getHotelAlerts(token)
+      .then((a) => {
+        if (!cancelled) setAlerts(a);
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) setErr(e instanceof ApiError ? e.message : '提醒线加载失败');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [token]);
+
+  const total = alerts
+    ? alerts.oversold.length + alerts.surplusSoon.length + alerts.overCapacitySchedules.length
+    : 0;
+
+  return (
+    <section className="card">
+      <div className="flex items-center justify-between">
+        <h2 className="text-sm font-semibold text-slate-900">
+          提醒线（超卖加房 / 富余退房 / 班次超开票上限）
+          {alerts != null && total > 0 && (
+            <span className="ml-2 rounded-full bg-red-100 px-2 py-0.5 text-xs font-medium text-red-700">
+              {total}
+            </span>
+          )}
+        </h2>
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          className="text-xs text-slate-500 hover:text-slate-900"
+        >
+          {open ? '收起 ▲' : '展开 ▼'}
+        </button>
+      </div>
+      {open && (
+        <div className="mt-3 space-y-1.5">
+          {err ? (
+            <div className="text-sm text-rose-600">{err}</div>
+          ) : alerts == null ? (
+            <div className="text-sm text-slate-500">加载提醒…</div>
+          ) : total === 0 ? (
+            <div className="text-sm text-slate-400">暂无提醒</div>
+          ) : (
+            <>
+              {alerts.oversold.map((a, i) => (
+                <div
+                  key={`os-${i}`}
+                  className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800"
+                >
+                  <span className="font-semibold">超卖 ⚠</span> {a.hotelName} {fmtMonthDay(a.date)}{' '}
+                  <span className="tabular-nums">{a.used}/{a.block}</span> 缺 {a.deficit} 间 · 让地接加房
+                </div>
+              ))}
+              {alerts.surplusSoon.map((a, i) => (
+                <div
+                  key={`sp-${i}`}
+                  className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800"
+                >
+                  <span className="font-semibold">富余提醒</span> {a.hotelName} {fmtMonthDay(a.date)} 还剩{' '}
+                  {a.surplus} 间 · 考虑退房
+                </div>
+              ))}
+              {alerts.overCapacitySchedules.map((a, i) => (
+                <div
+                  key={`oc-${i}`}
+                  className="rounded-md border border-purple-200 bg-purple-50 px-3 py-2 text-sm text-purple-800"
+                >
+                  <span className="font-semibold">票务 ⚠</span> {a.flightNumber}{' '}
+                  {fmtMonthDay(a.departureDate)} 已收客 {a.paxCount} 人 · 超过开票上限
+                </div>
+              ))}
+            </>
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+// ── 分房表导出（GET /orders/export-room-allocation；成都格式 xlsx）──────────
+function RoomAllocationExport({ token }: { token: string }) {
+  const [exportFrom, setExportFrom] = useState<string>(todayStr());
+  const [exportTo, setExportTo] = useState<string>(todayStr());
+  const [exporting, setExporting] = useState(false);
+
+  async function handleExport(): Promise<void> {
+    if (!token) return;
+    setExporting(true);
+    try {
+      const blob = await api.downloadRoomAllocation(token, { from: exportFrom, to: exportTo });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `分房表-${exportFrom}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (e: unknown) {
+      alert(e instanceof ApiError ? `导出失败：${e.message}` : '导出失败');
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  return (
+    <section className="card">
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h2 className="text-sm font-semibold text-slate-900">导出分房表</h2>
+          <p className="mt-1 text-xs text-slate-500">
+            成都格式 xlsx：每入住日期一个 sheet，按酒店分组（区间最长 14 天）。
+          </p>
+        </div>
+        <div className="flex items-end gap-2">
+          <div>
+            <label className="label">入住起</label>
+            <input
+              type="date"
+              className="input"
+              value={exportFrom}
+              onChange={(e) => setExportFrom(e.target.value)}
+            />
+          </div>
+          <div>
+            <label className="label">入住止</label>
+            <input
+              type="date"
+              className="input"
+              value={exportTo}
+              onChange={(e) => setExportTo(e.target.value)}
+            />
+          </div>
+          <button
+            type="button"
+            onClick={() => void handleExport()}
+            disabled={exporting || exportFrom > exportTo}
+            className="rounded-md bg-slate-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-slate-700 disabled:opacity-50"
+          >
+            {exporting ? '导出中…' : '导出分房表'}
+          </button>
+        </div>
+      </div>
+      {exportFrom > exportTo && (
+        <div className="mt-2 text-xs text-amber-700">入住起不能晚于入住止</div>
+      )}
+    </section>
   );
 }
 

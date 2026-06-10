@@ -21,3 +21,10 @@ export const updateFulfillmentBodySchema = z.object({
   failureReason: z.string().max(500).optional(),
 });
 export type UpdateFulfillmentBody = z.infer<typeof updateFulfillmentBodySchema>;
+
+// ── 批量状态流转（签证批量标"已送签"等；镜像 orders batch-status）─────────
+export const batchFulfillmentStatusBodySchema = z.object({
+  taskIds: z.array(z.string().min(1)).min(1).max(100),
+  toStatus: z.nativeEnum(FulfillmentStatus),
+});
+export type BatchFulfillmentStatusBody = z.infer<typeof batchFulfillmentStatusBodySchema>;

@@ -8,11 +8,13 @@
  *   DELETE /hotel-control/block-periods/:id        删周期
  *   GET    /hotel-control/board?from&to            销控板（按酒店×日期：切/占/余）
  *   GET    /hotel-control/forward?from&to          远期视图（按日期跨酒店合计）
+ *   GET    /hotel-control/alerts?days=14           提醒线（超卖加房/富余退房/班次超员）
  */
 import type { FastifyPluginAsync } from 'fastify';
 import { UserRole } from '@prisma/client';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
 import {
+  alertsQuerySchema,
   boardQuerySchema,
   createBlockPeriodBodySchema,
   listBlockPeriodsQuerySchema,
@@ -21,6 +23,7 @@ import {
 import {
   createBlockPeriod,
   deleteBlockPeriod,
+  getAlerts,
   getBoard,
   getForward,
   listBlockPeriods,
@@ -91,5 +94,11 @@ export const hotelControlRoutes: FastifyPluginAsync = async (app) => {
   app.get('/forward', requireStaff, async (req) => {
     const q = boardQuerySchema.parse(req.query);
     return getForward(q);
+  });
+
+  // ── 提醒线（按需计算，无 cron）────────────────────────────────────────
+  app.get('/alerts', requireStaff, async (req) => {
+    const q = alertsQuerySchema.parse(req.query);
+    return getAlerts(q.days);
   });
 };

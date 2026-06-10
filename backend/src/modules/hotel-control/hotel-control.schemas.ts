@@ -35,3 +35,9 @@ export const boardQuerySchema = z.object({
   to: dateStr,
 });
 export type BoardQuery = z.infer<typeof boardQuerySchema>;
+
+// ── 提醒线（超卖加房 / 富余退房 / 班次超开票上限）─────────────────────────
+export const alertsQuerySchema = z.object({
+  days: z.coerce.number().int().min(1).max(60).default(14),
+});
+export type AlertsQuery = z.infer<typeof alertsQuerySchema>;

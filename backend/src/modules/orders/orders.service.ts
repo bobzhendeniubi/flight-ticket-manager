@@ -32,6 +32,7 @@ import {
 } from '../../lib/errors.js';
 import { PricingService } from '../pricing/pricing.service.js';
 import { bundleItemMetadataSchema } from './orders.schemas.js';
+import { assertTicketingCap } from './ticketing-cap.js';
 import type {
   BatchCreateOrdersBody,
   CreateOrderBody,
@@ -117,8 +118,24 @@ export class OrderService {
       );
     }
 
+    // 重复乘客校验：同班次「占座中」订单里已有同证件号乘客 → 拒绝，防同人同航班重复占座
+    const flightScheduleIds = [
+      ...new Set(
+        body.items
+          .filter((i): i is Extract<OrderItemInput, { kind: 'FLIGHT' }> => i.kind === 'FLIGHT')
+          .map((i) => i.flightScheduleId),
+      ),
+    ];
+    await this.assertNoDuplicatePassengersOnFlights(
+      flightScheduleIds,
+      body.passengers.map((px) => px.documentNumber),
+    );
+
     // 先查所有 FLIGHT item 对应的 FlightSeatClass + 计算动态价（在事务外查，避免长事务）
     const pricedItems = await this.priceAndValidateItems(body.items);
+
+    // 签证订单规则：含 VISA 行时每位出行人必须填写护照有效期（送签材料必填）
+    assertVisaPassengersHavePassportExpiry(body.items, body.passengers);
 
     // 护照有效期规则（相对出发日）：<90 天禁止下单；不足 6 个月每人 +200 临期附加费
     await this.applyPassportExpiryRule(body, pricedItems);
@@ -330,6 +347,46 @@ export class OrderService {
         amount: NEAR_EXPIRY_SURCHARGE_CNY * surchargeCount,
       });
     }
+  }
+
+  /**
+   * 重复乘客校验：同一航班班次的「占座中」订单（SEAT_HOLDING_STATUSES）里，
+   * 同证件号乘客不允许再次下单 —— 已取消/已退款/超时的订单不算占座，可重订。
+   * 命中则抛 BadRequestError，列出证件号与冲突订单号。
+   */
+  private async assertNoDuplicatePassengersOnFlights(
+    flightScheduleIds: string[],
+    documentNumbers: string[],
+  ): Promise<void> {
+    if (flightScheduleIds.length === 0 || documentNumbers.length === 0) return;
+
+    const conflicts = await prisma.passenger.findMany({
+      where: {
+        documentNumber: { in: [...new Set(documentNumbers)] },
+        order: {
+          status: { in: SEAT_HOLDING_STATUSES },
+          items: { some: { flightScheduleId: { in: flightScheduleIds } } },
+        },
+      },
+      select: {
+        documentNumber: true,
+        order: { select: { orderNumber: true } },
+      },
+    });
+    if (conflicts.length === 0) return;
+
+    const orderNumbersByDoc = new Map<string, Set<string>>();
+    for (const c of conflicts) {
+      const orderNumbers = orderNumbersByDoc.get(c.documentNumber) ?? new Set<string>();
+      orderNumbers.add(c.order.orderNumber);
+      orderNumbersByDoc.set(c.documentNumber, orderNumbers);
+    }
+    const detail = [...orderNumbersByDoc.entries()]
+      .map(([doc, orderNumbers]) => `${doc}（订单 ${[...orderNumbers].join('、')}）`)
+      .join('；');
+    throw new BadRequestError(
+      `以下乘客证件号已在同航班的有效订单中，不能重复下单：${detail}`,
+    );
   }
 
   private async priceAndValidateItems(items: OrderItemInput[]) {
@@ -570,9 +627,20 @@ export class OrderService {
   ) {
     // 收集事务里创建的任务 id，提交后再入队（避免 worker 在 tx 提交前查不到）
     const pendingFulfillmentTaskIds: string[] = [];
+    // 收集释放座位的舱位 id，提交后排队候补检查
+    const releasedSeatClassIds: string[] = [];
 
     const updated = await prisma.$transaction(async (tx) => {
-      return this._updateStatusWithinTx(tx, id, toStatus, requester, reason, pendingFulfillmentTaskIds, force);
+      return this._updateStatusWithinTx(
+        tx,
+        id,
+        toStatus,
+        requester,
+        reason,
+        pendingFulfillmentTaskIds,
+        force,
+        releasedSeatClassIds,
+      );
     });
 
     // 事务提交后 enqueue fulfillment jobs（若有）
@@ -595,6 +663,19 @@ export class OrderService {
       } catch (err) {
         // eslint-disable-next-line no-console
         console.error('[orders] failed to cancel seat-hold job for', id, err);
+      }
+    }
+
+    // 释放了座位 → 排队候补检查（best-effort，失败不阻塞状态流转）
+    if (releasedSeatClassIds.length > 0) {
+      try {
+        const { enqueueWaitlistCheck } = await import('../../queues/queue.js');
+        await Promise.all(
+          [...new Set(releasedSeatClassIds)].map((seatClassId) => enqueueWaitlistCheck(seatClassId)),
+        );
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error('[orders] failed to enqueue waitlist-check for', id, err);
       }
     }
 
@@ -652,6 +733,22 @@ export class OrderService {
       error?: string;
     }>;
   }> {
+    // 重复乘客校验（整批先查，命中则整批拒绝，不产生部分建单）：
+    // 1) 名单内证件号重复；2) 与同班次「占座中」订单的乘客证件号重复
+    const seenDocs = new Set<string>();
+    const dupInBatch = new Set<string>();
+    for (const px of body.passengers) {
+      if (seenDocs.has(px.documentNumber)) dupInBatch.add(px.documentNumber);
+      seenDocs.add(px.documentNumber);
+    }
+    if (dupInBatch.size > 0) {
+      throw new BadRequestError(`名单内证件号重复：${[...dupInBatch].join('、')}`);
+    }
+    await this.assertNoDuplicatePassengersOnFlights(
+      [body.flightScheduleId],
+      body.passengers.map((px) => px.documentNumber),
+    );
+
     const results: Array<{
       index: number;
       passengerName: string;
@@ -708,15 +805,42 @@ export class OrderService {
     return { successCount, failureCount, results };
   }
 
-  /** 设置开票状态（路由层限 ADMIN/STAFF）。 */
+  /**
+   * 设置开票状态（路由层限 ADMIN/STAFF）。
+   * 转 ISSUED 前校验班次开票上限（FlightSchedule.ticketingCap，默认 191 张/班次），
+   * 超限抛 422。校验+更新同包一个事务，缩小并发开票越限的窗口。
+   */
   async setInvoiceStatus(
     id: string,
     invoiceStatus: InvoiceStatus,
   ): Promise<{ id: string; orderNumber: string; invoiceStatus: InvoiceStatus }> {
-    return prisma.order.update({
-      where: { id },
-      data: { invoiceStatus },
-      select: { id: true, orderNumber: true, invoiceStatus: true },
+    return prisma.$transaction(async (tx) => {
+      const order = await tx.order.findUnique({
+        where: { id },
+        select: {
+          invoiceStatus: true,
+          items: {
+            where: { kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
+            select: { flightScheduleId: true },
+          },
+          _count: { select: { passengers: true } },
+        },
+      });
+      if (!order) throw new NotFoundError('订单不存在');
+
+      // 已是 ISSUED 的订单重复设置不再计数（幂等）；改回 NONE/REQUESTED 不受限
+      if (invoiceStatus === InvoiceStatus.ISSUED && order.invoiceStatus !== InvoiceStatus.ISSUED) {
+        const scheduleIds = order.items
+          .map((it) => it.flightScheduleId)
+          .filter((sid): sid is string => sid !== null);
+        await assertTicketingCap(tx, scheduleIds, order._count.passengers);
+      }
+
+      return tx.order.update({
+        where: { id },
+        data: { invoiceStatus },
+        select: { id: true, orderNumber: true, invoiceStatus: true },
+      });
     });
   }
 
@@ -732,6 +856,7 @@ export class OrderService {
     reason: string | undefined,
     newTaskIdsOut: string[],
     force?: boolean,
+    releasedSeatClassIdsOut?: string[],
   ) {
     const order = await tx.order.findUnique({
       where: { id },
@@ -783,6 +908,14 @@ export class OrderService {
           where: { scheduleId: item.flightScheduleId, cabin: item.flightCabin },
           data: { sold: { decrement: item.quantity } },
         });
+        // 收集释放座位的舱位 id —— 调用方提交事务后排队候补检查
+        if (releasedSeatClassIdsOut) {
+          const sc = await tx.flightSeatClass.findFirst({
+            where: { scheduleId: item.flightScheduleId, cabin: item.flightCabin },
+            select: { id: true },
+          });
+          if (sc) releasedSeatClassIdsOut.push(sc.id);
+        }
       }
     }
 
@@ -1101,6 +1234,25 @@ export function buildOrderFilterWhere(query: OrderListFilters): Prisma.OrderWher
   }
 
   return where;
+}
+
+// ── 签证订单：护照有效期必填 ─────────────────────────────────────────
+/**
+ * items 含 VISA 行时，每位出行人都必须填写护照有效期（送签材料必填，
+ * 缺失会导致使馆退件）。不含 VISA 行的订单不受此规则约束。
+ *
+ * 导出供 createOrder 调用 + 单测使用。
+ */
+export function assertVisaPassengersHavePassportExpiry(
+  items: ReadonlyArray<Pick<OrderItemInput, 'kind'>>,
+  passengers: ReadonlyArray<Pick<PassengerInput, 'passportExpiry'>>,
+): void {
+  const hasVisaItem = items.some((i) => i.kind === 'VISA');
+  if (!hasVisaItem) return;
+  const hasMissingExpiry = passengers.some((px) => !px.passportExpiry);
+  if (hasMissingExpiry) {
+    throw new BadRequestError('签证订单每位出行人需填写护照有效期');
+  }
 }
 
 // ── 套餐酒店盖章 ─────────────────────────────────────────────────────

@@ -6,6 +6,27 @@ import type { CreateFlightBody, CreateScheduleBody, FlightSearchQuery } from './
 
 const pricingService = new PricingService();
 
+// ── 余位档位（服务端权威口径，前端只展示档位不展示精确数字）────────────────
+// 阈值（张）：>40 充足 AMPLE；16-40 偏紧 TIGHT；6-15 紧张 LOW；1-5 极少 VERY_LOW；≤0 售罄 SOLD_OUT
+// 注：运营可能随销售节奏调整这些阈值（改这里即可，全局唯一来源）。
+export const AVAILABILITY_TIER_THRESHOLDS = {
+  AMPLE_MIN: 41,
+  TIGHT_MIN: 16,
+  LOW_MIN: 6,
+  VERY_LOW_MIN: 1,
+} as const;
+
+export type AvailabilityTier = 'AMPLE' | 'TIGHT' | 'LOW' | 'VERY_LOW' | 'SOLD_OUT';
+
+/** 把锁位感知的可售余量（available）折算成档位。 */
+export function computeAvailabilityTier(available: number): AvailabilityTier {
+  if (available >= AVAILABILITY_TIER_THRESHOLDS.AMPLE_MIN) return 'AMPLE';
+  if (available >= AVAILABILITY_TIER_THRESHOLDS.TIGHT_MIN) return 'TIGHT';
+  if (available >= AVAILABILITY_TIER_THRESHOLDS.LOW_MIN) return 'LOW';
+  if (available >= AVAILABILITY_TIER_THRESHOLDS.VERY_LOW_MIN) return 'VERY_LOW';
+  return 'SOLD_OUT';
+}
+
 export class FlightService {
   /** 面向销售端的航班搜索 — 仅返回自营、激活且未来出发、且可售座位 > 0 的班次 */
   async search(q: FlightSearchQuery) {
@@ -90,6 +111,7 @@ export class FlightService {
               sold: c.sold,
               locked: lockedQty,
               available: avail,
+              availabilityTier: computeAvailabilityTier(avail),
               basePrice: c.basePrice.toString(),
               dynamicPrice,
               dateRank,
@@ -203,6 +225,7 @@ export class FlightService {
         arrivalTime: arr,
         departureTz: body.departureTz,
         arrivalTz: body.arrivalTz,
+        ...(body.ticketingCap !== undefined && { ticketingCap: body.ticketingCap }),
         seatClasses: {
           create: seats.map((c) => ({
             cabin: c.cabin,
@@ -214,6 +237,17 @@ export class FlightService {
       include: { seatClasses: true },
     });
     return schedule;
+  }
+
+  /** 调整班次开票上限（航司临时放宽/收紧时运营改）。 */
+  async updateTicketingCap(scheduleId: string, ticketingCap: number) {
+    const schedule = await prisma.flightSchedule.findUnique({ where: { id: scheduleId } });
+    if (!schedule) throw new NotFoundError('班次不存在');
+    return prisma.flightSchedule.update({
+      where: { id: scheduleId },
+      data: { ticketingCap },
+      select: { id: true, ticketingCap: true },
+    });
   }
 
   async deleteSchedule(scheduleId: string) {

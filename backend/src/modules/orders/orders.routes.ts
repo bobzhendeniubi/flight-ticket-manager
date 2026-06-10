@@ -14,6 +14,7 @@ import {
   batchCreateOrdersBodySchema,
   batchUpdateStatusBodySchema,
   createOrderBodySchema,
+  exportRoomAllocationQuerySchema,
   exportTemplatesQuerySchema,
   listOrdersQuerySchema,
   updateStatusBodySchema,
@@ -29,6 +30,10 @@ import {
   ORDER_TEMPLATE_LABEL,
   orderTemplateExportFilename,
 } from './orders.export-templates.js';
+import {
+  buildRoomAllocationWorkbook,
+  roomAllocationExportFilename,
+} from './orders.export-room-allocation.js';
 
 export const orderRoutes: FastifyPluginAsync = async (app) => {
   const service = new OrderService();
@@ -331,6 +336,41 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         .header(
           'Content-Disposition',
           `attachment; filename="${encodeURIComponent(orderTemplateExportFilename(query.template))}"`,
+        )
+        .send(buf);
+    },
+  );
+
+  // ── 分房表导出（成都格式：每入住日期一个 sheet，按酒店分组）──
+  // GET /orders/export-room-allocation?from&to — ADMIN/STAFF only
+  // 默认 from=to=今天；跨度上限 14 天（超出 service 抛 400）
+  app.get(
+    '/export-room-allocation',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    async (req, reply) => {
+      const query = exportRoomAllocationQuerySchema.parse(req.query);
+      const today = new Date().toISOString().slice(0, 10);
+      const from = query.from ?? today;
+      const to = query.to ?? from; // 只给 from 时按单日导出
+      const buf = await buildRoomAllocationWorkbook({ from, to });
+
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'EXPORT_ROOM_ALLOCATION',
+        targetType: 'ORDER',
+        targetId: 'room-allocation',
+        targetLabel: `分房表 ${from} ~ ${to}`,
+        after: { from, to },
+      });
+
+      return reply
+        .header(
+          'Content-Type',
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
+        .header(
+          'Content-Disposition',
+          `attachment; filename="${encodeURIComponent(roomAllocationExportFilename(from, to))}"`,
         )
         .send(buf);
     },

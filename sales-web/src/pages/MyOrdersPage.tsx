@@ -14,7 +14,15 @@
  */
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { api, type MySeatLock, type OrderSummary, type OrderStatus, type RefundQuote } from '../lib/api';
+import {
+  api,
+  type MySeatLock,
+  type MyWaitlistEntry,
+  type OrderSummary,
+  type OrderStatus,
+  type RefundQuote,
+  type WaitlistStatus,
+} from '../lib/api';
 import { CABIN_LABEL } from '../lib/airports';
 import { useAuth } from '../stores/auth';
 
@@ -167,6 +175,9 @@ export function MyOrdersPage() {
 
       {/* 我的锁位 — 有 ACTIVE 锁位才显示，挂在订单列表上方 */}
       <SeatLocksSection token={token} />
+
+      {/* 我的候补 — 有候补记录才显示，挂在锁位下方 */}
+      <WaitlistSection token={token} />
 
       {loading && <div className="card text-center py-8 text-slate-500">加载中…</div>}
       {error && <div className="card border-rose-200 bg-rose-50 text-sm text-rose-700">{error}</div>}
@@ -395,6 +406,93 @@ function SeatLocksSection({ token }: { token: string }) {
             </li>
           );
         })}
+      </ul>
+    </section>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────
+// WaitlistSection — 我的候补（售罄舱位登记，座位释放后按先来先到通知）。
+// 后端 GET /waitlist/mine 只返回 ACTIVE/NOTIFIED（仍在跟进中的），
+// 取消成功后客户端直接剔除该行；没有记录时整块不渲染。
+// ─────────────────────────────────────────────────────────────────
+const WAITLIST_STATUS_LABEL: Partial<Record<WaitlistStatus, string>> = {
+  ACTIVE: '等待中',
+  NOTIFIED: '已通知',
+};
+const WAITLIST_STATUS_CLASS: Partial<Record<WaitlistStatus, string>> = {
+  ACTIVE: 'bg-slate-100 text-slate-600',
+  NOTIFIED: 'bg-emerald-100 text-emerald-700',
+};
+
+function WaitlistSection({ token }: { token: string }) {
+  const [entries, setEntries] = useState<MyWaitlistEntry[]>([]);
+  const [cancellingId, setCancellingId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!token) return;
+    api
+      .listMyWaitlist(token)
+      .then((r) => setEntries(r.entries))
+      .catch(() => undefined); // 候补加载失败不阻塞订单列表
+  }, [token]);
+
+  if (entries.length === 0) return null;
+
+  const cancel = async (id: string) => {
+    setCancellingId(id);
+    setError(null);
+    try {
+      await api.cancelWaitlist(token, id);
+      setEntries((prev) => prev.filter((e) => e.id !== id));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '取消失败');
+    } finally {
+      setCancellingId(null);
+    }
+  };
+
+  return (
+    <section className="card space-y-2 border-sky-200 bg-sky-50/50">
+      <header className="flex flex-wrap items-center justify-between gap-2">
+        <h2 className="font-semibold text-slate-900">🕐 我的候补</h2>
+        <span className="text-xs text-sky-700">座位释放后按登记顺序通知，请保持手机畅通</span>
+      </header>
+      {error && <div className="text-sm text-rose-700">{error}</div>}
+      <ul className="space-y-1.5">
+        {entries.map((e) => (
+          <li
+            key={e.id}
+            className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-sky-100 bg-white px-3 py-2 text-sm"
+          >
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="font-mono font-semibold text-slate-800">{e.flightNumber}</span>
+              <span className="text-slate-500">
+                {new Date(e.departureTime).toLocaleString('zh-CN')}
+              </span>
+              <span className="rounded bg-slate-100 px-1.5 py-0.5 text-xs text-slate-600">
+                {CABIN_LABEL[e.cabin] ?? e.cabin}
+              </span>
+              <span className="text-slate-700">× {e.qty} 张</span>
+            </div>
+            <div className="flex items-center gap-3">
+              <span
+                className={`rounded px-2 py-0.5 text-xs font-medium ${WAITLIST_STATUS_CLASS[e.status] ?? 'bg-slate-100 text-slate-600'}`}
+              >
+                {WAITLIST_STATUS_LABEL[e.status] ?? e.status}
+              </span>
+              <button
+                type="button"
+                disabled={cancellingId === e.id}
+                onClick={() => cancel(e.id)}
+                className="rounded-md border border-rose-300 bg-white px-2.5 py-1 text-xs text-rose-700 hover:bg-rose-50 disabled:opacity-50"
+              >
+                {cancellingId === e.id ? '取消中…' : '取消'}
+              </button>
+            </div>
+          </li>
+        ))}
       </ul>
     </section>
   );

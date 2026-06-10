@@ -80,6 +80,9 @@ export interface AuthResult {
   tokens: AuthTokens;
 }
 
+// ── 余位档位（服务端权威口径；买家只看档位，不展示精确余票数）──────────────
+export type AvailabilityTier = 'AMPLE' | 'TIGHT' | 'LOW' | 'VERY_LOW' | 'SOLD_OUT';
+
 export interface FlightSeatAvailability {
   seatClassId: string; // 锁位接口（POST /seat-locks）需要
   cabin: CabinClass;
@@ -87,6 +90,7 @@ export interface FlightSeatAvailability {
   sold: number;
   locked: number;
   available: number;
+  availabilityTier: AvailabilityTier;
   basePrice: string;
   dynamicPrice: string;
   dateRank: string;
@@ -308,6 +312,35 @@ export interface MySeatLock {
   cabin: CabinClass;
   qty: number;
   expiresAt: string;
+  createdAt: string;
+}
+
+// ── 候补 ──────────────────────────────────────────────────────────────────
+// 舱位售罄时登记候补（单次 1-9 张 + 联系手机号）；座位释放后按先来先到通知。
+export type WaitlistStatus = 'ACTIVE' | 'NOTIFIED' | 'FULFILLED' | 'CANCELLED';
+
+/** POST /waitlist 返回的候补记录 */
+export interface WaitlistEntry {
+  id: string;
+  flightScheduleId: string;
+  seatClassId: string;
+  userId: string;
+  qty: number;
+  contactPhone: string;
+  status: WaitlistStatus;
+  createdAt: string;
+}
+
+/** GET /waitlist/mine 的行（含航班号/起飞时间/舱等/状态） */
+export interface MyWaitlistEntry {
+  id: string;
+  flightScheduleId: string;
+  seatClassId: string;
+  flightNumber: string;
+  departureTime: string;
+  cabin: CabinClass;
+  qty: number;
+  status: WaitlistStatus;
   createdAt: string;
 }
 
@@ -634,6 +667,19 @@ export const api = {
     apiFetch<{ locks: MySeatLock[] }>('/seat-locks/mine', { token }),
   releaseSeatLock: (token: string, id: string) =>
     apiFetch<{ result: { id: string; status: SeatLockStatus } }>(`/seat-locks/${id}`, {
+      method: 'DELETE',
+      token,
+    }),
+
+  // 候补 — 舱位售罄时登记（1-9 张 + 手机号），座位释放后按先来先到通知
+  createWaitlist: (
+    token: string,
+    body: { flightScheduleId: string; seatClassId: string; qty: number; contactPhone: string },
+  ) => apiFetch<{ entry: WaitlistEntry }>('/waitlist/', { method: 'POST', token, body }),
+  listMyWaitlist: (token: string) =>
+    apiFetch<{ entries: MyWaitlistEntry[] }>('/waitlist/mine', { token }),
+  cancelWaitlist: (token: string, id: string) =>
+    apiFetch<{ result: { id: string; status: WaitlistStatus } }>(`/waitlist/${id}`, {
       method: 'DELETE',
       token,
     }),

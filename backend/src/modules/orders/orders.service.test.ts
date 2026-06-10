@@ -21,6 +21,9 @@ const { mockPrisma, mockComputeQuote } = vi.hoisted(() => ({
       findUnique: vi.fn(),
       findUniqueOrThrow: vi.fn(),
     },
+    passenger: {
+      findMany: vi.fn(),
+    },
   },
   mockComputeQuote: vi.fn(),
 }));
@@ -34,7 +37,11 @@ vi.mock('../../lib/cancellation.js', () => ({
 }));
 
 // 现在才能 import service
-import { OrderService, resolveBundleHotelStamp } from './orders.service.js';
+import {
+  OrderService,
+  assertVisaPassengersHavePassportExpiry,
+  resolveBundleHotelStamp,
+} from './orders.service.js';
 
 // ── Fixture helper：build 一个完整的 fake order（serializeOrder 要的字段全有） ──
 const dec = (n: number) => ({ toString: () => String(n) });
@@ -214,6 +221,125 @@ describe('OrderService.requestCancellation', () => {
   });
 });
 
+// ── 重复乘客校验：同班次占座订单中证件号查重 ─────────────────────────────
+describe('OrderService 重复乘客校验', () => {
+  const service = new OrderService();
+
+  const fakePassenger = (documentNumber: string, fullName = '张三') => ({
+    fullName,
+    documentType: 'PASSPORT' as const,
+    documentNumber,
+    dateOfBirth: '1990-01-01',
+    nationality: 'CN',
+    passengerType: 'ADULT' as const,
+  });
+
+  const flightItem = {
+    kind: 'FLIGHT' as const,
+    description: 'QH9589 澳门→岘港 经济舱',
+    quantity: 1,
+    flightScheduleId: 'sched-1',
+    flightCabin: 'ECONOMY' as const,
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('createOrder：证件号已在同班次占座订单中 → BadRequestError 列出证件号+冲突订单号', async () => {
+    mockPrisma.passenger.findMany.mockResolvedValue([
+      { documentNumber: 'E12345678', order: { orderNumber: 'FTM-TEST-001' } },
+      { documentNumber: 'E12345678', order: { orderNumber: 'FTM-TEST-002' } },
+    ]);
+
+    let thrown: Error | undefined;
+    try {
+      await service.createOrder(
+        {
+          contactName: '联系人',
+          contactPhone: '13800000000',
+          items: [flightItem],
+          passengers: [fakePassenger('E12345678')],
+        },
+        { userId: 'u1', role: 'CUSTOMER' },
+      );
+    } catch (err) {
+      thrown = err as Error;
+    }
+
+    expect(thrown).toBeDefined();
+    expect(thrown!.message).toContain('E12345678');
+    expect(thrown!.message).toContain('FTM-TEST-001');
+    expect(thrown!.message).toContain('FTM-TEST-002');
+
+    // 查重条件：同班次 + 占座状态 + 证件号 in
+    expect(mockPrisma.passenger.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          documentNumber: { in: ['E12345678'] },
+          order: expect.objectContaining({
+            items: { some: { flightScheduleId: { in: ['sched-1'] } } },
+          }),
+        }),
+      }),
+    );
+  });
+
+  it('查重无命中 → 校验通过（不抛重复错误）', async () => {
+    mockPrisma.passenger.findMany.mockResolvedValue([]);
+    // 直接调私有校验方法：通过 = resolve，不抛
+    await expect(
+      (service as unknown as {
+        assertNoDuplicatePassengersOnFlights(s: string[], d: string[]): Promise<void>;
+      }).assertNoDuplicatePassengersOnFlights(['sched-1'], ['E12345678']),
+    ).resolves.toBeUndefined();
+  });
+
+  it('无 FLIGHT 班次（纯酒店/签证单）→ 跳过查重，不查库', async () => {
+    await (service as unknown as {
+      assertNoDuplicatePassengersOnFlights(s: string[], d: string[]): Promise<void>;
+    }).assertNoDuplicatePassengersOnFlights([], ['E12345678']);
+    expect(mockPrisma.passenger.findMany).not.toHaveBeenCalled();
+  });
+
+  it('batchCreateOrders：名单内证件号重复 → 整批拒绝，且不查库', async () => {
+    await expect(
+      service.batchCreateOrders(
+        {
+          flightScheduleId: 'sched-1',
+          flightCabin: 'ECONOMY',
+          description: 'QH9589 澳门→岘港',
+          contactName: '联系人',
+          contactPhone: '13800000000',
+          passengers: [fakePassenger('E12345678', '张三'), fakePassenger('E12345678', '李四')],
+        },
+        { userId: 'u1', role: 'STAFF' },
+      ),
+    ).rejects.toThrow(/名单内证件号重复.*E12345678/);
+    expect(mockPrisma.passenger.findMany).not.toHaveBeenCalled();
+  });
+
+  it('batchCreateOrders：名单与同班次占座订单冲突 → 整批拒绝（不建任何单）', async () => {
+    mockPrisma.passenger.findMany.mockResolvedValue([
+      { documentNumber: 'G88888888', order: { orderNumber: 'FTM-TEST-009' } },
+    ]);
+
+    await expect(
+      service.batchCreateOrders(
+        {
+          flightScheduleId: 'sched-1',
+          flightCabin: 'ECONOMY',
+          description: 'QH9589 澳门→岘港',
+          contactName: '联系人',
+          contactPhone: '13800000000',
+          passengers: [fakePassenger('E12345678'), fakePassenger('G88888888', '王五')],
+        },
+        { userId: 'u1', role: 'STAFF' },
+      ),
+    ).rejects.toThrow(/G88888888.*FTM-TEST-009/);
+  });
+});
+
 // ── 套餐酒店盖章：resolveBundleHotelStamp ─────────────────────────────
 describe('resolveBundleHotelStamp', () => {
   const linkedBundle = { hotelRoomTypeId: 'rt1', hotelNights: 3 };
@@ -273,5 +399,31 @@ describe('resolveBundleHotelStamp', () => {
     });
     expect(stamp?.hotelCheckIn).toEqual(new Date('2026-07-01'));
     expect(stamp?.hotelCheckOut).toEqual(new Date('2026-07-04'));
+  });
+});
+
+// ── 签证订单：护照有效期必填 assertVisaPassengersHavePassportExpiry ────
+describe('assertVisaPassengersHavePassportExpiry', () => {
+  const visaItem = { kind: 'VISA' as const };
+  const flightItem = { kind: 'FLIGHT' as const };
+  const pxFilled = { passportExpiry: '2030-01-01' };
+  const pxMissing = { passportExpiry: undefined };
+
+  it('含 VISA 行且有乘客缺护照有效期 → BadRequestError', () => {
+    expect(() =>
+      assertVisaPassengersHavePassportExpiry([flightItem, visaItem], [pxFilled, pxMissing]),
+    ).toThrow('签证订单每位出行人需填写护照有效期');
+  });
+
+  it('含 VISA 行且全部乘客已填 → 通过', () => {
+    expect(() =>
+      assertVisaPassengersHavePassportExpiry([visaItem], [pxFilled, pxFilled]),
+    ).not.toThrow();
+  });
+
+  it('不含 VISA 行 → 缺有效期也不拦截', () => {
+    expect(() =>
+      assertVisaPassengersHavePassportExpiry([flightItem], [pxMissing]),
+    ).not.toThrow();
   });
 });

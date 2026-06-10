@@ -17,6 +17,7 @@ import { SettlementsPage } from './pages/SettlementsPage';
 import { CancellationPoliciesPage } from './pages/CancellationPoliciesPage';
 import { FinancesPage } from './pages/FinancesPage';
 import { HotelControlPage } from './pages/HotelControlPage';
+import { VisaDeskPage } from './pages/VisaDeskPage';
 import { useAuth } from './stores/auth';
 
 // AGENT 可访问的页面集合（其他页面默认 ADMIN/STAFF 专属）
@@ -193,6 +194,14 @@ export function App() {
           element={
             <Protected adminOnly>
               <HotelControlPage />
+            </Protected>
+          }
+        />
+        <Route
+          path="/visa-desk"
+          element={
+            <Protected adminOnly>
+              <VisaDeskPage />
             </Protected>
           }
         />

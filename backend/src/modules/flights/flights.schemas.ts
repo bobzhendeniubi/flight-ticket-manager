@@ -31,6 +31,8 @@ export const createScheduleBodySchema = z.object({
   arrivalTime: z.string().datetime(),
   departureTz: z.string().default('Asia/Shanghai'),
   arrivalTz: z.string().default('Asia/Shanghai'),
+  // 班次开票上限（张）；缺省走 DB 默认 191
+  ticketingCap: z.number().int().min(1).max(600).optional(),
   seatClasses: z
     .array(
       z.object({

@@ -456,7 +456,39 @@ export interface FulfillmentTask {
   createdAt: string;
   updatedAt: string;
   item: { id: string; kind: OrderItemKind; description: string; quantity: number; orderId: string };
-  order?: { id: string; orderNumber: string; contactName: string; contactPhone: string; status: OrderStatus };
+  order?: { id: string; orderNumber: string; contactName: string; contactPhone: string; status: OrderStatus; notes?: string | null };
+}
+
+/** GET /fulfillment-tasks 列表查询（与 backend listFulfillmentQuerySchema 对齐） */
+export interface ListFulfillmentParams {
+  orderId?: string;
+  orderItemId?: string;
+  type?: FulfillmentType;
+  status?: FulfillmentStatus;
+  assigneeUserId?: string;
+  page?: number;
+  pageSize?: number;
+}
+
+/** POST /fulfillment-tasks/batch-status 返回（部分失败带 failures 明细） */
+export interface BatchFulfillmentStatusResult {
+  successCount: number;
+  failureCount: number;
+  failures: Array<{ id: string; error: string }>;
+}
+
+// ── 候补（ADMIN/STAFF 某班次候补名单，电话回访用）─────────────────────────
+export type WaitlistStatus = 'ACTIVE' | 'NOTIFIED' | 'FULFILLED' | 'CANCELLED';
+
+export interface WaitlistEntry {
+  id: string;
+  seatClassId: string;
+  cabin: CabinClass;
+  qty: number;
+  status: WaitlistStatus;
+  contactPhone: string;
+  user: { id: string; displayName: string | null; email: string | null; phone: string | null };
+  createdAt: string;
 }
 
 // ── Products ─────────────────────────────────────────────────────────────
@@ -602,6 +634,27 @@ export interface HotelControlForward {
   held: number[]; // 切房合计（控房）
   occupied: number[]; // 占房合计（收客）
   remaining: number[]; // held - occupied（余房）
+}
+
+/** GET /hotel-control/alerts — 提醒线（超卖加房 / 富余退房 / 班次超开票上限） */
+export interface HotelControlAlerts {
+  /** 余量 < 0：占房超过包房，提醒加房 */
+  oversold: Array<{
+    hotelId: string;
+    hotelName: string;
+    date: string; // YYYY-MM-DD
+    block: number;
+    used: number;
+    deficit: number; // used - block（正数）
+  }>;
+  /** 距今 3 天内仍有剩余包房：提示该退房 */
+  surplusSoon: Array<{ hotelName: string; date: string; surplus: number }>;
+  /** 出发在 30 天内、计入口径乘客数超过班次开票上限的班次 */
+  overCapacitySchedules: Array<{
+    flightNumber: string;
+    departureDate: string; // YYYY-MM-DD
+    paxCount: number;
+  }>;
 }
 
 // ── Dashboard ─────────────────────────────────────────────────────────────
@@ -1047,8 +1100,27 @@ export const api = {
     apiFetch<{ result: { id: string } }>(`/travelers/${id}`, { method: 'DELETE', token }),
 
   // Fulfillment
+  listFulfillmentTasks: (token: string, query?: ListFulfillmentParams) => {
+    const qs = new URLSearchParams();
+    if (query) {
+      for (const [k, v] of Object.entries(query)) {
+        if (v !== undefined && v !== '') qs.set(k, String(v));
+      }
+    }
+    return apiFetch<{
+      tasks: FulfillmentTask[];
+      pagination: { page: number; pageSize: number; total: number };
+    }>(`/fulfillment-tasks/${qs.toString() ? '?' + qs.toString() : ''}`, { token });
+  },
   listFulfillmentByOrder: (token: string, orderId: string) =>
     apiFetch<{ tasks: FulfillmentTask[] }>(`/fulfillment-tasks/by-order/${orderId}`, { token }),
+  // 批量改履约任务状态（签证台批量标"已送签"等；逐条校验，部分失败返回 failures）
+  batchUpdateFulfillmentStatus: (token: string, taskIds: string[], toStatus: FulfillmentStatus) =>
+    apiFetch<BatchFulfillmentStatusResult>('/fulfillment-tasks/batch-status', {
+      method: 'POST',
+      token,
+      body: { taskIds, toStatus },
+    }),
   updateFulfillmentTask: (token: string, id: string, body: Record<string, unknown>) =>
     apiFetch<{ task: FulfillmentTask }>(`/fulfillment-tasks/${id}`, { method: 'PATCH', token, body }),
   reissueFulfillmentTask: (token: string, id: string) =>
@@ -1256,6 +1328,29 @@ export const api = {
   getHotelForward: (token: string, from: string, to: string) =>
     apiFetch<HotelControlForward>(
       `/hotel-control/forward?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`,
+      { token },
+    ),
+  // 提醒线（超卖加房 / 富余退房 / 班次超开票上限；按需计算，无 cron）
+  getHotelAlerts: (token: string, days = 14) =>
+    apiFetch<HotelControlAlerts>(`/hotel-control/alerts?days=${days}`, { token }),
+
+  // 分房表导出（成都格式：每入住日期一个 sheet；ADMIN/STAFF only）— Blob 直接下载
+  downloadRoomAllocation: async (
+    token: string,
+    range: { from: string; to: string },
+  ): Promise<Blob> => {
+    const res = await fetch(
+      `${API_BASE}/orders/export-room-allocation?from=${encodeURIComponent(range.from)}&to=${encodeURIComponent(range.to)}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) throw new ApiError(res.status, { code: 'EXPORT_FAILED', message: await res.text() });
+    return res.blob();
+  },
+
+  // ── 候补（ADMIN/STAFF）— 某班次候补名单（含用户联系方式，电话回访用）──
+  listWaitlistBySchedule: (token: string, scheduleId: string) =>
+    apiFetch<{ entries: WaitlistEntry[] }>(
+      `/waitlist/?scheduleId=${encodeURIComponent(scheduleId)}`,
       { token },
     ),
 };

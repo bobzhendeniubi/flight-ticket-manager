@@ -132,10 +132,24 @@ export interface NotificationJobData {
   content: string;
   metadata?: Record<string, unknown>;
 }
-export const notificationQueue = new Queue<NotificationJobData>('notification', {
+
+// 候补检查任务（job name 'waitlist-check'）— 座位释放后检查该舱位最早的 ACTIVE 候补
+export interface WaitlistCheckJobData {
+  seatClassId: string;
+}
+
+export const notificationQueue = new Queue<NotificationJobData | WaitlistCheckJobData>('notification', {
   connection: bullRedis,
   defaultJobOptions: { attempts: 5, backoff: { type: 'exponential', delay: 5000 } },
 });
+
+/**
+ * 座位释放（订单取消/超时、锁位过期）后排队候补检查。
+ * 调用方包 try/catch best-effort —— 排队失败不阻塞释放主流程。
+ */
+export async function enqueueWaitlistCheck(seatClassId: string): Promise<void> {
+  await notificationQueue.add('waitlist-check', { seatClassId });
+}
 
 // ── 优雅关闭 ─────────────────────────────────────────────────────
 export async function closeQueues(): Promise<void> {

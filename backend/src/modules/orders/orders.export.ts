@@ -10,6 +10,7 @@ import type { Prisma, PrismaClient } from '@prisma/client';
 import { OrderStatus } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { toAlpha3 } from './nationality.js';
+import { countIssuedPassengers } from './ticketing-cap.js';
 
 /** 与财务导出一致：草稿 / 已取消 / 已退款 / 支付超时 / 失败 不计入。*/
 const COUNTED_STATUSES: OrderStatus[] = [
@@ -232,6 +233,15 @@ export async function buildOrdersBySchedule(
   scheduleId: string,
   client: PrismaClient = defaultPrisma,
 ): Promise<Buffer> {
+  // 开票进度（航司上限指示）：已开票乘客数 vs 班次 ticketingCap
+  const [schedule, issuedCount] = await Promise.all([
+    client.flightSchedule.findUnique({
+      where: { id: scheduleId },
+      select: { ticketingCap: true },
+    }),
+    countIssuedPassengers(client, scheduleId),
+  ]);
+
   const orders = (await client.order.findMany({
     where: {
       status: { in: COUNTED_STATUSES },
@@ -281,8 +291,21 @@ export async function buildOrdersBySchedule(
 
   for (const r of rows) ws.addRow(r);
 
-  // 冻结首行 + 订单号列，便于横向滚动核对
-  ws.views = [{ state: 'frozen', xSplit: 1, ySplit: 1 }];
+  // 开票进度指示行 — 插在表头上方；满额标红提醒运营停止开票
+  let frozenRows = 1;
+  if (schedule) {
+    const cap = schedule.ticketingCap;
+    ws.insertRow(1, [`开票进度：已开票 ${issuedCount} / 上限 ${cap} 张`]);
+    ws.mergeCells(1, 1, 1, COLUMNS.length);
+    ws.getRow(1).font = {
+      bold: true,
+      color: { argb: issuedCount >= cap ? 'FFCC0000' : 'FF555555' },
+    };
+    frozenRows = 2;
+  }
+
+  // 冻结指示行+表头 + 订单号列，便于横向滚动核对
+  ws.views = [{ state: 'frozen', xSplit: 1, ySplit: frozenRows }];
 
   const buf = await wb.xlsx.writeBuffer();
   return Buffer.from(buf);

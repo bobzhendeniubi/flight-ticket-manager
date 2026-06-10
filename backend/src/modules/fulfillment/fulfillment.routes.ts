@@ -4,11 +4,16 @@
  * GET  /fulfillment-tasks            列表（按 order/status/type 过滤）
  * GET  /fulfillment-tasks/by-order/:orderId   某订单的全部任务
  * PATCH /fulfillment-tasks/:id       更新状态/PNR/确认号/司机等
+ * POST /fulfillment-tasks/batch-status        批量改状态（签证批量"已送签"）
  */
 import type { FastifyPluginAsync } from 'fastify';
 import { UserRole } from '@prisma/client';
 import { FulfillmentService } from './fulfillment.service.js';
-import { listFulfillmentQuerySchema, updateFulfillmentBodySchema } from './fulfillment.schemas.js';
+import {
+  batchFulfillmentStatusBodySchema,
+  listFulfillmentQuerySchema,
+  updateFulfillmentBodySchema,
+} from './fulfillment.schemas.js';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
 
 export const fulfillmentRoutes: FastifyPluginAsync = async (app) => {
@@ -42,6 +47,34 @@ export const fulfillmentRoutes: FastifyPluginAsync = async (app) => {
     });
 
     return { task };
+  });
+
+  /**
+   * POST /fulfillment-tasks/batch-status
+   *
+   * 批量更新任务状态（如签证任务批量标"已送签"）。
+   * 逐条复用单任务 update 的校验/副作用；partial failure 返回 failures 明细。
+   */
+  app.post('/batch-status', pre, async (req) => {
+    const body = batchFulfillmentStatusBodySchema.parse(req.body);
+    const result = await service.batchUpdateStatus(body.taskIds, body.toStatus);
+
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'BATCH_UPDATE_FULFILLMENT_STATUS',
+      targetType: 'ORDER',
+      targetId: 'batch',
+      targetLabel: `${result.successCount}/${body.taskIds.length} tasks → ${body.toStatus}`,
+      after: {
+        toStatus: body.toStatus,
+        requestedCount: body.taskIds.length,
+        successCount: result.successCount,
+        failureCount: result.failureCount,
+      },
+      severity: result.failureCount > 0 || body.toStatus === 'FAILED' ? 'WARNING' : 'INFO',
+    });
+
+    return result;
   });
 
   /**

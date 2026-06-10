@@ -12,7 +12,7 @@
  *
  * 写操作由 routes 层负责 ADMIN/STAFF 鉴权 + 审计日志（镜像 finances 成本周期风格）。
  */
-import { OrderStatus, Prisma, type PrismaClient } from '@prisma/client';
+import { OrderItemKind, OrderStatus, Prisma, type PrismaClient } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { BadRequestError, NotFoundError } from '../../lib/errors.js';
 import type { CreateBlockPeriodBody, UpdateBlockPeriodBody } from './hotel-control.schemas.js';
@@ -266,6 +266,114 @@ export async function getBoard(
     });
 
   return { dates, hotels };
+}
+
+// ── 提醒线（超卖加房 / 富余退房 / 班次超开票上限）────────────────────────
+export interface HotelControlAlerts {
+  /** 余量 < 0：占房超过包房，提醒加房 */
+  oversold: Array<{
+    hotelId: string;
+    hotelName: string;
+    date: string; // YYYY-MM-DD
+    block: number;
+    used: number;
+    deficit: number; // used - block（正数）
+  }>;
+  /** 距今 3 天内仍有剩余包房（block > 0 且 remaining > 0）：提示该退房 */
+  surplusSoon: Array<{ hotelName: string; date: string; surplus: number }>;
+  /** 出发在 30 天内、计入口径乘客数超过班次开票上限（默认 191）的班次 */
+  overCapacitySchedules: Array<{
+    flightNumber: string;
+    departureDate: string; // YYYY-MM-DD
+    paxCount: number;
+  }>;
+}
+
+/** 富余提醒窗口（天）— 距今 3 天内还剩包房就该考虑退房了。*/
+const SURPLUS_WINDOW_DAYS = 3;
+
+/** 班次超员检查窗口（天）。*/
+const SCHEDULE_ALERT_WINDOW_DAYS = 30;
+
+/**
+ * 按需计算提醒线（无 cron）：
+ *   - 超卖 / 富余直接复用销控板 getBoard 的展开结果，不重复口径；
+ *   - 班次乘客数按导出同款 COUNTED_STATUSES 统计，对比 FlightSchedule.ticketingCap（默认 191）。
+ */
+export async function getAlerts(
+  days: number,
+  client: PrismaClient = defaultPrisma,
+): Promise<HotelControlAlerts> {
+  const today = new Date().toISOString().slice(0, 10);
+  const fromMs = toDateOnly(today).getTime();
+  // [today, today+days) → 销控板闭区间 [today, today+days-1]
+  const to = new Date(fromMs + (days - 1) * DAY_MS).toISOString().slice(0, 10);
+  const board = await getBoard({ from: today, to }, client);
+
+  const oversold: HotelControlAlerts['oversold'] = [];
+  const surplusSoon: HotelControlAlerts['surplusSoon'] = [];
+  const surplusCutoff = new Date(fromMs + SURPLUS_WINDOW_DAYS * DAY_MS)
+    .toISOString()
+    .slice(0, 10);
+  for (const hotel of board.hotels) {
+    for (let i = 0; i < board.dates.length; i++) {
+      const date = board.dates[i];
+      const block = hotel.rows.block[i];
+      const used = hotel.rows.used[i];
+      const remaining = hotel.rows.remaining[i];
+      if (remaining < 0) {
+        oversold.push({
+          hotelId: hotel.hotelId,
+          hotelName: hotel.hotelName,
+          date,
+          block,
+          used,
+          deficit: used - block,
+        });
+      }
+      if (date < surplusCutoff && block > 0 && remaining > 0) {
+        surplusSoon.push({ hotelName: hotel.hotelName, date, surplus: remaining });
+      }
+    }
+  }
+
+  // 班次乘客数 > 开票上限 — 出发日在 [today, today+30d)
+  const fromD = toDateOnly(today);
+  const horizon = new Date(fromD.getTime() + SCHEDULE_ALERT_WINDOW_DAYS * DAY_MS);
+  const schedules = await client.flightSchedule.findMany({
+    where: { departureTime: { gte: fromD, lt: horizon } },
+    orderBy: { departureTime: 'asc' },
+    select: {
+      id: true,
+      departureTime: true,
+      ticketingCap: true,
+      flight: { select: { flightNumber: true } },
+    },
+  });
+  const paxCounts = await Promise.all(
+    schedules.map((s) =>
+      client.passenger.count({
+        where: {
+          order: {
+            status: { in: COUNTED_STATUSES },
+            items: { some: { kind: OrderItemKind.FLIGHT, flightScheduleId: s.id } },
+          },
+        },
+      }),
+    ),
+  );
+  const overCapacitySchedules: HotelControlAlerts['overCapacitySchedules'] = [];
+  schedules.forEach((s, i) => {
+    if (paxCounts[i] > s.ticketingCap) {
+      overCapacitySchedules.push({
+        flightNumber: s.flight.flightNumber,
+        departureDate: fmtDateOnly(s.departureTime),
+        paxCount: paxCounts[i],
+      });
+    }
+  });
+
+  return { oversold, surplusSoon, overCapacitySchedules };
 }
 
 // ── 远期视图（按日期跨酒店合计）──────────────────────────────────────────

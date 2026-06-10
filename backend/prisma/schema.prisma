@@ -81,6 +81,7 @@ model User {
   remindersCreated OperationalReminder[] @relation("ReminderCreator")
   remindersClaimed OperationalReminder[] @relation("ReminderClaimedBy")
   seatLocks        SeatLock[]
+  seatWaitlists    SeatWaitlist[]
 
   @@index([role])
   @@index([createdAt])
@@ -391,6 +392,8 @@ model FlightSchedule {
   peakSurchargeCny   Decimal? @db.Decimal(10, 2)
   aircraftAdjustCny  Decimal? @db.Decimal(10, 2)
   takeoffDiscountCny Decimal? @db.Decimal(10, 2)
+  // 航司开票上限（张/班次）— 同一班次 invoiceStatus=ISSUED 的乘客数不得超过此值
+  ticketingCap     Int      @default(191)
   isActive         Boolean  @default(true)
   createdAt        DateTime @default(now())
   updatedAt        DateTime @updatedAt
@@ -400,6 +403,7 @@ model FlightSchedule {
   orderItems    OrderItem[]
   pricingConfig PricingConfig?
   seatLocks     SeatLock[]
+  seatWaitlists SeatWaitlist[]
 
   @@index([flightId, departureTime])
   @@index([departureTime])
@@ -415,8 +419,9 @@ model FlightSeatClass {
   createdAt  DateTime   @default(now())
   updatedAt  DateTime   @updatedAt
 
-  schedule  FlightSchedule @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
-  seatLocks SeatLock[]
+  schedule      FlightSchedule @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
+  seatLocks     SeatLock[]
+  seatWaitlists SeatWaitlist[]
 
   @@unique([scheduleId, cabin])
 }
@@ -440,6 +445,35 @@ model SeatLock {
   status           SeatLockStatus @default(ACTIVE)
   expiresAt        DateTime
   consumedOrderId  String? // 锁位被哪张订单消费（CONSUMED 时填）
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  flightSchedule FlightSchedule  @relation(fields: [flightScheduleId], references: [id], onDelete: Cascade)
+  seatClass      FlightSeatClass @relation(fields: [seatClassId], references: [id], onDelete: Cascade)
+  user           User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([flightScheduleId, seatClassId, status])
+  @@index([userId, status])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 候补 — 舱位售罄/余票不足时登记；座位释放后 worker 按先来先到标 NOTIFIED
+// ─────────────────────────────────────────────────────────────────────────────
+enum WaitlistStatus {
+  ACTIVE
+  NOTIFIED
+  FULFILLED
+  CANCELLED
+}
+
+model SeatWaitlist {
+  id               String         @id @default(cuid())
+  flightScheduleId String
+  seatClassId      String
+  userId           String
+  qty              Int
+  contactPhone     String
+  status           WaitlistStatus @default(ACTIVE)
   createdAt        DateTime       @default(now())
   updatedAt        DateTime       @updatedAt
 

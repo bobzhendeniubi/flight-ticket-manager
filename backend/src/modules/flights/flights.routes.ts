@@ -1,4 +1,5 @@
 import type { FastifyPluginAsync } from 'fastify';
+import { z } from 'zod';
 import { UserRole } from '@prisma/client';
 import { FlightService } from './flights.service.js';
 import { PricingService } from '../pricing/pricing.service.js';
@@ -86,6 +87,20 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
       const body = createScheduleBodySchema.parse(req.body);
       const schedule = await service.createSchedule(body);
       return reply.status(201).send({ schedule });
+    },
+  );
+
+  // 班次开票上限（航司限制；默认 191，运营可按班次调整）
+  app.patch(
+    '/schedules/:scheduleId/ticketing-cap',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN)] },
+    async (req) => {
+      const { scheduleId } = req.params as { scheduleId: string };
+      const body = z
+        .object({ ticketingCap: z.number().int().min(1).max(600) })
+        .parse(req.body);
+      const schedule = await service.updateTicketingCap(scheduleId, body.ticketingCap);
+      return { schedule };
     },
   );
 
