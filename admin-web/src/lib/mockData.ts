@@ -836,6 +836,12 @@ export interface MockBundle {
   suitableFor: string;
   /** 当前状态 */
   active: boolean;
+  /** 关联酒店房型 ID（房控板计入套餐占房）；null/缺省 = 不关联 */
+  hotelRoomTypeId?: string | null;
+  /** 关联房型晚数（1–30） */
+  hotelNights?: number | null;
+  /** 展示用：服务端返回的房型名 + 酒店名 */
+  hotelRoomType?: { id: string; name: string; hotelName: string } | null;
 }
 
 

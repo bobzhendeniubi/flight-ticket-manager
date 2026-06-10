@@ -94,6 +94,19 @@ export const bundleItemSchema = baseItemSchema.extend({
   unitPrice: z.number().nonnegative(),
 });
 
+// BUNDLE 行 metadata 里的出行信息（sales-web 购物车带过来，用于推导酒店入住日期）。
+// 全部 optional 且逐字段 .catch(undefined) 降级 —— metadata 异常绝不阻断套餐下单。
+const dateOnlySchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
+export const bundleItemMetadataSchema = z
+  .object({
+    goDate: dateOnlySchema.optional().catch(undefined),
+    returnDate: dateOnlySchema.optional().catch(undefined),
+    pax: z.number().int().min(1).max(99).optional().catch(undefined),
+    rooms: z.number().int().min(1).max(99).optional().catch(undefined),
+  })
+  .catch({});
+export type BundleItemMetadata = z.infer<typeof bundleItemMetadataSchema>;
+
 export const orderItemInputSchema = z.discriminatedUnion('kind', [
   flightItemSchema,
   hotelItemSchema,

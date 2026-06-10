@@ -36,6 +36,15 @@ function isCodeUniqueViolation(err: unknown): boolean {
   return err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002';
 }
 
+// ── Bundle 关联房型 include（list/get/create/update 共用）──────────────
+const BUNDLE_ROOM_INCLUDE = {
+  hotelRoomType: {
+    select: { id: true, name: true, hotel: { select: { name: true } } },
+  },
+} satisfies Prisma.BundleInclude;
+
+type BundleWithRoom = Prisma.BundleGetPayload<{ include: typeof BUNDLE_ROOM_INCLUDE }>;
+
 /** 查最大编号 → 生成下一个 → create；unique 冲突（并发同号）重试一次 +1。 */
 async function createWithProductCode<T>(
   prefix: string,
@@ -316,17 +325,22 @@ export class ProductsService {
     const rows = await prisma.bundle.findMany({
       where: activeOnly ? { isActive: true } : undefined,
       orderBy: { createdAt: 'asc' },
+      include: BUNDLE_ROOM_INCLUDE,
     });
     return rows.map(serializeBundle);
   }
 
   async getBundle(id: string) {
-    const b = await prisma.bundle.findUnique({ where: { id } });
+    const b = await prisma.bundle.findUnique({
+      where: { id },
+      include: BUNDLE_ROOM_INCLUDE,
+    });
     if (!b) throw new NotFoundError('套餐不存在');
     return serializeBundle(b);
   }
 
   async createBundle(body: CreateBundleBody) {
+    await this.assertHotelRoomTypeExists(body.hotelRoomTypeId);
     const b = await createWithProductCode(
       'B',
       async () => {
@@ -348,8 +362,11 @@ export class ProductsService {
           flightPax: body.flightPax,
           groundDiscount: new Prisma.Decimal(body.groundDiscount),
           suitableFor: body.suitableFor,
+          hotelRoomTypeId: body.hotelRoomTypeId ?? null,
+          hotelNights: body.hotelNights ?? null,
           isActive: body.isActive,
         },
+        include: BUNDLE_ROOM_INCLUDE,
       }),
     );
     return serializeBundle(b);
@@ -358,7 +375,8 @@ export class ProductsService {
   async updateBundle(id: string, body: UpdateBundleBody) {
     const existing = await prisma.bundle.findUnique({ where: { id } });
     if (!existing) throw new NotFoundError('套餐不存在');
-    const data: Prisma.BundleUpdateInput = {};
+    await this.assertHotelRoomTypeExists(body.hotelRoomTypeId);
+    const data: Prisma.BundleUncheckedUpdateInput = {};
     if (body.name !== undefined) data.name = body.name;
     if (body.tagline !== undefined) data.tagline = body.tagline;
     if (body.emoji !== undefined) data.emoji = body.emoji;
@@ -367,9 +385,25 @@ export class ProductsService {
     if (body.flightPax !== undefined) data.flightPax = body.flightPax;
     if (body.groundDiscount !== undefined) data.groundDiscount = new Prisma.Decimal(body.groundDiscount);
     if (body.suitableFor !== undefined) data.suitableFor = body.suitableFor;
+    if (body.hotelRoomTypeId !== undefined) data.hotelRoomTypeId = body.hotelRoomTypeId;
+    if (body.hotelNights !== undefined) data.hotelNights = body.hotelNights;
     if (body.isActive !== undefined) data.isActive = body.isActive;
-    const b = await prisma.bundle.update({ where: { id }, data });
+    const b = await prisma.bundle.update({
+      where: { id },
+      data,
+      include: BUNDLE_ROOM_INCLUDE,
+    });
     return serializeBundle(b);
+  }
+
+  /** 校验套餐关联的酒店房型存在（null/undefined 跳过） */
+  private async assertHotelRoomTypeExists(hotelRoomTypeId: string | null | undefined) {
+    if (!hotelRoomTypeId) return;
+    const rt = await prisma.hotelRoomType.findUnique({
+      where: { id: hotelRoomTypeId },
+      select: { id: true },
+    });
+    if (!rt) throw new NotFoundError(`酒店房型 ${hotelRoomTypeId} 不存在`);
   }
 
   async deleteBundle(id: string) {
@@ -414,10 +448,15 @@ function serializeVisa(v: Prisma.VisaGetPayload<Record<string, never>>) {
   };
 }
 
-function serializeBundle(b: Prisma.BundleGetPayload<Record<string, never>>) {
+function serializeBundle(b: BundleWithRoom) {
+  const { hotelRoomType, ...rest } = b;
   return {
-    ...b,
+    ...rest,
     groundDiscount: b.groundDiscount.toString(),
     items: b.items,
+    // admin-web 表单需要房型名 + 酒店名做展示
+    hotelRoomType: hotelRoomType
+      ? { id: hotelRoomType.id, name: hotelRoomType.name, hotelName: hotelRoomType.hotel.name }
+      : null,
   };
 }

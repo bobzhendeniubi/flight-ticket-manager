@@ -1,6 +1,12 @@
 import { Link, useNavigate } from 'react-router-dom';
 import { useCart, KIND_INFO, isSelected } from '../stores/cart';
 
+/** 金额渲染兜底：非法数值显示 '0' 而不是 NaN（白屏类反馈的修复之一） */
+function fmt(v: unknown): string {
+  const n = Number(v);
+  return Number.isFinite(n) ? n.toLocaleString() : '0';
+}
+
 export function CartPage() {
   const items = useCart((s) => s.items);
   const remove = useCart((s) => s.remove);
@@ -12,8 +18,8 @@ export function CartPage() {
 
   // 只结算勾选的产品（代理可挑着付，剩下的留在车里）
   const selectedItems = items.filter(isSelected);
-  const selectedTotal = selectedItems.reduce((sum, i) => sum + i.unitPrice * i.qty, 0);
-  const selectedCount = selectedItems.reduce((s, i) => s + i.qty, 0);
+  const selectedTotal = selectedItems.reduce((sum, i) => sum + (Number(i.unitPrice) * Number(i.qty) || 0), 0);
+  const selectedCount = selectedItems.reduce((s, i) => s + (Number(i.qty) || 0), 0);
   const allSelected = items.length > 0 && selectedItems.length === items.length;
 
   if (items.length === 0) {
@@ -33,7 +39,7 @@ export function CartPage() {
       <section>
         <h1 className="text-2xl font-bold text-slate-900">购物车</h1>
         <p className="mt-1 text-sm text-slate-600">
-          共 {items.reduce((s, i) => s + i.qty, 0)} 件商品 · 已选 {selectedCount} 件 · 已选合计 ¥{selectedTotal.toLocaleString()}
+          共 {items.reduce((s, i) => s + (Number(i.qty) || 0), 0)} 件商品 · 已选 {selectedCount} 件 · 已选合计 ¥{fmt(selectedTotal)}
         </p>
       </section>
 
@@ -77,20 +83,20 @@ export function CartPage() {
                 {/* 套餐: 显示航班明细 */}
                 {i.kind === 'BUNDLE' && i.meta && (
                   <div className="mt-1 text-xs text-slate-500 space-y-0.5">
-                    <div>✈ QH9589 澳门→岘港 {String(i.meta.goDate)} + QH9588 回程 {String(i.meta.returnDate)}</div>
+                    <div>✈ QH9589 澳门→岘港 {String(i.meta?.goDate ?? '')} + QH9588 回程 {String(i.meta?.returnDate ?? '')}</div>
                     <div>
-                      {Number(i.meta.pax) || 0} 人 · {Number(i.meta.rooms) || 1} 房 ·
-                      机票 ¥{Number(i.meta.flightTotal || 0).toLocaleString()} +
-                      地面 ¥{Number(i.meta.hotelTotal || 0).toLocaleString()} +
-                      其他 ¥{Number(i.meta.otherTotal || 0).toLocaleString()}
-                      {Number(i.meta.discount) > 0 && ` − 让利 ¥${Number(i.meta.discount).toLocaleString()}`}
+                      {Number(i.meta?.pax) || 0} 人 · {Number(i.meta?.rooms) || 1} 房 ·
+                      机票 ¥{fmt(Number(i.meta?.flightTotal) || 0)} +
+                      地面 ¥{fmt(Number(i.meta?.hotelTotal) || 0)} +
+                      其他 ¥{fmt(Number(i.meta?.otherTotal) || 0)}
+                      {(Number(i.meta?.discount) || 0) > 0 && ` − 让利 ¥${fmt(Number(i.meta?.discount) || 0)}`}
                     </div>
                   </div>
                 )}
                 {/* 机票: 显示舱等+日期+人数（dateRank 是内部字段，不展示给客户） */}
                 {i.kind === 'FLIGHT' && i.meta && (
                   <div className="mt-1 text-xs text-slate-500">
-                    {String(i.meta.cabin) === 'BUSINESS' ? '商务舱' : '经济舱'} · {String(i.meta.departureTime).slice(0, 10)} · {Number(i.meta.passengers)} 人
+                    {String(i.meta?.cabin ?? '') === 'BUSINESS' ? '商务舱' : '经济舱'} · {String(i.meta?.departureTime ?? '').slice(0, 10)} · {Number(i.meta?.passengers) || 0} 人
                   </div>
                 )}
                 <p className="mt-0.5 text-xs text-slate-400">
@@ -116,9 +122,9 @@ export function CartPage() {
                   </button>
                 </div>
                 <div className="text-right min-w-[80px] sm:w-24">
-                  <div className="text-xs text-slate-500 hidden sm:block">¥{i.unitPrice}</div>
+                  <div className="text-xs text-slate-500 hidden sm:block">¥{fmt(i.unitPrice)}</div>
                   <div className="text-sm sm:text-base font-semibold text-red-600">
-                    ¥{(i.unitPrice * i.qty).toLocaleString()}
+                    ¥{fmt(i.unitPrice * i.qty)}
                   </div>
                 </div>
                 <button
@@ -138,7 +144,7 @@ export function CartPage() {
           <div className="flex items-center gap-4">
             <div>
               <span className="text-sm text-slate-600">已选合计：</span>
-              <span className="text-2xl font-bold text-red-600">¥{selectedTotal.toLocaleString()}</span>
+              <span className="text-2xl font-bold text-red-600">¥{fmt(selectedTotal)}</span>
             </div>
             <button
               className="btn-primary disabled:opacity-50"

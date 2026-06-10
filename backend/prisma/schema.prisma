@@ -548,6 +548,7 @@ model HotelRoomType {
   hotel      Hotel                @relation(fields: [hotelId], references: [id], onDelete: Cascade)
   inventory  HotelRoomInventory[]
   orderItems OrderItem[]
+  bundles    Bundle[]
 
   @@unique([hotelId, name])
 }
@@ -636,11 +637,15 @@ model Bundle {
   flightPax      Int      @default(1) // 机票组件含多少人
   groundDiscount Decimal  @default(0) @db.Decimal(10, 2) // 地面部分让利（套餐专享优惠）
   suitableFor    String? // "2 人 · 情侣/家庭"
+  // 套餐关联酒店房型 — 下单时把房型+入住日期盖到订单行上，房控板自动计入套餐占房
+  hotelRoomTypeId String?
+  hotelNights     Int? // 默认入住晚数（客户没填回程日期时按 goDate + hotelNights 推 checkOut）
   isActive       Boolean  @default(true)
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 
-  orderItems OrderItem[]
+  hotelRoomType HotelRoomType? @relation(fields: [hotelRoomTypeId], references: [id])
+  orderItems    OrderItem[]
 
   @@index([isActive])
 }

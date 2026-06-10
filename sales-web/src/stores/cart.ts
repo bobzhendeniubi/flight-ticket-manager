@@ -31,6 +31,38 @@ export function isSelected(i: CartItem): boolean {
   return i.selected !== false;
 }
 
+const CART_KINDS: readonly string[] = ['FLIGHT', 'HOTEL', 'TRANSFER', 'VISA', 'BUNDLE'];
+
+/**
+ * 清洗持久化的购物车行。旧版本/被污染的 localStorage 数据（缺 unitPrice、
+ * qty 非法、kind 未知等）曾让 Cart/Checkout 渲染抛 TypeError → 整页白屏。
+ * 不合法的行静默丢弃；合法行做数值矫正 + 字段兜底。
+ */
+function sanitizeItems(raw: unknown): CartItem[] {
+  if (!Array.isArray(raw)) return [];
+  const cleaned: CartItem[] = [];
+  for (const entry of raw) {
+    if (typeof entry !== 'object' || entry === null) continue;
+    const it = entry as Record<string, unknown>;
+    if (typeof it.id !== 'string') continue;
+    if (typeof it.kind !== 'string' || !CART_KINDS.includes(it.kind)) continue;
+    const unitPrice = Number(it.unitPrice);
+    const qty = Number(it.qty);
+    if (!Number.isFinite(unitPrice) || !(qty >= 1)) continue;
+    cleaned.push({
+      ...(entry as CartItem),
+      unitPrice,
+      qty,
+      selected: typeof it.selected === 'boolean' ? it.selected : true,
+      meta:
+        typeof it.meta === 'object' && it.meta !== null && !Array.isArray(it.meta)
+          ? (it.meta as CartItem['meta'])
+          : {},
+    });
+  }
+  return cleaned;
+}
+
 interface CartState {
   items: CartItem[];
   add: (item: Omit<CartItem, 'id' | 'addedAt'>) => void;
@@ -99,7 +131,17 @@ export const useCart = create<CartState>()(
     }),
     {
       name: 'ftm-cart',
+      // v2：持久化数据带版本号。老数据（无版本/旧版本）经 migrate 清洗后保留合法行
+      version: 2,
       partialize: (state) => ({ items: state.items }),
+      migrate: (persisted) => ({
+        items: sanitizeItems((persisted as { items?: unknown } | null)?.items),
+      }),
+      // 同版本的数据每次 rehydrate 也清洗一遍（防手改 localStorage / 旧 bug 写入的脏行）
+      merge: (persisted, current) => ({
+        ...current,
+        items: sanitizeItems((persisted as { items?: unknown } | null)?.items),
+      }),
     },
   ),
 );

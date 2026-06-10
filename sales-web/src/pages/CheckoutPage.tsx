@@ -28,6 +28,12 @@ const EMPTY_PASSENGER: PassengerForm = {
   nationality: 'CN',
 };
 
+/** 金额渲染兜底：非法数值显示 '0' 而不是 NaN（白屏类反馈的修复之一） */
+function fmt(v: unknown): string {
+  const n = Number(v);
+  return Number.isFinite(n) ? n.toLocaleString() : '0';
+}
+
 // Real OCR 走 Tesseract.js（chi_sim + eng 语言包 + MRZ 解析）
 // 见 lib/passportOcr.ts
 
@@ -36,8 +42,11 @@ export function CheckoutPage() {
   const tokens = useAuth((s) => s.tokens);
   const isAgent = user?.role === 'AGENT';
   // 只结算购物车里"勾选"的产品（CartPage 勾选 → 这里结算 → 成功后只移除已结的）
-  const items = useCart((s) => s.items.filter(isSelected));
-  const total = items.reduce((sum, i) => sum + i.unitPrice * i.qty, 0);
+  // 不能在 zustand 选择器里 filter：每次返回新数组会让 React 18 的快照一致性
+  // 检查死循环（Maximum update depth exceeded → 整页白屏）。
+  const allItems = useCart((s) => s.items);
+  const items = useMemo(() => allItems.filter(isSelected), [allItems]);
+  const total = items.reduce((sum, i) => sum + (Number(i.unitPrice) * Number(i.qty) || 0), 0);
   const removeMany = useCart((s) => s.removeMany);
   const clearPassengers = usePassengers((s) => s.clear);
 
@@ -100,8 +109,16 @@ export function CheckoutPage() {
   const bundlePaxCount = items
     .filter((i) => i.kind === 'BUNDLE')
     .reduce((sum, i) => sum + (Number(i.meta?.pax) || 0), 0);
-  // 如果同时买了散票和套餐，取较大值（套餐含机票，乘客是同一批人）
-  const effectivePax = bundlePaxCount > 0 ? bundlePaxCount : flightTicketCount;
+  // 签证/接送也是"按人"的产品 —— 只买签证/接送时同样要填出行人
+  // （公测反馈：只买签证时出行人表单整个不出现，提交不了）
+  const visaPaxCount = items
+    .filter((i) => i.kind === 'VISA')
+    .reduce((sum, i) => sum + (Number(i.qty) || 0), 0);
+  const transferPaxCount = items
+    .filter((i) => i.kind === 'TRANSFER')
+    .reduce((sum, i) => sum + (Number(i.meta?.passengers) || Number(i.qty) || 0), 0);
+  // 混买时取最大值（套餐含机票、签证/接送都是同一批出行人，取 MAX 不取 SUM）
+  const effectivePax = Math.max(bundlePaxCount, flightTicketCount, visaPaxCount, transferPaxCount);
   const paxMismatch = effectivePax > 0 && passengers.length !== effectivePax;
 
   // 自动把出行人行数补齐到所需人数 —— 避免"少填一位 → 提交键灰着点不动"（前台反馈：下一步走不下去）
@@ -133,7 +150,7 @@ export function CheckoutPage() {
         <p className="mt-2 text-sm text-slate-600">订单号</p>
         <p className="font-mono text-lg text-slate-900">{done.orderNumber}</p>
         <p className="mt-2 text-sm text-slate-700">
-          应付 <span className="text-lg font-bold text-red-600">¥{Number(done.total).toLocaleString()}</span>
+          应付 <span className="text-lg font-bold text-red-600">¥{fmt(done.total)}</span>
         </p>
         {done.paymentExpiresAt && (
           <HoldCountdown expiresAt={done.paymentExpiresAt} />
@@ -169,7 +186,7 @@ export function CheckoutPage() {
     // Invariant: 买几张票/套餐几人就填几个出行人
     if (effectivePax > 0 && passengers.length !== effectivePax) {
       setErrorMsg(
-        `需要 ${effectivePax} 位出行人（${flightTicketCount > 0 ? `机票 ${flightTicketCount} 张` : ''}${bundlePaxCount > 0 ? ` 套餐 ${bundlePaxCount} 人` : ''}），当前填了 ${passengers.length} 位`,
+        `需要 ${effectivePax} 位出行人（${flightTicketCount > 0 ? `机票 ${flightTicketCount} 张` : ''}${bundlePaxCount > 0 ? ` 套餐 ${bundlePaxCount} 人` : ''}${visaPaxCount > 0 ? ` 签证 ${visaPaxCount} 人` : ''}${transferPaxCount > 0 ? ` 接送 ${transferPaxCount} 人` : ''}），当前填了 ${passengers.length} 位`,
       );
       return;
     }
@@ -245,12 +262,19 @@ export function CheckoutPage() {
           }];
         }
         if (i.kind === 'BUNDLE') {
+          // 把行程要素透传给后端 —— 后端据此写入套餐订单的酒店占房明细（房控板计入）
+          const bundleMeta: Record<string, unknown> = {};
+          if (i.meta?.goDate !== undefined) bundleMeta.goDate = i.meta.goDate;
+          if (i.meta?.returnDate !== undefined) bundleMeta.returnDate = i.meta.returnDate;
+          if (i.meta?.pax !== undefined) bundleMeta.pax = i.meta.pax;
+          if (i.meta?.rooms !== undefined) bundleMeta.rooms = i.meta.rooms;
           return [{
             kind: 'BUNDLE',
             description: i.name,
             quantity: i.qty,
             unitPrice: i.unitPrice,
             bundleId: i.productId,
+            ...(Object.keys(bundleMeta).length > 0 ? { metadata: bundleMeta } : {}),
           }];
         }
         return [];
@@ -270,10 +294,11 @@ export function CheckoutPage() {
         paymentExpiresAt: order.paymentExpiresAt ?? null,
       });
     } catch (err) {
+      // 任何异常都要给用户可见反馈（公测反馈：失败时页面"卡住"无提示）
       if (err instanceof ApiError) {
         setErrorMsg(`下单失败：${err.message}`);
       } else {
-        setErrorMsg('下单失败，请稍后重试');
+        setErrorMsg(err instanceof Error ? err.message : '提交失败，请重试');
       }
     } finally {
       setSubmitting(false);
@@ -309,13 +334,13 @@ export function CheckoutPage() {
                 </span>
                 <span className="flex-1 text-slate-900 truncate">{i.name}</span>
                 <span className="text-slate-500">× {i.qty}</span>
-                <span className="w-20 text-right font-medium">¥{(i.unitPrice * i.qty).toLocaleString()}</span>
+                <span className="w-20 text-right font-medium">¥{fmt(i.unitPrice * i.qty)}</span>
               </li>
             ))}
           </ul>
           <div className="mt-3 flex items-center justify-between border-t border-slate-200 pt-3">
             <span className="text-sm text-slate-600">合计</span>
-            <span className="text-2xl font-bold text-red-600">¥{total.toLocaleString()}</span>
+            <span className="text-2xl font-bold text-red-600">¥{fmt(total)}</span>
           </div>
         </section>
 
@@ -436,11 +461,11 @@ export function CheckoutPage() {
               </div>
               <div className="mt-1 flex items-center justify-between text-xs text-emerald-600">
                 <span>本单抵扣</span>
-                <span>−¥{total.toLocaleString()}</span>
+                <span>−¥{fmt(total)}</span>
               </div>
               <div className="mt-1 flex items-center justify-between text-xs text-emerald-600">
                 <span>支付后余额</span>
-                <span>¥{(80000 - total).toLocaleString()}</span>
+                <span>¥{fmt(80000 - total)}</span>
               </div>
               {total > 80000 && (
                 <div className="mt-2 text-xs text-red-600">⚠ 余额不足，请联系管理员充值或选择其他支付方式</div>
@@ -457,7 +482,7 @@ export function CheckoutPage() {
             </Link>
             <div className="flex items-center gap-2 sm:gap-4 flex-1 sm:flex-none justify-end">
               <span className="text-sm sm:text-base whitespace-nowrap">
-                合计 <span className="text-xl sm:text-2xl font-bold text-red-600">¥{total.toLocaleString()}</span>
+                合计 <span className="text-xl sm:text-2xl font-bold text-red-600">¥{fmt(total)}</span>
               </span>
               <button type="submit" className="btn-primary text-sm sm:text-base px-4 sm:px-6 whitespace-nowrap" disabled={submitting}>
                 {submitting ? '提交中…' : '提交订单'}

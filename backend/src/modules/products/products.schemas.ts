@@ -86,6 +86,9 @@ export const createBundleBodySchema = z.object({
   flightPax: z.number().int().min(1).max(20).default(1),
   groundDiscount: z.number().nonnegative().default(0),
   suitableFor: z.string().max(100).optional(),
+  // 套餐关联酒店房型（房控板计入套餐占房）；null = 解除关联
+  hotelRoomTypeId: z.string().min(1).nullable().optional(),
+  hotelNights: z.number().int().min(1).max(30).nullable().optional(),
   isActive: z.boolean().default(true),
 });
 export type CreateBundleBody = z.infer<typeof createBundleBodySchema>;

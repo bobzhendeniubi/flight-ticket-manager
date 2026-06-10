@@ -461,6 +461,11 @@ function FlightSeatCard({
   const [activeLock, setActiveLock] = useState<{ qty: number; expiresAt: string } | null>(null);
 
   const confirmLock = async () => {
+    // seatClassId 是新加字段 —— 老缓存/异常数据可能缺失，缺了直接提示而不是打 API
+    if (!cabin.seatClassId) {
+      setLockError('该舱位暂不支持锁位');
+      return;
+    }
     setLocking(true);
     setLockError(null);
     try {

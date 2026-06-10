@@ -34,7 +34,7 @@ vi.mock('../../lib/cancellation.js', () => ({
 }));
 
 // 现在才能 import service
-import { OrderService } from './orders.service.js';
+import { OrderService, resolveBundleHotelStamp } from './orders.service.js';
 
 // ── Fixture helper：build 一个完整的 fake order（serializeOrder 要的字段全有） ──
 const dec = (n: number) => ({ toString: () => String(n) });
@@ -211,5 +211,67 @@ describe('OrderService.requestCancellation', () => {
     expect(r.isNew).toBe(false);
     expect(r.order).toBeDefined();
     expect(r.quote.totalRefund).toBe(70);
+  });
+});
+
+// ── 套餐酒店盖章：resolveBundleHotelStamp ─────────────────────────────
+describe('resolveBundleHotelStamp', () => {
+  const linkedBundle = { hotelRoomTypeId: 'rt1', hotelNights: 3 };
+
+  it('套餐没关联房型 → null', () => {
+    expect(
+      resolveBundleHotelStamp(
+        { hotelRoomTypeId: null, hotelNights: null },
+        { goDate: '2026-07-01' },
+      ),
+    ).toBeNull();
+  });
+
+  it('goDate 缺失 → null（不盖章，不抛错）', () => {
+    expect(resolveBundleHotelStamp(linkedBundle, undefined)).toBeNull();
+    expect(resolveBundleHotelStamp(linkedBundle, {})).toBeNull();
+  });
+
+  it('returnDate 合法且晚于 goDate → 用 returnDate 做退房日', () => {
+    const stamp = resolveBundleHotelStamp(linkedBundle, {
+      goDate: '2026-07-01',
+      returnDate: '2026-07-04',
+    });
+    expect(stamp).toEqual({
+      hotelRoomTypeId: 'rt1',
+      hotelCheckIn: new Date('2026-07-01'),
+      hotelCheckOut: new Date('2026-07-04'),
+    });
+  });
+
+  it('returnDate 缺失 → goDate + hotelNights 推退房日', () => {
+    const stamp = resolveBundleHotelStamp(linkedBundle, { goDate: '2026-07-01' });
+    expect(stamp?.hotelCheckOut).toEqual(new Date('2026-07-04'));
+  });
+
+  it('returnDate ≤ goDate → 回落到 hotelNights；hotelNights 空默认 1 晚', () => {
+    const sameDay = resolveBundleHotelStamp(linkedBundle, {
+      goDate: '2026-07-01',
+      returnDate: '2026-07-01',
+    });
+    expect(sameDay?.hotelCheckOut).toEqual(new Date('2026-07-04'));
+
+    const oneNight = resolveBundleHotelStamp(
+      { hotelRoomTypeId: 'rt1', hotelNights: null },
+      { goDate: '2026-07-01' },
+    );
+    expect(oneNight?.hotelCheckOut).toEqual(new Date('2026-07-02'));
+  });
+
+  it('metadata 畸形（错误类型/非法格式）→ 降级不抛错', () => {
+    expect(resolveBundleHotelStamp(linkedBundle, { goDate: 12345 } as never)).toBeNull();
+    expect(resolveBundleHotelStamp(linkedBundle, { goDate: 'not-a-date' })).toBeNull();
+    // goDate 合法但 returnDate 畸形 → 仍盖章，按 hotelNights 推退房日
+    const stamp = resolveBundleHotelStamp(linkedBundle, {
+      goDate: '2026-07-01',
+      returnDate: 'garbage',
+    });
+    expect(stamp?.hotelCheckIn).toEqual(new Date('2026-07-01'));
+    expect(stamp?.hotelCheckOut).toEqual(new Date('2026-07-04'));
   });
 });

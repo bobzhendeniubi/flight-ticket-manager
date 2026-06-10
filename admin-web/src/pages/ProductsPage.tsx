@@ -101,7 +101,16 @@ function bundleApiToMock(b: ApiBundle): MockBundle {
     flightPax: b.flightPax,
     suitableFor: b.suitableFor ?? '',
     active: b.isActive,
+    hotelRoomTypeId: b.hotelRoomTypeId,
+    hotelNights: b.hotelNights,
+    hotelRoomType: b.hotelRoomType,
   };
+}
+
+/** 套餐表单的酒店房型下拉选项（酒店名 · 房型名，value = roomTypeId） */
+interface RoomTypeOption {
+  id: string;
+  label: string;
 }
 
 export function ProductsPage() {
@@ -111,6 +120,7 @@ export function ProductsPage() {
   const [transfers, setTransfers] = useState<MockTransfer[]>([]);
   const [visas, setVisas] = useState<MockVisa[]>([]);
   const [bundles, setBundles] = useState<MockBundle[]>([]);
+  const [roomTypeOptions, setRoomTypeOptions] = useState<RoomTypeOption[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -124,6 +134,9 @@ export function ProductsPage() {
         setTransfers(t.transfers.map(transferApiToMock));
         setVisas(v.visas.map(visaApiToMock));
         setBundles(b.bundles.map(bundleApiToMock));
+        setRoomTypeOptions(
+          h.hotels.flatMap((ht) => ht.roomTypes.map((rt) => ({ id: rt.id, label: `${ht.name} · ${rt.name}` }))),
+        );
       })
       .catch((e) => {
         if (!cancelled) setError(e instanceof ApiError ? e.message : '加载失败');
@@ -246,6 +259,8 @@ export function ProductsPage() {
           name: n.name, tagline: n.tagline, emoji: n.emoji,
           items: n.items, flightPax: n.flightPax,
           groundDiscount: n.groundDiscount, suitableFor: n.suitableFor,
+          hotelRoomTypeId: n.hotelRoomTypeId ?? null,
+          hotelNights: n.hotelRoomTypeId ? n.hotelNights ?? 1 : null,
         });
       }
       for (const n of next) {
@@ -255,6 +270,8 @@ export function ProductsPage() {
             name: n.name, tagline: n.tagline, emoji: n.emoji,
             items: n.items, flightPax: n.flightPax,
             groundDiscount: n.groundDiscount, suitableFor: n.suitableFor,
+            hotelRoomTypeId: n.hotelRoomTypeId ?? null,
+            hotelNights: n.hotelRoomTypeId ? n.hotelNights ?? 1 : null,
             isActive: n.active,
           });
         }
@@ -311,7 +328,7 @@ export function ProductsPage() {
       {section === 'transfers' && <TransfersSection items={transfers} onChange={persistTransfers} />}
       {section === 'visas' && <VisasSection items={visas} onChange={persistVisas} />}
       {section === 'bundles' && (
-        <BundlesSection items={bundles} onChange={persistBundles} />
+        <BundlesSection items={bundles} roomTypeOptions={roomTypeOptions} onChange={persistBundles} />
       )}
     </div>
   );
@@ -613,9 +630,11 @@ function VisasSection({ items, onChange }: { items: MockVisa[]; onChange: (v: Mo
 // ─── 套餐 ───────────────────────────────────────────────────────────
 function BundlesSection({
   items,
+  roomTypeOptions,
   onChange,
 }: {
   items: MockBundle[];
+  roomTypeOptions: RoomTypeOption[];
   onChange: (v: MockBundle[]) => void;
 }) {
   const [showWizard, setShowWizard] = useState(false);
@@ -629,6 +648,7 @@ function BundlesSection({
       </div>
       {showWizard && (
         <NewBundleWizard
+          roomTypeOptions={roomTypeOptions}
           onCancel={() => setShowWizard(false)}
           onSubmit={(b) => {
             onChange([b, ...items]);
@@ -697,6 +717,13 @@ function BundleCard({
         ))}
       </div>
 
+      {bundle.hotelRoomType && (
+        <div className="mt-2 text-xs text-slate-600">
+          🏨 关联酒店：{bundle.hotelRoomType.hotelName} · {bundle.hotelRoomType.name}
+          {bundle.hotelNights ? `（${bundle.hotelNights} 晚）` : ''}
+        </div>
+      )}
+
       <div className="mt-4 rounded-md bg-slate-50 p-3">
         <div className="flex items-center justify-between text-sm text-slate-600">
           <span>单买总价</span>
@@ -726,9 +753,11 @@ function BundleCard({
 }
 
 function NewBundleWizard({
+  roomTypeOptions,
   onCancel,
   onSubmit,
 }: {
+  roomTypeOptions: RoomTypeOption[];
   onCancel: () => void;
   onSubmit: (b: MockBundle) => void;
 }) {
@@ -736,6 +765,8 @@ function NewBundleWizard({
   const [tagline, setTagline] = useState('');
   const [emoji, setEmoji] = useState('🎁');
   const [suitableFor, setSuitableFor] = useState('2 大人');
+  const [hotelRoomTypeId, setHotelRoomTypeId] = useState('');
+  const [hotelNights, setHotelNights] = useState<number | null>(3);
   // Local draft shape allowing null for in-progress numeric edits
   type DraftBundleItem = Omit<BundleItem, 'qty' | 'unitPrice'> & { qty: number | null; unitPrice: number | null };
   const [items, setItems] = useState<DraftBundleItem[]>([
@@ -746,7 +777,8 @@ function NewBundleWizard({
   const listPrice = useMemo(() => items.reduce((s, i) => s + (i.qty ?? 0) * (i.unitPrice ?? 0), 0), [items]);
   const discountValue = Math.min(listPrice, Math.max(0, discount ?? 0));
   const bundlePrice = Math.max(0, listPrice - discountValue);
-  const valid = name.length > 0 && items.length > 0 && bundlePrice > 0;
+  const hotelLinkValid = !hotelRoomTypeId || (hotelNights != null && hotelNights >= 1 && hotelNights <= 30);
+  const valid = name.length > 0 && items.length > 0 && bundlePrice > 0 && hotelLinkValid;
 
   const addItem = (kind: BundleItem['kind']) => {
     const presets: Record<BundleItem['kind'], DraftBundleItem> = {
@@ -786,6 +818,23 @@ function NewBundleWizard({
           <div>
             <label className="label">适合人群</label>
             <input className="input" value={suitableFor} onChange={(e) => setSuitableFor(e.target.value)} />
+          </div>
+          <div className="grid gap-3 md:grid-cols-3">
+            <div className="md:col-span-2">
+              <label className="label">关联酒店房型（房控板计入套餐占房）</label>
+              <select className="input" value={hotelRoomTypeId} onChange={(e) => setHotelRoomTypeId(e.target.value)}>
+                <option value="">不关联酒店</option>
+                {roomTypeOptions.map((o) => (
+                  <option key={o.id} value={o.id}>{o.label}</option>
+                ))}
+              </select>
+            </div>
+            {hotelRoomTypeId && (
+              <div>
+                <label className="label">晚数</label>
+                <NumberInput min={1} max={30} className="input" value={hotelNights} onChange={(n) => setHotelNights(n)} integerOnly />
+              </div>
+            )}
           </div>
 
           <div>
@@ -877,6 +926,9 @@ function NewBundleWizard({
             {!valid && (
               <p className="text-xs text-red-600">⚠️ 请填写套餐名 + 至少 1 个产品 + 套餐价 &gt; 0</p>
             )}
+            {!hotelLinkValid && (
+              <p className="text-xs text-red-600">⚠️ 已关联酒店房型时，晚数需为 1–30 的整数</p>
+            )}
           </div>
 
           <div className="flex justify-end gap-3">
@@ -901,6 +953,8 @@ function NewBundleWizard({
                   flightPax: 2,
                   suitableFor,
                   active: true,
+                  hotelRoomTypeId: hotelRoomTypeId || null,
+                  hotelNights: hotelRoomTypeId ? hotelNights : null,
                 })
               }
             >
