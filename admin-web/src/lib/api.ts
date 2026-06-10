@@ -327,6 +327,44 @@ export interface OrderSummary {
   expectedAmountLocked?: boolean;
 }
 
+/** listOrders 查询参数（与 backend listOrdersQuerySchema 对齐） */
+export interface ListOrdersParams {
+  status?: OrderStatus;
+  agentId?: string;
+  kind?: OrderItemKind;
+  search?: string;
+  from?: string; // 下单日期起 YYYY-MM-DD
+  to?: string; // 下单日期止
+  travelFrom?: string; // 出行日期起
+  travelTo?: string; // 出行日期止
+  claimedById?: string;
+  unclaimedOnly?: string; // '1' = 只看未接单
+  flightNumber?: string; // 订单含该航班号的 FLIGHT 行（不区分大小写）
+  passengerName?: string; // 乘客姓名模糊匹配
+  invoiceStatus?: InvoiceStatus;
+  page?: number;
+  pageSize?: number;
+}
+
+// ── 三模板筛选导出（全岗可用 / 票务专用 / 签证专用）──────────────────────
+export type OrderExportTemplate = 'full' | 'ticketing' | 'visa';
+
+/** GET /orders/export-templates 查询参数 = listOrders 同款筛选 + template */
+export interface OrdersTemplateExportParams {
+  template: OrderExportTemplate;
+  status?: OrderStatus;
+  agentId?: string;
+  kind?: OrderItemKind;
+  search?: string;
+  from?: string;
+  to?: string;
+  travelFrom?: string;
+  travelTo?: string;
+  flightNumber?: string;
+  passengerName?: string;
+  invoiceStatus?: InvoiceStatus;
+}
+
 export interface OrderPayment {
   id: string;
   method: PaymentMethod;
@@ -435,6 +473,8 @@ export interface HotelRoomType {
 
 export interface Hotel {
   id: string;
+  /** 产品编号（服务端生成，如 H0001）；老数据可能为 null */
+  code: string | null;
   name: string;
   nameEn: string | null;
   cityCode: string;
@@ -455,6 +495,8 @@ export interface Hotel {
 
 export interface Transfer {
   id: string;
+  /** 产品编号（服务端生成，如 T0001）；老数据可能为 null */
+  code: string | null;
   name: string;
   vehicleType: string;
   capacity: number;
@@ -472,6 +514,8 @@ export interface Transfer {
 
 export interface Visa {
   id: string;
+  /** 产品编号（服务端生成，如 V0001）；老数据可能为 null */
+  code: string | null;
   destinationCountry: string;
   country: string | null;
   visaType: string;
@@ -497,6 +541,8 @@ export interface BundleItemData {
 
 export interface Bundle {
   id: string;
+  /** 产品编号（服务端生成，如 B0001）；老数据可能为 null */
+  code: string | null;
   name: string;
   tagline: string | null;
   emoji: string | null;
@@ -507,6 +553,49 @@ export interface Bundle {
   suitableFor: string | null;
   isActive: boolean;
   createdAt: string;
+}
+
+// ── 房控（酒店包房周期 + 销控板 / 远期视图）──────────────────────────────
+// 与 backend/src/modules/hotel-control/hotel-control.service.ts 对齐
+export interface HotelBlockPeriod {
+  id: string;
+  hotelId: string;
+  hotelName: string;
+  dateFrom: string; // YYYY-MM-DD
+  dateTo: string; // YYYY-MM-DD（闭区间）
+  rooms: number;
+  unitPrice: number | null; // 切房单价（CNY/间/晚）
+  note: string | null;
+  updatedAt: string;
+}
+
+export interface BlockPeriodWriteInput {
+  hotelId: string;
+  dateFrom: string;
+  dateTo: string;
+  rooms: number;
+  unitPrice?: number | null;
+  note?: string | null;
+}
+
+export interface HotelControlBoardHotel {
+  hotelId: string;
+  hotelName: string;
+  /** 最新周期（dateFrom 最晚且有价）的切房单价；都没填则 null */
+  unitPrice: number | null;
+  rows: { block: number[]; used: number[]; remaining: number[] };
+}
+
+export interface HotelControlBoard {
+  dates: string[];
+  hotels: HotelControlBoardHotel[];
+}
+
+export interface HotelControlForward {
+  dates: string[];
+  held: number[]; // 切房合计（控房）
+  occupied: number[]; // 占房合计（收客）
+  remaining: number[]; // held - occupied（余房）
 }
 
 // ── Dashboard ─────────────────────────────────────────────────────────────
@@ -629,7 +718,7 @@ export const api = {
     ),
 
   // Orders
-  listOrders: (token: string, query?: Record<string, string | number | undefined>) => {
+  listOrders: (token: string, query?: ListOrdersParams) => {
     const qs = new URLSearchParams();
     if (query) {
       for (const [k, v] of Object.entries(query)) {
@@ -715,6 +804,21 @@ export const api = {
       `${API_BASE}/orders/export-by-schedule?scheduleId=${encodeURIComponent(scheduleId)}`,
       { headers: { Authorization: `Bearer ${token}` } },
     );
+    if (!res.ok) throw new ApiError(res.status, { code: 'EXPORT_FAILED', message: await res.text() });
+    return res.blob();
+  },
+  // 三模板筛选导出（全岗可用/票务专用/签证专用；ADMIN/STAFF only）
+  downloadOrdersTemplateExport: async (
+    token: string,
+    params: OrdersTemplateExportParams,
+  ): Promise<Blob> => {
+    const qs = new URLSearchParams();
+    for (const [k, v] of Object.entries(params)) {
+      if (v !== undefined && v !== '') qs.set(k, String(v));
+    }
+    const res = await fetch(`${API_BASE}/orders/export-templates?${qs.toString()}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
     if (!res.ok) throw new ApiError(res.status, { code: 'EXPORT_FAILED', message: await res.text() });
     return res.blob();
   },
@@ -1123,6 +1227,31 @@ export const api = {
     if (!res.ok) throw new ApiError(res.status, { code: 'EXPORT_FAILED', message: await res.text() });
     return res.blob();
   },
+
+  // ── 房控（ADMIN/STAFF）— 包房周期 CRUD + 销控板 / 远期视图 ─────────────
+  listBlockPeriods: (token: string, hotelId?: string) => {
+    const qs = hotelId ? `?hotelId=${encodeURIComponent(hotelId)}` : '';
+    return apiFetch<{ periods: HotelBlockPeriod[] }>(`/hotel-control/block-periods${qs}`, { token });
+  },
+  createBlockPeriod: (token: string, body: BlockPeriodWriteInput) =>
+    apiFetch<{ period: HotelBlockPeriod }>('/hotel-control/block-periods', { method: 'POST', token, body }),
+  updateBlockPeriod: (
+    token: string,
+    id: string,
+    body: Partial<Omit<BlockPeriodWriteInput, 'hotelId'>>,
+  ) => apiFetch<{ period: HotelBlockPeriod }>(`/hotel-control/block-periods/${id}`, { method: 'PATCH', token, body }),
+  deleteBlockPeriod: (token: string, id: string) =>
+    apiFetch<{ id: string }>(`/hotel-control/block-periods/${id}`, { method: 'DELETE', token }),
+  getHotelBoard: (token: string, from: string, to: string) =>
+    apiFetch<HotelControlBoard>(
+      `/hotel-control/board?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`,
+      { token },
+    ),
+  getHotelForward: (token: string, from: string, to: string) =>
+    apiFetch<HotelControlForward>(
+      `/hotel-control/forward?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`,
+      { token },
+    ),
 };
 
 // ── 财务模块类型（与 backend/src/modules/finances/finances.service.ts 对齐）──

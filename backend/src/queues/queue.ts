@@ -84,6 +84,46 @@ export async function cancelSeatHoldRelease(orderId: string): Promise<void> {
   }
 }
 
+// ── Seat Lock 队列 — 锁位固定 10 分钟，到期自动失效回归可售 ───────
+export interface SeatLockJobData {
+  lockId: string;
+}
+
+export const seatLockQueue = new Queue<SeatLockJobData>('seat-lock', {
+  connection: bullRedis,
+  defaultJobOptions: {
+    attempts: 2, // 幂等：worker 只在锁仍 ACTIVE 时标 EXPIRED
+    backoff: { type: 'exponential', delay: 5000 },
+    removeOnComplete: { age: 7 * 24 * 3600 },
+    removeOnFail: { age: 30 * 24 * 3600 },
+  },
+});
+
+/**
+ * 创建锁位时排队：delay 毫秒后若锁仍 ACTIVE 则标 EXPIRED（座位自动回归可售）。
+ * jobId 用 `seatlock:<lockId>`，方便下单消费 / 手动释放时 remove() 取消。
+ */
+export async function scheduleSeatLockExpiry(lockId: string, delayMs: number): Promise<void> {
+  await seatLockQueue.add(
+    'expire-seat-lock',
+    { lockId },
+    {
+      jobId: `seatlock:${lockId}`,
+      delay: delayMs,
+    },
+  );
+}
+
+/** 锁位被消费 / 手动释放时调用；若任务已执行（锁已自动过期）则静默返回。 */
+export async function cancelSeatLockExpiry(lockId: string): Promise<void> {
+  try {
+    const job = await seatLockQueue.getJob(`seatlock:${lockId}`);
+    if (job) await job.remove();
+  } catch {
+    /* best-effort */
+  }
+}
+
 // ── Notification 队列（预留）──────────────────────────────────────
 export interface NotificationJobData {
   type: 'SMS' | 'EMAIL' | 'WECHAT_TEMPLATE';
@@ -103,6 +143,7 @@ export async function closeQueues(): Promise<void> {
     fulfillmentQueue.close(),
     notificationQueue.close(),
     seatHoldQueue.close(),
+    seatLockQueue.close(),
     fulfillmentQueueEvents.close(),
   ]);
   await bullRedis.quit();

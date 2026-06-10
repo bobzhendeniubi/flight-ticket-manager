@@ -2,6 +2,7 @@ import { z } from 'zod';
 import {
   CabinClass,
   DocumentType,
+  InvoiceStatus,
   OrderItemKind,
   OrderStatus,
   PassengerType,
@@ -128,10 +129,36 @@ export const listOrdersQuerySchema = z.object({
   // 接单状态过滤
   claimedById: z.string().optional(),   // 指定 ops
   unclaimedOnly: z.coerce.boolean().optional(),
+  // ops 确认的三个筛选（航班号 / 乘客姓名 / 开票状态）
+  flightNumber: z.string().max(20).optional(),    // 订单含该航班号的 FLIGHT 行（不区分大小写）
+  passengerName: z.string().max(120).optional(),  // 乘客姓名模糊匹配
+  invoiceStatus: z.nativeEnum(InvoiceStatus).optional(),
   page: z.coerce.number().int().min(1).default(1),
   pageSize: z.coerce.number().int().min(1).max(200).default(50),
 });
 export type ListOrdersQuery = z.infer<typeof listOrdersQuerySchema>;
+
+// ── 三模板筛选导出（全岗可用 / 票务专用 / 签证专用）────────────────────────
+// 与 listOrders 共用同一组筛选字段（status/agentId/kind/search/from/to/
+// travelFrom/travelTo/flightNumber/passengerName/invoiceStatus），外加 template。
+export const exportTemplatesQuerySchema = listOrdersQuerySchema
+  .pick({
+    status: true,
+    agentId: true,
+    kind: true,
+    search: true,
+    from: true,
+    to: true,
+    travelFrom: true,
+    travelTo: true,
+    flightNumber: true,
+    passengerName: true,
+    invoiceStatus: true,
+  })
+  .extend({
+    template: z.enum(['full', 'ticketing', 'visa']),
+  });
+export type ExportTemplatesQuery = z.infer<typeof exportTemplatesQuerySchema>;
 
 // ── 状态流转 ─────────────────────────────────────────────────────────────
 export const updateStatusBodySchema = z.object({

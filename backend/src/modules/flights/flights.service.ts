@@ -1,4 +1,4 @@
-import { CabinClass, Prisma } from '@prisma/client';
+import { CabinClass, Prisma, SeatLockStatus } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { BadRequestError, ConflictError, NotFoundError } from '../../lib/errors.js';
 import { PricingService } from '../pricing/pricing.service.js';
@@ -44,13 +44,29 @@ export class FlightService {
       take: 50,
     });
 
+    // 锁位占用：视野内所有舱位一次 groupBy（ACTIVE 且未过期），买家看到真实可售量
+    const seatClassIds = schedules.flatMap((s) => s.seatClasses.map((c) => c.id));
+    const lockSums = seatClassIds.length > 0
+      ? await prisma.seatLock.groupBy({
+          by: ['seatClassId'],
+          where: {
+            seatClassId: { in: seatClassIds },
+            status: SeatLockStatus.ACTIVE,
+            expiresAt: { gt: now },
+          },
+          _sum: { qty: true },
+        })
+      : [];
+    const lockedBySeatClass = new Map(lockSums.map((r) => [r.seatClassId, r._sum.qty ?? 0]));
+
     // 异步 map — 每个班次的每个舱位都要算动态价
     const mapped = await Promise.all(
       schedules.map(async (s) => {
         const seats = q.cabin ? s.seatClasses.filter((c) => c.cabin === q.cabin) : s.seatClasses;
         const availableSeats = await Promise.all(
           seats.map(async (c) => {
-            const avail = c.capacity - c.sold;
+            const lockedQty = lockedBySeatClass.get(c.id) ?? 0;
+            const avail = Math.max(0, c.capacity - c.sold - lockedQty);
             // 动态价：为请求人数算平均单价
             let dynamicPrice: string = c.basePrice.toString();
             let dateRank = 'C';
@@ -68,9 +84,11 @@ export class FlightService {
               // fallback to basePrice
             }
             return {
+              seatClassId: c.id, // 锁位接口（POST /seat-locks）需要
               cabin: c.cabin,
               capacity: c.capacity,
               sold: c.sold,
+              locked: lockedQty,
               available: avail,
               basePrice: c.basePrice.toString(),
               dynamicPrice,

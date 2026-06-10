@@ -14,6 +14,7 @@ import {
   batchCreateOrdersBodySchema,
   batchUpdateStatusBodySchema,
   createOrderBodySchema,
+  exportTemplatesQuerySchema,
   listOrdersQuerySchema,
   updateStatusBodySchema,
 } from './orders.schemas.js';
@@ -23,6 +24,11 @@ import { computeCancellationQuote } from '../../lib/cancellation.js';
 import { buildPnrWorkbook, pnrExportFilename } from './pnr-export.js';
 import { buildPassportPhotoZip, passportZipFilename } from './passport-zip.js';
 import { buildOrdersBySchedule, ordersExportFilename } from './orders.export.js';
+import {
+  buildOrderTemplateExportWorkbook,
+  ORDER_TEMPLATE_LABEL,
+  orderTemplateExportFilename,
+} from './orders.export-templates.js';
 
 export const orderRoutes: FastifyPluginAsync = async (app) => {
   const service = new OrderService();
@@ -293,6 +299,38 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
           `attachment; filename="${encodeURIComponent(
             ordersExportFilename(query.scheduleId, { flightNumber, departureDate }),
           )}"`,
+        )
+        .send(buf);
+    },
+  );
+
+  // ── 三模板筛选导出（全岗可用 / 票务专用 / 签证专用）──
+  // GET /orders/export-templates?template=full|ticketing|visa + listOrders 同款筛选
+  // ADMIN/STAFF only（与 export-by-schedule 一致：代理/客户不放行）
+  app.get(
+    '/export-templates',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    async (req, reply) => {
+      const query = exportTemplatesQuerySchema.parse(req.query);
+      const buf = await buildOrderTemplateExportWorkbook(query);
+
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'EXPORT_ORDER_TEMPLATES',
+        targetType: 'ORDER',
+        targetId: query.template,
+        targetLabel: ORDER_TEMPLATE_LABEL[query.template],
+        after: { ...query },
+      });
+
+      return reply
+        .header(
+          'Content-Type',
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
+        .header(
+          'Content-Disposition',
+          `attachment; filename="${encodeURIComponent(orderTemplateExportFilename(query.template))}"`,
         )
         .send(buf);
     },

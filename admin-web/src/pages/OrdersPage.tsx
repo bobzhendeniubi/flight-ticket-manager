@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { api, ApiError, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceStatus, type PaymentMethod, type OrderPayment } from '../lib/api';
+import { api, ApiError, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceStatus, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import {
   type FulfillmentStatus,
@@ -77,6 +77,13 @@ const PAYMENT_METHOD_LABEL: Record<string, string> = {
   WECHAT_PAY: '微信', ALIPAY: '支付宝', BANK_CARD: '银行转账', AGENT_PREPAYMENT: '代理预付',
 };
 
+// 三模板筛选导出（全岗可用 / 票务专用 / 签证专用）
+const TEMPLATE_LABEL: Record<OrderExportTemplate, string> = {
+  full: '全岗可用',
+  ticketing: '票务专用',
+  visa: '签证专用',
+};
+
 // 签证状态复用下方 FF_STATUS_LABEL / FF_STATUS_COLOR（履约任务状态映射）
 
 // 派生「签证状态」：订单有 VISA 项时，取其 VISA_APPLICATION 履约任务状态；无签证则 null
@@ -115,6 +122,13 @@ export function OrdersPage() {
   const [travelFrom, setTravelFrom] = useState('');
   const [travelTo, setTravelTo] = useState('');
   const [claimFilter, setClaimFilter] = useState<'' | 'unclaimed' | 'mine'>('');
+  // ops 确认的三个筛选（航班号 / 乘客姓名 / 开票状态）— 后端过滤
+  const [flightNumberFilter, setFlightNumberFilter] = useState('');
+  const [passengerNameFilter, setPassengerNameFilter] = useState('');
+  const [invoiceFilter, setInvoiceFilter] = useState<'' | InvoiceStatus>('');
+  // 三模板筛选导出（全岗可用/票务专用/签证专用）
+  const [exportTemplate, setExportTemplate] = useState<OrderExportTemplate>('full');
+  const [exporting, setExporting] = useState(false);
   const [selected, setSelected] = useState<OrderSummary | null>(null);
   // ── 批量管理状态 ─────────────────────────────────────
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -131,16 +145,19 @@ export function OrdersPage() {
   const [showBatchCreate, setShowBatchCreate] = useState(false);
   const [refreshNonce, setRefreshNonce] = useState(0);
 
-  // 拉取订单 — travelFrom/To/claimFilter 变化时重拉（后端按出行日期 + 接单状态过滤）
+  // 拉取订单 — travelFrom/To/claimFilter/航班号/乘客姓名/开票状态 变化时重拉（后端过滤）
   useEffect(() => {
     if (!tokens?.accessToken) return;
     let cancelled = false;
     setLoading(true);
     setError(null);
-    const query: Record<string, string | number | undefined> = { pageSize: 200 };
+    const query: ListOrdersParams = { pageSize: 200 };
     if (travelFrom) query.travelFrom = travelFrom;
     if (travelTo) query.travelTo = travelTo;
     if (claimFilter === 'unclaimed') query.unclaimedOnly = '1';
+    if (flightNumberFilter.trim()) query.flightNumber = flightNumberFilter.trim();
+    if (passengerNameFilter.trim()) query.passengerName = passengerNameFilter.trim();
+    if (invoiceFilter) query.invoiceStatus = invoiceFilter;
     api.listOrders(tokens.accessToken, query)
       .then((res) => {
         if (cancelled) return;
@@ -154,7 +171,7 @@ export function OrdersPage() {
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [tokens?.accessToken, travelFrom, travelTo, claimFilter, refreshNonce]);
+  }, [tokens?.accessToken, travelFrom, travelTo, claimFilter, flightNumberFilter, passengerNameFilter, invoiceFilter, refreshNonce]);
 
   // 视图层把 OrderSummary 映射成便于筛选/展示的数据
   const ordersView = useMemo(
@@ -290,6 +307,37 @@ export function OrdersPage() {
     }
   };
 
+  // 三模板筛选导出 — 用当前筛选条件调后端 xlsx，复用 createObjectURL 下载流
+  const handleTemplateExport = async () => {
+    if (!tokens?.accessToken) return;
+    setExporting(true);
+    try {
+      const blob = await api.downloadOrdersTemplateExport(tokens.accessToken, {
+        template: exportTemplate,
+        status: statusFilter || undefined,
+        kind: kindFilter || undefined,
+        search: search.trim() || undefined,
+        travelFrom: travelFrom || undefined,
+        travelTo: travelTo || undefined,
+        flightNumber: flightNumberFilter.trim() || undefined,
+        passengerName: passengerNameFilter.trim() || undefined,
+        invoiceStatus: invoiceFilter || undefined,
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `订单导出-${TEMPLATE_LABEL[exportTemplate]}-${new Date().toISOString().slice(0, 10)}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (err) {
+      alert(err instanceof ApiError ? `导出失败：${err.message}` : '导出失败');
+    } finally {
+      setExporting(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
       <section className="flex items-start justify-between">
@@ -343,6 +391,25 @@ export function OrdersPage() {
             }
           >
             📥 导出 CSV
+          </button>
+          <select
+            className="input max-w-[9.5rem] py-1.5 text-sm"
+            value={exportTemplate}
+            onChange={(e) => setExportTemplate(e.target.value as OrderExportTemplate)}
+            disabled={exporting}
+            title="选择导出模板（按当前筛选条件导出 xlsx）"
+          >
+            {(Object.keys(TEMPLATE_LABEL) as OrderExportTemplate[]).map((t) => (
+              <option key={t} value={t}>《{TEMPLATE_LABEL[t]}》</option>
+            ))}
+          </select>
+          <button
+            className="btn-secondary text-sm"
+            disabled={loading || exporting}
+            onClick={() => void handleTemplateExport()}
+            title="按当前筛选条件导出所选模板 xlsx"
+          >
+            {exporting ? '导出中…' : '📤 导出'}
           </button>
         </div>
       </section>
@@ -470,6 +537,37 @@ export function OrdersPage() {
               ))}
             </select>
           </div>
+          <div>
+            <label className="label">航班号</label>
+            <input
+              className="input"
+              placeholder="如 VJ527"
+              value={flightNumberFilter}
+              onChange={(e) => setFlightNumberFilter(e.target.value)}
+            />
+          </div>
+          <div>
+            <label className="label">乘客姓名</label>
+            <input
+              className="input"
+              placeholder="模糊匹配"
+              value={passengerNameFilter}
+              onChange={(e) => setPassengerNameFilter(e.target.value)}
+            />
+          </div>
+          <div>
+            <label className="label">开票状态</label>
+            <select
+              className="input"
+              value={invoiceFilter}
+              onChange={(e) => setInvoiceFilter(e.target.value as '' | InvoiceStatus)}
+            >
+              <option value="">全部</option>
+              {(['NONE', 'REQUESTED', 'ISSUED'] as InvoiceStatus[]).map((s) => (
+                <option key={s} value={s}>{INVOICE_LABEL[s]}</option>
+              ))}
+            </select>
+          </div>
           <div className="md:col-span-5">
             <label className="label">搜索（订单号 / 客户 / 代理）</label>
             <input
@@ -480,13 +578,14 @@ export function OrdersPage() {
             />
           </div>
         </div>
-        {(statusFilter || kindFilter || channelFilter || agentFilter || search) && (
+        {(statusFilter || kindFilter || channelFilter || agentFilter || search || flightNumberFilter || passengerNameFilter || invoiceFilter) && (
           <div className="mt-3 flex items-center justify-between text-xs text-slate-500">
             <span>显示 {filtered.length} 条订单</span>
             <button
               className="text-brand hover:text-brand-dark"
               onClick={() => {
                 setStatusFilter(''); setKindFilter(''); setChannelFilter(''); setAgentFilter(''); setSearch('');
+                setFlightNumberFilter(''); setPassengerNameFilter(''); setInvoiceFilter('');
               }}
             >
               清除所有过滤

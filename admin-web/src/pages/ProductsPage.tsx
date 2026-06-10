@@ -29,6 +29,7 @@ const SECTIONS: { key: Section; label: string; emoji: string }[] = [
 function hotelApiToMock(h: Hotel): MockHotel {
   return {
     id: h.id,
+    code: h.code,
     name: h.name,
     nameEn: h.nameEn ?? h.name,
     cityCode: h.cityCode,
@@ -53,6 +54,7 @@ function hotelApiToMock(h: Hotel): MockHotel {
 function transferApiToMock(t: ApiTransfer): MockTransfer {
   return {
     id: t.id,
+    code: t.code,
     name: t.name,
     vehicleType: t.vehicleType,
     capacity: t.capacity,
@@ -69,6 +71,7 @@ function transferApiToMock(t: ApiTransfer): MockTransfer {
 function visaApiToMock(v: ApiVisa): MockVisa {
   return {
     id: v.id,
+    code: v.code,
     country: v.country ?? v.destinationCountry,
     countryCode: v.destinationCountry,
     flag: v.flag ?? '🌐',
@@ -87,6 +90,7 @@ function bundleApiToMock(b: ApiBundle): MockBundle {
   const groundTotal = items.filter((i) => i.kind !== 'FLIGHT').reduce((s, i) => s + i.unitPrice * i.qty, 0);
   return {
     id: b.id,
+    code: b.code,
     name: b.name,
     tagline: b.tagline ?? '',
     emoji: b.emoji ?? '🎁',
@@ -339,6 +343,7 @@ function HotelsSection({ items, onChange }: { items: MockHotel[]; onChange: (v: 
       <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
         {items.map((h) => (
           <div key={h.id} className="card">
+            <div className="font-mono text-xs text-slate-500">编号 {h.code ?? '—'}</div>
             <div className="flex items-start justify-between">
               <div className="text-3xl">{h.emoji}</div>
               <span className="rounded bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-700">
@@ -504,6 +509,7 @@ function TransfersSection({ items, onChange }: { items: MockTransfer[]; onChange
           <article key={t.id} className="card flex items-center gap-6">
             <div className="text-4xl">{t.emoji}</div>
             <div className="flex-1 min-w-0">
+              <div className="font-mono text-xs text-slate-500">编号 {t.code ?? '—'}</div>
               <h3 className="font-semibold text-slate-900">{t.name}</h3>
               <p className="text-sm text-slate-600">{t.vehicleType}</p>
               <p className="mt-1 text-xs text-slate-500">
@@ -566,6 +572,7 @@ function VisasSection({ items, onChange }: { items: MockVisa[]; onChange: (v: Mo
       <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
         {items.map((v) => (
           <div key={v.id} className="card">
+            <div className="font-mono text-xs text-slate-500">编号 {v.code ?? '—'}</div>
             <div className="flex items-start justify-between">
               <span className="text-4xl">{v.flag}</span>
               <span className="rounded bg-blue-100 px-2 py-0.5 text-xs font-semibold text-blue-700">
@@ -653,6 +660,7 @@ function BundleCard({
   const savingPct = bundle.listPrice > 0 ? (saving / bundle.listPrice) * 100 : 0;
   return (
     <article className={`card ${bundle.active ? '' : 'opacity-60'}`}>
+      <div className="font-mono text-xs text-slate-500">编号 {bundle.code ?? '—'}</div>
       <div className="flex items-start justify-between">
         <div className="flex items-start gap-3">
           <span className="text-3xl">{bundle.emoji}</span>

@@ -9,7 +9,7 @@ import type { Passenger } from '@prisma/client';
 import { toAlpha3 } from './nationality.js';
 
 /** 日期 → DDMmmYY 格式，如 24Oct95 / 12Dec34（航司标准）*/
-function formatPnrDate(d: Date | null | undefined): string {
+export function formatPnrDate(d: Date | null | undefined): string {
   if (!d) return '';
   const day = String(d.getUTCDate()).padStart(2, '0');
   const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -23,7 +23,7 @@ function passengerTypeCode(t: string): string {
   return { ADULT: 'ADT', CHILD: 'CHD', INFANT: 'INF' }[t] ?? 'ADT';
 }
 
-interface PnrRow {
+export interface PnrRow {
   lastName: string;
   firstName: string;
   title: string;
@@ -51,7 +51,7 @@ interface PnrRow {
   addressZip: string;
 }
 
-const COLUMNS: Array<{ header: string; key: keyof PnrRow }> = [
+export const PNR_COLUMNS: Array<{ header: string; key: keyof PnrRow }> = [
   { header: 'Last Name', key: 'lastName' },
   { header: 'First Name and Middle Name', key: 'firstName' },
   { header: 'Title', key: 'title' },
@@ -79,7 +79,7 @@ const COLUMNS: Array<{ header: string; key: keyof PnrRow }> = [
   { header: 'Address Zip Code', key: 'addressZip' },
 ];
 
-function passengerToRow(p: Passenger): PnrRow {
+export function passengerToRow(p: Passenger): PnrRow {
   // 优先用拆分字段；fullName 兜底（按空格切）
   const [autoLast, ...rest] = (p.fullName || '').trim().split(/\s+/);
   const autoFirst = rest.join(' ');
@@ -120,7 +120,7 @@ export async function buildPnrWorkbook(order: { orderNumber: string; passengers:
   wb.created = new Date();
 
   const ws = wb.addWorksheet('Sheet0');
-  ws.columns = COLUMNS.map((c) => ({ header: c.header, key: c.key, width: 18 }));
+  ws.columns = PNR_COLUMNS.map((c) => ({ header: c.header, key: c.key, width: 18 }));
 
   // 表头加粗 + 浅灰底
   const headerRow = ws.getRow(1);

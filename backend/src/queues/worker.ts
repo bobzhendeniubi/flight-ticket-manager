@@ -11,12 +11,13 @@
 import { Worker } from 'bullmq';
 import { prisma } from '../db/prisma.js';
 import { env } from '../config/env.js';
-import { FulfillmentStatus, FulfillmentType, OrderStatus, Prisma } from '@prisma/client';
+import { FulfillmentStatus, FulfillmentType, OrderStatus, Prisma, SeatLockStatus } from '@prisma/client';
 import {
   bullRedis,
   type FulfillmentJobData,
   type NotificationJobData,
   type SeatHoldJobData,
+  type SeatLockJobData,
 } from './queue.js';
 import { closeMailer } from '../lib/mailer.js';
 import { sendItineraryEmail } from '../lib/itinerary-email.js';
@@ -218,6 +219,36 @@ seatHoldWorker.on('failed', (job, err) => {
 });
 
 // ══════════════════════════════════════════════════════════════════
+// Seat-Lock Expiry Worker — 锁位 10 分钟到期自动失效
+//
+// 触发：seat-locks.service.createLock 时排队 delay = expiresAt - now（10 min）。
+// 执行：只在锁仍 ACTIVE 时标 EXPIRED（幂等）；已消费/已释放的锁不动。
+// 注：所有可用量查询都按 status=ACTIVE AND expiresAt > now 惰性过滤，
+//     正确性不依赖本 worker 准时执行 —— 这里只是把状态落库方便排查。
+// ══════════════════════════════════════════════════════════════════
+const seatLockWorker = new Worker<SeatLockJobData>(
+  'seat-lock',
+  async (job) => {
+    const { lockId } = job.data;
+    const upd = await prisma.seatLock.updateMany({
+      where: { id: lockId, status: SeatLockStatus.ACTIVE },
+      data: { status: SeatLockStatus.EXPIRED },
+    });
+    if (upd.count === 1) {
+      // eslint-disable-next-line no-console
+      console.log(`[worker:seat-lock] ✓ lock ${lockId} expired`);
+    }
+    return { lockId, expired: upd.count === 1 };
+  },
+  { connection: bullRedis, concurrency: 5 },
+);
+
+seatLockWorker.on('failed', (job, err) => {
+  // eslint-disable-next-line no-console
+  console.error(`[worker:seat-lock] ✗ job ${job?.id} failed:`, err.message);
+});
+
+// ══════════════════════════════════════════════════════════════════
 // Notification Worker — 发短信/邮件（沙箱只 console.log）
 // ══════════════════════════════════════════════════════════════════
 const notificationWorker = new Worker<NotificationJobData>(
@@ -243,6 +274,7 @@ async function shutdown() {
   await Promise.all([
     fulfillmentWorker.close(),
     seatHoldWorker.close(),
+    seatLockWorker.close(),
     notificationWorker.close(),
   ]);
   await closeMailer();

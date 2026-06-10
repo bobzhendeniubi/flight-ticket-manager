@@ -18,6 +18,39 @@ import type {
   UpdateVisaBody,
 } from './products.schemas.js';
 
+// ── 产品编号生成 ─────────────────────────────────────────────────────
+// 规则：前缀 + 4 位零填充序号（H0001 / V0001 / T0001 / B0001）。
+// 序号 = 当前同前缀最大序号 + 1；并发撞 unique 时重试一次 +1。
+// 编号只由服务端生成，create/update schema 不暴露 code 字段。
+function formatProductCode(prefix: string, seq: number): string {
+  return `${prefix}${String(seq).padStart(4, '0')}`;
+}
+
+function parseCodeSeq(prefix: string, code: string | null): number {
+  if (!code) return 0;
+  const n = Number.parseInt(code.slice(prefix.length), 10);
+  return Number.isNaN(n) ? 0 : n;
+}
+
+function isCodeUniqueViolation(err: unknown): boolean {
+  return err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002';
+}
+
+/** 查最大编号 → 生成下一个 → create；unique 冲突（并发同号）重试一次 +1。 */
+async function createWithProductCode<T>(
+  prefix: string,
+  findMaxCode: () => Promise<string | null>,
+  create: (code: string) => Promise<T>,
+): Promise<T> {
+  const seq = parseCodeSeq(prefix, await findMaxCode()) + 1;
+  try {
+    return await create(formatProductCode(prefix, seq));
+  } catch (err) {
+    if (!isCodeUniqueViolation(err)) throw err;
+    return create(formatProductCode(prefix, seq + 1));
+  }
+}
+
 export class ProductsService {
   // ══════════════════════════════════════════════════════════════════
   // Hotels
@@ -41,34 +74,46 @@ export class ProductsService {
   }
 
   async createHotel(body: CreateHotelBody) {
-    const hotel = await prisma.hotel.create({
-      data: {
-        name: body.name,
-        nameEn: body.nameEn,
-        cityCode: body.cityCode,
-        area: body.area,
-        address: body.address,
-        starRating: body.starRating,
-        basePrice: body.basePrice !== undefined ? new Prisma.Decimal(body.basePrice) : null,
-        rating: body.rating !== undefined ? new Prisma.Decimal(body.rating) : null,
-        reviewCount: body.reviewCount,
-        emoji: body.emoji,
-        highlight: body.highlight,
-        amenities: body.amenities,
-        photos: body.photos,
-        isActive: body.isActive,
-        roomTypes: {
-          create: body.roomTypes.map((rt) => ({
-            name: rt.name,
-            bedType: rt.bedType,
-            capacity: rt.capacity,
-            basePrice: new Prisma.Decimal(rt.basePrice),
-            priceMultiplier: rt.priceMultiplier !== undefined ? new Prisma.Decimal(rt.priceMultiplier) : null,
-          })),
-        },
+    const hotel = await createWithProductCode(
+      'H',
+      async () => {
+        const row = await prisma.hotel.findFirst({
+          where: { code: { startsWith: 'H' } },
+          orderBy: { code: 'desc' },
+          select: { code: true },
+        });
+        return row?.code ?? null;
       },
-      include: { roomTypes: true },
-    });
+      (code) => prisma.hotel.create({
+        data: {
+          code,
+          name: body.name,
+          nameEn: body.nameEn,
+          cityCode: body.cityCode,
+          area: body.area,
+          address: body.address,
+          starRating: body.starRating,
+          basePrice: body.basePrice !== undefined ? new Prisma.Decimal(body.basePrice) : null,
+          rating: body.rating !== undefined ? new Prisma.Decimal(body.rating) : null,
+          reviewCount: body.reviewCount,
+          emoji: body.emoji,
+          highlight: body.highlight,
+          amenities: body.amenities,
+          photos: body.photos,
+          isActive: body.isActive,
+          roomTypes: {
+            create: body.roomTypes.map((rt) => ({
+              name: rt.name,
+              bedType: rt.bedType,
+              capacity: rt.capacity,
+              basePrice: new Prisma.Decimal(rt.basePrice),
+              priceMultiplier: rt.priceMultiplier !== undefined ? new Prisma.Decimal(rt.priceMultiplier) : null,
+            })),
+          },
+        },
+        include: { roomTypes: true },
+      }),
+    );
     return serializeHotel(hotel);
   }
 
@@ -148,12 +193,24 @@ export class ProductsService {
   }
 
   async createTransfer(body: CreateTransferBody) {
-    const t = await prisma.transfer.create({
-      data: {
-        ...body,
-        basePrice: new Prisma.Decimal(body.basePrice),
+    const t = await createWithProductCode(
+      'T',
+      async () => {
+        const row = await prisma.transfer.findFirst({
+          where: { code: { startsWith: 'T' } },
+          orderBy: { code: 'desc' },
+          select: { code: true },
+        });
+        return row?.code ?? null;
       },
-    });
+      (code) => prisma.transfer.create({
+        data: {
+          ...body,
+          code,
+          basePrice: new Prisma.Decimal(body.basePrice),
+        },
+      }),
+    );
     return serializeTransfer(t);
   }
 
@@ -202,13 +259,25 @@ export class ProductsService {
   }
 
   async createVisa(body: CreateVisaBody) {
-    const v = await prisma.visa.create({
-      data: {
-        ...body,
-        basePrice: new Prisma.Decimal(body.basePrice),
-        expressSurcharge: body.expressSurcharge !== undefined ? new Prisma.Decimal(body.expressSurcharge) : null,
+    const v = await createWithProductCode(
+      'V',
+      async () => {
+        const row = await prisma.visa.findFirst({
+          where: { code: { startsWith: 'V' } },
+          orderBy: { code: 'desc' },
+          select: { code: true },
+        });
+        return row?.code ?? null;
       },
-    });
+      (code) => prisma.visa.create({
+        data: {
+          ...body,
+          code,
+          basePrice: new Prisma.Decimal(body.basePrice),
+          expressSurcharge: body.expressSurcharge !== undefined ? new Prisma.Decimal(body.expressSurcharge) : null,
+        },
+      }),
+    );
     return serializeVisa(v);
   }
 
@@ -258,19 +327,31 @@ export class ProductsService {
   }
 
   async createBundle(body: CreateBundleBody) {
-    const b = await prisma.bundle.create({
-      data: {
-        name: body.name,
-        tagline: body.tagline,
-        emoji: body.emoji,
-        photo: body.photo,
-        items: body.items as unknown as Prisma.InputJsonValue,
-        flightPax: body.flightPax,
-        groundDiscount: new Prisma.Decimal(body.groundDiscount),
-        suitableFor: body.suitableFor,
-        isActive: body.isActive,
+    const b = await createWithProductCode(
+      'B',
+      async () => {
+        const row = await prisma.bundle.findFirst({
+          where: { code: { startsWith: 'B' } },
+          orderBy: { code: 'desc' },
+          select: { code: true },
+        });
+        return row?.code ?? null;
       },
-    });
+      (code) => prisma.bundle.create({
+        data: {
+          code,
+          name: body.name,
+          tagline: body.tagline,
+          emoji: body.emoji,
+          photo: body.photo,
+          items: body.items as unknown as Prisma.InputJsonValue,
+          flightPax: body.flightPax,
+          groundDiscount: new Prisma.Decimal(body.groundDiscount),
+          suitableFor: body.suitableFor,
+          isActive: body.isActive,
+        },
+      }),
+    );
     return serializeBundle(b);
   }
 

@@ -80,6 +80,7 @@ model User {
   auditLogs        AuditLog[]
   remindersCreated OperationalReminder[] @relation("ReminderCreator")
   remindersClaimed OperationalReminder[] @relation("ReminderClaimedBy")
+  seatLocks        SeatLock[]
 
   @@index([role])
   @@index([createdAt])
@@ -398,6 +399,7 @@ model FlightSchedule {
   seatClasses   FlightSeatClass[]
   orderItems    OrderItem[]
   pricingConfig PricingConfig?
+  seatLocks     SeatLock[]
 
   @@index([flightId, departureTime])
   @@index([departureTime])
@@ -413,9 +415,40 @@ model FlightSeatClass {
   createdAt  DateTime   @default(now())
   updatedAt  DateTime   @updatedAt
 
-  schedule FlightSchedule @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
+  schedule  FlightSchedule @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
+  seatLocks SeatLock[]
 
   @@unique([scheduleId, cabin])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Seat Locks — 锁位：下单前临时占座，到期自动释放（status 流转由应用层维护）
+// ─────────────────────────────────────────────────────────────────────────────
+enum SeatLockStatus {
+  ACTIVE
+  EXPIRED
+  CONSUMED
+  RELEASED
+}
+
+model SeatLock {
+  id               String         @id @default(cuid())
+  flightScheduleId String
+  seatClassId      String
+  userId           String
+  qty              Int
+  status           SeatLockStatus @default(ACTIVE)
+  expiresAt        DateTime
+  consumedOrderId  String? // 锁位被哪张订单消费（CONSUMED 时填）
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  flightSchedule FlightSchedule  @relation(fields: [flightScheduleId], references: [id], onDelete: Cascade)
+  seatClass      FlightSeatClass @relation(fields: [seatClassId], references: [id], onDelete: Cascade)
+  user           User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([flightScheduleId, seatClassId, status])
+  @@index([userId, status])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -452,6 +485,8 @@ model FlightCostPeriod {
 
 model Hotel {
   id          String   @id @default(cuid())
+  // 产品编号（H0001、H0002...）— 运营/财务对账用；老数据迁移时按 createdAt 回填
+  code        String?  @unique
   name        String
   nameEn      String?
   cityCode    String // IATA or internal city code
@@ -471,9 +506,29 @@ model Hotel {
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
-  roomTypes HotelRoomType[]
+  roomTypes    HotelRoomType[]
+  blockPeriods HotelBlockPeriod[]
 
   @@index([cityCode])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 酒店包房周期 — 按日期段向酒店切房（buy-out blocks）；dateFrom/dateTo 闭区间
+// ─────────────────────────────────────────────────────────────────────────────
+model HotelBlockPeriod {
+  id        String   @id @default(cuid())
+  hotelId   String
+  dateFrom  DateTime @db.Date
+  dateTo    DateTime @db.Date // inclusive
+  rooms     Int
+  unitPrice Decimal? @db.Decimal(12, 2) // 切房单价（CNY/间/晚）
+  note      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  hotel Hotel @relation(fields: [hotelId], references: [id], onDelete: Cascade)
+
+  @@index([hotelId, dateFrom, dateTo])
 }
 
 model HotelRoomType {
@@ -518,6 +573,8 @@ model HotelRoomInventory {
 
 model Transfer {
   id           String   @id @default(cuid())
+  // 产品编号（T0001、T0002...）
+  code         String?  @unique
   name         String
   vehicleType  String // e.g., "sedan", "suv", "van"
   capacity     Int
@@ -539,6 +596,8 @@ model Transfer {
 
 model Visa {
   id                 String   @id @default(cuid())
+  // 产品编号（V0001、V0002...）
+  code               String?  @unique
   destinationCountry String // ISO 3166-1 alpha-2 (e.g., "VN")
   country            String? // 中文国名（"越南"）
   visaType           String // e.g., "tourist", "business"
@@ -565,6 +624,8 @@ model Visa {
 // ─────────────────────────────────────────────────────────────────────────────
 model Bundle {
   id             String   @id @default(cuid())
+  // 产品编号（B0001、B0002...）
+  code           String?  @unique
   name           String
   tagline        String?
   emoji          String?

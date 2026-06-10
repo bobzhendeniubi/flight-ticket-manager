@@ -16,6 +16,7 @@ import { AuditLogsPage } from './pages/AuditLogsPage';
 import { SettlementsPage } from './pages/SettlementsPage';
 import { CancellationPoliciesPage } from './pages/CancellationPoliciesPage';
 import { FinancesPage } from './pages/FinancesPage';
+import { HotelControlPage } from './pages/HotelControlPage';
 import { useAuth } from './stores/auth';
 
 // AGENT 可访问的页面集合（其他页面默认 ADMIN/STAFF 专属）
@@ -184,6 +185,14 @@ export function App() {
           element={
             <Protected adminOnly>
               <FinancesPage />
+            </Protected>
+          }
+        />
+        <Route
+          path="/hotel-control"
+          element={
+            <Protected adminOnly>
+              <HotelControlPage />
             </Protected>
           }
         />

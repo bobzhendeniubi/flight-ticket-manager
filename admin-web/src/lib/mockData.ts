@@ -15,6 +15,8 @@ export interface HotelRoomType {
 
 export interface MockHotel {
   id: string;
+  /** 产品编号（服务端生成，如 H0001）；mock/新建数据可空 */
+  code?: string | null;
   name: string; // 中文名
   nameEn: string;
   cityCode: string; // 岘港 DAD / 会安 HOA / 巴拿山 BAN
@@ -286,6 +288,8 @@ export const MOCK_HOTELS: MockHotel[] = [
 // ── 岘港当地接送/包车 ────────────────────────────────────────────
 export interface MockTransfer {
   id: string;
+  /** 产品编号（服务端生成，如 T0001）；mock/新建数据可空 */
+  code?: string | null;
   name: string;
   vehicleType: string;
   capacity: number;
@@ -408,6 +412,8 @@ export const MOCK_TRANSFERS: MockTransfer[] = [
 // ── 签证 ──────────────────────────────────────────────────────────
 export interface MockVisa {
   id: string;
+  /** 产品编号（服务端生成，如 V0001）；mock/新建数据可空 */
+  code?: string | null;
   country: string;
   countryCode: string;
   flag: string;
@@ -811,6 +817,8 @@ export interface BundleItem {
 
 export interface MockBundle {
   id: string;
+  /** 产品编号（服务端生成，如 B0001）；mock/新建数据可空 */
+  code?: string | null;
   name: string;
   tagline: string;
   emoji: string;

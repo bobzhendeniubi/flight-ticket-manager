@@ -81,9 +81,11 @@ export interface AuthResult {
 }
 
 export interface FlightSeatAvailability {
+  seatClassId: string; // 锁位接口（POST /seat-locks）需要
   cabin: CabinClass;
   capacity: number;
   sold: number;
+  locked: number;
   available: number;
   basePrice: string;
   dynamicPrice: string;
@@ -277,6 +279,36 @@ export interface RefundQuote {
   items: RefundQuoteItem[];
   cancellable: boolean;
   cancellableReason?: string;
+}
+
+// ── 锁位 ──────────────────────────────────────────────────────────────────
+// 下单前临时占座：单次 ≤9 张 / 固定 10 分钟 / 到期自动回收；
+// 下单时服务端自动消费本人锁位（前端无需改结算流程）。
+export type SeatLockStatus = 'ACTIVE' | 'EXPIRED' | 'CONSUMED' | 'RELEASED';
+
+/** POST /seat-locks 返回的锁位记录 */
+export interface SeatLock {
+  id: string;
+  flightScheduleId: string;
+  seatClassId: string;
+  userId: string;
+  qty: number;
+  status: SeatLockStatus;
+  expiresAt: string;
+  createdAt: string;
+}
+
+/** GET /seat-locks/mine 的行（含航班号/起飞时间/舱等，倒计时以 expiresAt 为基准） */
+export interface MySeatLock {
+  id: string;
+  flightScheduleId: string;
+  seatClassId: string;
+  flightNumber: string;
+  departureTime: string;
+  cabin: CabinClass;
+  qty: number;
+  expiresAt: string;
+  createdAt: string;
 }
 
 export interface CreateOrderInput {
@@ -592,6 +624,19 @@ export const api = {
       `/orders/${id}/cancel`,
       { method: 'POST', token, body: { reason } },
     ),
+
+  // 锁位 — 下单前临时占座（单次 ≤9 张 / 固定 10 分钟 / 到期自动回收）
+  createSeatLock: (
+    token: string,
+    body: { flightScheduleId: string; seatClassId: string; qty: number },
+  ) => apiFetch<{ lock: SeatLock }>('/seat-locks/', { method: 'POST', token, body }),
+  listMyLocks: (token: string) =>
+    apiFetch<{ locks: MySeatLock[] }>('/seat-locks/mine', { token }),
+  releaseSeatLock: (token: string, id: string) =>
+    apiFetch<{ result: { id: string; status: SeatLockStatus } }>(`/seat-locks/${id}`, {
+      method: 'DELETE',
+      token,
+    }),
 
   // 产品（公开）
   listHotels: () => apiFetch<{ hotels: Hotel[] }>('/products/hotels?active=1'),

@@ -14,7 +14,8 @@
  */
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { api, type OrderSummary, type OrderStatus, type RefundQuote } from '../lib/api';
+import { api, type MySeatLock, type OrderSummary, type OrderStatus, type RefundQuote } from '../lib/api';
+import { CABIN_LABEL } from '../lib/airports';
 import { useAuth } from '../stores/auth';
 
 const STATUS_LABEL: Record<OrderStatus, string> = {
@@ -164,6 +165,9 @@ export function MyOrdersPage() {
         </Link>
       </header>
 
+      {/* 我的锁位 — 有 ACTIVE 锁位才显示，挂在订单列表上方 */}
+      <SeatLocksSection token={token} />
+
       {loading && <div className="card text-center py-8 text-slate-500">加载中…</div>}
       {error && <div className="card border-rose-200 bg-rose-50 text-sm text-rose-700">{error}</div>}
 
@@ -303,6 +307,96 @@ export function MyOrdersPage() {
         />
       )}
     </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────
+// SeatLocksSection — 我的锁位（下单前临时占座：≤9 张 / 10 分钟 / 到期自动回收）。
+// 倒计时同 CheckoutPage HoldCountdown 思路（1s setInterval + cleanup）；
+// 归零的锁位客户端直接剔除（服务端 worker 负责真正回收座位）。
+// ─────────────────────────────────────────────────────────────────
+function SeatLocksSection({ token }: { token: string }) {
+  const [locks, setLocks] = useState<MySeatLock[]>([]);
+  const [releasingId, setReleasingId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [now, setNow] = useState(Date.now());
+
+  useEffect(() => {
+    if (!token) return;
+    api
+      .listMyLocks(token)
+      .then((r) => setLocks(r.locks))
+      .catch(() => undefined); // 锁位加载失败不阻塞订单列表
+  }, [token]);
+
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  // 倒计时归零 → 不再展示（座位已由服务端自动回收）
+  const active = locks.filter((l) => new Date(l.expiresAt).getTime() > now);
+  if (active.length === 0) return null;
+
+  const release = async (id: string) => {
+    setReleasingId(id);
+    setError(null);
+    try {
+      await api.releaseSeatLock(token, id);
+      const r = await api.listMyLocks(token);
+      setLocks(r.locks);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : '释放失败');
+    } finally {
+      setReleasingId(null);
+    }
+  };
+
+  return (
+    <section className="card space-y-2 border-amber-200 bg-amber-50/50">
+      <header className="flex flex-wrap items-center justify-between gap-2">
+        <h2 className="font-semibold text-slate-900">🔒 我的锁位</h2>
+        <span className="text-xs text-amber-700">锁定有效期内完成下单即自动使用该锁位</span>
+      </header>
+      {error && <div className="text-sm text-rose-700">{error}</div>}
+      <ul className="space-y-1.5">
+        {active.map((l) => {
+          const leftMs = Math.max(0, new Date(l.expiresAt).getTime() - now);
+          const mm = Math.floor(leftMs / 60000);
+          const ss = Math.floor((leftMs % 60000) / 1000);
+          return (
+            <li
+              key={l.id}
+              className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-amber-100 bg-white px-3 py-2 text-sm"
+            >
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="font-mono font-semibold text-slate-800">{l.flightNumber}</span>
+                <span className="text-slate-500">
+                  {new Date(l.departureTime).toLocaleString('zh-CN')}
+                </span>
+                <span className="rounded bg-slate-100 px-1.5 py-0.5 text-xs text-slate-600">
+                  {CABIN_LABEL[l.cabin] ?? l.cabin}
+                </span>
+                <span className="text-slate-700">× {l.qty} 张</span>
+              </div>
+              <div className="flex items-center gap-3">
+                <span className="font-mono tabular-nums text-amber-700">
+                  ⏱ {String(mm).padStart(2, '0')}:{String(ss).padStart(2, '0')}
+                </span>
+                <button
+                  type="button"
+                  disabled={releasingId === l.id}
+                  onClick={() => release(l.id)}
+                  className="rounded-md border border-rose-300 bg-white px-2.5 py-1 text-xs text-rose-700 hover:bg-rose-50 disabled:opacity-50"
+                >
+                  {releasingId === l.id ? '释放中…' : '释放'}
+                </button>
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+    </section>
   );
 }
 

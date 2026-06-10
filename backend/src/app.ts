@@ -14,6 +14,8 @@ import { flightRoutes } from './modules/flights/flights.routes.js';
 import { agentRoutes } from './modules/agents/agents.routes.js';
 import { orderRoutes } from './modules/orders/orders.routes.js';
 import { orderCostItemRoutes } from './modules/orders/order-cost-items.routes.js';
+import { seatLockRoutes } from './modules/seat-locks/seat-locks.routes.js';
+import { hotelControlRoutes } from './modules/hotel-control/hotel-control.routes.js';
 import { settlementRoutes } from './modules/settlements/settlements.routes.js';
 import { productRoutes } from './modules/products/products.routes.js';
 import { dashboardRoutes } from './modules/dashboard/dashboard.routes.js';
@@ -70,6 +72,8 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(agentRoutes, { prefix: '/agents' });
   await app.register(orderRoutes, { prefix: '/orders' });
   await app.register(orderCostItemRoutes, { prefix: '/orders' });
+  await app.register(seatLockRoutes, { prefix: '/seat-locks' });
+  await app.register(hotelControlRoutes, { prefix: '/hotel-control' });
   await app.register(settlementRoutes, { prefix: '/settlements' });
   await app.register(productRoutes, { prefix: '/products' });
   await app.register(dashboardRoutes, { prefix: '/dashboard' });

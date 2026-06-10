@@ -19,6 +19,7 @@ import {
   PaymentMethod,
   Prisma,
   ProductKind,
+  SeatLockStatus,
   UserRole,
 } from '@prisma/client';
 import { randomInt } from 'node:crypto';
@@ -130,7 +131,9 @@ export class OrderService {
     // 生成订单号（有极小概率撞 unique，重试 3 次）
     const orderNumber = await generateOrderNumber();
 
-    // 事务：原子扣座位（CAS 防超卖）→ 写订单 → 写事件
+    // 事务：原子扣座位（CAS 防超卖）→ 写订单 → 写事件 → 消费本人锁位
+    // 事务提交后要移除已消费锁位的到期任务（jobId seatlock:<id>），先收集 id
+    const consumedLockIds: string[] = [];
     const order = await prisma.$transaction(async (tx) => {
       // 用 updateMany 的 where 条件做原子"检查+扣减"一步到位，避免 TOCTOU
       // where: `sold + qty <= capacity` 等价于 Prisma-expressible `capacity - qty >= sold`
@@ -138,12 +141,23 @@ export class OrderService {
       // SQL 函数，改用 raw SQL 保证原子性。
       for (const p of pricedItems) {
         if (p.kind !== 'FLIGHT') continue;
+        // 锁位语义：他人的 ACTIVE 未过期锁位占用余票（下单人自己的锁位不挡自己下单）
+        const lockedAgg = await tx.seatLock.aggregate({
+          _sum: { qty: true },
+          where: {
+            seatClass: { scheduleId: p.flightScheduleId!, cabin: p.flightCabin! },
+            userId: { not: requester.userId },
+            status: SeatLockStatus.ACTIVE,
+            expiresAt: { gt: new Date() },
+          },
+        });
+        const lockedByOthers = lockedAgg._sum.qty ?? 0;
         const affected = await tx.$executeRaw`
           UPDATE "FlightSeatClass"
           SET sold = sold + ${p.quantity}, "updatedAt" = NOW()
           WHERE "scheduleId" = ${p.flightScheduleId}
             AND cabin = ${p.flightCabin}::"CabinClass"
-            AND sold + ${p.quantity} <= capacity
+            AND sold + ${p.quantity} + ${lockedByOthers} <= capacity
         `;
         if (affected !== 1) {
           // 查当前库存给更友好的错误消息
@@ -151,7 +165,7 @@ export class OrderService {
             where: { scheduleId: p.flightScheduleId!, cabin: p.flightCabin! },
             select: { capacity: true, sold: true },
           });
-          const available = sc ? sc.capacity - sc.sold : 0;
+          const available = sc ? Math.max(0, sc.capacity - sc.sold - lockedByOthers) : 0;
           throw new ConflictError(
             `${p.flightCabin} 余票不足：需要 ${p.quantity} 张，仅剩 ${available} 张（并发抢占）`,
           );
@@ -207,9 +221,42 @@ export class OrderService {
         include: { items: true, passengers: true, statusEvents: true },
       });
 
+      // 消费下单人自己的锁位：FLIGHT 行对应舱位上本人的 ACTIVE 未过期锁位 → CONSUMED
+      // （座位已通过 sold 扣减真实占用，锁位完成使命；过期任务提交后再移除）
+      for (const p of pricedItems) {
+        if (p.kind !== 'FLIGHT') continue;
+        const myLocks = await tx.seatLock.findMany({
+          where: {
+            seatClass: { scheduleId: p.flightScheduleId!, cabin: p.flightCabin! },
+            userId: requester.userId,
+            status: SeatLockStatus.ACTIVE,
+            expiresAt: { gt: new Date() },
+          },
+          select: { id: true },
+        });
+        if (myLocks.length === 0) continue;
+        const lockIds = myLocks.map((l) => l.id);
+        await tx.seatLock.updateMany({
+          where: { id: { in: lockIds } },
+          data: { status: SeatLockStatus.CONSUMED, consumedOrderId: created.id },
+        });
+        consumedLockIds.push(...lockIds);
+      }
+
       // 座位已在订单 create 之前原子扣减；此处无需再动库存
       return created;
     });
+
+    // 事务成功后：移除已消费锁位的到期任务（best-effort；worker 端幂等）
+    if (consumedLockIds.length > 0) {
+      try {
+        const { cancelSeatLockExpiry } = await import('../../queues/queue.js');
+        await Promise.all(consumedLockIds.map((lockId) => cancelSeatLockExpiry(lockId)));
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error('[orders] failed to cancel seat-lock expiry jobs for', order.id, err);
+      }
+    }
 
     // 事务成功后：排队 seat-hold 自动释放任务（订单未在 paymentExpiresAt 内支付则取消）
     const holdMs = order.paymentExpiresAt
@@ -426,68 +473,27 @@ export class OrderService {
   // 列表
   // ════════════════════════════════════════════════════════════════════
   async listOrders(query: ListOrdersQuery, requester: OrderRequester) {
-    const where: Prisma.OrderWhereInput = {};
+    const where = buildOrderFilterWhere(query);
 
     // RBAC 过滤 — 先建基准可见集合，再按 query 过滤（但 query.agentId 不能覆盖可见集合）
-    let visibleAgentIds: string[] | null = null; // null = 无限制（ADMIN/STAFF）
     if (requester.role === 'CUSTOMER') {
       where.userId = requester.userId;
     } else if (requester.role === 'AGENT') {
-      visibleAgentIds = await this.getDescendantAgentIds(requester.agentId);
-      where.agentId = { in: visibleAgentIds };
-    }
-    // ADMIN/STAFF: visibleAgentIds 保持 null，无额外过滤
-
-    if (query.status) where.status = query.status;
-    if (query.agentId) {
-      // agentId 过滤 — 必须在可见集合内才生效，否则 403（防横向越权）
-      if (visibleAgentIds !== null && !visibleAgentIds.includes(query.agentId)) {
-        throw new ForbiddenError('无权查看该代理的订单');
+      const visibleAgentIds = await this.getDescendantAgentIds(requester.agentId);
+      if (query.agentId) {
+        // agentId 过滤 — 必须在可见集合内才生效，否则 403（防横向越权）
+        if (!visibleAgentIds.includes(query.agentId)) {
+          throw new ForbiddenError('无权查看该代理的订单');
+        }
+        // where.agentId 已由 buildOrderFilterWhere 设为 query.agentId
+      } else {
+        where.agentId = { in: visibleAgentIds };
       }
-      where.agentId = query.agentId;
     }
-    if (query.kind) where.items = { some: { kind: query.kind } };
-    if (query.from || query.to) {
-      where.createdAt = {
-        ...(query.from ? { gte: new Date(`${query.from}T00:00:00Z`) } : {}),
-        ...(query.to ? { lte: new Date(`${query.to}T23:59:59Z`) } : {}),
-      };
-    }
-    // 按出行日期筛选 — 跨 OrderItem 多种字段
-    // FLIGHT: 取 schedule.departureTime；HOTEL: hotelCheckIn；其他暂时用 createdAt 兜底
-    if (query.travelFrom || query.travelTo) {
-      const start = query.travelFrom ? new Date(`${query.travelFrom}T00:00:00Z`) : undefined;
-      const end = query.travelTo ? new Date(`${query.travelTo}T23:59:59Z`) : undefined;
-      where.items = {
-        some: {
-          OR: [
-            {
-              flightSchedule: {
-                departureTime: {
-                  ...(start ? { gte: start } : {}),
-                  ...(end ? { lte: end } : {}),
-                },
-              },
-            },
-            {
-              hotelCheckIn: {
-                ...(start ? { gte: start } : {}),
-                ...(end ? { lte: end } : {}),
-              },
-            },
-          ],
-        },
-      };
-    }
+    // ADMIN/STAFF: 无额外过滤；query.agentId（如有）已由 buildOrderFilterWhere 设置
+
     if (query.claimedById) where.claimedById = query.claimedById;
     if (query.unclaimedOnly) where.claimedById = null;
-    if (query.search) {
-      where.OR = [
-        { orderNumber: { contains: query.search, mode: 'insensitive' } },
-        { contactName: { contains: query.search, mode: 'insensitive' } },
-        { contactPhone: { contains: query.search } },
-      ];
-    }
 
     const [rows, total] = await prisma.$transaction([
       prisma.order.findMany({
@@ -987,6 +993,103 @@ const ORDER_FULL_INCLUDE = {
 } as const;
 
 // ── Helpers ────────────────────────────────────────────────────────────
+
+/** listOrders / 三模板导出共用的筛选字段（不含 RBAC / 接单 / 分页）。 */
+export type OrderListFilters = Pick<
+  ListOrdersQuery,
+  | 'status'
+  | 'agentId'
+  | 'kind'
+  | 'search'
+  | 'from'
+  | 'to'
+  | 'travelFrom'
+  | 'travelTo'
+  | 'flightNumber'
+  | 'passengerName'
+  | 'invoiceStatus'
+>;
+
+/**
+ * 把列表/导出共用的筛选参数转成 Prisma where。
+ * listOrders 与 orders.export-templates.ts 三模板导出共用，避免两处过滤逻辑漂移。
+ * 注意：不含 RBAC（userId/可见代理集合）、claimedById/unclaimedOnly、分页 —— 由调用方叠加。
+ */
+export function buildOrderFilterWhere(query: OrderListFilters): Prisma.OrderWhereInput {
+  const where: Prisma.OrderWhereInput = {};
+
+  if (query.status) where.status = query.status;
+  if (query.agentId) where.agentId = query.agentId;
+  if (query.kind) where.items = { some: { kind: query.kind } };
+  if (query.from || query.to) {
+    where.createdAt = {
+      ...(query.from ? { gte: new Date(`${query.from}T00:00:00Z`) } : {}),
+      ...(query.to ? { lte: new Date(`${query.to}T23:59:59Z`) } : {}),
+    };
+  }
+  // 按出行日期筛选 — 跨 OrderItem 多种字段
+  // FLIGHT: 取 schedule.departureTime；HOTEL: hotelCheckIn；其他暂时用 createdAt 兜底
+  if (query.travelFrom || query.travelTo) {
+    const start = query.travelFrom ? new Date(`${query.travelFrom}T00:00:00Z`) : undefined;
+    const end = query.travelTo ? new Date(`${query.travelTo}T23:59:59Z`) : undefined;
+    where.items = {
+      some: {
+        OR: [
+          {
+            flightSchedule: {
+              departureTime: {
+                ...(start ? { gte: start } : {}),
+                ...(end ? { lte: end } : {}),
+              },
+            },
+          },
+          {
+            hotelCheckIn: {
+              ...(start ? { gte: start } : {}),
+              ...(end ? { lte: end } : {}),
+            },
+          },
+        ],
+      },
+    };
+  }
+  if (query.invoiceStatus) where.invoiceStatus = query.invoiceStatus;
+  // 航班号筛选 — 订单需含该航班号的 FLIGHT 行
+  // 用 AND 叠加，避免覆盖 kind / 出行日期已占用的 where.items
+  if (query.flightNumber) {
+    where.AND = [
+      ...(Array.isArray(where.AND) ? where.AND : where.AND ? [where.AND] : []),
+      {
+        items: {
+          some: {
+            kind: OrderItemKind.FLIGHT,
+            flightSchedule: {
+              flight: {
+                flightNumber: { equals: query.flightNumber, mode: 'insensitive' },
+              },
+            },
+          },
+        },
+      },
+    ];
+  }
+  // 乘客姓名模糊匹配
+  if (query.passengerName) {
+    where.passengers = {
+      some: { fullName: { contains: query.passengerName, mode: 'insensitive' } },
+    };
+  }
+  if (query.search) {
+    where.OR = [
+      { orderNumber: { contains: query.search, mode: 'insensitive' } },
+      { contactName: { contains: query.search, mode: 'insensitive' } },
+      { contactPhone: { contains: query.search } },
+    ];
+  }
+
+  return where;
+}
+
 function passengerToData(p: PassengerInput) {
   // 自动拆 fullName → lastName/firstName，如果客户端没传
   const [autoLast, ...rest] = (p.fullName || '').trim().split(/\s+/);

@@ -441,7 +441,7 @@ function FlightSeatCard({
   flight,
   cabin,
   passengers,
-  isLoggedIn: _isLoggedIn,
+  isLoggedIn,
 }: {
   flight: FlightSearchResult;
   cabin: FlightSearchResult['seatClasses'][number];
@@ -449,7 +449,37 @@ function FlightSeatCard({
   isLoggedIn: boolean;
 }) {
   const add = useCart((s) => s.add);
+  const token = useAuth((s) => s.tokens?.accessToken ?? '');
   const enough = cabin.available >= passengers;
+
+  // ── 锁位（下单前临时占座：单次 ≤9 张 / 固定 10 分钟 / 到期自动回收） ──
+  const maxLockQty = Math.min(9, cabin.available);
+  const [lockOpen, setLockOpen] = useState(false);
+  const [lockQty, setLockQty] = useState(1);
+  const [locking, setLocking] = useState(false);
+  const [lockError, setLockError] = useState<string | null>(null);
+  const [activeLock, setActiveLock] = useState<{ qty: number; expiresAt: string } | null>(null);
+
+  const confirmLock = async () => {
+    setLocking(true);
+    setLockError(null);
+    try {
+      const r = await api.createSeatLock(token, {
+        flightScheduleId: flight.scheduleId,
+        seatClassId: cabin.seatClassId,
+        qty: lockQty,
+      });
+      // 同卡片多次锁 → 累计张数，倒计时以最新一次锁位为基准
+      setActiveLock((prev) => ({ qty: (prev?.qty ?? 0) + r.lock.qty, expiresAt: r.lock.expiresAt }));
+      setLockOpen(false);
+    } catch (err) {
+      // 409（同舱超 9 张 / 余票不足）等 → 原样展示服务端 message
+      setLockError(err instanceof ApiError ? err.message : '锁位失败，请稍后再试');
+    } finally {
+      setLocking(false);
+    }
+  };
+
   return (
     <div
       className={`rounded-md border px-3 py-2 text-sm ${
@@ -466,8 +496,9 @@ function FlightSeatCard({
         </div>
       </div>
       <div className="mt-1 text-xs text-slate-500">余票 {cabin.available} / {cabin.capacity}</div>
+      <div className="mt-2 flex gap-1.5">
       <button
-        className="btn-primary mt-2 w-full text-xs py-1"
+        className="btn-primary flex-1 text-xs py-1"
         disabled={!enough}
         onClick={() => {
           // 使用 totalForQty 精确总价（服务端 per-seat 累加），避免 round(avg)*qty 造成 1-2 元舍入差
@@ -492,6 +523,112 @@ function FlightSeatCard({
       >
         {enough ? `+ 加购 ${passengers} 张` : '余票不足'}
       </button>
+      {isLoggedIn && (
+        <button
+          type="button"
+          className="rounded-md border border-amber-300 bg-amber-50 px-2 py-1 text-xs text-amber-700 hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-40"
+          disabled={maxLockQty < 1}
+          title="先占座 10 分钟，收齐乘客姓名再下单"
+          onClick={() => {
+            setLockError(null);
+            setLockQty(Math.min(Math.max(1, passengers), maxLockQty));
+            setLockOpen((v) => !v);
+          }}
+        >
+          🔒 锁位
+        </button>
+      )}
+      </div>
+      {isLoggedIn && lockOpen && (
+        <div className="mt-1.5 space-y-1.5 rounded-md border border-amber-200 bg-amber-50/60 p-2">
+          <div className="flex items-center justify-between text-xs text-slate-600">
+            <span>锁定张数 · 10 分钟</span>
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                aria-label="减少锁定张数"
+                className="h-5 w-5 rounded border border-slate-300 bg-white leading-none text-slate-600 disabled:opacity-40"
+                disabled={lockQty <= 1}
+                onClick={() => setLockQty((q) => Math.max(1, q - 1))}
+              >
+                −
+              </button>
+              <span className="w-5 text-center font-semibold tabular-nums text-slate-800">{lockQty}</span>
+              <button
+                type="button"
+                aria-label="增加锁定张数"
+                className="h-5 w-5 rounded border border-slate-300 bg-white leading-none text-slate-600 disabled:opacity-40"
+                disabled={lockQty >= maxLockQty}
+                onClick={() => setLockQty((q) => Math.min(maxLockQty, q + 1))}
+              >
+                +
+              </button>
+            </div>
+          </div>
+          {lockError && <div className="text-xs text-red-600">{lockError}</div>}
+          <div className="flex gap-1.5">
+            <button
+              type="button"
+              className="flex-1 rounded-md bg-amber-500 px-2 py-1 text-xs font-medium text-white hover:bg-amber-600 disabled:opacity-50"
+              disabled={locking}
+              onClick={confirmLock}
+            >
+              {locking ? '锁定中…' : `确认锁 ${lockQty} 张`}
+            </button>
+            <button
+              type="button"
+              className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs text-slate-600 hover:bg-slate-50"
+              disabled={locking}
+              onClick={() => setLockOpen(false)}
+            >
+              取消
+            </button>
+          </div>
+        </div>
+      )}
+      {activeLock && (
+        <SeatLockChip
+          qty={activeLock.qty}
+          expiresAt={activeLock.expiresAt}
+          onExpire={() => setActiveLock(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────
+// SeatLockChip — 卡片上的锁位倒计时（mm:ss）。
+// 计时方式同 CheckoutPage 的 HoldCountdown：1s setInterval + useEffect 清理。
+// 倒计时归零 → onExpire 让父组件收起 chip（座位已由服务端自动回收）。
+// ─────────────────────────────────────────────────────────────────
+function SeatLockChip({
+  qty,
+  expiresAt,
+  onExpire,
+}: {
+  qty: number;
+  expiresAt: string;
+  onExpire: () => void;
+}) {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, []);
+  const leftMs = Math.max(0, new Date(expiresAt).getTime() - now);
+  useEffect(() => {
+    if (leftMs === 0) onExpire();
+  }, [leftMs, onExpire]);
+  if (leftMs === 0) return null;
+  const mm = Math.floor(leftMs / 60000);
+  const ss = Math.floor((leftMs % 60000) / 1000);
+  return (
+    <div className="mt-1.5 flex items-center justify-center gap-1 rounded-md bg-amber-100 px-2 py-1 text-xs font-medium text-amber-800">
+      🔒 已锁{qty}张{' '}
+      <strong className="font-mono tabular-nums">
+        {String(mm).padStart(2, '0')}:{String(ss).padStart(2, '0')}
+      </strong>
     </div>
   );
 }
