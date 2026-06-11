@@ -19,7 +19,7 @@ import { NumberInput } from './NumberInput';
 const CATEGORY_LABEL: Record<OrderCostCategory, string> = {
   GUIDE_SERVICE: '导游服务费',
   COMP_GIFT: '赠送费用',
-  HANDLING_FEE: '手续费',
+  HANDLING_FEE: '手续费（操作费）',
   OTHER: '其他',
 };
 

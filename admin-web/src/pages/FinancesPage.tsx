@@ -462,7 +462,7 @@ function FlightCostPeriodsEditor({ token }: { token: string }) {
                 <th className="py-2 text-right font-normal">燃油</th>
                 <th className="py-2 text-right font-normal">旺季附加</th>
                 <th className="py-2 text-right font-normal">机型调整</th>
-                <th className="py-2 text-right font-normal">起降折扣</th>
+                <th className="py-2 text-right font-normal">起降折扣（机场补贴）</th>
                 <th className="py-2 text-left font-normal">备注</th>
                 <th className="py-2 text-right font-normal"></th>
               </tr>
@@ -661,7 +661,7 @@ function CostPeriodNewForm({
           />
         </label>
         <label className="text-xs text-slate-600">
-          起降折扣
+          起降折扣（机场补贴）
           <NumberInput
             className={`mt-1 block w-full ${numCls}`}
             step={0.01}
@@ -886,7 +886,7 @@ function FlightScheduleCostEditors({ token }: { token: string }) {
                 <th className="py-2 text-right font-normal">燃油(¥)</th>
                 <th className="py-2 text-right font-normal">旺季附加(¥)</th>
                 <th className="py-2 text-right font-normal">机型调整(¥)</th>
-                <th className="py-2 text-right font-normal">起降折扣(¥)</th>
+                <th className="py-2 text-right font-normal">起降折扣/机场补贴(¥)</th>
                 <th className="py-2 text-right font-normal">已售/总座</th>
                 <th className="py-2 text-right font-normal text-blue-700">单座(已售)成本(¥)</th>
                 <th className="py-2 text-right font-normal"></th>
@@ -1452,7 +1452,7 @@ const COST_ITEMS: { key: keyof Omit<FinanceSummary['costBreakdown'], 'total'>; l
   { key: 'peakSurcharge', label: '旺季附加' },
   { key: 'fuel', label: '燃油' },
   { key: 'aircraftAdjust', label: '机型调整' },
-  { key: 'takeoffDiscount', label: '起降折扣' },
+  { key: 'takeoffDiscount', label: '起降折扣（机场补贴）' },
   { key: 'hotel', label: '房费' },
   { key: 'visa', label: '签证费' },
   { key: 'transfer', label: '车费' },

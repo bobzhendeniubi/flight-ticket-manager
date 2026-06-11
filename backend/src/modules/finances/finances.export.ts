@@ -112,7 +112,7 @@ const COLUMNS: Array<{ header: string; key: keyof FinanceRow; width: number }> =
   { header: '旺季附加(RMB)', key: 'peakSurchargeCny', width: 12 },
   { header: '燃油(RMB)', key: 'fuelCostCny', width: 12 },
   { header: '机型调整(RMB)', key: 'aircraftAdjustCny', width: 12 },
-  { header: '起降折扣(RMB)', key: 'takeoffDiscountCny', width: 12 },
+  { header: '起降折扣/机场补贴(RMB)', key: 'takeoffDiscountCny', width: 14 },
   { header: '导游服务费(RMB)', key: 'guideServiceCny', width: 14 },
   { header: '杂项(赠送+手续费+其他)(RMB)', key: 'otherOrderCostCny', width: 18 },
   { header: '入住酒店', key: 'hotelName', width: 18 },

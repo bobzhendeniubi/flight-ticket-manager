@@ -80,7 +80,7 @@ const COLUMNS: Array<{ header: string; key: keyof FlightRow; width: number }> = 
   { header: '燃油', key: 'fuelCost', width: 10 },
   { header: '旺季附加', key: 'peakSurchargeCost', width: 12 },
   { header: '机型调整', key: 'aircraftAdjustCost', width: 12 },
-  { header: '起降折扣', key: 'takeoffDiscountCost', width: 12 },
+  { header: '起降折扣/机场补贴', key: 'takeoffDiscountCost', width: 14 },
   { header: '房费', key: 'hotelCost', width: 12 },
   { header: '签证费', key: 'visaCost', width: 12 },
   { header: '车费', key: 'transferCost', width: 12 },
