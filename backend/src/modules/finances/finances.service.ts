@@ -88,7 +88,7 @@ export interface FinancesSummary {
   marginPct: number | null;
   /** 含已售/未售座位推算的"应负担"包机沉没成本（仅 charterCostCny 已填的航班） */
   emptySeatSunkCostCny: number;
-  /** 真实净利 = grossMargin - emptySeatSunkCost */
+  /** 航班贡献毛利（财务定名，原"净利"）= grossMargin - emptySeatSunkCost，未扣公司期间费用 */
   netMarginCny: number;
   /** 该区间内的订单数（不含 DRAFT / CANCELLED） */
   orderCount: number;
@@ -116,7 +116,7 @@ export interface FlightPnlRow {
   soldSeatAllocCostCny: number | null;
   /** 空座沉没成本 = (totalSeats - soldSeats) × perSeatCost */
   emptySeatSunkCostCny: number | null;
-  /** 整包机净利 = revenue - charterCost */
+  /** 整包机航班贡献毛利（财务定名，原"净利"）= revenue - charterCost */
   netMarginCny: number | null;
   /** 已售部分毛利 = revenue - 已售分摊成本 */
   grossOnSoldCny: number | null;

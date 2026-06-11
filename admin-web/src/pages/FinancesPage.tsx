@@ -1324,7 +1324,7 @@ function SummaryTab({ token, range }: { token: string; range: { from: string; to
           tone={marginTone}
         />
         <KpiCard
-          label="净利（扣空座沉没）"
+          label="航班贡献毛利（扣空座沉没）"
           value={fmtCny(data.netMarginCny)}
           hint={`空座沉没 ${fmtCny(-data.emptySeatSunkCostCny)}`}
           tone={netTone}
@@ -1550,7 +1550,7 @@ function FlightsTab({ token, range }: { token: string; range: { from: string; to
               <th className="py-2 text-right font-normal">包机成本</th>
               <th className="py-2 text-right font-normal text-blue-700">单座(已售)成本</th>
               <th className="py-2 text-right font-normal">空座沉没</th>
-              <th className="py-2 text-right font-normal">净利</th>
+              <th className="py-2 text-right font-normal">航班贡献毛利</th>
             </tr>
           </thead>
           <tbody>
