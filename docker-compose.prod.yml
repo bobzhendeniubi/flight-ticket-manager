@@ -46,7 +46,8 @@ services:
     image: redis:7-alpine
     container_name: ftm-redis-prod
     restart: unless-stopped
-    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    # noeviction：BullMQ 要求——lru 驱逐会悄悄丢延迟任务（锁位过期/座位超时释放）
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy noeviction
     volumes:
       - redis_data:/data
     expose:
@@ -136,6 +137,9 @@ services:
       SANDBOX_WEBHOOK_SECRET: ${SANDBOX_WEBHOOK_SECRET:-sandbox-test-secret}
       ENABLE_AUTO_FULFILLMENT: ${ENABLE_AUTO_FULFILLMENT:-true}
     command: ["node", "dist/queues/worker.js"]
+    # worker 不开 HTTP，必须屏蔽镜像里 backend 的 HEALTHCHECK（curl :4000 永远失败）
+    healthcheck:
+      disable: true
     logging:
       driver: "json-file"
       options: { max-size: "100m", max-file: "5" }
