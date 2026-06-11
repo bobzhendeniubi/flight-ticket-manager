@@ -351,11 +351,12 @@ export class SettlementService {
 
         const offset = Number(s.prepaymentOffset);
         if (offset > 0) {
-          const agent = await tx.agent.findUniqueOrThrow({
-            where: { id: s.agentId },
-            select: { prepaymentBalance: true },
-          });
-          const newBalance = Number(agent.prepaymentBalance) - offset;
+          // FOR UPDATE 行锁：两张结算单并发批准时防止用同一余额快照双扣（透支）
+          const agentRows = await tx.$queryRaw<Array<{ prepaymentBalance: Prisma.Decimal }>>`
+            SELECT "prepaymentBalance" FROM "Agent" WHERE id = ${s.agentId} FOR UPDATE
+          `;
+          if (!agentRows[0]) throw new NotFoundError('代理不存在');
+          const newBalance = Number(agentRows[0].prepaymentBalance) - offset;
           await tx.agent.update({
             where: { id: s.agentId },
             data: { prepaymentBalance: new Prisma.Decimal(newBalance) },

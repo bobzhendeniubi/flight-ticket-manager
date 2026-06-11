@@ -1951,6 +1951,13 @@ function ConfirmPaymentSection({
     reader.readAsDataURL(f);
   }
 
+  // 幂等键：同一次收款（含双击/网络重试）只入账一次；成功后换新键
+  const makeIdemKey = () =>
+    typeof crypto !== 'undefined' && 'randomUUID' in crypto
+      ? crypto.randomUUID()
+      : `mc-${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
+  const [idemKey, setIdemKey] = useState(makeIdemKey);
+
   async function confirm(): Promise<void> {
     if (!token || submitting) return;
     setErr(null);
@@ -1967,10 +1974,12 @@ function ConfirmPaymentSection({
         method,
         proofUrl: proofUrl ?? undefined,
         note: note.trim() || undefined,
+        idempotencyKey: idemKey,
       });
       setPaid(res.paidAmount);
       setProofUrl(null);
       setNote('');
+      setIdemKey(makeIdemKey());
       const r = await api.getOrder(token, orderId);
       setPayments(r.order.payments ?? []);
       onChanged?.();

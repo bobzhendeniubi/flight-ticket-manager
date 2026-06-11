@@ -234,7 +234,7 @@ export class PaymentsService {
    */
   async confirmManualPayment(
     orderId: string,
-    input: { amount?: number; method: PaymentMethod; proofUrl?: string; note?: string },
+    input: { amount?: number; method: PaymentMethod; proofUrl?: string; note?: string; idempotencyKey?: string },
     actor: { userId: string; role: UserRole },
   ): Promise<{
     ok: true;
@@ -245,27 +245,53 @@ export class PaymentsService {
     orderNumber: string;
     status: OrderStatus;
   }> {
-    const order = await prisma.order.findUnique({
-      where: { id: orderId },
-      select: { id: true, orderNumber: true, total: true, paidAmount: true, status: true },
-    });
-    if (!order) throw new NotFoundError('订单不存在');
-
-    const total = Number(order.total);
-    const already = Number(order.paidAmount);
-    const remaining = Math.max(0, total - already);
-    const amount = input.amount ?? remaining;
-    if (amount <= 0) throw new BadRequestError('收款金额必须大于 0');
-    if (amount > remaining + 0.001) {
-      throw new BadRequestError(`收款金额超过应收余额（应收 ¥${remaining.toFixed(2)}）`);
+    // 幂等回放：同一 idempotencyKey 已入账（双击/网络重试）→ 返回当时结果，绝不二次累计
+    if (input.idempotencyKey) {
+      const existing = await prisma.payment.findUnique({
+        where: { idempotencyKey: input.idempotencyKey },
+        select: { id: true, orderId: true },
+      });
+      if (existing) {
+        const o = await prisma.order.findUniqueOrThrow({
+          where: { id: existing.orderId },
+          select: { orderNumber: true, total: true, paidAmount: true, status: true },
+        });
+        const t = Number(o.total);
+        const p = Number(o.paidAmount);
+        return { ok: true, paymentId: existing.id, paidAmount: p, total: t, fullyPaid: p + 0.001 >= t, orderNumber: o.orderNumber, status: o.status };
+      }
     }
 
-    const newPaid = already + amount;
-    const fullyPaid = newPaid + 0.001 >= total;
     const pendingFulfillmentTaskIds: string[] = [];
     let paymentId = '';
+    let newPaid = 0;
+    let total = 0;
+    let fullyPaid = false;
+    let orderNumber = '';
+    let statusBefore: OrderStatus = OrderStatus.PENDING_PAYMENT;
 
-    await prisma.$transaction(async (tx) => {
+    try {
+      await prisma.$transaction(async (tx) => {
+      // FOR UPDATE 行锁 + 事务内读余额：并发确认不会用旧快照双计 paidAmount
+      const rows = await tx.$queryRaw<
+        Array<{ id: string; orderNumber: string; total: Prisma.Decimal; paidAmount: Prisma.Decimal; status: OrderStatus }>
+      >`SELECT id, "orderNumber", total, "paidAmount", status FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+      const order = rows[0];
+      if (!order) throw new NotFoundError('订单不存在');
+
+      total = Number(order.total);
+      const already = Number(order.paidAmount);
+      const remaining = Math.max(0, total - already);
+      const amount = input.amount ?? remaining;
+      if (amount <= 0) throw new BadRequestError('收款金额必须大于 0');
+      if (amount > remaining + 0.001) {
+        throw new BadRequestError(`收款金额超过应收余额（应收 ¥${remaining.toFixed(2)}）`);
+      }
+      newPaid = already + amount;
+      fullyPaid = newPaid + 0.001 >= total;
+      orderNumber = order.orderNumber;
+      statusBefore = order.status;
+
       const payment = await tx.payment.create({
         data: {
           orderId,
@@ -273,6 +299,7 @@ export class PaymentsService {
           amount: new Prisma.Decimal(amount),
           status: PaymentStatus.SUCCEEDED,
           paidAt: new Date(),
+          idempotencyKey: input.idempotencyKey ?? null,
           proofUrl: input.proofUrl ?? null,
           gatewayPayload: {
             manual: true,
@@ -296,7 +323,14 @@ export class PaymentsService {
           pendingFulfillmentTaskIds,
         );
       }
-    });
+      });
+    } catch (e) {
+      // 并发同 key 撞唯一索引（P2002）→ 另一请求已入账，走幂等回放
+      if (input.idempotencyKey && e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
+        return this.confirmManualPayment(orderId, input, actor);
+      }
+      throw e;
+    }
 
     if (pendingFulfillmentTaskIds.length > 0 && process.env.ENABLE_AUTO_FULFILLMENT === 'true') {
       const { fulfillmentQueue } = await import('../../queues/queue.js');
@@ -314,8 +348,8 @@ export class PaymentsService {
       paidAmount: newPaid,
       total,
       fullyPaid,
-      orderNumber: order.orderNumber,
-      status: fullyPaid ? OrderStatus.PAID : order.status,
+      orderNumber,
+      status: fullyPaid ? OrderStatus.PAID : statusBefore,
     };
   }
 

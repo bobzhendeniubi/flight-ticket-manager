@@ -69,6 +69,7 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
     method: z.nativeEnum(PaymentMethod),
     proofUrl: z.string().max(6_000_000).optional(), // data URL（截图）
     note: z.string().max(500).optional(),
+    idempotencyKey: z.string().min(8).max(64).optional(), // 同 key 重试只入账一次
   });
   app.post('/manual-confirm', { preHandler: [app.authenticate] }, async (req, reply) => {
     if (req.user.role !== UserRole.ADMIN && req.user.role !== UserRole.STAFF) {
@@ -77,7 +78,7 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
     const body = manualConfirmSchema.parse(req.body);
     const result = await service.confirmManualPayment(
       body.orderId,
-      { amount: body.amount, method: body.method, proofUrl: body.proofUrl, note: body.note },
+      { amount: body.amount, method: body.method, proofUrl: body.proofUrl, note: body.note, idempotencyKey: body.idempotencyKey },
       { userId: req.user.sub, role: req.user.role },
     );
     void writeAudit({

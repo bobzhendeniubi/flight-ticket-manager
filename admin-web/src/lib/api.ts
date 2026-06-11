@@ -828,7 +828,7 @@ export const api = {
   // 人工确认收款（线下收款 → 标记已付 + 上传截图）ADMIN/STAFF
   confirmPayment: (
     token: string,
-    body: { orderId: string; amount?: number; method: PaymentMethod; proofUrl?: string; note?: string },
+    body: { orderId: string; amount?: number; method: PaymentMethod; proofUrl?: string; note?: string; idempotencyKey?: string },
   ) =>
     apiFetch<{
       ok: true;

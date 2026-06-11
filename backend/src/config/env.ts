@@ -124,6 +124,16 @@ export const corsOrigins =
     ? true
     : rawCorsOrigins.split(',').map((s) => s.trim()).filter(Boolean);
 
+// 生产环境拒绝占位 JWT 密钥（防止 .env 模板原样上线）
+if (
+  env.NODE_ENV === 'production' &&
+  (env.JWT_ACCESS_SECRET.includes('change_me') || env.JWT_REFRESH_SECRET.includes('change_me'))
+) {
+  // eslint-disable-next-line no-console
+  console.error('❌ JWT secrets are placeholders; generate real ones: openssl rand -base64 48');
+  process.exit(1);
+}
+
 /** 公网基准 URL — 用于生成 webhook callback、跳转链接 */
 export const appPublicUrl: string =
   env.APP_PUBLIC_URL ??
