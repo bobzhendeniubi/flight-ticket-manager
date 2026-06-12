@@ -1,0 +1,48 @@
+# citurtravel.com 生产 Caddyfile
+# 部署：
+#   cp /opt/ftm/infra/staging/Caddyfile.citurtravel /etc/caddy/Caddyfile
+#   systemctl restart caddy
+#
+# 前提：
+#   1. 阿里云 DNS：@ / www / admin / api 四条 A 记录 → 本机公网 IP
+#   2. docker compose 用 SALES_WEB_BIND=127.0.0.1:8081、ADMIN_WEB_BIND=127.0.0.1:8080
+#      （80/443 让给 Caddy，Let's Encrypt 自动签证书）
+
+# === 客户前台（销售网站）=================================
+citurtravel.com, www.citurtravel.com {
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Permissions-Policy "geolocation=(), microphone=(), camera=()"
+    }
+    reverse_proxy 127.0.0.1:8081
+    encode gzip zstd
+}
+
+# === 管理后台 ============================================
+admin.citurtravel.com {
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+    # 可选：IP 白名单（只让公司 IP 访问），取消注释并填真实 IP
+    # @block_admin not remote_ip 1.2.3.4
+    # respond @block_admin 403
+    reverse_proxy 127.0.0.1:8080
+    encode gzip zstd
+}
+
+# === API（小程序 / 第三方对接 / 支付回调）=================
+api.citurtravel.com {
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+    reverse_proxy 127.0.0.1:4000
+    encode gzip zstd
+}

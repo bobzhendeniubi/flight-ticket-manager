@@ -108,6 +108,9 @@ services:
       sh -c "npx prisma migrate deploy && node dist/index.js"
     expose:
       - "4000"
+    ports:
+      # 只绑本机回环：给宿主机 Caddy 反代 api.xxx.com 用，不暴露公网
+      - "127.0.0.1:4000:4000"
     logging:
       driver: "json-file"
       options: { max-size: "100m", max-file: "5" }
@@ -156,7 +159,8 @@ services:
     depends_on:
       backend: { condition: service_started }
     ports:
-      - "80:80"        # 生产一般走 reverse proxy；这里直接映射 80 便于单机部署
+      # 默认 80 便于裸 IP 单机部署；上 Caddy/域名后设 SALES_WEB_BIND=127.0.0.1:8081 让出 80
+      - "${SALES_WEB_BIND:-80}:80"
 
   admin-web:
     build:
@@ -169,7 +173,8 @@ services:
     depends_on:
       backend: { condition: service_started }
     ports:
-      - "8080:80"      # admin 走 8080；生产建议放到独立子域名 admin.xxx.com
+      # 上 Caddy 后设 ADMIN_WEB_BIND=127.0.0.1:8080，只允许本机反代访问
+      - "${ADMIN_WEB_BIND:-8080}:80"
 
 volumes:
   postgres_data:
