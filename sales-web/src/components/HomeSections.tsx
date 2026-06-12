@@ -45,10 +45,20 @@ function bundleFromPricePerPerson(b: Bundle): number {
 
 export function BundlesPreviewSection({ keyword }: { keyword: string }) {
   const [bundles, setBundles] = useState<Bundle[]>([]);
+  // 套餐是主推位，任何情况下区块都不能整段消失（加载中给骨架、失败给提示）
+  const [state, setState] = useState<'loading' | 'ok' | 'error'>('loading');
 
   useEffect(() => {
     let cancelled = false;
-    api.listBundles().then((r) => { if (!cancelled) setBundles(r.bundles.filter((b) => b.isActive)); }).catch(() => {/* 静默 */});
+    api.listBundles()
+      .then((r) => {
+        if (cancelled) return;
+        setBundles(r.bundles.filter((b) => b.isActive));
+        setState('ok');
+      })
+      .catch(() => {
+        if (!cancelled) setState('error');
+      });
     return () => { cancelled = true; };
   }, []);
 
@@ -64,8 +74,6 @@ export function BundlesPreviewSection({ keyword }: { keyword: string }) {
     ),
   );
 
-  if (bundles.length === 0) return null;
-
   return (
     <section>
       <SectionHeader
@@ -74,7 +82,17 @@ export function BundlesPreviewSection({ keyword }: { keyword: string }) {
         to="/bundles"
         toLabel="全部套餐"
       />
-      {visible.length === 0 ? (
+      {state === 'loading' ? (
+        <div className="mt-4 grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+          {[0, 1, 2].map((i) => (
+            <div key={i} className="card h-40 animate-pulse bg-slate-100" aria-hidden />
+          ))}
+        </div>
+      ) : state === 'error' ? (
+        <div className="card mt-4 text-sm text-slate-500">套餐加载失败，请刷新页面重试。</div>
+      ) : bundles.length === 0 ? (
+        <div className="card mt-4 text-sm text-slate-500">套餐上架中，敬请期待。</div>
+      ) : visible.length === 0 ? (
         <div className="card mt-4 text-sm text-slate-500">没有匹配"{keyword}"的套餐，去看看全部套餐吧。</div>
       ) : (
         <div className="mt-4 grid gap-4 md:grid-cols-2 lg:grid-cols-3">
