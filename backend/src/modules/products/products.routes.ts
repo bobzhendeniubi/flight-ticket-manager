@@ -9,11 +9,13 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { UserRole } from '@prisma/client';
 import { ProductsService } from './products.service.js';
+import { getHotelAvailability } from './hotel-availability.service.js';
 import {
   createBundleBodySchema,
   createHotelBodySchema,
   createTransferBodySchema,
   createVisaBodySchema,
+  hotelAvailabilityQuerySchema,
   updateBundleBodySchema,
   updateHotelBodySchema,
   updateTransferBodySchema,
@@ -23,6 +25,12 @@ import {
 export const productRoutes: FastifyPluginAsync = async (app) => {
   const service = new ProductsService();
   const adminPre = { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] };
+
+  // ── 酒店余量（公开，前台套餐/酒店页用；只回档位不回原始数字）────
+  app.get('/hotel-availability', async (req) => {
+    const query = hotelAvailabilityQuerySchema.parse(req.query);
+    return await getHotelAvailability(query);
+  });
 
   // ── Hotels ─────────────────────────────────────────────────────
   app.get('/hotels', async (req) => {

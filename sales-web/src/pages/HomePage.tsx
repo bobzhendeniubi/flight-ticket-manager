@@ -12,9 +12,7 @@ import { DANANG_HIGHLIGHTS } from '../lib/mockData';
 import { useDebouncedValue } from '../lib/useDebouncedValue';
 import { BenefitsStrip } from '../components/BenefitsStrip';
 import { FlightSeatCard } from '../components/FlightSeatCard';
-import { HeroCarousel } from '../components/HeroCarousel';
 import {
-  BundlesPreviewSection,
   HotelsPreviewSection,
   TransfersPreviewSection,
   matchKeyword,
@@ -116,27 +114,21 @@ export function HomePage() {
 
   return (
     <div className="space-y-6">
-      {/* Hero 轮播 */}
-      <HeroCarousel greeting={user ? (user.displayName ?? user.email) : null} />
-
-      {/* 福利条 */}
+      {/* 福利条（hero 仅保留在套餐落地页 '/'，机票页直接进搜索） */}
       <BenefitsStrip />
 
-      {/* 产品关键字搜索（防抖过滤 套餐/航班/酒店/用车） */}
+      {/* 产品关键字搜索（防抖过滤 航班/酒店/用车） */}
       <section>
         <label className="sr-only" htmlFor="product-keyword">搜索产品</label>
         <input
           id="product-keyword"
           type="search"
           className="input py-2.5"
-          placeholder="🔍 搜索套餐 / 航班 / 酒店 / 用车，如：凯悦、QH9588、岘港、接送"
+          placeholder="🔍 搜索航班 / 酒店 / 用车，如：QH9588、岘港、接送"
           value={keyword}
           onChange={(e) => setKeyword(e.target.value)}
         />
       </section>
-
-      {/* 套餐 first（运营要求：一眼看清、马上能买） */}
-      <BundlesPreviewSection keyword={kw} />
 
       {/* 搜索表单 */}
       <section className="card">

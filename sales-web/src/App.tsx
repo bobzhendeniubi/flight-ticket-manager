@@ -1,5 +1,5 @@
 import { useEffect } from 'react';
-import { Navigate, Route, Routes } from 'react-router-dom';
+import { Navigate, Route, Routes, useLocation } from 'react-router-dom';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { Layout } from './components/Layout';
 import { HomePage } from './pages/HomePage';
@@ -37,6 +37,12 @@ function Protected({
 // access token TTL=1h；提前到 50 分钟续期，避免闲置掉登录
 const REFRESH_INTERVAL_MS = 50 * 60 * 1000;
 
+/** /bundles → /：保留 ?kw= 等查询参数的兼容跳转 */
+function BundlesRedirect() {
+  const { search } = useLocation();
+  return <Navigate to={{ pathname: '/', search }} replace />;
+}
+
 export function App() {
   const hasSession = useAuth((s) => Boolean(s.tokens?.refreshToken));
   const refreshSession = useAuth((s) => s.refreshSession);
@@ -53,12 +59,14 @@ export function App() {
     <ErrorBoundary>
       <Routes>
         <Route element={<Layout />}>
-          {/* 前台 — 所有人可见 */}
-          <Route index element={<HomePage />} />
+          {/* 前台 — 所有人可见。套餐落地页是首页（运营要求：套餐主推、默认首屏） */}
+          <Route index element={<BundlesPage />} />
+          <Route path="flights" element={<HomePage />} />
+          {/* 旧链接 /bundles → 落地页，保持向后兼容（保留 ?kw= 等查询参数） */}
+          <Route path="bundles" element={<BundlesRedirect />} />
           <Route path="hotels" element={<HotelsPage />} />
           <Route path="transfers" element={<TransfersPage />} />
           <Route path="visas" element={<VisasPage />} />
-          <Route path="bundles" element={<BundlesPage />} />
           <Route path="cart" element={<CartPage />} />
           <Route path="checkout" element={<CheckoutPage />} />
 

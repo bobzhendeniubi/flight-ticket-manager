@@ -18,7 +18,7 @@ import { BadRequestError, NotFoundError } from '../../lib/errors.js';
 import type { CreateBlockPeriodBody, UpdateBlockPeriodBody } from './hotel-control.schemas.js';
 
 /** 与财务/订单导出一致：草稿 / 已取消 / 已退款 / 支付超时 / 失败 不计入。*/
-const COUNTED_STATUSES: OrderStatus[] = [
+export const COUNTED_STATUSES: OrderStatus[] = [
   OrderStatus.PENDING_PAYMENT,
   OrderStatus.PAID,
   OrderStatus.PROCESSING,
@@ -167,6 +167,77 @@ export async function deleteBlockPeriod(
   return { id };
 }
 
+// ── 逐日展开（销控板 / 前台余量共用）─────────────────────────────────────
+/** dates 上逐日累加包房数：dateFrom <= d <= dateTo（闭区间，周期可叠加）。*/
+export function expandBlockByDate(
+  periods: ReadonlyArray<{ dateFrom: Date; dateTo: Date; rooms: number }>,
+  dates: readonly string[],
+): number[] {
+  const block = new Array<number>(dates.length).fill(0);
+  for (const p of periods) {
+    const fromStr = fmtDateOnly(p.dateFrom);
+    const toStr = fmtDateOnly(p.dateTo);
+    for (let i = 0; i < dates.length; i++) {
+      if (fromStr <= dates[i] && dates[i] <= toStr) block[i] += p.rooms;
+    }
+  }
+  return block;
+}
+
+/** dates 上逐日累计占房行数：checkIn <= d < checkOut（半开区间，1 间/行）。*/
+export function expandUsedByDate(
+  items: ReadonlyArray<{ hotelCheckIn: Date | null; hotelCheckOut: Date | null }>,
+  dates: readonly string[],
+): number[] {
+  const used = new Array<number>(dates.length).fill(0);
+  for (const it of items) {
+    if (!it.hotelCheckIn || !it.hotelCheckOut) continue;
+    const checkIn = fmtDateOnly(it.hotelCheckIn);
+    const checkOut = fmtDateOnly(it.hotelCheckOut);
+    for (let i = 0; i < dates.length; i++) {
+      if (checkIn <= dates[i] && dates[i] < checkOut) used[i] += 1;
+    }
+  }
+  return used;
+}
+
+/**
+ * 单酒店逐晚余量（remaining = block - used），口径与销控板 getBoard 完全一致。
+ * 一次 findMany 拉周期 + 一次 findMany 拉占房行，JS 内展开（无逐日查询）。
+ * hasBlock=false 表示整段没有任何包房周期（未配置房控）—— 调用方自行决定降级行为。
+ */
+export async function getHotelNightlyRemaining(
+  hotelId: string,
+  nightDates: readonly string[],
+  client: PrismaClient = defaultPrisma,
+): Promise<{ remaining: number[]; hasBlock: boolean }> {
+  if (nightDates.length === 0) return { remaining: [], hasBlock: false };
+  const fromD = toDateOnly(nightDates[0]);
+  const toD = toDateOnly(nightDates[nightDates.length - 1]);
+
+  const periods = await client.hotelBlockPeriod.findMany({
+    where: { hotelId, dateFrom: { lte: toD }, dateTo: { gte: fromD } },
+    select: { dateFrom: true, dateTo: true, rooms: true },
+  });
+  if (periods.length === 0) return { remaining: [], hasBlock: false };
+
+  // 占晚区间 [checkIn, checkOut) 与夜晚集合有交集 ⇔ checkIn <= 最后一晚 && checkOut > 第一晚
+  const items = await client.orderItem.findMany({
+    where: {
+      hotelRoomTypeId: { not: null },
+      hotelRoomType: { hotelId },
+      hotelCheckIn: { lte: toD },
+      hotelCheckOut: { gt: fromD },
+      order: { status: { in: COUNTED_STATUSES } },
+    },
+    select: { hotelCheckIn: true, hotelCheckOut: true },
+  });
+
+  const block = expandBlockByDate(periods, nightDates);
+  const used = expandUsedByDate(items, nightDates);
+  return { remaining: block.map((b, i) => b - used[i]), hasBlock: true };
+}
+
 // ── 销控板（按酒店 × 日期）────────────────────────────────────────────────
 export interface HotelControlBoard {
   dates: string[];
@@ -237,26 +308,12 @@ export async function getBoard(
   const hotels = Array.from(hotelNames.entries())
     .sort((a, b) => a[1].localeCompare(b[1], 'zh-CN'))
     .map(([hotelId, hotelName]) => {
-      const block = new Array<number>(dates.length).fill(0);
-      const used = new Array<number>(dates.length).fill(0);
-
       const hotelPeriods = periods.filter((p) => p.hotelId === hotelId);
-      for (const p of hotelPeriods) {
-        const fromStr = fmtDateOnly(p.dateFrom);
-        const toStr = fmtDateOnly(p.dateTo);
-        for (let i = 0; i < dates.length; i++) {
-          if (fromStr <= dates[i] && dates[i] <= toStr) block[i] += p.rooms;
-        }
-      }
-
-      for (const it of items) {
-        if (it.hotelRoomType?.hotelId !== hotelId || !it.hotelCheckIn || !it.hotelCheckOut) continue;
-        const checkIn = fmtDateOnly(it.hotelCheckIn);
-        const checkOut = fmtDateOnly(it.hotelCheckOut);
-        for (let i = 0; i < dates.length; i++) {
-          if (checkIn <= dates[i] && dates[i] < checkOut) used[i] += 1;
-        }
-      }
+      const block = expandBlockByDate(hotelPeriods, dates);
+      const used = expandUsedByDate(
+        items.filter((it) => it.hotelRoomType?.hotelId === hotelId),
+        dates,
+      );
 
       const remaining = block.map((b, i) => b - used[i]);
       const latestPriced = hotelPeriods.find((p) => p.unitPrice != null);

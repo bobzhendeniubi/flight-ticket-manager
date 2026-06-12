@@ -83,6 +83,15 @@ export interface AuthResult {
 // ── 余位档位（服务端权威口径；买家只看档位，不展示精确余票数）──────────────
 export type AvailabilityTier = 'AMPLE' | 'TIGHT' | 'LOW' | 'VERY_LOW' | 'SOLD_OUT';
 
+// ── 酒店房量档位（公开端点只回档位不回原始数字，与六档余位同纪律）──────────
+export type HotelAvailabilityTier = 'AMPLE' | 'TIGHT' | 'LOW' | 'SOLD_OUT';
+
+export interface HotelAvailabilityResult {
+  /** null = 该时段未配置包房（前台不展示房量，也不拦截销售） */
+  tier: HotelAvailabilityTier | null;
+  nights: number;
+}
+
 /** 行李规则（按 航班×舱等 配置；kg / 件数可分别为空，未配置整体为 null） */
 export interface BaggagePolicyInfo {
   checkedKg: number | null;
@@ -501,6 +510,10 @@ export interface Bundle {
   cabinUpgradeCnyPerLeg?: string | null;
   /** 套餐关联酒店房型（展示酒店名 + 房型名；null = 未关联） */
   hotelRoomType?: { id: string; name: string; hotelName: string } | null;
+  /** 关联房型 id（实时房量查询用；null = 未关联，不查房量） */
+  hotelRoomTypeId?: string | null;
+  /** 套餐住宿晚数（回程日期 = 出发 + 晚数；null = 用前端默认晚数） */
+  hotelNights?: number | null;
 }
 
 // ── 结算 / 佣金 ────────────────────────────────────────────────────────────
@@ -704,6 +717,12 @@ export const api = {
   listTransfers: () => apiFetch<{ transfers: Transfer[] }>('/products/transfers?active=1'),
   listVisas: () => apiFetch<{ visas: Visa[] }>('/products/visas?active=1'),
   listBundles: () => apiFetch<{ bundles: Bundle[] }>('/products/bundles?active=1'),
+
+  // 酒店房量档位（公开；[checkIn, checkOut) 半开区间，只回档位不回数字）
+  getHotelAvailability: (params: { hotelRoomTypeId: string; checkIn: string; checkOut: string }) => {
+    const qs = new URLSearchParams(params);
+    return apiFetch<HotelAvailabilityResult>(`/products/hotel-availability?${qs.toString()}`);
+  },
 
   // 结算 / 佣金 — 代理在自己的 dashboard 看分成
   // 后端 RBAC：AGENT 看自己 + 下级；ADMIN/STAFF 看全部

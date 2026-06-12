@@ -1,5 +1,35 @@
 import { z } from 'zod';
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** YYYY-MM-DD 且必须是真实日期（2026-02-30 之类直接拒）。*/
+const dateOnlyStr = z
+  .string()
+  .regex(/^\d{4}-\d{2}-\d{2}$/u, '日期格式应为 YYYY-MM-DD')
+  .refine((s) => !Number.isNaN(Date.parse(`${s}T00:00:00.000Z`)), '无效日期');
+
+/** [checkIn, checkOut) 的晚数；YYYY-MM-DD 按 UTC 零点解析。*/
+export function nightsBetween(checkIn: string, checkOut: string): number {
+  return Math.round(
+    (Date.parse(`${checkOut}T00:00:00.000Z`) - Date.parse(`${checkIn}T00:00:00.000Z`)) / DAY_MS,
+  );
+}
+
+// ── 酒店余量（公开端点查询）──────────────────────────────────────────────
+export const MAX_STAY_NIGHTS = 30;
+
+export const hotelAvailabilityQuerySchema = z
+  .object({
+    hotelRoomTypeId: z.string().min(1),
+    checkIn: dateOnlyStr,
+    checkOut: dateOnlyStr,
+  })
+  .refine((q) => q.checkIn < q.checkOut, { message: '入住日必须早于退房日' })
+  .refine((q) => nightsBetween(q.checkIn, q.checkOut) <= MAX_STAY_NIGHTS, {
+    message: `连住最多 ${MAX_STAY_NIGHTS} 晚`,
+  });
+export type HotelAvailabilityQuery = z.infer<typeof hotelAvailabilityQuerySchema>;
+
 // ── Hotel ────────────────────────────────────────────────────────────────
 export const createHotelBodySchema = z.object({
   name: z.string().min(1).max(200),

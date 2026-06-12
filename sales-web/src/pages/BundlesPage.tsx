@@ -1,29 +1,52 @@
 /**
- * 套餐展示页 — 可配置人数 + 房间数。
+ * 套餐落地页（首页）— 套餐主推、默认首屏。
  *
- * 机票：动态价 × 人数（从 /flights/search 实时拉，顺带拿去/回航班号+时刻展示）
- * 酒店：每晚价 × 晚数 × 房间数（关联房型时展示 酒店名+房型，含双早 · 2人1间）
- * 签证：每人价 × 人数
- * 接送：固定价（按趟，不按人头）
- * 升级：单住补房差 / 升舱商务 仅展示（收费走线下人工）
+ * 顶部：精简 hero 轮播 + 福利条 + 一个简单选择器（出发日期 + 人数）。
+ * 每张套餐卡：
+ *   - 回程日期 = 出发 + 套餐住宿晚数（hotelNights ?? 默认 4 晚），卡上展示"去/回/N晚"。
+ *   - 实时库存（选择器驱动，防抖 300ms）：
+ *       机票 → 去/回航段余位档位徽章（复用六档余位口径）。
+ *       酒店 → 关联房型时查后台房控，展示房量档位徽章；无包房配置则不展示。
+ *   - 去/回任一航段或酒店售罄 → 禁用"加入购物车"，给出换日期提示。
+ * 价格：机票按日期实时取价 × 人数；酒店每晚价 × 晚数 × 房间数；签证每人价 × 人数。
+ *
+ * 库存档位口径：买家只看档位（充足/紧张/少量/极少量/售罄、房量充足/紧张/极少/售罄），
+ * 绝不暴露原始余票/余房数字（与六档余位一致）。
  */
-import { useCallback, useEffect, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import { type MockBundle, type BundleItem } from '../lib/mockData';
-import { api, type Bundle as ApiBundle, type Hotel } from '../lib/api';
+import { api, type Bundle as ApiBundle, type Hotel, type AvailabilityTier, type FlightSearchResult } from '../lib/api';
 import { formatLocalTime } from '../lib/airports';
 import { BED_TYPE_NOTE } from '../lib/notices';
 import { useDebouncedValue } from '../lib/useDebouncedValue';
+import { useFlightSearchCache, type FlightSearchCache, type FlightLeg } from '../lib/useFlightSearchCache';
+import { useHotelAvailability } from '../lib/useHotelAvailability';
 import { BenefitsStrip } from '../components/BenefitsStrip';
 import { BookingNotices } from '../components/BookingNotices';
+import { HeroCarousel } from '../components/HeroCarousel';
 import { matchKeyword } from '../components/HomeSections';
+import { useAuth } from '../stores/auth';
 import { useCart } from '../stores/cart';
 
-/** MockBundle + 后端新增展示字段（升级价 / 关联房型） */
+/** 主航线（澳门 ⇌ 岘港）+ 默认住宿晚数（套餐未配置 hotelNights 时） */
+const ROUTE_ORIGIN = 'MFM';
+const ROUTE_DEST = 'DAD';
+const DEFAULT_NIGHTS = 4;
+
+/** 机票单航段兜底价（搜不到班次时用，避免价格显示为 0） */
+const FALLBACK_PRICE = {
+  ECONOMY: { go: 1480, ret: 1380 },
+  BUSINESS: { go: 4380, ret: 4280 },
+} as const;
+
+/** MockBundle + 后端新增展示字段（升级价 / 关联房型 / 实时库存所需 id+晚数） */
 interface BundleView extends MockBundle {
   singleSupplementPerNight: number | null;
   cabinUpgradePerLeg: number | null;
   hotelRoomType: { id: string; name: string; hotelName: string } | null;
+  hotelRoomTypeId: string | null;
+  hotelNights: number | null;
 }
 
 function bundleApiToView(b: ApiBundle): BundleView {
@@ -39,6 +62,8 @@ function bundleApiToView(b: ApiBundle): BundleView {
       b.singleSupplementCnyPerNight != null ? Number(b.singleSupplementCnyPerNight) : null,
     cabinUpgradePerLeg: b.cabinUpgradeCnyPerLeg != null ? Number(b.cabinUpgradeCnyPerLeg) : null,
     hotelRoomType: b.hotelRoomType ?? null,
+    hotelRoomTypeId: b.hotelRoomTypeId ?? null,
+    hotelNights: b.hotelNights ?? null,
   };
 }
 
@@ -48,11 +73,38 @@ function todayISO(offset = 3) {
   return d.toISOString().slice(0, 10);
 }
 
+/** 在 YYYY-MM-DD 上加 n 天（按 UTC 零点，避开时区漂移）。*/
+function addDaysISO(iso: string, days: number): string {
+  const ms = Date.parse(`${iso}T00:00:00.000Z`);
+  if (Number.isNaN(ms)) return iso;
+  return new Date(ms + days * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+}
+
+/** YYYY-MM-DD → "X月X日"（卡片紧凑展示用）。*/
+function formatMonthDay(iso: string): string {
+  const ms = Date.parse(`${iso}T00:00:00.000Z`);
+  if (Number.isNaN(ms)) return iso;
+  const d = new Date(ms);
+  return `${d.getUTCMonth() + 1}月${d.getUTCDate()}日`;
+}
+
 const KIND_LABEL: Record<BundleItem['kind'], { label: string; color: string }> = {
   FLIGHT: { label: '机票', color: 'bg-sky-100 text-sky-700' },
   HOTEL: { label: '酒店', color: 'bg-purple-100 text-purple-700' },
   TRANSFER: { label: '接送', color: 'bg-pink-100 text-pink-700' },
   VISA: { label: '签证', color: 'bg-amber-100 text-amber-700' },
+};
+
+// ── 库存档位徽章配置（买家只看档位，不看精确数字）────────────────────
+const FLIGHT_TIER_LABEL: Record<AvailabilityTier, string> = {
+  AMPLE: '余位充足', TIGHT: '余位紧张', LOW: '余位少量', VERY_LOW: '余位极少量', SOLD_OUT: '已售罄',
+};
+const FLIGHT_TIER_CLASS: Record<AvailabilityTier, string> = {
+  AMPLE: 'bg-emerald-100 text-emerald-700',
+  TIGHT: 'bg-sky-100 text-sky-700',
+  LOW: 'bg-amber-100 text-amber-800',
+  VERY_LOW: 'bg-orange-100 text-orange-700',
+  SOLD_OUT: 'bg-slate-100 text-rose-600',
 };
 
 /** 去/回航段展示信息（从 /flights/search 第一条结果取） */
@@ -62,6 +114,30 @@ interface LegInfo {
   arrivalTime: string;
   departureTz: string;
   arrivalTz: string;
+}
+
+function toLegInfo(r: FlightSearchResult | null | undefined): LegInfo | null {
+  return r
+    ? {
+        flightNumber: r.flightNumber,
+        departureTime: r.departureTime,
+        arrivalTime: r.arrivalTime,
+        departureTz: r.departureTz,
+        arrivalTz: r.arrivalTz,
+      }
+    : null;
+}
+
+/** 取某航段某舱位的余位档位（无班次/未加载 → null） */
+function legTier(leg: FlightLeg | undefined, cabin: 'ECONOMY' | 'BUSINESS'): AvailabilityTier | null {
+  if (!leg) return null;
+  return leg.seatClasses.find((c) => c.cabin === cabin)?.availabilityTier ?? null;
+}
+
+/** 取某航段某舱位的实时单价（无则兜底价） */
+function legPrice(leg: FlightLeg | undefined, cabin: 'ECONOMY' | 'BUSINESS', fallback: number): number {
+  const sc = leg?.seatClasses.find((c) => c.cabin === cabin);
+  return sc ? Number(sc.dynamicPrice) : fallback;
 }
 
 /** 套餐 → 酒店匹配：优先关联房型的酒店名，退化到 HOTEL 行项名称包含酒店名 */
@@ -77,6 +153,7 @@ function matchHotelForBundle(b: BundleView, hotels: Hotel[]): Hotel | undefined 
 
 export function BundlesPage() {
   const add = useCart((s) => s.add);
+  const user = useAuth((s) => s.user);
   const [bundles, setBundles] = useState<BundleView[]>([]);
   const [hotels, setHotels] = useState<Hotel[]>([]);
 
@@ -87,8 +164,11 @@ export function BundlesPage() {
     return () => { cancelled = true; };
   }, []);
 
+  // ── 简单选择器：出发日期（默认 +3 天）+ 人数（默认 2 人）──────────────
   const [goDate, setGoDate] = useState(todayISO(3));
-  const [returnDate, setReturnDate] = useState(todayISO(7));
+  const [pax, setPax] = useState(2);
+  // 库存查询用防抖日期（边改日期边查后台，不每次 onChange 都打 API）
+  const debouncedGoDate = useDebouncedValue(goDate);
 
   // 套餐关键字搜索（名称 / 行项 / 酒店名，防抖 300ms）
   // 首页套餐卡深链 /bundles?kw=xxx → 挂载时预填搜索框，落地即过滤
@@ -96,48 +176,8 @@ export function BundlesPage() {
   const [keyword, setKeyword] = useState(() => searchParams.get('kw') ?? '');
   const kw = useDebouncedValue(keyword);
 
-  // 动态机票价（单人来回）— dateRank 不展示给客户，所以不存进 state
-  const [flightPrices, setFlightPrices] = useState({
-    econPerPerson: 0,
-    bizPerPerson: 0,
-    loaded: false,
-  });
-  // 去/回航班号 + 时刻（套餐卡展示用；搜不到就不显示）
-  const [legs, setLegs] = useState<{ go: LegInfo | null; ret: LegInfo | null }>({ go: null, ret: null });
-
-  const loadPrices = useCallback(async () => {
-    try {
-      const [go, ret] = await Promise.all([
-        api.searchFlights({ origin: 'MFM', destination: 'DAD', date: goDate, passengers: 1 }),
-        api.searchFlights({ origin: 'DAD', destination: 'MFM', date: returnDate, passengers: 1 }),
-      ]);
-      const goE = go.results[0]?.seatClasses.find((c) => c.cabin === 'ECONOMY');
-      const retE = ret.results[0]?.seatClasses.find((c) => c.cabin === 'ECONOMY');
-      const goB = go.results[0]?.seatClasses.find((c) => c.cabin === 'BUSINESS');
-      const retB = ret.results[0]?.seatClasses.find((c) => c.cabin === 'BUSINESS');
-      setFlightPrices({
-        econPerPerson: (goE ? Number(goE.dynamicPrice) : 1480) + (retE ? Number(retE.dynamicPrice) : 1380),
-        bizPerPerson: (goB ? Number(goB.dynamicPrice) : 4380) + (retB ? Number(retB.dynamicPrice) : 4280),
-        loaded: true,
-      });
-      const toLeg = (r: (typeof go.results)[number] | undefined): LegInfo | null =>
-        r
-          ? {
-              flightNumber: r.flightNumber,
-              departureTime: r.departureTime,
-              arrivalTime: r.arrivalTime,
-              departureTz: r.departureTz,
-              arrivalTz: r.arrivalTz,
-            }
-          : null;
-      setLegs({ go: toLeg(go.results[0]), ret: toLeg(ret.results[0]) });
-    } catch {
-      setFlightPrices({ econPerPerson: 2860, bizPerPerson: 8660, loaded: true });
-      setLegs({ go: null, ret: null });
-    }
-  }, [goDate, returnDate]);
-
-  useEffect(() => { loadPrices(); }, [loadPrices]);
+  // 航班搜索缓存：多张卡共享同一 (日期,航线) 的搜索，避免重复请求
+  const flightCache = useFlightSearchCache();
 
   // 酒店明细 modal（笔记式：照片 + 房型 + 设施）
   const [hotelModal, setHotelModal] = useState<{ hotel: Hotel; roomTypeName: string | null } | null>(null);
@@ -158,24 +198,28 @@ export function BundlesPage() {
 
   return (
     <div className="space-y-5">
-      <section className="rounded-xl bg-gradient-to-br from-emerald-500 to-teal-500 p-6 text-white">
-        <h1 className="text-2xl font-bold">岘港全包套餐</h1>
-        <p className="mt-1 text-sm text-emerald-50">
-          来回机票 + 酒店含早 + 接送 + 签证一价全含。可调人数和房间数，价格实时更新。
-        </p>
-      </section>
+      {/* 精简 hero（hero 仅保留在落地页） */}
+      <HeroCarousel greeting={user ? (user.displayName ?? user.email) : null} />
 
       <BenefitsStrip />
 
+      {/* 简单选择器：出发日期 + 人数 + 搜索（钉在套餐列表上方） */}
       <section className="card">
-        <div className="grid gap-4 md:grid-cols-4">
+        <div className="grid gap-4 sm:grid-cols-2 md:grid-cols-3">
           <div>
-            <label className="label">去程日期</label>
-            <input type="date" className="input" value={goDate} onChange={(e) => setGoDate(e.target.value)} />
+            <label className="label" htmlFor="bundle-godate">出发日期</label>
+            <input
+              id="bundle-godate"
+              type="date"
+              className="input"
+              value={goDate}
+              min={todayISO(0)}
+              onChange={(e) => setGoDate(e.target.value)}
+            />
           </div>
           <div>
-            <label className="label">回程日期</label>
-            <input type="date" className="input" value={returnDate} min={goDate} onChange={(e) => setReturnDate(e.target.value)} />
+            <label className="label">出行人数</label>
+            <Stepper value={pax} min={1} max={9} onChange={setPax} />
           </div>
           <div>
             <label className="label" htmlFor="bundle-keyword">搜索套餐</label>
@@ -188,18 +232,10 @@ export function BundlesPage() {
               onChange={(e) => setKeyword(e.target.value)}
             />
           </div>
-          <div className="flex items-end">
-            {flightPrices.loaded ? (
-              <div className="text-sm">
-                <span className="text-slate-600">
-                  经济舱来回 <strong className="text-red-600">¥{flightPrices.econPerPerson.toLocaleString()}</strong>/人
-                </span>
-              </div>
-            ) : (
-              <span className="text-sm text-slate-500">加载中…</span>
-            )}
-          </div>
         </div>
+        <p className="mt-2 text-xs text-slate-500">
+          回程日期按各套餐住宿晚数自动推算；机位 / 房量随日期实时更新。
+        </p>
       </section>
 
       <section className="space-y-4">
@@ -210,24 +246,26 @@ export function BundlesPage() {
           <ConfigurableBundleCard
             key={b.id}
             bundle={b}
-            flightPrices={flightPrices}
+            flightCache={flightCache}
             goDate={goDate}
-            returnDate={returnDate}
-            legs={legs}
+            queryGoDate={debouncedGoDate}
+            pax={pax}
             hotel={matchHotelForBundle(b, hotels)}
             onShowHotel={(hotel) => setHotelModal({ hotel, roomTypeName: b.hotelRoomType?.name ?? null })}
             onAdd={(cfg) => {
               add({
                 kind: 'BUNDLE',
                 productId: b.id,
-                name: `${b.name}（${cfg.pax}人${cfg.rooms}房 · ${goDate}→${returnDate}）`,
+                name: `${b.name}（${cfg.pax}人${cfg.rooms}房 · ${goDate}→${cfg.returnDate}）`,
                 description: b.tagline,
                 emoji: b.emoji,
                 unitPrice: cfg.total,
                 qty: 1,
                 meta: {
-                  goDate, returnDate,
-                  pax: cfg.pax, rooms: cfg.rooms,
+                  goDate,
+                  returnDate: cfg.returnDate,
+                  pax: cfg.pax,
+                  rooms: cfg.rooms,
                   flightTotal: cfg.flightTotal,
                   hotelTotal: cfg.hotelTotal,
                   otherTotal: cfg.otherTotal,
@@ -255,30 +293,64 @@ export function BundlesPage() {
 
 // ── 可配置套餐卡 ─────────────────────────────────────────────────
 
+interface BundleAddConfig {
+  pax: number;
+  rooms: number;
+  returnDate: string;
+  total: number;
+  flightTotal: number;
+  hotelTotal: number;
+  otherTotal: number;
+}
+
 function ConfigurableBundleCard({
   bundle: b,
-  flightPrices,
+  flightCache,
   goDate,
-  returnDate,
-  legs,
+  queryGoDate,
+  pax,
   hotel,
   onShowHotel,
   onAdd,
 }: {
   bundle: BundleView;
-  flightPrices: { econPerPerson: number; bizPerPerson: number };
+  flightCache: FlightSearchCache;
   goDate: string;
-  returnDate: string;
-  legs: { go: LegInfo | null; ret: LegInfo | null };
+  queryGoDate: string;
+  pax: number;
   hotel?: Hotel;
   onShowHotel: (hotel: Hotel) => void;
-  onAdd: (cfg: { pax: number; rooms: number; total: number; flightTotal: number; hotelTotal: number; otherTotal: number }) => void;
+  onAdd: (cfg: BundleAddConfig) => void;
 }) {
-  const [pax, setPax] = useState(b.flightPax); // 出行人数（至少 1）
   const [rooms, setRooms] = useState(1); // 房间数
 
   const isBiz = b.items.some((i) => i.kind === 'FLIGHT' && i.productName.includes('商务'));
-  const pricePerPerson = isBiz ? flightPrices.bizPerPerson : flightPrices.econPerPerson;
+  const cabin: 'ECONOMY' | 'BUSINESS' = isBiz ? 'BUSINESS' : 'ECONOMY';
+
+  // 住宿晚数 → 回程日期。展示用 goDate（即时反馈），库存查询用防抖日期。
+  const nights = b.hotelNights ?? DEFAULT_NIGHTS;
+  const displayReturnDate = addDaysISO(goDate, nights);
+  const queryReturnDate = addDaysISO(queryGoDate, nights);
+
+  // 触发去/回航段搜索（缓存幂等去重）
+  useEffect(() => {
+    flightCache.ensure(ROUTE_ORIGIN, ROUTE_DEST, queryGoDate);
+    flightCache.ensure(ROUTE_DEST, ROUTE_ORIGIN, queryReturnDate);
+  }, [flightCache, queryGoDate, queryReturnDate]);
+
+  const outLeg = flightCache.get(ROUTE_ORIGIN, ROUTE_DEST, queryGoDate);
+  const retLeg = flightCache.get(ROUTE_DEST, ROUTE_ORIGIN, queryReturnDate);
+  const legs = { go: toLegInfo(outLeg), ret: toLegInfo(retLeg) };
+
+  const goTier = legTier(outLeg, cabin);
+  const retTier = legTier(retLeg, cabin);
+
+  // 酒店实时房量（关联房型才查；无包房配置 → null 不展示）
+  const hotelTier = useHotelAvailability(b.hotelRoomTypeId, queryGoDate, queryReturnDate);
+
+  // 实时机票单人来回价（搜不到用兜底价）
+  const fb = FALLBACK_PRICE[cabin];
+  const pricePerPerson = legPrice(outLeg, cabin, fb.go) + legPrice(retLeg, cabin, fb.ret);
 
   // 计算每个行项的金额
   const itemRows = b.items.map((item) => {
@@ -301,6 +373,9 @@ function ConfigurableBundleCard({
   const listTotal = flightTotal + hotelTotal + otherTotal;
   const total = listTotal - b.groundDiscount;
   const perPerson = pax > 0 ? Math.round(total / pax) : total;
+
+  // 售罄拦截：去/回任一航段或酒店售罄 → 禁止加购
+  const soldOut = goTier === 'SOLD_OUT' || retTier === 'SOLD_OUT' || hotelTier === 'SOLD_OUT';
 
   // 含什么 — 接送/签证按行项判断，中文客服全套餐标配
   const inclusions = [
@@ -343,12 +418,8 @@ function ConfigurableBundleCard({
           </div>
         </div>
 
-        {/* 人数 + 房间数 调整器 */}
+        {/* 房间数调整器（人数由顶部选择器统一控制） */}
         <div className="flex flex-col gap-2 items-end">
-          <div className="flex items-center gap-2 text-sm">
-            <span className="text-slate-600">出行人数</span>
-            <Stepper value={pax} min={1} max={9} onChange={setPax} />
-          </div>
           <div className="flex items-center gap-2 text-sm">
             <span className="text-slate-600">房间数</span>
             <Stepper value={rooms} min={1} max={5} onChange={setRooms} />
@@ -356,39 +427,59 @@ function ConfigurableBundleCard({
         </div>
       </div>
 
-      {/* 去/回航班号 + 时刻（搜得到班次才显示） */}
-      {(legs.go || legs.ret) && (
-        <div className="mt-3 grid gap-1.5 rounded-md bg-sky-50/70 p-2.5 text-xs text-slate-700 sm:grid-cols-2">
-          {legs.go && (
-            <div className="flex items-center gap-1.5">
-              <span className="rounded bg-sky-100 px-1.5 py-0.5 font-semibold text-sky-700">去程</span>
-              <span className="font-medium">{legs.go.flightNumber}</span>
-              <span>
-                {goDate} {formatLocalTime(legs.go.departureTime, legs.go.departureTz)} →{' '}
-                {formatLocalTime(legs.go.arrivalTime, legs.go.arrivalTz)}
+      {/* 出行日期一目了然：去 · 回 · N晚 */}
+      <div className="mt-3 text-xs font-medium text-slate-700">
+        🗓 {formatMonthDay(goDate)} 去 · {formatMonthDay(displayReturnDate)} 回 · {nights} 晚
+      </div>
+
+      {/* 去/回航班号 + 时刻 + 实时余位档位 */}
+      {(legs.go || legs.ret || goTier || retTier) && (
+        <div className="mt-2 grid gap-1.5 rounded-md bg-sky-50/70 p-2.5 text-xs text-slate-700 sm:grid-cols-2">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="rounded bg-sky-100 px-1.5 py-0.5 font-semibold text-sky-700">去程</span>
+            {legs.go && (
+              <>
+                <span className="font-medium">{legs.go.flightNumber}</span>
+                <span>
+                  {formatMonthDay(goDate)} {formatLocalTime(legs.go.departureTime, legs.go.departureTz)} →{' '}
+                  {formatLocalTime(legs.go.arrivalTime, legs.go.arrivalTz)}
+                </span>
+              </>
+            )}
+            {goTier && (
+              <span className={`rounded px-1.5 py-0.5 font-medium ${FLIGHT_TIER_CLASS[goTier]}`}>
+                {FLIGHT_TIER_LABEL[goTier]}
               </span>
-            </div>
-          )}
-          {legs.ret && (
-            <div className="flex items-center gap-1.5">
-              <span className="rounded bg-sky-100 px-1.5 py-0.5 font-semibold text-sky-700">回程</span>
-              <span className="font-medium">{legs.ret.flightNumber}</span>
-              <span>
-                {returnDate} {formatLocalTime(legs.ret.departureTime, legs.ret.departureTz)} →{' '}
-                {formatLocalTime(legs.ret.arrivalTime, legs.ret.arrivalTz)}
+            )}
+          </div>
+          <div className="flex flex-wrap items-center gap-1.5">
+            <span className="rounded bg-sky-100 px-1.5 py-0.5 font-semibold text-sky-700">回程</span>
+            {legs.ret && (
+              <>
+                <span className="font-medium">{legs.ret.flightNumber}</span>
+                <span>
+                  {formatMonthDay(displayReturnDate)} {formatLocalTime(legs.ret.departureTime, legs.ret.departureTz)} →{' '}
+                  {formatLocalTime(legs.ret.arrivalTime, legs.ret.arrivalTz)}
+                </span>
+              </>
+            )}
+            {retTier && (
+              <span className={`rounded px-1.5 py-0.5 font-medium ${FLIGHT_TIER_CLASS[retTier]}`}>
+                {FLIGHT_TIER_LABEL[retTier]}
               </span>
-            </div>
-          )}
+            )}
+          </div>
         </div>
       )}
 
-      {/* 酒店 + 房型（含双早 · 2人1间 · 床型尽量安排） */}
+      {/* 酒店 + 房型（含双早 · 2人1间 · 床型尽量安排）+ 实时房量档位 */}
       {(b.hotelRoomType || hotel) && (
         <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md bg-purple-50/70 p-2.5 text-xs text-slate-700">
           <span>
             🏨 <span className="font-medium">{b.hotelRoomType?.hotelName ?? hotel?.name}</span>
             {b.hotelRoomType?.name ? ` · ${b.hotelRoomType.name}` : ''} · 含双早 · 2 人 1 间
           </span>
+          <HotelTierBadge tier={hotelTier} />
           <span className="text-slate-500">（{BED_TYPE_NOTE}）</span>
           {hotel && (
             <button
@@ -446,7 +537,7 @@ function ConfigurableBundleCard({
         </div>
         <div className="mt-1 flex items-end justify-between">
           <div className="text-xs text-slate-500">
-            {pax} 人 · {rooms} 房 · {goDate} → {returnDate}
+            {pax} 人 · {rooms} 房 · {formatMonthDay(goDate)} → {formatMonthDay(displayReturnDate)}
           </div>
           <div className="text-right">
             {b.groundDiscount > 0 && (
@@ -458,18 +549,40 @@ function ConfigurableBundleCard({
         </div>
       </div>
 
+      {/* 售罄提示 */}
+      {soldOut && (
+        <p className="mt-2 text-right text-xs font-medium text-rose-600">该日期已售罄，换个日期试试</p>
+      )}
+
       <div className="mt-3 flex justify-end gap-2">
         <Link to="/cart" className="btn-secondary text-sm">查看购物车</Link>
         <button
           className="btn-primary text-sm"
-          onClick={() => onAdd({ pax, rooms, total, flightTotal, hotelTotal, otherTotal })}
+          disabled={soldOut}
+          title={soldOut ? '该日期已售罄，换个日期试试' : undefined}
+          onClick={() =>
+            onAdd({ pax, rooms, returnDate: displayReturnDate, total, flightTotal, hotelTotal, otherTotal })
+          }
         >
-          加入购物车
+          {soldOut ? '该日期已售罄' : '加入购物车'}
         </button>
       </div>
       </div>
     </article>
   );
+}
+
+/** 酒店房量档位徽章（与机票余位同纪律，只回档位不回数字；null/loading 不展示） */
+function HotelTierBadge({ tier }: { tier: ReturnType<typeof useHotelAvailability> }) {
+  if (tier === null || tier === 'loading') return null;
+  const map: Record<'SOLD_OUT' | 'LOW' | 'TIGHT' | 'AMPLE', { label: string; cls: string }> = {
+    SOLD_OUT: { label: '房量售罄', cls: 'bg-rose-100 text-rose-700' },
+    LOW: { label: '房量极少', cls: 'bg-orange-100 text-orange-700' },
+    TIGHT: { label: '房量紧张', cls: 'bg-amber-100 text-amber-800' },
+    AMPLE: { label: '房量充足', cls: 'bg-emerald-100 text-emerald-700' },
+  };
+  const { label, cls } = map[tier];
+  return <span className={`rounded px-1.5 py-0.5 font-medium ${cls}`}>{label}</span>;
 }
 
 // ── 酒店明细 modal（笔记式：照片 + 房型 + 设施，只看不订）──────────
@@ -616,4 +729,4 @@ function Stepper({
 }
 
 // RankBadge 已移除：dateRank A/B/C/D 是公司内部日期等级，不对客户展示
-// 余房档位：套餐数据没有余房口径，按"没有数据就不展示"处理（不造假数字）
+// 余房档位：关联房型 → 查后台房控；未关联或未配置包房 → 不展示（不造假数字）

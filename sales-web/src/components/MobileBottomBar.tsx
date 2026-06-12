@@ -11,8 +11,9 @@ export function MobileBottomBar() {
   const user = useAuth((s) => s.user);
 
   const tabs = [
-    { to: '/', label: '首页', emoji: '🏠', exact: true },
-    { to: '/bundles', label: '套餐', emoji: '🎁', exact: false },
+    // 套餐落地页即首页（运营要求默认首屏）
+    { to: '/', label: '套餐', emoji: '🎁', exact: true },
+    { to: '/flights', label: '机票', emoji: '✈️', exact: false },
     { to: '/cart', label: '购物车', emoji: '🛒', exact: false, badge: count },
     user
       ? { to: '/orders', label: '订单', emoji: '📋', exact: false }
