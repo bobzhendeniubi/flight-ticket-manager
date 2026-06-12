@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next';
 import { useAuth } from '../stores/auth';
 import { useCart } from '../stores/cart';
 import { MobilePreviewFrame } from './MobilePreviewFrame';
+import { MobileBottomBar } from './MobileBottomBar';
 import { AiAssistant } from './AiAssistant';
 
 const ROLE_LABEL: Record<string, string> = {
@@ -263,16 +264,20 @@ export function Layout() {
       </header>
 
       <main className="flex-1">
-        <div className="mx-auto w-full max-w-7xl px-4 py-8">
+        {/* 手机端底部留出 bottom bar 高度，避免内容被挡住 */}
+        <div className="mx-auto w-full max-w-7xl px-4 pt-8 pb-24 md:pb-8">
           <Outlet />
         </div>
       </main>
 
       <footer className="border-t border-slate-200 bg-white text-xs text-slate-500">
-        <div className="mx-auto max-w-7xl px-4 py-4">
+        <div className="mx-auto max-w-7xl px-4 py-4 pb-20 md:pb-4">
           世途旅行 · M2-M5 演示版 · © {new Date().getFullYear()}
         </div>
       </footer>
+
+      {/* 手机端底部导航：首页 / 套餐 / 购物车（带数量）/ 我的 */}
+      <MobileBottomBar />
 
       <AddToCartToast />
 
@@ -283,13 +288,14 @@ export function Layout() {
   );
 }
 
-/** 顶部购物车按钮 — 显示数量徽章，链到 /cart */
+/** 顶部购物车按钮 — 显示数量徽章，链到 /cart。
+ *  手机端隐藏（入口在 MobileBottomBar，拇指可达），桌面端保留。 */
 function CartButton() {
   const count = useCart((s) => s.items.reduce((sum, i) => sum + i.qty, 0));
   return (
     <Link
       to="/cart"
-      className="relative inline-flex items-center gap-1 rounded-md border border-slate-200 px-3 py-1.5 text-slate-700 hover:border-brand hover:text-brand"
+      className="relative hidden md:inline-flex items-center gap-1 rounded-md border border-slate-200 px-3 py-1.5 text-slate-700 hover:border-brand hover:text-brand"
     >
       <span aria-hidden>🛒</span>
       <span className="hidden md:inline">购物车</span>
@@ -318,7 +324,8 @@ function AddToCartToast() {
   }, []);
   if (!msg) return null;
   return (
-    <div className="fixed bottom-6 right-6 z-50 rounded-md bg-slate-900 px-4 py-2 text-sm text-white shadow-lg">
+    // 手机端抬高到 bottom bar 之上
+    <div className="fixed bottom-20 right-4 md:bottom-6 md:right-6 z-50 rounded-md bg-slate-900 px-4 py-2 text-sm text-white shadow-lg">
       {msg}
     </div>
   );

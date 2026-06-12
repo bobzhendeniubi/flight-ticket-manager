@@ -24,6 +24,31 @@ export const createFlightBodySchema = z.object({
 });
 export type CreateFlightBody = z.infer<typeof createFlightBodySchema>;
 
+// ── 行李规则（航班 × 舱等；kg / 件数 / 手提都可单独留空）────────────────
+export const baggagePolicyItemSchema = z.object({
+  cabin: z.nativeEnum(CabinClass),
+  checkedKg: z.number().int().min(0).max(999).nullable().optional(),
+  checkedPieces: z.number().int().min(0).max(99).nullable().optional(),
+  carryOnKg: z.number().int().min(0).max(99).nullable().optional(),
+  note: z.string().max(500).nullable().optional(),
+});
+export type BaggagePolicyItem = z.infer<typeof baggagePolicyItemSchema>;
+
+// PUT 整体替换：数组里没出现的舱等会被删除；同一舱等不可重复
+export const upsertBaggagePoliciesBodySchema = z
+  .array(baggagePolicyItemSchema)
+  .max(4)
+  .superRefine((items, ctx) => {
+    const seen = new Set<CabinClass>();
+    for (const item of items) {
+      if (seen.has(item.cabin)) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, message: `舱等 ${item.cabin} 重复` });
+      }
+      seen.add(item.cabin);
+    }
+  });
+export type UpsertBaggagePoliciesBody = z.infer<typeof upsertBaggagePoliciesBodySchema>;
+
 export const createScheduleBodySchema = z.object({
   flightId: z.string().min(1),
   // ISO 字符串，本地时间带时区或 UTC

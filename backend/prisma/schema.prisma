@@ -368,11 +368,29 @@ model Flight {
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
-  schedules   FlightSchedule[]
-  costPeriods FlightCostPeriod[]
+  schedules       FlightSchedule[]
+  costPeriods     FlightCostPeriod[]
+  baggagePolicies FlightBaggagePolicy[]
 
   @@unique([flightNumber])
   @@index([originCode, destinationCode])
+}
+
+// 行李规则 — 按 航班 × 舱等 配置（公斤 / 件数都可单独留空）
+model FlightBaggagePolicy {
+  id            String     @id @default(cuid())
+  flightId      String
+  cabin         CabinClass
+  checkedKg     Int? // 托运额度（kg/人）
+  checkedPieces Int? // 托运件数（件/人）
+  carryOnKg     Int? // 手提额度（kg/人）
+  note          String? // 补充说明（如"超件 ¥xx/件"）
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  flight Flight @relation(fields: [flightId], references: [id], onDelete: Cascade)
+
+  @@unique([flightId, cabin])
 }
 
 model FlightSchedule {
@@ -674,6 +692,9 @@ model Bundle {
   // 套餐关联酒店房型 — 下单时把房型+入住日期盖到订单行上，房控板自动计入套餐占房
   hotelRoomTypeId String?
   hotelNights     Int? // 默认入住晚数（客户没填回程日期时按 goDate + hotelNights 推 checkOut）
+  // 自愿升级展示价（CNY）— 单房差/晚、升舱/航段；null = 该套餐不展示升级项
+  singleSupplementCnyPerNight Decimal? @db.Decimal(10, 2)
+  cabinUpgradeCnyPerLeg       Decimal? @db.Decimal(10, 2)
   isActive       Boolean  @default(true)
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt

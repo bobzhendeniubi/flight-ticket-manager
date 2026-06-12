@@ -89,6 +89,9 @@ export const createBundleBodySchema = z.object({
   // 套餐关联酒店房型（房控板计入套餐占房）；null = 解除关联
   hotelRoomTypeId: z.string().min(1).nullable().optional(),
   hotelNights: z.number().int().min(1).max(30).nullable().optional(),
+  // 自愿升级展示价（CNY）：单房差/晚、升舱/航段；null = 不展示该升级项
+  singleSupplementCnyPerNight: z.number().nonnegative().max(1_000_000).nullable().optional(),
+  cabinUpgradeCnyPerLeg: z.number().nonnegative().max(1_000_000).nullable().optional(),
   isActive: z.boolean().default(true),
 });
 export type CreateBundleBody = z.infer<typeof createBundleBodySchema>;

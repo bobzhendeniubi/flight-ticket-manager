@@ -2,7 +2,12 @@ import { CabinClass, Prisma, SeatLockStatus } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { BadRequestError, ConflictError, NotFoundError } from '../../lib/errors.js';
 import { PricingService } from '../pricing/pricing.service.js';
-import type { CreateFlightBody, CreateScheduleBody, FlightSearchQuery } from './flights.schemas.js';
+import type {
+  BaggagePolicyItem,
+  CreateFlightBody,
+  CreateScheduleBody,
+  FlightSearchQuery,
+} from './flights.schemas.js';
 
 const pricingService = new PricingService();
 
@@ -80,6 +85,15 @@ export class FlightService {
       : [];
     const lockedBySeatClass = new Map(lockSums.map((r) => [r.seatClassId, r._sum.qty ?? 0]));
 
+    // 行李规则：视野内所有航班一次性查出（flightId+cabin 定位），避免 N+1
+    const flightIds = [...new Set(schedules.map((s) => s.flightId))];
+    const baggageRows = flightIds.length > 0
+      ? await prisma.flightBaggagePolicy.findMany({ where: { flightId: { in: flightIds } } })
+      : [];
+    const baggageByFlightCabin = new Map(
+      baggageRows.map((b) => [`${b.flightId}:${b.cabin}`, b]),
+    );
+
     // 异步 map — 每个班次的每个舱位都要算动态价
     const mapped = await Promise.all(
       schedules.map(async (s) => {
@@ -104,6 +118,7 @@ export class FlightService {
             } catch {
               // fallback to basePrice
             }
+            const baggage = baggageByFlightCabin.get(`${s.flightId}:${c.cabin}`);
             return {
               seatClassId: c.id, // 锁位接口（POST /seat-locks）需要
               cabin: c.cabin,
@@ -117,6 +132,15 @@ export class FlightService {
               dateRank,
               dateMultiplier,
               totalForQty,
+              // 行李规则（按 航班×舱等 配置；未配置 = null，前端不展示）
+              baggage: baggage
+                ? {
+                    checkedKg: baggage.checkedKg,
+                    checkedPieces: baggage.checkedPieces,
+                    carryOnKg: baggage.carryOnKg,
+                    note: baggage.note,
+                  }
+                : null,
             };
           }),
         );
@@ -248,6 +272,49 @@ export class FlightService {
       data: { ticketingCap },
       select: { id: true, ticketingCap: true },
     });
+  }
+
+  /** 行李规则：列出某航班全部舱等配置（ADMIN/STAFF 维护页用） */
+  async listBaggagePolicies(flightId: string) {
+    const flight = await prisma.flight.findUnique({ where: { id: flightId }, select: { id: true } });
+    if (!flight) throw new NotFoundError('航班不存在');
+    return prisma.flightBaggagePolicy.findMany({
+      where: { flightId },
+      orderBy: { cabin: 'asc' },
+    });
+  }
+
+  /** 行李规则：整体替换式 upsert — 数组里未出现的舱等删除，出现的按 flightId+cabin upsert */
+  async upsertBaggagePolicies(flightId: string, items: BaggagePolicyItem[]) {
+    const flight = await prisma.flight.findUnique({ where: { id: flightId }, select: { id: true } });
+    if (!flight) throw new NotFoundError('航班不存在');
+
+    const cabins = items.map((i) => i.cabin);
+    await prisma.$transaction([
+      prisma.flightBaggagePolicy.deleteMany({
+        where: { flightId, cabin: { notIn: cabins } },
+      }),
+      ...items.map((i) =>
+        prisma.flightBaggagePolicy.upsert({
+          where: { flightId_cabin: { flightId, cabin: i.cabin } },
+          create: {
+            flightId,
+            cabin: i.cabin,
+            checkedKg: i.checkedKg ?? null,
+            checkedPieces: i.checkedPieces ?? null,
+            carryOnKg: i.carryOnKg ?? null,
+            note: i.note ?? null,
+          },
+          update: {
+            checkedKg: i.checkedKg ?? null,
+            checkedPieces: i.checkedPieces ?? null,
+            carryOnKg: i.carryOnKg ?? null,
+            note: i.note ?? null,
+          },
+        }),
+      ),
+    ]);
+    return this.listBaggagePolicies(flightId);
   }
 
   async deleteSchedule(scheduleId: string) {

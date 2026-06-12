@@ -8,6 +8,7 @@ import {
   createFlightBodySchema,
   createScheduleBodySchema,
   flightSearchQuerySchema,
+  upsertBaggagePoliciesBodySchema,
 } from './flights.schemas.js';
 
 export const flightRoutes: FastifyPluginAsync = async (app) => {
@@ -77,6 +78,29 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
         return { schedules: sanitized };
       }
       return { schedules };
+    },
+  );
+
+  // ── 行李规则（航班 × 舱等；ADMIN/STAFF 维护）──
+  app.get(
+    '/:flightId/baggage-policies',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    async (req) => {
+      const { flightId } = req.params as { flightId: string };
+      const policies = await service.listBaggagePolicies(flightId);
+      return { policies };
+    },
+  );
+
+  // PUT 整体替换：body 是 [{cabin, checkedKg, checkedPieces, carryOnKg, note}]；未出现的舱等删除
+  app.put(
+    '/:flightId/baggage-policies',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    async (req) => {
+      const { flightId } = req.params as { flightId: string };
+      const items = upsertBaggagePoliciesBodySchema.parse(req.body);
+      const policies = await service.upsertBaggagePolicies(flightId, items);
+      return { policies };
     },
   );
 

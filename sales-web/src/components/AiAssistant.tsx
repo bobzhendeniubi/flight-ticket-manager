@@ -297,7 +297,7 @@ export function AiAssistant() {
         <button
           type="button"
           onClick={() => setOpen(true)}
-          className="fixed bottom-4 right-4 sm:bottom-6 sm:right-6 z-40 flex items-center gap-2 rounded-full bg-gradient-to-br from-blue-600 to-purple-600 p-3 sm:px-5 sm:py-3 text-white shadow-lg hover:shadow-xl transition"
+          className="fixed bottom-20 right-4 md:bottom-6 md:right-6 z-40 flex items-center gap-2 rounded-full bg-gradient-to-br from-blue-600 to-purple-600 p-3 sm:px-5 sm:py-3 text-white shadow-lg hover:shadow-xl transition"
           aria-label="AI 助手"
         >
           <span className="text-xl">🤖</span>

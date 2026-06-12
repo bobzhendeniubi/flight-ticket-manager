@@ -83,6 +83,14 @@ export interface AuthResult {
 // ── 余位档位（服务端权威口径；买家只看档位，不展示精确余票数）──────────────
 export type AvailabilityTier = 'AMPLE' | 'TIGHT' | 'LOW' | 'VERY_LOW' | 'SOLD_OUT';
 
+/** 行李规则（按 航班×舱等 配置；kg / 件数可分别为空，未配置整体为 null） */
+export interface BaggagePolicyInfo {
+  checkedKg: number | null;
+  checkedPieces: number | null;
+  carryOnKg: number | null;
+  note: string | null;
+}
+
 export interface FlightSeatAvailability {
   seatClassId: string; // 锁位接口（POST /seat-locks）需要
   cabin: CabinClass;
@@ -96,6 +104,8 @@ export interface FlightSeatAvailability {
   dateRank: string;
   dateMultiplier: number;
   totalForQty: number;
+  /** 行李额（未配置 = null / 老缓存可能缺字段，前端按"不展示"处理） */
+  baggage?: BaggagePolicyInfo | null;
 }
 
 export interface SeatBreakdown {
@@ -486,6 +496,11 @@ export interface Bundle {
   groundDiscount: string;
   suitableFor: string | null;
   isActive: boolean;
+  /** 自愿付费升级展示价（CNY 字符串；null = 不展示，收费仍走线下人工） */
+  singleSupplementCnyPerNight?: string | null;
+  cabinUpgradeCnyPerLeg?: string | null;
+  /** 套餐关联酒店房型（展示酒店名 + 房型名；null = 未关联） */
+  hotelRoomType?: { id: string; name: string; hotelName: string } | null;
 }
 
 // ── 结算 / 佣金 ────────────────────────────────────────────────────────────

@@ -109,6 +109,32 @@ export interface AdminSchedule {
   seatClasses: AdminScheduleSeat[];
 }
 
+// ── 行李规则（航班 × 舱等）── 与 backend flights.service listBaggagePolicies 对齐
+export interface FlightBaggagePolicy {
+  id: string;
+  flightId: string;
+  cabin: CabinClass;
+  /** 托运额度（kg/人）；null = 未配置 */
+  checkedKg: number | null;
+  /** 托运件数（件/人）；null = 未配置 */
+  checkedPieces: number | null;
+  /** 手提额度（kg/人）；null = 未配置 */
+  carryOnKg: number | null;
+  /** 补充说明（如"超件 ¥xx/件"） */
+  note: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** PUT 整体替换 body 的单项；数组里未出现的舱等会被删除 */
+export interface BaggagePolicyInput {
+  cabin: CabinClass;
+  checkedKg?: number | null;
+  checkedPieces?: number | null;
+  carryOnKg?: number | null;
+  note?: string | null;
+}
+
 // ── 批量散客建单 ──
 export interface BatchOrderPassenger {
   fullName: string;
@@ -589,6 +615,10 @@ export interface Bundle {
   hotelNights: number | null;
   /** 展示用：服务端联表返回的房型名 + 酒店名；null = 不关联 */
   hotelRoomType: { id: string; name: string; hotelName: string } | null;
+  /** 自愿升级展示价：单房差（CNY/晚，decimal 字符串）；null = 不展示 */
+  singleSupplementCnyPerNight: string | null;
+  /** 自愿升级展示价：升舱（CNY/程，decimal 字符串）；null = 不展示 */
+  cabinUpgradeCnyPerLeg: string | null;
   isActive: boolean;
   createdAt: string;
 }
@@ -767,6 +797,16 @@ export const api = {
       seatClasses: Array<{ cabin: CabinClass; capacity: number; basePrice: number }>;
     },
   ) => apiFetch<{ schedule: AdminSchedule }>('/flights/schedules', { method: 'POST', token, body }),
+  // 行李规则（航班 × 舱等；ADMIN/STAFF 维护）
+  getBaggagePolicies: (token: string, flightId: string) =>
+    apiFetch<{ policies: FlightBaggagePolicy[] }>(`/flights/${flightId}/baggage-policies`, { token }),
+  // PUT 整体替换：数组里未出现的舱等会被删除
+  saveBaggagePolicies: (token: string, flightId: string, items: BaggagePolicyInput[]) =>
+    apiFetch<{ policies: FlightBaggagePolicy[] }>(`/flights/${flightId}/baggage-policies`, {
+      method: 'PUT',
+      token,
+      body: items,
+    }),
 
   // Agents
   listAgents: (token: string) => apiFetch<{ agents: AgentListItem[] }>('/agents/', { token }),

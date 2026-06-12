@@ -11,6 +11,7 @@ import { usePassengers } from '../stores/passengers';
 import { ocrPassport } from '../lib/passportOcr';
 import { api, ApiError, type CreateOrderInput } from '../lib/api';
 import { safeRandomUUID } from '../lib/uuid';
+import { BookingNotices } from '../components/BookingNotices';
 
 interface PassengerForm {
   fullName: string;
@@ -474,8 +475,11 @@ export function CheckoutPage() {
           )}
         </section>
 
+        {/* 预订须知 / 扣损规则 / 值机提示（纯展示，提交逻辑不动） */}
+        <BookingNotices />
+
         {/* 手机端紧凑：返回 / 合计 + 按钮 在 360px 屏幕也不挤 */}
-        <div className="sticky bottom-0 bg-white border border-slate-200 rounded-md px-3 py-3 sm:px-4 shadow-lg">
+        <div className="sticky bottom-0 z-40 bg-white border border-slate-200 rounded-md px-3 py-3 sm:px-4 shadow-lg">
           <div className="flex items-center justify-between gap-2 sm:gap-4">
             <Link to="/cart" className="text-xs sm:text-sm text-slate-500 hover:text-brand whitespace-nowrap">
               ← <span className="hidden sm:inline">返回</span>购物车

@@ -842,6 +842,10 @@ export interface MockBundle {
   hotelNights?: number | null;
   /** 展示用：服务端返回的房型名 + 酒店名 */
   hotelRoomType?: { id: string; name: string; hotelName: string } | null;
+  /** 自愿升级展示价：单房差（¥/晚）；null/缺省 = 不展示 */
+  singleSupplementCnyPerNight?: number | null;
+  /** 自愿升级展示价：升舱（¥/程）；null/缺省 = 不展示 */
+  cabinUpgradeCnyPerLeg?: number | null;
 }
 
 

@@ -1,5 +1,5 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
-import { api, ApiError, type AdminFlight, type CabinClass } from '../lib/api';
+import { api, ApiError, type AdminFlight, type BaggagePolicyInput, type CabinClass, type FlightBaggagePolicy } from '../lib/api';
 import { AIRPORT_OPTIONS, CABIN_LABEL, airportLabel, formatLocalDate, formatLocalTime } from '../lib/airports';
 import { useAuth } from '../stores/auth';
 import { NumberInput } from '../components/NumberInput';
@@ -34,6 +34,7 @@ export function FlightsPage() {
   const [showNewFlight, setShowNewFlight] = useState(false);
   const [addingScheduleFor, setAddingScheduleFor] = useState<string | null>(null);
   const [bulkAddingFor, setBulkAddingFor] = useState<string | null>(null);
+  const [baggageFor, setBaggageFor] = useState<string | null>(null);
 
   const reload = useCallback(async () => {
     if (!tokens) return;
@@ -146,6 +147,13 @@ export function FlightsPage() {
                 <button type="button" className="btn-secondary text-sm" onClick={() => toggleExpand(f.id)}>
                   {expanded === f.id ? '收起' : '查看班次'}
                 </button>
+                <button
+                  type="button"
+                  className="btn-secondary text-sm"
+                  onClick={() => setBaggageFor((prev) => (prev === f.id ? null : f.id))}
+                >
+                  🧳 行李规则
+                </button>
                 {user.role === 'ADMIN' && (
                   <>
                     <button
@@ -196,6 +204,10 @@ export function FlightsPage() {
                   if (expanded === f.id) await refreshSchedules(f.id);
                 }}
               />
+            )}
+
+            {baggageFor === f.id && (
+              <BaggagePolicyEditor flight={f} onClose={() => setBaggageFor(null)} />
             )}
 
             {expanded === f.id && (
@@ -778,6 +790,190 @@ function BulkScheduleForm({
           </button>
         </div>
       </form>
+    </section>
+  );
+}
+
+// ── 行李规则（航班 × 舱等；ADMIN/STAFF 维护）────────────────────────────
+const BAGGAGE_CABINS: CabinClass[] = ['ECONOMY', 'PREMIUM_ECONOMY', 'BUSINESS', 'FIRST'];
+
+interface BaggageRowDraft {
+  enabled: boolean;
+  checkedKg: number | null;
+  checkedPieces: number | null;
+  carryOnKg: number | null;
+  note: string;
+}
+
+function policiesToDraft(policies: FlightBaggagePolicy[]): Record<CabinClass, BaggageRowDraft> {
+  const draft = {} as Record<CabinClass, BaggageRowDraft>;
+  for (const cabin of BAGGAGE_CABINS) {
+    const p = policies.find((x) => x.cabin === cabin);
+    draft[cabin] = {
+      enabled: !!p,
+      checkedKg: p?.checkedKg ?? null,
+      checkedPieces: p?.checkedPieces ?? null,
+      carryOnKg: p?.carryOnKg ?? null,
+      note: p?.note ?? '',
+    };
+  }
+  return draft;
+}
+
+function BaggagePolicyEditor({ flight, onClose }: { flight: AdminFlight; onClose: () => void }) {
+  const tokens = useAuth((s) => s.tokens);
+  const [rows, setRows] = useState<Record<CabinClass, BaggageRowDraft> | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [savedMsg, setSavedMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!tokens) return;
+    api
+      .getBaggagePolicies(tokens.accessToken, flight.id)
+      .then((res) => {
+        if (!cancelled) setRows(policiesToDraft(res.policies));
+      })
+      .catch((e) => {
+        if (!cancelled) setErr(e instanceof ApiError ? e.message : '加载行李规则失败');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [tokens, flight.id]);
+
+  const updateRow = (cabin: CabinClass, patch: Partial<BaggageRowDraft>) => {
+    setRows((prev) => (prev ? { ...prev, [cabin]: { ...prev[cabin], ...patch } } : prev));
+    setSavedMsg(null);
+  };
+
+  const onSave = async () => {
+    if (!tokens || !rows || saving) return;
+    setSaving(true);
+    setErr(null);
+    setSavedMsg(null);
+    try {
+      const items: BaggagePolicyInput[] = BAGGAGE_CABINS.filter((c) => rows[c].enabled).map((c) => ({
+        cabin: c,
+        checkedKg: rows[c].checkedKg,
+        checkedPieces: rows[c].checkedPieces,
+        carryOnKg: rows[c].carryOnKg,
+        note: rows[c].note.trim() ? rows[c].note.trim() : null,
+      }));
+      const res = await api.saveBaggagePolicies(tokens.accessToken, flight.id, items);
+      setRows(policiesToDraft(res.policies));
+      setSavedMsg('✅ 已保存');
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : '保存失败');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <section className="mt-4 rounded-lg border border-brand/30 bg-slate-50 p-4">
+      <div className="flex items-center justify-between">
+        <h3 className="font-medium text-slate-900">
+          🧳 <span className="text-brand">{flight.flightNumber}</span> 行李规则（按舱等配置；kg / 件数 / 手提可分别留空）
+        </h3>
+        <button type="button" className="text-slate-400 hover:text-slate-700 text-xl" onClick={onClose}>×</button>
+      </div>
+
+      {err && <div className="mt-3 rounded-md bg-red-50 px-3 py-2 text-sm text-red-700">{err}</div>}
+      {!rows && !err && <div className="mt-3 text-sm text-slate-500">加载行李规则中…</div>}
+
+      {rows && (
+        <>
+          <div className="mt-3 overflow-x-auto">
+            <table className="min-w-full divide-y divide-slate-200 text-sm">
+              <thead className="bg-slate-100 text-left text-xs font-medium uppercase text-slate-500">
+                <tr>
+                  <th className="px-3 py-2">舱等</th>
+                  <th className="px-3 py-2">启用</th>
+                  <th className="px-3 py-2">托运 (kg/人)</th>
+                  <th className="px-3 py-2">托运件数 (件/人)</th>
+                  <th className="px-3 py-2">手提 (kg/人)</th>
+                  <th className="px-3 py-2">补充说明</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-200 bg-white">
+                {BAGGAGE_CABINS.map((cabin) => {
+                  const row = rows[cabin];
+                  return (
+                    <tr key={cabin} className={row.enabled ? '' : 'opacity-50'}>
+                      <td className="px-3 py-2 font-medium text-slate-900 whitespace-nowrap">
+                        {CABIN_LABEL[cabin] ?? cabin}
+                      </td>
+                      <td className="px-3 py-2">
+                        <input
+                          type="checkbox"
+                          checked={row.enabled}
+                          onChange={(e) => updateRow(cabin, { enabled: e.target.checked })}
+                        />
+                      </td>
+                      <td className="px-3 py-2">
+                        <NumberInput
+                          min={0}
+                          max={999}
+                          className="input w-24"
+                          placeholder="如 23"
+                          value={row.checkedKg}
+                          onChange={(n) => updateRow(cabin, { checkedKg: n })}
+                          disabled={!row.enabled}
+                          integerOnly
+                        />
+                      </td>
+                      <td className="px-3 py-2">
+                        <NumberInput
+                          min={0}
+                          max={99}
+                          className="input w-24"
+                          placeholder="如 1"
+                          value={row.checkedPieces}
+                          onChange={(n) => updateRow(cabin, { checkedPieces: n })}
+                          disabled={!row.enabled}
+                          integerOnly
+                        />
+                      </td>
+                      <td className="px-3 py-2">
+                        <NumberInput
+                          min={0}
+                          max={99}
+                          className="input w-24"
+                          placeholder="如 7"
+                          value={row.carryOnKg}
+                          onChange={(n) => updateRow(cabin, { carryOnKg: n })}
+                          disabled={!row.enabled}
+                          integerOnly
+                        />
+                      </td>
+                      <td className="px-3 py-2">
+                        <input
+                          className="input w-full min-w-[180px]"
+                          maxLength={500}
+                          placeholder="如 超件 ¥200/件"
+                          value={row.note}
+                          onChange={(e) => updateRow(cabin, { note: e.target.value })}
+                          disabled={!row.enabled}
+                        />
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <div className="mt-3 flex items-center justify-end gap-3">
+            {savedMsg && <span className="text-sm text-green-700">{savedMsg}</span>}
+            <span className="text-xs text-slate-500">未启用的舱等保存后将删除其规则</span>
+            <button type="button" className="btn-secondary" onClick={onClose}>关闭</button>
+            <button type="button" className="btn-primary" disabled={saving} onClick={onSave}>
+              {saving ? '保存中…' : '保存行李规则'}
+            </button>
+          </div>
+        </>
+      )}
     </section>
   );
 }

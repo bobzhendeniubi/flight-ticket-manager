@@ -104,6 +104,9 @@ function bundleApiToMock(b: ApiBundle): MockBundle {
     hotelRoomTypeId: b.hotelRoomTypeId,
     hotelNights: b.hotelNights,
     hotelRoomType: b.hotelRoomType,
+    singleSupplementCnyPerNight:
+      b.singleSupplementCnyPerNight != null ? Number(b.singleSupplementCnyPerNight) : null,
+    cabinUpgradeCnyPerLeg: b.cabinUpgradeCnyPerLeg != null ? Number(b.cabinUpgradeCnyPerLeg) : null,
   };
 }
 
@@ -261,6 +264,8 @@ export function ProductsPage() {
           groundDiscount: n.groundDiscount, suitableFor: n.suitableFor,
           hotelRoomTypeId: n.hotelRoomTypeId ?? null,
           hotelNights: n.hotelRoomTypeId ? n.hotelNights ?? 1 : null,
+          singleSupplementCnyPerNight: n.singleSupplementCnyPerNight ?? null,
+          cabinUpgradeCnyPerLeg: n.cabinUpgradeCnyPerLeg ?? null,
         });
       }
       for (const n of next) {
@@ -272,6 +277,8 @@ export function ProductsPage() {
             groundDiscount: n.groundDiscount, suitableFor: n.suitableFor,
             hotelRoomTypeId: n.hotelRoomTypeId ?? null,
             hotelNights: n.hotelRoomTypeId ? n.hotelNights ?? 1 : null,
+            singleSupplementCnyPerNight: n.singleSupplementCnyPerNight ?? null,
+            cabinUpgradeCnyPerLeg: n.cabinUpgradeCnyPerLeg ?? null,
             isActive: n.active,
           });
         }
@@ -724,6 +731,18 @@ function BundleCard({
         </div>
       )}
 
+      {(bundle.singleSupplementCnyPerNight != null || bundle.cabinUpgradeCnyPerLeg != null) && (
+        <div className="mt-1 text-xs text-slate-600">
+          {bundle.singleSupplementCnyPerNight != null && (
+            <>🛏️ 单房差 ¥{bundle.singleSupplementCnyPerNight.toLocaleString()}/晚</>
+          )}
+          {bundle.singleSupplementCnyPerNight != null && bundle.cabinUpgradeCnyPerLeg != null && ' · '}
+          {bundle.cabinUpgradeCnyPerLeg != null && (
+            <>💺 升舱 ¥{bundle.cabinUpgradeCnyPerLeg.toLocaleString()}/程</>
+          )}
+        </div>
+      )}
+
       <div className="mt-4 rounded-md bg-slate-50 p-3">
         <div className="flex items-center justify-between text-sm text-slate-600">
           <span>单买总价</span>
@@ -767,6 +786,9 @@ function NewBundleWizard({
   const [suitableFor, setSuitableFor] = useState('2 大人');
   const [hotelRoomTypeId, setHotelRoomTypeId] = useState('');
   const [hotelNights, setHotelNights] = useState<number | null>(3);
+  // 自愿升级展示价（CNY；留空 = 前台不展示该升级项）
+  const [singleSupplement, setSingleSupplement] = useState<number | null>(null);
+  const [cabinUpgrade, setCabinUpgrade] = useState<number | null>(null);
   // Local draft shape allowing null for in-progress numeric edits
   type DraftBundleItem = Omit<BundleItem, 'qty' | 'unitPrice'> & { qty: number | null; unitPrice: number | null };
   const [items, setItems] = useState<DraftBundleItem[]>([
@@ -835,6 +857,31 @@ function NewBundleWizard({
                 <NumberInput min={1} max={30} className="input" value={hotelNights} onChange={(n) => setHotelNights(n)} integerOnly />
               </div>
             )}
+          </div>
+
+          <div className="grid gap-3 md:grid-cols-2">
+            <div>
+              <label className="label">单房差 (¥/晚)</label>
+              <NumberInput
+                min={0}
+                max={1000000}
+                className="input"
+                placeholder="留空 = 不展示"
+                value={singleSupplement}
+                onChange={(n) => setSingleSupplement(n)}
+              />
+            </div>
+            <div>
+              <label className="label">升舱 (¥/程)</label>
+              <NumberInput
+                min={0}
+                max={1000000}
+                className="input"
+                placeholder="留空 = 不展示"
+                value={cabinUpgrade}
+                onChange={(n) => setCabinUpgrade(n)}
+              />
+            </div>
           </div>
 
           <div>
@@ -955,6 +1002,8 @@ function NewBundleWizard({
                   active: true,
                   hotelRoomTypeId: hotelRoomTypeId || null,
                   hotelNights: hotelRoomTypeId ? hotelNights : null,
+                  singleSupplementCnyPerNight: singleSupplement,
+                  cabinUpgradeCnyPerLeg: cabinUpgrade,
                 })
               }
             >

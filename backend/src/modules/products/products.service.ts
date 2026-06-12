@@ -364,6 +364,10 @@ export class ProductsService {
           suitableFor: body.suitableFor,
           hotelRoomTypeId: body.hotelRoomTypeId ?? null,
           hotelNights: body.hotelNights ?? null,
+          singleSupplementCnyPerNight:
+            body.singleSupplementCnyPerNight != null ? new Prisma.Decimal(body.singleSupplementCnyPerNight) : null,
+          cabinUpgradeCnyPerLeg:
+            body.cabinUpgradeCnyPerLeg != null ? new Prisma.Decimal(body.cabinUpgradeCnyPerLeg) : null,
           isActive: body.isActive,
         },
         include: BUNDLE_ROOM_INCLUDE,
@@ -387,6 +391,14 @@ export class ProductsService {
     if (body.suitableFor !== undefined) data.suitableFor = body.suitableFor;
     if (body.hotelRoomTypeId !== undefined) data.hotelRoomTypeId = body.hotelRoomTypeId;
     if (body.hotelNights !== undefined) data.hotelNights = body.hotelNights;
+    if (body.singleSupplementCnyPerNight !== undefined) {
+      data.singleSupplementCnyPerNight =
+        body.singleSupplementCnyPerNight !== null ? new Prisma.Decimal(body.singleSupplementCnyPerNight) : null;
+    }
+    if (body.cabinUpgradeCnyPerLeg !== undefined) {
+      data.cabinUpgradeCnyPerLeg =
+        body.cabinUpgradeCnyPerLeg !== null ? new Prisma.Decimal(body.cabinUpgradeCnyPerLeg) : null;
+    }
     if (body.isActive !== undefined) data.isActive = body.isActive;
     const b = await prisma.bundle.update({
       where: { id },
@@ -453,6 +465,9 @@ function serializeBundle(b: BundleWithRoom) {
   return {
     ...rest,
     groundDiscount: b.groundDiscount.toString(),
+    // 自愿升级展示价（CNY；null = 不展示）
+    singleSupplementCnyPerNight: b.singleSupplementCnyPerNight?.toString() ?? null,
+    cabinUpgradeCnyPerLeg: b.cabinUpgradeCnyPerLeg?.toString() ?? null,
     items: b.items,
     // admin-web 表单需要房型名 + 酒店名做展示
     hotelRoomType: hotelRoomType
