@@ -71,7 +71,8 @@ export interface CostBreakdown {
   transfer: number;           // 车费
   guideService: number;       // 导游服务费（OrderCostItem.GUIDE_SERVICE）
   compGift: number;           // 赠送费用
-  handlingFee: number;        // 手续费
+  handlingFee: number;        // 手续费（收款/汇款结算）
+  operationFee: number;       // 操作费（OrderCostItem.OPERATION_FEE，每单固定计提）
   other: number;              // 其他
   total: number;              // 总和
 }
@@ -252,7 +253,7 @@ export async function getFinancesSummary(
     outboundCharter: 0, returnCharter: 0, outboundTax: 0, returnTax: 0,
     peakSurcharge: 0, fuel: 0, aircraftAdjust: 0, takeoffDiscount: 0,
     hotel: 0, visa: 0, transfer: 0,
-    guideService: 0, compGift: 0, handlingFee: 0, other: 0, total: 0,
+    guideService: 0, compGift: 0, handlingFee: 0, operationFee: 0, other: 0, total: 0,
   };
   let revenueCny = 0;
   let costCny = 0;
@@ -389,6 +390,7 @@ export async function getFinancesSummary(
         case 'GUIDE_SERVICE': cost.guideService += a; break;
         case 'COMP_GIFT':     cost.compGift += a; break;
         case 'HANDLING_FEE':  cost.handlingFee += a; break;
+        case 'OPERATION_FEE': cost.operationFee += a; break;
         case 'OTHER':         cost.other += a; break;
       }
     }
@@ -406,7 +408,7 @@ export async function getFinancesSummary(
     cost.outboundCharter + cost.returnCharter + cost.outboundTax + cost.returnTax +
     cost.peakSurcharge + cost.fuel + cost.aircraftAdjust + cost.takeoffDiscount +
     cost.hotel + cost.visa + cost.transfer +
-    cost.guideService + cost.compGift + cost.handlingFee + cost.other,
+    cost.guideService + cost.compGift + cost.handlingFee + cost.operationFee + cost.other,
   );
 
   // 空座沉没：仍用班次维度 + resolution（charter 可能来自 period）

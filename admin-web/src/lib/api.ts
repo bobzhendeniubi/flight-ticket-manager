@@ -1379,7 +1379,7 @@ export interface RevenueBreakdown {
   uncategorized: number;
   total: number;
 }
-/** 贺帅口径：成本细分（15 项 + 总和） */
+/** 贺帅口径：成本细分（16 项 + 总和） */
 export interface CostBreakdown {
   outboundCharter: number;
   returnCharter: number;
@@ -1395,6 +1395,7 @@ export interface CostBreakdown {
   guideService: number;
   compGift: number;
   handlingFee: number;
+  operationFee: number;
   other: number;
   total: number;
 }
@@ -1523,7 +1524,12 @@ export interface CostPeriodWriteInput {
 }
 
 /** 订单杂项成本（财务录入） */
-export type OrderCostCategory = 'GUIDE_SERVICE' | 'COMP_GIFT' | 'HANDLING_FEE' | 'OTHER';
+export type OrderCostCategory =
+  | 'GUIDE_SERVICE'
+  | 'COMP_GIFT'
+  | 'HANDLING_FEE'
+  | 'OPERATION_FEE'
+  | 'OTHER';
 export interface OrderCostItem {
   id: string;
   orderId: string;

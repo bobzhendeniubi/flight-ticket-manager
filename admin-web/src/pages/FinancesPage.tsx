@@ -1443,7 +1443,7 @@ function RevenueBreakdownTable({ data }: { data: FinanceSummary }) {
   );
 }
 
-// ── Summary · 成本细分（贺帅口径 15 项）─────────────────────────────────────
+// ── Summary · 成本细分（贺帅口径 16 项）─────────────────────────────────────
 const COST_ITEMS: { key: keyof Omit<FinanceSummary['costBreakdown'], 'total'>; label: string }[] = [
   { key: 'outboundCharter', label: '去程包机分摊' },
   { key: 'returnCharter', label: '返程包机分摊' },
@@ -1458,7 +1458,8 @@ const COST_ITEMS: { key: keyof Omit<FinanceSummary['costBreakdown'], 'total'>; l
   { key: 'transfer', label: '车费' },
   { key: 'guideService', label: '导游服务费' },
   { key: 'compGift', label: '赠送费用' },
-  { key: 'handlingFee', label: '手续费' },
+  { key: 'handlingFee', label: '手续费（结算）' },
+  { key: 'operationFee', label: '操作费' },
   { key: 'other', label: '其他' },
 ];
 

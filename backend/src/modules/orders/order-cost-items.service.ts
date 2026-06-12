@@ -4,7 +4,7 @@
  * 跟 OrderItem 区分：
  *   - OrderItem：面向客户的商品行（航班/酒店/签证/...）
  *   - OrderCostItem：后台财务录入的订单级成本明细
- *     按贺帅细分维度：导游服务费 / 赠送费用 / 手续费 / 其他
+ *     按贺帅细分维度：导游服务费 / 赠送费用 / 手续费（收款/汇款结算）/ 操作费（每单固定）/ 其他
  *
  * 一张订单可有 N 条（一类可多条）。
  * Decimal ↔ number 在 service 层完成；日期出 ISO 字符串。
@@ -13,7 +13,14 @@
 import { Prisma, type PrismaClient } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 
-export type OrderCostCategoryDto = 'GUIDE_SERVICE' | 'COMP_GIFT' | 'HANDLING_FEE' | 'OTHER';
+export type OrderCostCategoryDto =
+  | 'GUIDE_SERVICE'
+  | 'COMP_GIFT'
+  | 'HANDLING_FEE'
+  | 'OPERATION_FEE'
+  | 'OTHER';
+
+export const OPERATION_FEE_CNY_PER_ORDER = 20; // 财务定：每单固定操作费（人员服务费）
 
 export interface OrderCostItemDto {
   id: string;

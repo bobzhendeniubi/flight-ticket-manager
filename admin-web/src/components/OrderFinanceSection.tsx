@@ -19,7 +19,8 @@ import { NumberInput } from './NumberInput';
 const CATEGORY_LABEL: Record<OrderCostCategory, string> = {
   GUIDE_SERVICE: '导游服务费',
   COMP_GIFT: '赠送费用',
-  HANDLING_FEE: '手续费（操作费）',
+  HANDLING_FEE: '手续费（收款/汇款结算）',
+  OPERATION_FEE: '操作费（每单固定 ¥20）',
   OTHER: '其他',
 };
 
@@ -27,6 +28,7 @@ const CATEGORY_OPTIONS: OrderCostCategory[] = [
   'GUIDE_SERVICE',
   'COMP_GIFT',
   'HANDLING_FEE',
+  'OPERATION_FEE',
   'OTHER',
 ];
 
@@ -379,7 +381,7 @@ function CostItemsCard({
         <h3 className="text-sm font-semibold text-slate-800">
           订单杂项成本
           <span className="ml-2 text-xs font-normal text-slate-400">
-            导游 / 赠送 / 手续费 / 其他
+            导游 / 赠送 / 手续费 / 操作费 / 其他
           </span>
         </h3>
         <div className="flex items-center gap-2 text-xs text-slate-500">

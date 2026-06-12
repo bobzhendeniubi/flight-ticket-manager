@@ -259,7 +259,7 @@ export async function buildFinanceExportByFlightWorkbook(
       visaCost += visaOrder / legCount;
       transferCost += transferOrder / legCount;
 
-      // 杂项（OrderCostItem 4 类合一）：按腿数平摊
+      // 杂项（OrderCostItem 5 类合一，含每单固定操作费）：按腿数平摊
       let miscOrder = 0;
       for (const ci of o.costItems) {
         miscOrder += dec(ci.amountCny);

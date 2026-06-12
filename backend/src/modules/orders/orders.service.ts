@@ -31,6 +31,7 @@ import {
   NotFoundError,
 } from '../../lib/errors.js';
 import { PricingService } from '../pricing/pricing.service.js';
+import { OPERATION_FEE_CNY_PER_ORDER } from './order-cost-items.service.js';
 import { bundleItemMetadataSchema } from './orders.schemas.js';
 import { assertTicketingCap } from './ticketing-cap.js';
 import type {
@@ -237,6 +238,17 @@ export class OrderService {
           },
         },
         include: { items: true, passengers: true, statusEvents: true },
+      });
+
+      // 操作费自动计提（财务定：订单录入/服务人员费，每单固定 ¥20）
+      // 注意：操作费 ≠ 手续费（手续费=收款二维码/国际清算行结算手续费，仍走 HANDLING_FEE）
+      await tx.orderCostItem.create({
+        data: {
+          orderId: created.id,
+          category: 'OPERATION_FEE',
+          amountCny: new Prisma.Decimal(OPERATION_FEE_CNY_PER_ORDER),
+          note: '系统自动计提（每单固定操作费）',
+        },
       });
 
       // 消费下单人自己的锁位：FLIGHT 行对应舱位上本人的 ACTIVE 未过期锁位 → CONSUMED
