@@ -25,12 +25,13 @@ export function Layout() {
   const [searchParams] = useSearchParams();
 
   // 主导航：用 t() 而不是硬编码文字
+  // 排序按运营确认：套餐是主推，排第一（套餐-机票-酒店-用车-签证）
   const frontNav = [
+    { to: '/bundles', label: t('nav.bundles') },
     { to: '/', label: t('nav.flights'), exact: true },
     { to: '/hotels', label: t('nav.hotels') },
     { to: '/transfers', label: t('nav.transfers') },
     { to: '/visas', label: t('nav.visas') },
-    { to: '/bundles', label: t('nav.bundles') },
   ];
 
   const isAgent = user?.role === 'AGENT';
