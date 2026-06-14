@@ -102,12 +102,12 @@ function KpiCard({
         ? 'text-rose-700'
         : tone === 'warn'
           ? 'text-amber-700'
-          : 'text-slate-900';
+          : 'text-ink';
   return (
-    <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-      <div className="text-xs text-slate-500">{label}</div>
-      <div className={`mt-1 text-2xl font-semibold ${toneClass}`}>{value}</div>
-      {hint && <div className="mt-1 text-xs text-slate-500">{hint}</div>}
+    <div className="stat-card">
+      <div className="stat-label">{label}</div>
+      <div className={`stat-value ${toneClass}`}>{value}</div>
+      {hint && <div className="mt-1 text-xs text-ink-muted">{hint}</div>}
     </div>
   );
 }
@@ -125,10 +125,10 @@ function TabBtn({
     <button
       type="button"
       onClick={onClick}
-      className={`px-3 py-1.5 rounded-md text-sm border transition-colors ${
+      className={`rounded-lg border px-3.5 py-1.5 text-sm font-medium transition ${
         active
-          ? 'bg-slate-900 text-white border-slate-900'
-          : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
+          ? 'border-brand bg-brand text-white'
+          : 'border-slate-200 bg-white text-ink-soft hover:bg-slate-50 hover:text-ink'
       }`}
     >
       {children}
@@ -160,31 +160,31 @@ export function FinancesPage() {
     <div className="space-y-5">
       <header className="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-semibold text-slate-900">财务</h1>
-          <p className="mt-0.5 text-sm text-slate-500">
+          <h1 className="page-title">财务</h1>
+          <p className="page-sub">
             收入 / 成本 / 毛利按航班和订单实时核算 ·{' '}
             <span className="text-amber-700">⚠ 财务数据敏感，访问会记录到审计日志</span>
           </p>
         </div>
         <div className="flex items-end gap-2">
-          <label className="text-xs text-slate-500">
-            起始
+          <div>
+            <label className="label">起始</label>
             <input
               type="date"
               value={from}
               onChange={(e) => setFrom(e.target.value)}
-              className="block mt-1 rounded-md border border-slate-300 px-2 py-1 text-sm"
+              className="input py-1.5"
             />
-          </label>
-          <label className="text-xs text-slate-500">
-            截止
+          </div>
+          <div>
+            <label className="label">截止</label>
             <input
               type="date"
               value={to}
               onChange={(e) => setTo(e.target.value)}
-              className="block mt-1 rounded-md border border-slate-300 px-2 py-1 text-sm"
+              className="input py-1.5"
             />
-          </label>
+          </div>
           <div className="flex flex-col gap-1">
             <button
               type="button"
@@ -192,7 +192,7 @@ export function FinancesPage() {
                 setFrom(daysAgoStr(29));
                 setTo(todayStr());
               }}
-              className="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-600 hover:bg-slate-50"
+              className="btn-secondary px-2 py-1 text-xs"
             >
               最近 30 天
             </button>
@@ -202,7 +202,7 @@ export function FinancesPage() {
                 setFrom(daysAgoStr(89));
                 setTo(todayStr());
               }}
-              className="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-600 hover:bg-slate-50"
+              className="btn-secondary px-2 py-1 text-xs"
             >
               最近 90 天
             </button>
@@ -271,7 +271,7 @@ function ExportButton({ token, range }: { token: string; range: { from: string; 
         type="button"
         onClick={onClick}
         disabled={busy}
-        className="rounded-md bg-emerald-600 px-3 py-2 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+        className="btn-primary"
       >
         {busy ? '导出中…' : '⬇ 导出 xlsx'}
       </button>
@@ -312,7 +312,7 @@ function ExportByFlightButton({ token, range }: { token: string; range: { from: 
         type="button"
         onClick={onClick}
         disabled={busy}
-        className="rounded-md bg-indigo-600 px-3 py-2 text-sm font-medium text-white hover:bg-indigo-700 disabled:opacity-50"
+        className="btn-secondary"
       >
         {busy ? '导出中…' : '⬇ 导出 xlsx（按航班）'}
       </button>
@@ -331,7 +331,7 @@ function CostsTab({ token }: { token: string }) {
 
       <ProductCostEditors token={token} />
 
-      <p className="text-xs text-slate-400">
+      <p className="text-xs text-ink-muted">
         说明：成本统一人民币。航班按班次维护「包机/机场税/燃油/旺季附加/机型调整/起降折扣」，系统实时算出"单座(已售)成本"供定价参考。班次留空则回退到所匹配「周期」的默认值。
       </p>
     </section>
@@ -412,10 +412,10 @@ function FlightCostPeriodsEditor({ token }: { token: string }) {
   }
 
   return (
-    <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+    <div className="card">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div>
-          <h2 className="text-sm font-medium text-slate-700">
+          <h2 className="text-sm font-semibold text-ink">
             航班成本周期（按 航班 × 日期段 定包机/机场税/4 个新成本字段；班次可单独覆盖）
           </h2>
           <p className="mt-1 text-xs text-slate-500">
@@ -425,7 +425,7 @@ function FlightCostPeriodsEditor({ token }: { token: string }) {
         <button
           type="button"
           onClick={() => setShowNew((v) => !v)}
-          className="rounded-md bg-slate-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-slate-700"
+          className={showNew ? 'btn-secondary py-1.5 text-xs' : 'btn-primary py-1.5 text-xs'}
         >
           {showNew ? '× 取消' : '+ 新增周期'}
         </button>
@@ -450,7 +450,7 @@ function FlightCostPeriodsEditor({ token }: { token: string }) {
       ) : (
         <div className="mt-3 overflow-x-auto">
           <table className="w-full text-sm">
-            <thead className="text-xs text-slate-500">
+            <thead className="text-xs uppercase tracking-wide text-ink-muted">
               <tr className="border-b border-slate-200">
                 <th className="py-2 text-left font-normal">航班号</th>
                 <th className="py-2 text-left font-normal">路线</th>
@@ -470,7 +470,7 @@ function FlightCostPeriodsEditor({ token }: { token: string }) {
             <tbody>
               {periods.length === 0 && (
                 <tr>
-                  <td colSpan={13} className="py-4 text-center text-slate-400">
+                  <td colSpan={13} className="py-4 text-center text-ink-muted">
                     暂无周期 · 点击右上「+ 新增周期」开始
                   </td>
                 </tr>
@@ -554,13 +554,13 @@ function CostPeriodNewForm({
     }
   }
 
-  const inputCls = 'rounded border border-slate-300 px-2 py-1 text-sm';
-  const numCls = 'w-24 rounded border border-slate-300 px-1.5 py-0.5 text-right text-xs tabular-nums';
+  const inputCls = 'rounded-lg border border-slate-200 px-2 py-1 text-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20';
+  const numCls = 'w-24 rounded-lg border border-slate-200 px-1.5 py-0.5 text-right text-xs nums focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20';
 
   return (
-    <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3">
+    <div className="mt-3 rounded-lg border border-slate-200 bg-canvas p-3">
       <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-4">
-        <label className="text-xs text-slate-600">
+        <label className="text-xs text-ink-soft">
           航班
           <select
             value={flightId}
@@ -575,7 +575,7 @@ function CostPeriodNewForm({
             ))}
           </select>
         </label>
-        <label className="text-xs text-slate-600">
+        <label className="text-xs text-ink-soft">
           起始日
           <input
             type="date"
@@ -584,7 +584,7 @@ function CostPeriodNewForm({
             className={`mt-1 block w-full ${inputCls}`}
           />
         </label>
-        <label className="text-xs text-slate-600">
+        <label className="text-xs text-ink-soft">
           结束日
           <input
             type="date"
@@ -593,7 +593,7 @@ function CostPeriodNewForm({
             className={`mt-1 block w-full ${inputCls}`}
           />
         </label>
-        <label className="text-xs text-slate-600">
+        <label className="text-xs text-ink-soft">
           备注
           <input
             type="text"
@@ -605,7 +605,7 @@ function CostPeriodNewForm({
         </label>
       </div>
       <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-7">
-        <label className="text-xs text-slate-600">
+        <label className="text-xs text-ink-soft">
           包机(¥)
           <NumberInput
             className={`mt-1 block w-full ${numCls}`}
@@ -614,7 +614,7 @@ function CostPeriodNewForm({
             onChange={setCharter}
           />
         </label>
-        <label className="text-xs text-slate-600">
+        <label className="text-xs text-ink-soft">
           机场税去
           <NumberInput
             className={`mt-1 block w-full ${numCls}`}
@@ -623,7 +623,7 @@ function CostPeriodNewForm({
             onChange={setTaxDep}
           />
         </label>
-        <label className="text-xs text-slate-600">
+        <label className="text-xs text-ink-soft">
           机场税回
           <NumberInput
             className={`mt-1 block w-full ${numCls}`}
@@ -632,7 +632,7 @@ function CostPeriodNewForm({
             onChange={setTaxArr}
           />
         </label>
-        <label className="text-xs text-slate-600">
+        <label className="text-xs text-ink-soft">
           燃油
           <NumberInput
             className={`mt-1 block w-full ${numCls}`}
@@ -641,7 +641,7 @@ function CostPeriodNewForm({
             onChange={setFuel}
           />
         </label>
-        <label className="text-xs text-slate-600">
+        <label className="text-xs text-ink-soft">
           旺季附加
           <NumberInput
             className={`mt-1 block w-full ${numCls}`}
@@ -650,7 +650,7 @@ function CostPeriodNewForm({
             onChange={setPeak}
           />
         </label>
-        <label className="text-xs text-slate-600">
+        <label className="text-xs text-ink-soft">
           机型调整
           <NumberInput
             className={`mt-1 block w-full ${numCls}`}
@@ -660,7 +660,7 @@ function CostPeriodNewForm({
             onChange={setAircraft}
           />
         </label>
-        <label className="text-xs text-slate-600">
+        <label className="text-xs text-ink-soft">
           起降折扣（机场补贴）
           <NumberInput
             className={`mt-1 block w-full ${numCls}`}
@@ -676,14 +676,14 @@ function CostPeriodNewForm({
           type="button"
           onClick={submit}
           disabled={saving || !flightId}
-          className="rounded-md bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+          className="btn-primary py-1.5"
         >
           {saving ? '保存中…' : '保存'}
         </button>
         <button
           type="button"
           onClick={onCancel}
-          className="rounded-md border border-slate-300 px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-100"
+          className="btn-secondary py-1.5"
         >
           取消
         </button>
@@ -757,9 +757,9 @@ function CostPeriodRow({
     }
   }
 
-  const numCls = 'w-20 rounded border border-slate-300 px-1.5 py-0.5 text-right text-xs tabular-nums';
-  const dateCls = 'w-32 rounded border border-slate-300 px-1.5 py-0.5 text-xs';
-  const textCls = 'w-32 rounded border border-slate-300 px-1.5 py-0.5 text-xs';
+  const numCls = 'w-20 rounded-lg border border-slate-200 px-1.5 py-0.5 text-right text-xs nums focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20';
+  const dateCls = 'w-32 rounded-lg border border-slate-200 px-1.5 py-0.5 text-xs focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20';
+  const textCls = 'w-32 rounded-lg border border-slate-200 px-1.5 py-0.5 text-xs focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20';
 
   if (!editing) {
     return (
@@ -775,19 +775,19 @@ function CostPeriodRow({
         <td className="py-2 text-right tabular-nums">{fmtCny(period.peakSurchargeCny)}</td>
         <td className="py-2 text-right tabular-nums">{fmtCny(period.aircraftAdjustCny)}</td>
         <td className="py-2 text-right tabular-nums">{fmtCny(period.takeoffDiscountCny)}</td>
-        <td className="py-2 text-xs text-slate-500">{period.note ?? '—'}</td>
+        <td className="py-2 text-xs text-ink-muted">{period.note ?? '—'}</td>
         <td className="py-2 text-right">
           <button
             type="button"
             onClick={() => setEditing(true)}
-            className="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-50"
+            className="btn-secondary px-2 py-1 text-xs"
           >
             改
           </button>{' '}
           <button
             type="button"
             onClick={onDelete}
-            className="rounded-md border border-rose-300 px-2 py-1 text-xs text-rose-600 hover:bg-rose-50"
+            className="rounded-lg border border-rose-200 px-2 py-1 text-xs font-medium text-rose-600 transition hover:bg-rose-50"
           >
             删
           </button>
@@ -797,9 +797,9 @@ function CostPeriodRow({
   }
 
   return (
-    <tr className="border-b border-slate-100 last:border-0 bg-amber-50/40">
-      <td className="py-2 font-medium text-slate-900">{period.flightNumber}</td>
-      <td className="py-2 text-slate-600">{period.origin} → {period.destination}</td>
+    <tr className="border-b border-slate-100 last:border-0 bg-brand-50/50">
+      <td className="py-2 font-medium text-ink">{period.flightNumber}</td>
+      <td className="py-2 text-ink-soft">{period.origin} → {period.destination}</td>
       <td className="py-2"><input type="date" value={from} onChange={(e) => setFrom(e.target.value)} className={dateCls} /></td>
       <td className="py-2"><input type="date" value={to} onChange={(e) => setTo(e.target.value)} className={dateCls} /></td>
       <td className="py-2 text-right"><NumberInput className={numCls} step={1} value={charter} onChange={setCharter} /></td>
@@ -815,14 +815,14 @@ function CostPeriodRow({
           type="button"
           onClick={save}
           disabled={saving}
-          className="rounded-md bg-emerald-600 px-2 py-1 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+          className="btn-primary px-2 py-1 text-xs"
         >
           {saving ? '…' : '保存'}
         </button>{' '}
         <button
           type="button"
           onClick={() => { reset(); setEditing(false); }}
-          className="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-50"
+          className="btn-secondary px-2 py-1 text-xs"
         >
           取消
         </button>
@@ -862,8 +862,8 @@ function FlightScheduleCostEditors({ token }: { token: string }) {
   useEffect(() => load(), [load]);
 
   return (
-    <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-      <h2 className="text-sm font-medium text-slate-700">航班成本（按班次）</h2>
+    <div className="card">
+      <h2 className="text-sm font-semibold text-ink">航班成本（按班次）</h2>
       <p className="mt-1 text-xs text-slate-500">
         编辑包机/机场税/燃油/旺季附加/机型调整/起降折扣。空白时显示周期默认值（灰字 placeholder）。系统会算出"单座(已售)成本 = 包机÷已售"——帮你定价时看保本线。
       </p>
@@ -875,7 +875,7 @@ function FlightScheduleCostEditors({ token }: { token: string }) {
       ) : (
         <div className="mt-3 overflow-x-auto">
           <table className="w-full text-sm">
-            <thead className="text-xs text-slate-500">
+            <thead className="text-xs uppercase tracking-wide text-ink-muted">
               <tr className="border-b border-slate-200">
                 <th className="py-2 text-left font-normal">航班号</th>
                 <th className="py-2 text-left font-normal">路线</th>
@@ -895,7 +895,7 @@ function FlightScheduleCostEditors({ token }: { token: string }) {
             <tbody>
               {rows.length === 0 && (
                 <tr>
-                  <td colSpan={13} className="py-4 text-center text-slate-400">
+                  <td colSpan={13} className="py-4 text-center text-ink-muted">
                     暂无班次
                   </td>
                 </tr>
@@ -935,7 +935,7 @@ function FlightScheduleCostRow({
   const [saving, setSaving] = useState(false);
   const [saveErr, setSaveErr] = useState<string | null>(null);
 
-  const inputCls = 'w-20 rounded border border-slate-300 px-1.5 py-0.5 text-right text-xs tabular-nums';
+  const inputCls = 'w-20 rounded-lg border border-slate-200 px-1.5 py-0.5 text-right text-xs nums focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20';
 
   async function save(): Promise<void> {
     if (!token) return;
@@ -1059,7 +1059,7 @@ function FlightScheduleCostRow({
           type="button"
           onClick={save}
           disabled={saving}
-          className="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+          className="btn-secondary px-2 py-1 text-xs"
         >
           {saving ? '…' : '保存'}
         </button>
@@ -1107,10 +1107,10 @@ function ProductCostEditors({ token }: { token: string }) {
       {msg && <div className="text-xs text-rose-600">{msg}</div>}
 
       {/* 酒店房型 */}
-      <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-        <h2 className="text-sm font-medium text-slate-700">酒店净房价（按房型）</h2>
+      <div className="card">
+        <h2 className="text-sm font-semibold text-ink">酒店净房价（按房型）</h2>
         <table className="mt-3 w-full text-sm">
-          <thead className="text-xs text-slate-500">
+          <thead className="text-xs uppercase tracking-wide text-ink-muted">
             <tr className="border-b border-slate-200">
               <th className="py-2 text-left font-normal">酒店 / 房型</th>
               <th className="py-2 text-right font-normal">挂牌价(CNY)</th>
@@ -1140,10 +1140,10 @@ function ProductCostEditors({ token }: { token: string }) {
       </div>
 
       {/* 签证 */}
-      <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-        <h2 className="text-sm font-medium text-slate-700">签证成本</h2>
+      <div className="card">
+        <h2 className="text-sm font-semibold text-ink">签证成本</h2>
         <table className="mt-3 w-full text-sm">
-          <thead className="text-xs text-slate-500">
+          <thead className="text-xs uppercase tracking-wide text-ink-muted">
             <tr className="border-b border-slate-200">
               <th className="py-2 text-left font-normal">签证</th>
               <th className="py-2 text-right font-normal">挂牌价(CNY)</th>
@@ -1171,10 +1171,10 @@ function ProductCostEditors({ token }: { token: string }) {
       </div>
 
       {/* 接送 */}
-      <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-        <h2 className="text-sm font-medium text-slate-700">接送车队结算价</h2>
+      <div className="card">
+        <h2 className="text-sm font-semibold text-ink">接送车队结算价</h2>
         <table className="mt-3 w-full text-sm">
-          <thead className="text-xs text-slate-500">
+          <thead className="text-xs uppercase tracking-wide text-ink-muted">
             <tr className="border-b border-slate-200">
               <th className="py-2 text-left font-normal">车型 / 线路</th>
               <th className="py-2 text-right font-normal">挂牌价(CNY)</th>
@@ -1248,7 +1248,7 @@ function CostRow({
             step={0.01}
             value={draft[f.key] ?? null}
             onChange={(n) => setDraft((d) => ({ ...d, [f.key]: n }))}
-            className="w-28 rounded-md border border-slate-300 px-2 py-1 text-right text-sm"
+            className="w-28 rounded-lg border border-slate-200 px-2 py-1 text-right text-sm nums focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20"
           />
         </td>
       ))}
@@ -1257,7 +1257,7 @@ function CostRow({
           type="button"
           onClick={save}
           disabled={saving}
-          className="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+          className="btn-secondary px-2 py-1 text-xs"
         >
           {saving ? '…' : '保存'}
         </button>
@@ -1336,12 +1336,12 @@ function SummaryTab({ token, range }: { token: string; range: { from: string; to
         <CostBreakdownTable data={data} />
       </div>
 
-      <details className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-        <summary className="cursor-pointer text-sm font-medium text-slate-700">
+      <details className="card">
+        <summary className="cursor-pointer text-sm font-semibold text-ink">
           原始视图（按品类 kind 简表）
         </summary>
         <table className="mt-3 w-full text-sm">
-          <thead className="text-xs text-slate-500">
+          <thead className="text-xs uppercase tracking-wide text-ink-muted">
             <tr className="border-b border-slate-200">
               <th className="py-2 text-left font-normal">品类</th>
               <th className="py-2 text-right font-normal">收入</th>
@@ -1354,7 +1354,7 @@ function SummaryTab({ token, range }: { token: string; range: { from: string; to
           <tbody>
             {data.categories.length === 0 && (
               <tr>
-                <td colSpan={6} className="py-4 text-center text-slate-400">
+                <td colSpan={6} className="py-4 text-center text-ink-muted">
                   区间内没有订单数据
                 </td>
               </tr>
@@ -1380,7 +1380,7 @@ function SummaryTab({ token, range }: { token: string; range: { from: string; to
         </table>
       </details>
 
-      <p className="text-xs text-slate-400">
+      <p className="text-xs text-ink-muted">
         说明：收入按 OrderItem.amount 汇总（不含税费/折扣）；成本按 OrderItem.totalCostCny。
         空座沉没成本 = (整包机座位数 − 已售) × 单座分摊成本，仅对填了 charterCostCny 的航班计算。
       </p>
@@ -1407,11 +1407,11 @@ function RevenueBreakdownTable({ data }: { data: FinanceSummary }) {
   const denom = rb.total || data.revenueCny || 0;
   const pct = (n: number): number | null => (denom > 0 ? n / denom : null);
   return (
-    <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-      <h2 className="text-sm font-medium text-slate-700">收入细分（按贺帅口径）</h2>
+    <div className="card">
+      <h2 className="text-sm font-semibold text-ink">收入细分（按贺帅口径）</h2>
       <div className="mt-3 overflow-x-auto">
         <table className="w-full text-sm">
-          <thead className="text-xs text-slate-500">
+          <thead className="text-xs uppercase tracking-wide text-ink-muted">
             <tr className="border-b border-slate-200">
               <th className="py-2 text-left font-normal">项目</th>
               <th className="py-2 text-right font-normal">金额</th>
@@ -1468,11 +1468,11 @@ function CostBreakdownTable({ data }: { data: FinanceSummary }) {
   const denom = cb.total || data.costCny || 0;
   const pct = (n: number): number | null => (denom > 0 ? n / denom : null);
   return (
-    <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-      <h2 className="text-sm font-medium text-slate-700">成本细分（按贺帅口径）</h2>
+    <div className="card">
+      <h2 className="text-sm font-semibold text-ink">成本细分（按贺帅口径）</h2>
       <div className="mt-3 overflow-x-auto">
         <table className="w-full text-sm">
-          <thead className="text-xs text-slate-500">
+          <thead className="text-xs uppercase tracking-wide text-ink-muted">
             <tr className="border-b border-slate-200">
               <th className="py-2 text-left font-normal">项目</th>
               <th className="py-2 text-right font-normal">金额</th>
@@ -1534,14 +1534,14 @@ function FlightsTab({ token, range }: { token: string; range: { from: string; to
   if (err) return <div className="text-sm text-rose-600">加载失败：{err}</div>;
 
   return (
-    <section className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-      <h2 className="text-sm font-medium text-slate-700">按航班 P&L（最多 100 条）</h2>
+    <section className="card">
+      <h2 className="text-sm font-semibold text-ink">按航班 P&L（最多 100 条）</h2>
       <p className="mt-1 text-xs text-slate-500">
         机票成本按"卖出座位 × (包机总成本 / 总座位数)"分摊；空座沉没 = 剩余座位 × 单座分摊。
       </p>
       <div className="mt-3 overflow-x-auto">
         <table className="w-full text-sm">
-          <thead className="text-xs text-slate-500">
+          <thead className="text-xs uppercase tracking-wide text-ink-muted">
             <tr className="border-b border-slate-200">
               <th className="py-2 text-left font-normal">航班</th>
               <th className="py-2 text-left font-normal">出发</th>
@@ -1557,7 +1557,7 @@ function FlightsTab({ token, range }: { token: string; range: { from: string; to
           <tbody>
             {rows.length === 0 && (
               <tr>
-                <td colSpan={9} className="py-4 text-center text-slate-400">
+                <td colSpan={9} className="py-4 text-center text-ink-muted">
                   区间内没有航班
                 </td>
               </tr>
@@ -1644,14 +1644,14 @@ function OrdersTab({ token, range }: { token: string; range: { from: string; to:
   if (err) return <div className="text-sm text-rose-600">加载失败：{err}</div>;
 
   return (
-    <section className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
-      <h2 className="text-sm font-medium text-slate-700">按订单 P&L（最多 100 条）</h2>
+    <section className="card">
+      <h2 className="text-sm font-semibold text-ink">按订单 P&L（最多 100 条）</h2>
       <p className="mt-1 text-xs text-slate-500">
         毛利 = 订单总价 − Σ(OrderItem.totalCostCny)。某一条目没填成本则全单跳过成本统计。
       </p>
       <div className="mt-3 overflow-x-auto">
         <table className="w-full text-sm">
-          <thead className="text-xs text-slate-500">
+          <thead className="text-xs uppercase tracking-wide text-ink-muted">
             <tr className="border-b border-slate-200">
               <th className="py-2 text-left font-normal">订单</th>
               <th className="py-2 text-left font-normal">状态</th>
@@ -1666,7 +1666,7 @@ function OrdersTab({ token, range }: { token: string; range: { from: string; to:
           <tbody>
             {rows.length === 0 && (
               <tr>
-                <td colSpan={8} className="py-4 text-center text-slate-400">
+                <td colSpan={8} className="py-4 text-center text-ink-muted">
                   区间内没有订单
                 </td>
               </tr>
@@ -1752,9 +1752,9 @@ function MonthlyTab({ token }: { token: string }) {
   if (err) return <div className="text-sm text-rose-600">加载失败：{err}</div>;
 
   return (
-    <section className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+    <section className="card">
       <div className="flex items-center justify-between">
-        <h2 className="text-sm font-medium text-slate-700">月度趋势</h2>
+        <h2 className="text-sm font-semibold text-ink">月度趋势</h2>
         <select
           value={months}
           onChange={(e) => setMonths(parseInt(e.target.value, 10))}
@@ -1769,7 +1769,7 @@ function MonthlyTab({ token }: { token: string }) {
 
       <div className="mt-4 space-y-3">
         {points.length === 0 && (
-          <div className="text-sm text-slate-400">没有数据</div>
+          <div className="text-sm text-ink-muted">没有数据</div>
         )}
         {points.map((p) => {
           const revenuePct = p.revenueCny / maxRevenue;
@@ -1800,7 +1800,7 @@ function MonthlyTab({ token }: { token: string }) {
         })}
       </div>
 
-      <p className="mt-4 text-xs text-slate-400">
+      <p className="mt-4 text-xs text-ink-muted">
         柱图：浅绿 = 收入；红色覆盖部分 = 成本；露出的浅绿尾巴 = 毛利。
       </p>
     </section>

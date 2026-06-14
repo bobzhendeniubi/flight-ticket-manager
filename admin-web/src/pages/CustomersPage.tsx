@@ -100,21 +100,21 @@ export function CustomersPage() {
 
   return (
     <div className="space-y-4">
-      {/* KPI */}
-      <section className="grid gap-3 md:grid-cols-5">
-        <Kpi label="总散客数" value={kpi.total.toString()} sub={`${kpi.vip} VIP`} color="bg-brand" />
-        <Kpi label="直销散客" value={kpi.direct.toString()} sub="无代理归属" color="bg-indigo-500" />
-        <Kpi label="代理散客" value={kpi.viaAgent.toString()} sub="代理创建/归属" color="bg-amber-500" />
-        <Kpi label="累计消费" value={`¥${(kpi.totalSpent / 1000).toFixed(1)}K`} sub="所有散客" color="bg-green-600" />
-        <div className="card p-3 flex flex-col justify-between">
-          <p className="text-xs font-medium uppercase text-slate-500">导出</p>
-          <button className="btn-primary text-sm mt-2" onClick={handleExport}>📥 导出 CSV</button>
+      {/* 页头 */}
+      <section className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h1 className="page-title">散客管理</h1>
+          <p className="page-sub">所有购买过产品的散客，按归属代理、标签等维度筛选</p>
         </div>
+        <button className="btn-secondary" onClick={handleExport}>📥 导出 CSV</button>
       </section>
 
-      <section>
-        <h1 className="text-2xl font-bold text-slate-900">散客管理</h1>
-        <p className="mt-1 text-sm text-slate-600">所有购买过产品的散客，按归属代理、标签等维度筛选</p>
+      {/* KPI */}
+      <section className="grid gap-3 md:grid-cols-4">
+        <Kpi label="总散客数" value={kpi.total.toString()} sub={`${kpi.vip} VIP`} />
+        <Kpi label="直销散客" value={kpi.direct.toString()} sub="无代理归属" />
+        <Kpi label="代理散客" value={kpi.viaAgent.toString()} sub="代理创建/归属" />
+        <Kpi label="累计消费" value={`¥${(kpi.totalSpent / 1000).toFixed(1)}K`} sub="所有散客" />
       </section>
 
       {/* 过滤器 */}
@@ -151,63 +151,62 @@ export function CustomersPage() {
       {/* 表格 */}
       <section className="card p-0 overflow-hidden">
         <div className="overflow-x-auto">
-          <table className="min-w-full divide-y divide-slate-200 text-sm">
-            <thead className="bg-slate-50 text-xs uppercase text-slate-500">
+          <table className="table-admin">
+            <thead>
               <tr>
-                <th className="px-4 py-3 text-left">散客</th>
-                <th className="px-4 py-3 text-left">联系方式</th>
-                <th className="px-4 py-3 text-left">归属</th>
-                <th className="px-4 py-3 text-center">订单/消费</th>
-                <th className="px-4 py-3 text-left">最后下单</th>
-                <th className="px-4 py-3 text-left">标签</th>
-                <th className="px-4 py-3"></th>
+                <th className="text-left">散客</th>
+                <th className="text-left">联系方式</th>
+                <th className="text-left">归属</th>
+                <th className="text-center">订单/消费</th>
+                <th className="text-left">最后下单</th>
+                <th className="text-left">标签</th>
+                <th></th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-100">
+            <tbody>
               {filtered.map((c) => (
-                <tr key={c.id} className="hover:bg-slate-50">
-                  <td className="px-4 py-3">
-                    <button className="font-medium text-slate-900 hover:text-brand" onClick={() => setSelected(c)}>{c.name}</button>
-                    {c.idNumber && <div className="text-xs text-slate-400">{c.idNumber}</div>}
+                <tr key={c.id}>
+                  <td>
+                    <button className="font-medium text-ink hover:text-brand" onClick={() => setSelected(c)}>{c.name}</button>
+                    {c.idNumber && <div className="text-xs text-ink-muted">{c.idNumber}</div>}
                   </td>
-                  <td className="px-4 py-3 text-xs">
+                  <td className="text-xs">
                     <div>{c.phone}</div>
-                    <div className="text-slate-400">{c.email ?? '—'}</div>
+                    <div className="text-ink-muted">{c.email ?? '—'}</div>
                   </td>
-                  <td className="px-4 py-3 text-xs">
+                  <td className="text-xs">
                     {c.agentName ? (
-                      <span className="rounded bg-amber-100 px-2 py-0.5 text-amber-700">🤝 {c.agentName}</span>
+                      <span className="badge-warning">🤝 {c.agentName}</span>
                     ) : (
-                      <span className="rounded bg-indigo-100 px-2 py-0.5 text-indigo-700">🏢 直销</span>
+                      <span className="badge-info">🏢 直销</span>
                     )}
                   </td>
-                  <td className="px-4 py-3 text-center">
-                    <div className="font-semibold text-amber-600">{c.totalOrders}</div>
-                    <div className="text-xs text-slate-500">¥{c.totalSpent.toLocaleString()}</div>
+                  <td className="text-center">
+                    <div className="font-semibold text-ink nums">{c.totalOrders}</div>
+                    <div className="text-xs text-ink-muted nums">¥{c.totalSpent.toLocaleString()}</div>
                   </td>
-                  <td className="px-4 py-3 text-xs text-slate-600">
+                  <td className="text-xs text-ink-soft">
                     {c.lastOrderAt ? new Date(c.lastOrderAt).toLocaleDateString('zh-CN') : '—'}
                   </td>
-                  <td className="px-4 py-3">
+                  <td>
                     <div className="flex flex-wrap gap-1">
                       {c.tags.map((t) => (
-                        <span key={t} className={`rounded px-1.5 py-0.5 text-[10px] ${
-                          t === 'VIP' ? 'bg-red-100 text-red-700' :
-                          t === '回头客' ? 'bg-green-100 text-green-700' :
-                          t === '新客' ? 'bg-blue-100 text-blue-700' :
-                          t === '蜜月' ? 'bg-pink-100 text-pink-700' :
-                          'bg-slate-100 text-slate-600'
-                        }`}>{t}</span>
+                        <span key={t} className={
+                          t === 'VIP' ? 'badge-danger' :
+                          t === '回头客' ? 'badge-success' :
+                          t === '新客' ? 'badge-info' :
+                          'badge-neutral'
+                        }>{t}</span>
                       ))}
                     </div>
                   </td>
-                  <td className="px-4 py-3 text-right">
-                    <button className="text-xs text-brand hover:text-brand-dark" onClick={() => setSelected(c)}>详情</button>
+                  <td className="text-right">
+                    <button className="text-xs font-medium text-brand hover:text-brand-dark" onClick={() => setSelected(c)}>详情</button>
                   </td>
                 </tr>
               ))}
               {filtered.length === 0 && (
-                <tr><td colSpan={7} className="px-4 py-8 text-center text-slate-500">没有符合条件的散客</td></tr>
+                <tr><td colSpan={7} className="px-4 py-8 text-center text-ink-muted">没有符合条件的散客</td></tr>
               )}
             </tbody>
           </table>
@@ -219,15 +218,12 @@ export function CustomersPage() {
   );
 }
 
-function Kpi({ label, value, sub, color }: { label: string; value: string; sub: string; color: string }) {
+function Kpi({ label, value, sub }: { label: string; value: string; sub: string }) {
   return (
-    <div className="card p-3">
-      <div className="flex items-center gap-2">
-        <span className={`h-8 w-1 rounded ${color}`}></span>
-        <p className="text-xs font-medium uppercase text-slate-500">{label}</p>
-      </div>
-      <p className="mt-1.5 text-2xl font-bold text-slate-900">{value}</p>
-      <p className="mt-0.5 text-xs text-slate-500">{sub}</p>
+    <div className="stat-card">
+      <p className="stat-label">{label}</p>
+      <p className="stat-value">{value}</p>
+      <p className="mt-0.5 text-xs text-ink-muted">{sub}</p>
     </div>
   );
 }

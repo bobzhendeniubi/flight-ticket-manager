@@ -6,18 +6,31 @@ import { NOTICE_SECTIONS } from '../lib/notices';
  */
 export function BookingNotices({ className }: { className?: string }) {
   return (
-    <section className={`card bg-slate-50 ${className ?? ''}`}>
-      <h2 className="text-sm font-bold text-slate-800">📌 预订须知与温馨提示</h2>
-      <div className="mt-3 grid gap-4 md:grid-cols-3">
+    <section className={`card bg-canvas ${className ?? ''}`}>
+      <div className="flex items-center gap-2">
+        <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-brand-50 text-base" aria-hidden>
+          📌
+        </span>
+        <div>
+          <h2 className="section-title text-base md:text-lg">预订须知与温馨提示</h2>
+          <p className="section-sub text-xs">下单前请逐条阅读，避免行程纠纷</p>
+        </div>
+      </div>
+      <div className="mt-4 grid gap-3 md:grid-cols-3">
         {NOTICE_SECTIONS.map((sec) => (
-          <div key={sec.title}>
-            <h3 className="text-xs font-semibold text-slate-700">
-              {sec.emoji} {sec.title}
+          <div
+            key={sec.title}
+            className="rounded-2xl border border-slate-200/70 bg-surface p-4 shadow-card"
+          >
+            <h3 className="flex items-center gap-1.5 text-sm font-bold text-ink">
+              <span aria-hidden>{sec.emoji}</span> {sec.title}
             </h3>
-            <ul className="mt-1.5 space-y-1 text-xs leading-relaxed text-slate-600">
+            <ul className="mt-2.5 space-y-2 text-xs leading-relaxed text-ink-soft">
               {sec.items.map((item, idx) => (
-                <li key={idx} className="flex gap-1.5">
-                  <span className="shrink-0 text-slate-400">{idx + 1}.</span>
+                <li key={idx} className="flex gap-2">
+                  <span className="mt-px flex h-4 w-4 shrink-0 items-center justify-center rounded-full bg-brand-50 text-[10px] font-bold text-brand-700 nums">
+                    {idx + 1}
+                  </span>
                   <span>{item}</span>
                 </li>
               ))}

@@ -145,9 +145,9 @@ export function SeatAllocationPage() {
     return result;
   }, [selected, currentAllocations]);
 
-  if (loading) return <div className="card text-slate-500">加载中…</div>;
-  if (error) return <div className="card border-red-200 bg-red-50 text-red-700">{error}</div>;
-  if (!selected) return <div className="card text-slate-500">没有可用的班次（数据库可能没 seed）</div>;
+  if (loading) return <div className="card text-ink-muted">加载中…</div>;
+  if (error) return <div className="card border-rose-200 bg-rose-50 text-rose-700">{error}</div>;
+  if (!selected) return <div className="card text-ink-muted">没有可用的班次（数据库可能没 seed）</div>;
 
   /**
    * 回收一条切位 — 业务规则：
@@ -200,8 +200,8 @@ export function SeatAllocationPage() {
   return (
     <div className="space-y-5">
       <section>
-        <h1 className="text-2xl font-bold text-slate-900">切位 / 包位管理</h1>
-        <p className="mt-1 text-sm text-slate-600">
+        <h1 className="page-title">切位 / 包位管理</h1>
+        <p className="page-sub">
           为代理锁定特定班次的库存份额。代理负责销售并按月对账，未售出部分到期前回收回散客池。
         </p>
         <div className="mt-2 rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-700">
@@ -237,10 +237,7 @@ export function SeatAllocationPage() {
             <button className="btn-secondary text-sm" onClick={recycleExpired}>
               一键回收过期切位
             </button>
-            <button
-              className="text-sm px-4 py-2 rounded-md border border-purple-300 bg-purple-50 text-purple-700 hover:bg-purple-100"
-              onClick={() => setShowBulk(true)}
-            >
+            <button className="btn-secondary text-sm" onClick={() => setShowBulk(true)}>
               📦 批量切位
             </button>
             <button className="btn-primary text-sm" onClick={() => setShowForm(true)}>
@@ -294,53 +291,53 @@ export function SeatAllocationPage() {
           </p>
         </div>
         <div className="overflow-x-auto">
-          <table className="min-w-full divide-y divide-slate-200 text-sm">
-            <thead className="bg-slate-50 text-xs uppercase text-slate-500">
+          <table className="table-admin">
+            <thead>
               <tr>
-                <th className="px-4 py-2 text-left">代理</th>
-                <th className="px-4 py-2 text-left">舱位</th>
-                <th className="px-4 py-2 text-right">切位数</th>
-                <th className="px-4 py-2 text-right">已售</th>
-                <th className="px-4 py-2 text-right">余切位</th>
-                <th className="px-4 py-2 text-left">回收倒计时</th>
-                <th className="px-4 py-2"></th>
+                <th className="text-left">代理</th>
+                <th className="text-left">舱位</th>
+                <th className="text-right">切位数</th>
+                <th className="text-right">已售</th>
+                <th className="text-right">余切位</th>
+                <th className="text-left">回收倒计时</th>
+                <th></th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-100">
+            <tbody>
               {currentAllocations.map((a) => {
                 const remaining = a.allocated - a.sold;
                 const days = daysUntil(a.releaseAt);
                 const overSold = a.sold > a.allocated;
                 return (
-                  <tr key={a.id} className={overSold ? 'bg-red-50' : ''}>
-                    <td className="px-4 py-2">
-                      <div className="font-medium text-slate-900">{a.agentName}</div>
-                      <div className="text-xs text-slate-500">{a.agentTier} 级代理</div>
+                  <tr key={a.id} className={overSold ? 'bg-rose-50' : ''}>
+                    <td>
+                      <div className="font-medium text-ink">{a.agentName}</div>
+                      <div className="text-xs text-ink-muted">{a.agentTier} 级代理</div>
                     </td>
-                    <td className="px-4 py-2">
-                      <span className="rounded bg-slate-100 px-2 py-0.5 text-xs">
+                    <td>
+                      <span className="badge-neutral">
                         {CABIN_LABEL[a.cabin]}
                       </span>
                     </td>
-                    <td className="px-4 py-2 text-right font-medium">{a.allocated}</td>
-                    <td className="px-4 py-2 text-right">
-                      {a.sold} <span className="text-xs text-slate-400">({((a.sold / a.allocated) * 100).toFixed(0)}%)</span>
+                    <td className="text-right font-medium nums">{a.allocated}</td>
+                    <td className="text-right nums">
+                      {a.sold} <span className="text-xs text-ink-muted">({((a.sold / a.allocated) * 100).toFixed(0)}%)</span>
                     </td>
-                    <td className="px-4 py-2 text-right">
-                      <span className={remaining === 0 ? 'text-red-600 font-medium' : ''}>{remaining}</span>
+                    <td className="text-right nums">
+                      <span className={remaining === 0 ? 'text-rose-600 font-medium' : ''}>{remaining}</span>
                     </td>
-                    <td className="px-4 py-2">
+                    <td>
                       {days > 0 ? (
-                        <span className={`text-xs ${days <= 3 ? 'text-amber-700' : 'text-slate-600'}`}>
+                        <span className={`text-xs ${days <= 3 ? 'text-amber-700' : 'text-ink-soft'}`}>
                           剩 {days} 天到期
                         </span>
                       ) : (
-                        <span className="rounded bg-red-100 px-2 py-0.5 text-xs text-red-700">已过期</span>
+                        <span className="badge-danger">已过期</span>
                       )}
                     </td>
-                    <td className="px-4 py-2 text-right">
+                    <td className="text-right">
                       <button
-                        className="text-xs text-red-600 hover:text-red-700 disabled:text-slate-300"
+                        className="text-xs font-medium text-rose-600 hover:text-rose-700 disabled:text-ink-muted"
                         onClick={() => recycle(a.id)}
                         disabled={remaining <= 0}
                         title={
@@ -362,17 +359,17 @@ export function SeatAllocationPage() {
                 if (s.pool <= 0 && s.capacity === 0) return null;
                 return (
                   <tr key={'pool-' + cabin} className="bg-emerald-50/40">
-                    <td className="px-4 py-2">
+                    <td>
                       <div className="font-medium text-emerald-700">📦 散客池</div>
-                      <div className="text-xs text-slate-500">公共可售</div>
+                      <div className="text-xs text-ink-muted">公共可售</div>
                     </td>
-                    <td className="px-4 py-2">
-                      <span className="rounded bg-slate-100 px-2 py-0.5 text-xs">{CABIN_LABEL[cabin]}</span>
+                    <td>
+                      <span className="badge-neutral">{CABIN_LABEL[cabin]}</span>
                     </td>
-                    <td className="px-4 py-2 text-right">{s.pool}</td>
-                    <td className="px-4 py-2 text-right text-slate-400">—</td>
-                    <td className="px-4 py-2 text-right">{s.pool}</td>
-                    <td className="px-4 py-2 text-xs text-slate-400">不回收</td>
+                    <td className="text-right nums">{s.pool}</td>
+                    <td className="text-right text-ink-muted">—</td>
+                    <td className="text-right nums">{s.pool}</td>
+                    <td className="text-xs text-ink-muted">不回收</td>
                     <td></td>
                   </tr>
                 );

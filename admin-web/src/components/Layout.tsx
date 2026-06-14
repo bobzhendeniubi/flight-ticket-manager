@@ -1,5 +1,5 @@
-import { useEffect } from 'react';
-import { Link, NavLink, Outlet, useNavigate } from 'react-router-dom';
+import { useEffect, useState } from 'react';
+import { Link, NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../stores/auth';
 import { api, ApiError } from '../lib/api';
 
@@ -10,30 +10,44 @@ const ROLE_LABEL: Record<string, string> = {
 };
 
 // roles: 允许访问该导航的角色集合
-const NAV: Array<{ to: string; label: string; roles: Array<'ADMIN' | 'STAFF' | 'AGENT'> }> = [
-  { to: '/dashboard',       label: '仪表盘',      roles: ['ADMIN', 'STAFF'] },
-  { to: '/orders',          label: '订单管理',    roles: ['ADMIN', 'STAFF', 'AGENT'] },
-  { to: '/flights',         label: '航班管理',    roles: ['ADMIN', 'STAFF'] },
-  { to: '/seat-stats',      label: '座位统计',    roles: ['ADMIN', 'STAFF'] },
-  { to: '/seat-allocation', label: '切位（包位）', roles: ['ADMIN', 'STAFF'] },
-  { to: '/hotel-control',   label: '房控',        roles: ['ADMIN', 'STAFF'] },
-  { to: '/visa-desk',       label: '签证台',      roles: ['ADMIN', 'STAFF'] },
-  { to: '/products',        label: '产品管理',    roles: ['ADMIN', 'STAFF'] },
-  { to: '/pricing',         label: '动态定价',    roles: ['ADMIN', 'STAFF'] },
-  { to: '/cancellation-policies', label: '取消政策', roles: ['ADMIN', 'STAFF'] },
-  { to: '/agents',          label: '代理管理',    roles: ['ADMIN', 'STAFF', 'AGENT'] },
-  { to: '/customers',       label: '散客管理',    roles: ['ADMIN', 'STAFF', 'AGENT'] },
-  { to: '/travelers',       label: '旅客管理',    roles: ['ADMIN', 'STAFF', 'AGENT'] },
-  { to: '/settlements',     label: '结算单',      roles: ['ADMIN', 'STAFF', 'AGENT'] },
-  { to: '/audit-logs',      label: '审计日志',    roles: ['ADMIN', 'STAFF'] },
-  { to: '/finances',        label: '财务',        roles: ['ADMIN'] },
+// section: 侧栏分组标题（用于视觉分组，不影响路由 / 角色过滤）
+const NAV: Array<{
+  to: string;
+  label: string;
+  roles: Array<'ADMIN' | 'STAFF' | 'AGENT'>;
+  section: string;
+}> = [
+  { to: '/dashboard',       label: '仪表盘',      roles: ['ADMIN', 'STAFF'],          section: '概览' },
+  { to: '/orders',          label: '订单管理',    roles: ['ADMIN', 'STAFF', 'AGENT'], section: '运营' },
+  { to: '/flights',         label: '航班管理',    roles: ['ADMIN', 'STAFF'],          section: '运营' },
+  { to: '/seat-stats',      label: '座位统计',    roles: ['ADMIN', 'STAFF'],          section: '运营' },
+  { to: '/seat-allocation', label: '切位（包位）', roles: ['ADMIN', 'STAFF'],          section: '运营' },
+  { to: '/hotel-control',   label: '房控',        roles: ['ADMIN', 'STAFF'],          section: '运营' },
+  { to: '/visa-desk',       label: '签证台',      roles: ['ADMIN', 'STAFF'],          section: '运营' },
+  { to: '/products',        label: '产品管理',    roles: ['ADMIN', 'STAFF'],          section: '产品' },
+  { to: '/pricing',         label: '动态定价',    roles: ['ADMIN', 'STAFF'],          section: '产品' },
+  { to: '/cancellation-policies', label: '取消政策', roles: ['ADMIN', 'STAFF'],       section: '产品' },
+  { to: '/agents',          label: '代理管理',    roles: ['ADMIN', 'STAFF', 'AGENT'], section: '客户' },
+  { to: '/customers',       label: '散客管理',    roles: ['ADMIN', 'STAFF', 'AGENT'], section: '客户' },
+  { to: '/travelers',       label: '旅客管理',    roles: ['ADMIN', 'STAFF', 'AGENT'], section: '客户' },
+  { to: '/settlements',     label: '结算单',      roles: ['ADMIN', 'STAFF', 'AGENT'], section: '财务' },
+  { to: '/finances',        label: '财务',        roles: ['ADMIN'],                   section: '财务' },
+  { to: '/audit-logs',      label: '审计日志',    roles: ['ADMIN', 'STAFF'],          section: '系统' },
 ];
+
+// 侧栏分组渲染顺序（NAV 里出现的 section 都在这里列一遍）
+const SECTION_ORDER = ['概览', '运营', '产品', '客户', '财务', '系统'];
 
 export function Layout() {
   const user = useAuth((s) => s.user);
   const tokens = useAuth((s) => s.tokens);
   const logout = useAuth((s) => s.logout);
   const navigate = useNavigate();
+  const location = useLocation();
+
+  // 仅用于 <1024px 的侧栏抽屉开合（纯展示用的 chrome 状态）
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const closeDrawer = () => setDrawerOpen(false);
 
   /**
    * 启动时向后端验证 token 是否真有效 + 角色是否对得上。
@@ -61,63 +75,58 @@ export function Layout() {
     return () => { cancelled = true; };
   }, [tokens, user, logout, navigate]);
 
-  return (
-    <div className="min-h-screen flex flex-col bg-slate-100">
-      {/* 顶部品牌 + 用户 */}
-      <header className="bg-slate-900 text-white">
-        <div className="mx-auto flex max-w-[1400px] items-center justify-between px-5 py-3">
-          <Link
-            to={user?.role === 'AGENT' ? '/orders' : '/dashboard'}
-            className="flex items-center gap-2 text-lg font-semibold"
-          >
-            <span aria-hidden className="text-brand">⚙</span>
-            <span>世途旅行 · 后台</span>
-            <span className="ml-2 rounded bg-brand/20 px-2 py-0.5 text-xs text-brand">
-              {user?.role === 'AGENT' ? '代理端' : '运营端'}
-            </span>
-          </Link>
-          <div className="flex items-center gap-3 text-sm">
-            {user ? (
-              <>
-                <span className="text-slate-300">
-                  {user.displayName ?? user.email}
-                  <span className="ml-2 rounded bg-slate-700 px-1.5 py-0.5 text-xs">
-                    {ROLE_LABEL[user.role] ?? user.role}
-                  </span>
-                </span>
-                <button
-                  type="button"
-                  className="rounded bg-slate-700 px-3 py-1.5 hover:bg-slate-600"
-                  onClick={async () => {
-                    await logout();
-                    navigate('/login');
-                  }}
-                >
-                  退出
-                </button>
-              </>
-            ) : (
-              <span className="text-slate-400">未登录</span>
-            )}
-          </div>
-        </div>
-      </header>
+  // 切路由时收起抽屉（移动端）
+  useEffect(() => { setDrawerOpen(false); }, [location.pathname]);
 
-      {user && (
-        <nav className="border-b border-slate-200 bg-white">
-          <div className="mx-auto max-w-[1400px] px-5">
-            <ul className="flex flex-wrap gap-1 text-sm">
-              {NAV.filter((n) =>
-                n.roles.includes(user.role as 'ADMIN' | 'STAFF' | 'AGENT'),
-              ).map((n) => (
+  const visibleNav = user
+    ? NAV.filter((n) => n.roles.includes(user.role as 'ADMIN' | 'STAFF' | 'AGENT'))
+    : [];
+
+  // 当前页标题（用于内容区顶栏的上下文）
+  const currentLabel = visibleNav.find((n) => location.pathname.startsWith(n.to))?.label ?? '';
+
+  const homeTo = user?.role === 'AGENT' ? '/orders' : '/dashboard';
+
+  // 品牌锁定区（侧栏头部复用）
+  const brandLockup = (
+    <Link to={homeTo} className="flex items-center gap-2.5" onClick={closeDrawer}>
+      <span
+        aria-hidden
+        className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-brand text-sm font-bold text-white"
+      >
+        世
+      </span>
+      <span className="flex flex-col leading-tight">
+        <span className="text-sm font-semibold tracking-tight text-ink">世途旅行</span>
+        <span className="text-[11px] font-medium text-ink-muted">
+          {user?.role === 'AGENT' ? '代理控制台' : '运营控制台'}
+        </span>
+      </span>
+    </Link>
+  );
+
+  // 侧栏导航主体（桌面固定栏 / 移动抽屉共用）
+  const sidebarNav = (
+    <nav className="flex-1 overflow-y-auto px-3 py-4">
+      {SECTION_ORDER.map((section) => {
+        const items = visibleNav.filter((n) => n.section === section);
+        if (items.length === 0) return null;
+        return (
+          <div key={section} className="mb-5 last:mb-0">
+            <p className="px-3 pb-1.5 text-[10px] font-semibold uppercase tracking-wider text-ink-muted">
+              {section}
+            </p>
+            <ul className="space-y-0.5">
+              {items.map((n) => (
                 <li key={n.to}>
                   <NavLink
                     to={n.to}
+                    onClick={closeDrawer}
                     className={({ isActive }) =>
-                      `inline-block px-4 py-3 border-b-2 transition ${
+                      `relative flex items-center rounded-lg px-3 py-2 text-sm font-medium transition ${
                         isActive
-                          ? 'border-brand text-brand font-medium'
-                          : 'border-transparent text-slate-600 hover:text-brand hover:border-brand/30'
+                          ? 'bg-brand-50 font-semibold text-brand-700 before:absolute before:left-0 before:top-1.5 before:bottom-1.5 before:w-0.5 before:rounded-full before:bg-brand'
+                          : 'text-ink-soft hover:bg-slate-50 hover:text-ink'
                       }`
                     }
                   >
@@ -127,21 +136,111 @@ export function Layout() {
               ))}
             </ul>
           </div>
-        </nav>
+        );
+      })}
+    </nav>
+  );
+
+  return (
+    <div className="min-h-screen bg-canvas text-ink">
+      {/* ── 桌面端：固定左侧栏（≥1024px） ─────────────────────── */}
+      <aside className="fixed inset-y-0 left-0 z-30 hidden w-[232px] flex-col border-r border-slate-200 bg-surface lg:flex">
+        <div className="flex h-14 items-center border-b border-slate-200 px-4">
+          {brandLockup}
+        </div>
+        {sidebarNav}
+        {user ? (
+          <div className="border-t border-slate-200 p-3">
+            <div className="flex items-center gap-2 rounded-lg px-2 py-1.5">
+              <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-brand-50 text-xs font-semibold text-brand-700">
+                {(user.displayName ?? user.email ?? '?').slice(0, 1).toUpperCase()}
+              </span>
+              <div className="min-w-0 flex-1">
+                <p className="truncate text-sm font-medium text-ink">{user.displayName ?? user.email}</p>
+                <p className="text-[11px] text-ink-muted">{ROLE_LABEL[user.role] ?? user.role}</p>
+              </div>
+            </div>
+          </div>
+        ) : null}
+      </aside>
+
+      {/* ── 移动端：抽屉（<1024px） ───────────────────────────── */}
+      {drawerOpen && (
+        <div className="fixed inset-0 z-50 lg:hidden">
+          <div className="absolute inset-0 bg-ink/40 animate-fade-in" onClick={closeDrawer} aria-hidden />
+          <div className="absolute inset-y-0 left-0 flex w-[232px] max-w-[80vw] flex-col bg-surface shadow-pop">
+            <div className="flex h-14 items-center justify-between border-b border-slate-200 px-4">
+              {brandLockup}
+              <button
+                type="button"
+                onClick={closeDrawer}
+                className="flex h-8 w-8 items-center justify-center rounded-lg text-lg text-ink-muted transition hover:bg-slate-100 hover:text-ink"
+                aria-label="关闭菜单"
+              >
+                ×
+              </button>
+            </div>
+            {sidebarNav}
+          </div>
+        </div>
       )}
 
-      <main className="flex-1">
-        <div className="mx-auto w-full max-w-[1400px] px-5 py-6">
-          <Outlet />
-        </div>
-      </main>
+      {/* ── 内容区（桌面端给侧栏让出 232px） ──────────────────── */}
+      <div className="flex min-h-screen flex-col lg:pl-[232px]">
+        {/* 内容区顶栏：左侧汉堡 + 页面上下文，右侧用户菜单 / 退出 */}
+        <header className="sticky top-0 z-20 flex h-14 items-center gap-3 border-b border-slate-200 bg-surface/90 px-4 backdrop-blur md:px-6">
+          <button
+            type="button"
+            onClick={() => setDrawerOpen(true)}
+            className="flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-ink-soft transition hover:bg-slate-50 hover:text-ink lg:hidden"
+            aria-label="打开菜单"
+          >
+            <span className="text-base">☰</span>
+          </button>
 
-      <footer className="border-t border-slate-200 bg-white text-xs text-slate-500">
-        <div className="mx-auto max-w-[1400px] px-5 py-3 flex justify-between">
-          <span>世途旅行后台 · M2-M5 演示版 · © {new Date().getFullYear()}</span>
-          <span className="text-slate-400">前台入口：http://localhost:5173</span>
-        </div>
-      </footer>
+          <div className="min-w-0 flex-1">
+            {currentLabel && (
+              <span className="truncate text-sm font-semibold text-ink">{currentLabel}</span>
+            )}
+          </div>
+
+          <div className="flex items-center gap-3 text-sm">
+            {user ? (
+              <>
+                <span className="hidden items-center gap-2 sm:flex">
+                  <span className="font-medium text-ink-soft">{user.displayName ?? user.email}</span>
+                  <span className="badge-neutral">{ROLE_LABEL[user.role] ?? user.role}</span>
+                </span>
+                <button
+                  type="button"
+                  className="btn-secondary py-1.5"
+                  onClick={async () => {
+                    await logout();
+                    navigate('/login');
+                  }}
+                >
+                  退出
+                </button>
+              </>
+            ) : (
+              <span className="text-ink-muted">未登录</span>
+            )}
+          </div>
+        </header>
+
+        <main className="flex-1">
+          <div className="mx-auto w-full max-w-[1400px] px-4 py-6 md:px-6 lg:px-8">
+            <Outlet />
+          </div>
+        </main>
+
+        <footer className="border-t border-slate-200 bg-surface text-xs text-ink-muted">
+          <div className="mx-auto flex max-w-[1400px] flex-col gap-1 px-4 py-3 sm:flex-row sm:items-center sm:justify-between md:px-6 lg:px-8">
+            <span>世途旅行后台 · M2-M5 演示版 · © {new Date().getFullYear()}</span>
+            <span>前台入口：http://localhost:5173</span>
+          </div>
+        </footer>
+      </div>
     </div>
   );
 }

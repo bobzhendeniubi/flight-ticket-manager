@@ -171,32 +171,30 @@ function ExpectedAmountCard({
   }
 
   return (
-    <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+    <div className="card p-4">
       <div className="flex items-center justify-between">
-        <h3 className="text-sm font-semibold text-slate-800">预期到账金额</h3>
+        <h3 className="text-sm font-semibold text-ink">预期到账金额</h3>
         {locked ? (
-          <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-700">
+          <span className="badge-warning">
             已锁定{isAdmin ? '（admin 可改）' : '，找管理员'}
           </span>
         ) : (
-          <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs text-slate-500">
-            未锁定
-          </span>
+          <span className="badge-neutral">未锁定</span>
         )}
       </div>
 
       {err && (
-        <div className="mt-2 rounded bg-rose-50 px-2 py-1 text-xs text-rose-700">{err}</div>
+        <div className="mt-2 rounded-lg border border-rose-200 bg-rose-50 px-2 py-1 text-xs text-rose-700">{err}</div>
       )}
 
       <div className="mt-3 flex flex-wrap items-end gap-2">
-        <label className="flex-1 min-w-[180px] text-xs text-slate-500">
+        <label className="flex-1 min-w-[180px] text-xs text-ink-muted">
           金额（¥ CNY）
           <div className="mt-1 flex items-center gap-1">
-            <span className="text-sm text-slate-500">¥</span>
+            <span className="text-sm text-ink-muted">¥</span>
             <NumberInput
               step={0.01}
-              className="block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm disabled:bg-slate-50 disabled:text-slate-400"
+              className="input nums disabled:bg-slate-50 disabled:text-ink-muted"
               value={amount}
               onChange={setAmount}
               disabled={inputDisabled || loading}
@@ -215,7 +213,7 @@ function ExpectedAmountCard({
 
         {isAdmin && (
           <button
-            className="rounded-md border border-slate-300 px-3 py-1.5 text-sm hover:bg-slate-50 disabled:opacity-50"
+            className="btn-secondary text-sm"
             onClick={toggleLock}
             disabled={lockToggling || loading}
             title={locked ? '解锁后出纳可改' : '锁定后非 admin 无法修改'}
@@ -224,10 +222,10 @@ function ExpectedAmountCard({
           </button>
         )}
 
-        {ok && <span className="text-xs text-emerald-700">{ok}</span>}
+        {ok && <span className="text-xs font-medium text-emerald-700">{ok}</span>}
       </div>
 
-      <p className="mt-2 text-xs text-slate-400">
+      <p className="mt-2 text-xs text-ink-muted">
         出纳填客户应付到账金额；admin 锁定后非管理员无法修改。
       </p>
     </div>
@@ -376,44 +374,44 @@ function CostItemsCard({
   const totalCny = items.reduce((sum, it) => sum + Number(it.amountCny), 0);
 
   return (
-    <div className="rounded-xl border border-slate-200 bg-white shadow-sm">
-      <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3">
-        <h3 className="text-sm font-semibold text-slate-800">
+    <div className="card p-0">
+      <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
+        <h3 className="text-sm font-semibold text-ink">
           订单杂项成本
-          <span className="ml-2 text-xs font-normal text-slate-400">
+          <span className="ml-2 text-xs font-normal text-ink-muted">
             导游 / 赠送 / 手续费 / 操作费 / 其他
           </span>
         </h3>
-        <div className="flex items-center gap-2 text-xs text-slate-500">
-          {!loading && <span>合计 ¥{totalCny.toLocaleString()}</span>}
+        <div className="flex items-center gap-2 text-xs text-ink-soft">
+          {!loading && <span className="nums">合计 ¥{totalCny.toLocaleString()}</span>}
         </div>
       </div>
 
       {err && (
-        <div className="mx-4 mt-3 rounded bg-rose-50 px-2 py-1 text-xs text-rose-700">{err}</div>
+        <div className="mx-4 mt-3 rounded-lg border border-rose-200 bg-rose-50 px-2 py-1 text-xs text-rose-700">{err}</div>
       )}
 
       <div className="overflow-x-auto">
-        <table className="w-full text-sm">
+        <table className="table-admin">
           <thead>
-            <tr className="bg-slate-50 text-left text-xs uppercase text-slate-500">
-              <th className="px-4 py-2 font-medium">分类</th>
-              <th className="px-4 py-2 font-medium">金额 (¥)</th>
-              <th className="px-4 py-2 font-medium">备注</th>
-              <th className="px-4 py-2 text-right font-medium">操作</th>
+            <tr>
+              <th className="text-left">分类</th>
+              <th className="text-left">金额 (¥)</th>
+              <th className="text-left">备注</th>
+              <th className="text-right">操作</th>
             </tr>
           </thead>
           <tbody>
             {loading && (
               <tr>
-                <td colSpan={4} className="px-4 py-4 text-center text-xs text-slate-400">
+                <td colSpan={4} className="py-4 text-center text-xs text-ink-muted">
                   加载中…
                 </td>
               </tr>
             )}
             {!loading && items.length === 0 && !showAdd && (
               <tr>
-                <td colSpan={4} className="px-4 py-4 text-center text-xs text-slate-400">
+                <td colSpan={4} className="py-4 text-center text-xs text-ink-muted">
                   暂无杂项成本，点下方「+ 新增」添加
                 </td>
               </tr>
@@ -423,40 +421,40 @@ function CostItemsCard({
                 const isEditing = editingId === it.id;
                 if (isEditing) {
                   return (
-                    <tr key={it.id} className="border-t border-slate-100 bg-amber-50/40">
-                      <td className="px-4 py-2">
+                    <tr key={it.id} className="bg-amber-50/40">
+                      <td>
                         <CategorySelect
                           value={editDraft.category}
                           onChange={(c) => setEditDraft((d) => ({ ...d, category: c }))}
                         />
                       </td>
-                      <td className="px-4 py-2">
+                      <td>
                         <NumberInput
                           step={0.01}
-                          className="block w-32 rounded-md border border-slate-300 px-2 py-1 text-sm"
+                          className="input nums w-32"
                           value={editDraft.amount}
                           onChange={(n) => setEditDraft((d) => ({ ...d, amount: n }))}
                         />
                       </td>
-                      <td className="px-4 py-2">
+                      <td>
                         <input
-                          className="block w-full rounded-md border border-slate-300 px-2 py-1 text-sm"
+                          className="input"
                           value={editDraft.note}
                           onChange={(e) => setEditDraft((d) => ({ ...d, note: e.target.value }))}
                           placeholder="选填"
                         />
                       </td>
-                      <td className="px-4 py-2 text-right">
+                      <td className="text-right">
                         <div className="flex justify-end gap-1.5">
                           <button
-                            className="rounded border border-emerald-300 px-2 py-0.5 text-xs text-emerald-700 hover:bg-emerald-50 disabled:opacity-50"
+                            className="btn-primary px-2.5 py-1 text-xs"
                             onClick={() => saveEdit(it.id)}
                             disabled={editSubmitting}
                           >
                             {editSubmitting ? '保存中…' : '保存'}
                           </button>
                           <button
-                            className="rounded border border-slate-300 px-2 py-0.5 text-xs text-slate-600 hover:bg-slate-50"
+                            className="btn-secondary px-2.5 py-1 text-xs"
                             onClick={cancelEdit}
                             disabled={editSubmitting}
                           >
@@ -468,23 +466,23 @@ function CostItemsCard({
                   );
                 }
                 return (
-                  <tr key={it.id} className="border-t border-slate-100 hover:bg-slate-50/50">
-                    <td className="px-4 py-2 text-slate-700">{CATEGORY_LABEL[it.category]}</td>
-                    <td className="px-4 py-2 font-medium text-slate-900">
+                  <tr key={it.id}>
+                    <td className="text-ink">{CATEGORY_LABEL[it.category]}</td>
+                    <td className="nums font-medium text-ink">
                       ¥{Number(it.amountCny).toLocaleString()}
                     </td>
-                    <td className="px-4 py-2 text-slate-500">{it.note || '—'}</td>
-                    <td className="px-4 py-2 text-right">
+                    <td className="text-ink-muted">{it.note || '—'}</td>
+                    <td className="text-right">
                       <div className="flex justify-end gap-1.5">
                         <button
-                          className="rounded border border-slate-300 px-2 py-0.5 text-xs text-slate-700 hover:bg-slate-50"
+                          className="btn-secondary px-2.5 py-1 text-xs"
                           onClick={() => startEdit(it)}
                           disabled={Boolean(editingId) || deletingId === it.id}
                         >
                           改
                         </button>
                         <button
-                          className="rounded border border-rose-200 px-2 py-0.5 text-xs text-rose-700 hover:bg-rose-50 disabled:opacity-50"
+                          className="btn-ghost px-2.5 py-1 text-xs text-rose-700 hover:bg-rose-50 disabled:opacity-50"
                           onClick={() => removeItem(it.id)}
                           disabled={Boolean(editingId) || deletingId === it.id}
                         >
@@ -496,41 +494,41 @@ function CostItemsCard({
                 );
               })}
             {showAdd && (
-              <tr className="border-t border-slate-100 bg-emerald-50/40">
-                <td className="px-4 py-2">
+              <tr className="bg-emerald-50/40">
+                <td>
                   <CategorySelect
                     value={draft.category}
                     onChange={(c) => setDraft((d) => ({ ...d, category: c }))}
                   />
                 </td>
-                <td className="px-4 py-2">
+                <td>
                   <NumberInput
                     step={0.01}
-                    className="block w-32 rounded-md border border-slate-300 px-2 py-1 text-sm"
+                    className="input nums w-32"
                     value={draft.amount}
                     onChange={(n) => setDraft((d) => ({ ...d, amount: n }))}
                     placeholder="0.00"
                   />
                 </td>
-                <td className="px-4 py-2">
+                <td>
                   <input
-                    className="block w-full rounded-md border border-slate-300 px-2 py-1 text-sm"
+                    className="input"
                     value={draft.note}
                     onChange={(e) => setDraft((d) => ({ ...d, note: e.target.value }))}
                     placeholder="选填"
                   />
                 </td>
-                <td className="px-4 py-2 text-right">
+                <td className="text-right">
                   <div className="flex justify-end gap-1.5">
                     <button
-                      className="rounded border border-emerald-300 px-2 py-0.5 text-xs text-emerald-700 hover:bg-emerald-50 disabled:opacity-50"
+                      className="btn-primary px-2.5 py-1 text-xs"
                       onClick={addItem}
                       disabled={addSubmitting}
                     >
                       {addSubmitting ? '保存中…' : '保存'}
                     </button>
                     <button
-                      className="rounded border border-slate-300 px-2 py-0.5 text-xs text-slate-600 hover:bg-slate-50"
+                      className="btn-secondary px-2.5 py-1 text-xs"
                       onClick={() => {
                         setShowAdd(false);
                         setDraft(EMPTY_DRAFT);
@@ -548,9 +546,9 @@ function CostItemsCard({
       </div>
 
       {!showAdd && (
-        <div className="border-t border-slate-100 px-4 py-2">
+        <div className="border-t border-slate-200 px-4 py-2.5">
           <button
-            className="text-sm text-brand hover:text-brand-dark"
+            className="text-sm font-medium text-brand hover:text-brand-dark"
             onClick={() => {
               setShowAdd(true);
               setDraft(EMPTY_DRAFT);
@@ -574,7 +572,7 @@ function CategorySelect({
 }) {
   return (
     <select
-      className="block w-full rounded-md border border-slate-300 px-2 py-1 text-sm"
+      className="input"
       value={value}
       onChange={(e) => onChange(e.target.value as OrderCostCategory)}
     >

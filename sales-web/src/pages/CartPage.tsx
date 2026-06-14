@@ -25,138 +25,170 @@ export function CartPage() {
 
   if (items.length === 0) {
     return (
-      <div className="card text-center py-16">
-        <div className="text-5xl">🛒</div>
-        <p className="mt-3 text-slate-600">购物车空空如也</p>
-        <Link to="/" className="btn-primary mt-4 inline-block">
-          去搜机票
+      <div className="card animate-fade-up py-16 text-center">
+        <div className="mx-auto flex h-20 w-20 items-center justify-center rounded-full bg-brand-50 text-5xl">🛒</div>
+        <p className="mt-4 text-base font-semibold text-ink">购物车空空如也</p>
+        <p className="mt-1 text-sm text-ink-muted">挑选海岛专线机票或一价全含套餐，开启你的旅程</p>
+        <Link to="/" className="btn-primary mt-5 inline-flex">
+          去搜机票 →
         </Link>
       </div>
     );
   }
 
   return (
-    <div className="space-y-5">
-      <section>
-        <h1 className="text-2xl font-bold text-slate-900">购物车</h1>
-        <p className="mt-1 text-sm text-slate-600">
-          共 {items.reduce((s, i) => s + (Number(i.qty) || 0), 0)} 件商品 · 已选 {selectedCount} 件 · 已选合计 ¥{fmt(selectedTotal)}
+    <div className="space-y-5 pb-28 lg:pb-0">
+      <section className="animate-fade-up">
+        <h1 className="text-2xl font-extrabold tracking-tight text-ink">购物车</h1>
+        <p className="section-sub">
+          共 {items.reduce((s, i) => s + (Number(i.qty) || 0), 0)} 件商品 · 已选{' '}
+          <span className="font-semibold text-ink">{selectedCount}</span> 件 · 已选合计{' '}
+          <span className="price text-base">¥{fmt(selectedTotal)}</span>
         </p>
       </section>
 
-      <section className="card p-0 overflow-hidden">
-        {/* 全选 / 全不选 */}
-        <div className="flex items-center gap-2 border-b border-slate-200 bg-slate-50 px-4 py-2.5">
-          <input
-            type="checkbox"
-            className="h-4 w-4 accent-brand"
-            checked={allSelected}
-            onChange={(e) => setAllSelected(e.target.checked)}
-          />
-          <span className="text-sm text-slate-600">全选（勾选要结账的产品，未勾的留在车里）</span>
-        </div>
-        <ul className="divide-y divide-slate-200">
-          {items.map((i) => (
-            <li
-              key={i.id}
-              className={`flex flex-wrap items-center gap-3 sm:gap-4 p-3 sm:p-4 ${isSelected(i) ? '' : 'opacity-50'}`}
-            >
-              <input
-                type="checkbox"
-                className="h-5 w-5 flex-shrink-0 accent-brand"
-                checked={isSelected(i)}
-                onChange={() => toggleSelected(i.id)}
-                aria-label="选择结账"
-              />
-              <div className="text-2xl sm:text-3xl flex-shrink-0">{i.emoji}</div>
-              <div className="flex-1 min-w-[60%] sm:min-w-0">
-                <div className="flex items-center gap-2">
-                  <span
-                    className={`rounded px-1.5 py-0.5 text-xs font-medium ${KIND_INFO[i.kind].color}`}
-                  >
-                    {KIND_INFO[i.kind].label}
-                  </span>
-                  <h3 className="font-medium text-slate-900 truncate">{i.name}</h3>
+      <div className="lg:grid lg:grid-cols-[1fr_320px] lg:items-start lg:gap-5">
+        <section className="card overflow-hidden p-0">
+          {/* 全选 / 全不选 */}
+          <label className="flex cursor-pointer items-center gap-2.5 border-b border-slate-200/80 bg-canvas px-4 py-3">
+            <input
+              type="checkbox"
+              className="h-4 w-4 rounded accent-brand"
+              checked={allSelected}
+              onChange={(e) => setAllSelected(e.target.checked)}
+            />
+            <span className="text-sm font-medium text-ink-soft">全选（勾选要结账的产品，未勾的留在车里）</span>
+          </label>
+          <ul className="divide-y divide-slate-100">
+            {items.map((i) => (
+              <li
+                key={i.id}
+                className={`flex flex-wrap items-center gap-3 p-4 transition-opacity sm:gap-4 ${isSelected(i) ? '' : 'opacity-50'}`}
+              >
+                <input
+                  type="checkbox"
+                  className="h-5 w-5 flex-shrink-0 rounded accent-brand"
+                  checked={isSelected(i)}
+                  onChange={() => toggleSelected(i.id)}
+                  aria-label="选择结账"
+                />
+                <div className="flex h-14 w-14 flex-shrink-0 items-center justify-center rounded-2xl bg-brand-50 text-3xl">
+                  {i.emoji}
                 </div>
-                {i.description && (
-                  <p className="mt-0.5 text-xs text-slate-500 truncate">{i.description}</p>
-                )}
-                {/* 套餐: 显示航班明细 */}
-                {i.kind === 'BUNDLE' && i.meta && (
-                  <div className="mt-1 text-xs text-slate-500 space-y-0.5">
-                    <div>✈ QH9589 澳门→岘港 {String(i.meta?.goDate ?? '')} + QH9588 回程 {String(i.meta?.returnDate ?? '')}</div>
-                    <div>
-                      {Number(i.meta?.pax) || 0} 人 · {Number(i.meta?.rooms) || 1} 房 ·
-                      机票 ¥{fmt(Number(i.meta?.flightTotal) || 0)} +
-                      地面 ¥{fmt(Number(i.meta?.hotelTotal) || 0)} +
-                      其他 ¥{fmt(Number(i.meta?.otherTotal) || 0)}
-                      {(Number(i.meta?.discount) || 0) > 0 && ` − 让利 ¥${fmt(Number(i.meta?.discount) || 0)}`}
+                <div className="min-w-[55%] flex-1 sm:min-w-0">
+                  <div className="flex items-center gap-2">
+                    <span
+                      className={`rounded-full px-2 py-0.5 text-xs font-semibold ${KIND_INFO[i.kind].color}`}
+                    >
+                      {KIND_INFO[i.kind].label}
+                    </span>
+                    <h3 className="truncate font-semibold text-ink">{i.name}</h3>
+                  </div>
+                  {i.description && (
+                    <p className="mt-0.5 truncate text-xs text-ink-muted">{i.description}</p>
+                  )}
+                  {/* 套餐: 显示航班明细 */}
+                  {i.kind === 'BUNDLE' && i.meta && (
+                    <div className="mt-1.5 space-y-0.5 text-xs text-ink-soft">
+                      <div>✈ QH9589 澳门→岘港 {String(i.meta?.goDate ?? '')} + QH9588 回程 {String(i.meta?.returnDate ?? '')}</div>
+                      <div>
+                        {Number(i.meta?.pax) || 0} 人 · {Number(i.meta?.rooms) || 1} 房 ·
+                        机票 ¥{fmt(Number(i.meta?.flightTotal) || 0)} +
+                        地面 ¥{fmt(Number(i.meta?.hotelTotal) || 0)} +
+                        其他 ¥{fmt(Number(i.meta?.otherTotal) || 0)}
+                        {(Number(i.meta?.discount) || 0) > 0 && ` − 让利 ¥${fmt(Number(i.meta?.discount) || 0)}`}
+                      </div>
                     </div>
+                  )}
+                  {/* 机票: 显示舱等+日期+人数（dateRank 是内部字段，不展示给客户） */}
+                  {i.kind === 'FLIGHT' && i.meta && (
+                    <div className="mt-1.5 text-xs text-ink-soft">
+                      {String(i.meta?.cabin ?? '') === 'BUSINESS' ? '商务舱' : '经济舱'} · {String(i.meta?.departureTime ?? '').slice(0, 10)} · {Number(i.meta?.passengers) || 0} 人
+                    </div>
+                  )}
+                  <p className="mt-1 text-xs text-ink-muted">
+                    加入时间 {new Date(i.addedAt).toLocaleString('zh-CN')}
+                  </p>
+                </div>
+                {/* 手机端：qty/价格/删除 整体换到下一行（占满宽度，end 对齐） */}
+                <div className="ml-auto mt-2 flex w-full items-center justify-end gap-3 border-t border-slate-100 pt-3 sm:mt-0 sm:w-auto sm:border-t-0 sm:pt-0">
+                  <div className="flex items-center gap-1 rounded-xl border border-slate-200 p-0.5">
+                    <button
+                      className="flex h-7 w-7 items-center justify-center rounded-lg text-ink-soft transition hover:bg-brand-50 hover:text-brand-700 disabled:opacity-40"
+                      onClick={() => updateQty(i.id, i.qty - 1)}
+                      disabled={i.qty <= 1}
+                    >
+                      −
+                    </button>
+                    <span className="w-7 text-center text-sm font-semibold tabular-nums">{i.qty}</span>
+                    <button
+                      className="flex h-7 w-7 items-center justify-center rounded-lg text-ink-soft transition hover:bg-brand-50 hover:text-brand-700"
+                      onClick={() => updateQty(i.id, i.qty + 1)}
+                    >
+                      +
+                    </button>
                   </div>
-                )}
-                {/* 机票: 显示舱等+日期+人数（dateRank 是内部字段，不展示给客户） */}
-                {i.kind === 'FLIGHT' && i.meta && (
-                  <div className="mt-1 text-xs text-slate-500">
-                    {String(i.meta?.cabin ?? '') === 'BUSINESS' ? '商务舱' : '经济舱'} · {String(i.meta?.departureTime ?? '').slice(0, 10)} · {Number(i.meta?.passengers) || 0} 人
+                  <div className="min-w-[80px] text-right sm:w-24">
+                    <div className="hidden text-xs text-ink-muted sm:block">¥{fmt(i.unitPrice)}</div>
+                    <div className="price text-base">¥{fmt(i.unitPrice * i.qty)}</div>
                   </div>
-                )}
-                <p className="mt-0.5 text-xs text-slate-400">
-                  加入时间 {new Date(i.addedAt).toLocaleString('zh-CN')}
-                </p>
-              </div>
-              {/* 手机端：qty/价格/删除 整体换到下一行（占满宽度，end 对齐） */}
-              <div className="flex items-center gap-3 ml-auto w-full sm:w-auto justify-end mt-2 sm:mt-0 pt-2 sm:pt-0 border-t sm:border-t-0 border-slate-100">
-                <div className="flex items-center gap-2">
                   <button
-                    className="rounded border border-slate-300 w-7 h-7 hover:bg-slate-50 leading-none"
-                    onClick={() => updateQty(i.id, i.qty - 1)}
-                    disabled={i.qty <= 1}
+                    className="flex-shrink-0 rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs font-medium text-ink-soft transition hover:border-deal/50 hover:bg-deal-light hover:text-deal"
+                    onClick={() => remove(i.id)}
                   >
-                    −
-                  </button>
-                  <span className="w-7 text-center tabular-nums">{i.qty}</span>
-                  <button
-                    className="rounded border border-slate-300 w-7 h-7 hover:bg-slate-50 leading-none"
-                    onClick={() => updateQty(i.id, i.qty + 1)}
-                  >
-                    +
+                    🗑 删除
                   </button>
                 </div>
-                <div className="text-right min-w-[80px] sm:w-24">
-                  <div className="text-xs text-slate-500 hidden sm:block">¥{fmt(i.unitPrice)}</div>
-                  <div className="text-sm sm:text-base font-semibold text-red-600">
-                    ¥{fmt(i.unitPrice * i.qty)}
-                  </div>
-                </div>
-                <button
-                  className="flex-shrink-0 rounded-md border border-slate-300 px-2.5 py-1 text-xs font-medium text-slate-600 hover:border-red-400 hover:bg-red-50 hover:text-red-600"
-                  onClick={() => remove(i.id)}
-                >
-                  🗑 删除
-                </button>
-              </div>
-            </li>
-          ))}
-        </ul>
-        <div className="border-t border-slate-200 bg-slate-50 px-4 py-3 flex items-center justify-between">
-          <button className="text-sm text-slate-500 hover:text-red-600" onClick={clear}>
-            清空购物车
-          </button>
-          <div className="flex items-center gap-4">
-            <div>
-              <span className="text-sm text-slate-600">已选合计：</span>
-              <span className="text-2xl font-bold text-red-600">¥{fmt(selectedTotal)}</span>
+              </li>
+            ))}
+          </ul>
+          <div className="flex items-center justify-between border-t border-slate-100 bg-canvas px-4 py-3">
+            <button className="text-sm font-medium text-ink-muted transition hover:text-deal" onClick={clear}>
+              清空购物车
+            </button>
+            <span className="text-xs text-ink-muted">仅勾选的商品会进入结算</span>
+          </div>
+        </section>
+
+        {/* 结算汇总 — 桌面端右侧 sticky，手机端固定底部 */}
+        <aside className="hidden lg:sticky lg:top-24 lg:block">
+          <div className="card space-y-4">
+            <h2 className="section-title text-base">结算汇总</h2>
+            <div className="flex items-center justify-between text-sm text-ink-soft">
+              <span>已选商品</span>
+              <span className="font-semibold text-ink nums">{selectedCount} 件</span>
+            </div>
+            <div className="flex items-end justify-between border-t border-slate-100 pt-3">
+              <span className="text-sm text-ink-soft">已选合计</span>
+              <span className="price text-2xl">¥{fmt(selectedTotal)}</span>
             </div>
             <button
-              className="btn-primary disabled:opacity-50"
+              className="btn-deal w-full"
               disabled={selectedItems.length === 0}
               onClick={() => navigate('/checkout')}
             >
               结算所选 {selectedCount} 件 →
             </button>
           </div>
+        </aside>
+      </div>
+
+      {/* 手机端 sticky 底部结算条 */}
+      <div className="fixed inset-x-0 bottom-[calc(56px+env(safe-area-inset-bottom))] z-40 border-t border-slate-200/80 bg-surface/95 px-4 py-3 shadow-pop backdrop-blur-xl lg:hidden">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <div className="text-xs text-ink-muted">已选 {selectedCount} 件 · 合计</div>
+            <div className="price text-xl">¥{fmt(selectedTotal)}</div>
+          </div>
+          <button
+            className="btn-deal flex-shrink-0 px-6"
+            disabled={selectedItems.length === 0}
+            onClick={() => navigate('/checkout')}
+          >
+            去结算 →
+          </button>
         </div>
-      </section>
+      </div>
     </div>
   );
 }

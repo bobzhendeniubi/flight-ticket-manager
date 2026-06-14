@@ -134,10 +134,12 @@ export function CheckoutPage() {
 
   if (items.length === 0 && !done) {
     return (
-      <div className="card text-center py-16">
-        <p className="text-slate-600">购物车是空的</p>
-        <Link to="/" className="btn-primary mt-4 inline-block">
-          先去挑产品
+      <div className="card animate-fade-up py-16 text-center">
+        <div className="mx-auto flex h-20 w-20 items-center justify-center rounded-full bg-brand-50 text-5xl">🧳</div>
+        <p className="mt-4 text-base font-semibold text-ink">购物车是空的</p>
+        <p className="mt-1 text-sm text-ink-muted">先挑一份心仪的产品，再回来填资料下单</p>
+        <Link to="/" className="btn-primary mt-5 inline-flex">
+          先去挑产品 →
         </Link>
       </div>
     );
@@ -145,19 +147,21 @@ export function CheckoutPage() {
 
   if (done) {
     return (
-      <div className="card max-w-lg mx-auto text-center py-12">
-        <div className="text-5xl">🎉</div>
-        <h1 className="mt-3 text-2xl font-bold text-slate-900">下单成功</h1>
-        <p className="mt-2 text-sm text-slate-600">订单号</p>
-        <p className="font-mono text-lg text-slate-900">{done.orderNumber}</p>
-        <p className="mt-2 text-sm text-slate-700">
-          应付 <span className="text-lg font-bold text-red-600">¥{fmt(done.total)}</span>
+      <div className="card mx-auto max-w-lg animate-fade-up py-12 text-center">
+        <div className="mx-auto flex h-20 w-20 items-center justify-center rounded-full bg-brand-50 text-5xl">🎉</div>
+        <h1 className="mt-4 text-2xl font-extrabold tracking-tight text-ink">下单成功</h1>
+        <p className="mt-3 text-sm text-ink-muted">订单号</p>
+        <p className="mt-1 inline-block rounded-xl bg-canvas px-4 py-1.5 font-mono text-lg font-semibold text-ink nums">
+          {done.orderNumber}
+        </p>
+        <p className="mt-4 text-sm text-ink-soft">
+          应付 <span className="price text-xl align-middle">¥{fmt(done.total)}</span>
         </p>
         {done.paymentExpiresAt && (
           <HoldCountdown expiresAt={done.paymentExpiresAt} />
         )}
-        <p className="mt-3 text-sm text-slate-500">
-          订单已创建，状态为 <span className="font-medium">待支付</span>。
+        <p className="mt-4 text-sm text-ink-muted">
+          订单已创建，状态为 <span className="badge-sun">待支付</span>。
           运营会在 10 分钟内确认，已发短信至 {contactPhone}
         </p>
         <div className="mt-6 flex justify-center gap-3">
@@ -307,15 +311,15 @@ export function CheckoutPage() {
   };
 
   return (
-    <div className="space-y-5 max-w-4xl mx-auto">
-      <section>
-        <h1 className="text-2xl font-bold text-slate-900">确认订单</h1>
-        <p className="mt-1 text-sm text-slate-600">
+    <div className="mx-auto max-w-4xl space-y-5 pb-28">
+      <section className="animate-fade-up">
+        <h1 className="text-2xl font-extrabold tracking-tight text-ink">确认订单</h1>
+        <p className="section-sub">
           请填写联系人信息和每位乘客的护照信息。可上传护照照片自动识别（OCR）。
         </p>
         {errorMsg && (
-          <div className="mt-3 rounded-md bg-red-50 border border-red-200 px-4 py-3 text-sm text-red-800">
-            ❌ {errorMsg}
+          <div className="mt-3 flex items-start gap-2 rounded-xl border border-deal/30 bg-deal-light px-4 py-3 text-sm font-medium text-deal-dark">
+            <span aria-hidden>❌</span> <span>{errorMsg}</span>
           </div>
         )}
       </section>
@@ -323,32 +327,32 @@ export function CheckoutPage() {
       <form onSubmit={onSubmit} className="space-y-5">
         {/* 订单内容摘要 */}
         <section className="card">
-          <h2 className="font-semibold text-slate-900">订单内容</h2>
-          <ul className="mt-3 space-y-2">
+          <h2 className="section-title text-base">订单内容</h2>
+          <ul className="mt-4 divide-y divide-slate-100">
             {items.map((i) => (
-              <li key={i.id} className="flex items-center gap-3 text-sm">
-                <span className="text-2xl">{i.emoji}</span>
+              <li key={i.id} className="flex items-center gap-3 py-2.5 text-sm first:pt-0">
+                <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-brand-50 text-xl">{i.emoji}</span>
                 <span
-                  className={`rounded px-1.5 py-0.5 text-xs font-medium ${KIND_INFO[i.kind].color}`}
+                  className={`rounded-full px-2 py-0.5 text-xs font-semibold ${KIND_INFO[i.kind].color}`}
                 >
                   {KIND_INFO[i.kind].label}
                 </span>
-                <span className="flex-1 text-slate-900 truncate">{i.name}</span>
-                <span className="text-slate-500">× {i.qty}</span>
-                <span className="w-20 text-right font-medium">¥{fmt(i.unitPrice * i.qty)}</span>
+                <span className="flex-1 truncate font-medium text-ink">{i.name}</span>
+                <span className="text-ink-muted nums">× {i.qty}</span>
+                <span className="w-20 text-right font-semibold text-ink nums">¥{fmt(i.unitPrice * i.qty)}</span>
               </li>
             ))}
           </ul>
-          <div className="mt-3 flex items-center justify-between border-t border-slate-200 pt-3">
-            <span className="text-sm text-slate-600">合计</span>
-            <span className="text-2xl font-bold text-red-600">¥{fmt(total)}</span>
+          <div className="mt-3 flex items-center justify-between border-t border-slate-200/80 pt-3">
+            <span className="text-sm text-ink-soft">合计</span>
+            <span className="price text-2xl">¥{fmt(total)}</span>
           </div>
         </section>
 
         {/* 联系人 */}
         <section className="card">
-          <h2 className="font-semibold text-slate-900">联系人信息</h2>
-          <div className="mt-3 grid gap-3 md:grid-cols-3">
+          <h2 className="section-title text-base">联系人信息</h2>
+          <div className="mt-4 grid gap-3 md:grid-cols-3">
             <div>
               <label className="label">姓名 *</label>
               <input
@@ -386,7 +390,7 @@ export function CheckoutPage() {
                 value={orderNotes}
                 onChange={(e) => setOrderNotes(e.target.value)}
               />
-              <p className="mt-1 text-xs text-slate-500">
+              <p className="mt-1 text-xs text-ink-muted">
                 运营会在订单详情里看到，按需安排。
               </p>
             </div>
@@ -395,20 +399,25 @@ export function CheckoutPage() {
 
         {/* 乘客 / 出行人 */}
         <section className="card">
-          <div className="flex items-center justify-between">
-            <h2 className="font-semibold text-slate-900">
-              出行人信息（{passengers.length} 人
-              {effectivePax > 0 && ` / 需要 ${effectivePax} 人`}）
+          <div className="flex items-center justify-between gap-2">
+            <h2 className="section-title text-base">
+              出行人信息
+              <span className="ml-1.5 align-middle text-sm font-medium text-ink-muted">
+                {passengers.length} 人{effectivePax > 0 && ` / 需要 ${effectivePax} 人`}
+              </span>
             </h2>
-            <button type="button" className="text-sm text-brand hover:text-brand-dark" onClick={addPassenger}>
+            <button type="button" className="btn-ghost px-3 py-1.5 text-sm text-brand-700 hover:text-brand-dark" onClick={addPassenger}>
               + 增加出行人
             </button>
           </div>
-          <p className="mt-1 text-xs text-slate-500">机票、签证按出行人开票/办证。每位都需提供护照信息。</p>
+          <p className="mt-1 text-xs text-ink-muted">机票、签证按出行人开票/办证。每位都需提供护照信息。</p>
           {paxMismatch && (
-            <div className="mt-2 rounded-md bg-amber-50 border border-amber-200 px-4 py-3 text-sm text-amber-800">
-              ⚠ 需要 {effectivePax} 位出行人，当前填了 {passengers.length} 位。
-              请{passengers.length < effectivePax ? '增加出行人' : '减少出行人或返回购物车调整数量'}。
+            <div className="mt-3 flex items-start gap-2 rounded-xl border border-sun/40 bg-sun-light px-4 py-3 text-sm font-medium text-amber-800">
+              <span aria-hidden>⚠</span>
+              <span>
+                需要 {effectivePax} 位出行人，当前填了 {passengers.length} 位。
+                请{passengers.length < effectivePax ? '增加出行人' : '减少出行人或返回购物车调整数量'}。
+              </span>
             </div>
           )}
 
@@ -427,8 +436,8 @@ export function CheckoutPage() {
 
         {/* 支付方式 */}
         <section className="card">
-          <h2 className="font-semibold text-slate-900">支付方式</h2>
-          <div className="mt-3 grid gap-2 md:grid-cols-2 lg:grid-cols-4">
+          <h2 className="section-title text-base">支付方式</h2>
+          <div className="mt-4 grid gap-2.5 md:grid-cols-2 lg:grid-cols-4">
             {[
               { v: 'WECHAT_PAY', label: '微信支付', emoji: '💚', show: true },
               { v: 'ALIPAY', label: '支付宝', emoji: '💙', show: true },
@@ -437,8 +446,10 @@ export function CheckoutPage() {
             ].filter((p) => p.show).map((p) => (
               <label
                 key={p.v}
-                className={`cursor-pointer rounded-md border-2 p-3 text-center ${
-                  paymentMethod === p.v ? 'border-brand bg-brand/5' : 'border-slate-200 hover:border-slate-300'
+                className={`cursor-pointer rounded-2xl border-2 p-3 text-center transition-all ${
+                  paymentMethod === p.v
+                    ? 'border-brand bg-brand-50 shadow-card'
+                    : 'border-slate-200 hover:border-brand/40 hover:bg-brand-50/40'
                 }`}
               >
                 <input
@@ -450,26 +461,26 @@ export function CheckoutPage() {
                   onChange={(e) => setPaymentMethod(e.target.value as CreateOrderInput['paymentMethod'])}
                 />
                 <div className="text-2xl">{p.emoji}</div>
-                <div className="mt-1 text-sm font-medium text-slate-900">{p.label}</div>
+                <div className={`mt-1 text-sm font-semibold ${paymentMethod === p.v ? 'text-brand-700' : 'text-ink'}`}>{p.label}</div>
               </label>
             ))}
           </div>
           {paymentMethod === 'AGENT_PREPAYMENT' && isAgent && (
-            <div className="mt-3 rounded-md bg-emerald-50 border border-emerald-200 px-4 py-3 text-sm">
+            <div className="mt-3 rounded-2xl border border-brand-200 bg-brand-50/60 px-4 py-3 text-sm">
               <div className="flex items-center justify-between">
-                <span className="text-emerald-800">代理预付余额（demo 模拟）</span>
-                <span className="font-semibold text-emerald-700">¥80,000.00</span>
+                <span className="font-medium text-brand-800">代理预付余额（demo 模拟）</span>
+                <span className="font-bold text-brand-700 nums">¥80,000.00</span>
               </div>
-              <div className="mt-1 flex items-center justify-between text-xs text-emerald-600">
+              <div className="mt-1.5 flex items-center justify-between text-xs text-brand-700">
                 <span>本单抵扣</span>
-                <span>−¥{fmt(total)}</span>
+                <span className="nums">−¥{fmt(total)}</span>
               </div>
-              <div className="mt-1 flex items-center justify-between text-xs text-emerald-600">
+              <div className="mt-1 flex items-center justify-between text-xs text-brand-700">
                 <span>支付后余额</span>
-                <span>¥{fmt(80000 - total)}</span>
+                <span className="nums">¥{fmt(80000 - total)}</span>
               </div>
               {total > 80000 && (
-                <div className="mt-2 text-xs text-red-600">⚠ 余额不足，请联系管理员充值或选择其他支付方式</div>
+                <div className="mt-2 text-xs font-medium text-deal">⚠ 余额不足，请联系管理员充值或选择其他支付方式</div>
               )}
             </div>
           )}
@@ -479,16 +490,16 @@ export function CheckoutPage() {
         <BookingNotices />
 
         {/* 手机端紧凑：返回 / 合计 + 按钮 在 360px 屏幕也不挤 */}
-        <div className="sticky bottom-0 z-40 bg-white border border-slate-200 rounded-md px-3 py-3 sm:px-4 shadow-lg">
+        <div className="sticky bottom-[calc(56px+env(safe-area-inset-bottom))] z-40 rounded-2xl border border-slate-200/80 bg-surface/95 px-3 py-3 shadow-pop backdrop-blur-xl sm:bottom-4 sm:px-4">
           <div className="flex items-center justify-between gap-2 sm:gap-4">
-            <Link to="/cart" className="text-xs sm:text-sm text-slate-500 hover:text-brand whitespace-nowrap">
+            <Link to="/cart" className="whitespace-nowrap text-xs font-medium text-ink-muted transition hover:text-brand-700 sm:text-sm">
               ← <span className="hidden sm:inline">返回</span>购物车
             </Link>
-            <div className="flex items-center gap-2 sm:gap-4 flex-1 sm:flex-none justify-end">
-              <span className="text-sm sm:text-base whitespace-nowrap">
-                合计 <span className="text-xl sm:text-2xl font-bold text-red-600">¥{fmt(total)}</span>
+            <div className="flex flex-1 items-center justify-end gap-2 sm:flex-none sm:gap-4">
+              <span className="whitespace-nowrap text-sm text-ink-soft sm:text-base">
+                合计 <span className="price text-xl align-middle sm:text-2xl">¥{fmt(total)}</span>
               </span>
-              <button type="submit" className="btn-primary text-sm sm:text-base px-4 sm:px-6 whitespace-nowrap" disabled={submitting}>
+              <button type="submit" className="btn-deal whitespace-nowrap px-4 text-sm sm:px-6 sm:text-base" disabled={submitting}>
                 {submitting ? '提交中…' : '提交订单'}
               </button>
             </div>
@@ -569,11 +580,14 @@ function PassengerCard({
   };
 
   return (
-    <div className="rounded-md border border-slate-200 bg-slate-50/50 p-4">
+    <div className="rounded-2xl border border-slate-200/80 bg-canvas p-4">
       <div className="flex items-center justify-between">
-        <h3 className="text-sm font-medium text-slate-700">出行人 #{idx + 1}</h3>
+        <h3 className="flex items-center gap-2 text-sm font-bold text-ink">
+          <span className="flex h-6 w-6 items-center justify-center rounded-full bg-brand-50 text-xs font-bold text-brand-700 nums">{idx + 1}</span>
+          出行人
+        </h3>
         <div className="flex items-center gap-3">
-          <label className="cursor-pointer text-xs text-brand hover:text-brand-dark">
+          <label className="chip cursor-pointer text-brand-700 transition hover:bg-brand-50 hover:text-brand-dark">
             {ocring ? `识别中… ${ocrStage?.pct.toFixed(0) ?? 0}%` : '📷 上传护照 OCR'}
             <input
               type="file"
@@ -587,25 +601,25 @@ function PassengerCard({
             />
           </label>
           {onRemove && (
-            <button type="button" className="text-xs text-slate-400 hover:text-red-600" onClick={onRemove}>
+            <button type="button" className="text-xs font-medium text-ink-muted transition hover:text-deal" onClick={onRemove}>
               删除
             </button>
           )}
         </div>
       </div>
       {ocring && ocrStage && (
-        <div className="mt-2 rounded bg-blue-50 border border-blue-200 px-3 py-2 text-xs text-blue-800">
-          <div className="flex items-center justify-between mb-1">
+        <div className="mt-2.5 rounded-xl border border-brand-200 bg-brand-50/60 px-3 py-2 text-xs text-brand-800">
+          <div className="mb-1 flex items-center justify-between">
             <span>{ocrStage.label}</span>
-            <span className="font-semibold">{ocrStage.pct.toFixed(0)}%</span>
+            <span className="font-semibold nums">{ocrStage.pct.toFixed(0)}%</span>
           </div>
-          <div className="h-1.5 bg-blue-100 rounded-full overflow-hidden">
-            <div className="h-full bg-blue-500 transition-all" style={{ width: `${ocrStage.pct}%` }} />
+          <div className="h-1.5 overflow-hidden rounded-full bg-brand-100">
+            <div className="h-full bg-brand transition-all" style={{ width: `${ocrStage.pct}%` }} />
           </div>
         </div>
       )}
       {ocrResult && (
-        <div className={`mt-2 rounded px-3 py-2 text-xs ${ocrResult.ok ? 'bg-green-50 text-green-700' : 'bg-amber-50 text-amber-800 border border-amber-200'}`}>
+        <div className={`mt-2.5 rounded-xl px-3 py-2 text-xs ${ocrResult.ok ? 'border border-brand-200 bg-brand-50/60 text-brand-800' : 'border border-sun/40 bg-sun-light text-amber-800'}`}>
           <div className="font-medium">{ocrResult.msg}</div>
           {ocrResult.preview && (
             <details className="mt-1 text-[10px] opacity-70">
@@ -616,8 +630,8 @@ function PassengerCard({
         </div>
       )}
       {imagePreview && (
-        <div className="mt-2">
-          <img src={imagePreview} alt="护照预览" className="max-h-24 rounded border border-slate-200" />
+        <div className="mt-2.5">
+          <img src={imagePreview} alt="护照预览" className="max-h-24 rounded-xl border border-slate-200" />
         </div>
       )}
       <div className="mt-3 grid gap-3 md:grid-cols-3">
@@ -694,10 +708,10 @@ function HoldCountdown({ expiresAt }: { expiresAt: string }) {
   const expired = leftMs === 0;
 
   return (
-    <div className={`mt-3 rounded-md px-3 py-2 text-sm ${
-      expired ? 'bg-red-50 text-red-700'
-        : leftMs < 5 * 60 * 1000 ? 'bg-amber-50 text-amber-700'
-        : 'bg-slate-50 text-slate-700'
+    <div className={`mt-4 rounded-xl px-3 py-2.5 text-sm ${
+      expired ? 'border border-deal/30 bg-deal-light text-deal-dark'
+        : leftMs < 5 * 60 * 1000 ? 'border border-sun/40 bg-sun-light text-amber-800'
+        : 'border border-slate-200/80 bg-canvas text-ink-soft'
     }`}>
       {expired ? (
         <>⚠ 支付超时，座位已自动释放。请返回购物车重新下单。</>

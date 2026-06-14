@@ -7,12 +7,14 @@ import { BENEFIT_ITEMS } from '../lib/notices';
 export function BenefitsStrip({ className }: { className?: string }) {
   return (
     <div
-      className={`flex flex-wrap items-center gap-x-4 gap-y-1.5 rounded-lg border border-amber-200 bg-amber-50 px-4 py-2.5 text-xs text-amber-800 ${className ?? ''}`}
+      className={`flex flex-wrap items-center gap-x-5 gap-y-2 rounded-2xl border border-sun/30 bg-sun-light px-4 py-3 text-xs text-amber-800 shadow-card ${className ?? ''}`}
     >
-      <span className="font-bold">🎁 福利享不停</span>
+      <span className="inline-flex items-center gap-1 rounded-full bg-white/70 px-2.5 py-1 font-extrabold text-amber-900">
+        🎁 福利享不停
+      </span>
       {BENEFIT_ITEMS.map((b) => (
-        <span key={b.text} className="inline-flex items-center gap-1">
-          <span aria-hidden>{b.emoji}</span>
+        <span key={b.text} className="inline-flex items-center gap-1.5 font-medium">
+          <span aria-hidden className="text-sm">{b.emoji}</span>
           {b.text}
         </span>
       ))}

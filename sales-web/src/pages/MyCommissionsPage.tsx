@@ -183,15 +183,15 @@ export function MyCommissionsPage() {
 
   return (
     <div className="space-y-5">
-      <section>
-        <h1 className="text-2xl font-bold text-slate-900">我的分成 · 佣金</h1>
-        <p className="mt-1 text-sm text-slate-600">
+      <section className="animate-fade-up">
+        <h1 className="text-2xl font-extrabold tracking-tight text-ink">我的分成 · 佣金</h1>
+        <p className="section-sub">
           按月查看自己 + 下级代理的佣金结算。结算单状态：草稿 → 待审批 → 已核准 → 已支付。
         </p>
       </section>
 
       {error && (
-        <div className="rounded-md bg-red-50 px-3 py-2 text-sm text-red-700">❌ {error}</div>
+        <div className="rounded-xl border border-deal/30 bg-deal-light px-3 py-2 text-sm font-medium text-deal-dark">❌ {error}</div>
       )}
 
       <section className="grid gap-3 md:grid-cols-4">
@@ -262,37 +262,37 @@ export function MyCommissionsPage() {
             </select>
           </div>
           <div className="flex items-end">
-            <span className="text-sm text-slate-500">显示 {filtered.length} 条</span>
+            <span className="text-sm text-ink-muted">显示 <span className="font-semibold text-ink nums">{filtered.length}</span> 条</span>
           </div>
         </div>
       </section>
 
-      <section className="card p-0 overflow-hidden">
+      <section className="card overflow-hidden p-0">
         <div className="overflow-x-auto">
-          <table className="min-w-full divide-y divide-slate-200 text-sm">
-            <thead className="bg-slate-50 text-xs uppercase text-slate-500">
+          <table className="min-w-full divide-y divide-slate-100 text-sm">
+            <thead className="bg-canvas text-xs uppercase tracking-wide text-ink-muted">
               <tr>
-                <th className="px-4 py-3 text-left">期次</th>
-                <th className="px-4 py-3 text-left">代理</th>
-                <th className="px-4 py-3 text-right">订单数</th>
-                <th className="px-4 py-3 text-right">销售额（GMV）</th>
-                <th className="px-4 py-3 text-right">应得佣金</th>
-                <th className="px-4 py-3 text-right">分给下级</th>
-                <th className="px-4 py-3 text-right">应付</th>
-                <th className="px-4 py-3 text-center">状态</th>
+                <th className="px-4 py-3 text-left font-semibold">期次</th>
+                <th className="px-4 py-3 text-left font-semibold">代理</th>
+                <th className="px-4 py-3 text-right font-semibold">订单数</th>
+                <th className="px-4 py-3 text-right font-semibold">销售额（GMV）</th>
+                <th className="px-4 py-3 text-right font-semibold">应得佣金</th>
+                <th className="px-4 py-3 text-right font-semibold">分给下级</th>
+                <th className="px-4 py-3 text-right font-semibold">应付</th>
+                <th className="px-4 py-3 text-center font-semibold">状态</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
               {loading && (
                 <tr>
-                  <td colSpan={8} className="px-4 py-8 text-center text-slate-400">
+                  <td colSpan={8} className="px-4 py-8 text-center text-ink-muted">
                     加载中…
                   </td>
                 </tr>
               )}
               {!loading && filtered.length === 0 && (
                 <tr>
-                  <td colSpan={8} className="px-4 py-8 text-center text-slate-500">
+                  <td colSpan={8} className="px-4 py-8 text-center text-ink-muted">
                     {settlements.length === 0
                       ? '暂无结算单 — 月底由管理员生成后会自动出现在这里'
                       : '没有符合条件的结算单'}
@@ -304,38 +304,38 @@ export function MyCommissionsPage() {
                 return (
                   <tr
                     key={s.id}
-                    className={`hover:bg-slate-50 cursor-pointer ${self ? 'bg-brand/5' : ''}`}
+                    className={`cursor-pointer transition-colors hover:bg-brand-50/50 ${self ? 'bg-brand-50/60' : ''}`}
                     onClick={() => setSelectedId(s.id)}
                   >
-                    <td className="px-4 py-3 font-mono text-xs">{s.period}</td>
+                    <td className="px-4 py-3 font-mono text-xs text-ink-soft nums">{s.period}</td>
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-2">
-                        <span className="text-sm font-medium text-slate-900">
+                        <span className="text-sm font-semibold text-ink">
                           {s.agent.companyName ?? s.agent.contactName}
                         </span>
                         {self && (
-                          <span className="rounded bg-brand px-1.5 py-0.5 text-[10px] font-semibold text-white">
+                          <span className="badge-deal text-[10px]">
                             我自己
                           </span>
                         )}
                       </div>
-                      <div className="mt-0.5 text-xs text-slate-500">
+                      <div className="mt-0.5 text-xs text-ink-muted">
                         {TIER_LABEL[s.agent.tier] ?? `${s.agent.tier} 级代理`} · {s.agent.email ?? '—'}
                       </div>
                     </td>
-                    <td className="px-4 py-3 text-right text-sm">{s.orderCount}</td>
-                    <td className="px-4 py-3 text-right text-sm text-slate-700">
+                    <td className="px-4 py-3 text-right text-sm text-ink nums">{s.orderCount}</td>
+                    <td className="px-4 py-3 text-right text-sm text-ink-soft nums">
                       {fmtMoney(s.grossRevenue)}
                     </td>
-                    <td className="px-4 py-3 text-right text-sm font-semibold text-emerald-700">
+                    <td className="px-4 py-3 text-right text-sm font-semibold text-emerald-700 nums">
                       {fmtMoney(s.commissionEarned)}
                     </td>
-                    <td className="px-4 py-3 text-right text-sm text-slate-500">
+                    <td className="px-4 py-3 text-right text-sm text-ink-muted nums">
                       {Number(s.commissionPaidToChildren) > 0
                         ? fmtMoney(s.commissionPaidToChildren)
                         : '—'}
                     </td>
-                    <td className="px-4 py-3 text-right text-sm font-bold text-slate-900">
+                    <td className="px-4 py-3 text-right text-sm font-bold text-ink nums">
                       {fmtMoney(s.payableToAgent)}
                       {Number(s.prepaymentOffset) > 0 && (
                         <div className="text-[10px] font-normal text-amber-700">
@@ -344,7 +344,7 @@ export function MyCommissionsPage() {
                       )}
                     </td>
                     <td className="px-4 py-3 text-center">
-                      <span className={`rounded px-2 py-0.5 text-xs ${STATUS_COLOR[s.status]}`}>
+                      <span className={`rounded-full px-2.5 py-0.5 text-xs font-semibold ${STATUS_COLOR[s.status]}`}>
                         {STATUS_LABEL[s.status]}
                       </span>
                     </td>
@@ -358,44 +358,44 @@ export function MyCommissionsPage() {
 
       {selectedId && (
         <div
-          className="fixed inset-0 z-50 flex justify-end bg-slate-900/50"
+          className="fixed inset-0 z-50 flex justify-end bg-ink/40 backdrop-blur-sm"
           onClick={() => setSelectedId(null)}
         >
           <div
-            className="h-full w-full max-w-xl overflow-auto bg-white shadow-xl"
+            className="h-full w-full max-w-xl animate-fade-in overflow-auto bg-surface shadow-pop"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="sticky top-0 flex items-center justify-between border-b border-slate-200 bg-white px-6 py-4">
-              <h2 className="text-lg font-semibold">结算单详情</h2>
+            <div className="sticky top-0 z-10 flex items-center justify-between border-b border-slate-200/80 bg-surface/95 px-6 py-4 backdrop-blur-xl">
+              <h2 className="section-title text-base">结算单详情</h2>
               <button
-                className="text-2xl leading-none text-slate-400 hover:text-slate-700"
+                className="text-2xl leading-none text-ink-muted transition hover:text-ink"
                 onClick={() => setSelectedId(null)}
               >
                 ×
               </button>
             </div>
             {detailLoading ? (
-              <div className="px-6 py-8 text-center text-slate-400">加载中…</div>
+              <div className="px-6 py-8 text-center text-ink-muted">加载中…</div>
             ) : !detail ? (
-              <div className="px-6 py-8 text-center text-slate-500">无法加载详情</div>
+              <div className="px-6 py-8 text-center text-ink-muted">无法加载详情</div>
             ) : (
-              <div className="px-6 py-5 space-y-5">
+              <div className="space-y-5 px-6 py-5">
                 <section>
-                  <div className="font-mono text-xs text-slate-500">{detail.period}</div>
-                  <div className="mt-1 text-lg font-semibold text-slate-900">
+                  <div className="font-mono text-xs text-ink-muted nums">{detail.period}</div>
+                  <div className="mt-1 text-lg font-bold text-ink">
                     {detail.agent.companyName ?? detail.agent.contactName}
                   </div>
-                  <div className="mt-0.5 flex items-center gap-2">
-                    <span className="rounded bg-slate-100 px-2 py-0.5 text-xs text-slate-600">
+                  <div className="mt-1.5 flex items-center gap-2">
+                    <span className="chip">
                       {TIER_LABEL[detail.agent.tier] ?? `${detail.agent.tier} 级代理`}
                     </span>
-                    <span className={`rounded px-2 py-0.5 text-xs ${STATUS_COLOR[detail.status]}`}>
+                    <span className={`rounded-full px-2.5 py-0.5 text-xs font-semibold ${STATUS_COLOR[detail.status]}`}>
                       {STATUS_LABEL[detail.status]}
                     </span>
                   </div>
                 </section>
 
-                <section className="rounded-md border border-slate-200 bg-slate-50 p-4 space-y-1.5 text-sm">
+                <section className="space-y-1.5 rounded-2xl border border-slate-200/80 bg-canvas p-4 text-sm">
                   <Row k="销售额（直销 GMV）" v={fmtMoney(detail.grossRevenue)} />
                   <Row k="应得佣金（已扣下级分成）" v={fmtMoney(detail.commissionEarned)} highlight="emerald" />
                   {Number(detail.commissionPaidToChildren) > 0 && (
@@ -405,15 +405,15 @@ export function MyCommissionsPage() {
                   {Number(detail.prepaymentOffset) > 0 && (
                     <Row k="预付余额抵扣" v={`−${fmtMoney(detail.prepaymentOffset)}`} subtle />
                   )}
-                  <div className="border-t border-slate-200 pt-2 flex items-center justify-between">
-                    <span className="text-sm font-medium text-slate-700">实际应付</span>
-                    <span className="text-xl font-bold text-slate-900">
+                  <div className="flex items-center justify-between border-t border-slate-200/80 pt-2">
+                    <span className="text-sm font-medium text-ink-soft">实际应付</span>
+                    <span className="text-xl font-bold text-ink nums">
                       {fmtMoney(detail.payableToAgent)}
                     </span>
                   </div>
                 </section>
 
-                <section className="text-xs text-slate-500 space-y-0.5">
+                <section className="space-y-0.5 text-xs text-ink-muted">
                   <div>生成于：{new Date(detail.generatedAt).toLocaleString('zh-CN')}</div>
                   {detail.approvedAt && (
                     <div>核准于：{new Date(detail.approvedAt).toLocaleString('zh-CN')}</div>
@@ -425,42 +425,42 @@ export function MyCommissionsPage() {
                 </section>
 
                 <section>
-                  <h3 className="text-sm font-semibold text-slate-900 mb-2">
+                  <h3 className="mb-2 section-title text-sm">
                     佣金明细（{detail.commissions.length} 笔）
                   </h3>
                   {detail.commissions.length === 0 ? (
-                    <div className="rounded-md bg-slate-50 px-3 py-4 text-center text-xs text-slate-500">
+                    <div className="rounded-xl bg-canvas px-3 py-4 text-center text-xs text-ink-muted">
                       本期无佣金记录
                     </div>
                   ) : (
-                    <div className="overflow-x-auto rounded-md border border-slate-200">
-                      <table className="min-w-full divide-y divide-slate-200 text-xs">
-                        <thead className="bg-slate-50 text-[10px] uppercase text-slate-500">
+                    <div className="overflow-x-auto rounded-xl border border-slate-200/80">
+                      <table className="min-w-full divide-y divide-slate-100 text-xs">
+                        <thead className="bg-canvas text-[10px] uppercase tracking-wide text-ink-muted">
                           <tr>
-                            <th className="px-3 py-2 text-left">订单</th>
-                            <th className="px-3 py-2 text-left">产品</th>
-                            <th className="px-3 py-2 text-right">基数</th>
-                            <th className="px-3 py-2 text-right">费率</th>
-                            <th className="px-3 py-2 text-right">金额</th>
+                            <th className="px-3 py-2 text-left font-semibold">订单</th>
+                            <th className="px-3 py-2 text-left font-semibold">产品</th>
+                            <th className="px-3 py-2 text-right font-semibold">基数</th>
+                            <th className="px-3 py-2 text-right font-semibold">费率</th>
+                            <th className="px-3 py-2 text-right font-semibold">金额</th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-100">
                           {detail.commissions.map((c) => (
                             <tr key={c.id}>
-                              <td className="px-3 py-2 font-mono text-[11px] text-slate-700">
+                              <td className="px-3 py-2 font-mono text-[11px] text-ink-soft nums">
                                 {c.order.orderNumber}
                                 {c.chainDepth > 0 && (
-                                  <div className="text-[10px] text-slate-400">
+                                  <div className="text-[10px] text-ink-muted">
                                     下级 +{c.chainDepth} 层
                                   </div>
                                 )}
                               </td>
-                              <td className="px-3 py-2 text-slate-600">{PRODUCT_LABEL[c.productKind]}</td>
-                              <td className="px-3 py-2 text-right text-slate-600">
+                              <td className="px-3 py-2 text-ink-soft">{PRODUCT_LABEL[c.productKind]}</td>
+                              <td className="px-3 py-2 text-right text-ink-soft nums">
                                 {fmtMoney(c.baseAmount)}
                               </td>
-                              <td className="px-3 py-2 text-right text-slate-600">{fmtRate(c.rate)}</td>
-                              <td className="px-3 py-2 text-right font-semibold text-emerald-700">
+                              <td className="px-3 py-2 text-right text-ink-soft nums">{fmtRate(c.rate)}</td>
+                              <td className="px-3 py-2 text-right font-semibold text-emerald-700 nums">
                                 {fmtMoney(c.amount)}
                               </td>
                             </tr>
@@ -491,9 +491,9 @@ function Row({
   subtle?: boolean;
 }) {
   return (
-    <div className={`flex items-center justify-between ${subtle ? 'text-slate-500' : ''}`}>
-      <span className="text-slate-600">{k}</span>
-      <span className={highlight === 'emerald' ? 'font-semibold text-emerald-700' : 'text-slate-900'}>
+    <div className={`flex items-center justify-between ${subtle ? 'text-ink-muted' : ''}`}>
+      <span className="text-ink-soft">{k}</span>
+      <span className={highlight === 'emerald' ? 'font-semibold text-emerald-700 nums' : 'text-ink nums'}>
         {v}
       </span>
     </div>
@@ -505,18 +505,18 @@ type KpiTone = 'brand' | 'indigo' | 'amber' | 'slate';
 function Kpi({ label, value, sub, tone }: { label: string; value: string; sub: string; tone: KpiTone }) {
   const bar: Record<KpiTone, string> = {
     brand: 'bg-brand',
-    indigo: 'bg-indigo-500',
-    amber: 'bg-amber-500',
-    slate: 'bg-slate-500',
+    indigo: 'bg-brand-400',
+    amber: 'bg-sun',
+    slate: 'bg-ink-muted',
   };
   return (
-    <div className="card p-3">
+    <div className="card p-4">
       <div className="flex items-center gap-2">
-        <span className={`h-8 w-1 rounded ${bar[tone]}`}></span>
-        <p className="text-xs font-medium uppercase text-slate-500">{label}</p>
+        <span className={`h-8 w-1 rounded-full ${bar[tone]}`}></span>
+        <p className="text-xs font-semibold uppercase tracking-wide text-ink-muted">{label}</p>
       </div>
-      <p className="mt-1.5 text-xl font-bold text-slate-900">{value}</p>
-      <p className="mt-0.5 text-xs text-slate-500">{sub}</p>
+      <p className="mt-2 text-xl font-extrabold text-ink nums">{value}</p>
+      <p className="mt-0.5 text-xs text-ink-muted">{sub}</p>
     </div>
   );
 }

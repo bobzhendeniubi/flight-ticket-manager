@@ -2,6 +2,7 @@ import { FormEvent, useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../stores/auth';
 
+// 极简 console 登录页：居中卡片 + 克制靛蓝，工具气质
 export function LoginPage() {
   const login = useAuth((s) => s.login);
   const isLoading = useAuth((s) => s.isLoading);
@@ -30,16 +31,23 @@ export function LoginPage() {
   };
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-slate-900 px-4">
-      <div className="w-full max-w-sm">
-        <div className="text-center text-white mb-6">
-          <h1 className="text-2xl font-bold">世途旅行 · 后台</h1>
-          <p className="mt-2 text-sm text-slate-400">运营 / 管理员 / 代理 入口</p>
+    <div className="flex min-h-screen items-center justify-center bg-canvas px-4">
+      <div className="w-full max-w-sm animate-fade-in">
+        {/* Logo 锁定区 */}
+        <div className="mb-6 flex items-center gap-2.5">
+          <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-brand text-sm font-bold text-white">
+            世
+          </div>
+          <div className="leading-tight">
+            <p className="text-sm font-semibold text-ink">世途旅行 · 运营后台</p>
+            <p className="text-xs text-ink-muted">Operations Console</p>
+          </div>
         </div>
-        <div className="rounded-lg bg-white p-6 shadow-xl">
-          <h2 className="text-lg font-semibold text-slate-900">账号登录</h2>
-          <p className="mt-1 text-xs text-slate-500">
-            ADMIN / STAFF 见全部数据；AGENT 只能看自己树内的订单、客户、结算
+
+        <div className="rounded-xl border border-slate-200 bg-white p-6 shadow-card">
+          <h1 className="text-lg font-semibold text-ink">登录</h1>
+          <p className="mt-1 text-xs text-ink-soft">
+            ADMIN / STAFF 见全部数据；AGENT 仅限自己树内的订单、客户、结算。
           </p>
 
           <form className="mt-5 space-y-4" onSubmit={onSubmit}>
@@ -69,7 +77,7 @@ export function LoginPage() {
               />
             </div>
             {error && (
-              <p role="alert" className="rounded-md bg-red-50 px-3 py-2 text-sm text-red-700">
+              <p role="alert" className="rounded-lg bg-rose-50 px-3 py-2 text-sm text-rose-700">
                 {error}
               </p>
             )}
@@ -78,19 +86,21 @@ export function LoginPage() {
             </button>
           </form>
 
-          <div className="mt-5 rounded-md bg-slate-50 p-3 text-xs text-slate-600">
-            <p className="font-medium text-slate-700">开发账号（密码 <code>Password123!</code>）</p>
-            <p className="mt-1 font-mono">admin@ftm.local · <span className="text-slate-400">运营全权限</span></p>
-            <p className="mt-1 font-mono">agent1@ftm.local · <span className="text-slate-400">代理端（只看自己树）</span></p>
-            <p className="mt-2 text-slate-500">
-              客户请到{' '}
-              <a href="http://localhost:5173" className="text-brand hover:underline">
-                前台 :5173
-              </a>{' '}
-              登录购买。
+          <div className="mt-5 rounded-lg border border-slate-100 bg-canvas p-3 text-xs text-ink-soft">
+            <p className="font-medium text-ink-soft">
+              开发账号 · 密码 <code className="rounded bg-white px-1 py-0.5 text-brand-700">Password123!</code>
             </p>
+            <p className="mt-1.5 font-mono text-[11px]">admin@ftm.local · 运营全权限</p>
+            <p className="mt-1 font-mono text-[11px]">agent1@ftm.local · 代理端（只看自己树）</p>
           </div>
         </div>
+
+        <p className="mt-4 text-center text-xs text-ink-muted">
+          客户购买请前往{' '}
+          <a href="http://localhost:5173" className="font-medium text-brand hover:underline">
+            前台商城
+          </a>
+        </p>
       </div>
     </div>
   );

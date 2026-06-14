@@ -25,12 +25,13 @@ const VISA_STATUS_LABEL: Record<FulfillmentStatus, string> = {
   FAILED: '失败',
 };
 
-const VISA_STATUS_COLOR: Record<FulfillmentStatus, string> = {
-  PENDING: 'bg-slate-100 text-slate-600',
-  IN_PROGRESS: 'bg-blue-100 text-blue-700',
-  CONFIRMED: 'bg-green-100 text-green-700',
-  CANCELLED: 'bg-slate-200 text-slate-500',
-  FAILED: 'bg-red-100 text-red-700',
+// 状态徽章映射到 Console badge-* 体系（克制配色，仅状态用色）
+const VISA_STATUS_BADGE: Record<FulfillmentStatus, string> = {
+  PENDING: 'badge-neutral',
+  IN_PROGRESS: 'badge-info',
+  CONFIRMED: 'badge-success',
+  CANCELLED: 'badge-neutral',
+  FAILED: 'badge-danger',
 };
 
 // 批量流转的目标状态（签证台只做"材料准备 / 已送签"两档）
@@ -160,12 +161,12 @@ export function VisaDeskPage() {
     <div className="space-y-6">
       <section className="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-bold text-slate-900">签证台</h1>
-          <p className="mt-1 text-sm text-slate-600">
+          <h1 className="page-title">签证台</h1>
+          <p className="page-sub">
             签证履约任务批量流转：勾选订单后一键标记
-            <span className="mx-1 rounded bg-blue-100 px-1.5 py-0.5 text-xs text-blue-700">已送签材料准备</span>
+            <span className="badge-info mx-1">已送签材料准备</span>
             或
-            <span className="mx-1 rounded bg-green-100 px-1.5 py-0.5 text-xs text-green-700">已送签</span>
+            <span className="badge-success mx-1">已送签</span>
             。
           </p>
         </div>
@@ -187,20 +188,20 @@ export function VisaDeskPage() {
       </section>
 
       {error && (
-        <div className="rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800">
-          ❌ {error}
+        <div className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+          {error}
         </div>
       )}
 
       {/* ── 批量操作工具条 ───────────────────────────────────── */}
       {selectedIds.size > 0 && (
-        <section className="card border-2 border-brand bg-brand/5">
+        <section className="card border-brand-200 bg-brand-50/60">
           <div className="flex flex-wrap items-center gap-3">
-            <span className="text-sm font-semibold text-slate-900">
+            <span className="text-sm font-semibold text-ink">
               已选 <span className="text-brand">{selectedIds.size}</span> 条签证任务
             </span>
             <span className="text-slate-300">|</span>
-            <label className="text-sm text-slate-600">批量标记为：</label>
+            <label className="text-sm text-ink-soft">批量标记为：</label>
             <select
               className="input max-w-[12rem] py-1.5"
               value={batchTarget}
@@ -212,14 +213,14 @@ export function VisaDeskPage() {
               ))}
             </select>
             <button
-              className="btn-primary text-sm py-1.5 disabled:opacity-50"
+              className="btn-primary py-1.5"
               onClick={() => void applyBatch()}
               disabled={submitting}
             >
               {submitting ? '处理中…' : '执行'}
             </button>
             <button
-              className="text-sm text-slate-600 hover:text-slate-900"
+              className="btn-ghost py-1.5"
               onClick={clearSelection}
               disabled={submitting}
             >
@@ -227,15 +228,15 @@ export function VisaDeskPage() {
             </button>
           </div>
           {batchResult && (
-            <div className="mt-3 rounded-md bg-white px-3 py-2 text-xs">
-              <div className="text-slate-700">
-                ✓ 成功 {batchResult.successCount} 条
+            <div className="mt-3 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs">
+              <div className="text-ink-soft">
+                成功 {batchResult.successCount} 条
                 {batchResult.failureCount > 0 && (
-                  <span className="ml-3 text-red-600">✗ 失败 {batchResult.failureCount} 条</span>
+                  <span className="ml-3 text-rose-600">失败 {batchResult.failureCount} 条</span>
                 )}
               </div>
               {batchResult.failures.length > 0 && (
-                <ul className="mt-1 max-h-32 overflow-auto text-red-600">
+                <ul className="mt-1 max-h-32 overflow-auto text-rose-600">
                   {batchResult.failures.map((f) => (
                     <li key={f.id} className="font-mono text-[11px]">· {f.id.slice(0, 8)}…：{f.error}</li>
                   ))}
@@ -249,10 +250,10 @@ export function VisaDeskPage() {
       {/* ── 任务列表 ─────────────────────────────────────────── */}
       <section className="card p-0 overflow-hidden">
         <div className="overflow-x-auto">
-          <table className="min-w-full divide-y divide-slate-200 text-sm">
-            <thead className="bg-slate-50 text-xs uppercase text-slate-500">
+          <table className="table-admin">
+            <thead>
               <tr>
-                <th className="px-4 py-3 text-center w-10">
+                <th className="w-10 text-center">
                   <input
                     type="checkbox"
                     aria-label="全选当前列表"
@@ -261,20 +262,20 @@ export function VisaDeskPage() {
                     onChange={toggleAllVisible}
                   />
                 </th>
-                <th className="px-4 py-3 text-left">订单号</th>
-                <th className="px-4 py-3 text-right">乘客数</th>
-                <th className="px-4 py-3 text-left">备注</th>
-                <th className="px-4 py-3 text-center">当前状态</th>
+                <th>订单号</th>
+                <th className="text-right">乘客数</th>
+                <th>备注</th>
+                <th className="text-center">当前状态</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-100">
+            <tbody>
               {loading ? (
                 <tr>
-                  <td colSpan={5} className="px-4 py-6 text-center text-slate-500">加载签证任务…</td>
+                  <td colSpan={5} className="py-6 text-center text-ink-muted">加载签证任务…</td>
                 </tr>
               ) : filtered.length === 0 ? (
                 <tr>
-                  <td colSpan={5} className="px-4 py-6 text-center text-slate-400">
+                  <td colSpan={5} className="py-6 text-center text-ink-muted">
                     该筛选条件下暂无签证任务
                   </td>
                 </tr>
@@ -282,9 +283,9 @@ export function VisaDeskPage() {
                 filtered.map((task) => (
                   <tr
                     key={task.id}
-                    className={`hover:bg-slate-50 ${selectedIds.has(task.id) ? 'bg-brand/5' : ''}`}
+                    className={selectedIds.has(task.id) ? 'bg-brand-50/70' : ''}
                   >
-                    <td className="px-4 py-3 text-center">
+                    <td className="text-center">
                       <input
                         type="checkbox"
                         aria-label={`选择订单 ${task.order?.orderNumber ?? task.id}`}
@@ -292,17 +293,17 @@ export function VisaDeskPage() {
                         onChange={() => toggleRow(task.id)}
                       />
                     </td>
-                    <td className="px-4 py-3 font-mono text-xs text-slate-700">
+                    <td className="font-mono text-xs text-ink">
                       {task.order?.orderNumber ?? '—'}
                     </td>
-                    <td className="px-4 py-3 text-right tabular-nums">{task.item.quantity}</td>
-                    <td className="px-4 py-3 text-xs text-slate-500">
+                    <td className="text-right nums">{task.item.quantity}</td>
+                    <td className="text-xs text-ink-muted">
                       <div className="max-w-xs truncate" title={task.order?.notes ?? undefined}>
                         {task.order?.notes ?? '—'}
                       </div>
                     </td>
-                    <td className="px-4 py-3 text-center">
-                      <span className={`inline-block rounded-full px-2 py-0.5 text-xs ${VISA_STATUS_COLOR[task.status]}`}>
+                    <td className="text-center">
+                      <span className={VISA_STATUS_BADGE[task.status]}>
                         {VISA_STATUS_LABEL[task.status]}
                       </span>
                     </td>

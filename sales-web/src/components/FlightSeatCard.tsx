@@ -118,17 +118,17 @@ export function FlightSeatCard({
 
   return (
     <div
-      className={`rounded-md border px-3 py-2 text-sm ${
-        enough ? 'border-slate-200 bg-white' : 'border-slate-100 bg-slate-50 text-slate-400'
+      className={`rounded-xl border px-3 py-2.5 text-sm transition-colors ${
+        enough ? 'border-slate-200 bg-white hover:border-brand/30' : 'border-slate-100 bg-canvas text-ink-muted'
       }`}
     >
       <div className="flex items-center justify-between">
-        <span className="font-medium text-slate-700">{CABIN_LABEL[cabin.cabin] ?? cabin.cabin}</span>
-        <div className="text-right">
+        <span className="font-semibold text-ink">{CABIN_LABEL[cabin.cabin] ?? cabin.cabin}</span>
+        <div className="flex items-baseline gap-1 text-right">
           {Number(cabin.dynamicPrice) !== Number(cabin.basePrice) && (
-            <span className="text-xs text-slate-400 line-through mr-1">¥{Number(cabin.basePrice).toFixed(0)}</span>
+            <span className="price-old">¥{Number(cabin.basePrice).toFixed(0)}</span>
           )}
-          <span className="font-semibold text-red-600">¥{Number(cabin.dynamicPrice).toFixed(0)}</span>
+          <span className="price text-base">¥{Number(cabin.dynamicPrice).toFixed(0)}</span>
         </div>
       </div>
       {/* 买家只看档位徽章 —— 精确余票数（available/capacity）仅内部用于禁用逻辑 */}
@@ -142,20 +142,20 @@ export function FlightSeatCard({
       {/* 行李额（按 航班×舱等 配置；未配置不显示；note 直接展示一行，超长截断 + title 悬停看全文） */}
       {cabin.baggage && formatBaggage(cabin.baggage) && (
         <div
-          className="mt-1 text-[11px] leading-snug text-slate-500"
+          className="mt-1.5 text-[11px] leading-snug text-ink-soft"
           title={cabin.baggage.note ?? undefined}
         >
           🧳 {formatBaggage(cabin.baggage)}
           {cabin.baggage.note && (
-            <div className="max-w-[30ch] truncate text-[10px] text-slate-400" title={cabin.baggage.note}>
+            <div className="max-w-[30ch] truncate text-[10px] text-ink-muted" title={cabin.baggage.note}>
               {cabin.baggage.note}
             </div>
           )}
         </div>
       )}
-      <div className="mt-2 flex gap-1.5">
+      <div className="mt-2.5 flex gap-1.5">
       <button
-        className="btn-primary flex-1 text-xs py-1"
+        className="btn-deal flex-1 text-xs py-1.5"
         disabled={!enough}
         onClick={() => {
           // 使用 totalForQty 精确总价（服务端 per-seat 累加），避免 round(avg)*qty 造成 1-2 元舍入差

@@ -15,9 +15,9 @@ type Severity = AuditLog['severity'];
 type TargetType = AuditLog['targetType'];
 
 const SEVERITY_COLOR: Record<Severity, string> = {
-  INFO: 'bg-slate-100 text-slate-600',
-  WARNING: 'bg-amber-100 text-amber-700',
-  CRITICAL: 'bg-red-100 text-red-700',
+  INFO: 'badge-neutral',
+  WARNING: 'badge-warning',
+  CRITICAL: 'badge-danger',
 };
 
 const SEVERITY_LABEL: Record<Severity, string> = {
@@ -160,61 +160,61 @@ export function AuditLogsPage() {
 
   return (
     <div className="space-y-4">
-      <section className="grid gap-3 md:grid-cols-5">
-        <Kpi label="总日志数" value={kpi.total.toString()} sub="最近 90 天" color="bg-brand" />
-        <Kpi label="关键事件" value={kpi.critical.toString()} sub="支付 / 结算 / 权限" color="bg-red-600" />
-        <Kpi label="警告事件" value={kpi.warning.toString()} sub="退款 / 强制改状态" color="bg-amber-500" />
-        <Kpi label="今日动作" value={kpi.today.toString()} sub="截至现在" color="bg-green-600" />
-        <div className="card p-3 flex flex-col justify-between">
-          <p className="text-xs font-medium uppercase text-slate-500">导出</p>
-          <button
-            className="btn-primary text-sm mt-2"
-            onClick={() =>
-              exportToCSV(
-                '审计日志',
-                filtered.map((l) => ({
-                  timestamp: new Date(l.timestamp).toLocaleString('zh-CN'),
-                  actor: l.actor,
-                  actorRole: l.actorRole,
-                  ip: l.ip,
-                  action: l.actionLabel,
-                  rawAction: l.rawAction,
-                  targetType: TARGET_LABEL[l.targetType],
-                  target: l.targetLabel,
-                  changes: l.diffLines.map((d) => `${d.prefix} ${d.text}`).join(' | '),
-                  severity: SEVERITY_LABEL[l.severity],
-                })),
-                [
-                  { key: 'timestamp', label: '时间' },
-                  { key: 'actor', label: '操作人' },
-                  { key: 'actorRole', label: '角色' },
-                  { key: 'ip', label: 'IP' },
-                  { key: 'action', label: '动作' },
-                  { key: 'rawAction', label: '动作代码' },
-                  { key: 'targetType', label: '对象类型' },
-                  { key: 'target', label: '对象' },
-                  { key: 'changes', label: '变更' },
-                  { key: 'severity', label: '严重度' },
-                ],
-              )
-            }
-          >
-            📥 导出 CSV
-          </button>
+      <section className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h1 className="page-title">审计日志</h1>
+          <p className="page-sub">
+            所有敏感操作留痕 · 谁 / 何时 / 在哪 / 改了什么。合规与纠纷追责的基础。
+          </p>
         </div>
+        <button
+          className="btn-secondary"
+          onClick={() =>
+            exportToCSV(
+              '审计日志',
+              filtered.map((l) => ({
+                timestamp: new Date(l.timestamp).toLocaleString('zh-CN'),
+                actor: l.actor,
+                actorRole: l.actorRole,
+                ip: l.ip,
+                action: l.actionLabel,
+                rawAction: l.rawAction,
+                targetType: TARGET_LABEL[l.targetType],
+                target: l.targetLabel,
+                changes: l.diffLines.map((d) => `${d.prefix} ${d.text}`).join(' | '),
+                severity: SEVERITY_LABEL[l.severity],
+              })),
+              [
+                { key: 'timestamp', label: '时间' },
+                { key: 'actor', label: '操作人' },
+                { key: 'actorRole', label: '角色' },
+                { key: 'ip', label: 'IP' },
+                { key: 'action', label: '动作' },
+                { key: 'rawAction', label: '动作代码' },
+                { key: 'targetType', label: '对象类型' },
+                { key: 'target', label: '对象' },
+                { key: 'changes', label: '变更' },
+                { key: 'severity', label: '严重度' },
+              ],
+            )
+          }
+        >
+          📥 导出 CSV
+        </button>
       </section>
 
-      <section>
-        <h1 className="text-2xl font-bold text-slate-900">审计日志</h1>
-        <p className="mt-1 text-sm text-slate-600">
-          所有敏感操作留痕 · 谁 / 何时 / 在哪 / 改了什么。合规与纠纷追责的基础。
-        </p>
-        {loading && (
-          <div className="mt-2 rounded-md bg-slate-50 px-3 py-2 text-xs text-slate-500">加载中…</div>
-        )}
-        {error && (
-          <div className="mt-2 rounded-md bg-red-50 px-3 py-2 text-xs text-red-700">❌ {error}</div>
-        )}
+      {loading && (
+        <div className="rounded-md bg-canvas px-3 py-2 text-xs text-ink-muted">加载中…</div>
+      )}
+      {error && (
+        <div className="rounded-md bg-rose-50 px-3 py-2 text-xs text-rose-700">❌ {error}</div>
+      )}
+
+      <section className="grid gap-3 md:grid-cols-4">
+        <Kpi label="总日志数" value={kpi.total.toString()} sub="最近 90 天" />
+        <Kpi label="关键事件" value={kpi.critical.toString()} sub="支付 / 结算 / 权限" />
+        <Kpi label="警告事件" value={kpi.warning.toString()} sub="退款 / 强制改状态" />
+        <Kpi label="今日动作" value={kpi.today.toString()} sub="截至现在" />
       </section>
 
       <section className="card">
@@ -272,21 +272,21 @@ export function AuditLogsPage() {
 
       <section className="card p-0 overflow-hidden">
         <div className="overflow-x-auto">
-          <table className="min-w-full divide-y divide-slate-200 text-sm">
-            <thead className="bg-slate-50 text-xs uppercase text-slate-500">
+          <table className="table-admin">
+            <thead>
               <tr>
-                <th className="px-4 py-3 text-left">时间</th>
-                <th className="px-4 py-3 text-left">操作人</th>
-                <th className="px-4 py-3 text-left">动作</th>
-                <th className="px-4 py-3 text-left">对象</th>
-                <th className="px-4 py-3 text-left">变更摘要</th>
-                <th className="px-4 py-3 text-center">严重度</th>
+                <th className="text-left">时间</th>
+                <th className="text-left">操作人</th>
+                <th className="text-left">动作</th>
+                <th className="text-left">对象</th>
+                <th className="text-left">变更摘要</th>
+                <th className="text-center">严重度</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-100">
+            <tbody>
               {filtered.map((l) => (
-                <tr key={l.id} className="hover:bg-slate-50 cursor-pointer" onClick={() => setSelected(l)}>
-                  <td className="px-4 py-3 text-xs font-mono text-slate-600">
+                <tr key={l.id} className="cursor-pointer" onClick={() => setSelected(l)}>
+                  <td className="text-xs font-mono text-ink-soft">
                     {new Date(l.timestamp).toLocaleString('zh-CN', {
                       month: '2-digit',
                       day: '2-digit',
@@ -295,29 +295,29 @@ export function AuditLogsPage() {
                       second: '2-digit',
                     })}
                   </td>
-                  <td className="px-4 py-3 text-xs">
-                    <div className="font-medium text-slate-700">{l.actor}</div>
-                    <div className="text-[10px] text-slate-400">
+                  <td className="text-xs">
+                    <div className="font-medium text-ink-soft">{l.actor}</div>
+                    <div className="text-[10px] text-ink-muted">
                       {l.actorRole} · {l.ip}
                     </div>
                   </td>
-                  <td className="px-4 py-3 text-sm">
+                  <td className="text-sm">
                     <span className="mr-1.5">{l.actionEmoji}</span>
-                    <span className="font-medium text-slate-800">{l.actionLabel}</span>
-                    <div className="mt-0.5 font-mono text-[10px] text-slate-400">{l.rawAction}</div>
+                    <span className="font-medium text-ink">{l.actionLabel}</span>
+                    <div className="mt-0.5 font-mono text-[10px] text-ink-muted">{l.rawAction}</div>
                   </td>
-                  <td className="px-4 py-3 text-xs">
+                  <td className="text-xs">
                     <span className="mr-1">{TARGET_ICON[l.targetType]}</span>
-                    <span className="text-slate-700">{l.targetLabel}</span>
-                    <div className="mt-0.5 text-[10px] text-slate-400">{TARGET_LABEL[l.targetType]}</div>
+                    <span className="text-ink-soft">{l.targetLabel}</span>
+                    <div className="mt-0.5 text-[10px] text-ink-muted">{TARGET_LABEL[l.targetType]}</div>
                   </td>
-                  <td className="px-4 py-3 text-xs text-slate-600">
+                  <td className="text-xs text-ink-soft">
                     <div className="max-w-md truncate" title={l.diffSummary}>
                       {l.diffSummary}
                     </div>
                   </td>
-                  <td className="px-4 py-3 text-center">
-                    <span className={`rounded px-2 py-0.5 text-xs font-medium ${SEVERITY_COLOR[l.severity]}`}>
+                  <td className="text-center">
+                    <span className={SEVERITY_COLOR[l.severity]}>
                       {SEVERITY_LABEL[l.severity]}
                     </span>
                   </td>
@@ -325,7 +325,7 @@ export function AuditLogsPage() {
               ))}
               {filtered.length === 0 && !loading && (
                 <tr>
-                  <td colSpan={6} className="px-4 py-8 text-center text-slate-500">
+                  <td colSpan={6} className="px-4 py-8 text-center text-ink-muted">
                     没有符合条件的日志
                   </td>
                 </tr>
@@ -397,7 +397,7 @@ export function AuditLogsPage() {
                 )}
               </Field>
               <Field label="严重度">
-                <span className={`rounded px-2 py-0.5 text-xs ${SEVERITY_COLOR[selected.severity]}`}>
+                <span className={SEVERITY_COLOR[selected.severity]}>
                   {SEVERITY_LABEL[selected.severity]}
                 </span>
               </Field>
@@ -426,15 +426,12 @@ function Field({ label, children }: { label: string; children: React.ReactNode }
   );
 }
 
-function Kpi({ label, value, sub, color }: { label: string; value: string; sub: string; color: string }) {
+function Kpi({ label, value, sub }: { label: string; value: string; sub: string }) {
   return (
-    <div className="card p-3">
-      <div className="flex items-center gap-2">
-        <span className={`h-8 w-1 rounded ${color}`}></span>
-        <p className="text-xs font-medium uppercase text-slate-500">{label}</p>
-      </div>
-      <p className="mt-1.5 text-2xl font-bold text-slate-900">{value}</p>
-      <p className="mt-0.5 text-xs text-slate-500">{sub}</p>
+    <div className="stat-card">
+      <p className="stat-label">{label}</p>
+      <p className="stat-value">{value}</p>
+      <p className="mt-0.5 text-xs text-ink-muted">{sub}</p>
     </div>
   );
 }

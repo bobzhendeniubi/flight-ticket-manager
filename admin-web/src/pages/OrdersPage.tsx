@@ -26,19 +26,19 @@ const STATUS_LABEL: Record<OrderStatus, string> = {
 };
 
 const STATUS_COLOR: Record<OrderStatus, string> = {
-  DRAFT: 'bg-slate-100 text-slate-600',
-  PENDING_PAYMENT: 'bg-amber-100 text-amber-700',
-  PAID: 'bg-blue-100 text-blue-700',
-  PROCESSING: 'bg-indigo-100 text-indigo-700',
-  TICKETED: 'bg-green-100 text-green-700',
-  COMPLETED: 'bg-slate-100 text-slate-700',
-  PAYMENT_TIMEOUT: 'bg-orange-100 text-orange-700',
-  CANCELLED: 'bg-slate-200 text-slate-500',
-  REFUND_REQUESTED: 'bg-red-100 text-red-700',
-  REFUNDED: 'bg-red-200 text-red-800',
-  CHANGE_REQUESTED: 'bg-violet-100 text-violet-700',
-  CHANGED: 'bg-violet-200 text-violet-800',
-  FAILED: 'bg-rose-100 text-rose-700',
+  DRAFT: 'badge-neutral',
+  PENDING_PAYMENT: 'badge-warning',
+  PAID: 'badge-info',
+  PROCESSING: 'badge-info',
+  TICKETED: 'badge-success',
+  COMPLETED: 'badge-neutral',
+  PAYMENT_TIMEOUT: 'badge-warning',
+  CANCELLED: 'badge-neutral',
+  REFUND_REQUESTED: 'badge-danger',
+  REFUNDED: 'badge-danger',
+  CHANGE_REQUESTED: 'badge-info',
+  CHANGED: 'badge-info',
+  FAILED: 'badge-danger',
 };
 
 const FILTER_STATUSES: OrderStatus[] = [
@@ -351,15 +351,15 @@ export function OrdersPage() {
 
   return (
     <div className="space-y-6">
-      <section className="flex items-start justify-between">
+      <section className="flex items-start justify-between gap-4">
         <div>
-          <h1 className="text-2xl font-bold text-slate-900">订单管理</h1>
-          <p className="mt-1 text-sm text-slate-600">
+          <h1 className="page-title">订单管理</h1>
+          <p className="page-sub">
             全渠道订单实时视图，可按状态和产品筛选，点击订单查看详情并操作状态流转。
           </p>
         </div>
-        <div className="flex items-center gap-2">
-          <span className="rounded bg-slate-100 px-3 py-1 text-xs text-slate-600">
+        <div className="flex flex-wrap items-center justify-end gap-2">
+          <span className="badge-neutral">
             {loading ? '加载中…' : `共 ${filtered.length} 条`}
           </span>
           <button
@@ -426,41 +426,41 @@ export function OrdersPage() {
       </section>
 
       {error && (
-        <div className="rounded-md bg-red-50 border border-red-200 px-4 py-3 text-sm text-red-800">
-          ❌ {error}
+        <div className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+          {error}
         </div>
       )}
 
       {/* 代理维度统计 */}
       <section className="card">
         <div className="flex items-center justify-between mb-3">
-          <h2 className="text-sm font-semibold text-slate-900">代理分销统计（仅含已付款订单）</h2>
-          <span className="text-xs text-slate-500">点击代理名称可过滤订单</span>
+          <h2 className="text-sm font-semibold text-ink">代理分销统计（仅含已付款订单）</h2>
+          <span className="text-xs text-ink-muted">点击代理名称可过滤订单</span>
         </div>
         <div className="grid gap-2 md:grid-cols-3">
           <button
-            className={`rounded-md border-2 p-3 text-left transition ${channelFilter === 'direct' && !agentFilter ? 'border-brand bg-brand/5' : 'border-slate-200 hover:border-slate-300'}`}
+            className={`rounded-lg border p-3 text-left transition ${channelFilter === 'direct' && !agentFilter ? 'border-brand bg-brand-50 ring-1 ring-brand/20' : 'border-slate-200 hover:border-slate-300 hover:bg-slate-50/60'}`}
             onClick={() => { setChannelFilter('direct'); setAgentFilter(''); }}
           >
             <div className="flex items-center justify-between">
-              <span className="text-sm font-medium text-slate-700">🏢 直销（散客/自营）</span>
-              <span className="text-xs text-slate-500">{agentStats.direct.orders} 单</span>
+              <span className="text-sm font-medium text-ink-soft">🏢 直销（散客/自营）</span>
+              <span className="text-xs text-ink-muted">{agentStats.direct.orders} 单</span>
             </div>
-            <div className="mt-1 text-lg font-bold text-slate-900">¥{agentStats.direct.revenue.toLocaleString()}</div>
-            <div className="text-xs text-slate-500">无佣金</div>
+            <div className="nums mt-1 text-lg font-semibold text-ink">¥{agentStats.direct.revenue.toLocaleString()}</div>
+            <div className="text-xs text-ink-muted">无佣金</div>
           </button>
           {Array.from(agentStats.byAgent.entries()).slice(0, 2).map(([name, s]) => (
             <button
               key={name}
-              className={`rounded-md border-2 p-3 text-left transition ${agentFilter === name ? 'border-brand bg-brand/5' : 'border-slate-200 hover:border-slate-300'}`}
+              className={`rounded-lg border p-3 text-left transition ${agentFilter === name ? 'border-brand bg-brand-50 ring-1 ring-brand/20' : 'border-slate-200 hover:border-slate-300 hover:bg-slate-50/60'}`}
               onClick={() => { setAgentFilter(agentFilter === name ? '' : name); setChannelFilter(''); }}
             >
               <div className="flex items-center justify-between">
-                <span className="text-sm font-medium text-slate-700 truncate">🤝 {name}</span>
-                <span className="text-xs text-slate-500">{s.orders} 单</span>
+                <span className="truncate text-sm font-medium text-ink-soft">🤝 {name}</span>
+                <span className="text-xs text-ink-muted">{s.orders} 单</span>
               </div>
-              <div className="mt-1 text-lg font-bold text-slate-900">¥{s.revenue.toLocaleString()}</div>
-              <div className="text-xs text-green-700">佣金 ¥{Math.round(s.commission).toLocaleString()}</div>
+              <div className="nums mt-1 text-lg font-semibold text-ink">¥{s.revenue.toLocaleString()}</div>
+              <div className="text-xs text-emerald-700">佣金 ¥{Math.round(s.commission).toLocaleString()}</div>
             </button>
           ))}
         </div>
@@ -607,13 +607,13 @@ export function OrdersPage() {
 
       {/* ── 批量管理工具条 ───────────────────────────────────── */}
       {selectedIds.size > 0 && (
-        <section className="card border-2 border-brand bg-brand/5">
+        <section className="card border-brand bg-brand-50 ring-1 ring-brand/15">
           <div className="flex flex-wrap items-center gap-3">
-            <span className="text-sm font-semibold text-slate-900">
+            <span className="text-sm font-semibold text-ink">
               已选 <span className="text-brand">{selectedIds.size}</span> 条订单
             </span>
             <span className="text-slate-300">|</span>
-            <label className="text-sm text-slate-600">改为：</label>
+            <label className="text-sm text-ink-soft">改为：</label>
             <select
               className="input max-w-[10rem] py-1.5"
               value={bulkStatus}
@@ -625,9 +625,10 @@ export function OrdersPage() {
                 <option key={s} value={s}>{STATUS_LABEL[s]}</option>
               ))}
             </select>
-            <label className="flex items-center gap-1.5 text-sm text-slate-600">
+            <label className="flex items-center gap-1.5 text-sm text-ink-soft">
               <input
                 type="checkbox"
+                className="accent-brand"
                 checked={forceMode}
                 onChange={(e) => setForceMode(e.target.checked)}
                 disabled={bulkSubmitting}
@@ -642,7 +643,7 @@ export function OrdersPage() {
               {bulkSubmitting ? '处理中…' : `应用到 ${selectedIds.size} 条`}
             </button>
             <button
-              className="text-sm text-slate-600 hover:text-slate-900"
+              className="btn-ghost text-sm"
               onClick={clearSelection}
               disabled={bulkSubmitting}
             >
@@ -650,11 +651,11 @@ export function OrdersPage() {
             </button>
           </div>
           {bulkResult && (
-            <div className="mt-3 rounded-md bg-white px-3 py-2 text-xs">
-              <div className="text-slate-700">
+            <div className="mt-3 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs">
+              <div className="text-ink-soft">
                 ✓ 成功 {bulkResult.successCount} 条
                 {bulkResult.failureCount > 0 && (
-                  <span className="ml-3 text-red-600">✗ 失败 {bulkResult.failureCount} 条</span>
+                  <span className="ml-3 text-rose-600">✗ 失败 {bulkResult.failureCount} 条</span>
                 )}
               </div>
               {bulkResult.failures.length > 0 && (
@@ -671,82 +672,84 @@ export function OrdersPage() {
 
       <section className="card p-0 overflow-hidden">
         <div className="overflow-x-auto">
-          <table className="min-w-full divide-y divide-slate-200 text-sm">
-            <thead className="bg-slate-50 text-xs uppercase text-slate-500">
+          <table className="table-admin">
+            <thead>
               <tr>
-                <th className="px-4 py-3 text-center w-10">
+                <th className="w-10 text-center">
                   <input
                     type="checkbox"
+                    className="accent-brand"
                     aria-label="全选当前页"
                     checked={allVisibleSelected}
                     ref={(el) => { if (el) el.indeterminate = someVisibleSelected; }}
                     onChange={toggleAllVisible}
                   />
                 </th>
-                <th className="px-4 py-3 text-left">订单号</th>
-                <th className="px-4 py-3 text-left">客户 / 代理</th>
-                <th className="px-4 py-3 text-left">内容</th>
-                <th className="px-4 py-3 text-right">金额</th>
-                <th className="px-4 py-3 text-center">状态</th>
-                <th className="px-4 py-3 text-center">签证</th>
-                <th className="px-4 py-3 text-center">开票</th>
-                <th className="px-4 py-3 text-left">下单时间</th>
-                <th className="px-4 py-3 text-center">操作</th>
+                <th className="text-left">订单号</th>
+                <th className="text-left">客户 / 代理</th>
+                <th className="text-left">内容</th>
+                <th className="text-right">金额</th>
+                <th className="text-center">状态</th>
+                <th className="text-center">签证</th>
+                <th className="text-center">开票</th>
+                <th className="text-left">下单时间</th>
+                <th className="text-center">操作</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-100">
+            <tbody>
               {filtered.map(({ order, view }) => (
-                <tr key={order.id} className={`hover:bg-slate-50 ${selectedIds.has(order.id) ? 'bg-brand/5' : ''}`}>
-                  <td className="px-4 py-3 text-center">
+                <tr key={order.id} className={selectedIds.has(order.id) ? 'bg-brand-50' : ''}>
+                  <td className="text-center">
                     <input
                       type="checkbox"
+                      className="accent-brand"
                       aria-label={`选择订单 ${order.orderNumber}`}
                       checked={selectedIds.has(order.id)}
                       onChange={() => toggleRow(order.id)}
                     />
                   </td>
-                  <td className="px-4 py-3 font-mono text-xs text-slate-700">{order.orderNumber}</td>
-                  <td className="px-4 py-3">
-                    <div className="font-medium text-slate-900">{view.customerName}</div>
-                    <div className="text-xs text-slate-500">{order.contactPhone}</div>
+                  <td className="font-mono text-xs text-ink-soft">{order.orderNumber}</td>
+                  <td>
+                    <div className="font-medium text-ink">{view.customerName}</div>
+                    <div className="text-xs text-ink-muted">{order.contactPhone}</div>
                     {view.agentName && (
-                      <div className="mt-0.5 inline-block rounded bg-brand/10 px-1.5 py-0.5 text-xs text-brand">
+                      <div className="badge-info mt-0.5">
                         {view.agentName}
                       </div>
                     )}
                   </td>
-                  <td className="px-4 py-3">
-                    <div className="text-slate-900 max-w-xs truncate" title={view.itemSummary}>
+                  <td>
+                    <div className="max-w-xs truncate text-ink" title={view.itemSummary}>
                       {view.itemSummary}
                     </div>
-                    <div className="mt-0.5 text-xs text-slate-500">
+                    <div className="mt-0.5 flex items-center gap-2 text-xs text-ink-muted">
                       <span className="rounded bg-slate-100 px-1.5 py-0.5">{KIND_LABEL[view.itemKind]}</span>
-                      <span className="ml-2">{order.passengers.length} 人</span>
+                      <span>{order.passengers.length} 人</span>
                     </div>
                   </td>
-                  <td className="px-4 py-3 text-right font-medium text-slate-900">
+                  <td className="nums text-right font-medium text-ink">
                     ¥{view.totalNum.toLocaleString()}
                   </td>
-                  <td className="px-4 py-3 text-center">
-                    <span className={`rounded px-2 py-0.5 text-xs ${STATUS_COLOR[order.status]}`}>
+                  <td className="text-center">
+                    <span className={STATUS_COLOR[order.status]}>
                       {STATUS_LABEL[order.status]}
                     </span>
                   </td>
-                  <td className="px-4 py-3 text-center">
+                  <td className="text-center">
                     {(() => {
                       const vs = deriveVisaStatus(order);
                       return vs ? (
-                        <span className={`rounded px-2 py-0.5 text-xs ${FF_STATUS_COLOR[vs]}`}>
+                        <span className={FF_STATUS_COLOR[vs]}>
                           {FF_STATUS_LABEL[vs] ?? vs}
                         </span>
                       ) : (
-                        <span className="text-xs text-slate-300">—</span>
+                        <span className="text-xs text-ink-muted">—</span>
                       );
                     })()}
                   </td>
-                  <td className="px-4 py-3 text-center">
+                  <td className="text-center">
                     <select
-                      className={`rounded px-1.5 py-0.5 text-xs border-0 cursor-pointer ${INVOICE_COLOR[order.invoiceStatus ?? 'NONE']}`}
+                      className={`cursor-pointer rounded-md border-0 px-1.5 py-0.5 text-xs ${INVOICE_COLOR[order.invoiceStatus ?? 'NONE']}`}
                       value={order.invoiceStatus ?? 'NONE'}
                       onChange={(e) => void setInvoice(order, e.target.value as InvoiceStatus)}
                       title="开票状态（点击切换）"
@@ -756,15 +759,15 @@ export function OrdersPage() {
                       ))}
                     </select>
                   </td>
-                  <td className="px-4 py-3 text-xs text-slate-500">
+                  <td className="text-xs text-ink-muted">
                     {new Date(order.createdAt).toLocaleString('zh-CN', {
                       month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
                     })}
                   </td>
-                  <td className="px-4 py-3">
+                  <td>
                     <div className="flex items-center justify-end gap-2">
                       <select
-                        className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs disabled:opacity-50"
+                        className="rounded-md border border-slate-200 bg-white px-2 py-1 text-xs text-ink-soft disabled:opacity-50"
                         value=""
                         onChange={(e) => {
                           const next = e.target.value as OrderStatus;
@@ -784,7 +787,7 @@ export function OrdersPage() {
                             <option key={s} value={s}>{STATUS_LABEL[s]}</option>
                           ))}
                       </select>
-                      <button className="text-sm text-brand hover:text-brand-dark" onClick={() => setSelected(order)}>
+                      <button className="text-sm font-medium text-brand hover:text-brand-dark" onClick={() => setSelected(order)}>
                         详情
                       </button>
                     </div>
@@ -793,14 +796,14 @@ export function OrdersPage() {
               ))}
               {!loading && filtered.length === 0 && (
                 <tr>
-                  <td colSpan={10} className="px-4 py-8 text-center text-slate-500">
+                  <td colSpan={10} className="py-8 text-center text-ink-muted">
                     没有符合条件的订单
                   </td>
                 </tr>
               )}
               {loading && (
                 <tr>
-                  <td colSpan={10} className="px-4 py-8 text-center text-slate-400">加载中…</td>
+                  <td colSpan={10} className="py-8 text-center text-ink-muted">加载中…</td>
                 </tr>
               )}
             </tbody>
@@ -879,44 +882,44 @@ function OrderDrawer({
         className="h-full w-full max-w-md overflow-auto bg-white shadow-xl"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="sticky top-0 flex items-center justify-between border-b border-slate-200 bg-white px-6 py-4">
-          <h2 className="text-lg font-semibold text-slate-900">订单详情</h2>
-          <button className="text-slate-400 hover:text-slate-700 text-xl" onClick={onClose}>×</button>
+        <div className="sticky top-0 z-10 flex items-center justify-between border-b border-slate-200 bg-white px-6 py-4">
+          <h2 className="text-base font-semibold text-ink">订单详情</h2>
+          <button className="btn-ghost px-2 py-1 text-xl leading-none" onClick={onClose}>×</button>
         </div>
 
         <div className="px-6 py-5 space-y-6">
           <section>
-            <div className="font-mono text-xs text-slate-500">{order.orderNumber}</div>
+            <div className="font-mono text-xs text-ink-muted">{order.orderNumber}</div>
             <div className="mt-2 flex items-center gap-2">
-              <span className={`rounded px-2 py-0.5 text-xs ${STATUS_COLOR[order.status]}`}>
+              <span className={STATUS_COLOR[order.status]}>
                 {STATUS_LABEL[order.status]}
               </span>
-              <span className="rounded bg-slate-100 px-2 py-0.5 text-xs text-slate-600">
+              <span className="badge-neutral">
                 {KIND_LABEL[view.itemKind]}
               </span>
             </div>
           </section>
 
           <section>
-            <h3 className="text-sm font-medium text-slate-700">产品内容</h3>
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-ink-muted">产品内容</h3>
             <ul className="mt-2 space-y-2 text-sm">
               {order.items.map((it) => (
-                <li key={it.id} className="rounded-md border border-slate-200 bg-slate-50 p-3">
+                <li key={it.id} className="rounded-lg border border-slate-200 bg-slate-50/60 p-3">
                   <div className="flex items-start justify-between gap-2">
                     <div className="flex-1">
-                      <div className="text-slate-900">{it.description}</div>
-                      <div className="mt-0.5 text-xs text-slate-500">
+                      <div className="text-ink">{it.description}</div>
+                      <div className="mt-0.5 text-xs text-ink-muted">
                         {KIND_LABEL[it.kind]} · 数量 {it.quantity} · 单价 ¥{Number(it.unitPrice).toLocaleString()}
                       </div>
                     </div>
-                    <div className="text-sm font-medium text-slate-900">
+                    <div className="nums text-sm font-medium text-ink">
                       ¥{Number(it.amount).toLocaleString()}
                     </div>
                   </div>
                 </li>
               ))}
             </ul>
-            <p className="mt-2 text-xs text-slate-500">共 {order.passengers.length} 位乘客</p>
+            <p className="mt-2 text-xs text-ink-muted">共 {order.passengers.length} 位乘客</p>
           </section>
 
           <PassengersSection order={order} />
@@ -936,7 +939,7 @@ function OrderDrawer({
           />
 
           <section>
-            <h3 className="text-sm font-medium text-slate-700">客户信息</h3>
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-ink-muted">客户信息</h3>
             <dl className="mt-2 space-y-1 text-sm">
               <Row label="联系人" value={order.contactName} />
               <Row label="联系电话" value={order.contactPhone} />
@@ -946,13 +949,13 @@ function OrderDrawer({
           </section>
 
           <section>
-            <h3 className="text-sm font-medium text-slate-700">支付</h3>
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-ink-muted">支付</h3>
             <dl className="mt-2 space-y-1 text-sm">
               <Row
                 label="订单金额"
-                value={<span className="text-lg font-bold text-red-600">¥{view.totalNum.toLocaleString()}</span>}
+                value={<span className="nums text-lg font-semibold text-ink">¥{view.totalNum.toLocaleString()}</span>}
               />
-              <Row label="已付" value={`¥${Number(order.paidAmount).toLocaleString()}`} />
+              <Row label="已付" value={<span className="nums">¥{Number(order.paidAmount).toLocaleString()}</span>} />
               <Row label="下单时间" value={new Date(order.createdAt).toLocaleString('zh-CN')} />
             </dl>
           </section>
@@ -969,10 +972,10 @@ function OrderDrawer({
           <FulfillmentSection orderId={order.id} />
 
           <section>
-            <h3 className="text-sm font-medium text-slate-700">状态流转</h3>
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-ink-muted">状态流转</h3>
             <div className="mt-3 flex flex-col gap-2">
               {nextSteps.length === 0 && (
-                <div className="rounded-md bg-slate-50 p-3 text-xs text-slate-500">
+                <div className="rounded-lg border border-slate-200 bg-slate-50/60 p-3 text-xs text-ink-muted">
                   当前状态下无可用操作
                 </div>
               )}
@@ -982,7 +985,7 @@ function OrderDrawer({
                 </button>
               ))}
             </div>
-            <p className="mt-3 text-xs text-slate-400">
+            <p className="mt-3 text-xs text-ink-muted">
               ⓘ 状态变更会真实写入数据库并记录操作事件。
             </p>
           </section>
@@ -995,8 +998,8 @@ function OrderDrawer({
 function Row({ label, value }: { label: string; value: React.ReactNode }) {
   return (
     <div className="flex justify-between gap-4">
-      <dt className="text-slate-500">{label}</dt>
-      <dd className="text-right text-slate-900">{value}</dd>
+      <dt className="text-ink-muted">{label}</dt>
+      <dd className="text-right text-ink">{value}</dd>
     </div>
   );
 }
@@ -1006,11 +1009,11 @@ function Row({ label, value }: { label: string; value: React.ReactNode }) {
 // ═══════════════════════════════════════════════════════════════
 
 const FF_STATUS_COLOR: Record<FulfillmentStatus, string> = {
-  PENDING: 'bg-slate-100 text-slate-600',
-  IN_PROGRESS: 'bg-blue-100 text-blue-700',
-  CONFIRMED: 'bg-green-100 text-green-700',
-  CANCELLED: 'bg-slate-200 text-slate-500',
-  FAILED: 'bg-red-100 text-red-700',
+  PENDING: 'badge-neutral',
+  IN_PROGRESS: 'badge-info',
+  CONFIRMED: 'badge-success',
+  CANCELLED: 'badge-neutral',
+  FAILED: 'badge-danger',
 };
 
 const FF_STATUS_LABEL: Record<FulfillmentStatus, string> = {
@@ -1059,16 +1062,16 @@ function FulfillmentSection({ orderId }: { orderId: string }) {
   if (loading) {
     return (
       <section>
-        <h3 className="text-sm font-medium text-slate-700">🚚 履约进度</h3>
-        <div className="mt-2 rounded-md bg-slate-50 p-3 text-xs text-slate-400">加载中…</div>
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-ink-muted">🚚 履约进度</h3>
+        <div className="mt-2 rounded-lg border border-slate-200 bg-slate-50/60 p-3 text-xs text-ink-muted">加载中…</div>
       </section>
     );
   }
   if (tasks.length === 0) {
     return (
       <section>
-        <h3 className="text-sm font-medium text-slate-700">🚚 履约进度</h3>
-        <div className="mt-2 rounded-md bg-slate-50 p-3 text-xs text-slate-500">
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-ink-muted">🚚 履约进度</h3>
+        <div className="mt-2 rounded-lg border border-slate-200 bg-slate-50/60 p-3 text-xs text-ink-muted">
           暂无履约任务 · 订单转 PAID 时自动生成（按产品类型）
         </div>
       </section>
@@ -1080,7 +1083,7 @@ function FulfillmentSection({ orderId }: { orderId: string }) {
   return (
     <section>
       <div className="flex items-center justify-between">
-        <h3 className="text-sm font-medium text-slate-700">🚚 履约进度</h3>
+        <h3 className="text-xs font-semibold uppercase tracking-wide text-ink-muted">🚚 履约进度</h3>
         {hasTicketed && (
           <button
             className="text-xs rounded bg-blue-100 px-2 py-0.5 text-blue-700 hover:bg-blue-200"
@@ -1232,13 +1235,13 @@ function FfEditForm({ type, initial, onCancel, onSave, draft, setDraft }: {
 
 function FfCard({ icon, label, status, children }: { icon: string; label: string; status: FulfillmentStatus; children: React.ReactNode }) {
   return (
-    <div className="rounded-md border border-slate-200 bg-white p-3">
+    <div className="rounded-lg border border-slate-200 bg-white p-3">
       <div className="flex items-center justify-between mb-2">
         <div className="flex items-center gap-2">
           <span className="text-xl">{icon}</span>
-          <span className="text-sm font-medium text-slate-900">{label}</span>
+          <span className="text-sm font-medium text-ink">{label}</span>
         </div>
-        <span className={`rounded px-2 py-0.5 text-xs font-medium ${FF_STATUS_COLOR[status]}`}>
+        <span className={FF_STATUS_COLOR[status]}>
           {FF_STATUS_LABEL[status]}
         </span>
       </div>

@@ -17,12 +17,12 @@ interface Activity {
 }
 
 const KIND_LABEL: Record<Activity['kind'], { label: string; color: string }> = {
-  cart_view: { label: '浏览', color: 'bg-slate-100 text-slate-600' },
-  cart_add: { label: '加购', color: 'bg-blue-100 text-blue-700' },
-  checkout_start: { label: '结账', color: 'bg-amber-100 text-amber-700' },
-  order_create: { label: '下单', color: 'bg-indigo-100 text-indigo-700' },
-  order_pay: { label: '支付', color: 'bg-green-100 text-green-700' },
-  order_cancel: { label: '取消', color: 'bg-slate-200 text-slate-500' },
+  cart_view: { label: '浏览', color: 'badge-neutral' },
+  cart_add: { label: '加购', color: 'badge-info' },
+  checkout_start: { label: '结账', color: 'badge-warning' },
+  order_create: { label: '下单', color: 'badge-info' },
+  order_pay: { label: '支付', color: 'badge-success' },
+  order_cancel: { label: '取消', color: 'badge-neutral' },
 };
 
 // 模板池：每隔几秒随机推一条
@@ -136,48 +136,48 @@ export function RealtimeActivity() {
     <div className="card">
       <div className="flex items-center justify-between">
         <div>
-          <h2 className="font-semibold text-slate-900">实时客户动态</h2>
-          <p className="mt-0.5 text-xs text-slate-500">
+          <h2 className="text-sm font-semibold text-ink">实时客户动态</h2>
+          <p className="mt-0.5 text-xs text-ink-muted">
             来自前台 :5173 和小程序的实时事件流（demo 模拟 SSE 推送，每 8 秒一条）
           </p>
         </div>
-        <div className="flex items-center gap-2 text-xs">
-          <span className={`inline-flex items-center gap-1 ${paused ? 'text-slate-400' : 'text-green-600'}`}>
-            <span className={`h-2 w-2 rounded-full ${paused ? 'bg-slate-300' : 'bg-green-500 animate-pulse'}`} />
+        <div className="flex items-center gap-3 text-xs">
+          <span className={`inline-flex items-center gap-1.5 font-medium ${paused ? 'text-ink-muted' : 'text-emerald-600'}`}>
+            <span className={`h-1.5 w-1.5 rounded-full ${paused ? 'bg-slate-300' : 'bg-emerald-500 animate-pulse'}`} />
             {paused ? '已暂停' : 'LIVE'}
           </span>
-          <button className="text-slate-500 hover:text-brand" onClick={() => setPaused((p) => !p)}>
+          <button className="btn-ghost px-2 py-1 text-xs" onClick={() => setPaused((p) => !p)}>
             {paused ? '▶ 继续' : '⏸ 暂停'}
           </button>
         </div>
       </div>
 
-      <ul className="mt-4 space-y-2 max-h-96 overflow-y-auto">
+      <ul className="mt-4 space-y-1.5 max-h-96 overflow-y-auto">
         {activities.map((a) => (
           <li
             key={a.id}
-            className="flex items-start gap-3 rounded-md border border-slate-100 bg-slate-50/50 px-3 py-2"
+            className="flex items-start gap-3 rounded-lg border border-slate-100 px-3 py-2.5 transition hover:bg-slate-50/70"
           >
-            <span className="text-2xl mt-0.5">{a.emoji}</span>
+            <span className="mt-0.5 text-xl">{a.emoji}</span>
             <div className="flex-1 min-w-0">
               <div className="flex items-center gap-2">
-                <span className={`rounded px-1.5 py-0.5 text-xs font-medium ${KIND_LABEL[a.kind].color}`}>
+                <span className={KIND_LABEL[a.kind].color}>
                   {KIND_LABEL[a.kind].label}
                 </span>
-                <span className="text-sm font-medium text-slate-900 truncate">{a.customer}</span>
+                <span className="truncate text-sm font-medium text-ink">{a.customer}</span>
                 {a.amount && (
-                  <span className="ml-auto text-sm font-semibold text-red-600 whitespace-nowrap">
+                  <span className="nums ml-auto whitespace-nowrap text-sm font-semibold text-ink">
                     ¥{a.amount.toLocaleString()}
                   </span>
                 )}
               </div>
-              <p className="mt-0.5 text-sm text-slate-700 truncate">{a.message}</p>
-              <p className="mt-0.5 text-xs text-slate-400">{relativeTime(a.ts)}</p>
+              <p className="mt-0.5 truncate text-sm text-ink-soft">{a.message}</p>
+              <p className="mt-0.5 text-xs text-ink-muted">{relativeTime(a.ts)}</p>
             </div>
           </li>
         ))}
         {activities.length === 0 && (
-          <li className="text-center text-sm text-slate-400 py-4">等待第一条事件…</li>
+          <li className="py-4 text-center text-sm text-ink-muted">等待第一条事件…</li>
         )}
       </ul>
     </div>

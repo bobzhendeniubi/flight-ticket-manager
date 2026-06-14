@@ -2,26 +2,142 @@
 @tailwind components;
 @tailwind utilities;
 
-@layer components {
-  .btn {
-    @apply inline-flex items-center justify-center rounded-md px-4 py-2 font-medium transition
-           focus:outline-none focus:ring-2 focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-60;
+/* ─────────────────────────────────────────────────────────────
+   「Sunlit Coast」前台设计系统
+   海洋蓝绿(brand) + 日落珊瑚(deal) + 暖琥珀(sun)，OTA / 海岛专线气质
+   ───────────────────────────────────────────────────────────── */
+
+@layer base {
+  html {
+    -webkit-tap-highlight-color: transparent;
   }
+  body {
+    text-rendering: optimizeLegibility;
+  }
+  /* 只给字重/字距，不强制颜色：body 已是 text-ink，深色标题自然继承；
+     而海景 hero 上的白色标题（父级 .text-white）也能正常生效 */
+  h1, h2, h3 {
+    @apply tracking-tight;
+    font-weight: 700;
+  }
+  /* 价格 / 数字用等宽对齐，更有"票务"专业感 */
+  .nums {
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@layer components {
+  /* ── 按钮 ───────────────────────────────────────── */
+  .btn {
+    @apply inline-flex items-center justify-center gap-1.5 rounded-xl px-4 py-2.5 text-sm font-semibold
+           transition-all duration-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2
+           focus-visible:ring-brand/60 disabled:cursor-not-allowed disabled:opacity-50 active:scale-[.98];
+  }
+  /* 主行动：海洋渐变 */
   .btn-primary {
-    @apply btn bg-brand text-white hover:bg-brand-dark focus:ring-brand;
+    @apply btn text-white shadow-card;
+    background-image: linear-gradient(135deg, #129bb2 0%, #0e8aa0 55%, #0a6e80 100%);
+  }
+  .btn-primary:hover {
+    @apply shadow-lift -translate-y-px;
+  }
+  /* 成交 / 立即购买：日落珊瑚（OTA 价格红的 CTA） */
+  .btn-deal {
+    @apply btn text-white shadow-deal;
+    background-image: linear-gradient(135deg, #ff7a4a 0%, #ff5a3c 55%, #e8421f 100%);
+  }
+  .btn-deal:hover {
+    @apply -translate-y-px;
+    filter: brightness(1.04);
   }
   .btn-secondary {
-    @apply btn bg-white text-slate-900 border border-slate-300 hover:bg-slate-50 focus:ring-brand;
+    @apply btn border border-slate-200 bg-white text-ink hover:border-brand/40 hover:bg-brand-50/60 hover:text-brand-700;
   }
+  .btn-ghost {
+    @apply btn text-ink-soft hover:bg-slate-100 hover:text-ink;
+  }
+
+  /* ── 表单 ───────────────────────────────────────── */
   .input {
-    @apply block w-full rounded-md border border-slate-300 bg-white px-3 py-2 text-sm
-           shadow-sm focus:border-brand focus:outline-none focus:ring-1 focus:ring-brand;
+    @apply block w-full rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-ink
+           shadow-sm transition placeholder:text-ink-muted
+           focus:border-brand focus:outline-none focus:ring-4 focus:ring-brand/15;
   }
   .label {
-    @apply mb-1 block text-sm font-medium text-slate-700;
+    @apply mb-1.5 block text-sm font-semibold text-ink-soft;
   }
-  /* 手机端（<768px）紧凑：p-4；桌面恢复 p-6 */
+
+  /* ── 容器 ───────────────────────────────────────── */
   .card {
-    @apply rounded-lg border border-slate-200 bg-white p-4 shadow-sm md:p-6;
+    @apply rounded-2xl border border-slate-200/80 bg-surface p-4 shadow-card md:p-6;
+  }
+  /* 可点击卡片：悬浮上抬 + 边框点亮（套餐/产品卡） */
+  .card-interactive {
+    @apply rounded-2xl border border-slate-200/80 bg-surface shadow-card transition-all duration-300;
+  }
+  .card-interactive:hover {
+    @apply -translate-y-1 border-brand/30 shadow-lift;
+  }
+  /* 图片悬浮放大（配合 overflow-hidden 容器） */
+  .img-zoom {
+    @apply transition-transform duration-500 ease-out;
+  }
+  .group:hover .img-zoom {
+    transform: scale(1.06);
+  }
+
+  /* ── 徽章 / 标签 ─────────────────────────────────── */
+  .badge {
+    @apply inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-semibold;
+  }
+  .badge-deal {
+    @apply badge bg-deal text-white shadow-deal;
+  }
+  .badge-soft {
+    @apply badge bg-brand-50 text-brand-700;
+  }
+  .badge-sun {
+    @apply badge text-amber-700;
+    background-color: #fff6e6;
+  }
+  .badge-outline {
+    @apply badge border border-slate-200 bg-white text-ink-soft;
+  }
+  .chip {
+    @apply inline-flex items-center gap-1 rounded-lg bg-slate-100 px-2 py-1 text-xs font-medium text-ink-soft;
+  }
+
+  /* ── 价格（OTA 价格红 + 删除原价） ──────────────────── */
+  .price {
+    @apply nums font-extrabold text-deal;
+  }
+  .price-old {
+    @apply nums text-sm text-ink-muted line-through;
+  }
+
+  /* ── 评分（暖琥珀星） ─────────────────────────────── */
+  .rating {
+    @apply inline-flex items-center gap-0.5 rounded-md bg-sun-light px-1.5 py-0.5 text-xs font-bold text-amber-700;
+  }
+
+  /* ── 标题 ───────────────────────────────────────── */
+  .section-title {
+    @apply text-lg font-extrabold tracking-tight text-ink md:text-xl;
+  }
+  .section-sub {
+    @apply mt-0.5 text-sm text-ink-soft;
+  }
+
+  /* ── 玻璃顶栏 ────────────────────────────────────── */
+  .glass-header {
+    @apply border-b border-white/40 bg-white/80 backdrop-blur-xl;
+  }
+
+  /* ── 骨架屏 ──────────────────────────────────────── */
+  .skeleton {
+    @apply rounded-xl bg-slate-100;
+    background-image: linear-gradient(90deg, #eef2f6 0px, #f6f9fc 200px, #eef2f6 400px);
+    background-size: 800px 100%;
+    @apply animate-shimmer;
   }
 }

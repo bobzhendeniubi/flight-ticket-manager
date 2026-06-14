@@ -8,11 +8,11 @@ import { useAuth } from '../stores/auth';
 import { exportToCSV } from '../lib/csvExport';
 
 const STATUS_INFO: Record<SettlementStatus, { label: string; color: string }> = {
-  DRAFT: { label: '草稿', color: 'bg-slate-100 text-slate-600' },
-  PENDING_APPROVAL: { label: '待审核', color: 'bg-amber-100 text-amber-700' },
-  APPROVED: { label: '已核准', color: 'bg-blue-100 text-blue-700' },
-  PAID: { label: '已支付', color: 'bg-green-100 text-green-700' },
-  VOIDED: { label: '已作废', color: 'bg-slate-200 text-slate-500' },
+  DRAFT: { label: '草稿', color: 'badge-neutral' },
+  PENDING_APPROVAL: { label: '待审核', color: 'badge-warning' },
+  APPROVED: { label: '已核准', color: 'badge-info' },
+  PAID: { label: '已支付', color: 'badge-success' },
+  VOIDED: { label: '已作废', color: 'badge-neutral' },
 };
 
 function ymdNow(): string {
@@ -122,13 +122,18 @@ export function SettlementsPage() {
 
   return (
     <div className="space-y-4">
+      <section>
+        <h1 className="page-title">结算单管理</h1>
+        <p className="page-sub">每月自动/手动生成每个代理的结算单 · GMV → 佣金 → 预付抵扣 → 应付</p>
+      </section>
+
       <section className="grid gap-3 md:grid-cols-5">
-        <Kpi label="结算单数" value={filtered.length.toString()} sub={`${kpi.paidCount} 已支付`} color="bg-brand" />
-        <Kpi label="累计 GMV" value={`¥${(kpi.totalGMV / 10000).toFixed(1)}万`} sub="订单总额" color="bg-amber-500" />
-        <Kpi label="累计净佣金" value={`¥${kpi.totalCommission.toLocaleString()}`} sub="各级代理合计" color="bg-green-600" />
-        <Kpi label="待支付" value={`¥${kpi.totalPayable.toLocaleString()}`} sub="未结清金额" color="bg-red-600" />
-        <div className="card p-3 flex flex-col justify-between">
-          <p className="text-xs font-medium uppercase text-slate-500">生成结算单</p>
+        <Kpi label="结算单数" value={filtered.length.toString()} sub={`${kpi.paidCount} 已支付`} />
+        <Kpi label="累计 GMV" value={`¥${(kpi.totalGMV / 10000).toFixed(1)}万`} sub="订单总额" />
+        <Kpi label="累计净佣金" value={`¥${kpi.totalCommission.toLocaleString()}`} sub="各级代理合计" />
+        <Kpi label="待支付" value={`¥${kpi.totalPayable.toLocaleString()}`} sub="未结清金额" />
+        <div className="stat-card flex flex-col justify-between">
+          <p className="stat-label">生成结算单</p>
           <div className="flex gap-1 mt-2">
             <input
               className="input text-xs flex-1"
@@ -179,13 +184,8 @@ export function SettlementsPage() {
       </section>
 
       {error && (
-        <div className="rounded-md bg-red-50 border border-red-200 px-4 py-3 text-sm text-red-800">❌ {error}</div>
+        <div className="rounded-md bg-rose-50 border border-rose-200 px-4 py-3 text-sm text-rose-800">❌ {error}</div>
       )}
-
-      <section>
-        <h1 className="text-2xl font-bold text-slate-900">结算单管理</h1>
-        <p className="mt-1 text-sm text-slate-600">每月自动/手动生成每个代理的结算单 · GMV → 佣金 → 预付抵扣 → 应付</p>
-      </section>
 
       <section className="card">
         <div className="grid gap-3 md:grid-cols-3">
@@ -215,46 +215,46 @@ export function SettlementsPage() {
 
       <section className="card p-0 overflow-hidden">
         <div className="overflow-x-auto">
-          <table className="min-w-full divide-y divide-slate-200 text-sm">
-            <thead className="bg-slate-50 text-xs uppercase text-slate-500">
+          <table className="table-admin">
+            <thead>
               <tr>
-                <th className="px-4 py-3 text-left">月份</th>
-                <th className="px-4 py-3 text-left">代理</th>
-                <th className="px-4 py-3 text-right">订单</th>
-                <th className="px-4 py-3 text-right">GMV</th>
-                <th className="px-4 py-3 text-right">应得</th>
-                <th className="px-4 py-3 text-right">分下级</th>
-                <th className="px-4 py-3 text-right">净佣金</th>
-                <th className="px-4 py-3 text-right">预付抵</th>
-                <th className="px-4 py-3 text-right">应付</th>
-                <th className="px-4 py-3 text-center">状态</th>
+                <th className="text-left">月份</th>
+                <th className="text-left">代理</th>
+                <th className="text-right">订单</th>
+                <th className="text-right">GMV</th>
+                <th className="text-right">应得</th>
+                <th className="text-right">分下级</th>
+                <th className="text-right">净佣金</th>
+                <th className="text-right">预付抵</th>
+                <th className="text-right">应付</th>
+                <th className="text-center">状态</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-100">
+            <tbody>
               {filtered.map((s) => (
-                <tr key={s.id} className="hover:bg-slate-50 cursor-pointer" onClick={() => openDetail(s)}>
-                  <td className="px-4 py-3 font-mono text-xs">{s.period}</td>
-                  <td className="px-4 py-3">
-                    <div className="font-medium text-slate-900">{s.agent.companyName ?? s.agent.contactName}</div>
-                    <div className="text-[10px] text-slate-500">{s.agent.tier} 级</div>
+                <tr key={s.id} className="cursor-pointer" onClick={() => openDetail(s)}>
+                  <td className="font-mono text-xs">{s.period}</td>
+                  <td>
+                    <div className="font-medium text-ink">{s.agent.companyName ?? s.agent.contactName}</div>
+                    <div className="text-[10px] text-ink-muted">{s.agent.tier} 级</div>
                   </td>
-                  <td className="px-4 py-3 text-right font-medium text-amber-600">{s.orderCount}</td>
-                  <td className="px-4 py-3 text-right tabular-nums">¥{Number(s.grossRevenue).toLocaleString()}</td>
-                  <td className="px-4 py-3 text-right tabular-nums">¥{Number(s.commissionEarned).toLocaleString()}</td>
-                  <td className="px-4 py-3 text-right tabular-nums text-amber-700">-¥{Number(s.commissionPaidToChildren).toLocaleString()}</td>
-                  <td className="px-4 py-3 text-right tabular-nums font-semibold text-green-700">¥{Number(s.netCommission).toLocaleString()}</td>
-                  <td className="px-4 py-3 text-right tabular-nums text-red-600">-¥{Number(s.prepaymentOffset).toLocaleString()}</td>
-                  <td className="px-4 py-3 text-right tabular-nums font-bold text-brand">¥{Number(s.payableToAgent).toLocaleString()}</td>
-                  <td className="px-4 py-3 text-center">
-                    <span className={`rounded px-2 py-0.5 text-xs ${STATUS_INFO[s.status].color}`}>{STATUS_INFO[s.status].label}</span>
+                  <td className="text-right font-medium text-ink nums">{s.orderCount}</td>
+                  <td className="text-right nums">¥{Number(s.grossRevenue).toLocaleString()}</td>
+                  <td className="text-right nums">¥{Number(s.commissionEarned).toLocaleString()}</td>
+                  <td className="text-right nums text-amber-700">-¥{Number(s.commissionPaidToChildren).toLocaleString()}</td>
+                  <td className="text-right nums font-semibold text-emerald-700">¥{Number(s.netCommission).toLocaleString()}</td>
+                  <td className="text-right nums text-rose-600">-¥{Number(s.prepaymentOffset).toLocaleString()}</td>
+                  <td className="text-right nums font-bold text-brand">¥{Number(s.payableToAgent).toLocaleString()}</td>
+                  <td className="text-center">
+                    <span className={STATUS_INFO[s.status].color}>{STATUS_INFO[s.status].label}</span>
                   </td>
                 </tr>
               ))}
               {!loading && filtered.length === 0 && (
-                <tr><td colSpan={10} className="px-4 py-8 text-center text-slate-500">没有结算单 · 点右上角"生成/重算"从订单数据生成</td></tr>
+                <tr><td colSpan={10} className="px-4 py-8 text-center text-ink-muted">没有结算单 · 点右上角"生成/重算"从订单数据生成</td></tr>
               )}
               {loading && (
-                <tr><td colSpan={10} className="px-4 py-8 text-center text-slate-400">加载中…</td></tr>
+                <tr><td colSpan={10} className="px-4 py-8 text-center text-ink-muted">加载中…</td></tr>
               )}
             </tbody>
           </table>
@@ -390,15 +390,12 @@ function Row({ label, value }: { label: React.ReactNode; value: React.ReactNode 
   );
 }
 
-function Kpi({ label, value, sub, color }: { label: string; value: string; sub: string; color: string }) {
+function Kpi({ label, value, sub }: { label: string; value: string; sub: string }) {
   return (
-    <div className="card p-3">
-      <div className="flex items-center gap-2">
-        <span className={`h-8 w-1 rounded ${color}`}></span>
-        <p className="text-xs font-medium uppercase text-slate-500">{label}</p>
-      </div>
-      <p className="mt-1.5 text-2xl font-bold text-slate-900">{value}</p>
-      <p className="mt-0.5 text-xs text-slate-500">{sub}</p>
+    <div className="stat-card">
+      <p className="stat-label">{label}</p>
+      <p className="stat-value">{value}</p>
+      <p className="mt-0.5 text-xs text-ink-muted">{sub}</p>
     </div>
   );
 }

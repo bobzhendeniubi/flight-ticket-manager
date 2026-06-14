@@ -107,12 +107,12 @@ export function PricingPage() {
     [selected],
   );
 
-  if (error) return <div className="card border-red-200 bg-red-50 text-red-700">{error}</div>;
-  if (loading) return <div className="card text-slate-500">加载中…</div>;
-  if (schedules.length === 0) return <div className="card text-slate-500">未来 7 天没有班次</div>;
+  if (error) return <div className="card border-rose-200 bg-rose-50 text-rose-700">{error}</div>;
+  if (loading) return <div className="card text-ink-muted">加载中…</div>;
+  if (schedules.length === 0) return <div className="card text-ink-muted">未来 7 天没有班次</div>;
   if (!selected) {
     return (
-      <div className="card text-slate-500">
+      <div className="card text-ink-muted">
         请从左侧列表选择一个班次查看定价配置
       </div>
     );
@@ -123,8 +123,8 @@ export function PricingPage() {
   return (
     <div className="space-y-5">
       <section>
-        <h1 className="text-2xl font-bold text-slate-900">动态定价</h1>
-        <p className="mt-1 text-sm text-slate-600">
+        <h1 className="page-title">动态定价</h1>
+        <p className="page-sub">
           基于时段 / 上座率 / ML 需求预测的 ABCD 等级定价引擎。当前 demo 数据：QH9588/9589 未来 7 天班次。
         </p>
       </section>
@@ -397,8 +397,8 @@ function DateRankingCalendar() {
     }
   };
 
-  if (loading) return <div className="card text-slate-500">日期等级加载中…</div>;
-  if (err) return <div className="card border-red-200 bg-red-50 text-red-700">{err}</div>;
+  if (loading) return <div className="card text-ink-muted">日期等级加载中…</div>;
+  if (err) return <div className="card border-rose-200 bg-rose-50 text-rose-700">{err}</div>;
   if (rows.length === 0) return null;
 
   // 按周分组显示：每行 7 个 = 一周

@@ -17,6 +17,20 @@ const ROLE_LABEL: Record<string, string> = {
 // 管理后台已拆分到 admin-web (:5174)。前台不再展示后台入口。
 // /admin/* 路由仍保留可访问（向后兼容旧链接），但不在 nav 中显示。
 
+// 桌面端导航 pill：激活态用 brand-50 底 + brand-700 字（平滑高亮），默认态柔和悬停
+const navPill = (isActive: boolean) =>
+  `rounded-xl px-3.5 py-1.5 font-semibold transition-all duration-200 ${
+    isActive
+      ? 'bg-brand-50 text-brand-700 shadow-sm'
+      : 'text-ink-soft hover:bg-brand-50/60 hover:text-brand-700'
+  }`;
+
+// 手机抽屉导航项：同一套激活语义，纵向块状
+const drawerItem = (isActive: boolean) =>
+  `block rounded-xl px-3 py-2.5 text-sm font-semibold transition-colors ${
+    isActive ? 'bg-brand-50 text-brand-700' : 'text-ink-soft hover:bg-brand-50/60 hover:text-brand-700'
+  }`;
+
 export function Layout() {
   const { t } = useTranslation();
   const user = useAuth((s) => s.user);
@@ -49,23 +63,32 @@ export function Layout() {
   const closeMenu = () => setMobileMenuOpen(false);
 
   return (
-    <div className="min-h-screen flex flex-col">
+    <div className="min-h-screen flex flex-col bg-canvas">
       {/* 顶部：品牌 + 前台导航 + 用户菜单 */}
-      <header className="border-b border-slate-200 bg-white">
-        <div className="mx-auto flex max-w-7xl items-center justify-between gap-2 px-3 py-3 md:gap-4 md:px-4">
+      <header className="glass-header sticky top-0 z-40">
+        <div className="mx-auto flex max-w-7xl items-center justify-between gap-2 px-3 py-2.5 md:gap-5 md:px-4 md:py-3">
           {/* 手机端：左侧汉堡按钮 */}
           <button
             type="button"
-            className="md:hidden flex h-9 w-9 items-center justify-center rounded-md border border-slate-200 text-slate-700"
+            className="md:hidden flex h-9 w-9 items-center justify-center rounded-xl border border-ink/10 bg-white/70 text-ink-soft shadow-card transition-all duration-200 hover:border-brand/40 hover:bg-brand-50/60 hover:text-brand-700 active:scale-95"
             onClick={() => setMobileMenuOpen(true)}
             aria-label={t('nav.menu')}
           >
             <span className="text-lg">☰</span>
           </button>
 
-          <Link to="/" className="flex items-center gap-2 text-base md:text-lg font-semibold text-slate-900 truncate">
-            <span aria-hidden className="text-brand">✈︎</span>
-            <span>世途旅行</span>
+          <Link to="/" className="group flex items-center gap-2.5 truncate" aria-label="世途旅行">
+            <span
+              aria-hidden
+              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-2xl text-base text-white shadow-lift transition-transform duration-300 group-hover:-translate-y-0.5 group-hover:rotate-3"
+              style={{ backgroundImage: 'linear-gradient(135deg, #2fb6cb 0%, #0e8aa0 60%, #0a6e80 100%)' }}
+            >
+              ✈︎
+            </span>
+            <span className="flex flex-col leading-none">
+              <span className="text-base md:text-lg font-extrabold tracking-tight text-ink transition-colors group-hover:text-brand-700">世途旅行</span>
+              <span className="hidden md:block mt-0.5 text-[11px] font-medium text-ink-muted">海岛专线 · 一站式预订</span>
+            </span>
           </Link>
 
           {/* 桌面端：主导航 */}
@@ -75,35 +98,17 @@ export function Layout() {
                 key={n.to}
                 to={n.to}
                 end={n.exact}
-                className={({ isActive }) =>
-                  `px-3 py-1.5 rounded-md ${
-                    isActive ? 'bg-brand/10 text-brand' : 'text-slate-700 hover:text-brand'
-                  }`
-                }
+                className={({ isActive }) => navPill(isActive)}
               >
                 {n.label}
               </NavLink>
             ))}
             {isAgent && (
               <>
-                <NavLink
-                  to="/team"
-                  className={({ isActive }) =>
-                    `px-3 py-1.5 rounded-md ${
-                      isActive ? 'bg-brand/10 text-brand' : 'text-slate-700 hover:text-brand'
-                    }`
-                  }
-                >
+                <NavLink to="/team" className={({ isActive }) => navPill(isActive)}>
                   {t('nav.team')}
                 </NavLink>
-                <NavLink
-                  to="/my-commissions"
-                  className={({ isActive }) =>
-                    `px-3 py-1.5 rounded-md ${
-                      isActive ? 'bg-brand/10 text-brand' : 'text-slate-700 hover:text-brand'
-                    }`
-                  }
-                >
+                <NavLink to="/my-commissions" className={({ isActive }) => navPill(isActive)}>
                   {t('nav.commissions')}
                 </NavLink>
               </>
@@ -111,24 +116,32 @@ export function Layout() {
           </nav>
 
           {/* 右侧用户菜单：手机端只保留购物车，其他进汉堡 */}
-          <nav className="flex items-center gap-2 md:gap-3 text-sm">
+          <nav className="flex items-center gap-2 md:gap-2.5 text-sm">
             <a
               href="/?preview=mobile"
-              className="hidden md:inline-flex items-center gap-1 rounded-md border border-slate-200 bg-slate-50 px-2 py-1 text-xs text-slate-600 hover:border-brand hover:text-brand"
+              className="chip hidden md:inline-flex transition-colors hover:bg-brand-50 hover:text-brand-700"
               title="以移动端视口预览（小程序端测试）"
             >
+              <span aria-hidden>📱</span>
               {t('nav.miniprogramPreview')}
             </a>
             <CartButton />
             {/* 桌面端：完整用户区 */}
             {user ? (
-              <div className="hidden md:flex items-center gap-3">
-                <Link to="/orders" className="text-sm text-slate-700 hover:text-brand">
+              <div className="hidden md:flex items-center gap-2">
+                <span className="mx-1 h-5 w-px bg-ink/10" aria-hidden />
+                <Link to="/orders" className="rounded-xl px-3 py-1.5 font-semibold text-ink-soft transition-all duration-200 hover:bg-brand-50/60 hover:text-brand-700">
                   {t('nav.myOrders')}
                 </Link>
-                <Link to="/me" className="flex items-center gap-2 text-slate-700 hover:text-brand">
-                  <span>{user.displayName ?? user.email}</span>
-                  <span className="rounded bg-slate-100 px-1.5 py-0.5 text-xs text-slate-600">
+                <Link
+                  to="/me"
+                  className="flex items-center gap-2 rounded-xl py-1 pl-1 pr-2 text-ink-soft transition-all duration-200 hover:bg-brand-50/60 hover:text-brand-700"
+                >
+                  <span className="flex h-7 w-7 items-center justify-center rounded-full bg-gradient-to-br from-brand-100 to-brand-50 text-xs font-bold text-brand-700 ring-1 ring-brand-100">
+                    {(user.displayName ?? user.email ?? '').slice(0, 1).toUpperCase()}
+                  </span>
+                  <span className="max-w-[9rem] truncate font-semibold">{user.displayName ?? user.email}</span>
+                  <span className="badge-soft">
                     {ROLE_LABEL[user.role] ?? user.role}
                   </span>
                 </Link>
@@ -155,16 +168,31 @@ export function Layout() {
 
         {/* 手机端：汉堡菜单抽屉 */}
         {mobileMenuOpen && (
-          <div className="md:hidden fixed inset-0 z-50 bg-black/40" onClick={closeMenu}>
+          <div className="md:hidden fixed inset-0 z-50 bg-ink/40 backdrop-blur-sm animate-fade-in" onClick={closeMenu}>
             <div
-              className="absolute left-0 top-0 h-full w-72 max-w-[80vw] bg-white shadow-xl flex flex-col"
+              className="absolute left-0 top-0 h-full w-72 max-w-[82vw] bg-surface shadow-pop flex flex-col"
               onClick={(e) => e.stopPropagation()}
             >
-              <div className="flex items-center justify-between border-b border-slate-200 px-4 py-3">
-                <span className="font-semibold">{t('nav.menu')}</span>
-                <button onClick={closeMenu} className="text-slate-400 hover:text-slate-700 text-xl" aria-label="关闭">×</button>
+              <div className="flex items-center justify-between border-b border-ink/10 px-4 py-3.5">
+                <span className="flex items-center gap-2 font-extrabold text-ink">
+                  <span
+                    aria-hidden
+                    className="flex h-7 w-7 items-center justify-center rounded-xl text-white text-sm shadow-card"
+                    style={{ backgroundImage: 'linear-gradient(135deg, #2fb6cb 0%, #0e8aa0 60%, #0a6e80 100%)' }}
+                  >
+                    ✈︎
+                  </span>
+                  世途旅行
+                </span>
+                <button
+                  onClick={closeMenu}
+                  className="flex h-8 w-8 items-center justify-center rounded-xl text-ink-muted transition-colors hover:bg-brand-50/60 hover:text-brand-700 text-xl"
+                  aria-label="关闭"
+                >
+                  ×
+                </button>
               </div>
-              <div className="flex-1 overflow-y-auto py-2">
+              <div className="flex-1 overflow-y-auto px-2 py-3">
                 {/* 主导航 */}
                 {frontNav.map((n) => (
                   <NavLink
@@ -172,59 +200,39 @@ export function Layout() {
                     to={n.to}
                     end={n.exact}
                     onClick={closeMenu}
-                    className={({ isActive }) =>
-                      `block px-4 py-3 text-sm border-l-4 ${
-                        isActive ? 'border-brand bg-brand/5 text-brand font-semibold' : 'border-transparent text-slate-700 hover:bg-slate-50'
-                      }`
-                    }
+                    className={({ isActive }) => drawerItem(isActive)}
                   >
                     {n.label}
                   </NavLink>
                 ))}
                 {isAgent && (
                   <>
-                    <NavLink
-                      to="/team"
-                      onClick={closeMenu}
-                      className={({ isActive }) =>
-                        `block px-4 py-3 text-sm border-l-4 ${
-                          isActive ? 'border-brand bg-brand/5 text-brand font-semibold' : 'border-transparent text-slate-700 hover:bg-slate-50'
-                        }`
-                      }
-                    >
+                    <NavLink to="/team" onClick={closeMenu} className={({ isActive }) => drawerItem(isActive)}>
                       {t('nav.team')}
                     </NavLink>
-                    <NavLink
-                      to="/my-commissions"
-                      onClick={closeMenu}
-                      className={({ isActive }) =>
-                        `block px-4 py-3 text-sm border-l-4 ${
-                          isActive ? 'border-brand bg-brand/5 text-brand font-semibold' : 'border-transparent text-slate-700 hover:bg-slate-50'
-                        }`
-                      }
-                    >
+                    <NavLink to="/my-commissions" onClick={closeMenu} className={({ isActive }) => drawerItem(isActive)}>
                       {t('nav.commissions')}
                     </NavLink>
                   </>
                 )}
 
-                <div className="my-2 border-t border-slate-100" />
+                <div className="my-2.5 border-t border-ink/10" />
 
                 {/* 用户区 */}
                 {user ? (
                   <>
-                    <Link to="/orders" onClick={closeMenu} className="block px-4 py-3 text-sm text-slate-700 hover:bg-slate-50">
+                    <Link to="/orders" onClick={closeMenu} className="block rounded-xl px-3 py-2.5 text-sm font-medium text-ink-soft transition-colors hover:bg-brand-50/60 hover:text-brand-700">
                       📋 {t('nav.myOrders')}
                     </Link>
-                    <Link to="/me" onClick={closeMenu} className="block px-4 py-3 text-sm text-slate-700 hover:bg-slate-50">
-                      👤 {user.displayName ?? user.email}
-                      <span className="ml-2 rounded bg-slate-100 px-1.5 py-0.5 text-xs text-slate-600">
+                    <Link to="/me" onClick={closeMenu} className="flex items-center gap-2 rounded-xl px-3 py-2.5 text-sm font-medium text-ink-soft transition-colors hover:bg-brand-50/60 hover:text-brand-700">
+                      <span>👤 {user.displayName ?? user.email}</span>
+                      <span className="badge-soft">
                         {ROLE_LABEL[user.role] ?? user.role}
                       </span>
                     </Link>
                     <button
                       type="button"
-                      className="w-full text-left block px-4 py-3 text-sm text-rose-700 hover:bg-rose-50"
+                      className="w-full text-left block rounded-xl px-3 py-2.5 text-sm font-semibold text-deal transition-colors hover:bg-deal-light"
                       onClick={async () => {
                         closeMenu();
                         await logout();
@@ -235,11 +243,9 @@ export function Layout() {
                     </button>
                   </>
                 ) : (
-                  <>
-                    <Link to="/login" onClick={closeMenu} className="block px-4 py-3 text-sm font-semibold text-brand hover:bg-brand/5">
-                      {t('nav.login')}
-                    </Link>
-                  </>
+                  <Link to="/login" onClick={closeMenu} className="mt-1 block">
+                    <span className="btn-primary w-full text-sm">{t('nav.login')}</span>
+                  </Link>
                 )}
               </div>
             </div>
@@ -248,15 +254,15 @@ export function Layout() {
 
         {/* 管理员登录在前台时，显示提示去后台 */}
         {isAdmin && (
-          <div className="border-t border-slate-200 bg-amber-50">
-            <div className="mx-auto max-w-7xl px-4 py-2 text-xs text-amber-800 flex items-center justify-between">
+          <div className="border-t border-sun/25 bg-sun-light">
+            <div className="mx-auto max-w-7xl px-4 py-2 text-xs text-amber-800 flex items-center justify-between gap-3">
               <span>
                 ⓘ 您是管理员/运营，前台仅供浏览。后台操作请到{' '}
-                <a href="http://localhost:5174" className="font-semibold underline" target="_blank" rel="noreferrer">
+                <a href="http://localhost:5174" className="font-semibold underline decoration-sun underline-offset-2 transition-colors hover:text-amber-900" target="_blank" rel="noreferrer">
                   http://localhost:5174
                 </a>
               </span>
-              <a href="http://localhost:5174" target="_blank" rel="noreferrer" className="rounded bg-amber-600 px-2 py-1 text-white hover:bg-amber-700">
+              <a href="http://localhost:5174" target="_blank" rel="noreferrer" className="shrink-0 rounded-xl bg-sun px-2.5 py-1 font-semibold text-white shadow-card transition-all duration-200 hover:brightness-105 hover:-translate-y-px active:scale-95">
                 进入后台 →
               </a>
             </div>
@@ -271,9 +277,13 @@ export function Layout() {
         </div>
       </main>
 
-      <footer className="border-t border-slate-200 bg-white text-xs text-slate-500">
-        <div className="mx-auto max-w-7xl px-4 py-4 pb-20 md:pb-4">
-          世途旅行 · M2-M5 演示版 · © {new Date().getFullYear()}
+      <footer className="border-t border-slate-200/70 bg-surface text-xs text-ink-muted">
+        <div className="mx-auto flex max-w-7xl flex-col items-start gap-1 px-4 py-5 pb-20 sm:flex-row sm:items-center sm:justify-between md:pb-5">
+          <span className="flex items-center gap-1.5 font-semibold text-ink-soft">
+            <span aria-hidden className="text-brand-600">✈︎</span>
+            世途旅行
+          </span>
+          <span>海岛专线 · 一站式预订 · M2-M5 演示版 · © {new Date().getFullYear()}</span>
         </div>
       </footer>
 
@@ -296,12 +306,12 @@ function CartButton() {
   return (
     <Link
       to="/cart"
-      className="relative hidden md:inline-flex items-center gap-1 rounded-md border border-slate-200 px-3 py-1.5 text-slate-700 hover:border-brand hover:text-brand"
+      className="relative hidden md:inline-flex items-center gap-1.5 rounded-xl border border-slate-200/70 bg-white/70 px-3 py-1.5 font-semibold text-ink-soft shadow-card transition-all duration-200 hover:border-brand/40 hover:bg-brand-50/60 hover:text-brand-700 active:scale-95"
     >
       <span aria-hidden>🛒</span>
       <span className="hidden md:inline">购物车</span>
       {count > 0 && (
-        <span className="absolute -top-1.5 -right-1.5 inline-flex h-5 min-w-[20px] items-center justify-center rounded-full bg-red-500 px-1 text-[11px] font-bold text-white">
+        <span className="absolute -top-1.5 -right-1.5 inline-flex h-5 min-w-[20px] items-center justify-center rounded-full bg-deal px-1 text-[11px] font-bold text-white shadow-deal nums">
           {count > 99 ? '99+' : count}
         </span>
       )}
@@ -326,7 +336,7 @@ function AddToCartToast() {
   if (!msg) return null;
   return (
     // 手机端抬高到 bottom bar 之上
-    <div className="fixed bottom-20 right-4 md:bottom-6 md:right-6 z-50 rounded-md bg-slate-900 px-4 py-2 text-sm text-white shadow-lg">
+    <div className="fixed bottom-20 right-4 md:bottom-6 md:right-6 z-50 rounded-2xl bg-ink px-4 py-2.5 text-sm font-semibold text-white shadow-pop animate-fade-up">
       {msg}
     </div>
   );

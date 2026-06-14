@@ -58,6 +58,8 @@ export function App() {
   return (
     <ErrorBoundary>
       <Routes>
+        {/* 登录是独立全屏页（沉浸式海岛 split），不套前台外壳 */}
+        <Route path="login" element={<LoginPage />} />
         <Route element={<Layout />}>
           {/* 前台 — 所有人可见。套餐落地页是首页（运营要求：套餐主推、默认首屏） */}
           <Route index element={<BundlesPage />} />
@@ -70,8 +72,7 @@ export function App() {
           <Route path="cart" element={<CartPage />} />
           <Route path="checkout" element={<CheckoutPage />} />
 
-          {/* 认证 */}
-          <Route path="login" element={<LoginPage />} />
+          {/* 认证（login 已提到外层全屏路由） */}
           {/* 注册由销售代理后台为客户开通，前台不再开放自助注册 */}
           <Route path="register" element={<Navigate to="/login" replace />} />
           <Route

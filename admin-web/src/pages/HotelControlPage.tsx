@@ -38,11 +38,11 @@ function fmtCny(n: number | null | undefined): string {
   if (n == null || !Number.isFinite(n)) return '—';
   return `¥${n.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}`;
 }
-/** 余量/余房单元格配色：<0 红底白字加粗、=0 黄 */
+/** 余量/余房单元格配色：<0 红底白字加粗（超卖醒目）、=0 黄 */
 function remainingCellCls(v: number): string {
-  if (v < 0) return 'bg-red-600 font-bold text-white';
-  if (v === 0) return 'bg-amber-100 text-amber-800';
-  return 'text-slate-700';
+  if (v < 0) return 'bg-rose-600 font-bold text-white';
+  if (v === 0) return 'bg-amber-50 font-medium text-amber-700';
+  return 'text-ink-soft';
 }
 
 // 矩阵 sticky 列宽：第一列（酒店）11rem，第二列（行标签）3.5rem
@@ -86,11 +86,11 @@ export function HotelControlPage() {
     <div className="space-y-6">
       <section className="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h1 className="text-2xl font-bold text-slate-900">房控</h1>
-          <p className="mt-1 text-sm text-slate-600">
+          <h1 className="page-title">房控</h1>
+          <p className="page-sub">
             酒店切房台账：按日期看「包房（切了多少）/ 用房（订单占了多少）/ 余量」。余量
-            <span className="mx-1 rounded bg-red-600 px-1.5 py-0.5 text-xs font-bold text-white">&lt;0 超卖</span>
-            <span className="mr-1 rounded bg-amber-100 px-1.5 py-0.5 text-xs text-amber-800">=0 售罄</span>
+            <span className="badge-danger mx-1">&lt;0 超卖</span>
+            <span className="badge-warning mr-1">=0 售罄</span>
             一眼可见。
           </p>
         </div>
@@ -110,12 +110,12 @@ export function HotelControlPage() {
       <AlertsBanner token={token} />
 
       {error && (
-        <div className="rounded-md border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-800">
-          ❌ {error}
+        <div className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+          {error}
         </div>
       )}
       {from > to && (
-        <div className="rounded-md border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
+        <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-700">
           起始日不能晚于截止日
         </div>
       )}
@@ -125,25 +125,25 @@ export function HotelControlPage() {
 
       {/* ── 销控矩阵（按酒店 × 日期）──────────────────────────────── */}
       <section className="card">
-        <h2 className="text-sm font-semibold text-slate-900">销控矩阵（按酒店 × 日期）</h2>
-        <p className="mt-1 text-xs text-slate-500">
+        <h2 className="text-sm font-semibold text-ink">销控矩阵（按酒店 × 日期）</h2>
+        <p className="mt-1 text-xs text-ink-muted">
           每家酒店三行：包房 / 用房 / 余量。横向滚动看更多日期（最长 120 天）。
         </p>
         {loading ? (
-          <div className="mt-3 text-sm text-slate-500">加载销控板…</div>
+          <div className="mt-3 text-sm text-ink-muted">加载销控板…</div>
         ) : !board || board.hotels.length === 0 ? (
-          <div className="mt-3 py-4 text-center text-sm text-slate-400">
+          <div className="mt-3 py-4 text-center text-sm text-ink-muted">
             该区间暂无包房周期或占房订单 · 先在下方「包房周期管理」新增周期
           </div>
         ) : (
           <div className="mt-3 overflow-x-auto">
-            <table className="border-collapse text-sm">
-              <thead className="text-xs text-slate-500">
+            <table className="border-collapse text-sm nums">
+              <thead className="text-xs text-ink-muted">
                 <tr className="border-b border-slate-200">
-                  <th className={`${STICKY_COL1} py-2 pr-2 text-left font-normal`}>酒店</th>
+                  <th className={`${STICKY_COL1} py-2 pr-2 text-left font-medium uppercase tracking-wide`}>酒店</th>
                   <th className={`${STICKY_COL2} py-2 pr-2 text-left font-normal`}></th>
                   {board.dates.map((d) => (
-                    <th key={d} className="whitespace-nowrap px-2 py-2 text-right font-normal">
+                    <th key={d} className="whitespace-nowrap px-2 py-2 text-right font-medium">
                       {d.slice(5)}
                     </th>
                   ))}
@@ -154,26 +154,26 @@ export function HotelControlPage() {
                   <Fragment key={h.hotelId}>
                     <tr className="border-t border-slate-200">
                       <td rowSpan={3} className={`${STICKY_COL1} py-2 pr-2 align-top`}>
-                        <div className="font-medium text-slate-900">{h.hotelName}</div>
+                        <div className="font-medium text-ink">{h.hotelName}</div>
                         {h.unitPrice != null && (
-                          <div className="text-xs text-slate-500">单价 {fmtCny(h.unitPrice)}/晚</div>
+                          <div className="text-xs text-ink-muted">单价 {fmtCny(h.unitPrice)}/晚</div>
                         )}
                       </td>
-                      <td className={`${STICKY_COL2} py-1 pr-2 text-xs text-slate-500`}>包房</td>
+                      <td className={`${STICKY_COL2} py-1 pr-2 text-xs text-ink-muted`}>包房</td>
                       {h.rows.block.map((v, i) => (
-                        <td key={i} className="px-2 py-1 text-right tabular-nums text-slate-700">{v}</td>
+                        <td key={i} className="px-2 py-1 text-right text-ink-soft">{v}</td>
                       ))}
                     </tr>
                     <tr>
-                      <td className={`${STICKY_COL2} py-1 pr-2 text-xs text-slate-500`}>用房</td>
+                      <td className={`${STICKY_COL2} py-1 pr-2 text-xs text-ink-muted`}>用房</td>
                       {h.rows.used.map((v, i) => (
-                        <td key={i} className="px-2 py-1 text-right tabular-nums text-slate-700">{v}</td>
+                        <td key={i} className="px-2 py-1 text-right text-ink-soft">{v}</td>
                       ))}
                     </tr>
                     <tr className="border-b border-slate-100">
-                      <td className={`${STICKY_COL2} py-1 pr-2 text-xs text-slate-500`}>余量</td>
+                      <td className={`${STICKY_COL2} py-1 pr-2 text-xs text-ink-muted`}>余量</td>
                       {h.rows.remaining.map((v, i) => (
-                        <td key={i} className={`px-2 py-1 text-right tabular-nums ${remainingCellCls(v)}`}>{v}</td>
+                        <td key={i} className={`px-2 py-1 text-right ${remainingCellCls(v)}`}>{v}</td>
                       ))}
                     </tr>
                   </Fragment>
@@ -186,20 +186,20 @@ export function HotelControlPage() {
 
       {/* ── 远期总量（按日期跨酒店合计）──────────────────────────── */}
       <section className="card">
-        <h2 className="text-sm font-semibold text-slate-900">远期总量（跨酒店合计）</h2>
-        <p className="mt-1 text-xs text-slate-500">收客 = 占房订单合计；控房 = 切房合计；余房 = 控房 − 收客。</p>
+        <h2 className="text-sm font-semibold text-ink">远期总量（跨酒店合计）</h2>
+        <p className="mt-1 text-xs text-ink-muted">收客 = 占房订单合计；控房 = 切房合计；余房 = 控房 − 收客。</p>
         {loading ? (
-          <div className="mt-3 text-sm text-slate-500">加载远期视图…</div>
+          <div className="mt-3 text-sm text-ink-muted">加载远期视图…</div>
         ) : !forward || forward.dates.length === 0 ? (
-          <div className="mt-3 py-4 text-center text-sm text-slate-400">该区间暂无数据</div>
+          <div className="mt-3 py-4 text-center text-sm text-ink-muted">该区间暂无数据</div>
         ) : (
           <div className="mt-3 overflow-x-auto">
-            <table className="border-collapse text-sm">
-              <thead className="text-xs text-slate-500">
+            <table className="border-collapse text-sm nums">
+              <thead className="text-xs text-ink-muted">
                 <tr className="border-b border-slate-200">
-                  <th className={`${STICKY_COL1} py-2 pr-2 text-left font-normal`}>日期</th>
+                  <th className={`${STICKY_COL1} py-2 pr-2 text-left font-medium uppercase tracking-wide`}>日期</th>
                   {forward.dates.map((d) => (
-                    <th key={d} className="whitespace-nowrap px-2 py-2 text-right font-normal">
+                    <th key={d} className="whitespace-nowrap px-2 py-2 text-right font-medium">
                       {d.slice(5)}
                     </th>
                   ))}
@@ -207,21 +207,21 @@ export function HotelControlPage() {
               </thead>
               <tbody>
                 <tr className="border-b border-slate-100">
-                  <td className={`${STICKY_COL1} py-1 pr-2 text-xs text-slate-500`}>收客</td>
+                  <td className={`${STICKY_COL1} py-1 pr-2 text-xs text-ink-muted`}>收客</td>
                   {forward.occupied.map((v, i) => (
-                    <td key={i} className="px-2 py-1 text-right tabular-nums text-slate-700">{v}</td>
+                    <td key={i} className="px-2 py-1 text-right text-ink-soft">{v}</td>
                   ))}
                 </tr>
                 <tr className="border-b border-slate-100">
-                  <td className={`${STICKY_COL1} py-1 pr-2 text-xs text-slate-500`}>控房</td>
+                  <td className={`${STICKY_COL1} py-1 pr-2 text-xs text-ink-muted`}>控房</td>
                   {forward.held.map((v, i) => (
-                    <td key={i} className="px-2 py-1 text-right tabular-nums text-slate-700">{v}</td>
+                    <td key={i} className="px-2 py-1 text-right text-ink-soft">{v}</td>
                   ))}
                 </tr>
                 <tr>
-                  <td className={`${STICKY_COL1} py-1 pr-2 text-xs text-slate-500`}>余房</td>
+                  <td className={`${STICKY_COL1} py-1 pr-2 text-xs text-ink-muted`}>余房</td>
                   {forward.remaining.map((v, i) => (
-                    <td key={i} className={`px-2 py-1 text-right tabular-nums ${remainingCellCls(v)}`}>{v}</td>
+                    <td key={i} className={`px-2 py-1 text-right ${remainingCellCls(v)}`}>{v}</td>
                   ))}
                 </tr>
               </tbody>
@@ -271,18 +271,16 @@ function AlertsBanner({ token }: { token: string }) {
   return (
     <section className="card">
       <div className="flex items-center justify-between">
-        <h2 className="text-sm font-semibold text-slate-900">
+        <h2 className="flex items-center gap-2 text-sm font-semibold text-ink">
           提醒线（超卖加房 / 富余退房 / 班次超开票上限）
           {alerts != null && total > 0 && (
-            <span className="ml-2 rounded-full bg-red-100 px-2 py-0.5 text-xs font-medium text-red-700">
-              {total}
-            </span>
+            <span className="badge-danger">{total}</span>
           )}
         </h2>
         <button
           type="button"
           onClick={() => setOpen((v) => !v)}
-          className="text-xs text-slate-500 hover:text-slate-900"
+          className="btn-ghost px-2 py-1 text-xs"
         >
           {open ? '收起 ▲' : '展开 ▼'}
         </button>
@@ -292,24 +290,24 @@ function AlertsBanner({ token }: { token: string }) {
           {err ? (
             <div className="text-sm text-rose-600">{err}</div>
           ) : alerts == null ? (
-            <div className="text-sm text-slate-500">加载提醒…</div>
+            <div className="text-sm text-ink-muted">加载提醒…</div>
           ) : total === 0 ? (
-            <div className="text-sm text-slate-400">暂无提醒</div>
+            <div className="text-sm text-ink-muted">暂无提醒</div>
           ) : (
             <>
               {alerts.oversold.map((a, i) => (
                 <div
                   key={`os-${i}`}
-                  className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-800"
+                  className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700"
                 >
                   <span className="font-semibold">超卖 ⚠</span> {a.hotelName} {fmtMonthDay(a.date)}{' '}
-                  <span className="tabular-nums">{a.used}/{a.block}</span> 缺 {a.deficit} 间 · 让地接加房
+                  <span className="nums">{a.used}/{a.block}</span> 缺 {a.deficit} 间 · 让地接加房
                 </div>
               ))}
               {alerts.surplusSoon.map((a, i) => (
                 <div
                   key={`sp-${i}`}
-                  className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800"
+                  className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700"
                 >
                   <span className="font-semibold">富余提醒</span> {a.hotelName} {fmtMonthDay(a.date)} 还剩{' '}
                   {a.surplus} 间 · 考虑退房
@@ -318,7 +316,7 @@ function AlertsBanner({ token }: { token: string }) {
               {alerts.overCapacitySchedules.map((a, i) => (
                 <div
                   key={`oc-${i}`}
-                  className="rounded-md border border-purple-200 bg-purple-50 px-3 py-2 text-sm text-purple-800"
+                  className="rounded-lg border border-violet-200 bg-violet-50 px-3 py-2 text-sm text-violet-700"
                 >
                   <span className="font-semibold">票务 ⚠</span> {a.flightNumber}{' '}
                   {fmtMonthDay(a.departureDate)} 已收客 {a.paxCount} 人 · 超过开票上限
@@ -362,8 +360,8 @@ function RoomAllocationExport({ token }: { token: string }) {
     <section className="card">
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h2 className="text-sm font-semibold text-slate-900">导出分房表</h2>
-          <p className="mt-1 text-xs text-slate-500">
+          <h2 className="text-sm font-semibold text-ink">导出分房表</h2>
+          <p className="mt-1 text-xs text-ink-muted">
             成都格式 xlsx：每入住日期一个 sheet，按酒店分组（区间最长 14 天）。
           </p>
         </div>
@@ -390,7 +388,7 @@ function RoomAllocationExport({ token }: { token: string }) {
             type="button"
             onClick={() => void handleExport()}
             disabled={exporting || exportFrom > exportTo}
-            className="rounded-md bg-slate-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-slate-700 disabled:opacity-50"
+            className="btn-primary"
           >
             {exporting ? '导出中…' : '导出分房表'}
           </button>
@@ -471,20 +469,20 @@ function BlockPeriodsEditor({ token, onChanged }: { token: string; onChanged: ()
   }
 
   return (
-    <div className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm">
+    <div className="card">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div>
-          <h2 className="text-sm font-medium text-slate-700">
+          <h2 className="text-sm font-semibold text-ink">
             包房周期管理（按 酒店 × 日期段 定切房间数 / 单价；周期可叠加）
           </h2>
-          <p className="mt-1 text-xs text-slate-500">
+          <p className="mt-1 text-xs text-ink-muted">
             为某家酒店在某段日期切下固定间数。销控板的「包房」= 当天所有覆盖周期 rooms 之和。
           </p>
         </div>
         <button
           type="button"
           onClick={() => setShowNew((v) => !v)}
-          className="rounded-md bg-slate-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-slate-700"
+          className={showNew ? 'btn-secondary py-1.5' : 'btn-primary py-1.5'}
         >
           {showNew ? '× 取消' : '+ 新增周期'}
         </button>
@@ -504,27 +502,27 @@ function BlockPeriodsEditor({ token, onChanged }: { token: string; onChanged: ()
       )}
 
       {loading ? (
-        <div className="mt-3 text-sm text-slate-500">加载周期…</div>
+        <div className="mt-3 text-sm text-ink-muted">加载周期…</div>
       ) : err ? (
         <div className="mt-3 text-sm text-rose-600">{err}</div>
       ) : (
         <div className="mt-3 overflow-x-auto">
           <table className="w-full text-sm">
-            <thead className="text-xs text-slate-500">
+            <thead className="text-xs uppercase tracking-wide text-ink-muted">
               <tr className="border-b border-slate-200">
-                <th className="py-2 text-left font-normal">酒店</th>
-                <th className="py-2 text-left font-normal">起始</th>
-                <th className="py-2 text-left font-normal">结束</th>
-                <th className="py-2 text-right font-normal">间数</th>
-                <th className="py-2 text-right font-normal">单价(¥/间/晚)</th>
-                <th className="py-2 text-left font-normal">备注</th>
-                <th className="py-2 text-right font-normal"></th>
+                <th className="py-2 text-left font-medium">酒店</th>
+                <th className="py-2 text-left font-medium">起始</th>
+                <th className="py-2 text-left font-medium">结束</th>
+                <th className="py-2 text-right font-medium">间数</th>
+                <th className="py-2 text-right font-medium">单价(¥/间/晚)</th>
+                <th className="py-2 text-left font-medium">备注</th>
+                <th className="py-2 text-right font-medium"></th>
               </tr>
             </thead>
             <tbody>
               {periods.length === 0 && (
                 <tr>
-                  <td colSpan={7} className="py-4 text-center text-slate-400">
+                  <td colSpan={7} className="py-4 text-center text-ink-muted">
                     暂无周期 · 点击右上「+ 新增周期」开始
                   </td>
                 </tr>
@@ -605,13 +603,13 @@ function BlockPeriodNewForm({
     }
   }
 
-  const inputCls = 'rounded border border-slate-300 px-2 py-1 text-sm';
-  const numCls = 'w-24 rounded border border-slate-300 px-1.5 py-0.5 text-right text-xs tabular-nums';
+  const inputCls = 'rounded-lg border border-slate-200 px-2 py-1 text-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20';
+  const numCls = 'w-24 rounded-lg border border-slate-200 px-1.5 py-0.5 text-right text-xs nums focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20';
 
   return (
-    <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 p-3">
+    <div className="mt-3 rounded-lg border border-slate-200 bg-canvas p-3">
       <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
-        <label className="text-xs text-slate-600">
+        <label className="text-xs text-ink-soft">
           酒店
           <select
             value={hotelId}
@@ -626,7 +624,7 @@ function BlockPeriodNewForm({
             ))}
           </select>
         </label>
-        <label className="text-xs text-slate-600">
+        <label className="text-xs text-ink-soft">
           起始日
           <input
             type="date"
@@ -644,7 +642,7 @@ function BlockPeriodNewForm({
             className={`mt-1 block w-full ${inputCls}`}
           />
         </label>
-        <label className="text-xs text-slate-600">
+        <label className="text-xs text-ink-soft">
           间数
           <NumberInput
             className={`mt-1 block w-full ${numCls}`}
@@ -655,7 +653,7 @@ function BlockPeriodNewForm({
             onChange={setRooms}
           />
         </label>
-        <label className="text-xs text-slate-600">
+        <label className="text-xs text-ink-soft">
           切房单价(¥/间/晚)
           <NumberInput
             className={`mt-1 block w-full ${numCls}`}
@@ -665,7 +663,7 @@ function BlockPeriodNewForm({
             onChange={setUnitPrice}
           />
         </label>
-        <label className="text-xs text-slate-600">
+        <label className="text-xs text-ink-soft">
           备注
           <input
             type="text"
@@ -681,14 +679,14 @@ function BlockPeriodNewForm({
           type="button"
           onClick={submit}
           disabled={saving || !hotelId}
-          className="rounded-md bg-emerald-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+          className="btn-primary py-1.5"
         >
           {saving ? '保存中…' : '保存'}
         </button>
         <button
           type="button"
           onClick={onCancel}
-          className="rounded-md border border-slate-300 px-3 py-1.5 text-sm text-slate-700 hover:bg-slate-100"
+          className="btn-secondary py-1.5"
         >
           取消
         </button>
@@ -751,31 +749,31 @@ function BlockPeriodRow({
     }
   }
 
-  const numCls = 'w-20 rounded border border-slate-300 px-1.5 py-0.5 text-right text-xs tabular-nums';
-  const dateCls = 'w-32 rounded border border-slate-300 px-1.5 py-0.5 text-xs';
-  const textCls = 'w-32 rounded border border-slate-300 px-1.5 py-0.5 text-xs';
+  const numCls = 'w-20 rounded-lg border border-slate-200 px-1.5 py-0.5 text-right text-xs nums focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20';
+  const dateCls = 'w-32 rounded-lg border border-slate-200 px-1.5 py-0.5 text-xs focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20';
+  const textCls = 'w-32 rounded-lg border border-slate-200 px-1.5 py-0.5 text-xs focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20';
 
   if (!editing) {
     return (
-      <tr className="border-b border-slate-100 last:border-0">
-        <td className="py-2 font-medium text-slate-900">{period.hotelName}</td>
-        <td className="py-2 text-slate-600">{period.dateFrom}</td>
-        <td className="py-2 text-slate-600">{period.dateTo}</td>
-        <td className="py-2 text-right tabular-nums">{period.rooms}</td>
-        <td className="py-2 text-right tabular-nums">{fmtCny(period.unitPrice)}</td>
-        <td className="py-2 text-xs text-slate-500">{period.note ?? '—'}</td>
+      <tr className="border-b border-slate-100 last:border-0 hover:bg-slate-50/60">
+        <td className="py-2 font-medium text-ink">{period.hotelName}</td>
+        <td className="py-2 text-ink-soft">{period.dateFrom}</td>
+        <td className="py-2 text-ink-soft">{period.dateTo}</td>
+        <td className="py-2 text-right nums text-ink-soft">{period.rooms}</td>
+        <td className="py-2 text-right nums text-ink-soft">{fmtCny(period.unitPrice)}</td>
+        <td className="py-2 text-xs text-ink-muted">{period.note ?? '—'}</td>
         <td className="py-2 text-right">
           <button
             type="button"
             onClick={() => setEditing(true)}
-            className="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-50"
+            className="btn-secondary px-2 py-1 text-xs"
           >
             改
           </button>{' '}
           <button
             type="button"
             onClick={onDelete}
-            className="rounded-md border border-rose-300 px-2 py-1 text-xs text-rose-600 hover:bg-rose-50"
+            className="rounded-lg border border-rose-200 px-2 py-1 text-xs font-medium text-rose-600 transition hover:bg-rose-50"
           >
             删
           </button>
@@ -785,8 +783,8 @@ function BlockPeriodRow({
   }
 
   return (
-    <tr className="border-b border-slate-100 bg-amber-50/40 last:border-0">
-      <td className="py-2 font-medium text-slate-900">{period.hotelName}</td>
+    <tr className="border-b border-slate-100 bg-brand-50/50 last:border-0">
+      <td className="py-2 font-medium text-ink">{period.hotelName}</td>
       <td className="py-2"><input type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} className={dateCls} /></td>
       <td className="py-2"><input type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} className={dateCls} /></td>
       <td className="py-2 text-right"><NumberInput className={numCls} step={1} min={0} integerOnly value={rooms} onChange={setRooms} /></td>
@@ -797,14 +795,14 @@ function BlockPeriodRow({
           type="button"
           onClick={save}
           disabled={saving}
-          className="rounded-md bg-emerald-600 px-2 py-1 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+          className="btn-primary px-2 py-1 text-xs"
         >
           {saving ? '…' : '保存'}
         </button>{' '}
         <button
           type="button"
           onClick={() => { reset(); setEditing(false); }}
-          className="rounded-md border border-slate-300 px-2 py-1 text-xs text-slate-700 hover:bg-slate-50"
+          className="btn-secondary px-2 py-1 text-xs"
         >
           取消
         </button>

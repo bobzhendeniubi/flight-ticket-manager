@@ -32,10 +32,10 @@ export function TeamPage() {
   const tree = useMemo(() => buildTree(agents ?? []), [agents]);
 
   if (error) {
-    return <div className="card border-red-200 bg-red-50 text-red-700">{error}</div>;
+    return <div className="card border-deal/30 bg-deal-light font-medium text-deal-dark">{error}</div>;
   }
   if (!agents) {
-    return <div className="card text-slate-500">加载中…</div>;
+    return <div className="card text-ink-muted">加载中…</div>;
   }
 
   const title = isAdmin ? '代理管理' : '我的团队';
@@ -44,12 +44,12 @@ export function TeamPage() {
     : '查看您和您发展的所有下级代理。可直接为您自己创建下级账号。';
 
   return (
-    <div className="space-y-6">
-      <section className="card">
+    <div className="space-y-5">
+      <section className="card animate-fade-up">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
-            <h1 className="text-2xl font-bold text-slate-900">{title}</h1>
-            <p className="mt-1 text-sm text-slate-600">{subtitle}</p>
+            <h1 className="text-2xl font-extrabold tracking-tight text-ink">{title}</h1>
+            <p className="section-sub">{subtitle}</p>
           </div>
           <button
             type="button"
@@ -79,7 +79,7 @@ export function TeamPage() {
 
       <section>
         {tree.length === 0 ? (
-          <div className="card text-slate-500">暂无代理。</div>
+          <div className="card text-ink-muted">暂无代理。</div>
         ) : (
           <ul className="space-y-3">
             {tree.map((node) => (
@@ -139,28 +139,28 @@ function AgentNode({
   return (
     <li>
       <div
-        className="card flex flex-wrap items-start justify-between gap-4"
+        className="card-interactive flex flex-wrap items-start justify-between gap-4 p-4 md:p-5"
         style={{ marginLeft: depth * 24 }}
       >
         <div className="min-w-0">
-          <div className="flex items-center gap-2 flex-wrap">
-            <span className="rounded bg-brand/10 px-2 py-0.5 text-xs font-semibold text-brand">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="badge-soft">
               {TIER_LABEL[node.tier] ?? `${node.tier}级`}
             </span>
-            <h3 className="text-lg font-semibold text-slate-900">
+            <h3 className="text-lg font-bold text-ink">
               {node.companyName || node.contactName}
             </h3>
             {!node.isActive && (
-              <span className="rounded bg-slate-200 px-2 py-0.5 text-xs text-slate-600">已停用</span>
+              <span className="badge-outline">已停用</span>
             )}
           </div>
-          <div className="mt-1 text-sm text-slate-600">
-            <span className="mr-3">联系人：{node.contactName}</span>
-            <span className="mr-3">电话：{node.contactPhone}</span>
+          <div className="mt-1.5 flex flex-wrap gap-x-3 gap-y-0.5 text-sm text-ink-soft">
+            <span>联系人：{node.contactName}</span>
+            <span>电话：{node.contactPhone}</span>
             <span>邮箱：{node.email ?? '—'}</span>
           </div>
-          <div className="mt-1 text-xs text-slate-500">
-            下级 {node.childCount} 个 · 订单 {node.orderCount} 笔 · 预付余额 ¥{Number(node.prepaymentBalance).toFixed(2)}
+          <div className="mt-1.5 text-xs text-ink-muted">
+            下级 <span className="font-medium text-ink-soft nums">{node.childCount}</span> 个 · 订单 <span className="font-medium text-ink-soft nums">{node.orderCount}</span> 笔 · 预付余额 <span className="font-medium text-brand-700 nums">¥{Number(node.prepaymentBalance).toFixed(2)}</span>
             {node.parent && (
               <> · 上级：{node.parent.companyName ?? node.parent.contactName}（{TIER_LABEL[node.parent.tier] ?? ''}）</>
             )}
@@ -240,10 +240,10 @@ function CreateAgentForm({
   };
 
   return (
-    <section className="card border-brand/30">
+    <section className="card animate-fade-up border-brand/30 ring-1 ring-brand/10">
       <div className="flex items-center justify-between">
-        <h2 className="text-lg font-semibold text-slate-900">新建下级代理</h2>
-        <button type="button" className="text-sm text-slate-500 hover:text-slate-700" onClick={onCancel}>
+        <h2 className="section-title text-base">新建下级代理</h2>
+        <button type="button" className="text-sm font-medium text-ink-muted transition hover:text-ink" onClick={onCancel}>
           取消
         </button>
       </div>
@@ -265,7 +265,7 @@ function CreateAgentForm({
                 </option>
               ))}
             </select>
-            <p className="mt-1 text-xs text-slate-500">
+            <p className="mt-1 text-xs text-ink-muted">
               选择上级后，新代理 tier = 上级 tier + 1；不选则创建一个顶层 1 级代理。
             </p>
           </div>
@@ -357,7 +357,7 @@ function CreateAgentForm({
         </div>
 
         {err && (
-          <div className="md:col-span-2 rounded-md bg-red-50 px-3 py-2 text-sm text-red-700">{err}</div>
+          <div className="md:col-span-2 rounded-xl border border-deal/30 bg-deal-light px-3 py-2 text-sm font-medium text-deal-dark">{err}</div>
         )}
 
         <div className="md:col-span-2 flex justify-end gap-3">

@@ -36,8 +36,8 @@ export function TransfersPage() {
   return (
     <div className="space-y-6">
       <section className="card">
-        <h1 className="text-2xl font-bold text-slate-900">机场接送 / 包车</h1>
-        <p className="mt-1 text-sm text-slate-600">
+        <h1 className="text-2xl font-extrabold tracking-tight text-ink">机场接送 / 包车</h1>
+        <p className="mt-1 text-sm text-ink-soft">
           机场点对点 + 当地包车 + 一日游接驳，配中文司机，航班延误自动顺延。
         </p>
 
@@ -74,29 +74,34 @@ export function TransfersPage() {
       </section>
 
       <section>
-        <p className="text-sm text-slate-500 mb-3">推荐 {transfers.length} 种车型</p>
+        <div className="mb-3 flex items-baseline justify-between">
+          <p className="section-title">推荐车型</p>
+          <p className="text-sm text-ink-muted">{transfers.filter((t) => t.capacity >= passengers).length} 种可选</p>
+        </div>
         <div className="space-y-3">
           {transfers.filter((t) => t.capacity >= passengers).map((t) => (
-            <article key={t.id} className="card flex items-center gap-6 hover:shadow-md transition">
-              <img src={t.photo} alt={t.name} className="w-28 h-20 object-cover rounded-md flex-shrink-0" onError={(e) => { e.currentTarget.outerHTML = `<div class="text-5xl">${t.emoji}</div>`; }} />
-              <div className="flex-1 min-w-0">
-                <h3 className="font-semibold text-slate-900">{t.name}</h3>
-                <p className="mt-1 text-sm text-slate-600">{t.vehicleType}</p>
-                <div className="mt-2 flex flex-wrap gap-2">
+            <article key={t.id} className="card-interactive group flex flex-col gap-4 p-4 sm:flex-row sm:items-center sm:gap-6">
+              <div className="h-24 w-full flex-shrink-0 overflow-hidden rounded-2xl bg-slate-100 sm:h-20 sm:w-32">
+                <img src={t.photo} alt={t.name} className="img-zoom h-full w-full object-cover" onError={(e) => { e.currentTarget.outerHTML = `<div class="grid h-full w-full place-items-center text-5xl">${t.emoji}</div>`; }} />
+              </div>
+              <div className="min-w-0 flex-1">
+                <h3 className="font-bold text-ink">{t.name}</h3>
+                <p className="mt-0.5 text-sm text-ink-soft">{t.vehicleType}</p>
+                <div className="mt-2 flex flex-wrap gap-1.5">
                   {t.features.map((f) => (
-                    <span key={f} className="rounded bg-slate-100 px-2 py-0.5 text-xs text-slate-600">
-                      {f}
-                    </span>
+                    <span key={f} className="chip">{f}</span>
                   ))}
                 </div>
-                <p className="mt-2 text-xs text-slate-500">
+                <p className="mt-2 text-xs text-ink-muted">
                   {t.originArea} → {t.destArea} · 最多 {t.capacity} 人 · {t.duration}
                 </p>
               </div>
-              <div className="text-right">
-                <div className="text-xs text-slate-500">起步价</div>
-                <div className="text-2xl font-bold text-red-600">¥{t.basePrice}</div>
-                <button className="btn-primary mt-2 text-sm" onClick={() => setSelected(t)}>
+              <div className="flex items-center justify-between gap-4 border-t border-slate-100 pt-3 sm:block sm:border-0 sm:pt-0 sm:text-right">
+                <div>
+                  <div className="text-xs text-ink-muted">起步价</div>
+                  <div className="price text-2xl">¥{t.basePrice}</div>
+                </div>
+                <button className="btn-deal text-sm sm:mt-2" onClick={() => setSelected(t)}>
                   立即预订
                 </button>
               </div>
@@ -105,7 +110,7 @@ export function TransfersPage() {
         </div>
 
         {transfers.filter((t) => t.capacity >= passengers).length === 0 && (
-          <div className="card text-slate-500">没有足够大的车型，请减少乘车人数。</div>
+          <div className="card text-ink-soft">没有足够大的车型，请减少乘车人数。</div>
         )}
       </section>
 
@@ -151,43 +156,45 @@ function BookModal(props: {
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" onClick={onClose}>
-      <div className="w-full max-w-lg rounded-lg bg-white shadow-xl" onClick={(e) => e.stopPropagation()}>
-        <div className="flex items-center justify-between border-b border-slate-200 px-6 py-4">
-          <h2 className="text-lg font-semibold text-slate-900">确认用车信息</h2>
-          <button className="text-slate-400 hover:text-slate-700 text-xl" onClick={onClose}>×</button>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/50 p-4 backdrop-blur-sm" onClick={onClose}>
+      <div className="w-full max-w-lg overflow-hidden rounded-3xl bg-surface shadow-pop" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between border-b border-slate-200/80 px-6 py-4">
+          <h2 className="text-lg font-extrabold tracking-tight text-ink">确认用车信息</h2>
+          <button className="text-xl text-ink-muted transition-colors hover:text-ink" onClick={onClose}>×</button>
         </div>
         <div className="px-6 py-5">
-          <dl className="space-y-2 text-sm">
+          <dl className="space-y-2.5 text-sm">
             <div className="flex justify-between">
-              <dt className="text-slate-600">车型</dt>
-              <dd className="text-slate-900">{transfer.emoji} {transfer.name}</dd>
+              <dt className="text-ink-soft">车型</dt>
+              <dd className="font-medium text-ink">{transfer.emoji} {transfer.name}</dd>
             </div>
             <div className="flex justify-between">
-              <dt className="text-slate-600">上车地址</dt>
-              <dd className="text-slate-900">{pickupAddress}</dd>
+              <dt className="text-ink-soft">上车地址</dt>
+              <dd className="font-medium text-ink">{pickupAddress}</dd>
             </div>
             <div className="flex justify-between">
-              <dt className="text-slate-600">目的地</dt>
-              <dd className="text-slate-900">{transfer.destArea}</dd>
+              <dt className="text-ink-soft">目的地</dt>
+              <dd className="font-medium text-ink">{transfer.destArea}</dd>
             </div>
             <div className="flex justify-between">
-              <dt className="text-slate-600">用车时间</dt>
-              <dd className="text-slate-900">{pickupDate} {pickupTime}</dd>
+              <dt className="text-ink-soft">用车时间</dt>
+              <dd className="font-medium text-ink">{pickupDate} {pickupTime}</dd>
             </div>
             <div className="flex justify-between">
-              <dt className="text-slate-600">乘车人数</dt>
-              <dd className="text-slate-900">{passengers} 人</dd>
+              <dt className="text-ink-soft">乘车人数</dt>
+              <dd className="font-medium text-ink">{passengers} 人</dd>
             </div>
-            <div className="flex justify-between border-t border-slate-200 pt-2">
-              <dt className="text-slate-600">应付</dt>
-              <dd className="text-xl font-bold text-red-600">¥{transfer.basePrice}</dd>
+            <div className="flex items-end justify-between border-t border-slate-200 pt-3">
+              <dt className="text-ink-soft">应付</dt>
+              <dd className="price text-xl">¥{transfer.basePrice}</dd>
             </div>
           </dl>
-          <div className="mt-5 flex justify-end gap-3">
-            <button className="btn-secondary" onClick={onClose}>取消</button>
+        </div>
+        <div className="flex items-center justify-between gap-3 border-t border-slate-200/80 bg-canvas px-6 py-4">
+          <button className="btn-ghost" onClick={onClose}>取消</button>
+          <div className="flex gap-2">
             <button className="btn-secondary" onClick={() => addToCart(false)}>🛒 加入购物车</button>
-            <button className="btn-primary" onClick={() => addToCart(true)}>立即购买 →</button>
+            <button className="btn-deal" onClick={() => addToCart(true)}>立即购买 →</button>
           </div>
         </div>
       </div>

@@ -23,7 +23,7 @@ export function MobileBottomBar() {
   return (
     <nav
       aria-label="底部导航"
-      className="md:hidden fixed inset-x-0 bottom-0 z-30 border-t border-slate-200 bg-white/95 backdrop-blur pb-[env(safe-area-inset-bottom)]"
+      className="md:hidden fixed inset-x-0 bottom-0 z-30 border-t border-brand-100/70 bg-surface/90 shadow-pop backdrop-blur-xl pb-[env(safe-area-inset-bottom)]"
     >
       <div className="grid grid-cols-4">
         {tabs.map((t) => (
@@ -32,15 +32,17 @@ export function MobileBottomBar() {
             to={t.to}
             end={t.exact}
             className={({ isActive }) =>
-              `flex flex-col items-center justify-center gap-0.5 py-1.5 text-[11px] ${
-                isActive ? 'text-brand font-semibold' : 'text-slate-600'
+              `relative flex flex-col items-center justify-center gap-0.5 py-2 text-[11px] transition-colors ${
+                isActive
+                  ? "text-brand-700 font-semibold after:absolute after:left-1/2 after:top-0 after:h-0.5 after:w-8 after:-translate-x-1/2 after:rounded-full after:bg-brand after:content-['']"
+                  : 'text-ink-muted hover:text-ink-soft'
               }`
             }
           >
             <span className="relative text-lg leading-none" aria-hidden>
               {t.emoji}
               {'badge' in t && t.badge ? (
-                <span className="absolute -right-3.5 -top-1.5 inline-flex h-4 min-w-[16px] items-center justify-center rounded-full bg-red-500 px-1 text-[10px] font-bold text-white">
+                <span className="absolute -right-3.5 -top-1.5 inline-flex h-4 min-w-[16px] items-center justify-center rounded-full bg-deal px-1 text-[10px] font-bold text-white shadow-deal nums">
                   {t.badge > 99 ? '99+' : t.badge}
                 </span>
               ) : null}

@@ -61,7 +61,7 @@ export function HeroCarousel({ greeting }: { greeting?: string | null }) {
 
   return (
     <section
-      className="relative overflow-hidden rounded-xl shadow-sm"
+      className="relative overflow-hidden rounded-3xl shadow-pop"
       onMouseEnter={() => setPaused(true)}
       onMouseLeave={() => setPaused(false)}
       aria-roledescription="轮播"
@@ -84,16 +84,16 @@ export function HeroCarousel({ greeting }: { greeting?: string | null }) {
               }}
             />
             <div className={`absolute inset-0 bg-gradient-to-br ${s.gradient}`} />
-            <div className="relative flex min-h-[220px] md:min-h-[260px] flex-col justify-center p-6 pb-10 text-white md:p-10 md:pb-12">
-              <div className="text-xs md:text-sm text-white/90">
+            <div className="relative flex min-h-[240px] flex-col justify-center p-6 pb-11 text-white md:min-h-[300px] md:p-12 md:pb-14">
+              <div className="inline-flex w-fit items-center rounded-full bg-white/15 px-3 py-1 text-xs font-semibold text-white/95 backdrop-blur md:text-sm">
                 {greeting ? `${greeting}，您好 · ` : ''}
                 {s.kicker}
               </div>
-              <h1 className="mt-2 text-2xl font-bold md:text-4xl">{s.title}</h1>
-              <p className="mt-2 max-w-2xl text-sm text-white/90 md:text-base">{s.subtitle}</p>
-              <div className="mt-3 flex flex-wrap gap-2 text-xs md:text-sm">
+              <h1 className="mt-3 text-2xl font-extrabold leading-tight drop-shadow-sm md:text-4xl">{s.title}</h1>
+              <p className="mt-2.5 max-w-2xl text-sm text-white/90 md:text-base">{s.subtitle}</p>
+              <div className="mt-4 flex flex-wrap gap-2 text-xs md:text-sm">
                 {s.chips.map((c) => (
-                  <span key={c} className="rounded-full bg-white/20 px-3 py-1 backdrop-blur">
+                  <span key={c} className="rounded-full bg-white/20 px-3 py-1.5 font-medium backdrop-blur ring-1 ring-white/15">
                     {c}
                   </span>
                 ))}

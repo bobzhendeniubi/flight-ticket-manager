@@ -233,14 +233,18 @@ export function BundlesPage() {
             />
           </div>
         </div>
-        <p className="mt-2 text-xs text-slate-500">
+        <p className="mt-2 text-xs text-ink-muted">
           回程日期按各套餐住宿晚数自动推算；机位 / 房量随日期实时更新。
         </p>
       </section>
 
       <section className="space-y-4">
+        <div className="flex items-end justify-between">
+          <h2 className="section-title">🎁 一价全含套餐</h2>
+          <Link to="/hotels" className="text-sm font-semibold text-brand transition-colors hover:text-brand-dark">浏览更多 →</Link>
+        </div>
         {visible.length === 0 && bundles.length > 0 && (
-          <div className="card text-sm text-slate-500">没有匹配"{kw}"的套餐，清空搜索框看全部。</div>
+          <div className="card text-sm text-ink-soft">没有匹配"{kw}"的套餐，清空搜索框看全部。</div>
         )}
         {visible.map((b) => (
           <ConfigurableBundleCard
@@ -388,16 +392,20 @@ function ConfigurableBundleCard({
   const hasUpgrades = b.singleSupplementPerNight != null || b.cabinUpgradePerLeg != null;
 
   return (
-    <article className="card overflow-hidden p-0">
+    <article className="card-interactive group overflow-hidden">
       {b.photo ? (
-        <div className="relative h-44 w-full overflow-hidden bg-slate-100">
+        <div className="relative h-48 w-full overflow-hidden bg-slate-100">
           <img
             src={b.photo}
             alt={b.name}
-            className="h-full w-full object-cover"
+            className="img-zoom h-full w-full object-cover"
             onError={(e) => { e.currentTarget.style.display = 'none'; }}
           />
-          <span className="absolute left-3 top-3 text-3xl drop-shadow">{b.emoji}</span>
+          <div className="pointer-events-none absolute inset-x-0 bottom-0 h-20 bg-gradient-to-t from-black/40 to-transparent" />
+          <span className="absolute left-3 top-3 text-3xl drop-shadow-md">{b.emoji}</span>
+          {b.groundDiscount > 0 && (
+            <span className="badge-deal absolute right-3 top-3">立减 ¥{b.groundDiscount.toLocaleString()}</span>
+          )}
         </div>
       ) : null}
       <div className="p-4 md:p-5">
@@ -405,15 +413,13 @@ function ConfigurableBundleCard({
         {!b.photo && <span className="text-4xl">{b.emoji}</span>}
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
-            <h3 className="font-semibold text-slate-900">{b.name}</h3>
+            <h3 className="font-extrabold tracking-tight text-ink">{b.name}</h3>
           </div>
-          <p className="mt-0.5 text-sm text-slate-600">{b.tagline}</p>
+          <p className="mt-0.5 text-sm text-ink-soft">{b.tagline}</p>
           {/* 含什么 一眼看清 */}
-          <div className="mt-1.5 flex flex-wrap gap-1.5 text-xs">
+          <div className="mt-2 flex flex-wrap gap-1.5 text-xs">
             {inclusions.map((inc) => (
-              <span key={inc} className="rounded bg-emerald-50 px-1.5 py-0.5 text-emerald-700">
-                {inc}
-              </span>
+              <span key={inc} className="badge-soft">{inc}</span>
             ))}
           </div>
         </div>
@@ -421,14 +427,14 @@ function ConfigurableBundleCard({
         {/* 房间数调整器（人数由顶部选择器统一控制） */}
         <div className="flex flex-col gap-2 items-end">
           <div className="flex items-center gap-2 text-sm">
-            <span className="text-slate-600">房间数</span>
+            <span className="text-ink-soft">房间数</span>
             <Stepper value={rooms} min={1} max={5} onChange={setRooms} />
           </div>
         </div>
       </div>
 
       {/* 出行日期一目了然：去 · 回 · N晚 */}
-      <div className="mt-3 text-xs font-medium text-slate-700">
+      <div className="mt-3 inline-flex items-center gap-1 rounded-lg bg-canvas px-2.5 py-1 text-xs font-semibold text-ink">
         🗓 {formatMonthDay(goDate)} 去 · {formatMonthDay(displayReturnDate)} 回 · {nights} 晚
       </div>
 
@@ -528,36 +534,38 @@ function ConfigurableBundleCard({
       )}
 
       {/* 价格汇总 */}
-      <div className="mt-4 rounded-md bg-slate-50 p-3">
-        <div className="flex items-center justify-between text-xs text-slate-500">
+      <div className="mt-4 rounded-2xl border border-slate-200/70 bg-canvas p-3.5">
+        <div className="flex items-center justify-between text-xs text-ink-muted">
           <span>
             机票 ¥{flightTotal.toLocaleString()} + 酒店 ¥{hotelTotal.toLocaleString()} + 其他 ¥{otherTotal.toLocaleString()}
             {b.groundDiscount > 0 && ` − 让利 ¥${b.groundDiscount.toLocaleString()}`}
           </span>
         </div>
-        <div className="mt-1 flex items-end justify-between">
-          <div className="text-xs text-slate-500">
+        <div className="mt-1.5 flex items-end justify-between">
+          <div className="text-xs text-ink-muted">
             {pax} 人 · {rooms} 房 · {formatMonthDay(goDate)} → {formatMonthDay(displayReturnDate)}
           </div>
-          <div className="text-right">
+          <div className="flex items-baseline justify-end gap-2 text-right">
             {b.groundDiscount > 0 && (
-              <span className="text-xs text-slate-400 line-through mr-2">¥{listTotal.toLocaleString()}</span>
+              <span className="price-old">¥{listTotal.toLocaleString()}</span>
             )}
-            <span className="text-2xl font-bold text-red-600">¥{total.toLocaleString()}</span>
-            <div className="text-xs text-slate-500">≈ ¥{perPerson.toLocaleString()} /人</div>
+            <div>
+              <span className="price text-2xl">¥{total.toLocaleString()}</span>
+              <div className="text-xs text-ink-muted">≈ ¥{perPerson.toLocaleString()} /人</div>
+            </div>
           </div>
         </div>
       </div>
 
       {/* 售罄提示 */}
       {soldOut && (
-        <p className="mt-2 text-right text-xs font-medium text-rose-600">该日期已售罄，换个日期试试</p>
+        <p className="mt-2 text-right text-xs font-semibold text-deal">该日期已售罄，换个日期试试</p>
       )}
 
       <div className="mt-3 flex justify-end gap-2">
         <Link to="/cart" className="btn-secondary text-sm">查看购物车</Link>
         <button
-          className="btn-primary text-sm"
+          className="btn-deal text-sm"
           disabled={soldOut}
           title={soldOut ? '该日期已售罄，换个日期试试' : undefined}
           onClick={() =>
@@ -602,28 +610,30 @@ function HotelInfoModal({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-ink/50 p-4 backdrop-blur-sm"
       onClick={onClose}
     >
       <div
-        className="max-h-[90vh] w-full max-w-2xl overflow-auto rounded-lg bg-white shadow-xl"
+        className="max-h-[90vh] w-full max-w-2xl overflow-auto rounded-3xl bg-surface shadow-pop"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="sticky top-0 flex items-center justify-between border-b border-slate-200 bg-white px-6 py-4">
-          <h2 className="text-lg font-semibold text-slate-900">
+        <div className="sticky top-0 z-10 flex items-center justify-between border-b border-slate-200/80 bg-surface/90 px-6 py-4 backdrop-blur-xl">
+          <h2 className="text-lg font-extrabold tracking-tight text-ink">
             {hotel.emoji ?? '🏨'} {hotel.name}
           </h2>
-          <button onClick={onClose} className="text-slate-400 hover:text-slate-700 text-xl" aria-label="关闭">×</button>
+          <button onClick={onClose} className="text-xl text-ink-muted transition-colors hover:text-ink" aria-label="关闭">×</button>
         </div>
 
-        <div className="px-6 py-5 space-y-4">
+        <div className="space-y-4 px-6 py-5">
           {hotel.photos[0] && (
-            <img
-              src={hotel.photos[0]}
-              alt={hotel.name}
-              className="w-full h-48 object-cover rounded-md"
-              onError={(e) => { e.currentTarget.style.display = 'none'; }}
-            />
+            <div className="overflow-hidden rounded-2xl bg-slate-100">
+              <img
+                src={hotel.photos[0]}
+                alt={hotel.name}
+                className="h-48 w-full object-cover"
+                onError={(e) => { e.currentTarget.style.display = 'none'; }}
+              />
+            </div>
           )}
           {hotel.photos.length > 1 && (
             <div className="grid grid-cols-3 gap-2">
@@ -633,7 +643,7 @@ function HotelInfoModal({
                   src={p}
                   alt=""
                   loading="lazy"
-                  className="h-20 w-full object-cover rounded"
+                  className="h-20 w-full rounded-xl object-cover"
                   onError={(e) => { e.currentTarget.style.display = 'none'; }}
                 />
               ))}
@@ -641,41 +651,35 @@ function HotelInfoModal({
           )}
 
           <div className="flex flex-wrap items-center gap-2 text-xs">
-            <span className="rounded bg-amber-100 px-2 py-0.5 font-semibold text-amber-700">
-              {'★'.repeat(hotel.starRating)}
-            </span>
+            <span className="badge-sun">{'★'.repeat(hotel.starRating)}</span>
             {hotel.rating && (
-              <span className="rounded bg-green-100 px-2 py-0.5 font-semibold text-green-700">
-                {hotel.rating} / 5
-              </span>
+              <span className="rating">{hotel.rating} / 5</span>
             )}
-            <span className="text-slate-500">📍 {hotel.area ?? hotel.address}</span>
+            <span className="text-ink-muted">📍 {hotel.area ?? hotel.address}</span>
           </div>
 
-          {hotel.highlight && <p className="text-sm text-slate-700 italic">{hotel.highlight}</p>}
+          {hotel.highlight && <p className="text-sm italic text-ink-soft">{hotel.highlight}</p>}
 
           {/* 套餐安排的房型 */}
-          <div className="rounded-md border border-purple-200 bg-purple-50/60 p-3 text-sm">
-            <div className="font-semibold text-slate-900">
+          <div className="rounded-2xl border border-brand/20 bg-brand-50/50 p-3.5 text-sm">
+            <div className="font-bold text-ink">
               本套餐房型：{roomTypeName ?? matchedRoom?.name ?? '以确认单为准'}
             </div>
-            <div className="mt-1 text-xs text-slate-600">
+            <div className="mt-1 text-xs text-ink-soft">
               {matchedRoom?.bedType ? `${matchedRoom.bedType} · ` : ''}
               {matchedRoom ? `可住 ${matchedRoom.capacity} 人 · ` : ''}
               含双早 · 2 人 1 间
             </div>
-            <div className="mt-1 text-xs text-slate-500">{BED_TYPE_NOTE}</div>
+            <div className="mt-1 text-xs text-ink-muted">{BED_TYPE_NOTE}</div>
           </div>
 
           {/* 设施 */}
           {hotel.amenities.length > 0 && (
             <div>
-              <h3 className="text-sm font-medium text-slate-900">酒店设施</h3>
+              <h3 className="text-sm font-bold text-ink">酒店设施</h3>
               <div className="mt-2 flex flex-wrap gap-1.5">
                 {hotel.amenities.map((a) => (
-                  <span key={a} className="rounded bg-slate-100 px-2 py-0.5 text-xs text-slate-600">
-                    {a}
-                  </span>
+                  <span key={a} className="chip">{a}</span>
                 ))}
               </div>
             </div>
@@ -704,21 +708,21 @@ function Stepper({
   onChange: (v: number) => void;
 }) {
   return (
-    <div className="flex items-center rounded-md border border-slate-300 overflow-hidden">
+    <div className="flex items-center overflow-hidden rounded-xl border border-slate-200">
       <button
         type="button"
-        className="px-2 py-1 hover:bg-slate-50 disabled:text-slate-300"
+        className="px-2.5 py-1.5 text-ink-soft transition-colors hover:bg-brand-50 disabled:text-slate-300"
         disabled={value <= min}
         onClick={() => onChange(value - 1)}
       >
         −
       </button>
-      <span className="px-3 py-1 text-center tabular-nums min-w-[2.5rem] bg-white font-medium">
+      <span className="nums min-w-[2.5rem] bg-white px-3 py-1.5 text-center font-semibold text-ink">
         {value}
       </span>
       <button
         type="button"
-        className="px-2 py-1 hover:bg-slate-50 disabled:text-slate-300"
+        className="px-2.5 py-1.5 text-ink-soft transition-colors hover:bg-brand-50 disabled:text-slate-300"
         disabled={value >= max}
         onClick={() => onChange(value + 1)}
       >

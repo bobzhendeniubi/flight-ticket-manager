@@ -86,30 +86,28 @@ export function FlightsPage() {
   };
 
   if (user?.role !== 'ADMIN' && user?.role !== 'STAFF') {
-    return <div className="card text-slate-600">仅管理员/运营可访问此页面。</div>;
+    return <div className="card text-ink-soft">仅管理员/运营可访问此页面。</div>;
   }
 
   if (error) {
-    return <div className="card border-red-200 bg-red-50 text-red-700">{error}</div>;
+    return <div className="card border-rose-200 bg-rose-50 text-rose-700">{error}</div>;
   }
   if (!flights) {
-    return <div className="card text-slate-500">加载中…</div>;
+    return <div className="card text-ink-muted">加载中…</div>;
   }
 
   return (
     <div className="space-y-6">
-      <section className="card">
-        <div className="flex items-start justify-between">
-          <div>
-            <h1 className="text-2xl font-bold text-slate-900">航班管理</h1>
-            <p className="mt-1 text-sm text-slate-600">维护自营航班、班次和舱位。</p>
-          </div>
-          {user.role === 'ADMIN' && (
-            <button type="button" className="btn-primary" onClick={() => setShowNewFlight(true)}>
-              + 新建航班
-            </button>
-          )}
+      <section className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h1 className="page-title">航班管理</h1>
+          <p className="page-sub">维护自营航班、班次和舱位。</p>
         </div>
+        {user.role === 'ADMIN' && (
+          <button type="button" className="btn-primary" onClick={() => setShowNewFlight(true)}>
+            + 新建航班
+          </button>
+        )}
       </section>
 
       {showNewFlight && (
@@ -123,26 +121,26 @@ export function FlightsPage() {
       )}
 
       <section className="space-y-3">
-        {flights.length === 0 && <div className="card text-slate-500">暂无航班，点右上角创建。</div>}
+        {flights.length === 0 && <div className="card text-ink-muted">暂无航班，点右上角创建。</div>}
         {flights.map((f) => (
           <div key={f.id} className="card">
             <div className="flex flex-wrap items-center justify-between gap-3">
               <div className="flex items-center gap-4">
-                <span className="inline-flex items-center rounded bg-brand/10 px-2 py-0.5 text-sm font-semibold text-brand">
+                <span className="inline-flex items-center rounded-md bg-brand-50 px-2 py-0.5 text-sm font-semibold text-brand-700">
                   {f.flightNumber}
                 </span>
                 <div>
-                  <div className="font-medium text-slate-900">
+                  <div className="font-medium text-ink">
                     {airportLabel(f.originCode)} → {airportLabel(f.destinationCode)}
                   </div>
-                  <div className="text-xs text-slate-500">
+                  <div className="text-xs text-ink-muted">
                     机型：{f.aircraftType ?? '—'} · 共 {f.scheduleCount} 个班次
                   </div>
                 </div>
               </div>
               <div className="flex items-center gap-2">
                 {!f.isActive && (
-                  <span className="rounded bg-slate-200 px-2 py-0.5 text-xs text-slate-600">已停用</span>
+                  <span className="badge-neutral">已停用</span>
                 )}
                 <button type="button" className="btn-secondary text-sm" onClick={() => toggleExpand(f.id)}>
                   {expanded === f.id ? '收起' : '查看班次'}
@@ -262,8 +260,8 @@ function SchedulesList({
     }
   }
 
-  if (schedules === null) return <div className="mt-3 text-sm text-slate-500">加载班次中…</div>;
-  if (schedules.length === 0) return <div className="mt-3 text-sm text-slate-500">还没有班次。</div>;
+  if (schedules === null) return <div className="mt-3 text-sm text-ink-muted">加载班次中…</div>;
+  if (schedules.length === 0) return <div className="mt-3 text-sm text-ink-muted">还没有班次。</div>;
 
   // 构造可筛选的月份列表 (YYYY-MM)
   const months = Array.from(
@@ -304,22 +302,22 @@ function SchedulesList({
         <span className="text-xs text-slate-500">显示 {filtered.length} 条</span>
       </div>
       {exportErr && (
-        <div className="rounded border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700">
+        <div className="rounded border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
           {exportErr}
         </div>
       )}
       <div className="overflow-x-auto">
-        <table className="min-w-full divide-y divide-slate-200 text-sm">
-        <thead className="bg-slate-50 text-left text-xs font-medium uppercase text-slate-500">
+        <table className="table-admin">
+        <thead>
           <tr>
-            <th className="px-3 py-2">出发</th>
-            <th className="px-3 py-2">到达</th>
-            <th className="px-3 py-2">舱位 / 余票 / 价格</th>
-            <th className="px-3 py-2">状态</th>
-            <th className="px-3 py-2">操作</th>
+            <th className="text-left">出发</th>
+            <th className="text-left">到达</th>
+            <th className="text-left">舱位 / 余票 / 价格</th>
+            <th className="text-left">状态</th>
+            <th className="text-left">操作</th>
           </tr>
         </thead>
-        <tbody className="divide-y divide-slate-200">
+        <tbody>
           {filtered.map((s) => {
             // 用 UTC 拿日期作为文件名（与后端 ordersExportFilename 保持一致；
             // 班次入库时间是 UTC，按 UTC 转日期即可，跟时区无关）
@@ -328,19 +326,19 @@ function SchedulesList({
             const isExporting = exporting === s.id;
             return (
               <tr key={s.id}>
-                <td className="px-3 py-2">
-                  <div className="font-medium text-slate-900">
+                <td>
+                  <div className="font-medium text-ink">
                     {formatLocalDate(s.departureTime, s.departureTz)} {formatLocalTime(s.departureTime, s.departureTz)}
                   </div>
-                  <div className="text-xs text-slate-500">{s.departureTz}</div>
+                  <div className="text-xs text-ink-muted">{s.departureTz}</div>
                 </td>
-                <td className="px-3 py-2">
-                  <div className="font-medium text-slate-900">
+                <td>
+                  <div className="font-medium text-ink">
                     {formatLocalDate(s.arrivalTime, s.arrivalTz)} {formatLocalTime(s.arrivalTime, s.arrivalTz)}
                   </div>
-                  <div className="text-xs text-slate-500">{s.arrivalTz}</div>
+                  <div className="text-xs text-ink-muted">{s.arrivalTz}</div>
                 </td>
-                <td className="px-3 py-2">
+                <td>
                   <ul className="space-y-0.5">
                     {s.seatClasses.map((c) => (
                       <li key={c.id}>
@@ -349,14 +347,14 @@ function SchedulesList({
                     ))}
                   </ul>
                 </td>
-                <td className="px-3 py-2">
+                <td>
                   {s.isActive ? (
-                    <span className="rounded bg-green-100 px-2 py-0.5 text-xs text-green-700">在售</span>
+                    <span className="badge-success">在售</span>
                   ) : (
-                    <span className="rounded bg-slate-200 px-2 py-0.5 text-xs text-slate-600">已停</span>
+                    <span className="badge-neutral">已停</span>
                   )}
                 </td>
-                <td className="px-3 py-2">
+                <td>
                   <button
                     type="button"
                     className="btn-secondary text-xs whitespace-nowrap"
@@ -886,33 +884,33 @@ function BaggagePolicyEditor({ flight, onClose }: { flight: AdminFlight; onClose
       {rows && (
         <>
           <div className="mt-3 overflow-x-auto">
-            <table className="min-w-full divide-y divide-slate-200 text-sm">
-              <thead className="bg-slate-100 text-left text-xs font-medium uppercase text-slate-500">
+            <table className="table-admin">
+              <thead>
                 <tr>
-                  <th className="px-3 py-2">舱等</th>
-                  <th className="px-3 py-2">启用</th>
-                  <th className="px-3 py-2">托运 (kg/人)</th>
-                  <th className="px-3 py-2">托运件数 (件/人)</th>
-                  <th className="px-3 py-2">手提 (kg/人)</th>
-                  <th className="px-3 py-2">补充说明</th>
+                  <th className="text-left">舱等</th>
+                  <th className="text-left">启用</th>
+                  <th className="text-left">托运 (kg/人)</th>
+                  <th className="text-left">托运件数 (件/人)</th>
+                  <th className="text-left">手提 (kg/人)</th>
+                  <th className="text-left">补充说明</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-slate-200 bg-white">
+              <tbody>
                 {BAGGAGE_CABINS.map((cabin) => {
                   const row = rows[cabin];
                   return (
                     <tr key={cabin} className={row.enabled ? '' : 'opacity-50'}>
-                      <td className="px-3 py-2 font-medium text-slate-900 whitespace-nowrap">
+                      <td className="font-medium text-ink whitespace-nowrap">
                         {CABIN_LABEL[cabin] ?? cabin}
                       </td>
-                      <td className="px-3 py-2">
+                      <td>
                         <input
                           type="checkbox"
                           checked={row.enabled}
                           onChange={(e) => updateRow(cabin, { enabled: e.target.checked })}
                         />
                       </td>
-                      <td className="px-3 py-2">
+                      <td>
                         <NumberInput
                           min={0}
                           max={999}
@@ -924,7 +922,7 @@ function BaggagePolicyEditor({ flight, onClose }: { flight: AdminFlight; onClose
                           integerOnly
                         />
                       </td>
-                      <td className="px-3 py-2">
+                      <td>
                         <NumberInput
                           min={0}
                           max={99}
@@ -936,7 +934,7 @@ function BaggagePolicyEditor({ flight, onClose }: { flight: AdminFlight; onClose
                           integerOnly
                         />
                       </td>
-                      <td className="px-3 py-2">
+                      <td>
                         <NumberInput
                           min={0}
                           max={99}
@@ -948,7 +946,7 @@ function BaggagePolicyEditor({ flight, onClose }: { flight: AdminFlight; onClose
                           integerOnly
                         />
                       </td>
-                      <td className="px-3 py-2">
+                      <td>
                         <input
                           className="input w-full min-w-[180px]"
                           maxLength={500}
@@ -965,8 +963,8 @@ function BaggagePolicyEditor({ flight, onClose }: { flight: AdminFlight; onClose
             </table>
           </div>
           <div className="mt-3 flex items-center justify-end gap-3">
-            {savedMsg && <span className="text-sm text-green-700">{savedMsg}</span>}
-            <span className="text-xs text-slate-500">未启用的舱等保存后将删除其规则</span>
+            {savedMsg && <span className="text-sm text-emerald-700">{savedMsg}</span>}
+            <span className="text-xs text-ink-muted">未启用的舱等保存后将删除其规则</span>
             <button type="button" className="btn-secondary" onClick={onClose}>关闭</button>
             <button type="button" className="btn-primary" disabled={saving} onClick={onSave}>
               {saving ? '保存中…' : '保存行李规则'}

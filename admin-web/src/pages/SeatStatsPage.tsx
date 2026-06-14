@@ -107,14 +107,14 @@ export function SeatStatsPage() {
     return { totalCap, totalSold, avgOcc, count: filtered.length };
   }, [filtered]);
 
-  if (error) return <div className="card border-red-200 bg-red-50 text-red-700">{error}</div>;
-  if (loading) return <div className="card text-slate-500">加载中…</div>;
+  if (error) return <div className="card border-rose-200 bg-rose-50 text-rose-700">{error}</div>;
+  if (loading) return <div className="card text-ink-muted">加载中…</div>;
 
   return (
     <div className="space-y-5">
       <section>
-        <h1 className="text-2xl font-bold text-slate-900">航班座位统计</h1>
-        <p className="mt-1 text-sm text-slate-600">
+        <h1 className="page-title">航班座位统计</h1>
+        <p className="page-sub">
           实时统计自营航班的座位占用情况。数据口径：FlightSeatClass.sold（占库存即计入）。
         </p>
       </section>
@@ -159,68 +159,68 @@ export function SeatStatsPage() {
 
       <section className="card p-0 overflow-hidden">
         <div className="overflow-x-auto">
-          <table className="min-w-full divide-y divide-slate-200 text-sm">
-            <thead className="bg-slate-50 text-xs uppercase text-slate-500">
+          <table className="table-admin">
+            <thead>
               <tr>
-                <th className="px-3 py-2 text-left">出发</th>
-                <th className="px-3 py-2 text-left">航班 / 路线</th>
-                <th className="px-3 py-2 text-left">舱位明细</th>
-                <th className="px-3 py-2 text-right">总座位</th>
-                <th className="px-3 py-2 text-right">已售</th>
-                <th className="px-3 py-2 text-right">余票</th>
-                <th className="px-3 py-2 w-48">占用率</th>
+                <th className="text-left">出发</th>
+                <th className="text-left">航班 / 路线</th>
+                <th className="text-left">舱位明细</th>
+                <th className="text-right">总座位</th>
+                <th className="text-right">已售</th>
+                <th className="text-right">余票</th>
+                <th className="w-48">占用率</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-100">
+            <tbody>
               {filtered.map((s) => (
-                <tr key={s.id} className="hover:bg-slate-50">
-                  <td className="px-3 py-2">
-                    <div className="font-medium text-slate-900">
+                <tr key={s.id}>
+                  <td>
+                    <div className="font-medium text-ink">
                       {formatLocalDate(s.departureTime, s.departureTz)}
                     </div>
-                    <div className="text-xs text-slate-500">
+                    <div className="text-xs text-ink-muted">
                       {formatLocalTime(s.departureTime, s.departureTz)} {s.departureTz}
                     </div>
                   </td>
-                  <td className="px-3 py-2">
+                  <td>
                     <div className="font-mono text-brand">{s.flightNumber}</div>
-                    <div className="text-xs text-slate-500">
+                    <div className="text-xs text-ink-muted">
                       {airportLabel(s.origin)} → {airportLabel(s.dest)}
                     </div>
                   </td>
-                  <td className="px-3 py-2 text-xs">
+                  <td className="text-xs">
                     {s.seatClasses.map((c) => (
                       <div key={c.id}>
-                        <span className="text-slate-500">{CABIN_LABEL[c.cabin] ?? c.cabin}:</span>{' '}
-                        <span className="text-slate-900">
+                        <span className="text-ink-muted">{CABIN_LABEL[c.cabin] ?? c.cabin}:</span>{' '}
+                        <span className="text-ink">
                           {c.sold}/{c.capacity}
                         </span>{' '}
-                        <span className="text-slate-400">¥{Number(c.basePrice).toFixed(0)}</span>
+                        <span className="text-ink-muted">¥{Number(c.basePrice).toFixed(0)}</span>
                       </div>
                     ))}
                   </td>
-                  <td className="px-3 py-2 text-right">{s.totalCapacity}</td>
-                  <td className="px-3 py-2 text-right">{s.totalSold}</td>
+                  <td className="text-right nums">{s.totalCapacity}</td>
+                  <td className="text-right nums">{s.totalSold}</td>
                   {(() => {
                     const avail = s.totalCapacity - s.totalSold;
                     const low = avail < LOW_SEAT_THRESHOLD;
                     return (
                       <td
-                        className={`px-3 py-2 text-right tabular-nums ${low ? 'font-bold text-red-600' : ''}`}
+                        className={`text-right nums ${low ? 'font-bold text-rose-600' : ''}`}
                         title={low ? `余位不足 ${LOW_SEAT_THRESHOLD}，建议关注/调价` : undefined}
                       >
                         {low && '🔴 '}{avail}
                       </td>
                     );
                   })()}
-                  <td className="px-3 py-2">
+                  <td>
                     <OccupancyBar occupancy={s.occupancy} />
                   </td>
                 </tr>
               ))}
               {filtered.length === 0 && (
                 <tr>
-                  <td colSpan={7} className="px-3 py-8 text-center text-slate-500">
+                  <td colSpan={7} className="px-3 py-8 text-center text-ink-muted">
                     没有数据
                   </td>
                 </tr>
@@ -235,10 +235,10 @@ export function SeatStatsPage() {
 
 function KpiCard({ label, value, sub }: { label: string; value: string; sub?: string }) {
   return (
-    <div className="card">
-      <p className="text-xs font-medium uppercase text-slate-500">{label}</p>
-      <p className="mt-2 text-2xl font-bold text-slate-900">{value}</p>
-      {sub && <p className="mt-1 text-xs text-slate-500">{sub}</p>}
+    <div className="stat-card">
+      <p className="stat-label">{label}</p>
+      <p className="stat-value">{value}</p>
+      {sub && <p className="mt-1 text-xs text-ink-muted">{sub}</p>}
     </div>
   );
 }

@@ -20,11 +20,14 @@ function SectionHeader({ title, sub, to, toLabel }: { title: string; sub?: strin
   return (
     <div className="flex items-end justify-between gap-2">
       <div>
-        <h2 className="text-xl font-bold text-slate-900">{title}</h2>
-        {sub && <p className="text-xs text-slate-500">{sub}</p>}
+        <h2 className="section-title">{title}</h2>
+        {sub && <p className="section-sub">{sub}</p>}
       </div>
-      <Link to={to} className="text-sm text-brand hover:text-brand-dark whitespace-nowrap">
-        {toLabel} →
+      <Link
+        to={to}
+        className="inline-flex shrink-0 items-center gap-0.5 whitespace-nowrap text-sm font-semibold text-brand transition-colors hover:text-brand-dark"
+      >
+        {toLabel} <span aria-hidden>→</span>
       </Link>
     </div>
   );
@@ -85,57 +88,58 @@ export function BundlesPreviewSection({ keyword }: { keyword: string }) {
       {state === 'loading' ? (
         <div className="mt-4 grid gap-4 md:grid-cols-2 lg:grid-cols-3">
           {[0, 1, 2].map((i) => (
-            <div key={i} className="card h-40 animate-pulse bg-slate-100" aria-hidden />
+            <div key={i} className="skeleton h-52" aria-hidden />
           ))}
         </div>
       ) : state === 'error' ? (
-        <div className="card mt-4 text-sm text-slate-500">套餐加载失败，请刷新页面重试。</div>
+        <div className="card mt-4 text-sm text-ink-soft">套餐加载失败，请刷新页面重试。</div>
       ) : bundles.length === 0 ? (
-        <div className="card mt-4 text-sm text-slate-500">套餐上架中，敬请期待。</div>
+        <div className="card mt-4 text-sm text-ink-soft">套餐上架中，敬请期待。</div>
       ) : visible.length === 0 ? (
-        <div className="card mt-4 text-sm text-slate-500">没有匹配"{keyword}"的套餐，去看看全部套餐吧。</div>
+        <div className="card mt-4 text-sm text-ink-soft">没有匹配"{keyword}"的套餐，去看看全部套餐吧。</div>
       ) : (
         <div className="mt-4 grid gap-4 md:grid-cols-2 lg:grid-cols-3">
           {visible.slice(0, 6).map((b) => (
             <Link
               key={b.id}
               to={`/bundles?kw=${encodeURIComponent(b.name)}`}
-              className="card overflow-hidden p-0 hover:shadow-md transition block"
+              className="card-interactive group block overflow-hidden"
             >
               {b.photo && (
-                <div className="relative h-32 w-full overflow-hidden bg-slate-100">
+                <div className="relative h-40 w-full overflow-hidden bg-slate-100">
                   <img
                     src={b.photo}
                     alt={b.name}
                     loading="lazy"
-                    className="h-full w-full object-cover"
+                    className="img-zoom h-full w-full object-cover"
                     onError={(e) => { e.currentTarget.style.display = 'none'; }}
                   />
-                  <span className="absolute left-2 top-2 text-2xl drop-shadow">{b.emoji}</span>
+                  <div className="pointer-events-none absolute inset-x-0 bottom-0 h-16 bg-gradient-to-t from-black/35 to-transparent" />
+                  <span className="absolute left-2.5 top-2.5 text-2xl drop-shadow-md">{b.emoji}</span>
                   {Number(b.groundDiscount) > 0 && (
-                    <span className="absolute right-2 top-2 rounded bg-red-500 px-1.5 py-0.5 text-xs font-semibold text-white">
+                    <span className="badge-deal absolute right-2.5 top-2.5">
                       立减 ¥{Number(b.groundDiscount).toLocaleString()}
                     </span>
                   )}
                 </div>
               )}
               <div className="p-4">
-                <h3 className="font-semibold text-slate-900 truncate">{!b.photo ? `${b.emoji ?? '🎁'} ` : ''}{b.name}</h3>
-                <p className="mt-0.5 text-xs text-slate-600 line-clamp-2">{b.tagline}</p>
+                <h3 className="truncate font-bold text-ink">{!b.photo ? `${b.emoji ?? '🎁'} ` : ''}{b.name}</h3>
+                <p className="mt-0.5 line-clamp-2 text-xs text-ink-soft">{b.tagline}</p>
                 {b.hotelRoomType && (
-                  <p className="mt-1.5 text-xs text-slate-500 truncate">
+                  <p className="mt-1.5 truncate text-xs text-ink-muted">
                     🏨 {b.hotelRoomType.hotelName} · {b.hotelRoomType.name} · 含双早
                   </p>
                 )}
                 {bundleFromPricePerPerson(b) > 0 && (
-                  <p className="mt-1.5 text-sm font-semibold text-red-600">
-                    ¥{bundleFromPricePerPerson(b).toLocaleString()}
-                    <span className="text-xs font-normal text-slate-500"> 起/人</span>
+                  <p className="mt-2 flex items-baseline gap-1">
+                    <span className="price text-lg">¥{bundleFromPricePerPerson(b).toLocaleString()}</span>
+                    <span className="text-xs font-normal text-ink-muted">起/人</span>
                   </p>
                 )}
-                <div className="mt-2 flex items-center justify-between text-xs">
-                  <span className="text-slate-500">{b.suitableFor}</span>
-                  <span className="font-semibold text-brand">看详情 / 订 →</span>
+                <div className="mt-2.5 flex items-center justify-between border-t border-slate-100 pt-2.5 text-xs">
+                  <span className="text-ink-muted">{b.suitableFor}</span>
+                  <span className="font-semibold text-brand transition-colors group-hover:text-brand-dark">看详情 / 订 →</span>
                 </div>
               </div>
             </Link>
@@ -165,29 +169,32 @@ export function HotelsPreviewSection({ keyword }: { keyword: string }) {
     <section>
       <SectionHeader title="🏨 精选酒店" sub="直签合作 · 含早可选 · 与机票打包更优惠" to="/hotels" toLabel="全部酒店" />
       {visible.length === 0 ? (
-        <div className="card mt-4 text-sm text-slate-500">没有匹配"{keyword}"的酒店。</div>
+        <div className="card mt-4 text-sm text-ink-soft">没有匹配"{keyword}"的酒店。</div>
       ) : (
-        <div className="mt-4 grid gap-4 grid-cols-2 lg:grid-cols-4">
+        <div className="mt-4 grid grid-cols-2 gap-4 lg:grid-cols-4">
           {visible.slice(0, 4).map((h) => (
-            <Link key={h.id} to="/hotels" className="card overflow-hidden p-0 hover:shadow-md transition block">
+            <Link key={h.id} to="/hotels" className="card-interactive group block overflow-hidden">
               {h.photos[0] && (
-                <img
-                  src={h.photos[0]}
-                  alt={h.name}
-                  loading="lazy"
-                  className="h-24 w-full object-cover"
-                  onError={(e) => { e.currentTarget.style.display = 'none'; }}
-                />
+                <div className="relative h-28 w-full overflow-hidden bg-slate-100">
+                  <img
+                    src={h.photos[0]}
+                    alt={h.name}
+                    loading="lazy"
+                    className="img-zoom h-full w-full object-cover"
+                    onError={(e) => { e.currentTarget.style.display = 'none'; }}
+                  />
+                  <span className="rating absolute left-2 top-2 shadow-card">★ {h.starRating}.0</span>
+                </div>
               )}
               <div className="p-3">
-                <h3 className="text-sm font-semibold text-slate-900 truncate">{h.name}</h3>
-                <p className="mt-0.5 text-xs text-slate-500 truncate">
-                  {'★'.repeat(h.starRating)} · {h.area ?? h.cityCode}
+                <h3 className="truncate text-sm font-bold text-ink">{h.name}</h3>
+                <p className="mt-0.5 truncate text-xs text-ink-muted">
+                  📍 {h.area ?? h.cityCode}
                 </p>
                 {h.basePrice && (
-                  <p className="mt-1 text-sm font-semibold text-red-600">
-                    ¥{Number(h.basePrice).toLocaleString()}
-                    <span className="text-xs font-normal text-slate-500"> /晚起</span>
+                  <p className="mt-1.5 flex items-baseline gap-1">
+                    <span className="price text-base">¥{Number(h.basePrice).toLocaleString()}</span>
+                    <span className="text-xs font-normal text-ink-muted">/晚起</span>
                   </p>
                 )}
               </div>
@@ -220,17 +227,17 @@ export function TransfersPreviewSection({ keyword }: { keyword: string }) {
     <section>
       <SectionHeader title="🚐 接送 / 包车" sub="中文司机点对点 · 航班延误自动顺延" to="/transfers" toLabel="全部用车" />
       {visible.length === 0 ? (
-        <div className="card mt-4 text-sm text-slate-500">没有匹配"{keyword}"的用车产品。</div>
+        <div className="card mt-4 text-sm text-ink-soft">没有匹配"{keyword}"的用车产品。</div>
       ) : (
-        <div className="mt-4 grid gap-4 grid-cols-2 lg:grid-cols-4">
+        <div className="mt-4 grid grid-cols-2 gap-4 lg:grid-cols-4">
           {visible.slice(0, 4).map((t) => (
-            <Link key={t.id} to="/transfers" className="card hover:shadow-md transition block !p-4">
-              <div className="text-2xl">{t.emoji ?? '🚐'}</div>
-              <h3 className="mt-1 text-sm font-semibold text-slate-900 line-clamp-2">{t.name}</h3>
-              <p className="mt-0.5 text-xs text-slate-500 truncate">{t.vehicleType}</p>
-              <p className="mt-1 text-sm font-semibold text-red-600">
-                ¥{Number(t.basePrice).toLocaleString()}
-                <span className="text-xs font-normal text-slate-500"> 起</span>
+            <Link key={t.id} to="/transfers" className="card-interactive group flex flex-col p-4">
+              <div className="grid h-11 w-11 place-items-center rounded-xl bg-brand-50 text-2xl">{t.emoji ?? '🚐'}</div>
+              <h3 className="mt-2 line-clamp-2 text-sm font-bold text-ink">{t.name}</h3>
+              <p className="mt-0.5 truncate text-xs text-ink-muted">{t.vehicleType}</p>
+              <p className="mt-1.5 flex items-baseline gap-1">
+                <span className="price text-base">¥{Number(t.basePrice).toLocaleString()}</span>
+                <span className="text-xs font-normal text-ink-muted">起</span>
               </p>
             </Link>
           ))}

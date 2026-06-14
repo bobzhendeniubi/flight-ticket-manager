@@ -294,17 +294,17 @@ export function ProductsPage() {
   return (
     <div className="space-y-5">
       <section>
-        <h1 className="text-2xl font-bold text-slate-900">产品管理</h1>
-        <p className="mt-1 text-sm text-slate-600">
+        <h1 className="page-title">产品管理</h1>
+        <p className="page-sub">
           维护酒店、机场接送、签证三大基础产品，组合成套餐 (Bundle) 销售。
           套餐可让利定价，提升客单价和打包销售率。
         </p>
-        {loading && <div className="mt-2 rounded-md bg-slate-50 px-3 py-2 text-xs text-slate-500">加载中…</div>}
-        {error && <div className="mt-2 rounded-md bg-red-50 px-3 py-2 text-xs text-red-700">❌ {error}</div>}
+        {loading && <div className="mt-2 rounded-lg bg-canvas px-3 py-2 text-xs text-ink-muted">加载中…</div>}
+        {error && <div className="mt-2 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">{error}</div>}
       </section>
 
       {/* Tabs */}
-      <nav className="flex flex-wrap gap-2 border-b border-slate-200">
+      <nav className="flex flex-wrap gap-1 border-b border-slate-200">
         {SECTIONS.map((s) => {
           const isSel = section === s.key;
           const count = {
@@ -317,15 +317,15 @@ export function ProductsPage() {
             <button
               key={s.key}
               onClick={() => setSection(s.key)}
-              className={`px-4 py-2.5 text-sm border-b-2 transition ${
+              className={`-mb-px border-b-2 px-4 py-2.5 text-sm transition ${
                 isSel
-                  ? 'border-brand text-brand font-medium'
-                  : 'border-transparent text-slate-600 hover:text-brand hover:border-brand/30'
+                  ? 'border-brand font-semibold text-brand'
+                  : 'border-transparent text-ink-soft hover:border-slate-300 hover:text-ink'
               }`}
             >
               <span className="mr-1.5">{s.emoji}</span>
               {s.label}
-              <span className="ml-2 rounded bg-slate-100 px-1.5 py-0.5 text-xs text-slate-600">{count}</span>
+              <span className={`ml-2 rounded-md px-1.5 py-0.5 text-xs nums ${isSel ? 'bg-brand-50 text-brand-700' : 'bg-slate-100 text-ink-muted'}`}>{count}</span>
             </button>
           );
         })}
@@ -366,33 +366,31 @@ function HotelsSection({ items, onChange }: { items: MockHotel[]; onChange: (v: 
       )}
       <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
         {items.map((h) => (
-          <div key={h.id} className="card">
-            <div className="font-mono text-xs text-slate-500">编号 {h.code ?? '—'}</div>
+          <div key={h.id} className="card transition hover:shadow-pop">
+            <div className="font-mono text-xs text-ink-muted">编号 {h.code ?? '—'}</div>
             <div className="flex items-start justify-between">
               <div className="text-3xl">{h.emoji}</div>
-              <span className="rounded bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-700">
-                {'★'.repeat(h.stars)}
-              </span>
+              <span className="badge-warning">{'★'.repeat(h.stars)}</span>
             </div>
-            <h3 className="mt-2 font-semibold text-slate-900">{h.name}</h3>
-            <p className="text-xs text-slate-500">{h.nameEn}</p>
-            <p className="mt-1 text-xs text-slate-500">📍 {h.area}</p>
+            <h3 className="mt-2 font-semibold text-ink">{h.name}</h3>
+            <p className="text-xs text-ink-muted">{h.nameEn}</p>
+            <p className="mt-1 text-xs text-ink-muted">📍 {h.area}</p>
             <div className="mt-2 flex flex-wrap gap-1">
               {h.amenities.slice(0, 3).map((a) => (
-                <span key={a} className="rounded bg-slate-100 px-2 py-0.5 text-xs text-slate-600">
+                <span key={a} className="badge-neutral">
                   {a}
                 </span>
               ))}
             </div>
-            <div className="mt-3 flex items-end justify-between">
+            <div className="mt-3 flex items-end justify-between border-t border-slate-100 pt-3">
               <div>
-                <div className="text-xs text-slate-500">每晚起</div>
-                <div className="text-lg font-semibold text-red-600">¥{h.basePrice}</div>
+                <div className="text-xs text-ink-muted">每晚起</div>
+                <div className="text-lg font-semibold text-ink nums">¥{h.basePrice}</div>
               </div>
-              <div className="flex gap-2 text-xs">
-                <button className="text-brand hover:text-brand-dark" onClick={() => setEditing(h)}>✏️ 编辑</button>
+              <div className="flex gap-3 text-xs">
+                <button className="font-medium text-brand hover:text-brand-dark" onClick={() => setEditing(h)}>编辑</button>
                 <button
-                  className="text-slate-500 hover:text-red-600"
+                  className="text-ink-muted hover:text-rose-600"
                   onClick={() => { if (confirm(`删除 ${h.name}？`)) onChange(items.filter((x) => x.id !== h.id)); }}
                 >
                   删除
@@ -420,8 +418,8 @@ function NewHotelForm({
   const [basePrice, setBasePrice] = useState<number | null>(880);
 
   return (
-    <section className="card border-brand/30">
-      <h3 className="font-semibold text-slate-900">新增酒店</h3>
+    <section className="card border-brand-200 bg-brand-50/40">
+      <h3 className="font-semibold text-ink">新增酒店</h3>
       <form
         className="mt-3 grid gap-3 md:grid-cols-3"
         onSubmit={(e) => {
@@ -530,23 +528,23 @@ function TransfersSection({ items, onChange }: { items: MockTransfer[]; onChange
       />
       <div className="space-y-3">
         {items.map((t) => (
-          <article key={t.id} className="card flex items-center gap-6">
+          <article key={t.id} className="card flex items-center gap-6 transition hover:shadow-pop">
             <div className="text-4xl">{t.emoji}</div>
             <div className="flex-1 min-w-0">
-              <div className="font-mono text-xs text-slate-500">编号 {t.code ?? '—'}</div>
-              <h3 className="font-semibold text-slate-900">{t.name}</h3>
-              <p className="text-sm text-slate-600">{t.vehicleType}</p>
-              <p className="mt-1 text-xs text-slate-500">
+              <div className="font-mono text-xs text-ink-muted">编号 {t.code ?? '—'}</div>
+              <h3 className="font-semibold text-ink">{t.name}</h3>
+              <p className="text-sm text-ink-soft">{t.vehicleType}</p>
+              <p className="mt-1 text-xs text-ink-muted">
                 {t.originArea} → {t.destArea} · 最多 {t.capacity} 人 · {t.duration}
               </p>
             </div>
             <div className="text-right">
-              <div className="text-xs text-slate-500">起步价</div>
-              <div className="text-xl font-bold text-red-600">¥{t.basePrice}</div>
-              <div className="mt-1 flex gap-2 text-xs">
-                <button className="text-brand hover:text-brand-dark" onClick={() => setEditing(t)}>✏️ 编辑</button>
+              <div className="text-xs text-ink-muted">起步价</div>
+              <div className="text-xl font-semibold text-ink nums">¥{t.basePrice}</div>
+              <div className="mt-1 flex justify-end gap-3 text-xs">
+                <button className="font-medium text-brand hover:text-brand-dark" onClick={() => setEditing(t)}>编辑</button>
                 <button
-                  className="text-slate-500 hover:text-red-600"
+                  className="text-ink-muted hover:text-rose-600"
                   onClick={() => { if (confirm(`删除 ${t.name}？`)) onChange(items.filter((x) => x.id !== t.id)); }}
                 >
                   删除
@@ -595,32 +593,30 @@ function VisasSection({ items, onChange }: { items: MockVisa[]; onChange: (v: Mo
       />
       <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
         {items.map((v) => (
-          <div key={v.id} className="card">
-            <div className="font-mono text-xs text-slate-500">编号 {v.code ?? '—'}</div>
+          <div key={v.id} className="card transition hover:shadow-pop">
+            <div className="font-mono text-xs text-ink-muted">编号 {v.code ?? '—'}</div>
             <div className="flex items-start justify-between">
               <span className="text-4xl">{v.flag}</span>
-              <span className="rounded bg-blue-100 px-2 py-0.5 text-xs font-semibold text-blue-700">
-                {v.processingDays} 天出签
-              </span>
+              <span className="badge-info">{v.processingDays} 天出签</span>
             </div>
-            <h3 className="mt-2 font-semibold text-slate-900">
+            <h3 className="mt-2 font-semibold text-ink">
               {v.country} · {v.type}
             </h3>
             {v.highlight && (
               <p className="mt-1 text-xs font-medium text-emerald-700">★ {v.highlight}</p>
             )}
-            <p className="mt-1 text-xs text-slate-500">
+            <p className="mt-1 text-xs text-ink-muted">
               有效期 {v.validityMonths} 个月 · 材料 {v.requiredDocs.length} 项
             </p>
-            <div className="mt-3 flex items-end justify-between">
+            <div className="mt-3 flex items-end justify-between border-t border-slate-100 pt-3">
               <div>
-                <div className="text-xs text-slate-500">办理费</div>
-                <div className="text-lg font-semibold text-red-600">¥{v.basePrice}</div>
+                <div className="text-xs text-ink-muted">办理费</div>
+                <div className="text-lg font-semibold text-ink nums">¥{v.basePrice}</div>
               </div>
-              <div className="flex gap-2 text-xs">
-                <button className="text-brand hover:text-brand-dark" onClick={() => setEditing(v)}>✏️ 编辑</button>
+              <div className="flex gap-3 text-xs">
+                <button className="font-medium text-brand hover:text-brand-dark" onClick={() => setEditing(v)}>编辑</button>
                 <button
-                  className="text-slate-500 hover:text-red-600"
+                  className="text-ink-muted hover:text-rose-600"
                   onClick={() => { if (confirm(`删除 ${v.country} · ${v.type}？`)) onChange(items.filter((x) => x.id !== v.id)); }}
                 >
                   删除
@@ -686,23 +682,19 @@ function BundleCard({
   const saving = bundle.listPrice - bundle.bundlePrice;
   const savingPct = bundle.listPrice > 0 ? (saving / bundle.listPrice) * 100 : 0;
   return (
-    <article className={`card ${bundle.active ? '' : 'opacity-60'}`}>
-      <div className="font-mono text-xs text-slate-500">编号 {bundle.code ?? '—'}</div>
+    <article className={`card transition hover:shadow-pop ${bundle.active ? '' : 'opacity-60'}`}>
+      <div className="font-mono text-xs text-ink-muted">编号 {bundle.code ?? '—'}</div>
       <div className="flex items-start justify-between">
         <div className="flex items-start gap-3">
           <span className="text-3xl">{bundle.emoji}</span>
           <div>
-            <h3 className="font-semibold text-slate-900">{bundle.name}</h3>
-            <p className="text-xs text-slate-600 mt-0.5">{bundle.tagline}</p>
-            <p className="text-xs text-slate-500 mt-0.5">{bundle.suitableFor}</p>
+            <h3 className="font-semibold text-ink">{bundle.name}</h3>
+            <p className="text-xs text-ink-soft mt-0.5">{bundle.tagline}</p>
+            <p className="text-xs text-ink-muted mt-0.5">{bundle.suitableFor}</p>
           </div>
         </div>
         <div className="flex flex-col items-end gap-2">
-          <span
-            className={`rounded px-2 py-0.5 text-xs font-medium ${
-              bundle.active ? 'bg-green-100 text-green-700' : 'bg-slate-200 text-slate-500'
-            }`}
-          >
+          <span className={bundle.active ? 'badge-success' : 'badge-neutral'}>
             {bundle.active ? '在售' : '已停'}
           </span>
         </div>
@@ -712,12 +704,12 @@ function BundleCard({
         {bundle.items.map((i, idx) => (
           <div key={idx} className="flex items-center justify-between text-xs">
             <div className="flex items-center gap-2 min-w-0">
-              <span className={`rounded px-1.5 py-0.5 font-medium ${KIND_LABEL[i.kind].color}`}>
+              <span className={`rounded-md px-1.5 py-0.5 font-medium ${KIND_LABEL[i.kind].color}`}>
                 {KIND_LABEL[i.kind].label}
               </span>
-              <span className="text-slate-700 truncate">{i.productName}</span>
+              <span className="text-ink-soft truncate">{i.productName}</span>
             </div>
-            <span className="text-slate-500 tabular-nums whitespace-nowrap">
+            <span className="text-ink-muted nums whitespace-nowrap">
               {i.qty} × ¥{i.unitPrice} = ¥{(i.qty * i.unitPrice).toLocaleString()}
             </span>
           </div>
@@ -725,14 +717,14 @@ function BundleCard({
       </div>
 
       {bundle.hotelRoomType && (
-        <div className="mt-2 text-xs text-slate-600">
+        <div className="mt-2 text-xs text-ink-soft">
           🏨 关联酒店：{bundle.hotelRoomType.hotelName} · {bundle.hotelRoomType.name}
           {bundle.hotelNights ? `（${bundle.hotelNights} 晚）` : ''}
         </div>
       )}
 
       {(bundle.singleSupplementCnyPerNight != null || bundle.cabinUpgradeCnyPerLeg != null) && (
-        <div className="mt-1 text-xs text-slate-600">
+        <div className="mt-1 text-xs text-ink-soft">
           {bundle.singleSupplementCnyPerNight != null && (
             <>🛏️ 单房差 ¥{bundle.singleSupplementCnyPerNight.toLocaleString()}/晚</>
           )}
@@ -743,16 +735,16 @@ function BundleCard({
         </div>
       )}
 
-      <div className="mt-4 rounded-md bg-slate-50 p-3">
-        <div className="flex items-center justify-between text-sm text-slate-600">
+      <div className="mt-4 rounded-lg border border-slate-100 bg-canvas p-3">
+        <div className="flex items-center justify-between text-sm text-ink-muted">
           <span>单买总价</span>
-          <span className="line-through">¥{bundle.listPrice.toLocaleString()}</span>
+          <span className="line-through nums">¥{bundle.listPrice.toLocaleString()}</span>
         </div>
         <div className="mt-1 flex items-end justify-between">
-          <span className="text-sm text-slate-600">套餐价</span>
+          <span className="text-sm text-ink-soft">套餐价</span>
           <div>
-            <span className="text-2xl font-bold text-red-600">¥{bundle.bundlePrice.toLocaleString()}</span>
-            <span className="ml-2 rounded bg-red-100 px-2 py-0.5 text-xs font-semibold text-red-700">
+            <span className="text-2xl font-semibold text-ink nums">¥{bundle.bundlePrice.toLocaleString()}</span>
+            <span className="badge-danger ml-2">
               省 ¥{saving.toLocaleString()} ({savingPct.toFixed(0)}%)
             </span>
           </div>
@@ -760,10 +752,10 @@ function BundleCard({
       </div>
 
       <div className="mt-3 flex justify-end gap-3 text-xs">
-        <button className="text-slate-500 hover:text-brand" onClick={onToggle}>
+        <button className="font-medium text-ink-muted hover:text-brand" onClick={onToggle}>
           {bundle.active ? '停用' : '启用'}
         </button>
-        <button className="text-slate-500 hover:text-red-600" onClick={onDelete}>
+        <button className="text-ink-muted hover:text-rose-600" onClick={onDelete}>
           删除
         </button>
       </div>
@@ -813,14 +805,14 @@ function NewBundleWizard({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" onClick={onCancel}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/40 p-4 backdrop-blur-sm" onClick={onCancel}>
       <div
-        className="w-full max-w-2xl max-h-[90vh] overflow-auto rounded-lg bg-white shadow-xl"
+        className="w-full max-w-2xl max-h-[90vh] overflow-auto rounded-xl border border-slate-200 bg-white shadow-pop"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="sticky top-0 flex items-center justify-between border-b border-slate-200 bg-white px-5 py-3">
-          <h2 className="text-lg font-semibold text-slate-900">新建套餐</h2>
-          <button className="text-slate-400 hover:text-slate-700 text-xl" onClick={onCancel}>×</button>
+        <div className="sticky top-0 z-10 flex items-center justify-between border-b border-slate-200 bg-white/95 px-5 py-3 backdrop-blur">
+          <h2 className="text-lg font-semibold text-ink">新建套餐</h2>
+          <button className="btn-ghost px-2 py-1 text-xl leading-none" onClick={onCancel}>×</button>
         </div>
         <div className="px-5 py-4 space-y-4">
           <div className="grid gap-3 md:grid-cols-3">
@@ -902,7 +894,7 @@ function NewBundleWizard({
             </div>
             <div className="mt-2 space-y-2">
               {items.map((it, idx) => (
-                <div key={idx} className="flex items-center gap-2 rounded border border-slate-200 p-2">
+                <div key={idx} className="flex items-center gap-2 rounded-lg border border-slate-200 bg-canvas p-2">
                   <span className={`rounded px-1.5 py-0.5 text-xs font-medium ${KIND_LABEL[it.kind].color}`}>
                     {KIND_LABEL[it.kind].label}
                   </span>
@@ -936,12 +928,12 @@ function NewBundleWizard({
                       setItems(next);
                     }}
                   />
-                  <span className="text-xs text-slate-500 w-20 text-right">
+                  <span className="text-xs text-ink-muted w-20 text-right nums">
                     ¥{((it.qty ?? 0) * (it.unitPrice ?? 0)).toLocaleString()}
                   </span>
                   <button
                     type="button"
-                    className="text-xs text-red-600 hover:text-red-700"
+                    className="text-xs text-ink-muted hover:text-rose-600"
                     onClick={() => setItems(items.filter((_, i) => i !== idx))}
                   >
                     ×
@@ -951,13 +943,13 @@ function NewBundleWizard({
             </div>
           </div>
 
-          <div className="rounded-md bg-slate-50 p-3 space-y-2">
+          <div className="rounded-lg border border-slate-100 bg-canvas p-3 space-y-2">
             <div className="flex items-center justify-between text-sm">
-              <span className="text-slate-600">单买总价</span>
-              <span className="font-medium">¥{listPrice.toLocaleString()}</span>
+              <span className="text-ink-soft">单买总价</span>
+              <span className="font-medium text-ink nums">¥{listPrice.toLocaleString()}</span>
             </div>
             <div className="flex items-center justify-between text-sm">
-              <span className="text-slate-600">让利金额</span>
+              <span className="text-ink-soft">让利金额</span>
               <NumberInput
                 min={0}
                 max={listPrice}
@@ -967,14 +959,14 @@ function NewBundleWizard({
               />
             </div>
             <div className="flex items-center justify-between border-t border-slate-200 pt-2">
-              <span className="text-sm text-slate-600">套餐价</span>
-              <span className="text-2xl font-bold text-red-600">¥{bundlePrice.toLocaleString()}</span>
+              <span className="text-sm text-ink-soft">套餐价</span>
+              <span className="text-2xl font-semibold text-ink nums">¥{bundlePrice.toLocaleString()}</span>
             </div>
             {!valid && (
-              <p className="text-xs text-red-600">⚠️ 请填写套餐名 + 至少 1 个产品 + 套餐价 &gt; 0</p>
+              <p className="text-xs text-rose-600">⚠️ 请填写套餐名 + 至少 1 个产品 + 套餐价 &gt; 0</p>
             )}
             {!hotelLinkValid && (
-              <p className="text-xs text-red-600">⚠️ 已关联酒店房型时，晚数需为 1–30 的整数</p>
+              <p className="text-xs text-rose-600">⚠️ 已关联酒店房型时，晚数需为 1–30 的整数</p>
             )}
           </div>
 
@@ -1020,8 +1012,8 @@ function NewBundleWizard({
 function ActionBar({ active, onAdd, addLabel }: { active: number; onAdd: () => void; addLabel: string }) {
   return (
     <div className="flex items-center justify-between">
-      <p className="text-sm text-slate-500">共 {active} 项</p>
-      <button className="btn-primary text-sm" onClick={onAdd}>{addLabel}</button>
+      <p className="text-sm text-ink-muted">共 <span className="nums font-medium text-ink-soft">{active}</span> 项</p>
+      <button className="btn-primary" onClick={onAdd}>{addLabel}</button>
     </div>
   );
 }
@@ -1048,10 +1040,10 @@ function EditHotelForm({ hotel, onCancel, onSave }: { hotel: MockHotel; onCancel
   };
 
   return (
-    <section className="card border-2 border-brand/50 bg-brand/5">
+    <section className="card border-brand-200 bg-brand-50/40">
       <div className="flex items-center justify-between">
-        <h3 className="font-semibold text-slate-900">✏️ 编辑酒店 · {hotel.name}</h3>
-        <button type="button" className="text-slate-400 hover:text-slate-700 text-xl" onClick={onCancel}>×</button>
+        <h3 className="font-semibold text-ink">编辑酒店 · {hotel.name}</h3>
+        <button type="button" className="btn-ghost px-2 py-1 text-xl leading-none" onClick={onCancel}>×</button>
       </div>
       <form className="mt-3 grid gap-3 md:grid-cols-3" onSubmit={handleSubmit}>
         <div>
@@ -1102,7 +1094,7 @@ function EditHotelForm({ hotel, onCancel, onSave }: { hotel: MockHotel; onCancel
           <input className="input" maxLength={4} value={form.emoji} onChange={(e) => setForm({ ...form, emoji: e.target.value })} />
         </div>
 
-        {saved && <div className="md:col-span-3 rounded bg-green-50 px-3 py-2 text-sm text-green-700">✅ 保存中…</div>}
+        {saved && <div className="md:col-span-3 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700">保存中…</div>}
 
         <div className="md:col-span-3 flex justify-end gap-3">
           <button type="button" className="btn-secondary" onClick={onCancel}>取消</button>
@@ -1133,10 +1125,10 @@ function EditTransferForm({ transfer, onCancel, onSave }: { transfer: MockTransf
   };
 
   return (
-    <section className="card border-2 border-brand/50 bg-brand/5">
+    <section className="card border-brand-200 bg-brand-50/40">
       <div className="flex items-center justify-between">
-        <h3 className="font-semibold text-slate-900">✏️ 编辑接送 · {transfer.name}</h3>
-        <button type="button" className="text-slate-400 hover:text-slate-700 text-xl" onClick={onCancel}>×</button>
+        <h3 className="font-semibold text-ink">编辑接送 · {transfer.name}</h3>
+        <button type="button" className="btn-ghost px-2 py-1 text-xl leading-none" onClick={onCancel}>×</button>
       </div>
       <form className="mt-3 grid gap-3 md:grid-cols-3" onSubmit={handleSubmit}>
         <div className="md:col-span-2">
@@ -1180,7 +1172,7 @@ function EditTransferForm({ transfer, onCancel, onSave }: { transfer: MockTransf
           <input className="input" maxLength={4} value={form.emoji} onChange={(e) => setForm({ ...form, emoji: e.target.value })} />
         </div>
 
-        {saved && <div className="md:col-span-3 rounded bg-green-50 px-3 py-2 text-sm text-green-700">✅ 保存中…</div>}
+        {saved && <div className="md:col-span-3 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700">保存中…</div>}
 
         <div className="md:col-span-3 flex justify-end gap-3">
           <button type="button" className="btn-secondary" onClick={onCancel}>取消</button>
@@ -1216,10 +1208,10 @@ function EditVisaForm({ visa, onCancel, onSave }: { visa: MockVisa; onCancel: ()
   };
 
   return (
-    <section className="card border-2 border-brand/50 bg-brand/5">
+    <section className="card border-brand-200 bg-brand-50/40">
       <div className="flex items-center justify-between">
-        <h3 className="font-semibold text-slate-900">✏️ 编辑签证 · {visa.country} {visa.type}</h3>
-        <button type="button" className="text-slate-400 hover:text-slate-700 text-xl" onClick={onCancel}>×</button>
+        <h3 className="font-semibold text-ink">编辑签证 · {visa.country} {visa.type}</h3>
+        <button type="button" className="btn-ghost px-2 py-1 text-xl leading-none" onClick={onCancel}>×</button>
       </div>
       <form className="mt-3 grid gap-3 md:grid-cols-3" onSubmit={handleSubmit}>
         <div>
@@ -1263,7 +1255,7 @@ function EditVisaForm({ visa, onCancel, onSave }: { visa: MockVisa; onCancel: ()
           <input className="input" value={docsText} onChange={(e) => setDocsText(e.target.value)} placeholder="护照首页扫描件, 2寸白底照片" />
         </div>
 
-        {saved && <div className="md:col-span-3 rounded bg-green-50 px-3 py-2 text-sm text-green-700">✅ 保存中…</div>}
+        {saved && <div className="md:col-span-3 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700">保存中…</div>}
 
         <div className="md:col-span-3 flex justify-end gap-3">
           <button type="button" className="btn-secondary" onClick={onCancel}>取消</button>

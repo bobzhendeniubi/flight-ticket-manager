@@ -46,7 +46,7 @@ const STATUS_CLASS: Record<OrderStatus, string> = {
   DRAFT: 'bg-slate-100 text-slate-600',
   PENDING_PAYMENT: 'bg-amber-100 text-amber-800',
   PAID: 'bg-emerald-100 text-emerald-700',
-  PROCESSING: 'bg-sky-100 text-sky-700',
+  PROCESSING: 'bg-brand-100 text-brand-700',
   TICKETED: 'bg-emerald-100 text-emerald-700',
   COMPLETED: 'bg-slate-100 text-slate-700',
   PAYMENT_TIMEOUT: 'bg-rose-100 text-rose-700',
@@ -150,10 +150,12 @@ export function MyOrdersPage() {
 
   if (!token) {
     return (
-      <div className="card text-center py-16">
-        <p className="text-slate-600">请先登录</p>
-        <Link to="/login?redirect=/orders" className="btn-primary mt-3 inline-block">
-          去登录
+      <div className="card animate-fade-up py-16 text-center">
+        <div className="mx-auto flex h-20 w-20 items-center justify-center rounded-full bg-brand-50 text-5xl">🔐</div>
+        <p className="mt-4 text-base font-semibold text-ink">请先登录</p>
+        <p className="mt-1 text-sm text-ink-muted">登录后即可查看订单、锁位与候补</p>
+        <Link to="/login?redirect=/orders" className="btn-primary mt-5 inline-flex">
+          去登录 →
         </Link>
       </div>
     );
@@ -161,14 +163,14 @@ export function MyOrdersPage() {
 
   return (
     <div className="space-y-4">
-      <header className="flex items-end justify-between">
+      <header className="flex items-end justify-between gap-2">
         <div>
-          <h1 className="text-xl font-semibold text-slate-900">我的订单</h1>
-          <p className="text-sm text-slate-500">
-            一共 {orders.length} 笔订单。可取消的订单点"申请取消"看退款明细。
+          <h1 className="text-2xl font-extrabold tracking-tight text-ink">我的订单</h1>
+          <p className="section-sub">
+            一共 <span className="font-semibold text-ink nums">{orders.length}</span> 笔订单。可取消的订单点"申请取消"看退款明细。
           </p>
         </div>
-        <Link to="/" className="text-sm text-blue-600 hover:underline">
+        <Link to="/" className="whitespace-nowrap text-sm font-medium text-brand-700 transition hover:text-brand-dark">
           ← 继续逛
         </Link>
       </header>
@@ -179,15 +181,16 @@ export function MyOrdersPage() {
       {/* 我的候补 — 有候补记录才显示，挂在锁位下方 */}
       <WaitlistSection token={token} />
 
-      {loading && <div className="card text-center py-8 text-slate-500">加载中…</div>}
-      {error && <div className="card border-rose-200 bg-rose-50 text-sm text-rose-700">{error}</div>}
+      {loading && <div className="card py-8 text-center text-ink-muted">加载中…</div>}
+      {error && <div className="card border-deal/30 bg-deal-light text-sm font-medium text-deal-dark">{error}</div>}
 
       {!loading && !error && orders.length === 0 && (
-        <div className="card text-center py-12">
-          <div className="text-3xl mb-2">🎒</div>
-          <p className="text-slate-600 mb-3">还没有订单</p>
-          <Link to="/" className="btn-primary inline-block">
-            去看看机票
+        <div className="card animate-fade-up py-12 text-center">
+          <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-brand-50 text-3xl">🎒</div>
+          <p className="mt-3 text-base font-semibold text-ink">还没有订单</p>
+          <p className="mt-1 text-sm text-ink-muted">挑一张机票或一价全含套餐，开启岘港之旅</p>
+          <Link to="/" className="btn-primary mt-4 inline-flex">
+            去看看机票 →
           </Link>
         </div>
       )}
@@ -198,49 +201,49 @@ export function MyOrdersPage() {
         // 展开后用 detail（详情拉到的完整 passenger）；详情没拿到时 fallback 到列表
         const detail = detailCache[o.id] ?? o;
         return (
-          <article key={o.id} className="card space-y-2">
+          <article key={o.id} className="card-interactive space-y-3 p-4 md:p-5">
             <header className="flex flex-wrap items-center justify-between gap-2">
-              <div className="flex items-center gap-3">
-                <span className="font-mono text-sm text-slate-700">{o.orderNumber}</span>
+              <div className="flex items-center gap-2.5">
+                <span className="font-mono text-sm font-semibold text-ink nums">{o.orderNumber}</span>
                 <span
-                  className={`rounded px-2 py-0.5 text-xs font-medium ${STATUS_CLASS[o.status]}`}
+                  className={`rounded-full px-2.5 py-0.5 text-xs font-semibold ${STATUS_CLASS[o.status]}`}
                 >
                   {STATUS_LABEL[o.status]}
                 </span>
               </div>
               <div className="text-right">
-                <div className="text-lg font-semibold text-red-600">
+                <div className="price text-lg">
                   ¥{Number(o.total).toLocaleString()}
                 </div>
-                <div className="text-xs text-slate-500">
+                <div className="text-xs text-ink-muted">
                   {new Date(o.createdAt).toLocaleString('zh-CN')}
                 </div>
               </div>
             </header>
 
-            <div className="text-sm text-slate-600">
+            <div className="flex flex-wrap gap-x-3 gap-y-1 text-sm text-ink-soft">
               {o.items.slice(0, 3).map((it, i) => (
-                <span key={it.id} className="mr-3 inline-block">
+                <span key={it.id} className="inline-flex items-center gap-1">
                   {KIND_EMOJI[it.kind] ?? '📦'} {it.description}
                   {i < Math.min(2, o.items.length - 1) && ' ·'}
                 </span>
               ))}
-              {o.items.length > 3 && <span className="text-slate-400">…等 {o.items.length} 项</span>}
+              {o.items.length > 3 && <span className="text-ink-muted">…等 {o.items.length} 项</span>}
             </div>
 
-            <footer className="flex items-center justify-between border-t border-slate-100 pt-2">
+            <footer className="flex items-center justify-between border-t border-slate-100 pt-3">
               <button
                 type="button"
                 onClick={() => toggleExpand(o)}
-                className="text-sm text-blue-600 hover:underline"
+                className="text-sm font-medium text-brand-700 transition hover:text-brand-dark"
               >
-                {expanded ? '收起' : '查看详情'}
+                {expanded ? '收起 ↑' : '查看详情 →'}
               </button>
               {cancellable && (
                 <button
                   type="button"
                   onClick={() => startCancel(o)}
-                  className="text-sm rounded-md border border-rose-300 bg-white px-3 py-1 text-rose-700 hover:bg-rose-50"
+                  className="rounded-lg border border-deal/40 bg-white px-3 py-1.5 text-sm font-medium text-deal transition hover:bg-deal-light"
                 >
                   申请取消
                 </button>
@@ -248,26 +251,26 @@ export function MyOrdersPage() {
             </footer>
 
             {expanded && (
-              <div className="space-y-3 border-t border-slate-100 pt-3 text-sm">
+              <div className="animate-fade-in space-y-3 border-t border-slate-100 pt-3 text-sm">
                 {/* 联系人 */}
-                <div className="rounded-md bg-slate-50 p-3">
-                  <div className="text-xs font-semibold text-slate-500 mb-1">联系人</div>
-                  <div>{o.contactName} · {o.contactPhone}</div>
-                  {o.contactEmail && <div className="text-slate-500">{o.contactEmail}</div>}
+                <div className="rounded-xl bg-canvas p-3.5">
+                  <div className="mb-1 text-xs font-bold uppercase tracking-wide text-ink-muted">联系人</div>
+                  <div className="text-ink">{o.contactName} · {o.contactPhone}</div>
+                  {o.contactEmail && <div className="text-ink-soft">{o.contactEmail}</div>}
                 </div>
 
                 {/* 项目明细 */}
                 <div>
-                  <div className="text-xs font-semibold text-slate-500 mb-1">项目明细</div>
+                  <div className="mb-1.5 text-xs font-bold uppercase tracking-wide text-ink-muted">项目明细</div>
                   <ul className="space-y-1.5">
                     {o.items.map((it) => (
-                      <li key={it.id} className="flex items-center justify-between rounded-md bg-white border border-slate-100 px-3 py-2">
-                        <div>
+                      <li key={it.id} className="flex items-center justify-between rounded-xl border border-slate-100 bg-surface px-3 py-2.5">
+                        <div className="text-ink">
                           <span className="mr-1">{KIND_EMOJI[it.kind] ?? '📦'}</span>
                           {it.description}
-                          {it.quantity > 1 && <span className="text-slate-400"> × {it.quantity}</span>}
+                          {it.quantity > 1 && <span className="text-ink-muted"> × {it.quantity}</span>}
                         </div>
-                        <div className="font-medium text-slate-700">
+                        <div className="font-semibold text-ink nums">
                           ¥{Number(it.amount).toLocaleString()}
                         </div>
                       </li>
@@ -278,11 +281,11 @@ export function MyOrdersPage() {
                 {/* 出行人（用 detail，因为列表只 select fullName，没有 documentType/Number） */}
                 {detail.passengers.length > 0 && (
                   <div>
-                    <div className="text-xs font-semibold text-slate-500 mb-1">出行人</div>
+                    <div className="mb-1.5 text-xs font-bold uppercase tracking-wide text-ink-muted">出行人</div>
                     <ul className="space-y-1">
                       {detail.passengers.map((p) => (
-                        <li key={p.id} className="text-slate-700">
-                          {p.fullName}
+                        <li key={p.id} className="text-ink-soft">
+                          <span className="font-medium text-ink">{p.fullName}</span>
                           {p.documentNumber && (
                             <>
                               {' · '}
@@ -364,13 +367,13 @@ function SeatLocksSection({ token }: { token: string }) {
   };
 
   return (
-    <section className="card space-y-2 border-amber-200 bg-amber-50/50">
+    <section className="card space-y-2.5 border-sun/40 bg-sun-light/50">
       <header className="flex flex-wrap items-center justify-between gap-2">
-        <h2 className="font-semibold text-slate-900">🔒 我的锁位</h2>
-        <span className="text-xs text-amber-700">锁定有效期内完成下单即自动使用该锁位</span>
+        <h2 className="flex items-center gap-1.5 text-base font-bold text-ink">🔒 我的锁位</h2>
+        <span className="text-xs font-medium text-amber-800">锁定有效期内完成下单即自动使用该锁位</span>
       </header>
-      {error && <div className="text-sm text-rose-700">{error}</div>}
-      <ul className="space-y-1.5">
+      {error && <div className="text-sm font-medium text-deal">{error}</div>}
+      <ul className="space-y-2">
         {active.map((l) => {
           const leftMs = Math.max(0, new Date(l.expiresAt).getTime() - now);
           const mm = Math.floor(leftMs / 60000);
@@ -378,27 +381,27 @@ function SeatLocksSection({ token }: { token: string }) {
           return (
             <li
               key={l.id}
-              className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-amber-100 bg-white px-3 py-2 text-sm"
+              className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-sun/30 bg-surface px-3 py-2.5 text-sm"
             >
               <div className="flex flex-wrap items-center gap-2">
-                <span className="font-mono font-semibold text-slate-800">{l.flightNumber}</span>
-                <span className="text-slate-500">
+                <span className="font-mono font-semibold text-ink">{l.flightNumber}</span>
+                <span className="text-ink-muted">
                   {new Date(l.departureTime).toLocaleString('zh-CN')}
                 </span>
-                <span className="rounded bg-slate-100 px-1.5 py-0.5 text-xs text-slate-600">
+                <span className="chip">
                   {CABIN_LABEL[l.cabin] ?? l.cabin}
                 </span>
-                <span className="text-slate-700">× {l.qty} 张</span>
+                <span className="font-medium text-ink-soft">× {l.qty} 张</span>
               </div>
               <div className="flex items-center gap-3">
-                <span className="font-mono tabular-nums text-amber-700">
+                <span className="rating font-mono tabular-nums">
                   ⏱ {String(mm).padStart(2, '0')}:{String(ss).padStart(2, '0')}
                 </span>
                 <button
                   type="button"
                   disabled={releasingId === l.id}
                   onClick={() => release(l.id)}
-                  className="rounded-md border border-rose-300 bg-white px-2.5 py-1 text-xs text-rose-700 hover:bg-rose-50 disabled:opacity-50"
+                  className="rounded-lg border border-deal/40 bg-white px-2.5 py-1.5 text-xs font-medium text-deal transition hover:bg-deal-light disabled:opacity-50"
                 >
                   {releasingId === l.id ? '释放中…' : '释放'}
                 </button>
@@ -454,31 +457,31 @@ function WaitlistSection({ token }: { token: string }) {
   };
 
   return (
-    <section className="card space-y-2 border-sky-200 bg-sky-50/50">
+    <section className="card space-y-2.5 border-brand-200 bg-brand-50/40">
       <header className="flex flex-wrap items-center justify-between gap-2">
-        <h2 className="font-semibold text-slate-900">🕐 我的候补</h2>
-        <span className="text-xs text-sky-700">座位释放后按登记顺序通知，请保持手机畅通</span>
+        <h2 className="flex items-center gap-1.5 text-base font-bold text-ink">🕐 我的候补</h2>
+        <span className="text-xs font-medium text-brand-700">座位释放后按登记顺序通知，请保持手机畅通</span>
       </header>
-      {error && <div className="text-sm text-rose-700">{error}</div>}
-      <ul className="space-y-1.5">
+      {error && <div className="text-sm font-medium text-deal">{error}</div>}
+      <ul className="space-y-2">
         {entries.map((e) => (
           <li
             key={e.id}
-            className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-sky-100 bg-white px-3 py-2 text-sm"
+            className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-brand-200/70 bg-surface px-3 py-2.5 text-sm"
           >
             <div className="flex flex-wrap items-center gap-2">
-              <span className="font-mono font-semibold text-slate-800">{e.flightNumber}</span>
-              <span className="text-slate-500">
+              <span className="font-mono font-semibold text-ink">{e.flightNumber}</span>
+              <span className="text-ink-muted">
                 {new Date(e.departureTime).toLocaleString('zh-CN')}
               </span>
-              <span className="rounded bg-slate-100 px-1.5 py-0.5 text-xs text-slate-600">
+              <span className="chip">
                 {CABIN_LABEL[e.cabin] ?? e.cabin}
               </span>
-              <span className="text-slate-700">× {e.qty} 张</span>
+              <span className="font-medium text-ink-soft">× {e.qty} 张</span>
             </div>
             <div className="flex items-center gap-3">
               <span
-                className={`rounded px-2 py-0.5 text-xs font-medium ${WAITLIST_STATUS_CLASS[e.status] ?? 'bg-slate-100 text-slate-600'}`}
+                className={`rounded-full px-2.5 py-0.5 text-xs font-semibold ${WAITLIST_STATUS_CLASS[e.status] ?? 'bg-slate-100 text-slate-600'}`}
               >
                 {WAITLIST_STATUS_LABEL[e.status] ?? e.status}
               </span>
@@ -486,7 +489,7 @@ function WaitlistSection({ token }: { token: string }) {
                 type="button"
                 disabled={cancellingId === e.id}
                 onClick={() => cancel(e.id)}
-                className="rounded-md border border-rose-300 bg-white px-2.5 py-1 text-xs text-rose-700 hover:bg-rose-50 disabled:opacity-50"
+                className="rounded-lg border border-deal/40 bg-white px-2.5 py-1.5 text-xs font-medium text-deal transition hover:bg-deal-light disabled:opacity-50"
               >
                 {cancellingId === e.id ? '取消中…' : '取消'}
               </button>
@@ -525,28 +528,28 @@ function CancelDialog({
   }, [quote]);
 
   return (
-    <div className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-4">
-      <div className="w-full max-w-lg bg-white rounded-lg shadow-xl flex flex-col max-h-[90vh]">
-        <header className="flex items-center justify-between px-4 py-3 border-b">
-          <h2 className="font-semibold">申请取消订单</h2>
-          <button onClick={onClose} className="text-slate-400 hover:text-slate-700 text-xl">×</button>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/40 p-4 backdrop-blur-sm">
+      <div className="flex max-h-[90vh] w-full max-w-lg animate-fade-up flex-col rounded-3xl bg-surface shadow-pop">
+        <header className="flex items-center justify-between border-b border-slate-200/80 px-5 py-4">
+          <h2 className="section-title text-base">申请取消订单</h2>
+          <button onClick={onClose} className="text-2xl leading-none text-ink-muted transition hover:text-ink">×</button>
         </header>
 
-        <div className="flex-1 overflow-y-auto p-4 space-y-3 text-sm">
-          <div className="text-slate-600">
-            订单 <span className="font-mono">{order.orderNumber}</span>
+        <div className="flex-1 space-y-3 overflow-y-auto p-5 text-sm">
+          <div className="text-ink-soft">
+            订单 <span className="font-mono font-semibold text-ink">{order.orderNumber}</span>
           </div>
 
-          {loading && !quote && <div className="text-center py-6 text-slate-500">计算退款…</div>}
+          {loading && !quote && <div className="py-6 text-center text-ink-muted">计算退款…</div>}
 
           {error && (
-            <div className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-rose-700">
+            <div className="rounded-xl border border-deal/30 bg-deal-light px-3 py-2 font-medium text-deal-dark">
               {error}
             </div>
           )}
 
           {quote && !quote.cancellable && (
-            <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-amber-800">
+            <div className="rounded-xl border border-sun/40 bg-sun-light px-3 py-2.5 text-amber-800">
               <div className="font-semibold">不可取消</div>
               <div>{quote.cancellableReason ?? '当前订单状态不允许取消，请联系客服。'}</div>
             </div>
@@ -554,38 +557,38 @@ function CancelDialog({
 
           {quote && quote.cancellable && (
             <>
-              <div className="rounded-md bg-slate-50 p-3 space-y-1">
+              <div className="space-y-1.5 rounded-2xl bg-canvas p-4">
                 <div className="flex justify-between">
-                  <span className="text-slate-500">已支付</span>
-                  <span>¥{quote.paidAmount.toLocaleString()}</span>
+                  <span className="text-ink-muted">已支付</span>
+                  <span className="text-ink nums">¥{quote.paidAmount.toLocaleString()}</span>
                 </div>
-                <div className="flex justify-between text-rose-700">
+                <div className="flex justify-between text-deal">
                   <span>取消手续费 ({lossPercent}%)</span>
-                  <span>− ¥{quote.totalFee.toLocaleString()}</span>
+                  <span className="nums">− ¥{quote.totalFee.toLocaleString()}</span>
                 </div>
-                <div className="flex justify-between font-semibold text-emerald-700 border-t border-slate-200 pt-1">
+                <div className="flex justify-between border-t border-slate-200/80 pt-1.5 font-bold text-brand-700">
                   <span>预计可退</span>
-                  <span>¥{quote.totalRefund.toLocaleString()}</span>
+                  <span className="nums">¥{quote.totalRefund.toLocaleString()}</span>
                 </div>
               </div>
 
               <details className="text-xs">
-                <summary className="cursor-pointer text-slate-500">分项明细</summary>
+                <summary className="cursor-pointer font-medium text-ink-muted">分项明细</summary>
                 <ul className="mt-2 space-y-1.5">
                   {quote.items.map((it) => (
-                    <li key={it.itemId} className="rounded bg-white border border-slate-100 px-2 py-1.5">
+                    <li key={it.itemId} className="rounded-xl border border-slate-100 bg-surface px-2.5 py-2">
                       <div className="flex justify-between">
-                        <span className="text-slate-700">{KIND_EMOJI[it.kind] ?? '📦'} {it.description}</span>
-                        <span className="text-slate-700">¥{it.refundAmount.toLocaleString()}</span>
+                        <span className="text-ink">{KIND_EMOJI[it.kind] ?? '📦'} {it.description}</span>
+                        <span className="text-ink nums">¥{it.refundAmount.toLocaleString()}</span>
                       </div>
-                      <div className="text-slate-400">{it.reason}</div>
+                      <div className="text-ink-muted">{it.reason}</div>
                     </li>
                   ))}
                 </ul>
               </details>
 
               <div>
-                <label className="text-xs text-slate-500 mb-1 block">取消原因（可选）</label>
+                <label className="label text-xs">取消原因（可选）</label>
                 <textarea
                   value={reason}
                   onChange={(e) => onReasonChange(e.target.value)}
@@ -596,19 +599,19 @@ function CancelDialog({
                 />
               </div>
 
-              <div className="text-xs text-slate-400">
+              <div className="text-xs text-ink-muted">
                 提交后订单进入"退款审核"，审核通过后 1-3 个工作日原路退回。
               </div>
             </>
           )}
         </div>
 
-        <footer className="flex justify-end gap-2 px-4 py-3 border-t bg-slate-50 rounded-b-lg">
+        <footer className="flex justify-end gap-2 rounded-b-3xl border-t border-slate-200/80 bg-canvas px-5 py-4">
           <button
             type="button"
             onClick={onClose}
             disabled={loading}
-            className="px-4 py-2 text-sm border border-slate-300 rounded-md hover:bg-white"
+            className="btn-secondary"
           >
             再想想
           </button>
@@ -616,7 +619,7 @@ function CancelDialog({
             type="button"
             onClick={onConfirm}
             disabled={loading || !quote || !quote.cancellable}
-            className="px-4 py-2 text-sm bg-rose-600 text-white rounded-md hover:bg-rose-700 disabled:bg-slate-300"
+            className="btn-deal"
           >
             {loading ? '提交中…' : '确认申请取消'}
           </button>

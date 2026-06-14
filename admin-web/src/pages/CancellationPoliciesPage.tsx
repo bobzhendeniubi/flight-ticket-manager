@@ -81,16 +81,21 @@ export function CancellationPoliciesPage() {
     }
   };
 
-  if (loading) return <div className="card text-slate-500">加载中…</div>;
-  if (error) return <div className="card border-red-200 bg-red-50 text-red-700">{error}</div>;
+  if (loading) return <div className="card text-ink-muted">加载中…</div>;
+  if (error) return <div className="card border-rose-200 bg-rose-50 text-rose-700">{error}</div>;
 
   return (
     <div className="space-y-5">
-      <section>
-        <h1 className="text-2xl font-bold text-slate-900">取消订单 · 退款手续费规则</h1>
-        <p className="mt-1 text-sm text-slate-600">
-          客户申请取消时按这里的费率阶梯算手续费。改完立即生效（前台 GET /refund-quote 实时算）。
-        </p>
+      <section className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h1 className="page-title">取消订单 · 退款手续费规则</h1>
+          <p className="page-sub">
+            客户申请取消时按这里的费率阶梯算手续费。改完立即生效（前台 GET /refund-quote 实时算）。
+          </p>
+        </div>
+        <button className="btn-primary" onClick={() => setShowCreate(true)}>
+          + 新建策略
+        </button>
       </section>
 
       {savedFlash && (
@@ -98,12 +103,6 @@ export function CancellationPoliciesPage() {
           {savedFlash}
         </div>
       )}
-
-      <div className="flex justify-end">
-        <button className="btn-primary text-sm" onClick={() => setShowCreate(true)}>
-          + 新建策略
-        </button>
-      </div>
 
       <div className="space-y-3">
         {policies.map((p) => (
@@ -118,7 +117,7 @@ export function CancellationPoliciesPage() {
           />
         ))}
         {policies.length === 0 && (
-          <div className="card text-slate-500 text-center py-12">
+          <div className="card text-ink-muted text-center py-12">
             还没有任何取消策略。点右上角「新建」开始配置，或运行 npm run prisma:seed 拉默认值。
           </div>
         )}
@@ -173,20 +172,20 @@ function PolicyCard({
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <div className="flex items-center gap-2">
-            <span className="rounded bg-blue-100 px-2 py-0.5 text-xs font-medium text-blue-700">
+            <span className="badge-info">
               {KIND_LABEL[policy.productKind]}
             </span>
             {policy.isDefault && (
-              <span className="rounded bg-emerald-100 px-2 py-0.5 text-xs text-emerald-700">默认</span>
+              <span className="badge-success">默认</span>
             )}
             {policy.scope && policy.scope !== '__DEFAULT__' && (
-              <span className="rounded bg-slate-100 px-2 py-0.5 text-xs text-slate-700">
+              <span className="badge-neutral">
                 覆盖：{policy.scope}
               </span>
             )}
           </div>
           {!editing && (
-            <h3 className="mt-1 font-semibold text-slate-900">{policy.name}</h3>
+            <h3 className="mt-1 font-semibold text-ink">{policy.name}</h3>
           )}
           {editing && (
             <input
@@ -201,10 +200,7 @@ function PolicyCard({
             <>
               <button className="btn-secondary text-sm" onClick={onEdit}>编辑</button>
               {!policy.isDefault && (
-                <button
-                  className="text-sm rounded-md border border-red-300 bg-red-50 px-3 py-1.5 text-red-700 hover:bg-red-100"
-                  onClick={onDelete}
-                >
+                <button className="btn-danger text-sm" onClick={onDelete}>
                   删除
                 </button>
               )}
@@ -215,21 +211,21 @@ function PolicyCard({
 
       {/* tiers 表 */}
       <div className="mt-3 overflow-x-auto">
-        <table className="min-w-full text-sm">
-          <thead className="bg-slate-50 text-slate-600 text-xs">
+        <table className="table-admin">
+          <thead>
             <tr>
-              <th className="px-3 py-2 text-left">距离出发 ≥</th>
-              <th className="px-3 py-2 text-left">手续费比例</th>
-              {editing && <th className="px-3 py-2 text-right"></th>}
+              <th className="text-left">距离出发 ≥</th>
+              <th className="text-left">手续费比例</th>
+              {editing && <th className="text-right"></th>}
             </tr>
           </thead>
-          <tbody className="divide-y divide-slate-100">
+          <tbody>
             {tiers.map((t, i) => {
               const hours = t.hoursBeforeDeparture ?? 0;
               const fee = t.feePercent ?? 0;
               return (
               <tr key={i}>
-                <td className="px-3 py-2">
+                <td>
                   {editing ? (
                     <NumberInput
                       className="input w-32"
@@ -246,7 +242,7 @@ function PolicyCard({
                     </span>
                   )}
                 </td>
-                <td className="px-3 py-2">
+                <td>
                   {editing ? (
                     <div className="flex items-center gap-1">
                       <NumberInput
@@ -258,14 +254,14 @@ function PolicyCard({
                           setTiers((prev) => prev.map((x, j) => j === i ? { ...x, feePercent: n } : x));
                         }}
                       />
-                      <span className="text-slate-500">%</span>
+                      <span className="text-ink-muted">%</span>
                     </div>
                   ) : (
                     <span
                       className={`font-semibold ${
-                        fee >= 80 ? 'text-red-600' :
+                        fee >= 80 ? 'text-rose-600' :
                         fee >= 50 ? 'text-amber-600' :
-                        fee > 0 ? 'text-slate-700' : 'text-emerald-600'
+                        fee > 0 ? 'text-ink-soft' : 'text-emerald-600'
                       }`}
                     >
                       {fee}% {fee === 0 && '（免费）'}
@@ -273,9 +269,9 @@ function PolicyCard({
                   )}
                 </td>
                 {editing && (
-                  <td className="px-3 py-2 text-right">
+                  <td className="text-right">
                     <button
-                      className="text-xs text-red-600 hover:underline"
+                      className="text-xs text-rose-600 hover:underline"
                       onClick={() => setTiers((prev) => prev.filter((_, j) => j !== i))}
                     >
                       删除

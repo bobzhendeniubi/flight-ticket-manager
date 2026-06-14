@@ -107,23 +107,23 @@ export function TravelersPage() {
 
   return (
     <div className="space-y-4">
-      {/* KPI */}
-      <section className="grid gap-3 md:grid-cols-5">
-        <Kpi label="总旅客数" value={kpi.total.toString()} sub="从订单提取去重" color="bg-brand" />
-        <Kpi label="儿童 &lt;12" value={kpi.children.toString()} sub="需监护人" color="bg-pink-500" />
-        <Kpi label="成人 12-59" value={kpi.adults.toString()} sub="主力出行" color="bg-indigo-500" />
-        <Kpi label="老人 ≥60" value={kpi.seniors.toString()} sub="需关注健康" color="bg-amber-500" />
-        <div className="card p-3 flex flex-col justify-between">
-          <p className="text-xs font-medium uppercase text-slate-500">导出</p>
-          <button className="btn-primary text-sm mt-2" onClick={handleExport}>📥 导出 CSV</button>
+      {/* 页头 */}
+      <section className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h1 className="page-title">旅客管理</h1>
+          <p className="page-sub">
+            从所有订单自动提取的出行人档案。用<strong>姓名 + 生日</strong>精确查找客户（身份核实常用）。
+          </p>
         </div>
+        <button className="btn-secondary" onClick={handleExport}>📥 导出 CSV</button>
       </section>
 
-      <section>
-        <h1 className="text-2xl font-bold text-slate-900">旅客管理</h1>
-        <p className="mt-1 text-sm text-slate-600">
-          从所有订单自动提取的出行人档案。用<strong>姓名 + 生日</strong>精确查找客户（身份核实常用）。
-        </p>
+      {/* KPI */}
+      <section className="grid gap-3 md:grid-cols-4">
+        <Kpi label="总旅客数" value={kpi.total.toString()} sub="从订单提取去重" />
+        <Kpi label="儿童 &lt;12" value={kpi.children.toString()} sub="需监护人" />
+        <Kpi label="成人 12-59" value={kpi.adults.toString()} sub="主力出行" />
+        <Kpi label="老人 ≥60" value={kpi.seniors.toString()} sub="需关注健康" />
       </section>
 
       {/* 过滤器 */}
@@ -177,53 +177,53 @@ export function TravelersPage() {
       {/* 表格 */}
       <section className="card p-0 overflow-hidden">
         <div className="overflow-x-auto">
-          <table className="min-w-full divide-y divide-slate-200 text-sm">
-            <thead className="bg-slate-50 text-xs uppercase text-slate-500">
+          <table className="table-admin">
+            <thead>
               <tr>
-                <th className="px-4 py-3 text-left">姓名</th>
-                <th className="px-4 py-3 text-left">护照号</th>
-                <th className="px-4 py-3 text-left">生日 / 年龄</th>
-                <th className="px-4 py-3 text-center">国籍</th>
-                <th className="px-4 py-3 text-left">电话</th>
-                <th className="px-4 py-3 text-center">出行次数</th>
-                <th className="px-4 py-3 text-left">最近出行</th>
-                <th className="px-4 py-3"></th>
+                <th className="text-left">姓名</th>
+                <th className="text-left">护照号</th>
+                <th className="text-left">生日 / 年龄</th>
+                <th className="text-center">国籍</th>
+                <th className="text-left">电话</th>
+                <th className="text-center">出行次数</th>
+                <th className="text-left">最近出行</th>
+                <th></th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-100">
+            <tbody>
               {filtered.map((t) => {
                 const age = calcAge(t.dateOfBirth);
                 return (
-                  <tr key={t.id} className="hover:bg-slate-50">
-                    <td className="px-4 py-3">
-                      <button className="font-medium text-slate-900 hover:text-brand" onClick={() => setSelected(t)}>
+                  <tr key={t.id}>
+                    <td>
+                      <button className="font-medium text-ink hover:text-brand" onClick={() => setSelected(t)}>
                         {t.fullName}
                       </button>
-                      {t.notes && <div className="text-xs text-slate-400">{t.notes}</div>}
+                      {t.notes && <div className="text-xs text-ink-muted">{t.notes}</div>}
                     </td>
-                    <td className="px-4 py-3 font-mono text-xs text-slate-600">{t.passportNumber}</td>
-                    <td className="px-4 py-3 text-xs">
+                    <td className="font-mono text-xs text-ink-soft">{t.passportNumber}</td>
+                    <td className="text-xs">
                       <div>{t.dateOfBirth}</div>
-                      <div className="text-slate-400">
+                      <div className="text-ink-muted">
                         {age < 12 ? `${age} 岁 · 儿童` : age >= 60 ? `${age} 岁 · 老人` : `${age} 岁 · 成人`}
                       </div>
                     </td>
-                    <td className="px-4 py-3 text-center">
-                      <span className="rounded bg-slate-100 px-2 py-0.5 text-xs">{t.nationality}</span>
+                    <td className="text-center">
+                      <span className="badge-neutral">{t.nationality}</span>
                     </td>
-                    <td className="px-4 py-3 text-xs text-slate-600">{t.phone ?? '—'}</td>
-                    <td className="px-4 py-3 text-center">
-                      <span className="font-semibold text-indigo-600">{t.tripCount}</span>
+                    <td className="text-xs text-ink-soft">{t.phone ?? '—'}</td>
+                    <td className="text-center">
+                      <span className="font-semibold text-ink nums">{t.tripCount}</span>
                     </td>
-                    <td className="px-4 py-3 text-xs text-slate-600">{t.lastTripAt ?? '—'}</td>
-                    <td className="px-4 py-3 text-right">
-                      <button className="text-xs text-brand hover:text-brand-dark" onClick={() => setSelected(t)}>详情</button>
+                    <td className="text-xs text-ink-soft">{t.lastTripAt ?? '—'}</td>
+                    <td className="text-right">
+                      <button className="text-xs font-medium text-brand hover:text-brand-dark" onClick={() => setSelected(t)}>详情</button>
                     </td>
                   </tr>
                 );
               })}
               {filtered.length === 0 && (
-                <tr><td colSpan={8} className="px-4 py-8 text-center text-slate-500">没有符合条件的旅客</td></tr>
+                <tr><td colSpan={8} className="px-4 py-8 text-center text-ink-muted">没有符合条件的旅客</td></tr>
               )}
             </tbody>
           </table>
@@ -235,15 +235,12 @@ export function TravelersPage() {
   );
 }
 
-function Kpi({ label, value, sub, color }: { label: string; value: string; sub: string; color: string }) {
+function Kpi({ label, value, sub }: { label: string; value: string; sub: string }) {
   return (
-    <div className="card p-3">
-      <div className="flex items-center gap-2">
-        <span className={`h-8 w-1 rounded ${color}`}></span>
-        <p className="text-xs font-medium uppercase text-slate-500" dangerouslySetInnerHTML={{ __html: label }} />
-      </div>
-      <p className="mt-1.5 text-2xl font-bold text-slate-900">{value}</p>
-      <p className="mt-0.5 text-xs text-slate-500">{sub}</p>
+    <div className="stat-card">
+      <p className="stat-label" dangerouslySetInnerHTML={{ __html: label }} />
+      <p className="stat-value">{value}</p>
+      <p className="mt-0.5 text-xs text-ink-muted">{sub}</p>
     </div>
   );
 }

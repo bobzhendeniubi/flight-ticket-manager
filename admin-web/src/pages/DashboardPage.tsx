@@ -20,14 +20,14 @@ const STATUS_LABEL: Record<string, string> = {
   FAILED: '出票失败',
 };
 const STATUS_COLOR: Record<string, string> = {
-  PENDING_PAYMENT: 'bg-amber-100 text-amber-700',
-  PAID: 'bg-blue-100 text-blue-700',
-  PROCESSING: 'bg-indigo-100 text-indigo-700',
-  TICKETED: 'bg-green-100 text-green-700',
-  COMPLETED: 'bg-slate-100 text-slate-700',
-  CANCELLED: 'bg-slate-200 text-slate-500',
-  REFUND_REQUESTED: 'bg-red-100 text-red-700',
-  REFUNDED: 'bg-red-200 text-red-800',
+  PENDING_PAYMENT: 'badge-warning',
+  PAID: 'badge-info',
+  PROCESSING: 'badge-info',
+  TICKETED: 'badge-success',
+  COMPLETED: 'badge-neutral',
+  CANCELLED: 'badge-neutral',
+  REFUND_REQUESTED: 'badge-danger',
+  REFUNDED: 'badge-danger',
 };
 
 export function DashboardPage() {
@@ -69,17 +69,19 @@ export function DashboardPage() {
     <div className="space-y-6">
       <section className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold text-slate-900">运营仪表盘</h1>
-          <p className="mt-1 text-sm text-slate-600">
+          <h1 className="page-title">运营仪表盘</h1>
+          <p className="page-sub">
             {kpi ? `截至 ${new Date(kpi.asOf).toLocaleString('zh-CN', { hour: '2-digit', minute: '2-digit' })}` : '加载中…'}
             {!loading && !error && kpi && ' · 实时数据'}
           </p>
         </div>
-        <span className="rounded bg-green-100 px-3 py-1 text-xs font-semibold text-green-700">● 系统运行中</span>
+        <span className="badge-success">
+          <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" /> 系统运行中
+        </span>
       </section>
 
       {error && (
-        <div className="rounded-md bg-red-50 border border-red-200 px-4 py-3 text-sm text-red-800">❌ {error}</div>
+        <div className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">{error}</div>
       )}
 
       <section className="grid gap-4 md:grid-cols-4">
@@ -114,11 +116,11 @@ export function DashboardPage() {
       <section className="grid gap-4 lg:grid-cols-3">
         <div className="card lg:col-span-2">
           <div className="flex items-center justify-between">
-            <h2 className="font-semibold text-slate-900">近 7 天营收</h2>
-            <span className="text-xs text-slate-500">
-              本月累计 ¥{kpi ? kpi.monthRevenue.toLocaleString() : '—'}
+            <h2 className="text-sm font-semibold text-ink">近 7 天营收</h2>
+            <span className="text-xs text-ink-muted">
+              本月累计 <span className="nums text-ink-soft">¥{kpi ? kpi.monthRevenue.toLocaleString() : '—'}</span>
               {kpi && kpi.monthRevenueChangePct !== 0 && (
-                <span className={`ml-2 ${kpi.monthRevenueChangePct >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                <span className={`ml-2 font-medium ${kpi.monthRevenueChangePct >= 0 ? 'text-emerald-600' : 'text-rose-600'}`}>
                   ({kpi.monthRevenueChangePct >= 0 ? '+' : ''}{kpi.monthRevenueChangePct}% vs 上月)
                 </span>
               )}
@@ -127,7 +129,7 @@ export function DashboardPage() {
           <div className="mt-5 flex items-end gap-2 h-48">
             {weekly.map((d) => (
               <div key={d.date} className="flex-1 flex flex-col items-center gap-1">
-                <div className="text-xs text-slate-500">
+                <div className="nums text-xs text-ink-muted">
                   {d.revenue > 0 ? `¥${(d.revenue / 1000).toFixed(0)}k` : '—'}
                 </div>
                 <div
@@ -135,21 +137,21 @@ export function DashboardPage() {
                   style={{ height: `${Math.max(2, (d.revenue / maxRevenue) * 80)}%` }}
                   title={`${d.date}  ¥${d.revenue.toLocaleString()}  (${d.orders} 单)`}
                 />
-                <div className="text-xs text-slate-600">{d.date}</div>
+                <div className="text-xs text-ink-soft">{d.date}</div>
               </div>
             ))}
             {weekly.length === 0 && (
-              <div className="flex-1 text-center text-sm text-slate-400">暂无数据</div>
+              <div className="flex-1 text-center text-sm text-ink-muted">暂无数据</div>
             )}
           </div>
         </div>
 
         <div className="card">
-          <h2 className="font-semibold text-slate-900">Top 代理（本月）</h2>
-          <p className="mt-1 text-xs text-slate-500">按 GMV 排名 Top 5</p>
+          <h2 className="text-sm font-semibold text-ink">Top 代理（本月）</h2>
+          <p className="mt-1 text-xs text-ink-muted">按 GMV 排名 Top 5</p>
           <div className="mt-4 space-y-3">
             {topAgents.length === 0 && (
-              <div className="text-xs text-slate-400 py-4 text-center">暂无数据</div>
+              <div className="py-4 text-center text-xs text-ink-muted">暂无数据</div>
             )}
             {topAgents.map((a, i) => {
               const max = topAgents[0]?.revenue || 1;
@@ -157,19 +159,19 @@ export function DashboardPage() {
               return (
                 <div key={a.agentId}>
                   <div className="flex justify-between text-sm">
-                    <span className="text-slate-700 truncate">
+                    <span className="truncate text-ink-soft">
                       {i === 0 && '🥇 '}
                       {i === 1 && '🥈 '}
                       {i === 2 && '🥉 '}
                       {a.companyName ?? a.contactName}
-                      <span className="ml-1 text-xs text-slate-400">T{a.tier}</span>
+                      <span className="ml-1 text-xs text-ink-muted">T{a.tier}</span>
                     </span>
-                    <span className="font-medium text-slate-900">¥{a.revenue.toLocaleString()}</span>
+                    <span className="nums font-medium text-ink">¥{a.revenue.toLocaleString()}</span>
                   </div>
-                  <div className="mt-1 h-2 w-full rounded-full bg-slate-100">
+                  <div className="mt-1.5 h-1.5 w-full rounded-full bg-slate-100">
                     <div className="h-full rounded-full bg-brand" style={{ width: `${pct}%` }} />
                   </div>
-                  <div className="text-[10px] text-slate-400">{a.orderCount} 单</div>
+                  <div className="mt-0.5 text-[10px] text-ink-muted">{a.orderCount} 单</div>
                 </div>
               );
             })}
@@ -181,50 +183,50 @@ export function DashboardPage() {
 
       <section className="card">
         <div className="flex items-center justify-between">
-          <h2 className="font-semibold text-slate-900">最新订单</h2>
-          <Link to="/orders" className="text-sm text-brand hover:text-brand-dark">查看全部 →</Link>
+          <h2 className="text-sm font-semibold text-ink">最新订单</h2>
+          <Link to="/orders" className="text-sm font-medium text-brand hover:text-brand-dark">查看全部 →</Link>
         </div>
         <div className="mt-4 overflow-x-auto">
-          <table className="min-w-full divide-y divide-slate-200 text-sm">
-            <thead className="text-xs uppercase text-slate-500">
+          <table className="table-admin">
+            <thead>
               <tr>
-                <th className="px-3 py-2 text-left">订单号</th>
-                <th className="px-3 py-2 text-left">客户</th>
-                <th className="px-3 py-2 text-left">内容</th>
-                <th className="px-3 py-2 text-right">金额</th>
-                <th className="px-3 py-2 text-center">状态</th>
-                <th className="px-3 py-2 text-left">时间</th>
+                <th className="text-left">订单号</th>
+                <th className="text-left">客户</th>
+                <th className="text-left">内容</th>
+                <th className="text-right">金额</th>
+                <th className="text-center">状态</th>
+                <th className="text-left">时间</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-slate-100">
+            <tbody>
               {recent.map((o) => {
                 const summary = o.items.map((it) => it.description).join(' + ');
                 return (
                   <tr key={o.id}>
-                    <td className="px-3 py-2 font-mono text-xs text-slate-700">{o.orderNumber}</td>
-                    <td className="px-3 py-2 text-slate-900">
+                    <td className="font-mono text-xs text-ink-soft">{o.orderNumber}</td>
+                    <td className="text-ink">
                       {o.user.displayName ?? o.contactName}
                       {o.agent && (
-                        <span className="ml-2 rounded bg-brand/10 px-1.5 py-0.5 text-xs text-brand">
+                        <span className="badge-info ml-2">
                           代理 · {o.agent.companyName ?? o.agent.contactName}
                         </span>
                       )}
                     </td>
-                    <td className="px-3 py-2 text-slate-700 max-w-xs truncate" title={summary}>{summary}</td>
-                    <td className="px-3 py-2 text-right font-medium text-slate-900">¥{Number(o.total).toLocaleString()}</td>
-                    <td className="px-3 py-2 text-center">
-                      <span className={`rounded px-2 py-0.5 text-xs ${STATUS_COLOR[o.status] ?? 'bg-slate-100 text-slate-600'}`}>
+                    <td className="max-w-xs truncate" title={summary}>{summary}</td>
+                    <td className="nums text-right font-medium text-ink">¥{Number(o.total).toLocaleString()}</td>
+                    <td className="text-center">
+                      <span className={STATUS_COLOR[o.status] ?? 'badge-neutral'}>
                         {STATUS_LABEL[o.status] ?? o.status}
                       </span>
                     </td>
-                    <td className="px-3 py-2 text-xs text-slate-500">
+                    <td className="text-xs text-ink-muted">
                       {new Date(o.createdAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}
                     </td>
                   </tr>
                 );
               })}
               {!loading && recent.length === 0 && (
-                <tr><td colSpan={6} className="px-3 py-8 text-center text-slate-400">暂无订单</td></tr>
+                <tr><td colSpan={6} className="py-8 text-center text-ink-muted">暂无订单</td></tr>
               )}
             </tbody>
           </table>
@@ -248,13 +250,13 @@ function KpiCard({
   positive?: boolean;
 }) {
   return (
-    <div className="card">
-      <p className="text-xs font-medium uppercase text-slate-500">{title}</p>
-      <p className="mt-2 text-2xl font-bold text-slate-900">{value}</p>
-      <p className={`mt-1 text-xs ${positive ? 'text-green-600' : 'text-amber-600'}`}>
+    <div className="stat-card">
+      <p className="stat-label">{title}</p>
+      <p className="stat-value">{value}</p>
+      <p className={`mt-1 text-xs font-medium ${positive ? 'text-emerald-600' : 'text-amber-600'}`}>
         {positive && change.startsWith('+') ? '↑ ' : ''}{change}
       </p>
-      <p className="mt-0.5 text-xs text-slate-400">{sub}</p>
+      <p className="mt-0.5 text-xs text-ink-muted">{sub}</p>
     </div>
   );
 }

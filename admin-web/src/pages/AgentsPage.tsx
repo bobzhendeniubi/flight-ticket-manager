@@ -94,29 +94,32 @@ export function AgentsPage() {
 
   const tree = useMemo(() => buildTree(filtered), [filtered]);
 
-  if (error) return <div className="card border-red-200 bg-red-50 text-red-700">{error}</div>;
-  if (!agents) return <div className="card text-slate-500">加载中…</div>;
+  if (error) return <div className="card border-rose-200 bg-rose-50 text-rose-700">{error}</div>;
+  if (!agents) return <div className="card text-ink-muted">加载中…</div>;
 
   return (
     <div className="space-y-4">
-      {/* KPI 顶栏 */}
-      <section className="grid gap-3 md:grid-cols-5">
-        <KpiCard label="总代理数" value={kpi.total.toString()} sub={`${kpi.active} 在用 / ${kpi.total - kpi.active} 停用`} color="bg-brand" />
-        <KpiCard label="总预付余额" value={`¥${(kpi.totalBalance / 1000).toFixed(1)}K`} sub={`平均 ¥${kpi.total > 0 ? Math.round(kpi.totalBalance / kpi.total).toLocaleString() : 0}`} color="bg-green-600" />
-        <KpiCard label="总订单数" value={kpi.totalOrders.toString()} sub="累计所有代理" color="bg-amber-500" />
-        <KpiCard label="1/2/3 级" value={`${kpi.byTier[0]}/${kpi.byTier[1]}/${kpi.byTier[2]}`} sub="层级分布" color="bg-indigo-500" />
-        <div className="card flex flex-col justify-between">
-          <p className="text-xs font-medium uppercase text-slate-500">快捷操作</p>
-          <div className="flex gap-2 mt-2">
-            <button
-              type="button"
-              className="btn-primary text-sm flex-1"
-              onClick={() => { setParentForAdmin(''); setShowForm(true); }}
-            >
-              + 新建代理
-            </button>
-          </div>
+      {/* 页头 */}
+      <section className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h1 className="page-title">代理管理</h1>
+          <p className="page-sub">树形 / 表格视图，多维过滤、佣金设置、创建散客。</p>
         </div>
+        <button
+          type="button"
+          className="btn-primary"
+          onClick={() => { setParentForAdmin(''); setShowForm(true); }}
+        >
+          + 新建代理
+        </button>
+      </section>
+
+      {/* KPI 顶栏 */}
+      <section className="grid gap-3 md:grid-cols-4">
+        <KpiCard label="总代理数" value={kpi.total.toString()} sub={`${kpi.active} 在用 / ${kpi.total - kpi.active} 停用`} />
+        <KpiCard label="总预付余额" value={`¥${(kpi.totalBalance / 1000).toFixed(1)}K`} sub={`平均 ¥${kpi.total > 0 ? Math.round(kpi.totalBalance / kpi.total).toLocaleString() : 0}`} />
+        <KpiCard label="总订单数" value={kpi.totalOrders.toString()} sub="累计所有代理" />
+        <KpiCard label="1/2/3 级" value={`${kpi.byTier[0]}/${kpi.byTier[1]}/${kpi.byTier[2]}`} sub="层级分布" />
       </section>
 
       {/* 过滤器 + 视图切换 */}
@@ -293,61 +296,61 @@ function AgentTableView({
   return (
     <section className="card p-0 overflow-hidden">
       <div className="overflow-x-auto">
-        <table className="min-w-full divide-y divide-slate-200 text-sm">
-          <thead className="bg-slate-50 text-xs uppercase text-slate-500">
+        <table className="table-admin">
+          <thead>
             <tr>
-              <th className="px-4 py-3 text-left">层级</th>
-              <th className="px-4 py-3 text-left">代理</th>
-              <th className="px-4 py-3 text-left">联系方式</th>
-              <th className="px-4 py-3 text-center">下级/订单</th>
-              <th className="px-4 py-3 text-right">预付余额</th>
-              <th className="px-4 py-3 text-center">状态</th>
-              <th className="px-4 py-3"></th>
+              <th className="text-left">层级</th>
+              <th className="text-left">代理</th>
+              <th className="text-left">联系方式</th>
+              <th className="text-center">下级/订单</th>
+              <th className="text-right">预付余额</th>
+              <th className="text-center">状态</th>
+              <th></th>
             </tr>
           </thead>
-          <tbody className="divide-y divide-slate-100">
+          <tbody>
             {agents.map((a) => (
-              <tr key={a.id} className="hover:bg-slate-50">
-                <td className="px-4 py-3">
-                  <span className={`rounded px-2 py-0.5 text-xs font-semibold ${TIER_COLOR[a.tier]}`}>
+              <tr key={a.id}>
+                <td>
+                  <span className={`rounded-md px-2 py-0.5 text-xs font-semibold ${TIER_COLOR[a.tier]}`}>
                     {TIER_LABEL[a.tier] ?? `${a.tier}级`}
                   </span>
                 </td>
-                <td className="px-4 py-3">
-                  <button className="font-medium text-slate-900 hover:text-brand" onClick={() => onSelectAgent(a)}>
+                <td>
+                  <button className="font-medium text-ink hover:text-brand" onClick={() => onSelectAgent(a)}>
                     {a.companyName || a.contactName}
                   </button>
-                  <div className="text-xs text-slate-500">
+                  <div className="text-xs text-ink-muted">
                     {a.contactName}
-                    {a.parent && <span className="ml-2 text-slate-400">↑ {a.parent.companyName ?? a.parent.contactName}</span>}
+                    {a.parent && <span className="ml-2 text-ink-muted">↑ {a.parent.companyName ?? a.parent.contactName}</span>}
                   </div>
                 </td>
-                <td className="px-4 py-3 text-xs">
+                <td className="text-xs">
                   <div>{a.contactPhone}</div>
-                  <div className="text-slate-400">{a.email ?? '—'}</div>
+                  <div className="text-ink-muted">{a.email ?? '—'}</div>
                 </td>
-                <td className="px-4 py-3 text-center">
+                <td className="text-center">
                   <div className="text-sm">
-                    <span className="font-semibold text-indigo-600">{a.childCount}</span>
-                    <span className="text-slate-400"> / </span>
-                    <span className="font-semibold text-amber-600">{a.orderCount}</span>
+                    <span className="font-semibold text-ink">{a.childCount}</span>
+                    <span className="text-ink-muted"> / </span>
+                    <span className="font-semibold text-ink">{a.orderCount}</span>
                   </div>
-                  <div className="text-[10px] text-slate-400">下级 / 订单</div>
+                  <div className="text-[10px] text-ink-muted">下级 / 订单</div>
                 </td>
-                <td className="px-4 py-3 text-right">
-                  <div className={`font-semibold tabular-nums ${Number(a.prepaymentBalance) < 1000 ? 'text-red-600' : 'text-green-700'}`}>
+                <td className="text-right">
+                  <div className={`font-semibold nums ${Number(a.prepaymentBalance) < 1000 ? 'text-rose-600' : 'text-emerald-700'}`}>
                     ¥{Number(a.prepaymentBalance).toLocaleString()}
                   </div>
                 </td>
-                <td className="px-4 py-3 text-center">
+                <td className="text-center">
                   {a.isActive ? (
-                    <span className="rounded bg-green-100 px-2 py-0.5 text-xs text-green-700">在用</span>
+                    <span className="badge-success">在用</span>
                   ) : (
-                    <span className="rounded bg-slate-200 px-2 py-0.5 text-xs text-slate-600">停用</span>
+                    <span className="badge-neutral">停用</span>
                   )}
                 </td>
-                <td className="px-4 py-3 text-right">
-                  <div className="flex items-center justify-end gap-2 text-xs">
+                <td className="text-right">
+                  <div className="flex items-center justify-end gap-2 text-xs font-medium">
                     <button className="text-brand hover:text-brand-dark" onClick={() => onSelectAgent(a)}>详情</button>
                     {canAddChildOf(a) && (
                       <button className="text-brand hover:text-brand-dark" onClick={() => onAddChild(a.id)}>+ 下级</button>
@@ -358,7 +361,7 @@ function AgentTableView({
               </tr>
             ))}
             {agents.length === 0 && (
-              <tr><td colSpan={7} className="px-4 py-8 text-center text-slate-500">没有符合条件的代理</td></tr>
+              <tr><td colSpan={7} className="px-4 py-8 text-center text-ink-muted">没有符合条件的代理</td></tr>
             )}
           </tbody>
         </table>
@@ -740,15 +743,12 @@ function Row({ label, value }: { label: string; value: React.ReactNode }) {
   );
 }
 
-function KpiCard({ label, value, sub, color }: { label: string; value: string; sub: string; color: string }) {
+function KpiCard({ label, value, sub }: { label: string; value: string; sub: string }) {
   return (
-    <div className="card p-3">
-      <div className="flex items-center gap-2">
-        <span className={`h-8 w-1 rounded ${color}`}></span>
-        <p className="text-xs font-medium uppercase text-slate-500">{label}</p>
-      </div>
-      <p className="mt-1.5 text-2xl font-bold text-slate-900">{value}</p>
-      <p className="mt-0.5 text-xs text-slate-500">{sub}</p>
+    <div className="stat-card">
+      <p className="stat-label">{label}</p>
+      <p className="stat-value">{value}</p>
+      <p className="mt-0.5 text-xs text-ink-muted">{sub}</p>
     </div>
   );
 }
@@ -787,13 +787,13 @@ function AgentTreeNode({
       <div className="card flex flex-wrap items-start justify-between gap-3" style={{ marginLeft: depth * 24 }}>
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2 flex-wrap">
-            <span className={`rounded px-2 py-0.5 text-xs font-semibold ${TIER_COLOR[node.tier]}`}>
+            <span className={`rounded-md px-2 py-0.5 text-xs font-semibold ${TIER_COLOR[node.tier]}`}>
               {TIER_LABEL[node.tier]}
             </span>
-            <h3 className="text-lg font-semibold text-slate-900">
+            <h3 className="text-lg font-semibold text-ink">
               {node.companyName || node.contactName}
             </h3>
-            {!node.isActive && <span className="rounded bg-slate-200 px-2 py-0.5 text-xs text-slate-600">已停用</span>}
+            {!node.isActive && <span className="badge-neutral">已停用</span>}
           </div>
           <div className="mt-1 text-sm text-slate-600">
             <span className="mr-3">👤 {node.contactName}</span>
