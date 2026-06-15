@@ -367,10 +367,10 @@ function HotelsSection({ items, onChange }: { items: MockHotel[]; onChange: (v: 
       <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
         {items.map((h) => (
           <div key={h.id} className="card transition hover:shadow-pop">
-            <div className="font-mono text-xs text-ink-muted">编号 {h.code ?? '—'}</div>
+            <div className="font-mono text-xs text-ink-muted">编号 {h.code ?? '—'} <span className="font-sans not-italic text-ink-muted">(系统自动生成)</span></div>
             <div className="flex items-start justify-between">
               <div className="text-3xl">{h.emoji}</div>
-              <span className="badge-warning">{'★'.repeat(h.stars)}</span>
+              <span className="badge-warning">{'★'.repeat(h.stars)} {h.stars}星</span>
             </div>
             <h3 className="mt-2 font-semibold text-ink">{h.name}</h3>
             <p className="text-xs text-ink-muted">{h.nameEn}</p>
@@ -531,7 +531,7 @@ function TransfersSection({ items, onChange }: { items: MockTransfer[]; onChange
           <article key={t.id} className="card flex items-center gap-6 transition hover:shadow-pop">
             <div className="text-4xl">{t.emoji}</div>
             <div className="flex-1 min-w-0">
-              <div className="font-mono text-xs text-ink-muted">编号 {t.code ?? '—'}</div>
+              <div className="font-mono text-xs text-ink-muted">编号 {t.code ?? '—'} <span className="font-sans not-italic text-ink-muted">(系统自动生成)</span></div>
               <h3 className="font-semibold text-ink">{t.name}</h3>
               <p className="text-sm text-ink-soft">{t.vehicleType}</p>
               <p className="mt-1 text-xs text-ink-muted">
@@ -594,7 +594,7 @@ function VisasSection({ items, onChange }: { items: MockVisa[]; onChange: (v: Mo
       <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
         {items.map((v) => (
           <div key={v.id} className="card transition hover:shadow-pop">
-            <div className="font-mono text-xs text-ink-muted">编号 {v.code ?? '—'}</div>
+            <div className="font-mono text-xs text-ink-muted">编号 {v.code ?? '—'} <span className="font-sans not-italic text-ink-muted">(系统自动生成)</span></div>
             <div className="flex items-start justify-between">
               <span className="text-4xl">{v.flag}</span>
               <span className="badge-info">{v.processingDays} 天出签</span>
@@ -683,7 +683,7 @@ function BundleCard({
   const savingPct = bundle.listPrice > 0 ? (saving / bundle.listPrice) * 100 : 0;
   return (
     <article className={`card transition hover:shadow-pop ${bundle.active ? '' : 'opacity-60'}`}>
-      <div className="font-mono text-xs text-ink-muted">编号 {bundle.code ?? '—'}</div>
+      <div className="font-mono text-xs text-ink-muted">编号 {bundle.code ?? '—'} <span className="font-sans not-italic text-ink-muted">(系统自动生成)</span></div>
       <div className="flex items-start justify-between">
         <div className="flex items-start gap-3">
           <span className="text-3xl">{bundle.emoji}</span>
@@ -949,7 +949,10 @@ function NewBundleWizard({
               <span className="font-medium text-ink nums">¥{listPrice.toLocaleString()}</span>
             </div>
             <div className="flex items-center justify-between text-sm">
-              <span className="text-ink-soft">让利金额</span>
+              <span className="text-ink-soft">
+                让利金额
+                <span className="ml-1 text-xs text-ink-muted">(单买总价 − 套餐价)</span>
+              </span>
               <NumberInput
                 min={0}
                 max={listPrice}
@@ -962,6 +965,12 @@ function NewBundleWizard({
               <span className="text-sm text-ink-soft">套餐价</span>
               <span className="text-2xl font-semibold text-ink nums">¥{bundlePrice.toLocaleString()}</span>
             </div>
+            {discountValue > 0 && (
+              <div className="text-right text-xs text-emerald-700">
+                客户节省 ¥{discountValue.toLocaleString()}
+                {listPrice > 0 ? `（${((discountValue / listPrice) * 100).toFixed(0)}%）` : ''}
+              </div>
+            )}
             {!valid && (
               <p className="text-xs text-rose-600">⚠️ 请填写套餐名 + 至少 1 个产品 + 套餐价 &gt; 0</p>
             )}

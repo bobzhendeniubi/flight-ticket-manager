@@ -48,7 +48,7 @@ export function MobileBottomBar() {
                 </span>
               ) : null}
             </span>
-            <span>{t.label}</span>
+            <span className="text-[10px] sm:text-[11px]">{t.label}</span>
           </NavLink>
         ))}
       </div>

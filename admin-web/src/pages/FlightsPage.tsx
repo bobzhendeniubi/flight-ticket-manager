@@ -4,6 +4,9 @@ import { AIRPORT_OPTIONS, CABIN_LABEL, airportLabel, formatLocalDate, formatLoca
 import { useAuth } from '../stores/auth';
 import { NumberInput } from '../components/NumberInput';
 
+// 余位低于此数时高亮提醒（与订单页座位预警口径一致）
+const LOW_SEAT_THRESHOLD = 20;
+
 interface ScheduleSeat {
   id: string;
   cabin: CabinClass;
@@ -340,11 +343,20 @@ function SchedulesList({
                 </td>
                 <td>
                   <ul className="space-y-0.5">
-                    {s.seatClasses.map((c) => (
-                      <li key={c.id}>
-                        {CABIN_LABEL[c.cabin] ?? c.cabin}: {c.capacity - c.sold}/{c.capacity} · ¥{Number(c.basePrice).toFixed(0)}
-                      </li>
-                    ))}
+                    {s.seatClasses.map((c) => {
+                      const remaining = c.capacity - c.sold;
+                      const isLow = remaining <= LOW_SEAT_THRESHOLD;
+                      return (
+                        <li key={c.id}>
+                          {CABIN_LABEL[c.cabin] ?? c.cabin}:{' '}
+                          <span className={isLow ? 'font-medium text-rose-600' : 'font-medium text-ink'}>
+                            {remaining}
+                          </span>
+                          /<span className="font-medium text-ink">{c.capacity}</span> · ¥{Number(c.basePrice).toFixed(0)}
+                          {isLow && <span className="ml-1 text-xs text-rose-600">余位紧张</span>}
+                        </li>
+                      );
+                    })}
                   </ul>
                 </td>
                 <td>

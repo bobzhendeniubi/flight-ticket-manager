@@ -205,7 +205,7 @@ export function BundlesPage() {
 
       {/* 简单选择器：出发日期 + 人数 + 搜索（钉在套餐列表上方） */}
       <section className="card">
-        <div className="grid gap-4 sm:grid-cols-2 md:grid-cols-3">
+        <div className="grid grid-cols-1 gap-3 sm:gap-4 sm:grid-cols-2 md:grid-cols-3">
           <div>
             <label className="label" htmlFor="bundle-godate">出发日期</label>
             <input
@@ -458,7 +458,7 @@ function ConfigurableBundleCard({
           <span className="text-ink-soft">出发</span>
           <input
             type="date"
-            className="input h-7 w-auto px-2 py-0.5 text-xs"
+            className="input h-7 w-24 sm:w-auto px-2 py-0.5 text-xs"
             min={todayISO(0)}
             value={cardGoDate}
             onChange={(e) => setCardGoDate(e.target.value)}
@@ -470,7 +470,7 @@ function ConfigurableBundleCard({
 
       {/* 去/回航班号 + 时刻 + 实时余位档位 */}
       {(legs.go || legs.ret || goTier || retTier) && (
-        <div className="mt-2 grid gap-1.5 rounded-md bg-sky-50/70 p-2.5 text-xs text-slate-700 sm:grid-cols-2">
+        <div className="mt-2 grid grid-cols-1 gap-1.5 rounded-md bg-sky-50/70 p-2 sm:p-2.5 text-[11px] sm:text-xs text-slate-700 sm:grid-cols-2">
           <div className="flex flex-wrap items-center gap-1.5">
             <span className="rounded bg-sky-100 px-1.5 py-0.5 font-semibold text-sky-700">去程</span>
             {legs.go && (
@@ -510,7 +510,7 @@ function ConfigurableBundleCard({
 
       {/* 酒店 + 房型（含双早 · 2人1间 · 床型尽量安排）+ 实时房量档位 */}
       {(b.hotelRoomType || hotel) && (
-        <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md bg-purple-50/70 p-2.5 text-xs text-slate-700">
+        <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md bg-purple-50/70 p-2 sm:p-2.5 text-[11px] sm:text-xs text-slate-700">
           <span className="inline-flex items-center gap-1.5">
             <Icon name="hotel" className="h-4 w-4 text-purple-600" />
             <span className="font-medium">{b.hotelRoomType?.hotelName ?? hotel?.name}</span>
@@ -566,13 +566,13 @@ function ConfigurableBundleCard({
 
       {/* 价格汇总 */}
       <div className="mt-4 rounded-2xl border border-slate-200/70 bg-canvas p-3.5">
-        <div className="flex items-center justify-between text-xs text-ink-muted">
+        <div className="flex flex-col gap-1 text-[11px] text-ink-muted sm:flex-row sm:items-center sm:justify-between sm:text-xs">
           <span>
             机票 ¥{flightTotal.toLocaleString()} + 酒店 ¥{hotelTotal.toLocaleString()} + 其他 ¥{otherTotal.toLocaleString()}
-            {b.groundDiscount > 0 && ` − 让利 ¥${b.groundDiscount.toLocaleString()}`}
+            {b.groundDiscount > 0 && ` − 已省 ¥${b.groundDiscount.toLocaleString()}`}
           </span>
         </div>
-        <div className="mt-1.5 flex items-end justify-between">
+        <div className="mt-1.5 flex flex-col gap-1.5 sm:flex-row sm:items-end sm:justify-between">
           <div className="text-xs text-ink-muted">
             {pax} 人 · {rooms} 房 · {formatMonthDay(cardGoDate)} → {formatMonthDay(displayReturnDate)}
           </div>
@@ -750,18 +750,18 @@ function Stepper({
     <div className="flex items-center overflow-hidden rounded-xl border border-slate-200">
       <button
         type="button"
-        className="px-2.5 py-1.5 text-ink-soft transition-colors hover:bg-brand-50 disabled:text-slate-300"
+        className="px-2.5 py-2 sm:py-1.5 text-ink-soft transition-colors hover:bg-brand-50 disabled:text-slate-300"
         disabled={value <= min}
         onClick={() => onChange(value - 1)}
       >
         −
       </button>
-      <span className="nums min-w-[2.5rem] bg-white px-3 py-1.5 text-center font-semibold text-ink">
+      <span className="nums min-w-[2.5rem] bg-white px-3 py-2 sm:py-1.5 text-center font-semibold text-ink">
         {value}
       </span>
       <button
         type="button"
-        className="px-2.5 py-1.5 text-ink-soft transition-colors hover:bg-brand-50 disabled:text-slate-300"
+        className="px-2.5 py-2 sm:py-1.5 text-ink-soft transition-colors hover:bg-brand-50 disabled:text-slate-300"
         disabled={value >= max}
         onClick={() => onChange(value + 1)}
       >

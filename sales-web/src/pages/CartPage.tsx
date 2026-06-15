@@ -111,7 +111,7 @@ export function CartPage() {
                         机票 ¥{fmt(Number(i.meta?.flightTotal) || 0)} +
                         地面 ¥{fmt(Number(i.meta?.hotelTotal) || 0)} +
                         其他 ¥{fmt(Number(i.meta?.otherTotal) || 0)}
-                        {(Number(i.meta?.discount) || 0) > 0 && ` − 让利 ¥${fmt(Number(i.meta?.discount) || 0)}`}
+                        {(Number(i.meta?.discount) || 0) > 0 && ` − 已省 ¥${fmt(Number(i.meta?.discount) || 0)}`}
                       </div>
                     </div>
                   )}
@@ -126,10 +126,10 @@ export function CartPage() {
                   </p>
                 </div>
                 {/* 手机端：qty/价格/删除 整体换到下一行（占满宽度，end 对齐） */}
-                <div className="ml-auto mt-2 flex w-full items-center justify-end gap-3 border-t border-slate-100 pt-3 sm:mt-0 sm:w-auto sm:border-t-0 sm:pt-0">
+                <div className="ml-auto mt-2 flex w-full flex-wrap items-center justify-end gap-2 border-t border-slate-100 pt-3 sm:mt-0 sm:w-auto sm:flex-nowrap sm:gap-3 sm:border-t-0 sm:pt-0">
                   <div className="flex items-center gap-1 rounded-xl border border-slate-200 p-0.5">
                     <button
-                      className="flex h-7 w-7 items-center justify-center rounded-lg text-ink-soft transition hover:bg-brand-50 hover:text-brand-700 disabled:opacity-40"
+                      className="flex h-8 w-8 items-center justify-center rounded-lg text-ink-soft transition hover:bg-brand-50 hover:text-brand-700 disabled:opacity-40 sm:h-7 sm:w-7"
                       onClick={() => updateQty(i.id, i.qty - 1)}
                       disabled={i.qty <= 1}
                     >
@@ -137,7 +137,7 @@ export function CartPage() {
                     </button>
                     <span className="w-7 text-center text-sm font-semibold tabular-nums">{i.qty}</span>
                     <button
-                      className="flex h-7 w-7 items-center justify-center rounded-lg text-ink-soft transition hover:bg-brand-50 hover:text-brand-700"
+                      className="flex h-8 w-8 items-center justify-center rounded-lg text-ink-soft transition hover:bg-brand-50 hover:text-brand-700 sm:h-7 sm:w-7"
                       onClick={() => updateQty(i.id, i.qty + 1)}
                     >
                       +
@@ -145,10 +145,10 @@ export function CartPage() {
                   </div>
                   <div className="min-w-[80px] text-right sm:w-24">
                     <div className="hidden text-xs text-ink-muted sm:block">¥{fmt(i.unitPrice)}</div>
-                    <div className="price text-base">¥{fmt(i.unitPrice * i.qty)}</div>
+                    <div className="price text-sm sm:text-base">¥{fmt(i.unitPrice * i.qty)}</div>
                   </div>
                   <button
-                    className="flex-shrink-0 rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs font-medium text-ink-soft transition hover:border-deal/50 hover:bg-deal-light hover:text-deal"
+                    className="flex h-8 flex-shrink-0 items-center rounded-lg border border-slate-200 px-2.5 text-xs font-medium whitespace-nowrap text-ink-soft transition hover:border-deal/50 hover:bg-deal-light hover:text-deal sm:py-1.5"
                     onClick={() => remove(i.id)}
                   >
                     删除

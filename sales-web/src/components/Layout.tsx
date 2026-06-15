@@ -275,8 +275,8 @@ export function Layout() {
       </header>
 
       <main className="flex-1">
-        {/* 手机端底部留出 bottom bar 高度，避免内容被挡住 */}
-        <div className="mx-auto w-full max-w-7xl px-4 pt-8 pb-24 md:pb-8">
+        {/* 手机端底部留出 bottom bar 高度 + 页面操作条，避免内容被挡住 */}
+        <div className="mx-auto w-full max-w-7xl px-4 pt-8 pb-32 md:pb-8">
           <Outlet />
         </div>
       </main>

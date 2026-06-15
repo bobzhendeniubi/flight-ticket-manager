@@ -901,7 +901,7 @@ function ProposalItemRow({ item }: { item: AiProposal['items'][number] }) {
       <div className="text-xs text-slate-500 mt-0.5">
         {d.pax} 人{d.rooms > 1 ? ` · ${d.rooms} 间房` : ''}
         {d.groundDiscount > 0 && (
-          <span className="ml-1 text-emerald-600">已让利 ¥{d.groundDiscount}</span>
+          <span className="ml-1 text-emerald-600">已省 ¥{d.groundDiscount}</span>
         )}
       </div>
       {d.components && d.components.length > 0 && (

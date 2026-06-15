@@ -191,7 +191,7 @@ export function CheckoutPage() {
     // Invariant: 买几张票/套餐几人就填几个出行人
     if (effectivePax > 0 && passengers.length !== effectivePax) {
       setErrorMsg(
-        `需要 ${effectivePax} 位出行人（${flightTicketCount > 0 ? `机票 ${flightTicketCount} 张` : ''}${bundlePaxCount > 0 ? ` 套餐 ${bundlePaxCount} 人` : ''}${visaPaxCount > 0 ? ` 签证 ${visaPaxCount} 人` : ''}${transferPaxCount > 0 ? ` 接送 ${transferPaxCount} 人` : ''}），当前填了 ${passengers.length} 位`,
+        `本次行程共需 ${effectivePax} 位出行人的护照信息，您已填写 ${passengers.length} 位，还差 ${Math.abs(effectivePax - passengers.length)} 位，请${passengers.length < effectivePax ? '补全' : '删除多余的出行人'}后再提交。`,
       );
       return;
     }
@@ -311,7 +311,7 @@ export function CheckoutPage() {
   };
 
   return (
-    <div className="mx-auto max-w-4xl space-y-5 pb-28">
+    <div className="mx-auto max-w-4xl space-y-5 pb-36 sm:pb-28">
       <section className="animate-fade-up">
         <h1 className="text-2xl font-extrabold tracking-tight text-ink">确认订单</h1>
         <p className="section-sub">
@@ -352,7 +352,7 @@ export function CheckoutPage() {
         {/* 联系人 */}
         <section className="card">
           <h2 className="section-title text-base">联系人信息</h2>
-          <div className="mt-4 grid gap-3 md:grid-cols-3">
+          <div className="mt-4 grid gap-2 sm:gap-3 md:grid-cols-3">
             <div>
               <label className="label">姓名 *</label>
               <input
@@ -490,7 +490,7 @@ export function CheckoutPage() {
         <BookingNotices />
 
         {/* 手机端紧凑：返回 / 合计 + 按钮 在 360px 屏幕也不挤 */}
-        <div className="sticky bottom-[calc(56px+env(safe-area-inset-bottom))] z-40 rounded-2xl border border-slate-200/80 bg-surface/95 px-3 py-3 shadow-pop backdrop-blur-xl sm:bottom-4 sm:px-4">
+        <div className="sticky bottom-[calc(56px+env(safe-area-inset-bottom))] z-40 rounded-2xl border border-slate-200/80 bg-surface/95 px-3 py-2.5 shadow-pop backdrop-blur-xl sm:bottom-4 sm:px-4 sm:py-3">
           <div className="flex items-center justify-between gap-2 sm:gap-4">
             <Link to="/cart" className="whitespace-nowrap text-xs font-medium text-ink-muted transition hover:text-brand-700 sm:text-sm">
               ← <span className="hidden sm:inline">返回</span>购物车

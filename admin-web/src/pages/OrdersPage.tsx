@@ -359,9 +359,18 @@ export function OrdersPage() {
           </p>
         </div>
         <div className="flex flex-wrap items-center justify-end gap-2">
-          <span className="badge-neutral">
-            {loading ? '加载中…' : `共 ${filtered.length} 条`}
-          </span>
+          {(() => {
+            const isFiltered = filtered.length !== orders.length;
+            return (
+              <span className={isFiltered ? 'badge-info' : 'badge-neutral'}>
+                {loading
+                  ? '加载中…'
+                  : isFiltered
+                    ? `${filtered.length} / ${orders.length} 条`
+                    : `共 ${orders.length} 条`}
+              </span>
+            );
+          })()}
           <button
             className="btn-primary text-sm"
             onClick={() => setShowBatchCreate(true)}
@@ -550,21 +559,35 @@ export function OrdersPage() {
           </div>
           <div>
             <label className="label">航班号</label>
-            <input
-              className="input"
-              placeholder="如 VJ527"
-              value={flightNumberFilter}
-              onChange={(e) => setFlightNumberFilter(e.target.value)}
-            />
+            <div className="relative">
+              <input
+                className="input"
+                placeholder="如 VJ527"
+                value={flightNumberFilter}
+                onChange={(e) => setFlightNumberFilter(e.target.value)}
+              />
+              {flightNumberFilter !== debouncedFlightNumber && (
+                <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-ink-muted">
+                  搜索中…
+                </span>
+              )}
+            </div>
           </div>
           <div>
             <label className="label">乘客姓名</label>
-            <input
-              className="input"
-              placeholder="模糊匹配"
-              value={passengerNameFilter}
-              onChange={(e) => setPassengerNameFilter(e.target.value)}
-            />
+            <div className="relative">
+              <input
+                className="input"
+                placeholder="模糊匹配"
+                value={passengerNameFilter}
+                onChange={(e) => setPassengerNameFilter(e.target.value)}
+              />
+              {passengerNameFilter !== debouncedPassengerName && (
+                <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-ink-muted">
+                  搜索中…
+                </span>
+              )}
+            </div>
           </div>
           <div>
             <label className="label">开票状态</label>
@@ -724,7 +747,7 @@ export function OrdersPage() {
                     </div>
                     <div className="mt-0.5 flex items-center gap-2 text-xs text-ink-muted">
                       <span className="rounded bg-slate-100 px-1.5 py-0.5">{KIND_LABEL[view.itemKind]}</span>
-                      <span>{order.passengers.length} 人</span>
+                      <span><span className="nums font-medium text-ink">{order.passengers.length}</span> 人</span>
                     </div>
                   </td>
                   <td className="nums text-right font-medium text-ink">

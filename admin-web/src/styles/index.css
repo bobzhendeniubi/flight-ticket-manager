@@ -89,7 +89,7 @@
     @apply inline-flex items-center gap-1 rounded-md px-2 py-0.5 text-xs font-medium;
   }
   .badge-neutral { @apply badge bg-slate-100 text-slate-600; }
-  .badge-info    { @apply badge bg-brand-50 text-brand-700; }
+  .badge-info    { @apply badge bg-brand-100 text-brand-700; }
   .badge-success { @apply badge bg-emerald-50 text-emerald-700; }
   .badge-warning { @apply badge bg-amber-50 text-amber-700; }
   .badge-danger  { @apply badge bg-rose-50 text-rose-700; }

@@ -172,12 +172,15 @@ function ExpectedAmountCard({
 
   return (
     <div className="card p-4">
-      <div className="flex items-center justify-between">
+      <div className="flex items-start justify-between gap-2">
         <h3 className="text-sm font-semibold text-ink">预期到账金额</h3>
         {locked ? (
-          <span className="badge-warning">
-            已锁定{isAdmin ? '（admin 可改）' : '，找管理员'}
-          </span>
+          <div className="text-right">
+            <span className="badge-warning">🔒 已锁定</span>
+            <p className="mt-1 text-xs text-ink-muted">
+              {isAdmin ? '管理员可解锁/修改；非管理员无法编辑。' : '已由管理员锁定，如需修改请联系管理员。'}
+            </p>
+          </div>
         ) : (
           <span className="badge-neutral">未锁定</span>
         )}
@@ -194,7 +197,7 @@ function ExpectedAmountCard({
             <span className="text-sm text-ink-muted">¥</span>
             <NumberInput
               step={0.01}
-              className="input nums disabled:bg-slate-50 disabled:text-ink-muted"
+              className={`input nums disabled:bg-slate-50 disabled:text-ink-muted ${err ? 'border-rose-400 bg-rose-50' : ''}`}
               value={amount}
               onChange={setAmount}
               disabled={inputDisabled || loading}
@@ -431,7 +434,11 @@ function CostItemsCard({
                       <td>
                         <NumberInput
                           step={0.01}
-                          className="input nums w-32"
+                          className={`input nums w-32 ${
+                            err === '金额需为正数' && !(editDraft.amount !== null && editDraft.amount > 0)
+                              ? 'border-rose-400 bg-rose-50'
+                              : ''
+                          }`}
                           value={editDraft.amount}
                           onChange={(n) => setEditDraft((d) => ({ ...d, amount: n }))}
                         />
@@ -504,7 +511,11 @@ function CostItemsCard({
                 <td>
                   <NumberInput
                     step={0.01}
-                    className="input nums w-32"
+                    className={`input nums w-32 ${
+                      err === '金额需为正数' && !(draft.amount !== null && draft.amount > 0)
+                        ? 'border-rose-400 bg-rose-50'
+                        : ''
+                    }`}
                     value={draft.amount}
                     onChange={(n) => setDraft((d) => ({ ...d, amount: n }))}
                     placeholder="0.00"
