@@ -17,6 +17,7 @@ import {
   exportRoomAllocationQuerySchema,
   exportTemplatesQuerySchema,
   listOrdersQuerySchema,
+  publicOrderLookupQuerySchema,
   updateStatusBodySchema,
 } from './orders.schemas.js';
 import { prisma } from '../../db/prisma.js';
@@ -38,23 +39,59 @@ import {
 export const orderRoutes: FastifyPluginAsync = async (app) => {
   const service = new OrderService();
 
-  // ── 下单 ────────────────────────────────────────────────────────
+  // ── 下单（登录可选：登录用户绑 userId/代理；游客需 guestContact）────────
   app.post(
     '/',
-    { preHandler: [app.authenticate] },
+    { preHandler: [app.optionalAuthenticate] },
     async (req, reply) => {
       const body = createOrderBodySchema.parse(req.body);
-      const requester = await buildRequester(req.user.sub, req.user.role);
-      const order = await service.createOrder(body, requester);
+      // req.user 由 optionalAuthenticate 在带有效 token 时设置；否则为 undefined（游客）
+      const isLoggedIn = Boolean(req.user);
+      let order;
+      if (isLoggedIn) {
+        const requester = await buildRequester(req.user.sub, req.user.role);
+        order = await service.createOrder(body, requester);
+      } else {
+        if (!body.guestContact) {
+          return reply.status(400).send({ error: '游客下单需填写联系人姓名与手机号（guestContact）' });
+        }
+        order = await service.createOrder(body, { guest: body.guestContact });
+      }
       void writeAudit({
         actor: actorFromRequest(req),
         action: 'CREATE_ORDER',
         targetType: 'ORDER',
         targetId: order.id,
         targetLabel: order.orderNumber,
-        after: { total: order.total.toString(), itemCount: order.items.length, passengerCount: order.passengers.length },
+        after: {
+          total: order.total.toString(),
+          itemCount: order.items.length,
+          passengerCount: order.passengers.length,
+          guest: !isLoggedIn,
+        },
       });
       return reply.status(201).send({ order });
+    },
+  );
+
+  // ── 公开订单查询（A4，免登录 + 限流 + 脱敏）────────────────────────
+  // GET /orders/lookup?orderNumber=...&phone=...（也接受 &email=）
+  // 命中返回脱敏视图；不命中一律 404（不泄露哪个字段错）
+  app.get(
+    '/lookup',
+    {
+      config: {
+        // 覆盖全局限流：本路由更严（~10 req/min/IP）防枚举订单号
+        rateLimit: { max: 10, timeWindow: '1 minute' },
+      },
+    },
+    async (req, reply) => {
+      const query = publicOrderLookupQuerySchema.parse(req.query);
+      const masked = await service.lookupOrderPublic(query);
+      if (!masked) {
+        return reply.status(404).send({ error: '未找到匹配的订单，请核对订单号与联系方式' });
+      }
+      return { order: masked };
     },
   );
 

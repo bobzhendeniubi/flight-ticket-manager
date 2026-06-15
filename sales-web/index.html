@@ -2,16 +2,36 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <link rel="manifest" href="/site.webmanifest" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="theme-color" content="#0e8aa0" />
+
+    <!-- 默认 SEO（详情页等会用 react-helmet-async 覆盖 title/description/og:*/canonical） -->
+    <title>世途旅行 · 澳门⇌越南海岛专线</title>
+    <meta
+      name="description"
+      content="世途旅行 · 澳门⇌越南海岛专线：套餐 / 机票 / 酒店 / 接送 / 签证一站式预订，一价全包，省心出行。"
+    />
+    <link rel="canonical" href="https://store.citurtravel.com/" />
+
+    <!-- Open Graph 默认值 -->
+    <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="世途旅行" />
+    <meta property="og:title" content="世途旅行 · 澳门⇌越南海岛专线" />
+    <meta
+      property="og:description"
+      content="套餐 / 机票 / 酒店 / 接送 / 签证一站式预订，一价全包，省心出行。"
+    />
+    <meta property="og:image" content="https://store.citurtravel.com/favicon.svg" />
+    <meta property="og:url" content="https://store.citurtravel.com/" />
+
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link
       href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap"
       rel="stylesheet"
     />
-    <title>世途旅行 · 澳门⇌越南海岛专线</title>
   </head>
   <body class="bg-canvas text-ink antialiased">
     <div id="root"></div>

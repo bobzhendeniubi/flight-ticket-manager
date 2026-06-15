@@ -116,6 +116,15 @@ export const orderItemInputSchema = z.discriminatedUnion('kind', [
 ]);
 export type OrderItemInput = z.infer<typeof orderItemInputSchema>;
 
+// 游客下单（免登录）联系人 —— 仅在请求未带有效登录态时必填（路由层断言）。
+// 登录用户下单时忽略此字段（沿用 userId 绑定）。
+export const guestContactSchema = z.object({
+  name: z.string().min(1).max(120),
+  phone: z.string().min(5).max(40),
+  email: z.string().email().optional(),
+});
+export type GuestContact = z.infer<typeof guestContactSchema>;
+
 export const createOrderBodySchema = z.object({
   contactName: z.string().min(1).max(120),
   contactPhone: z.string().min(5).max(40),
@@ -125,6 +134,8 @@ export const createOrderBodySchema = z.object({
   passengers: z.array(passengerInputSchema).min(1).max(20),
   notes: z.string().max(500).optional(),
   idempotencyKey: z.string().min(8).max(128).optional(),
+  // 游客下单联系人（免登录时必填；登录用户忽略）
+  guestContact: guestContactSchema.optional(),
 });
 export type CreateOrderBody = z.infer<typeof createOrderBodySchema>;
 
@@ -200,6 +211,19 @@ export type BatchUpdateStatusBody = z.infer<typeof batchUpdateStatusBodySchema>;
 
 // ── 批量散客建单（后台）─────────────────────────────────────────────────────
 // 选一个航班班次 + 舱位 + 共享联系人 → 名单里每位乘客各成一单（FLIGHT × 1）
+// ── 公开订单查询（免登录，A4）──────────────────────────────────────────────
+// orderNumber + (phone 或 email) 任一匹配；至少给一个联系方式。
+export const publicOrderLookupQuerySchema = z
+  .object({
+    orderNumber: z.string().min(3).max(40),
+    phone: z.string().min(3).max(40).optional(),
+    email: z.string().email().optional(),
+  })
+  .refine((q) => Boolean(q.phone) || Boolean(q.email), {
+    message: '需提供手机号或邮箱',
+  });
+export type PublicOrderLookupQuery = z.infer<typeof publicOrderLookupQuerySchema>;
+
 export const batchCreateOrdersBodySchema = z.object({
   flightScheduleId: z.string().min(1),
   flightCabin: z.nativeEnum(CabinClass),

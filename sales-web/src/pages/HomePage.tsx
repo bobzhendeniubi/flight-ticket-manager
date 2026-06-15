@@ -1,4 +1,5 @@
 import { FormEvent, useEffect, useState } from 'react';
+import { Link, useSearchParams } from 'react-router-dom';
 import { api, ApiError, type CabinClass, type FlightSearchResult } from '../lib/api';
 import {
   AIRPORT_OPTIONS,
@@ -19,6 +20,36 @@ import {
 } from '../components/HomeSections';
 import { useAuth } from '../stores/auth';
 import { Icon } from '../components/Icon';
+import { SortSelect, type SortOption } from '../components/SortSelect';
+import { ListSkeleton } from '../components/LoadingSkeleton';
+import { ErrorRetry } from '../components/ErrorRetry';
+import { EmptyState } from '../components/EmptyState';
+
+// ── 列表排序（对标 Klook/携程）：URL 持久化（?sort=） ──────────────────
+type FlightSort = 'recommended' | 'priceAsc' | 'departAsc' | 'durationAsc';
+
+const SORT_OPTIONS: SortOption[] = [
+  { value: 'recommended', label: '推荐' },
+  { value: 'priceAsc', label: '价格低→高' },
+  { value: 'departAsc', label: '出发时间早→晚' },
+  { value: 'durationAsc', label: '飞行时长短→长' },
+];
+
+const VALID_SORTS = new Set<FlightSort>(['recommended', 'priceAsc', 'departAsc', 'durationAsc']);
+
+function parseSort(raw: string | null): FlightSort {
+  return raw && VALID_SORTS.has(raw as FlightSort) ? (raw as FlightSort) : 'recommended';
+}
+
+/** 该班次满足人数的最低动态价（无可售舱位 → null，排序时沉底）。 */
+function minSellablePrice(flight: FlightSearchResult, passengers: number): number | null {
+  return flight.seatClasses
+    .filter((c) => c.available >= passengers)
+    .reduce(
+      (m, c) => (m === null || Number(c.dynamicPrice) < m ? Number(c.dynamicPrice) : m),
+      null as number | null,
+    );
+}
 
 function todayISO(offsetDays = 1): string {
   const d = new Date();
@@ -41,26 +72,47 @@ export function HomePage() {
   type SearchResultWithLeg = FlightSearchResult & { _leg?: '去程' | '回程' };
   const [results, setResults] = useState<SearchResultWithLeg[] | null>(null);
   const [loading, setLoading] = useState(false);
+  // error 与"空结果"是两种不同状态：error = 请求失败（给 ErrorRetry）；
+  // results=[] 且 hasSearched = 请求成功但 0 班次（给 EmptyState）。两者绝不同屏。
   const [error, setError] = useState<string | null>(null);
   const [hasSearched, setHasSearched] = useState(false);
+
+  // 排序（URL 持久化 ?sort=）。读：解析校验；写：setSearchParams。
+  const [searchParams, setSearchParams] = useSearchParams();
+  const sort = parseSort(searchParams.get('sort'));
+  const setSort = (next: string) => {
+    const params = new URLSearchParams(searchParams);
+    if (next === 'recommended') params.delete('sort');
+    else params.set('sort', next);
+    setSearchParams(params, { replace: true });
+  };
 
   // 产品关键字搜索（防抖 300ms）— 客户端过滤套餐 / 航班 / 酒店 / 用车
   const [keyword, setKeyword] = useState('');
   const kw = useDebouncedValue(keyword);
 
+  // 首屏拉取全部可售班次（公开端点）；失败要进 error 态而不是静默，
+  // 否则用户分不清"加载失败"和"暂无班次"。
+  const loadInitial = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await api.searchFlights({ passengers: 1 });
+      setResults(res.results);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : '航班加载失败');
+      setResults(null);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   useEffect(() => {
-    (async () => {
-      try {
-        const res = await api.searchFlights({ passengers: 1 });
-        setResults(res.results);
-      } catch {
-        // 静默
-      }
-    })();
+    void loadInitial();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const onSubmit = async (e: FormEvent) => {
-    e.preventDefault();
+  const runSearch = async () => {
     setLoading(true);
     setError(null);
     setHasSearched(true);
@@ -88,11 +140,37 @@ export function HomePage() {
       }
       setResults(combined);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '搜索失败');
-      setResults([]);
+      // 失败：进 error 态，results 置 null（绝不与 EmptyState 同屏）
+      setError(err instanceof ApiError ? err.message : '搜索失败，请稍后再试');
+      setResults(null);
     } finally {
       setLoading(false);
     }
+  };
+
+  const onSubmit = (e: FormEvent) => {
+    e.preventDefault();
+    void runSearch();
+  };
+
+  /** 按当前 sort 排序（不改去/回程分组，分组内排序）。 */
+  const sortFlights = (list: SearchResultWithLeg[]): SearchResultWithLeg[] => {
+    if (sort === 'recommended') return list;
+    const copy = [...list];
+    copy.sort((a, b) => {
+      if (sort === 'departAsc') {
+        return new Date(a.departureTime).getTime() - new Date(b.departureTime).getTime();
+      }
+      if (sort === 'durationAsc') return a.durationMinutes - b.durationMinutes;
+      // priceAsc：无可售价（null）沉底
+      const pa = minSellablePrice(a, passengers);
+      const pb = minSellablePrice(b, passengers);
+      if (pa === null && pb === null) return 0;
+      if (pa === null) return 1;
+      if (pb === null) return -1;
+      return pa - pb;
+    });
+    return copy;
   };
 
   const swap = () => {
@@ -247,74 +325,107 @@ export function HomePage() {
         </form>
       </section>
 
-      {/* 航班结果（受关键字过滤） */}
-      <section className="space-y-3">
-        {error && (
-          <div className="card border-red-200 bg-red-50 text-sm text-red-700">{error}</div>
-        )}
+      {/* 航班结果 —— 四种状态互斥，绝不同屏：
+          1) loading → H1 + ListSkeleton（搜索/加载中）
+          2) error   → ErrorRetry 卡片（请求失败，可重试，与"零结果"区分）
+          3) 成功但 0 班次 → EmptyState（换日期/航线）
+          4) 有班次 → 排序工具条 + 去/回程分组列表（关键字过滤再叠加） */}
+      <section className="space-y-3" aria-labelledby="flight-results-heading">
+        <h1 id="flight-results-heading" className="sr-only">航班搜索结果</h1>
 
-        {results && results.length === 0 && (
-          <div className="card text-slate-600">
-            {hasSearched ? '没有符合条件的航班，换个日期或航线试试。' : '暂无可售航班，请先由管理员添加班次。'}
-          </div>
-        )}
-
-        {results && results.length > 0 && (() => {
-          const visibleResults = filterFlights(results);
-          if (visibleResults.length === 0) {
+        {loading ? (
+          <>
+            <h3 className="text-sm font-semibold text-ink-soft">正在为你查找航班…</h3>
+            <ListSkeleton rows={4} />
+          </>
+        ) : error ? (
+          // 请求失败：独立 ErrorRetry（明确区别于"无符合条件航班"）
+          <ErrorRetry message={error} onRetry={() => (hasSearched ? void runSearch() : void loadInitial())} />
+        ) : results && results.length === 0 ? (
+          // 请求成功但 0 班次
+          hasSearched ? (
+            <EmptyState
+              icon="plane"
+              title="没有符合条件的航班"
+              hint="换个日期或航线试试，或清空筛选看看全部班次。"
+            />
+          ) : (
+            <EmptyState
+              icon="plane"
+              title="暂无可售航班"
+              hint="班次正在上架中，请稍后再来看看。"
+            />
+          )
+        ) : results && results.length > 0 ? (
+          (() => {
+            const visibleResults = sortFlights(filterFlights(results));
+            // 关键字过滤后无命中（区别于服务端 0 结果）
+            if (visibleResults.length === 0) {
+              return (
+                <EmptyState
+                  icon="search"
+                  title={`没有匹配"${kw}"的航班`}
+                  hint="清空搜索框即可查看全部班次。"
+                  action={
+                    <button type="button" className="btn-secondary" onClick={() => setKeyword('')}>
+                      清空关键字
+                    </button>
+                  }
+                />
+              );
+            }
             return (
-              <div className="card text-sm text-slate-500">没有匹配"{kw}"的航班，清空搜索框看全部班次。</div>
-            );
-          }
-          return (
-            <>
-              <p className="text-sm text-slate-500">
-                {tripType === 'roundtrip' ? '往返' : '单程'} · 共 {visibleResults.length} 个班次
-              </p>
-              <div className="space-y-3">
-                {/* 按去程/回程分组显示 */}
-                {tripType === 'roundtrip' && visibleResults.some((r) => r._leg === '去程') && (
-                  <div className="flex items-center gap-2 text-sm font-semibold text-brand mt-2">
-                    <span className="inline-flex items-center gap-1 rounded bg-brand/10 px-2 py-0.5">
-                      <Icon name="planeDepart" className="h-3.5 w-3.5" />去程
-                    </span>
-                    <span className="text-slate-500 font-normal">{origin} → {destination} · {date}</span>
-                  </div>
-                )}
-                {visibleResults.filter((r) => r._leg !== '回程').map((r) => (
-                  <FlightCard
-                    key={r.scheduleId}
-                    flight={r}
-                    passengers={passengers}
-                    isLoggedIn={!!user}
-                    mobileRouteCollapsed={r._leg !== undefined}
-                  />
-                ))}
-                {tripType === 'roundtrip' && visibleResults.some((r) => r._leg === '回程') && (
-                  <>
-                    <div className="flex items-center gap-2 text-sm font-semibold text-brand mt-4">
+              <>
+                {/* 排序工具条（对标 Klook/携程）：左计数、右排序 */}
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <h3 className="text-sm font-semibold text-ink-soft">
+                    {tripType === 'roundtrip' ? '往返' : '单程'} · 共 {visibleResults.length} 个班次
+                  </h3>
+                  <SortSelect value={sort} options={SORT_OPTIONS} onChange={setSort} />
+                </div>
+                <div className="space-y-3">
+                  {/* 按去程/回程分组显示 */}
+                  {tripType === 'roundtrip' && visibleResults.some((r) => r._leg === '去程') && (
+                    <div className="flex items-center gap-2 text-sm font-semibold text-brand mt-2">
                       <span className="inline-flex items-center gap-1 rounded bg-brand/10 px-2 py-0.5">
-                        <Icon name="planeReturn" className="h-3.5 w-3.5" />回程
+                        <Icon name="planeDepart" className="h-3.5 w-3.5" />去程
                       </span>
-                      <span className="text-slate-500 font-normal">{destination} → {origin} · {returnDate}</span>
+                      <span className="text-slate-500 font-normal">{origin} → {destination} · {date}</span>
                     </div>
-                    {visibleResults.filter((r) => r._leg === '回程').map((r) => (
-                      <FlightCard
-                        key={r.scheduleId}
-                        flight={r}
-                        passengers={passengers}
-                        isLoggedIn={!!user}
-                        mobileRouteCollapsed
-                      />
-                    ))}
-                  </>
-                )}
-              </div>
-            </>
-          );
-        })()}
-
-        {results === null && <div className="card text-slate-500">正在加载…</div>}
+                  )}
+                  {visibleResults.filter((r) => r._leg !== '回程').map((r) => (
+                    <FlightCard
+                      key={r.scheduleId}
+                      flight={r}
+                      passengers={passengers}
+                      isLoggedIn={!!user}
+                      mobileRouteCollapsed={r._leg !== undefined}
+                    />
+                  ))}
+                  {tripType === 'roundtrip' && visibleResults.some((r) => r._leg === '回程') && (
+                    <>
+                      <div className="flex items-center gap-2 text-sm font-semibold text-brand mt-4">
+                        <span className="inline-flex items-center gap-1 rounded bg-brand/10 px-2 py-0.5">
+                          <Icon name="planeReturn" className="h-3.5 w-3.5" />回程
+                        </span>
+                        <span className="text-slate-500 font-normal">{destination} → {origin} · {returnDate}</span>
+                      </div>
+                      {visibleResults.filter((r) => r._leg === '回程').map((r) => (
+                        <FlightCard
+                          key={r.scheduleId}
+                          flight={r}
+                          passengers={passengers}
+                          isLoggedIn={!!user}
+                          mobileRouteCollapsed
+                        />
+                      ))}
+                    </>
+                  )}
+                </div>
+              </>
+            );
+          })()
+        ) : null}
       </section>
 
       {/* 酒店 / 用车速览（排在机票后面） */}
@@ -407,11 +518,24 @@ function FlightCard({
     <article className="card hover:shadow-md transition">
       {/* 顶部行：航班号 + 价格（手机端两端对齐，桌面端航班号靠左、其它信息后面跟） */}
       <div className="flex items-start justify-between gap-3 sm:flex-wrap sm:items-center sm:gap-6">
-        <div className="flex items-center gap-2 sm:gap-3 flex-shrink-0">
-          <span className="inline-flex items-center rounded bg-brand/10 px-2 py-0.5 text-sm font-semibold text-brand">
-            {flight.flightNumber}
-          </span>
-          <span className="hidden sm:inline text-xs text-slate-500">{flight.aircraftType ?? ''}</span>
+        <div className="flex min-w-0 flex-col gap-0.5 flex-shrink-0">
+          <div className="flex items-center gap-2 sm:gap-3">
+            <span className="inline-flex items-center rounded bg-brand/10 px-2 py-0.5 text-sm font-semibold text-brand">
+              {flight.flightNumber}
+            </span>
+            {/* 机型 · 飞行时长 · 直飞 —— 桌面端跟在航班号后；机型为空则只显示时长 */}
+            <span className="hidden truncate text-xs text-slate-500 sm:inline">
+              {[flight.aircraftType, `飞行约${formatDuration(flight.durationMinutes)}`, '直飞']
+                .filter(Boolean)
+                .join(' · ')}
+            </span>
+          </div>
+          {/* 手机端：只补机型（时长/直飞已在下方时间行，避免重复）；无机型则不渲染 */}
+          {flight.aircraftType && (
+            <span className="truncate text-[11px] text-slate-500 sm:hidden">
+              {flight.aircraftType}
+            </span>
+          )}
         </div>
 
         {/* 时间块：手机端单独占一行（在下面），桌面端在中间 */}
@@ -496,6 +620,18 @@ function FlightCard({
             isLoggedIn={isLoggedIn}
           />
         ))}
+      </div>
+
+      {/* 详情入口（B2）：去航班详情页看时刻线 / 行李 / 改退 / 评价。
+          独立 Link，不影响卡内 加购/锁位 逻辑。 */}
+      <div className="mt-3 flex justify-end border-t border-slate-100 pt-2.5">
+        <Link
+          to={`/flights/${flight.scheduleId}`}
+          className="group inline-flex items-center gap-1 text-xs font-semibold text-brand transition-colors hover:text-brand-dark"
+        >
+          查看航班详情
+          <Icon name="arrowRight" className="h-3.5 w-3.5 transition-transform group-hover:translate-x-0.5" />
+        </Link>
       </div>
     </article>
   );

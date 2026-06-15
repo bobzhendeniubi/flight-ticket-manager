@@ -13,6 +13,16 @@ export default defineConfig(({ mode }) => {
     resolve: {
       alias: { '@': path.resolve(__dirname, 'src') },
     },
+    build: {
+      rollupOptions: {
+        output: {
+          // 把 React 运行时与路由拆到独立 vendor chunk —— 长缓存、与业务代码分离。
+          manualChunks: {
+            vendor: ['react', 'react-dom', 'react-router-dom'],
+          },
+        },
+      },
+    },
     server: {
       port: devPort,
       proxy: {

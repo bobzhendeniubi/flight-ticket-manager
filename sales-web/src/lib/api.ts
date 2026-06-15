@@ -44,13 +44,22 @@ export async function apiFetch<T>(path: string, init: ApiRequestInit = {}): Prom
   if (res.status === 204) return undefined as T;
 
   const text = await res.text();
-  const parsed = text ? (JSON.parse(text) as unknown) : undefined;
+  // 非 JSON 响应（如 nginx 的 HTML 502/404 页）不能直接 JSON.parse —— 否则抛
+  // 裸 SyntaxError（不带 status），下游 401/404 处理会失效。容错为 undefined，
+  // 由下面的 !res.ok 分支统一抛出带 status 的 ApiError。
+  let parsed: unknown;
+  try {
+    parsed = text ? (JSON.parse(text) as unknown) : undefined;
+  } catch {
+    parsed = undefined;
+  }
 
   if (!res.ok) {
     const errBody = (parsed as ApiErrorBody | undefined)?.error ?? {
       code: 'UNKNOWN',
-      message: res.statusText,
+      message: res.statusText || `HTTP ${res.status}`,
     };
+    // ApiError.status 暴露 HTTP 状态码（结算/401/404 处理依赖它，见 H3）。
     throw new ApiError(res.status, errBody);
   }
   return parsed as T;
@@ -363,11 +372,23 @@ export interface MyWaitlistEntry {
   createdAt: string;
 }
 
+/**
+ * 游客（未登录）下单联系人。
+ * 仅在 **未登录** 时随 POST /orders 一起发送；已登录时省略（后端用 token 关联用户）。
+ */
+export interface GuestContact {
+  name: string;
+  phone: string;
+  email?: string;
+}
+
 export interface CreateOrderInput {
   contactName: string;
   contactPhone: string;
   contactEmail?: string;
   paymentMethod?: PaymentMethod;
+  /** 游客下单联系人；只在未登录场景传，已登录请省略。 */
+  guestContact?: GuestContact;
   items: Array<
     | {
         kind: 'FLIGHT';
@@ -425,6 +446,21 @@ export interface CreateOrderInput {
 }
 
 // ── Products ─────────────────────────────────────────────────────────────
+
+/**
+ * 产品评分聚合（后端 list/detail 现在按 item 一并返回）。
+ *
+ * 注意命名：历史上 Hotel 已有 `rating: string`（单值字符串）与 `reviewCount`，
+ * 为了不破坏既有页面对这两个字段的消费，结构化的评分聚合统一放在
+ * `productRating`（不与旧 `rating` 冲突）。Phase-3 详情页消费评分聚合时
+ * 读 `productRating`（{average,count}），需要展示销量读 `soldCount`。
+ * 全部 optional，老缓存/未配置时为 undefined，前端按"不展示"处理。
+ */
+export interface ProductRating {
+  average: number;
+  count: number;
+}
+
 export interface HotelRoomType {
   id: string;
   hotelId: string;
@@ -453,6 +489,10 @@ export interface Hotel {
   isActive: boolean;
   roomTypes: HotelRoomType[];
   createdAt: string;
+  /** 评分聚合（结构化；旧 `rating: string` 仍保留兼容，新代码读这里） */
+  productRating?: ProductRating;
+  /** 累计销量（null/缺省 = 不展示） */
+  soldCount?: number;
 }
 
 export interface Transfer {
@@ -468,6 +508,9 @@ export interface Transfer {
   emoji: string | null;
   photo: string | null;
   isActive: boolean;
+  productRating?: ProductRating;
+  reviewCount?: number;
+  soldCount?: number;
 }
 
 export interface Visa {
@@ -485,6 +528,9 @@ export interface Visa {
   highlight: string | null;
   requiredDocs: string[];
   isActive: boolean;
+  productRating?: ProductRating;
+  reviewCount?: number;
+  soldCount?: number;
 }
 
 export interface BundleItemData {
@@ -514,6 +560,10 @@ export interface Bundle {
   hotelRoomTypeId?: string | null;
   /** 套餐住宿晚数（回程日期 = 出发 + 晚数；null = 用前端默认晚数） */
   hotelNights?: number | null;
+  /** 评分聚合 + 销量（后端 list/detail 现按 item 返回；全 optional 不破坏老页面） */
+  productRating?: ProductRating;
+  reviewCount?: number;
+  soldCount?: number;
 }
 
 // ── 结算 / 佣金 ────────────────────────────────────────────────────────────
@@ -559,6 +609,80 @@ export interface SettlementCommissionRecord {
 
 export interface SettlementDetail extends SettlementSummary {
   commissions: SettlementCommissionRecord[];
+}
+
+// ── 评价 / 评论 ─────────────────────────────────────────────────────────────
+export type ReviewProductType = 'BUNDLE' | 'HOTEL' | 'TRANSFER' | 'VISA' | 'FLIGHT';
+
+/** 单条评价（对标 Klook/携程 评论；后端 GET /reviews 的 item） */
+export interface Review {
+  id: string;
+  productType: ReviewProductType;
+  productId: string;
+  rating: number;
+  title?: string;
+  body: string;
+  authorName: string;
+  verified: boolean;
+  tripType?: string;
+  /** 商家回复（null/缺省 = 未回复） */
+  reply?: string | null;
+  orderId?: string | null;
+  createdAt: string;
+}
+
+/** 评分聚合（GET /reviews 的 summary 字段） */
+export interface ReviewSummary {
+  average: number;
+  count: number;
+  /** 5/4/3/2/1 星各自条数 */
+  distribution: Record<'5' | '4' | '3' | '2' | '1', number>;
+}
+
+/** GET /reviews 返回（分页 + 聚合） */
+export interface ReviewListResult {
+  items: Review[];
+  total: number;
+  page: number;
+  limit: number;
+  summary: ReviewSummary;
+}
+
+/** POST /orders/:id/review 入参 */
+export interface CreateReviewInput {
+  rating: number;
+  body: string;
+  title?: string;
+  tripType?: string;
+  /** 评指定产品时传；省略 = 评该订单里的全部产品 */
+  productType?: ReviewProductType;
+  /** HOTEL 时 productId = hotelRoomTypeId */
+  productId?: string;
+  /** 游客凭订单号+手机号评价（未登录时）；已登录用 token */
+  orderNumber?: string;
+  phone?: string;
+}
+
+// ── 订单查询（公开脱敏）─────────────────────────────────────────────────────
+/** GET /orders/lookup 返回的脱敏订单项 */
+export interface MaskedOrderItem {
+  kind: OrderItemKind;
+  productName: string;
+  quantity: number;
+  amount: string;
+  /** 出行日期（ISO 字符串）；不适用时 null */
+  travelDate: string | null;
+}
+
+/** GET /orders/lookup 返回的脱敏订单（无需登录，订单号 + 手机号或邮箱即可查） */
+export interface MaskedOrder {
+  orderNumber: string;
+  status: OrderStatus;
+  paymentStatus: string;
+  createdAt: string;
+  total: string;
+  items: MaskedOrderItem[];
+  passengers: Array<{ name: string }>;
 }
 
 // ── Typed endpoints ───────────────────────────────────────────────────────
@@ -654,8 +778,21 @@ export const api = {
     ),
 
   // 订单
-  createOrder: (token: string, body: CreateOrderInput) =>
+  // POST /orders 现在登录可选：未登录传 token=null + body.guestContact；
+  // apiFetch 在 token 为 null/空时不带 Authorization 头，不抛错。
+  createOrder: (token: string | null, body: CreateOrderInput) =>
     apiFetch<{ order: OrderSummary }>('/orders/', { method: 'POST', token, body }),
+  /**
+   * 公开查单（无需登录）：订单号 + 手机号或邮箱（二选一）。
+   * 命中返回脱敏订单；无匹配后端回 HTTP 404（apiFetch 抛 ApiError，status=404）。
+   */
+  lookupOrder: (params: { orderNumber: string; phone?: string; email?: string }) => {
+    const qs = new URLSearchParams();
+    qs.set('orderNumber', params.orderNumber);
+    if (params.phone) qs.set('phone', params.phone);
+    if (params.email) qs.set('email', params.email);
+    return apiFetch<{ order: MaskedOrder }>(`/orders/lookup?${qs.toString()}`);
+  },
   listOrders: (token: string, query?: Record<string, string | number | undefined>) => {
     const qs = new URLSearchParams();
     if (query) {
@@ -743,6 +880,33 @@ export const api = {
   },
   getSettlement: (token: string, id: string) =>
     apiFetch<{ settlement: SettlementDetail }>(`/settlements/${id}`, { token }),
+
+  // 评价（公开读；写需订单关联）
+  /** GET /reviews — 某产品的评价列表 + 评分聚合（分页） */
+  listReviews: (params: {
+    productType: string;
+    productId: string;
+    page?: number;
+    limit?: number;
+  }) => {
+    const qs = new URLSearchParams();
+    qs.set('productType', params.productType);
+    qs.set('productId', params.productId);
+    if (params.page !== undefined) qs.set('page', String(params.page));
+    if (params.limit !== undefined) qs.set('limit', String(params.limit));
+    return apiFetch<ReviewListResult>(`/reviews?${qs.toString()}`);
+  },
+  /**
+   * POST /orders/:id/review — 对已完成订单写评价。
+   * 已登录传 token；游客评价可省 token，用 body.orderNumber + body.phone 验证。
+   * 返回 201 + 创建的评价数组（评整单时一次可创建多条）。
+   */
+  createReview: (orderId: string, body: CreateReviewInput, token?: string | null) =>
+    apiFetch<{ created: Review[] }>(`/orders/${orderId}/review`, {
+      method: 'POST',
+      token: token ?? undefined,
+      body,
+    }),
 
   // AI 助手（公开 — 任何人可聊；下单时才要登录）
   aiChat: (body: { messages: AiChatMessage[]; userMessage: string }) =>

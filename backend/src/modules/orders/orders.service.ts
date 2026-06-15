@@ -40,6 +40,7 @@ import type {
   ListOrdersQuery,
   OrderItemInput,
   PassengerInput,
+  PublicOrderLookupQuery,
 } from './orders.schemas.js';
 
 // ── 状态机：允许的转移 ──────────────────────────────────────────────────
@@ -78,6 +79,9 @@ const SEAT_RELEASING_STATUSES: OrderStatus[] = [
   'FAILED',
 ];
 
+// 服务端价格校验容差（CNY）：客户端提交金额与服务端权威重算金额相差超过此值则拒单（A3）
+const PRICE_TOLERANCE_CNY = 1.0;
+
 // 护照有效期规则（相对出发日）— 反馈：李萍
 const PASSPORT_EXPIRY_BLOCK_DAYS = 90; // 不足 90 天禁止下单
 const PASSPORT_EXPIRY_SURCHARGE_DAYS = 180; // 不足 6 个月加收附加费
@@ -93,13 +97,29 @@ export interface OrderRequester {
   actorType?: 'USER' | 'SYSTEM';
 }
 
+/**
+ * 游客下单上下文（免登录，A1）。createOrder 收到 guest 时：
+ * userId=null、agentId=null、无佣金/结算（等同直客无代理单）。
+ */
+export interface GuestRequester {
+  guest: { name: string; phone: string; email?: string };
+}
+
+function isGuestRequester(r: OrderRequester | GuestRequester): r is GuestRequester {
+  return 'guest' in r;
+}
+
 export class OrderService {
   private readonly pricing = new PricingService();
 
   // ════════════════════════════════════════════════════════════════════
   // 下单
   // ════════════════════════════════════════════════════════════════════
-  async createOrder(body: CreateOrderBody, requester: OrderRequester) {
+  async createOrder(body: CreateOrderBody, requester: OrderRequester | GuestRequester) {
+    // 游客 vs 登录用户：拆出统一的归属信息（userId/agentId/锁位归属/事件 actor）
+    const isGuest = isGuestRequester(requester);
+    const ownerUserId: string | null = isGuest ? null : requester.userId;
+    const guest = isGuest ? requester.guest : null;
     // 幂等：提前查 key 是否已存在
     if (body.idempotencyKey) {
       const existing = await prisma.order.findUnique({
@@ -144,8 +164,8 @@ export class OrderService {
     const subtotal = pricedItems.reduce((sum, p) => sum + p.amount, 0);
     const total = subtotal; // 目前没有 taxes / discount，直接等于 subtotal
 
-    // 代理身份判定：非 AGENT 则 agentId=null
-    const agentId = requester.role === 'AGENT' ? (requester.agentId ?? null) : null;
+    // 代理身份判定：游客无代理；登录用户里非 AGENT 也 agentId=null
+    const agentId = !isGuest && requester.role === 'AGENT' ? (requester.agentId ?? null) : null;
 
     // 生成订单号（有极小概率撞 unique，重试 3 次）
     const orderNumber = await generateOrderNumber();
@@ -165,7 +185,8 @@ export class OrderService {
           _sum: { qty: true },
           where: {
             seatClass: { scheduleId: p.flightScheduleId!, cabin: p.flightCabin! },
-            userId: { not: requester.userId },
+            // 游客无锁位归属 → 所有他人 ACTIVE 锁位都占用余票
+            ...(ownerUserId ? { userId: { not: ownerUserId } } : {}),
             status: SeatLockStatus.ACTIVE,
             expiresAt: { gt: new Date() },
           },
@@ -195,8 +216,12 @@ export class OrderService {
       const created = await tx.order.create({
         data: {
           orderNumber,
-          userId: requester.userId,
+          userId: ownerUserId,
           agentId,
+          // 游客下单：存联系人，供公开订单查询匹配 + 履约联系
+          guestName: guest?.name ?? null,
+          guestPhone: guest?.phone ?? null,
+          guestEmail: guest?.email ?? null,
           status: OrderStatus.PENDING_PAYMENT,
           currency: 'CNY',
           subtotal: new Prisma.Decimal(subtotal),
@@ -232,8 +257,8 @@ export class OrderService {
             create: {
               fromStatus: null,
               toStatus: OrderStatus.PENDING_PAYMENT,
-              actorUserId: requester.userId,
-              reason: '订单创建',
+              actorUserId: ownerUserId, // 游客下单 → null（系统/匿名）
+              reason: isGuest ? '游客下单创建' : '订单创建',
             },
           },
         },
@@ -253,12 +278,13 @@ export class OrderService {
 
       // 消费下单人自己的锁位：FLIGHT 行对应舱位上本人的 ACTIVE 未过期锁位 → CONSUMED
       // （座位已通过 sold 扣减真实占用，锁位完成使命；过期任务提交后再移除）
+      // 游客无锁位归属 → 跳过整段
       for (const p of pricedItems) {
-        if (p.kind !== 'FLIGHT') continue;
+        if (p.kind !== 'FLIGHT' || !ownerUserId) continue;
         const myLocks = await tx.seatLock.findMany({
           where: {
             seatClass: { scheduleId: p.flightScheduleId!, cabin: p.flightCabin! },
-            userId: requester.userId,
+            userId: ownerUserId,
             status: SeatLockStatus.ACTIVE,
             expiresAt: { gt: new Date() },
           },
@@ -453,6 +479,8 @@ export class OrderService {
           if (!rt) throw new NotFoundError(`酒店房型 ${item.hotelRoomTypeId} 不存在`);
           if (!rt.hotel.isActive) throw new BadRequestError('酒店已下架');
           unitPrice = Number(rt.basePrice);
+          // A3：拒绝偏离服务端权威价超容差的提交（仅有产品 id 时校验，无 id 走信任旧路径）
+          assertAmountWithinTolerance('酒店', item.unitPrice, unitPrice, item.quantity);
         }
         priced.push({
           kind: 'HOTEL',
@@ -475,6 +503,7 @@ export class OrderService {
           if (!t) throw new NotFoundError(`接送产品 ${item.transferId} 不存在`);
           if (!t.isActive) throw new BadRequestError('接送产品已下架');
           unitPrice = Number(t.basePrice);
+          assertAmountWithinTolerance('接送', item.unitPrice, unitPrice, item.quantity);
         }
         priced.push({
           kind: 'TRANSFER',
@@ -499,6 +528,7 @@ export class OrderService {
           unitPrice = express && v.expressSurcharge
             ? baseUnitPrice + Number(v.expressSurcharge)
             : baseUnitPrice;
+          assertAmountWithinTolerance('签证', item.unitPrice, unitPrice, item.quantity);
         }
         priced.push({
           kind: 'VISA',
@@ -625,6 +655,44 @@ export class OrderService {
     if (!order) throw new NotFoundError('订单不存在');
     await this.assertCanView(order, requester);
     return serializeOrder(order);
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  // 公开订单查询（A4，免登录）
+  // ════════════════════════════════════════════════════════════════════
+  /**
+   * 用 orderNumber + (phone 或 email) 匹配订单，命中返回脱敏视图，否则返回 null。
+   * 匹配范围：订单游客联系人(guestPhone/guestEmail/contactPhone/contactEmail) 或
+   * 归属用户(user.phone/user.email)。任一字段命中即可。
+   * 安全：永不泄露内部备注/成本/代理/expectedAmount/PII；不命中统一返回 null（路由 → 404）。
+   */
+  async lookupOrderPublic(query: PublicOrderLookupQuery): Promise<MaskedOrderView | null> {
+    const order = await prisma.order.findUnique({
+      where: { orderNumber: query.orderNumber },
+      include: {
+        items: { include: { flightSchedule: { select: { departureTime: true } } } },
+        passengers: { select: { fullName: true, firstName: true } },
+        payments: { select: { status: true } },
+        user: { select: { phone: true, email: true } },
+      },
+    });
+    if (!order) return null;
+
+    // 联系方式匹配（phone / email 任一）。比对时去空白；电话忽略大小写无意义但邮箱忽略大小写。
+    const phone = query.phone?.trim();
+    const email = query.email?.trim().toLowerCase();
+    const orderPhones = [order.guestPhone, order.contactPhone, order.user?.phone]
+      .filter((v): v is string => Boolean(v))
+      .map((v) => v.trim());
+    const orderEmails = [order.guestEmail, order.contactEmail, order.user?.email]
+      .filter((v): v is string => Boolean(v))
+      .map((v) => v.trim().toLowerCase());
+
+    const phoneMatch = phone ? orderPhones.includes(phone) : false;
+    const emailMatch = email ? orderEmails.includes(email) : false;
+    if (!phoneMatch && !emailMatch) return null;
+
+    return maskOrderForPublic(order);
   }
 
   // ════════════════════════════════════════════════════════════════════
@@ -980,10 +1048,11 @@ export class OrderService {
   // ════════════════════════════════════════════════════════════════════
   // 权限校验
   // ════════════════════════════════════════════════════════════════════
-  private async assertCanView(order: { userId: string; agentId: string | null }, requester: OrderRequester) {
+  private async assertCanView(order: { userId: string | null; agentId: string | null }, requester: OrderRequester) {
     if (requester.role === 'ADMIN' || requester.role === 'STAFF') return;
     if (requester.role === 'CUSTOMER') {
-      if (order.userId !== requester.userId) throw new ForbiddenError('无权查看该订单');
+      // 游客单（userId=null）无登录归属 → 普通客户不可通过此路径查看（走公开 lookup）
+      if (!order.userId || order.userId !== requester.userId) throw new ForbiddenError('无权查看该订单');
       return;
     }
     if (requester.role === 'AGENT') {
@@ -995,13 +1064,13 @@ export class OrderService {
   }
 
   private async assertCanTransition(
-    order: { userId: string; agentId: string | null; status: OrderStatus },
+    order: { userId: string | null; agentId: string | null; status: OrderStatus },
     toStatus: OrderStatus,
     requester: OrderRequester,
   ) {
     if (requester.role === 'ADMIN' || requester.role === 'STAFF') return;
     if (requester.role === 'CUSTOMER') {
-      if (order.userId !== requester.userId) throw new ForbiddenError('无权操作该订单');
+      if (!order.userId || order.userId !== requester.userId) throw new ForbiddenError('无权操作该订单');
       // 客户允许的状态流转：
       //   1. PENDING_PAYMENT → CANCELLED （直接取消未支付订单）
       //   2. PAID / PROCESSING / TICKETED → REFUND_REQUESTED （申请取消已支付订单）
@@ -1267,6 +1336,28 @@ export function assertVisaPassengersHavePassportExpiry(
   }
 }
 
+// ── 服务端价格校验（A3）─────────────────────────────────────────────
+/**
+ * 比对客户端提交的「单价 × 数量」与服务端权威「单价 × 数量」。
+ * 偏差超过 PRICE_TOLERANCE_CNY（1.00 元）则抛 400，拒绝下单。
+ * 用于 HOTEL/VISA/TRANSFER —— FLIGHT/BUNDLE 走各自动态重算，不需此通用比对。
+ * 导出仅供单测使用。
+ */
+export function assertAmountWithinTolerance(
+  label: string,
+  clientUnitPrice: number,
+  serverUnitPrice: number,
+  quantity: number,
+): void {
+  const clientAmount = clientUnitPrice * quantity;
+  const serverAmount = serverUnitPrice * quantity;
+  if (Math.abs(clientAmount - serverAmount) > PRICE_TOLERANCE_CNY) {
+    throw new BadRequestError(
+      `${label}价格已变动（提交 ¥${clientAmount.toFixed(2)}，当前 ¥${serverAmount.toFixed(2)}），请刷新后重试`,
+    );
+  }
+}
+
 // ── 套餐酒店盖章 ─────────────────────────────────────────────────────
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DEFAULT_BUNDLE_HOTEL_NIGHTS = 1;
@@ -1378,6 +1469,90 @@ function serializeOrder<T extends OrderLike>(order: T) {
       amount: i.amount.toString(),
     })),
   };
+}
+
+// ── 公开订单脱敏视图（A4）────────────────────────────────────────────
+export interface MaskedOrderView {
+  orderNumber: string;
+  status: OrderStatus;
+  paymentStatus: 'PENDING' | 'SUCCEEDED' | 'FAILED' | 'REFUNDED' | 'NONE';
+  createdAt: Date;
+  total: string;
+  items: Array<{
+    kind: OrderItemKind;
+    productName: string;
+    quantity: number;
+    amount: string;
+    travelDate: string | null; // 出行/入住日期（仅日期，无时间）
+  }>;
+  passengers: Array<{ name: string }>; // 仅名（given name），姓氏脱敏
+}
+
+/**
+ * 脱敏中文/英文姓名：只保留「名」，姓氏打码。
+ *   "张三"   → "张*"     （中文：首字 + *）
+ *   "李小明" → "李**"
+ *   "WANG MEI" → "W** MEI"（拉丁：首字母 + ** + 其余）
+ * 兜底：无法判断时保留首字符 + *。
+ */
+export function maskFamilyName(fullName: string): string {
+  const name = (fullName ?? '').trim();
+  if (!name) return '*';
+  // 拉丁姓名（含空格）：第一段视为姓 → 首字母 + **，其余原样
+  if (/\s/.test(name)) {
+    const [family, ...rest] = name.split(/\s+/);
+    const maskedFamily = family.length <= 1 ? `${family}*` : `${family[0]}${'*'.repeat(Math.min(family.length - 1, 2))}`;
+    return [maskedFamily, ...rest].join(' ');
+  }
+  // 中文姓名：首字（姓）+ 其余打码
+  if (name.length <= 1) return `${name}*`;
+  return `${name[0]}${'*'.repeat(name.length - 1)}`;
+}
+
+type OrderForMasking = Prisma.OrderGetPayload<{
+  include: {
+    items: { include: { flightSchedule: { select: { departureTime: true } } } };
+    passengers: { select: { fullName: true; firstName: true } };
+    payments: { select: { status: true } };
+  };
+}>;
+
+/** 把 order（含 items/passengers/payments）转脱敏视图，绝不带内部字段。 */
+function maskOrderForPublic(order: OrderForMasking): MaskedOrderView {
+  // 取最近一笔成功支付；否则取任一支付状态；都没有 → NONE
+  const succeeded = order.payments.some((p) => p.status === 'SUCCEEDED');
+  const latest = order.payments[order.payments.length - 1];
+  const paymentStatus: MaskedOrderView['paymentStatus'] = succeeded
+    ? 'SUCCEEDED'
+    : latest
+      ? (latest.status as MaskedOrderView['paymentStatus'])
+      : 'NONE';
+
+  return {
+    orderNumber: order.orderNumber,
+    status: order.status,
+    paymentStatus,
+    createdAt: order.createdAt,
+    total: order.total.toString(),
+    items: order.items.map((it) => ({
+      kind: it.kind,
+      productName: it.description,
+      quantity: it.quantity,
+      amount: it.amount.toString(),
+      travelDate: maskedItemTravelDate(it),
+    })),
+    passengers: order.passengers.map((p) => ({ name: maskFamilyName(p.fullName) })),
+  };
+}
+
+/** 行的出行/入住日期（仅日期字符串）；HOTEL→入住日，FLIGHT→出发日，否则 null。 */
+function maskedItemTravelDate(it: {
+  hotelCheckIn: Date | null;
+  flightSchedule: { departureTime: Date } | null;
+}): string | null {
+  if (it.hotelCheckIn) return it.hotelCheckIn.toISOString().slice(0, 10);
+  if (it.flightSchedule) return it.flightSchedule.departureTime.toISOString().slice(0, 10);
+  return null;
 }
 
 // 避免 PaymentMethod 未使用告警（未来接支付时会用到）

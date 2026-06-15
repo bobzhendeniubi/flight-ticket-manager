@@ -4,9 +4,10 @@
  * 4 个 sub-resource 单独方法组；每个都是标准 list/get/create/update/delete。
  * Hotel 额外支持 nested roomTypes 替换式更新（简化处理）。
  */
-import { Prisma } from '@prisma/client';
+import { Prisma, ProductReviewType } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { NotFoundError } from '../../lib/errors.js';
+import { ReviewsService, type ProductRatingAggregate } from '../reviews/reviews.service.js';
 import type {
   CreateBundleBody,
   CreateHotelBody,
@@ -60,7 +61,11 @@ async function createWithProductCode<T>(
   }
 }
 
+const ZERO_RATING: ProductRatingAggregate = { average: 0, count: 0 };
+
 export class ProductsService {
+  private readonly reviews = new ReviewsService();
+
   // ══════════════════════════════════════════════════════════════════
   // Hotels
   // ══════════════════════════════════════════════════════════════════
@@ -70,7 +75,8 @@ export class ProductsService {
       include: { roomTypes: { orderBy: { basePrice: 'asc' } } },
       orderBy: { createdAt: 'asc' },
     });
-    return hotels.map(serializeHotel);
+    const ratings = await this.hotelRatings(hotels);
+    return hotels.map((h) => serializeHotel(h, ratings.get(h.id) ?? ZERO_RATING));
   }
 
   async getHotel(id: string) {
@@ -79,7 +85,36 @@ export class ProductsService {
       include: { roomTypes: { orderBy: { basePrice: 'asc' } } },
     });
     if (!hotel) throw new NotFoundError('酒店不存在');
-    return serializeHotel(hotel);
+    const ratings = await this.hotelRatings([hotel]);
+    return serializeHotel(hotel, ratings.get(hotel.id) ?? ZERO_RATING);
+  }
+
+  /**
+   * 酒店级评分聚合：HOTEL 评价以 hotelRoomTypeId 为 productId，故按酒店把它的
+   * 所有房型 id 的评价汇总成酒店级 { average, count }。
+   */
+  private async hotelRatings(
+    hotels: Array<{ id: string; roomTypes: Array<{ id: string }> }>,
+  ): Promise<Map<string, ProductRatingAggregate>> {
+    const roomTypeIds = hotels.flatMap((h) => h.roomTypes.map((rt) => rt.id));
+    const byRoomType = await this.reviews.getAggregates(ProductReviewType.HOTEL, roomTypeIds);
+    const byHotel = new Map<string, ProductRatingAggregate>();
+    for (const h of hotels) {
+      let count = 0;
+      let weighted = 0;
+      for (const rt of h.roomTypes) {
+        const agg = byRoomType.get(rt.id);
+        if (agg && agg.count > 0) {
+          count += agg.count;
+          weighted += agg.average * agg.count;
+        }
+      }
+      byHotel.set(h.id, {
+        count,
+        average: count > 0 ? Math.round((weighted / count) * 10) / 10 : 0,
+      });
+    }
+    return byHotel;
   }
 
   async createHotel(body: CreateHotelBody) {
@@ -192,13 +227,15 @@ export class ProductsService {
       where: activeOnly ? { isActive: true } : undefined,
       orderBy: { createdAt: 'asc' },
     });
-    return rows.map(serializeTransfer);
+    const ratings = await this.reviews.getAggregates(ProductReviewType.TRANSFER, rows.map((r) => r.id));
+    return rows.map((t) => serializeTransfer(t, ratings.get(t.id) ?? ZERO_RATING));
   }
 
   async getTransfer(id: string) {
     const t = await prisma.transfer.findUnique({ where: { id } });
     if (!t) throw new NotFoundError('接送产品不存在');
-    return serializeTransfer(t);
+    const ratings = await this.reviews.getAggregates(ProductReviewType.TRANSFER, [id]);
+    return serializeTransfer(t, ratings.get(id) ?? ZERO_RATING);
   }
 
   async createTransfer(body: CreateTransferBody) {
@@ -258,13 +295,15 @@ export class ProductsService {
       where: activeOnly ? { isActive: true } : undefined,
       orderBy: { createdAt: 'asc' },
     });
-    return rows.map(serializeVisa);
+    const ratings = await this.reviews.getAggregates(ProductReviewType.VISA, rows.map((r) => r.id));
+    return rows.map((v) => serializeVisa(v, ratings.get(v.id) ?? ZERO_RATING));
   }
 
   async getVisa(id: string) {
     const v = await prisma.visa.findUnique({ where: { id } });
     if (!v) throw new NotFoundError('签证产品不存在');
-    return serializeVisa(v);
+    const ratings = await this.reviews.getAggregates(ProductReviewType.VISA, [id]);
+    return serializeVisa(v, ratings.get(id) ?? ZERO_RATING);
   }
 
   async createVisa(body: CreateVisaBody) {
@@ -327,7 +366,8 @@ export class ProductsService {
       orderBy: { createdAt: 'asc' },
       include: BUNDLE_ROOM_INCLUDE,
     });
-    return rows.map(serializeBundle);
+    const ratings = await this.reviews.getAggregates(ProductReviewType.BUNDLE, rows.map((r) => r.id));
+    return rows.map((b) => serializeBundle(b, ratings.get(b.id) ?? ZERO_RATING));
   }
 
   async getBundle(id: string) {
@@ -336,7 +376,8 @@ export class ProductsService {
       include: BUNDLE_ROOM_INCLUDE,
     });
     if (!b) throw new NotFoundError('套餐不存在');
-    return serializeBundle(b);
+    const ratings = await this.reviews.getAggregates(ProductReviewType.BUNDLE, [id]);
+    return serializeBundle(b, ratings.get(id) ?? ZERO_RATING);
   }
 
   async createBundle(body: CreateBundleBody) {
@@ -427,11 +468,18 @@ export class ProductsService {
 // ── Serializers ─────────────────────────────────────────────────────
 type HotelWithRooms = Prisma.HotelGetPayload<{ include: { roomTypes: true } }>;
 
-function serializeHotel(h: HotelWithRooms) {
+// D3：所有产品对外统一暴露 rating: { average, count }（来自 Review 真实聚合）
+// + soldCount（seed 填充）。reviewCount 用聚合 count 覆盖（有评价时），
+// 老的 hotel.rating(Decimal) 改名 ratingLegacy 兼容旧前端兜底。
+function serializeHotel(h: HotelWithRooms, rating: ProductRatingAggregate = ZERO_RATING) {
+  const { rating: legacyRating, reviewCount, ...rest } = h;
   return {
-    ...h,
+    ...rest,
     basePrice: h.basePrice?.toString() ?? null,
-    rating: h.rating?.toString() ?? null,
+    ratingLegacy: legacyRating?.toString() ?? null,
+    rating, // { average, count } —— 真实评价聚合
+    reviewCount: rating.count > 0 ? rating.count : (reviewCount ?? 0),
+    soldCount: h.soldCount,
     latitude: h.latitude?.toString() ?? null,
     longitude: h.longitude?.toString() ?? null,
     roomTypes: h.roomTypes.map((rt) => ({
@@ -443,24 +491,36 @@ function serializeHotel(h: HotelWithRooms) {
   };
 }
 
-function serializeTransfer(t: Prisma.TransferGetPayload<Record<string, never>>) {
+function serializeTransfer(
+  t: Prisma.TransferGetPayload<Record<string, never>>,
+  rating: ProductRatingAggregate = ZERO_RATING,
+) {
   return {
     ...t,
     basePrice: t.basePrice.toString(),
     costPriceCny: t.costPriceCny?.toString() ?? null,
+    rating,
+    reviewCount: rating.count,
+    soldCount: t.soldCount,
   };
 }
 
-function serializeVisa(v: Prisma.VisaGetPayload<Record<string, never>>) {
+function serializeVisa(
+  v: Prisma.VisaGetPayload<Record<string, never>>,
+  rating: ProductRatingAggregate = ZERO_RATING,
+) {
   return {
     ...v,
     basePrice: v.basePrice.toString(),
     expressSurcharge: v.expressSurcharge?.toString() ?? null,
     costPriceCny: v.costPriceCny?.toString() ?? null,
+    rating,
+    reviewCount: rating.count,
+    soldCount: v.soldCount,
   };
 }
 
-function serializeBundle(b: BundleWithRoom) {
+function serializeBundle(b: BundleWithRoom, rating: ProductRatingAggregate = ZERO_RATING) {
   const { hotelRoomType, ...rest } = b;
   return {
     ...rest,
@@ -469,6 +529,9 @@ function serializeBundle(b: BundleWithRoom) {
     singleSupplementCnyPerNight: b.singleSupplementCnyPerNight?.toString() ?? null,
     cabinUpgradeCnyPerLeg: b.cabinUpgradeCnyPerLeg?.toString() ?? null,
     items: b.items,
+    rating,
+    reviewCount: rating.count,
+    soldCount: b.soldCount,
     // admin-web 表单需要房型名 + 酒店名做展示
     hotelRoomType: hotelRoomType
       ? { id: hotelRoomType.id, name: hotelRoomType.name, hotelName: hotelRoomType.hotel.name }

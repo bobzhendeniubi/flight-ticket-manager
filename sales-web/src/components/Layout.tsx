@@ -1,12 +1,20 @@
-import { useEffect, useState } from 'react';
+import { Suspense, lazy, useEffect, useState } from 'react';
+import type { FormEvent } from 'react';
 import { Link, NavLink, Outlet, useNavigate, useSearchParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../stores/auth';
 import { useCart } from '../stores/cart';
+import { useLanguage, SUPPORTED_LANGUAGES, type SupportedLanguage } from '../i18n';
 import { MobilePreviewFrame } from './MobilePreviewFrame';
 import { MobileBottomBar } from './MobileBottomBar';
-import { AiAssistant } from './AiAssistant';
 import { Icon } from './Icon';
+
+// 浮动 AI 助手懒加载（G1 性能）：AiAssistant 体量大（~40KB），不该进首屏 bundle。
+// React.lazy + Suspense(fallback=null) 让它在外壳挂载后异步拉取 —— 行为与之前完全一致
+// （仍渲染同一个浮动入口），只是把它从初始 chunk 里挪走，缩小首屏 JS。
+const AiAssistant = lazy(() =>
+  import('./AiAssistant').then((m) => ({ default: m.AiAssistant })),
+);
 
 const ROLE_LABEL: Record<string, string> = {
   CUSTOMER: '客户',
@@ -116,8 +124,13 @@ export function Layout() {
             )}
           </nav>
 
-          {/* 右侧用户菜单：手机端只保留购物车，其他进汉堡 */}
+          {/* 桌面端：全局搜索（C2）—— 一框直达 /search?q= */}
+          <GlobalSearch className="hidden lg:flex" />
+
+          {/* 右侧用户菜单：手机端只保留搜索图标 + 购物车，其他进汉堡 */}
           <nav className="flex items-center gap-2 md:gap-2.5 text-sm">
+            {/* 手机端 / 中屏：搜索改为图标，点开展开成搜索条（C2 紧凑形态） */}
+            <MobileSearchToggle />
             <a
               href="/?preview=mobile"
               className="chip hidden md:inline-flex items-center gap-1.5 transition-colors hover:bg-brand-50 hover:text-brand-700"
@@ -126,6 +139,8 @@ export function Layout() {
               <Icon name="phone" className="h-3.5 w-3.5" />
               {t('nav.miniprogramPreview')}
             </a>
+            {/* 桌面端：语言切换（zh 默认） */}
+            <LanguageSwitch className="hidden md:flex" />
             <CartButton />
             {/* 桌面端：完整用户区 */}
             {user ? (
@@ -194,6 +209,11 @@ export function Layout() {
                 </button>
               </div>
               <div className="flex-1 overflow-y-auto px-2 py-3">
+                {/* 抽屉内全局搜索（C2 手机端形态） */}
+                <div className="px-1 pb-2">
+                  <GlobalSearch onSubmitted={closeMenu} />
+                </div>
+
                 {/* 主导航 */}
                 {frontNav.map((n) => (
                   <NavLink
@@ -216,6 +236,24 @@ export function Layout() {
                     </NavLink>
                   </>
                 )}
+
+                <div className="my-2.5 border-t border-ink/10" />
+
+                {/* 服务入口：查订单 / 帮助（非会员也常用） */}
+                <Link to="/lookup" onClick={closeMenu} className="flex items-center gap-2 rounded-xl px-3 py-2.5 text-sm font-medium text-ink-soft transition-colors hover:bg-brand-50/60 hover:text-brand-700">
+                  <Icon name="search" className="h-4 w-4 text-ink-muted" />
+                  查订单
+                </Link>
+                <Link to="/help" onClick={closeMenu} className="flex items-center gap-2 rounded-xl px-3 py-2.5 text-sm font-medium text-ink-soft transition-colors hover:bg-brand-50/60 hover:text-brand-700">
+                  <Icon name="support" className="h-4 w-4 text-ink-muted" />
+                  帮助中心
+                </Link>
+
+                {/* 语言切换（zh 默认） */}
+                <div className="px-3 pt-2 pb-1">
+                  <span className="mb-1.5 block text-xs font-semibold text-ink-muted">{t('language.label')}</span>
+                  <LanguageSwitch />
+                </div>
 
                 <div className="my-2.5 border-t border-ink/10" />
 
@@ -281,25 +319,252 @@ export function Layout() {
         </div>
       </main>
 
-      <footer className="border-t border-slate-200/70 bg-surface text-xs text-ink-muted">
-        <div className="mx-auto flex max-w-7xl flex-col items-start gap-1 px-4 py-5 pb-20 sm:flex-row sm:items-center sm:justify-between md:pb-5">
-          <span className="flex items-center gap-1.5 font-semibold text-ink-soft">
-            <Icon name="plane" className="h-4 w-4 text-brand-600" />
-            世途旅行
-          </span>
-          <span>海岛专线 · 一站式预订 · M2-M5 演示版 · © {new Date().getFullYear()}</span>
-        </div>
-      </footer>
+      <SiteFooter />
 
       {/* 手机端底部导航：首页 / 套餐 / 购物车（带数量）/ 我的 */}
       <MobileBottomBar />
 
       <AddToCartToast />
 
-      {/* 浮动 AI 助手 — 任何角色都看得到（admin 也能测试 demo）；
-          下单时才跳登录 */}
-      <AiAssistant />
+      {/* 浮动 AI 助手 — 任何角色都看得到（admin 也能测试 demo）；下单时才跳登录。
+          懒加载：fallback=null，加载完成前不占位（浮动入口出现得略晚，可接受）。 */}
+      <Suspense fallback={null}>
+        <AiAssistant />
+      </Suspense>
     </div>
+  );
+}
+
+/** 全局搜索框（C2）— 提交后跳 /search?q=<encoded>。
+ *  桌面端 inline 用在顶栏；手机端用在抽屉里（onSubmitted 关抽屉）。 */
+function GlobalSearch({
+  className,
+  onSubmitted,
+}: {
+  className?: string;
+  onSubmitted?: () => void;
+}) {
+  const { t } = useTranslation();
+  const navigate = useNavigate();
+  const [q, setQ] = useState('');
+
+  const onSubmit = (e: FormEvent) => {
+    e.preventDefault();
+    const keyword = q.trim();
+    if (!keyword) return;
+    navigate(`/search?q=${encodeURIComponent(keyword)}`);
+    setQ('');
+    onSubmitted?.();
+  };
+
+  return (
+    <form
+      role="search"
+      onSubmit={onSubmit}
+      className={`relative items-center ${className ?? 'flex'}`}
+    >
+      <Icon
+        name="search"
+        className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-ink-muted"
+      />
+      <input
+        type="search"
+        value={q}
+        onChange={(e) => setQ(e.target.value)}
+        placeholder="搜套餐 / 机票 / 酒店 / 目的地"
+        aria-label={t('common.search')}
+        className="input w-full py-2 pl-9 pr-3 lg:w-64"
+        enterKeyHint="search"
+      />
+    </form>
+  );
+}
+
+/** 手机 / 中屏：搜索图标 → 点开展开成顶栏下方的搜索条（C2 紧凑形态）。 */
+function MobileSearchToggle() {
+  const { t } = useTranslation();
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <button
+        type="button"
+        className="lg:hidden flex h-9 w-9 items-center justify-center rounded-xl border border-ink/10 bg-white/70 text-ink-soft shadow-card transition-all duration-200 hover:border-brand/40 hover:bg-brand-50/60 hover:text-brand-700 active:scale-95"
+        onClick={() => setOpen((v) => !v)}
+        aria-label={t('common.search')}
+        aria-expanded={open}
+      >
+        <Icon name="search" className="h-5 w-5" />
+      </button>
+      {open && (
+        <div className="lg:hidden absolute inset-x-0 top-full z-40 border-b border-slate-200/70 bg-surface/95 px-3 py-2.5 shadow-card backdrop-blur-xl animate-fade-in">
+          <GlobalSearch onSubmitted={() => setOpen(false)} />
+        </div>
+      )}
+    </>
+  );
+}
+
+/** 语言切换（zh/en/vi）— 用 useLanguage()，zh 为默认。
+ *  小巧分段控件，避免新增依赖；切换即时持久化到 localStorage（i18n 内部处理）。 */
+function LanguageSwitch({ className }: { className?: string }) {
+  const { language, setLanguage } = useLanguage();
+  const { t } = useTranslation();
+  return (
+    <div
+      role="group"
+      aria-label={t('language.label')}
+      className={`items-center gap-0.5 rounded-xl border border-slate-200 bg-white/70 p-0.5 text-xs ${className ?? 'flex'}`}
+    >
+      {SUPPORTED_LANGUAGES.map((lng: SupportedLanguage) => {
+        const active = language === lng;
+        const short = lng === 'zh-CN' ? '中' : lng === 'en' ? 'EN' : 'VI';
+        return (
+          <button
+            key={lng}
+            type="button"
+            onClick={() => setLanguage(lng)}
+            aria-pressed={active}
+            title={t(`language.${lng}`)}
+            className={`rounded-lg px-2 py-1 font-semibold transition-colors ${
+              active
+                ? 'bg-brand-50 text-brand-700 shadow-sm'
+                : 'text-ink-muted hover:bg-brand-50/60 hover:text-brand-700'
+            }`}
+          >
+            {short}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+/** 多列页脚（E1）— 关于世途 / 帮助支持 / 法律条款 / 联系我们 + 品牌简介 + 社交 + 底部法律行。
+ *  链接全用 react-router <Link>；手机端列堆叠，并留出底部导航高度（pb-24）。 */
+function SiteFooter() {
+  const year = new Date().getFullYear();
+
+  // 占位公司信息：真实主体名称与 ICP 备案号待法务/运营补全 —— 这里明确标注 placeholder。
+  const COMPANY_NAME = '世途旅行（Citur Travel）'; // 工商主体名称待确认（placeholder）
+  const ICP = 'ICP 备案号：待补（placeholder）';
+
+  const columns: Array<{
+    title: string;
+    links: Array<{ label: string; to: string }>;
+  }> = [
+    {
+      title: '关于世途',
+      links: [
+        { label: '关于我们', to: '/about' },
+        { label: '为什么选我们', to: '/about' },
+        { label: '海岛套餐', to: '/' },
+        { label: '机票', to: '/flights' },
+      ],
+    },
+    {
+      title: '帮助支持',
+      links: [
+        { label: '帮助中心', to: '/help' },
+        { label: '查询订单', to: '/lookup' },
+        { label: '我的订单', to: '/orders' },
+        { label: '购物车', to: '/cart' },
+      ],
+    },
+    {
+      title: '产品服务',
+      links: [
+        { label: '酒店', to: '/hotels' },
+        { label: '接送机', to: '/transfers' },
+        { label: '签证', to: '/visas' },
+        { label: '套餐', to: '/' },
+      ],
+    },
+    {
+      title: '联系我们',
+      links: [
+        { label: '联系方式', to: '/contact' },
+        { label: '在线咨询', to: '/contact' },
+        { label: '帮助中心', to: '/help' },
+        { label: '查询订单', to: '/lookup' },
+      ],
+    },
+  ];
+
+  return (
+    <footer className="border-t border-slate-200/70 bg-surface text-sm text-ink-soft">
+      <div className="mx-auto max-w-7xl px-4 py-10">
+        <div className="grid gap-8 md:grid-cols-12">
+          {/* 品牌简介 + 社交 */}
+          <div className="md:col-span-4">
+            <Link to="/" className="inline-flex items-center gap-2.5" aria-label="世途旅行">
+              <span
+                aria-hidden
+                className="flex h-9 w-9 items-center justify-center rounded-2xl text-white shadow-card"
+                style={{ backgroundImage: 'linear-gradient(135deg, #2fb6cb 0%, #0e8aa0 60%, #0a6e80 100%)' }}
+              >
+                <Icon name="plane" className="h-5 w-5" />
+              </span>
+              <span className="flex flex-col leading-none">
+                <span className="text-base font-extrabold tracking-tight text-ink">世途旅行</span>
+                <span className="mt-0.5 text-[11px] font-medium text-ink-muted">Citur Travel</span>
+              </span>
+            </Link>
+            <p className="mt-4 max-w-xs text-sm leading-relaxed text-ink-soft">
+              澳门⇌岘港海岛专线，机票 + 酒店 + 签证 + 接送一价全包。中文客服全程在线，让海岛度假省心又省钱。
+            </p>
+            <div className="mt-4 flex flex-wrap gap-2">
+              <span className="badge-soft">
+                <Icon name="shield" className="h-3.5 w-3.5" />
+                正规旅行社
+              </span>
+              <span className="badge-soft">
+                <Icon name="support" className="h-3.5 w-3.5" />
+                7×12 客服
+              </span>
+            </div>
+          </div>
+
+          {/* 链接列 */}
+          <nav aria-label="页脚导航" className="md:col-span-8">
+            <div className="grid grid-cols-2 gap-8 sm:grid-cols-4">
+              {columns.map((col) => (
+                <div key={col.title}>
+                  <h3 className="text-sm font-bold text-ink">{col.title}</h3>
+                  <ul className="mt-3 space-y-2.5">
+                    {col.links.map((link, idx) => (
+                      <li key={`${link.label}-${idx}`}>
+                        <Link
+                          to={link.to}
+                          className="text-sm text-ink-soft transition-colors hover:text-brand-700 hover:underline"
+                        >
+                          {link.label}
+                        </Link>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ))}
+            </div>
+          </nav>
+        </div>
+
+        {/* 底部法律行 — 公司名称占位 + ICP 占位 + © */}
+        <div className="mt-10 flex flex-col gap-2 border-t border-slate-200/70 pt-6 text-xs text-ink-muted sm:flex-row sm:items-center sm:justify-between">
+          <span>
+            © {year} {COMPANY_NAME} · 保留所有权利
+          </span>
+          <span className="flex flex-wrap items-center gap-x-3 gap-y-1">
+            <span>{ICP}</span>
+            <span aria-hidden className="hidden sm:inline text-ink/20">·</span>
+            <Link to="/help" className="transition-colors hover:text-brand-700">服务条款（待补）</Link>
+            <Link to="/help" className="transition-colors hover:text-brand-700">隐私政策（待补）</Link>
+          </span>
+        </div>
+      </div>
+
+      {/* 手机端底部导航占位高度，避免最后一行被 bottom bar 挡住 */}
+      <div className="h-20 md:hidden" aria-hidden />
+    </footer>
   );
 }
 

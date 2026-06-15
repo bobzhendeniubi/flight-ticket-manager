@@ -17,11 +17,22 @@ import {
   PaymentMethod,
   PaymentStatus,
   DocumentType,
+  ProductReviewType,
   Prisma,
 } from '@prisma/client';
 import argon2 from 'argon2';
 
 const prisma = new PrismaClient();
+
+/** 随机整数 [min, max]（含两端）。seed 展示数据用，无需密码学随机。 */
+function randInt(min: number, max: number): number {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
+}
+
+/** 从数组里随机取一个元素。 */
+function pick<T>(arr: readonly T[]): T {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
 
 // 航班配置：时间都用「出发地本地」表达，下面会按 IANA tz 折算到 UTC。
 const FLIGHT_SEED = [
@@ -321,6 +332,9 @@ async function main() {
   // ── Demo 订单（演示后台用：6 条不同状态的样例订单）──
   await seedDemoOrders(customer.id);
 
+  // ── 上线编造评价（每产品 6~12 条 zh-CN 评价 + 航线评价）──
+  await seedReviews();
+
   // ── 清理不在列表里的历史航班（只在没有订单关联时） ──
   const keepFlightNumbers = FLIGHT_SEED.map((f) => f.flightNumber);
   const toRemove = await prisma.flight.findMany({
@@ -541,12 +555,13 @@ async function seedHotels() {
       basePrice: h.basePrice * rt.mult,
       priceMultiplier: rt.mult,
     }));
+    const soldCount = randInt(120, 980); // 已售份数（展示用）
     if (existing) {
       await prisma.hotel.update({
         where: { id: existing.id },
         data: {
           nameEn: h.nameEn, area: h.area, address: h.address, starRating: h.stars,
-          basePrice: h.basePrice, rating: h.rating, reviewCount: h.reviewCount,
+          basePrice: h.basePrice, rating: h.rating, reviewCount: h.reviewCount, soldCount,
           emoji: h.emoji, photos: [h.photo], amenities: h.amenities, highlight: h.highlight, isActive: true,
         },
       });
@@ -559,7 +574,7 @@ async function seedHotels() {
       await prisma.hotel.create({
         data: {
           name: h.name, nameEn: h.nameEn, cityCode: h.cityCode, area: h.area, address: h.address,
-          starRating: h.stars, basePrice: h.basePrice, rating: h.rating, reviewCount: h.reviewCount,
+          starRating: h.stars, basePrice: h.basePrice, rating: h.rating, reviewCount: h.reviewCount, soldCount,
           emoji: h.emoji, photos: [h.photo], amenities: h.amenities, highlight: h.highlight, isActive: true,
           roomTypes: { create: rooms },
         },
@@ -579,11 +594,12 @@ async function seedTransfers() {
   ];
 
   for (const t of TRANSFERS) {
+    const soldCount = randInt(80, 640);
     const existing = await prisma.transfer.findFirst({ where: { name: t.name } });
     if (existing) {
-      await prisma.transfer.update({ where: { id: existing.id }, data: { ...t, basePrice: t.basePrice, isActive: true } });
+      await prisma.transfer.update({ where: { id: existing.id }, data: { ...t, basePrice: t.basePrice, soldCount, isActive: true } });
     } else {
-      await prisma.transfer.create({ data: { ...t, isActive: true } });
+      await prisma.transfer.create({ data: { ...t, soldCount, isActive: true } });
     }
   }
 }
@@ -599,13 +615,14 @@ async function seedVisas() {
   ];
 
   for (const v of VISAS) {
+    const soldCount = randInt(150, 1200);
     const existing = await prisma.visa.findFirst({
       where: { destinationCountry: v.destinationCountry, visaType: v.visaType },
     });
     if (existing) {
-      await prisma.visa.update({ where: { id: existing.id }, data: { ...v, isActive: true } });
+      await prisma.visa.update({ where: { id: existing.id }, data: { ...v, soldCount, isActive: true } });
     } else {
-      await prisma.visa.create({ data: { ...v, isActive: true } });
+      await prisma.visa.create({ data: { ...v, soldCount, isActive: true } });
     }
   }
 }
@@ -660,14 +677,15 @@ async function seedBundles() {
   ];
 
   for (const b of BUNDLES) {
+    const soldCount = randInt(60, 520);
     const existing = await prisma.bundle.findFirst({ where: { name: b.name } });
     if (existing) {
       await prisma.bundle.update({
         where: { id: existing.id },
-        data: { ...b, items: b.items, isActive: true },
+        data: { ...b, items: b.items, soldCount, isActive: true },
       });
     } else {
-      await prisma.bundle.create({ data: { ...b, items: b.items, isActive: true } });
+      await prisma.bundle.create({ data: { ...b, items: b.items, soldCount, isActive: true } });
     }
   }
 }
@@ -753,6 +771,142 @@ async function seedCancellationPolicies() {
     });
   }
 }
+
+// ════════════════════════════════════════════════════════════════════════
+// SEED: fabricated launch reviews — replace with real ones
+// ────────────────────────────────────────────────────────────────────────
+// 上线冷启动用的「编造」评价：澳门⇌岘港海岛游主题、zh-CN、4~5 星为主偶尔 3 星，
+// 作者名脱敏（王**/陈*/L** 等），createdAt 散布在最近 ~6 个月，tripType 混合。
+// 每个 BUNDLE/HOTEL/TRANSFER/VISA 产品各 6~12 条；几条航线评价。
+// 删除方式：整段（本注释到下方对应 END 标记）连同 seedReviews() 调用一并删除即可。
+// ════════════════════════════════════════════════════════════════════════
+
+// 脱敏作者名池（姓打码，保留名/首字母风格）
+const FAKE_AUTHORS = [
+  '王**', '陈*', '李**', '张*', '刘**', '黄*', '吴**', '周*', '徐**', '林*',
+  'L**', 'W**', 'Z**', 'C**', '赵*', '孙**', '马*', '朱**', '胡*', '郭**',
+] as const;
+
+const TRIP_TYPES = ['家庭', '情侣', '朋友', '商务'] as const;
+
+// 各品类评价正文池（真实口吻，围绕澳门⇌岘港海岛游）
+const REVIEW_BODIES: Record<ProductReviewType, readonly { title?: string; body: string }[]> = {
+  BUNDLE: [
+    { title: '省心又划算', body: '机票酒店接送一次搞定，比自己单订便宜不少，全程不用操心，岘港海景真的绝。' },
+    { title: '蜜月首选', body: '套餐里洲际半岛太惊艳了，日落海景配米其林晚餐，客服安排得很周到，强烈推荐。' },
+    { body: '一家四口出行，凯悦套餐性价比高，亲子设施齐全，接送司机准时还会说中文。' },
+    { body: '套餐价格透明没有隐形消费，行程紧凑但很顺，巴拿山佛手桥那天玩得很尽兴。' },
+    { body: '第二次买他们家套餐了，签证机票酒店全包，省去自己研究的时间，老客户认证。' },
+    { body: '整体满意，唯一小遗憾是回程航班偏早，但套餐本身很超值，会再来。' },
+    { body: '朋友几个人拼的套餐，分房安排很合理，客服沟通响应快，玩得很开心。' },
+    { title: '商务出行也合适', body: '商务舱+市区公寓的快闪套餐很适合短差，落地签批文办得很快，效率高。' },
+    { body: '海景房升级加了点钱很值，套餐含的接送省了打车的麻烦，下次还选这家。' },
+    { body: '岘港的海太干净了，套餐安排的会安一日游也很有味道，灯笼夜景拍照很美。' },
+  ],
+  HOTEL: [
+    { title: '海景无敌', body: '房间正对大海，早上拉开窗帘就是无边泳池和海平线，服务也很贴心。' },
+    { body: '床很舒服，自助早餐种类多，离海滩很近，性价比在五星里算高的。' },
+    { title: '设施很新', body: '泳池干净，健身房设备齐全，前台有会中文的同事，沟通无障碍。' },
+    { body: '位置很好，去市区和海滩都方便，房间隔音不错，睡得很安稳。' },
+    { body: '带孩子住的家庭房很宽敞，儿童俱乐部小朋友玩得不想走，会再来。' },
+    { body: '度假村环境一流，绿化好空气清新，唯一就是餐厅价格略高，可以出去吃。' },
+    { title: '性价比之选', body: '虽然不是顶奢但干净舒适，海滩私密度高，这个价格很满意。' },
+    { body: 'SPA 体验很棒，按摩师手法专业，泡完池子再来一场，整个人都放松了。' },
+    { body: '房间打扫及时，毛巾每天换，细节到位，下次去岘港还住这里。' },
+  ],
+  TRANSFER: [
+    { title: '司机准时', body: '航班落地就看到举牌的司机，全程开车很稳，还帮忙搬行李，体验好。' },
+    { body: '中文司机沟通顺畅，路上还介绍了几个当地吃饭的地方，很热情。' },
+    { body: '车很干净有矿泉水，儿童安全座椅也提前备好了，带娃出行放心。' },
+    { title: '包车很值', body: '巴拿山一日包车，司机等了我们一整天毫无怨言，行程自由度高。' },
+    { body: '7 座商务车空间大，一家人加行李完全够，价格也比打表便宜。' },
+    { body: '去会安古城的专车很准时，中途还停美溪海滩让我们拍照，加分。' },
+    { body: '深夜航班也安排到了接机，司机一直在等，很负责，推荐。' },
+    { body: '顺化一日游包车体验不错，海云岭观景台风景太美了，司机很会找角度。' },
+  ],
+  VISA: [
+    { title: '出签很快', body: '资料交上去三天就出签了，全程线上不用跑，比想象中省心太多。' },
+    { body: '客服很耐心，照片不合格还提醒我重拍，最后顺利拿到电子签。' },
+    { body: '加急服务很给力，临出发前两天才办，居然也赶上了，救命。' },
+    { title: '省心代办', body: '第一次办越南签证，跟着指引一步步来，没踩坑，已推荐给同事。' },
+    { body: '价格透明，出签邮件直接发到邮箱，打印带着就能过关，方便。' },
+    { body: '90 天多次往返签很适合我经常出差，办理流程清晰，效率高。' },
+    { body: '落地签批文当天就发来了，临时决定的行程也不慌，靠谱。' },
+  ],
+  FLIGHT: [
+    { title: '准点舒适', body: '澳门飞岘港很准时，机舱干净，乘务态度好，一个多小时就到了。' },
+    { body: '直飞省时间，行李额度够用，整体体验不错，回程也顺利。' },
+    { body: '经济舱座位间距还可以，短途航线性价比高，会再选。' },
+    { body: '值机顺畅，起降平稳，澳门⇌岘港这条线很方便周末出游。' },
+    { body: '航班整体满意，就是出发那天稍微延误了十几分钟，可以接受。' },
+  ],
+};
+
+async function seedReviews() {
+  const sixMonthsMs = 1000 * 60 * 60 * 24 * 30 * 6;
+  const now = Date.now();
+  const randCreatedAt = () => new Date(now - randInt(0, sixMonthsMs));
+  // 4~5 星为主，偶尔 3 星（权重池）
+  const ratingPool = [5, 5, 5, 5, 5, 4, 4, 4, 4, 3] as const;
+
+  type ReviewSeed = { productType: ProductReviewType; productId: string };
+
+  // 收集所有产品的 (type, productId)
+  const targets: ReviewSeed[] = [];
+  // BUNDLE / TRANSFER / VISA：productId = 自身 id
+  const [bundles, transfers, visas] = await Promise.all([
+    prisma.bundle.findMany({ select: { id: true } }),
+    prisma.transfer.findMany({ select: { id: true } }),
+    prisma.visa.findMany({ select: { id: true } }),
+  ]);
+  bundles.forEach((b) => targets.push({ productType: ProductReviewType.BUNDLE, productId: b.id }));
+  transfers.forEach((t) => targets.push({ productType: ProductReviewType.TRANSFER, productId: t.id }));
+  visas.forEach((v) => targets.push({ productType: ProductReviewType.VISA, productId: v.id }));
+  // HOTEL：productId = hotelRoomType.id（与 products.service 聚合口径一致）
+  const roomTypes = await prisma.hotelRoomType.findMany({ select: { id: true } });
+  roomTypes.forEach((rt) => targets.push({ productType: ProductReviewType.HOTEL, productId: rt.id }));
+  // FLIGHT：productId = flightSchedule.id（几条航线评价，取前若干班次）
+  const schedules = await prisma.flightSchedule.findMany({ select: { id: true }, take: 6 });
+  schedules.forEach((s) => targets.push({ productType: ProductReviewType.FLIGHT, productId: s.id }));
+
+  // 幂等：已存在该 (type, productId) 的评价就跳过，避免重复 seed 暴涨
+  let created = 0;
+  let skipped = 0;
+  for (const t of targets) {
+    const existing = await prisma.review.count({
+      where: { productType: t.productType, productId: t.productId },
+    });
+    if (existing > 0) {
+      skipped++;
+      continue;
+    }
+    const pool = REVIEW_BODIES[t.productType];
+    const n = randInt(6, Math.min(12, pool.length));
+    // 不重复取 n 条正文（pool 不足则允许重复）
+    const shuffled = [...pool].sort(() => Math.random() - 0.5);
+    const rows = Array.from({ length: n }, (_, i) => {
+      const content = shuffled[i % shuffled.length];
+      return {
+        productType: t.productType,
+        productId: t.productId,
+        rating: pick(ratingPool),
+        title: content.title ?? null,
+        body: content.body,
+        authorName: pick(FAKE_AUTHORS),
+        verified: Math.random() < 0.8, // 多数标记为来自真实订单
+        tripType: pick(TRIP_TYPES),
+        createdAt: randCreatedAt(),
+      };
+    });
+    await prisma.review.createMany({ data: rows });
+    created += rows.length;
+  }
+  // eslint-disable-next-line no-console
+  console.log(`  …评价（编造）：新增 ${created} 条，跳过 ${skipped} 个已有产品`);
+}
+// ════════════════════════════════════════════════════════════════════════
+// END SEED: fabricated launch reviews
+// ════════════════════════════════════════════════════════════════════════
 
 // ════════════════════════════════════════════════════════════════════
 // Demo 订单 seed（让客服后台一打开就有数据）

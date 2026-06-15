@@ -410,7 +410,8 @@ function orderToFullRows(order: OrderForTemplateExport, ctx: OrderContext): Omit
     expiryDate: fmtDate(p.passportExpiry),
     infantWith: '',
     recordedAt: fmtDateTime(order.createdAt),
-    recordedBy: order.user.displayName ?? order.user.email ?? '',
+    // 游客单 user=null：回退到游客联系人姓名
+    recordedBy: order.user?.displayName ?? order.user?.email ?? order.guestName ?? '',
   }));
 }
 

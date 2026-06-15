@@ -1,14 +1,21 @@
 import { useEffect, useMemo, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
-import { type MockHotel } from '../lib/mockData';
+import { useNavigate, useSearchParams } from 'react-router-dom';
 import { api, type Hotel } from '../lib/api';
 import { useCart } from '../stores/cart';
 import { Icon } from '../components/Icon';
+import { Img } from '../components/Img';
+import { SortSelect, type SortOption } from '../components/SortSelect';
+import { StarRating } from '../components/StarRating';
+import { RefundBadge } from '../components/RefundBadge';
+import { ListSkeleton } from '../components/LoadingSkeleton';
+import { ErrorRetry } from '../components/ErrorRetry';
+import { EmptyState } from '../components/EmptyState';
+import { Seo } from '../components/Seo';
 
-/** 星级 → 实心星图标行（取代 '★'.repeat 文本，统一图标观感） */
-function StarRow({ count, className }: { count: number; className?: string }) {
+/** 酒店星级 → 实心星图标行（与「点评评分」的金星刻意区分：这是建筑挂牌星级）。 */
+function HotelClassStars({ count, className }: { count: number; className?: string }) {
   return (
-    <span className={`inline-flex items-center ${className ?? ''}`}>
+    <span className={`inline-flex items-center ${className ?? ''}`} aria-label={`${count} 星级酒店`}>
       {Array.from({ length: count }).map((_, i) => (
         <Icon key={i} name="star" className="h-3 w-3" />
       ))}
@@ -16,18 +23,20 @@ function StarRow({ count, className }: { count: number; className?: string }) {
   );
 }
 
-function hotelApiToMock(h: Hotel): MockHotel {
-  return {
-    id: h.id, name: h.name, nameEn: h.nameEn ?? h.name, cityCode: h.cityCode,
-    area: h.area ?? h.address, stars: (h.starRating as 3 | 4 | 5),
-    basePrice: Number(h.basePrice ?? 0), rating: h.rating ? Number(h.rating) : 4.5,
-    reviewCount: h.reviewCount ?? 0, emoji: h.emoji ?? '🏨',
-    photo: h.photos[0] ?? '', amenities: h.amenities, highlight: h.highlight ?? '',
-    roomTypes: h.roomTypes.map((rt) => ({
-      name: rt.name, priceMult: rt.priceMultiplier ? Number(rt.priceMultiplier) : 1,
-      sleeps: rt.capacity, bedType: rt.bedType ?? '',
-    })),
-  };
+/** 列表排序口径（对标 Klook/携程）。值会写入 URL（?sort=）。 */
+const SORT_OPTIONS: SortOption[] = [
+  { value: 'recommended', label: '推荐排序' },
+  { value: 'price_asc', label: '价格从低到高' },
+  { value: 'price_desc', label: '价格从高到低' },
+  { value: 'rating', label: '好评优先' },
+  { value: 'sold', label: '热度优先' },
+];
+const SORT_VALUES = new Set(SORT_OPTIONS.map((o) => o.value));
+
+type LoadState = 'loading' | 'error' | 'ready';
+
+function basePriceNum(h: Hotel): number {
+  return Number(h.basePrice ?? 0);
 }
 
 function todayISO(offsetDays = 0) {
@@ -37,38 +46,130 @@ function todayISO(offsetDays = 0) {
 }
 
 export function HotelsPage() {
-  const [hotels, setHotels] = useState<MockHotel[]>([]);
+  const [hotels, setHotels] = useState<Hotel[]>([]);
+  const [load, setLoad] = useState<LoadState>('loading');
   const [city, setCity] = useState('');
   const [stars, setStars] = useState<'' | '3' | '4' | '5'>('');
   const [maxPrice, setMaxPrice] = useState(4000);
   const [checkIn, setCheckIn] = useState(todayISO(3));
   const [checkOut, setCheckOut] = useState(todayISO(5));
-  const [selected, setSelected] = useState<MockHotel | null>(null);
+  const [amenityFilter, setAmenityFilter] = useState<string[]>([]);
+  const [reloadKey, setReloadKey] = useState(0);
   const add = useCart((s) => s.add);
   const navigate = useNavigate();
 
+  // 排序持久化到 URL（?sort=），刷新/分享保留口径
+  const [searchParams, setSearchParams] = useSearchParams();
+  const sortParam = searchParams.get('sort') ?? '';
+  const sort = SORT_VALUES.has(sortParam) ? sortParam : 'recommended';
+  const setSort = (value: string) => {
+    const next = new URLSearchParams(searchParams);
+    if (value === 'recommended') next.delete('sort');
+    else next.set('sort', value);
+    setSearchParams(next, { replace: true });
+  };
+
   useEffect(() => {
     let cancelled = false;
-    api.listHotels().then((r) => { if (!cancelled) setHotels(r.hotels.map(hotelApiToMock)); }).catch(() => {/* 静默失败 */});
-    return () => { cancelled = true; };
-  }, []);
+    setLoad('loading');
+    api
+      .listHotels()
+      .then((r) => {
+        if (cancelled) return;
+        setHotels(r.hotels);
+        setLoad('ready');
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setLoad('error');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [reloadKey]);
+
+  // 全量设施集合（用于多选筛选；不依赖新接口，从已加载酒店聚合）
+  const allAmenities = useMemo(() => {
+    const set = new Set<string>();
+    for (const h of hotels) for (const a of h.amenities) set.add(a);
+    return Array.from(set);
+  }, [hotels]);
+
+  const toggleAmenity = (a: string) =>
+    setAmenityFilter((cur) => (cur.includes(a) ? cur.filter((x) => x !== a) : [...cur, a]));
 
   const filtered = useMemo(() => {
-    return hotels.filter((h) => {
+    const list = hotels.filter((h) => {
       if (city && h.cityCode !== city) return false;
-      if (stars && h.stars !== Number(stars)) return false;
-      if (h.basePrice > maxPrice) return false;
+      if (stars && h.starRating !== Number(stars)) return false;
+      if (basePriceNum(h) > maxPrice) return false;
+      if (amenityFilter.length > 0 && !amenityFilter.every((a) => h.amenities.includes(a)))
+        return false;
       return true;
     });
-  }, [hotels, city, stars, maxPrice]);
+    const sorted = [...list];
+    switch (sort) {
+      case 'price_asc':
+        sorted.sort((a, b) => basePriceNum(a) - basePriceNum(b));
+        break;
+      case 'price_desc':
+        sorted.sort((a, b) => basePriceNum(b) - basePriceNum(a));
+        break;
+      case 'rating':
+        sorted.sort((a, b) => (b.productRating?.average ?? 0) - (a.productRating?.average ?? 0));
+        break;
+      case 'sold':
+        sorted.sort((a, b) => (b.soldCount ?? 0) - (a.soldCount ?? 0));
+        break;
+      default:
+        break; // recommended = 后端返回顺序
+    }
+    return sorted;
+  }, [hotels, city, stars, maxPrice, amenityFilter, sort]);
 
   const nights = Math.max(
     1,
     Math.round((new Date(checkOut).getTime() - new Date(checkIn).getTime()) / 86400000),
   );
 
+  /** 卡片内直接加购：取最便宜房型 × 1 间 × nights 晚（不打断列表流，详情页可精选房型）。 */
+  const quickAdd = (h: Hotel) => {
+    const cheapest = [...h.roomTypes].sort(
+      (a, b) =>
+        Number(a.basePrice) * Number(a.priceMultiplier ?? 1) -
+        Number(b.basePrice) * Number(b.priceMultiplier ?? 1),
+    )[0];
+    const perNight = cheapest
+      ? Math.round(Number(cheapest.basePrice) * Number(cheapest.priceMultiplier ?? 1))
+      : basePriceNum(h);
+    const roomName = cheapest?.name ?? '标准房';
+    add({
+      kind: 'HOTEL',
+      productId: cheapest ? cheapest.id : `${h.id}-${roomName}`,
+      name: `${h.name} · ${roomName} × 1 房 · ${nights} 晚`,
+      description: `${h.area ?? h.address} · ${'★'.repeat(h.starRating)} · ${cheapest?.bedType ?? ''}`,
+      emoji: h.emoji ?? '🏨',
+      unitPrice: perNight * nights,
+      qty: 1,
+      meta: {
+        checkIn,
+        checkOut,
+        nights,
+        roomType: roomName,
+        rooms: 1,
+        hotelRoomTypeId: cheapest ? cheapest.id : '',
+      },
+    });
+  };
+
   return (
     <div className="space-y-6">
+      <Seo
+        title="酒店预订"
+        description="覆盖岘港 / 会安等海岛目的地的精选酒店，房型、设施、真实点评一目了然，与航班打包更划算。"
+        canonicalPath="/hotels"
+      />
+
       <section className="card">
         <h1 className="text-2xl font-extrabold tracking-tight text-ink">酒店预订</h1>
         <p className="mt-1 text-sm text-ink-soft">
@@ -90,7 +191,13 @@ export function HotelsPage() {
           </div>
           <div>
             <label className="label">退房</label>
-            <input type="date" className="input" value={checkOut} onChange={(e) => setCheckOut(e.target.value)} />
+            <input
+              type="date"
+              className="input"
+              value={checkOut}
+              min={checkIn}
+              onChange={(e) => setCheckOut(e.target.value)}
+            />
           </div>
           <div>
             <label className="label">星级</label>
@@ -114,268 +221,211 @@ export function HotelsPage() {
             />
           </div>
         </div>
-      </section>
 
-      <section>
-        <div className="mb-3 flex items-baseline justify-between">
-          <p className="section-title">精选酒店</p>
-          <p className="text-sm text-ink-muted">找到 {filtered.length} 家 · {nights} 晚</p>
-        </div>
-        <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
-          {filtered.map((h) => (
-            <article
-              key={h.id}
-              className="card-interactive group flex cursor-pointer flex-col overflow-hidden"
-              onClick={() => setSelected(h)}
-            >
-              <div className="relative h-44 w-full overflow-hidden bg-slate-100">
-                <img
-                  src={h.photo}
-                  alt={h.name}
-                  className="img-zoom h-full w-full object-cover"
-                  onError={(e) => { e.currentTarget.style.display = 'none'; }}
-                />
-                <div className="pointer-events-none absolute inset-x-0 bottom-0 h-16 bg-gradient-to-t from-black/35 to-transparent" />
-                <span className="badge-sun absolute left-3 top-3 shadow-card"><StarRow count={h.stars} /></span>
-                <span className="rating absolute right-3 top-3 inline-flex items-center gap-0.5 shadow-card">
-                  <Icon name="star" className="h-3 w-3 text-amber-500" />
-                  {h.rating}
-                </span>
-              </div>
-              <div className="flex flex-1 flex-col p-4">
-                <h3 className="font-bold text-ink">{h.name}</h3>
-                <p className="text-xs text-ink-muted">{h.nameEn}</p>
-                <p className="mt-1 inline-flex items-center gap-1 text-xs text-ink-soft">
-                  <Icon name="mapPin" className="h-3 w-3 shrink-0" />
-                  {h.area} · {h.reviewCount} 条评价
-                </p>
-                <p className="mt-2 line-clamp-2 text-xs italic text-ink-soft">{h.highlight}</p>
-                <div className="mt-2 flex flex-wrap gap-1">
-                  {h.amenities.slice(0, 3).map((a) => (
-                    <span key={a} className="chip">{a}</span>
-                  ))}
-                </div>
-                <div className="mt-4 flex items-end justify-between border-t border-slate-100 pt-3">
-                  <div>
-                    <div className="text-xs text-ink-muted">每晚起</div>
-                    <div className="flex items-baseline gap-1">
-                      <span className="price text-xl">¥{h.basePrice}</span>
-                    </div>
-                  </div>
-                  <button className="btn-deal py-1.5 text-sm">查看详情</button>
-                </div>
-              </div>
-            </article>
-          ))}
-        </div>
-
-        {filtered.length === 0 && (
-          <div className="card text-ink-soft">没有符合条件的酒店，请调整筛选条件。</div>
-        )}
-      </section>
-
-      {selected && (
-        <HotelDetailModal
-          hotel={selected}
-          nights={nights}
-          checkIn={checkIn}
-          checkOut={checkOut}
-          onClose={() => setSelected(null)}
-          onAdd={(room, rooms, goCart) => {
-            const unitPrice = Math.round(selected.basePrice * room.priceMult * nights) * rooms;
-            add({
-              kind: 'HOTEL',
-              productId: `${selected.id}-${room.name}`,
-              name: `${selected.name} · ${room.name} × ${rooms} 房 · ${nights} 晚`,
-              description: `${selected.area} · ${'★'.repeat(selected.stars)} · ${room.bedType}`,
-              emoji: selected.emoji,
-              unitPrice,
-              qty: 1,
-              meta: { checkIn, checkOut, nights, roomType: room.name, rooms },
-            });
-            setSelected(null);
-            if (goCart) navigate('/cart');
-          }}
-        />
-      )}
-    </div>
-  );
-}
-
-function HotelDetailModal({
-  hotel,
-  nights,
-  checkIn,
-  checkOut,
-  onClose,
-  onAdd,
-}: {
-  hotel: MockHotel;
-  nights: number;
-  checkIn: string;
-  checkOut: string;
-  onClose: () => void;
-  onAdd: (room: import('../lib/mockData').HotelRoomType, rooms: number, goCart: boolean) => void;
-}) {
-  const [selectedRoomIdx, setSelectedRoomIdx] = useState(0);
-  const [rooms, setRooms] = useState(1);
-  const [selectedCheckIn, setSelectedCheckIn] = useState(checkIn);
-  const [selectedCheckOut, setSelectedCheckOut] = useState(checkOut);
-  const room = hotel.roomTypes[selectedRoomIdx];
-  const actualNights = Math.max(
-    1,
-    Math.round((new Date(selectedCheckOut).getTime() - new Date(selectedCheckIn).getTime()) / 86400000),
-  );
-  const _unused = nights; void _unused;
-  const unitPrice = Math.round(hotel.basePrice * room.priceMult);
-  const total = unitPrice * actualNights * rooms;
-
-  return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-ink/50 p-4 backdrop-blur-sm"
-      onClick={onClose}
-    >
-      <div
-        className="max-h-[90vh] w-full max-w-3xl overflow-auto rounded-3xl bg-surface shadow-pop"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <div className="sticky top-0 z-10 flex items-center justify-between border-b border-slate-200/80 bg-surface/90 px-6 py-4 backdrop-blur-xl">
-          <h2 className="inline-flex items-center gap-2 text-lg font-extrabold tracking-tight text-ink">
-            <Icon name="hotel" className="h-5 w-5 text-brand" />
-            {hotel.name}
-          </h2>
-          <button onClick={onClose} className="text-xl text-ink-muted transition-colors hover:text-ink">×</button>
-        </div>
-
-        <div className="space-y-4 px-6 py-5">
-          <div className="relative overflow-hidden rounded-2xl bg-slate-100">
-            <img src={hotel.photo} alt={hotel.name} className="h-52 w-full object-cover" />
-          </div>
-
-          <div className="flex items-center gap-2">
-            <span className="badge-sun"><StarRow count={hotel.stars} /></span>
-            <span className="rating inline-flex items-center gap-0.5">
-              <Icon name="star" className="h-3 w-3 text-amber-500" />
-              {hotel.rating} / 5
-            </span>
-            <span className="text-xs text-ink-muted">{hotel.reviewCount} 条评价</span>
-            <span className="inline-flex items-center gap-1 text-xs text-ink-muted">
-              · <Icon name="mapPin" className="h-3 w-3" /> {hotel.area}
-            </span>
-          </div>
-          <p className="text-sm italic text-ink-soft">{hotel.highlight}</p>
-
-          {/* 入住日期调整 */}
-          <div className="grid gap-3 md:grid-cols-3">
-            <div>
-              <label className="label text-xs">入住</label>
-              <input
-                type="date"
-                className="input"
-                value={selectedCheckIn}
-                onChange={(e) => setSelectedCheckIn(e.target.value)}
-              />
-            </div>
-            <div>
-              <label className="label text-xs">退房</label>
-              <input
-                type="date"
-                className="input"
-                value={selectedCheckOut}
-                min={selectedCheckIn}
-                onChange={(e) => setSelectedCheckOut(e.target.value)}
-              />
-            </div>
-            <div>
-              <label className="label text-xs">房间数</label>
-              <div className="flex h-10 items-center overflow-hidden rounded-xl border border-slate-200">
+        {/* 设施多选筛选（从已加载酒店聚合，不依赖新接口） */}
+        {allAmenities.length > 0 && (
+          <div className="mt-4 border-t border-slate-100 pt-4">
+            <div className="mb-2 flex items-center justify-between">
+              <span className="label mb-0">设施筛选</span>
+              {amenityFilter.length > 0 && (
                 <button
                   type="button"
-                  className="h-full px-3 text-ink-soft transition-colors hover:bg-brand-50 disabled:text-slate-300"
-                  disabled={rooms <= 1}
-                  onClick={() => setRooms(rooms - 1)}
-                >−</button>
-                <span className="nums flex-1 text-center font-semibold text-ink">{rooms}</span>
-                <button
-                  type="button"
-                  className="h-full px-3 text-ink-soft transition-colors hover:bg-brand-50 disabled:text-slate-300"
-                  disabled={rooms >= 5}
-                  onClick={() => setRooms(rooms + 1)}
-                >+</button>
-              </div>
+                  className="text-xs font-semibold text-brand hover:underline"
+                  onClick={() => setAmenityFilter([])}
+                >
+                  清空（{amenityFilter.length}）
+                </button>
+              )}
             </div>
-          </div>
-
-          {/* 房型选择 */}
-          <div>
-            <h3 className="font-bold text-ink">选择房型（{hotel.roomTypes.length} 种）</h3>
-            <div className="mt-2 space-y-2">
-              {hotel.roomTypes.map((r, idx) => {
-                const rPrice = Math.round(hotel.basePrice * r.priceMult);
-                const selected = idx === selectedRoomIdx;
+            <div className="flex flex-wrap gap-1.5">
+              {allAmenities.map((a) => {
+                const on = amenityFilter.includes(a);
                 return (
                   <button
-                    key={r.name}
+                    key={a}
                     type="button"
-                    onClick={() => setSelectedRoomIdx(idx)}
-                    className={`w-full rounded-2xl border-2 p-3 text-left transition-all ${
-                      selected ? 'border-brand bg-brand-50/60 shadow-card' : 'border-slate-200 hover:border-brand/40'
+                    onClick={() => toggleAmenity(a)}
+                    aria-pressed={on}
+                    className={`chip cursor-pointer transition-colors ${
+                      on
+                        ? 'border-brand bg-brand-50 text-brand-700'
+                        : 'hover:border-brand/40 hover:text-brand-700'
                     }`}
                   >
-                    <div className="flex items-center justify-between">
-                      <div>
-                        <div className="flex items-center gap-2">
-                          <span className="font-bold text-ink">{r.name}</span>
-                          {selected && <span className="badge-soft">已选</span>}
-                        </div>
-                        <div className="mt-0.5 text-xs text-ink-muted">
-                          {r.bedType} · 可住 {r.sleeps} 人
-                        </div>
-                      </div>
-                      <div className="text-right">
-                        <div className="price text-lg">¥{rPrice}</div>
-                        <div className="text-xs text-ink-muted">每晚</div>
-                      </div>
-                    </div>
+                    {on && <Icon name="check" className="h-3 w-3" />}
+                    {a}
                   </button>
                 );
               })}
             </div>
           </div>
+        )}
+      </section>
 
-          {/* 价格汇总 */}
-          <div className="rounded-2xl border border-slate-200/80 bg-canvas p-4">
-            <div className="flex justify-between text-sm">
-              <span className="text-ink-soft">{room.name} · ¥{unitPrice}/晚</span>
-              <span className="font-semibold text-ink">¥{unitPrice}</span>
-            </div>
-            <div className="mt-1 flex justify-between text-sm">
-              <span className="text-ink-soft">{actualNights} 晚 × {rooms} 房</span>
-              <span className="font-semibold text-ink">¥{unitPrice * actualNights * rooms}</span>
-            </div>
-            <div className="mt-3 flex items-end justify-between border-t border-slate-200 pt-3">
-              <span className="text-sm text-ink-soft">合计</span>
-              <span className="price text-2xl">¥{total.toLocaleString()}</span>
-            </div>
+      <section>
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <p className="section-title">精选酒店</p>
+            {load === 'ready' && (
+              <p className="text-sm text-ink-muted">找到 {filtered.length} 家 · {nights} 晚</p>
+            )}
           </div>
+          <SortSelect value={sort} options={SORT_OPTIONS} onChange={setSort} />
         </div>
 
-        {/* 底部固定 CTA 栏 */}
-        <div className="sticky bottom-0 flex items-center justify-between gap-3 border-t border-slate-200/80 bg-surface/90 px-6 py-4 backdrop-blur-xl">
-          <div className="text-sm">
-            <span className="text-ink-soft">合计 </span>
-            <span className="price text-xl">¥{total.toLocaleString()}</span>
+        {load === 'loading' && <ListSkeleton rows={5} />}
+
+        {load === 'error' && (
+          <ErrorRetry
+            message="酒店列表没能加载出来，请稍后重试。"
+            onRetry={() => setReloadKey((k) => k + 1)}
+          />
+        )}
+
+        {load === 'ready' && filtered.length === 0 && (
+          <EmptyState
+            icon="hotel"
+            title="没有符合条件的酒店"
+            hint="试着放宽星级、价格或设施筛选，换个日期也许有惊喜。"
+            action={
+              <button
+                type="button"
+                className="btn-secondary"
+                onClick={() => {
+                  setCity('');
+                  setStars('');
+                  setMaxPrice(4000);
+                  setAmenityFilter([]);
+                }}
+              >
+                重置筛选
+              </button>
+            }
+          />
+        )}
+
+        {load === 'ready' && filtered.length > 0 && (
+          <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
+            {filtered.map((h) => (
+              <HotelCard
+                key={h.id}
+                hotel={h}
+                onOpen={() => navigate(`/hotels/${h.id}`)}
+                onQuickAdd={() => quickAdd(h)}
+              />
+            ))}
           </div>
-          <div className="flex gap-2">
-            <button className="btn-secondary inline-flex items-center gap-1.5" onClick={() => onAdd(room, rooms, false)}>
-              <Icon name="cart" className="h-4 w-4" />加入购物车
+        )}
+      </section>
+    </div>
+  );
+}
+
+interface HotelCardProps {
+  hotel: Hotel;
+  onOpen: () => void;
+  onQuickAdd: () => void;
+}
+
+const CARD_AMENITIES = 3;
+
+function HotelCard({ hotel, onOpen, onQuickAdd }: HotelCardProps) {
+  const rating = hotel.productRating;
+  const extraAmenities = hotel.amenities.length - CARD_AMENITIES;
+
+  return (
+    <article
+      className="card-interactive group flex cursor-pointer flex-col overflow-hidden"
+      onClick={onOpen}
+      role="link"
+      tabIndex={0}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          onOpen();
+        }
+      }}
+    >
+      <div className="relative overflow-hidden bg-slate-100">
+        <Img src={hotel.photos[0] ?? ''} alt={hotel.name} ratio="4/3" className="img-zoom" />
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 h-16 bg-gradient-to-t from-black/35 to-transparent" />
+        {/* 挂牌星级（建筑级别，区别于点评评分） */}
+        <span className="badge-sun absolute left-3 top-3 shadow-card">
+          <HotelClassStars count={hotel.starRating} />
+        </span>
+        {/* 点评评分（金星 + 数值），仅在有真实评分时显示 */}
+        {rating && rating.count > 0 && (
+          <span className="absolute right-3 top-3 inline-flex items-center rounded-full bg-white/95 px-2 py-1 shadow-card backdrop-blur">
+            <StarRating value={rating.average} size="sm" showValue />
+          </span>
+        )}
+      </div>
+      <div className="flex flex-1 flex-col p-4">
+        <h3 className="font-bold text-ink">{hotel.name}</h3>
+        {hotel.nameEn && <p className="text-xs text-ink-muted">{hotel.nameEn}</p>}
+        <p className="mt-1 inline-flex items-center gap-1 text-xs text-ink-soft">
+          <Icon name="mapPin" className="h-3 w-3 shrink-0" />
+          {hotel.area ?? hotel.address}
+          {typeof hotel.soldCount === 'number' && hotel.soldCount > 0 && (
+            <span className="text-ink-muted">· 已售 {hotel.soldCount}</span>
+          )}
+        </p>
+        {hotel.highlight && (
+          <p className="mt-2 line-clamp-2 text-xs italic text-ink-soft">{hotel.highlight}</p>
+        )}
+
+        <div className="mt-2 flex flex-wrap items-center gap-1">
+          {hotel.amenities.slice(0, CARD_AMENITIES).map((a) => (
+            <span key={a} className="chip">{a}</span>
+          ))}
+          {extraAmenities > 0 && (
+            <button
+              type="button"
+              className="chip cursor-pointer text-brand-700 hover:underline"
+              onClick={(e) => {
+                e.stopPropagation();
+                onOpen();
+              }}
+            >
+              查看全部 +{extraAmenities}
             </button>
-            <button className="btn-deal inline-flex items-center gap-1.5" onClick={() => onAdd(room, rooms, true)}>
-              立即购买 <Icon name="arrowRight" className="h-4 w-4" />
+          )}
+        </div>
+
+        <div className="mt-3">
+          <RefundBadge />
+        </div>
+
+        <div className="mt-4 flex items-end justify-between border-t border-slate-100 pt-3">
+          <div>
+            <div className="text-xs text-ink-muted">每晚起</div>
+            <div className="flex items-baseline gap-1">
+              <span className="price text-xl">¥{basePriceNum(hotel)}</span>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              className="btn-secondary inline-flex items-center gap-1 py-1.5 text-sm"
+              onClick={(e) => {
+                e.stopPropagation();
+                onQuickAdd();
+              }}
+            >
+              <Icon name="cart" className="h-4 w-4" />
+              加购
+            </button>
+            <button
+              className="btn-deal py-1.5 text-sm"
+              onClick={(e) => {
+                e.stopPropagation();
+                onOpen();
+              }}
+            >
+              查看详情
             </button>
           </div>
         </div>
       </div>
-    </div>
+    </article>
   );
 }

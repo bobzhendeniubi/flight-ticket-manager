@@ -2,6 +2,9 @@ import { useMemo } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useCart, KIND_INFO, isSelected, type CartItem } from '../stores/cart';
 import { Icon, type IconName } from '../components/Icon';
+import { EmptyState } from '../components/EmptyState';
+import { RefundBadge } from '../components/RefundBadge';
+import { TrustBadges } from '../components/TrustBadges';
 
 /** 购物车条目按 kind 映射统一线性图标（取代存储的 emoji 渲染；不改 store 里的 emoji 字段） */
 const CART_KIND_ICON: Record<CartItem['kind'], IconName> = {
@@ -35,21 +38,23 @@ export function CartPage() {
 
   if (items.length === 0) {
     return (
-      <div className="card animate-fade-up py-16 text-center">
-        <div className="mx-auto flex h-20 w-20 items-center justify-center rounded-full bg-brand-50 text-brand">
-          <Icon name="cart" className="h-9 w-9" />
-        </div>
-        <p className="mt-4 text-base font-semibold text-ink">购物车空空如也</p>
-        <p className="mt-1 text-sm text-ink-muted">挑选海岛专线机票或一价全含套餐，开启你的旅程</p>
-        <Link to="/" className="btn-primary mt-5 inline-flex items-center gap-1.5">
-          去搜机票 <Icon name="arrowRight" className="h-4 w-4" />
-        </Link>
+      <div className="card animate-fade-up">
+        <EmptyState
+          icon="cart"
+          title="购物车空空如也"
+          hint="挑选海岛专线机票或一价全含套餐，开启你的旅程"
+          action={
+            <Link to="/" className="btn-primary inline-flex items-center gap-1.5">
+              去逛逛 <Icon name="arrowRight" className="h-4 w-4" />
+            </Link>
+          }
+        />
       </div>
     );
   }
 
   return (
-    <div className="space-y-5 pb-28 lg:pb-0">
+    <div className="space-y-5 pb-36 lg:pb-0">
       <section className="animate-fade-up">
         <h1 className="text-2xl font-extrabold tracking-tight text-ink">购物车</h1>
         <p className="section-sub">
@@ -157,10 +162,18 @@ export function CartPage() {
               </li>
             ))}
           </ul>
-          <div className="flex items-center justify-between border-t border-slate-100 bg-canvas px-4 py-3">
-            <button className="text-sm font-medium text-ink-muted transition hover:text-deal" onClick={clear}>
-              清空购物车
-            </button>
+          <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 bg-canvas px-4 py-3">
+            <div className="flex items-center gap-3">
+              <button className="text-sm font-medium text-ink-muted transition hover:text-deal" onClick={clear}>
+                清空购物车
+              </button>
+              <Link
+                to="/"
+                className="inline-flex items-center gap-1 text-sm font-medium text-brand-700 transition hover:text-brand-dark"
+              >
+                <Icon name="arrowRight" className="h-3.5 w-3.5 rotate-180" /> 继续挑选
+              </Link>
+            </div>
             <span className="text-xs text-ink-muted">仅勾选的商品会进入结算</span>
           </div>
         </section>
@@ -184,12 +197,22 @@ export function CartPage() {
             >
               结算所选 {selectedCount} 件 <Icon name="arrowRight" className="h-4 w-4" />
             </button>
+            <div className="flex justify-center">
+              <RefundBadge />
+            </div>
+            <div className="border-t border-slate-100 pt-3">
+              <TrustBadges variant="card" />
+            </div>
           </div>
         </aside>
       </div>
 
       {/* 手机端 sticky 底部结算条 */}
       <div className="fixed inset-x-0 bottom-[calc(56px+env(safe-area-inset-bottom))] z-40 border-t border-slate-200/80 bg-surface/95 px-4 py-3 shadow-pop backdrop-blur-xl lg:hidden">
+        <div className="mb-2 flex items-center gap-1.5 text-xs text-ink-soft">
+          <Icon name="shield" className="h-3.5 w-3.5 shrink-0 text-emerald-600" />
+          出发前 7 天免费取消 · 安全支付
+        </div>
         <div className="flex items-center justify-between gap-3">
           <div>
             <div className="text-xs text-ink-muted">已选 {selectedCount} 件 · 合计</div>

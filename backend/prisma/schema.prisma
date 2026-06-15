@@ -546,8 +546,9 @@ model Hotel {
   address     String
   starRating  Int // 1..5
   basePrice   Decimal? @db.Decimal(10, 2) // 起步价（展示用）
-  rating      Decimal? @db.Decimal(3, 2) // 客户评分 0-5
+  rating      Decimal? @db.Decimal(3, 2) // 客户评分 0-5（兜底展示；真实评分由 Review 聚合覆盖）
   reviewCount Int?
+  soldCount   Int      @default(0) // 已售份数（展示用，seed 填充）
   emoji       String?
   highlight   String? // 一句话卖点
   latitude    Decimal? @db.Decimal(9, 6)
@@ -638,6 +639,7 @@ model Transfer {
   costPriceCny Decimal? @db.Decimal(10, 2)
   features     String[] // e.g., ["中文司机", "免费等候 60 分钟"]
   duration     String? // "约 15 分钟"
+  soldCount    Int      @default(0) // 已售份数（展示用，seed 填充）
   emoji        String?
   photo        String?
   isActive     Boolean  @default(true)
@@ -665,6 +667,7 @@ model Visa {
   validityMonths     Int? // 签证有效期（月）
   highlight          String? // "最热销 · 全流程线上"
   requiredDocs       String[] // e.g., ["passport_scan", "photo", "itinerary"]
+  soldCount          Int      @default(0) // 已售份数（展示用，seed 填充）
   isActive           Boolean  @default(true)
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
@@ -695,6 +698,7 @@ model Bundle {
   // 自愿升级展示价（CNY）— 单房差/晚、升舱/航段；null = 该套餐不展示升级项
   singleSupplementCnyPerNight Decimal? @db.Decimal(10, 2)
   cabinUpgradeCnyPerLeg       Decimal? @db.Decimal(10, 2)
+  soldCount      Int      @default(0) // 已售份数（展示用，seed 填充）
   isActive       Boolean  @default(true)
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
@@ -703,6 +707,36 @@ model Bundle {
   orderItems    OrderItem[]
 
   @@index([isActive])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Reviews — 产品评价（前台展示 + 订单完成后客户提交）
+// productId 是 polymorphic：按 productType 指向 Bundle/Hotel/Transfer/Visa.id，
+// FLIGHT 评价用航线/航班号字符串做 productId（无强外键，故不建关系）。
+// ─────────────────────────────────────────────────────────────────────────────
+enum ProductReviewType {
+  BUNDLE
+  HOTEL
+  TRANSFER
+  VISA
+  FLIGHT
+}
+
+model Review {
+  id          String            @id @default(cuid())
+  productType ProductReviewType
+  productId   String
+  rating      Int // 1-5
+  title       String?
+  body        String
+  authorName  String // 已脱敏的展示名（"王**"）
+  verified    Boolean           @default(false) // true = 来自真实订单
+  tripType    String? // 家庭/情侣/朋友/商务
+  reply       String? // 商家回复
+  orderId     String? // 关联订单（订单后评价时填）
+  createdAt   DateTime          @default(now())
+
+  @@index([productType, productId])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -748,8 +782,12 @@ enum InvoiceStatus {
 model Order {
   id               String        @id @default(cuid())
   orderNumber      String        @unique // human-friendly, e.g., "FTM2026041400001"
-  userId           String
+  userId           String? // null for guest (no-login) checkout
   agentId          String? // non-null when placed by an agent
+  // 游客下单（免登录）联系人 —— userId=null 时用于公开订单查询匹配 + 履约联系
+  guestName        String?
+  guestPhone       String?
+  guestEmail       String?
   status           OrderStatus   @default(DRAFT)
   // 开票状态（运营在订单管理里维护，反馈：李萍）
   invoiceStatus    InvoiceStatus @default(NONE)
@@ -778,7 +816,7 @@ model Order {
   createdAt        DateTime      @default(now())
   updatedAt        DateTime      @updatedAt
 
-  user              User                  @relation("OrderUser", fields: [userId], references: [id])
+  user              User?                 @relation("OrderUser", fields: [userId], references: [id])
   agent             Agent?                @relation(fields: [agentId], references: [id])
   claimedBy         User?                 @relation("OrderClaimedBy", fields: [claimedById], references: [id], onDelete: SetNull)
   items             OrderItem[]

@@ -1,0 +1,19 @@
+{
+  "name": "世途旅行",
+  "short_name": "世途旅行",
+  "description": "澳门⇌越南海岛专线 · 套餐 / 机票 / 酒店 / 接送 / 签证一站式预订",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#0e8aa0",
+  "lang": "zh-CN",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "type": "image/svg+xml",
+      "sizes": "any",
+      "purpose": "any maskable"
+    }
+  ]
+}

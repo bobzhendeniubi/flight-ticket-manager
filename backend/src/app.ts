@@ -30,6 +30,7 @@ import { cancellationRoutes } from './modules/cancellation/cancellation.routes.j
 import { reminderRoutes } from './modules/reminders/reminders.routes.js';
 import { financesRoutes } from './modules/finances/finances.routes.js';
 import { aiRoutes } from './modules/ai/ai.routes.js';
+import { reviewRoutes, orderReviewRoutes } from './modules/reviews/reviews.routes.js';
 import { redis } from './db/redis.js';
 
 export async function buildApp(): Promise<FastifyInstance> {
@@ -72,6 +73,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(flightRoutes, { prefix: '/flights' });
   await app.register(agentRoutes, { prefix: '/agents' });
   await app.register(orderRoutes, { prefix: '/orders' });
+  await app.register(orderReviewRoutes, { prefix: '/orders' });
   await app.register(orderCostItemRoutes, { prefix: '/orders' });
   await app.register(seatLockRoutes, { prefix: '/seat-locks' });
   await app.register(waitlistRoutes, { prefix: '/waitlist' });
@@ -89,6 +91,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(reminderRoutes, { prefix: '/reminders' });
   await app.register(financesRoutes, { prefix: '/finances' });
   await app.register(aiRoutes, { prefix: '/ai' });
+  await app.register(reviewRoutes, { prefix: '/reviews' });
 
   // Root
   app.get('/', async () => ({

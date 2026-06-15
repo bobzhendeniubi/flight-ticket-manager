@@ -26,6 +26,8 @@ import {
 import { CABIN_LABEL } from '../lib/airports';
 import { useAuth } from '../stores/auth';
 import { Icon, type IconName } from '../components/Icon';
+import { Modal } from '../components/Modal';
+import { WriteReviewForm, type WriteReviewFormData } from '../components/WriteReviewForm';
 
 const STATUS_LABEL: Record<OrderStatus, string> = {
   DRAFT: '草稿',
@@ -76,6 +78,9 @@ function KindIcon({ kind, className }: { kind: string; className?: string }) {
 }
 
 const CANCELLABLE = new Set<OrderStatus>(['PAID', 'PROCESSING', 'TICKETED']);
+// 可写评价的订单状态：行程已完成（COMPLETED）。后端无 reviewed 字段，
+// 本会话内用客户端 Set 记下已评价的订单，提交成功后禁用再次评价。
+const REVIEWABLE = new Set<OrderStatus>(['COMPLETED']);
 
 export function MyOrdersPage() {
   const { tokens } = useAuth();
@@ -94,6 +99,41 @@ export function MyOrdersPage() {
   const [cancelLoading, setCancelLoading] = useState(false);
   const [cancelReason, setCancelReason] = useState('');
   const [cancelError, setCancelError] = useState<string | null>(null);
+
+  // 写评价流程状态
+  const [reviewTarget, setReviewTarget] = useState<OrderSummary | null>(null);
+  const [reviewSubmitting, setReviewSubmitting] = useState(false);
+  const [reviewError, setReviewError] = useState<string | null>(null);
+  // 本会话内已评价的订单 id（提交成功后加入，用于禁用「写评价」按钮）
+  const [reviewedIds, setReviewedIds] = useState<Set<string>>(() => new Set());
+
+  const openReview = (order: OrderSummary) => {
+    setReviewTarget(order);
+    setReviewError(null);
+  };
+
+  const submitReview = async (data: WriteReviewFormData) => {
+    if (!reviewTarget) return;
+    setReviewSubmitting(true);
+    setReviewError(null);
+    try {
+      await api.createReview(
+        reviewTarget.id,
+        { rating: data.rating, body: data.body, title: data.title },
+        token,
+      );
+      setReviewedIds((prev) => {
+        const next = new Set(prev);
+        next.add(reviewTarget.id);
+        return next;
+      });
+      setReviewTarget(null);
+    } catch (e) {
+      setReviewError(e instanceof Error ? e.message : '提交评价失败，请重试');
+    } finally {
+      setReviewSubmitting(false);
+    }
+  };
 
   useEffect(() => {
     if (!token) return;
@@ -209,6 +249,8 @@ export function MyOrdersPage() {
       {orders.map((o) => {
         const expanded = expandedId === o.id;
         const cancellable = CANCELLABLE.has(o.status);
+        const reviewable = REVIEWABLE.has(o.status);
+        const reviewed = reviewedIds.has(o.id);
         // 展开后用 detail（详情拉到的完整 passenger）；详情没拿到时 fallback 到列表
         const detail = detailCache[o.id] ?? o;
         return (
@@ -242,7 +284,7 @@ export function MyOrdersPage() {
               {o.items.length > 3 && <span className="text-ink-muted">…等 {o.items.length} 项</span>}
             </div>
 
-            <footer className="flex items-center justify-between border-t border-slate-100 pt-3">
+            <footer className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 pt-3">
               <button
                 type="button"
                 onClick={() => toggleExpand(o)}
@@ -250,15 +292,32 @@ export function MyOrdersPage() {
               >
                 {expanded ? '收起 ↑' : '查看详情 →'}
               </button>
-              {cancellable && (
-                <button
-                  type="button"
-                  onClick={() => startCancel(o)}
-                  className="rounded-lg border border-deal/40 bg-white px-3 py-1.5 text-sm font-medium text-deal transition hover:bg-deal-light"
-                >
-                  申请取消
-                </button>
-              )}
+              <div className="flex items-center gap-2">
+                {reviewable && (
+                  reviewed ? (
+                    <span className="inline-flex items-center gap-1 rounded-lg bg-emerald-50 px-3 py-1.5 text-sm font-medium text-emerald-700">
+                      <Icon name="check" className="h-4 w-4" /> 已评价
+                    </span>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => openReview(o)}
+                      className="inline-flex items-center gap-1 rounded-lg border border-brand/40 bg-white px-3 py-1.5 text-sm font-medium text-brand-700 transition hover:bg-brand-50"
+                    >
+                      <Icon name="star" className="h-4 w-4 text-sun" /> 写评价
+                    </button>
+                  )
+                )}
+                {cancellable && (
+                  <button
+                    type="button"
+                    onClick={() => startCancel(o)}
+                    className="rounded-lg border border-deal/40 bg-white px-3 py-1.5 text-sm font-medium text-deal transition hover:bg-deal-light"
+                  >
+                    申请取消
+                  </button>
+                )}
+              </div>
             </footer>
 
             {expanded && (
@@ -331,6 +390,34 @@ export function MyOrdersPage() {
           onConfirm={confirmCancel}
         />
       )}
+
+      {/* 写评价弹窗 */}
+      <Modal
+        open={reviewTarget !== null}
+        onClose={() => {
+          if (reviewSubmitting) return;
+          setReviewTarget(null);
+          setReviewError(null);
+        }}
+        title="写评价"
+        size="md"
+      >
+        <div className="space-y-3 p-5">
+          {reviewTarget && (
+            <p className="text-sm text-ink-soft">
+              订单 <span className="font-mono font-semibold text-ink">{reviewTarget.orderNumber}</span>
+              {' · '}分享你的真实体验，帮助更多旅客。
+            </p>
+          )}
+          {reviewError && (
+            <p className="flex items-center gap-1.5 rounded-xl border border-deal/30 bg-deal-light px-3 py-2 text-sm font-medium text-deal-dark" role="alert">
+              <Icon name="info" className="h-4 w-4 shrink-0" />
+              {reviewError}
+            </p>
+          )}
+          <WriteReviewForm onSubmit={submitReview} submitting={reviewSubmitting} />
+        </div>
+      </Modal>
     </div>
   );
 }

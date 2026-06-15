@@ -12,6 +12,15 @@ import { ocrPassport } from '../lib/passportOcr';
 import { api, ApiError, type CreateOrderInput } from '../lib/api';
 import { safeRandomUUID } from '../lib/uuid';
 import { BookingNotices } from '../components/BookingNotices';
+import { TrustBadges } from '../components/TrustBadges';
+import { RefundBadge } from '../components/RefundBadge';
+import { Icon } from '../components/Icon';
+
+/** 手机号轻校验：允许 +、空格、-，纯数字位数 7–15（含国际区号）。空串不在这里判（必填由调用方控制）。 */
+function isLikelyPhone(raw: string): boolean {
+  const digits = raw.replace(/[^\d]/g, '');
+  return digits.length >= 7 && digits.length <= 15;
+}
 
 interface PassengerForm {
   fullName: string;
@@ -42,6 +51,8 @@ export function CheckoutPage() {
   const user = useAuth((s) => s.user);
   const tokens = useAuth((s) => s.tokens);
   const isAgent = user?.role === 'AGENT';
+  // 登录态：有有效 accessToken 即视为已登录；否则走游客分支（A1：去登录墙）
+  const isLoggedIn = Boolean(tokens?.accessToken);
   // 只结算购物车里"勾选"的产品（CartPage 勾选 → 这里结算 → 成功后只移除已结的）
   // 不能在 zustand 选择器里 filter：每次返回新数组会让 React 18 的快照一致性
   // 检查死循环（Maximum update depth exceeded → 整页白屏）。
@@ -54,6 +65,11 @@ export function CheckoutPage() {
   const [contactName, setContactName] = useState('');
   const [contactPhone, setContactPhone] = useState('');
   const [contactEmail, setContactEmail] = useState('');
+  // A1 游客下单：未登录时让用户二选一 —— 去登录 OR 以游客身份继续。
+  // null = 还没选；'guest' = 已选游客（露出联系人必填字段）。已登录时此状态不参与。
+  const [guestChoice, setGuestChoice] = useState<'guest' | null>(null);
+  // A5 优惠码：后端暂无促销端点，输入框可见但不参与算价（不伪造折扣）。
+  const [promoCode, setPromoCode] = useState('');
   // 5/20 反馈：客人特殊要求（如先办批文、酒店单过海关）
   const [orderNotes, setOrderNotes] = useState('');
   // 初始化 passengers：如果 AI 助手在聊天里 OCR 过护照，从 sessionStorage 拉出来预填
@@ -88,7 +104,11 @@ export function CheckoutPage() {
     orderNumber: string;
     total: string;
     paymentExpiresAt: string | null;
+    isGuest: boolean;
+    contactPhone: string;
   } | null>(null);
+  // H3：捕获到 401/会话过期时置真 —— 渲染"重新登录"专用提示而非通用失败文案。
+  const [sessionExpired, setSessionExpired] = useState(false);
 
   // 幂等 key：整个结账会话一个，重试 / 重提交复用（防止双击造两单）
   // useMemo 只跑一次；重新下单（done 后换页）会自然创建新组件 → 新 key
@@ -161,16 +181,38 @@ export function CheckoutPage() {
           <HoldCountdown expiresAt={done.paymentExpiresAt} />
         )}
         <p className="mt-4 text-sm text-ink-muted">
-          订单已创建，状态为 <span className="badge-sun">待支付</span>。
-          运营会在 10 分钟内确认，已发短信至 {contactPhone}
+          订单已创建，状态为 <span className="badge-sun">待确认</span>。
+          客服会尽快联系确认收款，已发短信至 {done.contactPhone}
         </p>
+        {done.isGuest && (
+          <div className="mt-4 rounded-2xl border border-brand-200 bg-brand-50/60 px-4 py-3 text-left text-sm text-brand-800">
+            <p className="flex items-center gap-1.5 font-semibold">
+              <Icon name="search" className="h-4 w-4" /> 凭「订单号 + 手机号」可随时查订单
+            </p>
+            <p className="mt-1 text-brand-700">
+              未登录下单不会进入「我的订单」。请记下订单号
+              <span className="mx-1 font-mono font-semibold">{done.orderNumber}</span>，
+              到{' '}
+              <Link to="/lookup" className="font-semibold underline underline-offset-2 hover:text-brand-dark">
+                查订单
+              </Link>{' '}
+              页面输入订单号与下单手机号即可查看进度。
+            </p>
+          </div>
+        )}
         <div className="mt-6 flex justify-center gap-3">
           <Link to="/" className="btn-secondary">
             返回首页
           </Link>
-          <button className="btn-primary" onClick={() => setDone(null)}>
-            再下一单
-          </button>
+          {done.isGuest ? (
+            <Link to="/lookup" className="btn-primary">
+              去查订单
+            </Link>
+          ) : (
+            <Link to="/orders" className="btn-primary">
+              查看我的订单
+            </Link>
+          )}
         </div>
       </div>
     );
@@ -187,6 +229,13 @@ export function CheckoutPage() {
   const onSubmit = async (e: FormEvent) => {
     e.preventDefault();
     setErrorMsg(null);
+    setSessionExpired(false);
+
+    // A1：未登录且还没选"游客继续"时，先逼用户做选择（登录 or 游客），不直接提交
+    if (!isLoggedIn && guestChoice !== 'guest') {
+      setErrorMsg('请先选择「登录后下单」或「以游客身份继续」');
+      return;
+    }
 
     // Invariant: 买几张票/套餐几人就填几个出行人
     if (effectivePax > 0 && passengers.length !== effectivePax) {
@@ -203,20 +252,43 @@ export function CheckoutPage() {
       setErrorMsg('请填写所有出行人的姓名、护照号和出生日期');
       return;
     }
+    // 出行人联系电话：必填 + 轻校验（位数 7–15）
+    if (passengers.some((p) => !p.phone.trim())) {
+      setErrorMsg('请填写每位出行人的联系电话');
+      return;
+    }
+    if (passengers.some((p) => !isLikelyPhone(p.phone))) {
+      setErrorMsg('出行人联系电话格式不正确，请填写 7–15 位有效号码');
+      return;
+    }
     if (!contactName.trim() || !contactPhone.trim()) {
       setErrorMsg('请填写联系人姓名和手机号');
       return;
     }
-    if (!tokens?.accessToken) {
-      setErrorMsg('登录已失效，请重新登录后再下单');
+    if (!isLikelyPhone(contactPhone)) {
+      setErrorMsg('联系人手机号格式不正确，请填写 7–15 位有效号码');
       return;
     }
+
+    // 已登录 → 用 accessToken，后端按用户关联；游客 → token=null + guestContact
+    const submitAsGuest = !isLoggedIn;
+    const token = submitAsGuest ? null : tokens!.accessToken;
 
     // 购物车 → CreateOrderInput.items
     const body: CreateOrderInput = {
       contactName: contactName.trim(),
       contactPhone: contactPhone.trim(),
       contactEmail: contactEmail.trim() || undefined,
+      // 游客下单：联系人同时作为 guestContact 传给后端（已登录省略，后端用 token 关联用户）
+      ...(submitAsGuest
+        ? {
+            guestContact: {
+              name: contactName.trim(),
+              phone: contactPhone.trim(),
+              email: contactEmail.trim() || undefined,
+            },
+          }
+        : {}),
       notes: orderNotes.trim() || undefined,
       paymentMethod,
       passengers: passengers.map((p) => ({
@@ -290,19 +362,25 @@ export function CheckoutPage() {
     const orderedIds = items.map((i) => i.id);
     setSubmitting(true);
     try {
-      const { order } = await api.createOrder(tokens.accessToken, body);
+      const { order } = await api.createOrder(token, body);
       removeMany(orderedIds); // 只移除本次结算的产品，未勾选的留在购物车
       clearPassengers(); // 防止下单成功后下次开新单沿用旧 OCR 缓存（Codex P2 反馈）
       setDone({
         orderNumber: order.orderNumber,
         total: order.total,
         paymentExpiresAt: order.paymentExpiresAt ?? null,
+        isGuest: submitAsGuest,
+        contactPhone: contactPhone.trim(),
       });
     } catch (err) {
-      // 任何异常都要给用户可见反馈（公测反馈：失败时页面"卡住"无提示）
-      if (err instanceof ApiError) {
+      // H3：会话过期/未授权 → 友好"重新登录"提示，不混在通用失败里
+      if (err instanceof ApiError && err.status === 401) {
+        setSessionExpired(true);
+        setErrorMsg(null);
+      } else if (err instanceof ApiError) {
         setErrorMsg(`下单失败：${err.message}`);
       } else {
+        // 任何异常都要给用户可见反馈（公测反馈：失败时页面"卡住"无提示）
         setErrorMsg(err instanceof Error ? err.message : '提交失败，请重试');
       }
     } finally {
@@ -311,27 +389,94 @@ export function CheckoutPage() {
   };
 
   return (
-    <div className="mx-auto max-w-4xl space-y-5 pb-36 sm:pb-28">
+    <div className="mx-auto max-w-4xl space-y-5 pb-44 sm:pb-32">
       <section className="animate-fade-up">
         <h1 className="text-2xl font-extrabold tracking-tight text-ink">确认订单</h1>
         <p className="section-sub">
           请填写联系人信息和每位乘客的护照信息。可上传护照照片自动识别（OCR）。
         </p>
+
+        {/* A5 步骤指示器（纯展示，不改流程） */}
+        <CheckoutSteps />
+
+        {/* H3 会话过期专用提示（带重新登录入口） */}
+        {sessionExpired && (
+          <div className="mt-3 flex flex-wrap items-center gap-3 rounded-xl border border-sun/40 bg-sun-light px-4 py-3 text-sm font-medium text-amber-800">
+            <span className="inline-flex items-center gap-1.5">
+              <Icon name="info" className="h-4 w-4" /> 登录已过期，请重新登录后再下单
+            </span>
+            <Link to="/login?redirect=/checkout" className="btn-primary ml-auto px-4 py-1.5 text-sm">
+              重新登录
+            </Link>
+          </div>
+        )}
+
         {errorMsg && (
           <div className="mt-3 flex items-start gap-2 rounded-xl border border-deal/30 bg-deal-light px-4 py-3 text-sm font-medium text-deal-dark">
-            <span aria-hidden>❌</span> <span>{errorMsg}</span>
+            <Icon name="info" className="mt-0.5 h-4 w-4 shrink-0" /> <span>{errorMsg}</span>
           </div>
         )}
       </section>
 
       <form onSubmit={onSubmit} className="space-y-5">
+        {/* A1 未登录：给清晰二选一（登录 OR 游客继续），不再硬性拦截 */}
+        {!isLoggedIn && (
+          <section className="card border-brand-200 bg-brand-50/40">
+            <h2 className="section-title text-base">下单方式</h2>
+            <p className="mt-1 text-sm text-ink-soft">
+              你还没有登录。可以登录后下单（订单进「我的订单」便于管理），也可以直接以游客身份下单。
+            </p>
+            <div className="mt-3 grid gap-2.5 sm:grid-cols-2">
+              <Link
+                to="/login?redirect=/checkout"
+                className="flex items-center gap-3 rounded-2xl border-2 border-slate-200 bg-surface p-3.5 text-left transition-all hover:border-brand/50 hover:bg-brand-50/50"
+              >
+                <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-brand-50 text-brand">
+                  <Icon name="user" className="h-5 w-5" />
+                </span>
+                <span>
+                  <span className="block text-sm font-semibold text-ink">登录后下单</span>
+                  <span className="block text-xs text-ink-muted">订单可在「我的订单」查看与管理</span>
+                </span>
+              </Link>
+              <button
+                type="button"
+                onClick={() => { setGuestChoice('guest'); setErrorMsg(null); }}
+                className={`flex items-center gap-3 rounded-2xl border-2 p-3.5 text-left transition-all ${
+                  guestChoice === 'guest'
+                    ? 'border-brand bg-brand-50 shadow-card'
+                    : 'border-slate-200 bg-surface hover:border-brand/50 hover:bg-brand-50/50'
+                }`}
+              >
+                <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-brand-50 text-brand">
+                  <Icon name="arrowRight" className="h-5 w-5" />
+                </span>
+                <span>
+                  <span className="block text-sm font-semibold text-ink">以游客身份继续</span>
+                  <span className="block text-xs text-ink-muted">凭「订单号 + 手机号」在『查订单』查询进度</span>
+                </span>
+              </button>
+            </div>
+            {guestChoice === 'guest' && (
+              <p className="mt-3 flex items-center gap-1.5 text-xs font-medium text-brand-700">
+                <Icon name="check" className="h-3.5 w-3.5" /> 已选择游客下单，请在下方填写联系人信息（手机号必填）
+              </p>
+            )}
+          </section>
+        )}
+
         {/* 订单内容摘要 */}
         <section className="card">
           <h2 className="section-title text-base">订单内容</h2>
           <ul className="mt-4 divide-y divide-slate-100">
             {items.map((i) => (
               <li key={i.id} className="flex items-center gap-3 py-2.5 text-sm first:pt-0">
-                <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-brand-50 text-xl">{i.emoji}</span>
+                <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-brand-50 text-brand">
+                  <Icon
+                    name={({ BUNDLE: 'package', FLIGHT: 'plane', HOTEL: 'hotel', VISA: 'visa', TRANSFER: 'car' } as const)[i.kind as 'BUNDLE' | 'FLIGHT' | 'HOTEL' | 'VISA' | 'TRANSFER'] ?? 'package'}
+                    className="h-5 w-5"
+                  />
+                </span>
                 <span
                   className={`rounded-full px-2 py-0.5 text-xs font-semibold ${KIND_INFO[i.kind].color}`}
                 >
@@ -343,6 +488,32 @@ export function CheckoutPage() {
               </li>
             ))}
           </ul>
+          {/* A5 优惠码：可见但暂不可用（后端无促销端点，不伪造折扣） */}
+          <div className="mt-4 rounded-2xl border border-dashed border-slate-200 bg-canvas px-3.5 py-3">
+            <label className="label text-xs" htmlFor="promo-code">优惠码</label>
+            <div className="mt-1 flex items-center gap-2">
+              <input
+                id="promo-code"
+                className="input flex-1"
+                placeholder="输入优惠码"
+                value={promoCode}
+                onChange={(e) => setPromoCode(e.target.value)}
+                aria-describedby="promo-hint"
+              />
+              <button
+                type="button"
+                disabled
+                className="btn-secondary shrink-0 cursor-not-allowed opacity-60"
+                title="优惠码功能即将上线"
+              >
+                使用
+              </button>
+            </div>
+            <p id="promo-hint" className="mt-1.5 flex items-center gap-1 text-xs text-ink-muted">
+              <Icon name="clock" className="h-3 w-3" /> 优惠码暂不可用，敬请期待
+            </p>
+          </div>
+
           <div className="mt-3 flex items-center justify-between border-t border-slate-200/80 pt-3">
             <span className="text-sm text-ink-soft">合计</span>
             <span className="price text-2xl">¥{fmt(total)}</span>
@@ -352,12 +523,18 @@ export function CheckoutPage() {
         {/* 联系人 */}
         <section className="card">
           <h2 className="section-title text-base">联系人信息</h2>
+          {!isLoggedIn && guestChoice === 'guest' && (
+            <p className="mt-1 text-xs text-ink-muted">
+              游客下单：请确保手机号准确 —— 后续查订单、接收确认短信都用它。
+            </p>
+          )}
           <div className="mt-4 grid gap-2 sm:gap-3 md:grid-cols-3">
             <div>
               <label className="label">姓名 *</label>
               <input
                 className="input"
                 required
+                autoComplete="name"
                 value={contactName}
                 onChange={(e) => setContactName(e.target.value)}
               />
@@ -365,17 +542,25 @@ export function CheckoutPage() {
             <div>
               <label className="label">手机号 *</label>
               <input
-                className="input"
+                type="tel"
+                inputMode="tel"
+                autoComplete="tel"
+                className={`input ${contactPhone && !isLikelyPhone(contactPhone) ? 'border-deal/60' : ''}`}
                 required
                 placeholder="如 +853 6234 5678"
                 value={contactPhone}
                 onChange={(e) => setContactPhone(e.target.value)}
               />
+              {contactPhone && !isLikelyPhone(contactPhone) && (
+                <p className="mt-1 text-xs font-medium text-deal">请输入 7–15 位有效手机号</p>
+              )}
             </div>
             <div>
               <label className="label">邮箱（选填）</label>
               <input
                 type="email"
+                inputMode="email"
+                autoComplete="email"
                 className="input"
                 value={contactEmail}
                 onChange={(e) => setContactEmail(e.target.value)}
@@ -484,6 +669,24 @@ export function CheckoutPage() {
               )}
             </div>
           )}
+
+          {/* D2 安心保障 + 退改徽章；并诚实说明当前线下确认流程（非即时在线扣款） */}
+          <div className="mt-4 space-y-3">
+            <div className="flex flex-wrap items-center gap-2">
+              <RefundBadge />
+              <span className="badge border border-brand-200 bg-brand-50 text-brand-700">
+                <Icon name="shield" className="h-3 w-3" />
+                提交即锁价 · 客服确认收款
+              </span>
+            </div>
+            <div className="flex items-start gap-2 rounded-2xl border border-sun/40 bg-sun-light px-4 py-3 text-sm text-amber-800">
+              <Icon name="info" className="mt-0.5 h-4 w-4 shrink-0" />
+              <span>
+                提交后订单状态为 <strong>待确认</strong>，客服将联系确认收款（暂为线下确认流程，<strong>不会</strong>立即在线扣款）。请保持手机畅通。
+              </span>
+            </div>
+            <TrustBadges variant="checkout" />
+          </div>
         </section>
 
         {/* 预订须知 / 扣损规则 / 值机提示（纯展示，提交逻辑不动） */}
@@ -500,13 +703,37 @@ export function CheckoutPage() {
                 合计 <span className="price text-xl align-middle sm:text-2xl">¥{fmt(total)}</span>
               </span>
               <button type="submit" className="btn-deal whitespace-nowrap px-4 text-sm sm:px-6 sm:text-base" disabled={submitting}>
-                {submitting ? '提交中…' : '提交订单'}
+                {submitting ? '提交中…' : !isLoggedIn && guestChoice === 'guest' ? '游客提交订单' : '提交订单'}
               </button>
             </div>
           </div>
         </div>
       </form>
     </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────
+// CheckoutSteps — A5 三步进度条（纯展示，反映现有单页流程，不改变流程本身）
+// 单页结算里三步同屏，这里只是把心智模型显性化：确认信息 → 填写出行人 → 提交。
+// ─────────────────────────────────────────────────────────────────
+const CHECKOUT_STEPS = ['确认信息', '填写出行人', '提交'] as const;
+
+function CheckoutSteps() {
+  return (
+    <ol className="mt-4 flex items-center gap-1.5 sm:gap-2" aria-label="结算步骤">
+      {CHECKOUT_STEPS.map((label, idx) => (
+        <li key={label} className="flex flex-1 items-center gap-1.5 sm:gap-2">
+          <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-brand-50 text-xs font-bold text-brand-700 nums">
+            {idx + 1}
+          </span>
+          <span className="truncate text-xs font-medium text-ink-soft sm:text-sm">{label}</span>
+          {idx < CHECKOUT_STEPS.length - 1 && (
+            <span className="h-px flex-1 bg-slate-200" aria-hidden />
+          )}
+        </li>
+      ))}
+    </ol>
   );
 }
 
@@ -658,12 +885,18 @@ function PassengerCard({
         <div>
           <label className="label text-xs">联系电话 *</label>
           <input
-            className="input"
+            type="tel"
+            inputMode="tel"
+            autoComplete="tel"
+            className={`input ${passenger.phone && !isLikelyPhone(passenger.phone) ? 'border-deal/60' : ''}`}
             required
             value={passenger.phone}
             onChange={(e) => onChange({ phone: e.target.value })}
             placeholder="紧急联系电话"
           />
+          {passenger.phone && !isLikelyPhone(passenger.phone) && (
+            <p className="mt-1 text-xs font-medium text-deal">请输入 7–15 位有效号码</p>
+          )}
         </div>
         <div>
           <label className="label text-xs">出生日期</label>

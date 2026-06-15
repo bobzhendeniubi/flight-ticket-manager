@@ -65,13 +65,15 @@ export class CustomersService {
         _sum: { total: true },
         _max: { createdAt: true },
       });
-      rows.forEach((r) =>
+      rows.forEach((r) => {
+        // userId 现为可空（游客单），但 where 已过滤 in: userIds（非空），守卫满足类型
+        if (!r.userId) return;
         aggMap.set(r.userId, {
           orders: r._count?._all ?? 0,
           spent: Number(r._sum?.total ?? 0),
           lastAt: r._max?.createdAt ?? null,
-        }),
-      );
+        });
+      });
     }
 
     return {

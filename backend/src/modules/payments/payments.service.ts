@@ -392,7 +392,11 @@ export class PaymentsService {
       throw new BadRequestError(`订单状态 ${order.status}，无法发起支付`);
     }
 
-    // 需要用户的 openid（wx.login 注册时写入）
+    // 需要用户的 openid（wx.login 注册时写入）。游客单（userId=null）无微信归属，
+    // 不能走小程序 JSAPI 支付（游客付款走其他通道）。
+    if (!order.userId) {
+      throw new BadRequestError('游客订单不支持小程序 JSAPI 支付，请走收款码或登录后支付');
+    }
     const user = await prisma.user.findUnique({ where: { id: order.userId } });
     const openid = user?.wechatOpenId;
     if (!openid) {

@@ -13,10 +13,10 @@
  * 库存档位口径：买家只看档位（充足/紧张/少量/极少量/售罄、房量充足/紧张/极少/售罄），
  * 绝不暴露原始余票/余房数字（与六档余位一致）。
  */
-import { useEffect, useState } from 'react';
-import { Link, useSearchParams } from 'react-router-dom';
+import { useEffect, useRef, useState } from 'react';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { type MockBundle, type BundleItem } from '../lib/mockData';
-import { api, type Bundle as ApiBundle, type Hotel, type AvailabilityTier, type FlightSearchResult } from '../lib/api';
+import { api, type Bundle as ApiBundle, type Hotel, type AvailabilityTier, type FlightSearchResult, type ProductRating } from '../lib/api';
 import { formatLocalTime } from '../lib/airports';
 import { BED_TYPE_NOTE } from '../lib/notices';
 import { useDebouncedValue } from '../lib/useDebouncedValue';
@@ -26,6 +26,14 @@ import { BenefitsStrip } from '../components/BenefitsStrip';
 import { BookingNotices } from '../components/BookingNotices';
 import { HeroCarousel } from '../components/HeroCarousel';
 import { Icon, type IconName } from '../components/Icon';
+import { Img } from '../components/Img';
+import { SortSelect, type SortOption } from '../components/SortSelect';
+import { StarRating } from '../components/StarRating';
+import { ScarcityBadge } from '../components/ScarcityBadge';
+import { RefundBadge } from '../components/RefundBadge';
+import { ListSkeleton } from '../components/LoadingSkeleton';
+import { ErrorRetry } from '../components/ErrorRetry';
+import { EmptyState } from '../components/EmptyState';
 import { matchKeyword } from '../components/HomeSections';
 import { useAuth } from '../stores/auth';
 import { useCart } from '../stores/cart';
@@ -41,13 +49,16 @@ const FALLBACK_PRICE = {
   BUSINESS: { go: 4380, ret: 4280 },
 } as const;
 
-/** MockBundle + 后端新增展示字段（升级价 / 关联房型 / 实时库存所需 id+晚数） */
+/** MockBundle + 后端新增展示字段（升级价 / 关联房型 / 实时库存所需 id+晚数 / 评分销量） */
 interface BundleView extends MockBundle {
   singleSupplementPerNight: number | null;
   cabinUpgradePerLeg: number | null;
   hotelRoomType: { id: string; name: string; hotelName: string } | null;
   hotelRoomTypeId: string | null;
   hotelNights: number | null;
+  productRating: ProductRating | null;
+  reviewCount: number | null;
+  soldCount: number | null;
 }
 
 function bundleApiToView(b: ApiBundle): BundleView {
@@ -65,7 +76,60 @@ function bundleApiToView(b: ApiBundle): BundleView {
     hotelRoomType: b.hotelRoomType ?? null,
     hotelRoomTypeId: b.hotelRoomTypeId ?? null,
     hotelNights: b.hotelNights ?? null,
+    productRating: b.productRating ?? null,
+    reviewCount: b.reviewCount ?? null,
+    soldCount: b.soldCount ?? null,
   };
+}
+
+// ── 排序（对标 Klook/携程 列表排序，选中值持久化到 ?sort=）──────────────
+type SortKey = 'recommended' | 'price_asc' | 'price_desc' | 'rating' | 'popular';
+
+const SORT_OPTIONS: SortOption[] = [
+  { value: 'recommended', label: '推荐' },
+  { value: 'price_asc', label: '价格低→高' },
+  { value: 'price_desc', label: '价格高→低' },
+  { value: 'rating', label: '好评优先' },
+  { value: 'popular', label: '热度' },
+];
+
+const SORT_KEYS = new Set<SortKey>(['recommended', 'price_asc', 'price_desc', 'rating', 'popular']);
+
+function parseSort(raw: string | null): SortKey {
+  return raw && SORT_KEYS.has(raw as SortKey) ? (raw as SortKey) : 'recommended';
+}
+
+/**
+ * 套餐"地板价"估算：用于排序与卡片"¥X起"展示。
+ * 卡内实时机票价随日期波动，列表排序用稳定的地面项总价 − 立减，避免排序抖动。
+ * （= listPrice/bundlePrice，即非机票项之和；机票实时价在卡内单独计算。）
+ */
+function bundleFloorPrice(b: BundleView): number {
+  return Math.max(0, b.bundlePrice - b.groundDiscount);
+}
+
+/** 销量阈值：达到才显示"近期热订"紧迫感徽章（避免给冷门套餐贴假热度）。 */
+const SOLD_RECENTLY_THRESHOLD = 30;
+
+/** 按排序键给可见套餐排序（recommended = 保留后端默认顺序，稳定排序）。 */
+function sortBundles(list: BundleView[], sort: SortKey): BundleView[] {
+  if (sort === 'recommended') return list;
+  const withIndex = list.map((b, i) => ({ b, i }));
+  withIndex.sort((x, y) => {
+    switch (sort) {
+      case 'price_asc':
+        return bundleFloorPrice(x.b) - bundleFloorPrice(y.b) || x.i - y.i;
+      case 'price_desc':
+        return bundleFloorPrice(y.b) - bundleFloorPrice(x.b) || x.i - y.i;
+      case 'rating':
+        return (y.b.productRating?.average ?? 0) - (x.b.productRating?.average ?? 0) || x.i - y.i;
+      case 'popular':
+        return (y.b.soldCount ?? 0) - (x.b.soldCount ?? 0) || x.i - y.i;
+      default:
+        return x.i - y.i;
+    }
+  });
+  return withIndex.map((w) => w.b);
 }
 
 function todayISO(offset = 3) {
@@ -155,15 +219,28 @@ function matchHotelForBundle(b: BundleView, hotels: Hotel[]): Hotel | undefined 
 export function BundlesPage() {
   const add = useCart((s) => s.add);
   const user = useAuth((s) => s.user);
+  const navigate = useNavigate();
   const [bundles, setBundles] = useState<BundleView[]>([]);
   const [hotels, setHotels] = useState<Hotel[]>([]);
+  const [status, setStatus] = useState<'loading' | 'ready' | 'error'>('loading');
+  const [reloadKey, setReloadKey] = useState(0);
 
+  // 套餐列表为主内容，决定页面加载/错误态；酒店明细为增强信息，失败仅降级（不阻塞页面）。
   useEffect(() => {
     let cancelled = false;
-    api.listBundles().then((r) => { if (!cancelled) setBundles(r.bundles.map(bundleApiToView)); }).catch(() => {/* 静默 */});
-    api.listHotels().then((r) => { if (!cancelled) setHotels(r.hotels); }).catch(() => {/* 静默 */});
+    setStatus('loading');
+    Promise.all([api.listBundles(), api.listHotels().catch(() => ({ hotels: [] as Hotel[] }))])
+      .then(([bundleRes, hotelRes]) => {
+        if (cancelled) return;
+        setBundles(bundleRes.bundles.map(bundleApiToView));
+        setHotels(hotelRes.hotels);
+        setStatus('ready');
+      })
+      .catch(() => {
+        if (!cancelled) setStatus('error');
+      });
     return () => { cancelled = true; };
-  }, []);
+  }, [reloadKey]);
 
   // ── 简单选择器：出发日期（默认 +3 天）+ 人数（默认 2 人）──────────────
   const [goDate, setGoDate] = useState(todayISO(3));
@@ -172,9 +249,23 @@ export function BundlesPage() {
 
   // 套餐关键字搜索（名称 / 行项 / 酒店名，防抖 300ms）
   // 首页套餐卡深链 /bundles?kw=xxx → 挂载时预填搜索框，落地即过滤
-  const [searchParams] = useSearchParams();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [keyword, setKeyword] = useState(() => searchParams.get('kw') ?? '');
   const kw = useDebouncedValue(keyword);
+
+  // 排序：从 ?sort= 读取，可分享；变更写回 URL（保留已有 query 如 kw）
+  const sort = parseSort(searchParams.get('sort'));
+  const onSortChange = (next: string) => {
+    setSearchParams(
+      (prev) => {
+        const p = new URLSearchParams(prev);
+        if (next === 'recommended') p.delete('sort');
+        else p.set('sort', next);
+        return p;
+      },
+      { replace: true },
+    );
+  };
 
   // 航班搜索缓存：多张卡共享同一 (日期,航线) 的搜索，避免重复请求
   const flightCache = useFlightSearchCache();
@@ -182,7 +273,7 @@ export function BundlesPage() {
   // 酒店明细 modal（笔记式：照片 + 房型 + 设施）
   const [hotelModal, setHotelModal] = useState<{ hotel: Hotel; roomTypeName: string | null } | null>(null);
 
-  const visible = bundles.filter(
+  const filtered = bundles.filter(
     (b) =>
       b.active &&
       matchKeyword(
@@ -195,6 +286,7 @@ export function BundlesPage() {
         ...b.items.map((i) => i.productName),
       ),
   );
+  const visible = sortBundles(filtered, sort);
 
   return (
     <div className="space-y-5">
@@ -239,16 +331,44 @@ export function BundlesPage() {
       </section>
 
       <section className="space-y-4">
-        <div className="flex items-end justify-between">
+        <div className="flex flex-wrap items-end justify-between gap-3">
           <h2 className="section-title inline-flex items-center gap-2">
             <Icon name="gift" className="h-5 w-5 text-brand" />一价全含套餐
           </h2>
-          <Link to="/hotels" className="text-sm font-semibold text-brand transition-colors hover:text-brand-dark">浏览更多 →</Link>
+          <div className="flex items-center gap-3">
+            {status === 'ready' && (
+              <SortSelect value={sort} options={SORT_OPTIONS} onChange={onSortChange} />
+            )}
+            <Link to="/hotels" className="shrink-0 text-sm font-semibold text-brand transition-colors hover:text-brand-dark">浏览更多 →</Link>
+          </div>
         </div>
-        {visible.length === 0 && bundles.length > 0 && (
-          <div className="card text-sm text-ink-soft">没有匹配"{kw}"的套餐，清空搜索框看全部。</div>
+
+        {status === 'loading' && <ListSkeleton rows={3} />}
+
+        {status === 'error' && (
+          <ErrorRetry
+            message="套餐列表没能加载出来，检查下网络再试一次"
+            onRetry={() => setReloadKey((k) => k + 1)}
+          />
         )}
-        {visible.map((b) => (
+
+        {status === 'ready' && visible.length === 0 && (
+          <EmptyState
+            icon="package"
+            title={kw ? `没有匹配"${kw}"的套餐` : '暂时没有可预订的套餐'}
+            hint={kw ? '换个关键词，或清空搜索看全部套餐' : '新行程正在筹备，过两天再来看看'}
+            action={
+              kw ? (
+                <button type="button" className="btn-secondary text-sm" onClick={() => setKeyword('')}>
+                  清空搜索
+                </button>
+              ) : undefined
+            }
+          />
+        )}
+
+        {status === 'ready' &&
+          visible.map((b) => (
           <ConfigurableBundleCard
             key={b.id}
             bundle={b}
@@ -256,6 +376,7 @@ export function BundlesPage() {
             goDate={goDate}
             pax={pax}
             hotel={matchHotelForBundle(b, hotels)}
+            onView={() => navigate(`/bundles/${b.id}`)}
             onShowHotel={(hotel) => setHotelModal({ hotel, roomTypeName: b.hotelRoomType?.name ?? null })}
             onAdd={(cfg) => {
               add({
@@ -315,6 +436,7 @@ function ConfigurableBundleCard({
   goDate,
   pax,
   hotel,
+  onView,
   onShowHotel,
   onAdd,
 }: {
@@ -323,10 +445,15 @@ function ConfigurableBundleCard({
   goDate: string;
   pax: number;
   hotel?: Hotel;
+  /** 跳转到套餐详情（/bundles/:id）；卡片整体或"查看详情"触发。 */
+  onView: () => void;
   onShowHotel: (hotel: Hotel) => void;
   onAdd: (cfg: BundleAddConfig) => void;
 }) {
   const [rooms, setRooms] = useState(1); // 房间数
+
+  // 日期输入框 ref：售罄时"看看其它日期"聚焦并弹出原生日期选择器（不暴露原始库存）。
+  const dateInputRef = useRef<HTMLInputElement>(null);
 
   // 每张卡可单独改出发日期：默认跟随顶部选择器（goDate 变化时同步），用户可在卡内覆盖。
   const [cardGoDate, setCardGoDate] = useState(goDate);
@@ -387,6 +514,27 @@ function ConfigurableBundleCard({
   // 售罄拦截：去/回任一航段或酒店售罄 → 禁止加购
   const soldOut = goTier === 'SOLD_OUT' || retTier === 'SOLD_OUT' || hotelTier === 'SOLD_OUT';
 
+  // 售罄时"看看其它日期"：聚焦日期框并尝试弹出原生选择器（不暴露任何库存数字）。
+  const nudgeDatePicker = () => {
+    const el = dateInputRef.current;
+    if (!el) return;
+    el.focus();
+    // showPicker 仅部分浏览器支持，失败静默（聚焦已足够引导用户改日期）。
+    try {
+      (el as HTMLInputElement & { showPicker?: () => void }).showPicker?.();
+    } catch {
+      /* 不支持 showPicker 的浏览器：focus 已生效 */
+    }
+  };
+
+  // 紧迫感徽章（对标 Klook/携程"近期热订"）：仅当销量达阈值才贴，绝不暴露原始库存数字。
+  const showScarcity = !soldOut && (b.soldCount ?? 0) >= SOLD_RECENTLY_THRESHOLD;
+
+  // 评分行（productRating 优先；缺省则不展示，不造假分数）
+  const rating = b.productRating;
+  const reviewCount = b.reviewCount ?? rating?.count ?? 0;
+  const soldCount = b.soldCount ?? 0;
+
   // 含什么 — 接送/签证按行项判断，中文客服全套餐标配
   type Inclusion = { icon: IconName; label: string };
   const inclusions = (
@@ -402,35 +550,52 @@ function ConfigurableBundleCard({
 
   return (
     <article className="card-interactive group overflow-hidden">
-      {b.photo ? (
-        <div className="relative h-48 w-full overflow-hidden bg-slate-100">
-          <img
-            src={b.photo}
-            alt={b.name}
-            className="img-zoom h-full w-full object-cover"
-            onError={(e) => { e.currentTarget.style.display = 'none'; }}
-          />
-          <div className="pointer-events-none absolute inset-x-0 bottom-0 h-20 bg-gradient-to-t from-black/40 to-transparent" />
-          <span className="absolute left-3 top-3 inline-flex h-8 w-8 items-center justify-center rounded-full bg-white/85 text-brand shadow-sm backdrop-blur-sm">
-            <Icon name="package" className="h-4 w-4" />
-          </span>
+      {/* 图片整块可点 → 详情页（不影响下方加购按钮，按钮 stopPropagation 走自己的逻辑） */}
+      <button
+        type="button"
+        onClick={onView}
+        aria-label={`查看「${b.name}」套餐详情`}
+        className="relative block w-full overflow-hidden bg-slate-100 text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/60"
+      >
+        <Img src={b.photo} alt={b.name} ratio="4/3" className="img-zoom max-h-48" />
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 h-20 bg-gradient-to-t from-black/40 to-transparent" />
+        <span className="absolute left-3 top-3 inline-flex h-8 w-8 items-center justify-center rounded-full bg-white/85 text-brand shadow-sm backdrop-blur-sm">
+          <Icon name="package" className="h-4 w-4" />
+        </span>
+        <div className="absolute right-3 top-3 flex flex-col items-end gap-1.5">
           {b.groundDiscount > 0 && (
-            <span className="badge-deal absolute right-3 top-3">立减 ¥{b.groundDiscount.toLocaleString()}</span>
+            <span className="badge-deal">立减 ¥{b.groundDiscount.toLocaleString()}</span>
           )}
+          {showScarcity && <ScarcityBadge kind="soldRecently" text="近期热订" />}
         </div>
-      ) : null}
+      </button>
       <div className="p-4 md:p-5">
       <div className="flex flex-wrap items-start gap-4">
-        {!b.photo && (
-          <span className="inline-flex h-10 w-10 items-center justify-center rounded-xl bg-brand-50 text-brand">
-            <Icon name="package" className="h-5 w-5" />
-          </span>
-        )}
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
-            <h3 className="font-extrabold tracking-tight text-ink">{b.name}</h3>
+            <h3 className="font-extrabold tracking-tight text-ink">
+              <Link
+                to={`/bundles/${b.id}`}
+                className="transition-colors hover:text-brand focus:outline-none focus-visible:underline"
+              >
+                {b.name}
+              </Link>
+            </h3>
           </div>
           <p className="mt-0.5 text-sm text-ink-soft">{b.tagline}</p>
+
+          {/* 评分 + 销量（对标 Klook/携程；缺省不展示，不造假） */}
+          {(rating || soldCount > 0) && (
+            <div className="mt-1.5 flex flex-wrap items-center gap-x-2.5 gap-y-1 text-xs">
+              {rating && (
+                <StarRating value={rating.average} size="sm" showValue count={reviewCount} />
+              )}
+              {soldCount > 0 && (
+                <span className="text-ink-muted">已售 {soldCount.toLocaleString()}</span>
+              )}
+            </div>
+          )}
+
           {/* 含什么 一眼看清 */}
           <div className="mt-2 flex flex-wrap gap-1.5 text-xs">
             {inclusions.map((inc) => (
@@ -439,6 +604,7 @@ function ConfigurableBundleCard({
                 {inc.label}
               </span>
             ))}
+            <RefundBadge />
           </div>
         </div>
 
@@ -457,6 +623,7 @@ function ConfigurableBundleCard({
         <label className="flex items-center gap-1.5">
           <span className="text-ink-soft">出发</span>
           <input
+            ref={dateInputRef}
             type="date"
             className="input h-7 w-24 sm:w-auto px-2 py-0.5 text-xs"
             min={todayISO(0)}
@@ -588,12 +755,25 @@ function ConfigurableBundleCard({
         </div>
       </div>
 
-      {/* 售罄提示 */}
+      {/* 售罄提示 + "看看其它日期"引导（不暴露任何原始库存数字，仅引导改日期） */}
       {soldOut && (
-        <p className="mt-2 text-right text-xs font-semibold text-deal">该日期已售罄，换个日期试试</p>
+        <div className="mt-2 flex flex-wrap items-center justify-end gap-2 text-xs font-semibold text-deal">
+          <span>该日期已售罄，换个日期试试</span>
+          <button
+            type="button"
+            className="inline-flex items-center gap-1 rounded-full bg-deal-light px-2.5 py-1 text-deal-dark transition-colors hover:bg-deal/15"
+            onClick={nudgeDatePicker}
+          >
+            <Icon name="calendar" className="h-3.5 w-3.5" />
+            看看其它日期
+          </button>
+        </div>
       )}
 
-      <div className="mt-3 flex justify-end gap-2">
+      <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
+        <button type="button" className="btn-ghost text-sm" onClick={onView}>
+          查看详情
+        </button>
         <Link to="/cart" className="btn-secondary text-sm">查看购物车</Link>
         <button
           className="btn-deal text-sm"

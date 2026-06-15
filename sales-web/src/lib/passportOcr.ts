@@ -11,7 +11,8 @@
  * tesseract 中文护照识别准确率约 60-75%，边缘场景（反光/倾斜）会失败。
  * 此模块保证：UI 有真实 OCR 流程，识别失败时清楚提示用户手填。
  */
-import Tesseract from 'tesseract.js';
+// tesseract.js 体积大（含 wasm + worker），改为在用到 OCR 的函数里动态 import，
+// 让它从主 bundle 拆出去（只有真正调护照识别时才下载）。
 
 export interface OcrResult {
   success: boolean;
@@ -58,6 +59,9 @@ export async function ocrPassport(
   const start = Date.now();
   try {
     onProgress?.(5, '初始化 OCR 引擎…');
+
+    // 动态加载 tesseract.js（首次识别时才下载，主 bundle 不含它）
+    const Tesseract = (await import('tesseract.js')).default;
 
     // 1. 用 chi_sim + eng 双语识别整页
     const result = await Tesseract.recognize(
