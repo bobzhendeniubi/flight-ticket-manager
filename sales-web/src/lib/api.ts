@@ -476,6 +476,14 @@ export interface CreateOrderInput {
     dateOfBirth: string;
     nationality?: string;
     passengerType?: PassengerType;
+    /**
+     * 护照全采集字段（客源地分析）—— 仅在前台 OCR 命中 MRZ 时带出，手填不要求。
+     * 镜像后端 passengerInputSchema：gender enum 'M'|'F'|'X'；passportExpiry/passportIssueCountry
+     * 全 optional，空值请省略（不要发 '' —— passportExpiry 的 YYYY-MM-DD 正则会拒空串）。
+     */
+    gender?: 'M' | 'F' | 'X';
+    passportExpiry?: string; // YYYY-MM-DD
+    passportIssueCountry?: string; // ISO-2
   }>;
   notes?: string;
   idempotencyKey?: string;

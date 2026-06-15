@@ -15,6 +15,13 @@ export interface OcrPassenger {
   passportNumber: string;
   dateOfBirth?: string;
   nationality?: string;
+  /**
+   * 护照全采集字段（客源地分析）—— 仅 AI 助手里 OCR 命中 MRZ 时带出，与结账页同步。
+   * 全 optional：老缓存 / 未命中 MRZ 时缺失，下游按"不展示/不发送"处理。
+   */
+  gender?: 'M' | 'F' | 'X';
+  passportExpiry?: string; // YYYY-MM-DD
+  passportIssueCountry?: string; // ISO-2
   /** OCR 时间戳，前端展示用 */
   capturedAt: number;
 }

@@ -120,6 +120,10 @@ export function AiAssistant() {
         passportNumber: result.suggested.passportNumber,
         dateOfBirth: result.suggested.dateOfBirth,
         nationality: result.suggested.nationality,
+        // 护照全采集字段（仅 MRZ 命中时由 OCR 带出，与结账页一致）；undefined 则不暂存。
+        gender: result.suggested.gender,
+        passportExpiry: result.suggested.passportExpiry,
+        passportIssueCountry: result.suggested.passportIssueCountry,
         capturedAt: Date.now(),
       };
       addPassenger(ocr);

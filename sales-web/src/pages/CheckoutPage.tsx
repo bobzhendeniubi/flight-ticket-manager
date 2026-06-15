@@ -28,6 +28,14 @@ interface PassengerForm {
   phone: string;
   dateOfBirth: string;
   nationality: string;
+  /**
+   * 护照全采集字段（客源地分析）——「只在 OCR 时采，不让手填」：
+   * 仅当上传护照 OCR 命中 MRZ 时自动写入，UI 只读展示，不作必填、不阻断提交。
+   * 空 = 该出行人没走 OCR 或未命中 MRZ；提交时省略，绝不发 ''。
+   */
+  gender?: 'M' | 'F' | 'X';
+  passportExpiry?: string; // YYYY-MM-DD
+  passportIssueCountry?: string; // ISO-2
 }
 
 const EMPTY_PASSENGER: PassengerForm = {
@@ -83,6 +91,9 @@ export function CheckoutPage() {
           passportNumber: string;
           dateOfBirth?: string;
           nationality?: string;
+          gender?: 'M' | 'F' | 'X';
+          passportExpiry?: string;
+          passportIssueCountry?: string;
         }>;
         if (ocrList.length > 0) {
           return ocrList.map((p) => ({
@@ -91,6 +102,10 @@ export function CheckoutPage() {
             phone: '',
             dateOfBirth: p.dateOfBirth ?? '',
             nationality: p.nationality ?? 'CN',
+            // AI 助手 OCR 命中 MRZ 时带过来的护照全采集字段（缺失则 undefined，只读展示，不发送空值）
+            gender: p.gender,
+            passportExpiry: p.passportExpiry,
+            passportIssueCountry: p.passportIssueCountry,
           }));
         }
       }
@@ -312,6 +327,11 @@ export function CheckoutPage() {
         dateOfBirth: p.dateOfBirth,
         nationality: p.nationality || 'CN',
         passengerType: 'ADULT',
+        // 护照全采集字段（仅 OCR 命中 MRZ 时有值）。空/undefined 一律省略 ——
+        // passportExpiry/passportIssueCountry 后端是严格正则/长度校验，发 '' 会被拒。
+        ...(p.gender ? { gender: p.gender } : {}),
+        ...(p.passportExpiry ? { passportExpiry: p.passportExpiry } : {}),
+        ...(p.passportIssueCountry ? { passportIssueCountry: p.passportIssueCountry } : {}),
       })),
       items: items.flatMap((i): CreateOrderInput['items'] => {
         if (i.kind === 'FLIGHT') {
@@ -844,12 +864,16 @@ function PassengerCard({
       });
 
       if (result.success) {
-        // 填入识别结果
+        // 填入识别结果。性别/护照有效期/签发国只在 MRZ 命中时由 OCR 带出（result.suggested 有值才覆盖），
+        // 这样实现了「只在 OCR 时全采集，不增加手填负担」——这几项不渲染成可填输入框，只读展示。
         onChange({
           fullName: result.suggested.fullName || passenger.fullName,
           passportNumber: result.suggested.passportNumber || passenger.passportNumber,
           dateOfBirth: result.suggested.dateOfBirth || passenger.dateOfBirth,
           nationality: result.suggested.nationality || passenger.nationality,
+          gender: result.suggested.gender ?? passenger.gender,
+          passportExpiry: result.suggested.passportExpiry ?? passenger.passportExpiry,
+          passportIssueCountry: result.suggested.passportIssueCountry ?? passenger.passportIssueCountry,
         });
         setOcrResult({
           ok: true,
@@ -997,6 +1021,20 @@ function PassengerCard({
           </select>
         </div>
       </div>
+      {/* OCR 已识别的护照附加信息（性别 / 有效期 / 签发地）——只读展示，不作必填字段。
+          只在上传护照 OCR 命中 MRZ 时出现；没识别到就不显示，手填用户完全看不到、也不用管。 */}
+      {(passenger.gender || passenger.passportExpiry || passenger.passportIssueCountry) && (
+        <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 rounded-xl border border-brand-200/70 bg-brand-50/50 px-3 py-2 text-xs text-brand-800">
+          <span className="inline-flex items-center gap-1 font-medium">
+            <Icon name="check" className="h-3.5 w-3.5" /> OCR 已识别
+          </span>
+          {passenger.gender && (
+            <span>性别 {passenger.gender === 'M' ? '男' : passenger.gender === 'F' ? '女' : '未注明'}</span>
+          )}
+          {passenger.passportExpiry && <span className="nums">护照有效期 {passenger.passportExpiry}</span>}
+          {passenger.passportIssueCountry && <span>签发地 {passenger.passportIssueCountry}</span>}
+        </div>
+      )}
     </div>
   );
 }

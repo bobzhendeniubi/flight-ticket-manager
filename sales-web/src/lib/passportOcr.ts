@@ -24,6 +24,8 @@ export interface OcrResult {
     givenNames: string;
     passportNumber: string;
     nationality: string;
+    /** TD3 line1 签发国 ISO-3 原始码（line1 第 3-5 位）；映射不到 ISO-2 时仅作展示，不发后端 */
+    issuingState?: string;
     dateOfBirth: string; // YYYY-MM-DD
     sex: 'M' | 'F' | 'X';
     expiryDate: string; // YYYY-MM-DD
@@ -45,6 +47,16 @@ export interface OcrResult {
     passportNumber?: string;
     dateOfBirth?: string;
     nationality?: string;
+    /**
+     * 以下三项只在 MRZ 命中时填（客源地分析需要全采集，但只在 OCR 时拿，不增加手填负担）：
+     *   gender              = MRZ sex（M/F/X）
+     *   passportExpiry      = MRZ 有效期（YYYY-MM-DD）
+     *   passportIssueCountry= MRZ 签发国转 ISO-2（映射不到 ISO-2 时省略，绝不发 3 字母给后端）
+     * 非 MRZ 兜底路径一律 undefined（手填只保留姓名/护照号/出生日期/国籍 4 项）。
+     */
+    gender?: 'M' | 'F' | 'X';
+    passportExpiry?: string;
+    passportIssueCountry?: string;
   };
   /** 识别耗时（ms） */
   elapsedMs: number;
@@ -92,12 +104,18 @@ export async function ocrPassport(
     const fallback = extractFallback(rawText);
 
     // 4. 给表单的建议字段
+    //    MRZ 命中时一并带出 性别/护照有效期/签发国（客源地分析全采集，只在 OCR 时拿）。
+    //    签发国：MRZ ISO-3 能映射到 ISO-2 才发（否则省略，后端要求 length(2)）。
+    const issueIso2 = mrz?.issuingState ? mrzNationalityToISO(mrz.issuingState) : undefined;
     const suggested = mrz
       ? {
           fullName: formatMrzName(mrz.surname, mrz.givenNames),
           passportNumber: mrz.passportNumber,
           dateOfBirth: mrz.dateOfBirth,
           nationality: mrzNationalityToISO(mrz.nationality),
+          gender: mrz.sex,
+          passportExpiry: mrz.expiryDate || undefined,
+          passportIssueCountry: issueIso2 && issueIso2.length === 2 ? issueIso2 : undefined,
         }
       : {
           fullName: fallback.englishName || fallback.chineseName,
@@ -166,6 +184,9 @@ function parseMRZ(text: string): OcrResult['mrz'] | undefined {
 
     try {
       // TD3 line 1: P<CCC<SURNAME<<GIVENNAME<...
+      // 第 3-5 位（0-indexed 2-5）是签发国 ISO-3（如 CHN）；仅当是 3 个字母时才采，OCR 噪点（含 <）跳过。
+      const issuingRaw = l1.substring(2, 5);
+      const issuingState = /^[A-Z]{3}$/.test(issuingRaw) ? issuingRaw : undefined;
       // 砍掉前 5 位（"P<CCC"），剩下是 SURNAME<<GIVEN<NAMES<... 用 << 分隔姓和名
       // 注意：先 split 再把 < 替成空格，否则收尾会把姓名边界丢掉
       const after = l1.substring(5);
@@ -192,6 +213,7 @@ function parseMRZ(text: string): OcrResult['mrz'] | undefined {
         givenNames,
         passportNumber,
         nationality,
+        issuingState,
         dateOfBirth: yymmddToIso(dobRaw, true),
         sex,
         expiryDate: yymmddToIso(expiryRaw, false),
