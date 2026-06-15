@@ -1,0 +1,3 @@
+-- AlterTable
+ALTER TABLE "HotelRoomType" ADD COLUMN     "maxAdults" INTEGER NOT NULL DEFAULT 2,
+ADD COLUMN     "maxChildren" INTEGER NOT NULL DEFAULT 1;

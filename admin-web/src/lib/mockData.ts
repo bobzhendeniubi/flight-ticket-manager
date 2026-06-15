@@ -11,6 +11,10 @@ export interface HotelRoomType {
   priceMult: number; // 倍率相对于 basePrice
   sleeps: number;
   bedType: string;
+  /** 可住大人数（缺省 2）；后端 maxAdults */
+  maxAdults?: number;
+  /** 可加小孩数（缺省 1）；后端 maxChildren */
+  maxChildren?: number;
 }
 
 export interface MockHotel {

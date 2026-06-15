@@ -584,16 +584,38 @@ export class OrderService {
             childSeatDiscountCnyPerPerson: true,
             infantPriceCny: true,
             legs: true,
+            // 关联房型容量 → 算 roomsNeeded（自动加房，套餐酒店部分按房价 ×rooms 收费）
+            hotelRoomType: { select: { maxAdults: true, maxChildren: true } },
           },
         });
         if (!bundle) throw new NotFoundError(`套餐 ${item.bundleId} 不存在`);
         if (!bundle.isActive) throw new BadRequestError('套餐已下架');
-        // 地面部分价：sum(items[kind!==FLIGHT].qty * unitPrice) - groundDiscount
-        // （机票部分留给 FLIGHT item 单独动态定价）
+        // 占座模型归一化（成人 / 占座儿童 / 不占座婴儿；向后兼容旧 pax → 全成人）。
+        // 先算占座，再据房型容量推 roomsNeeded（酒店地面部分按房间数缩放）。
+        const occupancy = resolveBundleOccupancy({
+          adultCount: item.adultCount,
+          childCount: item.childCount,
+          infantCount: item.infantCount,
+          quantity: item.quantity,
+          metadata: item.metadata,
+        });
+        // 所需房间数：选的人数一间房坐不下时自动加房（赵姐口径）。
+        //   roomsNeeded = max( ceil(成人/maxAdults), ceil(占座儿童/maxChildren), 1 )
+        // 套餐没绑房型 / 容量缺失 → computeRoomsNeeded 回退默认 2大1小（≈旧 ceil(seatPax/2) 行为）。
+        // 注意：单人入住（singleCount）不在此计入 —— 它是独立自愿加价项，容量才驱动房间数。
+        const roomsNeeded = computeRoomsNeeded(occupancy, bundle.hotelRoomType);
+
+        // 地面部分价（机票部分留给 FLIGHT item 单独动态定价）：
+        //   HOTEL 行（unitPrice=每间每晚, qty=晚数）按 unitPrice×qty×roomsNeeded 收费 → 套餐价随房间数涨；
+        //   非 HOTEL 地面行（TRANSFER/VISA 等）固定 unitPrice×qty×1（不随房间数变）。
+        //   bundleGround = Σ(HOTEL×rooms) + Σ(其它非机票) − groundDiscount
         const bundleItems = (bundle.items as Array<{ kind: string; qty: number; unitPrice: number }>) ?? [];
         const groundTotal = bundleItems
           .filter((b) => b.kind !== 'FLIGHT')
-          .reduce((s, b) => s + b.qty * b.unitPrice, 0);
+          .reduce((s, b) => {
+            const roomFactor = b.kind === 'HOTEL' ? roomsNeeded : 1;
+            return s + b.qty * b.unitPrice * roomFactor;
+          }, 0);
         const bundleUnitPrice = Math.max(0, Math.round(groundTotal - Number(bundle.groundDiscount)));
         // 套餐关联酒店 → 把房型+入住日期盖到订单行（房控板自动计入套餐占房）。
         // metadata 缺失/异常时只是不盖章，绝不阻断下单。
@@ -604,14 +626,6 @@ export class OrderService {
         //   升舱商务加价 = businessCount × businessUpgradeCnyPerLeg × legs
         //     —— 这是客户升舱的「总加价」（不是在全价商务票之上再加 ¥700）。客户机票仍按经济舱套餐价收，
         //        差价由商家补贴；升舱只占用真实商务舱库存（不超售），见下方按经济舱航段拆座逻辑。
-        // 占座模型归一化（成人 / 占座儿童 / 不占座婴儿；向后兼容旧 pax → 全成人）
-        const occupancy = resolveBundleOccupancy({
-          adultCount: item.adultCount,
-          childCount: item.childCount,
-          infantCount: item.infantCount,
-          quantity: item.quantity,
-          metadata: item.metadata,
-        });
         const addOn = computeBundleAddOn(
           bundle,
           hotelStamp,
@@ -634,9 +648,10 @@ export class OrderService {
           hotelRoomTypeId: hotelStamp?.hotelRoomTypeId,
           hotelCheckIn: hotelStamp?.hotelCheckIn,
           hotelCheckOut: hotelStamp?.hotelCheckOut,
-          // 把升级选择 + 重算明细落到订单行 metadata，供运营/财务查看（admin 内部仍可叫"单房差/升舱"）
-          metadata: addOn.hasAddOn
-            ? { ...(item.metadata ?? {}), addOns: addOn.breakdown }
+          // 把升级选择 + 重算明细 + roomsNeeded 落到订单行 metadata，供运营/财务查看
+          //（admin 内部仍可叫"单房差/升舱"；roomsNeeded 解释酒店部分为何按房价 ×rooms 收费）
+          metadata: addOn.hasAddOn || roomsNeeded > 1
+            ? { ...(item.metadata ?? {}), roomsNeeded, addOns: addOn.breakdown }
             : item.metadata,
         });
       }
@@ -1614,8 +1629,43 @@ export function resolveBundleOccupancy(item: BundleOccupancyInput): BundleOccupa
   }
   const seatPax = adultCount + childCount;
   const headCount = adultCount + childCount + infantCount;
-  const rooms = Math.ceil(seatPax / 2); // 每人 0.5 间；婴儿不占房
+  const rooms = Math.ceil(seatPax / 2); // 每人 0.5 间；婴儿不占房（旧拼房口径，展示用）
   return { adultCount, childCount, infantCount, seatPax, headCount, rooms };
+}
+
+// ── 按房型容量算所需房间数（C-v2 核心）────────────────────────────────
+/**
+ * 赵姐口径："每个酒店房型可以 fit 几大人几小孩；选的人数一间房坐不下时，自动加房。"
+ *
+ *   roomsNeeded = max( ceil(成人 / maxAdults), ceil(占座儿童 / maxChildren), 1 )
+ *
+ * - 婴儿不占床 → 不参与计算。
+ * - maxChildren=0 且有占座儿童时：把儿童并入成人维度 ceil((adult+child)/maxAdults)
+ *   近似（避免除 0；lone-child packing edge case）。正常配置 maxChildren≥1 不会走到这里。
+ * - 套餐没绑房型 / 容量缺失 → 回退默认 2大1小（等价旧 ceil(seatPax/2)-ish 行为）。
+ * - 注意：单人入住（singleCount）是独立自愿加价项，**不**计入 roomsNeeded —— 容量驱动房间数，
+ *   单人入住是另算的 opt-in 房差。此口径有意为之，已向 owner 标注。
+ *
+ * 导出供单测与 createOrder 共用。
+ */
+export const DEFAULT_ROOM_MAX_ADULTS = 2;
+export const DEFAULT_ROOM_MAX_CHILDREN = 1;
+export function computeRoomsNeeded(
+  occupancy: Pick<BundleOccupancy, 'adultCount' | 'childCount'>,
+  capacity: { maxAdults?: number | null; maxChildren?: number | null } | null,
+): number {
+  const maxAdults = Math.max(1, Math.trunc(capacity?.maxAdults ?? DEFAULT_ROOM_MAX_ADULTS));
+  const maxChildrenRaw = Math.trunc(capacity?.maxChildren ?? DEFAULT_ROOM_MAX_CHILDREN);
+  const adults = Math.max(0, occupancy.adultCount);
+  const children = Math.max(0, occupancy.childCount);
+
+  const adultRooms = Math.ceil(adults / maxAdults);
+  // maxChildren=0 → 该房型不单独承载儿童；把儿童并入成人维度（lone-child packing edge case）。
+  const childRooms =
+    maxChildrenRaw > 0
+      ? Math.ceil(children / maxChildrenRaw)
+      : Math.ceil((adults + children) / maxAdults);
+  return Math.max(adultRooms, childRooms, 1);
 }
 
 /**

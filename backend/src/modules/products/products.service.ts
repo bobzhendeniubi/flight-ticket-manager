@@ -40,7 +40,15 @@ function isCodeUniqueViolation(err: unknown): boolean {
 // ── Bundle 关联房型 include（list/get/create/update 共用）──────────────
 const BUNDLE_ROOM_INCLUDE = {
   hotelRoomType: {
-    select: { id: true, name: true, hotel: { select: { name: true } } },
+    // capacity/maxAdults/maxChildren 暴露给前台，使其能镜像 roomsNeeded 计算并展示
+    select: {
+      id: true,
+      name: true,
+      capacity: true,
+      maxAdults: true,
+      maxChildren: true,
+      hotel: { select: { name: true } },
+    },
   },
 } satisfies Prisma.BundleInclude;
 
@@ -150,6 +158,8 @@ export class ProductsService {
               name: rt.name,
               bedType: rt.bedType,
               capacity: rt.capacity,
+              maxAdults: rt.maxAdults,
+              maxChildren: rt.maxChildren,
               basePrice: new Prisma.Decimal(rt.basePrice),
               priceMultiplier: rt.priceMultiplier !== undefined ? new Prisma.Decimal(rt.priceMultiplier) : null,
             })),
@@ -194,6 +204,8 @@ export class ProductsService {
               name: rt.name,
               bedType: rt.bedType,
               capacity: rt.capacity,
+              maxAdults: rt.maxAdults,
+              maxChildren: rt.maxChildren,
               basePrice: new Prisma.Decimal(rt.basePrice),
               priceMultiplier: rt.priceMultiplier !== undefined ? new Prisma.Decimal(rt.priceMultiplier) : null,
             })),
@@ -562,9 +574,16 @@ function serializeBundle(b: BundleWithRoom, rating: ProductRatingAggregate = ZER
     rating,
     reviewCount: rating.count,
     soldCount: b.soldCount,
-    // admin-web 表单需要房型名 + 酒店名做展示
+    // admin-web 表单需要房型名 + 酒店名做展示；前台用 capacity/maxAdults/maxChildren 镜像 roomsNeeded
     hotelRoomType: hotelRoomType
-      ? { id: hotelRoomType.id, name: hotelRoomType.name, hotelName: hotelRoomType.hotel.name }
+      ? {
+          id: hotelRoomType.id,
+          name: hotelRoomType.name,
+          hotelName: hotelRoomType.hotel.name,
+          capacity: hotelRoomType.capacity,
+          maxAdults: hotelRoomType.maxAdults,
+          maxChildren: hotelRoomType.maxChildren,
+        }
       : null,
   };
 }

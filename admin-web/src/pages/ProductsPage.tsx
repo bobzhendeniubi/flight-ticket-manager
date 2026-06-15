@@ -59,6 +59,8 @@ function hotelApiToMock(h: Hotel): MockHotel {
       priceMult: rt.priceMultiplier ? Number(rt.priceMultiplier) : 1,
       sleeps: rt.capacity,
       bedType: rt.bedType ?? '',
+      maxAdults: rt.maxAdults ?? 2,
+      maxChildren: rt.maxChildren ?? 1,
     })),
   };
 }
@@ -180,6 +182,7 @@ export function ProductsPage() {
           roomTypes: n.roomTypes.map((rt) => ({
             name: rt.name, bedType: rt.bedType, capacity: rt.sleeps,
             basePrice: n.basePrice * rt.priceMult, priceMultiplier: rt.priceMult,
+            maxAdults: rt.maxAdults ?? 2, maxChildren: rt.maxChildren ?? 1,
           })),
         });
       }
@@ -195,6 +198,7 @@ export function ProductsPage() {
             roomTypes: n.roomTypes.map((rt) => ({
               name: rt.name, bedType: rt.bedType, capacity: rt.sleeps,
               basePrice: n.basePrice * rt.priceMult, priceMultiplier: rt.priceMult,
+              maxAdults: rt.maxAdults ?? 2, maxChildren: rt.maxChildren ?? 1,
             })),
           });
         }
@@ -455,7 +459,7 @@ function NewHotelForm({
     photos: [],
     amenities: ['免费 WiFi', '含早餐'],
     highlight: '',
-    roomTypes: [{ name: '标准房', priceMult: 1, sleeps: 2, bedType: '双床或大床' }],
+    roomTypes: [{ name: '标准房', priceMult: 1, sleeps: 2, bedType: '双床或大床', maxAdults: 2, maxChildren: 1 }],
   };
   return (
     <HotelEditorForm hotel={blank} title="新增酒店" submitLabel="添加" onCancel={onCancel} onSave={onSubmit} />
@@ -1159,7 +1163,7 @@ function HotelEditorForm({
   );
   const [amenities, setAmenities] = useState<string[]>(hotel.amenities);
   const [roomTypes, setRoomTypes] = useState<HotelRoomType[]>(
-    hotel.roomTypes.length > 0 ? hotel.roomTypes : [{ name: '', priceMult: 1, sleeps: 2, bedType: '' }],
+    hotel.roomTypes.length > 0 ? hotel.roomTypes : [{ name: '', priceMult: 1, sleeps: 2, bedType: '', maxAdults: 2, maxChildren: 1 }],
   );
   const [saved, setSaved] = useState(false);
 
@@ -1374,14 +1378,14 @@ function RoomTypesEditor({ roomTypes, onChange }: { roomTypes: HotelRoomType[]; 
         <button
           type="button"
           className="text-xs font-medium text-brand hover:text-brand-dark"
-          onClick={() => onChange([...roomTypes, { name: '', priceMult: 1, sleeps: 2, bedType: '' }])}
+          onClick={() => onChange([...roomTypes, { name: '', priceMult: 1, sleeps: 2, bedType: '', maxAdults: 2, maxChildren: 1 }])}
         >
           + 添加房型
         </button>
       </div>
       <div className="mt-2 space-y-2">
         {roomTypes.map((rt, idx) => (
-          <div key={idx} className="grid grid-cols-2 items-end gap-2 rounded-lg border border-slate-200 bg-canvas p-2 md:grid-cols-12">
+          <div key={idx} className="grid grid-cols-2 items-end gap-2 rounded-lg border border-slate-200 bg-canvas p-2 md:grid-cols-16">
             <div className="col-span-2 md:col-span-3">
               <label className="label text-xs">房型名 *</label>
               <input className="input" value={rt.name} onChange={(e) => setAt(idx, { name: e.target.value })} placeholder="海景大床房" />
@@ -1393,6 +1397,14 @@ function RoomTypesEditor({ roomTypes, onChange }: { roomTypes: HotelRoomType[]; 
             <div className="md:col-span-2">
               <label className="label text-xs">可住人数</label>
               <NumberInput min={1} max={20} className="input" value={rt.sleeps} onChange={(n) => setAt(idx, { sleeps: n ?? 1 })} integerOnly />
+            </div>
+            <div className="md:col-span-2">
+              <label className="label text-xs">可住大人</label>
+              <NumberInput min={1} max={20} className="input" value={rt.maxAdults ?? 2} onChange={(n) => setAt(idx, { maxAdults: n ?? 2 })} integerOnly />
+            </div>
+            <div className="md:col-span-2">
+              <label className="label text-xs">可加小孩</label>
+              <NumberInput min={0} max={20} className="input" value={rt.maxChildren ?? 1} onChange={(n) => setAt(idx, { maxChildren: n ?? 0 })} integerOnly />
             </div>
             <div className="md:col-span-2">
               <label className="label text-xs">价格系数</label>

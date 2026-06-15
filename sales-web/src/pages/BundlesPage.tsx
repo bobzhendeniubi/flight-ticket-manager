@@ -23,6 +23,7 @@ import { useDebouncedValue } from '../lib/useDebouncedValue';
 import { useFlightSearchCache, type FlightSearchCache, type FlightLeg } from '../lib/useFlightSearchCache';
 import { useHotelAvailability } from '../lib/useHotelAvailability';
 import { useBundleSellableDates } from '../lib/useBundleSellableDates';
+import { computeRoomsNeeded, resolveRoomCapacity } from '../lib/bundleRooms';
 import {
   SellableReasonChip,
   isSellableBlocked,
@@ -64,7 +65,15 @@ interface BundleView extends MockBundle {
   /** 不占座婴儿每人机票价（CNY）；null = 不收婴儿价 */
   infantPrice: number | null;
   legs: number;
-  hotelRoomType: { id: string; name: string; hotelName: string } | null;
+  // capacity/maxAdults/maxChildren 用于镜像后端 roomsNeeded（房间数按房型能住几大几小算）。
+  hotelRoomType: {
+    id: string;
+    name: string;
+    hotelName: string;
+    capacity?: number | null;
+    maxAdults?: number | null;
+    maxChildren?: number | null;
+  } | null;
   hotelRoomTypeId: string | null;
   hotelNights: number | null;
   /** 套餐默认出发日（管理员设；null = 未设，前端回退 today+3） */
@@ -365,7 +374,7 @@ export function BundlesPage() {
           </div>
         </div>
         <p className="mt-2 text-xs text-ink-muted">
-          默认已为你选好最近可出发日（今天 +3 天起），可改；成人和占座儿童每 2 人拼 1 间房（婴儿不占座、不占房，仍需护照）；回程日期按各套餐住宿晚数自动推算，机位 / 房量随日期实时更新，每张套餐只让选可售日期。
+          默认已为你选好最近可出发日（今天 +3 天起），可改；房间数按各套餐房型能住几大几小自动算，人多一间坐不下会自动加房、价格已含（婴儿不占座、不占床，仍需护照）；回程日期按各套餐住宿晚数自动推算，机位 / 房量随日期实时更新，每张套餐只让选可售日期。
         </p>
       </section>
 
@@ -481,7 +490,7 @@ interface BundleAddConfig {
   childCount: number; // 占座儿童（占座，比成人便宜）
   infantCount: number; // 不占座婴儿（不占座、不占房，仍需护照）
   headCount: number; // = adult + child + infant（出行人总数）
-  rooms: number; // 住宿间数 = ceil(seatPax/2)（拼房，2 人 1 间；婴儿不占房）
+  rooms: number; // 住宿间数 = roomsNeeded（按房型容量自动算；一间坐不下自动加房，婴儿不占床）
   goDate: string;
   returnDate: string;
   total: number;
@@ -520,12 +529,14 @@ function ConfigurableBundleCard({
   onAdd: (cfg: BundleAddConfig) => void;
 }) {
   // 占座模型（镜像后端 resolveBundleOccupancy）：
-  //   seatPax  = 成人 + 占座儿童（占座、计入机票座位与拼房）
+  //   seatPax  = 成人 + 占座儿童（占座、计入机票座位）
   //   headCount= 成人 + 占座儿童 + 不占座婴儿（出行人总数，都要护照）
-  //   baseRooms= ceil(seatPax / 2)（拼房，2 人 1 间；婴儿不占房）
   const seatPax = adultCount + childCount;
   const headCount = adultCount + childCount + infantCount;
-  const baseRooms = Math.max(1, Math.ceil(seatPax / 2));
+  // 房间数按关联房型容量算（镜像后端 computeRoomsNeeded）：一间坐不下就自动加房，
+  // 加的房按房价收钱。容量缺失/未绑房型 → 兜底 2 大 1 小。婴儿不占床、单人入住独立不计入。
+  const roomCapacity = resolveRoomCapacity(b.hotelRoomType);
+  const baseRooms = computeRoomsNeeded(adultCount, childCount, b.hotelRoomType);
   // 可选升级 add-on（默认 0；范围 0..seatPax — 婴儿不占座、不能升舱/不算单人入住房）。
   const [singleCount, setSingleCount] = useState(0); // 一个人住酒店（单人入住）
   const [businessCount, setBusinessCount] = useState(0); // 升级商务舱
@@ -629,8 +640,8 @@ function ConfigurableBundleCard({
   // 计算每个行项展示金额，逐行镜像后端权威重算（card total 必须 == order total，否则后端拒单）：
   //   FLIGHT：经济舱全价×seatPax（占座；婴儿不占座 → 不发机票座位）。儿童折扣/婴儿价不在机票行，
   //           而是并进套餐 add-on（与后端 computeBundleAddOn 一致：折扣/婴儿价计入 BUNDLE 行净额）。
-  //   HOTEL/VISA/TRANSFER：后端套餐地面价 = sum(bundle.items[kind!==FLIGHT].qty × unitPrice) − 立减，
-  //           按套餐固定份数计（不随占座/房间数缩放；拼房只是展示与占房口径，不改地面价）。
+  //   HOTEL：每间每晚价 × 晚数 × 房间数（镜像后端 roomFactor=roomsNeeded；一间坐不下自动加房按房价收）。
+  //   VISA/TRANSFER：固定份数，不随房间数缩放。
   const itemRows = b.items.map((item) => {
     if (item.kind === 'FLIGHT') {
       return {
@@ -640,8 +651,12 @@ function ConfigurableBundleCard({
       };
     }
     if (item.kind === 'HOTEL') {
-      // baseRooms 为占房展示口径；地面价按套餐固定份数（item.qty = 晚数）计，与后端一致。
-      return { ...item, computedTotal: item.unitPrice * item.qty, label: `${item.productName}（${baseRooms} 间 · 拼房）` };
+      // 酒店地面价随房间数缩放（item.qty = 晚数；× baseRooms = 房间数），与后端 hotel=单价×晚×房 一致。
+      return {
+        ...item,
+        computedTotal: item.unitPrice * item.qty * baseRooms,
+        label: `${item.productName}（${baseRooms} 间）`,
+      };
     }
     if (item.kind === 'VISA') {
       return { ...item, computedTotal: item.unitPrice * item.qty, label: item.productName };
@@ -766,7 +781,7 @@ function ConfigurableBundleCard({
           </div>
         </div>
 
-        {/* 人数 + 房间数（拼房，每 2 位占座者 1 间；婴儿不占座不占房） */}
+        {/* 人数 + 房间数（按房型容量自动算；一间坐不下自动加房，婴儿不占床） */}
         <div className="flex flex-col gap-1 items-end">
           <span className="inline-flex items-center gap-1.5 rounded-full bg-sky-50 px-2.5 py-1 text-xs font-semibold text-sky-700">
             <Icon name="user" className="h-3.5 w-3.5" />
@@ -774,8 +789,14 @@ function ConfigurableBundleCard({
           </span>
           <span className="inline-flex items-center gap-1.5 rounded-full bg-purple-50 px-2.5 py-1 text-xs font-semibold text-purple-700">
             <Icon name="hotel" className="h-3.5 w-3.5" />
-            {baseRooms} 间房（拼房，2 人 1 间）
+            房间数：{baseRooms} 间（每间最多 {roomCapacity.maxAdults} 大 {roomCapacity.maxChildren} 小）
           </span>
+          {/* 人数一间坐不下 → 自动加房，明确告知价格已含多出的房间 */}
+          {baseRooms > 1 && (
+            <span className="text-right text-[11px] font-medium text-purple-600">
+              需 {baseRooms} 间房（按 {roomCapacity.maxAdults} 大 {roomCapacity.maxChildren} 小自动安排，价格已含）
+            </span>
+          )}
         </div>
       </div>
 
@@ -849,13 +870,13 @@ function ConfigurableBundleCard({
         </div>
       )}
 
-      {/* 酒店 + 房型（含双早 · 2人1间 · 床型尽量安排）+ 实时房量档位 */}
+      {/* 酒店 + 房型（含双早 · 每间最多 X 大 Y 小 · 床型尽量安排）+ 实时房量档位 */}
       {(b.hotelRoomType || hotel) && (
         <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md bg-purple-50/70 p-2 sm:p-2.5 text-[11px] sm:text-xs text-slate-700">
           <span className="inline-flex items-center gap-1.5">
             <Icon name="hotel" className="h-4 w-4 text-purple-600" />
             <span className="font-medium">{b.hotelRoomType?.hotelName ?? hotel?.name}</span>
-            {b.hotelRoomType?.name ? ` · ${b.hotelRoomType.name}` : ''} · 含双早 · 2 人 1 间
+            {b.hotelRoomType?.name ? ` · ${b.hotelRoomType.name}` : ''} · 含双早 · 每间最多 {roomCapacity.maxAdults} 大 {roomCapacity.maxChildren} 小
           </span>
           <HotelTierBadge tier={hotelTier} />
           <span className="text-slate-500">（{BED_TYPE_NOTE}）</span>
@@ -1135,7 +1156,7 @@ function HotelInfoModal({
             <div className="mt-1 text-xs text-ink-soft">
               {matchedRoom?.bedType ? `${matchedRoom.bedType} · ` : ''}
               {matchedRoom ? `可住 ${matchedRoom.capacity} 人 · ` : ''}
-              含双早 · 2 人 1 间
+              含双早
             </div>
             <div className="mt-1 text-xs text-ink-muted">{BED_TYPE_NOTE}</div>
           </div>
@@ -1201,7 +1222,7 @@ function Stepper({
 
 /**
  * 占座模型出行人选择器：成人（占座，≥1）/ 占座儿童（占座，≥0）/ 不占座婴儿（≥0）。
- * 三行紧凑 stepper，附一行占座/房间数说明，让买家一眼看清人数与拼房间数。
+ * 三行紧凑 stepper，附一行说明；具体房间数按各套餐房型容量在卡片上算（一间坐不下自动加房）。
  */
 function OccupancyPicker({
   adultCount,
@@ -1218,15 +1239,13 @@ function OccupancyPicker({
   onChild: (v: number) => void;
   onInfant: (v: number) => void;
 }) {
-  const seatPax = adultCount + childCount;
-  const rooms = Math.max(1, Math.ceil(seatPax / 2));
   return (
     <div className="space-y-2 rounded-xl border border-slate-200 p-2.5">
       <OccupancyRow label="成人" hint="占座" value={adultCount} min={1} max={9} onChange={onAdult} />
       <OccupancyRow label="儿童" hint="占座 · 比成人便宜" value={childCount} min={0} max={9} onChange={onChild} />
-      <OccupancyRow label="婴儿" hint="不占座 · 不占房" value={infantCount} min={0} max={9} onChange={onInfant} />
+      <OccupancyRow label="婴儿" hint="不占座 · 不占床" value={infantCount} min={0} max={9} onChange={onInfant} />
       <p className="text-[11px] text-ink-muted">
-        房间数：{rooms} 间（拼房，2 人 1 间）
+        房间数按各套餐房型自动算（一间坐不下会自动加房）；以每张套餐卡上的"房间数"为准。
       </p>
     </div>
   );

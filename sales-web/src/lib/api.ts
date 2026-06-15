@@ -613,8 +613,19 @@ export interface Bundle {
    */
   childSeatDiscountCnyPerPerson?: number | null;
   infantPriceCny?: number | null;
-  /** 套餐关联酒店房型（展示酒店名 + 房型名；null = 未关联） */
-  hotelRoomType?: { id: string; name: string; hotelName: string } | null;
+  /**
+   * 套餐关联酒店房型（展示酒店名 + 房型名；null = 未关联）。
+   * capacity/maxAdults/maxChildren 由后端 serializer 暴露（products.service serialize），
+   * 供前台镜像 roomsNeeded 计算与展示（"每间最多 X 大 Y 小"）。全 optional，老缓存缺省按兜底处理。
+   */
+  hotelRoomType?: {
+    id: string;
+    name: string;
+    hotelName: string;
+    capacity?: number | null;
+    maxAdults?: number | null;
+    maxChildren?: number | null;
+  } | null;
   /** 关联房型 id（实时房量查询用；null = 未关联，不查房量） */
   hotelRoomTypeId?: string | null;
   /** 套餐住宿晚数（回程日期 = 出发 + 晚数；null = 用前端默认晚数） */

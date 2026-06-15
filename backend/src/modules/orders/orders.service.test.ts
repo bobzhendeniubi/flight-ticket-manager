@@ -45,6 +45,7 @@ import {
   computeBundleSeatSplit,
   computeRequiredPassengerCount,
   resolveBundleOccupancy,
+  computeRoomsNeeded,
 } from './orders.service.js';
 import type { OrderItemInput } from './orders.schemas.js';
 
@@ -594,6 +595,98 @@ describe('computeBundleAddOn', () => {
   it('婴儿不占座、不能升舱：2 大 0 小 0 婴 seatPax=2，businessCount=3 夹到 2', () => {
     const r = computeBundleAddOn(bundle, stamp, 0, 3, occ(2, 0, 0));
     expect(r.breakdown.businessCount).toBe(2);
+  });
+});
+
+// ── 按房型容量算所需房间数：computeRoomsNeeded（C-v2 核心）──────────────
+describe('computeRoomsNeeded', () => {
+  const occ = (adultCount: number, childCount = 0, infantCount = 0) =>
+    resolveBundleOccupancy({ adultCount, childCount, infantCount });
+  // 标准房型：1 间坐 2 大 1 小
+  const room2A1C = { maxAdults: 2, maxChildren: 1 };
+
+  it('2 大（房型 2大1小）→ 1 间（向后兼容：与旧 ceil(seatPax/2)=1 一致）', () => {
+    expect(computeRoomsNeeded(occ(2), room2A1C)).toBe(1);
+  });
+
+  it('4 大（房型 2大1小）→ ceil(4/2)=2 间', () => {
+    expect(computeRoomsNeeded(occ(4), room2A1C)).toBe(2);
+  });
+
+  it('2 大 2 小（房型 2大1小）→ max(ceil(2/2)=1, ceil(2/1)=2, 1)=2 间', () => {
+    expect(computeRoomsNeeded(occ(2, 2), room2A1C)).toBe(2);
+  });
+
+  it('2 大 1 小（房型 2大1小）→ max(1, 1, 1)=1 间', () => {
+    expect(computeRoomsNeeded(occ(2, 1), room2A1C)).toBe(1);
+  });
+
+  it('婴儿不占床：2 大 0 小 3 婴 → 仍 1 间（婴儿不计入）', () => {
+    expect(computeRoomsNeeded(occ(2, 0, 3), room2A1C)).toBe(1);
+  });
+
+  it('容量缺失 / 无房型 → 回退默认 2大1小：4 大 → 2 间', () => {
+    expect(computeRoomsNeeded(occ(4), null)).toBe(2);
+    expect(computeRoomsNeeded(occ(4), {})).toBe(2);
+  });
+
+  it('大房型 4大2小：6 大 → ceil(6/4)=2 间；4 小 → ceil(4/2)=2 间', () => {
+    expect(computeRoomsNeeded(occ(6), { maxAdults: 4, maxChildren: 2 })).toBe(2);
+    expect(computeRoomsNeeded(occ(0, 4), { maxAdults: 4, maxChildren: 2 })).toBe(2);
+  });
+
+  it('永远 ≥ 1 间（0 人也至少 1 间）', () => {
+    expect(computeRoomsNeeded(occ(0), room2A1C)).toBe(1);
+  });
+
+  it('lone-child packing：房型 maxChildren=0 时把儿童并入成人维度（不除 0）', () => {
+    // 2 大 1 小，maxAdults=2、maxChildren=0 → ceil((2+1)/2)=2 间
+    expect(computeRoomsNeeded(occ(2, 1), { maxAdults: 2, maxChildren: 0 })).toBe(2);
+  });
+});
+
+// ── 套餐酒店地面成本随房间数缩放（与 createOrder BUNDLE 分支同源公式）──────
+// 公式：bundleGround = Σ(HOTEL: unitPrice×qty×roomsNeeded) + Σ(其它非机票: unitPrice×qty) − groundDiscount
+describe('套餐酒店地面成本 ×roomsNeeded', () => {
+  const occ = (adultCount: number, childCount = 0) =>
+    resolveBundleOccupancy({ adultCount, childCount });
+  const room2A1C = { maxAdults: 2, maxChildren: 1 };
+  // HOTEL: 每间每晚 1280，住 2 晚；TRANSFER: 一口价 300（不随房间数变）
+  const items = [
+    { kind: 'FLIGHT', qty: 1, unitPrice: 0 },
+    { kind: 'HOTEL', qty: 2, unitPrice: 1280 },
+    { kind: 'TRANSFER', qty: 1, unitPrice: 300 },
+  ];
+  const groundDiscount = 100;
+  // 与 orders.service.ts BUNDLE 分支同源的纯函数复刻（验证缩放公式）
+  const computeGround = (rooms: number) =>
+    Math.max(
+      0,
+      Math.round(
+        items
+          .filter((b) => b.kind !== 'FLIGHT')
+          .reduce((s, b) => s + b.qty * b.unitPrice * (b.kind === 'HOTEL' ? rooms : 1), 0) -
+          groundDiscount,
+      ),
+    );
+
+  it('2 大 → 1 间 → 酒店 1280×2×1 + 300 − 100 = 2760', () => {
+    const rooms = computeRoomsNeeded(occ(2), room2A1C);
+    expect(rooms).toBe(1);
+    expect(computeGround(rooms)).toBe(1280 * 2 * 1 + 300 - 100); // 2760
+  });
+
+  it('4 大 → 2 间 → 酒店 1280×2×2 + 300 − 100 = 5320（酒店部分翻倍，接送不变）', () => {
+    const rooms = computeRoomsNeeded(occ(4), room2A1C);
+    expect(rooms).toBe(2);
+    expect(computeGround(rooms)).toBe(1280 * 2 * 2 + 300 - 100); // 5320
+  });
+
+  it('酒店成本随房间数线性增长（4 大酒店部分 = 2 大的 2 倍）', () => {
+    const hotelOnly = (rooms: number) => 1280 * 2 * rooms;
+    expect(hotelOnly(computeRoomsNeeded(occ(4), room2A1C))).toBe(
+      hotelOnly(computeRoomsNeeded(occ(2), room2A1C)) * 2,
+    );
   });
 });
 

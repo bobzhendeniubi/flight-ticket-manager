@@ -35,6 +35,10 @@ export default {
         card: '0 1px 2px rgba(15,23,42,.05)',
         pop: '0 8px 28px -10px rgba(15,23,42,.22)',
       },
+      gridTemplateColumns: {
+        // 房型编辑行：房型名/床型/可住人数/可住大人/可加小孩/价格系数/删除
+        16: 'repeat(16, minmax(0, 1fr))',
+      },
       keyframes: {
         'fade-in': { '0%': { opacity: '0' }, '100%': { opacity: '1' } },
       },

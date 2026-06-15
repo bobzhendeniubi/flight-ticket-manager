@@ -25,6 +25,7 @@ import { useDebouncedValue } from '../lib/useDebouncedValue';
 import { useFlightSearchCache, type FlightLeg } from '../lib/useFlightSearchCache';
 import { useHotelAvailability } from '../lib/useHotelAvailability';
 import { useBundleSellableDates } from '../lib/useBundleSellableDates';
+import { computeRoomsNeeded, resolveRoomCapacity } from '../lib/bundleRooms';
 import {
   SellableReasonChip,
   isSellableBlocked,
@@ -268,8 +269,8 @@ function BundleDetailContent({
   const isBiz = items.some((i) => i.kind === 'FLIGHT' && i.productName.includes('商务'));
   const cabin: 'ECONOMY' | 'BUSINESS' = isBiz ? 'BUSINESS' : 'ECONOMY';
 
-  // 配置器：出发日期 + 占座模型三计数（与列表卡同款；拼房间数 = ceil(seatPax/2) 自动推导）
-  //   seatPax  = 成人 + 占座儿童（占座、计入机票座位与拼房）
+  // 配置器：出发日期 + 占座模型三计数（与列表卡同款；房间数按房型容量自动算）
+  //   seatPax  = 成人 + 占座儿童（占座、计入机票座位）
   //   headCount= 成人 + 占座儿童 + 不占座婴儿（出行人总数，都要护照）
   // 出发日期初值：优先用套餐默认出发日（管理员设的最近可出发日），未设则回退 today+3。
   const [goDate, setGoDate] = useState(b.defaultDepartDate ?? todayISO(3));
@@ -278,7 +279,10 @@ function BundleDetailContent({
   const [infantCount, setInfantCount] = useState(0);
   const seatPax = adultCount + childCount;
   const headCount = adultCount + childCount + infantCount;
-  const baseRooms = Math.max(1, Math.ceil(seatPax / 2));
+  // 房间数按关联房型容量算（镜像后端 computeRoomsNeeded）：一间坐不下就自动加房，加的房按房价收钱。
+  // 容量缺失/未绑房型 → 兜底 2 大 1 小。婴儿不占床、单人入住独立不计入。
+  const roomCapacity = resolveRoomCapacity(b.hotelRoomType);
+  const baseRooms = computeRoomsNeeded(adultCount, childCount, b.hotelRoomType);
   // 可选升级 add-on（默认 0；范围 0..seatPax — 婴儿不占座，不能升舱/不算单人入住房）
   const [singleCount, setSingleCount] = useState(0); // 一个人住酒店（单人入住）
   const [businessCount, setBusinessCount] = useState(0); // 升级商务舱
@@ -352,8 +356,8 @@ function BundleDetailContent({
 
   // 逐行镜像后端权威重算（card total 必须 == order total，否则后端拒单）：
   //   FLIGHT：经济舱全价×seatPax（占座；婴儿不占座）。儿童折扣/婴儿价并进套餐 add-on（不在机票行）。
-  //   HOTEL/VISA/TRANSFER：后端套餐地面价 = sum(bundle.items[kind!==FLIGHT].qty×unitPrice) − 立减，
-  //           按套餐固定份数计（不随占座/房间数缩放；拼房只是展示与占房口径）。
+  //   HOTEL：每间每晚价 × 晚数 × 房间数（镜像后端 roomFactor=roomsNeeded；一间坐不下自动加房按房价收）。
+  //   VISA/TRANSFER：固定份数，不随房间数缩放。
   const itemRows = items.map((item) => {
     if (item.kind === 'FLIGHT') {
       return {
@@ -363,7 +367,8 @@ function BundleDetailContent({
       };
     }
     if (item.kind === 'HOTEL') {
-      return { ...item, computedTotal: item.unitPrice * item.qty, label: `${item.productName}（${baseRooms} 间 · 拼房）` };
+      // 酒店地面价随房间数缩放（item.qty = 晚数；× baseRooms = 房间数），与后端 hotel=单价×晚×房 一致。
+      return { ...item, computedTotal: item.unitPrice * item.qty * baseRooms, label: `${item.productName}（${baseRooms} 间）` };
     }
     if (item.kind === 'VISA') {
       return { ...item, computedTotal: item.unitPrice * item.qty, label: item.productName };
@@ -695,7 +700,7 @@ function BundleDetailContent({
               <div className="space-y-2 rounded-xl border border-slate-200 p-2.5">
                 <OccupancyRow label="成人" hint="占座" value={adultCount} min={1} max={9} onChange={setAdultCount} />
                 <OccupancyRow label="儿童" hint="占座 · 比成人便宜" value={childCount} min={0} max={9} onChange={setChildCount} />
-                <OccupancyRow label="婴儿" hint="不占座 · 不占房" value={infantCount} min={0} max={9} onChange={setInfantCount} />
+                <OccupancyRow label="婴儿" hint="不占座 · 不占床" value={infantCount} min={0} max={9} onChange={setInfantCount} />
               </div>
               <p className="mt-1.5 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
                 <span className="inline-flex items-center gap-1.5 font-semibold text-sky-700">
@@ -704,9 +709,15 @@ function BundleDetailContent({
                 </span>
                 <span className="inline-flex items-center gap-1.5 font-semibold text-purple-700">
                   <Icon name="hotel" className="h-3.5 w-3.5" />
-                  {baseRooms} 间房（拼房，2 人 1 间）
+                  房间数：{baseRooms} 间（每间最多 {roomCapacity.maxAdults} 大 {roomCapacity.maxChildren} 小）
                 </span>
               </p>
+              {/* 人数一间坐不下 → 自动加房，明确告知价格已含多出的房间 */}
+              {baseRooms > 1 && (
+                <p className="mt-1 text-xs font-medium text-purple-600">
+                  需 {baseRooms} 间房（按 {roomCapacity.maxAdults} 大 {roomCapacity.maxChildren} 小自动安排，价格已含）
+                </p>
+              )}
             </div>
 
             {/* 可选升级 add-on（即选即享，下单即含；不走客服） */}

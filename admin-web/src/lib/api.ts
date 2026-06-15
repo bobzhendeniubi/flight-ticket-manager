@@ -527,6 +527,10 @@ export interface HotelRoomType {
   basePrice: string;
   priceMultiplier: string | null;
   costPriceCny: string | null;
+  /** 可住大人数（后端默认 2） */
+  maxAdults: number;
+  /** 可加小孩数（后端默认 1） */
+  maxChildren: number;
 }
 
 export interface Hotel {

@@ -589,7 +589,12 @@ model HotelRoomType {
   hotelId         String
   name            String // e.g., "Deluxe King"
   bedType         String? // "1 张大床 · 海景"
-  capacity        Int // max guests
+  capacity        Int // max guests（总人数上限；保留作为整体容量）
+  // 单间可坐几大人 / 几小孩（赵姐："每个酒店房型可以 fit 几大人几小孩"）。
+  // 套餐下单时据此算 roomsNeeded = max(ceil(成人/maxAdults), ceil(儿童/maxChildren), 1)，
+  // 房间数 >1 时套餐酒店部分按房价 ×roomsNeeded 收费（自动加房收钱）。婴儿不占床。
+  maxAdults       Int      @default(2)
+  maxChildren     Int      @default(1)
   basePrice       Decimal  @db.Decimal(10, 2)
   // 净房价（CNY/晚）— 付给酒店的真实成本；NULL 时按 basePrice × 0.70 估算
   costPriceCny    Decimal? @db.Decimal(10, 2)
