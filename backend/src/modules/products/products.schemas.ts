@@ -30,6 +30,42 @@ export const hotelAvailabilityQuerySchema = z
   });
 export type HotelAvailabilityQuery = z.infer<typeof hotelAvailabilityQuerySchema>;
 
+// ── 套餐可售日期（公开端点查询）────────────────────────────────────────────
+/** 可售日期查询最长跨度（天，含两端）。*/
+export const MAX_SELLABLE_RANGE_DAYS = 90;
+/** 仅给了 from 时的默认跨度（天，含两端）。*/
+export const DEFAULT_SELLABLE_RANGE_DAYS = 60;
+
+/** [from, to] 的天数（含两端）；YYYY-MM-DD 按 UTC 零点解析。*/
+export function daysInclusive(from: string, to: string): number {
+  return (
+    Math.round(
+      (Date.parse(`${to}T00:00:00.000Z`) - Date.parse(`${from}T00:00:00.000Z`)) / DAY_MS,
+    ) + 1
+  );
+}
+
+/** from + days → YYYY-MM-DD（UTC 零点口径）。*/
+function addDaysOnly(from: string, days: number): string {
+  return new Date(Date.parse(`${from}T00:00:00.000Z`) + days * DAY_MS).toISOString().slice(0, 10);
+}
+
+export const bundleSellableDatesQuerySchema = z
+  .object({
+    from: dateOnlyStr,
+    // to 省略时 = from + (DEFAULT_SELLABLE_RANGE_DAYS - 1)（默认 60 天窗口，含两端）
+    to: dateOnlyStr.optional(),
+  })
+  .transform((q) => ({
+    from: q.from,
+    to: q.to ?? addDaysOnly(q.from, DEFAULT_SELLABLE_RANGE_DAYS - 1),
+  }))
+  .refine((q) => q.from <= q.to, { message: '起始日不能晚于结束日' })
+  .refine((q) => daysInclusive(q.from, q.to) <= MAX_SELLABLE_RANGE_DAYS, {
+    message: `日期跨度最多 ${MAX_SELLABLE_RANGE_DAYS} 天`,
+  });
+export type BundleSellableDatesQuery = z.infer<typeof bundleSellableDatesQuerySchema>;
+
 // ── Hotel ────────────────────────────────────────────────────────────────
 export const createHotelBodySchema = z.object({
   name: z.string().min(1).max(200),
@@ -107,6 +143,17 @@ export const bundleItemSchema = z.object({
 });
 export type BundleItemInput = z.infer<typeof bundleItemSchema>;
 
+/** 运营封盘日（按出发日 D）：[{date:"2026-02-15", reason?:"春节封盘"}]，最多 120 条。*/
+export const bundleBlackoutSchema = z
+  .array(
+    z.object({
+      date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, '日期格式应为 YYYY-MM-DD'),
+      reason: z.string().max(60).optional(),
+    }),
+  )
+  .max(120);
+export type BundleBlackoutInput = z.infer<typeof bundleBlackoutSchema>;
+
 export const createBundleBodySchema = z.object({
   name: z.string().min(1).max(200),
   tagline: z.string().max(300).optional(),
@@ -130,6 +177,14 @@ export const createBundleBodySchema = z.object({
   infantPriceCny: z.number().int().nonnegative().max(1_000_000).optional(),
   // 机票航段数（来回 = 2，单程 = 1）
   legs: z.number().int().min(1).max(8).optional(),
+  // 运营封盘日（按出发日 D）；该日整套餐不可售，优先级高于库存判定。省略 = 不改。
+  blackoutDates: bundleBlackoutSchema.optional(),
+  // 该套餐前台默认出发日（YYYY-MM-DD）；null = 用全局默认。仅影响前台初始选中，不参与可售判定。
+  defaultDepartDate: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/u, '日期格式应为 YYYY-MM-DD')
+    .nullable()
+    .optional(),
   isActive: z.boolean().default(true),
 });
 export type CreateBundleBody = z.infer<typeof createBundleBodySchema>;

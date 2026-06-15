@@ -101,6 +101,25 @@ export interface HotelAvailabilityResult {
   nights: number;
 }
 
+// ── 套餐可售日期（公开；按 航班+酒店库存 逐日算，可设 blackout 封盘）──────────
+/** 某日不可售的原因：封盘 / 机位售罄 / 满房；可售时为 null。 */
+export type SellableDateReason = 'BLACKOUT' | 'FLIGHT_SOLD_OUT' | 'HOTEL_SOLD_OUT' | null;
+
+/** GET /products/bundles/:id/sellable-dates 的单日（只回档位，不回原始库存数字）。 */
+export interface SellableDate {
+  dateISO: string;
+  sellable: boolean;
+  reason: SellableDateReason;
+  /** 当日去/回机位综合档位（null = 无班次/未配置；前端不据此造数字） */
+  flightTier: AvailabilityTier | null;
+  /** 当日房量档位（null = 未关联包房） */
+  hotelTier: HotelAvailabilityTier | null;
+}
+
+export interface SellableDatesResult {
+  dates: SellableDate[];
+}
+
 /** 行李规则（按 航班×舱等 配置；kg / 件数可分别为空，未配置整体为 null） */
 export interface BaggagePolicyInfo {
   checkedKg: number | null;
@@ -592,6 +611,16 @@ export interface Bundle {
   hotelRoomTypeId?: string | null;
   /** 套餐住宿晚数（回程日期 = 出发 + 晚数；null = 用前端默认晚数） */
   hotelNights?: number | null;
+  /**
+   * 封盘日期（管理员手动设的不可售日；逐日可售查询会标 reason='BLACKOUT'）。
+   * 全 optional / 缺省 []，老缓存不带此字段时前端按"无封盘"处理。
+   */
+  blackoutDates?: Array<{ date: string; reason?: string | null }> | null;
+  /**
+   * 套餐默认出发日（管理员设的"最近可出发日"；null = 未设，前端回退 today+3）。
+   * 前台据此初始化出发日期输入框（仍受可售区间约束）。
+   */
+  defaultDepartDate?: string | null;
   /** 评分聚合 + 销量（后端 list/detail 现按 item 返回；全 optional 不破坏老页面） */
   productRating?: ProductRating;
   reviewCount?: number;
@@ -891,6 +920,16 @@ export const api = {
   getHotelAvailability: (params: { hotelRoomTypeId: string; checkIn: string; checkOut: string }) => {
     const qs = new URLSearchParams(params);
     return apiFetch<HotelAvailabilityResult>(`/products/hotel-availability?${qs.toString()}`);
+  },
+
+  // 套餐可售日期（公开；按 航班+酒店库存 逐日算，可设 blackout 封盘）。
+  // to 可省（后端默认 from+59 天）；区间 ≤90 天。只回档位与 sellable/reason，不回原始数字。
+  getBundleSellableDates: (bundleId: string, from: string, to?: string) => {
+    const qs = new URLSearchParams({ from });
+    if (to) qs.set('to', to);
+    return apiFetch<SellableDatesResult>(
+      `/products/bundles/${encodeURIComponent(bundleId)}/sellable-dates?${qs.toString()}`,
+    );
   },
 
   // 结算 / 佣金 — 代理在自己的 dashboard 看分成

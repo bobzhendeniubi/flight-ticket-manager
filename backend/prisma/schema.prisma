@@ -709,6 +709,12 @@ model Bundle {
   infantPriceCny                Int @default(0)
   // 机票航段数（来回 = 2，单程 = 1）— 升舱加价 = businessUpgradeCnyPerLeg × legs × businessCount
   legs           Int      @default(2)
+  // 运营封盘日（按出发日 D）：该日整套餐不可售，优先级高于库存判定。
+  //   形如 [{date:"2026-02-15", reason:"春节封盘"}]；reason 可选。
+  blackoutDates     Json    @default("[]")
+  // 该套餐前台默认出发日（YYYY-MM-DD）；null = 用全局默认。
+  //   仅影响前台初始选中的出发日，不参与"可售判定"。
+  defaultDepartDate String?
   soldCount      Int      @default(0) // 已售份数（展示用，seed 填充）
   isActive       Boolean  @default(true)
   createdAt      DateTime @default(now())

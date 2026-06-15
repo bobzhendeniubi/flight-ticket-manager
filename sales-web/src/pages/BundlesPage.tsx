@@ -22,6 +22,12 @@ import { BED_TYPE_NOTE } from '../lib/notices';
 import { useDebouncedValue } from '../lib/useDebouncedValue';
 import { useFlightSearchCache, type FlightSearchCache, type FlightLeg } from '../lib/useFlightSearchCache';
 import { useHotelAvailability } from '../lib/useHotelAvailability';
+import { useBundleSellableDates } from '../lib/useBundleSellableDates';
+import {
+  SellableReasonChip,
+  isSellableBlocked,
+  sellableBlockTitle,
+} from '../components/SellableReasonChip';
 import { BenefitsStrip } from '../components/BenefitsStrip';
 import { BookingNotices } from '../components/BookingNotices';
 import { HeroCarousel } from '../components/HeroCarousel';
@@ -61,6 +67,8 @@ interface BundleView extends MockBundle {
   hotelRoomType: { id: string; name: string; hotelName: string } | null;
   hotelRoomTypeId: string | null;
   hotelNights: number | null;
+  /** 套餐默认出发日（管理员设；null = 未设，前端回退 today+3） */
+  defaultDepartDate: string | null;
   productRating: ProductRating | null;
   reviewCount: number | null;
   soldCount: number | null;
@@ -86,6 +94,7 @@ function bundleApiToView(b: ApiBundle): BundleView {
     hotelRoomType: b.hotelRoomType ?? null,
     hotelRoomTypeId: b.hotelRoomTypeId ?? null,
     hotelNights: b.hotelNights ?? null,
+    defaultDepartDate: b.defaultDepartDate ?? null,
     productRating: b.productRating ?? null,
     reviewCount: b.reviewCount ?? null,
     soldCount: b.soldCount ?? null,
@@ -356,7 +365,7 @@ export function BundlesPage() {
           </div>
         </div>
         <p className="mt-2 text-xs text-ink-muted">
-          成人和占座儿童每 2 人拼 1 间房（婴儿不占座、不占房，仍需护照）；回程日期按各套餐住宿晚数自动推算，机位 / 房量随日期实时更新。
+          默认已为你选好最近可出发日（今天 +3 天起），可改；成人和占座儿童每 2 人拼 1 间房（婴儿不占座、不占房，仍需护照）；回程日期按各套餐住宿晚数自动推算，机位 / 房量随日期实时更新，每张套餐只让选可售日期。
         </p>
       </section>
 
@@ -524,9 +533,24 @@ function ConfigurableBundleCard({
   // 日期输入框 ref：售罄时"看看其它日期"聚焦并弹出原生日期选择器（不暴露原始库存）。
   const dateInputRef = useRef<HTMLInputElement>(null);
 
-  // 每张卡可单独改出发日期：默认跟随顶部选择器（goDate 变化时同步），用户可在卡内覆盖。
-  const [cardGoDate, setCardGoDate] = useState(goDate);
-  useEffect(() => setCardGoDate(goDate), [goDate]);
+  // 每张卡可单独改出发日期：初值优先用套餐默认出发日（管理员设的最近可出发日），
+  // 未设则回退顶部选择器（页级 goDate = today+3 默认）。用户可在卡内覆盖。
+  const [cardGoDate, setCardGoDate] = useState(b.defaultDepartDate ?? goDate);
+  // 页→卡同步：顶部出发日期变化时把各卡同步过去（sync 逻辑保持不变）。
+  // mount 用 ref 跳过，避免初始把套餐默认日清成 today+3；之后每次页级变更都同步并提示。
+  const didMountSyncRef = useRef(false);
+  const [syncedHint, setSyncedHint] = useState(false);
+  useEffect(() => {
+    if (!didMountSyncRef.current) {
+      didMountSyncRef.current = true;
+      return;
+    }
+    setCardGoDate(goDate);
+    // 短暂提示：本卡已跟随上方出发日期更新（纯展示，不改同步逻辑）。
+    setSyncedHint(true);
+    const t = setTimeout(() => setSyncedHint(false), 2600);
+    return () => clearTimeout(t);
+  }, [goDate]);
   // 库存/价格查询用防抖日期（边改边查后台，不每次 onChange 都打 API）
   const queryCardGo = useDebouncedValue(cardGoDate);
 
@@ -575,6 +599,15 @@ function ConfigurableBundleCard({
 
   // 酒店实时房量（关联房型才查；无包房配置 → null 不展示）
   const hotelTier = useHotelAvailability(b.hotelRoomTypeId, queryCardGo, queryReturnDate);
+
+  // 套餐可售日期窗口（按 航班+酒店库存 逐日 + blackout 封盘）。查失败 → PERMISSIVE（空集不硬拦截）。
+  const sellable = useBundleSellableDates(b.id);
+  // 所选出发日不在可售集合时的原因（封盘/机位满/满房）；可售或未知 → null（不拦截）。
+  // 仅当窗口已就绪且确有可售日时才据集合判定，避免空窗（加载中/查失败）误拦。
+  const dateReason =
+    sellable.status === 'ready' && sellable.sellableSet.size > 0 && !sellable.sellableSet.has(cardGoDate)
+      ? sellable.reasonOf(cardGoDate)
+      : null;
 
   // 实时机票单人来回价（搜不到用兜底价）
   const fb = FALLBACK_PRICE[cabin];
@@ -633,6 +666,10 @@ function ConfigurableBundleCard({
 
   // 售罄拦截：去/回任一航段或酒店售罄 → 禁止加购
   const soldOut = goTier === 'SOLD_OUT' || retTier === 'SOLD_OUT' || hotelTier === 'SOLD_OUT';
+  // 加购禁用（单一路径）：实时售罄 OR 所选日期不可售（封盘/机位满/满房）。
+  // dateReason 层叠在既有 soldOut 之上，不另开并行禁用路径；售罄文案优先，否则用日期原因文案。
+  const addBlocked = soldOut || isSellableBlocked(dateReason);
+  const blockTitle = soldOut ? '该日期已售罄，换个日期试试' : sellableBlockTitle(dateReason);
 
   // 售罄时"看看其它日期"：聚焦日期框并尝试弹出原生选择器（不暴露任何库存数字）。
   const nudgeDatePicker = () => {
@@ -742,7 +779,7 @@ function ConfigurableBundleCard({
         </div>
       </div>
 
-      {/* 出行日期可改：每张卡独立选出发日期，机位/房量/价格随之实时更新 */}
+      {/* 出行日期可改：每张卡独立选出发日期，机位/房量/价格随之实时更新；只让选可售日期。 */}
       <div className="mt-3 inline-flex flex-wrap items-center gap-2 rounded-lg bg-canvas px-2.5 py-1.5 text-xs font-semibold text-ink">
         <Icon name="calendar" className="h-4 w-4 text-brand" />
         <label className="flex items-center gap-1.5">
@@ -751,13 +788,25 @@ function ConfigurableBundleCard({
             ref={dateInputRef}
             type="date"
             className="input h-7 w-24 sm:w-auto px-2 py-0.5 text-xs"
-            min={todayISO(0)}
+            // 约束到可售区间：min = max(今天, 首个可售日)，max = 末个可售日。
+            // 窗口未知（加载中/查失败 PERMISSIVE）→ 回退 min=今天、无 max（不硬框）。
+            min={sellable.minDate && sellable.minDate > todayISO(0) ? sellable.minDate : todayISO(0)}
+            max={sellable.maxDate ?? undefined}
             value={cardGoDate}
             onChange={(e) => setCardGoDate(e.target.value)}
             aria-label="出发日期"
           />
         </label>
         <span className="text-ink-soft">回 {formatMonthDay(displayReturnDate)} · {nights} 晚</span>
+        {/* 页级出发日期把本卡同步过来时的短暂提示（纯展示，不改同步逻辑） */}
+        {syncedHint && (
+          <span className="inline-flex items-center gap-1 rounded-full bg-brand-50 px-2 py-0.5 text-[11px] font-medium text-brand">
+            <Icon name="check" className="h-3 w-3" />
+            已跟随上方出发日期更新
+          </span>
+        )}
+        {/* 所选日期不可售：保留所选值，旁边标原因（封盘/机位满/满房），加购同时禁用 */}
+        <SellableReasonChip reason={dateReason} />
       </div>
 
       {/* 去/回航班号 + 时刻 + 实时余位档位 */}
@@ -938,10 +987,10 @@ function ConfigurableBundleCard({
         </div>
       </div>
 
-      {/* 售罄提示 + "看看其它日期"引导（不暴露任何原始库存数字，仅引导改日期） */}
-      {soldOut && (
+      {/* 不可加购提示 + "看看其它日期"引导（售罄 / 封盘 / 机位满 / 满房；不暴露原始库存数字） */}
+      {addBlocked && (
         <div className="mt-2 flex flex-wrap items-center justify-end gap-2 text-xs font-semibold text-deal">
-          <span>该日期已售罄，换个日期试试</span>
+          <span>{blockTitle ?? '该日期暂不可售，换个日期试试'}</span>
           <button
             type="button"
             className="inline-flex items-center gap-1 rounded-full bg-deal-light px-2.5 py-1 text-deal-dark transition-colors hover:bg-deal/15"
@@ -960,8 +1009,8 @@ function ConfigurableBundleCard({
         <Link to="/cart" className="btn-secondary text-sm">查看购物车</Link>
         <button
           className="btn-deal text-sm"
-          disabled={soldOut}
-          title={soldOut ? '该日期已售罄，换个日期试试' : undefined}
+          disabled={addBlocked}
+          title={blockTitle}
           onClick={() =>
             onAdd({
               adultCount,
@@ -982,7 +1031,7 @@ function ConfigurableBundleCard({
             })
           }
         >
-          {soldOut ? '该日期已售罄' : '加入购物车'}
+          {soldOut ? '该日期已售罄' : isSellableBlocked(dateReason) ? '该日期不可售' : '加入购物车'}
         </button>
       </div>
       </div>

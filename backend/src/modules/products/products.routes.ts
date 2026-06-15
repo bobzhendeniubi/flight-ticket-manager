@@ -10,7 +10,9 @@ import type { FastifyPluginAsync } from 'fastify';
 import { UserRole } from '@prisma/client';
 import { ProductsService } from './products.service.js';
 import { getHotelAvailability } from './hotel-availability.service.js';
+import { getBundleSellableDates } from './bundle-availability.service.js';
 import {
+  bundleSellableDatesQuerySchema,
   createBundleBodySchema,
   createHotelBodySchema,
   createTransferBodySchema,
@@ -30,6 +32,14 @@ export const productRoutes: FastifyPluginAsync = async (app) => {
   app.get('/hotel-availability', async (req) => {
     const query = hotelAvailabilityQuerySchema.parse(req.query);
     return await getHotelAvailability(query);
+  });
+
+  // ── 套餐可售日期（公开，前台套餐日历用；只回 sellable/reason/档位，不回原始数字）──
+  //   from 必填，to 省略 = from + 59 天（默认 60 天窗口）；跨度封顶 90 天，倒序/超长 → 400。
+  app.get('/bundles/:id/sellable-dates', async (req) => {
+    const { id } = req.params as { id: string };
+    const { from, to } = bundleSellableDatesQuerySchema.parse(req.query);
+    return { dates: await getBundleSellableDates(id, from, to) };
   });
 
   // ── Hotels ─────────────────────────────────────────────────────

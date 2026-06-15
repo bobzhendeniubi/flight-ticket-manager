@@ -856,6 +856,10 @@ export interface MockBundle {
   infantPriceCny?: number | null;
   /** 计费航段数（来回 = 2，单程 = 1）；null/缺省 = 用服务端默认 */
   legs?: number | null;
+  /** 按出发日的不可售日期（单套餐粒度）；reason ≤60 字，最多 120 条；缺省/空 = 不限制 */
+  blackoutDates?: { date: string; reason?: string }[];
+  /** 前台默认出发日（YYYY-MM-DD，不影响可售判定）；null/缺省 = 无默认 */
+  defaultDepartDate?: string | null;
 }
 
 

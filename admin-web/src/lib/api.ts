@@ -597,6 +597,12 @@ export interface BundleItemData {
   unitPrice: number;
 }
 
+/** 套餐不可售日期（按出发日）；reason ≤60 字，最多 120 条 */
+export interface BundleBlackoutDate {
+  date: string; // YYYY-MM-DD
+  reason?: string;
+}
+
 export interface Bundle {
   id: string;
   /** 产品编号（服务端生成，如 B0001）；老数据可能为 null */
@@ -625,6 +631,10 @@ export interface Bundle {
   infantPriceCny: number;
   /** 计费航段数（来回 = 2，单程 = 1）；升舱加价 = businessUpgradeCnyPerLeg × legs × 人数 */
   legs: number;
+  /** 按出发日的不可售日期（单套餐粒度）；缺省/空 = 不限制 */
+  blackoutDates?: BundleBlackoutDate[];
+  /** 前台默认出发日（不影响可售判定）；null = 无默认 */
+  defaultDepartDate?: string | null;
   isActive: boolean;
   createdAt: string;
 }

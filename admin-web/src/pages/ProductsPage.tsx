@@ -16,6 +16,7 @@ import {
 import { api, ApiError, type Hotel, type Transfer as ApiTransfer, type Visa as ApiVisa, type Bundle as ApiBundle } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { NumberInput } from '../components/NumberInput';
+import { BundleBlackoutEditor, type BlackoutDateRow } from '../components/BundleBlackoutEditor';
 
 type Section = 'hotels' | 'transfers' | 'visas' | 'bundles';
 
@@ -120,6 +121,8 @@ function bundleApiToMock(b: ApiBundle): MockBundle {
     childSeatDiscountCnyPerPerson: b.childSeatDiscountCnyPerPerson,
     infantPriceCny: b.infantPriceCny,
     legs: b.legs,
+    blackoutDates: b.blackoutDates ?? [],
+    defaultDepartDate: b.defaultDepartDate ?? null,
   };
 }
 
@@ -283,6 +286,8 @@ export function ProductsPage() {
           childSeatDiscountCnyPerPerson: n.childSeatDiscountCnyPerPerson ?? null,
           infantPriceCny: n.infantPriceCny ?? null,
           legs: n.legs ?? 2,
+          blackoutDates: n.blackoutDates ?? [],
+          defaultDepartDate: n.defaultDepartDate ?? null,
         });
       }
       for (const n of next) {
@@ -299,6 +304,8 @@ export function ProductsPage() {
             childSeatDiscountCnyPerPerson: n.childSeatDiscountCnyPerPerson ?? null,
             infantPriceCny: n.infantPriceCny ?? null,
             legs: n.legs ?? 2,
+            blackoutDates: n.blackoutDates ?? [],
+            defaultDepartDate: n.defaultDepartDate ?? null,
             isActive: n.active,
           });
         }
@@ -604,12 +611,19 @@ function BundlesSection({
   onChange: (v: MockBundle[]) => void;
 }) {
   const [showWizard, setShowWizard] = useState(false);
+  const [editing, setEditing] = useState<MockBundle | null>(null);
   return (
     <div className="space-y-3">
       <ActionBar active={items.length} onAdd={() => setShowWizard(true)} addLabel="+ 新建套餐" />
       <div className="grid gap-3 md:grid-cols-2">
         {items.map((b) => (
-          <BundleCard key={b.id} bundle={b} onToggle={() => onChange(items.map((x) => (x.id === b.id ? { ...x, active: !x.active } : x)))} onDelete={() => onChange(items.filter((x) => x.id !== b.id))} />
+          <BundleCard
+            key={b.id}
+            bundle={b}
+            onEdit={() => setEditing(b)}
+            onToggle={() => onChange(items.map((x) => (x.id === b.id ? { ...x, active: !x.active } : x)))}
+            onDelete={() => onChange(items.filter((x) => x.id !== b.id))}
+          />
         ))}
       </div>
       {showWizard && (
@@ -619,6 +633,19 @@ function BundlesSection({
           onSubmit={(b) => {
             onChange([b, ...items]);
             setShowWizard(false);
+          }}
+        />
+      )}
+      {editing && (
+        <NewBundleWizard
+          key={editing.id}
+          roomTypeOptions={roomTypeOptions}
+          initial={editing}
+          onCancel={() => setEditing(null)}
+          onSubmit={(b) => {
+            // 更新既有套餐（保留 id + 顺序）；persistBundles 走 update 分支
+            onChange(items.map((x) => (x.id === b.id ? b : x)));
+            setEditing(null);
           }}
         />
       )}
@@ -635,10 +662,12 @@ const KIND_LABEL: Record<BundleItem['kind'], { label: string; color: string }> =
 
 function BundleCard({
   bundle,
+  onEdit,
   onToggle,
   onDelete,
 }: {
   bundle: MockBundle;
+  onEdit: () => void;
   onToggle: () => void;
   onDelete: () => void;
 }) {
@@ -728,6 +757,9 @@ function BundleCard({
       </div>
 
       <div className="mt-3 flex justify-end gap-3 text-xs">
+        <button className="font-medium text-brand hover:text-brand-dark" onClick={onEdit}>
+          编辑
+        </button>
         <button className="font-medium text-ink-muted hover:text-brand" onClick={onToggle}>
           {bundle.active ? '停用' : '启用'}
         </button>
@@ -741,32 +773,40 @@ function BundleCard({
 
 function NewBundleWizard({
   roomTypeOptions,
+  initial,
   onCancel,
   onSubmit,
 }: {
   roomTypeOptions: RoomTypeOption[];
+  /** 传入既有套餐 = 编辑模式（各字段预填）；缺省 = 新建 */
+  initial?: MockBundle;
   onCancel: () => void;
   onSubmit: (b: MockBundle) => void;
 }) {
-  const [name, setName] = useState('');
-  const [tagline, setTagline] = useState('');
-  const [emoji, setEmoji] = useState('🎁');
-  const [suitableFor, setSuitableFor] = useState('2 大人');
-  const [hotelRoomTypeId, setHotelRoomTypeId] = useState('');
-  const [hotelNights, setHotelNights] = useState<number | null>(3);
+  const [name, setName] = useState(initial?.name ?? '');
+  const [tagline, setTagline] = useState(initial?.tagline ?? '');
+  const [emoji, setEmoji] = useState(initial?.emoji ?? '🎁');
+  const [suitableFor, setSuitableFor] = useState(initial?.suitableFor ?? '2 大人');
+  const [hotelRoomTypeId, setHotelRoomTypeId] = useState(initial?.hotelRoomTypeId ?? '');
+  const [hotelNights, setHotelNights] = useState<number | null>(initial?.hotelNights ?? 3);
+  // 不可售日期（blackout，按出发日，单套餐粒度）+ 前台默认出发日
+  const [blackoutDates, setBlackoutDates] = useState<BlackoutDateRow[]>(initial?.blackoutDates ?? []);
+  const [defaultDepartDate, setDefaultDepartDate] = useState<string>(initial?.defaultDepartDate ?? '');
   // 自愿升级展示价（CNY；留空 = 前台不展示该升级项）
-  const [singleSupplement, setSingleSupplement] = useState<number | null>(null);
-  const [businessUpgrade, setBusinessUpgrade] = useState<number | null>(null);
+  const [singleSupplement, setSingleSupplement] = useState<number | null>(initial?.singleSupplementCnyPerNight ?? null);
+  const [businessUpgrade, setBusinessUpgrade] = useState<number | null>(initial?.businessUpgradeCnyPerLeg ?? null);
   // 大人/小孩区分（CNY；留空 = 用服务端默认：占座儿童差价 ¥30、婴儿价 ¥0）
-  const [childSeatDiscount, setChildSeatDiscount] = useState<number | null>(null);
-  const [infantPrice, setInfantPrice] = useState<number | null>(null);
-  const [legs, setLegs] = useState<number | null>(2);
+  const [childSeatDiscount, setChildSeatDiscount] = useState<number | null>(initial?.childSeatDiscountCnyPerPerson ?? null);
+  const [infantPrice, setInfantPrice] = useState<number | null>(initial?.infantPriceCny ?? null);
+  const [legs, setLegs] = useState<number | null>(initial?.legs ?? 2);
   // Local draft shape allowing null for in-progress numeric edits
   type DraftBundleItem = Omit<BundleItem, 'qty' | 'unitPrice'> & { qty: number | null; unitPrice: number | null };
-  const [items, setItems] = useState<DraftBundleItem[]>([
-    { kind: 'HOTEL', productName: '岘港凯悦度假村 3 晚', qty: 3, unitPrice: 1880 },
-  ]);
-  const [discount, setDiscount] = useState<number | null>(500);
+  const [items, setItems] = useState<DraftBundleItem[]>(
+    initial && initial.items.length > 0
+      ? initial.items.map((it) => ({ kind: it.kind, productName: it.productName, qty: it.qty, unitPrice: it.unitPrice }))
+      : [{ kind: 'HOTEL', productName: '岘港凯悦度假村 3 晚', qty: 3, unitPrice: 1880 }],
+  );
+  const [discount, setDiscount] = useState<number | null>(initial?.groundDiscount ?? 500);
 
   const listPrice = useMemo(() => items.reduce((s, i) => s + (i.qty ?? 0) * (i.unitPrice ?? 0), 0), [items]);
   const discountValue = Math.min(listPrice, Math.max(0, discount ?? 0));
@@ -791,7 +831,7 @@ function NewBundleWizard({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="sticky top-0 z-10 flex items-center justify-between border-b border-slate-200 bg-white/95 px-5 py-3 backdrop-blur">
-          <h2 className="text-lg font-semibold text-ink">新建套餐</h2>
+          <h2 className="text-lg font-semibold text-ink">{initial ? '编辑套餐' : '新建套餐'}</h2>
           <button className="btn-ghost px-2 py-1 text-xl leading-none" onClick={onCancel}>×</button>
         </div>
         <div className="px-5 py-4 space-y-4">
@@ -830,7 +870,19 @@ function NewBundleWizard({
                 <NumberInput min={1} max={30} className="input" value={hotelNights} onChange={(n) => setHotelNights(n)} integerOnly />
               </div>
             )}
+            <div>
+              <label className="label">默认出发日（可选）</label>
+              <input
+                type="date"
+                className="input"
+                value={defaultDepartDate}
+                onChange={(e) => setDefaultDepartDate(e.target.value)}
+              />
+              <p className="mt-1 text-xs text-ink-muted">前台默认带出的出发日，不影响可售判定。留空 = 无默认。</p>
+            </div>
           </div>
+
+          <BundleBlackoutEditor value={blackoutDates} onChange={setBlackoutDates} />
 
           <div className="grid gap-3 md:grid-cols-3">
             <div>
@@ -1005,7 +1057,8 @@ function NewBundleWizard({
               disabled={!valid}
               onClick={() =>
                 onSubmit({
-                  id: 'b-' + Date.now(),
+                  ...(initial ?? {}),
+                  id: initial?.id ?? 'b-' + Date.now(),
                   name,
                   tagline: tagline || '新建套餐',
                   emoji,
@@ -1019,7 +1072,7 @@ function NewBundleWizard({
                   groundDiscount: discountValue,
                   flightPax: 2,
                   suitableFor,
-                  active: true,
+                  active: initial?.active ?? true,
                   hotelRoomTypeId: hotelRoomTypeId || null,
                   hotelNights: hotelRoomTypeId ? hotelNights : null,
                   singleSupplementCnyPerNight: singleSupplement,
@@ -1027,10 +1080,18 @@ function NewBundleWizard({
                   childSeatDiscountCnyPerPerson: childSeatDiscount,
                   infantPriceCny: infantPrice,
                   legs: legs ?? 2,
+                  // 仅提交填了日期的封盘行；reason 去空格，空则省略
+                  blackoutDates: blackoutDates
+                    .filter((b) => b.date)
+                    .map((b) => ({
+                      date: b.date,
+                      ...(b.reason?.trim() ? { reason: b.reason.trim() } : {}),
+                    })),
+                  defaultDepartDate: defaultDepartDate || null,
                 })
               }
             >
-              创建套餐
+              {initial ? '保存修改' : '创建套餐'}
             </button>
           </div>
         </div>

@@ -24,6 +24,12 @@ import { BED_TYPE_NOTE, PACKAGE_RULES, BOOKING_NOTICES, CHECKIN_TIPS } from '../
 import { useDebouncedValue } from '../lib/useDebouncedValue';
 import { useFlightSearchCache, type FlightLeg } from '../lib/useFlightSearchCache';
 import { useHotelAvailability } from '../lib/useHotelAvailability';
+import { useBundleSellableDates } from '../lib/useBundleSellableDates';
+import {
+  SellableReasonChip,
+  isSellableBlocked,
+  sellableBlockTitle,
+} from '../components/SellableReasonChip';
 import { Seo } from '../components/Seo';
 import { Breadcrumb } from '../components/Breadcrumb';
 import { PhotoGallery, type GalleryImage } from '../components/PhotoGallery';
@@ -265,7 +271,8 @@ function BundleDetailContent({
   // 配置器：出发日期 + 占座模型三计数（与列表卡同款；拼房间数 = ceil(seatPax/2) 自动推导）
   //   seatPax  = 成人 + 占座儿童（占座、计入机票座位与拼房）
   //   headCount= 成人 + 占座儿童 + 不占座婴儿（出行人总数，都要护照）
-  const [goDate, setGoDate] = useState(todayISO(3));
+  // 出发日期初值：优先用套餐默认出发日（管理员设的最近可出发日），未设则回退 today+3。
+  const [goDate, setGoDate] = useState(b.defaultDepartDate ?? todayISO(3));
   const [adultCount, setAdultCount] = useState(2);
   const [childCount, setChildCount] = useState(0);
   const [infantCount, setInfantCount] = useState(0);
@@ -301,6 +308,14 @@ function BundleDetailContent({
   const goTier = legTier(outLeg, cabin);
   const retTier = legTier(retLeg, cabin);
   const hotelTier = useHotelAvailability(b.hotelRoomTypeId ?? null, queryGo, queryReturn);
+
+  // 套餐可售日期窗口（按 航班+酒店库存 逐日 + blackout 封盘）。查失败 → PERMISSIVE（空集不硬拦截）。
+  const sellable = useBundleSellableDates(b.id);
+  // 所选出发日不在可售集合时的原因（封盘/机位满/满房）；可售或未知 → null（不拦截）。
+  const dateReason =
+    sellable.status === 'ready' && sellable.sellableSet.size > 0 && !sellable.sellableSet.has(goDate)
+      ? sellable.reasonOf(goDate)
+      : null;
 
   // 升级商务舱占真实商务舱库存 → 取去/回航段 BUSINESS 档位；任一段无商务舱/已售罄则不可升舱。
   const goBizTier = legTier(outLeg, 'BUSINESS');
@@ -367,6 +382,10 @@ function BundleDetailContent({
   const perPerson = headCount > 0 ? Math.round(total / headCount) : total;
 
   const soldOut = goTier === 'SOLD_OUT' || retTier === 'SOLD_OUT' || hotelTier === 'SOLD_OUT';
+  // 加购禁用（单一路径）：实时售罄 OR 所选日期不可售（封盘/机位满/满房）。
+  // dateReason 层叠在既有 soldOut 之上，不另开并行禁用路径；售罄文案优先，否则用日期原因文案。
+  const addBlocked = soldOut || isSellableBlocked(dateReason);
+  const blockTitle = soldOut ? '该日期已售罄，换个日期试试' : sellableBlockTitle(dateReason);
 
   const nudgeDatePicker = () => {
     const el = dateInputRef.current;
@@ -644,7 +663,7 @@ function BundleDetailContent({
           <div className="card space-y-4">
             <h2 className="section-title text-base">选择出行</h2>
 
-            {/* 出发日期 */}
+            {/* 出发日期（只让选可售日期；默认已选最近可出发日，可改） */}
             <div>
               <label className="label" htmlFor="detail-godate">出发日期</label>
               <input
@@ -652,13 +671,22 @@ function BundleDetailContent({
                 id="detail-godate"
                 type="date"
                 className="input"
-                min={todayISO(0)}
+                // 约束到可售区间：min = max(今天, 首个可售日)，max = 末个可售日。
+                // 窗口未知（加载中/查失败 PERMISSIVE）→ 回退 min=今天、无 max（不硬框）。
+                min={sellable.minDate && sellable.minDate > todayISO(0) ? sellable.minDate : todayISO(0)}
+                max={sellable.maxDate ?? undefined}
                 value={goDate}
                 onChange={(e) => setGoDate(e.target.value)}
               />
               <p className="mt-1 text-xs text-ink-muted">
-                回程 {formatMonthDay(displayReturn)} · {nights} 晚（按住宿晚数自动推算）
+                默认已为你选好最近可出发日（今天 +3 天起），可改 · 回程 {formatMonthDay(displayReturn)} · {nights} 晚（按住宿晚数自动推算）
               </p>
+              {/* 所选日期不可售：保留所选值，下方标原因（封盘/机位满/满房），加购同时禁用 */}
+              {dateReason && (
+                <div className="mt-1.5">
+                  <SellableReasonChip reason={dateReason} />
+                </div>
+              )}
             </div>
 
             {/* 出行人（成人/占座儿童/不占座婴儿）+ 拼房间数自动推导 */}
@@ -802,10 +830,10 @@ function BundleDetailContent({
               </div>
             </div>
 
-            {/* 售罄引导 */}
-            {soldOut && (
+            {/* 不可加购引导（售罄 / 封盘 / 机位满 / 满房；不暴露原始库存数字） */}
+            {addBlocked && (
               <div className="flex flex-wrap items-center justify-between gap-2 text-xs font-semibold text-deal">
-                <span>该日期已售罄</span>
+                <span>{soldOut ? '该日期已售罄' : (blockTitle ?? '该日期暂不可售')}</span>
                 <button
                   type="button"
                   className="inline-flex items-center gap-1 rounded-full bg-deal-light px-2.5 py-1 text-deal-dark transition-colors hover:bg-deal/15"
@@ -819,11 +847,11 @@ function BundleDetailContent({
             <button
               type="button"
               className="btn-deal w-full"
-              disabled={soldOut}
-              title={soldOut ? '该日期已售罄，换个日期试试' : undefined}
+              disabled={addBlocked}
+              title={blockTitle}
               onClick={handleAdd}
             >
-              {soldOut ? '该日期已售罄' : '加入购物车'}
+              {soldOut ? '该日期已售罄' : isSellableBlocked(dateReason) ? '该日期不可售' : '加入购物车'}
             </button>
             <TrustBadges variant="card" />
           </div>
@@ -842,8 +870,8 @@ function BundleDetailContent({
               {formatMonthDay(goDate)}→{formatMonthDay(displayReturn)} · {formatOccupancy(adultCount, childCount, infantCount)}·{baseRooms}间房
             </div>
           </div>
-          {soldOut ? (
-            <button type="button" className="btn-secondary shrink-0 text-sm" onClick={nudgeDatePicker}>
+          {addBlocked ? (
+            <button type="button" className="btn-secondary shrink-0 text-sm" onClick={nudgeDatePicker} title={blockTitle}>
               换个日期
             </button>
           ) : (

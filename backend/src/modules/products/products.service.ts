@@ -418,6 +418,11 @@ export class ProductsService {
             : {}),
           ...(body.infantPriceCny != null ? { infantPriceCny: body.infantPriceCny } : {}),
           ...(body.legs != null ? { legs: body.legs } : {}),
+          // 运营封盘日（省略 = DB 默认 []）；前台默认出发日（省略 = null）
+          ...(body.blackoutDates != null
+            ? { blackoutDates: body.blackoutDates as unknown as Prisma.InputJsonValue }
+            : {}),
+          defaultDepartDate: body.defaultDepartDate ?? null,
           isActive: body.isActive,
         },
         include: BUNDLE_ROOM_INCLUDE,
@@ -454,6 +459,10 @@ export class ProductsService {
       data.infantPriceCny = body.infantPriceCny;
     }
     if (body.legs !== undefined) data.legs = body.legs;
+    if (body.blackoutDates !== undefined) {
+      data.blackoutDates = body.blackoutDates as unknown as Prisma.InputJsonValue;
+    }
+    if (body.defaultDepartDate !== undefined) data.defaultDepartDate = body.defaultDepartDate;
     if (body.isActive !== undefined) data.isActive = body.isActive;
     const b = await prisma.bundle.update({
       where: { id },
@@ -546,6 +555,9 @@ function serializeBundle(b: BundleWithRoom, rating: ProductRatingAggregate = ZER
     childSeatDiscountCnyPerPerson: b.childSeatDiscountCnyPerPerson,
     infantPriceCny: b.infantPriceCny,
     legs: b.legs,
+    // 运营封盘日（按出发日 D；admin 读回）+ 前台默认出发日（仅影响初始选中）
+    blackoutDates: b.blackoutDates,
+    defaultDepartDate: b.defaultDepartDate,
     items: b.items,
     rating,
     reviewCount: rating.count,
