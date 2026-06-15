@@ -41,7 +41,11 @@ import {
   OrderService,
   assertVisaPassengersHavePassportExpiry,
   resolveBundleHotelStamp,
+  computeBundleAddOn,
+  computeBundleSeatSplit,
+  computeRequiredPassengerCount,
 } from './orders.service.js';
+import type { OrderItemInput } from './orders.schemas.js';
 
 // ── Fixture helper：build 一个完整的 fake order（serializeOrder 要的字段全有） ──
 const dec = (n: number) => ({ toString: () => String(n) });
@@ -399,6 +403,218 @@ describe('resolveBundleHotelStamp', () => {
     });
     expect(stamp?.hotelCheckIn).toEqual(new Date('2026-07-01'));
     expect(stamp?.hotelCheckOut).toEqual(new Date('2026-07-04'));
+  });
+});
+
+// ── 套餐可选升级 add-on 重算：computeBundleAddOn ──────────────────────
+describe('computeBundleAddOn', () => {
+  const bundle = {
+    hotelNights: 3,
+    singleSupplementCnyPerNight: 80,
+    businessUpgradeCnyPerLeg: 700,
+    legs: 2,
+  };
+  // 真实入住区间：7/1 → 7/4 = 3 晚
+  const stamp = {
+    hotelCheckIn: new Date('2026-07-01'),
+    hotelCheckOut: new Date('2026-07-04'),
+  };
+
+  it('无升级（singleCount/businessCount 缺省）→ total 0、hasAddOn false（向后兼容）', () => {
+    const r = computeBundleAddOn(bundle, stamp, undefined, undefined);
+    expect(r.total).toBe(0);
+    expect(r.hasAddOn).toBe(false);
+    const zero = computeBundleAddOn(bundle, stamp, 0, 0);
+    expect(zero.total).toBe(0);
+    expect(zero.hasAddOn).toBe(false);
+  });
+
+  it('单人入住 = singleCount × 房差/晚 × 晚数', () => {
+    // 1 人 × 80 × 3 晚 = 240
+    const r = computeBundleAddOn(bundle, stamp, 1, 0);
+    expect(r.breakdown.singleSupplementTotal).toBe(240);
+    expect(r.breakdown.businessUpgradeTotal).toBe(0);
+    expect(r.total).toBe(240);
+    expect(r.hasAddOn).toBe(true);
+  });
+
+  it('升舱商务 = businessCount × 升舱/航段 × 航段数', () => {
+    // 1 人 × 700 × 2 段 = 1400
+    const r = computeBundleAddOn(bundle, stamp, 0, 1);
+    expect(r.breakdown.businessUpgradeTotal).toBe(1400);
+    expect(r.total).toBe(1400);
+  });
+
+  it('两项叠加（赵姐默认费率，3 晚来回，各 1 人）= 240 + 1400 = 1640', () => {
+    const r = computeBundleAddOn(bundle, stamp, 1, 1);
+    expect(r.total).toBe(1640);
+    expect(r.breakdown).toMatchObject({
+      singleCount: 1,
+      businessCount: 1,
+      nights: 3,
+      legs: 2,
+      singleSupplementCnyPerNight: 80,
+      businessUpgradeCnyPerLeg: 700,
+    });
+  });
+
+  it('每产品可配置：高端套餐房差上调（480/晚）按配置算', () => {
+    const premium = { ...bundle, singleSupplementCnyPerNight: 480 };
+    // 4 晚区间
+    const fourNights = {
+      hotelCheckIn: new Date('2026-07-01'),
+      hotelCheckOut: new Date('2026-07-05'),
+    };
+    const r = computeBundleAddOn(premium, fourNights, 1, 0);
+    expect(r.breakdown.nights).toBe(4);
+    expect(r.total).toBe(480 * 4); // 1920
+  });
+
+  it('无 hotelStamp → 回退 bundle.hotelNights（≥1）算晚数', () => {
+    const r = computeBundleAddOn(bundle, null, 2, 0);
+    // 2 人 × 80 × 3 晚 = 480
+    expect(r.breakdown.nights).toBe(3);
+    expect(r.total).toBe(480);
+  });
+
+  it('单程套餐 legs=1：升舱只算 1 段', () => {
+    const oneWay = { ...bundle, legs: 1 };
+    const r = computeBundleAddOn(oneWay, stamp, 0, 2);
+    // 2 人 × 700 × 1 段 = 1400
+    expect(r.breakdown.legs).toBe(1);
+    expect(r.total).toBe(1400);
+  });
+});
+
+// ── 套餐升舱拆座模型：computeBundleSeatSplit ──────────────────────────
+// 正确模型：客户机票仍按经济舱套餐价收，升舱只把座位从经济舱「拆」到真实商务舱库存
+// （ECONOMY 减 businessCount、BUSINESS 加 businessCount），净占座不变、不超售。
+describe('computeBundleSeatSplit', () => {
+  it('businessCount 缺省/0 → 全额留原舱、不占商务舱（向后兼容）', () => {
+    expect(computeBundleSeatSplit('ECONOMY', 2, undefined)).toEqual({ sameCabin: 2, business: 0 });
+    expect(computeBundleSeatSplit('ECONOMY', 2, 0)).toEqual({ sameCabin: 2, business: 0 });
+  });
+
+  it('2 人 1 人升舱 → 经济舱占 1、商务舱占 1（净占座仍 2）', () => {
+    const split = computeBundleSeatSplit('ECONOMY', 2, 1);
+    expect(split).toEqual({ sameCabin: 1, business: 1 });
+    expect(split.sameCabin + split.business).toBe(2);
+  });
+
+  it('全员升舱：2 人 2 人升舱 → 经济舱 0、商务舱 2', () => {
+    expect(computeBundleSeatSplit('ECONOMY', 2, 2)).toEqual({ sameCabin: 0, business: 2 });
+  });
+
+  it('升舱人数超过本段人数 → clamp 到本段人数（不会出现负的经济舱占座）', () => {
+    expect(computeBundleSeatSplit('ECONOMY', 2, 5)).toEqual({ sameCabin: 0, business: 2 });
+  });
+
+  it('非经济舱航段不拆：BUSINESS 行即便带 businessUpgradeCount 也全额留本舱', () => {
+    expect(computeBundleSeatSplit('BUSINESS', 2, 1)).toEqual({ sameCabin: 2, business: 0 });
+  });
+});
+
+// ── 出行人数校验口径：computeRequiredPassengerCount ───────────────────────
+// 正确模型：往返同一批人，按「单程最大人数」取 MAX 不取 SUM；签证/接送/套餐同理。
+describe('computeRequiredPassengerCount', () => {
+  const flightLeg = (quantity: number, scheduleId = 'sched-go'): OrderItemInput => ({
+    kind: 'FLIGHT',
+    description: 'QH9589 经济舱',
+    quantity,
+    flightScheduleId: scheduleId,
+    flightCabin: 'ECONOMY',
+  });
+  const bundleLine = (
+    quantity: number,
+    metadata?: Record<string, unknown>,
+  ): OrderItemInput => ({
+    kind: 'BUNDLE',
+    description: '岘港 4 天 3 晚',
+    quantity,
+    bundleId: 'bundle-1',
+    unitPrice: 1000,
+    ...(metadata ? { metadata } : {}),
+  });
+  const visaLine = (quantity: number): OrderItemInput => ({
+    kind: 'VISA',
+    description: '越南签证',
+    quantity,
+    unitPrice: 300,
+  });
+  const transferLine = (quantity: number): OrderItemInput => ({
+    kind: 'TRANSFER',
+    description: '机场接送',
+    quantity,
+    unitPrice: 150,
+  });
+
+  it('往返机票（2 段各 2 人）→ 需 2 位（MAX 不是 SUM 的 4）', () => {
+    // 这是本次修复的核心：旧 SUM 逻辑会错算成 4，新 MAX 逻辑算 2
+    expect(
+      computeRequiredPassengerCount([flightLeg(2, 'sched-go'), flightLeg(2, 'sched-ret')]),
+    ).toBe(2);
+  });
+
+  it('单程单航段 2 人 → 需 2 位（与旧行为一致，向后兼容）', () => {
+    expect(computeRequiredPassengerCount([flightLeg(2)])).toBe(2);
+  });
+
+  it('往返人数不同（去 3 / 回 2，理论异常）→ 取最大段 3', () => {
+    expect(
+      computeRequiredPassengerCount([flightLeg(3, 'sched-go'), flightLeg(2, 'sched-ret')]),
+    ).toBe(3);
+  });
+
+  it('套餐 + 往返机票（套餐 pax=2，2 段各 2 人）→ 需 2 位', () => {
+    expect(
+      computeRequiredPassengerCount([
+        flightLeg(2, 'sched-go'),
+        flightLeg(2, 'sched-ret'),
+        bundleLine(1, { pax: 2 }),
+      ]),
+    ).toBe(2);
+  });
+
+  it('套餐无 metadata.pax → 回退到行 quantity', () => {
+    expect(computeRequiredPassengerCount([bundleLine(3)])).toBe(3);
+  });
+
+  it('多份套餐叠加：pax 2 + pax 1 → 3 位', () => {
+    expect(
+      computeRequiredPassengerCount([bundleLine(1, { pax: 2 }), bundleLine(1, { pax: 1 })]),
+    ).toBe(3);
+  });
+
+  it('纯签证 3 张 → 需 3 位', () => {
+    expect(computeRequiredPassengerCount([visaLine(3)])).toBe(3);
+  });
+
+  it('纯接送 2 → 需 2 位', () => {
+    expect(computeRequiredPassengerCount([transferLine(2)])).toBe(2);
+  });
+
+  it('混买取最大维度：往返机票 2 人 + 签证 4 张 → 需 4 位', () => {
+    expect(
+      computeRequiredPassengerCount([
+        flightLeg(2, 'sched-go'),
+        flightLeg(2, 'sched-ret'),
+        visaLine(4),
+      ]),
+    ).toBe(4);
+  });
+
+  it('仅酒店（无按人产品）→ 0，不触发出行人校验', () => {
+    const hotel: OrderItemInput = {
+      kind: 'HOTEL',
+      description: '海景房 3 晚',
+      quantity: 1,
+      unitPrice: 800,
+    };
+    expect(computeRequiredPassengerCount([hotel])).toBe(0);
+  });
+
+  it('套餐畸形 metadata.pax（非法格式）→ 降级回退行 quantity，不抛错', () => {
+    expect(computeRequiredPassengerCount([bundleLine(2, { pax: 'garbage' })])).toBe(2);
   });
 });
 

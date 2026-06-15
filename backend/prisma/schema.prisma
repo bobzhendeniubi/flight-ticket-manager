@@ -695,9 +695,14 @@ model Bundle {
   // 套餐关联酒店房型 — 下单时把房型+入住日期盖到订单行上，房控板自动计入套餐占房
   hotelRoomTypeId String?
   hotelNights     Int? // 默认入住晚数（客户没填回程日期时按 goDate + hotelNights 推 checkOut）
-  // 自愿升级展示价（CNY）— 单房差/晚、升舱/航段；null = 该套餐不展示升级项
-  singleSupplementCnyPerNight Decimal? @db.Decimal(10, 2)
-  cabinUpgradeCnyPerLeg       Decimal? @db.Decimal(10, 2)
+  // 可选升级加价（CNY，按产品可配置；运营在后台改）— 都是 server-priced add-on：
+  //   singleSupplementCnyPerNight = 一个人住酒店（单人入住）/晚 的房差，赵姐默认 ¥80
+  //   businessUpgradeCnyPerLeg    = 升舱商务 /航段 的加价，赵姐默认 ¥700
+  // 注意：豪华/五星套餐（洲际半岛、四季）的单人入住房差远高于平价默认值，故 seed 里按产品上调。
+  singleSupplementCnyPerNight Int @default(80)
+  businessUpgradeCnyPerLeg    Int @default(700)
+  // 机票航段数（来回 = 2，单程 = 1）— 升舱加价 = businessUpgradeCnyPerLeg × legs × businessCount
+  legs           Int      @default(2)
   soldCount      Int      @default(0) // 已售份数（展示用，seed 填充）
   isActive       Boolean  @default(true)
   createdAt      DateTime @default(now())

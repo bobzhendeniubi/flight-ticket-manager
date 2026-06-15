@@ -430,6 +430,14 @@ export interface CreateOrderInput {
         quantity: number;
         unitPrice: number;
         bundleId: string;
+        /**
+         * 可选升级 add-on（整数份数，后端权威重算；缺省 0 = 无升级，价格与旧版一致）：
+         *   singleCount   = 选「一个人住酒店（单人入住）」的人数
+         *   businessCount = 选「升级商务舱」的人数（占用真实商务舱库存；
+         *                   business>0 时本单必须同时带经济舱 FLIGHT 行供后端拆座）
+         */
+        singleCount?: number;
+        businessCount?: number;
         metadata?: Record<string, unknown>;
       }
   >;
@@ -551,9 +559,16 @@ export interface Bundle {
   groundDiscount: string;
   suitableFor: string | null;
   isActive: boolean;
-  /** 自愿付费升级展示价（CNY 字符串；null = 不展示，收费仍走线下人工） */
-  singleSupplementCnyPerNight?: string | null;
-  cabinUpgradeCnyPerLeg?: string | null;
+  /**
+   * 可选升级 add-on 报价（server-priced，后端返回为整数 number）：
+   *   singleSupplementCnyPerNight = 一个人住酒店（单人入住）每人每晚加价
+   *   businessUpgradeCnyPerLeg    = 升级商务舱每人每程加价（占用真实商务舱库存）
+   *   legs                        = 计费航段数（来回默认 2）
+   * 直接在前台 add-on 里卖（不走客服）；0/缺省 = 不加价（与旧版价格一致）。
+   */
+  singleSupplementCnyPerNight?: number | null;
+  businessUpgradeCnyPerLeg?: number | null;
+  legs?: number | null;
   /** 套餐关联酒店房型（展示酒店名 + 房型名；null = 未关联） */
   hotelRoomType?: { id: string; name: string; hotelName: string } | null;
   /** 关联房型 id（实时房量查询用；null = 未关联，不查房量） */

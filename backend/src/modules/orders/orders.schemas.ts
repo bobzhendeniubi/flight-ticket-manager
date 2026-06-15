@@ -92,6 +92,11 @@ export const bundleItemSchema = baseItemSchema.extend({
   kind: z.literal('BUNDLE'),
   bundleId: z.string().min(1),
   unitPrice: z.number().nonnegative(),
+  // 可选升级 add-on（server-priced，整数份数；缺省 0 = 无升级，价格与旧版完全一致）：
+  //   singleCount   = 选「一个人住酒店（单人入住）」的人数 → 每人每晚加 singleSupplementCnyPerNight
+  //   businessCount = 选「升舱商务」的人数 → 每人每航段加 businessUpgradeCnyPerLeg（占用真实商务舱库存）
+  singleCount: z.number().int().min(0).max(20).optional(),
+  businessCount: z.number().int().min(0).max(20).optional(),
 });
 
 // BUNDLE 行 metadata 里的出行信息（sales-web 购物车带过来，用于推导酒店入住日期）。

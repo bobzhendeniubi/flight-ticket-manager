@@ -164,7 +164,7 @@ interface FaqEntry { q: string; a: string }
 const FAQS: FaqEntry[] = [
   { q: '套餐价格包含哪些？', a: '含往返机票、岘港酒店住宿（含双早）、签证代办与当地接送，以及全程中文客服。具体以本页"套餐包含"清单为准。' },
   { q: '可以只买其中几项吗？', a: '套餐为整体打包优惠价，单项自愿放弃使用不退差价；如需单独购买机票/酒店，请到对应的机票或酒店频道下单。' },
-  { q: '单人出行怎么算？', a: '套餐按 2 人 1 间核算（显示为每人价）。单人出行需补单房差，金额见套餐说明，可在下单后联系客服办理。' },
+  { q: '想一个人住一间房怎么算？', a: '套餐默认 2 人 1 间（显示为每人价）。想一个人住酒店（单人入住、一人一间房）的，在下单框勾选「一个人住酒店」并选人数即可，按每人每晚加价实时算进总价。' },
   { q: '床型可以指定吗？', a: BED_TYPE_NOTE + '。下单时在订单备注里写明偏好即可。' },
   { q: '签证需要多久？要准备什么？', a: '一般 3 个工作日左右，建议至少提前 7 天预订并提交护照资料。护照有效期需距回程 6 个月以上。' },
   { q: '行程有变能改期或取消吗？', a: '退改按套餐扣损规则执行（见"退改政策"）；遇航班取消等不可抗力，我们协助免费改期或按未发生费用退款。' },
@@ -251,11 +251,19 @@ function BundleDetailContent({
   const isBiz = items.some((i) => i.kind === 'FLIGHT' && i.productName.includes('商务'));
   const cabin: 'ECONOMY' | 'BUSINESS' = isBiz ? 'BUSINESS' : 'ECONOMY';
 
-  // 配置器：出发日期 + 人数 + 房间（与列表卡同款）
+  // 配置器：出发日期 + 人数（与列表卡同款；住宿间数按双人同住自动推导，不让用户调）
   const [goDate, setGoDate] = useState(todayISO(3));
   const [pax, setPax] = useState(2);
-  const [rooms, setRooms] = useState(1);
+  const baseRooms = Math.max(1, Math.ceil(pax / 2));
+  // 可选升级 add-on（默认 0；范围 0..pax）
+  const [singleCount, setSingleCount] = useState(0); // 一个人住酒店（单人入住）
+  const [businessCount, setBusinessCount] = useState(0); // 升级商务舱
   const dateInputRef = useRef<HTMLInputElement>(null);
+
+  // 套餐 add-on 报价（server-priced，后端返回 number）+ 计费航段数
+  const singleSupp = b.singleSupplementCnyPerNight != null ? num(b.singleSupplementCnyPerNight) : null;
+  const businessUpg = b.businessUpgradeCnyPerLeg != null ? num(b.businessUpgradeCnyPerLeg) : null;
+  const bundleLegs = b.legs != null ? num(b.legs) : 2;
 
   const queryGo = useDebouncedValue(goDate);
   const displayReturn = addDaysISO(goDate, nights);
@@ -274,15 +282,42 @@ function BundleDetailContent({
   const retTier = legTier(retLeg, cabin);
   const hotelTier = useHotelAvailability(b.hotelRoomTypeId ?? null, queryGo, queryReturn);
 
+  // 升级商务舱占真实商务舱库存 → 取去/回航段 BUSINESS 档位；任一段无商务舱/已售罄则不可升舱。
+  const goBizTier = legTier(outLeg, 'BUSINESS');
+  const retBizTier = legTier(retLeg, 'BUSINESS');
+  const businessSoldOut =
+    goBizTier === 'SOLD_OUT' ||
+    retBizTier === 'SOLD_OUT' ||
+    (outLeg != null && goBizTier === null) ||
+    (retLeg != null && retBizTier === null);
+  const canOfferBusiness = businessUpg != null && cabin === 'ECONOMY';
+  const canOfferSingle = singleSupp != null && pax >= 2;
+
+  // pax 变化时把 add-on 份数夹回 [0, pax]
+  useEffect(() => {
+    setSingleCount((c) => Math.min(c, pax));
+    setBusinessCount((c) => Math.min(c, pax));
+  }, [pax]);
+  // 商务舱售罄/不可升舱 → 强制清零（避免提交被后端拒）
+  useEffect(() => {
+    if (businessSoldOut || !canOfferBusiness) setBusinessCount(0);
+  }, [businessSoldOut, canOfferBusiness]);
+
   const fb = FALLBACK_PRICE[cabin];
   const pricePerPerson = legPrice(outLeg, cabin, fb.go) + legPrice(retLeg, cabin, fb.ret);
+
+  // 计费晚数 = 套餐住宿晚数（镜像后端 computeBundleAddOn 回退口径）
+  const billNights = Math.max(1, nights);
+  // ── add-on 加价（镜像后端：单人入住 = singleCount×supp×nights；升舱 = businessCount×upg×legs）──
+  const singleAddOn = singleCount * (singleSupp ?? 0) * billNights;
+  const businessAddOn = businessCount * (businessUpg ?? 0) * bundleLegs;
 
   const itemRows = items.map((item) => {
     if (item.kind === 'FLIGHT') {
       return { ...item, computedTotal: pricePerPerson * pax, label: `来回${isBiz ? '商务' : '经济'}舱 × ${pax} 人` };
     }
     if (item.kind === 'HOTEL') {
-      return { ...item, computedTotal: item.unitPrice * item.qty * rooms, label: `${item.productName}${rooms > 1 ? ` × ${rooms} 房` : ''}` };
+      return { ...item, computedTotal: item.unitPrice * item.qty * baseRooms, label: `${item.productName}${baseRooms > 1 ? ` × ${baseRooms} 间` : ''}` };
     }
     if (item.kind === 'VISA') {
       return { ...item, computedTotal: item.unitPrice * pax, label: item.productName.replace(/× \d+/, `× ${pax}`) };
@@ -291,9 +326,12 @@ function BundleDetailContent({
   });
 
   const flightTotal = itemRows.filter((r) => r.kind === 'FLIGHT').reduce((s, r) => s + r.computedTotal, 0);
-  const hotelTotal = itemRows.filter((r) => r.kind === 'HOTEL').reduce((s, r) => s + r.computedTotal, 0);
-  const otherTotal = itemRows.filter((r) => r.kind !== 'FLIGHT' && r.kind !== 'HOTEL').reduce((s, r) => s + r.computedTotal, 0);
-  const listTotal = flightTotal + hotelTotal + otherTotal;
+  // 单人入住加价并入酒店金额；升舱加价并入机票部分（与后端 hotel/flight 公式一致）
+  const hotelTotal =
+    itemRows.filter((r) => r.kind === 'HOTEL').reduce((s, r) => s + r.computedTotal, 0) + singleAddOn;
+  const otherTotal =
+    itemRows.filter((r) => r.kind !== 'FLIGHT' && r.kind !== 'HOTEL').reduce((s, r) => s + r.computedTotal, 0);
+  const listTotal = flightTotal + hotelTotal + otherTotal + businessAddOn;
   const total = listTotal - groundDiscount;
   const perPerson = pax > 0 ? Math.round(total / pax) : total;
 
@@ -311,17 +349,26 @@ function BundleDetailContent({
   };
 
   const handleAdd = () => {
+    const addOnSummary = [
+      singleCount > 0 ? `单人入住×${singleCount}` : null,
+      businessCount > 0 ? `商务舱×${businessCount}` : null,
+    ]
+      .filter(Boolean)
+      .join(' · ');
     add({
       kind: 'BUNDLE',
       productId: b.id,
-      name: `${b.name}（${pax}人${rooms}房 · ${goDate}→${displayReturn}）`,
+      name: `${b.name}（${pax}人${baseRooms}房 · ${goDate}→${displayReturn}${addOnSummary ? ` · ${addOnSummary}` : ''}）`,
       description: b.tagline ?? '',
       emoji: b.emoji ?? '🎁',
       unitPrice: total,
       qty: 1,
       meta: {
-        goDate, returnDate: displayReturn, pax, rooms,
+        goDate, returnDate: displayReturn, pax, rooms: baseRooms,
         flightTotal, hotelTotal, otherTotal, discount: groundDiscount,
+        singleCount, businessCount,
+        ...(outLeg?.scheduleId ? { goLegScheduleId: outLeg.scheduleId } : {}),
+        ...(retLeg?.scheduleId ? { retLegScheduleId: retLeg.scheduleId } : {}),
       },
     });
     navigate('/cart');
@@ -339,12 +386,9 @@ function BundleDetailContent({
     { icon: 'support', label: '全程中文客服' },
   ].filter((x): x is { icon: IconName; label: string } => x !== null);
 
-  const excluded = ['个人消费与自费项目', '旅游意外险（建议自行购买）', '单房差（单人出行需补，见套餐说明）', '行程外的额外用车与门票'];
+  const excluded = ['个人消费与自费项目', '旅游意外险（建议自行购买）', '行程外的额外用车与门票'];
 
-  const upgrades = [
-    b.singleSupplementCnyPerNight != null ? `单住补房差 ¥${num(b.singleSupplementCnyPerNight).toLocaleString()}/晚` : null,
-    b.cabinUpgradeCnyPerLeg != null ? `升舱商务 ¥${num(b.cabinUpgradeCnyPerLeg).toLocaleString()}/程` : null,
-  ].filter(Boolean) as string[];
+  // 可选升级现作为前台 add-on 即选即享（下方配置器内选购），不再走客服线下办理。
 
   const rating = b.productRating;
   const soldCount = b.soldCount ?? 0;
@@ -449,10 +493,16 @@ function BundleDetailContent({
                 </li>
               ))}
             </ul>
-            {upgrades.length > 0 && (
-              <div className="mt-4 rounded-xl border border-dashed border-indigo-300 bg-indigo-50/60 p-3 text-xs text-indigo-800">
-                <span className="font-semibold">可选升级（自愿付费，下单后联系客服办理）：</span>{' '}
-                {upgrades.join(' · ')}
+            {(canOfferSingle || canOfferBusiness) && (
+              <div className="mt-4 rounded-xl border border-indigo-200 bg-indigo-50/50 p-3 text-xs text-indigo-900">
+                <span className="font-semibold">可选升级即选即享：</span>{' '}
+                {[
+                  canOfferSingle ? `一个人住酒店（单人入住）+¥${(singleSupp ?? 0).toLocaleString()}/晚/人` : null,
+                  canOfferBusiness ? `升级商务舱 +¥${(businessUpg ?? 0).toLocaleString()}/程/人` : null,
+                ]
+                  .filter(Boolean)
+                  .join(' · ')}
+                <span className="text-indigo-700">（在右侧下单框直接选份数）</span>
               </div>
             )}
           </section>
@@ -575,17 +625,51 @@ function BundleDetailContent({
               </p>
             </div>
 
-            {/* 人数 / 房间 */}
-            <div className="grid grid-cols-2 gap-3">
-              <div>
-                <label className="label">出行人数</label>
-                <Stepper value={pax} min={1} max={9} onChange={setPax} />
-              </div>
-              <div>
-                <label className="label">房间数</label>
-                <Stepper value={rooms} min={1} max={5} onChange={setRooms} />
-              </div>
+            {/* 出行人数（住宿间数按双人同住自动推导） */}
+            <div>
+              <label className="label">出行人数</label>
+              <Stepper value={pax} min={1} max={9} onChange={setPax} />
+              <p className="mt-1 inline-flex items-center gap-1.5 text-xs font-semibold text-purple-700">
+                <Icon name="hotel" className="h-3.5 w-3.5" />
+                住宿：{baseRooms} 间房（双人同住）
+              </p>
             </div>
+
+            {/* 可选升级 add-on（即选即享，下单即含；不走客服） */}
+            {(canOfferSingle || canOfferBusiness) && (
+              <div className="space-y-2.5 rounded-xl border border-indigo-200 bg-indigo-50/50 p-3 text-xs">
+                <div className="font-semibold text-indigo-900">可选升级（即选即享）</div>
+                {canOfferSingle && (
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="font-medium text-ink">一个人住酒店（单人入住）</div>
+                      <div className="text-ink-muted">
+                        一人一间房 · +¥{(singleSupp ?? 0).toLocaleString()}/晚/人
+                      </div>
+                    </div>
+                    <Stepper value={singleCount} min={0} max={pax} onChange={setSingleCount} />
+                  </div>
+                )}
+                {canOfferBusiness && (
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="min-w-0">
+                      <div className="font-medium text-ink">升级商务舱</div>
+                      <div className="text-ink-muted">
+                        {businessSoldOut
+                          ? '商务舱已售罄'
+                          : `+¥${(businessUpg ?? 0).toLocaleString()}/程/人`}
+                      </div>
+                    </div>
+                    <Stepper
+                      value={businessCount}
+                      min={0}
+                      max={businessSoldOut ? 0 : pax}
+                      onChange={setBusinessCount}
+                    />
+                  </div>
+                )}
+              </div>
+            )}
 
             {/* 去/回航段 + 余位档位 */}
             {(goTier || retTier || outLeg || retLeg) && (
@@ -620,13 +704,31 @@ function BundleDetailContent({
                   <span className="nums whitespace-nowrap text-slate-600">¥{r.computedTotal.toLocaleString()}</span>
                 </div>
               ))}
+              {singleCount > 0 && (
+                <div className="flex items-center justify-between text-xs">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <span className="rounded bg-indigo-100 px-1.5 py-0.5 font-medium text-indigo-700">升级</span>
+                    <span className="truncate text-slate-700">单人入住 ×{singleCount}</span>
+                  </div>
+                  <span className="nums whitespace-nowrap text-slate-600">+¥{singleAddOn.toLocaleString()}</span>
+                </div>
+              )}
+              {businessCount > 0 && (
+                <div className="flex items-center justify-between text-xs">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <span className="rounded bg-indigo-100 px-1.5 py-0.5 font-medium text-indigo-700">升级</span>
+                    <span className="truncate text-slate-700">升级商务舱 ×{businessCount}</span>
+                  </div>
+                  <span className="nums whitespace-nowrap text-slate-600">+¥{businessAddOn.toLocaleString()}</span>
+                </div>
+              )}
             </div>
 
             {/* 价格 */}
             <div className="rounded-2xl border border-slate-200/70 bg-canvas p-3.5">
               <div className="flex items-end justify-between gap-2">
                 <div className="text-xs text-ink-muted">
-                  {pax} 人 · {rooms} 房{groundDiscount > 0 && <span className="ml-1 text-deal">已省 ¥{groundDiscount.toLocaleString()}</span>}
+                  {pax} 人 · {baseRooms} 间房{groundDiscount > 0 && <span className="ml-1 text-deal">已省 ¥{groundDiscount.toLocaleString()}</span>}
                 </div>
                 <div className="text-right">
                   {groundDiscount > 0 && <span className="price-old block text-xs">¥{listTotal.toLocaleString()}</span>}
@@ -673,7 +775,7 @@ function BundleDetailContent({
               <span className="text-[11px] text-ink-muted">≈¥{perPerson.toLocaleString()}/人</span>
             </div>
             <div className="truncate text-[11px] text-ink-muted">
-              {formatMonthDay(goDate)}→{formatMonthDay(displayReturn)} · {pax}人{rooms}房
+              {formatMonthDay(goDate)}→{formatMonthDay(displayReturn)} · {pax}人{baseRooms}间房
             </div>
           </div>
           {soldOut ? (

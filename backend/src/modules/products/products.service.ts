@@ -405,10 +405,14 @@ export class ProductsService {
           suitableFor: body.suitableFor,
           hotelRoomTypeId: body.hotelRoomTypeId ?? null,
           hotelNights: body.hotelNights ?? null,
-          singleSupplementCnyPerNight:
-            body.singleSupplementCnyPerNight != null ? new Prisma.Decimal(body.singleSupplementCnyPerNight) : null,
-          cabinUpgradeCnyPerLeg:
-            body.cabinUpgradeCnyPerLeg != null ? new Prisma.Decimal(body.cabinUpgradeCnyPerLeg) : null,
+          // 省略时落 DB 默认（单人入住 ¥80/晚、升舱 ¥700/程、来回 2 段）
+          ...(body.singleSupplementCnyPerNight != null
+            ? { singleSupplementCnyPerNight: body.singleSupplementCnyPerNight }
+            : {}),
+          ...(body.businessUpgradeCnyPerLeg != null
+            ? { businessUpgradeCnyPerLeg: body.businessUpgradeCnyPerLeg }
+            : {}),
+          ...(body.legs != null ? { legs: body.legs } : {}),
           isActive: body.isActive,
         },
         include: BUNDLE_ROOM_INCLUDE,
@@ -433,13 +437,12 @@ export class ProductsService {
     if (body.hotelRoomTypeId !== undefined) data.hotelRoomTypeId = body.hotelRoomTypeId;
     if (body.hotelNights !== undefined) data.hotelNights = body.hotelNights;
     if (body.singleSupplementCnyPerNight !== undefined) {
-      data.singleSupplementCnyPerNight =
-        body.singleSupplementCnyPerNight !== null ? new Prisma.Decimal(body.singleSupplementCnyPerNight) : null;
+      data.singleSupplementCnyPerNight = body.singleSupplementCnyPerNight;
     }
-    if (body.cabinUpgradeCnyPerLeg !== undefined) {
-      data.cabinUpgradeCnyPerLeg =
-        body.cabinUpgradeCnyPerLeg !== null ? new Prisma.Decimal(body.cabinUpgradeCnyPerLeg) : null;
+    if (body.businessUpgradeCnyPerLeg !== undefined) {
+      data.businessUpgradeCnyPerLeg = body.businessUpgradeCnyPerLeg;
     }
+    if (body.legs !== undefined) data.legs = body.legs;
     if (body.isActive !== undefined) data.isActive = body.isActive;
     const b = await prisma.bundle.update({
       where: { id },
@@ -525,9 +528,10 @@ function serializeBundle(b: BundleWithRoom, rating: ProductRatingAggregate = ZER
   return {
     ...rest,
     groundDiscount: b.groundDiscount.toString(),
-    // 自愿升级展示价（CNY；null = 不展示）
-    singleSupplementCnyPerNight: b.singleSupplementCnyPerNight?.toString() ?? null,
-    cabinUpgradeCnyPerLeg: b.cabinUpgradeCnyPerLeg?.toString() ?? null,
+    // 可选升级加价（CNY，整数，server-priced add-on）+ 航段数；前端据此报价升级项
+    singleSupplementCnyPerNight: b.singleSupplementCnyPerNight,
+    businessUpgradeCnyPerLeg: b.businessUpgradeCnyPerLeg,
+    legs: b.legs,
     items: b.items,
     rating,
     reviewCount: rating.count,

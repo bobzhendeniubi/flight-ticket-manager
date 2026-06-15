@@ -119,9 +119,12 @@ export const createBundleBodySchema = z.object({
   // 套餐关联酒店房型（房控板计入套餐占房）；null = 解除关联
   hotelRoomTypeId: z.string().min(1).nullable().optional(),
   hotelNights: z.number().int().min(1).max(30).nullable().optional(),
-  // 自愿升级展示价（CNY）：单房差/晚、升舱/航段；null = 不展示该升级项
-  singleSupplementCnyPerNight: z.number().nonnegative().max(1_000_000).nullable().optional(),
-  cabinUpgradeCnyPerLeg: z.number().nonnegative().max(1_000_000).nullable().optional(),
+  // 可选升级加价（CNY，按产品可配置）：单人入住房差/晚、升舱商务/航段。
+  // 整数 CNY；省略时用 DB 默认（单人入住 ¥80/晚、升舱 ¥700/程）。
+  singleSupplementCnyPerNight: z.number().int().nonnegative().max(1_000_000).optional(),
+  businessUpgradeCnyPerLeg: z.number().int().nonnegative().max(1_000_000).optional(),
+  // 机票航段数（来回 = 2，单程 = 1）
+  legs: z.number().int().min(1).max(8).optional(),
   isActive: z.boolean().default(true),
 });
 export type CreateBundleBody = z.infer<typeof createBundleBodySchema>;

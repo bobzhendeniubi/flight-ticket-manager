@@ -52,7 +52,8 @@ const FALLBACK_PRICE = {
 /** MockBundle + 后端新增展示字段（升级价 / 关联房型 / 实时库存所需 id+晚数 / 评分销量） */
 interface BundleView extends MockBundle {
   singleSupplementPerNight: number | null;
-  cabinUpgradePerLeg: number | null;
+  businessUpgradePerLeg: number | null;
+  legs: number;
   hotelRoomType: { id: string; name: string; hotelName: string } | null;
   hotelRoomTypeId: string | null;
   hotelNights: number | null;
@@ -72,7 +73,9 @@ function bundleApiToView(b: ApiBundle): BundleView {
     suitableFor: b.suitableFor ?? '', active: b.isActive,
     singleSupplementPerNight:
       b.singleSupplementCnyPerNight != null ? Number(b.singleSupplementCnyPerNight) : null,
-    cabinUpgradePerLeg: b.cabinUpgradeCnyPerLeg != null ? Number(b.cabinUpgradeCnyPerLeg) : null,
+    businessUpgradePerLeg:
+      b.businessUpgradeCnyPerLeg != null ? Number(b.businessUpgradeCnyPerLeg) : null,
+    legs: b.legs != null ? Number(b.legs) : 2,
     hotelRoomType: b.hotelRoomType ?? null,
     hotelRoomTypeId: b.hotelRoomTypeId ?? null,
     hotelNights: b.hotelNights ?? null,
@@ -379,10 +382,16 @@ export function BundlesPage() {
             onView={() => navigate(`/bundles/${b.id}`)}
             onShowHotel={(hotel) => setHotelModal({ hotel, roomTypeName: b.hotelRoomType?.name ?? null })}
             onAdd={(cfg) => {
+              const addOnSummary = [
+                cfg.singleCount > 0 ? `单人入住×${cfg.singleCount}` : null,
+                cfg.businessCount > 0 ? `商务舱×${cfg.businessCount}` : null,
+              ]
+                .filter(Boolean)
+                .join(' · ');
               add({
                 kind: 'BUNDLE',
                 productId: b.id,
-                name: `${b.name}（${cfg.pax}人${cfg.rooms}房 · ${cfg.goDate}→${cfg.returnDate}）`,
+                name: `${b.name}（${cfg.pax}人${cfg.rooms}房 · ${cfg.goDate}→${cfg.returnDate}${addOnSummary ? ` · ${addOnSummary}` : ''}）`,
                 description: b.tagline,
                 emoji: b.emoji,
                 unitPrice: cfg.total,
@@ -396,6 +405,10 @@ export function BundlesPage() {
                   hotelTotal: cfg.hotelTotal,
                   otherTotal: cfg.otherTotal,
                   discount: b.groundDiscount,
+                  singleCount: cfg.singleCount,
+                  businessCount: cfg.businessCount,
+                  ...(cfg.goLegScheduleId ? { goLegScheduleId: cfg.goLegScheduleId } : {}),
+                  ...(cfg.retLegScheduleId ? { retLegScheduleId: cfg.retLegScheduleId } : {}),
                 },
               });
             }}
@@ -421,13 +434,18 @@ export function BundlesPage() {
 
 interface BundleAddConfig {
   pax: number;
-  rooms: number;
+  rooms: number; // 住宿间数 = ceil(pax/2)（双人同住），后端按 baseRooms 计费
   goDate: string;
   returnDate: string;
   total: number;
   flightTotal: number;
   hotelTotal: number;
   otherTotal: number;
+  // ── 可选升级 add-on ──
+  singleCount: number; // 「一个人住酒店（单人入住）」人数
+  businessCount: number; // 「升级商务舱」人数（占真实商务舱库存）
+  goLegScheduleId: string | null; // 已解析的去程经济舱班次 id（升舱需补 FLIGHT 行）
+  retLegScheduleId: string | null; // 已解析的回程经济舱班次 id
 }
 
 function ConfigurableBundleCard({
@@ -450,7 +468,11 @@ function ConfigurableBundleCard({
   onShowHotel: (hotel: Hotel) => void;
   onAdd: (cfg: BundleAddConfig) => void;
 }) {
-  const [rooms, setRooms] = useState(1); // 房间数
+  // 入住模型（按已确认决策）：默认双人同住，住宿间数 = ceil(pax/2)，不让用户自由调间数。
+  const baseRooms = Math.max(1, Math.ceil(pax / 2));
+  // 可选升级 add-on（默认 0；范围 0..pax）。
+  const [singleCount, setSingleCount] = useState(0); // 一个人住酒店（单人入住）
+  const [businessCount, setBusinessCount] = useState(0); // 升级商务舱
 
   // 日期输入框 ref：售罄时"看看其它日期"聚焦并弹出原生日期选择器（不暴露原始库存）。
   const dateInputRef = useRef<HTMLInputElement>(null);
@@ -482,6 +504,28 @@ function ConfigurableBundleCard({
   const goTier = legTier(outLeg, cabin);
   const retTier = legTier(retLeg, cabin);
 
+  // 升级商务舱要占真实商务舱库存 → 取去/回航段 BUSINESS 档位；任一段无商务舱/已售罄则不可升舱。
+  const goBizTier = legTier(outLeg, 'BUSINESS');
+  const retBizTier = legTier(retLeg, 'BUSINESS');
+  // 已加载航段但查不到 BUSINESS 舱位（null）→ 视为该段无商务舱可卖。
+  const businessSoldOut =
+    goBizTier === 'SOLD_OUT' ||
+    retBizTier === 'SOLD_OUT' ||
+    (outLeg != null && goBizTier === null) ||
+    (retLeg != null && retBizTier === null);
+  // 升级开关只在套餐配置了升舱报价、且本航线为经济舱套餐（升舱才有意义）时出现。
+  const canOfferBusiness = b.businessUpgradePerLeg != null && cabin === 'ECONOMY';
+
+  // pax 变化时把 add-on 份数夹回 [0, pax]（人数减少不能留下超额升级）。
+  useEffect(() => {
+    setSingleCount((c) => Math.min(c, pax));
+    setBusinessCount((c) => Math.min(c, pax));
+  }, [pax]);
+  // 商务舱售罄时强制清零升舱份数（避免提交后被后端拒）。
+  useEffect(() => {
+    if (businessSoldOut || !canOfferBusiness) setBusinessCount(0);
+  }, [businessSoldOut, canOfferBusiness]);
+
   // 酒店实时房量（关联房型才查；无包房配置 → null 不展示）
   const hotelTier = useHotelAvailability(b.hotelRoomTypeId, queryCardGo, queryReturnDate);
 
@@ -489,13 +533,21 @@ function ConfigurableBundleCard({
   const fb = FALLBACK_PRICE[cabin];
   const pricePerPerson = legPrice(outLeg, cabin, fb.go) + legPrice(retLeg, cabin, fb.ret);
 
-  // 计算每个行项的金额
+  // 计费晚数 = 套餐住宿晚数（镜像后端 computeBundleAddOn：无关联房型时回退 hotelNights）。
+  const billNights = Math.max(1, nights);
+  const supp = b.singleSupplementPerNight ?? 0;
+  const upg = b.businessUpgradePerLeg ?? 0;
+  // ── add-on 加价（镜像后端：单人入住 = singleCount×supp×nights；升舱 = businessCount×upg×legs）──
+  const singleAddOn = singleCount * supp * billNights;
+  const businessAddOn = businessCount * upg * b.legs;
+
+  // 计算每个行项的金额（住宿按 baseRooms 计费；double-occupancy 模型，不再让用户调间数）
   const itemRows = b.items.map((item) => {
     if (item.kind === 'FLIGHT') {
       return { ...item, computedTotal: pricePerPerson * pax, label: `来回${isBiz ? '商务' : '经济'}舱 × ${pax} 人` };
     }
     if (item.kind === 'HOTEL') {
-      return { ...item, computedTotal: item.unitPrice * item.qty * rooms, label: `${item.productName}${rooms > 1 ? ` × ${rooms} 房` : ''}` };
+      return { ...item, computedTotal: item.unitPrice * item.qty * baseRooms, label: `${item.productName}${baseRooms > 1 ? ` × ${baseRooms} 间` : ''}` };
     }
     if (item.kind === 'VISA') {
       return { ...item, computedTotal: item.unitPrice * pax, label: `${item.productName.replace(/× \d+/, `× ${pax}`)}` };
@@ -505,9 +557,13 @@ function ConfigurableBundleCard({
   });
 
   const flightTotal = itemRows.filter((r) => r.kind === 'FLIGHT').reduce((s, r) => s + r.computedTotal, 0);
-  const hotelTotal = itemRows.filter((r) => r.kind === 'HOTEL').reduce((s, r) => s + r.computedTotal, 0);
-  const otherTotal = itemRows.filter((r) => r.kind !== 'FLIGHT' && r.kind !== 'HOTEL').reduce((s, r) => s + r.computedTotal, 0);
-  const listTotal = flightTotal + hotelTotal + otherTotal;
+  // 单人入住加价并入酒店金额（与后端 hotel 公式一致）
+  const hotelTotal =
+    itemRows.filter((r) => r.kind === 'HOTEL').reduce((s, r) => s + r.computedTotal, 0) + singleAddOn;
+  // 升舱加价并入机票部分（与后端 flight 公式一致）
+  const otherTotal =
+    itemRows.filter((r) => r.kind !== 'FLIGHT' && r.kind !== 'HOTEL').reduce((s, r) => s + r.computedTotal, 0);
+  const listTotal = flightTotal + hotelTotal + otherTotal + businessAddOn;
   const total = listTotal - b.groundDiscount;
   const perPerson = pax > 0 ? Math.round(total / pax) : total;
 
@@ -546,7 +602,8 @@ function ConfigurableBundleCard({
     ] as (Inclusion | null)[]
   ).filter((x): x is Inclusion => x !== null);
 
-  const hasUpgrades = b.singleSupplementPerNight != null || b.cabinUpgradePerLeg != null;
+  // 是否展示「单人入住」升级（pax≥2 才有意义：1 人本就独住一间）
+  const canOfferSingle = b.singleSupplementPerNight != null && pax >= 2;
 
   return (
     <article className="card-interactive group overflow-hidden">
@@ -608,12 +665,12 @@ function ConfigurableBundleCard({
           </div>
         </div>
 
-        {/* 房间数调整器（人数由顶部选择器统一控制） */}
-        <div className="flex flex-col gap-2 items-end">
-          <div className="flex items-center gap-2 text-sm">
-            <span className="text-ink-soft">房间数</span>
-            <Stepper value={rooms} min={1} max={5} onChange={setRooms} />
-          </div>
+        {/* 住宿间数信息（双人同住，自动 = ceil(人数/2)，人数由顶部选择器统一控制） */}
+        <div className="flex flex-col gap-1 items-end">
+          <span className="inline-flex items-center gap-1.5 rounded-full bg-purple-50 px-2.5 py-1 text-xs font-semibold text-purple-700">
+            <Icon name="hotel" className="h-3.5 w-3.5" />
+            住宿：{baseRooms} 间房（双人同住）
+          </span>
         </div>
       </div>
 
@@ -712,22 +769,60 @@ function ConfigurableBundleCard({
             </span>
           </div>
         ))}
+        {/* 升级 add-on 明细行（选了才显示） */}
+        {singleCount > 0 && (
+          <div className="flex items-center justify-between text-xs">
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="rounded bg-indigo-100 px-1.5 py-0.5 font-medium text-indigo-700">升级</span>
+              <span className="text-slate-700 truncate">单人入住 ×{singleCount}</span>
+            </div>
+            <span className="text-slate-600 tabular-nums whitespace-nowrap">+¥{singleAddOn.toLocaleString()}</span>
+          </div>
+        )}
+        {businessCount > 0 && (
+          <div className="flex items-center justify-between text-xs">
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="rounded bg-indigo-100 px-1.5 py-0.5 font-medium text-indigo-700">升级</span>
+              <span className="text-slate-700 truncate">升级商务舱 ×{businessCount}</span>
+            </div>
+            <span className="text-slate-600 tabular-nums whitespace-nowrap">+¥{businessAddOn.toLocaleString()}</span>
+          </div>
+        )}
       </div>
 
-      {/* 可自愿付费升级（仅展示，收费走线下人工） */}
-      {hasUpgrades && (
-        <div className="mt-3 rounded-md border border-dashed border-indigo-300 bg-indigo-50/60 p-2.5 text-xs text-indigo-800">
-          <span className="font-semibold">可选升级（自愿付费，下单后联系客服办理）：</span>{' '}
-          {[
-            b.singleSupplementPerNight != null
-              ? `单住补房差 ¥${b.singleSupplementPerNight.toLocaleString()}/晚`
-              : null,
-            b.cabinUpgradePerLeg != null
-              ? `升舱商务 ¥${b.cabinUpgradePerLeg.toLocaleString()}/程`
-              : null,
-          ]
-            .filter(Boolean)
-            .join(' · ')}
+      {/* 可选升级 add-on（直接在前台选购，下单即含；不走客服） */}
+      {(canOfferSingle || canOfferBusiness) && (
+        <div className="mt-3 space-y-2.5 rounded-xl border border-indigo-200 bg-indigo-50/50 p-3 text-xs">
+          <div className="font-semibold text-indigo-900">可选升级（即选即享）</div>
+          {canOfferSingle && (
+            <div className="flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="font-medium text-ink">一个人住酒店（单人入住）</div>
+                <div className="text-ink-muted">
+                  一人一间房 · +¥{(b.singleSupplementPerNight ?? 0).toLocaleString()}/晚/人
+                </div>
+              </div>
+              <Stepper value={singleCount} min={0} max={pax} onChange={setSingleCount} />
+            </div>
+          )}
+          {canOfferBusiness && (
+            <div className="flex items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="font-medium text-ink">升级商务舱</div>
+                <div className="text-ink-muted">
+                  {businessSoldOut
+                    ? '商务舱已售罄'
+                    : `+¥${(b.businessUpgradePerLeg ?? 0).toLocaleString()}/程/人`}
+                </div>
+              </div>
+              <Stepper
+                value={businessCount}
+                min={0}
+                max={businessSoldOut ? 0 : pax}
+                onChange={setBusinessCount}
+              />
+            </div>
+          )}
         </div>
       )}
 
@@ -741,7 +836,7 @@ function ConfigurableBundleCard({
         </div>
         <div className="mt-1.5 flex flex-col gap-1.5 sm:flex-row sm:items-end sm:justify-between">
           <div className="text-xs text-ink-muted">
-            {pax} 人 · {rooms} 房 · {formatMonthDay(cardGoDate)} → {formatMonthDay(displayReturnDate)}
+            {pax} 人 · {baseRooms} 间房 · {formatMonthDay(cardGoDate)} → {formatMonthDay(displayReturnDate)}
           </div>
           <div className="flex items-baseline justify-end gap-2 text-right">
             {b.groundDiscount > 0 && (
@@ -780,7 +875,20 @@ function ConfigurableBundleCard({
           disabled={soldOut}
           title={soldOut ? '该日期已售罄，换个日期试试' : undefined}
           onClick={() =>
-            onAdd({ pax, rooms, goDate: cardGoDate, returnDate: displayReturnDate, total, flightTotal, hotelTotal, otherTotal })
+            onAdd({
+              pax,
+              rooms: baseRooms,
+              goDate: cardGoDate,
+              returnDate: displayReturnDate,
+              total,
+              flightTotal,
+              hotelTotal,
+              otherTotal,
+              singleCount,
+              businessCount,
+              goLegScheduleId: outLeg?.scheduleId ?? null,
+              retLegScheduleId: retLeg?.scheduleId ?? null,
+            })
           }
         >
           {soldOut ? '该日期已售罄' : '加入购物车'}

@@ -20,6 +20,15 @@ export interface CartItem {
   emoji: string;
   unitPrice: number;
   qty: number;
+  /**
+   * 行附加信息（扁平标量）。BUNDLE 行约定的键：
+   *   goDate/returnDate/pax/rooms      — 行程要素（后端推导酒店占房）
+   *   flightTotal/hotelTotal/otherTotal/discount — 展示用价格拆分
+   *   singleCount                      — 「一个人住酒店（单人入住）」人数（add-on）
+   *   businessCount                    — 「升级商务舱」人数（add-on，占真实商务舱库存）
+   *   goLegScheduleId/retLegScheduleId — 已解析的经济舱航段班次 id；
+   *                                      businessCount>0 时结算页据此补发经济舱 FLIGHT 行
+   */
   meta?: Record<string, string | number | boolean>;
   addedAt: string; // ISO 时间，用于"实时动态"展示
   // 结账勾选 —— 代理可只结一部分，剩下的留在车里。老数据无此字段时按"已勾选"处理。

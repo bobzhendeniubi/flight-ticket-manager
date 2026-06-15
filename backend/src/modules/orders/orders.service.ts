@@ -129,13 +129,17 @@ export class OrderService {
       if (existing) return existing;
     }
 
-    // 机票张数 = 乘客数 校验
-    const flightQty = body.items
-      .filter((i) => i.kind === 'FLIGHT')
-      .reduce((sum, i) => sum + i.quantity, 0);
-    if (flightQty > 0 && flightQty !== body.passengers.length) {
+    // 出行人数校验（与前台 effectivePax 同口径）。
+    // 关键：往返机票是「同一批人」，会拆成去/回两条 FLIGHT 行（各 quantity=pax）。
+    // 所需出行人按「单程最大人数」算，取各 FLIGHT 行 quantity 的 MAX，绝不两段相加 ——
+    // 否则 2 人往返会被错误要求 4 本护照（公测反馈）。
+    // 签证/接送/套餐也都是「按人」的产品（同一批出行人），同样取 MAX 不取 SUM：
+    //   required = max( max(FLIGHT 行 quantity), Σ(BUNDLE pax), Σ(VISA qty), Σ(TRANSFER qty) )
+    // 镜像前台 CheckoutPage 的 effectivePax 计算，保证两端结论一致。
+    const requiredPax = computeRequiredPassengerCount(body.items);
+    if (requiredPax > 0 && requiredPax !== body.passengers.length) {
       throw new BadRequestError(
-        `机票 ${flightQty} 张，必须填 ${flightQty} 位乘客（当前 ${body.passengers.length} 位）`,
+        `本次行程共需 ${requiredPax} 位出行人，当前填了 ${body.passengers.length} 位`,
       );
     }
 
@@ -178,13 +182,21 @@ export class OrderService {
       // where: `sold + qty <= capacity` 等价于 Prisma-expressible `capacity - qty >= sold`
       // 但 Prisma raw 不支持这种 cross-column where；用 sold + qty <= capacity 需要
       // SQL 函数，改用 raw SQL 保证原子性。
-      for (const p of pricedItems) {
-        if (p.kind !== 'FLIGHT') continue;
+      // 原子扣座（CAS 防超卖）。一行经济舱 FLIGHT 在套餐升舱时会拆成两笔：
+      //   ECONOMY  sold += quantity − businessUpgradeCount（剩下没升舱的人）
+      //   BUSINESS sold += businessUpgradeCount（升舱的人，占用真实商务舱座位）
+      // 净占座仍 = quantity，不超售商务舱、不持有幽灵经济舱座位。businessUpgradeCount=0 → 行为与旧版完全一致。
+      const decrementSeat = async (
+        scheduleId: string,
+        cabin: import('@prisma/client').CabinClass,
+        qty: number,
+      ): Promise<void> => {
+        if (qty <= 0) return;
         // 锁位语义：他人的 ACTIVE 未过期锁位占用余票（下单人自己的锁位不挡自己下单）
         const lockedAgg = await tx.seatLock.aggregate({
           _sum: { qty: true },
           where: {
-            seatClass: { scheduleId: p.flightScheduleId!, cabin: p.flightCabin! },
+            seatClass: { scheduleId, cabin },
             // 游客无锁位归属 → 所有他人 ACTIVE 锁位都占用余票
             ...(ownerUserId ? { userId: { not: ownerUserId } } : {}),
             status: SeatLockStatus.ACTIVE,
@@ -194,22 +206,31 @@ export class OrderService {
         const lockedByOthers = lockedAgg._sum.qty ?? 0;
         const affected = await tx.$executeRaw`
           UPDATE "FlightSeatClass"
-          SET sold = sold + ${p.quantity}, "updatedAt" = NOW()
-          WHERE "scheduleId" = ${p.flightScheduleId}
-            AND cabin = ${p.flightCabin}::"CabinClass"
-            AND sold + ${p.quantity} + ${lockedByOthers} <= capacity
+          SET sold = sold + ${qty}, "updatedAt" = NOW()
+          WHERE "scheduleId" = ${scheduleId}
+            AND cabin = ${cabin}::"CabinClass"
+            AND sold + ${qty} + ${lockedByOthers} <= capacity
         `;
         if (affected !== 1) {
           // 查当前库存给更友好的错误消息
           const sc = await tx.flightSeatClass.findFirst({
-            where: { scheduleId: p.flightScheduleId!, cabin: p.flightCabin! },
+            where: { scheduleId, cabin },
             select: { capacity: true, sold: true },
           });
           const available = sc ? Math.max(0, sc.capacity - sc.sold - lockedByOthers) : 0;
           throw new ConflictError(
-            `${p.flightCabin} 余票不足：需要 ${p.quantity} 张，仅剩 ${available} 张（并发抢占）`,
+            `${cabin} 余票不足：需要 ${qty} 张，仅剩 ${available} 张（并发抢占）`,
           );
         }
+      };
+
+      for (const p of pricedItems) {
+        if (p.kind !== 'FLIGHT' || !p.flightScheduleId || !p.flightCabin) continue;
+        const split = computeBundleSeatSplit(p.flightCabin, p.quantity, p.businessUpgradeCount);
+        // 升舱的人占商务舱真实座位
+        await decrementSeat(p.flightScheduleId, 'BUSINESS', split.business);
+        // 其余人占本行原舱位（经济舱减掉升舱人数；非经济舱行 split.business=0，等于全额扣原舱）
+        await decrementSeat(p.flightScheduleId, p.flightCabin, split.sameCabin);
       }
 
       // 初始状态直接 PENDING_PAYMENT（MVP 阶段没有 DRAFT 保存流）
@@ -436,6 +457,9 @@ export class OrderService {
       amount: number;
       flightScheduleId?: string;
       flightCabin?: import('@prisma/client').CabinClass;
+      // 套餐升舱：这条经济舱 FLIGHT 行里有多少个座位要占用真实商务舱库存
+      // （扣座时 ECONOMY sold += quantity − businessUpgradeCount，BUSINESS sold += businessUpgradeCount）
+      businessUpgradeCount?: number;
       hotelRoomTypeId?: string;
       hotelCheckIn?: Date;
       hotelCheckOut?: Date;
@@ -444,6 +468,10 @@ export class OrderService {
       bundleId?: string;
       metadata?: Record<string, unknown>;
     }> = [];
+
+    // 本单所有 BUNDLE 行选「升舱商务」的总人数（多份套餐叠加）。
+    // 循环结束后分摊到本单的经济舱 FLIGHT 航段：每段占用 businessUpgradeCount 个真实商务舱座位。
+    let bundleBusinessUpgradeCount = 0;
 
     for (const item of items) {
       if (item.kind === 'FLIGHT') {
@@ -549,6 +577,10 @@ export class OrderService {
             isActive: true,
             hotelRoomTypeId: true,
             hotelNights: true,
+            // 可选升级加价费率（server-priced，按产品可配置）+ 航段数
+            singleSupplementCnyPerNight: true,
+            businessUpgradeCnyPerLeg: true,
+            legs: true,
           },
         });
         if (!bundle) throw new NotFoundError(`套餐 ${item.bundleId} 不存在`);
@@ -563,22 +595,106 @@ export class OrderService {
         // 套餐关联酒店 → 把房型+入住日期盖到订单行（房控板自动计入套餐占房）。
         // metadata 缺失/异常时只是不盖章，绝不阻断下单。
         const hotelStamp = resolveBundleHotelStamp(bundle, item.metadata);
+
+        // 可选升级 add-on（server-priced，权威重算；缺省 0 → 与旧版价格完全一致）：
+        //   单人入住房差 = singleCount × singleSupplementCnyPerNight × nights
+        //   升舱商务加价 = businessCount × businessUpgradeCnyPerLeg × legs
+        //     —— 这是客户升舱的「总加价」（不是在全价商务票之上再加 ¥700）。客户机票仍按经济舱套餐价收，
+        //        差价由商家补贴；升舱只占用真实商务舱库存（不超售），见下方按经济舱航段拆座逻辑。
+        const addOn = computeBundleAddOn(bundle, hotelStamp, item.singleCount, item.businessCount);
+        // 累计本单的升舱人数（多份套餐叠加），下方循环结束后统一分摊到经济舱航段并预检商务舱余位。
+        bundleBusinessUpgradeCount += addOn.breakdown.businessCount;
+
         priced.push({
           kind: 'BUNDLE',
           description: item.description,
           quantity: item.quantity,
           unitPrice: bundleUnitPrice,
-          amount: bundleUnitPrice * item.quantity,
+          // 升级加价加在套餐行总额上（不摊进 unitPrice，保持基础单价语义不变）
+          amount: bundleUnitPrice * item.quantity + addOn.total,
           bundleId: item.bundleId,
           hotelRoomTypeId: hotelStamp?.hotelRoomTypeId,
           hotelCheckIn: hotelStamp?.hotelCheckIn,
           hotelCheckOut: hotelStamp?.hotelCheckOut,
-          metadata: item.metadata,
+          // 把升级选择 + 重算明细落到订单行 metadata，供运营/财务查看（admin 内部仍可叫"单房差/升舱"）
+          metadata: addOn.hasAddOn
+            ? { ...(item.metadata ?? {}), addOns: addOn.breakdown }
+            : item.metadata,
         });
       }
     }
 
+    // ── 套餐升舱占座：把 businessCount 个座位从经济舱航段「拆」到真实商务舱库存 ──
+    // 套餐本身不绑班次（bundle.items 里的 FLIGHT 组件只有描述、无 scheduleId），故升舱要占用的
+    // 真实座位来自本单的经济舱 FLIGHT 行（前台套餐订单的往返机票就是这些经济舱航段）。
+    // 客户机票仍按经济舱收费（FLIGHT 行 amount 不变）；升舱只改变扣座的舱位分布：
+    //   每个经济舱航段：BUSINESS sold += businessUpgradeCount，ECONOMY sold += quantity − businessUpgradeCount。
+    // 净占座仍 = quantity（不持有幽灵经济舱座位、不超售商务舱）。
+    if (bundleBusinessUpgradeCount > 0) {
+      const economyLegs = priced.filter(
+        (p) => p.kind === 'FLIGHT' && p.flightCabin === 'ECONOMY',
+      );
+      if (economyLegs.length === 0) {
+        // 没有可升舱的经济舱航段 → 无从占用真实商务舱座位（套餐本身不绑班次）。
+        throw new BadRequestError('商务舱余位不足，无法升舱');
+      }
+      // 每段经济舱座位数必须 ≥ 升舱人数（不能把比本段乘客还多的人升舱）。
+      for (const leg of economyLegs) {
+        if (leg.quantity < bundleBusinessUpgradeCount) {
+          throw new BadRequestError('商务舱余位不足，无法升舱');
+        }
+      }
+      // 逐段预检真实商务舱余位（事务前友好预检，真正扣减由事务里的原子 CAS 完成，最终防超售）。
+      await this.assertBusinessAvailabilityForBundle(economyLegs, bundleBusinessUpgradeCount);
+      // 标记每个经济舱航段要拆多少座到商务舱，并落到订单行 metadata（取消退座时按此还原拆座）。
+      for (const leg of economyLegs) {
+        leg.businessUpgradeCount = bundleBusinessUpgradeCount;
+        leg.metadata = { ...(leg.metadata ?? {}), businessUpgradeCount: bundleBusinessUpgradeCount };
+      }
+    }
+
     return priced;
+  }
+
+  /**
+   * 升舱占座预检（套餐升级商务舱时调用）。
+   *
+   * 套餐升舱的正确模型：客户机票仍按经济舱套餐价收，¥700/程 是升舱的「总加价」（不是在全价商务票上再加）；
+   * 升舱要占用的真实商务舱座位来自本单的经济舱 FLIGHT 航段（套餐本身不绑班次）。
+   * 这里逐段按六档余位口径（available = capacity − sold − 他人 ACTIVE 锁位）预检每个经济舱航段对应班次的
+   * 商务舱余位是否够 businessCount：
+   *   - 任一航段班次没有商务舱舱位 / 商务舱余位 < businessCount → 拒单（"商务舱余位不足，无法升舱"）
+   * 真正的扣减（ECONOMY 减 businessCount、BUSINESS 加 businessCount）由事务里的原子 CAS 完成，最终防超售；
+   * 此处只做事务前的友好预检。
+   */
+  private async assertBusinessAvailabilityForBundle(
+    economyLegs: Array<{ flightScheduleId?: string }>,
+    businessCount: number,
+  ): Promise<void> {
+    const now = new Date();
+    for (const leg of economyLegs) {
+      if (!leg.flightScheduleId) continue;
+      const sc = await prisma.flightSeatClass.findFirst({
+        where: { scheduleId: leg.flightScheduleId, cabin: 'BUSINESS' },
+        select: { capacity: true, sold: true },
+      });
+      if (!sc) {
+        throw new BadRequestError('商务舱余位不足，无法升舱');
+      }
+      const lockedAgg = await prisma.seatLock.aggregate({
+        _sum: { qty: true },
+        where: {
+          seatClass: { scheduleId: leg.flightScheduleId, cabin: 'BUSINESS' },
+          status: SeatLockStatus.ACTIVE,
+          expiresAt: { gt: now },
+        },
+      });
+      const locked = lockedAgg._sum.qty ?? 0;
+      const available = Math.max(0, sc.capacity - sc.sold - locked);
+      if (available < businessCount) {
+        throw new BadRequestError('商务舱余位不足，无法升舱');
+      }
+    }
   }
 
   // ════════════════════════════════════════════════════════════════════
@@ -982,20 +1098,35 @@ export class OrderService {
     });
 
     if (wasHolding && isReleasing) {
-      for (const item of order.items) {
-        if (item.kind !== 'FLIGHT' || !item.flightScheduleId || !item.flightCabin) continue;
+      const releaseSeat = async (
+        scheduleId: string,
+        cabin: import('@prisma/client').CabinClass,
+        qty: number,
+      ): Promise<void> => {
+        if (qty <= 0) return;
         await tx.flightSeatClass.updateMany({
-          where: { scheduleId: item.flightScheduleId, cabin: item.flightCabin },
-          data: { sold: { decrement: item.quantity } },
+          where: { scheduleId, cabin },
+          data: { sold: { decrement: qty } },
         });
         // 收集释放座位的舱位 id —— 调用方提交事务后排队候补检查
         if (releasedSeatClassIdsOut) {
           const sc = await tx.flightSeatClass.findFirst({
-            where: { scheduleId: item.flightScheduleId, cabin: item.flightCabin },
+            where: { scheduleId, cabin },
             select: { id: true },
           });
           if (sc) releasedSeatClassIdsOut.push(sc.id);
         }
+      };
+
+      for (const item of order.items) {
+        if (item.kind !== 'FLIGHT' || !item.flightScheduleId || !item.flightCabin) continue;
+        // 套餐升舱拆座的镜像还原：经济舱行下单时拆了 businessUpgradeCount 个座到商务舱，
+        // 退座时也要按同一拆分各退各舱（否则会少退商务舱、多退经济舱）。
+        const meta = (item.metadata ?? {}) as { businessUpgradeCount?: unknown };
+        const rawUpgrade = typeof meta.businessUpgradeCount === 'number' ? meta.businessUpgradeCount : 0;
+        const split = computeBundleSeatSplit(item.flightCabin, item.quantity, rawUpgrade);
+        await releaseSeat(item.flightScheduleId, 'BUSINESS', split.business);
+        await releaseSeat(item.flightScheduleId, item.flightCabin, split.sameCabin);
       }
     }
 
@@ -1389,6 +1520,136 @@ export function resolveBundleHotelStamp(
     hotelCheckIn: checkIn,
     hotelCheckOut: checkOut,
   };
+}
+
+// ── 套餐可选升级 add-on 重算（server-priced）─────────────────────────
+/** 写到订单行 metadata.addOns 的升级重算明细（金额单位 CNY，整数）。 */
+export interface BundleAddOnBreakdown {
+  singleCount: number; // 选「一个人住酒店（单人入住）」的人数
+  businessCount: number; // 选「升舱商务」的人数
+  nights: number; // 计费晚数（用于单人入住房差）
+  legs: number; // 计费航段数（用于升舱商务）
+  singleSupplementCnyPerNight: number; // 该套餐配置的单人入住房差/晚
+  businessUpgradeCnyPerLeg: number; // 该套餐配置的升舱/航段
+  singleSupplementTotal: number; // = singleCount × rate × nights
+  businessUpgradeTotal: number; // = businessCount × rate × legs
+  total: number; // 两项之和
+}
+
+/**
+ * 套餐升级加价权威重算（不信任客户端金额）。公式：
+ *   nights = stamp 推导的入住晚数（无房型 → hotelNights ?? 1）
+ *   legs   = bundle.legs（来回默认 2）
+ *   单人入住房差 = singleCount × singleSupplementCnyPerNight × nights
+ *   升舱商务加价 = businessCount × businessUpgradeCnyPerLeg × legs
+ * singleCount / businessCount 缺省 0 → total=0 → 套餐价与旧版完全一致（向后兼容）。
+ *
+ * 导出仅供单测使用。
+ */
+export function computeBundleAddOn(
+  bundle: {
+    hotelNights: number | null;
+    singleSupplementCnyPerNight: number;
+    businessUpgradeCnyPerLeg: number;
+    legs: number;
+  },
+  hotelStamp: { hotelCheckIn: Date; hotelCheckOut: Date } | null,
+  singleCount: number | undefined,
+  businessCount: number | undefined,
+): { total: number; hasAddOn: boolean; breakdown: BundleAddOnBreakdown } {
+  const single = Math.max(0, Math.trunc(singleCount ?? 0));
+  const business = Math.max(0, Math.trunc(businessCount ?? 0));
+  // 计费晚数：优先用盖章推导的真实入住区间，否则回退套餐默认晚数（≥1）
+  const nights = hotelStamp
+    ? Math.max(
+        1,
+        Math.round((hotelStamp.hotelCheckOut.getTime() - hotelStamp.hotelCheckIn.getTime()) / DAY_MS),
+      )
+    : Math.max(1, bundle.hotelNights ?? DEFAULT_BUNDLE_HOTEL_NIGHTS);
+  const legs = Math.max(1, bundle.legs);
+  const singleRate = Math.max(0, bundle.singleSupplementCnyPerNight);
+  const businessRate = Math.max(0, bundle.businessUpgradeCnyPerLeg);
+
+  const singleSupplementTotal = single * singleRate * nights;
+  const businessUpgradeTotal = business * businessRate * legs;
+  const total = singleSupplementTotal + businessUpgradeTotal;
+
+  return {
+    total,
+    hasAddOn: single > 0 || business > 0,
+    breakdown: {
+      singleCount: single,
+      businessCount: business,
+      nights,
+      legs,
+      singleSupplementCnyPerNight: singleRate,
+      businessUpgradeCnyPerLeg: businessRate,
+      singleSupplementTotal,
+      businessUpgradeTotal,
+      total,
+    },
+  };
+}
+
+/**
+ * 出行人数校验口径（纯函数，与前台 CheckoutPage 的 effectivePax 同源）。
+ *
+ * 同一批出行人会出现在多条订单行里 —— 往返机票拆成去/回两条 FLIGHT 行（各 quantity=pax），
+ * 套餐 / 签证 / 接送也都是「按人」的产品。所需出行人数应是「单程最大人数」，不是各行相加：
+ *   - FLIGHT：取各行 quantity 的 MAX（往返同一批人，绝不两段相加）
+ *   - BUNDLE：每行 pax 取自 metadata.pax（缺失回退 quantity），多份套餐相加
+ *   - VISA / TRANSFER：每行 quantity 相加
+ *   - required = max(maxFlightLegQty, bundlePax, visaQty, transferPax)
+ * 任一维度为 0 时不约束（required 仍由其余维度决定）；全为 0（无按人产品）→ 返回 0，不校验。
+ *
+ * 导出供单测与 createOrder 共用。
+ */
+export function computeRequiredPassengerCount(items: OrderItemInput[]): number {
+  let maxFlightLegQty = 0;
+  let bundlePax = 0;
+  let visaQty = 0;
+  let transferPax = 0;
+
+  for (const item of items) {
+    if (item.kind === 'FLIGHT') {
+      // 往返两段共享乘客 → 取最大单段人数，不累加
+      maxFlightLegQty = Math.max(maxFlightLegQty, item.quantity);
+    } else if (item.kind === 'BUNDLE') {
+      // 套餐人数以 metadata.pax 为准（前台带过来），缺失/异常回退到行 quantity
+      const meta = bundleItemMetadataSchema.parse(item.metadata ?? {});
+      bundlePax += meta.pax ?? item.quantity;
+    } else if (item.kind === 'VISA') {
+      visaQty += item.quantity;
+    } else if (item.kind === 'TRANSFER') {
+      transferPax += item.quantity;
+    }
+  }
+
+  return Math.max(maxFlightLegQty, bundlePax, visaQty, transferPax);
+}
+
+/**
+ * 套餐升舱「拆座」模型（纯函数，扣座/退座共用，最终防超售）。
+ *
+ * 一个航段（FLIGHT 行）下单 `quantity` 人，其中 `businessUpgradeCount` 人选了升舱商务：
+ *   - 升舱的人占用真实商务舱座位：BUSINESS += min(businessUpgradeCount, quantity)
+ *   - 其余的人留在本行原舱位：原舱 += quantity − 上述商务数
+ * 净占座仍 = quantity（不超售商务舱、不持有幽灵经济舱座位）。
+ * 只有经济舱航段（cabin === 'ECONOMY'）才会被拆；其他舱位 businessUpgradeCount 视为 0。
+ * businessUpgradeCount 缺省/0 → economy=quantity、business=0，与旧版行为完全一致（向后兼容）。
+ *
+ * 导出仅供单测使用。
+ */
+export function computeBundleSeatSplit(
+  cabin: import('@prisma/client').CabinClass,
+  quantity: number,
+  businessUpgradeCount: number | undefined,
+): { sameCabin: number; business: number } {
+  const upgrade =
+    cabin === 'ECONOMY'
+      ? Math.min(Math.max(0, Math.trunc(businessUpgradeCount ?? 0)), quantity)
+      : 0;
+  return { sameCabin: quantity - upgrade, business: upgrade };
 }
 
 function passengerToData(p: PassengerInput) {

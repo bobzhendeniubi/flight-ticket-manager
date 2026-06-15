@@ -538,11 +538,11 @@ async function seedHotels() {
     { name: '别墅套房', bedType: '2 卧室 + 私人泳池', mult: 1.85, capacity: 4 },
   ];
   const HOTELS = [
-    { key: 'h1', name: '岘港四季度假村', nameEn: 'Four Seasons Resort The Nam Hai', cityCode: 'DAD', area: '美溪海滩 / 会安之间', address: 'Hamlet 1, Dien Duong, Dien Ban, Quang Nam', stars: 5, basePrice: 3280, rating: 4.9, reviewCount: 2891, emoji: '🏝️', photo: 'https://images.unsplash.com/photo-1582719508461-905c673771fd?w=600&h=400&fit=crop', amenities: ['私人海滩', '全海景别墅', '3 个无边泳池', '含自助早餐', '免费班车', 'SPA'], highlight: '全别墅式私密度假，The Nam Hai 独家 1km 海岸线' },
-    { key: 'h2', name: '岘港洲际半岛度假村', nameEn: 'InterContinental Danang Sun Peninsula Resort', cityCode: 'DAD', area: '山茶半岛', address: 'Bai Bac, Son Tra Peninsula, Danang', stars: 5, basePrice: 3680, rating: 4.9, reviewCount: 3421, emoji: '🌊', photo: 'https://images.unsplash.com/photo-1520250497591-112f2f40a3f4?w=600&h=400&fit=crop', amenities: ['私人海湾', '缆车', '米其林餐厅 La Maison 1888', '日落无敌海景', '豪华 SPA'], highlight: 'Bill Bensley 设计，山茶半岛独占海湾' },
-    { key: 'h3', name: '岘港凯悦度假村', nameEn: 'Hyatt Regency Danang Resort and Spa', cityCode: 'DAD', area: '美溪海滩', address: '5 Truong Sa Street, Hoa Hai Ward, Danang', stars: 5, basePrice: 1880, rating: 4.7, reviewCount: 4215, emoji: '🏖️', photo: 'https://images.unsplash.com/photo-1571896349842-33c89424de2d?w=600&h=400&fit=crop', amenities: ['5 个泳池', '直通海滩', '儿童俱乐部', '含早餐', '免费机场班车'], highlight: '美溪海滩热门家庭首选，亲子设施完善' },
-    { key: 'h4', name: '岘港铂尔曼海滩度假村', nameEn: 'Pullman Danang Beach Resort', cityCode: 'DAD', area: '美溪海滩', address: '101 Vo Nguyen Giap, Danang', stars: 5, basePrice: 1480, rating: 4.6, reviewCount: 2108, emoji: '🏨', photo: 'https://images.unsplash.com/photo-1445019980597-93fa8acb246c?w=600&h=400&fit=crop', amenities: ['海滩泳池', '水疗中心', '含早餐', '儿童乐园'], highlight: '性价比首选，美溪海滩中心位置' },
-    { key: 'h5', name: '会安阿南塔拉度假村', nameEn: 'Anantara Hoi An Resort', cityCode: 'HOA', area: '会安古城', address: '1 Pham Hong Thai, Hoi An', stars: 5, basePrice: 2280, rating: 4.8, reviewCount: 1892, emoji: '🏮', photo: 'https://images.unsplash.com/photo-1578662996442-48f60103fc96?w=600&h=400&fit=crop', amenities: ['河畔泳池', '古城步行 5 分钟', '越南传统建筑', 'SPA'], highlight: '会安古城中心，步行即达灯笼市集' },
+    { key: 'h1', name: '岘港四季度假村', nameEn: 'Four Seasons Resort The Nam Hai', cityCode: 'DAD', area: '美溪海滩 / 会安之间', address: 'Hamlet 1, Dien Duong, Dien Ban, Quang Nam', stars: 5, basePrice: 3280, rating: 4.9, reviewCount: 2891, emoji: '🏝️', photo: 'https://images.unsplash.com/photo-1582719508461-905c673771fd?w=600&h=400&fit=crop', gallery: ['https://images.unsplash.com/photo-1582719478250-c89cae4dc85b?w=600&h=400&fit=crop', 'https://images.unsplash.com/photo-1611892440504-42a792e24d32?w=600&h=400&fit=crop'], amenities: ['私人海滩', '全海景别墅', '3 个无边泳池', '含自助早餐', '免费班车', 'SPA'], highlight: '全别墅式私密度假，The Nam Hai 独家 1km 海岸线' },
+    { key: 'h2', name: '岘港洲际半岛度假村', nameEn: 'InterContinental Danang Sun Peninsula Resort', cityCode: 'DAD', area: '山茶半岛', address: 'Bai Bac, Son Tra Peninsula, Danang', stars: 5, basePrice: 3680, rating: 4.9, reviewCount: 3421, emoji: '🌊', photo: 'https://images.unsplash.com/photo-1520250497591-112f2f40a3f4?w=600&h=400&fit=crop', gallery: ['https://images.unsplash.com/photo-1455587734955-081b22074882?w=600&h=400&fit=crop', 'https://images.unsplash.com/photo-1631049307264-da0ec9d70304?w=600&h=400&fit=crop'], amenities: ['私人海湾', '缆车', '米其林餐厅 La Maison 1888', '日落无敌海景', '豪华 SPA'], highlight: 'Bill Bensley 设计，山茶半岛独占海湾' },
+    { key: 'h3', name: '岘港凯悦度假村', nameEn: 'Hyatt Regency Danang Resort and Spa', cityCode: 'DAD', area: '美溪海滩', address: '5 Truong Sa Street, Hoa Hai Ward, Danang', stars: 5, basePrice: 1880, rating: 4.7, reviewCount: 4215, emoji: '🏖️', photo: 'https://images.unsplash.com/photo-1571896349842-33c89424de2d?w=600&h=400&fit=crop', gallery: ['https://images.unsplash.com/photo-1564013799919-ab600027ffc6?w=600&h=400&fit=crop', 'https://images.unsplash.com/photo-1571902943202-507ec2618e8f?w=600&h=400&fit=crop'], amenities: ['5 个泳池', '直通海滩', '儿童俱乐部', '含早餐', '免费机场班车'], highlight: '美溪海滩热门家庭首选，亲子设施完善' },
+    { key: 'h4', name: '岘港铂尔曼海滩度假村', nameEn: 'Pullman Danang Beach Resort', cityCode: 'DAD', area: '美溪海滩', address: '101 Vo Nguyen Giap, Danang', stars: 5, basePrice: 1480, rating: 4.6, reviewCount: 2108, emoji: '🏨', photo: 'https://images.unsplash.com/photo-1445019980597-93fa8acb246c?w=600&h=400&fit=crop', gallery: ['https://images.unsplash.com/photo-1551882547-ff40c63fe5fa?w=600&h=400&fit=crop', 'https://images.unsplash.com/photo-1610641818989-c2051b5e2cfd?w=600&h=400&fit=crop'], amenities: ['海滩泳池', '水疗中心', '含早餐', '儿童乐园'], highlight: '性价比首选，美溪海滩中心位置' },
+    { key: 'h5', name: '会安阿南塔拉度假村', nameEn: 'Anantara Hoi An Resort', cityCode: 'HOA', area: '会安古城', address: '1 Pham Hong Thai, Hoi An', stars: 5, basePrice: 2280, rating: 4.8, reviewCount: 1892, emoji: '🏮', photo: 'https://images.unsplash.com/photo-1578662996442-48f60103fc96?w=600&h=400&fit=crop', gallery: ['https://images.unsplash.com/photo-1582610116397-edb318620f90?w=600&h=400&fit=crop', 'https://images.unsplash.com/photo-1568084680786-a84f91d1153c?w=600&h=400&fit=crop'], amenities: ['河畔泳池', '古城步行 5 分钟', '越南传统建筑', 'SPA'], highlight: '会安古城中心，步行即达灯笼市集' },
   ];
 
   for (const h of HOTELS) {
@@ -562,7 +562,7 @@ async function seedHotels() {
         data: {
           nameEn: h.nameEn, area: h.area, address: h.address, starRating: h.stars,
           basePrice: h.basePrice, rating: h.rating, reviewCount: h.reviewCount, soldCount,
-          emoji: h.emoji, photos: [h.photo], amenities: h.amenities, highlight: h.highlight, isActive: true,
+          emoji: h.emoji, photos: [h.photo, ...h.gallery], amenities: h.amenities, highlight: h.highlight, isActive: true,
         },
       });
       // 房型先删再建
@@ -575,7 +575,7 @@ async function seedHotels() {
         data: {
           name: h.name, nameEn: h.nameEn, cityCode: h.cityCode, area: h.area, address: h.address,
           starRating: h.stars, basePrice: h.basePrice, rating: h.rating, reviewCount: h.reviewCount, soldCount,
-          emoji: h.emoji, photos: [h.photo], amenities: h.amenities, highlight: h.highlight, isActive: true,
+          emoji: h.emoji, photos: [h.photo, ...h.gallery], amenities: h.amenities, highlight: h.highlight, isActive: true,
           roomTypes: { create: rooms },
         },
       });
@@ -637,6 +637,10 @@ async function seedBundles() {
       flightPax: 2,
       groundDiscount: 380,
       suitableFor: '2 人 · 情侣/家庭',
+      // 可选升级加价（按产品可配置；运营在后台可改）：单人入住房差/晚、升舱商务/航段、来回 2 段
+      singleSupplementCnyPerNight: 80, // 平价 4-5 星，赵姐默认
+      businessUpgradeCnyPerLeg: 700,
+      legs: 2,
       items: [
         { kind: 'FLIGHT', productName: 'QH 澳门↔岘港 来回经济舱 × 2 人', qty: 1, unitPrice: 0 },
         { kind: 'HOTEL', productName: '岘港凯悦度假村 美溪海景房 3 晚', qty: 3, unitPrice: 1880 },
@@ -651,6 +655,10 @@ async function seedBundles() {
       flightPax: 2,
       groundDiscount: 1200,
       suitableFor: '2 人 · 蜜月/纪念日',
+      // 顶级 5 星（洲际半岛）单人入住房差远高于平价默认——一间客房卖一个人，¥80/晚会亏本，故上调
+      singleSupplementCnyPerNight: 480,
+      businessUpgradeCnyPerLeg: 700,
+      legs: 2,
       items: [
         { kind: 'FLIGHT', productName: 'QH 澳门↔岘港 来回经济舱 × 2 人', qty: 1, unitPrice: 0 },
         { kind: 'HOTEL', productName: '岘港洲际半岛度假村 山景房 4 晚', qty: 4, unitPrice: 3680 },
@@ -663,10 +671,14 @@ async function seedBundles() {
       name: '商务快闪 1 晚 · 商务舱',
       tagline: '商务舱来回 + 市区公寓 + 签证 + 豪华接送',
       emoji: '💼',
-      photo: 'https://images.unsplash.com/photo-1571003123894-1f0594d2b5d9?w=600&h=400&fit=crop',
+      photo: 'https://images.unsplash.com/photo-1542314831-068cd1dbfeeb?w=600&h=400&fit=crop',
       flightPax: 1,
       groundDiscount: 200,
       suitableFor: '1 人 · 商务',
+      // 单人产品 + 市区公寓：单人入住房差适中；本套餐机票已是商务舱，升舱项给默认即可
+      singleSupplementCnyPerNight: 150,
+      businessUpgradeCnyPerLeg: 700,
+      legs: 2,
       items: [
         { kind: 'FLIGHT', productName: 'QH 澳门↔岘港 来回商务舱 × 1 人', qty: 1, unitPrice: 0 },
         { kind: 'HOTEL', productName: '馨乐庭蓝湾公寓 市区 1 晚', qty: 1, unitPrice: 580 },

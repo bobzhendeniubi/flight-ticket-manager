@@ -345,14 +345,58 @@ export function CheckoutPage() {
           if (i.meta?.returnDate !== undefined) bundleMeta.returnDate = i.meta.returnDate;
           if (i.meta?.pax !== undefined) bundleMeta.pax = i.meta.pax;
           if (i.meta?.rooms !== undefined) bundleMeta.rooms = i.meta.rooms;
-          return [{
-            kind: 'BUNDLE',
+
+          // 可选升级 add-on 份数（缺省 0 = 无升级）
+          const singleCount = Math.max(0, Number(i.meta?.singleCount) || 0);
+          const businessCount = Math.max(0, Number(i.meta?.businessCount) || 0);
+          const bundlePax = Math.max(1, Number(i.meta?.pax) || 1);
+          const goLegScheduleId =
+            typeof i.meta?.goLegScheduleId === 'string' ? i.meta.goLegScheduleId : '';
+          const retLegScheduleId =
+            typeof i.meta?.retLegScheduleId === 'string' ? i.meta.retLegScheduleId : '';
+
+          // BUNDLE 行 = 纯地面口径（机票拆成独立 FLIGHT 行单独动态计价）。
+          // 后端 bundleUnitPrice 本就只含地面（items[kind!==FLIGHT] − groundDiscount），
+          // singleCount/businessCount 的加价由后端 computeBundleAddOn 一次性加到本 BUNDLE 行
+          // （与航段条数无关）。所以无论拆几条 FLIGHT 行，升舱加价都不会被重复收。
+          const bundleLine = {
+            kind: 'BUNDLE' as const,
             description: i.name,
             quantity: i.qty,
             unitPrice: i.unitPrice,
             bundleId: i.productId,
+            singleCount,
+            businessCount,
             ...(Object.keys(bundleMeta).length > 0 ? { metadata: bundleMeta } : {}),
-          }];
+          };
+
+          // 关键修复（少收机票钱的根因）：套餐订单必须把往返机票计入并扣座位。
+          // 旧逻辑只在 businessCount>0 时补「一条」FLIGHT 行 —— businessCount=0 的普通套餐根本不发机票行，
+          // 后端只按地面口径算 BUNDLE 行，机票（约 ¥4970）从未被收、座位也没扣。
+          // 现在：每个套餐项 **总是** 拆出去程 + 回程两条经济舱 FLIGHT 行（quantity=pax），后端按各航段
+          // 真实经济舱动态价收费 + 各扣 pax 个座位；businessCount>0 时再把 businessCount 个座位从两段经济舱
+          // 拆到真实商务舱库存（超售则拒）。
+          //
+          // 出行人数不受影响：后端 computeRequiredPassengerCount 对 FLIGHT 行取「单段最大人数」MAX（往返同一批人），
+          // 两条 quantity=pax 的航段 → requiredPax = max(pax, pax) = pax，仍只要 pax 本护照（不是 2×pax）。
+          //
+          // 客户总价 = 去程经济舱 + 回程经济舱 + 地面 + 单人入住加价 + 升舱加价 − 立减，与卡片展示价一致，
+          // 也与后端权威重算逐行相加一致（>1 元偏差会被后端拒）。
+          const legScheduleIds = [goLegScheduleId, retLegScheduleId].filter(
+            (id): id is string => Boolean(id),
+          );
+          const legLabel: Record<number, string> = { 0: '去程（经济舱）', 1: '回程（经济舱）' };
+          const flightLines = legScheduleIds.map((scheduleId, legIdx) => ({
+            kind: 'FLIGHT' as const,
+            description: `${i.name} · ${legLabel[legIdx] ?? '航段（经济舱）'}`,
+            quantity: bundlePax,
+            flightScheduleId: scheduleId,
+            flightCabin: 'ECONOMY' as const,
+          }));
+
+          // 退路：套餐缺航段 id（异常 / 老购物车数据 / 单程）→ 只发可用航段（可能为 0 条）+ BUNDLE 行，
+          // 绝不崩。若一条 FLIGHT 行都没有且 businessCount>0，后端会因无经济舱航段友好拒绝升舱。
+          return [...flightLines, bundleLine];
         }
         return [];
       }),
