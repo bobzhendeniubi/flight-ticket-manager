@@ -127,9 +127,23 @@ export function CheckoutPage() {
     },
     [items],
   );
+  // 套餐出行人数 = 占座模型 headCount（成人 + 占座儿童 + 不占座婴儿，都需护照）。
+  // 优先读三计数之和；缺失（老购物车）回退旧 pax（= headCount）。婴儿不占座但仍要护照 → 计入。
   const bundlePaxCount = items
     .filter((i) => i.kind === 'BUNDLE')
-    .reduce((sum, i) => sum + (Number(i.meta?.pax) || 0), 0);
+    .reduce((sum, i) => {
+      const adult = Number(i.meta?.adultCount);
+      const child = Number(i.meta?.childCount);
+      const infant = Number(i.meta?.infantCount);
+      const hasCounts =
+        Number.isFinite(adult) || Number.isFinite(child) || Number.isFinite(infant);
+      const headCount = hasCounts
+        ? (Number.isFinite(adult) ? adult : 0) +
+          (Number.isFinite(child) ? child : 0) +
+          (Number.isFinite(infant) ? infant : 0)
+        : Number(i.meta?.pax) || 0;
+      return sum + headCount;
+    }, 0);
   // 签证/接送也是"按人"的产品 —— 只买签证/接送时同样要填出行人
   // （公测反馈：只买签证时出行人表单整个不出现，提交不了）
   const visaPaxCount = items
@@ -346,42 +360,60 @@ export function CheckoutPage() {
           if (i.meta?.pax !== undefined) bundleMeta.pax = i.meta.pax;
           if (i.meta?.rooms !== undefined) bundleMeta.rooms = i.meta.rooms;
 
+          // ── 占座模型三计数（缺失 = 老购物车 → 回退旧 pax 当全成人，与旧行为一致）──
+          //   seatPax  = 成人 + 占座儿童（占座、扣经济舱座位、拼房）
+          //   headCount= 成人 + 占座儿童 + 不占座婴儿（出行人，都要护照）
+          const adultExplicit = i.meta?.adultCount;
+          const childExplicit = i.meta?.childCount;
+          const infantExplicit = i.meta?.infantCount;
+          const hasCounts =
+            adultExplicit !== undefined ||
+            childExplicit !== undefined ||
+            infantExplicit !== undefined;
+          const adultCount = hasCounts
+            ? Math.max(0, Number(adultExplicit) || 0)
+            : Math.max(1, Number(i.meta?.pax) || 1);
+          const childCount = hasCounts ? Math.max(0, Number(childExplicit) || 0) : 0;
+          const infantCount = hasCounts ? Math.max(0, Number(infantExplicit) || 0) : 0;
+          const seatPax = Math.max(1, adultCount + childCount); // 占座（≥1）
+
           // 可选升级 add-on 份数（缺省 0 = 无升级）
           const singleCount = Math.max(0, Number(i.meta?.singleCount) || 0);
           const businessCount = Math.max(0, Number(i.meta?.businessCount) || 0);
-          const bundlePax = Math.max(1, Number(i.meta?.pax) || 1);
           const goLegScheduleId =
             typeof i.meta?.goLegScheduleId === 'string' ? i.meta.goLegScheduleId : '';
           const retLegScheduleId =
             typeof i.meta?.retLegScheduleId === 'string' ? i.meta.retLegScheduleId : '';
 
           // BUNDLE 行 = 纯地面口径（机票拆成独立 FLIGHT 行单独动态计价）。
-          // 后端 bundleUnitPrice 本就只含地面（items[kind!==FLIGHT] − groundDiscount），
-          // singleCount/businessCount 的加价由后端 computeBundleAddOn 一次性加到本 BUNDLE 行
-          // （与航段条数无关）。所以无论拆几条 FLIGHT 行，升舱加价都不会被重复收。
+          // 后端 bundleUnitPrice 本就只含地面（items[kind!==FLIGHT] − groundDiscount）；
+          // 占座儿童折扣 / 婴儿价 / 单人入住 / 升舱的加价由后端 computeBundleAddOn 一次性加到本 BUNDLE 行
+          // （与航段条数无关）。所以无论拆几条 FLIGHT 行，加价都不会被重复收。
+          // 三计数（adult/child/infant）传给后端 → 后端权威重算占座/出行人/拼房/儿童折扣/婴儿价。
           const bundleLine = {
             kind: 'BUNDLE' as const,
             description: i.name,
             quantity: i.qty,
             unitPrice: i.unitPrice,
             bundleId: i.productId,
+            adultCount,
+            childCount,
+            infantCount,
             singleCount,
             businessCount,
             ...(Object.keys(bundleMeta).length > 0 ? { metadata: bundleMeta } : {}),
           };
 
-          // 关键修复（少收机票钱的根因）：套餐订单必须把往返机票计入并扣座位。
-          // 旧逻辑只在 businessCount>0 时补「一条」FLIGHT 行 —— businessCount=0 的普通套餐根本不发机票行，
-          // 后端只按地面口径算 BUNDLE 行，机票（约 ¥4970）从未被收、座位也没扣。
-          // 现在：每个套餐项 **总是** 拆出去程 + 回程两条经济舱 FLIGHT 行（quantity=pax），后端按各航段
-          // 真实经济舱动态价收费 + 各扣 pax 个座位；businessCount>0 时再把 businessCount 个座位从两段经济舱
-          // 拆到真实商务舱库存（超售则拒）。
+          // 套餐订单把往返机票计入并扣座位：每个套餐项总是拆出去程 + 回程两条经济舱 FLIGHT 行
+          // （quantity = seatPax = 占座人数，婴儿不占座、不发机票座位），后端按各航段真实经济舱动态价收费 +
+          // 各扣 seatPax 个座位；businessCount>0 时再把 businessCount 个座位从两段经济舱拆到真实商务舱库存（超售则拒）。
           //
-          // 出行人数不受影响：后端 computeRequiredPassengerCount 对 FLIGHT 行取「单段最大人数」MAX（往返同一批人），
-          // 两条 quantity=pax 的航段 → requiredPax = max(pax, pax) = pax，仍只要 pax 本护照（不是 2×pax）。
+          // 出行人数：后端 computeRequiredPassengerCount 对 FLIGHT 行取「单段最大人数」MAX（往返同一批人），
+          // 但对 BUNDLE 行按 headCount（含婴儿）→ required = max(seatPax, headCount) = headCount，
+          // 婴儿也要一行护照（不是 seatPax）。
           //
-          // 客户总价 = 去程经济舱 + 回程经济舱 + 地面 + 单人入住加价 + 升舱加价 − 立减，与卡片展示价一致，
-          // 也与后端权威重算逐行相加一致（>1 元偏差会被后端拒）。
+          // 客户总价 = 去程经济舱×seatPax + 回程经济舱×seatPax + 地面 + 儿童折扣/婴儿价/单人入住/升舱加价 − 立减，
+          // 与卡片展示价一致，也与后端权威重算逐行相加一致（>1 元偏差会被后端拒）。
           const legScheduleIds = [goLegScheduleId, retLegScheduleId].filter(
             (id): id is string => Boolean(id),
           );
@@ -389,7 +421,7 @@ export function CheckoutPage() {
           const flightLines = legScheduleIds.map((scheduleId, legIdx) => ({
             kind: 'FLIGHT' as const,
             description: `${i.name} · ${legLabel[legIdx] ?? '航段（经济舱）'}`,
-            quantity: bundlePax,
+            quantity: seatPax,
             flightScheduleId: scheduleId,
             flightCabin: 'ECONOMY' as const,
           }));

@@ -412,6 +412,11 @@ export class ProductsService {
           ...(body.businessUpgradeCnyPerLeg != null
             ? { businessUpgradeCnyPerLeg: body.businessUpgradeCnyPerLeg }
             : {}),
+          // 占座儿童折扣 / 婴儿价：省略时落 DB 默认（30 / 0）
+          ...(body.childSeatDiscountCnyPerPerson != null
+            ? { childSeatDiscountCnyPerPerson: body.childSeatDiscountCnyPerPerson }
+            : {}),
+          ...(body.infantPriceCny != null ? { infantPriceCny: body.infantPriceCny } : {}),
           ...(body.legs != null ? { legs: body.legs } : {}),
           isActive: body.isActive,
         },
@@ -441,6 +446,12 @@ export class ProductsService {
     }
     if (body.businessUpgradeCnyPerLeg !== undefined) {
       data.businessUpgradeCnyPerLeg = body.businessUpgradeCnyPerLeg;
+    }
+    if (body.childSeatDiscountCnyPerPerson !== undefined) {
+      data.childSeatDiscountCnyPerPerson = body.childSeatDiscountCnyPerPerson;
+    }
+    if (body.infantPriceCny !== undefined) {
+      data.infantPriceCny = body.infantPriceCny;
     }
     if (body.legs !== undefined) data.legs = body.legs;
     if (body.isActive !== undefined) data.isActive = body.isActive;
@@ -531,6 +542,9 @@ function serializeBundle(b: BundleWithRoom, rating: ProductRatingAggregate = ZER
     // 可选升级加价（CNY，整数，server-priced add-on）+ 航段数；前端据此报价升级项
     singleSupplementCnyPerNight: b.singleSupplementCnyPerNight,
     businessUpgradeCnyPerLeg: b.businessUpgradeCnyPerLeg,
+    // 占座儿童折扣 / 婴儿价（CNY，整数，server-priced）；前端据此报价儿童/婴儿
+    childSeatDiscountCnyPerPerson: b.childSeatDiscountCnyPerPerson,
+    infantPriceCny: b.infantPriceCny,
     legs: b.legs,
     items: b.items,
     rating,

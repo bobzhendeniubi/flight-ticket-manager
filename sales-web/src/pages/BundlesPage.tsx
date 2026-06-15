@@ -53,6 +53,10 @@ const FALLBACK_PRICE = {
 interface BundleView extends MockBundle {
   singleSupplementPerNight: number | null;
   businessUpgradePerLeg: number | null;
+  /** 占座儿童每人比成人便宜多少（机票折扣，CNY）；null = 不优惠 */
+  childSeatDiscount: number | null;
+  /** 不占座婴儿每人机票价（CNY）；null = 不收婴儿价 */
+  infantPrice: number | null;
   legs: number;
   hotelRoomType: { id: string; name: string; hotelName: string } | null;
   hotelRoomTypeId: string | null;
@@ -75,6 +79,9 @@ function bundleApiToView(b: ApiBundle): BundleView {
       b.singleSupplementCnyPerNight != null ? Number(b.singleSupplementCnyPerNight) : null,
     businessUpgradePerLeg:
       b.businessUpgradeCnyPerLeg != null ? Number(b.businessUpgradeCnyPerLeg) : null,
+    childSeatDiscount:
+      b.childSeatDiscountCnyPerPerson != null ? Number(b.childSeatDiscountCnyPerPerson) : null,
+    infantPrice: b.infantPriceCny != null ? Number(b.infantPriceCny) : null,
     legs: b.legs != null ? Number(b.legs) : 2,
     hotelRoomType: b.hotelRoomType ?? null,
     hotelRoomTypeId: b.hotelRoomTypeId ?? null,
@@ -154,6 +161,16 @@ function formatMonthDay(iso: string): string {
   if (Number.isNaN(ms)) return iso;
   const d = new Date(ms);
   return `${d.getUTCMonth() + 1}月${d.getUTCDate()}日`;
+}
+
+/** 占座模型人数文案："X 成人 · Y 儿童 · Z 婴儿"（0 的不显示；全 0 兜底显示成人）。 */
+function formatOccupancy(adultCount: number, childCount: number, infantCount: number): string {
+  const parts = [
+    `${adultCount} 成人`,
+    childCount > 0 ? `${childCount} 儿童` : null,
+    infantCount > 0 ? `${infantCount} 婴儿` : null,
+  ].filter(Boolean);
+  return parts.join(' · ');
 }
 
 const KIND_LABEL: Record<BundleItem['kind'], { label: string; color: string }> = {
@@ -245,9 +262,12 @@ export function BundlesPage() {
     return () => { cancelled = true; };
   }, [reloadKey]);
 
-  // ── 简单选择器：出发日期（默认 +3 天）+ 人数（默认 2 人）──────────────
+  // ── 简单选择器：出发日期（默认 +3 天）+ 占座模型三计数 ──────────────
+  // 成人（占座，≥1）/ 占座儿童（占座，比成人便宜）/ 不占座婴儿（不占座、不占房、仍需护照）
   const [goDate, setGoDate] = useState(todayISO(3));
-  const [pax, setPax] = useState(2);
+  const [adultCount, setAdultCount] = useState(2);
+  const [childCount, setChildCount] = useState(0);
+  const [infantCount, setInfantCount] = useState(0);
   // 顶部选择器为各卡默认出发日期；每张卡内部各自防抖查询库存/价格。
 
   // 套餐关键字搜索（名称 / 行项 / 酒店名，防抖 300ms）
@@ -298,7 +318,7 @@ export function BundlesPage() {
 
       <BenefitsStrip />
 
-      {/* 简单选择器：出发日期 + 人数 + 搜索（钉在套餐列表上方） */}
+      {/* 简单选择器：出发日期 + 出行人（成人/儿童/婴儿）+ 搜索（钉在套餐列表上方） */}
       <section className="card">
         <div className="grid grid-cols-1 gap-3 sm:gap-4 sm:grid-cols-2 md:grid-cols-3">
           <div>
@@ -312,11 +332,7 @@ export function BundlesPage() {
               onChange={(e) => setGoDate(e.target.value)}
             />
           </div>
-          <div>
-            <label className="label">出行人数</label>
-            <Stepper value={pax} min={1} max={9} onChange={setPax} />
-          </div>
-          <div>
+          <div className="md:col-span-1">
             <label className="label" htmlFor="bundle-keyword">搜索套餐</label>
             <input
               id="bundle-keyword"
@@ -327,9 +343,20 @@ export function BundlesPage() {
               onChange={(e) => setKeyword(e.target.value)}
             />
           </div>
+          <div className="sm:col-span-2 md:col-span-1">
+            <span className="label">出行人</span>
+            <OccupancyPicker
+              adultCount={adultCount}
+              childCount={childCount}
+              infantCount={infantCount}
+              onAdult={setAdultCount}
+              onChild={setChildCount}
+              onInfant={setInfantCount}
+            />
+          </div>
         </div>
         <p className="mt-2 text-xs text-ink-muted">
-          回程日期按各套餐住宿晚数自动推算；机位 / 房量随日期实时更新。
+          成人和占座儿童每 2 人拼 1 间房（婴儿不占座、不占房，仍需护照）；回程日期按各套餐住宿晚数自动推算，机位 / 房量随日期实时更新。
         </p>
       </section>
 
@@ -377,12 +404,16 @@ export function BundlesPage() {
             bundle={b}
             flightCache={flightCache}
             goDate={goDate}
-            pax={pax}
+            adultCount={adultCount}
+            childCount={childCount}
+            infantCount={infantCount}
             hotel={matchHotelForBundle(b, hotels)}
             onView={() => navigate(`/bundles/${b.id}`)}
             onShowHotel={(hotel) => setHotelModal({ hotel, roomTypeName: b.hotelRoomType?.name ?? null })}
             onAdd={(cfg) => {
               const addOnSummary = [
+                cfg.childCount > 0 ? `儿童×${cfg.childCount}` : null,
+                cfg.infantCount > 0 ? `婴儿×${cfg.infantCount}` : null,
                 cfg.singleCount > 0 ? `单人入住×${cfg.singleCount}` : null,
                 cfg.businessCount > 0 ? `商务舱×${cfg.businessCount}` : null,
               ]
@@ -391,7 +422,7 @@ export function BundlesPage() {
               add({
                 kind: 'BUNDLE',
                 productId: b.id,
-                name: `${b.name}（${cfg.pax}人${cfg.rooms}房 · ${cfg.goDate}→${cfg.returnDate}${addOnSummary ? ` · ${addOnSummary}` : ''}）`,
+                name: `${b.name}（${formatOccupancy(cfg.adultCount, cfg.childCount, cfg.infantCount)}·${cfg.rooms}房 · ${cfg.goDate}→${cfg.returnDate}${addOnSummary ? ` · ${addOnSummary}` : ''}）`,
                 description: b.tagline,
                 emoji: b.emoji,
                 unitPrice: cfg.total,
@@ -399,7 +430,11 @@ export function BundlesPage() {
                 meta: {
                   goDate: cfg.goDate,
                   returnDate: cfg.returnDate,
-                  pax: cfg.pax,
+                  adultCount: cfg.adultCount,
+                  childCount: cfg.childCount,
+                  infantCount: cfg.infantCount,
+                  // 兼容旧字段：pax = headCount（出行人总数，含婴儿）
+                  pax: cfg.headCount,
                   rooms: cfg.rooms,
                   flightTotal: cfg.flightTotal,
                   hotelTotal: cfg.hotelTotal,
@@ -433,8 +468,11 @@ export function BundlesPage() {
 // ── 可配置套餐卡 ─────────────────────────────────────────────────
 
 interface BundleAddConfig {
-  pax: number;
-  rooms: number; // 住宿间数 = ceil(pax/2)（双人同住），后端按 baseRooms 计费
+  adultCount: number; // 成人（占座）
+  childCount: number; // 占座儿童（占座，比成人便宜）
+  infantCount: number; // 不占座婴儿（不占座、不占房，仍需护照）
+  headCount: number; // = adult + child + infant（出行人总数）
+  rooms: number; // 住宿间数 = ceil(seatPax/2)（拼房，2 人 1 间；婴儿不占房）
   goDate: string;
   returnDate: string;
   total: number;
@@ -452,7 +490,9 @@ function ConfigurableBundleCard({
   bundle: b,
   flightCache,
   goDate,
-  pax,
+  adultCount,
+  childCount,
+  infantCount,
   hotel,
   onView,
   onShowHotel,
@@ -461,16 +501,23 @@ function ConfigurableBundleCard({
   bundle: BundleView;
   flightCache: FlightSearchCache;
   goDate: string;
-  pax: number;
+  adultCount: number;
+  childCount: number;
+  infantCount: number;
   hotel?: Hotel;
   /** 跳转到套餐详情（/bundles/:id）；卡片整体或"查看详情"触发。 */
   onView: () => void;
   onShowHotel: (hotel: Hotel) => void;
   onAdd: (cfg: BundleAddConfig) => void;
 }) {
-  // 入住模型（按已确认决策）：默认双人同住，住宿间数 = ceil(pax/2)，不让用户自由调间数。
-  const baseRooms = Math.max(1, Math.ceil(pax / 2));
-  // 可选升级 add-on（默认 0；范围 0..pax）。
+  // 占座模型（镜像后端 resolveBundleOccupancy）：
+  //   seatPax  = 成人 + 占座儿童（占座、计入机票座位与拼房）
+  //   headCount= 成人 + 占座儿童 + 不占座婴儿（出行人总数，都要护照）
+  //   baseRooms= ceil(seatPax / 2)（拼房，2 人 1 间；婴儿不占房）
+  const seatPax = adultCount + childCount;
+  const headCount = adultCount + childCount + infantCount;
+  const baseRooms = Math.max(1, Math.ceil(seatPax / 2));
+  // 可选升级 add-on（默认 0；范围 0..seatPax — 婴儿不占座、不能升舱/不算单人入住房）。
   const [singleCount, setSingleCount] = useState(0); // 一个人住酒店（单人入住）
   const [businessCount, setBusinessCount] = useState(0); // 升级商务舱
 
@@ -516,11 +563,11 @@ function ConfigurableBundleCard({
   // 升级开关只在套餐配置了升舱报价、且本航线为经济舱套餐（升舱才有意义）时出现。
   const canOfferBusiness = b.businessUpgradePerLeg != null && cabin === 'ECONOMY';
 
-  // pax 变化时把 add-on 份数夹回 [0, pax]（人数减少不能留下超额升级）。
+  // 占座人数变化时把 add-on 份数夹回 [0, seatPax]（婴儿不占座 → 不计入升级上限）。
   useEffect(() => {
-    setSingleCount((c) => Math.min(c, pax));
-    setBusinessCount((c) => Math.min(c, pax));
-  }, [pax]);
+    setSingleCount((c) => Math.min(c, seatPax));
+    setBusinessCount((c) => Math.min(c, seatPax));
+  }, [seatPax]);
   // 商务舱售罄时强制清零升舱份数（避免提交后被后端拒）。
   useEffect(() => {
     if (businessSoldOut || !canOfferBusiness) setBusinessCount(0);
@@ -537,35 +584,52 @@ function ConfigurableBundleCard({
   const billNights = Math.max(1, nights);
   const supp = b.singleSupplementPerNight ?? 0;
   const upg = b.businessUpgradePerLeg ?? 0;
+  // 占座模型报价（镜像后端 flight 公式）：占座儿童每人减 childDiscount；不占座婴儿每人收 infantPrice。
+  const childDiscount = b.childSeatDiscount ?? 0;
+  const infantPrice = b.infantPrice ?? 0;
+  const childDiscountTotal = childCount * childDiscount;
+  const infantPriceTotal = infantCount * infantPrice;
   // ── add-on 加价（镜像后端：单人入住 = singleCount×supp×nights；升舱 = businessCount×upg×legs）──
   const singleAddOn = singleCount * supp * billNights;
   const businessAddOn = businessCount * upg * b.legs;
 
-  // 计算每个行项的金额（住宿按 baseRooms 计费；double-occupancy 模型，不再让用户调间数）
+  // 计算每个行项展示金额，逐行镜像后端权威重算（card total 必须 == order total，否则后端拒单）：
+  //   FLIGHT：经济舱全价×seatPax（占座；婴儿不占座 → 不发机票座位）。儿童折扣/婴儿价不在机票行，
+  //           而是并进套餐 add-on（与后端 computeBundleAddOn 一致：折扣/婴儿价计入 BUNDLE 行净额）。
+  //   HOTEL/VISA/TRANSFER：后端套餐地面价 = sum(bundle.items[kind!==FLIGHT].qty × unitPrice) − 立减，
+  //           按套餐固定份数计（不随占座/房间数缩放；拼房只是展示与占房口径，不改地面价）。
   const itemRows = b.items.map((item) => {
     if (item.kind === 'FLIGHT') {
-      return { ...item, computedTotal: pricePerPerson * pax, label: `来回${isBiz ? '商务' : '经济'}舱 × ${pax} 人` };
+      return {
+        ...item,
+        computedTotal: pricePerPerson * seatPax,
+        label: `来回${isBiz ? '商务' : '经济'}舱 · ${formatOccupancy(adultCount, childCount, infantCount)}`,
+      };
     }
     if (item.kind === 'HOTEL') {
-      return { ...item, computedTotal: item.unitPrice * item.qty * baseRooms, label: `${item.productName}${baseRooms > 1 ? ` × ${baseRooms} 间` : ''}` };
+      // baseRooms 为占房展示口径；地面价按套餐固定份数（item.qty = 晚数）计，与后端一致。
+      return { ...item, computedTotal: item.unitPrice * item.qty, label: `${item.productName}（${baseRooms} 间 · 拼房）` };
     }
     if (item.kind === 'VISA') {
-      return { ...item, computedTotal: item.unitPrice * pax, label: `${item.productName.replace(/× \d+/, `× ${pax}`)}` };
+      return { ...item, computedTotal: item.unitPrice * item.qty, label: item.productName };
     }
     // TRANSFER — 固定价（按趟不按人头）
     return { ...item, computedTotal: item.unitPrice * item.qty, label: item.productName };
   });
 
   const flightTotal = itemRows.filter((r) => r.kind === 'FLIGHT').reduce((s, r) => s + r.computedTotal, 0);
-  // 单人入住加价并入酒店金额（与后端 hotel 公式一致）
-  const hotelTotal =
-    itemRows.filter((r) => r.kind === 'HOTEL').reduce((s, r) => s + r.computedTotal, 0) + singleAddOn;
-  // 升舱加价并入机票部分（与后端 flight 公式一致）
+  // 套餐 add-on 净额（镜像后端 computeBundleAddOn：升级加价 + 婴儿价 − 儿童折扣，向上夹到 0）。
+  // 单人入住 / 升舱是正向加价，儿童折扣负向，婴儿价正向；夹 0 避免套餐行出现负总额。
+  const addOnTotal = Math.max(0, singleAddOn + businessAddOn + infantPriceTotal - childDiscountTotal);
+  // 展示用拆分：酒店并入单人入住加价，其他并入升舱（仅供 UI 拆条，total 以 addOnTotal 为准）。
+  const hotelTotal = itemRows.filter((r) => r.kind === 'HOTEL').reduce((s, r) => s + r.computedTotal, 0);
   const otherTotal =
     itemRows.filter((r) => r.kind !== 'FLIGHT' && r.kind !== 'HOTEL').reduce((s, r) => s + r.computedTotal, 0);
-  const listTotal = flightTotal + hotelTotal + otherTotal + businessAddOn;
+  // 地面总价（套餐固定份数）；listTotal 用于展示原价（划线价）。
+  const groundTotal = hotelTotal + otherTotal;
+  const listTotal = flightTotal + groundTotal + addOnTotal;
   const total = listTotal - b.groundDiscount;
-  const perPerson = pax > 0 ? Math.round(total / pax) : total;
+  const perPerson = headCount > 0 ? Math.round(total / headCount) : total;
 
   // 售罄拦截：去/回任一航段或酒店售罄 → 禁止加购
   const soldOut = goTier === 'SOLD_OUT' || retTier === 'SOLD_OUT' || hotelTier === 'SOLD_OUT';
@@ -602,8 +666,8 @@ function ConfigurableBundleCard({
     ] as (Inclusion | null)[]
   ).filter((x): x is Inclusion => x !== null);
 
-  // 是否展示「单人入住」升级（pax≥2 才有意义：1 人本就独住一间）
-  const canOfferSingle = b.singleSupplementPerNight != null && pax >= 2;
+  // 是否展示「单人入住」升级（占座 seatPax≥2 才有意义：1 人本就独住一间；婴儿不占房不算）
+  const canOfferSingle = b.singleSupplementPerNight != null && seatPax >= 2;
 
   return (
     <article className="card-interactive group overflow-hidden">
@@ -665,11 +729,15 @@ function ConfigurableBundleCard({
           </div>
         </div>
 
-        {/* 住宿间数信息（双人同住，自动 = ceil(人数/2)，人数由顶部选择器统一控制） */}
+        {/* 人数 + 房间数（拼房，每 2 位占座者 1 间；婴儿不占座不占房） */}
         <div className="flex flex-col gap-1 items-end">
+          <span className="inline-flex items-center gap-1.5 rounded-full bg-sky-50 px-2.5 py-1 text-xs font-semibold text-sky-700">
+            <Icon name="user" className="h-3.5 w-3.5" />
+            {formatOccupancy(adultCount, childCount, infantCount)}
+          </span>
           <span className="inline-flex items-center gap-1.5 rounded-full bg-purple-50 px-2.5 py-1 text-xs font-semibold text-purple-700">
             <Icon name="hotel" className="h-3.5 w-3.5" />
-            住宿：{baseRooms} 间房（双人同住）
+            {baseRooms} 间房（拼房，2 人 1 间）
           </span>
         </div>
       </div>
@@ -769,6 +837,25 @@ function ConfigurableBundleCard({
             </span>
           </div>
         ))}
+        {/* 占座儿童折扣 / 不占座婴儿价 明细行（>0 才显示，镜像后端 flight 公式） */}
+        {childCount > 0 && childDiscount > 0 && (
+          <div className="flex items-center justify-between text-xs">
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="rounded bg-emerald-100 px-1.5 py-0.5 font-medium text-emerald-700">儿童</span>
+              <span className="text-slate-700 truncate">占座儿童 ×{childCount} · 每人 −¥{childDiscount.toLocaleString()}</span>
+            </div>
+            <span className="text-emerald-700 tabular-nums whitespace-nowrap">−¥{childDiscountTotal.toLocaleString()}</span>
+          </div>
+        )}
+        {infantCount > 0 && (
+          <div className="flex items-center justify-between text-xs">
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="rounded bg-amber-100 px-1.5 py-0.5 font-medium text-amber-700">婴儿</span>
+              <span className="text-slate-700 truncate">婴儿 ×{infantCount} · 每人 ¥{infantPrice.toLocaleString()}</span>
+            </div>
+            <span className="text-slate-600 tabular-nums whitespace-nowrap">+¥{infantPriceTotal.toLocaleString()}</span>
+          </div>
+        )}
         {/* 升级 add-on 明细行（选了才显示） */}
         {singleCount > 0 && (
           <div className="flex items-center justify-between text-xs">
@@ -802,7 +889,7 @@ function ConfigurableBundleCard({
                   一人一间房 · +¥{(b.singleSupplementPerNight ?? 0).toLocaleString()}/晚/人
                 </div>
               </div>
-              <Stepper value={singleCount} min={0} max={pax} onChange={setSingleCount} />
+              <Stepper value={singleCount} min={0} max={seatPax} onChange={setSingleCount} />
             </div>
           )}
           {canOfferBusiness && (
@@ -818,7 +905,7 @@ function ConfigurableBundleCard({
               <Stepper
                 value={businessCount}
                 min={0}
-                max={businessSoldOut ? 0 : pax}
+                max={businessSoldOut ? 0 : seatPax}
                 onChange={setBusinessCount}
               />
             </div>
@@ -831,12 +918,13 @@ function ConfigurableBundleCard({
         <div className="flex flex-col gap-1 text-[11px] text-ink-muted sm:flex-row sm:items-center sm:justify-between sm:text-xs">
           <span>
             机票 ¥{flightTotal.toLocaleString()} + 酒店 ¥{hotelTotal.toLocaleString()} + 其他 ¥{otherTotal.toLocaleString()}
+            {addOnTotal > 0 && ` + 升级/差价 ¥${addOnTotal.toLocaleString()}`}
             {b.groundDiscount > 0 && ` − 已省 ¥${b.groundDiscount.toLocaleString()}`}
           </span>
         </div>
         <div className="mt-1.5 flex flex-col gap-1.5 sm:flex-row sm:items-end sm:justify-between">
           <div className="text-xs text-ink-muted">
-            {pax} 人 · {baseRooms} 间房 · {formatMonthDay(cardGoDate)} → {formatMonthDay(displayReturnDate)}
+            {formatOccupancy(adultCount, childCount, infantCount)} · {baseRooms} 间房 · {formatMonthDay(cardGoDate)} → {formatMonthDay(displayReturnDate)}
           </div>
           <div className="flex items-baseline justify-end gap-2 text-right">
             {b.groundDiscount > 0 && (
@@ -876,7 +964,10 @@ function ConfigurableBundleCard({
           title={soldOut ? '该日期已售罄，换个日期试试' : undefined}
           onClick={() =>
             onAdd({
-              pax,
+              adultCount,
+              childCount,
+              infantCount,
+              headCount,
               rooms: baseRooms,
               goDate: cardGoDate,
               returnDate: displayReturnDate,
@@ -1055,6 +1146,65 @@ function Stepper({
       >
         +
       </button>
+    </div>
+  );
+}
+
+/**
+ * 占座模型出行人选择器：成人（占座，≥1）/ 占座儿童（占座，≥0）/ 不占座婴儿（≥0）。
+ * 三行紧凑 stepper，附一行占座/房间数说明，让买家一眼看清人数与拼房间数。
+ */
+function OccupancyPicker({
+  adultCount,
+  childCount,
+  infantCount,
+  onAdult,
+  onChild,
+  onInfant,
+}: {
+  adultCount: number;
+  childCount: number;
+  infantCount: number;
+  onAdult: (v: number) => void;
+  onChild: (v: number) => void;
+  onInfant: (v: number) => void;
+}) {
+  const seatPax = adultCount + childCount;
+  const rooms = Math.max(1, Math.ceil(seatPax / 2));
+  return (
+    <div className="space-y-2 rounded-xl border border-slate-200 p-2.5">
+      <OccupancyRow label="成人" hint="占座" value={adultCount} min={1} max={9} onChange={onAdult} />
+      <OccupancyRow label="儿童" hint="占座 · 比成人便宜" value={childCount} min={0} max={9} onChange={onChild} />
+      <OccupancyRow label="婴儿" hint="不占座 · 不占房" value={infantCount} min={0} max={9} onChange={onInfant} />
+      <p className="text-[11px] text-ink-muted">
+        房间数：{rooms} 间（拼房，2 人 1 间）
+      </p>
+    </div>
+  );
+}
+
+function OccupancyRow({
+  label,
+  hint,
+  value,
+  min,
+  max,
+  onChange,
+}: {
+  label: string;
+  hint: string;
+  value: number;
+  min: number;
+  max: number;
+  onChange: (v: number) => void;
+}) {
+  return (
+    <div className="flex items-center justify-between gap-3">
+      <div className="min-w-0">
+        <div className="text-sm font-medium text-ink">{label}</div>
+        <div className="text-[11px] text-ink-muted">{hint}</div>
+      </div>
+      <Stepper value={value} min={min} max={max} onChange={onChange} />
     </div>
   );
 }

@@ -97,6 +97,14 @@ export const bundleItemSchema = baseItemSchema.extend({
   //   businessCount = 选「升舱商务」的人数 → 每人每航段加 businessUpgradeCnyPerLeg（占用真实商务舱库存）
   singleCount: z.number().int().min(0).max(20).optional(),
   businessCount: z.number().int().min(0).max(20).optional(),
+  // 占座模型（赵姐需求）：区分成人 / 占座儿童 / 不占座婴儿（都需护照，均为出行人）：
+  //   adultCount  = 成人数（占 1 座、计入拼房）
+  //   childCount  = 占座儿童数（占 1 座、计入拼房；机票按成人价减 childSeatDiscountCnyPerPerson）
+  //   infantCount = 不占座婴儿数（不占座、不占房；机票收 infantPriceCny/人）
+  // 向后兼容：三者全缺省时，旧 pax（metadata.pax 或行 quantity）视为 adultCount，child/infant=0，定价与旧版完全一致。
+  adultCount: z.number().int().min(0).max(20).optional(),
+  childCount: z.number().int().min(0).max(20).optional(),
+  infantCount: z.number().int().min(0).max(20).optional(),
 });
 
 // BUNDLE 行 metadata 里的出行信息（sales-web 购物车带过来，用于推导酒店入住日期）。
@@ -108,6 +116,10 @@ export const bundleItemMetadataSchema = z
     returnDate: dateOnlySchema.optional().catch(undefined),
     pax: z.number().int().min(1).max(99).optional().catch(undefined),
     rooms: z.number().int().min(1).max(99).optional().catch(undefined),
+    // 占座模型计数（前台带过来，用于出行人数校验）。逐字段降级，异常绝不阻断下单。
+    adultCount: z.number().int().min(0).max(99).optional().catch(undefined),
+    childCount: z.number().int().min(0).max(99).optional().catch(undefined),
+    infantCount: z.number().int().min(0).max(99).optional().catch(undefined),
   })
   .catch({});
 export type BundleItemMetadata = z.infer<typeof bundleItemMetadataSchema>;

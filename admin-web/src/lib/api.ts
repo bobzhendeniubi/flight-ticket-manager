@@ -615,10 +615,16 @@ export interface Bundle {
   hotelNights: number | null;
   /** 展示用：服务端联表返回的房型名 + 酒店名；null = 不关联 */
   hotelRoomType: { id: string; name: string; hotelName: string } | null;
-  /** 自愿升级展示价：单房差（CNY/晚，decimal 字符串）；null = 不展示 */
-  singleSupplementCnyPerNight: string | null;
-  /** 自愿升级展示价：升舱（CNY/程，decimal 字符串）；null = 不展示 */
-  cabinUpgradeCnyPerLeg: string | null;
+  /** 自愿升级：一个人住酒店（单人入住）每人每晚加价（CNY/晚，整数） */
+  singleSupplementCnyPerNight: number;
+  /** 自愿升级：升舱商务每人每航段加价（CNY/程，整数） */
+  businessUpgradeCnyPerLeg: number;
+  /** 占座儿童比成人每人便宜多少（CNY/人，整数，默认 30） */
+  childSeatDiscountCnyPerPerson: number;
+  /** 不占座婴儿每人价（CNY/人，整数，默认 0） */
+  infantPriceCny: number;
+  /** 计费航段数（来回 = 2，单程 = 1）；升舱加价 = businessUpgradeCnyPerLeg × legs × 人数 */
+  legs: number;
   isActive: boolean;
   createdAt: string;
 }

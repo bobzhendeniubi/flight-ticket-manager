@@ -22,12 +22,15 @@ export interface CartItem {
   qty: number;
   /**
    * 行附加信息（扁平标量）。BUNDLE 行约定的键：
-   *   goDate/returnDate/pax/rooms      — 行程要素（后端推导酒店占房）
+   *   goDate/returnDate/rooms          — 行程要素（后端推导酒店占房；rooms=ceil(seatPax/2) 拼房）
+   *   adultCount/childCount/infantCount — 占座模型三计数（成人 / 占座儿童 / 不占座婴儿）；
+   *                                      后端据此重算占座(seatPax=adult+child)/出行人(headCount=三者和)/拼房
+   *   pax                              — 兼容旧字段：= headCount（出行人总数）；后端仅在三计数缺失时回退当全成人
    *   flightTotal/hotelTotal/otherTotal/discount — 展示用价格拆分
-   *   singleCount                      — 「一个人住酒店（单人入住）」人数（add-on）
-   *   businessCount                    — 「升级商务舱」人数（add-on，占真实商务舱库存）
+   *   singleCount                      — 「一个人住酒店（单人入住）」人数（add-on；退出拼房，每人单独一间）
+   *   businessCount                    — 「升级商务舱」人数（add-on，≤seatPax，占真实商务舱库存）
    *   goLegScheduleId/retLegScheduleId — 已解析的经济舱航段班次 id；
-   *                                      businessCount>0 时结算页据此补发经济舱 FLIGHT 行
+   *                                      结算页据此补发去/回经济舱 FLIGHT 行（quantity=seatPax）
    */
   meta?: Record<string, string | number | boolean>;
   addedAt: string; // ISO 时间，用于"实时动态"展示

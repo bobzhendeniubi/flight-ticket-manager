@@ -7,6 +7,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   type MockHotel,
+  type HotelRoomType,
   type MockTransfer,
   type MockVisa,
   type MockBundle,
@@ -25,6 +26,14 @@ const SECTIONS: { key: Section; label: string; emoji: string }[] = [
   { key: 'bundles', label: '套餐 / Bundle', emoji: '🎁' },
 ];
 
+/** 归一化酒店图片：优先用 photos[]，回退到单张 photo，去空去重 */
+function hotelPhotos(h: MockHotel): string[] {
+  const list = (h.photos && h.photos.length > 0 ? h.photos : h.photo ? [h.photo] : [])
+    .map((u) => u.trim())
+    .filter(Boolean);
+  return Array.from(new Set(list));
+}
+
 // ─── API → Mock 适配器（保留现有 UI，不改子组件） ───────────────────
 function hotelApiToMock(h: Hotel): MockHotel {
   return {
@@ -34,12 +43,14 @@ function hotelApiToMock(h: Hotel): MockHotel {
     nameEn: h.nameEn ?? h.name,
     cityCode: h.cityCode,
     area: h.area ?? h.address,
+    address: h.address ?? '',
     stars: (h.starRating as 3 | 4 | 5) ?? 4,
     basePrice: Number(h.basePrice ?? 0),
     rating: h.rating ? Number(h.rating) : 4.5,
     reviewCount: h.reviewCount ?? 0,
     emoji: h.emoji ?? '🏨',
     photo: h.photos[0] ?? '',
+    photos: h.photos ?? [],
     amenities: h.amenities,
     highlight: h.highlight ?? '',
     roomTypes: h.roomTypes.map((rt) => ({
@@ -104,9 +115,11 @@ function bundleApiToMock(b: ApiBundle): MockBundle {
     hotelRoomTypeId: b.hotelRoomTypeId,
     hotelNights: b.hotelNights,
     hotelRoomType: b.hotelRoomType,
-    singleSupplementCnyPerNight:
-      b.singleSupplementCnyPerNight != null ? Number(b.singleSupplementCnyPerNight) : null,
-    cabinUpgradeCnyPerLeg: b.cabinUpgradeCnyPerLeg != null ? Number(b.cabinUpgradeCnyPerLeg) : null,
+    singleSupplementCnyPerNight: b.singleSupplementCnyPerNight,
+    businessUpgradeCnyPerLeg: b.businessUpgradeCnyPerLeg,
+    childSeatDiscountCnyPerPerson: b.childSeatDiscountCnyPerPerson,
+    infantPriceCny: b.infantPriceCny,
+    legs: b.legs,
   };
 }
 
@@ -158,9 +171,9 @@ export function ProductsPage() {
       for (const n of next) if (!prev.find((p) => p.id === n.id)) {
         await api.createHotel(tk, {
           name: n.name, nameEn: n.nameEn, cityCode: n.cityCode, area: n.area,
-          address: n.area, starRating: n.stars, basePrice: n.basePrice,
+          address: n.address || n.area, starRating: n.stars, basePrice: n.basePrice,
           rating: n.rating, reviewCount: n.reviewCount, emoji: n.emoji,
-          highlight: n.highlight, amenities: n.amenities, photos: n.photo ? [n.photo] : [],
+          highlight: n.highlight, amenities: n.amenities, photos: hotelPhotos(n),
           roomTypes: n.roomTypes.map((rt) => ({
             name: rt.name, bedType: rt.bedType, capacity: rt.sleeps,
             basePrice: n.basePrice * rt.priceMult, priceMultiplier: rt.priceMult,
@@ -171,10 +184,11 @@ export function ProductsPage() {
         const old = prev.find((p) => p.id === n.id);
         if (old && JSON.stringify(old) !== JSON.stringify(n)) {
           await api.updateHotel(tk, n.id, {
-            name: n.name, nameEn: n.nameEn, area: n.area, starRating: n.stars,
+            name: n.name, nameEn: n.nameEn, cityCode: n.cityCode, area: n.area,
+            address: n.address || n.area, starRating: n.stars,
             basePrice: n.basePrice, rating: n.rating, reviewCount: n.reviewCount,
             emoji: n.emoji, highlight: n.highlight, amenities: n.amenities,
-            photos: n.photo ? [n.photo] : [],
+            photos: hotelPhotos(n),
             roomTypes: n.roomTypes.map((rt) => ({
               name: rt.name, bedType: rt.bedType, capacity: rt.sleeps,
               basePrice: n.basePrice * rt.priceMult, priceMultiplier: rt.priceMult,
@@ -265,7 +279,10 @@ export function ProductsPage() {
           hotelRoomTypeId: n.hotelRoomTypeId ?? null,
           hotelNights: n.hotelRoomTypeId ? n.hotelNights ?? 1 : null,
           singleSupplementCnyPerNight: n.singleSupplementCnyPerNight ?? null,
-          cabinUpgradeCnyPerLeg: n.cabinUpgradeCnyPerLeg ?? null,
+          businessUpgradeCnyPerLeg: n.businessUpgradeCnyPerLeg ?? null,
+          childSeatDiscountCnyPerPerson: n.childSeatDiscountCnyPerPerson ?? null,
+          infantPriceCny: n.infantPriceCny ?? null,
+          legs: n.legs ?? 2,
         });
       }
       for (const n of next) {
@@ -278,7 +295,10 @@ export function ProductsPage() {
             hotelRoomTypeId: n.hotelRoomTypeId ?? null,
             hotelNights: n.hotelRoomTypeId ? n.hotelNights ?? 1 : null,
             singleSupplementCnyPerNight: n.singleSupplementCnyPerNight ?? null,
-            cabinUpgradeCnyPerLeg: n.cabinUpgradeCnyPerLeg ?? null,
+            businessUpgradeCnyPerLeg: n.businessUpgradeCnyPerLeg ?? null,
+            childSeatDiscountCnyPerPerson: n.childSeatDiscountCnyPerPerson ?? null,
+            infantPriceCny: n.infantPriceCny ?? null,
+            legs: n.legs ?? 2,
             isActive: n.active,
           });
         }
@@ -404,6 +424,7 @@ function HotelsSection({ items, onChange }: { items: MockHotel[]; onChange: (v: 
   );
 }
 
+/** 新增酒店：复用统一的富信息编辑器，预填一份合理空白模板 */
 function NewHotelForm({
   onCancel,
   onSubmit,
@@ -411,84 +432,26 @@ function NewHotelForm({
   onCancel: () => void;
   onSubmit: (h: MockHotel) => void;
 }) {
-  const [name, setName] = useState('');
-  const [nameEn, setNameEn] = useState('');
-  const [area, setArea] = useState('美溪海滩');
-  const [stars, setStars] = useState<3 | 4 | 5>(4);
-  const [basePrice, setBasePrice] = useState<number | null>(880);
-
+  const blank: MockHotel = {
+    id: 'h-' + Date.now(),
+    name: '',
+    nameEn: '',
+    cityCode: 'DAD',
+    area: '美溪海滩',
+    address: '',
+    stars: 4,
+    basePrice: 880,
+    rating: 4.5,
+    reviewCount: 0,
+    emoji: '🏨',
+    photo: '',
+    photos: [],
+    amenities: ['免费 WiFi', '含早餐'],
+    highlight: '',
+    roomTypes: [{ name: '标准房', priceMult: 1, sleeps: 2, bedType: '双床或大床' }],
+  };
   return (
-    <section className="card border-brand-200 bg-brand-50/40">
-      <h3 className="font-semibold text-ink">新增酒店</h3>
-      <form
-        className="mt-3 grid gap-3 md:grid-cols-3"
-        onSubmit={(e) => {
-          e.preventDefault();
-          onSubmit({
-            id: 'h-' + Date.now(),
-            name,
-            nameEn,
-            cityCode: 'DAD',
-            area,
-            stars,
-            basePrice: basePrice ?? 0,
-            rating: 4.5,
-            reviewCount: 0,
-            emoji: '🏨',
-            photo: 'https://images.unsplash.com/photo-1566073771259-6a8506099945?w=600&h=400&fit=crop',
-            amenities: ['免费 WiFi', '含早餐'],
-            highlight: '新增酒店（demo）',
-            roomTypes: [
-              { name: '标准房', priceMult: 1.0, sleeps: 2, bedType: '双床或大床' },
-              { name: '豪华房', priceMult: 1.3, sleeps: 2, bedType: '1 大床' },
-            ],
-          });
-        }}
-      >
-        <div>
-          <label className="label">中文名 *</label>
-          <input className="input" required value={name} onChange={(e) => setName(e.target.value)} />
-        </div>
-        <div>
-          <label className="label">英文名</label>
-          <input className="input" value={nameEn} onChange={(e) => setNameEn(e.target.value)} />
-        </div>
-        <div>
-          <label className="label">区域</label>
-          <select className="input" value={area} onChange={(e) => setArea(e.target.value)}>
-            <option>美溪海滩</option>
-            <option>山茶半岛</option>
-            <option>会安</option>
-            <option>市中心</option>
-          </select>
-        </div>
-        <div>
-          <label className="label">星级</label>
-          <select
-            className="input"
-            value={stars}
-            onChange={(e) => setStars(Number(e.target.value) as 3 | 4 | 5)}
-          >
-            <option value={3}>三星</option>
-            <option value={4}>四星</option>
-            <option value={5}>五星</option>
-          </select>
-        </div>
-        <div>
-          <label className="label">每晚起价 (¥)</label>
-          <NumberInput
-            min={100}
-            className="input"
-            value={basePrice}
-            onChange={(n) => setBasePrice(n)}
-          />
-        </div>
-        <div className="md:col-span-3 flex justify-end gap-3">
-          <button type="button" className="btn-secondary" onClick={onCancel}>取消</button>
-          <button type="submit" className="btn-primary">添加</button>
-        </div>
-      </form>
-    </section>
+    <HotelEditorForm hotel={blank} title="新增酒店" submitLabel="添加" onCancel={onCancel} onSave={onSubmit} />
   );
 }
 
@@ -723,14 +686,27 @@ function BundleCard({
         </div>
       )}
 
-      {(bundle.singleSupplementCnyPerNight != null || bundle.cabinUpgradeCnyPerLeg != null) && (
+      {(bundle.singleSupplementCnyPerNight != null || bundle.businessUpgradeCnyPerLeg != null) && (
         <div className="mt-1 text-xs text-ink-soft">
           {bundle.singleSupplementCnyPerNight != null && (
             <>🛏️ 单房差 ¥{bundle.singleSupplementCnyPerNight.toLocaleString()}/晚</>
           )}
-          {bundle.singleSupplementCnyPerNight != null && bundle.cabinUpgradeCnyPerLeg != null && ' · '}
-          {bundle.cabinUpgradeCnyPerLeg != null && (
-            <>💺 升舱 ¥{bundle.cabinUpgradeCnyPerLeg.toLocaleString()}/程</>
+          {bundle.singleSupplementCnyPerNight != null && bundle.businessUpgradeCnyPerLeg != null && ' · '}
+          {bundle.businessUpgradeCnyPerLeg != null && (
+            <>💺 升舱 ¥{bundle.businessUpgradeCnyPerLeg.toLocaleString()}/程
+              {bundle.legs ? ` × ${bundle.legs} 段` : ''}</>
+          )}
+        </div>
+      )}
+
+      {(bundle.childSeatDiscountCnyPerPerson != null || bundle.infantPriceCny != null) && (
+        <div className="mt-1 text-xs text-ink-soft">
+          {bundle.childSeatDiscountCnyPerPerson != null && (
+            <>🧒 占座儿童差价 −¥{bundle.childSeatDiscountCnyPerPerson.toLocaleString()}/人</>
+          )}
+          {bundle.childSeatDiscountCnyPerPerson != null && bundle.infantPriceCny != null && ' · '}
+          {bundle.infantPriceCny != null && (
+            <>👶 婴儿价 ¥{bundle.infantPriceCny.toLocaleString()}/人</>
           )}
         </div>
       )}
@@ -780,7 +756,11 @@ function NewBundleWizard({
   const [hotelNights, setHotelNights] = useState<number | null>(3);
   // 自愿升级展示价（CNY；留空 = 前台不展示该升级项）
   const [singleSupplement, setSingleSupplement] = useState<number | null>(null);
-  const [cabinUpgrade, setCabinUpgrade] = useState<number | null>(null);
+  const [businessUpgrade, setBusinessUpgrade] = useState<number | null>(null);
+  // 大人/小孩区分（CNY；留空 = 用服务端默认：占座儿童差价 ¥30、婴儿价 ¥0）
+  const [childSeatDiscount, setChildSeatDiscount] = useState<number | null>(null);
+  const [infantPrice, setInfantPrice] = useState<number | null>(null);
+  const [legs, setLegs] = useState<number | null>(2);
   // Local draft shape allowing null for in-progress numeric edits
   type DraftBundleItem = Omit<BundleItem, 'qty' | 'unitPrice'> & { qty: number | null; unitPrice: number | null };
   const [items, setItems] = useState<DraftBundleItem[]>([
@@ -842,6 +822,7 @@ function NewBundleWizard({
                   <option key={o.id} value={o.id}>{o.label}</option>
                 ))}
               </select>
+              <p className="mt-1 text-xs text-ink-muted">找不到酒店？在 产品管理 › 酒店 里添加/编辑（含介绍、图片、房型）。</p>
             </div>
             {hotelRoomTypeId && (
               <div>
@@ -851,27 +832,65 @@ function NewBundleWizard({
             )}
           </div>
 
-          <div className="grid gap-3 md:grid-cols-2">
+          <div className="grid gap-3 md:grid-cols-3">
             <div>
               <label className="label">单房差 (¥/晚)</label>
               <NumberInput
                 min={0}
                 max={1000000}
                 className="input"
-                placeholder="留空 = 不展示"
+                placeholder="留空 = 用默认 ¥80"
                 value={singleSupplement}
                 onChange={(n) => setSingleSupplement(n)}
               />
             </div>
             <div>
-              <label className="label">升舱 (¥/程)</label>
+              <label className="label">升舱商务 (¥/程)</label>
               <NumberInput
                 min={0}
                 max={1000000}
                 className="input"
-                placeholder="留空 = 不展示"
-                value={cabinUpgrade}
-                onChange={(n) => setCabinUpgrade(n)}
+                placeholder="留空 = 用默认 ¥700"
+                value={businessUpgrade}
+                onChange={(n) => setBusinessUpgrade(n)}
+              />
+            </div>
+            <div>
+              <label className="label">航段数（来回 = 2 / 单程 = 1）</label>
+              <NumberInput
+                min={1}
+                max={8}
+                className="input"
+                value={legs}
+                onChange={(n) => setLegs(n)}
+                integerOnly
+              />
+            </div>
+          </div>
+
+          <div className="grid gap-3 md:grid-cols-2">
+            <div>
+              <label className="label">儿童差价 (¥/人，占座儿童比成人便宜)</label>
+              <NumberInput
+                min={0}
+                max={1000000}
+                className="input"
+                placeholder="留空 = 用默认 ¥30"
+                value={childSeatDiscount}
+                onChange={(n) => setChildSeatDiscount(n)}
+                integerOnly
+              />
+            </div>
+            <div>
+              <label className="label">婴儿价 (¥/人，不占座婴儿)</label>
+              <NumberInput
+                min={0}
+                max={1000000}
+                className="input"
+                placeholder="留空 = 用默认 ¥0"
+                value={infantPrice}
+                onChange={(n) => setInfantPrice(n)}
+                integerOnly
               />
             </div>
           </div>
@@ -1004,7 +1023,10 @@ function NewBundleWizard({
                   hotelRoomTypeId: hotelRoomTypeId || null,
                   hotelNights: hotelRoomTypeId ? hotelNights : null,
                   singleSupplementCnyPerNight: singleSupplement,
-                  cabinUpgradeCnyPerLeg: cabinUpgrade,
+                  businessUpgradeCnyPerLeg: businessUpgrade,
+                  childSeatDiscountCnyPerPerson: childSeatDiscount,
+                  infantPriceCny: infantPrice,
+                  legs: legs ?? 2,
                 })
               }
             >
@@ -1032,85 +1054,299 @@ function ActionBar({ active, onAdd, addLabel }: { active: number; onAdd: () => v
 // ═══════════════════════════════════════════════════════════════
 
 function EditHotelForm({ hotel, onCancel, onSave }: { hotel: MockHotel; onCancel: () => void; onSave: (h: MockHotel) => void }) {
-  const [form, setForm] = useState({ ...hotel });
+  return (
+    <HotelEditorForm
+      hotel={hotel}
+      title={`编辑酒店 · ${hotel.name}`}
+      submitLabel="保存修改"
+      onCancel={onCancel}
+      onSave={onSave}
+    />
+  );
+}
+
+/**
+ * 统一的酒店富信息编辑器（新增 / 编辑共用）。
+ * 暴露全部后端支持的字段：中文名 / 英文名 / 城市码 / 区域 / 地址 / 星级 / 每晚起价 /
+ * 详细介绍 / 多张图片 / 设施标签 / 房型（含床型·人数·价格·系数）。
+ */
+function HotelEditorForm({
+  hotel,
+  title,
+  submitLabel,
+  onCancel,
+  onSave,
+}: {
+  hotel: MockHotel;
+  title: string;
+  submitLabel: string;
+  onCancel: () => void;
+  onSave: (h: MockHotel) => void;
+}) {
+  const [name, setName] = useState(hotel.name);
+  const [nameEn, setNameEn] = useState(hotel.nameEn);
+  const [cityCode, setCityCode] = useState(hotel.cityCode || 'DAD');
+  const [area, setArea] = useState(hotel.area);
+  const [address, setAddress] = useState(hotel.address ?? '');
+  const [stars, setStars] = useState<3 | 4 | 5>(hotel.stars);
   const [basePrice, setBasePrice] = useState<number | null>(hotel.basePrice);
-  const [amenitiesText, setAmenitiesText] = useState(hotel.amenities.join(', '));
+  const [emoji, setEmoji] = useState(hotel.emoji);
+  const [highlight, setHighlight] = useState(hotel.highlight);
+  // 图片：优先 photos[]，回退单张 photo；保证至少 1 行可填
+  const [photos, setPhotos] = useState<string[]>(
+    hotel.photos && hotel.photos.length > 0 ? hotel.photos : hotel.photo ? [hotel.photo] : [''],
+  );
+  const [amenities, setAmenities] = useState<string[]>(hotel.amenities);
+  const [roomTypes, setRoomTypes] = useState<HotelRoomType[]>(
+    hotel.roomTypes.length > 0 ? hotel.roomTypes : [{ name: '', priceMult: 1, sleeps: 2, bedType: '' }],
+  );
   const [saved, setSaved] = useState(false);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    const cleanPhotos = photos.map((p) => p.trim()).filter(Boolean);
+    const cleanRooms = roomTypes
+      .map((rt) => ({ ...rt, name: rt.name.trim(), bedType: rt.bedType.trim() }))
+      .filter((rt) => rt.name);
     const updated: MockHotel = {
-      ...form,
+      ...hotel,
+      name: name.trim(),
+      nameEn: nameEn.trim(),
+      cityCode,
+      area: area.trim(),
+      address: address.trim(),
+      stars,
       basePrice: basePrice ?? 0,
-      amenities: amenitiesText.split(',').map(s => s.trim()).filter(Boolean),
+      emoji: emoji.trim() || '🏨',
+      highlight: highlight.trim(),
+      photo: cleanPhotos[0] ?? '',
+      photos: cleanPhotos,
+      amenities: amenities.map((a) => a.trim()).filter(Boolean),
+      roomTypes: cleanRooms,
     };
     setSaved(true);
-    setTimeout(() => onSave(updated), 800);
+    setTimeout(() => onSave(updated), 600);
   };
 
   return (
     <section className="card border-brand-200 bg-brand-50/40">
       <div className="flex items-center justify-between">
-        <h3 className="font-semibold text-ink">编辑酒店 · {hotel.name}</h3>
+        <h3 className="font-semibold text-ink">{title}</h3>
         <button type="button" className="btn-ghost px-2 py-1 text-xl leading-none" onClick={onCancel}>×</button>
       </div>
-      <form className="mt-3 grid gap-3 md:grid-cols-3" onSubmit={handleSubmit}>
-        <div>
-          <label className="label text-xs">中文名 *</label>
-          <input required className="input" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
-        </div>
-        <div>
-          <label className="label text-xs">英文名</label>
-          <input className="input" value={form.nameEn} onChange={(e) => setForm({ ...form, nameEn: e.target.value })} />
-        </div>
-        <div>
-          <label className="label text-xs">区域</label>
-          <input className="input" value={form.area} onChange={(e) => setForm({ ...form, area: e.target.value })} />
-        </div>
-        <div>
-          <label className="label text-xs">星级</label>
-          <select className="input" value={form.stars} onChange={(e) => setForm({ ...form, stars: Number(e.target.value) as 3 | 4 | 5 })}>
-            <option value={3}>三星</option>
-            <option value={4}>四星</option>
-            <option value={5}>五星</option>
-          </select>
-        </div>
-        <div>
-          <label className="label text-xs">每晚起价 (¥)</label>
-          <NumberInput min={0} className="input" value={basePrice} onChange={(n) => setBasePrice(n)} />
-        </div>
-        <div>
-          <label className="label text-xs">城市代码</label>
-          <select className="input" value={form.cityCode} onChange={(e) => setForm({ ...form, cityCode: e.target.value })}>
-            <option value="DAD">DAD 岘港</option>
-            <option value="HOA">HOA 会安</option>
-          </select>
-        </div>
-        <div className="md:col-span-3">
-          <label className="label text-xs">卖点亮点</label>
-          <input className="input" value={form.highlight} onChange={(e) => setForm({ ...form, highlight: e.target.value })} />
-        </div>
-        <div className="md:col-span-3">
-          <label className="label text-xs">设施（逗号分隔）</label>
-          <input className="input" value={amenitiesText} onChange={(e) => setAmenitiesText(e.target.value)} placeholder="私人海滩, 泳池, 含早餐" />
-        </div>
-        <div className="md:col-span-2">
-          <label className="label text-xs">图片 URL</label>
-          <input className="input" value={form.photo} onChange={(e) => setForm({ ...form, photo: e.target.value })} />
-        </div>
-        <div>
-          <label className="label text-xs">Emoji 图标</label>
-          <input className="input" maxLength={4} value={form.emoji} onChange={(e) => setForm({ ...form, emoji: e.target.value })} />
+      <form className="mt-3 space-y-4" onSubmit={handleSubmit}>
+        {/* 基本信息 */}
+        <div className="grid gap-3 md:grid-cols-3">
+          <div>
+            <label className="label text-xs">中文名 *</label>
+            <input required className="input" value={name} onChange={(e) => setName(e.target.value)} />
+          </div>
+          <div>
+            <label className="label text-xs">英文名</label>
+            <input className="input" value={nameEn} onChange={(e) => setNameEn(e.target.value)} />
+          </div>
+          <div>
+            <label className="label text-xs">Emoji 图标</label>
+            <input className="input" maxLength={4} value={emoji} onChange={(e) => setEmoji(e.target.value)} />
+          </div>
+          <div>
+            <label className="label text-xs">城市代码</label>
+            <select className="input" value={cityCode} onChange={(e) => setCityCode(e.target.value)}>
+              <option value="DAD">DAD 岘港</option>
+              <option value="HOA">HOA 会安</option>
+              <option value="BAN">BAN 巴拿山</option>
+            </select>
+          </div>
+          <div>
+            <label className="label text-xs">区域</label>
+            <input className="input" value={area} onChange={(e) => setArea(e.target.value)} placeholder="美溪海滩 / 山茶半岛 / 市中心" />
+          </div>
+          <div>
+            <label className="label text-xs">星级</label>
+            <select className="input" value={stars} onChange={(e) => setStars(Number(e.target.value) as 3 | 4 | 5)}>
+              <option value={3}>三星</option>
+              <option value={4}>四星</option>
+              <option value={5}>五星</option>
+            </select>
+          </div>
+          <div className="md:col-span-2">
+            <label className="label text-xs">详细地址</label>
+            <input className="input" value={address} onChange={(e) => setAddress(e.target.value)} placeholder="如 越南岘港市 Vo Nguyen Giap 路 5 号" />
+          </div>
+          <div>
+            <label className="label text-xs">每晚起价 (¥)</label>
+            <NumberInput min={0} className="input" value={basePrice} onChange={(n) => setBasePrice(n)} />
+          </div>
         </div>
 
-        {saved && <div className="md:col-span-3 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700">保存中…</div>}
+        {/* 详细介绍 / 亮点 */}
+        <div>
+          <label className="label text-xs">详细介绍 / 亮点</label>
+          <textarea
+            className="input min-h-[88px] resize-y"
+            value={highlight}
+            onChange={(e) => setHighlight(e.target.value)}
+            placeholder="酒店卖点、地理位置、特色服务，可多行。前台/套餐里会展示给客户。"
+          />
+        </div>
 
-        <div className="md:col-span-3 flex justify-end gap-3">
+        {/* 图片（多张 URL，第一张 = 封面） */}
+        <PhotoListEditor photos={photos} onChange={setPhotos} />
+
+        {/* 设施标签 */}
+        <AmenityChipsEditor amenities={amenities} onChange={setAmenities} />
+
+        {/* 房型管理 */}
+        <RoomTypesEditor roomTypes={roomTypes} onChange={setRoomTypes} />
+
+        {saved && <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700">保存中…</div>}
+
+        <div className="flex justify-end gap-3">
           <button type="button" className="btn-secondary" onClick={onCancel}>取消</button>
-          <button type="submit" className="btn-primary">保存修改</button>
+          <button type="submit" className="btn-primary">{submitLabel}</button>
         </div>
       </form>
     </section>
+  );
+}
+
+/** 多张图片 URL 编辑（第一张为封面，可增删，URL 制无上传） */
+function PhotoListEditor({ photos, onChange }: { photos: string[]; onChange: (v: string[]) => void }) {
+  const setAt = (idx: number, val: string) => onChange(photos.map((p, i) => (i === idx ? val : p)));
+  const removeAt = (idx: number) => {
+    const next = photos.filter((_, i) => i !== idx);
+    onChange(next.length > 0 ? next : ['']);
+  };
+  return (
+    <div>
+      <div className="flex items-center justify-between">
+        <label className="label text-xs !mb-0">图片 URL（第一张为封面）</label>
+        <button type="button" className="text-xs font-medium text-brand hover:text-brand-dark" onClick={() => onChange([...photos, ''])}>
+          + 添加图片
+        </button>
+      </div>
+      <div className="mt-2 space-y-2">
+        {photos.map((p, idx) => (
+          <div key={idx} className="flex items-center gap-2">
+            <span className={`w-12 shrink-0 text-center text-xs ${idx === 0 ? 'font-medium text-brand' : 'text-ink-muted'}`}>
+              {idx === 0 ? '封面' : `#${idx + 1}`}
+            </span>
+            <input
+              className="input flex-1"
+              value={p}
+              onChange={(e) => setAt(idx, e.target.value)}
+              placeholder="https://…（粘贴图片链接）"
+            />
+            {p.trim() && (
+              <img src={p} alt="" className="h-9 w-9 shrink-0 rounded object-cover" onError={(e) => { (e.currentTarget.style.display = 'none'); }} />
+            )}
+            <button
+              type="button"
+              className="shrink-0 text-xs text-ink-muted hover:text-rose-600"
+              onClick={() => removeAt(idx)}
+              aria-label="删除图片"
+            >
+              ×
+            </button>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/** 设施标签编辑（chip 增删，回车 / 逗号添加） */
+function AmenityChipsEditor({ amenities, onChange }: { amenities: string[]; onChange: (v: string[]) => void }) {
+  const [draft, setDraft] = useState('');
+  const add = () => {
+    const tags = draft.split(/[,，]/).map((s) => s.trim()).filter(Boolean);
+    if (tags.length === 0) return;
+    onChange(Array.from(new Set([...amenities, ...tags])));
+    setDraft('');
+  };
+  return (
+    <div>
+      <label className="label text-xs">设施</label>
+      <div className="flex flex-wrap items-center gap-1.5">
+        {amenities.map((a, idx) => (
+          <span key={`${a}-${idx}`} className="badge-neutral inline-flex items-center gap-1">
+            {a}
+            <button
+              type="button"
+              className="text-ink-muted hover:text-rose-600"
+              onClick={() => onChange(amenities.filter((_, i) => i !== idx))}
+              aria-label={`删除 ${a}`}
+            >
+              ×
+            </button>
+          </span>
+        ))}
+      </div>
+      <div className="mt-2 flex gap-2">
+        <input
+          className="input flex-1"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' || e.key === ',' || e.key === '，') {
+              e.preventDefault();
+              add();
+            }
+          }}
+          placeholder="输入设施后回车，如 私人海滩 / 泳池 / 含早餐"
+        />
+        <button type="button" className="btn-secondary" onClick={add}>添加</button>
+      </div>
+    </div>
+  );
+}
+
+/** 房型管理：可增删行，每行 房型名 / 床型 / 人数 / 每晚价 / 价格系数 */
+function RoomTypesEditor({ roomTypes, onChange }: { roomTypes: HotelRoomType[]; onChange: (v: HotelRoomType[]) => void }) {
+  const setAt = (idx: number, patch: Partial<HotelRoomType>) =>
+    onChange(roomTypes.map((rt, i) => (i === idx ? { ...rt, ...patch } : rt)));
+  const removeAt = (idx: number) => onChange(roomTypes.filter((_, i) => i !== idx));
+  return (
+    <div>
+      <div className="flex items-center justify-between">
+        <label className="label text-xs !mb-0">房型管理</label>
+        <button
+          type="button"
+          className="text-xs font-medium text-brand hover:text-brand-dark"
+          onClick={() => onChange([...roomTypes, { name: '', priceMult: 1, sleeps: 2, bedType: '' }])}
+        >
+          + 添加房型
+        </button>
+      </div>
+      <div className="mt-2 space-y-2">
+        {roomTypes.map((rt, idx) => (
+          <div key={idx} className="grid grid-cols-2 items-end gap-2 rounded-lg border border-slate-200 bg-canvas p-2 md:grid-cols-12">
+            <div className="col-span-2 md:col-span-3">
+              <label className="label text-xs">房型名 *</label>
+              <input className="input" value={rt.name} onChange={(e) => setAt(idx, { name: e.target.value })} placeholder="海景大床房" />
+            </div>
+            <div className="col-span-2 md:col-span-3">
+              <label className="label text-xs">床型</label>
+              <input className="input" value={rt.bedType} onChange={(e) => setAt(idx, { bedType: e.target.value })} placeholder="1 张大床 · 海景" />
+            </div>
+            <div className="md:col-span-2">
+              <label className="label text-xs">可住人数</label>
+              <NumberInput min={1} max={20} className="input" value={rt.sleeps} onChange={(n) => setAt(idx, { sleeps: n ?? 1 })} integerOnly />
+            </div>
+            <div className="md:col-span-2">
+              <label className="label text-xs">价格系数</label>
+              <NumberInput min={0.1} max={20} className="input" value={rt.priceMult} onChange={(n) => setAt(idx, { priceMult: n ?? 1 })} />
+            </div>
+            <div className="md:col-span-2 flex items-center justify-end pb-1">
+              <button type="button" className="text-xs text-ink-muted hover:text-rose-600" onClick={() => removeAt(idx)}>
+                删除
+              </button>
+            </div>
+          </div>
+        ))}
+      </div>
+      <p className="mt-1 text-xs text-ink-muted">每晚价 = 酒店每晚起价 × 价格系数（如标准房 1.0、海景房 1.15）。</p>
+    </div>
   );
 }
 

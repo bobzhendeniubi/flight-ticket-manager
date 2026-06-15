@@ -431,9 +431,18 @@ export interface CreateOrderInput {
         unitPrice: number;
         bundleId: string;
         /**
+         * 占座模型三计数（后端权威重算占座/出行人/拼房；缺省时回退旧 pax → 全成人）：
+         *   adultCount  = 成人（≥1）—— 占座，机票收经济舱全价
+         *   childCount  = 占座儿童 —— 占座，机票按成人价减 childSeatDiscountCnyPerPerson
+         *   infantCount = 不占座婴儿 —— 不占座、不占房，机票收 infantPriceCny；仍需护照（出行人计入）
+         */
+        adultCount?: number;
+        childCount?: number;
+        infantCount?: number;
+        /**
          * 可选升级 add-on（整数份数，后端权威重算；缺省 0 = 无升级，价格与旧版一致）：
-         *   singleCount   = 选「一个人住酒店（单人入住）」的人数
-         *   businessCount = 选「升级商务舱」的人数（占用真实商务舱库存；
+         *   singleCount   = 选「一个人住酒店（单人入住）」的人数（退出拼房 → 每人单独一间）
+         *   businessCount = 选「升级商务舱」的人数（≤ 占座人数 seatPax；占用真实商务舱库存；
          *                   business>0 时本单必须同时带经济舱 FLIGHT 行供后端拆座）
          */
         singleCount?: number;
@@ -569,6 +578,14 @@ export interface Bundle {
   singleSupplementCnyPerNight?: number | null;
   businessUpgradeCnyPerLeg?: number | null;
   legs?: number | null;
+  /**
+   * 占座模型报价（server-priced，后端返回为整数 number）：
+   *   childSeatDiscountCnyPerPerson = 占座儿童每人比成人便宜多少（机票折扣）
+   *   infantPriceCny                = 不占座婴儿每人机票价（不走经济舱全价）
+   * 0/缺省 = 不优惠/不收婴儿价（与旧版价格一致）。
+   */
+  childSeatDiscountCnyPerPerson?: number | null;
+  infantPriceCny?: number | null;
   /** 套餐关联酒店房型（展示酒店名 + 房型名；null = 未关联） */
   hotelRoomType?: { id: string; name: string; hotelName: string } | null;
   /** 关联房型 id（实时房量查询用；null = 未关联，不查房量） */

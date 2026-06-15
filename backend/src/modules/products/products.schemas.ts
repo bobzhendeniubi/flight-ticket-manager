@@ -123,6 +123,11 @@ export const createBundleBodySchema = z.object({
   // 整数 CNY；省略时用 DB 默认（单人入住 ¥80/晚、升舱 ¥700/程）。
   singleSupplementCnyPerNight: z.number().int().nonnegative().max(1_000_000).optional(),
   businessUpgradeCnyPerLeg: z.number().int().nonnegative().max(1_000_000).optional(),
+  // 占座儿童 / 不占座婴儿定价（CNY，按产品可配置；省略时用 DB 默认 30 / 0）：
+  //   childSeatDiscountCnyPerPerson = 占座儿童比成人每人便宜多少 CNY（机票按成人价减此折扣；不一定 30）
+  //   infantPriceCny                = 不占座婴儿每人价 CNY（默认免费 0）
+  childSeatDiscountCnyPerPerson: z.number().int().nonnegative().max(1_000_000).optional(),
+  infantPriceCny: z.number().int().nonnegative().max(1_000_000).optional(),
   // 机票航段数（来回 = 2，单程 = 1）
   legs: z.number().int().min(1).max(8).optional(),
   isActive: z.boolean().default(true),

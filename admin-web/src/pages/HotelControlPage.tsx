@@ -623,6 +623,9 @@ function BlockPeriodNewForm({
               </option>
             ))}
           </select>
+          <span className="mt-1 block font-normal normal-case text-ink-muted">
+            找不到酒店？在 产品管理 › 酒店 里添加/编辑（含介绍、图片、房型）。
+          </span>
         </label>
         <label className="text-xs text-ink-soft">
           起始日

@@ -44,6 +44,7 @@ import {
   computeBundleAddOn,
   computeBundleSeatSplit,
   computeRequiredPassengerCount,
+  resolveBundleOccupancy,
 } from './orders.service.js';
 import type { OrderItemInput } from './orders.schemas.js';
 
@@ -406,12 +407,65 @@ describe('resolveBundleHotelStamp', () => {
   });
 });
 
+// ── 套餐占座归一化：resolveBundleOccupancy ───────────────────────────────
+// 成人 / 占座儿童 / 不占座婴儿；向后兼容旧 pax → 全成人。拼房每人 0.5 间、婴儿不占房。
+describe('resolveBundleOccupancy', () => {
+  it('显式三计数（2 大 1 小 1 婴）→ seatPax 3、headCount 4、rooms 2', () => {
+    const o = resolveBundleOccupancy({ adultCount: 2, childCount: 1, infantCount: 1 });
+    expect(o).toEqual({
+      adultCount: 2,
+      childCount: 1,
+      infantCount: 1,
+      seatPax: 3, // 2 大 + 1 占座小孩
+      headCount: 4, // + 1 婴儿（也是出行人）
+      rooms: 2, // ceil(3/2)
+    });
+  });
+
+  it('1 人（1 大）→ seatPax 1、headCount 1、rooms 1（ceil(0.5)=1）', () => {
+    expect(resolveBundleOccupancy({ adultCount: 1 })).toEqual({
+      adultCount: 1,
+      childCount: 0,
+      infantCount: 0,
+      seatPax: 1,
+      headCount: 1,
+      rooms: 1,
+    });
+  });
+
+  it('向后兼容：无三计数，metadata.pax=2 → 2 大 0 小 0 婴（与旧版一致）', () => {
+    const o = resolveBundleOccupancy({ metadata: { pax: 2 } });
+    expect(o).toMatchObject({ adultCount: 2, childCount: 0, infantCount: 0, seatPax: 2, headCount: 2, rooms: 1 });
+  });
+
+  it('向后兼容：无三计数也无 pax → 回退行 quantity 当成人', () => {
+    expect(resolveBundleOccupancy({ quantity: 3 })).toMatchObject({
+      adultCount: 3,
+      seatPax: 3,
+      headCount: 3,
+      rooms: 2,
+    });
+  });
+
+  it('metadata 三计数（前台带过来）在无行字段时生效', () => {
+    const o = resolveBundleOccupancy({ metadata: { adultCount: 1, childCount: 2, infantCount: 1 } });
+    expect(o).toMatchObject({ adultCount: 1, childCount: 2, infantCount: 1, seatPax: 3, headCount: 4, rooms: 2 });
+  });
+
+  it('行字段优先于 metadata（显式 1 大覆盖 metadata.pax=5）', () => {
+    const o = resolveBundleOccupancy({ adultCount: 1, metadata: { pax: 5 } });
+    expect(o).toMatchObject({ adultCount: 1, seatPax: 1, headCount: 1 });
+  });
+});
+
 // ── 套餐可选升级 add-on 重算：computeBundleAddOn ──────────────────────
 describe('computeBundleAddOn', () => {
   const bundle = {
     hotelNights: 3,
     singleSupplementCnyPerNight: 80,
     businessUpgradeCnyPerLeg: 700,
+    childSeatDiscountCnyPerPerson: 30,
+    infantPriceCny: 0,
     legs: 2,
   };
   // 真实入住区间：7/1 → 7/4 = 3 晚
@@ -419,19 +473,22 @@ describe('computeBundleAddOn', () => {
     hotelCheckIn: new Date('2026-07-01'),
     hotelCheckOut: new Date('2026-07-04'),
   };
+  // 占座归一化助手：单测里按需造 occupancy
+  const occ = (adultCount: number, childCount = 0, infantCount = 0) =>
+    resolveBundleOccupancy({ adultCount, childCount, infantCount });
 
-  it('无升级（singleCount/businessCount 缺省）→ total 0、hasAddOn false（向后兼容）', () => {
-    const r = computeBundleAddOn(bundle, stamp, undefined, undefined);
+  it('无升级（singleCount/businessCount 缺省，纯成人）→ total 0、hasAddOn false（向后兼容）', () => {
+    const r = computeBundleAddOn(bundle, stamp, undefined, undefined, occ(2));
     expect(r.total).toBe(0);
     expect(r.hasAddOn).toBe(false);
-    const zero = computeBundleAddOn(bundle, stamp, 0, 0);
+    const zero = computeBundleAddOn(bundle, stamp, 0, 0, occ(2));
     expect(zero.total).toBe(0);
     expect(zero.hasAddOn).toBe(false);
   });
 
   it('单人入住 = singleCount × 房差/晚 × 晚数', () => {
     // 1 人 × 80 × 3 晚 = 240
-    const r = computeBundleAddOn(bundle, stamp, 1, 0);
+    const r = computeBundleAddOn(bundle, stamp, 1, 0, occ(2));
     expect(r.breakdown.singleSupplementTotal).toBe(240);
     expect(r.breakdown.businessUpgradeTotal).toBe(0);
     expect(r.total).toBe(240);
@@ -440,13 +497,13 @@ describe('computeBundleAddOn', () => {
 
   it('升舱商务 = businessCount × 升舱/航段 × 航段数', () => {
     // 1 人 × 700 × 2 段 = 1400
-    const r = computeBundleAddOn(bundle, stamp, 0, 1);
+    const r = computeBundleAddOn(bundle, stamp, 0, 1, occ(2));
     expect(r.breakdown.businessUpgradeTotal).toBe(1400);
     expect(r.total).toBe(1400);
   });
 
   it('两项叠加（赵姐默认费率，3 晚来回，各 1 人）= 240 + 1400 = 1640', () => {
-    const r = computeBundleAddOn(bundle, stamp, 1, 1);
+    const r = computeBundleAddOn(bundle, stamp, 1, 1, occ(2));
     expect(r.total).toBe(1640);
     expect(r.breakdown).toMatchObject({
       singleCount: 1,
@@ -465,13 +522,13 @@ describe('computeBundleAddOn', () => {
       hotelCheckIn: new Date('2026-07-01'),
       hotelCheckOut: new Date('2026-07-05'),
     };
-    const r = computeBundleAddOn(premium, fourNights, 1, 0);
+    const r = computeBundleAddOn(premium, fourNights, 1, 0, occ(2));
     expect(r.breakdown.nights).toBe(4);
     expect(r.total).toBe(480 * 4); // 1920
   });
 
   it('无 hotelStamp → 回退 bundle.hotelNights（≥1）算晚数', () => {
-    const r = computeBundleAddOn(bundle, null, 2, 0);
+    const r = computeBundleAddOn(bundle, null, 2, 0, occ(2));
     // 2 人 × 80 × 3 晚 = 480
     expect(r.breakdown.nights).toBe(3);
     expect(r.total).toBe(480);
@@ -479,10 +536,64 @@ describe('computeBundleAddOn', () => {
 
   it('单程套餐 legs=1：升舱只算 1 段', () => {
     const oneWay = { ...bundle, legs: 1 };
-    const r = computeBundleAddOn(oneWay, stamp, 0, 2);
+    const r = computeBundleAddOn(oneWay, stamp, 0, 2, occ(2));
     // 2 人 × 700 × 1 段 = 1400
     expect(r.breakdown.legs).toBe(1);
     expect(r.total).toBe(1400);
+  });
+
+  // ── 占座儿童折扣 + 婴儿价（赵姐新需求）────────────────────────────────
+  it('占座儿童折扣：1 小孩 × 30 → 套餐行净减 30（hasAddOn true）', () => {
+    const r = computeBundleAddOn(bundle, stamp, 0, 0, occ(2, 1, 0));
+    expect(r.breakdown.childSeatDiscountTotal).toBe(30);
+    expect(r.breakdown.infantPriceTotal).toBe(0);
+    expect(r.total).toBe(0); // 0 升级 + 0 婴儿 − 30 折扣 → clamp 到 0（无其他正向项时）
+    expect(r.hasAddOn).toBe(true);
+    expect(r.breakdown).toMatchObject({ adultCount: 2, childCount: 1, infantCount: 0, seatPax: 3, headCount: 3 });
+  });
+
+  it('折扣可配置：childSeatDiscount=50（不是死 30）→ 2 小孩净减 100', () => {
+    const cfg = { ...bundle, childSeatDiscountCnyPerPerson: 50 };
+    // 加一个升级让 total 不被 clamp 到 0，验证折扣真减进去：
+    //   单人入住 1 人 × 80 × 3 = 240；2 小孩折扣 50 × 2 = 100 → 240 − 100 = 140
+    const r = computeBundleAddOn(cfg, stamp, 1, 0, occ(2, 2, 0));
+    expect(r.breakdown.childSeatDiscountCnyPerPerson).toBe(50);
+    expect(r.breakdown.childSeatDiscountTotal).toBe(100);
+    expect(r.total).toBe(140);
+  });
+
+  it('婴儿价：infantPrice=500/人 × 1 婴 → 套餐行净加 500', () => {
+    const cfg = { ...bundle, infantPriceCny: 500 };
+    const r = computeBundleAddOn(cfg, stamp, 0, 0, occ(2, 0, 1));
+    expect(r.breakdown.infantPriceTotal).toBe(500);
+    expect(r.total).toBe(500);
+    expect(r.hasAddOn).toBe(true);
+  });
+
+  it('2 大 1 小 1 婴（折扣 30、婴儿价 0）→ 折扣 30、婴儿 0、净 0（升级机票仍在 FLIGHT 行）', () => {
+    const r = computeBundleAddOn(bundle, stamp, 0, 0, occ(2, 1, 1));
+    expect(r.breakdown).toMatchObject({
+      adultCount: 2,
+      childCount: 1,
+      infantCount: 1,
+      seatPax: 3,
+      headCount: 4,
+      rooms: 2,
+      childSeatDiscountTotal: 30,
+      infantPriceTotal: 0,
+    });
+    expect(r.total).toBe(0); // 升级 0 + 婴儿 0 − 折扣 30 → clamp 0
+  });
+
+  it('businessCount 夹到占座人数（seatPax）上限：2 大 0 小，businessCount=5 → 只算 2 段商务', () => {
+    const r = computeBundleAddOn(bundle, stamp, 0, 5, occ(2, 0, 0));
+    expect(r.breakdown.businessCount).toBe(2);
+    expect(r.breakdown.businessUpgradeTotal).toBe(2 * 700 * 2); // 2800
+  });
+
+  it('婴儿不占座、不能升舱：2 大 0 小 0 婴 seatPax=2，businessCount=3 夹到 2', () => {
+    const r = computeBundleAddOn(bundle, stamp, 0, 3, occ(2, 0, 0));
+    expect(r.breakdown.businessCount).toBe(2);
   });
 });
 
@@ -615,6 +726,54 @@ describe('computeRequiredPassengerCount', () => {
 
   it('套餐畸形 metadata.pax（非法格式）→ 降级回退行 quantity，不抛错', () => {
     expect(computeRequiredPassengerCount([bundleLine(2, { pax: 'garbage' })])).toBe(2);
+  });
+
+  // ── 占座模型：套餐出行人 = headCount（成人 + 占座儿童 + 不占座婴儿）─────────
+  const bundleWithCounts = (
+    adultCount: number,
+    childCount: number,
+    infantCount: number,
+  ): OrderItemInput => ({
+    kind: 'BUNDLE',
+    description: '岘港 4 天 3 晚',
+    quantity: 1,
+    bundleId: 'bundle-1',
+    unitPrice: 1000,
+    adultCount,
+    childCount,
+    infantCount,
+  });
+
+  it('2 大 1 小 1 婴 → 需 4 位（婴儿也是出行人，需护照）', () => {
+    // 赵姐核心场景：占座 3，出行人 4
+    expect(computeRequiredPassengerCount([bundleWithCounts(2, 1, 1)])).toBe(4);
+  });
+
+  it('2 大 1 小 1 婴 + 占座往返机票（各 3 座）→ 需 4 位（headCount=4 > seatPax=3）', () => {
+    // FLIGHT 行 quantity = seatPax = 3（占座），但出行人按 headCount=4 校验
+    expect(
+      computeRequiredPassengerCount([
+        flightLeg(3, 'sched-go'),
+        flightLeg(3, 'sched-ret'),
+        bundleWithCounts(2, 1, 1),
+      ]),
+    ).toBe(4);
+  });
+
+  it('纯 2 大（无小孩婴儿）→ 需 2 位（与旧版 pax=2 一致，向后兼容）', () => {
+    expect(computeRequiredPassengerCount([bundleWithCounts(2, 0, 0)])).toBe(2);
+  });
+
+  it('metadata 三计数（前台只塞 metadata）→ headCount 同样生效', () => {
+    expect(
+      computeRequiredPassengerCount([bundleLine(1, { adultCount: 1, childCount: 1, infantCount: 1 })]),
+    ).toBe(3);
+  });
+
+  it('多份套餐叠加 headCount：(2 大 1 婴) + (1 大) → 4 位', () => {
+    expect(
+      computeRequiredPassengerCount([bundleWithCounts(2, 0, 1), bundleWithCounts(1, 0, 0)]),
+    ).toBe(4);
   });
 });
 

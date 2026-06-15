@@ -21,12 +21,16 @@ export interface MockHotel {
   nameEn: string;
   cityCode: string; // 岘港 DAD / 会安 HOA / 巴拿山 BAN
   area: string; // 所在区域
+  /** 详细地址（后端 address 字段）；老/mock 数据可空 */
+  address?: string;
   stars: 3 | 4 | 5;
   basePrice: number; // 每晚起
   rating: number;
   reviewCount: number;
   emoji: string;
-  photo: string;
+  photo: string; // 封面（= photos[0]），保留向后兼容
+  /** 全部图片（第一张 = 封面）；老/mock 数据可空，回退到 photo */
+  photos?: string[];
   amenities: string[];
   highlight: string;
   roomTypes: HotelRoomType[];
@@ -842,10 +846,16 @@ export interface MockBundle {
   hotelNights?: number | null;
   /** 展示用：服务端返回的房型名 + 酒店名 */
   hotelRoomType?: { id: string; name: string; hotelName: string } | null;
-  /** 自愿升级展示价：单房差（¥/晚）；null/缺省 = 不展示 */
+  /** 自愿升级：单房差（¥/晚，整数）；null/缺省 = 用服务端默认 */
   singleSupplementCnyPerNight?: number | null;
-  /** 自愿升级展示价：升舱（¥/程）；null/缺省 = 不展示 */
-  cabinUpgradeCnyPerLeg?: number | null;
+  /** 自愿升级：升舱商务（¥/程，整数）；null/缺省 = 用服务端默认 */
+  businessUpgradeCnyPerLeg?: number | null;
+  /** 占座儿童差价（¥/人，整数，占座儿童比成人便宜）；null/缺省 = 用服务端默认 ¥30 */
+  childSeatDiscountCnyPerPerson?: number | null;
+  /** 婴儿价（¥/人，整数，不占座婴儿）；null/缺省 = 用服务端默认 ¥0 */
+  infantPriceCny?: number | null;
+  /** 计费航段数（来回 = 2，单程 = 1）；null/缺省 = 用服务端默认 */
+  legs?: number | null;
 }
 
 

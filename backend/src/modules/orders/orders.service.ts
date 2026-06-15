@@ -580,6 +580,9 @@ export class OrderService {
             // 可选升级加价费率（server-priced，按产品可配置）+ 航段数
             singleSupplementCnyPerNight: true,
             businessUpgradeCnyPerLeg: true,
+            // 占座儿童折扣 / 婴儿价（server-priced，按产品可配置）
+            childSeatDiscountCnyPerPerson: true,
+            infantPriceCny: true,
             legs: true,
           },
         });
@@ -601,8 +604,23 @@ export class OrderService {
         //   升舱商务加价 = businessCount × businessUpgradeCnyPerLeg × legs
         //     —— 这是客户升舱的「总加价」（不是在全价商务票之上再加 ¥700）。客户机票仍按经济舱套餐价收，
         //        差价由商家补贴；升舱只占用真实商务舱库存（不超售），见下方按经济舱航段拆座逻辑。
-        const addOn = computeBundleAddOn(bundle, hotelStamp, item.singleCount, item.businessCount);
+        // 占座模型归一化（成人 / 占座儿童 / 不占座婴儿；向后兼容旧 pax → 全成人）
+        const occupancy = resolveBundleOccupancy({
+          adultCount: item.adultCount,
+          childCount: item.childCount,
+          infantCount: item.infantCount,
+          quantity: item.quantity,
+          metadata: item.metadata,
+        });
+        const addOn = computeBundleAddOn(
+          bundle,
+          hotelStamp,
+          item.singleCount,
+          item.businessCount,
+          occupancy,
+        );
         // 累计本单的升舱人数（多份套餐叠加），下方循环结束后统一分摊到经济舱航段并预检商务舱余位。
+        // 注意：addOn.breakdown.businessCount 已夹到占座人数（seatPax）上限，婴儿不计入。
         bundleBusinessUpgradeCount += addOn.breakdown.businessCount;
 
         priced.push({
@@ -1527,13 +1545,77 @@ export function resolveBundleHotelStamp(
 export interface BundleAddOnBreakdown {
   singleCount: number; // 选「一个人住酒店（单人入住）」的人数
   businessCount: number; // 选「升舱商务」的人数
+  // 占座模型（赵姐需求）：成人 / 占座儿童 / 不占座婴儿
+  adultCount: number; // 成人数（占座、占房）
+  childCount: number; // 占座儿童数（占座、占房；机票按成人价减折扣）
+  infantCount: number; // 不占座婴儿数（不占座、不占房；按婴儿价收）
+  seatPax: number; // 占座人数 = adultCount + childCount（拼房按此计房；businessCount ≤ seatPax）
+  headCount: number; // 全部出行人 = adultCount + childCount + infantCount（都需护照）
+  rooms: number; // 拼房间数 = ceil(seatPax / 2)（婴儿不占房）
   nights: number; // 计费晚数（用于单人入住房差）
   legs: number; // 计费航段数（用于升舱商务）
   singleSupplementCnyPerNight: number; // 该套餐配置的单人入住房差/晚
   businessUpgradeCnyPerLeg: number; // 该套餐配置的升舱/航段
+  childSeatDiscountCnyPerPerson: number; // 该套餐配置的占座儿童折扣/人
+  infantPriceCny: number; // 该套餐配置的婴儿价/人
   singleSupplementTotal: number; // = singleCount × rate × nights
   businessUpgradeTotal: number; // = businessCount × rate × legs
-  total: number; // 两项之和
+  childSeatDiscountTotal: number; // = childCount × childSeatDiscountCnyPerPerson（机票折扣，负向计入套餐行）
+  infantPriceTotal: number; // = infantCount × infantPriceCny（婴儿机票价，正向计入套餐行）
+  total: number; // 升级加价 + 婴儿价 − 儿童折扣 的净额（计入套餐行总额）
+}
+
+/**
+ * 套餐占座模型归一化（纯函数，向后兼容）。
+ * 优先用订单行显式三计数；缺省时用 metadata.adultCount/childCount/infantCount；
+ * 若三者都没有，则把旧的 pax（metadata.pax）或行 quantity 视为 adultCount（child/infant = 0），
+ * 保证旧客户端/旧订单的占座 + 定价与扩展前完全一致。
+ *
+ * 导出供单测与 createOrder 共用。
+ */
+export interface BundleOccupancyInput {
+  adultCount?: number;
+  childCount?: number;
+  infantCount?: number;
+  quantity?: number;
+  metadata?: Record<string, unknown>;
+}
+export interface BundleOccupancy {
+  adultCount: number;
+  childCount: number;
+  infantCount: number;
+  seatPax: number; // adult + child（占座）
+  headCount: number; // adult + child + infant（出行人）
+  rooms: number; // ceil(seatPax / 2)
+}
+export function resolveBundleOccupancy(item: BundleOccupancyInput): BundleOccupancy {
+  const meta = bundleItemMetadataSchema.parse(item.metadata ?? {});
+  const norm = (v: number | undefined): number | undefined =>
+    v == null ? undefined : Math.max(0, Math.trunc(v));
+  // 显式行字段优先，其次 metadata 字段
+  const adultExplicit = norm(item.adultCount) ?? norm(meta.adultCount);
+  const childExplicit = norm(item.childCount) ?? norm(meta.childCount);
+  const infantExplicit = norm(item.infantCount) ?? norm(meta.infantCount);
+  const hasExplicit =
+    adultExplicit != null || childExplicit != null || infantExplicit != null;
+
+  let adultCount: number;
+  let childCount: number;
+  let infantCount: number;
+  if (hasExplicit) {
+    adultCount = adultExplicit ?? 0;
+    childCount = childExplicit ?? 0;
+    infantCount = infantExplicit ?? 0;
+  } else {
+    // 向后兼容：旧 pax（metadata.pax）或行 quantity → 全部当成成人
+    adultCount = Math.max(0, Math.trunc(meta.pax ?? item.quantity ?? 0));
+    childCount = 0;
+    infantCount = 0;
+  }
+  const seatPax = adultCount + childCount;
+  const headCount = adultCount + childCount + infantCount;
+  const rooms = Math.ceil(seatPax / 2); // 每人 0.5 间；婴儿不占房
+  return { adultCount, childCount, infantCount, seatPax, headCount, rooms };
 }
 
 /**
@@ -1551,14 +1633,21 @@ export function computeBundleAddOn(
     hotelNights: number | null;
     singleSupplementCnyPerNight: number;
     businessUpgradeCnyPerLeg: number;
+    childSeatDiscountCnyPerPerson: number;
+    infantPriceCny: number;
     legs: number;
   },
   hotelStamp: { hotelCheckIn: Date; hotelCheckOut: Date } | null,
   singleCount: number | undefined,
   businessCount: number | undefined,
+  occupancy: BundleOccupancy,
 ): { total: number; hasAddOn: boolean; breakdown: BundleAddOnBreakdown } {
   const single = Math.max(0, Math.trunc(singleCount ?? 0));
-  const business = Math.max(0, Math.trunc(businessCount ?? 0));
+  // businessCount 不能超过占座人数（成人 + 占座儿童）；婴儿不占座、不能升舱
+  const business = Math.min(
+    Math.max(0, Math.trunc(businessCount ?? 0)),
+    occupancy.seatPax,
+  );
   // 计费晚数：优先用盖章推导的真实入住区间，否则回退套餐默认晚数（≥1）
   const nights = hotelStamp
     ? Math.max(
@@ -1569,23 +1658,48 @@ export function computeBundleAddOn(
   const legs = Math.max(1, bundle.legs);
   const singleRate = Math.max(0, bundle.singleSupplementCnyPerNight);
   const businessRate = Math.max(0, bundle.businessUpgradeCnyPerLeg);
+  const childDiscountRate = Math.max(0, bundle.childSeatDiscountCnyPerPerson);
+  const infantRate = Math.max(0, bundle.infantPriceCny);
 
   const singleSupplementTotal = single * singleRate * nights;
   const businessUpgradeTotal = business * businessRate * legs;
-  const total = singleSupplementTotal + businessUpgradeTotal;
+  // 占座儿童机票按成人价减折扣 → 套餐行净减 childCount × 折扣
+  const childSeatDiscountTotal = occupancy.childCount * childDiscountRate;
+  // 不占座婴儿机票收婴儿价（不走经济舱全价）→ 套餐行净加 infantCount × 婴儿价
+  const infantPriceTotal = occupancy.infantCount * infantRate;
+  // 升级加价 + 婴儿价 − 儿童折扣（向上夹到 0，避免套餐行出现负总额）
+  const total = Math.max(
+    0,
+    singleSupplementTotal + businessUpgradeTotal + infantPriceTotal - childSeatDiscountTotal,
+  );
 
   return {
     total,
-    hasAddOn: single > 0 || business > 0,
+    // 任一占座升级或儿童/婴儿差价存在 → 视为有 add-on（落 metadata 供运营/财务查看）
+    hasAddOn:
+      single > 0 ||
+      business > 0 ||
+      childSeatDiscountTotal > 0 ||
+      infantPriceTotal > 0,
     breakdown: {
       singleCount: single,
       businessCount: business,
+      adultCount: occupancy.adultCount,
+      childCount: occupancy.childCount,
+      infantCount: occupancy.infantCount,
+      seatPax: occupancy.seatPax,
+      headCount: occupancy.headCount,
+      rooms: occupancy.rooms,
       nights,
       legs,
       singleSupplementCnyPerNight: singleRate,
       businessUpgradeCnyPerLeg: businessRate,
+      childSeatDiscountCnyPerPerson: childDiscountRate,
+      infantPriceCny: infantRate,
       singleSupplementTotal,
       businessUpgradeTotal,
+      childSeatDiscountTotal,
+      infantPriceTotal,
       total,
     },
   };
@@ -1615,9 +1729,17 @@ export function computeRequiredPassengerCount(items: OrderItemInput[]): number {
       // 往返两段共享乘客 → 取最大单段人数，不累加
       maxFlightLegQty = Math.max(maxFlightLegQty, item.quantity);
     } else if (item.kind === 'BUNDLE') {
-      // 套餐人数以 metadata.pax 为准（前台带过来），缺失/异常回退到行 quantity
-      const meta = bundleItemMetadataSchema.parse(item.metadata ?? {});
-      bundlePax += meta.pax ?? item.quantity;
+      // 套餐出行人数 = 占座模型 headCount（成人 + 占座儿童 + 不占座婴儿，都需护照）。
+      // 婴儿不占座但是出行人：FLIGHT 行 quantity = seatPax（占座），required 校验按 headCount。
+      // 向后兼容：无三计数时把旧 pax / 行 quantity 当成全成人 → headCount = 旧 pax，结论与旧版一致。
+      const occupancy = resolveBundleOccupancy({
+        adultCount: item.adultCount,
+        childCount: item.childCount,
+        infantCount: item.infantCount,
+        quantity: item.quantity,
+        metadata: item.metadata,
+      });
+      bundlePax += occupancy.headCount;
     } else if (item.kind === 'VISA') {
       visaQty += item.quantity;
     } else if (item.kind === 'TRANSFER') {

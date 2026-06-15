@@ -701,6 +701,12 @@ model Bundle {
   // 注意：豪华/五星套餐（洲际半岛、四季）的单人入住房差远高于平价默认值，故 seed 里按产品上调。
   singleSupplementCnyPerNight Int @default(80)
   businessUpgradeCnyPerLeg    Int @default(700)
+  // 占座儿童 / 不占座婴儿定价（按产品可配置；运营在后台改）：
+  //   childSeatDiscountCnyPerPerson = 占座儿童比成人每人便宜多少 CNY（赵姐默认 ¥30，可改）
+  //   infantPriceCny                = 不占座婴儿每人价 CNY（默认免费 0，可改）
+  // 占座儿童与成人同占 1 座（机票按成人价减此折扣）；婴儿不占座、不占房，仍需护照。
+  childSeatDiscountCnyPerPerson Int @default(30)
+  infantPriceCny                Int @default(0)
   // 机票航段数（来回 = 2，单程 = 1）— 升舱加价 = businessUpgradeCnyPerLeg × legs × businessCount
   legs           Int      @default(2)
   soldCount      Int      @default(0) // 已售份数（展示用，seed 填充）
