@@ -25,6 +25,7 @@ import { useHotelAvailability } from '../lib/useHotelAvailability';
 import { BenefitsStrip } from '../components/BenefitsStrip';
 import { BookingNotices } from '../components/BookingNotices';
 import { HeroCarousel } from '../components/HeroCarousel';
+import { Icon, type IconName } from '../components/Icon';
 import { matchKeyword } from '../components/HomeSections';
 import { useAuth } from '../stores/auth';
 import { useCart } from '../stores/cart';
@@ -167,8 +168,7 @@ export function BundlesPage() {
   // ── 简单选择器：出发日期（默认 +3 天）+ 人数（默认 2 人）──────────────
   const [goDate, setGoDate] = useState(todayISO(3));
   const [pax, setPax] = useState(2);
-  // 库存查询用防抖日期（边改日期边查后台，不每次 onChange 都打 API）
-  const debouncedGoDate = useDebouncedValue(goDate);
+  // 顶部选择器为各卡默认出发日期；每张卡内部各自防抖查询库存/价格。
 
   // 套餐关键字搜索（名称 / 行项 / 酒店名，防抖 300ms）
   // 首页套餐卡深链 /bundles?kw=xxx → 挂载时预填搜索框，落地即过滤
@@ -240,7 +240,9 @@ export function BundlesPage() {
 
       <section className="space-y-4">
         <div className="flex items-end justify-between">
-          <h2 className="section-title">🎁 一价全含套餐</h2>
+          <h2 className="section-title inline-flex items-center gap-2">
+            <Icon name="gift" className="h-5 w-5 text-brand" />一价全含套餐
+          </h2>
           <Link to="/hotels" className="text-sm font-semibold text-brand transition-colors hover:text-brand-dark">浏览更多 →</Link>
         </div>
         {visible.length === 0 && bundles.length > 0 && (
@@ -252,7 +254,6 @@ export function BundlesPage() {
             bundle={b}
             flightCache={flightCache}
             goDate={goDate}
-            queryGoDate={debouncedGoDate}
             pax={pax}
             hotel={matchHotelForBundle(b, hotels)}
             onShowHotel={(hotel) => setHotelModal({ hotel, roomTypeName: b.hotelRoomType?.name ?? null })}
@@ -260,13 +261,13 @@ export function BundlesPage() {
               add({
                 kind: 'BUNDLE',
                 productId: b.id,
-                name: `${b.name}（${cfg.pax}人${cfg.rooms}房 · ${goDate}→${cfg.returnDate}）`,
+                name: `${b.name}（${cfg.pax}人${cfg.rooms}房 · ${cfg.goDate}→${cfg.returnDate}）`,
                 description: b.tagline,
                 emoji: b.emoji,
                 unitPrice: cfg.total,
                 qty: 1,
                 meta: {
-                  goDate,
+                  goDate: cfg.goDate,
                   returnDate: cfg.returnDate,
                   pax: cfg.pax,
                   rooms: cfg.rooms,
@@ -300,6 +301,7 @@ export function BundlesPage() {
 interface BundleAddConfig {
   pax: number;
   rooms: number;
+  goDate: string;
   returnDate: string;
   total: number;
   flightTotal: number;
@@ -311,7 +313,6 @@ function ConfigurableBundleCard({
   bundle: b,
   flightCache,
   goDate,
-  queryGoDate,
   pax,
   hotel,
   onShowHotel,
@@ -320,7 +321,6 @@ function ConfigurableBundleCard({
   bundle: BundleView;
   flightCache: FlightSearchCache;
   goDate: string;
-  queryGoDate: string;
   pax: number;
   hotel?: Hotel;
   onShowHotel: (hotel: Hotel) => void;
@@ -328,21 +328,27 @@ function ConfigurableBundleCard({
 }) {
   const [rooms, setRooms] = useState(1); // 房间数
 
+  // 每张卡可单独改出发日期：默认跟随顶部选择器（goDate 变化时同步），用户可在卡内覆盖。
+  const [cardGoDate, setCardGoDate] = useState(goDate);
+  useEffect(() => setCardGoDate(goDate), [goDate]);
+  // 库存/价格查询用防抖日期（边改边查后台，不每次 onChange 都打 API）
+  const queryCardGo = useDebouncedValue(cardGoDate);
+
   const isBiz = b.items.some((i) => i.kind === 'FLIGHT' && i.productName.includes('商务'));
   const cabin: 'ECONOMY' | 'BUSINESS' = isBiz ? 'BUSINESS' : 'ECONOMY';
 
-  // 住宿晚数 → 回程日期。展示用 goDate（即时反馈），库存查询用防抖日期。
+  // 住宿晚数 → 回程日期。展示用 cardGoDate（即时反馈），库存查询用防抖日期。
   const nights = b.hotelNights ?? DEFAULT_NIGHTS;
-  const displayReturnDate = addDaysISO(goDate, nights);
-  const queryReturnDate = addDaysISO(queryGoDate, nights);
+  const displayReturnDate = addDaysISO(cardGoDate, nights);
+  const queryReturnDate = addDaysISO(queryCardGo, nights);
 
   // 触发去/回航段搜索（缓存幂等去重）
   useEffect(() => {
-    flightCache.ensure(ROUTE_ORIGIN, ROUTE_DEST, queryGoDate);
+    flightCache.ensure(ROUTE_ORIGIN, ROUTE_DEST, queryCardGo);
     flightCache.ensure(ROUTE_DEST, ROUTE_ORIGIN, queryReturnDate);
-  }, [flightCache, queryGoDate, queryReturnDate]);
+  }, [flightCache, queryCardGo, queryReturnDate]);
 
-  const outLeg = flightCache.get(ROUTE_ORIGIN, ROUTE_DEST, queryGoDate);
+  const outLeg = flightCache.get(ROUTE_ORIGIN, ROUTE_DEST, queryCardGo);
   const retLeg = flightCache.get(ROUTE_DEST, ROUTE_ORIGIN, queryReturnDate);
   const legs = { go: toLegInfo(outLeg), ret: toLegInfo(retLeg) };
 
@@ -350,7 +356,7 @@ function ConfigurableBundleCard({
   const retTier = legTier(retLeg, cabin);
 
   // 酒店实时房量（关联房型才查；无包房配置 → null 不展示）
-  const hotelTier = useHotelAvailability(b.hotelRoomTypeId, queryGoDate, queryReturnDate);
+  const hotelTier = useHotelAvailability(b.hotelRoomTypeId, queryCardGo, queryReturnDate);
 
   // 实时机票单人来回价（搜不到用兜底价）
   const fb = FALLBACK_PRICE[cabin];
@@ -382,12 +388,15 @@ function ConfigurableBundleCard({
   const soldOut = goTier === 'SOLD_OUT' || retTier === 'SOLD_OUT' || hotelTier === 'SOLD_OUT';
 
   // 含什么 — 接送/签证按行项判断，中文客服全套餐标配
-  const inclusions = [
-    b.items.some((i) => i.kind === 'HOTEL') ? '🏨 酒店含双早' : null,
-    b.items.some((i) => i.kind === 'TRANSFER') ? '🚐 当地接送' : null,
-    b.items.some((i) => i.kind === 'VISA') ? '🛂 签证代办' : null,
-    '🎧 中文客服',
-  ].filter((x): x is string => x !== null);
+  type Inclusion = { icon: IconName; label: string };
+  const inclusions = (
+    [
+      b.items.some((i) => i.kind === 'HOTEL') ? { icon: 'hotel', label: '酒店含双早' } : null,
+      b.items.some((i) => i.kind === 'TRANSFER') ? { icon: 'car', label: '当地接送' } : null,
+      b.items.some((i) => i.kind === 'VISA') ? { icon: 'visa', label: '签证代办' } : null,
+      { icon: 'support', label: '中文客服' },
+    ] as (Inclusion | null)[]
+  ).filter((x): x is Inclusion => x !== null);
 
   const hasUpgrades = b.singleSupplementPerNight != null || b.cabinUpgradePerLeg != null;
 
@@ -402,7 +411,9 @@ function ConfigurableBundleCard({
             onError={(e) => { e.currentTarget.style.display = 'none'; }}
           />
           <div className="pointer-events-none absolute inset-x-0 bottom-0 h-20 bg-gradient-to-t from-black/40 to-transparent" />
-          <span className="absolute left-3 top-3 text-3xl drop-shadow-md">{b.emoji}</span>
+          <span className="absolute left-3 top-3 inline-flex h-8 w-8 items-center justify-center rounded-full bg-white/85 text-brand shadow-sm backdrop-blur-sm">
+            <Icon name="package" className="h-4 w-4" />
+          </span>
           {b.groundDiscount > 0 && (
             <span className="badge-deal absolute right-3 top-3">立减 ¥{b.groundDiscount.toLocaleString()}</span>
           )}
@@ -410,7 +421,11 @@ function ConfigurableBundleCard({
       ) : null}
       <div className="p-4 md:p-5">
       <div className="flex flex-wrap items-start gap-4">
-        {!b.photo && <span className="text-4xl">{b.emoji}</span>}
+        {!b.photo && (
+          <span className="inline-flex h-10 w-10 items-center justify-center rounded-xl bg-brand-50 text-brand">
+            <Icon name="package" className="h-5 w-5" />
+          </span>
+        )}
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
             <h3 className="font-extrabold tracking-tight text-ink">{b.name}</h3>
@@ -419,7 +434,10 @@ function ConfigurableBundleCard({
           {/* 含什么 一眼看清 */}
           <div className="mt-2 flex flex-wrap gap-1.5 text-xs">
             {inclusions.map((inc) => (
-              <span key={inc} className="badge-soft">{inc}</span>
+              <span key={inc.label} className="badge-soft inline-flex items-center gap-1">
+                <Icon name={inc.icon} className="h-3.5 w-3.5 text-brand" />
+                {inc.label}
+              </span>
             ))}
           </div>
         </div>
@@ -433,9 +451,21 @@ function ConfigurableBundleCard({
         </div>
       </div>
 
-      {/* 出行日期一目了然：去 · 回 · N晚 */}
-      <div className="mt-3 inline-flex items-center gap-1 rounded-lg bg-canvas px-2.5 py-1 text-xs font-semibold text-ink">
-        🗓 {formatMonthDay(goDate)} 去 · {formatMonthDay(displayReturnDate)} 回 · {nights} 晚
+      {/* 出行日期可改：每张卡独立选出发日期，机位/房量/价格随之实时更新 */}
+      <div className="mt-3 inline-flex flex-wrap items-center gap-2 rounded-lg bg-canvas px-2.5 py-1.5 text-xs font-semibold text-ink">
+        <Icon name="calendar" className="h-4 w-4 text-brand" />
+        <label className="flex items-center gap-1.5">
+          <span className="text-ink-soft">出发</span>
+          <input
+            type="date"
+            className="input h-7 w-auto px-2 py-0.5 text-xs"
+            min={todayISO(0)}
+            value={cardGoDate}
+            onChange={(e) => setCardGoDate(e.target.value)}
+            aria-label="出发日期"
+          />
+        </label>
+        <span className="text-ink-soft">回 {formatMonthDay(displayReturnDate)} · {nights} 晚</span>
       </div>
 
       {/* 去/回航班号 + 时刻 + 实时余位档位 */}
@@ -447,7 +477,7 @@ function ConfigurableBundleCard({
               <>
                 <span className="font-medium">{legs.go.flightNumber}</span>
                 <span>
-                  {formatMonthDay(goDate)} {formatLocalTime(legs.go.departureTime, legs.go.departureTz)} →{' '}
+                  {formatMonthDay(cardGoDate)} {formatLocalTime(legs.go.departureTime, legs.go.departureTz)} →{' '}
                   {formatLocalTime(legs.go.arrivalTime, legs.go.arrivalTz)}
                 </span>
               </>
@@ -481,8 +511,9 @@ function ConfigurableBundleCard({
       {/* 酒店 + 房型（含双早 · 2人1间 · 床型尽量安排）+ 实时房量档位 */}
       {(b.hotelRoomType || hotel) && (
         <div className="mt-2 flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md bg-purple-50/70 p-2.5 text-xs text-slate-700">
-          <span>
-            🏨 <span className="font-medium">{b.hotelRoomType?.hotelName ?? hotel?.name}</span>
+          <span className="inline-flex items-center gap-1.5">
+            <Icon name="hotel" className="h-4 w-4 text-purple-600" />
+            <span className="font-medium">{b.hotelRoomType?.hotelName ?? hotel?.name}</span>
             {b.hotelRoomType?.name ? ` · ${b.hotelRoomType.name}` : ''} · 含双早 · 2 人 1 间
           </span>
           <HotelTierBadge tier={hotelTier} />
@@ -543,7 +574,7 @@ function ConfigurableBundleCard({
         </div>
         <div className="mt-1.5 flex items-end justify-between">
           <div className="text-xs text-ink-muted">
-            {pax} 人 · {rooms} 房 · {formatMonthDay(goDate)} → {formatMonthDay(displayReturnDate)}
+            {pax} 人 · {rooms} 房 · {formatMonthDay(cardGoDate)} → {formatMonthDay(displayReturnDate)}
           </div>
           <div className="flex items-baseline justify-end gap-2 text-right">
             {b.groundDiscount > 0 && (
@@ -569,7 +600,7 @@ function ConfigurableBundleCard({
           disabled={soldOut}
           title={soldOut ? '该日期已售罄，换个日期试试' : undefined}
           onClick={() =>
-            onAdd({ pax, rooms, returnDate: displayReturnDate, total, flightTotal, hotelTotal, otherTotal })
+            onAdd({ pax, rooms, goDate: cardGoDate, returnDate: displayReturnDate, total, flightTotal, hotelTotal, otherTotal })
           }
         >
           {soldOut ? '该日期已售罄' : '加入购物车'}
@@ -618,8 +649,9 @@ function HotelInfoModal({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="sticky top-0 z-10 flex items-center justify-between border-b border-slate-200/80 bg-surface/90 px-6 py-4 backdrop-blur-xl">
-          <h2 className="text-lg font-extrabold tracking-tight text-ink">
-            {hotel.emoji ?? '🏨'} {hotel.name}
+          <h2 className="inline-flex items-center gap-2 text-lg font-extrabold tracking-tight text-ink">
+            <Icon name="hotel" className="h-5 w-5 text-purple-600" />
+            {hotel.name}
           </h2>
           <button onClick={onClose} className="text-xl text-ink-muted transition-colors hover:text-ink" aria-label="关闭">×</button>
         </div>
@@ -651,11 +683,18 @@ function HotelInfoModal({
           )}
 
           <div className="flex flex-wrap items-center gap-2 text-xs">
-            <span className="badge-sun">{'★'.repeat(hotel.starRating)}</span>
+            <span className="badge-sun inline-flex items-center gap-0.5">
+              {Array.from({ length: hotel.starRating }).map((_, i) => (
+                <Icon key={i} name="star" className="h-3.5 w-3.5 text-amber-500" />
+              ))}
+            </span>
             {hotel.rating && (
               <span className="rating">{hotel.rating} / 5</span>
             )}
-            <span className="text-ink-muted">📍 {hotel.area ?? hotel.address}</span>
+            <span className="inline-flex items-center gap-1 text-ink-muted">
+              <Icon name="mapPin" className="h-3.5 w-3.5" />
+              {hotel.area ?? hotel.address}
+            </span>
           </div>
 
           {hotel.highlight && <p className="text-sm italic text-ink-soft">{hotel.highlight}</p>}

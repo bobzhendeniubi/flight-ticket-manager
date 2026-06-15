@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { type MockTransfer } from '../lib/mockData';
 import { api, type Transfer as ApiTransfer } from '../lib/api';
 import { useCart } from '../stores/cart';
+import { Icon } from '../components/Icon';
 
 function transferApiToMock(t: ApiTransfer): MockTransfer {
   return {
@@ -166,7 +167,9 @@ function BookModal(props: {
           <dl className="space-y-2.5 text-sm">
             <div className="flex justify-between">
               <dt className="text-ink-soft">车型</dt>
-              <dd className="font-medium text-ink">{transfer.emoji} {transfer.name}</dd>
+              <dd className="inline-flex items-center gap-1.5 font-medium text-ink">
+                <Icon name="car" className="h-4 w-4 text-brand" />{transfer.name}
+              </dd>
             </div>
             <div className="flex justify-between">
               <dt className="text-ink-soft">上车地址</dt>
@@ -193,8 +196,12 @@ function BookModal(props: {
         <div className="flex items-center justify-between gap-3 border-t border-slate-200/80 bg-canvas px-6 py-4">
           <button className="btn-ghost" onClick={onClose}>取消</button>
           <div className="flex gap-2">
-            <button className="btn-secondary" onClick={() => addToCart(false)}>🛒 加入购物车</button>
-            <button className="btn-deal" onClick={() => addToCart(true)}>立即购买 →</button>
+            <button className="btn-secondary inline-flex items-center gap-1.5" onClick={() => addToCart(false)}>
+              <Icon name="cart" className="h-4 w-4" />加入购物车
+            </button>
+            <button className="btn-deal inline-flex items-center gap-1.5" onClick={() => addToCart(true)}>
+              立即购买 <Icon name="arrowRight" className="h-4 w-4" />
+            </button>
           </div>
         </div>
       </div>

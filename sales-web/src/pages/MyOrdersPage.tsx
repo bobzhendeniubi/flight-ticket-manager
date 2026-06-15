@@ -25,6 +25,7 @@ import {
 } from '../lib/api';
 import { CABIN_LABEL } from '../lib/airports';
 import { useAuth } from '../stores/auth';
+import { Icon, type IconName } from '../components/Icon';
 
 const STATUS_LABEL: Record<OrderStatus, string> = {
   DRAFT: '草稿',
@@ -58,15 +59,21 @@ const STATUS_CLASS: Record<OrderStatus, string> = {
   FAILED: 'bg-rose-100 text-rose-700',
 };
 
-const KIND_EMOJI: Record<string, string> = {
-  FLIGHT: '✈️',
-  HOTEL: '🏨',
-  TRANSFER: '🚗',
-  VISA: '🛂',
-  INSURANCE: '🛡️',
-  FEE: '💰',
-  DISCOUNT: '🎟️',
+// 订单条目按 kind 映射统一线性图标（取代散落的 emoji）
+const KIND_ICON: Record<string, IconName> = {
+  FLIGHT: 'plane',
+  HOTEL: 'hotel',
+  TRANSFER: 'car',
+  VISA: 'visa',
+  INSURANCE: 'shield',
+  FEE: 'info',
+  DISCOUNT: 'ticket',
 };
+
+/** 订单条目 kind 图标（未知 kind 兜底用 package） */
+function KindIcon({ kind, className }: { kind: string; className?: string }) {
+  return <Icon name={KIND_ICON[kind] ?? 'package'} className={className ?? 'h-3.5 w-3.5'} />;
+}
 
 const CANCELLABLE = new Set<OrderStatus>(['PAID', 'PROCESSING', 'TICKETED']);
 
@@ -151,11 +158,13 @@ export function MyOrdersPage() {
   if (!token) {
     return (
       <div className="card animate-fade-up py-16 text-center">
-        <div className="mx-auto flex h-20 w-20 items-center justify-center rounded-full bg-brand-50 text-5xl">🔐</div>
+        <div className="mx-auto flex h-20 w-20 items-center justify-center rounded-full bg-brand-50 text-brand">
+          <Icon name="user" className="h-9 w-9" />
+        </div>
         <p className="mt-4 text-base font-semibold text-ink">请先登录</p>
         <p className="mt-1 text-sm text-ink-muted">登录后即可查看订单、锁位与候补</p>
-        <Link to="/login?redirect=/orders" className="btn-primary mt-5 inline-flex">
-          去登录 →
+        <Link to="/login?redirect=/orders" className="btn-primary mt-5 inline-flex items-center gap-1.5">
+          去登录 <Icon name="arrowRight" className="h-4 w-4" />
         </Link>
       </div>
     );
@@ -186,11 +195,13 @@ export function MyOrdersPage() {
 
       {!loading && !error && orders.length === 0 && (
         <div className="card animate-fade-up py-12 text-center">
-          <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-brand-50 text-3xl">🎒</div>
+          <div className="mx-auto flex h-16 w-16 items-center justify-center rounded-full bg-brand-50 text-brand">
+            <Icon name="ticket" className="h-7 w-7" />
+          </div>
           <p className="mt-3 text-base font-semibold text-ink">还没有订单</p>
           <p className="mt-1 text-sm text-ink-muted">挑一张机票或一价全含套餐，开启岘港之旅</p>
-          <Link to="/" className="btn-primary mt-4 inline-flex">
-            去看看机票 →
+          <Link to="/" className="btn-primary mt-4 inline-flex items-center gap-1.5">
+            去看看机票 <Icon name="arrowRight" className="h-4 w-4" />
           </Link>
         </div>
       )}
@@ -224,7 +235,7 @@ export function MyOrdersPage() {
             <div className="flex flex-wrap gap-x-3 gap-y-1 text-sm text-ink-soft">
               {o.items.slice(0, 3).map((it, i) => (
                 <span key={it.id} className="inline-flex items-center gap-1">
-                  {KIND_EMOJI[it.kind] ?? '📦'} {it.description}
+                  <KindIcon kind={it.kind} /> {it.description}
                   {i < Math.min(2, o.items.length - 1) && ' ·'}
                 </span>
               ))}
@@ -265,8 +276,8 @@ export function MyOrdersPage() {
                   <ul className="space-y-1.5">
                     {o.items.map((it) => (
                       <li key={it.id} className="flex items-center justify-between rounded-xl border border-slate-100 bg-surface px-3 py-2.5">
-                        <div className="text-ink">
-                          <span className="mr-1">{KIND_EMOJI[it.kind] ?? '📦'}</span>
+                        <div className="inline-flex items-center gap-1.5 text-ink">
+                          <KindIcon kind={it.kind} className="h-4 w-4 text-ink-muted" />
                           {it.description}
                           {it.quantity > 1 && <span className="text-ink-muted"> × {it.quantity}</span>}
                         </div>
@@ -369,7 +380,9 @@ function SeatLocksSection({ token }: { token: string }) {
   return (
     <section className="card space-y-2.5 border-sun/40 bg-sun-light/50">
       <header className="flex flex-wrap items-center justify-between gap-2">
-        <h2 className="flex items-center gap-1.5 text-base font-bold text-ink">🔒 我的锁位</h2>
+        <h2 className="flex items-center gap-1.5 text-base font-bold text-ink">
+          <Icon name="clock" className="h-4 w-4 text-amber-600" />我的锁位
+        </h2>
         <span className="text-xs font-medium text-amber-800">锁定有效期内完成下单即自动使用该锁位</span>
       </header>
       {error && <div className="text-sm font-medium text-deal">{error}</div>}
@@ -394,8 +407,9 @@ function SeatLocksSection({ token }: { token: string }) {
                 <span className="font-medium text-ink-soft">× {l.qty} 张</span>
               </div>
               <div className="flex items-center gap-3">
-                <span className="rating font-mono tabular-nums">
-                  ⏱ {String(mm).padStart(2, '0')}:{String(ss).padStart(2, '0')}
+                <span className="rating inline-flex items-center gap-1 font-mono tabular-nums">
+                  <Icon name="clock" className="h-3.5 w-3.5" />
+                  {String(mm).padStart(2, '0')}:{String(ss).padStart(2, '0')}
                 </span>
                 <button
                   type="button"
@@ -459,7 +473,9 @@ function WaitlistSection({ token }: { token: string }) {
   return (
     <section className="card space-y-2.5 border-brand-200 bg-brand-50/40">
       <header className="flex flex-wrap items-center justify-between gap-2">
-        <h2 className="flex items-center gap-1.5 text-base font-bold text-ink">🕐 我的候补</h2>
+        <h2 className="flex items-center gap-1.5 text-base font-bold text-ink">
+          <Icon name="clock" className="h-4 w-4 text-brand-700" />我的候补
+        </h2>
         <span className="text-xs font-medium text-brand-700">座位释放后按登记顺序通知，请保持手机畅通</span>
       </header>
       {error && <div className="text-sm font-medium text-deal">{error}</div>}
@@ -578,7 +594,10 @@ function CancelDialog({
                   {quote.items.map((it) => (
                     <li key={it.itemId} className="rounded-xl border border-slate-100 bg-surface px-2.5 py-2">
                       <div className="flex justify-between">
-                        <span className="text-ink">{KIND_EMOJI[it.kind] ?? '📦'} {it.description}</span>
+                        <span className="inline-flex items-center gap-1.5 text-ink">
+                          <KindIcon kind={it.kind} className="h-3.5 w-3.5 text-ink-muted" />
+                          {it.description}
+                        </span>
                         <span className="text-ink nums">¥{it.refundAmount.toLocaleString()}</span>
                       </div>
                       <div className="text-ink-muted">{it.reason}</div>

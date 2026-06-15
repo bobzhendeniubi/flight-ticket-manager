@@ -8,6 +8,7 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api, type Bundle, type Hotel, type Transfer } from '../lib/api';
+import { Icon, type IconName } from './Icon';
 
 /** 关键字命中：任一字段包含（不区分大小写）即命中 */
 export function matchKeyword(keyword: string, ...fields: Array<string | null | undefined>): boolean {
@@ -16,18 +17,22 @@ export function matchKeyword(keyword: string, ...fields: Array<string | null | u
   return fields.some((f) => (f ?? '').toLowerCase().includes(kw));
 }
 
-function SectionHeader({ title, sub, to, toLabel }: { title: string; sub?: string; to: string; toLabel: string }) {
+function SectionHeader({ icon, title, sub, to, toLabel }: { icon: IconName; title: string; sub?: string; to: string; toLabel: string }) {
   return (
     <div className="flex items-end justify-between gap-2">
       <div>
-        <h2 className="section-title">{title}</h2>
+        <h2 className="section-title inline-flex items-center gap-2">
+          <Icon name={icon} className="h-5 w-5 text-brand" />
+          {title}
+        </h2>
         {sub && <p className="section-sub">{sub}</p>}
       </div>
       <Link
         to={to}
-        className="inline-flex shrink-0 items-center gap-0.5 whitespace-nowrap text-sm font-semibold text-brand transition-colors hover:text-brand-dark"
+        className="group inline-flex shrink-0 items-center gap-1 whitespace-nowrap text-sm font-semibold text-brand transition-colors hover:text-brand-dark"
       >
-        {toLabel} <span aria-hidden>→</span>
+        {toLabel}
+        <Icon name="arrowRight" className="h-4 w-4 transition-transform group-hover:translate-x-0.5" />
       </Link>
     </div>
   );
@@ -80,7 +85,8 @@ export function BundlesPreviewSection({ keyword }: { keyword: string }) {
   return (
     <section>
       <SectionHeader
-        title="🎁 一价全含套餐"
+        icon="package"
+        title="一价全含套餐"
         sub="机票 + 酒店含早 + 签证 + 接送一次订齐 · 一眼看清、马上能买"
         to="/bundles"
         toLabel="全部套餐"
@@ -115,7 +121,6 @@ export function BundlesPreviewSection({ keyword }: { keyword: string }) {
                     onError={(e) => { e.currentTarget.style.display = 'none'; }}
                   />
                   <div className="pointer-events-none absolute inset-x-0 bottom-0 h-16 bg-gradient-to-t from-black/35 to-transparent" />
-                  <span className="absolute left-2.5 top-2.5 text-2xl drop-shadow-md">{b.emoji}</span>
                   {Number(b.groundDiscount) > 0 && (
                     <span className="badge-deal absolute right-2.5 top-2.5">
                       立减 ¥{Number(b.groundDiscount).toLocaleString()}
@@ -124,11 +129,15 @@ export function BundlesPreviewSection({ keyword }: { keyword: string }) {
                 </div>
               )}
               <div className="p-4">
-                <h3 className="truncate font-bold text-ink">{!b.photo ? `${b.emoji ?? '🎁'} ` : ''}{b.name}</h3>
+                <h3 className="flex items-center gap-1.5 truncate font-bold text-ink">
+                  {!b.photo && <Icon name="package" className="h-4 w-4 shrink-0 text-brand" />}
+                  <span className="truncate">{b.name}</span>
+                </h3>
                 <p className="mt-0.5 line-clamp-2 text-xs text-ink-soft">{b.tagline}</p>
                 {b.hotelRoomType && (
-                  <p className="mt-1.5 truncate text-xs text-ink-muted">
-                    🏨 {b.hotelRoomType.hotelName} · {b.hotelRoomType.name} · 含双早
+                  <p className="mt-1.5 flex items-center gap-1.5 truncate text-xs text-ink-muted">
+                    <Icon name="hotel" className="h-3.5 w-3.5 shrink-0" />
+                    <span className="truncate">{b.hotelRoomType.hotelName} · {b.hotelRoomType.name} · 含双早</span>
                   </p>
                 )}
                 {bundleFromPricePerPerson(b) > 0 && (
@@ -139,7 +148,9 @@ export function BundlesPreviewSection({ keyword }: { keyword: string }) {
                 )}
                 <div className="mt-2.5 flex items-center justify-between border-t border-slate-100 pt-2.5 text-xs">
                   <span className="text-ink-muted">{b.suitableFor}</span>
-                  <span className="font-semibold text-brand transition-colors group-hover:text-brand-dark">看详情 / 订 →</span>
+                  <span className="inline-flex items-center gap-1 font-semibold text-brand transition-colors group-hover:text-brand-dark">
+                    看详情 / 订 <Icon name="arrowRight" className="h-3.5 w-3.5" />
+                  </span>
                 </div>
               </div>
             </Link>
@@ -167,7 +178,7 @@ export function HotelsPreviewSection({ keyword }: { keyword: string }) {
 
   return (
     <section>
-      <SectionHeader title="🏨 精选酒店" sub="直签合作 · 含早可选 · 与机票打包更优惠" to="/hotels" toLabel="全部酒店" />
+      <SectionHeader icon="hotel" title="精选酒店" sub="直签合作 · 含早可选 · 与机票打包更优惠" to="/hotels" toLabel="全部酒店" />
       {visible.length === 0 ? (
         <div className="card mt-4 text-sm text-ink-soft">没有匹配"{keyword}"的酒店。</div>
       ) : (
@@ -183,13 +194,17 @@ export function HotelsPreviewSection({ keyword }: { keyword: string }) {
                     className="img-zoom h-full w-full object-cover"
                     onError={(e) => { e.currentTarget.style.display = 'none'; }}
                   />
-                  <span className="rating absolute left-2 top-2 shadow-card">★ {h.starRating}.0</span>
+                  <span className="rating absolute left-2 top-2 inline-flex items-center gap-0.5 shadow-card">
+                    <Icon name="star" className="h-3 w-3 text-amber-500" />
+                    {h.starRating}.0
+                  </span>
                 </div>
               )}
               <div className="p-3">
                 <h3 className="truncate text-sm font-bold text-ink">{h.name}</h3>
-                <p className="mt-0.5 truncate text-xs text-ink-muted">
-                  📍 {h.area ?? h.cityCode}
+                <p className="mt-0.5 flex items-center gap-1 truncate text-xs text-ink-muted">
+                  <Icon name="mapPin" className="h-3 w-3 shrink-0" />
+                  <span className="truncate">{h.area ?? h.cityCode}</span>
                 </p>
                 {h.basePrice && (
                   <p className="mt-1.5 flex items-baseline gap-1">
@@ -225,14 +240,16 @@ export function TransfersPreviewSection({ keyword }: { keyword: string }) {
 
   return (
     <section>
-      <SectionHeader title="🚐 接送 / 包车" sub="中文司机点对点 · 航班延误自动顺延" to="/transfers" toLabel="全部用车" />
+      <SectionHeader icon="car" title="接送 / 包车" sub="中文司机点对点 · 航班延误自动顺延" to="/transfers" toLabel="全部用车" />
       {visible.length === 0 ? (
         <div className="card mt-4 text-sm text-ink-soft">没有匹配"{keyword}"的用车产品。</div>
       ) : (
         <div className="mt-4 grid grid-cols-2 gap-4 lg:grid-cols-4">
           {visible.slice(0, 4).map((t) => (
             <Link key={t.id} to="/transfers" className="card-interactive group flex flex-col p-4">
-              <div className="grid h-11 w-11 place-items-center rounded-xl bg-brand-50 text-2xl">{t.emoji ?? '🚐'}</div>
+              <div className="grid h-11 w-11 place-items-center rounded-xl bg-brand-50 text-brand">
+                <Icon name="car" className="h-6 w-6" />
+              </div>
               <h3 className="mt-2 line-clamp-2 text-sm font-bold text-ink">{t.name}</h3>
               <p className="mt-0.5 truncate text-xs text-ink-muted">{t.vehicleType}</p>
               <p className="mt-1.5 flex items-baseline gap-1">

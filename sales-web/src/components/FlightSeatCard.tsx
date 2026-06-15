@@ -9,6 +9,7 @@ import { CABIN_LABEL, formatLocalDate, formatLocalTime } from '../lib/airports';
 import { formatBaggage } from '../lib/baggage';
 import { useAuth } from '../stores/auth';
 import { useCart } from '../stores/cart';
+import { Icon } from './Icon';
 
 // ─────────────────────────────────────────────────────────────────
 // 余位档位徽章 — 买家只看档位不看精确余票数（档位口径由服务端
@@ -145,7 +146,10 @@ export function FlightSeatCard({
           className="mt-1.5 text-[11px] leading-snug text-ink-soft"
           title={cabin.baggage.note ?? undefined}
         >
-          🧳 {formatBaggage(cabin.baggage)}
+          <span className="inline-flex items-center gap-1">
+            <Icon name="ticket" className="h-3 w-3 shrink-0" />
+            {formatBaggage(cabin.baggage)}
+          </span>
           {cabin.baggage.note && (
             <div className="max-w-[30ch] truncate text-[10px] text-ink-muted" title={cabin.baggage.note}>
               {cabin.baggage.note}
@@ -183,7 +187,7 @@ export function FlightSeatCard({
       {isLoggedIn && !soldOut && (
         <button
           type="button"
-          className="rounded-md border border-amber-300 bg-amber-50 px-2 py-1 text-xs text-amber-700 hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-40"
+          className="inline-flex items-center gap-1 rounded-md border border-amber-300 bg-amber-50 px-2 py-1 text-xs text-amber-700 hover:bg-amber-100 disabled:cursor-not-allowed disabled:opacity-40"
           disabled={maxLockQty < 1}
           title="先占座 10 分钟，收齐乘客姓名再下单"
           onClick={() => {
@@ -192,13 +196,14 @@ export function FlightSeatCard({
             setLockOpen((v) => !v);
           }}
         >
-          🔒 锁位
+          <Icon name="clock" className="h-3.5 w-3.5" />
+          锁位
         </button>
       )}
       {isLoggedIn && soldOut && !wlDone && (
         <button
           type="button"
-          className="rounded-md border border-sky-300 bg-sky-50 px-2 py-1 text-xs text-sky-700 hover:bg-sky-100"
+          className="inline-flex items-center gap-1 rounded-md border border-sky-300 bg-sky-50 px-2 py-1 text-xs text-sky-700 hover:bg-sky-100"
           title="留下手机号，座位释放后按先来先到通知"
           onClick={() => {
             setWlError(null);
@@ -206,7 +211,8 @@ export function FlightSeatCard({
             setWlOpen((v) => !v);
           }}
         >
-          🕐 候补登记
+          <Icon name="clock" className="h-3.5 w-3.5" />
+          候补登记
         </button>
       )}
       </div>
@@ -320,8 +326,9 @@ export function FlightSeatCard({
         </div>
       )}
       {wlDone && (
-        <div className="mt-1.5 rounded-md bg-sky-100 px-2 py-1 text-center text-xs font-medium text-sky-800">
-          ✓ 已登记候补，有位会通知你
+        <div className="mt-1.5 inline-flex w-full items-center justify-center gap-1 rounded-md bg-sky-100 px-2 py-1 text-center text-xs font-medium text-sky-800">
+          <Icon name="check" className="h-3.5 w-3.5" />
+          已登记候补，有位会通知你
         </div>
       )}
       {activeLock && (
@@ -363,7 +370,8 @@ function SeatLockChip({
   const ss = Math.floor((leftMs % 60000) / 1000);
   return (
     <div className="mt-1.5 flex items-center justify-center gap-1 rounded-md bg-amber-100 px-2 py-1 text-xs font-medium text-amber-800">
-      🔒 已锁{qty}张{' '}
+      <Icon name="clock" className="h-3.5 w-3.5" />
+      已锁{qty}张{' '}
       <strong className="font-mono tabular-nums">
         {String(mm).padStart(2, '0')}:{String(ss).padStart(2, '0')}
       </strong>

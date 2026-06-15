@@ -24,6 +24,7 @@ import {
   type SettlementStatus,
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { Icon } from '../components/Icon';
 
 const STATUS_LABEL: Record<SettlementStatus, string> = {
   DRAFT: '草稿',
@@ -191,7 +192,10 @@ export function MyCommissionsPage() {
       </section>
 
       {error && (
-        <div className="rounded-xl border border-deal/30 bg-deal-light px-3 py-2 text-sm font-medium text-deal-dark">❌ {error}</div>
+        <div className="inline-flex items-center gap-1.5 rounded-xl border border-deal/30 bg-deal-light px-3 py-2 text-sm font-medium text-deal-dark">
+          <Icon name="info" className="h-4 w-4 shrink-0" />
+          {error}
+        </div>
       )}
 
       <section className="grid gap-3 md:grid-cols-4">

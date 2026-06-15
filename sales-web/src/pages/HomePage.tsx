@@ -18,6 +18,7 @@ import {
   matchKeyword,
 } from '../components/HomeSections';
 import { useAuth } from '../stores/auth';
+import { Icon } from '../components/Icon';
 
 function todayISO(offsetDays = 1): string {
   const d = new Date();
@@ -120,14 +121,17 @@ export function HomePage() {
       {/* 产品关键字搜索（防抖过滤 航班/酒店/用车） */}
       <section>
         <label className="sr-only" htmlFor="product-keyword">搜索产品</label>
-        <input
-          id="product-keyword"
-          type="search"
-          className="input py-2.5"
-          placeholder="🔍 搜索航班 / 酒店 / 用车，如：QH9588、岘港、接送"
-          value={keyword}
-          onChange={(e) => setKeyword(e.target.value)}
-        />
+        <div className="relative">
+          <Icon name="search" className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-ink-muted" />
+          <input
+            id="product-keyword"
+            type="search"
+            className="input py-2.5 pl-9"
+            placeholder="搜索航班 / 酒店 / 用车，如：QH9588、岘港、接送"
+            value={keyword}
+            onChange={(e) => setKeyword(e.target.value)}
+          />
+        </div>
       </section>
 
       {/* 搜索表单 */}
@@ -271,7 +275,9 @@ export function HomePage() {
                 {/* 按去程/回程分组显示 */}
                 {tripType === 'roundtrip' && visibleResults.some((r) => r._leg === '去程') && (
                   <div className="flex items-center gap-2 text-sm font-semibold text-brand mt-2">
-                    <span className="rounded bg-brand/10 px-2 py-0.5">✈ 去程</span>
+                    <span className="inline-flex items-center gap-1 rounded bg-brand/10 px-2 py-0.5">
+                      <Icon name="planeDepart" className="h-3.5 w-3.5" />去程
+                    </span>
                     <span className="text-slate-500 font-normal">{origin} → {destination} · {date}</span>
                   </div>
                 )}
@@ -287,7 +293,9 @@ export function HomePage() {
                 {tripType === 'roundtrip' && visibleResults.some((r) => r._leg === '回程') && (
                   <>
                     <div className="flex items-center gap-2 text-sm font-semibold text-brand mt-4">
-                      <span className="rounded bg-brand/10 px-2 py-0.5">✈ 回程</span>
+                      <span className="inline-flex items-center gap-1 rounded bg-brand/10 px-2 py-0.5">
+                        <Icon name="planeReturn" className="h-3.5 w-3.5" />回程
+                      </span>
                       <span className="text-slate-500 font-normal">{destination} → {origin} · {returnDate}</span>
                     </div>
                     {visibleResults.filter((r) => r._leg === '回程').map((r) => (
@@ -322,7 +330,9 @@ export function HomePage() {
         <div className="mt-4 grid gap-4 md:grid-cols-2 lg:grid-cols-4">
           {DANANG_HIGHLIGHTS.map((h) => (
             <div key={h.title} className="card hover:shadow-md transition">
-              <div className="text-4xl">{h.emoji}</div>
+              <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-brand-50 text-brand">
+                <Icon name="mapPin" className="h-6 w-6" />
+              </div>
               <h3 className="mt-2 font-semibold text-slate-900">{h.title}</h3>
               <p className="mt-1 text-sm text-slate-600">{h.description}</p>
               <span className="mt-3 inline-block rounded bg-emerald-100 px-2 py-0.5 text-xs text-emerald-700">
@@ -338,23 +348,31 @@ export function HomePage() {
         <h2 className="text-lg font-bold text-slate-900">为什么选我们</h2>
         <div className="mt-4 grid gap-4 md:grid-cols-4 text-sm">
           <div>
-            <div className="text-3xl">✈️</div>
-            <h3 className="mt-1 font-semibold text-slate-900">自营直飞航班</h3>
+            <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-brand-50 text-brand">
+              <Icon name="plane" className="h-6 w-6" />
+            </div>
+            <h3 className="mt-2 font-semibold text-slate-900">自营直飞航班</h3>
             <p className="mt-1 text-slate-600">QH9588/9589 澳门 ↔ 岘港直飞 1h45m，每天 1 班</p>
           </div>
           <div>
-            <div className="text-3xl">🏨</div>
-            <h3 className="mt-1 font-semibold text-slate-900">酒店预订</h3>
+            <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-brand-50 text-brand">
+              <Icon name="hotel" className="h-6 w-6" />
+            </div>
+            <h3 className="mt-2 font-semibold text-slate-900">酒店预订</h3>
             <p className="mt-1 text-slate-600">直签合作酒店覆盖东南亚 / 中国港澳 / 全球主要城市</p>
           </div>
           <div>
-            <div className="text-3xl">🚘</div>
-            <h3 className="mt-1 font-semibold text-slate-900">机场接送 / 包车</h3>
+            <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-brand-50 text-brand">
+              <Icon name="car" className="h-6 w-6" />
+            </div>
+            <h3 className="mt-2 font-semibold text-slate-900">机场接送 / 包车</h3>
             <p className="mt-1 text-slate-600">中文司机点对点、一日游包车，航班延误自动顺延</p>
           </div>
           <div>
-            <div className="text-3xl">🛂</div>
-            <h3 className="mt-1 font-semibold text-slate-900">签证代办</h3>
+            <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-brand-50 text-brand">
+              <Icon name="visa" className="h-6 w-6" />
+            </div>
+            <h3 className="mt-2 font-semibold text-slate-900">签证代办</h3>
             <p className="mt-1 text-slate-600">东南亚 / 东北亚 / 申根，全程线上提交，最快 2 天出签</p>
           </div>
         </div>

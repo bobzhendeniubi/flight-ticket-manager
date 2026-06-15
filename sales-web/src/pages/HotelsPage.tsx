@@ -3,6 +3,18 @@ import { useNavigate } from 'react-router-dom';
 import { type MockHotel } from '../lib/mockData';
 import { api, type Hotel } from '../lib/api';
 import { useCart } from '../stores/cart';
+import { Icon } from '../components/Icon';
+
+/** 星级 → 实心星图标行（取代 '★'.repeat 文本，统一图标观感） */
+function StarRow({ count, className }: { count: number; className?: string }) {
+  return (
+    <span className={`inline-flex items-center ${className ?? ''}`}>
+      {Array.from({ length: count }).map((_, i) => (
+        <Icon key={i} name="star" className="h-3 w-3" />
+      ))}
+    </span>
+  );
+}
 
 function hotelApiToMock(h: Hotel): MockHotel {
   return {
@@ -124,13 +136,19 @@ export function HotelsPage() {
                   onError={(e) => { e.currentTarget.style.display = 'none'; }}
                 />
                 <div className="pointer-events-none absolute inset-x-0 bottom-0 h-16 bg-gradient-to-t from-black/35 to-transparent" />
-                <span className="badge-sun absolute left-3 top-3 shadow-card">{'★'.repeat(h.stars)}</span>
-                <span className="rating absolute right-3 top-3 shadow-card">{h.rating}</span>
+                <span className="badge-sun absolute left-3 top-3 shadow-card"><StarRow count={h.stars} /></span>
+                <span className="rating absolute right-3 top-3 inline-flex items-center gap-0.5 shadow-card">
+                  <Icon name="star" className="h-3 w-3 text-amber-500" />
+                  {h.rating}
+                </span>
               </div>
               <div className="flex flex-1 flex-col p-4">
                 <h3 className="font-bold text-ink">{h.name}</h3>
                 <p className="text-xs text-ink-muted">{h.nameEn}</p>
-                <p className="mt-1 text-xs text-ink-soft">📍 {h.area} · {h.reviewCount} 条评价</p>
+                <p className="mt-1 inline-flex items-center gap-1 text-xs text-ink-soft">
+                  <Icon name="mapPin" className="h-3 w-3 shrink-0" />
+                  {h.area} · {h.reviewCount} 条评价
+                </p>
                 <p className="mt-2 line-clamp-2 text-xs italic text-ink-soft">{h.highlight}</p>
                 <div className="mt-2 flex flex-wrap gap-1">
                   {h.amenities.slice(0, 3).map((a) => (
@@ -222,7 +240,10 @@ function HotelDetailModal({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="sticky top-0 z-10 flex items-center justify-between border-b border-slate-200/80 bg-surface/90 px-6 py-4 backdrop-blur-xl">
-          <h2 className="text-lg font-extrabold tracking-tight text-ink">{hotel.emoji} {hotel.name}</h2>
+          <h2 className="inline-flex items-center gap-2 text-lg font-extrabold tracking-tight text-ink">
+            <Icon name="hotel" className="h-5 w-5 text-brand" />
+            {hotel.name}
+          </h2>
           <button onClick={onClose} className="text-xl text-ink-muted transition-colors hover:text-ink">×</button>
         </div>
 
@@ -232,10 +253,15 @@ function HotelDetailModal({
           </div>
 
           <div className="flex items-center gap-2">
-            <span className="badge-sun">{'★'.repeat(hotel.stars)}</span>
-            <span className="rating">{hotel.rating} / 5</span>
+            <span className="badge-sun"><StarRow count={hotel.stars} /></span>
+            <span className="rating inline-flex items-center gap-0.5">
+              <Icon name="star" className="h-3 w-3 text-amber-500" />
+              {hotel.rating} / 5
+            </span>
             <span className="text-xs text-ink-muted">{hotel.reviewCount} 条评价</span>
-            <span className="text-xs text-ink-muted">· 📍 {hotel.area}</span>
+            <span className="inline-flex items-center gap-1 text-xs text-ink-muted">
+              · <Icon name="mapPin" className="h-3 w-3" /> {hotel.area}
+            </span>
           </div>
           <p className="text-sm italic text-ink-soft">{hotel.highlight}</p>
 
@@ -341,8 +367,12 @@ function HotelDetailModal({
             <span className="price text-xl">¥{total.toLocaleString()}</span>
           </div>
           <div className="flex gap-2">
-            <button className="btn-secondary" onClick={() => onAdd(room, rooms, false)}>🛒 加入购物车</button>
-            <button className="btn-deal" onClick={() => onAdd(room, rooms, true)}>立即购买 →</button>
+            <button className="btn-secondary inline-flex items-center gap-1.5" onClick={() => onAdd(room, rooms, false)}>
+              <Icon name="cart" className="h-4 w-4" />加入购物车
+            </button>
+            <button className="btn-deal inline-flex items-center gap-1.5" onClick={() => onAdd(room, rooms, true)}>
+              立即购买 <Icon name="arrowRight" className="h-4 w-4" />
+            </button>
           </div>
         </div>
       </div>

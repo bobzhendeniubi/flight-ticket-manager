@@ -1,15 +1,16 @@
 import { FormEvent, useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { useAuth } from '../stores/auth';
+import { Icon, type IconName } from '../components/Icon';
 
 // 沉浸式海岛 split 登录页（OTA 气质）：左侧全幅岘港海景 + 卖点，右侧登录卡
 const HERO_IMG =
   'https://images.unsplash.com/photo-1559592413-7cec4d0cae2b?auto=format&fit=crop&w=1400&q=80';
 
-const SELLING_POINTS = [
-  { icon: '✈️', text: '澳门 ⇌ 岘港 自营直飞，每天一班' },
-  { icon: '🎁', text: '机票 · 酒店含早 · 签证 · 接送一价全含' },
-  { icon: '🎧', text: '中文客服全程在线，落地无忧' },
+const SELLING_POINTS: Array<{ icon: IconName; text: string }> = [
+  { icon: 'plane', text: '澳门 ⇌ 岘港 自营直飞，每天一班' },
+  { icon: 'package', text: '机票 · 酒店含早 · 签证 · 接送一价全含' },
+  { icon: 'support', text: '中文客服全程在线，落地无忧' },
 ];
 
 export function LoginPage() {
@@ -54,7 +55,7 @@ export function LoginPage() {
         <div className="absolute inset-0 bg-gradient-to-tr from-brand-900/85 via-brand-800/55 to-brand-600/30" />
         <div className="relative flex h-44 flex-col justify-end p-6 lg:h-full lg:justify-between lg:p-12">
           <Link to="/" className="hidden items-center gap-2 text-lg font-extrabold text-white lg:flex">
-            <span aria-hidden>✈︎</span>
+            <Icon name="plane" className="h-5 w-5" />
             <span>世途旅行</span>
           </Link>
           <div className="text-white">
@@ -67,8 +68,8 @@ export function LoginPage() {
             <ul className="mt-6 hidden space-y-3 lg:block">
               {SELLING_POINTS.map((p) => (
                 <li key={p.text} className="flex items-center gap-3 text-white/90">
-                  <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-white/15 text-lg backdrop-blur">
-                    {p.icon}
+                  <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-white/15 backdrop-blur">
+                    <Icon name={p.icon} className="h-5 w-5" />
                   </span>
                   <span className="font-medium">{p.text}</span>
                 </li>
@@ -83,11 +84,11 @@ export function LoginPage() {
       <main className="flex flex-1 items-center justify-center px-5 py-10 lg:px-12">
         <div className="w-full max-w-sm animate-fade-up">
           <Link to="/" className="mb-8 flex items-center gap-2 text-xl font-extrabold text-brand lg:hidden">
-            <span aria-hidden>✈︎</span>
+            <Icon name="plane" className="h-5 w-5" />
             <span>世途旅行</span>
           </Link>
 
-          <h2 className="text-2xl font-extrabold text-ink">欢迎回来 👋</h2>
+          <h2 className="text-2xl font-extrabold text-ink">欢迎回来</h2>
           <p className="mt-1.5 text-sm text-ink-soft">登录后查看订单、继续未完成的预订。</p>
 
           <form className="mt-7 space-y-4" onSubmit={onSubmit}>

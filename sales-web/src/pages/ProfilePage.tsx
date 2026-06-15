@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api, ApiError } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { Icon } from '../components/Icon';
 
 interface FullUser {
   id: string;
@@ -52,8 +53,8 @@ export function ProfilePage() {
       <div className="card animate-fade-up">
         {/* 顶部身份卡 */}
         <div className="flex items-center gap-4">
-          <div className="flex h-16 w-16 shrink-0 items-center justify-center rounded-2xl bg-brand-50 text-3xl">
-            {user.displayName?.trim()?.[0] ?? '👤'}
+          <div className="flex h-16 w-16 shrink-0 items-center justify-center rounded-2xl bg-brand-50 text-3xl font-bold text-brand">
+            {user.displayName?.trim()?.[0] ?? <Icon name="user" className="h-7 w-7" />}
           </div>
           <div className="min-w-0">
             <h1 className="truncate text-xl font-extrabold tracking-tight text-ink">

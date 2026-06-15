@@ -6,6 +6,7 @@ import { useCart } from '../stores/cart';
 import { MobilePreviewFrame } from './MobilePreviewFrame';
 import { MobileBottomBar } from './MobileBottomBar';
 import { AiAssistant } from './AiAssistant';
+import { Icon } from './Icon';
 
 const ROLE_LABEL: Record<string, string> = {
   CUSTOMER: '客户',
@@ -74,16 +75,16 @@ export function Layout() {
             onClick={() => setMobileMenuOpen(true)}
             aria-label={t('nav.menu')}
           >
-            <span className="text-lg">☰</span>
+            <Icon name="menu" className="h-5 w-5" />
           </button>
 
           <Link to="/" className="group flex items-center gap-2.5 truncate" aria-label="世途旅行">
             <span
               aria-hidden
-              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-2xl text-base text-white shadow-lift transition-transform duration-300 group-hover:-translate-y-0.5 group-hover:rotate-3"
+              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-2xl text-white shadow-lift transition-transform duration-300 group-hover:-translate-y-0.5 group-hover:rotate-3"
               style={{ backgroundImage: 'linear-gradient(135deg, #2fb6cb 0%, #0e8aa0 60%, #0a6e80 100%)' }}
             >
-              ✈︎
+              <Icon name="plane" className="h-5 w-5" />
             </span>
             <span className="flex flex-col leading-none">
               <span className="text-base md:text-lg font-extrabold tracking-tight text-ink transition-colors group-hover:text-brand-700">世途旅行</span>
@@ -119,10 +120,10 @@ export function Layout() {
           <nav className="flex items-center gap-2 md:gap-2.5 text-sm">
             <a
               href="/?preview=mobile"
-              className="chip hidden md:inline-flex transition-colors hover:bg-brand-50 hover:text-brand-700"
+              className="chip hidden md:inline-flex items-center gap-1.5 transition-colors hover:bg-brand-50 hover:text-brand-700"
               title="以移动端视口预览（小程序端测试）"
             >
-              <span aria-hidden>📱</span>
+              <Icon name="phone" className="h-3.5 w-3.5" />
               {t('nav.miniprogramPreview')}
             </a>
             <CartButton />
@@ -177,10 +178,10 @@ export function Layout() {
                 <span className="flex items-center gap-2 font-extrabold text-ink">
                   <span
                     aria-hidden
-                    className="flex h-7 w-7 items-center justify-center rounded-xl text-white text-sm shadow-card"
+                    className="flex h-7 w-7 items-center justify-center rounded-xl text-white shadow-card"
                     style={{ backgroundImage: 'linear-gradient(135deg, #2fb6cb 0%, #0e8aa0 60%, #0a6e80 100%)' }}
                   >
-                    ✈︎
+                    <Icon name="plane" className="h-4 w-4" />
                   </span>
                   世途旅行
                 </span>
@@ -221,11 +222,13 @@ export function Layout() {
                 {/* 用户区 */}
                 {user ? (
                   <>
-                    <Link to="/orders" onClick={closeMenu} className="block rounded-xl px-3 py-2.5 text-sm font-medium text-ink-soft transition-colors hover:bg-brand-50/60 hover:text-brand-700">
-                      📋 {t('nav.myOrders')}
+                    <Link to="/orders" onClick={closeMenu} className="flex items-center gap-2 rounded-xl px-3 py-2.5 text-sm font-medium text-ink-soft transition-colors hover:bg-brand-50/60 hover:text-brand-700">
+                      <Icon name="ticket" className="h-4 w-4 text-ink-muted" />
+                      {t('nav.myOrders')}
                     </Link>
                     <Link to="/me" onClick={closeMenu} className="flex items-center gap-2 rounded-xl px-3 py-2.5 text-sm font-medium text-ink-soft transition-colors hover:bg-brand-50/60 hover:text-brand-700">
-                      <span>👤 {user.displayName ?? user.email}</span>
+                      <Icon name="user" className="h-4 w-4 text-ink-muted" />
+                      <span>{user.displayName ?? user.email}</span>
                       <span className="badge-soft">
                         {ROLE_LABEL[user.role] ?? user.role}
                       </span>
@@ -256,14 +259,15 @@ export function Layout() {
         {isAdmin && (
           <div className="border-t border-sun/25 bg-sun-light">
             <div className="mx-auto max-w-7xl px-4 py-2 text-xs text-amber-800 flex items-center justify-between gap-3">
-              <span>
-                ⓘ 您是管理员/运营，前台仅供浏览。后台操作请到{' '}
+              <span className="inline-flex items-center gap-1.5">
+                <Icon name="info" className="h-3.5 w-3.5 shrink-0" />
+                您是管理员/运营，前台仅供浏览。后台操作请到{' '}
                 <a href="http://localhost:5174" className="font-semibold underline decoration-sun underline-offset-2 transition-colors hover:text-amber-900" target="_blank" rel="noreferrer">
                   http://localhost:5174
                 </a>
               </span>
-              <a href="http://localhost:5174" target="_blank" rel="noreferrer" className="shrink-0 rounded-xl bg-sun px-2.5 py-1 font-semibold text-white shadow-card transition-all duration-200 hover:brightness-105 hover:-translate-y-px active:scale-95">
-                进入后台 →
+              <a href="http://localhost:5174" target="_blank" rel="noreferrer" className="inline-flex shrink-0 items-center gap-1 rounded-xl bg-sun px-2.5 py-1 font-semibold text-white shadow-card transition-all duration-200 hover:brightness-105 hover:-translate-y-px active:scale-95">
+                进入后台 <Icon name="arrowRight" className="h-3.5 w-3.5" />
               </a>
             </div>
           </div>
@@ -280,7 +284,7 @@ export function Layout() {
       <footer className="border-t border-slate-200/70 bg-surface text-xs text-ink-muted">
         <div className="mx-auto flex max-w-7xl flex-col items-start gap-1 px-4 py-5 pb-20 sm:flex-row sm:items-center sm:justify-between md:pb-5">
           <span className="flex items-center gap-1.5 font-semibold text-ink-soft">
-            <span aria-hidden className="text-brand-600">✈︎</span>
+            <Icon name="plane" className="h-4 w-4 text-brand-600" />
             世途旅行
           </span>
           <span>海岛专线 · 一站式预订 · M2-M5 演示版 · © {new Date().getFullYear()}</span>
@@ -308,7 +312,7 @@ function CartButton() {
       to="/cart"
       className="relative hidden md:inline-flex items-center gap-1.5 rounded-xl border border-slate-200/70 bg-white/70 px-3 py-1.5 font-semibold text-ink-soft shadow-card transition-all duration-200 hover:border-brand/40 hover:bg-brand-50/60 hover:text-brand-700 active:scale-95"
     >
-      <span aria-hidden>🛒</span>
+      <Icon name="cart" className="h-4 w-4" />
       <span className="hidden md:inline">购物车</span>
       {count > 0 && (
         <span className="absolute -top-1.5 -right-1.5 inline-flex h-5 min-w-[20px] items-center justify-center rounded-full bg-deal px-1 text-[11px] font-bold text-white shadow-deal nums">
@@ -326,7 +330,7 @@ function AddToCartToast() {
     const onAdd = (e: Event) => {
       const detail = (e as CustomEvent<{ name: string }>).detail;
       if (detail?.name) {
-        setMsg(`✅ 已加入购物车：${detail.name}`);
+        setMsg(`已加入购物车：${detail.name}`);
         setTimeout(() => setMsg(null), 1800);
       }
     };
@@ -336,7 +340,8 @@ function AddToCartToast() {
   if (!msg) return null;
   return (
     // 手机端抬高到 bottom bar 之上
-    <div className="fixed bottom-20 right-4 md:bottom-6 md:right-6 z-50 rounded-2xl bg-ink px-4 py-2.5 text-sm font-semibold text-white shadow-pop animate-fade-up">
+    <div className="fixed bottom-20 right-4 md:bottom-6 md:right-6 z-50 inline-flex items-center gap-1.5 rounded-2xl bg-ink px-4 py-2.5 text-sm font-semibold text-white shadow-pop animate-fade-up">
+      <Icon name="check" className="h-4 w-4 text-emerald-300" />
       {msg}
     </div>
   );

@@ -1,6 +1,16 @@
 import { useMemo } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
-import { useCart, KIND_INFO, isSelected } from '../stores/cart';
+import { useCart, KIND_INFO, isSelected, type CartItem } from '../stores/cart';
+import { Icon, type IconName } from '../components/Icon';
+
+/** 购物车条目按 kind 映射统一线性图标（取代存储的 emoji 渲染；不改 store 里的 emoji 字段） */
+const CART_KIND_ICON: Record<CartItem['kind'], IconName> = {
+  FLIGHT: 'plane',
+  HOTEL: 'hotel',
+  TRANSFER: 'car',
+  VISA: 'visa',
+  BUNDLE: 'package',
+};
 
 /** 金额渲染兜底：非法数值显示 '0' 而不是 NaN（白屏类反馈的修复之一） */
 function fmt(v: unknown): string {
@@ -26,11 +36,13 @@ export function CartPage() {
   if (items.length === 0) {
     return (
       <div className="card animate-fade-up py-16 text-center">
-        <div className="mx-auto flex h-20 w-20 items-center justify-center rounded-full bg-brand-50 text-5xl">🛒</div>
+        <div className="mx-auto flex h-20 w-20 items-center justify-center rounded-full bg-brand-50 text-brand">
+          <Icon name="cart" className="h-9 w-9" />
+        </div>
         <p className="mt-4 text-base font-semibold text-ink">购物车空空如也</p>
         <p className="mt-1 text-sm text-ink-muted">挑选海岛专线机票或一价全含套餐，开启你的旅程</p>
-        <Link to="/" className="btn-primary mt-5 inline-flex">
-          去搜机票 →
+        <Link to="/" className="btn-primary mt-5 inline-flex items-center gap-1.5">
+          去搜机票 <Icon name="arrowRight" className="h-4 w-4" />
         </Link>
       </div>
     );
@@ -72,8 +84,8 @@ export function CartPage() {
                   onChange={() => toggleSelected(i.id)}
                   aria-label="选择结账"
                 />
-                <div className="flex h-14 w-14 flex-shrink-0 items-center justify-center rounded-2xl bg-brand-50 text-3xl">
-                  {i.emoji}
+                <div className="flex h-14 w-14 flex-shrink-0 items-center justify-center rounded-2xl bg-brand-50 text-brand">
+                  <Icon name={CART_KIND_ICON[i.kind]} className="h-7 w-7" />
                 </div>
                 <div className="min-w-[55%] flex-1 sm:min-w-0">
                   <div className="flex items-center gap-2">
@@ -90,7 +102,10 @@ export function CartPage() {
                   {/* 套餐: 显示航班明细 */}
                   {i.kind === 'BUNDLE' && i.meta && (
                     <div className="mt-1.5 space-y-0.5 text-xs text-ink-soft">
-                      <div>✈ QH9589 澳门→岘港 {String(i.meta?.goDate ?? '')} + QH9588 回程 {String(i.meta?.returnDate ?? '')}</div>
+                      <div className="inline-flex items-center gap-1">
+                        <Icon name="plane" className="h-3 w-3 shrink-0" />
+                        QH9589 澳门→岘港 {String(i.meta?.goDate ?? '')} + QH9588 回程 {String(i.meta?.returnDate ?? '')}
+                      </div>
                       <div>
                         {Number(i.meta?.pax) || 0} 人 · {Number(i.meta?.rooms) || 1} 房 ·
                         机票 ¥{fmt(Number(i.meta?.flightTotal) || 0)} +
@@ -136,7 +151,7 @@ export function CartPage() {
                     className="flex-shrink-0 rounded-lg border border-slate-200 px-2.5 py-1.5 text-xs font-medium text-ink-soft transition hover:border-deal/50 hover:bg-deal-light hover:text-deal"
                     onClick={() => remove(i.id)}
                   >
-                    🗑 删除
+                    删除
                   </button>
                 </div>
               </li>
@@ -163,11 +178,11 @@ export function CartPage() {
               <span className="price text-2xl">¥{fmt(selectedTotal)}</span>
             </div>
             <button
-              className="btn-deal w-full"
+              className="btn-deal inline-flex w-full items-center justify-center gap-1.5"
               disabled={selectedItems.length === 0}
               onClick={() => navigate('/checkout')}
             >
-              结算所选 {selectedCount} 件 →
+              结算所选 {selectedCount} 件 <Icon name="arrowRight" className="h-4 w-4" />
             </button>
           </div>
         </aside>
@@ -181,11 +196,11 @@ export function CartPage() {
             <div className="price text-xl">¥{fmt(selectedTotal)}</div>
           </div>
           <button
-            className="btn-deal flex-shrink-0 px-6"
+            className="btn-deal inline-flex flex-shrink-0 items-center gap-1.5 px-6"
             disabled={selectedItems.length === 0}
             onClick={() => navigate('/checkout')}
           >
-            去结算 →
+            去结算 <Icon name="arrowRight" className="h-4 w-4" />
           </button>
         </div>
       </div>

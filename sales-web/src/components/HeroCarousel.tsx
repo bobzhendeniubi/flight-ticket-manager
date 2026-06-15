@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { Icon, type IconName } from './Icon';
 
 /**
  * 首页 hero 轮播 — 3 张 slide 自动播放 + 圆点切换。
@@ -12,6 +13,8 @@ const AUTO_ADVANCE_MS = 5000;
 interface HeroSlide {
   photo: string;
   gradient: string;
+  /** kicker 前的线性图标（取代原 emoji，保持 OTA 干净气质） */
+  kickerIcon: IconName;
   kicker: string;
   title: string;
   subtitle: string;
@@ -22,26 +25,29 @@ const HERO_SLIDES: HeroSlide[] = [
   {
     photo: 'https://images.unsplash.com/photo-1559592413-7cec4d0cae2b?w=1600&h=600&fit=crop',
     gradient: 'from-sky-600/85 to-emerald-500/70',
-    kicker: '✈️ 澳门出发 · 🇻🇳 岘港专线',
+    kickerIcon: 'plane',
+    kicker: '澳门出发 · 岘港专线',
     title: '澳门 ⇌ 越南 商务自由行专属',
     subtitle: '自营 QH9588 / QH9589 澳门 ↔ 岘港直飞 1h45m，每天 1 班，说走就走。',
-    chips: ['🏝️ 美溪海滩', '🌉 巴拿山', '🏮 会安古城'],
+    chips: ['美溪海滩', '巴拿山', '会安古城'],
   },
   {
     photo: 'https://images.unsplash.com/photo-1582719508461-905c673771fd?w=1600&h=600&fit=crop',
     gradient: 'from-emerald-600/85 to-teal-500/70',
-    kicker: '🎁 全包套餐 · 明白消费',
+    kickerIcon: 'package',
+    kicker: '全包套餐 · 明白消费',
     title: '一价全含 · 拎包出发',
     subtitle: '往返机票 · 签证 · 酒店含早 · 中文客服 · 当地接送，一次订齐不操心。',
-    chips: ['🏨 酒店含双早', '🛂 签证代办', '🚐 当地接送'],
+    chips: ['酒店含双早', '签证代办', '当地接送'],
   },
   {
     photo: 'https://images.unsplash.com/photo-1540541338287-41700207dee6?w=1600&h=600&fit=crop',
     gradient: 'from-indigo-600/85 to-sky-500/70',
-    kicker: '💎 会员福利',
+    kickerIcon: 'sparkles',
+    kicker: '会员福利',
     title: '福利享不停',
     subtitle: '澳门免费接送机 · 中文客服全程护航 · 会员积分体系筹备中。',
-    chips: ['🚐 澳门免费接送机', '🎧 中文客服全程护航', '⏳ 积分体系筹备中'],
+    chips: ['澳门免费接送机', '中文客服全程护航', '积分体系筹备中'],
   },
 ];
 
@@ -85,7 +91,8 @@ export function HeroCarousel({ greeting }: { greeting?: string | null }) {
             />
             <div className={`absolute inset-0 bg-gradient-to-br ${s.gradient}`} />
             <div className="relative flex min-h-[240px] flex-col justify-center p-6 pb-11 text-white md:min-h-[300px] md:p-12 md:pb-14">
-              <div className="inline-flex w-fit items-center rounded-full bg-white/15 px-3 py-1 text-xs font-semibold text-white/95 backdrop-blur md:text-sm">
+              <div className="inline-flex w-fit items-center gap-1.5 rounded-full bg-white/15 px-3 py-1 text-xs font-semibold text-white/95 backdrop-blur md:text-sm">
+                <Icon name={s.kickerIcon} className="h-3.5 w-3.5 md:h-4 md:w-4" />
                 {greeting ? `${greeting}，您好 · ` : ''}
                 {s.kicker}
               </div>

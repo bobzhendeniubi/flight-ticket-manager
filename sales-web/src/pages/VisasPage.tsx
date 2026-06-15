@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { type MockVisa } from '../lib/mockData';
 import { api, type Visa } from '../lib/api';
 import { useCart } from '../stores/cart';
+import { Icon } from '../components/Icon';
 
 function visaApiToMock(v: Visa): MockVisa {
   return {
@@ -93,7 +94,10 @@ export function VisasPage() {
             <h3 className="font-bold text-ink">{v.country}</h3>
             <p className="mt-0.5 text-sm text-ink-soft">{v.type}</p>
             {v.highlight && (
-              <p className="mt-1 text-xs font-semibold text-emerald-700">★ {v.highlight}</p>
+              <p className="mt-1 inline-flex items-center gap-1 text-xs font-semibold text-emerald-700">
+                <Icon name="star" className="h-3 w-3 text-amber-500" />
+                {v.highlight}
+              </p>
             )}
             <p className="mt-2 text-xs text-ink-muted">有效期 {v.validityMonths} 个月 · 需材料 {v.requiredDocs.length} 项</p>
             <div className="mt-4 flex items-end justify-between border-t border-slate-100 pt-3">
@@ -196,8 +200,12 @@ function VisaDetailModal({ visa, onClose }: { visa: MockVisa; onClose: () => voi
         <div className="sticky bottom-0 flex items-center justify-between gap-3 border-t border-slate-200/80 bg-surface/90 px-6 py-4 backdrop-blur-xl">
           <button className="btn-ghost" onClick={onClose}>取消</button>
           <div className="flex gap-2">
-            <button className="btn-secondary" onClick={() => addToCart(false)}>🛒 加入购物车</button>
-            <button className="btn-deal" onClick={() => addToCart(true)}>立即购买 →</button>
+            <button className="btn-secondary inline-flex items-center gap-1.5" onClick={() => addToCart(false)}>
+              <Icon name="cart" className="h-4 w-4" />加入购物车
+            </button>
+            <button className="btn-deal inline-flex items-center gap-1.5" onClick={() => addToCart(true)}>
+              立即购买 <Icon name="arrowRight" className="h-4 w-4" />
+            </button>
           </div>
         </div>
       </div>

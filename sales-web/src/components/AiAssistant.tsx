@@ -18,6 +18,7 @@ import { useCart } from '../stores/cart';
 import { useAuth } from '../stores/auth';
 import { usePassengers, type OcrPassenger } from '../stores/passengers';
 import { ocrPassport } from '../lib/passportOcr';
+import { Icon, type IconName } from './Icon';
 
 interface DisplayMessage {
   role: 'user' | 'assistant';
@@ -375,7 +376,10 @@ export function AiAssistant() {
                     <div className="whitespace-pre-wrap">{m.text}</div>
                   )}
                   {m.mocked && (
-                    <div className="mt-1 text-xs opacity-70">⚙ 本地演示模式（基于规则匹配，未接 LLM）</div>
+                    <div className="mt-1 inline-flex items-center gap-1 text-xs opacity-70">
+                      <Icon name="info" className="h-3 w-3" />
+                      本地演示模式（基于规则匹配，未接 LLM）
+                    </div>
                   )}
                 </div>
                 {m.proposals?.map((p, pi) => (
@@ -437,27 +441,30 @@ export function AiAssistant() {
                         quickAction('好的，给我详细信息（出发到达时间、行李、退改条款都给我说一下）');
                       }
                     }}
-                    className={`flex-1 min-w-[80px] text-xs rounded-md border px-2 py-1.5 ${
+                    className={`flex-1 min-w-[80px] inline-flex items-center justify-center gap-1 text-xs rounded-md border px-2 py-1.5 ${
                       lastProposal
                         ? 'border-emerald-500 bg-emerald-600 text-white hover:bg-emerald-700'
                         : 'border-emerald-300 bg-emerald-50 text-emerald-800 hover:bg-emerald-100'
                     }`}
                   >
-                    {lastProposal ? '✅ 确认下单' : '👌 OK · 看详情'}
+                    <Icon name="check" className="h-3.5 w-3.5" />
+                    {lastProposal ? '确认下单' : 'OK · 看详情'}
                   </button>
                   <button
                     type="button"
                     onClick={() => setActionMenu('add')}
-                    className="flex-1 min-w-[80px] text-xs rounded-md border border-blue-300 bg-blue-50 px-2 py-1.5 text-blue-800 hover:bg-blue-100"
+                    className="flex-1 min-w-[80px] inline-flex items-center justify-center gap-1 text-xs rounded-md border border-blue-300 bg-blue-50 px-2 py-1.5 text-blue-800 hover:bg-blue-100"
                   >
-                    ➕ 再加点
+                    <Icon name="cart" className="h-3.5 w-3.5" />
+                    再加点
                   </button>
                   <button
                     type="button"
                     onClick={() => setActionMenu('modify')}
-                    className="flex-1 min-w-[80px] text-xs rounded-md border border-amber-300 bg-amber-50 px-2 py-1.5 text-amber-800 hover:bg-amber-100"
+                    className="flex-1 min-w-[80px] inline-flex items-center justify-center gap-1 text-xs rounded-md border border-amber-300 bg-amber-50 px-2 py-1.5 text-amber-800 hover:bg-amber-100"
                   >
-                    ✏️ 要改
+                    <Icon name="info" className="h-3.5 w-3.5" />
+                    要改
                   </button>
                 </div>
               )}
@@ -474,10 +481,10 @@ export function AiAssistant() {
                     </button>
                   </div>
                   <div className="flex flex-wrap gap-1.5">
-                    <button type="button" onClick={() => quickAction('帮我加目的地签证（每个出行人都要）')} className="text-xs rounded-md border border-blue-200 bg-white px-2 py-1.5 hover:bg-blue-50">🛂 加签证</button>
-                    <button type="button" onClick={() => quickAction('再帮我加目的地 3 晚酒店')} className="text-xs rounded-md border border-blue-200 bg-white px-2 py-1.5 hover:bg-blue-50">🏨 加酒店</button>
-                    <button type="button" onClick={() => quickAction('再帮我加机场接机一趟')} className="text-xs rounded-md border border-blue-200 bg-white px-2 py-1.5 hover:bg-blue-50">🚗 加接机</button>
-                    <button type="button" onClick={() => quickAction('有什么一价全包套餐推荐？')} className="text-xs rounded-md border border-blue-200 bg-white px-2 py-1.5 hover:bg-blue-50">🎁 看套餐</button>
+                    <button type="button" onClick={() => quickAction('帮我加目的地签证（每个出行人都要）')} className="inline-flex items-center gap-1 text-xs rounded-md border border-blue-200 bg-white px-2 py-1.5 hover:bg-blue-50"><Icon name="visa" className="h-3.5 w-3.5" />加签证</button>
+                    <button type="button" onClick={() => quickAction('再帮我加目的地 3 晚酒店')} className="inline-flex items-center gap-1 text-xs rounded-md border border-blue-200 bg-white px-2 py-1.5 hover:bg-blue-50"><Icon name="hotel" className="h-3.5 w-3.5" />加酒店</button>
+                    <button type="button" onClick={() => quickAction('再帮我加机场接机一趟')} className="inline-flex items-center gap-1 text-xs rounded-md border border-blue-200 bg-white px-2 py-1.5 hover:bg-blue-50"><Icon name="car" className="h-3.5 w-3.5" />加接机</button>
+                    <button type="button" onClick={() => quickAction('有什么一价全包套餐推荐？')} className="inline-flex items-center gap-1 text-xs rounded-md border border-blue-200 bg-white px-2 py-1.5 hover:bg-blue-50"><Icon name="package" className="h-3.5 w-3.5" />看套餐</button>
                   </div>
                 </div>
               )}
@@ -494,10 +501,10 @@ export function AiAssistant() {
                     </button>
                   </div>
                   <div className="flex flex-wrap gap-1.5">
-                    <button type="button" onClick={() => quickAction('改人数（请问当前是几人？我想改成 ___ 人）')} className="text-xs rounded-md border border-amber-200 bg-white px-2 py-1.5 hover:bg-amber-50">👥 改人数</button>
-                    <button type="button" onClick={() => quickAction('改日期，我想换一天看看')} className="text-xs rounded-md border border-amber-200 bg-white px-2 py-1.5 hover:bg-amber-50">📅 改日期</button>
-                    <button type="button" onClick={() => quickAction('我想换商务舱看看价格')} className="text-xs rounded-md border border-amber-200 bg-white px-2 py-1.5 hover:bg-amber-50">💺 换舱位</button>
-                    <button type="button" onClick={() => quickAction('再给我看看其他选项')} className="text-xs rounded-md border border-amber-200 bg-white px-2 py-1.5 hover:bg-amber-50">🔄 看别的</button>
+                    <button type="button" onClick={() => quickAction('改人数（请问当前是几人？我想改成 ___ 人）')} className="inline-flex items-center gap-1 text-xs rounded-md border border-amber-200 bg-white px-2 py-1.5 hover:bg-amber-50"><Icon name="user" className="h-3.5 w-3.5" />改人数</button>
+                    <button type="button" onClick={() => quickAction('改日期，我想换一天看看')} className="inline-flex items-center gap-1 text-xs rounded-md border border-amber-200 bg-white px-2 py-1.5 hover:bg-amber-50"><Icon name="calendar" className="h-3.5 w-3.5" />改日期</button>
+                    <button type="button" onClick={() => quickAction('我想换商务舱看看价格')} className="inline-flex items-center gap-1 text-xs rounded-md border border-amber-200 bg-white px-2 py-1.5 hover:bg-amber-50"><Icon name="ticket" className="h-3.5 w-3.5" />换舱位</button>
+                    <button type="button" onClick={() => quickAction('再给我看看其他选项')} className="inline-flex items-center gap-1 text-xs rounded-md border border-amber-200 bg-white px-2 py-1.5 hover:bg-amber-50"><Icon name="search" className="h-3.5 w-3.5" />看别的</button>
                   </div>
                 </div>
               )}
@@ -529,8 +536,9 @@ export function AiAssistant() {
             return (
               <div className="px-3 py-2 border-t-2 border-rose-400 bg-rose-50">
                 <div className="flex items-center justify-between mb-1.5">
-                  <div className="text-xs font-semibold text-rose-900">
-                    {done ? '✅ 护照已齐' : `📷 还需 ${need - uploaded} 本护照`}
+                  <div className="inline-flex items-center gap-1 text-xs font-semibold text-rose-900">
+                    <Icon name={done ? 'check' : 'user'} className="h-3.5 w-3.5" />
+                    {done ? '护照已齐' : `还需 ${need - uploaded} 本护照`}
                   </div>
                   <div className="text-xs text-rose-700">
                     已上传 <strong>{uploaded}</strong> / {need}
@@ -547,9 +555,10 @@ export function AiAssistant() {
                     <button
                       type="button"
                       onClick={() => fileRef.current?.click()}
-                      className="flex-1 rounded-md bg-rose-600 px-3 py-2 text-sm font-semibold text-white hover:bg-rose-700"
+                      className="flex-1 inline-flex items-center justify-center gap-1.5 rounded-md bg-rose-600 px-3 py-2 text-sm font-semibold text-white hover:bg-rose-700"
                     >
-                      📷 上传第 {uploaded + 1} 本护照
+                      <Icon name="user" className="h-4 w-4" />
+                      上传第 {uploaded + 1} 本护照
                     </button>
                   )}
                   <button
@@ -561,11 +570,11 @@ export function AiAssistant() {
                     }}
                     className={`rounded-md px-3 py-2 text-sm ${
                       done
-                        ? 'flex-1 bg-emerald-600 font-semibold text-white hover:bg-emerald-700'
+                        ? 'flex-1 inline-flex items-center justify-center gap-1 bg-emerald-600 font-semibold text-white hover:bg-emerald-700'
                         : 'border border-slate-300 bg-white text-slate-600 hover:bg-slate-50'
                     }`}
                   >
-                    {done ? '✓ 去结账' : '稍后填'}
+                    {done ? <><Icon name="check" className="h-3.5 w-3.5" />去结账</> : '稍后填'}
                   </button>
                 </div>
               </div>
@@ -597,9 +606,10 @@ export function AiAssistant() {
               onClick={() => fileRef.current?.click()}
               disabled={loading || !!ocrProgress}
               title="上传护照照片自动识别"
-              className="rounded-md border border-slate-300 px-2.5 py-2 text-sm hover:bg-slate-50 disabled:opacity-40"
+              aria-label="上传护照照片"
+              className="flex items-center justify-center rounded-md border border-slate-300 px-2.5 py-2 text-slate-600 hover:bg-slate-50 disabled:opacity-40"
             >
-              📎
+              <Icon name="user" className="h-4 w-4" />
             </button>
             <input
               type="text"
@@ -620,8 +630,9 @@ export function AiAssistant() {
           </form>
 
           {/* 安全提示 */}
-          <div className="px-3 pb-2 text-[10px] text-slate-400 text-center bg-white sm:rounded-b-lg">
-            ⚠️ AI 只能给你提议；真正下单需要你点确认按钮 → 填乘客信息 → 支付
+          <div className="px-3 pb-2 inline-flex w-full items-center justify-center gap-1 text-[10px] text-slate-400 text-center bg-white sm:rounded-b-lg">
+            <Icon name="info" className="h-3 w-3 shrink-0" />
+            AI 只能给你提议；真正下单需要你点确认按钮 → 填乘客信息 → 支付
           </div>
         </div>
       )}
@@ -642,16 +653,15 @@ function ProposalCard({
   const summaryText =
     items.length === 0
       ? '空草稿'
-      : items
-          .map((i) => `${i.kind === 'FLIGHT' ? '✈️' : '🛂'} ${shortItemLabel(i)}`)
-          .join(' + ');
+      : items.map((i) => shortItemLabel(i)).join(' + ');
 
   return (
     <div className="mt-2 max-w-[85%] rounded-lg border-2 border-purple-300 bg-gradient-to-br from-purple-50 to-blue-50 p-3 shadow-sm">
       <div className="flex items-center justify-between mb-2">
         <div className="flex items-center gap-2">
-          <span className="text-xs font-semibold text-purple-700 bg-purple-100 px-2 py-0.5 rounded">
-            📋 订单草稿
+          <span className="inline-flex items-center gap-1 text-xs font-semibold text-purple-700 bg-purple-100 px-2 py-0.5 rounded">
+            <Icon name="ticket" className="h-3.5 w-3.5" />
+            订单草稿
           </span>
           <span className="text-xs text-slate-500">需要你确认</span>
         </div>
@@ -685,9 +695,10 @@ function ProposalCard({
       <button
         type="button"
         onClick={onConfirm}
-        className="mt-3 w-full rounded-md bg-purple-600 py-2 text-sm font-semibold text-white hover:bg-purple-700"
+        className="mt-3 inline-flex w-full items-center justify-center gap-1.5 rounded-md bg-purple-600 py-2 text-sm font-semibold text-white hover:bg-purple-700"
       >
-        ✓ 确认加入购物车 → 去结账
+        <Icon name="check" className="h-4 w-4" />
+        确认加入购物车 → 去结账
       </button>
       <div className="mt-1 text-[10px] text-slate-400 text-center">
         加购后可改人数 / 填乘客 / 支付
@@ -714,6 +725,15 @@ function shortItemLabel(item: AiProposal['items'][number]): string {
   }
 }
 
+// 草稿条目按 kind 映射到统一线性图标（取代每行前的 emoji）
+const ITEM_KIND_ICON: Record<string, IconName> = {
+  FLIGHT: 'plane',
+  VISA: 'visa',
+  HOTEL: 'hotel',
+  TRANSFER: 'car',
+  BUNDLE: 'package',
+};
+
 function ProposalItemRow({ item }: { item: AiProposal['items'][number] }) {
   if (item.kind === 'FLIGHT') {
     const d = item.detail as {
@@ -734,8 +754,8 @@ function ProposalItemRow({ item }: { item: AiProposal['items'][number] }) {
     return (
       <div className="rounded-md bg-white/70 px-3 py-2 border border-purple-100">
         <div className="flex items-center justify-between">
-          <div className="flex items-center gap-1">
-            <span className="text-xs">✈️</span>
+          <div className="flex items-center gap-1.5">
+            <Icon name={ITEM_KIND_ICON.FLIGHT} className="h-3.5 w-3.5 text-slate-500" />
             <span className="font-semibold text-slate-900 text-sm">
               {d.flightNumber} {d.origin}→{d.destination}
             </span>
@@ -763,8 +783,8 @@ function ProposalItemRow({ item }: { item: AiProposal['items'][number] }) {
     return (
       <div className="rounded-md bg-white/70 px-3 py-2 border border-purple-100">
         <div className="flex items-center justify-between">
-          <div className="flex items-center gap-1">
-            <span className="text-xs">🛂</span>
+          <div className="flex items-center gap-1.5">
+            <Icon name={ITEM_KIND_ICON.VISA} className="h-3.5 w-3.5 text-slate-500" />
             <span className="font-semibold text-slate-900 text-sm">
               {d.country} · {d.type}
             </span>
@@ -800,11 +820,15 @@ function ProposalItemRow({ item }: { item: AiProposal['items'][number] }) {
     return (
       <div className="rounded-md bg-white/70 px-3 py-2 border border-purple-100">
         <div className="flex items-center justify-between">
-          <div className="flex items-center gap-1 min-w-0">
-            <span className="text-xs">🏨</span>
+          <div className="flex items-center gap-1.5 min-w-0">
+            <Icon name={ITEM_KIND_ICON.HOTEL} className="h-3.5 w-3.5 shrink-0 text-slate-500" />
             <span className="font-semibold text-slate-900 text-sm truncate">{d.hotelName}</span>
             {d.starRating && (
-              <span className="text-xs text-amber-500 flex-shrink-0">{'★'.repeat(d.starRating)}</span>
+              <span className="flex shrink-0 items-center text-amber-500">
+                {Array.from({ length: d.starRating }).map((_, si) => (
+                  <Icon key={si} name="star" className="h-3 w-3" />
+                ))}
+              </span>
             )}
           </div>
           <span className="text-sm font-bold text-red-600 flex-shrink-0 ml-2">
@@ -832,8 +856,8 @@ function ProposalItemRow({ item }: { item: AiProposal['items'][number] }) {
     return (
       <div className="rounded-md bg-white/70 px-3 py-2 border border-purple-100">
         <div className="flex items-center justify-between">
-          <div className="flex items-center gap-1 min-w-0">
-            <span className="text-xs">🚗</span>
+          <div className="flex items-center gap-1.5 min-w-0">
+            <Icon name={ITEM_KIND_ICON.TRANSFER} className="h-3.5 w-3.5 shrink-0 text-slate-500" />
             <span className="font-semibold text-slate-900 text-sm truncate">{item.name}</span>
           </div>
           <span className="text-sm font-bold text-red-600 flex-shrink-0 ml-2">
@@ -865,8 +889,8 @@ function ProposalItemRow({ item }: { item: AiProposal['items'][number] }) {
   return (
     <div className="rounded-md bg-white/70 px-3 py-2 border border-purple-100">
       <div className="flex items-center justify-between">
-        <div className="flex items-center gap-1 min-w-0">
-          <span className="text-xs">🎁</span>
+        <div className="flex items-center gap-1.5 min-w-0">
+          <Icon name={ITEM_KIND_ICON.BUNDLE} className="h-3.5 w-3.5 shrink-0 text-slate-500" />
           <span className="font-semibold text-slate-900 text-sm truncate">{d.bundleName}</span>
         </div>
         <span className="text-sm font-bold text-red-600 flex-shrink-0 ml-2">
@@ -885,7 +909,12 @@ function ProposalItemRow({ item }: { item: AiProposal['items'][number] }) {
           含：{d.components.map((c) => c.productName ?? c.kind).slice(0, 4).join(' / ')}
         </div>
       )}
-      {d.note && <div className="text-[10px] text-amber-600 mt-1 italic">⚠ {d.note}</div>}
+      {d.note && (
+        <div className="mt-1 inline-flex items-center gap-1 text-[10px] italic text-amber-600">
+          <Icon name="info" className="h-3 w-3 shrink-0" />
+          {d.note}
+        </div>
+      )}
     </div>
   );
 }

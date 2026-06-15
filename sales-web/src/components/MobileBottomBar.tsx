@@ -1,6 +1,7 @@
 import { NavLink } from 'react-router-dom';
 import { useAuth } from '../stores/auth';
 import { useCart } from '../stores/cart';
+import { Icon, type IconName } from './Icon';
 
 /**
  * 手机端底部导航条（≤768px 显示）— 首页 / 套餐 / 购物车（带数量）/ 我的。
@@ -10,14 +11,14 @@ export function MobileBottomBar() {
   const count = useCart((s) => s.items.reduce((sum, i) => sum + i.qty, 0));
   const user = useAuth((s) => s.user);
 
-  const tabs = [
+  const tabs: Array<{ to: string; label: string; icon: IconName; exact: boolean; badge?: number }> = [
     // 套餐落地页即首页（运营要求默认首屏）
-    { to: '/', label: '套餐', emoji: '🎁', exact: true },
-    { to: '/flights', label: '机票', emoji: '✈️', exact: false },
-    { to: '/cart', label: '购物车', emoji: '🛒', exact: false, badge: count },
+    { to: '/', label: '套餐', icon: 'package', exact: true },
+    { to: '/flights', label: '机票', icon: 'plane', exact: false },
+    { to: '/cart', label: '购物车', icon: 'cart', exact: false, badge: count },
     user
-      ? { to: '/orders', label: '订单', emoji: '📋', exact: false }
-      : { to: '/login', label: '登录', emoji: '👤', exact: false },
+      ? { to: '/orders', label: '订单', icon: 'ticket', exact: false }
+      : { to: '/login', label: '登录', icon: 'user', exact: false },
   ];
 
   return (
@@ -39,8 +40,8 @@ export function MobileBottomBar() {
               }`
             }
           >
-            <span className="relative text-lg leading-none" aria-hidden>
-              {t.emoji}
+            <span className="relative leading-none">
+              <Icon name={t.icon} className="h-5 w-5" />
               {'badge' in t && t.badge ? (
                 <span className="absolute -right-3.5 -top-1.5 inline-flex h-4 min-w-[16px] items-center justify-center rounded-full bg-deal px-1 text-[10px] font-bold text-white shadow-deal nums">
                   {t.badge > 99 ? '99+' : t.badge}
