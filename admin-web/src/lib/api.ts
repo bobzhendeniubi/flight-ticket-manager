@@ -817,6 +817,20 @@ export const api = {
       seatClasses: Array<{ cabin: CabinClass; capacity: number; basePrice: number }>;
     },
   ) => apiFetch<{ schedule: AdminSchedule }>('/flights/schedules', { method: 'POST', token, body }),
+  // 改单个班次：停用/启用 + 按舱等改价/改容量（后端守 capacity ≥ sold，否则 400）
+  updateSchedule: (
+    token: string,
+    scheduleId: string,
+    body: {
+      isActive?: boolean;
+      seatClasses?: Array<{ cabin: CabinClass; basePrice?: number; capacity?: number }>;
+    },
+  ) =>
+    apiFetch<{ schedule: AdminSchedule }>(`/flights/schedules/${scheduleId}`, {
+      method: 'PATCH',
+      token,
+      body,
+    }),
   // 行李规则（航班 × 舱等；ADMIN/STAFF 维护）
   getBaggagePolicies: (token: string, flightId: string) =>
     apiFetch<{ policies: FlightBaggagePolicy[] }>(`/flights/${flightId}/baggage-policies`, { token }),

@@ -7,7 +7,15 @@ import type {
   CreateFlightBody,
   CreateScheduleBody,
   FlightSearchQuery,
+  UpdateScheduleBody,
 } from './flights.schemas.js';
+
+const CABIN_LABEL: Record<CabinClass, string> = {
+  [CabinClass.ECONOMY]: '经济舱',
+  [CabinClass.PREMIUM_ECONOMY]: '超级经济舱',
+  [CabinClass.BUSINESS]: '商务舱',
+  [CabinClass.FIRST]: '头等舱',
+};
 
 const pricingService = new PricingService();
 
@@ -272,6 +280,96 @@ export class FlightService {
       data: { ticketingCap },
       select: { id: true, ticketingCap: true },
     });
+  }
+
+  /**
+   * 单班次编辑（月历库存视图：改价 / 改容量 / 停用启用）。
+   * 事务内：isActive 整班次改；seatClasses 按 cabin 定位逐条改 basePrice/capacity。
+   * 守卫：新容量不得低于该舱位已售（sold）；body 里的 cabin 必须存在于该班次。
+   * 返回与 listSchedules 同形（id/flightId/时间/时区/isActive/seatClasses[]）。
+   */
+  async updateSchedule(scheduleId: string, body: UpdateScheduleBody) {
+    const schedule = await prisma.flightSchedule.findUnique({
+      where: { id: scheduleId },
+      include: { seatClasses: true },
+    });
+    if (!schedule) throw new NotFoundError('班次不存在');
+
+    const seatClassByCabin = new Map(schedule.seatClasses.map((c) => [c.cabin, c]));
+    const seatUpdates = body.seatClasses ?? [];
+
+    // 先全量校验，再写库（避免部分写入）
+    for (const upd of seatUpdates) {
+      const current = seatClassByCabin.get(upd.cabin);
+      if (!current) {
+        throw new BadRequestError(`该班次没有${CABIN_LABEL[upd.cabin]}（${upd.cabin}）`);
+      }
+      if (upd.capacity !== undefined && upd.capacity < current.sold) {
+        throw new BadRequestError(
+          `${CABIN_LABEL[upd.cabin]}已售 ${current.sold}，容量不能低于 ${current.sold}`,
+        );
+      }
+    }
+
+    await prisma.$transaction(async (tx) => {
+      if (body.isActive !== undefined) {
+        await tx.flightSchedule.update({
+          where: { id: scheduleId },
+          data: { isActive: body.isActive },
+        });
+      }
+      for (const upd of seatUpdates) {
+        const current = seatClassByCabin.get(upd.cabin)!;
+        await tx.flightSeatClass.update({
+          where: { id: current.id },
+          data: {
+            ...(upd.basePrice !== undefined && { basePrice: upd.basePrice }),
+            ...(upd.capacity !== undefined && { capacity: upd.capacity }),
+          },
+        });
+      }
+    });
+
+    const updated = await prisma.flightSchedule.findUniqueOrThrow({
+      where: { id: scheduleId },
+      include: { seatClasses: true },
+    });
+    return this.serializeSchedule(updated);
+  }
+
+  /** listSchedules / updateSchedule 共用的序列化（时间 ISO、basePrice 转字符串）。 */
+  private serializeSchedule(s: {
+    id: string;
+    flightId: string;
+    departureTime: Date;
+    arrivalTime: Date;
+    departureTz: string;
+    arrivalTz: string;
+    isActive: boolean;
+    seatClasses: Array<{
+      id: string;
+      cabin: CabinClass;
+      capacity: number;
+      sold: number;
+      basePrice: Prisma.Decimal;
+    }>;
+  }) {
+    return {
+      id: s.id,
+      flightId: s.flightId,
+      departureTime: s.departureTime.toISOString(),
+      arrivalTime: s.arrivalTime.toISOString(),
+      departureTz: s.departureTz,
+      arrivalTz: s.arrivalTz,
+      isActive: s.isActive,
+      seatClasses: s.seatClasses.map((c) => ({
+        id: c.id,
+        cabin: c.cabin,
+        capacity: c.capacity,
+        sold: c.sold,
+        basePrice: c.basePrice.toString(),
+      })),
+    };
   }
 
   /** 行李规则：列出某航班全部舱等配置（ADMIN/STAFF 维护页用） */

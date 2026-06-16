@@ -8,6 +8,7 @@ import {
   createFlightBodySchema,
   createScheduleBodySchema,
   flightSearchQuerySchema,
+  updateScheduleBodySchema,
   upsertBaggagePoliciesBodySchema,
 } from './flights.schemas.js';
 
@@ -124,6 +125,18 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
         .object({ ticketingCap: z.number().int().min(1).max(600) })
         .parse(req.body);
       const schedule = await service.updateTicketingCap(scheduleId, body.ticketingCap);
+      return { schedule };
+    },
+  );
+
+  // 单班次编辑（月历库存视图：改价 / 改容量 / 停用启用）。ADMIN/STAFF 都可改。
+  app.patch(
+    '/schedules/:scheduleId',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    async (req) => {
+      const { scheduleId } = req.params as { scheduleId: string };
+      const body = updateScheduleBodySchema.parse(req.body);
+      const schedule = await service.updateSchedule(scheduleId, body);
       return { schedule };
     },
   );

@@ -214,8 +214,9 @@ export function FlightsPage() {
             {expanded === f.id && (
               <SchedulesList
                 schedules={schedulesByFlight[f.id] ?? null}
-                originTz={null}
                 flightNumber={f.flightNumber}
+                canEdit={user.role === 'ADMIN'}
+                onRefresh={() => refreshSchedules(f.id)}
               />
             )}
           </div>
@@ -225,24 +226,80 @@ export function FlightsPage() {
   );
 }
 
+// ── 日期工具：按时区取本地 YYYY-MM-DD（班次落到日历格用的 key）──────────
+// 班次 departureTime 是 UTC ISO；departureTz 决定它属于哪一"天"。
+// 用 Intl parts 取本地年月日，跟 formatLocalDate 同口径，避免 UTC slice 跨日错位。
+function localYmd(iso: string, tz: string): string {
+  try {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: tz,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).formatToParts(new Date(iso));
+    const y = parts.find((p) => p.type === 'year')?.value ?? '0000';
+    const m = parts.find((p) => p.type === 'month')?.value ?? '01';
+    const d = parts.find((p) => p.type === 'day')?.value ?? '01';
+    return `${y}-${m}-${d}`;
+  } catch {
+    return iso.slice(0, 10);
+  }
+}
+
+// 出发文件名用日期（与后端 ordersExportFilename 一致：按 UTC 转日期）
+function utcYmd(iso: string): string {
+  const d = new Date(iso);
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+}
+
+// 经济舱余位的三档色：≤20 红 / ≤40 琥珀 / 其余 绿
+function seatTone(remaining: number): { text: string; dot: string } {
+  if (remaining <= LOW_SEAT_THRESHOLD) return { text: 'text-rose-600', dot: 'bg-rose-500' };
+  if (remaining <= 40) return { text: 'text-amber-600', dot: 'bg-amber-500' };
+  return { text: 'text-emerald-600', dot: 'bg-emerald-500' };
+}
+
+function getCabin(s: AdminSchedule, cabin: CabinClass): ScheduleSeat | undefined {
+  return s.seatClasses.find((c) => c.cabin === cabin);
+}
+
+const WEEK_HEAD = ['日', '一', '二', '三', '四', '五', '六'];
+
+function monthKeyOf(date: Date): string {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+}
+
+// ── 班次：月历库存视图 + 列表（替代原"每天一行"长表）──────────────────
 function SchedulesList({
   schedules,
   flightNumber,
+  canEdit,
+  onRefresh,
 }: {
   schedules: AdminSchedule[] | null;
-  originTz: string | null;
   flightNumber: string;
+  canEdit: boolean;
+  onRefresh: () => Promise<void> | void;
 }) {
   const tokens = useAuth((s) => s.tokens);
-  const [monthFilter, setMonthFilter] = useState<string>('upcoming30');
+  const [view, setView] = useState<'calendar' | 'list'>('calendar');
+  const [showBulk, setShowBulk] = useState(false);
   const [exporting, setExporting] = useState<string | null>(null);
   const [exportErr, setExportErr] = useState<string | null>(null);
 
-  async function downloadOrdersBySchedule(
-    scheduleId: string,
-    flightNo: string,
-    departureDate: string,
-  ): Promise<void> {
+  // 班次按本地出发日分桶（一天一般一班，但允许一天多班 → 数组）
+  const byDay = useMemo(() => {
+    const map = new Map<string, AdminSchedule[]>();
+    for (const s of schedules ?? []) {
+      const key = localYmd(s.departureTime, s.departureTz);
+      const arr = map.get(key);
+      if (arr) arr.push(s);
+      else map.set(key, [s]);
+    }
+    return map;
+  }, [schedules]);
+
+  async function downloadOrdersBySchedule(scheduleId: string, departureDate: string): Promise<void> {
     if (!tokens || exporting) return;
     setExporting(scheduleId);
     setExportErr(null);
@@ -251,7 +308,7 @@ function SchedulesList({
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `订单明细_${flightNo}_${departureDate}.xlsx`;
+      a.download = `订单明细_${flightNumber}_${departureDate}.xlsx`;
       document.body.appendChild(a);
       a.click();
       a.remove();
@@ -266,11 +323,87 @@ function SchedulesList({
   if (schedules === null) return <div className="mt-3 text-sm text-ink-muted">加载班次中…</div>;
   if (schedules.length === 0) return <div className="mt-3 text-sm text-ink-muted">还没有班次。</div>;
 
-  // 构造可筛选的月份列表 (YYYY-MM)
-  const months = Array.from(
-    new Set(schedules.map((s) => s.departureTime.slice(0, 7))),
-  ).sort();
+  return (
+    <div className="mt-4 space-y-3">
+      <div className="flex flex-wrap items-center gap-3">
+        <span className="text-sm text-slate-600">共 {schedules.length} 个班次</span>
+        <span className="text-slate-300">·</span>
+        {/* 视图切换 月历 / 列表 */}
+        <div className="inline-flex rounded-md border border-slate-200 bg-white p-0.5">
+          <button
+            type="button"
+            className={`px-3 py-1 text-sm rounded transition-colors ${view === 'calendar' ? 'bg-brand text-white' : 'text-slate-600 hover:bg-slate-100'}`}
+            onClick={() => setView('calendar')}
+          >
+            📅 月历
+          </button>
+          <button
+            type="button"
+            className={`px-3 py-1 text-sm rounded transition-colors ${view === 'list' ? 'bg-brand text-white' : 'text-slate-600 hover:bg-slate-100'}`}
+            onClick={() => setView('list')}
+          >
+            📋 列表
+          </button>
+        </div>
+        {canEdit && (
+          <button
+            type="button"
+            className="btn-secondary text-sm"
+            onClick={() => setShowBulk((v) => !v)}
+          >
+            {showBulk ? '收起批量操作' : '⚡ 批量改价 / 停用'}
+          </button>
+        )}
+      </div>
 
+      {exportErr && (
+        <div className="rounded border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
+          {exportErr}
+        </div>
+      )}
+
+      {showBulk && canEdit && (
+        <BulkEditPanel
+          flightNumber={flightNumber}
+          schedules={schedules}
+          onClose={() => setShowBulk(false)}
+          onDone={onRefresh}
+        />
+      )}
+
+      {view === 'calendar' ? (
+        <MonthCalendar
+          schedules={schedules}
+          byDay={byDay}
+          canEdit={canEdit}
+          onRefresh={onRefresh}
+          exportingId={exporting}
+          onExport={downloadOrdersBySchedule}
+        />
+      ) : (
+        <SchedulesTable
+          schedules={schedules}
+          exportingId={exporting}
+          onExport={downloadOrdersBySchedule}
+        />
+      )}
+    </div>
+  );
+}
+
+// ── 列表视图（保留原表格，行为不变）─────────────────────────────────────
+function SchedulesTable({
+  schedules,
+  exportingId,
+  onExport,
+}: {
+  schedules: AdminSchedule[];
+  exportingId: string | null;
+  onExport: (scheduleId: string, departureDate: string) => void;
+}) {
+  const [monthFilter, setMonthFilter] = useState<string>('upcoming30');
+
+  const months = Array.from(new Set(schedules.map((s) => s.departureTime.slice(0, 7)))).sort();
   const now = new Date();
   const thirtyDaysLater = new Date(now.getTime() + 30 * 86400000);
 
@@ -284,10 +417,8 @@ function SchedulesList({
   });
 
   return (
-    <div className="mt-4 space-y-3">
+    <div className="space-y-3">
       <div className="flex flex-wrap items-center gap-3">
-        <span className="text-sm text-slate-600">共 {schedules.length} 个班次</span>
-        <span className="text-slate-300">·</span>
         <label className="text-sm text-slate-600">筛选:</label>
         <select
           className="input max-w-[200px]"
@@ -304,86 +435,666 @@ function SchedulesList({
         </select>
         <span className="text-xs text-slate-500">显示 {filtered.length} 条</span>
       </div>
-      {exportErr && (
-        <div className="rounded border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
-          {exportErr}
-        </div>
-      )}
       <div className="overflow-x-auto">
         <table className="table-admin">
-        <thead>
-          <tr>
-            <th className="text-left">出发</th>
-            <th className="text-left">到达</th>
-            <th className="text-left">舱位 / 余票 / 价格</th>
-            <th className="text-left">状态</th>
-            <th className="text-left">操作</th>
-          </tr>
-        </thead>
-        <tbody>
-          {filtered.map((s) => {
-            // 用 UTC 拿日期作为文件名（与后端 ordersExportFilename 保持一致；
-            // 班次入库时间是 UTC，按 UTC 转日期即可，跟时区无关）
-            const dep = new Date(s.departureTime);
-            const departureDate = `${dep.getUTCFullYear()}-${String(dep.getUTCMonth() + 1).padStart(2, '0')}-${String(dep.getUTCDate()).padStart(2, '0')}`;
-            const isExporting = exporting === s.id;
-            return (
-              <tr key={s.id}>
-                <td>
-                  <div className="font-medium text-ink">
-                    {formatLocalDate(s.departureTime, s.departureTz)} {formatLocalTime(s.departureTime, s.departureTz)}
-                  </div>
-                  <div className="text-xs text-ink-muted">{s.departureTz}</div>
-                </td>
-                <td>
-                  <div className="font-medium text-ink">
-                    {formatLocalDate(s.arrivalTime, s.arrivalTz)} {formatLocalTime(s.arrivalTime, s.arrivalTz)}
-                  </div>
-                  <div className="text-xs text-ink-muted">{s.arrivalTz}</div>
-                </td>
-                <td>
-                  <ul className="space-y-0.5">
-                    {s.seatClasses.map((c) => {
-                      const remaining = c.capacity - c.sold;
-                      const isLow = remaining <= LOW_SEAT_THRESHOLD;
-                      return (
-                        <li key={c.id}>
-                          {CABIN_LABEL[c.cabin] ?? c.cabin}:{' '}
-                          <span className={isLow ? 'font-medium text-rose-600' : 'font-medium text-ink'}>
-                            {remaining}
-                          </span>
-                          /<span className="font-medium text-ink">{c.capacity}</span> · ¥{Number(c.basePrice).toFixed(0)}
-                          {isLow && <span className="ml-1 text-xs text-rose-600">余位紧张</span>}
-                        </li>
-                      );
-                    })}
-                  </ul>
-                </td>
-                <td>
-                  {s.isActive ? (
-                    <span className="badge-success">在售</span>
-                  ) : (
-                    <span className="badge-neutral">已停</span>
-                  )}
-                </td>
-                <td>
-                  <button
-                    type="button"
-                    className="btn-secondary text-xs whitespace-nowrap"
-                    disabled={isExporting}
-                    title="下载该班次的所有订单明细（xlsx，不含成本）"
-                    onClick={() => downloadOrdersBySchedule(s.id, flightNumber, departureDate)}
-                  >
-                    {isExporting ? '导出中…' : '📋 导出整班订单'}
-                  </button>
-                </td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
+          <thead>
+            <tr>
+              <th className="text-left">出发</th>
+              <th className="text-left">到达</th>
+              <th className="text-left">舱位 / 余票 / 价格</th>
+              <th className="text-left">状态</th>
+              <th className="text-left">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map((s) => {
+              const departureDate = utcYmd(s.departureTime);
+              const isExporting = exportingId === s.id;
+              return (
+                <tr key={s.id}>
+                  <td>
+                    <div className="font-medium text-ink">
+                      {formatLocalDate(s.departureTime, s.departureTz)} {formatLocalTime(s.departureTime, s.departureTz)}
+                    </div>
+                    <div className="text-xs text-ink-muted">{s.departureTz}</div>
+                  </td>
+                  <td>
+                    <div className="font-medium text-ink">
+                      {formatLocalDate(s.arrivalTime, s.arrivalTz)} {formatLocalTime(s.arrivalTime, s.arrivalTz)}
+                    </div>
+                    <div className="text-xs text-ink-muted">{s.arrivalTz}</div>
+                  </td>
+                  <td>
+                    <ul className="space-y-0.5">
+                      {s.seatClasses.map((c) => {
+                        const remaining = c.capacity - c.sold;
+                        const isLow = remaining <= LOW_SEAT_THRESHOLD;
+                        return (
+                          <li key={c.id}>
+                            {CABIN_LABEL[c.cabin] ?? c.cabin}:{' '}
+                            <span className={isLow ? 'font-medium text-rose-600' : 'font-medium text-ink'}>
+                              {remaining}
+                            </span>
+                            /<span className="font-medium text-ink">{c.capacity}</span> · ¥{Number(c.basePrice).toFixed(0)}
+                            {isLow && <span className="ml-1 text-xs text-rose-600">余位紧张</span>}
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  </td>
+                  <td>
+                    {s.isActive ? (
+                      <span className="badge-success">在售</span>
+                    ) : (
+                      <span className="badge-neutral">已停</span>
+                    )}
+                  </td>
+                  <td>
+                    <button
+                      type="button"
+                      className="btn-secondary text-xs whitespace-nowrap"
+                      disabled={isExporting}
+                      title="下载该班次的所有订单明细（xlsx，不含成本）"
+                      onClick={() => onExport(s.id, departureDate)}
+                    >
+                      {isExporting ? '导出中…' : '📋 导出整班订单'}
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
       </div>
     </div>
+  );
+}
+
+// ── 月历视图（一次一个月，◀ ▶ 切月）─────────────────────────────────────
+function MonthCalendar({
+  schedules,
+  byDay,
+  canEdit,
+  onRefresh,
+  exportingId,
+  onExport,
+}: {
+  schedules: AdminSchedule[];
+  byDay: Map<string, AdminSchedule[]>;
+  canEdit: boolean;
+  onRefresh: () => Promise<void> | void;
+  exportingId: string | null;
+  onExport: (scheduleId: string, departureDate: string) => void;
+}) {
+  // 默认月份：当前月若有班次则当前月，否则最近一个有班次的月份
+  const defaultMonth = useMemo(() => {
+    const today = new Date();
+    const thisMonth = monthKeyOf(today);
+    const monthsWithData = Array.from(byDay.keys()).map((d) => d.slice(0, 7));
+    if (monthsWithData.includes(thisMonth)) return new Date(today.getFullYear(), today.getMonth(), 1);
+    const future = monthsWithData.filter((m) => m >= thisMonth).sort();
+    const pick = future[0] ?? monthsWithData.sort()[monthsWithData.length - 1] ?? thisMonth;
+    const [y, m] = pick.split('-').map(Number);
+    return new Date(y, m - 1, 1);
+  }, [byDay]);
+
+  const [cursor, setCursor] = useState<Date>(defaultMonth);
+  const [selectedDay, setSelectedDay] = useState<string | null>(null);
+
+  const year = cursor.getFullYear();
+  const month = cursor.getMonth(); // 0-based
+  const firstOfMonth = new Date(year, month, 1);
+  const startWeekday = firstOfMonth.getDay(); // 0 = 周日
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+
+  // 拼出 7×N 网格的每个格子（前补空、后补空）
+  const cells: Array<{ ymd: string; day: number } | null> = [];
+  for (let i = 0; i < startWeekday; i++) cells.push(null);
+  for (let d = 1; d <= daysInMonth; d++) {
+    const ymd = `${year}-${String(month + 1).padStart(2, '0')}-${String(d).padStart(2, '0')}`;
+    cells.push({ ymd, day: d });
+  }
+  while (cells.length % 7 !== 0) cells.push(null);
+
+  const monthCount = schedules.filter(
+    (s) => localYmd(s.departureTime, s.departureTz).slice(0, 7) === monthKeyOf(cursor),
+  ).length;
+
+  const todayYmd = localYmd(new Date().toISOString(), Intl.DateTimeFormat().resolvedOptions().timeZone);
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between gap-3">
+        <button
+          type="button"
+          className="btn-secondary text-sm"
+          onClick={() => {
+            setSelectedDay(null);
+            setCursor(new Date(year, month - 1, 1));
+          }}
+        >
+          ◀
+        </button>
+        <div className="text-center">
+          <div className="text-base font-semibold text-ink">
+            {year} 年 {month + 1} 月
+          </div>
+          <div className="text-xs text-ink-muted">本月 {monthCount} 个班次</div>
+        </div>
+        <button
+          type="button"
+          className="btn-secondary text-sm"
+          onClick={() => {
+            setSelectedDay(null);
+            setCursor(new Date(year, month + 1, 1));
+          }}
+        >
+          ▶
+        </button>
+      </div>
+
+      <div className="grid grid-cols-7 gap-1">
+        {WEEK_HEAD.map((w) => (
+          <div key={w} className="py-1 text-center text-xs font-medium text-ink-muted">
+            {w}
+          </div>
+        ))}
+        {cells.map((cell, idx) => {
+          if (!cell) return <div key={`empty-${idx}`} className="min-h-[64px] rounded-md bg-slate-50/40" />;
+          const daySchedules = byDay.get(cell.ymd) ?? [];
+          const hasData = daySchedules.length > 0;
+          const isToday = cell.ymd === todayYmd;
+          const isSelected = selectedDay === cell.ymd;
+
+          if (!hasData) {
+            return (
+              <div
+                key={cell.ymd}
+                className={`min-h-[64px] rounded-md border border-slate-100 bg-white p-1.5 text-xs text-ink-muted ${isToday ? 'ring-1 ring-brand/40' : ''}`}
+              >
+                <span className={isToday ? 'font-semibold text-brand' : ''}>{cell.day}</span>
+              </div>
+            );
+          }
+
+          // 一天通常一班；多班取第一班展示，点开后逐班编辑
+          const primary = daySchedules[0];
+          const econ = getCabin(primary, 'ECONOMY');
+          const remaining = econ ? econ.capacity - econ.sold : 0;
+          const tone = seatTone(remaining);
+          const allInactive = daySchedules.every((s) => !s.isActive);
+
+          return (
+            <button
+              type="button"
+              key={cell.ymd}
+              onClick={() => setSelectedDay(isSelected ? null : cell.ymd)}
+              className={`min-h-[64px] rounded-md border p-1.5 text-left transition-shadow hover:shadow-md ${
+                isSelected ? 'border-brand ring-2 ring-brand/40' : 'border-slate-200'
+              } ${allInactive ? 'bg-slate-100 opacity-70' : 'bg-white'}`}
+            >
+              <div className="flex items-center justify-between">
+                <span className={`text-xs ${isToday ? 'font-semibold text-brand' : 'text-ink-muted'}`}>
+                  {cell.day}
+                </span>
+                {allInactive && (
+                  <span className="text-[10px] leading-none text-slate-400" title="已停用">
+                    ✕
+                  </span>
+                )}
+                {daySchedules.length > 1 && (
+                  <span className="rounded bg-slate-100 px-1 text-[10px] text-slate-500">
+                    {daySchedules.length}班
+                  </span>
+                )}
+              </div>
+              {econ && (
+                <div className="mt-1 flex items-center gap-1">
+                  <span className={`inline-block h-1.5 w-1.5 rounded-full ${tone.dot}`} />
+                  <span className={`text-sm font-semibold ${tone.text}`}>{remaining}</span>
+                  <span className="text-[10px] text-ink-muted">余位</span>
+                </div>
+              )}
+              {econ && (
+                <div className="text-[11px] text-ink-soft">¥{Number(econ.basePrice).toFixed(0)}</div>
+              )}
+            </button>
+          );
+        })}
+      </div>
+
+      {selectedDay && (byDay.get(selectedDay)?.length ?? 0) > 0 && (
+        <DayCellEditor
+          ymd={selectedDay}
+          schedules={byDay.get(selectedDay) ?? []}
+          canEdit={canEdit}
+          onClose={() => setSelectedDay(null)}
+          onSaved={onRefresh}
+          exportingId={exportingId}
+          onExport={onExport}
+        />
+      )}
+    </div>
+  );
+}
+
+// ── 某一天的内联编辑器（改经济/商务价 + 停用/启用 + 导出整班订单）────────
+function DayCellEditor({
+  ymd,
+  schedules,
+  canEdit,
+  onClose,
+  onSaved,
+  exportingId,
+  onExport,
+}: {
+  ymd: string;
+  schedules: AdminSchedule[];
+  canEdit: boolean;
+  onClose: () => void;
+  onSaved: () => Promise<void> | void;
+  exportingId: string | null;
+  onExport: (scheduleId: string, departureDate: string) => void;
+}) {
+  return (
+    <section className="rounded-lg border border-brand/30 bg-slate-50 p-4">
+      <div className="flex items-center justify-between">
+        <h3 className="font-medium text-slate-900">{ymd} · {schedules.length} 个班次</h3>
+        <button type="button" className="text-slate-400 hover:text-slate-700 text-xl" onClick={onClose}>
+          ×
+        </button>
+      </div>
+      <div className="mt-3 space-y-3">
+        {schedules.map((s) => (
+          <DaySchedule
+            key={s.id}
+            schedule={s}
+            canEdit={canEdit}
+            onSaved={onSaved}
+            exportingId={exportingId}
+            onExport={onExport}
+          />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function DaySchedule({
+  schedule,
+  canEdit,
+  onSaved,
+  exportingId,
+  onExport,
+}: {
+  schedule: AdminSchedule;
+  canEdit: boolean;
+  onSaved: () => Promise<void> | void;
+  exportingId: string | null;
+  onExport: (scheduleId: string, departureDate: string) => void;
+}) {
+  const tokens = useAuth((s) => s.tokens);
+  const econ = getCabin(schedule, 'ECONOMY');
+  const biz = getCabin(schedule, 'BUSINESS');
+
+  const [econPrice, setEconPrice] = useState<number | null>(econ ? Number(econ.basePrice) : null);
+  const [bizPrice, setBizPrice] = useState<number | null>(biz ? Number(biz.basePrice) : null);
+  const [saving, setSaving] = useState(false);
+  const [toggling, setToggling] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [savedMsg, setSavedMsg] = useState<string | null>(null);
+
+  const econRemaining = econ ? econ.capacity - econ.sold : 0;
+  const tone = seatTone(econRemaining);
+  const isExporting = exportingId === schedule.id;
+  const departureDate = utcYmd(schedule.departureTime);
+
+  const onSavePrices = async () => {
+    if (!tokens || saving) return;
+    setSaving(true);
+    setErr(null);
+    setSavedMsg(null);
+    try {
+      const seatClasses: Array<{ cabin: CabinClass; basePrice?: number }> = [];
+      if (econ && econPrice != null) seatClasses.push({ cabin: 'ECONOMY', basePrice: econPrice });
+      if (biz && bizPrice != null) seatClasses.push({ cabin: 'BUSINESS', basePrice: bizPrice });
+      if (seatClasses.length === 0) {
+        setErr('没有可保存的舱位价格');
+        setSaving(false);
+        return;
+      }
+      await api.updateSchedule(tokens.accessToken, schedule.id, { seatClasses });
+      setSavedMsg('✅ 已保存');
+      await onSaved();
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : '保存失败');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const onToggle = async () => {
+    if (!tokens || toggling) return;
+    setToggling(true);
+    setErr(null);
+    setSavedMsg(null);
+    try {
+      await api.updateSchedule(tokens.accessToken, schedule.id, { isActive: !schedule.isActive });
+      await onSaved();
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : '操作失败');
+    } finally {
+      setToggling(false);
+    }
+  };
+
+  return (
+    <div className="rounded-md border border-slate-200 bg-white p-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="text-sm">
+          <span className="font-medium text-ink">
+            出发 {formatLocalTime(schedule.departureTime, schedule.departureTz)}
+          </span>
+          <span className="mx-1 text-slate-300">·</span>
+          <span className="text-ink-muted">到达 {formatLocalTime(schedule.arrivalTime, schedule.arrivalTz)}</span>
+        </div>
+        {schedule.isActive ? (
+          <span className="badge-success">在售</span>
+        ) : (
+          <span className="badge-neutral">已停</span>
+        )}
+      </div>
+
+      {/* 余位/已售（只读）*/}
+      <div className="mt-2 flex flex-wrap gap-4 text-xs">
+        {econ && (
+          <span>
+            经济舱余位 <span className={`font-semibold ${tone.text}`}>{econRemaining}</span> / {econ.capacity}
+            <span className="ml-1 text-ink-muted">（已售 {econ.sold}）</span>
+          </span>
+        )}
+        {biz && (
+          <span>
+            商务舱余位 <span className="font-semibold text-ink">{biz.capacity - biz.sold}</span> / {biz.capacity}
+            <span className="ml-1 text-ink-muted">（已售 {biz.sold}）</span>
+          </span>
+        )}
+      </div>
+
+      {/* 改价（仅 ADMIN）*/}
+      {canEdit && (
+        <div className="mt-3 grid gap-3 sm:grid-cols-2">
+          {econ && (
+            <div>
+              <label className="label">经济舱价 (¥)</label>
+              <NumberInput min={0} className="input" value={econPrice} onChange={(n) => setEconPrice(n)} />
+            </div>
+          )}
+          {biz && (
+            <div>
+              <label className="label">商务舱价 (¥)</label>
+              <NumberInput min={0} className="input" value={bizPrice} onChange={(n) => setBizPrice(n)} />
+            </div>
+          )}
+        </div>
+      )}
+
+      {err && <div className="mt-2 rounded-md bg-red-50 px-3 py-2 text-xs text-red-700">{err}</div>}
+
+      <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
+        {savedMsg && <span className="text-xs text-emerald-700">{savedMsg}</span>}
+        <button
+          type="button"
+          className="btn-secondary text-xs whitespace-nowrap"
+          disabled={isExporting}
+          title="下载该班次的所有订单明细（xlsx，不含成本）"
+          onClick={() => onExport(schedule.id, departureDate)}
+        >
+          {isExporting ? '导出中…' : '📋 导出整班订单'}
+        </button>
+        {canEdit && (
+          <>
+            <button type="button" className="btn-secondary text-xs" disabled={toggling} onClick={onToggle}>
+              {toggling ? '处理中…' : schedule.isActive ? '停用' : '启用'}
+            </button>
+            <button type="button" className="btn-primary text-xs" disabled={saving} onClick={onSavePrices}>
+              {saving ? '保存中…' : '保存价格'}
+            </button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── 批量改价 / 批量停用（日期范围 + 星期几 + 进度条；镜像 BulkScheduleForm）─
+type BulkAction = 'setPrice' | 'addAmount' | 'addPercent' | 'deactivate' | 'activate';
+type BulkCabinPick = 'ECONOMY' | 'BUSINESS' | 'ALL';
+
+function BulkEditPanel({
+  flightNumber,
+  schedules,
+  onClose,
+  onDone,
+}: {
+  flightNumber: string;
+  schedules: AdminSchedule[];
+  onClose: () => void;
+  onDone: () => Promise<void> | void;
+}) {
+  const tokens = useAuth((s) => s.tokens);
+
+  function addDays(offset: number): string {
+    const d = new Date();
+    d.setDate(d.getDate() + offset);
+    return d.toISOString().slice(0, 10);
+  }
+
+  const [startDate, setStartDate] = useState(addDays(0));
+  const [endDate, setEndDate] = useState(addDays(30));
+  const [weekdays, setWeekdays] = useState<Set<number>>(new Set([0, 1, 2, 3, 4, 5, 6]));
+  const [action, setAction] = useState<BulkAction>('setPrice');
+  const [cabinPick, setCabinPick] = useState<BulkCabinPick>('ECONOMY');
+  const [amount, setAmount] = useState<number | null>(0);
+  const [submitting, setSubmitting] = useState(false);
+  const [progress, setProgress] = useState({ done: 0, total: 0, errors: 0 });
+  const [result, setResult] = useState<string | null>(null);
+  const [errMsg, setErrMsg] = useState<string | null>(null);
+
+  const isPriceAction = action === 'setPrice' || action === 'addAmount' || action === 'addPercent';
+
+  // 命中的班次：本地出发日 ∈ [start,end] 且 星期几被选中
+  const matched = useMemo(() => {
+    if (!startDate || !endDate) return [];
+    return schedules.filter((s) => {
+      const ymd = localYmd(s.departureTime, s.departureTz);
+      if (ymd < startDate || ymd > endDate) return false;
+      const [y, m, d] = ymd.split('-').map(Number);
+      const dow = new Date(y, m - 1, d).getDay();
+      return weekdays.has(dow);
+    });
+  }, [schedules, startDate, endDate, weekdays]);
+
+  const toggleWeekday = (day: number) => {
+    setWeekdays((prev) => {
+      const next = new Set(prev);
+      if (next.has(day)) next.delete(day);
+      else next.add(day);
+      return next;
+    });
+  };
+
+  const cabinsToEdit = (s: AdminSchedule): CabinClass[] => {
+    if (cabinPick === 'ALL') return s.seatClasses.map((c) => c.cabin);
+    return getCabin(s, cabinPick) ? [cabinPick] : [];
+  };
+
+  const buildBody = (s: AdminSchedule):
+    | { isActive: boolean }
+    | { seatClasses: Array<{ cabin: CabinClass; basePrice: number }> }
+    | null => {
+    if (action === 'deactivate') return { isActive: false };
+    if (action === 'activate') return { isActive: true };
+    const cabins = cabinsToEdit(s);
+    if (cabins.length === 0) return null;
+    const amt = amount ?? 0;
+    const seatClasses = cabins.map((cabin) => {
+      const seat = getCabin(s, cabin)!;
+      const cur = Number(seat.basePrice);
+      let next = cur;
+      if (action === 'setPrice') next = amt;
+      else if (action === 'addAmount') next = cur + amt;
+      else if (action === 'addPercent') next = Math.round(cur * (1 + amt / 100));
+      return { cabin, basePrice: Math.max(0, next) };
+    });
+    return { seatClasses };
+  };
+
+  const actionLabel = (): string => {
+    const cab = cabinPick === 'ALL' ? '全部舱位' : CABIN_LABEL[cabinPick];
+    if (action === 'setPrice') return `把 ${cab} 价设为 ¥${amount ?? 0}`;
+    if (action === 'addAmount') return `${cab} 价上调 ¥${amount ?? 0}`;
+    if (action === 'addPercent') return `${cab} 价上调 ${amount ?? 0}%`;
+    if (action === 'deactivate') return '停用这些班次';
+    return '启用这些班次';
+  };
+
+  const onSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!tokens) return;
+    if (matched.length === 0) {
+      setErrMsg('没有命中的班次，检查日期范围和星期几');
+      return;
+    }
+    if (!confirm(`将对 ${matched.length} 个班次执行：${actionLabel()}，确认？`)) return;
+
+    setErrMsg(null);
+    setResult(null);
+    setSubmitting(true);
+    setProgress({ done: 0, total: matched.length, errors: 0 });
+
+    let done = 0;
+    let errors = 0;
+    let lastError = '';
+    for (const s of matched) {
+      const body = buildBody(s);
+      if (!body) {
+        done++;
+        setProgress({ done: done + errors, total: matched.length, errors });
+        continue;
+      }
+      try {
+        await api.updateSchedule(tokens.accessToken, s.id, body);
+        done++;
+      } catch (e2) {
+        errors++;
+        lastError = e2 instanceof ApiError ? e2.message : '失败';
+      }
+      setProgress({ done: done + errors, total: matched.length, errors });
+    }
+
+    setSubmitting(false);
+    setResult(`✅ 完成：成功 ${done} 个${errors > 0 ? ` · 失败 ${errors} 个（${lastError}）` : ''}`);
+    await onDone();
+  };
+
+  return (
+    <section className="rounded-lg border-2 border-brand/50 bg-brand/5 p-4">
+      <div className="flex items-center justify-between">
+        <h3 className="font-semibold text-slate-900">
+          ⚡ 批量操作 <span className="text-brand">{flightNumber}</span> 班次
+        </h3>
+        <button type="button" className="text-slate-400 hover:text-slate-700 text-xl" onClick={onClose}>
+          ×
+        </button>
+      </div>
+      <p className="text-xs text-slate-500 mt-0.5">按日期范围 + 星期几，批量改价 / 停用 / 启用现有班次</p>
+
+      <form className="mt-4 grid gap-3 md:grid-cols-4" onSubmit={onSubmit}>
+        <div>
+          <label className="label">起始日期</label>
+          <input type="date" className="input" value={startDate} onChange={(e) => setStartDate(e.target.value)} />
+        </div>
+        <div>
+          <label className="label">结束日期</label>
+          <input type="date" className="input" value={endDate} min={startDate} onChange={(e) => setEndDate(e.target.value)} />
+        </div>
+        <div className="md:col-span-2">
+          <label className="label">适用星期</label>
+          <div className="flex gap-1">
+            {WEEK_HEAD.map((d, i) => (
+              <button
+                key={i}
+                type="button"
+                className={`flex-1 py-2 rounded text-sm ${weekdays.has(i) ? 'bg-brand text-white' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'}`}
+                onClick={() => toggleWeekday(i)}
+              >
+                {d}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div>
+          <label className="label">操作</label>
+          <select className="input" value={action} onChange={(e) => setAction(e.target.value as BulkAction)}>
+            <option value="setPrice">设为指定价</option>
+            <option value="addAmount">在原价上涨 ¥X</option>
+            <option value="addPercent">涨 X%</option>
+            <option value="deactivate">停用</option>
+            <option value="activate">启用</option>
+          </select>
+        </div>
+        {isPriceAction && (
+          <>
+            <div>
+              <label className="label">舱位</label>
+              <select className="input" value={cabinPick} onChange={(e) => setCabinPick(e.target.value as BulkCabinPick)}>
+                <option value="ECONOMY">经济舱</option>
+                <option value="BUSINESS">商务舱</option>
+                <option value="ALL">全部</option>
+              </select>
+            </div>
+            <div>
+              <label className="label">
+                {action === 'setPrice' ? '目标价 (¥)' : action === 'addPercent' ? '涨幅 (%)' : '涨价 (¥)'}
+              </label>
+              <NumberInput min={0} className="input" value={amount} onChange={(n) => setAmount(n)} />
+            </div>
+          </>
+        )}
+
+        <div className="md:col-span-4 rounded-md bg-white border border-slate-200 p-3">
+          <div className="flex items-center justify-between text-sm">
+            <span className="text-slate-600">命中班次数</span>
+            <span className="text-2xl font-bold text-brand">{matched.length} 个</span>
+          </div>
+          <div className="mt-1 text-xs text-slate-500">将执行：{actionLabel()}</div>
+          {submitting && (
+            <div className="mt-2">
+              <div className="h-2 bg-slate-200 rounded-full overflow-hidden">
+                <div
+                  className="h-full bg-brand transition-all"
+                  style={{ width: `${(progress.done / Math.max(1, progress.total)) * 100}%` }}
+                />
+              </div>
+              <div className="text-xs text-slate-500 mt-1">
+                进度: {progress.done} / {progress.total} · 失败 {progress.errors}
+              </div>
+            </div>
+          )}
+          {result && <div className="mt-2 text-sm text-green-700">{result}</div>}
+          {errMsg && <div className="mt-2 text-sm text-rose-700">{errMsg}</div>}
+        </div>
+
+        <div className="md:col-span-4 flex justify-end gap-3">
+          <button type="button" className="btn-secondary" onClick={onClose}>取消</button>
+          <button type="submit" className="btn-primary" disabled={submitting || matched.length === 0}>
+            {submitting ? `处理中 ${progress.done}/${progress.total}...` : `执行（${matched.length} 个班次）`}
+          </button>
+        </div>
+      </form>
+    </section>
   );
 }
 
