@@ -2,6 +2,8 @@ import { CabinClass, Prisma, SeatLockStatus } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { BadRequestError, ConflictError, NotFoundError } from '../../lib/errors.js';
 import { PricingService } from '../pricing/pricing.service.js';
+import { parseFareBuckets } from '../pricing/pricing.schemas.js';
+import type { FareBucketsInput } from '../pricing/pricing.schemas.js';
 import type {
   BaggagePolicyItem,
   CreateFlightBody,
@@ -18,6 +20,20 @@ const CABIN_LABEL: Record<CabinClass, string> = {
 };
 
 const pricingService = new PricingService();
+
+/**
+ * 把 zod 校验过的 fareBuckets 输入折叠成 Prisma Json? 写入值。
+ * 非空数组 → 原样写入（已按给定顺序，index 0 先卖）。
+ * undefined / null / [] → Prisma.JsonNull（写 SQL NULL = 清空阶梯 = 回退自动定价）。
+ */
+function fareBucketsToPrisma(
+  input: FareBucketsInput | undefined,
+): Prisma.InputJsonValue | typeof Prisma.JsonNull {
+  if (input && input.length > 0) {
+    return input as unknown as Prisma.InputJsonValue;
+  }
+  return Prisma.JsonNull;
+}
 
 // ── 余位档位（服务端权威口径，前端只展示档位不展示精确数字）────────────────
 // 阈值（张）：>40 充足 AMPLE；16-40 偏紧 TIGHT；6-15 紧张 LOW；1-5 极少 VERY_LOW；≤0 售罄 SOLD_OUT
@@ -217,15 +233,27 @@ export class FlightService {
     return prisma.flight.update({ where: { id: flightId }, data: { isActive: !flight.isActive } });
   }
 
-  /** 管理员：列出某航班的所有班次 */
+  /**
+   * 管理员：列出某航班的所有班次。
+   * 保留 FlightSchedule 全部顶层字段（成本字段由路由层按角色脱敏）；
+   * 每个 seatClass 额外把 fareBuckets 从 Json 解析成 FareBucket[]（null=未配置），
+   * 使管理端月历库存视图可直接读/编辑仓位阶梯，basePrice 保留原 Decimal 形态不变更其它消费方。
+   */
   async listSchedules(flightId: string) {
-    return prisma.flightSchedule.findMany({
+    const schedules = await prisma.flightSchedule.findMany({
       where: { flightId },
       orderBy: { departureTime: 'asc' },
       include: {
         seatClasses: true,
       },
     });
+    return schedules.map((s) => ({
+      ...s,
+      seatClasses: s.seatClasses.map((c) => ({
+        ...c,
+        fareBuckets: parseFareBuckets(c.fareBuckets),
+      })),
+    }));
   }
 
   async createSchedule(body: CreateScheduleBody) {
@@ -263,12 +291,14 @@ export class FlightService {
             cabin: c.cabin,
             capacity: c.capacity,
             basePrice: c.basePrice,
+            // 仓位阶梯（可选）：给了非空数组就存；省略 / null / [] 存 NULL（无阶梯）
+            fareBuckets: fareBucketsToPrisma(c.fareBuckets),
           })),
         },
       },
       include: { seatClasses: true },
     });
-    return schedule;
+    return this.serializeSchedule(schedule);
   }
 
   /** 调整班次开票上限（航司临时放宽/收紧时运营改）。 */
@@ -325,6 +355,10 @@ export class FlightService {
           data: {
             ...(upd.basePrice !== undefined && { basePrice: upd.basePrice }),
             ...(upd.capacity !== undefined && { capacity: upd.capacity }),
+            // fareBuckets 给了才动：数组=设置阶梯；null / [] = 清空（写 NULL，回退自动定价）
+            ...(upd.fareBuckets !== undefined && {
+              fareBuckets: fareBucketsToPrisma(upd.fareBuckets),
+            }),
           },
         });
       }
@@ -337,7 +371,11 @@ export class FlightService {
     return this.serializeSchedule(updated);
   }
 
-  /** listSchedules / updateSchedule 共用的序列化（时间 ISO、basePrice 转字符串）。 */
+  /**
+   * listSchedules / createSchedule / updateSchedule 共用的序列化。
+   * 时间 ISO、basePrice 转字符串；fareBuckets 从 Json 安全解析（脏数据 → null）。
+   * 管理端月历库存视图据此读/编辑仓位阶梯。
+   */
   private serializeSchedule(s: {
     id: string;
     flightId: string;
@@ -352,6 +390,7 @@ export class FlightService {
       capacity: number;
       sold: number;
       basePrice: Prisma.Decimal;
+      fareBuckets?: Prisma.JsonValue | null;
     }>;
   }) {
     return {
@@ -368,6 +407,8 @@ export class FlightService {
         capacity: c.capacity,
         sold: c.sold,
         basePrice: c.basePrice.toString(),
+        // 仓位阶梯：解析过的 FareBucket[]（最便宜在前）；null = 未配置（走自动定价）
+        fareBuckets: parseFareBuckets(c.fareBuckets),
       })),
     };
   }

@@ -434,6 +434,9 @@ model FlightSeatClass {
   capacity   Int // base capacity
   sold       Int        @default(0) // source of truth; Redis is cache
   basePrice  Decimal    @db.Decimal(10, 2) // CNY
+  // 仓位阶梯（显式动态加价）：有序数组 [{ quota, price }]，最便宜的在前；售罄一档开下一档。
+  // null / [] = 未配置阶梯 = 回退旧版 basePrice×日期倍率×余位倍率自动定价。
+  fareBuckets Json?     // [{ "quota": 20, "price": 1280 }, ...]（quota int≥1, price≥0）
   createdAt  DateTime   @default(now())
   updatedAt  DateTime   @updatedAt
 

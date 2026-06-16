@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { CabinClass } from '@prisma/client';
+import { fareBucketsSchema } from '../pricing/pricing.schemas.js';
 
 // ── 搜索 ──────────────────────────────────────────────────────────────────
 export const flightSearchQuerySchema = z.object({
@@ -64,6 +65,8 @@ export const createScheduleBodySchema = z.object({
         cabin: z.nativeEnum(CabinClass),
         capacity: z.number().int().min(1).max(600),
         basePrice: z.number().positive().max(1_000_000),
+        // 仓位阶梯（可选）：[{quota,price}]，最便宜的在前；省略 / null / [] = 无阶梯
+        fareBuckets: fareBucketsSchema.optional(),
       }),
     )
     .min(1),
@@ -81,6 +84,8 @@ export const updateScheduleBodySchema = z
           cabin: z.nativeEnum(CabinClass),
           basePrice: z.number().min(0).max(1_000_000).optional(),
           capacity: z.number().int().min(0).max(600).optional(),
+          // 仓位阶梯（可选）：[{quota,price}] 设置阶梯；null / [] 清空阶梯（回退旧版自动定价）
+          fareBuckets: fareBucketsSchema.optional(),
         }),
       )
       .max(4)
@@ -91,10 +96,15 @@ export const updateScheduleBodySchema = z
             ctx.addIssue({ code: z.ZodIssueCode.custom, message: `舱等 ${item.cabin} 重复` });
           }
           seen.add(item.cabin);
-          if (item.basePrice === undefined && item.capacity === undefined) {
+          // 价格 / 容量 / 仓位阶梯，至少改一项（fareBuckets:null 视为"清空阶梯"也算一项变更）
+          if (
+            item.basePrice === undefined &&
+            item.capacity === undefined &&
+            item.fareBuckets === undefined
+          ) {
             ctx.addIssue({
               code: z.ZodIssueCode.custom,
-              message: `舱等 ${item.cabin} 至少要改价格或容量之一`,
+              message: `舱等 ${item.cabin} 至少要改价格 / 容量 / 仓位阶梯之一`,
             });
           }
         }

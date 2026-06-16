@@ -12,6 +12,8 @@
 import { CabinClass } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { BadRequestError, NotFoundError } from '../../lib/errors.js';
+import { computeLadderBreakdown } from './pricing.calc.js';
+import { parseFareBuckets } from './pricing.schemas.js';
 
 // ── 配置常量 ──────────────────────────────────────────────────────
 // 这些将来可以从 PricingConfig 表读取，目前用默认值。
@@ -38,13 +40,15 @@ export interface PriceResult {
   scheduleId: string;
   cabin: CabinClass;
   qty: number;
+  // 定价模式：LADDER=按显式仓位阶梯卖（仓位价即成交价）；AUTO=旧版 basePrice×日期倍率×余位倍率
+  pricingMode: 'LADDER' | 'AUTO';
   basePrice: number;
   dateRank: string;
-  dateMultiplier: number;
-  bucketSize: number;
-  totalBuckets: number;
-  currentBucket: number; // 下一张票所在的 bucket（基于当前 sold）
-  currentBucketRemaining: number; // 当前 bucket 剩余多少张
+  dateMultiplier: number; // LADDER 模式恒为 1（仓位价不叠日期倍率）
+  bucketSize: number; // AUTO=固定 BUCKET_SIZE；LADDER 无意义（保留字段，填 0）
+  totalBuckets: number; // AUTO=ceil(capacity/BUCKET_SIZE)；LADDER=阶梯档位数
+  currentBucket: number; // 下一张票所在的档（基于当前 sold）
+  currentBucketRemaining: number; // 当前档剩余多少张（驱动"还剩 X 张就涨价"）
   perSeatBreakdown: SeatBreakdown[];
   totalPrice: number;
   averageUnitPrice: number; // = round(totalPrice / qty)
@@ -73,7 +77,7 @@ export class PricingService {
     const { capacity, sold, basePrice: basePriceDec } = seatClass;
     const basePrice = Number(basePriceDec);
 
-    // 余票检查
+    // 余票检查（两种模式都保持这条不变 —— 容量是硬上限，与定价模式无关）
     const available = capacity - sold;
     if (qty > available) {
       throw new BadRequestError(
@@ -82,26 +86,39 @@ export class PricingService {
       );
     }
 
-    // 2. Layer 1 — 日期等级
-    // 从 schedule.departureTime 提取出发地本地日期（对 Asia/Ho_Chi_Minh=+7, Asia/Macau=+8）
-    const depTz = seatClass.schedule.departureTz;
-    const offsetHours = depTz === 'Asia/Macau' ? 8 : depTz === 'Asia/Ho_Chi_Minh' ? 7 : 8;
-    const depUtc = seatClass.schedule.departureTime;
-    const localMs = depUtc.getTime() + offsetHours * 3600000;
-    const localDate = new Date(localMs);
-    // 取 UTC midnight 作为 date 查找 key
-    const dateLookup = new Date(
-      Date.UTC(localDate.getUTCFullYear(), localDate.getUTCMonth(), localDate.getUTCDate()),
-    );
+    // ── 仓位阶梯模式（显式动态加价）─────────────────────────────────────────
+    // 配了非空阶梯就走这条：仓位价即成交价，忽略日期等级 / 余位倍率。
+    const fareBuckets = parseFareBuckets((seatClass as { fareBuckets?: unknown }).fareBuckets);
+    if (fareBuckets) {
+      const ladder = computeLadderBreakdown({ fareBuckets, sold, qty });
+      // dateRank 仍计算出来（运营内部参考），但不参与定价；dateMultiplier 恒 1。
+      const dateRank = await this.resolveDateRank(
+        seatClass.schedule.departureTz,
+        seatClass.schedule.departureTime,
+      );
+      return {
+        scheduleId,
+        cabin,
+        qty,
+        pricingMode: 'LADDER',
+        basePrice,
+        dateRank,
+        dateMultiplier: 1,
+        bucketSize: 0, // 阶梯模式无固定 bucket 大小
+        totalBuckets: ladder.totalBuckets,
+        currentBucket: ladder.currentBucket,
+        currentBucketRemaining: ladder.currentBucketRemaining,
+        perSeatBreakdown: ladder.breakdown,
+        totalPrice: ladder.totalPrice,
+        averageUnitPrice: ladder.averageUnitPrice,
+      };
+    }
 
-    const ranking = await prisma.dateRanking.findUnique({
-      where: { date: dateLookup },
-    });
-    // Fallback: 按 DOW 算
-    const dowFallback: Record<number, string> = {
-      0: 'A', 1: 'C', 2: 'D', 3: 'D', 4: 'C', 5: 'B', 6: 'B',
-    };
-    const dateRank = ranking?.rank ?? dowFallback[localDate.getUTCDay()] ?? 'C';
+    // 2. Layer 1 — 日期等级
+    const dateRank = await this.resolveDateRank(
+      seatClass.schedule.departureTz,
+      seatClass.schedule.departureTime,
+    );
     const dateMultiplier = RANK_MULTIPLIER[dateRank] ?? 1.0;
 
     // 3. Layer 2 — 余位阶梯
@@ -139,6 +156,7 @@ export class PricingService {
       scheduleId,
       cabin,
       qty,
+      pricingMode: 'AUTO',
       basePrice,
       dateRank,
       dateMultiplier,
@@ -150,5 +168,29 @@ export class PricingService {
       totalPrice,
       averageUnitPrice,
     };
+  }
+
+  /**
+   * 日期等级解析（AUTO 与 LADDER 共用）。
+   * 从出发地本地日期查 DateRanking 表；查不到按星期几兜底（DOW fallback）。
+   * 注意：LADDER 模式只把它当作运营内部参考，不参与定价。
+   */
+  private async resolveDateRank(departureTz: string, departureTime: Date): Promise<string> {
+    // 从 schedule.departureTime 提取出发地本地日期（Asia/Ho_Chi_Minh=+7, Asia/Macau=+8）
+    const offsetHours =
+      departureTz === 'Asia/Macau' ? 8 : departureTz === 'Asia/Ho_Chi_Minh' ? 7 : 8;
+    const localMs = departureTime.getTime() + offsetHours * 3600000;
+    const localDate = new Date(localMs);
+    // 取 UTC midnight 作为 date 查找 key
+    const dateLookup = new Date(
+      Date.UTC(localDate.getUTCFullYear(), localDate.getUTCMonth(), localDate.getUTCDate()),
+    );
+
+    const ranking = await prisma.dateRanking.findUnique({ where: { date: dateLookup } });
+    // Fallback: 按 DOW 算
+    const dowFallback: Record<number, string> = {
+      0: 'A', 1: 'C', 2: 'D', 3: 'D', 4: 'C', 5: 'B', 6: 'B',
+    };
+    return ranking?.rank ?? dowFallback[localDate.getUTCDay()] ?? 'C';
   }
 }
