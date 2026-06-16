@@ -8,7 +8,7 @@ const HERO_IMG =
   'https://images.unsplash.com/photo-1559592413-7cec4d0cae2b?auto=format&fit=crop&w=1400&q=80';
 
 const SELLING_POINTS: Array<{ icon: IconName; text: string }> = [
-  { icon: 'plane', text: '澳门 ⇌ 岘港 自营直飞，每天一班' },
+  { icon: 'plane', text: '澳门 ⇌ 岘港 每日直飞，每天一班' },
   { icon: 'package', text: '机票 · 酒店含早 · 签证 · 地面服务一价全含' },
   { icon: 'support', text: '中文客服全程在线，落地无忧' },
 ];

@@ -462,8 +462,8 @@ export function HomePage() {
             <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-brand-50 text-brand">
               <Icon name="plane" className="h-6 w-6" />
             </div>
-            <h3 className="mt-2 font-semibold text-slate-900">自营直飞航班</h3>
-            <p className="mt-1 text-slate-600">QH9588/9589 澳门 ↔ 岘港直飞 1h45m，每天 1 班</p>
+            <h3 className="mt-2 font-semibold text-slate-900">澳门 ⇌ 岘港海岛专线</h3>
+            <p className="mt-1 text-slate-600">QH9588/9589 澳门 ↔ 岘港每日直飞 1h45m，每天 1 班</p>
           </div>
           <div>
             <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-brand-50 text-brand">

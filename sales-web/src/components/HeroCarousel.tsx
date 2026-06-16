@@ -28,7 +28,7 @@ const HERO_SLIDES: HeroSlide[] = [
     kickerIcon: 'plane',
     kicker: '澳门出发 · 岘港专线',
     title: '澳门 ⇌ 越南 商务自由行专属',
-    subtitle: '自营 QH9588 / QH9589 澳门 ↔ 岘港直飞 1h45m，每天 1 班，说走就走。',
+    subtitle: 'QH9588 / QH9589 澳门 ↔ 岘港每日直飞 1h45m，每天 1 班，说走就走。',
     chips: ['美溪海滩', '巴拿山', '会安古城'],
   },
   {
