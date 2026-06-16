@@ -90,12 +90,22 @@ export interface AdminFlight {
   createdAt: string;
 }
 
+// 仓位阶梯一档：N 张以该价出售（int 张数 ≥1 / 价格 ≥0）。
+// 按数组顺序由前往后出售（最便宜在前，卖满跳下一档）。
+export interface FareBucket {
+  quota: number;
+  price: number;
+}
+
 export interface AdminScheduleSeat {
   id: string;
   cabin: CabinClass;
   capacity: number;
   sold: number;
   basePrice: string;
+  // 仓位阶梯：有序数组（最便宜在前），自顶向下出售；
+  // null / [] = 无阶梯（沿用旧的自动定价）。1..20 档。
+  fareBuckets: FareBucket[] | null;
 }
 
 export interface AdminSchedule {
@@ -823,7 +833,14 @@ export const api = {
     scheduleId: string,
     body: {
       isActive?: boolean;
-      seatClasses?: Array<{ cabin: CabinClass; basePrice?: number; capacity?: number }>;
+      // fareBuckets：数组=设阶梯；null 或 [] = 清除阶梯（恢复自动定价）；
+      // 单独传 fareBuckets 即为有效修改（无需同时传 basePrice/capacity）。
+      seatClasses?: Array<{
+        cabin: CabinClass;
+        basePrice?: number;
+        capacity?: number;
+        fareBuckets?: FareBucket[] | null;
+      }>;
     },
   ) =>
     apiFetch<{ schedule: AdminSchedule }>(`/flights/schedules/${scheduleId}`, {

@@ -1,5 +1,5 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
-import { api, ApiError, type AdminFlight, type BaggagePolicyInput, type CabinClass, type FlightBaggagePolicy } from '../lib/api';
+import { api, ApiError, type AdminFlight, type BaggagePolicyInput, type CabinClass, type FareBucket, type FlightBaggagePolicy } from '../lib/api';
 import { AIRPORT_OPTIONS, CABIN_LABEL, airportLabel, formatLocalDate, formatLocalTime } from '../lib/airports';
 import { useAuth } from '../stores/auth';
 import { NumberInput } from '../components/NumberInput';
@@ -13,6 +13,7 @@ interface ScheduleSeat {
   capacity: number;
   sold: number;
   basePrice: string;
+  fareBuckets: FareBucket[] | null;
 }
 
 interface AdminSchedule {
@@ -262,6 +263,130 @@ function seatTone(remaining: number): { text: string; dot: string } {
 
 function getCabin(s: AdminSchedule, cabin: CabinClass): ScheduleSeat | undefined {
   return s.seatClasses.find((c) => c.cabin === cabin);
+}
+
+// ── 仓位阶梯：常量与工具 ───────────────────────────────────────────────
+const MAX_FARE_TIERS = 20;
+
+function hasLadder(buckets: FareBucket[] | null | undefined): buckets is FareBucket[] {
+  return Array.isArray(buckets) && buckets.length > 0;
+}
+
+// 当前现价：按已售张数 sold 自顶向下走档 —— 第 i 档卖满（Σ前 i 档张数 ≤ sold）
+// 就跳到下一档；卖超 Σ张数后停在最后一档价（与后端 per-seat 出售语义一致）。
+function currentLadderPrice(buckets: FareBucket[], sold: number): number {
+  let cumulative = 0;
+  for (const b of buckets) {
+    cumulative += b.quota;
+    if (sold < cumulative) return b.price;
+  }
+  return buckets[buckets.length - 1]?.price ?? 0;
+}
+
+// ── 仓位阶梯行编辑器（单点 & 批量复用）──────────────────────────────────
+// 受控组件：父持有 FareBucket[] 草稿，这里只负责"加一档 / 改张数 / 改价 / 删除"。
+function FareLadderEditor({
+  buckets,
+  capacity,
+  onChange,
+  disabled,
+}: {
+  buckets: FareBucket[];
+  // 容量用于 Σ张数 对比提示；批量场景下未知则传 null（不显示对比）。
+  capacity: number | null;
+  onChange: (next: FareBucket[]) => void;
+  disabled?: boolean;
+}) {
+  const sumQuota = buckets.reduce((sum, b) => sum + (b.quota || 0), 0);
+  const mismatch = capacity != null && buckets.length > 0 && sumQuota !== capacity;
+
+  const updateRow = (idx: number, patch: Partial<FareBucket>) => {
+    onChange(buckets.map((b, i) => (i === idx ? { ...b, ...patch } : b)));
+  };
+  const removeRow = (idx: number) => {
+    onChange(buckets.filter((_, i) => i !== idx));
+  };
+  const addRow = () => {
+    if (buckets.length >= MAX_FARE_TIERS) return;
+    const last = buckets[buckets.length - 1];
+    onChange([...buckets, { quota: 0, price: last ? last.price : 0 }]);
+  };
+
+  return (
+    <div className="space-y-1.5">
+      {buckets.length === 0 ? (
+        <p className="text-xs text-ink-muted">暂无阶梯，点「+ 加一档」开始；从最便宜的一档往后加。</p>
+      ) : (
+        buckets.map((b, idx) => (
+          <div key={idx} className="flex flex-wrap items-center gap-2 text-xs">
+            <span className="inline-flex h-6 w-12 shrink-0 items-center justify-center rounded bg-slate-100 font-medium text-slate-600">
+              第{idx + 1}档
+            </span>
+            <span className="text-ink-muted">张数</span>
+            <NumberInput
+              min={1}
+              className="input h-8 w-20 py-1"
+              value={b.quota || null}
+              onChange={(n) => updateRow(idx, { quota: n ?? 0 })}
+              disabled={disabled}
+              integerOnly
+            />
+            <span className="text-ink-muted">价格 ¥</span>
+            <NumberInput
+              min={0}
+              className="input h-8 w-24 py-1"
+              value={b.price ?? null}
+              onChange={(n) => updateRow(idx, { price: n ?? 0 })}
+              disabled={disabled}
+            />
+            <button
+              type="button"
+              className="text-rose-500 hover:text-rose-700 disabled:opacity-40"
+              disabled={disabled}
+              title="删除该档"
+              onClick={() => removeRow(idx)}
+            >
+              删除
+            </button>
+          </div>
+        ))
+      )}
+      <div className="flex flex-wrap items-center gap-3 pt-0.5">
+        <button
+          type="button"
+          className="btn-secondary text-xs"
+          disabled={disabled || buckets.length >= MAX_FARE_TIERS}
+          onClick={addRow}
+        >
+          + 加一档
+        </button>
+        {buckets.length >= MAX_FARE_TIERS && (
+          <span className="text-[11px] text-ink-muted">最多 {MAX_FARE_TIERS} 档</span>
+        )}
+        {mismatch && (
+          <span className="text-[11px] text-amber-600">
+            各档张数合计 {sumQuota}，舱位容量 {capacity}（不等也可，卖超按最后一档价）
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// 校验阶梯草稿 → 可提交的 FareBucket[]；不合法返回错误文案。
+function validateLadder(buckets: FareBucket[]): { ok: true; value: FareBucket[] } | { ok: false; error: string } {
+  if (buckets.length === 0) return { ok: false, error: '请至少加一档，或点「清除阶梯」恢复自动定价' };
+  if (buckets.length > MAX_FARE_TIERS) return { ok: false, error: `最多 ${MAX_FARE_TIERS} 档` };
+  for (let i = 0; i < buckets.length; i++) {
+    const b = buckets[i];
+    if (!Number.isInteger(b.quota) || b.quota < 1) {
+      return { ok: false, error: `第${i + 1}档张数需为 ≥1 的整数` };
+    }
+    if (!Number.isFinite(b.price) || b.price < 0) {
+      return { ok: false, error: `第${i + 1}档价格需为 ≥0 的数字` };
+    }
+  }
+  return { ok: true, value: buckets };
 }
 
 const WEEK_HEAD = ['日', '一', '二', '三', '四', '五', '六'];
@@ -624,6 +749,13 @@ function MonthCalendar({
           const remaining = econ ? econ.capacity - econ.sold : 0;
           const tone = seatTone(remaining);
           const allInactive = daySchedules.every((s) => !s.isActive);
+          // 有阶梯则显示按已售算出的"现价"，否则显示固定 basePrice
+          const econHasLadder = econ ? hasLadder(econ.fareBuckets) : false;
+          const econDisplayPrice = econ
+            ? econHasLadder
+              ? currentLadderPrice(econ.fareBuckets as FareBucket[], econ.sold)
+              : Number(econ.basePrice)
+            : 0;
 
           return (
             <button
@@ -657,7 +789,17 @@ function MonthCalendar({
                 </div>
               )}
               {econ && (
-                <div className="text-[11px] text-ink-soft">¥{Number(econ.basePrice).toFixed(0)}</div>
+                <div className="flex items-center gap-1 text-[11px] text-ink-soft">
+                  <span>¥{econDisplayPrice.toFixed(0)}</span>
+                  {econHasLadder && (
+                    <span
+                      className="rounded bg-brand-50 px-1 text-[9px] font-medium text-brand-700"
+                      title="按仓位阶梯出售，显示当前现价"
+                    >
+                      阶梯
+                    </span>
+                  )}
+                </div>
               )}
             </button>
           );
@@ -745,6 +887,17 @@ function DaySchedule({
   const [err, setErr] = useState<string | null>(null);
   const [savedMsg, setSavedMsg] = useState<string | null>(null);
 
+  // 仓位阶梯草稿（按舱位）—— 初值取自该舱位已有阶梯，深拷贝避免改到 props。
+  const [econLadder, setEconLadder] = useState<FareBucket[]>(
+    econ?.fareBuckets ? econ.fareBuckets.map((b) => ({ ...b })) : [],
+  );
+  const [bizLadder, setBizLadder] = useState<FareBucket[]>(
+    biz?.fareBuckets ? biz.fareBuckets.map((b) => ({ ...b })) : [],
+  );
+  const [ladderBusy, setLadderBusy] = useState<CabinClass | null>(null);
+  const [ladderErr, setLadderErr] = useState<string | null>(null);
+  const [ladderMsg, setLadderMsg] = useState<string | null>(null);
+
   const econRemaining = econ ? econ.capacity - econ.sold : 0;
   const tone = seatTone(econRemaining);
   const isExporting = exportingId === schedule.id;
@@ -787,6 +940,95 @@ function DaySchedule({
     } finally {
       setToggling(false);
     }
+  };
+
+  // 保存某舱位的仓位阶梯（数组）。单独传 fareBuckets 即有效修改。
+  const onSaveLadder = async (cabin: CabinClass, draft: FareBucket[]) => {
+    if (!tokens || ladderBusy) return;
+    const v = validateLadder(draft);
+    if (!v.ok) {
+      setLadderErr(`${CABIN_LABEL[cabin] ?? cabin}：${v.error}`);
+      return;
+    }
+    setLadderBusy(cabin);
+    setLadderErr(null);
+    setLadderMsg(null);
+    try {
+      await api.updateSchedule(tokens.accessToken, schedule.id, {
+        seatClasses: [{ cabin, fareBuckets: v.value }],
+      });
+      setLadderMsg(`✅ ${CABIN_LABEL[cabin] ?? cabin}阶梯已保存`);
+      await onSaved();
+    } catch (e) {
+      setLadderErr(e instanceof ApiError ? e.message : '保存阶梯失败');
+    } finally {
+      setLadderBusy(null);
+    }
+  };
+
+  // 清除某舱位的阶梯（传 [] → 后端清空，恢复自动定价）。
+  const onClearLadder = async (cabin: CabinClass) => {
+    if (!tokens || ladderBusy) return;
+    setLadderBusy(cabin);
+    setLadderErr(null);
+    setLadderMsg(null);
+    try {
+      await api.updateSchedule(tokens.accessToken, schedule.id, {
+        seatClasses: [{ cabin, fareBuckets: [] }],
+      });
+      if (cabin === 'ECONOMY') setEconLadder([]);
+      else if (cabin === 'BUSINESS') setBizLadder([]);
+      setLadderMsg(`✅ ${CABIN_LABEL[cabin] ?? cabin}已恢复自动定价`);
+      await onSaved();
+    } catch (e) {
+      setLadderErr(e instanceof ApiError ? e.message : '清除阶梯失败');
+    } finally {
+      setLadderBusy(null);
+    }
+  };
+
+  // 渲染单个舱位的阶梯小节（经济总有；商务存在才显示）。
+  const renderLadderSection = (cabin: CabinClass, seat: ScheduleSeat, draft: FareBucket[], setDraft: (next: FareBucket[]) => void) => {
+    const liveHint = hasLadder(seat.fareBuckets)
+      ? `当前现价 ¥${currentLadderPrice(seat.fareBuckets, seat.sold).toFixed(0)}`
+      : '当前无阶梯（自动定价）';
+    return (
+      <div className="rounded-md border border-slate-200 bg-slate-50/60 p-3">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <span className="text-xs font-medium text-ink">
+            {CABIN_LABEL[cabin] ?? cabin}仓位阶梯
+            <span className="ml-2 font-normal text-ink-muted">{liveHint}</span>
+          </span>
+          <button
+            type="button"
+            className="text-xs text-ink-muted underline-offset-2 hover:text-rose-600 hover:underline disabled:opacity-40"
+            disabled={ladderBusy != null || !hasLadder(seat.fareBuckets)}
+            title="清除阶梯，恢复自动定价"
+            onClick={() => onClearLadder(cabin)}
+          >
+            清除阶梯（恢复自动定价）
+          </button>
+        </div>
+        <div className="mt-2">
+          <FareLadderEditor
+            buckets={draft}
+            capacity={seat.capacity}
+            onChange={setDraft}
+            disabled={ladderBusy != null}
+          />
+        </div>
+        <div className="mt-2 flex justify-end">
+          <button
+            type="button"
+            className="btn-primary text-xs"
+            disabled={ladderBusy != null}
+            onClick={() => onSaveLadder(cabin, draft)}
+          >
+            {ladderBusy === cabin ? '保存中…' : '保存阶梯'}
+          </button>
+        </div>
+      </div>
+    );
   };
 
   return (
@@ -840,6 +1082,17 @@ function DaySchedule({
         </div>
       )}
 
+      {/* 仓位阶梯（仅 ADMIN）：每个有座的舱位一个小节 —— 每档几张 + 价格，自顶向下卖 */}
+      {canEdit && (econ || biz) && (
+        <div className="mt-3 space-y-2">
+          <div className="text-xs font-medium text-ink-soft">仓位阶梯（按仓位卖：每档几张 + 价格；卖满跳下一档）</div>
+          {econ && renderLadderSection('ECONOMY', econ, econLadder, setEconLadder)}
+          {biz && renderLadderSection('BUSINESS', biz, bizLadder, setBizLadder)}
+          {ladderErr && <div className="rounded-md bg-red-50 px-3 py-2 text-xs text-red-700">{ladderErr}</div>}
+          {ladderMsg && <div className="text-xs text-emerald-700">{ladderMsg}</div>}
+        </div>
+      )}
+
       {err && <div className="mt-2 rounded-md bg-red-50 px-3 py-2 text-xs text-red-700">{err}</div>}
 
       <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
@@ -875,7 +1128,7 @@ function DaySchedule({
 }
 
 // ── 批量改价 / 批量停用（日期范围 + 星期几 + 进度条；镜像 BulkScheduleForm）─
-type BulkAction = 'setPrice' | 'addAmount' | 'addPercent' | 'deactivate' | 'activate';
+type BulkAction = 'setPrice' | 'addAmount' | 'addPercent' | 'deactivate' | 'activate' | 'setLadder' | 'clearLadder';
 type BulkCabinPick = 'ECONOMY' | 'BUSINESS' | 'ALL';
 
 function BulkEditPanel({
@@ -903,12 +1156,16 @@ function BulkEditPanel({
   const [action, setAction] = useState<BulkAction>('setPrice');
   const [cabinPick, setCabinPick] = useState<BulkCabinPick>('ECONOMY');
   const [amount, setAmount] = useState<number | null>(0);
+  // 批量设阶梯用的统一阶梯草稿 + 舱位（仅经济/商务，不支持"全部"）
+  const [ladderDraft, setLadderDraft] = useState<FareBucket[]>([]);
+  const [ladderCabin, setLadderCabin] = useState<CabinClass>('ECONOMY');
   const [submitting, setSubmitting] = useState(false);
   const [progress, setProgress] = useState({ done: 0, total: 0, errors: 0 });
   const [result, setResult] = useState<string | null>(null);
   const [errMsg, setErrMsg] = useState<string | null>(null);
 
   const isPriceAction = action === 'setPrice' || action === 'addAmount' || action === 'addPercent';
+  const isLadderAction = action === 'setLadder' || action === 'clearLadder';
 
   // 命中的班次：本地出发日 ∈ [start,end] 且 星期几被选中
   const matched = useMemo(() => {
@@ -938,10 +1195,16 @@ function BulkEditPanel({
 
   const buildBody = (s: AdminSchedule):
     | { isActive: boolean }
-    | { seatClasses: Array<{ cabin: CabinClass; basePrice: number }> }
+    | { seatClasses: Array<{ cabin: CabinClass; basePrice?: number; fareBuckets?: FareBucket[] | null }> }
     | null => {
     if (action === 'deactivate') return { isActive: false };
     if (action === 'activate') return { isActive: true };
+    // 阶梯类操作：只动选定的单一舱位（经济/商务），该班次没有此舱位则跳过
+    if (isLadderAction) {
+      if (!getCabin(s, ladderCabin)) return null;
+      if (action === 'clearLadder') return { seatClasses: [{ cabin: ladderCabin, fareBuckets: [] }] };
+      return { seatClasses: [{ cabin: ladderCabin, fareBuckets: ladderDraft }] };
+    }
     const cabins = cabinsToEdit(s);
     if (cabins.length === 0) return null;
     const amt = amount ?? 0;
@@ -959,11 +1222,14 @@ function BulkEditPanel({
 
   const actionLabel = (): string => {
     const cab = cabinPick === 'ALL' ? '全部舱位' : CABIN_LABEL[cabinPick];
+    const ladderCab = CABIN_LABEL[ladderCabin] ?? ladderCabin;
     if (action === 'setPrice') return `把 ${cab} 价设为 ¥${amount ?? 0}`;
     if (action === 'addAmount') return `${cab} 价上调 ¥${amount ?? 0}`;
     if (action === 'addPercent') return `${cab} 价上调 ${amount ?? 0}%`;
     if (action === 'deactivate') return '将这些班次售罄/暂停销售';
-    return '恢复销售这些班次';
+    if (action === 'activate') return '恢复销售这些班次';
+    if (action === 'setLadder') return `把 ${ladderCab} 设为 ${ladderDraft.length} 档仓位阶梯`;
+    return `清除 ${ladderCab} 仓位阶梯（恢复自动定价）`;
   };
 
   const onSubmit = async (e: FormEvent) => {
@@ -972,6 +1238,13 @@ function BulkEditPanel({
     if (matched.length === 0) {
       setErrMsg('没有命中的班次，检查日期范围和星期几');
       return;
+    }
+    if (action === 'setLadder') {
+      const v = validateLadder(ladderDraft);
+      if (!v.ok) {
+        setErrMsg(v.error);
+        return;
+      }
     }
     if (!confirm(`将对 ${matched.length} 个班次执行：${actionLabel()}，确认？`)) return;
 
@@ -1048,6 +1321,8 @@ function BulkEditPanel({
             <option value="setPrice">设为指定价</option>
             <option value="addAmount">在原价上涨 ¥X</option>
             <option value="addPercent">涨 X%</option>
+            <option value="setLadder">设置仓位阶梯</option>
+            <option value="clearLadder">清除仓位阶梯</option>
             <option value="deactivate">售罄/暂停销售</option>
             <option value="activate">恢复销售</option>
           </select>
@@ -1069,6 +1344,24 @@ function BulkEditPanel({
               <NumberInput min={0} className="input" value={amount} onChange={(n) => setAmount(n)} />
             </div>
           </>
+        )}
+        {isLadderAction && (
+          <div>
+            <label className="label">舱位</label>
+            <select className="input" value={ladderCabin} onChange={(e) => setLadderCabin(e.target.value as CabinClass)}>
+              <option value="ECONOMY">经济舱</option>
+              <option value="BUSINESS">商务舱</option>
+            </select>
+          </div>
+        )}
+        {action === 'setLadder' && (
+          <div className="md:col-span-4 rounded-md border border-slate-200 bg-white p-3">
+            <div className="mb-2 text-xs font-medium text-ink-soft">
+              统一仓位阶梯（每档几张 + 价格，自顶向下卖；将套用到所有命中班次的{CABIN_LABEL[ladderCabin] ?? ladderCabin}）
+            </div>
+            {/* 批量场景容量因班次而异，传 null 不显示 Σ对比 */}
+            <FareLadderEditor buckets={ladderDraft} capacity={null} onChange={setLadderDraft} disabled={submitting} />
+          </div>
         )}
 
         <div className="md:col-span-4 rounded-md bg-white border border-slate-200 p-3">
