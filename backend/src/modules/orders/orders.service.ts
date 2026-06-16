@@ -1994,35 +1994,106 @@ void PaymentMethod;
 // ── Fulfillment 任务生成（PAID 时触发） ─────────────────────────
 import { FulfillmentStatus, FulfillmentType } from '@prisma/client';
 
+// 非套餐订单项：一行 → 一个对应岗任务。
 const KIND_TO_FULFILLMENT_TYPE: Partial<Record<OrderItemKind, FulfillmentType>> = {
   FLIGHT: FulfillmentType.FLIGHT_TICKETING,
   HOTEL: FulfillmentType.HOTEL_BOOKING,
   VISA: FulfillmentType.VISA_APPLICATION,
   TRANSFER: FulfillmentType.TRANSFER_DISPATCH,
-  BUNDLE: FulfillmentType.BUNDLE_COMPOSITE,
 };
 
+// 套餐组件 kind（Bundle.items[].kind，见 products.schemas bundleItemSchema）→ 对应岗任务。
+// 注意：FLIGHT 组件不在此列 —— 套餐下单已单独落 FLIGHT 订单项（FLIGHT_TICKETING 由那行生成），
+//       从套餐再生成会与之重复，故套餐只 fan-out 地面（酒店/签证/接送）组件。
+const BUNDLE_COMPONENT_KIND_TO_TYPE: Record<string, FulfillmentType | undefined> = {
+  HOTEL: FulfillmentType.HOTEL_BOOKING,
+  VISA: FulfillmentType.VISA_APPLICATION,
+  TRANSFER: FulfillmentType.TRANSFER_DISPATCH,
+};
+
+/**
+ * 解析套餐订单项需要生成哪些「地面岗」任务类型。
+ * 通过订单项的 bundleId 反查 Bundle.items JSON，取其组件 kind 集合映射到 FulfillmentType。
+ * 解析不到（bundleId 缺失 / 套餐被删 / items 畸形）时优雅降级：
+ *   至少回退一个 HOTEL_BOOKING（套餐基本必含酒店），保证酒店岗能看到该套餐单。
+ */
+async function resolveBundleFulfillmentTypes(
+  tx: Prisma.TransactionClient,
+  bundleId: string | null,
+): Promise<FulfillmentType[]> {
+  const FALLBACK = [FulfillmentType.HOTEL_BOOKING];
+  if (!bundleId) return FALLBACK;
+  const bundle = await tx.bundle.findUnique({
+    where: { id: bundleId },
+    select: { items: true },
+  });
+  if (!bundle) return FALLBACK;
+  const components = Array.isArray(bundle.items)
+    ? (bundle.items as Array<{ kind?: unknown }>)
+    : [];
+  // 去重保序：同一类组件（如两段接送）只开一个对应岗任务。
+  const types = new Set<FulfillmentType>();
+  for (const c of components) {
+    if (typeof c?.kind !== 'string') continue;
+    const type = BUNDLE_COMPONENT_KIND_TO_TYPE[c.kind];
+    if (type) types.add(type);
+  }
+  return types.size > 0 ? [...types] : FALLBACK;
+}
+
+/**
+ * PAID 时为订单的每个订单项生成 fulfillment 任务。
+ *
+ * - 非套餐项（FLIGHT/HOTEL/VISA/TRANSFER）：一行 → 一个对应岗任务。
+ * - 套餐项（BUNDLE）：反查套餐组件，fan-out 成 per-component 地面岗任务
+ *   （HOTEL→HOTEL_BOOKING / VISA→VISA_APPLICATION / TRANSFER→TRANSFER_DISPATCH），
+ *   不再生成单一 BUNDLE_COMPOSITE 占位任务 —— 否则签证岗/酒店岗/地面岗看不到套餐单。
+ *   （FLIGHT 组件由套餐另落的 FLIGHT 订单项生成，避免重复。）
+ *
+ * 幂等：按「该订单项已存在的任务类型集合」判定，只补缺失的类型。
+ *   首次运行会一次性建齐所有需要的类型；重跑不会重复建（即便套餐含多类型，
+ *   旧的 `fulfillmentTasks.length > 0` 单值守卫会漏建剩余类型，故改为按类型去重）。
+ */
 async function createFulfillmentTasks(tx: Prisma.TransactionClient, orderId: string): Promise<string[]> {
   const items = await tx.orderItem.findMany({
     where: { orderId },
-    select: { id: true, kind: true, fulfillmentTasks: { select: { id: true } } },
+    select: {
+      id: true,
+      kind: true,
+      bundleId: true,
+      fulfillmentTasks: { select: { type: true } },
+    },
   });
   const newTaskIds: string[] = [];
   for (const item of items) {
-    const type = KIND_TO_FULFILLMENT_TYPE[item.kind];
-    if (!type) continue;
-    if (item.fulfillmentTasks.length > 0) continue;
-    const task = await tx.fulfillmentTask.create({
-      data: {
-        orderItemId: item.id,
-        type,
-        status: FulfillmentStatus.PENDING,
-      },
-    });
-    newTaskIds.push(task.id);
+    // 该订单项需要的任务类型集合
+    const desiredTypes =
+      item.kind === OrderItemKind.BUNDLE
+        ? await resolveBundleFulfillmentTypes(tx, item.bundleId)
+        : (() => {
+            const t = KIND_TO_FULFILLMENT_TYPE[item.kind];
+            return t ? [t] : [];
+          })();
+    if (desiredTypes.length === 0) continue;
+
+    // 幂等：跳过已存在的类型，只补缺失的（支持套餐多类型的部分补建）
+    const existingTypes = new Set(item.fulfillmentTasks.map((t) => t.type));
+    for (const type of desiredTypes) {
+      if (existingTypes.has(type)) continue;
+      const task = await tx.fulfillmentTask.create({
+        data: {
+          orderItemId: item.id,
+          type,
+          status: FulfillmentStatus.PENDING,
+        },
+      });
+      newTaskIds.push(task.id);
+    }
   }
   return newTaskIds;
 }
+
+export { createFulfillmentTasks, resolveBundleFulfillmentTypes };
 
 // ════════════════════════════════════════════════════════════════════
 // 佣金链路计算 — 当订单转 PAID 时调用，为卖家代理 + 所有上级代理创建 CommissionRecord

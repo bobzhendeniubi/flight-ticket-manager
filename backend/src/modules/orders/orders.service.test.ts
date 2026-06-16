@@ -46,6 +46,7 @@ import {
   computeRequiredPassengerCount,
   resolveBundleOccupancy,
   computeRoomsNeeded,
+  createFulfillmentTasks,
 } from './orders.service.js';
 import type { OrderItemInput } from './orders.schemas.js';
 
@@ -893,5 +894,154 @@ describe('assertVisaPassengersHavePassportExpiry', () => {
     expect(() =>
       assertVisaPassengersHavePassportExpiry([flightItem], [pxMissing]),
     ).not.toThrow();
+  });
+});
+
+// ── 套餐 fan-out：createFulfillmentTasks 把 BUNDLE 项拆成 per-component 地面岗任务 ──
+// 根因：旧逻辑 BUNDLE→单一 BUNDLE_COMPOSITE，签证/酒店/地面岗永远看不到套餐单。
+// 修复：反查 Bundle.items 组件 kind，fan-out 成 HOTEL_BOOKING / VISA_APPLICATION / TRANSFER_DISPATCH。
+describe('createFulfillmentTasks · 套餐 fan-out 到地面岗', () => {
+  // 构造一个可控的假 tx（TransactionClient stub）：
+  //   orderItem.findMany → 返回给定订单项；bundle.findUnique → 返回给定套餐 items；
+  //   fulfillmentTask.create → 记录所有写入，返回带 id 的任务。
+  function makeTx(opts: {
+    items: Array<{
+      id: string;
+      kind: string;
+      bundleId?: string | null;
+      fulfillmentTasks?: Array<{ type: string }>;
+    }>;
+    bundleItems?: Array<{ kind: string }> | null;
+  }) {
+    const created: Array<{ orderItemId: string; type: string; status: string }> = [];
+    let seq = 0;
+    const tx = {
+      orderItem: {
+        findMany: vi.fn().mockResolvedValue(
+          opts.items.map((it) => ({
+            id: it.id,
+            kind: it.kind,
+            bundleId: it.bundleId ?? null,
+            fulfillmentTasks: it.fulfillmentTasks ?? [],
+          })),
+        ),
+      },
+      bundle: {
+        findUnique: vi.fn().mockResolvedValue(
+          opts.bundleItems === null ? null : { items: opts.bundleItems ?? [] },
+        ),
+      },
+      fulfillmentTask: {
+        create: vi.fn().mockImplementation(async ({ data }: { data: { orderItemId: string; type: string; status: string } }) => {
+          created.push(data);
+          return { id: `task_${++seq}`, ...data };
+        }),
+      },
+    };
+    return { tx, created };
+  }
+
+  const run = async (tx: unknown) =>
+    createFulfillmentTasks(tx as Parameters<typeof createFulfillmentTasks>[0], 'ord1');
+
+  it('套餐含 VISA 组件 → 生成 VISA_APPLICATION 任务（核心修复：签证岗能看到套餐单）', async () => {
+    const { tx, created } = makeTx({
+      items: [{ id: 'itm_bundle', kind: 'BUNDLE', bundleId: 'bdl_visa' }],
+      bundleItems: [
+        { kind: 'FLIGHT' },
+        { kind: 'HOTEL' },
+        { kind: 'VISA' },
+      ],
+    });
+    const ids = await run(tx);
+    const types = created.map((c) => c.type);
+    expect(types).toContain('VISA_APPLICATION');
+    expect(types).toContain('HOTEL_BOOKING');
+    // FLIGHT 组件不从套餐生成（套餐另落 FLIGHT 订单项）
+    expect(types).not.toContain('FLIGHT_TICKETING');
+    // 不再生成 BUNDLE_COMPOSITE 占位
+    expect(types).not.toContain('BUNDLE_COMPOSITE');
+    expect(ids).toHaveLength(2);
+    expect(created.every((c) => c.status === 'PENDING')).toBe(true);
+    expect(created.every((c) => c.orderItemId === 'itm_bundle')).toBe(true);
+  });
+
+  it('套餐不含 VISA → 不生成签证任务，但酒店任务恒有', async () => {
+    const { tx, created } = makeTx({
+      items: [{ id: 'itm_bundle', kind: 'BUNDLE', bundleId: 'bdl_no_visa' }],
+      bundleItems: [{ kind: 'FLIGHT' }, { kind: 'HOTEL' }, { kind: 'TRANSFER' }],
+    });
+    await run(tx);
+    const types = created.map((c) => c.type);
+    expect(types).not.toContain('VISA_APPLICATION');
+    expect(types).toContain('HOTEL_BOOKING');
+    expect(types).toContain('TRANSFER_DISPATCH');
+  });
+
+  it('套餐组件解析不到（套餐被删）→ 优雅降级至少建 HOTEL_BOOKING', async () => {
+    const { tx, created } = makeTx({
+      items: [{ id: 'itm_bundle', kind: 'BUNDLE', bundleId: 'bdl_gone' }],
+      bundleItems: null, // findUnique 返回 null
+    });
+    await run(tx);
+    expect(created.map((c) => c.type)).toEqual(['HOTEL_BOOKING']);
+  });
+
+  it('同类组件去重：两段 TRANSFER → 只开一个 TRANSFER_DISPATCH', async () => {
+    const { tx, created } = makeTx({
+      items: [{ id: 'itm_bundle', kind: 'BUNDLE', bundleId: 'bdl_2transfer' }],
+      bundleItems: [{ kind: 'HOTEL' }, { kind: 'TRANSFER' }, { kind: 'TRANSFER' }],
+    });
+    await run(tx);
+    const transferCount = created.filter((c) => c.type === 'TRANSFER_DISPATCH').length;
+    expect(transferCount).toBe(1);
+  });
+
+  it('幂等：套餐已有 HOTEL_BOOKING、缺 VISA → 只补 VISA，不重复建酒店', async () => {
+    const { tx, created } = makeTx({
+      items: [
+        {
+          id: 'itm_bundle',
+          kind: 'BUNDLE',
+          bundleId: 'bdl_visa',
+          fulfillmentTasks: [{ type: 'HOTEL_BOOKING' }], // 已存在
+        },
+      ],
+      bundleItems: [{ kind: 'HOTEL' }, { kind: 'VISA' }],
+    });
+    const ids = await run(tx);
+    expect(created.map((c) => c.type)).toEqual(['VISA_APPLICATION']); // 只补缺失类型
+    expect(ids).toHaveLength(1);
+  });
+
+  it('幂等：全类型已存在 → 重跑零新建', async () => {
+    const { tx, created } = makeTx({
+      items: [
+        {
+          id: 'itm_bundle',
+          kind: 'BUNDLE',
+          bundleId: 'bdl_visa',
+          fulfillmentTasks: [{ type: 'HOTEL_BOOKING' }, { type: 'VISA_APPLICATION' }],
+        },
+      ],
+      bundleItems: [{ kind: 'HOTEL' }, { kind: 'VISA' }],
+    });
+    const ids = await run(tx);
+    expect(created).toHaveLength(0);
+    expect(ids).toHaveLength(0);
+  });
+
+  it('非套餐项仍是一行一任务（FLIGHT→FLIGHT_TICKETING、HOTEL→HOTEL_BOOKING）', async () => {
+    const { tx, created } = makeTx({
+      items: [
+        { id: 'itm_flight', kind: 'FLIGHT' },
+        { id: 'itm_hotel', kind: 'HOTEL' },
+      ],
+    });
+    await run(tx);
+    expect(created).toEqual([
+      { orderItemId: 'itm_flight', type: 'FLIGHT_TICKETING', status: 'PENDING' },
+      { orderItemId: 'itm_hotel', type: 'HOTEL_BOOKING', status: 'PENDING' },
+    ]);
   });
 });
