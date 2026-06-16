@@ -143,7 +143,7 @@ export function FlightsPage() {
               </div>
               <div className="flex items-center gap-2">
                 {!f.isActive && (
-                  <span className="badge-neutral">已停用</span>
+                  <span className="badge-neutral">整线停售</span>
                 )}
                 <button type="button" className="btn-secondary text-sm" onClick={() => toggleExpand(f.id)}>
                   {expanded === f.id ? '收起' : '查看班次'}
@@ -174,9 +174,10 @@ export function FlightsPage() {
                     <button
                       type="button"
                       className="btn-secondary text-sm"
+                      title="对整条航线（所有班次）停售或恢复"
                       onClick={() => onToggleFlight(f.id)}
                     >
-                      {f.isActive ? '停用' : '启用'}
+                      {f.isActive ? '整线停售' : '整线恢复'}
                     </button>
                   </>
                 )}
@@ -351,7 +352,7 @@ function SchedulesList({
             className="btn-secondary text-sm"
             onClick={() => setShowBulk((v) => !v)}
           >
-            {showBulk ? '收起批量操作' : '⚡ 批量改价 / 停用'}
+            {showBulk ? '收起批量操作' : '⚡ 批量改价 / 售罄'}
           </button>
         )}
       </div>
@@ -486,7 +487,7 @@ function SchedulesTable({
                     {s.isActive ? (
                       <span className="badge-success">在售</span>
                     ) : (
-                      <span className="badge-neutral">已停</span>
+                      <span className="badge-neutral">售罄/暂停销售</span>
                     )}
                   </td>
                   <td>
@@ -638,7 +639,7 @@ function MonthCalendar({
                   {cell.day}
                 </span>
                 {allInactive && (
-                  <span className="text-[10px] leading-none text-slate-400" title="已停用">
+                  <span className="text-[10px] leading-none text-slate-400" title="售罄/暂停销售">
                     ✕
                   </span>
                 )}
@@ -678,7 +679,7 @@ function MonthCalendar({
   );
 }
 
-// ── 某一天的内联编辑器（改经济/商务价 + 停用/启用 + 导出整班订单）────────
+// ── 某一天的内联编辑器（改经济/商务价 + 售罄/恢复销售 + 导出整班订单）────────
 function DayCellEditor({
   ymd,
   schedules,
@@ -801,7 +802,7 @@ function DaySchedule({
         {schedule.isActive ? (
           <span className="badge-success">在售</span>
         ) : (
-          <span className="badge-neutral">已停</span>
+          <span className="badge-neutral">售罄/暂停销售</span>
         )}
       </div>
 
@@ -854,8 +855,14 @@ function DaySchedule({
         </button>
         {canEdit && (
           <>
-            <button type="button" className="btn-secondary text-xs" disabled={toggling} onClick={onToggle}>
-              {toggling ? '处理中…' : schedule.isActive ? '停用' : '启用'}
+            <button
+              type="button"
+              className="btn-secondary text-xs"
+              title="只对该单个班次售罄或恢复销售"
+              disabled={toggling}
+              onClick={onToggle}
+            >
+              {toggling ? '处理中…' : schedule.isActive ? '售罄' : '恢复销售'}
             </button>
             <button type="button" className="btn-primary text-xs" disabled={saving} onClick={onSavePrices}>
               {saving ? '保存中…' : '保存价格'}
@@ -955,8 +962,8 @@ function BulkEditPanel({
     if (action === 'setPrice') return `把 ${cab} 价设为 ¥${amount ?? 0}`;
     if (action === 'addAmount') return `${cab} 价上调 ¥${amount ?? 0}`;
     if (action === 'addPercent') return `${cab} 价上调 ${amount ?? 0}%`;
-    if (action === 'deactivate') return '停用这些班次';
-    return '启用这些班次';
+    if (action === 'deactivate') return '将这些班次售罄/暂停销售';
+    return '恢复销售这些班次';
   };
 
   const onSubmit = async (e: FormEvent) => {
@@ -1008,7 +1015,7 @@ function BulkEditPanel({
           ×
         </button>
       </div>
-      <p className="text-xs text-slate-500 mt-0.5">按日期范围 + 星期几，批量改价 / 停用 / 启用现有班次</p>
+      <p className="text-xs text-slate-500 mt-0.5">按日期范围 + 星期几，批量改价 / 售罄 / 恢复销售现有班次</p>
 
       <form className="mt-4 grid gap-3 md:grid-cols-4" onSubmit={onSubmit}>
         <div>
@@ -1041,8 +1048,8 @@ function BulkEditPanel({
             <option value="setPrice">设为指定价</option>
             <option value="addAmount">在原价上涨 ¥X</option>
             <option value="addPercent">涨 X%</option>
-            <option value="deactivate">停用</option>
-            <option value="activate">启用</option>
+            <option value="deactivate">售罄/暂停销售</option>
+            <option value="activate">恢复销售</option>
           </select>
         </div>
         {isPriceAction && (

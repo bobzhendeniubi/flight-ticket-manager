@@ -118,6 +118,9 @@ export function OrdersPage() {
   const [channelFilter, setChannelFilter] = useState<'' | 'direct' | 'agent'>('');
   const [agentFilter, setAgentFilter] = useState<string>('');
   const [search, setSearch] = useState('');
+  // 6/16 反馈（赵姐）：按下单日期(createdAt)筛 — 用于"当天进单多少"的导出
+  const [createdFrom, setCreatedFrom] = useState('');
+  const [createdTo, setCreatedTo] = useState('');
   // 5/20 反馈：按出行日期筛 + 是否已认领
   const [travelFrom, setTravelFrom] = useState('');
   const [travelTo, setTravelTo] = useState('');
@@ -156,13 +159,15 @@ export function OrdersPage() {
   const [showBatchCreate, setShowBatchCreate] = useState(false);
   const [refreshNonce, setRefreshNonce] = useState(0);
 
-  // 拉取订单 — travelFrom/To/claimFilter/航班号/乘客姓名/开票状态 变化时重拉（后端过滤）
+  // 拉取订单 — 下单日期/出行日期/claimFilter/航班号/乘客姓名/开票状态 变化时重拉（后端过滤）
   useEffect(() => {
     if (!tokens?.accessToken) return;
     let cancelled = false;
     setLoading(true);
     setError(null);
     const query: ListOrdersParams = { pageSize: 200 };
+    if (createdFrom) query.from = createdFrom; // 下单日期起（createdAt）
+    if (createdTo) query.to = createdTo; // 下单日期止（createdAt）
     if (travelFrom) query.travelFrom = travelFrom;
     if (travelTo) query.travelTo = travelTo;
     if (claimFilter === 'unclaimed') query.unclaimedOnly = '1';
@@ -182,7 +187,7 @@ export function OrdersPage() {
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [tokens?.accessToken, travelFrom, travelTo, claimFilter, debouncedFlightNumber, debouncedPassengerName, invoiceFilter, refreshNonce]);
+  }, [tokens?.accessToken, createdFrom, createdTo, travelFrom, travelTo, claimFilter, debouncedFlightNumber, debouncedPassengerName, invoiceFilter, refreshNonce]);
 
   // 视图层把 OrderSummary 映射成便于筛选/展示的数据
   const ordersView = useMemo(
@@ -328,6 +333,8 @@ export function OrdersPage() {
         status: statusFilter || undefined,
         kind: kindFilter || undefined,
         search: search.trim() || undefined,
+        from: createdFrom || undefined, // 下单日期起（createdAt）— "当天进单多少"导出
+        to: createdTo || undefined, // 下单日期止（createdAt）
         travelFrom: travelFrom || undefined,
         travelTo: travelTo || undefined,
         flightNumber: flightNumberFilter.trim() || undefined,
@@ -491,21 +498,45 @@ export function OrdersPage() {
             </select>
           </div>
           <div>
-            <label className="label">出行起始</label>
+            <label className="label">下单时间 · 起始</label>
+            <input
+              type="date"
+              className="input"
+              value={createdFrom}
+              max={createdTo || undefined}
+              onChange={(e) => setCreatedFrom(e.target.value)}
+              title="按下单日期（录入/创建时间）筛选，配合导出看当天进单量"
+            />
+          </div>
+          <div>
+            <label className="label">下单时间 · 截止</label>
+            <input
+              type="date"
+              className="input"
+              value={createdTo}
+              min={createdFrom || undefined}
+              onChange={(e) => setCreatedTo(e.target.value)}
+              title="按下单日期（录入/创建时间）筛选，配合导出看当天进单量"
+            />
+          </div>
+          <div>
+            <label className="label">出行日期 · 起始</label>
             <input
               type="date"
               className="input"
               value={travelFrom}
               onChange={(e) => setTravelFrom(e.target.value)}
+              title="按乘客实际出行日期筛选（与下单时间不同）"
             />
           </div>
           <div>
-            <label className="label">出行截止</label>
+            <label className="label">出行日期 · 截止</label>
             <input
               type="date"
               className="input"
               value={travelTo}
               onChange={(e) => setTravelTo(e.target.value)}
+              title="按乘客实际出行日期筛选（与下单时间不同）"
             />
           </div>
           <div>
@@ -612,7 +643,7 @@ export function OrdersPage() {
             />
           </div>
         </div>
-        {(statusFilter || kindFilter || channelFilter || agentFilter || search || flightNumberFilter || passengerNameFilter || invoiceFilter) && (
+        {(statusFilter || kindFilter || channelFilter || agentFilter || search || flightNumberFilter || passengerNameFilter || invoiceFilter || createdFrom || createdTo || travelFrom || travelTo) && (
           <div className="mt-3 flex items-center justify-between text-xs text-slate-500">
             <span>显示 {filtered.length} 条订单</span>
             <button
@@ -620,6 +651,7 @@ export function OrdersPage() {
               onClick={() => {
                 setStatusFilter(''); setKindFilter(''); setChannelFilter(''); setAgentFilter(''); setSearch('');
                 setFlightNumberFilter(''); setPassengerNameFilter(''); setInvoiceFilter('');
+                setCreatedFrom(''); setCreatedTo(''); setTravelFrom(''); setTravelTo('');
               }}
             >
               清除所有过滤

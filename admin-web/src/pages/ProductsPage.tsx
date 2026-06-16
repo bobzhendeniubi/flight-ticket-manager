@@ -866,6 +866,14 @@ function NewBundleWizard({
                   <option key={o.id} value={o.id}>{o.label}</option>
                 ))}
               </select>
+              <p className="mt-1 text-xs text-ink-soft">
+                💡 关联后：房控库存会联动套餐可售日期；选的人数超过房型容量时自动加房收费。<span className="font-medium">不关联 = 酒店不参与库存/日期校验</span>。
+              </p>
+              {!hotelRoomTypeId && roomTypeOptions.length > 0 && (
+                <p className="mt-1 rounded-md border border-amber-300 bg-amber-50 px-2 py-1 text-xs text-amber-800">
+                  ⚠️ 未关联酒店：该套餐不做房量/日期校验。建议从上方下拉选一个房型；确需纯机票/无房套餐可保留"不关联"。
+                </p>
+              )}
               <p className="mt-1 text-xs text-ink-muted">找不到酒店？在 产品管理 › 酒店 里添加/编辑（含介绍、图片、房型）。</p>
             </div>
             {hotelRoomTypeId && (
