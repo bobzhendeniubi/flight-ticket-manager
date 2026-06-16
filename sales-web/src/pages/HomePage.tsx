@@ -476,7 +476,7 @@ export function HomePage() {
             <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-brand-50 text-brand">
               <Icon name="car" className="h-6 w-6" />
             </div>
-            <h3 className="mt-2 font-semibold text-slate-900">机场接送 / 包车</h3>
+            <h3 className="mt-2 font-semibold text-slate-900">地面服务</h3>
             <p className="mt-1 text-slate-600">中文司机点对点、一日游包车，航班延误自动顺延</p>
           </div>
           <div>

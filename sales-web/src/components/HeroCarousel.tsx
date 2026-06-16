@@ -37,8 +37,8 @@ const HERO_SLIDES: HeroSlide[] = [
     kickerIcon: 'package',
     kicker: '全包套餐 · 明白消费',
     title: '一价全含 · 拎包出发',
-    subtitle: '往返机票 · 签证 · 酒店含早 · 中文客服 · 当地接送，一次订齐不操心。',
-    chips: ['酒店含双早', '签证代办', '当地接送'],
+    subtitle: '往返机票 · 签证 · 酒店含早 · 中文客服 · 当地地面服务，一次订齐不操心。',
+    chips: ['酒店含双早', '签证代办', '当地地面服务'],
   },
   {
     photo: 'https://images.unsplash.com/photo-1540541338287-41700207dee6?w=1600&h=600&fit=crop',

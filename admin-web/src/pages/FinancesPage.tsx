@@ -34,7 +34,7 @@ type Tab = 'summary' | 'flights' | 'orders' | 'monthly' | 'costs';
 const KIND_LABEL: Record<string, string> = {
   FLIGHT: '机票',
   HOTEL: '酒店',
-  TRANSFER: '接送',
+  TRANSFER: '地面服务',
   VISA: '签证',
   BUNDLE: '套餐',
   INSURANCE: '保险',
@@ -1180,7 +1180,7 @@ function ProductCostEditors({ token }: { token: string }) {
 
       {/* 接送 */}
       <div className="card">
-        <h2 className="text-sm font-semibold text-ink">接送车队结算价</h2>
+        <h2 className="text-sm font-semibold text-ink">地面服务车队结算价</h2>
         <table className="mt-3 w-full text-sm">
           <thead className="text-xs uppercase tracking-wide text-ink-muted">
             <tr className="border-b border-slate-200">

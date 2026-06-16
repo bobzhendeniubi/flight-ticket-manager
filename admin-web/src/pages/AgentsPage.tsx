@@ -462,7 +462,7 @@ const PARENT_RATES: Record<number, RateMap> = {
 };
 
 const PRODUCT_LABEL: Record<ProductKey, string> = {
-  FLIGHT: '✈️ 机票', HOTEL: '🏨 酒店', TRANSFER: '🚐 接送', VISA: '🛂 签证', BUNDLE: '🎁 套餐',
+  FLIGHT: '✈️ 机票', HOTEL: '🏨 酒店', TRANSFER: '🚐 地面服务', VISA: '🛂 签证', BUNDLE: '🎁 套餐',
 };
 
 function CommissionTab({ agent }: { agent: AgentListItem }) {

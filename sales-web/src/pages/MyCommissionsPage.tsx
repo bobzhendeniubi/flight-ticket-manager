@@ -45,7 +45,7 @@ const STATUS_COLOR: Record<SettlementStatus, string> = {
 const PRODUCT_LABEL: Record<'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA', string> = {
   FLIGHT: '机票',
   HOTEL: '酒店',
-  TRANSFER: '接送',
+  TRANSFER: '地面服务',
   VISA: '签证',
 };
 

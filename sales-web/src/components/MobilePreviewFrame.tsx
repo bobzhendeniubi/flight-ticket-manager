@@ -80,7 +80,7 @@ export function MobilePreviewFrame() {
         <QuickLink to="/" label="套餐" />
         <QuickLink to="/flights" label="机票" />
         <QuickLink to="/hotels" label="酒店" />
-        <QuickLink to="/transfers" label="接送" />
+        <QuickLink to="/transfers" label="地面服务" />
         <QuickLink to="/visas" label="签证" />
         <QuickLink to="/cart" label="购物车" />
         <QuickLink to="/orders" label="订单" />

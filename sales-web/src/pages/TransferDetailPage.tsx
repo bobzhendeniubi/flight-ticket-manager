@@ -261,7 +261,7 @@ export default function TransferDetailPage() {
       <Breadcrumb
         items={[
           { label: '首页', to: '/' },
-          { label: '机场接送 / 包车', to: '/transfers' },
+          { label: '地面服务', to: '/transfers' },
           { label: transfer.name },
         ]}
       />

@@ -125,12 +125,12 @@ export function TransfersPage() {
   return (
     <div className="space-y-6">
       <Seo
-        title="机场接送 / 包车"
+        title="地面服务"
         description="机场点对点 + 当地包车 + 一日游接驳，配中文司机，航班延误自动顺延。"
         canonicalPath="/transfers"
       />
       <section className="card">
-        <h1 className="text-2xl font-extrabold tracking-tight text-ink">机场接送 / 包车</h1>
+        <h1 className="text-2xl font-extrabold tracking-tight text-ink">地面服务</h1>
         <p className="mt-1 text-sm text-ink-soft">
           机场点对点 + 当地包车 + 一日游接驳，配中文司机，航班延误自动顺延。
         </p>

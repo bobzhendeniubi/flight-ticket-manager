@@ -21,7 +21,7 @@ const REASONS: Reason[] = [
   {
     icon: 'package',
     title: '一价全包，省心',
-    desc: '机票 + 酒店 + 签证 + 接送整体打包，一个价格搞定海岛度假，不用逐项比价、来回拼凑。',
+    desc: '机票 + 酒店 + 签证 + 地面服务整体打包，一个价格搞定海岛度假，不用逐项比价、来回拼凑。',
   },
   {
     icon: 'mapPin',
@@ -49,7 +49,7 @@ interface TrustItem {
 const TRUST: TrustItem[] = [
   { icon: 'shield', label: '经营资质', value: '正规旅行社（牌照号待补 placeholder）' },
   { icon: 'plane', label: '主营线路', value: '澳门 ⇌ 岘港海岛专线' },
-  { icon: 'gift', label: '套餐内含', value: '机票 + 酒店 + 签证 + 接送' },
+  { icon: 'gift', label: '套餐内含', value: '机票 + 酒店 + 签证 + 地面服务' },
   { icon: 'support', label: '客服支持', value: '中文客服 · 工作时间在线' },
 ];
 
@@ -58,7 +58,7 @@ export default function AboutPage() {
     <div className="mx-auto max-w-4xl">
       <Seo
         title="关于我们"
-        description="世途旅行 · Citur Travel — 澳门⇌岘港海岛专线，专注机票+酒店+签证+接送一价全包的海岛度假。"
+        description="世途旅行 · Citur Travel — 澳门⇌岘港海岛专线，专注机票+酒店+签证+地面服务一价全包的海岛度假。"
         canonicalPath="/about"
       />
 
@@ -72,7 +72,7 @@ export default function AboutPage() {
         </span>
         <h1 className="mt-4 text-3xl font-extrabold tracking-tight md:text-4xl">世途旅行 · Citur Travel</h1>
         <p className="mt-3 max-w-2xl text-base leading-relaxed text-white/90 md:text-lg">
-          我们把海岛度假这件事做简单：机票、酒店、签证、接送一价全包，明码标价、须知透明、客服在线。
+          我们把海岛度假这件事做简单：机票、酒店、签证、地面服务一价全包，明码标价、须知透明、客服在线。
           让你只管享受海岛阳光，繁琐的预订交给我们。
         </p>
       </header>
@@ -82,7 +82,7 @@ export default function AboutPage() {
         <h2 className="section-title text-xl">我们是谁</h2>
         <div className="section-sub space-y-3 text-base leading-relaxed text-ink-soft">
           <p>
-            世途旅行（Citur Travel）专注澳门⇌岘港海岛专线，为出行者提供机票 + 酒店 + 签证 + 接送的一站式打包预订。
+            世途旅行（Citur Travel）专注澳门⇌岘港海岛专线，为出行者提供机票 + 酒店 + 签证 + 地面服务的一站式打包预订。
             相比东拼西凑地分别预订，我们用一个套餐价覆盖整段行程，省下比价和协调的精力。
           </p>
           <p>

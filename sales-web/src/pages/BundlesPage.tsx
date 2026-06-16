@@ -194,7 +194,7 @@ function formatOccupancy(adultCount: number, childCount: number, infantCount: nu
 const KIND_LABEL: Record<BundleItem['kind'], { label: string; color: string }> = {
   FLIGHT: { label: '机票', color: 'bg-sky-100 text-sky-700' },
   HOTEL: { label: '酒店', color: 'bg-purple-100 text-purple-700' },
-  TRANSFER: { label: '接送', color: 'bg-pink-100 text-pink-700' },
+  TRANSFER: { label: '地面服务', color: 'bg-pink-100 text-pink-700' },
   VISA: { label: '签证', color: 'bg-amber-100 text-amber-700' },
 };
 

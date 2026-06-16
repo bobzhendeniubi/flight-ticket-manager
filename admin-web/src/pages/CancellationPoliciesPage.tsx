@@ -22,7 +22,7 @@ const tierToDraft = (t: CancellationTier): DraftTier => ({
 const KIND_LABEL: Record<ProductKind, string> = {
   FLIGHT: '机票',
   HOTEL: '酒店',
-  TRANSFER: '接送',
+  TRANSFER: '地面服务',
   VISA: '签证',
   BUNDLE: '套餐',
   INSURANCE: '保险',

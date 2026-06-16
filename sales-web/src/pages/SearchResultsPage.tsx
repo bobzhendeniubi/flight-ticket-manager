@@ -228,7 +228,7 @@ export default function SearchResultsPage() {
   const countSummary = [
     !bundles.errored && bundles.items.length > 0 ? `套餐 ${bundles.items.length}` : null,
     !hotels.errored && hotels.items.length > 0 ? `酒店 ${hotels.items.length}` : null,
-    !transfers.errored && transfers.items.length > 0 ? `接送 ${transfers.items.length}` : null,
+    !transfers.errored && transfers.items.length > 0 ? `地面服务 ${transfers.items.length}` : null,
     !visas.errored && visas.items.length > 0 ? `签证 ${visas.items.length}` : null,
     !flights.errored && flights.items.length > 0 ? `机票 ${flights.items.length}` : null,
   ]
@@ -340,7 +340,7 @@ export default function SearchResultsPage() {
           />
           <CategoryBlock
             icon="car"
-            title="接送 / 用车"
+            title="地面服务"
             state={transfers}
             q={q}
             render={(t) => (

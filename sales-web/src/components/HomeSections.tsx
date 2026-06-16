@@ -240,7 +240,7 @@ export function TransfersPreviewSection({ keyword }: { keyword: string }) {
 
   return (
     <section>
-      <SectionHeader icon="car" title="接送 / 包车" sub="中文司机点对点 · 航班延误自动顺延" to="/transfers" toLabel="全部用车" />
+      <SectionHeader icon="car" title="地面服务" sub="中文司机点对点 · 航班延误自动顺延" to="/transfers" toLabel="全部用车" />
       {visible.length === 0 ? (
         <div className="card mt-4 text-sm text-ink-soft">没有匹配"{keyword}"的用车产品。</div>
       ) : (

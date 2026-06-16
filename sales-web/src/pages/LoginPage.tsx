@@ -9,7 +9,7 @@ const HERO_IMG =
 
 const SELLING_POINTS: Array<{ icon: IconName; text: string }> = [
   { icon: 'plane', text: '澳门 ⇌ 岘港 自营直飞，每天一班' },
-  { icon: 'package', text: '机票 · 酒店含早 · 签证 · 接送一价全含' },
+  { icon: 'package', text: '机票 · 酒店含早 · 签证 · 地面服务一价全含' },
   { icon: 'support', text: '中文客服全程在线，落地无忧' },
 ];
 

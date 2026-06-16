@@ -474,7 +474,7 @@ function SiteFooter() {
       title: '产品服务',
       links: [
         { label: '酒店', to: '/hotels' },
-        { label: '接送机', to: '/transfers' },
+        { label: '地面服务', to: '/transfers' },
         { label: '签证', to: '/visas' },
         { label: '套餐', to: '/' },
       ],
@@ -510,7 +510,7 @@ function SiteFooter() {
               </span>
             </Link>
             <p className="mt-4 max-w-xs text-sm leading-relaxed text-ink-soft">
-              澳门⇌岘港海岛专线，机票 + 酒店 + 签证 + 接送一价全包。中文客服全程在线，让海岛度假省心又省钱。
+              澳门⇌岘港海岛专线，机票 + 酒店 + 签证 + 地面服务一价全包。中文客服全程在线，让海岛度假省心又省钱。
             </p>
             <div className="mt-4 flex flex-wrap gap-2">
               <span className="badge-soft">

@@ -143,7 +143,7 @@ const FAQ_GROUPS: FaqGroup[] = [
   },
   {
     id: 'transfer',
-    title: '接送',
+    title: '地面服务',
     icon: 'car',
     faqs: [
       {

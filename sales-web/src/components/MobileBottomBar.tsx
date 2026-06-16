@@ -31,7 +31,7 @@ interface MoreLink {
 
 const MORE_LINKS: MoreLink[] = [
   { to: '/hotels', label: '酒店', icon: 'hotel', desc: '海景 / 市区精选酒店' },
-  { to: '/transfers', label: '接送机', icon: 'car', desc: '澳门 ⇌ 机场专车接送' },
+  { to: '/transfers', label: '地面服务', icon: 'car', desc: '澳门 ⇌ 机场专车接送' },
   { to: '/visas', label: '签证', icon: 'visa', desc: '越南签证代办' },
   { to: '/lookup', label: '查订单', icon: 'search', desc: '免登录凭订单号查询' },
   { to: '/help', label: '帮助中心', icon: 'support', desc: '常见问题 / 退改 / 联系客服' },

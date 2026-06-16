@@ -22,7 +22,7 @@ type Section = 'hotels' | 'transfers' | 'visas' | 'bundles';
 
 const SECTIONS: { key: Section; label: string; emoji: string }[] = [
   { key: 'hotels', label: '酒店', emoji: '🏨' },
-  { key: 'transfers', label: '机场接送', emoji: '🚐' },
+  { key: 'transfers', label: '地面服务', emoji: '🚐' },
   { key: 'visas', label: '签证', emoji: '🛂' },
   { key: 'bundles', label: '套餐 / Bundle', emoji: '🎁' },
 ];
@@ -327,7 +327,7 @@ export function ProductsPage() {
       <section>
         <h1 className="page-title">产品管理</h1>
         <p className="page-sub">
-          维护酒店、机场接送、签证三大基础产品，组合成套餐 (Bundle) 销售。
+          维护酒店、地面服务、签证三大基础产品，组合成套餐 (Bundle) 销售。
           套餐可让利定价，提升客单价和打包销售率。
         </p>
         {loading && <div className="mt-2 rounded-lg bg-canvas px-3 py-2 text-xs text-ink-muted">加载中…</div>}
@@ -660,7 +660,7 @@ function BundlesSection({
 const KIND_LABEL: Record<BundleItem['kind'], { label: string; color: string }> = {
   FLIGHT: { label: '机票', color: 'bg-sky-100 text-sky-700' },
   HOTEL: { label: '酒店', color: 'bg-purple-100 text-purple-700' },
-  TRANSFER: { label: '接送', color: 'bg-pink-100 text-pink-700' },
+  TRANSFER: { label: '地面服务', color: 'bg-pink-100 text-pink-700' },
   VISA: { label: '签证', color: 'bg-amber-100 text-amber-700' },
 };
 
@@ -1445,7 +1445,7 @@ function EditTransferForm({ transfer, onCancel, onSave }: { transfer: MockTransf
   return (
     <section className="card border-brand-200 bg-brand-50/40">
       <div className="flex items-center justify-between">
-        <h3 className="font-semibold text-ink">编辑接送 · {transfer.name}</h3>
+        <h3 className="font-semibold text-ink">编辑地面服务 · {transfer.name}</h3>
         <button type="button" className="btn-ghost px-2 py-1 text-xl leading-none" onClick={onCancel}>×</button>
       </div>
       <form className="mt-3 grid gap-3 md:grid-cols-3" onSubmit={handleSubmit}>

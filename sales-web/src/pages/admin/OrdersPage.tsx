@@ -20,7 +20,7 @@ const ALL_STATUSES: MockOrderStatus[] = [
 const KIND_LABEL: Record<MockOrder['itemKind'], string> = {
   FLIGHT: '机票',
   HOTEL: '酒店',
-  TRANSFER: '接送',
+  TRANSFER: '地面服务',
   VISA: '签证',
   COMBO: '打包',
 };

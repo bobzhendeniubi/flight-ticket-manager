@@ -49,7 +49,7 @@ type OrderItemKindLabel = OrderItem['kind'];
 const KIND_LABEL: Record<OrderItemKindLabel, string> = {
   FLIGHT: '机票',
   HOTEL: '酒店',
-  TRANSFER: '接送',
+  TRANSFER: '地面服务',
   VISA: '签证',
   BUNDLE: '套餐',
   INSURANCE: '保险',
@@ -1047,7 +1047,7 @@ const FF_TYPE_LABEL: Record<FulfillmentTask['type'], { icon: string; label: stri
   FLIGHT_TICKETING: { icon: '✈️', label: '机票出票' },
   HOTEL_BOOKING: { icon: '🏨', label: '酒店确认' },
   VISA_APPLICATION: { icon: '🛂', label: '签证办理' },
-  TRANSFER_DISPATCH: { icon: '🚐', label: '接送调度' },
+  TRANSFER_DISPATCH: { icon: '🚐', label: '地面服务调度' },
   BUNDLE_COMPOSITE: { icon: '🎁', label: '套餐履约' },
 };
 

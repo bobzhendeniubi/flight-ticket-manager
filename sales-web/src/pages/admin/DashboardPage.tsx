@@ -81,7 +81,7 @@ export function AdminDashboardPage() {
               { label: '机票', pct: 62, color: 'bg-brand' },
               { label: '酒店', pct: 18, color: 'bg-indigo-500' },
               { label: '签证', pct: 13, color: 'bg-amber-500' },
-              { label: '机场接送', pct: 7, color: 'bg-pink-500' },
+              { label: '地面服务', pct: 7, color: 'bg-pink-500' },
             ].map((p) => (
               <div key={p.label}>
                 <div className="flex justify-between text-sm">
