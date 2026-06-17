@@ -473,7 +473,7 @@ function BundleDetailContent({
       name: b.name,
       description: b.tagline ?? `${b.name} 一价全含海岛专线套餐`,
       ...(b.photo ? { image: b.photo } : {}),
-      brand: { '@type': 'Brand', name: 'Citur Travel · 海岛专线' },
+      brand: { '@type': 'Brand', name: '椰岛假期 · 海岛专线' },
       offers: {
         '@type': 'Offer',
         priceCurrency: 'CNY',

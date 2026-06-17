@@ -18,7 +18,7 @@ export interface SeoProps {
   jsonLd?: object;
 }
 
-const SITE_NAME = 'Citur Travel · 海岛专线';
+const SITE_NAME = '椰岛假期 · 海岛专线';
 
 export function Seo({ title, description, image, canonicalPath, jsonLd }: SeoProps) {
   const fullTitle = title.includes(SITE_NAME) ? title : `${title} | ${SITE_NAME}`;

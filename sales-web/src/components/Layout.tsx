@@ -86,7 +86,7 @@ export function Layout() {
             <Icon name="menu" className="h-5 w-5" />
           </button>
 
-          <Link to="/" className="group flex items-center gap-2.5 truncate" aria-label="世途旅行">
+          <Link to="/" className="group flex items-center gap-2.5 truncate" aria-label="椰岛假期">
             <span
               aria-hidden
               className="flex h-9 w-9 shrink-0 items-center justify-center rounded-2xl text-white shadow-lift transition-transform duration-300 group-hover:-translate-y-0.5 group-hover:rotate-3"
@@ -95,7 +95,7 @@ export function Layout() {
               <Icon name="plane" className="h-5 w-5" />
             </span>
             <span className="flex flex-col leading-none">
-              <span className="text-base md:text-lg font-extrabold tracking-tight text-ink transition-colors group-hover:text-brand-700">世途旅行</span>
+              <span className="text-base md:text-lg font-extrabold tracking-tight text-ink transition-colors group-hover:text-brand-700">椰岛假期</span>
               <span className="hidden md:block mt-0.5 text-[11px] font-medium text-ink-muted">海岛专线 · 一站式预订</span>
             </span>
           </Link>
@@ -198,7 +198,7 @@ export function Layout() {
                   >
                     <Icon name="plane" className="h-4 w-4" />
                   </span>
-                  世途旅行
+                  椰岛假期
                 </span>
                 <button
                   onClick={closeMenu}
@@ -439,13 +439,13 @@ function LanguageSwitch({ className }: { className?: string }) {
   );
 }
 
-/** 多列页脚（E1）— 关于世途 / 帮助支持 / 法律条款 / 联系我们 + 品牌简介 + 社交 + 底部法律行。
+/** 多列页脚（E1）— 关于椰岛假期 / 帮助支持 / 法律条款 / 联系我们 + 品牌简介 + 社交 + 底部法律行。
  *  链接全用 react-router <Link>；手机端列堆叠，并留出底部导航高度（pb-24）。 */
 function SiteFooter() {
   const year = new Date().getFullYear();
 
   // 占位公司信息：真实主体名称与 ICP 备案号待法务/运营补全 —— 这里明确标注 placeholder。
-  const COMPANY_NAME = '世途旅行（Citur Travel）'; // 工商主体名称待确认（placeholder）
+  const COMPANY_NAME = '椰岛假期'; // 页脚展示品牌名（公司主体名称按要求不对外展示）
   const ICP = 'ICP 备案号：待补（placeholder）';
 
   const columns: Array<{
@@ -453,7 +453,7 @@ function SiteFooter() {
     links: Array<{ label: string; to: string }>;
   }> = [
     {
-      title: '关于世途',
+      title: '关于椰岛假期',
       links: [
         { label: '关于我们', to: '/about' },
         { label: '为什么选我们', to: '/about' },
@@ -496,7 +496,7 @@ function SiteFooter() {
         <div className="grid gap-8 md:grid-cols-12">
           {/* 品牌简介 + 社交 */}
           <div className="md:col-span-4">
-            <Link to="/" className="inline-flex items-center gap-2.5" aria-label="世途旅行">
+            <Link to="/" className="inline-flex items-center gap-2.5" aria-label="椰岛假期">
               <span
                 aria-hidden
                 className="flex h-9 w-9 items-center justify-center rounded-2xl text-white shadow-card"
@@ -505,8 +505,8 @@ function SiteFooter() {
                 <Icon name="plane" className="h-5 w-5" />
               </span>
               <span className="flex flex-col leading-none">
-                <span className="text-base font-extrabold tracking-tight text-ink">世途旅行</span>
-                <span className="mt-0.5 text-[11px] font-medium text-ink-muted">Citur Travel</span>
+                <span className="text-base font-extrabold tracking-tight text-ink">椰岛假期</span>
+                <span className="mt-0.5 text-[11px] font-medium text-ink-muted">Coco Holiday</span>
               </span>
             </Link>
             <p className="mt-4 max-w-xs text-sm leading-relaxed text-ink-soft">

@@ -57,7 +57,7 @@ export default function ContactPage() {
     <div className="mx-auto max-w-4xl">
       <Seo
         title="联系我们"
-        description="世途旅行客服渠道、营业时间与在线留言 —— 电话、微信、邮箱，出行问题全程协助。"
+        description="椰岛假期客服渠道、营业时间与在线留言 —— 电话、微信、邮箱，出行问题全程协助。"
         canonicalPath="/contact"
       />
 

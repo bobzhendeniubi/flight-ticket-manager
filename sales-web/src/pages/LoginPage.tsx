@@ -56,7 +56,7 @@ export function LoginPage() {
         <div className="relative flex h-44 flex-col justify-end p-6 lg:h-full lg:justify-between lg:p-12">
           <Link to="/" className="hidden items-center gap-2 text-lg font-extrabold text-white lg:flex">
             <Icon name="plane" className="h-5 w-5" />
-            <span>世途旅行</span>
+            <span>椰岛假期</span>
           </Link>
           <div className="text-white">
             <p className="text-sm font-semibold uppercase tracking-[0.2em] text-white/80">
@@ -76,7 +76,7 @@ export function LoginPage() {
               ))}
             </ul>
           </div>
-          <p className="hidden text-xs text-white/60 lg:block">© {new Date().getFullYear()} 世途旅行 · CITUR TRAVEL</p>
+          <p className="hidden text-xs text-white/60 lg:block">© {new Date().getFullYear()} 椰岛假期 · COCO HOLIDAY</p>
         </div>
       </aside>
 
@@ -85,7 +85,7 @@ export function LoginPage() {
         <div className="w-full max-w-sm animate-fade-up">
           <Link to="/" className="mb-8 flex items-center gap-2 text-xl font-extrabold text-brand lg:hidden">
             <Icon name="plane" className="h-5 w-5" />
-            <span>世途旅行</span>
+            <span>椰岛假期</span>
           </Link>
 
           <h2 className="text-2xl font-extrabold text-ink">欢迎回来</h2>

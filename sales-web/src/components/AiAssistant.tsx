@@ -38,7 +38,7 @@ export function AiAssistant() {
   const [messages, setMessages] = useState<DisplayMessage[]>([
     {
       role: 'assistant',
-      text: '你好！我是世途旅行 AI 助手 ✈️\n\n你可以：\n- 用人话告诉我你想要什么机票（日期/人数/舱位）\n- 点 📎 上传护照照片，我帮你 OCR 提取信息',
+      text: '你好！我是椰岛假期 AI 助手 ✈️\n\n你可以：\n- 用人话告诉我你想要什么机票（日期/人数/舱位）\n- 点 📎 上传护照照片，我帮你 OCR 提取信息',
     },
   ]);
   // 后端真正记忆 = aiHistory（包含 tool_use / tool_result blocks）
@@ -319,7 +319,7 @@ export function AiAssistant() {
             <div className="flex items-center gap-2">
               <span className="text-lg">🤖</span>
               <div>
-                <div className="font-semibold text-sm">世途 AI 助手</div>
+                <div className="font-semibold text-sm">椰岛假期 AI 助手</div>
                 <div className="text-xs opacity-80">Beta · 帮你找机票 + 报价</div>
               </div>
             </div>
