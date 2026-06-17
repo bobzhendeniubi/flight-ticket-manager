@@ -380,9 +380,15 @@ export function BundlesPage() {
 
       <section className="space-y-4">
         <div className="flex flex-wrap items-end justify-between gap-3">
-          <h2 className="section-title inline-flex items-center gap-2">
-            <Icon name="gift" className="h-5 w-5 text-brand" />一价全含套餐
-          </h2>
+          <div>
+            {/* 英文 eyebrow（Fraunces 展示字）—— 编辑气质，中文标题靠字重出彩 */}
+            <span className="text-display block text-[11px] font-semibold uppercase tracking-[0.2em] text-palm">
+              All-Inclusive Packages
+            </span>
+            <h2 className="section-title mt-0.5 inline-flex items-center gap-2">
+              <Icon name="gift" className="h-5 w-5 text-brand" />一价全含套餐
+            </h2>
+          </div>
           <div className="flex items-center gap-3">
             {status === 'ready' && (
               <SortSelect value={sort} options={SORT_OPTIONS} onChange={onSortChange} />
@@ -722,13 +728,13 @@ function ConfigurableBundleCard({
   const canOfferSingle = b.singleSupplementPerNight != null && seatPax >= 2;
 
   return (
-    <article className="card-interactive group overflow-hidden">
+    <article className="card-warm-interactive group overflow-hidden">
       {/* 图片整块可点 → 详情页（不影响下方加购按钮，按钮 stopPropagation 走自己的逻辑） */}
       <button
         type="button"
         onClick={onView}
         aria-label={`查看「${b.name}」套餐详情`}
-        className="relative block w-full overflow-hidden bg-slate-100 text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/60"
+        className="relative block w-full overflow-hidden bg-sand-light text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/60"
       >
         <Img src={b.photo} alt={b.name} ratio="4/3" className="img-zoom max-h-48" />
         <div className="pointer-events-none absolute inset-x-0 bottom-0 h-20 bg-gradient-to-t from-black/40 to-transparent" />
@@ -769,11 +775,11 @@ function ConfigurableBundleCard({
             </div>
           )}
 
-          {/* 含什么 一眼看清 */}
+          {/* 含什么 一眼看清 —— 棕榈绿福利 chip（含早/接送/签证/中文客服） */}
           <div className="mt-2 flex flex-wrap gap-1.5 text-xs">
             {inclusions.map((inc) => (
-              <span key={inc.label} className="badge-soft inline-flex items-center gap-1">
-                <Icon name={inc.icon} className="h-3.5 w-3.5 text-brand" />
+              <span key={inc.label} className="chip-palm">
+                <Icon name={inc.icon} className="h-3.5 w-3.5" />
                 {inc.label}
               </span>
             ))}

@@ -8,6 +8,7 @@ import { useLanguage, SUPPORTED_LANGUAGES, type SupportedLanguage } from '../i18
 import { MobilePreviewFrame } from './MobilePreviewFrame';
 import { MobileBottomBar } from './MobileBottomBar';
 import { Icon } from './Icon';
+import { WaveDivider } from './WaveDivider';
 
 // 浮动 AI 助手懒加载（G1 性能）：AiAssistant 体量大（~40KB），不该进首屏 bundle。
 // React.lazy + Suspense(fallback=null) 让它在外壳挂载后异步拉取 —— 行为与之前完全一致
@@ -72,7 +73,19 @@ export function Layout() {
   const closeMenu = () => setMobileMenuOpen(false);
 
   return (
-    <div className="min-h-screen flex flex-col bg-canvas">
+    <div className="relative min-h-screen flex flex-col bg-canvasWarm">
+      {/* 顶部柔和天幕（lagoon-light → 透明）+ 极淡颗粒：给整站一层海岛暖空气，
+          固定在视口顶部、pointer-events-none，不影响任何交互 / 布局。 */}
+      <div
+        aria-hidden
+        className="pointer-events-none fixed inset-x-0 top-0 z-0 h-64"
+        style={{
+          backgroundImage:
+            'linear-gradient(180deg, rgba(234,250,255,0.9) 0%, rgba(234,250,255,0.45) 38%, rgba(251,246,238,0) 100%)',
+        }}
+      />
+      <div aria-hidden className="grain pointer-events-none fixed inset-0 z-0" />
+
       {/* 顶部：品牌 + 前台导航 + 用户菜单 */}
       <header className="glass-header sticky top-0 z-40">
         <div className="mx-auto flex max-w-7xl items-center justify-between gap-2 px-3 py-2.5 md:gap-5 md:px-4 md:py-3">
@@ -86,17 +99,22 @@ export function Layout() {
             <Icon name="menu" className="h-5 w-5" />
           </button>
 
-          <Link to="/" className="group flex items-center gap-2.5 truncate" aria-label="椰岛假期">
+          <Link to="/" className="group flex items-center gap-2.5 truncate" aria-label="椰岛假期 Coco Holiday">
+            {/* 椰岛日轮标记：lagoon→brand 渐变底 + 暖金小太阳叠角，呼应海岛美学 */}
             <span
               aria-hidden
-              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-2xl text-white shadow-lift transition-transform duration-300 group-hover:-translate-y-0.5 group-hover:rotate-3"
-              style={{ backgroundImage: 'linear-gradient(135deg, #2fb6cb 0%, #0e8aa0 60%, #0a6e80 100%)' }}
+              className="relative flex h-9 w-9 shrink-0 items-center justify-center overflow-hidden rounded-2xl text-white shadow-lift transition-transform duration-300 group-hover:-translate-y-0.5 group-hover:rotate-3"
+              style={{ backgroundImage: 'linear-gradient(135deg, #19b8c9 0%, #0e8aa0 60%, #0a6e80 100%)' }}
             >
-              <Icon name="plane" className="h-5 w-5" />
+              <span
+                className="absolute -right-1.5 -top-1.5 h-5 w-5 rounded-full"
+                style={{ background: 'radial-gradient(circle at 40% 40%, #ffe8b4, #ffc86e 70%)' }}
+              />
+              <Icon name="plane" className="relative h-5 w-5" />
             </span>
             <span className="flex flex-col leading-none">
               <span className="text-base md:text-lg font-extrabold tracking-tight text-ink transition-colors group-hover:text-brand-700">椰岛假期</span>
-              <span className="hidden md:block mt-0.5 text-[11px] font-medium text-ink-muted">海岛专线 · 一站式预订</span>
+              <span className="text-display hidden md:block mt-0.5 text-[11px] font-medium uppercase tracking-[0.22em] text-brand-700/80">Coco Holiday</span>
             </span>
           </Link>
 
@@ -312,7 +330,7 @@ export function Layout() {
         )}
       </header>
 
-      <main className="flex-1">
+      <main className="relative z-10 flex-1">
         {/* 手机端底部留出 bottom bar 高度 + 页面操作条，避免内容被挡住 */}
         <div className="mx-auto w-full max-w-7xl px-4 pt-8 pb-32 md:pb-8">
           <Outlet />
@@ -491,7 +509,16 @@ function SiteFooter() {
   ];
 
   return (
-    <footer className="border-t border-slate-200/70 bg-surface text-sm text-ink-soft">
+    <footer className="relative z-10 mt-8 text-sm text-ink-soft">
+      {/* 顶部漂移波浪（翻转贴顶，波峰朝上"托住"页脚）—— 与 hero 底波呼应，标志性海岛母题。
+          色值 = 页脚暖沙底，让波浪与页脚无缝融合（波之上是页面暖底）。 */}
+      <div className="relative h-11" aria-hidden>
+        <WaveDivider fill="#f6ecdb" height={44} flip position="top" />
+      </div>
+      <div
+        className="border-t border-sand"
+        style={{ backgroundImage: 'linear-gradient(180deg, #f6ecdb 0%, #fbf4e9 100%)' }}
+      >
       <div className="mx-auto max-w-7xl px-4 py-10">
         <div className="grid gap-8 md:grid-cols-12">
           {/* 品牌简介 + 社交 */}
@@ -564,6 +591,7 @@ function SiteFooter() {
 
       {/* 手机端底部导航占位高度，避免最后一行被 bottom bar 挡住 */}
       <div className="h-20 md:hidden" aria-hidden />
+      </div>
     </footer>
   );
 }

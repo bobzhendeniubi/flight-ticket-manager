@@ -17,11 +17,17 @@ export function matchKeyword(keyword: string, ...fields: Array<string | null | u
   return fields.some((f) => (f ?? '').toLowerCase().includes(kw));
 }
 
-function SectionHeader({ icon, title, sub, to, toLabel }: { icon: IconName; title: string; sub?: string; to: string; toLabel: string }) {
+function SectionHeader({ icon, title, sub, to, toLabel, eyebrow }: { icon: IconName; title: string; sub?: string; to: string; toLabel: string; eyebrow?: string }) {
   return (
     <div className="flex items-end justify-between gap-2">
       <div>
-        <h2 className="section-title inline-flex items-center gap-2">
+        {/* 英文 eyebrow（Fraunces 展示字，编辑气质）—— 仅 Latin 走衬线，中文标题靠字重 */}
+        {eyebrow && (
+          <span className="text-display block text-[11px] font-semibold uppercase tracking-[0.2em] text-palm">
+            {eyebrow}
+          </span>
+        )}
+        <h2 className="section-title mt-0.5 inline-flex items-center gap-2">
           <Icon name={icon} className="h-5 w-5 text-brand" />
           {title}
         </h2>
@@ -86,6 +92,7 @@ export function BundlesPreviewSection({ keyword }: { keyword: string }) {
     <section>
       <SectionHeader
         icon="package"
+        eyebrow="All-Inclusive Packages"
         title="一价全含套餐"
         sub="机票 + 酒店含早 + 签证 + 接送一次订齐 · 一眼看清、马上能买"
         to="/bundles"
@@ -109,10 +116,10 @@ export function BundlesPreviewSection({ keyword }: { keyword: string }) {
             <Link
               key={b.id}
               to={`/bundles?kw=${encodeURIComponent(b.name)}`}
-              className="card-interactive group block overflow-hidden"
+              className="card-warm-interactive group block overflow-hidden"
             >
               {b.photo && (
-                <div className="relative h-40 w-full overflow-hidden bg-slate-100">
+                <div className="relative h-40 w-full overflow-hidden bg-sand-light">
                   <img
                     src={b.photo}
                     alt={b.name}
@@ -126,6 +133,11 @@ export function BundlesPreviewSection({ keyword }: { keyword: string }) {
                       立减 ¥{Number(b.groundDiscount).toLocaleString()}
                     </span>
                   )}
+                  {/* 一价全含徽标（棕榈绿，左上角） */}
+                  <span className="chip-palm absolute left-2.5 top-2.5 shadow-sm">
+                    <Icon name="check" className="h-3 w-3" />
+                    一价全含
+                  </span>
                 </div>
               )}
               <div className="p-4">
@@ -140,6 +152,18 @@ export function BundlesPreviewSection({ keyword }: { keyword: string }) {
                     <span className="truncate">{b.hotelRoomType.hotelName} · {b.hotelRoomType.name} · 含双早</span>
                   </p>
                 )}
+                {/* 含什么 — 棕榈绿福利 chip（含早/签证/接送，按行项判断） */}
+                <div className="mt-2 flex flex-wrap gap-1">
+                  {b.items.some((i) => i.kind === 'HOTEL') && (
+                    <span className="chip-palm"><Icon name="hotel" className="h-3 w-3" />含早</span>
+                  )}
+                  {b.items.some((i) => i.kind === 'VISA') && (
+                    <span className="chip-palm"><Icon name="visa" className="h-3 w-3" />签证</span>
+                  )}
+                  {b.items.some((i) => i.kind === 'TRANSFER') && (
+                    <span className="chip-palm"><Icon name="car" className="h-3 w-3" />地面服务</span>
+                  )}
+                </div>
                 {bundleFromPricePerPerson(b) > 0 && (
                   <p className="mt-2 flex items-baseline gap-1">
                     <span className="price text-lg">¥{bundleFromPricePerPerson(b).toLocaleString()}</span>
@@ -178,15 +202,15 @@ export function HotelsPreviewSection({ keyword }: { keyword: string }) {
 
   return (
     <section>
-      <SectionHeader icon="hotel" title="精选酒店" sub="直签合作 · 含早可选 · 与机票打包更优惠" to="/hotels" toLabel="全部酒店" />
+      <SectionHeader icon="hotel" eyebrow="Handpicked Stays" title="精选酒店" sub="直签合作 · 含早可选 · 与机票打包更优惠" to="/hotels" toLabel="全部酒店" />
       {visible.length === 0 ? (
         <div className="card mt-4 text-sm text-ink-soft">没有匹配"{keyword}"的酒店。</div>
       ) : (
         <div className="mt-4 grid grid-cols-2 gap-4 lg:grid-cols-4">
           {visible.slice(0, 4).map((h) => (
-            <Link key={h.id} to="/hotels" className="card-interactive group block overflow-hidden">
+            <Link key={h.id} to="/hotels" className="card-warm-interactive group block overflow-hidden">
               {h.photos[0] && (
-                <div className="relative h-28 w-full overflow-hidden bg-slate-100">
+                <div className="relative h-28 w-full overflow-hidden bg-sand-light">
                   <img
                     src={h.photos[0]}
                     alt={h.name}
@@ -240,14 +264,14 @@ export function TransfersPreviewSection({ keyword }: { keyword: string }) {
 
   return (
     <section>
-      <SectionHeader icon="car" title="地面服务" sub="中文司机点对点 · 航班延误自动顺延" to="/transfers" toLabel="全部用车" />
+      <SectionHeader icon="car" eyebrow="Ground Service" title="地面服务" sub="中文司机点对点 · 航班延误自动顺延" to="/transfers" toLabel="全部用车" />
       {visible.length === 0 ? (
         <div className="card mt-4 text-sm text-ink-soft">没有匹配"{keyword}"的用车产品。</div>
       ) : (
         <div className="mt-4 grid grid-cols-2 gap-4 lg:grid-cols-4">
           {visible.slice(0, 4).map((t) => (
-            <Link key={t.id} to="/transfers" className="card-interactive group flex flex-col p-4">
-              <div className="grid h-11 w-11 place-items-center rounded-xl bg-brand-50 text-brand">
+            <Link key={t.id} to="/transfers" className="card-warm-interactive group flex flex-col p-4">
+              <div className="grid h-11 w-11 place-items-center rounded-xl bg-palm-light text-palm">
                 <Icon name="car" className="h-6 w-6" />
               </div>
               <h3 className="mt-2 line-clamp-2 text-sm font-bold text-ink">{t.name}</h3>

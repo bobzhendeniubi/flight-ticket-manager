@@ -28,12 +28,15 @@
 
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <!-- Manrope = 正文 + 中文标题字重；Fraunces（可变衬线，opsz 轴）= 仅 Latin 展示位
+         （kicker 英文、Coco Holiday 罗马字、¥/时长/日期等大数字、英文副标题）。
+         Fraunces 不渲染中文 —— 中文标题靠字重/字号/字距出气质。 -->
     <link
-      href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap"
+      href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&display=swap"
       rel="stylesheet"
     />
   </head>
-  <body class="bg-canvas text-ink antialiased">
+  <body class="bg-canvasWarm text-ink antialiased">
     <div id="root"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>

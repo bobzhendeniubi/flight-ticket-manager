@@ -17,15 +17,17 @@ function benefitIcon(text: string): IconName {
 export function BenefitsStrip({ className }: { className?: string }) {
   return (
     <div
-      className={`flex flex-wrap items-center gap-x-5 gap-y-2 rounded-2xl border border-sun/30 bg-sun-light px-4 py-3 text-xs text-amber-800 shadow-card ${className ?? ''}`}
+      className={`flex flex-wrap items-center gap-x-3 gap-y-2 rounded-2xl border border-palm/20 px-4 py-3 text-xs text-ink-soft shadow-warm ${className ?? ''}`}
+      style={{ backgroundImage: 'linear-gradient(110deg, #e7f6ee 0%, #fbf4e9 60%, #fff6e6 100%)' }}
     >
-      <span className="inline-flex items-center gap-1.5 rounded-full bg-white/70 px-2.5 py-1 font-extrabold text-amber-900">
-        <Icon name="sparkles" className="h-3.5 w-3.5" />
+      {/* 标签头：暖金小太阳 + 棕榈绿气质 */}
+      <span className="inline-flex items-center gap-1.5 rounded-full bg-white/80 px-3 py-1 font-extrabold text-palm shadow-sm">
+        <Icon name="sparkles" className="h-3.5 w-3.5 text-sun" />
         福利享不停
       </span>
       {BENEFIT_ITEMS.map((b) => (
-        <span key={b.text} className="inline-flex items-center gap-1.5 font-medium">
-          <Icon name={benefitIcon(b.text)} className="h-4 w-4 text-amber-700" />
+        <span key={b.text} className="chip-palm">
+          <Icon name={benefitIcon(b.text)} className="h-3.5 w-3.5" />
           {b.text}
         </span>
       ))}

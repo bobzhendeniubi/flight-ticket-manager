@@ -140,4 +140,95 @@
     background-size: 800px 100%;
     @apply animate-shimmer;
   }
+
+  /* ─────────────────────────────────────────────────────────────
+     椰岛大气层（atmosphere primitives）—— 海岛美学的骨架
+     全部加在组件层，纯 CSS/SVG，零额外依赖
+     ───────────────────────────────────────────────────────────── */
+
+  /* Latin 展示字体（仅英文/数字用：kicker、Coco Holiday、¥/时长/日期）。
+     中文不走这个 —— 中文气质靠字重/字号/字距。 */
+  .text-display {
+    font-family: 'Fraunces', Georgia, 'Times New Roman', serif;
+    font-optical-sizing: auto;
+    letter-spacing: -0.01em;
+  }
+
+  /* 海洋→礁湖竖向渐变：天（lagoon-light）→ 海（brand）。hero/页面顶部天幕用。 */
+  .bg-island {
+    background-image: linear-gradient(180deg, #eafaff 0%, #a2e6ef 34%, #2fb6cb 72%, #0e8aa0 100%);
+  }
+
+  /* 暖阳辉光：右上角放置的暖色径向光，缓慢呼吸（sun.glow → 透明）。 */
+  .sun-glow {
+    background-image: radial-gradient(
+      circle at center,
+      rgba(255, 210, 122, 0.85) 0%,
+      rgba(255, 210, 122, 0.45) 32%,
+      rgba(255, 210, 122, 0) 70%
+    );
+    @apply animate-sun-glow;
+    will-change: transform, opacity;
+  }
+
+  /* 颗粒纹理：极淡 SVG 噪点叠层（~3% 不透明度），给画面一点空气感与质地。
+     用 data-uri，零额外请求；建议套在 pointer-events-none + absolute inset-0 的层上。 */
+  .grain {
+    background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='160' height='160' filter='url(%23n)' opacity='0.6'/%3E%3C/svg%3E");
+    opacity: 0.03;
+    mix-blend-mode: multiply;
+  }
+
+  /* 沙色暖卡：暖中性面 + 暖色软阴影，比纯白卡更亲和（海岛体感）。 */
+  .card-warm {
+    @apply rounded-2xl border border-sand/70 p-4 shadow-warm md:p-6;
+    background-color: #fbf4e9;
+  }
+  .card-warm-interactive {
+    @apply rounded-2xl border border-sand/70 shadow-warm transition-all duration-300;
+    background-color: #fbf4e9;
+  }
+  .card-warm-interactive:hover {
+    @apply -translate-y-1 shadow-warm-lift;
+    border-color: rgba(31, 138, 91, 0.35);
+  }
+
+  /* 棕榈绿福利 chip（含早/直飞/签证/地面服务 等正向福利）。 */
+  .chip-palm {
+    @apply inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-semibold;
+    background-color: #e7f6ee;
+    color: #15613f;
+  }
+
+  /* 波浪分隔条容器：放一条比父级更宽的波浪 SVG（w-[200%]），横向缓慢漂移成无缝循环。
+     标志性海岛母题，用在 hero 底部与页脚顶部。 */
+  .wave-divider {
+    @apply pointer-events-none absolute inset-x-0 overflow-hidden;
+    line-height: 0;
+  }
+  .wave-divider svg {
+    @apply block h-full w-[200%];
+    @apply animate-wave-drift;
+    will-change: transform;
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────
+   全局减少动态效果守卫（A11y）：用户系统偏好"减少动态"时，
+   关闭所有动画与位移（含上面的呼吸/漂移/升起），只保留静态终态。
+   ───────────────────────────────────────────────────────────── */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+  .sun-glow,
+  .wave-divider svg {
+    animation: none !important;
+    transform: none !important;
+  }
 }
