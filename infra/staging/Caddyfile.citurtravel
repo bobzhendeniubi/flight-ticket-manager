@@ -4,9 +4,11 @@
 #   systemctl restart caddy
 #
 # 前提：
-#   1. 阿里云 DNS：@ / www / admin / api 四条 A 记录 → 本机公网 IP
+#   1. 阿里云 DNS：@ / www / store / admin / api A 记录 → 本机公网 IP
 #   2. docker compose 用 SALES_WEB_BIND=127.0.0.1:8081、ADMIN_WEB_BIND=127.0.0.1:8080
 #      （80/443 让给 Caddy，Let's Encrypt 自动签证书）
+#   3. 主域名 landing page 静态文件在仓库 landing/ 目录，
+#      服务器上 git pull 后即位于 /opt/ftm/landing，无需额外构建
 
 # === 客户前台（销售网站）=================================
 store.citurtravel.com {
@@ -20,9 +22,25 @@ store.citurtravel.com {
     encode gzip zstd
 }
 
-# 主域名 / www 统一 301 到 store
-citurtravel.com, www.citurtravel.com {
-    redir https://store.citurtravel.com{uri} permanent
+# 主域名：公司 landing page（静态托管 /opt/ftm/landing）
+citurtravel.com {
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        Permissions-Policy "geolocation=(), microphone=(), camera=()"
+    }
+    # 静态资源按 7 天缓存（更新资源时改文件名即可）
+    @static path /assets/*
+    header @static Cache-Control "public, max-age=604800"
+    root * /opt/ftm/landing
+    file_server
+    encode gzip zstd
+}
+
+# www 统一 301 到主域名
+www.citurtravel.com {
+    redir https://citurtravel.com{uri} permanent
 }
 
 # === 管理后台 ============================================

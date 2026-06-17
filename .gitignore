@@ -53,3 +53,7 @@ yarn-error.log*
 ~$*.xlsx
 ~$*.docx
 ~$*.pptx
+
+# agent worktrees + build caches
+.claude/worktrees/
+**/.swc/
