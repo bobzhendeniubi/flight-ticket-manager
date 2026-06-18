@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { Link, NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../stores/auth';
 import { api, ApiError } from '../lib/api';
+import { ErrorBoundary } from './ErrorBoundary';
 
 const ROLE_LABEL: Record<string, string> = {
   STAFF: '运营',
@@ -229,7 +230,9 @@ export function Layout() {
 
         <main className="flex-1">
           <div className="mx-auto w-full max-w-[1400px] px-4 py-6 md:px-6 lg:px-8">
-            <Outlet />
+            <ErrorBoundary resetKey={location.pathname}>
+              <Outlet />
+            </ErrorBoundary>
           </div>
         </main>
 

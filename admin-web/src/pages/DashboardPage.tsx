@@ -200,12 +200,12 @@ export function DashboardPage() {
             </thead>
             <tbody>
               {recent.map((o) => {
-                const summary = o.items.map((it) => it.description).join(' + ');
+                const summary = (o.items ?? []).map((it) => it.description).join(' + ');
                 return (
                   <tr key={o.id}>
                     <td className="font-mono text-xs text-ink-soft">{o.orderNumber}</td>
                     <td className="text-ink">
-                      {o.user.displayName ?? o.contactName}
+                      {o.user?.displayName ?? o.contactName}
                       {o.agent && (
                         <span className="badge-info ml-2">
                           代理 · {o.agent.companyName ?? o.agent.contactName}
