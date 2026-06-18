@@ -128,6 +128,17 @@ function bundleApiToMock(b: ApiBundle): MockBundle {
   };
 }
 
+/**
+ * 住宿晚数唯一真源（持久化侧）：含 HOTEL 项的套餐，hotelNights 取套餐自身的
+ * hotelNights，回退到首个 HOTEL 项的 qty，再回退 1；不含 HOTEL 项则为 null。
+ * 与是否关联房型无关 —— 修复旧逻辑「未关联房型就把 hotelNights 置 null」。
+ */
+function persistedHotelNights(b: MockBundle): number | null {
+  const firstHotelQty = (b.items as BundleItem[]).find((it) => it.kind === 'HOTEL')?.qty ?? null;
+  if (firstHotelQty == null) return null;
+  return b.hotelNights ?? firstHotelQty ?? 1;
+}
+
 /** 套餐表单的酒店房型下拉选项（酒店名 · 房型名，value = roomTypeId） */
 interface RoomTypeOption {
   id: string;
@@ -284,7 +295,7 @@ export function ProductsPage() {
           items: n.items, flightPax: n.flightPax,
           groundDiscount: n.groundDiscount, suitableFor: n.suitableFor,
           hotelRoomTypeId: n.hotelRoomTypeId ?? null,
-          hotelNights: n.hotelRoomTypeId ? n.hotelNights ?? 1 : null,
+          hotelNights: persistedHotelNights(n),
           singleSupplementCnyPerNight: n.singleSupplementCnyPerNight ?? null,
           businessUpgradeCnyPerLeg: n.businessUpgradeCnyPerLeg ?? null,
           childSeatDiscountCnyPerPerson: n.childSeatDiscountCnyPerPerson ?? null,
@@ -302,7 +313,7 @@ export function ProductsPage() {
             items: n.items, flightPax: n.flightPax,
             groundDiscount: n.groundDiscount, suitableFor: n.suitableFor,
             hotelRoomTypeId: n.hotelRoomTypeId ?? null,
-            hotelNights: n.hotelRoomTypeId ? n.hotelNights ?? 1 : null,
+            hotelNights: persistedHotelNights(n),
             singleSupplementCnyPerNight: n.singleSupplementCnyPerNight ?? null,
             businessUpgradeCnyPerLeg: n.businessUpgradeCnyPerLeg ?? null,
             childSeatDiscountCnyPerPerson: n.childSeatDiscountCnyPerPerson ?? null,
@@ -792,7 +803,11 @@ function NewBundleWizard({
   const [emoji, setEmoji] = useState(initial?.emoji ?? '🎁');
   const [suitableFor, setSuitableFor] = useState(initial?.suitableFor ?? '2 大人');
   const [hotelRoomTypeId, setHotelRoomTypeId] = useState(initial?.hotelRoomTypeId ?? '');
-  const [hotelNights, setHotelNights] = useState<number | null>(initial?.hotelNights ?? 3);
+  // 住宿晚数 = 唯一真源：同时驱动 hotelNights + 首个 HOTEL 项的 qty。
+  // 预填：旧数据 hotelNights 可能为 null，回退到 HOTEL 项 qty，再回退 1。
+  const initialFirstHotelQty = initial?.items.find((it) => it.kind === 'HOTEL')?.qty ?? null;
+  const initialNights = initial ? initial.hotelNights ?? initialFirstHotelQty ?? 1 : 3;
+  const [hotelNights, setHotelNights] = useState<number | null>(initialNights);
   // 不可售日期（blackout，按出发日，单套餐粒度）+ 前台默认出发日
   const [blackoutDates, setBlackoutDates] = useState<BlackoutDateRow[]>(initial?.blackoutDates ?? []);
   const [defaultDepartDate, setDefaultDepartDate] = useState<string>(initial?.defaultDepartDate ?? '');
@@ -805,23 +820,50 @@ function NewBundleWizard({
   const [legs, setLegs] = useState<number | null>(initial?.legs ?? 2);
   // Local draft shape allowing null for in-progress numeric edits
   type DraftBundleItem = Omit<BundleItem, 'qty' | 'unitPrice'> & { qty: number | null; unitPrice: number | null };
-  const [items, setItems] = useState<DraftBundleItem[]>(
-    initial && initial.items.length > 0
-      ? initial.items.map((it) => ({ kind: it.kind, productName: it.productName, qty: it.qty, unitPrice: it.unitPrice }))
-      : [{ kind: 'HOTEL', productName: '岘港凯悦度假村 3 晚', qty: 3, unitPrice: 1880 }],
-  );
+  const [items, setItems] = useState<DraftBundleItem[]>(() => {
+    if (initial && initial.items.length > 0) {
+      const firstHotel = initial.items.findIndex((it) => it.kind === 'HOTEL');
+      // 首个 HOTEL 项数量归一到住宿晚数（修旧数据 qty 与 hotelNights 分叉）。
+      return initial.items.map((it, i) => ({
+        kind: it.kind,
+        productName: it.productName,
+        qty: i === firstHotel ? initialNights : it.qty,
+        unitPrice: it.unitPrice,
+      }));
+    }
+    return [{ kind: 'HOTEL', productName: '岘港凯悦度假村', qty: 3, unitPrice: 1880 }];
+  });
   const [discount, setDiscount] = useState<number | null>(initial?.groundDiscount ?? 500);
 
   const listPrice = useMemo(() => items.reduce((s, i) => s + (i.qty ?? 0) * (i.unitPrice ?? 0), 0), [items]);
   const discountValue = Math.min(listPrice, Math.max(0, discount ?? 0));
   const bundlePrice = Math.max(0, listPrice - discountValue);
+  // 住宿晚数是否可填 = 套餐里是否含 HOTEL 项（不再仅靠是否关联房型）。
+  const hasHotelItem = items.some((it) => it.kind === 'HOTEL');
+  const firstHotelIdx = items.findIndex((it) => it.kind === 'HOTEL');
+  // 名称里若写了「N 晚」，与当前晚数不一致 → 软提示（不阻断提交）。
+  const nameNightsMatch = name.match(/(\d+)\s*晚/);
+  const nameNights = nameNightsMatch ? Number(nameNightsMatch[1]) : null;
+  const nightsHint = hasHotelItem && nameNights != null && hotelNights != null && nameNights !== hotelNights;
+  // 关联房型时晚数必须 1–30；含 HOTEL 项时晚数须为正整数。
+  const nightsValid = !hasHotelItem || (hotelNights != null && hotelNights >= 1 && hotelNights <= 30);
   const hotelLinkValid = !hotelRoomTypeId || (hotelNights != null && hotelNights >= 1 && hotelNights <= 30);
-  const valid = name.length > 0 && items.length > 0 && bundlePrice > 0 && hotelLinkValid;
+  const valid = name.length > 0 && items.length > 0 && bundlePrice > 0 && hotelLinkValid && nightsValid;
+
+  // 住宿晚数 = 唯一真源：写入 hotelNights 的同时镜像给首个 HOTEL 项的 qty。
+  const setNights = (n: number | null) => {
+    setHotelNights(n);
+    if (n != null && firstHotelIdx >= 0) {
+      setItems((prev) =>
+        prev.map((it, i) => (i === firstHotelIdx ? { ...it, qty: n } : it)),
+      );
+    }
+  };
 
   const addItem = (kind: BundleItem['kind']) => {
     const presets: Record<BundleItem['kind'], DraftBundleItem> = {
       FLIGHT: { kind: 'HOTEL', productName: '（请从下方添加）', qty: 1, unitPrice: 0 },
-      HOTEL: { kind: 'HOTEL', productName: '岘港凯悦度假村 1 晚', qty: 3, unitPrice: 1880 },
+      HOTEL: { kind: 'HOTEL', productName: '岘港凯悦度假村', qty: hotelNights ?? 1, unitPrice: 1880 },
       TRANSFER: { kind: 'TRANSFER', productName: '岘港机场接送 商务车', qty: 2, unitPrice: 188 },
       VISA: { kind: 'VISA', productName: '越南 E-visa 30 天', qty: 2, unitPrice: 280 },
     };
@@ -876,10 +918,16 @@ function NewBundleWizard({
               )}
               <p className="mt-1 text-xs text-ink-muted">找不到酒店？在 产品管理 › 酒店 里添加/编辑（含介绍、图片、房型）。</p>
             </div>
-            {hotelRoomTypeId && (
+            {hasHotelItem && (
               <div>
-                <label className="label">晚数</label>
-                <NumberInput min={1} max={30} className="input" value={hotelNights} onChange={(n) => setHotelNights(n)} integerOnly />
+                <label className="label">住宿晚数 *</label>
+                <NumberInput min={1} max={30} className="input" value={hotelNights} onChange={setNights} integerOnly />
+                <p className="mt-1 text-xs text-ink-muted">同步酒店项数量；房控按此计入占房。</p>
+                {nightsHint && (
+                  <p className="mt-1 rounded-md border border-amber-300 bg-amber-50 px-2 py-1 text-xs text-amber-800">
+                    ⚠️ 套餐名里写的「{nameNights} 晚」与住宿晚数（{hotelNights} 晚）不一致，请确认。
+                  </p>
+                )}
               </div>
             )}
             <div>
@@ -990,17 +1038,29 @@ function NewBundleWizard({
                       setItems(next);
                     }}
                   />
-                  <NumberInput
-                    min={1}
-                    className="input w-16 text-xs"
-                    value={it.qty}
-                    onChange={(n) => {
-                      const next = [...items];
-                      next[idx] = { ...it, qty: n };
-                      setItems(next);
-                    }}
-                    integerOnly
-                  />
+                  {it.kind === 'HOTEL' && idx === firstHotelIdx ? (
+                    // 首个 HOTEL 项数量 = 住宿晚数派生值，只读，避免第二真源。
+                    <NumberInput
+                      min={1}
+                      className="input w-16 text-xs bg-canvas text-ink-muted"
+                      value={hotelNights}
+                      onChange={() => {}}
+                      disabled
+                      integerOnly
+                    />
+                  ) : (
+                    <NumberInput
+                      min={1}
+                      className="input w-16 text-xs"
+                      value={it.qty}
+                      onChange={(n) => {
+                        const next = [...items];
+                        next[idx] = { ...it, qty: n };
+                        setItems(next);
+                      }}
+                      integerOnly
+                    />
+                  )}
                   <NumberInput
                     min={0}
                     className="input w-24 text-xs"
@@ -1057,8 +1117,8 @@ function NewBundleWizard({
             {!valid && (
               <p className="text-xs text-rose-600">⚠️ 请填写套餐名 + 至少 1 个产品 + 套餐价 &gt; 0</p>
             )}
-            {!hotelLinkValid && (
-              <p className="text-xs text-rose-600">⚠️ 已关联酒店房型时，晚数需为 1–30 的整数</p>
+            {!nightsValid && (
+              <p className="text-xs text-rose-600">⚠️ 含酒店项时，住宿晚数需为 1–30 的整数</p>
             )}
           </div>
 
@@ -1086,7 +1146,8 @@ function NewBundleWizard({
                   suitableFor,
                   active: initial?.active ?? true,
                   hotelRoomTypeId: hotelRoomTypeId || null,
-                  hotelNights: hotelRoomTypeId ? hotelNights : null,
+                  // 住宿晚数唯一真源：含 HOTEL 项即提交晚数（与首个 HOTEL 项 qty 一致），与是否关联房型无关。
+                  hotelNights: hasHotelItem ? hotelNights ?? 1 : null,
                   singleSupplementCnyPerNight: singleSupplement,
                   businessUpgradeCnyPerLeg: businessUpgrade,
                   childSeatDiscountCnyPerPerson: childSeatDiscount,
