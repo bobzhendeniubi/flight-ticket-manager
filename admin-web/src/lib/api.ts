@@ -208,7 +208,32 @@ export type CreateOrderItemInput =
       infantCount?: number;
     });
 
-export interface CreateOrderInput {
+// 签证状态（录单/详情用）；后端 enum → 中文：
+// NOT_NEEDED=不需要 / NEEDED=需要 / E_VISA=电子签(三个月多次) / HAS_VISA=已签证
+export type VisaStatusInput = 'NOT_NEEDED' | 'NEEDED' | 'E_VISA' | 'HAS_VISA';
+
+export const VISA_STATUS_LABEL: Record<VisaStatusInput, string> = {
+  NOT_NEEDED: '不需要',
+  NEEDED: '需要',
+  E_VISA: '电子签(三个月多次)',
+  HAS_VISA: '已签证',
+};
+
+/** 结构化备注（签证状态 + 酒店/签证/付款/特殊要求）；每段 ≤300 字 */
+export interface OrderStructuredNotes {
+  /** 签证状态 */
+  visaStatus?: VisaStatusInput;
+  /** 酒店情况 */
+  noteHotel?: string;
+  /** 签证情况 */
+  noteVisa?: string;
+  /** 付款情况 */
+  notePayment?: string;
+  /** 特殊要求 */
+  noteSpecial?: string;
+}
+
+export interface CreateOrderInput extends OrderStructuredNotes {
   contactName: string;
   contactPhone: string;
   contactEmail?: string;
@@ -399,6 +424,13 @@ export interface OrderSummary {
   // 新增字段（5/20 反馈）
   notes?: string | null;
   internalNotes?: string | null;
+
+  // 签证状态 + 结构化备注（详情 getOrder 带出；列表可能为空）
+  visaStatus?: VisaStatusInput | null;
+  noteHotel?: string | null;
+  noteVisa?: string | null;
+  notePayment?: string | null;
+  noteSpecial?: string | null;
   claimedById?: string | null;
   claimedAt?: string | null;
   claimedBy?: { id: string; displayName: string | null; email: string | null } | null;
@@ -1046,11 +1078,11 @@ export const api = {
       token,
       body: { roomGroups },
     }),
-  // 修改订单备注
+  // 修改订单备注（自由备注 + 签证状态 + 结构化备注；任意子集）
   updateOrderNotes: (
     token: string,
     orderId: string,
-    body: { notes?: string; internalNotes?: string },
+    body: { notes?: string; internalNotes?: string } & OrderStructuredNotes,
   ) =>
     apiFetch<{ ok: boolean }>(`/orders/${orderId}/notes`, {
       method: 'PATCH',

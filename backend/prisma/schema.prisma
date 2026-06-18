@@ -784,6 +784,14 @@ enum OrderStatus {
   FAILED
 }
 
+// 订单级签证状态（录单时选择）：不需要 / 需要 / 电子签(三个月多次) / 已签证
+enum VisaRequirement {
+  NOT_NEEDED // 不需要
+  NEEDED // 需要
+  E_VISA // 电子签（三个月多次）
+  HAS_VISA // 已签证
+}
+
 enum OrderItemKind {
   FLIGHT
   HOTEL
@@ -828,8 +836,15 @@ model Order {
   contactEmail     String?
   paymentExpiresAt DateTime?
   idempotencyKey   String?       @unique
-  notes            String? // 客户填写的特殊说明
+  notes            String? // 客户填写的特殊说明（兼容保留：老的自由文本备注框）
   internalNotes    String? // 运营/客服内部备忘（客户看不到）
+  // 订单级签证状态（录单时选择）
+  visaStatus       VisaRequirement?
+  // 结构化备注四栏（取代「一个框 + 手工排序」的老做法）；与 notes 并存，互不影响
+  noteHotel        String? // 酒店
+  noteVisa         String? // 签证
+  notePayment      String? // 付款
+  noteSpecial      String? // 特殊
   // 防漏单：哪位运营接的单 + 接单时间
   claimedById      String?
   claimedAt        DateTime?

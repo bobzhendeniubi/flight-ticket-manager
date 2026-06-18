@@ -7,7 +7,19 @@ import {
   OrderStatus,
   PassengerType,
   PaymentMethod,
+  VisaRequirement,
 } from '@prisma/client';
+
+// ── 订单级签证状态 + 结构化备注四栏（录单/编辑共用）─────────────────────────
+// 全部 optional：老客户端不传则字段留空，与旧行为一致。每栏限 ~300 字。
+const STRUCTURED_NOTE_MAX = 300;
+export const orderStructuredNotesShape = {
+  visaStatus: z.nativeEnum(VisaRequirement).optional(),
+  noteHotel: z.string().max(STRUCTURED_NOTE_MAX).optional(),
+  noteVisa: z.string().max(STRUCTURED_NOTE_MAX).optional(),
+  notePayment: z.string().max(STRUCTURED_NOTE_MAX).optional(),
+  noteSpecial: z.string().max(STRUCTURED_NOTE_MAX).optional(),
+} as const;
 
 // ── 下单 ─────────────────────────────────────────────────────────────────
 // 乘客信息 — 注：所有新字段都是 optional，老客户端可继续工作
@@ -150,6 +162,8 @@ export const createOrderBodySchema = z.object({
   items: z.array(orderItemInputSchema).min(1).max(20),
   passengers: z.array(passengerInputSchema).min(1).max(20),
   notes: z.string().max(500).optional(),
+  // 签证状态 + 结构化备注四栏（可选；兼容旧客户端）
+  ...orderStructuredNotesShape,
   idempotencyKey: z.string().min(8).max(128).optional(),
   // 游客下单联系人（免登录时必填；登录用户忽略）
   guestContact: guestContactSchema.optional(),
@@ -255,6 +269,8 @@ export const batchCreateOrdersBodySchema = z.object({
   contactEmail: z.string().email().optional(),
   paymentMethod: z.nativeEnum(PaymentMethod).optional(),
   notes: z.string().max(500).optional(),
+  // 签证状态 + 结构化备注四栏（整批共用，写入每张子单）
+  ...orderStructuredNotesShape,
   // 运营批量录单时整批归属的代理（仅 ADMIN/STAFF 生效，校验同单条下单）。
   agentId: z.string().optional(),
   passengers: z.array(passengerInputSchema).min(1).max(100), // 每位 → 一单

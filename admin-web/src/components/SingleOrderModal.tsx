@@ -24,6 +24,8 @@ import {
   type OrderPassengerInput,
   type Transfer,
   type Visa,
+  type VisaStatusInput,
+  VISA_STATUS_LABEL,
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { NumberInput } from './NumberInput';
@@ -113,6 +115,12 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const [agentId, setAgentId] = useState('');
 
   const [notes, setNotes] = useState('');
+  // 签证状态 + 结构化备注（酒店/签证/付款/特殊要求）
+  const [visaStatus, setVisaStatus] = useState<VisaStatusInput>('NEEDED');
+  const [noteHotel, setNoteHotel] = useState('');
+  const [noteVisa, setNoteVisa] = useState('');
+  const [notePayment, setNotePayment] = useState('');
+  const [noteSpecial, setNoteSpecial] = useState('');
   const [passengers, setPassengers] = useState<PassengerRow[]>([emptyPassenger()]);
 
   const [submitting, setSubmitting] = useState(false);
@@ -372,6 +380,11 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       items: [built.item],
       passengers: passengerPayload,
       notes: notes.trim() || undefined,
+      visaStatus,
+      noteHotel: noteHotel.trim() || undefined,
+      noteVisa: noteVisa.trim() || undefined,
+      notePayment: notePayment.trim() || undefined,
+      noteSpecial: noteSpecial.trim() || undefined,
       idempotencyKey: idemKey,
       ...(agentId ? { agentId } : {}),
     };
@@ -417,6 +430,11 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                   setOkOrderNumber(null);
                   setPassengers([emptyPassenger()]);
                   setNotes('');
+                  setVisaStatus('NEEDED');
+                  setNoteHotel('');
+                  setNoteVisa('');
+                  setNotePayment('');
+                  setNoteSpecial('');
                 }}
               >
                 再录一单
@@ -649,6 +667,41 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                   <input className={inputCls} value={notes} onChange={(e) => setNotes(e.target.value)} />
                 </label>
               </div>
+            </div>
+
+            {/* 签证状态 + 结构化备注（酒店 / 签证 / 付款 / 特殊要求） */}
+            <div className="rounded-lg border border-slate-200 p-3">
+              <div className="grid gap-3 md:grid-cols-2">
+                <label className="text-xs text-slate-500">
+                  签证状态
+                  <select
+                    className={inputCls}
+                    value={visaStatus}
+                    onChange={(e) => setVisaStatus(e.target.value as VisaStatusInput)}
+                  >
+                    {(Object.keys(VISA_STATUS_LABEL) as VisaStatusInput[]).map((v) => (
+                      <option key={v} value={v}>{VISA_STATUS_LABEL[v]}</option>
+                    ))}
+                  </select>
+                </label>
+                <label className="text-xs text-slate-500">
+                  酒店情况（选填）
+                  <input className={inputCls} value={noteHotel} maxLength={300} onChange={(e) => setNoteHotel(e.target.value)} />
+                </label>
+                <label className="text-xs text-slate-500">
+                  签证情况（选填）
+                  <input className={inputCls} value={noteVisa} maxLength={300} onChange={(e) => setNoteVisa(e.target.value)} />
+                </label>
+                <label className="text-xs text-slate-500">
+                  付款情况（选填）
+                  <input className={inputCls} value={notePayment} maxLength={300} onChange={(e) => setNotePayment(e.target.value)} />
+                </label>
+                <label className="text-xs text-slate-500 md:col-span-2">
+                  特殊要求（选填）
+                  <input className={inputCls} value={noteSpecial} maxLength={300} onChange={(e) => setNoteSpecial(e.target.value)} />
+                </label>
+              </div>
+              <p className="mt-2 text-[11px] text-slate-400">机票 / 套餐默认「需要」签证；不涉及签证可选「不需要」。</p>
             </div>
 
             {/* 出行人 */}

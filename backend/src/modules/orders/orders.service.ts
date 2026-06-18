@@ -295,6 +295,12 @@ export class OrderService {
           paymentExpiresAt: new Date(Date.now() + 30 * 60 * 1000), // 30 分钟后超时
           idempotencyKey: body.idempotencyKey,
           notes: body.notes,
+          // 订单级签证状态 + 结构化备注四栏（可选；不传则留空，与旧行为一致）
+          visaStatus: body.visaStatus ?? null,
+          noteHotel: body.noteHotel ?? null,
+          noteVisa: body.noteVisa ?? null,
+          notePayment: body.notePayment ?? null,
+          noteSpecial: body.noteSpecial ?? null,
           items: {
             create: pricedItems.map((p) => ({
               kind: p.kind,
@@ -1056,6 +1062,12 @@ export class OrderService {
             contactEmail: body.contactEmail,
             paymentMethod: body.paymentMethod,
             notes: body.notes,
+            // 签证状态 + 结构化备注四栏（整批共用，写入每张子单）
+            visaStatus: body.visaStatus,
+            noteHotel: body.noteHotel,
+            noteVisa: body.noteVisa,
+            notePayment: body.notePayment,
+            noteSpecial: body.noteSpecial,
             // 整批归属代理（ADMIN/STAFF 录单）；AGENT 自助仍归属本人。
             agentId: body.agentId,
             items: [

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { api, ApiError, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceStatus, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate } from '../lib/api';
+import { api, ApiError, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceStatus, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type VisaStatusInput, VISA_STATUS_LABEL } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import {
   type FulfillmentStatus,
@@ -962,13 +962,18 @@ function OrderDrawer({
         <div className="px-6 py-5 space-y-6">
           <section>
             <div className="font-mono text-xs text-ink-muted">{order.orderNumber}</div>
-            <div className="mt-2 flex items-center gap-2">
+            <div className="mt-2 flex flex-wrap items-center gap-2">
               <span className={STATUS_COLOR[order.status]}>
                 {STATUS_LABEL[order.status]}
               </span>
               <span className="badge-neutral">
                 {KIND_LABEL[view.itemKind]}
               </span>
+              {order.visaStatus && (
+                <span className={`rounded px-2 py-0.5 text-[11px] font-medium ${VISA_STATUS_BADGE[order.visaStatus]}`}>
+                  签证：{VISA_STATUS_LABEL[order.visaStatus]}
+                </span>
+              )}
             </div>
           </section>
 
@@ -1490,20 +1495,58 @@ function OpsToolbar({ order }: { order: OrderSummary; onAdvance: (next: OrderSta
   );
 }
 
+// 签证状态徽标色（录单口径 enum；不同于履约任务状态）
+const VISA_STATUS_BADGE: Record<VisaStatusInput, string> = {
+  NOT_NEEDED: 'bg-slate-100 text-slate-500',
+  NEEDED: 'bg-amber-100 text-amber-700',
+  E_VISA: 'bg-sky-100 text-sky-700',
+  HAS_VISA: 'bg-emerald-100 text-emerald-700',
+};
+
+// 结构化备注录入口径展示顺序：酒店 → 签证 → 付款 → 特殊
+const STRUCTURED_NOTE_FIELDS = [
+  { key: 'noteHotel', label: '酒店情况', placeholder: '房型/入住时间/特殊安排' },
+  { key: 'noteVisa', label: '签证情况', placeholder: '材料进度/批文/送签情况' },
+  { key: 'notePayment', label: '付款情况', placeholder: '收款进度/尾款/退款备注' },
+  { key: 'noteSpecial', label: '特殊要求', placeholder: '客户其它特殊要求' },
+] as const;
+
 function NotesSection({ order }: { order: OrderSummary }) {
   const tokens = useAuth((s) => s.tokens);
   const [customerNotes, setCustomerNotes] = useState(order.notes ?? '');
   const [internalNotes, setInternalNotes] = useState(order.internalNotes ?? '');
+  const [visaStatus, setVisaStatus] = useState<VisaStatusInput>(order.visaStatus ?? 'NEEDED');
+  const [structured, setStructured] = useState({
+    noteHotel: order.noteHotel ?? '',
+    noteVisa: order.noteVisa ?? '',
+    notePayment: order.notePayment ?? '',
+    noteSpecial: order.noteSpecial ?? '',
+  });
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
 
-  const dirty = customerNotes !== (order.notes ?? '') || internalNotes !== (order.internalNotes ?? '');
+  const dirty =
+    customerNotes !== (order.notes ?? '') ||
+    internalNotes !== (order.internalNotes ?? '') ||
+    visaStatus !== (order.visaStatus ?? 'NEEDED') ||
+    structured.noteHotel !== (order.noteHotel ?? '') ||
+    structured.noteVisa !== (order.noteVisa ?? '') ||
+    structured.notePayment !== (order.notePayment ?? '') ||
+    structured.noteSpecial !== (order.noteSpecial ?? '');
 
   const save = async () => {
     if (!tokens?.accessToken) return;
     setSaving(true);
     try {
-      await api.updateOrderNotes(tokens.accessToken, order.id, { notes: customerNotes, internalNotes });
+      await api.updateOrderNotes(tokens.accessToken, order.id, {
+        notes: customerNotes,
+        internalNotes,
+        visaStatus,
+        noteHotel: structured.noteHotel,
+        noteVisa: structured.noteVisa,
+        notePayment: structured.notePayment,
+        noteSpecial: structured.noteSpecial,
+      });
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     } catch (e) {
@@ -1515,8 +1558,38 @@ function NotesSection({ order }: { order: OrderSummary }) {
 
   return (
     <section>
-      <h3 className="text-sm font-medium text-slate-700">备注</h3>
+      <div className="flex items-center gap-2">
+        <h3 className="text-sm font-medium text-slate-700">签证状态 / 备注</h3>
+        <span className={`rounded px-2 py-0.5 text-[11px] font-medium ${VISA_STATUS_BADGE[visaStatus]}`}>
+          {VISA_STATUS_LABEL[visaStatus]}
+        </span>
+      </div>
       <div className="mt-2 space-y-2">
+        <div>
+          <label className="text-xs text-slate-500">签证状态</label>
+          <select
+            className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 text-xs"
+            value={visaStatus}
+            onChange={(e) => setVisaStatus(e.target.value as VisaStatusInput)}
+          >
+            {(Object.keys(VISA_STATUS_LABEL) as VisaStatusInput[]).map((v) => (
+              <option key={v} value={v}>{VISA_STATUS_LABEL[v]}</option>
+            ))}
+          </select>
+        </div>
+        {STRUCTURED_NOTE_FIELDS.map((f) => (
+          <div key={f.key}>
+            <label className="text-xs text-slate-500">{f.label}</label>
+            <textarea
+              className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 text-xs"
+              rows={2}
+              value={structured[f.key]}
+              maxLength={300}
+              onChange={(e) => setStructured((prev) => ({ ...prev, [f.key]: e.target.value }))}
+              placeholder={f.placeholder}
+            />
+          </div>
+        ))}
         <div>
           <label className="text-xs text-slate-500">客户备注（客户可见）</label>
           <textarea

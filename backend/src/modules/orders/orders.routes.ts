@@ -17,6 +17,7 @@ import {
   exportRoomAllocationQuerySchema,
   exportTemplatesQuerySchema,
   listOrdersQuerySchema,
+  orderStructuredNotesShape,
   publicOrderLookupQuerySchema,
   updateStatusBodySchema,
 } from './orders.schemas.js';
@@ -519,16 +520,38 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   app.patch('/:id/notes', { preHandler: [app.authenticate] }, async (req, reply) => {
     const { id } = req.params as { id: string };
     const body = z
-      .object({ notes: z.string().max(2000).optional(), internalNotes: z.string().max(2000).optional() })
+      .object({
+        notes: z.string().max(2000).optional(),
+        internalNotes: z.string().max(2000).optional(),
+        // 订单级签证状态 + 结构化备注四栏（运营在已存在的订单上编辑）
+        ...orderStructuredNotesShape,
+      })
       .parse(req.body);
     const role = req.user.role;
-    // internalNotes 只有 ADMIN/STAFF 可改
-    if (body.internalNotes !== undefined && role !== UserRole.ADMIN && role !== UserRole.STAFF) {
-      return reply.status(403).send({ error: '仅运营/管理员可修改内部备注' });
+    const isOps = role === UserRole.ADMIN || role === UserRole.STAFF;
+    // internalNotes / 签证状态 / 结构化备注四栏 只有 ADMIN/STAFF 可改
+    const opsOnlyTouched =
+      body.internalNotes !== undefined ||
+      body.visaStatus !== undefined ||
+      body.noteHotel !== undefined ||
+      body.noteVisa !== undefined ||
+      body.notePayment !== undefined ||
+      body.noteSpecial !== undefined;
+    if (opsOnlyTouched && !isOps) {
+      return reply.status(403).send({ error: '仅运营/管理员可修改内部备注 / 签证状态 / 结构化备注' });
     }
     const before = await prisma.order.findUnique({
       where: { id },
-      select: { orderNumber: true, notes: true, internalNotes: true },
+      select: {
+        orderNumber: true,
+        notes: true,
+        internalNotes: true,
+        visaStatus: true,
+        noteHotel: true,
+        noteVisa: true,
+        notePayment: true,
+        noteSpecial: true,
+      },
     });
     if (!before) return reply.status(404).send({ error: '订单不存在' });
     await prisma.order.update({
@@ -536,6 +559,11 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       data: {
         ...(body.notes !== undefined && { notes: body.notes }),
         ...(body.internalNotes !== undefined && { internalNotes: body.internalNotes }),
+        ...(body.visaStatus !== undefined && { visaStatus: body.visaStatus }),
+        ...(body.noteHotel !== undefined && { noteHotel: body.noteHotel }),
+        ...(body.noteVisa !== undefined && { noteVisa: body.noteVisa }),
+        ...(body.notePayment !== undefined && { notePayment: body.notePayment }),
+        ...(body.noteSpecial !== undefined && { noteSpecial: body.noteSpecial }),
       },
     });
     void writeAudit({
@@ -544,7 +572,15 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       targetType: 'ORDER',
       targetId: id,
       targetLabel: before.orderNumber,
-      before: { notes: before.notes, internalNotes: before.internalNotes },
+      before: {
+        notes: before.notes,
+        internalNotes: before.internalNotes,
+        visaStatus: before.visaStatus,
+        noteHotel: before.noteHotel,
+        noteVisa: before.noteVisa,
+        notePayment: before.notePayment,
+        noteSpecial: before.noteSpecial,
+      },
       after: body,
     });
     return { ok: true };

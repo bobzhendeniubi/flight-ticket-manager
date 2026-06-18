@@ -56,6 +56,7 @@ import {
   resolveOrderAgentId,
 } from './orders.service.js';
 import type { OrderItemInput } from './orders.schemas.js';
+import { batchCreateOrdersBodySchema, createOrderBodySchema } from './orders.schemas.js';
 
 // ── Fixture helper：build 一个完整的 fake order（serializeOrder 要的字段全有） ──
 const dec = (n: number) => ({ toString: () => String(n) });
@@ -1191,5 +1192,107 @@ describe('resolveOrderAgentId · 代理归属', () => {
     );
     expect(resolved).toBeNull();
     expect(mockPrisma.agent.findUnique).not.toHaveBeenCalled();
+  });
+});
+
+// ── 订单级签证状态 + 结构化备注四栏：schema 受理 + serializer 暴露 ────────────
+describe('订单签证状态 + 结构化备注四栏', () => {
+  const onePassenger = {
+    fullName: '张三',
+    documentNumber: 'E12345678',
+    dateOfBirth: '1990-01-01',
+  };
+  const structured = {
+    visaStatus: 'E_VISA' as const,
+    noteHotel: '海景房 2 间',
+    noteVisa: '电子签待出',
+    notePayment: '已付定金 ¥2000',
+    noteSpecial: '蜜月布置',
+  };
+
+  it('createOrderBodySchema 受理 visaStatus + 四栏结构化备注', () => {
+    const parsed = createOrderBodySchema.parse({
+      contactName: '张三',
+      contactPhone: '13800000000',
+      items: [{ kind: 'VISA', description: '泰国签证', quantity: 1, unitPrice: 300 }],
+      passengers: [onePassenger],
+      ...structured,
+    });
+    expect(parsed.visaStatus).toBe('E_VISA');
+    expect(parsed.noteHotel).toBe('海景房 2 间');
+    expect(parsed.noteVisa).toBe('电子签待出');
+    expect(parsed.notePayment).toBe('已付定金 ¥2000');
+    expect(parsed.noteSpecial).toBe('蜜月布置');
+  });
+
+  it('createOrderBodySchema 四栏全缺省 → 解析通过（向后兼容，老客户端不传）', () => {
+    const parsed = createOrderBodySchema.parse({
+      contactName: '张三',
+      contactPhone: '13800000000',
+      items: [{ kind: 'VISA', description: '泰国签证', quantity: 1, unitPrice: 300 }],
+      passengers: [onePassenger],
+    });
+    expect(parsed.visaStatus).toBeUndefined();
+    expect(parsed.noteHotel).toBeUndefined();
+  });
+
+  it('结构化备注单栏超 300 字 → 拒绝', () => {
+    expect(() =>
+      createOrderBodySchema.parse({
+        contactName: '张三',
+        contactPhone: '13800000000',
+        items: [{ kind: 'VISA', description: '泰国签证', quantity: 1, unitPrice: 300 }],
+        passengers: [onePassenger],
+        noteHotel: 'x'.repeat(301),
+      }),
+    ).toThrow();
+  });
+
+  it('非法 visaStatus 枚举值 → 拒绝', () => {
+    expect(() =>
+      createOrderBodySchema.parse({
+        contactName: '张三',
+        contactPhone: '13800000000',
+        items: [{ kind: 'VISA', description: '泰国签证', quantity: 1, unitPrice: 300 }],
+        passengers: [onePassenger],
+        visaStatus: 'MAYBE',
+      }),
+    ).toThrow();
+  });
+
+  it('batchCreateOrdersBodySchema 受理 visaStatus + 四栏（整批共用）', () => {
+    const parsed = batchCreateOrdersBodySchema.parse({
+      flightScheduleId: 'fs1',
+      flightCabin: 'ECONOMY',
+      description: 'QH9589 澳门→岘港 2026-06-01 经济舱',
+      passengers: [onePassenger],
+      ...structured,
+    });
+    expect(parsed.visaStatus).toBe('E_VISA');
+    expect(parsed.notePayment).toBe('已付定金 ¥2000');
+  });
+
+  it('getOrder：serializer 透传 visaStatus + 四栏结构化备注（详情读路径）', async () => {
+    const service = new OrderService();
+    mockPrisma.order.findUnique.mockResolvedValue(
+      fakeFullOrder({
+        userId: 'someone-else',
+        visaStatus: 'E_VISA',
+        noteHotel: '海景房 2 间',
+        noteVisa: '电子签待出',
+        notePayment: '已付定金 ¥2000',
+        noteSpecial: '蜜月布置',
+        notes: '客户原始自由备注（兼容保留）',
+      }),
+    );
+    // ADMIN 直接通过 assertCanView
+    const result = await service.getOrder('ord1', { userId: 'admin1', role: 'ADMIN' });
+    expect(result.visaStatus).toBe('E_VISA');
+    expect(result.noteHotel).toBe('海景房 2 间');
+    expect(result.noteVisa).toBe('电子签待出');
+    expect(result.notePayment).toBe('已付定金 ¥2000');
+    expect(result.noteSpecial).toBe('蜜月布置');
+    // 兼容：老的 notes 字段仍然存在
+    expect(result.notes).toBe('客户原始自由备注（兼容保留）');
   });
 });
