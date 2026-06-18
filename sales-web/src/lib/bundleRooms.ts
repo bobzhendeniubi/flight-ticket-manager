@@ -1,7 +1,7 @@
 /**
  * 套餐房间数（roomsNeeded）前台镜像 —— 与后端 orders.service.computeRoomsNeeded 一一对应。
  *
- * 赵姐口径（verbatim）：「选的人数一间房坐不下时，自动加房、加的房按房价收钱；
+ * 业务口径（verbatim）：「选的人数一间房坐不下时，自动加房、加的房按房价收钱；
  * 房间数按房型能住几大人几小孩算。」
  *
  *   roomsNeeded = max( ceil(成人 / maxAdults), ceil(占座儿童 / maxChildren), 1 )

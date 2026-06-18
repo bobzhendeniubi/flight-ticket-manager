@@ -40,7 +40,7 @@ export interface CategoryBreakdown {
   orderItemCount: number;
 }
 
-/** 收入细分（贺帅口径，10 项；机场税收入按 pass-through = 对应 leg 机场税成本） */
+/** 收入细分（财务口径，10 项；机场税收入按 pass-through = 对应 leg 机场税成本） */
 export interface RevenueBreakdown {
   outboundFlight: number;     // 去程机票收入
   returnFlight: number;       // 返程机票收入
@@ -56,7 +56,7 @@ export interface RevenueBreakdown {
   total: number;              // 总和
 }
 
-/** 成本细分（贺帅口径，15 项） */
+/** 成本细分（财务口径，15 项） */
 export interface CostBreakdown {
   outboundCharter: number;    // 去程包机分摊（charter ÷ 总座 × paxCount）
   returnCharter: number;      // 返程包机分摊
@@ -97,7 +97,7 @@ export interface FinancesSummary {
   missingCostItemCount: number;
   /** 旧 UI 兼容：按 OrderItem.kind 粗分 */
   categories: CategoryBreakdown[];
-  /** 新：按贺帅口径细分 */
+  /** 新：按财务口径细分 */
   revenueBreakdown: RevenueBreakdown;
   costBreakdown: CostBreakdown;
 }
@@ -187,7 +187,7 @@ function round2(n: number): number {
   return Math.round(n * 100) / 100;
 }
 
-/** 计算财务概览（KPI + 按 OrderItem.kind 粗分 + 按贺帅口径细分） */
+/** 计算财务概览（KPI + 按 OrderItem.kind 粗分 + 按财务口径细分） */
 export async function getFinancesSummary(
   range: DateRange,
   client: PrismaClient = defaultPrisma,
@@ -281,7 +281,7 @@ export async function getFinancesSummary(
       categoryMap.set(key, cur);
     }
 
-    // 新细分（贺帅口径）
+    // 新细分（财务口径）
     // FLIGHT items: 按 departureTime 排序，第一段=去程，其余=返程
     const flightItems = o.items
       .filter((i) => i.kind === 'FLIGHT' && i.flightSchedule != null)

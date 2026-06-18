@@ -504,7 +504,7 @@ describe('computeBundleAddOn', () => {
     expect(r.total).toBe(1400);
   });
 
-  it('两项叠加（赵姐默认费率，3 晚来回，各 1 人）= 240 + 1400 = 1640', () => {
+  it('两项叠加（占座模型默认费率，3 晚来回，各 1 人）= 240 + 1400 = 1640', () => {
     const r = computeBundleAddOn(bundle, stamp, 1, 1, occ(2));
     expect(r.total).toBe(1640);
     expect(r.breakdown).toMatchObject({
@@ -544,7 +544,7 @@ describe('computeBundleAddOn', () => {
     expect(r.total).toBe(1400);
   });
 
-  // ── 占座儿童折扣 + 婴儿价（赵姐新需求）────────────────────────────────
+  // ── 占座儿童折扣 + 婴儿价（占座模型新需求）────────────────────────────────
   it('占座儿童折扣：1 小孩 × 30 → 套餐行净减 30（hasAddOn true）', () => {
     const r = computeBundleAddOn(bundle, stamp, 0, 0, occ(2, 1, 0));
     expect(r.breakdown.childSeatDiscountTotal).toBe(30);
@@ -839,7 +839,7 @@ describe('computeRequiredPassengerCount', () => {
   });
 
   it('2 大 1 小 1 婴 → 需 4 位（婴儿也是出行人，需护照）', () => {
-    // 赵姐核心场景：占座 3，出行人 4
+    // 占座核心场景：占座 3，出行人 4
     expect(computeRequiredPassengerCount([bundleWithCounts(2, 1, 1)])).toBe(4);
   });
 

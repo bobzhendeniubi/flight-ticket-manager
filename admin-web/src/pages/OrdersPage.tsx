@@ -65,7 +65,7 @@ const COMMISSION_RATE: Partial<Record<OrderItemKindLabel, number>> = {
   FLIGHT: 0.10, HOTEL: 0.08, TRANSFER: 0.15, VISA: 0.12,
 };
 
-// 开票状态（反馈：李萍）
+// 开票状态
 const INVOICE_LABEL: Record<string, string> = { NONE: '未开', REQUESTED: '待开', ISSUED: '已开' };
 const INVOICE_COLOR: Record<string, string> = {
   NONE: 'bg-slate-100 text-slate-500',
@@ -118,7 +118,7 @@ export function OrdersPage() {
   const [channelFilter, setChannelFilter] = useState<'' | 'direct' | 'agent'>('');
   const [agentFilter, setAgentFilter] = useState<string>('');
   const [search, setSearch] = useState('');
-  // 6/16 反馈（赵姐）：按下单日期(createdAt)筛 — 用于"当天进单多少"的导出
+  // 6/16 反馈（业务反馈）：按下单日期(createdAt)筛 — 用于"当天进单多少"的导出
   const [createdFrom, setCreatedFrom] = useState('');
   const [createdTo, setCreatedTo] = useState('');
   // 5/20 反馈：按出行日期筛 + 是否已认领

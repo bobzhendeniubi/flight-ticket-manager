@@ -97,7 +97,7 @@ export const bundleItemSchema = baseItemSchema.extend({
   //   businessCount = 选「升舱商务」的人数 → 每人每航段加 businessUpgradeCnyPerLeg（占用真实商务舱库存）
   singleCount: z.number().int().min(0).max(20).optional(),
   businessCount: z.number().int().min(0).max(20).optional(),
-  // 占座模型（赵姐需求）：区分成人 / 占座儿童 / 不占座婴儿（都需护照，均为出行人）：
+  // 占座模型（业务需求）：区分成人 / 占座儿童 / 不占座婴儿（都需护照，均为出行人）：
   //   adultCount  = 成人数（占 1 座、计入拼房）
   //   childCount  = 占座儿童数（占 1 座、计入拼房；机票按成人价减 childSeatDiscountCnyPerPerson）
   //   infantCount = 不占座婴儿数（不占座、不占房；机票收 infantPriceCny/人）

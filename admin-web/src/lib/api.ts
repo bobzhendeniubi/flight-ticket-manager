@@ -1455,7 +1455,7 @@ export interface CategoryBreakdown {
   marginPct: number | null;
   orderItemCount: number;
 }
-/** 贺帅口径：收入细分（10 项 + 未分类 + 总和） */
+/** 财务口径：收入细分（10 项 + 未分类 + 总和） */
 export interface RevenueBreakdown {
   outboundFlight: number;
   returnFlight: number;
@@ -1470,7 +1470,7 @@ export interface RevenueBreakdown {
   uncategorized: number;
   total: number;
 }
-/** 贺帅口径：成本细分（16 项 + 总和） */
+/** 财务口径：成本细分（16 项 + 总和） */
 export interface CostBreakdown {
   outboundCharter: number;
   returnCharter: number;

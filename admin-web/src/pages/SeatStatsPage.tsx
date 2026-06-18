@@ -12,7 +12,7 @@ import { api, ApiError, type AdminFlight, type AdminSchedule } from '../lib/api'
 import { airportLabel, CABIN_LABEL, formatLocalDate, formatLocalTime } from '../lib/airports';
 import { useAuth } from '../stores/auth';
 
-// 余位低于此值标红（反馈：李萍 — 方便及时调价 / 关注余位）
+// 余位低于此值标红（反馈：签证岗 — 方便及时调价 / 关注余位）
 const LOW_SEAT_THRESHOLD = 20;
 
 interface ScheduleStat extends AdminSchedule {

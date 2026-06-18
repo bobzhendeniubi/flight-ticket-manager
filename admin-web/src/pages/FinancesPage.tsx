@@ -1396,7 +1396,7 @@ function SummaryTab({ token, range }: { token: string; range: { from: string; to
   );
 }
 
-// ── Summary · 收入细分（贺帅口径 10 项）─────────────────────────────────────
+// ── Summary · 收入细分（财务口径 10 项）─────────────────────────────────────
 const REVENUE_ITEMS: { key: keyof Omit<FinanceSummary['revenueBreakdown'], 'uncategorized' | 'total'>; label: string }[] = [
   { key: 'outboundFlight', label: '去程机票收入' },
   { key: 'returnFlight', label: '返程机票收入' },
@@ -1416,7 +1416,7 @@ function RevenueBreakdownTable({ data }: { data: FinanceSummary }) {
   const pct = (n: number): number | null => (denom > 0 ? n / denom : null);
   return (
     <div className="card">
-      <h2 className="text-sm font-semibold text-ink">收入细分（按贺帅口径）</h2>
+      <h2 className="text-sm font-semibold text-ink">收入细分</h2>
       <div className="mt-3 overflow-x-auto">
         <table className="w-full text-sm">
           <thead className="text-xs uppercase tracking-wide text-ink-muted">
@@ -1451,7 +1451,7 @@ function RevenueBreakdownTable({ data }: { data: FinanceSummary }) {
   );
 }
 
-// ── Summary · 成本细分（贺帅口径 16 项）─────────────────────────────────────
+// ── Summary · 成本细分（财务口径 16 项）─────────────────────────────────────
 const COST_ITEMS: { key: keyof Omit<FinanceSummary['costBreakdown'], 'total'>; label: string }[] = [
   { key: 'outboundCharter', label: '去程包机分摊' },
   { key: 'returnCharter', label: '返程包机分摊' },
@@ -1477,7 +1477,7 @@ function CostBreakdownTable({ data }: { data: FinanceSummary }) {
   const pct = (n: number): number | null => (denom > 0 ? n / denom : null);
   return (
     <div className="card">
-      <h2 className="text-sm font-semibold text-ink">成本细分（按贺帅口径）</h2>
+      <h2 className="text-sm font-semibold text-ink">成本细分</h2>
       <div className="mt-3 overflow-x-auto">
         <table className="w-full text-sm">
           <thead className="text-xs uppercase tracking-wide text-ink-muted">

@@ -82,7 +82,7 @@ const SEAT_RELEASING_STATUSES: OrderStatus[] = [
 // 服务端价格校验容差（CNY）：客户端提交金额与服务端权威重算金额相差超过此值则拒单（A3）
 const PRICE_TOLERANCE_CNY = 1.0;
 
-// 护照有效期规则（相对出发日）— 反馈：李萍
+// 护照有效期规则（相对出发日）— 反馈：签证岗
 const PASSPORT_EXPIRY_BLOCK_DAYS = 90; // 不足 90 天禁止下单
 const PASSPORT_EXPIRY_SURCHARGE_DAYS = 180; // 不足 6 个月加收附加费
 const NEAR_EXPIRY_SURCHARGE_CNY = 200; // 每位临期乘客附加费
@@ -355,7 +355,7 @@ export class OrderService {
   // 定价 + 校验（事务外，节省行锁时间）
   // ════════════════════════════════════════════════════════════════════
   /**
-   * 护照有效期业务规则（反馈：李萍）。仅对有出发日的订单（含 FLIGHT）生效，
+   * 护照有效期业务规则（反馈：签证岗）。仅对有出发日的订单（含 FLIGHT）生效，
    * 且只检查填了 passportExpiry 的乘客（OCR/手填得到）。
    *   - 距出发日不足 90 天 → 禁止下单（抛 BadRequestError）
    *   - 距出发日不足 6 个月（180 天）→ 每位 +200 临期附加费（FEE 行）
@@ -599,7 +599,7 @@ export class OrderService {
           quantity: item.quantity,
           metadata: item.metadata,
         });
-        // 所需房间数：选的人数一间房坐不下时自动加房（赵姐口径）。
+        // 所需房间数：选的人数一间房坐不下时自动加房（业务口径）。
         //   roomsNeeded = max( ceil(成人/maxAdults), ceil(占座儿童/maxChildren), 1 )
         // 套餐没绑房型 / 容量缺失 → computeRoomsNeeded 回退默认 2大1小（≈旧 ceil(seatPax/2) 行为）。
         // 注意：单人入住（singleCount）不在此计入 —— 它是独立自愿加价项，容量才驱动房间数。
@@ -1560,7 +1560,7 @@ export function resolveBundleHotelStamp(
 export interface BundleAddOnBreakdown {
   singleCount: number; // 选「一个人住酒店（单人入住）」的人数
   businessCount: number; // 选「升舱商务」的人数
-  // 占座模型（赵姐需求）：成人 / 占座儿童 / 不占座婴儿
+  // 占座模型（业务需求）：成人 / 占座儿童 / 不占座婴儿
   adultCount: number; // 成人数（占座、占房）
   childCount: number; // 占座儿童数（占座、占房；机票按成人价减折扣）
   infantCount: number; // 不占座婴儿数（不占座、不占房；按婴儿价收）
@@ -1635,7 +1635,7 @@ export function resolveBundleOccupancy(item: BundleOccupancyInput): BundleOccupa
 
 // ── 按房型容量算所需房间数（C-v2 核心）────────────────────────────────
 /**
- * 赵姐口径："每个酒店房型可以 fit 几大人几小孩；选的人数一间房坐不下时，自动加房。"
+ * 业务口径："每个酒店房型可以 fit 几大人几小孩；选的人数一间房坐不下时，自动加房。"
  *
  *   roomsNeeded = max( ceil(成人 / maxAdults), ceil(占座儿童 / maxChildren), 1 )
  *
