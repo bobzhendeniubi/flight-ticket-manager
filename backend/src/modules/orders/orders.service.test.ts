@@ -24,6 +24,9 @@ const { mockPrisma, mockComputeQuote } = vi.hoisted(() => ({
     passenger: {
       findMany: vi.fn(),
     },
+    user: {
+      findUnique: vi.fn(),
+    },
   },
   mockComputeQuote: vi.fn(),
 }));
@@ -344,6 +347,75 @@ describe('OrderService 重复乘客校验', () => {
         { userId: 'u1', role: 'STAFF' },
       ),
     ).rejects.toThrow(/G88888888.*FTM-TEST-009/);
+  });
+
+  it('batchCreateOrders：不传 contactName/contactPhone → 录入人=登录账号（displayName 落 contactName）', async () => {
+    // 无重复 → 进入逐单建单
+    mockPrisma.passenger.findMany.mockResolvedValue([]);
+    // 登录用户：录入人 = 王操作（displayName）
+    mockPrisma.user.findUnique.mockResolvedValue({
+      displayName: '王操作',
+      email: 'op@example.com',
+      phone: '13900000000',
+    });
+    // 隔离 createOrder：只断言传入的 contact 是登录账号，不跑真事务
+    const createSpy = vi
+      .spyOn(service, 'createOrder')
+      .mockResolvedValue({ id: 'ord-1', orderNumber: 'FTM-001' } as never);
+
+    const result = await service.batchCreateOrders(
+      {
+        flightScheduleId: 'sched-1',
+        flightCabin: 'ECONOMY',
+        description: 'QH9589 澳门→岘港',
+        // 注意：不传 contactName / contactPhone
+        passengers: [fakePassenger('E12345678', '张三')],
+      },
+      { userId: 'u1', role: 'STAFF' },
+    );
+
+    expect(mockPrisma.user.findUnique).toHaveBeenCalledWith({
+      where: { id: 'u1' },
+      select: { displayName: true, email: true, phone: true },
+    });
+    // 录入人即登录账号：contactName=displayName，contactPhone=登录账号 phone
+    expect(createSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ contactName: '王操作', contactPhone: '13900000000' }),
+      { userId: 'u1', role: 'STAFF' },
+    );
+    expect(result.successCount).toBe(1);
+    expect(result.failureCount).toBe(0);
+    createSpy.mockRestore();
+  });
+
+  it('batchCreateOrders：显式传 contactName 时覆盖登录账号（兼容旧前端）', async () => {
+    mockPrisma.passenger.findMany.mockResolvedValue([]);
+    mockPrisma.user.findUnique.mockResolvedValue({
+      displayName: '王操作',
+      email: null,
+      phone: '13900000000',
+    });
+    const createSpy = vi
+      .spyOn(service, 'createOrder')
+      .mockResolvedValue({ id: 'ord-2', orderNumber: 'FTM-002' } as never);
+
+    await service.batchCreateOrders(
+      {
+        flightScheduleId: 'sched-1',
+        flightCabin: 'ECONOMY',
+        description: 'QH9589 澳门→岘港',
+        contactName: '指定联系人',
+        contactPhone: '13800000000',
+        passengers: [fakePassenger('E12345678', '张三')],
+      },
+      { userId: 'u1', role: 'STAFF' },
+    );
+
+    expect(createSpy).toHaveBeenCalledWith(
+      expect.objectContaining({ contactName: '指定联系人', contactPhone: '13800000000' }),
+      { userId: 'u1', role: 'STAFF' },
+    );
+    createSpy.mockRestore();
   });
 });
 

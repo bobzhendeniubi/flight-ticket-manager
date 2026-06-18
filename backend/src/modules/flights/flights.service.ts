@@ -456,19 +456,28 @@ export class FlightService {
     return this.listBaggagePolicies(flightId);
   }
 
+  /**
+   * 删除班次（路由层限 ADMIN）。
+   * 有销售则禁删 —— 任一舱位已售 sold>0，或已有订单项关联本班次，一律 400 拒绝
+   * （提示改用「售罄」即停用，保留历史数据）。无销售才硬删（级联清掉舱位 / 仓位阶梯）。
+   */
   async deleteSchedule(scheduleId: string) {
     const schedule = await prisma.flightSchedule.findUnique({
       where: { id: scheduleId },
-      include: { orderItems: { take: 1 } },
+      include: {
+        orderItems: { take: 1 },
+        seatClasses: { select: { sold: true } },
+      },
     });
     if (!schedule) throw new NotFoundError('班次不存在');
-    if (schedule.orderItems.length > 0) {
-      // 有订单关联 — 只能停用
-      return prisma.flightSchedule.update({
-        where: { id: scheduleId },
-        data: { isActive: !schedule.isActive },
-      });
+
+    const hasSold = schedule.seatClasses.some((c) => c.sold > 0);
+    const hasOrders = schedule.orderItems.length > 0;
+    if (hasSold || hasOrders) {
+      throw new BadRequestError('该班次已有销售，不能删除（请改用售罄）');
     }
+
+    // 无销售：硬删（onDelete: Cascade 自动清掉 seatClasses 及其 fareBuckets）
     await prisma.flightSchedule.delete({ where: { id: scheduleId } });
     return { id: scheduleId, deleted: true };
   }

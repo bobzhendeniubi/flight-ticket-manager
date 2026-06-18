@@ -1,13 +1,13 @@
 /**
- * 动态定价引擎 — 两层模型。
+ * 定价引擎 — 所见即所得（仓位价/底价即成交价）。
  *
- * Layer 1 (日期等级): DateRanking 表 → A/B/C/D → 倍率
- * Layer 2 (余位阶梯): 每 BUCKET_SIZE 张票一个 bucket，从 BUCKET_START 线性递增到 BUCKET_END
+ * LADDER（配了仓位阶梯）：按显式档位卖，仓位价即成交价；售罄一档自动开下一档。
+ * AUTO（无仓位阶梯）：固定底价 —— 每张票都是 round(basePrice)，不叠任何倍率。
  *
- * 最终单座价 = basePrice × 日期倍率 × bucket 倍率（取整）
- *
- * 跨 bucket 逻辑：遍历 sold+1 到 sold+qty，每个座位独立算 bucket index → 单价。
- * 这意味着一个订单里每张票可能价格不同（bucket 0 和 bucket 1 价格不同）。
+ * 历史说明：旧版 AUTO 曾用两层自动倍率「日期等级（DateRanking A/B/C/D）× 余位 bucket
+ * （0.7→1.55 线性）」做动态定价。应业主要求退役该老页 —— 定价统一到仓位阶梯，无阶梯则固定底价。
+ * dateRank 仍解析出来供运营内部参考，但不再参与定价（dateMultiplier 恒 1）。
+ * DateRanking 表保留休眠（不迁移/不删），只是不再应用其倍率。
  */
 import { CabinClass } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
@@ -15,40 +15,27 @@ import { BadRequestError, NotFoundError } from '../../lib/errors.js';
 import { computeLadderBreakdown } from './pricing.calc.js';
 import { parseFareBuckets } from './pricing.schemas.js';
 
-// ── 配置常量 ──────────────────────────────────────────────────────
-// 这些将来可以从 PricingConfig 表读取，目前用默认值。
-const BUCKET_SIZE = 10; // 每 bucket 多少张票
-const BUCKET_START_MULT = 0.7; // 最便宜的 bucket 倍率
-const BUCKET_END_MULT = 1.55; // 最贵的 bucket 倍率
-
-const RANK_MULTIPLIER: Record<string, number> = {
-  A: 1.5,
-  B: 1.2,
-  C: 1.0,
-  D: 0.8,
-};
-
 // ── 返回类型 ──────────────────────────────────────────────────────
 export interface SeatBreakdown {
   seatIndex: number; // 1-based: 这是该班次的第几张票（sold+1, sold+2, ...）
-  bucket: number; // 0-based bucket index
-  bucketMultiplier: number;
-  unitPrice: number; // = round(basePrice × dateMultiplier × bucketMultiplier)
+  bucket: number; // 0-based bucket index（AUTO 恒 0；LADDER 为所属档位）
+  bucketMultiplier: number; // 保留字段：AUTO/LADDER 均恒为 1（无倍率概念）
+  unitPrice: number; // = round(basePrice)（AUTO 固定底价）或该档仓位价（LADDER）
 }
 
 export interface PriceResult {
   scheduleId: string;
   cabin: CabinClass;
   qty: number;
-  // 定价模式：LADDER=按显式仓位阶梯卖（仓位价即成交价）；AUTO=旧版 basePrice×日期倍率×余位倍率
+  // 定价模式：LADDER=按显式仓位阶梯卖（仓位价即成交价）；AUTO=固定底价 round(basePrice)
   pricingMode: 'LADDER' | 'AUTO';
   basePrice: number;
   dateRank: string;
-  dateMultiplier: number; // LADDER 模式恒为 1（仓位价不叠日期倍率）
-  bucketSize: number; // AUTO=固定 BUCKET_SIZE；LADDER 无意义（保留字段，填 0）
-  totalBuckets: number; // AUTO=ceil(capacity/BUCKET_SIZE)；LADDER=阶梯档位数
-  currentBucket: number; // 下一张票所在的档（基于当前 sold）
-  currentBucketRemaining: number; // 当前档剩余多少张（驱动"还剩 X 张就涨价"）
+  dateMultiplier: number; // 两种模式均恒为 1（不再叠日期倍率，仅保留字段同形）
+  bucketSize: number; // 保留字段：AUTO 固定底价填 0；LADDER 无意义填 0
+  totalBuckets: number; // AUTO=1（固定底价不分档）；LADDER=阶梯档位数
+  currentBucket: number; // 下一张票所在的档（基于当前 sold；AUTO 恒 0）
+  currentBucketRemaining: number; // 当前档剩余多少张（LADDER 驱动"还剩 X 张就涨价"；AUTO=capacity−sold）
   perSeatBreakdown: SeatBreakdown[];
   totalPrice: number;
   averageUnitPrice: number; // = round(totalPrice / qty)
@@ -114,39 +101,20 @@ export class PricingService {
       };
     }
 
-    // 2. Layer 1 — 日期等级
+    // ── 固定底价模式（无仓位阶梯）─────────────────────────────────────────
+    // 所见即所得：每张票都是 round(basePrice)，不叠日期倍率、不叠余位倍率。
+    // dateRank 仍解析出来供运营内部参考，但 dateMultiplier 恒 1（不参与定价）。
     const dateRank = await this.resolveDateRank(
       seatClass.schedule.departureTz,
       seatClass.schedule.departureTime,
     );
-    const dateMultiplier = RANK_MULTIPLIER[dateRank] ?? 1.0;
 
-    // 3. Layer 2 — 余位阶梯
-    const totalBuckets = Math.max(1, Math.ceil(capacity / BUCKET_SIZE));
-    const getBucketMultiplier = (bucketIndex: number): number => {
-      if (totalBuckets <= 1) return 1.0;
-      const clamped = Math.min(bucketIndex, totalBuckets - 1);
-      return (
-        BUCKET_START_MULT +
-        ((BUCKET_END_MULT - BUCKET_START_MULT) * clamped) / (totalBuckets - 1)
-      );
-    };
-
-    // 当前 bucket（下一张票的 bucket）
-    const currentBucket = Math.floor(sold / BUCKET_SIZE);
-    const currentBucketEnd = (currentBucket + 1) * BUCKET_SIZE;
-    const currentBucketRemaining = Math.min(currentBucketEnd, capacity) - sold;
-
-    // 4. Per-seat breakdown
+    const unitPrice = Math.round(basePrice);
     const perSeatBreakdown: SeatBreakdown[] = [];
     let totalPrice = 0;
-
     for (let i = 0; i < qty; i++) {
       const seatIndex = sold + 1 + i; // 1-based
-      const bucket = Math.floor((seatIndex - 1) / BUCKET_SIZE);
-      const bucketMultiplier = getBucketMultiplier(bucket);
-      const unitPrice = Math.round(basePrice * dateMultiplier * bucketMultiplier);
-      perSeatBreakdown.push({ seatIndex, bucket, bucketMultiplier, unitPrice });
+      perSeatBreakdown.push({ seatIndex, bucket: 0, bucketMultiplier: 1, unitPrice });
       totalPrice += unitPrice;
     }
 
@@ -159,11 +127,11 @@ export class PricingService {
       pricingMode: 'AUTO',
       basePrice,
       dateRank,
-      dateMultiplier,
-      bucketSize: BUCKET_SIZE,
-      totalBuckets,
-      currentBucket,
-      currentBucketRemaining,
+      dateMultiplier: 1,
+      bucketSize: 0, // 固定底价无 bucket 概念
+      totalBuckets: 1, // 整段一个 bucket（不分档）
+      currentBucket: 0,
+      currentBucketRemaining: capacity - sold, // 整段剩余 = capacity − sold
       perSeatBreakdown,
       totalPrice,
       averageUnitPrice,

@@ -245,8 +245,10 @@ export const batchCreateOrdersBodySchema = z.object({
   flightScheduleId: z.string().min(1),
   flightCabin: z.nativeEnum(CabinClass),
   description: z.string().min(1).max(200), // 航段描述，如 "QH9589 澳门→岘港 2026-06-01 经济舱"
-  contactName: z.string().min(1).max(120), // 全批次共享联系人（一般是代理自己）
-  contactPhone: z.string().min(5).max(40),
+  // 录入人即登录账号 —— 后端用登录用户名兜底联系人，前台不再要求填写。
+  // 仍可选传（兼容旧前端/特殊场景）；不传则 service 用登录账号 displayName 落 contactName。
+  contactName: z.string().min(1).max(120).optional(),
+  contactPhone: z.string().min(5).max(40).optional(),
   contactEmail: z.string().email().optional(),
   paymentMethod: z.nativeEnum(PaymentMethod).optional(),
   notes: z.string().max(500).optional(),

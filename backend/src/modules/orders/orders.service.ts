@@ -944,7 +944,9 @@ export class OrderService {
   }
 
   /**
-   * 批量散客建单：选一个航班班次 + 舱位 + 共享联系人，名单里每位乘客各成一单（FLIGHT × 1）。
+   * 批量散客建单：选一个航班班次 + 舱位，名单里每位乘客各成一单（FLIGHT × 1）。
+   * 录入人即登录账号 —— 联系人/电话默认取登录用户（displayName / phone），
+   * 「系统谁录的就找谁」；body 仍可显式传 contactName/contactPhone 覆盖（兼容旧前端）。
    * 逐单复用 createOrder（含动态定价 / 原子扣座 / 订单号），单条失败不影响其余，逐行返回结果。
    */
   async batchCreateOrders(
@@ -962,6 +964,15 @@ export class OrderService {
       error?: string;
     }>;
   }> {
+    // 录入人 = 登录账号：查登录用户名作为联系人兜底（body 未传时用）。
+    // Order.contactName/contactPhone 是非空列，createOrder 又要求 min(1)，故需落具体值。
+    const recorder = await prisma.user.findUnique({
+      where: { id: requester.userId },
+      select: { displayName: true, email: true, phone: true },
+    });
+    const contactName = body.contactName ?? recorder?.displayName ?? recorder?.email ?? '系统录入';
+    const contactPhone = body.contactPhone ?? recorder?.phone ?? '-';
+
     // 重复乘客校验（整批先查，命中则整批拒绝，不产生部分建单）：
     // 1) 名单内证件号重复；2) 与同班次「占座中」订单的乘客证件号重复
     const seenDocs = new Set<string>();
@@ -994,8 +1005,8 @@ export class OrderService {
       try {
         const order = await this.createOrder(
           {
-            contactName: body.contactName,
-            contactPhone: body.contactPhone,
+            contactName,
+            contactPhone,
             contactEmail: body.contactEmail,
             paymentMethod: body.paymentMethod,
             notes: body.notes,

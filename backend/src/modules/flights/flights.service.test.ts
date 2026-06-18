@@ -10,11 +10,16 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // vi.mock 工厂会被 hoist 到文件顶部，故用 vi.hoisted 构造 prismaMock 供工厂与用例共用。
 const prismaMock = vi.hoisted(() => {
   const mock: {
-    flightSchedule: { findUnique: ReturnType<typeof vi.fn>; findUniqueOrThrow: ReturnType<typeof vi.fn>; update: ReturnType<typeof vi.fn> };
+    flightSchedule: {
+      findUnique: ReturnType<typeof vi.fn>;
+      findUniqueOrThrow: ReturnType<typeof vi.fn>;
+      update: ReturnType<typeof vi.fn>;
+      delete: ReturnType<typeof vi.fn>;
+    };
     flightSeatClass: { update: ReturnType<typeof vi.fn> };
     $transaction: ReturnType<typeof vi.fn>;
   } = {
-    flightSchedule: { findUnique: vi.fn(), findUniqueOrThrow: vi.fn(), update: vi.fn() },
+    flightSchedule: { findUnique: vi.fn(), findUniqueOrThrow: vi.fn(), update: vi.fn(), delete: vi.fn() },
     flightSeatClass: { update: vi.fn() },
     // $transaction(fn) 直接以同一个 mock 作为 tx 执行回调
     $transaction: vi.fn(async (fn: (tx: unknown) => unknown) => fn(mock)),
@@ -167,5 +172,65 @@ describe('FlightService.updateSchedule', () => {
       }),
     ).rejects.toMatchObject({ statusCode: 400 });
     expect(prismaMock.flightSeatClass.update).not.toHaveBeenCalled();
+  });
+});
+
+// ── deleteSchedule（有销售则禁删）─────────────────────────────────────
+describe('FlightService.deleteSchedule', () => {
+  const service = new FlightService();
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('无销售（sold=0、无订单项）→ 硬删，返回 { deleted: true }', async () => {
+    prismaMock.flightSchedule.findUnique.mockResolvedValue({
+      id: 'sched_1',
+      isActive: true,
+      orderItems: [],
+      seatClasses: [{ sold: 0 }, { sold: 0 }],
+    });
+    prismaMock.flightSchedule.delete.mockResolvedValue({ id: 'sched_1' });
+
+    const result = await service.deleteSchedule('sched_1');
+
+    expect(prismaMock.flightSchedule.delete).toHaveBeenCalledWith({ where: { id: 'sched_1' } });
+    expect(result).toEqual({ id: 'sched_1', deleted: true });
+  });
+
+  it('某舱位已售 sold>0 → 抛 400「该班次已有销售，不能删除（请改用售罄）」且不删', async () => {
+    prismaMock.flightSchedule.findUnique.mockResolvedValue({
+      id: 'sched_1',
+      isActive: true,
+      orderItems: [],
+      seatClasses: [{ sold: 0 }, { sold: 3 }], // 第二个舱位有销售
+    });
+
+    await expect(service.deleteSchedule('sched_1')).rejects.toMatchObject({
+      statusCode: 400,
+      message: '该班次已有销售，不能删除（请改用售罄）',
+    });
+    expect(prismaMock.flightSchedule.delete).not.toHaveBeenCalled();
+  });
+
+  it('有订单项关联（即便 sold=0）→ 抛 400 且不删', async () => {
+    prismaMock.flightSchedule.findUnique.mockResolvedValue({
+      id: 'sched_1',
+      isActive: true,
+      orderItems: [{ id: 'oi_1' }],
+      seatClasses: [{ sold: 0 }],
+    });
+
+    await expect(service.deleteSchedule('sched_1')).rejects.toMatchObject({
+      statusCode: 400,
+      message: '该班次已有销售，不能删除（请改用售罄）',
+    });
+    expect(prismaMock.flightSchedule.delete).not.toHaveBeenCalled();
+  });
+
+  it('班次不存在：抛 404', async () => {
+    prismaMock.flightSchedule.findUnique.mockResolvedValue(null);
+    await expect(service.deleteSchedule('nope')).rejects.toMatchObject({ statusCode: 404 });
+    expect(prismaMock.flightSchedule.delete).not.toHaveBeenCalled();
   });
 });
