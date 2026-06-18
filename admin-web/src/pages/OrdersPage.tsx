@@ -1662,20 +1662,45 @@ const CABIN_ZH: Record<string, string> = {
 interface BatchRow {
   fullName: string;
   documentNumber: string;
+  /** 用户原始输入（如 1990-01-01 / 1990/1/1），提交时统一解析为 ISO。 */
   dateOfBirth: string;
+}
+
+/**
+ * 把宽松输入的生日解析成后端要的 YYYY-MM-DD。
+ * 接受 1990-01-01 / 1990/1/1 / 1990.1.1 等分隔符；非法返回 null。
+ */
+function parseDob(raw: string): string | null {
+  const s = raw.trim();
+  if (!s) return null;
+  const m = s.match(/^(\d{4})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{1,2})$/);
+  if (!m) return null;
+  const year = Number(m[1]);
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  // 真实日历校验（拦掉 2 月 30 日之类）
+  const d = new Date(Date.UTC(year, month - 1, day));
+  if (d.getUTCFullYear() !== year || d.getUTCMonth() !== month - 1 || d.getUTCDate() !== day) {
+    return null;
+  }
+  const mm = String(month).padStart(2, '0');
+  const dd = String(day).padStart(2, '0');
+  return `${year}-${mm}-${dd}`;
 }
 
 function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
   const tokens = useAuth((s) => s.tokens);
+  const user = useAuth((s) => s.user);
   const token = tokens?.accessToken ?? '';
+  // 录入人 = 当前登录账号（后端从 auth 自动盖章；前端仅显示）
+  const recorderLabel = user?.displayName || user?.email || '当前账号';
 
   const [flights, setFlights] = useState<AdminFlight[]>([]);
   const [flightId, setFlightId] = useState('');
   const [schedules, setSchedules] = useState<AdminSchedule[]>([]);
   const [scheduleId, setScheduleId] = useState('');
   const [cabin, setCabin] = useState<CabinClass | ''>('');
-  const [contactName, setContactName] = useState('');
-  const [contactPhone, setContactPhone] = useState('');
   const [notes, setNotes] = useState('');
   const [rows, setRows] = useState<BatchRow[]>([{ fullName: '', documentNumber: '', dateOfBirth: '' }]);
   const [submitting, setSubmitting] = useState(false);
@@ -1705,7 +1730,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   const flight = flights.find((f) => f.id === flightId);
   const schedule = schedules.find((s) => s.id === scheduleId);
   const cabinOptions = schedule?.seatClasses ?? [];
-  const validRows = rows.filter((r) => r.fullName.trim() && r.documentNumber.trim() && r.dateOfBirth);
+  const validRows = rows.filter((r) => r.fullName.trim() && r.documentNumber.trim() && parseDob(r.dateOfBirth));
 
   function setRow(i: number, patch: Partial<BatchRow>): void {
     setRows((prev) => prev.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
@@ -1716,21 +1741,28 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   function removeRow(i: number): void {
     setRows((prev) => (prev.length > 1 ? prev.filter((_, idx) => idx !== i) : prev));
   }
-  function pasteNames(text: string): void {
-    const names = text.split('\n').map((s) => s.trim()).filter(Boolean);
-    if (names.length > 0) {
-      setRows(names.map((n) => ({ fullName: n, documentNumber: '', dateOfBirth: '' })));
-    }
+  // 每行一位：支持「姓名」或「姓名,护照号,生日」（逗号 / 制表符 / 空格分隔）
+  function pasteRows(text: string): void {
+    const parsed = text
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => {
+        const cols = line.split(/[,，\t]+|\s{2,}|\s+/).map((c) => c.trim()).filter(Boolean);
+        return {
+          fullName: cols[0] ?? '',
+          documentNumber: cols[1] ?? '',
+          dateOfBirth: cols[2] ?? '',
+        };
+      })
+      .filter((r) => r.fullName);
+    if (parsed.length > 0) setRows(parsed);
   }
 
   async function submit(): Promise<void> {
     setErr(null);
     if (!scheduleId || !cabin) {
       setErr('请选择航班班次和舱位');
-      return;
-    }
-    if (!contactName.trim() || !contactPhone.trim()) {
-      setErr('请填联系人姓名和电话（全批次共享）');
       return;
     }
     if (validRows.length === 0) {
@@ -1746,13 +1778,12 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
         flightScheduleId: scheduleId,
         flightCabin: cabin,
         description,
-        contactName: contactName.trim(),
-        contactPhone: contactPhone.trim(),
+        // 联系人/录入人由后端从登录账号自动盖章，前端不再发送 contactName/contactPhone
         notes: notes.trim() || undefined,
         passengers: validRows.map((r) => ({
           fullName: r.fullName.trim(),
           documentNumber: r.documentNumber.trim(),
-          dateOfBirth: r.dateOfBirth,
+          dateOfBirth: parseDob(r.dateOfBirth) ?? '',
           nationality: 'CN',
         })),
       });
@@ -1871,31 +1902,33 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
               </label>
             </div>
 
-            {/* 共享联系人 */}
-            <div className="grid gap-3 md:grid-cols-3">
-              <label className="text-xs text-slate-500">
-                联系人姓名（共享）
-                <input className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm" value={contactName} onChange={(e) => setContactName(e.target.value)} />
-              </label>
-              <label className="text-xs text-slate-500">
-                联系电话（共享）
-                <input className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm" value={contactPhone} onChange={(e) => setContactPhone(e.target.value)} />
-              </label>
+            {/* 录入人（= 当前登录账号，后端自动记录）+ 备注 */}
+            <div className="grid gap-3 md:grid-cols-2">
+              <div className="text-xs text-slate-500">
+                录入人
+                <div className="mt-1 flex h-[34px] items-center rounded-md bg-slate-50 px-2.5 text-sm text-slate-700">
+                  {recorderLabel}
+                  <span className="ml-2 text-xs text-slate-400">（系统自动记录，谁录的找谁）</span>
+                </div>
+              </div>
               <label className="text-xs text-slate-500">
                 备注（选填，写入每单）
                 <input className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm" value={notes} onChange={(e) => setNotes(e.target.value)} />
               </label>
             </div>
 
-            {/* 快速粘贴姓名 */}
+            {/* 快速粘贴：姓名 或 姓名,护照号,生日 */}
             <details className="text-xs text-slate-500">
-              <summary className="cursor-pointer">快速粘贴姓名（每行一个 → 自动生成行，护照号/生日再补）</summary>
+              <summary className="cursor-pointer">快速粘贴（每行一位：姓名 — 或 姓名,护照号,生日(YYYY-MM-DD)）</summary>
               <textarea
                 className="mt-2 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
                 rows={3}
-                placeholder={'张三\n李四\n王五'}
-                onChange={(e) => pasteNames(e.target.value)}
+                placeholder={'张三\n李四,E12345678,1990-01-01\n王五  G87654321  1985/12/3'}
+                onChange={(e) => pasteRows(e.target.value)}
               />
+              <p className="mt-1 text-[11px] text-slate-400">
+                分隔符支持逗号 / Tab / 空格；只填姓名也行，护照号、生日可留空后续手录。
+              </p>
             </details>
 
             {/* 乘客表格 */}
@@ -1923,8 +1956,27 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                         <td className="px-2 py-1">
                           <input className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm" value={r.documentNumber} onChange={(e) => setRow(i, { documentNumber: e.target.value })} />
                         </td>
-                        <td className="px-2 py-1">
-                          <input type="date" className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm" value={r.dateOfBirth} onChange={(e) => setRow(i, { dateOfBirth: e.target.value })} />
+                        <td className="px-2 py-1 align-top">
+                          {(() => {
+                            const dobTouched = r.dateOfBirth.trim().length > 0;
+                            const dobValid = parseDob(r.dateOfBirth) !== null;
+                            const dobBad = dobTouched && !dobValid;
+                            return (
+                              <>
+                                <input
+                                  type="text"
+                                  inputMode="numeric"
+                                  className={`w-full rounded border px-1.5 py-1 text-sm ${dobBad ? 'border-rose-400 bg-rose-50' : 'border-slate-300'}`}
+                                  placeholder="YYYY-MM-DD"
+                                  value={r.dateOfBirth}
+                                  onChange={(e) => setRow(i, { dateOfBirth: e.target.value })}
+                                />
+                                {dobBad && (
+                                  <span className="mt-0.5 block text-[11px] text-rose-500">格式如 1990-01-01</span>
+                                )}
+                              </>
+                            );
+                          })()}
                         </td>
                         <td className="px-2 py-1 text-right">
                           <button className="text-xs text-slate-400 hover:text-rose-600" onClick={() => removeRow(i)} disabled={rows.length <= 1}>删</button>

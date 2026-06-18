@@ -8,7 +8,6 @@ import { FlightsPage } from './pages/FlightsPage';
 import { SeatStatsPage } from './pages/SeatStatsPage';
 import { SeatAllocationPage } from './pages/SeatAllocationPage';
 import { ProductsPage } from './pages/ProductsPage';
-import { PricingPage } from './pages/PricingPage';
 import { AgentsPage } from './pages/AgentsPage';
 import { CustomersPage } from './pages/CustomersPage';
 import { TravelersPage } from './pages/TravelersPage';
@@ -125,14 +124,9 @@ export function App() {
             </Protected>
           }
         />
-        <Route
-          path="/pricing"
-          element={
-            <Protected adminOnly>
-              <PricingPage />
-            </Protected>
-          }
-        />
+        {/* 动态定价页已退役：定价改由航班月历的「仓位阶梯」承载。
+            旧 /pricing 链接重定向到航班管理，避免书签/历史 404。 */}
+        <Route path="/pricing" element={<Navigate to="/flights" replace />} />
         <Route
           path="/agents"
           element={

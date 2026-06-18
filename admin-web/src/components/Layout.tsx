@@ -25,7 +25,6 @@ const NAV: Array<{
   { to: '/hotel-control',   label: '房控',        roles: ['ADMIN', 'STAFF'],          section: '运营' },
   { to: '/visa-desk',       label: '签证台',      roles: ['ADMIN', 'STAFF'],          section: '运营' },
   { to: '/products',        label: '产品管理',    roles: ['ADMIN', 'STAFF'],          section: '产品' },
-  { to: '/pricing',         label: '动态定价',    roles: ['ADMIN', 'STAFF'],          section: '产品' },
   { to: '/cancellation-policies', label: '取消政策', roles: ['ADMIN', 'STAFF'],       section: '产品' },
   { to: '/agents',          label: '代理管理',    roles: ['ADMIN', 'STAFF', 'AGENT'], section: '客户' },
   { to: '/customers',       label: '散客管理',    roles: ['ADMIN', 'STAFF', 'AGENT'], section: '客户' },

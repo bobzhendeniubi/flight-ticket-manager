@@ -283,6 +283,56 @@ function currentLadderPrice(buckets: FareBucket[], sold: number): number {
   return buckets[buckets.length - 1]?.price ?? 0;
 }
 
+// 当前停在第几档（0-based）：与 currentLadderPrice 同口径；卖超停在最后一档。
+function currentLadderTierIndex(buckets: FareBucket[], sold: number): number {
+  let cumulative = 0;
+  for (let i = 0; i < buckets.length; i++) {
+    cumulative += buckets[i].quota;
+    if (sold < cumulative) return i;
+  }
+  return Math.max(0, buckets.length - 1);
+}
+
+// 某舱位的"当前售价"（镜像后端定价）：有阶梯→当前档价；否则→固定 basePrice。
+function seatCurrentPrice(seat: ScheduleSeat): number {
+  return hasLadder(seat.fareBuckets)
+    ? currentLadderPrice(seat.fareBuckets, seat.sold)
+    : Number(seat.basePrice);
+}
+
+// 一个班次是否有阶梯（任一舱位设了 fareBuckets 即视为"阶梯"定价）。
+function scheduleHasLadder(s: AdminSchedule): boolean {
+  return s.seatClasses.some((c) => hasLadder(c.fareBuckets));
+}
+
+// 月历格用：在「在售」班次里取经济舱当前售价区间。
+// 关键修复：售罄/停售班次绝不参与价格展示，避免显示已关班次的高价。
+function activeEconPriceRange(daySchedules: AdminSchedule[]): {
+  min: number;
+  max: number;
+  count: number;
+} | null {
+  const prices: number[] = [];
+  for (const s of daySchedules) {
+    if (!s.isActive) continue; // 只看在售班次
+    const econ = getCabin(s, 'ECONOMY');
+    if (econ) prices.push(seatCurrentPrice(econ));
+  }
+  if (prices.length === 0) return null;
+  return { min: Math.min(...prices), max: Math.max(...prices), count: prices.length };
+}
+
+// 月历格用：在「在售」班次里取经济舱余位合计（无在售班次则回退到全部班次的合计，
+// 用于展示"已全部售罄"的余位读数）。
+function dayEconRemaining(daySchedules: AdminSchedule[]): number {
+  const active = daySchedules.filter((s) => s.isActive);
+  const pool = active.length > 0 ? active : daySchedules;
+  return pool.reduce((sum, s) => {
+    const econ = getCabin(s, 'ECONOMY');
+    return sum + (econ ? econ.capacity - econ.sold : 0);
+  }, 0);
+}
+
 // ── 仓位阶梯行编辑器（单点 & 批量复用）──────────────────────────────────
 // 受控组件：父持有 FareBucket[] 草稿，这里只负责"加一档 / 改张数 / 改价 / 删除"。
 function FareLadderEditor({
@@ -477,7 +527,7 @@ function SchedulesList({
             className="btn-secondary text-sm"
             onClick={() => setShowBulk((v) => !v)}
           >
-            {showBulk ? '收起批量操作' : '⚡ 批量改价 / 售罄'}
+            {showBulk ? '收起批量操作' : '⚡ 批量改价 / 仓位阶梯'}
           </button>
         )}
       </div>
@@ -528,12 +578,16 @@ function SchedulesTable({
   onExport: (scheduleId: string, departureDate: string) => void;
 }) {
   const [monthFilter, setMonthFilter] = useState<string>('upcoming30');
+  // 具体日期筛选（按本地出发日）。非空时优先生效，覆盖"月份"下拉。
+  const [dateFilter, setDateFilter] = useState<string>('');
 
   const months = Array.from(new Set(schedules.map((s) => s.departureTime.slice(0, 7)))).sort();
   const now = new Date();
   const thirtyDaysLater = new Date(now.getTime() + 30 * 86400000);
 
   const filtered = schedules.filter((s) => {
+    // 选了具体日期：只看那天（本地出发日），其余筛选忽略
+    if (dateFilter) return localYmd(s.departureTime, s.departureTz) === dateFilter;
     if (monthFilter === 'all') return true;
     if (monthFilter === 'upcoming30') {
       const d = new Date(s.departureTime);
@@ -545,10 +599,11 @@ function SchedulesTable({
   return (
     <div className="space-y-3">
       <div className="flex flex-wrap items-center gap-3">
-        <label className="text-sm text-slate-600">筛选:</label>
+        <label className="text-sm text-slate-600">月份:</label>
         <select
           className="input max-w-[200px]"
           value={monthFilter}
+          disabled={!!dateFilter}
           onChange={(e) => setMonthFilter(e.target.value)}
         >
           <option value="upcoming30">未来 30 天</option>
@@ -559,6 +614,23 @@ function SchedulesTable({
             </option>
           ))}
         </select>
+        <span className="text-slate-300">·</span>
+        <label className="text-sm text-slate-600">具体日期:</label>
+        <input
+          type="date"
+          className="input max-w-[160px]"
+          value={dateFilter}
+          onChange={(e) => setDateFilter(e.target.value)}
+        />
+        {dateFilter && (
+          <button
+            type="button"
+            className="text-xs text-brand underline-offset-2 hover:underline"
+            onClick={() => setDateFilter('')}
+          >
+            清除日期
+          </button>
+        )}
         <span className="text-xs text-slate-500">显示 {filtered.length} 条</span>
       </div>
       <div className="overflow-x-auto">
@@ -743,19 +815,15 @@ function MonthCalendar({
             );
           }
 
-          // 一天通常一班；多班取第一班展示，点开后逐班编辑
-          const primary = daySchedules[0];
-          const econ = getCabin(primary, 'ECONOMY');
-          const remaining = econ ? econ.capacity - econ.sold : 0;
-          const tone = seatTone(remaining);
+          // 多班次时：价格/余位只看「在售」班次，售罄/停售班次绝不参与展示
+          // （修复 700/800 在售阶梯被 1480 已关班次盖掉的 bug）。
           const allInactive = daySchedules.every((s) => !s.isActive);
-          // 有阶梯则显示按已售算出的"现价"，否则显示固定 basePrice
-          const econHasLadder = econ ? hasLadder(econ.fareBuckets) : false;
-          const econDisplayPrice = econ
-            ? econHasLadder
-              ? currentLadderPrice(econ.fareBuckets as FareBucket[], econ.sold)
-              : Number(econ.basePrice)
-            : 0;
+          const remaining = dayEconRemaining(daySchedules);
+          const tone = seatTone(remaining);
+          const priceRange = activeEconPriceRange(daySchedules); // null = 无在售班次
+          // 「阶梯/固定价」一眼可辨：以在售班次为准（无在售时回退看全部）。
+          const ladderPool = allInactive ? daySchedules : daySchedules.filter((s) => s.isActive);
+          const dayHasLadder = ladderPool.some(scheduleHasLadder);
 
           return (
             <button
@@ -766,39 +834,60 @@ function MonthCalendar({
                 isSelected ? 'border-brand ring-2 ring-brand/40' : 'border-slate-200'
               } ${allInactive ? 'bg-slate-100 opacity-70' : 'bg-white'}`}
             >
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between gap-1">
                 <span className={`text-xs ${isToday ? 'font-semibold text-brand' : 'text-ink-muted'}`}>
                   {cell.day}
                 </span>
-                {allInactive && (
-                  <span className="text-[10px] leading-none text-slate-400" title="售罄/暂停销售">
-                    ✕
-                  </span>
-                )}
-                {daySchedules.length > 1 && (
-                  <span className="rounded bg-slate-100 px-1 text-[10px] text-slate-500">
-                    {daySchedules.length}班
-                  </span>
-                )}
-              </div>
-              {econ && (
-                <div className="mt-1 flex items-center gap-1">
-                  <span className={`inline-block h-1.5 w-1.5 rounded-full ${tone.dot}`} />
-                  <span className={`text-sm font-semibold ${tone.text}`}>{remaining}</span>
-                  <span className="text-[10px] text-ink-muted">余位</span>
-                </div>
-              )}
-              {econ && (
-                <div className="flex items-center gap-1 text-[11px] text-ink-soft">
-                  <span>¥{econDisplayPrice.toFixed(0)}</span>
-                  {econHasLadder && (
+                <span className="flex items-center gap-0.5">
+                  {/* 阶梯 / 固定价 一眼可辨 */}
+                  {dayHasLadder ? (
                     <span
                       className="rounded bg-brand-50 px-1 text-[9px] font-medium text-brand-700"
-                      title="按仓位阶梯出售，显示当前现价"
+                      title="按仓位阶梯出售（手动分档定价），价格随已售推进"
                     >
                       阶梯
                     </span>
+                  ) : (
+                    <span
+                      className="rounded bg-slate-100 px-1 text-[9px] font-medium text-slate-500"
+                      title="固定价（未设阶梯）：写多少卖多少"
+                    >
+                      固定价
+                    </span>
                   )}
+                  {allInactive && (
+                    <span className="text-[10px] leading-none text-slate-400" title="售罄/暂停销售">
+                      ✕
+                    </span>
+                  )}
+                  {daySchedules.length > 1 && (
+                    <span className="rounded bg-slate-100 px-1 text-[10px] text-slate-500">
+                      {daySchedules.length}班
+                    </span>
+                  )}
+                </span>
+              </div>
+              <div className="mt-1 flex items-center gap-1">
+                <span className={`inline-block h-1.5 w-1.5 rounded-full ${tone.dot}`} />
+                <span className={`text-sm font-semibold ${tone.text}`}>{remaining}</span>
+                <span className="text-[10px] text-ink-muted">余位</span>
+              </div>
+              {/* 售价只取在售班次（已关班次不参与），多班在售取最低～最高 */}
+              {priceRange ? (
+                <div className="flex items-center gap-1 text-[11px] text-ink-soft">
+                  <span>
+                    ¥{priceRange.min.toFixed(0)}
+                    {priceRange.max > priceRange.min && `～${priceRange.max.toFixed(0)}`}
+                  </span>
+                  {priceRange.count > 1 && (
+                    <span className="text-[9px] text-ink-muted" title="取在售班次的最低～最高经济舱售价">
+                      在售{priceRange.count}班
+                    </span>
+                  )}
+                </div>
+              ) : (
+                <div className="text-[11px] text-slate-400" title="当天所有班次均已售罄/停售">
+                  无在售
                 </div>
               )}
             </button>
@@ -884,8 +973,12 @@ function DaySchedule({
   const [bizPrice, setBizPrice] = useState<number | null>(biz ? Number(biz.basePrice) : null);
   const [saving, setSaving] = useState(false);
   const [toggling, setToggling] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [savedMsg, setSavedMsg] = useState<string | null>(null);
+
+  // 该班次的总已售（任一舱位 sold>0 即视为"已有销售"，禁止删除）。
+  const totalSold = schedule.seatClasses.reduce((sum, c) => sum + c.sold, 0);
 
   // 仓位阶梯草稿（按舱位）—— 初值取自该舱位已有阶梯，深拷贝避免改到 props。
   const [econLadder, setEconLadder] = useState<FareBucket[]>(
@@ -939,6 +1032,30 @@ function DaySchedule({
       setErr(e instanceof ApiError ? e.message : '操作失败');
     } finally {
       setToggling(false);
+    }
+  };
+
+  // 删除班次：已有销售（sold>0）时按钮本就 disabled；这里再兜底拦一次。
+  // 后端对有订单关联的班次也会拒绝/转停用，按返回信息提示。
+  const onDelete = async () => {
+    if (!tokens || deleting) return;
+    if (totalSold > 0) {
+      setErr('已有销售，不能删除（请用售罄）');
+      return;
+    }
+    const depTime = formatLocalTime(schedule.departureTime, schedule.departureTz);
+    if (!confirm(`确认删除该班次（出发 ${depTime}）？此操作不可恢复。`)) return;
+    setDeleting(true);
+    setErr(null);
+    setSavedMsg(null);
+    try {
+      await api.deleteSchedule(tokens.accessToken, schedule.id);
+      await onSaved();
+    } catch (e) {
+      // 后端 sold>0 / 有订单关联会回 400，把其信息透传给操作员。
+      setErr(e instanceof ApiError ? e.message : '删除失败');
+    } finally {
+      setDeleting(false);
     }
   };
 
@@ -1041,11 +1158,29 @@ function DaySchedule({
           <span className="mx-1 text-slate-300">·</span>
           <span className="text-ink-muted">到达 {formatLocalTime(schedule.arrivalTime, schedule.arrivalTz)}</span>
         </div>
-        {schedule.isActive ? (
-          <span className="badge-success">在售</span>
-        ) : (
-          <span className="badge-neutral">售罄/暂停销售</span>
-        )}
+        <div className="flex items-center gap-1.5">
+          {/* 阶梯 / 固定价：一眼看出这个班次有没有在用仓位阶梯定价 */}
+          {scheduleHasLadder(schedule) ? (
+            <span
+              className="rounded bg-brand-50 px-1.5 py-0.5 text-[11px] font-medium text-brand-700"
+              title="按仓位阶梯出售（手动分档定价）"
+            >
+              阶梯
+            </span>
+          ) : (
+            <span
+              className="rounded bg-slate-100 px-1.5 py-0.5 text-[11px] font-medium text-slate-500"
+              title="固定价（未设阶梯）：写多少卖多少"
+            >
+              固定价
+            </span>
+          )}
+          {schedule.isActive ? (
+            <span className="badge-success">在售</span>
+          ) : (
+            <span className="badge-neutral">售罄/暂停销售</span>
+          )}
+        </div>
       </div>
 
       {/* 余位/已售（只读）*/}
@@ -1064,19 +1199,63 @@ function DaySchedule({
         )}
       </div>
 
-      {/* 改价（仅 ADMIN）*/}
+      {/* 当前售价（醒目）：镜像后端 —— 有阶梯则显示当前档价 + 第N档，否则显示固定价。
+          直接回答"我写多少就卖多少？"：固定价=是；阶梯=以当前档为准。 */}
+      {(econ || biz) && (
+        <div className="mt-2 flex flex-wrap gap-2">
+          {[econ, biz].filter((c): c is ScheduleSeat => Boolean(c)).map((seat) => {
+            const ladder = hasLadder(seat.fareBuckets);
+            const price = seatCurrentPrice(seat);
+            const tierIdx = hasLadder(seat.fareBuckets)
+              ? currentLadderTierIndex(seat.fareBuckets, seat.sold)
+              : -1;
+            return (
+              <span
+                key={seat.cabin}
+                className={`inline-flex items-baseline gap-1 rounded-md px-2.5 py-1 text-xs ${
+                  ladder ? 'bg-brand-50 text-brand-800' : 'bg-emerald-50 text-emerald-800'
+                }`}
+              >
+                <span className="text-ink-muted">{CABIN_LABEL[seat.cabin] ?? seat.cabin}当前售价</span>
+                <span className="text-sm font-bold">¥{price.toFixed(0)}</span>
+                {ladder ? (
+                  <span className="text-[11px] font-medium">· 阶梯第{tierIdx + 1}档</span>
+                ) : (
+                  <span className="text-[11px] font-medium">· 固定价</span>
+                )}
+              </span>
+            );
+          })}
+        </div>
+      )}
+
+      {/* 改价（仅 ADMIN）：有阶梯时基础价不是现售价，标注清楚避免误改 */}
       {canEdit && (
         <div className="mt-3 grid gap-3 sm:grid-cols-2">
           {econ && (
             <div>
-              <label className="label">经济舱价 (¥)</label>
+              <label className="label">
+                {hasLadder(econ.fareBuckets) ? '经济舱基础价（未设阶梯时生效）(¥)' : '经济舱价 (¥)'}
+              </label>
               <NumberInput min={0} className="input" value={econPrice} onChange={(n) => setEconPrice(n)} />
+              {hasLadder(econ.fareBuckets) && (
+                <p className="mt-0.5 text-[11px] text-ink-muted">
+                  当前按阶梯出售，此价仅在清除阶梯后才生效。
+                </p>
+              )}
             </div>
           )}
           {biz && (
             <div>
-              <label className="label">商务舱价 (¥)</label>
+              <label className="label">
+                {hasLadder(biz.fareBuckets) ? '商务舱基础价（未设阶梯时生效）(¥)' : '商务舱价 (¥)'}
+              </label>
               <NumberInput min={0} className="input" value={bizPrice} onChange={(n) => setBizPrice(n)} />
+              {hasLadder(biz.fareBuckets) && (
+                <p className="mt-0.5 text-[11px] text-ink-muted">
+                  当前按阶梯出售，此价仅在清除阶梯后才生效。
+                </p>
+              )}
             </div>
           )}
         </div>
@@ -1110,6 +1289,15 @@ function DaySchedule({
           <>
             <button
               type="button"
+              className="btn-secondary text-xs text-rose-600 hover:bg-rose-50 disabled:text-slate-300 disabled:hover:bg-transparent"
+              title={totalSold > 0 ? '已有销售，不能删除（请用售罄）' : '彻底删除该班次（不可恢复）'}
+              disabled={deleting || totalSold > 0}
+              onClick={onDelete}
+            >
+              {deleting ? '删除中…' : '删除班次'}
+            </button>
+            <button
+              type="button"
               className="btn-secondary text-xs"
               title="只对该单个班次售罄或恢复销售"
               disabled={toggling}
@@ -1127,8 +1315,10 @@ function DaySchedule({
   );
 }
 
-// ── 批量改价 / 批量停用（日期范围 + 星期几 + 进度条；镜像 BulkScheduleForm）─
-type BulkAction = 'setPrice' | 'addAmount' | 'addPercent' | 'deactivate' | 'activate' | 'setLadder' | 'clearLadder';
+// ── 批量改价 / 批量仓位阶梯（日期范围 + 星期几 + 进度条；镜像 BulkScheduleForm）─
+// 注：批量「售罄/恢复销售」已移除（机位卖完即售罄，不需手动批量调）；
+// 单班次的售罄/恢复按钮保留在 DaySchedule。
+type BulkAction = 'setPrice' | 'addAmount' | 'addPercent' | 'setLadder' | 'clearLadder';
 type BulkCabinPick = 'ECONOMY' | 'BUSINESS' | 'ALL';
 
 function BulkEditPanel({
@@ -1194,11 +1384,8 @@ function BulkEditPanel({
   };
 
   const buildBody = (s: AdminSchedule):
-    | { isActive: boolean }
     | { seatClasses: Array<{ cabin: CabinClass; basePrice?: number; fareBuckets?: FareBucket[] | null }> }
     | null => {
-    if (action === 'deactivate') return { isActive: false };
-    if (action === 'activate') return { isActive: true };
     // 阶梯类操作：只动选定的单一舱位（经济/商务），该班次没有此舱位则跳过
     if (isLadderAction) {
       if (!getCabin(s, ladderCabin)) return null;
@@ -1226,8 +1413,6 @@ function BulkEditPanel({
     if (action === 'setPrice') return `把 ${cab} 价设为 ¥${amount ?? 0}`;
     if (action === 'addAmount') return `${cab} 价上调 ¥${amount ?? 0}`;
     if (action === 'addPercent') return `${cab} 价上调 ${amount ?? 0}%`;
-    if (action === 'deactivate') return '将这些班次售罄/暂停销售';
-    if (action === 'activate') return '恢复销售这些班次';
     if (action === 'setLadder') return `把 ${ladderCab} 设为 ${ladderDraft.length} 档仓位阶梯`;
     return `清除 ${ladderCab} 仓位阶梯（恢复自动定价）`;
   };
@@ -1288,7 +1473,7 @@ function BulkEditPanel({
           ×
         </button>
       </div>
-      <p className="text-xs text-slate-500 mt-0.5">按日期范围 + 星期几，批量改价 / 售罄 / 恢复销售现有班次</p>
+      <p className="text-xs text-slate-500 mt-0.5">按日期范围 + 星期几，批量改价 / 设置或清除仓位阶梯</p>
 
       <form className="mt-4 grid gap-3 md:grid-cols-4" onSubmit={onSubmit}>
         <div>
@@ -1323,8 +1508,6 @@ function BulkEditPanel({
             <option value="addPercent">涨 X%</option>
             <option value="setLadder">设置仓位阶梯</option>
             <option value="clearLadder">清除仓位阶梯</option>
-            <option value="deactivate">售罄/暂停销售</option>
-            <option value="activate">恢复销售</option>
           </select>
         </div>
         {isPriceAction && (

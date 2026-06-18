@@ -156,8 +156,9 @@ export interface BatchCreateOrdersInput {
   flightScheduleId: string;
   flightCabin: CabinClass;
   description: string;
-  contactName: string;
-  contactPhone: string;
+  /** 录入人由后端从登录账号自动盖章；前端不再采集/发送联系人。 */
+  contactName?: string;
+  contactPhone?: string;
   contactEmail?: string;
   notes?: string;
   passengers: BatchOrderPassenger[];
@@ -848,6 +849,13 @@ export const api = {
       token,
       body,
     }),
+  // 删除班次（仅 ADMIN）。后端守 sold>0：有订单关联则拒绝/转停用，
+  // result 可能是 { id, deleted: true } 或被停用的班次对象。
+  deleteSchedule: (token: string, scheduleId: string) =>
+    apiFetch<{ result: { id: string; deleted?: boolean } | AdminSchedule }>(
+      `/flights/schedules/${scheduleId}`,
+      { method: 'DELETE', token },
+    ),
   // 行李规则（航班 × 舱等；ADMIN/STAFF 维护）
   getBaggagePolicies: (token: string, flightId: string) =>
     apiFetch<{ policies: FlightBaggagePolicy[] }>(`/flights/${flightId}/baggage-policies`, { token }),
