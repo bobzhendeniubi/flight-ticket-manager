@@ -8,6 +8,24 @@ import { Prisma, ProductReviewType } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { NotFoundError } from '../../lib/errors.js';
 import { ReviewsService, type ProductRatingAggregate } from '../reviews/reviews.service.js';
+import { firstHotelQty } from './bundle-nights.js';
+
+/** hotelNights 的 DB/zod 取值上限（schema: int 1..30）。 */
+const HOTEL_NIGHTS_MAX = 30;
+
+/**
+ * 写入不变量：套餐 items 含 HOTEL 组件时，hotelNights 必须等于该 HOTEL 组件的 qty
+ * （真实住宿晚数）。规范化口径，保证落库的 hotelNights 永不与 HOTEL.qty 背离，且
+ * legacy null 行在任意一次 re-save 时自愈。夹到 zod 范围 1..30。
+ *
+ *   有 HOTEL 组件 → 返回 clamp(HOTEL.qty, 1, 30)；
+ *   无 HOTEL 组件 → 返回 undefined（保持调用方原本要写的值，不强行覆盖）。
+ */
+export function deriveHotelNightsFromItems(items: unknown): number | undefined {
+  const qty = firstHotelQty(items);
+  if (qty == null) return undefined;
+  return Math.min(HOTEL_NIGHTS_MAX, Math.max(1, qty));
+}
 import type {
   CreateBundleBody,
   CreateHotelBody,
@@ -416,7 +434,9 @@ export class ProductsService {
           groundDiscount: new Prisma.Decimal(body.groundDiscount),
           suitableFor: body.suitableFor,
           hotelRoomTypeId: body.hotelRoomTypeId ?? null,
-          hotelNights: body.hotelNights ?? null,
+          // 写入不变量：items 含 HOTEL 组件 → hotelNights 强制 = HOTEL.qty（真实晚数，clamp 1..30）；
+          // 无 HOTEL 组件 → 保留请求值（或 null）。保证落库 hotelNights 永不与 HOTEL.qty 背离。
+          hotelNights: deriveHotelNightsFromItems(body.items) ?? body.hotelNights ?? null,
           // 省略时落 DB 默认（单人入住 ¥80/晚、升舱 ¥700/程、来回 2 段）
           ...(body.singleSupplementCnyPerNight != null
             ? { singleSupplementCnyPerNight: body.singleSupplementCnyPerNight }
@@ -458,6 +478,13 @@ export class ProductsService {
     if (body.suitableFor !== undefined) data.suitableFor = body.suitableFor;
     if (body.hotelRoomTypeId !== undefined) data.hotelRoomTypeId = body.hotelRoomTypeId;
     if (body.hotelNights !== undefined) data.hotelNights = body.hotelNights;
+    // 写入不变量：仅当本次在改 items 时，按新 items 的 HOTEL 组件 qty 规范化/覆盖 hotelNights
+    // （即便请求显式传了别的 hotelNights，也以真实 HOTEL.qty 为准；legacy null 行借此自愈）。
+    // 新 items 无 HOTEL 组件 → 不动 hotelNights，保留上面按 body.hotelNights 的处理。
+    if (body.items !== undefined) {
+      const derived = deriveHotelNightsFromItems(body.items);
+      if (derived !== undefined) data.hotelNights = derived;
+    }
     if (body.singleSupplementCnyPerNight !== undefined) {
       data.singleSupplementCnyPerNight = body.singleSupplementCnyPerNight;
     }

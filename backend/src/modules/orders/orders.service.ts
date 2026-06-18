@@ -30,6 +30,7 @@ import {
   ForbiddenError,
   NotFoundError,
 } from '../../lib/errors.js';
+import { resolveBundleNights } from '../products/bundle-nights.js';
 import { PricingService } from '../pricing/pricing.service.js';
 import { OPERATION_FEE_CNY_PER_ORDER } from './order-cost-items.service.js';
 import { bundleItemMetadataSchema } from './orders.schemas.js';
@@ -590,6 +591,9 @@ export class OrderService {
         });
         if (!bundle) throw new NotFoundError(`套餐 ${item.bundleId} 不存在`);
         if (!bundle.isActive) throw new BadRequestError('套餐已下架');
+        // 住宿晚数：单一权威口径（hotelNights ?? 首个 HOTEL 组件 qty ?? 默认）。
+        // 一次解析，喂给酒店盖章 + 升级 add-on，保证回程日期 / 单人入住房差 / HOTEL 地面价口径一致。
+        const nights = resolveBundleNights(bundle.items, bundle.hotelNights);
         // 占座模型归一化（成人 / 占座儿童 / 不占座婴儿；向后兼容旧 pax → 全成人）。
         // 先算占座，再据房型容量推 roomsNeeded（酒店地面部分按房间数缩放）。
         const occupancy = resolveBundleOccupancy({
@@ -619,7 +623,7 @@ export class OrderService {
         const bundleUnitPrice = Math.max(0, Math.round(groundTotal - Number(bundle.groundDiscount)));
         // 套餐关联酒店 → 把房型+入住日期盖到订单行（房控板自动计入套餐占房）。
         // metadata 缺失/异常时只是不盖章，绝不阻断下单。
-        const hotelStamp = resolveBundleHotelStamp(bundle, item.metadata);
+        const hotelStamp = resolveBundleHotelStamp(bundle, item.metadata, nights);
 
         // 可选升级 add-on（server-priced，权威重算；缺省 0 → 与旧版价格完全一致）：
         //   单人入住房差 = singleCount × singleSupplementCnyPerNight × nights
@@ -632,6 +636,7 @@ export class OrderService {
           item.singleCount,
           item.businessCount,
           occupancy,
+          nights,
         );
         // 累计本单的升舱人数（多份套餐叠加），下方循环结束后统一分摊到经济舱航段并预检商务舱余位。
         // 注意：addOn.breakdown.businessCount 已夹到占座人数（seatPax）上限，婴儿不计入。
@@ -1535,30 +1540,31 @@ export function assertAmountWithinTolerance(
 
 // ── 套餐酒店盖章 ─────────────────────────────────────────────────────
 const DAY_MS = 24 * 60 * 60 * 1000;
-const DEFAULT_BUNDLE_HOTEL_NIGHTS = 1;
 
 /**
  * 套餐关联了酒店房型时，从订单行 metadata（goDate/returnDate）推导入住/退房日期。
  * - returnDate 合法且晚于 goDate → 用 returnDate 做退房日
- * - 否则按 goDate + hotelNights（默认 1 晚）推退房日
+ * - 否则按 goDate + nights 推退房日（nights 由 resolveBundleNights 解析的单一权威晚数，调用方传入）
  * - 套餐没关联房型、或 goDate 缺失/非法 → 返回 null（不盖章，下单照常）
  *
  * 导出仅供单测使用。
  */
 export function resolveBundleHotelStamp(
-  bundle: { hotelRoomTypeId: string | null; hotelNights: number | null },
+  bundle: { hotelRoomTypeId: string | null },
   metadata: Record<string, unknown> | undefined,
+  nights: number,
 ): { hotelRoomTypeId: string; hotelCheckIn: Date; hotelCheckOut: Date } | null {
   if (!bundle.hotelRoomTypeId) return null;
   const meta = bundleItemMetadataSchema.parse(metadata ?? {});
   if (!meta.goDate) return null;
   const checkIn = new Date(meta.goDate);
   if (Number.isNaN(checkIn.getTime())) return null;
+  const safeNights = Math.max(1, Math.trunc(nights));
   const returnDate = meta.returnDate ? new Date(meta.returnDate) : null;
   const checkOut =
     returnDate && !Number.isNaN(returnDate.getTime()) && returnDate.getTime() > checkIn.getTime()
       ? returnDate
-      : new Date(checkIn.getTime() + (bundle.hotelNights ?? DEFAULT_BUNDLE_HOTEL_NIGHTS) * DAY_MS);
+      : new Date(checkIn.getTime() + safeNights * DAY_MS);
   return {
     hotelRoomTypeId: bundle.hotelRoomTypeId,
     hotelCheckIn: checkIn,
@@ -1702,6 +1708,8 @@ export function computeBundleAddOn(
   singleCount: number | undefined,
   businessCount: number | undefined,
   occupancy: BundleOccupancy,
+  /** 调用方按 resolveBundleNights 解析的单一权威晚数（无盖章时的回退口径）。 */
+  resolvedNights: number,
 ): { total: number; hasAddOn: boolean; breakdown: BundleAddOnBreakdown } {
   const single = Math.max(0, Math.trunc(singleCount ?? 0));
   // businessCount 不能超过占座人数（成人 + 占座儿童）；婴儿不占座、不能升舱
@@ -1715,7 +1723,7 @@ export function computeBundleAddOn(
         1,
         Math.round((hotelStamp.hotelCheckOut.getTime() - hotelStamp.hotelCheckIn.getTime()) / DAY_MS),
       )
-    : Math.max(1, bundle.hotelNights ?? DEFAULT_BUNDLE_HOTEL_NIGHTS);
+    : Math.max(1, resolvedNights);
   const legs = Math.max(1, bundle.legs);
   const singleRate = Math.max(0, bundle.singleSupplementCnyPerNight);
   const businessRate = Math.max(0, bundle.businessUpgradeCnyPerLeg);

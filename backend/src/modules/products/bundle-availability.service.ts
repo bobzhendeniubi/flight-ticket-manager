@@ -7,7 +7,7 @@
  *   1. BLACKOUT 优先（不查库）：D ∈ bundle.blackoutDates → 不可售 reason='BLACKOUT'，其余跳过。
  *   2. 机票：套餐 FLIGHT 组件只有自由文本 productName，无班次/航线引用。
  *      固定航线 MFM⇌DAD（与前台/AI 助手一致），去程 D、回程 D+nights；
- *      nights = bundle.hotelNights ?? DEFAULT_BUNDLE_NIGHTS。
+ *      nights = resolveBundleNights(items, hotelNights)（单一权威口径，见 bundle-nights.ts）。
  *      舱位：任一 FLIGHT 组件 productName 含「商务」→ BUSINESS，否则 ECONOMY。
  *      可售要求去/回两段所选舱位档位均 ≠ 'SOLD_OUT'（口径同六档余位 computeAvailabilityTier）。
  *   3. 酒店：bundle.hotelRoomTypeId 已配置 → 取 [D, D+nights) 整段最差一晚档位：
@@ -32,6 +32,7 @@ import {
   type AvailabilityTier,
 } from '../flights/flights.service.js';
 import { getHotelNightlyRemaining } from '../hotel-control/hotel-control.service.js';
+import { resolveBundleNights } from './bundle-nights.js';
 import {
   computeHotelAvailabilityTier,
   type HotelAvailabilityTier,
@@ -41,9 +42,6 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 
 /** 套餐固定航线（与前台 BundlesPage / AI 助手一致：澳门 ⇌ 岘港）。*/
 export const BUNDLE_ROUTE = { origin: 'MFM', destination: 'DAD' } as const;
-
-/** 套餐未配置 hotelNights 时的默认住宿晚数（与前台 DEFAULT_NIGHTS 一致）。*/
-export const DEFAULT_BUNDLE_NIGHTS = 4;
 
 export type BundleSellableReason =
   | 'BLACKOUT'
@@ -223,7 +221,7 @@ export async function getBundleSellableDates(
   const dates = buildDateRange(from, to);
   if (dates.length === 0) return [];
 
-  const nights = bundle.hotelNights ?? DEFAULT_BUNDLE_NIGHTS;
+  const nights = resolveBundleNights(bundle.items, bundle.hotelNights);
   const cabin = resolveCabin(bundle.items);
   const blackoutSet = parseBlackoutSet(bundle.blackoutDates);
 

@@ -420,28 +420,27 @@ describe('OrderService 重复乘客校验', () => {
 });
 
 // ── 套餐酒店盖章：resolveBundleHotelStamp ─────────────────────────────
+// 第 3 参 nights = 调用方按 resolveBundleNights 解析的单一权威晚数（不再从 bundle 内部读 hotelNights）。
 describe('resolveBundleHotelStamp', () => {
-  const linkedBundle = { hotelRoomTypeId: 'rt1', hotelNights: 3 };
+  const linkedBundle = { hotelRoomTypeId: 'rt1' };
 
   it('套餐没关联房型 → null', () => {
     expect(
-      resolveBundleHotelStamp(
-        { hotelRoomTypeId: null, hotelNights: null },
-        { goDate: '2026-07-01' },
-      ),
+      resolveBundleHotelStamp({ hotelRoomTypeId: null }, { goDate: '2026-07-01' }, 3),
     ).toBeNull();
   });
 
   it('goDate 缺失 → null（不盖章，不抛错）', () => {
-    expect(resolveBundleHotelStamp(linkedBundle, undefined)).toBeNull();
-    expect(resolveBundleHotelStamp(linkedBundle, {})).toBeNull();
+    expect(resolveBundleHotelStamp(linkedBundle, undefined, 3)).toBeNull();
+    expect(resolveBundleHotelStamp(linkedBundle, {}, 3)).toBeNull();
   });
 
   it('returnDate 合法且晚于 goDate → 用 returnDate 做退房日', () => {
-    const stamp = resolveBundleHotelStamp(linkedBundle, {
-      goDate: '2026-07-01',
-      returnDate: '2026-07-04',
-    });
+    const stamp = resolveBundleHotelStamp(
+      linkedBundle,
+      { goDate: '2026-07-01', returnDate: '2026-07-04' },
+      3,
+    );
     expect(stamp).toEqual({
       hotelRoomTypeId: 'rt1',
       hotelCheckIn: new Date('2026-07-01'),
@@ -449,33 +448,37 @@ describe('resolveBundleHotelStamp', () => {
     });
   });
 
-  it('returnDate 缺失 → goDate + hotelNights 推退房日', () => {
-    const stamp = resolveBundleHotelStamp(linkedBundle, { goDate: '2026-07-01' });
+  it('returnDate 缺失 → goDate + nights 推退房日', () => {
+    const stamp = resolveBundleHotelStamp(linkedBundle, { goDate: '2026-07-01' }, 3);
     expect(stamp?.hotelCheckOut).toEqual(new Date('2026-07-04'));
   });
 
-  it('returnDate ≤ goDate → 回落到 hotelNights；hotelNights 空默认 1 晚', () => {
-    const sameDay = resolveBundleHotelStamp(linkedBundle, {
-      goDate: '2026-07-01',
-      returnDate: '2026-07-01',
-    });
+  it('returnDate ≤ goDate → 回落到 nights；nights=1 默认 1 晚', () => {
+    const sameDay = resolveBundleHotelStamp(
+      linkedBundle,
+      { goDate: '2026-07-01', returnDate: '2026-07-01' },
+      3,
+    );
     expect(sameDay?.hotelCheckOut).toEqual(new Date('2026-07-04'));
 
+    // nights=1（调用方对 hotelNights 空套餐解析出的最小晚数）→ 退房日 = 入住 + 1 晚
     const oneNight = resolveBundleHotelStamp(
-      { hotelRoomTypeId: 'rt1', hotelNights: null },
+      { hotelRoomTypeId: 'rt1' },
       { goDate: '2026-07-01' },
+      1,
     );
     expect(oneNight?.hotelCheckOut).toEqual(new Date('2026-07-02'));
   });
 
   it('metadata 畸形（错误类型/非法格式）→ 降级不抛错', () => {
-    expect(resolveBundleHotelStamp(linkedBundle, { goDate: 12345 } as never)).toBeNull();
-    expect(resolveBundleHotelStamp(linkedBundle, { goDate: 'not-a-date' })).toBeNull();
-    // goDate 合法但 returnDate 畸形 → 仍盖章，按 hotelNights 推退房日
-    const stamp = resolveBundleHotelStamp(linkedBundle, {
-      goDate: '2026-07-01',
-      returnDate: 'garbage',
-    });
+    expect(resolveBundleHotelStamp(linkedBundle, { goDate: 12345 } as never, 3)).toBeNull();
+    expect(resolveBundleHotelStamp(linkedBundle, { goDate: 'not-a-date' }, 3)).toBeNull();
+    // goDate 合法但 returnDate 畸形 → 仍盖章，按 nights 推退房日
+    const stamp = resolveBundleHotelStamp(
+      linkedBundle,
+      { goDate: '2026-07-01', returnDate: 'garbage' },
+      3,
+    );
     expect(stamp?.hotelCheckIn).toEqual(new Date('2026-07-01'));
     expect(stamp?.hotelCheckOut).toEqual(new Date('2026-07-04'));
   });
@@ -552,17 +555,17 @@ describe('computeBundleAddOn', () => {
     resolveBundleOccupancy({ adultCount, childCount, infantCount });
 
   it('无升级（singleCount/businessCount 缺省，纯成人）→ total 0、hasAddOn false（向后兼容）', () => {
-    const r = computeBundleAddOn(bundle, stamp, undefined, undefined, occ(2));
+    const r = computeBundleAddOn(bundle, stamp, undefined, undefined, occ(2), 3);
     expect(r.total).toBe(0);
     expect(r.hasAddOn).toBe(false);
-    const zero = computeBundleAddOn(bundle, stamp, 0, 0, occ(2));
+    const zero = computeBundleAddOn(bundle, stamp, 0, 0, occ(2), 3);
     expect(zero.total).toBe(0);
     expect(zero.hasAddOn).toBe(false);
   });
 
   it('单人入住 = singleCount × 房差/晚 × 晚数', () => {
     // 1 人 × 80 × 3 晚 = 240
-    const r = computeBundleAddOn(bundle, stamp, 1, 0, occ(2));
+    const r = computeBundleAddOn(bundle, stamp, 1, 0, occ(2), 3);
     expect(r.breakdown.singleSupplementTotal).toBe(240);
     expect(r.breakdown.businessUpgradeTotal).toBe(0);
     expect(r.total).toBe(240);
@@ -571,13 +574,13 @@ describe('computeBundleAddOn', () => {
 
   it('升舱商务 = businessCount × 升舱/航段 × 航段数', () => {
     // 1 人 × 700 × 2 段 = 1400
-    const r = computeBundleAddOn(bundle, stamp, 0, 1, occ(2));
+    const r = computeBundleAddOn(bundle, stamp, 0, 1, occ(2), 3);
     expect(r.breakdown.businessUpgradeTotal).toBe(1400);
     expect(r.total).toBe(1400);
   });
 
   it('两项叠加（占座模型默认费率，3 晚来回，各 1 人）= 240 + 1400 = 1640', () => {
-    const r = computeBundleAddOn(bundle, stamp, 1, 1, occ(2));
+    const r = computeBundleAddOn(bundle, stamp, 1, 1, occ(2), 3);
     expect(r.total).toBe(1640);
     expect(r.breakdown).toMatchObject({
       singleCount: 1,
@@ -596,13 +599,14 @@ describe('computeBundleAddOn', () => {
       hotelCheckIn: new Date('2026-07-01'),
       hotelCheckOut: new Date('2026-07-05'),
     };
-    const r = computeBundleAddOn(premium, fourNights, 1, 0, occ(2));
+    const r = computeBundleAddOn(premium, fourNights, 1, 0, occ(2), 4);
     expect(r.breakdown.nights).toBe(4);
     expect(r.total).toBe(480 * 4); // 1920
   });
 
   it('无 hotelStamp → 回退 bundle.hotelNights（≥1）算晚数', () => {
-    const r = computeBundleAddOn(bundle, null, 2, 0, occ(2));
+    // 无盖章 → resolvedNights 被使用；传 bundle.hotelNights(=3) 保持旧期望 ¥
+    const r = computeBundleAddOn(bundle, null, 2, 0, occ(2), 3);
     // 2 人 × 80 × 3 晚 = 480
     expect(r.breakdown.nights).toBe(3);
     expect(r.total).toBe(480);
@@ -610,7 +614,7 @@ describe('computeBundleAddOn', () => {
 
   it('单程套餐 legs=1：升舱只算 1 段', () => {
     const oneWay = { ...bundle, legs: 1 };
-    const r = computeBundleAddOn(oneWay, stamp, 0, 2, occ(2));
+    const r = computeBundleAddOn(oneWay, stamp, 0, 2, occ(2), 3);
     // 2 人 × 700 × 1 段 = 1400
     expect(r.breakdown.legs).toBe(1);
     expect(r.total).toBe(1400);
@@ -618,7 +622,7 @@ describe('computeBundleAddOn', () => {
 
   // ── 占座儿童折扣 + 婴儿价（占座模型新需求）────────────────────────────────
   it('占座儿童折扣：1 小孩 × 30 → 套餐行净减 30（hasAddOn true）', () => {
-    const r = computeBundleAddOn(bundle, stamp, 0, 0, occ(2, 1, 0));
+    const r = computeBundleAddOn(bundle, stamp, 0, 0, occ(2, 1, 0), 3);
     expect(r.breakdown.childSeatDiscountTotal).toBe(30);
     expect(r.breakdown.infantPriceTotal).toBe(0);
     expect(r.total).toBe(0); // 0 升级 + 0 婴儿 − 30 折扣 → clamp 到 0（无其他正向项时）
@@ -630,7 +634,7 @@ describe('computeBundleAddOn', () => {
     const cfg = { ...bundle, childSeatDiscountCnyPerPerson: 50 };
     // 加一个升级让 total 不被 clamp 到 0，验证折扣真减进去：
     //   单人入住 1 人 × 80 × 3 = 240；2 小孩折扣 50 × 2 = 100 → 240 − 100 = 140
-    const r = computeBundleAddOn(cfg, stamp, 1, 0, occ(2, 2, 0));
+    const r = computeBundleAddOn(cfg, stamp, 1, 0, occ(2, 2, 0), 3);
     expect(r.breakdown.childSeatDiscountCnyPerPerson).toBe(50);
     expect(r.breakdown.childSeatDiscountTotal).toBe(100);
     expect(r.total).toBe(140);
@@ -638,14 +642,14 @@ describe('computeBundleAddOn', () => {
 
   it('婴儿价：infantPrice=500/人 × 1 婴 → 套餐行净加 500', () => {
     const cfg = { ...bundle, infantPriceCny: 500 };
-    const r = computeBundleAddOn(cfg, stamp, 0, 0, occ(2, 0, 1));
+    const r = computeBundleAddOn(cfg, stamp, 0, 0, occ(2, 0, 1), 3);
     expect(r.breakdown.infantPriceTotal).toBe(500);
     expect(r.total).toBe(500);
     expect(r.hasAddOn).toBe(true);
   });
 
   it('2 大 1 小 1 婴（折扣 30、婴儿价 0）→ 折扣 30、婴儿 0、净 0（升级机票仍在 FLIGHT 行）', () => {
-    const r = computeBundleAddOn(bundle, stamp, 0, 0, occ(2, 1, 1));
+    const r = computeBundleAddOn(bundle, stamp, 0, 0, occ(2, 1, 1), 3);
     expect(r.breakdown).toMatchObject({
       adultCount: 2,
       childCount: 1,
@@ -660,13 +664,13 @@ describe('computeBundleAddOn', () => {
   });
 
   it('businessCount 夹到占座人数（seatPax）上限：2 大 0 小，businessCount=5 → 只算 2 段商务', () => {
-    const r = computeBundleAddOn(bundle, stamp, 0, 5, occ(2, 0, 0));
+    const r = computeBundleAddOn(bundle, stamp, 0, 5, occ(2, 0, 0), 3);
     expect(r.breakdown.businessCount).toBe(2);
     expect(r.breakdown.businessUpgradeTotal).toBe(2 * 700 * 2); // 2800
   });
 
   it('婴儿不占座、不能升舱：2 大 0 小 0 婴 seatPax=2，businessCount=3 夹到 2', () => {
-    const r = computeBundleAddOn(bundle, stamp, 0, 3, occ(2, 0, 0));
+    const r = computeBundleAddOn(bundle, stamp, 0, 3, occ(2, 0, 0), 3);
     expect(r.breakdown.businessCount).toBe(2);
   });
 });
