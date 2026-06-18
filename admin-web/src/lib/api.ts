@@ -1010,6 +1010,7 @@ export const api = {
     ),
 
   // 人工确认收款（线下收款 → 标记已付 + 上传截图）ADMIN/STAFF
+  // 现已允许多付：amount 可超过尾款（paidAmount 可大于 total）。
   confirmPayment: (
     token: string,
     body: { orderId: string; amount?: number; method: PaymentMethod; proofUrl?: string; note?: string; idempotencyKey?: string },
@@ -1023,6 +1024,25 @@ export const api = {
       orderNumber: string;
       status: OrderStatus;
     }>('/payments/manual-confirm', { method: 'POST', token, body }),
+
+  // 批量到账（选多笔订单 → 逐单录入到账金额 + 共享水单）ADMIN/STAFF。
+  // 逐单入账：单条失败不影响其它（每条返回 ok / error + 最新 paidAmount/status）。
+  batchConfirmPayments: (
+    token: string,
+    body: {
+      items: Array<{ orderId: string; amount: number; method?: PaymentMethod; proofUrl?: string; note?: string }>;
+      sharedProofUrl?: string;
+    },
+  ) =>
+    apiFetch<{
+      results: Array<{
+        orderId: string;
+        ok: boolean;
+        error?: string;
+        paidAmount: number;
+        status: OrderStatus;
+      }>;
+    }>('/payments/batch-confirm', { method: 'POST', token, body }),
 
   // ── 5/20 反馈新增 API ──────────────────────────────────────────────────
   // 一键导出 PNR Excel；返回 Blob 直接下载

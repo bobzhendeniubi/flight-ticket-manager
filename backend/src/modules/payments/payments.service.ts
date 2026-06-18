@@ -33,6 +33,13 @@ export interface PaymentRequester {
   actorType?: 'USER' | 'SYSTEM';
 }
 
+/** 防手误上限：单笔到账金额不得超过订单总额的该倍数（允许正常多付，仅拦截录入事故）。 */
+const MAX_OVERPAY_MULTIPLE = 10;
+/** 防手误绝对上限（元）：即便订单总额很小，也允许单笔到账到此金额（覆盖小额订单的合理多付）。 */
+const MAX_SINGLE_PAYMENT_CNY = 1_000_000;
+/** 批量到账单次最多处理的订单数。 */
+const MAX_BATCH_ITEMS = 100;
+
 export class PaymentsService {
   private readonly orderService = new OrderService();
 
@@ -284,8 +291,15 @@ export class PaymentsService {
       const remaining = Math.max(0, total - already);
       const amount = input.amount ?? remaining;
       if (amount <= 0) throw new BadRequestError('收款金额必须大于 0');
-      if (amount > remaining + 0.001) {
-        throw new BadRequestError(`收款金额超过应收余额（应收 ¥${remaining.toFixed(2)}）`);
+      // 允许多付：到账金额可超过应收余额（结算价≠到账金额时常见），paidAmount 据此可超 total，
+      // 尾款 = total − paidAmount 变负即为「多付」，后续抵扣/代理余额依赖该记录。
+      // 仅设一个防手误的上限：单笔到账不得超过订单总额的 MAX_OVERPAY_MULTIPLE 倍，
+      // 且不超过绝对上限 MAX_SINGLE_PAYMENT_CNY，避免少打一位/多打几位的录入事故。
+      const fatFingerCap = Math.max(total * MAX_OVERPAY_MULTIPLE, MAX_SINGLE_PAYMENT_CNY);
+      if (amount > fatFingerCap + 0.001) {
+        throw new BadRequestError(
+          `收款金额 ¥${amount.toFixed(2)} 异常偏高（订单总额 ¥${total.toFixed(2)}），疑似录入错误，已拒绝。如确需大额到账请分笔录入或核对金额。`,
+        );
       }
       newPaid = already + amount;
       fullyPaid = newPaid + 0.001 >= total;
@@ -351,6 +365,85 @@ export class PaymentsService {
       orderNumber,
       status: fullyPaid ? OrderStatus.PAID : statusBefore,
     };
+  }
+
+  /**
+   * 批量确认收款 —— 选多个订单一次性到账。ADMIN/STAFF 用。
+   * 逐单复用 confirmManualPayment（每单独立行锁 + 幂等 + 审计），互不影响：
+   * 某一单失败（订单不存在/金额异常等）不会中断其余订单，结果逐单收集返回。
+   * sharedProofUrl 作为没有单独 proofUrl 的订单的回退凭证（如一张合并转账截图）。
+   */
+  async batchConfirmManualPayment(
+    input: {
+      items: Array<{
+        orderId: string;
+        amount: number;
+        method?: PaymentMethod;
+        proofUrl?: string;
+        note?: string;
+      }>;
+      sharedProofUrl?: string;
+    },
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
+    results: Array<{
+      orderId: string;
+      ok: boolean;
+      error?: string;
+      paidAmount?: number;
+      total?: number;
+      status?: OrderStatus;
+      paymentId?: string;
+    }>;
+  }> {
+    if (!Array.isArray(input.items) || input.items.length === 0) {
+      throw new BadRequestError('批量到账列表不能为空');
+    }
+    if (input.items.length > MAX_BATCH_ITEMS) {
+      throw new BadRequestError(`单次批量到账最多 ${MAX_BATCH_ITEMS} 笔订单`);
+    }
+
+    const results: Array<{
+      orderId: string;
+      ok: boolean;
+      error?: string;
+      paidAmount?: number;
+      total?: number;
+      status?: OrderStatus;
+      paymentId?: string;
+    }> = [];
+
+    // 逐单串行处理：每单一个事务/行锁，一坏不连累其余（收集错误而非整体回滚）
+    for (const item of input.items) {
+      try {
+        const result = await this.confirmManualPayment(
+          item.orderId,
+          {
+            amount: item.amount,
+            method: item.method ?? PaymentMethod.BANK_CARD,
+            proofUrl: item.proofUrl ?? input.sharedProofUrl,
+            note: item.note,
+          },
+          actor,
+        );
+        results.push({
+          orderId: item.orderId,
+          ok: true,
+          paidAmount: result.paidAmount,
+          total: result.total,
+          status: result.status,
+          paymentId: result.paymentId,
+        });
+      } catch (e) {
+        results.push({
+          orderId: item.orderId,
+          ok: false,
+          error: e instanceof Error ? e.message : '到账失败',
+        });
+      }
+    }
+
+    return { results };
   }
 
   /**

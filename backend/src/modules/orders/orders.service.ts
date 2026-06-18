@@ -1181,7 +1181,11 @@ export class OrderService {
 
     // ── 原子 CAS：where 附加当前状态，防并发重复转移（如两个支付回调同时来）──
     const extraData: Record<string, unknown> = { status: toStatus };
-    if (toStatus === 'PAID') extraData.paidAmount = order.total;
+    // 转 PAID 时确保 paidAmount 至少等于 total（全额已付）。但若已记录多付（paidAmount > total，
+    // 如线下到账金额高于结算价），不能回压到 total —— 取两者较大值，保留多付记录（尾款=total−paidAmount 为负）。
+    if (toStatus === 'PAID') {
+      extraData.paidAmount = order.paidAmount.greaterThan(order.total) ? order.paidAmount : order.total;
+    }
 
     const casResult = await tx.order.updateMany({
       where: { id, status: order.status },

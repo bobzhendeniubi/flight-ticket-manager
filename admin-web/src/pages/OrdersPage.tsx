@@ -109,6 +109,38 @@ function deriveView(o: OrderSummary) {
   return { itemKind, itemSummary, customerName, agentName, totalNum };
 }
 
+// 尾款 = 应收(total) − 已到账(paidAmount)。正=欠款(少付)、0=已结清、负=多付。
+// 用 2 位小数四舍五入避免浮点毛刺。
+function deriveBalance(o: OrderSummary): { total: number; paid: number; balance: number } {
+  const total = Number(o.total) || 0;
+  const paid = Number(o.paidAmount) || 0;
+  const balance = Math.round((total - paid) * 100) / 100;
+  return { total, paid, balance };
+}
+
+// 尾款徽标：少付=琥珀(欠款)、结清=绿、多付=蓝(highlight)。
+function BalanceBadge({ balance }: { balance: number }) {
+  if (balance > 0) {
+    return (
+      <span className="rounded bg-amber-100 px-1.5 py-0.5 text-xs font-medium text-amber-700">
+        欠 ¥{balance.toLocaleString()}
+      </span>
+    );
+  }
+  if (balance < 0) {
+    return (
+      <span className="rounded bg-blue-100 px-1.5 py-0.5 text-xs font-medium text-blue-700">
+        多付 ¥{Math.abs(balance).toLocaleString()}
+      </span>
+    );
+  }
+  return (
+    <span className="rounded bg-emerald-100 px-1.5 py-0.5 text-xs font-medium text-emerald-700">
+      已结清
+    </span>
+  );
+}
+
 export function OrdersPage() {
   const tokens = useAuth((s) => s.tokens);
   const [orders, setOrders] = useState<OrderSummary[]>([]);
@@ -156,6 +188,8 @@ export function OrdersPage() {
   } | null>(null);
   // 强制模式默认开（管理员手动改状态的核心场景就是绕开标准流转）
   const [forceMode, setForceMode] = useState(true);
+  // 批量到账弹窗（选多单 → 逐单录到账金额 + 共享水单）
+  const [showBatchPay, setShowBatchPay] = useState(false);
   // 批量创单弹窗 + 单笔录单弹窗 + 列表刷新计数（建单后 +1 触发重新拉单）
   const [showBatchCreate, setShowBatchCreate] = useState(false);
   const [showSingleCreate, setShowSingleCreate] = useState(false);
@@ -289,6 +323,17 @@ export function OrdersPage() {
     });
   };
   const clearSelection = () => { setSelectedIds(new Set()); setBulkResult(null); };
+
+  // 当前选中的订单对象（批量到账弹窗用）
+  const selectedOrders = useMemo(
+    () => orders.filter((o) => selectedIds.has(o.id)),
+    [orders, selectedIds],
+  );
+  // 可批量到账的订单 = 还没结清的（尾款 > 0）。已结清/多付的不重复到账。
+  const payableSelected = useMemo(
+    () => selectedOrders.filter((o) => deriveBalance(o).balance > 0),
+    [selectedOrders],
+  );
 
   const applyBulkStatus = async () => {
     if (!tokens?.accessToken || !bulkStatus || selectedIds.size === 0) return;
@@ -707,6 +752,19 @@ export function OrdersPage() {
             >
               {bulkSubmitting ? '处理中…' : `应用到 ${selectedIds.size} 条`}
             </button>
+            <span className="text-slate-300">|</span>
+            <button
+              className="btn-secondary text-sm py-1.5 disabled:opacity-50"
+              onClick={() => setShowBatchPay(true)}
+              disabled={bulkSubmitting || payableSelected.length === 0}
+              title={
+                payableSelected.length === 0
+                  ? '所选订单均已结清，无需到账'
+                  : '逐单录入到账金额（默认=尾款）+ 共享水单'
+              }
+            >
+              💰 批量到账（{payableSelected.length} 条待收）
+            </button>
             <button
               className="btn-ghost text-sm"
               onClick={clearSelection}
@@ -754,6 +812,7 @@ export function OrdersPage() {
                 <th className="text-left">客户 / 代理</th>
                 <th className="text-left">内容</th>
                 <th className="text-right">金额</th>
+                <th className="text-center">尾款</th>
                 <th className="text-center">状态</th>
                 <th className="text-center">签证</th>
                 <th className="text-center">开票</th>
@@ -794,6 +853,9 @@ export function OrdersPage() {
                   </td>
                   <td className="nums text-right font-medium text-ink">
                     ¥{view.totalNum.toLocaleString()}
+                  </td>
+                  <td className="text-center">
+                    <BalanceBadge balance={deriveBalance(order).balance} />
                   </td>
                   <td className="text-center">
                     <span className={STATUS_COLOR[order.status]}>
@@ -861,14 +923,14 @@ export function OrdersPage() {
               ))}
               {!loading && filtered.length === 0 && (
                 <tr>
-                  <td colSpan={10} className="py-8 text-center text-ink-muted">
+                  <td colSpan={11} className="py-8 text-center text-ink-muted">
                     没有符合条件的订单
                   </td>
                 </tr>
               )}
               {loading && (
                 <tr>
-                  <td colSpan={10} className="py-8 text-center text-ink-muted">加载中…</td>
+                  <td colSpan={11} className="py-8 text-center text-ink-muted">加载中…</td>
                 </tr>
               )}
             </tbody>
@@ -882,6 +944,24 @@ export function OrdersPage() {
           onClose={() => setSelected(null)}
           onAdvance={(next, reason) => advance(selected, next, reason)}
           onChanged={() => setRefreshNonce((n) => n + 1)}
+        />
+      )}
+
+      {showBatchPay && (
+        <BatchPayModal
+          orders={payableSelected}
+          onClose={() => setShowBatchPay(false)}
+          onDone={(succeededIds) => {
+            setRefreshNonce((n) => n + 1);
+            // 成功到账的从选择集移除，避免重复操作
+            if (succeededIds.length > 0) {
+              setSelectedIds((prev) => {
+                const next = new Set(prev);
+                succeededIds.forEach((id) => next.delete(id));
+                return next;
+              });
+            }
+          }}
         />
       )}
 
@@ -2117,7 +2197,8 @@ function ConfirmPaymentSection({
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  const remaining = Math.max(0, Math.round((total - paid) * 100) / 100);
+  // 尾款 = 应收 − 已付。正=欠款(少付)、0=已结清、负=多付（不再 clamp，多付要看得见）。
+  const balance = Math.round((total - paid) * 100) / 100;
 
   // 拉订单详情拿现有收款记录 + 最新已付
   useEffect(() => {
@@ -2130,7 +2211,7 @@ function ConfirmPaymentSection({
         setPayments(r.order.payments ?? []);
         const p = Number(r.order.paidAmount);
         setPaid(p);
-        const due = Math.max(0, Math.round((total - p) * 100) / 100);
+        const due = Math.round((total - p) * 100) / 100;
         setAmount(due > 0 ? due : null);
       })
       .catch(() => undefined);
@@ -2190,7 +2271,8 @@ function ConfirmPaymentSection({
     }
   }
 
-  const settled = remaining <= 0;
+  const settled = balance === 0;
+  const overpaid = balance < 0;
 
   return (
     <section>
@@ -2203,8 +2285,10 @@ function ConfirmPaymentSection({
             <span className="text-slate-400"> / ¥{total.toLocaleString()}</span>
             {settled ? (
               <span className="ml-2 rounded bg-emerald-100 px-1.5 py-0.5 text-xs text-emerald-700">已结清</span>
+            ) : overpaid ? (
+              <span className="ml-2 rounded bg-blue-100 px-1.5 py-0.5 text-xs text-blue-700">多付 ¥{Math.abs(balance).toLocaleString()}</span>
             ) : (
-              <span className="ml-2 rounded bg-amber-100 px-1.5 py-0.5 text-xs text-amber-700">应收 ¥{remaining.toLocaleString()}</span>
+              <span className="ml-2 rounded bg-amber-100 px-1.5 py-0.5 text-xs text-amber-700">应收 ¥{balance.toLocaleString()}</span>
             )}
           </span>
         </div>
@@ -2227,9 +2311,12 @@ function ConfirmPaymentSection({
           </ul>
         )}
 
-        {/* 确认收款表单 */}
-        {!settled && (
-          <div className="mt-3 space-y-2 border-t border-slate-100 pt-3">
+        {/* 确认收款表单（始终可补录：允许多付/追加收款，后端已放开 ≤尾款 限制）*/}
+        <div className="mt-3 space-y-2 border-t border-slate-100 pt-3">
+          {settled && (
+            <p className="text-xs text-slate-400">已结清；如需追加收款（多付）可继续录入。</p>
+          )}
+          <div className="space-y-2">
             {err && <div className="rounded bg-rose-50 px-2 py-1 text-xs text-rose-700">{err}</div>}
             <div className="flex gap-2">
               <label className="flex-1 text-xs text-slate-500">
@@ -2239,7 +2326,7 @@ function ConfirmPaymentSection({
                   className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1 text-sm"
                   value={amount}
                   onChange={(n) => setAmount(n)}
-                  placeholder={`默认应收 ¥${remaining}`}
+                  placeholder={balance > 0 ? `默认尾款 ¥${balance}` : '输入收款金额'}
                 />
               </label>
               <label className="flex-1 text-xs text-slate-500">
@@ -2278,8 +2365,244 @@ function ConfirmPaymentSection({
               </button>
             </div>
           </div>
-        )}
+        </div>
       </div>
     </section>
+  );
+}
+
+// ── 批量到账（选多单 → 逐单录入到账金额 + 共享水单 + 备注）──────────────
+// 流程：操作员勾选若干未结清订单 → 打开此弹窗 → 每单默认到账=尾款（可改）
+// → 选一个共享收款方式 + 可选共享水单（截图/URL）+ 备注 → 提交 →
+// 逐单入账（单条失败不影响其它），结果显示每单成功/失败。
+interface BatchPayRow {
+  orderId: string;
+  orderNumber: string;
+  customerName: string;
+  total: number;
+  paid: number;
+  balance: number;
+  /** 本次到账金额（默认 = 尾款）；null = 空 */
+  amount: number | null;
+}
+
+function BatchPayModal({
+  orders,
+  onClose,
+  onDone,
+}: {
+  orders: OrderSummary[];
+  onClose: () => void;
+  onDone: (succeededIds: string[]) => void;
+}) {
+  const tokens = useAuth((s) => s.tokens);
+  const token = tokens?.accessToken ?? '';
+
+  const [rows, setRows] = useState<BatchPayRow[]>(() =>
+    orders.map((o) => {
+      const { total, paid, balance } = deriveBalance(o);
+      const { customerName } = deriveView(o);
+      return {
+        orderId: o.id,
+        orderNumber: o.orderNumber,
+        customerName,
+        total,
+        paid,
+        balance,
+        amount: balance > 0 ? balance : null,
+      };
+    }),
+  );
+  const [method, setMethod] = useState<PaymentMethod>('BANK_CARD');
+  const [sharedProofUrl, setSharedProofUrl] = useState<string | null>(null);
+  const [sharedNote, setSharedNote] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [results, setResults] = useState<
+    Array<{ orderId: string; ok: boolean; error?: string; paidAmount: number; status: OrderStatus }> | null
+  >(null);
+
+  function setRowAmount(orderId: string, amount: number | null): void {
+    setRows((prev) => prev.map((r) => (r.orderId === orderId ? { ...r, amount } : r)));
+  }
+
+  function onSharedFile(e: React.ChangeEvent<HTMLInputElement>): void {
+    const f = e.target.files?.[0];
+    if (!f) return;
+    if (f.size > 4 * 1024 * 1024) {
+      setErr('截图过大（>4MB），请压缩后再传');
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => setSharedProofUrl(typeof reader.result === 'string' ? reader.result : null);
+    reader.readAsDataURL(f);
+  }
+
+  // 有效行 = 填了正数金额的行
+  const validRows = rows.filter((r) => r.amount !== null && Number.isFinite(r.amount) && (r.amount as number) > 0);
+
+  async function submit(): Promise<void> {
+    if (!token || submitting) return;
+    setErr(null);
+    if (validRows.length === 0) {
+      setErr('请至少为一笔订单填写到账金额（正数）');
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const res = await api.batchConfirmPayments(token, {
+        items: validRows.map((r) => ({
+          orderId: r.orderId,
+          amount: r.amount as number,
+          method,
+          note: sharedNote.trim() || undefined,
+        })),
+        sharedProofUrl: sharedProofUrl ?? undefined,
+      });
+      setResults(res.results);
+      const succeeded = res.results.filter((r) => r.ok).map((r) => r.orderId);
+      onDone(succeeded);
+    } catch (e: unknown) {
+      setErr(e instanceof ApiError ? e.message : '批量到账失败');
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  const totalToReceive = validRows.reduce((sum, r) => sum + (r.amount as number), 0);
+  const resultById = useMemo(() => {
+    const m = new Map<string, { ok: boolean; error?: string; paidAmount: number; status: OrderStatus }>();
+    results?.forEach((r) => m.set(r.orderId, r));
+    return m;
+  }, [results]);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 p-4">
+      <div className="my-8 w-full max-w-3xl rounded-xl bg-white shadow-xl">
+        <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3">
+          <h2 className="text-lg font-semibold text-slate-900">批量到账（{rows.length} 笔订单）</h2>
+          <button className="text-slate-400 hover:text-slate-700" onClick={onClose}>✕</button>
+        </div>
+
+        <div className="space-y-4 p-5">
+          {err && <div className="rounded-md bg-rose-50 px-4 py-2 text-sm text-rose-700">{err}</div>}
+
+          {/* 共享：收款方式 + 水单 + 备注（应用到本批所有单）*/}
+          <div className="rounded-md border border-slate-200 bg-slate-50/60 p-3">
+            <div className="mb-2 text-xs font-medium text-slate-600">本批共享信息（应用到下列每一单）</div>
+            <div className="grid gap-3 md:grid-cols-2">
+              <label className="text-xs text-slate-500">
+                收款方式
+                <select
+                  className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                  value={method}
+                  onChange={(e) => setMethod(e.target.value as PaymentMethod)}
+                  disabled={submitting || results !== null}
+                >
+                  {(['BANK_CARD', 'WECHAT_PAY', 'ALIPAY', 'AGENT_PREPAYMENT'] as PaymentMethod[]).map((m) => (
+                    <option key={m} value={m}>{PAYMENT_METHOD_LABEL[m]}</option>
+                  ))}
+                </select>
+              </label>
+              <label className="text-xs text-slate-500">
+                备注（选填，写入每单）
+                <input
+                  className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                  value={sharedNote}
+                  onChange={(e) => setSharedNote(e.target.value)}
+                  disabled={submitting || results !== null}
+                />
+              </label>
+            </div>
+            <label className="mt-2 flex items-center gap-2 text-xs text-slate-600">
+              <span className="rounded-md border border-slate-300 px-2 py-1 cursor-pointer hover:bg-slate-50">📷 上传共享水单（选填）</span>
+              <input type="file" accept="image/*" className="hidden" onChange={onSharedFile} disabled={submitting || results !== null} />
+              {sharedProofUrl && <img src={sharedProofUrl} alt="水单预览" className="h-8 w-8 rounded border border-slate-300 object-cover" />}
+            </label>
+          </div>
+
+          {/* 逐单到账金额（默认 = 尾款）*/}
+          <div className="max-h-80 overflow-y-auto rounded-md border border-slate-200">
+            <table className="w-full text-sm">
+              <thead className="sticky top-0 bg-slate-50 text-xs text-slate-500">
+                <tr>
+                  <th className="px-3 py-1.5 text-left font-normal">订单 / 客户</th>
+                  <th className="px-3 py-1.5 text-right font-normal">应收</th>
+                  <th className="px-3 py-1.5 text-right font-normal">已付</th>
+                  <th className="px-3 py-1.5 text-right font-normal">尾款</th>
+                  <th className="px-3 py-1.5 text-right font-normal">本次到账</th>
+                  {results !== null && <th className="px-3 py-1.5 text-left font-normal">结果</th>}
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((r) => {
+                  const res = resultById.get(r.orderId);
+                  return (
+                    <tr key={r.orderId} className="border-t border-slate-100">
+                      <td className="px-3 py-1.5">
+                        <div className="font-mono text-xs text-ink-soft">{r.orderNumber}</div>
+                        <div className="text-xs text-ink-muted">{r.customerName}</div>
+                      </td>
+                      <td className="nums px-3 py-1.5 text-right text-slate-600">¥{r.total.toLocaleString()}</td>
+                      <td className="nums px-3 py-1.5 text-right text-slate-600">¥{r.paid.toLocaleString()}</td>
+                      <td className="px-3 py-1.5 text-right">
+                        <BalanceBadge balance={r.balance} />
+                      </td>
+                      <td className="px-3 py-1.5 text-right">
+                        <NumberInput
+                          step={0.01}
+                          className="block w-28 rounded-md border border-slate-300 px-2 py-1 text-right text-sm"
+                          value={r.amount}
+                          onChange={(n) => setRowAmount(r.orderId, n)}
+                          placeholder="不收"
+                          disabled={submitting || results !== null}
+                        />
+                      </td>
+                      {results !== null && (
+                        <td className="px-3 py-1.5 text-xs">
+                          {res ? (
+                            res.ok ? (
+                              <span className="text-emerald-700">✓ 已到账（已付 ¥{res.paidAmount.toLocaleString()}）</span>
+                            ) : (
+                              <span className="text-rose-600">✕ {res.error ?? '失败'}</span>
+                            )
+                          ) : (
+                            <span className="text-slate-400">未提交</span>
+                          )}
+                        </td>
+                      )}
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+
+          <div className="flex items-center justify-between border-t border-slate-200 pt-3">
+            <span className="text-xs text-slate-500">
+              {results !== null
+                ? `成功 ${results.filter((r) => r.ok).length} 笔 · 失败 ${results.filter((r) => !r.ok).length} 笔`
+                : `将为 ${validRows.length} 笔订单入账，合计 ¥${totalToReceive.toLocaleString()}`}
+            </span>
+            <div className="flex gap-2">
+              {results !== null ? (
+                <button className="btn-primary text-sm" onClick={onClose}>完成</button>
+              ) : (
+                <>
+                  <button className="btn-secondary text-sm" onClick={onClose} disabled={submitting}>取消</button>
+                  <button
+                    className="btn-primary text-sm disabled:opacity-50"
+                    onClick={() => void submit()}
+                    disabled={submitting || validRows.length === 0}
+                  >
+                    {submitting ? '入账中…' : `确认到账 ${validRows.length} 笔`}
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }

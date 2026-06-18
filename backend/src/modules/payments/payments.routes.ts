@@ -92,6 +92,43 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
     return result;
   });
 
+  // ── 批量确认收款（选多个订单一次到账）ADMIN/STAFF ──
+  // POST /payments/batch-confirm
+  const batchConfirmSchema = z.object({
+    items: z
+      .array(
+        z.object({
+          orderId: z.string().min(1),
+          amount: z.number().positive(),
+          method: z.nativeEnum(PaymentMethod).optional(),
+          proofUrl: z.string().max(6_000_000).optional(),
+          note: z.string().max(500).optional(),
+        }),
+      )
+      .min(1)
+      .max(100),
+    sharedProofUrl: z.string().max(6_000_000).optional(),
+  });
+  app.post('/batch-confirm', { preHandler: [app.authenticate] }, async (req, reply) => {
+    if (req.user.role !== UserRole.ADMIN && req.user.role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅运营/管理员可确认收款' });
+    }
+    const body = batchConfirmSchema.parse(req.body);
+    const result = await service.batchConfirmManualPayment(
+      { items: body.items, sharedProofUrl: body.sharedProofUrl },
+      { userId: req.user.sub, role: req.user.role },
+    );
+    const okCount = result.results.filter((r) => r.ok).length;
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'BATCH_CONFIRM_MANUAL_PAYMENT',
+      targetType: 'ORDER',
+      targetLabel: `batch(${result.results.length})`,
+      after: { total: result.results.length, ok: okCount, failed: result.results.length - okCount },
+    });
+    return result;
+  });
+
   // ── 小程序 JSAPI 支付（生成 wx.requestPayment 参数） ─────
   app.post('/wechat/miniapp-prepay', { preHandler: [app.authenticate] }, async (req) => {
     const body = z.object({ orderId: z.string().min(1) }).parse(req.body);
