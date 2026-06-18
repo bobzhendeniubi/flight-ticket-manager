@@ -7,6 +7,7 @@ import {
 import { exportToCSV } from '../lib/csvExport';
 import { NumberInput } from '../components/NumberInput';
 import { OrderFinanceSection } from '../components/OrderFinanceSection';
+import { SingleOrderModal } from '../components/SingleOrderModal';
 
 // 本地可视化用的状态子集（后端 OrderStatus 更全，这里只列出常用 7 个做 filter）
 const STATUS_LABEL: Record<OrderStatus, string> = {
@@ -155,8 +156,9 @@ export function OrdersPage() {
   } | null>(null);
   // 强制模式默认开（管理员手动改状态的核心场景就是绕开标准流转）
   const [forceMode, setForceMode] = useState(true);
-  // 批量创单弹窗 + 列表刷新计数（建单后 +1 触发重新拉单）
+  // 批量创单弹窗 + 单笔录单弹窗 + 列表刷新计数（建单后 +1 触发重新拉单）
   const [showBatchCreate, setShowBatchCreate] = useState(false);
+  const [showSingleCreate, setShowSingleCreate] = useState(false);
   const [refreshNonce, setRefreshNonce] = useState(0);
 
   // 拉取订单 — 下单日期/出行日期/claimFilter/航班号/乘客姓名/开票状态 变化时重拉（后端过滤）
@@ -380,7 +382,15 @@ export function OrdersPage() {
           })()}
           <button
             className="btn-primary text-sm"
+            onClick={() => setShowSingleCreate(true)}
+            title="按产品类型录一笔订单（机票/酒店/签证/套餐/接送）"
+          >
+            ＋ 录单
+          </button>
+          <button
+            className="btn-secondary text-sm"
             onClick={() => setShowBatchCreate(true)}
+            title="按航班班次批量录散客机票（每位乘客一单）"
           >
             ＋ 批量创单
           </button>
@@ -878,6 +888,13 @@ export function OrdersPage() {
       {showBatchCreate && (
         <BatchCreateModal
           onClose={() => setShowBatchCreate(false)}
+          onCreated={() => setRefreshNonce((n) => n + 1)}
+        />
+      )}
+
+      {showSingleCreate && (
+        <SingleOrderModal
+          onClose={() => setShowSingleCreate(false)}
           onCreated={() => setRefreshNonce((n) => n + 1)}
         />
       )}

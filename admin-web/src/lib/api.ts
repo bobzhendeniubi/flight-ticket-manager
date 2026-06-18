@@ -176,6 +176,55 @@ export interface BatchCreateOrdersResult {
   }>;
 }
 
+// ── 单笔录单（按产品类型）—— 与 backend createOrderBodySchema / orderItemInputSchema 对齐 ──
+// 所有行都带 description + quantity（int 1..20）；HOTEL/VISA/TRANSFER/BUNDLE 的 unitPrice 仅占位，
+// 服务端会按产品权威重算价格（HOTEL/VISA/TRANSFER 后端定价；BUNDLE/FLIGHT 后端重算）。
+export interface OrderPassengerInput {
+  fullName: string;
+  documentNumber: string;
+  dateOfBirth: string; // YYYY-MM-DD
+  nationality?: string; // ISO alpha-2，默认 CN
+  passengerType?: PassengerType;
+}
+
+interface OrderItemBase {
+  description: string;
+  quantity: number;
+  metadata?: Record<string, unknown>;
+}
+export type CreateOrderItemInput =
+  | (OrderItemBase & { kind: 'FLIGHT'; flightScheduleId: string; flightCabin: CabinClass })
+  | (OrderItemBase & { kind: 'HOTEL'; hotelRoomTypeId?: string; checkIn?: string; checkOut?: string; unitPrice: number })
+  | (OrderItemBase & { kind: 'TRANSFER'; transferId?: string; unitPrice: number })
+  | (OrderItemBase & { kind: 'VISA'; visaId?: string; unitPrice: number })
+  | (OrderItemBase & {
+      kind: 'BUNDLE';
+      bundleId: string;
+      unitPrice: number;
+      singleCount?: number;
+      businessCount?: number;
+      adultCount?: number;
+      childCount?: number;
+      infantCount?: number;
+    });
+
+export interface CreateOrderInput {
+  contactName: string;
+  contactPhone: string;
+  contactEmail?: string;
+  paymentMethod?: PaymentMethod;
+  items: CreateOrderItemInput[];
+  passengers: OrderPassengerInput[];
+  notes?: string;
+  idempotencyKey?: string;
+  /**
+   * 代为某代理录单（ADMIN/STAFF 用）。直客/无代理 = 不传。
+   * 注：服务端创单接口对 agentId 的归属支持为后端配套改动；本字段为前向兼容透传，
+   * 服务端未启用时会被静默忽略（不报错）。
+   */
+  agentId?: string;
+}
+
 export interface AgentListItem {
   id: string;
   userId: string;
@@ -916,6 +965,10 @@ export const api = {
   // 批量散客建单：一个航班班次+舱位+共享联系人，名单每位乘客一单
   batchCreateOrders: (token: string, body: BatchCreateOrdersInput) =>
     apiFetch<BatchCreateOrdersResult>('/orders/batch', { method: 'POST', token, body }),
+
+  // 单笔录单（按产品类型 机票/酒店/签证/套餐/接送）。服务端按产品权威重算价格 + 校验余票。
+  createOrder: (token: string, body: CreateOrderInput) =>
+    apiFetch<{ order: OrderSummary }>('/orders/', { method: 'POST', token, body }),
 
   // 设置开票状态（ADMIN/STAFF）
   setInvoiceStatus: (token: string, id: string, invoiceStatus: InvoiceStatus) =>
