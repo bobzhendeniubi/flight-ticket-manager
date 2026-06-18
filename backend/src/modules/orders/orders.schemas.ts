@@ -153,6 +153,9 @@ export const createOrderBodySchema = z.object({
   idempotencyKey: z.string().min(8).max(128).optional(),
   // 游客下单联系人（免登录时必填；登录用户忽略）
   guestContact: guestContactSchema.optional(),
+  // 运营代下单时归属的代理（仅 ADMIN/STAFF 录单时生效）。
+  // AGENT 自助下单忽略此字段（只能归属自己）；游客忽略。
+  agentId: z.string().optional(),
 });
 export type CreateOrderBody = z.infer<typeof createOrderBodySchema>;
 
@@ -252,6 +255,8 @@ export const batchCreateOrdersBodySchema = z.object({
   contactEmail: z.string().email().optional(),
   paymentMethod: z.nativeEnum(PaymentMethod).optional(),
   notes: z.string().max(500).optional(),
+  // 运营批量录单时整批归属的代理（仅 ADMIN/STAFF 生效，校验同单条下单）。
+  agentId: z.string().optional(),
   passengers: z.array(passengerInputSchema).min(1).max(100), // 每位 → 一单
 });
 export type BatchCreateOrdersBody = z.infer<typeof batchCreateOrdersBodySchema>;

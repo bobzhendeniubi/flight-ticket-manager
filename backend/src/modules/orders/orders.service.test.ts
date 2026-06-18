@@ -27,6 +27,9 @@ const { mockPrisma, mockComputeQuote } = vi.hoisted(() => ({
     user: {
       findUnique: vi.fn(),
     },
+    agent: {
+      findUnique: vi.fn(),
+    },
   },
   mockComputeQuote: vi.fn(),
 }));
@@ -50,6 +53,7 @@ import {
   resolveBundleOccupancy,
   computeRoomsNeeded,
   createFulfillmentTasks,
+  resolveOrderAgentId,
 } from './orders.service.js';
 import type { OrderItemInput } from './orders.schemas.js';
 
@@ -1119,5 +1123,73 @@ describe('createFulfillmentTasks · 套餐 fan-out 到地面岗', () => {
       { orderItemId: 'itm_flight', type: 'FLIGHT_TICKETING', status: 'PENDING' },
       { orderItemId: 'itm_hotel', type: 'HOTEL_BOOKING', status: 'PENDING' },
     ]);
+  });
+});
+
+// ── 代理归属解析（运营代下单选代理）─────────────────────────────────────
+describe('resolveOrderAgentId · 代理归属', () => {
+  beforeEach(() => {
+    mockPrisma.agent.findUnique.mockReset();
+  });
+
+  it('ADMIN 传有效 agentId → 校验通过后归属该代理（佣金链按 order.agentId 跑，与代理自下单一致）', async () => {
+    mockPrisma.agent.findUnique.mockResolvedValue({ id: 'agent_target', isActive: true });
+    const resolved = await resolveOrderAgentId(
+      { userId: 'u_admin', role: 'ADMIN' },
+      'agent_target',
+    );
+    expect(resolved).toBe('agent_target');
+    expect(mockPrisma.agent.findUnique).toHaveBeenCalledWith({
+      where: { id: 'agent_target' },
+      select: { id: true, isActive: true },
+    });
+  });
+
+  it('STAFF 传有效 agentId → 同样归属该代理', async () => {
+    mockPrisma.agent.findUnique.mockResolvedValue({ id: 'agent_target', isActive: true });
+    const resolved = await resolveOrderAgentId(
+      { userId: 'u_staff', role: 'STAFF' },
+      'agent_target',
+    );
+    expect(resolved).toBe('agent_target');
+  });
+
+  it('AGENT 自助下单忽略 body.agentId，永远归属自己（代理不能替他人记单）', async () => {
+    const resolved = await resolveOrderAgentId(
+      { userId: 'u_agent', role: 'AGENT', agentId: 'agent_self' },
+      'agent_someone_else',
+    );
+    expect(resolved).toBe('agent_self');
+    // 不应查库校验他人代理
+    expect(mockPrisma.agent.findUnique).not.toHaveBeenCalled();
+  });
+
+  it('ADMIN 不传 agentId → 直客单（null）', async () => {
+    const resolved = await resolveOrderAgentId({ userId: 'u_admin', role: 'ADMIN' }, undefined);
+    expect(resolved).toBeNull();
+    expect(mockPrisma.agent.findUnique).not.toHaveBeenCalled();
+  });
+
+  it('ADMIN 传不存在的 agentId → 抛错（拒单）', async () => {
+    mockPrisma.agent.findUnique.mockResolvedValue(null);
+    await expect(
+      resolveOrderAgentId({ userId: 'u_admin', role: 'ADMIN' }, 'agent_ghost'),
+    ).rejects.toThrow(/不存在/);
+  });
+
+  it('ADMIN 传已停用的 agentId → 抛错（拒单）', async () => {
+    mockPrisma.agent.findUnique.mockResolvedValue({ id: 'agent_off', isActive: false });
+    await expect(
+      resolveOrderAgentId({ userId: 'u_admin', role: 'ADMIN' }, 'agent_off'),
+    ).rejects.toThrow(/停用/);
+  });
+
+  it('CUSTOMER 自助下单 → 无代理归属（null），不查库', async () => {
+    const resolved = await resolveOrderAgentId(
+      { userId: 'u_cust', role: 'CUSTOMER' },
+      'agent_target',
+    );
+    expect(resolved).toBeNull();
+    expect(mockPrisma.agent.findUnique).not.toHaveBeenCalled();
   });
 });

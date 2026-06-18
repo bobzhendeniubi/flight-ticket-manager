@@ -110,6 +110,43 @@ function isGuestRequester(r: OrderRequester | GuestRequester): r is GuestRequest
   return 'guest' in r;
 }
 
+/**
+ * 解析订单的代理归属（登录用户）。佣金链路在订单转 PAID 时按 order.agentId 计算，
+ * 因此 ADMIN/STAFF 代下单显式归属的代理，会与该代理本人下单产生完全相同的佣金链。
+ *
+ *   - AGENT：只能归属自己（忽略 body.agentId，代理不能替他人记单）。
+ *   - ADMIN / STAFF：可显式传 body.agentId 归属某代理；先校验存在且 isActive，
+ *     否则 404（不存在）/ 400（已停用）。不传则记为直客（null）。
+ *   - 其他角色（如 CUSTOMER 自助下单）：无代理归属 → null。
+ *
+ * 导出供单测复用。
+ */
+export async function resolveOrderAgentId(
+  requester: OrderRequester,
+  bodyAgentId: string | undefined,
+): Promise<string | null> {
+  if (requester.role === 'AGENT') {
+    return requester.agentId ?? null;
+  }
+
+  if (requester.role === 'ADMIN' || requester.role === 'STAFF') {
+    if (!bodyAgentId) return null;
+    const agent = await prisma.agent.findUnique({
+      where: { id: bodyAgentId },
+      select: { id: true, isActive: true },
+    });
+    if (!agent) {
+      throw new NotFoundError(`指定的代理不存在：${bodyAgentId}`);
+    }
+    if (!agent.isActive) {
+      throw new BadRequestError('指定的代理已停用，无法归属订单');
+    }
+    return agent.id;
+  }
+
+  return null;
+}
+
 export class OrderService {
   private readonly pricing = new PricingService();
 
@@ -169,8 +206,12 @@ export class OrderService {
     const subtotal = pricedItems.reduce((sum, p) => sum + p.amount, 0);
     const total = subtotal; // 目前没有 taxes / discount，直接等于 subtotal
 
-    // 代理身份判定：游客无代理；登录用户里非 AGENT 也 agentId=null
-    const agentId = !isGuest && requester.role === 'AGENT' ? (requester.agentId ?? null) : null;
+    // 代理归属判定：
+    //   游客 / 直客 → null；AGENT 自助 → 自己的 agentId（忽略 body.agentId）；
+    //   ADMIN·STAFF 录单 → 可显式归属 body.agentId（校验存在且在用），否则 null。
+    const agentId = isGuest
+      ? null
+      : await resolveOrderAgentId(requester, body.agentId);
 
     // 生成订单号（有极小概率撞 unique，重试 3 次）
     const orderNumber = await generateOrderNumber();
@@ -1015,6 +1056,8 @@ export class OrderService {
             contactEmail: body.contactEmail,
             paymentMethod: body.paymentMethod,
             notes: body.notes,
+            // 整批归属代理（ADMIN/STAFF 录单）；AGENT 自助仍归属本人。
+            agentId: body.agentId,
             items: [
               {
                 kind: 'FLIGHT',
