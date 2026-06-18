@@ -60,3 +60,35 @@ export function computeRoomsNeeded(
 
   return Math.max(adultRooms, childRooms, 1);
 }
+
+// ── 套餐住宿晚数（nights）解析 ───────────────────────────────────────────────
+//
+// 单一口径，镜像后端（与 backend 对齐）：
+//   nights = hotelNights ?? (第一条 HOTEL item 的 qty) ?? 默认 4 晚
+//
+// 背景：套餐真实晚数来自 HOTEL 行项的 qty（如 "凯悦 3 晚" → HOTEL qty=3）；
+// 历史数据里 hotelNights 多为 null，直接回退默认 4 晚会让 1/3 晚的产品错显「4 晚」、
+// 算错回程日期与单人入住晚数。故先取 hotelNights，缺省时回落到 HOTEL 行项 qty，再兜底。
+//
+// 仅作展示与价格镜像；下单时由服务端重算为权威值。
+
+/** 套餐晚数兜底（最后才用；与展示口径一致）。 */
+export const DEFAULT_NIGHTS = 4;
+
+/** resolveBundleNights 所需的最小套餐视图结构（两处页面视图均已携带）。 */
+export interface BundleNightsView {
+  hotelNights?: number | null;
+  items?: ReadonlyArray<{ kind: string; qty?: number | null }> | null;
+}
+
+/**
+ * 解析套餐住宿晚数。
+ * @returns hotelNights（非 null）→ 否则第一条 HOTEL item 的 qty（≥1）→ 否则 DEFAULT_NIGHTS。
+ */
+export function resolveBundleNights(b: BundleNightsView | null | undefined): number {
+  if (b?.hotelNights != null) return b.hotelNights;
+  const hotelItem = b?.items?.find((i) => i.kind === 'HOTEL');
+  const hotelQty = hotelItem?.qty;
+  if (hotelQty != null && hotelQty >= 1) return hotelQty;
+  return DEFAULT_NIGHTS;
+}

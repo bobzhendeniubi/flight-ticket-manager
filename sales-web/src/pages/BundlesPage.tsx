@@ -23,7 +23,7 @@ import { useDebouncedValue } from '../lib/useDebouncedValue';
 import { useFlightSearchCache, type FlightSearchCache, type FlightLeg } from '../lib/useFlightSearchCache';
 import { useHotelAvailability } from '../lib/useHotelAvailability';
 import { useBundleSellableDates } from '../lib/useBundleSellableDates';
-import { computeRoomsNeeded, resolveRoomCapacity } from '../lib/bundleRooms';
+import { computeRoomsNeeded, resolveRoomCapacity, resolveBundleNights } from '../lib/bundleRooms';
 import {
   SellableReasonChip,
   isSellableBlocked,
@@ -45,10 +45,9 @@ import { matchKeyword } from '../components/HomeSections';
 import { useAuth } from '../stores/auth';
 import { useCart } from '../stores/cart';
 
-/** 主航线（澳门 ⇌ 岘港）+ 默认住宿晚数（套餐未配置 hotelNights 时） */
+/** 主航线（澳门 ⇌ 岘港）。住宿晚数走 resolveBundleNights（hotelNights → HOTEL qty → 兜底）。 */
 const ROUTE_ORIGIN = 'MFM';
 const ROUTE_DEST = 'DAD';
-const DEFAULT_NIGHTS = 4;
 
 /** 机票单航段兜底价（搜不到班次时用，避免价格显示为 0） */
 const FALLBACK_PRICE = {
@@ -575,7 +574,8 @@ function ConfigurableBundleCard({
   const cabin: 'ECONOMY' | 'BUSINESS' = isBiz ? 'BUSINESS' : 'ECONOMY';
 
   // 住宿晚数 → 回程日期。展示用 cardGoDate（即时反馈），库存查询用防抖日期。
-  const nights = b.hotelNights ?? DEFAULT_NIGHTS;
+  // 口径：hotelNights ?? 第一条 HOTEL item 的 qty ?? 默认 4 晚（镜像后端）。
+  const nights = resolveBundleNights(b);
   const displayReturnDate = addDaysISO(cardGoDate, nights);
   const queryReturnDate = addDaysISO(queryCardGo, nights);
 

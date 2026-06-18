@@ -25,7 +25,7 @@ import { useDebouncedValue } from '../lib/useDebouncedValue';
 import { useFlightSearchCache, type FlightLeg } from '../lib/useFlightSearchCache';
 import { useHotelAvailability } from '../lib/useHotelAvailability';
 import { useBundleSellableDates } from '../lib/useBundleSellableDates';
-import { computeRoomsNeeded, resolveRoomCapacity } from '../lib/bundleRooms';
+import { computeRoomsNeeded, resolveRoomCapacity, resolveBundleNights } from '../lib/bundleRooms';
 import {
   SellableReasonChip,
   isSellableBlocked,
@@ -49,7 +49,7 @@ import { useCart } from '../stores/cart';
 // ── 与列表页一致的常量 ────────────────────────────────────────────
 const ROUTE_ORIGIN = 'MFM';
 const ROUTE_DEST = 'DAD';
-const DEFAULT_NIGHTS = 4;
+// 住宿晚数走 resolveBundleNights（hotelNights → HOTEL qty → 兜底），不再用本地默认常量。
 const REVIEW_PAGE_SIZE = 5;
 const SOLD_RECENTLY_THRESHOLD = 30;
 
@@ -265,7 +265,8 @@ function BundleDetailContent({
 }) {
   const items = (b.items ?? []) as BundleItemData[];
   const groundDiscount = num(b.groundDiscount);
-  const nights = b.hotelNights ?? DEFAULT_NIGHTS;
+  // 口径：hotelNights ?? 第一条 HOTEL item 的 qty ?? 默认 4 晚（镜像后端）。
+  const nights = resolveBundleNights(b);
   const isBiz = items.some((i) => i.kind === 'FLIGHT' && i.productName.includes('商务'));
   const cabin: 'ECONOMY' | 'BUSINESS' = isBiz ? 'BUSINESS' : 'ECONOMY';
 
