@@ -435,6 +435,18 @@ export interface RoomAssignment {
 
 export type InvoiceStatus = 'NONE' | 'REQUESTED' | 'ISSUED';
 
+/**
+ * 售后费用记录（改期费 / 换人费）。total = 产品金额；
+ * adjustmentCny = 售后费用合计；尾款 = total + adjustmentCny − paidAmount。
+ */
+export interface OrderAdjustment {
+  id: string;
+  amountCny: string;
+  label: string;
+  note: string | null;
+  createdAt: string;
+}
+
 export interface OrderSummary {
   id: string;
   orderNumber: string;
@@ -446,6 +458,10 @@ export interface OrderSummary {
   subtotal: string;
   total: string;
   paidAmount: string;
+  /** 售后费用合计（改期费 + 换人费）；尾款 = total + adjustmentCny − paidAmount。后端未启用时缺省 */
+  adjustmentCny?: string;
+  /** 售后费用明细（改期费 / 换人费）；列表可能为空，详情带出 */
+  adjustments?: OrderAdjustment[];
   contactName: string;
   contactPhone: string;
   contactEmail: string | null;
@@ -1183,6 +1199,53 @@ export const api = {
     body: { notes?: string; internalNotes?: string } & OrderStructuredNotes,
   ) =>
     apiFetch<{ ok: boolean }>(`/orders/${orderId}/notes`, {
+      method: 'PATCH',
+      token,
+      body,
+    }),
+
+  // ── 售后：改期 / 换人（ADMIN/STAFF）──────────────────────────────────
+  // 改期：把某个 FLIGHT 订单项移到新班次（座位服务端搬移；新班次售罄则拒绝），
+  // 可选改舱位 + 可选加「改期费」到订单。返回更新后的订单。
+  rescheduleOrder: (
+    token: string,
+    orderId: string,
+    body: {
+      orderItemId: string;
+      newScheduleId: string;
+      newCabin?: CabinClass;
+      feeCny?: number;
+      feeLabel?: string;
+      note?: string;
+    },
+  ) =>
+    apiFetch<{ order: OrderSummary }>(`/orders/${orderId}/reschedule`, {
+      method: 'PATCH',
+      token,
+      body,
+    }),
+  // 换人/编辑出行人：改姓名/护照/生日/性别/国籍；可选重置开票(→NONE)/签证(→PENDING)；
+  // 可选加「换人费」到订单。返回更新后的订单。
+  updateOrderPassenger: (
+    token: string,
+    orderId: string,
+    passengerId: string,
+    body: {
+      lastName?: string;
+      firstName?: string;
+      fullName?: string;
+      documentNumber?: string;
+      dateOfBirth?: string;
+      gender?: 'M' | 'F' | 'X';
+      nationality?: string;
+      resetInvoice?: boolean;
+      resetVisa?: boolean;
+      feeCny?: number;
+      feeLabel?: string;
+      note?: string;
+    },
+  ) =>
+    apiFetch<{ order: OrderSummary }>(`/orders/${orderId}/passengers/${passengerId}`, {
       method: 'PATCH',
       token,
       body,

@@ -1713,6 +1713,360 @@ export class OrderService {
     });
     return { order: serializeOrder(finalOrder), refund: result.refund, quote, isNew: true };
   }
+
+  // ════════════════════════════════════════════════════════════════════
+  // 售后改单：改期（reschedule）/ 换人（passenger swap）
+  // 订单创建后原本不可改（只能取消重建）；这两个端点补「就地改」能力。
+  // 全程 ADMIN/STAFF（路由层断言）、事务安全、审计。
+  // 钱与库存口径：
+  //   - 改期不重算机票基础价（doc：只加改期费）；尾款用 total + adjustmentCny − paidAmount。
+  //   - 座位「先放旧、再原子拿新」：拿新失败则整事务回滚，旧座不会被放掉（无泄漏、无超售）。
+  // ════════════════════════════════════════════════════════════════════
+
+  /**
+   * 改期：把订单里某条 FLIGHT 行就地改到新班次/新舱位，并（可选）加改期费。
+   *
+   * body：{ orderItemId, newScheduleId, newCabin?, feeCny?, feeLabel?, note? }
+   *   - orderItemId 必须属于本订单且 kind=FLIGHT，且有原班次/原舱位。
+   *   - newCabin 缺省则沿用原舱位。
+   *
+   * 单事务内：
+   *   1. 释放旧座（旧班次+旧舱位 sold −= quantity）
+   *   2. 原子拿新座（新班次+新舱位 CAS：sold + qty + 他人锁位 ≤ capacity）
+   *      —— 新班次售罄则抛错，事务回滚 → 旧座保持原样（不泄漏）。
+   *   3. 更新该行 flightScheduleId/flightCabin（amount/quantity 不变，机票基础价不重算）。
+   *   4. feeCny>0 → order.adjustmentCny += feeCny，并 push 一条 adjustments 流水（RESCHEDULE_FEE）。
+   *   5. 当前若处于 CHANGE_REQUESTED（状态机允许 → CHANGED）则推进到 CHANGED；其余状态保持不变。
+   *
+   * 返回更新后的订单（serializeOrder）。
+   */
+  async rescheduleOrderItem(
+    orderId: string,
+    input: {
+      orderItemId: string;
+      newScheduleId: string;
+      newCabin?: import('@prisma/client').CabinClass;
+      feeCny?: number;
+      feeLabel?: string;
+      note?: string;
+    },
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
+    order: ReturnType<typeof serializeOrder>;
+    audit: {
+      orderNumber: string;
+      orderItemId: string;
+      fromScheduleId: string;
+      fromCabin: import('@prisma/client').CabinClass;
+      fromDeparture: Date | null;
+      toScheduleId: string;
+      toCabin: import('@prisma/client').CabinClass;
+      toDeparture: Date | null;
+      feeCny: number;
+      statusChanged: boolean;
+    };
+  }> {
+    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+      throw new ForbiddenError('仅运营/管理员可改期');
+    }
+    const feeCny = Math.max(0, Math.trunc(input.feeCny ?? 0));
+
+    const scratch = await prisma.$transaction(async (tx) => {
+      const order = await tx.order.findUnique({
+        where: { id: orderId },
+        select: { id: true, status: true, adjustmentCny: true, adjustments: true },
+      });
+      if (!order) throw new NotFoundError('订单不存在');
+
+      const item = await tx.orderItem.findUnique({
+        where: { id: input.orderItemId },
+        select: {
+          id: true,
+          orderId: true,
+          kind: true,
+          quantity: true,
+          flightScheduleId: true,
+          flightCabin: true,
+          metadata: true,
+        },
+      });
+      if (!item || item.orderId !== orderId) {
+        throw new NotFoundError('订单项不存在或不属于该订单');
+      }
+      if (item.kind !== OrderItemKind.FLIGHT || !item.flightScheduleId || !item.flightCabin) {
+        throw new BadRequestError('只能对机票行（FLIGHT）改期');
+      }
+
+      const oldScheduleId = item.flightScheduleId;
+      const oldCabin = item.flightCabin;
+      const newScheduleId = input.newScheduleId;
+      const newCabin = input.newCabin ?? oldCabin;
+
+      // 无变化（同班次同舱位）→ 不做座位搬移，避免无意义的放/拿
+      const sameSeat = oldScheduleId === newScheduleId && oldCabin === newCabin;
+
+      // 新班次必须存在且有该舱位（友好报错；最终防超售仍靠下面的原子 CAS）
+      const newSeatClass = await tx.flightSeatClass.findFirst({
+        where: { scheduleId: newScheduleId, cabin: newCabin },
+        select: { id: true },
+      });
+      if (!newSeatClass) {
+        throw new BadRequestError('目标班次不存在该舱位，无法改期');
+      }
+
+      // 套餐升舱拆座：该行下单时可能把 businessUpgradeCount 个座拆到了商务舱。
+      // 改期同样按原拆分「先放旧、再拿新」，否则商务/经济会错位泄漏。
+      const meta = (item.metadata ?? {}) as { businessUpgradeCount?: unknown };
+      const rawUpgrade = typeof meta.businessUpgradeCount === 'number' ? meta.businessUpgradeCount : 0;
+
+      if (!sameSeat) {
+        // ── 1. 释放旧座（按原拆分各退各舱）──
+        const oldSplit = computeBundleSeatSplit(oldCabin, item.quantity, rawUpgrade);
+        await releaseSeatWithinTx(tx, oldScheduleId, 'BUSINESS', oldSplit.business);
+        await releaseSeatWithinTx(tx, oldScheduleId, oldCabin, oldSplit.sameCabin);
+
+        // ── 2. 原子拿新座（同款 CAS；售罄 → 抛错，整事务回滚，旧座不会真被放掉）──
+        // 拆座只对经济舱行成立；新舱位非经济舱则 split.business=0，全额拿新原舱。
+        const newSplit = computeBundleSeatSplit(newCabin, item.quantity, rawUpgrade);
+        await takeSeatWithinTx(tx, newScheduleId, 'BUSINESS', newSplit.business, null);
+        await takeSeatWithinTx(tx, newScheduleId, newCabin, newSplit.sameCabin, null);
+      }
+
+      // ── 3. 更新订单行的班次/舱位（amount/quantity 不变：机票基础价不重算）──
+      await tx.orderItem.update({
+        where: { id: item.id },
+        data: { flightScheduleId: newScheduleId, flightCabin: newCabin },
+      });
+
+      // ── 4. 加改期费（adjustmentCny + adjustments 流水）──
+      if (feeCny > 0) {
+        const log = appendAdjustment(order.adjustments, {
+          type: 'RESCHEDULE_FEE',
+          label: input.feeLabel || '改期费',
+          amountCny: feeCny,
+          at: new Date().toISOString(),
+          by: actor.userId,
+          note: input.note,
+        });
+        await tx.order.update({
+          where: { id: orderId },
+          data: { adjustmentCny: order.adjustmentCny + feeCny, adjustments: log },
+        });
+      }
+
+      // ── 5. 仅在状态机允许时推进到 CHANGED（不破坏状态机）──
+      let statusChanged = false;
+      if (
+        order.status !== OrderStatus.CHANGED &&
+        ALLOWED_TRANSITIONS[order.status].includes(OrderStatus.CHANGED)
+      ) {
+        await this._updateStatusWithinTx(
+          tx,
+          orderId,
+          OrderStatus.CHANGED,
+          { userId: actor.userId, role: actor.role, actorType: 'USER' },
+          input.note ? `改期（${input.note}）` : '改期',
+          [], // 改期不产生履约任务
+        );
+        statusChanged = true;
+      }
+
+      // 把审计需要的「原/新」明细返回到 tx 外（出发时间另查）。
+      // 直接 return 而非写模块级单例，避免并发改期互相覆盖。
+      return { oldScheduleId, oldCabin, newScheduleId, newCabin, statusChanged };
+    });
+
+    // 审计明细：原/新出发时间（事务外查，避免污染事务）
+    const [fromSched, toSched, finalOrder] = await Promise.all([
+      prisma.flightSchedule.findUnique({
+        where: { id: scratch.oldScheduleId },
+        select: { departureTime: true },
+      }),
+      prisma.flightSchedule.findUnique({
+        where: { id: scratch.newScheduleId },
+        select: { departureTime: true },
+      }),
+      prisma.order.findUniqueOrThrow({ where: { id: orderId }, include: ORDER_FULL_INCLUDE }),
+    ]);
+
+    return {
+      order: serializeOrder(finalOrder),
+      audit: {
+        orderNumber: finalOrder.orderNumber,
+        orderItemId: input.orderItemId,
+        fromScheduleId: scratch.oldScheduleId,
+        fromCabin: scratch.oldCabin,
+        fromDeparture: fromSched?.departureTime ?? null,
+        toScheduleId: scratch.newScheduleId,
+        toCabin: scratch.newCabin,
+        toDeparture: toSched?.departureTime ?? null,
+        feeCny,
+        statusChanged: scratch.statusChanged,
+      },
+    };
+  }
+
+  /**
+   * 换人：把订单里某位出行人就地换成新人（改身份字段），并按需重置开票/签证状态、加换人费。
+   *
+   * body：{ lastName?, firstName?, fullName?, documentNumber?, dateOfBirth?, gender?,
+   *         nationality?, resetInvoice?, resetVisa?, feeCny?, feeLabel?, note? }
+   *
+   * 单事务内：
+   *   1. 更新该乘客的身份字段（仅传入的字段；fullName/姓名拆分与下单口径一致）。
+   *   2. resetInvoice → order.invoiceStatus = NONE（新出行人需重新开票）。
+   *   3. resetVisa → 该订单所有 VISA 履约任务回到 PENDING（新出行人需重新送签）。
+   *   4. feeCny>0 → order.adjustmentCny += feeCny + adjustments 流水（SWAP_FEE）。
+   *
+   * 返回更新后的订单（serializeOrder）+ 审计用的原/新身份。
+   */
+  async swapPassenger(
+    orderId: string,
+    passengerId: string,
+    input: {
+      lastName?: string;
+      firstName?: string;
+      fullName?: string;
+      documentNumber?: string;
+      dateOfBirth?: string;
+      gender?: import('@prisma/client').Gender;
+      nationality?: string;
+      resetInvoice?: boolean;
+      resetVisa?: boolean;
+      feeCny?: number;
+      feeLabel?: string;
+      note?: string;
+    },
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
+    order: ReturnType<typeof serializeOrder>;
+    audit: {
+      orderNumber: string;
+      passengerId: string;
+      before: { fullName: string; documentNumber: string };
+      after: { fullName: string; documentNumber: string };
+      resetInvoice: boolean;
+      resetVisa: boolean;
+      visaTasksReset: number;
+      feeCny: number;
+    };
+  }> {
+    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+      throw new ForbiddenError('仅运营/管理员可换人');
+    }
+    const feeCny = Math.max(0, Math.trunc(input.feeCny ?? 0));
+
+    const result = await prisma.$transaction(async (tx) => {
+      const order = await tx.order.findUnique({
+        where: { id: orderId },
+        select: { id: true, adjustmentCny: true, adjustments: true },
+      });
+      if (!order) throw new NotFoundError('订单不存在');
+
+      const passenger = await tx.passenger.findUnique({
+        where: { id: passengerId },
+        select: { id: true, orderId: true, fullName: true, documentNumber: true },
+      });
+      if (!passenger || passenger.orderId !== orderId) {
+        throw new NotFoundError('出行人不存在或不属于该订单');
+      }
+      const beforeIdentity = {
+        fullName: passenger.fullName,
+        documentNumber: passenger.documentNumber,
+      };
+
+      // ── 1. 更新身份字段（仅传入的字段；fullName 时按下单口径自动拆姓/名兜底）──
+      const data: Prisma.PassengerUpdateInput = {};
+      if (input.fullName !== undefined) {
+        data.fullName = input.fullName;
+        // 客户端没显式给 lastName/firstName 时，用 fullName 自动拆（与 passengerToData 同口径）
+        if (input.lastName === undefined || input.firstName === undefined) {
+          const [autoLast, ...rest] = input.fullName.trim().split(/\s+/);
+          if (input.lastName === undefined) data.lastName = autoLast ?? null;
+          if (input.firstName === undefined) data.firstName = rest.join(' ') || null;
+        }
+      }
+      if (input.lastName !== undefined) data.lastName = input.lastName;
+      if (input.firstName !== undefined) data.firstName = input.firstName;
+      if (input.documentNumber !== undefined) data.documentNumber = input.documentNumber;
+      if (input.dateOfBirth !== undefined) data.dateOfBirth = new Date(input.dateOfBirth);
+      if (input.gender !== undefined) data.gender = input.gender;
+      if (input.nationality !== undefined) data.nationality = input.nationality;
+      await tx.passenger.update({ where: { id: passengerId }, data });
+
+      // ── 2. resetInvoice → 开票状态回 NONE（新出行人重开票）──
+      if (input.resetInvoice) {
+        await tx.order.update({
+          where: { id: orderId },
+          data: { invoiceStatus: InvoiceStatus.NONE },
+        });
+      }
+
+      // ── 3. resetVisa → 该订单所有 VISA 履约任务回 PENDING（新出行人重新送签）──
+      let visaTasksReset = 0;
+      if (input.resetVisa) {
+        const reset = await tx.fulfillmentTask.updateMany({
+          where: {
+            type: FulfillmentType.VISA_APPLICATION,
+            orderItem: { orderId },
+            status: { not: FulfillmentStatus.PENDING },
+          },
+          data: {
+            status: FulfillmentStatus.PENDING,
+            startedAt: null,
+            completedAt: null,
+            failureReason: null,
+          },
+        });
+        visaTasksReset = reset.count;
+      }
+
+      // ── 4. 加换人费（adjustmentCny + adjustments 流水）──
+      if (feeCny > 0) {
+        const log = appendAdjustment(order.adjustments, {
+          type: 'SWAP_FEE',
+          label: input.feeLabel || '换人费',
+          amountCny: feeCny,
+          at: new Date().toISOString(),
+          by: actor.userId,
+          note: input.note,
+        });
+        await tx.order.update({
+          where: { id: orderId },
+          data: { adjustmentCny: order.adjustmentCny + feeCny, adjustments: log },
+        });
+      }
+
+      const afterPassenger = await tx.passenger.findUniqueOrThrow({
+        where: { id: passengerId },
+        select: { fullName: true, documentNumber: true },
+      });
+
+      return { beforeIdentity, afterIdentity: afterPassenger, visaTasksReset };
+    });
+
+    const finalOrder = await prisma.order.findUniqueOrThrow({
+      where: { id: orderId },
+      include: ORDER_FULL_INCLUDE,
+    });
+
+    return {
+      order: serializeOrder(finalOrder),
+      audit: {
+        orderNumber: finalOrder.orderNumber,
+        passengerId,
+        before: result.beforeIdentity,
+        after: {
+          fullName: result.afterIdentity.fullName,
+          documentNumber: result.afterIdentity.documentNumber,
+        },
+        resetInvoice: Boolean(input.resetInvoice),
+        resetVisa: Boolean(input.resetVisa),
+        visaTasksReset: result.visaTasksReset,
+        feeCny,
+      },
+    };
+  }
 }
 
 // 完整 include 给 serializeOrder 用
@@ -2146,6 +2500,90 @@ export function computeRequiredPassengerCount(items: OrderItemInput[]): number {
   return Math.max(maxFlightLegQty, bundlePax, visaQty, transferPax);
 }
 
+// ── 售后改单：座位搬移 + 费用流水（事务内复用 createOrder/状态机的同款口径）──
+
+/**
+ * 事务内原子「拿座」（CAS，最终防超售）—— 与 createOrder 的 decrementSeat 同款保证。
+ *   UPDATE ... SET sold = sold + qty WHERE sold + qty + 他人ACTIVE锁位 ≤ capacity
+ * affected ≠ 1（售罄/并发抢占/无此舱位）→ 抛 ConflictError，调用方的事务随之回滚。
+ *
+ * @param excludeUserId 排除其本人锁位不挡自己（下单场景用）；改期由运营操作 → 传 null（所有他人锁位都占余票）。
+ */
+async function takeSeatWithinTx(
+  tx: Prisma.TransactionClient,
+  scheduleId: string,
+  cabin: import('@prisma/client').CabinClass,
+  qty: number,
+  excludeUserId: string | null,
+): Promise<void> {
+  if (qty <= 0) return;
+  const lockedAgg = await tx.seatLock.aggregate({
+    _sum: { qty: true },
+    where: {
+      seatClass: { scheduleId, cabin },
+      ...(excludeUserId ? { userId: { not: excludeUserId } } : {}),
+      status: SeatLockStatus.ACTIVE,
+      expiresAt: { gt: new Date() },
+    },
+  });
+  const lockedByOthers = lockedAgg._sum.qty ?? 0;
+  const affected = await tx.$executeRaw`
+    UPDATE "FlightSeatClass"
+    SET sold = sold + ${qty}, "updatedAt" = NOW()
+    WHERE "scheduleId" = ${scheduleId}
+      AND cabin = ${cabin}::"CabinClass"
+      AND sold + ${qty} + ${lockedByOthers} <= capacity
+  `;
+  if (affected !== 1) {
+    const sc = await tx.flightSeatClass.findFirst({
+      where: { scheduleId, cabin },
+      select: { capacity: true, sold: true },
+    });
+    const available = sc ? Math.max(0, sc.capacity - sc.sold - lockedByOthers) : 0;
+    throw new ConflictError(
+      `${cabin} 余票不足：需要 ${qty} 张，仅剩 ${available} 张（改期目标班次售罄/并发抢占）`,
+    );
+  }
+}
+
+/**
+ * 事务内「放座」—— 与状态机 releaseSeat 同款（sold -= qty，无下限保护交由调用约束保证）。
+ */
+async function releaseSeatWithinTx(
+  tx: Prisma.TransactionClient,
+  scheduleId: string,
+  cabin: import('@prisma/client').CabinClass,
+  qty: number,
+): Promise<void> {
+  if (qty <= 0) return;
+  await tx.flightSeatClass.updateMany({
+    where: { scheduleId, cabin },
+    data: { sold: { decrement: qty } },
+  });
+}
+
+/** 一条售后费用流水（写入 Order.adjustments）。 */
+export interface OrderAdjustmentEntry {
+  type: 'RESCHEDULE_FEE' | 'SWAP_FEE' | string;
+  label: string;
+  amountCny: number;
+  at: string; // ISO 时间
+  by: string | null; // 操作人 userId
+  note?: string;
+}
+
+/**
+ * 不可变地把一条流水追加到 Order.adjustments（JSON 数组）。
+ * 旧值非数组（脏数据/旧空默认）时按空数组处理，绝不抛错。
+ */
+function appendAdjustment(
+  existing: Prisma.JsonValue | null | undefined,
+  entry: OrderAdjustmentEntry,
+): Prisma.InputJsonValue {
+  const arr = Array.isArray(existing) ? (existing as Prisma.JsonArray) : [];
+  return [...arr, entry as unknown as Prisma.InputJsonValue];
+}
+
 /**
  * 套餐升舱「拆座」模型（纯函数，扣座/退座共用，最终防超售）。
  *
@@ -2230,6 +2668,8 @@ interface OrderLike {
   total: Prisma.Decimal;
   paidAmount: Prisma.Decimal;
   prepaymentOffset: Prisma.Decimal;
+  // 售后费用（改期费/换人费等）累计额（CNY，整数）。Prisma 直接返回 number。
+  adjustmentCny: number;
   items: Array<{ unitPrice: Prisma.Decimal; amount: Prisma.Decimal } & Record<string, unknown>>;
   // 可选嵌套代理（含余额 Decimal + 结算模式）；不同 include 下可能不带或带 null
   agent?: ({ prepaymentBalance?: Prisma.Decimal | null } & Record<string, unknown>) | null;
@@ -2241,6 +2681,15 @@ function round2(n: number): number {
 }
 
 function serializeOrder<T extends OrderLike>(order: T) {
+  // 售后费用叠加后的口径：
+  //   effectivePayable = total + adjustmentCny（客户实际应付）
+  //   balanceDue       = effectivePayable − paidAmount（尾款；负数表示多付）
+  // 不改 total/subtotal（机票基础价不重算），只在结清口径上暴露派生值，前端统一用此尾款。
+  const adjustmentCny = order.adjustmentCny ?? 0;
+  const totalNum = Number(order.total.toString());
+  const paidNum = Number(order.paidAmount.toString());
+  const effectivePayable = round2(totalNum + adjustmentCny);
+  const balanceDue = round2(effectivePayable - paidNum);
   return {
     ...order,
     subtotal: order.subtotal.toString(),
@@ -2249,6 +2698,10 @@ function serializeOrder<T extends OrderLike>(order: T) {
     total: order.total.toString(),
     paidAmount: order.paidAmount.toString(),
     prepaymentOffset: order.prepaymentOffset.toString(),
+    // 售后费用派生口径（前端用 effectivePayable / balanceDue 取代「total − paidAmount」）
+    adjustmentCny,
+    effectivePayable: effectivePayable.toString(),
+    balanceDue: balanceDue.toString(),
     // 暴露代理结算模式 + 余额（前端据 settlementMode=MONTHLY 把订单显示成「月结」而非「欠款」）
     agent:
       order.agent == null

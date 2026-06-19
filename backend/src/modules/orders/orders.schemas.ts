@@ -2,6 +2,7 @@ import { z } from 'zod';
 import {
   CabinClass,
   DocumentType,
+  Gender,
   InvoiceStatus,
   OrderItemKind,
   OrderStatus,
@@ -12,6 +13,9 @@ import {
 
 // 团队议价结算价上限（CNY/人）。防误输天价；正常机票远低于此。
 export const SETTLEMENT_PRICE_CAP_CNY = 100_000;
+
+// 售后费用（改期费/换人费）上限（CNY）。防误输天价；正常售后费远低于此。
+export const POST_SALE_FEE_CAP_CNY = 100_000;
 
 // ── 订单级签证状态 + 结构化备注四栏（录单/编辑共用）─────────────────────────
 // 全部 optional：老客户端不传则字段留空，与旧行为一致。每栏限 ~300 字。
@@ -297,3 +301,56 @@ export const batchCreateOrdersBodySchema = z.object({
   passengers: z.array(passengerInputSchema).min(1).max(100), // 每位 → 一单
 });
 export type BatchCreateOrdersBody = z.infer<typeof batchCreateOrdersBodySchema>;
+
+// ── 售后改单：改期（reschedule）─────────────────────────────────────────────
+// PATCH /orders/:id/reschedule（ADMIN/STAFF）：把某条 FLIGHT 行就地改到新班次/新舱位 + 可选改期费。
+const postSaleFeeSchema = z
+  .number()
+  .int('费用必须为整数（CNY）')
+  .min(0, '费用不能为负')
+  .max(POST_SALE_FEE_CAP_CNY, `费用超出上限（${POST_SALE_FEE_CAP_CNY}）`)
+  .optional();
+
+export const rescheduleOrderBodySchema = z.object({
+  orderItemId: z.string().min(1, 'orderItemId 必填'),
+  newScheduleId: z.string().min(1, 'newScheduleId 必填'),
+  newCabin: z.nativeEnum(CabinClass).optional(), // 缺省沿用原舱位
+  feeCny: postSaleFeeSchema, // 改期费（CNY，整数；0/缺省=不收）
+  feeLabel: z.string().max(120).optional(), // 自定义费用名（缺省"改期费"）
+  note: z.string().max(500).optional(),
+});
+export type RescheduleOrderBody = z.infer<typeof rescheduleOrderBodySchema>;
+
+// ── 售后改单：换人（passenger swap）─────────────────────────────────────────
+// PATCH /orders/:id/passengers/:passengerId（ADMIN/STAFF）：就地改出行人身份 + 可选重置开票/签证 + 换人费。
+export const swapPassengerBodySchema = z
+  .object({
+    lastName: z.string().max(120).optional(),
+    firstName: z.string().max(120).optional(),
+    fullName: z.string().max(120).optional(),
+    documentNumber: z.string().max(60).optional(),
+    dateOfBirth: z.string().optional(), // ISO 日期字符串
+    gender: z.nativeEnum(Gender).optional(),
+    nationality: z.string().max(60).optional(),
+    resetInvoice: z.boolean().optional(), // → 开票状态回 NONE
+    resetVisa: z.boolean().optional(), // → 该订单 VISA 履约任务回 PENDING
+    feeCny: postSaleFeeSchema, // 换人费（CNY，整数；0/缺省=不收）
+    feeLabel: z.string().max(120).optional(), // 自定义费用名（缺省"换人费"）
+    note: z.string().max(500).optional(),
+  })
+  // 至少改一项身份字段，或触发一次重置/收费 —— 防空 PATCH
+  .refine(
+    (b) =>
+      b.lastName !== undefined ||
+      b.firstName !== undefined ||
+      b.fullName !== undefined ||
+      b.documentNumber !== undefined ||
+      b.dateOfBirth !== undefined ||
+      b.gender !== undefined ||
+      b.nationality !== undefined ||
+      b.resetInvoice === true ||
+      b.resetVisa === true ||
+      (b.feeCny ?? 0) > 0,
+    { message: '换人请求需至少包含一项身份变更 / 重置 / 费用' },
+  );
+export type SwapPassengerBody = z.infer<typeof swapPassengerBodySchema>;

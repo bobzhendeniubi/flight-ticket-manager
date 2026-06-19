@@ -109,13 +109,14 @@ function deriveView(o: OrderSummary) {
   return { itemKind, itemSummary, customerName, agentName, totalNum };
 }
 
-// 尾款 = 应收(total) − 已到账(paidAmount)。正=欠款(少付)、0=已结清、负=多付。
-// 用 2 位小数四舍五入避免浮点毛刺。
-function deriveBalance(o: OrderSummary): { total: number; paid: number; balance: number } {
+// 尾款 = 应收(total + 售后费用 adjustmentCny) − 已到账(paidAmount)。
+// 正=欠款(少付)、0=已结清、负=多付。用 2 位小数四舍五入避免浮点毛刺。
+function deriveBalance(o: OrderSummary): { total: number; adjustment: number; paid: number; balance: number } {
   const total = Number(o.total) || 0;
+  const adjustment = Number(o.adjustmentCny) || 0;
   const paid = Number(o.paidAmount) || 0;
-  const balance = Math.round((total - paid) * 100) / 100;
-  return { total, paid, balance };
+  const balance = Math.round((total + adjustment - paid) * 100) / 100;
+  return { total, adjustment, paid, balance };
 }
 
 // 尾款徽标：少付=琥珀(欠款)、结清=绿、多付=蓝(highlight)。
@@ -952,6 +953,10 @@ export function OrdersPage() {
           onClose={() => setSelected(null)}
           onAdvance={(next, reason) => advance(selected, next, reason)}
           onChanged={() => setRefreshNonce((n) => n + 1)}
+          onOrderUpdated={(updated) => {
+            setOrders((prev) => prev.map((o) => (o.id === updated.id ? updated : o)));
+            setSelected((prev) => (prev && prev.id === updated.id ? updated : prev));
+          }}
         />
       )}
 
@@ -996,11 +1001,14 @@ function OrderDrawer({
   onClose,
   onAdvance,
   onChanged,
+  onOrderUpdated,
 }: {
   order: OrderSummary;
   onClose: () => void;
   onAdvance: (next: OrderStatus, reason?: string) => void;
   onChanged?: () => void;
+  /** 售后改期/换人后用更新后的订单就地刷新抽屉与列表 */
+  onOrderUpdated?: (order: OrderSummary) => void;
 }) {
   const view = deriveView(order);
   // 可行的下一步状态（与 backend orders.service ALLOWED_TRANSITIONS 保持一致的子集）
@@ -1069,25 +1077,20 @@ function OrderDrawer({
             <h3 className="text-xs font-semibold uppercase tracking-wide text-ink-muted">产品内容</h3>
             <ul className="mt-2 space-y-2 text-sm">
               {order.items.map((it) => (
-                <li key={it.id} className="rounded-lg border border-slate-200 bg-slate-50/60 p-3">
-                  <div className="flex items-start justify-between gap-2">
-                    <div className="flex-1">
-                      <div className="text-ink">{it.description}</div>
-                      <div className="mt-0.5 text-xs text-ink-muted">
-                        {KIND_LABEL[it.kind]} · 数量 {it.quantity} · 单价 ¥{Number(it.unitPrice).toLocaleString()}
-                      </div>
-                    </div>
-                    <div className="nums text-sm font-medium text-ink">
-                      ¥{Number(it.amount).toLocaleString()}
-                    </div>
-                  </div>
-                </li>
+                <OrderItemRow
+                  key={it.id}
+                  orderId={order.id}
+                  item={it}
+                  onOrderUpdated={onOrderUpdated}
+                />
               ))}
             </ul>
             <p className="mt-2 text-xs text-ink-muted">共 {order.passengers.length} 位乘客</p>
           </section>
 
-          <PassengersSection order={order} />
+          <AdjustmentsSection order={order} />
+
+          <PassengersSection order={order} onOrderUpdated={onOrderUpdated} />
 
           <OpsToolbar order={order} onAdvance={onAdvance} />
 
@@ -1115,20 +1118,35 @@ function OrderDrawer({
 
           <section>
             <h3 className="text-xs font-semibold uppercase tracking-wide text-ink-muted">支付</h3>
-            <dl className="mt-2 space-y-1 text-sm">
-              <Row
-                label="订单金额"
-                value={<span className="nums text-lg font-semibold text-ink">¥{view.totalNum.toLocaleString()}</span>}
-              />
-              <Row label="已付" value={<span className="nums">¥{Number(order.paidAmount).toLocaleString()}</span>} />
-              <Row label="下单时间" value={new Date(order.createdAt).toLocaleString('zh-CN')} />
-            </dl>
+            {(() => {
+              const bal = deriveBalance(order);
+              return (
+                <dl className="mt-2 space-y-1 text-sm">
+                  <Row
+                    label="订单金额"
+                    value={<span className="nums text-lg font-semibold text-ink">¥{view.totalNum.toLocaleString()}</span>}
+                  />
+                  {bal.adjustment !== 0 && (
+                    <Row
+                      label="售后费用"
+                      value={<span className="nums text-ink">¥{bal.adjustment.toLocaleString()}</span>}
+                    />
+                  )}
+                  <Row label="已付" value={<span className="nums">¥{bal.paid.toLocaleString()}</span>} />
+                  <Row
+                    label="尾款"
+                    value={<BalanceBadge balance={bal.balance} settlementMode={order.agent?.settlementMode} />}
+                  />
+                  <Row label="下单时间" value={new Date(order.createdAt).toLocaleString('zh-CN')} />
+                </dl>
+              );
+            })()}
           </section>
 
-          {/* 确认收款（线下收款 → 标记已付 + 上传截图）*/}
+          {/* 确认收款（线下收款 → 标记已付 + 上传截图）。应收 = 订单金额 + 售后费用 */}
           <ConfirmPaymentSection
             orderId={order.id}
-            total={view.totalNum}
+            total={view.totalNum + (Number(order.adjustmentCny) || 0)}
             paidAmount={Number(order.paidAmount)}
             agent={order.agent}
             onChanged={onChanged}
@@ -1427,7 +1445,253 @@ function daysUntil(dateStr: string | null | undefined): number | null {
   return Math.floor((target.getTime() - today.getTime()) / 86400_000);
 }
 
-function PassengersSection({ order }: { order: OrderSummary }) {
+// 班次展示文案：起飞→到达（本地时间）
+function scheduleLabel(s: AdminSchedule): string {
+  const dep = new Date(s.departureTime).toLocaleString('zh-CN', {
+    month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+  });
+  const arr = new Date(s.arrivalTime).toLocaleString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+  return `${dep} → ${arr}`;
+}
+
+// ── 产品内容行：FLIGHT 项可「改期」（换班次/日期 + 改舱位 + 改期费）──────
+function OrderItemRow({
+  orderId,
+  item,
+  onOrderUpdated,
+}: {
+  orderId: string;
+  item: OrderItem;
+  onOrderUpdated?: (order: OrderSummary) => void;
+}) {
+  const [rescheduling, setRescheduling] = useState(false);
+  const isFlight = item.kind === 'FLIGHT';
+
+  return (
+    <li className="rounded-lg border border-slate-200 bg-slate-50/60 p-3">
+      <div className="flex items-start justify-between gap-2">
+        <div className="flex-1">
+          <div className="text-ink">{item.description}</div>
+          <div className="mt-0.5 text-xs text-ink-muted">
+            {KIND_LABEL[item.kind]} · 数量 {item.quantity} · 单价 ¥{Number(item.unitPrice).toLocaleString()}
+            {item.flightCabin && <> · {CABIN_ZH[item.flightCabin] ?? item.flightCabin}</>}
+          </div>
+        </div>
+        <div className="flex flex-col items-end gap-1">
+          <div className="nums text-sm font-medium text-ink">¥{Number(item.amount).toLocaleString()}</div>
+          {isFlight && !rescheduling && (
+            <button
+              className="text-[11px] font-medium text-brand hover:text-brand-dark"
+              onClick={() => setRescheduling(true)}
+            >
+              改期
+            </button>
+          )}
+        </div>
+      </div>
+      {isFlight && rescheduling && (
+        <RescheduleForm
+          orderId={orderId}
+          item={item}
+          onCancel={() => setRescheduling(false)}
+          onSaved={(updated) => {
+            setRescheduling(false);
+            onOrderUpdated?.(updated);
+          }}
+        />
+      )}
+    </li>
+  );
+}
+
+function RescheduleForm({
+  orderId,
+  item,
+  onCancel,
+  onSaved,
+}: {
+  orderId: string;
+  item: OrderItem;
+  onCancel: () => void;
+  onSaved: (order: OrderSummary) => void;
+}) {
+  const tokens = useAuth((s) => s.tokens);
+  const token = tokens?.accessToken ?? '';
+  const [flights, setFlights] = useState<AdminFlight[]>([]);
+  const [flightId, setFlightId] = useState('');
+  const [schedules, setSchedules] = useState<AdminSchedule[]>([]);
+  const [newScheduleId, setNewScheduleId] = useState('');
+  const [newCabin, setNewCabin] = useState<CabinClass | ''>(item.flightCabin ?? '');
+  const [feeCny, setFeeCny] = useState<number | null>(null);
+  const [note, setNote] = useState('');
+  const [loadingSchedules, setLoadingSchedules] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    api.listAllFlights(token)
+      .then((r) => { if (!cancelled) setFlights(r.flights); })
+      .catch(() => { if (!cancelled) setErr('航班列表加载失败'); });
+    return () => { cancelled = true; };
+  }, [token]);
+
+  useEffect(() => {
+    if (!token || !flightId) { setSchedules([]); setNewScheduleId(''); return; }
+    let cancelled = false;
+    setLoadingSchedules(true);
+    api.listSchedules(token, flightId)
+      .then((r) => { if (!cancelled) setSchedules(r.schedules.filter((s) => s.isActive)); })
+      .catch(() => { if (!cancelled) setErr('班次加载失败'); })
+      .finally(() => { if (!cancelled) setLoadingSchedules(false); });
+    return () => { cancelled = true; };
+  }, [token, flightId]);
+
+  const selectedSchedule = schedules.find((s) => s.id === newScheduleId);
+  const cabinOptions = selectedSchedule?.seatClasses ?? [];
+
+  const submit = async () => {
+    if (!token || submitting) return;
+    setErr(null);
+    if (!newScheduleId) { setErr('请选择新班次'); return; }
+    if (!confirm('确认改期？座位会移动到新班次（新班次售罄会被拒绝），如填了改期费将计入订单尾款。')) return;
+    setSubmitting(true);
+    try {
+      const res = await api.rescheduleOrder(token, orderId, {
+        orderItemId: item.id,
+        newScheduleId,
+        newCabin: newCabin || undefined,
+        feeCny: feeCny != null && feeCny > 0 ? feeCny : undefined,
+        feeLabel: feeCny != null && feeCny > 0 ? '改期费' : undefined,
+        note: note.trim() || undefined,
+      });
+      onSaved(res.order);
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : '改期失败');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="mt-3 space-y-2 rounded-md border border-brand/40 bg-white p-3 text-xs">
+      <div className="font-medium text-brand">改期 · 当前：{item.description}{item.flightCabin && ` · ${CABIN_ZH[item.flightCabin] ?? item.flightCabin}`}</div>
+
+      <label className="block">
+        <span className="text-slate-500">选航班</span>
+        <select
+          className="mt-0.5 w-full rounded border border-slate-300 px-2 py-1"
+          value={flightId}
+          onChange={(e) => setFlightId(e.target.value)}
+        >
+          <option value="">选择航班…</option>
+          {flights.map((f) => (
+            <option key={f.id} value={f.id}>
+              {f.flightNumber} · {f.originCode}→{f.destinationCode}
+            </option>
+          ))}
+        </select>
+      </label>
+
+      <label className="block">
+        <span className="text-slate-500">新班次{loadingSchedules && '（加载中…）'}</span>
+        <select
+          className="mt-0.5 w-full rounded border border-slate-300 px-2 py-1 disabled:bg-slate-100"
+          value={newScheduleId}
+          onChange={(e) => setNewScheduleId(e.target.value)}
+          disabled={!flightId || loadingSchedules}
+        >
+          <option value="">选择班次…</option>
+          {schedules.map((s) => (
+            <option key={s.id} value={s.id}>{scheduleLabel(s)}</option>
+          ))}
+        </select>
+      </label>
+
+      <label className="block">
+        <span className="text-slate-500">新舱位（可选）</span>
+        <select
+          className="mt-0.5 w-full rounded border border-slate-300 px-2 py-1 disabled:bg-slate-100"
+          value={newCabin}
+          onChange={(e) => setNewCabin(e.target.value as CabinClass | '')}
+          disabled={!selectedSchedule}
+        >
+          <option value="">沿用原舱位</option>
+          {cabinOptions.map((c) => (
+            <option key={c.id} value={c.cabin}>{CABIN_ZH[c.cabin] ?? c.cabin}</option>
+          ))}
+        </select>
+      </label>
+
+      <label className="block">
+        <span className="text-slate-500">改期费（¥，可选）</span>
+        <NumberInput
+          value={feeCny}
+          onChange={setFeeCny}
+          integerOnly
+          placeholder="不收改期费则留空"
+          className="mt-0.5 w-full rounded border border-slate-300 px-2 py-1"
+        />
+      </label>
+
+      <label className="block">
+        <span className="text-slate-500">备注（可选）</span>
+        <input
+          className="mt-0.5 w-full rounded border border-slate-300 px-2 py-1"
+          value={note}
+          onChange={(e) => setNote(e.target.value)}
+          placeholder="如：客户主动改期 / 航变"
+        />
+      </label>
+
+      {err && <div className="rounded bg-red-50 px-2 py-1 text-red-700">{err}</div>}
+
+      <div className="flex gap-2 pt-1">
+        <button
+          className="flex-1 rounded bg-brand px-2 py-1.5 font-medium text-white disabled:opacity-50"
+          onClick={submit}
+          disabled={submitting || !newScheduleId}
+        >
+          {submitting ? '改期中…' : '确认改期'}
+        </button>
+        <button
+          className="rounded bg-slate-100 px-3 py-1.5 text-slate-700 disabled:opacity-50"
+          onClick={onCancel}
+          disabled={submitting}
+        >
+          取消
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── 售后费用（改期费 / 换人费）明细展示 ───────────────────────────────
+function AdjustmentsSection({ order }: { order: OrderSummary }) {
+  const adjustments = order.adjustments ?? [];
+  if (adjustments.length === 0) return null;
+  return (
+    <section>
+      <h3 className="text-xs font-semibold uppercase tracking-wide text-ink-muted">售后费用</h3>
+      <ul className="mt-2 space-y-1.5 text-sm">
+        {adjustments.map((a) => (
+          <li key={a.id} className="flex items-start justify-between gap-2 rounded-md border border-amber-200 bg-amber-50/60 p-2.5">
+            <div className="flex-1">
+              <div className="text-ink">{a.label}</div>
+              {a.note && <div className="mt-0.5 text-xs text-ink-muted">{a.note}</div>}
+              <div className="mt-0.5 text-[11px] text-ink-muted">{new Date(a.createdAt).toLocaleString('zh-CN')}</div>
+            </div>
+            <div className="nums text-sm font-medium text-amber-700">+¥{Number(a.amountCny).toLocaleString()}</div>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onOrderUpdated?: (order: OrderSummary) => void }) {
+  const [editingId, setEditingId] = useState<string | null>(null);
   return (
     <section>
       <h3 className="text-sm font-medium text-slate-700">乘客 ({order.passengers.length})</h3>
@@ -1436,6 +1700,21 @@ function PassengersSection({ order }: { order: OrderSummary }) {
           const passDaysLeft = daysUntil(p.passportExpiry);
           const passWarn = passDaysLeft !== null && passDaysLeft < 180;
           const passBlock = passDaysLeft !== null && passDaysLeft < 90;
+          if (editingId === p.id) {
+            return (
+              <li key={p.id} className="rounded-md border border-brand/40 bg-brand/5 p-3">
+                <PassengerEditForm
+                  orderId={order.id}
+                  passenger={p}
+                  onCancel={() => setEditingId(null)}
+                  onSaved={(updated) => {
+                    setEditingId(null);
+                    onOrderUpdated?.(updated);
+                  }}
+                />
+              </li>
+            );
+          }
           return (
             <li key={p.id} className="rounded-md border border-slate-200 bg-white p-3">
               <div className="flex items-start justify-between gap-2">
@@ -1443,6 +1722,12 @@ function PassengersSection({ order }: { order: OrderSummary }) {
                   <div className="font-medium text-slate-900">
                     {p.fullName}
                     {p.gender && <span className="ml-2 text-xs text-slate-500">{p.gender === 'M' ? '男' : p.gender === 'F' ? '女' : '其他'}</span>}
+                    <button
+                      className="ml-2 text-[11px] font-normal text-brand hover:text-brand-dark"
+                      onClick={() => setEditingId(p.id)}
+                    >
+                      换人/编辑
+                    </button>
                   </div>
                   <dl className="mt-1 grid grid-cols-2 gap-x-3 gap-y-0.5 text-[11px] text-slate-600">
                     <dt>护照号</dt><dd className="font-mono">{p.documentNumber ?? '—'}</dd>
@@ -1485,6 +1770,166 @@ function PassengersSection({ order }: { order: OrderSummary }) {
         })}
       </ul>
     </section>
+  );
+}
+
+// ── 换人/编辑出行人（改身份 + 可选重置开票/签证 + 换人费）─────────────
+function PassengerEditForm({
+  orderId,
+  passenger,
+  onCancel,
+  onSaved,
+}: {
+  orderId: string;
+  passenger: OrderSummary['passengers'][number];
+  onCancel: () => void;
+  onSaved: (order: OrderSummary) => void;
+}) {
+  const tokens = useAuth((s) => s.tokens);
+  const token = tokens?.accessToken ?? '';
+  const [lastName, setLastName] = useState(passenger.lastName ?? '');
+  const [firstName, setFirstName] = useState(passenger.firstName ?? '');
+  const [fullName, setFullName] = useState(passenger.fullName ?? '');
+  const [documentNumber, setDocumentNumber] = useState(passenger.documentNumber ?? '');
+  const [dob, setDob] = useState(passenger.dateOfBirth?.slice(0, 10) ?? '');
+  const [gender, setGender] = useState<'M' | 'F' | 'X' | ''>(passenger.gender ?? '');
+  const [nationality, setNationality] = useState(passenger.nationality ?? '');
+  const [resetInvoice, setResetInvoice] = useState(false);
+  const [resetVisa, setResetVisa] = useState(false);
+  const [feeCny, setFeeCny] = useState<number | null>(null);
+  const [note, setNote] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const submit = async () => {
+    if (!token || submitting) return;
+    setErr(null);
+    // 生日填了就必须解析合法
+    let dobValue: string | undefined;
+    if (dob.trim()) {
+      const parsed = parseDob(dob);
+      if (!parsed) { setErr('出生日期格式不正确（示例：1990-01-01）'); return; }
+      dobValue = parsed;
+    }
+    if (!confirm('确认保存出行人改动？如勾选了重置开票/签证将清除对应状态，填了换人费将计入订单尾款。')) return;
+    setSubmitting(true);
+    try {
+      const res = await api.updateOrderPassenger(token, orderId, passenger.id, {
+        lastName: lastName.trim() || undefined,
+        firstName: firstName.trim() || undefined,
+        fullName: fullName.trim() || undefined,
+        documentNumber: documentNumber.trim() || undefined,
+        dateOfBirth: dobValue,
+        gender: gender || undefined,
+        nationality: nationality.trim() || undefined,
+        resetInvoice: resetInvoice || undefined,
+        resetVisa: resetVisa || undefined,
+        feeCny: feeCny != null && feeCny > 0 ? feeCny : undefined,
+        feeLabel: feeCny != null && feeCny > 0 ? '换人费' : undefined,
+        note: note.trim() || undefined,
+      });
+      onSaved(res.order);
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : '保存失败');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const inputCls = 'mt-0.5 w-full rounded border border-slate-300 px-2 py-1 text-xs';
+
+  return (
+    <div className="space-y-2 text-xs">
+      <div className="font-medium text-brand">换人/编辑 · {passenger.fullName}</div>
+
+      <div className="grid grid-cols-2 gap-2">
+        <label className="block">
+          <span className="text-slate-500">姓（Last）</span>
+          <input className={inputCls} value={lastName} onChange={(e) => setLastName(e.target.value)} />
+        </label>
+        <label className="block">
+          <span className="text-slate-500">名（First）</span>
+          <input className={inputCls} value={firstName} onChange={(e) => setFirstName(e.target.value)} />
+        </label>
+      </div>
+
+      <label className="block">
+        <span className="text-slate-500">全名</span>
+        <input className={inputCls} value={fullName} onChange={(e) => setFullName(e.target.value)} placeholder="如未拆姓/名可直接填全名" />
+      </label>
+
+      <label className="block">
+        <span className="text-slate-500">护照号</span>
+        <input className={`${inputCls} font-mono`} value={documentNumber} onChange={(e) => setDocumentNumber(e.target.value)} />
+      </label>
+
+      <div className="grid grid-cols-2 gap-2">
+        <label className="block">
+          <span className="text-slate-500">出生日期</span>
+          <input className={`${inputCls} font-mono`} value={dob} onChange={(e) => setDob(e.target.value)} placeholder="1990-01-01" />
+        </label>
+        <label className="block">
+          <span className="text-slate-500">性别</span>
+          <select className={inputCls} value={gender} onChange={(e) => setGender(e.target.value as 'M' | 'F' | 'X' | '')}>
+            <option value="">未填</option>
+            <option value="M">男</option>
+            <option value="F">女</option>
+            <option value="X">其他</option>
+          </select>
+        </label>
+      </div>
+
+      <label className="block">
+        <span className="text-slate-500">国籍（ISO，如 CN）</span>
+        <input className={inputCls} value={nationality} onChange={(e) => setNationality(e.target.value)} placeholder="CN" />
+      </label>
+
+      <div className="space-y-1 rounded border border-slate-200 bg-white p-2">
+        <label className="flex items-center gap-2">
+          <input type="checkbox" checked={resetInvoice} onChange={(e) => setResetInvoice(e.target.checked)} />
+          <span>重置开票状态（开票 → 未开）</span>
+        </label>
+        <label className="flex items-center gap-2">
+          <input type="checkbox" checked={resetVisa} onChange={(e) => setResetVisa(e.target.checked)} />
+          <span>重置签证状态（签证任务 → 待处理）</span>
+        </label>
+      </div>
+
+      <label className="block">
+        <span className="text-slate-500">换人费（¥，可选）</span>
+        <NumberInput
+          value={feeCny}
+          onChange={setFeeCny}
+          integerOnly
+          placeholder="不收换人费则留空"
+          className={inputCls}
+        />
+      </label>
+
+      <label className="block">
+        <span className="text-slate-500">备注（可选）</span>
+        <input className={inputCls} value={note} onChange={(e) => setNote(e.target.value)} placeholder="如：客户更换出行人" />
+      </label>
+
+      {err && <div className="rounded bg-red-50 px-2 py-1 text-red-700">{err}</div>}
+
+      <div className="flex gap-2 pt-1">
+        <button
+          className="flex-1 rounded bg-brand px-2 py-1.5 font-medium text-white disabled:opacity-50"
+          onClick={submit}
+          disabled={submitting}
+        >
+          {submitting ? '保存中…' : '保存'}
+        </button>
+        <button
+          className="rounded bg-slate-100 px-3 py-1.5 text-slate-700 disabled:opacity-50"
+          onClick={onCancel}
+          disabled={submitting}
+        >
+          取消
+        </button>
+      </div>
+    </div>
   );
 }
 

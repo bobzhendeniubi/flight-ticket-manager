@@ -861,6 +861,13 @@ model Order {
   // 出纳：预期到账总额（CNY）+ 锁定标记。锁定后只 ADMIN 能改，避免运营随便改。
   expectedAmountCny    Decimal? @db.Decimal(12, 2)
   expectedAmountLocked Boolean  @default(false)
+  // 售后费用（改期费 / 换人费等）：累计客户应补付的金额（CNY，整数）。
+  // 应付 = total + adjustmentCny；尾款 = total + adjustmentCny − paidAmount。
+  // 不改 total/subtotal（机票基础价不重算），只在结清口径上叠加。
+  adjustmentCny    Int           @default(0)
+  // 售后费用流水（审计）：[{ type, label, amountCny, at, by }]
+  // type ∈ RESCHEDULE_FEE | SWAP_FEE | ...；by = 操作人 userId（无则 null）
+  adjustments      Json          @default("[]")
   createdAt        DateTime      @default(now())
   updatedAt        DateTime      @updatedAt
 

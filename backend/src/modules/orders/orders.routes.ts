@@ -19,6 +19,8 @@ import {
   listOrdersQuerySchema,
   orderStructuredNotesShape,
   publicOrderLookupQuerySchema,
+  rescheduleOrderBodySchema,
+  swapPassengerBodySchema,
   updateStatusBodySchema,
 } from './orders.schemas.js';
 import { prisma } from '../../db/prisma.js';
@@ -817,6 +819,82 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       severity: 'WARNING',
     });
     return result;
+  });
+
+  // ── 售后改单：改期（ADMIN/STAFF）──
+  // PATCH /orders/:id/reschedule  body: { orderItemId, newScheduleId, newCabin?, feeCny?, feeLabel?, note? }
+  // 把某条 FLIGHT 行就地改到新班次/新舱位（座位先放旧再原子拿新，售罄回滚不泄漏），可选加改期费。
+  app.patch('/:id/reschedule', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅运营/管理员可改期' });
+    }
+    const { id } = req.params as { id: string };
+    const body = rescheduleOrderBodySchema.parse(req.body);
+    const { order, audit } = await service.rescheduleOrderItem(id, body, {
+      userId: req.user.sub,
+      role,
+    });
+    const fmt = (d: Date | null) => (d ? d.toISOString() : null);
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'RESCHEDULE_ORDER_ITEM',
+      targetType: 'ORDER',
+      targetId: id,
+      targetLabel: audit.orderNumber,
+      before: {
+        orderItemId: audit.orderItemId,
+        scheduleId: audit.fromScheduleId,
+        cabin: audit.fromCabin,
+        departure: fmt(audit.fromDeparture),
+      },
+      after: {
+        scheduleId: audit.toScheduleId,
+        cabin: audit.toCabin,
+        departure: fmt(audit.toDeparture),
+        feeCny: audit.feeCny,
+        statusChanged: audit.statusChanged,
+        note: body.note,
+      },
+      severity: 'WARNING',
+    });
+    return { order };
+  });
+
+  // ── 售后改单：换人（ADMIN/STAFF）──
+  // PATCH /orders/:id/passengers/:passengerId
+  //   body: { lastName?, firstName?, fullName?, documentNumber?, dateOfBirth?, gender?,
+  //           nationality?, resetInvoice?, resetVisa?, feeCny?, feeLabel?, note? }
+  // 就地把出行人换成新人；resetInvoice→开票 NONE、resetVisa→签证任务 PENDING；可选加换人费。
+  app.patch('/:id/passengers/:passengerId', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅运营/管理员可换人' });
+    }
+    const { id, passengerId } = req.params as { id: string; passengerId: string };
+    const body = swapPassengerBodySchema.parse(req.body);
+    const { order, audit } = await service.swapPassenger(id, passengerId, body, {
+      userId: req.user.sub,
+      role,
+    });
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'SWAP_ORDER_PASSENGER',
+      targetType: 'ORDER',
+      targetId: id,
+      targetLabel: audit.orderNumber,
+      before: { passengerId: audit.passengerId, ...audit.before },
+      after: {
+        ...audit.after,
+        resetInvoice: audit.resetInvoice,
+        resetVisa: audit.resetVisa,
+        visaTasksReset: audit.visaTasksReset,
+        feeCny: audit.feeCny,
+        note: body.note,
+      },
+      severity: 'WARNING',
+    });
+    return { order };
   });
 };
 
