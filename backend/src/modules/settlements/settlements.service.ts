@@ -161,6 +161,18 @@ export class SettlementService {
       distinct: ['agentId'],
     });
     accruedRows.forEach((r) => ids.add(r.agentId));
+    // 也纳入「本期只有退款冲销、没有新佣金」的代理：跨期反冲的负数补偿记录必须
+    // 进入某张结算单去追回，否则永远漏算（净额对不上 = 平台多付）。
+    const reversedRows = await prisma.commissionRecord.findMany({
+      where: {
+        status: CommissionStatus.REVERSED,
+        settlementId: null,
+        createdAt: { gte: start, lt: end },
+      },
+      select: { agentId: true },
+      distinct: ['agentId'],
+    });
+    reversedRows.forEach((r) => ids.add(r.agentId));
     const existing = await prisma.settlement.findMany({
       where: { period },
       select: { agentId: true },
@@ -187,8 +199,40 @@ export class SettlementService {
     });
 
     const commissionEarned = earnedRecords.reduce((s, r) => s + Number(r.amount), 0);
-    const recordIds = earnedRecords.map((r) => r.id);
-    const relatedOrderIds = Array.from(new Set(earnedRecords.map((r) => r.orderId)));
+
+    // 1b. 本人当期「退款冲销」records —— 尚未并入任何结算单的 REVERSED 记录
+    // （settlementId=null）。两类来源：
+    //   - 同期退款：整单冲销时被翻状态的 ACCRUED→REVERSED 记录（amount 仍为正）。
+    //   - 跨期反冲：已结算订单退款时新建的「负数补偿记录」（amount<0）。
+    // 这些必须并入本期 netCommission（追回多付的佣金），不能静默丢弃。
+    const reversalRecords = await prisma.commissionRecord.findMany({
+      where: {
+        agentId,
+        status: CommissionStatus.REVERSED,
+        settlementId: null,
+        createdAt: { gte: start, lt: end },
+      },
+      select: { id: true, amount: true, orderId: true },
+    });
+    // reversalAmount = 本期应从净佣金里冲回的总额，恒为非正数（≤0）。
+    //   负数补偿记录（amount<0）：直接累加。
+    //   被翻状态的 ACCRUED（amount>0）：取相反数冲掉（它原本被计入过/会计入 earned 口径）。
+    const reversalAmount = reversalRecords.reduce(
+      (s, r) => s + -Math.abs(Number(r.amount)),
+      0,
+    );
+    const reversalCount = reversalRecords.length;
+
+    const recordIds = [
+      ...earnedRecords.map((r) => r.id),
+      ...reversalRecords.map((r) => r.id),
+    ];
+    const relatedOrderIds = Array.from(
+      new Set([
+        ...earnedRecords.map((r) => r.orderId),
+        ...reversalRecords.map((r) => r.orderId),
+      ]),
+    );
 
     // 2. 作为 seller 的订单数 + GMV（只算本人直销，上级代理的 grossRevenue 由他们自己算）
     const sellerOrders = await prisma.order.findMany({
@@ -220,7 +264,9 @@ export class SettlementService {
       commissionPaidToChildren = childRecords.reduce((s, r) => s + Number(r.amount), 0);
     }
 
-    const netCommission = commissionEarned; // records 已是净额
+    // netCommission = 本期应计净佣金 + 本期退款冲销（reversalAmount ≤ 0）
+    //   records 本身已是链路净额；reversalAmount 把退款追回的部分扣回（可使 net 变小甚至为负）。
+    const netCommission = commissionEarned + reversalAmount;
 
     // 4. 预付抵扣：取 min(netCommission, 当前 prepaymentBalance)
     const agent = await prisma.agent.findUnique({
@@ -239,6 +285,10 @@ export class SettlementService {
       netCommission: round2(netCommission),
       prepaymentOffset: round2(prepaymentOffset),
       payableToAgent: round2(payableToAgent),
+      // 本期退款冲销摘要（reversalAmount ≤ 0）；recordIds 已含 REVERSED 记录，
+      // generate 会把它们一并绑到本结算单（settlementId），下期不再重复计入。
+      reversalCount,
+      reversalAmount: round2(reversalAmount),
       recordIds,
     };
   }
@@ -277,6 +327,8 @@ export class SettlementService {
               user: { select: { displayName: true } },
             },
           },
+          // 只取汇总退款冲销所需的最小字段（status + amount），不展开订单
+          commissions: { select: { status: true, amount: true } },
         },
         orderBy: [{ period: 'desc' }, { agent: { tier: 'asc' } }],
         take: query.pageSize,
@@ -444,10 +496,28 @@ type SettlementWithAgent = Prisma.SettlementGetPayload<{
   };
 }>;
 
+// 从结算单已绑定的佣金记录里汇总「本期退款冲销」摘要：
+//   count = REVERSED 记录条数；amount = 这些记录金额之和（恒 ≤ 0）。
+// 便于财务在结算单上直观看到「本期退款冲销 N 笔 / ¥X」。
+type ReversalSummary = { reversalCount: number; reversalAmount: string };
+function summarizeReversals(
+  commissions: Array<{ status: string; amount: Prisma.Decimal }> | undefined,
+): ReversalSummary {
+  if (!commissions) return { reversalCount: 0, reversalAmount: '0' };
+  const reversed = commissions.filter((c) => c.status === 'REVERSED');
+  const total = reversed.reduce((sum, c) => sum + -Math.abs(Number(c.amount)), 0);
+  return { reversalCount: reversed.length, reversalAmount: round2(total).toString() };
+}
+
 function serializeSettlement<T extends SettlementWithAgent | (SettlementWithAgent & { commissions?: unknown })>(
   s: T,
   includeCommissions = false,
 ): unknown {
+  const boundCommissions = 'commissions' in s
+    ? (s.commissions as Array<{ status: string; amount: Prisma.Decimal }> | undefined)
+    : undefined;
+  const reversalSummary = summarizeReversals(boundCommissions);
+
   const base = {
     id: s.id,
     period: s.period,
@@ -459,6 +529,9 @@ function serializeSettlement<T extends SettlementWithAgent | (SettlementWithAgen
     netCommission: s.netCommission.toString(),
     prepaymentOffset: s.prepaymentOffset.toString(),
     payableToAgent: s.payableToAgent.toString(),
+    // 本期退款冲销摘要（amount ≤ 0）。从绑定的 REVERSED 佣金记录汇总；list 与详情均带。
+    reversalCount: reversalSummary.reversalCount,
+    reversalAmount: reversalSummary.reversalAmount,
     status: s.status,
     generatedAt: s.generatedAt,
     approvedAt: s.approvedAt,

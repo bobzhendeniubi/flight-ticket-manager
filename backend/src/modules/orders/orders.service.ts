@@ -1642,10 +1642,42 @@ export class OrderService {
     }
 
     if (isReleasing && wasHolding && order.status !== 'PENDING_PAYMENT') {
+      // 退款/取消时整单冲销佣金（保证会计恒等：座位退了，佣金不能继续欠代理）。
+      //
+      // 两类记录分别处理，以免破坏「已结算快照」：
+      //   - ACCRUED（尚未进结算单）：直接置 REVERSED（旧行为，期内净额自然归零）。
+      //   - SETTLED（代理已在某张结算单里被结过账）：历史快照是冻结的，绝不回改；
+      //     改为新建一条「负数补偿记录」（amount/baseAmount 取负、status=REVERSED、
+      //     settlementId=null），让下一期结算把这笔负数净掉（跨期反冲），既追回多付
+      //     又不污染上一张已支付结算单。负数 + REVERSED + settlementId=null 即是
+      //     补偿记录的自识别标志（schema 无 note/source 列，故不另加列）。
+      //
+      // 口径说明：此处为「整单全额冲销」。部分退款 / 留存退改费时按比例冲销多少佣金
+      // 属业务政策（按退款额比例 vs 按费档 vs 全额），待财务确认口径后再实现；
+      // 当前不做猜测式按比例冲销。
       await tx.commissionRecord.updateMany({
         where: { orderId: order.id, status: CommissionStatus.ACCRUED },
         data: { status: CommissionStatus.REVERSED },
       });
+
+      const settledRecords = await tx.commissionRecord.findMany({
+        where: { orderId: order.id, status: CommissionStatus.SETTLED },
+      });
+      for (const rec of settledRecords) {
+        await tx.commissionRecord.create({
+          data: {
+            agentId: rec.agentId,
+            orderId: rec.orderId,
+            productKind: rec.productKind,
+            baseAmount: rec.baseAmount.negated(),
+            rate: rec.rate,
+            amount: rec.amount.negated(),
+            chainDepth: rec.chainDepth,
+            status: CommissionStatus.REVERSED,
+            settlementId: null,
+          },
+        });
+      }
     }
 
     // 同步 Refund 状态：当订单走到终态时，关联的 REQUESTED Refund 应该相应推进
