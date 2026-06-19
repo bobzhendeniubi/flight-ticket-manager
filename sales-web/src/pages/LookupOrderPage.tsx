@@ -10,6 +10,7 @@ import { Link } from 'react-router-dom';
 import { api, ApiError, type MaskedOrder, type OrderStatus, type OrderItemKind } from '../lib/api';
 import { Seo } from '../components/Seo';
 import { Breadcrumb } from '../components/Breadcrumb';
+import { PaymentPanel } from '../components/PaymentPanel';
 import { Icon, type IconName } from '../components/Icon';
 
 // 订单状态中文标签（与 MyOrdersPage 保持一致）
@@ -75,7 +76,8 @@ function fmtDate(iso: string | null): string {
 type QueryState =
   | { kind: 'idle' }
   | { kind: 'loading' }
-  | { kind: 'found'; order: MaskedOrder }
+  // lookupKey = 命中时用的手机号/邮箱，原样传给收款面板做上传凭证的校验凭据
+  | { kind: 'found'; order: MaskedOrder; lookupKey: string }
   | { kind: 'notFound' }
   | { kind: 'error'; message: string };
 
@@ -101,7 +103,7 @@ export default function LookupOrderPage() {
         orderNumber: trimmedOrder,
         ...(isEmail ? { email: trimmedContact } : { phone: trimmedContact }),
       });
-      setState({ kind: 'found', order });
+      setState({ kind: 'found', order, lookupKey: trimmedContact });
     } catch (err) {
       if (err instanceof ApiError && err.status === 404) {
         setState({ kind: 'notFound' });
@@ -201,8 +203,20 @@ export default function LookupOrderPage() {
         </div>
       )}
 
-      {/* 命中态：脱敏订单卡片 */}
-      {state.kind === 'found' && <MaskedOrderCard order={state.order} />}
+      {/* 命中态：脱敏订单卡片（未支付时附「收款方式 + 上传凭证」） */}
+      {state.kind === 'found' && (
+        <>
+          <MaskedOrderCard order={state.order} />
+          {state.order.status === 'PENDING_PAYMENT' && (
+            <PaymentPanel
+              orderNo={state.order.orderNumber}
+              lookupKey={state.lookupKey}
+              amountDueCny={Number(state.order.total) || 0}
+              variant="detail"
+            />
+          )}
+        </>
+      )}
 
       {/* 底部回链 */}
       <div className="flex flex-wrap items-center justify-center gap-x-4 gap-y-1 pt-2 text-sm">

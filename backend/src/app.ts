@@ -25,6 +25,9 @@ import { customerRoutes } from './modules/customers/customers.routes.js';
 import { travelerRoutes } from './modules/travelers/travelers.routes.js';
 import { fulfillmentRoutes } from './modules/fulfillment/fulfillment.routes.js';
 import { paymentRoutes } from './modules/payments/payments.routes.js';
+import { paymentChannelRoutes } from './modules/payment-channels/payment-channels.routes.js';
+import { receiptRoutes } from './modules/receipts/receipts.routes.js';
+import { publicRoutes } from './modules/public/public.routes.js';
 import { pricingRoutes } from './modules/pricing/pricing.routes.js';
 import { cancellationRoutes } from './modules/cancellation/cancellation.routes.js';
 import { reminderRoutes } from './modules/reminders/reminders.routes.js';
@@ -35,6 +38,10 @@ import { redis } from './db/redis.js';
 
 export async function buildApp(): Promise<FastifyInstance> {
   const app = Fastify({
+    // 收款凭证 / 收款码二维码以 data-URL（base64）形式上传，Zod 上限约 6MB；
+    // Fastify 默认 bodyLimit 仅 1MB 会直接拒掉这类请求（公开上传 + 后台人工确认收款截图）。
+    // 全局放宽到 8MB（> 6MB cap + JSON 包裹开销）；本应用整体 auth + 限流，全局放宽是安全的。
+    bodyLimit: 8 * 1024 * 1024,
     logger: {
       level: env.LOG_LEVEL,
       ...(env.NODE_ENV === 'development'
@@ -86,6 +93,9 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(travelerRoutes, { prefix: '/travelers' });
   await app.register(fulfillmentRoutes, { prefix: '/fulfillment-tasks' });
   await app.register(paymentRoutes, { prefix: '/payments' });
+  await app.register(paymentChannelRoutes, { prefix: '/payment-channels' });
+  await app.register(receiptRoutes, { prefix: '/receipts' });
+  await app.register(publicRoutes, { prefix: '/public' });
   await app.register(pricingRoutes, { prefix: '/pricing' });
   await app.register(cancellationRoutes, { prefix: '/cancellation-policies' });
   await app.register(reminderRoutes, { prefix: '/reminders' });

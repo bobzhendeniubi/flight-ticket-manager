@@ -2908,6 +2908,26 @@ function ConfirmPaymentSection({
     }
   }
 
+  // 多付转挂账池：把 paidAmount−total 转入挂账池（生成一条 ORDER_OVERPAY 进账），
+  // 订单回到刚好结清。散客 / 代理订单都可用（与「存入代理余额」区别：钱进对账台待认领，
+  // 不绑定某个代理）。
+  async function moveToPool(): Promise<void> {
+    if (!token || submitting) return;
+    if (!window.confirm(`确认把多付的 ¥${Math.abs(balance).toLocaleString()} 转入挂账池？转入后订单回到刚好结清，这笔钱将在收款对账台待认领。`))
+      return;
+    setErr(null);
+    setSubmitting(true);
+    try {
+      const res = await api.overpayOrderToPool(token, orderId);
+      setPaid(res.newPaidAmount);
+      onChanged?.();
+    } catch (e: unknown) {
+      setErr(e instanceof ApiError ? e.message : '转挂账池失败');
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
   // 用代理余额抵尾款：amount ≤ 尾款 且 ≤ 代理余额；覆盖则翻 PAID。
   async function applyBalance(amt: number): Promise<void> {
     if (!token || !agent || submitting) return;
@@ -2964,7 +2984,7 @@ function ConfirmPaymentSection({
           </div>
         )}
 
-        {/* 多付 → 存入代理余额 */}
+        {/* 多付 → 存入代理余额（仅代理订单） */}
         {agent && overpaid && (
           <div className="mt-2 flex items-center justify-between gap-2 rounded-md border border-blue-200 bg-blue-50 px-2 py-1.5 text-xs">
             <span className="text-blue-700">多付 ¥{Math.abs(balance).toLocaleString()} 可存入代理余额</span>
@@ -2974,6 +2994,22 @@ function ConfirmPaymentSection({
               disabled={submitting}
             >
               存入代理余额
+            </button>
+          </div>
+        )}
+
+        {/* 多付 → 转挂账池（散客 / 代理均可；钱进收款对账台待认领） */}
+        {overpaid && (
+          <div className="mt-2 flex items-center justify-between gap-2 rounded-md border border-amber-200 bg-amber-50 px-2 py-1.5 text-xs">
+            <span className="text-amber-800">
+              多付 ¥{Math.abs(balance).toLocaleString()} 可转挂账池（在收款对账台待认领）
+            </span>
+            <button
+              className="btn-secondary text-xs px-2 py-1 disabled:opacity-50"
+              onClick={moveToPool}
+              disabled={submitting}
+            >
+              转挂账池
             </button>
           </div>
         )}

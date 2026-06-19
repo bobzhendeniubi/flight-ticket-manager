@@ -789,6 +789,34 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     return result;
   });
 
+  // ── 订单超额转入挂账池（ADMIN/STAFF）──
+  // POST /orders/:id/overpay-to-pool
+  // 任意订单（游客 OR 代理）多付（paidAmount > total）→ 多付额转入挂账池建一笔 OPEN 进账，
+  // 订单回压到恰好结清；财务后续在收款对账台认领/退款。（游客版「存代理余额」。）
+  app.post('/:id/overpay-to-pool', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅运营/管理员可将订单超额转入挂账池' });
+    }
+    const { id } = req.params as { id: string };
+    const result = await service.overpayToPool(id, { userId: req.user.sub, role });
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'ORDER_OVERPAY_TO_POOL',
+      targetType: 'ORDER',
+      targetId: id,
+      targetLabel: result.orderNumber,
+      after: {
+        movedAmount: result.movedAmount,
+        newPaidAmount: result.newPaidAmount,
+        receiptId: result.receiptId,
+        receiptNo: result.receiptNo,
+      },
+      severity: 'WARNING',
+    });
+    return result;
+  });
+
   // ── 用代理余额抵尾款（ADMIN/STAFF）──
   // POST /orders/:id/apply-agent-balance  body: { amount }
   // 从归属代理预存余额扣 amount，记入订单 paidAmount；抵满则订单转 PAID（含佣金/履约）。

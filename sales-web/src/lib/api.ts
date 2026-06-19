@@ -765,6 +765,49 @@ export interface MaskedOrder {
   passengers: Array<{ name: string }>;
 }
 
+// ── 收款方式 / 付款凭证（公开）─────────────────────────────────────────────
+/**
+ * 公开收款渠道（GET /public/payment-channels，只回启用中的）。
+ * 后端 serializePublicPaymentChannel：丢掉 isActive/sortOrder/时间戳，只回展示所需字段。
+ *   kind：'WECHAT' | 'ALIPAY' | 'BANK'（渠道分组，与 PaymentMethod 不同）
+ *   qrImageUrl：收款码图（data:image/...;base64 或外链）；null = 仅文字账户
+ *   accountText：账户/收款信息文字（如银行卡号、户名）；null = 无
+ *   note：补充说明（如"备注请填订单号"）；null = 无
+ */
+export type PaymentChannelKind = 'WECHAT' | 'ALIPAY' | 'BANK';
+
+export interface PublicPaymentChannel {
+  id: string;
+  kind: PaymentChannelKind;
+  label: string;
+  qrImageUrl: string | null;
+  accountText: string | null;
+  note: string | null;
+}
+
+/** POST /public/orders/upload-receipt 入参（订单号 + lookupKey 校验，同公开查单）。 */
+export interface UploadOrderReceiptInput {
+  /** 订单号（3–40）。 */
+  orderNo: string;
+  /** 查单凭据：下单手机号 / 邮箱 / 联系人姓氏（与公开查单同口径）。 */
+  lookupKey: string;
+  /** 本次付款金额（选填，>0 且 ≤1e8）；不填则由财务对账时核定。 */
+  amountCny?: number;
+  /** 付款方式（选填）。 */
+  method?: PaymentMethod;
+  /** 付款凭证图（必填，data:image/...;base64，≤6MB）。 */
+  proofUrl: string;
+}
+
+/** POST /public/orders/upload-receipt 返回（201）。 */
+export interface UploadOrderReceiptResult {
+  ok: true;
+  receiptId: string;
+  receiptNo: string;
+  amountCny: string;
+  status: 'OPEN';
+}
+
 // ── Typed endpoints ───────────────────────────────────────────────────────
 
 export const api = {
@@ -873,6 +916,21 @@ export const api = {
     if (params.email) qs.set('email', params.email);
     return apiFetch<{ order: MaskedOrder }>(`/orders/lookup?${qs.toString()}`);
   },
+
+  // ── 收款方式 / 付款凭证（公开，无需登录）──────────────────────────────────
+  /** 公开收款渠道：买家下单后看到的统一收款码 / 账户（只回启用中的）。 */
+  getPublicPaymentChannels: () =>
+    apiFetch<{ channels: PublicPaymentChannel[] }>('/public/payment-channels'),
+  /**
+   * 公开上传付款凭证：凭「订单号 + lookupKey（手机号/邮箱/姓氏）」校验后建一条待对账凭证。
+   * lookupKey 不匹配后端回 404（apiFetch 抛 ApiError，status=404）；按 IP 限流 10 次/分钟。
+   * 注意：上传仅是"认领"，订单到账由财务人工核对后才入账（前端不据此改订单状态）。
+   */
+  uploadOrderReceipt: (input: UploadOrderReceiptInput) =>
+    apiFetch<UploadOrderReceiptResult>('/public/orders/upload-receipt', {
+      method: 'POST',
+      body: input,
+    }),
   listOrders: (token: string, query?: Record<string, string | number | undefined>) => {
     const qs = new URLSearchParams();
     if (query) {

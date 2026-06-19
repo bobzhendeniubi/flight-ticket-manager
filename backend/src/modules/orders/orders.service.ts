@@ -20,6 +20,7 @@ import {
   PrepaymentTxType,
   Prisma,
   ProductKind,
+  ReceiptSource,
   SeatLockStatus,
   UserRole,
 } from '@prisma/client';
@@ -33,6 +34,7 @@ import {
 } from '../../lib/errors.js';
 import { resolveBundleNights } from '../products/bundle-nights.js';
 import { PricingService } from '../pricing/pricing.service.js';
+import { createOpenReceiptWithinTx } from '../receipts/receipts.service.js';
 import { OPERATION_FEE_CNY_PER_ORDER } from './order-cost-items.service.js';
 import { bundleItemMetadataSchema } from './orders.schemas.js';
 import { assertTicketingCap } from './ticketing-cap.js';
@@ -1119,6 +1121,86 @@ export class OrderService {
   }
 
   // ════════════════════════════════════════════════════════════════════
+  // 订单超额 → 挂账池（游客版「存代理余额」；对账时再认领/退款）
+  // ════════════════════════════════════════════════════════════════════
+  /**
+   * 把订单的多付额转入挂账池。适用于任意订单（游客 OR 代理）——
+   * 这是「超额放挂账池」的答案，对应代理单的 creditOverpayToAgent。
+   *   一个事务里：订单行锁 → 多付 = paidAmount − total（> 0 才放行）→ paidAmount 回压到 total →
+   *   建一笔 OPEN Receipt（source=ORDER_OVERPAY，金额=多付额，method 取最近一笔 Payment 否则 WECHAT_PAY，
+   *   payerNote='订单超额 '+orderNo，orderHintId=orderId）。
+   * 无多付（paidAmount ≤ total）→ 拒绝。原子。
+   */
+  async overpayToPool(
+    orderId: string,
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
+    ok: true;
+    orderId: string;
+    orderNumber: string;
+    movedAmount: number;
+    newPaidAmount: number;
+    total: number;
+    receiptId: string;
+    receiptNo: string;
+  }> {
+    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+      throw new ForbiddenError('仅运营/管理员可将订单超额转入挂账池');
+    }
+
+    return prisma.$transaction(async (tx) => {
+      // 订单行锁 + 事务内读最新 paidAmount/total（与并发到账/抵扣同一并发安全口径）
+      const rows = await tx.$queryRaw<
+        Array<{ id: string; orderNumber: string; total: Prisma.Decimal; paidAmount: Prisma.Decimal }>
+      >`SELECT id, "orderNumber", total, "paidAmount" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+      const order = rows[0];
+      if (!order) throw new NotFoundError('订单不存在');
+
+      const total = Number(order.total);
+      const paid = Number(order.paidAmount);
+      const overpay = round2(paid - total);
+      if (overpay <= 0) {
+        throw new BadRequestError('该订单没有多付金额（paidAmount ≤ total），无可转入挂账池');
+      }
+
+      // method 兜底：取最近一笔 Payment 的 method，否则 WECHAT_PAY
+      const latestPayment = await tx.payment.findFirst({
+        where: { orderId },
+        orderBy: { createdAt: 'desc' },
+        select: { method: true },
+      });
+      const method = latestPayment?.method ?? PaymentMethod.WECHAT_PAY;
+
+      // 多付回压：订单 paidAmount 降回 total（订单恰好结清，不再显示多付）
+      await tx.order.update({
+        where: { id: orderId },
+        data: { paidAmount: new Prisma.Decimal(total) },
+      });
+
+      // 建一笔 OPEN 进账（挂账池），来源标记订单超额
+      const receipt = await createOpenReceiptWithinTx(tx, {
+        amountCny: overpay,
+        method,
+        source: ReceiptSource.ORDER_OVERPAY,
+        payerNote: `订单超额 ${order.orderNumber}`,
+        orderHintId: orderId,
+        createdById: actor.userId,
+      });
+
+      return {
+        ok: true as const,
+        orderId,
+        orderNumber: order.orderNumber,
+        movedAmount: overpay,
+        newPaidAmount: total,
+        total,
+        receiptId: receipt.id,
+        receiptNo: receipt.receiptNo,
+      };
+    });
+  }
+
+  // ════════════════════════════════════════════════════════════════════
   // 公开订单查询（A4，免登录）
   // ════════════════════════════════════════════════════════════════════
   /**
@@ -1154,6 +1236,51 @@ export class OrderService {
     if (!phoneMatch && !emailMatch) return null;
 
     return maskOrderForPublic(order);
+  }
+
+  /**
+   * 客户上传付款凭证用的轻量校验 —— 与公开订单查询同一套防枚举门禁。
+   *   orderNo + lookupKey 必须命中（lookupKey 任一匹配：手机号 / 邮箱 / 订单联系人姓氏）。
+   * 命中返回订单 id + 应付尾款（amountCny 缺省时用作进账额）；不命中返回 null（路由 → 拒绝）。
+   * 只读，绝不入账。
+   */
+  async lookupOrderForReceiptUpload(
+    orderNumber: string,
+    lookupKey: string,
+  ): Promise<{ orderId: string; balanceCny: number } | null> {
+    const order = await prisma.order.findUnique({
+      where: { orderNumber },
+      include: { user: { select: { phone: true, email: true } } },
+    });
+    if (!order) return null;
+
+    const key = lookupKey.trim();
+    if (!key) return null;
+    const keyLower = key.toLowerCase();
+
+    const phones = [order.guestPhone, order.contactPhone, order.user?.phone]
+      .filter((v): v is string => Boolean(v))
+      .map((v) => v.trim());
+    const emails = [order.guestEmail, order.contactEmail, order.user?.email]
+      .filter((v): v is string => Boolean(v))
+      .map((v) => v.trim().toLowerCase());
+    // 姓氏匹配：联系人 / 游客姓名首段（与公开查单同口径），忽略大小写。
+    // 只取首段（拉丁名首词 / 中文整名），不再接受单字符首字匹配——
+    // 单字符的猜测空间太小，会削弱公开上传的第二因子强度。
+    const names = [order.contactName, order.guestName]
+      .filter((v): v is string => Boolean(v))
+      .map((v) => v.trim());
+    const lastNames = names.flatMap((n) => {
+      const segs = n.split(/\s+/).filter(Boolean);
+      return segs.length > 0 ? [segs[0].toLowerCase()] : [];
+    });
+
+    const matched =
+      phones.includes(key) || emails.includes(keyLower) || lastNames.includes(keyLower);
+    if (!matched) return null;
+
+    const balanceCny = round2(Number(order.total) + (order.adjustmentCny ?? 0) - Number(order.paidAmount));
+    return { orderId: order.id, balanceCny: Math.max(0, balanceCny) };
   }
 
   // ════════════════════════════════════════════════════════════════════

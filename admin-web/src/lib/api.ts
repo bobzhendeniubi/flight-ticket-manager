@@ -340,6 +340,14 @@ export type DocumentType = 'PASSPORT' | 'ID_CARD' | 'OTHER';
 export type PassengerType = 'ADULT' | 'CHILD' | 'INFANT';
 export type PaymentMethod = 'WECHAT_PAY' | 'ALIPAY' | 'BANK_CARD' | 'AGENT_PREPAYMENT';
 
+/** 收款方式中文标签（订单收款 / 进账对账共用） */
+export const PAYMENT_METHOD_LABEL: Record<PaymentMethod, string> = {
+  WECHAT_PAY: '微信',
+  ALIPAY: '支付宝',
+  BANK_CARD: '银行转账',
+  AGENT_PREPAYMENT: '代理预付',
+};
+
 export interface OrderItem {
   id: string;
   kind: OrderItemKind;
@@ -923,6 +931,161 @@ export interface SettlementCommissionRecord {
 
 export interface SettlementDetail extends SettlementSummary {
   commissions: SettlementCommissionRecord[];
+}
+
+// ── 收款渠道 / 进账对账（收款对账台）─────────────────────────────────────
+// 与 backend payment-channels + receipts 模块对齐（serializePaymentChannel / serializeReceipt）。
+
+/** 收款渠道分组（仅在 PaymentChannel 上；Receipt 用 PaymentMethod） */
+export type PaymentChannelKind = 'WECHAT' | 'ALIPAY' | 'BANK';
+
+export const PAYMENT_CHANNEL_KIND_LABEL: Record<PaymentChannelKind, string> = {
+  WECHAT: '微信',
+  ALIPAY: '支付宝',
+  BANK: '银行',
+};
+
+/** 收款渠道（admin GET/POST/PATCH 完整形态） */
+export interface PaymentChannel {
+  id: string;
+  kind: string; // 'WECHAT' | 'ALIPAY' | 'BANK'（后端为 String，zod 校验枚举）
+  label: string;
+  qrImageUrl: string | null;
+  accountText: string | null;
+  note: string | null;
+  isActive: boolean;
+  sortOrder: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** POST /payment-channels body（qrImageUrl 为 data:image/...;base64，≤6MB） */
+export interface CreatePaymentChannelInput {
+  kind: PaymentChannelKind;
+  label: string;
+  qrImageUrl?: string;
+  accountText?: string;
+  note?: string;
+  isActive?: boolean;
+  sortOrder?: number;
+}
+
+/** PATCH /payment-channels/:id body（任意子集，≥1 字段；可空字段传 null 清除） */
+export interface UpdatePaymentChannelInput {
+  kind?: PaymentChannelKind;
+  label?: string;
+  qrImageUrl?: string | null;
+  accountText?: string | null;
+  note?: string | null;
+  isActive?: boolean;
+  sortOrder?: number;
+}
+
+/** 进账状态：未认领 / 部分认领 / 已认领 / 已退款 */
+export type ReceiptStatus = 'OPEN' | 'PARTIALLY_ALLOCATED' | 'ALLOCATED' | 'REFUNDED';
+/** 进账来源：客户上传 / 后台录入 / 订单超额转入 */
+export type ReceiptSource = 'CUSTOMER_UPLOAD' | 'STAFF_ENTRY' | 'ORDER_OVERPAY';
+
+export const RECEIPT_STATUS_LABEL: Record<ReceiptStatus, string> = {
+  OPEN: '待认领',
+  PARTIALLY_ALLOCATED: '部分认领',
+  ALLOCATED: '已认领',
+  REFUNDED: '已退款',
+};
+export const RECEIPT_SOURCE_LABEL: Record<ReceiptSource, string> = {
+  CUSTOMER_UPLOAD: '客户上传',
+  STAFF_ENTRY: '后台录入',
+  ORDER_OVERPAY: '订单超额',
+};
+
+/** 单笔进账的认领分配（嵌在 Receipt.allocations[]；金额为 Decimal→string） */
+export interface ReceiptAllocation {
+  id: string;
+  orderId: string;
+  amountCny: string;
+  createdById: string | null;
+  createdAt: string;
+}
+
+/** 进账记录（serializeReceipt；所有金额 Decimal→string，remainingCny 为 toFixed(2)） */
+export interface Receipt {
+  id: string;
+  receiptNo: string;
+  amountCny: string;
+  allocatedCny: string;
+  remainingCny: string;
+  method: PaymentMethod;
+  proofUrl: string | null;
+  payerNote: string | null;
+  orderHintId: string | null;
+  receivedAt: string;
+  source: ReceiptSource;
+  status: ReceiptStatus;
+  refundNote: string | null;
+  createdById: string | null;
+  createdAt: string;
+  updatedAt: string;
+  allocations: ReceiptAllocation[];
+}
+
+/** GET /receipts 查询参数 */
+export interface ListReceiptsParams {
+  status?: ReceiptStatus;
+  q?: string; // 匹配 receiptNo / payerNote / orderHintId
+}
+
+/** POST /receipts body（后台登记新进账） */
+export interface CreateReceiptInput {
+  amountCny: number;
+  method: PaymentMethod;
+  proofUrl?: string;
+  payerNote?: string;
+  receivedAt?: string;
+  orderHintId?: string;
+}
+
+/** 全部流水：进账 + 订单收款合并视图（GET /receipts/ledger） */
+export interface LedgerEntry {
+  kind: 'RECEIPT' | 'ORDER_PAYMENT';
+  id: string;
+  ref: string;
+  amountCny: string;
+  method: string;
+  status: string;
+  source: string;
+  orderNo: string | null;
+  at: string;
+}
+
+/** POST /receipts/:id/allocate 返回 */
+export interface AllocateReceiptResult {
+  ok: true;
+  receiptId: string;
+  receiptNo: string;
+  allocatedAmount: number;
+  remainingCny: string;
+  receiptStatus: ReceiptStatus;
+  order: {
+    orderId: string;
+    orderNumber: string;
+    paidAmount: number;
+    total: number;
+    fullyPaid: boolean;
+    status: OrderStatus;
+    paymentId: string;
+  };
+}
+
+/** POST /orders/:id/overpay-to-pool 返回 */
+export interface OverpayToPoolResult {
+  ok: true;
+  orderId: string;
+  orderNumber: string;
+  movedAmount: number;
+  newPaidAmount: number;
+  total: number;
+  receiptId: string;
+  receiptNo: string;
 }
 
 export const api = {
@@ -1698,6 +1861,55 @@ export const api = {
       `/waitlist/?scheduleId=${encodeURIComponent(scheduleId)}`,
       { token },
     ),
+
+  // ── 收款渠道管理（ADMIN/STAFF）── CRUD（统一收款码 + 账号信息）
+  listPaymentChannels: (token: string) =>
+    apiFetch<{ channels: PaymentChannel[] }>('/payment-channels', { token }),
+  createPaymentChannel: (token: string, body: CreatePaymentChannelInput) =>
+    apiFetch<{ channel: PaymentChannel }>('/payment-channels', { method: 'POST', token, body }),
+  updatePaymentChannel: (token: string, id: string, body: UpdatePaymentChannelInput) =>
+    apiFetch<{ channel: PaymentChannel }>(`/payment-channels/${id}`, { method: 'PATCH', token, body }),
+  deletePaymentChannel: (token: string, id: string) =>
+    apiFetch<{ ok: true; id: string }>(`/payment-channels/${id}`, { method: 'DELETE', token }),
+
+  // ── 收款对账台（ADMIN/STAFF）── 进账列表 / 全部流水 / 登记 / 认领 / 退款
+  // 进账列表：每条带 remainingCny + allocations[]
+  listReceipts: (token: string, query?: ListReceiptsParams) => {
+    const qs = new URLSearchParams();
+    if (query) {
+      for (const [k, v] of Object.entries(query)) {
+        if (v !== undefined && v !== '') qs.set(k, String(v));
+      }
+    }
+    return apiFetch<{ receipts: Receipt[] }>(
+      `/receipts${qs.toString() ? '?' + qs.toString() : ''}`,
+      { token },
+    );
+  },
+  // 全部流水：进账 + 订单收款合并，按时间倒序（只读）
+  getReceiptLedger: (token: string) =>
+    apiFetch<{ entries: LedgerEntry[] }>('/receipts/ledger', { token }),
+  // 登记新进账（后台手动录入）→ 生成 OPEN 进账
+  createReceipt: (token: string, body: CreateReceiptInput) =>
+    apiFetch<{ receipt: Receipt }>('/receipts', { method: 'POST', token, body }),
+  // 认领：把进账金额分配到某订单（原子；超额/已退款会被拒绝）
+  allocateReceipt: (token: string, id: string, body: { orderId: string; amountCny: number }) =>
+    apiFetch<AllocateReceiptResult>(`/receipts/${id}/allocate`, { method: 'POST', token, body }),
+  // 退款：把进账剩余金额标记退款（不可再认领）
+  refundReceipt: (token: string, id: string, note: string) =>
+    apiFetch<{ ok: true; receiptId: string; receiptNo: string; refundedRemainingCny: string; status: 'REFUNDED' }>(
+      `/receipts/${id}/refund`,
+      { method: 'POST', token, body: { note } },
+    ),
+
+  // ── 订单超额转挂账池（ADMIN/STAFF）──
+  // 把订单多付（paidAmount−total）转入挂账池：生成一条 ORDER_OVERPAY 进账，订单回到刚好结清。
+  overpayOrderToPool: (token: string, orderId: string) =>
+    apiFetch<OverpayToPoolResult>(`/orders/${orderId}/overpay-to-pool`, {
+      method: 'POST',
+      token,
+      body: {},
+    }),
 };
 
 // ── 财务模块类型（与 backend/src/modules/finances/finances.service.ts 对齐）──

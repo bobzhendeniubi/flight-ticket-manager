@@ -27,6 +27,7 @@ import { CABIN_LABEL } from '../lib/airports';
 import { useAuth } from '../stores/auth';
 import { Icon, type IconName } from '../components/Icon';
 import { Modal } from '../components/Modal';
+import { PaymentPanel } from '../components/PaymentPanel';
 import { WriteReviewForm, type WriteReviewFormData } from '../components/WriteReviewForm';
 
 const STATUS_LABEL: Record<OrderStatus, string> = {
@@ -78,6 +79,23 @@ function KindIcon({ kind, className }: { kind: string; className?: string }) {
 }
 
 const CANCELLABLE = new Set<OrderStatus>(['PAID', 'PROCESSING', 'TICKETED']);
+// 仍需付款的状态：订单未结清时露出收款方式 + 上传凭证（买家可稍后回来付）。
+// 已取消 / 退款 / 失败 / 超时等终态不再展示收款入口。
+const PAYABLE_STATUS = new Set<OrderStatus>([
+  'DRAFT',
+  'PENDING_PAYMENT',
+  'PAID',
+  'PROCESSING',
+  'TICKETED',
+]);
+
+/** 应付余额（总额 − 已付）；≤0 视为已结清。money 字段是 Decimal 序列化的字符串。 */
+function balanceDueCny(order: OrderSummary): number {
+  const total = Number(order.total);
+  const paid = Number(order.paidAmount);
+  const due = (Number.isFinite(total) ? total : 0) - (Number.isFinite(paid) ? paid : 0);
+  return due > 0 ? due : 0;
+}
 // 可写评价的订单状态：行程已完成（COMPLETED）。后端无 reviewed 字段，
 // 本会话内用客户端 Set 记下已评价的订单，提交成功后禁用再次评价。
 const REVIEWABLE = new Set<OrderStatus>(['COMPLETED']);
@@ -366,6 +384,16 @@ export function MyOrdersPage() {
                       ))}
                     </ul>
                   </div>
+                )}
+
+                {/* 收款方式 + 上传付款凭证：仅在订单仍有应付余额时露出（买家可稍后回来付） */}
+                {PAYABLE_STATUS.has(o.status) && balanceDueCny(o) > 0 && (
+                  <PaymentPanel
+                    orderNo={o.orderNumber}
+                    lookupKey={o.contactPhone}
+                    amountDueCny={balanceDueCny(o)}
+                    variant="detail"
+                  />
                 )}
               </div>
             )}

@@ -368,6 +368,95 @@ export class PaymentsService {
   }
 
   /**
+   * 在调用方事务内给订单入账 —— confirmManualPayment 入账内核的「事务内」变体。
+   *
+   * 收款对账台「认领进账到订单」复用此函数：因为认领必须和
+   * （扣减进账剩余额 + 写 ReceiptAllocation + 重算 Receipt 状态）在同一个原子事务里完成，
+   * 全成功或全回滚——不能出现「订单加了钱但进账没记认领」的资金分叉。
+   *
+   * 与 confirmManualPayment 的入账口径逐字一致（同一行锁读余额 + 同一防手误上限
+   * + 同一 paidAmount 累加 + 同一全额自动翻 PAID + 同一 _updateStatusWithinTx 生成佣金/履约）。
+   * 差异仅在事务边界：这里不自己开事务，由调用方 tx 统筹；履约任务 id 通过
+   * pendingFulfillmentTaskIds 回传，调用方在事务提交后入队。
+   *
+   * 注意：此函数本身不写审计——调用方（对账认领）按自己的口径写审计。
+   */
+  async _creditOrderPaymentWithinTx(
+    tx: Prisma.TransactionClient,
+    orderId: string,
+    input: { amount: number; method: PaymentMethod; proofUrl?: string | null; note?: string | null },
+    actor: { userId: string; role: UserRole },
+    pendingFulfillmentTaskIds: string[],
+  ): Promise<{
+    paymentId: string;
+    paidAmount: number;
+    total: number;
+    fullyPaid: boolean;
+    orderNumber: string;
+    status: OrderStatus;
+  }> {
+    // FOR UPDATE 行锁 + 事务内读余额：与 confirmManualPayment 完全一致的并发安全口径
+    const rows = await tx.$queryRaw<
+      Array<{ id: string; orderNumber: string; total: Prisma.Decimal; paidAmount: Prisma.Decimal; status: OrderStatus }>
+    >`SELECT id, "orderNumber", total, "paidAmount", status FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+    const order = rows[0];
+    if (!order) throw new NotFoundError('订单不存在');
+
+    const total = Number(order.total);
+    const already = Number(order.paidAmount);
+    const amount = input.amount;
+    if (amount <= 0) throw new BadRequestError('收款金额必须大于 0');
+    // 与 confirmManualPayment 同一防手误上限
+    const fatFingerCap = Math.max(total * MAX_OVERPAY_MULTIPLE, MAX_SINGLE_PAYMENT_CNY);
+    if (amount > fatFingerCap + 0.001) {
+      throw new BadRequestError(
+        `收款金额 ¥${amount.toFixed(2)} 异常偏高（订单总额 ¥${total.toFixed(2)}），疑似录入错误，已拒绝。如确需大额到账请分笔录入或核对金额。`,
+      );
+    }
+    const newPaid = already + amount;
+    const fullyPaid = newPaid + 0.001 >= total;
+
+    const payment = await tx.payment.create({
+      data: {
+        orderId,
+        method: input.method,
+        amount: new Prisma.Decimal(amount),
+        status: PaymentStatus.SUCCEEDED,
+        paidAt: new Date(),
+        proofUrl: input.proofUrl ?? null,
+        gatewayPayload: {
+          manual: true,
+          note: input.note ?? null,
+          confirmedBy: actor.userId,
+        } as Prisma.InputJsonValue,
+      },
+    });
+    await tx.order.update({
+      where: { id: orderId },
+      data: { paidAmount: new Prisma.Decimal(newPaid) },
+    });
+    if (fullyPaid && order.status === OrderStatus.PENDING_PAYMENT) {
+      await this.orderService._updateStatusWithinTx(
+        tx,
+        orderId,
+        OrderStatus.PAID,
+        { userId: actor.userId, role: actor.role, actorType: 'USER' },
+        `人工确认收款（${input.method}，¥${amount.toFixed(2)}）`,
+        pendingFulfillmentTaskIds,
+      );
+    }
+
+    return {
+      paymentId: payment.id,
+      paidAmount: newPaid,
+      total,
+      fullyPaid,
+      orderNumber: order.orderNumber,
+      status: fullyPaid ? OrderStatus.PAID : order.status,
+    };
+  }
+
+  /**
    * 批量确认收款 —— 选多个订单一次性到账。ADMIN/STAFF 用。
    * 逐单复用 confirmManualPayment（每单独立行锁 + 幂等 + 审计），互不影响：
    * 某一单失败（订单不存在/金额异常等）不会中断其余订单，结果逐单收集返回。

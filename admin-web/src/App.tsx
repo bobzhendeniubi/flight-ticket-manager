@@ -15,6 +15,7 @@ import { AuditLogsPage } from './pages/AuditLogsPage';
 import { SettlementsPage } from './pages/SettlementsPage';
 import { CancellationPoliciesPage } from './pages/CancellationPoliciesPage';
 import { FinancesPage } from './pages/FinancesPage';
+import { ReconciliationPage } from './pages/ReconciliationPage';
 import { HotelControlPage } from './pages/HotelControlPage';
 import { VisaDeskPage } from './pages/VisaDeskPage';
 import { useAuth } from './stores/auth';
@@ -180,6 +181,14 @@ export function App() {
           element={
             <Protected adminOnly>
               <FinancesPage />
+            </Protected>
+          }
+        />
+        <Route
+          path="/reconciliation"
+          element={
+            <Protected adminOnly>
+              <ReconciliationPage />
             </Protected>
           }
         />

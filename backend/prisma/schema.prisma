@@ -1108,6 +1108,91 @@ model Payment {
   @@index([status])
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 统一收款 + 收款对账台 + 挂账池（Receipts / Reconciliation / Suspense pool）
+//
+// 公司用统一收款码收钱（微信/支付宝/银行），客服/财务在后台手动对账：
+//   - 客户下单后看到统一收款码 + 应付金额，可上传付款凭证（仅"声明"，不直接入账）
+//   - 财务在后台登记进账（Receipt），再手动认领（allocate）到订单或退款
+//   - 暂时认不出是哪单的钱，先进"挂账池"（status=OPEN 的 Receipt），财务再处理
+//   - 订单超额的钱也可放挂账池（source=ORDER_OVERPAY）
+//
+// 一笔 Receipt 可被拆成多笔 ReceiptAllocation 认领到不同订单；
+// 每次认领复用人工确认收款的入账内核（PaymentsService 内 within-tx 变体），
+// 因此认领 = 给订单累加 paidAmount + 全额自动翻 PAID + 审计，和直接确认收款口径完全一致。
+// ─────────────────────────────────────────────────────────────────────────────
+
+// 统一收款渠道（收款码 / 收款账户），供客户付款页展示。
+model PaymentChannel {
+  id          String   @id @default(cuid())
+  kind        String // WECHAT | ALIPAY | BANK
+  label       String // 展示名，如「微信收款码」「公司对公账户」
+  qrImageUrl  String?  @db.Text // 收款码图片（data URL，≤6MB）
+  accountText String?  @db.Text // 账户信息文本（开户行/账号/户名等）
+  note        String?  @db.Text // 备注（如「请备注订单号」）
+  isActive    Boolean  @default(true)
+  sortOrder   Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([isActive, sortOrder])
+}
+
+// 进账（挂账池）状态。
+enum ReceiptStatus {
+  OPEN // 未认领（在挂账池里）
+  PARTIALLY_ALLOCATED // 部分已认领
+  ALLOCATED // 已全部认领
+  REFUNDED // 剩余未认领部分已退款
+}
+
+// 进账来源。
+enum ReceiptSource {
+  CUSTOMER_UPLOAD // 客户上传付款凭证（仅声明）
+  STAFF_ENTRY // 财务/客服后台登记
+  ORDER_OVERPAY // 订单超额转入挂账池
+}
+
+// 一笔到账（统一收款码收到的钱）。
+model Receipt {
+  id           String        @id @default(cuid())
+  receiptNo    String        @unique // 人类可读，如「RCP2026061800001」
+  amountCny    Decimal       @db.Decimal(14, 2) // 到账总额
+  allocatedCny Decimal       @default(0) @db.Decimal(14, 2) // 已认领额（remaining = amount − allocated）
+  method       PaymentMethod
+  proofUrl     String?       @db.Text // 付款凭证截图（data URL，≤6MB）
+  payerNote    String? // 付款人备注（客户填的订单号/留言）
+  orderHintId  String? // 疑似归属订单（客户上传时带的；仅提示，不等于已认领）
+  receivedAt   DateTime // 到账时间（财务可手填）
+  source       ReceiptSource
+  status       ReceiptStatus @default(OPEN)
+  refundNote   String? // 退款备注（仅 REFUNDED 时）
+  createdById  String? // 登记人 userId（系统/客户上传时为 null）
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  allocations ReceiptAllocation[]
+
+  @@index([status])
+  @@index([receivedAt])
+  @@index([orderHintId])
+}
+
+// 一笔进账认领到某订单的记录（一笔进账可拆多条认领到不同订单）。
+model ReceiptAllocation {
+  id          String   @id @default(cuid())
+  receiptId   String
+  orderId     String
+  amountCny   Decimal  @db.Decimal(14, 2)
+  createdById String?
+  createdAt   DateTime @default(now())
+
+  receipt Receipt @relation(fields: [receiptId], references: [id], onDelete: Cascade)
+
+  @@index([receiptId])
+  @@index([orderId])
+}
+
 enum RefundStatus {
   REQUESTED
   APPROVED

@@ -14,6 +14,7 @@ import { safeRandomUUID } from '../lib/uuid';
 import { BookingNotices } from '../components/BookingNotices';
 import { TrustBadges } from '../components/TrustBadges';
 import { RefundBadge } from '../components/RefundBadge';
+import { PaymentPanel } from '../components/PaymentPanel';
 import { Icon } from '../components/Icon';
 
 /** 手机号轻校验：允许 +、空格、-，纯数字位数 7–15（含国际区号）。空串不在这里判（必填由调用方控制）。 */
@@ -196,25 +197,33 @@ export function CheckoutPage() {
 
   if (done) {
     return (
-      <div className="card mx-auto max-w-lg animate-fade-up py-12 text-center">
-        <div className="mx-auto flex h-20 w-20 items-center justify-center rounded-full bg-brand-50 text-5xl">🎉</div>
-        <h1 className="mt-4 text-2xl font-extrabold tracking-tight text-ink">下单成功</h1>
-        <p className="mt-3 text-sm text-ink-muted">订单号</p>
-        <p className="mt-1 inline-block rounded-xl bg-canvas px-4 py-1.5 font-mono text-lg font-semibold text-ink nums">
-          {done.orderNumber}
-        </p>
-        <p className="mt-4 text-sm text-ink-soft">
-          应付 <span className="price text-xl align-middle">¥{fmt(done.total)}</span>
-        </p>
-        {done.paymentExpiresAt && (
-          <HoldCountdown expiresAt={done.paymentExpiresAt} />
-        )}
-        <p className="mt-4 text-sm text-ink-muted">
-          订单已创建，状态为 <span className="badge-sun">待确认</span>。
-          客服会尽快联系确认收款，已发短信至 {done.contactPhone}
-        </p>
+      <div className="mx-auto max-w-lg space-y-4 pb-12">
+        <div className="card animate-fade-up py-10 text-center">
+          <div className="mx-auto flex h-20 w-20 items-center justify-center rounded-full bg-brand-50 text-5xl">🎉</div>
+          <h1 className="mt-4 text-2xl font-extrabold tracking-tight text-ink">下单成功</h1>
+          <p className="mt-3 text-sm text-ink-muted">订单号</p>
+          <p className="mt-1 inline-block rounded-xl bg-canvas px-4 py-1.5 font-mono text-lg font-semibold text-ink nums">
+            {done.orderNumber}
+          </p>
+          {done.paymentExpiresAt && (
+            <HoldCountdown expiresAt={done.paymentExpiresAt} />
+          )}
+          <p className="mt-4 text-sm text-ink-muted">
+            订单已创建，状态为 <span className="badge-sun">待确认</span>。
+            请按下方收款方式付款并上传凭证，已发短信至 {done.contactPhone}
+          </p>
+        </div>
+
+        {/* 收款方式 + 上传付款凭证：买家可立即付款，也可稍后凭订单号回来付 */}
+        <PaymentPanel
+          orderNo={done.orderNumber}
+          lookupKey={done.contactPhone}
+          amountDueCny={Number(done.total) || 0}
+          variant="success"
+        />
+
         {done.isGuest && (
-          <div className="mt-4 rounded-2xl border border-brand-200 bg-brand-50/60 px-4 py-3 text-left text-sm text-brand-800">
+          <div className="card animate-fade-up rounded-2xl border border-brand-200 bg-brand-50/60 text-left text-sm text-brand-800">
             <p className="flex items-center gap-1.5 font-semibold">
               <Icon name="search" className="h-4 w-4" /> 凭「订单号 + 手机号」可随时查订单
             </p>
@@ -225,11 +234,12 @@ export function CheckoutPage() {
               <Link to="/lookup" className="font-semibold underline underline-offset-2 hover:text-brand-dark">
                 查订单
               </Link>{' '}
-              页面输入订单号与下单手机号即可查看进度。
+              页面输入订单号与下单手机号即可继续付款、查看进度。
             </p>
           </div>
         )}
-        <div className="mt-6 flex justify-center gap-3">
+
+        <div className="flex justify-center gap-3">
           <Link to="/" className="btn-secondary">
             返回首页
           </Link>
