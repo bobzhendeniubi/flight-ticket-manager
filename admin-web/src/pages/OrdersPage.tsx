@@ -89,7 +89,7 @@ const TEMPLATE_LABEL: Record<OrderExportTemplate, string> = {
 
 // 派生「签证状态」：订单有 VISA 项时，取其 VISA_APPLICATION 履约任务状态；无签证则 null
 function deriveVisaStatus(o: OrderSummary): ApiFfStatus | null {
-  const visaItem = o.items.find((i) => i.kind === 'VISA');
+  const visaItem = (o.items ?? []).find((i) => i.kind === 'VISA');
   if (!visaItem) return null;
   const task = visaItem.fulfillmentTasks?.find((t) => t.type === 'VISA_APPLICATION');
   return task?.status ?? 'PENDING';
@@ -97,13 +97,13 @@ function deriveVisaStatus(o: OrderSummary): ApiFfStatus | null {
 
 // ── 辅助：从 OrderSummary 派生视图字段 ──────────────────────────────
 function deriveView(o: OrderSummary) {
-  const first = o.items[0];
+  const first = (o.items ?? [])[0];
   const itemKind: OrderItemKindLabel = first?.kind ?? 'FLIGHT';
-  const summaryParts = o.items.map((it) =>
+  const summaryParts = (o.items ?? []).map((it) =>
     it.quantity > 1 ? `${it.description} × ${it.quantity}` : it.description,
   );
   const itemSummary = summaryParts.join(' + ');
-  const customerName = o.user.displayName ?? o.contactName;
+  const customerName = o.user?.displayName ?? o.contactName;
   const agentName = o.agent?.companyName ?? o.agent?.contactName ?? null;
   const totalNum = Number(o.total);
   return { itemKind, itemSummary, customerName, agentName, totalNum };
@@ -1076,7 +1076,7 @@ function OrderDrawer({
           <section>
             <h3 className="text-xs font-semibold uppercase tracking-wide text-ink-muted">产品内容</h3>
             <ul className="mt-2 space-y-2 text-sm">
-              {order.items.map((it) => (
+              {(order.items ?? []).map((it) => (
                 <OrderItemRow
                   key={it.id}
                   orderId={order.id}

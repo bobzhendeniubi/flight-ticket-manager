@@ -284,7 +284,7 @@ export function MyOrdersPage() {
               </div>
               <div className="text-right">
                 <div className="price text-lg">
-                  ¥{Number(o.total).toLocaleString()}
+                  ¥{(Number(o.total) || 0).toLocaleString()}
                 </div>
                 <div className="text-xs text-ink-muted">
                   {new Date(o.createdAt).toLocaleString('zh-CN')}

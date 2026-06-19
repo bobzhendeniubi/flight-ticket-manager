@@ -23,8 +23,8 @@ interface ContactMethod {
 
 const METHODS: ContactMethod[] = [
   { icon: 'phone', label: '客服电话', value: '+853 0000 0000', hint: '工作时间内人工接听（号码待补）' },
-  { icon: 'support', label: '微信客服', value: 'citur-travel', hint: '加微信咨询、发资料更方便（微信号待补）' },
-  { icon: 'info', label: '客服邮箱', value: 'support@citurtravel.example', hint: '非紧急问题可邮件留言（邮箱待补）' },
+  { icon: 'support', label: '微信客服', value: 'coco-holiday', hint: '加微信咨询、发资料更方便（微信号待补）' },
+  { icon: 'info', label: '客服邮箱', value: 'support@cocoholiday.example', hint: '非紧急问题可邮件留言（邮箱待补）' },
   { icon: 'mapPin', label: '公司地址', value: '澳门（详细地址待补）', hint: '到访请提前预约' },
 ];
 

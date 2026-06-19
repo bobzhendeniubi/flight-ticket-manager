@@ -61,14 +61,14 @@ export const seatHoldQueue = new Queue<SeatHoldJobData>('seat-hold', {
 
 /**
  * 订单创建时排队：delay 毫秒后如果订单仍是 PENDING_PAYMENT 则取消 + 释放座位。
- * jobId 用 `hold:<orderId>`，方便支付成功时 remove() 取消。
+ * jobId 用 `hold-<orderId>`，方便支付成功时 remove() 取消。
  */
 export async function scheduleSeatHoldRelease(orderId: string, delayMs: number): Promise<void> {
   await seatHoldQueue.add(
     'release-seat-hold',
     { orderId },
     {
-      jobId: `hold:${orderId}`,
+      jobId: `hold-${orderId}`,
       delay: delayMs,
     },
   );
@@ -77,7 +77,7 @@ export async function scheduleSeatHoldRelease(orderId: string, delayMs: number):
 /** 支付成功或手动取消时调用；若任务已执行（订单已自动取消）则静默返回。 */
 export async function cancelSeatHoldRelease(orderId: string): Promise<void> {
   try {
-    const job = await seatHoldQueue.getJob(`hold:${orderId}`);
+    const job = await seatHoldQueue.getJob(`hold-${orderId}`);
     if (job) await job.remove();
   } catch {
     /* best-effort */
@@ -101,14 +101,14 @@ export const seatLockQueue = new Queue<SeatLockJobData>('seat-lock', {
 
 /**
  * 创建锁位时排队：delay 毫秒后若锁仍 ACTIVE 则标 EXPIRED（座位自动回归可售）。
- * jobId 用 `seatlock:<lockId>`，方便下单消费 / 手动释放时 remove() 取消。
+ * jobId 用 `seatlock-<lockId>`，方便下单消费 / 手动释放时 remove() 取消。
  */
 export async function scheduleSeatLockExpiry(lockId: string, delayMs: number): Promise<void> {
   await seatLockQueue.add(
     'expire-seat-lock',
     { lockId },
     {
-      jobId: `seatlock:${lockId}`,
+      jobId: `seatlock-${lockId}`,
       delay: delayMs,
     },
   );
@@ -117,7 +117,7 @@ export async function scheduleSeatLockExpiry(lockId: string, delayMs: number): P
 /** 锁位被消费 / 手动释放时调用；若任务已执行（锁已自动过期）则静默返回。 */
 export async function cancelSeatLockExpiry(lockId: string): Promise<void> {
   try {
-    const job = await seatLockQueue.getJob(`seatlock:${lockId}`);
+    const job = await seatLockQueue.getJob(`seatlock-${lockId}`);
     if (job) await job.remove();
   } catch {
     /* best-effort */

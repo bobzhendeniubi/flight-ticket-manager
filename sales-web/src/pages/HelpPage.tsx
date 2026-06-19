@@ -29,8 +29,8 @@ interface FaqGroup {
 // 占位客服信息 —— 待运营补真值（placeholder）
 const SUPPORT = {
   phone: '+853 0000 0000（待补）',
-  wechat: 'citur-travel（待补）',
-  email: 'support@citurtravel.example（待补）',
+  wechat: 'coco-holiday（待补）',
+  email: 'support@cocoholiday.example（待补）',
   hours: '每天 09:00 – 21:00（节假日顺延，待运营确认）',
 };
 

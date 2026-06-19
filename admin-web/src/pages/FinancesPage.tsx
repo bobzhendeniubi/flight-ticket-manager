@@ -1128,7 +1128,7 @@ function ProductCostEditors({ token }: { token: string }) {
           </thead>
           <tbody>
             {hotels.flatMap((h) =>
-              h.roomTypes.map((rt) => (
+              (h.roomTypes ?? []).map((rt) => (
                 <CostRow
                   key={rt.id}
                   label={`${h.name} · ${rt.name}`}
