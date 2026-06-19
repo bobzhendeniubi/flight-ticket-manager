@@ -422,6 +422,104 @@ describe('OrderService 重复乘客校验', () => {
     );
     createSpy.mockRestore();
   });
+
+  // ── 团队议价结算价 + 团期备注 ──────────────────────────────────────────
+  it('batchCreateOrders：传 settlementPriceCny → 每张子单注入 flightSettlementPriceCny（覆盖机票价）', async () => {
+    mockPrisma.passenger.findMany.mockResolvedValue([]);
+    mockPrisma.user.findUnique.mockResolvedValue({ displayName: '王操作', email: null, phone: '139' });
+    const createSpy = vi
+      .spyOn(service, 'createOrder')
+      .mockResolvedValue({ id: 'ord-1', orderNumber: 'FTM-001' } as never);
+
+    await service.batchCreateOrders(
+      {
+        flightScheduleId: 'sched-1',
+        flightCabin: 'ECONOMY',
+        description: 'QH9589 澳门→岘港',
+        settlementPriceCny: 1500,
+        groupNote: '0701团 20人',
+        passengers: [fakePassenger('E12345678', '张三'), fakePassenger('E22222222', '李四')],
+      },
+      { userId: 'u1', role: 'STAFF' },
+    );
+
+    // 每张子单都带上议价结算价；FLIGHT 行 quantity 仍是 1（扣座不受影响）
+    expect(createSpy).toHaveBeenCalledTimes(2);
+    expect(createSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        flightSettlementPriceCny: 1500,
+        items: [expect.objectContaining({ kind: 'FLIGHT', quantity: 1, flightScheduleId: 'sched-1' })],
+      }),
+      { userId: 'u1', role: 'STAFF' },
+    );
+    createSpy.mockRestore();
+  });
+
+  it('batchCreateOrders：groupNote 合并进 notes + noteSpecial', async () => {
+    mockPrisma.passenger.findMany.mockResolvedValue([]);
+    mockPrisma.user.findUnique.mockResolvedValue({ displayName: '王操作', email: null, phone: '139' });
+    const createSpy = vi
+      .spyOn(service, 'createOrder')
+      .mockResolvedValue({ id: 'ord-1', orderNumber: 'FTM-001' } as never);
+
+    await service.batchCreateOrders(
+      {
+        flightScheduleId: 'sched-1',
+        flightCabin: 'ECONOMY',
+        description: 'QH9589 澳门→岘港',
+        notes: '已收定金',
+        groupNote: '0701团 20人',
+        passengers: [fakePassenger('E12345678', '张三')],
+      },
+      { userId: 'u1', role: 'STAFF' },
+    );
+
+    expect(createSpy).toHaveBeenCalledWith(
+      expect.objectContaining({
+        notes: '已收定金 · 0701团 20人',
+        noteSpecial: '0701团 20人',
+      }),
+      { userId: 'u1', role: 'STAFF' },
+    );
+    createSpy.mockRestore();
+  });
+
+  it('batchCreateOrders：不传 settlementPriceCny → 子单 flightSettlementPriceCny=undefined（走动态价）', async () => {
+    mockPrisma.passenger.findMany.mockResolvedValue([]);
+    mockPrisma.user.findUnique.mockResolvedValue({ displayName: '王操作', email: null, phone: '139' });
+    const createSpy = vi
+      .spyOn(service, 'createOrder')
+      .mockResolvedValue({ id: 'ord-1', orderNumber: 'FTM-001' } as never);
+
+    await service.batchCreateOrders(
+      {
+        flightScheduleId: 'sched-1',
+        flightCabin: 'ECONOMY',
+        description: 'QH9589 澳门→岘港',
+        passengers: [fakePassenger('E12345678', '张三')],
+      },
+      { userId: 'u1', role: 'STAFF' },
+    );
+
+    const arg = createSpy.mock.calls[0][0] as Record<string, unknown>;
+    expect(arg.flightSettlementPriceCny).toBeUndefined();
+    createSpy.mockRestore();
+  });
+
+  // ── schema 守卫：结算价 ≥ 0 且封顶 ───────────────────────────────────────
+  it('batchCreateOrdersBodySchema：结算价负数 / 超上限 → 校验失败；合法值通过', () => {
+    const base = {
+      flightScheduleId: 'sched-1',
+      flightCabin: 'ECONOMY' as const,
+      description: 'QH9589',
+      passengers: [fakePassenger('E12345678', '张三')],
+    };
+    expect(batchCreateOrdersBodySchema.safeParse({ ...base, settlementPriceCny: -1 }).success).toBe(false);
+    expect(batchCreateOrdersBodySchema.safeParse({ ...base, settlementPriceCny: 999999999 }).success).toBe(false);
+    expect(batchCreateOrdersBodySchema.safeParse({ ...base, settlementPriceCny: 1500 }).success).toBe(true);
+    // 缺省（不传）仍合法 → 走旧动态定价路径
+    expect(batchCreateOrdersBodySchema.safeParse(base).success).toBe(true);
+  });
 });
 
 // ── 套餐酒店盖章：resolveBundleHotelStamp ─────────────────────────────

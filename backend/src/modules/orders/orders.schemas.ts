@@ -10,6 +10,9 @@ import {
   VisaRequirement,
 } from '@prisma/client';
 
+// 团队议价结算价上限（CNY/人）。防误输天价；正常机票远低于此。
+export const SETTLEMENT_PRICE_CAP_CNY = 100_000;
+
 // ── 订单级签证状态 + 结构化备注四栏（录单/编辑共用）─────────────────────────
 // 全部 optional：老客户端不传则字段留空，与旧行为一致。每栏限 ~300 字。
 const STRUCTURED_NOTE_MAX = 300;
@@ -170,6 +173,14 @@ export const createOrderBodySchema = z.object({
   // 运营代下单时归属的代理（仅 ADMIN/STAFF 录单时生效）。
   // AGENT 自助下单忽略此字段（只能归属自己）；游客忽略。
   agentId: z.string().optional(),
+  // 团队议价结算价（CNY，每位出行人）覆盖机票动态价。仅内部调用方（batchCreateOrders）
+  // 在路由层完成 ADMIN/STAFF 鉴权后注入；公开下单端点不暴露此字段（createOrderBodySchema.parse
+  // 会接受但路由 POST / 永不设置它）。设置时仅改 FLIGHT 行价格，扣座 quantity/班次/舱位不变。
+  flightSettlementPriceCny: z
+    .number()
+    .min(0)
+    .max(SETTLEMENT_PRICE_CAP_CNY)
+    .optional(),
 });
 export type CreateOrderBody = z.infer<typeof createOrderBodySchema>;
 
@@ -273,6 +284,16 @@ export const batchCreateOrdersBodySchema = z.object({
   ...orderStructuredNotesShape,
   // 运营批量录单时整批归属的代理（仅 ADMIN/STAFF 生效，校验同单条下单）。
   agentId: z.string().optional(),
+  // 团队议价结算价（CNY，每位出行人）。仅 ADMIN/STAFF 生效（路由层断言）：
+  // 旅游团一般只机票，整批以谈定的结算价建单，覆盖动态/目录机票价。
+  // 缺省 → 走动态定价（与旧行为完全一致）。≥0，封顶 SETTLEMENT_PRICE_CAP_CNY。
+  settlementPriceCny: z
+    .number()
+    .min(0, '结算价不能为负')
+    .max(SETTLEMENT_PRICE_CAP_CNY, `结算价超出上限（${SETTLEMENT_PRICE_CAP_CNY}）`)
+    .optional(),
+  // 团期备注（写入每张子单 notes + noteSpecial），如 "0701团 20人 结算价1500"。
+  groupNote: z.string().max(500).optional(),
   passengers: z.array(passengerInputSchema).min(1).max(100), // 每位 → 一单
 });
 export type BatchCreateOrdersBody = z.infer<typeof batchCreateOrdersBodySchema>;

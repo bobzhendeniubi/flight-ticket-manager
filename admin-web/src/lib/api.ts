@@ -162,6 +162,27 @@ export interface BatchCreateOrdersInput {
   contactEmail?: string;
   notes?: string;
   passengers: BatchOrderPassenger[];
+  /** 代为某代理批量录单（ADMIN/STAFF 用）。直客/无代理 = 不传。 */
+  agentId?: string;
+  /**
+   * 团队结算价（每人 CNY，与代理谈定的整团一口价）。
+   * 设置后覆盖动态定价：每位乘客按此价建单，不再走仓位阶梯/自动定价。
+   */
+  settlementPriceCny?: number;
+  /** 团期备注（如「2026 春节团 7 日」），写入每单。 */
+  groupNote?: string;
+}
+
+/** POST /orders/roster/parse 返回的一行（名单导入；字段可缺省，后续手录补全） */
+export interface RosterParsedRow {
+  name: string;
+  passportNo?: string;
+  dob?: string; // YYYY-MM-DD
+  gender?: string;
+}
+export interface ParseRosterResult {
+  rows: RosterParsedRow[];
+  warnings: string[];
 }
 export interface BatchCreateOrdersResult {
   successCount: number;
@@ -997,6 +1018,22 @@ export const api = {
   // 批量散客建单：一个航班班次+舱位+共享联系人，名单每位乘客一单
   batchCreateOrders: (token: string, body: BatchCreateOrdersInput) =>
     apiFetch<BatchCreateOrdersResult>('/orders/batch', { method: 'POST', token, body }),
+
+  // 下载名单模版（.xlsx：姓名/护照号/出生日期/性别）；ADMIN/STAFF only。返回 Blob 直接下载。
+  downloadRosterTemplate: async (token: string): Promise<Blob> => {
+    const res = await fetch(`${API_BASE}/orders/roster/template`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) throw new ApiError(res.status, { code: 'TEMPLATE_FAILED', message: await res.text() });
+    return res.blob();
+  },
+  // 解析上传的名单 Excel（base64）→ 乘客行 + 警告（缺字段/格式问题）；ADMIN/STAFF only。
+  parseRoster: (token: string, fileBase64: string) =>
+    apiFetch<ParseRosterResult>('/orders/roster/parse', {
+      method: 'POST',
+      token,
+      body: { fileBase64 },
+    }),
 
   // 单笔录单（按产品类型 机票/酒店/签证/套餐/接送）。服务端按产品权威重算价格 + 校验余票。
   createOrder: (token: string, body: CreateOrderInput) =>

@@ -1876,6 +1876,83 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   const [submitting, setSubmitting] = useState(false);
   const [result, setResult] = useState<BatchCreateOrdersResult | null>(null);
   const [err, setErr] = useState<string | null>(null);
+  // 团队字段：团队结算价（每人 CNY，谈定一口价，覆盖动态定价）+ 团期备注
+  const [settlementPriceCny, setSettlementPriceCny] = useState<number | null>(null);
+  const [groupNote, setGroupNote] = useState('');
+  // 名单导入：下载模版忙碌 / 解析忙碌 / 解析警告
+  const [templateBusy, setTemplateBusy] = useState(false);
+  const [rosterBusy, setRosterBusy] = useState(false);
+  const [rosterWarnings, setRosterWarnings] = useState<string[]>([]);
+
+  // 下载名单模版（.xlsx：姓名/护照号/出生日期/性别）
+  async function downloadTemplate(): Promise<void> {
+    if (!token) return;
+    setErr(null);
+    setTemplateBusy(true);
+    try {
+      const blob = await api.downloadRosterTemplate(token);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `名单模版-${new Date().toISOString().slice(0, 10)}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (e: unknown) {
+      setErr(e instanceof ApiError ? `模版下载失败：${e.message}` : '模版下载失败');
+    } finally {
+      setTemplateBusy(false);
+    }
+  }
+
+  // 上传名单 Excel → base64 → 解析 → 填充乘客行（与快速粘贴并存，均可用）
+  function onRosterFile(e: React.ChangeEvent<HTMLInputElement>): void {
+    const f = e.target.files?.[0];
+    e.target.value = ''; // 允许重复选同一文件再次触发
+    if (!f || !token) return;
+    if (f.size > 4 * 1024 * 1024) {
+      setErr('名单文件过大（>4MB），请精简后再传');
+      return;
+    }
+    setErr(null);
+    setRosterWarnings([]);
+    setRosterBusy(true);
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = typeof reader.result === 'string' ? reader.result : '';
+      // FileReader 给的是 data:...;base64,XXXX，后端要纯 base64，去掉前缀
+      const base64 = dataUrl.includes(',') ? dataUrl.slice(dataUrl.indexOf(',') + 1) : dataUrl;
+      if (!base64) {
+        setErr('文件读取失败');
+        setRosterBusy(false);
+        return;
+      }
+      api
+        .parseRoster(token, base64)
+        .then((res) => {
+          const parsed: BatchRow[] = res.rows
+            .filter((r) => r.name?.trim())
+            .map((r) => ({
+              fullName: r.name.trim(),
+              documentNumber: r.passportNo?.trim() ?? '',
+              dateOfBirth: r.dob?.trim() ?? '',
+            }));
+          if (parsed.length > 0) setRows(parsed);
+          else setErr('名单未解析出任何乘客，请检查文件格式');
+          setRosterWarnings(res.warnings ?? []);
+        })
+        .catch((e: unknown) => {
+          setErr(e instanceof ApiError ? `名单解析失败：${e.message}` : '名单解析失败');
+        })
+        .finally(() => setRosterBusy(false));
+    };
+    reader.onerror = () => {
+      setErr('文件读取失败');
+      setRosterBusy(false);
+    };
+    reader.readAsDataURL(f);
+  }
 
   useEffect(() => {
     if (!token) return;
@@ -1942,6 +2019,11 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
     const departDate = schedule ? schedule.departureTime.slice(0, 10) : '';
     const description =
       `${flight?.flightNumber ?? ''} ${flight?.originCode ?? ''}→${flight?.destinationCode ?? ''} ${departDate} ${CABIN_ZH[cabin] ?? cabin}`.trim();
+    // 团队结算价：>0 才视为设置（覆盖动态定价）；同时带上团期备注
+    const teamPrice =
+      settlementPriceCny !== null && Number.isFinite(settlementPriceCny) && settlementPriceCny > 0
+        ? settlementPriceCny
+        : undefined;
     setSubmitting(true);
     try {
       const res = await api.batchCreateOrders(token, {
@@ -1956,6 +2038,10 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
           dateOfBirth: parseDob(r.dateOfBirth) ?? '',
           nationality: 'CN',
         })),
+        // 团队结算价设置后覆盖动态定价；团期备注随团队字段一起带（无价时不发）
+        ...(teamPrice !== undefined
+          ? { settlementPriceCny: teamPrice, groupNote: groupNote.trim() || undefined }
+          : {}),
       });
       setResult(res);
       if (res.successCount > 0) onCreated();
@@ -2010,6 +2096,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                 onClick={() => {
                   setResult(null);
                   setRows([{ fullName: '', documentNumber: '', dateOfBirth: '' }]);
+                  setRosterWarnings([]);
                 }}
               >
                 再建一批
@@ -2086,6 +2173,74 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                 <input className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm" value={notes} onChange={(e) => setNotes(e.target.value)} />
               </label>
             </div>
+
+            {/* 旅游团：团队结算价（每人一口价，覆盖动态定价）+ 团期备注 */}
+            <div className="rounded-md border border-slate-200 bg-slate-50/60 p-3">
+              <div className="mb-2 text-sm font-medium text-slate-700">旅游团（选填）</div>
+              <div className="grid gap-3 md:grid-cols-2">
+                <label className="text-xs text-slate-500">
+                  团队结算价（每人 ¥）
+                  <NumberInput
+                    className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                    value={settlementPriceCny}
+                    onChange={setSettlementPriceCny}
+                    min={0}
+                    step={1}
+                    integerOnly
+                    placeholder="留空 = 按动态定价"
+                  />
+                </label>
+                <label className="text-xs text-slate-500">
+                  团期备注
+                  <input
+                    className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                    value={groupNote}
+                    onChange={(e) => setGroupNote(e.target.value)}
+                    placeholder="如 2026 春节团 7 日"
+                  />
+                </label>
+              </div>
+              <p className="mt-2 text-[11px] text-amber-700">
+                ⓘ 填了团队结算价后，每位乘客按此价建单，覆盖仓位阶梯 / 自动定价（与代理谈定的整团一口价）。
+              </p>
+            </div>
+
+            {/* 名单导入：下载模版 → 上传 Excel 自动填充乘客行（与快速粘贴并存） */}
+            <div className="flex flex-wrap items-center gap-3">
+              <button
+                type="button"
+                className="btn-secondary text-sm disabled:opacity-50"
+                onClick={() => void downloadTemplate()}
+                disabled={templateBusy}
+              >
+                {templateBusy ? '生成中…' : '📄 下载名单模版'}
+              </button>
+              <label className="btn-secondary cursor-pointer text-sm">
+                {rosterBusy ? '解析中…' : '📋 上传名单(Excel)'}
+                <input
+                  type="file"
+                  accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                  className="hidden"
+                  onChange={onRosterFile}
+                  disabled={rosterBusy}
+                />
+              </label>
+              <span className="text-[11px] text-slate-400">
+                上传后自动填充下方名单（姓名/护照号/出生日期）；也可继续手动修改。
+              </span>
+            </div>
+
+            {/* 名单解析警告（缺字段/格式问题） */}
+            {rosterWarnings.length > 0 && (
+              <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                <div className="font-medium">名单解析提醒（{rosterWarnings.length} 条）：</div>
+                <ul className="mt-1 max-h-32 list-disc space-y-0.5 overflow-auto pl-5">
+                  {rosterWarnings.map((w, i) => (
+                    <li key={i}>{w}</li>
+                  ))}
+                </ul>
+              </div>
+            )}
 
             {/* 快速粘贴：姓名 或 姓名,护照号,生日 */}
             <details className="text-xs text-slate-500">

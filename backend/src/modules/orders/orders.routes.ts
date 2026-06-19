@@ -36,6 +36,11 @@ import {
   buildRoomAllocationWorkbook,
   roomAllocationExportFilename,
 } from './orders.export-room-allocation.js';
+import {
+  buildRosterTemplateWorkbook,
+  parseRosterXlsx,
+  rosterTemplateFilename,
+} from './roster.js';
 
 export const orderRoutes: FastifyPluginAsync = async (app) => {
   const service = new OrderService();
@@ -107,6 +112,11 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         return reply.status(403).send({ error: '客户不可批量建单' });
       }
       const body = batchCreateOrdersBodySchema.parse(req.body);
+      // 团队议价结算价覆盖机票价：仅 ADMIN/STAFF 可用（AGENT 自助批量建单不得改价）。
+      const isOps = req.user.role === UserRole.ADMIN || req.user.role === UserRole.STAFF;
+      if (body.settlementPriceCny !== undefined && !isOps) {
+        return reply.status(403).send({ error: '仅运营/管理员可指定团队议价结算价' });
+      }
       const requester = await buildRequester(req.user.sub, req.user.role);
       const result = await service.batchCreateOrders(body, requester);
       void writeAudit({
@@ -121,10 +131,74 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
           requestedCount: body.passengers.length,
           successCount: result.successCount,
           failureCount: result.failureCount,
+          // 团队议价结算价覆盖（如有）— 审计谁、改成多少、团期备注
+          settlementPriceCny: body.settlementPriceCny ?? null,
+          priceOverride: body.settlementPriceCny !== undefined ? 'TEAM_SETTLEMENT' : null,
+          groupNote: body.groupNote ?? null,
         },
-        severity: result.failureCount > 0 ? 'WARNING' : 'INFO',
+        // 改价是敏感操作 → 提级到 WARNING（便于审计检索）
+        severity:
+          result.failureCount > 0 || body.settlementPriceCny !== undefined ? 'WARNING' : 'INFO',
       });
       return reply.status(201).send(result);
+    },
+  );
+
+  // ── 旅游团名单模版下载 ───────────────────────────────────────────
+  // GET /orders/roster/template — ADMIN/STAFF only
+  // 导出空白名单模版（姓名 | 护照号 | 出生日期 | 性别），运营把收单群名单转此格式后上传解析。
+  app.get(
+    '/roster/template',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    async (req, reply) => {
+      const buf = await buildRosterTemplateWorkbook();
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'DOWNLOAD_ROSTER_TEMPLATE',
+        targetType: 'ORDER',
+        targetId: 'roster-template',
+        targetLabel: '名单模版',
+      });
+      return reply
+        .header(
+          'Content-Type',
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
+        .header(
+          'Content-Disposition',
+          `attachment; filename="${encodeURIComponent(rosterTemplateFilename())}"`,
+        )
+        .send(buf);
+    },
+  );
+
+  // ── 旅游团名单解析 ───────────────────────────────────────────────
+  // POST /orders/roster/parse — ADMIN/STAFF only
+  // body { fileBase64 }（上传的 .xlsx 名单，base64）→ { rows, warnings }
+  // 容错：跳空行 / 容错日期格式 / 单格不可解析只收 warning，不整文件抛错。
+  app.post(
+    '/roster/parse',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    async (req, reply) => {
+      const body = z
+        .object({ fileBase64: z.string().min(1, 'fileBase64 必填') })
+        .parse(req.body);
+      let result;
+      try {
+        result = await parseRosterXlsx(body.fileBase64);
+      } catch {
+        // 文件损坏 / 非 xlsx → 400（解析内部的单格错误已被吞成 warning，不会走到这里）
+        return reply.status(400).send({ error: '名单文件无法解析，请确认为有效的 .xlsx 文件' });
+      }
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'PARSE_ROSTER',
+        targetType: 'ORDER',
+        targetId: 'roster-parse',
+        targetLabel: `名单解析 ${result.rows.length} 行`,
+        after: { rowCount: result.rows.length, warningCount: result.warnings.length },
+      });
+      return result;
     },
   );
 

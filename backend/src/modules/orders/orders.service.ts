@@ -195,7 +195,11 @@ export class OrderService {
     );
 
     // 先查所有 FLIGHT item 对应的 FlightSeatClass + 计算动态价（在事务外查，避免长事务）
-    const pricedItems = await this.priceAndValidateItems(body.items);
+    // body.flightSettlementPriceCny 存在 → 团队议价结算价覆盖机票价（鉴权在路由/批量层完成）。
+    const pricedItems = await this.priceAndValidateItems(
+      body.items,
+      body.flightSettlementPriceCny,
+    );
 
     // 签证订单规则：含 VISA 行时每位出行人必须填写护照有效期（送签材料必填）
     assertVisaPassengersHavePassportExpiry(body.items, body.passengers);
@@ -496,7 +500,16 @@ export class OrderService {
     );
   }
 
-  private async priceAndValidateItems(items: OrderItemInput[]) {
+  /**
+   * @param flightSettlementPriceCny 团队议价结算价（CNY/人）。设置时覆盖 FLIGHT 行的
+   *   动态价：unitPrice = 结算价，amount = 结算价 × quantity。仅改价格，绝不动
+   *   quantity / flightScheduleId / flightCabin —— 扣座（CAS）仍按 quantity 执行。
+   *   缺省 → 走动态定价（旧行为）。
+   */
+  private async priceAndValidateItems(
+    items: OrderItemInput[],
+    flightSettlementPriceCny?: number,
+  ) {
     const priced: Array<{
       kind: OrderItemKind;
       description: string;
@@ -523,7 +536,27 @@ export class OrderService {
 
     for (const item of items) {
       if (item.kind === 'FLIGHT') {
-        // 动态定价重算 — 这是唯一权威价格源
+        // 团队议价结算价：整批以谈定的每人结算价覆盖动态/目录机票价。
+        // 仅改价格，扣座 quantity / 班次 / 舱位完全不变（CAS 仍按 quantity 执行）。
+        if (flightSettlementPriceCny !== undefined) {
+          priced.push({
+            kind: 'FLIGHT',
+            description: item.description,
+            quantity: item.quantity,
+            unitPrice: flightSettlementPriceCny,
+            amount: Math.round(flightSettlementPriceCny * item.quantity),
+            flightScheduleId: item.flightScheduleId,
+            flightCabin: item.flightCabin,
+            metadata: {
+              ...(item.metadata ?? {}),
+              // 审计：标记本行价格来自团队议价结算价（非动态价）
+              priceOverride: 'TEAM_SETTLEMENT',
+              settlementPriceCny: flightSettlementPriceCny,
+            },
+          });
+          continue;
+        }
+        // 动态定价重算 — 这是唯一权威价格源（无议价结算价时）
         const pricing = await this.pricing.calculatePrice(
           item.flightScheduleId,
           item.flightCabin,
@@ -1025,6 +1058,10 @@ export class OrderService {
     const contactName = body.contactName ?? recorder?.displayName ?? recorder?.email ?? '系统录入';
     const contactPhone = body.contactPhone ?? recorder?.phone ?? '-';
 
+    // 团期备注：写入每张子单的 notes（与既有 notes 合并）+ noteSpecial（结构化「特殊」栏）。
+    const mergedNotes = [body.notes, body.groupNote].filter(Boolean).join(' · ') || undefined;
+    const mergedNoteSpecial = [body.noteSpecial, body.groupNote].filter(Boolean).join(' · ') || undefined;
+
     // 重复乘客校验（整批先查，命中则整批拒绝，不产生部分建单）：
     // 1) 名单内证件号重复；2) 与同班次「占座中」订单的乘客证件号重复
     const seenDocs = new Set<string>();
@@ -1061,15 +1098,19 @@ export class OrderService {
             contactPhone,
             contactEmail: body.contactEmail,
             paymentMethod: body.paymentMethod,
-            notes: body.notes,
+            // 团期备注合并进每张子单 notes
+            notes: mergedNotes,
             // 签证状态 + 结构化备注四栏（整批共用，写入每张子单）
             visaStatus: body.visaStatus,
             noteHotel: body.noteHotel,
             noteVisa: body.noteVisa,
             notePayment: body.notePayment,
-            noteSpecial: body.noteSpecial,
+            // 团期备注同时写入结构化「特殊」栏
+            noteSpecial: mergedNoteSpecial,
             // 整批归属代理（ADMIN/STAFF 录单）；AGENT 自助仍归属本人。
             agentId: body.agentId,
+            // 团队议价结算价（CNY/人）覆盖机票动态价；仅 ADMIN/STAFF（路由层已断言）。
+            flightSettlementPriceCny: body.settlementPriceCny,
             items: [
               {
                 kind: 'FLIGHT',
