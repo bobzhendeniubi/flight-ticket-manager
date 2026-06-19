@@ -760,6 +760,64 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       expectedAmountLocked: updated.expectedAmountLocked,
     };
   });
+
+  // ── 多付存入代理余额（ADMIN/STAFF）──
+  // POST /orders/:id/credit-overpay-to-agent
+  // 订单多付（paidAmount > total）→ 把多付额转入归属代理的预存余额，订单回压到恰好结清。
+  app.post('/:id/credit-overpay-to-agent', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅运营/管理员可将多付存入代理余额' });
+    }
+    const { id } = req.params as { id: string };
+    const result = await service.creditOverpayToAgent(id, { userId: req.user.sub, role });
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'CREDIT_OVERPAY_TO_AGENT',
+      targetType: 'ORDER',
+      targetId: id,
+      targetLabel: result.orderNumber,
+      after: {
+        agentId: result.agentId,
+        creditedAmount: result.creditedAmount,
+        agentBalanceAfter: result.agentBalanceAfter,
+      },
+      severity: 'WARNING',
+    });
+    return result;
+  });
+
+  // ── 用代理余额抵尾款（ADMIN/STAFF）──
+  // POST /orders/:id/apply-agent-balance  body: { amount }
+  // 从归属代理预存余额扣 amount，记入订单 paidAmount；抵满则订单转 PAID（含佣金/履约）。
+  app.post('/:id/apply-agent-balance', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅运营/管理员可用代理余额抵尾款' });
+    }
+    const { id } = req.params as { id: string };
+    const body = z.object({ amount: z.number().positive() }).parse(req.body);
+    const result = await service.applyAgentBalanceToOrder(id, body.amount, {
+      userId: req.user.sub,
+      role,
+    });
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'APPLY_AGENT_BALANCE',
+      targetType: 'ORDER',
+      targetId: id,
+      targetLabel: result.orderNumber,
+      after: {
+        agentId: result.agentId,
+        appliedAmount: result.appliedAmount,
+        fullyPaid: result.fullyPaid,
+        status: result.status,
+        agentBalanceAfter: result.agentBalanceAfter,
+      },
+      severity: 'WARNING',
+    });
+    return result;
+  });
 };
 
 /**

@@ -17,6 +17,7 @@ import {
   OrderItemKind,
   OrderStatus,
   PaymentMethod,
+  PrepaymentTxType,
   Prisma,
   ProductKind,
   SeatLockStatus,
@@ -848,7 +849,7 @@ export class OrderService {
           // 带上 fulfillment 任务(类型+状态)，前端据此派生「签证状态」列
           items: { include: { fulfillmentTasks: { select: { type: true, status: true } } } },
           passengers: { select: { id: true, fullName: true } },
-          agent: { select: { id: true, companyName: true, contactName: true } },
+          agent: { select: { id: true, companyName: true, contactName: true, settlementMode: true, prepaymentBalance: true } },
           user: { select: { id: true, displayName: true, email: true } },
           claimedBy: { select: { id: true, displayName: true, email: true } },
         },
@@ -877,7 +878,7 @@ export class OrderService {
         payments: true,
         refunds: true,
         statusEvents: { orderBy: { createdAt: 'asc' } },
-        agent: { select: { id: true, companyName: true, contactName: true } },
+        agent: { select: { id: true, companyName: true, contactName: true, settlementMode: true, prepaymentBalance: true } },
         user: { select: { id: true, displayName: true, email: true } },
         claimedBy: { select: { id: true, displayName: true, email: true } },
         reminders: {
@@ -889,6 +890,232 @@ export class OrderService {
     if (!order) throw new NotFoundError('订单不存在');
     await this.assertCanView(order, requester);
     return serializeOrder(order);
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  // 代理余额账户 —— 多付存入 / 用余额抵尾款
+  // （取代「跨人抵扣」：多付不再直接抵给别的客户，而是进代理自己的预存余额账户；
+  //  少付从同一余额顶。ADMIN/STAFF 操作，全程事务安全 + 审计 + 余额不为负。）
+  // ════════════════════════════════════════════════════════════════════
+
+  /**
+   * 多付存入代理余额。订单有代理且 paidAmount > total（多付）时：
+   *   一个事务里：order.paidAmount 回压到 total（消掉多付），代理 prepaymentBalance += 多付额，
+   *   写一条 PrepaymentTransaction（TOP_UP，钱进余额）+ 关联 orderId。
+   * 无代理 / 无多付 → 拒绝。
+   */
+  async creditOverpayToAgent(
+    orderId: string,
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
+    ok: true;
+    orderId: string;
+    orderNumber: string;
+    agentId: string;
+    creditedAmount: number;
+    newPaidAmount: number;
+    total: number;
+    agentBalanceAfter: number;
+  }> {
+    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+      throw new ForbiddenError('仅运营/管理员可将多付存入代理余额');
+    }
+
+    return prisma.$transaction(async (tx) => {
+      // FOR UPDATE 行锁：事务内读最新 paidAmount/total，避免与并发到账/抵扣用旧快照
+      const rows = await tx.$queryRaw<
+        Array<{
+          id: string;
+          orderNumber: string;
+          agentId: string | null;
+          total: Prisma.Decimal;
+          paidAmount: Prisma.Decimal;
+        }>
+      >`SELECT id, "orderNumber", "agentId", total, "paidAmount" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+      const order = rows[0];
+      if (!order) throw new NotFoundError('订单不存在');
+      if (!order.agentId) throw new BadRequestError('该订单无归属代理，无法存入代理余额');
+
+      const total = Number(order.total);
+      const paid = Number(order.paidAmount);
+      const overpay = round2(paid - total);
+      if (overpay <= 0) {
+        throw new BadRequestError('该订单没有多付金额（paidAmount ≤ total），无可存入余额');
+      }
+
+      // 代理余额行锁 + 事务内累加（与 settlements PAID 抵扣同一并发安全口径）
+      const agentRows = await tx.$queryRaw<Array<{ prepaymentBalance: Prisma.Decimal }>>`
+        SELECT "prepaymentBalance" FROM "Agent" WHERE id = ${order.agentId} FOR UPDATE
+      `;
+      if (!agentRows[0]) throw new NotFoundError('代理不存在');
+      const balanceAfter = round2(Number(agentRows[0].prepaymentBalance) + overpay);
+
+      await tx.agent.update({
+        where: { id: order.agentId },
+        data: { prepaymentBalance: new Prisma.Decimal(balanceAfter) },
+      });
+      // 多付回压：订单 paidAmount 降回 total（订单恰好结清，不再显示多付）
+      await tx.order.update({
+        where: { id: orderId },
+        data: { paidAmount: new Prisma.Decimal(total) },
+      });
+      await tx.prepaymentTransaction.create({
+        data: {
+          agentId: order.agentId,
+          amount: new Prisma.Decimal(overpay), // 正数 = 入账
+          balanceAfter: new Prisma.Decimal(balanceAfter),
+          type: PrepaymentTxType.TOP_UP,
+          orderId,
+          description: `订单 ${order.orderNumber} 多付转存代理余额`,
+          createdById: actor.userId,
+        },
+      });
+
+      return {
+        ok: true as const,
+        orderId,
+        orderNumber: order.orderNumber,
+        agentId: order.agentId,
+        creditedAmount: overpay,
+        newPaidAmount: total,
+        total,
+        agentBalanceAfter: balanceAfter,
+      };
+    });
+  }
+
+  /**
+   * 用代理余额抵订单尾款。订单有代理、代理余额 ≥ amount、amount ≤ 尾款（total − paidAmount，须 > 0）时：
+   *   一个事务里：代理 prepaymentBalance -= amount，order.paidAmount += amount，
+   *   写一条 PrepaymentTransaction（OFFSET，余额用在订单上）+ 关联 orderId；
+   *   若抵扣后已全额覆盖且订单仍在 PENDING_PAYMENT，复用 _updateStatusWithinTx 推 PAID
+   *   （同走佣金 / 履约任务生成那一套）。
+   * 无代理 / 超抵（amount > 尾款）/ 余额不足 → 拒绝；余额不会为负。
+   */
+  async applyAgentBalanceToOrder(
+    orderId: string,
+    amount: number,
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
+    ok: true;
+    orderId: string;
+    orderNumber: string;
+    agentId: string;
+    appliedAmount: number;
+    newPaidAmount: number;
+    total: number;
+    fullyPaid: boolean;
+    status: OrderStatus;
+    agentBalanceAfter: number;
+  }> {
+    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+      throw new ForbiddenError('仅运营/管理员可用代理余额抵尾款');
+    }
+    const apply = round2(amount);
+    if (apply <= 0) throw new BadRequestError('抵扣金额必须大于 0');
+
+    const pendingFulfillmentTaskIds: string[] = [];
+    const result = await prisma.$transaction(async (tx) => {
+      // 订单行锁 + 事务内读最新尾款
+      const rows = await tx.$queryRaw<
+        Array<{
+          id: string;
+          orderNumber: string;
+          agentId: string | null;
+          total: Prisma.Decimal;
+          paidAmount: Prisma.Decimal;
+          status: OrderStatus;
+        }>
+      >`SELECT id, "orderNumber", "agentId", total, "paidAmount", status FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+      const order = rows[0];
+      if (!order) throw new NotFoundError('订单不存在');
+      if (!order.agentId) throw new BadRequestError('该订单无归属代理，无法用代理余额抵扣');
+
+      const total = Number(order.total);
+      const paid = Number(order.paidAmount);
+      const remaining = round2(total - paid);
+      if (remaining <= 0) throw new BadRequestError('该订单无尾款（已结清或多付），无需抵扣');
+      if (apply > remaining + 0.001) {
+        throw new BadRequestError(
+          `抵扣金额 ¥${apply.toFixed(2)} 超过尾款 ¥${remaining.toFixed(2)}，已拒绝`,
+        );
+      }
+
+      // 代理余额行锁：余额不足直接拒，绝不透支为负
+      const agentRows = await tx.$queryRaw<Array<{ prepaymentBalance: Prisma.Decimal }>>`
+        SELECT "prepaymentBalance" FROM "Agent" WHERE id = ${order.agentId} FOR UPDATE
+      `;
+      if (!agentRows[0]) throw new NotFoundError('代理不存在');
+      const balance = Number(agentRows[0].prepaymentBalance);
+      if (apply > balance + 0.001) {
+        throw new BadRequestError(
+          `代理余额 ¥${balance.toFixed(2)} 不足以抵扣 ¥${apply.toFixed(2)}，已拒绝`,
+        );
+      }
+      const balanceAfter = round2(balance - apply);
+      const newPaid = round2(paid + apply);
+      const fullyPaid = newPaid + 0.001 >= total;
+
+      await tx.agent.update({
+        where: { id: order.agentId },
+        data: { prepaymentBalance: new Prisma.Decimal(balanceAfter) },
+      });
+      await tx.order.update({
+        where: { id: orderId },
+        data: { paidAmount: new Prisma.Decimal(newPaid) },
+      });
+      await tx.prepaymentTransaction.create({
+        data: {
+          agentId: order.agentId,
+          amount: new Prisma.Decimal(-apply), // 负数 = 余额扣减（用在订单上）
+          balanceAfter: new Prisma.Decimal(balanceAfter),
+          type: PrepaymentTxType.OFFSET,
+          orderId,
+          description: `订单 ${order.orderNumber} 代理余额抵尾款`,
+          createdById: actor.userId,
+        },
+      });
+
+      // 抵满 + 仍待支付 → 复用 PAID 流转（含佣金 / 履约任务）
+      let finalStatus: OrderStatus = order.status;
+      if (fullyPaid && order.status === OrderStatus.PENDING_PAYMENT) {
+        await this._updateStatusWithinTx(
+          tx,
+          orderId,
+          OrderStatus.PAID,
+          { userId: actor.userId, role: actor.role, actorType: 'USER' },
+          `代理余额抵尾款（¥${apply.toFixed(2)}）结清`,
+          pendingFulfillmentTaskIds,
+        );
+        finalStatus = OrderStatus.PAID;
+      }
+
+      return {
+        ok: true as const,
+        orderId,
+        orderNumber: order.orderNumber,
+        agentId: order.agentId,
+        appliedAmount: apply,
+        newPaidAmount: newPaid,
+        total,
+        fullyPaid,
+        status: finalStatus,
+        agentBalanceAfter: balanceAfter,
+      };
+    });
+
+    // 事务外 enqueue fulfillment（与 confirmManualPayment 一致）
+    if (pendingFulfillmentTaskIds.length > 0 && process.env.ENABLE_AUTO_FULFILLMENT === 'true') {
+      const { fulfillmentQueue } = await import('../../queues/queue.js');
+      for (const taskId of pendingFulfillmentTaskIds) {
+        void fulfillmentQueue.add('auto-fulfill', { taskId }, { jobId: taskId, delay: 1000 }).catch((e) => {
+          // eslint-disable-next-line no-console
+          console.error('[orders] failed to enqueue fulfillment task:', e);
+        });
+      }
+    }
+
+    return result;
   }
 
   // ════════════════════════════════════════════════════════════════════
@@ -1319,7 +1546,7 @@ export class OrderService {
         payments: true,
         refunds: true,
         statusEvents: { orderBy: { createdAt: 'asc' } },
-        agent: { select: { id: true, companyName: true, contactName: true } },
+        agent: { select: { id: true, companyName: true, contactName: true, settlementMode: true, prepaymentBalance: true } },
         user: { select: { id: true, displayName: true, email: true } },
       },
     });
@@ -1495,7 +1722,7 @@ const ORDER_FULL_INCLUDE = {
   payments: true,
   refunds: true,
   statusEvents: { orderBy: { createdAt: 'asc' } },
-  agent: { select: { id: true, companyName: true, contactName: true } },
+  agent: { select: { id: true, companyName: true, contactName: true, settlementMode: true, prepaymentBalance: true } },
   user: { select: { id: true, displayName: true, email: true } },
 } as const;
 
@@ -2004,6 +2231,13 @@ interface OrderLike {
   paidAmount: Prisma.Decimal;
   prepaymentOffset: Prisma.Decimal;
   items: Array<{ unitPrice: Prisma.Decimal; amount: Prisma.Decimal } & Record<string, unknown>>;
+  // 可选嵌套代理（含余额 Decimal + 结算模式）；不同 include 下可能不带或带 null
+  agent?: ({ prepaymentBalance?: Prisma.Decimal | null } & Record<string, unknown>) | null;
+}
+
+/** 金额保留 2 位小数（CNY，避免浮点累计误差）。 */
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
 }
 
 function serializeOrder<T extends OrderLike>(order: T) {
@@ -2015,6 +2249,17 @@ function serializeOrder<T extends OrderLike>(order: T) {
     total: order.total.toString(),
     paidAmount: order.paidAmount.toString(),
     prepaymentOffset: order.prepaymentOffset.toString(),
+    // 暴露代理结算模式 + 余额（前端据 settlementMode=MONTHLY 把订单显示成「月结」而非「欠款」）
+    agent:
+      order.agent == null
+        ? order.agent
+        : {
+            ...order.agent,
+            prepaymentBalance:
+              order.agent.prepaymentBalance == null
+                ? null
+                : order.agent.prepaymentBalance.toString(),
+          },
     items: order.items.map((i) => ({
       ...i,
       unitPrice: i.unitPrice.toString(),

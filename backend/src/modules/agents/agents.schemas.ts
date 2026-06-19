@@ -1,4 +1,10 @@
 import { z } from 'zod';
+import { SettlementMode } from '@prisma/client';
+
+export const setSettlementModeBodySchema = z.object({
+  settlementMode: z.nativeEnum(SettlementMode),
+});
+export type SetSettlementModeBody = z.infer<typeof setSettlementModeBodySchema>;
 
 export const createChildAgentBodySchema = z.object({
   email: z.string().email().max(255),

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { api, ApiError, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceStatus, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type VisaStatusInput, VISA_STATUS_LABEL } from '../lib/api';
+import { api, ApiError, SETTLEMENT_MODE_LABEL, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceStatus, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import {
   type FulfillmentStatus,
@@ -119,8 +119,16 @@ function deriveBalance(o: OrderSummary): { total: number; paid: number; balance:
 }
 
 // 尾款徽标：少付=琥珀(欠款)、结清=绿、多付=蓝(highlight)。
-function BalanceBadge({ balance }: { balance: number }) {
+// 月结代理：尾款>0 不按欠款告警，改为中性蓝「月结挂账」（月末统一对账）。
+function BalanceBadge({ balance, settlementMode }: { balance: number; settlementMode?: SettlementMode }) {
   if (balance > 0) {
+    if (settlementMode === 'MONTHLY') {
+      return (
+        <span className="rounded bg-blue-100 px-1.5 py-0.5 text-xs font-medium text-blue-700">
+          月结挂账 ¥{balance.toLocaleString()}
+        </span>
+      );
+    }
     return (
       <span className="rounded bg-amber-100 px-1.5 py-0.5 text-xs font-medium text-amber-700">
         欠 ¥{balance.toLocaleString()}
@@ -1122,6 +1130,7 @@ function OrderDrawer({
             orderId={order.id}
             total={view.totalNum}
             paidAmount={Number(order.paidAmount)}
+            agent={order.agent}
             onChanged={onChanged}
           />
 
@@ -2334,17 +2343,24 @@ function ConfirmPaymentSection({
   orderId,
   total,
   paidAmount,
+  agent,
   onChanged,
 }: {
   orderId: string;
   total: number;
   paidAmount: number;
+  agent: OrderSummary['agent'];
   onChanged?: () => void;
 }) {
   const tokens = useAuth((s) => s.tokens);
   const token = tokens?.accessToken ?? '';
   const [payments, setPayments] = useState<OrderPayment[]>([]);
   const [paid, setPaid] = useState(paidAmount);
+  // 代理预存余额本地副本（抵扣/存入后即时刷新展示，不必等父级 onChanged 重拉）
+  const [agentBalance, setAgentBalance] = useState<number>(agent ? Number(agent.prepaymentBalance) : 0);
+  useEffect(() => {
+    setAgentBalance(agent ? Number(agent.prepaymentBalance) : 0);
+  }, [agent]);
   const [amount, setAmount] = useState<number | null>(null);
   const [method, setMethod] = useState<PaymentMethod>('BANK_CARD');
   const [proofUrl, setProofUrl] = useState<string | null>(null);
@@ -2428,6 +2444,41 @@ function ConfirmPaymentSection({
 
   const settled = balance === 0;
   const overpaid = balance < 0;
+  const isMonthly = agent?.settlementMode === 'MONTHLY';
+
+  // 多付存入代理余额：把 paidAmount−total 转入代理预存，订单回到刚好结清。
+  async function creditOverpay(): Promise<void> {
+    if (!token || !agent || submitting) return;
+    setErr(null);
+    setSubmitting(true);
+    try {
+      const res = await api.creditOverpayToAgent(token, orderId);
+      setPaid(Number(res.order.paidAmount));
+      if (res.order.agent) setAgentBalance(Number(res.order.agent.prepaymentBalance));
+      onChanged?.();
+    } catch (e: unknown) {
+      setErr(e instanceof ApiError ? e.message : '存入代理余额失败');
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  // 用代理余额抵尾款：amount ≤ 尾款 且 ≤ 代理余额；覆盖则翻 PAID。
+  async function applyBalance(amt: number): Promise<void> {
+    if (!token || !agent || submitting) return;
+    setErr(null);
+    setSubmitting(true);
+    try {
+      const res = await api.applyAgentBalance(token, orderId, amt);
+      setPaid(Number(res.order.paidAmount));
+      if (res.order.agent) setAgentBalance(Number(res.order.agent.prepaymentBalance));
+      onChanged?.();
+    } catch (e: unknown) {
+      setErr(e instanceof ApiError ? e.message : '抵扣失败');
+    } finally {
+      setSubmitting(false);
+    }
+  }
 
   return (
     <section>
@@ -2438,15 +2489,59 @@ function ConfirmPaymentSection({
           <span>
             <b className="text-emerald-700">¥{paid.toLocaleString()}</b>
             <span className="text-slate-400"> / ¥{total.toLocaleString()}</span>
-            {settled ? (
-              <span className="ml-2 rounded bg-emerald-100 px-1.5 py-0.5 text-xs text-emerald-700">已结清</span>
-            ) : overpaid ? (
-              <span className="ml-2 rounded bg-blue-100 px-1.5 py-0.5 text-xs text-blue-700">多付 ¥{Math.abs(balance).toLocaleString()}</span>
-            ) : (
-              <span className="ml-2 rounded bg-amber-100 px-1.5 py-0.5 text-xs text-amber-700">应收 ¥{balance.toLocaleString()}</span>
-            )}
+            <span className="ml-2">
+              <BalanceBadge balance={balance} settlementMode={agent?.settlementMode} />
+            </span>
           </span>
         </div>
+
+        {/* 代理 + 余额 + 结算方式 */}
+        {agent && (
+          <div className={`mt-2 rounded-md border p-2 text-xs ${isMonthly ? 'border-blue-200 bg-blue-50' : 'border-slate-200 bg-slate-50'}`}>
+            <div className="flex items-center justify-between">
+              <span className="text-slate-600">
+                代理 <b className="text-slate-800">{agent.companyName ?? agent.contactName}</b>
+              </span>
+              <span className={`rounded px-1.5 py-0.5 font-medium ${isMonthly ? 'bg-blue-100 text-blue-700' : 'bg-slate-200 text-slate-600'}`}>
+                {SETTLEMENT_MODE_LABEL[agent.settlementMode]}
+              </span>
+            </div>
+            <div className="mt-1 text-slate-600">
+              代理余额 <b className="text-emerald-700">¥{agentBalance.toLocaleString()}</b>
+            </div>
+          </div>
+        )}
+
+        {/* 月结挂账说明（月结代理尾款>0 不催款）*/}
+        {agent && isMonthly && balance > 0 && (
+          <div className="mt-2 rounded-md border border-blue-200 bg-blue-50 px-2 py-1.5 text-xs text-blue-700">
+            🗓 月结代理：尾款 ¥{balance.toLocaleString()} 计入月结挂账，月末统一对账，无需逐单催款。
+          </div>
+        )}
+
+        {/* 多付 → 存入代理余额 */}
+        {agent && overpaid && (
+          <div className="mt-2 flex items-center justify-between gap-2 rounded-md border border-blue-200 bg-blue-50 px-2 py-1.5 text-xs">
+            <span className="text-blue-700">多付 ¥{Math.abs(balance).toLocaleString()} 可存入代理余额</span>
+            <button
+              className="btn-secondary text-xs px-2 py-1 disabled:opacity-50"
+              onClick={creditOverpay}
+              disabled={submitting}
+            >
+              存入代理余额
+            </button>
+          </div>
+        )}
+
+        {/* 欠款 + 代理有余额 → 用代理余额抵 */}
+        {agent && balance > 0 && agentBalance > 0 && (
+          <ApplyAgentBalanceRow
+            balance={balance}
+            agentBalance={agentBalance}
+            submitting={submitting}
+            onApply={applyBalance}
+          />
+        )}
 
         {/* 已记录收款 */}
         {payments.length > 0 && (
@@ -2523,6 +2618,48 @@ function ConfirmPaymentSection({
         </div>
       </div>
     </section>
+  );
+}
+
+// 用代理余额抵尾款：金额默认 = min(尾款, 代理余额)，可改；提交受后端 ≤尾款 且 ≤余额 守门。
+function ApplyAgentBalanceRow({
+  balance,
+  agentBalance,
+  submitting,
+  onApply,
+}: {
+  balance: number;
+  agentBalance: number;
+  submitting: boolean;
+  onApply: (amount: number) => void | Promise<void>;
+}) {
+  const max = Math.round(Math.min(balance, agentBalance) * 100) / 100;
+  const [amount, setAmount] = useState<number | null>(max);
+  const amt = amount ?? 0;
+  const valid = amt > 0 && amt <= max;
+
+  return (
+    <div className="mt-2 rounded-md border border-emerald-200 bg-emerald-50 px-2 py-2 text-xs">
+      <div className="text-emerald-800">用代理余额抵尾款（最多 ¥{max.toLocaleString()}）</div>
+      <div className="mt-1.5 flex items-center gap-2">
+        <NumberInput
+          step={0.01}
+          min={0}
+          max={max}
+          className="block w-28 rounded-md border border-slate-300 px-2 py-1 text-sm"
+          value={amount}
+          onChange={(n) => setAmount(n)}
+          placeholder={`默认 ¥${max}`}
+        />
+        <button
+          className="btn-primary text-xs px-2 py-1 disabled:opacity-50"
+          onClick={() => onApply(amt)}
+          disabled={submitting || !valid}
+        >
+          用代理余额抵
+        </button>
+      </div>
+    </div>
   );
 }
 

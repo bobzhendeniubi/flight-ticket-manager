@@ -271,6 +271,18 @@ export interface CreateOrderInput extends OrderStructuredNotes {
   agentId?: string;
 }
 
+/**
+ * 结算方式：
+ * - PER_ORDER 逐单到账：每笔订单单独收尾款（默认）。
+ * - MONTHLY 月结：订单尾款挂账，月末统一对账，不逐单催款。
+ */
+export type SettlementMode = 'PER_ORDER' | 'MONTHLY';
+
+export const SETTLEMENT_MODE_LABEL: Record<SettlementMode, string> = {
+  PER_ORDER: '逐单到账',
+  MONTHLY: '月结',
+};
+
 export interface AgentListItem {
   id: string;
   userId: string;
@@ -281,6 +293,8 @@ export interface AgentListItem {
   contactName: string;
   contactPhone: string;
   prepaymentBalance: string;
+  /** 结算方式（逐单到账 / 月结）；后端默认 PER_ORDER */
+  settlementMode: SettlementMode;
   isActive: boolean;
   notes: string | null;
   email: string | null;
@@ -439,7 +453,13 @@ export interface OrderSummary {
   updatedAt: string;
   items: OrderItem[];
   passengers: OrderPassenger[];
-  agent: { id: string; companyName: string | null; contactName: string } | null;
+  agent: {
+    id: string;
+    companyName: string | null;
+    contactName: string;
+    settlementMode: SettlementMode;
+    prepaymentBalance: string;
+  } | null;
   user: { id: string; displayName: string | null; email: string | null };
 
   // 新增字段（5/20 反馈）
@@ -976,6 +996,13 @@ export const api = {
       parentId ? `/agents/children?parentId=${encodeURIComponent(parentId)}` : '/agents/children',
       { method: 'POST', token, body },
     ),
+  // 改代理结算方式（逐单到账 / 月结）；ADMIN only
+  setAgentSettlementMode: (token: string, id: string, settlementMode: SettlementMode) =>
+    apiFetch<{ agent: AgentListItem }>(`/agents/${id}/settlement-mode`, {
+      method: 'PATCH',
+      token,
+      body: { settlementMode },
+    }),
 
   // Orders
   listOrders: (token: string, query?: ListOrdersParams) => {
@@ -1122,6 +1149,20 @@ export const api = {
     if (!res.ok) throw new ApiError(res.status, { code: 'EXPORT_FAILED', message: await res.text() });
     return res.blob();
   },
+  // 把订单多付（paidAmount−total）转入其代理预存余额；订单回到刚好结清。ADMIN/STAFF
+  creditOverpayToAgent: (token: string, orderId: string) =>
+    apiFetch<{ order: OrderSummary }>(`/orders/${orderId}/credit-overpay-to-agent`, {
+      method: 'POST',
+      token,
+      body: {},
+    }),
+  // 用代理预存余额抵订单尾款；覆盖则翻 PAID。amount ≤ 尾款 且 ≤ 代理余额。ADMIN/STAFF
+  applyAgentBalance: (token: string, orderId: string, amount: number) =>
+    apiFetch<{ order: OrderSummary }>(`/orders/${orderId}/apply-agent-balance`, {
+      method: 'POST',
+      token,
+      body: { amount },
+    }),
   // 认领订单（防漏单）
   claimOrder: (token: string, orderId: string) =>
     apiFetch<{ ok: boolean; claimedBy: { id: string; displayName: string | null; email: string | null } }>(

@@ -1,7 +1,8 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { UserRole } from '@prisma/client';
 import { AgentService } from './agents.service.js';
-import { createChildAgentBodySchema } from './agents.schemas.js';
+import { createChildAgentBodySchema, setSettlementModeBodySchema } from './agents.schemas.js';
+import { actorFromRequest, writeAudit } from '../../lib/audit.js';
 
 export const agentRoutes: FastifyPluginAsync = async (app) => {
   const service = new AgentService();
@@ -42,6 +43,29 @@ export const agentRoutes: FastifyPluginAsync = async (app) => {
         body,
       });
       return reply.status(201).send(result);
+    },
+  );
+
+  // 设置代理结算模式（PER_ORDER 逐单到账 / MONTHLY 月结挂账）。仅 ADMIN。
+  // PATCH /agents/:id/settlement-mode  body: { settlementMode }
+  app.patch(
+    '/:id/settlement-mode',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN)] },
+    async (req) => {
+      const { id } = req.params as { id: string };
+      const body = setSettlementModeBodySchema.parse(req.body);
+      const result = await service.setSettlementMode(id, body.settlementMode, req.user.role);
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'SET_AGENT_SETTLEMENT_MODE',
+        targetType: 'AGENT',
+        targetId: id,
+        targetLabel: result.contactName,
+        before: { settlementMode: result.previousMode },
+        after: { settlementMode: result.settlementMode },
+        severity: 'WARNING',
+      });
+      return result;
     },
   );
 };

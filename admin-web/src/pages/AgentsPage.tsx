@@ -2,7 +2,7 @@
  * 代理管理 — 支持树形/表格切换、多维过滤、佣金设置、创建散客。
  */
 import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
-import { api, ApiError, type AgentListItem, type CreateChildAgentInput } from '../lib/api';
+import { api, ApiError, SETTLEMENT_MODE_LABEL, type AgentListItem, type CreateChildAgentInput, type SettlementMode } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { NumberInput } from '../components/NumberInput';
 
@@ -272,7 +272,17 @@ export function AgentsPage() {
       )}
 
       {/* 代理详情抽屉 */}
-      {selected && <AgentDetailDrawer agent={selected} onClose={() => setSelected(null)} />}
+      {selected && (
+        <AgentDetailDrawer
+          agent={selected}
+          isAdmin={isAdmin}
+          onClose={() => setSelected(null)}
+          onChanged={async (updated) => {
+            setSelected(updated);
+            await reload();
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -324,6 +334,11 @@ function AgentTableView({
                     {a.contactName}
                     {a.parent && <span className="ml-2 text-ink-muted">↑ {a.parent.companyName ?? a.parent.contactName}</span>}
                   </div>
+                  <div className="mt-0.5">
+                    <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${a.settlementMode === 'MONTHLY' ? 'bg-blue-100 text-blue-700' : 'bg-slate-100 text-slate-500'}`}>
+                      {SETTLEMENT_MODE_LABEL[a.settlementMode]}
+                    </span>
+                  </div>
                 </td>
                 <td className="text-xs">
                   <div>{a.contactPhone}</div>
@@ -373,7 +388,17 @@ function AgentTableView({
 // ═══════════════════════════════════════════════════════════════
 // 代理详情抽屉（点名字展开看）
 // ═══════════════════════════════════════════════════════════════
-function AgentDetailDrawer({ agent, onClose }: { agent: AgentListItem; onClose: () => void }) {
+function AgentDetailDrawer({
+  agent,
+  isAdmin,
+  onClose,
+  onChanged,
+}: {
+  agent: AgentListItem;
+  isAdmin: boolean;
+  onClose: () => void;
+  onChanged: (updated: AgentListItem) => void | Promise<void>;
+}) {
   const [tab, setTab] = useState<'info' | 'commission' | 'balance' | 'customers'>('info');
 
   return (
@@ -410,7 +435,7 @@ function AgentDetailDrawer({ agent, onClose }: { agent: AgentListItem; onClose: 
           </nav>
         </div>
         <div className="px-6 py-5 space-y-4">
-          {tab === 'info' && <InfoTab agent={agent} />}
+          {tab === 'info' && <InfoTab agent={agent} isAdmin={isAdmin} onChanged={onChanged} />}
           {tab === 'commission' && <CommissionTab agent={agent} />}
           {tab === 'balance' && <BalanceTab agent={agent} />}
           {tab === 'customers' && <CustomersTab agent={agent} />}
@@ -420,22 +445,96 @@ function AgentDetailDrawer({ agent, onClose }: { agent: AgentListItem; onClose: 
   );
 }
 
-function InfoTab({ agent }: { agent: AgentListItem }) {
+function InfoTab({
+  agent,
+  isAdmin,
+  onChanged,
+}: {
+  agent: AgentListItem;
+  isAdmin: boolean;
+  onChanged: (updated: AgentListItem) => void | Promise<void>;
+}) {
   return (
-    <dl className="space-y-2 text-sm">
-      <Row label="公司名" value={agent.companyName ?? '—'} />
-      <Row label="联系人" value={agent.contactName} />
-      <Row label="电话" value={agent.contactPhone} />
-      <Row label="邮箱" value={agent.email ?? '—'} />
-      <Row label="层级" value={TIER_LABEL[agent.tier]} />
-      <Row label="上级" value={agent.parent ? (agent.parent.companyName ?? agent.parent.contactName) : '无（顶级）'} />
-      <Row label="下级数" value={agent.childCount.toString()} />
-      <Row label="订单数" value={agent.orderCount.toString()} />
-      <Row label="状态" value={agent.isActive ? '✅ 在用' : '⏸ 停用'} />
-      <Row label="注册时间" value={new Date(agent.createdAt).toLocaleString('zh-CN')} />
-      <Row label="上次登录" value={agent.lastLoginAt ? new Date(agent.lastLoginAt).toLocaleString('zh-CN') : '从未登录'} />
-      {agent.notes && <Row label="备注" value={agent.notes} />}
-    </dl>
+    <div className="space-y-4">
+      <SettlementModeCard agent={agent} isAdmin={isAdmin} onChanged={onChanged} />
+      <dl className="space-y-2 text-sm">
+        <Row label="公司名" value={agent.companyName ?? '—'} />
+        <Row label="联系人" value={agent.contactName} />
+        <Row label="电话" value={agent.contactPhone} />
+        <Row label="邮箱" value={agent.email ?? '—'} />
+        <Row label="层级" value={TIER_LABEL[agent.tier]} />
+        <Row label="预存余额" value={<span className="font-semibold text-emerald-700">¥{Number(agent.prepaymentBalance).toLocaleString()}</span>} />
+        <Row label="上级" value={agent.parent ? (agent.parent.companyName ?? agent.parent.contactName) : '无（顶级）'} />
+        <Row label="下级数" value={agent.childCount.toString()} />
+        <Row label="订单数" value={agent.orderCount.toString()} />
+        <Row label="状态" value={agent.isActive ? '✅ 在用' : '⏸ 停用'} />
+        <Row label="注册时间" value={new Date(agent.createdAt).toLocaleString('zh-CN')} />
+        <Row label="上次登录" value={agent.lastLoginAt ? new Date(agent.lastLoginAt).toLocaleString('zh-CN') : '从未登录'} />
+        {agent.notes && <Row label="备注" value={agent.notes} />}
+      </dl>
+    </div>
+  );
+}
+
+// 结算方式卡片：展示 逐单到账 / 月结；ADMIN 可切换（调 setAgentSettlementMode）。
+function SettlementModeCard({
+  agent,
+  isAdmin,
+  onChanged,
+}: {
+  agent: AgentListItem;
+  isAdmin: boolean;
+  onChanged: (updated: AgentListItem) => void | Promise<void>;
+}) {
+  const tokens = useAuth((s) => s.tokens);
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const isMonthly = agent.settlementMode === 'MONTHLY';
+
+  const change = async (next: SettlementMode) => {
+    if (!tokens || next === agent.settlementMode || saving) return;
+    setSaving(true);
+    setErr(null);
+    try {
+      const res = await api.setAgentSettlementMode(tokens.accessToken, agent.id, next);
+      await onChanged(res.agent);
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : '修改结算方式失败');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className={`rounded-md border p-3 ${isMonthly ? 'border-blue-200 bg-blue-50' : 'border-slate-200 bg-slate-50'}`}>
+      <div className="flex items-center justify-between">
+        <div>
+          <div className="text-xs text-slate-500">结算方式</div>
+          <div className={`mt-0.5 text-sm font-semibold ${isMonthly ? 'text-blue-700' : 'text-slate-700'}`}>
+            {isMonthly ? '🗓 月结' : '💳 逐单到账'}
+          </div>
+        </div>
+        {isAdmin ? (
+          <select
+            className="input text-sm w-32"
+            value={agent.settlementMode}
+            disabled={saving}
+            onChange={(e) => change(e.target.value as SettlementMode)}
+          >
+            <option value="PER_ORDER">{SETTLEMENT_MODE_LABEL.PER_ORDER}</option>
+            <option value="MONTHLY">{SETTLEMENT_MODE_LABEL.MONTHLY}</option>
+          </select>
+        ) : (
+          <span className={`rounded px-2 py-0.5 text-xs font-medium ${isMonthly ? 'bg-blue-100 text-blue-700' : 'bg-slate-200 text-slate-600'}`}>
+            {SETTLEMENT_MODE_LABEL[agent.settlementMode]}
+          </span>
+        )}
+      </div>
+      <p className="mt-1.5 text-[11px] text-slate-500">
+        {isMonthly ? '订单尾款挂账，月末统一对账，不逐单催款。' : '每笔订单单独收尾款。'}
+      </p>
+      {err && <div className="mt-2 rounded bg-rose-50 px-2 py-1 text-xs text-rose-700">{err}</div>}
+    </div>
   );
 }
 

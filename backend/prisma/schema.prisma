@@ -195,20 +195,28 @@ model AuditLog {
 // Agents
 // ─────────────────────────────────────────────────────────────────────────────
 
+// 代理结算模式：逐单到账（每张订单都要见到钱才算清）/ 月结挂账（月底统一对账，单张订单不催款）
+enum SettlementMode {
+  PER_ORDER // 逐单到账
+  MONTHLY // 月结挂账
+}
+
 model Agent {
-  id                String   @id @default(cuid())
-  userId            String   @unique
+  id                String         @id @default(cuid())
+  userId            String         @unique
   companyName       String?
   contactName       String
   contactPhone      String
-  prepaymentBalance Decimal  @default(0) @db.Decimal(14, 2) // CNY, can be negative only by admin override
-  isActive          Boolean  @default(true)
+  prepaymentBalance Decimal        @default(0) @db.Decimal(14, 2) // CNY, can be negative only by admin override
+  // 结算模式：PER_ORDER（默认，逐单见钱）/ MONTHLY（月结代理，单张订单挂账不催款，月底统一对账）
+  settlementMode    SettlementMode @default(PER_ORDER)
+  isActive          Boolean        @default(true)
   notes             String?
   // 代理层级 — 1 级代理 parentAgentId = null；上级创建下级时 tier = parent.tier + 1
   parentAgentId     String?
-  tier              Int      @default(1)
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
+  tier              Int            @default(1)
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
 
   user                   User                    @relation(fields: [userId], references: [id], onDelete: Cascade)
   parentAgent            Agent?                  @relation("AgentHierarchy", fields: [parentAgentId], references: [id])

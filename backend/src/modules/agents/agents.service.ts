@@ -1,4 +1,4 @@
-import { Prisma, UserRole } from '@prisma/client';
+import { Prisma, SettlementMode, UserRole } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { hashPassword } from '../../lib/password.js';
 import { ConflictError, ForbiddenError, NotFoundError } from '../../lib/errors.js';
@@ -64,6 +64,7 @@ export class AgentService {
       contactName: a.contactName,
       contactPhone: a.contactPhone,
       prepaymentBalance: a.prepaymentBalance.toString(),
+      settlementMode: a.settlementMode,
       isActive: a.isActive,
       notes: a.notes,
       email: a.user.email,
@@ -149,5 +150,42 @@ export class AgentService {
 
       return { user: { id: user.id, email: user.email, displayName: user.displayName }, agent };
     });
+  }
+
+  /**
+   * 设置代理结算模式（PER_ORDER 逐单到账 / MONTHLY 月结挂账）。仅 ADMIN。
+   * 返回前后值供审计；只改模式标记，不动余额/订单（前端据此把月结代理的订单显示成「月结」）。
+   */
+  async setSettlementMode(
+    agentId: string,
+    mode: SettlementMode,
+    currentRole: UserRole,
+  ): Promise<{
+    id: string;
+    settlementMode: SettlementMode;
+    previousMode: SettlementMode;
+    contactName: string;
+  }> {
+    if (currentRole !== UserRole.ADMIN) {
+      throw new ForbiddenError('仅管理员可设置代理结算模式');
+    }
+    const agent = await prisma.agent.findUnique({
+      where: { id: agentId },
+      select: { id: true, settlementMode: true, contactName: true },
+    });
+    if (!agent) throw new NotFoundError('代理不存在');
+
+    const updated = await prisma.agent.update({
+      where: { id: agentId },
+      data: { settlementMode: mode },
+      select: { id: true, settlementMode: true, contactName: true },
+    });
+
+    return {
+      id: updated.id,
+      settlementMode: updated.settlementMode,
+      previousMode: agent.settlementMode,
+      contactName: updated.contactName,
+    };
   }
 }
