@@ -1642,36 +1642,82 @@ export class OrderService {
     }
 
     if (isReleasing && wasHolding && order.status !== 'PENDING_PAYMENT') {
-      // 退款/取消时整单冲销佣金（保证会计恒等：座位退了，佣金不能继续欠代理）。
+      // 退款/取消时按比例冲销佣金（保证会计恒等：座位退了，已退的那部分佣金不能继续欠代理）。
+      //
+      // 冲销口径（按实退金额比例，分 ProductKind）：
+      //   - 仅在「批准退款」(REFUNDED) 时按比例冲销：读本次推进的 Refund 快照
+      //     gatewayPayload.quoteSnapshot.items[]，按 productKind 聚合
+      //     refundRatio = Σ退款额 / Σ(退款额+退改费)（= Σ退款额 / Σ该类已付金额），
+      //     clamp 到 [0,1]。平台留存的退改费对应的那部分佣金保留（不冲销）。
+      //   - 其余「释放型」流转（CANCELLED / PAYMENT_TIMEOUT / FAILED）以及无法解析快照的
+      //     旧退款 → 整单全额冲销（ratio=1，旧行为不变，绝不少冲）。
       //
       // 两类记录分别处理，以免破坏「已结算快照」：
-      //   - ACCRUED（尚未进结算单）：直接置 REVERSED（旧行为，期内净额自然归零）。
+      //   - ACCRUED（尚未进结算单）：
+      //       · 全额（ratio>=1）→ 直接置 REVERSED（旧行为，期内净额自然归零）。
+      //       · 部分（0<ratio<1）→ 原 ACCRUED 保留全额 + 新建一条「负数补偿记录」
+      //         （amount/baseAmount 取负 × ratio、REVERSED、settlementId=null）；
+      //         结算时 earned(+全额) 与补偿(−比例额) 相抵，净 = 原额 ×(1−ratio)，
+      //         留存退改费对应的佣金可见可对账。
       //   - SETTLED（代理已在某张结算单里被结过账）：历史快照是冻结的，绝不回改；
-      //     改为新建一条「负数补偿记录」（amount/baseAmount 取负、status=REVERSED、
+      //     新建一条「负数补偿记录」（amount/baseAmount = −原额 × ratio、REVERSED、
       //     settlementId=null），让下一期结算把这笔负数净掉（跨期反冲），既追回多付
       //     又不污染上一张已支付结算单。负数 + REVERSED + settlementId=null 即是
       //     补偿记录的自识别标志（schema 无 note/source 列，故不另加列）。
-      //
-      // 口径说明：此处为「整单全额冲销」。部分退款 / 留存退改费时按比例冲销多少佣金
-      // 属业务政策（按退款额比例 vs 按费档 vs 全额），待财务确认口径后再实现；
-      // 当前不做猜测式按比例冲销。
-      await tx.commissionRecord.updateMany({
-        where: { orderId: order.id, status: CommissionStatus.ACCRUED },
-        data: { status: CommissionStatus.REVERSED },
+      const refundRatioByKind = await this._computeRefundRatioByKind(tx, id, toStatus);
+
+      const liveRecords = await tx.commissionRecord.findMany({
+        where: {
+          orderId: order.id,
+          status: { in: [CommissionStatus.ACCRUED, CommissionStatus.SETTLED] },
+        },
       });
 
-      const settledRecords = await tx.commissionRecord.findMany({
-        where: { orderId: order.id, status: CommissionStatus.SETTLED },
-      });
-      for (const rec of settledRecords) {
+      for (const rec of liveRecords) {
+        const ratio = refundRatioByKind.get(rec.productKind) ?? 0;
+        if (ratio <= 0) continue; // 该 ProductKind 未退（快照里没有）→ 不冲销
+
+        if (ratio >= 1) {
+          if (rec.status === CommissionStatus.ACCRUED) {
+            // 全额 + 尚未结算 → 翻状态（旧行为，最省记录）
+            await tx.commissionRecord.update({
+              where: { id: rec.id },
+              data: { status: CommissionStatus.REVERSED },
+            });
+            continue;
+          }
+          // 全额 + 已结算 → 负数补偿记录（M1-A 跨期反冲，整额）
+          await tx.commissionRecord.create({
+            data: {
+              agentId: rec.agentId,
+              orderId: rec.orderId,
+              productKind: rec.productKind,
+              baseAmount: rec.baseAmount.negated(),
+              rate: rec.rate,
+              amount: rec.amount.negated(),
+              chainDepth: rec.chainDepth,
+              status: CommissionStatus.REVERSED,
+              settlementId: null,
+            },
+          });
+          continue;
+        }
+
+        // 0 < ratio < 1 → 按比例：负数补偿记录（ACCRUED 与 SETTLED 同样处理；
+        // ACCRUED 原记录保留全额，靠补偿记录净掉退款部分，留存退改费佣金不动）。
+        const ratioDec = new Prisma.Decimal(ratio);
+        const clawBase = round2Decimal(rec.baseAmount.mul(ratioDec));
+        const clawAmount = round2Decimal(rec.amount.mul(ratioDec));
+        if (clawAmount.lessThanOrEqualTo(0)) continue; // 防御：四舍五入后无金额可冲
+
         await tx.commissionRecord.create({
           data: {
             agentId: rec.agentId,
             orderId: rec.orderId,
             productKind: rec.productKind,
-            baseAmount: rec.baseAmount.negated(),
+            baseAmount: clawBase.negated(),
             rate: rec.rate,
-            amount: rec.amount.negated(),
+            amount: clawAmount.negated(),
             chainDepth: rec.chainDepth,
             status: CommissionStatus.REVERSED,
             settlementId: null,
@@ -1709,6 +1755,89 @@ export class OrderService {
         user: { select: { id: true, displayName: true, email: true } },
       },
     });
+  }
+
+  /**
+   * 计算「本次释放型流转应冲销多少佣金」的比例（按 ProductKind）。
+   *
+   * 规则：
+   *   - 非 REFUNDED（CANCELLED / PAYMENT_TIMEOUT / FAILED 等）→ 整单全额冲销：
+   *     所有 ProductKind 一律返回 ratio=1（取消语义不变，不按比例）。
+   *   - REFUNDED（批准退款）→ 按「实退金额」比例分类冲销：
+   *     读本次被推进的 Refund（status=REQUESTED，下一步会被翻 COMPLETED）的
+   *     gatewayPayload.quoteSnapshot.items[]，按 item.kind 聚合
+   *       refundedByKind = Σ refundAmount
+   *       revenueByKind  = Σ (refundAmount + feeAmount)   // = 该类已付金额
+   *       ratio[kind]    = clamp(refundedByKind / revenueByKind, 0, 1)
+   *     未出现在快照里的 ProductKind → Map 无键 → 调用方按 0 处理（不冲销）。
+   *   - 无可解析快照（旧退款 / 脏数据）→ 退回整单全额冲销（所有键缺失但返回哨兵：
+   *     这里用 fullReversalAllKinds=true 表示"对任何 kind 都 ratio=1"，绝不少冲）。
+   *
+   * 返回一个 Map<ProductKind, number>；为简化调用方，缺省键即 0。
+   * 当需要"对所有 kind 都全额冲销"时，预填全部 4 个 ProductKind 为 1。
+   */
+  private async _computeRefundRatioByKind(
+    tx: Prisma.TransactionClient,
+    orderId: string,
+    toStatus: OrderStatus,
+  ): Promise<Map<ProductKind, number>> {
+    const ALL_PRODUCT_KINDS: ProductKind[] = [
+      ProductKind.FLIGHT,
+      ProductKind.HOTEL,
+      ProductKind.TRANSFER,
+      ProductKind.VISA,
+    ];
+    const fullReversal = (): Map<ProductKind, number> =>
+      new Map(ALL_PRODUCT_KINDS.map((k) => [k, 1] as const));
+
+    // 非批准退款的释放（取消 / 超时 / 失败）→ 整单全额冲销，语义不变。
+    if (toStatus !== 'REFUNDED') return fullReversal();
+
+    // 读本次推进的 Refund（与下方 Refund 状态同步同一批：status=REQUESTED）。
+    const pendingRefunds = await tx.refund.findMany({
+      where: { orderId, status: 'REQUESTED' },
+      select: { gatewayPayload: true },
+    });
+
+    const refundedByKind = new Map<string, number>();
+    const revenueByKind = new Map<string, number>();
+    let parsedAnyItem = false;
+
+    for (const r of pendingRefunds) {
+      // gatewayPayload 是未知 JSON —— 防御式解析，任何不符合预期的形状都跳过。
+      const payload = r.gatewayPayload;
+      if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) continue;
+      const snapshot = (payload as Record<string, unknown>).quoteSnapshot;
+      if (snapshot === null || typeof snapshot !== 'object' || Array.isArray(snapshot)) continue;
+      const items = (snapshot as Record<string, unknown>).items;
+      if (!Array.isArray(items)) continue;
+
+      for (const raw of items) {
+        if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) continue;
+        const it = raw as Record<string, unknown>;
+        const kind = typeof it.kind === 'string' ? it.kind : null;
+        const feeAmount = Number(it.feeAmount);
+        const refundAmount = Number(it.refundAmount);
+        if (!kind || !Number.isFinite(feeAmount) || !Number.isFinite(refundAmount)) continue;
+        parsedAnyItem = true;
+        refundedByKind.set(kind, (refundedByKind.get(kind) ?? 0) + refundAmount);
+        revenueByKind.set(kind, (revenueByKind.get(kind) ?? 0) + refundAmount + feeAmount);
+      }
+    }
+
+    // 无任何可解析快照项（旧退款 / 脏数据）→ 退回整单全额冲销，绝不少冲。
+    if (!parsedAnyItem) return fullReversal();
+
+    const ratioByKind = new Map<ProductKind, number>();
+    for (const kindStr of revenueByKind.keys()) {
+      // 只接受合法 ProductKind 字符串；其他（如 BUNDLE / INSURANCE）无佣金记录，忽略。
+      if (!ALL_PRODUCT_KINDS.includes(kindStr as ProductKind)) continue;
+      const revenue = revenueByKind.get(kindStr) ?? 0;
+      const refunded = refundedByKind.get(kindStr) ?? 0;
+      const ratio = revenue > 0 ? Math.min(1, Math.max(0, refunded / revenue)) : 0;
+      ratioByKind.set(kindStr as ProductKind, ratio);
+    }
+    return ratioByKind;
   }
 
   // ════════════════════════════════════════════════════════════════════
@@ -2837,6 +2966,12 @@ interface OrderLike {
 /** 金额保留 2 位小数（CNY，避免浮点累计误差）。 */
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
+}
+
+// 用 Prisma.Decimal 做钱算术（避免 float 漂移），结果四舍五入到 2 位小数。
+// ROUND_HALF_UP 与文件其余处（round2 的 Math.round）一致。
+function round2Decimal(d: Prisma.Decimal): Prisma.Decimal {
+  return d.toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP);
 }
 
 function serializeOrder<T extends OrderLike>(order: T) {

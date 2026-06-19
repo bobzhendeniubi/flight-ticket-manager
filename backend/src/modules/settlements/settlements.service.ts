@@ -215,13 +215,13 @@ export class SettlementService {
       select: { id: true, amount: true, orderId: true },
     });
     // reversalAmount = 本期应从净佣金里冲回的总额，恒为非正数（≤0）。
-    //   负数补偿记录（amount<0）：直接累加。
-    //   被翻状态的 ACCRUED（amount>0）：取相反数冲掉（它原本被计入过/会计入 earned 口径）。
-    const reversalAmount = reversalRecords.reduce(
-      (s, r) => s + -Math.abs(Number(r.amount)),
-      0,
-    );
-    const reversalCount = reversalRecords.length;
+    // 只累加「负数补偿记录」（amount<0）—— 它们代表对【已计入/已结算】佣金的真实追回
+    // （部分退款的按比例冲销，或跨「已结算」边界的整额反冲）。
+    // 同期被翻状态的 ACCRUED→REVERSED 记录（amount>0）【绝不在此扣减】：它们已因状态≠ACCRUED
+    // 被排除在 commissionEarned 之外；若再取相反数减一次会【重复冲销】、误伤同期其他订单的佣金。
+    const negativeReversals = reversalRecords.filter((r) => Number(r.amount) < 0);
+    const reversalAmount = negativeReversals.reduce((s, r) => s + Number(r.amount), 0);
+    const reversalCount = negativeReversals.length;
 
     const recordIds = [
       ...earnedRecords.map((r) => r.id),
@@ -504,8 +504,9 @@ function summarizeReversals(
   commissions: Array<{ status: string; amount: Prisma.Decimal }> | undefined,
 ): ReversalSummary {
   if (!commissions) return { reversalCount: 0, reversalAmount: '0' };
-  const reversed = commissions.filter((c) => c.status === 'REVERSED');
-  const total = reversed.reduce((sum, c) => sum + -Math.abs(Number(c.amount)), 0);
+  // 只统计「负数补偿记录」（真实追回）；同期翻状态的正数 REVERSED 不计入（与 computeSettlement 口径一致）。
+  const reversed = commissions.filter((c) => c.status === 'REVERSED' && Number(c.amount) < 0);
+  const total = reversed.reduce((sum, c) => sum + Number(c.amount), 0);
   return { reversalCount: reversed.length, reversalAmount: round2(total).toString() };
 }
 

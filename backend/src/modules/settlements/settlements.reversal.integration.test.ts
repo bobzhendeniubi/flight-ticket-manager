@@ -217,11 +217,12 @@ describe('结算佣金冲销 · 结算前取消（保留旧行为）', () => {
     expect(after[0].status).toBe(CommissionStatus.REVERSED);
     expect(after[0].settlementId).toBeNull();
 
-    // 生成结算：该 REVERSED 是同期翻状态的（amount 仍为正 50），computeSettlement 取相反数净掉
+    // 生成结算：该 REVERSED 是同期翻状态的（amount 正 50）→ 已因状态≠ACCRUED 被排除在 earned 之外，
+    // 不再二次扣减（否则会重复冲销、误伤同期其他订单）。本单同期取消既不计佣金也不倒欠：net = 0。
     const gen = await settlementService.generate({ period, agentId: agent.id, overwrite: false }, ADMIN);
     const s = await prisma.settlement.findUniqueOrThrow({ where: { id: gen.generated[0].settlementId } });
     expect(Number(s.commissionEarned)).toBe(0); // 已 REVERSED，无 ACCRUED
-    expect(Number(s.netCommission)).toBe(-50); // 0 + (-50)
+    expect(Number(s.netCommission)).toBe(0); // 同期翻状态不重复扣减
   });
 });
 
@@ -267,5 +268,100 @@ describe('serializeSettlement · 暴露退款冲销摘要', () => {
     expect(row).toBeDefined();
     expect(row?.reversalCount).toBe(1);
     expect(Number(row?.reversalAmount)).toBe(-50);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+describe('结算佣金冲销 · 同期其他订单不被误伤（修双重扣减）', () => {
+  it('A 同期取消 + B 未退 ⇒ B 的佣金保留，net = 50（A 翻转记录不重复扣减）', async () => {
+    const ADMIN = await createAdminActor();
+    const agent = await createAgentWithRule(0.05);
+    const period = currentPeriod();
+    const orderA = await createPaidPendingOrder(agent.id, 1000); // 佣金 50
+    const orderB = await createPaidPendingOrder(agent.id, 1000); // 佣金 50
+    await orderService.updateStatus(orderA.id, OrderStatus.PAID, ADMIN);
+    await orderService.updateStatus(orderB.id, OrderStatus.PAID, ADMIN);
+
+    // A 同期取消：ACCRUED→REVERSED（amount 仍为正 50）
+    await orderService.updateStatus(orderA.id, OrderStatus.CANCELLED, ADMIN, '客户取消', true);
+
+    const gen = await settlementService.generate({ period, agentId: agent.id, overwrite: false }, ADMIN);
+    const s = await prisma.settlement.findUniqueOrThrow({ where: { id: gen.generated[0].settlementId } });
+    expect(Number(s.commissionEarned)).toBe(50); // 只 B（A 已 REVERSED 排除）
+    expect(Number(s.netCommission)).toBe(50); // 修复前会错成 0（A 的 +50 翻转记录被重复扣减）
+    expect(Number(s.payableToAgent)).toBe(50);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+describe('结算佣金冲销 · 部分退款按实退金额比例（M1-D）', () => {
+  // 造一条 REQUESTED Refund，带 quoteSnapshot（VISA 项按 feePercent 部分退款）。
+  async function craftPartialRefund(orderId: string, feePercent: number, paidTotal: number) {
+    const refundAmount = (paidTotal * (100 - feePercent)) / 100;
+    const feeAmount = paidTotal - refundAmount;
+    await prisma.refund.create({
+      data: {
+        orderId,
+        amount: new Prisma.Decimal(refundAmount),
+        status: 'REQUESTED',
+        gatewayPayload: {
+          quoteSnapshot: {
+            totalFee: feeAmount,
+            totalRefund: refundAmount,
+            items: [{ itemId: 'x', kind: 'VISA', feePercent, feeAmount, refundAmount }],
+          },
+        },
+      },
+    });
+  }
+
+  it('部分退款 60% · 结算后 ⇒ 负数补偿 = −60% 佣金（原 SETTLED 不动）', async () => {
+    const ADMIN = await createAdminActor();
+    const agent = await createAgentWithRule(0.05);
+    const order = await createPaidPendingOrder(agent.id, 1000); // 佣金 50
+    const period = currentPeriod();
+    await orderService.updateStatus(order.id, OrderStatus.PAID, ADMIN);
+
+    const gen = await settlementService.generate({ period, agentId: agent.id, overwrite: false }, ADMIN);
+    const sid = gen.generated[0].settlementId;
+    await settlementService.updateStatus(sid, SettlementStatus.PENDING_APPROVAL, ADMIN);
+    await settlementService.updateStatus(sid, SettlementStatus.APPROVED, ADMIN);
+    await settlementService.updateStatus(sid, SettlementStatus.PAID, ADMIN);
+
+    await craftPartialRefund(order.id, 40, 1000); // 退 60%、留 40% 手续费
+    await orderService.updateStatus(order.id, OrderStatus.REFUND_REQUESTED, ADMIN);
+    await orderService.updateStatus(order.id, OrderStatus.REFUNDED, ADMIN);
+
+    const comp = await prisma.commissionRecord.findMany({
+      where: { orderId: order.id, status: CommissionStatus.REVERSED },
+    });
+    expect(comp).toHaveLength(1);
+    expect(Number(comp[0].amount)).toBe(-30); // 50 × 0.6
+    expect(Number(comp[0].baseAmount)).toBe(-600); // 1000 × 0.6
+    expect(comp[0].settlementId).toBeNull();
+  });
+
+  it('部分退款 60% · 结算前 ⇒ 原 ACCRUED 保留 + 负数补偿 −30，net = 20', async () => {
+    const ADMIN = await createAdminActor();
+    const agent = await createAgentWithRule(0.05);
+    const order = await createPaidPendingOrder(agent.id, 1000); // 佣金 50
+    const period = currentPeriod();
+    await orderService.updateStatus(order.id, OrderStatus.PAID, ADMIN);
+
+    await craftPartialRefund(order.id, 40, 1000); // 退 60%
+    await orderService.updateStatus(order.id, OrderStatus.REFUND_REQUESTED, ADMIN);
+    await orderService.updateStatus(order.id, OrderStatus.REFUNDED, ADMIN);
+
+    const recs = await prisma.commissionRecord.findMany({ where: { orderId: order.id } });
+    expect(recs).toHaveLength(2);
+    const accruedRec = recs.find((r) => r.status === CommissionStatus.ACCRUED);
+    const compRec = recs.find((r) => r.status === CommissionStatus.REVERSED);
+    expect(Number(accruedRec?.amount)).toBe(50);
+    expect(Number(compRec?.amount)).toBe(-30);
+
+    const gen = await settlementService.generate({ period, agentId: agent.id, overwrite: false }, ADMIN);
+    const s = await prisma.settlement.findUniqueOrThrow({ where: { id: gen.generated[0].settlementId } });
+    expect(Number(s.commissionEarned)).toBe(50); // 原 ACCRUED 全额
+    expect(Number(s.netCommission)).toBe(20); // 50 + (−30)；留存 40% 手续费对应佣金
   });
 });
