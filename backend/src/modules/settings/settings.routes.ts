@@ -58,8 +58,17 @@ async function readPublicConfig() {
 
 const updateBodySchema = z.object({
   apiKey: z.string().optional(), // 空字符串视为"不更新"
-  baseUrl: z.string().url().optional(),
-  model: z.string().optional(),
+  // 宽容处理：trim；空/空白 → 不更新；缺 scheme 自动补 https://（用户常只粘主机名）
+  baseUrl: z.preprocess((v) => {
+    if (typeof v !== 'string') return v ?? undefined;
+    const s = v.trim();
+    if (s === '') return undefined;
+    return /^https?:\/\//i.test(s) ? s : `https://${s}`;
+  }, z.string().url().optional()),
+  model: z.preprocess(
+    (v) => (typeof v === 'string' ? (v.trim() === '' ? undefined : v.trim()) : v),
+    z.string().optional(),
+  ),
   enabled: z.boolean().optional(),
 });
 
