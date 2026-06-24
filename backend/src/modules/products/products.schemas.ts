@@ -170,14 +170,15 @@ export const createBundleBodySchema = z.object({
   hotelRoomTypeId: z.string().min(1).nullable().optional(),
   hotelNights: z.number().int().min(1).max(30).nullable().optional(),
   // 可选升级加价（CNY，按产品可配置）：单人入住房差/晚、升舱商务/航段。
-  // 整数 CNY；省略时用 DB 默认（单人入住 ¥80/晚、升舱 ¥700/程）。
-  singleSupplementCnyPerNight: z.number().int().nonnegative().max(1_000_000).optional(),
-  businessUpgradeCnyPerLeg: z.number().int().nonnegative().max(1_000_000).optional(),
-  // 占座儿童 / 不占座婴儿定价（CNY，按产品可配置；省略时用 DB 默认 30 / 0）：
+  // 整数 CNY；null / 省略时用 DB 默认（单人入住 ¥80/晚、升舱 ¥700/程）。
+  // nullable：前端"留空=用默认"会显式传 null；列本身非空有默认，服务层把 null 当省略处理。
+  singleSupplementCnyPerNight: z.number().int().nonnegative().max(1_000_000).nullable().optional(),
+  businessUpgradeCnyPerLeg: z.number().int().nonnegative().max(1_000_000).nullable().optional(),
+  // 占座儿童 / 不占座婴儿定价（CNY，按产品可配置；null / 省略时用 DB 默认 30 / 0）：
   //   childSeatDiscountCnyPerPerson = 占座儿童比成人每人便宜多少 CNY（机票按成人价减此折扣；不一定 30）
   //   infantPriceCny                = 不占座婴儿每人价 CNY（默认免费 0）
-  childSeatDiscountCnyPerPerson: z.number().int().nonnegative().max(1_000_000).optional(),
-  infantPriceCny: z.number().int().nonnegative().max(1_000_000).optional(),
+  childSeatDiscountCnyPerPerson: z.number().int().nonnegative().max(1_000_000).nullable().optional(),
+  infantPriceCny: z.number().int().nonnegative().max(1_000_000).nullable().optional(),
   // 机票航段数（来回 = 2，单程 = 1）
   legs: z.number().int().min(1).max(8).optional(),
   // 运营封盘日（按出发日 D）；该日整套餐不可售，优先级高于库存判定。省略 = 不改。

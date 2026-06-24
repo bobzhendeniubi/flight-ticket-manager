@@ -485,16 +485,18 @@ export class ProductsService {
       const derived = deriveHotelNightsFromItems(body.items);
       if (derived !== undefined) data.hotelNights = derived;
     }
-    if (body.singleSupplementCnyPerNight !== undefined) {
+    // 用 != null（排除 null 与 undefined）：列非空有默认，前端"留空=用默认"会传 null，
+    // 不能把 null 写进 Prisma（会报错）。null/省略一律视为"不改"，与 createBundle 的 != null 一致。
+    if (body.singleSupplementCnyPerNight != null) {
       data.singleSupplementCnyPerNight = body.singleSupplementCnyPerNight;
     }
-    if (body.businessUpgradeCnyPerLeg !== undefined) {
+    if (body.businessUpgradeCnyPerLeg != null) {
       data.businessUpgradeCnyPerLeg = body.businessUpgradeCnyPerLeg;
     }
-    if (body.childSeatDiscountCnyPerPerson !== undefined) {
+    if (body.childSeatDiscountCnyPerPerson != null) {
       data.childSeatDiscountCnyPerPerson = body.childSeatDiscountCnyPerPerson;
     }
-    if (body.infantPriceCny !== undefined) {
+    if (body.infantPriceCny != null) {
       data.infantPriceCny = body.infantPriceCny;
     }
     if (body.legs !== undefined) data.legs = body.legs;

@@ -290,3 +290,70 @@ describe('OrderService.updateItemSettlementPrice · 真 DB E2E', () => {
     ).rejects.toThrow();
   });
 });
+
+// ══════════════════════════════════════════════════════════════════════════
+// (d) 单笔录单 套餐：机票航段行 + 地面套餐行 → 扣机票座位（0624 #2 回归）
+//     后台单笔录单的套餐现在像前台一样拆成 FLIGHT 航段行 + 地面 BUNDLE 行；
+//     FLIGHT 行才会扣 FlightSeatClass.sold。此前只发一条 BUNDLE 行 → 座位不减。
+// ══════════════════════════════════════════════════════════════════════════
+describe('OrderService.createOrder · 套餐(机票航段 + 地面行) · 真 DB E2E', () => {
+  it('套餐订单含 FLIGHT 航段行 → 对应班次 sold + 占座人数；地面行仍盖酒店房型', async () => {
+    const requester = await staffRequester();
+    const outbound = await createSchedule({ capacity: 50, sold: 0 });
+    const { roomType, bundle } = await createBundleWithHotel({
+      defaultDepartDate: '2026-07-13',
+      hotelNights: 3,
+    });
+    const before = await soldEconomy(outbound.id);
+
+    // 与前台商城 / 后台 SingleOrderModal 同结构：机票航段行在前 + 地面套餐行在后。
+    const order = await service.createOrder(
+      {
+        contactName: '套餐录单测试',
+        contactPhone: '13800138000',
+        items: [
+          {
+            kind: 'FLIGHT',
+            description: `${bundle.name} · 去程（经济舱）`,
+            quantity: 2, // 占座人数 = 2 位成人
+            flightScheduleId: outbound.id,
+            flightCabin: CabinClass.ECONOMY,
+          },
+          {
+            kind: 'BUNDLE',
+            description: `${bundle.name} · 2成人`,
+            quantity: 1,
+            bundleId: bundle.id,
+            unitPrice: 0, // 服务端权威重算（仅地面部分）
+            adultCount: 2,
+            childCount: 0,
+            infantCount: 0,
+            singleCount: 0,
+            businessCount: 0,
+            // goDate 用于盖酒店入住章（createOrder 仅在有 goDate 时盖章）；模拟模态框默认填充。
+            metadata: { adultCount: 2, childCount: 0, infantCount: 0, goDate: '2026-07-13' },
+          },
+        ],
+        passengers: [passenger(41), passenger(42)],
+      },
+      requester,
+    );
+
+    // 核心回归点：去程班次 sold + 2（此前套餐订单完全不动 sold）
+    expect(await soldEconomy(outbound.id)).toBe(before + 2);
+
+    const created = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+      include: { items: true },
+    });
+    const flightItems = created.items.filter((it) => it.kind === OrderItemKind.FLIGHT);
+    expect(flightItems).toHaveLength(1);
+    expect(flightItems[0].flightScheduleId).toBe(outbound.id);
+    expect(flightItems[0].quantity).toBe(2);
+    // 地面套餐行仍盖酒店房型（房控计入），价格仅地面部分（机票走上面的 FLIGHT 行）
+    const bundleItem = created.items.find((it) => it.kind === OrderItemKind.BUNDLE);
+    expect(bundleItem).toBeTruthy();
+    expect(bundleItem!.hotelRoomTypeId).toBe(roomType.id);
+    expect(Number(bundleItem!.amount)).toBeGreaterThan(0);
+  });
+});

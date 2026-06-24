@@ -59,6 +59,12 @@ const PASSENGERS_REQUIRED: Record<ProductKind, boolean> = {
   TRANSFER: false,
 };
 
+// 护照图上限（一单）：每张存库 base64 约 0.7–1MB，后端单次请求上限 25MB，留足余量取 20。
+// 既在界面写明，也在「批量传护照 / 单张 OCR」两处强制；超出请分单录入。
+const MAX_PHOTO_PASSENGERS = 20;
+// 批量识别并发：一次最多同时打 3 张，避免 OCR 服务商按 key 限流（429）。
+const BULK_OCR_CONCURRENCY = 3;
+
 // ── 出行人行 ──────────────────────────────────────────────────────────
 interface PassengerRow {
   fullName: string;
@@ -145,6 +151,9 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
 
   // 每位乘客一个隐藏 file input（OCR）；用 index 区分
   const ocrInputRefs = useRef<Array<HTMLInputElement | null>>([]);
+  // 批量护照：一个多选 file input + 总进度（{done,total}；null = 未在跑）
+  const bulkOcrInputRef = useRef<HTMLInputElement | null>(null);
+  const [bulkOcr, setBulkOcr] = useState<{ done: number; total: number } | null>(null);
 
   // 幂等键：同一次提交（含双击/重试）只入账一次；成功后换新键
   const makeIdemKey = (): string =>
@@ -183,6 +192,14 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   // 单人入住（单房差）和商务舱升级，范围 0..(成人+儿童)
   const [singleCount, setSingleCount] = useState<number | null>(0);
   const [businessCount, setBusinessCount] = useState<number | null>(0);
+  // 套餐机票航段：去程必选（选了才扣对应航班座位 + 进票务待办），回程往返套餐填。
+  // 复用机票 tab 的 flights 列表；班次按各腿航班单独拉取。
+  const [bundleGoFlightId, setBundleGoFlightId] = useState('');
+  const [bundleGoScheduleId, setBundleGoScheduleId] = useState('');
+  const [bundleGoSchedules, setBundleGoSchedules] = useState<AdminSchedule[]>([]);
+  const [bundleRetFlightId, setBundleRetFlightId] = useState('');
+  const [bundleRetScheduleId, setBundleRetScheduleId] = useState('');
+  const [bundleRetSchedules, setBundleRetSchedules] = useState<AdminSchedule[]>([]);
 
   // ── 接送 ──
   const [transfers, setTransfers] = useState<Transfer[]>([]);
@@ -199,9 +216,9 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       .catch(() => undefined); // 无代理可选不致命
   }, [token]);
 
-  // 机票：航班列表（仅机票 tab 需要）
+  // 机票/套餐：航班列表（机票 tab 与套餐机票航段共用）
   useEffect(() => {
-    if (!token || kind !== 'FLIGHT' || flights.length > 0) return;
+    if (!token || (kind !== 'FLIGHT' && kind !== 'BUNDLE') || flights.length > 0) return;
     api.listAllFlights(token).then((r) => setFlights(r.flights)).catch(() => setErr('航班列表加载失败'));
   }, [token, kind, flights.length]);
 
@@ -214,6 +231,26 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     }
     api.listSchedules(token, flightId).then((r) => setSchedules(r.schedules)).catch(() => setErr('班次加载失败'));
   }, [token, flightId]);
+
+  // 套餐去程：选航班后拉班次
+  useEffect(() => {
+    if (!token || !bundleGoFlightId) {
+      setBundleGoSchedules([]);
+      setBundleGoScheduleId('');
+      return;
+    }
+    api.listSchedules(token, bundleGoFlightId).then((r) => setBundleGoSchedules(r.schedules)).catch(() => setErr('去程班次加载失败'));
+  }, [token, bundleGoFlightId]);
+
+  // 套餐回程：选航班后拉班次
+  useEffect(() => {
+    if (!token || !bundleRetFlightId) {
+      setBundleRetSchedules([]);
+      setBundleRetScheduleId('');
+      return;
+    }
+    api.listSchedules(token, bundleRetFlightId).then((r) => setBundleRetSchedules(r.schedules)).catch(() => setErr('回程班次加载失败'));
+  }, [token, bundleRetFlightId]);
 
   // 酒店列表
   useEffect(() => {
@@ -278,6 +315,65 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   }
 
   /**
+   * 批量护照：一次多选 → 逐张识别（一次跑 BULK_OCR_CONCURRENCY 张）→ 自动生成出行人行。
+   * 先复用前面的空白行，不够再追加。受 MAX_PHOTO_PASSENGERS 上限约束（超出截断 + 提示）。
+   */
+  async function handleBulkOcrFiles(fileList: FileList): Promise<void> {
+    if (bulkOcr) return; // 已在跑，忽略重复触发
+    const files = Array.from(fileList);
+    if (files.length === 0) return;
+
+    const withPhoto = passengers.filter((p) => p.passportPhotoUrl).length;
+    const slots = Math.max(0, MAX_PHOTO_PASSENGERS - withPhoto);
+    if (slots === 0) {
+      setErr(`护照图最多 ${MAX_PHOTO_PASSENGERS} 张/单，已达上限；更多请分单录入`);
+      return;
+    }
+    const accepted = files.slice(0, slots);
+    setErr(
+      accepted.length < files.length
+        ? `一单护照图上限 ${MAX_PHOTO_PASSENGERS} 张，本次已取前 ${accepted.length} 张，其余请分单录入`
+        : null,
+    );
+
+    // 目标行：先复用空白行（无姓名/护照号/照片），不够再追加新行。
+    const pristineIdx: number[] = [];
+    passengers.forEach((p, idx) => {
+      if (!p.fullName.trim() && !p.documentNumber.trim() && !p.passportPhotoUrl) pristineIdx.push(idx);
+    });
+    const targetIndices: number[] = [];
+    let appendCount = 0;
+    for (let k = 0; k < accepted.length; k++) {
+      if (k < pristineIdx.length) targetIndices.push(pristineIdx[k]);
+      else targetIndices.push(passengers.length + appendCount++);
+    }
+    if (appendCount > 0) {
+      setPassengers((prev) => [...prev, ...Array.from({ length: appendCount }, () => emptyPassenger())]);
+    }
+
+    // 并发池：最多 BULK_OCR_CONCURRENCY 个 worker 取任务，复用单张 handleOcrFile。
+    setBulkOcr({ done: 0, total: accepted.length });
+    let cursor = 0;
+    let done = 0;
+    const worker = async (): Promise<void> => {
+      while (cursor < accepted.length) {
+        const k = cursor++;
+        try {
+          await handleOcrFile(targetIndices[k], accepted[k]);
+        } catch {
+          /* 单张失败不阻断其余；handleOcrFile 内部已回退/容错 */
+        }
+        done++;
+        setBulkOcr({ done, total: accepted.length });
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(BULK_OCR_CONCURRENCY, accepted.length) }, () => worker()),
+    );
+    setBulkOcr(null);
+  }
+
+  /**
    * 护照 OCR：点按钮 → 触发隐藏 file input → 读取图片 → 识别 → 自动填表
    *
    * 策略：
@@ -291,6 +387,13 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
    * 图片压缩：存库图先缩到长边 ≤1600 + JPEG ≤~700KB，OCR 识别用原始 File。
    */
   async function handleOcrFile(idx: number, file: File): Promise<void> {
+    // 写死上限：一单护照图最多 MAX_PHOTO_PASSENGERS 张（受后端单次请求大小所限）。
+    // 仅在「该行原本没图」且已达上限时拦截（重新识别已有图不增加张数）。
+    const alreadyHasPhoto = Boolean(passengers[idx]?.passportPhotoUrl);
+    if (!alreadyHasPhoto && passengers.filter((p) => p.passportPhotoUrl).length >= MAX_PHOTO_PASSENGERS) {
+      setErr(`护照图最多 ${MAX_PHOTO_PASSENGERS} 张/单，已达上限；更多请分单录入`);
+      return;
+    }
     setPassenger(idx, { ocrPct: 0, ocrStage: '加载中…', ocrEngine: null, ocrModel: null });
 
     // ── 1. 存库图压缩 ──
@@ -381,7 +484,10 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   }
 
   /** 构建当前产品类型的订单行；缺字段返回 { error }。 */
-  function buildItem(): { item: CreateOrderItemInput } | { error: string } {
+  function buildItem():
+    | { item: CreateOrderItemInput }
+    | { items: CreateOrderItemInput[] }
+    | { error: string } {
     if (kind === 'FLIGHT') {
       if (!scheduleId || !cabin) return { error: '请选择航班班次和舱位' };
       const departDateStr = schedule ? schedule.departureTime.slice(0, 10) : '';
@@ -435,11 +541,35 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       const children = Math.max(0, childCount ?? 0);
       const infants = Math.max(0, infantCount ?? 0);
       if (adults + children < 1) return { error: '套餐至少需 1 位占座出行人（成人或儿童）' };
+      // 出行人需与人数完全一致（成人+儿童+婴儿），否则服务端拒收（婴儿不占座但也是出行人）。
+      const headCount = adults + children + infants;
+      if (validPassengers.length !== headCount) {
+        return {
+          error: `套餐出行人数需与人数一致：应填 ${headCount} 位（${adults}成人+${children}儿童+${infants}婴儿），当前 ${validPassengers.length} 位有效`,
+        };
+      }
+      // 去程班次必选：选了机票航段才会扣对应航班座位、并进票务待办；商务升舱也要从经济舱腿拆位。
+      if (!bundleGoScheduleId) return { error: '请选择套餐「去程班次」（用于扣减机票座位）' };
       const maxSingleBusiness = adults + children;
       const singles = Math.min(Math.max(0, singleCount ?? 0), maxSingleBusiness);
       const businesses = Math.min(Math.max(0, businessCount ?? 0), maxSingleBusiness);
+      // 机票航段：去程 +（往返套餐）回程；占座人数 = 成人 + 儿童（婴儿不占座），舱位固定经济舱。
+      const seatPax = Math.max(1, adults + children);
+      const legScheduleIds = [bundleGoScheduleId, bundleRetScheduleId].filter(Boolean);
+      const legLabel = ['去程（经济舱）', '回程（经济舱）'];
+      const flightLines = legScheduleIds.map((sid, i) => ({
+        kind: 'FLIGHT' as const,
+        description: `${bundle?.name ?? '套餐'} · ${legLabel[i] ?? '航段（经济舱）'}`,
+        quantity: seatPax,
+        flightScheduleId: sid,
+        flightCabin: 'ECONOMY' as CabinClass,
+      }));
+      // goDate 决定套餐酒店入住日（缺则后端 createOrder 不盖酒店章 → 房控不计套餐占房）。
+      // 优先级：手填出发日期 > 去程班次日期 > 套餐默认出发日，确保哪怕没填日期也能盖章。
+      const goSched = bundleGoSchedules.find((s) => s.id === bundleGoScheduleId);
+      const goDate = departDate || goSched?.departureTime?.slice(0, 10) || bundle?.defaultDepartDate || '';
       const metadata: Record<string, unknown> = { adultCount: adults, childCount: children, infantCount: infants };
-      if (departDate) metadata.goDate = departDate;
+      if (goDate) metadata.goDate = goDate;
       const descParts = [
         `${bundle?.name ?? '套餐'}`,
         departDate ? `${departDate}出发` : null,
@@ -447,21 +577,21 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
         singles > 0 ? `单住×${singles}` : null,
         businesses > 0 ? `商务×${businesses}` : null,
       ].filter(Boolean).join(' · ');
-      return {
-        item: {
-          kind: 'BUNDLE',
-          description: descParts,
-          quantity: 1,
-          bundleId,
-          unitPrice: 0, // 服务端权威重算
-          adultCount: adults,
-          childCount: children,
-          infantCount: infants,
-          singleCount: singles,
-          businessCount: businesses,
-          metadata,
-        },
+      const bundleLine = {
+        kind: 'BUNDLE' as const,
+        description: descParts,
+        quantity: 1,
+        bundleId,
+        unitPrice: 0, // 服务端权威重算（仅地面部分，机票走上面的 FLIGHT 行）
+        adultCount: adults,
+        childCount: children,
+        infantCount: infants,
+        singleCount: singles,
+        businessCount: businesses,
+        metadata,
       };
+      // 机票航段在前 + 地面套餐行在后：与前台商城同结构，服务端按航段扣座、套餐行只算地面。
+      return { items: [...flightLines, bundleLine] };
     }
     // TRANSFER —— 单价送接送当前 basePrice；服务端按 basePrice × qty 校验（±1 元）。
     if (!transferId) return { error: '请选择接送产品' };
@@ -487,6 +617,8 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       setErr(built.error);
       return;
     }
+    // 套餐返回多行（机票航段 + 地面套餐）；其余类型返回单行。
+    const orderItems = 'items' in built ? built.items : [built.item];
 
     if (passengersRequired && validPassengers.length === 0) {
       setErr('该产品类型需至少一位完整出行人（姓名 + 护照号 + 出生日期）');
@@ -516,7 +648,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       contactName: contactName.trim(),
       contactPhone: contactPhone.trim(),
       contactEmail: contactEmail.trim() || undefined,
-      items: [built.item],
+      items: orderItems,
       passengers: passengerPayload,
       notes: notes.trim() || undefined,
       visaStatus,
@@ -717,6 +849,70 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                     出发日期
                     <input type="date" className={inputCls} value={departDate} onChange={(e) => setDepartDate(e.target.value)} />
                   </label>
+                  {/* 机票航段：去程必选（选了才扣对应航班座位 + 进票务待办）；往返套餐填回程。婴儿不占座。 */}
+                  <div className="md:col-span-2 grid gap-3 rounded-md bg-white/70 p-2 ring-1 ring-slate-200 md:grid-cols-2">
+                    <p className="md:col-span-2 text-[11px] text-slate-500">
+                      机票航段 · 选了才会扣减对应航班座位并进票务待办（去程必选）
+                    </p>
+                    <label className="text-xs text-slate-500">
+                      去程航班 <span className="text-rose-500">*</span>
+                      <select
+                        className={inputCls}
+                        value={bundleGoFlightId}
+                        onChange={(e) => { setBundleGoFlightId(e.target.value); setBundleGoScheduleId(''); }}
+                      >
+                        <option value="">选择航班…</option>
+                        {flights.map((f) => (
+                          <option key={f.id} value={f.id}>{f.flightNumber} {f.originCode}→{f.destinationCode}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="text-xs text-slate-500">
+                      去程班次 <span className="text-rose-500">*</span>
+                      <select
+                        className={inputCls}
+                        value={bundleGoScheduleId}
+                        onChange={(e) => setBundleGoScheduleId(e.target.value)}
+                        disabled={!bundleGoFlightId}
+                      >
+                        <option value="">选择班次…</option>
+                        {bundleGoSchedules.map((s) => (
+                          <option key={s.id} value={s.id}>{s.departureTime.slice(0, 16).replace('T', ' ')}</option>
+                        ))}
+                      </select>
+                    </label>
+                    {(bundle?.legs ?? 2) >= 2 && (
+                      <>
+                        <label className="text-xs text-slate-500">
+                          回程航班
+                          <select
+                            className={inputCls}
+                            value={bundleRetFlightId}
+                            onChange={(e) => { setBundleRetFlightId(e.target.value); setBundleRetScheduleId(''); }}
+                          >
+                            <option value="">选择航班…</option>
+                            {flights.map((f) => (
+                              <option key={f.id} value={f.id}>{f.flightNumber} {f.originCode}→{f.destinationCode}</option>
+                            ))}
+                          </select>
+                        </label>
+                        <label className="text-xs text-slate-500">
+                          回程班次
+                          <select
+                            className={inputCls}
+                            value={bundleRetScheduleId}
+                            onChange={(e) => setBundleRetScheduleId(e.target.value)}
+                            disabled={!bundleRetFlightId}
+                          >
+                            <option value="">选择班次…</option>
+                            {bundleRetSchedules.map((s) => (
+                              <option key={s.id} value={s.id}>{s.departureTime.slice(0, 16).replace('T', ' ')}</option>
+                            ))}
+                          </select>
+                        </label>
+                      </>
+                    )}
+                  </div>
                   <div className="grid grid-cols-3 gap-2">
                     <label className="text-xs text-slate-500">
                       成人
@@ -876,7 +1072,31 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                 <span className="text-sm font-medium text-slate-700">
                   出行人{passengersRequired ? <span className="text-rose-500"> *</span> : '（选填）'} · 共 {validPassengers.length} 位有效
                 </span>
-                <button className="text-sm text-brand hover:text-brand-dark" onClick={addPassenger} type="button">＋ 加一位</button>
+                <div className="flex items-center gap-3">
+                  {/* 批量传护照：多选 → 逐张识别（并发 3）→ 自动生成出行人行 */}
+                  <input
+                    type="file"
+                    accept="image/*"
+                    multiple
+                    className="hidden"
+                    ref={bulkOcrInputRef}
+                    onChange={(e) => {
+                      const fs = e.target.files;
+                      e.target.value = '';
+                      if (fs && fs.length) void handleBulkOcrFiles(fs);
+                    }}
+                  />
+                  <button
+                    type="button"
+                    className="text-sm text-brand hover:text-brand-dark disabled:opacity-50"
+                    onClick={() => bulkOcrInputRef.current?.click()}
+                    disabled={bulkOcr !== null}
+                    title={`一次多选护照照片自动识别，最多 ${MAX_PHOTO_PASSENGERS} 张/单`}
+                  >
+                    {bulkOcr ? `识别中 ${bulkOcr.done}/${bulkOcr.total}…` : `📷 批量传护照（≤${MAX_PHOTO_PASSENGERS}）`}
+                  </button>
+                  <button className="text-sm text-brand hover:text-brand-dark" onClick={addPassenger} type="button">＋ 加一位</button>
+                </div>
               </div>
               <div className="max-h-72 overflow-y-auto rounded-md border border-slate-200">
                 <table className="w-full text-sm">
@@ -1009,6 +1229,9 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                   </tbody>
                 </table>
               </div>
+              <p className="mt-1 text-[11px] text-slate-400">
+                📷「批量传护照」可一次多选，自动逐张识别并生成出行人；护照图最多 {MAX_PHOTO_PASSENGERS} 张/单，超出请分单录入。识别后请核对<span className="text-slate-500">中文名 / 签发日期</span>。
+              </p>
               {!passengersRequired && (
                 <p className="mt-1 text-[11px] text-slate-400">纯酒店/接送可不填出行人；留空时系统用联系人占位一位出行人。</p>
               )}

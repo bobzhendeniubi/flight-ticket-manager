@@ -717,7 +717,10 @@ function BundleCard({
               <span className="text-ink-soft truncate">{i.productName}</span>
             </div>
             <span className="text-ink-muted nums whitespace-nowrap">
-              {i.qty} × ¥{i.unitPrice} = ¥{(i.qty * i.unitPrice).toLocaleString()}
+              {i.kind === 'HOTEL'
+                ? `${i.qty} 晚 × ¥${i.unitPrice}/晚 = ¥`
+                : `${i.qty} × ¥${i.unitPrice} = ¥`}
+              {(i.qty * i.unitPrice).toLocaleString()}
             </span>
           </div>
         ))}
@@ -1084,6 +1087,9 @@ function NewBundleWizard({
                 </div>
               ))}
             </div>
+            <p className="mt-1.5 text-[11px] leading-relaxed text-ink-muted">
+              💡 酒店行的"数量"即<strong>住宿晚数</strong>，小计 = 晚数 × 每晚单价；下单时再按入住人数自动乘以所需房间数。
+            </p>
           </div>
 
           <div className="rounded-lg border border-slate-100 bg-canvas p-3 space-y-2">

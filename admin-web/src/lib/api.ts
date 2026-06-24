@@ -43,12 +43,22 @@ export async function apiFetch<T>(path: string, init: ApiRequestInit = {}): Prom
   if (res.status === 204) return undefined as T;
 
   const text = await res.text();
-  const parsed = text ? (JSON.parse(text) as unknown) : undefined;
+  // 容错解析：错误响应体未必是 JSON（如 nginx 的 413/502/504 是 HTML 错误页）。
+  // 直接 JSON.parse 会抛不透明的 SyntaxError，把真实状态码淹没成"未知错误"。
+  let parsed: unknown;
+  try {
+    parsed = text ? (JSON.parse(text) as unknown) : undefined;
+  } catch {
+    parsed = undefined;
+  }
 
   if (!res.ok) {
     const errBody = (parsed as ApiErrorBody | undefined)?.error ?? {
-      code: 'UNKNOWN',
-      message: res.statusText,
+      code: res.status === 413 ? 'PAYLOAD_TOO_LARGE' : 'UNKNOWN',
+      message:
+        res.status === 413
+          ? '提交内容过大（通常是护照照片太大）；请减少出行人数、或移除部分护照照片后重试'
+          : res.statusText || `请求失败（HTTP ${res.status}）`,
     };
     throw new ApiError(res.status, errBody);
   }
