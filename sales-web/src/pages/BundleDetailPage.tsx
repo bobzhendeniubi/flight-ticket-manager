@@ -10,7 +10,7 @@
  * 绝不暴露原始余票/余房数字。
  */
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { Link, useNavigate, useParams } from 'react-router-dom';
+import { Link, useLocation, useNavigate, useParams } from 'react-router-dom';
 import {
   api,
   type Bundle,
@@ -188,9 +188,22 @@ const FAQS: FaqEntry[] = [
   { q: '行程有变能改期或取消吗？', a: '退改按套餐扣损规则执行（见"退改政策"）；遇航班取消等不可抗力，我们协助免费改期或按未发生费用退款。' },
 ];
 
+/** 从列表卡「查看详情」跳过来时随 state 携带的配置快照（可选；直接访问 URL 时无 state）。 */
+interface BundleNavState {
+  goDate?: string;
+  adultCount?: number;
+  childCount?: number;
+  infantCount?: number;
+  singleCount?: number;
+  businessCount?: number;
+  nights?: number;
+}
+
 export default function BundleDetailPage() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const location = useLocation();
+  const navState = (location.state ?? {}) as BundleNavState;
   const add = useCart((s) => s.add);
 
   const [bundle, setBundle] = useState<Bundle | null>(null);
@@ -250,7 +263,7 @@ export default function BundleDetailPage() {
     );
   }
 
-  return <BundleDetailContent bundle={bundle} add={add} navigate={navigate} />;
+  return <BundleDetailContent bundle={bundle} add={add} navigate={navigate} navState={navState} />;
 }
 
 // ── 详情主体（bundle 已确定存在）────────────────────────────────────
@@ -258,10 +271,12 @@ function BundleDetailContent({
   bundle: b,
   add,
   navigate,
+  navState,
 }: {
   bundle: Bundle;
   add: ReturnType<typeof useCart.getState>['add'];
   navigate: ReturnType<typeof useNavigate>;
+  navState: BundleNavState;
 }) {
   const items = (b.items ?? []) as BundleItemData[];
   const groundDiscount = num(b.groundDiscount);
@@ -273,20 +288,21 @@ function BundleDetailContent({
   // 配置器：出发日期 + 占座模型三计数（与列表卡同款；房间数按房型容量自动算）
   //   seatPax  = 成人 + 占座儿童（占座、计入机票座位）
   //   headCount= 成人 + 占座儿童 + 不占座婴儿（出行人总数，都要护照）
-  // 出发日期初值：优先用套餐默认出发日（管理员设的最近可出发日），未设则回退 today+3。
-  const [goDate, setGoDate] = useState(b.defaultDepartDate ?? todayISO(3));
-  const [adultCount, setAdultCount] = useState(2);
-  const [childCount, setChildCount] = useState(0);
-  const [infantCount, setInfantCount] = useState(0);
+  // 出发日期初值：优先用从列表卡透传过来的 navState.goDate，
+  //   其次套餐默认出发日（管理员设的最近可出发日），最后回退 today+3。
+  const [goDate, setGoDate] = useState(navState.goDate ?? b.defaultDepartDate ?? todayISO(3));
+  const [adultCount, setAdultCount] = useState(navState.adultCount ?? 2);
+  const [childCount, setChildCount] = useState(navState.childCount ?? 0);
+  const [infantCount, setInfantCount] = useState(navState.infantCount ?? 0);
   const seatPax = adultCount + childCount;
   const headCount = adultCount + childCount + infantCount;
   // 房间数按关联房型容量算（镜像后端 computeRoomsNeeded）：一间坐不下就自动加房，加的房按房价收钱。
   // 容量缺失/未绑房型 → 兜底 2 大 1 小。婴儿不占床、单人入住独立不计入。
   const roomCapacity = resolveRoomCapacity(b.hotelRoomType);
   const baseRooms = computeRoomsNeeded(adultCount, childCount, b.hotelRoomType);
-  // 可选升级 add-on（默认 0；范围 0..seatPax — 婴儿不占座，不能升舱/不算单人入住房）
-  const [singleCount, setSingleCount] = useState(0); // 一个人住酒店（单人入住）
-  const [businessCount, setBusinessCount] = useState(0); // 升级商务舱
+  // 可选升级 add-on：优先用列表卡透传过来的 navState 值（默认 0；范围 0..seatPax）
+  const [singleCount, setSingleCount] = useState(navState.singleCount ?? 0); // 一个人住酒店（单人入住）
+  const [businessCount, setBusinessCount] = useState(navState.businessCount ?? 0); // 升级商务舱
   const dateInputRef = useRef<HTMLInputElement>(null);
 
   // 套餐 add-on 报价（server-priced，后端返回 number）+ 计费航段数

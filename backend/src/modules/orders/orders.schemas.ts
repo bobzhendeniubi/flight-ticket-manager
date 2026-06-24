@@ -273,33 +273,95 @@ export const publicOrderLookupQuerySchema = z
   });
 export type PublicOrderLookupQuery = z.infer<typeof publicOrderLookupQuerySchema>;
 
-export const batchCreateOrdersBodySchema = z.object({
-  flightScheduleId: z.string().min(1),
-  flightCabin: z.nativeEnum(CabinClass),
-  description: z.string().min(1).max(200), // 航段描述，如 "QH9589 澳门→岘港 2026-06-01 经济舱"
-  // 录入人即登录账号 —— 后端用登录用户名兜底联系人，前台不再要求填写。
-  // 仍可选传（兼容旧前端/特殊场景）；不传则 service 用登录账号 displayName 落 contactName。
-  contactName: z.string().min(1).max(120).optional(),
-  contactPhone: z.string().min(5).max(40).optional(),
-  contactEmail: z.string().email().optional(),
-  paymentMethod: z.nativeEnum(PaymentMethod).optional(),
-  notes: z.string().max(500).optional(),
-  // 签证状态 + 结构化备注四栏（整批共用，写入每张子单）
-  ...orderStructuredNotesShape,
-  // 运营批量录单时整批归属的代理（仅 ADMIN/STAFF 生效，校验同单条下单）。
-  agentId: z.string().optional(),
-  // 团队议价结算价（CNY，每位出行人）。仅 ADMIN/STAFF 生效（路由层断言）：
-  // 旅游团一般只机票，整批以谈定的结算价建单，覆盖动态/目录机票价。
-  // 缺省 → 走动态定价（与旧行为完全一致）。≥0，封顶 SETTLEMENT_PRICE_CAP_CNY。
-  settlementPriceCny: z
-    .number()
-    .min(0, '结算价不能为负')
-    .max(SETTLEMENT_PRICE_CAP_CNY, `结算价超出上限（${SETTLEMENT_PRICE_CAP_CNY}）`)
-    .optional(),
-  // 团期备注（写入每张子单 notes + noteSpecial），如 "0701团 20人 结算价1500"。
-  groupNote: z.string().max(500).optional(),
-  passengers: z.array(passengerInputSchema).min(1).max(100), // 每位 → 一单
-});
+// ── B5: 批量建单 productType 枚举 ─────────────────────────────────────────────
+// 必须在 batchCreateOrdersBodySchema 之前声明（const 不提升；下方对象字段直接引用）。
+export const batchProductTypeSchema = z
+  .enum(['FLIGHT_ONEWAY', 'FLIGHT_ROUNDTRIP', 'BUNDLE'])
+  .default('FLIGHT_ONEWAY');
+export type BatchProductType = z.infer<typeof batchProductTypeSchema>;
+
+export const batchCreateOrdersBodySchema = z
+  .object({
+    // ── 产品类型（B5 新增）──────────────────────────────────────────────────────
+    // FLIGHT_ONEWAY  : outboundScheduleId + cabin（单程，每人 1 条 FLIGHT 行）
+    // FLIGHT_ROUNDTRIP: outboundScheduleId + returnScheduleId + cabin（往返，每人 2 条 FLIGHT 行）
+    // BUNDLE          : bundleId（套餐，每人 1 张套餐订单，含 HOTEL 项）
+    // 向后兼容：旧调用只传 flightScheduleId 时等价于 FLIGHT_ONEWAY。
+    productType: batchProductTypeSchema,
+
+    // ── FLIGHT_ONEWAY / FLIGHT_ROUNDTRIP ──────────────────────────────────────
+    // 兼容旧字段名：flightScheduleId → 等价于 outboundScheduleId
+    flightScheduleId: z.string().optional(), // 旧路径（向后兼容）
+    outboundScheduleId: z.string().optional(),
+    returnScheduleId: z.string().optional(), // 仅 FLIGHT_ROUNDTRIP 必填
+    flightCabin: z.nativeEnum(CabinClass).optional(),
+
+    // ── BUNDLE ─────────────────────────────────────────────────────────────────
+    bundleId: z.string().optional(),
+    // 套餐入住晚数 / 占座等（透传给 bundleItemSchema add-on 字段）
+    bundleNights: z.number().int().min(1).max(30).optional(),
+    bundleSingleCount: z.number().int().min(0).max(20).optional(),
+    bundleBusinessCount: z.number().int().min(0).max(20).optional(),
+
+    // ── 公共字段 ────────────────────────────────────────────────────────────────
+    description: z.string().min(1).max(200), // 航段/套餐描述（每张子单写入 item.description）
+    // 录入人即登录账号 —— 后端用登录用户名兜底联系人，前台不再要求填写。
+    contactName: z.string().min(1).max(120).optional(),
+    contactPhone: z.string().min(5).max(40).optional(),
+    contactEmail: z.string().email().optional(),
+    paymentMethod: z.nativeEnum(PaymentMethod).optional(),
+    notes: z.string().max(500).optional(),
+    // 签证状态 + 结构化备注四栏（整批共用，写入每张子单）
+    ...orderStructuredNotesShape,
+    // 运营批量录单时整批归属的代理（仅 ADMIN/STAFF 生效）
+    agentId: z.string().optional(),
+    // 团队议价结算价（CNY，每位出行人）。仅 ADMIN/STAFF 生效（路由层断言）。
+    // 仅对 FLIGHT 行生效（BUNDLE 套餐走 bundleItemSchema 的 server-priced 逻辑）。
+    settlementPriceCny: z
+      .number()
+      .min(0, '结算价不能为负')
+      .max(SETTLEMENT_PRICE_CAP_CNY, `结算价超出上限（${SETTLEMENT_PRICE_CAP_CNY}）`)
+      .optional(),
+    // 团期备注（写入每张子单 notes + noteSpecial）
+    groupNote: z.string().max(500).optional(),
+    passengers: z.array(passengerInputSchema).min(1).max(100), // 每位 → 一单
+  })
+  .superRefine((val, ctx) => {
+    const pt = val.productType;
+    const outbound = val.outboundScheduleId ?? val.flightScheduleId;
+    if (pt === 'FLIGHT_ONEWAY' || pt === 'FLIGHT_ROUNDTRIP') {
+      if (!outbound) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'FLIGHT 类型必须提供 outboundScheduleId（或 flightScheduleId）',
+          path: ['outboundScheduleId'],
+        });
+      }
+      if (!val.flightCabin) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'FLIGHT 类型必须提供 flightCabin',
+          path: ['flightCabin'],
+        });
+      }
+      if (pt === 'FLIGHT_ROUNDTRIP' && !val.returnScheduleId) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'FLIGHT_ROUNDTRIP 必须提供 returnScheduleId',
+          path: ['returnScheduleId'],
+        });
+      }
+    }
+    if (pt === 'BUNDLE') {
+      if (!val.bundleId) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: 'BUNDLE 类型必须提供 bundleId',
+          path: ['bundleId'],
+        });
+      }
+    }
+  });
 export type BatchCreateOrdersBody = z.infer<typeof batchCreateOrdersBodySchema>;
 
 // ── 售后改单：改期（reschedule）─────────────────────────────────────────────
@@ -354,3 +416,17 @@ export const swapPassengerBodySchema = z
     { message: '换人请求需至少包含一项身份变更 / 重置 / 费用' },
   );
 export type SwapPassengerBody = z.infer<typeof swapPassengerBodySchema>;
+
+// ── B4: 改结算价（ADMIN/STAFF）────────────────────────────────────────────────
+// PATCH /orders/:id/items/:itemId/settlement-price
+// 仅允许 kind=FLIGHT；事务内重算 order.subtotal/total；
+// 不走 adjustmentCny（那是售后费用，这是基础价订正）。
+export const updateItemSettlementPriceBodySchema = z.object({
+  unitPriceCny: z
+    .number()
+    .positive('结算价必须大于 0')
+    .max(SETTLEMENT_PRICE_CAP_CNY, `结算价超出上限（${SETTLEMENT_PRICE_CAP_CNY}）`),
+  reason: z.string().max(500).optional(),
+});
+export type UpdateItemSettlementPriceBody = z.infer<typeof updateItemSettlementPriceBodySchema>;
+

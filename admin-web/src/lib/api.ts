@@ -146,15 +146,32 @@ export interface BaggagePolicyInput {
 }
 
 // ── 批量散客建单 ──
+export type BatchProductType = 'FLIGHT_ONEWAY' | 'FLIGHT_ROUNDTRIP' | 'BUNDLE';
+
 export interface BatchOrderPassenger {
   fullName: string;
   documentNumber: string;
   dateOfBirth: string; // YYYY-MM-DD
   nationality?: string;
+  lastName?: string;
+  firstName?: string;
+  gender?: 'M' | 'F';
+  passportExpiry?: string;
 }
 export interface BatchCreateOrdersInput {
-  flightScheduleId: string;
-  flightCabin: CabinClass;
+  productType?: BatchProductType;
+  // FLIGHT_ONEWAY / FLIGHT_ROUNDTRIP
+  /** 向后兼容旧字段名；优先用 outboundScheduleId */
+  flightScheduleId?: string;
+  outboundScheduleId?: string;
+  returnScheduleId?: string;
+  flightCabin?: CabinClass;
+  // BUNDLE
+  bundleId?: string;
+  bundleNights?: number;
+  bundleSingleCount?: number;
+  bundleBusinessCount?: number;
+  // 公共
   description: string;
   /** 录入人由后端从登录账号自动盖章；前端不再采集/发送联系人。 */
   contactName?: string;
@@ -166,19 +183,31 @@ export interface BatchCreateOrdersInput {
   agentId?: string;
   /**
    * 团队结算价（每人 CNY，与代理谈定的整团一口价）。
-   * 设置后覆盖动态定价：每位乘客按此价建单，不再走仓位阶梯/自动定价。
+   * 仅对 FLIGHT 行生效；BUNDLE 走套餐定价逻辑。
    */
   settlementPriceCny?: number;
   /** 团期备注（如「2026 春节团 7 日」），写入每单。 */
   groupNote?: string;
 }
 
-/** POST /orders/roster/parse 返回的一行（名单导入；字段可缺省，后续手录补全） */
+/** POST /orders/roster/parse 返回的一行（11 列新模版；字段可缺省，后续手录补全） */
 export interface RosterParsedRow {
+  /** 中文姓名（列1）或 PNR 全名兜底 */
   name: string;
-  passportNo?: string;
-  dob?: string; // YYYY-MM-DD
-  gender?: string;
+  fullName?: string;
+  lastName?: string;
+  firstName?: string;
+  passportNo?: string;    // 向后兼容旧字段名（= documentNumber）
+  documentNumber?: string;
+  dob?: string;           // 向后兼容旧字段名（= dateOfBirth），YYYY-MM-DD
+  dateOfBirth?: string;   // YYYY-MM-DD
+  gender?: string;        // 'M' | 'F'
+  nationality?: string;
+  documentType?: string;
+  visaIssueDate?: string; // YYYY-MM-DD
+  passportExpiry?: string; // YYYY-MM-DD
+  infantCompanion?: string;
+  remarks?: string;
 }
 export interface ParseRosterResult {
   rows: RosterParsedRow[];
@@ -1135,6 +1164,9 @@ export const api = {
     scheduleId: string,
     body: {
       isActive?: boolean;
+      /** 改时刻：ISO datetime 字符串（本地时间带时区或 UTC） */
+      departureTime?: string;
+      arrivalTime?: string;
       // fareBuckets：数组=设阶梯；null 或 [] = 清除阶梯（恢复自动定价）；
       // 单独传 fareBuckets 即为有效修改（无需同时传 basePrice/capacity）。
       seatClasses?: Array<{
@@ -1221,9 +1253,23 @@ export const api = {
       body: { ids, toStatus, reason, force },
     }),
 
-  // 批量散客建单：一个航班班次+舱位+共享联系人，名单每位乘客一单
+  // 批量散客建单（支持单程/往返/套餐）：名单每位乘客一单
   batchCreateOrders: (token: string, body: BatchCreateOrdersInput) =>
     apiFetch<BatchCreateOrdersResult>('/orders/batch', { method: 'POST', token, body }),
+
+  // 改结算价（ADMIN/STAFF）：仅对 FLIGHT 行生效；事务内重算 order.total
+  // PATCH /orders/:orderId/items/:itemId/settlement-price
+  updateItemSettlementPrice: (
+    token: string,
+    orderId: string,
+    itemId: string,
+    body: { unitPriceCny: number; reason?: string },
+  ) =>
+    apiFetch<{ order: OrderSummary }>(`/orders/${orderId}/items/${itemId}/settlement-price`, {
+      method: 'PATCH',
+      token,
+      body,
+    }),
 
   // 下载名单模版（.xlsx：姓名/护照号/出生日期/性别）；ADMIN/STAFF only。返回 Blob 直接下载。
   downloadRosterTemplate: async (token: string): Promise<Blob> => {

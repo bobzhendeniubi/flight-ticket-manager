@@ -73,11 +73,14 @@ export const createScheduleBodySchema = z.object({
 });
 export type CreateScheduleBody = z.infer<typeof createScheduleBodySchema>;
 
-// ── 单班次编辑（月历库存视图：改价 / 改容量 / 停用启用）────────────────────
+// ── 单班次编辑（月历库存视图：改价 / 改容量 / 停用启用 / 改时刻）────────────
 // 全部可选，但至少给一个；seatClasses 内每条按 cabin 定位，basePrice/capacity 各自可选
 export const updateScheduleBodySchema = z
   .object({
     isActive: z.boolean().optional(),
+    // 航司改点：ISO datetime 字符串（本地时间带时区或 UTC）
+    departureTime: z.string().datetime().optional(),
+    arrivalTime: z.string().datetime().optional(),
     seatClasses: z
       .array(
         z.object({
@@ -113,8 +116,9 @@ export const updateScheduleBodySchema = z
   })
   .superRefine((body, ctx) => {
     const hasSeatChanges = body.seatClasses !== undefined && body.seatClasses.length > 0;
-    if (body.isActive === undefined && !hasSeatChanges) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, message: '至少要改一项（停用启用 / 价格 / 容量）' });
+    const hasTimeChange = body.departureTime !== undefined || body.arrivalTime !== undefined;
+    if (body.isActive === undefined && !hasSeatChanges && !hasTimeChange) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: '至少要改一项（停用启用 / 价格 / 容量 / 时刻）' });
     }
   });
 export type UpdateScheduleBody = z.infer<typeof updateScheduleBodySchema>;

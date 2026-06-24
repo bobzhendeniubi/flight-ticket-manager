@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { UserRole } from '@prisma/client';
 import { FlightService } from './flights.service.js';
 import { PricingService } from '../pricing/pricing.service.js';
+import { actorFromRequest } from '../../lib/audit.js';
 import { priceQuerySchema } from '../pricing/pricing.schemas.js';
 import {
   createFlightBodySchema,
@@ -129,14 +130,14 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
     },
   );
 
-  // 单班次编辑（月历库存视图：改价 / 改容量 / 停用启用）。ADMIN/STAFF 都可改。
+  // 单班次编辑（月历库存视图：改价 / 改容量 / 停用启用 / 改时刻）。ADMIN/STAFF 都可改。
   app.patch(
     '/schedules/:scheduleId',
     { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
     async (req) => {
       const { scheduleId } = req.params as { scheduleId: string };
       const body = updateScheduleBodySchema.parse(req.body);
-      const schedule = await service.updateSchedule(scheduleId, body);
+      const schedule = await service.updateSchedule(scheduleId, body, actorFromRequest(req));
       return { schedule };
     },
   );

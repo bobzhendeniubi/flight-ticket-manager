@@ -1,6 +1,8 @@
-import { CabinClass, Prisma, SeatLockStatus } from '@prisma/client';
+import { AuditSeverity, AuditTargetType, CabinClass, Prisma, SeatLockStatus } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { BadRequestError, ConflictError, NotFoundError } from '../../lib/errors.js';
+import { writeAudit } from '../../lib/audit.js';
+import type { AuditActor } from '../../lib/audit.js';
 import { PricingService } from '../pricing/pricing.service.js';
 import { parseFareBuckets } from '../pricing/pricing.schemas.js';
 import type { FareBucketsInput } from '../pricing/pricing.schemas.js';
@@ -313,12 +315,16 @@ export class FlightService {
   }
 
   /**
-   * 单班次编辑（月历库存视图：改价 / 改容量 / 停用启用）。
-   * 事务内：isActive 整班次改；seatClasses 按 cabin 定位逐条改 basePrice/capacity。
-   * 守卫：新容量不得低于该舱位已售（sold）；body 里的 cabin 必须存在于该班次。
-   * 返回与 listSchedules 同形（id/flightId/时间/时区/isActive/seatClasses[]）。
+   * 单班次编辑（月历库存视图：改价 / 改容量 / 停用启用 / 改时刻）。
+   * 事务内：isActive 整班次改；seatClasses 按 cabin 定位逐条改 basePrice/capacity；
+   * departureTime/arrivalTime 按航司改点写入。
+   *
+   * 时刻变更守卫：
+   *   - arrival 必须晚于 departure（允许跨天到达）
+   *   - 若该班次任意舱位已售（sold>0）则允许改时刻，但额外写审计（WARNING 级）
+   *   - 返回与 listSchedules 同形
    */
-  async updateSchedule(scheduleId: string, body: UpdateScheduleBody) {
+  async updateSchedule(scheduleId: string, body: UpdateScheduleBody, actor?: AuditActor) {
     const schedule = await prisma.flightSchedule.findUnique({
       where: { id: scheduleId },
       include: { seatClasses: true },
@@ -328,7 +334,18 @@ export class FlightService {
     const seatClassByCabin = new Map(schedule.seatClasses.map((c) => [c.cabin, c]));
     const seatUpdates = body.seatClasses ?? [];
 
-    // 先全量校验，再写库（避免部分写入）
+    // ── 时刻变更校验 ─────────────────────────────────────────────────────────
+    let newDep: Date | undefined;
+    let newArr: Date | undefined;
+    if (body.departureTime !== undefined || body.arrivalTime !== undefined) {
+      newDep = body.departureTime ? new Date(body.departureTime) : schedule.departureTime;
+      newArr = body.arrivalTime ? new Date(body.arrivalTime) : schedule.arrivalTime;
+      if (newArr <= newDep) {
+        throw new BadRequestError('到达时间必须晚于出发时间（跨天到达请使用次日时间）');
+      }
+    }
+
+    // ── 座位类校验 ───────────────────────────────────────────────────────────
     for (const upd of seatUpdates) {
       const current = seatClassByCabin.get(upd.cabin);
       if (!current) {
@@ -342,12 +359,15 @@ export class FlightService {
     }
 
     await prisma.$transaction(async (tx) => {
-      if (body.isActive !== undefined) {
-        await tx.flightSchedule.update({
-          where: { id: scheduleId },
-          data: { isActive: body.isActive },
-        });
+      // 时刻 + isActive 一次写（减少 round-trips）
+      const scheduleData: Prisma.FlightScheduleUpdateInput = {};
+      if (body.isActive !== undefined) scheduleData.isActive = body.isActive;
+      if (newDep) scheduleData.departureTime = newDep;
+      if (newArr) scheduleData.arrivalTime = newArr;
+      if (Object.keys(scheduleData).length > 0) {
+        await tx.flightSchedule.update({ where: { id: scheduleId }, data: scheduleData });
       }
+
       for (const upd of seatUpdates) {
         const current = seatClassByCabin.get(upd.cabin)!;
         await tx.flightSeatClass.update({
@@ -368,6 +388,29 @@ export class FlightService {
       where: { id: scheduleId },
       include: { seatClasses: true },
     });
+
+    // ── 时刻变更审计（有已售座位时额外标 WARNING）────────────────────────────
+    if (newDep || newArr) {
+      const totalSold = schedule.seatClasses.reduce((sum, c) => sum + c.sold, 0);
+      const hasSold = totalSold > 0;
+      await writeAudit({
+        actor: actor ?? {},
+        action: 'UPDATE_SCHEDULE_TIME',
+        targetType: AuditTargetType.FLIGHT,
+        targetId: scheduleId,
+        targetLabel: `班次 ${scheduleId}（${schedule.departureTime.toISOString()} → ${updated.departureTime.toISOString()}）`,
+        before: {
+          departureTime: schedule.departureTime.toISOString(),
+          arrivalTime: schedule.arrivalTime.toISOString(),
+        },
+        after: {
+          departureTime: updated.departureTime.toISOString(),
+          arrivalTime: updated.arrivalTime.toISOString(),
+        },
+        severity: hasSold ? AuditSeverity.WARNING : AuditSeverity.INFO,
+      });
+    }
+
     return this.serializeSchedule(updated);
   }
 

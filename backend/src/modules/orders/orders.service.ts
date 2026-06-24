@@ -45,6 +45,7 @@ import type {
   OrderItemInput,
   PassengerInput,
   PublicOrderLookupQuery,
+  UpdateItemSettlementPriceBody,
 } from './orders.schemas.js';
 
 // ── 状态机：允许的转移 ──────────────────────────────────────────────────
@@ -148,6 +149,88 @@ export async function resolveOrderAgentId(
   }
 
   return null;
+}
+
+/**
+ * 批量散客建单：按 productType 构造每张子单的 items（与具体出行人无关，整批共用一份）。
+ * 导出供单测复用。
+ *   FLIGHT_ONEWAY    → [FLIGHT(outbound)]
+ *   FLIGHT_ROUNDTRIP → [FLIGHT(outbound 去程), FLIGHT(return 返程)]，均同舱位
+ *   BUNDLE           → [BUNDLE(bundleId, +单人入住/升舱份数, +goDate/returnDate metadata)]
+ *                      复用 createOrder 的 BUNDLE 分支：服务端重算套餐价 + 盖酒店房型/入住日期
+ *                      → 房控/销控自动计入套餐占房（这是「销控酒店不减」的修复点）。
+ *
+ * 缺省/旧调用（只传 flightScheduleId、productType 缺省）按 FLIGHT_ONEWAY 处理（向后兼容）。
+ * 校验由 batchCreateOrdersBodySchema.superRefine 完成（outbound/cabin/return/bundleId 必填），
+ * 此处仅做断言式兜底（理论上不会触发）。
+ */
+export function buildBatchItems(
+  body: BatchCreateOrdersBody,
+  productType: BatchCreateOrdersBody['productType'],
+  outbound: string | undefined,
+  bundleDates: { goDate?: string; returnDate?: string } = {},
+): OrderItemInput[] {
+  if (productType === 'BUNDLE') {
+    if (!body.bundleId) throw new BadRequestError('BUNDLE 类型必须提供 bundleId');
+    const metadata: Record<string, unknown> = {};
+    if (bundleDates.goDate) metadata.goDate = bundleDates.goDate;
+    if (bundleDates.returnDate) metadata.returnDate = bundleDates.returnDate;
+    return [
+      {
+        kind: 'BUNDLE',
+        description: body.description,
+        quantity: 1,
+        bundleId: body.bundleId,
+        // unitPrice 由服务端权威重算（createOrder BUNDLE 分支忽略前端传值，0 仅占位）
+        unitPrice: 0,
+        // 可选升级 add-on 份数（缺省 0 = 无升级）
+        singleCount: body.bundleSingleCount ?? 0,
+        businessCount: body.bundleBusinessCount ?? 0,
+        ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
+      },
+    ];
+  }
+
+  if (!outbound) {
+    throw new BadRequestError('FLIGHT 类型必须提供 outboundScheduleId（或 flightScheduleId）');
+  }
+  if (!body.flightCabin) {
+    throw new BadRequestError('FLIGHT 类型必须提供 flightCabin');
+  }
+
+  if (productType === 'FLIGHT_ROUNDTRIP') {
+    if (!body.returnScheduleId) {
+      throw new BadRequestError('FLIGHT_ROUNDTRIP 必须提供 returnScheduleId');
+    }
+    // 每位出行人 2 条 FLIGHT 行（去程 + 返程），createOrder 据此对两个班次各做一次原子扣座。
+    return [
+      {
+        kind: 'FLIGHT',
+        description: `${body.description} 去程`,
+        quantity: 1,
+        flightScheduleId: outbound,
+        flightCabin: body.flightCabin,
+      },
+      {
+        kind: 'FLIGHT',
+        description: `${body.description} 返程`,
+        quantity: 1,
+        flightScheduleId: body.returnScheduleId,
+        flightCabin: body.flightCabin,
+      },
+    ];
+  }
+
+  // FLIGHT_ONEWAY（含旧调用兜底）
+  return [
+    {
+      kind: 'FLIGHT',
+      description: body.description,
+      quantity: 1,
+      flightScheduleId: outbound,
+      flightCabin: body.flightCabin,
+    },
+  ];
 }
 
 export class OrderService {
@@ -1427,10 +1510,51 @@ export class OrderService {
     if (dupInBatch.size > 0) {
       throw new BadRequestError(`名单内证件号重复：${[...dupInBatch].join('、')}`);
     }
+    // 产品类型分支（B5）：FLIGHT_ONEWAY/ROUNDTRIP 走班次扣座 + 同航班查重；
+    // BUNDLE 的机票航段在 createOrder 内部派生（前台拆 FLIGHT 行），这里跳过基于班次的查重。
+    // 向后兼容：缺省/旧调用（只传 flightScheduleId）= FLIGHT_ONEWAY。
+    const productType = body.productType ?? 'FLIGHT_ONEWAY';
+    const outbound = body.outboundScheduleId ?? body.flightScheduleId;
+    // 同航班重复乘客查重：单程 [outbound]；往返 [outbound, return]；BUNDLE 不参与（无班次）。
+    // filter(Boolean) 防止把 undefined 传进查重（assertNoDuplicate... 空数组直接 return）。
+    const dedupScheduleIds =
+      productType === 'BUNDLE'
+        ? []
+        : ([outbound, productType === 'FLIGHT_ROUNDTRIP' ? body.returnScheduleId : undefined].filter(
+            (id): id is string => Boolean(id),
+          ) as string[]);
     await this.assertNoDuplicatePassengersOnFlights(
-      [body.flightScheduleId],
+      dedupScheduleIds,
       body.passengers.map((px) => px.documentNumber),
     );
+
+    // BUNDLE：房控/销控要计入套餐占房，需把酒店房型 + 入住日期盖到订单行。
+    // 入住日期靠 BUNDLE 行 metadata.goDate（resolveBundleHotelStamp 无 goDate 则不盖章）。
+    // 批量录单 body 不带行程日期 → 用套餐自身的 defaultDepartDate 推 goDate，
+    // returnDate 由 goDate + nights（bundleNights ?? hotelNights）推算（缺 defaultDepartDate 则不盖章，不阻断建单）。
+    let bundleDates: { goDate?: string; returnDate?: string } = {};
+    if (productType === 'BUNDLE' && body.bundleId) {
+      const b = await prisma.bundle.findUnique({
+        where: { id: body.bundleId },
+        select: { defaultDepartDate: true, hotelNights: true },
+      });
+      const goDate = b?.defaultDepartDate ?? undefined;
+      if (goDate) {
+        const nights = Math.max(1, Math.trunc(body.bundleNights ?? b?.hotelNights ?? 1));
+        const checkIn = new Date(goDate);
+        const returnDate = Number.isNaN(checkIn.getTime())
+          ? undefined
+          : new Date(checkIn.getTime() + nights * 86_400_000).toISOString().slice(0, 10);
+        bundleDates = { goDate, returnDate };
+      }
+    }
+
+    // 按 productType 构造每张子单的 items（每位出行人都用同一份；与乘客无关，循环外算一次）。
+    //   FLIGHT_ONEWAY   → 1 条 FLIGHT（outbound）
+    //   FLIGHT_ROUNDTRIP→ 2 条 FLIGHT（去程 outbound + 返程 return），均同舱位
+    //   BUNDLE          → 1 条 BUNDLE（复用 createOrder 的 BUNDLE 分支：服务端重算套餐价 +
+    //                      盖酒店房型/入住日期到订单行 → 房控/销控自动计入套餐占房）
+    const batchItems: OrderItemInput[] = buildBatchItems(body, productType, outbound, bundleDates);
 
     const results: Array<{
       index: number;
@@ -1464,16 +1588,9 @@ export class OrderService {
             // 整批归属代理（ADMIN/STAFF 录单）；AGENT 自助仍归属本人。
             agentId: body.agentId,
             // 团队议价结算价（CNY/人）覆盖机票动态价；仅 ADMIN/STAFF（路由层已断言）。
+            // 仅作用于 FLIGHT 行；BUNDLE 走 createOrder 的 server-priced 套餐定价，此值对其无效。
             flightSettlementPriceCny: body.settlementPriceCny,
-            items: [
-              {
-                kind: 'FLIGHT',
-                description: body.description,
-                quantity: 1,
-                flightScheduleId: body.flightScheduleId,
-                flightCabin: body.flightCabin,
-              },
-            ],
+            items: batchItems,
             passengers: [passenger],
           },
           requester,
@@ -1498,6 +1615,127 @@ export class OrderService {
     }
 
     return { successCount, failureCount, results };
+  }
+
+  /**
+   * B4 改结算价（路由层限 ADMIN/STAFF）：建单后订正某条 FLIGHT 行的每张结算价。
+   * 仅允许 kind=FLIGHT；事务内把 item.unitPrice 设为新价、amount=round2(unitPrice×quantity)，
+   * 再用所有订单行重算 order.subtotal/total（taxesAndFees/discountTotal 不动）。
+   *
+   * 这是「基础价订正」，不走 adjustmentCny（那是售后费用，改期费/换人费才用）。
+   * 尾款（serializeOrder 的 balanceDue = total + adjustmentCny − paidAmount）随 total 自然更新。
+   * 不动 quantity / flightScheduleId / flightCabin / 库存（扣座与本订正无关）。
+   * 返回 serializeOrder（含审计用的 before/after，由路由层 writeAudit 落库）。
+   */
+  async updateItemSettlementPrice(
+    orderId: string,
+    itemId: string,
+    input: UpdateItemSettlementPriceBody,
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
+    order: ReturnType<typeof serializeOrder>;
+    audit: {
+      orderNumber: string;
+      orderItemId: string;
+      before: { unitPrice: string; amount: string; subtotal: string; total: string };
+      after: { unitPrice: string; amount: string; subtotal: string; total: string };
+      reason?: string;
+    };
+  }> {
+    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+      throw new ForbiddenError('仅运营/管理员可改结算价');
+    }
+    const unitPriceCny = input.unitPriceCny;
+
+    const scratch = await prisma.$transaction(async (tx) => {
+      const order = await tx.order.findUnique({
+        where: { id: orderId },
+        select: {
+          id: true,
+          orderNumber: true,
+          subtotal: true,
+          total: true,
+          items: {
+            select: { id: true, kind: true, quantity: true, unitPrice: true, amount: true },
+          },
+        },
+      });
+      if (!order) throw new NotFoundError('订单不存在');
+
+      const target = order.items.find((it) => it.id === itemId);
+      if (!target) {
+        throw new NotFoundError('订单项不存在或不属于该订单');
+      }
+      if (target.kind !== OrderItemKind.FLIGHT) {
+        throw new BadRequestError('只能对机票行（FLIGHT）改结算价');
+      }
+
+      const beforeUnitPrice = target.unitPrice.toString();
+      const beforeAmount = target.amount.toString();
+      const newAmount = round2(unitPriceCny * target.quantity);
+
+      await tx.orderItem.update({
+        where: { id: itemId },
+        data: {
+          unitPrice: new Prisma.Decimal(unitPriceCny),
+          amount: new Prisma.Decimal(newAmount),
+        },
+      });
+
+      // 用所有订单行（含本次新 amount）重算 subtotal/total。
+      const newSubtotal = order.items.reduce(
+        (sum, it) => sum + (it.id === itemId ? newAmount : Number(it.amount.toString())),
+        0,
+      );
+      const newTotal = round2(newSubtotal); // 当前无 taxes/discount，total = subtotal
+
+      const updated = await tx.order.update({
+        where: { id: orderId },
+        data: {
+          subtotal: new Prisma.Decimal(round2(newSubtotal)),
+          total: new Prisma.Decimal(newTotal),
+        },
+        select: { subtotal: true, total: true },
+      });
+
+      return {
+        orderNumber: order.orderNumber,
+        beforeUnitPrice,
+        beforeAmount,
+        beforeSubtotal: order.subtotal.toString(),
+        beforeTotal: order.total.toString(),
+        afterUnitPrice: unitPriceCny,
+        afterAmount: newAmount,
+        afterSubtotal: updated.subtotal.toString(),
+        afterTotal: updated.total.toString(),
+      };
+    });
+
+    const finalOrder = await prisma.order.findUniqueOrThrow({
+      where: { id: orderId },
+      include: ORDER_FULL_INCLUDE,
+    });
+
+    return {
+      order: serializeOrder(finalOrder),
+      audit: {
+        orderNumber: scratch.orderNumber,
+        orderItemId: itemId,
+        before: {
+          unitPrice: scratch.beforeUnitPrice,
+          amount: scratch.beforeAmount,
+          subtotal: scratch.beforeSubtotal,
+          total: scratch.beforeTotal,
+        },
+        after: {
+          unitPrice: String(scratch.afterUnitPrice),
+          amount: String(scratch.afterAmount),
+          subtotal: scratch.afterSubtotal,
+          total: scratch.afterTotal,
+        },
+        reason: input.reason,
+      },
+    };
   }
 
   /**

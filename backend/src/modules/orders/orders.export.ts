@@ -12,8 +12,12 @@ import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { toAlpha3 } from './nationality.js';
 import { countIssuedPassengers } from './ticketing-cap.js';
 
-/** 与财务导出一致：草稿 / 已取消 / 已退款 / 支付超时 / 失败 不计入。*/
-const COUNTED_STATUSES: OrderStatus[] = [
+/**
+ * 整班运营导出口径（SEAT_HOLDING）：所有「占座中」订单。
+ * 排除：DRAFT / CANCELLED / PAYMENT_TIMEOUT / FAILED / REFUNDED。
+ * 与财务导出（finances.export.ts）口径相同，但查询维度不同（班次 vs 时间段）。
+ */
+const SEAT_HOLDING_STATUSES: OrderStatus[] = [
   OrderStatus.PENDING_PAYMENT,
   OrderStatus.PAID,
   OrderStatus.PROCESSING,
@@ -242,12 +246,14 @@ export async function buildOrdersBySchedule(
     countIssuedPassengers(client, scheduleId),
   ]);
 
+  // 运营口径：包含所有「占座中」订单（见 SEAT_HOLDING_STATUSES）。
+  // 关联条件：任意订单行 flightScheduleId = scheduleId（不限 kind），
+  // 避免漏掉批量导入单 / 改期后仍在本班次的单 / 含套餐行但无独立 FLIGHT 行的单。
   const orders = (await client.order.findMany({
     where: {
-      status: { in: COUNTED_STATUSES },
+      status: { in: SEAT_HOLDING_STATUSES },
       items: {
         some: {
-          kind: 'FLIGHT',
           flightScheduleId: scheduleId,
         },
       },
@@ -278,31 +284,58 @@ export async function buildOrdersBySchedule(
     rows.push(...orderToRows(o));
   }
 
+  // 本班实际乘客数 = 所有 SEAT_HOLDING 订单的乘客行数（即已展开的 rows 数量）
+  const totalPassengers = rows.length;
+
   const wb = new ExcelJS.Workbook();
   wb.creator = 'Citur Travel · 整班机订单导出';
   wb.created = new Date();
   const ws = wb.addWorksheet('班机订单明细');
-  ws.columns = COLUMNS.map((c) => ({ header: c.header, key: c.key, width: c.width }));
 
-  const headerRow = ws.getRow(1);
+  // ── 顶部汇总区（先手写汇总行，再设列宽，再追加数据行）──
+  // ExcelJS 的 insertRow+mergeCells 连续调用同一行号有 bug（"Cannot merge already merged cells"）。
+  // 绕过方式：先写汇总行（不依赖 ws.columns），再配列定义，再追加数据行。
+  // 最终布局：
+  //   - schedule 存在：row1=开票进度，row2=乘客数，row3=表头，row4+=数据
+  //   - schedule 不存在：row1=乘客数，row2=表头，row3+=数据
+
+  let headerRowNumber = 1;
+
+  if (schedule) {
+    const cap = schedule.ticketingCap;
+    const r1 = ws.addRow([`开票进度：已开票 ${issuedCount} / 上限 ${cap} 张`]);
+    ws.mergeCells(r1.number, 1, r1.number, COLUMNS.length);
+    r1.font = {
+      bold: true,
+      color: { argb: issuedCount >= cap ? 'FFCC0000' : 'FF555555' },
+    };
+    headerRowNumber++;
+  }
+
+  const r2 = ws.addRow([
+    `本班实际乘客数：${totalPassengers} 人（含待支付/处理中/已完成等占座订单）`,
+  ]);
+  ws.mergeCells(r2.number, 1, r2.number, COLUMNS.length);
+  r2.font = { bold: true, color: { argb: 'FF1A5276' } };
+  headerRowNumber++;
+
+  // 表头行（手动写，列宽通过 ws.getColumn 单独设置）
+  const headerRow = ws.addRow(COLUMNS.map((c) => c.header));
   headerRow.font = { bold: true };
   headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEFEFEF' } };
   headerRow.alignment = { vertical: 'middle', horizontal: 'center' };
 
+  // 设置列宽 + key（列宽通过 column index 设置，不影响已有行）
+  COLUMNS.forEach((c, i) => {
+    const col = ws.getColumn(i + 1);
+    col.width = c.width;
+    col.key = c.key;
+  });
+
+  // 数据行（key-based addRow 在设好 key 之后仍然可用）
   for (const r of rows) ws.addRow(r);
 
-  // 开票进度指示行 — 插在表头上方；满额标红提醒运营停止开票
-  let frozenRows = 1;
-  if (schedule) {
-    const cap = schedule.ticketingCap;
-    ws.insertRow(1, [`开票进度：已开票 ${issuedCount} / 上限 ${cap} 张`]);
-    ws.mergeCells(1, 1, 1, COLUMNS.length);
-    ws.getRow(1).font = {
-      bold: true,
-      color: { argb: issuedCount >= cap ? 'FFCC0000' : 'FF555555' },
-    };
-    frozenRows = 2;
-  }
+  const frozenRows = headerRowNumber; // 冻结所有汇总行+表头
 
   // 冻结指示行+表头 + 订单号列，便于横向滚动核对
   ws.views = [{ state: 'frozen', xSplit: 1, ySplit: frozenRows }];

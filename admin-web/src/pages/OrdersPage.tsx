@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { api, ApiError, SETTLEMENT_MODE_LABEL, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceStatus, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL } from '../lib/api';
+import { api, ApiError, SETTLEMENT_MODE_LABEL, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceStatus, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import {
   type FulfillmentStatus,
@@ -152,6 +152,8 @@ function BalanceBadge({ balance, settlementMode }: { balance: number; settlement
 
 export function OrdersPage() {
   const tokens = useAuth((s) => s.tokens);
+  const user = useAuth((s) => s.user);
+  const isAdmin = user?.role === 'ADMIN';
   const [orders, setOrders] = useState<OrderSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -298,6 +300,28 @@ export function OrdersPage() {
       setSelected((prev) => (prev && prev.id === order.id ? res.order : prev));
     } catch (err) {
       alert(err instanceof ApiError ? `操作失败：${err.message}` : '操作失败');
+    }
+  };
+
+  // 删除订单（仅 ADMIN）：取消 + 释放机位/酒店库存
+  const deleteOrder = async (order: OrderSummary) => {
+    if (!tokens?.accessToken) return;
+    const confirmed = window.confirm(
+      `删除订单 ${order.orderNumber}？\n\n删除后机位/酒店将退回库存，且不可恢复。`,
+    );
+    if (!confirmed) return;
+    try {
+      const res = await api.updateOrderStatus(
+        tokens.accessToken,
+        order.id,
+        'CANCELLED',
+        '录入错误删除',
+        true, // force
+      );
+      setOrders((prev) => prev.map((o) => (o.id === order.id ? res.order : o)));
+      setSelected((prev) => (prev && prev.id === order.id ? res.order : prev));
+    } catch (err) {
+      alert(err instanceof ApiError ? `删除失败：${err.message}` : '删除失败');
     }
   };
 
@@ -926,6 +950,15 @@ export function OrdersPage() {
                       <button className="text-sm font-medium text-brand hover:text-brand-dark" onClick={() => setSelected(order)}>
                         详情
                       </button>
+                      {isAdmin && (
+                        <button
+                          className="text-xs text-rose-500 hover:text-rose-700"
+                          title="删除订单（ADMIN）"
+                          onClick={() => void deleteOrder(order)}
+                        >
+                          删除
+                        </button>
+                      )}
                     </div>
                   </td>
                 </tr>
@@ -957,6 +990,10 @@ export function OrdersPage() {
             setOrders((prev) => prev.map((o) => (o.id === updated.id ? updated : o)));
             setSelected((prev) => (prev && prev.id === updated.id ? updated : prev));
           }}
+          onDelete={() => {
+            void deleteOrder(selected);
+          }}
+          isAdmin={isAdmin}
         />
       )}
 
@@ -1002,6 +1039,8 @@ function OrderDrawer({
   onAdvance,
   onChanged,
   onOrderUpdated,
+  onDelete,
+  isAdmin,
 }: {
   order: OrderSummary;
   onClose: () => void;
@@ -1009,6 +1048,9 @@ function OrderDrawer({
   onChanged?: () => void;
   /** 售后改期/换人后用更新后的订单就地刷新抽屉与列表 */
   onOrderUpdated?: (order: OrderSummary) => void;
+  /** 删除订单（ADMIN 专用） */
+  onDelete?: () => void;
+  isAdmin?: boolean;
 }) {
   const view = deriveView(order);
   // 可行的下一步状态（与 backend orders.service ALLOWED_TRANSITIONS 保持一致的子集）
@@ -1082,6 +1124,7 @@ function OrderDrawer({
                   orderId={order.id}
                   item={it}
                   onOrderUpdated={onOrderUpdated}
+                  isAdmin={isAdmin}
                 />
               ))}
             </ul>
@@ -1173,6 +1216,20 @@ function OrderDrawer({
               ⓘ 状态变更会真实写入数据库并记录操作事件。
             </p>
           </section>
+
+          {isAdmin && onDelete && (
+            <section className="border-t border-rose-100 pt-3">
+              <button
+                className="w-full rounded-lg border border-rose-300 bg-rose-50 px-3 py-2 text-sm font-medium text-rose-700 hover:bg-rose-100"
+                onClick={onDelete}
+              >
+                删除订单（ADMIN）
+              </button>
+              <p className="mt-1 text-[11px] text-rose-400">
+                删除后机位/酒店将退回库存，且不可恢复。
+              </p>
+            </section>
+          )}
         </div>
       </div>
     </div>
@@ -1459,12 +1516,15 @@ function OrderItemRow({
   orderId,
   item,
   onOrderUpdated,
+  isAdmin,
 }: {
   orderId: string;
   item: OrderItem;
   onOrderUpdated?: (order: OrderSummary) => void;
+  isAdmin?: boolean;
 }) {
   const [rescheduling, setRescheduling] = useState(false);
+  const [editingPrice, setEditingPrice] = useState(false);
   const isFlight = item.kind === 'FLIGHT';
 
   return (
@@ -1479,12 +1539,20 @@ function OrderItemRow({
         </div>
         <div className="flex flex-col items-end gap-1">
           <div className="nums text-sm font-medium text-ink">¥{Number(item.amount).toLocaleString()}</div>
-          {isFlight && !rescheduling && (
+          {isFlight && !rescheduling && !editingPrice && (
             <button
               className="text-[11px] font-medium text-brand hover:text-brand-dark"
               onClick={() => setRescheduling(true)}
             >
               改期
+            </button>
+          )}
+          {isFlight && isAdmin && !rescheduling && !editingPrice && (
+            <button
+              className="text-[11px] font-medium text-amber-600 hover:text-amber-800"
+              onClick={() => setEditingPrice(true)}
+            >
+              改结算价
             </button>
           )}
         </div>
@@ -1496,6 +1564,18 @@ function OrderItemRow({
           onCancel={() => setRescheduling(false)}
           onSaved={(updated) => {
             setRescheduling(false);
+            onOrderUpdated?.(updated);
+          }}
+        />
+      )}
+      {isFlight && editingPrice && (
+        <SettlementPriceForm
+          orderId={orderId}
+          itemId={item.id}
+          currentPrice={Number(item.unitPrice)}
+          onCancel={() => setEditingPrice(false)}
+          onSaved={(updated) => {
+            setEditingPrice(false);
             onOrderUpdated?.(updated);
           }}
         />
@@ -1663,6 +1743,94 @@ function RescheduleForm({
           取消
         </button>
       </div>
+    </div>
+  );
+}
+
+// ── 改结算价（ADMIN）: 修订机票行单价 → 后端重算 order.total ────────────
+function SettlementPriceForm({
+  orderId,
+  itemId,
+  currentPrice,
+  onCancel,
+  onSaved,
+}: {
+  orderId: string;
+  itemId: string;
+  currentPrice: number;
+  onCancel: () => void;
+  onSaved: (order: OrderSummary) => void;
+}) {
+  const tokens = useAuth((s) => s.tokens);
+  const token = tokens?.accessToken ?? '';
+  const [newPrice, setNewPrice] = useState<number | null>(null);
+  const [reason, setReason] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function submit(): Promise<void> {
+    if (newPrice === null || newPrice <= 0) {
+      setErr('请输入大于 0 的结算价');
+      return;
+    }
+    setErr(null);
+    setSubmitting(true);
+    try {
+      const res = await api.updateItemSettlementPrice(token, orderId, itemId, {
+        unitPriceCny: newPrice,
+        reason: reason.trim() || undefined,
+      });
+      onSaved(res.order);
+    } catch (e: unknown) {
+      setErr(e instanceof ApiError ? e.message : '改价失败');
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div className="mt-2 space-y-2 rounded border border-amber-200 bg-amber-50/60 p-2 text-xs">
+      <div className="font-medium text-amber-800">改结算价（ADMIN）· 当前 ¥{currentPrice.toLocaleString()}</div>
+      <label className="block">
+        <span className="text-slate-500">新单价（¥，必填，大于 0）</span>
+        <NumberInput
+          value={newPrice}
+          onChange={setNewPrice}
+          min={1}
+          integerOnly
+          placeholder="如 1580"
+          className="mt-0.5 w-full rounded border border-slate-300 px-2 py-1"
+        />
+      </label>
+      <label className="block">
+        <span className="text-slate-500">原因（可选）</span>
+        <input
+          className="mt-0.5 w-full rounded border border-slate-300 px-2 py-1"
+          value={reason}
+          onChange={(e) => setReason(e.target.value)}
+          placeholder="如：补录团队价"
+        />
+      </label>
+      {err && <div className="rounded bg-rose-50 px-2 py-1 text-rose-700">{err}</div>}
+      <div className="flex gap-2 pt-1">
+        <button
+          className="flex-1 rounded bg-amber-600 px-2 py-1.5 font-medium text-white disabled:opacity-50"
+          onClick={submit}
+          disabled={submitting || newPrice === null || newPrice <= 0}
+        >
+          {submitting ? '保存中…' : '确认改价'}
+        </button>
+        <button
+          className="rounded bg-slate-100 px-3 py-1.5 text-slate-700 disabled:opacity-50"
+          onClick={onCancel}
+          disabled={submitting}
+        >
+          取消
+        </button>
+      </div>
+      <p className="text-[11px] text-amber-700">
+        ⓘ 改价直接修订订单行单价并重算订单总金额（非售后附加费）。
+      </p>
     </div>
   );
 }
@@ -2317,174 +2485,213 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   const tokens = useAuth((s) => s.tokens);
   const user = useAuth((s) => s.user);
   const token = tokens?.accessToken ?? '';
-  // 录入人 = 当前登录账号（后端从 auth 自动盖章；前端仅显示）
   const recorderLabel = user?.displayName || user?.email || '当前账号';
 
+  // ── 产品类型 ──────────────────────────────────────────────────────────────
+  const [productType, setProductType] = useState<BatchProductType>('FLIGHT_ONEWAY');
+
+  // ── 航班：出港（单程 + 往返）+ 回程（仅往返）────────────────────────────
   const [flights, setFlights] = useState<AdminFlight[]>([]);
-  const [flightId, setFlightId] = useState('');
-  const [schedules, setSchedules] = useState<AdminSchedule[]>([]);
-  const [scheduleId, setScheduleId] = useState('');
+  const [flightsErr, setFlightsErr] = useState<string | null>(null);
+  const [flightsLoading, setFlightsLoading] = useState(false);
+
+  const [outboundFlightId, setOutboundFlightId] = useState('');
+  const [outboundSchedules, setOutboundSchedules] = useState<AdminSchedule[]>([]);
+  const [outboundScheduleId, setOutboundScheduleId] = useState('');
+
+  const [returnFlightId, setReturnFlightId] = useState('');
+  const [returnSchedules, setReturnSchedules] = useState<AdminSchedule[]>([]);
+  const [returnScheduleId, setReturnScheduleId] = useState('');
+
   const [cabin, setCabin] = useState<CabinClass | ''>('');
-  const [notes, setNotes] = useState('');
-  const [rows, setRows] = useState<BatchRow[]>([{ fullName: '', documentNumber: '', dateOfBirth: '' }]);
-  const [submitting, setSubmitting] = useState(false);
-  const [result, setResult] = useState<BatchCreateOrdersResult | null>(null);
-  const [err, setErr] = useState<string | null>(null);
-  // 团队字段：团队结算价（每人 CNY，谈定一口价，覆盖动态定价）+ 团期备注
+
+  // ── 套餐 ──────────────────────────────────────────────────────────────────
+  const [bundles, setBundles] = useState<Bundle[]>([]);
+  const [bundleId, setBundleId] = useState('');
+  const [bundleNights, setBundleNights] = useState<number | null>(null);
+  const [bundleSingleCount, setBundleSingleCount] = useState<number | null>(null);
+  const [bundleBusinessCount, setBundleBusinessCount] = useState<number | null>(null);
+
+  // ── 结算价（FLIGHT 类型专用）+ 团期备注 ──────────────────────────────────
   const [settlementPriceCny, setSettlementPriceCny] = useState<number | null>(null);
   const [groupNote, setGroupNote] = useState('');
-  // 名单导入：下载模版忙碌 / 解析忙碌 / 解析警告
+
+  // ── 备注 ──────────────────────────────────────────────────────────────────
+  const [notes, setNotes] = useState('');
+
+  // ── 名单 ──────────────────────────────────────────────────────────────────
+  const [rows, setRows] = useState<BatchRow[]>([{ fullName: '', documentNumber: '', dateOfBirth: '' }]);
   const [templateBusy, setTemplateBusy] = useState(false);
   const [rosterBusy, setRosterBusy] = useState(false);
   const [rosterWarnings, setRosterWarnings] = useState<string[]>([]);
 
-  // 下载名单模版（.xlsx：姓名/护照号/出生日期/性别）
-  async function downloadTemplate(): Promise<void> {
-    if (!token) return;
-    setErr(null);
-    setTemplateBusy(true);
-    try {
-      const blob = await api.downloadRosterTemplate(token);
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `名单模版-${new Date().toISOString().slice(0, 10)}.xlsx`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 1000);
-    } catch (e: unknown) {
-      setErr(e instanceof ApiError ? `模版下载失败：${e.message}` : '模版下载失败');
-    } finally {
-      setTemplateBusy(false);
-    }
-  }
+  // ── 提交 ──────────────────────────────────────────────────────────────────
+  const [submitting, setSubmitting] = useState(false);
+  const [result, setResult] = useState<BatchCreateOrdersResult | null>(null);
+  const [err, setErr] = useState<string | null>(null);
 
-  // 上传名单 Excel → base64 → 解析 → 填充乘客行（与快速粘贴并存，均可用）
-  function onRosterFile(e: React.ChangeEvent<HTMLInputElement>): void {
-    const f = e.target.files?.[0];
-    e.target.value = ''; // 允许重复选同一文件再次触发
-    if (!f || !token) return;
-    if (f.size > 4 * 1024 * 1024) {
-      setErr('名单文件过大（>4MB），请精简后再传');
-      return;
-    }
-    setErr(null);
-    setRosterWarnings([]);
-    setRosterBusy(true);
-    const reader = new FileReader();
-    reader.onload = () => {
-      const dataUrl = typeof reader.result === 'string' ? reader.result : '';
-      // FileReader 给的是 data:...;base64,XXXX，后端要纯 base64，去掉前缀
-      const base64 = dataUrl.includes(',') ? dataUrl.slice(dataUrl.indexOf(',') + 1) : dataUrl;
-      if (!base64) {
-        setErr('文件读取失败');
-        setRosterBusy(false);
-        return;
-      }
-      api
-        .parseRoster(token, base64)
-        .then((res) => {
-          const parsed: BatchRow[] = res.rows
-            .filter((r) => r.name?.trim())
-            .map((r) => ({
-              fullName: r.name.trim(),
-              documentNumber: r.passportNo?.trim() ?? '',
-              dateOfBirth: r.dob?.trim() ?? '',
-            }));
-          if (parsed.length > 0) setRows(parsed);
-          else setErr('名单未解析出任何乘客，请检查文件格式');
-          setRosterWarnings(res.warnings ?? []);
-        })
-        .catch((e: unknown) => {
-          setErr(e instanceof ApiError ? `名单解析失败：${e.message}` : '名单解析失败');
-        })
-        .finally(() => setRosterBusy(false));
-    };
-    reader.onerror = () => {
-      setErr('文件读取失败');
-      setRosterBusy(false);
-    };
-    reader.readAsDataURL(f);
-  }
-
-  useEffect(() => {
+  // ── 加载航班列表（带重试）────────────────────────────────────────────────
+  function loadFlights(): void {
     if (!token) return;
+    setFlightsLoading(true);
+    setFlightsErr(null);
     api
       .listAllFlights(token)
       .then((r) => setFlights(r.flights))
-      .catch(() => setErr('航班列表加载失败'));
-  }, [token]);
+      .catch((e: unknown) => {
+        const isPermErr = e instanceof ApiError && (e.status === 401 || e.status === 403);
+        setFlightsErr(isPermErr ? '无权限加载航班列表，请刷新页面重新登录' : '航班列表加载失败，请点击重试');
+      })
+      .finally(() => setFlightsLoading(false));
+  }
 
+  useEffect(() => { loadFlights(); }, [token]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // 加载套餐列表
   useEffect(() => {
-    if (!token || !flightId) {
-      setSchedules([]);
-      setScheduleId('');
-      return;
-    }
-    api
-      .listSchedules(token, flightId)
-      .then((r) => setSchedules(r.schedules))
-      .catch(() => setErr('班次加载失败'));
-  }, [token, flightId]);
+    if (!token || productType !== 'BUNDLE') return;
+    api.listBundles(false).then((r) => setBundles(r.bundles)).catch(() => {/* 忽略，套餐下拉空白时用户可重选 */});
+  }, [token, productType]);
 
-  const flight = flights.find((f) => f.id === flightId);
-  const schedule = schedules.find((s) => s.id === scheduleId);
-  const cabinOptions = schedule?.seatClasses ?? [];
+  // 出港班次
+  useEffect(() => {
+    if (!token || !outboundFlightId) { setOutboundSchedules([]); setOutboundScheduleId(''); return; }
+    api.listSchedules(token, outboundFlightId)
+      .then((r) => setOutboundSchedules(r.schedules))
+      .catch(() => setErr('出港班次加载失败'));
+  }, [token, outboundFlightId]);
+
+  // 回程班次
+  useEffect(() => {
+    if (!token || !returnFlightId) { setReturnSchedules([]); setReturnScheduleId(''); return; }
+    api.listSchedules(token, returnFlightId)
+      .then((r) => setReturnSchedules(r.schedules))
+      .catch(() => setErr('回程班次加载失败'));
+  }, [token, returnFlightId]);
+
+  // 切换产品类型时清空相关选择
+  function switchProductType(pt: BatchProductType): void {
+    setProductType(pt);
+    setOutboundFlightId(''); setOutboundScheduleId(''); setOutboundSchedules([]);
+    setReturnFlightId(''); setReturnScheduleId(''); setReturnSchedules([]);
+    setCabin('');
+    setBundleId(''); setBundleNights(null); setBundleSingleCount(null); setBundleBusinessCount(null);
+    setSettlementPriceCny(null); setGroupNote('');
+    setErr(null);
+  }
+
+  const outboundFlight = flights.find((f) => f.id === outboundFlightId);
+  const outboundSchedule = outboundSchedules.find((s) => s.id === outboundScheduleId);
+  const returnFlight = flights.find((f) => f.id === returnFlightId);
+  const cabinOptions = outboundSchedule?.seatClasses ?? [];
+  const selectedBundle = bundles.find((b) => b.id === bundleId);
+
   const validRows = rows.filter((r) => r.fullName.trim() && r.documentNumber.trim() && parseDob(r.dateOfBirth));
 
   function setRow(i: number, patch: Partial<BatchRow>): void {
     setRows((prev) => prev.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
   }
-  function addRow(): void {
-    setRows((prev) => [...prev, { fullName: '', documentNumber: '', dateOfBirth: '' }]);
-  }
-  function removeRow(i: number): void {
-    setRows((prev) => (prev.length > 1 ? prev.filter((_, idx) => idx !== i) : prev));
-  }
-  // 每行一位：支持「姓名」或「姓名,护照号,生日」（逗号 / 制表符 / 空格分隔）
+  function addRow(): void { setRows((prev) => [...prev, { fullName: '', documentNumber: '', dateOfBirth: '' }]); }
+  function removeRow(i: number): void { setRows((prev) => (prev.length > 1 ? prev.filter((_, idx) => idx !== i) : prev)); }
+
   function pasteRows(text: string): void {
     const parsed = text
-      .split('\n')
-      .map((line) => line.trim())
-      .filter(Boolean)
+      .split('\n').map((l) => l.trim()).filter(Boolean)
       .map((line) => {
         const cols = line.split(/[,，\t]+|\s{2,}|\s+/).map((c) => c.trim()).filter(Boolean);
-        return {
-          fullName: cols[0] ?? '',
-          documentNumber: cols[1] ?? '',
-          dateOfBirth: cols[2] ?? '',
-        };
+        return { fullName: cols[0] ?? '', documentNumber: cols[1] ?? '', dateOfBirth: cols[2] ?? '' };
       })
       .filter((r) => r.fullName);
     if (parsed.length > 0) setRows(parsed);
   }
 
+  async function downloadTemplate(): Promise<void> {
+    if (!token) return;
+    setErr(null); setTemplateBusy(true);
+    try {
+      const blob = await api.downloadRosterTemplate(token);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = `名单模版-${new Date().toISOString().slice(0, 10)}.xlsx`;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (e: unknown) {
+      setErr(e instanceof ApiError ? `模版下载失败：${e.message}` : '模版下载失败');
+    } finally { setTemplateBusy(false); }
+  }
+
+  function onRosterFile(e: React.ChangeEvent<HTMLInputElement>): void {
+    const f = e.target.files?.[0];
+    e.target.value = '';
+    if (!f || !token) return;
+    if (f.size > 4 * 1024 * 1024) { setErr('名单文件过大（>4MB），请精简后再传'); return; }
+    setErr(null); setRosterWarnings([]); setRosterBusy(true);
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = typeof reader.result === 'string' ? reader.result : '';
+      const base64 = dataUrl.includes(',') ? dataUrl.slice(dataUrl.indexOf(',') + 1) : dataUrl;
+      if (!base64) { setErr('文件读取失败'); setRosterBusy(false); return; }
+      api.parseRoster(token, base64)
+        .then((res) => {
+          const parsed: BatchRow[] = res.rows
+            .filter((r) => (r.fullName ?? r.name)?.trim())
+            .map((r) => ({
+              fullName: (r.fullName ?? r.name ?? '').trim(),
+              documentNumber: (r.documentNumber ?? r.passportNo ?? '').trim(),
+              dateOfBirth: (r.dateOfBirth ?? r.dob ?? '').trim(),
+            }));
+          if (parsed.length > 0) setRows(parsed);
+          else setErr('名单未解析出任何乘客，请检查文件格式');
+          setRosterWarnings(res.warnings ?? []);
+        })
+        .catch((e: unknown) => { setErr(e instanceof ApiError ? `名单解析失败：${e.message}` : '名单解析失败'); })
+        .finally(() => setRosterBusy(false));
+    };
+    reader.onerror = () => { setErr('文件读取失败'); setRosterBusy(false); };
+    reader.readAsDataURL(f);
+  }
+
   async function submit(): Promise<void> {
     setErr(null);
-    if (!scheduleId || !cabin) {
-      setErr('请选择航班班次和舱位');
-      return;
+    if (validRows.length === 0) { setErr('至少要有一位完整乘客（姓名 + 护照号 + 出生日期）'); return; }
+
+    let description = '';
+    if (productType === 'FLIGHT_ONEWAY') {
+      if (!outboundScheduleId || !cabin) { setErr('请选择出港班次和舱位'); return; }
+      const dep = outboundSchedule?.departureTime.slice(0, 10) ?? '';
+      description = `${outboundFlight?.flightNumber ?? ''} ${outboundFlight?.originCode ?? ''}→${outboundFlight?.destinationCode ?? ''} ${dep} ${CABIN_ZH[cabin] ?? cabin}`.trim();
+    } else if (productType === 'FLIGHT_ROUNDTRIP') {
+      if (!outboundScheduleId || !returnScheduleId || !cabin) { setErr('请选择出港班次、回程班次和舱位'); return; }
+      const dep = outboundSchedule?.departureTime.slice(0, 10) ?? '';
+      const ret = returnSchedules.find((s) => s.id === returnScheduleId)?.departureTime.slice(0, 10) ?? '';
+      description = `${outboundFlight?.flightNumber ?? ''}去 ${dep} / ${returnFlight?.flightNumber ?? ''}回 ${ret} ${CABIN_ZH[cabin] ?? cabin}`.trim();
+    } else {
+      if (!bundleId) { setErr('请选择套餐'); return; }
+      description = selectedBundle?.name ?? bundleId;
     }
-    if (validRows.length === 0) {
-      setErr('至少要有一位完整乘客（姓名 + 护照号 + 出生日期）');
-      return;
-    }
-    const departDate = schedule ? schedule.departureTime.slice(0, 10) : '';
-    const description =
-      `${flight?.flightNumber ?? ''} ${flight?.originCode ?? ''}→${flight?.destinationCode ?? ''} ${departDate} ${CABIN_ZH[cabin] ?? cabin}`.trim();
-    // 团队结算价：>0 才视为设置（覆盖动态定价）；同时带上团期备注
+
     const teamPrice =
+      productType !== 'BUNDLE' &&
       settlementPriceCny !== null && Number.isFinite(settlementPriceCny) && settlementPriceCny > 0
-        ? settlementPriceCny
-        : undefined;
+        ? settlementPriceCny : undefined;
+
     setSubmitting(true);
     try {
       const res = await api.batchCreateOrders(token, {
-        flightScheduleId: scheduleId,
-        flightCabin: cabin,
+        productType,
+        ...(productType === 'FLIGHT_ONEWAY' || productType === 'FLIGHT_ROUNDTRIP'
+          ? {
+              outboundScheduleId,
+              ...(productType === 'FLIGHT_ROUNDTRIP' ? { returnScheduleId } : {}),
+              flightCabin: cabin as CabinClass,
+            }
+          : {
+              bundleId,
+              ...(bundleNights !== null ? { bundleNights } : {}),
+              ...(bundleSingleCount !== null ? { bundleSingleCount } : {}),
+              ...(bundleBusinessCount !== null ? { bundleBusinessCount } : {}),
+            }),
         description,
-        // 联系人/录入人由后端从登录账号自动盖章，前端不再发送 contactName/contactPhone
         notes: notes.trim() || undefined,
         passengers: validRows.map((r) => ({
           fullName: r.fullName.trim(),
@@ -2492,7 +2699,6 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
           dateOfBirth: parseDob(r.dateOfBirth) ?? '',
           nationality: 'CN',
         })),
-        // 团队结算价设置后覆盖动态定价；团期备注随团队字段一起带（无价时不发）
         ...(teamPrice !== undefined
           ? { settlementPriceCny: teamPrice, groupNote: groupNote.trim() || undefined }
           : {}),
@@ -2501,10 +2707,15 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
       if (res.successCount > 0) onCreated();
     } catch (e: unknown) {
       setErr(e instanceof ApiError ? e.message : '批量创建失败');
-    } finally {
-      setSubmitting(false);
-    }
+    } finally { setSubmitting(false); }
   }
+
+  const productTypeLabel: Record<BatchProductType, string> = {
+    FLIGHT_ONEWAY: '单程机票',
+    FLIGHT_ROUNDTRIP: '往返机票',
+    BUNDLE: '套餐',
+  };
+  const orderCountLabel = productType === 'BUNDLE' ? '套餐订单' : '机票订单';
 
   return (
     <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 p-4">
@@ -2562,64 +2773,247 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
           <div className="space-y-4 p-5">
             {err && <div className="rounded-md bg-rose-50 px-4 py-2 text-sm text-rose-700">{err}</div>}
 
-            {/* 航班 + 班次 + 舱位 */}
-            <div className="grid gap-3 md:grid-cols-3">
-              <label className="text-xs text-slate-500">
-                航班
-                <select
-                  className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
-                  value={flightId}
-                  onChange={(e) => setFlightId(e.target.value)}
-                >
-                  <option value="">选择航班…</option>
-                  {flights.map((f) => (
-                    <option key={f.id} value={f.id}>
-                      {f.flightNumber} {f.originCode}→{f.destinationCode}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="text-xs text-slate-500">
-                班次（出发日期）
-                <select
-                  className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
-                  value={scheduleId}
-                  onChange={(e) => { setScheduleId(e.target.value); setCabin(''); }}
-                  disabled={!flightId}
-                >
-                  <option value="">选择班次…</option>
-                  {schedules.map((s) => (
-                    <option key={s.id} value={s.id}>
-                      {s.departureTime.slice(0, 16).replace('T', ' ')}
-                    </option>
-                  ))}
-                </select>
-              </label>
-              <label className="text-xs text-slate-500">
-                舱位
-                <select
-                  className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
-                  value={cabin}
-                  onChange={(e) => setCabin(e.target.value as CabinClass)}
-                  disabled={!scheduleId}
-                >
-                  <option value="">选择舱位…</option>
-                  {cabinOptions.map((c) => (
-                    <option key={c.id} value={c.cabin}>
-                      {CABIN_ZH[c.cabin] ?? c.cabin}（余 {c.capacity - c.sold}）¥{Number(c.basePrice).toFixed(0)}
-                    </option>
-                  ))}
-                </select>
-              </label>
+            {/* 产品类型选择 */}
+            <div>
+              <div className="mb-1.5 text-xs font-medium text-slate-500">产品类型</div>
+              <div className="flex gap-2">
+                {(['FLIGHT_ONEWAY', 'FLIGHT_ROUNDTRIP', 'BUNDLE'] as BatchProductType[]).map((pt) => (
+                  <button
+                    key={pt}
+                    type="button"
+                    className={`rounded-md border px-3 py-1.5 text-sm font-medium transition-colors ${
+                      productType === pt
+                        ? 'border-brand bg-brand text-white'
+                        : 'border-slate-300 bg-white text-slate-700 hover:border-brand hover:text-brand'
+                    }`}
+                    onClick={() => switchProductType(pt)}
+                  >
+                    {productTypeLabel[pt]}
+                  </button>
+                ))}
+              </div>
             </div>
 
-            {/* 录入人（= 当前登录账号，后端自动记录）+ 备注 */}
+            {/* ── 航班类型：出港 ── */}
+            {(productType === 'FLIGHT_ONEWAY' || productType === 'FLIGHT_ROUNDTRIP') && (
+              <>
+                {flightsErr && (
+                  <div className="flex items-center gap-2 rounded-md bg-rose-50 px-3 py-2 text-sm text-rose-700">
+                    <span>{flightsErr}</span>
+                    <button
+                      type="button"
+                      className="ml-auto rounded border border-rose-300 px-2 py-0.5 text-xs hover:bg-rose-100"
+                      onClick={loadFlights}
+                      disabled={flightsLoading}
+                    >
+                      {flightsLoading ? '加载中…' : '重试'}
+                    </button>
+                  </div>
+                )}
+
+                <div className="rounded-md border border-slate-200 p-3">
+                  <div className="mb-2 text-xs font-medium text-slate-600">
+                    {productType === 'FLIGHT_ROUNDTRIP' ? '出港航班' : '航班'}
+                  </div>
+                  <div className="grid gap-3 md:grid-cols-3">
+                    <label className="text-xs text-slate-500">
+                      航班
+                      <select
+                        className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                        value={outboundFlightId}
+                        onChange={(e) => { setOutboundFlightId(e.target.value); setOutboundScheduleId(''); setCabin(''); }}
+                        disabled={flightsLoading}
+                      >
+                        <option value="">选择航班…</option>
+                        {flights.map((f) => (
+                          <option key={f.id} value={f.id}>
+                            {f.flightNumber} {f.originCode}→{f.destinationCode}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="text-xs text-slate-500">
+                      班次（出发日期）
+                      <select
+                        className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                        value={outboundScheduleId}
+                        onChange={(e) => { setOutboundScheduleId(e.target.value); setCabin(''); }}
+                        disabled={!outboundFlightId}
+                      >
+                        <option value="">选择班次…</option>
+                        {outboundSchedules.map((s) => (
+                          <option key={s.id} value={s.id}>
+                            {s.departureTime.slice(0, 16).replace('T', ' ')}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="text-xs text-slate-500">
+                      舱位
+                      <select
+                        className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                        value={cabin}
+                        onChange={(e) => setCabin(e.target.value as CabinClass)}
+                        disabled={!outboundScheduleId}
+                      >
+                        <option value="">选择舱位…</option>
+                        {cabinOptions.map((c) => (
+                          <option key={c.id} value={c.cabin}>
+                            {CABIN_ZH[c.cabin] ?? c.cabin}（余 {c.capacity - c.sold}）¥{Number(c.basePrice).toFixed(0)}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  </div>
+                </div>
+
+                {/* 回程航班（仅往返） */}
+                {productType === 'FLIGHT_ROUNDTRIP' && (
+                  <div className="rounded-md border border-slate-200 p-3">
+                    <div className="mb-2 text-xs font-medium text-slate-600">回程航班</div>
+                    <div className="grid gap-3 md:grid-cols-2">
+                      <label className="text-xs text-slate-500">
+                        航班
+                        <select
+                          className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                          value={returnFlightId}
+                          onChange={(e) => { setReturnFlightId(e.target.value); setReturnScheduleId(''); }}
+                          disabled={flightsLoading}
+                        >
+                          <option value="">选择航班…</option>
+                          {flights.map((f) => (
+                            <option key={f.id} value={f.id}>
+                              {f.flightNumber} {f.originCode}→{f.destinationCode}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="text-xs text-slate-500">
+                        班次（出发日期）
+                        <select
+                          className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                          value={returnScheduleId}
+                          onChange={(e) => setReturnScheduleId(e.target.value)}
+                          disabled={!returnFlightId}
+                        >
+                          <option value="">选择班次…</option>
+                          {returnSchedules.map((s) => (
+                            <option key={s.id} value={s.id}>
+                              {s.departureTime.slice(0, 16).replace('T', ' ')}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
+                    <p className="mt-1.5 text-[11px] text-slate-400">
+                      回程与出港可以是不同航班，共用同一舱位等级。
+                    </p>
+                  </div>
+                )}
+
+                {/* 结算价（FLIGHT 专用） */}
+                <div className="rounded-md border border-slate-200 bg-slate-50/60 p-3">
+                  <div className="mb-2 text-sm font-medium text-slate-700">旅游团（选填）</div>
+                  <div className="grid gap-3 md:grid-cols-2">
+                    <label className="text-xs text-slate-500">
+                      结算价/人（¥）
+                      <NumberInput
+                        className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                        value={settlementPriceCny}
+                        onChange={setSettlementPriceCny}
+                        min={0}
+                        step={1}
+                        integerOnly
+                        placeholder="留空 = 按动态定价"
+                      />
+                    </label>
+                    <label className="text-xs text-slate-500">
+                      团期备注
+                      <input
+                        className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                        value={groupNote}
+                        onChange={(e) => setGroupNote(e.target.value)}
+                        placeholder="如 2026 春节团 7 日"
+                      />
+                    </label>
+                  </div>
+                  <p className="mt-2 text-[11px] text-amber-700">
+                    ⓘ 填了结算价后，每位乘客按此价建单，覆盖仓位阶梯 / 自动定价。
+                  </p>
+                </div>
+              </>
+            )}
+
+            {/* ── 套餐类型 ── */}
+            {productType === 'BUNDLE' && (
+              <div className="rounded-md border border-slate-200 p-3">
+                <div className="mb-2 text-xs font-medium text-slate-600">套餐</div>
+                <div className="grid gap-3 md:grid-cols-2">
+                  <label className="text-xs text-slate-500">
+                    选择套餐
+                    <select
+                      className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                      value={bundleId}
+                      onChange={(e) => setBundleId(e.target.value)}
+                    >
+                      <option value="">选择套餐…</option>
+                      {bundles.map((b) => (
+                        <option key={b.id} value={b.id}>
+                          {b.code ? `[${b.code}] ` : ''}{b.name}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="text-xs text-slate-500">
+                    入住晚数（选填）
+                    <NumberInput
+                      className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                      value={bundleNights}
+                      onChange={setBundleNights}
+                      min={1}
+                      max={30}
+                      step={1}
+                      integerOnly
+                      placeholder={selectedBundle?.hotelNights ? `默认 ${selectedBundle.hotelNights} 晚` : '晚数'}
+                    />
+                  </label>
+                  <label className="text-xs text-slate-500">
+                    单人入住人数（选填）
+                    <NumberInput
+                      className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                      value={bundleSingleCount}
+                      onChange={setBundleSingleCount}
+                      min={0}
+                      max={20}
+                      step={1}
+                      integerOnly
+                      placeholder="0"
+                    />
+                  </label>
+                  <label className="text-xs text-slate-500">
+                    升舱商务人数（选填）
+                    <NumberInput
+                      className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                      value={bundleBusinessCount}
+                      onChange={setBundleBusinessCount}
+                      min={0}
+                      max={20}
+                      step={1}
+                      integerOnly
+                      placeholder="0"
+                    />
+                  </label>
+                </div>
+              </div>
+            )}
+
+            {/* 录入人 + 备注 */}
             <div className="grid gap-3 md:grid-cols-2">
               <div className="text-xs text-slate-500">
                 录入人
                 <div className="mt-1 flex h-[34px] items-center rounded-md bg-slate-50 px-2.5 text-sm text-slate-700">
                   {recorderLabel}
-                  <span className="ml-2 text-xs text-slate-400">（系统自动记录，谁录的找谁）</span>
+                  <span className="ml-2 text-xs text-slate-400">（系统自动记录）</span>
                 </div>
               </div>
               <label className="text-xs text-slate-500">
@@ -2628,38 +3022,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
               </label>
             </div>
 
-            {/* 旅游团：团队结算价（每人一口价，覆盖动态定价）+ 团期备注 */}
-            <div className="rounded-md border border-slate-200 bg-slate-50/60 p-3">
-              <div className="mb-2 text-sm font-medium text-slate-700">旅游团（选填）</div>
-              <div className="grid gap-3 md:grid-cols-2">
-                <label className="text-xs text-slate-500">
-                  团队结算价（每人 ¥）
-                  <NumberInput
-                    className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
-                    value={settlementPriceCny}
-                    onChange={setSettlementPriceCny}
-                    min={0}
-                    step={1}
-                    integerOnly
-                    placeholder="留空 = 按动态定价"
-                  />
-                </label>
-                <label className="text-xs text-slate-500">
-                  团期备注
-                  <input
-                    className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
-                    value={groupNote}
-                    onChange={(e) => setGroupNote(e.target.value)}
-                    placeholder="如 2026 春节团 7 日"
-                  />
-                </label>
-              </div>
-              <p className="mt-2 text-[11px] text-amber-700">
-                ⓘ 填了团队结算价后，每位乘客按此价建单，覆盖仓位阶梯 / 自动定价（与代理谈定的整团一口价）。
-              </p>
-            </div>
-
-            {/* 名单导入：下载模版 → 上传 Excel 自动填充乘客行（与快速粘贴并存） */}
+            {/* 名单导入 */}
             <div className="flex flex-wrap items-center gap-3">
               <button
                 type="button"
@@ -2667,10 +3030,10 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                 onClick={() => void downloadTemplate()}
                 disabled={templateBusy}
               >
-                {templateBusy ? '生成中…' : '📄 下载名单模版'}
+                {templateBusy ? '生成中…' : '下载名单模版'}
               </button>
               <label className="btn-secondary cursor-pointer text-sm">
-                {rosterBusy ? '解析中…' : '📋 上传名单(Excel)'}
+                {rosterBusy ? '解析中…' : '上传名单 Excel'}
                 <input
                   type="file"
                   accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -2679,35 +3042,27 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                   disabled={rosterBusy}
                 />
               </label>
-              <span className="text-[11px] text-slate-400">
-                上传后自动填充下方名单（姓名/护照号/出生日期）；也可继续手动修改。
-              </span>
+              <span className="text-[11px] text-slate-400">上传后自动填充下方名单；也可手动录入。</span>
             </div>
 
-            {/* 名单解析警告（缺字段/格式问题） */}
             {rosterWarnings.length > 0 && (
               <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
                 <div className="font-medium">名单解析提醒（{rosterWarnings.length} 条）：</div>
                 <ul className="mt-1 max-h-32 list-disc space-y-0.5 overflow-auto pl-5">
-                  {rosterWarnings.map((w, i) => (
-                    <li key={i}>{w}</li>
-                  ))}
+                  {rosterWarnings.map((w, i) => <li key={i}>{w}</li>)}
                 </ul>
               </div>
             )}
 
-            {/* 快速粘贴：姓名 或 姓名,护照号,生日 */}
             <details className="text-xs text-slate-500">
-              <summary className="cursor-pointer">快速粘贴（每行一位：姓名 — 或 姓名,护照号,生日(YYYY-MM-DD)）</summary>
+              <summary className="cursor-pointer">快速粘贴（每行一位：姓名 — 或 姓名,护照号,生日）</summary>
               <textarea
                 className="mt-2 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
                 rows={3}
                 placeholder={'张三\n李四,E12345678,1990-01-01\n王五  G87654321  1985/12/3'}
                 onChange={(e) => pasteRows(e.target.value)}
               />
-              <p className="mt-1 text-[11px] text-slate-400">
-                分隔符支持逗号 / Tab / 空格；只填姓名也行，护照号、生日可留空后续手录。
-              </p>
+              <p className="mt-1 text-[11px] text-slate-400">分隔符支持逗号 / Tab / 空格；只填姓名也行，护照号、生日可留空后续手录。</p>
             </details>
 
             {/* 乘客表格 */}
@@ -2750,9 +3105,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                                   value={r.dateOfBirth}
                                   onChange={(e) => setRow(i, { dateOfBirth: e.target.value })}
                                 />
-                                {dobBad && (
-                                  <span className="mt-0.5 block text-[11px] text-rose-500">格式如 1990-01-01</span>
-                                )}
+                                {dobBad && <span className="mt-0.5 block text-[11px] text-rose-500">格式如 1990-01-01</span>}
                               </>
                             );
                           })()}
@@ -2768,10 +3121,10 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
             </div>
 
             <div className="flex items-center justify-between border-t border-slate-200 pt-3">
-              <span className="text-xs text-slate-500">将创建 {validRows.length} 张订单（机票 × 1/人）</span>
+              <span className="text-xs text-slate-500">将创建 {validRows.length} 张{orderCountLabel}（1/人）</span>
               <div className="flex gap-2">
                 <button className="btn-secondary text-sm" onClick={onClose}>取消</button>
-                <button className="btn-primary text-sm disabled:opacity-50" onClick={submit} disabled={submitting}>
+                <button className="btn-primary text-sm disabled:opacity-50" onClick={() => void submit()} disabled={submitting}>
                   {submitting ? '创建中…' : `批量创建 ${validRows.length} 单`}
                 </button>
               </div>

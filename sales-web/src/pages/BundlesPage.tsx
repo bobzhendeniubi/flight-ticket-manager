@@ -431,7 +431,19 @@ export function BundlesPage() {
             childCount={childCount}
             infantCount={infantCount}
             hotel={matchHotelForBundle(b, hotels)}
-            onView={() => navigate(`/bundles/${b.id}`)}
+            onView={(cfg) =>
+            navigate(`/bundles/${b.id}`, {
+              state: {
+                goDate: cfg.goDate,
+                adultCount: cfg.adultCount,
+                childCount: cfg.childCount,
+                infantCount: cfg.infantCount,
+                singleCount: cfg.singleCount,
+                businessCount: cfg.businessCount,
+                nights: cfg.nights,
+              },
+            })
+          }
             onShowHotel={(hotel) => setHotelModal({ hotel, roomTypeName: b.hotelRoomType?.name ?? null })}
             onAdd={(cfg) => {
               const addOnSummary = [
@@ -528,8 +540,8 @@ function ConfigurableBundleCard({
   childCount: number;
   infantCount: number;
   hotel?: Hotel;
-  /** 跳转到套餐详情（/bundles/:id）；卡片整体或"查看详情"触发。 */
-  onView: () => void;
+  /** 跳转到套餐详情（/bundles/:id）；卡片整体或"查看详情"触发。透传当前卡片配置供详情页初始化。 */
+  onView: (cfg: { goDate: string; adultCount: number; childCount: number; infantCount: number; singleCount: number; businessCount: number; nights: number }) => void;
   onShowHotel: (hotel: Hotel) => void;
   onAdd: (cfg: BundleAddConfig) => void;
 }) {
@@ -732,7 +744,7 @@ function ConfigurableBundleCard({
       {/* 图片整块可点 → 详情页（不影响下方加购按钮，按钮 stopPropagation 走自己的逻辑） */}
       <button
         type="button"
-        onClick={onView}
+        onClick={() => onView({ goDate: cardGoDate, adultCount, childCount, infantCount, singleCount, businessCount, nights })}
         aria-label={`查看「${b.name}」套餐详情`}
         className="relative block w-full overflow-hidden bg-sand-light text-left focus:outline-none focus-visible:ring-2 focus-visible:ring-brand/60"
       >
@@ -1030,7 +1042,11 @@ function ConfigurableBundleCard({
       )}
 
       <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
-        <button type="button" className="btn-ghost text-sm" onClick={onView}>
+        <button
+          type="button"
+          className="btn-ghost text-sm"
+          onClick={() => onView({ goDate: cardGoDate, adultCount, childCount, infantCount, singleCount, businessCount, nights })}
+        >
           查看详情
         </button>
         <Link to="/cart" className="btn-secondary text-sm">查看购物车</Link>

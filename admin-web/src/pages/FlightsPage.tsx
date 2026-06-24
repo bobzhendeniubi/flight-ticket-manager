@@ -262,7 +262,7 @@ function seatTone(remaining: number): { text: string; dot: string } {
 }
 
 function getCabin(s: AdminSchedule, cabin: CabinClass): ScheduleSeat | undefined {
-  return s.seatClasses.find((c) => c.cabin === cabin);
+  return (s.seatClasses ?? []).find((c) => c.cabin === cabin);
 }
 
 // ── 仓位阶梯：常量与工具 ───────────────────────────────────────────────
@@ -294,15 +294,16 @@ function currentLadderTierIndex(buckets: FareBucket[], sold: number): number {
 }
 
 // 某舱位的"当前售价"（镜像后端定价）：有阶梯→当前档价；否则→固定 basePrice。
+// || 0 兜住 basePrice 为空串/null 时 Number(...) 产生 NaN，避免渲染抛错。
 function seatCurrentPrice(seat: ScheduleSeat): number {
   return hasLadder(seat.fareBuckets)
     ? currentLadderPrice(seat.fareBuckets, seat.sold)
-    : Number(seat.basePrice);
+    : (Number(seat.basePrice) || 0);
 }
 
 // 一个班次是否有阶梯（任一舱位设了 fareBuckets 即视为"阶梯"定价）。
 function scheduleHasLadder(s: AdminSchedule): boolean {
-  return s.seatClasses.some((c) => hasLadder(c.fareBuckets));
+  return (s.seatClasses ?? []).some((c) => hasLadder(c.fareBuckets));
 }
 
 // 月历格用：在「在售」班次里取经济舱当前售价区间。
@@ -664,7 +665,7 @@ function SchedulesTable({
                   </td>
                   <td>
                     <ul className="space-y-0.5">
-                      {s.seatClasses.map((c) => {
+                      {(s.seatClasses ?? []).map((c) => {
                         const remaining = c.capacity - c.sold;
                         const isLow = remaining <= LOW_SEAT_THRESHOLD;
                         return (
@@ -673,7 +674,7 @@ function SchedulesTable({
                             <span className={isLow ? 'font-medium text-rose-600' : 'font-medium text-ink'}>
                               {remaining}
                             </span>
-                            /<span className="font-medium text-ink">{c.capacity}</span> · ¥{Number(c.basePrice).toFixed(0)}
+                            /<span className="font-medium text-ink">{c.capacity}</span> · ¥{(Number(c.basePrice) || 0).toFixed(0)}
                             {isLow && <span className="ml-1 text-xs text-rose-600">余位紧张</span>}
                           </li>
                         );
@@ -969,16 +970,24 @@ function DaySchedule({
   const econ = getCabin(schedule, 'ECONOMY');
   const biz = getCabin(schedule, 'BUSINESS');
 
-  const [econPrice, setEconPrice] = useState<number | null>(econ ? Number(econ.basePrice) : null);
-  const [bizPrice, setBizPrice] = useState<number | null>(biz ? Number(biz.basePrice) : null);
+  const [econPrice, setEconPrice] = useState<number | null>(econ ? (Number(econ.basePrice) || 0) : null);
+  const [bizPrice, setBizPrice] = useState<number | null>(biz ? (Number(biz.basePrice) || 0) : null);
   const [saving, setSaving] = useState(false);
   const [toggling, setToggling] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [savedMsg, setSavedMsg] = useState<string | null>(null);
 
+  // 改时刻弹窗
+  const [showTimeEdit, setShowTimeEdit] = useState(false);
+  const [timeDep, setTimeDep] = useState('');
+  const [timeArr, setTimeArr] = useState('');
+  const [timeSaving, setTimeSaving] = useState(false);
+  const [timeErr, setTimeErr] = useState<string | null>(null);
+  const [timeMsg, setTimeMsg] = useState<string | null>(null);
+
   // 该班次的总已售（任一舱位 sold>0 即视为"已有销售"，禁止删除）。
-  const totalSold = schedule.seatClasses.reduce((sum, c) => sum + c.sold, 0);
+  const totalSold = (schedule.seatClasses ?? []).reduce((sum, c) => sum + c.sold, 0);
 
   // 仓位阶梯草稿（按舱位）—— 初值取自该舱位已有阶梯，深拷贝避免改到 props。
   const [econLadder, setEconLadder] = useState<FareBucket[]>(
@@ -1101,6 +1110,50 @@ function DaySchedule({
       setLadderErr(e instanceof ApiError ? e.message : '清除阶梯失败');
     } finally {
       setLadderBusy(null);
+    }
+  };
+
+  // 将 ISO 字符串转成 datetime-local 输入框的默认值（本地时区，保留到分）。
+  const isoToLocal = (iso: string): string => {
+    if (!iso) return '';
+    const d = new Date(iso);
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  };
+
+  // 打开改时刻弹窗，预填当前值。
+  const openTimeEdit = () => {
+    setTimeDep(isoToLocal(schedule.departureTime));
+    setTimeArr(isoToLocal(schedule.arrivalTime));
+    setTimeErr(null);
+    setTimeMsg(null);
+    setShowTimeEdit(true);
+  };
+
+  // 提交改时刻——只传两个字段，校验由后端负责（到达早于出发会返回 400）。
+  const onSaveTime = async () => {
+    if (!tokens || timeSaving) return;
+    if (!timeDep || !timeArr) {
+      setTimeErr('请填写出发和到达时刻');
+      return;
+    }
+    setTimeSaving(true);
+    setTimeErr(null);
+    setTimeMsg(null);
+    try {
+      // datetime-local 值形如 "2026-07-01T10:30"，附加系统时区偏移后传给后端。
+      const toIso = (local: string) => new Date(local).toISOString();
+      await api.updateSchedule(tokens.accessToken, schedule.id, {
+        departureTime: toIso(timeDep),
+        arrivalTime: toIso(timeArr),
+      });
+      setTimeMsg('✅ 时刻已更新');
+      setShowTimeEdit(false);
+      await onSaved();
+    } catch (e) {
+      setTimeErr(e instanceof ApiError ? e.message : '保存失败');
+    } finally {
+      setTimeSaving(false);
     }
   };
 
@@ -1305,12 +1358,71 @@ function DaySchedule({
             >
               {toggling ? '处理中…' : schedule.isActive ? '售罄' : '恢复销售'}
             </button>
+            <button
+              type="button"
+              className="btn-secondary text-xs"
+              title="修改该班次的出发/到达时刻（航司改点）"
+              onClick={openTimeEdit}
+            >
+              改时刻
+            </button>
             <button type="button" className="btn-primary text-xs" disabled={saving} onClick={onSavePrices}>
               {saving ? '保存中…' : '保存价格'}
             </button>
           </>
         )}
       </div>
+
+      {/* 改时刻弹窗 */}
+      {showTimeEdit && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+          <div className="w-full max-w-sm rounded-lg bg-white p-5 shadow-xl">
+            <h3 className="mb-4 text-sm font-semibold text-ink">修改班次时刻</h3>
+            <div className="space-y-3">
+              <div>
+                <label className="label">出发时刻</label>
+                <input
+                  type="datetime-local"
+                  className="input w-full"
+                  value={timeDep}
+                  onChange={(e) => setTimeDep(e.target.value)}
+                />
+              </div>
+              <div>
+                <label className="label">到达时刻</label>
+                <input
+                  type="datetime-local"
+                  className="input w-full"
+                  value={timeArr}
+                  onChange={(e) => setTimeArr(e.target.value)}
+                />
+              </div>
+            </div>
+            {timeErr && (
+              <div className="mt-3 rounded-md bg-red-50 px-3 py-2 text-xs text-red-700">{timeErr}</div>
+            )}
+            {timeMsg && <div className="mt-3 text-xs text-emerald-700">{timeMsg}</div>}
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                type="button"
+                className="btn-secondary text-xs"
+                disabled={timeSaving}
+                onClick={() => setShowTimeEdit(false)}
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                className="btn-primary text-xs"
+                disabled={timeSaving}
+                onClick={onSaveTime}
+              >
+                {timeSaving ? '保存中…' : '保存时刻'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1379,7 +1491,7 @@ function BulkEditPanel({
   };
 
   const cabinsToEdit = (s: AdminSchedule): CabinClass[] => {
-    if (cabinPick === 'ALL') return s.seatClasses.map((c) => c.cabin);
+    if (cabinPick === 'ALL') return (s.seatClasses ?? []).map((c) => c.cabin);
     return getCabin(s, cabinPick) ? [cabinPick] : [];
   };
 

@@ -21,6 +21,7 @@ import {
   publicOrderLookupQuerySchema,
   rescheduleOrderBodySchema,
   swapPassengerBodySchema,
+  updateItemSettlementPriceBodySchema,
   updateStatusBodySchema,
 } from './orders.schemas.js';
 import { prisma } from '../../db/prisma.js';
@@ -884,6 +885,33 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         statusChanged: audit.statusChanged,
         note: body.note,
       },
+      severity: 'WARNING',
+    });
+    return { order };
+  });
+
+  // ── B4 改结算价（ADMIN/STAFF）──
+  // PATCH /orders/:id/items/:itemId/settlement-price  body: { unitPriceCny, reason? }
+  // 建单后订正某条 FLIGHT 行的每张结算价；事务内重算 order.subtotal/total（不走 adjustmentCny）。
+  app.patch('/:id/items/:itemId/settlement-price', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅运营/管理员可改结算价' });
+    }
+    const { id, itemId } = req.params as { id: string; itemId: string };
+    const body = updateItemSettlementPriceBodySchema.parse(req.body);
+    const { order, audit } = await service.updateItemSettlementPrice(id, itemId, body, {
+      userId: req.user.sub,
+      role,
+    });
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'UPDATE_ITEM_SETTLEMENT_PRICE',
+      targetType: 'ORDER',
+      targetId: id,
+      targetLabel: audit.orderNumber,
+      before: { orderItemId: audit.orderItemId, ...audit.before },
+      after: { ...audit.after, reason: audit.reason },
       severity: 'WARNING',
     });
     return { order };

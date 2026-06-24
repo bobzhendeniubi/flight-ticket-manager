@@ -16,6 +16,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
   api,
+  ApiError,
   type MySeatLock,
   type MyWaitlistEntry,
   type OrderSummary,
@@ -106,6 +107,8 @@ export function MyOrdersPage() {
   const [orders, setOrders] = useState<OrderSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // token 过期/无效时（401）→ 展示游客查单入口而非错误文案
+  const [tokenInvalid, setTokenInvalid] = useState(false);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   // 详情缓存：listOrders 返回的 passenger 只有 {id, fullName}，
   // 展开时拉 GET /orders/:id 拿完整 documentType / documentNumber
@@ -156,10 +159,18 @@ export function MyOrdersPage() {
   useEffect(() => {
     if (!token) return;
     setLoading(true);
+    setTokenInvalid(false);
     api
       .listOrders(token)
       .then((r) => setOrders(r.orders))
-      .catch((e) => setError(e instanceof Error ? e.message : '加载失败'))
+      .catch((e) => {
+        // 401 = token 过期/失效 → 展示游客查单入口，不显示原始错误文案
+        if (e instanceof ApiError && e.status === 401) {
+          setTokenInvalid(true);
+        } else {
+          setError(e instanceof Error ? e.message : '加载失败');
+        }
+      })
       .finally(() => setLoading(false));
   }, [token]);
 
@@ -217,13 +228,44 @@ export function MyOrdersPage() {
     return (
       <div className="card animate-fade-up py-16 text-center">
         <div className="mx-auto flex h-20 w-20 items-center justify-center rounded-full bg-brand-50 text-brand">
-          <Icon name="user" className="h-9 w-9" />
+          <Icon name="search" className="h-9 w-9" />
         </div>
-        <p className="mt-4 text-base font-semibold text-ink">请先登录</p>
-        <p className="mt-1 text-sm text-ink-muted">登录后即可查看订单、锁位与候补</p>
-        <Link to="/login?redirect=/orders" className="btn-primary mt-5 inline-flex items-center gap-1.5">
-          去登录 <Icon name="arrowRight" className="h-4 w-4" />
-        </Link>
+        <p className="mt-4 text-base font-semibold text-ink">游客订单查询</p>
+        <p className="mt-1 text-sm text-ink-muted">
+          游客下单后请用「订单号 + 手机号」查询订单进度，无需登录。
+        </p>
+        <div className="mt-5 flex flex-col items-center gap-3">
+          <Link to="/lookup" className="btn-primary inline-flex items-center gap-1.5">
+            <Icon name="search" className="h-4 w-4" />
+            用订单号查询
+          </Link>
+          <Link to="/login?redirect=/orders" className="text-sm font-medium text-brand-700 transition hover:text-brand-dark">
+            已有账号？去登录 →
+          </Link>
+        </div>
+      </div>
+    );
+  }
+
+  if (tokenInvalid) {
+    return (
+      <div className="card animate-fade-up py-16 text-center">
+        <div className="mx-auto flex h-20 w-20 items-center justify-center rounded-full bg-sun-light text-amber-600">
+          <Icon name="clock" className="h-9 w-9" />
+        </div>
+        <p className="mt-4 text-base font-semibold text-ink">登录已过期</p>
+        <p className="mt-1 text-sm text-ink-muted">
+          游客或会话过期后可用「订单号 + 手机号」查询订单，无需重新登录。
+        </p>
+        <div className="mt-5 flex flex-col items-center gap-3">
+          <Link to="/lookup" className="btn-primary inline-flex items-center gap-1.5">
+            <Icon name="search" className="h-4 w-4" />
+            用订单号查询
+          </Link>
+          <Link to="/login?redirect=/orders" className="text-sm font-medium text-brand-700 transition hover:text-brand-dark">
+            重新登录 →
+          </Link>
+        </div>
       </div>
     );
   }
