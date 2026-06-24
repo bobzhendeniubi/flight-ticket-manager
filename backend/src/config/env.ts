@@ -90,7 +90,7 @@ const EnvSchema = z.object({
   // 在 DashScope 控制台（https://dashscope.console.aliyun.com）→ API-KEY 管理 申请。
   // ═══════════════════════════════════════════════════════════
   DASHSCOPE_API_KEY: z.string().optional(),
-  QWEN_VL_MODEL: z.string().default('qwen-vl-max-latest'),
+  QWEN_VL_MODEL: z.string().default('qwen3.6'),
   // 可指向其他兼容端点；空字符串（docker compose ${VAR:-} 默认值）当 undefined 处理后回退默认值
   QWEN_BASE_URL: z.preprocess(
     (v) => (typeof v === 'string' && v.trim() === '' ? undefined : v),
