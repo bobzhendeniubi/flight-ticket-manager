@@ -171,6 +171,9 @@ export interface BatchCreateOrdersInput {
   bundleNights?: number;
   bundleSingleCount?: number;
   bundleBusinessCount?: number;
+  adultCount?: number;
+  childCount?: number;
+  infantCount?: number;
   // 公共
   description: string;
   /** 录入人由后端从登录账号自动盖章；前端不再采集/发送联系人。 */
@@ -235,6 +238,8 @@ export interface OrderPassengerInput {
   dateOfBirth: string; // YYYY-MM-DD
   nationality?: string; // ISO alpha-2，默认 CN
   passengerType?: PassengerType;
+  /** 护照图 data URL（OCR 识别后附带，后端持久化为 Passenger.passportPhotoUrl） */
+  passportPhotoUrl?: string;
 }
 
 interface OrderItemBase {
@@ -652,6 +657,17 @@ export interface Traveler {
 export type FulfillmentType = 'FLIGHT_TICKETING' | 'HOTEL_BOOKING' | 'VISA_APPLICATION' | 'TRANSFER_DISPATCH' | 'BUNDLE_COMPOSITE';
 export type FulfillmentStatus = 'PENDING' | 'IN_PROGRESS' | 'CONFIRMED' | 'CANCELLED' | 'FAILED';
 
+/** 签证台乘客明细（仅 VISA_APPLICATION 任务后端附带）*/
+export interface VisaTaskPassenger {
+  id: string;
+  fullName: string;
+  documentNumber: string;
+  /** 护照图 URL；null = 未上传 */
+  passportPhotoUrl: string | null;
+  /** passportPhotoUrl 非空 → true；缺照时签证台标红用 */
+  hasPhoto: boolean;
+}
+
 export interface FulfillmentTask {
   id: string;
   orderItemId: string;
@@ -669,6 +685,8 @@ export interface FulfillmentTask {
   updatedAt: string;
   item: { id: string; kind: OrderItemKind; description: string; quantity: number; orderId: string };
   order?: { id: string; orderNumber: string; contactName: string; contactPhone: string; status: OrderStatus; notes?: string | null };
+  /** 仅 type=VISA_APPLICATION 时后端附带，其余任务类型无此字段 */
+  passengers?: VisaTaskPassenger[];
 }
 
 /** GET /fulfillment-tasks 列表查询（与 backend listFulfillmentQuerySchema 对齐） */

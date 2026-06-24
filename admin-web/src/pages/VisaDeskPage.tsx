@@ -2,10 +2,9 @@
  * 签证台 · ADMIN/STAFF — 签证履约任务批量状态流转（批量标"已送签"）
  *
  * 数据源：backend/src/modules/fulfillment/*
- *   GET  /fulfillment-tasks?type=VISA_APPLICATION&status=   任务列表
+ *   GET  /fulfillment-tasks?type=VISA_APPLICATION&status=   任务列表（含 passengers[]）
  *   POST /fulfillment-tasks/batch-status                    批量改状态（部分失败返回 failures）
- *
- * 口径：IN_PROGRESS = 已送签材料准备；CONFIRMED = 已送签。
+ *   GET  /orders/:id/passport-photos.zip                   下载护照包（送签用）
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
@@ -13,6 +12,7 @@ import {
   ApiError,
   type FulfillmentStatus,
   type FulfillmentTask,
+  type VisaTaskPassenger,
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
 
@@ -56,6 +56,197 @@ const FILTER_OPTIONS: Array<{ value: StatusFilter; label: string }> = [
   { value: 'ALL', label: '全部状态' },
 ];
 
+// ── 乘客行：名称 / 护照号 / 照片缩略图 ─────────────────────────────────────
+interface PassengerRowProps {
+  passenger: VisaTaskPassenger;
+}
+function PassengerRow({ passenger }: PassengerRowProps) {
+  const [enlarged, setEnlarged] = useState(false);
+
+  return (
+    <div className="flex items-center gap-3 py-1 text-xs">
+      {/* 护照照片区 */}
+      <div className="w-8 shrink-0">
+        {passenger.passportPhotoUrl ? (
+          <>
+            <button
+              type="button"
+              onClick={() => setEnlarged(true)}
+              title="点击查看大图"
+              className="block h-8 w-8 overflow-hidden rounded border border-slate-200 hover:opacity-80 transition-opacity"
+            >
+              <img
+                src={passenger.passportPhotoUrl}
+                alt={`${passenger.fullName} 护照`}
+                className="h-full w-full object-cover"
+              />
+            </button>
+            {enlarged && (
+              <div
+                className="fixed inset-0 z-50 flex items-center justify-center bg-black/70"
+                onClick={() => setEnlarged(false)}
+              >
+                <div className="relative max-h-[90vh] max-w-[90vw]" onClick={(e) => e.stopPropagation()}>
+                  <img
+                    src={passenger.passportPhotoUrl}
+                    alt={`${passenger.fullName} 护照`}
+                    className="max-h-[85vh] max-w-[85vw] rounded-lg shadow-2xl"
+                  />
+                  <div className="mt-2 flex justify-center gap-3">
+                    <a
+                      href={passenger.passportPhotoUrl}
+                      download={`passport-${passenger.documentNumber}.jpg`}
+                      className="btn-secondary text-xs py-1"
+                      onClick={(e) => e.stopPropagation()}
+                    >
+                      下载此照片
+                    </a>
+                    <button
+                      type="button"
+                      className="btn-ghost text-xs py-1"
+                      onClick={() => setEnlarged(false)}
+                    >
+                      关闭
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+          </>
+        ) : (
+          <div className="flex h-8 w-8 items-center justify-center rounded border border-rose-200 bg-rose-50 text-[9px] font-semibold text-rose-600">
+            缺
+          </div>
+        )}
+      </div>
+
+      {/* 姓名 / 护照号 */}
+      <div className="min-w-0 flex-1">
+        <div className="font-medium text-ink truncate">{passenger.fullName || '—'}</div>
+        <div className="font-mono text-ink-muted truncate">{passenger.documentNumber || '—'}</div>
+      </div>
+
+      {/* 缺护照标记 */}
+      {!passenger.hasPhoto && (
+        <span className="badge-danger shrink-0 text-[10px]">缺护照</span>
+      )}
+    </div>
+  );
+}
+
+// ── 可展开的任务行 ────────────────────────────────────────────────────────────
+interface TaskRowProps {
+  task: FulfillmentTask;
+  selected: boolean;
+  onToggle: () => void;
+  token: string;
+}
+function TaskRow({ task, selected, onToggle, token }: TaskRowProps) {
+  const [expanded, setExpanded] = useState(false);
+  const [downloading, setDownloading] = useState(false);
+
+  const passengers = task.passengers ?? [];
+  const missingCount = passengers.filter((p) => !p.hasPhoto).length;
+  const orderId = task.item.orderId;
+
+  const handleDownloadZip = async () => {
+    if (!orderId) return;
+    setDownloading(true);
+    try {
+      const blob = await api.downloadPassportsZip(token, orderId);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `passports-${task.order?.orderNumber ?? orderId}.zip`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e: unknown) {
+      alert(e instanceof ApiError ? `下载失败：${e.message}` : '下载失败，请重试');
+    } finally {
+      setDownloading(false);
+    }
+  };
+
+  return (
+    <>
+      <tr className={selected ? 'bg-brand-50/70' : ''}>
+        <td className="text-center">
+          <input
+            type="checkbox"
+            aria-label={`选择订单 ${task.order?.orderNumber ?? task.id}`}
+            checked={selected}
+            onChange={onToggle}
+          />
+        </td>
+        <td className="font-mono text-xs text-ink">
+          {task.order?.orderNumber ?? '—'}
+        </td>
+        <td className="text-right nums">{task.item.quantity}</td>
+        <td className="text-xs text-ink-muted">
+          <div className="max-w-xs truncate" title={task.order?.notes ?? undefined}>
+            {task.order?.notes ?? '—'}
+          </div>
+        </td>
+        <td className="text-center">
+          <span className={VISA_STATUS_BADGE[task.status]}>
+            {VISA_STATUS_LABEL[task.status]}
+          </span>
+        </td>
+        <td className="text-center">
+          <button
+            type="button"
+            onClick={() => setExpanded((v) => !v)}
+            className="btn-ghost py-0.5 px-2 text-xs"
+            title={expanded ? '收起乘客信息' : '查看乘客 / 护照'}
+          >
+            {expanded ? '收起' : `乘客${passengers.length > 0 ? `(${passengers.length})` : ''}`}
+            {missingCount > 0 && (
+              <span className="badge-danger ml-1 text-[10px]">缺 {missingCount}</span>
+            )}
+          </button>
+        </td>
+      </tr>
+
+      {expanded && (
+        <tr className="bg-slate-50">
+          <td colSpan={6} className="px-4 pb-3 pt-2">
+            {passengers.length === 0 ? (
+              <p className="text-xs text-ink-muted">无乘客数据</p>
+            ) : (
+              <div className="max-w-lg divide-y divide-slate-100">
+                {passengers.map((p) => (
+                  <PassengerRow key={p.id} passenger={p} />
+                ))}
+              </div>
+            )}
+
+            {passengers.length > 0 && (
+              <div className="mt-2 flex items-center gap-3">
+                <button
+                  type="button"
+                  className="btn-secondary text-xs py-1.5"
+                  onClick={() => void handleDownloadZip()}
+                  disabled={downloading}
+                >
+                  {downloading ? '打包中…' : '下载护照(送签)'}
+                </button>
+                {missingCount > 0 && (
+                  <span className="text-xs text-rose-600">
+                    注意：{missingCount} 名乘客缺少护照照片
+                  </span>
+                )}
+              </div>
+            )}
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
+// ── 主页面 ────────────────────────────────────────────────────────────────────
 export function VisaDeskPage() {
   const tokens = useAuth((s) => s.tokens);
   const token = tokens?.accessToken ?? '';
@@ -167,7 +358,7 @@ export function VisaDeskPage() {
             <span className="badge-info mx-1">已送签材料准备</span>
             或
             <span className="badge-success mx-1">已送签</span>
-            。
+            。点击"乘客"可展开护照信息及下载按钮。
           </p>
         </div>
         <div>
@@ -266,48 +457,29 @@ export function VisaDeskPage() {
                 <th className="text-right">乘客数</th>
                 <th>备注</th>
                 <th className="text-center">当前状态</th>
+                <th className="text-center">护照信息</th>
               </tr>
             </thead>
             <tbody>
               {loading ? (
                 <tr>
-                  <td colSpan={5} className="py-6 text-center text-ink-muted">加载签证任务…</td>
+                  <td colSpan={6} className="py-6 text-center text-ink-muted">加载签证任务…</td>
                 </tr>
               ) : filtered.length === 0 ? (
                 <tr>
-                  <td colSpan={5} className="py-6 text-center text-ink-muted">
+                  <td colSpan={6} className="py-6 text-center text-ink-muted">
                     该筛选条件下暂无签证任务
                   </td>
                 </tr>
               ) : (
                 filtered.map((task) => (
-                  <tr
+                  <TaskRow
                     key={task.id}
-                    className={selectedIds.has(task.id) ? 'bg-brand-50/70' : ''}
-                  >
-                    <td className="text-center">
-                      <input
-                        type="checkbox"
-                        aria-label={`选择订单 ${task.order?.orderNumber ?? task.id}`}
-                        checked={selectedIds.has(task.id)}
-                        onChange={() => toggleRow(task.id)}
-                      />
-                    </td>
-                    <td className="font-mono text-xs text-ink">
-                      {task.order?.orderNumber ?? '—'}
-                    </td>
-                    <td className="text-right nums">{task.item.quantity}</td>
-                    <td className="text-xs text-ink-muted">
-                      <div className="max-w-xs truncate" title={task.order?.notes ?? undefined}>
-                        {task.order?.notes ?? '—'}
-                      </div>
-                    </td>
-                    <td className="text-center">
-                      <span className={VISA_STATUS_BADGE[task.status]}>
-                        {VISA_STATUS_LABEL[task.status]}
-                      </span>
-                    </td>
-                  </tr>
+                    task={task}
+                    selected={selectedIds.has(task.id)}
+                    onToggle={() => toggleRow(task.id)}
+                    token={token}
+                  />
                 ))
               )}
             </tbody>

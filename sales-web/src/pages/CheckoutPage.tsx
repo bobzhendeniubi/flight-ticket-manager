@@ -37,6 +37,11 @@ interface PassengerForm {
   gender?: 'M' | 'F' | 'X';
   passportExpiry?: string; // YYYY-MM-DD
   passportIssueCountry?: string; // ISO-2
+  /**
+   * 护照图片 data-URL——上传/OCR 时顺带捕获，随下单一起传给后端落库。
+   * 超过 6MB 时前端先压缩（canvas 等比缩放 + JPEG 降质）再存，避免后端 413。
+   */
+  passportPhotoUrl?: string;
 }
 
 const EMPTY_PASSENGER: PassengerForm = {
@@ -51,6 +56,58 @@ const EMPTY_PASSENGER: PassengerForm = {
 function fmt(v: unknown): string {
   const n = Number(v);
   return Number.isFinite(n) ? n.toLocaleString() : '0';
+}
+
+// ── 护照图压缩（避免后端 413）────────────────────────────────────────────────
+// 多人团（如 9 人各一张护照图）会把请求体撑爆后端上限。策略：每张图都缩到长边 ≤1600px、
+// 转 JPEG、目标 ≤~700KB（data-URL）。9 张 × ~700KB ≈ 6MB，稳落在后端上限内。
+const PASSPORT_PHOTO_MAX_BYTES = 6 * 1024 * 1024; // 单张 data-URL 硬上限，超则丢弃该图
+const PASSPORT_PHOTO_COMPRESS_TARGET = 700 * 1024; // 压缩目标（~700KB data-URL）
+const MAX_IMAGE_DIMENSION = 1600; // 缩放时长边上限（px）
+
+/** 把护照图片 File 读成 data-URL；统一 canvas 等比缩小到长边 ≤1600 + JPEG 降质到目标体积。 */
+async function passportFileToDataUrl(file: File): Promise<string> {
+  const raw = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => (typeof reader.result === 'string' ? resolve(reader.result) : reject(new Error('读取失败')));
+    reader.onerror = () => reject(new Error('读取失败'));
+    reader.readAsDataURL(file);
+  });
+
+  // 解码原图（拿到像素尺寸才能等比缩放）
+  const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+    const el = new Image();
+    el.onload = () => resolve(el);
+    el.onerror = () => reject(new Error('图片解析失败'));
+    el.src = raw;
+  });
+
+  // 统一缩放到长边 ≤ MAX_IMAGE_DIMENSION（小图不放大；scale 上限 1）
+  const scale = Math.min(1, MAX_IMAGE_DIMENSION / Math.max(img.width, img.height));
+  const w = Math.max(1, Math.round(img.width * scale));
+  const h = Math.max(1, Math.round(img.height * scale));
+
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) {
+    // 极端环境拿不到 canvas：原图已在目标内就用原图，否则丢弃（不阻断下单）
+    return raw.length <= PASSPORT_PHOTO_MAX_BYTES ? raw : '';
+  }
+
+  ctx.drawImage(img, 0, 0, w, h);
+
+  // 缩放后逐步降质到目标体积
+  for (const quality of [0.82, 0.7, 0.58, 0.45]) {
+    const out = canvas.toDataURL('image/jpeg', quality);
+    if (out.length <= PASSPORT_PHOTO_COMPRESS_TARGET) return out;
+  }
+
+  const fallback = canvas.toDataURL('image/jpeg', 0.45);
+  // 仍超硬上限 → 丢弃图片（不阻断下单），上传失败只影响签证台取图，不影响订单创建
+  if (fallback.length > PASSPORT_PHOTO_MAX_BYTES) return '';
+  return fallback;
 }
 
 // Real OCR 走 Tesseract.js（chi_sim + eng 语言包 + MRZ 解析）
@@ -342,6 +399,8 @@ export function CheckoutPage() {
         ...(p.gender ? { gender: p.gender } : {}),
         ...(p.passportExpiry ? { passportExpiry: p.passportExpiry } : {}),
         ...(p.passportIssueCountry ? { passportIssueCountry: p.passportIssueCountry } : {}),
+        // 护照图落库：有图才传，空串同样省略（压缩兜底返回 '' 时）
+        ...(p.passportPhotoUrl ? { passportPhotoUrl: p.passportPhotoUrl } : {}),
       })),
       items: items.flatMap((i): CreateOrderInput['items'] => {
         if (i.kind === 'FLIGHT') {
@@ -863,10 +922,18 @@ function PassengerCard({
     setOcring(true);
     setOcrResult(null);
 
-    // 图片预览
-    const reader = new FileReader();
-    reader.onload = (e) => setImagePreview(e.target?.result as string);
-    reader.readAsDataURL(file);
+    // 读取图片为 data-URL（顺带压缩），用于预览 + 落库
+    let photoDataUrl: string | undefined;
+    try {
+      const url = await passportFileToDataUrl(file);
+      // 压缩后仍超限则 passportFileToDataUrl 返回 ''，不存
+      if (url) {
+        photoDataUrl = url;
+        setImagePreview(url);
+      }
+    } catch {
+      // 读取失败不阻断 OCR
+    }
 
     try {
       const result = await ocrPassport(file, (pct, label) => {
@@ -884,6 +951,8 @@ function PassengerCard({
           gender: result.suggested.gender ?? passenger.gender,
           passportExpiry: result.suggested.passportExpiry ?? passenger.passportExpiry,
           passportIssueCountry: result.suggested.passportIssueCountry ?? passenger.passportIssueCountry,
+          // 护照图落库：OCR 成功时一并存入
+          ...(photoDataUrl ? { passportPhotoUrl: photoDataUrl } : {}),
         });
         setOcrResult({
           ok: true,
@@ -891,14 +960,15 @@ function PassengerCard({
           preview: result.rawText.slice(0, 120),
         });
       } else {
-        // 识别失败，但给出部分兜底结果
+        // 识别失败，但给出部分兜底结果；图片仍然落库（签证台需要原图）
+        const patch: Partial<typeof passenger> = {};
         if (result.fallback?.passportNumber || result.fallback?.chineseName) {
-          onChange({
-            fullName: result.fallback.englishName || result.fallback.chineseName || passenger.fullName,
-            passportNumber: result.fallback.passportNumber || passenger.passportNumber,
-            dateOfBirth: result.fallback.dateOfBirth || passenger.dateOfBirth,
-          });
+          patch.fullName = result.fallback.englishName || result.fallback.chineseName || passenger.fullName;
+          patch.passportNumber = result.fallback.passportNumber || passenger.passportNumber;
+          patch.dateOfBirth = result.fallback.dateOfBirth || passenger.dateOfBirth;
         }
+        if (photoDataUrl) patch.passportPhotoUrl = photoDataUrl;
+        if (Object.keys(patch).length > 0) onChange(patch);
         setOcrResult({
           ok: false,
           msg: '⚠️ OCR 部分识别（未匹配 MRZ 标准），请手工核对并补全字段',
@@ -906,6 +976,8 @@ function PassengerCard({
         });
       }
     } catch (err) {
+      // OCR 报错时图片仍存入（签证台仍可查看）
+      if (photoDataUrl) onChange({ passportPhotoUrl: photoDataUrl });
       setOcrResult({
         ok: false,
         msg: `❌ 识别失败：${err instanceof Error ? err.message : '未知错误'}。请手工填写。`,

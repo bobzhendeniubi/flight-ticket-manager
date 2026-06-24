@@ -484,6 +484,11 @@ export interface CreateOrderInput {
     gender?: 'M' | 'F' | 'X';
     passportExpiry?: string; // YYYY-MM-DD
     passportIssueCountry?: string; // ISO-2
+    /**
+     * 护照图片 data-URL（≤6MB，前端压缩后传）。
+     * 有才传；游客下单同样支持。
+     */
+    passportPhotoUrl?: string;
   }>;
   notes?: string;
   idempotencyKey?: string;

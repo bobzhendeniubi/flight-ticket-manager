@@ -51,7 +51,11 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // ── 下单（登录可选：登录用户绑 userId/代理；游客需 guestContact）────────
   app.post(
     '/',
-    { preHandler: [app.optionalAuthenticate] },
+    {
+      preHandler: [app.optionalAuthenticate],
+      // 多人团每位乘客可带一张护照图（data-URL），全局 8MB 上限对 9 人团不够 → 单路由放宽到 25MB
+      bodyLimit: 25 * 1024 * 1024,
+    },
     async (req, reply) => {
       const body = createOrderBodySchema.parse(req.body);
       // req.user 由 optionalAuthenticate 在带有效 token 时设置；否则为 undefined（游客）
@@ -109,7 +113,11 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // CUSTOMER 不可用（前台无此入口）；ADMIN/STAFF/AGENT 可用
   app.post(
     '/batch',
-    { preHandler: [app.authenticate] },
+    {
+      preHandler: [app.authenticate],
+      // 批量散客建单：名单每位乘客各带一张护照图（data-URL），单路由放宽到 25MB 防 413
+      bodyLimit: 25 * 1024 * 1024,
+    },
     async (req, reply) => {
       if (req.user.role === UserRole.CUSTOMER) {
         return reply.status(403).send({ error: '客户不可批量建单' });

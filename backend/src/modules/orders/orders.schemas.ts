@@ -68,7 +68,8 @@ export const passengerInputSchema = z.object({
   needsWheelchair: z.boolean().optional(),
   needsInfantBassinet: z.boolean().optional(),
   bedPref: z.enum(['SINGLE', 'DOUBLE', 'TWIN', 'SHARE_OK']).optional(),
-  passportPhotoUrl: z.string().url().optional(),
+  // 护照图 data-URL；3MB 上限让单张超大图快速失败（清晰报错，而非整请求 413 黑盒）
+  passportPhotoUrl: z.string().url().max(3_000_000, '护照图过大，请压缩后重试').optional(),
 });
 export type PassengerInput = z.infer<typeof passengerInputSchema>;
 

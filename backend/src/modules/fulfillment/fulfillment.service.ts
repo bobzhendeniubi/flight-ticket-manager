@@ -58,12 +58,26 @@ export class FulfillmentService {
   }
 
   async listByOrder(orderId: string) {
-    const items = await prisma.orderItem.findMany({
-      where: { orderId },
-      include: { fulfillmentTasks: { orderBy: { createdAt: 'asc' } } },
-    });
+    // 乘客明细一次性取出（按 orderId），避免后续 VISA 任务 N+1 查乘客
+    const [items, passengers] = await prisma.$transaction([
+      prisma.orderItem.findMany({
+        where: { orderId },
+        include: { fulfillmentTasks: { orderBy: { createdAt: 'asc' } } },
+      }),
+      prisma.passenger.findMany({
+        where: { orderId },
+        select: { id: true, fullName: true, documentNumber: true, passportPhotoUrl: true },
+      }),
+    ]);
+    const serializedPassengers = passengers.map(serializePassenger);
     return items.flatMap((it) =>
-      it.fulfillmentTasks.map((t) => serializeTask(t, it)),
+      it.fulfillmentTasks.map((t) => ({
+        ...serializeTask(t, it),
+        // 签证任务附带乘客护照明细；其他类型任务不返回（undefined 被 JSON 序列化忽略）
+        ...(t.type === FulfillmentType.VISA_APPLICATION
+          ? { passengers: serializedPassengers }
+          : {}),
+      })),
     );
   }
 
@@ -78,7 +92,26 @@ export class FulfillmentService {
     const [rows, total] = await prisma.$transaction([
       prisma.fulfillmentTask.findMany({
         where,
-        include: { orderItem: { include: { order: { select: { id: true, orderNumber: true, contactName: true, contactPhone: true, status: true, notes: true } } } } },
+        include: {
+          orderItem: {
+            include: {
+              order: {
+                select: {
+                  id: true,
+                  orderNumber: true,
+                  contactName: true,
+                  contactPhone: true,
+                  status: true,
+                  notes: true,
+                  // 乘客护照明细（供签证台显示；一次 include，无 N+1）
+                  passengers: {
+                    select: { id: true, fullName: true, documentNumber: true, passportPhotoUrl: true },
+                  },
+                },
+              },
+            },
+          },
+        },
         orderBy: { createdAt: 'desc' },
         take: query.pageSize,
         skip: (query.page - 1) * query.pageSize,
@@ -87,10 +120,17 @@ export class FulfillmentService {
     ]);
 
     return {
-      tasks: rows.map((t) => ({
-        ...serializeTask(t, t.orderItem),
-        order: t.orderItem.order,
-      })),
+      tasks: rows.map((t) => {
+        const { passengers: rawPassengers, ...orderWithoutPassengers } = t.orderItem.order;
+        return {
+          ...serializeTask(t, t.orderItem),
+          order: orderWithoutPassengers,
+          // 签证任务附带乘客护照明细；其他类型不附带
+          ...(t.type === FulfillmentType.VISA_APPLICATION
+            ? { passengers: rawPassengers.map(serializePassenger) }
+            : {}),
+        };
+      }),
       pagination: { page: query.page, pageSize: query.pageSize, total },
     };
   }
@@ -270,7 +310,26 @@ export class FulfillmentService {
   }
 }
 
-// ── Serializer ──────────────────────────────────────────────────
+// ── Serializers ─────────────────────────────────────────────────
+/**
+ * 乘客护照摘要（签证台专用）。
+ * hasPhoto: 是否已上传护照图 → 前端缺照标红。
+ */
+function serializePassenger(p: {
+  id: string;
+  fullName: string;
+  documentNumber: string;
+  passportPhotoUrl: string | null;
+}) {
+  return {
+    id: p.id,
+    fullName: p.fullName,
+    documentNumber: p.documentNumber,
+    passportPhotoUrl: p.passportPhotoUrl,
+    hasPhoto: p.passportPhotoUrl !== null && p.passportPhotoUrl.length > 0,
+  };
+}
+
 function serializeTask(
   t: {
     id: string; orderItemId: string; type: FulfillmentType; status: FulfillmentStatus;

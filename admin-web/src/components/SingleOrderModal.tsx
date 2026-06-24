@@ -9,7 +9,7 @@
  *
  * 与「批量创单」并存：批量创单服务票务整班散客；本弹窗服务单笔多产品类型录单。
  */
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   api,
   ApiError,
@@ -29,6 +29,7 @@ import {
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { NumberInput } from './NumberInput';
+import { type OcrResult } from '../lib/passportOcr';
 
 // ── 产品类型 ──────────────────────────────────────────────────────────
 type ProductKind = 'FLIGHT' | 'HOTEL' | 'VISA' | 'BUNDLE' | 'TRANSFER';
@@ -62,6 +63,12 @@ interface PassengerRow {
   fullName: string;
   documentNumber: string;
   dateOfBirth: string; // 原始输入，提交时解析为 ISO
+  /** 护照图 base64 data URL（OCR 识别后存入，随乘客一起提交给后端） */
+  passportPhotoUrl?: string;
+  /** OCR 识别进度 0-100；null = 未识别 */
+  ocrPct?: number | null;
+  /** OCR 识别阶段描述 */
+  ocrStage?: string;
 }
 
 const emptyPassenger = (): PassengerRow => ({ fullName: '', documentNumber: '', dateOfBirth: '' });
@@ -127,6 +134,9 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const [err, setErr] = useState<string | null>(null);
   const [okOrderNumber, setOkOrderNumber] = useState<string | null>(null);
 
+  // 每位乘客一个隐藏 file input（OCR）；用 index 区分
+  const ocrInputRefs = useRef<Array<HTMLInputElement | null>>([]);
+
   // 幂等键：同一次提交（含双击/重试）只入账一次；成功后换新键
   const makeIdemKey = (): string =>
     typeof crypto !== 'undefined' && 'randomUUID' in crypto
@@ -161,6 +171,9 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const [adultCount, setAdultCount] = useState<number | null>(1);
   const [childCount, setChildCount] = useState<number | null>(0);
   const [infantCount, setInfantCount] = useState<number | null>(0);
+  // 单人入住（单房差）和商务舱升级，范围 0..(成人+儿童)
+  const [singleCount, setSingleCount] = useState<number | null>(0);
+  const [businessCount, setBusinessCount] = useState<number | null>(0);
 
   // ── 接送 ──
   const [transfers, setTransfers] = useState<Transfer[]>([]);
@@ -255,6 +268,41 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     setPassengers((prev) => (prev.length > 1 ? prev.filter((_, idx) => idx !== i) : prev));
   }
 
+  /** 护照 OCR：点按钮 → 触发隐藏 file input → 读取图片 → 识别 → 自动填表 */
+  async function handleOcrFile(idx: number, file: File): Promise<void> {
+    setPassenger(idx, { ocrPct: 0, ocrStage: '加载中…' });
+
+    // 存库图先压缩（长边 ≤1600 + JPEG ≤~700KB），多人团才不会撑爆后端请求体上限（413）。
+    // OCR 识别本身仍用原始 File，不受压缩影响。压缩失败不阻断录单（dataUrl 为 ''）。
+    let dataUrl = '';
+    try {
+      const { passportPhotoToDataUrl } = await import('../lib/passportOcr');
+      dataUrl = await passportPhotoToDataUrl(file);
+    } catch {
+      dataUrl = '';
+    }
+    // 先把（已压缩的）图片存起来（即使 OCR 失败也保留照片）
+    if (dataUrl) setPassenger(idx, { passportPhotoUrl: dataUrl });
+
+    try {
+      // 动态引入（tesseract.js 体积大，仅在点击 OCR 时加载）
+      const { ocrPassport } = await import('../lib/passportOcr');
+      const result: OcrResult = await ocrPassport(file, (pct, stage) => {
+        setPassenger(idx, { ocrPct: pct, ocrStage: stage });
+      });
+
+      // 自动填充识别结果
+      const s = result.suggested;
+      const patch: Partial<PassengerRow> = { ocrPct: 100, ocrStage: result.success ? '识别完成' : '识别不完整，请核对' };
+      if (s.fullName) patch.fullName = s.fullName;
+      if (s.passportNumber) patch.documentNumber = s.passportNumber;
+      if (s.dateOfBirth) patch.dateOfBirth = s.dateOfBirth;
+      setPassenger(idx, patch);
+    } catch {
+      setPassenger(idx, { ocrPct: null, ocrStage: undefined });
+    }
+  }
+
   /** 构建当前产品类型的订单行；缺字段返回 { error }。 */
   function buildItem(): { item: CreateOrderItemInput } | { error: string } {
     if (kind === 'FLIGHT') {
@@ -310,19 +358,30 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       const children = Math.max(0, childCount ?? 0);
       const infants = Math.max(0, infantCount ?? 0);
       if (adults + children < 1) return { error: '套餐至少需 1 位占座出行人（成人或儿童）' };
+      const maxSingleBusiness = adults + children;
+      const singles = Math.min(Math.max(0, singleCount ?? 0), maxSingleBusiness);
+      const businesses = Math.min(Math.max(0, businessCount ?? 0), maxSingleBusiness);
       const metadata: Record<string, unknown> = { adultCount: adults, childCount: children, infantCount: infants };
       if (departDate) metadata.goDate = departDate;
-      const description = `${bundle?.name ?? '套餐'}${departDate ? ` · ${departDate}出发` : ''} · ${adults}成人${children ? `/${children}儿童` : ''}${infants ? `/${infants}婴儿` : ''}`;
+      const descParts = [
+        `${bundle?.name ?? '套餐'}`,
+        departDate ? `${departDate}出发` : null,
+        `${adults}成人${children ? `/${children}儿童` : ''}${infants ? `/${infants}婴儿` : ''}`,
+        singles > 0 ? `单住×${singles}` : null,
+        businesses > 0 ? `商务×${businesses}` : null,
+      ].filter(Boolean).join(' · ');
       return {
         item: {
           kind: 'BUNDLE',
-          description,
+          description: descParts,
           quantity: 1,
           bundleId,
           unitPrice: 0, // 服务端权威重算
           adultCount: adults,
           childCount: children,
           infantCount: infants,
+          singleCount: singles,
+          businessCount: businesses,
           metadata,
         },
       };
@@ -362,6 +421,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       documentNumber: p.documentNumber.trim(),
       dateOfBirth: parseDob(p.dateOfBirth) ?? '',
       nationality: 'CN',
+      ...(p.passportPhotoUrl ? { passportPhotoUrl: p.passportPhotoUrl } : {}),
     }));
     // 纯酒店/接送且未填出行人：后端 passengers 至少 1 条，用联系人占位一位出行人。
     if (passengerPayload.length === 0) {
@@ -592,6 +652,33 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                       <NumberInput className={inputCls} value={infantCount} onChange={setInfantCount} integerOnly min={0} placeholder="0" />
                     </label>
                   </div>
+                  {/* 单人入住（单房差）与商务舱升级 — 与前台同口径 */}
+                  <label className="text-xs text-slate-500">
+                    单人入住人数（单房差）
+                    <NumberInput
+                      className={inputCls}
+                      value={singleCount}
+                      onChange={setSingleCount}
+                      integerOnly
+                      min={0}
+                      max={Math.max(0, (adultCount ?? 0) + (childCount ?? 0))}
+                      placeholder="0"
+                    />
+                    <span className="mt-0.5 block text-[11px] text-slate-400">最多 {(adultCount ?? 0) + (childCount ?? 0)} 人</span>
+                  </label>
+                  <label className="text-xs text-slate-500">
+                    商务舱升级人数
+                    <NumberInput
+                      className={inputCls}
+                      value={businessCount}
+                      onChange={setBusinessCount}
+                      integerOnly
+                      min={0}
+                      max={Math.max(0, (adultCount ?? 0) + (childCount ?? 0))}
+                      placeholder="0"
+                    />
+                    <span className="mt-0.5 block text-[11px] text-slate-400">最多 {(adultCount ?? 0) + (childCount ?? 0)} 人</span>
+                  </label>
                   <p className="md:col-span-2 text-[11px] text-slate-400">
                     成人 + 儿童 + 婴儿都是出行人（都需护照，下方逐位填）。机票/房/价格由系统按套餐权威重算。
                   </p>
@@ -712,13 +799,14 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                 </span>
                 <button className="text-sm text-brand hover:text-brand-dark" onClick={addPassenger} type="button">＋ 加一位</button>
               </div>
-              <div className="max-h-56 overflow-y-auto rounded-md border border-slate-200">
+              <div className="max-h-64 overflow-y-auto rounded-md border border-slate-200">
                 <table className="w-full text-sm">
                   <thead className="sticky top-0 bg-slate-50 text-xs text-slate-500">
                     <tr>
                       <th className="px-2 py-1.5 text-left font-normal">姓名</th>
                       <th className="px-2 py-1.5 text-left font-normal">护照号</th>
                       <th className="px-2 py-1.5 text-left font-normal">出生日期</th>
+                      <th className="px-2 py-1.5 text-left font-normal">护照图</th>
                       <th className="px-2 py-1.5"></th>
                     </tr>
                   </thead>
@@ -726,6 +814,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                     {passengers.map((p, i) => {
                       const dobTouched = p.dateOfBirth.trim().length > 0;
                       const dobBad = dobTouched && parseDob(p.dateOfBirth) === null;
+                      const isOcring = p.ocrPct !== null && p.ocrPct !== undefined && p.ocrPct < 100;
                       return (
                         <tr key={i} className="border-t border-slate-100">
                           <td className="px-2 py-1">
@@ -744,6 +833,51 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                               onChange={(e) => setPassenger(i, { dateOfBirth: e.target.value })}
                             />
                             {dobBad && <span className="mt-0.5 block text-[11px] text-rose-500">格式如 1990-01-01</span>}
+                          </td>
+                          <td className="px-2 py-1 align-top">
+                            {/* 隐藏 file input */}
+                            <input
+                              type="file"
+                              accept="image/*"
+                              className="hidden"
+                              ref={(el) => { ocrInputRefs.current[i] = el; }}
+                              onChange={(e) => {
+                                const f = e.target.files?.[0];
+                                e.target.value = '';
+                                if (f) void handleOcrFile(i, f);
+                              }}
+                            />
+                            {isOcring ? (
+                              <div className="space-y-0.5">
+                                <div className="h-1.5 w-20 overflow-hidden rounded-full bg-slate-200">
+                                  <div
+                                    className="h-full rounded-full bg-brand transition-all"
+                                    style={{ width: `${p.ocrPct ?? 0}%` }}
+                                  />
+                                </div>
+                                <span className="block text-[10px] text-slate-400 truncate max-w-[5rem]">{p.ocrStage}</span>
+                              </div>
+                            ) : p.passportPhotoUrl ? (
+                              <div className="flex items-center gap-1">
+                                <a href={p.passportPhotoUrl} target="_blank" rel="noreferrer">
+                                  <img src={p.passportPhotoUrl} alt="护照" className="h-7 w-10 rounded object-cover ring-1 ring-slate-200" />
+                                </a>
+                                <button
+                                  type="button"
+                                  className="text-[10px] text-slate-400 hover:text-rose-500"
+                                  onClick={() => setPassenger(i, { passportPhotoUrl: undefined, ocrPct: null, ocrStage: undefined })}
+                                  title="移除图片"
+                                >✕</button>
+                              </div>
+                            ) : (
+                              <button
+                                type="button"
+                                className="rounded border border-slate-300 px-1.5 py-0.5 text-[11px] text-slate-600 hover:border-brand hover:text-brand"
+                                onClick={() => ocrInputRefs.current[i]?.click()}
+                              >
+                                OCR
+                              </button>
+                            )}
                           </td>
                           <td className="px-2 py-1 text-right">
                             <button className="text-xs text-slate-400 hover:text-rose-600" onClick={() => removePassenger(i)} disabled={passengers.length <= 1} type="button">删</button>

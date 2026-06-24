@@ -2511,6 +2511,10 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   const [bundleNights, setBundleNights] = useState<number | null>(null);
   const [bundleSingleCount, setBundleSingleCount] = useState<number | null>(null);
   const [bundleBusinessCount, setBundleBusinessCount] = useState<number | null>(null);
+  // 人群区分：批量模式每乘客一单，这三个值描述本批整体的人群结构
+  const [bundleAdultCount, setBundleAdultCount] = useState<number | null>(1);
+  const [bundleChildCount, setBundleChildCount] = useState<number | null>(0);
+  const [bundleInfantCount, setBundleInfantCount] = useState<number | null>(0);
 
   // ── 结算价（FLIGHT 类型专用）+ 团期备注 ──────────────────────────────────
   const [settlementPriceCny, setSettlementPriceCny] = useState<number | null>(null);
@@ -2576,6 +2580,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
     setReturnFlightId(''); setReturnScheduleId(''); setReturnSchedules([]);
     setCabin('');
     setBundleId(''); setBundleNights(null); setBundleSingleCount(null); setBundleBusinessCount(null);
+    setBundleAdultCount(1); setBundleChildCount(0); setBundleInfantCount(0);
     setSettlementPriceCny(null); setGroupNote('');
     setErr(null);
   }
@@ -2690,6 +2695,9 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
               ...(bundleNights !== null ? { bundleNights } : {}),
               ...(bundleSingleCount !== null ? { bundleSingleCount } : {}),
               ...(bundleBusinessCount !== null ? { bundleBusinessCount } : {}),
+              ...(bundleAdultCount !== null ? { adultCount: bundleAdultCount } : {}),
+              ...(bundleChildCount !== null ? { childCount: bundleChildCount } : {}),
+              ...(bundleInfantCount !== null ? { infantCount: bundleInfantCount } : {}),
             }),
         description,
         notes: notes.trim() || undefined,
@@ -2998,6 +3006,45 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                       onChange={setBundleBusinessCount}
                       min={0}
                       max={20}
+                      step={1}
+                      integerOnly
+                      placeholder="0"
+                    />
+                  </label>
+                  <label className="text-xs text-slate-500">
+                    成人人数
+                    <NumberInput
+                      className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                      value={bundleAdultCount}
+                      onChange={setBundleAdultCount}
+                      min={1}
+                      max={50}
+                      step={1}
+                      integerOnly
+                      placeholder="1"
+                    />
+                  </label>
+                  <label className="text-xs text-slate-500">
+                    儿童人数（选填）
+                    <NumberInput
+                      className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                      value={bundleChildCount}
+                      onChange={setBundleChildCount}
+                      min={0}
+                      max={20}
+                      step={1}
+                      integerOnly
+                      placeholder="0"
+                    />
+                  </label>
+                  <label className="text-xs text-slate-500">
+                    婴儿人数（选填）
+                    <NumberInput
+                      className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                      value={bundleInfantCount}
+                      onChange={setBundleInfantCount}
+                      min={0}
+                      max={10}
                       step={1}
                       integerOnly
                       placeholder="0"
