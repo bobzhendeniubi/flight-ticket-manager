@@ -34,6 +34,8 @@ import { reminderRoutes } from './modules/reminders/reminders.routes.js';
 import { financesRoutes } from './modules/finances/finances.routes.js';
 import { aiRoutes } from './modules/ai/ai.routes.js';
 import { reviewRoutes, orderReviewRoutes } from './modules/reviews/reviews.routes.js';
+import { ocrRoutes } from './modules/ocr/ocr.routes.js';
+import { settingsRoutes } from './modules/settings/settings.routes.js';
 import { redis } from './db/redis.js';
 
 export async function buildApp(): Promise<FastifyInstance> {
@@ -102,6 +104,8 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(financesRoutes, { prefix: '/finances' });
   await app.register(aiRoutes, { prefix: '/ai' });
   await app.register(reviewRoutes, { prefix: '/reviews' });
+  await app.register(ocrRoutes, { prefix: '/ocr' });
+  await app.register(settingsRoutes, { prefix: '/settings' });
 
   // Root
   app.get('/', async () => ({

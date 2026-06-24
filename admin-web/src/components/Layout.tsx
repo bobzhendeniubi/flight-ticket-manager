@@ -34,6 +34,7 @@ const NAV: Array<{
   { to: '/reconciliation',  label: '收款对账台',  roles: ['ADMIN', 'STAFF'],          section: '财务' },
   { to: '/finances',        label: '财务',        roles: ['ADMIN'],                   section: '财务' },
   { to: '/audit-logs',      label: '审计日志',    roles: ['ADMIN', 'STAFF'],          section: '系统' },
+  { to: '/settings/ai-ocr', label: 'AI 识别设置', roles: ['ADMIN'],                   section: '系统' },
 ];
 
 // 侧栏分组渲染顺序（NAV 里出现的 section 都在这里列一遍）

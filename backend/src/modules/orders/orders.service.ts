@@ -3150,6 +3150,8 @@ function passengerToData(p: PassengerInput) {
     placeOfBirth: p.placeOfBirth ?? null,
     nationality: p.nationality,
     passengerType: p.passengerType,
+    chineseName: p.chineseName ?? null,
+    passportIssueDate: p.passportIssueDate ? new Date(p.passportIssueDate) : null,
     passportIssueCountry: p.passportIssueCountry ?? null,
     passportExpiry: p.passportExpiry ? new Date(p.passportExpiry) : null,
     visaNumber: p.visaNumber ?? null,

@@ -48,16 +48,17 @@ export const ROSTER_COL = {
 /** 解析出来的一行出行人（fullName 或 documentNumber 至少一项有值）。*/
 export interface RosterRow {
   // 基础身份
-  fullName?: string;        // 中文姓名（列1）
-  lastName?: string;        // 从 PNR 解析出的姓
-  firstName?: string;       // 从 PNR 解析出的名
+  chineseName?: string;        // 中文姓名（列1，专用字段）
+  fullName?: string;           // 兜底全名（同 chineseName 或 PNR 全名）
+  lastName?: string;           // 从 PNR 解析出的姓
+  firstName?: string;          // 从 PNR 解析出的名
   gender?: 'M' | 'F';
-  dateOfBirth?: string;     // YYYY-MM-DD
-  nationality?: string;     // 2-letter ISO（CN / XX 等）
-  documentType?: string;    // PASSPORT | ID_CARD
-  documentNumber?: string;  // 证件号
-  visaIssueDate?: string;   // 签发日期 YYYY-MM-DD（签证用）
-  passportExpiry?: string;  // 有效日期 YYYY-MM-DD
+  dateOfBirth?: string;        // YYYY-MM-DD
+  nationality?: string;        // 2-letter ISO（CN / XX 等）
+  documentType?: string;       // PASSPORT | ID_CARD
+  documentNumber?: string;     // 证件号
+  passportIssueDate?: string;  // 护照签发日期 YYYY-MM-DD（列8）
+  passportExpiry?: string;     // 有效日期 YYYY-MM-DD（列9）
   // 辅助
   infantCompanion?: string;
   remarks?: string;
@@ -66,6 +67,8 @@ export interface RosterRow {
   passportNo?: string;
   /** @deprecated 请用 dateOfBirth */
   dob?: string;
+  /** @deprecated 请用 passportIssueDate */
+  visaIssueDate?: string;
 }
 
 export interface RosterParseResult {
@@ -419,7 +422,10 @@ export async function parseRosterXlsx(fileBase64: string): Promise<RosterParseRe
     const displayName = fullNameText || pnrText || docNumT;
     const out: RosterRow = {};
 
-    if (fullNameText) out.fullName = fullNameText;
+    if (fullNameText) {
+      out.chineseName = fullNameText; // 列1专门给中文姓名
+      out.fullName    = fullNameText; // fullName 兜底
+    }
 
     // 解析 PNR 姓名 → lastName / firstName
     if (pnrText) {
@@ -427,7 +433,7 @@ export async function parseRosterXlsx(fileBase64: string): Promise<RosterParseRe
       if (pnr) {
         out.lastName  = pnr.lastName;
         out.firstName = pnr.firstName;
-        // 若无中文姓名则用 PNR 全名兜底 fullName
+        // 若无中文姓名则用 PNR 全名兜底 fullName（chineseName 仍留 undefined）
         if (!out.fullName) out.fullName = pnrText;
       } else if (!out.fullName) {
         out.fullName = pnrText;
@@ -459,12 +465,16 @@ export async function parseRosterXlsx(fileBase64: string): Promise<RosterParseRe
     // 证件号
     if (docNumT) { out.documentNumber = docNumT; out.passportNo = docNumT; }
 
-    // 签发日期
+    // 签发日期（护照签发日期；同时保留已废弃的 visaIssueDate 别名）
     const issueText = cellText(issueDateRaw).trim();
     if (issueText) {
       const d = parseDateCell(issueDateRaw);
-      if (d) out.visaIssueDate = d;
-      else warnings.push(`第 ${rowNumber} 行（${displayName}）：签发日期「${issueText}」无法解析，已留空`);
+      if (d) {
+        out.passportIssueDate = d;
+        out.visaIssueDate     = d; // 向后兼容
+      } else {
+        warnings.push(`第 ${rowNumber} 行（${displayName}）：签发日期「${issueText}」无法解析，已留空`);
+      }
     }
 
     // 有效日期

@@ -18,6 +18,7 @@ import { FinancesPage } from './pages/FinancesPage';
 import { ReconciliationPage } from './pages/ReconciliationPage';
 import { HotelControlPage } from './pages/HotelControlPage';
 import { VisaDeskPage } from './pages/VisaDeskPage';
+import { AiOcrSettingsPage } from './pages/AiOcrSettingsPage';
 import { useAuth } from './stores/auth';
 
 // AGENT 可访问的页面集合（其他页面默认 ADMIN/STAFF 专属）
@@ -205,6 +206,14 @@ export function App() {
           element={
             <Protected adminOnly>
               <VisaDeskPage />
+            </Protected>
+          }
+        />
+        <Route
+          path="/settings/ai-ocr"
+          element={
+            <Protected adminOnly>
+              <AiOcrSettingsPage />
             </Protected>
           }
         />

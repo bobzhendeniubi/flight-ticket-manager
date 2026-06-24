@@ -16,6 +16,7 @@ import {
   type AdminFlight,
   type AdminSchedule,
   type AgentListItem,
+  type AiOcrPassportResult,
   type Bundle,
   type CabinClass,
   type CreateOrderInput,
@@ -63,12 +64,20 @@ interface PassengerRow {
   fullName: string;
   documentNumber: string;
   dateOfBirth: string; // 原始输入，提交时解析为 ISO
+  /** 中文姓名（可选；OCR 填写或手动输入） */
+  chineseName?: string;
+  /** 护照签发日期 YYYY-MM-DD（可选；OCR 填写或手动输入） */
+  passportIssueDate?: string;
   /** 护照图 base64 data URL（OCR 识别后存入，随乘客一起提交给后端） */
   passportPhotoUrl?: string;
   /** OCR 识别进度 0-100；null = 未识别 */
   ocrPct?: number | null;
   /** OCR 识别阶段描述 */
   ocrStage?: string;
+  /** OCR 引擎标签：'ai' | 'local' | 'ai-fallback' | null */
+  ocrEngine?: 'ai' | 'local' | 'ai-fallback' | null;
+  /** AI 识别时使用的模型名 */
+  ocrModel?: string | null;
 }
 
 const emptyPassenger = (): PassengerRow => ({ fullName: '', documentNumber: '', dateOfBirth: '' });
@@ -268,12 +277,23 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     setPassengers((prev) => (prev.length > 1 ? prev.filter((_, idx) => idx !== i) : prev));
   }
 
-  /** 护照 OCR：点按钮 → 触发隐藏 file input → 读取图片 → 识别 → 自动填表 */
+  /**
+   * 护照 OCR：点按钮 → 触发隐藏 file input → 读取图片 → 识别 → 自动填表
+   *
+   * 策略：
+   *   1. 先尝试后端 AI 识别（POST /ocr/passport）。
+   *      configured:true 且 suggested 有结果 → 用 AI 结果（含 chineseName/passportIssueDate），
+   *      显示绿色标签「AI识别 · {model}」。
+   *   2. AI 未配置（configured:false）→ 直接本地 Tesseract，灰色标签「本地识别(tesseract)」。
+   *   3. AI 配了但 suggested 为 null / 有 error → 回退本地 Tesseract，
+   *      黄色标签「AI失败已回退本地」。
+   *
+   * 图片压缩：存库图先缩到长边 ≤1600 + JPEG ≤~700KB，OCR 识别用原始 File。
+   */
   async function handleOcrFile(idx: number, file: File): Promise<void> {
-    setPassenger(idx, { ocrPct: 0, ocrStage: '加载中…' });
+    setPassenger(idx, { ocrPct: 0, ocrStage: '加载中…', ocrEngine: null, ocrModel: null });
 
-    // 存库图先压缩（长边 ≤1600 + JPEG ≤~700KB），多人团才不会撑爆后端请求体上限（413）。
-    // OCR 识别本身仍用原始 File，不受压缩影响。压缩失败不阻断录单（dataUrl 为 ''）。
+    // ── 1. 存库图压缩 ──
     let dataUrl = '';
     try {
       const { passportPhotoToDataUrl } = await import('../lib/passportOcr');
@@ -281,25 +301,82 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     } catch {
       dataUrl = '';
     }
-    // 先把（已压缩的）图片存起来（即使 OCR 失败也保留照片）
     if (dataUrl) setPassenger(idx, { passportPhotoUrl: dataUrl });
 
+    // ── 2. 尝试 AI 识别 ──
+    if (token) {
+      try {
+        setPassenger(idx, { ocrPct: 20, ocrStage: 'AI 识别中…' });
+
+        // 把压缩后（或原始）图片转成 data URL 发给后端
+        const imageDataUrl = dataUrl || await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => typeof reader.result === 'string' ? resolve(reader.result) : reject(new Error('读取失败'));
+          reader.onerror = () => reject(new Error('读取失败'));
+          reader.readAsDataURL(file);
+        });
+
+        const aiRes: AiOcrPassportResult = await api.ocrPassportAi(token, imageDataUrl);
+
+        if (!aiRes.configured) {
+          // 未配置 AI，直接走本地
+          await runLocalOcr(idx, file, 'local');
+          return;
+        }
+
+        // AI 有结果
+        if (aiRes.suggested) {
+          const s = aiRes.suggested;
+          const patch: Partial<PassengerRow> = {
+            ocrPct: 100,
+            ocrStage: '识别完成',
+            ocrEngine: 'ai',
+            ocrModel: aiRes.model ?? null,
+          };
+          if (s.fullName) patch.fullName = s.fullName;
+          if (s.documentNumber) patch.documentNumber = s.documentNumber;
+          if (s.dateOfBirth) patch.dateOfBirth = s.dateOfBirth;
+          if (s.chineseName) patch.chineseName = s.chineseName;
+          if (s.passportIssueDate) patch.passportIssueDate = s.passportIssueDate;
+          setPassenger(idx, patch);
+          return;
+        }
+
+        // AI 配了但识别失败 → 回退本地
+        await runLocalOcr(idx, file, 'ai-fallback');
+        return;
+      } catch {
+        // 网络/后端异常 → 回退本地
+        await runLocalOcr(idx, file, 'ai-fallback');
+        return;
+      }
+    }
+
+    // 无 token（不应出现，保险兜底）→ 本地
+    await runLocalOcr(idx, file, 'local');
+  }
+
+  /** 本地 Tesseract 识别（备用路径） */
+  async function runLocalOcr(idx: number, file: File, engine: 'local' | 'ai-fallback'): Promise<void> {
     try {
-      // 动态引入（tesseract.js 体积大，仅在点击 OCR 时加载）
       const { ocrPassport } = await import('../lib/passportOcr');
       const result: OcrResult = await ocrPassport(file, (pct, stage) => {
-        setPassenger(idx, { ocrPct: pct, ocrStage: stage });
+        setPassenger(idx, { ocrPct: 20 + Math.round(pct * 0.8), ocrStage: stage });
       });
 
-      // 自动填充识别结果
       const s = result.suggested;
-      const patch: Partial<PassengerRow> = { ocrPct: 100, ocrStage: result.success ? '识别完成' : '识别不完整，请核对' };
+      const patch: Partial<PassengerRow> = {
+        ocrPct: 100,
+        ocrStage: result.success ? '识别完成' : '识别不完整，请核对',
+        ocrEngine: engine,
+        ocrModel: null,
+      };
       if (s.fullName) patch.fullName = s.fullName;
       if (s.passportNumber) patch.documentNumber = s.passportNumber;
       if (s.dateOfBirth) patch.dateOfBirth = s.dateOfBirth;
       setPassenger(idx, patch);
     } catch {
-      setPassenger(idx, { ocrPct: null, ocrStage: undefined });
+      setPassenger(idx, { ocrPct: null, ocrStage: undefined, ocrEngine: null, ocrModel: null });
     }
   }
 
@@ -422,6 +499,8 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       dateOfBirth: parseDob(p.dateOfBirth) ?? '',
       nationality: 'CN',
       ...(p.passportPhotoUrl ? { passportPhotoUrl: p.passportPhotoUrl } : {}),
+      ...(p.chineseName?.trim() ? { chineseName: p.chineseName.trim() } : {}),
+      ...(p.passportIssueDate?.trim() ? { passportIssueDate: p.passportIssueDate.trim() } : {}),
     }));
     // 纯酒店/接送且未填出行人：后端 passengers 至少 1 条，用联系人占位一位出行人。
     if (passengerPayload.length === 0) {
@@ -799,13 +878,15 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                 </span>
                 <button className="text-sm text-brand hover:text-brand-dark" onClick={addPassenger} type="button">＋ 加一位</button>
               </div>
-              <div className="max-h-64 overflow-y-auto rounded-md border border-slate-200">
+              <div className="max-h-72 overflow-y-auto rounded-md border border-slate-200">
                 <table className="w-full text-sm">
                   <thead className="sticky top-0 bg-slate-50 text-xs text-slate-500">
                     <tr>
                       <th className="px-2 py-1.5 text-left font-normal">姓名</th>
                       <th className="px-2 py-1.5 text-left font-normal">护照号</th>
                       <th className="px-2 py-1.5 text-left font-normal">出生日期</th>
+                      <th className="px-2 py-1.5 text-left font-normal">中文姓名</th>
+                      <th className="px-2 py-1.5 text-left font-normal">护照签发日期</th>
                       <th className="px-2 py-1.5 text-left font-normal">护照图</th>
                       <th className="px-2 py-1.5"></th>
                     </tr>
@@ -814,6 +895,8 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                     {passengers.map((p, i) => {
                       const dobTouched = p.dateOfBirth.trim().length > 0;
                       const dobBad = dobTouched && parseDob(p.dateOfBirth) === null;
+                      const issueTouched = (p.passportIssueDate ?? '').trim().length > 0;
+                      const issueBad = issueTouched && parseDob(p.passportIssueDate ?? '') === null;
                       const isOcring = p.ocrPct !== null && p.ocrPct !== undefined && p.ocrPct < 100;
                       return (
                         <tr key={i} className="border-t border-slate-100">
@@ -833,6 +916,26 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                               onChange={(e) => setPassenger(i, { dateOfBirth: e.target.value })}
                             />
                             {dobBad && <span className="mt-0.5 block text-[11px] text-rose-500">格式如 1990-01-01</span>}
+                          </td>
+                          <td className="px-2 py-1">
+                            <input
+                              type="text"
+                              className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm"
+                              placeholder="中文姓名（选填）"
+                              value={p.chineseName ?? ''}
+                              onChange={(e) => setPassenger(i, { chineseName: e.target.value })}
+                            />
+                          </td>
+                          <td className="px-2 py-1 align-top">
+                            <input
+                              type="text"
+                              inputMode="numeric"
+                              className={`w-full rounded border px-1.5 py-1 text-sm ${issueBad ? 'border-rose-400 bg-rose-50' : 'border-slate-300'}`}
+                              placeholder="YYYY-MM-DD（选填）"
+                              value={p.passportIssueDate ?? ''}
+                              onChange={(e) => setPassenger(i, { passportIssueDate: e.target.value })}
+                            />
+                            {issueBad && <span className="mt-0.5 block text-[11px] text-rose-500">格式如 2018-01-01</span>}
                           </td>
                           <td className="px-2 py-1 align-top">
                             {/* 隐藏 file input */}
@@ -858,16 +961,34 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                                 <span className="block text-[10px] text-slate-400 truncate max-w-[5rem]">{p.ocrStage}</span>
                               </div>
                             ) : p.passportPhotoUrl ? (
-                              <div className="flex items-center gap-1">
-                                <a href={p.passportPhotoUrl} target="_blank" rel="noreferrer">
-                                  <img src={p.passportPhotoUrl} alt="护照" className="h-7 w-10 rounded object-cover ring-1 ring-slate-200" />
-                                </a>
-                                <button
-                                  type="button"
-                                  className="text-[10px] text-slate-400 hover:text-rose-500"
-                                  onClick={() => setPassenger(i, { passportPhotoUrl: undefined, ocrPct: null, ocrStage: undefined })}
-                                  title="移除图片"
-                                >✕</button>
+                              <div className="flex flex-col items-start gap-1">
+                                <div className="flex items-center gap-1">
+                                  <a href={p.passportPhotoUrl} target="_blank" rel="noreferrer">
+                                    <img src={p.passportPhotoUrl} alt="护照" className="h-7 w-10 rounded object-cover ring-1 ring-slate-200" />
+                                  </a>
+                                  <button
+                                    type="button"
+                                    className="text-[10px] text-slate-400 hover:text-rose-500"
+                                    onClick={() => setPassenger(i, { passportPhotoUrl: undefined, ocrPct: null, ocrStage: undefined, ocrEngine: null, ocrModel: null })}
+                                    title="移除图片"
+                                  >✕</button>
+                                </div>
+                                {/* OCR 引擎标签 */}
+                                {p.ocrEngine === 'ai' && (
+                                  <span className="rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 ring-1 ring-emerald-200">
+                                    AI识别{p.ocrModel ? ` · ${p.ocrModel}` : ''}
+                                  </span>
+                                )}
+                                {p.ocrEngine === 'local' && (
+                                  <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-500">
+                                    本地识别(tesseract)
+                                  </span>
+                                )}
+                                {p.ocrEngine === 'ai-fallback' && (
+                                  <span className="rounded bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-amber-200">
+                                    AI失败已回退本地
+                                  </span>
+                                )}
                               </div>
                             ) : (
                               <button

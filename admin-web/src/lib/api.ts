@@ -240,6 +240,10 @@ export interface OrderPassengerInput {
   passengerType?: PassengerType;
   /** 护照图 data URL（OCR 识别后附带，后端持久化为 Passenger.passportPhotoUrl） */
   passportPhotoUrl?: string;
+  /** 中文姓名（可选；OCR 能识别时带出） */
+  chineseName?: string;
+  /** 护照签发日期 YYYY-MM-DD（可选；OCR 能识别时带出） */
+  passportIssueDate?: string;
 }
 
 interface OrderItemBase {
@@ -1974,6 +1978,30 @@ export const api = {
       token,
       body: {},
     }),
+
+  // ── AI OCR 护照识别 (ADMIN|STAFF) ────────────────────────────────────────
+  // POST /ocr/passport
+  //   no key → { configured: false }
+  //   ok     → { configured: true, engine, model, suggested: {...} }
+  //   fail   → { configured: true, engine, model, error, suggested: null }
+  ocrPassportAi: (token: string, imageDataUrl: string) =>
+    apiFetch<AiOcrPassportResult>('/ocr/passport', {
+      method: 'POST',
+      token,
+      body: { imageDataUrl },
+    }),
+
+  // ── AI OCR 设置（ADMIN only）────────────────────────────────────────────────
+  getAiOcrConfig: (token: string) =>
+    apiFetch<AiOcrConfig>('/settings/ai-ocr', { token }),
+  updateAiOcrConfig: (token: string, body: AiOcrConfigInput) =>
+    apiFetch<AiOcrConfig>('/settings/ai-ocr', { method: 'PUT', token, body }),
+  testAiOcrConfig: (token: string) =>
+    apiFetch<{ ok: boolean; message: string }>('/settings/ai-ocr/test', {
+      method: 'POST',
+      token,
+      body: {},
+    }),
 };
 
 // ── 财务模块类型（与 backend/src/modules/finances/finances.service.ts 对齐）──
@@ -2199,4 +2227,58 @@ export interface CancellationPolicy {
   notes: string | null;
   createdAt: string;
   updatedAt: string;
+}
+
+// ── AI OCR 类型（护照识别 + 设置）────────────────────────────────────────────
+
+/** 后端返回的 AI 识别字段（与 backend POST /ocr/passport suggested 对齐） */
+export interface AiOcrSuggested {
+  lastName?: string;
+  firstName?: string;
+  fullName?: string;
+  /** 中文姓名（可选字段，OCR 能识别时带出） */
+  chineseName?: string;
+  documentNumber?: string;
+  dateOfBirth?: string;       // YYYY-MM-DD
+  gender?: 'M' | 'F' | 'X';
+  /** ISO-3 国籍（后端返回三字母）*/
+  nationality?: string;
+  /** ISO-3 签发国 */
+  passportIssueCountry?: string;
+  passportExpiry?: string;    // YYYY-MM-DD
+  /** 护照签发日期（可选字段）*/
+  passportIssueDate?: string; // YYYY-MM-DD
+  placeOfBirth?: string;
+}
+
+/** POST /ocr/passport 响应 */
+export type AiOcrPassportResult =
+  | { configured: false }
+  | {
+      configured: true;
+      engine: 'qwen';
+      model: string;
+      suggested: AiOcrSuggested | null;
+      error?: string;
+    };
+
+/** GET /settings/ai-ocr 响应（PUT 同形） */
+export interface AiOcrConfig {
+  provider: string;
+  baseUrl: string | null;
+  model: string | null;
+  enabled: boolean;
+  /** true = DB 里有 key */
+  apiKeySet: boolean;
+  /** 脱敏后的 key 前缀 + 后缀（如 "sk-1****4567"）；未配置时 null */
+  apiKeyMasked: string | null;
+}
+
+/** PUT /settings/ai-ocr body */
+export interface AiOcrConfigInput {
+  /** 空/缺省 = 保留现有 key；非空 = 更新 */
+  apiKey?: string;
+  baseUrl?: string;
+  model?: string;
+  enabled?: boolean;
 }

@@ -1016,6 +1016,8 @@ model Passenger {
   passengerType  PassengerType @default(ADULT)
 
   // ── 护照扩展（出票 + 签证用）──
+  chineseName          String?   // 中文姓名（OCR 识别或手工填写）
+  passportIssueDate    DateTime? @db.Date // 护照签发日期
   passportIssueCountry String? // 颁发国 ISO-2，如 CHN
   passportExpiry       DateTime? @db.Date
 
@@ -1384,4 +1386,19 @@ model OperationalReminder {
   @@index([orderId])
   @@index([status, priority, dueAt])
   @@index([claimedById, status])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AI OCR 配置 — 单例表（最多一行），存后台粘贴的 Qwen-VL API Key
+// 读取优先级：DB > env（DASHSCOPE_API_KEY / QWEN_BASE_URL / QWEN_VL_MODEL）
+// ─────────────────────────────────────────────────────────────────────────────
+model AiOcrConfig {
+  id          String   @id @default(cuid())
+  provider    String   @default("QWEN")
+  apiKey      String?  // 明文存库；序列化给前端时打码（不返回原文）
+  baseUrl     String?
+  model       String?
+  enabled     Boolean  @default(true)
+  updatedById String? // 最后修改人 userId
+  updatedAt   DateTime @updatedAt
 }

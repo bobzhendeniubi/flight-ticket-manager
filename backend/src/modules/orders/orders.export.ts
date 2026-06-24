@@ -53,6 +53,7 @@ interface OrderRow {
   contactPhone: string;
   // 乘客
   chineseName: string;
+  passportIssueDate: string;
   pnrName: string;
   gender: string;
   dateOfBirth: string;
@@ -82,6 +83,7 @@ const COLUMNS: Array<{ header: string; key: keyof OrderRow; width: number }> = [
   { header: '联系人', key: 'contactName', width: 12 },
   { header: '联系电话', key: 'contactPhone', width: 14 },
   { header: '乘客中文名', key: 'chineseName', width: 14 },
+  { header: '护照签发日期', key: 'passportIssueDate', width: 12 },
   { header: 'PNR 姓名', key: 'pnrName', width: 20 },
   { header: '性别', key: 'gender', width: 6 },
   { header: '出生日期', key: 'dateOfBirth', width: 12 },
@@ -207,7 +209,8 @@ function orderToRows(order: OrderForExport): OrderRow[] {
       agency,
       contactName: order.contactName,
       contactPhone: order.contactPhone,
-      chineseName: p.fullName,
+      chineseName: p.chineseName ?? p.fullName,
+      passportIssueDate: fmtDate(p.passportIssueDate),
       pnrName,
       gender: p.gender ? GENDER_LABEL[p.gender] ?? p.gender : '',
       dateOfBirth: fmtDate(p.dateOfBirth),

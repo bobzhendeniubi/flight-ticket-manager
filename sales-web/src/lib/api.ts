@@ -489,6 +489,16 @@ export interface CreateOrderInput {
      * 有才传；游客下单同样支持。
      */
     passportPhotoUrl?: string;
+    /**
+     * 中文姓名（镜像后端 passengerInputSchema.chineseName）。
+     * 前台本地 OCR 基本带不出中文名，有值才传；缺省省略。
+     */
+    chineseName?: string;
+    /**
+     * 护照签发日期 YYYY-MM-DD（镜像后端 passengerInputSchema.passportIssueDate）。
+     * 仅在 OCR/手填时带出；有值才传，不发空串（后端正则 \d{4}-\d{2}-\d{2} 会拒空串）。
+     */
+    passportIssueDate?: string;
   }>;
   notes?: string;
   idempotencyKey?: string;

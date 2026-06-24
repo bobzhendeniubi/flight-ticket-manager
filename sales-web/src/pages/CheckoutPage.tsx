@@ -42,6 +42,16 @@ interface PassengerForm {
    * 超过 6MB 时前端先压缩（canvas 等比缩放 + JPEG 降质）再存，避免后端 413。
    */
   passportPhotoUrl?: string;
+  /**
+   * 中文姓名（镜像后端 passengerInputSchema.chineseName）。
+   * tesseract.js 本地 OCR 基本识别不出中文名，留空即可；有值才传，不发空串。
+   */
+  chineseName?: string;
+  /**
+   * 护照签发日期 YYYY-MM-DD（镜像后端 passengerInputSchema.passportIssueDate）。
+   * OCR 命中时由 ocrPassport 带出；手填不强制。有值才传，空串省略。
+   */
+  passportIssueDate?: string;
 }
 
 const EMPTY_PASSENGER: PassengerForm = {
@@ -401,6 +411,9 @@ export function CheckoutPage() {
         ...(p.passportIssueCountry ? { passportIssueCountry: p.passportIssueCountry } : {}),
         // 护照图落库：有图才传，空串同样省略（压缩兜底返回 '' 时）
         ...(p.passportPhotoUrl ? { passportPhotoUrl: p.passportPhotoUrl } : {}),
+        // 中文姓名 / 护照签发日期：有值才传，不发空串（后端正则校验 passportIssueDate）
+        ...(p.chineseName ? { chineseName: p.chineseName } : {}),
+        ...(p.passportIssueDate ? { passportIssueDate: p.passportIssueDate } : {}),
       })),
       items: items.flatMap((i): CreateOrderInput['items'] => {
         if (i.kind === 'FLIGHT') {

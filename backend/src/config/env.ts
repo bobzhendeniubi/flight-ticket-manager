@@ -85,6 +85,19 @@ const EnvSchema = z.object({
   ),
 
   // ═══════════════════════════════════════════════════════════
+  // 阿里云 DashScope / Qwen-VL（护照 OCR，OpenAI 兼容端点）
+  // 未配时 /ocr/passport 返回 { configured: false }，前端自动回退浏览器 Tesseract。
+  // 在 DashScope 控制台（https://dashscope.console.aliyun.com）→ API-KEY 管理 申请。
+  // ═══════════════════════════════════════════════════════════
+  DASHSCOPE_API_KEY: z.string().optional(),
+  QWEN_VL_MODEL: z.string().default('qwen-vl-max-latest'),
+  // 可指向其他兼容端点；空字符串（docker compose ${VAR:-} 默认值）当 undefined 处理后回退默认值
+  QWEN_BASE_URL: z.preprocess(
+    (v) => (typeof v === 'string' && v.trim() === '' ? undefined : v),
+    z.string().url().default('https://dashscope.aliyuncs.com/compatible-mode/v1'),
+  ),
+
+  // ═══════════════════════════════════════════════════════════
   // 邮件（SMTP，发送电子行程单）
   // 没配置时 worker 静默跳过邮件发送（只写日志）。
   // 沙箱推荐 Mailtrap / Ethereal；生产可用 Alibaba DirectMail / AWS SES。

@@ -45,6 +45,8 @@ export const passengerInputSchema = z.object({
   passengerType: z.nativeEnum(PassengerType).default('ADULT'),
 
   // 护照扩展
+  chineseName: z.string().max(120).optional(),                                  // 中文姓名
+  passportIssueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),       // 护照签发日期
   passportIssueCountry: z.string().length(2).optional(),
   passportExpiry: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
 
