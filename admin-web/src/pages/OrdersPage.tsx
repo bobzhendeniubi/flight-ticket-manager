@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { api, ApiError, SETTLEMENT_MODE_LABEL, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceStatus, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { useFlightSeats } from '../stores/flightSeats';
 import {
   type FulfillmentStatus,
 } from '../lib/mockData';
@@ -153,6 +154,7 @@ function BalanceBadge({ balance, settlementMode }: { balance: number; settlement
 export function OrdersPage() {
   const tokens = useAuth((s) => s.tokens);
   const user = useAuth((s) => s.user);
+  const bumpSeats = useFlightSeats((s) => s.bumpSeats);
   const isAdmin = user?.role === 'ADMIN';
   const [orders, setOrders] = useState<OrderSummary[]>([]);
   const [loading, setLoading] = useState(true);
@@ -298,6 +300,8 @@ export function OrdersPage() {
       const res = await api.updateOrderStatus(tokens.accessToken, order.id, next, reason, force);
       setOrders((prev) => prev.map((o) => (o.id === order.id ? res.order : o)));
       setSelected((prev) => (prev && prev.id === order.id ? res.order : prev));
+      // 状态流转可能占用/释放机位（确认占座、取消/退款回收）→ 广播座位变更。
+      bumpSeats();
     } catch (err) {
       alert(err instanceof ApiError ? `操作失败：${err.message}` : '操作失败');
     }
@@ -320,6 +324,8 @@ export function OrdersPage() {
       );
       setOrders((prev) => prev.map((o) => (o.id === order.id ? res.order : o)));
       setSelected((prev) => (prev && prev.id === order.id ? res.order : prev));
+      // 删除（强制取消）会退回机位库存 → 广播座位变更。
+      bumpSeats();
     } catch (err) {
       alert(err instanceof ApiError ? `删除失败：${err.message}` : '删除失败');
     }
@@ -410,7 +416,9 @@ export function OrdersPage() {
     try {
       const blob = await api.downloadOrdersTemplateExport(tokens.accessToken, {
         template: exportTemplate,
-        status: statusFilter || undefined,
+        // 不透传列表的"状态"筛选：整班/名单导出要覆盖全部「占座」订单（含未支付那单），
+        // 否则会漏单（如 4 人分 2 单、只翻了 3 人单为已支付时漏掉 1 人单）。
+        // 后端已限定在 COUNTED_STATUSES（占座状态）范围内。
         kind: kindFilter || undefined,
         search: search.trim() || undefined,
         from: createdFrom || undefined, // 下单日期起（createdAt）— "当天进单多少"导出
@@ -1018,14 +1026,20 @@ export function OrdersPage() {
       {showBatchCreate && (
         <BatchCreateModal
           onClose={() => setShowBatchCreate(false)}
-          onCreated={() => setRefreshNonce((n) => n + 1)}
+          onCreated={() => {
+            setRefreshNonce((n) => n + 1);
+            bumpSeats();
+          }}
         />
       )}
 
       {showSingleCreate && (
         <SingleOrderModal
           onClose={() => setShowSingleCreate(false)}
-          onCreated={() => setRefreshNonce((n) => n + 1)}
+          onCreated={() => {
+            setRefreshNonce((n) => n + 1);
+            bumpSeats();
+          }}
         />
       )}
     </div>
@@ -2867,7 +2881,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                         <option value="">选择舱位…</option>
                         {cabinOptions.map((c) => (
                           <option key={c.id} value={c.cabin}>
-                            {CABIN_ZH[c.cabin] ?? c.cabin}（余 {c.capacity - c.sold}）¥{Number(c.basePrice).toFixed(0)}
+                            {CABIN_ZH[c.cabin] ?? c.cabin}（余 {c.available}）¥{Number(c.basePrice).toFixed(0)}
                           </option>
                         ))}
                       </select>

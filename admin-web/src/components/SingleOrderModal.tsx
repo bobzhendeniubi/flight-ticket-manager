@@ -23,6 +23,8 @@ import {
   type CreateOrderItemInput,
   type Hotel,
   type OrderPassengerInput,
+  type OrderSummary,
+  type RoomGroup,
   type Transfer,
   type Visa,
   type VisaStatusInput,
@@ -30,7 +32,9 @@ import {
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { NumberInput } from './NumberInput';
+import { RoomingEditor, type RoomingPassenger } from './RoomingEditor';
 import { type OcrResult } from '../lib/passportOcr';
+import { formatLocalTime } from '../lib/airports';
 
 // ── 产品类型 ──────────────────────────────────────────────────────────
 type ProductKind = 'FLIGHT' | 'HOTEL' | 'VISA' | 'BUNDLE' | 'TRANSFER';
@@ -113,6 +117,70 @@ function nightsBetween(checkIn: string, checkOut: string): number {
   return diff > 0 ? diff : 0;
 }
 
+// ── 套餐航段自动派生（去程/回程班次按出发日期匹配；时间按澳门时区显示）──────
+// 套餐固定航线：去程 MFM→DAD（澳门→岘港），回程 DAD→MFM（岘港→澳门，QH9588）。
+const BUNDLE_GO_ORIGIN = 'MFM';
+const BUNDLE_GO_DEST = 'DAD';
+
+/** 套餐未配置 hotelNights 且无 HOTEL 组件时的兜底晚数（与后端 bundle-nights.ts 一致）。 */
+const DEFAULT_BUNDLE_NIGHTS = 1;
+
+/** 从 Bundle.items 取第一个 HOTEL 组件的 qty（即真实住宿晚数）；找不到返回 null。 */
+function firstHotelQty(items: ReadonlyArray<{ kind: string; qty: number }>): number | null {
+  for (const it of items) {
+    if (it.kind !== 'HOTEL') continue;
+    if (typeof it.qty !== 'number' || !Number.isFinite(it.qty)) continue;
+    const qty = Math.trunc(it.qty);
+    if (qty >= 1) return qty;
+  }
+  return null;
+}
+
+/**
+ * 套餐住宿晚数唯一权威口径（port of backend bundle-nights.resolveBundleNights）：
+ *   hotelNights 显式配置 → 用之（≥1 保底）；否则第一个 HOTEL 组件 qty；再否则兜底。
+ * 返回恒为整数且 ≥1。
+ */
+function resolveBundleNights(
+  items: ReadonlyArray<{ kind: string; qty: number }>,
+  hotelNights: number | null,
+): number {
+  const explicit =
+    typeof hotelNights === 'number' && Number.isFinite(hotelNights) ? Math.trunc(hotelNights) : null;
+  const raw = explicit ?? firstHotelQty(items) ?? DEFAULT_BUNDLE_NIGHTS;
+  return Math.max(1, raw);
+}
+
+/**
+ * 班次 departureTime 是 UTC ISO；departureTz 决定它属于哪一"天"。
+ * 用 Intl parts 取本地年月日（en-CA → YYYY-MM-DD），跟 formatLocalDate 同口径，
+ * 避免 UTC slice 跨日错位（08:40 vs 16:40 那类时区 bug 的根因）。
+ */
+function localYmd(iso: string, tz: string): string {
+  try {
+    const parts = new Intl.DateTimeFormat('en-CA', {
+      timeZone: tz,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).formatToParts(new Date(iso));
+    const y = parts.find((p) => p.type === 'year')?.value ?? '0000';
+    const m = parts.find((p) => p.type === 'month')?.value ?? '01';
+    const d = parts.find((p) => p.type === 'day')?.value ?? '01';
+    return `${y}-${m}-${d}`;
+  } catch {
+    return iso.slice(0, 10);
+  }
+}
+
+/** departDate（YYYY-MM-DD）+ 晚数 → 退房/回程日期（YYYY-MM-DD）。 */
+function addDays(ymd: string, days: number): string {
+  const [y, m, d] = ymd.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, (m || 1) - 1, d || 1));
+  dt.setUTCDate(dt.getUTCDate() + days);
+  return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, '0')}-${String(dt.getUTCDate()).padStart(2, '0')}`;
+}
+
 interface SingleOrderModalProps {
   onClose: () => void;
   onCreated: () => void;
@@ -126,8 +194,8 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
 
   const [kind, setKind] = useState<ProductKind>('FLIGHT');
 
-  // 联系人（订单必填）
-  const [contactName, setContactName] = useState('');
+  // 联系人（选填；缺省默认=录入人本人，后端缺联系人时也会回退到录入人）
+  const [contactName, setContactName] = useState(recorderLabel);
   const [contactPhone, setContactPhone] = useState('');
   const [contactEmail, setContactEmail] = useState('');
 
@@ -144,10 +212,21 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const [notePayment, setNotePayment] = useState('');
   const [noteSpecial, setNoteSpecial] = useState('');
   const [passengers, setPassengers] = useState<PassengerRow[]>([emptyPassenger()]);
+  // 最新乘客快照（ref）：批量并发 OCR 时，handleOcrFile 的「护照图上限」要读实时状态，
+  // 不能用渲染闭包里的 passengers（并发 worker 之间会读到陈旧值，导致少计/超计）。
+  const passengersRef = useRef<PassengerRow[]>(passengers);
+  useEffect(() => {
+    passengersRef.current = passengers;
+  }, [passengers]);
 
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [okOrderNumber, setOkOrderNumber] = useState<string | null>(null);
+  // 录单成功的订单（含 id + 出行人）→ 录单后分房用；null = 未创建/已跳过
+  const [createdOrder, setCreatedOrder] = useState<OrderSummary | null>(null);
+  // 是否进入「录单后分房」步骤（默认进；可跳过稍后在房控页分）
+  const [showRooming, setShowRooming] = useState(false);
+  const [roomingSaved, setRoomingSaved] = useState(false);
 
   // 每位乘客一个隐藏 file input（OCR）；用 index 区分
   const ocrInputRefs = useRef<Array<HTMLInputElement | null>>([]);
@@ -192,14 +271,12 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   // 单人入住（单房差）和商务舱升级，范围 0..(成人+儿童)
   const [singleCount, setSingleCount] = useState<number | null>(0);
   const [businessCount, setBusinessCount] = useState<number | null>(0);
-  // 套餐机票航段：去程必选（选了才扣对应航班座位 + 进票务待办），回程往返套餐填。
-  // 复用机票 tab 的 flights 列表；班次按各腿航班单独拉取。
-  const [bundleGoFlightId, setBundleGoFlightId] = useState('');
-  const [bundleGoScheduleId, setBundleGoScheduleId] = useState('');
-  const [bundleGoSchedules, setBundleGoSchedules] = useState<AdminSchedule[]>([]);
-  const [bundleRetFlightId, setBundleRetFlightId] = useState('');
-  const [bundleRetScheduleId, setBundleRetScheduleId] = useState('');
-  const [bundleRetSchedules, setBundleRetSchedules] = useState<AdminSchedule[]>([]);
+  // 客人自备签证（套餐含签证时可勾选；勾选后服务端扣减 bundle.selfVisaDeductCny）
+  const [selfProvidedVisa, setSelfProvidedVisa] = useState(false);
+  // 套餐机票航段：不再手选，按「出发日期」自动派生。
+  // 预拉两个方向的全部班次池，再按本地日期匹配去程（MFM→DAD）/回程（DAD→MFM）。
+  const [bundleGoSchedulePool, setBundleGoSchedulePool] = useState<AdminSchedule[]>([]);
+  const [bundleRetSchedulePool, setBundleRetSchedulePool] = useState<AdminSchedule[]>([]);
 
   // ── 接送 ──
   const [transfers, setTransfers] = useState<Transfer[]>([]);
@@ -232,25 +309,37 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     api.listSchedules(token, flightId).then((r) => setSchedules(r.schedules)).catch(() => setErr('班次加载失败'));
   }, [token, flightId]);
 
-  // 套餐去程：选航班后拉班次
+  // 套餐机票航段：选了套餐 + 航班列表就绪后，预拉两个方向（去程 MFM→DAD / 回程 DAD→MFM）
+  // 的全部班次池；后续按「出发日期」本地日期匹配派生具体班次。
   useEffect(() => {
-    if (!token || !bundleGoFlightId) {
-      setBundleGoSchedules([]);
-      setBundleGoScheduleId('');
+    if (!token || kind !== 'BUNDLE' || !bundleId || flights.length === 0) {
+      setBundleGoSchedulePool([]);
+      setBundleRetSchedulePool([]);
       return;
     }
-    api.listSchedules(token, bundleGoFlightId).then((r) => setBundleGoSchedules(r.schedules)).catch(() => setErr('去程班次加载失败'));
-  }, [token, bundleGoFlightId]);
-
-  // 套餐回程：选航班后拉班次
-  useEffect(() => {
-    if (!token || !bundleRetFlightId) {
-      setBundleRetSchedules([]);
-      setBundleRetScheduleId('');
-      return;
+    const goFlight = flights.find(
+      (f) => f.isActive && f.originCode === BUNDLE_GO_ORIGIN && f.destinationCode === BUNDLE_GO_DEST,
+    );
+    const retFlight = flights.find(
+      (f) => f.isActive && f.originCode === BUNDLE_GO_DEST && f.destinationCode === BUNDLE_GO_ORIGIN,
+    );
+    if (goFlight) {
+      api
+        .listSchedules(token, goFlight.id)
+        .then((r) => setBundleGoSchedulePool(r.schedules))
+        .catch(() => setErr('去程班次加载失败'));
+    } else {
+      setBundleGoSchedulePool([]);
     }
-    api.listSchedules(token, bundleRetFlightId).then((r) => setBundleRetSchedules(r.schedules)).catch(() => setErr('回程班次加载失败'));
-  }, [token, bundleRetFlightId]);
+    if (retFlight) {
+      api
+        .listSchedules(token, retFlight.id)
+        .then((r) => setBundleRetSchedulePool(r.schedules))
+        .catch(() => setErr('回程班次加载失败'));
+    } else {
+      setBundleRetSchedulePool([]);
+    }
+  }, [token, kind, bundleId, flights]);
 
   // 酒店列表
   useEffect(() => {
@@ -285,6 +374,27 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const bundle = bundles.find((b) => b.id === bundleId);
   const transfer = transfers.find((t) => t.id === transferId);
 
+  // 套餐航段自动派生：出发日期 → 去程班次（MFM→DAD，本地日期 == departDate）；
+  // 晚数 → 回程日期 → 回程班次（DAD→MFM，本地日期 == returnDate）。仅往返套餐(legs≥2)派生回程。
+  const bundleLegs = useMemo(() => {
+    if (!bundle || !departDate) {
+      return { go: null as AdminSchedule | null, ret: null as AdminSchedule | null, returnDate: '' };
+    }
+    const go =
+      bundleGoSchedulePool
+        .filter((s) => s.isActive && localYmd(s.departureTime, s.departureTz) === departDate)
+        .sort((a, b) => a.departureTime.localeCompare(b.departureTime))[0] ?? null;
+    const isRoundTrip = (bundle.legs ?? 2) >= 2;
+    const nights = resolveBundleNights(bundle.items, bundle.hotelNights);
+    const returnDate = isRoundTrip ? addDays(departDate, nights) : '';
+    const ret = isRoundTrip
+      ? bundleRetSchedulePool
+          .filter((s) => s.isActive && localYmd(s.departureTime, s.departureTz) === returnDate)
+          .sort((a, b) => a.departureTime.localeCompare(b.departureTime))[0] ?? null
+      : null;
+    return { go, ret, returnDate };
+  }, [bundle, departDate, bundleGoSchedulePool, bundleRetSchedulePool]);
+
   const filteredAgents = useMemo(() => {
     const q = agentSearch.trim().toLowerCase();
     if (!q) return agents.slice(0, 50);
@@ -305,25 +415,41 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   );
 
   function setPassenger(i: number, patch: Partial<PassengerRow>): void {
-    setPassengers((prev) => prev.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
+    setPassengers((prev) => {
+      const next = prev.map((r, idx) => (idx === i ? { ...r, ...patch } : r));
+      passengersRef.current = next; // 即时同步 ref：并发 OCR 的上限计数读最新值
+      return next;
+    });
   }
   function addPassenger(): void {
-    setPassengers((prev) => [...prev, emptyPassenger()]);
+    setPassengers((prev) => {
+      const next = [...prev, emptyPassenger()];
+      passengersRef.current = next;
+      return next;
+    });
   }
   function removePassenger(i: number): void {
-    setPassengers((prev) => (prev.length > 1 ? prev.filter((_, idx) => idx !== i) : prev));
+    setPassengers((prev) => {
+      if (prev.length <= 1) return prev;
+      const next = prev.filter((_, idx) => idx !== i);
+      passengersRef.current = next;
+      return next;
+    });
   }
 
   /**
    * 批量护照：一次多选 → 逐张识别（一次跑 BULK_OCR_CONCURRENCY 张）→ 自动生成出行人行。
-   * 先复用前面的空白行，不够再追加。受 MAX_PHOTO_PASSENGERS 上限约束（超出截断 + 提示）。
+   *
+   * 顺序保证（修排版乱序 bug）：只复用「表尾」连续的空白行，其余追加到末尾——
+   * 这样上传顺序 == 行顺序，不会把照片塞进中间已填行之间打乱排版。
+   * 受 MAX_PHOTO_PASSENGERS 上限约束（超出截断 + 提示）。
    */
-  async function handleBulkOcrFiles(fileList: FileList): Promise<void> {
+  async function handleBulkOcrFiles(files: File[]): Promise<void> {
     if (bulkOcr) return; // 已在跑，忽略重复触发
-    const files = Array.from(fileList);
     if (files.length === 0) return;
 
-    const withPhoto = passengers.filter((p) => p.passportPhotoUrl).length;
+    const current = passengersRef.current;
+    const withPhoto = current.filter((p) => p.passportPhotoUrl).length;
     const slots = Math.max(0, MAX_PHOTO_PASSENGERS - withPhoto);
     if (slots === 0) {
       setErr(`护照图最多 ${MAX_PHOTO_PASSENGERS} 张/单，已达上限；更多请分单录入`);
@@ -336,19 +462,25 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
         : null,
     );
 
-    // 目标行：先复用空白行（无姓名/护照号/照片），不够再追加新行。
-    const pristineIdx: number[] = [];
-    passengers.forEach((p, idx) => {
-      if (!p.fullName.trim() && !p.documentNumber.trim() && !p.passportPhotoUrl) pristineIdx.push(idx);
-    });
+    // 表尾连续空白行（无姓名/护照号/照片）的起点：只复用末尾这段，保持顺序不被打乱。
+    const isPristine = (p: PassengerRow): boolean =>
+      !p.fullName.trim() && !p.documentNumber.trim() && !p.passportPhotoUrl;
+    let trailingStart = current.length;
+    while (trailingStart > 0 && isPristine(current[trailingStart - 1])) trailingStart--;
+    const trailingEmptyCount = current.length - trailingStart;
+
+    // 前 trailingEmptyCount 张复用表尾空白行，剩下的追加到末尾——行顺序严格 == 上传顺序。
     const targetIndices: number[] = [];
     let appendCount = 0;
     for (let k = 0; k < accepted.length; k++) {
-      if (k < pristineIdx.length) targetIndices.push(pristineIdx[k]);
-      else targetIndices.push(passengers.length + appendCount++);
+      if (k < trailingEmptyCount) targetIndices.push(trailingStart + k);
+      else targetIndices.push(current.length + appendCount++);
     }
     if (appendCount > 0) {
-      setPassengers((prev) => [...prev, ...Array.from({ length: appendCount }, () => emptyPassenger())]);
+      const toAppend = Array.from({ length: appendCount }, () => emptyPassenger());
+      setPassengers((prev) => [...prev, ...toAppend]);
+      // ref 同步前置：并发 worker 会立即按这些末尾索引写入，别等 effect 回灌。
+      passengersRef.current = [...current, ...toAppend];
     }
 
     // 并发池：最多 BULK_OCR_CONCURRENCY 个 worker 取任务，复用单张 handleOcrFile。
@@ -389,8 +521,10 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   async function handleOcrFile(idx: number, file: File): Promise<void> {
     // 写死上限：一单护照图最多 MAX_PHOTO_PASSENGERS 张（受后端单次请求大小所限）。
     // 仅在「该行原本没图」且已达上限时拦截（重新识别已有图不增加张数）。
-    const alreadyHasPhoto = Boolean(passengers[idx]?.passportPhotoUrl);
-    if (!alreadyHasPhoto && passengers.filter((p) => p.passportPhotoUrl).length >= MAX_PHOTO_PASSENGERS) {
+    // 用 ref 读最新乘客快照，避免批量并发时读到陈旧的渲染闭包（漏计/超计）。
+    const snapshot = passengersRef.current;
+    const alreadyHasPhoto = Boolean(snapshot[idx]?.passportPhotoUrl);
+    if (!alreadyHasPhoto && snapshot.filter((p) => p.passportPhotoUrl).length >= MAX_PHOTO_PASSENGERS) {
       setErr(`护照图最多 ${MAX_PHOTO_PASSENGERS} 张/单，已达上限；更多请分单录入`);
       return;
     }
@@ -548,26 +682,38 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
           error: `套餐出行人数需与人数一致：应填 ${headCount} 位（${adults}成人+${children}儿童+${infants}婴儿），当前 ${validPassengers.length} 位有效`,
         };
       }
-      // 去程班次必选：选了机票航段才会扣对应航班座位、并进票务待办；商务升舱也要从经济舱腿拆位。
-      if (!bundleGoScheduleId) return { error: '请选择套餐「去程班次」（用于扣减机票座位）' };
+      // 出发日期必填：航段按它自动派生（匹配去程/回程班次本地日期）。
+      if (!departDate) return { error: '请选择套餐「出发日期」（用于自动匹配机票航段并扣座）' };
+      // 去程航段必须派生成功，否则该出发日无对应去程班次 → 不能扣座/进票务待办。
+      if (!bundleLegs.go) {
+        return { error: `所选出发日期 ${departDate} 没有匹配的去程班次（${BUNDLE_GO_ORIGIN}→${BUNDLE_GO_DEST}），请换日期或先在航班里建班次` };
+      }
+      // 往返套餐必须派生出回程；缺回程班次说明回程日期那天没排班。
+      const isRoundTrip = (bundle?.legs ?? 2) >= 2;
+      if (isRoundTrip && !bundleLegs.ret) {
+        return { error: `回程日期 ${bundleLegs.returnDate} 没有匹配的回程班次（${BUNDLE_GO_DEST}→${BUNDLE_GO_ORIGIN}），请核对套餐晚数/排班` };
+      }
       const maxSingleBusiness = adults + children;
       const singles = Math.min(Math.max(0, singleCount ?? 0), maxSingleBusiness);
       const businesses = Math.min(Math.max(0, businessCount ?? 0), maxSingleBusiness);
       // 机票航段：去程 +（往返套餐）回程；占座人数 = 成人 + 儿童（婴儿不占座），舱位固定经济舱。
       const seatPax = Math.max(1, adults + children);
-      const legScheduleIds = [bundleGoScheduleId, bundleRetScheduleId].filter(Boolean);
-      const legLabel = ['去程（经济舱）', '回程（经济舱）'];
-      const flightLines = legScheduleIds.map((sid, i) => ({
+      // 同时派发去程 + 回程两条 FLIGHT 行：后端对每条 FLIGHT 行都扣座，这是「回程没扣」的根因修复。
+      const derivedLegs: Array<{ sched: AdminSchedule; label: string }> = [
+        { sched: bundleLegs.go, label: '去程（经济舱）' },
+      ];
+      if (isRoundTrip && bundleLegs.ret) {
+        derivedLegs.push({ sched: bundleLegs.ret, label: '回程（经济舱）' });
+      }
+      const flightLines = derivedLegs.map(({ sched, label }) => ({
         kind: 'FLIGHT' as const,
-        description: `${bundle?.name ?? '套餐'} · ${legLabel[i] ?? '航段（经济舱）'}`,
+        description: `${bundle?.name ?? '套餐'} · ${label}`,
         quantity: seatPax,
-        flightScheduleId: sid,
+        flightScheduleId: sched.id,
         flightCabin: 'ECONOMY' as CabinClass,
       }));
       // goDate 决定套餐酒店入住日（缺则后端 createOrder 不盖酒店章 → 房控不计套餐占房）。
-      // 优先级：手填出发日期 > 去程班次日期 > 套餐默认出发日，确保哪怕没填日期也能盖章。
-      const goSched = bundleGoSchedules.find((s) => s.id === bundleGoScheduleId);
-      const goDate = departDate || goSched?.departureTime?.slice(0, 10) || bundle?.defaultDepartDate || '';
+      const goDate = departDate;
       const metadata: Record<string, unknown> = { adultCount: adults, childCount: children, infantCount: infants };
       if (goDate) metadata.goDate = goDate;
       const descParts = [
@@ -576,6 +722,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
         `${adults}成人${children ? `/${children}儿童` : ''}${infants ? `/${infants}婴儿` : ''}`,
         singles > 0 ? `单住×${singles}` : null,
         businesses > 0 ? `商务×${businesses}` : null,
+        selfProvidedVisa ? '自备签证' : null,
       ].filter(Boolean).join(' · ');
       const bundleLine = {
         kind: 'BUNDLE' as const,
@@ -588,6 +735,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
         infantCount: infants,
         singleCount: singles,
         businessCount: businesses,
+        ...(selfProvidedVisa ? { selfProvidedVisa: true } : {}),
         metadata,
       };
       // 机票航段在前 + 地面套餐行在后：与前台商城同结构，服务端按航段扣座、套餐行只算地面。
@@ -607,11 +755,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     if (!token || submitting) return;
     setErr(null);
 
-    if (!contactName.trim() || !contactPhone.trim()) {
-      setErr('请填写联系人姓名与电话');
-      return;
-    }
-
+    // 联系人现为选填：后端会回退到登录的录入人。这里不再硬性拦截。
     const built = buildItem();
     if ('error' in built) {
       setErr(built.error);
@@ -634,10 +778,10 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       ...(p.chineseName?.trim() ? { chineseName: p.chineseName.trim() } : {}),
       ...(p.passportIssueDate?.trim() ? { passportIssueDate: p.passportIssueDate.trim() } : {}),
     }));
-    // 纯酒店/接送且未填出行人：后端 passengers 至少 1 条，用联系人占位一位出行人。
+    // 纯酒店/接送且未填出行人：后端 passengers 至少 1 条，用联系人（或录入人）占位一位出行人。
     if (passengerPayload.length === 0) {
       passengerPayload.push({
-        fullName: contactName.trim(),
+        fullName: contactName.trim() || recorderLabel,
         documentNumber: 'N/A',
         dateOfBirth: '1990-01-01',
         nationality: 'CN',
@@ -645,8 +789,8 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     }
 
     const body: CreateOrderInput = {
-      contactName: contactName.trim(),
-      contactPhone: contactPhone.trim(),
+      contactName: contactName.trim() || undefined,
+      contactPhone: contactPhone.trim() || undefined,
       contactEmail: contactEmail.trim() || undefined,
       items: orderItems,
       passengers: passengerPayload,
@@ -664,6 +808,9 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     try {
       const res = await api.createOrder(token, body);
       setOkOrderNumber(res.order.orderNumber);
+      setCreatedOrder(res.order);
+      setRoomingSaved(false);
+      setShowRooming(false);
       setIdemKey(makeIdemKey());
       onCreated();
     } catch (e: unknown) {
@@ -677,6 +824,43 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   function switchKind(next: ProductKind): void {
     setKind(next);
     setErr(null);
+  }
+
+  // ── 录单后分房 ─────────────────────────────────────────────────────────
+  // 创建响应已带 order.passengers（含 id + fullName + chineseName + gender），无需再拉详情。
+  // 占位出行人（纯酒店/接送用联系人占位，documentNumber='N/A'）不进分房池。
+  const roomingPassengers: RoomingPassenger[] = useMemo(() => {
+    if (!createdOrder?.passengers) return [];
+    return createdOrder.passengers
+      .filter((p) => p.documentNumber !== 'N/A')
+      .map((p) => ({
+        id: p.id,
+        name: p.fullName,
+        gender: p.gender ?? null,
+      }));
+  }, [createdOrder]);
+
+  async function handleRoomingSave(groups: RoomGroup[]): Promise<void> {
+    if (!createdOrder) return;
+    await api.updateRoomAssignment(token, createdOrder.id, groups);
+    setRoomingSaved(true);
+    setShowRooming(false);
+  }
+
+  // 「再录一单」/ 关闭后复位录单态（含分房步骤）
+  function resetForNextOrder(): void {
+    setOkOrderNumber(null);
+    setCreatedOrder(null);
+    setShowRooming(false);
+    setRoomingSaved(false);
+    setPassengers([emptyPassenger()]);
+    setNotes('');
+    setVisaStatus('NEEDED');
+    setNoteHotel('');
+    setNoteVisa('');
+    setNotePayment('');
+    setNoteSpecial('');
+    setSelfProvidedVisa(false);
   }
 
   const inputCls = 'mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm';
@@ -693,21 +877,40 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
           <div className="space-y-4 p-5">
             <div className="rounded-md bg-emerald-50 px-4 py-3 text-sm text-emerald-800">
               ✓ 录单成功 · 订单号 <b className="font-mono">{okOrderNumber}</b>
+              {roomingSaved && <span className="ml-2 text-emerald-700">· 分房已保存</span>}
             </div>
+
+            {/* 录单后分房：进入分房编辑器 */}
+            {showRooming && roomingPassengers.length > 0 ? (
+              <div className="rounded-lg border border-slate-200 bg-slate-50/40 p-4">
+                <RoomingEditor
+                  passengers={roomingPassengers}
+                  initial={createdOrder?.roomAssignment?.roomGroups}
+                  onSave={handleRoomingSave}
+                  onClose={() => setShowRooming(false)}
+                />
+              </div>
+            ) : (
+              // 分房入口（仅当订单有真实出行人时提示）
+              roomingPassengers.length > 0 && !roomingSaved && (
+                <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-brand/20 bg-brand-50 px-4 py-3">
+                  <div className="text-sm text-ink">
+                    需要分房吗？把出行人拖进房间，决定谁和谁一起住（{roomingPassengers.length} 人）。
+                  </div>
+                  <button className="btn-primary text-sm" onClick={() => setShowRooming(true)}>
+                    分房
+                  </button>
+                </div>
+              )
+            )}
+
             <div className="flex justify-end gap-2">
-              <button
-                className="btn-secondary text-sm"
-                onClick={() => {
-                  setOkOrderNumber(null);
-                  setPassengers([emptyPassenger()]);
-                  setNotes('');
-                  setVisaStatus('NEEDED');
-                  setNoteHotel('');
-                  setNoteVisa('');
-                  setNotePayment('');
-                  setNoteSpecial('');
-                }}
-              >
+              {showRooming && (
+                <button className="btn-ghost text-sm" onClick={() => setShowRooming(false)}>
+                  跳过（稍后在房控页分）
+                </button>
+              )}
+              <button className="btn-secondary text-sm" onClick={resetForNextOrder}>
                 再录一单
               </button>
               <button className="btn-primary text-sm" onClick={onClose}>完成</button>
@@ -752,11 +955,13 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                     </select>
                   </label>
                   <label className="text-xs text-slate-500">
-                    班次（出发）
+                    班次（出发 · 当地时间）
                     <select className={inputCls} value={scheduleId} onChange={(e) => { setScheduleId(e.target.value); setCabin(''); }} disabled={!flightId}>
                       <option value="">选择班次…</option>
                       {schedules.map((s) => (
-                        <option key={s.id} value={s.id}>{s.departureTime.slice(0, 16).replace('T', ' ')}</option>
+                        <option key={s.id} value={s.id}>
+                          {localYmd(s.departureTime, s.departureTz)} {formatLocalTime(s.departureTime, s.departureTz)}
+                        </option>
                       ))}
                     </select>
                   </label>
@@ -766,7 +971,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                       <option value="">选择舱位…</option>
                       {cabinOptions.map((c) => (
                         <option key={c.id} value={c.cabin}>
-                          {CABIN_ZH[c.cabin] ?? c.cabin}（余 {Math.max(0, c.capacity - c.sold)}）¥{Number(c.basePrice).toFixed(0)}
+                          {CABIN_ZH[c.cabin] ?? c.cabin}（余 {Math.max(0, c.available)}）¥{Number(c.basePrice).toFixed(0)}
                         </option>
                       ))}
                     </select>
@@ -849,67 +1054,46 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                     出发日期
                     <input type="date" className={inputCls} value={departDate} onChange={(e) => setDepartDate(e.target.value)} />
                   </label>
-                  {/* 机票航段：去程必选（选了才扣对应航班座位 + 进票务待办）；往返套餐填回程。婴儿不占座。 */}
-                  <div className="md:col-span-2 grid gap-3 rounded-md bg-white/70 p-2 ring-1 ring-slate-200 md:grid-cols-2">
-                    <p className="md:col-span-2 text-[11px] text-slate-500">
-                      机票航段 · 选了才会扣减对应航班座位并进票务待办（去程必选）
+                  {/* 机票航段：按「出发日期」自动派生去程（MFM→DAD）+ 回程（DAD→MFM），扣两段座位。只读展示。 */}
+                  <div className="md:col-span-2 grid gap-2 rounded-md bg-white/70 p-2.5 ring-1 ring-slate-200">
+                    <p className="text-[11px] text-slate-500">
+                      机票航段 · 按出发日期自动匹配去程/回程班次（时间为当地时间），下单时扣减两段座位并进票务待办
                     </p>
-                    <label className="text-xs text-slate-500">
-                      去程航班 <span className="text-rose-500">*</span>
-                      <select
-                        className={inputCls}
-                        value={bundleGoFlightId}
-                        onChange={(e) => { setBundleGoFlightId(e.target.value); setBundleGoScheduleId(''); }}
-                      >
-                        <option value="">选择航班…</option>
-                        {flights.map((f) => (
-                          <option key={f.id} value={f.id}>{f.flightNumber} {f.originCode}→{f.destinationCode}</option>
-                        ))}
-                      </select>
-                    </label>
-                    <label className="text-xs text-slate-500">
-                      去程班次 <span className="text-rose-500">*</span>
-                      <select
-                        className={inputCls}
-                        value={bundleGoScheduleId}
-                        onChange={(e) => setBundleGoScheduleId(e.target.value)}
-                        disabled={!bundleGoFlightId}
-                      >
-                        <option value="">选择班次…</option>
-                        {bundleGoSchedules.map((s) => (
-                          <option key={s.id} value={s.id}>{s.departureTime.slice(0, 16).replace('T', ' ')}</option>
-                        ))}
-                      </select>
-                    </label>
-                    {(bundle?.legs ?? 2) >= 2 && (
+                    {!bundle || !departDate ? (
+                      <p className="text-[11px] text-slate-400">选择套餐和出发日期后自动派生航段…</p>
+                    ) : (
                       <>
-                        <label className="text-xs text-slate-500">
-                          回程航班
-                          <select
-                            className={inputCls}
-                            value={bundleRetFlightId}
-                            onChange={(e) => { setBundleRetFlightId(e.target.value); setBundleRetScheduleId(''); }}
-                          >
-                            <option value="">选择航班…</option>
-                            {flights.map((f) => (
-                              <option key={f.id} value={f.id}>{f.flightNumber} {f.originCode}→{f.destinationCode}</option>
-                            ))}
-                          </select>
-                        </label>
-                        <label className="text-xs text-slate-500">
-                          回程班次
-                          <select
-                            className={inputCls}
-                            value={bundleRetScheduleId}
-                            onChange={(e) => setBundleRetScheduleId(e.target.value)}
-                            disabled={!bundleRetFlightId}
-                          >
-                            <option value="">选择班次…</option>
-                            {bundleRetSchedules.map((s) => (
-                              <option key={s.id} value={s.id}>{s.departureTime.slice(0, 16).replace('T', ' ')}</option>
-                            ))}
-                          </select>
-                        </label>
+                        {/* 去程 */}
+                        {bundleLegs.go ? (
+                          <div className="flex items-center gap-2 text-xs text-slate-700">
+                            <span className="rounded bg-brand-50 px-1.5 py-0.5 text-[11px] font-medium text-brand">去程</span>
+                            <span className="font-medium">{BUNDLE_GO_ORIGIN}→{BUNDLE_GO_DEST}</span>
+                            <span className="text-slate-500">
+                              {localYmd(bundleLegs.go.departureTime, bundleLegs.go.departureTz)}{' '}
+                              {formatLocalTime(bundleLegs.go.departureTime, bundleLegs.go.departureTz)}
+                            </span>
+                          </div>
+                        ) : (
+                          <div className="text-[11px] text-rose-600">
+                            ⚠ {departDate} 没有匹配的去程班次（{BUNDLE_GO_ORIGIN}→{BUNDLE_GO_DEST}），请换日期或先建班次
+                          </div>
+                        )}
+                        {/* 回程（仅往返套餐） */}
+                        {(bundle.legs ?? 2) >= 2 &&
+                          (bundleLegs.ret ? (
+                            <div className="flex items-center gap-2 text-xs text-slate-700">
+                              <span className="rounded bg-brand-50 px-1.5 py-0.5 text-[11px] font-medium text-brand">回程</span>
+                              <span className="font-medium">{BUNDLE_GO_DEST}→{BUNDLE_GO_ORIGIN}</span>
+                              <span className="text-slate-500">
+                                {localYmd(bundleLegs.ret.departureTime, bundleLegs.ret.departureTz)}{' '}
+                                {formatLocalTime(bundleLegs.ret.departureTime, bundleLegs.ret.departureTz)}
+                              </span>
+                            </div>
+                          ) : (
+                            <div className="text-[11px] text-rose-600">
+                              ⚠ 回程日期 {bundleLegs.returnDate} 没有匹配的回程班次（{BUNDLE_GO_DEST}→{BUNDLE_GO_ORIGIN}），请核对套餐晚数/排班
+                            </div>
+                          ))}
                       </>
                     )}
                   </div>
@@ -954,6 +1138,23 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                     />
                     <span className="mt-0.5 block text-[11px] text-slate-400">最多 {(adultCount ?? 0) + (childCount ?? 0)} 人</span>
                   </label>
+                  {/* 客人自备签证：仅当套餐配置了可扣减金额时显示 */}
+                  {bundle && bundle.selfVisaDeductCny > 0 && (
+                    <label className="md:col-span-2 flex items-center gap-2 text-xs text-slate-600">
+                      <input
+                        type="checkbox"
+                        className="h-4 w-4 rounded border-slate-300 text-brand focus:ring-brand"
+                        checked={selfProvidedVisa}
+                        onChange={(e) => {
+                          const next = e.target.checked;
+                          setSelfProvidedVisa(next);
+                          // 勾选时把订单级签证状态同步为「不需要」，与套餐价扣减口径一致；取消勾选不强行回写。
+                          if (next) setVisaStatus('NOT_NEEDED');
+                        }}
+                      />
+                      客人自备签证（−¥{bundle.selfVisaDeductCny}/单）
+                    </label>
+                  )}
                   <p className="md:col-span-2 text-[11px] text-slate-400">
                     成人 + 儿童 + 婴儿都是出行人（都需护照，下方逐位填）。机票/房/价格由系统按套餐权威重算。
                   </p>
@@ -983,14 +1184,14 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
               )}
             </div>
 
-            {/* 联系人 */}
+            {/* 联系人（选填；默认=录入人本人，可改） */}
             <div className="grid gap-3 md:grid-cols-3">
               <label className="text-xs text-slate-500">
-                联系人姓名 <span className="text-rose-500">*</span>
+                联系人姓名（默认本人）
                 <input className={inputCls} value={contactName} onChange={(e) => setContactName(e.target.value)} />
               </label>
               <label className="text-xs text-slate-500">
-                联系电话 <span className="text-rose-500">*</span>
+                联系电话（选填）
                 <input className={inputCls} value={contactPhone} onChange={(e) => setContactPhone(e.target.value)} />
               </label>
               <label className="text-xs text-slate-500">
@@ -1081,9 +1282,11 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                     className="hidden"
                     ref={bulkOcrInputRef}
                     onChange={(e) => {
-                      const fs = e.target.files;
+                      // 先把 FileList 复制成数组：下一行 e.target.value='' 会清空 e.target.files，
+                      // 若仍持有原 FileList 引用，其 length 立即变 0 → 批量识别"没反应/没放"。
+                      const fs = e.target.files ? Array.from(e.target.files) : [];
                       e.target.value = '';
-                      if (fs && fs.length) void handleBulkOcrFiles(fs);
+                      if (fs.length) void handleBulkOcrFiles(fs);
                     }}
                   />
                   <button

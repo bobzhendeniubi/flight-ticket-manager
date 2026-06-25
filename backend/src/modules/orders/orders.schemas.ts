@@ -96,6 +96,8 @@ export const hotelItemSchema = baseItemSchema.extend({
   checkIn: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   checkOut: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   unitPrice: z.number().nonnegative(),
+  // 计费房间数（支持 0.5 间）。缺省 → 按房型容量自动推算 roomsNeeded（旧行为）。
+  roomsBilled: z.number().multipleOf(0.5).min(0.5).max(50).optional(),
 });
 
 export const transferItemSchema = baseItemSchema.extend({
@@ -127,6 +129,10 @@ export const bundleItemSchema = baseItemSchema.extend({
   adultCount: z.number().int().min(0).max(20).optional(),
   childCount: z.number().int().min(0).max(20).optional(),
   infantCount: z.number().int().min(0).max(20).optional(),
+  // 自备签证：出行人自行办妥签证，套餐加价里减去该套餐配置的自备签证减免（selfVisaDeductCny）。
+  selfProvidedVisa: z.boolean().optional(),
+  // 计费房间数（支持 0.5 间）。缺省 → 按房型容量自动推算 roomsNeeded（旧行为）。
+  roomsBilled: z.number().multipleOf(0.5).min(0.5).max(50).optional(),
 });
 
 // BUNDLE 行 metadata 里的出行信息（sales-web 购物车带过来，用于推导酒店入住日期）。
@@ -165,8 +171,10 @@ export const guestContactSchema = z.object({
 export type GuestContact = z.infer<typeof guestContactSchema>;
 
 export const createOrderBodySchema = z.object({
-  contactName: z.string().min(1).max(120),
-  contactPhone: z.string().min(5).max(40),
+  // 联系人默认=录入人，电话选填：登录用户下单时缺省由后端用登录账号兜底（见 createOrder）。
+  // 游客下单仍须通过 guestContact 提供联系人（路由层断言），与此处放宽无关。
+  contactName: z.preprocess((v) => (v === '' ? undefined : v), z.string().min(1).max(120).optional()),
+  contactPhone: z.preprocess((v) => (v === '' ? undefined : v), z.string().min(5).max(40).optional()),
   contactEmail: z.string().email().optional(),
   paymentMethod: z.nativeEnum(PaymentMethod).optional(),
   items: z.array(orderItemInputSchema).min(1).max(20),

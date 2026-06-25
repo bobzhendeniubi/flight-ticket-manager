@@ -2,6 +2,7 @@ import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import { api, ApiError, type AdminFlight, type BaggagePolicyInput, type CabinClass, type FareBucket, type FlightBaggagePolicy } from '../lib/api';
 import { AIRPORT_OPTIONS, CABIN_LABEL, airportLabel, formatLocalDate, formatLocalTime } from '../lib/airports';
 import { useAuth } from '../stores/auth';
+import { useFlightSeats } from '../stores/flightSeats';
 import { NumberInput } from '../components/NumberInput';
 
 // 余位低于此数时高亮提醒（与订单页座位预警口径一致）
@@ -12,6 +13,9 @@ interface ScheduleSeat {
   cabin: CabinClass;
   capacity: number;
   sold: number;
+  // 后端权威口径：available = capacity − sold − locked（与前台一致）。
+  locked: number;
+  available: number;
   basePrice: string;
   fareBuckets: FareBucket[] | null;
 }
@@ -30,6 +34,8 @@ interface AdminSchedule {
 export function FlightsPage() {
   const tokens = useAuth((s) => s.tokens);
   const user = useAuth((s) => s.user);
+  const seatsVersion = useFlightSeats((s) => s.seatsVersion);
+  const bumpSeats = useFlightSeats((s) => s.bumpSeats);
 
   const [flights, setFlights] = useState<AdminFlight[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -54,30 +60,43 @@ export function FlightsPage() {
     reload();
   }, [reload]);
 
+  const refreshSchedules = useCallback(
+    async (flightId: string) => {
+      if (!tokens) return;
+      const res = await api.listSchedules(tokens.accessToken, flightId);
+      setSchedulesByFlight((prev) => ({ ...prev, [flightId]: res.schedules as AdminSchedule[] }));
+    },
+    [tokens],
+  );
+
+  // 班次发生改价/改容量/新增等会影响余位的修改后：刷新本页 + 广播座位变更信号。
+  const refreshSchedulesAndBump = useCallback(
+    async (flightId: string) => {
+      await refreshSchedules(flightId);
+      bumpSeats();
+    },
+    [refreshSchedules, bumpSeats],
+  );
+
   const toggleExpand = async (flightId: string) => {
     if (expanded === flightId) {
       setExpanded(null);
       return;
     }
     setExpanded(flightId);
-    if (!schedulesByFlight[flightId] && tokens) {
-      try {
-        const res = await api.listSchedules(tokens.accessToken, flightId);
-        setSchedulesByFlight((prev) => ({
-          ...prev,
-          [flightId]: res.schedules as AdminSchedule[],
-        }));
-      } catch (err) {
-        setError(err instanceof ApiError ? err.message : '加载班次失败');
-      }
+    // 每次展开都重新拉取该航班班次余位（不再缓存），避免在别处建单后余位读数过期。
+    try {
+      await refreshSchedules(flightId);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : '加载班次失败');
     }
   };
 
-  const refreshSchedules = async (flightId: string) => {
-    if (!tokens) return;
-    const res = await api.listSchedules(tokens.accessToken, flightId);
-    setSchedulesByFlight((prev) => ({ ...prev, [flightId]: res.schedules as AdminSchedule[] }));
-  };
+  // 座位变更信号：任一已展开航班在他处发生建单/退订后，重新拉取其余位。
+  useEffect(() => {
+    if (seatsVersion === 0 || !expanded) return;
+    refreshSchedules(expanded).catch(() => undefined);
+  }, [seatsVersion, expanded, refreshSchedules]);
 
   const onToggleFlight = async (flightId: string) => {
     if (!tokens) return;
@@ -193,6 +212,7 @@ export function FlightsPage() {
                   setAddingScheduleFor(null);
                   await reload();
                   if (expanded === f.id) await refreshSchedules(f.id);
+                  bumpSeats();
                 }}
               />
             )}
@@ -205,6 +225,7 @@ export function FlightsPage() {
                   setBulkAddingFor(null);
                   await reload();
                   if (expanded === f.id) await refreshSchedules(f.id);
+                  bumpSeats();
                 }}
               />
             )}
@@ -218,7 +239,7 @@ export function FlightsPage() {
                 schedules={schedulesByFlight[f.id] ?? null}
                 flightNumber={f.flightNumber}
                 canEdit={user.role === 'ADMIN'}
-                onRefresh={() => refreshSchedules(f.id)}
+                onRefresh={() => refreshSchedulesAndBump(f.id)}
               />
             )}
           </div>
@@ -330,7 +351,7 @@ function dayEconRemaining(daySchedules: AdminSchedule[]): number {
   const pool = active.length > 0 ? active : daySchedules;
   return pool.reduce((sum, s) => {
     const econ = getCabin(s, 'ECONOMY');
-    return sum + (econ ? econ.capacity - econ.sold : 0);
+    return sum + (econ ? econ.available : 0);
   }, 0);
 }
 
@@ -666,7 +687,7 @@ function SchedulesTable({
                   <td>
                     <ul className="space-y-0.5">
                       {(s.seatClasses ?? []).map((c) => {
-                        const remaining = c.capacity - c.sold;
+                        const remaining = c.available;
                         const isLow = remaining <= LOW_SEAT_THRESHOLD;
                         return (
                           <li key={c.id}>
@@ -1000,7 +1021,7 @@ function DaySchedule({
   const [ladderErr, setLadderErr] = useState<string | null>(null);
   const [ladderMsg, setLadderMsg] = useState<string | null>(null);
 
-  const econRemaining = econ ? econ.capacity - econ.sold : 0;
+  const econRemaining = econ ? econ.available : 0;
   const tone = seatTone(econRemaining);
   const isExporting = exportingId === schedule.id;
   const departureDate = utcYmd(schedule.departureTime);
@@ -1246,7 +1267,7 @@ function DaySchedule({
         )}
         {biz && (
           <span>
-            商务舱余位 <span className="font-semibold text-ink">{biz.capacity - biz.sold}</span> / {biz.capacity}
+            商务舱余位 <span className="font-semibold text-ink">{biz.available}</span> / {biz.capacity}
             <span className="ml-1 text-ink-muted">（已售 {biz.sold}）</span>
           </span>
         )}

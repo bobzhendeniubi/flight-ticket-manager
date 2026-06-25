@@ -712,17 +712,20 @@ model Bundle {
   hotelRoomTypeId String?
   hotelNights     Int? // 默认入住晚数（客户没填回程日期时按 goDate + hotelNights 推 checkOut）
   // 可选升级加价（CNY，按产品可配置；运营在后台改）— 都是 server-priced add-on：
-  //   singleSupplementCnyPerNight = 一个人住酒店（单人入住）/晚 的房差，赵姐默认 ¥80
-  //   businessUpgradeCnyPerLeg    = 升舱商务 /航段 的加价，赵姐默认 ¥700
+  //   singleSupplementCnyPerNight = 一个人住酒店（单人入住）/晚 的房差，运营默认 ¥80
+  //   businessUpgradeCnyPerLeg    = 升舱商务 /航段 的加价，运营默认 ¥700
   // 注意：豪华/五星套餐（洲际半岛、四季）的单人入住房差远高于平价默认值，故 seed 里按产品上调。
   singleSupplementCnyPerNight Int @default(80)
   businessUpgradeCnyPerLeg    Int @default(700)
   // 占座儿童 / 不占座婴儿定价（按产品可配置；运营在后台改）：
-  //   childSeatDiscountCnyPerPerson = 占座儿童比成人每人便宜多少 CNY（赵姐默认 ¥30，可改）
+  //   childSeatDiscountCnyPerPerson = 占座儿童比成人每人便宜多少 CNY（运营默认 ¥30，可改）
   //   infantPriceCny                = 不占座婴儿每人价 CNY（默认免费 0，可改）
   // 占座儿童与成人同占 1 座（机票按成人价减此折扣）；婴儿不占座、不占房，仍需护照。
   childSeatDiscountCnyPerPerson Int @default(30)
   infantPriceCny                Int @default(0)
+  // 自备签证可减额（CNY）：套餐含签证费时，客人自备签证（不需要送签）则从套餐价减此额。
+  // 运营在后台改；0 = 不允许减。录单勾"客人自备签证"时由 computeBundleAddOn 扣减。
+  selfVisaDeductCny             Int @default(0)
   // 机票航段数（来回 = 2，单程 = 1）— 升舱加价 = businessUpgradeCnyPerLeg × legs × businessCount
   legs           Int      @default(2)
   // 运营封盘日（按出发日 D）：该日整套餐不可售，优先级高于库存判定。
@@ -913,6 +916,9 @@ model OrderItem {
   visaId           String?
   bundleId         String?
   metadata         Json?
+  // 计费/占房间数（允许 0.5，用于拼房：7 人 3.5 间、1 人占半间）。
+  // NULL = 老数据/未显式分房 → 房控按容量算法或 metadata.roomsNeeded 回落。
+  roomsBilled      Decimal?      @db.Decimal(4, 1)
   createdAt        DateTime      @default(now())
 
   order            Order             @relation(fields: [orderId], references: [id], onDelete: Cascade)

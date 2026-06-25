@@ -112,6 +112,9 @@ export interface AdminScheduleSeat {
   cabin: CabinClass;
   capacity: number;
   sold: number;
+  // 后端权威口径：locked = 锁位占用，available = capacity − sold − locked（与前台一致）。
+  locked: number;
+  available: number;
   basePrice: string;
   // 仓位阶梯：有序数组（最便宜在前），自顶向下出售；
   // null / [] = 无阶梯（沿用旧的自动定价）。1..20 档。
@@ -127,6 +130,34 @@ export interface AdminSchedule {
   arrivalTz: string;
   isActive: boolean;
   seatClasses: AdminScheduleSeat[];
+}
+
+// ── 跨日期区间班次（GET /flights/schedules?from=&to=）──
+// 单次拉取一段日期内所有航班的班次（含每个班次航班号/航线/出发时间），
+// 用于座位统计页（取代逐航班 listSchedules 的 N+1）。
+export interface RangeScheduleSeat {
+  id: string;
+  cabin: CabinClass;
+  capacity: number;
+  sold: number;
+  locked: number;
+  // available = capacity − sold − locked（后端权威口径）。
+  available: number;
+  basePrice: string;
+}
+
+export interface RangeSchedule {
+  id: string;
+  flightId: string;
+  flightNumber: string;
+  originCode: string;
+  destinationCode: string;
+  /** ISO datetime 字符串 */
+  departureTime: string;
+  departureTz: string;
+  /** 出票上限（座位 ≤ 此值时仍按此封顶）；null = 不限 */
+  ticketingCap: number | null;
+  seatClasses: RangeScheduleSeat[];
 }
 
 // ── 行李规则（航班 × 舱等）── 与 backend flights.service listBaggagePolicies 对齐
@@ -263,7 +294,15 @@ interface OrderItemBase {
 }
 export type CreateOrderItemInput =
   | (OrderItemBase & { kind: 'FLIGHT'; flightScheduleId: string; flightCabin: CabinClass })
-  | (OrderItemBase & { kind: 'HOTEL'; hotelRoomTypeId?: string; checkIn?: string; checkOut?: string; unitPrice: number })
+  | (OrderItemBase & {
+      kind: 'HOTEL';
+      hotelRoomTypeId?: string;
+      checkIn?: string;
+      checkOut?: string;
+      unitPrice: number;
+      /** 计费间数（0.5 步进；分房半间用）；缺省 = 按数量/晚数推算 */
+      roomsBilled?: number;
+    })
   | (OrderItemBase & { kind: 'TRANSFER'; transferId?: string; unitPrice: number })
   | (OrderItemBase & { kind: 'VISA'; visaId?: string; unitPrice: number })
   | (OrderItemBase & {
@@ -275,6 +314,10 @@ export type CreateOrderItemInput =
       adultCount?: number;
       childCount?: number;
       infantCount?: number;
+      /** 客人自备签证：勾选后服务端扣减 selfVisaDeductCny */
+      selfProvidedVisa?: boolean;
+      /** 计费间数（0.5 步进；分房半间用）；缺省 = 按人数推算 */
+      roomsBilled?: number;
     });
 
 // 签证状态（录单/详情用）；后端 enum → 中文：
@@ -303,8 +346,8 @@ export interface OrderStructuredNotes {
 }
 
 export interface CreateOrderInput extends OrderStructuredNotes {
-  contactName: string;
-  contactPhone: string;
+  contactName?: string;
+  contactPhone?: string;
   contactEmail?: string;
   paymentMethod?: PaymentMethod;
   items: CreateOrderItemInput[];
@@ -483,6 +526,8 @@ export interface RoomGroup {
   roomType: string;
   passengerIds: string[];
   notes?: string;
+  /** 占房间数：整间=1（缺省），拼房半间=0.5。例：7人3.5间。 */
+  roomFraction?: number;
 }
 
 export interface RoomAssignment {
@@ -853,6 +898,8 @@ export interface Bundle {
   infantPriceCny: number;
   /** 计费航段数（来回 = 2，单程 = 1）；升舱加价 = businessUpgradeCnyPerLeg × legs × 人数 */
   legs: number;
+  /** 客人自备签证可扣减金额（CNY/单，整数，每张套餐减一次）；>0 时录单/前台显示"自备签证"勾选 */
+  selfVisaDeductCny: number;
   /** 按出发日的不可售日期（单套餐粒度）；缺省/空 = 不限制 */
   blackoutDates?: BundleBlackoutDate[];
   /** 前台默认出发日（不影响可售判定）；null = 无默认 */
@@ -1179,6 +1226,14 @@ export const api = {
     apiFetch<{ flight: AdminFlight }>(`/flights/${flightId}/toggle`, { method: 'POST', token }),
   listSchedules: (token: string, flightId: string) =>
     apiFetch<{ schedules: AdminSchedule[] }>(`/flights/${flightId}/schedules`, { token }),
+  // 跨日期区间拉取所有航班班次（座位统计用）。省略 from/to 则返回全部。
+  listSchedulesInRange: (token: string, range?: { from?: string; to?: string }) => {
+    const params = new URLSearchParams();
+    if (range?.from) params.set('from', range.from);
+    if (range?.to) params.set('to', range.to);
+    const qs = params.toString() ? `?${params.toString()}` : '';
+    return apiFetch<{ schedules: RangeSchedule[] }>(`/flights/schedules${qs}`, { token });
+  },
   createSchedule: (
     token: string,
     body: {

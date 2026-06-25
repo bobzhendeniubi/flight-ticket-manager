@@ -184,9 +184,37 @@ export function expandBlockByDate(
   return block;
 }
 
-/** dates 上逐日累计占房行数：checkIn <= d < checkOut（半开区间，1 间/行）。*/
+/**
+ * 单行真实占房间数：roomsBilled（新列，支持 0.5 半间）→ metadata.roomsNeeded（套餐已写）
+ * → metadata.rooms（酒店行写）→ 1（兜底）。任意值非有限正数都回落到下一优先级。
+ */
+function itemRoomCount(it: {
+  roomsBilled?: Prisma.Decimal | number | null;
+  metadata?: unknown;
+}): number {
+  const billed = dec(it.roomsBilled ?? null);
+  if (billed != null && Number.isFinite(billed) && billed > 0) return billed;
+  if (it.metadata != null && typeof it.metadata === 'object') {
+    const meta = it.metadata as { roomsNeeded?: unknown; rooms?: unknown };
+    const needed = Number(meta.roomsNeeded);
+    if (Number.isFinite(needed) && needed > 0) return needed;
+    const rooms = Number(meta.rooms);
+    if (Number.isFinite(rooms) && rooms > 0) return rooms;
+  }
+  return 1;
+}
+
+/**
+ * dates 上逐日累计占房间数：checkIn <= d < checkOut（半开区间）。
+ * 每行按真实房间数计（见 itemRoomCount），支持 0.5 半间 — 用浮点累加后 round2。
+ */
 export function expandUsedByDate(
-  items: ReadonlyArray<{ hotelCheckIn: Date | null; hotelCheckOut: Date | null }>,
+  items: ReadonlyArray<{
+    hotelCheckIn: Date | null;
+    hotelCheckOut: Date | null;
+    roomsBilled?: Prisma.Decimal | number | null;
+    metadata?: unknown;
+  }>,
   dates: readonly string[],
 ): number[] {
   const used = new Array<number>(dates.length).fill(0);
@@ -194,11 +222,13 @@ export function expandUsedByDate(
     if (!it.hotelCheckIn || !it.hotelCheckOut) continue;
     const checkIn = fmtDateOnly(it.hotelCheckIn);
     const checkOut = fmtDateOnly(it.hotelCheckOut);
+    const rooms = itemRoomCount(it);
     for (let i = 0; i < dates.length; i++) {
-      if (checkIn <= dates[i] && dates[i] < checkOut) used[i] += 1;
+      if (checkIn <= dates[i] && dates[i] < checkOut) used[i] += rooms;
     }
   }
-  return used;
+  // 浮点累加可能引入 0.999… 误差 — 统一 round2，半间(0.5)精度足够
+  return used.map(round2);
 }
 
 /**
@@ -230,7 +260,7 @@ export async function getHotelNightlyRemaining(
       hotelCheckOut: { gt: fromD },
       order: { status: { in: COUNTED_STATUSES } },
     },
-    select: { hotelCheckIn: true, hotelCheckOut: true },
+    select: { hotelCheckIn: true, hotelCheckOut: true, roomsBilled: true, metadata: true },
   });
 
   const block = expandBlockByDate(periods, nightDates);
@@ -292,6 +322,8 @@ export async function getBoard(
     select: {
       hotelCheckIn: true,
       hotelCheckOut: true,
+      roomsBilled: true,
+      metadata: true,
       hotelRoomType: { select: { hotelId: true, hotel: { select: { name: true } } } },
     },
   });

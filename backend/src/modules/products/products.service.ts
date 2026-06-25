@@ -449,6 +449,8 @@ export class ProductsService {
             ? { childSeatDiscountCnyPerPerson: body.childSeatDiscountCnyPerPerson }
             : {}),
           ...(body.infantPriceCny != null ? { infantPriceCny: body.infantPriceCny } : {}),
+          // 自备签证可减额：省略 / null 时落 DB 默认（0 = 不减）
+          ...(body.selfVisaDeductCny != null ? { selfVisaDeductCny: body.selfVisaDeductCny } : {}),
           ...(body.legs != null ? { legs: body.legs } : {}),
           // 运营封盘日（省略 = DB 默认 []）；前台默认出发日（省略 = null）
           ...(body.blackoutDates != null
@@ -498,6 +500,9 @@ export class ProductsService {
     }
     if (body.infantPriceCny != null) {
       data.infantPriceCny = body.infantPriceCny;
+    }
+    if (body.selfVisaDeductCny != null) {
+      data.selfVisaDeductCny = body.selfVisaDeductCny;
     }
     if (body.legs !== undefined) data.legs = body.legs;
     if (body.blackoutDates !== undefined) {
@@ -595,6 +600,8 @@ function serializeBundle(b: BundleWithRoom, rating: ProductRatingAggregate = ZER
     // 占座儿童折扣 / 婴儿价（CNY，整数，server-priced）；前端据此报价儿童/婴儿
     childSeatDiscountCnyPerPerson: b.childSeatDiscountCnyPerPerson,
     infantPriceCny: b.infantPriceCny,
+    // 自备签证可减额（CNY，整数）；admin 表单读回
+    selfVisaDeductCny: b.selfVisaDeductCny,
     legs: b.legs,
     // 运营封盘日（按出发日 D；admin 读回）+ 前台默认出发日（仅影响初始选中）
     blackoutDates: b.blackoutDates,

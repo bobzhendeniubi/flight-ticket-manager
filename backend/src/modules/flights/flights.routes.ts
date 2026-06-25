@@ -83,6 +83,22 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
     },
   );
 
+  // ── 座位统计：按出发日区间列出所有航班的班次（含 available/locked，一次取数，免 N+1）──
+  app.get(
+    '/schedules',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    async (req) => {
+      const q = z
+        .object({
+          from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, 'from 格式应为 YYYY-MM-DD').optional(),
+          to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, 'to 格式应为 YYYY-MM-DD').optional(),
+        })
+        .parse(req.query);
+      const schedules = await service.listSchedulesInRange(q);
+      return { schedules };
+    },
+  );
+
   // ── 行李规则（航班 × 舱等；ADMIN/STAFF 维护）──
   app.get(
     '/:flightId/baggage-policies',

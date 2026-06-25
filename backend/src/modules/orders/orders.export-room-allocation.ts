@@ -31,7 +31,7 @@ const COUNTED_STATUSES: OrderStatus[] = [
 /** 导出最长跨度（天）— 超出直接 400，导出不做静默截断。*/
 export const ROOM_ALLOCATION_MAX_DAYS = 14;
 
-const GENDER_MF: Record<string, string> = { MALE: 'M', FEMALE: 'F' };
+const GENDER_MF: Record<string, string> = { M: 'M', F: 'F' };
 
 export interface RoomAllocationRow {
   seq: number;
@@ -70,12 +70,14 @@ const COLUMNS: Array<{ header: string; key: keyof RoomAllocationRow; width: numb
 ];
 
 /** 拼房分配 JSON（Order.roomAssignment.roomGroups 的单组）。*/
-interface RoomGroup {
+export interface RoomGroup {
   id: string;
   hotelName: string;
   roomType: string;
   passengerIds: string[];
   notes?: string;
+  /** 该组占房间数：0.5 = 半间/拼房（与他人合住一间），1 = 整间。缺省视为整间。*/
+  roomFraction?: number;
 }
 
 function fmtDate(d: Date | null | undefined): string {
@@ -95,7 +97,7 @@ function sheetNameForDate(date: string): string {
 }
 
 /** 防御式解析 roomAssignment JSON；形状不符直接当无分配处理。*/
-function parseRoomGroups(roomAssignment: unknown): RoomGroup[] {
+export function parseRoomGroups(roomAssignment: unknown): RoomGroup[] {
   if (roomAssignment == null || typeof roomAssignment !== 'object') return [];
   const groups = (roomAssignment as { roomGroups?: unknown }).roomGroups;
   if (!Array.isArray(groups)) return [];
@@ -166,7 +168,9 @@ export function buildRoomAllocationSheets(items: RoomItemForExport[]): RoomAlloc
       // 分了房用 roomGroup 的房型（回落乘客床型偏好）；没分房回落行上房型床型
       const assignedRoomType = group ? group.roomType || p.bedPref || '' : '';
       const roomType = assignedRoomType || it.hotelRoomType.bedType || '';
-      const notes = [group?.notes, order.notes].filter(Boolean).join(' / ');
+      // 半间/拼房标记：roomFraction === 0.5 时在备注里点出（整间/缺省不标）
+      const halfRoomNote = group && group.roomFraction === 0.5 ? '半间/拼房' : '';
+      const notes = [group?.notes, order.notes, halfRoomNote].filter(Boolean).join(' / ');
 
       const row: Omit<RoomAllocationRow, 'seq'> = {
         agency,

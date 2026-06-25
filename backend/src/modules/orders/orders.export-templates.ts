@@ -15,6 +15,7 @@ import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { toAlpha3 } from './nationality.js';
 import { passengerToRow, type PnrRow, PNR_COLUMNS } from './pnr-export.js';
 import { buildOrderFilterWhere } from './orders.service.js';
+import { parseRoomGroups } from './orders.export-room-allocation.js';
 import type { ExportTemplatesQuery } from './orders.schemas.js';
 
 export type OrderExportTemplate = ExportTemplatesQuery['template'];
@@ -63,6 +64,8 @@ const PASSENGER_TYPE_LABEL: Record<string, string> = {
   CHILD: '儿童',
   INFANT: '婴儿',
 };
+
+const GENDER_LABEL: Record<string, string> = { M: '男', F: '女', X: '其他' };
 
 const DOCUMENT_TYPE_LABEL: Record<string, string> = {
   PASSPORT: '护照',
@@ -308,7 +311,7 @@ const FULL_COLUMNS: Array<{ header: string; key: keyof FullRow; width: number }>
   { header: '签证状态', key: 'visaStatus', width: 10 },
   { header: '签证选项', key: 'visaOption', width: 20 },
   { header: '签证备注', key: 'visaNote', width: 14 },
-  { header: '护照签发地', key: 'passportIssuePlace', width: 10 },
+  { header: '护照签发国', key: 'passportIssuePlace', width: 10 },
   { header: '出生地', key: 'placeOfBirth', width: 10 },
   { header: '订单编号', key: 'orderNumber', width: 20 },
   { header: '舱位等级', key: 'cabin', width: 10 },
@@ -362,10 +365,24 @@ function orderToFullRows(order: OrderForTemplateExport, ctx: OrderContext): Omit
 
   const settled = dec(order.paidAmount) >= dec(order.total) ? '是' : '否';
 
-  return order.passengers.map<Omit<FullRow, 'seq'>>((p) => ({
+  // 备注列对标旧系统：结构化四栏 + 自由文本，再按乘客叠加其分房组（酒店/房型/组备注）。
+  const baseNotes = [order.noteSpecial, order.noteHotel, order.noteVisa, order.notePayment, order.notes]
+    .filter(Boolean)
+    .join(' / ');
+  const roomGroups = parseRoomGroups(order.roomAssignment);
+
+  return order.passengers.map<Omit<FullRow, 'seq'>>((p) => {
+    // 分房：本乘客所在组的「酒店名/房型/组备注」拼成一段（如"利国 郭针针//三星大床"由组备注承载）
+    const group = roomGroups.find((g) => g.passengerIds.includes(p.id));
+    const groupInfo = group
+      ? [group.hotelName, group.roomType, group.notes].filter(Boolean).join(' / ')
+      : '';
+    const notes = [baseNotes, groupInfo].filter(Boolean).join(' / ');
+
+    return {
     productCodes: codes.join(' / '),
     agency: ctx.agency,
-    notes: ctx.notes,
+    notes,
     hotelInfo: ctx.hotelInfo,
     chineseName: p.chineseName ?? p.fullName,
     passengerName: pnrName(p),
@@ -402,7 +419,7 @@ function orderToFullRows(order: OrderForTemplateExport, ctx: OrderContext): Omit
     dateOfBirth: fmtDate(p.dateOfBirth),
     passengerType: PASSENGER_TYPE_LABEL[p.passengerType] ?? p.passengerType,
     distribution: order.agent ? '代理' : '直客',
-    gender: p.gender ?? '',
+    gender: p.gender ? GENDER_LABEL[p.gender] ?? p.gender : '',
     nationality: toAlpha3(p.nationality),
     documentType: DOCUMENT_TYPE_LABEL[p.documentType] ?? p.documentType,
     documentNumber: p.documentNumber,
@@ -412,7 +429,8 @@ function orderToFullRows(order: OrderForTemplateExport, ctx: OrderContext): Omit
     recordedAt: fmtDateTime(order.createdAt),
     // 游客单 user=null：回退到游客联系人姓名
     recordedBy: order.user?.displayName ?? order.user?.email ?? order.guestName ?? '',
-  }));
+    };
+  });
 }
 
 // ── 模板二：《票务专用》27 列 = 代理 + 备注 + 航司 PNR 25 列 ───────────────
@@ -520,7 +538,8 @@ export async function buildOrderTemplateExportWorkbook(
 
   const orders = (await client.order.findMany({
     where,
-    orderBy: { createdAt: 'asc' },
+    // 名单按录入倒序（最新录入在最上），对标旧系统
+    orderBy: { createdAt: 'desc' },
     include: {
       agent: { select: { companyName: true } },
       user: { select: { displayName: true, email: true } },

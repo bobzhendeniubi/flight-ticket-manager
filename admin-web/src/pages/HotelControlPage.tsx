@@ -20,9 +20,12 @@ import {
   type HotelControlAlerts,
   type HotelControlBoard,
   type HotelControlForward,
+  type OrderSummary,
+  type RoomGroup,
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { NumberInput } from '../components/NumberInput';
+import { RoomingEditor, type RoomingPassenger } from '../components/RoomingEditor';
 
 // ── helpers ────────────────────────────────────────────────────────────────
 function todayStr(): string {
@@ -122,6 +125,9 @@ export function HotelControlPage() {
 
       {/* ── 分房表导出（成都格式 xlsx）──────────────────────────── */}
       <RoomAllocationExport token={token} />
+
+      {/* ── 订单分房（按订单号查 → 拖拽分房）────────────────────── */}
+      <RoomingSection token={token} />
 
       {/* ── 销控矩阵（按酒店 × 日期）──────────────────────────────── */}
       <section className="card">
@@ -233,6 +239,113 @@ export function HotelControlPage() {
       {/* ── 包房周期管理 ─────────────────────────────────────────── */}
       <BlockPeriodsEditor token={token} onChanged={() => setBoardNonce((n) => n + 1)} />
     </div>
+  );
+}
+
+// ── 订单分房（按订单号查 → 拖拽分房）────────────────────────────────────────
+/** 占位出行人（纯酒店/接送用联系人占位 documentNumber='N/A'）不进分房池。 */
+function toRoomingPassengers(order: OrderSummary): RoomingPassenger[] {
+  return order.passengers
+    .filter((p) => p.documentNumber !== 'N/A')
+    .map((p) => ({
+      id: p.id,
+      name: p.fullName,
+      gender: p.gender ?? null,
+    }));
+}
+
+function RoomingSection({ token }: { token: string }) {
+  const [orderNo, setOrderNo] = useState('');
+  const [order, setOrder] = useState<OrderSummary | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [savedAt, setSavedAt] = useState<number | null>(null);
+
+  async function lookup(): Promise<void> {
+    const q = orderNo.trim();
+    if (!q) return;
+    setLoading(true);
+    setErr(null);
+    setOrder(null);
+    setSavedAt(null);
+    try {
+      // 列表按订单号模糊查 → 精确匹配优先 → getOrder 取完整出行人 + 现有分房
+      const res = await api.listOrders(token, { search: q, pageSize: 10 });
+      const hit = res.orders.find((o) => o.orderNumber === q) ?? res.orders[0];
+      if (!hit) {
+        setErr('未找到该订单号对应的订单');
+        return;
+      }
+      const detail = await api.getOrder(token, hit.id);
+      setOrder(detail.order);
+    } catch (e: unknown) {
+      setErr(e instanceof ApiError ? e.message : '订单查询失败');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleSave(groups: RoomGroup[]): Promise<void> {
+    if (!order) return;
+    await api.updateRoomAssignment(token, order.id, groups);
+    setSavedAt(Date.now());
+  }
+
+  const roomingPassengers = order ? toRoomingPassengers(order) : [];
+  const seedHotelName = order?.roomAssignment?.roomGroups?.find((g) => g.hotelName)?.hotelName;
+
+  return (
+    <section className="card">
+      <h2 className="text-sm font-semibold text-ink">订单分房（拖拽）</h2>
+      <p className="mt-1 text-xs text-ink-muted">
+        输入订单号查出订单，把出行人拖进房间决定谁和谁一起住。保存写入该订单的分房表（分房表导出会读取）。
+      </p>
+
+      <div className="mt-3 flex flex-wrap items-end gap-2">
+        <div className="grow sm:grow-0">
+          <label className="label">订单号</label>
+          <input
+            className="input sm:w-64"
+            placeholder="如 ST-20260625-0001"
+            value={orderNo}
+            onChange={(e) => setOrderNo(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') void lookup();
+            }}
+          />
+        </div>
+        <button className="btn-primary" onClick={() => void lookup()} disabled={loading || !orderNo.trim()}>
+          {loading ? '查询中…' : '查订单'}
+        </button>
+      </div>
+
+      {err && <div className="mt-3 rounded-lg bg-rose-50 px-3 py-2 text-sm text-rose-700">{err}</div>}
+
+      {order && (
+        <div className="mt-4">
+          <div className="mb-2 text-xs text-ink-soft">
+            订单 <b className="font-mono text-ink">{order.orderNumber}</b> · 联系人 {order.contactName}
+            {savedAt != null && <span className="ml-2 text-emerald-700">· 分房已保存</span>}
+          </div>
+          {roomingPassengers.length === 0 ? (
+            <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">
+              该订单暂无可分房的出行人。
+            </div>
+          ) : (
+            <div className="rounded-lg border border-slate-200 bg-slate-50/40 p-4">
+              <RoomingEditor
+                key={order.id}
+                passengers={roomingPassengers}
+                initial={order.roomAssignment?.roomGroups}
+                hotelName={seedHotelName ?? undefined}
+                onSave={handleSave}
+                onClose={() => setOrder(null)}
+              />
+            </div>
+          )}
+        </div>
+      )}
+    </section>
   );
 }
 

@@ -856,6 +856,8 @@ export interface MockBundle {
   businessUpgradeCnyPerLeg?: number | null;
   /** 占座儿童差价（¥/人，整数，占座儿童比成人便宜）；null/缺省 = 用服务端默认 ¥30 */
   childSeatDiscountCnyPerPerson?: number | null;
+  /** 自备签证可减额（¥/单，整数，每张套餐减一次，客人自备签证时减）；null/缺省 = 0（不减） */
+  selfVisaDeductCny?: number | null;
   /** 婴儿价（¥/人，整数，不占座婴儿）；null/缺省 = 用服务端默认 ¥0 */
   infantPriceCny?: number | null;
   /** 计费航段数（来回 = 2，单程 = 1）；null/缺省 = 用服务端默认 */

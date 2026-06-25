@@ -39,11 +39,7 @@ const STATUS_LABEL: Record<string, string> = {
   CHANGED: '已改期',
 };
 
-const GENDER_LABEL: Record<string, string> = {
-  MALE: '男',
-  FEMALE: '女',
-  OTHER: '其他',
-};
+const GENDER_LABEL: Record<string, string> = { M: '男', F: '女', X: '其他' };
 
 interface OrderRow {
   orderNumber: string;

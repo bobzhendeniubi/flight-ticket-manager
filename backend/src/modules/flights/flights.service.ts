@@ -241,6 +241,27 @@ export class FlightService {
    * 每个 seatClass 额外把 fareBuckets 从 Json 解析成 FareBucket[]（null=未配置），
    * 使管理端月历库存视图可直接读/编辑仓位阶梯，basePrice 保留原 Decimal 形态不变更其它消费方。
    */
+  /**
+   * 给一组班次的每个 seatClass 算"他人 ACTIVE 未过期锁位"占用量（与前台 search() 同口径）。
+   * 让 admin 的余位 = capacity − sold − locked，消灭"航班管理/座位统计比前台多算锁位张数"的偏差。
+   */
+  private async lockedMapForSchedules(
+    schedules: { seatClasses: { id: string }[] }[],
+  ): Promise<Map<string, number>> {
+    const seatClassIds = schedules.flatMap((s) => s.seatClasses.map((c) => c.id));
+    if (seatClassIds.length === 0) return new Map();
+    const lockSums = await prisma.seatLock.groupBy({
+      by: ['seatClassId'],
+      where: {
+        seatClassId: { in: seatClassIds },
+        status: SeatLockStatus.ACTIVE,
+        expiresAt: { gt: new Date() },
+      },
+      _sum: { qty: true },
+    });
+    return new Map(lockSums.map((r) => [r.seatClassId, r._sum.qty ?? 0]));
+  }
+
   async listSchedules(flightId: string) {
     const schedules = await prisma.flightSchedule.findMany({
       where: { flightId },
@@ -249,12 +270,69 @@ export class FlightService {
         seatClasses: true,
       },
     });
+    const lockedMap = await this.lockedMapForSchedules(schedules);
     return schedules.map((s) => ({
       ...s,
-      seatClasses: s.seatClasses.map((c) => ({
-        ...c,
-        fareBuckets: parseFareBuckets(c.fareBuckets),
-      })),
+      seatClasses: s.seatClasses.map((c) => {
+        const locked = lockedMap.get(c.id) ?? 0;
+        return {
+          ...c,
+          fareBuckets: parseFareBuckets(c.fareBuckets),
+          locked,
+          // 权威余位口径（与前台一致）：capacity − sold − 他人未过期锁位
+          available: Math.max(0, c.capacity - c.sold - locked),
+        };
+      }),
+    }));
+  }
+
+  /**
+   * 座位统计：按出发日区间一次列出"所有航班"的班次（含 locked/available），
+   * 取代前端 N+1（每航班一拉）。range 省略则返回全部。
+   */
+  async listSchedulesInRange(range: { from?: string; to?: string }) {
+    // from/to 是出发地当地(Asia/Macau, UTC+8)日期；折算到 UTC 瞬间，避免 8h 边界偏移。
+    const localDayStartUtc = (d: string) => {
+      const [y, m, dd] = d.split('-').map(Number);
+      return new Date(Date.UTC(y, m - 1, dd, -8, 0, 0));
+    };
+    const where: Prisma.FlightScheduleWhereInput = {};
+    if (range.from || range.to) {
+      where.departureTime = {};
+      if (range.from) where.departureTime.gte = localDayStartUtc(range.from);
+      if (range.to)
+        where.departureTime.lte = new Date(localDayStartUtc(range.to).getTime() + 24 * 3600 * 1000 - 1);
+    }
+    const schedules = await prisma.flightSchedule.findMany({
+      where,
+      orderBy: { departureTime: 'asc' },
+      include: {
+        flight: { select: { flightNumber: true, originCode: true, destinationCode: true } },
+        seatClasses: true,
+      },
+    });
+    const lockedMap = await this.lockedMapForSchedules(schedules);
+    return schedules.map((s) => ({
+      id: s.id,
+      flightId: s.flightId,
+      flightNumber: s.flight.flightNumber,
+      originCode: s.flight.originCode,
+      destinationCode: s.flight.destinationCode,
+      departureTime: s.departureTime.toISOString(),
+      departureTz: s.departureTz,
+      ticketingCap: s.ticketingCap,
+      seatClasses: s.seatClasses.map((c) => {
+        const locked = lockedMap.get(c.id) ?? 0;
+        return {
+          id: c.id,
+          cabin: c.cabin,
+          capacity: c.capacity,
+          sold: c.sold,
+          locked,
+          available: Math.max(0, c.capacity - c.sold - locked),
+          basePrice: c.basePrice.toString(),
+        };
+      }),
     }));
   }
 

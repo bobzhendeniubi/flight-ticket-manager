@@ -575,6 +575,9 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
             roomType: z.string(),
             passengerIds: z.array(z.string()),
             notes: z.string().optional(),
+            // 半间/拼房：0.5 = 占半间（与他人拼），默认 1 间。Σ roomFraction = 该单实际占房间数。
+            // 只允许 0.5 步进（Decimal(4,1)），拒绝脏小数被静默四舍五入；0 间组不入此校验。
+            roomFraction: z.number().multipleOf(0.5).min(0.5).max(20).optional(),
           }),
         ),
       })
@@ -584,9 +587,32 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       select: { orderNumber: true, roomAssignment: true },
     });
     if (!before) return reply.status(404).send({ error: '订单不存在' });
-    await prisma.order.update({
-      where: { id },
-      data: { roomAssignment: body as unknown as object },
+    // 分房总间数（含 0.5 拼房）→ 写回酒店订单行的 roomsBilled，房控据此按真实间数计（如 7 人 3.5 间）。
+    const totalRooms = body.roomGroups.reduce((s, g) => s + (g.roomFraction ?? 1), 0);
+    await prisma.$transaction(async (tx) => {
+      await tx.order.update({
+        where: { id },
+        data: { roomAssignment: body as unknown as object },
+      });
+      // 先清空本单所有酒店行的 roomsBilled，避免多酒店行残留旧值导致房控按行 Σ 重复计数。
+      await tx.orderItem.updateMany({
+        where: { orderId: id, hotelRoomTypeId: { not: null } },
+        data: { roomsBilled: null },
+      });
+      if (totalRooms > 0) {
+        // 落到首个带房型的订单行（套餐/酒店行）；多酒店行的复杂分摊本期不处理。
+        const hotelItem = await tx.orderItem.findFirst({
+          where: { orderId: id, hotelRoomTypeId: { not: null } },
+          orderBy: { createdAt: 'asc' },
+          select: { id: true },
+        });
+        if (hotelItem) {
+          await tx.orderItem.update({
+            where: { id: hotelItem.id },
+            data: { roomsBilled: totalRooms },
+          });
+        }
+      }
     });
     void writeAudit({
       actor: actorFromRequest(req),

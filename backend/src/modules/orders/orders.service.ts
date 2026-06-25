@@ -253,6 +253,23 @@ export class OrderService {
       if (existing) return existing;
     }
 
+    // 联系人默认=录入人，电话选填（Order.contactName/contactPhone 为非空列，必须落具体值）：
+    //   - 登录用户缺省时用登录账号兜底（与 batchCreateOrders 同口径）。
+    //   - 游客缺省时用 guestContact 兜底（游客联系人路由层已断言存在）。
+    const trimmedName = body.contactName?.trim();
+    const trimmedPhone = body.contactPhone?.trim();
+    let contactName = trimmedName || guest?.name || '系统录入';
+    let contactPhone = trimmedPhone || guest?.phone || '-';
+    // 仅当登录用户且联系人/电话有缺省时，才查录入人兜底 —— 两项都已填则跳过这次 DB 查询。
+    if (!isGuest && (!trimmedName || !trimmedPhone)) {
+      const recorder = await prisma.user.findUnique({
+        where: { id: requester.userId },
+        select: { displayName: true, email: true, phone: true },
+      });
+      contactName = trimmedName || recorder?.displayName || recorder?.email || '系统录入';
+      contactPhone = trimmedPhone || recorder?.phone || '-';
+    }
+
     // 出行人数校验（与前台 effectivePax 同口径）。
     // 关键：往返机票是「同一批人」，会拆成去/回两条 FLIGHT 行（各 quantity=pax）。
     // 所需出行人按「单程最大人数」算，取各 FLIGHT 行 quantity 的 MAX，绝不两段相加 ——
@@ -379,8 +396,8 @@ export class OrderService {
           currency: 'CNY',
           subtotal: new Prisma.Decimal(subtotal),
           total: new Prisma.Decimal(total),
-          contactName: body.contactName,
-          contactPhone: body.contactPhone,
+          contactName,
+          contactPhone,
           contactEmail: body.contactEmail,
           paymentExpiresAt: new Date(Date.now() + 30 * 60 * 1000), // 30 分钟后超时
           idempotencyKey: body.idempotencyKey,
@@ -406,6 +423,8 @@ export class OrderService {
               transferId: p.transferId ?? null,
               visaId: p.visaId ?? null,
               bundleId: p.bundleId ?? null,
+              // 计费房间数（支持 0.5 间）：套餐/酒店行解析后落库，供房控读取。
+              roomsBilled: p.roomsBilled != null ? new Prisma.Decimal(p.roomsBilled) : null,
               metadata: (p.metadata ?? undefined) as Prisma.InputJsonValue | undefined,
             })),
           },
@@ -613,6 +632,8 @@ export class OrderService {
       transferId?: string;
       visaId?: string;
       bundleId?: string;
+      // 解析后的计费房间数（支持 0.5 间）。落到 OrderItem.roomsBilled 供房控读取。
+      roomsBilled?: number;
       metadata?: Record<string, unknown>;
     }> = [];
 
@@ -666,6 +687,9 @@ export class OrderService {
       } else if (item.kind === 'HOTEL') {
         // 服务端权威定价：有 hotelRoomTypeId 就从 DB 查，不信任前端 unitPrice
         let unitPrice = item.unitPrice;
+        // 计费房间数（支持 0.5 间）：录单方显式传 roomsBilled 时按其缩放，缺省 1（与旧版一致）。
+        // 单独 HOTEL 行无套餐占座模型，故不走 computeRoomsNeeded（那是套餐容量口径）。
+        const rooms = item.roomsBilled ?? 1;
         if (item.hotelRoomTypeId) {
           const rt = await prisma.hotelRoomType.findUnique({
             where: { id: item.hotelRoomTypeId },
@@ -674,18 +698,21 @@ export class OrderService {
           if (!rt) throw new NotFoundError(`酒店房型 ${item.hotelRoomTypeId} 不存在`);
           if (!rt.hotel.isActive) throw new BadRequestError('酒店已下架');
           unitPrice = Number(rt.basePrice);
-          // A3：拒绝偏离服务端权威价超容差的提交（仅有产品 id 时校验，无 id 走信任旧路径）
-          assertAmountWithinTolerance('酒店', item.unitPrice, unitPrice, item.quantity);
+          // A3：拒绝偏离服务端权威价超容差的提交（仅有产品 id 时校验，无 id 走信任旧路径）。
+          // 0.5 间：金额随 roomsBilled 缩放，容差按同一房间数口径比较，避免误判价格变动。
+          assertAmountWithinTolerance('酒店', item.unitPrice, unitPrice, item.quantity * rooms);
         }
         priced.push({
           kind: 'HOTEL',
           description: item.description,
           quantity: item.quantity,
           unitPrice,
-          amount: Math.round(unitPrice * item.quantity),
+          // 单独 HOTEL 行：unitPrice×qty×rooms（rooms 缺省 1 → 与旧版一致）。
+          amount: Math.round(unitPrice * item.quantity * rooms),
           hotelRoomTypeId: item.hotelRoomTypeId,
           hotelCheckIn: item.checkIn ? new Date(item.checkIn) : undefined,
           hotelCheckOut: item.checkOut ? new Date(item.checkOut) : undefined,
+          roomsBilled: rooms,
           metadata: item.metadata,
         });
       } else if (item.kind === 'TRANSFER') {
@@ -750,6 +777,8 @@ export class OrderService {
             // 占座儿童折扣 / 婴儿价（server-priced，按产品可配置）
             childSeatDiscountCnyPerPerson: true,
             infantPriceCny: true,
+            // 自备签证减免（出行人自行办妥签证时从套餐行扣减；server-priced）
+            selfVisaDeductCny: true,
             legs: true,
             // 关联房型容量 → 算 roomsNeeded（自动加房，套餐酒店部分按房价 ×rooms 收费）
             hotelRoomType: { select: { maxAdults: true, maxChildren: true } },
@@ -773,17 +802,18 @@ export class OrderService {
         //   roomsNeeded = max( ceil(成人/maxAdults), ceil(占座儿童/maxChildren), 1 )
         // 套餐没绑房型 / 容量缺失 → computeRoomsNeeded 回退默认 2大1小（≈旧 ceil(seatPax/2) 行为）。
         // 注意：单人入住（singleCount）不在此计入 —— 它是独立自愿加价项，容量才驱动房间数。
-        const roomsNeeded = computeRoomsNeeded(occupancy, bundle.hotelRoomType);
+        // 0.5 间：录单方显式传 roomsBilled（支持半间）时以其为准，否则按容量自动推算。
+        const rooms = item.roomsBilled ?? computeRoomsNeeded(occupancy, bundle.hotelRoomType);
 
         // 地面部分价（机票部分留给 FLIGHT item 单独动态定价）：
-        //   HOTEL 行（unitPrice=每间每晚, qty=晚数）按 unitPrice×qty×roomsNeeded 收费 → 套餐价随房间数涨；
+        //   HOTEL 行（unitPrice=每间每晚, qty=晚数）按 unitPrice×qty×rooms 收费 → 套餐价随房间数涨；
         //   非 HOTEL 地面行（TRANSFER/VISA 等）固定 unitPrice×qty×1（不随房间数变）。
         //   bundleGround = Σ(HOTEL×rooms) + Σ(其它非机票) − groundDiscount
         const bundleItems = (bundle.items as Array<{ kind: string; qty: number; unitPrice: number }>) ?? [];
         const groundTotal = bundleItems
           .filter((b) => b.kind !== 'FLIGHT')
           .reduce((s, b) => {
-            const roomFactor = b.kind === 'HOTEL' ? roomsNeeded : 1;
+            const roomFactor = b.kind === 'HOTEL' ? rooms : 1;
             return s + b.qty * b.unitPrice * roomFactor;
           }, 0);
         const bundleUnitPrice = Math.max(0, Math.round(groundTotal - Number(bundle.groundDiscount)));
@@ -803,6 +833,7 @@ export class OrderService {
           item.businessCount,
           occupancy,
           nights,
+          item.selfProvidedVisa,
         );
         // 累计本单的升舱人数（多份套餐叠加），下方循环结束后统一分摊到经济舱航段并预检商务舱余位。
         // 注意：addOn.breakdown.businessCount 已夹到占座人数（seatPax）上限，婴儿不计入。
@@ -819,10 +850,12 @@ export class OrderService {
           hotelRoomTypeId: hotelStamp?.hotelRoomTypeId,
           hotelCheckIn: hotelStamp?.hotelCheckIn,
           hotelCheckOut: hotelStamp?.hotelCheckOut,
+          // 解析后的计费房间数（支持 0.5 间）落到 OrderItem.roomsBilled，供房控读取。
+          roomsBilled: rooms,
           // 把升级选择 + 重算明细 + roomsNeeded 落到订单行 metadata，供运营/财务查看
           //（admin 内部仍可叫"单房差/升舱"；roomsNeeded 解释酒店部分为何按房价 ×rooms 收费）
-          metadata: addOn.hasAddOn || roomsNeeded > 1
-            ? { ...(item.metadata ?? {}), roomsNeeded, addOns: addOn.breakdown }
+          metadata: addOn.hasAddOn || rooms > 1
+            ? { ...(item.metadata ?? {}), roomsNeeded: rooms, addOns: addOn.breakdown }
             : item.metadata,
         });
       }
@@ -2631,10 +2664,14 @@ export type OrderListFilters = Pick<
  */
 export function buildOrderFilterWhere(query: OrderListFilters): Prisma.OrderWhereInput {
   const where: Prisma.OrderWhereInput = {};
+  // 多个 items 维度的筛选必须用 AND 叠加（每个 { items: { some } } 各自独立成立），
+  // 否则直接赋值 where.items 会互相覆盖 —— 历史上 kind 与 travelFrom/travelTo 同时传时
+  // 后者会清掉前者，造成漏单（结构性根因）。统一往 andClauses 里推。
+  const andClauses: Prisma.OrderWhereInput[] = [];
 
   if (query.status) where.status = query.status;
   if (query.agentId) where.agentId = query.agentId;
-  if (query.kind) where.items = { some: { kind: query.kind } };
+  if (query.kind) andClauses.push({ items: { some: { kind: query.kind } } });
   if (query.from || query.to) {
     where.createdAt = {
       ...(query.from ? { gte: new Date(`${query.from}T00:00:00Z`) } : {}),
@@ -2642,50 +2679,55 @@ export function buildOrderFilterWhere(query: OrderListFilters): Prisma.OrderWher
     };
   }
   // 按出行日期筛选 — 跨 OrderItem 多种字段
-  // FLIGHT: 取 schedule.departureTime；HOTEL: hotelCheckIn；其他暂时用 createdAt 兜底
+  // FLIGHT: 取 schedule.departureTime；HOTEL: hotelCheckIn；其他暂时用 createdAt 兜底。
+  // 出行日期存的是 UTC 时刻，而筛选用的是本地（出发地 +8）日期；UTC 与本地跨午夜会落到相邻日，
+  // 直接按 [from 00:00Z, to 23:59Z] 卡会漏掉边界单。故把窗口各向外放宽一天做安全余量
+  //（宁可多召回、不漏单 —— 与财务按出发地时区分桶同源的容忍口径）。
   if (query.travelFrom || query.travelTo) {
-    const start = query.travelFrom ? new Date(`${query.travelFrom}T00:00:00Z`) : undefined;
-    const end = query.travelTo ? new Date(`${query.travelTo}T23:59:59Z`) : undefined;
-    where.items = {
-      some: {
-        OR: [
-          {
-            flightSchedule: {
-              departureTime: {
+    const start = query.travelFrom
+      ? new Date(new Date(`${query.travelFrom}T00:00:00Z`).getTime() - DAY_MS)
+      : undefined;
+    const end = query.travelTo
+      ? new Date(new Date(`${query.travelTo}T23:59:59Z`).getTime() + DAY_MS)
+      : undefined;
+    andClauses.push({
+      items: {
+        some: {
+          OR: [
+            {
+              flightSchedule: {
+                departureTime: {
+                  ...(start ? { gte: start } : {}),
+                  ...(end ? { lte: end } : {}),
+                },
+              },
+            },
+            {
+              hotelCheckIn: {
                 ...(start ? { gte: start } : {}),
                 ...(end ? { lte: end } : {}),
               },
             },
-          },
-          {
-            hotelCheckIn: {
-              ...(start ? { gte: start } : {}),
-              ...(end ? { lte: end } : {}),
-            },
-          },
-        ],
+          ],
+        },
       },
-    };
+    });
   }
   if (query.invoiceStatus) where.invoiceStatus = query.invoiceStatus;
-  // 航班号筛选 — 订单需含该航班号的 FLIGHT 行
-  // 用 AND 叠加，避免覆盖 kind / 出行日期已占用的 where.items
+  // 航班号筛选 — 订单需含该航班号的 FLIGHT 行（同样走 AND 叠加，可与 kind/出行日期组合）
   if (query.flightNumber) {
-    where.AND = [
-      ...(Array.isArray(where.AND) ? where.AND : where.AND ? [where.AND] : []),
-      {
-        items: {
-          some: {
-            kind: OrderItemKind.FLIGHT,
-            flightSchedule: {
-              flight: {
-                flightNumber: { equals: query.flightNumber, mode: 'insensitive' },
-              },
+    andClauses.push({
+      items: {
+        some: {
+          kind: OrderItemKind.FLIGHT,
+          flightSchedule: {
+            flight: {
+              flightNumber: { equals: query.flightNumber, mode: 'insensitive' },
             },
           },
         },
       },
-    ];
+    });
   }
   // 乘客姓名模糊匹配
   if (query.passengerName) {
@@ -2700,6 +2742,9 @@ export function buildOrderFilterWhere(query: OrderListFilters): Prisma.OrderWher
       { contactPhone: { contains: query.search } },
     ];
   }
+
+  // 把所有 items 维度的子句一次性 AND 起来（kind / 出行日期 / 航班号可任意组合，互不覆盖）
+  if (andClauses.length > 0) where.AND = andClauses;
 
   return where;
 }
@@ -2797,11 +2842,14 @@ export interface BundleAddOnBreakdown {
   businessUpgradeCnyPerLeg: number; // 该套餐配置的升舱/航段
   childSeatDiscountCnyPerPerson: number; // 该套餐配置的占座儿童折扣/人
   infantPriceCny: number; // 该套餐配置的婴儿价/人
+  selfProvidedVisa: boolean; // 是否自备签证（自行办妥签证）
+  selfVisaDeductCny: number; // 该套餐配置的自备签证减免/单
   singleSupplementTotal: number; // = singleCount × rate × nights
   businessUpgradeTotal: number; // = businessCount × rate × legs
   childSeatDiscountTotal: number; // = childCount × childSeatDiscountCnyPerPerson（机票折扣，负向计入套餐行）
   infantPriceTotal: number; // = infantCount × infantPriceCny（婴儿机票价，正向计入套餐行）
-  total: number; // 升级加价 + 婴儿价 − 儿童折扣 的净额（计入套餐行总额）
+  selfVisaDeductTotal: number; // = selfProvidedVisa ? selfVisaDeductCny : 0（自备签证减免，负向计入套餐行）
+  total: number; // 升级加价 + 婴儿价 − 儿童折扣 − 自备签证减免 的净额（计入套餐行总额）
 }
 
 /**
@@ -2898,7 +2946,8 @@ export function computeRoomsNeeded(
  *   legs   = bundle.legs（来回默认 2）
  *   单人入住房差 = singleCount × singleSupplementCnyPerNight × nights
  *   升舱商务加价 = businessCount × businessUpgradeCnyPerLeg × legs
- * singleCount / businessCount 缺省 0 → total=0 → 套餐价与旧版完全一致（向后兼容）。
+ *   自备签证减免 = selfProvidedVisa ? selfVisaDeductCny : 0（自行办妥签证，从套餐行扣减）
+ * singleCount / businessCount 缺省 0、selfProvidedVisa 缺省 false → total=0 → 套餐价与旧版完全一致（向后兼容）。
  *
  * 导出仅供单测使用。
  */
@@ -2909,6 +2958,7 @@ export function computeBundleAddOn(
     businessUpgradeCnyPerLeg: number;
     childSeatDiscountCnyPerPerson: number;
     infantPriceCny: number;
+    selfVisaDeductCny: number;
     legs: number;
   },
   hotelStamp: { hotelCheckIn: Date; hotelCheckOut: Date } | null,
@@ -2917,6 +2967,8 @@ export function computeBundleAddOn(
   occupancy: BundleOccupancy,
   /** 调用方按 resolveBundleNights 解析的单一权威晚数（无盖章时的回退口径）。 */
   resolvedNights: number,
+  /** 自备签证（出行人自行办妥签证）→ 从套餐行扣减 selfVisaDeductCny。缺省 false。 */
+  selfProvidedVisa?: boolean,
 ): { total: number; hasAddOn: boolean; breakdown: BundleAddOnBreakdown } {
   const single = Math.max(0, Math.trunc(singleCount ?? 0));
   // businessCount 不能超过占座人数（成人 + 占座儿童）；婴儿不占座、不能升舱
@@ -2936,6 +2988,8 @@ export function computeBundleAddOn(
   const businessRate = Math.max(0, bundle.businessUpgradeCnyPerLeg);
   const childDiscountRate = Math.max(0, bundle.childSeatDiscountCnyPerPerson);
   const infantRate = Math.max(0, bundle.infantPriceCny);
+  const selfVisaRate = Math.max(0, bundle.selfVisaDeductCny);
+  const selfVisa = selfProvidedVisa === true;
 
   const singleSupplementTotal = single * singleRate * nights;
   const businessUpgradeTotal = business * businessRate * legs;
@@ -2943,20 +2997,27 @@ export function computeBundleAddOn(
   const childSeatDiscountTotal = occupancy.childCount * childDiscountRate;
   // 不占座婴儿机票收婴儿价（不走经济舱全价）→ 套餐行净加 infantCount × 婴儿价
   const infantPriceTotal = occupancy.infantCount * infantRate;
-  // 升级加价 + 婴儿价 − 儿童折扣（向上夹到 0，避免套餐行出现负总额）
+  // 自备签证：出行人自行办妥签证 → 套餐行净减该套餐配置的自备签证减免
+  const selfVisaDeductTotal = selfVisa ? selfVisaRate : 0;
+  // 升级加价 + 婴儿价 − 儿童折扣 − 自备签证减免（向上夹到 0，避免套餐行出现负总额）
   const total = Math.max(
     0,
-    singleSupplementTotal + businessUpgradeTotal + infantPriceTotal - childSeatDiscountTotal,
+    singleSupplementTotal +
+      businessUpgradeTotal +
+      infantPriceTotal -
+      childSeatDiscountTotal -
+      selfVisaDeductTotal,
   );
 
   return {
     total,
-    // 任一占座升级或儿童/婴儿差价存在 → 视为有 add-on（落 metadata 供运营/财务查看）
+    // 任一占座升级或儿童/婴儿差价 / 自备签证减免存在 → 视为有 add-on（落 metadata 供运营/财务查看）
     hasAddOn:
       single > 0 ||
       business > 0 ||
       childSeatDiscountTotal > 0 ||
-      infantPriceTotal > 0,
+      infantPriceTotal > 0 ||
+      selfVisaDeductTotal > 0,
     breakdown: {
       singleCount: single,
       businessCount: business,
@@ -2972,10 +3033,13 @@ export function computeBundleAddOn(
       businessUpgradeCnyPerLeg: businessRate,
       childSeatDiscountCnyPerPerson: childDiscountRate,
       infantPriceCny: infantRate,
+      selfProvidedVisa: selfVisa,
+      selfVisaDeductCny: selfVisaRate,
       singleSupplementTotal,
       businessUpgradeTotal,
       childSeatDiscountTotal,
       infantPriceTotal,
+      selfVisaDeductTotal,
       total,
     },
   };
@@ -3406,6 +3470,12 @@ async function resolveBundleFulfillmentTypes(
  *   旧的 `fulfillmentTasks.length > 0` 单值守卫会漏建剩余类型，故改为按类型去重）。
  */
 async function createFulfillmentTasks(tx: Prisma.TransactionClient, orderId: string): Promise<string[]> {
+  // 订单级签证状态：visaStatus='NEEDED' 的订单即便没有 VISA 行/套餐签证组件，
+  // 也要进签证台（让签证岗看见）。NOT_NEEDED/HAS_VISA/E_VISA 不开任务。
+  const order = await tx.order.findUnique({
+    where: { id: orderId },
+    select: { visaStatus: true },
+  });
   const items = await tx.orderItem.findMany({
     where: { orderId },
     select: {
@@ -3416,6 +3486,10 @@ async function createFulfillmentTasks(tx: Prisma.TransactionClient, orderId: str
     },
   });
   const newTaskIds: string[] = [];
+  // 全单是否已（含本次新建）存在签证任务 —— 用于订单级「需要签证」去重，避免重复建。
+  let hasVisaTask = items.some((item) =>
+    item.fulfillmentTasks.some((t) => t.type === FulfillmentType.VISA_APPLICATION),
+  );
   for (const item of items) {
     // 该订单项需要的任务类型集合
     const desiredTypes =
@@ -3439,7 +3513,22 @@ async function createFulfillmentTasks(tx: Prisma.TransactionClient, orderId: str
         },
       });
       newTaskIds.push(task.id);
+      if (type === FulfillmentType.VISA_APPLICATION) hasVisaTask = true;
     }
+  }
+
+  // 订单级「需要签证」：visaStatus='NEEDED' 且本单全程没有任何签证任务（VISA 行 / 套餐签证组件
+  // 都没产生）→ 补一条 VISA_APPLICATION，挂到首个订单项（FulfillmentTask 仅有 orderItemId 外键，
+  // 无 Order 直挂）。已有签证任务则跳过，保证重跑 PAID 不重复建（幂等）。
+  if (order?.visaStatus === 'NEEDED' && !hasVisaTask && items.length > 0) {
+    const task = await tx.fulfillmentTask.create({
+      data: {
+        orderItemId: items[0].id,
+        type: FulfillmentType.VISA_APPLICATION,
+        status: FulfillmentStatus.PENDING,
+      },
+    });
+    newTaskIds.push(task.id);
   }
   return newTaskIds;
 }

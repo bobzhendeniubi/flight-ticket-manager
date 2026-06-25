@@ -646,6 +646,7 @@ describe('computeBundleAddOn', () => {
     businessUpgradeCnyPerLeg: 700,
     childSeatDiscountCnyPerPerson: 30,
     infantPriceCny: 0,
+    selfVisaDeductCny: 0,
     legs: 2,
   };
   // 真实入住区间：7/1 → 7/4 = 3 晚
@@ -775,6 +776,28 @@ describe('computeBundleAddOn', () => {
   it('婴儿不占座、不能升舱：2 大 0 小 0 婴 seatPax=2，businessCount=3 夹到 2', () => {
     const r = computeBundleAddOn(bundle, stamp, 0, 3, occ(2, 0, 0), 3);
     expect(r.breakdown.businessCount).toBe(2);
+  });
+
+  // ── 自备签证减钱 ────────────────────────────────────────────────────
+  it('自备签证：selfProvidedVisa=true → 套餐行净减该套餐配置的 selfVisaDeductCny', () => {
+    const cfg = { ...bundle, selfVisaDeductCny: 600 };
+    // 单人入住 1 人 × 80 × 3 = 240；自备签证减 600 → 240 − 600 → clamp 0
+    const withDeduct = computeBundleAddOn(cfg, stamp, 1, 0, occ(2), 3, true);
+    expect(withDeduct.breakdown.selfVisaDeductTotal).toBe(600);
+    expect(withDeduct.breakdown.selfProvidedVisa).toBe(true);
+    expect(withDeduct.total).toBe(0); // 240 − 600 clamp 0
+    expect(withDeduct.hasAddOn).toBe(true);
+    // 升级足够大时确实减进去：升舱 1 人 × 700 × 2 = 1400 − 600 = 800
+    const r = computeBundleAddOn(cfg, stamp, 0, 1, occ(2), 3, true);
+    expect(r.total).toBe(800);
+  });
+
+  it('自备签证缺省 false → 不减（向后兼容，selfVisaDeductTotal=0）', () => {
+    const cfg = { ...bundle, selfVisaDeductCny: 600 };
+    const r = computeBundleAddOn(cfg, stamp, 0, 1, occ(2), 3);
+    expect(r.breakdown.selfVisaDeductTotal).toBe(0);
+    expect(r.breakdown.selfProvidedVisa).toBe(false);
+    expect(r.total).toBe(1400); // 升舱 1400，无减免
   });
 });
 
@@ -1091,10 +1114,15 @@ describe('createFulfillmentTasks · 套餐 fan-out 到地面岗', () => {
       fulfillmentTasks?: Array<{ type: string }>;
     }>;
     bundleItems?: Array<{ kind: string }> | null;
+    // 订单级签证状态（缺省 null = 不需要订单级补签证任务）
+    visaStatus?: string | null;
   }) {
     const created: Array<{ orderItemId: string; type: string; status: string }> = [];
     let seq = 0;
     const tx = {
+      order: {
+        findUnique: vi.fn().mockResolvedValue({ visaStatus: opts.visaStatus ?? null }),
+      },
       orderItem: {
         findMany: vi.fn().mockResolvedValue(
           opts.items.map((it) => ({
@@ -1222,6 +1250,57 @@ describe('createFulfillmentTasks · 套餐 fan-out 到地面岗', () => {
       { orderItemId: 'itm_flight', type: 'FLIGHT_TICKETING', status: 'PENDING' },
       { orderItemId: 'itm_hotel', type: 'HOTEL_BOOKING', status: 'PENDING' },
     ]);
+  });
+
+  // ── 订单级「需要签证」也进签证台 ─────────────────────────────────────
+  it('visaStatus=NEEDED 且无任何签证任务（纯机票单）→ 补一条 VISA_APPLICATION 挂首项', async () => {
+    const { tx, created } = makeTx({
+      items: [{ id: 'itm_flight', kind: 'FLIGHT' }],
+      visaStatus: 'NEEDED',
+    });
+    await run(tx);
+    expect(created).toEqual([
+      { orderItemId: 'itm_flight', type: 'FLIGHT_TICKETING', status: 'PENDING' },
+      { orderItemId: 'itm_flight', type: 'VISA_APPLICATION', status: 'PENDING' },
+    ]);
+  });
+
+  it('visaStatus=NEEDED 但已有签证任务（套餐含 VISA 组件）→ 不重复补', async () => {
+    const { tx, created } = makeTx({
+      items: [{ id: 'itm_bundle', kind: 'BUNDLE', bundleId: 'bdl_visa' }],
+      bundleItems: [{ kind: 'HOTEL' }, { kind: 'VISA' }],
+      visaStatus: 'NEEDED',
+    });
+    await run(tx);
+    const visaCount = created.filter((c) => c.type === 'VISA_APPLICATION').length;
+    expect(visaCount).toBe(1); // 套餐组件已建一条，不再额外补
+  });
+
+  it('visaStatus=NEEDED 幂等：已存在 VISA_APPLICATION → 重跑零新建', async () => {
+    const { tx, created } = makeTx({
+      items: [
+        {
+          id: 'itm_flight',
+          kind: 'FLIGHT',
+          fulfillmentTasks: [{ type: 'FLIGHT_TICKETING' }, { type: 'VISA_APPLICATION' }],
+        },
+      ],
+      visaStatus: 'NEEDED',
+    });
+    const ids = await run(tx);
+    expect(created).toHaveLength(0);
+    expect(ids).toHaveLength(0);
+  });
+
+  it('visaStatus=NOT_NEEDED/HAS_VISA/E_VISA → 不补订单级签证任务', async () => {
+    for (const visaStatus of ['NOT_NEEDED', 'HAS_VISA', 'E_VISA']) {
+      const { tx, created } = makeTx({
+        items: [{ id: 'itm_flight', kind: 'FLIGHT' }],
+        visaStatus,
+      });
+      await run(tx);
+      expect(created.map((c) => c.type)).not.toContain('VISA_APPLICATION');
+    }
   });
 });
 

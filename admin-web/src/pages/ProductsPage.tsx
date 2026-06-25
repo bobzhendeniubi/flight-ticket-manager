@@ -121,6 +121,7 @@ function bundleApiToMock(b: ApiBundle): MockBundle {
     singleSupplementCnyPerNight: b.singleSupplementCnyPerNight,
     businessUpgradeCnyPerLeg: b.businessUpgradeCnyPerLeg,
     childSeatDiscountCnyPerPerson: b.childSeatDiscountCnyPerPerson,
+    selfVisaDeductCny: b.selfVisaDeductCny ?? null,
     infantPriceCny: b.infantPriceCny,
     legs: b.legs,
     blackoutDates: b.blackoutDates ?? [],
@@ -299,6 +300,7 @@ export function ProductsPage() {
           singleSupplementCnyPerNight: n.singleSupplementCnyPerNight ?? null,
           businessUpgradeCnyPerLeg: n.businessUpgradeCnyPerLeg ?? null,
           childSeatDiscountCnyPerPerson: n.childSeatDiscountCnyPerPerson ?? null,
+          selfVisaDeductCny: n.selfVisaDeductCny ?? null,
           infantPriceCny: n.infantPriceCny ?? null,
           legs: n.legs ?? 2,
           blackoutDates: n.blackoutDates ?? [],
@@ -317,6 +319,7 @@ export function ProductsPage() {
             singleSupplementCnyPerNight: n.singleSupplementCnyPerNight ?? null,
             businessUpgradeCnyPerLeg: n.businessUpgradeCnyPerLeg ?? null,
             childSeatDiscountCnyPerPerson: n.childSeatDiscountCnyPerPerson ?? null,
+            selfVisaDeductCny: n.selfVisaDeductCny ?? null,
             infantPriceCny: n.infantPriceCny ?? null,
             legs: n.legs ?? 2,
             blackoutDates: n.blackoutDates ?? [],
@@ -746,7 +749,7 @@ function BundleCard({
         </div>
       )}
 
-      {(bundle.childSeatDiscountCnyPerPerson != null || bundle.infantPriceCny != null) && (
+      {(bundle.childSeatDiscountCnyPerPerson != null || bundle.infantPriceCny != null || (bundle.selfVisaDeductCny != null && bundle.selfVisaDeductCny > 0)) && (
         <div className="mt-1 text-xs text-ink-soft">
           {bundle.childSeatDiscountCnyPerPerson != null && (
             <>🧒 占座儿童差价 −¥{bundle.childSeatDiscountCnyPerPerson.toLocaleString()}/人</>
@@ -754,6 +757,10 @@ function BundleCard({
           {bundle.childSeatDiscountCnyPerPerson != null && bundle.infantPriceCny != null && ' · '}
           {bundle.infantPriceCny != null && (
             <>👶 婴儿价 ¥{bundle.infantPriceCny.toLocaleString()}/人</>
+          )}
+          {(bundle.childSeatDiscountCnyPerPerson != null || bundle.infantPriceCny != null) && bundle.selfVisaDeductCny != null && bundle.selfVisaDeductCny > 0 && ' · '}
+          {bundle.selfVisaDeductCny != null && bundle.selfVisaDeductCny > 0 && (
+            <>🛂 自备签证 −¥{bundle.selfVisaDeductCny.toLocaleString()}/单</>
           )}
         </div>
       )}
@@ -819,6 +826,7 @@ function NewBundleWizard({
   const [businessUpgrade, setBusinessUpgrade] = useState<number | null>(initial?.businessUpgradeCnyPerLeg ?? null);
   // 大人/小孩区分（CNY；留空 = 用服务端默认：占座儿童差价 ¥30、婴儿价 ¥0）
   const [childSeatDiscount, setChildSeatDiscount] = useState<number | null>(initial?.childSeatDiscountCnyPerPerson ?? null);
+  const [selfVisaDeduct, setSelfVisaDeduct] = useState<number | null>(initial?.selfVisaDeductCny ?? null);
   const [infantPrice, setInfantPrice] = useState<number | null>(initial?.infantPriceCny ?? null);
   const [legs, setLegs] = useState<number | null>(initial?.legs ?? 2);
   // Local draft shape allowing null for in-progress numeric edits
@@ -1008,6 +1016,18 @@ function NewBundleWizard({
                 integerOnly
               />
             </div>
+            <div>
+              <label className="label">自备签证可减额（¥/单，每张套餐减一次）</label>
+              <NumberInput
+                min={0}
+                max={1000000}
+                className="input"
+                placeholder="留空 = 0（不减）"
+                value={selfVisaDeduct}
+                onChange={(n) => setSelfVisaDeduct(n)}
+                integerOnly
+              />
+            </div>
           </div>
 
           <div>
@@ -1157,6 +1177,7 @@ function NewBundleWizard({
                   singleSupplementCnyPerNight: singleSupplement,
                   businessUpgradeCnyPerLeg: businessUpgrade,
                   childSeatDiscountCnyPerPerson: childSeatDiscount,
+                  selfVisaDeductCny: selfVisaDeduct,
                   infantPriceCny: infantPrice,
                   legs: legs ?? 2,
                   // 仅提交填了日期的封盘行；reason 去空格，空则省略
