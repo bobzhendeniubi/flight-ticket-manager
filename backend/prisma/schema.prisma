@@ -1031,6 +1031,8 @@ model Passenger {
   visaNumber               String?
   visaType                 String? // E-visa / Sticker / Approval letter
   visaIssueDate            DateTime? @db.Date
+  // 签证生效日（线下确认模版的"生效时间"，可与出签日不同）
+  visaEffectiveDate        DateTime? @db.Date
   visaExpiry               DateTime? @db.Date
   visaPlaceOfIssue         String?
   visaCountryOfApplication String?

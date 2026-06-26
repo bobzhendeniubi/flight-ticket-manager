@@ -285,6 +285,14 @@ export interface OrderPassengerInput {
   chineseName?: string;
   /** 护照签发日期 YYYY-MM-DD（可选；OCR 能识别时带出） */
   passportIssueDate?: string;
+  /** 护照有效期 YYYY-MM-DD（可选；OCR 能识别时带出） */
+  passportExpiry?: string;
+  /** 签证出签日 YYYY-MM-DD（可选） */
+  visaIssueDate?: string;
+  /** 签证生效日 YYYY-MM-DD（可选） */
+  visaEffectiveDate?: string;
+  /** 签证有效期 YYYY-MM-DD（可选） */
+  visaExpiry?: string;
 }
 
 interface OrderItemBase {

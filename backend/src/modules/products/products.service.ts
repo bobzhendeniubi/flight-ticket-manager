@@ -212,22 +212,45 @@ export class ProductsService {
 
       await tx.hotel.update({ where: { id }, data });
 
-      // 房型替换式更新（简化：若提供 roomTypes 则全量重建）
+      // 房型 upsert 式更新（关键：保留已有房型 id，避免套餐 hotelRoomTypeId / 订单引用漂移失联）。
+      // 匹配优先用回传的 id，其次按名称匹配现有房型 → 原地 update；未匹配的为新建；
+      // 现有房型中本次未出现的才删除（按 id 集合差）。
       if (body.roomTypes !== undefined) {
-        await tx.hotelRoomType.deleteMany({ where: { hotelId: id } });
-        if (body.roomTypes.length > 0) {
-          await tx.hotelRoomType.createMany({
-            data: body.roomTypes.map((rt) => ({
-              hotelId: id,
-              name: rt.name,
-              bedType: rt.bedType,
-              capacity: rt.capacity,
-              maxAdults: rt.maxAdults,
-              maxChildren: rt.maxChildren,
-              basePrice: new Prisma.Decimal(rt.basePrice),
-              priceMultiplier: rt.priceMultiplier !== undefined ? new Prisma.Decimal(rt.priceMultiplier) : null,
-            })),
-          });
+        const existing = await tx.hotelRoomType.findMany({
+          where: { hotelId: id },
+          select: { id: true, name: true },
+        });
+        const existingById = new Map(existing.map((rt) => [rt.id, rt]));
+        const existingByName = new Map(existing.map((rt) => [rt.name, rt]));
+
+        const keptIds = new Set<string>();
+        for (const rt of body.roomTypes) {
+          const matched =
+            (rt.id && existingById.get(rt.id)) || existingByName.get(rt.name) || null;
+          const data = {
+            name: rt.name,
+            bedType: rt.bedType,
+            capacity: rt.capacity,
+            maxAdults: rt.maxAdults,
+            maxChildren: rt.maxChildren,
+            basePrice: new Prisma.Decimal(rt.basePrice),
+            priceMultiplier:
+              rt.priceMultiplier !== undefined ? new Prisma.Decimal(rt.priceMultiplier) : null,
+          };
+          if (matched) {
+            // 原地更新：保留原 id
+            await tx.hotelRoomType.update({ where: { id: matched.id }, data });
+            keptIds.add(matched.id);
+          } else {
+            const created = await tx.hotelRoomType.create({ data: { hotelId: id, ...data } });
+            keptIds.add(created.id);
+          }
+        }
+
+        // 只删本次未保留的现有房型（被移除的）
+        const toDelete = existing.filter((rt) => !keptIds.has(rt.id)).map((rt) => rt.id);
+        if (toDelete.length > 0) {
+          await tx.hotelRoomType.deleteMany({ where: { id: { in: toDelete } } });
         }
       }
 

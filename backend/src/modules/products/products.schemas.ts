@@ -84,6 +84,9 @@ export const createHotelBodySchema = z.object({
   isActive: z.boolean().default(true),
   roomTypes: z.array(
     z.object({
+      // 编辑时回传已有房型 id → 原地更新（保留 id，避免套餐 hotelRoomTypeId 漂移失联）。
+      // 新建房型不传 id。
+      id: z.string().min(1).optional(),
       name: z.string().min(1).max(100),
       bedType: z.string().max(100).optional(),
       capacity: z.number().int().min(1).max(10),
@@ -93,7 +96,13 @@ export const createHotelBodySchema = z.object({
       basePrice: z.number().nonnegative(),
       priceMultiplier: z.number().positive().optional(),
     }),
-  ).default([]),
+  )
+    // 同名房型会让 updateHotel 的 name 匹配二义（后写覆盖前写、静默丢一条）→ 直接拒绝
+    .refine(
+      (rts) => new Set(rts.map((rt) => rt.name)).size === rts.length,
+      { message: '房型名称不能重复' },
+    )
+    .default([]),
 });
 export type CreateHotelBody = z.infer<typeof createHotelBodySchema>;
 export const updateHotelBodySchema = createHotelBodySchema.partial();

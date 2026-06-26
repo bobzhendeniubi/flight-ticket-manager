@@ -515,6 +515,26 @@ export function OrdersPage() {
           >
             📥 导出 CSV
           </button>
+          {/* 录入周期快捷预设：一键设上方「下单时间」起止，导出按此周期（佣金/提成/客户统计） */}
+          {([
+            ['thisMonth', '本月'],
+            ['lastMonth', '上月'],
+            ['last30', '近30天'],
+          ] as [CreatedPreset, string][]).map(([preset, label]) => (
+            <button
+              key={preset}
+              type="button"
+              className="btn-ghost text-sm"
+              onClick={() => {
+                const [f, t] = createdRangePreset(preset);
+                setCreatedFrom(f);
+                setCreatedTo(t);
+              }}
+              title={`设「下单时间」为${label}（导出/统计按此录入周期）`}
+            >
+              {label}
+            </button>
+          ))}
           <select
             className="input max-w-[9.5rem] py-1.5 text-sm"
             value={exportTemplate}
@@ -530,10 +550,13 @@ export function OrdersPage() {
             className="btn-secondary text-sm"
             disabled={loading || exporting}
             onClick={() => void handleTemplateExport()}
-            title="按当前筛选条件导出所选模板 xlsx"
+            title="导出按上方「下单时间」周期（录入日期），用于佣金/提成/客户统计"
           >
             {exporting ? '导出中…' : '📤 导出'}
           </button>
+          <p className="w-full text-right text-xs text-ink-muted">
+            导出按上方「下单时间」周期（录入日期），用于佣金/提成/客户统计
+          </p>
         </div>
       </section>
 
@@ -1514,6 +1537,30 @@ function daysUntil(dateStr: string | null | undefined): number | null {
   const target = new Date(dateStr);
   const today = new Date();
   return Math.floor((target.getTime() - today.getTime()) / 86400_000);
+}
+
+// 本地日期 YYYY-MM-DD（用 getFullYear/getMonth/getDate，避免 toISOString 的 UTC 偏移）
+function localDateStr(d: Date): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+// 录入周期快捷预设 → 返回 [起, 止]（闭区间，本地日期）
+type CreatedPreset = 'thisMonth' | 'lastMonth' | 'last30';
+function createdRangePreset(preset: CreatedPreset): [string, string] {
+  const now = new Date();
+  if (preset === 'thisMonth') {
+    const first = new Date(now.getFullYear(), now.getMonth(), 1);
+    const last = new Date(now.getFullYear(), now.getMonth() + 1, 0);
+    return [localDateStr(first), localDateStr(last)];
+  }
+  if (preset === 'lastMonth') {
+    const first = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    const last = new Date(now.getFullYear(), now.getMonth(), 0);
+    return [localDateStr(first), localDateStr(last)];
+  }
+  // last30：含今天在内的最近 30 天
+  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 29);
+  return [localDateStr(start), localDateStr(now)];
 }
 
 // 班次展示文案：起飞→到达（本地时间）

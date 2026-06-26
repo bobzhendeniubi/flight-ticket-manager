@@ -10,7 +10,7 @@
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, ApiError, type RangeSchedule } from '../lib/api';
-import { airportLabel, CABIN_LABEL, formatLocalDate, formatLocalTime } from '../lib/airports';
+import { airportLabel, CABIN_LABEL, formatLocalDate, formatLocalTime, localYmd } from '../lib/airports';
 import { useAuth } from '../stores/auth';
 import { useFlightSeats } from '../stores/flightSeats';
 
@@ -95,7 +95,15 @@ export function SeatStatsPage() {
         occupancy: totalCapacity > 0 ? totalSold / totalCapacity : 0,
       };
     });
-    return result.sort((a, b) => a.departureTime.localeCompare(b.departureTime));
+    return result.sort(
+      (a, b) =>
+        // 主键用含年份的本地日期 YYYY-MM-DD，跨月/跨年才不会乱序（formatLocalDate 无年份）
+        localYmd(a.departureTime, a.departureTz).localeCompare(
+          localYmd(b.departureTime, b.departureTz),
+        ) ||
+        a.flightNumber.localeCompare(b.flightNumber) ||
+        a.departureTime.localeCompare(b.departureTime),
+    );
   }, [schedules]);
 
   // 航班下拉来源：当前区间内出现过的航班号

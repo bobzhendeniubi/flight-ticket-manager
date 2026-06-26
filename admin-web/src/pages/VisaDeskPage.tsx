@@ -120,10 +120,28 @@ function PassengerRow({ passenger }: PassengerRowProps) {
         )}
       </div>
 
-      {/* 姓名 / 护照号 */}
+      {/* 姓名 / 护照号 / 签证日期（若 payload 带了就显示，没带也不报错） */}
       <div className="min-w-0 flex-1">
         <div className="font-medium text-ink truncate">{passenger.fullName || '—'}</div>
         <div className="font-mono text-ink-muted truncate">{passenger.documentNumber || '—'}</div>
+        {(() => {
+          // 签证日期目前未必在签证任务 payload 里 → 防御式读取，存在才显示。
+          const v = passenger as {
+            visaIssueDate?: string | null;
+            visaEffectiveDate?: string | null;
+            visaExpiry?: string | null;
+          };
+          const parts = [
+            v.visaIssueDate ? `出签日 ${v.visaIssueDate}` : null,
+            v.visaEffectiveDate ? `生效日 ${v.visaEffectiveDate}` : null,
+            v.visaExpiry ? `有效期 ${v.visaExpiry}` : null,
+          ].filter(Boolean);
+          return parts.length > 0 ? (
+            <div className="text-[10px] text-ink-muted truncate" title={parts.join(' · ')}>
+              {parts.join(' · ')}
+            </div>
+          ) : null;
+        })()}
       </div>
 
       {/* 缺护照标记 */}
@@ -375,6 +393,7 @@ export function VisaDeskPage() {
               <option key={o.value} value={o.value}>{o.label}</option>
             ))}
           </select>
+          <p className="mt-1 text-xs text-ink-muted">新录入的待送签单在『待处理』里</p>
         </div>
       </section>
 

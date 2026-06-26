@@ -160,6 +160,98 @@ describe('buildRoomAllocationSheets', () => {
   });
 });
 
+/** 单酒店、指定容量、可设分房组的极简 item（专测房间号分配）。*/
+function roomNoItem(opts: {
+  checkIn: string;
+  hotelName: string;
+  capacity: number;
+  passengerIds: string[];
+  roomGroups?: Array<{
+    id: string;
+    hotelName: string;
+    roomType?: string;
+    roomFraction?: number;
+    passengerIds: string[];
+  }>;
+}): RoomItemForExport {
+  return {
+    hotelCheckIn: D(opts.checkIn),
+    hotelRoomType: {
+      name: '双床',
+      bedType: '双床',
+      capacity: opts.capacity,
+      hotel: { name: opts.hotelName },
+    },
+    order: {
+      notes: null,
+      roomAssignment: opts.roomGroups ? { roomGroups: opts.roomGroups } : null,
+      agent: null,
+      items: [{ kind: 'HOTEL', flightSchedule: null }],
+      passengers: opts.passengerIds.map((id, i) => ({
+        id,
+        fullName: `客${id}`,
+        lastName: null,
+        firstName: null,
+        gender: null,
+        dateOfBirth: D('1990-01-01'),
+        documentNumber: `X${i}`,
+        passportExpiry: null,
+        bedPref: null,
+      })),
+    },
+  } as unknown as RoomItemForExport;
+}
+
+describe('buildRoomAllocationSheets 房间号', () => {
+  it('房间号 per 酒店各自从 1 起（同房型名不同酒店不撞号）', () => {
+    const sheets = buildRoomAllocationSheets(fixtureItems());
+    const [r1, r2] = sheets[0].rows;
+    expect(r1.roomNo).toBe('房1'); // p1 → A酒店（分房组）
+    expect(r2.roomNo).toBe('房1'); // p2 → B酒店，另一酒店独立从 1 起
+  });
+
+  it('同酒店未分房乘客按容量打包：满 capacity 开新房', () => {
+    const [sheet] = buildRoomAllocationSheets([
+      roomNoItem({
+        checkIn: '2026-08-01',
+        hotelName: 'D酒店',
+        capacity: 2,
+        passengerIds: ['a', 'b', 'c'],
+      }),
+    ]);
+    expect(sheet.rows.map((r) => r.roomNo)).toEqual(['房1', '房1', '房2']);
+  });
+
+  it('已分房同组共号、未分房续在其后', () => {
+    const [sheet] = buildRoomAllocationSheets([
+      roomNoItem({
+        checkIn: '2026-08-03',
+        hotelName: 'F酒店',
+        capacity: 2,
+        passengerIds: ['g1a', 'g1b', 'u1'],
+        roomGroups: [{ id: 'grp1', hotelName: 'F酒店', passengerIds: ['g1a', 'g1b'] }],
+      }),
+    ]);
+    // grp1 两人 = 房1；未分房 u1 续号 = 房2
+    expect(sheet.rows.map((r) => r.roomNo)).toEqual(['房1', '房1', '房2']);
+  });
+
+  it('半间/拼房组（roomFraction 0.5）房号标 (½)', () => {
+    const [sheet] = buildRoomAllocationSheets([
+      roomNoItem({
+        checkIn: '2026-08-02',
+        hotelName: 'E酒店',
+        capacity: 2,
+        passengerIds: ['x', 'y'],
+        roomGroups: [
+          { id: 'gh', hotelName: 'E酒店', roomFraction: 0.5, passengerIds: ['x', 'y'] },
+        ],
+      }),
+    ]);
+    expect(sheet.rows.map((r) => r.roomNo)).toEqual(['房1(½)', '房1(½)']);
+  });
+});
+
 describe('roomAllocationExportFilename', () => {
   it('单日 / 区间两种文件名', () => {
     expect(roomAllocationExportFilename('2026-07-10', '2026-07-10')).toBe('分房表_2026-07-10.xlsx');

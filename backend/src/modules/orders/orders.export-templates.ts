@@ -59,6 +59,23 @@ const FULFILLMENT_STATUS_LABEL: Record<string, string> = {
   FAILED: '失败',
 };
 
+// 订单状态中文（与 orders.export.ts STATUS_LABEL 同口径，含释放型状态全量）。
+const ORDER_STATUS_LABEL: Record<string, string> = {
+  DRAFT: '草稿',
+  PENDING_PAYMENT: '待支付',
+  PAID: '已支付',
+  PROCESSING: '处理中',
+  TICKETED: '已出票',
+  COMPLETED: '已完成',
+  CANCELLED: '已取消',
+  PAYMENT_TIMEOUT: '支付超时',
+  FAILED: '失败',
+  REFUND_REQUESTED: '退款中',
+  REFUNDED: '已退款',
+  CHANGE_REQUESTED: '改期中',
+  CHANGED: '已改期',
+};
+
 const PASSENGER_TYPE_LABEL: Record<string, string> = {
   ADULT: '成人',
   CHILD: '儿童',
@@ -135,7 +152,9 @@ type OrderForTemplateExport = Prisma.OrderGetPayload<{
     items: {
       include: {
         flightSchedule: {
-          include: { flight: { select: { flightNumber: true } } };
+          include: {
+            flight: { select: { flightNumber: true; originCode: true; destinationCode: true } };
+          };
         };
         hotelRoomType: { select: { name: true; hotel: { select: { name: true; code: true } } } };
         visa: { select: { code: true; visaName: true; visaType: true } };
@@ -155,6 +174,7 @@ interface OrderContext {
   hotelInfo: string; // 酒店类型 = 酒店名 + 房型名
   travelDates: string; // 'YYYY-MM-DD / YYYY-MM-DD'（单段只有一个日期）
   flightNumbers: string; // ' ⇌ ' 连接
+  route: string; // 航线 origin→dest，多段 ' / ' 连接（去重）
   flightLegCount: number;
   cabinLabels: string;
   orderType: string;
@@ -172,6 +192,7 @@ function buildOrderContext(order: OrderForTemplateExport): OrderContext {
     .map((it) => ({
       departureTime: it.flightSchedule!.departureTime,
       flightNumber: it.flightSchedule!.flight.flightNumber,
+      route: `${it.flightSchedule!.flight.originCode} → ${it.flightSchedule!.flight.destinationCode}`,
       cabin: it.flightCabin,
     }))
     .sort((a, b) => a.departureTime.getTime() - b.departureTime.getTime());
@@ -182,6 +203,7 @@ function buildOrderContext(order: OrderForTemplateExport): OrderContext {
         ? fmtDate(legs[0].departureTime)
         : `${fmtDate(legs[0].departureTime)} / ${fmtDate(legs[legs.length - 1].departureTime)}`;
   const flightNumbers = legs.map((l) => l.flightNumber).join(' ⇌ ');
+  const route = Array.from(new Set(legs.map((l) => l.route))).join(' / ');
   const cabinLabels = Array.from(
     new Set(legs.filter((l) => l.cabin).map((l) => CABIN_LABEL[l.cabin!] ?? l.cabin!)),
   ).join(' / ');
@@ -215,6 +237,7 @@ function buildOrderContext(order: OrderForTemplateExport): OrderContext {
     hotelInfo: hotelParts.join(' + '),
     travelDates,
     flightNumbers,
+    route,
     flightLegCount: legs.length,
     cabinLabels,
     orderType,
@@ -236,7 +259,11 @@ interface FullRow {
   flightCount: string; // 暂无数据 — 留空
   travelDates: string;
   flightNumbers: string;
+  route: string;
   orderType: string;
+  status: string; // 订单状态中文
+  contactName: string;
+  contactPhone: string;
   settlePrice: number;
   settleReceived: number;
   settleReceivedAt: string;
@@ -288,7 +315,11 @@ const FULL_COLUMNS: Array<{ header: string; key: keyof FullRow; width: number }>
   { header: '飞行次数', key: 'flightCount', width: 8 },
   { header: '出发(往返)日期', key: 'travelDates', width: 24 },
   { header: '航班号', key: 'flightNumbers', width: 18 },
+  { header: '航线', key: 'route', width: 14 },
   { header: '订单类型', key: 'orderType', width: 10 },
+  { header: '订单状态', key: 'status', width: 10 },
+  { header: '联系人', key: 'contactName', width: 12 },
+  { header: '联系电话', key: 'contactPhone', width: 14 },
   { header: '结算价格', key: 'settlePrice', width: 10 },
   { header: '结算价到账金额', key: 'settleReceived', width: 14 },
   { header: '结算价到账时间', key: 'settleReceivedAt', width: 18 },
@@ -389,7 +420,11 @@ function orderToFullRows(order: OrderForTemplateExport, ctx: OrderContext): Omit
     flightCount: '',
     travelDates: ctx.travelDates,
     flightNumbers: ctx.flightNumbers,
+    route: ctx.route,
     orderType: ctx.orderType,
+    status: ORDER_STATUS_LABEL[order.status] ?? order.status,
+    contactName: order.contactName,
+    contactPhone: order.contactPhone,
     settlePrice: ctx.settlePerPax,
     settleReceived: ctx.paidPerPax,
     settleReceivedAt: lastPayment ? fmtDateTime(lastPayment.paidAt) : '',

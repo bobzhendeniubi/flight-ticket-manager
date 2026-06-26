@@ -54,6 +54,7 @@ export const passengerInputSchema = z.object({
   visaNumber: z.string().max(40).optional(),
   visaType: z.string().max(40).optional(),
   visaIssueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  visaEffectiveDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),       // 签证生效日期
   visaExpiry: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   visaPlaceOfIssue: z.string().max(60).optional(),
   visaCountryOfApplication: z.string().length(2).optional(),

@@ -483,6 +483,7 @@ function SchedulesList({
   const [view, setView] = useState<'calendar' | 'list'>('calendar');
   const [showBulk, setShowBulk] = useState(false);
   const [exporting, setExporting] = useState<string | null>(null);
+  const [exportingFull, setExportingFull] = useState(false);
   const [exportErr, setExportErr] = useState<string | null>(null);
 
   // 班次按本地出发日分桶（一天一般一班，但允许一天多班 → 数组）
@@ -515,6 +516,31 @@ function SchedulesList({
       setExportErr(e instanceof ApiError ? e.message : '导出失败');
     } finally {
       setExporting(null);
+    }
+  }
+
+  // 导出该航班全部班次的「全岗可用」名单（full 模板：分人金额 + 票务/签证补列）。
+  async function downloadFullTemplateByFlight(): Promise<void> {
+    if (!tokens || exportingFull) return;
+    setExportingFull(true);
+    setExportErr(null);
+    try {
+      const blob = await api.downloadOrdersTemplateExport(tokens.accessToken, {
+        template: 'full',
+        flightNumber,
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `整班全岗_${flightNumber}_${new Date().toISOString().slice(0, 10)}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e: unknown) {
+      setExportErr(e instanceof ApiError ? e.message : '导出失败');
+    } finally {
+      setExportingFull(false);
     }
   }
 
@@ -577,12 +603,16 @@ function SchedulesList({
           onRefresh={onRefresh}
           exportingId={exporting}
           onExport={downloadOrdersBySchedule}
+          exportingFull={exportingFull}
+          onExportFull={downloadFullTemplateByFlight}
         />
       ) : (
         <SchedulesTable
           schedules={schedules}
           exportingId={exporting}
           onExport={downloadOrdersBySchedule}
+          exportingFull={exportingFull}
+          onExportFull={downloadFullTemplateByFlight}
         />
       )}
     </div>
@@ -594,10 +624,14 @@ function SchedulesTable({
   schedules,
   exportingId,
   onExport,
+  exportingFull,
+  onExportFull,
 }: {
   schedules: AdminSchedule[];
   exportingId: string | null;
   onExport: (scheduleId: string, departureDate: string) => void;
+  exportingFull: boolean;
+  onExportFull: () => void;
 }) {
   const [monthFilter, setMonthFilter] = useState<string>('upcoming30');
   // 具体日期筛选（按本地出发日）。非空时优先生效，覆盖"月份"下拉。
@@ -710,15 +744,26 @@ function SchedulesTable({
                     )}
                   </td>
                   <td>
-                    <button
-                      type="button"
-                      className="btn-secondary text-xs whitespace-nowrap"
-                      disabled={isExporting}
-                      title="下载该班次的所有订单明细（xlsx，不含成本）"
-                      onClick={() => onExport(s.id, departureDate)}
-                    >
-                      {isExporting ? '导出中…' : '📋 导出整班订单'}
-                    </button>
+                    <div className="flex flex-wrap gap-1">
+                      <button
+                        type="button"
+                        className="btn-secondary text-xs whitespace-nowrap"
+                        disabled={isExporting}
+                        title="下载该班次的所有订单明细（xlsx，不含成本）"
+                        onClick={() => onExport(s.id, departureDate)}
+                      >
+                        {isExporting ? '导出中…' : '📋 导出整班订单'}
+                      </button>
+                      <button
+                        type="button"
+                        className="btn-secondary text-xs whitespace-nowrap"
+                        disabled={exportingFull}
+                        title="导出该航班「全岗可用」名单（分人金额 + 票务/签证补列，xlsx）"
+                        onClick={() => onExportFull()}
+                      >
+                        {exportingFull ? '导出中…' : '📋 导出整班·全岗'}
+                      </button>
+                    </div>
                   </td>
                 </tr>
               );
@@ -738,6 +783,8 @@ function MonthCalendar({
   onRefresh,
   exportingId,
   onExport,
+  exportingFull,
+  onExportFull,
 }: {
   schedules: AdminSchedule[];
   byDay: Map<string, AdminSchedule[]>;
@@ -745,6 +792,8 @@ function MonthCalendar({
   onRefresh: () => Promise<void> | void;
   exportingId: string | null;
   onExport: (scheduleId: string, departureDate: string) => void;
+  exportingFull: boolean;
+  onExportFull: () => void;
 }) {
   // 默认月份：当前月若有班次则当前月，否则最近一个有班次的月份
   const defaultMonth = useMemo(() => {
@@ -926,6 +975,8 @@ function MonthCalendar({
           onSaved={onRefresh}
           exportingId={exportingId}
           onExport={onExport}
+          exportingFull={exportingFull}
+          onExportFull={onExportFull}
         />
       )}
     </div>
@@ -941,6 +992,8 @@ function DayCellEditor({
   onSaved,
   exportingId,
   onExport,
+  exportingFull,
+  onExportFull,
 }: {
   ymd: string;
   schedules: AdminSchedule[];
@@ -949,6 +1002,8 @@ function DayCellEditor({
   onSaved: () => Promise<void> | void;
   exportingId: string | null;
   onExport: (scheduleId: string, departureDate: string) => void;
+  exportingFull: boolean;
+  onExportFull: () => void;
 }) {
   return (
     <section className="rounded-lg border border-brand/30 bg-slate-50 p-4">
@@ -967,6 +1022,8 @@ function DayCellEditor({
             onSaved={onSaved}
             exportingId={exportingId}
             onExport={onExport}
+            exportingFull={exportingFull}
+            onExportFull={onExportFull}
           />
         ))}
       </div>
@@ -980,12 +1037,16 @@ function DaySchedule({
   onSaved,
   exportingId,
   onExport,
+  exportingFull,
+  onExportFull,
 }: {
   schedule: AdminSchedule;
   canEdit: boolean;
   onSaved: () => Promise<void> | void;
   exportingId: string | null;
   onExport: (scheduleId: string, departureDate: string) => void;
+  exportingFull: boolean;
+  onExportFull: () => void;
 }) {
   const tokens = useAuth((s) => s.tokens);
   const econ = getCabin(schedule, 'ECONOMY');
@@ -1358,6 +1419,15 @@ function DaySchedule({
           onClick={() => onExport(schedule.id, departureDate)}
         >
           {isExporting ? '导出中…' : '📋 导出整班订单'}
+        </button>
+        <button
+          type="button"
+          className="btn-secondary text-xs whitespace-nowrap"
+          disabled={exportingFull}
+          title="导出该航班「全岗可用」名单（分人金额 + 票务/签证补列，xlsx）"
+          onClick={() => onExportFull()}
+        >
+          {exportingFull ? '导出中…' : '📋 导出整班·全岗'}
         </button>
         {canEdit && (
           <>

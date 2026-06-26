@@ -64,6 +64,20 @@ export function formatLocalDate(iso: string, tz: string): string {
   }
 }
 
+/** 本地时区 YYYY-MM-DD（含年份）——用于跨月/跨年仍可正确字典序排序。 */
+export function localYmd(iso: string, tz: string): string {
+  try {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: tz,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(new Date(iso));
+  } catch {
+    return new Date(iso).toISOString().slice(0, 10);
+  }
+}
+
 export function formatDuration(minutes: number): string {
   const h = Math.floor(minutes / 60);
   const m = minutes % 60;

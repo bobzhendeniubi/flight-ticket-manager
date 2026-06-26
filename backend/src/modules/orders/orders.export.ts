@@ -11,6 +11,7 @@ import { OrderStatus } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { toAlpha3 } from './nationality.js';
 import { countIssuedPassengers } from './ticketing-cap.js';
+import { parseRoomGroups } from './orders.export-room-allocation.js';
 
 /**
  * 整班运营导出口径（SEAT_HOLDING）：所有「占座中」订单。
@@ -93,7 +94,7 @@ const COLUMNS: Array<{ header: string; key: keyof OrderRow; width: number }> = [
   { header: '酒店房型', key: 'hotelInfo', width: 28 },
   { header: '签证', key: 'visaInfo', width: 20 },
   { header: '接送', key: 'transferInfo', width: 18 },
-  { header: '订单金额', key: 'orderTotal', width: 12 },
+  { header: '客单金额(人均)', key: 'orderTotal', width: 14 },
   { header: '录入时间', key: 'recordedAt', width: 18 },
   { header: '备注', key: 'notes', width: 24 },
 ];
@@ -124,7 +125,7 @@ type OrderForExport = Prisma.OrderGetPayload<{
             flight: { select: { flightNumber: true; originCode: true; destinationCode: true } };
           };
         };
-        hotelRoomType: { select: { name: true } };
+        hotelRoomType: { select: { name: true; hotel: { select: { name: true } } } };
         visa: { select: { visaName: true; visaType: true; country: true } };
         transfer: { select: { name: true } };
         bundle: { select: { name: true } };
@@ -150,17 +151,24 @@ function orderToRows(order: OrderForExport): OrderRow[] {
   }
   departDates.sort((a, b) => a.getTime() - b.getTime());
 
-  // ── 酒店：房型 + 入住起止 ──
-  const hotelParts: string[] = [];
+  // ── 酒店：房型 + 入住起止（含每行所属酒店名，供 per-passenger 人工分房回落）──
+  // 同一房型名（如多团共用 "明月"）不再混淆 —— 优先用人工分房组里的酒店名，
+  // 缺失才回落到行上酒店名 + 房型名（与分房表导出口径一致）。
+  const hotelRooms: Array<{ hotelName: string; roomType: string; range: string }> = [];
   for (const it of order.items) {
     if (it.kind === 'HOTEL' && it.hotelRoomType) {
       const range =
         it.hotelCheckIn && it.hotelCheckOut
           ? ` (${fmtDate(it.hotelCheckIn)} ~ ${fmtDate(it.hotelCheckOut)})`
           : '';
-      hotelParts.push(`${it.hotelRoomType.name}${range}`);
+      hotelRooms.push({
+        hotelName: it.hotelRoomType.hotel?.name ?? '',
+        roomType: it.hotelRoomType.name,
+        range,
+      });
     }
   }
+  const roomGroups = parseRoomGroups(order.roomAssignment);
 
   // ── 签证：优先 visaName，回落 visaType；附带国家 ──
   const visaParts: string[] = [];
@@ -193,12 +201,26 @@ function orderToRows(order: OrderForExport): OrderRow[] {
   const flightStr = Array.from(new Set(flightNumbers)).join(' / ');
   const routeStr = Array.from(new Set(routes)).join(' / ');
   const departStr = fmtDate(departDates[0]);
-  const orderTotal = dec(order.total);
+  // 客单金额(人均) = 订单总额 ÷ 乘客数（每行写人均，避免按总额误读为每人都付了全款）
+  const orderTotal = dec(order.total) / Math.max(1, order.passengers.length);
   const recordedAt = fmtDateTime(order.createdAt);
 
   return order.passengers.map<OrderRow>((p) => {
     const pnrName =
       p.lastName && p.firstName ? `${p.lastName}/${p.firstName}`.toUpperCase() : p.fullName;
+
+    // 每行酒店名优先用该订单项自带的酒店名（多酒店行程才不会被并成一个酒店）；
+    // 仅当订单项没带酒店名时，才回退到该乘客的人工分房组酒店名。
+    const group = roomGroups.find((g) => g.passengerIds.includes(p.id));
+    const groupHotelName = group?.hotelName?.trim() || '';
+    const hotelInfo = hotelRooms
+      .map((r) => {
+        const hotelName = r.hotelName || groupHotelName;
+        const prefix = hotelName ? `${hotelName} · ` : '';
+        return `${prefix}${r.roomType}${r.range}`;
+      })
+      .join(' + ');
+
     return {
       orderNumber: order.orderNumber,
       status: statusLabel,
@@ -217,7 +239,7 @@ function orderToRows(order: OrderForExport): OrderRow[] {
       departDate: departStr,
       route: routeStr,
       bundleName: bundleParts.join(' + '),
-      hotelInfo: hotelParts.join(' + '),
+      hotelInfo,
       visaInfo: visaParts.join(' + '),
       transferInfo: transferParts.join(' + '),
       orderTotal,
@@ -268,7 +290,7 @@ export async function buildOrdersBySchedule(
               flight: { select: { flightNumber: true, originCode: true, destinationCode: true } },
             },
           },
-          hotelRoomType: { select: { name: true } },
+          hotelRoomType: { select: { name: true, hotel: { select: { name: true } } } },
           visa: { select: { visaName: true, visaType: true, country: true } },
           transfer: { select: { name: true } },
           bundle: { select: { name: true } },

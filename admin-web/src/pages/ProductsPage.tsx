@@ -27,6 +27,11 @@ const SECTIONS: { key: Section; label: string; emoji: string }[] = [
   { key: 'bundles', label: '套餐 / Bundle', emoji: '🎁' },
 ];
 
+/** 列表行只保留在售：软删除（isActive=false）后端仍会返回，前端需过滤掉，否则删了又被拉回。 */
+function activeOnly<T extends { isActive?: boolean }>(rows: T[]): T[] {
+  return rows.filter((r) => r.isActive !== false);
+}
+
 /** 归一化酒店图片：优先用 photos[]，回退到单张 photo，去空去重 */
 function hotelPhotos(h: MockHotel): string[] {
   const list = (h.photos && h.photos.length > 0 ? h.photos : h.photo ? [h.photo] : [])
@@ -163,12 +168,13 @@ export function ProductsPage() {
     Promise.all([api.listHotels(false), api.listTransfers(false), api.listVisas(false), api.listBundles(false)])
       .then(([h, t, v, b]) => {
         if (cancelled) return;
-        setHotels(h.hotels.map(hotelApiToMock));
-        setTransfers(t.transfers.map(transferApiToMock));
-        setVisas(v.visas.map(visaApiToMock));
-        setBundles(b.bundles.map(bundleApiToMock));
+        const activeHotels = activeOnly(h.hotels);
+        setHotels(activeHotels.map(hotelApiToMock));
+        setTransfers(activeOnly(t.transfers).map(transferApiToMock));
+        setVisas(activeOnly(v.visas).map(visaApiToMock));
+        setBundles(activeOnly(b.bundles).map(bundleApiToMock));
         setRoomTypeOptions(
-          h.hotels.flatMap((ht) => ht.roomTypes.map((rt) => ({ id: rt.id, label: `${ht.name} · ${rt.name}` }))),
+          activeHotels.flatMap((ht) => ht.roomTypes.map((rt) => ({ id: rt.id, label: `${ht.name} · ${rt.name}` }))),
         );
       })
       .catch((e) => {
@@ -216,7 +222,7 @@ export function ProductsPage() {
         }
       }
       const fresh = await api.listHotels(false);
-      setHotels(fresh.hotels.map(hotelApiToMock));
+      setHotels(activeOnly(fresh.hotels).map(hotelApiToMock));
     } catch (e) {
       alert(e instanceof ApiError ? `保存失败：${e.message}` : '保存失败');
       setHotels(prev);
@@ -246,7 +252,7 @@ export function ProductsPage() {
         }
       }
       const fresh = await api.listTransfers(false);
-      setTransfers(fresh.transfers.map(transferApiToMock));
+      setTransfers(activeOnly(fresh.transfers).map(transferApiToMock));
     } catch (e) {
       alert(e instanceof ApiError ? `保存失败：${e.message}` : '保存失败');
       setTransfers(prev);
@@ -278,7 +284,7 @@ export function ProductsPage() {
         }
       }
       const fresh = await api.listVisas(false);
-      setVisas(fresh.visas.map(visaApiToMock));
+      setVisas(activeOnly(fresh.visas).map(visaApiToMock));
     } catch (e) {
       alert(e instanceof ApiError ? `保存失败：${e.message}` : '保存失败');
       setVisas(prev);
@@ -329,7 +335,7 @@ export function ProductsPage() {
         }
       }
       const fresh = await api.listBundles(false);
-      setBundles(fresh.bundles.map(bundleApiToMock));
+      setBundles(activeOnly(fresh.bundles).map(bundleApiToMock));
     } catch (e) {
       alert(e instanceof ApiError ? `保存失败：${e.message}` : '保存失败');
       setBundles(prev);
@@ -482,6 +488,7 @@ function NewHotelForm({
 
 // ─── 接送 ───────────────────────────────────────────────────────────
 function TransfersSection({ items, onChange }: { items: MockTransfer[]; onChange: (v: MockTransfer[]) => void }) {
+  const [showForm, setShowForm] = useState(false);
   const [editing, setEditing] = useState<MockTransfer | null>(null);
   return (
     <div className="space-y-3">
@@ -492,28 +499,13 @@ function TransfersSection({ items, onChange }: { items: MockTransfer[]; onChange
           onSave={(t) => { onChange(items.map((x) => x.id === t.id ? t : x)); setEditing(null); }}
         />
       )}
-      <ActionBar
-        active={items.length}
-        onAdd={() =>
-          onChange([
-            {
-              id: 't-' + Date.now(),
-              name: '新增接送服务',
-              vehicleType: '舒适型轿车',
-              capacity: 3,
-              basePrice: 128,
-              originArea: '岘港机场 (DAD)',
-              destArea: '美溪海滩',
-              emoji: '🚗',
-              photo: 'https://images.unsplash.com/photo-1549317661-bd32c8ce0afa?w=600&h=400&fit=crop',
-              features: ['含中文司机'],
-              duration: '约 15 分钟',
-            },
-            ...items,
-          ])
-        }
-        addLabel="+ 新增车型"
-      />
+      {showForm && (
+        <NewTransferForm
+          onCancel={() => setShowForm(false)}
+          onSubmit={(t) => { onChange([t, ...items]); setShowForm(false); }}
+        />
+      )}
+      <ActionBar active={items.length} onAdd={() => setShowForm(true)} addLabel="+ 新增车型" />
       <div className="space-y-3">
         {items.map((t) => (
           <article key={t.id} className="card flex items-center gap-6 transition hover:shadow-pop">
@@ -548,6 +540,7 @@ function TransfersSection({ items, onChange }: { items: MockTransfer[]; onChange
 
 // ─── 签证 ───────────────────────────────────────────────────────────
 function VisasSection({ items, onChange }: { items: MockVisa[]; onChange: (v: MockVisa[]) => void }) {
+  const [showForm, setShowForm] = useState(false);
   const [editing, setEditing] = useState<MockVisa | null>(null);
   return (
     <div className="space-y-3">
@@ -558,27 +551,13 @@ function VisasSection({ items, onChange }: { items: MockVisa[]; onChange: (v: Mo
           onSave={(v) => { onChange(items.map((x) => x.id === v.id ? v : x)); setEditing(null); }}
         />
       )}
-      <ActionBar
-        active={items.length}
-        onAdd={() =>
-          onChange([
-            {
-              id: 'v-' + Date.now(),
-              country: '新增国家',
-              countryCode: 'XX',
-              flag: '🌍',
-              type: '旅游签',
-              processingDays: 7,
-              basePrice: 380,
-              expressSurcharge: 150,
-              requiredDocs: ['护照', '照片'],
-              validityMonths: 3,
-            },
-            ...items,
-          ])
-        }
-        addLabel="+ 新增签证产品"
-      />
+      {showForm && (
+        <NewVisaForm
+          onCancel={() => setShowForm(false)}
+          onSubmit={(v) => { onChange([v, ...items]); setShowForm(false); }}
+        />
+      )}
+      <ActionBar active={items.length} onAdd={() => setShowForm(true)} addLabel="+ 新增签证产品" />
       <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
         {items.map((v) => (
           <div key={v.id} className="card transition hover:shadow-pop">
@@ -873,7 +852,7 @@ function NewBundleWizard({
 
   const addItem = (kind: BundleItem['kind']) => {
     const presets: Record<BundleItem['kind'], DraftBundleItem> = {
-      FLIGHT: { kind: 'HOTEL', productName: '（请从下方添加）', qty: 1, unitPrice: 0 },
+      FLIGHT: { kind: 'FLIGHT', productName: '澳门⇌岘港 经济舱', qty: 2, unitPrice: 0 },
       HOTEL: { kind: 'HOTEL', productName: '岘港凯悦度假村', qty: hotelNights ?? 1, unitPrice: 1880 },
       TRANSFER: { kind: 'TRANSFER', productName: '岘港机场接送 商务车', qty: 2, unitPrice: 188 },
       VISA: { kind: 'VISA', productName: '越南 E-visa 30 天', qty: 2, unitPrice: 280 },
@@ -1034,7 +1013,7 @@ function NewBundleWizard({
             <div className="flex items-center justify-between">
               <label className="label !mb-0">套餐内容</label>
               <div className="flex gap-2">
-                {(['HOTEL', 'TRANSFER', 'VISA'] as const).map((k) => (
+                {(['FLIGHT', 'HOTEL', 'TRANSFER', 'VISA'] as const).map((k) => (
                   <button
                     key={k}
                     type="button"
@@ -1519,7 +1498,51 @@ function RoomTypesEditor({ roomTypes, onChange }: { roomTypes: HotelRoomType[]; 
   );
 }
 
+/** 新增地面服务：复用统一编辑器，预填一份合理空白模板（弹窗内填好再 POST）。 */
+function NewTransferForm({ onCancel, onSubmit }: { onCancel: () => void; onSubmit: (t: MockTransfer) => void }) {
+  const blank: MockTransfer = {
+    id: 't-' + Date.now(),
+    name: '',
+    vehicleType: '舒适型轿车',
+    capacity: 3,
+    basePrice: 128,
+    originArea: '岘港机场 (DAD)',
+    destArea: '美溪海滩',
+    emoji: '🚗',
+    photo: '',
+    features: ['含中文司机'],
+    duration: '约 15 分钟',
+  };
+  return (
+    <TransferEditorForm transfer={blank} title="新增地面服务" submitLabel="添加" onCancel={onCancel} onSave={onSubmit} />
+  );
+}
+
 function EditTransferForm({ transfer, onCancel, onSave }: { transfer: MockTransfer; onCancel: () => void; onSave: (t: MockTransfer) => void }) {
+  return (
+    <TransferEditorForm
+      transfer={transfer}
+      title={`编辑地面服务 · ${transfer.name}`}
+      submitLabel="保存修改"
+      onCancel={onCancel}
+      onSave={onSave}
+    />
+  );
+}
+
+function TransferEditorForm({
+  transfer,
+  title,
+  submitLabel,
+  onCancel,
+  onSave,
+}: {
+  transfer: MockTransfer;
+  title: string;
+  submitLabel: string;
+  onCancel: () => void;
+  onSave: (t: MockTransfer) => void;
+}) {
   const [form, setForm] = useState({ ...transfer });
   const [basePrice, setBasePrice] = useState<number | null>(transfer.basePrice);
   const [capacity, setCapacity] = useState<number | null>(transfer.capacity);
@@ -1541,7 +1564,7 @@ function EditTransferForm({ transfer, onCancel, onSave }: { transfer: MockTransf
   return (
     <section className="card border-brand-200 bg-brand-50/40">
       <div className="flex items-center justify-between">
-        <h3 className="font-semibold text-ink">编辑地面服务 · {transfer.name}</h3>
+        <h3 className="font-semibold text-ink">{title}</h3>
         <button type="button" className="btn-ghost px-2 py-1 text-xl leading-none" onClick={onCancel}>×</button>
       </div>
       <form className="mt-3 grid gap-3 md:grid-cols-3" onSubmit={handleSubmit}>
@@ -1590,14 +1613,57 @@ function EditTransferForm({ transfer, onCancel, onSave }: { transfer: MockTransf
 
         <div className="md:col-span-3 flex justify-end gap-3">
           <button type="button" className="btn-secondary" onClick={onCancel}>取消</button>
-          <button type="submit" className="btn-primary">保存修改</button>
+          <button type="submit" className="btn-primary">{submitLabel}</button>
         </div>
       </form>
     </section>
   );
 }
 
+/** 新增签证：复用统一编辑器，预填一份合理空白模板（弹窗内填好再 POST）。 */
+function NewVisaForm({ onCancel, onSubmit }: { onCancel: () => void; onSubmit: (v: MockVisa) => void }) {
+  const blank: MockVisa = {
+    id: 'v-' + Date.now(),
+    country: '',
+    countryCode: 'XX',
+    flag: '🌍',
+    type: '旅游签',
+    processingDays: 7,
+    basePrice: 380,
+    expressSurcharge: 150,
+    requiredDocs: ['护照', '照片'],
+    validityMonths: 3,
+  };
+  return (
+    <VisaEditorForm visa={blank} title="新增签证" submitLabel="添加" onCancel={onCancel} onSave={onSubmit} />
+  );
+}
+
 function EditVisaForm({ visa, onCancel, onSave }: { visa: MockVisa; onCancel: () => void; onSave: (v: MockVisa) => void }) {
+  return (
+    <VisaEditorForm
+      visa={visa}
+      title={`编辑签证 · ${visa.country} ${visa.type}`}
+      submitLabel="保存修改"
+      onCancel={onCancel}
+      onSave={onSave}
+    />
+  );
+}
+
+function VisaEditorForm({
+  visa,
+  title,
+  submitLabel,
+  onCancel,
+  onSave,
+}: {
+  visa: MockVisa;
+  title: string;
+  submitLabel: string;
+  onCancel: () => void;
+  onSave: (v: MockVisa) => void;
+}) {
   const [form, setForm] = useState({ ...visa, highlight: visa.highlight ?? '' });
   const [basePrice, setBasePrice] = useState<number | null>(visa.basePrice);
   const [expressSurcharge, setExpressSurcharge] = useState<number | null>(visa.expressSurcharge);
@@ -1624,7 +1690,7 @@ function EditVisaForm({ visa, onCancel, onSave }: { visa: MockVisa; onCancel: ()
   return (
     <section className="card border-brand-200 bg-brand-50/40">
       <div className="flex items-center justify-between">
-        <h3 className="font-semibold text-ink">编辑签证 · {visa.country} {visa.type}</h3>
+        <h3 className="font-semibold text-ink">{title}</h3>
         <button type="button" className="btn-ghost px-2 py-1 text-xl leading-none" onClick={onCancel}>×</button>
       </div>
       <form className="mt-3 grid gap-3 md:grid-cols-3" onSubmit={handleSubmit}>
@@ -1673,7 +1739,7 @@ function EditVisaForm({ visa, onCancel, onSave }: { visa: MockVisa; onCancel: ()
 
         <div className="md:col-span-3 flex justify-end gap-3">
           <button type="button" className="btn-secondary" onClick={onCancel}>取消</button>
-          <button type="submit" className="btn-primary">保存修改</button>
+          <button type="submit" className="btn-primary">{submitLabel}</button>
         </div>
       </form>
     </section>

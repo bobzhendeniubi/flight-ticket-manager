@@ -23,6 +23,7 @@ import {
   ReceiptSource,
   SeatLockStatus,
   UserRole,
+  VisaRequirement,
 } from '@prisma/client';
 import { randomInt } from 'node:crypto';
 import { prisma } from '../../db/prisma.js';
@@ -480,6 +481,15 @@ export class OrderService {
       // 座位已在订单 create 之前原子扣减；此处无需再动库存
       return created;
     });
+
+    // 事务成功后：下单即建签证任务（best-effort）——让「录进去但还没付款」的需签证单也进签证台。
+    // 放在订单事务外，签证任务建失败也不回滚订单（PAID 时会再补建，幂等）。其余岗位任务仍留到 PAID。
+    try {
+      await createVisaTaskAtCreation(prisma, order.id);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error('[orders] failed to create visa task at order creation for', order.id, err);
+    }
 
     // 事务成功后：移除已消费锁位的到期任务（best-effort；worker 端幂等）
     if (consumedLockIds.length > 0) {
@@ -3221,6 +3231,7 @@ function passengerToData(p: PassengerInput) {
     visaNumber: p.visaNumber ?? null,
     visaType: p.visaType ?? null,
     visaIssueDate: p.visaIssueDate ? new Date(p.visaIssueDate) : null,
+    visaEffectiveDate: p.visaEffectiveDate ? new Date(p.visaEffectiveDate) : null,
     visaExpiry: p.visaExpiry ? new Date(p.visaExpiry) : null,
     visaPlaceOfIssue: p.visaPlaceOfIssue ?? null,
     visaCountryOfApplication: p.visaCountryOfApplication ?? null,
@@ -3533,7 +3544,81 @@ async function createFulfillmentTasks(tx: Prisma.TransactionClient, orderId: str
   return newTaskIds;
 }
 
-export { createFulfillmentTasks, resolveBundleFulfillmentTypes };
+/**
+ * 下单（CREATE）时即建签证任务 —— 让「录进去但还没付款」的需签证单也能进签证台。
+ *
+ * 背景：完整履约任务（机票/酒店/接送/签证）在 PAID 时才由 createFulfillmentTasks 生成，
+ * 于是未付款订单一个任务都没有，签证台（读 VISA_APPLICATION 任务）看不到要送签的单。
+ * 这里只在下单时**提前补签证那一项**，其余岗位任务仍留到 PAID。
+ *
+ * 「需要签证」判定（任一成立，与 PAID 路径一致）：
+ *   - 订单级 visaStatus = NEEDED
+ *   - 含 VISA 订单项
+ *   - 含 BUNDLE 订单项，且该套餐组件含 VISA
+ *
+ * 任务锚点与 PAID 路径保持一致（VISA 项 → 该项；含签证套餐 → 该套餐项；
+ * 否则订单级需签 → 首个订单项），并按「已存在 VISA 任务即跳过」幂等：
+ * PAID 时 createFulfillmentTasks 按订单项的已有任务类型去重，能识别这条早建任务而不重复建。
+ */
+async function createVisaTaskAtCreation(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+): Promise<string[]> {
+  const order = await tx.order.findUnique({
+    where: { id: orderId },
+    select: { visaStatus: true },
+  });
+  const items = await tx.orderItem.findMany({
+    where: { orderId },
+    select: {
+      id: true,
+      kind: true,
+      bundleId: true,
+      fulfillmentTasks: { select: { type: true } },
+    },
+  });
+  if (items.length === 0) return [];
+
+  // 幂等：已存在任意签证任务 → 不重复建
+  const alreadyHasVisaTask = items.some((item) =>
+    item.fulfillmentTasks.some((t) => t.type === FulfillmentType.VISA_APPLICATION),
+  );
+  if (alreadyHasVisaTask) return [];
+
+  // 锚点选择（与 PAID 路径一致）：优先 VISA 项 → 含签证套餐项 → 订单级需签时首个订单项
+  let anchorItemId: string | null = null;
+  const visaItem = items.find((item) => item.kind === OrderItemKind.VISA);
+  if (visaItem) {
+    anchorItemId = visaItem.id;
+  } else {
+    for (const item of items) {
+      if (item.kind !== OrderItemKind.BUNDLE) continue;
+      const types = await resolveBundleFulfillmentTypes(tx, item.bundleId);
+      if (types.includes(FulfillmentType.VISA_APPLICATION)) {
+        anchorItemId = item.id;
+        break;
+      }
+    }
+  }
+  // 订单级「需要签证」兜底：挂到首个订单项。判定与 PAID 路径（createFulfillmentTasks）
+  // 完全一致——仅 visaStatus='NEEDED'（E_VISA/电子签按既有口径不开签证台任务），
+  // 保证两条路径触发条件相同、重跑 PAID 幂等、不产生不对称的兜底缺口。
+  if (!anchorItemId && order?.visaStatus === VisaRequirement.NEEDED) {
+    anchorItemId = items[0].id;
+  }
+  if (!anchorItemId) return [];
+
+  const task = await tx.fulfillmentTask.create({
+    data: {
+      orderItemId: anchorItemId,
+      type: FulfillmentType.VISA_APPLICATION,
+      status: FulfillmentStatus.PENDING,
+    },
+  });
+  return [task.id];
+}
+
+export { createFulfillmentTasks, resolveBundleFulfillmentTypes, createVisaTaskAtCreation };
 
 // ════════════════════════════════════════════════════════════════════
 // 佣金链路计算 — 当订单转 PAID 时调用，为卖家代理 + 所有上级代理创建 CommissionRecord
