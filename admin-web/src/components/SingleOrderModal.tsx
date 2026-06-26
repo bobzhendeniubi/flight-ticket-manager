@@ -1366,10 +1366,10 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                       const isOcring = p.ocrPct !== null && p.ocrPct !== undefined && p.ocrPct < 100;
                       return (
                         <tr key={i} className="border-t border-slate-100">
-                          <td className="px-2 py-1">
+                          <td className="px-2 py-1 align-top">
                             <input className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm" value={p.fullName} onChange={(e) => setPassenger(i, { fullName: e.target.value })} />
                           </td>
-                          <td className="px-2 py-1">
+                          <td className="px-2 py-1 align-top">
                             <input className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm" value={p.documentNumber} onChange={(e) => setPassenger(i, { documentNumber: e.target.value })} />
                           </td>
                           <td className="px-2 py-1 align-top">
@@ -1383,7 +1383,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                             />
                             {dobBad && <span className="mt-0.5 block text-[11px] text-rose-500">格式如 1990-01-01</span>}
                           </td>
-                          <td className="px-2 py-1">
+                          <td className="px-2 py-1 align-top">
                             <input
                               type="text"
                               className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm"
@@ -1525,7 +1525,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                               </button>
                             )}
                           </td>
-                          <td className="px-2 py-1 text-right">
+                          <td className="px-2 py-1 text-right align-top">
                             <button className="text-xs text-slate-400 hover:text-rose-600" onClick={() => removePassenger(i)} disabled={passengers.length <= 1} type="button">删</button>
                           </td>
                         </tr>
