@@ -242,6 +242,8 @@ export const exportTemplatesQuerySchema = listOrdersQuerySchema
   })
   .extend({
     template: z.enum(['full', 'ticketing', 'visa']),
+    // 精确按班次（整班·全岗导出用）；优先于 travelFrom/travelTo，只导该班次订单。
+    scheduleId: z.string().min(1).optional(),
   });
 export type ExportTemplatesQuery = z.infer<typeof exportTemplatesQuerySchema>;
 

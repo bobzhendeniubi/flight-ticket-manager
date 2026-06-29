@@ -172,6 +172,7 @@ interface OrderContext {
   agency: string;
   notes: string;
   hotelInfo: string; // 酒店类型 = 酒店名 + 房型名
+  hotelNames: string; // 酒店名称 = 各酒店名去重，' / ' 连接
   travelDates: string; // 'YYYY-MM-DD / YYYY-MM-DD'（单段只有一个日期）
   flightNumbers: string; // ' ⇌ ' 连接
   route: string; // 航线 origin→dest，多段 ' / ' 连接（去重）
@@ -221,11 +222,14 @@ function buildOrderContext(order: OrderForTemplateExport): OrderContext {
 
   // 酒店类型 = 酒店名 + 房型名
   const hotelParts: string[] = [];
+  const hotelNameSet = new Set<string>();
   for (const it of order.items) {
     if (it.kind === 'HOTEL' && it.hotelRoomType) {
       hotelParts.push(`${it.hotelRoomType.hotel.name} ${it.hotelRoomType.name}`);
+      hotelNameSet.add(it.hotelRoomType.hotel.name);
     }
   }
+  const hotelNames = Array.from(hotelNameSet).join(' / ');
 
   const total = dec(order.total);
   const paid = dec(order.paidAmount);
@@ -235,6 +239,7 @@ function buildOrderContext(order: OrderForTemplateExport): OrderContext {
     agency: order.agent?.companyName ?? '直客',
     notes: order.notes ?? '',
     hotelInfo: hotelParts.join(' + '),
+    hotelNames,
     travelDates,
     flightNumbers,
     route,
@@ -251,6 +256,7 @@ function buildOrderContext(order: OrderForTemplateExport): OrderContext {
 interface FullRow {
   seq: number;
   productCodes: string;
+  hotelName: string;
   agency: string;
   notes: string;
   hotelInfo: string;
@@ -307,6 +313,7 @@ interface FullRow {
 const FULL_COLUMNS: Array<{ header: string; key: keyof FullRow; width: number }> = [
   { header: '序号', key: 'seq', width: 6 },
   { header: '产品编号', key: 'productCodes', width: 14 },
+  { header: '酒店名称', key: 'hotelName', width: 20 },
   { header: '代理机构', key: 'agency', width: 16 },
   { header: '备注', key: 'notes', width: 20 },
   { header: '酒店类型', key: 'hotelInfo', width: 24 },
@@ -412,6 +419,7 @@ function orderToFullRows(order: OrderForTemplateExport, ctx: OrderContext): Omit
 
     return {
     productCodes: codes.join(' / '),
+    hotelName: ctx.hotelNames,
     agency: ctx.agency,
     notes,
     hotelInfo: ctx.hotelInfo,
@@ -584,7 +592,7 @@ export async function buildOrderTemplateExportWorkbook(
       items: {
         include: {
           flightSchedule: {
-            include: { flight: { select: { flightNumber: true } } },
+            include: { flight: { select: { flightNumber: true, originCode: true, destinationCode: true } } },
           },
           hotelRoomType: { select: { name: true, hotel: { select: { name: true, code: true } } } },
           visa: { select: { code: true, visaName: true, visaType: true } },

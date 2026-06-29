@@ -644,6 +644,8 @@ export interface OrdersTemplateExportParams {
   to?: string;
   travelFrom?: string;
   travelTo?: string;
+  /** 精确按班次导出（整班·全岗用）；比 travelFrom/travelTo 精确，只导该班次订单。 */
+  scheduleId?: string;
   flightNumber?: string;
   passengerName?: string;
   invoiceStatus?: InvoiceStatus;
@@ -751,7 +753,20 @@ export interface FulfillmentTask {
   createdAt: string;
   updatedAt: string;
   item: { id: string; kind: OrderItemKind; description: string; quantity: number; orderId: string };
-  order?: { id: string; orderNumber: string; contactName: string; contactPhone: string; status: OrderStatus; notes?: string | null };
+  order?: {
+    id: string;
+    orderNumber: string;
+    contactName: string;
+    contactPhone: string;
+    status: OrderStatus;
+    notes?: string | null;
+    /** 出发时间（ISO）；纯签证单无航班 → null */
+    departureTime?: string | null;
+    /** 出发机场时区（IANA）；用于本地化出发日期 */
+    departureTz?: string | null;
+  };
+  /** 签证产品名（含"…单次"/"…多次"）；非签证任务或缺失 → null */
+  visaName?: string | null;
   /** 仅 type=VISA_APPLICATION 时后端附带，其余任务类型无此字段 */
   passengers?: VisaTaskPassenger[];
 }

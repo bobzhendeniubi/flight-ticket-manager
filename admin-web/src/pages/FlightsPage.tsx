@@ -519,20 +519,22 @@ function SchedulesList({
     }
   }
 
-  // 导出该航班全部班次的「全岗可用」名单（full 模板：分人金额 + 票务/签证补列）。
-  async function downloadFullTemplateByFlight(): Promise<void> {
+  // 导出该班次「全岗可用」名单（full 模板：分人金额 + 票务/签证补列）。按班次出发日过滤，避免导出全部日期。
+  async function downloadFullTemplateByFlight(scheduleId: string, departureDate: string): Promise<void> {
     if (!tokens || exportingFull) return;
     setExportingFull(true);
     setExportErr(null);
     try {
+      // 精确按班次导出，只含该班次当天订单（travelFrom/travelTo 会 ±1 天放宽，漏进相邻日）。
       const blob = await api.downloadOrdersTemplateExport(tokens.accessToken, {
         template: 'full',
         flightNumber,
+        scheduleId,
       });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `整班全岗_${flightNumber}_${new Date().toISOString().slice(0, 10)}.xlsx`;
+      a.download = `整班全岗_${flightNumber}_${departureDate || new Date().toISOString().slice(0, 10)}.xlsx`;
       document.body.appendChild(a);
       a.click();
       a.remove();
@@ -631,7 +633,7 @@ function SchedulesTable({
   exportingId: string | null;
   onExport: (scheduleId: string, departureDate: string) => void;
   exportingFull: boolean;
-  onExportFull: () => void;
+  onExportFull: (scheduleId: string, departureDate: string) => void;
 }) {
   const [monthFilter, setMonthFilter] = useState<string>('upcoming30');
   // 具体日期筛选（按本地出发日）。非空时优先生效，覆盖"月份"下拉。
@@ -758,8 +760,8 @@ function SchedulesTable({
                         type="button"
                         className="btn-secondary text-xs whitespace-nowrap"
                         disabled={exportingFull}
-                        title="导出该航班「全岗可用」名单（分人金额 + 票务/签证补列，xlsx）"
-                        onClick={() => onExportFull()}
+                        title="导出该班次「全岗可用」名单（分人金额 + 票务/签证补列，xlsx）"
+                        onClick={() => onExportFull(s.id, departureDate)}
                       >
                         {exportingFull ? '导出中…' : '📋 导出整班·全岗'}
                       </button>
@@ -793,7 +795,7 @@ function MonthCalendar({
   exportingId: string | null;
   onExport: (scheduleId: string, departureDate: string) => void;
   exportingFull: boolean;
-  onExportFull: () => void;
+  onExportFull: (scheduleId: string, departureDate: string) => void;
 }) {
   // 默认月份：当前月若有班次则当前月，否则最近一个有班次的月份
   const defaultMonth = useMemo(() => {
@@ -1003,7 +1005,7 @@ function DayCellEditor({
   exportingId: string | null;
   onExport: (scheduleId: string, departureDate: string) => void;
   exportingFull: boolean;
-  onExportFull: () => void;
+  onExportFull: (scheduleId: string, departureDate: string) => void;
 }) {
   return (
     <section className="rounded-lg border border-brand/30 bg-slate-50 p-4">
@@ -1046,7 +1048,7 @@ function DaySchedule({
   exportingId: string | null;
   onExport: (scheduleId: string, departureDate: string) => void;
   exportingFull: boolean;
-  onExportFull: () => void;
+  onExportFull: (scheduleId: string, departureDate: string) => void;
 }) {
   const tokens = useAuth((s) => s.tokens);
   const econ = getCabin(schedule, 'ECONOMY');
@@ -1424,8 +1426,8 @@ function DaySchedule({
           type="button"
           className="btn-secondary text-xs whitespace-nowrap"
           disabled={exportingFull}
-          title="导出该航班「全岗可用」名单（分人金额 + 票务/签证补列，xlsx）"
-          onClick={() => onExportFull()}
+          title="导出该班次「全岗可用」名单（分人金额 + 票务/签证补列，xlsx）"
+          onClick={() => onExportFull(schedule.id, departureDate)}
         >
           {exportingFull ? '导出中…' : '📋 导出整班·全岗'}
         </button>

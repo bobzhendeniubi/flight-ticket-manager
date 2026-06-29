@@ -746,11 +746,11 @@ function BundleCard({
 
       <div className="mt-4 rounded-lg border border-slate-100 bg-canvas p-3">
         <div className="flex items-center justify-between text-sm text-ink-muted">
-          <span>单买总价</span>
+          <span>地面单买总价</span>
           <span className="line-through nums">¥{bundle.listPrice.toLocaleString()}</span>
         </div>
         <div className="mt-1 flex items-end justify-between">
-          <span className="text-sm text-ink-soft">套餐价</span>
+          <span className="text-sm text-ink-soft">套餐价（地面价 · 不含机票）</span>
           <div>
             <span className="text-2xl font-semibold text-ink nums">¥{bundle.bundlePrice.toLocaleString()}</span>
             <span className="badge-danger ml-2">
@@ -825,7 +825,14 @@ function NewBundleWizard({
   });
   const [discount, setDiscount] = useState<number | null>(initial?.groundDiscount ?? 500);
 
-  const listPrice = useMemo(() => items.reduce((s, i) => s + (i.qty ?? 0) * (i.unitPrice ?? 0), 0), [items]);
+  // 套餐价=地面部分；机票按出发日实时取价，不计入（与展示读模型 line ~109 的 groundTotal 口径一致）
+  const listPrice = useMemo(
+    () =>
+      items
+        .filter((i) => i.kind !== 'FLIGHT')
+        .reduce((s, i) => s + (i.qty ?? 0) * (i.unitPrice ?? 0), 0),
+    [items],
+  );
   const discountValue = Math.min(listPrice, Math.max(0, discount ?? 0));
   const bundlePrice = Math.max(0, listPrice - discountValue);
   // 住宿晚数是否可填 = 套餐里是否含 HOTEL 项（不再仅靠是否关联房型）。
@@ -1063,16 +1070,30 @@ function NewBundleWizard({
                       integerOnly
                     />
                   )}
-                  <NumberInput
-                    min={0}
-                    className="input w-24 text-xs"
-                    value={it.unitPrice}
-                    onChange={(n) => {
-                      const next = [...items];
-                      next[idx] = { ...it, unitPrice: n };
-                      setItems(next);
-                    }}
-                  />
+                  {it.kind === 'FLIGHT' ? (
+                    // 机票不计入套餐价：单价锁 0，避免误填后被静默丢弃
+                    <div className="flex w-24 flex-col">
+                      <NumberInput
+                        min={0}
+                        className="input w-24 text-xs bg-canvas text-ink-muted"
+                        value={0}
+                        onChange={() => {}}
+                        disabled
+                      />
+                      <span className="mt-0.5 text-[10px] leading-tight text-ink-muted">机票按出发日实时取价</span>
+                    </div>
+                  ) : (
+                    <NumberInput
+                      min={0}
+                      className="input w-24 text-xs"
+                      value={it.unitPrice}
+                      onChange={(n) => {
+                        const next = [...items];
+                        next[idx] = { ...it, unitPrice: n };
+                        setItems(next);
+                      }}
+                    />
+                  )}
                   <span className="text-xs text-ink-muted w-20 text-right nums">
                     ¥{((it.qty ?? 0) * (it.unitPrice ?? 0)).toLocaleString()}
                   </span>
@@ -1093,9 +1114,10 @@ function NewBundleWizard({
 
           <div className="rounded-lg border border-slate-100 bg-canvas p-3 space-y-2">
             <div className="flex items-center justify-between text-sm">
-              <span className="text-ink-soft">单买总价</span>
+              <span className="text-ink-soft">地面单买总价</span>
               <span className="font-medium text-ink nums">¥{listPrice.toLocaleString()}</span>
             </div>
+            <p className="text-[11px] text-ink-muted">机票按出发日实时取价，不计入套餐价</p>
             <div className="flex items-center justify-between text-sm">
               <span className="text-ink-soft">
                 让利金额
@@ -1110,7 +1132,7 @@ function NewBundleWizard({
               />
             </div>
             <div className="flex items-center justify-between border-t border-slate-200 pt-2">
-              <span className="text-sm text-ink-soft">套餐价</span>
+              <span className="text-sm text-ink-soft">套餐价（地面价 · 不含机票）</span>
               <span className="text-2xl font-semibold text-ink nums">¥{bundlePrice.toLocaleString()}</span>
             </div>
             {discountValue > 0 && (

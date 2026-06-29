@@ -6,7 +6,7 @@
  *   POST /fulfillment-tasks/batch-status                    批量改状态（部分失败返回 failures）
  *   GET  /orders/:id/passport-photos.zip                   下载护照包（送签用）
  */
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   api,
   ApiError,
@@ -15,6 +15,7 @@ import {
   type VisaTaskPassenger,
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { localYmd } from '../lib/airports';
 
 // 签证语境的状态文案（IN_PROGRESS/CONFIRMED 与批量操作下拉一致）
 const VISA_STATUS_LABEL: Record<FulfillmentStatus, string> = {
@@ -48,9 +49,9 @@ type StatusFilter = 'OPEN' | 'ALL' | FulfillmentStatus;
 
 const FILTER_OPTIONS: Array<{ value: StatusFilter; label: string }> = [
   { value: 'OPEN', label: '待处理 + 材料准备（默认）' },
+  { value: 'CONFIRMED', label: '已处理（已送签）' },
   { value: 'PENDING', label: '仅待处理' },
   { value: 'IN_PROGRESS', label: '仅已送签材料准备' },
-  { value: 'CONFIRMED', label: '仅已送签' },
   { value: 'CANCELLED', label: '仅已取消' },
   { value: 'FAILED', label: '仅失败' },
   { value: 'ALL', label: '全部状态' },
@@ -158,14 +159,57 @@ interface TaskRowProps {
   selected: boolean;
   onToggle: () => void;
   token: string;
+  /** 备注保存成功后触发列表刷新 */
+  onChanged: () => void;
 }
-function TaskRow({ task, selected, onToggle, token }: TaskRowProps) {
+function TaskRow({ task, selected, onToggle, token, onChanged }: TaskRowProps) {
   const [expanded, setExpanded] = useState(false);
   const [downloading, setDownloading] = useState(false);
+
+  // 备注 = 任务级 task.notes（可编辑），区别于订单级 order.notes（只读）
+  const [noteDraft, setNoteDraft] = useState(task.notes ?? '');
+  const [savingNote, setSavingNote] = useState(false);
+  const [noteError, setNoteError] = useState<string | null>(null);
+  // 输入框是否聚焦中：刷新时若用户正在输入，别用服务端值覆盖草稿（否则丢键入）
+  const noteFocusedRef = useRef(false);
+  // task 刷新后同步草稿（仅在未聚焦时；避免乐观值与服务端不一致，又不打断输入）
+  useEffect(() => {
+    if (!noteFocusedRef.current) setNoteDraft(task.notes ?? '');
+  }, [task.notes]);
 
   const passengers = task.passengers ?? [];
   const missingCount = passengers.filter((p) => !p.hasPhoto).length;
   const orderId = task.item.orderId;
+
+  // 出发日期（本地化）：纯签证单无航班 → null
+  const departureYmd =
+    task.order?.departureTime && task.order?.departureTz
+      ? localYmd(task.order.departureTime, task.order.departureTz)
+      : null;
+
+  // 单次/多次签徽章：从签证产品名启发式判断
+  const visaName = task.visaName ?? '';
+  const visaEntryBadge = /多次/.test(visaName)
+    ? '多次签'
+    : /单次/.test(visaName)
+      ? '单次签'
+      : null;
+
+  const saveNote = async () => {
+    if (savingNote) return; // 防重入：Enter→blur 可能重复触发
+    const next = noteDraft.trim();
+    if (next === (task.notes ?? '')) return; // 无变化不提交
+    setSavingNote(true);
+    setNoteError(null);
+    try {
+      await api.updateFulfillmentTask(token, task.id, { notes: next });
+      onChanged();
+    } catch (e: unknown) {
+      setNoteError(e instanceof ApiError ? e.message : '备注保存失败');
+    } finally {
+      setSavingNote(false);
+    }
+  };
 
   const handleDownloadZip = async () => {
     if (!orderId) return;
@@ -190,7 +234,7 @@ function TaskRow({ task, selected, onToggle, token }: TaskRowProps) {
   return (
     <>
       <tr className={selected ? 'bg-brand-50/70' : ''}>
-        <td className="text-center">
+        <td className="align-top text-center">
           <input
             type="checkbox"
             aria-label={`选择订单 ${task.order?.orderNumber ?? task.id}`}
@@ -198,21 +242,41 @@ function TaskRow({ task, selected, onToggle, token }: TaskRowProps) {
             onChange={onToggle}
           />
         </td>
-        <td className="font-mono text-xs text-ink">
-          {task.order?.orderNumber ?? '—'}
-        </td>
-        <td className="text-right nums">{task.item.quantity}</td>
-        <td className="text-xs text-ink-muted">
-          <div className="max-w-xs truncate" title={task.order?.notes ?? undefined}>
-            {task.order?.notes ?? '—'}
+        <td className="align-top font-mono text-xs text-ink">
+          <div>{task.order?.orderNumber ?? '—'}</div>
+          {/* 出发日期（不是录入日期）；纯签证单无航班 → — */}
+          <div className="mt-0.5 font-sans text-[10px] text-ink-muted">
+            出发 {departureYmd ?? '—'}
           </div>
         </td>
-        <td className="text-center">
+        <td className="align-top text-right nums">{task.item.quantity}</td>
+        <td className="align-top text-xs text-ink-muted">
+          <input
+            className="input max-w-xs py-1 text-xs"
+            value={noteDraft}
+            placeholder="添加备注…"
+            disabled={savingNote}
+            onChange={(e) => setNoteDraft(e.target.value)}
+            onFocus={() => { noteFocusedRef.current = true; }}
+            onBlur={() => { noteFocusedRef.current = false; void saveNote(); }}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') e.currentTarget.blur();
+            }}
+          />
+          {savingNote && <div className="mt-0.5 text-[10px] text-ink-muted">保存中…</div>}
+          {noteError && <div className="mt-0.5 text-[10px] text-rose-600">{noteError}</div>}
+        </td>
+        <td className="align-top text-center">
           <span className={VISA_STATUS_BADGE[task.status]}>
             {VISA_STATUS_LABEL[task.status]}
           </span>
+          {visaEntryBadge && (
+            <div className="mt-1">
+              <span className="badge-neutral text-[10px]">{visaEntryBadge}</span>
+            </div>
+          )}
         </td>
-        <td className="text-center">
+        <td className="align-top text-center">
           <button
             type="button"
             onClick={() => setExpanded((v) => !v)}
@@ -248,7 +312,7 @@ function TaskRow({ task, selected, onToggle, token }: TaskRowProps) {
                   onClick={() => void handleDownloadZip()}
                   disabled={downloading}
                 >
-                  {downloading ? '打包中…' : '下载护照(送签)'}
+                  {downloading ? '打包中…' : '下载护照'}
                 </button>
                 {missingCount > 0 && (
                   <span className="text-xs text-rose-600">
@@ -273,6 +337,8 @@ export function VisaDeskPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('OPEN');
+  // 出发日期筛选（单日 YYYY-MM-DD）；空 = 不按出发日过滤
+  const [departureDate, setDepartureDate] = useState('');
 
   // ── 批量选择 / 流转状态 ─────────────────────────────────
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -313,11 +379,19 @@ export function VisaDeskPage() {
   }, [token, statusFilter, refreshNonce]);
 
   const filtered = useMemo(() => {
+    let list = tasks;
     if (statusFilter === 'OPEN') {
-      return tasks.filter((t) => t.status === 'PENDING' || t.status === 'IN_PROGRESS');
+      list = list.filter((t) => t.status === 'PENDING' || t.status === 'IN_PROGRESS');
     }
-    return tasks;
-  }, [tasks, statusFilter]);
+    // 出发日期过滤（客户端）：选了日期时按本地出发日比对；纯签证单无航班 → 保留可见（不被日期筛选误隐藏）
+    if (departureDate) {
+      list = list.filter((t) => {
+        if (!t.order?.departureTime || !t.order?.departureTz) return true;
+        return localYmd(t.order.departureTime, t.order.departureTz) === departureDate;
+      });
+    }
+    return list;
+  }, [tasks, statusFilter, departureDate]);
 
   // ── 勾选 helpers（镜像 OrdersPage 批量管理）────────────────
   const visibleIds = useMemo(() => filtered.map((t) => t.id), [filtered]);
@@ -379,21 +453,50 @@ export function VisaDeskPage() {
             。点击"乘客"可展开护照信息及下载按钮。
           </p>
         </div>
-        <div>
-          <label className="label">状态筛选</label>
-          <select
-            className="input max-w-[16rem] py-1.5"
-            value={statusFilter}
-            onChange={(e) => {
-              setStatusFilter(e.target.value as StatusFilter);
-              clearSelection();
-            }}
-          >
-            {FILTER_OPTIONS.map((o) => (
-              <option key={o.value} value={o.value}>{o.label}</option>
-            ))}
-          </select>
-          <p className="mt-1 text-xs text-ink-muted">新录入的待送签单在『待处理』里</p>
+        <div className="flex flex-wrap items-start gap-3">
+          <div>
+            <label className="label">状态筛选</label>
+            <select
+              className="input max-w-[16rem] py-1.5"
+              value={statusFilter}
+              onChange={(e) => {
+                setStatusFilter(e.target.value as StatusFilter);
+                clearSelection();
+              }}
+            >
+              {FILTER_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>{o.label}</option>
+              ))}
+            </select>
+            <p className="mt-1 text-xs text-ink-muted">新录入的待送签单在『待处理』里</p>
+          </div>
+          <div>
+            <label className="label">出发日期</label>
+            <div className="flex items-center gap-2">
+              <input
+                type="date"
+                className="input max-w-[12rem] py-1.5"
+                value={departureDate}
+                onChange={(e) => {
+                  setDepartureDate(e.target.value);
+                  clearSelection();
+                }}
+              />
+              {departureDate && (
+                <button
+                  type="button"
+                  className="btn-ghost py-1.5 text-xs"
+                  onClick={() => {
+                    setDepartureDate('');
+                    clearSelection();
+                  }}
+                >
+                  清除
+                </button>
+              )}
+            </div>
+            <p className="mt-1 text-xs text-ink-muted">按客户出发日筛选（纯签证单无航班）</p>
+          </div>
         </div>
       </section>
 
@@ -498,6 +601,7 @@ export function VisaDeskPage() {
                     selected={selectedIds.has(task.id)}
                     onToggle={() => toggleRow(task.id)}
                     token={token}
+                    onChanged={() => setRefreshNonce((n) => n + 1)}
                   />
                 ))
               )}

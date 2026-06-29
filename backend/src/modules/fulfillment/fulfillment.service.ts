@@ -95,6 +95,8 @@ export class FulfillmentService {
         include: {
           orderItem: {
             include: {
+              // 本签证 item 关联的签证产品（用于 #7：单次/多次签名称）
+              visa: { select: { visaName: true, visaType: true } },
               order: {
                 select: {
                   id: true,
@@ -106,6 +108,13 @@ export class FulfillmentService {
                   // 乘客护照明细（供签证台显示；一次 include，无 N+1）
                   passengers: {
                     select: { id: true, fullName: true, documentNumber: true, passportPhotoUrl: true },
+                  },
+                  // 同订单最早一段机票行程（用于 #6：签证台显示出发日期）
+                  items: {
+                    where: { kind: OrderItemKind.FLIGHT },
+                    select: { flightSchedule: { select: { departureTime: true, departureTz: true } } },
+                    orderBy: { flightSchedule: { departureTime: 'asc' } },
+                    take: 1,
                   },
                 },
               },
@@ -121,10 +130,23 @@ export class FulfillmentService {
 
     return {
       tasks: rows.map((t) => {
-        const { passengers: rawPassengers, ...orderWithoutPassengers } = t.orderItem.order;
+        const {
+          passengers: rawPassengers,
+          items: flightLegs,
+          ...orderWithoutPassengers
+        } = t.orderItem.order;
+        // 最早一段机票的出发时间/时区（无机票则 null）— 供签证台显示出发日期
+        const firstLeg = flightLegs[0]?.flightSchedule ?? null;
         return {
           ...serializeTask(t, t.orderItem),
-          order: orderWithoutPassengers,
+          // #7：本签证产品名称（单次/多次签等）置于任务顶层
+          visaName: t.orderItem.visa?.visaName ?? null,
+          order: {
+            ...orderWithoutPassengers,
+            // #6：出发日期 + 时区（ISO 字符串 / null）
+            departureTime: firstLeg?.departureTime ? firstLeg.departureTime.toISOString() : null,
+            departureTz: firstLeg?.departureTz ?? null,
+          },
           // 签证任务附带乘客护照明细；其他类型不附带
           ...(t.type === FulfillmentType.VISA_APPLICATION
             ? { passengers: rawPassengers.map(serializePassenger) }

@@ -2665,7 +2665,10 @@ export type OrderListFilters = Pick<
   | 'flightNumber'
   | 'passengerName'
   | 'invoiceStatus'
->;
+> & {
+  /** 精确按班次过滤（整班·全岗导出用）；比 travelFrom/travelTo 更准，不受 ±1 天放宽影响。 */
+  scheduleId?: string;
+};
 
 /**
  * 把列表/导出共用的筛选参数转成 Prisma where。
@@ -2722,6 +2725,11 @@ export function buildOrderFilterWhere(query: OrderListFilters): Prisma.OrderWher
         },
       },
     });
+  }
+  // 精确按班次：订单需含该班次的 FLIGHT 行。整班·全岗导出专用——比 travelFrom/travelTo 精确，
+  // 不受出行日期窗口 ±1 天放宽影响，保证只导该班次当天的订单。
+  if (query.scheduleId) {
+    andClauses.push({ items: { some: { flightScheduleId: query.scheduleId } } });
   }
   if (query.invoiceStatus) where.invoiceStatus = query.invoiceStatus;
   // 航班号筛选 — 订单需含该航班号的 FLIGHT 行（同样走 AND 叠加，可与 kind/出行日期组合）
