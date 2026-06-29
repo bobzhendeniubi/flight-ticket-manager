@@ -8,7 +8,9 @@
  *       机票 → 去/回航段余位档位徽章（复用六档余位口径）。
  *       酒店 → 关联房型时查后台房控，展示房量档位徽章；无包房配置则不展示。
  *   - 去/回任一航段或酒店售罄 → 禁用"加入购物车"，给出换日期提示。
- * 价格：机票按日期实时取价 × 人数；酒店每晚价 × 晚数 × 房间数；签证每人价 × 人数。
+ * 价格：含机票的全包价；机票按所选出发日实时计价（fareBuckets 阶梯），故同套餐不同日期总价不同。
+ *   卡内逐行重算 = 机票 × 人数 + 酒店每晚价 × 晚数 × 房间数 + 签证每人价 × 人数 − 立减，
+ *   与后端权威重算一致；列表"地板价"排序用含机票（基准价）的合计（见 bundleFloorPrice）。
  *
  * 库存档位口径：买家只看档位（充足/紧张/少量/极少量/售罄、房量充足/紧张/极少/售罄），
  * 绝不暴露原始余票/余房数字（与六档余位一致）。
@@ -84,11 +86,13 @@ interface BundleView extends MockBundle {
 
 function bundleApiToView(b: ApiBundle): BundleView {
   const items = (b.items as BundleItem[]) ?? [];
-  const groundTotal = items.filter((i) => i.kind !== 'FLIGHT').reduce((s, i) => s + i.unitPrice * i.qty, 0);
+  // 列表排序/「地板价」估算：全部要素合计（FLIGHT 行 unitPrice 为可选机票基准价，运营未填=0 则只含地面）。
+  // 卡内总价另按所选出发日实时机票价逐行重算（见 ConfigurableBundleCard），故排序稳定、不随日期抖动。
+  const allInTotal = items.reduce((s, i) => s + i.unitPrice * i.qty, 0);
   return {
     id: b.id, name: b.name, tagline: b.tagline ?? '', emoji: b.emoji ?? '🎁',
     photo: b.photo ?? '',
-    items, listPrice: groundTotal, bundlePrice: groundTotal,
+    items, listPrice: allInTotal, bundlePrice: allInTotal,
     groundDiscount: Number(b.groundDiscount), flightPax: b.flightPax,
     suitableFor: b.suitableFor ?? '', active: b.isActive,
     singleSupplementPerNight:
@@ -127,9 +131,10 @@ function parseSort(raw: string | null): SortKey {
 }
 
 /**
- * 套餐"地板价"估算：用于排序与卡片"¥X起"展示。
- * 卡内实时机票价随日期波动，列表排序用稳定的地面项总价 − 立减，避免排序抖动。
- * （= listPrice/bundlePrice，即非机票项之和；机票实时价在卡内单独计算。）
+ * 套餐排序用「地板价」估算：全部要素合计 − 立减。
+ * 机票按可选基准价计入（运营未填=0 则仅地面）；用固定值排序，稳定不随日期抖动。
+ * 卡内展示总价另按所选出发日实时机票价逐行重算（含机票真实价），两者口径分工不同。
+ * （= listPrice/bundlePrice − groundDiscount。）
  */
 function bundleFloorPrice(b: BundleView): number {
   return Math.max(0, b.bundlePrice - b.groundDiscount);

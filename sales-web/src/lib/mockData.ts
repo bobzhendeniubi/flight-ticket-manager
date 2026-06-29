@@ -828,11 +828,11 @@ export interface MockBundle {
   photo: string;
   /** 含哪些产品 */
   items: BundleItem[];
-  /** 单卖总价（计算自 items） */
+  /** 单卖总价（计算自 items；机票为可选基准价，运营未填=0 则仅含地面项） */
   listPrice: number;
-  /** 套餐价（已让利） */
+  /** 套餐价（已让利；机票基准价计入，未填=0 则仅地面，卡内按出发日实时重算含机票真实价） */
   bundlePrice: number;
-  /** 地面服务让利金额 */
+  /** 套餐让利金额 */
   groundDiscount: number;
   /** 机票对应人数（用于调 /flights/price） */
   flightPax: number;
@@ -850,7 +850,8 @@ export const MOCK_BUNDLES: MockBundle[] = [
       { kind: 'HOTEL', productName: '岘港凯悦度假村 美溪海景房 3 晚', qty: 3, unitPrice: 1880 },
       { kind: 'TRANSFER', productName: '岘港机场接送（来回 7 座商务车）', qty: 2, unitPrice: 188 },
     ];
-    const groundTotal = items.filter(i => i.kind !== 'FLIGHT').reduce((s, i) => s + i.unitPrice * i.qty, 0);
+    // 一价全包：含机票在内的全部要素合计（FLIGHT 行项带固定机票价；mock 占位 0）。
+    const allInTotal = items.reduce((s, i) => s + i.unitPrice * i.qty, 0);
     return {
       id: 'b1',
       name: '经典度假 3 晚 · 凯悦海景',
@@ -858,8 +859,8 @@ export const MOCK_BUNDLES: MockBundle[] = [
       emoji: '🏖️',
       photo: 'https://images.unsplash.com/photo-1582719508461-905c673771fd?w=600&h=400&fit=crop',
       items,
-      listPrice: groundTotal,
-      bundlePrice: groundTotal,
+      listPrice: allInTotal,
+      bundlePrice: allInTotal,
       groundDiscount: 380,
       flightPax: 2,
       suitableFor: '2 人 · 情侣/家庭',
@@ -874,7 +875,8 @@ export const MOCK_BUNDLES: MockBundle[] = [
       { kind: 'TRANSFER', productName: '巴拿山 1 日包车', qty: 1, unitPrice: 588 },
       { kind: 'VISA', productName: '越南 E-visa 30 天 × 2', qty: 2, unitPrice: 280 },
     ];
-    const groundTotal = items.filter(i => i.kind !== 'FLIGHT').reduce((s, i) => s + i.unitPrice * i.qty, 0);
+    // 一价全包：含机票在内的全部要素合计（FLIGHT 行项带固定机票价；mock 占位 0）。
+    const allInTotal = items.reduce((s, i) => s + i.unitPrice * i.qty, 0);
     return {
       id: 'b2',
       name: '蜜月豪华 4 晚 · 洲际半岛',
@@ -882,8 +884,8 @@ export const MOCK_BUNDLES: MockBundle[] = [
       emoji: '💍',
       photo: 'https://images.unsplash.com/photo-1520250497591-112f2f40a3f4?w=600&h=400&fit=crop',
       items,
-      listPrice: groundTotal,
-      bundlePrice: groundTotal,
+      listPrice: allInTotal,
+      bundlePrice: allInTotal,
       groundDiscount: 1200,
       flightPax: 2,
       suitableFor: '2 人 · 蜜月/纪念日',
@@ -897,7 +899,8 @@ export const MOCK_BUNDLES: MockBundle[] = [
       { kind: 'TRANSFER', productName: '岘港机场接送（豪华轿车 来回）', qty: 2, unitPrice: 388 },
       { kind: 'VISA', productName: '越南落地签批文', qty: 1, unitPrice: 180 },
     ];
-    const groundTotal = items.filter(i => i.kind !== 'FLIGHT').reduce((s, i) => s + i.unitPrice * i.qty, 0);
+    // 一价全包：含机票在内的全部要素合计（FLIGHT 行项带固定机票价；mock 占位 0）。
+    const allInTotal = items.reduce((s, i) => s + i.unitPrice * i.qty, 0);
     return {
       id: 'b3',
       name: '商务快闪 1 晚 · 商务舱',
@@ -905,8 +908,8 @@ export const MOCK_BUNDLES: MockBundle[] = [
       emoji: '💼',
       photo: 'https://images.unsplash.com/photo-1551882547-ff40c63fe5fa?w=600&h=400&fit=crop',
       items,
-      listPrice: groundTotal,
-      bundlePrice: groundTotal,
+      listPrice: allInTotal,
+      bundlePrice: allInTotal,
       groundDiscount: 200,
       flightPax: 1,
       suitableFor: '1 人 · 商务',
@@ -921,7 +924,8 @@ export const MOCK_BUNDLES: MockBundle[] = [
       { kind: 'TRANSFER', productName: '会安古城 1 日包车', qty: 1, unitPrice: 248 },
       { kind: 'VISA', productName: '越南 E-visa 30 天 × 4', qty: 4, unitPrice: 280 },
     ];
-    const groundTotal = items.filter(i => i.kind !== 'FLIGHT').reduce((s, i) => s + i.unitPrice * i.qty, 0);
+    // 一价全包：含机票在内的全部要素合计（FLIGHT 行项带固定机票价；mock 占位 0）。
+    const allInTotal = items.reduce((s, i) => s + i.unitPrice * i.qty, 0);
     return {
       id: 'b4',
       name: '亲子 4 晚 · 太阳豪庭',
@@ -929,8 +933,8 @@ export const MOCK_BUNDLES: MockBundle[] = [
       emoji: '👨‍👩‍👧‍👦',
       photo: 'https://images.unsplash.com/photo-1564501049412-61c2a3083791?w=600&h=400&fit=crop',
       items,
-      listPrice: groundTotal,
-      bundlePrice: groundTotal,
+      listPrice: allInTotal,
+      bundlePrice: allInTotal,
       groundDiscount: 800,
       flightPax: 4,
       suitableFor: '4 人 · 全家出游',
@@ -945,7 +949,8 @@ export const MOCK_BUNDLES: MockBundle[] = [
       { kind: 'TRANSFER', productName: '海上钓鱼半日团', qty: 1, unitPrice: 988 },
       { kind: 'VISA', productName: '越南 E-visa 30 天 × 2', qty: 2, unitPrice: 280 },
     ];
-    const groundTotal = items.filter(i => i.kind !== 'FLIGHT').reduce((s, i) => s + i.unitPrice * i.qty, 0);
+    // 一价全包：含机票在内的全部要素合计（FLIGHT 行项带固定机票价；mock 占位 0）。
+    const allInTotal = items.reduce((s, i) => s + i.unitPrice * i.qty, 0);
     return {
       id: 'b5',
       name: '养生 5 晚 · TIA 全 SPA',
@@ -953,8 +958,8 @@ export const MOCK_BUNDLES: MockBundle[] = [
       emoji: '🧘',
       photo: 'https://images.unsplash.com/photo-1540541338287-41700207dee6?w=600&h=400&fit=crop',
       items,
-      listPrice: groundTotal,
-      bundlePrice: groundTotal,
+      listPrice: allInTotal,
+      bundlePrice: allInTotal,
       groundDiscount: 1000,
       flightPax: 2,
       suitableFor: '2 人 · 减压度假',
@@ -969,7 +974,8 @@ export const MOCK_BUNDLES: MockBundle[] = [
       { kind: 'TRANSFER', productName: '美山圣地半日包车', qty: 1, unitPrice: 488 },
       { kind: 'VISA', productName: '越南 E-visa 30 天 × 2', qty: 2, unitPrice: 280 },
     ];
-    const groundTotal = items.filter(i => i.kind !== 'FLIGHT').reduce((s, i) => s + i.unitPrice * i.qty, 0);
+    // 一价全包：含机票在内的全部要素合计（FLIGHT 行项带固定机票价；mock 占位 0）。
+    const allInTotal = items.reduce((s, i) => s + i.unitPrice * i.qty, 0);
     return {
       id: 'b6',
       name: '会安文化 4 晚 · 安岚古城',
@@ -977,8 +983,8 @@ export const MOCK_BUNDLES: MockBundle[] = [
       emoji: '🏮',
       photo: 'https://images.unsplash.com/photo-1558005137-d9619a5c539f?w=600&h=400&fit=crop',
       items,
-      listPrice: groundTotal,
-      bundlePrice: groundTotal,
+      listPrice: allInTotal,
+      bundlePrice: allInTotal,
       groundDiscount: 680,
       flightPax: 2,
       suitableFor: '2 人 · 文化探索',

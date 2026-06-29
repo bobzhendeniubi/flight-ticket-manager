@@ -47,14 +47,18 @@ function SectionHeader({ icon, title, sub, to, toLabel, eyebrow }: { icon: IconN
 // ── 套餐速览（首页第一个产品 section）─────────────────────────────
 
 /**
- * 套餐"¥X 起/人"展示价：地面部分（酒店/签证/接送）合计 − 套餐让利，按 flightPax 摊到每人。
- * FLIGHT 行项 unitPrice=0（机票按日期实时取价），所以实际总价只会更高 —— "起"是真实下限。
+ * 套餐"¥X 起/人"展示价。机票按出发日实时定价，运营默认不逐个填机票价：
+ *   - 套餐填了机票基准价（FLIGHT 行 unitPrice>0）→ 起价含机票（基准价做「起」下限），标「含机票」；
+ *   - 未填（默认）→ 起价只含地面项，标「机票按出发日实时」；买家点进详情即见含机票实时总价。
  * groundDiscount 是后端 Decimal 序列化的字符串，须 Number() 后再参与计算。
  */
-function bundleFromPricePerPerson(b: Bundle): number {
-  const groundTotal = b.items.reduce((s, i) => s + i.unitPrice * i.qty, 0);
+function bundleStartPricePerPerson(b: Bundle): { perPerson: number; includesFlight: boolean } {
+  const flightTotal = b.items.filter((i) => i.kind === 'FLIGHT').reduce((s, i) => s + i.unitPrice * i.qty, 0);
+  const groundTotal = b.items.filter((i) => i.kind !== 'FLIGHT').reduce((s, i) => s + i.unitPrice * i.qty, 0);
+  const includesFlight = flightTotal > 0;
+  const base = (includesFlight ? flightTotal + groundTotal : groundTotal) - Number(b.groundDiscount);
   const pax = Math.max(1, b.flightPax);
-  return Math.max(0, Math.round((groundTotal - Number(b.groundDiscount)) / pax));
+  return { perPerson: Math.max(0, Math.round(base / pax)), includesFlight };
 }
 
 export function BundlesPreviewSection({ keyword }: { keyword: string }) {
@@ -164,12 +168,18 @@ export function BundlesPreviewSection({ keyword }: { keyword: string }) {
                     <span className="chip-palm"><Icon name="car" className="h-3 w-3" />地面服务</span>
                   )}
                 </div>
-                {bundleFromPricePerPerson(b) > 0 && (
-                  <p className="mt-2 flex items-baseline gap-1">
-                    <span className="price text-lg">¥{bundleFromPricePerPerson(b).toLocaleString()}</span>
-                    <span className="text-xs font-normal text-ink-muted">起/人</span>
-                  </p>
-                )}
+                {(() => {
+                  const sp = bundleStartPricePerPerson(b);
+                  if (sp.perPerson <= 0) return null;
+                  return (
+                    <p className="mt-2 flex items-baseline gap-1">
+                      <span className="price text-lg">¥{sp.perPerson.toLocaleString()}</span>
+                      <span className="text-xs font-normal text-ink-muted">
+                        {sp.includesFlight ? '起/人 · 含机票（按出发日实时）' : '起/人（地面）· 机票按出发日实时'}
+                      </span>
+                    </p>
+                  );
+                })()}
                 <div className="mt-2.5 flex items-center justify-between border-t border-slate-100 pt-2.5 text-xs">
                   <span className="text-ink-muted">{b.suitableFor}</span>
                   <span className="inline-flex items-center gap-1 font-semibold text-brand transition-colors group-hover:text-brand-dark">
