@@ -108,8 +108,10 @@ function bundleApiToMock(b: ApiBundle): MockBundle {
   const items = (b.items as BundleItem[]) ?? [];
   // 原价参考 = 各项合计（机票行 unitPrice 在 DB 为 0 → 此处仅地面参考；真实全包价含实时机票，在前台/下单时算）。
   // 套餐价 = 原价 ×(1 − discountPct/100)；折扣是套餐唯一口径。
-  const allInTotal = items.reduce((s, i) => s + i.unitPrice * i.qty, 0);
   const discountPct = b.discountPct ?? 0;
+  // 原价 = 含当前最低机票的全包原价（后端 originalAllInCny）；旧数据/无机票估值时回退 items 合计。
+  // 用它做"单买总价/划线价"，确保含机票（修复套餐卡只显示地面价 ¥350 的问题）。
+  const originalAllIn = b.originalAllInCny ?? items.reduce((s, i) => s + i.unitPrice * i.qty, 0);
   return {
     id: b.id,
     code: b.code,
@@ -117,8 +119,8 @@ function bundleApiToMock(b: ApiBundle): MockBundle {
     tagline: b.tagline ?? '',
     emoji: b.emoji ?? '🎁',
     items,
-    listPrice: allInTotal,
-    bundlePrice: Math.round(allInTotal * (1 - discountPct / 100)),
+    listPrice: originalAllIn,
+    bundlePrice: Math.round(originalAllIn * (1 - discountPct / 100)),
     discountPct,
     originalAllInCny: b.originalAllInCny,
     originalPerPaxCny: b.originalPerPaxCny,
@@ -783,9 +785,7 @@ function BundleCard({
             </span>
           </div>
         </div>
-        {!bundle.items.some((i) => i.kind === 'FLIGHT' && i.unitPrice > 0) && (
-          <p className="mt-1 text-right text-[11px] text-ink-muted">地面价 · 机票按出发日实时另计</p>
-        )}
+        <p className="mt-1 text-right text-[11px] text-ink-muted">原价含当前最低机票 · 实际按出发日实时机票浮动</p>
       </div>
 
       <div className="mt-3 flex justify-end gap-3 text-xs">
