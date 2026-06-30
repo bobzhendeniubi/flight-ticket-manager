@@ -50,13 +50,14 @@ function SectionHeader({ icon, title, sub, to, toLabel, eyebrow }: { icon: IconN
  * 套餐"¥X 起/人"展示价。机票按出发日实时定价，运营默认不逐个填机票价：
  *   - 套餐填了机票基准价（FLIGHT 行 unitPrice>0）→ 起价含机票（基准价做「起」下限），标「含机票」；
  *   - 未填（默认）→ 起价只含地面项，标「机票按出发日实时」；买家点进详情即见含机票实时总价。
- * groundDiscount 是后端 Decimal 序列化的字符串，须 Number() 后再参与计算。
+ * 整单 percent off：起价 = 合计 × (1 − discountPct/100)（旧固定让利 groundDiscount 已弃用）。
  */
 function bundleStartPricePerPerson(b: Bundle): { perPerson: number; includesFlight: boolean } {
   const flightTotal = b.items.filter((i) => i.kind === 'FLIGHT').reduce((s, i) => s + i.unitPrice * i.qty, 0);
   const groundTotal = b.items.filter((i) => i.kind !== 'FLIGHT').reduce((s, i) => s + i.unitPrice * i.qty, 0);
   const includesFlight = flightTotal > 0;
-  const base = (includesFlight ? flightTotal + groundTotal : groundTotal) - Number(b.groundDiscount);
+  const pct = b.discountPct ?? 0;
+  const base = (includesFlight ? flightTotal + groundTotal : groundTotal) * (1 - pct / 100);
   const pax = Math.max(1, b.flightPax);
   return { perPerson: Math.max(0, Math.round(base / pax)), includesFlight };
 }
@@ -132,9 +133,9 @@ export function BundlesPreviewSection({ keyword }: { keyword: string }) {
                     onError={(e) => { e.currentTarget.style.display = 'none'; }}
                   />
                   <div className="pointer-events-none absolute inset-x-0 bottom-0 h-16 bg-gradient-to-t from-black/35 to-transparent" />
-                  {Number(b.groundDiscount) > 0 && (
+                  {(b.discountPct ?? 0) > 0 && (
                     <span className="badge-deal absolute right-2.5 top-2.5">
-                      立减 ¥{Number(b.groundDiscount).toLocaleString()}
+                      省 {b.discountPct}%
                     </span>
                   )}
                   {/* 一价全含徽标（棕榈绿，左上角） */}

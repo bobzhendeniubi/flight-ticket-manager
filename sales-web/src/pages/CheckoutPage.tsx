@@ -526,6 +526,8 @@ export function CheckoutPage() {
             quantity: seatPax,
             flightScheduleId: scheduleId,
             flightCabin: 'ECONOMY' as const,
+            // 给机票腿打 bundleId 标 → 后端据此按该套餐 discountPct 对这两条机票腿打折。
+            bundleId: i.productId,
           }));
 
           // 退路：套餐缺航段 id（异常 / 老购物车数据 / 单程）→ 只发可用航段（可能为 0 条）+ BUNDLE 行，

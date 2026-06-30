@@ -279,7 +279,8 @@ function BundleDetailContent({
   navState: BundleNavState;
 }) {
   const items = (b.items ?? []) as BundleItemData[];
-  const groundDiscount = num(b.groundDiscount);
+  // 整单 percent off：套餐总价 = 全包价 × (1 − discountPct/100)（旧固定让利 groundDiscount 已弃用）。
+  const pct = b.discountPct ?? 0;
   // 口径：hotelNights ?? 第一条 HOTEL item 的 qty ?? 默认 4 晚（镜像后端）。
   const nights = resolveBundleNights(b);
   const isBiz = items.some((i) => i.kind === 'FLIGHT' && i.productName.includes('商务'));
@@ -400,7 +401,7 @@ function BundleDetailContent({
   const otherTotal =
     itemRows.filter((r) => r.kind !== 'FLIGHT' && r.kind !== 'HOTEL').reduce((s, r) => s + r.computedTotal, 0);
   const listTotal = flightTotal + hotelTotal + otherTotal + addOnTotal;
-  const total = listTotal - groundDiscount;
+  const total = Math.round(listTotal * (1 - pct / 100));
   const perPerson = headCount > 0 ? Math.round(total / headCount) : total;
 
   const soldOut = goTier === 'SOLD_OUT' || retTier === 'SOLD_OUT' || hotelTier === 'SOLD_OUT';
@@ -442,7 +443,7 @@ function BundleDetailContent({
         adultCount, childCount, infantCount,
         // 兼容旧字段：pax = headCount（出行人总数，含婴儿）
         pax: headCount, rooms: baseRooms,
-        flightTotal, hotelTotal, otherTotal, discount: groundDiscount,
+        flightTotal, hotelTotal, otherTotal, discountPct: pct,
         singleCount, businessCount,
         ...(outLeg?.scheduleId ? { goLegScheduleId: outLeg.scheduleId } : {}),
         ...(retLeg?.scheduleId ? { retLegScheduleId: retLeg.scheduleId } : {}),
@@ -848,10 +849,10 @@ function BundleDetailContent({
             <div className="rounded-2xl border border-slate-200/70 bg-canvas p-3.5">
               <div className="flex items-end justify-between gap-2">
                 <div className="text-xs text-ink-muted">
-                  {formatOccupancy(adultCount, childCount, infantCount)} · {baseRooms} 间房{groundDiscount > 0 && <span className="ml-1 text-deal">已省 ¥{groundDiscount.toLocaleString()}</span>}
+                  {formatOccupancy(adultCount, childCount, infantCount)} · {baseRooms} 间房{pct > 0 && <span className="ml-1 text-deal">已省 {pct}%</span>}
                 </div>
                 <div className="text-right">
-                  {groundDiscount > 0 && <span className="price-old block text-xs">¥{listTotal.toLocaleString()}</span>}
+                  {pct > 0 && <span className="price-old block text-xs">¥{listTotal.toLocaleString()}</span>}
                   <span className="price text-2xl">¥{total.toLocaleString()}</span>
                   <div className="text-xs text-ink-muted">≈ ¥{perPerson.toLocaleString()} /人</div>
                 </div>

@@ -9,8 +9,8 @@
  *       酒店 → 关联房型时查后台房控，展示房量档位徽章；无包房配置则不展示。
  *   - 去/回任一航段或酒店售罄 → 禁用"加入购物车"，给出换日期提示。
  * 价格：含机票的全包价；机票按所选出发日实时计价（fareBuckets 阶梯），故同套餐不同日期总价不同。
- *   卡内逐行重算 = 机票 × 人数 + 酒店每晚价 × 晚数 × 房间数 + 签证每人价 × 人数 − 立减，
- *   与后端权威重算一致；列表"地板价"排序用含机票（基准价）的合计（见 bundleFloorPrice）。
+ *   卡内逐行重算 = (机票 × 人数 + 酒店每晚价 × 晚数 × 房间数 + 签证每人价 × 人数 + 加项) × (1 − discountPct/100)，
+ *   整单 percent off；与后端权威重算一致；列表"地板价"排序用含机票（基准价）的折后合计（见 bundleFloorPrice）。
  *
  * 库存档位口径：买家只看档位（充足/紧张/少量/极少量/售罄、房量充足/紧张/极少/售罄），
  * 绝不暴露原始余票/余房数字（与六档余位一致）。
@@ -93,6 +93,7 @@ function bundleApiToView(b: ApiBundle): BundleView {
     id: b.id, name: b.name, tagline: b.tagline ?? '', emoji: b.emoji ?? '🎁',
     photo: b.photo ?? '',
     items, listPrice: allInTotal, bundlePrice: allInTotal,
+    discountPct: b.discountPct ?? 0,
     groundDiscount: Number(b.groundDiscount), flightPax: b.flightPax,
     suitableFor: b.suitableFor ?? '', active: b.isActive,
     singleSupplementPerNight:
@@ -131,13 +132,13 @@ function parseSort(raw: string | null): SortKey {
 }
 
 /**
- * 套餐排序用「地板价」估算：全部要素合计 − 立减。
+ * 套餐排序用「地板价」估算：全部要素合计 × (1 − discountPct/100)（整单折后价）。
  * 机票按可选基准价计入（运营未填=0 则仅地面）；用固定值排序，稳定不随日期抖动。
  * 卡内展示总价另按所选出发日实时机票价逐行重算（含机票真实价），两者口径分工不同。
- * （= listPrice/bundlePrice − groundDiscount。）
+ * （= bundlePrice × 折后系数。）
  */
 function bundleFloorPrice(b: BundleView): number {
-  return Math.max(0, b.bundlePrice - b.groundDiscount);
+  return Math.max(0, Math.round(b.bundlePrice * (1 - (b.discountPct ?? 0) / 100)));
 }
 
 /** 销量阈值：达到才显示"近期热订"紧迫感徽章（避免给冷门套餐贴假热度）。 */
@@ -479,7 +480,7 @@ export function BundlesPage() {
                   flightTotal: cfg.flightTotal,
                   hotelTotal: cfg.hotelTotal,
                   otherTotal: cfg.otherTotal,
-                  discount: b.groundDiscount,
+                  discountPct: b.discountPct ?? 0,
                   singleCount: cfg.singleCount,
                   businessCount: cfg.businessCount,
                   ...(cfg.goLegScheduleId ? { goLegScheduleId: cfg.goLegScheduleId } : {}),
@@ -699,7 +700,9 @@ function ConfigurableBundleCard({
   // 地面总价（套餐固定份数）；listTotal 用于展示原价（划线价）。
   const groundTotal = hotelTotal + otherTotal;
   const listTotal = flightTotal + groundTotal + addOnTotal;
-  const total = listTotal - b.groundDiscount;
+  // 整单 percent off：套餐总价 = 全包价（机票+酒店+其他+加项）× (1 − discountPct/100)。
+  const pct = b.discountPct ?? 0;
+  const total = Math.round(listTotal * (1 - pct / 100));
   const perPerson = headCount > 0 ? Math.round(total / headCount) : total;
 
   // 售罄拦截：去/回任一航段或酒店售罄 → 禁止加购
@@ -759,8 +762,8 @@ function ConfigurableBundleCard({
           <Icon name="package" className="h-4 w-4" />
         </span>
         <div className="absolute right-3 top-3 flex flex-col items-end gap-1.5">
-          {b.groundDiscount > 0 && (
-            <span className="badge-deal">立减 ¥{b.groundDiscount.toLocaleString()}</span>
+          {pct > 0 && (
+            <span className="badge-deal">省 {pct}%</span>
           )}
           {showScarcity && <ScarcityBadge kind="soldRecently" text="近期热订" />}
         </div>
@@ -1012,7 +1015,7 @@ function ConfigurableBundleCard({
           <span>
             机票 ¥{flightTotal.toLocaleString()} + 酒店 ¥{hotelTotal.toLocaleString()} + 其他 ¥{otherTotal.toLocaleString()}
             {addOnTotal > 0 && ` + 升级/差价 ¥${addOnTotal.toLocaleString()}`}
-            {b.groundDiscount > 0 && ` − 已省 ¥${b.groundDiscount.toLocaleString()}`}
+            {pct > 0 && ` − 已省 ${pct}%`}
           </span>
         </div>
         <div className="mt-1.5 flex flex-col gap-1.5 sm:flex-row sm:items-end sm:justify-between">
@@ -1020,7 +1023,7 @@ function ConfigurableBundleCard({
             {formatOccupancy(adultCount, childCount, infantCount)} · {baseRooms} 间房 · {formatMonthDay(cardGoDate)} → {formatMonthDay(displayReturnDate)}
           </div>
           <div className="flex items-baseline justify-end gap-2 text-right">
-            {b.groundDiscount > 0 && (
+            {pct > 0 && (
               <span className="price-old">¥{listTotal.toLocaleString()}</span>
             )}
             <div>

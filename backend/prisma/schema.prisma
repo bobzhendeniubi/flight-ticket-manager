@@ -706,7 +706,11 @@ model Bundle {
   // 注意：FLIGHT 组件的 unitPrice=0，客户端选日期后调 /flights/price 实时取价
   items          Json
   flightPax      Int      @default(1) // 机票组件含多少人
-  groundDiscount Decimal  @default(0) @db.Decimal(10, 2) // 地面部分让利（套餐专享优惠）
+  // 套餐折扣（百分比，0–100）：整个全包价(实时机票+地面+加项) × (1 − discountPct/100)。
+  // 这是套餐唯一的折扣口径，随出发日自动浮动（机票实时）。运营只填这一个数。
+  discountPct    Int      @default(0)
+  // [已弃用] 旧的固定 CNY 让利；被 discountPct 取代，新逻辑不再读取（列暂留，避免破坏性迁移）。
+  groundDiscount Decimal  @default(0) @db.Decimal(10, 2)
   suitableFor    String? // "2 人 · 情侣/家庭"
   // 套餐关联酒店房型 — 下单时把房型+入住日期盖到订单行上，房控板自动计入套餐占房
   hotelRoomTypeId String?

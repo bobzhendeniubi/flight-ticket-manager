@@ -635,7 +635,8 @@ async function seedBundles() {
       emoji: '🏖️',
       photo: 'https://images.unsplash.com/photo-1540541338287-41700207dee6?w=600&h=400&fit=crop',
       flightPax: 2,
-      groundDiscount: 380,
+      discountPct: 10, // 整个全包价打 9 折
+      groundDiscount: 0, // 弃用（改用 discountPct）
       suitableFor: '2 人 · 情侣/家庭',
       // 可选升级加价（按产品可配置；运营在后台可改）：单人入住房差/晚、升舱商务/航段、来回 2 段
       singleSupplementCnyPerNight: 80, // 平价 4-5 星，赵姐默认
@@ -653,7 +654,8 @@ async function seedBundles() {
       emoji: '💍',
       photo: 'https://images.unsplash.com/photo-1564501049412-61c2a3083791?w=600&h=400&fit=crop',
       flightPax: 2,
-      groundDiscount: 1200,
+      discountPct: 12, // 整个全包价打 88 折
+      groundDiscount: 0, // 弃用（改用 discountPct）
       suitableFor: '2 人 · 蜜月/纪念日',
       // 顶级 5 星（洲际半岛）单人入住房差远高于平价默认——一间客房卖一个人，¥80/晚会亏本，故上调
       singleSupplementCnyPerNight: 480,
@@ -673,7 +675,8 @@ async function seedBundles() {
       emoji: '💼',
       photo: 'https://images.unsplash.com/photo-1542314831-068cd1dbfeeb?w=600&h=400&fit=crop',
       flightPax: 1,
-      groundDiscount: 200,
+      discountPct: 8, // 整个全包价打 92 折
+      groundDiscount: 0, // 弃用（改用 discountPct）
       suitableFor: '1 人 · 商务',
       // 单人产品 + 市区公寓：单人入住房差适中；本套餐机票已是商务舱，升舱项给默认即可
       singleSupplementCnyPerNight: 150,

@@ -830,9 +830,11 @@ export interface MockBundle {
   items: BundleItem[];
   /** 单卖总价（计算自 items；机票为可选基准价，运营未填=0 则仅含地面项） */
   listPrice: number;
-  /** 套餐价（已让利；机票基准价计入，未填=0 则仅地面，卡内按出发日实时重算含机票真实价） */
+  /** 套餐价（机票基准价计入，未填=0 则仅地面，卡内按出发日实时重算含机票真实价） */
   bundlePrice: number;
-  /** 套餐让利金额 */
+  /** 整单折扣百分比（整数 0–100）：套餐总价 = 全包价 × (1 − discountPct/100） */
+  discountPct: number;
+  /** @deprecated 已弃用的固定让利金额；前台改用 discountPct（整单 percent off） */
   groundDiscount: number;
   /** 机票对应人数（用于调 /flights/price） */
   flightPax: number;
@@ -861,6 +863,7 @@ export const MOCK_BUNDLES: MockBundle[] = [
       items,
       listPrice: allInTotal,
       bundlePrice: allInTotal,
+      discountPct: 10,
       groundDiscount: 380,
       flightPax: 2,
       suitableFor: '2 人 · 情侣/家庭',
@@ -886,6 +889,7 @@ export const MOCK_BUNDLES: MockBundle[] = [
       items,
       listPrice: allInTotal,
       bundlePrice: allInTotal,
+      discountPct: 12,
       groundDiscount: 1200,
       flightPax: 2,
       suitableFor: '2 人 · 蜜月/纪念日',
@@ -910,6 +914,7 @@ export const MOCK_BUNDLES: MockBundle[] = [
       items,
       listPrice: allInTotal,
       bundlePrice: allInTotal,
+      discountPct: 8,
       groundDiscount: 200,
       flightPax: 1,
       suitableFor: '1 人 · 商务',
@@ -935,6 +940,7 @@ export const MOCK_BUNDLES: MockBundle[] = [
       items,
       listPrice: allInTotal,
       bundlePrice: allInTotal,
+      discountPct: 0,
       groundDiscount: 800,
       flightPax: 4,
       suitableFor: '4 人 · 全家出游',
@@ -960,6 +966,7 @@ export const MOCK_BUNDLES: MockBundle[] = [
       items,
       listPrice: allInTotal,
       bundlePrice: allInTotal,
+      discountPct: 0,
       groundDiscount: 1000,
       flightPax: 2,
       suitableFor: '2 人 · 减压度假',
@@ -985,6 +992,7 @@ export const MOCK_BUNDLES: MockBundle[] = [
       items,
       listPrice: allInTotal,
       bundlePrice: allInTotal,
+      discountPct: 0,
       groundDiscount: 680,
       flightPax: 2,
       suitableFor: '2 人 · 文化探索',

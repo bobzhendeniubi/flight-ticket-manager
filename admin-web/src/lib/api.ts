@@ -903,6 +903,13 @@ export interface Bundle {
   photo: string | null;
   items: BundleItemData[];
   flightPax: number;
+  /** 套餐折扣（百分比 0–100）：整个全包价 ×(1 − discountPct/100)。套餐唯一折扣口径。 */
+  discountPct: number;
+  /** 原价（含当前最低来回机票，CNY）；后台「想卖的价格」↔折扣% 换算 + 展示原价划线用。估算锚点。 */
+  originalAllInCny: number;
+  /** 每人原价（= originalAllInCny / flightPax，CNY） */
+  originalPerPaxCny: number;
+  /** [已弃用] 旧固定 CNY 让利，被 discountPct 取代 */
   groundDiscount: string;
   suitableFor: string | null;
   /** 关联酒店房型 ID（房控板计入套餐占房）；null = 不关联 */

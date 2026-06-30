@@ -116,7 +116,7 @@ export function CartPage() {
                         机票 ¥{fmt(Number(i.meta?.flightTotal) || 0)} +
                         地面 ¥{fmt(Number(i.meta?.hotelTotal) || 0)} +
                         其他 ¥{fmt(Number(i.meta?.otherTotal) || 0)}
-                        {(Number(i.meta?.discount) || 0) > 0 && ` − 已省 ¥${fmt(Number(i.meta?.discount) || 0)}`}
+                        {(Number(i.meta?.discountPct) || 0) > 0 && ` − 已省 ${Number(i.meta?.discountPct) || 0}%`}
                       </div>
                     </div>
                   )}

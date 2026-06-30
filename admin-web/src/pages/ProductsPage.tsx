@@ -106,8 +106,10 @@ function visaApiToMock(v: ApiVisa): MockVisa {
 
 function bundleApiToMock(b: ApiBundle): MockBundle {
   const items = (b.items as BundleItem[]) ?? [];
-  // 套餐价 = 各项合计（含机票），一价全包
+  // 原价参考 = 各项合计（机票行 unitPrice 在 DB 为 0 → 此处仅地面参考；真实全包价含实时机票，在前台/下单时算）。
+  // 套餐价 = 原价 ×(1 − discountPct/100)；折扣是套餐唯一口径。
   const allInTotal = items.reduce((s, i) => s + i.unitPrice * i.qty, 0);
+  const discountPct = b.discountPct ?? 0;
   return {
     id: b.id,
     code: b.code,
@@ -116,7 +118,10 @@ function bundleApiToMock(b: ApiBundle): MockBundle {
     emoji: b.emoji ?? '🎁',
     items,
     listPrice: allInTotal,
-    bundlePrice: allInTotal,
+    bundlePrice: Math.round(allInTotal * (1 - discountPct / 100)),
+    discountPct,
+    originalAllInCny: b.originalAllInCny,
+    originalPerPaxCny: b.originalPerPaxCny,
     groundDiscount: Number(b.groundDiscount),
     flightPax: b.flightPax,
     suitableFor: b.suitableFor ?? '',
@@ -133,6 +138,23 @@ function bundleApiToMock(b: ApiBundle): MockBundle {
     blackoutDates: b.blackoutDates ?? [],
     defaultDepartDate: b.defaultDepartDate ?? null,
   };
+}
+
+/**
+ * 从已有套餐反推「当前最低来回机票 / 人」(CNY)：后端给的 originalAllInCny = 地面 + 机票×flightPax，
+ * 故 机票 = (originalAllInCny − 地面) / flightPax。新建套餐用它把「想卖的价格」换算成折扣%。
+ * 取第一个能算出正值的套餐；都算不出 → null（新建时退化为仅地面口径）。
+ */
+function deriveFlightRefRoundTrip(bundles: MockBundle[]): number | null {
+  for (const b of bundles) {
+    if (b.originalAllInCny == null || !b.flightPax) continue;
+    const ground = b.items
+      .filter((i) => i.kind !== 'FLIGHT')
+      .reduce((s, i) => s + (i.qty ?? 0) * (i.unitPrice ?? 0), 0);
+    const ref = Math.round((b.originalAllInCny - ground) / b.flightPax);
+    if (ref > 0) return ref;
+  }
+  return null;
 }
 
 /**
@@ -301,7 +323,7 @@ export function ProductsPage() {
         await api.createBundle(tk, {
           name: n.name, tagline: n.tagline, emoji: n.emoji,
           items: n.items, flightPax: n.flightPax,
-          groundDiscount: n.groundDiscount, suitableFor: n.suitableFor,
+          discountPct: n.discountPct ?? 0, groundDiscount: n.groundDiscount, suitableFor: n.suitableFor,
           hotelRoomTypeId: n.hotelRoomTypeId ?? null,
           hotelNights: persistedHotelNights(n),
           singleSupplementCnyPerNight: n.singleSupplementCnyPerNight ?? null,
@@ -627,6 +649,7 @@ function BundlesSection({
       {showWizard && (
         <NewBundleWizard
           roomTypeOptions={roomTypeOptions}
+          flightRefRoundTripCny={deriveFlightRefRoundTrip(items)}
           onCancel={() => setShowWizard(false)}
           onSubmit={(b) => {
             onChange([b, ...items]);
@@ -639,6 +662,7 @@ function BundlesSection({
           key={editing.id}
           roomTypeOptions={roomTypeOptions}
           initial={editing}
+          flightRefRoundTripCny={deriveFlightRefRoundTrip(items)}
           onCancel={() => setEditing(null)}
           onSubmit={(b) => {
             // 更新既有套餐（保留 id + 顺序）；persistBundles 走 update 分支
@@ -782,12 +806,15 @@ function BundleCard({
 function NewBundleWizard({
   roomTypeOptions,
   initial,
+  flightRefRoundTripCny,
   onCancel,
   onSubmit,
 }: {
   roomTypeOptions: RoomTypeOption[];
   /** 传入既有套餐 = 编辑模式（各字段预填）；缺省 = 新建 */
   initial?: MockBundle;
+  /** 当前最低来回机票 / 人（CNY）：把「想卖的价格」换算成折扣% 的原价锚点；页面从已有套餐推得 */
+  flightRefRoundTripCny?: number | null;
   onCancel: () => void;
   onSubmit: (b: MockBundle) => void;
 }) {
@@ -827,15 +854,27 @@ function NewBundleWizard({
     }
     return [{ kind: 'HOTEL', productName: '岘港凯悦度假村', qty: 3, unitPrice: 1880 }];
   });
-  const [discount, setDiscount] = useState<number | null>(initial?.groundDiscount ?? 500);
-
-  // 套餐价 = 各项合计（含机票），一价全包
+  // 地面合计（机票行 unitPrice=0 → 仅地面；真实全包价含实时机票）。
   const listPrice = useMemo(
     () => items.reduce((s, i) => s + (i.qty ?? 0) * (i.unitPrice ?? 0), 0),
     [items],
   );
-  const discountValue = Math.min(listPrice, Math.max(0, discount ?? 0));
-  const bundlePrice = Math.max(0, listPrice - discountValue);
+  // 原价 / 人（含当前最低来回机票）：地面 + 来回机票×人数，再 / 人。flightRefRoundTripCny 由页面推得。
+  const FLIGHT_PAX = initial?.flightPax ?? 2;
+  const originalAllIn = listPrice + (flightRefRoundTripCny ?? 0) * FLIGHT_PAX;
+  const originalPerPax = Math.round(originalAllIn / Math.max(1, FLIGHT_PAX));
+  // 运营录入「想卖的价格 / 人」(目标起价)；系统反推折扣%。初值 = 现折后价/人(编辑) 或 原价/人(新建·0折)。
+  const [targetPerPax, setTargetPerPax] = useState<number | null>(
+    initial != null
+      ? Math.round((initial.originalPerPaxCny ?? originalPerPax) * (1 - (initial.discountPct ?? 0) / 100))
+      : null,
+  );
+  // 反推折扣%（夹 0..100）：原价为 0 或目标价空 → 0 折。套餐价 = 整个全包价 ×(1 − pct/100)。
+  const pct =
+    originalPerPax > 0 && targetPerPax != null
+      ? Math.min(100, Math.max(0, Math.round((1 - targetPerPax / originalPerPax) * 100)))
+      : 0;
+  const bundlePrice = Math.round(listPrice * (1 - pct / 100)); // 地面折后（参考）
   // 住宿晚数是否可填 = 套餐里是否含 HOTEL 项（不再仅靠是否关联房型）。
   const hasHotelItem = items.some((it) => it.kind === 'HOTEL');
   const firstHotelIdx = items.findIndex((it) => it.kind === 'HOTEL');
@@ -1117,34 +1156,35 @@ function NewBundleWizard({
 
           <div className="rounded-lg border border-slate-100 bg-canvas p-3 space-y-2">
             <div className="flex items-center justify-between text-sm">
-              <span className="text-ink-soft">单买总价</span>
-              <span className="font-medium text-ink nums">¥{listPrice.toLocaleString()}</span>
+              <span className="text-ink-soft">原价 / 人<span className="ml-1 text-xs text-ink-muted">(含当前最低来回机票)</span></span>
+              <span className="font-medium text-ink nums">¥{originalPerPax.toLocaleString()}</span>
             </div>
             <div className="flex items-center justify-between text-sm">
               <span className="text-ink-soft">
-                让利金额
-                <span className="ml-1 text-xs text-ink-muted">(单买总价 − 套餐价)</span>
+                想卖的价格 / 人
+                <span className="ml-1 text-xs text-ink-muted">(目标起价)</span>
               </span>
-              <NumberInput
-                min={0}
-                max={listPrice}
-                className="input w-32 text-right"
-                value={discount}
-                onChange={(n) => setDiscount(n)}
-              />
+              <div className="flex items-center gap-1">
+                <span className="text-ink-muted">¥</span>
+                <NumberInput
+                  min={0}
+                  className="input w-28 text-right"
+                  value={targetPerPax}
+                  onChange={(n) => setTargetPerPax(n)}
+                />
+              </div>
             </div>
             <div className="flex items-center justify-between border-t border-slate-200 pt-2">
-              <span className="text-sm text-ink-soft">套餐价</span>
-              <span className="text-2xl font-semibold text-ink nums">¥{bundlePrice.toLocaleString()}</span>
+              <span className="text-sm text-ink-soft">= 折扣</span>
+              <span className="text-2xl font-semibold text-ink nums">{pct}%</span>
             </div>
             <p className="text-right text-[11px] text-ink-muted">
-              机票价选填：填了→前台显示「含机票起价」；留空（0）→前台显示「机票按出发日实时」。
-              实际收款一律按出发日实时机票价结算，无需逐套餐维护。
+              填你想卖的价 → 系统按「原价(含当前最低机票)」反推折扣 {pct}%。整个全包价随出发日实时浮动 ×(1−{pct}%)，
+              机票自动算入、无需逐套餐维护；前台买家看到「原价划线 → 省 {pct}%、¥X 起」。
             </p>
-            {discountValue > 0 && (
+            {pct > 0 && (
               <div className="text-right text-xs text-emerald-700">
-                客户节省 ¥{discountValue.toLocaleString()}
-                {listPrice > 0 ? `（${((discountValue / listPrice) * 100).toFixed(0)}%）` : ''}
+                整个全包价省 {pct}%
               </div>
             )}
             {!valid && (
@@ -1174,7 +1214,8 @@ function NewBundleWizard({
                   })),
                   listPrice,
                   bundlePrice,
-                  groundDiscount: discountValue,
+                  discountPct: pct,
+                  groundDiscount: 0,
                   flightPax: 2,
                   suitableFor,
                   active: initial?.active ?? true,

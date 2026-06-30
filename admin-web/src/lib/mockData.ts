@@ -832,11 +832,17 @@ export interface MockBundle {
   emoji: string;
   /** 含哪些产品 */
   items: BundleItem[];
-  /** 单卖总价（计算自 items） */
+  /** 单卖总价（计算自 items，全包原价） */
   listPrice: number;
-  /** 套餐价（已让利） */
+  /** 套餐价（= listPrice ×(1 − discountPct/100)） */
   bundlePrice: number;
-  /** 地面服务让利金额 */
+  /** 套餐折扣（百分比 0–100）：整个全包价打折，套餐唯一折扣口径。real API 必带；mock 缺省按 0。 */
+  discountPct?: number;
+  /** 原价（含当前最低来回机票，CNY）；后台目标价↔折扣% 换算用。real API 带；mock 缺省。 */
+  originalAllInCny?: number;
+  /** 每人原价（CNY）。 */
+  originalPerPaxCny?: number;
+  /** [已弃用] 旧固定 CNY 让利，被 discountPct 取代 */
   groundDiscount: number;
   /** 机票对应人数（用于调 /flights/price） */
   flightPax: number;

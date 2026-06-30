@@ -415,6 +415,12 @@ export interface CreateOrderInput {
         quantity: number;
         flightScheduleId: string;
         flightCabin: CabinClass;
+        /**
+         * 套餐机票腿标记：值 = 该机票腿所属套餐的 bundleId。
+         * 套餐下单时两条机票腿（去/回）带此标，后端据此按该套餐 discountPct 对机票腿打折。
+         * 单买机票不带此字段。
+         */
+        bundleId?: string;
         metadata?: Record<string, unknown>;
       }
     | {
@@ -607,6 +613,13 @@ export interface Bundle {
   photo: string | null;
   items: BundleItemData[];
   flightPax: number;
+  /**
+   * 整单折扣百分比（整数 0–100，后端序列化返回）。
+   * 套餐总价 = (实时机票 + 地面 + 加项) × (1 − discountPct/100)。
+   * 旧的固定让利金额 groundDiscount 已弃用（后端不再读取），前台一律用 discountPct。
+   */
+  discountPct: number;
+  /** @deprecated 已弃用的固定让利金额；后端不再读取，前台改用 discountPct（整单 percent off）。 */
   groundDiscount: string;
   suitableFor: string | null;
   isActive: boolean;

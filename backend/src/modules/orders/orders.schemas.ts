@@ -89,6 +89,9 @@ export const flightItemSchema = baseItemSchema.extend({
   kind: z.literal('FLIGHT'),
   flightScheduleId: z.string().min(1),
   flightCabin: z.nativeEnum(CabinClass),
+  // 套餐折扣关联：该机票腿属于哪个套餐（前台套餐下单时打的标）。
+  // 后端据此把该腿按套餐 discountPct 打折（不信前端折扣值，从 DB 读 bundle.discountPct）。
+  bundleId: z.string().min(1).optional(),
 });
 
 export const hotelItemSchema = baseItemSchema.extend({

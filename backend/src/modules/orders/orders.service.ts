@@ -651,6 +651,11 @@ export class OrderService {
     // 循环结束后分摊到本单的经济舱 FLIGHT 航段：每段占用 businessUpgradeCount 个真实商务舱座位。
     let bundleBusinessUpgradeCount = 0;
 
+    // 套餐折扣（bundleId → discountPct 0..100）：循环里从 DB 读，循环后对该套餐的
+    // BUNDLE 行 + 关联 FLIGHT 腿逐行 ×(1−pct/100)，使「整个全包价打折」且各行金额诚实
+    // （航班行=折后机票收入，财务航班毛利不假高）。pct 只从 DB 取，不信前端。
+    const bundleDiscountPct = new Map<string, number>();
+
     for (const item of items) {
       if (item.kind === 'FLIGHT') {
         // 团队议价结算价：整批以谈定的每人结算价覆盖动态/目录机票价。
@@ -664,6 +669,7 @@ export class OrderService {
             amount: Math.round(flightSettlementPriceCny * item.quantity),
             flightScheduleId: item.flightScheduleId,
             flightCabin: item.flightCabin,
+            bundleId: item.bundleId,
             metadata: {
               ...(item.metadata ?? {}),
               // 审计：标记本行价格来自团队议价结算价（非动态价）
@@ -687,6 +693,7 @@ export class OrderService {
           amount: pricing.totalPrice,
           flightScheduleId: item.flightScheduleId,
           flightCabin: item.flightCabin,
+          bundleId: item.bundleId,
           metadata: {
             ...(item.metadata ?? {}),
             dateRank: pricing.dateRank,
@@ -778,6 +785,8 @@ export class OrderService {
           select: {
             items: true,
             groundDiscount: true,
+            // 套餐折扣（%）：整个全包价(机票+地面+加项) × (1 − discountPct/100)；下方逐行打折
+            discountPct: true,
             isActive: true,
             hotelRoomTypeId: true,
             hotelNights: true,
@@ -796,6 +805,8 @@ export class OrderService {
         });
         if (!bundle) throw new NotFoundError(`套餐 ${item.bundleId} 不存在`);
         if (!bundle.isActive) throw new BadRequestError('套餐已下架');
+        // 记下该套餐折扣（%），循环后对本套餐的 BUNDLE 行 + 关联 FLIGHT 腿逐行打折。
+        if (item.bundleId) bundleDiscountPct.set(item.bundleId, bundle.discountPct ?? 0);
         // 住宿晚数：单一权威口径（hotelNights ?? 首个 HOTEL 组件 qty ?? 默认）。
         // 一次解析，喂给酒店盖章 + 升级 add-on，保证回程日期 / 单人入住房差 / HOTEL 地面价口径一致。
         const nights = resolveBundleNights(bundle.items, bundle.hotelNights);
@@ -818,7 +829,8 @@ export class OrderService {
         // 地面部分价（机票部分留给 FLIGHT item 单独动态定价）：
         //   HOTEL 行（unitPrice=每间每晚, qty=晚数）按 unitPrice×qty×rooms 收费 → 套餐价随房间数涨；
         //   非 HOTEL 地面行（TRANSFER/VISA 等）固定 unitPrice×qty×1（不随房间数变）。
-        //   bundleGround = Σ(HOTEL×rooms) + Σ(其它非机票) − groundDiscount
+        //   bundleGround = Σ(HOTEL×rooms) + Σ(其它非机票)。折扣不在此扣 —— 改由循环后的
+        //   percent-off 后处理对「机票腿 + 套餐行」整体 ×(1−discountPct/100)（旧的固定 groundDiscount 已弃用）。
         const bundleItems = (bundle.items as Array<{ kind: string; qty: number; unitPrice: number }>) ?? [];
         const groundTotal = bundleItems
           .filter((b) => b.kind !== 'FLIGHT')
@@ -826,7 +838,7 @@ export class OrderService {
             const roomFactor = b.kind === 'HOTEL' ? rooms : 1;
             return s + b.qty * b.unitPrice * roomFactor;
           }, 0);
-        const bundleUnitPrice = Math.max(0, Math.round(groundTotal - Number(bundle.groundDiscount)));
+        const bundleUnitPrice = Math.max(0, Math.round(groundTotal));
         // 套餐关联酒店 → 把房型+入住日期盖到订单行（房控板自动计入套餐占房）。
         // metadata 缺失/异常时只是不盖章，绝不阻断下单。
         const hotelStamp = resolveBundleHotelStamp(bundle, item.metadata, nights);
@@ -898,6 +910,20 @@ export class OrderService {
         leg.businessUpgradeCount = bundleBusinessUpgradeCount;
         leg.metadata = { ...(leg.metadata ?? {}), businessUpgradeCount: bundleBusinessUpgradeCount };
       }
+    }
+
+    // ── 套餐折扣（percent off）：整个全包价 ×(1−pct/100) ──
+    // 逐行对该套餐的 BUNDLE 行 + 关联 FLIGHT 腿打折，使 Σ(行金额) = 全包价×(1−pct)，且各行金额诚实：
+    //   航班行 = 折后机票收入（财务航班毛利按折后算，不假高）；套餐行 = 折后地面+加项。
+    // 扣座/锁位/查重均按 quantity（不受金额影响）。pct 仅来自 DB（不信前端）。折扣在升舱拆座之后做，不动 quantity。
+    for (const p of priced) {
+      if (p.kind !== 'BUNDLE' && p.kind !== 'FLIGHT') continue;
+      const pct = p.bundleId ? bundleDiscountPct.get(p.bundleId) ?? 0 : 0;
+      if (pct <= 0) continue;
+      const factor = (100 - pct) / 100;
+      p.amount = Math.round(p.amount * factor);
+      p.unitPrice = Math.round(p.unitPrice * factor);
+      p.metadata = { ...(p.metadata ?? {}), bundleDiscountPct: pct };
     }
 
     return priced;

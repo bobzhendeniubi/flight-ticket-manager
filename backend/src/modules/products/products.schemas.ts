@@ -173,6 +173,9 @@ export const createBundleBodySchema = z.object({
   photo: z.string().url().optional(),
   items: z.array(bundleItemSchema).min(1).max(20),
   flightPax: z.number().int().min(1).max(20).default(1),
+  // 套餐折扣（百分比 0–100）：整个全包价 ×(1 − discountPct/100)。套餐唯一折扣口径。
+  discountPct: z.number().int().min(0).max(100).default(0),
+  // [已弃用] 旧固定 CNY 让利；被 discountPct 取代，保留以兼容旧表单提交。
   groundDiscount: z.number().nonnegative().default(0),
   suitableFor: z.string().max(100).optional(),
   // 套餐关联酒店房型（房控板计入套餐占房）；null = 解除关联

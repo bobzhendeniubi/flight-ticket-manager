@@ -9,6 +9,7 @@ import { prisma } from '../../db/prisma.js';
 import { NotFoundError } from '../../lib/errors.js';
 import { ReviewsService, type ProductRatingAggregate } from '../reviews/reviews.service.js';
 import { firstHotelQty } from './bundle-nights.js';
+import { getCheapestRoundTripEconomyCny, computeBundleOriginalAllInCny } from './bundle-pricing.js';
 
 /** hotelNights 的 DB/zod 取值上限（schema: int 1..30）。 */
 const HOTEL_NIGHTS_MAX = 30;
@@ -420,7 +421,9 @@ export class ProductsService {
       include: BUNDLE_ROOM_INCLUDE,
     });
     const ratings = await this.reviews.getAggregates(ProductReviewType.BUNDLE, rows.map((r) => r.id));
-    return rows.map((b) => serializeBundle(b, ratings.get(b.id) ?? ZERO_RATING));
+    // 当前最低来回机票（缓存），喂给每个套餐算「原价（含机票）」，供后台目标价↔折扣% 换算。
+    const flightRef = await getCheapestRoundTripEconomyCny(new Date());
+    return rows.map((b) => serializeBundle(b, ratings.get(b.id) ?? ZERO_RATING, flightRef));
   }
 
   async getBundle(id: string) {
@@ -430,7 +433,8 @@ export class ProductsService {
     });
     if (!b) throw new NotFoundError('套餐不存在');
     const ratings = await this.reviews.getAggregates(ProductReviewType.BUNDLE, [id]);
-    return serializeBundle(b, ratings.get(id) ?? ZERO_RATING);
+    const flightRef = await getCheapestRoundTripEconomyCny(new Date());
+    return serializeBundle(b, ratings.get(id) ?? ZERO_RATING, flightRef);
   }
 
   async createBundle(body: CreateBundleBody) {
@@ -454,6 +458,7 @@ export class ProductsService {
           photo: body.photo,
           items: body.items as unknown as Prisma.InputJsonValue,
           flightPax: body.flightPax,
+          discountPct: body.discountPct,
           groundDiscount: new Prisma.Decimal(body.groundDiscount),
           suitableFor: body.suitableFor,
           hotelRoomTypeId: body.hotelRoomTypeId ?? null,
@@ -499,6 +504,7 @@ export class ProductsService {
     if (body.photo !== undefined) data.photo = body.photo;
     if (body.items !== undefined) data.items = body.items as unknown as Prisma.InputJsonValue;
     if (body.flightPax !== undefined) data.flightPax = body.flightPax;
+    if (body.discountPct !== undefined) data.discountPct = body.discountPct;
     if (body.groundDiscount !== undefined) data.groundDiscount = new Prisma.Decimal(body.groundDiscount);
     if (body.suitableFor !== undefined) data.suitableFor = body.suitableFor;
     if (body.hotelRoomTypeId !== undefined) data.hotelRoomTypeId = body.hotelRoomTypeId;
@@ -612,10 +618,24 @@ function serializeVisa(
   };
 }
 
-function serializeBundle(b: BundleWithRoom, rating: ProductRatingAggregate = ZERO_RATING) {
+function serializeBundle(
+  b: BundleWithRoom,
+  rating: ProductRatingAggregate = ZERO_RATING,
+  flightRefRoundTripCny: number | null = null,
+) {
   const { hotelRoomType, ...rest } = b;
+  // 原价（含当前最低来回机票）：后台「想卖的价格」录入据此反推 discountPct + 展示「原价划线/省X%」。
+  // 估算锚点，不参与买家实际计价（买家价 = 实时全包 ×(1 − discountPct/100)）。
+  const bItems = (b.items as Array<{ kind: string; qty: number; unitPrice: number }>) ?? [];
+  const originalAllInCny = computeBundleOriginalAllInCny(bItems, b.flightPax, flightRefRoundTripCny);
+  const originalPerPaxCny = Math.round(originalAllInCny / Math.max(1, b.flightPax));
   return {
     ...rest,
+    // 套餐折扣（%）：整个全包价 ×(1 − discountPct/100)，前台据此展示原价划线/省X%
+    discountPct: b.discountPct,
+    // 原价（含当前最低来回机票）+ 每人原价；后台目标价↔折扣% 换算用
+    originalAllInCny,
+    originalPerPaxCny,
     groundDiscount: b.groundDiscount.toString(),
     // 可选升级加价（CNY，整数，server-priced add-on）+ 航段数；前端据此报价升级项
     singleSupplementCnyPerNight: b.singleSupplementCnyPerNight,
