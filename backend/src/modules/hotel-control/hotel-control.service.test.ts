@@ -120,6 +120,66 @@ describe('getAlerts', () => {
   });
 });
 
+describe('getAlerts sharedOddNear（拼房落单临近推送）', () => {
+  const rt = { hotelRoomType: { hotelId: 'h1', hotel: { name: '美溪海滩酒店' } } };
+
+  /**
+   * 拼房落单场景专用 fake client：包房 5 间覆盖 today..today+29，
+   * 无班次/乘客（overCapacity 不参与），占房行由用例注入。
+   */
+  function sharedClient(orderItems: unknown[]): PrismaClient {
+    return {
+      hotelBlockPeriod: {
+        findMany: vi.fn().mockResolvedValue([
+          {
+            hotelId: 'h1',
+            dateFrom: day(0),
+            dateTo: day(29),
+            rooms: 5,
+            unitPrice: null,
+            hotel: { name: '美溪海滩酒店' },
+          },
+        ]),
+      },
+      orderItem: { findMany: vi.fn().mockResolvedValue(orderItems) },
+      flightSchedule: { findMany: vi.fn().mockResolvedValue([]) },
+      passenger: { count: vi.fn().mockResolvedValue(0) },
+    } as unknown as PrismaClient;
+  }
+
+  it('临近日（窗口内）拼房客奇数 → 报，且带酒店/日期/人数', async () => {
+    // D+3 三位拼房客（奇数，落单）——入住临近（< 7 天）
+    const client = sharedClient([
+      { hotelCheckIn: day(3), hotelCheckOut: day(4), roomsBilled: 0.5, ...rt },
+      { hotelCheckIn: day(3), hotelCheckOut: day(4), roomsBilled: 0.5, ...rt },
+      { hotelCheckIn: day(3), hotelCheckOut: day(4), roomsBilled: 0.5, ...rt },
+    ]);
+    const alerts = await getAlerts(30, client);
+    expect(alerts.sharedOddNear).toEqual([
+      { hotelId: 'h1', hotelName: '美溪海滩酒店', date: dayStr(3), sharedHalfCount: 3 },
+    ]);
+  });
+
+  it('远期日（窗口外）拼房客奇数 → 不报', async () => {
+    // D+10 一位拼房客（奇数）——超出 7 天窗口
+    const client = sharedClient([
+      { hotelCheckIn: day(10), hotelCheckOut: day(11), roomsBilled: 0.5, ...rt },
+    ]);
+    const alerts = await getAlerts(30, client);
+    expect(alerts.sharedOddNear).toEqual([]);
+  });
+
+  it('临近日拼房客偶数 → 不报（两两成对，无人落单）', async () => {
+    // D+2 两位拼房客（偶数）
+    const client = sharedClient([
+      { hotelCheckIn: day(2), hotelCheckOut: day(3), roomsBilled: 0.5, ...rt },
+      { hotelCheckIn: day(2), hotelCheckOut: day(3), roomsBilled: 0.5, ...rt },
+    ]);
+    const alerts = await getAlerts(30, client);
+    expect(alerts.sharedOddNear).toEqual([]);
+  });
+});
+
 describe('expandSharedHalfByDate', () => {
   const dates = [dayStr(0), dayStr(1), dayStr(2)];
 

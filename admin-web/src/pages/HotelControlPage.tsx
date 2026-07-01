@@ -432,6 +432,21 @@ function fmtMonthDay(date: string): string {
   return `${Number(m)}/${Number(d)}`;
 }
 
+/**
+ * 拼房落单临近提醒 — 后端 alerts 新增（附加字段，向后兼容）。
+ * api.ts 的 HotelControlAlerts 尚未声明该列，这里按可选读取，缺省即降级不显示。
+ */
+type SharedOddNear = Array<{
+  hotelId: string;
+  hotelName: string;
+  date: string;
+  sharedHalfCount: number;
+}>;
+function readSharedOddNear(alerts: unknown): SharedOddNear {
+  const a = alerts as { sharedOddNear?: SharedOddNear };
+  return Array.isArray(a.sharedOddNear) ? a.sharedOddNear : [];
+}
+
 function AlertsBanner({ token }: { token: string }) {
   const [alerts, setAlerts] = useState<HotelControlAlerts | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -453,15 +468,19 @@ function AlertsBanner({ token }: { token: string }) {
     };
   }, [token]);
 
+  const sharedOddNear = alerts ? readSharedOddNear(alerts) : [];
   const total = alerts
-    ? alerts.oversold.length + alerts.surplusSoon.length + alerts.overCapacitySchedules.length
+    ? alerts.oversold.length +
+      alerts.surplusSoon.length +
+      alerts.overCapacitySchedules.length +
+      sharedOddNear.length
     : 0;
 
   return (
     <section className="card">
       <div className="flex items-center justify-between">
         <h2 className="flex items-center gap-2 text-sm font-semibold text-ink">
-          提醒线（超卖加房 / 富余退房 / 班次超开票上限）
+          提醒线（超卖加房 / 富余退房 / 班次超开票上限 / 拼房落单）
           {alerts != null && total > 0 && (
             <span className="badge-danger">{total}</span>
           )}
@@ -509,6 +528,16 @@ function AlertsBanner({ token }: { token: string }) {
                 >
                   <span className="font-semibold">票务 ⚠</span> {a.flightNumber}{' '}
                   {fmtMonthDay(a.departureDate)} 已收客 {a.paxCount} 人 · 超过开票上限
+                </div>
+              ))}
+              {sharedOddNear.map((a, i) => (
+                <div
+                  key={`so-${i}`}
+                  className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700"
+                >
+                  <span className="font-semibold">拼房落单 ⚠</span> {a.hotelName}{' '}
+                  {fmtMonthDay(a.date)} 有 {a.sharedHalfCount} 位拼房客（奇数）临近出发仍未配对 ·
+                  补单房差或另配
                 </div>
               ))}
             </>

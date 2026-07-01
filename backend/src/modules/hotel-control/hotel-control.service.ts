@@ -452,7 +452,7 @@ export async function getBoard(
   return { dates, hotels };
 }
 
-// ── 提醒线（超卖加房 / 富余退房 / 班次超开票上限）────────────────────────
+// ── 提醒线（超卖加房 / 富余退房 / 班次超开票上限 / 拼房落单临近）──────────
 export interface HotelControlAlerts {
   /** 余量 < 0：占房超过包房，提醒加房 */
   oversold: Array<{
@@ -471,6 +471,16 @@ export interface HotelControlAlerts {
     departureDate: string; // YYYY-MM-DD
     paxCount: number;
   }>;
+  /**
+   * 入住临近（SHARED_ODD_NEAR_DAYS 天内）当晚拼房客为奇数：有 1 位无法配对，
+   * 需趁出发前补单房差或另配。被动的销控板「拼」角标之外的主动推送。
+   */
+  sharedOddNear: Array<{
+    hotelId: string;
+    hotelName: string;
+    date: string; // YYYY-MM-DD（入住晚）
+    sharedHalfCount: number; // 当晚拼房客总人数（奇数）
+  }>;
 }
 
 /** 富余提醒窗口（天）— 距今 3 天内还剩包房就该考虑退房了。*/
@@ -478,6 +488,9 @@ const SURPLUS_WINDOW_DAYS = 3;
 
 /** 班次超员检查窗口（天）。*/
 const SCHEDULE_ALERT_WINDOW_DAYS = 30;
+
+/** 拼房客落单主动提醒窗口（天）— 入住在此天数内且当晚拼房客为奇数就推送。*/
+const SHARED_ODD_NEAR_DAYS = 7;
 
 /**
  * 按需计算提醒线（无 cron）：
@@ -496,7 +509,12 @@ export async function getAlerts(
 
   const oversold: HotelControlAlerts['oversold'] = [];
   const surplusSoon: HotelControlAlerts['surplusSoon'] = [];
+  const sharedOddNear: HotelControlAlerts['sharedOddNear'] = [];
   const surplusCutoff = new Date(fromMs + SURPLUS_WINDOW_DAYS * DAY_MS)
+    .toISOString()
+    .slice(0, 10);
+  // 拼房落单临近窗口：入住晚在 [today, today+SHARED_ODD_NEAR_DAYS) 内即算「临近」。
+  const sharedOddCutoff = new Date(fromMs + SHARED_ODD_NEAR_DAYS * DAY_MS)
     .toISOString()
     .slice(0, 10);
   for (const hotel of board.hotels) {
@@ -517,6 +535,16 @@ export async function getAlerts(
       }
       if (date < surplusCutoff && block > 0 && remaining > 0) {
         surplusSoon.push({ hotelName: hotel.hotelName, date, surplus: remaining });
+      }
+      // 拼房客奇数（有 1 位落单）且入住临近 → 主动提醒补单房差 / 另配
+      const shared = hotel.rows.sharedHalfCount[i];
+      if (date < sharedOddCutoff && shared > 0 && shared % 2 === 1) {
+        sharedOddNear.push({
+          hotelId: hotel.hotelId,
+          hotelName: hotel.hotelName,
+          date,
+          sharedHalfCount: shared,
+        });
       }
     }
   }
@@ -557,7 +585,7 @@ export async function getAlerts(
     }
   });
 
-  return { oversold, surplusSoon, overCapacitySchedules };
+  return { oversold, surplusSoon, overCapacitySchedules, sharedOddNear };
 }
 
 // ── 远期视图（按日期跨酒店合计）──────────────────────────────────────────

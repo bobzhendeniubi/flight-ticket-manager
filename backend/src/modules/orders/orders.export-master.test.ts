@@ -153,7 +153,7 @@ function fixtureRoundTripBundle(): OrderForMasterExport {
  * 没有独立 kind:'HOTEL' / kind:'VISA' 行（与 orders.service BUNDLE 分支的真实写入形态一致）。
  *   - 1 位乘客，无分房分配（roomAssignment 空）→ 有酒店但未分房，应显示"未分房"
  *   - 订单级 visaStatus 缺省 → 签证状态回落 BUNDLE 行上的 VISA_APPLICATION 任务
- *   - 签证费并入套餐价，不单列金额 → 签证金额 0
+ *   - 套餐定义 bundle.items 含 VISA 组件（越南 E-visa ¥220）→ 签证金额从套餐挂牌价捞出（非 0）
  */
 function fixtureBundleHotelStampedOnBundleItem(): OrderForMasterExport {
   return {
@@ -208,6 +208,14 @@ function fixtureBundleHotelStampedOnBundleItem(): OrderForMasterExport {
         flightSchedule: null,
         hotelRoomType: { name: '海景房', hotel: { name: '岘港四季度假村' } },
         visa: null,
+        // 套餐定义：含签证组件（越南 E-visa 挂牌价 ¥220 × 1）+ 其它组件（用于验证只加总 VISA）
+        bundle: {
+          items: [
+            { kind: 'FLIGHT', productName: 'QH 澳门↔岘港 来回经济舱 × 1 人', qty: 1, unitPrice: 0 },
+            { kind: 'HOTEL', productName: '岘港四季度假村 海景房 4 晚', qty: 4, unitPrice: 3680 },
+            { kind: 'VISA', productName: '越南 E-visa 30 天', qty: 1, unitPrice: 220 },
+          ],
+        },
         fulfillmentTasks: [{ type: 'VISA_APPLICATION', status: 'IN_PROGRESS' }],
       },
     ],
@@ -308,8 +316,8 @@ describe('orderToMasterRows', () => {
     expect(r1.hotelName).toBe('岘港四季度假村');
     // 有酒店但该乘客未分房 → "未分房"（此前 hasHotel 只认 HOTEL 行会永远留空）
     expect(r1.distribution).toBe('未分房');
-    // 套餐单签证费并入套餐价、不可拆分 → 签证金额留 0
-    expect(r1.visaAmount).toBe(0);
+    // 套餐签证费并入套餐价，但从套餐定义 items 的 VISA 组件挂牌价捞出 → 220×1 / 1 人 = 220（非 0）
+    expect(r1.visaAmount).toBe(220);
     // 签证履约任务挂在 BUNDLE 行上、订单级 visaStatus 缺省 → 回落任务状态"处理中"
     expect(r1.visaStatus).toBe('处理中');
   });

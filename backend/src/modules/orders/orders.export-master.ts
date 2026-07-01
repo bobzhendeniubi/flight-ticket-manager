@@ -22,6 +22,7 @@ import ExcelJS from 'exceljs';
 import type { Prisma, PrismaClient } from '@prisma/client';
 import { OrderStatus } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
+import type { BundleItemJson } from '../../lib/json-types.js';
 import { toAlpha3 } from './nationality.js';
 import { parseRoomGroups } from './orders.export-room-allocation.js';
 import { pnrName } from './orders.export-templates.js';
@@ -253,6 +254,8 @@ export const MASTER_EXPORT_INCLUDE = {
       },
       hotelRoomType: { select: { name: true, hotel: { select: { name: true } } } },
       visa: { select: { visaName: true, visaType: true } },
+      // 套餐(BUNDLE)行关联的套餐定义：取 items JSON 以捞出签证组件的挂牌价（qty×unitPrice）。
+      bundle: { select: { items: true } },
       fulfillmentTasks: { select: { type: true, status: true } },
     },
   },
@@ -323,9 +326,24 @@ export function orderToMasterRows(order: OrderForMasterExport): Omit<MasterRow, 
   const settled = paid >= total ? '是' : '否';
 
   // ── 签证：金额 + 状态 ──
-  // 金额只从独立 VISA 行取（套餐单的签证费已并入套餐价、不可拆分，故套餐单签证金额留 0）。
+  // 独立 VISA 行的实收金额（客人单买签证时的口径）。
   const visaItems = order.items.filter((it) => it.kind === 'VISA');
-  const visaAmountOrder = visaItems.reduce((s, it) => s + dec(it.amount), 0);
+  const visaAmountStandalone = visaItems.reduce((s, it) => s + dec(it.amount), 0);
+  // 套餐(BUNDLE)行：签证费并入折后套餐价、订单行不单列，但套餐定义 items JSON 里仍有
+  // 签证组件的挂牌价。此处取套餐定义中 VISA 组件的挂牌价（qty×unitPrice）补上，
+  // 让套餐单的签证金额不再显示 0。口径说明：客人付的是折后套餐总价，本列反映的是
+  // 套餐里签证部分的「挂牌价」（list price），仅供运营核对签证分摊，非实收拆分额。
+  const visaAmountBundle = order.items.reduce((s, it) => {
+    if (it.kind !== 'BUNDLE' || !it.bundle) return s;
+    const components = Array.isArray(it.bundle.items)
+      ? (it.bundle.items as unknown as BundleItemJson[])
+      : [];
+    const bundleVisa = components
+      .filter((c) => c && c.kind === 'VISA')
+      .reduce((acc, c) => acc + (Number(c.qty) || 0) * (Number(c.unitPrice) || 0), 0);
+    return s + bundleVisa;
+  }, 0);
+  const visaAmountOrder = visaAmountStandalone + visaAmountBundle;
   // 状态：订单级签证状态优先，回落到任意订单行的签证履约任务。
   // 不限 kind —— 套餐(BUNDLE)含签证时 VISA_APPLICATION 任务挂在 BUNDLE 行上（无独立 VISA 行），
   // 只从 VISA 行找会让套餐含签证单的签证状态漏显；跨全部行找可覆盖套餐单。
