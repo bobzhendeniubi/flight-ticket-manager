@@ -1039,6 +1039,7 @@ model Passenger {
   chineseName          String?   // 中文姓名（OCR 识别或手工填写）
   passportIssueDate    DateTime? @db.Date // 护照签发日期
   passportIssueCountry String? // 颁发国 ISO-2，如 CHN
+  passportIssuePlace   String? // 护照签发地点（城市/机关文本，OCR 识别或手填，选填）
   passportExpiry       DateTime? @db.Date
 
   // ── 签证（已签发的，给出票/接送参考）──

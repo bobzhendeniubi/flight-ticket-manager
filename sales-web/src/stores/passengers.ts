@@ -22,6 +22,11 @@ export interface OcrPassenger {
   gender?: 'M' | 'F' | 'X';
   passportExpiry?: string; // YYYY-MM-DD
   passportIssueCountry?: string; // ISO-2
+  /**
+   * 护照签发地点（自由文本，如「广东省广州市」）—— 与 ISO-2 签发国 passportIssueCountry 区分开。
+   * 仅 OCR 命中时带出；全 optional，老缓存/未命中时缺失。
+   */
+  passportIssuePlace?: string;
   /** OCR 时间戳，前端展示用 */
   capturedAt: number;
 }

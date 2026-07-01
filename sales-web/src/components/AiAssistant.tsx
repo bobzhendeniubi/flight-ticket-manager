@@ -124,6 +124,7 @@ export function AiAssistant() {
         gender: result.suggested.gender,
         passportExpiry: result.suggested.passportExpiry,
         passportIssueCountry: result.suggested.passportIssueCountry,
+        passportIssuePlace: result.suggested.passportIssuePlace,
         capturedAt: Date.now(),
       };
       addPassenger(ocr);

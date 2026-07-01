@@ -48,6 +48,7 @@ export const passengerInputSchema = z.object({
   chineseName: z.string().max(120).optional(),                                  // 中文姓名
   passportIssueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),       // 护照签发日期
   passportIssueCountry: z.string().length(2).optional(),
+  passportIssuePlace: z.string().max(120).optional(),                          // 护照签发地点（城市/机关文本，OCR 或手填，选填）
   passportExpiry: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
 
   // 签证

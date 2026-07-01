@@ -38,6 +38,11 @@ interface PassengerForm {
   passportExpiry?: string; // YYYY-MM-DD
   passportIssueCountry?: string; // ISO-2
   /**
+   * 护照签发地点（自由文本，如「广东省广州市」）——与 ISO-2 签发国 passportIssueCountry 区分开。
+   * OCR 命中时自动填；手填选填，永不阻断提交。空 = 未采集，提交时省略，绝不发 ''。
+   */
+  passportIssuePlace?: string;
+  /**
    * 护照图片 data-URL——上传/OCR 时顺带捕获，随下单一起传给后端落库。
    * 超过 6MB 时前端先压缩（canvas 等比缩放 + JPEG 降质）再存，避免后端 413。
    */
@@ -162,6 +167,7 @@ export function CheckoutPage() {
           gender?: 'M' | 'F' | 'X';
           passportExpiry?: string;
           passportIssueCountry?: string;
+          passportIssuePlace?: string;
         }>;
         if (ocrList.length > 0) {
           return ocrList.map((p) => ({
@@ -174,6 +180,7 @@ export function CheckoutPage() {
             gender: p.gender,
             passportExpiry: p.passportExpiry,
             passportIssueCountry: p.passportIssueCountry,
+            passportIssuePlace: p.passportIssuePlace,
           }));
         }
       }
@@ -409,6 +416,8 @@ export function CheckoutPage() {
         ...(p.gender ? { gender: p.gender } : {}),
         ...(p.passportExpiry ? { passportExpiry: p.passportExpiry } : {}),
         ...(p.passportIssueCountry ? { passportIssueCountry: p.passportIssueCountry } : {}),
+        // 护照签发地点（自由文本）：有值才传，空/undefined 省略
+        ...(p.passportIssuePlace?.trim() ? { passportIssuePlace: p.passportIssuePlace.trim() } : {}),
         // 护照图落库：有图才传，空串同样省略（压缩兜底返回 '' 时）
         ...(p.passportPhotoUrl ? { passportPhotoUrl: p.passportPhotoUrl } : {}),
         // 中文姓名 / 护照签发日期：有值才传，不发空串（后端正则校验 passportIssueDate）
@@ -966,6 +975,7 @@ function PassengerCard({
           gender: result.suggested.gender ?? passenger.gender,
           passportExpiry: result.suggested.passportExpiry ?? passenger.passportExpiry,
           passportIssueCountry: result.suggested.passportIssueCountry ?? passenger.passportIssueCountry,
+          passportIssuePlace: result.suggested.passportIssuePlace ?? passenger.passportIssuePlace,
           // 护照图落库：OCR 成功时一并存入
           ...(photoDataUrl ? { passportPhotoUrl: photoDataUrl } : {}),
         });
@@ -1117,10 +1127,19 @@ function PassengerCard({
             <option value="TW">中国台湾 TW</option>
           </select>
         </div>
+        <div>
+          <label className="label text-xs">护照签发地点（选填）</label>
+          <input
+            className="input"
+            value={passenger.passportIssuePlace ?? ''}
+            onChange={(e) => onChange({ passportIssuePlace: e.target.value })}
+            placeholder="如 广东省广州市（选填）"
+          />
+        </div>
       </div>
       {/* OCR 已识别的护照附加信息（性别 / 有效期 / 签发地）——只读展示，不作必填字段。
           只在上传护照 OCR 命中 MRZ 时出现；没识别到就不显示，手填用户完全看不到、也不用管。 */}
-      {(passenger.gender || passenger.passportExpiry || passenger.passportIssueCountry) && (
+      {(passenger.gender || passenger.passportExpiry || passenger.passportIssueCountry || passenger.passportIssuePlace) && (
         <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 rounded-xl border border-brand-200/70 bg-brand-50/50 px-3 py-2 text-xs text-brand-800">
           <span className="inline-flex items-center gap-1 font-medium">
             <Icon name="check" className="h-3.5 w-3.5" /> OCR 已识别
@@ -1129,7 +1148,9 @@ function PassengerCard({
             <span>性别 {passenger.gender === 'M' ? '男' : passenger.gender === 'F' ? '女' : '未注明'}</span>
           )}
           {passenger.passportExpiry && <span className="nums">护照有效期 {passenger.passportExpiry}</span>}
-          {passenger.passportIssueCountry && <span>签发地 {passenger.passportIssueCountry}</span>}
+          {(passenger.passportIssuePlace || passenger.passportIssueCountry) && (
+            <span>签发地 {passenger.passportIssuePlace || passenger.passportIssueCountry}</span>
+          )}
         </div>
       )}
     </div>

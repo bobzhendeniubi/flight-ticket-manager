@@ -455,7 +455,7 @@ function orderToFullRows(order: OrderForTemplateExport, ctx: OrderContext): Omit
     visaStatus: visaTask ? FULFILLMENT_STATUS_LABEL[visaTask.status] ?? visaTask.status : '',
     visaOption,
     visaNote: '',
-    passportIssuePlace: p.passportIssueCountry ?? '',
+    passportIssuePlace: p.passportIssuePlace ?? p.passportIssueCountry ?? '',
     placeOfBirth: p.placeOfBirth ?? '',
     orderNumber: order.orderNumber,
     cabin: ctx.cabinLabels,

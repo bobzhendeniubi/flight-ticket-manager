@@ -1486,6 +1486,68 @@ describe('订单签证状态 + 结构化备注四栏', () => {
   });
 });
 
+// ── 护照签发地点 passportIssuePlace（OCR 或手填，选填）────────────────────
+// 自由文本（如"广东省广州市"），区别于 ISO-2 颁发国 passportIssueCountry。
+describe('乘客护照签发地点 passportIssuePlace', () => {
+  const basePassenger = {
+    fullName: '张三',
+    documentNumber: 'E12345678',
+    dateOfBirth: '1990-01-01',
+  };
+
+  it('passengerInputSchema 受理 passportIssuePlace 自由文本（≤120 字）', () => {
+    const parsed = createOrderBodySchema.parse({
+      contactName: '张三',
+      contactPhone: '13800000000',
+      items: [{ kind: 'VISA', description: '泰国签证', quantity: 1, unitPrice: 300 }],
+      passengers: [{ ...basePassenger, passportIssuePlace: '广东省广州市' }],
+    });
+    expect(parsed.passengers[0].passportIssuePlace).toBe('广东省广州市');
+  });
+
+  it('passportIssuePlace 缺省 → 解析通过（选填，向后兼容手填/老客户端）', () => {
+    const parsed = createOrderBodySchema.parse({
+      contactName: '张三',
+      contactPhone: '13800000000',
+      items: [{ kind: 'VISA', description: '泰国签证', quantity: 1, unitPrice: 300 }],
+      passengers: [basePassenger],
+    });
+    expect(parsed.passengers[0].passportIssuePlace).toBeUndefined();
+  });
+
+  it('passportIssuePlace 超 120 字 → 拒绝', () => {
+    expect(() =>
+      createOrderBodySchema.parse({
+        contactName: '张三',
+        contactPhone: '13800000000',
+        items: [{ kind: 'VISA', description: '泰国签证', quantity: 1, unitPrice: 300 }],
+        passengers: [{ ...basePassenger, passportIssuePlace: '市'.repeat(121) }],
+      }),
+    ).toThrow();
+  });
+
+  it('getOrder：serializer 透传乘客 passportIssuePlace（passengers select=true，读路径不剥字段）', async () => {
+    const service = new OrderService();
+    mockPrisma.order.findUnique.mockResolvedValue(
+      fakeFullOrder({
+        userId: 'someone-else',
+        passengers: [
+          {
+            id: 'px1',
+            fullName: '张三',
+            passportIssueCountry: 'CN',
+            passportIssuePlace: '广东省广州市',
+          },
+        ],
+      }),
+    );
+    const result = await service.getOrder('ord1', { userId: 'admin1', role: 'ADMIN' });
+    expect(result.passengers[0].passportIssuePlace).toBe('广东省广州市');
+    // 与 ISO-2 颁发国是两个独立字段，各自透传
+    expect(result.passengers[0].passportIssueCountry).toBe('CN');
+  });
+});
+
 // ── 住宿逐晚展开：buildStayNightDates ────────────────────────────────────
 // [checkIn, checkOut) 半开区间展开为逐晚 YYYY-MM-DD（UTC date-only）。
 // 防御：反向 / 相等 / 超大跨度 → []（调用方按"无从校验"跳过，不阻断下单）。

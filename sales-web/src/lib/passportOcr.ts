@@ -53,10 +53,14 @@ export interface OcrResult {
      *   passportExpiry      = MRZ 有效期（YYYY-MM-DD）
      *   passportIssueCountry= MRZ 签发国转 ISO-2（映射不到 ISO-2 时省略，绝不发 3 字母给后端）
      * 非 MRZ 兜底路径一律 undefined（手填只保留姓名/护照号/出生日期/国籍 4 项）。
+     *
+     * passportIssuePlace（护照签发地点，自由文本，如「广东省广州市」）与 ISO-2 签发国区分开：
+     * 浏览器端 tesseract 兜底路径不抽取，仅承载后端 OCR（Qwen）返回值透传给结账页；缺失则 undefined。
      */
     gender?: 'M' | 'F' | 'X';
     passportExpiry?: string;
     passportIssueCountry?: string;
+    passportIssuePlace?: string;
   };
   /** 识别耗时（ms） */
   elapsedMs: number;

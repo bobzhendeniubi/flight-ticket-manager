@@ -285,6 +285,8 @@ export interface OrderPassengerInput {
   chineseName?: string;
   /** 护照签发日期 YYYY-MM-DD（可选；OCR 能识别时带出） */
   passportIssueDate?: string;
+  /** 护照签发地点（自由文本，城市/机关；可选；OCR 能识别时带出）。区别于 ISO-2 签发国。 */
+  passportIssuePlace?: string;
   /** 护照有效期 YYYY-MM-DD（可选；OCR 能识别时带出） */
   passportExpiry?: string;
   /** 签证出签日 YYYY-MM-DD（可选） */
@@ -483,6 +485,8 @@ export interface OrderPassenger {
 
   // 护照扩展
   passportIssueCountry?: string | null;
+  /** 护照签发地点（自由文本，城市/机关；区别于 ISO-2 签发国） */
+  passportIssuePlace?: string | null;
   passportExpiry?: string | null;
 
   // 签证
@@ -2397,6 +2401,8 @@ export interface AiOcrSuggested {
   nationality?: string;
   /** ISO-3 签发国 */
   passportIssueCountry?: string;
+  /** 护照签发地点（自由文本，城市/机关；区别于 ISO-2 签发国） */
+  passportIssuePlace?: string;
   passportExpiry?: string;    // YYYY-MM-DD
   /** 护照签发日期（可选字段）*/
   passportIssueDate?: string; // YYYY-MM-DD

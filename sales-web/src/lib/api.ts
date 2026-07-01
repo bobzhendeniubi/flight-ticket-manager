@@ -491,6 +491,11 @@ export interface CreateOrderInput {
     passportExpiry?: string; // YYYY-MM-DD
     passportIssueCountry?: string; // ISO-2
     /**
+     * 护照签发地点（自由文本，如「广东省广州市」）—— 与 ISO-2 签发国 passportIssueCountry 区分开。
+     * OCR 命中或手填时带出；全 optional，空值请省略（不发 ''）。
+     */
+    passportIssuePlace?: string;
+    /**
      * 护照图片 data-URL（≤6MB，前端压缩后传）。
      * 有才传；游客下单同样支持。
      */

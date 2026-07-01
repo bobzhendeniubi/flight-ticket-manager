@@ -59,8 +59,9 @@ async function callQwenOcr(
     '字段：lastName, firstName, fullName, chineseName, documentNumber, ' +
     'dateOfBirth(YYYY-MM-DD), gender(M/F/X), nationality(ISO-3166 alpha-3), ' +
     'passportIssueCountry(ISO-3166 alpha-3), passportExpiry(YYYY-MM-DD), ' +
-    'passportIssueDate(YYYY-MM-DD), placeOfBirth。' +
-    '找不到的字段填 null。优先用 MRZ 机读区提取机读字段，中文姓名/签发日期/出生地用目视区。';
+    'passportIssueDate(YYYY-MM-DD), passportIssuePlace(签发地点/签发机关文本，如"广东省广州市"), ' +
+    'placeOfBirth。' +
+    '找不到的字段填 null。优先用 MRZ 机读区提取机读字段，中文姓名/签发日期/签发地点/出生地用目视区。';
 
   const url = `${cfg.baseUrl.replace(/\/$/, '')}/chat/completions`;
 

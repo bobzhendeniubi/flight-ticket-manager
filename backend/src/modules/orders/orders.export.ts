@@ -239,7 +239,7 @@ function orderToRows(order: OrderForExport): OrderRow[] {
       contactPhone: order.contactPhone,
       chineseName: p.chineseName ?? p.fullName,
       passportIssueDate: fmtDate(p.passportIssueDate),
-      passportIssuePlace: p.passportIssueCountry ?? '',
+      passportIssuePlace: p.passportIssuePlace ?? p.passportIssueCountry ?? '',
       placeOfBirth: p.placeOfBirth ?? '',
       pnrName,
       gender: p.gender ? GENDER_LABEL[p.gender] ?? p.gender : '',

@@ -79,6 +79,8 @@ interface PassengerRow {
   chineseName?: string;
   /** 护照签发日期 YYYY-MM-DD（可选；OCR 填写或手动输入） */
   passportIssueDate?: string;
+  /** 护照签发地点（自由文本，城市/机关；可选；OCR 填写或手动输入）。区别于 ISO-2 签发国。 */
+  passportIssuePlace?: string;
   /** 护照有效期 YYYY-MM-DD（可选；OCR 填写或手动输入） */
   passportExpiry?: string;
   /** 签证出签日 YYYY-MM-DD（可选；手动输入） */
@@ -586,6 +588,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
           if (s.dateOfBirth) patch.dateOfBirth = s.dateOfBirth;
           if (s.chineseName) patch.chineseName = s.chineseName;
           if (s.passportIssueDate) patch.passportIssueDate = s.passportIssueDate;
+          if (s.passportIssuePlace) patch.passportIssuePlace = s.passportIssuePlace;
           if (s.passportExpiry) patch.passportExpiry = s.passportExpiry;
           setPassenger(idx, patch);
           return;
@@ -789,6 +792,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       ...(p.passportPhotoUrl ? { passportPhotoUrl: p.passportPhotoUrl } : {}),
       ...(p.chineseName?.trim() ? { chineseName: p.chineseName.trim() } : {}),
       ...(p.passportIssueDate?.trim() ? { passportIssueDate: p.passportIssueDate.trim() } : {}),
+      ...(p.passportIssuePlace?.trim() ? { passportIssuePlace: p.passportIssuePlace.trim() } : {}),
       ...(p.passportExpiry?.trim() ? { passportExpiry: p.passportExpiry.trim() } : {}),
       ...(p.visaIssueDate?.trim() ? { visaIssueDate: p.visaIssueDate.trim() } : {}),
       ...(p.visaEffectiveDate?.trim() ? { visaEffectiveDate: p.visaEffectiveDate.trim() } : {}),
@@ -1375,12 +1379,13 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                       百分比按签证列是否展示分两套，确保两种模式下 % 之和都不超 100%（叠加
                       护照图/删两列定宽时配合外层 overflow-x-auto，列宽不会被挤崩。） */}
                   <colgroup>
-                    <col style={{ width: showVisaCols ? '12%' : '17%' }} />{/* 姓名 */}
-                    <col style={{ width: showVisaCols ? '12%' : '17%' }} />{/* 护照号 */}
-                    <col style={{ width: showVisaCols ? '10%' : '14%' }} />{/* 出生日期 */}
-                    <col style={{ width: showVisaCols ? '10%' : '14%' }} />{/* 中文姓名 */}
-                    <col style={{ width: showVisaCols ? '10%' : '14%' }} />{/* 护照签发日期 */}
-                    <col style={{ width: showVisaCols ? '10%' : '14%' }} />{/* 护照有效期 */}
+                    <col style={{ width: showVisaCols ? '11%' : '15%' }} />{/* 姓名 */}
+                    <col style={{ width: showVisaCols ? '11%' : '15%' }} />{/* 护照号 */}
+                    <col style={{ width: showVisaCols ? '9%' : '12%' }} />{/* 出生日期 */}
+                    <col style={{ width: showVisaCols ? '9%' : '12%' }} />{/* 中文姓名 */}
+                    <col style={{ width: showVisaCols ? '9%' : '12%' }} />{/* 护照签发日期 */}
+                    <col style={{ width: showVisaCols ? '10%' : '12%' }} />{/* 护照签发地点 */}
+                    <col style={{ width: showVisaCols ? '9%' : '12%' }} />{/* 护照有效期 */}
                     {showVisaCols && <col style={{ width: '12%' }} />}{/* 签证出签日 */}
                     {showVisaCols && <col style={{ width: '12%' }} />}{/* 签证生效日 */}
                     {showVisaCols && <col style={{ width: '12%' }} />}{/* 签证有效期 */}
@@ -1394,6 +1399,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                       <th className="px-2 py-1.5 text-left font-normal">出生日期</th>
                       <th className="px-2 py-1.5 text-left font-normal">中文姓名</th>
                       <th className="px-2 py-1.5 text-left font-normal">护照签发日期</th>
+                      <th className="px-2 py-1.5 text-left font-normal">护照签发地点</th>
                       <th className="px-2 py-1.5 text-left font-normal">护照有效期</th>
                       {showVisaCols && <th className="px-2 py-1.5 text-left font-normal">签证出签日</th>}
                       {showVisaCols && <th className="px-2 py-1.5 text-left font-normal">签证生效日</th>}
@@ -1455,6 +1461,15 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                               onChange={(e) => setPassenger(i, { passportIssueDate: e.target.value })}
                             />
                             {issueBad && <span className="mt-0.5 block text-[11px] text-rose-500">格式如 2018-01-01</span>}
+                          </td>
+                          <td className="px-2 py-1 align-top">
+                            <input
+                              type="text"
+                              className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm"
+                              placeholder="如 广东省广州市（选填）"
+                              value={p.passportIssuePlace ?? ''}
+                              onChange={(e) => setPassenger(i, { passportIssuePlace: e.target.value })}
+                            />
                           </td>
                           <td className="px-2 py-1 align-top">
                             <input

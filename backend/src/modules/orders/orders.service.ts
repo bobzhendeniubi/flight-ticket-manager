@@ -3327,6 +3327,7 @@ function passengerToData(p: PassengerInput) {
     chineseName: p.chineseName ?? null,
     passportIssueDate: p.passportIssueDate ? new Date(p.passportIssueDate) : null,
     passportIssueCountry: p.passportIssueCountry ?? null,
+    passportIssuePlace: p.passportIssuePlace ?? null,
     passportExpiry: p.passportExpiry ? new Date(p.passportExpiry) : null,
     visaNumber: p.visaNumber ?? null,
     visaType: p.visaType ?? null,
