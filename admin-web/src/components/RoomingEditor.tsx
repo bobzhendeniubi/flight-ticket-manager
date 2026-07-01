@@ -260,8 +260,13 @@ export function RoomingEditor({ passengers, initial, hotelName, hotelTier, onSav
               className="rounded-xl border border-slate-200 bg-surface p-3 shadow-sm transition hover:border-brand/30"
             >
               <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-                <span className="flex items-center gap-2 text-sm font-medium text-ink">
+                <span className="flex flex-wrap items-center gap-2 text-sm font-medium text-ink">
                   房间 {idx + 1}
+                  {hotelName && (
+                    <span className="inline-flex items-center gap-1 text-xs font-normal text-ink-soft">
+                      🏨 {hotelName}
+                    </span>
+                  )}
                   {b.roomFraction === HALF_ROOM && <span className="badge-warning">½ 半间</span>}
                   <span className="text-xs font-normal text-ink-muted">{b.passengerIds.length} 人</span>
                 </span>

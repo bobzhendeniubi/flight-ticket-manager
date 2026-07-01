@@ -636,4 +636,81 @@ export class FlightService {
     await prisma.flightSchedule.delete({ where: { id: scheduleId } });
     return { id: scheduleId, deleted: true };
   }
+
+  /**
+   * 批量删除班次（路由层限 ADMIN/STAFF）。
+   * 场景：一天两班、整月排期，运营想按出发日区间删掉其中某档班次，又不想逐个点。
+   * 出发日区间 [from, to]（出发地当地 UTC+8 日，闭区间）内选出班次；flightId 省略=全部航班。
+   * 每个班次沿用 deleteSchedule 同口径的"有销售则禁删"守卫（任一舱位 sold>0，或有订单项关联）：
+   *   命中守卫 → 跳过（不删），记入 skipped；否则硬删（级联清掉舱位 / 仓位阶梯）。
+   * 事务内一次删掉本批可删项，保证要么全部落库、要么整体回滚（已跳过项不参与删除，天然安全）。
+   * 删除成功后写审计（删除数 + 已删/跳过的 scheduleId），批量删的爆炸半径大，必须留痕可追溯。
+   */
+  async batchDeleteSchedules(
+    body: { flightId?: string; from: string; to: string },
+    actor?: AuditActor,
+  ) {
+    // from/to 是出发地当地(UTC+8)日期；折算到 UTC 瞬间（与 listSchedulesInRange 同口径，避免 8h 边界偏移）。
+    const localDayStartUtc = (d: string) => {
+      const [y, m, dd] = d.split('-').map(Number);
+      return new Date(Date.UTC(y, m - 1, dd, -8, 0, 0));
+    };
+    const where: Prisma.FlightScheduleWhereInput = {
+      departureTime: {
+        gte: localDayStartUtc(body.from),
+        lte: new Date(localDayStartUtc(body.to).getTime() + 24 * 3600 * 1000 - 1),
+      },
+      ...(body.flightId ? { flightId: body.flightId } : {}),
+    };
+
+    const schedules = await prisma.flightSchedule.findMany({
+      where,
+      orderBy: { departureTime: 'asc' },
+      include: {
+        orderItems: { take: 1 },
+        seatClasses: { select: { sold: true } },
+      },
+    });
+
+    // 先分流：哪些可删、哪些因已售跳过（沿用单删守卫口径）。
+    const deletableIds: string[] = [];
+    const skipped: Array<{ scheduleId: string; reason: string }> = [];
+    for (const s of schedules) {
+      const hasSold = s.seatClasses.some((c) => c.sold > 0);
+      const hasOrders = s.orderItems.length > 0;
+      if (hasSold || hasOrders) {
+        skipped.push({ scheduleId: s.id, reason: '已售' });
+      } else {
+        deletableIds.push(s.id);
+      }
+    }
+
+    if (deletableIds.length > 0) {
+      // 事务内一次删掉所有可删班次（onDelete: Cascade 自动清舱位/阶梯）。
+      await prisma.$transaction([
+        prisma.flightSchedule.deleteMany({ where: { id: { in: deletableIds } } }),
+      ]);
+
+      // 批量删爆炸半径大 —— 写审计留痕（删除数 + 已删/跳过明细）。
+      // 沿用 updateSchedule 的 writeAudit 口径（fire-and-forget，不参与上面的删除事务）。
+      const skippedIds = skipped.map((s) => s.scheduleId);
+      await writeAudit({
+        actor: actor ?? {},
+        action: 'BATCH_DELETE_SCHEDULES',
+        targetType: AuditTargetType.FLIGHT,
+        targetId: body.flightId,
+        targetLabel: `批量删除班次 ${deletableIds.length} 条（出发日 ${body.from} ~ ${body.to}${
+          body.flightId ? `，航班 ${body.flightId}` : '，全部航班'
+        }）`,
+        after: {
+          deletedCount: deletableIds.length,
+          deletedScheduleIds: deletableIds,
+          skippedScheduleIds: skippedIds,
+        },
+        severity: AuditSeverity.WARNING,
+      });
+    }
+
+    return { deleted: deletableIds.length, skipped };
+  }
 }

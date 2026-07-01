@@ -301,6 +301,21 @@ export function HotelControlPage() {
 }
 
 // ── 订单分房（按订单号查 → 拖拽分房）────────────────────────────────────────
+/**
+ * 订单要显示的酒店中文名。
+ * 优先取订单 HOTEL 行：description 形如「酒店名 · 房型 · 入住~退房 · N晚 × M间」，取 ' · ' 前段。
+ * 回退到已存分房组里带的 hotelName（老订单可能只在分房表里留了酒店名）。
+ * 都取不到返回 undefined（分房编辑器优雅降级为不显示酒店头）。
+ */
+function hotelNameFromOrder(order: OrderSummary | null): string | undefined {
+  if (!order) return undefined;
+  const hotelItem = order.items?.find((it) => it.kind === 'HOTEL');
+  const fromItem = hotelItem?.description.split(' · ')[0]?.trim();
+  if (fromItem) return fromItem;
+  const fromGroup = order.roomAssignment?.roomGroups?.find((g) => g.hotelName)?.hotelName?.trim();
+  return fromGroup || undefined;
+}
+
 /** 占位出行人（纯酒店/接送用联系人占位 documentNumber='N/A'）不进分房池。 */
 function toRoomingPassengers(order: OrderSummary): RoomingPassenger[] {
   return order.passengers
@@ -350,7 +365,10 @@ function RoomingSection({ token }: { token: string }) {
   }
 
   const roomingPassengers = order ? toRoomingPassengers(order) : [];
-  const seedHotelName = order?.roomAssignment?.roomGroups?.find((g) => g.hotelName)?.hotelName;
+  // 分房要显示的酒店中文名：优先取订单 HOTEL 行（description 形如「酒店名 · 房型 · 入住~退房 · N晚 × M间」，
+  // 取 ' · ' 前段作酒店名），回退到已存分房组里带的 hotelName。这样新订单未存分房时也能显示真实酒店名，
+  // 不再落到「N人同酒店」这类占位。
+  const seedHotelName = hotelNameFromOrder(order);
 
   return (
     <section className="card">

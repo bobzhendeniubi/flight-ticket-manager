@@ -1,0 +1,509 @@
+/**
+ * 全岗总表导出 —— 一行/乘客的「完整」运营台账（PRIMARY 综合导出）。
+ *
+ * 定位：把过去要靠多张表 + 线下手工台账拼出来的口径，一次性做全 —— 运营再也不会
+ * 遇到「导出缺酒店名 / 缺结算 / 缺航段 / 缺分房」。与 orders.export-templates.ts 的
+ * 《全岗可用》模板相比，本表把系统里真实存有的字段全部填满（护照签发日、分房情况、
+ * 订单成本、单房差、退款金额等），而不是留空占位。
+ *
+ * 筛选：按出发日期区间（from/to → travelFrom/travelTo 口径，复用 buildOrderFilterWhere），
+ * 与整班/全岗导出选单方式一致；同时排除草稿/已取消/超时/失败/已退款。
+ *
+ * 可选 role（all|ticketing|visa）：只隐藏与岗位无关的列，默认（不传）= 完整全岗表。
+ * 无论 role 如何，都是同一份数据、同一个端点 —— role 仅做列可见性裁剪。
+ *
+ * 诚实口径：
+ *   - 飞行次数 = 航段数（往返2 / 单程1）。运营「飞行次数」口径尚未确认，表头附批注说明，
+ *     等确认后再调整（切勿冒充真实值）。
+ *   - 金额列（结算价/到账/尾款/单房差/签证/退款/订单成本）均为「每位出行人」均摊，
+ *     与《全岗可用》模板同口径，避免按订单总额被误读为每人都付了全款。
+ */
+import ExcelJS from 'exceljs';
+import type { Prisma, PrismaClient } from '@prisma/client';
+import { OrderStatus } from '@prisma/client';
+import { prisma as defaultPrisma } from '../../db/prisma.js';
+import { toAlpha3 } from './nationality.js';
+import { parseRoomGroups } from './orders.export-room-allocation.js';
+import { pnrName } from './orders.export-templates.js';
+import { buildOrderFilterWhere } from './orders.service.js';
+
+// ── 岗位视图 ──────────────────────────────────────────────────────────────
+/** 岗位视图：all=完整全岗（默认）；ticketing=票务；visa=签证。仅裁列，不改数据/取数。*/
+export type MasterExportRole = 'all' | 'ticketing' | 'visa';
+
+export interface MasterExportQuery {
+  /** 出发日期起（YYYY-MM-DD，含）*/
+  from?: string;
+  /** 出发日期止（YYYY-MM-DD，含）*/
+  to?: string;
+  /** 岗位视图，默认 all（完整全岗表）*/
+  role?: MasterExportRole;
+}
+
+/** 运营口径：所有「占座中」订单（与财务/整班/分房导出同口径，排除释放型状态）。*/
+const COUNTED_STATUSES: OrderStatus[] = [
+  OrderStatus.PENDING_PAYMENT,
+  OrderStatus.PAID,
+  OrderStatus.PROCESSING,
+  OrderStatus.TICKETED,
+  OrderStatus.COMPLETED,
+  OrderStatus.REFUND_REQUESTED,
+  OrderStatus.CHANGE_REQUESTED,
+  OrderStatus.CHANGED,
+];
+
+// ── 中文标签表 ──────────────────────────────────────────────────────────────
+const INVOICE_STATUS_LABEL: Record<string, string> = {
+  NONE: '未开',
+  REQUESTED: '已要求',
+  ISSUED: '已开',
+};
+
+const FULFILLMENT_STATUS_LABEL: Record<string, string> = {
+  PENDING: '待处理',
+  IN_PROGRESS: '处理中',
+  CONFIRMED: '已确认',
+  CANCELLED: '已取消',
+  FAILED: '失败',
+};
+
+/** 订单级签证状态（录单时选择，与履约任务状态区分）。*/
+const VISA_REQUIREMENT_LABEL: Record<string, string> = {
+  NOT_NEEDED: '不需要',
+  NEEDED: '需要',
+  E_VISA: '电子签',
+  HAS_VISA: '已签证',
+};
+
+const PASSENGER_TYPE_LABEL: Record<string, string> = {
+  ADULT: '成人',
+  CHILD: '儿童',
+  INFANT: '婴儿',
+};
+
+const GENDER_LABEL: Record<string, string> = { M: '男', F: '女', X: '其他' };
+
+const DOCUMENT_TYPE_LABEL: Record<string, string> = {
+  PASSPORT: '护照',
+  ID_CARD: '身份证',
+};
+
+const CABIN_LABEL: Record<string, string> = {
+  ECONOMY: '经济舱',
+  PREMIUM_ECONOMY: '超级经济舱',
+  BUSINESS: '商务舱',
+  FIRST: '头等舱',
+};
+
+const ORDER_KIND_LABEL: Record<string, string> = {
+  BUNDLE: '套餐',
+  HOTEL: '酒店',
+  VISA: '签证',
+  TRANSFER: '接送',
+  INSURANCE: '保险',
+};
+
+/** 订单成本类别（与 order-cost-items.service 同口径）。*/
+const COST_CATEGORY_LABEL: Record<string, string> = {
+  GUIDE_SERVICE: '导游服务费',
+  COMP_GIFT: '赠送费用',
+  HANDLING_FEE: '手续费',
+  OPERATION_FEE: '操作费',
+  OTHER: '其他',
+};
+
+// ── 小工具（与其它导出同款）────────────────────────────────────────────────
+function dec(v: Prisma.Decimal | number | null | undefined): number {
+  if (v == null) return 0;
+  return typeof v === 'number' ? v : Number(v.toString());
+}
+
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
+}
+
+function fmtDate(d: Date | null | undefined): string {
+  if (!d) return '';
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+}
+
+function fmtDateTime(d: Date | null | undefined): string {
+  if (!d) return '';
+  return `${fmtDate(d)} ${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
+}
+
+// ── 一行（每位乘客）───────────────────────────────────────────────────────
+export interface MasterRow {
+  seq: number;
+  agency: string;
+  notes: string;
+  hotelName: string; // 酒店中文名称（hotelRoomType.hotel.name 去重）
+  chineseName: string;
+  passengerName: string; // 拼音/PNR：LAST/FIRST
+  flightCount: string; // 航段数（往返2/单程1）—— 口径待确认，见表头批注
+  travelDates: string; // 出发(往返)日期
+  flightNumbers: string; // 航班号（去⇌回）
+  orderType: string; // 往返票/单程票/品类
+  cabin: string; // 舱位等级
+  settlePrice: number; // 结算价格（人均）
+  balanceDue: number; // 尾款金额（人均）
+  settleReceived: number; // 已到账金额（人均）
+  singleRoomDiff: number; // 单房差（人均）
+  visaAmount: number; // 签证金额（人均）
+  visaStatus: string; // 签证状态（订单级 + 履约任务，取更具体者）
+  invoiceStatus: string; // 开票状态
+  settled: string; // 是否清账（结清）
+  refundAmount: number; // 退款金额（人均，已完成退款）
+  passportIssuePlace: string; // 护照签发地 ?? 颁发国
+  placeOfBirth: string; // 出生地
+  orderNumber: string;
+  dateOfBirth: string; // 乘客生日
+  passengerType: string; // 成人/儿童/婴儿
+  gender: string;
+  nationality: string; // ISO alpha-3
+  documentType: string; // 证件类型
+  documentNumber: string; // 证件编号
+  issueDate: string; // 证件签发日（护照签发日期）
+  expiryDate: string; // 证件有效期
+  distribution: string; // 分房情况（房N·拼房 / 整间 / 未分房）
+  orderCost: string; // 订单成本（类别 金额，多条 ' + ' 连接）
+  recordedAt: string; // 录入时间
+  recordedBy: string; // 录入人员
+}
+
+interface MasterColumn {
+  header: string;
+  key: keyof MasterRow;
+  width: number;
+  /** 表头批注（诚实口径说明），如飞行次数。*/
+  note?: string;
+  /** 属于哪些岗位视图；缺省 = 所有视图都显示。role 命中时保留该列。*/
+  roles?: MasterExportRole[];
+}
+
+/**
+ * 完整列定义（全岗序）。roles 缺省 = 通用列（任何视图都显示）。
+ * ticketing（票务）与 visa（签证）视图各自额外保留对本岗有意义的列 —— 通用列始终在。
+ */
+const MASTER_COLUMNS: MasterColumn[] = [
+  { header: '序号', key: 'seq', width: 6 },
+  { header: '代理机构', key: 'agency', width: 16 },
+  { header: '备注', key: 'notes', width: 22 },
+  { header: '酒店中文名称', key: 'hotelName', width: 20, roles: ['all', 'visa'] },
+  { header: '乘客中文名', key: 'chineseName', width: 12 },
+  { header: '乘客拼音名', key: 'passengerName', width: 18 },
+  {
+    header: '飞行次数',
+    key: 'flightCount',
+    width: 8,
+    note: '航段数（往返2 / 单程1）。运营「飞行次数」口径待确认。',
+    roles: ['all', 'ticketing'],
+  },
+  { header: '出发(往返)日期', key: 'travelDates', width: 24 },
+  { header: '航班号', key: 'flightNumbers', width: 18, roles: ['all', 'ticketing'] },
+  { header: '订单类型', key: 'orderType', width: 10 },
+  { header: '舱位等级', key: 'cabin', width: 10, roles: ['all', 'ticketing'] },
+  { header: '结算价格', key: 'settlePrice', width: 10, roles: ['all'] },
+  { header: '尾款金额', key: 'balanceDue', width: 10, roles: ['all'] },
+  { header: '已到账金额', key: 'settleReceived', width: 12, roles: ['all'] },
+  { header: '单房差', key: 'singleRoomDiff', width: 8, roles: ['all'] },
+  { header: '签证金额', key: 'visaAmount', width: 10, roles: ['all', 'visa'] },
+  { header: '签证状态', key: 'visaStatus', width: 10, roles: ['all', 'visa'] },
+  { header: '开票状态', key: 'invoiceStatus', width: 10, roles: ['all'] },
+  { header: '是否清账', key: 'settled', width: 8, roles: ['all'] },
+  { header: '退款金额', key: 'refundAmount', width: 10, roles: ['all'] },
+  { header: '护照签发地', key: 'passportIssuePlace', width: 12, roles: ['all', 'visa'] },
+  { header: '出生地', key: 'placeOfBirth', width: 10, roles: ['all', 'visa'] },
+  { header: '订单编号', key: 'orderNumber', width: 20 },
+  { header: '乘客生日', key: 'dateOfBirth', width: 12 },
+  { header: '乘客类型', key: 'passengerType', width: 8 },
+  { header: '性别', key: 'gender', width: 6 },
+  { header: '国籍', key: 'nationality', width: 8 },
+  { header: '证件类型', key: 'documentType', width: 8, roles: ['all', 'ticketing', 'visa'] },
+  { header: '证件编号', key: 'documentNumber', width: 16, roles: ['all', 'ticketing', 'visa'] },
+  { header: '证件签发日', key: 'issueDate', width: 12, roles: ['all', 'visa'] },
+  { header: '证件有效期', key: 'expiryDate', width: 12, roles: ['all', 'ticketing', 'visa'] },
+  { header: '分房情况', key: 'distribution', width: 16, roles: ['all'] },
+  { header: '订单成本', key: 'orderCost', width: 24, roles: ['all'] },
+  { header: '录入时间', key: 'recordedAt', width: 18 },
+  { header: '录入人员', key: 'recordedBy', width: 14 },
+];
+
+/** 按岗位视图筛出可见列（role=all/缺省 → 全部；否则保留 roles 命中或未限定 role 的列）。*/
+export function visibleColumns(role: MasterExportRole): MasterColumn[] {
+  if (role === 'all') return MASTER_COLUMNS;
+  return MASTER_COLUMNS.filter((c) => !c.roles || c.roles.includes(role));
+}
+
+// ── 取数形态 ────────────────────────────────────────────────────────────────
+/** Prisma include（取数 + 测试类型共享）。*/
+export const MASTER_EXPORT_INCLUDE = {
+  agent: { select: { companyName: true } },
+  user: { select: { displayName: true, email: true } },
+  passengers: true,
+  payments: true,
+  refunds: true,
+  costItems: true,
+  items: {
+    include: {
+      flightSchedule: {
+        include: {
+          flight: { select: { flightNumber: true, originCode: true, destinationCode: true } },
+        },
+      },
+      hotelRoomType: { select: { name: true, hotel: { select: { name: true } } } },
+      visa: { select: { visaName: true, visaType: true } },
+      fulfillmentTasks: { select: { type: true, status: true } },
+    },
+  },
+} satisfies Prisma.OrderInclude;
+
+export type OrderForMasterExport = Prisma.OrderGetPayload<{ include: typeof MASTER_EXPORT_INCLUDE }>;
+
+// ── 订单 → 每位乘客一行 ─────────────────────────────────────────────────────
+/**
+ * 把一张订单展开成 N 行（每位乘客一行），字段尽量填满系统真实存有的数据。
+ * 纯函数（不碰 DB），便于单测；金额均为「每位出行人」均摊。
+ */
+export function orderToMasterRows(order: OrderForMasterExport): Omit<MasterRow, 'seq'>[] {
+  const paxCount = Math.max(1, order.passengers.length);
+
+  // ── 航段（按出发时间排序）──
+  const legs = order.items
+    .filter((it) => it.kind === 'FLIGHT' && it.flightSchedule)
+    .map((it) => ({
+      departureTime: it.flightSchedule!.departureTime,
+      flightNumber: it.flightSchedule!.flight.flightNumber,
+      cabin: it.flightCabin,
+    }))
+    .sort((a, b) => a.departureTime.getTime() - b.departureTime.getTime());
+
+  const travelDates =
+    legs.length === 0
+      ? ''
+      : legs.length === 1
+        ? fmtDate(legs[0].departureTime)
+        : `${fmtDate(legs[0].departureTime)} / ${fmtDate(legs[legs.length - 1].departureTime)}`;
+  const flightNumbers = legs.map((l) => l.flightNumber).join(' ⇌ ');
+  const cabinLabels = Array.from(
+    new Set(legs.filter((l) => l.cabin).map((l) => CABIN_LABEL[l.cabin!] ?? l.cabin!)),
+  ).join(' / ');
+  // 飞行次数 = 航段数（往返2 / 单程1）。无机票行 → 留空（口径待确认，见表头批注）。
+  const flightCount = legs.length > 0 ? String(legs.length) : '';
+
+  // ── 订单类型：两段及以上=往返票 / 一段=单程票 / 无机票按品类 ──
+  let orderType: string;
+  if (legs.length >= 2) orderType = '往返票';
+  else if (legs.length === 1) orderType = '单程票';
+  else {
+    const kind = (['BUNDLE', 'HOTEL', 'VISA', 'TRANSFER', 'INSURANCE'] as const).find((k) =>
+      order.items.some((it) => it.kind === k),
+    );
+    orderType = kind ? ORDER_KIND_LABEL[kind] : '';
+  }
+
+  // ── 酒店中文名（去重）──
+  // 任何"关联了酒店房型"的订单行都算（不限 kind）：套餐(BUNDLE)把房型盖在 BUNDLE 行上、
+  // 无独立 HOTEL 行，若只认 kind==='HOTEL' 会漏掉套餐单的酒店名。Set 去重防同名重复计。
+  const hotelNames = Array.from(
+    new Set(
+      order.items
+        .filter((it) => it.hotelRoomType)
+        .map((it) => it.hotelRoomType!.hotel.name)
+        .filter(Boolean),
+    ),
+  ).join(' / ');
+
+  // ── 金额口径（均摊到人）──
+  const total = dec(order.total);
+  const paid = dec(order.paidAmount);
+  const settlePerPax = round2(total / paxCount);
+  const paidPerPax = round2(paid / paxCount);
+  const balancePerPax = round2(Math.max(0, total - paid) / paxCount);
+  const settled = paid >= total ? '是' : '否';
+
+  // ── 签证：金额 + 状态 ──
+  // 金额只从独立 VISA 行取（套餐单的签证费已并入套餐价、不可拆分，故套餐单签证金额留 0）。
+  const visaItems = order.items.filter((it) => it.kind === 'VISA');
+  const visaAmountOrder = visaItems.reduce((s, it) => s + dec(it.amount), 0);
+  // 状态：订单级签证状态优先，回落到任意订单行的签证履约任务。
+  // 不限 kind —— 套餐(BUNDLE)含签证时 VISA_APPLICATION 任务挂在 BUNDLE 行上（无独立 VISA 行），
+  // 只从 VISA 行找会让套餐含签证单的签证状态漏显；跨全部行找可覆盖套餐单。
+  const visaTask = order.items
+    .flatMap((it) => it.fulfillmentTasks)
+    .find((t) => t.type === 'VISA_APPLICATION');
+  const visaStatus = order.visaStatus
+    ? VISA_REQUIREMENT_LABEL[order.visaStatus] ?? order.visaStatus
+    : visaTask
+      ? FULFILLMENT_STATUS_LABEL[visaTask.status] ?? visaTask.status
+      : '';
+
+  // ── 单房差：从酒店/套餐行 metadata.singleRoomDiff 汇总（系统若无该字段 → 0）──
+  const singleRoomDiffOrder = order.items.reduce((s, it) => {
+    const meta = (it.metadata ?? null) as { singleRoomDiff?: unknown } | null;
+    const v = meta && typeof meta.singleRoomDiff === 'number' ? meta.singleRoomDiff : 0;
+    return s + v;
+  }, 0);
+
+  // ── 退款：已完成退款金额合计 ──
+  const refundTotal = order.refunds
+    .filter((r) => r.status === 'COMPLETED')
+    .reduce((s, r) => s + dec(r.amount), 0);
+
+  // ── 订单成本（OrderCostItem）：类别 金额，多条 ' + ' 连接 ──
+  const orderCost = order.costItems
+    .map((c) => `${COST_CATEGORY_LABEL[c.category] ?? c.category} ${round2(dec(c.amountCny))}`)
+    .join(' + ');
+
+  // ── 备注：结构化四栏 + 自由文本 ──
+  const baseNotes = [
+    order.noteSpecial,
+    order.noteHotel,
+    order.noteVisa,
+    order.notePayment,
+    order.notes,
+  ]
+    .filter(Boolean)
+    .join(' / ');
+
+  const agency = order.agent?.companyName ?? '直客';
+  const invoiceStatus = INVOICE_STATUS_LABEL[order.invoiceStatus] ?? order.invoiceStatus;
+  const recordedAt = fmtDateTime(order.createdAt);
+  const recordedBy = order.user?.displayName ?? order.user?.email ?? order.guestName ?? '';
+  const roomGroups = parseRoomGroups(order.roomAssignment);
+  // 有酒店 = 任何订单行关联了酒店房型（不限 kind）。套餐(BUNDLE)把房型盖在 BUNDLE 行上，
+  // 只认 kind==='HOTEL' 会让套餐单永远不显示"未分房"。分房情况据此对未分房乘客回落"未分房"。
+  const hasHotel = order.items.some((it) => it.hotelRoomTypeId);
+
+  // 分房情况（每位乘客各算）：分了房 → "房N·拼房/整间"；未分房但有酒店 → "未分房"；无酒店 → ""
+  let roomSeq = 0;
+  const groupRoomNo = new Map<string, number>();
+
+  return order.passengers.map<Omit<MasterRow, 'seq'>>((p) => {
+    const group = roomGroups.find((g) => g.passengerIds.includes(p.id));
+    let distribution: string;
+    if (group) {
+      let no = groupRoomNo.get(group.id);
+      if (no === undefined) {
+        no = ++roomSeq;
+        groupRoomNo.set(group.id, no);
+      }
+      const share = group.roomFraction === 0.5 ? '拼房' : '整间';
+      distribution = `房${no}·${share}`;
+    } else {
+      distribution = hasHotel ? '未分房' : '';
+    }
+
+    // 备注叠加乘客分房组备注（酒店/房型/组备注）
+    const groupInfo = group
+      ? [group.hotelName, group.roomType, group.notes].filter(Boolean).join(' / ')
+      : '';
+    const notes = [baseNotes, groupInfo].filter(Boolean).join(' / ');
+
+    return {
+      agency,
+      notes,
+      hotelName: hotelNames,
+      chineseName: p.chineseName ?? p.fullName,
+      passengerName: pnrName(p),
+      flightCount,
+      travelDates,
+      flightNumbers,
+      orderType,
+      cabin: cabinLabels,
+      settlePrice: settlePerPax,
+      balanceDue: balancePerPax,
+      settleReceived: paidPerPax,
+      singleRoomDiff: round2(singleRoomDiffOrder / paxCount),
+      visaAmount: round2(visaAmountOrder / paxCount),
+      visaStatus,
+      invoiceStatus,
+      settled,
+      refundAmount: round2(refundTotal / paxCount),
+      passportIssuePlace: p.passportIssuePlace ?? p.passportIssueCountry ?? '',
+      placeOfBirth: p.placeOfBirth ?? '',
+      orderNumber: order.orderNumber,
+      dateOfBirth: fmtDate(p.dateOfBirth),
+      passengerType: PASSENGER_TYPE_LABEL[p.passengerType] ?? p.passengerType,
+      gender: p.gender ? GENDER_LABEL[p.gender] ?? p.gender : '',
+      nationality: toAlpha3(p.nationality),
+      documentType: DOCUMENT_TYPE_LABEL[p.documentType] ?? p.documentType,
+      documentNumber: p.documentNumber,
+      issueDate: fmtDate(p.passportIssueDate),
+      expiryDate: fmtDate(p.passportExpiry),
+      distribution,
+      orderCost,
+      recordedAt,
+      recordedBy,
+    };
+  });
+}
+
+/**
+ * 构建全岗总表 xlsx（一个 worksheet，一行/乘客）。
+ * @param query  { from, to, role }：出发日期区间 + 岗位视图
+ * @param client 可选注入用于测试；缺省取默认 prisma
+ */
+export async function buildMasterExportWorkbook(
+  query: MasterExportQuery,
+  client: PrismaClient = defaultPrisma,
+): Promise<Buffer> {
+  const role: MasterExportRole = query.role ?? 'all';
+
+  // 按出发日期区间选单：复用 buildOrderFilterWhere 的 travelFrom/travelTo 口径，
+  // 再强制排除释放型状态。与整班/全岗导出选单方式一致。
+  const where = buildOrderFilterWhere({
+    travelFrom: query.from,
+    travelTo: query.to,
+  } as Parameters<typeof buildOrderFilterWhere>[0]);
+  const and = Array.isArray(where.AND) ? where.AND : where.AND ? [where.AND] : [];
+  and.push({ status: { in: COUNTED_STATUSES } });
+  where.AND = and;
+
+  const orders = (await client.order.findMany({
+    where,
+    orderBy: { createdAt: 'desc' },
+    include: MASTER_EXPORT_INCLUDE,
+  })) as OrderForMasterExport[];
+
+  const cols = visibleColumns(role);
+
+  const wb = new ExcelJS.Workbook();
+  wb.creator = 'Citur Travel · 全岗总表导出';
+  wb.created = new Date();
+  const ws = wb.addWorksheet('全岗总表');
+  ws.columns = cols.map((c) => ({ header: c.header, key: c.key, width: c.width }));
+
+  const headerRow = ws.getRow(1);
+  headerRow.font = { bold: true };
+  headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEFEFEF' } };
+  headerRow.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+  // 表头批注（诚实口径说明，如飞行次数=航段数）
+  cols.forEach((c, i) => {
+    if (c.note) {
+      ws.getRow(1).getCell(i + 1).note = c.note;
+    }
+  });
+
+  let seq = 0;
+  for (const order of orders) {
+    if (order.passengers.length === 0) continue;
+    for (const row of orderToMasterRows(order)) {
+      seq += 1;
+      // key-based addRow 只取可见列对应的 key，多余字段忽略 —— role 裁列天然生效
+      ws.addRow({ seq, ...row });
+    }
+  }
+
+  ws.views = [{ state: 'frozen', xSplit: 1, ySplit: 1 }];
+
+  const buf = await wb.xlsx.writeBuffer();
+  return Buffer.from(buf);
+}
+
+/** 文件名：`全岗总表_{from}_{to}.xlsx`（缺省日期用「全部」）。*/
+export function masterExportFilename(from?: string, to?: string): string {
+  const a = from ?? '全部';
+  const b = to ?? from ?? '全部';
+  return `全岗总表_${a}_${b}.xlsx`;
+}

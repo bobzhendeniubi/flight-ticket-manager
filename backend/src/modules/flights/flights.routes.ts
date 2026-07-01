@@ -6,6 +6,7 @@ import { PricingService } from '../pricing/pricing.service.js';
 import { actorFromRequest } from '../../lib/audit.js';
 import { priceQuerySchema } from '../pricing/pricing.schemas.js';
 import {
+  batchDeleteSchedulesBodySchema,
   createFlightBodySchema,
   createScheduleBodySchema,
   flightSearchQuerySchema,
@@ -155,6 +156,20 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
       const body = updateScheduleBodySchema.parse(req.body);
       const schedule = await service.updateSchedule(scheduleId, body, actorFromRequest(req));
       return { schedule };
+    },
+  );
+
+  // 批量删除班次（按出发日区间；已售班次自动跳过）。仅 ADMIN —— 与单删同权限，
+  // 避免 STAFF 一次跨全航班/整月批量删的更大爆炸半径；操作写审计留痕。
+  // body: { flightId?, from, to }（from/to 为出发地当地日 YYYY-MM-DD）。
+  // 返回 { deleted, skipped: [{ scheduleId, reason }] }，已售/有订单的班次不会被删。
+  app.post(
+    '/schedules/batch-delete',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN)] },
+    async (req) => {
+      const body = batchDeleteSchedulesBodySchema.parse(req.body);
+      const result = await service.batchDeleteSchedules(body, actorFromRequest(req));
+      return { result };
     },
   );
 

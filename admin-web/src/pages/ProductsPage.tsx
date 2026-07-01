@@ -162,6 +162,26 @@ function deriveFlightRefRoundTrip(bundles: MockBundle[]): number | null {
 }
 
 /**
+ * 单套餐机票口径（展示用）：从 originalAllInCny 反推「每人来回机票」= (原价 − 地面) / flightPax，
+ * 来回价再对半拆成去程 / 回程（去回两程等价，各占一半，向下取整、回程补差保证 去+回=来回）。
+ * 只做展示，不改任何定价数学。算不出正值（缺 originalAllInCny / 无机票项）→ null。
+ */
+function bundleFlightRoundTrip(
+  b: MockBundle,
+): { roundTrip: number; outbound: number; inbound: number } | null {
+  const hasFlight = b.items.some((i) => i.kind === 'FLIGHT');
+  if (!hasFlight || b.originalAllInCny == null || !b.flightPax) return null;
+  const ground = b.items
+    .filter((i) => i.kind !== 'FLIGHT')
+    .reduce((s, i) => s + (i.qty ?? 0) * (i.unitPrice ?? 0), 0);
+  const roundTrip = Math.round((b.originalAllInCny - ground) / b.flightPax);
+  if (roundTrip <= 0) return null;
+  const outbound = Math.floor(roundTrip / 2);
+  const inbound = roundTrip - outbound; // 补差，保证 去+回 = 来回
+  return { roundTrip, outbound, inbound };
+}
+
+/**
  * 住宿晚数唯一真源（持久化侧）：含 HOTEL 项的套餐，hotelNights 取套餐自身的
  * hotelNights，回退到首个 HOTEL 项的 qty，再回退 1；不含 HOTEL 项则为 null。
  * 与是否关联房型无关 —— 修复旧逻辑「未关联房型就把 hotelNights 置 null」。
@@ -408,8 +428,11 @@ export function ProductsPage() {
         if (old && JSON.stringify(old) !== JSON.stringify(n)) {
           await api.updateBundle(tk, n.id, {
             name: n.name, tagline: n.tagline, emoji: n.emoji,
-            items: n.items, flightPax: n.flightPax,
-            groundDiscount: n.groundDiscount, suitableFor: n.suitableFor,
+            items: n.items, flightPax: n.flightPax ?? 1,
+            // 改价的唯一真源：编辑向导算出新折扣% 后写在 discountPct 上，更新时必须一并回传，
+            // 否则后端保留旧折扣 → PATCH 返回 200 但价格没变（"改价保存不了"）。
+            discountPct: n.discountPct ?? 0,
+            groundDiscount: n.groundDiscount ?? 0, suitableFor: n.suitableFor,
             hotelRoomTypeId: n.hotelRoomTypeId ?? null,
             hotelNights: persistedHotelNights(n),
             singleSupplementCnyPerNight: n.singleSupplementCnyPerNight ?? null,
@@ -783,6 +806,8 @@ function BundleCard({
 }) {
   const saving = bundle.listPrice - bundle.bundlePrice;
   const savingPct = bundle.listPrice > 0 ? (saving / bundle.listPrice) * 100 : 0;
+  // 机票口径：来回 = 去程(单程) + 回程(单程)；拆开显示，避免把来回价误当单程。
+  const flight = bundleFlightRoundTrip(bundle);
   return (
     <article className={`card transition hover:shadow-pop ${bundle.active ? '' : 'opacity-60'}`}>
       <div className="font-mono text-xs text-ink-muted">编号 {bundle.code ?? '—'} <span className="font-sans not-italic text-ink-muted">(系统自动生成)</span></div>
@@ -811,15 +836,34 @@ function BundleCard({
               </span>
               <span className="text-ink-soft truncate">{i.productName}</span>
             </div>
-            <span className="text-ink-muted nums whitespace-nowrap">
-              {i.kind === 'HOTEL'
-                ? `${i.qty} 晚 × ¥${i.unitPrice}/晚 = ¥`
-                : `${i.qty} × ¥${i.unitPrice} = ¥`}
-              {(i.qty * i.unitPrice).toLocaleString()}
-            </span>
+            {i.kind === 'FLIGHT' ? (
+              // 机票不在套餐里逐项定价（随出发日实时浮动，已含在原价）→ 标「往返」而非 ¥0。
+              <span className="text-ink-muted whitespace-nowrap">往返（去+回两程）</span>
+            ) : (
+              <span className="text-ink-muted nums whitespace-nowrap">
+                {i.kind === 'HOTEL'
+                  ? `${i.qty} 晚 × ¥${i.unitPrice}/晚 = ¥`
+                  : `${i.qty} × ¥${i.unitPrice} = ¥`}
+                {(i.qty * i.unitPrice).toLocaleString()}
+              </span>
+            )}
           </div>
         ))}
       </div>
+
+      {flight && (
+        // 机票往返口径拆开：去程(单程) + 回程(单程) = 来回×1，避免运营把来回价误当单程。
+        <div className="mt-2 rounded-lg border border-sky-100 bg-sky-50/60 px-3 py-2 text-xs">
+          <div className="flex items-center justify-between text-sky-800">
+            <span className="font-medium">✈️ 机票 往返 / 人</span>
+            <span className="nums font-semibold">¥{flight.roundTrip.toLocaleString()}</span>
+          </div>
+          <div className="mt-1 flex items-center justify-between text-sky-700/90">
+            <span className="nums">去程 ¥{flight.outbound.toLocaleString()} + 回程 ¥{flight.inbound.toLocaleString()}</span>
+            <span className="text-[11px] text-sky-700/70">共 2 程 · 按当前最低起价</span>
+          </div>
+        </div>
+      )}
 
       {bundle.hotelRoomType && (
         <div className="mt-2 text-xs text-ink-soft">

@@ -44,6 +44,7 @@ export function FlightsPage() {
   const [showNewFlight, setShowNewFlight] = useState(false);
   const [addingScheduleFor, setAddingScheduleFor] = useState<string | null>(null);
   const [bulkAddingFor, setBulkAddingFor] = useState<string | null>(null);
+  const [batchDeletingFor, setBatchDeletingFor] = useState<string | null>(null);
   const [baggageFor, setBaggageFor] = useState<string | null>(null);
 
   const reload = useCallback(async () => {
@@ -175,6 +176,14 @@ export function FlightsPage() {
                 >
                   🧳 行李规则
                 </button>
+                <button
+                  type="button"
+                  className="btn-secondary text-sm"
+                  title="按出发日区间批量删除该航班班次（已售班次自动跳过）"
+                  onClick={() => setBatchDeletingFor((prev) => (prev === f.id ? null : f.id))}
+                >
+                  🗑️ 批量删除班次
+                </button>
                 {user.role === 'ADMIN' && (
                   <>
                     <button
@@ -227,6 +236,19 @@ export function FlightsPage() {
                   if (expanded === f.id) await refreshSchedules(f.id);
                   bumpSeats();
                 }}
+              />
+            )}
+
+            {batchDeletingFor === f.id && (
+              <BatchDeleteScheduleForm
+                flight={f}
+                onCancel={() => setBatchDeletingFor(null)}
+                onDone={async () => {
+                  await reload();
+                  if (expanded === f.id) await refreshSchedules(f.id);
+                  bumpSeats();
+                }}
+                onClose={() => setBatchDeletingFor(null)}
               />
             )}
 
@@ -1832,18 +1854,22 @@ function NewFlightForm({ onCancel, onCreated }: { onCancel: () => void; onCreate
           />
         </div>
         <div>
-          <label className="label" htmlFor="originCode">出发机场</label>
+          <label className="label" htmlFor="originCode">出发机场（航线起点）</label>
           <select className="input" id="originCode" value={originCode} onChange={(e) => setOriginCode(e.target.value)}>
             {AIRPORT_OPTIONS.map((a) => (
-              <option key={a.code} value={a.code}>{a.name} ({a.code})</option>
+              <option key={a.code} value={a.code}>
+                {a.name} ({a.code}){a.active ? '' : ' · 未来航线'}
+              </option>
             ))}
           </select>
         </div>
         <div>
-          <label className="label" htmlFor="destinationCode">到达机场</label>
+          <label className="label" htmlFor="destinationCode">到达机场（航线终点）</label>
           <select className="input" id="destinationCode" value={destinationCode} onChange={(e) => setDestinationCode(e.target.value)}>
             {AIRPORT_OPTIONS.map((a) => (
-              <option key={a.code} value={a.code}>{a.name} ({a.code})</option>
+              <option key={a.code} value={a.code}>
+                {a.name} ({a.code}){a.active ? '' : ' · 未来航线'}
+              </option>
             ))}
           </select>
         </div>
@@ -1855,6 +1881,15 @@ function NewFlightForm({ onCancel, onCreated }: { onCancel: () => void; onCreate
             value={aircraftType}
             onChange={(e) => setAircraftType(e.target.value)}
           />
+        </div>
+        {/* 航线预览：新增航线（如 澳门⇌胡志明 / 河内）时一眼确认起终点，避免选反。 */}
+        <div className="md:col-span-4 -mt-1 text-sm text-ink-soft">
+          航线：<span className="font-medium text-ink">{airportLabel(originCode)}</span>
+          <span className="mx-1.5 text-brand">→</span>
+          <span className="font-medium text-ink">{airportLabel(destinationCode)}</span>
+          {originCode === destinationCode && (
+            <span className="ml-2 text-rose-600">出发和到达不能是同一机场</span>
+          )}
         </div>
         {err && <div className="md:col-span-4 rounded-md bg-red-50 px-3 py-2 text-sm text-red-700">{err}</div>}
         <div className="md:col-span-4 flex justify-end gap-3">
@@ -2196,6 +2231,121 @@ function BulkScheduleForm({
           <button type="button" className="btn-secondary" onClick={onCancel}>取消</button>
           <button type="submit" className="btn-primary" disabled={submitting || previewCount === 0}>
             {submitting ? `创建中 ${progress.done}/${progress.total}...` : `批量创建 ${previewCount} 个班次`}
+          </button>
+        </div>
+      </form>
+    </section>
+  );
+}
+
+// ── 批量删除班次（按出发日区间；已售班次自动跳过）────────────────────────
+// 场景：一天两班、整月排期，运营想按出发日区间删掉某一档班次，又不想逐个点。
+// 后端逐条守 sold>0/有订单：已售班次跳过（不删），返回 { deleted, skipped }。
+function BatchDeleteScheduleForm({
+  flight,
+  onCancel,
+  onDone,
+  onClose,
+}: {
+  flight: AdminFlight;
+  onCancel: () => void;
+  onDone: () => Promise<void> | void;
+  onClose: () => void;
+}) {
+  const tokens = useAuth((s) => s.tokens);
+
+  function addDays(offset: number): string {
+    const d = new Date();
+    d.setDate(d.getDate() + offset);
+    return d.toISOString().slice(0, 10);
+  }
+
+  const [from, setFrom] = useState(addDays(0));
+  const [to, setTo] = useState(addDays(30));
+  const [submitting, setSubmitting] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [result, setResult] = useState<{ deleted: number; skipped: number } | null>(null);
+
+  const onSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!tokens || submitting) return;
+    if (!from || !to) {
+      setErr('请填写出发日期区间');
+      return;
+    }
+    if (to < from) {
+      setErr('结束日期不能早于开始日期');
+      return;
+    }
+    if (
+      !confirm(
+        `将删除 ${flight.flightNumber} 在 ${from} ~ ${to} 之间的未售班次（已售班次自动跳过），确认？`,
+      )
+    )
+      return;
+
+    setSubmitting(true);
+    setErr(null);
+    setResult(null);
+    try {
+      const res = await api.batchDeleteSchedules(tokens.accessToken, {
+        flightId: flight.id,
+        from,
+        to,
+      });
+      setResult({ deleted: res.result.deleted, skipped: res.result.skipped.length });
+      await onDone();
+    } catch (error) {
+      setErr(error instanceof ApiError ? error.message : '批量删除失败');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <section className="mt-4 rounded-lg border-2 border-rose-300 bg-rose-50/60 p-4">
+      <div className="flex items-center justify-between">
+        <h3 className="font-semibold text-slate-900">
+          🗑️ 批量删除 <span className="text-brand">{flight.flightNumber}</span> 班次
+        </h3>
+        <button type="button" className="text-slate-400 hover:text-slate-700 text-xl" onClick={onClose}>
+          ×
+        </button>
+      </div>
+      <p className="text-xs text-slate-500 mt-0.5">
+        按出发日区间删除；已有销售（已售座位 / 关联订单）的班次会自动跳过，不会被删。
+      </p>
+
+      <form className="mt-4 grid gap-3 md:grid-cols-4" onSubmit={onSubmit}>
+        <div>
+          <label className="label">起始日期（出发本地日）</label>
+          <input type="date" className="input" value={from} onChange={(e) => setFrom(e.target.value)} />
+        </div>
+        <div>
+          <label className="label">结束日期（含当天）</label>
+          <input type="date" className="input" value={to} min={from} onChange={(e) => setTo(e.target.value)} />
+        </div>
+
+        {err && (
+          <div className="md:col-span-4 rounded-md bg-red-50 px-3 py-2 text-sm text-red-700">{err}</div>
+        )}
+        {result && (
+          <div className="md:col-span-4 rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700">
+            ✅ 完成：删除 {result.deleted} 班
+            {result.skipped > 0 && ` · 跳过 ${result.skipped} 班（已售）`}
+          </div>
+        )}
+
+        <div className="md:col-span-4 flex justify-end gap-3">
+          <button type="button" className="btn-secondary" onClick={onCancel}>
+            {result ? '关闭' : '取消'}
+          </button>
+          <button
+            type="submit"
+            className="btn-primary bg-rose-600 hover:bg-rose-700"
+            disabled={submitting}
+          >
+            {submitting ? '删除中…' : '批量删除'}
           </button>
         </div>
       </form>

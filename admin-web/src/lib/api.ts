@@ -1361,6 +1361,17 @@ export const api = {
       `/flights/schedules/${scheduleId}`,
       { method: 'DELETE', token },
     ),
+  // 批量删除班次（ADMIN/STAFF）：按出发日区间 [from, to]（本地日 YYYY-MM-DD），
+  // flightId 省略=全部航班。后端逐条守 sold>0/有订单：已售班次跳过（不删），
+  // 返回 { deleted, skipped: [{ scheduleId, reason }] }。
+  batchDeleteSchedules: (
+    token: string,
+    body: { flightId?: string; from: string; to: string },
+  ) =>
+    apiFetch<{ result: { deleted: number; skipped: Array<{ scheduleId: string; reason: string }> } }>(
+      '/flights/schedules/batch-delete',
+      { method: 'POST', token, body },
+    ),
   // 行李规则（航班 × 舱等；ADMIN/STAFF 维护）
   getBaggagePolicies: (token: string, flightId: string) =>
     apiFetch<{ policies: FlightBaggagePolicy[] }>(`/flights/${flightId}/baggage-policies`, { token }),
@@ -1541,6 +1552,23 @@ export const api = {
       if (v !== undefined && v !== '') qs.set(k, String(v));
     }
     const res = await fetch(`${API_BASE}/orders/export-templates?${qs.toString()}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) throw new ApiError(res.status, { code: 'EXPORT_FAILED', message: await res.text() });
+    return res.blob();
+  },
+  // 全岗总表导出（PRIMARY 综合导出：一行/乘客，字段全）；ADMIN/STAFF only。
+  // GET /orders/export/master?from&to&role — 按出发日期区间选单；缺省 = 全部。返回 Blob 直接下载。
+  exportMaster: async (
+    token: string,
+    params?: { from?: string; to?: string; role?: 'all' | 'ticketing' | 'visa' },
+  ): Promise<Blob> => {
+    const qs = new URLSearchParams();
+    if (params?.from) qs.set('from', params.from);
+    if (params?.to) qs.set('to', params.to);
+    if (params?.role) qs.set('role', params.role);
+    const suffix = qs.toString() ? `?${qs.toString()}` : '';
+    const res = await fetch(`${API_BASE}/orders/export/master${suffix}`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     if (!res.ok) throw new ApiError(res.status, { code: 'EXPORT_FAILED', message: await res.text() });

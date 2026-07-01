@@ -73,6 +73,22 @@ export const createScheduleBodySchema = z.object({
 });
 export type CreateScheduleBody = z.infer<typeof createScheduleBodySchema>;
 
+// ── 批量删除班次（按出发日区间；已售班次自动跳过）────────────────────────
+// from/to 为出发地当地(UTC+8)日期 YYYY-MM-DD（闭区间）；flightId 可选（省略=全部航班）。
+// 语义：区间内每个无销售的班次硬删，已售/有订单关联的跳过并回报，绝不误删已卖班次。
+export const batchDeleteSchedulesBodySchema = z
+  .object({
+    flightId: z.string().min(1).optional(),
+    from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, 'from 格式应为 YYYY-MM-DD'),
+    to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, 'to 格式应为 YYYY-MM-DD'),
+  })
+  .superRefine((body, ctx) => {
+    if (body.to < body.from) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: '结束日期不能早于开始日期' });
+    }
+  });
+export type BatchDeleteSchedulesBody = z.infer<typeof batchDeleteSchedulesBodySchema>;
+
 // ── 单班次编辑（月历库存视图：改价 / 改容量 / 停用启用 / 改时刻）────────────
 // 全部可选，但至少给一个；seatClasses 内每条按 cabin 定位，basePrice/capacity 各自可选
 export const updateScheduleBodySchema = z

@@ -9,6 +9,8 @@ import { exportToCSV } from '../lib/csvExport';
 import { NumberInput } from '../components/NumberInput';
 import { OrderFinanceSection } from '../components/OrderFinanceSection';
 import { SingleOrderModal } from '../components/SingleOrderModal';
+import { RoomingEditor, type RoomingPassenger } from '../components/RoomingEditor';
+import type { RoomGroup } from '../lib/api';
 
 // 本地可视化用的状态子集（后端 OrderStatus 更全，这里只列出常用 7 个做 filter）
 const STATUS_LABEL: Record<OrderStatus, string> = {
@@ -189,6 +191,8 @@ export function OrdersPage() {
   // 三模板筛选导出（全岗可用/票务专用/签证专用）
   const [exportTemplate, setExportTemplate] = useState<OrderExportTemplate>('full');
   const [exporting, setExporting] = useState(false);
+  // 全岗总表导出（一行/乘客·字段全）
+  const [exportingMaster, setExportingMaster] = useState(false);
   const [selected, setSelected] = useState<OrderSummary | null>(null);
   // ── 批量管理状态 ─────────────────────────────────────
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -444,6 +448,34 @@ export function OrdersPage() {
     }
   };
 
+  // 全岗总表导出 — 一行/乘客·字段全（PRIMARY 综合台账）。按上方「出行日期」区间选单；无日期=全部。
+  const handleMasterExport = async () => {
+    if (!tokens?.accessToken) return;
+    setExportingMaster(true);
+    try {
+      const blob = await api.exportMaster(tokens.accessToken, {
+        from: travelFrom || undefined,
+        to: travelTo || undefined,
+        role: 'all',
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      const rangeLabel = travelFrom || travelTo
+        ? `${travelFrom || '全部'}_${travelTo || travelFrom || '全部'}`
+        : '全部_全部';
+      a.download = `全岗总表_${rangeLabel}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (err) {
+      alert(err instanceof ApiError ? `导出失败：${err.message}` : '导出失败');
+    } finally {
+      setExportingMaster(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
       <section className="flex items-start justify-between gap-4">
@@ -554,8 +586,16 @@ export function OrdersPage() {
           >
             {exporting ? '导出中…' : '📤 导出'}
           </button>
+          <button
+            className="btn-primary text-sm"
+            disabled={loading || exportingMaster}
+            onClick={() => void handleMasterExport()}
+            title="全岗综合台账：一行一位乘客，涵盖机票/酒店/签证/付款全字段。按上方「出行日期」区间选单，不填=全部。"
+          >
+            {exportingMaster ? '导出中…' : '📊 导出全岗总表'}
+          </button>
           <p className="w-full text-right text-xs text-ink-muted">
-            导出按上方「下单时间」周期（录入日期），用于佣金/提成/客户统计
+            《导出》按上方「下单时间」周期（佣金/提成/客户统计）；《全岗总表》按「出行日期」区间（综合台账，不填=全部）
           </p>
         </div>
       </section>
@@ -1069,6 +1109,54 @@ export function OrdersPage() {
   );
 }
 
+// ── 酒店 / 分房派生（详情「酒店情况」+ 应分房未分房判定，与房控页同口径）──────
+// 订单要显示的酒店中文名。优先取 HOTEL 行 description（形如「酒店名 · 房型 · …」，取 ' · ' 前段），
+// 回退到已存分房组里带的 hotelName；都取不到返回 null。
+function hotelNameFromOrder(order: OrderSummary): string | null {
+  const hotelItem = order.items?.find((it) => it.kind === 'HOTEL');
+  const fromItem = hotelItem?.description.split(' · ')[0]?.trim();
+  if (fromItem) return fromItem;
+  const fromGroup = order.roomAssignment?.roomGroups?.find((g) => g.hotelName)?.hotelName?.trim();
+  return fromGroup || null;
+}
+
+// 该订单是否「应分房」：含 HOTEL 行，或套餐（BUNDLE）关联了酒店（description 含「酒店」/「N晚」）。
+function orderNeedsRooming(order: OrderSummary): boolean {
+  const items = order.items ?? [];
+  if (items.some((it) => it.kind === 'HOTEL')) return true;
+  const bundle = items.find((it) => it.kind === 'BUNDLE');
+  if (bundle && /酒店|晚/.test(bundle.description)) return true;
+  return false;
+}
+
+// 是否已分房（分房表里至少一个含出行人的房间组）。
+function orderHasRooming(order: OrderSummary): boolean {
+  const groups = order.roomAssignment?.roomGroups ?? [];
+  return groups.some((g) => (g.passengerIds?.length ?? 0) > 0);
+}
+
+// 占位出行人（纯酒店/接送用联系人占位 documentNumber='N/A'）不进分房池。与房控页同口径。
+function toRoomingPassengers(order: OrderSummary): RoomingPassenger[] {
+  return order.passengers
+    .filter((p) => p.documentNumber !== 'N/A')
+    .map((p) => ({ id: p.id, name: p.fullName, gender: p.gender ?? null }));
+}
+
+// 分房情况一句话摘要（详情「酒店情况」用；等价旧系统备注里的拼房说明）。
+function roomingSummary(order: OrderSummary): string {
+  const groups = (order.roomAssignment?.roomGroups ?? []).filter((g) => (g.passengerIds?.length ?? 0) > 0);
+  if (groups.length === 0) return '未分房';
+  const nameById = new Map(order.passengers.map((p) => [p.id, p.fullName]));
+  return groups
+    .map((g) => {
+      const names = g.passengerIds.map((id) => nameById.get(id) ?? '?').join('、');
+      const frac = g.roomFraction === 0.5 ? '半间(拼房)' : '整间';
+      const type = g.roomType ? ` ${g.roomType}` : '';
+      return `${frac}${type}：${names}`;
+    })
+    .join('；');
+}
+
 // ── Drawer ─────────────────────────────────────────────────────────────
 function OrderDrawer({
   order,
@@ -1089,10 +1177,51 @@ function OrderDrawer({
   onDelete?: () => void;
   isAdmin?: boolean;
 }) {
-  const view = deriveView(order);
+  const tokens = useAuth((s) => s.tokens);
+  const token = tokens?.accessToken ?? '';
+  // #8 修复：列表行的 passengers 只有 {id, fullName}（后端 listOrders select 精简），护照号/生日/国籍/类型
+  // 恒显示「—」。抽屉打开时用 getOrder 拉全量详情，之后所有子区块都读 hydrated（拿不到时兜底列表行）。
+  const [hydrated, setHydrated] = useState<OrderSummary | null>(null);
+  const [hydrating, setHydrating] = useState(false);
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    setHydrating(true);
+    api.getOrder(token, order.id)
+      .then((r) => { if (!cancelled) setHydrated(r.order); })
+      .catch(() => { /* 拉详情失败则沿用列表行数据，护照等字段可能仍显示 — */ })
+      .finally(() => { if (!cancelled) setHydrating(false); });
+    return () => { cancelled = true; };
+  }, [token, order.id]);
+  // 详情各区块统一读 o（详情优先，兜底列表行）。售后改期/换人后用返回的整单同步 hydrated + 列表行。
+  const o = hydrated ?? order;
+  const view = deriveView(o);
+  const bal = deriveBalance(o);
+  // 子组件（改期/换人/改价）拿到更新后的整单 → 同步抽屉本地 hydrated + 冒泡给父级刷列表。
+  const handleOrderUpdated = (updated: OrderSummary) => {
+    setHydrated(updated);
+    onOrderUpdated?.(updated);
+  };
+
+  // #4/#5 分房：应分房未分房 → 显示「分房」按钮；已分房 → 摘要 + 「调整分房」。
+  const hotelName = hotelNameFromOrder(o);
+  const needsRooming = orderNeedsRooming(o);
+  const hasRooming = orderHasRooming(o);
+  const [roomingOpen, setRoomingOpen] = useState(false);
+
+  const saveRooming = async (groups: RoomGroup[]): Promise<void> => {
+    if (!token) return;
+    await api.updateRoomAssignment(token, o.id, groups);
+    // 重拉详情让「酒店情况」摘要与按钮态即时刷新
+    const r = await api.getOrder(token, o.id);
+    setHydrated(r.order);
+    setRoomingOpen(false);
+    onChanged?.();
+  };
+
   // 可行的下一步状态（与 backend orders.service ALLOWED_TRANSITIONS 保持一致的子集）
   const nextSteps: Array<{ label: string; to: OrderStatus; style: string }> = (() => {
-    switch (order.status) {
+    switch (o.status) {
       case 'PENDING_PAYMENT':
         return [
           { label: '标记已支付', to: 'PAID', style: 'btn-primary' },
@@ -1124,127 +1253,165 @@ function OrderDrawer({
   })();
 
   return (
-    <div className="fixed inset-0 z-50 flex justify-end bg-slate-900/50" onClick={onClose}>
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4"
+      onClick={onClose}
+    >
       <div
-        className="h-full w-full max-w-md overflow-auto bg-white shadow-xl"
+        className="flex max-h-[92vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
-        <div className="sticky top-0 z-10 flex items-center justify-between border-b border-slate-200 bg-white px-6 py-4">
-          <h2 className="text-base font-semibold text-ink">订单详情</h2>
+        {/* 头：订单号 + 状态/类型/签证 徽章 一行看全 */}
+        <div className="flex items-start justify-between gap-3 border-b border-slate-200 px-6 py-4">
+          <div className="min-w-0">
+            <div className="flex items-center gap-2">
+              <h2 className="text-base font-semibold text-ink">订单详情</h2>
+              <span className="font-mono text-xs text-ink-muted">{o.orderNumber}</span>
+              {hydrating && <span className="text-[11px] text-ink-muted">· 载入详情…</span>}
+            </div>
+            <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+              <span className={STATUS_COLOR[o.status]}>{STATUS_LABEL[o.status]}</span>
+              <span className="badge-neutral">{KIND_LABEL[view.itemKind]}</span>
+              {o.visaStatus && (
+                <span className={`rounded px-2 py-0.5 text-[11px] font-medium ${VISA_STATUS_BADGE[o.visaStatus]}`}>
+                  签证：{VISA_STATUS_LABEL[o.visaStatus]}
+                </span>
+              )}
+              <BalanceBadge balance={bal.balance} settlementMode={o.agent?.settlementMode} />
+            </div>
+          </div>
           <button className="btn-ghost px-2 py-1 text-xl leading-none" onClick={onClose}>×</button>
         </div>
 
-        <div className="px-6 py-5 space-y-6">
-          <section>
-            <div className="font-mono text-xs text-ink-muted">{order.orderNumber}</div>
-            <div className="mt-2 flex flex-wrap items-center gap-2">
-              <span className={STATUS_COLOR[order.status]}>
-                {STATUS_LABEL[order.status]}
-              </span>
-              <span className="badge-neutral">
-                {KIND_LABEL[view.itemKind]}
-              </span>
-              {order.visaStatus && (
-                <span className={`rounded px-2 py-0.5 text-[11px] font-medium ${VISA_STATUS_BADGE[order.visaStatus]}`}>
-                  签证：{VISA_STATUS_LABEL[order.visaStatus]}
-                </span>
+        <div className="flex-1 space-y-5 overflow-auto px-6 py-5">
+          {/* ── 概览：最常查的信息一屏看全（客户 / 付款 / 签证 / 酒店拼房）── */}
+          <section className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            {/* 客户 */}
+            <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3">
+              <div className="text-xs font-semibold uppercase tracking-wide text-ink-muted">客户</div>
+              <div className="mt-1.5 text-sm font-medium text-ink">{view.customerName}</div>
+              <div className="text-xs text-ink-soft">{o.contactPhone}</div>
+              {o.contactEmail && <div className="truncate text-xs text-ink-muted">{o.contactEmail}</div>}
+              {view.agentName && <div className="mt-1 badge-info">{view.agentName}</div>}
+              <div className="mt-1 text-[11px] text-ink-muted">下单 {new Date(o.createdAt).toLocaleString('zh-CN')}</div>
+            </div>
+
+            {/* 付款情况（与列表尾款/状态一致；抵扣读 notePayment）*/}
+            <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3">
+              <div className="text-xs font-semibold uppercase tracking-wide text-ink-muted">付款情况</div>
+              <div className="mt-1.5 flex items-baseline gap-1 text-sm">
+                <span className="nums text-lg font-semibold text-emerald-700">¥{bal.paid.toLocaleString()}</span>
+                <span className="text-ink-muted"> / 应收 ¥{(bal.total + bal.adjustment).toLocaleString()}</span>
+              </div>
+              <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                <BalanceBadge balance={bal.balance} settlementMode={o.agent?.settlementMode} />
+                {bal.adjustment !== 0 && (
+                  <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[11px] text-amber-700">含售后费 ¥{bal.adjustment.toLocaleString()}</span>
+                )}
+              </div>
+              {o.notePayment && (
+                <div className="mt-1.5 rounded bg-white px-2 py-1 text-[11px] text-ink-soft">
+                  <span className="text-ink-muted">抵扣/备注：</span>{o.notePayment}
+                </div>
               )}
             </div>
+
+            {/* 酒店情况（酒店中文名 + 拼房/整间 摘要 = 旧系统备注）*/}
+            {(needsRooming || hotelName) && (
+              <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3 sm:col-span-2">
+                <div className="flex items-center justify-between">
+                  <div className="text-xs font-semibold uppercase tracking-wide text-ink-muted">酒店情况 · 拼房</div>
+                  {needsRooming && (
+                    hasRooming ? (
+                      <button
+                        className="text-[11px] font-medium text-brand hover:text-brand-dark"
+                        onClick={() => setRoomingOpen(true)}
+                      >
+                        调整分房
+                      </button>
+                    ) : (
+                      <button
+                        className="rounded bg-brand px-2 py-0.5 text-[11px] font-medium text-white hover:bg-brand-dark"
+                        onClick={() => setRoomingOpen(true)}
+                        title="该订单含酒店但尚未分房 — 点此分房（拖名字到房间）"
+                      >
+                        🛏 分房
+                      </button>
+                    )
+                  )}
+                </div>
+                <div className="mt-1.5 text-sm font-medium text-ink">🏨 {hotelName ?? '（未识别酒店名）'}</div>
+                <div className={`mt-0.5 text-xs ${hasRooming ? 'text-ink-soft' : 'text-amber-700'}`}>
+                  {needsRooming && !hasRooming ? '应分房 · 尚未分房' : roomingSummary(o)}
+                </div>
+              </div>
+            )}
+
+            {o.noteHotel && (
+              <div className="rounded-xl border border-slate-200 bg-white p-3 text-xs text-ink-soft sm:col-span-2">
+                <span className="text-ink-muted">酒店备注：</span>{o.noteHotel}
+              </div>
+            )}
           </section>
 
+          {/* 产品内容 */}
           <section>
             <h3 className="text-xs font-semibold uppercase tracking-wide text-ink-muted">产品内容</h3>
             <ul className="mt-2 space-y-2 text-sm">
-              {(order.items ?? []).map((it) => (
+              {(o.items ?? []).map((it) => (
                 <OrderItemRow
                   key={it.id}
-                  orderId={order.id}
+                  orderId={o.id}
                   item={it}
-                  onOrderUpdated={onOrderUpdated}
+                  onOrderUpdated={handleOrderUpdated}
                   isAdmin={isAdmin}
                 />
               ))}
             </ul>
-            <p className="mt-2 text-xs text-ink-muted">共 {order.passengers.length} 位乘客</p>
+            <p className="mt-2 text-xs text-ink-muted">共 {o.passengers.length} 位乘客</p>
           </section>
 
-          <AdjustmentsSection order={order} />
+          <AdjustmentsSection order={o} />
 
-          <PassengersSection order={order} onOrderUpdated={onOrderUpdated} />
+          {/* 乘客（读 hydrated → 护照号/生日/国籍/类型 真实显示）*/}
+          <PassengersSection order={o} onOrderUpdated={handleOrderUpdated} />
 
-          <OpsToolbar order={order} onAdvance={onAdvance} />
+          {/* 收款（确认收款 / 代理余额抵扣 / 多付处理）*/}
+          <ConfirmPaymentSection
+            orderId={o.id}
+            total={view.totalNum + (Number(o.adjustmentCny) || 0)}
+            paidAmount={Number(o.paidAmount)}
+            agent={o.agent}
+            onChanged={onChanged}
+          />
 
-          <NotesSection order={order} />
+          <OpsToolbar order={o} onAdvance={onAdvance} />
 
-          <RemindersSection order={order} />
+          <NotesSection order={o} />
+
+          <RemindersSection order={o} />
 
           {/* 财务/出纳：预期到账金额 + 订单杂项成本（仅 ADMIN/STAFF 可见，组件内做权限判断） */}
           <OrderFinanceSection
-            orderId={order.id}
-            initialExpectedAmountCny={order.expectedAmountCny}
-            initialExpectedAmountLocked={order.expectedAmountLocked}
+            orderId={o.id}
+            initialExpectedAmountCny={o.expectedAmountCny}
+            initialExpectedAmountLocked={o.expectedAmountLocked}
             onChanged={onChanged}
           />
 
-          <section>
-            <h3 className="text-xs font-semibold uppercase tracking-wide text-ink-muted">客户信息</h3>
-            <dl className="mt-2 space-y-1 text-sm">
-              <Row label="联系人" value={order.contactName} />
-              <Row label="联系电话" value={order.contactPhone} />
-              {order.contactEmail && <Row label="邮箱" value={order.contactEmail} />}
-              {view.agentName && <Row label="归属代理" value={view.agentName} />}
-            </dl>
-          </section>
-
-          <section>
-            <h3 className="text-xs font-semibold uppercase tracking-wide text-ink-muted">支付</h3>
-            {(() => {
-              const bal = deriveBalance(order);
-              return (
-                <dl className="mt-2 space-y-1 text-sm">
-                  <Row
-                    label="订单金额"
-                    value={<span className="nums text-lg font-semibold text-ink">¥{view.totalNum.toLocaleString()}</span>}
-                  />
-                  {bal.adjustment !== 0 && (
-                    <Row
-                      label="售后费用"
-                      value={<span className="nums text-ink">¥{bal.adjustment.toLocaleString()}</span>}
-                    />
-                  )}
-                  <Row label="已付" value={<span className="nums">¥{bal.paid.toLocaleString()}</span>} />
-                  <Row
-                    label="尾款"
-                    value={<BalanceBadge balance={bal.balance} settlementMode={order.agent?.settlementMode} />}
-                  />
-                  <Row label="下单时间" value={new Date(order.createdAt).toLocaleString('zh-CN')} />
-                </dl>
-              );
-            })()}
-          </section>
-
-          {/* 确认收款（线下收款 → 标记已付 + 上传截图）。应收 = 订单金额 + 售后费用 */}
-          <ConfirmPaymentSection
-            orderId={order.id}
-            total={view.totalNum + (Number(order.adjustmentCny) || 0)}
-            paidAmount={Number(order.paidAmount)}
-            agent={order.agent}
-            onChanged={onChanged}
-          />
-
-          {/* 履约 Fulfillment — 目前仍 mock，M6 接真实 FulfillmentTask 表 */}
-          <FulfillmentSection orderId={order.id} />
+          {/* 履约 Fulfillment — PNR 为演示自动出票（非真实航司 PNR），组件内已加标注 */}
+          <FulfillmentSection orderId={o.id} />
 
           <section>
             <h3 className="text-xs font-semibold uppercase tracking-wide text-ink-muted">状态流转</h3>
-            <div className="mt-3 flex flex-col gap-2">
+            <div className="mt-3 flex flex-wrap gap-2">
               {nextSteps.length === 0 && (
-                <div className="rounded-lg border border-slate-200 bg-slate-50/60 p-3 text-xs text-ink-muted">
+                <div className="w-full rounded-lg border border-slate-200 bg-slate-50/60 p-3 text-xs text-ink-muted">
                   当前状态下无可用操作
                 </div>
               )}
               {nextSteps.map((s) => (
-                <button key={s.to} className={`${s.style} text-sm`} onClick={() => onAdvance(s.to)}>
+                <button key={s.to} className={`${s.style} flex-1 text-sm`} onClick={() => onAdvance(s.to)}>
                   {s.label}
                 </button>
               ))}
@@ -1269,6 +1436,28 @@ function OrderDrawer({
           )}
         </div>
       </div>
+
+      {/* #4 分房弹窗：复用房控页同款 RoomingEditor / updateRoomAssignment 路径 */}
+      {roomingOpen && (
+        <div
+          className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/50 p-4"
+          onClick={() => setRoomingOpen(false)}
+        >
+          <div
+            className="max-h-[90vh] w-full max-w-3xl overflow-auto rounded-2xl bg-white p-5 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <RoomingEditor
+              key={o.id}
+              passengers={toRoomingPassengers(o)}
+              initial={o.roomAssignment?.roomGroups}
+              hotelName={hotelName ?? undefined}
+              onSave={saveRooming}
+              onClose={() => setRoomingOpen(false)}
+            />
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1399,7 +1588,22 @@ function FulfillmentSection({ orderId }: { orderId: string }) {
             <FfCard key={t.id} icon={meta.icon} label={meta.label} status={t.status as FulfillmentStatus}>
               {t.type === 'FLIGHT_TICKETING' && !isEditing && (
                 <>
-                  <Row label="PNR" value={<span className="font-mono">{data.pnr ?? '（未生成）'}</span>} />
+                  <Row
+                    label="PNR"
+                    value={
+                      <span className="inline-flex items-center gap-1.5">
+                        <span className="font-mono">{data.pnr ?? '（未生成）'}</span>
+                        {data.pnr && (
+                          <span
+                            className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700"
+                            title="此 PNR/电子票号为系统演示自动出票生成，非真实航司 PNR；正式对接航司后以真实出票为准。"
+                          >
+                            演示自动出票
+                          </span>
+                        )}
+                      </span>
+                    }
+                  />
                   <Row label="电子票号" value={<span className="font-mono">{data.eTicketNumber ?? '—'}</span>} />
                 </>
               )}
@@ -2211,7 +2415,7 @@ function OpsToolbar({ order }: { order: OrderSummary; onAdvance: (next: OrderSta
       const res = await api.claimOrder(tokens.accessToken, order.id);
       setClaimed(res.claimedBy);
     } catch (e) {
-      alert(`认领失败：${e instanceof Error ? e.message : '未知错误'}`);
+      alert(`接单失败：${e instanceof Error ? e.message : '未知错误'}`);
     } finally {
       setBusy(null);
     }
@@ -2222,16 +2426,20 @@ function OpsToolbar({ order }: { order: OrderSummary; onAdvance: (next: OrderSta
       <div className="flex items-center justify-between mb-2">
         <h3 className="text-sm font-semibold text-brand">运营工具</h3>
         {claimed ? (
-          <span className="text-xs text-slate-600">
-            🤝 已认领 · {claimed.displayName ?? claimed.email ?? claimed.id}
+          <span
+            className="text-xs text-slate-600"
+            title="该订单已由此人负责跟进（出票/签证/联系客户）"
+          >
+            🙋 已接单 · 负责人 {claimed.displayName ?? claimed.email ?? claimed.id}
           </span>
         ) : (
           <button
             className="rounded bg-amber-500 px-2 py-0.5 text-xs text-white hover:bg-amber-600 disabled:opacity-50"
             onClick={handleClaim}
             disabled={busy !== null}
+            title="接下这单，成为负责人跟进出票/签证/联系客户（避免多人重复处理或漏单）"
           >
-            {busy === 'claim' ? '认领中…' : '🙋 我接这单'}
+            {busy === 'claim' ? '接单中…' : '🙋 我来接单'}
           </button>
         )}
       </div>

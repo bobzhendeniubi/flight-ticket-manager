@@ -40,6 +40,10 @@ import {
   roomAllocationExportFilename,
 } from './orders.export-room-allocation.js';
 import {
+  buildMasterExportWorkbook,
+  masterExportFilename,
+} from './orders.export-master.js';
+import {
   buildRosterTemplateWorkbook,
   parseRosterXlsx,
   rosterTemplateFilename,
@@ -459,6 +463,45 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         .header(
           'Content-Disposition',
           `attachment; filename="${encodeURIComponent(orderTemplateExportFilename(query.template))}"`,
+        )
+        .send(buf);
+    },
+  );
+
+  // ── 全岗总表导出（PRIMARY 综合导出：一行/乘客，字段全）──
+  // GET /orders/export/master?from=YYYY-MM-DD&to=YYYY-MM-DD&role=all|ticketing|visa
+  // 按出发日期区间选单（同整班/全岗口径）；role 缺省=完整全岗表，仅裁与岗位无关的列。
+  // ADMIN/STAFF only（与其它导出一致：代理/客户不放行）。
+  app.get(
+    '/export/master',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    async (req, reply) => {
+      const query = z
+        .object({
+          from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, '日期格式应为 YYYY-MM-DD').optional(),
+          to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, '日期格式应为 YYYY-MM-DD').optional(),
+          role: z.enum(['all', 'ticketing', 'visa']).optional(),
+        })
+        .parse(req.query);
+      const buf = await buildMasterExportWorkbook(query);
+
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'EXPORT_ORDER_MASTER',
+        targetType: 'ORDER',
+        targetId: 'master',
+        targetLabel: `全岗总表 ${query.from ?? '全部'} ~ ${query.to ?? query.from ?? '全部'}`,
+        after: { from: query.from ?? null, to: query.to ?? null, role: query.role ?? 'all' },
+      });
+
+      return reply
+        .header(
+          'Content-Type',
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
+        .header(
+          'Content-Disposition',
+          `attachment; filename="${encodeURIComponent(masterExportFilename(query.from, query.to))}"`,
         )
         .send(buf);
     },
