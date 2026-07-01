@@ -13,7 +13,7 @@ import {
   type MockBundle,
   type BundleItem,
 } from '../lib/mockData';
-import { api, ApiError, type Hotel, type Transfer as ApiTransfer, type Visa as ApiVisa, type Bundle as ApiBundle } from '../lib/api';
+import { api, ApiError, type Hotel, type Transfer as ApiTransfer, type Visa as ApiVisa, type Bundle as ApiBundle, type AdminFlight, type BundleFlightRef } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { NumberInput } from '../components/NumberInput';
 import { BundleBlackoutEditor, type BlackoutDateRow } from '../components/BundleBlackoutEditor';
@@ -139,6 +139,8 @@ function bundleApiToMock(b: ApiBundle): MockBundle {
     legs: b.legs,
     blackoutDates: b.blackoutDates ?? [],
     defaultDepartDate: b.defaultDepartDate ?? null,
+    outboundFlight: b.outboundFlight ?? null,
+    returnFlight: b.returnFlight ?? null,
   };
 }
 
@@ -176,6 +178,56 @@ interface RoomTypeOption {
   label: string;
 }
 
+/** 套餐表单的航班号下拉选项（航班号 · 航线，value = flightId）；保留航班号/航线字段以便提交时回建引用 */
+interface FlightOption {
+  id: string;
+  label: string;
+  flightNumber: string;
+  originCode: string;
+  destinationCode: string;
+}
+
+/** 航班号下拉标签：`QH9589 · MFM→DAD`。只列在售航班；value = flight.id。 */
+function flightsToOptions(flights: AdminFlight[]): FlightOption[] {
+  return flights
+    .filter((f) => f.isActive)
+    .map((f) => ({
+      id: f.id,
+      label: `${f.flightNumber} · ${f.originCode}→${f.destinationCode}`,
+      flightNumber: f.flightNumber,
+      originCode: f.originCode,
+      destinationCode: f.destinationCode,
+    }));
+}
+
+/**
+ * 由选中的 flightId 回建套餐航班号引用（BundleFlightRef）：
+ * 优先用当前下拉选项；选项里没有（如航班停用了但套餐仍绑着）则回退已绑引用；都没有 → null。
+ */
+function resolveFlightRef(
+  flightId: string,
+  options: FlightOption[],
+  fallback: BundleFlightRef | null | undefined,
+): BundleFlightRef | null {
+  if (!flightId) return null;
+  const opt = options.find((o) => o.id === flightId);
+  if (opt) {
+    return {
+      id: opt.id,
+      flightNumber: opt.flightNumber,
+      originCode: opt.originCode,
+      destinationCode: opt.destinationCode,
+    };
+  }
+  return fallback && fallback.id === flightId ? fallback : null;
+}
+
+/** 航班号引用 → 展示标签：`QH9589 · MFM→DAD`（套餐卡/表单展示已绑航班用）。 */
+function flightRefLabel(ref: BundleFlightRef | null | undefined): string | null {
+  if (!ref) return null;
+  return `${ref.flightNumber} · ${ref.originCode}→${ref.destinationCode}`;
+}
+
 export function ProductsPage() {
   const tokens = useAuth((s) => s.tokens);
   const [section, setSection] = useState<Section>('hotels');
@@ -184,14 +236,24 @@ export function ProductsPage() {
   const [visas, setVisas] = useState<MockVisa[]>([]);
   const [bundles, setBundles] = useState<MockBundle[]>([]);
   const [roomTypeOptions, setRoomTypeOptions] = useState<RoomTypeOption[]>([]);
+  // 套餐可绑定的航班号选项（去程/回程下拉用）。仅在售航班。
+  const [flightOptions, setFlightOptions] = useState<FlightOption[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+
+  const tk = tokens?.accessToken ?? '';
 
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
-    Promise.all([api.listHotels(false), api.listTransfers(false), api.listVisas(false), api.listBundles(false)])
-      .then(([h, t, v, b]) => {
+    Promise.all([
+      api.listHotels(false),
+      api.listTransfers(false),
+      api.listVisas(false),
+      api.listBundles(false),
+      api.listAllFlights(tk).catch(() => ({ flights: [] as AdminFlight[] })),
+    ])
+      .then(([h, t, v, b, f]) => {
         if (cancelled) return;
         const activeHotels = activeOnly(h.hotels);
         setHotels(activeHotels.map(hotelApiToMock));
@@ -201,15 +263,15 @@ export function ProductsPage() {
         setRoomTypeOptions(
           activeHotels.flatMap((ht) => ht.roomTypes.map((rt) => ({ id: rt.id, label: `${ht.name} · ${rt.name}` }))),
         );
+        setFlightOptions(flightsToOptions(f.flights));
       })
       .catch((e) => {
         if (!cancelled) setError(e instanceof ApiError ? e.message : '加载失败');
       })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  const tk = tokens?.accessToken ?? '';
 
   async function persistHotels(next: MockHotel[]) {
     const prev = hotels;
@@ -336,6 +398,9 @@ export function ProductsPage() {
           legs: n.legs ?? 2,
           blackoutDates: n.blackoutDates ?? [],
           defaultDepartDate: n.defaultDepartDate ?? null,
+          // 绑定航班号（去程/回程）：选了 = flight.id；不指定 = null。
+          outboundFlightId: n.outboundFlight?.id ?? null,
+          returnFlightId: n.returnFlight?.id ?? null,
         });
       }
       for (const n of next) {
@@ -355,6 +420,9 @@ export function ProductsPage() {
             legs: n.legs ?? 2,
             blackoutDates: n.blackoutDates ?? [],
             defaultDepartDate: n.defaultDepartDate ?? null,
+            // 绑定航班号（去程/回程）：选了 = flight.id；不指定 = null（解绑）。
+            outboundFlightId: n.outboundFlight?.id ?? null,
+            returnFlightId: n.returnFlight?.id ?? null,
             isActive: n.active,
           });
         }
@@ -411,7 +479,12 @@ export function ProductsPage() {
       {section === 'transfers' && <TransfersSection items={transfers} onChange={persistTransfers} />}
       {section === 'visas' && <VisasSection items={visas} onChange={persistVisas} />}
       {section === 'bundles' && (
-        <BundlesSection items={bundles} roomTypeOptions={roomTypeOptions} onChange={persistBundles} />
+        <BundlesSection
+          items={bundles}
+          roomTypeOptions={roomTypeOptions}
+          flightOptions={flightOptions}
+          onChange={persistBundles}
+        />
       )}
     </div>
   );
@@ -425,7 +498,10 @@ function HotelsSection({ items, onChange }: { items: MockHotel[]; onChange: (v: 
     <div className="space-y-3">
       <ActionBar active={items.length} onAdd={() => setShowForm(true)} addLabel="+ 新增酒店" />
       {editing && (
+        // key=编辑目标 id：强制每次「编辑」都重挂载表单，用最新 hotel 重新播种内部 state。
+        // 缺 key 时表单实例被复用，新建酒店后刷新列表（id 变、对象换新）会让二次编辑打不开/带旧数据。
         <EditHotelForm
+          key={editing.id}
           hotel={editing}
           onCancel={() => setEditing(null)}
           onSave={(h) => { onChange(items.map((x) => x.id === h.id ? h : x)); setEditing(null); }}
@@ -518,7 +594,10 @@ function TransfersSection({ items, onChange }: { items: MockTransfer[]; onChange
   return (
     <div className="space-y-3">
       {editing && (
+        // key=编辑目标 id：强制每次「编辑」都重挂载表单，用最新对象重新播种内部 state。
+        // 缺 key 时表单实例被复用，新建后刷新列表（id 变、对象换新）会让二次编辑打不开/带旧数据。
         <EditTransferForm
+          key={editing.id}
           transfer={editing}
           onCancel={() => setEditing(null)}
           onSave={(t) => { onChange(items.map((x) => x.id === t.id ? t : x)); setEditing(null); }}
@@ -570,7 +649,10 @@ function VisasSection({ items, onChange }: { items: MockVisa[]; onChange: (v: Mo
   return (
     <div className="space-y-3">
       {editing && (
+        // key=编辑目标 id：强制每次「编辑」都重挂载表单，用最新对象重新播种内部 state。
+        // 缺 key 时表单实例被复用，新建后刷新列表（id 变、对象换新）会让二次编辑打不开/带旧数据。
         <EditVisaForm
+          key={editing.id}
           visa={editing}
           onCancel={() => setEditing(null)}
           onSave={(v) => { onChange(items.map((x) => x.id === v.id ? v : x)); setEditing(null); }}
@@ -626,10 +708,12 @@ function VisasSection({ items, onChange }: { items: MockVisa[]; onChange: (v: Mo
 function BundlesSection({
   items,
   roomTypeOptions,
+  flightOptions,
   onChange,
 }: {
   items: MockBundle[];
   roomTypeOptions: RoomTypeOption[];
+  flightOptions: FlightOption[];
   onChange: (v: MockBundle[]) => void;
 }) {
   const [showWizard, setShowWizard] = useState(false);
@@ -651,6 +735,7 @@ function BundlesSection({
       {showWizard && (
         <NewBundleWizard
           roomTypeOptions={roomTypeOptions}
+          flightOptions={flightOptions}
           flightRefRoundTripCny={deriveFlightRefRoundTrip(items)}
           onCancel={() => setShowWizard(false)}
           onSubmit={(b) => {
@@ -663,6 +748,7 @@ function BundlesSection({
         <NewBundleWizard
           key={editing.id}
           roomTypeOptions={roomTypeOptions}
+          flightOptions={flightOptions}
           initial={editing}
           flightRefRoundTripCny={deriveFlightRefRoundTrip(items)}
           onCancel={() => setEditing(null)}
@@ -742,6 +828,15 @@ function BundleCard({
         </div>
       )}
 
+      {(bundle.outboundFlight || bundle.returnFlight) && (
+        <div className="mt-1 text-xs text-ink-soft">
+          ✈️
+          {bundle.outboundFlight && <> 去程 {flightRefLabel(bundle.outboundFlight)}</>}
+          {bundle.outboundFlight && bundle.returnFlight && ' · '}
+          {bundle.returnFlight && <> 回程 {flightRefLabel(bundle.returnFlight)}</>}
+        </div>
+      )}
+
       {(bundle.singleSupplementCnyPerNight != null || bundle.businessUpgradeCnyPerLeg != null) && (
         <div className="mt-1 text-xs text-ink-soft">
           {bundle.singleSupplementCnyPerNight != null && (
@@ -805,12 +900,15 @@ function BundleCard({
 
 function NewBundleWizard({
   roomTypeOptions,
+  flightOptions,
   initial,
   flightRefRoundTripCny,
   onCancel,
   onSubmit,
 }: {
   roomTypeOptions: RoomTypeOption[];
+  /** 可绑定的航班号选项（去程/回程下拉）；value = flight.id */
+  flightOptions: FlightOption[];
   /** 传入既有套餐 = 编辑模式（各字段预填）；缺省 = 新建 */
   initial?: MockBundle;
   /** 当前最低来回机票 / 人（CNY）：把「想卖的价格」换算成折扣% 的原价锚点；页面从已有套餐推得 */
@@ -831,6 +929,9 @@ function NewBundleWizard({
   // 不可售日期（blackout，按出发日，单套餐粒度）+ 前台默认出发日
   const [blackoutDates, setBlackoutDates] = useState<BlackoutDateRow[]>(initial?.blackoutDates ?? []);
   const [defaultDepartDate, setDefaultDepartDate] = useState<string>(initial?.defaultDepartDate ?? '');
+  // 绑定航班号（去程/回程）：存 flight.id，空串 = 不指定（按最便宜航班）。编辑时从已绑航班预填。
+  const [outboundFlightId, setOutboundFlightId] = useState<string>(initial?.outboundFlight?.id ?? '');
+  const [returnFlightId, setReturnFlightId] = useState<string>(initial?.returnFlight?.id ?? '');
   // 自愿升级展示价（CNY；留空 = 前台不展示该升级项）
   const [singleSupplement, setSingleSupplement] = useState<number | null>(initial?.singleSupplementCnyPerNight ?? null);
   const [businessUpgrade, setBusinessUpgrade] = useState<number | null>(initial?.businessUpgradeCnyPerLeg ?? null);
@@ -907,6 +1008,26 @@ function NewBundleWizard({
     setItems([...items, presets[kind]]);
   };
 
+  // 去程/回程方向过滤：单一往返航线，回程须从去程到达地起飞（origin = 去程 destination）。
+  // 反向亦然。不硬编码机场码，全靠所选航班的 origin/destination 推导。
+  const outboundSel = flightOptions.find((o) => o.id === outboundFlightId) ?? null;
+  const returnSel = flightOptions.find((o) => o.id === returnFlightId) ?? null;
+  // 回程候选：选了去程 → 只留「从去程到达地起飞」的航班；未选 → 全部。
+  // 兜底：始终保留当前已绑回程（编辑预填时方向过滤不该把已绑值挤掉）。
+  const returnOptions = useMemo(() => {
+    if (!outboundSel) return flightOptions;
+    return flightOptions.filter(
+      (o) => o.originCode === outboundSel.destinationCode || o.id === returnFlightId,
+    );
+  }, [flightOptions, outboundSel, returnFlightId]);
+  // 去程候选：对称过滤 —— 选了回程 → 只留「到达地 = 回程出发地」的航班；未选 → 全部。始终保留已绑去程。
+  const outboundOptions = useMemo(() => {
+    if (!returnSel) return flightOptions;
+    return flightOptions.filter(
+      (o) => o.destinationCode === returnSel.originCode || o.id === outboundFlightId,
+    );
+  }, [flightOptions, returnSel, outboundFlightId]);
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/40 p-4 backdrop-blur-sm" onClick={onCancel}>
       <div
@@ -977,6 +1098,44 @@ function NewBundleWizard({
               />
               <p className="mt-1 text-xs text-ink-muted">前台默认带出的出发日，不影响可售判定。留空 = 无默认。</p>
             </div>
+          </div>
+
+          {/* 绑定航班号（去程/回程）：只绑航班号，不绑某一天班次；买家选出发日后系统匹配当天班次 */}
+          <div>
+            <div className="grid gap-3 md:grid-cols-2">
+              <div>
+                <label className="label">去程航班</label>
+                <select
+                  className="input"
+                  value={outboundFlightId}
+                  onChange={(e) => setOutboundFlightId(e.target.value)}
+                >
+                  <option value="">不指定（按最便宜航班）</option>
+                  {outboundOptions.map((o) => (
+                    <option key={o.id} value={o.id}>{o.label}</option>
+                  ))}
+                </select>
+              </div>
+              <div>
+                <label className="label">回程航班</label>
+                <select
+                  className="input"
+                  value={returnFlightId}
+                  onChange={(e) => setReturnFlightId(e.target.value)}
+                >
+                  <option value="">不指定（按最便宜航班）</option>
+                  {returnOptions.map((o) => (
+                    <option key={o.id} value={o.id}>{o.label}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+            <p className="mt-1 text-xs text-ink-muted">
+              绑定航班号即可（不用选某一天）。买家选出发日后，系统按航班号自动匹配当天班次。
+            </p>
+            {flightOptions.length === 0 && (
+              <p className="mt-1 text-xs text-ink-muted">暂无可选航班？在 航班管理 里添加航班后即可绑定。</p>
+            )}
           </div>
 
           <BundleBlackoutEditor value={blackoutDates} onChange={setBlackoutDates} />
@@ -1244,6 +1403,9 @@ function NewBundleWizard({
                       ...(b.reason?.trim() ? { reason: b.reason.trim() } : {}),
                     })),
                   defaultDepartDate: defaultDepartDate || null,
+                  // 绑定航班号（去程/回程）：回建引用；不选 = null（不指定，按最便宜航班）
+                  outboundFlight: resolveFlightRef(outboundFlightId, flightOptions, initial?.outboundFlight),
+                  returnFlight: resolveFlightRef(returnFlightId, flightOptions, initial?.returnFlight),
                 })
               }
             >

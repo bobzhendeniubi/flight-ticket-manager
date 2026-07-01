@@ -349,7 +349,7 @@ const FULL_COLUMNS: Array<{ header: string; key: keyof FullRow; width: number }>
   { header: '签证状态', key: 'visaStatus', width: 10 },
   { header: '签证选项', key: 'visaOption', width: 20 },
   { header: '签证备注', key: 'visaNote', width: 14 },
-  { header: '护照签发国', key: 'passportIssuePlace', width: 10 },
+  { header: '护照签发地', key: 'passportIssuePlace', width: 10 },
   { header: '出生地', key: 'placeOfBirth', width: 10 },
   { header: '订单编号', key: 'orderNumber', width: 20 },
   { header: '舱位等级', key: 'cabin', width: 10 },

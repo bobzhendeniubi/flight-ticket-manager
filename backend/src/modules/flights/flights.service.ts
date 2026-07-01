@@ -6,6 +6,7 @@ import type { AuditActor } from '../../lib/audit.js';
 import { PricingService } from '../pricing/pricing.service.js';
 import { parseFareBuckets } from '../pricing/pricing.schemas.js';
 import type { FareBucketsInput } from '../pricing/pricing.schemas.js';
+import { localDate } from '../finances/finances.cost.service.js';
 import type {
   BaggagePolicyItem,
   CreateFlightBody,
@@ -350,6 +351,20 @@ export class FlightService {
     });
     if (dup) throw new ConflictError('该航班在此出发时间已有班次');
 
+    // 约束：一个航班号一天只能一班（套餐绑航班号后，买家选出发日须能唯一解析出班次）。
+    // 用出发地时区把 departureTime 折成本地日比较（避免 UTC 边界导致跨天误判）。
+    const depLocalDay = localDate(dep, body.departureTz);
+    const sameFlightSchedules = await prisma.flightSchedule.findMany({
+      where: { flightId: flight.id },
+      select: { departureTime: true, departureTz: true },
+    });
+    const clash = sameFlightSchedules.some(
+      (s) => localDate(s.departureTime, s.departureTz) === depLocalDay,
+    );
+    if (clash) {
+      throw new BadRequestError('该航班号当天已有班次，一个航班号一天只能一班');
+    }
+
     const seats = body.seatClasses;
     // 确保同一舱等不重复
     const cabins = new Set<CabinClass>();
@@ -420,6 +435,25 @@ export class FlightService {
       newArr = body.arrivalTime ? new Date(body.arrivalTime) : schedule.arrivalTime;
       if (newArr <= newDep) {
         throw new BadRequestError('到达时间必须晚于出发时间（跨天到达请使用次日时间）');
+      }
+
+      // 约束：一个航班号一天只能一班（与 createSchedule 同口径）。改点若把本地出发日挪到
+      // 同航班号已有班次占用的那一天 → 拒绝，避免编辑绕过创建时的当天唯一性校验。
+      // 用出发地时区把出发时间折成本地日比较（复用 createSchedule 的 localDate 折叠，避免 UTC 边界跨天误判）。
+      // updateSchedule 不改时区，故沿用本班次现有 departureTz；仅当本地出发日实际改变才校验。
+      const oldLocalDay = localDate(schedule.departureTime, schedule.departureTz);
+      const newLocalDay = localDate(newDep, schedule.departureTz);
+      if (newLocalDay !== oldLocalDay) {
+        const sameFlightSchedules = await prisma.flightSchedule.findMany({
+          where: { flightId: schedule.flightId, id: { not: scheduleId } },
+          select: { departureTime: true, departureTz: true },
+        });
+        const clash = sameFlightSchedules.some(
+          (s) => localDate(s.departureTime, s.departureTz) === newLocalDay,
+        );
+        if (clash) {
+          throw new BadRequestError('该航班号当天已有班次，一个航班号一天只能一班');
+        }
       }
     }
 

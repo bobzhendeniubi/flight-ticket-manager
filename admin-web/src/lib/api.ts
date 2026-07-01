@@ -542,6 +542,15 @@ export interface RoomAssignment {
   roomGroups: RoomGroup[];
 }
 
+// ── 酒店房量档位（公开端点只回档位不回原始数字，与六档余位同纪律）──────────
+export type HotelAvailabilityTier = 'AMPLE' | 'TIGHT' | 'LOW' | 'SOLD_OUT';
+
+export interface HotelAvailabilityResult {
+  /** null = 该时段未配置包房（不展示房量，也不拦截销售） */
+  tier: HotelAvailabilityTier | null;
+  nights: number;
+}
+
 export type InvoiceStatus = 'NONE' | 'REQUESTED' | 'ISSUED';
 
 /**
@@ -893,6 +902,44 @@ export interface BundleBlackoutDate {
   reason?: string;
 }
 
+/** 套餐绑定的航班号引用（serializeBundle 联表返回）；按航班号绑定，买家选出发日后系统再匹配当天班次 */
+export interface BundleFlightRef {
+  id: string;
+  flightNumber: string;
+  originCode: string;
+  destinationCode: string;
+}
+
+/**
+ * 套餐写入体（create / update 共用；update 时字段可省略 = 不改）。
+ * outboundFlightId / returnFlightId：航班号绑定 —— string=绑该 Flight.id，null=解绑（不指定）。
+ */
+export interface BundleWriteBody {
+  name?: string;
+  tagline?: string | null;
+  emoji?: string | null;
+  items?: BundleItemData[];
+  flightPax?: number;
+  discountPct?: number;
+  groundDiscount?: number;
+  suitableFor?: string | null;
+  hotelRoomTypeId?: string | null;
+  hotelNights?: number | null;
+  singleSupplementCnyPerNight?: number | null;
+  businessUpgradeCnyPerLeg?: number | null;
+  childSeatDiscountCnyPerPerson?: number | null;
+  selfVisaDeductCny?: number | null;
+  infantPriceCny?: number | null;
+  legs?: number | null;
+  blackoutDates?: BundleBlackoutDate[];
+  defaultDepartDate?: string | null;
+  /** 绑定去程航班号：Flight.id 绑定；null 解绑；省略 = 不改 */
+  outboundFlightId?: string | null;
+  /** 绑定回程航班号：Flight.id 绑定；null 解绑；省略 = 不改 */
+  returnFlightId?: string | null;
+  isActive?: boolean;
+}
+
 export interface Bundle {
   id: string;
   /** 产品编号（服务端生成，如 B0001）；老数据可能为 null */
@@ -918,6 +965,10 @@ export interface Bundle {
   hotelNights: number | null;
   /** 展示用：服务端联表返回的房型名 + 酒店名；null = 不关联 */
   hotelRoomType: { id: string; name: string; hotelName: string } | null;
+  /** 绑定的去程航班号（按航班号绑定，不绑某一天班次）；null = 不指定，按最便宜航班 */
+  outboundFlight: BundleFlightRef | null;
+  /** 绑定的回程航班号；null = 不指定，按最便宜航班 */
+  returnFlight: BundleFlightRef | null;
   /** 自愿升级：一个人住酒店（单人入住）每人每晚加价（CNY/晚，整数） */
   singleSupplementCnyPerNight: number;
   /** 自愿升级：升舱商务每人每航段加价（CNY/程，整数） */
@@ -1682,6 +1733,12 @@ export const api = {
       body: { toStatus, notes },
     }),
 
+  // 酒店房量档位（公开端点，只回档位不回原始数字，与六档余位同纪律）
+  getHotelAvailability: (params: { hotelRoomTypeId: string; checkIn: string; checkOut: string }) => {
+    const qs = new URLSearchParams(params);
+    return apiFetch<HotelAvailabilityResult>(`/products/hotel-availability?${qs.toString()}`);
+  },
+
   // Products — Hotels
   listHotels: (activeOnly = false) =>
     apiFetch<{ hotels: Hotel[] }>(`/products/hotels${activeOnly ? '?active=1' : ''}`),
@@ -1715,9 +1772,9 @@ export const api = {
   // Products — Bundles
   listBundles: (activeOnly = false) =>
     apiFetch<{ bundles: Bundle[] }>(`/products/bundles${activeOnly ? '?active=1' : ''}`),
-  createBundle: (token: string, body: Record<string, unknown>) =>
+  createBundle: (token: string, body: BundleWriteBody) =>
     apiFetch<{ bundle: Bundle }>('/products/bundles', { method: 'POST', token, body }),
-  updateBundle: (token: string, id: string, body: Record<string, unknown>) =>
+  updateBundle: (token: string, id: string, body: BundleWriteBody) =>
     apiFetch<{ bundle: Bundle }>(`/products/bundles/${id}`, { method: 'PATCH', token, body }),
   deleteBundle: (token: string, id: string) =>
     apiFetch<{ result: { id: string; isActive: boolean } }>(`/products/bundles/${id}`, { method: 'DELETE', token }),

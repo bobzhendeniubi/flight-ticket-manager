@@ -15,7 +15,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ── 在 import OrderService 之前 mock 依赖 ──
 // vi.mock 会被 hoist 到文件顶部，所以引用的变量也得 hoist
-const { mockPrisma, mockComputeQuote } = vi.hoisted(() => ({
+const { mockPrisma, mockComputeQuote, mockGetHotelNightlyRemaining } = vi.hoisted(() => ({
   mockPrisma: {
     order: {
       findUnique: vi.fn(),
@@ -30,8 +30,15 @@ const { mockPrisma, mockComputeQuote } = vi.hoisted(() => ({
     agent: {
       findUnique: vi.fn(),
     },
+    hotelRoomType: {
+      findUnique: vi.fn(),
+    },
+    bundle: {
+      findUnique: vi.fn(),
+    },
   },
   mockComputeQuote: vi.fn(),
+  mockGetHotelNightlyRemaining: vi.fn(),
 }));
 
 vi.mock('../../db/prisma.js', () => ({
@@ -40,6 +47,10 @@ vi.mock('../../db/prisma.js', () => ({
 
 vi.mock('../../lib/cancellation.js', () => ({
   computeCancellationQuote: mockComputeQuote,
+}));
+
+vi.mock('../hotel-control/hotel-control.service.js', () => ({
+  getHotelNightlyRemaining: mockGetHotelNightlyRemaining,
 }));
 
 // 现在才能 import service
@@ -54,6 +65,7 @@ import {
   computeRoomsNeeded,
   createFulfillmentTasks,
   resolveOrderAgentId,
+  buildStayNightDates,
 } from './orders.service.js';
 import type { OrderItemInput } from './orders.schemas.js';
 import { batchCreateOrdersBodySchema, createOrderBodySchema } from './orders.schemas.js';
@@ -1471,5 +1483,239 @@ describe('订单签证状态 + 结构化备注四栏', () => {
     expect(result.noteSpecial).toBe('蜜月布置');
     // 兼容：老的 notes 字段仍然存在
     expect(result.notes).toBe('客户原始自由备注（兼容保留）');
+  });
+});
+
+// ── 住宿逐晚展开：buildStayNightDates ────────────────────────────────────
+// [checkIn, checkOut) 半开区间展开为逐晚 YYYY-MM-DD（UTC date-only）。
+// 防御：反向 / 相等 / 超大跨度 → []（调用方按"无从校验"跳过，不阻断下单）。
+describe('buildStayNightDates', () => {
+  it('合法区间 [7/1, 7/4) → 三晚 7/1、7/2、7/3', () => {
+    expect(
+      buildStayNightDates(new Date('2026-07-01T00:00:00.000Z'), new Date('2026-07-04T00:00:00.000Z')),
+    ).toEqual(['2026-07-01', '2026-07-02', '2026-07-03']);
+  });
+
+  it('单晚 [7/1, 7/2) → [7/1]', () => {
+    expect(
+      buildStayNightDates(new Date('2026-07-01T00:00:00.000Z'), new Date('2026-07-02T00:00:00.000Z')),
+    ).toEqual(['2026-07-01']);
+  });
+
+  it('反向区间（checkOut < checkIn）→ []', () => {
+    expect(
+      buildStayNightDates(new Date('2026-07-04T00:00:00.000Z'), new Date('2026-07-01T00:00:00.000Z')),
+    ).toEqual([]);
+  });
+
+  it('相等区间（0 晚）→ []', () => {
+    expect(
+      buildStayNightDates(new Date('2026-07-01T00:00:00.000Z'), new Date('2026-07-01T00:00:00.000Z')),
+    ).toEqual([]);
+  });
+
+  it('超大跨度（> 60 晚）→ []（防御）', () => {
+    expect(
+      buildStayNightDates(new Date('2026-07-01T00:00:00.000Z'), new Date('2026-12-01T00:00:00.000Z')),
+    ).toEqual([]);
+  });
+
+  it('非法 Date（NaN）→ []', () => {
+    expect(buildStayNightDates(new Date('garbage'), new Date('2026-07-04T00:00:00.000Z'))).toEqual([]);
+  });
+});
+
+// ── 套餐酒店房量库存门槛（与 createOrder BUNDLE 分支同源判定式）──────────────
+// 守卫式：hasBlock && remaining.some((r, i) => block[i] > 0 && r < rooms) → 房量不足拦截。
+//   · 只看被周期覆盖的晚（block[i] > 0）：未管控的晚（block[i] === 0）不拦截。
+//   · 与本单所需房间数 rooms 比较（多间需求时够 1 间不能放行）。
+describe('套餐酒店房量库存门槛（roomsNeeded-aware guard）', () => {
+  // 与 orders.service.ts BUNDLE 分支逐字同源的纯判定式复刻
+  const blocks = (
+    remaining: number[],
+    block: number[],
+    hasBlock: boolean,
+    rooms: number,
+  ): boolean => hasBlock && remaining.some((r, i) => block[i] > 0 && r < rooms);
+
+  it('每晚 remaining ≥ rooms → 放行（不拦截）', () => {
+    // 需要 2 间，被管控晚都剩 2 → 通过
+    expect(blocks([2, 2, 3], [4, 4, 4], true, 2)).toBe(false);
+  });
+
+  it('被管控晚 remaining < rooms（余 1 需 2）→ 拦截', () => {
+    // 第二晚被周期覆盖（block=4）但只剩 1 间 < 需求 2 → 拦截（旧逻辑只查 <=0 会漏放）
+    expect(blocks([2, 1, 2], [4, 4, 4], true, 2)).toBe(true);
+  });
+
+  it('余量不足的那晚未被周期覆盖（block===0）→ 不拦截', () => {
+    // 第二晚 remaining=0 但 block=0（未管控）→ 不据此判售罄
+    expect(blocks([2, 0, 2], [4, 0, 4], true, 2)).toBe(false);
+  });
+
+  it('hasBlock=false（整段未配置房控）→ 直接跳过守卫', () => {
+    // 即便 remaining 里有不足，hasBlock=false 一律放行
+    expect(blocks([0, 0, 0], [0, 0, 0], false, 2)).toBe(false);
+  });
+
+  it('rooms=1（单间需求）且被管控晚剩 0 → 拦截（等价旧 <=0 语义）', () => {
+    expect(blocks([1, 0, 1], [2, 2, 2], true, 1)).toBe(true);
+  });
+
+  it('半间需求（rooms=0.5）被管控晚剩 0 → 拦截；剩 1 → 放行', () => {
+    expect(blocks([0], [2], true, 0.5)).toBe(true);
+    expect(blocks([1], [2], true, 0.5)).toBe(false);
+  });
+});
+
+// ── 套餐/酒店服务端权威重算 + 下架拦截（priceAndValidateItems）─────────────
+// 通过私有方法直接驱动，隔离扣座事务；验证 FIX：机票外产品的重算价来源 + 下架酒店拦截。
+describe('priceAndValidateItems · 酒店重算价来源 + 下架拦截', () => {
+  const service = new OrderService();
+  const dec2 = (n: number) => ({ toString: () => String(n) }) as unknown;
+  // 私有方法访问器（沿用文件既有 as-unknown 转型风格）
+  const price = (items: OrderItemInput[]) =>
+    (service as unknown as {
+      priceAndValidateItems(i: OrderItemInput[], s?: number): Promise<Array<{
+        kind: string;
+        unitPrice: number;
+        amount: number;
+        hotelRoomTypeId?: string;
+      }>>;
+    }).priceAndValidateItems(items);
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('HOTEL 行绑房型 → 单价改用 HotelRoomType.basePrice（不信前端 unitPrice）', async () => {
+    // 房型权威价 1280；酒店在售
+    mockPrisma.hotelRoomType.findUnique.mockResolvedValue({
+      basePrice: dec2(1280),
+      hotel: { isActive: true },
+    });
+    const priced = await price([
+      {
+        kind: 'HOTEL',
+        description: '海景房',
+        quantity: 2, // 2 晚
+        unitPrice: 1280, // 前端传的价与权威价一致（避免容差拒单）
+        hotelRoomTypeId: 'rt1',
+      } as OrderItemInput,
+    ]);
+    const hotel = priced.find((p) => p.kind === 'HOTEL')!;
+    expect(hotel.unitPrice).toBe(1280); // 来自 basePrice
+    expect(hotel.amount).toBe(1280 * 2); // unitPrice × qty × rooms(1)
+    expect(mockPrisma.hotelRoomType.findUnique).toHaveBeenCalled();
+  });
+
+  it('HOTEL 行无房型（未绑）→ 信任前端 unitPrice（JSON fallback 路径，不查库）', async () => {
+    const priced = await price([
+      {
+        kind: 'HOTEL',
+        description: '自由行酒店',
+        quantity: 3,
+        unitPrice: 900,
+        // 无 hotelRoomTypeId
+      } as OrderItemInput,
+    ]);
+    const hotel = priced.find((p) => p.kind === 'HOTEL')!;
+    expect(hotel.unitPrice).toBe(900);
+    expect(hotel.amount).toBe(900 * 3);
+    // 未绑房型 → 不查房型库
+    expect(mockPrisma.hotelRoomType.findUnique).not.toHaveBeenCalled();
+  });
+
+  it('HOTEL 行绑房型但酒店已下架 → 抛「酒店已下架」', async () => {
+    mockPrisma.hotelRoomType.findUnique.mockResolvedValue({
+      basePrice: dec2(1280),
+      hotel: { isActive: false },
+    });
+    await expect(
+      price([
+        {
+          kind: 'HOTEL',
+          description: '海景房',
+          quantity: 1,
+          unitPrice: 1280,
+          hotelRoomTypeId: 'rt_off',
+        } as OrderItemInput,
+      ]),
+    ).rejects.toThrow('酒店已下架');
+  });
+
+  it('套餐绑的房型其酒店已下架 → 抛「酒店已下架」（防止经套餐绕过下架酒店，FIX C）', async () => {
+    mockPrisma.bundle.findUnique.mockResolvedValue({
+      items: [],
+      groundDiscount: dec2(0),
+      discountPct: 0,
+      isActive: true,
+      hotelRoomTypeId: 'rt_bundle',
+      hotelNights: 3,
+      singleSupplementCnyPerNight: 80,
+      businessUpgradeCnyPerLeg: 700,
+      childSeatDiscountCnyPerPerson: 30,
+      infantPriceCny: 0,
+      selfVisaDeductCny: 0,
+      legs: 2,
+      hotelRoomType: {
+        maxAdults: 2,
+        maxChildren: 1,
+        basePrice: dec2(1280),
+        hotelId: 'hotel_off',
+        hotel: { isActive: false }, // 下架
+      },
+    });
+    await expect(
+      price([
+        {
+          kind: 'BUNDLE',
+          description: '岘港套餐',
+          quantity: 1,
+          unitPrice: 0,
+          bundleId: 'bdl1',
+        } as OrderItemInput,
+      ]),
+    ).rejects.toThrow('酒店已下架');
+    // 抛错在库存校验之前，不应调用房量查询
+    expect(mockGetHotelNightlyRemaining).not.toHaveBeenCalled();
+  });
+
+  it('套餐绑的房型酒店在售 → 不因下架拦截（走后续定价，酒店在售放行）', async () => {
+    mockPrisma.bundle.findUnique.mockResolvedValue({
+      items: [{ kind: 'HOTEL', qty: 3, unitPrice: 1280 }],
+      groundDiscount: dec2(0),
+      discountPct: 0,
+      isActive: true,
+      hotelRoomTypeId: 'rt_bundle',
+      hotelNights: 3,
+      singleSupplementCnyPerNight: 80,
+      businessUpgradeCnyPerLeg: 700,
+      childSeatDiscountCnyPerPerson: 30,
+      infantPriceCny: 0,
+      selfVisaDeductCny: 0,
+      legs: 2,
+      hotelRoomType: {
+        maxAdults: 2,
+        maxChildren: 1,
+        basePrice: dec2(1280),
+        hotelId: 'hotel_on',
+        hotel: { isActive: true },
+      },
+    });
+    // 无 goDate 盖章 → 不触发库存校验（沿用宽松口径），此调用应成功不抛下架
+    const priced = await price([
+      {
+        kind: 'BUNDLE',
+        description: '岘港套餐',
+        quantity: 1,
+        unitPrice: 0,
+        bundleId: 'bdl1',
+      } as OrderItemInput,
+    ]);
+    const bundle = priced.find((p) => p.kind === 'BUNDLE')!;
+    expect(bundle).toBeDefined();
+    // 酒店地面价按权威 basePrice ×rooms 重算：1280 × 3 晚 × 1 间 = 3840
+    expect(bundle.unitPrice).toBe(3840);
   });
 });

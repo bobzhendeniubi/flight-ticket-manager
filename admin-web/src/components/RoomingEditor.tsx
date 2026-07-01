@@ -11,7 +11,7 @@
  * 保存：onSave 只收「至少 1 名出行人」的盒子，按 RoomGroup 形状回传。
  */
 import { useMemo, useState } from 'react';
-import type { RoomGroup } from '../lib/api';
+import type { HotelAvailabilityTier, RoomGroup } from '../lib/api';
 
 // ── 类型 ─────────────────────────────────────────────────────────────────
 export interface RoomingPassenger {
@@ -24,9 +24,19 @@ interface RoomingEditorProps {
   passengers: RoomingPassenger[];
   initial?: RoomGroup[];
   hotelName?: string;
+  /** 该酒店在住宿区间的房量档位（只显档位不显数字，与六档余位同纪律）；null = 不展示。 */
+  hotelTier?: HotelAvailabilityTier | null;
   onSave: (groups: RoomGroup[]) => Promise<void>;
   onClose: () => void;
 }
+
+// 房量档位文案 + 徽章配色（只看档位，绝不暴露精确余房数字）。
+const HOTEL_TIER_BADGE: Record<HotelAvailabilityTier, { label: string; cls: string }> = {
+  AMPLE: { label: '房量充足', cls: 'bg-emerald-50 text-emerald-700' },
+  TIGHT: { label: '房量紧张', cls: 'bg-sky-50 text-sky-700' },
+  LOW: { label: '仅剩少量', cls: 'bg-amber-50 text-amber-700' },
+  SOLD_OUT: { label: '已订满', cls: 'bg-rose-50 text-rose-700' },
+};
 
 /** 编辑期房间盒子（roomFraction 必有值，保存时回写 RoomGroup）。 */
 interface RoomBox {
@@ -72,7 +82,7 @@ function seedBoxes(initial: RoomGroup[] | undefined): RoomBox[] {
 }
 
 // ── 组件 ─────────────────────────────────────────────────────────────────
-export function RoomingEditor({ passengers, initial, hotelName, onSave, onClose }: RoomingEditorProps) {
+export function RoomingEditor({ passengers, initial, hotelName, hotelTier, onSave, onClose }: RoomingEditorProps) {
   const [boxes, setBoxes] = useState<RoomBox[]>(() => seedBoxes(initial));
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -197,9 +207,18 @@ export function RoomingEditor({ passengers, initial, hotelName, onSave, onClose 
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div>
           <h3 className="text-base font-semibold text-ink">分房（拖名字到房间）</h3>
+          {hotelName ? (
+            <div className="mt-1 flex flex-wrap items-center gap-2">
+              <span className="text-sm font-medium text-ink">🏨 {hotelName}</span>
+              {hotelTier && (
+                <span className={`badge ${HOTEL_TIER_BADGE[hotelTier].cls}`}>
+                  {HOTEL_TIER_BADGE[hotelTier].label}
+                </span>
+              )}
+            </div>
+          ) : null}
           <p className="mt-0.5 text-xs text-ink-muted">
             把出行人拖到右侧房间盒子，决定谁和谁一起住。拼房可切「半间」。
-            {hotelName ? <> · 酒店：{hotelName}</> : null}
           </p>
         </div>
         <div className="text-xs text-ink-soft">

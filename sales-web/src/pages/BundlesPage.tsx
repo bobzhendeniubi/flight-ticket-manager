@@ -77,6 +77,9 @@ interface BundleView extends MockBundle {
   } | null;
   hotelRoomTypeId: string | null;
   hotelNights: number | null;
+  /** 运营绑定的去/回航班号（选出发日后据此把航段解析到对应班次；null = 未绑定，回退首条）。 */
+  outboundFlightNumber: string | null;
+  returnFlightNumber: string | null;
   /** 套餐默认出发日（管理员设；null = 未设，前端回退 today+3） */
   defaultDepartDate: string | null;
   productRating: ProductRating | null;
@@ -107,6 +110,8 @@ function bundleApiToView(b: ApiBundle): BundleView {
     hotelRoomType: b.hotelRoomType ?? null,
     hotelRoomTypeId: b.hotelRoomTypeId ?? null,
     hotelNights: b.hotelNights ?? null,
+    outboundFlightNumber: b.outboundFlight?.flightNumber ?? null,
+    returnFlightNumber: b.returnFlight?.flightNumber ?? null,
     defaultDepartDate: b.defaultDepartDate ?? null,
     productRating: b.productRating ?? null,
     reviewCount: b.reviewCount ?? null,
@@ -603,8 +608,9 @@ function ConfigurableBundleCard({
     flightCache.ensure(ROUTE_DEST, ROUTE_ORIGIN, queryReturnDate);
   }, [flightCache, queryCardGo, queryReturnDate]);
 
-  const outLeg = flightCache.get(ROUTE_ORIGIN, ROUTE_DEST, queryCardGo);
-  const retLeg = flightCache.get(ROUTE_DEST, ROUTE_ORIGIN, queryReturnDate);
+  // 按运营绑定的航班号解析航段：绑定命中该班，未绑定/未命中回退首条（与旧版一致）。
+  const outLeg = flightCache.getByFlightNumber(ROUTE_ORIGIN, ROUTE_DEST, queryCardGo, b.outboundFlightNumber);
+  const retLeg = flightCache.getByFlightNumber(ROUTE_DEST, ROUTE_ORIGIN, queryReturnDate, b.returnFlightNumber);
   const legs = { go: toLegInfo(outLeg), ret: toLegInfo(retLeg) };
 
   const goTier = legTier(outLeg, cabin);

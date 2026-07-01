@@ -89,6 +89,10 @@ export class FulfillmentService {
     if (query.orderItemId) where.orderItemId = query.orderItemId;
     if (query.orderId) where.orderItem = { orderId: query.orderId };
 
+    // 性能（签证台加载慢根因修复）：
+    // 旧实现在每行 task 的 order include 里嵌套 passengers[] + 关系排序的最早机票子查询，
+    // 一页 200 条会放大成 200× 相关子查询（Prisma 对「嵌套关系排序 + take」逐父发查询 = N+1），
+    // 且非签证任务也会白拉整单乘客。现改为：主查询只取轻量标量，出发日 / 乘客各用 1 条批量查询按 orderId 合并。
     const [rows, total] = await prisma.$transaction([
       prisma.fulfillmentTask.findMany({
         where,
@@ -96,7 +100,7 @@ export class FulfillmentService {
           orderItem: {
             include: {
               // 本签证 item 关联的签证产品（用于 #7：单次/多次签名称）
-              visa: { select: { visaName: true, visaType: true } },
+              visa: { select: { visaName: true } },
               order: {
                 select: {
                   id: true,
@@ -105,17 +109,6 @@ export class FulfillmentService {
                   contactPhone: true,
                   status: true,
                   notes: true,
-                  // 乘客护照明细（供签证台显示；一次 include，无 N+1）
-                  passengers: {
-                    select: { id: true, fullName: true, documentNumber: true, passportPhotoUrl: true },
-                  },
-                  // 同订单最早一段机票行程（用于 #6：签证台显示出发日期）
-                  items: {
-                    where: { kind: OrderItemKind.FLIGHT },
-                    select: { flightSchedule: { select: { departureTime: true, departureTz: true } } },
-                    orderBy: { flightSchedule: { departureTime: 'asc' } },
-                    take: 1,
-                  },
                 },
               },
             },
@@ -128,28 +121,95 @@ export class FulfillmentService {
       prisma.fulfillmentTask.count({ where }),
     ]);
 
+    // 本页涉及的订单集合（去重）——用于批量取乘客 + 最早出发日
+    const orderIds = [...new Set(rows.map((t) => t.orderItem.order.id))];
+    // 仅签证任务需要乘客明细（UI 只在 VISA_APPLICATION 时读取 passengers）
+    const visaOrderIds = [
+      ...new Set(
+        rows
+          .filter((t) => t.type === FulfillmentType.VISA_APPLICATION)
+          .map((t) => t.orderItem.order.id),
+      ),
+    ];
+
+    type PassengerRow = {
+      orderId: string;
+      id: string;
+      fullName: string;
+      documentNumber: string;
+      passportPhotoUrl: string | null;
+    };
+    type FlightLegRow = {
+      orderId: string;
+      flightSchedule: { departureTime: Date; departureTz: string } | null;
+    };
+    const [passengerRows, flightLegRows] = await Promise.all([
+      visaOrderIds.length
+        ? prisma.passenger.findMany({
+            where: { orderId: { in: visaOrderIds } },
+            select: {
+              orderId: true,
+              id: true,
+              fullName: true,
+              documentNumber: true,
+              passportPhotoUrl: true,
+            },
+          })
+        : Promise.resolve([] as PassengerRow[]),
+      orderIds.length
+        ? prisma.orderItem.findMany({
+            where: {
+              orderId: { in: orderIds },
+              kind: OrderItemKind.FLIGHT,
+              flightScheduleId: { not: null },
+            },
+            select: {
+              orderId: true,
+              flightSchedule: { select: { departureTime: true, departureTz: true } },
+            },
+            // 每个订单可能多段机票；下方按 orderId 归并时取最早出发
+            orderBy: { flightSchedule: { departureTime: 'asc' } },
+          })
+        : Promise.resolve([] as FlightLegRow[]),
+    ]);
+
+    // orderId → 乘客列表
+    const passengersByOrder = new Map<string, PassengerRow[]>();
+    for (const p of passengerRows) {
+      const list = passengersByOrder.get(p.orderId);
+      if (list) list.push(p);
+      else passengersByOrder.set(p.orderId, [p]);
+    }
+    // orderId → 最早一段机票行程（flightLegRows 已按出发升序，首个即最早）
+    const earliestLegByOrder = new Map<string, { departureTime: Date; departureTz: string }>();
+    for (const leg of flightLegRows) {
+      const sched = leg.flightSchedule;
+      if (sched && !earliestLegByOrder.has(leg.orderId)) {
+        earliestLegByOrder.set(leg.orderId, {
+          departureTime: sched.departureTime,
+          departureTz: sched.departureTz,
+        });
+      }
+    }
+
     return {
       tasks: rows.map((t) => {
-        const {
-          passengers: rawPassengers,
-          items: flightLegs,
-          ...orderWithoutPassengers
-        } = t.orderItem.order;
+        const order = t.orderItem.order;
         // 最早一段机票的出发时间/时区（无机票则 null）— 供签证台显示出发日期
-        const firstLeg = flightLegs[0]?.flightSchedule ?? null;
+        const firstLeg = earliestLegByOrder.get(order.id) ?? null;
         return {
           ...serializeTask(t, t.orderItem),
           // #7：本签证产品名称（单次/多次签等）置于任务顶层
           visaName: t.orderItem.visa?.visaName ?? null,
           order: {
-            ...orderWithoutPassengers,
+            ...order,
             // #6：出发日期 + 时区（ISO 字符串 / null）
-            departureTime: firstLeg?.departureTime ? firstLeg.departureTime.toISOString() : null,
+            departureTime: firstLeg ? firstLeg.departureTime.toISOString() : null,
             departureTz: firstLeg?.departureTz ?? null,
           },
           // 签证任务附带乘客护照明细；其他类型不附带
           ...(t.type === FulfillmentType.VISA_APPLICATION
-            ? { passengers: rawPassengers.map(serializePassenger) }
+            ? { passengers: (passengersByOrder.get(order.id) ?? []).map(serializePassenger) }
             : {}),
         };
       }),

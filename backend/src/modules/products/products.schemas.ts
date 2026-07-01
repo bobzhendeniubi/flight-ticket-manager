@@ -181,6 +181,10 @@ export const createBundleBodySchema = z.object({
   // 套餐关联酒店房型（房控板计入套餐占房）；null = 解除关联
   hotelRoomTypeId: z.string().min(1).nullable().optional(),
   hotelNights: z.number().int().min(1).max(30).nullable().optional(),
+  // 套餐绑定的去程 / 回程航班号（模板绑法：只绑航班号，不绑某天）。
+  // 买家选出发日后按航班号 + 本地出发日解析具体班次。null = 解除绑定。
+  outboundFlightId: z.string().nullable().optional(),
+  returnFlightId: z.string().nullable().optional(),
   // 可选升级加价（CNY，按产品可配置）：单人入住房差/晚、升舱商务/航段。
   // 整数 CNY；null / 省略时用 DB 默认（单人入住 ¥80/晚、升舱 ¥700/程）。
   // nullable：前端"留空=用默认"会显式传 null；列本身非空有默认，服务层把 null 当省略处理。

@@ -10,17 +10,33 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // vi.mock 工厂会被 hoist 到文件顶部，故用 vi.hoisted 构造 prismaMock 供工厂与用例共用。
 const prismaMock = vi.hoisted(() => {
   const mock: {
+    flight: { findUnique: ReturnType<typeof vi.fn> };
     flightSchedule: {
       findUnique: ReturnType<typeof vi.fn>;
       findUniqueOrThrow: ReturnType<typeof vi.fn>;
+      findFirst: ReturnType<typeof vi.fn>;
+      findMany: ReturnType<typeof vi.fn>;
+      create: ReturnType<typeof vi.fn>;
       update: ReturnType<typeof vi.fn>;
       delete: ReturnType<typeof vi.fn>;
     };
     flightSeatClass: { update: ReturnType<typeof vi.fn> };
+    auditLog: { create: ReturnType<typeof vi.fn> };
     $transaction: ReturnType<typeof vi.fn>;
   } = {
-    flightSchedule: { findUnique: vi.fn(), findUniqueOrThrow: vi.fn(), update: vi.fn(), delete: vi.fn() },
+    flight: { findUnique: vi.fn() },
+    flightSchedule: {
+      findUnique: vi.fn(),
+      findUniqueOrThrow: vi.fn(),
+      findFirst: vi.fn(),
+      findMany: vi.fn(),
+      create: vi.fn(),
+      update: vi.fn(),
+      delete: vi.fn(),
+    },
     flightSeatClass: { update: vi.fn() },
+    // 改点路径会 best-effort 写审计（writeAudit → prisma.auditLog.create）；给个空 mock 免噪声
+    auditLog: { create: vi.fn() },
     // $transaction(fn) 直接以同一个 mock 作为 tx 执行回调
     $transaction: vi.fn(async (fn: (tx: unknown) => unknown) => fn(mock)),
   };
@@ -172,6 +188,180 @@ describe('FlightService.updateSchedule', () => {
       }),
     ).rejects.toMatchObject({ statusCode: 400 });
     expect(prismaMock.flightSeatClass.update).not.toHaveBeenCalled();
+  });
+});
+
+// ── createSchedule（一个航班号一天只能一班）─────────────────────────────
+// 用出发地时区把 departureTime 折成本地日比较，避免 UTC 边界跨天误判。
+describe('FlightService.createSchedule · 当天唯一班次', () => {
+  const service = new FlightService();
+
+  const createBody = (departureTime: string, arrivalTime: string) => ({
+    flightId: 'flight_1',
+    departureTime,
+    arrivalTime,
+    departureTz: 'Asia/Shanghai',
+    arrivalTz: 'Asia/Shanghai',
+    seatClasses: [{ cabin: 'ECONOMY' as const, capacity: 200, basePrice: 3000 }],
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    prismaMock.flight.findUnique.mockResolvedValue({ id: 'flight_1' });
+    // 出发时间不撞（findFirst 为 null）；当天唯一性由 findMany 结果驱动
+    prismaMock.flightSchedule.findFirst.mockResolvedValue(null);
+    prismaMock.flightSchedule.create.mockResolvedValue({
+      id: 'sched_new',
+      flightId: 'flight_1',
+      departureTime: new Date('2026-07-02T01:00:00.000Z'),
+      arrivalTime: new Date('2026-07-02T04:00:00.000Z'),
+      departureTz: 'Asia/Shanghai',
+      arrivalTz: 'Asia/Shanghai',
+      isActive: true,
+      seatClasses: [],
+    });
+  });
+
+  it('同航班号同一本地日已有班次 → 抛 400，不写库', async () => {
+    // 已有班次本地日 = 2026-07-02（Asia/Shanghai）
+    prismaMock.flightSchedule.findMany.mockResolvedValue([
+      { departureTime: new Date('2026-07-02T02:00:00.000Z'), departureTz: 'Asia/Shanghai' },
+    ]);
+    // 新班次也落在 2026-07-02 本地日
+    await expect(
+      service.createSchedule(createBody('2026-07-02T09:00:00.000Z', '2026-07-02T12:00:00.000Z')),
+    ).rejects.toMatchObject({
+      statusCode: 400,
+      message: '该航班号当天已有班次，一个航班号一天只能一班',
+    });
+    expect(prismaMock.flightSchedule.create).not.toHaveBeenCalled();
+  });
+
+  it('同航班号但不同本地日 → 放行，写库', async () => {
+    // 已有班次本地日 = 2026-07-02
+    prismaMock.flightSchedule.findMany.mockResolvedValue([
+      { departureTime: new Date('2026-07-02T02:00:00.000Z'), departureTz: 'Asia/Shanghai' },
+    ]);
+    // 新班次 2026-07-03 本地日（不同天）
+    await expect(
+      service.createSchedule(createBody('2026-07-03T09:00:00.000Z', '2026-07-03T12:00:00.000Z')),
+    ).resolves.toMatchObject({ id: 'sched_new' });
+    expect(prismaMock.flightSchedule.create).toHaveBeenCalledTimes(1);
+  });
+
+  it('同一本地日但不同航班号 → 放行（findMany 只查本航班号，无冲突）', async () => {
+    // 本航班号当天无班次（findMany 已按 flightId 过滤 → 空）
+    prismaMock.flightSchedule.findMany.mockResolvedValue([]);
+    await expect(
+      service.createSchedule(createBody('2026-07-02T09:00:00.000Z', '2026-07-02T12:00:00.000Z')),
+    ).resolves.toMatchObject({ id: 'sched_new' });
+    // 查询限定本航班号
+    expect(prismaMock.flightSchedule.findMany).toHaveBeenCalledWith({
+      where: { flightId: 'flight_1' },
+      select: { departureTime: true, departureTz: true },
+    });
+    expect(prismaMock.flightSchedule.create).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── updateSchedule · 改点触发当天唯一班次校验 ───────────────────────────
+// 编辑不能把本地出发日挪到同航班号已占用的那天（否则绕过 createSchedule 的唯一性）。
+describe('FlightService.updateSchedule · 改点当天唯一性', () => {
+  const service = new FlightService();
+  const decimal = (n: number) => ({ toString: () => String(n) });
+
+  // 现有班次本地出发日 = 2026-07-01（Asia/Shanghai）
+  const baseSchedule = () => ({
+    id: 'sched_1',
+    flightId: 'flight_1',
+    departureTime: new Date('2026-07-01T01:00:00.000Z'),
+    arrivalTime: new Date('2026-07-01T04:00:00.000Z'),
+    departureTz: 'Asia/Shanghai',
+    arrivalTz: 'Asia/Shanghai',
+    isActive: true,
+    seatClasses: [
+      { id: 'sc_eco', cabin: 'ECONOMY', capacity: 200, sold: 30, basePrice: decimal(3000) },
+    ],
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    prismaMock.$transaction.mockImplementation(async (fn: (tx: unknown) => unknown) =>
+      fn(prismaMock),
+    );
+  });
+
+  it('改点把本地日挪到同航班号已占用的那天 → 抛 400，不写库', async () => {
+    prismaMock.flightSchedule.findUnique.mockResolvedValue(baseSchedule());
+    // 同航班号另有一班在 2026-07-05 本地日
+    prismaMock.flightSchedule.findMany.mockResolvedValue([
+      { departureTime: new Date('2026-07-05T02:00:00.000Z'), departureTz: 'Asia/Shanghai' },
+    ]);
+
+    await expect(
+      service.updateSchedule('sched_1', {
+        departureTime: '2026-07-05T09:00:00.000Z',
+        arrivalTime: '2026-07-05T12:00:00.000Z',
+      }),
+    ).rejects.toMatchObject({
+      statusCode: 400,
+      message: '该航班号当天已有班次，一个航班号一天只能一班',
+    });
+    expect(prismaMock.$transaction).not.toHaveBeenCalled();
+    expect(prismaMock.flightSchedule.update).not.toHaveBeenCalled();
+    // 排除被编辑班次自己
+    expect(prismaMock.flightSchedule.findMany).toHaveBeenCalledWith({
+      where: { flightId: 'flight_1', id: { not: 'sched_1' } },
+      select: { departureTime: true, departureTz: true },
+    });
+  });
+
+  it('改点到无冲突的本地日 → 放行，写库', async () => {
+    prismaMock.flightSchedule.findUnique.mockResolvedValue(baseSchedule());
+    // 同航班号另一班在 2026-07-05，本次挪到 2026-07-06（不冲突）
+    prismaMock.flightSchedule.findMany.mockResolvedValue([
+      { departureTime: new Date('2026-07-05T02:00:00.000Z'), departureTz: 'Asia/Shanghai' },
+    ]);
+    const after = baseSchedule();
+    after.departureTime = new Date('2026-07-06T09:00:00.000Z');
+    after.arrivalTime = new Date('2026-07-06T12:00:00.000Z');
+    prismaMock.flightSchedule.findUniqueOrThrow.mockResolvedValue(after);
+
+    const result = await service.updateSchedule('sched_1', {
+      departureTime: '2026-07-06T09:00:00.000Z',
+      arrivalTime: '2026-07-06T12:00:00.000Z',
+    });
+    expect(result.departureTime).toBe('2026-07-06T09:00:00.000Z');
+    expect(prismaMock.flightSchedule.update).toHaveBeenCalled();
+  });
+
+  it('改点但本地日不变（仅调整当天时刻）→ 不触发唯一性查库，正常写库', async () => {
+    prismaMock.flightSchedule.findUnique.mockResolvedValue(baseSchedule());
+    const after = baseSchedule();
+    after.departureTime = new Date('2026-07-01T06:00:00.000Z');
+    after.arrivalTime = new Date('2026-07-01T09:00:00.000Z');
+    prismaMock.flightSchedule.findUniqueOrThrow.mockResolvedValue(after);
+
+    await service.updateSchedule('sched_1', {
+      departureTime: '2026-07-01T06:00:00.000Z',
+      arrivalTime: '2026-07-01T09:00:00.000Z',
+    });
+    // 本地日未变（都是 2026-07-01）→ 不查同航班号当天班次
+    expect(prismaMock.flightSchedule.findMany).not.toHaveBeenCalled();
+    expect(prismaMock.flightSchedule.update).toHaveBeenCalled();
+  });
+
+  it('非时刻字段更新（改价，无 departureTime/arrivalTime）→ 不触发唯一性查库', async () => {
+    prismaMock.flightSchedule.findUnique.mockResolvedValue(baseSchedule());
+    const after = baseSchedule();
+    after.seatClasses[0].basePrice = decimal(3500);
+    prismaMock.flightSchedule.findUniqueOrThrow.mockResolvedValue(after);
+
+    await service.updateSchedule('sched_1', {
+      seatClasses: [{ cabin: 'ECONOMY', basePrice: 3500 }],
+    });
+    expect(prismaMock.flightSchedule.findMany).not.toHaveBeenCalled();
+    expect(prismaMock.flightSeatClass.update).toHaveBeenCalled();
   });
 });
 

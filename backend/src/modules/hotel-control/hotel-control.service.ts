@@ -235,13 +235,17 @@ export function expandUsedByDate(
  * 单酒店逐晚余量（remaining = block - used），口径与销控板 getBoard 完全一致。
  * 一次 findMany 拉周期 + 一次 findMany 拉占房行，JS 内展开（无逐日查询）。
  * hasBlock=false 表示整段没有任何包房周期（未配置房控）—— 调用方自行决定降级行为。
+ *
+ * 返回逐晚 `block`（该晚被包房周期管控的房量）供调用方区分「被管控但售罄」与「未被管控」：
+ *   block[i] > 0 ⇒ 该晚由房控管控，remaining[i] 可信；
+ *   block[i] === 0 ⇒ 该晚无任何周期覆盖（未管控），不应据 remaining 判为售罄。
  */
 export async function getHotelNightlyRemaining(
   hotelId: string,
   nightDates: readonly string[],
   client: PrismaClient = defaultPrisma,
-): Promise<{ remaining: number[]; hasBlock: boolean }> {
-  if (nightDates.length === 0) return { remaining: [], hasBlock: false };
+): Promise<{ remaining: number[]; hasBlock: boolean; block: number[] }> {
+  if (nightDates.length === 0) return { remaining: [], hasBlock: false, block: [] };
   const fromD = toDateOnly(nightDates[0]);
   const toD = toDateOnly(nightDates[nightDates.length - 1]);
 
@@ -249,7 +253,7 @@ export async function getHotelNightlyRemaining(
     where: { hotelId, dateFrom: { lte: toD }, dateTo: { gte: fromD } },
     select: { dateFrom: true, dateTo: true, rooms: true },
   });
-  if (periods.length === 0) return { remaining: [], hasBlock: false };
+  if (periods.length === 0) return { remaining: [], hasBlock: false, block: [] };
 
   // 占晚区间 [checkIn, checkOut) 与夜晚集合有交集 ⇔ checkIn <= 最后一晚 && checkOut > 第一晚
   const items = await client.orderItem.findMany({
@@ -265,7 +269,7 @@ export async function getHotelNightlyRemaining(
 
   const block = expandBlockByDate(periods, nightDates);
   const used = expandUsedByDate(items, nightDates);
-  return { remaining: block.map((b, i) => b - used[i]), hasBlock: true };
+  return { remaining: block.map((b, i) => b - used[i]), hasBlock: true, block };
 }
 
 // ── 销控板（按酒店 × 日期）────────────────────────────────────────────────

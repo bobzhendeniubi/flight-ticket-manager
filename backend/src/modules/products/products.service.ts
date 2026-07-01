@@ -57,6 +57,11 @@ function isCodeUniqueViolation(err: unknown): boolean {
 }
 
 // ── Bundle 关联房型 include（list/get/create/update 共用）──────────────
+// 套餐绑定航班号（去/回程）对外暴露的字段：id + 航班号 + 起降地
+const BUNDLE_FLIGHT_SELECT = {
+  select: { id: true, flightNumber: true, originCode: true, destinationCode: true },
+} satisfies Prisma.Bundle$outboundFlightArgs;
+
 const BUNDLE_ROOM_INCLUDE = {
   hotelRoomType: {
     // capacity/maxAdults/maxChildren 暴露给前台，使其能镜像 roomsNeeded 计算并展示
@@ -69,6 +74,9 @@ const BUNDLE_ROOM_INCLUDE = {
       hotel: { select: { name: true } },
     },
   },
+  // 套餐绑定的去程 / 回程航班号（买家选出发日后据此解析具体班次）
+  outboundFlight: BUNDLE_FLIGHT_SELECT,
+  returnFlight: BUNDLE_FLIGHT_SELECT,
 } satisfies Prisma.BundleInclude;
 
 type BundleWithRoom = Prisma.BundleGetPayload<{ include: typeof BUNDLE_ROOM_INCLUDE }>;
@@ -439,6 +447,8 @@ export class ProductsService {
 
   async createBundle(body: CreateBundleBody) {
     await this.assertHotelRoomTypeExists(body.hotelRoomTypeId);
+    await this.assertFlightExists(body.outboundFlightId);
+    await this.assertFlightExists(body.returnFlightId);
     const b = await createWithProductCode(
       'B',
       async () => {
@@ -462,6 +472,9 @@ export class ProductsService {
           groundDiscount: new Prisma.Decimal(body.groundDiscount),
           suitableFor: body.suitableFor,
           hotelRoomTypeId: body.hotelRoomTypeId ?? null,
+          // 套餐绑定去/回程航班号（模板绑法：只绑航班号，不绑某天）；省略 / null = 不绑
+          outboundFlightId: body.outboundFlightId ?? null,
+          returnFlightId: body.returnFlightId ?? null,
           // 写入不变量：items 含 HOTEL 组件 → hotelNights 强制 = HOTEL.qty（真实晚数，clamp 1..30）；
           // 无 HOTEL 组件 → 保留请求值（或 null）。保证落库 hotelNights 永不与 HOTEL.qty 背离。
           hotelNights: deriveHotelNightsFromItems(body.items) ?? body.hotelNights ?? null,
@@ -497,6 +510,8 @@ export class ProductsService {
     const existing = await prisma.bundle.findUnique({ where: { id } });
     if (!existing) throw new NotFoundError('套餐不存在');
     await this.assertHotelRoomTypeExists(body.hotelRoomTypeId);
+    await this.assertFlightExists(body.outboundFlightId);
+    await this.assertFlightExists(body.returnFlightId);
     const data: Prisma.BundleUncheckedUpdateInput = {};
     if (body.name !== undefined) data.name = body.name;
     if (body.tagline !== undefined) data.tagline = body.tagline;
@@ -509,6 +524,9 @@ export class ProductsService {
     if (body.suitableFor !== undefined) data.suitableFor = body.suitableFor;
     if (body.hotelRoomTypeId !== undefined) data.hotelRoomTypeId = body.hotelRoomTypeId;
     if (body.hotelNights !== undefined) data.hotelNights = body.hotelNights;
+    // 套餐绑定去/回程航班号：列可空，null = 解除绑定、undefined = 不改（与 hotelRoomTypeId 同款可空口径）
+    if (body.outboundFlightId !== undefined) data.outboundFlightId = body.outboundFlightId;
+    if (body.returnFlightId !== undefined) data.returnFlightId = body.returnFlightId;
     // 写入不变量：仅当本次在改 items 时，按新 items 的 HOTEL 组件 qty 规范化/覆盖 hotelNights
     // （即便请求显式传了别的 hotelNights，也以真实 HOTEL.qty 为准；legacy null 行借此自愈）。
     // 新 items 无 HOTEL 组件 → 不动 hotelNights，保留上面按 body.hotelNights 的处理。
@@ -555,6 +573,19 @@ export class ProductsService {
       select: { id: true },
     });
     if (!rt) throw new NotFoundError(`酒店房型 ${hotelRoomTypeId} 不存在`);
+  }
+
+  /**
+   * 校验套餐绑定的航班存在（null/undefined 跳过 —— null = 解绑）。
+   * 在写库前显式校验，给出干净的 404「所选航班不存在」，而非依赖 Prisma 原始外键错误。
+   */
+  private async assertFlightExists(flightId: string | null | undefined) {
+    if (!flightId) return;
+    const flight = await prisma.flight.findUnique({
+      where: { id: flightId },
+      select: { id: true },
+    });
+    if (!flight) throw new NotFoundError('所选航班不存在');
   }
 
   async deleteBundle(id: string) {
@@ -623,7 +654,7 @@ function serializeBundle(
   rating: ProductRatingAggregate = ZERO_RATING,
   flightRefRoundTripCny: number | null = null,
 ) {
-  const { hotelRoomType, ...rest } = b;
+  const { hotelRoomType, outboundFlight, returnFlight, ...rest } = b;
   // 原价（含当前最低来回机票）：后台「想卖的价格」录入据此反推 discountPct + 展示「原价划线/省X%」。
   // 估算锚点，不参与买家实际计价（买家价 = 实时全包 ×(1 − discountPct/100)）。
   const bItems = (b.items as Array<{ kind: string; qty: number; unitPrice: number }>) ?? [];
@@ -664,5 +695,9 @@ function serializeBundle(
           maxChildren: hotelRoomType.maxChildren,
         }
       : null,
+    // 套餐绑定的去/回程航班号（各含 id + 航班号 + 起降地）；未绑 = null。
+    // 后台读回做展示/编辑；前台买家选出发日后按航班号 + 本地出发日解析具体班次。
+    outboundFlight: outboundFlight ?? null,
+    returnFlight: returnFlight ?? null,
   };
 }

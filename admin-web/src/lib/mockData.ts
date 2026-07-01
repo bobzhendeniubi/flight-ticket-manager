@@ -872,6 +872,18 @@ export interface MockBundle {
   blackoutDates?: { date: string; reason?: string }[];
   /** 前台默认出发日（YYYY-MM-DD，不影响可售判定）；null/缺省 = 无默认 */
   defaultDepartDate?: string | null;
+  /** 绑定的去程航班号（按航班号绑定，不绑某一天班次）；null/缺省 = 不指定，按最便宜航班 */
+  outboundFlight?: BundleFlightRef | null;
+  /** 绑定的回程航班号；null/缺省 = 不指定，按最便宜航班 */
+  returnFlight?: BundleFlightRef | null;
+}
+
+/** 套餐绑定的航班号引用（按航班号绑定；买家选出发日后系统匹配当天班次） */
+export interface BundleFlightRef {
+  id: string;
+  flightNumber: string;
+  originCode: string;
+  destinationCode: string;
 }
 
 

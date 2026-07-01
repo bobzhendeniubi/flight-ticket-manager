@@ -325,8 +325,9 @@ function BundleDetailContent({
     flightCache.ensure(ROUTE_DEST, ROUTE_ORIGIN, queryReturn);
   }, [flightCache, queryGo, queryReturn]);
 
-  const outLeg = flightCache.get(ROUTE_ORIGIN, ROUTE_DEST, queryGo);
-  const retLeg = flightCache.get(ROUTE_DEST, ROUTE_ORIGIN, queryReturn);
+  // 按运营绑定的航班号解析航段：绑定命中该班，未绑定/未命中回退首条（与旧版一致）。
+  const outLeg = flightCache.getByFlightNumber(ROUTE_ORIGIN, ROUTE_DEST, queryGo, b.outboundFlight?.flightNumber);
+  const retLeg = flightCache.getByFlightNumber(ROUTE_DEST, ROUTE_ORIGIN, queryReturn, b.returnFlight?.flightNumber);
   const goTier = legTier(outLeg, cabin);
   const retTier = legTier(retLeg, cabin);
   const hotelTier = useHotelAvailability(b.hotelRoomTypeId ?? null, queryGo, queryReturn);

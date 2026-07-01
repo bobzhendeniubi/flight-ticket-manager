@@ -379,6 +379,9 @@ model Flight {
   schedules       FlightSchedule[]
   costPeriods     FlightCostPeriod[]
   baggagePolicies FlightBaggagePolicy[]
+  // 套餐绑定的航班号（模板绑法：只绑航班号，不绑某天；买家选出发日再解析具体班次）
+  outboundBundles Bundle[] @relation("BundleOutboundFlight")
+  returnBundles   Bundle[] @relation("BundleReturnFlight")
 
   @@unique([flightNumber])
   @@index([originCode, destinationCode])
@@ -601,7 +604,7 @@ model HotelRoomType {
   name            String // e.g., "Deluxe King"
   bedType         String? // "1 张大床 · 海景"
   capacity        Int // max guests（总人数上限；保留作为整体容量）
-  // 单间可坐几大人 / 几小孩（赵姐："每个酒店房型可以 fit 几大人几小孩"）。
+  // 单间可坐几大人 / 几小孩（每个酒店房型可 fit 几大人/几小孩）。
   // 套餐下单时据此算 roomsNeeded = max(ceil(成人/maxAdults), ceil(儿童/maxChildren), 1)，
   // 房间数 >1 时套餐酒店部分按房价 ×roomsNeeded 收费（自动加房收钱）。婴儿不占床。
   maxAdults       Int      @default(2)
@@ -715,6 +718,11 @@ model Bundle {
   // 套餐关联酒店房型 — 下单时把房型+入住日期盖到订单行上，房控板自动计入套餐占房
   hotelRoomTypeId String?
   hotelNights     Int? // 默认入住晚数（客户没填回程日期时按 goDate + hotelNights 推 checkOut）
+  // 套餐绑定的去程 / 回程航班号（模板绑法：只绑航班号，不绑某天）。
+  // 买家选出发日后按该航班号 + 本地出发日解析出具体班次（一个航班号一天只有一班）。
+  // onDelete SetNull：删航班不删套餐，只解除绑定。
+  outboundFlightId String?
+  returnFlightId   String?
   // 可选升级加价（CNY，按产品可配置；运营在后台改）— 都是 server-priced add-on：
   //   singleSupplementCnyPerNight = 一个人住酒店（单人入住）/晚 的房差，运营默认 ¥80
   //   businessUpgradeCnyPerLeg    = 升舱商务 /航段 的加价，运营默认 ¥700
@@ -744,6 +752,8 @@ model Bundle {
   updatedAt      DateTime @updatedAt
 
   hotelRoomType HotelRoomType? @relation(fields: [hotelRoomTypeId], references: [id])
+  outboundFlight Flight? @relation("BundleOutboundFlight", fields: [outboundFlightId], references: [id], onDelete: SetNull)
+  returnFlight   Flight? @relation("BundleReturnFlight", fields: [returnFlightId], references: [id], onDelete: SetNull)
   orderItems    OrderItem[]
 
   @@index([isActive])
@@ -816,7 +826,7 @@ enum OrderItemKind {
   INSURANCE
   FEE // airport construction / fuel surcharge
   DISCOUNT
-  GUIDE          // 导游服务费收入（贺帅细分）
+  GUIDE          // 导游服务费收入（财务细分）
   UPGRADE_CHANGE // 升舱 / 改期收入
   OVERSALE       // 超售收入
 }
@@ -837,7 +847,7 @@ model Order {
   guestPhone       String?
   guestEmail       String?
   status           OrderStatus   @default(DRAFT)
-  // 开票状态（运营在订单管理里维护，反馈：李萍）
+  // 开票状态（运营在订单管理里维护）
   invoiceStatus    InvoiceStatus @default(NONE)
   currency         String        @default("CNY")
   subtotal         Decimal       @db.Decimal(12, 2)
@@ -937,7 +947,7 @@ model OrderItem {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 订单杂项成本 — 财务录入的订单级成本明细（贺帅细分：导游/赠送/手续费/操作费/其他）
+// 订单杂项成本 — 财务录入的订单级成本明细（财务细分：导游/赠送/手续费/操作费/其他）
 // 跟 OrderItem 区分：OrderItem 是面向客户的商品行；OrderCostItem 是后台财务的成本明细
 // 一张订单可有 N 条（一类可多条）
 // ─────────────────────────────────────────────────────────────────────────────

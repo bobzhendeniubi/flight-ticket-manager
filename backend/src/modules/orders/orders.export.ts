@@ -51,6 +51,8 @@ interface OrderRow {
   // 乘客
   chineseName: string;
   passportIssueDate: string;
+  passportIssuePlace: string;
+  placeOfBirth: string;
   pnrName: string;
   gender: string;
   dateOfBirth: string;
@@ -63,6 +65,7 @@ interface OrderRow {
   route: string;
   // 产品
   bundleName: string;
+  hotelName: string;
   hotelInfo: string;
   visaInfo: string;
   transferInfo: string;
@@ -81,6 +84,8 @@ const COLUMNS: Array<{ header: string; key: keyof OrderRow; width: number }> = [
   { header: '联系电话', key: 'contactPhone', width: 14 },
   { header: '乘客中文名', key: 'chineseName', width: 14 },
   { header: '护照签发日期', key: 'passportIssueDate', width: 12 },
+  { header: '护照签发地', key: 'passportIssuePlace', width: 10 },
+  { header: '出生地', key: 'placeOfBirth', width: 10 },
   { header: 'PNR 姓名', key: 'pnrName', width: 20 },
   { header: '性别', key: 'gender', width: 6 },
   { header: '出生日期', key: 'dateOfBirth', width: 12 },
@@ -91,6 +96,7 @@ const COLUMNS: Array<{ header: string; key: keyof OrderRow; width: number }> = [
   { header: '出发日期', key: 'departDate', width: 12 },
   { header: '路线', key: 'route', width: 14 },
   { header: '套餐', key: 'bundleName', width: 18 },
+  { header: '酒店名称', key: 'hotelName', width: 20 },
   { header: '酒店房型', key: 'hotelInfo', width: 28 },
   { header: '签证', key: 'visaInfo', width: 20 },
   { header: '接送', key: 'transferInfo', width: 18 },
@@ -213,6 +219,10 @@ function orderToRows(order: OrderForExport): OrderRow[] {
     // 仅当订单项没带酒店名时，才回退到该乘客的人工分房组酒店名。
     const group = roomGroups.find((g) => g.passengerIds.includes(p.id));
     const groupHotelName = group?.hotelName?.trim() || '';
+    // 酒店名称（去重）：每段优先用订单项自带酒店名，缺失才回落到本乘客分房组酒店名。
+    const hotelNames = Array.from(
+      new Set(hotelRooms.map((r) => r.hotelName || groupHotelName).filter(Boolean)),
+    ).join(' / ');
     const hotelInfo = hotelRooms
       .map((r) => {
         const hotelName = r.hotelName || groupHotelName;
@@ -229,6 +239,8 @@ function orderToRows(order: OrderForExport): OrderRow[] {
       contactPhone: order.contactPhone,
       chineseName: p.chineseName ?? p.fullName,
       passportIssueDate: fmtDate(p.passportIssueDate),
+      passportIssuePlace: p.passportIssueCountry ?? '',
+      placeOfBirth: p.placeOfBirth ?? '',
       pnrName,
       gender: p.gender ? GENDER_LABEL[p.gender] ?? p.gender : '',
       dateOfBirth: fmtDate(p.dateOfBirth),
@@ -239,6 +251,7 @@ function orderToRows(order: OrderForExport): OrderRow[] {
       departDate: departStr,
       route: routeStr,
       bundleName: bundleParts.join(' + '),
+      hotelName: hotelNames,
       hotelInfo,
       visaInfo: visaParts.join(' + '),
       transferInfo: transferParts.join(' + '),

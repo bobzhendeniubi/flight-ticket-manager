@@ -22,6 +22,7 @@ import {
   type CreateOrderInput,
   type CreateOrderItemInput,
   type Hotel,
+  type HotelAvailabilityTier,
   type OrderPassengerInput,
   type OrderSummary,
   type RoomGroup,
@@ -855,9 +856,52 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       }));
   }, [createdOrder]);
 
+  // 分房页要显示的酒店信息：从订单 HOTEL 行取酒店名 + 房型/入住/退房（供查房量档位）。
+  // 套餐订单的 HOTEL 行由服务端盖章带出 hotelRoomTypeId/hotelCheckIn/hotelCheckOut。
+  // description 形如「酒店名 · 房型 · 入住~退房 · N晚 × M间」，取 ' · ' 前段作酒店名。
+  const roomingHotel = useMemo(() => {
+    const hotelItem = createdOrder?.items?.find((it) => it.kind === 'HOTEL');
+    if (!hotelItem) return null;
+    const hotelName = hotelItem.description.split(' · ')[0]?.trim() || '';
+    return {
+      hotelName,
+      hotelRoomTypeId: hotelItem.hotelRoomTypeId,
+      checkIn: hotelItem.hotelCheckIn,
+      checkOut: hotelItem.hotelCheckOut,
+    };
+  }, [createdOrder]);
+
+  // 房量档位（只回档位不回原始数字，与六档余位同纪律）；null = 未配置/查询失败 → 不展示。
+  const [hotelTier, setHotelTier] = useState<HotelAvailabilityTier | null>(null);
+  useEffect(() => {
+    const rt = roomingHotel?.hotelRoomTypeId;
+    const ci = roomingHotel?.checkIn;
+    const co = roomingHotel?.checkOut;
+    if (!showRooming || !rt || !ci || !co) {
+      setHotelTier(null);
+      return;
+    }
+    let cancelled = false;
+    api
+      .getHotelAvailability({ hotelRoomTypeId: rt, checkIn: ci, checkOut: co })
+      .then((r) => {
+        if (!cancelled) setHotelTier(r.tier);
+      })
+      .catch(() => {
+        // 查询失败按「无数据」处理：不展示房量档位、不阻断分房（不造假）
+        if (!cancelled) setHotelTier(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [showRooming, roomingHotel]);
+
   async function handleRoomingSave(groups: RoomGroup[]): Promise<void> {
     if (!createdOrder) return;
-    await api.updateRoomAssignment(token, createdOrder.id, groups);
+    // 录单→OCR→分房这一整段可能开很久，渲染时闭包捕获的 token 可能已被后台续期换掉而过期
+    // （报「Invalid or expired access token」）。保存时改从 store 现取最新 accessToken。
+    const freshToken = useAuth.getState().tokens?.accessToken ?? token;
+    await api.updateRoomAssignment(freshToken, createdOrder.id, groups);
     setRoomingSaved(true);
     setShowRooming(false);
   }
@@ -901,6 +945,8 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                 <RoomingEditor
                   passengers={roomingPassengers}
                   initial={createdOrder?.roomAssignment?.roomGroups}
+                  hotelName={roomingHotel?.hotelName}
+                  hotelTier={hotelTier}
                   onSave={handleRoomingSave}
                   onClose={() => setShowRooming(false)}
                 />
@@ -919,10 +965,17 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
               )
             )}
 
+            {/* 没分房也不丢：任何时候都能到「房控页」按订单再分。入口文案说明清楚。 */}
+            {roomingPassengers.length > 0 && !roomingSaved && (
+              <p className="text-xs text-ink-muted">
+                现在不分也没关系 —— 之后可到「房控页」按订单随时补分房。
+              </p>
+            )}
+
             <div className="flex justify-end gap-2">
               {showRooming && (
                 <button className="btn-ghost text-sm" onClick={() => setShowRooming(false)}>
-                  跳过（稍后在房控页分）
+                  稍后再分（去「房控页」分房）
                 </button>
               )}
               <button className="btn-secondary text-sm" onClick={resetForNextOrder}>

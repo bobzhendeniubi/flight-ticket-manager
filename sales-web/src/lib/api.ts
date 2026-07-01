@@ -654,6 +654,14 @@ export interface Bundle {
     maxAdults?: number | null;
     maxChildren?: number | null;
   } | null;
+  /**
+   * 运营为套餐绑定的去/回航班（按航班号绑定，非日期）。买家选出发日后，
+   * 前台据 flightNumber 把该航段解析到对应班次；未绑定（null）时回退首条搜索结果。
+   * flightNumber = 绑定的航班号；originCode/destinationCode = 该航班的起降机场码，
+   * 供展示/选班用（非方向校验）。全 optional，老缓存缺省时按"未绑定"处理。
+   */
+  outboundFlight?: { id: string; flightNumber: string; originCode: string; destinationCode: string } | null;
+  returnFlight?: { id: string; flightNumber: string; originCode: string; destinationCode: string } | null;
   /** 关联房型 id（实时房量查询用；null = 未关联，不查房量） */
   hotelRoomTypeId?: string | null;
   /** 套餐住宿晚数（回程日期 = 出发 + 晚数；null = 用前端默认晚数） */

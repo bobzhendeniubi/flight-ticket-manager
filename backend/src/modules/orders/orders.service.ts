@@ -34,6 +34,7 @@ import {
   NotFoundError,
 } from '../../lib/errors.js';
 import { resolveBundleNights } from '../products/bundle-nights.js';
+import { getHotelNightlyRemaining } from '../hotel-control/hotel-control.service.js';
 import { PricingService } from '../pricing/pricing.service.js';
 import { createOpenReceiptWithinTx } from '../receipts/receipts.service.js';
 import { OPERATION_FEE_CNY_PER_ORDER } from './order-cost-items.service.js';
@@ -800,11 +801,26 @@ export class OrderService {
             selfVisaDeductCny: true,
             legs: true,
             // 关联房型容量 → 算 roomsNeeded（自动加房，套餐酒店部分按房价 ×rooms 收费）
-            hotelRoomType: { select: { maxAdults: true, maxChildren: true } },
+            // basePrice：套餐酒店行的权威每间每晚价（服务端重算，不信 items JSON 里的 unitPrice —
+            //   历史上 items 里的 HOTEL.unitPrice 可能是占位/过时的畸低值，导致套餐酒店部分只算出几元）。
+            // hotelId：出发日期房量库存校验（无房不让下单）。
+            hotelRoomType: {
+              select: {
+                maxAdults: true,
+                maxChildren: true,
+                basePrice: true,
+                hotelId: true,
+                hotel: { select: { isActive: true } },
+              },
+            },
           },
         });
         if (!bundle) throw new NotFoundError(`套餐 ${item.bundleId} 不存在`);
         if (!bundle.isActive) throw new BadRequestError('套餐已下架');
+        // 套餐绑定的酒店房型若其酒店已下架 → 拒单（与单独 HOTEL 行同口径，防止经套餐绕过下架酒店）。
+        if (bundle.hotelRoomType && !bundle.hotelRoomType.hotel.isActive) {
+          throw new BadRequestError('酒店已下架');
+        }
         // 记下该套餐折扣（%），循环后对本套餐的 BUNDLE 行 + 关联 FLIGHT 腿逐行打折。
         if (item.bundleId) bundleDiscountPct.set(item.bundleId, bundle.discountPct ?? 0);
         // 住宿晚数：单一权威口径（hotelNights ?? 首个 HOTEL 组件 qty ?? 默认）。
@@ -826,8 +842,17 @@ export class OrderService {
         // 0.5 间：录单方显式传 roomsBilled（支持半间）时以其为准，否则按容量自动推算。
         const rooms = item.roomsBilled ?? computeRoomsNeeded(occupancy, bundle.hotelRoomType);
 
+        // 酒店行的权威每间每晚价：套餐绑了房型 → 用 HotelRoomType.basePrice（服务端重算），
+        // 绝不信任 bundle.items JSON 里的 HOTEL.unitPrice（历史上可能是占位/过时的畸低值，
+        // 会把套餐酒店部分算成几元 → 整单总价崩塌）。未绑房型的老套餐才回退到 JSON 里的 unitPrice。
+        const linkedHotelNightlyPrice =
+          bundle.hotelRoomTypeId && bundle.hotelRoomType
+            ? Number(bundle.hotelRoomType.basePrice)
+            : null;
+
         // 地面部分价（机票部分留给 FLIGHT item 单独动态定价）：
-        //   HOTEL 行（unitPrice=每间每晚, qty=晚数）按 unitPrice×qty×rooms 收费 → 套餐价随房间数涨；
+        //   HOTEL 行（qty=晚数）按 每间每晚价×qty×rooms 收费 → 套餐价随房间数涨；
+        //     每间每晚价 = linkedHotelNightlyPrice（权威）优先，回退 JSON 里的 unitPrice。
         //   非 HOTEL 地面行（TRANSFER/VISA 等）固定 unitPrice×qty×1（不随房间数变）。
         //   bundleGround = Σ(HOTEL×rooms) + Σ(其它非机票)。折扣不在此扣 —— 改由循环后的
         //   percent-off 后处理对「机票腿 + 套餐行」整体 ×(1−discountPct/100)（旧的固定 groundDiscount 已弃用）。
@@ -835,13 +860,37 @@ export class OrderService {
         const groundTotal = bundleItems
           .filter((b) => b.kind !== 'FLIGHT')
           .reduce((s, b) => {
-            const roomFactor = b.kind === 'HOTEL' ? rooms : 1;
-            return s + b.qty * b.unitPrice * roomFactor;
+            if (b.kind === 'HOTEL') {
+              const nightlyPrice = linkedHotelNightlyPrice ?? b.unitPrice;
+              return s + b.qty * nightlyPrice * rooms;
+            }
+            return s + b.qty * b.unitPrice;
           }, 0);
         const bundleUnitPrice = Math.max(0, Math.round(groundTotal));
         // 套餐关联酒店 → 把房型+入住日期盖到订单行（房控板自动计入套餐占房）。
         // metadata 缺失/异常时只是不盖章，绝不阻断下单。
         const hotelStamp = resolveBundleHotelStamp(bundle, item.metadata, nights);
+
+        // ── 出发日期房量库存校验（房量不足不让下单）──────────────────────────
+        // 套餐绑了房型 + 能推出入住区间（有 goDate 盖章）时，校验整段每一晚都有足够余房。
+        // 口径与房控/前台可售日期完全一致（getHotelNightlyRemaining）：
+        //   hasBlock=false（该酒店没配任何包房周期，即未做库存管控）→ 不拦截（与既有 E2E 一致）；
+        //   逐晚判定：block[i] > 0（该晚确被包房周期管控）且 remaining[i] < rooms（余房不够本单所需房间数）→ 抛错。
+        //     · 只看被周期覆盖的晚（block[i] > 0）：未被任何周期覆盖的晚（block[i] === 0）视为未管控，不据此拦截。
+        //     · 与本单所需房间数 rooms 比较（多大人可能需 2+ 间）：只要够 1 间就放行会导致超卖。
+        // 无盖章（缺 goDate）→ 无从确定入住日期，不在此拦截（沿用既有"缺 goDate 不盖章"的宽松口径）。
+        if (hotelStamp && bundle.hotelRoomType) {
+          const nightDates = buildStayNightDates(hotelStamp.hotelCheckIn, hotelStamp.hotelCheckOut);
+          if (nightDates.length > 0) {
+            const { remaining, hasBlock, block } = await getHotelNightlyRemaining(
+              bundle.hotelRoomType.hotelId,
+              nightDates,
+            );
+            if (hasBlock && remaining.some((r, i) => block[i] > 0 && r < rooms)) {
+              throw new BadRequestError('该出发日期酒店可用房量不足，请更换日期或联系客服');
+            }
+          }
+        }
 
         // 可选升级 add-on（server-priced，权威重算；缺省 0 → 与旧版价格完全一致）：
         //   单人入住房差 = singleCount × singleSupplementCnyPerNight × nights
@@ -2845,6 +2894,23 @@ const DAY_MS = 24 * 60 * 60 * 1000;
  *
  * 导出仅供单测使用。
  */
+/**
+ * 把住宿区间 [checkIn, checkOut)（半开）展开为逐晚 YYYY-MM-DD（UTC date-only）。
+ * 供套餐下单时的酒店房量库存校验用（口径与 getHotelNightlyRemaining / 房控完全一致）。
+ * 防御：checkOut <= checkIn 或跨度异常大 → 返回空数组（调用方按"无从校验"跳过，不阻断下单）。
+ */
+const MAX_STAY_NIGHTS = 60;
+export function buildStayNightDates(checkIn: Date, checkOut: Date): string[] {
+  const startMs = checkIn.getTime();
+  const endMs = checkOut.getTime();
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return [];
+  const nights = Math.round((endMs - startMs) / DAY_MS);
+  if (nights < 1 || nights > MAX_STAY_NIGHTS) return [];
+  return Array.from({ length: nights }, (_, i) =>
+    new Date(startMs + i * DAY_MS).toISOString().slice(0, 10),
+  );
+}
+
 export function resolveBundleHotelStamp(
   bundle: { hotelRoomTypeId: string | null },
   metadata: Record<string, unknown> | undefined,
