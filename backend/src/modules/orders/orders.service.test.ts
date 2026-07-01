@@ -63,6 +63,7 @@ import {
   computeRequiredPassengerCount,
   resolveBundleOccupancy,
   computeRoomsNeeded,
+  computeBundleRoomsCharged,
   createFulfillmentTasks,
   resolveOrderAgentId,
   buildStayNightDates,
@@ -905,6 +906,144 @@ describe('套餐酒店地面成本 ×roomsNeeded', () => {
   });
 });
 
+// ── 单人拼房 0.5 间计费房间数（server-authoritative）：computeBundleRoomsCharged ──
+// 业务口径：1 人报套餐且非独住 → 愿意拼房共用一间，只按 0.5 间收（床位口径）；
+// 独住 / 2 人及以上 / 含占座儿童 → 沿用容量口径（不变）。客户端 roomsBilled 只能上调不能下压。
+describe('computeBundleRoomsCharged（单人拼房 0.5 间 + 权威下限）', () => {
+  const occ = (adultCount: number, childCount = 0, infantCount = 0) =>
+    resolveBundleOccupancy({ adultCount, childCount, infantCount });
+  const room2A1C = { maxAdults: 2, maxChildren: 1 };
+  const ROOM_TYPE_ID = 'room-type-1'; // 绑定套餐房型的占位 id
+
+  const call = (over: Partial<Parameters<typeof computeBundleRoomsCharged>[0]>) =>
+    computeBundleRoomsCharged({
+      occupancy: occ(1),
+      capacity: room2A1C,
+      hotelRoomTypeId: ROOM_TYPE_ID,
+      singleCount: undefined,
+      clientRoomsBilled: undefined,
+      ...over,
+    });
+
+  it('单人拼房（1 成人 0 儿童，singleCount 缺省 / 0，绑房型）→ 0.5 间', () => {
+    expect(call({ singleCount: undefined })).toBe(0.5);
+    expect(call({ singleCount: 0 })).toBe(0.5);
+  });
+
+  it('单人独住（singleCount ≥ 1）→ 1 整间（不走 0.5，照旧 + 单房差另算）', () => {
+    expect(call({ singleCount: 1 })).toBe(1);
+  });
+
+  it('单人 + 婴儿（婴儿不占房）仍算单人拼房 → 0.5 间', () => {
+    expect(call({ occupancy: occ(1, 0, 2) })).toBe(0.5);
+  });
+
+  it('未绑套餐房型（hotelRoomTypeId=null）→ 不走 0.5 口径，按容量 1 间', () => {
+    expect(call({ hotelRoomTypeId: null })).toBe(1);
+  });
+
+  it('2 成人 → 1 整间（容量口径不变，不走 0.5）', () => {
+    expect(call({ occupancy: occ(2) })).toBe(1);
+  });
+
+  it('1 成人 1 占座儿童 → 有占座儿童，非单人 → 按容量 1 间（不走 0.5）', () => {
+    expect(call({ occupancy: occ(1, 1) })).toBe(1);
+  });
+
+  it('权威下限：2 成人 + 客户端伪造 roomsBilled=0.5 → 取 max(0.5, 1)=1（不给少付）', () => {
+    expect(call({ occupancy: occ(2), clientRoomsBilled: 0.5 })).toBe(1);
+  });
+
+  it('权威下限：单人拼房 + 客户端 roomsBilled=0.5 → 与权威一致 0.5', () => {
+    expect(call({ occupancy: occ(1), clientRoomsBilled: 0.5 })).toBe(0.5);
+  });
+
+  it('客户端可上调：单人拼房 + roomsBilled=2（主动多开房）→ 取 max(2, 0.5)=2', () => {
+    expect(call({ occupancy: occ(1), clientRoomsBilled: 2 })).toBe(2);
+  });
+
+  it('4 成人 + 客户端伪造 roomsBilled=0.5 → 取 max(0.5, 2)=2（多人不给伪造半间）', () => {
+    expect(call({ occupancy: occ(4), clientRoomsBilled: 0.5 })).toBe(2);
+  });
+});
+
+// ── 单人拼房 0.5 间：可观测的套餐地面价（与 BUNDLE 分支同源公式：ground = basePrice×nights×rooms，随后 ×(1−pct/100)）──
+// 用 computeBundleRoomsCharged 的权威房间数驱动酒店行定价，复刻 createOrder BUNDLE 分支的收费口径。
+describe('单人拼房 0.5 间 → 套餐酒店地面价（basePrice 600 / 2 晚）', () => {
+  const occ = (adultCount: number, childCount = 0) =>
+    resolveBundleOccupancy({ adultCount, childCount });
+  const room2A1C = { maxAdults: 2, maxChildren: 1 };
+  const ROOM_TYPE_ID = 'room-type-1';
+  const BASE_PRICE = 600;
+  const NIGHTS = 2;
+  // 与 orders.service.ts BUNDLE 分支同源：groundTotal = basePrice×nights×rooms（HOTEL 行随房间数缩放）。
+  const hotelGround = (rooms: number) => Math.max(0, Math.round(BASE_PRICE * NIGHTS * rooms));
+  // 折后套餐行金额 = round(amount × (100−pct)/100)（与循环后 percent-off 后处理一致）。
+  const afterDiscount = (amount: number, pct: number) => Math.round((amount * (100 - pct)) / 100);
+  const rooms = (over: Partial<Parameters<typeof computeBundleRoomsCharged>[0]>) =>
+    computeBundleRoomsCharged({
+      occupancy: occ(1),
+      capacity: room2A1C,
+      hotelRoomTypeId: ROOM_TYPE_ID,
+      singleCount: undefined,
+      clientRoomsBilled: undefined,
+      ...over,
+    });
+
+  it('单人拼房（singleCount 0）→ 0.5 间 → 酒店地面 = 600×2×0.5 = 600（折前）', () => {
+    const r = rooms({ singleCount: 0 });
+    expect(r).toBe(0.5);
+    expect(hotelGround(r)).toBe(600);
+  });
+
+  it('单人拼房 + discountPct 10 → 折后 = round(600 × 0.9) = 540', () => {
+    const r = rooms({ singleCount: 0 });
+    expect(afterDiscount(hotelGround(r), 10)).toBe(540);
+  });
+
+  it('单人独住（singleCount 1）→ 1 整间 → 酒店地面 = 600×2×1 = 1200（不变；单房差另算）', () => {
+    const r = rooms({ singleCount: 1 });
+    expect(r).toBe(1);
+    expect(hotelGround(r)).toBe(1200);
+  });
+
+  it('2 成人 → 1 间 → 酒店地面 = 600×2×1 = 1200（不变）', () => {
+    const r = rooms({ occupancy: occ(2) });
+    expect(r).toBe(1);
+    expect(hotelGround(r)).toBe(1200);
+  });
+
+  it('3 成人 → 2 间 → 酒店地面 = 600×2×2 = 2400（不变）', () => {
+    const r = rooms({ occupancy: occ(3) });
+    expect(r).toBe(2);
+    expect(hotelGround(r)).toBe(2400);
+  });
+
+  it('滥用：2 成人 + 客户端伪造 roomsBilled=0.5 → 服务端仍按 1 间收 1200（不给 0.5 少付）', () => {
+    const r = rooms({ occupancy: occ(2), clientRoomsBilled: 0.5 });
+    expect(r).toBe(1);
+    expect(hotelGround(r)).toBe(1200);
+  });
+
+  it('单房差独住 vs 拼房：拼房酒店地面正好是独住整间的一半（0.5 vs 1）', () => {
+    const share = hotelGround(rooms({ singleCount: 0 }));
+    const single = hotelGround(rooms({ singleCount: 1 }));
+    expect(share * 2).toBe(single);
+  });
+});
+
+// ── 单独 HOTEL 行（非套餐）不受 0.5 拼房口径影响：仍按 computeRoomsNeeded 整间（out of scope）──
+// computeBundleRoomsCharged 仅在 BUNDLE 分支调用；单独 HOTEL 分支用 computeRoomsNeeded，1 成人 → ceil(1/2)=1 间。
+describe('单独 HOTEL 单人（非套餐）→ 仍 1 整间（0.5 口径不外溢）', () => {
+  const occ = (adultCount: number, childCount = 0) =>
+    resolveBundleOccupancy({ adultCount, childCount });
+  const room2A1C = { maxAdults: 2, maxChildren: 1 };
+
+  it('1 成人（房型 2大1小）→ computeRoomsNeeded = 1 间（单独 HOTEL 分支不走 0.5）', () => {
+    expect(computeRoomsNeeded(occ(1), room2A1C)).toBe(1);
+  });
+});
+
 // ── 套餐升舱拆座模型：computeBundleSeatSplit ──────────────────────────
 // 正确模型：客户机票仍按经济舱套餐价收，升舱只把座位从经济舱「拆」到真实商务舱库存
 // （ECONOMY 减 businessCount、BUSINESS 加 businessCount），净占座不变、不超售。
@@ -1643,6 +1782,7 @@ describe('priceAndValidateItems · 酒店重算价来源 + 下架拦截', () => 
         unitPrice: number;
         amount: number;
         hotelRoomTypeId?: string;
+        roomsBilled?: number;
       }>>;
     }).priceAndValidateItems(items);
 
@@ -1765,7 +1905,8 @@ describe('priceAndValidateItems · 酒店重算价来源 + 下架拦截', () => 
         hotel: { isActive: true },
       },
     });
-    // 无 goDate 盖章 → 不触发库存校验（沿用宽松口径），此调用应成功不抛下架
+    // 无 goDate 盖章 → 不触发库存校验（沿用宽松口径），此调用应成功不抛下架。
+    // 显式 2 成人（占整间）→ 走整间口径，验证「在售放行 + 权威 basePrice ×rooms 重算」。
     const priced = await price([
       {
         kind: 'BUNDLE',
@@ -1773,11 +1914,94 @@ describe('priceAndValidateItems · 酒店重算价来源 + 下架拦截', () => 
         quantity: 1,
         unitPrice: 0,
         bundleId: 'bdl1',
+        adultCount: 2,
       } as OrderItemInput,
     ]);
     const bundle = priced.find((p) => p.kind === 'BUNDLE')!;
     expect(bundle).toBeDefined();
     // 酒店地面价按权威 basePrice ×rooms 重算：1280 × 3 晚 × 1 间 = 3840
     expect(bundle.unitPrice).toBe(3840);
+  });
+
+  // ── 单人拼房 0.5 间（server-authoritative，钱路径经 BUNDLE 分支落到订单行）─────────
+  const soloBundleFixture = () =>
+    mockPrisma.bundle.findUnique.mockResolvedValue({
+      items: [{ kind: 'HOTEL', qty: 3, unitPrice: 1280 }],
+      groundDiscount: dec2(0),
+      discountPct: 0,
+      isActive: true,
+      hotelRoomTypeId: 'rt_bundle',
+      hotelNights: 3,
+      singleSupplementCnyPerNight: 80,
+      businessUpgradeCnyPerLeg: 700,
+      childSeatDiscountCnyPerPerson: 30,
+      infantPriceCny: 0,
+      selfVisaDeductCny: 0,
+      legs: 2,
+      hotelRoomType: {
+        maxAdults: 2,
+        maxChildren: 1,
+        basePrice: dec2(1280),
+        hotelId: 'hotel_on',
+        hotel: { isActive: true },
+      },
+    });
+
+  it('单人拼房（1 成人 / singleCount 0，绑房型）→ 0.5 间 → 酒店地面 1280×3×0.5 = 1920', async () => {
+    soloBundleFixture();
+    const priced = await price([
+      {
+        kind: 'BUNDLE',
+        description: '岘港套餐',
+        quantity: 1,
+        unitPrice: 0,
+        bundleId: 'bdl1',
+        adultCount: 1,
+        childCount: 0,
+      } as OrderItemInput,
+    ]);
+    const bundle = priced.find((p) => p.kind === 'BUNDLE')!;
+    expect(bundle.unitPrice).toBe(1920); // 1280 × 3 × 0.5
+    expect(bundle.roomsBilled).toBe(0.5); // 计费房间数落到订单行（供房控读取）
+  });
+
+  it('单人独住（1 成人 / singleCount 1，绑房型）→ 1 整间 → 酒店地面 1280×3×1 = 3840 + 单房差', async () => {
+    soloBundleFixture();
+    const priced = await price([
+      {
+        kind: 'BUNDLE',
+        description: '岘港套餐',
+        quantity: 1,
+        unitPrice: 0,
+        bundleId: 'bdl1',
+        adultCount: 1,
+        childCount: 0,
+        singleCount: 1,
+      } as OrderItemInput,
+    ]);
+    const bundle = priced.find((p) => p.kind === 'BUNDLE')!;
+    expect(bundle.roomsBilled).toBe(1); // 独住 → 整间（不走 0.5）
+    expect(bundle.unitPrice).toBe(3840); // 1280 × 3 × 1（单房差记在 amount，不进 unitPrice）
+    // 单房差 = 1 × 80 × 3 晚 = 240 → amount = 3840 + 240
+    expect(bundle.amount).toBe(3840 + 240);
+  });
+
+  it('滥用防护：2 成人 + 客户端伪造 roomsBilled=0.5 → 服务端仍按 1 间收 3840（不给少付）', async () => {
+    soloBundleFixture();
+    const priced = await price([
+      {
+        kind: 'BUNDLE',
+        description: '岘港套餐',
+        quantity: 1,
+        unitPrice: 0,
+        bundleId: 'bdl1',
+        adultCount: 2,
+        childCount: 0,
+        roomsBilled: 0.5, // 客户端伪造半间
+      } as OrderItemInput,
+    ]);
+    const bundle = priced.find((p) => p.kind === 'BUNDLE')!;
+    expect(bundle.roomsBilled).toBe(1); // 权威下限：max(0.5, 1) = 1
+    expect(bundle.unitPrice).toBe(3840); // 按 1 间收，不给 0.5 少付
   });
 });

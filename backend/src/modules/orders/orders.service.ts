@@ -835,12 +835,20 @@ export class OrderService {
           quantity: item.quantity,
           metadata: item.metadata,
         });
-        // 所需房间数：选的人数一间房坐不下时自动加房（业务口径）。
-        //   roomsNeeded = max( ceil(成人/maxAdults), ceil(占座儿童/maxChildren), 1 )
-        // 套餐没绑房型 / 容量缺失 → computeRoomsNeeded 回退默认 2大1小（≈旧 ceil(seatPax/2) 行为）。
-        // 注意：单人入住（singleCount）不在此计入 —— 它是独立自愿加价项，容量才驱动房间数。
-        // 0.5 间：录单方显式传 roomsBilled（支持半间）时以其为准，否则按容量自动推算。
-        const rooms = item.roomsBilled ?? computeRoomsNeeded(occupancy, bundle.hotelRoomType);
+        // 计费房间数（server-authoritative，钱路径权威计算）：
+        //   · 容量口径 physicalRooms = computeRoomsNeeded（选的人数一间坐不下自动加房）：
+        //       max( ceil(成人/maxAdults), ceil(占座儿童/maxChildren), 1 )；缺房型回退默认 2大1小。
+        //   · 单人拼房 0.5 间：绑了套餐房型 且 1 成人 0 儿童（婴儿不占房）且非独住（singleCount=0）
+        //       → 只按 0.5 间收（床位口径）；独住（singleCount≥1）照旧整间 + 单人入住房差。
+        //   · 客户端 roomsBilled 只能上调不能下压（max(client, roomsCharged)）——防止把多人单伪造成 0.5 间。
+        // 单一权威口径由 computeBundleRoomsCharged 提供（单测与本分支共用，避免漂移）。
+        const rooms = computeBundleRoomsCharged({
+          occupancy,
+          capacity: bundle.hotelRoomType,
+          hotelRoomTypeId: bundle.hotelRoomTypeId,
+          singleCount: item.singleCount,
+          clientRoomsBilled: item.roomsBilled,
+        });
 
         // 酒店行的权威每间每晚价：套餐绑了房型 → 用 HotelRoomType.basePrice（服务端重算），
         // 绝不信任 bundle.items JSON 里的 HOTEL.unitPrice（历史上可能是占位/过时的畸低值，
@@ -3048,6 +3056,47 @@ export function computeRoomsNeeded(
       ? Math.ceil(children / maxChildrenRaw)
       : Math.ceil((adults + children) / maxAdults);
   return Math.max(adultRooms, childRooms, 1);
+}
+
+// ── 套餐酒店计费房间数（server-authoritative；含单人拼房 0.5 间口径）──────────
+/**
+ * 计算套餐酒店部分应计费的房间数（钱路径，权威计算，不轻信客户端）。
+ *
+ * 业务口径：一个人报套餐（1 成人 / 0 儿童，婴儿不占房）且**不**独住时，愿意拼房共用一间，
+ * 只按 0.5 间收费（床位口径）；独住（singleCount ≥ 1）则照旧收整间 + 单人入住房差。
+ * 2 人及以上、或含占座儿童 → 沿用 computeRoomsNeeded 的容量口径（不变）。
+ *
+ *   isSoloSharing = 绑了套餐房型 且 adultCount===1 且 childCount===0 且 singleCount(缺省0)===0
+ *   roomsCharged  = isSoloSharing ? 0.5 : physicalRooms(容量推算)
+ *
+ * 仅对绑定套餐房型（hotelRoomTypeId 存在）生效；未绑房型的老套餐不走 0.5 口径。
+ *
+ * server-authoritative：客户端传的 roomsBilled 只能「上调」不能「下压」——最终取
+ * max(clientRooms, roomsCharged)。这样单人拼房单不会被 2 人单伪造成 0.5 间少付钱，
+ * 同时保留「录单方主动多开房」等向上调整的向后兼容能力。
+ *
+ * 导出供单测与 createOrder BUNDLE 分支共用（同一份权威口径，避免漂移）。
+ */
+export function computeBundleRoomsCharged(params: {
+  occupancy: Pick<BundleOccupancy, 'adultCount' | 'childCount'>;
+  capacity: { maxAdults?: number | null; maxChildren?: number | null } | null;
+  hotelRoomTypeId: string | null;
+  singleCount: number | undefined;
+  clientRoomsBilled: number | undefined;
+}): number {
+  const { occupancy, capacity, hotelRoomTypeId, singleCount, clientRoomsBilled } = params;
+  const physicalRooms = computeRoomsNeeded(occupancy, capacity);
+  const isSoloSharing =
+    hotelRoomTypeId != null &&
+    occupancy.adultCount === 1 &&
+    occupancy.childCount === 0 &&
+    (singleCount ?? 0) === 0;
+  const roomsCharged = isSoloSharing ? 0.5 : physicalRooms;
+  // 权威下限：客户端只能上调、不能下压（防止把多人单伪造成 0.5 间）。
+  if (clientRoomsBilled != null) {
+    return Math.max(clientRoomsBilled, roomsCharged);
+  }
+  return roomsCharged;
 }
 
 /**

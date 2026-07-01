@@ -25,7 +25,13 @@ import { useDebouncedValue } from '../lib/useDebouncedValue';
 import { useFlightSearchCache, type FlightSearchCache, type FlightLeg } from '../lib/useFlightSearchCache';
 import { useHotelAvailability } from '../lib/useHotelAvailability';
 import { useBundleSellableDates } from '../lib/useBundleSellableDates';
-import { computeRoomsNeeded, resolveRoomCapacity, resolveBundleNights } from '../lib/bundleRooms';
+import {
+  computeRoomsNeeded,
+  resolveRoomCapacity,
+  resolveBundleNights,
+  resolveBundleRoomFactor,
+  isSoloOccupancy,
+} from '../lib/bundleRooms';
 import {
   SellableReasonChip,
   isSellableBlocked,
@@ -565,8 +571,11 @@ function ConfigurableBundleCard({
   // 加的房按房价收钱。容量缺失/未绑房型 → 兜底 2 大 1 小。婴儿不占床、单人入住独立不计入。
   const roomCapacity = resolveRoomCapacity(b.hotelRoomType);
   const baseRooms = computeRoomsNeeded(adultCount, childCount, b.hotelRoomType);
+  // 单人预订（1 成人、0 儿童）：默认拼房（与同行客共一间双人房，只占半间）。
+  const isSolo = isSoloOccupancy(adultCount, childCount);
   // 可选升级 add-on（默认 0；范围 0..seatPax — 婴儿不占座、不能升舱/不算单人入住房）。
-  const [singleCount, setSingleCount] = useState(0); // 一个人住酒店（单人入住）
+  // 单人预订时 singleCount 同时充当「拼房(0) / 独住(1)」开关（默认拼房）。
+  const [singleCount, setSingleCount] = useState(0); // 一个人住酒店（单人入住 / 独住）
   const [businessCount, setBusinessCount] = useState(0); // 升级商务舱
 
   // 日期输入框 ref：售罄时"看看其它日期"聚焦并弹出原生日期选择器（不暴露原始库存）。
@@ -663,9 +672,16 @@ function ConfigurableBundleCard({
   const infantPrice = b.infantPrice ?? 0;
   const childDiscountTotal = childCount * childDiscount;
   const infantPriceTotal = infantCount * infantPrice;
-  // ── add-on 加价（镜像后端：单人入住 = singleCount×supp×nights；升舱 = businessCount×upg×legs）──
+  // ── add-on 加价（镜像后端：单人入住/独住 = singleCount×supp×nights；升舱 = businessCount×upg×legs）──
   const singleAddOn = singleCount * supp * billNights;
   const businessAddOn = businessCount * upg * b.legs;
+
+  // 计费房间比例（展示与提交口径一致）：单人拼房只占半间（0.5），其余按容量整数房间数 baseRooms。
+  //   solo 拼房（singleCount=0）→ 0.5 间（拼房价 = 0.5×房价×晚，镜像后端 roomsBilled 缺省的半间口径）；
+  //   solo 独住（singleCount=1）→ 整间 + 单房差（singleAddOn）；多人 → baseRooms。
+  const roomFactor = resolveBundleRoomFactor(adultCount, childCount, singleCount, baseRooms);
+  // 拼房（半间）文案标签：仅单人拼房时点出，避免与整间价混淆。
+  const soloShared = isSolo && singleCount <= 0;
 
   // 计算每个行项展示金额，逐行镜像后端权威重算（card total 必须 == order total，否则后端拒单）：
   //   FLIGHT：经济舱全价×seatPax（占座；婴儿不占座 → 不发机票座位）。儿童折扣/婴儿价不在机票行，
@@ -681,11 +697,14 @@ function ConfigurableBundleCard({
       };
     }
     if (item.kind === 'HOTEL') {
-      // 酒店地面价随房间数缩放（item.qty = 晚数；× baseRooms = 房间数），与后端 hotel=单价×晚×房 一致。
+      // 酒店地面价随计费房间比例缩放（item.qty = 晚数；× roomFactor = 房间数或半间），
+      // 与后端 hotel = 单价×晚×房 一致；单人拼房 roomFactor=0.5（拼房价 = 0.5×房价×晚）。
       return {
         ...item,
-        computedTotal: item.unitPrice * item.qty * baseRooms,
-        label: `${item.productName}（${baseRooms} 间）`,
+        computedTotal: item.unitPrice * item.qty * roomFactor,
+        label: soloShared
+          ? `${item.productName}（拼房价·双人一间，单人拼房）`
+          : `${item.productName}（${baseRooms} 间）`,
       };
     }
     if (item.kind === 'VISA') {
@@ -750,8 +769,10 @@ function ConfigurableBundleCard({
     ] as (Inclusion | null)[]
   ).filter((x): x is Inclusion => x !== null);
 
-  // 是否展示「单人入住」升级（占座 seatPax≥2 才有意义：1 人本就独住一间；婴儿不占房不算）
+  // 多人「单人入住」升级（占座 seatPax≥2：多人里某几位想一人一间；婴儿不占房不算）。
   const canOfferSingle = b.singleSupplementPerNight != null && seatPax >= 2;
+  // 单人「拼房 / 独住」开关（solo 才出现；配置了单房差才可选独住）。默认拼房（singleCount=0）。
+  const canOfferSoloRoom = isSolo && b.singleSupplementPerNight != null;
 
   return (
     <article className="card-warm-interactive group overflow-hidden">
@@ -821,7 +842,9 @@ function ConfigurableBundleCard({
           </span>
           <span className="inline-flex items-center gap-1.5 rounded-full bg-purple-50 px-2.5 py-1 text-xs font-semibold text-purple-700">
             <Icon name="hotel" className="h-3.5 w-3.5" />
-            房间数：{baseRooms} 间（每间最多 {roomCapacity.maxAdults} 大 {roomCapacity.maxChildren} 小）
+            {soloShared
+              ? '住宿：拼房（与同行客共一间双人房）'
+              : `房间数：${baseRooms} 间（每间最多 ${roomCapacity.maxAdults} 大 ${roomCapacity.maxChildren} 小）`}
           </span>
           {/* 人数一间坐不下 → 自动加房，明确告知价格已含多出的房间 */}
           {baseRooms > 1 && (
@@ -958,12 +981,14 @@ function ConfigurableBundleCard({
             <span className="text-slate-600 tabular-nums whitespace-nowrap">+¥{infantPriceTotal.toLocaleString()}</span>
           </div>
         )}
-        {/* 升级 add-on 明细行（选了才显示） */}
+        {/* 升级 add-on 明细行（选了才显示）；单人预订独住时显示为「独住·单房差」 */}
         {singleCount > 0 && (
           <div className="flex items-center justify-between text-xs">
             <div className="flex items-center gap-2 min-w-0">
               <span className="rounded bg-indigo-100 px-1.5 py-0.5 font-medium text-indigo-700">升级</span>
-              <span className="text-slate-700 truncate">单人入住 ×{singleCount}</span>
+              <span className="text-slate-700 truncate">
+                {isSolo ? '独住 · 单房差' : `单人入住 ×${singleCount}`}
+              </span>
             </div>
             <span className="text-slate-600 tabular-nums whitespace-nowrap">+¥{singleAddOn.toLocaleString()}</span>
           </div>
@@ -978,6 +1003,43 @@ function ConfigurableBundleCard({
           </div>
         )}
       </div>
+
+      {/* 单人预订：拼房（默认，半间价）/ 独住（整间 + 单房差）二选一。诚实标价，与服务端实收一致。 */}
+      {canOfferSoloRoom && (
+        <div className="mt-3 rounded-xl border border-brand-200 bg-brand-50/40 p-3 text-xs">
+          <div className="font-semibold text-ink">住宿方式（单人预订）</div>
+          <div className="mt-2 grid grid-cols-2 gap-2">
+            <button
+              type="button"
+              onClick={() => setSingleCount(0)}
+              aria-pressed={singleCount <= 0}
+              className={`rounded-xl border-2 p-2.5 text-left transition-colors ${
+                singleCount <= 0
+                  ? 'border-brand bg-surface shadow-card'
+                  : 'border-slate-200 bg-surface/60 hover:border-brand/50'
+              }`}
+            >
+              <div className="font-semibold text-ink">拼房</div>
+              <div className="mt-0.5 text-ink-muted">与同行客共一间 · 默认</div>
+            </button>
+            <button
+              type="button"
+              onClick={() => setSingleCount(1)}
+              aria-pressed={singleCount >= 1}
+              className={`rounded-xl border-2 p-2.5 text-left transition-colors ${
+                singleCount >= 1
+                  ? 'border-brand bg-surface shadow-card'
+                  : 'border-slate-200 bg-surface/60 hover:border-brand/50'
+              }`}
+            >
+              <div className="font-semibold text-ink">独住</div>
+              <div className="mt-0.5 text-ink-muted">
+                一人一间 · +¥{(b.singleSupplementPerNight ?? 0).toLocaleString()}/晚
+              </div>
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* 可选升级 add-on（直接在前台选购，下单即含；不走客服） */}
       {(canOfferSingle || canOfferBusiness) && (

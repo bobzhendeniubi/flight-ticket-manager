@@ -61,6 +61,45 @@ export function computeRoomsNeeded(
   return Math.max(adultRooms, childRooms, 1);
 }
 
+// ── SOLO 拼房 / 独住（半间口径）─────────────────────────────────────────────
+//
+// 单人预订（1 成人、0 儿童）默认「拼房」——与同行客共用一间双人房，只占半间（0.5）。
+// 后端权威口径（与并行开发的服务端一致）：
+//   SOLO 且 singleCount==0 → 酒店按 0.5 间计价（拼房价 = 0.5 × 房价 × 晚）。
+//   SOLO 且 singleCount==1 → 整间 + 单房差（full room + 单房差）。
+// 非单人预订不受影响（照旧按容量推 roomsNeeded）。
+//
+// 前台据此镜像展示价，保证「买家看到的价 == 服务端实收」，避免拼房显示整间价却只收半价的口径撕裂。
+
+/** 单人拼房占用的房间比例（半间）。与后端 0.5 半间口径一致。 */
+export const SOLO_SHARED_ROOM_FRACTION = 0.5;
+
+/** 是否为单人预订（1 成人、0 儿童）—— 拼房/独住口径只对单人生效（镜像后端 adultCount==1 && childCount==0）。 */
+export function isSoloOccupancy(adultCount: number, childCount: number): boolean {
+  return adultCount === 1 && childCount === 0;
+}
+
+/**
+ * 计费房间比例（展示与提交口径一致）。
+ * - 单人拼房（solo 且 singleCount==0）→ 0.5 间（拼房价）。
+ * - 其余（含单人独住 singleCount≥1、多人）→ 走容量推的整数房间数 baseRooms。
+ * @param adultCount  成人（占座）
+ * @param childCount  占座儿童
+ * @param singleCount 单人独住份数（0=拼房；≥1=独住）
+ * @param baseRooms   按容量算出的整数房间数（computeRoomsNeeded 结果）
+ */
+export function resolveBundleRoomFactor(
+  adultCount: number,
+  childCount: number,
+  singleCount: number,
+  baseRooms: number,
+): number {
+  if (isSoloOccupancy(adultCount, childCount) && singleCount <= 0) {
+    return SOLO_SHARED_ROOM_FRACTION;
+  }
+  return baseRooms;
+}
+
 // ── 套餐住宿晚数（nights）解析 ───────────────────────────────────────────────
 //
 // 单一口径，镜像后端（与 backend 对齐）：

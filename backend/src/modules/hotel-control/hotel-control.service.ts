@@ -231,6 +231,62 @@ export function expandUsedByDate(
   return used.map(round2);
 }
 
+/** roomsBilled 判为半间（拼房 0.5）：恰为 0.5 的分数占房行。*/
+function isHalfRoom(it: { roomsBilled?: Prisma.Decimal | number | null }): boolean {
+  const billed = dec(it.roomsBilled ?? null);
+  return billed != null && billed === 0.5;
+}
+
+/**
+ * dates 上逐日累计「拼房客」人数：roomsBilled == 0.5 的占房行，
+ * 入住区间 [checkIn, checkOut) 覆盖该晚即 +1（每行 = 1 位拼房客）。
+ * 用于「奇数拼房客落单」提醒：两位 0.5 拼一间，奇数则有 1 位无法配对。
+ */
+export function expandSharedHalfByDate(
+  items: ReadonlyArray<{
+    hotelCheckIn: Date | null;
+    hotelCheckOut: Date | null;
+    roomsBilled?: Prisma.Decimal | number | null;
+  }>,
+  dates: readonly string[],
+): number[] {
+  const count = new Array<number>(dates.length).fill(0);
+  for (const it of items) {
+    if (!it.hotelCheckIn || !it.hotelCheckOut) continue;
+    if (!isHalfRoom(it)) continue;
+    const checkIn = fmtDateOnly(it.hotelCheckIn);
+    const checkOut = fmtDateOnly(it.hotelCheckOut);
+    for (let i = 0; i < dates.length; i++) {
+      if (checkIn <= dates[i] && dates[i] < checkOut) count[i] += 1;
+    }
+  }
+  return count;
+}
+
+/**
+ * 物理房间口径占房：逐日真实占用的整间数（可由销控板既有数组在内存推导，无需查库）。
+ *   physicalUsed[i] = ceil(拼房客数 / 2) + 整间预订数
+ * 其中：
+ *   sharedHalfCount[i] * 0.5 = 拼房客贡献的床位当量；
+ *   used[i] - sharedHalfCount[i] * 0.5 = 整间预订当量（整数），即整间预订数；
+ *   两位拼房客共用 1 间物理房，落单 1 位向上取整独占 1 间 ⇒ ceil(拼房客数 / 2)。
+ * 防浮点误差：整间余数按最近的 0.5 取整后再运算，最后 round2 输出。
+ */
+export function computePhysicalUsed(
+  used: readonly number[],
+  sharedHalfCount: readonly number[],
+): number[] {
+  return used.map((u, i) => {
+    const solos = sharedHalfCount[i] ?? 0;
+    // used 由 Decimal 0.5 累加而来，先按 0.5 网格对齐消除 0.999… 类误差
+    const usedHalfUnits = Math.round(u * 2);
+    const soloHalfUnits = solos; // 每位拼房客 = 0.5 = 1 个 half-unit
+    const wholeRoomHalfUnits = usedHalfUnits - soloHalfUnits; // 整间部分（half-unit 计）
+    const wholeRooms = wholeRoomHalfUnits / 2; // 整间预订数（应为整数）
+    return round2(Math.ceil(solos / 2) + wholeRooms);
+  });
+}
+
 /**
  * 单酒店逐晚余量（remaining = block - used），口径与销控板 getBoard 完全一致。
  * 一次 findMany 拉周期 + 一次 findMany 拉占房行，JS 内展开（无逐日查询）。
@@ -280,7 +336,25 @@ export interface HotelControlBoard {
     hotelName: string;
     /** 最新周期（dateFrom 最晚且有价）的切房单价；都没填则 null */
     unitPrice: number | null;
-    rows: { block: number[]; used: number[]; remaining: number[] };
+    rows: {
+      block: number[];
+      /** 床位口径占房：Σ roomsBilled（拼房客各计 0.5，可为小数），逐日 */
+      used: number[];
+      /** 床位口径余量 = block - used，逐日 */
+      remaining: number[];
+      /** 当晚拼房客（roomsBilled==0.5）人数，逐日 */
+      sharedHalfCount: number[];
+      /** 当晚拼房客人数为奇数 ⇒ 有 1 位无法配对（需补单房差或另行配对），逐日 */
+      sharedOdd: boolean[];
+      /**
+       * 物理房间口径占房：真实占用的整间数，逐日。
+       * = ceil(拼房客数 / 2) + 整间预订数
+       *   两位拼房客共用 1 间物理房；落单的 1 位仍独占 1 间（向上取整）。
+       */
+      physicalUsed: number[];
+      /** 物理房间口径余量 = block - physicalUsed，逐日 */
+      physicalRemaining: number[];
+    };
   }>;
 }
 
@@ -345,17 +419,34 @@ export async function getBoard(
     .sort((a, b) => a[1].localeCompare(b[1], 'zh-CN'))
     .map(([hotelId, hotelName]) => {
       const hotelPeriods = periods.filter((p) => p.hotelId === hotelId);
+      const hotelItems = items.filter((it) => it.hotelRoomType?.hotelId === hotelId);
       const block = expandBlockByDate(hotelPeriods, dates);
-      const used = expandUsedByDate(
-        items.filter((it) => it.hotelRoomType?.hotelId === hotelId),
-        dates,
-      );
+      const used = expandUsedByDate(hotelItems, dates);
+      // 拼房客（0.5 半间）逐日人数 + 奇数标记（同一份占房行复用，O(items)）
+      const sharedHalfCount = expandSharedHalfByDate(hotelItems, dates);
+      const sharedOdd = sharedHalfCount.map((n) => n % 2 === 1);
 
       const remaining = block.map((b, i) => b - used[i]);
+      // 物理房间口径（内存推导，无额外查库）：整间占用数 + 余量
+      const physicalUsed = computePhysicalUsed(used, sharedHalfCount);
+      const physicalRemaining = block.map((b, i) => round2(b - physicalUsed[i]));
       const latestPriced = hotelPeriods.find((p) => p.unitPrice != null);
       const unitPrice = latestPriced ? round2(dec(latestPriced.unitPrice)!) : null;
 
-      return { hotelId, hotelName, unitPrice, rows: { block, used, remaining } };
+      return {
+        hotelId,
+        hotelName,
+        unitPrice,
+        rows: {
+          block,
+          used,
+          remaining,
+          sharedHalfCount,
+          sharedOdd,
+          physicalUsed,
+          physicalRemaining,
+        },
+      };
     });
 
   return { dates, hotels };

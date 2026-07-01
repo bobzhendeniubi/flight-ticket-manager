@@ -48,6 +48,27 @@ function remainingCellCls(v: number): string {
   return 'text-ink-soft';
 }
 
+/**
+ * 拼房客（0.5 半间）逐日附加口径 + 物理房间口径 — 后端 board.hotels[].rows 新增（附加字段，向后兼容）。
+ * api.ts 的 HotelControlBoardHotel.rows 尚未声明这些列，这里按可选读取，缺省即降级不显示。
+ * physicalUsed = ceil(拼房客数/2) + 整间预订数；两位拼房共用 1 间，落单 1 位向上取整独占 1 间。
+ */
+type SharedRows = {
+  sharedHalfCount?: number[];
+  sharedOdd?: boolean[];
+  physicalUsed?: number[];
+  physicalRemaining?: number[];
+};
+function readShared(rows: unknown): SharedRows {
+  const r = rows as SharedRows;
+  return {
+    sharedHalfCount: r.sharedHalfCount,
+    sharedOdd: r.sharedOdd,
+    physicalUsed: r.physicalUsed,
+    physicalRemaining: r.physicalRemaining,
+  };
+}
+
 // 矩阵 sticky 列宽：第一列（酒店）11rem，第二列（行标签）3.5rem
 const STICKY_COL1 = 'sticky left-0 z-10 min-w-[11rem] bg-white';
 const STICKY_COL2 = 'sticky left-[11rem] z-10 min-w-[3.5rem] bg-white';
@@ -133,7 +154,10 @@ export function HotelControlPage() {
       <section className="card">
         <h2 className="text-sm font-semibold text-ink">销控矩阵（按酒店 × 日期）</h2>
         <p className="mt-1 text-xs text-ink-muted">
-          每家酒店三行：包房 / 用房 / 余量。横向滚动看更多日期（最长 120 天）。
+          每家酒店四行：包房 / 用房（床位口径）/ 物理房间 / 余量。横向滚动看更多日期（最长 120 天）。用房格出现
+          <span className="mx-1 inline-flex h-4 min-w-[1rem] items-center justify-center rounded-full bg-amber-100 px-1 text-[10px] font-semibold leading-none text-amber-700 ring-1 ring-amber-300">拼</span>
+          表示当晚拼房客为奇数，有 1 位无法配对（需补单房差或另行配对）。
+          「用房」为床位口径（拼房客各计 0.5，可为小数）；「物理房间」是实际占用的整间数（两位拼房共用 1 间，落单 1 位仍独占 1 间）。
         </p>
         {loading ? (
           <div className="mt-3 text-sm text-ink-muted">加载销控板…</div>
@@ -159,7 +183,7 @@ export function HotelControlPage() {
                 {board.hotels.map((h) => (
                   <Fragment key={h.hotelId}>
                     <tr className="border-t border-slate-200">
-                      <td rowSpan={3} className={`${STICKY_COL1} py-2 pr-2 align-top`}>
+                      <td rowSpan={4} className={`${STICKY_COL1} py-2 pr-2 align-top`}>
                         <div className="font-medium text-ink">{h.hotelName}</div>
                         {h.unitPrice != null && (
                           <div className="text-xs text-ink-muted">单价 {fmtCny(h.unitPrice)}/晚</div>
@@ -171,10 +195,44 @@ export function HotelControlPage() {
                       ))}
                     </tr>
                     <tr>
-                      <td className={`${STICKY_COL2} py-1 pr-2 text-xs text-ink-muted`}>用房</td>
-                      {h.rows.used.map((v, i) => (
-                        <td key={i} className="px-2 py-1 text-right text-ink-soft">{v}</td>
-                      ))}
+                      <td className={`${STICKY_COL2} py-1 pr-2 text-xs text-ink-muted`}>
+                        用房<span className="ml-0.5 text-[10px] text-ink-muted/70">床位</span>
+                      </td>
+                      {h.rows.used.map((v, i) => {
+                        const shared = readShared(h.rows);
+                        const odd = shared.sharedOdd?.[i] === true;
+                        const n = shared.sharedHalfCount?.[i] ?? 0;
+                        return (
+                          <td key={i} className="px-2 py-1 text-right text-ink-soft">
+                            <span className="inline-flex items-center gap-1">
+                              {v}
+                              {odd && (
+                                <span
+                                  className="inline-flex h-4 min-w-[1rem] items-center justify-center rounded-full bg-amber-100 px-1 text-[10px] font-semibold leading-none text-amber-700 ring-1 ring-amber-300"
+                                  title={`本日有 ${n} 位拼房客（奇数）——1 位需补单房差或另行配对`}
+                                  aria-label={`本日有 ${n} 位拼房客（奇数），1 位需补单房差或另行配对`}
+                                >
+                                  拼
+                                </span>
+                              )}
+                            </span>
+                          </td>
+                        );
+                      })}
+                    </tr>
+                    <tr>
+                      <td className={`${STICKY_COL2} py-1 pr-2 text-xs text-ink-muted`}>
+                        物理房间
+                      </td>
+                      {h.rows.used.map((_, i) => {
+                        const shared = readShared(h.rows);
+                        const phys = shared.physicalUsed?.[i];
+                        return (
+                          <td key={i} className="px-2 py-1 text-right font-medium text-ink">
+                            {phys == null ? '—' : phys}
+                          </td>
+                        );
+                      })}
                     </tr>
                     <tr className="border-b border-slate-100">
                       <td className={`${STICKY_COL2} py-1 pr-2 text-xs text-ink-muted`}>余量</td>

@@ -14,7 +14,12 @@ import { describe, it, expect, vi } from 'vitest';
 vi.mock('../../db/prisma.js', () => ({ prisma: {} }));
 
 import type { PrismaClient } from '@prisma/client';
-import { getAlerts } from './hotel-control.service.js';
+import {
+  getAlerts,
+  getBoard,
+  expandSharedHalfByDate,
+  computePhysicalUsed,
+} from './hotel-control.service.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const todayStr = new Date().toISOString().slice(0, 10);
@@ -112,5 +117,137 @@ describe('getAlerts', () => {
     const client = fakeClient({ paxCounts: [191, 191] });
     const alerts = await getAlerts(14, client);
     expect(alerts.overCapacitySchedules).toEqual([]);
+  });
+});
+
+describe('expandSharedHalfByDate', () => {
+  const dates = [dayStr(0), dayStr(1), dayStr(2)];
+
+  it('只数 roomsBilled==0.5 的行，整间/其它房量不计', () => {
+    const items = [
+      // 拼房客 A：D0..D1 覆盖 D0
+      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.5 },
+      // 整间：不计
+      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 1 },
+      // 拼房客 B：D0..D2 覆盖 D0、D1
+      { hotelCheckIn: day(0), hotelCheckOut: day(2), roomsBilled: 0.5 },
+    ];
+    // D0: A+B=2；D1: B=1；D2: 0
+    expect(expandSharedHalfByDate(items, dates)).toEqual([2, 1, 0]);
+  });
+
+  it('缺 check-in/out 或非 0.5 的行跳过', () => {
+    const items = [
+      { hotelCheckIn: null, hotelCheckOut: day(1), roomsBilled: 0.5 },
+      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: null },
+      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.25 },
+    ];
+    expect(expandSharedHalfByDate(items, dates)).toEqual([0, 0, 0]);
+  });
+});
+
+describe('getBoard sharedHalfCount / sharedOdd', () => {
+  function boardClient(orderItems: unknown[]): PrismaClient {
+    return {
+      hotelBlockPeriod: {
+        findMany: vi.fn().mockResolvedValue([
+          {
+            hotelId: 'h1',
+            dateFrom: day(0),
+            dateTo: day(2),
+            rooms: 5,
+            unitPrice: null,
+            hotel: { name: '美溪海滩酒店' },
+          },
+        ]),
+      },
+      orderItem: { findMany: vi.fn().mockResolvedValue(orderItems) },
+    } as unknown as PrismaClient;
+  }
+
+  it('拼房客奇数标 sharedOdd，偶数不标；整间不影响', async () => {
+    const client = boardClient([
+      // D0 两位拼房（偶数）+ 一整间
+      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.5, hotelRoomType: { hotelId: 'h1', hotel: { name: '美溪海滩酒店' } } },
+      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.5, hotelRoomType: { hotelId: 'h1', hotel: { name: '美溪海滩酒店' } } },
+      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 1, hotelRoomType: { hotelId: 'h1', hotel: { name: '美溪海滩酒店' } } },
+      // D1 一位拼房（奇数）→ 落单
+      { hotelCheckIn: day(1), hotelCheckOut: day(2), roomsBilled: 0.5, hotelRoomType: { hotelId: 'h1', hotel: { name: '美溪海滩酒店' } } },
+    ]);
+    const board = await getBoard({ from: dayStr(0), to: dayStr(2) }, client);
+    const rows = board.hotels[0]!.rows;
+    // D0=2（偶）, D1=1（奇）, D2=0
+    expect(rows.sharedHalfCount).toEqual([2, 1, 0]);
+    expect(rows.sharedOdd).toEqual([false, true, false]);
+    // 既有口径不受影响
+    expect(rows.remaining.length).toBe(3);
+  });
+});
+
+describe('computePhysicalUsed', () => {
+  it('3 位拼房客 → 床位 1.5，物理 ceil(3/2)+0 = 2 间', () => {
+    // used = 3 * 0.5 = 1.5；无整间预订
+    expect(computePhysicalUsed([1.5], [3])).toEqual([2]);
+  });
+
+  it('2 位拼房客 + 1 整间 → 床位 2.0，物理 ceil(2/2)+1 = 2 间', () => {
+    // used = 2*0.5 + 1 = 2.0
+    expect(computePhysicalUsed([2.0], [2])).toEqual([2]);
+  });
+
+  it('0 拼房客、2 整间 → 物理 = 2（与床位口径一致）', () => {
+    expect(computePhysicalUsed([2], [0])).toEqual([2]);
+  });
+
+  it('仅 1 位拼房客 → 床位 0.5，落单向上取整为整间 → 物理 1', () => {
+    expect(computePhysicalUsed([0.5], [1])).toEqual([1]);
+  });
+
+  it('浮点误差（0.5 累加）不影响整间余数取整', () => {
+    // 3 位拼房 + 2 整间：床位 = 1.5 + 2 = 3.5（可能带 0.999… 误差）
+    const usedWithError = 0.5 + 0.5 + 0.5 + 1 + 1; // = 3.5，构造累加路径
+    expect(computePhysicalUsed([usedWithError], [3])).toEqual([2 + 2]); // ceil(3/2)=2, 整间 2 → 4
+  });
+});
+
+describe('getBoard physicalUsed / physicalRemaining', () => {
+  function boardClient(orderItems: unknown[]): PrismaClient {
+    return {
+      hotelBlockPeriod: {
+        findMany: vi.fn().mockResolvedValue([
+          {
+            hotelId: 'h1',
+            dateFrom: day(0),
+            dateTo: day(2),
+            rooms: 5,
+            unitPrice: null,
+            hotel: { name: '美溪海滩酒店' },
+          },
+        ]),
+      },
+      orderItem: { findMany: vi.fn().mockResolvedValue(orderItems) },
+    } as unknown as PrismaClient;
+  }
+
+  it('销控板输出物理房间口径（block=5，D0 3 拼房→物理 2，余 3）', async () => {
+    const rt = { hotelRoomType: { hotelId: 'h1', hotel: { name: '美溪海滩酒店' } } };
+    const client = boardClient([
+      // D0：3 位拼房客（奇数，落单）→ 床位 1.5、物理 2
+      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.5, ...rt },
+      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.5, ...rt },
+      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.5, ...rt },
+      // D1：2 位拼房客 + 1 整间 → 床位 2.0、物理 2
+      { hotelCheckIn: day(1), hotelCheckOut: day(2), roomsBilled: 0.5, ...rt },
+      { hotelCheckIn: day(1), hotelCheckOut: day(2), roomsBilled: 0.5, ...rt },
+      { hotelCheckIn: day(1), hotelCheckOut: day(2), roomsBilled: 1, ...rt },
+    ]);
+    const board = await getBoard({ from: dayStr(0), to: dayStr(2) }, client);
+    const rows = board.hotels[0]!.rows;
+    // 床位口径不变
+    expect(rows.used).toEqual([1.5, 2, 0]);
+    // 物理房间口径：D0=2, D1=2, D2=0
+    expect(rows.physicalUsed).toEqual([2, 2, 0]);
+    // 物理余量 = block(5) - physicalUsed
+    expect(rows.physicalRemaining).toEqual([3, 3, 5]);
   });
 });
