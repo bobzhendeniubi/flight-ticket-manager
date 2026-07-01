@@ -854,9 +854,9 @@ function NewBundleWizard({
     }
     return [{ kind: 'HOTEL', productName: '岘港凯悦度假村', qty: 3, unitPrice: 1880 }];
   });
-  // 地面合计（机票行 unitPrice=0 → 仅地面；真实全包价含实时机票）。
+  // 地面合计 = 只算非机票行（机票不在套餐里填价，按航班最便宜起价单独加，见 originalAllIn）。
   const listPrice = useMemo(
-    () => items.reduce((s, i) => s + (i.qty ?? 0) * (i.unitPrice ?? 0), 0),
+    () => items.filter((i) => i.kind !== 'FLIGHT').reduce((s, i) => s + (i.qty ?? 0) * (i.unitPrice ?? 0), 0),
     [items],
   );
   // 原价 / 人（含当前最低来回机票）：地面 + 来回机票×人数，再 / 人。flightRefRoundTripCny 由页面推得。
@@ -1111,18 +1111,10 @@ function NewBundleWizard({
                     />
                   )}
                   {it.kind === 'FLIGHT' ? (
-                    <div className="flex w-24 flex-col">
-                      <NumberInput
-                        min={0}
-                        className="input w-24 text-xs"
-                        value={it.unitPrice}
-                        onChange={(n) => {
-                          const next = [...items];
-                          next[idx] = { ...it, unitPrice: n };
-                          setItems(next);
-                        }}
-                      />
-                      <span className="mt-0.5 text-[10px] leading-tight text-ink-muted">机票起价/人（选填，留空=按出发日实时）</span>
+                    // 机票不在套餐里填价：按航班最便宜那天做起价（自动，含在原价里），下单按出发日实时浮动。
+                    <div className="flex w-24 flex-col items-end justify-center text-right">
+                      <span className="text-xs text-ink-muted">按航班</span>
+                      <span className="text-[10px] leading-tight text-ink-muted">最便宜起价·自动</span>
                     </div>
                   ) : (
                     <NumberInput
@@ -1137,7 +1129,7 @@ function NewBundleWizard({
                     />
                   )}
                   <span className="text-xs text-ink-muted w-20 text-right nums">
-                    ¥{((it.qty ?? 0) * (it.unitPrice ?? 0)).toLocaleString()}
+                    {it.kind === 'FLIGHT' ? '实时' : `¥${((it.qty ?? 0) * (it.unitPrice ?? 0)).toLocaleString()}`}
                   </span>
                   <button
                     type="button"
@@ -1175,12 +1167,27 @@ function NewBundleWizard({
               </div>
             </div>
             <div className="flex items-center justify-between border-t border-slate-200 pt-2">
-              <span className="text-sm text-ink-soft">= 折扣</span>
-              <span className="text-2xl font-semibold text-ink nums">{pct}%</span>
+              <span className="text-sm text-ink-soft">折扣<span className="ml-1 text-xs text-ink-muted">(也可直接改)</span></span>
+              <div className="flex items-center gap-1">
+                <NumberInput
+                  min={0}
+                  max={100}
+                  className="input w-20 text-right text-lg font-semibold"
+                  value={pct}
+                  onChange={(n) => {
+                    const p = Math.min(100, Math.max(0, n ?? 0));
+                    // 直接改折扣% → 反算想卖的价（两个字段联动，单一真源仍是 targetPerPax）
+                    setTargetPerPax(originalPerPax > 0 ? Math.round(originalPerPax * (1 - p / 100)) : null);
+                  }}
+                  integerOnly
+                />
+                <span className="text-ink-muted">%</span>
+              </div>
             </div>
-            <p className="text-right text-[11px] text-ink-muted">
-              填你想卖的价 → 系统按「原价(含当前最低机票)」反推折扣 {pct}%。整个全包价随出发日实时浮动 ×(1−{pct}%)，
-              机票自动算入、无需逐套餐维护；前台买家看到「原价划线 → 省 {pct}%、¥X 起」。
+            <p className="text-[11px] leading-relaxed text-ink-muted">
+              💡 机票按<strong>航班最便宜那天</strong>做起价（已含在"原价"里，你不用在套餐里填机票价）。你填
+              <strong>想卖的价格</strong>、或直接改<strong>折扣%</strong>都行，两个会自动联动。实际下单：整个全包价按
+              <strong>出发日实时机票</strong>浮动 ×(1−{pct}%)，前台买家看到「原价划线 → 省 {pct}% → ¥X 起」。
             </p>
             {pct > 0 && (
               <div className="text-right text-xs text-emerald-700">
@@ -1210,7 +1217,8 @@ function NewBundleWizard({
                   items: items.map((it) => ({
                     ...it,
                     qty: Math.max(1, it.qty ?? 1),
-                    unitPrice: it.unitPrice ?? 0,
+                    // 机票行不在套餐里定价（按航班最便宜起价，实时浮动）→ 强制 0，清掉历史误填值
+                    unitPrice: it.kind === 'FLIGHT' ? 0 : (it.unitPrice ?? 0),
                   })),
                   listPrice,
                   bundlePrice,
