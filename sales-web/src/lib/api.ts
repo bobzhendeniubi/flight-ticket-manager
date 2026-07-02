@@ -131,9 +131,12 @@ export interface BaggagePolicyInfo {
 export interface FlightSeatAvailability {
   seatClassId: string; // 锁位接口（POST /seat-locks）需要
   cabin: CabinClass;
+  // ⚠️ capacity/sold/locked：公开 /flights/search 已不返回（防匿名爬取实时销量），
+  // 仅带权的班次接口（listSchedules，AdminFlightsPage 用）仍有；search 消费方请勿读取。
   capacity: number;
   sold: number;
   locked: number;
+  /** 公开 search 口径：≤9 真实值，>9 封顶报 9（服务端契约）；带权接口仍为精确值 */
   available: number;
   availabilityTier: AvailabilityTier;
   basePrice: string;

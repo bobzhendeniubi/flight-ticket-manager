@@ -49,6 +49,7 @@ vi.mock('../pricing/pricing.service.js', () => ({ PricingService: class {} }));
 
 import {
   AVAILABILITY_TIER_THRESHOLDS,
+  capPublicAvailable,
   computeAvailabilityTier,
   FlightService,
 } from './flights.service.js';
@@ -85,6 +86,29 @@ describe('computeAvailabilityTier', () => {
     expect(computeAvailabilityTier(AVAILABILITY_TIER_THRESHOLDS.TIGHT_MIN - 1)).toBe('LOW');
     expect(computeAvailabilityTier(AVAILABILITY_TIER_THRESHOLDS.LOW_MIN - 1)).toBe('VERY_LOW');
     expect(computeAvailabilityTier(AVAILABILITY_TIER_THRESHOLDS.VERY_LOW_MIN - 1)).toBe('SOLD_OUT');
+  });
+});
+
+// ── capPublicAvailable（公开口径余位封顶：防匿名爬取实时销量）────────────────
+describe('capPublicAvailable · 公开口径余位封顶', () => {
+  it('≤9 报真实值（含 0 与边界 9）', () => {
+    expect(capPublicAvailable(0)).toBe(0);
+    expect(capPublicAvailable(5)).toBe(5);
+    expect(capPublicAvailable(9)).toBe(9);
+  });
+
+  it('>9 一律封顶报 9（不再暴露精确余量）', () => {
+    expect(capPublicAvailable(10)).toBe(9);
+    expect(capPublicAvailable(178)).toBe(9);
+  });
+
+  it('负数夹到 0（防御）', () => {
+    expect(capPublicAvailable(-3)).toBe(0);
+  });
+
+  it('封顶不影响档位：档位仍按真实余量计算', () => {
+    expect(computeAvailabilityTier(178)).toBe('AMPLE');
+    expect(capPublicAvailable(178)).toBe(9);
   });
 });
 

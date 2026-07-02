@@ -191,7 +191,7 @@ function FlightCard({ flight, passengers }: { flight: FlightSearchResult; passen
             >
               <View className='cabin-info'>
                 <Text className='cabin-name'>{CABIN_LABEL[c.cabin] ?? c.cabin}</Text>
-                <Text className='avail'>余票 {c.available}/{c.capacity}</Text>
+                <Text className='avail'>余票 {c.available >= 9 ? '9+' : c.available}</Text>
               </View>
               <View className='cabin-price'>
                 {showLine && <Text className='text-price-line'>¥{Number(c.basePrice).toFixed(0)}</Text>}

@@ -1,7 +1,7 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { UserRole } from '@prisma/client';
-import { FlightService } from './flights.service.js';
+import { FlightService, capPublicAvailable } from './flights.service.js';
 import { PricingService } from '../pricing/pricing.service.js';
 import { actorFromRequest } from '../../lib/audit.js';
 import { priceQuerySchema } from '../pricing/pricing.schemas.js';
@@ -29,7 +29,11 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
   app.get('/price', async (req) => {
     const q = priceQuerySchema.parse(req.query);
     const pricing = await pricingService.calculatePrice(q.scheduleId, q.cabin, q.qty);
-    return { pricing };
+    // 公开端点余位封顶：currentBucketRemaining 是精确档内剩余（内部计价要真值），
+    // 对匿名端 ≤9 封顶输出，防止轮询重建实时销量；价格/档位字段不受影响。
+    return {
+      pricing: { ...pricing, currentBucketRemaining: capPublicAvailable(pricing.currentBucketRemaining) },
+    };
   });
 
   // ── 管理员航班 CRUD ──

@@ -57,6 +57,19 @@ export const AVAILABILITY_TIER_THRESHOLDS = {
 
 export type AvailabilityTier = 'AMPLE' | 'TIGHT' | 'LOW' | 'VERY_LOW' | 'SOLD_OUT';
 
+/**
+ * 公开端点（/flights/search、/flights/price）的余位数值封顶：≤9 报真实值（与单笔锁位上限 9 一致），
+ * >9 一律报 9。精确 capacity/sold/locked 不对公开端点输出——此前匿名轮询可重建每个班次的
+ * 实时销售数据（公测检查发现）；「只展示档位」必须由服务端契约保证，不能只靠前端不渲染。
+ * 档位（availabilityTier）仍按真实余量计算；带角色守卫的管理/代理路由不受影响。
+ */
+export const PUBLIC_AVAILABLE_CAP = 9;
+
+/** 公开口径余位数值：夹到 [0, PUBLIC_AVAILABLE_CAP]。 */
+export function capPublicAvailable(available: number): number {
+  return Math.min(Math.max(0, available), PUBLIC_AVAILABLE_CAP);
+}
+
 /** 把锁位感知的可售余量（available）折算成档位。 */
 export function computeAvailabilityTier(available: number): AvailabilityTier {
   if (available >= AVAILABILITY_TIER_THRESHOLDS.AMPLE_MIN) return 'AMPLE';
@@ -154,12 +167,12 @@ export class FlightService {
             }
             const baggage = baggageByFlightCabin.get(`${s.flightId}:${c.cabin}`);
             return {
+              // 内部真值：hasSpace 过滤用，返回前会剥掉（不出现在公开响应里）
+              availExact: avail,
               seatClassId: c.id, // 锁位接口（POST /seat-locks）需要
               cabin: c.cabin,
-              capacity: c.capacity,
-              sold: c.sold,
-              locked: lockedQty,
-              available: avail,
+              // 公开口径：不输出 capacity/sold/locked，余位数值 ≤9 封顶（档位仍按真值算）
+              available: capPublicAvailable(avail),
               availabilityTier: computeAvailabilityTier(avail),
               basePrice: c.basePrice.toString(),
               dynamicPrice,
@@ -178,7 +191,7 @@ export class FlightService {
             };
           }),
         );
-        const hasSpace = availableSeats.some((c) => c.available >= q.passengers);
+        const hasSpace = availableSeats.some((c) => c.availExact >= q.passengers);
         return {
           scheduleId: s.id,
           flightId: s.flightId,
@@ -191,7 +204,8 @@ export class FlightService {
           departureTz: s.departureTz,
           arrivalTz: s.arrivalTz,
           durationMinutes: Math.round((s.arrivalTime.getTime() - s.departureTime.getTime()) / 60000),
-          seatClasses: availableSeats,
+          // 剥掉内部真值字段，公开响应只带封顶后的 available + 档位
+          seatClasses: availableSeats.map(({ availExact: _availExact, ...pub }) => pub),
           hasSpace,
         };
       }),

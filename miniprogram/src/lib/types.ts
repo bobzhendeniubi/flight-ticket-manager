@@ -52,8 +52,10 @@ export interface AuthResult {
 // ── 航班 ───────────────────────────────────────────────────
 export interface FlightSeatAvailability {
   cabin: CabinClass;
-  capacity: number;
-  sold: number;
+  /** 公开接口已不返回精确容量/已售（防爬取实时销量）；保留可选仅为兼容老缓存 */
+  capacity?: number;
+  sold?: number;
+  /** 公开口径余位：≤9 真实值，>9 封顶报 9（服务端契约） */
   available: number;
   basePrice: string;
   dynamicPrice: string;
