@@ -169,6 +169,8 @@ function deriveFlightRefRoundTrip(bundles: MockBundle[]): number | null {
 function bundleFlightRoundTrip(
   b: MockBundle,
 ): { roundTrip: number; outbound: number; inbound: number } | null {
+  // 防御：items 非数组等畸形形状（历史脏数据）时安全短路，不让整个套餐列表因一条坏数据崩溃。
+  if (!Array.isArray(b.items)) return null;
   const hasFlight = b.items.some((i) => i.kind === 'FLIGHT');
   if (!hasFlight || b.originalAllInCny == null || !b.flightPax) return null;
   const ground = b.items
@@ -196,6 +198,8 @@ function persistedHotelNights(b: MockBundle): number | null {
 interface RoomTypeOption {
   id: string;
   label: string;
+  /** 房型整间夜价（¥/晚，= 酒店每晚起价 × 价格系数，与后端 HotelRoomType.basePrice 落库口径一致）；只读展示用 */
+  nightlyPriceCny: number;
 }
 
 /** 套餐表单的航班号下拉选项（航班号 · 航线，value = flightId）；保留航班号/航线字段以便提交时回建引用 */
@@ -281,7 +285,14 @@ export function ProductsPage() {
         setVisas(activeOnly(v.visas).map(visaApiToMock));
         setBundles(activeOnly(b.bundles).map(bundleApiToMock));
         setRoomTypeOptions(
-          activeHotels.flatMap((ht) => ht.roomTypes.map((rt) => ({ id: rt.id, label: `${ht.name} · ${rt.name}` }))),
+          activeHotels.flatMap((ht) =>
+            ht.roomTypes.map((rt) => ({
+              id: rt.id,
+              label: `${ht.name} · ${rt.name}`,
+              // 整间夜价 = 房型自身 basePrice（服务端权威取价源，与 hotelRoomType.nightlyPriceCny 落库口径一致）。
+              nightlyPriceCny: Math.round(Number(rt.basePrice)),
+            })),
+          ),
         );
         setFlightOptions(flightsToOptions(f.flights));
       })
@@ -506,6 +517,8 @@ export function ProductsPage() {
           items={bundles}
           roomTypeOptions={roomTypeOptions}
           flightOptions={flightOptions}
+          transfers={transfers}
+          visas={visas}
           onChange={persistBundles}
         />
       )}
@@ -732,11 +745,17 @@ function BundlesSection({
   items,
   roomTypeOptions,
   flightOptions,
+  transfers,
+  visas,
   onChange,
 }: {
   items: MockBundle[];
   roomTypeOptions: RoomTypeOption[];
   flightOptions: FlightOption[];
+  /** 接送产品下拉选项（在售）；套餐 TRANSFER 组件只能挑产品，不再手填价 */
+  transfers: MockTransfer[];
+  /** 签证产品下拉选项（在售）；套餐 VISA 组件只能挑产品，不再手填价 */
+  visas: MockVisa[];
   onChange: (v: MockBundle[]) => void;
 }) {
   const [showWizard, setShowWizard] = useState(false);
@@ -759,6 +778,8 @@ function BundlesSection({
         <NewBundleWizard
           roomTypeOptions={roomTypeOptions}
           flightOptions={flightOptions}
+          transfers={transfers}
+          visas={visas}
           flightRefRoundTripCny={deriveFlightRefRoundTrip(items)}
           onCancel={() => setShowWizard(false)}
           onSubmit={(b) => {
@@ -772,6 +793,8 @@ function BundlesSection({
           key={editing.id}
           roomTypeOptions={roomTypeOptions}
           flightOptions={flightOptions}
+          transfers={transfers}
+          visas={visas}
           initial={editing}
           flightRefRoundTripCny={deriveFlightRefRoundTrip(items)}
           onCancel={() => setEditing(null)}
@@ -808,6 +831,8 @@ function BundleCard({
   const savingPct = bundle.listPrice > 0 ? (saving / bundle.listPrice) * 100 : 0;
   // 机票口径：来回 = 去程(单程) + 回程(单程)；拆开显示，避免把来回价误当单程。
   const flight = bundleFlightRoundTrip(bundle);
+  // 防御：items 非数组等畸形形状（历史脏数据）时安全兜底为 []，不让一条坏数据挂掉整卡渲染。
+  const safeBundleItems = Array.isArray(bundle.items) ? bundle.items : [];
   return (
     <article className={`card transition hover:shadow-pop ${bundle.active ? '' : 'opacity-60'}`}>
       <div className="font-mono text-xs text-ink-muted">编号 {bundle.code ?? '—'} <span className="font-sans not-italic text-ink-muted">(系统自动生成)</span></div>
@@ -828,7 +853,7 @@ function BundleCard({
       </div>
 
       <div className="mt-3 space-y-1.5">
-        {bundle.items.map((i, idx) => (
+        {safeBundleItems.map((i, idx) => (
           <div key={idx} className="flex items-center justify-between text-xs">
             <div className="flex items-center gap-2 min-w-0">
               <span className={`rounded-md px-1.5 py-0.5 font-medium ${KIND_LABEL[i.kind].color}`}>
@@ -910,7 +935,21 @@ function BundleCard({
         </div>
       )}
 
-      <div className="mt-4 rounded-lg border border-slate-100 bg-canvas p-3">
+      <div className="mt-4 rounded-lg border border-brand-200 bg-brand-50/60 p-3">
+        <div className="flex items-end justify-between">
+          <span className="text-sm text-ink-soft">
+            起价 / 人<span className="ml-1 text-xs text-ink-muted">(from · 拼房)</span>
+          </span>
+          <span className="text-2xl font-semibold text-brand-700 nums">
+            from ¥{(bundle.originalPerPaxCny ?? 0).toLocaleString()}
+          </span>
+        </div>
+        <p className="mt-1 text-right text-[11px] text-ink-muted">
+          双人拼房价 · 单人独住+单房差 · 实际按出发日实时机票浮动
+        </p>
+      </div>
+
+      <div className="mt-2 rounded-lg border border-slate-100 bg-canvas p-3">
         <div className="flex items-center justify-between text-sm text-ink-muted">
           <span>单买总价</span>
           <span className="line-through nums">¥{bundle.listPrice.toLocaleString()}</span>
@@ -945,6 +984,8 @@ function BundleCard({
 function NewBundleWizard({
   roomTypeOptions,
   flightOptions,
+  transfers,
+  visas,
   initial,
   flightRefRoundTripCny,
   onCancel,
@@ -953,9 +994,13 @@ function NewBundleWizard({
   roomTypeOptions: RoomTypeOption[];
   /** 可绑定的航班号选项（去程/回程下拉）；value = flight.id */
   flightOptions: FlightOption[];
+  /** 接送产品下拉选项（在售）；TRANSFER 组件只能挑产品，价格只读来自产品 */
+  transfers: MockTransfer[];
+  /** 签证产品下拉选项（在售）；VISA 组件只能挑产品，价格只读来自产品 */
+  visas: MockVisa[];
   /** 传入既有套餐 = 编辑模式（各字段预填）；缺省 = 新建 */
   initial?: MockBundle;
-  /** 当前最低来回机票 / 人（CNY）：把「想卖的价格」换算成折扣% 的原价锚点；页面从已有套餐推得 */
+  /** 当前最低来回机票 / 人（CNY）：起价 / 人公式里的机票项；页面从已有套餐推得 */
   flightRefRoundTripCny?: number | null;
   onCancel: () => void;
   onSubmit: (b: MockBundle) => void;
@@ -984,45 +1029,86 @@ function NewBundleWizard({
   const [selfVisaDeduct, setSelfVisaDeduct] = useState<number | null>(initial?.selfVisaDeductCny ?? null);
   const [infantPrice, setInfantPrice] = useState<number | null>(initial?.infantPriceCny ?? null);
   const [legs, setLegs] = useState<number | null>(initial?.legs ?? 2);
-  // Local draft shape allowing null for in-progress numeric edits
-  type DraftBundleItem = Omit<BundleItem, 'qty' | 'unitPrice'> & { qty: number | null; unitPrice: number | null };
+  // Local draft shape allowing null for in-progress numeric edits.
+  // transferId/visaId：TRANSFER/VISA 组件挑的产品 id（价格只读，来自产品，见 productPriceFor）。
+  type DraftBundleItem = Omit<BundleItem, 'qty' | 'unitPrice'> & {
+    qty: number | null;
+    unitPrice: number | null;
+    transferId?: string | null;
+    visaId?: string | null;
+  };
   const [items, setItems] = useState<DraftBundleItem[]>(() => {
     if (initial && initial.items.length > 0) {
       const firstHotel = initial.items.findIndex((it) => it.kind === 'HOTEL');
       // 首个 HOTEL 项数量归一到住宿晚数（修旧数据 qty 与 hotelNights 分叉）。
-      return initial.items.map((it, i) => ({
-        kind: it.kind,
-        productName: it.productName,
-        qty: i === firstHotel ? initialNights : it.qty,
-        unitPrice: it.unitPrice,
-      }));
+      return initial.items.map((it, i) => {
+        const raw = it as BundleItem & { transferId?: string | null; visaId?: string | null };
+        return {
+          kind: it.kind,
+          productName: it.productName,
+          qty: i === firstHotel ? initialNights : it.qty,
+          unitPrice: it.unitPrice,
+          transferId: raw.transferId ?? null,
+          visaId: raw.visaId ?? null,
+        };
+      });
     }
     return [{ kind: 'HOTEL', productName: '岘港凯悦度假村', qty: 3, unitPrice: 1880 }];
   });
-  // 地面合计 = 只算非机票行（机票不在套餐里填价，按航班最便宜起价单独加，见 originalAllIn）。
+  // 房型整间夜价（¥/晚，只读展示 + 起价公式用）：未关联房型 → 0。
+  const selectedRoomType = roomTypeOptions.find((o) => o.id === hotelRoomTypeId) ?? null;
+  const hotelNightlyPriceCny = selectedRoomType?.nightlyPriceCny ?? 0;
+  // 接送 / 签证组件价格权威来源 = 所挑产品的 basePrice（只读，运营不可手改）。
+  const transferPriceById = useMemo(() => new Map(transfers.map((t) => [t.id, t.basePrice])), [transfers]);
+  const visaPriceById = useMemo(() => new Map(visas.map((v) => [v.id, v.basePrice])), [visas]);
+  // 地面合计（参考展示用，1 间房口径）：只算非机票行，价格取权威产品价（HOTEL 用整间夜价 × 晚数）。
   const listPrice = useMemo(
-    () => items.filter((i) => i.kind !== 'FLIGHT').reduce((s, i) => s + (i.qty ?? 0) * (i.unitPrice ?? 0), 0),
-    [items],
+    () =>
+      items.reduce((s, i) => {
+        if (i.kind === 'FLIGHT') return s;
+        if (i.kind === 'HOTEL') return s + hotelNightlyPriceCny * (i.qty ?? 0);
+        if (i.kind === 'TRANSFER') return s + (i.transferId ? (transferPriceById.get(i.transferId) ?? 0) : 0) * (i.qty ?? 0);
+        return s + (i.visaId ? (visaPriceById.get(i.visaId) ?? 0) : 0) * (i.qty ?? 0);
+      }, 0),
+    [items, hotelNightlyPriceCny, transferPriceById, visaPriceById],
   );
-  // 原价 / 人（含当前最低来回机票）：地面 + 来回机票×人数，再 / 人。flightRefRoundTripCny 由页面推得。
-  const FLIGHT_PAX = initial?.flightPax ?? 2;
-  const originalAllIn = listPrice + (flightRefRoundTripCny ?? 0) * FLIGHT_PAX;
-  const originalPerPax = Math.round(originalAllIn / Math.max(1, FLIGHT_PAX));
-  // 运营录入「想卖的价格 / 人」(目标起价)；系统反推折扣%。初值 = 现折后价/人(编辑) 或 原价/人(新建·0折)。
+  // 住宿晚数是否可填 = 套餐里是否含 HOTEL 项（不再仅靠是否关联房型）。
+  const hasHotelItem = items.some((it) => it.kind === 'HOTEL');
+  const firstHotelIdx = items.findIndex((it) => it.kind === 'HOTEL');
+  // 起价 / 人（唯一权威口径，1 人·半间房拼房）—— 与后端 computeBundleOriginalPerPaxCny 公式一致：
+  //   flightRoundTripPerPax + 0.5×房型整间夜价×晚数 + 接送合计(Σqty×单价) + 签证/人(ΣunitPrice，忽略 qty)。
+  // 0.5 已在这里生效，酒店组件行本身仍展示整间价，不要重复打折。
+  const nightsForPricing = hasHotelItem ? hotelNights ?? 0 : 0;
+  const transferTotal = useMemo(
+    () =>
+      items
+        .filter((i) => i.kind === 'TRANSFER')
+        .reduce((s, i) => s + (i.qty ?? 0) * (i.transferId ? (transferPriceById.get(i.transferId) ?? 0) : 0), 0),
+    [items, transferPriceById],
+  );
+  const visaPerPax = useMemo(
+    () =>
+      items
+        .filter((i) => i.kind === 'VISA')
+        .reduce((s, i) => s + (i.visaId ? (visaPriceById.get(i.visaId) ?? 0) : 0), 0),
+    [items, visaPriceById],
+  );
+  const originalPerPax = Math.round(
+    (flightRefRoundTripCny ?? 0) + 0.5 * hotelNightlyPriceCny * nightsForPricing + transferTotal + visaPerPax,
+  );
+  // 运营录入「想卖的价格 / 人」(目标起价，基于 originalPerPaxCny)；系统反推折扣%。
+  // 初值 = 现折后价/人(编辑，优先用服务端权威 originalPerPaxCny) 或 原价/人(新建·0折)。
   const [targetPerPax, setTargetPerPax] = useState<number | null>(
     initial != null
       ? Math.round((initial.originalPerPaxCny ?? originalPerPax) * (1 - (initial.discountPct ?? 0) / 100))
       : null,
   );
-  // 反推折扣%（夹 0..100）：原价为 0 或目标价空 → 0 折。套餐价 = 整个全包价 ×(1 − pct/100)。
+  // 反推折扣%（夹 0..100）：起价/人为 0 或目标价空 → 0 折。套餐价 = 整个全包价 ×(1 − pct/100)。
   const pct =
     originalPerPax > 0 && targetPerPax != null
       ? Math.min(100, Math.max(0, Math.round((1 - targetPerPax / originalPerPax) * 100)))
       : 0;
   const bundlePrice = Math.round(listPrice * (1 - pct / 100)); // 地面折后（参考）
-  // 住宿晚数是否可填 = 套餐里是否含 HOTEL 项（不再仅靠是否关联房型）。
-  const hasHotelItem = items.some((it) => it.kind === 'HOTEL');
-  const firstHotelIdx = items.findIndex((it) => it.kind === 'HOTEL');
   // 名称里若写了「N 晚」，与当前晚数不一致 → 软提示（不阻断提交）。
   const nameNightsMatch = name.match(/(\d+)\s*晚/);
   const nameNights = nameNightsMatch ? Number(nameNightsMatch[1]) : null;
@@ -1030,7 +1116,14 @@ function NewBundleWizard({
   // 关联房型时晚数必须 1–30；含 HOTEL 项时晚数须为正整数。
   const nightsValid = !hasHotelItem || (hotelNights != null && hotelNights >= 1 && hotelNights <= 30);
   const hotelLinkValid = !hotelRoomTypeId || (hotelNights != null && hotelNights >= 1 && hotelNights <= 30);
-  const valid = name.length > 0 && items.length > 0 && bundlePrice > 0 && hotelLinkValid && nightsValid;
+  // TRANSFER/VISA 组件必须选了产品才能定价（与后端「必须关联接送/签证产品」校验一致，提交前先在前端拦一遍）。
+  const allComponentsLinked = items.every((it) => {
+    if (it.kind === 'TRANSFER') return !!it.transferId;
+    if (it.kind === 'VISA') return !!it.visaId;
+    return true;
+  });
+  const valid =
+    name.length > 0 && items.length > 0 && bundlePrice > 0 && hotelLinkValid && nightsValid && allComponentsLinked;
 
   // 住宿晚数 = 唯一真源：写入 hotelNights 的同时镜像给首个 HOTEL 项的 qty。
   const setNights = (n: number | null) => {
@@ -1042,12 +1135,13 @@ function NewBundleWizard({
     }
   };
 
+  // 新增组件：价格只读来自产品，新增行不预填价（TRANSFER/VISA 须选产品才有价，见下方下拉）。
   const addItem = (kind: BundleItem['kind']) => {
     const presets: Record<BundleItem['kind'], DraftBundleItem> = {
       FLIGHT: { kind: 'FLIGHT', productName: '澳门⇌岘港 经济舱', qty: 2, unitPrice: 0 },
-      HOTEL: { kind: 'HOTEL', productName: '岘港凯悦度假村', qty: hotelNights ?? 1, unitPrice: 1880 },
-      TRANSFER: { kind: 'TRANSFER', productName: '岘港机场接送 商务车', qty: 2, unitPrice: 188 },
-      VISA: { kind: 'VISA', productName: '越南 E-visa 30 天', qty: 2, unitPrice: 280 },
+      HOTEL: { kind: 'HOTEL', productName: '岘港凯悦度假村', qty: hotelNights ?? 1, unitPrice: 0 },
+      TRANSFER: { kind: 'TRANSFER', productName: '', qty: 2, unitPrice: 0, transferId: null },
+      VISA: { kind: 'VISA', productName: '', qty: 2, unitPrice: 0, visaId: null },
     };
     setItems([...items, presets[kind]]);
   };
@@ -1276,84 +1370,137 @@ function NewBundleWizard({
               </div>
             </div>
             <div className="mt-2 space-y-2">
-              {items.map((it, idx) => (
-                <div key={idx} className="flex items-center gap-2 rounded-lg border border-slate-200 bg-canvas p-2">
-                  <span className={`rounded px-1.5 py-0.5 text-xs font-medium ${KIND_LABEL[it.kind].color}`}>
-                    {KIND_LABEL[it.kind].label}
-                  </span>
-                  <input
-                    className="input flex-1 text-xs"
-                    value={it.productName}
-                    onChange={(e) => {
-                      const next = [...items];
-                      next[idx] = { ...it, productName: e.target.value };
-                      setItems(next);
-                    }}
-                  />
-                  {it.kind === 'HOTEL' && idx === firstHotelIdx ? (
-                    // 首个 HOTEL 项数量 = 住宿晚数派生值，只读，避免第二真源。
-                    <NumberInput
-                      min={1}
-                      className="input w-16 text-xs bg-canvas text-ink-muted"
-                      value={hotelNights}
-                      onChange={() => {}}
-                      disabled
-                      integerOnly
-                    />
-                  ) : (
-                    <NumberInput
-                      min={1}
-                      className="input w-16 text-xs"
-                      value={it.qty}
-                      onChange={(n) => {
-                        const next = [...items];
-                        next[idx] = { ...it, qty: n };
-                        setItems(next);
-                      }}
-                      integerOnly
-                    />
-                  )}
-                  {it.kind === 'FLIGHT' ? (
-                    // 机票不在套餐里填价：按航班最便宜那天做起价（自动，含在原价里），下单按出发日实时浮动。
-                    <div className="flex w-24 flex-col items-end justify-center text-right">
-                      <span className="text-xs text-ink-muted">按航班</span>
-                      <span className="text-[10px] leading-tight text-ink-muted">最便宜起价·自动</span>
-                    </div>
-                  ) : (
-                    <NumberInput
-                      min={0}
-                      className="input w-24 text-xs"
-                      value={it.unitPrice}
-                      onChange={(n) => {
-                        const next = [...items];
-                        next[idx] = { ...it, unitPrice: n };
-                        setItems(next);
-                      }}
-                    />
-                  )}
-                  <span className="text-xs text-ink-muted w-20 text-right nums">
-                    {it.kind === 'FLIGHT' ? '实时' : `¥${((it.qty ?? 0) * (it.unitPrice ?? 0)).toLocaleString()}`}
-                  </span>
-                  <button
-                    type="button"
-                    className="text-xs text-ink-muted hover:text-rose-600"
-                    onClick={() => setItems(items.filter((_, i) => i !== idx))}
-                  >
-                    ×
-                  </button>
-                </div>
-              ))}
+              {items.map((it, idx) => {
+                // 组件价格只读、来自产品：TRANSFER/VISA 挑产品定价，HOTEL 用房型整间夜价，FLIGHT 恒自动。
+                const unitPriceReadOnly =
+                  it.kind === 'HOTEL'
+                    ? hotelNightlyPriceCny
+                    : it.kind === 'TRANSFER'
+                      ? (it.transferId ? transferPriceById.get(it.transferId) : undefined) ?? 0
+                      : it.kind === 'VISA'
+                        ? (it.visaId ? visaPriceById.get(it.visaId) : undefined) ?? 0
+                        : 0;
+                return (
+                  <div key={idx} className="flex items-center gap-2 rounded-lg border border-slate-200 bg-canvas p-2">
+                    <span className={`rounded px-1.5 py-0.5 text-xs font-medium ${KIND_LABEL[it.kind].color}`}>
+                      {KIND_LABEL[it.kind].label}
+                    </span>
+                    {it.kind === 'TRANSFER' ? (
+                      // 接送产品下拉：价格只读来自产品，不再手填（换产品自动重新取价）。
+                      <select
+                        className="input flex-1 text-xs"
+                        value={it.transferId ?? ''}
+                        onChange={(e) => {
+                          const t = transfers.find((x) => x.id === e.target.value) ?? null;
+                          const next = [...items];
+                          next[idx] = { ...it, transferId: t?.id ?? null, productName: t?.name ?? '' };
+                          setItems(next);
+                        }}
+                      >
+                        <option value="">选择接送产品…</option>
+                        {transfers.map((t) => (
+                          <option key={t.id} value={t.id}>{t.name} · ¥{t.basePrice}</option>
+                        ))}
+                      </select>
+                    ) : it.kind === 'VISA' ? (
+                      // 签证产品下拉：价格只读来自产品，不再手填（换产品自动重新取价）。
+                      <select
+                        className="input flex-1 text-xs"
+                        value={it.visaId ?? ''}
+                        onChange={(e) => {
+                          const v = visas.find((x) => x.id === e.target.value) ?? null;
+                          const next = [...items];
+                          next[idx] = { ...it, visaId: v?.id ?? null, productName: v ? `${v.country} · ${v.type}` : '' };
+                          setItems(next);
+                        }}
+                      >
+                        <option value="">选择签证产品…</option>
+                        {visas.map((v) => (
+                          <option key={v.id} value={v.id}>{v.country} · {v.type} · ¥{v.basePrice}</option>
+                        ))}
+                      </select>
+                    ) : (
+                      <input
+                        className="input flex-1 text-xs"
+                        value={it.productName}
+                        onChange={(e) => {
+                          const next = [...items];
+                          next[idx] = { ...it, productName: e.target.value };
+                          setItems(next);
+                        }}
+                        placeholder={it.kind === 'HOTEL' ? '房型/描述（价格由上方关联房型决定）' : undefined}
+                      />
+                    )}
+                    {it.kind === 'HOTEL' && idx === firstHotelIdx ? (
+                      // 首个 HOTEL 项数量 = 住宿晚数派生值，只读，避免第二真源。
+                      <NumberInput
+                        min={1}
+                        className="input w-16 text-xs bg-canvas text-ink-muted"
+                        value={hotelNights}
+                        onChange={() => {}}
+                        disabled
+                        integerOnly
+                      />
+                    ) : (
+                      <NumberInput
+                        min={1}
+                        className="input w-16 text-xs"
+                        value={it.qty}
+                        onChange={(n) => {
+                          const next = [...items];
+                          next[idx] = { ...it, qty: n };
+                          setItems(next);
+                        }}
+                        integerOnly
+                      />
+                    )}
+                    {it.kind === 'FLIGHT' ? (
+                      // 机票不在套餐里填价：按航班最便宜那天做起价（自动，含在起价里），下单按出发日实时浮动。
+                      <div className="flex w-24 flex-col items-end justify-center text-right">
+                        <span className="text-xs text-ink-muted">按航班</span>
+                        <span className="text-[10px] leading-tight text-ink-muted">最便宜起价·自动</span>
+                      </div>
+                    ) : (
+                      // 只读价格：来自产品（HOTEL=整间夜价 / TRANSFER=接送产品价 / VISA=签证产品价），运营不可手改。
+                      <span className="input flex w-24 items-center justify-end bg-canvas text-xs text-ink-muted nums">
+                        ¥{unitPriceReadOnly.toLocaleString()}
+                      </span>
+                    )}
+                    <span className="text-xs text-ink-muted w-20 text-right nums">
+                      {it.kind === 'FLIGHT' ? '实时' : `¥${((it.qty ?? 0) * unitPriceReadOnly).toLocaleString()}`}
+                    </span>
+                    <button
+                      type="button"
+                      className="text-xs text-ink-muted hover:text-rose-600"
+                      onClick={() => setItems(items.filter((_, i) => i !== idx))}
+                    >
+                      ×
+                    </button>
+                  </div>
+                );
+              })}
             </div>
             <p className="mt-1.5 text-[11px] leading-relaxed text-ink-muted">
-              💡 酒店行的"数量"即<strong>住宿晚数</strong>，小计 = 晚数 × 每晚单价；下单时再按入住人数自动乘以所需房间数。
+              💡 组件价格只读、来自产品：酒店取上方关联房型的整间夜价（数量=住宿晚数）；接送/签证挑产品后自动取价，换产品自动重新取价。
             </p>
+            {transfers.length === 0 && items.some((it) => it.kind === 'TRANSFER') && (
+              <p className="mt-1 text-xs text-amber-700">⚠️ 暂无在售接送产品，请先到 产品管理 › 地面服务 里添加。</p>
+            )}
+            {visas.length === 0 && items.some((it) => it.kind === 'VISA') && (
+              <p className="mt-1 text-xs text-amber-700">⚠️ 暂无在售签证产品，请先到 产品管理 › 签证 里添加。</p>
+            )}
           </div>
 
           <div className="rounded-lg border border-slate-100 bg-canvas p-3 space-y-2">
             <div className="flex items-center justify-between text-sm">
-              <span className="text-ink-soft">原价 / 人<span className="ml-1 text-xs text-ink-muted">(含当前最低来回机票)</span></span>
+              <span className="text-ink-soft">
+                起价 / 人<span className="ml-1 text-xs text-ink-muted">(from，1 人·半间房拼房口径)</span>
+              </span>
               <span className="font-medium text-ink nums">¥{originalPerPax.toLocaleString()}</span>
             </div>
+            <p className="text-[11px] leading-relaxed text-ink-muted">
+              双人拼房价 · 单人独住 +单房差 · 实际按出发日实时机票浮动
+            </p>
             <div className="flex items-center justify-between text-sm">
               <span className="text-ink-soft">
                 想卖的价格 / 人
@@ -1388,9 +1535,9 @@ function NewBundleWizard({
               </div>
             </div>
             <p className="text-[11px] leading-relaxed text-ink-muted">
-              💡 机票按<strong>航班最便宜那天</strong>做起价（已含在"原价"里，你不用在套餐里填机票价）。你填
+              💡 机票按<strong>航班最便宜那天</strong>做起价（已含在"起价"里，你不用在套餐里填机票价）；酒店按<strong>关联房型整间夜价的一半</strong>（拼房）计入起价。你填
               <strong>想卖的价格</strong>、或直接改<strong>折扣%</strong>都行，两个会自动联动。实际下单：整个全包价按
-              <strong>出发日实时机票</strong>浮动 ×(1−{pct}%)，前台买家看到「原价划线 → 省 {pct}% → ¥X 起」。
+              <strong>出发日实时机票</strong>浮动 ×(1−{pct}%)，前台买家看到「起价 from ¥X/人 → 省 {pct}%」。
             </p>
             {pct > 0 && (
               <div className="text-right text-xs text-emerald-700">
@@ -1398,7 +1545,7 @@ function NewBundleWizard({
               </div>
             )}
             {!valid && (
-              <p className="text-xs text-rose-600">⚠️ 请填写套餐名 + 至少 1 个产品 + 套餐价 &gt; 0</p>
+              <p className="text-xs text-rose-600">⚠️ 请填写套餐名 + 至少 1 个产品 + 套餐价 &gt; 0 + 接送/签证组件都已选产品</p>
             )}
             {!nightsValid && (
               <p className="text-xs text-rose-600">⚠️ 含酒店项时，住宿晚数需为 1–30 的整数</p>
@@ -1417,12 +1564,26 @@ function NewBundleWizard({
                   name,
                   tagline: tagline || '新建套餐',
                   emoji,
-                  items: items.map((it) => ({
-                    ...it,
-                    qty: Math.max(1, it.qty ?? 1),
-                    // 机票行不在套餐里定价（按航班最便宜起价，实时浮动）→ 强制 0，清掉历史误填值
-                    unitPrice: it.kind === 'FLIGHT' ? 0 : (it.unitPrice ?? 0),
-                  })),
+                  items: items.map((it) => {
+                    // 组件价格只读、来自产品：服务端会按 transferId/visaId/关联房型权威重算 unitPrice，
+                    // 这里传的值仅作占位通过 schema 校验（真正生效的是 transferId/visaId + hotelRoomTypeId）。
+                    const unitPrice =
+                      it.kind === 'FLIGHT'
+                        ? 0
+                        : it.kind === 'HOTEL'
+                          ? hotelNightlyPriceCny
+                          : it.kind === 'TRANSFER'
+                            ? (it.transferId ? transferPriceById.get(it.transferId) : undefined) ?? 0
+                            : (it.visaId ? visaPriceById.get(it.visaId) : undefined) ?? 0;
+                    return {
+                      kind: it.kind,
+                      productName: it.productName,
+                      qty: Math.max(1, it.qty ?? 1),
+                      unitPrice,
+                      ...(it.kind === 'TRANSFER' ? { transferId: it.transferId ?? null } : {}),
+                      ...(it.kind === 'VISA' ? { visaId: it.visaId ?? null } : {}),
+                    };
+                  }),
                   listPrice,
                   bundlePrice,
                   discountPct: pct,

@@ -151,7 +151,15 @@ export const bundleItemSchema = z.object({
   kind: z.enum(['FLIGHT', 'HOTEL', 'TRANSFER', 'VISA']),
   productName: z.string().min(1).max(300),
   qty: z.number().int().min(1).max(99),
+  // unitPrice 仅作展示占位：HOTEL/TRANSFER/VISA 行落库前由服务端按下面的产品 id 权威取价覆盖
+  // （见 products.service resolveBundleItemPrices），FLIGHT 恒为 0（出发日实时定价）。
+  // 客户端传的值不会被信任写库，只用于校验通过；真正生效的价格来自关联产品。
   unitPrice: z.number().nonnegative(),
+  // TRANSFER/VISA 组件关联的产品 id（服务端据此取 Transfer.basePrice / Visa.basePrice 权威定价）。
+  // HOTEL 组件不在这里带 id ——沿用既有 bundle.hotelRoomTypeId 关联（单套餐一个房型，不按 item 逐条挂）。
+  // 省略/undefined：TRANSFER/VISA 行必须带 id 才能定价（服务层校验），FLIGHT/HOTEL 行忽略此字段。
+  transferId: z.string().min(1).optional(),
+  visaId: z.string().min(1).optional(),
 });
 export type BundleItemInput = z.infer<typeof bundleItemSchema>;
 

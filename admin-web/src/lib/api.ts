@@ -897,7 +897,12 @@ export interface BundleItemData {
   kind: 'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA';
   productName: string;
   qty: number;
+  /** 服务端权威定价（HOTEL 已关联房型 / TRANSFER / VISA 均为产品价，只读展示；FLIGHT 恒为 0） */
   unitPrice: number;
+  /** TRANSFER 组件关联的接送产品 id（服务端据此取 Transfer.basePrice 权威定价）；TRANSFER 行必填 */
+  transferId?: string | null;
+  /** VISA 组件关联的签证产品 id（服务端据此取 Visa.basePrice 权威定价）；VISA 行必填 */
+  visaId?: string | null;
 }
 
 /** 套餐不可售日期（按出发日）；reason ≤60 字，最多 120 条 */
@@ -956,9 +961,13 @@ export interface Bundle {
   flightPax: number;
   /** 套餐折扣（百分比 0–100）：整个全包价 ×(1 − discountPct/100)。套餐唯一折扣口径。 */
   discountPct: number;
-  /** 原价（含当前最低来回机票，CNY）；后台「想卖的价格」↔折扣% 换算 + 展示原价划线用。估算锚点。 */
+  /** 原价（含当前最低来回机票，CNY，整包/flightPax 均分口径）；admin-web 用它反推展示用机票价。估算锚点。 */
   originalAllInCny: number;
-  /** 每人原价（= originalAllInCny / flightPax，CNY） */
+  /**
+   * 起价 / 人（CNY）—— 唯一权威口径，1 人 · 半间房拼房：
+   * = 来回机票/人 + 0.5×酒店房型整间夜价×晚数 + 接送合计 + 签证/人。
+   * 后台「想卖的价格」↔折扣% 换算 + 套餐卡「¥X 起/人」展示均用此字段（与 originalAllInCny 是独立口径，互不派生）。
+   */
   originalPerPaxCny: number;
   /** [已弃用] 旧固定 CNY 让利，被 discountPct 取代 */
   groundDiscount: string;
@@ -967,8 +976,14 @@ export interface Bundle {
   hotelRoomTypeId: string | null;
   /** 关联房型晚数（1–30）；null = 不关联 */
   hotelNights: number | null;
-  /** 展示用：服务端联表返回的房型名 + 酒店名；null = 不关联 */
-  hotelRoomType: { id: string; name: string; hotelName: string } | null;
+  /** 展示用：服务端联表返回的房型名 + 酒店名 + 整间夜价；null = 不关联 */
+  hotelRoomType: {
+    id: string;
+    name: string;
+    hotelName: string;
+    /** 房型整间夜价（¥/晚，服务端权威取价源，非半价）；起价里的 0.5 折算只在 originalPerPaxCny 内部生效 */
+    nightlyPriceCny?: number;
+  } | null;
   /** 绑定的去程航班号（按航班号绑定，不绑某一天班次）；null = 不指定，按最便宜航班 */
   outboundFlight: BundleFlightRef | null;
   /** 绑定的回程航班号；null = 不指定，按最便宜航班 */

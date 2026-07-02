@@ -6,10 +6,25 @@
  */
 import { Prisma, ProductReviewType } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
-import { NotFoundError } from '../../lib/errors.js';
+import { NotFoundError, BadRequestError } from '../../lib/errors.js';
 import { ReviewsService, type ProductRatingAggregate } from '../reviews/reviews.service.js';
-import { firstHotelQty } from './bundle-nights.js';
-import { getCheapestRoundTripEconomyCny, computeBundleOriginalAllInCny } from './bundle-pricing.js';
+import { firstHotelQty, resolveBundleNights } from './bundle-nights.js';
+import {
+  getCheapestRoundTripEconomyCny,
+  computeBundleOriginalAllInCny,
+  computeBundleOriginalPerPaxCny,
+} from './bundle-pricing.js';
+import type {
+  BundleItemInput,
+  CreateBundleBody,
+  CreateHotelBody,
+  CreateTransferBody,
+  CreateVisaBody,
+  UpdateBundleBody,
+  UpdateHotelBody,
+  UpdateTransferBody,
+  UpdateVisaBody,
+} from './products.schemas.js';
 
 /** hotelNights 的 DB/zod 取值上限（schema: int 1..30）。 */
 const HOTEL_NIGHTS_MAX = 30;
@@ -27,16 +42,76 @@ export function deriveHotelNightsFromItems(items: unknown): number | undefined {
   if (qty == null) return undefined;
   return Math.min(HOTEL_NIGHTS_MAX, Math.max(1, qty));
 }
-import type {
-  CreateBundleBody,
-  CreateHotelBody,
-  CreateTransferBody,
-  CreateVisaBody,
-  UpdateBundleBody,
-  UpdateHotelBody,
-  UpdateTransferBody,
-  UpdateVisaBody,
-} from './products.schemas.js';
+
+/**
+ * 套餐组件价格权威定价（写入前的服务端 authoritative 定价，钱路径关键函数）：
+ *   FLIGHT   → unitPrice 恒为 0（客户选出发日后由 /flights/price 实时定价，不在此定价）。
+ *   HOTEL    → 套餐关联了房型（hotelRoomTypeId） → 用 HotelRoomType.basePrice 覆盖
+ *              （与 orders.service 对 HOTEL 行的权威取价口径一致，绝不信任 items JSON 里手填的值）；
+ *              未关联房型（老套餐/尚未选房型）→ 保留调用方传入的 unitPrice（无产品可溯源，找不到权威价）。
+ *   TRANSFER → 必须带 transferId，按其查 Transfer.basePrice 覆盖；查无此产品 → 404。
+ *   VISA     → 必须带 visaId，按其查 Visa.basePrice 覆盖；查无此产品 → 404。
+ *
+ * 客户端传的 unitPrice 在 HOTEL（已关联房型时）/TRANSFER/VISA 上永远被服务端权威值覆盖 ——
+ * 运营在后台唯一能动的定价杠杆是 discountPct + 目标价（换算折扣%）与升级加价项，价格本身不可手改。
+ * 返回新数组（不可变，不修改入参）。
+ */
+export async function resolveBundleItemPrices(
+  items: ReadonlyArray<BundleItemInput>,
+  hotelRoomTypeId: string | null | undefined,
+): Promise<BundleItemInput[]> {
+  // 先滤掉 undefined 再去重：TRANSFER/VISA 行缺 id 是校验错误（下面逐行 400），
+  // 不该先为它发一次 findMany({where:{id:{in:[undefined]}}})（Prisma 会报错，且语义上没有查询意义）。
+  const transferIds = [
+    ...new Set(
+      items
+        .filter((i) => i.kind === 'TRANSFER')
+        .map((i) => i.transferId)
+        .filter((id): id is string => id != null),
+    ),
+  ];
+  const visaIds = [
+    ...new Set(
+      items
+        .filter((i) => i.kind === 'VISA')
+        .map((i) => i.visaId)
+        .filter((id): id is string => id != null),
+    ),
+  ];
+
+  const [transfers, visas, hotelRoomType] = await Promise.all([
+    transferIds.length > 0
+      ? prisma.transfer.findMany({ where: { id: { in: transferIds } }, select: { id: true, basePrice: true } })
+      : Promise.resolve([]),
+    visaIds.length > 0
+      ? prisma.visa.findMany({ where: { id: { in: visaIds } }, select: { id: true, basePrice: true } })
+      : Promise.resolve([]),
+    hotelRoomTypeId
+      ? prisma.hotelRoomType.findUnique({ where: { id: hotelRoomTypeId }, select: { basePrice: true } })
+      : Promise.resolve(null),
+  ]);
+  const transferPriceById = new Map(transfers.map((t) => [t.id, Number(t.basePrice)]));
+  const visaPriceById = new Map(visas.map((v) => [v.id, Number(v.basePrice)]));
+
+  return items.map((item) => {
+    if (item.kind === 'FLIGHT') return { ...item, unitPrice: 0 };
+    if (item.kind === 'HOTEL') {
+      // 未关联房型：无产品可溯源，保留调用方原值（老套餐兼容）。
+      return hotelRoomType ? { ...item, unitPrice: Number(hotelRoomType.basePrice) } : item;
+    }
+    if (item.kind === 'TRANSFER') {
+      if (!item.transferId) throw new BadRequestError('套餐 TRANSFER 组件必须关联接送产品（transferId）');
+      const price = transferPriceById.get(item.transferId);
+      if (price === undefined) throw new NotFoundError(`接送产品 ${item.transferId} 不存在`);
+      return { ...item, unitPrice: price };
+    }
+    // VISA
+    if (!item.visaId) throw new BadRequestError('套餐 VISA 组件必须关联签证产品（visaId）');
+    const price = visaPriceById.get(item.visaId);
+    if (price === undefined) throw new NotFoundError(`签证产品 ${item.visaId} 不存在`);
+    return { ...item, unitPrice: price };
+  });
+}
 
 // ── 产品编号生成 ─────────────────────────────────────────────────────
 // 规则：前缀 + 4 位零填充序号（H0001 / V0001 / T0001 / B0001）。
@@ -64,13 +139,16 @@ const BUNDLE_FLIGHT_SELECT = {
 
 const BUNDLE_ROOM_INCLUDE = {
   hotelRoomType: {
-    // capacity/maxAdults/maxChildren 暴露给前台，使其能镜像 roomsNeeded 计算并展示
+    // capacity/maxAdults/maxChildren 暴露给前台，使其能镜像 roomsNeeded 计算并展示。
+    // basePrice：整间夜价（服务端权威取价源，也是「起价/人」拼房 0.5 的被乘数）——
+    //   admin 编辑器按此展示「酒店 ¥X/晚」（整间价，不预先打 0.5，0.5 只在 originalPerPaxCny 内部生效）。
     select: {
       id: true,
       name: true,
       capacity: true,
       maxAdults: true,
       maxChildren: true,
+      basePrice: true,
       hotel: { select: { name: true } },
     },
   },
@@ -449,6 +527,9 @@ export class ProductsService {
     await this.assertHotelRoomTypeExists(body.hotelRoomTypeId);
     await this.assertFlightExists(body.outboundFlightId);
     await this.assertFlightExists(body.returnFlightId);
+    // 组件价格权威定价（HOTEL/TRANSFER/VISA 覆盖为产品价，FLIGHT 归零）——
+    // 运营在表单里填的 unitPrice 只用来过校验，落库前在此被服务端权威值覆盖。
+    const pricedItems = await resolveBundleItemPrices(body.items, body.hotelRoomTypeId);
     const b = await createWithProductCode(
       'B',
       async () => {
@@ -466,7 +547,7 @@ export class ProductsService {
           tagline: body.tagline,
           emoji: body.emoji,
           photo: body.photo,
-          items: body.items as unknown as Prisma.InputJsonValue,
+          items: pricedItems as unknown as Prisma.InputJsonValue,
           flightPax: body.flightPax,
           discountPct: body.discountPct,
           groundDiscount: new Prisma.Decimal(body.groundDiscount),
@@ -503,7 +584,10 @@ export class ProductsService {
         include: BUNDLE_ROOM_INCLUDE,
       }),
     );
-    return serializeBundle(b);
+    // 与 getBundle/listBundles 同口径喂机票参考价，保证创建响应里的 originalPerPaxCny/originalAllInCny
+    // 与随后 GET 到的值一致（不留「刚创建时是 0，下次 GET 才对」的窗口）。
+    const flightRef = await getCheapestRoundTripEconomyCny(new Date());
+    return serializeBundle(b, ZERO_RATING, flightRef);
   }
 
   async updateBundle(id: string, body: UpdateBundleBody) {
@@ -517,7 +601,14 @@ export class ProductsService {
     if (body.tagline !== undefined) data.tagline = body.tagline;
     if (body.emoji !== undefined) data.emoji = body.emoji;
     if (body.photo !== undefined) data.photo = body.photo;
-    if (body.items !== undefined) data.items = body.items as unknown as Prisma.InputJsonValue;
+    if (body.items !== undefined) {
+      // 组件价格权威定价：本次生效的 hotelRoomTypeId = 请求里显式改的值（含解绑 null），
+      // 否则沿用落库的现值 —— 保证「只改 items 不改房型」时 HOTEL 行仍按当前关联房型权威取价。
+      const effectiveHotelRoomTypeId =
+        body.hotelRoomTypeId !== undefined ? body.hotelRoomTypeId : existing.hotelRoomTypeId;
+      const pricedItems = await resolveBundleItemPrices(body.items, effectiveHotelRoomTypeId);
+      data.items = pricedItems as unknown as Prisma.InputJsonValue;
+    }
     if (body.flightPax !== undefined) data.flightPax = body.flightPax;
     if (body.discountPct !== undefined) data.discountPct = body.discountPct;
     if (body.groundDiscount !== undefined) data.groundDiscount = new Prisma.Decimal(body.groundDiscount);
@@ -562,7 +653,9 @@ export class ProductsService {
       data,
       include: BUNDLE_ROOM_INCLUDE,
     });
-    return serializeBundle(b);
+    // 与 getBundle/listBundles/createBundle 同口径喂机票参考价（见 createBundle 同款注释）。
+    const flightRef = await getCheapestRoundTripEconomyCny(new Date());
+    return serializeBundle(b, ZERO_RATING, flightRef);
   }
 
   /** 校验套餐关联的酒店房型存在（null/undefined 跳过） */
@@ -649,22 +742,43 @@ function serializeVisa(
   };
 }
 
+/**
+ * Bundle 序列化 — admin 编辑器的定价 CONTRACT（本次改版新增/变更的字段见下方注释）：
+ *
+ *   originalPerPaxCny  — 起价 / 人（1 人 · 半间房拼房口径，唯一权威）；见 bundle-pricing 里的公式与出处。
+ *   originalAllInCny   — [未变] 整包原价锚点（地面 1 间房 + 机票×flightPax），admin-web 仍用它反推展示用机票价。
+ *   discountPct        — [未变] 套餐唯一折扣杠杆。
+ *   items[].unitPrice  — 服务端权威定价（HOTEL 已关联房型 / TRANSFER / VISA 均为产品价，只读展示）。
+ *   items[].transferId / items[].visaId — 组件关联的产品 id（写入时校验存在，读回供 admin 编辑器回显选中项）。
+ *   hotelRoomType.id            — 即 hotelRoomTypeId（已在 ...rest 里，此处 hotelRoomType 对象额外带全名/容量展示）。
+ *   hotelRoomType.nightlyPriceCny — 房型整间夜价（¥/晚，服务端权威取价源）—— 明确不预先打 0.5，
+ *                                    0.5 拼房折算只在 originalPerPaxCny 内部生效，这里展示的是整间价。
+ */
 function serializeBundle(
   b: BundleWithRoom,
   rating: ProductRatingAggregate = ZERO_RATING,
   flightRefRoundTripCny: number | null = null,
 ) {
   const { hotelRoomType, outboundFlight, returnFlight, ...rest } = b;
+  const bItems = Array.isArray(b.items) ? (b.items as Array<{ kind: string; qty: number; unitPrice: number }>) : [];
   // 原价（含当前最低来回机票）：后台「想卖的价格」录入据此反推 discountPct + 展示「原价划线/省X%」。
-  // 估算锚点，不参与买家实际计价（买家价 = 实时全包 ×(1 − discountPct/100)）。
-  const bItems = (b.items as Array<{ kind: string; qty: number; unitPrice: number }>) ?? [];
+  // 估算锚点，不参与买家实际计价（买家价 = 实时全包 ×(1 − discountPct/100)）。公式/口径未变。
   const originalAllInCny = computeBundleOriginalAllInCny(bItems, b.flightPax, flightRefRoundTripCny);
-  const originalPerPaxCny = Math.round(originalAllInCny / Math.max(1, b.flightPax));
+  // 起价 / 人：1 人 · 半间房拼房口径（唯一权威，见 bundle-pricing computeBundleOriginalPerPaxCny）。
+  // 与 originalAllInCny 是两条独立口径，不再用 originalAllInCny / flightPax 派生。
+  const nights = resolveBundleNights(b.items, b.hotelNights);
+  const originalPerPaxCny = computeBundleOriginalPerPaxCny({
+    items: bItems,
+    nights,
+    hotelRoomTypeNightlyCny: hotelRoomType ? Number(hotelRoomType.basePrice) : null,
+    flightRoundTripPerPaxCny: flightRefRoundTripCny,
+  });
   return {
     ...rest,
     // 套餐折扣（%）：整个全包价 ×(1 − discountPct/100)，前台据此展示原价划线/省X%
     discountPct: b.discountPct,
-    // 原价（含当前最低来回机票）+ 每人原价；后台目标价↔折扣% 换算用
+    // 原价（含当前最低来回机票，整包/flightPax 均分口径，未变）+ 起价/人（1人半间房，本次改版新公式）；
+    // 后台目标价↔折扣% 换算、以及套餐卡「¥X 起/人」展示均用 originalPerPaxCny。
     originalAllInCny,
     originalPerPaxCny,
     groundDiscount: b.groundDiscount.toString(),
@@ -680,11 +794,14 @@ function serializeBundle(
     // 运营封盘日（按出发日 D；admin 读回）+ 前台默认出发日（仅影响初始选中）
     blackoutDates: b.blackoutDates,
     defaultDepartDate: b.defaultDepartDate,
+    // 组件明细：unitPrice 已是服务端权威产品价（只读展示，非运营手填）；
+    // TRANSFER/VISA 行带 transferId/visaId（关联产品 id，供 admin 编辑器回显选中项 + 换产品时重新取价）。
     items: b.items,
     rating,
     reviewCount: rating.count,
     soldCount: b.soldCount,
-    // admin-web 表单需要房型名 + 酒店名做展示；前台用 capacity/maxAdults/maxChildren 镜像 roomsNeeded
+    // admin-web 表单需要房型名 + 酒店名做展示；前台用 capacity/maxAdults/maxChildren 镜像 roomsNeeded。
+    // nightlyPriceCny：整间夜价只读展示（¥/晚，非半价）——hotelRoomTypeId 本身已在 ...rest 里。
     hotelRoomType: hotelRoomType
       ? {
           id: hotelRoomType.id,
@@ -693,6 +810,7 @@ function serializeBundle(
           capacity: hotelRoomType.capacity,
           maxAdults: hotelRoomType.maxAdults,
           maxChildren: hotelRoomType.maxChildren,
+          nightlyPriceCny: Number(hotelRoomType.basePrice),
         }
       : null,
     // 套餐绑定的去/回程航班号（各含 id + 航班号 + 起降地）；未绑 = null。

@@ -627,81 +627,97 @@ async function seedVisas() {
   }
 }
 
+/**
+ * 套餐种子数据 —— 起价 = 1 人 · 半间房（拼房 twin-share）定价模型下的唯一示例。
+ *
+ * 历史上这里有 3 个示例套餐，口径互相矛盾（flightPax=2 却按整间房定价、VISA qty 不统一），
+ * 且「商务快闪」引用了一个根本不存在于种子数据里的酒店（馨乐庭蓝湾公寓）——items 里只是一条
+ * 悬空的展示字符串，从未真正关联过任何产品。新模型下 HOTEL/TRANSFER/VISA 的 unitPrice 必须
+ * server-authoritative 地来自关联产品（见 products.service resolveBundleItemPrices），
+ * seed.ts 直接写库、不经过那层服务端定价，所以这里手动把 unitPrice 设成与关联产品一致的真实值，
+ * 保证种子数据本身就是「新模型下的合法样本」。
+ *
+ * 只留 1 个示例（凯悦海景，明确关联真实房型/接送/签证产品），其余交给运营在后台自建——
+ * 避免继续维护一批容易和真实产品定义脱节的手填示例。
+ *
+ * 注意：本函数只改变「这次 seed 会创建/更新成什么」，不处理数据库里已存在的旧 3 个示例套餐
+ * （若某个环境之前跑过旧版 seed，那 2 个多出来的行如何处理由调用方另行决定，不在本函数职责内）。
+ */
 async function seedBundles() {
-  const BUNDLES = [
-    {
-      name: '经典度假 3 晚 · 凯悦海景',
-      tagline: '来回机票 + 凯悦海景 3 晚 + 来回接送',
-      emoji: '🏖️',
-      photo: 'https://images.unsplash.com/photo-1540541338287-41700207dee6?w=600&h=400&fit=crop',
-      flightPax: 2,
-      discountPct: 10, // 整个全包价打 9 折
-      groundDiscount: 0, // 弃用（改用 discountPct）
-      suitableFor: '2 人 · 情侣/家庭',
-      // 可选升级加价（按产品可配置；运营在后台可改）：单人入住房差/晚、升舱商务/航段、来回 2 段
-      singleSupplementCnyPerNight: 80, // 平价 4-5 星，赵姐默认
-      businessUpgradeCnyPerLeg: 700,
-      legs: 2,
-      items: [
-        { kind: 'FLIGHT', productName: 'QH 澳门↔岘港 来回经济舱 × 2 人', qty: 1, unitPrice: 0 },
-        { kind: 'HOTEL', productName: '岘港凯悦度假村 美溪海景房 3 晚', qty: 3, unitPrice: 1880 },
-        { kind: 'TRANSFER', productName: '岘港机场接送（来回 7 座商务车）', qty: 2, unitPrice: 188 },
-      ],
-    },
-    {
-      name: '蜜月豪华 4 晚 · 洲际半岛',
-      tagline: '来回机票 + 洲际半岛 + 巴拿山佛手桥 + 签证全包',
-      emoji: '💍',
-      photo: 'https://images.unsplash.com/photo-1564501049412-61c2a3083791?w=600&h=400&fit=crop',
-      flightPax: 2,
-      discountPct: 12, // 整个全包价打 88 折
-      groundDiscount: 0, // 弃用（改用 discountPct）
-      suitableFor: '2 人 · 蜜月/纪念日',
-      // 顶级 5 星（洲际半岛）单人入住房差远高于平价默认——一间客房卖一个人，¥80/晚会亏本，故上调
-      singleSupplementCnyPerNight: 480,
-      businessUpgradeCnyPerLeg: 700,
-      legs: 2,
-      items: [
-        { kind: 'FLIGHT', productName: 'QH 澳门↔岘港 来回经济舱 × 2 人', qty: 1, unitPrice: 0 },
-        { kind: 'HOTEL', productName: '岘港洲际半岛度假村 山景房 4 晚', qty: 4, unitPrice: 3680 },
-        { kind: 'TRANSFER', productName: '岘港机场接送（豪华轿车 来回）', qty: 2, unitPrice: 388 },
-        { kind: 'TRANSFER', productName: '巴拿山 1 日包车', qty: 1, unitPrice: 588 },
-        { kind: 'VISA', productName: '越南 E-visa 30 天 × 2', qty: 2, unitPrice: 280 },
-      ],
-    },
-    {
-      name: '商务快闪 1 晚 · 商务舱',
-      tagline: '商务舱来回 + 市区公寓 + 签证 + 豪华接送',
-      emoji: '💼',
-      photo: 'https://images.unsplash.com/photo-1542314831-068cd1dbfeeb?w=600&h=400&fit=crop',
-      flightPax: 1,
-      discountPct: 8, // 整个全包价打 92 折
-      groundDiscount: 0, // 弃用（改用 discountPct）
-      suitableFor: '1 人 · 商务',
-      // 单人产品 + 市区公寓：单人入住房差适中；本套餐机票已是商务舱，升舱项给默认即可
-      singleSupplementCnyPerNight: 150,
-      businessUpgradeCnyPerLeg: 700,
-      legs: 2,
-      items: [
-        { kind: 'FLIGHT', productName: 'QH 澳门↔岘港 来回商务舱 × 1 人', qty: 1, unitPrice: 0 },
-        { kind: 'HOTEL', productName: '馨乐庭蓝湾公寓 市区 1 晚', qty: 1, unitPrice: 580 },
-        { kind: 'TRANSFER', productName: '岘港机场接送（豪华轿车 来回）', qty: 2, unitPrice: 388 },
-        { kind: 'VISA', productName: '越南落地签批文', qty: 1, unitPrice: 180 },
-      ],
-    },
-  ];
+  // 关联真实产品（都在上面 seedHotels/seedTransfers/seedVisas 建过，这里按业务键查出 id + 权威单价）。
+  const hyattRoomType = await prisma.hotelRoomType.findFirst({
+    where: { hotel: { name: '岘港凯悦度假村' }, name: '海景大床房' },
+    select: { id: true, basePrice: true },
+  });
+  const airportTransfer = await prisma.transfer.findFirst({
+    where: { name: '岘港机场接送 · 7 座商务车' },
+    select: { id: true, basePrice: true },
+  });
+  const evisa30d = await prisma.visa.findFirst({
+    where: { destinationCountry: 'VN', visaType: 'e_visa' },
+    select: { id: true, basePrice: true },
+  });
+  if (!hyattRoomType || !airportTransfer || !evisa30d) {
+    // seedHotels/seedTransfers/seedVisas 在本函数之前跑（见 main 里的调用顺序），
+    // 正常情况下这里必能查到；查不到多半是种子数据改了名字没同步，宁可提前报错也不要悄悄建出
+    // 一个未关联产品、口径又跑偏的套餐。
+    throw new Error('seedBundles: 关联产品（房型/接送/签证）缺失，请检查 seedHotels/seedTransfers/seedVisas');
+  }
 
-  for (const b of BUNDLES) {
-    const soldCount = randInt(60, 520);
-    const existing = await prisma.bundle.findFirst({ where: { name: b.name } });
-    if (existing) {
-      await prisma.bundle.update({
-        where: { id: existing.id },
-        data: { ...b, items: b.items, soldCount, isActive: true },
-      });
-    } else {
-      await prisma.bundle.create({ data: { ...b, items: b.items, soldCount, isActive: true } });
-    }
+  const nights = 3;
+  const b = {
+    name: '经典度假 3 晚 · 凯悦海景',
+    tagline: '来回机票 + 凯悦海景 3 晚 + 来回接送 + 越南签证',
+    emoji: '🏖️',
+    photo: 'https://images.unsplash.com/photo-1540541338287-41700207dee6?w=600&h=400&fit=crop',
+    // flightPax 仅供 originalAllInCny（整包原价锚点）反推展示用机票价，不参与起价计算——
+    // 起价 = 1 人半间房，恒定按 1 人计（见 bundle-pricing computeBundleOriginalPerPaxCny）。
+    flightPax: 2,
+    discountPct: 10, // 整个全包价打 9 折
+    groundDiscount: 0, // 弃用（改用 discountPct）
+    suitableFor: '2 人 · 情侣/家庭（1 人报名按半间拼房价起）',
+    hotelRoomTypeId: hyattRoomType.id,
+    hotelNights: nights,
+    // 可选升级加价（按产品可配置；运营在后台可改）：单人入住房差/晚、升舱商务/航段、来回 2 段
+    singleSupplementCnyPerNight: 80,
+    businessUpgradeCnyPerLeg: 700,
+    legs: 2,
+    items: [
+      { kind: 'FLIGHT', productName: 'QH 澳门↔岘港 来回经济舱', qty: 1, unitPrice: 0 },
+      // HOTEL/TRANSFER/VISA 的 unitPrice = 关联产品的权威单价（与下面 hotelRoomTypeId/transferId/visaId
+      // 保持一致，模拟 resolveBundleItemPrices 落库后的结果，而不是随便手填）。
+      {
+        kind: 'HOTEL',
+        productName: '岘港凯悦度假村 美溪海景房',
+        qty: nights,
+        unitPrice: Number(hyattRoomType.basePrice),
+      },
+      {
+        kind: 'TRANSFER',
+        productName: '岘港机场接送（来回 7 座商务车）',
+        qty: 2,
+        unitPrice: Number(airportTransfer.basePrice),
+        transferId: airportTransfer.id,
+      },
+      {
+        kind: 'VISA',
+        productName: '越南 E-visa 30 天 × 2 人',
+        qty: 2,
+        unitPrice: Number(evisa30d.basePrice),
+        visaId: evisa30d.id,
+      },
+    ],
+  };
+
+  const soldCount = randInt(60, 520);
+  const existing = await prisma.bundle.findFirst({ where: { name: b.name } });
+  if (existing) {
+    await prisma.bundle.update({
+      where: { id: existing.id },
+      data: { ...b, items: b.items, soldCount, isActive: true },
+    });
+  } else {
+    await prisma.bundle.create({ data: { ...b, items: b.items, soldCount, isActive: true } });
   }
 }
 
