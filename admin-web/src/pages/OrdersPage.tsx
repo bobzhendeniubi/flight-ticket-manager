@@ -922,7 +922,7 @@ export function OrdersPage() {
                 <th className="text-center">签证</th>
                 <th className="text-center">开票</th>
                 <th className="text-left">下单时间</th>
-                <th className="text-center">操作</th>
+                <th className="whitespace-nowrap text-center">操作</th>
               </tr>
             </thead>
             <tbody>
@@ -996,7 +996,7 @@ export function OrdersPage() {
                       month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
                     })}
                   </td>
-                  <td>
+                  <td className="whitespace-nowrap">
                     <div className="flex items-center justify-end gap-2">
                       <select
                         className="rounded-md border border-slate-200 bg-white px-2 py-1 text-xs text-ink-soft disabled:opacity-50"
@@ -1019,12 +1019,12 @@ export function OrdersPage() {
                             <option key={s} value={s}>{STATUS_LABEL[s]}</option>
                           ))}
                       </select>
-                      <button className="text-sm font-medium text-brand hover:text-brand-dark" onClick={() => setSelected(order)}>
+                      <button className="whitespace-nowrap text-sm font-medium text-brand hover:text-brand-dark" onClick={() => setSelected(order)}>
                         详情
                       </button>
                       {isAdmin && (
                         <button
-                          className="text-xs text-rose-500 hover:text-rose-700"
+                          className="whitespace-nowrap text-xs text-rose-500 hover:text-rose-700"
                           title="删除订单（ADMIN）"
                           onClick={() => void deleteOrder(order)}
                         >
@@ -1363,22 +1363,43 @@ function OrderDrawer({
           {/* 产品内容 */}
           <section>
             <h3 className="text-xs font-semibold uppercase tracking-wide text-ink-muted">产品内容</h3>
-            {(o.items ?? []).some((it) => it.kind === 'BUNDLE') && (
-              <div className="mt-2">
-                <BundleItineraryCard items={o.items ?? []} order={o} />
-              </div>
+            {isBundleOrder(o) ? (
+              <>
+                <div className="mt-2">
+                  <BundleItineraryCard items={o.items ?? []} order={o} />
+                </div>
+                {/* 套餐订单：原始行金额明细折叠隐藏（公测反馈原始金额行「不太实用」），
+                    默认收起，点开仍可见 + 改期/改结算价 操作照旧可用。非套餐订单不受影响（见下方 else 分支）。 */}
+                <details className="mt-2 rounded-lg border border-slate-200 bg-white">
+                  <summary className="cursor-pointer select-none px-3 py-2 text-xs font-medium text-ink-muted hover:text-ink">
+                    金额明细（点开）
+                  </summary>
+                  <ul className="space-y-2 border-t border-slate-100 p-3 text-sm">
+                    {(o.items ?? []).map((it) => (
+                      <OrderItemRow
+                        key={it.id}
+                        orderId={o.id}
+                        item={it}
+                        onOrderUpdated={handleOrderUpdated}
+                        isAdmin={isAdmin}
+                      />
+                    ))}
+                  </ul>
+                </details>
+              </>
+            ) : (
+              <ul className="mt-2 space-y-2 text-sm">
+                {(o.items ?? []).map((it) => (
+                  <OrderItemRow
+                    key={it.id}
+                    orderId={o.id}
+                    item={it}
+                    onOrderUpdated={handleOrderUpdated}
+                    isAdmin={isAdmin}
+                  />
+                ))}
+              </ul>
             )}
-            <ul className="mt-2 space-y-2 text-sm">
-              {(o.items ?? []).map((it) => (
-                <OrderItemRow
-                  key={it.id}
-                  orderId={o.id}
-                  item={it}
-                  onOrderUpdated={handleOrderUpdated}
-                  isAdmin={isAdmin}
-                />
-              ))}
-            </ul>
             <p className="mt-2 text-xs text-ink-muted">共 {o.passengers.length} 位乘客</p>
           </section>
 
@@ -1815,60 +1836,96 @@ function addDaysToDateOnly(dateOnly: string, days: number): string {
   return d.toISOString().slice(0, 10);
 }
 
+/** 本单是否套餐订单（含至少一条 BUNDLE 行）——产品内容卡片 v2 / 金额明细折叠 共用判定。 */
+function isBundleOrder(order: OrderSummary): boolean {
+  return (order.items ?? []).some((it) => it.kind === 'BUNDLE');
+}
+
 function BundleItineraryCard({ items, order }: { items: OrderItem[]; order: OrderSummary }) {
   const bundleLine = items.find((it) => it.kind === 'BUNDLE');
   if (!bundleLine) return null;
 
-  // 同一套餐组：BUNDLE 行本身 + 携带同一 bundleId 的 FLIGHT/VISA/TRANSFER 行（关联行，服务端打的标）。
-  const bundleId = bundleLine.bundleId ?? null;
-  const group = bundleId ? items.filter((it) => it.bundleId === bundleId) : [bundleLine];
-  const flightLegs = group.filter((it) => it.kind === 'FLIGHT' && it.flightNumber);
-  const visaLine = group.find((it) => it.kind === 'VISA') ?? (bundleLine.visaName ? bundleLine : null);
-  const transferLine = group.find((it) => it.kind === 'TRANSFER') ?? (bundleLine.transferProductName ? bundleLine : null);
+  // 航班信息来源 = 本单「所有」FLIGHT 行，按出发时间排序 —— 不再按 bundleId 匹配过滤。
+  // 根因（公测截图：套餐订单卡片只有产品名/人数/酒店，航班/机票/签证/服务内容全部缺失）：
+  // 老订单的 BUNDLE 行与 FLIGHT 行的 bundleId 经常有一边是 null（历史数据，早于 bundleId 打标
+  // 上线），v1 版本按 `flightLine.bundleId === bundleLine.bundleId` 过滤，两边 null 时 `null === null`
+  // 恒真没问题，但 bundleLine.bundleId 为 null 时 v1 直接把 group 收窄成 `[bundleLine]`（见旧代码
+  // `bundleId ? items.filter(...) : [bundleLine]`），FLIGHT 行被整段排除在外。
+  // 套餐订单目前不支持"一单多套餐"，本单的 FLIGHT 行本来就都属于同一趟行程，直接取全部更稳健。
+  const flightLegs = [...items]
+    .filter((it) => it.kind === 'FLIGHT' && it.flightNumber)
+    .sort((a, b) => {
+      const da = a.departureDate && a.departureTime ? `${a.departureDate}T${a.departureTime}` : '';
+      const db = b.departureDate && b.departureTime ? `${b.departureDate}T${b.departureTime}` : '';
+      return da.localeCompare(db);
+    });
 
-  // 产品名称：套餐名 + 自动组合的组件摘要（如「往返机票+酒店+签证+接送机」，按实际存在的组件动态拼）。
-  const componentParts: string[] = [];
-  if (flightLegs.length > 0) componentParts.push('往返机票');
-  if (bundleLine.roomTypeName || bundleLine.hotelName) componentParts.push('酒店');
-  if (visaLine) componentParts.push('签证');
-  if (transferLine) componentParts.push('接送机');
-  const componentSummary = componentParts.length > 0 ? componentParts.join('+') : null;
-
-  const adultCount = order.adultCount ?? 0;
-  const childCount = order.childCount ?? 0;
-  const infantCount = order.infantCount ?? 0;
-
-  const nights = bundleLine.hotelCheckIn && bundleLine.hotelCheckOut
-    ? Math.round((new Date(bundleLine.hotelCheckOut).getTime() - new Date(bundleLine.hotelCheckIn).getTime()) / 86_400_000)
-    : null;
-  const rooms = bundleLine.roomsBilled ?? null;
-
-  // 签证生效/失效预计日期：去程出发日 + stayDays（都存在时才推算；标注「预计/以实际出签为准」）。
-  const outboundDate = flightLegs[0]?.departureDate ?? null;
-  const visaStayDays = visaLine?.visaStayDays ?? null;
-  const visaEffectiveDate = outboundDate && visaStayDays ? outboundDate : null;
-  const visaExpiryDate = outboundDate && visaStayDays ? addDaysToDateOnly(outboundDate, visaStayDays) : null;
-
+  // 签证/接送/服务内容一律来自套餐定义（bundle.items / bundleTransfers / bundleVisa / serviceNotes），
+  // 不是订单行 —— 套餐订单通常只有机票腿 + 一条 BUNDLE 地面行，不会有独立的 VISA/TRANSFER 行。
+  const bundleKinds = bundleLine.bundleKinds ?? [];
+  const transfers = bundleLine.bundleTransfers ?? [];
+  const visa = bundleLine.bundleVisa ?? null;
   const serviceNoteLines = (bundleLine.serviceNotes ?? '')
     .split('\n')
     .map((s) => s.trim())
     .filter(Boolean);
 
+  // 产品名称：{起点城市}-{终点城市}往返机票+酒店(+签证)(+接送机服务)，按套餐定义实际含有的组件动态拼。
+  const originCode = flightLegs[0]?.route?.split('→')[0];
+  const destCode = flightLegs[0]?.route?.split('→')[1];
+  const routeLabel = originCode && destCode ? `${cityNameFor(originCode)}-${cityNameFor(destCode)}` : null;
+  const componentParts: string[] = [];
+  if (bundleKinds.includes('FLIGHT') || flightLegs.length > 0) componentParts.push('往返机票');
+  if (bundleKinds.includes('HOTEL') || bundleLine.roomTypeName || bundleLine.hotelName) componentParts.push('酒店');
+  if (bundleKinds.includes('VISA') || visa) componentParts.push('签证');
+  if (bundleKinds.includes('TRANSFER') || transfers.length > 0) componentParts.push('接送机服务');
+  const productName = routeLabel
+    ? `${routeLabel}${componentParts.join('+')}`
+    : bundleLine.bundleName ?? bundleLine.description;
+
+  const adultCount = order.adultCount ?? 0;
+  const childCount = order.childCount ?? 0;
+  const infantCount = order.infantCount ?? 0;
+  const totalCount = adultCount + childCount + infantCount;
+  const adultPrice = order.adultUnitPriceCny ?? null;
+  const childPrice = order.childUnitPriceCny ?? null;
+  const infantPrice = order.infantUnitPriceCny ?? null;
+
+  const nights = bundleLine.hotelCheckIn && bundleLine.hotelCheckOut
+    ? Math.round((new Date(bundleLine.hotelCheckOut).getTime() - new Date(bundleLine.hotelCheckIn).getTime()) / 86_400_000)
+    : null;
+  const rooms = bundleLine.roomsBilled ?? null;
+  const hotelName = bundleLine.hotelName ?? null;
+  const roomTypeName = bundleLine.roomTypeName ?? null;
+
+  // 签证生效/失效预计日期：去程出发日 + stayDays（都存在时才推算；标注「预计/以实际出签为准」）。
+  const outboundDate = flightLegs[0]?.departureDate ?? null;
+  const visaStayDays = visa?.stayDays ?? null;
+  const visaEffectiveDate = outboundDate && visaStayDays ? outboundDate : null;
+  const visaExpiryDate = outboundDate && visaStayDays ? addDaysToDateOnly(outboundDate, visaStayDays) : null;
+
   return (
     <div className="rounded-xl border border-brand-200 bg-brand-50/40 p-3 text-sm">
-      <div className="flex items-start justify-between gap-2">
-        <div>
-          <div className="font-semibold text-ink">
-            {bundleLine.bundleName ?? bundleLine.description}
-            {componentSummary && <span className="ml-1 font-normal text-ink-muted">· {componentSummary}</span>}
-          </div>
-          <div className="mt-0.5 text-xs text-ink-muted">
-            人数：成人 {adultCount} · 儿童 {childCount} · 婴儿 {infantCount}
-          </div>
-        </div>
+      <div>
+        <div className="text-xs font-medium text-ink-muted">产品名称</div>
+        <div className="mt-0.5 font-semibold text-ink">{productName}</div>
       </div>
 
-      <dl className="mt-2 space-y-1.5 text-xs text-ink-soft">
+      <dl className="mt-2.5 space-y-1.5 text-xs text-ink-soft">
+        {/* 人数：总数 ／ 按年龄段分列人数+单价（价格来自 order.total 反推，非套餐订单/查不到定价配置时为 null） */}
+        <div>
+          <dt className="font-medium text-ink-muted">人数</dt>
+          <dd className="mt-0.5">
+            {totalCount}
+            {' ／ '}成人：{adultCount}{adultPrice != null && `，价格${adultPrice.toLocaleString()}`}
+            {' ／ '}2-12岁儿童：{childCount}{childPrice != null && `，价格${childPrice.toLocaleString()}`}
+            {' ／ '}2岁以下婴儿：{infantCount}{infantPrice != null && `，价格${infantPrice.toLocaleString()}`}
+            {(adultPrice != null || childPrice != null || infantPrice != null) && (
+              <div className="mt-0.5 text-[11px] text-ink-muted">价格口径：按本单实付均摊</div>
+            )}
+          </dd>
+        </div>
+
         {flightLegs.length > 0 && (
           <div>
             <dt className="font-medium text-ink-muted">航班信息</dt>
@@ -1892,36 +1949,28 @@ function BundleItineraryCard({ items, order }: { items: OrderItem[]; order: Orde
             </dd>
           </div>
         )}
-        {(bundleLine.hotelName || bundleLine.roomTypeName) && (
+        {(hotelName || roomTypeName) && (
           <div>
             <dt className="font-medium text-ink-muted">酒店</dt>
             <dd className="mt-0.5">
-              {bundleLine.hotelName ?? ''}
-              {bundleLine.roomTypeName && ` ${bundleLine.roomTypeName}`}
+              {hotelName ?? ''}
+              {roomTypeName && ` ${roomTypeName}`}
               {rooms != null && ` × ${rooms}间`}
               {nights != null && nights > 0 && ` × ${nights}晚`}
             </dd>
           </div>
         )}
-        {visaLine && (visaLine.visaName || bundleLine.description) && (
+        {visa && (
           <div>
             <dt className="font-medium text-ink-muted">签证</dt>
             <dd className="mt-0.5">
-              {visaLine.visaName ?? '签证'}
-              {visaStayDays != null && `；最多可停留 ${visaStayDays} 天`}
+              {visa.name}
+              {visaStayDays != null && `；最多可停留：${visaStayDays}天`}
               {visaEffectiveDate && visaExpiryDate && (
                 <span className="ml-1 text-ink-muted">
                   （签证生效日期(预计)={visaEffectiveDate}、失效日期(预计)={visaExpiryDate}，以实际出签为准）
                 </span>
               )}
-            </dd>
-          </div>
-        )}
-        {transferLine && transferLine.transferProductName && (
-          <div>
-            <dt className="font-medium text-ink-muted">接送</dt>
-            <dd className="mt-0.5">
-              {transferLine.transferProductName} × {transferLine.quantity}
             </dd>
           </div>
         )}
@@ -1934,6 +1983,16 @@ function BundleItineraryCard({ items, order }: { items: OrderItem[]; order: Orde
                   <li key={i}>{line}</li>
                 ))}
               </ul>
+            </dd>
+          </div>
+        )}
+        {transfers.length > 0 && (
+          <div>
+            <dt className="font-medium text-ink-muted">接送</dt>
+            <dd className="mt-0.5 space-y-0.5">
+              {transfers.map((t, i) => (
+                <div key={i}>{t.name} × {t.qty}趟</div>
+              ))}
             </dd>
           </div>
         )}

@@ -1072,7 +1072,11 @@ export class OrderService {
     ]);
 
     return {
-      orders: rows.map(serializeOrder),
+      // 显式包一层箭头函数——serializeOrder 现在带一个可选的第二参数（ctx），直接把它当
+      // Array.map 回调传会让 map 的 index 顶进 ctx 位置（number 不是合法 ctx，TS 会报错，
+      // 运行时也会把 index 当 ctx.visaStayDaysById 用，产生诡异行为）。listOrders 未联查
+      // bundle.items，本来就没有 visaStayDaysById 可传，这里显式只传 order，用默认空表。
+      orders: rows.map((order) => serializeOrder(order)),
       pagination: { page: query.page, pageSize: query.pageSize, total },
     };
   }
@@ -1091,7 +1095,9 @@ export class OrderService {
         //   visa → 签证名/国家/单次最多停留天数（VISA 行 或 套餐通过 items JSON 描述，行本身仅在
         //     客户端提交独立 VISA 行时才带 visaId；套餐纯地面签证组件走 bundle.items 文本描述，见 serializeOrder）。
         //   transfer → 接送产品名。
-        //   bundle → 套餐名 + 服务内容（BUNDLE 行）。
+        //   bundle → 套餐名 + 服务内容 + 组件明细（items）+ 按人定价配置 + 关联房型（BUNDLE 行「产品内容」卡片 v2 用）。
+        //     不按 isActive 过滤 —— 套餐下架/软删后历史订单仍需正确渲染（Bundle? 关系本身是普通 FK join，
+        //     不会因为关联行的其它字段值而不联查；isActive 只在下单校验时拦截新购，不影响历史订单读取）。
         items: {
           include: {
             hotelRoomType: { select: { name: true, hotel: { select: { name: true } } } },
@@ -1104,7 +1110,17 @@ export class OrderService {
             },
             visa: { select: { visaName: true, country: true, destinationCountry: true, stayDays: true } },
             transfer: { select: { name: true } },
-            bundle: { select: { name: true, serviceNotes: true } },
+            bundle: {
+              select: {
+                name: true,
+                serviceNotes: true,
+                items: true,
+                infantPriceCny: true,
+                childSeatDiscountCnyPerPerson: true,
+                hotelRoomTypeId: true,
+                hotelRoomType: { select: { name: true, hotel: { select: { name: true } } } },
+              },
+            },
           },
         },
         passengers: true, // 含护照/签证/地址全部新字段
@@ -1122,7 +1138,44 @@ export class OrderService {
     });
     if (!order) throw new NotFoundError('订单不存在');
     await this.assertCanView(order, requester);
-    return serializeOrder(order);
+    // 套餐 VISA 组件的「最多可停留天数」不在 bundle.items JSON 里（那只存 visaId），需按 visaId 批量查
+    // Visa.stayDays（best-effort：查询失败/无签证组件时给空表，itineraryFieldsForItem 照常降级为 null）。
+    const visaStayDaysById = await this.loadBundleVisaStayDays(order.items);
+    return serializeOrder(order, { visaStayDaysById });
+  }
+
+  /**
+   * 批量解析本单所有 BUNDLE 行关联套餐的 VISA 组件 stayDays（订单详情「产品内容」卡片「签证」板块用）。
+   * bundle.items JSON 里的 VISA 组件只带 visaId（见 bundleItemSchema），stayDays 要另查 Visa 表。
+   * 一次 findMany 覆盖本单所有套餐的所有 VISA 组件，避免逐行 N+1。查询失败不阻断订单详情渲染。
+   */
+  private async loadBundleVisaStayDays(
+    items: ReadonlyArray<{ bundle?: { items: Prisma.JsonValue } | null }>,
+  ): Promise<Map<string, number | null>> {
+    const visaIds = new Set<string>();
+    for (const i of items) {
+      const bundleItems = i.bundle?.items;
+      if (!Array.isArray(bundleItems)) continue;
+      for (const b of bundleItems) {
+        if (b == null || typeof b !== 'object') continue;
+        const rec = b as { kind?: unknown; visaId?: unknown };
+        if (rec.kind === 'VISA' && typeof rec.visaId === 'string' && rec.visaId) {
+          visaIds.add(rec.visaId);
+        }
+      }
+    }
+    if (visaIds.size === 0) return new Map();
+    try {
+      const visas = await prisma.visa.findMany({
+        where: { id: { in: [...visaIds] } },
+        select: { id: true, stayDays: true },
+      });
+      return new Map(visas.map((v) => [v.id, v.stayDays]));
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error('[orders] failed to load bundle visa stayDays for', [...visaIds], err);
+      return new Map();
+    }
   }
 
   // ════════════════════════════════════════════════════════════════════
@@ -3476,14 +3529,83 @@ function decimalOrNull(d: Prisma.Decimal | null | undefined): number | null {
   return d == null ? null : Number(d);
 }
 
+/** 套餐组件明细里的一条（Bundle.items JSON 元素；与 bundleItemSchema 对齐）。 */
+interface BundleItemEntry {
+  kind?: unknown;
+  productName?: unknown;
+  qty?: unknown;
+  transferId?: unknown;
+  visaId?: unknown;
+}
+
+/**
+ * BUNDLE 行「产品内容」卡片 v2 用的套餐组件派生字段（纯函数，供单测复用）：
+ *   bundleKinds  — 该套餐 items 里实际存在哪些组件类型（FLIGHT/HOTEL/TRANSFER/VISA），
+ *                  用于拼「往返机票+酒店+签证+接送机服务」这类产品名称。
+ *   transfers    — TRANSFER 组件列表 [{name, qty(趟)}]（一个套餐可能配多条接送）。
+ *   visa         — 第一个 VISA 组件 {name, stayDays}；name 用 productName（运营在套餐向导里填的
+ *                  展示名，如「越南 E-visa 30 天 × 2 人」），productName 缺失时兜底为字面量「签证」；
+ *                  stayDays 从 visaStayDaysById（按 visaId 查好的 Visa.stayDays）取，查不到落 null。
+ * 容错：items 非数组/元素非对象/字段类型不对 → 跳过该条，不抛错（老数据/畸形 JSON 不阻断渲染）。
+ */
+export interface BundleItemsSummary {
+  bundleKinds: Array<'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA'>;
+  transfers: Array<{ name: string; qty: number }>;
+  visa: { name: string; visaId: string; stayDays: number | null } | null;
+}
+export function summarizeBundleItems(
+  bundleItems: unknown,
+  visaStayDaysById: ReadonlyMap<string, number | null> = new Map(),
+): BundleItemsSummary {
+  const empty: BundleItemsSummary = { bundleKinds: [], transfers: [], visa: null };
+  if (!Array.isArray(bundleItems)) return empty;
+
+  const kindSet = new Set<string>();
+  const transfers: Array<{ name: string; qty: number }> = [];
+  let visa: BundleItemsSummary['visa'] = null;
+
+  for (const raw of bundleItems as BundleItemEntry[]) {
+    if (raw == null || typeof raw !== 'object') continue;
+    const kind = raw.kind;
+    if (kind !== 'FLIGHT' && kind !== 'HOTEL' && kind !== 'TRANSFER' && kind !== 'VISA') continue;
+    kindSet.add(kind);
+    const name = typeof raw.productName === 'string' && raw.productName.trim() ? raw.productName.trim() : null;
+    if (kind === 'TRANSFER') {
+      const qty = typeof raw.qty === 'number' && Number.isFinite(raw.qty) ? Math.trunc(raw.qty) : 1;
+      transfers.push({ name: name ?? '接送服务', qty: Math.max(1, qty) });
+    } else if (kind === 'VISA' && !visa) {
+      // 只取第一个 VISA 组件（套餐目前按单一目的地/单一签证产品设计，多签证组件不是既有用例）
+      const visaId = typeof raw.visaId === 'string' && raw.visaId ? raw.visaId : null;
+      visa = {
+        name: name ?? '签证',
+        visaId: visaId ?? '',
+        stayDays: visaId ? visaStayDaysById.get(visaId) ?? null : null,
+      };
+    }
+  }
+
+  return {
+    bundleKinds: [...kindSet] as BundleItemsSummary['bundleKinds'],
+    transfers,
+    visa,
+  };
+}
+
 /**
  * 单条订单行的行程单渲染字段（套餐订单详情「产品内容」板块用；ADDITIVE，不改/不删既有字段）。
  * FLIGHT 行 → 航班号/出发日期时间/到达时间/航线/舱位（来自 flightSchedule include）；
- * BUNDLE 行 → 套餐名/服务内容（来自 bundle include）；
- * 三者关联的 VISA/TRANSFER 独立行（客户端提交时才会有）→ 签证/接送产品名称。
+ * BUNDLE 行 → 套餐名/服务内容/组件构成/接送/签证（来自 bundle include，签证/接送来自套餐定义
+ *   而非订单行——套餐订单通常只有机票腿 + 一条 BUNDLE 地面行，没有独立 VISA/TRANSFER 行）；
+ * 三者关联的 VISA/TRANSFER 独立行（客户端提交时才会有）→ 签证/接送产品名称（保留，向后兼容）。
  * 未联查对应关系时（如 listOrders 用扁平 items:true）安全落 null，不强行断言非空。
+ *
+ * @param visaStayDaysById BUNDLE 行的 VISA 组件 stayDays 查询结果（getOrder 事先批量查好传入；
+ *   其余调用方未传时用空表——套餐签证板块的 stayDays 会是 null，不影响其余字段。
  */
-function itineraryFieldsForItem(i: Record<string, unknown>): Record<string, unknown> {
+function itineraryFieldsForItem(
+  i: Record<string, unknown>,
+  visaStayDaysById: ReadonlyMap<string, number | null> = new Map(),
+): Record<string, unknown> {
   const flightSchedule = i.flightSchedule as
     | {
         departureTime?: Date | string;
@@ -3498,10 +3620,19 @@ function itineraryFieldsForItem(i: Record<string, unknown>): Record<string, unkn
     | null
     | undefined;
   const transfer = i.transfer as { name?: string | null } | null | undefined;
-  const bundle = i.bundle as { name?: string | null; serviceNotes?: string | null } | null | undefined;
+  const bundle = i.bundle as
+    | {
+        name?: string | null;
+        serviceNotes?: string | null;
+        items?: unknown;
+        hotelRoomType?: { name?: string | null; hotel?: { name?: string | null } | null } | null;
+      }
+    | null
+    | undefined;
 
   const departureTime = flightSchedule?.departureTime ? new Date(flightSchedule.departureTime) : null;
   const arrivalTime = flightSchedule?.arrivalTime ? new Date(flightSchedule.arrivalTime) : null;
+  const bundleSummary = bundle ? summarizeBundleItems(bundle.items, visaStayDaysById) : null;
 
   return {
     // ── FLIGHT 行（含套餐关联的经济舱腿）──
@@ -3525,6 +3656,16 @@ function itineraryFieldsForItem(i: Record<string, unknown>): Record<string, unkn
     // ── BUNDLE 行 ──
     bundleName: bundle?.name ?? null,
     serviceNotes: bundle?.serviceNotes ?? null,
+    // 套餐组件构成（该套餐 items 里实际有哪些类型）——「产品名称」自动拼装用
+    bundleKinds: bundleSummary?.bundleKinds ?? null,
+    // 套餐定义里的接送组件（来自套餐，不是订单行——套餐订单通常没有独立 TRANSFER 行）
+    bundleTransfers: bundleSummary?.transfers ?? null,
+    // 套餐定义里的签证组件（来自套餐，不是订单行；stayDays 由调用方批量查好传入）
+    bundleVisa: bundleSummary?.visa ?? null,
+    // 套餐关联房型的兜底酒店名/房型名——订单行自身未盖章 hotelRoomTypeId 时（老订单常见），
+    // 从套餐定义本身的关联房型回落，而不是整段留空。
+    bundleHotelName: bundle?.hotelRoomType?.hotel?.name ?? null,
+    bundleRoomTypeName: bundle?.hotelRoomType?.name ?? null,
   };
 }
 
@@ -3539,7 +3680,71 @@ function round2Decimal(d: Prisma.Decimal): Prisma.Decimal {
   return d.toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP);
 }
 
-function serializeOrder<T extends OrderLike>(order: T) {
+/**
+ * 订单级「按人头单价」派生（套餐订单详情「产品内容」卡片「人数」板块用）。
+ * 由真实成交金额反推，不臆造数字——起点是 order.total（服务端权威重算后的实付总额，
+ * 已含套餐折扣/升级加价等一切调整），按套餐的婴儿价/占座儿童折扣往回摊：
+ *
+ *   infantUnitPriceCny = bundle.infantPriceCny（套餐配置的婴儿价，直接展示，不参与摊分）
+ *   childDiscount      = bundle.childSeatDiscountCnyPerPerson（占座儿童比成人价低多少）
+ *   adultUnitPriceCny  = round( (total − infantCount×infantPrice + childCount×childDiscount)
+ *                                 / max(1, adultCount+childCount) )
+ *     —— 先把婴儿价从总额里减掉（婴儿不占座，价格与成人/儿童均摊池无关），
+ *        儿童比成人少收的部分加回去（还原「儿童按成人价打折」之前的等效成人价基数），
+ *        再按占座人数（成人+儿童）均摊，得到「等效成人单价」。
+ *   childUnitPriceCny  = adultUnitPriceCny − childDiscount
+ *
+ * 仅在本单含 BUNDLE 行且能解析出该行关联套餐的定价配置时返回；非套餐订单 / 套餐已被删除
+ * 查不到定价配置时返回 null（调用方按需省略该板块，不臆造）。
+ */
+export interface BundlePerAgeUnitPrices {
+  infantUnitPriceCny: number;
+  childUnitPriceCny: number;
+  adultUnitPriceCny: number;
+}
+export function deriveBundlePerAgeUnitPrices(
+  totalCny: number,
+  counts: { adultCount: number; childCount: number; infantCount: number },
+  bundlePricing: { infantPriceCny: number; childSeatDiscountCnyPerPerson: number },
+): BundlePerAgeUnitPrices {
+  const { adultCount, childCount, infantCount } = counts;
+  const infantUnitPriceCny = bundlePricing.infantPriceCny;
+  const childDiscount = bundlePricing.childSeatDiscountCnyPerPerson;
+  const seatPax = Math.max(1, adultCount + childCount);
+  const adultUnitPriceCny = round2(
+    (totalCny - infantCount * infantUnitPriceCny + childCount * childDiscount) / seatPax,
+  );
+  const childUnitPriceCny = round2(adultUnitPriceCny - childDiscount);
+  return { infantUnitPriceCny, childUnitPriceCny, adultUnitPriceCny };
+}
+
+/**
+ * 从订单行数组里找第一条 BUNDLE 行关联的套餐定价配置（infantPriceCny / childSeatDiscountCnyPerPerson）。
+ * 未联查 bundle（如 listOrders 用扁平 items:true）或本单无 BUNDLE 行 / 套餐已被删除 → 返回 null。
+ */
+function findBundlePricingConfig(
+  items: ReadonlyArray<Record<string, unknown>>,
+): { infantPriceCny: number; childSeatDiscountCnyPerPerson: number } | null {
+  for (const i of items) {
+    if (i.kind !== 'BUNDLE') continue;
+    const bundle = i.bundle as
+      | { infantPriceCny?: number | null; childSeatDiscountCnyPerPerson?: number | null }
+      | null
+      | undefined;
+    if (!bundle) continue;
+    return {
+      infantPriceCny: bundle.infantPriceCny ?? 0,
+      childSeatDiscountCnyPerPerson: bundle.childSeatDiscountCnyPerPerson ?? 0,
+    };
+  }
+  return null;
+}
+
+function serializeOrder<T extends OrderLike>(
+  order: T,
+  ctx: { visaStayDaysById?: ReadonlyMap<string, number | null> } = {},
+) {
+  const visaStayDaysById = ctx.visaStayDaysById ?? new Map<string, number | null>();
   // 售后费用叠加后的口径：
   //   effectivePayable = total + adjustmentCny（客户实际应付）
   //   balanceDue       = effectivePayable − paidAmount（尾款；负数表示多付）
@@ -3556,6 +3761,11 @@ function serializeOrder<T extends OrderLike>(order: T) {
   const adultCount = order.passengers?.filter((p) => passengerTypeOf(p) === 'ADULT').length ?? 0;
   const childCount = order.passengers?.filter((p) => passengerTypeOf(p) === 'CHILD').length ?? 0;
   const infantCount = order.passengers?.filter((p) => passengerTypeOf(p) === 'INFANT').length ?? 0;
+  // 套餐订单按人头单价（仅本单含 BUNDLE 行且联查到套餐定价配置时才有；见 deriveBundlePerAgeUnitPrices）。
+  const bundlePricing = findBundlePricingConfig(order.items);
+  const perAgePrices = bundlePricing
+    ? deriveBundlePerAgeUnitPrices(totalNum, { adultCount, childCount, infantCount }, bundlePricing)
+    : null;
   return {
     ...order,
     subtotal: order.subtotal.toString(),
@@ -3572,6 +3782,10 @@ function serializeOrder<T extends OrderLike>(order: T) {
     adultCount,
     childCount,
     infantCount,
+    // 套餐订单按人头单价（由 total 反推，非套餐订单/查不到套餐定价配置时为 null；「产品内容」卡片用）
+    infantUnitPriceCny: perAgePrices?.infantUnitPriceCny ?? null,
+    childUnitPriceCny: perAgePrices?.childUnitPriceCny ?? null,
+    adultUnitPriceCny: perAgePrices?.adultUnitPriceCny ?? null,
     // 暴露代理结算模式 + 余额（前端据 settlementMode=MONTHLY 把订单显示成「月结」而非「欠款」）
     agent:
       order.agent == null
@@ -3583,21 +3797,35 @@ function serializeOrder<T extends OrderLike>(order: T) {
                 ? null
                 : order.agent.prepaymentBalance.toString(),
           },
-    items: order.items.map((i) => ({
-      ...i,
-      unitPrice: i.unitPrice.toString(),
-      amount: i.amount.toString(),
+    items: order.items.map((i) => {
+      const bundleFallback = i.bundle as
+        | { hotelRoomType?: { name?: string | null; hotel?: { name?: string | null } | null } | null }
+        | null
+        | undefined;
       // 权威酒店中文名：HOTEL 行或 BUNDLE 行（盖章 hotelRoomTypeId）联查 hotelRoomType.hotel.name 均可命中。
       // 不是所有调用方的 items include 都联查了 hotelRoomType（如 listOrders 用 items: true）——
       // 这里用可选链读取，未联查时安全落 null，不强行断言非空。
-      hotelName:
+      // 订单行自身未盖章 hotelRoomTypeId 时（老订单常见，见 CLAUDE 里记录的"套餐没盖房型"数据问题），
+      // 回落到套餐定义自己关联的房型，而不是整段留空。
+      const ownHotelName =
         (i as { hotelRoomType?: { hotel?: { name?: string | null } | null } | null }).hotelRoomType
-          ?.hotel?.name ?? null,
-      // 计费房间数（Decimal → number；未联查/未盖章时为 null，原样透出不强行转换）。
-      roomsBilled: decimalOrNull((i as { roomsBilled?: Prisma.Decimal | null }).roomsBilled),
-      // 行程单渲染字段（ADDITIVE；见 itineraryFieldsForItem 注释——未联查对应关系时安全落 null）。
-      ...itineraryFieldsForItem(i),
-    })),
+          ?.hotel?.name ?? null;
+      const ownRoomTypeName =
+        (i as { hotelRoomType?: { name?: string | null } | null }).hotelRoomType?.name ?? null;
+      return {
+        ...i,
+        unitPrice: i.unitPrice.toString(),
+        amount: i.amount.toString(),
+        hotelName: ownHotelName ?? bundleFallback?.hotelRoomType?.hotel?.name ?? null,
+        // 计费房间数（Decimal → number；未联查/未盖章时为 null，原样透出不强行转换）。
+        roomsBilled: decimalOrNull((i as { roomsBilled?: Prisma.Decimal | null }).roomsBilled),
+        // 行程单渲染字段（ADDITIVE；见 itineraryFieldsForItem 注释——未联查对应关系时安全落 null）。
+        ...itineraryFieldsForItem(i, visaStayDaysById),
+        // itineraryFieldsForItem 已经算了 roomTypeName（HOTEL/BUNDLE 行自身盖章的房型名）；
+        // 这里只在它为空时才用套餐兜底房型名覆盖，放在展开之后确保生效（避免被 spread 顺序覆盖）。
+        roomTypeName: ownRoomTypeName ?? bundleFallback?.hotelRoomType?.name ?? null,
+      };
+    }),
   };
 }
 

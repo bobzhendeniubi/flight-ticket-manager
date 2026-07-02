@@ -23,6 +23,10 @@ import { SearchSelect, type SearchSelectOption } from '../components/SearchSelec
 // 用本页局部扩展类型承接，不改共享 mock 类型定义。
 type MockVisaWithStayDays = MockVisa & { stayDays?: number | null };
 type MockBundleWithServiceNotes = MockBundle & { serviceNotes?: string | null };
+// 0702 反馈 3：起价拆解需要房型整间夜价 —— MockBundle.hotelRoomType（lib/mockData.ts）里没声明
+// nightlyPriceCny，但后端 serializeBundle 实际会发（见 products.service.ts BUNDLE_ROOM_INCLUDE /
+// serializeBundle），本页局部扩展类型承接，不改共享 mock 类型定义。
+type BundleHotelRoomTypeWithPrice = { id: string; name: string; hotelName: string; nightlyPriceCny?: number | null };
 
 type Section = 'hotels' | 'transfers' | 'visas' | 'bundles';
 
@@ -118,7 +122,7 @@ function bundleApiToMock(b: ApiBundle): MockBundleWithServiceNotes {
   // 套餐价 = 原价 ×(1 − discountPct/100)；折扣是套餐唯一口径。
   const discountPct = b.discountPct ?? 0;
   // 原价 = 含当前最低机票的全包原价（后端 originalAllInCny）；旧数据/无机票估值时回退 items 合计。
-  // 用它做"单买总价/划线价"，确保含机票（修复套餐卡只显示地面价 ¥350 的问题）。
+  // 仅作参考锚点保留（卡片不再展示整包口径——0702 反馈：与每人起价同框打架，已统一为折后起价/人）。
   const originalAllIn = b.originalAllInCny ?? items.reduce((s, i) => s + i.unitPrice * i.qty, 0);
   return {
     id: b.id,
@@ -373,8 +377,10 @@ export function ProductsPage() {
         const old = prev.find((p) => p.id === n.id);
         if (old && JSON.stringify(old) !== JSON.stringify(n)) {
           await api.updateTransfer(tk, n.id, {
+            // basePrice 曾漏传：与 createTransfer 字段列表不一致，导致「编辑」改了起步价、
+            // PATCH 200 但价格没变（后端 undefined 字段=不改，静默丢弃）——0702 反馈的真实根因。
             name: n.name, vehicleType: n.vehicleType, capacity: n.capacity,
-            originArea: n.originArea, destArea: n.destArea,
+            originArea: n.originArea, destArea: n.destArea, basePrice: n.basePrice,
             features: n.features, duration: n.duration, emoji: n.emoji, photo: n.photo,
           });
         }
@@ -406,8 +412,10 @@ export function ProductsPage() {
         const old = prev.find((p) => p.id === n.id);
         if (old && JSON.stringify(old) !== JSON.stringify(n)) {
           await api.updateVisa(tk, n.id, {
+            // basePrice 曾漏传：与 createVisa 字段列表不一致，导致「编辑」改了办理费、
+            // PATCH 200 但价格没变（后端 undefined 字段=不改，静默丢弃）——与 Transfer 同一类缺陷。
             country: n.country, flag: n.flag, visaName: n.type,
-            processingDays: n.processingDays, expressSurcharge: n.expressSurcharge,
+            processingDays: n.processingDays, basePrice: n.basePrice, expressSurcharge: n.expressSurcharge,
             validityMonths: n.validityMonths, highlight: n.highlight,
             requiredDocs: n.requiredDocs,
             stayDays: n.stayDays ?? undefined,
@@ -843,12 +851,41 @@ function BundleCard({
   onToggle: () => void;
   onDelete: () => void;
 }) {
-  const saving = bundle.listPrice - bundle.bundlePrice;
-  const savingPct = bundle.listPrice > 0 ? (saving / bundle.listPrice) * 100 : 0;
+  // 折后起价/人 = originalPerPaxCny ×(1−discountPct/100)。卡片唯一价格口径（0702 反馈：
+  // 旧「单买总价/套餐价」块按 flightPax 整包口径（如 3376/3207），与每人起价同框互相打架，已移除）。
+  const cardDiscountPct = bundle.discountPct ?? 0;
+  const cardOriginalPerPax = bundle.originalPerPaxCny ?? 0;
+  const cardDiscountedPerPax = Math.round(cardOriginalPerPax * (1 - cardDiscountPct / 100));
   // 机票口径：来回 = 去程(单程) + 回程(单程)；拆开显示，避免把来回价误当单程。
   const flight = bundleFlightRoundTrip(bundle);
   // 防御：items 非数组等畸形形状（历史脏数据）时安全兜底为 []，不让一条坏数据挂掉整卡渲染。
   const safeBundleItems = Array.isArray(bundle.items) ? bundle.items : [];
+  // 起价拆解（0702 反馈：运营把 1400=经济舱700×2 误读成「升舱默认700×2」，此处逐项摊开）：
+  // 与向导里的 originalPerPaxBreakdown 用同一份权威数据（items 已是服务端定价、hotelNights 已落库），
+  // 四项相加 = bundle.originalPerPaxCny（服务端 computeBundleOriginalPerPaxCny 的同一份口径）。
+  const nightsForBreakdown = bundle.hotelNights ?? 0;
+  const hotelRoomTypeWithPrice = bundle.hotelRoomType as BundleHotelRoomTypeWithPrice | null | undefined;
+  const hotelNightlyForBreakdown = hotelRoomTypeWithPrice?.nightlyPriceCny ?? 0;
+  const hotelHalfShareForBreakdown = Math.round(0.5 * hotelNightlyForBreakdown * nightsForBreakdown);
+  const transferTotalForBreakdown = safeBundleItems
+    .filter((i) => i.kind === 'TRANSFER')
+    .reduce((s, i) => s + i.qty * i.unitPrice, 0);
+  const transferTripsForBreakdown = safeBundleItems
+    .filter((i) => i.kind === 'TRANSFER')
+    .reduce((s, i) => s + i.qty, 0);
+  const visaPerPaxForBreakdown = safeBundleItems
+    .filter((i) => i.kind === 'VISA')
+    .reduce((s, i) => s + i.unitPrice, 0);
+  const originalPerPaxBreakdown = [
+    flight && flight.roundTrip > 0 ? { label: '机票往返(经济舱最低)', amount: flight.roundTrip } : null,
+    hotelHalfShareForBreakdown > 0
+      ? { label: `酒店 0.5间×${nightsForBreakdown}晚`, amount: hotelHalfShareForBreakdown }
+      : null,
+    transferTotalForBreakdown > 0
+      ? { label: `接送 ${transferTripsForBreakdown}趟`, amount: transferTotalForBreakdown }
+      : null,
+    visaPerPaxForBreakdown > 0 ? { label: '签证', amount: visaPerPaxForBreakdown } : null,
+  ].filter((row): row is { label: string; amount: number } => row != null);
   return (
     <article className={`card transition hover:shadow-pop ${bundle.active ? '' : 'opacity-60'}`}>
       <div className="font-mono text-xs text-ink-muted">编号 {bundle.code ?? '—'} <span className="font-sans not-italic text-ink-muted">(系统自动生成)</span></div>
@@ -925,21 +962,28 @@ function BundleCard({
         </div>
       )}
 
-      {(bundle.singleSupplementCnyPerNight != null || bundle.businessUpgradeCnyPerLeg != null) && (
+      {/* 可选加项：单房差 / 升舱 / 儿童差价 / 婴儿价 / 自备签证减额 —— 都是买家下单时可另加购的升级项，
+          不是套餐组件，不计入下方「起价」。0702 反馈：运营把这行里的 700 误读成「升舱默认包含在起价里」，
+          明确打标签避免再混淆。升舱 ¥0（= 未设置/不提供）不展示——避免读成「升舱免费」。 */}
+      {(bundle.singleSupplementCnyPerNight != null ||
+        (bundle.businessUpgradeCnyPerLeg != null && bundle.businessUpgradeCnyPerLeg > 0)) && (
         <div className="mt-1 text-xs text-ink-soft">
+          <span className="mr-1 rounded bg-slate-100 px-1 py-0.5 text-[10px] font-medium text-ink-muted">可选加项 · 不计入起价</span>
           {bundle.singleSupplementCnyPerNight != null && (
             <>🛏️ 单房差 ¥{bundle.singleSupplementCnyPerNight.toLocaleString()}/晚</>
           )}
-          {bundle.singleSupplementCnyPerNight != null && bundle.businessUpgradeCnyPerLeg != null && ' · '}
-          {bundle.businessUpgradeCnyPerLeg != null && (
-            <>💺 升舱 ¥{bundle.businessUpgradeCnyPerLeg.toLocaleString()}/程
-              {bundle.legs ? ` × ${bundle.legs} 段` : ''}</>
+          {bundle.singleSupplementCnyPerNight != null && bundle.businessUpgradeCnyPerLeg != null && bundle.businessUpgradeCnyPerLeg > 0 && ' · '}
+          {bundle.businessUpgradeCnyPerLeg != null && bundle.businessUpgradeCnyPerLeg > 0 && (
+            // 只显示单价，不显示「× N 段」——0702 反馈实证：任何乘法样式都会被读成「已计入价格」；
+            // 按段合计只在买家真正选购升舱时（前台加购器/订单）出现。
+            <>💺 升舱 ¥{bundle.businessUpgradeCnyPerLeg.toLocaleString()}/程</>
           )}
         </div>
       )}
 
       {(bundle.childSeatDiscountCnyPerPerson != null || bundle.infantPriceCny != null || (bundle.selfVisaDeductCny != null && bundle.selfVisaDeductCny > 0)) && (
         <div className="mt-1 text-xs text-ink-soft">
+          <span className="mr-1 rounded bg-slate-100 px-1 py-0.5 text-[10px] font-medium text-ink-muted">可选加项 · 不计入起价</span>
           {bundle.childSeatDiscountCnyPerPerson != null && (
             <>🧒 占座儿童差价 −¥{bundle.childSeatDiscountCnyPerPerson.toLocaleString()}/人</>
           )}
@@ -959,30 +1003,26 @@ function BundleCard({
           <span className="text-sm text-ink-soft">
             起价 / 人<span className="ml-1 text-xs text-ink-muted">(from · 拼房)</span>
           </span>
-          <span className="text-2xl font-semibold text-brand-700 nums">
-            from ¥{(bundle.originalPerPaxCny ?? 0).toLocaleString()}
-          </span>
+          <div className="text-right">
+            {cardDiscountPct > 0 && (
+              <span className="mr-2 text-sm text-ink-muted line-through nums">¥{cardOriginalPerPax.toLocaleString()}</span>
+            )}
+            <span className="text-2xl font-semibold text-brand-700 nums">
+              from ¥{cardDiscountedPerPax.toLocaleString()}
+            </span>
+            {cardDiscountPct > 0 && <span className="badge-danger ml-2">省 {cardDiscountPct}%</span>}
+          </div>
         </div>
+        {originalPerPaxBreakdown.length > 0 && (
+          // 起价拆解：同一份权威数据算出，逐项相加 = 原价起价；折扣在尾部标明（买家价 = 大字）。
+          <p className="mt-1 text-right text-[11px] leading-relaxed text-ink-muted nums">
+            = {originalPerPaxBreakdown.map((row) => `${row.label} ¥${row.amount.toLocaleString()}`).join(' + ')} /人
+            {cardDiscountPct > 0 && ` → 省 ${cardDiscountPct}% = ¥${cardDiscountedPerPax.toLocaleString()}/人`}
+          </p>
+        )}
         <p className="mt-1 text-right text-[11px] text-ink-muted">
           双人拼房价 · 单人独住+单房差 · 实际按出发日实时机票浮动
         </p>
-      </div>
-
-      <div className="mt-2 rounded-lg border border-slate-100 bg-canvas p-3">
-        <div className="flex items-center justify-between text-sm text-ink-muted">
-          <span>单买总价</span>
-          <span className="line-through nums">¥{bundle.listPrice.toLocaleString()}</span>
-        </div>
-        <div className="mt-1 flex items-end justify-between">
-          <span className="text-sm text-ink-soft">套餐价</span>
-          <div>
-            <span className="text-2xl font-semibold text-ink nums">¥{bundle.bundlePrice.toLocaleString()}</span>
-            <span className="badge-danger ml-2">
-              省 ¥{saving.toLocaleString()} ({savingPct.toFixed(0)}%)
-            </span>
-          </div>
-        </div>
-        <p className="mt-1 text-right text-[11px] text-ink-muted">原价含当前最低机票 · 实际按出发日实时机票浮动</p>
       </div>
 
       <div className="mt-3 flex justify-end gap-3 text-xs">
@@ -1135,6 +1175,24 @@ function NewBundleWizard({
   const originalPerPax = Math.round(
     (flightRefRoundTripCny ?? 0) + 0.5 * hotelNightlyPriceCny * nightsForPricing + transferTotal + visaPerPax,
   );
+  // 起价拆解（0702 反馈：运营把 1400=经济舱700×2 误读成「升舱默认700×2」；此处逐项摊开，
+  // 每项都用起价公式本身的同一组变量算出，四项相加 = originalPerPax，杜绝口径分叉）。
+  // 只列非零/非空项；接送凑「N 趟」= 各 TRANSFER 行 qty 之和（趟数，非产品数）。
+  const transferTripsCount = useMemo(
+    () => items.filter((i) => i.kind === 'TRANSFER').reduce((s, i) => s + (i.qty ?? 0), 0),
+    [items],
+  );
+  const hotelHalfShareCny = Math.round(0.5 * hotelNightlyPriceCny * nightsForPricing);
+  const originalPerPaxBreakdown = [
+    flightRefRoundTripCny != null && flightRefRoundTripCny > 0
+      ? { label: '机票往返(经济舱最低)', amount: flightRefRoundTripCny }
+      : null,
+    hotelHalfShareCny > 0
+      ? { label: `酒店 0.5间×${nightsForPricing}晚`, amount: hotelHalfShareCny }
+      : null,
+    transferTotal > 0 ? { label: `接送 ${transferTripsCount}趟`, amount: transferTotal } : null,
+    visaPerPax > 0 ? { label: '签证', amount: visaPerPax } : null,
+  ].filter((row): row is { label: string; amount: number } => row != null);
   // 运营录入「想卖的价格 / 人」(目标起价，基于 originalPerPaxCny)；系统反推折扣%。
   // 初值 = 现折后价/人(编辑，优先用服务端权威 originalPerPaxCny) 或 原价/人(新建·0折)。
   const [targetPerPax, setTargetPerPax] = useState<number | null>(
@@ -1323,7 +1381,7 @@ function NewBundleWizard({
                 min={0}
                 max={1000000}
                 className="input"
-                placeholder="留空 = 用默认 ¥700"
+                placeholder="留空 = 不提供升舱（¥0）"
                 value={businessUpgrade}
                 onChange={(n) => setBusinessUpgrade(n)}
               />
@@ -1576,6 +1634,13 @@ function NewBundleWizard({
               </span>
               <span className="font-medium text-ink nums">¥{originalPerPax.toLocaleString()}</span>
             </div>
+            {originalPerPaxBreakdown.length > 0 && (
+              // 起价拆解：每项都是同一套变量算出（见上方 originalPerPaxBreakdown），逐项相加 = 起价，
+              // 避免运营把机票/酒店/升舱几项数字混在一起猜（如把 1400=经济舱700×2 误读成升舱默认）。
+              <p className="text-[11px] leading-relaxed text-ink-muted nums">
+                = {originalPerPaxBreakdown.map((row) => `${row.label} ¥${row.amount.toLocaleString()}`).join(' + ')} /人
+              </p>
+            )}
             <p className="text-[11px] leading-relaxed text-ink-muted">
               双人拼房价 · 单人独住 +单房差 · 实际按出发日实时机票浮动
             </p>

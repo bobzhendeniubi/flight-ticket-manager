@@ -508,3 +508,275 @@ describe('ProductsService · 套餐含酒店组件必须关联房型（create + 
     expect(mockPrisma.bundle.update).toHaveBeenCalled();
   });
 });
+
+describe('ProductsService · businessUpgradeCnyPerLeg 默认值（0702 反馈：留空=不提供升舱，非 DB 默认 ¥700）', () => {
+  // 0702 反馈：运营把「留空」当成「用默认 ¥700」，还把这 700 错当成起价的一部分。
+  // createBundle 现在显式写 0（不再让 DB @default(700) 生效）；updateBundle 保持原「省略=保留现值」不变。
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockPrisma.flightSeatClass.findMany.mockResolvedValue([]);
+  });
+
+  const flightOnlyItem = { kind: 'FLIGHT' as const, productName: '去程', qty: 1, unitPrice: 0 };
+
+  it('createBundle：省略 businessUpgradeCnyPerLeg → 显式落库 0（不落 DB 默认 700）', async () => {
+    mockPrisma.bundle.findFirst.mockResolvedValueOnce(null);
+    mockPrisma.bundle.create.mockImplementationOnce(async ({ data }: { data: Record<string, unknown> }) => ({
+      id: 'bundle-1',
+      code: data.code,
+      name: data.name,
+      tagline: null,
+      serviceNotes: null,
+      emoji: null,
+      photo: null,
+      items: data.items,
+      flightPax: data.flightPax,
+      discountPct: data.discountPct,
+      groundDiscount: new Prisma.Decimal(0),
+      suitableFor: null,
+      hotelRoomTypeId: null,
+      hotelNights: null,
+      outboundFlightId: null,
+      returnFlightId: null,
+      singleSupplementCnyPerNight: 80,
+      businessUpgradeCnyPerLeg: data.businessUpgradeCnyPerLeg,
+      childSeatDiscountCnyPerPerson: 30,
+      infantPriceCny: 0,
+      selfVisaDeductCny: 0,
+      legs: 2,
+      blackoutDates: [],
+      defaultDepartDate: null,
+      soldCount: 0,
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      hotelRoomType: null,
+      outboundFlight: null,
+      returnFlight: null,
+    }));
+
+    const service = new ProductsService();
+    const result = await service.createBundle({
+      name: '不提供升舱套餐',
+      items: [flightOnlyItem],
+      flightPax: 1,
+      discountPct: 0,
+      groundDiscount: 0,
+      isActive: true,
+      // businessUpgradeCnyPerLeg 省略
+    });
+
+    expect(result.businessUpgradeCnyPerLeg).toBe(0);
+    expect(mockPrisma.bundle.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ businessUpgradeCnyPerLeg: 0 }) }),
+    );
+  });
+
+  it('createBundle：businessUpgradeCnyPerLeg 显式传 null → 同样落库 0', async () => {
+    mockPrisma.bundle.findFirst.mockResolvedValueOnce(null);
+    mockPrisma.bundle.create.mockImplementationOnce(async ({ data }: { data: Record<string, unknown> }) => ({
+      id: 'bundle-1',
+      code: data.code,
+      name: data.name,
+      tagline: null,
+      serviceNotes: null,
+      emoji: null,
+      photo: null,
+      items: data.items,
+      flightPax: data.flightPax,
+      discountPct: data.discountPct,
+      groundDiscount: new Prisma.Decimal(0),
+      suitableFor: null,
+      hotelRoomTypeId: null,
+      hotelNights: null,
+      outboundFlightId: null,
+      returnFlightId: null,
+      singleSupplementCnyPerNight: 80,
+      businessUpgradeCnyPerLeg: data.businessUpgradeCnyPerLeg,
+      childSeatDiscountCnyPerPerson: 30,
+      infantPriceCny: 0,
+      selfVisaDeductCny: 0,
+      legs: 2,
+      blackoutDates: [],
+      defaultDepartDate: null,
+      soldCount: 0,
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      hotelRoomType: null,
+      outboundFlight: null,
+      returnFlight: null,
+    }));
+
+    const service = new ProductsService();
+    const result = await service.createBundle({
+      name: '不提供升舱套餐（显式 null）',
+      items: [flightOnlyItem],
+      flightPax: 1,
+      discountPct: 0,
+      groundDiscount: 0,
+      isActive: true,
+      businessUpgradeCnyPerLeg: null,
+    });
+
+    expect(result.businessUpgradeCnyPerLeg).toBe(0);
+    expect(mockPrisma.bundle.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ businessUpgradeCnyPerLeg: 0 }) }),
+    );
+  });
+
+  it('createBundle：显式传 700 → 原样落库 700（运营仍可主动设置）', async () => {
+    mockPrisma.bundle.findFirst.mockResolvedValueOnce(null);
+    mockPrisma.bundle.create.mockImplementationOnce(async ({ data }: { data: Record<string, unknown> }) => ({
+      id: 'bundle-1',
+      code: data.code,
+      name: data.name,
+      tagline: null,
+      serviceNotes: null,
+      emoji: null,
+      photo: null,
+      items: data.items,
+      flightPax: data.flightPax,
+      discountPct: data.discountPct,
+      groundDiscount: new Prisma.Decimal(0),
+      suitableFor: null,
+      hotelRoomTypeId: null,
+      hotelNights: null,
+      outboundFlightId: null,
+      returnFlightId: null,
+      singleSupplementCnyPerNight: 80,
+      businessUpgradeCnyPerLeg: data.businessUpgradeCnyPerLeg,
+      childSeatDiscountCnyPerPerson: 30,
+      infantPriceCny: 0,
+      selfVisaDeductCny: 0,
+      legs: 2,
+      blackoutDates: [],
+      defaultDepartDate: null,
+      soldCount: 0,
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      hotelRoomType: null,
+      outboundFlight: null,
+      returnFlight: null,
+    }));
+
+    const service = new ProductsService();
+    const result = await service.createBundle({
+      name: '显式升舱 700 套餐',
+      items: [flightOnlyItem],
+      flightPax: 1,
+      discountPct: 0,
+      groundDiscount: 0,
+      isActive: true,
+      businessUpgradeCnyPerLeg: 700,
+    });
+
+    expect(result.businessUpgradeCnyPerLeg).toBe(700);
+    expect(mockPrisma.bundle.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ businessUpgradeCnyPerLeg: 700 }) }),
+    );
+  });
+
+  it('updateBundle：省略 businessUpgradeCnyPerLeg → 不写该字段（保留现值，不强行改成 0）', async () => {
+    mockPrisma.bundle.findUnique.mockResolvedValueOnce({
+      id: 'bundle-1',
+      hotelRoomTypeId: null,
+      outboundFlightId: null,
+      returnFlightId: null,
+    });
+    mockPrisma.bundle.update.mockImplementationOnce(async () => ({
+      id: 'bundle-1',
+      code: 'B0001',
+      name: '既有套餐',
+      tagline: '新文案',
+      serviceNotes: null,
+      emoji: null,
+      photo: null,
+      items: [],
+      flightPax: 1,
+      discountPct: 0,
+      groundDiscount: new Prisma.Decimal(0),
+      suitableFor: null,
+      hotelRoomTypeId: null,
+      hotelNights: null,
+      outboundFlightId: null,
+      returnFlightId: null,
+      singleSupplementCnyPerNight: 80,
+      // 既有套餐落库现值 700（历史数据）：本次只改 tagline，升舱现值应保持不变。
+      businessUpgradeCnyPerLeg: 700,
+      childSeatDiscountCnyPerPerson: 30,
+      infantPriceCny: 0,
+      selfVisaDeductCny: 0,
+      legs: 2,
+      blackoutDates: [],
+      defaultDepartDate: null,
+      soldCount: 0,
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      hotelRoomType: null,
+      outboundFlight: null,
+      returnFlight: null,
+    }));
+
+    const service = new ProductsService();
+    const result = await service.updateBundle('bundle-1', { tagline: '新文案' });
+
+    // 保留现值 700（未被强行改成 0）——PATCH body 里根本不该出现 businessUpgradeCnyPerLeg 键。
+    expect(result.businessUpgradeCnyPerLeg).toBe(700);
+    expect(mockPrisma.bundle.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'bundle-1' },
+        data: expect.not.objectContaining({ businessUpgradeCnyPerLeg: expect.anything() }),
+      }),
+    );
+  });
+
+  it('updateBundle：显式传 0 → 正常写入 0（运营主动把已有套餐的升舱关掉）', async () => {
+    mockPrisma.bundle.findUnique.mockResolvedValueOnce({
+      id: 'bundle-1',
+      hotelRoomTypeId: null,
+      outboundFlightId: null,
+      returnFlightId: null,
+    });
+    mockPrisma.bundle.update.mockImplementationOnce(async ({ data }: { data: Record<string, unknown> }) => ({
+      id: 'bundle-1',
+      code: 'B0001',
+      name: '既有套餐',
+      tagline: null,
+      serviceNotes: null,
+      emoji: null,
+      photo: null,
+      items: [],
+      flightPax: 1,
+      discountPct: 0,
+      groundDiscount: new Prisma.Decimal(0),
+      suitableFor: null,
+      hotelRoomTypeId: null,
+      hotelNights: null,
+      outboundFlightId: null,
+      returnFlightId: null,
+      singleSupplementCnyPerNight: 80,
+      businessUpgradeCnyPerLeg: data.businessUpgradeCnyPerLeg ?? 700,
+      childSeatDiscountCnyPerPerson: 30,
+      infantPriceCny: 0,
+      selfVisaDeductCny: 0,
+      legs: 2,
+      blackoutDates: [],
+      defaultDepartDate: null,
+      soldCount: 0,
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      hotelRoomType: null,
+      outboundFlight: null,
+      returnFlight: null,
+    }));
+
+    const service = new ProductsService();
+    const result = await service.updateBundle('bundle-1', { businessUpgradeCnyPerLeg: 0 });
+
+    expect(result.businessUpgradeCnyPerLeg).toBe(0);
+  });
+});

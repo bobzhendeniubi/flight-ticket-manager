@@ -357,7 +357,9 @@ function BundleDetailContent({
     retBizTier === 'SOLD_OUT' ||
     (outLeg != null && goBizTier === null) ||
     (retLeg != null && retBizTier === null);
-  const canOfferBusiness = businessUpg != null && cabin === 'ECONOMY';
+  // > 0（非 != null）：新建套餐留空时后端显式落 0（= 不提供升舱，见 products.service
+  // createBundle），仍按 != null 判断会把「不提供」误读成「¥0 免费升舱」显示出来。
+  const canOfferBusiness = (businessUpg ?? 0) > 0 && cabin === 'ECONOMY';
   // 多人「单人入住」升级（占座 seatPax≥2）。
   const canOfferSingle = singleSupp != null && seatPax >= 2;
   // 单人「拼房 / 独住」开关（solo 才出现；配置了单房差才可选独住）。默认拼房（singleCount=0）。

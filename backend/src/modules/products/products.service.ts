@@ -569,13 +569,14 @@ export class ProductsService {
           // 写入不变量：items 含 HOTEL 组件 → hotelNights 强制 = HOTEL.qty（真实晚数，clamp 1..30）；
           // 无 HOTEL 组件 → 保留请求值（或 null）。保证落库 hotelNights 永不与 HOTEL.qty 背离。
           hotelNights: deriveHotelNightsFromItems(body.items) ?? body.hotelNights ?? null,
-          // 省略时落 DB 默认（单人入住 ¥80/晚、升舱 ¥700/程、来回 2 段）
+          // 省略时落 DB 默认（单人入住 ¥80/晚、来回 2 段）
           ...(body.singleSupplementCnyPerNight != null
             ? { singleSupplementCnyPerNight: body.singleSupplementCnyPerNight }
             : {}),
-          ...(body.businessUpgradeCnyPerLeg != null
-            ? { businessUpgradeCnyPerLeg: body.businessUpgradeCnyPerLeg }
-            : {}),
+          // 升舱商务：省略/null 时显式写 0（= 不提供升舱），不再落 DB 默认 ¥700 ——
+          // 运营反馈「留空」被误当成默认价 700，还把 700 错当成套餐起价的一部分（0702 反馈）。
+          // updateBundle 保持原逻辑不变（省略 = 保留现值，运营需显式改成 0 才关闭已有套餐的升舱）。
+          businessUpgradeCnyPerLeg: body.businessUpgradeCnyPerLeg ?? 0,
           // 占座儿童折扣 / 婴儿价：省略时落 DB 默认（30 / 0）
           ...(body.childSeatDiscountCnyPerPerson != null
             ? { childSeatDiscountCnyPerPerson: body.childSeatDiscountCnyPerPerson }

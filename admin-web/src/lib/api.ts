@@ -501,6 +501,16 @@ export interface OrderItem {
   bundleName?: string | null;
   /** BUNDLE 行：服务内容（每行一条，运营在套餐向导里填） */
   serviceNotes?: string | null;
+
+  // ── 产品内容卡片 v2：套餐组件构成（来自套餐定义 bundle.items，非订单行；ADDITIVE）──
+  // 套餐订单通常只有机票腿 + 一条 BUNDLE 地面行，没有独立的 VISA/TRANSFER 行——
+  // 签证/接送信息要从套餐定义本身取，而不是（不存在的）订单行。
+  /** BUNDLE 行：该套餐 items 里实际存在哪些组件类型；未联查/非 BUNDLE 行为 null */
+  bundleKinds?: Array<'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA'> | null;
+  /** BUNDLE 行：套餐定义里的接送组件列表（可能多条）；未联查/无接送组件为 null 或空数组 */
+  bundleTransfers?: Array<{ name: string; qty: number }> | null;
+  /** BUNDLE 行：套餐定义里的签证组件（第一条）；stayDays 由服务端按 visaId 查好；无签证组件为 null */
+  bundleVisa?: { name: string; visaId: string; stayDays: number | null } | null;
 }
 
 export interface OrderPassenger {
@@ -663,6 +673,12 @@ export interface OrderSummary {
   adultCount?: number;
   childCount?: number;
   infantCount?: number;
+
+  // 套餐订单按人头单价（由 order.total 反推，非套餐订单/查不到套餐定价配置时为 null；
+  // 「产品内容」卡片 v2「人数」板块用；口径见 backend deriveBundlePerAgeUnitPrices）
+  adultUnitPriceCny?: number | null;
+  childUnitPriceCny?: number | null;
+  infantUnitPriceCny?: number | null;
 }
 
 /** listOrders 查询参数（与 backend listOrdersQuerySchema 对齐） */

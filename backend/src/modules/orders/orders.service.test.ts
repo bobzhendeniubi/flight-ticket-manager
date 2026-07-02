@@ -41,6 +41,12 @@ const { mockPrisma, mockComputeQuote, mockGetHotelNightlyRemaining } = vi.hoiste
     bundle: {
       findUnique: vi.fn(),
     },
+    // getOrder 的 loadBundleVisaStayDays 用它批量查套餐 VISA 组件的 stayDays（不 mock 时默认
+    // undefined，调用即抛错——loadBundleVisaStayDays 有 try/catch best-effort 降级，不影响
+    // 既有未涉及签证的测试；专门测 visa 板块的用例会显式 mock 这个方法）。
+    visa: {
+      findMany: vi.fn(),
+    },
     // swapPassenger 内部用 prisma.$transaction(async (tx) => {...})；tx 复用同一批 mock 方法
     // （swapPassenger 事务体只碰 order/passenger/fulfillmentTask，这里按需最小补齐）。
     fulfillmentTask: {
@@ -82,6 +88,8 @@ import {
   createFulfillmentTasks,
   resolveOrderAgentId,
   buildStayNightDates,
+  summarizeBundleItems,
+  deriveBundlePerAgeUnitPrices,
 } from './orders.service.js';
 import type { OrderItemInput } from './orders.schemas.js';
 import {
@@ -1798,6 +1806,345 @@ describe('getOrder：套餐订单行程单渲染字段（ADDITIVE）', () => {
     expect(result.adultCount).toBe(2);
     expect(result.childCount).toBe(1);
     expect(result.infantCount).toBe(1);
+  });
+});
+
+// ── 0702 反馈：产品内容卡片 v2 — 套餐组件构成派生（summarizeBundleItems） ──────────
+// bundle.items JSON → bundleKinds / transfers[{name,qty}] / visa{name,stayDays}。
+// 纯函数：不查库（stayDays 由调用方批量查好，作为 visaStayDaysById 传入）。
+describe('summarizeBundleItems', () => {
+  it('全组件套餐（FLIGHT+HOTEL+TRANSFER+VISA）→ 正确拆出 kinds/transfers/visa', () => {
+    const summary = summarizeBundleItems(
+      [
+        { kind: 'FLIGHT', productName: 'QH 澳门↔岘港 来回经济舱', qty: 1, unitPrice: 0 },
+        { kind: 'HOTEL', productName: '岘港凯悦度假村 美溪海景房', qty: 3, unitPrice: 2162 },
+        {
+          kind: 'TRANSFER',
+          productName: '岘港机场接送（来回 7 座商务车）',
+          qty: 2,
+          unitPrice: 188,
+          transferId: 'trf1',
+        },
+        { kind: 'VISA', productName: '越南 E-visa 30 天 × 2 人', qty: 2, unitPrice: 280, visaId: 'visa1' },
+      ],
+      new Map([['visa1', 30]]),
+    );
+    expect(summary.bundleKinds.sort()).toEqual(['FLIGHT', 'HOTEL', 'TRANSFER', 'VISA'].sort());
+    expect(summary.transfers).toEqual([{ name: '岘港机场接送（来回 7 座商务车）', qty: 2 }]);
+    expect(summary.visa).toEqual({ name: '越南 E-visa 30 天 × 2 人', visaId: 'visa1', stayDays: 30 });
+  });
+
+  it('多条 TRANSFER 组件 → 全部列出（不只取第一条）', () => {
+    const summary = summarizeBundleItems([
+      { kind: 'TRANSFER', productName: '接机', qty: 1, unitPrice: 100, transferId: 't1' },
+      { kind: 'TRANSFER', productName: '送机', qty: 1, unitPrice: 100, transferId: 't2' },
+    ]);
+    expect(summary.transfers).toEqual([
+      { name: '接机', qty: 1 },
+      { name: '送机', qty: 1 },
+    ]);
+  });
+
+  it('VISA 组件的 visaId 在 visaStayDaysById 里查不到 → stayDays 落 null（不抛错）', () => {
+    const summary = summarizeBundleItems(
+      [{ kind: 'VISA', productName: '越南签证', qty: 1, unitPrice: 280, visaId: 'visa-unknown' }],
+      new Map([['visa1', 30]]), // 不含 visa-unknown
+    );
+    expect(summary.visa).toEqual({ name: '越南签证', visaId: 'visa-unknown', stayDays: null });
+  });
+
+  it('只有 FLIGHT+HOTEL 的套餐（无接送/签证）→ transfers 空数组、visa 为 null', () => {
+    const summary = summarizeBundleItems([
+      { kind: 'FLIGHT', productName: 'QH 往返', qty: 1, unitPrice: 0 },
+      { kind: 'HOTEL', productName: '海景房', qty: 2, unitPrice: 800 },
+    ]);
+    expect(summary.bundleKinds.sort()).toEqual(['FLIGHT', 'HOTEL']);
+    expect(summary.transfers).toEqual([]);
+    expect(summary.visa).toBeNull();
+  });
+
+  it('items 非数组 / null / 元素畸形 → 安全降级为空摘要，不抛错', () => {
+    expect(summarizeBundleItems(null)).toEqual({ bundleKinds: [], transfers: [], visa: null });
+    expect(summarizeBundleItems(undefined)).toEqual({ bundleKinds: [], transfers: [], visa: null });
+    expect(summarizeBundleItems('not-an-array')).toEqual({ bundleKinds: [], transfers: [], visa: null });
+    // 元素非对象 / kind 不识别 / 字段类型错误 → 逐条跳过，其余正常条目仍解析
+    const summary = summarizeBundleItems([
+      null,
+      42,
+      { kind: 'UNKNOWN_KIND', productName: 'x', qty: 1 },
+      { kind: 'TRANSFER', productName: '正常接送', qty: 1, unitPrice: 100, transferId: 't1' },
+    ] as never);
+    expect(summary.transfers).toEqual([{ name: '正常接送', qty: 1 }]);
+  });
+
+  it('TRANSFER 缺 productName / qty 非法 → 名称兜底「接送服务」、qty 兜底 1', () => {
+    const summary = summarizeBundleItems([
+      { kind: 'TRANSFER', qty: -5, unitPrice: 100, transferId: 't1' },
+      { kind: 'TRANSFER', productName: '  ', qty: 'not-a-number', unitPrice: 100, transferId: 't2' },
+    ] as never);
+    expect(summary.transfers).toEqual([
+      { name: '接送服务', qty: 1 }, // qty=-5 → 兜底 1（不允许负数/0 趟）
+      { name: '接送服务', qty: 1 }, // 空白 productName 视为缺失；qty 非数字 → 兜底 1
+    ]);
+  });
+});
+
+// ── 0702 反馈：产品内容卡片 v2 — 按人头单价反推（deriveBundlePerAgeUnitPrices） ────
+// 由 order.total（服务端权威重算后的实付总额）反推成人/儿童/婴儿单价，不臆造数字。
+describe('deriveBundlePerAgeUnitPrices', () => {
+  it('worked example：真实订单 FTM2026063016427（2 成人，total=10562，无儿童/婴儿）', () => {
+    // 该套餐（经典度假 3 晚 · 凯悦海景）infantPriceCny=0，childSeatDiscountCnyPerPerson=30
+    const result = deriveBundlePerAgeUnitPrices(
+      10562,
+      { adultCount: 2, childCount: 0, infantCount: 0 },
+      { infantPriceCny: 0, childSeatDiscountCnyPerPerson: 30 },
+    );
+    // adultUnitPriceCny = round((10562 − 0 + 0) / 2) = 5281
+    expect(result.adultUnitPriceCny).toBe(5281);
+    // childUnitPriceCny = 5281 − 30 = 5251（本单无儿童，仍按配置算出展示价）
+    expect(result.childUnitPriceCny).toBe(5251);
+    expect(result.infantUnitPriceCny).toBe(0);
+  });
+
+  it('含儿童+婴儿：儿童折扣从均摊池里加回、婴儿价先从总额减掉，均摊人数=成人+儿童', () => {
+    // 6 人：2 成人 + 2 儿童（占座儿童折扣 30/人）+ 2 婴儿（不占座，婴儿价 1000/人）
+    // total = 假设服务端权威重算出 10680
+    const result = deriveBundlePerAgeUnitPrices(
+      10680,
+      { adultCount: 2, childCount: 2, infantCount: 2 },
+      { infantPriceCny: 1000, childSeatDiscountCnyPerPerson: 30 },
+    );
+    // adultUnitPriceCny = round((10680 − 2×1000 + 2×30) / (2+2)) = round(8740/4) = 2185
+    expect(result.adultUnitPriceCny).toBe(2185);
+    // childUnitPriceCny = 2185 − 30 = 2155
+    expect(result.childUnitPriceCny).toBe(2155);
+    expect(result.infantUnitPriceCny).toBe(1000);
+    // 反向验证：Σ(单价×人数) 应约等于 total（婴儿价单独展示，不参与均摊池但仍是总额的一部分）
+    const reconstructed =
+      result.adultUnitPriceCny * 2 + result.childUnitPriceCny * 2 + result.infantUnitPriceCny * 2;
+    expect(Math.abs(reconstructed - 10680)).toBeLessThanOrEqual(2); // round() 累计误差容差
+  });
+
+  it('adultCount+childCount=0（全婴儿的异常订单，理论不应发生）→ 除数保底 1，不除零', () => {
+    const result = deriveBundlePerAgeUnitPrices(
+      500,
+      { adultCount: 0, childCount: 0, infantCount: 1 },
+      { infantPriceCny: 500, childSeatDiscountCnyPerPerson: 30 },
+    );
+    // seatPax = max(1, 0) = 1 → adultUnitPriceCny = round((500 − 500 + 0) / 1) = 0（不抛错/不是 NaN）
+    expect(result.adultUnitPriceCny).toBe(0);
+    expect(Number.isFinite(result.adultUnitPriceCny)).toBe(true);
+  });
+
+  it('childSeatDiscountCnyPerPerson=0（套餐未配置儿童折扣）→ 儿童单价=成人单价', () => {
+    const result = deriveBundlePerAgeUnitPrices(
+      4000,
+      { adultCount: 2, childCount: 0, infantCount: 0 },
+      { infantPriceCny: 0, childSeatDiscountCnyPerPerson: 0 },
+    );
+    expect(result.adultUnitPriceCny).toBe(2000);
+    expect(result.childUnitPriceCny).toBe(2000);
+  });
+});
+
+// ── 0702 反馈：产品内容卡片 v2 — getOrder 端到端联查（bundle.items/visa/按人单价） ──
+describe('getOrder：产品内容卡片 v2（套餐组件构成 + 按人单价，来自套餐定义而非订单行）', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('BUNDLE 行联查 bundle.items（全组件）→ bundleKinds/bundleTransfers/bundleVisa 来自套餐定义', async () => {
+    const service = new OrderService();
+    mockPrisma.visa.findMany.mockResolvedValue([{ id: 'visa1', stayDays: 30 }]);
+    mockPrisma.order.findUnique.mockResolvedValue(
+      fakeFullOrder({
+        userId: 'someone-else',
+        items: [
+          {
+            id: 'itm-bundle',
+            kind: 'BUNDLE',
+            description: '套餐',
+            quantity: 1,
+            unitPrice: dec(5414),
+            amount: dec(5414),
+            bundleId: 'bdl1',
+            bundle: {
+              name: '经典度假 3 晚 · 凯悦海景',
+              serviceNotes: null,
+              items: [
+                { kind: 'FLIGHT', productName: 'QH 澳门↔岘港 来回经济舱', qty: 1, unitPrice: 0 },
+                { kind: 'HOTEL', productName: '岘港凯悦度假村 美溪海景房', qty: 3, unitPrice: 2162 },
+                {
+                  kind: 'TRANSFER',
+                  productName: '岘港机场接送（来回 7 座商务车）',
+                  qty: 2,
+                  unitPrice: 188,
+                  transferId: 'trf1',
+                },
+                {
+                  kind: 'VISA',
+                  productName: '越南 E-visa 30 天 × 2 人',
+                  qty: 2,
+                  unitPrice: 280,
+                  visaId: 'visa1',
+                },
+              ],
+              infantPriceCny: 0,
+              childSeatDiscountCnyPerPerson: 30,
+              hotelRoomTypeId: 'rt1',
+              hotelRoomType: { name: '海景大床房', hotel: { name: '岘港凯悦度假村' } },
+            },
+          },
+        ],
+      }),
+    );
+    const result = await service.getOrder('ord1', { userId: 'admin1', role: 'ADMIN' });
+    const item = result.items[0];
+    expect(item.bundleKinds?.sort()).toEqual(['FLIGHT', 'HOTEL', 'TRANSFER', 'VISA'].sort());
+    expect(item.bundleTransfers).toEqual([{ name: '岘港机场接送（来回 7 座商务车）', qty: 2 }]);
+    expect(item.bundleVisa).toEqual({ name: '越南 E-visa 30 天 × 2 人', visaId: 'visa1', stayDays: 30 });
+    // Visa.stayDays 查询确实按本单套餐的 visaId 发出（不是本地硬编码）
+    expect(mockPrisma.visa.findMany).toHaveBeenCalledWith({
+      where: { id: { in: ['visa1'] } },
+      select: { id: true, stayDays: true },
+    });
+    // 订单行自身未盖章 hotelRoomTypeId（老订单常见）时，酒店名/房型名回落到套餐定义自己的关联房型
+    expect(item.hotelName).toBe('岘港凯悦度假村');
+    expect(item.roomTypeName).toBe('海景大床房');
+  });
+
+  it('软删除套餐（isActive=false）仍正常联查——不按 isActive 过滤', async () => {
+    // isActive 字段本身不在 select 里（getOrder 的 bundle select 没选它），这条用例验证的是
+    // 「即便套餐已下架，只要 bundle 关联行还在，FK join 就照常返回数据」——这是 Prisma include
+    // 的默认行为（不会因为关联行的其它字段值而跳过联查），这里用一个不含 isActive 的 bundle
+    // 对象模拟软删除套餐的联查结果，断言字段仍正确透出。
+    const service = new OrderService();
+    mockPrisma.visa.findMany.mockResolvedValue([]);
+    mockPrisma.order.findUnique.mockResolvedValue(
+      fakeFullOrder({
+        userId: 'someone-else',
+        items: [
+          {
+            id: 'itm-bundle',
+            kind: 'BUNDLE',
+            description: '套餐',
+            quantity: 1,
+            unitPrice: dec(1200),
+            amount: dec(1200),
+            bundleId: 'bdl-deleted',
+            bundle: {
+              name: '已下架套餐',
+              serviceNotes: '中文客服',
+              items: [{ kind: 'HOTEL', productName: '海景房', qty: 2, unitPrice: 600 }],
+              infantPriceCny: 0,
+              childSeatDiscountCnyPerPerson: 30,
+              hotelRoomTypeId: null,
+              hotelRoomType: null,
+            },
+          },
+        ],
+      }),
+    );
+    const result = await service.getOrder('ord1', { userId: 'admin1', role: 'ADMIN' });
+    expect(result.items[0].bundleName).toBe('已下架套餐');
+    expect(result.items[0].bundleKinds).toEqual(['HOTEL']);
+  });
+
+  it('本单含 BUNDLE 行 → order 级 adultUnitPriceCny/childUnitPriceCny/infantUnitPriceCny 由 total 反推', async () => {
+    const service = new OrderService();
+    mockPrisma.visa.findMany.mockResolvedValue([]);
+    mockPrisma.order.findUnique.mockResolvedValue(
+      fakeFullOrder({
+        userId: 'someone-else',
+        total: dec(10562),
+        passengers: [
+          { id: 'p1', fullName: 'A', passengerType: 'ADULT' },
+          { id: 'p2', fullName: 'B', passengerType: 'ADULT' },
+        ],
+        items: [
+          {
+            id: 'itm-bundle',
+            kind: 'BUNDLE',
+            description: '套餐',
+            quantity: 1,
+            unitPrice: dec(5414),
+            amount: dec(5414),
+            bundleId: 'bdl1',
+            bundle: {
+              name: '经典度假 3 晚 · 凯悦海景',
+              serviceNotes: null,
+              items: [],
+              infantPriceCny: 0,
+              childSeatDiscountCnyPerPerson: 30,
+              hotelRoomTypeId: null,
+              hotelRoomType: null,
+            },
+          },
+        ],
+      }),
+    );
+    const result = await service.getOrder('ord1', { userId: 'admin1', role: 'ADMIN' });
+    // 与 deriveBundlePerAgeUnitPrices 单测的 worked example 同一组输入，结果应一致
+    expect(result.adultUnitPriceCny).toBe(5281);
+    expect(result.childUnitPriceCny).toBe(5251);
+    expect(result.infantUnitPriceCny).toBe(0);
+  });
+
+  it('非套餐订单（无 BUNDLE 行）→ 按人头单价字段安全落 null，不抛错', async () => {
+    const service = new OrderService();
+    mockPrisma.order.findUnique.mockResolvedValue(
+      fakeFullOrder({
+        userId: 'someone-else',
+        total: dec(2100),
+        items: [
+          {
+            id: 'itm-flight',
+            kind: 'FLIGHT',
+            description: '单程机票',
+            quantity: 1,
+            unitPrice: dec(2100),
+            amount: dec(2100),
+          },
+        ],
+      }),
+    );
+    const result = await service.getOrder('ord1', { userId: 'admin1', role: 'ADMIN' });
+    expect(result.adultUnitPriceCny).toBeNull();
+    expect(result.childUnitPriceCny).toBeNull();
+    expect(result.infantUnitPriceCny).toBeNull();
+  });
+
+  it('Visa.stayDays 查询失败（DB 异常）→ best-effort 降级，bundleVisa.stayDays 落 null，不阻断整单渲染', async () => {
+    const service = new OrderService();
+    mockPrisma.visa.findMany.mockRejectedValue(new Error('DB 连接超时'));
+    mockPrisma.order.findUnique.mockResolvedValue(
+      fakeFullOrder({
+        userId: 'someone-else',
+        items: [
+          {
+            id: 'itm-bundle',
+            kind: 'BUNDLE',
+            description: '套餐',
+            quantity: 1,
+            unitPrice: dec(1200),
+            amount: dec(1200),
+            bundleId: 'bdl1',
+            bundle: {
+              name: '套餐',
+              serviceNotes: null,
+              items: [{ kind: 'VISA', productName: '越南签证', qty: 1, unitPrice: 280, visaId: 'visa1' }],
+              infantPriceCny: 0,
+              childSeatDiscountCnyPerPerson: 30,
+              hotelRoomTypeId: null,
+              hotelRoomType: null,
+            },
+          },
+        ],
+      }),
+    );
+    // 不抛错，整单仍正常返回
+    const result = await service.getOrder('ord1', { userId: 'admin1', role: 'ADMIN' });
+    expect(result.items[0].bundleVisa).toEqual({ name: '越南签证', visaId: 'visa1', stayDays: null });
   });
 });
 

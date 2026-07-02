@@ -634,8 +634,11 @@ function ConfigurableBundleCard({
     retBizTier === 'SOLD_OUT' ||
     (outLeg != null && goBizTier === null) ||
     (retLeg != null && retBizTier === null);
-  // 升级开关只在套餐配置了升舱报价、且本航线为经济舱套餐（升舱才有意义）时出现。
-  const canOfferBusiness = b.businessUpgradePerLeg != null && cabin === 'ECONOMY';
+  // 升级开关只在套餐配置了升舱报价（> 0，即真的收费才算「提供升舱」）、
+  // 且本航线为经济舱套餐（升舱才有意义）时出现。用 > 0 而非 != null——
+  // 新建套餐留空时后端显式落 0（= 不提供升舱，见 products.service createBundle），
+  // 若仍按 != null 判断会把「不提供」误读成「¥0 免费升舱」显示出来。
+  const canOfferBusiness = (b.businessUpgradePerLeg ?? 0) > 0 && cabin === 'ECONOMY';
 
   // 占座人数变化时把 add-on 份数夹回 [0, seatPax]（婴儿不占座 → 不计入升级上限）。
   useEffect(() => {

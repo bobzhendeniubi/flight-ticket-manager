@@ -198,8 +198,10 @@ export const createBundleBodySchema = z.object({
   outboundFlightId: z.string().nullable().optional(),
   returnFlightId: z.string().nullable().optional(),
   // 可选升级加价（CNY，按产品可配置）：单人入住房差/晚、升舱商务/航段。
-  // 整数 CNY；null / 省略时用 DB 默认（单人入住 ¥80/晚、升舱 ¥700/程）。
-  // nullable：前端"留空=用默认"会显式传 null；列本身非空有默认，服务层把 null 当省略处理。
+  // 整数 CNY；单人入住房差 null / 省略时用 DB 默认 ¥80/晚。
+  // 升舱商务 null / 省略时新建套餐显式落 0（= 不提供升舱，见 products.service createBundle）；
+  // 更新套餐时 null / 省略 = 保留现值（不改，与其余可选升级加价字段口径一致）。
+  // nullable：前端"留空=用默认/不提供"会显式传 null；服务层据此区分"省略"与"改成 0"。
   singleSupplementCnyPerNight: z.number().int().nonnegative().max(1_000_000).nullable().optional(),
   businessUpgradeCnyPerLeg: z.number().int().nonnegative().max(1_000_000).nullable().optional(),
   // 占座儿童 / 不占座婴儿定价（CNY，按产品可配置；null / 省略时用 DB 默认 30 / 0）：
