@@ -408,7 +408,17 @@ export class SettlementService {
             SELECT "prepaymentBalance" FROM "Agent" WHERE id = ${s.agentId} FOR UPDATE
           `;
           if (!agentRows[0]) throw new NotFoundError('代理不存在');
-          const newBalance = Number(agentRows[0].prepaymentBalance) - offset;
+          const freshBalance = Number(agentRows[0].prepaymentBalance);
+          // prepaymentOffset 是「生成结算单当时」的余额快照；生成后余额可能已被订单抵扣消耗。
+          // 余额不允许为负（不许赊账），且已审核的结算数字不悄悄改 ——
+          // 余额不足以覆盖快照抵扣时拒绝转 PAID，让财务作废本单后按当前余额重新生成。
+          if (offset > freshBalance + 0.001) {
+            throw new BadRequestError(
+              `代理当前预存余额 ¥${freshBalance.toFixed(2)} 已不足以覆盖本单抵扣 ¥${offset.toFixed(2)}` +
+                '（生成结算单后余额有新消耗）；请作废本单后重新生成',
+            );
+          }
+          const newBalance = round2(freshBalance - offset);
           await tx.agent.update({
             where: { id: s.agentId },
             data: { prepaymentBalance: new Prisma.Decimal(newBalance) },

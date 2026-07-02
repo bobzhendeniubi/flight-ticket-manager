@@ -18,13 +18,19 @@ const { mockPrisma } = vi.hoisted(() => ({
     bundle: { findFirst: vi.fn(), findUnique: vi.fn(), create: vi.fn(), update: vi.fn() },
     hotelRoomType: { findUnique: vi.fn() },
     transfer: { findMany: vi.fn() },
-    visa: { findMany: vi.fn() },
+    visa: { findMany: vi.fn(), findFirst: vi.fn(), create: vi.fn(), update: vi.fn(), findUnique: vi.fn() },
+    flight: { findUnique: vi.fn() },
+    flightSeatClass: { findMany: vi.fn() },
   },
 }));
 
 vi.mock('../../db/prisma.js', () => ({ prisma: mockPrisma }));
 
-import { deriveHotelNightsFromItems, resolveBundleItemPrices } from './products.service.js';
+import {
+  ProductsService,
+  deriveHotelNightsFromItems,
+  resolveBundleItemPrices,
+} from './products.service.js';
 import type { BundleItemInput } from './products.schemas.js';
 
 describe('deriveHotelNightsFromItems · 套餐写入不变量', () => {
@@ -183,5 +189,200 @@ describe('resolveBundleItemPrices · 套餐组件价格服务端权威定价', (
     expect(out.map((i) => i.unitPrice)).toEqual([0, 2162, 188, 280]);
     // 不可变：入参数组未被就地修改
     expect(original).toEqual(originalSnapshot);
+  });
+});
+
+describe('ProductsService · serviceNotes / stayDays 写入 + 序列化往返', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // createBundle/updateBundle 内部会喂 getCheapestRoundTripEconomyCny 算 originalAllInCny/originalPerPaxCny
+    // （与本次新增字段无关的旁路依赖）；给个空数组兜底，避免未 mock 时读 undefined 报错。
+    mockPrisma.flightSeatClass.findMany.mockResolvedValue([]);
+  });
+
+  it('createBundle 落库 serviceNotes 并原样透出', async () => {
+    mockPrisma.bundle.findFirst.mockResolvedValueOnce(null);
+    mockPrisma.bundle.create.mockImplementationOnce(async ({ data }: { data: Record<string, unknown> }) => ({
+      id: 'bundle-1',
+      code: data.code,
+      name: data.name,
+      tagline: data.tagline ?? null,
+      serviceNotes: data.serviceNotes ?? null,
+      emoji: null,
+      photo: null,
+      items: data.items,
+      flightPax: data.flightPax,
+      discountPct: data.discountPct,
+      groundDiscount: new Prisma.Decimal(0),
+      suitableFor: null,
+      hotelRoomTypeId: null,
+      hotelNights: null,
+      outboundFlightId: null,
+      returnFlightId: null,
+      singleSupplementCnyPerNight: 80,
+      businessUpgradeCnyPerLeg: 700,
+      childSeatDiscountCnyPerPerson: 30,
+      infantPriceCny: 0,
+      selfVisaDeductCny: 0,
+      legs: 2,
+      blackoutDates: [],
+      defaultDepartDate: null,
+      soldCount: 0,
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      hotelRoomType: null,
+      outboundFlight: null,
+      returnFlight: null,
+    }));
+
+    const service = new ProductsService();
+    const result = await service.createBundle({
+      name: '测试套餐',
+      items: [{ kind: 'FLIGHT', productName: '去程', qty: 1, unitPrice: 0 }],
+      flightPax: 1,
+      discountPct: 0,
+      groundDiscount: 0,
+      isActive: true,
+      serviceNotes: '中文客服，越南当地机场助签\n举牌接机，送至酒店并协助分房',
+    });
+
+    expect(result.serviceNotes).toBe('中文客服，越南当地机场助签\n举牌接机，送至酒店并协助分房');
+    expect(mockPrisma.bundle.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          serviceNotes: '中文客服，越南当地机场助签\n举牌接机，送至酒店并协助分房',
+        }),
+      }),
+    );
+  });
+
+  it('updateBundle 只传 serviceNotes 时只更新该字段（其余不变）', async () => {
+    mockPrisma.bundle.findUnique.mockResolvedValueOnce({
+      id: 'bundle-1',
+      hotelRoomTypeId: null,
+      outboundFlightId: null,
+      returnFlightId: null,
+    });
+    mockPrisma.bundle.update.mockImplementationOnce(async ({ data }: { data: Record<string, unknown> }) => ({
+      id: 'bundle-1',
+      code: 'B0001',
+      name: '测试套餐',
+      tagline: null,
+      serviceNotes: data.serviceNotes,
+      emoji: null,
+      photo: null,
+      items: [],
+      flightPax: 1,
+      discountPct: 0,
+      groundDiscount: new Prisma.Decimal(0),
+      suitableFor: null,
+      hotelRoomTypeId: null,
+      hotelNights: null,
+      outboundFlightId: null,
+      returnFlightId: null,
+      singleSupplementCnyPerNight: 80,
+      businessUpgradeCnyPerLeg: 700,
+      childSeatDiscountCnyPerPerson: 30,
+      infantPriceCny: 0,
+      selfVisaDeductCny: 0,
+      legs: 2,
+      blackoutDates: [],
+      defaultDepartDate: null,
+      soldCount: 0,
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      hotelRoomType: null,
+      outboundFlight: null,
+      returnFlight: null,
+    }));
+
+    const service = new ProductsService();
+    const result = await service.updateBundle('bundle-1', { serviceNotes: '离境日通知旅客，送往机场并辅助值机' });
+
+    expect(result.serviceNotes).toBe('离境日通知旅客，送往机场并辅助值机');
+    expect(mockPrisma.bundle.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'bundle-1' },
+        data: { serviceNotes: '离境日通知旅客，送往机场并辅助值机' },
+      }),
+    );
+  });
+
+  it('createVisa 落库 stayDays 并原样透出', async () => {
+    mockPrisma.visa.findFirst.mockResolvedValueOnce(null);
+    mockPrisma.visa.create.mockImplementationOnce(async ({ data }: { data: Record<string, unknown> }) => ({
+      id: 'visa-1',
+      code: data.code,
+      destinationCountry: data.destinationCountry,
+      country: data.country ?? null,
+      visaType: data.visaType,
+      visaName: data.visaName ?? null,
+      flag: null,
+      photo: null,
+      processingDays: data.processingDays,
+      basePrice: new Prisma.Decimal(280),
+      expressSurcharge: null,
+      costPriceCny: null,
+      validityMonths: data.validityMonths ?? null,
+      stayDays: data.stayDays ?? null,
+      highlight: null,
+      requiredDocs: [],
+      soldCount: 0,
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    }));
+
+    const service = new ProductsService();
+    const result = await service.createVisa({
+      destinationCountry: 'VN',
+      visaType: 'tourist',
+      processingDays: 3,
+      basePrice: 280,
+      isActive: true,
+      stayDays: 30,
+    });
+
+    expect(result.stayDays).toBe(30);
+    expect(mockPrisma.visa.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ stayDays: 30 }) }),
+    );
+  });
+
+  it('updateVisa 只传 stayDays 时只更新该字段（其余不变）', async () => {
+    mockPrisma.visa.findUnique.mockResolvedValueOnce({ id: 'visa-1' });
+    mockPrisma.visa.update.mockImplementationOnce(async ({ data }: { data: Record<string, unknown> }) => ({
+      id: 'visa-1',
+      code: 'V0001',
+      destinationCountry: 'VN',
+      country: '越南',
+      visaType: 'tourist',
+      visaName: '电子签证',
+      flag: null,
+      photo: null,
+      processingDays: 3,
+      basePrice: new Prisma.Decimal(280),
+      expressSurcharge: null,
+      costPriceCny: null,
+      validityMonths: null,
+      stayDays: data.stayDays,
+      highlight: null,
+      requiredDocs: [],
+      soldCount: 0,
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    }));
+
+    const service = new ProductsService();
+    const result = await service.updateVisa('visa-1', { stayDays: 45 });
+
+    expect(result.stayDays).toBe(45);
+    expect(mockPrisma.visa.update).toHaveBeenCalledWith({
+      where: { id: 'visa-1' },
+      data: { stayDays: 45 },
+    });
   });
 });

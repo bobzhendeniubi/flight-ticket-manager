@@ -18,6 +18,11 @@ import { useAuth } from '../stores/auth';
 import { NumberInput } from '../components/NumberInput';
 import { BundleBlackoutEditor, type BlackoutDateRow } from '../components/BundleBlackoutEditor';
 
+// 0702 反馈 1：服务内容 / 单次最多停留天数 —— MockVisa/MockBundle（lib/mockData.ts）暂未声明这两个字段，
+// 用本页局部扩展类型承接，不改共享 mock 类型定义。
+type MockVisaWithStayDays = MockVisa & { stayDays?: number | null };
+type MockBundleWithServiceNotes = MockBundle & { serviceNotes?: string | null };
+
 type Section = 'hotels' | 'transfers' | 'visas' | 'bundles';
 
 const SECTIONS: { key: Section; label: string; emoji: string }[] = [
@@ -87,7 +92,7 @@ function transferApiToMock(t: ApiTransfer): MockTransfer {
   };
 }
 
-function visaApiToMock(v: ApiVisa): MockVisa {
+function visaApiToMock(v: ApiVisa): MockVisaWithStayDays {
   return {
     id: v.id,
     code: v.code,
@@ -101,10 +106,12 @@ function visaApiToMock(v: ApiVisa): MockVisa {
     requiredDocs: v.requiredDocs,
     validityMonths: v.validityMonths ?? 1,
     highlight: v.highlight ?? undefined,
+    // 单次入境最多可停留天数（订单详情行程单「最多可停留 X 天」用）
+    stayDays: v.stayDays,
   };
 }
 
-function bundleApiToMock(b: ApiBundle): MockBundle {
+function bundleApiToMock(b: ApiBundle): MockBundleWithServiceNotes {
   const items = (b.items as BundleItem[]) ?? [];
   // 原价参考 = 各项合计（机票行 unitPrice 在 DB 为 0 → 此处仅地面参考；真实全包价含实时机票，在前台/下单时算）。
   // 套餐价 = 原价 ×(1 − discountPct/100)；折扣是套餐唯一口径。
@@ -117,6 +124,8 @@ function bundleApiToMock(b: ApiBundle): MockBundle {
     code: b.code,
     name: b.name,
     tagline: b.tagline ?? '',
+    // 服务内容（订单详情行程单「服务内容」板块；运营在向导里填，每行一条）
+    serviceNotes: b.serviceNotes ?? '',
     emoji: b.emoji ?? '🎁',
     items,
     listPrice: originalAllIn,
@@ -257,8 +266,8 @@ export function ProductsPage() {
   const [section, setSection] = useState<Section>('hotels');
   const [hotels, setHotels] = useState<MockHotel[]>([]);
   const [transfers, setTransfers] = useState<MockTransfer[]>([]);
-  const [visas, setVisas] = useState<MockVisa[]>([]);
-  const [bundles, setBundles] = useState<MockBundle[]>([]);
+  const [visas, setVisas] = useState<MockVisaWithStayDays[]>([]);
+  const [bundles, setBundles] = useState<MockBundleWithServiceNotes[]>([]);
   const [roomTypeOptions, setRoomTypeOptions] = useState<RoomTypeOption[]>([]);
   // 套餐可绑定的航班号选项（去程/回程下拉用）。仅在售航班。
   const [flightOptions, setFlightOptions] = useState<FlightOption[]>([]);
@@ -377,7 +386,7 @@ export function ProductsPage() {
     }
   }
 
-  async function persistVisas(next: MockVisa[]) {
+  async function persistVisas(next: MockVisaWithStayDays[]) {
     const prev = visas;
     setVisas(next);
     try {
@@ -388,6 +397,8 @@ export function ProductsPage() {
           visaType: n.type, visaName: n.type, processingDays: n.processingDays,
           basePrice: n.basePrice, expressSurcharge: n.expressSurcharge,
           validityMonths: n.validityMonths, highlight: n.highlight, requiredDocs: n.requiredDocs,
+          // 单次入境最多可停留天数（选填）
+          stayDays: n.stayDays ?? undefined,
         });
       }
       for (const n of next) {
@@ -398,6 +409,7 @@ export function ProductsPage() {
             processingDays: n.processingDays, expressSurcharge: n.expressSurcharge,
             validityMonths: n.validityMonths, highlight: n.highlight,
             requiredDocs: n.requiredDocs,
+            stayDays: n.stayDays ?? undefined,
           });
         }
       }
@@ -409,7 +421,7 @@ export function ProductsPage() {
     }
   }
 
-  async function persistBundles(next: MockBundle[]) {
+  async function persistBundles(next: MockBundleWithServiceNotes[]) {
     const prev = bundles;
     setBundles(next);
     try {
@@ -417,6 +429,8 @@ export function ProductsPage() {
       for (const n of next) if (!prev.find((p) => p.id === n.id)) {
         await api.createBundle(tk, {
           name: n.name, tagline: n.tagline, emoji: n.emoji,
+          // 服务内容（选填；每行一条，订单详情行程单据此渲染「服务内容」板块）
+          serviceNotes: n.serviceNotes || undefined,
           items: n.items, flightPax: n.flightPax,
           discountPct: n.discountPct ?? 0, groundDiscount: n.groundDiscount, suitableFor: n.suitableFor,
           hotelRoomTypeId: n.hotelRoomTypeId ?? null,
@@ -439,6 +453,7 @@ export function ProductsPage() {
         if (old && JSON.stringify(old) !== JSON.stringify(n)) {
           await api.updateBundle(tk, n.id, {
             name: n.name, tagline: n.tagline, emoji: n.emoji,
+            serviceNotes: n.serviceNotes || undefined,
             items: n.items, flightPax: n.flightPax ?? 1,
             // 改价的唯一真源：编辑向导算出新折扣% 后写在 discountPct 上，更新时必须一并回传，
             // 否则后端保留旧折扣 → PATCH 返回 200 但价格没变（"改价保存不了"）。
@@ -679,9 +694,9 @@ function TransfersSection({ items, onChange }: { items: MockTransfer[]; onChange
 }
 
 // ─── 签证 ───────────────────────────────────────────────────────────
-function VisasSection({ items, onChange }: { items: MockVisa[]; onChange: (v: MockVisa[]) => void }) {
+function VisasSection({ items, onChange }: { items: MockVisaWithStayDays[]; onChange: (v: MockVisaWithStayDays[]) => void }) {
   const [showForm, setShowForm] = useState(false);
-  const [editing, setEditing] = useState<MockVisa | null>(null);
+  const [editing, setEditing] = useState<MockVisaWithStayDays | null>(null);
   return (
     <div className="space-y-3">
       {editing && (
@@ -749,17 +764,17 @@ function BundlesSection({
   visas,
   onChange,
 }: {
-  items: MockBundle[];
+  items: MockBundleWithServiceNotes[];
   roomTypeOptions: RoomTypeOption[];
   flightOptions: FlightOption[];
   /** 接送产品下拉选项（在售）；套餐 TRANSFER 组件只能挑产品，不再手填价 */
   transfers: MockTransfer[];
   /** 签证产品下拉选项（在售）；套餐 VISA 组件只能挑产品，不再手填价 */
-  visas: MockVisa[];
-  onChange: (v: MockBundle[]) => void;
+  visas: MockVisaWithStayDays[];
+  onChange: (v: MockBundleWithServiceNotes[]) => void;
 }) {
   const [showWizard, setShowWizard] = useState(false);
-  const [editing, setEditing] = useState<MockBundle | null>(null);
+  const [editing, setEditing] = useState<MockBundleWithServiceNotes | null>(null);
   return (
     <div className="space-y-3">
       <ActionBar active={items.length} onAdd={() => setShowWizard(true)} addLabel="+ 新建套餐" />
@@ -997,16 +1012,18 @@ function NewBundleWizard({
   /** 接送产品下拉选项（在售）；TRANSFER 组件只能挑产品，价格只读来自产品 */
   transfers: MockTransfer[];
   /** 签证产品下拉选项（在售）；VISA 组件只能挑产品，价格只读来自产品 */
-  visas: MockVisa[];
+  visas: MockVisaWithStayDays[];
   /** 传入既有套餐 = 编辑模式（各字段预填）；缺省 = 新建 */
-  initial?: MockBundle;
+  initial?: MockBundleWithServiceNotes;
   /** 当前最低来回机票 / 人（CNY）：起价 / 人公式里的机票项；页面从已有套餐推得 */
   flightRefRoundTripCny?: number | null;
   onCancel: () => void;
-  onSubmit: (b: MockBundle) => void;
+  onSubmit: (b: MockBundleWithServiceNotes) => void;
 }) {
   const [name, setName] = useState(initial?.name ?? '');
   const [tagline, setTagline] = useState(initial?.tagline ?? '');
+  // 服务内容（订单详情行程单「服务内容」板块用；每行一条，选填）
+  const [serviceNotes, setServiceNotes] = useState(initial?.serviceNotes ?? '');
   const [emoji, setEmoji] = useState(initial?.emoji ?? '🎁');
   const [suitableFor, setSuitableFor] = useState(initial?.suitableFor ?? '2 大人');
   const [hotelRoomTypeId, setHotelRoomTypeId] = useState(initial?.hotelRoomTypeId ?? '');
@@ -1190,6 +1207,15 @@ function NewBundleWizard({
           <div>
             <label className="label">营销文案</label>
             <input className="input" value={tagline} onChange={(e) => setTagline(e.target.value)} placeholder="一句话卖点" />
+          </div>
+          <div>
+            <label className="label">服务内容（选填，每行一条，订单详情行程单据此展示）</label>
+            <textarea
+              className="input min-h-[88px]"
+              value={serviceNotes}
+              onChange={(e) => setServiceNotes(e.target.value)}
+              placeholder={'中文客服，越南当地机场助签\n举牌接机，送至酒店并协助分房\n离境日通知旅客，送往机场并辅助值机'}
+            />
           </div>
           <div>
             <label className="label">适合人群</label>
@@ -1563,6 +1589,7 @@ function NewBundleWizard({
                   id: initial?.id ?? 'b-' + Date.now(),
                   name,
                   tagline: tagline || '新建套餐',
+                  serviceNotes: serviceNotes || undefined,
                   emoji,
                   items: items.map((it) => {
                     // 组件价格只读、来自产品：服务端会按 transferId/visaId/关联房型权威重算 unitPrice，
@@ -2065,8 +2092,8 @@ function TransferEditorForm({
 }
 
 /** 新增签证：复用统一编辑器，预填一份合理空白模板（弹窗内填好再 POST）。 */
-function NewVisaForm({ onCancel, onSubmit }: { onCancel: () => void; onSubmit: (v: MockVisa) => void }) {
-  const blank: MockVisa = {
+function NewVisaForm({ onCancel, onSubmit }: { onCancel: () => void; onSubmit: (v: MockVisaWithStayDays) => void }) {
+  const blank: MockVisaWithStayDays = {
     id: 'v-' + Date.now(),
     country: '',
     countryCode: 'XX',
@@ -2083,7 +2110,7 @@ function NewVisaForm({ onCancel, onSubmit }: { onCancel: () => void; onSubmit: (
   );
 }
 
-function EditVisaForm({ visa, onCancel, onSave }: { visa: MockVisa; onCancel: () => void; onSave: (v: MockVisa) => void }) {
+function EditVisaForm({ visa, onCancel, onSave }: { visa: MockVisaWithStayDays; onCancel: () => void; onSave: (v: MockVisaWithStayDays) => void }) {
   return (
     <VisaEditorForm
       visa={visa}
@@ -2102,23 +2129,25 @@ function VisaEditorForm({
   onCancel,
   onSave,
 }: {
-  visa: MockVisa;
+  visa: MockVisaWithStayDays;
   title: string;
   submitLabel: string;
   onCancel: () => void;
-  onSave: (v: MockVisa) => void;
+  onSave: (v: MockVisaWithStayDays) => void;
 }) {
   const [form, setForm] = useState({ ...visa, highlight: visa.highlight ?? '' });
   const [basePrice, setBasePrice] = useState<number | null>(visa.basePrice);
   const [expressSurcharge, setExpressSurcharge] = useState<number | null>(visa.expressSurcharge);
   const [processingDays, setProcessingDays] = useState<number | null>(visa.processingDays);
   const [validityMonths, setValidityMonths] = useState<number | null>(visa.validityMonths);
+  // 单次入境最多可停留天数（选填；订单详情行程单「最多可停留 X 天」+ 推算生效/失效日期用）
+  const [stayDays, setStayDays] = useState<number | null>(visa.stayDays ?? null);
   const [docsText, setDocsText] = useState(visa.requiredDocs.join(', '));
   const [saved, setSaved] = useState(false);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    const updated: MockVisa = {
+    const updated: MockVisaWithStayDays = {
       ...form,
       basePrice: basePrice ?? 0,
       expressSurcharge: expressSurcharge ?? 0,
@@ -2126,6 +2155,7 @@ function VisaEditorForm({
       validityMonths: validityMonths ?? 1,
       highlight: form.highlight || undefined,
       requiredDocs: docsText.split(',').map(s => s.trim()).filter(Boolean),
+      stayDays: stayDays ?? undefined,
     };
     setSaved(true);
     setTimeout(() => onSave(updated), 800);
@@ -2169,6 +2199,10 @@ function VisaEditorForm({
         <div>
           <label className="label text-xs">有效期 (月)</label>
           <NumberInput min={1} max={120} className="input" value={validityMonths} onChange={(n) => setValidityMonths(n)} integerOnly />
+        </div>
+        <div>
+          <label className="label text-xs">单次最多停留（天，选填）</label>
+          <NumberInput min={1} max={365} className="input" value={stayDays} onChange={(n) => setStayDays(n)} integerOnly placeholder="不限则留空" />
         </div>
         <div className="md:col-span-2">
           <label className="label text-xs">卖点（如"最热销"）</label>

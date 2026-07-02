@@ -939,7 +939,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
 
   return (
     <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 p-4">
-      <div className="my-8 w-full max-w-3xl rounded-xl bg-white shadow-xl">
+      <div className="my-8 w-full max-w-3xl rounded-xl bg-white shadow-xl xl:max-w-[1400px]">
         <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3">
           <h2 className="text-lg font-semibold text-slate-900">录单（按产品类型 · 单笔）</h2>
           <button className="text-slate-400 hover:text-slate-700" onClick={onClose}>✕</button>
@@ -1382,39 +1382,26 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                   <button className="text-sm text-brand hover:text-brand-dark" onClick={addPassenger} type="button">＋ 加一位</button>
                 </div>
               </div>
-              <div className="max-h-72 overflow-x-auto overflow-y-auto rounded-md border border-slate-200">
-                <table className="w-full table-fixed text-sm">
-                  {/* 固定列宽：避免「护照图」单元格里的 AI 模型标签把整张表撑宽错位。
-                      百分比按签证列是否展示分两套，确保两种模式下 % 之和都不超 100%（叠加
-                      护照图/删两列定宽时配合外层 overflow-x-auto，列宽不会被挤崩。） */}
-                  <colgroup>
-                    <col style={{ width: showVisaCols ? '11%' : '15%' }} />{/* 姓名 */}
-                    <col style={{ width: showVisaCols ? '11%' : '15%' }} />{/* 护照号 */}
-                    <col style={{ width: showVisaCols ? '9%' : '12%' }} />{/* 出生日期 */}
-                    <col style={{ width: showVisaCols ? '9%' : '12%' }} />{/* 中文姓名 */}
-                    <col style={{ width: showVisaCols ? '9%' : '12%' }} />{/* 护照签发日期 */}
-                    <col style={{ width: showVisaCols ? '10%' : '12%' }} />{/* 护照签发地点 */}
-                    <col style={{ width: showVisaCols ? '9%' : '12%' }} />{/* 护照有效期 */}
-                    {showVisaCols && <col style={{ width: '12%' }} />}{/* 签证出签日 */}
-                    {showVisaCols && <col style={{ width: '12%' }} />}{/* 签证生效日 */}
-                    {showVisaCols && <col style={{ width: '12%' }} />}{/* 签证有效期 */}
-                    <col style={{ width: '96px' }} />{/* 护照图（固定窄列） */}
-                    <col style={{ width: '36px' }} />{/* 删 */}
-                  </colgroup>
+              <div className="max-h-[28rem] overflow-x-auto overflow-y-auto rounded-md border border-slate-200">
+                {/* 列宽用固定 min-width 直接标在每个 th/td 上（不用 col min-width——部分浏览器
+                    的 auto-layout 表格不认 <col> 上的 min-width，只认 width，等于没生效）。
+                    日期列需完整显示 YYYY-MM-DD 不被截断成「2026-」，姓名类列需够宽可读；
+                    表格允许超过容器宽度，靠外层 overflow-x-auto 横向滚动兜底，不挤压/不截断任何一列。 */}
+                <table className="min-w-max text-sm">
                   <thead className="sticky top-0 bg-slate-50 text-xs text-slate-500">
                     <tr>
-                      <th className="px-2 py-1.5 text-left font-normal">姓名</th>
-                      <th className="px-2 py-1.5 text-left font-normal">护照号</th>
-                      <th className="px-2 py-1.5 text-left font-normal">出生日期</th>
-                      <th className="px-2 py-1.5 text-left font-normal">中文姓名</th>
-                      <th className="px-2 py-1.5 text-left font-normal">护照签发日期</th>
-                      <th className="px-2 py-1.5 text-left font-normal">护照签发地点</th>
-                      <th className="px-2 py-1.5 text-left font-normal">护照有效期</th>
-                      {showVisaCols && <th className="px-2 py-1.5 text-left font-normal">签证出签日</th>}
-                      {showVisaCols && <th className="px-2 py-1.5 text-left font-normal">签证生效日</th>}
-                      {showVisaCols && <th className="px-2 py-1.5 text-left font-normal">签证有效期</th>}
-                      <th className="px-2 py-1.5 text-left font-normal">护照图</th>
-                      <th className="px-2 py-1.5"></th>
+                      <th className="min-w-[140px] whitespace-nowrap px-2 py-1.5 text-left font-normal">姓名</th>
+                      <th className="min-w-[140px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照号</th>
+                      <th className="min-w-[120px] whitespace-nowrap px-2 py-1.5 text-left font-normal">出生日期</th>
+                      <th className="min-w-[140px] whitespace-nowrap px-2 py-1.5 text-left font-normal">中文姓名</th>
+                      <th className="min-w-[120px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照签发日期</th>
+                      <th className="min-w-[160px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照签发地点</th>
+                      <th className="min-w-[120px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照有效期</th>
+                      {showVisaCols && <th className="min-w-[120px] whitespace-nowrap px-2 py-1.5 text-left font-normal">签证出签日</th>}
+                      {showVisaCols && <th className="min-w-[120px] whitespace-nowrap px-2 py-1.5 text-left font-normal">签证生效日</th>}
+                      {showVisaCols && <th className="min-w-[120px] whitespace-nowrap px-2 py-1.5 text-left font-normal">签证有效期</th>}
+                      <th className="min-w-[110px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照图</th>
+                      <th className="min-w-[40px] px-2 py-1.5"></th>
                     </tr>
                   </thead>
                   <tbody>
@@ -1434,13 +1421,13 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                       const isOcring = p.ocrPct !== null && p.ocrPct !== undefined && p.ocrPct < 100;
                       return (
                         <tr key={i} className="border-t border-slate-100">
-                          <td className="px-2 py-1 align-top">
+                          <td className="min-w-[140px] px-2 py-1 align-top">
                             <input className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm" value={p.fullName} onChange={(e) => setPassenger(i, { fullName: e.target.value })} />
                           </td>
-                          <td className="px-2 py-1 align-top">
+                          <td className="min-w-[140px] px-2 py-1 align-top">
                             <input className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm" value={p.documentNumber} onChange={(e) => setPassenger(i, { documentNumber: e.target.value })} />
                           </td>
-                          <td className="px-2 py-1 align-top">
+                          <td className="min-w-[120px] px-2 py-1 align-top">
                             <input
                               type="text"
                               inputMode="numeric"
@@ -1449,9 +1436,9 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                               value={p.dateOfBirth}
                               onChange={(e) => setPassenger(i, { dateOfBirth: e.target.value })}
                             />
-                            {dobBad && <span className="mt-0.5 block text-[11px] text-rose-500">格式如 1990-01-01</span>}
+                            {dobBad && <span className="mt-0.5 block whitespace-nowrap text-[11px] text-rose-500">格式如 1990-01-01</span>}
                           </td>
-                          <td className="px-2 py-1 align-top">
+                          <td className="min-w-[140px] px-2 py-1 align-top">
                             <input
                               type="text"
                               className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm"
@@ -1460,7 +1447,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                               onChange={(e) => setPassenger(i, { chineseName: e.target.value })}
                             />
                           </td>
-                          <td className="px-2 py-1 align-top">
+                          <td className="min-w-[120px] px-2 py-1 align-top">
                             <input
                               type="text"
                               inputMode="numeric"
@@ -1469,9 +1456,9 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                               value={p.passportIssueDate ?? ''}
                               onChange={(e) => setPassenger(i, { passportIssueDate: e.target.value })}
                             />
-                            {issueBad && <span className="mt-0.5 block text-[11px] text-rose-500">格式如 2018-01-01</span>}
+                            {issueBad && <span className="mt-0.5 block whitespace-nowrap text-[11px] text-rose-500">格式如 2018-01-01</span>}
                           </td>
-                          <td className="px-2 py-1 align-top">
+                          <td className="min-w-[160px] px-2 py-1 align-top">
                             <input
                               type="text"
                               className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm"
@@ -1480,7 +1467,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                               onChange={(e) => setPassenger(i, { passportIssuePlace: e.target.value })}
                             />
                           </td>
-                          <td className="px-2 py-1 align-top">
+                          <td className="min-w-[120px] px-2 py-1 align-top">
                             <input
                               type="text"
                               inputMode="numeric"
@@ -1489,10 +1476,10 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                               value={p.passportExpiry ?? ''}
                               onChange={(e) => setPassenger(i, { passportExpiry: e.target.value })}
                             />
-                            {ppExpiryBad && <span className="mt-0.5 block text-[11px] text-rose-500">格式如 2030-01-01</span>}
+                            {ppExpiryBad && <span className="mt-0.5 block whitespace-nowrap text-[11px] text-rose-500">格式如 2030-01-01</span>}
                           </td>
                           {showVisaCols && (
-                            <td className="px-2 py-1 align-top">
+                            <td className="min-w-[120px] px-2 py-1 align-top">
                               <input
                                 type="text"
                                 inputMode="numeric"
@@ -1501,11 +1488,11 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                                 value={p.visaIssueDate ?? ''}
                                 onChange={(e) => setPassenger(i, { visaIssueDate: e.target.value })}
                               />
-                              {visaIssueBad && <span className="mt-0.5 block text-[11px] text-rose-500">格式如 2026-01-01</span>}
+                              {visaIssueBad && <span className="mt-0.5 block whitespace-nowrap text-[11px] text-rose-500">格式如 2026-01-01</span>}
                             </td>
                           )}
                           {showVisaCols && (
-                            <td className="px-2 py-1 align-top">
+                            <td className="min-w-[120px] px-2 py-1 align-top">
                               <input
                                 type="text"
                                 inputMode="numeric"
@@ -1514,11 +1501,11 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                                 value={p.visaEffectiveDate ?? ''}
                                 onChange={(e) => setPassenger(i, { visaEffectiveDate: e.target.value })}
                               />
-                              {visaEffBad && <span className="mt-0.5 block text-[11px] text-rose-500">格式如 2026-01-01</span>}
+                              {visaEffBad && <span className="mt-0.5 block whitespace-nowrap text-[11px] text-rose-500">格式如 2026-01-01</span>}
                             </td>
                           )}
                           {showVisaCols && (
-                            <td className="px-2 py-1 align-top">
+                            <td className="min-w-[120px] px-2 py-1 align-top">
                               <input
                                 type="text"
                                 inputMode="numeric"
@@ -1527,10 +1514,10 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                                 value={p.visaExpiry ?? ''}
                                 onChange={(e) => setPassenger(i, { visaExpiry: e.target.value })}
                               />
-                              {visaExpiryBad && <span className="mt-0.5 block text-[11px] text-rose-500">格式如 2026-06-01</span>}
+                              {visaExpiryBad && <span className="mt-0.5 block whitespace-nowrap text-[11px] text-rose-500">格式如 2026-06-01</span>}
                             </td>
                           )}
-                          <td className="px-2 py-1 align-top">
+                          <td className="min-w-[110px] px-2 py-1 align-top">
                             {/* 隐藏 file input */}
                             <input
                               type="file"

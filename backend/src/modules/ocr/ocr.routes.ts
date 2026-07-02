@@ -3,7 +3,7 @@
  *
  * POST /ocr/passport
  *   body : { imageDataUrl: string }  — data:image/...;base64,... (≤6MB)
- *   auth : ADMIN 或 STAFF
+ *   auth : ADMIN / STAFF / AGENT —— 代理录单同样需要护照识别（公测反馈）
  *
  * 配置优先级：AiOcrConfig（DB 单例）> 环境变量（DASHSCOPE_API_KEY / QWEN_BASE_URL / QWEN_VL_MODEL）
  * 无可用 key → 200 { configured: false }
@@ -121,7 +121,7 @@ export const ocrRoutes: FastifyPluginAsync = async (app) => {
   app.post(
     '/passport',
     {
-      preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)],
+      preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT)],
     },
     async (req) => {
       const body = ocrBodySchema.parse(req.body);

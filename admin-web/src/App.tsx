@@ -9,6 +9,7 @@ import { SeatStatsPage } from './pages/SeatStatsPage';
 import { SeatAllocationPage } from './pages/SeatAllocationPage';
 import { ProductsPage } from './pages/ProductsPage';
 import { AgentsPage } from './pages/AgentsPage';
+import { AgentBalancePage } from './pages/AgentBalancePage';
 import { CustomersPage } from './pages/CustomersPage';
 import { TravelersPage } from './pages/TravelersPage';
 import { AuditLogsPage } from './pages/AuditLogsPage';
@@ -29,6 +30,7 @@ const AGENT_ALLOWED_PATHS = new Set([
   '/travelers',
   '/agents',
   '/settlements',
+  '/agent-balance',
 ]);
 
 function Protected({
@@ -174,6 +176,14 @@ export function App() {
           element={
             <Protected>
               <SettlementsPage />
+            </Protected>
+          }
+        />
+        <Route
+          path="/agent-balance"
+          element={
+            <Protected>
+              <AgentBalancePage />
             </Protected>
           }
         />

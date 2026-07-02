@@ -26,6 +26,7 @@ import { travelerRoutes } from './modules/travelers/travelers.routes.js';
 import { fulfillmentRoutes } from './modules/fulfillment/fulfillment.routes.js';
 import { paymentRoutes } from './modules/payments/payments.routes.js';
 import { paymentChannelRoutes } from './modules/payment-channels/payment-channels.routes.js';
+import { agentRechargeRoutes } from './modules/agent-recharges/agent-recharges.routes.js';
 import { receiptRoutes } from './modules/receipts/receipts.routes.js';
 import { publicRoutes } from './modules/public/public.routes.js';
 import { pricingRoutes } from './modules/pricing/pricing.routes.js';
@@ -102,6 +103,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(fulfillmentRoutes, { prefix: '/fulfillment-tasks' });
   await app.register(paymentRoutes, { prefix: '/payments' });
   await app.register(paymentChannelRoutes, { prefix: '/payment-channels' });
+  await app.register(agentRechargeRoutes, { prefix: '/agent-recharges' });
   await app.register(receiptRoutes, { prefix: '/receipts' });
   await app.register(publicRoutes, { prefix: '/public' });
   await app.register(pricingRoutes, { prefix: '/pricing' });

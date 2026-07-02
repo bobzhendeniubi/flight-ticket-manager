@@ -38,7 +38,7 @@ export const paymentChannelRoutes: FastifyPluginAsync = async (app) => {
       targetType: 'SYSTEM',
       targetId: channel.id,
       targetLabel: channel.label,
-      after: { kind: channel.kind, label: channel.label, isActive: channel.isActive },
+      after: { kind: channel.kind, label: channel.label, isActive: channel.isActive, agentId: channel.agentId },
     });
     return reply.status(201).send({ channel });
   });
@@ -54,7 +54,7 @@ export const paymentChannelRoutes: FastifyPluginAsync = async (app) => {
       targetType: 'SYSTEM',
       targetId: channel.id,
       targetLabel: channel.label,
-      after: { kind: channel.kind, label: channel.label, isActive: channel.isActive },
+      after: { kind: channel.kind, label: channel.label, isActive: channel.isActive, agentId: channel.agentId },
     });
     return { channel };
   });

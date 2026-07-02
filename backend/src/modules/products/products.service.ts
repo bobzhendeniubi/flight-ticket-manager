@@ -482,6 +482,7 @@ export class ProductsService {
     if (body.basePrice !== undefined) data.basePrice = new Prisma.Decimal(body.basePrice);
     if (body.expressSurcharge !== undefined) data.expressSurcharge = new Prisma.Decimal(body.expressSurcharge);
     if (body.validityMonths !== undefined) data.validityMonths = body.validityMonths;
+    if (body.stayDays !== undefined) data.stayDays = body.stayDays;
     if (body.highlight !== undefined) data.highlight = body.highlight;
     if (body.requiredDocs !== undefined) data.requiredDocs = body.requiredDocs;
     if (body.isActive !== undefined) data.isActive = body.isActive;
@@ -545,6 +546,7 @@ export class ProductsService {
           code,
           name: body.name,
           tagline: body.tagline,
+          serviceNotes: body.serviceNotes,
           emoji: body.emoji,
           photo: body.photo,
           items: pricedItems as unknown as Prisma.InputJsonValue,
@@ -599,6 +601,7 @@ export class ProductsService {
     const data: Prisma.BundleUncheckedUpdateInput = {};
     if (body.name !== undefined) data.name = body.name;
     if (body.tagline !== undefined) data.tagline = body.tagline;
+    if (body.serviceNotes !== undefined) data.serviceNotes = body.serviceNotes;
     if (body.emoji !== undefined) data.emoji = body.emoji;
     if (body.photo !== undefined) data.photo = body.photo;
     if (body.items !== undefined) {
@@ -736,6 +739,8 @@ function serializeVisa(
     basePrice: v.basePrice.toString(),
     expressSurcharge: v.expressSurcharge?.toString() ?? null,
     costPriceCny: v.costPriceCny?.toString() ?? null,
+    // 单次入境最多可停留天数（订单详情行程单据此推算签证生效/失效预计日期）
+    stayDays: v.stayDays,
     rating,
     reviewCount: rating.count,
     soldCount: v.soldCount,
@@ -782,6 +787,8 @@ function serializeBundle(
     originalAllInCny,
     originalPerPaxCny,
     groundDiscount: b.groundDiscount.toString(),
+    // 服务内容（订单详情行程单「服务内容」板块；每行一条，admin 表单读回编辑）
+    serviceNotes: b.serviceNotes,
     // 可选升级加价（CNY，整数，server-priced add-on）+ 航段数；前端据此报价升级项
     singleSupplementCnyPerNight: b.singleSupplementCnyPerNight,
     businessUpgradeCnyPerLeg: b.businessUpgradeCnyPerLeg,

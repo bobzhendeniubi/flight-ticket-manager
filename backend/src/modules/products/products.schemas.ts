@@ -138,6 +138,8 @@ export const createVisaBodySchema = z.object({
   basePrice: z.number().nonnegative(),
   expressSurcharge: z.number().nonnegative().optional(),
   validityMonths: z.number().int().min(0).max(120).optional(),
+  // 单次入境最多可停留天数（订单详情「最多可停留 X 天」展示 + 推算生效/失效日期用）
+  stayDays: z.number().int().min(1).max(365).optional(),
   highlight: z.string().max(300).optional(),
   requiredDocs: z.array(z.string().max(100)).default([]),
   isActive: z.boolean().default(true),
@@ -177,6 +179,8 @@ export type BundleBlackoutInput = z.infer<typeof bundleBlackoutSchema>;
 export const createBundleBodySchema = z.object({
   name: z.string().min(1).max(200),
   tagline: z.string().max(300).optional(),
+  // 服务内容（订单详情行程单 / 前台展示；运营每行一条，如「中文客服，越南当地机场助签」）
+  serviceNotes: z.string().max(2000).optional(),
   emoji: z.string().max(10).optional(),
   photo: z.string().url().optional(),
   items: z.array(bundleItemSchema).min(1).max(20),

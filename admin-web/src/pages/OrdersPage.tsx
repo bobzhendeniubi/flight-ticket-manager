@@ -6,6 +6,7 @@ import {
   type FulfillmentStatus,
 } from '../lib/mockData';
 import { exportToCSV } from '../lib/csvExport';
+import { AIRPORTS } from '../lib/airports';
 import { NumberInput } from '../components/NumberInput';
 import { OrderFinanceSection } from '../components/OrderFinanceSection';
 import { SingleOrderModal } from '../components/SingleOrderModal';
@@ -1362,6 +1363,11 @@ function OrderDrawer({
           {/* 产品内容 */}
           <section>
             <h3 className="text-xs font-semibold uppercase tracking-wide text-ink-muted">产品内容</h3>
+            {(o.items ?? []).some((it) => it.kind === 'BUNDLE') && (
+              <div className="mt-2">
+                <BundleItineraryCard items={o.items ?? []} order={o} />
+              </div>
+            )}
             <ul className="mt-2 space-y-2 text-sm">
               {(o.items ?? []).map((it) => (
                 <OrderItemRow
@@ -1781,6 +1787,161 @@ function scheduleLabel(s: AdminSchedule): string {
   return `${dep} → ${arr}`;
 }
 
+// ── 套餐行程单卡片（订单详情「产品内容」板块，套餐订单专属，展示在原始金额行上方）────
+// 人类可读的行程摘要，方便运营截图发给地接/客人核对，而非逐行读金额。非套餐订单不渲染。
+
+/** M月D日（departureDate 为 YYYY-MM-DD） */
+function formatMonthDayZh(dateOnly: string): string {
+  const [, m, d] = dateOnly.split('-');
+  return `${Number(m)}月${Number(d)}日`;
+}
+
+/** IATA 代码 → 中文城市名；查不到原样返回代码（兜底，不阻断展示） */
+function cityNameFor(code: string): string {
+  return AIRPORTS[code]?.name ?? code;
+}
+
+/** route 形如 "MFM→DAD" → "澳门 → 岘港"（IATA 换成城市名，箭头前后各加空格） */
+function routeCityLabel(route: string): string {
+  const [from, to] = route.split('→');
+  if (!from || !to) return route;
+  return `${cityNameFor(from)} → ${cityNameFor(to)}`;
+}
+
+/** 出发日 + stayDays → 签证生效/失效预计日期（YYYY-MM-DD + N 天，简单加法，不处理时区/闰年之外的精度） */
+function addDaysToDateOnly(dateOnly: string, days: number): string {
+  const d = new Date(`${dateOnly}T00:00:00.000Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+function BundleItineraryCard({ items, order }: { items: OrderItem[]; order: OrderSummary }) {
+  const bundleLine = items.find((it) => it.kind === 'BUNDLE');
+  if (!bundleLine) return null;
+
+  // 同一套餐组：BUNDLE 行本身 + 携带同一 bundleId 的 FLIGHT/VISA/TRANSFER 行（关联行，服务端打的标）。
+  const bundleId = bundleLine.bundleId ?? null;
+  const group = bundleId ? items.filter((it) => it.bundleId === bundleId) : [bundleLine];
+  const flightLegs = group.filter((it) => it.kind === 'FLIGHT' && it.flightNumber);
+  const visaLine = group.find((it) => it.kind === 'VISA') ?? (bundleLine.visaName ? bundleLine : null);
+  const transferLine = group.find((it) => it.kind === 'TRANSFER') ?? (bundleLine.transferProductName ? bundleLine : null);
+
+  // 产品名称：套餐名 + 自动组合的组件摘要（如「往返机票+酒店+签证+接送机」，按实际存在的组件动态拼）。
+  const componentParts: string[] = [];
+  if (flightLegs.length > 0) componentParts.push('往返机票');
+  if (bundleLine.roomTypeName || bundleLine.hotelName) componentParts.push('酒店');
+  if (visaLine) componentParts.push('签证');
+  if (transferLine) componentParts.push('接送机');
+  const componentSummary = componentParts.length > 0 ? componentParts.join('+') : null;
+
+  const adultCount = order.adultCount ?? 0;
+  const childCount = order.childCount ?? 0;
+  const infantCount = order.infantCount ?? 0;
+
+  const nights = bundleLine.hotelCheckIn && bundleLine.hotelCheckOut
+    ? Math.round((new Date(bundleLine.hotelCheckOut).getTime() - new Date(bundleLine.hotelCheckIn).getTime()) / 86_400_000)
+    : null;
+  const rooms = bundleLine.roomsBilled ?? null;
+
+  // 签证生效/失效预计日期：去程出发日 + stayDays（都存在时才推算；标注「预计/以实际出签为准」）。
+  const outboundDate = flightLegs[0]?.departureDate ?? null;
+  const visaStayDays = visaLine?.visaStayDays ?? null;
+  const visaEffectiveDate = outboundDate && visaStayDays ? outboundDate : null;
+  const visaExpiryDate = outboundDate && visaStayDays ? addDaysToDateOnly(outboundDate, visaStayDays) : null;
+
+  const serviceNoteLines = (bundleLine.serviceNotes ?? '')
+    .split('\n')
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  return (
+    <div className="rounded-xl border border-brand-200 bg-brand-50/40 p-3 text-sm">
+      <div className="flex items-start justify-between gap-2">
+        <div>
+          <div className="font-semibold text-ink">
+            {bundleLine.bundleName ?? bundleLine.description}
+            {componentSummary && <span className="ml-1 font-normal text-ink-muted">· {componentSummary}</span>}
+          </div>
+          <div className="mt-0.5 text-xs text-ink-muted">
+            人数：成人 {adultCount} · 儿童 {childCount} · 婴儿 {infantCount}
+          </div>
+        </div>
+      </div>
+
+      <dl className="mt-2 space-y-1.5 text-xs text-ink-soft">
+        {flightLegs.length > 0 && (
+          <div>
+            <dt className="font-medium text-ink-muted">航班信息</dt>
+            <dd className="mt-0.5 space-y-0.5">
+              {flightLegs.map((leg) => (
+                <div key={leg.id}>
+                  {leg.departureDate && `${formatMonthDayZh(leg.departureDate)} `}
+                  {leg.route && routeCityLabel(leg.route)}
+                  {leg.flightNumber && ` ${leg.flightNumber}`}
+                  {leg.departureTime && leg.arrivalTime && ` ${leg.departureTime}-${leg.arrivalTime}`}
+                </div>
+              ))}
+            </dd>
+          </div>
+        )}
+        {flightLegs.length > 0 && (
+          <div>
+            <dt className="font-medium text-ink-muted">机票</dt>
+            <dd className="mt-0.5">
+              {CABIN_ZH[flightLegs[0].cabin ?? flightLegs[0].flightCabin ?? ''] ?? '经济舱'} × {adultCount + childCount}人
+            </dd>
+          </div>
+        )}
+        {(bundleLine.hotelName || bundleLine.roomTypeName) && (
+          <div>
+            <dt className="font-medium text-ink-muted">酒店</dt>
+            <dd className="mt-0.5">
+              {bundleLine.hotelName ?? ''}
+              {bundleLine.roomTypeName && ` ${bundleLine.roomTypeName}`}
+              {rooms != null && ` × ${rooms}间`}
+              {nights != null && nights > 0 && ` × ${nights}晚`}
+            </dd>
+          </div>
+        )}
+        {visaLine && (visaLine.visaName || bundleLine.description) && (
+          <div>
+            <dt className="font-medium text-ink-muted">签证</dt>
+            <dd className="mt-0.5">
+              {visaLine.visaName ?? '签证'}
+              {visaStayDays != null && `；最多可停留 ${visaStayDays} 天`}
+              {visaEffectiveDate && visaExpiryDate && (
+                <span className="ml-1 text-ink-muted">
+                  （签证生效日期(预计)={visaEffectiveDate}、失效日期(预计)={visaExpiryDate}，以实际出签为准）
+                </span>
+              )}
+            </dd>
+          </div>
+        )}
+        {transferLine && transferLine.transferProductName && (
+          <div>
+            <dt className="font-medium text-ink-muted">接送</dt>
+            <dd className="mt-0.5">
+              {transferLine.transferProductName} × {transferLine.quantity}
+            </dd>
+          </div>
+        )}
+        {serviceNoteLines.length > 0 && (
+          <div>
+            <dt className="font-medium text-ink-muted">服务内容</dt>
+            <dd className="mt-0.5">
+              <ul className="list-disc space-y-0.5 pl-4">
+                {serviceNoteLines.map((line, i) => (
+                  <li key={i}>{line}</li>
+                ))}
+              </ul>
+            </dd>
+          </div>
+        )}
+      </dl>
+    </div>
+  );
+}
+
 // ── 产品内容行：FLIGHT 项可「改期」（换班次/日期 + 改舱位 + 改期费）──────
 function OrderItemRow({
   orderId,
@@ -2167,6 +2328,11 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
                       换人/编辑
                     </button>
                   </div>
+                  <div className="mt-0.5 text-xs">
+                    {p.chineseName
+                      ? <span className="text-slate-700">{p.chineseName}</span>
+                      : <span className="text-slate-400">未录中文名</span>}
+                  </div>
                   <dl className="mt-1 grid grid-cols-2 gap-x-3 gap-y-0.5 text-[11px] text-slate-600">
                     <dt>护照号</dt><dd className="font-mono">{p.documentNumber ?? '—'}</dd>
                     <dt>出生日期</dt><dd className="font-mono">{p.dateOfBirth?.slice(0, 10) ?? '—'}</dd>
@@ -2228,6 +2394,7 @@ function PassengerEditForm({
   const [lastName, setLastName] = useState(passenger.lastName ?? '');
   const [firstName, setFirstName] = useState(passenger.firstName ?? '');
   const [fullName, setFullName] = useState(passenger.fullName ?? '');
+  const [chineseName, setChineseName] = useState(passenger.chineseName ?? '');
   const [documentNumber, setDocumentNumber] = useState(passenger.documentNumber ?? '');
   const [dob, setDob] = useState(passenger.dateOfBirth?.slice(0, 10) ?? '');
   const [gender, setGender] = useState<'M' | 'F' | 'X' | ''>(passenger.gender ?? '');
@@ -2256,6 +2423,7 @@ function PassengerEditForm({
         lastName: lastName.trim() || undefined,
         firstName: firstName.trim() || undefined,
         fullName: fullName.trim() || undefined,
+        chineseName: chineseName.trim() || undefined,
         documentNumber: documentNumber.trim() || undefined,
         dateOfBirth: dobValue,
         gender: gender || undefined,
@@ -2294,6 +2462,11 @@ function PassengerEditForm({
       <label className="block">
         <span className="text-slate-500">全名</span>
         <input className={inputCls} value={fullName} onChange={(e) => setFullName(e.target.value)} placeholder="如未拆姓/名可直接填全名" />
+      </label>
+
+      <label className="block">
+        <span className="text-slate-500">中文姓名（选填）</span>
+        <input className={inputCls} value={chineseName} onChange={(e) => setChineseName(e.target.value)} placeholder="如：庄宇" />
       </label>
 
       <label className="block">

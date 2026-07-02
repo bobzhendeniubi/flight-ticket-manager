@@ -17,6 +17,8 @@ export const createPaymentChannelSchema = z.object({
   note: z.string().max(2000).optional(),
   isActive: z.boolean().optional(),
   sortOrder: z.number().int().min(0).max(100000).optional(),
+  // 专属代理（部分代理有专用收款码）：不填 = 公司统一码，对所有人展示
+  agentId: z.string().min(1).optional(),
 });
 export type CreatePaymentChannelInput = z.infer<typeof createPaymentChannelSchema>;
 
@@ -29,6 +31,8 @@ export const updatePaymentChannelSchema = z
     note: z.string().max(2000).nullable().optional(),
     isActive: z.boolean().optional(),
     sortOrder: z.number().int().min(0).max(100000).optional(),
+    // 传 null = 改回公司统一码；传字符串 = 绑定到该代理
+    agentId: z.string().min(1).nullable().optional(),
   })
   .refine((v) => Object.keys(v).length > 0, { message: '无可更新字段' });
 export type UpdatePaymentChannelInput = z.infer<typeof updatePaymentChannelSchema>;

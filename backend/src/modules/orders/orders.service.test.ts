@@ -23,6 +23,11 @@ const { mockPrisma, mockComputeQuote, mockGetHotelNightlyRemaining } = vi.hoiste
     },
     passenger: {
       findMany: vi.fn(),
+      // findUnique/update/findUniqueOrThrow: 只有 swapPassenger 的换人测试用（其余既有测试不碰这几个
+      // 方法，新增不影响它们）。
+      findUnique: vi.fn(),
+      update: vi.fn(),
+      findUniqueOrThrow: vi.fn(),
     },
     user: {
       findUnique: vi.fn(),
@@ -36,10 +41,20 @@ const { mockPrisma, mockComputeQuote, mockGetHotelNightlyRemaining } = vi.hoiste
     bundle: {
       findUnique: vi.fn(),
     },
+    // swapPassenger 内部用 prisma.$transaction(async (tx) => {...})；tx 复用同一批 mock 方法
+    // （swapPassenger 事务体只碰 order/passenger/fulfillmentTask，这里按需最小补齐）。
+    fulfillmentTask: {
+      updateMany: vi.fn(),
+    },
+    $transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn(mockTx)),
   },
   mockComputeQuote: vi.fn(),
   mockGetHotelNightlyRemaining: vi.fn(),
 }));
+
+// tx 对象与 mockPrisma 共享同一批 vi.fn()（swapPassenger 事务内 tx.order/tx.passenger/tx.fulfillmentTask
+// 与事务外的 prisma.order/passenger 调用互不区分，测试只需断言最终调用记录）。
+const mockTx = mockPrisma;
 
 vi.mock('../../db/prisma.js', () => ({
   prisma: mockPrisma,
@@ -69,7 +84,11 @@ import {
   buildStayNightDates,
 } from './orders.service.js';
 import type { OrderItemInput } from './orders.schemas.js';
-import { batchCreateOrdersBodySchema, createOrderBodySchema } from './orders.schemas.js';
+import {
+  batchCreateOrdersBodySchema,
+  createOrderBodySchema,
+  swapPassengerBodySchema,
+} from './orders.schemas.js';
 
 // ── Fixture helper：build 一个完整的 fake order（serializeOrder 要的字段全有） ──
 const dec = (n: number) => ({ toString: () => String(n) });
@@ -1684,6 +1703,146 @@ describe('乘客护照签发地点 passportIssuePlace', () => {
     expect(result.passengers[0].passportIssuePlace).toBe('广东省广州市');
     // 与 ISO-2 颁发国是两个独立字段，各自透传
     expect(result.passengers[0].passportIssueCountry).toBe('CN');
+  });
+});
+
+// ── 0702 反馈 1：订单详情行程单（套餐订单「产品内容」板块）────────────────────
+// getOrder 联查 flightSchedule/bundle/visa/transfer/hotelRoomType 后，serializeOrder 应把渲染
+// 行程单所需字段（航班号/出发日期时间/到达时间/航线/舱位、套餐名/服务内容）附加到每条订单行上，
+// ADDITIVE，不改动既有 unitPrice/amount/hotelName 等字段的既有行为。
+describe('getOrder：套餐订单行程单渲染字段（ADDITIVE）', () => {
+  it('FLIGHT 行联查 flightSchedule → 透出 flightNumber/departureDate/departureTime/arrivalTime/route/cabin', async () => {
+    const service = new OrderService();
+    mockPrisma.order.findUnique.mockResolvedValue(
+      fakeFullOrder({
+        userId: 'someone-else',
+        items: [
+          {
+            id: 'itm-flight',
+            kind: 'FLIGHT',
+            description: '去程',
+            quantity: 2,
+            unitPrice: dec(2100),
+            amount: dec(4200),
+            flightCabin: 'ECONOMY',
+            bundleId: 'bdl1',
+            flightSchedule: {
+              departureTime: new Date('2026-07-11T08:40:00.000Z'),
+              arrivalTime: new Date('2026-07-11T09:35:00.000Z'),
+              flight: { flightNumber: 'QH9589', originCode: 'MFM', destinationCode: 'DAD' },
+            },
+          },
+        ],
+      }),
+    );
+    const result = await service.getOrder('ord1', { userId: 'admin1', role: 'ADMIN' });
+    const item = result.items[0];
+    expect(item.flightNumber).toBe('QH9589');
+    expect(item.departureDate).toBe('2026-07-11');
+    expect(item.departureTime).toBe('08:40');
+    expect(item.arrivalTime).toBe('09:35');
+    expect(item.route).toBe('MFM→DAD');
+    expect(item.cabin).toBe('ECONOMY');
+    // 既有字段（unitPrice/amount 的 Decimal→string 转换）不受影响
+    expect(item.unitPrice).toBe('2100');
+    expect(item.amount).toBe('4200');
+  });
+
+  it('BUNDLE 行联查 bundle → 透出 bundleName/serviceNotes；未联查关系时安全落 null', async () => {
+    const service = new OrderService();
+    mockPrisma.order.findUnique.mockResolvedValue(
+      fakeFullOrder({
+        userId: 'someone-else',
+        items: [
+          {
+            id: 'itm-bundle',
+            kind: 'BUNDLE',
+            description: '套餐',
+            quantity: 1,
+            unitPrice: dec(1378),
+            amount: dec(1378),
+            bundleId: 'bdl1',
+            bundle: {
+              name: '澳门-岘港 5 天 4 晚',
+              serviceNotes: '中文客服，越南当地机场助签\n举牌接机，送至酒店并协助分房',
+            },
+          },
+        ],
+      }),
+    );
+    const result = await service.getOrder('ord1', { userId: 'admin1', role: 'ADMIN' });
+    const item = result.items[0];
+    expect(item.bundleName).toBe('澳门-岘港 5 天 4 晚');
+    expect(item.serviceNotes).toBe('中文客服，越南当地机场助签\n举牌接机，送至酒店并协助分房');
+    // 该行没有联查 flightSchedule/visa/transfer/hotelRoomType → 对应字段安全落 null，不抛错
+    expect(item.flightNumber).toBeNull();
+    expect(item.visaName).toBeNull();
+    expect(item.transferProductName).toBeNull();
+    expect(item.roomTypeName).toBeNull();
+  });
+
+  it('order.passengers 按 passengerType 统计 → adultCount/childCount/infantCount', async () => {
+    const service = new OrderService();
+    mockPrisma.order.findUnique.mockResolvedValue(
+      fakeFullOrder({
+        userId: 'someone-else',
+        passengers: [
+          { id: 'p1', fullName: '张三', passengerType: 'ADULT' },
+          { id: 'p2', fullName: '李四', passengerType: 'ADULT' },
+          { id: 'p3', fullName: '张小明', passengerType: 'CHILD' },
+          { id: 'p4', fullName: '张小宝', passengerType: 'INFANT' },
+        ],
+      }),
+    );
+    const result = await service.getOrder('ord1', { userId: 'admin1', role: 'ADMIN' });
+    expect(result.adultCount).toBe(2);
+    expect(result.childCount).toBe(1);
+    expect(result.infantCount).toBe(1);
+  });
+});
+
+// ── 0702 反馈 2：换人/编辑接受中文姓名 chineseName ────────────────────────────
+describe('swapPassengerBodySchema · chineseName', () => {
+  it('受理 chineseName（与下单时 passengerInputSchema 同款 ≤120 字约束）', () => {
+    const parsed = swapPassengerBodySchema.parse({ chineseName: '庄宇' });
+    expect(parsed.chineseName).toBe('庄宇');
+  });
+
+  it('仅传 chineseName 不视为空 PATCH（不触发"至少一项变更"拒绝）', () => {
+    expect(() => swapPassengerBodySchema.parse({ chineseName: '庄宇' })).not.toThrow();
+  });
+
+  it('chineseName 超 120 字 → 拒绝', () => {
+    expect(() => swapPassengerBodySchema.parse({ chineseName: '庄'.repeat(121) })).toThrow();
+  });
+
+  it('swapPassenger 服务层：chineseName 传入时写入 Prisma.PassengerUpdateInput.chineseName', async () => {
+    const service = new OrderService();
+    mockPrisma.order.findUnique.mockResolvedValueOnce({ id: 'ord1', adjustmentCny: 0, adjustments: [] });
+    mockPrisma.passenger.findUnique.mockResolvedValueOnce({
+      id: 'px1',
+      orderId: 'ord1',
+      fullName: 'ZHUANG, YU',
+      documentNumber: 'E12345678',
+    });
+    mockPrisma.passenger.update.mockResolvedValueOnce({});
+    mockPrisma.passenger.findUniqueOrThrow.mockResolvedValueOnce({
+      fullName: 'ZHUANG, YU',
+      documentNumber: 'E12345678',
+    });
+    mockPrisma.order.findUniqueOrThrow.mockResolvedValueOnce(fakeFullOrder({ id: 'ord1' }));
+
+    await service.swapPassenger(
+      'ord1',
+      'px1',
+      { chineseName: '庄宇' },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    expect(mockPrisma.passenger.update).toHaveBeenCalledWith({
+      where: { id: 'px1' },
+      data: { chineseName: '庄宇' },
+    });
   });
 });
 

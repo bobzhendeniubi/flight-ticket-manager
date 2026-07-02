@@ -13,8 +13,11 @@ import {
   api,
   ApiError,
   PAYMENT_CHANNEL_KIND_LABEL,
-  type PaymentChannel,
+  type AgentListItem,
+  type CreatePaymentChannelWithAgentInput,
   type PaymentChannelKind,
+  type PaymentChannelWithAgent,
+  type UpdatePaymentChannelWithAgentInput,
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { NumberInput } from './NumberInput';
@@ -32,6 +35,8 @@ type ChannelDraft = {
   note: string;
   isActive: boolean;
   sortOrder: number | null;
+  // 专属代理（部分代理有专用收款码）：'' = 公司统一码，对所有人展示
+  agentId: string;
 };
 
 const EMPTY_DRAFT: ChannelDraft = {
@@ -42,9 +47,10 @@ const EMPTY_DRAFT: ChannelDraft = {
   note: '',
   isActive: true,
   sortOrder: 0,
+  agentId: '',
 };
 
-function channelToDraft(c: PaymentChannel): ChannelDraft {
+function channelToDraft(c: PaymentChannelWithAgent): ChannelDraft {
   return {
     kind: (KIND_OPTIONS.includes(c.kind as PaymentChannelKind) ? c.kind : 'BANK') as PaymentChannelKind,
     label: c.label,
@@ -53,6 +59,7 @@ function channelToDraft(c: PaymentChannel): ChannelDraft {
     note: c.note ?? '',
     isActive: c.isActive,
     sortOrder: c.sortOrder,
+    agentId: c.agentId ?? '',
   };
 }
 
@@ -60,7 +67,8 @@ export function PaymentChannelsManager() {
   const tokens = useAuth((s) => s.tokens);
   const token = tokens?.accessToken ?? '';
 
-  const [channels, setChannels] = useState<PaymentChannel[]>([]);
+  const [channels, setChannels] = useState<PaymentChannelWithAgent[]>([]);
+  const [agents, setAgents] = useState<AgentListItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
 
@@ -75,9 +83,11 @@ export function PaymentChannelsManager() {
     if (!token) return;
     setLoading(true);
     setErr(null);
-    api
-      .listPaymentChannels(token)
-      .then((r) => setChannels(r.channels))
+    Promise.all([api.listPaymentChannels(token), api.listAgents(token)])
+      .then(([channelsRes, agentsRes]) => {
+        setChannels(channelsRes.channels as PaymentChannelWithAgent[]);
+        setAgents(agentsRes.agents);
+      })
       .catch((e: unknown) => setErr(e instanceof ApiError ? e.message : '加载收款渠道失败'))
       .finally(() => setLoading(false));
   }
@@ -94,7 +104,7 @@ export function PaymentChannelsManager() {
     setFormErr(null);
   }
 
-  function startEdit(c: PaymentChannel) {
+  function startEdit(c: PaymentChannelWithAgent) {
     setEditing(c.id);
     setDraft(channelToDraft(c));
     setFormErr(null);
@@ -130,7 +140,9 @@ export function PaymentChannelsManager() {
     setSaving(true);
     try {
       if (editing === 'new') {
-        const r = await api.createPaymentChannel(token, {
+        // 显式标注扩展类型（含 agentId），绕开对象字面量直传时的多余属性检查——
+        // 不改 api.ts 中段既有的 CreatePaymentChannelInput（那里被另一并发改动同时编辑）。
+        const body: CreatePaymentChannelWithAgentInput = {
           kind: draft.kind,
           label,
           qrImageUrl: draft.qrImageUrl ?? undefined,
@@ -138,11 +150,13 @@ export function PaymentChannelsManager() {
           note: draft.note.trim() || undefined,
           isActive: draft.isActive,
           sortOrder: draft.sortOrder ?? 0,
-        });
-        setChannels((prev) => [...prev, r.channel]);
+          agentId: draft.agentId || undefined,
+        };
+        const r = await api.createPaymentChannel(token, body);
+        setChannels((prev) => [...prev, r.channel as PaymentChannelWithAgent]);
       } else if (editing) {
         // PATCH：可空字段传 null 清除
-        const r = await api.updatePaymentChannel(token, editing, {
+        const body: UpdatePaymentChannelWithAgentInput = {
           kind: draft.kind,
           label,
           qrImageUrl: draft.qrImageUrl ?? null,
@@ -150,8 +164,10 @@ export function PaymentChannelsManager() {
           note: draft.note.trim() || null,
           isActive: draft.isActive,
           sortOrder: draft.sortOrder ?? 0,
-        });
-        setChannels((prev) => prev.map((c) => (c.id === r.channel.id ? r.channel : c)));
+          agentId: draft.agentId || null,
+        };
+        const r = await api.updatePaymentChannel(token, editing, body);
+        setChannels((prev) => prev.map((c) => (c.id === r.channel.id ? (r.channel as PaymentChannelWithAgent) : c)));
       }
       cancelEdit();
     } catch (e: unknown) {
@@ -161,7 +177,7 @@ export function PaymentChannelsManager() {
     }
   }
 
-  async function remove(c: PaymentChannel) {
+  async function remove(c: PaymentChannelWithAgent) {
     if (!token || deletingId) return;
     if (!window.confirm(`确认删除收款渠道「${c.label}」？`)) return;
     setErr(null);
@@ -212,6 +228,7 @@ export function PaymentChannelsManager() {
           saving={saving}
           formErr={formErr}
           isNew={editing === 'new'}
+          agents={agents}
         />
       )}
 
@@ -225,6 +242,7 @@ export function PaymentChannelsManager() {
                 <th>名称</th>
                 <th>收款码</th>
                 <th>账号</th>
+                <th>绑定代理</th>
                 <th>状态</th>
                 <th className="text-right">操作</th>
               </tr>
@@ -232,14 +250,14 @@ export function PaymentChannelsManager() {
             <tbody>
               {loading && (
                 <tr>
-                  <td colSpan={7} className="py-6 text-center text-sm text-ink-muted">
+                  <td colSpan={8} className="py-6 text-center text-sm text-ink-muted">
                     加载中…
                   </td>
                 </tr>
               )}
               {!loading && sorted.length === 0 && (
                 <tr>
-                  <td colSpan={7} className="py-6 text-center text-sm text-ink-muted">
+                  <td colSpan={8} className="py-6 text-center text-sm text-ink-muted">
                     暂无收款渠道，点右上「+ 新增渠道」添加。
                   </td>
                 </tr>
@@ -269,6 +287,13 @@ export function PaymentChannelsManager() {
                     </td>
                     <td className="max-w-[220px] truncate text-ink-soft" title={c.accountText ?? ''}>
                       {c.accountText || '—'}
+                    </td>
+                    <td>
+                      {c.agentId ? (
+                        <span className="badge-info">{c.agentName ?? c.agentId}</span>
+                      ) : (
+                        <span className="text-xs text-ink-muted">公司统一码</span>
+                      )}
                     </td>
                     <td>
                       {c.isActive ? (
@@ -316,6 +341,7 @@ function ChannelForm({
   saving,
   formErr,
   isNew,
+  agents,
 }: {
   draft: ChannelDraft;
   setDraft: React.Dispatch<React.SetStateAction<ChannelDraft>>;
@@ -325,6 +351,7 @@ function ChannelForm({
   saving: boolean;
   formErr: string | null;
   isNew: boolean;
+  agents: AgentListItem[];
 }) {
   return (
     <div className="card space-y-3 border-brand-200 bg-brand-50/40">
@@ -361,6 +388,23 @@ function ChannelForm({
             placeholder="如：公司微信收款 / 对公账户"
             maxLength={120}
           />
+        </label>
+
+        <label className="block sm:col-span-2">
+          <span className="label">绑定代理（选填）</span>
+          <select
+            className="input"
+            value={draft.agentId}
+            onChange={(e) => setDraft((d) => ({ ...d, agentId: e.target.value }))}
+          >
+            <option value="">不绑定（公司统一码，对所有人展示）</option>
+            {agents.map((a) => (
+              <option key={a.id} value={a.id}>
+                {a.companyName || a.contactName}
+              </option>
+            ))}
+          </select>
+          <p className="mt-1 text-xs text-ink-muted">部分代理有专用收款码；绑定后仅该代理在认款页看到此码，不会对外公开展示。</p>
         </label>
 
         <label className="block sm:col-span-2">

@@ -207,7 +207,7 @@ model Agent {
   companyName       String?
   contactName       String
   contactPhone      String
-  prepaymentBalance Decimal        @default(0) @db.Decimal(14, 2) // CNY, can be negative only by admin override
+  prepaymentBalance Decimal        @default(0) @db.Decimal(14, 2) // CNY；不允许为负（不许赊账——扣减路径一律先校验余额，欠款走「认款→到账→再抵」）
   // 结算模式：PER_ORDER（默认，逐单见钱）/ MONTHLY（月结代理，单张订单挂账不催款，月底统一对账）
   settlementMode    SettlementMode @default(PER_ORDER)
   isActive          Boolean        @default(true)
@@ -222,6 +222,8 @@ model Agent {
   parentAgent            Agent?                  @relation("AgentHierarchy", fields: [parentAgentId], references: [id])
   childAgents            Agent[]                 @relation("AgentHierarchy")
   prepaymentTransactions PrepaymentTransaction[]
+  rechargeRequests       AgentRechargeRequest[]
+  paymentChannels        PaymentChannel[]
   commissionRules        CommissionRule[]
   commissionRecords      CommissionRecord[]
   settlements            Settlement[]
@@ -255,6 +257,43 @@ model PrepaymentTransaction {
 
   @@index([agentId, createdAt])
   @@index([orderId])
+}
+
+// 代理认款（充值申请）状态。
+enum AgentRechargeStatus {
+  PENDING // 待财务审核
+  CONFIRMED // 已确认到账（已生成 TOP_UP 预存流水并加余额）
+  REJECTED // 已驳回（不入账）
+}
+
+// 代理认款通道：代理上传付款凭证 + 申报金额 → 财务核实到账后确认 →
+// 原子生成 PrepaymentTransaction(TOP_UP) 并加 prepaymentBalance。
+// 余额只能这样充进来，不许赊账（prepaymentBalance 永不为负）；
+// 订单尾款用「代理余额抵」从余额扣，凭证与订单不再逐张配对（多单混付由余额池消化）。
+model AgentRechargeRequest {
+  id                 String              @id @default(cuid())
+  agentId            String
+  // 代理申报金额（CNY）
+  amountCny          Decimal             @db.Decimal(14, 2)
+  // 财务核实的实际到账金额（确认时可修正；NULL = 按申报金额入账）
+  confirmedAmountCny Decimal?            @db.Decimal(14, 2)
+  // 付款凭证截图（data URL；张数/单张大小由服务端校验，受全局 bodyLimit 约束）
+  proofImages        String[]
+  note               String? // 代理备注（如「7/1 两笔货款合并」）
+  status             AgentRechargeStatus @default(PENDING)
+  reviewNote         String? // 财务审核备注 / 驳回原因
+  submittedByUserId  String // 提交人 user id（代理账号）
+  reviewedByUserId   String? // 审核人 user id（财务/管理员）
+  reviewedAt         DateTime?
+  // 确认入账生成的预存流水 id（幂等锚点：一张认款单最多入账一次）
+  prepaymentTxId     String?             @unique
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+
+  agent Agent @relation(fields: [agentId], references: [id], onDelete: Cascade)
+
+  @@index([status, createdAt])
+  @@index([agentId, createdAt])
 }
 
 enum ProductKind {
@@ -684,6 +723,7 @@ model Visa {
   // 使馆/代办成本（CNY）— NULL 时按 basePrice × 0.55 估算（签证毛利通常更高）
   costPriceCny       Decimal? @db.Decimal(10, 2)
   validityMonths     Int? // 签证有效期（月）
+  stayDays           Int? // 单次入境最多可停留天数（订单详情「最多可停留 X 天」展示用）
   highlight          String? // "最热销 · 全流程线上"
   requiredDocs       String[] // e.g., ["passport_scan", "photo", "itinerary"]
   soldCount          Int      @default(0) // 已售份数（展示用，seed 填充）
@@ -703,6 +743,9 @@ model Bundle {
   code           String?  @unique
   name           String
   tagline        String?
+  // 服务内容（订单详情 / 前台展示的服务说明，运营在套餐向导里填，每行一条，
+  // 如「中文客服，越南当地机场助签」「举牌接机，送至酒店并协助分房」）
+  serviceNotes   String?  @db.Text
   emoji          String?
   photo          String?
   // 套餐组件列表（JSON）: [{kind: 'HOTEL', productName, qty, unitPrice}, ...]
@@ -1155,12 +1198,17 @@ model PaymentChannel {
   qrImageUrl  String?  @db.Text // 收款码图片（data URL，≤6MB）
   accountText String?  @db.Text // 账户信息文本（开户行/账号/户名等）
   note        String?  @db.Text // 备注（如「请备注订单号」）
+  // 专属代理（部分代理有专用收款二维码；NULL = 公司统一码，对所有人展示）
+  agentId     String?
   isActive    Boolean  @default(true)
   sortOrder   Int      @default(0)
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
+  agent Agent? @relation(fields: [agentId], references: [id], onDelete: SetNull)
+
   @@index([isActive, sortOrder])
+  @@index([agentId])
 }
 
 // 进账（挂账池）状态。

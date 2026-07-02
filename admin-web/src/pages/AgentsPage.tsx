@@ -2,6 +2,7 @@
  * 代理管理 — 支持树形/表格切换、多维过滤、佣金设置、创建散客。
  */
 import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { api, ApiError, SETTLEMENT_MODE_LABEL, type AgentListItem, type CreateChildAgentInput, type CustomerSummary, type SettlementMode } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { NumberInput } from '../components/NumberInput';
@@ -560,9 +561,12 @@ function BalanceTab({ agent }: { agent: AgentListItem }) {
         </div>
       </div>
 
-      <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2.5 text-sm text-amber-800">
-        余额调整暂未开通，请走线下对账；充值/扣款上线后将在此处提供并写入审计日志。
+      <div className="rounded-md border border-brand-200 bg-brand-50 px-3 py-2.5 text-sm text-ink-soft">
+        认款审核（确认到账 / 驳回）与线下对账手动调整已迁移到「余额与认款」页，避免功能重复。
       </div>
+      <Link to="/agent-balance" className="btn-primary inline-flex text-sm">
+        前往「余额与认款」
+      </Link>
     </div>
   );
 }

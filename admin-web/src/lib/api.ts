@@ -463,10 +463,44 @@ export interface OrderItem {
   hotelCheckOut: string | null;
   transferId: string | null;
   visaId: string | null;
+  /** 该行所属套餐 id（BUNDLE 行本身 + 其关联的 FLIGHT 腿都会带同一个 bundleId）；非套餐订单为 null */
+  bundleId?: string | null;
+  /** 计费房间数（支持 0.5 间拼房）；未联查/未盖章为 null */
+  roomsBilled?: number | null;
   metadata: unknown;
   createdAt: string;
   // 列表带出的履约任务（仅 type+status），用于派生「签证状态」「出票状态」
   fulfillmentTasks?: Array<{ type: string; status: FulfillmentStatus }>;
+
+  // ── 行程单渲染字段（ADDITIVE；getOrder 联查后附加，未联查对应关系时为 null）──
+  /** FLIGHT 行：航班号 */
+  flightNumber?: string | null;
+  /** FLIGHT 行：出发日期（YYYY-MM-DD） */
+  departureDate?: string | null;
+  /** FLIGHT 行：出发时间（HH:MM） */
+  departureTime?: string | null;
+  /** FLIGHT 行：到达时间（HH:MM） */
+  arrivalTime?: string | null;
+  /** FLIGHT 行：航线，如「MFM→DAD」 */
+  route?: string | null;
+  /** FLIGHT 行：舱位（与 flightCabin 同值，行程单展示用别名） */
+  cabin?: CabinClass | null;
+  /** HOTEL 行 / BUNDLE 行盖章酒店：房型名（区别于 hotelName 酒店名） */
+  roomTypeName?: string | null;
+  /** HOTEL 行 / BUNDLE 行盖章酒店：酒店中文名 */
+  hotelName?: string | null;
+  /** VISA 行（独立提交时）：签证名称 */
+  visaName?: string | null;
+  /** VISA 行：签证目的国 */
+  visaCountry?: string | null;
+  /** VISA 行：单次入境最多可停留天数 */
+  visaStayDays?: number | null;
+  /** TRANSFER 行（独立提交时）：接送产品名称 */
+  transferProductName?: string | null;
+  /** BUNDLE 行：套餐名 */
+  bundleName?: string | null;
+  /** BUNDLE 行：服务内容（每行一条，运营在套餐向导里填） */
+  serviceNotes?: string | null;
 }
 
 export interface OrderPassenger {
@@ -484,6 +518,8 @@ export interface OrderPassenger {
   passengerType?: PassengerType;
 
   // 护照扩展
+  /** 中文姓名（OCR 识别或手工填写） */
+  chineseName?: string | null;
   passportIssueCountry?: string | null;
   /** 护照签发地点（自由文本，城市/机关；区别于 ISO-2 签发国） */
   passportIssuePlace?: string | null;
@@ -622,6 +658,11 @@ export interface OrderSummary {
   // Decimal 在 JSON 里是 string；null 表示未设置
   expectedAmountCny?: string | null;
   expectedAmountLocked?: boolean;
+
+  // 出行人数（按 Passenger.passengerType 统计；套餐订单详情行程单「人数」板块用）
+  adultCount?: number;
+  childCount?: number;
+  infantCount?: number;
 }
 
 /** listOrders 查询参数（与 backend listOrdersQuerySchema 对齐） */
@@ -886,6 +927,8 @@ export interface Visa {
   basePrice: string;
   expressSurcharge: string | null;
   validityMonths: number | null;
+  /** 单次入境最多可停留天数（订单详情行程单「最多可停留 X 天」展示 + 推算生效/失效日期用）；未设置为 null */
+  stayDays: number | null;
   highlight: string | null;
   requiredDocs: string[];
   isActive: boolean;
@@ -926,6 +969,8 @@ export interface BundleFlightRef {
 export interface BundleWriteBody {
   name?: string;
   tagline?: string | null;
+  /** 服务内容（订单详情行程单「服务内容」板块；每行一条，选填） */
+  serviceNotes?: string | null;
   emoji?: string | null;
   items?: BundleItemData[];
   flightPax?: number;
@@ -955,6 +1000,8 @@ export interface Bundle {
   code: string | null;
   name: string;
   tagline: string | null;
+  /** 服务内容（订单详情行程单「服务内容」板块；每行一条，运营在向导里填；未设置为 null） */
+  serviceNotes: string | null;
   emoji: string | null;
   photo: string | null;
   items: BundleItemData[];
@@ -1658,6 +1705,8 @@ export const api = {
       lastName?: string;
       firstName?: string;
       fullName?: string;
+      /** 中文姓名（选填；下单时已支持，此处补录/编辑用同一字段） */
+      chineseName?: string;
       documentNumber?: string;
       dateOfBirth?: string;
       gender?: 'M' | 'F' | 'X';
@@ -2483,3 +2532,143 @@ export interface AiOcrConfigInput {
   model?: string;
   enabled?: boolean;
 }
+
+// ── 代理认款 / 收款码绑代理 ──────────────────────────────────────────────
+// 与 backend agent-recharges 模块对齐（AgentRechargesService 序列化形态）+
+// payment-channels 模块新增的 agentId/agentName 字段（专属代理收款码）。
+// 独立导出（不塞进上面 `api` 对象），避免与并发编辑该文件中段的改动冲突；
+// 调用方按 `agentRechargeApi.xxx(token, ...)` 使用，风格与 `api.xxx(token, ...)` 一致。
+
+/** 代理认款状态：待审核 / 已确认到账 / 已驳回 */
+export type AgentRechargeStatus = 'PENDING' | 'CONFIRMED' | 'REJECTED';
+
+export const AGENT_RECHARGE_STATUS_LABEL: Record<AgentRechargeStatus, string> = {
+  PENDING: '待审核',
+  CONFIRMED: '已确认',
+  REJECTED: '已驳回',
+};
+
+/** 认款申请（serializeRechargeRequest；金额 Decimal→string） */
+export interface AgentRechargeRequest {
+  id: string;
+  agentId: string;
+  /** 列表接口附带展示用（公司名优先，否则联系人名）；提交接口的回包可能没有这个字段 */
+  agentName?: string;
+  amountCny: string;
+  confirmedAmountCny: string | null;
+  proofImages: string[];
+  note: string | null;
+  status: AgentRechargeStatus;
+  reviewNote: string | null;
+  submittedByUserId: string;
+  reviewedByUserId: string | null;
+  reviewedAt: string | null;
+  prepaymentTxId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** POST /agent-recharges body */
+export interface CreateAgentRechargeInput {
+  /** ADMIN/STAFF 代提交时必填；AGENT 自己提交时忽略（服务端按登录身份解析） */
+  agentId?: string;
+  amountCny: number;
+  note?: string;
+  /** 1-3 张，data:image/...;base64（前端上传前先压缩） */
+  proofImages: string[];
+}
+
+/** GET /agent-recharges 查询参数 */
+export interface ListAgentRechargesParams {
+  status?: AgentRechargeStatus;
+  /** 仅 ADMIN/STAFF 生效；AGENT 传了也会被服务端忽略/校验 */
+  agentId?: string;
+  page?: number;
+  pageSize?: number;
+}
+
+/** PATCH /agent-recharges/:id/confirm body */
+export interface ConfirmAgentRechargeInput {
+  /** 缺省 = 按申报金额（amountCny）全额入账 */
+  confirmedAmountCny?: number;
+  reviewNote?: string;
+}
+
+/** PATCH /agent-recharges/:id/reject body */
+export interface RejectAgentRechargeInput {
+  reviewNote: string;
+}
+
+/** POST /agent-recharges/manual-adjust body（线下对账修正用） */
+export interface ManualBalanceAdjustmentInput {
+  agentId: string;
+  /** 正数 = 加余额，负数 = 扣余额（扣减后不得为负，由服务端校验） */
+  amount: number;
+  reason: string;
+}
+
+/** GET /agent-recharges/my-channels 响应（AGENT 专用：应付款到哪个渠道） */
+export interface MyPaymentChannelsResult {
+  channels: PaymentChannel[];
+  /** DEDICATED = 该代理的专属收款码；COMPANY = 退回公司统一码（无专属码时） */
+  source: 'DEDICATED' | 'COMPANY';
+}
+
+/**
+ * PaymentChannel 的扩展形态：补上 payment-channels 模块新增的 agentId/agentName
+ * （不改原 `PaymentChannel` 接口——那是本文件中段的既有导出，另一并发改动可能同时在改）。
+ */
+export type PaymentChannelWithAgent = PaymentChannel & {
+  agentId: string | null;
+  agentName: string | null;
+};
+
+/** CreatePaymentChannelInput / UpdatePaymentChannelInput 的 agentId 扩展（同上，独立叠加不改原类型）。 */
+export type CreatePaymentChannelWithAgentInput = CreatePaymentChannelInput & { agentId?: string };
+export type UpdatePaymentChannelWithAgentInput = UpdatePaymentChannelInput & { agentId?: string | null };
+
+export const agentRechargeApi = {
+  /** 提交认款申请（AGENT 为自己；ADMIN/STAFF 需在 body 里指定 agentId） */
+  createAgentRecharge: (token: string, body: CreateAgentRechargeInput) =>
+    apiFetch<{ request: AgentRechargeRequest }>('/agent-recharges', { method: 'POST', token, body }),
+
+  /** 列表：ADMIN/STAFF 全部可见（可过滤）；AGENT 仅自己 + 下级 */
+  listAgentRecharges: (token: string, params?: ListAgentRechargesParams) => {
+    const qs = new URLSearchParams();
+    if (params?.status) qs.set('status', params.status);
+    if (params?.agentId) qs.set('agentId', params.agentId);
+    if (params?.page) qs.set('page', String(params.page));
+    if (params?.pageSize) qs.set('pageSize', String(params.pageSize));
+    const suffix = qs.toString() ? `?${qs.toString()}` : '';
+    return apiFetch<{
+      requests: AgentRechargeRequest[];
+      pagination: { page: number; pageSize: number; total: number };
+    }>(`/agent-recharges${suffix}`, { token });
+  },
+
+  /** AGENT 专用：查询应付款到哪个收款渠道（专属码优先，否则公司码） */
+  myPaymentChannels: (token: string) =>
+    apiFetch<MyPaymentChannelsResult>('/agent-recharges/my-channels', { token }),
+
+  /** 确认到账（ADMIN/STAFF） */
+  confirmAgentRecharge: (token: string, id: string, body: ConfirmAgentRechargeInput) =>
+    apiFetch<{ request: AgentRechargeRequest; agentBalanceAfter: number }>(
+      `/agent-recharges/${id}/confirm`,
+      { method: 'PATCH', token, body },
+    ),
+
+  /** 驳回（ADMIN/STAFF，reviewNote 必填） */
+  rejectAgentRecharge: (token: string, id: string, body: RejectAgentRechargeInput) =>
+    apiFetch<{ request: AgentRechargeRequest }>(`/agent-recharges/${id}/reject`, {
+      method: 'PATCH',
+      token,
+      body,
+    }),
+
+  /** 手动调整代理余额（ADMIN/STAFF，线下对账修正；负向调整不能击穿 0） */
+  manualAdjustAgentBalance: (token: string, body: ManualBalanceAdjustmentInput) =>
+    apiFetch<{ ok: true; agentId: string; amount: number; balanceAfter: number; transactionId: string }>(
+      '/agent-recharges/manual-adjust',
+      { method: 'POST', token, body },
+    ),
+};

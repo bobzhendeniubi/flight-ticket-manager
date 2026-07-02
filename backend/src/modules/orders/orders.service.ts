@@ -1084,10 +1084,29 @@ export class OrderService {
     const order = await prisma.order.findUnique({
       where: { id },
       include: {
-        // 联查酒店中文名（HOTEL 行 或 BUNDLE 行盖章的 hotelRoomTypeId 均可命中）：
-        // 套餐订单没有独立的 HOTEL 行，酒店只盖章在 BUNDLE 行的 hotelRoomTypeId 上，
-        // 这里联查出真实酒店名供 serializeOrder 落到 item.hotelName（分房弹窗/详情页据此取名）。
-        items: { include: { hotelRoomType: { select: { hotel: { select: { name: true } } } } } },
+        // 联查行程单渲染所需的产品信息（套餐订单「产品内容」板块用；不新增客户端往返）：
+        //   hotelRoomType → 房型名 + 酒店中文名（HOTEL 行 或 BUNDLE 行盖章的 hotelRoomTypeId 均可命中；
+        //     套餐订单没有独立的 HOTEL 行，酒店只盖章在 BUNDLE 行的 hotelRoomTypeId 上）。
+        //   flightSchedule → 出发/到达时间 + 航班号/起降地（FLIGHT 行、含套餐关联的经济舱腿）。
+        //   visa → 签证名/国家/单次最多停留天数（VISA 行 或 套餐通过 items JSON 描述，行本身仅在
+        //     客户端提交独立 VISA 行时才带 visaId；套餐纯地面签证组件走 bundle.items 文本描述，见 serializeOrder）。
+        //   transfer → 接送产品名。
+        //   bundle → 套餐名 + 服务内容（BUNDLE 行）。
+        items: {
+          include: {
+            hotelRoomType: { select: { name: true, hotel: { select: { name: true } } } },
+            flightSchedule: {
+              select: {
+                departureTime: true,
+                arrivalTime: true,
+                flight: { select: { flightNumber: true, originCode: true, destinationCode: true } },
+              },
+            },
+            visa: { select: { visaName: true, country: true, destinationCountry: true, stayDays: true } },
+            transfer: { select: { name: true } },
+            bundle: { select: { name: true, serviceNotes: true } },
+          },
+        },
         passengers: true, // 含护照/签证/地址全部新字段
         payments: true,
         refunds: true,
@@ -2582,6 +2601,7 @@ export class OrderService {
       lastName?: string;
       firstName?: string;
       fullName?: string;
+      chineseName?: string;
       documentNumber?: string;
       dateOfBirth?: string;
       gender?: import('@prisma/client').Gender;
@@ -2643,6 +2663,7 @@ export class OrderService {
       }
       if (input.lastName !== undefined) data.lastName = input.lastName;
       if (input.firstName !== undefined) data.firstName = input.firstName;
+      if (input.chineseName !== undefined) data.chineseName = input.chineseName;
       if (input.documentNumber !== undefined) data.documentNumber = input.documentNumber;
       if (input.dateOfBirth !== undefined) data.dateOfBirth = new Date(input.dateOfBirth);
       if (input.gender !== undefined) data.gender = input.gender;
@@ -3429,6 +3450,82 @@ interface OrderLike {
   items: Array<{ unitPrice: Prisma.Decimal; amount: Prisma.Decimal } & Record<string, unknown>>;
   // 可选嵌套代理（含余额 Decimal + 结算模式）；不同 include 下可能不带或带 null
   agent?: ({ prepaymentBalance?: Prisma.Decimal | null } & Record<string, unknown>) | null;
+  // 出行人（用于套餐行程单「人数」——按 passengerType 计数；不同 include 下 select 形状不同，
+  // 如 listOrders 只 select id/fullName，无 passengerType 字段，故用 Record<string, unknown> 兜底，
+  // 与本接口 items/agent 的处理方式一致）。
+  passengers?: Array<Record<string, unknown>>;
+}
+
+/** M月D日（本地展示用；departureDate 等按 UTC 零点解析的 date-only 字段沿用同一口径）。 */
+function formatMonthDay(d: Date): string {
+  return `${d.getUTCMonth() + 1}月${d.getUTCDate()}日`;
+}
+
+/** HH:MM（24 小时制，UTC 分量——与本仓库其余处按 UTC 存取时间的口径一致）。 */
+function formatHHMM(d: Date): string {
+  return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
+}
+
+/** YYYY-MM-DD（date-only）。 */
+function formatDateOnly(d: Date): string {
+  return d.toISOString().slice(0, 10);
+}
+
+/** Prisma.Decimal | null | undefined → number | null（JSON 序列化前统一转换，未联查/未盖章时安全落 null）。 */
+function decimalOrNull(d: Prisma.Decimal | null | undefined): number | null {
+  return d == null ? null : Number(d);
+}
+
+/**
+ * 单条订单行的行程单渲染字段（套餐订单详情「产品内容」板块用；ADDITIVE，不改/不删既有字段）。
+ * FLIGHT 行 → 航班号/出发日期时间/到达时间/航线/舱位（来自 flightSchedule include）；
+ * BUNDLE 行 → 套餐名/服务内容（来自 bundle include）；
+ * 三者关联的 VISA/TRANSFER 独立行（客户端提交时才会有）→ 签证/接送产品名称。
+ * 未联查对应关系时（如 listOrders 用扁平 items:true）安全落 null，不强行断言非空。
+ */
+function itineraryFieldsForItem(i: Record<string, unknown>): Record<string, unknown> {
+  const flightSchedule = i.flightSchedule as
+    | {
+        departureTime?: Date | string;
+        arrivalTime?: Date | string;
+        flight?: { flightNumber?: string; originCode?: string; destinationCode?: string } | null;
+      }
+    | null
+    | undefined;
+  const hotelRoomType = i.hotelRoomType as { name?: string | null } | null | undefined;
+  const visa = i.visa as
+    | { visaName?: string | null; country?: string | null; destinationCountry?: string | null; stayDays?: number | null }
+    | null
+    | undefined;
+  const transfer = i.transfer as { name?: string | null } | null | undefined;
+  const bundle = i.bundle as { name?: string | null; serviceNotes?: string | null } | null | undefined;
+
+  const departureTime = flightSchedule?.departureTime ? new Date(flightSchedule.departureTime) : null;
+  const arrivalTime = flightSchedule?.arrivalTime ? new Date(flightSchedule.arrivalTime) : null;
+
+  return {
+    // ── FLIGHT 行（含套餐关联的经济舱腿）──
+    flightNumber: flightSchedule?.flight?.flightNumber ?? null,
+    departureDate: departureTime ? formatDateOnly(departureTime) : null,
+    departureTime: departureTime ? formatHHMM(departureTime) : null,
+    arrivalTime: arrivalTime ? formatHHMM(arrivalTime) : null,
+    route:
+      flightSchedule?.flight?.originCode && flightSchedule?.flight?.destinationCode
+        ? `${flightSchedule.flight.originCode}→${flightSchedule.flight.destinationCode}`
+        : null,
+    cabin: (i.flightCabin as string | null | undefined) ?? null,
+    // ── HOTEL 行 / BUNDLE 行盖章的酒店房型 ──
+    roomTypeName: hotelRoomType?.name ?? null,
+    // ── VISA 行（独立提交时）──
+    visaName: visa?.visaName ?? null,
+    visaCountry: visa?.country ?? visa?.destinationCountry ?? null,
+    visaStayDays: visa?.stayDays ?? null,
+    // ── TRANSFER 行（独立提交时）──
+    transferProductName: transfer?.name ?? null,
+    // ── BUNDLE 行 ──
+    bundleName: bundle?.name ?? null,
+    serviceNotes: bundle?.serviceNotes ?? null,
+  };
 }
 
 /** 金额保留 2 位小数（CNY，避免浮点累计误差）。 */
@@ -3452,6 +3549,13 @@ function serializeOrder<T extends OrderLike>(order: T) {
   const paidNum = Number(order.paidAmount.toString());
   const effectivePayable = round2(totalNum + adjustmentCny);
   const balanceDue = round2(effectivePayable - paidNum);
+  // 按 passengerType 统计人数（订单详情行程单「人数」板块用；未 include passengers/无 passengerType
+  // 字段时安全落 0，不强行断言——如 listOrders 的 passengers select 只带 id/fullName）。
+  const passengerTypeOf = (p: Record<string, unknown>): string =>
+    (p.passengerType as string | null | undefined) ?? 'ADULT';
+  const adultCount = order.passengers?.filter((p) => passengerTypeOf(p) === 'ADULT').length ?? 0;
+  const childCount = order.passengers?.filter((p) => passengerTypeOf(p) === 'CHILD').length ?? 0;
+  const infantCount = order.passengers?.filter((p) => passengerTypeOf(p) === 'INFANT').length ?? 0;
   return {
     ...order,
     subtotal: order.subtotal.toString(),
@@ -3464,6 +3568,10 @@ function serializeOrder<T extends OrderLike>(order: T) {
     adjustmentCny,
     effectivePayable: effectivePayable.toString(),
     balanceDue: balanceDue.toString(),
+    // 出行人数（按 Passenger.passengerType 统计；套餐行程单「人数：成人 X · 儿童 X · 婴儿 X」用）
+    adultCount,
+    childCount,
+    infantCount,
     // 暴露代理结算模式 + 余额（前端据 settlementMode=MONTHLY 把订单显示成「月结」而非「欠款」）
     agent:
       order.agent == null
@@ -3485,6 +3593,10 @@ function serializeOrder<T extends OrderLike>(order: T) {
       hotelName:
         (i as { hotelRoomType?: { hotel?: { name?: string | null } | null } | null }).hotelRoomType
           ?.hotel?.name ?? null,
+      // 计费房间数（Decimal → number；未联查/未盖章时为 null，原样透出不强行转换）。
+      roomsBilled: decimalOrNull((i as { roomsBilled?: Prisma.Decimal | null }).roomsBilled),
+      // 行程单渲染字段（ADDITIVE；见 itineraryFieldsForItem 注释——未联查对应关系时安全落 null）。
+      ...itineraryFieldsForItem(i),
     })),
   };
 }

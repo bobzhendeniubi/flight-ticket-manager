@@ -408,6 +408,8 @@ export const swapPassengerBodySchema = z
     lastName: z.string().max(120).optional(),
     firstName: z.string().max(120).optional(),
     fullName: z.string().max(120).optional(),
+    // 中文姓名（护照扩展字段；下单时已支持，此处补录/编辑用同一约束）
+    chineseName: z.string().max(120).optional(),
     documentNumber: z.string().max(60).optional(),
     dateOfBirth: z.string().optional(), // ISO 日期字符串
     gender: z.nativeEnum(Gender).optional(),
@@ -424,6 +426,7 @@ export const swapPassengerBodySchema = z
       b.lastName !== undefined ||
       b.firstName !== undefined ||
       b.fullName !== undefined ||
+      b.chineseName !== undefined ||
       b.documentNumber !== undefined ||
       b.dateOfBirth !== undefined ||
       b.gender !== undefined ||
