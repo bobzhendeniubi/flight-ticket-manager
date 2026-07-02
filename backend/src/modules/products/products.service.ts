@@ -46,13 +46,14 @@ export function deriveHotelNightsFromItems(items: unknown): number | undefined {
 /**
  * 套餐组件价格权威定价（写入前的服务端 authoritative 定价，钱路径关键函数）：
  *   FLIGHT   → unitPrice 恒为 0（客户选出发日后由 /flights/price 实时定价，不在此定价）。
- *   HOTEL    → 套餐关联了房型（hotelRoomTypeId） → 用 HotelRoomType.basePrice 覆盖
+ *   HOTEL    → 套餐必须关联房型（hotelRoomTypeId），用 HotelRoomType.basePrice 覆盖
  *              （与 orders.service 对 HOTEL 行的权威取价口径一致，绝不信任 items JSON 里手填的值）；
- *              未关联房型（老套餐/尚未选房型）→ 保留调用方传入的 unitPrice（无产品可溯源，找不到权威价）。
+ *              未关联房型 → 400。旧版曾对「未关联」静默放行、保留调用方乱填的 unitPrice —— 这正是
+ *              向导里「酒店行 ¥0 但看起来价格正常」陷阱的根因（起价漏算酒店却不报错），现改为硬拒绝。
  *   TRANSFER → 必须带 transferId，按其查 Transfer.basePrice 覆盖；查无此产品 → 404。
  *   VISA     → 必须带 visaId，按其查 Visa.basePrice 覆盖；查无此产品 → 404。
  *
- * 客户端传的 unitPrice 在 HOTEL（已关联房型时）/TRANSFER/VISA 上永远被服务端权威值覆盖 ——
+ * 客户端传的 unitPrice 在 HOTEL/TRANSFER/VISA 上永远被服务端权威值覆盖 ——
  * 运营在后台唯一能动的定价杠杆是 discountPct + 目标价（换算折扣%）与升级加价项，价格本身不可手改。
  * 返回新数组（不可变，不修改入参）。
  */
@@ -60,6 +61,11 @@ export async function resolveBundleItemPrices(
   items: ReadonlyArray<BundleItemInput>,
   hotelRoomTypeId: string | null | undefined,
 ): Promise<BundleItemInput[]> {
+  // 套餐含酒店组件时必须关联房型：没有房型就没有权威取价源，起价公式会静默漏算酒店那一项。
+  // 在发任何查询前先拦，给出干净的 400，而非放行后让 HOTEL 行的 unitPrice 停留在调用方乱填的值。
+  if (!hotelRoomTypeId && items.some((i) => i.kind === 'HOTEL')) {
+    throw new BadRequestError('套餐含酒店组件时必须关联房型');
+  }
   // 先滤掉 undefined 再去重：TRANSFER/VISA 行缺 id 是校验错误（下面逐行 400），
   // 不该先为它发一次 findMany({where:{id:{in:[undefined]}}})（Prisma 会报错，且语义上没有查询意义）。
   const transferIds = [
@@ -96,7 +102,9 @@ export async function resolveBundleItemPrices(
   return items.map((item) => {
     if (item.kind === 'FLIGHT') return { ...item, unitPrice: 0 };
     if (item.kind === 'HOTEL') {
-      // 未关联房型：无产品可溯源，保留调用方原值（老套餐兼容）。
+      // 走到这里 hotelRoomTypeId 必已存在（上面已拦未关联的情况）；
+      // hotelRoomType 为 null 仅当调用方在此函数之外跳过了 assertHotelRoomTypeExists 校验
+      // （正常两条写路径都会先校验），防御性保留原值而非抛错崩溃整个请求。
       return hotelRoomType ? { ...item, unitPrice: Number(hotelRoomType.basePrice) } : item;
     }
     if (item.kind === 'TRANSFER') {

@@ -110,13 +110,31 @@ describe('resolveBundleItemPrices · 套餐组件价格服务端权威定价', (
     });
   });
 
-  it('HOTEL 未关联房型（老套餐兼容）→ 保留调用方原值，不强行覆盖', async () => {
-    const [out] = await resolveBundleItemPrices(
-      [item({ kind: 'HOTEL', unitPrice: 580 })],
+  it('HOTEL 未关联房型 → 抛 400（套餐含酒店组件时必须关联房型，防止起价静默漏算酒店）', async () => {
+    await expect(
+      resolveBundleItemPrices([item({ kind: 'HOTEL', unitPrice: 580 })], null),
+    ).rejects.toThrow('套餐含酒店组件时必须关联房型');
+    expect(mockPrisma.hotelRoomType.findUnique).not.toHaveBeenCalled();
+  });
+
+  it('HOTEL 未关联房型 + hotelRoomTypeId=undefined（省略）→ 同样抛 400', async () => {
+    await expect(
+      resolveBundleItemPrices([item({ kind: 'HOTEL', unitPrice: 580 })], undefined),
+    ).rejects.toThrow('套餐含酒店组件时必须关联房型');
+  });
+
+  it('无 HOTEL 组件 + 未关联房型 → 不受影响，正常定价（如纯机票+接送套餐）', async () => {
+    mockPrisma.transfer.findMany.mockResolvedValueOnce([
+      { id: 't1', basePrice: new Prisma.Decimal(188) },
+    ]);
+    const out = await resolveBundleItemPrices(
+      [
+        item({ kind: 'FLIGHT', unitPrice: 0 }),
+        item({ kind: 'TRANSFER', unitPrice: 1, transferId: 't1' }),
+      ],
       null,
     );
-    expect(out.unitPrice).toBe(580);
-    expect(mockPrisma.hotelRoomType.findUnique).not.toHaveBeenCalled();
+    expect(out.map((i) => i.unitPrice)).toEqual([0, 188]);
   });
 
   it('TRANSFER 带 transferId → unitPrice 覆盖为 Transfer.basePrice（忽略调用方手填的值）', async () => {
@@ -384,5 +402,109 @@ describe('ProductsService · serviceNotes / stayDays 写入 + 序列化往返', 
       where: { id: 'visa-1' },
       data: { stayDays: 45 },
     });
+  });
+});
+
+describe('ProductsService · 套餐含酒店组件必须关联房型（create + update 路径）', () => {
+  // 复现向导截图里的陷阱：酒店行没关联房型 → 服务端曾静默保留调用方乱填的 unitPrice，
+  // 起价漏算酒店（¥0）却看起来是正常价格。现在两条写路径都必须在写库前硬拒绝。
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockPrisma.flightSeatClass.findMany.mockResolvedValue([]);
+  });
+
+  const hotelItem = { kind: 'FLIGHT' as const, productName: '澳门⇌岘港', qty: 1, unitPrice: 0 };
+  const hotelOnly = { kind: 'HOTEL' as const, productName: '海景大床房', qty: 3, unitPrice: 999 };
+
+  it('createBundle：items 含 HOTEL 但未传 hotelRoomTypeId → 抛 400，且不写库', async () => {
+    const service = new ProductsService();
+    await expect(
+      service.createBundle({
+        name: '未关联房型套餐',
+        items: [hotelItem, hotelOnly],
+        flightPax: 2,
+        discountPct: 0,
+        groundDiscount: 0,
+        isActive: true,
+      }),
+    ).rejects.toThrow('套餐含酒店组件时必须关联房型');
+    expect(mockPrisma.bundle.create).not.toHaveBeenCalled();
+  });
+
+  it('createBundle：items 含 HOTEL 且 hotelRoomTypeId 显式传 null → 同样抛 400', async () => {
+    const service = new ProductsService();
+    await expect(
+      service.createBundle({
+        name: '未关联房型套餐',
+        items: [hotelItem, hotelOnly],
+        flightPax: 2,
+        discountPct: 0,
+        groundDiscount: 0,
+        isActive: true,
+        hotelRoomTypeId: null,
+      }),
+    ).rejects.toThrow('套餐含酒店组件时必须关联房型');
+  });
+
+  it('updateBundle：改 items 加入 HOTEL 行，既有套餐 + 本次请求都没有 hotelRoomTypeId → 抛 400，且不写库', async () => {
+    mockPrisma.bundle.findUnique.mockResolvedValueOnce({
+      id: 'bundle-1',
+      hotelRoomTypeId: null,
+      outboundFlightId: null,
+      returnFlightId: null,
+    });
+    const service = new ProductsService();
+    await expect(
+      service.updateBundle('bundle-1', { items: [hotelItem, hotelOnly] }),
+    ).rejects.toThrow('套餐含酒店组件时必须关联房型');
+    expect(mockPrisma.bundle.update).not.toHaveBeenCalled();
+  });
+
+  it('updateBundle：既有套餐已关联房型，本次只改别的字段（不传 items）→ 不受影响，正常保存', async () => {
+    mockPrisma.bundle.findUnique.mockResolvedValueOnce({
+      id: 'bundle-1',
+      hotelRoomTypeId: 'room-1',
+      outboundFlightId: null,
+      returnFlightId: null,
+    });
+    mockPrisma.bundle.update.mockImplementationOnce(async ({ data }: { data: Record<string, unknown> }) => ({
+      id: 'bundle-1',
+      code: 'B0001',
+      name: '关联房型套餐',
+      tagline: data.tagline ?? null,
+      serviceNotes: null,
+      emoji: null,
+      photo: null,
+      items: [hotelOnly],
+      flightPax: 2,
+      discountPct: 0,
+      groundDiscount: new Prisma.Decimal(0),
+      suitableFor: null,
+      hotelRoomTypeId: 'room-1',
+      hotelNights: 3,
+      outboundFlightId: null,
+      returnFlightId: null,
+      singleSupplementCnyPerNight: 80,
+      businessUpgradeCnyPerLeg: 700,
+      childSeatDiscountCnyPerPerson: 30,
+      infantPriceCny: 0,
+      selfVisaDeductCny: 0,
+      legs: 2,
+      blackoutDates: [],
+      defaultDepartDate: null,
+      soldCount: 0,
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      hotelRoomType: null,
+      outboundFlight: null,
+      returnFlight: null,
+    }));
+
+    const service = new ProductsService();
+    const result = await service.updateBundle('bundle-1', { tagline: '新文案' });
+
+    expect(result.tagline).toBe('新文案');
+    expect(mockPrisma.bundle.update).toHaveBeenCalled();
   });
 });
