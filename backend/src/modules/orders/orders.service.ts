@@ -1084,7 +1084,10 @@ export class OrderService {
     const order = await prisma.order.findUnique({
       where: { id },
       include: {
-        items: true,
+        // 联查酒店中文名（HOTEL 行 或 BUNDLE 行盖章的 hotelRoomTypeId 均可命中）：
+        // 套餐订单没有独立的 HOTEL 行，酒店只盖章在 BUNDLE 行的 hotelRoomTypeId 上，
+        // 这里联查出真实酒店名供 serializeOrder 落到 item.hotelName（分房弹窗/详情页据此取名）。
+        items: { include: { hotelRoomType: { select: { hotel: { select: { name: true } } } } } },
         passengers: true, // 含护照/签证/地址全部新字段
         payments: true,
         refunds: true,
@@ -3476,6 +3479,12 @@ function serializeOrder<T extends OrderLike>(order: T) {
       ...i,
       unitPrice: i.unitPrice.toString(),
       amount: i.amount.toString(),
+      // 权威酒店中文名：HOTEL 行或 BUNDLE 行（盖章 hotelRoomTypeId）联查 hotelRoomType.hotel.name 均可命中。
+      // 不是所有调用方的 items include 都联查了 hotelRoomType（如 listOrders 用 items: true）——
+      // 这里用可选链读取，未联查时安全落 null，不强行断言非空。
+      hotelName:
+        (i as { hotelRoomType?: { hotel?: { name?: string | null } | null } | null }).hotelRoomType
+          ?.hotel?.name ?? null,
     })),
   };
 }

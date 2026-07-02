@@ -860,13 +860,22 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       }));
   }, [createdOrder]);
 
-  // 分房页要显示的酒店信息：从订单 HOTEL 行取酒店名 + 房型/入住/退房（供查房量档位）。
-  // 套餐订单的 HOTEL 行由服务端盖章带出 hotelRoomTypeId/hotelCheckIn/hotelCheckOut。
-  // description 形如「酒店名 · 房型 · 入住~退房 · N晚 × M间」，取 ' · ' 前段作酒店名。
+  // 分房页要显示的酒店信息：套餐（BUNDLE）订单没有独立 HOTEL 行——酒店由服务端盖章在
+  // BUNDLE 行的 hotelRoomTypeId/hotelCheckIn/hotelCheckOut 上，酒店中文名则落在
+  // item.hotelName（后端联查 hotelRoomType.hotel.name，任意 kind 命中即可，不再局限于 HOTEL 行）。
+  // description 形如「酒店名 · 房型 · 入住~退房 · N晚 × M间」，取 ' · ' 前段作 hotelName 兜底。
   const roomingHotel = useMemo(() => {
-    const hotelItem = createdOrder?.items?.find((it) => it.kind === 'HOTEL');
+    const items = (createdOrder?.items ?? []) as Array<{
+      kind?: string;
+      description: string;
+      hotelName?: string | null;
+      hotelRoomTypeId?: string;
+      hotelCheckIn?: string;
+      hotelCheckOut?: string;
+    }>;
+    const hotelItem = items.find((it) => it.hotelName || it.kind === 'HOTEL');
     if (!hotelItem) return null;
-    const hotelName = hotelItem.description.split(' · ')[0]?.trim() || '';
+    const hotelName = hotelItem.hotelName?.trim() || hotelItem.description.split(' · ')[0]?.trim() || '';
     return {
       hotelName,
       hotelRoomTypeId: hotelItem.hotelRoomTypeId,

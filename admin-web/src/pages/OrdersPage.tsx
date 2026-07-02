@@ -1110,9 +1110,14 @@ export function OrdersPage() {
 }
 
 // ── 酒店 / 分房派生（详情「酒店情况」+ 应分房未分房判定，与房控页同口径）──────
-// 订单要显示的酒店中文名。优先取 HOTEL 行 description（形如「酒店名 · 房型 · …」，取 ' · ' 前段），
-// 回退到已存分房组里带的 hotelName；都取不到返回 null。
+// 订单要显示的酒店中文名。优先取后端联查落的 item.hotelName（HOTEL 行或 BUNDLE 行盖章的
+// hotelRoomTypeId 均可命中，套餐订单没有独立 HOTEL 行时也能取到），
+// 回退到 HOTEL 行 description（形如「酒店名 · 房型 · …」，取 ' · ' 前段），
+// 再回退到已存分房组里带的 hotelName；都取不到返回 null。
 function hotelNameFromOrder(order: OrderSummary): string | null {
+  const items = (order.items ?? []) as Array<{ hotelName?: string | null; kind?: string; description?: string }>;
+  const fromHotelName = items.find((it) => it.hotelName)?.hotelName?.trim();
+  if (fromHotelName) return fromHotelName;
   const hotelItem = order.items?.find((it) => it.kind === 'HOTEL');
   const fromItem = hotelItem?.description.split(' · ')[0]?.trim();
   if (fromItem) return fromItem;

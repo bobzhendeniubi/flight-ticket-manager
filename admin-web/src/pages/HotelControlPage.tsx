@@ -303,12 +303,17 @@ export function HotelControlPage() {
 // ── 订单分房（按订单号查 → 拖拽分房）────────────────────────────────────────
 /**
  * 订单要显示的酒店中文名。
- * 优先取订单 HOTEL 行：description 形如「酒店名 · 房型 · 入住~退房 · N晚 × M间」，取 ' · ' 前段。
- * 回退到已存分房组里带的 hotelName（老订单可能只在分房表里留了酒店名）。
+ * 优先取后端联查落的 item.hotelName（HOTEL 行或 BUNDLE 行盖章的 hotelRoomTypeId 均可命中，
+ * 套餐订单没有独立 HOTEL 行时也能取到——否则套餐订单的分房弹窗酒店头会是空的）。
+ * 回退到订单 HOTEL 行：description 形如「酒店名 · 房型 · 入住~退房 · N晚 × M间」，取 ' · ' 前段。
+ * 再回退到已存分房组里带的 hotelName（老订单可能只在分房表里留了酒店名）。
  * 都取不到返回 undefined（分房编辑器优雅降级为不显示酒店头）。
  */
 function hotelNameFromOrder(order: OrderSummary | null): string | undefined {
   if (!order) return undefined;
+  const items = (order.items ?? []) as Array<{ hotelName?: string | null; kind?: string; description?: string }>;
+  const fromHotelName = items.find((it) => it.hotelName)?.hotelName?.trim();
+  if (fromHotelName) return fromHotelName;
   const hotelItem = order.items?.find((it) => it.kind === 'HOTEL');
   const fromItem = hotelItem?.description.split(' · ')[0]?.trim();
   if (fromItem) return fromItem;
