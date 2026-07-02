@@ -445,7 +445,9 @@ export function ProductsPage() {
           hotelRoomTypeId: n.hotelRoomTypeId ?? null,
           hotelNights: persistedHotelNights(n),
           singleSupplementCnyPerNight: n.singleSupplementCnyPerNight ?? null,
-          businessUpgradeCnyPerLeg: n.businessUpgradeCnyPerLeg ?? null,
+          // 留空 = 0/不提供（0702 反馈）：不能发 null——更新路径把 null 当「不改」，
+          // 存量 700 会清不掉（编辑态的「留空=不提供」就成了谎言）。
+          businessUpgradeCnyPerLeg: n.businessUpgradeCnyPerLeg ?? 0,
           childSeatDiscountCnyPerPerson: n.childSeatDiscountCnyPerPerson ?? null,
           selfVisaDeductCny: n.selfVisaDeductCny ?? null,
           infantPriceCny: n.infantPriceCny ?? null,
@@ -471,7 +473,9 @@ export function ProductsPage() {
             hotelRoomTypeId: n.hotelRoomTypeId ?? null,
             hotelNights: persistedHotelNights(n),
             singleSupplementCnyPerNight: n.singleSupplementCnyPerNight ?? null,
-            businessUpgradeCnyPerLeg: n.businessUpgradeCnyPerLeg ?? null,
+            // 留空 = 0/不提供（0702 反馈）：不能发 null——更新路径把 null 当「不改」，
+          // 存量 700 会清不掉（编辑态的「留空=不提供」就成了谎言）。
+          businessUpgradeCnyPerLeg: n.businessUpgradeCnyPerLeg ?? 0,
             childSeatDiscountCnyPerPerson: n.childSeatDiscountCnyPerPerson ?? null,
             selfVisaDeductCny: n.selfVisaDeductCny ?? null,
             infantPriceCny: n.infantPriceCny ?? null,
