@@ -33,25 +33,25 @@ export function TravelersPage() {
   const [nationalityFilter, setNationalityFilter] = useState('');
   const [ageRange, setAgeRange] = useState<'' | 'child' | 'adult' | 'senior'>('');
   const [selected, setSelected] = useState<MockTraveler | null>(null);
+  const [reloadNonce, setReloadNonce] = useState(0);
 
   useEffect(() => {
     if (!tokens?.accessToken) return;
     let cancelled = false;
     setLoading(true);
+    setError(null);
     api.listTravelers(tokens.accessToken, { pageSize: 500 })
       .then((r) => { if (!cancelled) setTravelers(r.travelers.map(travelerApiToMock)); })
       .catch((e) => { if (!cancelled) setError(e instanceof ApiError ? e.message : '加载失败'); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, [tokens?.accessToken]);
+  }, [tokens?.accessToken, reloadNonce]);
 
   const nationalities = useMemo(() => {
     const set = new Set<string>();
     travelers.forEach((t) => set.add(t.nationality));
     return Array.from(set).sort();
   }, [travelers]);
-
-  void loading; void error;
 
   const today = new Date();
   const calcAge = (dob: string): number => {
@@ -78,7 +78,7 @@ export function TravelersPage() {
       }
       return true;
     });
-  }, [nameQuery, birthdayQuery, nationalityFilter, ageRange]);
+  }, [travelers, nameQuery, birthdayQuery, nationalityFilter, ageRange]);
 
   const kpi = useMemo(() => {
     const ages = travelers.map((t) => calcAge(t.dateOfBirth));
@@ -89,7 +89,7 @@ export function TravelersPage() {
       seniors: ages.filter((a) => a >= 60).length,
       totalTrips: travelers.reduce((s, t) => s + t.tripCount, 0),
     };
-  }, []);
+  }, [travelers]);
 
   const handleExport = () => {
     exportToCSV('旅客名单', filtered, [
@@ -117,6 +117,13 @@ export function TravelersPage() {
         </div>
         <button className="btn-secondary" onClick={handleExport}>📥 导出 CSV</button>
       </section>
+
+      {error && (
+        <section className="card border border-red-200 bg-red-50 flex items-center justify-between gap-3">
+          <p className="text-sm text-red-700">加载旅客数据失败：{error}</p>
+          <button className="btn-secondary text-sm" onClick={() => setReloadNonce((n) => n + 1)}>重试</button>
+        </section>
+      )}
 
       {/* KPI */}
       <section className="grid gap-3 md:grid-cols-4">
@@ -223,14 +230,27 @@ export function TravelersPage() {
                 );
               })}
               {filtered.length === 0 && (
-                <tr><td colSpan={8} className="px-4 py-8 text-center text-ink-muted">没有符合条件的旅客</td></tr>
+                <tr>
+                  <td colSpan={8} className="px-4 py-8 text-center text-ink-muted">
+                    {loading ? '加载中…' : '没有符合条件的旅客'}
+                  </td>
+                </tr>
               )}
             </tbody>
           </table>
         </div>
       </section>
 
-      {selected && <TravelerDrawer traveler={selected} onClose={() => setSelected(null)} />}
+      {selected && (
+        <TravelerDrawer
+          traveler={selected}
+          onClose={() => setSelected(null)}
+          onSaved={(updated) => {
+            setTravelers((prev) => prev.map((t) => (t.id === updated.id ? updated : t)));
+            setSelected(updated);
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -245,7 +265,16 @@ function Kpi({ label, value, sub }: { label: string; value: string; sub: string 
   );
 }
 
-function TravelerDrawer({ traveler, onClose }: { traveler: MockTraveler; onClose: () => void }) {
+function TravelerDrawer({
+  traveler,
+  onClose,
+  onSaved,
+}: {
+  traveler: MockTraveler;
+  onClose: () => void;
+  onSaved: (updated: MockTraveler) => void;
+}) {
+  const tokens = useAuth((s) => s.tokens);
   const [editing, setEditing] = useState(false);
   const [form, setForm] = useState({
     fullName: traveler.fullName,
@@ -256,6 +285,31 @@ function TravelerDrawer({ traveler, onClose }: { traveler: MockTraveler; onClose
     notes: traveler.notes ?? '',
   });
   const [saved, setSaved] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  const save = async () => {
+    if (!tokens?.accessToken) return;
+    setSaving(true);
+    setSaveError(null);
+    try {
+      const res = await api.updateTraveler(tokens.accessToken, traveler.id, {
+        fullName: form.fullName,
+        documentNumber: form.passportNumber,
+        dateOfBirth: form.dateOfBirth,
+        nationality: form.nationality,
+        phone: form.phone || undefined,
+        notes: form.notes || undefined,
+      });
+      onSaved(travelerApiToMock(res.traveler));
+      setSaved(true);
+      setTimeout(() => { setEditing(false); setSaved(false); }, 1200);
+    } catch (e) {
+      setSaveError(e instanceof ApiError ? e.message : '保存失败，请重试');
+    } finally {
+      setSaving(false);
+    }
+  };
 
   // customerIds 仍保留（后端适配时会填 1 个 user id），UI 展示"已关联 N 位客户"即可
   const customers = traveler.customerIds.map((id) => ({ id, name: '客户 #' + id.slice(0, 8) }));
@@ -313,11 +367,6 @@ function TravelerDrawer({ traveler, onClose }: { traveler: MockTraveler; onClose
                   <p className="text-sm text-slate-700">{traveler.notes}</p>
                 </section>
               )}
-              <section className="pt-3 border-t border-slate-200">
-                <button className="btn-secondary w-full text-sm" onClick={() => alert('跳转订单列表 (demo) - 真环境过滤 passengerId=' + traveler.id)}>
-                  查看该旅客所有行程 →
-                </button>
-              </section>
             </>
           ) : (
             <>
@@ -357,11 +406,14 @@ function TravelerDrawer({ traveler, onClose }: { traveler: MockTraveler; onClose
               </section>
 
               {saved && (
-                <div className="rounded bg-green-50 px-3 py-2 text-sm text-green-700">✅ 已保存（demo，真环境 PUT /travelers/:id）</div>
+                <div className="rounded bg-green-50 px-3 py-2 text-sm text-green-700">已保存</div>
+              )}
+              {saveError && (
+                <div className="rounded bg-red-50 px-3 py-2 text-sm text-red-700">{saveError}</div>
               )}
               <section className="pt-3 border-t border-slate-200 flex gap-3">
-                <button className="btn-secondary flex-1" onClick={() => setEditing(false)}>取消</button>
-                <button className="btn-primary flex-1" onClick={() => { setSaved(true); setTimeout(() => { setEditing(false); setSaved(false); }, 1500); }}>保存修改</button>
+                <button className="btn-secondary flex-1" onClick={() => setEditing(false)} disabled={saving}>取消</button>
+                <button className="btn-primary flex-1" onClick={save} disabled={saving}>{saving ? '保存中…' : '保存修改'}</button>
               </section>
             </>
           )}

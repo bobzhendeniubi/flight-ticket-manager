@@ -52,7 +52,11 @@ export async function buildApp(): Promise<FastifyInstance> {
     },
     genReqId: (req) => (req.headers['x-request-id'] as string | undefined) ?? randomUUID(),
     disableRequestLogging: false,
-    trustProxy: true,
+    // 只信任离我们最近的一跳反代（nginx）注入的 X-Forwarded-For；跳数必须与实际反代拓扑一致，
+    // 否则 req.ip 可能仍取到客户端可伪造的值。此前是 `true`（信任整条 XFF 链），
+    // 客户端随便追加一段自定义 XFF 就能让 req.ip 跟着变，从而绕过所有按 IP 限流
+    // （登录爆破、订单号枚举）。若未来在 nginx 前再加一层反代/CDN，这里要同步改成对应跳数。
+    trustProxy: 1,
   });
 
   // Core plugins
@@ -66,7 +70,9 @@ export async function buildApp(): Promise<FastifyInstance> {
     max: 100,
     timeWindow: '1 minute',
     redis,
-    keyGenerator: (req) => `${req.ip}:${req.url}`,
+    // 按路由模式（而非完整 URL）分桶：req.url 带 query string，之前用 req.url 会导致
+    // 每个不同的 query 值（如 ?orderNumber=xxx）都落到不同的桶，等于绕过了限流。
+    keyGenerator: (req) => `${req.ip}:${req.routeOptions?.url ?? req.url}`,
   });
 
   // Auth decorators

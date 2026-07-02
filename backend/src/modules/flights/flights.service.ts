@@ -1,4 +1,11 @@
-import { AuditSeverity, AuditTargetType, CabinClass, Prisma, SeatLockStatus } from '@prisma/client';
+import {
+  AuditSeverity,
+  AuditTargetType,
+  CabinClass,
+  Prisma,
+  SeatLockStatus,
+  WaitlistStatus,
+} from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { BadRequestError, ConflictError, NotFoundError } from '../../lib/errors.js';
 import { writeAudit } from '../../lib/audit.js';
@@ -614,7 +621,12 @@ export class FlightService {
   /**
    * 删除班次（路由层限 ADMIN）。
    * 有销售则禁删 —— 任一舱位已售 sold>0，或已有订单项关联本班次，一律 400 拒绝
-   * （提示改用「售罄」即停用，保留历史数据）。无销售才硬删（级联清掉舱位 / 仓位阶梯）。
+   * （提示改用「售罄」即停用，保留历史数据）。
+   * 同理：本班次若有生效中的锁位（SeatLock ACTIVE）或候补（SeatWaitlist ACTIVE），
+   * 也禁删 —— 这两张表都是 onDelete: Cascade 挂在 FlightSchedule 上，硬删班次会
+   * 把这些生效记录一并静默清空（用户占的位/候补资格无声消失）。
+   * 无销售、无生效锁位/候补才硬删（级联清掉舱位 / 仓位阶梯）。
+   * TODO 切位（SeatAllocation）落地后一并纳入删除守卫
    */
   async deleteSchedule(scheduleId: string) {
     const schedule = await prisma.flightSchedule.findUnique({
@@ -622,6 +634,12 @@ export class FlightService {
       include: {
         orderItems: { take: 1 },
         seatClasses: { select: { sold: true } },
+        seatLocks: { where: { status: SeatLockStatus.ACTIVE }, select: { id: true }, take: 1 },
+        seatWaitlists: {
+          where: { status: WaitlistStatus.ACTIVE },
+          select: { id: true },
+          take: 1,
+        },
       },
     });
     if (!schedule) throw new NotFoundError('班次不存在');
@@ -631,8 +649,11 @@ export class FlightService {
     if (hasSold || hasOrders) {
       throw new BadRequestError('该班次已有销售，不能删除（请改用售罄）');
     }
+    if (schedule.seatLocks.length > 0 || schedule.seatWaitlists.length > 0) {
+      throw new BadRequestError('该班次有生效中的锁位/候补，暂不能删除');
+    }
 
-    // 无销售：硬删（onDelete: Cascade 自动清掉 seatClasses 及其 fareBuckets）
+    // 无销售、无生效锁位/候补：硬删（onDelete: Cascade 自动清掉 seatClasses 及其 fareBuckets）
     await prisma.flightSchedule.delete({ where: { id: scheduleId } });
     return { id: scheduleId, deleted: true };
   }
@@ -641,10 +662,11 @@ export class FlightService {
    * 批量删除班次（路由层限 ADMIN/STAFF）。
    * 场景：一天两班、整月排期，运营想按出发日区间删掉其中某档班次，又不想逐个点。
    * 出发日区间 [from, to]（出发地当地 UTC+8 日，闭区间）内选出班次；flightId 省略=全部航班。
-   * 每个班次沿用 deleteSchedule 同口径的"有销售则禁删"守卫（任一舱位 sold>0，或有订单项关联）：
-   *   命中守卫 → 跳过（不删），记入 skipped；否则硬删（级联清掉舱位 / 仓位阶梯）。
+   * 每个班次沿用 deleteSchedule 同口径的"有销售则禁删"守卫（任一舱位 sold>0，或有订单项关联，
+   * 或有生效中的锁位/候补）：命中守卫 → 跳过（不删），记入 skipped；否则硬删（级联清掉舱位 / 仓位阶梯）。
    * 事务内一次删掉本批可删项，保证要么全部落库、要么整体回滚（已跳过项不参与删除，天然安全）。
    * 删除成功后写审计（删除数 + 已删/跳过的 scheduleId），批量删的爆炸半径大，必须留痕可追溯。
+   * TODO 切位（SeatAllocation）落地后一并纳入删除守卫
    */
   async batchDeleteSchedules(
     body: { flightId?: string; from: string; to: string },
@@ -669,17 +691,26 @@ export class FlightService {
       include: {
         orderItems: { take: 1 },
         seatClasses: { select: { sold: true } },
+        seatLocks: { where: { status: SeatLockStatus.ACTIVE }, select: { id: true }, take: 1 },
+        seatWaitlists: {
+          where: { status: WaitlistStatus.ACTIVE },
+          select: { id: true },
+          take: 1,
+        },
       },
     });
 
-    // 先分流：哪些可删、哪些因已售跳过（沿用单删守卫口径）。
+    // 先分流：哪些可删、哪些因已售/有生效锁位或候补跳过（沿用单删守卫口径）。
     const deletableIds: string[] = [];
     const skipped: Array<{ scheduleId: string; reason: string }> = [];
     for (const s of schedules) {
       const hasSold = s.seatClasses.some((c) => c.sold > 0);
       const hasOrders = s.orderItems.length > 0;
+      const hasActiveLockOrWaitlist = s.seatLocks.length > 0 || s.seatWaitlists.length > 0;
       if (hasSold || hasOrders) {
         skipped.push({ scheduleId: s.id, reason: '已售' });
+      } else if (hasActiveLockOrWaitlist) {
+        skipped.push({ scheduleId: s.id, reason: '有生效中的锁位/候补' });
       } else {
         deletableIds.push(s.id);
       }

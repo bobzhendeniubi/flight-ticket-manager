@@ -27,6 +27,7 @@ import {
 import { prisma } from '../../db/prisma.js';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
 import { computeCancellationQuote } from '../../lib/cancellation.js';
+import { BadRequestError } from '../../lib/errors.js';
 import { buildPnrWorkbook, pnrExportFilename } from './pnr-export.js';
 import { buildPassportPhotoZip, passportZipFilename } from './passport-zip.js';
 import { buildOrdersBySchedule, ordersExportFilename } from './orders.export.js';
@@ -194,7 +195,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   app.post(
     '/roster/parse',
     { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
-    async (req, reply) => {
+    async (req) => {
       const body = z
         .object({ fileBase64: z.string().min(1, 'fileBase64 必填') })
         .parse(req.body);
@@ -203,7 +204,9 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         result = await parseRosterXlsx(body.fileBase64);
       } catch {
         // 文件损坏 / 非 xlsx → 400（解析内部的单格错误已被吞成 warning，不会走到这里）
-        return reply.status(400).send({ error: '名单文件无法解析，请确认为有效的 .xlsx 文件' });
+        // 走全局错误处理器，返回和其他接口一致的 {error:{code,message}} 结构，
+        // 之前这里直接 reply.send({error:string}) 会被后台前端的 error.message 取值方式吞掉。
+        throw new BadRequestError('名单文件无法解析，请确认为有效的 .xlsx 文件');
       }
       void writeAudit({
         actor: actorFromRequest(req),

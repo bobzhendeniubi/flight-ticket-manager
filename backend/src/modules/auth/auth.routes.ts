@@ -30,13 +30,20 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
     return reply.status(201).send(result);
   });
 
-  app.post('/login', async (req) => {
-    const body = loginBodySchema.parse(req.body);
-    return service.login(body, {
-      userAgent: req.headers['user-agent'],
-      ipAddress: req.ip,
-    });
-  });
+  app.post(
+    '/login',
+    {
+      // 覆盖全局限流：登录口更严（~8 req/min/IP），防暴力破解密码。
+      config: { rateLimit: { max: 8, timeWindow: '1 minute' } },
+    },
+    async (req) => {
+      const body = loginBodySchema.parse(req.body);
+      return service.login(body, {
+        userAgent: req.headers['user-agent'],
+        ipAddress: req.ip,
+      });
+    },
+  );
 
   app.post('/refresh', async (req) => {
     const body = refreshBodySchema.parse(req.body);

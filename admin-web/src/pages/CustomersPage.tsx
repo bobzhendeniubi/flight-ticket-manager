@@ -35,17 +35,19 @@ export function CustomersPage() {
   const [agentFilter, setAgentFilter] = useState<string>('');
   const [tagFilter, setTagFilter] = useState<string>('');
   const [selected, setSelected] = useState<MockCustomer | null>(null);
+  const [reloadNonce, setReloadNonce] = useState(0);
 
   useEffect(() => {
     if (!tokens?.accessToken) return;
     let cancelled = false;
     setLoading(true);
+    setError(null);
     api.listCustomers(tokens.accessToken, { pageSize: 200 })
       .then((r) => { if (!cancelled) setCustomers(r.customers.map(customerApiToMock)); })
       .catch((e) => { if (!cancelled) setError(e instanceof ApiError ? e.message : '加载失败'); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, [tokens?.accessToken]);
+  }, [tokens?.accessToken, reloadNonce]);
 
   const agentNames = useMemo(() => {
     const set = new Set<string>();
@@ -81,8 +83,6 @@ export function CustomersPage() {
     vip: customers.filter((c) => c.tags.includes('VIP')).length,
   }), [customers]);
 
-  void loading; void error;
-
   const handleExport = () => {
     exportToCSV('散客名单', filtered, [
       { key: 'name', label: '姓名' },
@@ -108,6 +108,13 @@ export function CustomersPage() {
         </div>
         <button className="btn-secondary" onClick={handleExport}>📥 导出 CSV</button>
       </section>
+
+      {error && (
+        <section className="card border border-red-200 bg-red-50 flex items-center justify-between gap-3">
+          <p className="text-sm text-red-700">加载散客数据失败：{error}</p>
+          <button className="btn-secondary text-sm" onClick={() => setReloadNonce((n) => n + 1)}>重试</button>
+        </section>
+      )}
 
       {/* KPI */}
       <section className="grid gap-3 md:grid-cols-4">
@@ -206,14 +213,27 @@ export function CustomersPage() {
                 </tr>
               ))}
               {filtered.length === 0 && (
-                <tr><td colSpan={7} className="px-4 py-8 text-center text-ink-muted">没有符合条件的散客</td></tr>
+                <tr>
+                  <td colSpan={7} className="px-4 py-8 text-center text-ink-muted">
+                    {loading ? '加载中…' : '没有符合条件的散客'}
+                  </td>
+                </tr>
               )}
             </tbody>
           </table>
         </div>
       </section>
 
-      {selected && <CustomerDrawer customer={selected} onClose={() => setSelected(null)} />}
+      {selected && (
+        <CustomerDrawer
+          customer={selected}
+          onClose={() => setSelected(null)}
+          onSaved={(updated) => {
+            setCustomers((prev) => prev.map((c) => (c.id === updated.id ? updated : c)));
+            setSelected(updated);
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -228,7 +248,16 @@ function Kpi({ label, value, sub }: { label: string; value: string; sub: string 
   );
 }
 
-function CustomerDrawer({ customer, onClose }: { customer: MockCustomer; onClose: () => void }) {
+function CustomerDrawer({
+  customer,
+  onClose,
+  onSaved,
+}: {
+  customer: MockCustomer;
+  onClose: () => void;
+  onSaved: (updated: MockCustomer) => void;
+}) {
+  const tokens = useAuth((s) => s.tokens);
   const [editing, setEditing] = useState(false);
   const [form, setForm] = useState({
     name: customer.name,
@@ -239,10 +268,31 @@ function CustomerDrawer({ customer, onClose }: { customer: MockCustomer; onClose
     notes: '',
   });
   const [saved, setSaved] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
 
-  const save = () => {
-    setSaved(true);
-    setTimeout(() => { setEditing(false); setSaved(false); }, 1500);
+  const save = async () => {
+    if (!tokens?.accessToken) return;
+    setSaving(true);
+    setSaveError(null);
+    try {
+      const tags = form.tags.split(',').map((t) => t.trim()).filter(Boolean);
+      const res = await api.updateCustomer(tokens.accessToken, customer.id, {
+        displayName: form.name,
+        phone: form.phone,
+        email: form.email || undefined,
+        idNumber: form.idNumber || null,
+        tags,
+        notes: form.notes || null,
+      });
+      onSaved(customerApiToMock(res.customer));
+      setSaved(true);
+      setTimeout(() => { setEditing(false); setSaved(false); }, 1200);
+    } catch (e) {
+      setSaveError(e instanceof ApiError ? e.message : '保存失败，请重试');
+    } finally {
+      setSaving(false);
+    }
   };
 
   const addTag = (tag: string) => {
@@ -305,11 +355,6 @@ function CustomerDrawer({ customer, onClose }: { customer: MockCustomer; onClose
                   最近下单: {customer.lastOrderAt ? new Date(customer.lastOrderAt).toLocaleString('zh-CN') : '—'}
                 </div>
               </section>
-              <section className="pt-3 border-t border-slate-200">
-                <button className="btn-secondary w-full text-sm" onClick={() => alert('跳转订单列表 (demo) - 真环境过滤 customerId=' + customer.id)}>
-                  查看该散客所有订单 →
-                </button>
-              </section>
             </>
           ) : (
             // ── 编辑模式 ──
@@ -350,11 +395,14 @@ function CustomerDrawer({ customer, onClose }: { customer: MockCustomer; onClose
               </section>
 
               {saved && (
-                <div className="rounded bg-green-50 px-3 py-2 text-sm text-green-700">✅ 已保存（demo，真环境走 PUT /customers/:id）</div>
+                <div className="rounded bg-green-50 px-3 py-2 text-sm text-green-700">已保存</div>
+              )}
+              {saveError && (
+                <div className="rounded bg-red-50 px-3 py-2 text-sm text-red-700">{saveError}</div>
               )}
               <section className="pt-3 border-t border-slate-200 flex gap-3">
-                <button className="btn-secondary flex-1" onClick={() => setEditing(false)}>取消</button>
-                <button className="btn-primary flex-1" onClick={save}>保存修改</button>
+                <button className="btn-secondary flex-1" onClick={() => setEditing(false)} disabled={saving}>取消</button>
+                <button className="btn-primary flex-1" onClick={save} disabled={saving}>{saving ? '保存中…' : '保存修改'}</button>
               </section>
             </>
           )}

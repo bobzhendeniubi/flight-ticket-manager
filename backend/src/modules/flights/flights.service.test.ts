@@ -375,12 +375,14 @@ describe('FlightService.deleteSchedule', () => {
     vi.clearAllMocks();
   });
 
-  it('无销售（sold=0、无订单项）→ 硬删，返回 { deleted: true }', async () => {
+  it('无销售（sold=0、无订单项、无生效锁位/候补）→ 硬删，返回 { deleted: true }', async () => {
     prismaMock.flightSchedule.findUnique.mockResolvedValue({
       id: 'sched_1',
       isActive: true,
       orderItems: [],
       seatClasses: [{ sold: 0 }, { sold: 0 }],
+      seatLocks: [],
+      seatWaitlists: [],
     });
     prismaMock.flightSchedule.delete.mockResolvedValue({ id: 'sched_1' });
 
@@ -396,6 +398,8 @@ describe('FlightService.deleteSchedule', () => {
       isActive: true,
       orderItems: [],
       seatClasses: [{ sold: 0 }, { sold: 3 }], // 第二个舱位有销售
+      seatLocks: [],
+      seatWaitlists: [],
     });
 
     await expect(service.deleteSchedule('sched_1')).rejects.toMatchObject({
@@ -411,11 +415,47 @@ describe('FlightService.deleteSchedule', () => {
       isActive: true,
       orderItems: [{ id: 'oi_1' }],
       seatClasses: [{ sold: 0 }],
+      seatLocks: [],
+      seatWaitlists: [],
     });
 
     await expect(service.deleteSchedule('sched_1')).rejects.toMatchObject({
       statusCode: 400,
       message: '该班次已有销售，不能删除（请改用售罄）',
+    });
+    expect(prismaMock.flightSchedule.delete).not.toHaveBeenCalled();
+  });
+
+  it('有生效中的锁位（即便无销售/无订单）→ 抛 400「该班次有生效中的锁位/候补，暂不能删除」且不删', async () => {
+    prismaMock.flightSchedule.findUnique.mockResolvedValue({
+      id: 'sched_1',
+      isActive: true,
+      orderItems: [],
+      seatClasses: [{ sold: 0 }],
+      seatLocks: [{ id: 'lock_1' }], // 生效中的锁位（findUnique 的 include 已按 status:ACTIVE 过滤）
+      seatWaitlists: [],
+    });
+
+    await expect(service.deleteSchedule('sched_1')).rejects.toMatchObject({
+      statusCode: 400,
+      message: '该班次有生效中的锁位/候补，暂不能删除',
+    });
+    expect(prismaMock.flightSchedule.delete).not.toHaveBeenCalled();
+  });
+
+  it('有生效中的候补（即便无销售/无订单）→ 抛 400「该班次有生效中的锁位/候补，暂不能删除」且不删', async () => {
+    prismaMock.flightSchedule.findUnique.mockResolvedValue({
+      id: 'sched_1',
+      isActive: true,
+      orderItems: [],
+      seatClasses: [{ sold: 0 }],
+      seatLocks: [],
+      seatWaitlists: [{ id: 'wl_1' }], // 生效中的候补
+    });
+
+    await expect(service.deleteSchedule('sched_1')).rejects.toMatchObject({
+      statusCode: 400,
+      message: '该班次有生效中的锁位/候补，暂不能删除',
     });
     expect(prismaMock.flightSchedule.delete).not.toHaveBeenCalled();
   });
@@ -445,9 +485,30 @@ describe('FlightService.batchDeleteSchedules', () => {
   it('区间内：删无销售班次、跳过已售班次，返回 deleted 计数 + skipped 明细', async () => {
     // findMany 返回区间内命中的班次：sched_a 无销售、sched_b 有已售舱位、sched_c 无销售但有订单项
     prismaMock.flightSchedule.findMany.mockResolvedValue([
-      { id: 'sched_a', flightId: 'flight_1', orderItems: [], seatClasses: [{ sold: 0 }, { sold: 0 }] },
-      { id: 'sched_b', flightId: 'flight_1', orderItems: [], seatClasses: [{ sold: 0 }, { sold: 5 }] },
-      { id: 'sched_c', flightId: 'flight_1', orderItems: [{ id: 'oi_1' }], seatClasses: [{ sold: 0 }] },
+      {
+        id: 'sched_a',
+        flightId: 'flight_1',
+        orderItems: [],
+        seatClasses: [{ sold: 0 }, { sold: 0 }],
+        seatLocks: [],
+        seatWaitlists: [],
+      },
+      {
+        id: 'sched_b',
+        flightId: 'flight_1',
+        orderItems: [],
+        seatClasses: [{ sold: 0 }, { sold: 5 }],
+        seatLocks: [],
+        seatWaitlists: [],
+      },
+      {
+        id: 'sched_c',
+        flightId: 'flight_1',
+        orderItems: [{ id: 'oi_1' }],
+        seatClasses: [{ sold: 0 }],
+        seatLocks: [],
+        seatWaitlists: [],
+      },
     ]);
 
     const result = await service.batchDeleteSchedules({
@@ -465,6 +526,54 @@ describe('FlightService.batchDeleteSchedules', () => {
       skipped: [
         { scheduleId: 'sched_b', reason: '已售' },
         { scheduleId: 'sched_c', reason: '已售' },
+      ],
+    });
+  });
+
+  it('区间内有生效中的锁位/候补（即便无销售/无订单）→ 跳过，不参与硬删', async () => {
+    // sched_a 无销售但有生效锁位；sched_b 无销售但有生效候补；sched_c 完全干净可删
+    prismaMock.flightSchedule.findMany.mockResolvedValue([
+      {
+        id: 'sched_a',
+        flightId: 'flight_1',
+        orderItems: [],
+        seatClasses: [{ sold: 0 }],
+        seatLocks: [{ id: 'lock_1' }],
+        seatWaitlists: [],
+      },
+      {
+        id: 'sched_b',
+        flightId: 'flight_1',
+        orderItems: [],
+        seatClasses: [{ sold: 0 }],
+        seatLocks: [],
+        seatWaitlists: [{ id: 'wl_1' }],
+      },
+      {
+        id: 'sched_c',
+        flightId: 'flight_1',
+        orderItems: [],
+        seatClasses: [{ sold: 0 }],
+        seatLocks: [],
+        seatWaitlists: [],
+      },
+    ]);
+
+    const result = await service.batchDeleteSchedules({
+      flightId: 'flight_1',
+      from: '2026-07-01',
+      to: '2026-07-31',
+    });
+
+    // 只删完全干净的 sched_c；sched_a（生效锁位）、sched_b（生效候补）跳过且不进 deleteMany
+    expect(prismaMock.flightSchedule.deleteMany).toHaveBeenCalledWith({
+      where: { id: { in: ['sched_c'] } },
+    });
+    expect(result).toEqual({
+      deleted: 1,
+      skipped: [
+        { scheduleId: 'sched_a', reason: '有生效中的锁位/候补' },
+        { scheduleId: 'sched_b', reason: '有生效中的锁位/候补' },
       ],
     });
   });
@@ -491,8 +600,22 @@ describe('FlightService.batchDeleteSchedules', () => {
 
   it('省略 flightId：跨全部航班按区间筛选（where 不含 flightId）', async () => {
     prismaMock.flightSchedule.findMany.mockResolvedValue([
-      { id: 'sched_x', flightId: 'flight_1', orderItems: [], seatClasses: [{ sold: 0 }] },
-      { id: 'sched_y', flightId: 'flight_2', orderItems: [], seatClasses: [{ sold: 0 }] },
+      {
+        id: 'sched_x',
+        flightId: 'flight_1',
+        orderItems: [],
+        seatClasses: [{ sold: 0 }],
+        seatLocks: [],
+        seatWaitlists: [],
+      },
+      {
+        id: 'sched_y',
+        flightId: 'flight_2',
+        orderItems: [],
+        seatClasses: [{ sold: 0 }],
+        seatLocks: [],
+        seatWaitlists: [],
+      },
     ]);
 
     const result = await service.batchDeleteSchedules({ from: '2026-08-01', to: '2026-08-31' });
@@ -508,8 +631,22 @@ describe('FlightService.batchDeleteSchedules', () => {
 
   it('区间内全部已售：deleted=0、不调用 deleteMany、全部进 skipped', async () => {
     prismaMock.flightSchedule.findMany.mockResolvedValue([
-      { id: 'sched_a', flightId: 'flight_1', orderItems: [], seatClasses: [{ sold: 3 }] },
-      { id: 'sched_b', flightId: 'flight_1', orderItems: [{ id: 'oi_1' }], seatClasses: [{ sold: 0 }] },
+      {
+        id: 'sched_a',
+        flightId: 'flight_1',
+        orderItems: [],
+        seatClasses: [{ sold: 3 }],
+        seatLocks: [],
+        seatWaitlists: [],
+      },
+      {
+        id: 'sched_b',
+        flightId: 'flight_1',
+        orderItems: [{ id: 'oi_1' }],
+        seatClasses: [{ sold: 0 }],
+        seatLocks: [],
+        seatWaitlists: [],
+      },
     ]);
 
     const result = await service.batchDeleteSchedules({

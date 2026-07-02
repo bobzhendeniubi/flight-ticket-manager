@@ -240,8 +240,8 @@ export function Layout() {
 
         <footer className="border-t border-slate-200 bg-surface text-xs text-ink-muted">
           <div className="mx-auto flex max-w-[1400px] flex-col gap-1 px-4 py-3 sm:flex-row sm:items-center sm:justify-between md:px-6 lg:px-8">
-            <span>世途旅行后台 · M2-M5 演示版 · © {new Date().getFullYear()}</span>
-            <span>前台入口：http://localhost:5173</span>
+            <span>世途旅行后台 · © {new Date().getFullYear()}</span>
+            <span>前台入口：<a className="text-brand hover:text-brand-dark" href="https://store.citurtravel.com" target="_blank" rel="noreferrer">store.citurtravel.com</a></span>
           </div>
         </footer>
       </div>
