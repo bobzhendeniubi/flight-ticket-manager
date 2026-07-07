@@ -190,24 +190,25 @@ export class ProductsService {
   // ══════════════════════════════════════════════════════════════════
   // Hotels
   // ══════════════════════════════════════════════════════════════════
-  async listHotels(activeOnly = false) {
+  /** includeCost：仅 ADMIN/STAFF（由路由层按 req.user 角色判定）传 true，下发 costPriceCny；匿名/游客恒 false。 */
+  async listHotels(activeOnly = false, includeCost = false) {
     const hotels = await prisma.hotel.findMany({
       where: activeOnly ? { isActive: true } : undefined,
       include: { roomTypes: { orderBy: { basePrice: 'asc' } } },
       orderBy: { createdAt: 'asc' },
     });
     const ratings = await this.hotelRatings(hotels);
-    return hotels.map((h) => serializeHotel(h, ratings.get(h.id) ?? ZERO_RATING));
+    return hotels.map((h) => serializeHotel(h, ratings.get(h.id) ?? ZERO_RATING, includeCost));
   }
 
-  async getHotel(id: string) {
+  async getHotel(id: string, includeCost = false) {
     const hotel = await prisma.hotel.findUnique({
       where: { id },
       include: { roomTypes: { orderBy: { basePrice: 'asc' } } },
     });
     if (!hotel) throw new NotFoundError('酒店不存在');
     const ratings = await this.hotelRatings([hotel]);
-    return serializeHotel(hotel, ratings.get(hotel.id) ?? ZERO_RATING);
+    return serializeHotel(hotel, ratings.get(hotel.id) ?? ZERO_RATING, includeCost);
   }
 
   /**
@@ -275,6 +276,8 @@ export class ProductsService {
               maxChildren: rt.maxChildren,
               basePrice: new Prisma.Decimal(rt.basePrice),
               priceMultiplier: rt.priceMultiplier !== undefined ? new Prisma.Decimal(rt.priceMultiplier) : null,
+              // 净房价（仅内部）：省略/null 两种"未录"都落 null（== 而非 === undefined，因该字段本身可空）。
+              costPriceCny: rt.costPriceCny != null ? new Prisma.Decimal(rt.costPriceCny) : null,
             })),
           },
         },
@@ -331,6 +334,8 @@ export class ProductsService {
             basePrice: new Prisma.Decimal(rt.basePrice),
             priceMultiplier:
               rt.priceMultiplier !== undefined ? new Prisma.Decimal(rt.priceMultiplier) : null,
+            // 净房价（仅内部）：房型行是整行覆盖式提交（非增量 PATCH），省略/null 都表示"未录" → null。
+            costPriceCny: rt.costPriceCny != null ? new Prisma.Decimal(rt.costPriceCny) : null,
           };
           if (matched) {
             // 原地更新：保留原 id
@@ -370,20 +375,20 @@ export class ProductsService {
   // ══════════════════════════════════════════════════════════════════
   // Transfers
   // ══════════════════════════════════════════════════════════════════
-  async listTransfers(activeOnly = false) {
+  async listTransfers(activeOnly = false, includeCost = false) {
     const rows = await prisma.transfer.findMany({
       where: activeOnly ? { isActive: true } : undefined,
       orderBy: { createdAt: 'asc' },
     });
     const ratings = await this.reviews.getAggregates(ProductReviewType.TRANSFER, rows.map((r) => r.id));
-    return rows.map((t) => serializeTransfer(t, ratings.get(t.id) ?? ZERO_RATING));
+    return rows.map((t) => serializeTransfer(t, ratings.get(t.id) ?? ZERO_RATING, includeCost));
   }
 
-  async getTransfer(id: string) {
+  async getTransfer(id: string, includeCost = false) {
     const t = await prisma.transfer.findUnique({ where: { id } });
     if (!t) throw new NotFoundError('接送产品不存在');
     const ratings = await this.reviews.getAggregates(ProductReviewType.TRANSFER, [id]);
-    return serializeTransfer(t, ratings.get(id) ?? ZERO_RATING);
+    return serializeTransfer(t, ratings.get(id) ?? ZERO_RATING, includeCost);
   }
 
   async createTransfer(body: CreateTransferBody) {
@@ -402,6 +407,8 @@ export class ProductsService {
           ...body,
           code,
           basePrice: new Prisma.Decimal(body.basePrice),
+          // 司机/车队结算价（仅内部）：省略/null 两种"未录"都落 null（新建无"保留现值"这一说）。
+          costPriceCny: body.costPriceCny != null ? new Prisma.Decimal(body.costPriceCny) : null,
         },
       }),
     );
@@ -422,6 +429,11 @@ export class ProductsService {
     if (body.duration !== undefined) data.duration = body.duration;
     if (body.emoji !== undefined) data.emoji = body.emoji;
     if (body.photo !== undefined) data.photo = body.photo;
+    // 真·部分更新字段（与上面同款 !== undefined 守卫一致）：省略 = 不改；显式 null = 清空为未录；
+    // 数字 = 覆盖。costPriceCny 本身可空，不能用 !=null 一并吞掉"显式清空"这个语义。
+    if (body.costPriceCny !== undefined) {
+      data.costPriceCny = body.costPriceCny === null ? null : new Prisma.Decimal(body.costPriceCny);
+    }
     if (body.isActive !== undefined) data.isActive = body.isActive;
     const t = await prisma.transfer.update({ where: { id }, data });
     return serializeTransfer(t);
@@ -438,20 +450,20 @@ export class ProductsService {
   // ══════════════════════════════════════════════════════════════════
   // Visas
   // ══════════════════════════════════════════════════════════════════
-  async listVisas(activeOnly = false) {
+  async listVisas(activeOnly = false, includeCost = false) {
     const rows = await prisma.visa.findMany({
       where: activeOnly ? { isActive: true } : undefined,
       orderBy: { createdAt: 'asc' },
     });
     const ratings = await this.reviews.getAggregates(ProductReviewType.VISA, rows.map((r) => r.id));
-    return rows.map((v) => serializeVisa(v, ratings.get(v.id) ?? ZERO_RATING));
+    return rows.map((v) => serializeVisa(v, ratings.get(v.id) ?? ZERO_RATING, includeCost));
   }
 
-  async getVisa(id: string) {
+  async getVisa(id: string, includeCost = false) {
     const v = await prisma.visa.findUnique({ where: { id } });
     if (!v) throw new NotFoundError('签证产品不存在');
     const ratings = await this.reviews.getAggregates(ProductReviewType.VISA, [id]);
-    return serializeVisa(v, ratings.get(id) ?? ZERO_RATING);
+    return serializeVisa(v, ratings.get(id) ?? ZERO_RATING, includeCost);
   }
 
   async createVisa(body: CreateVisaBody) {
@@ -471,6 +483,8 @@ export class ProductsService {
           code,
           basePrice: new Prisma.Decimal(body.basePrice),
           expressSurcharge: body.expressSurcharge !== undefined ? new Prisma.Decimal(body.expressSurcharge) : null,
+          // 使馆/代办成本（仅内部）：省略/null 两种"未录"都落 null（新建无"保留现值"这一说）。
+          costPriceCny: body.costPriceCny != null ? new Prisma.Decimal(body.costPriceCny) : null,
         },
       }),
     );
@@ -493,6 +507,10 @@ export class ProductsService {
     if (body.stayDays !== undefined) data.stayDays = body.stayDays;
     if (body.highlight !== undefined) data.highlight = body.highlight;
     if (body.requiredDocs !== undefined) data.requiredDocs = body.requiredDocs;
+    // 真·部分更新字段：省略 = 不改；显式 null = 清空为未录；数字 = 覆盖（与 updateTransfer 同款约定）。
+    if (body.costPriceCny !== undefined) {
+      data.costPriceCny = body.costPriceCny === null ? null : new Prisma.Decimal(body.costPriceCny);
+    }
     if (body.isActive !== undefined) data.isActive = body.isActive;
     const v = await prisma.visa.update({ where: { id }, data });
     return serializeVisa(v);
@@ -705,7 +723,17 @@ type HotelWithRooms = Prisma.HotelGetPayload<{ include: { roomTypes: true } }>;
 // D3：所有产品对外统一暴露 rating: { average, count }（来自 Review 真实聚合）
 // + soldCount（seed 填充）。reviewCount 用聚合 count 覆盖（有评价时），
 // 老的 hotel.rating(Decimal) 改名 ratingLegacy 兼容旧前端兜底。
-function serializeHotel(h: HotelWithRooms, rating: ProductRatingAggregate = ZERO_RATING) {
+//
+// includeCost（0702 后台反馈 6·成本泄漏修复）：costPriceCny 是内部结算成本，不是给匿名/游客看的字段。
+// 默认 true —— create/update 这几条写路径（已在路由层用 adminPre 强制 ADMIN/STAFF）继续无脑下发，
+// 不用逐个改调用点；唯二会显式传 false 的是 list/get 这几条公开只读路由，按 req.user 角色现算
+// （见 products.routes.ts isCostVisible）。false 时直接不放这个 key，而不是塞 null —— 防止「反正都能
+// 看到 key，null 判断松了照样能探出「有没有录成本」」这种旁路信息泄漏。
+export function serializeHotel(
+  h: HotelWithRooms,
+  rating: ProductRatingAggregate = ZERO_RATING,
+  includeCost = true,
+) {
   const { rating: legacyRating, reviewCount, ...rest } = h;
   return {
     ...rest,
@@ -716,38 +744,45 @@ function serializeHotel(h: HotelWithRooms, rating: ProductRatingAggregate = ZERO
     soldCount: h.soldCount,
     latitude: h.latitude?.toString() ?? null,
     longitude: h.longitude?.toString() ?? null,
-    roomTypes: h.roomTypes.map((rt) => ({
-      ...rt,
-      basePrice: rt.basePrice.toString(),
-      priceMultiplier: rt.priceMultiplier?.toString() ?? null,
-      costPriceCny: rt.costPriceCny?.toString() ?? null,
-    })),
+    roomTypes: h.roomTypes.map((rt) => {
+      const { costPriceCny, ...rtRest } = rt;
+      return {
+        ...rtRest,
+        basePrice: rt.basePrice.toString(),
+        priceMultiplier: rt.priceMultiplier?.toString() ?? null,
+        ...(includeCost ? { costPriceCny: costPriceCny?.toString() ?? null } : {}),
+      };
+    }),
   };
 }
 
-function serializeTransfer(
+export function serializeTransfer(
   t: Prisma.TransferGetPayload<Record<string, never>>,
   rating: ProductRatingAggregate = ZERO_RATING,
+  includeCost = true,
 ) {
+  const { costPriceCny, ...rest } = t;
   return {
-    ...t,
+    ...rest,
     basePrice: t.basePrice.toString(),
-    costPriceCny: t.costPriceCny?.toString() ?? null,
+    ...(includeCost ? { costPriceCny: costPriceCny?.toString() ?? null } : {}),
     rating,
     reviewCount: rating.count,
     soldCount: t.soldCount,
   };
 }
 
-function serializeVisa(
+export function serializeVisa(
   v: Prisma.VisaGetPayload<Record<string, never>>,
   rating: ProductRatingAggregate = ZERO_RATING,
+  includeCost = true,
 ) {
+  const { costPriceCny, ...rest } = v;
   return {
-    ...v,
+    ...rest,
     basePrice: v.basePrice.toString(),
     expressSurcharge: v.expressSurcharge?.toString() ?? null,
-    costPriceCny: v.costPriceCny?.toString() ?? null,
+    ...(includeCost ? { costPriceCny: costPriceCny?.toString() ?? null } : {}),
     // 单次入境最多可停留天数（订单详情行程单据此推算签证生效/失效预计日期）
     stayDays: v.stayDays,
     rating,

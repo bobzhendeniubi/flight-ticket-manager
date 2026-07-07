@@ -14,6 +14,7 @@ import type { Prisma, PrismaClient } from '@prisma/client';
 import { OrderStatus } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { BadRequestError } from '../../lib/errors.js';
+import { getHotelNightlyRemaining } from '../hotel-control/hotel-control.service.js';
 import { fmtDateDMYDash, pnrName } from './orders.export-templates.js';
 
 /** 与财务/订单导出一致：草稿 / 已取消 / 已退款 / 支付超时 / 失败 不计入。*/
@@ -50,6 +51,13 @@ export interface RoomAllocationRow {
   roomType: string;
   notes: string;
   upgradeReason: string; // 系统暂无数据 — 留空
+  /**
+   * 该乘客入住日、其所在酒店当晚的销控余量（与房控销控板/导出同口径）：
+   *   数字字符串 = 正常余量（可能为负，真超卖）；
+   *   "未配"     = 该晚没有任何包房周期覆盖（block=0），不是真超卖，先补配包房；
+   *   "—"        = 分房组人工填的酒店名与本行 FK 关联酒店不一致，无法确定归属哪家酒店，绝不瞎标。
+   */
+  dailyRemaining: string;
 }
 
 const COLUMNS: Array<{ header: string; key: keyof RoomAllocationRow; width: number }> = [
@@ -69,6 +77,7 @@ const COLUMNS: Array<{ header: string; key: keyof RoomAllocationRow; width: numb
   { header: '房型', key: 'roomType', width: 14 },
   { header: '备注', key: 'notes', width: 24 },
   { header: '升级原因', key: 'upgradeReason', width: 12 },
+  { header: '当日余房', key: 'dailyRemaining', width: 12 },
 ];
 
 /** 拼房分配 JSON（Order.roomAssignment.roomGroups 的单组）。*/
@@ -114,7 +123,13 @@ export function parseRoomGroups(roomAssignment: unknown): RoomGroup[] {
 export type RoomItemForExport = Prisma.OrderItemGetPayload<{
   include: {
     hotelRoomType: {
-      select: { name: true; bedType: true; capacity: true; hotel: { select: { name: true } } };
+      select: {
+        hotelId: true;
+        name: true;
+        bedType: true;
+        capacity: true;
+        hotel: { select: { name: true } };
+      };
     };
     order: {
       include: {
@@ -166,7 +181,10 @@ function formatRoomNo(order: number, isHalf: boolean): string {
  *   - 已分房：同一 roomGroup.id 共用一个房号（半间/拼房组房号标 "房N(½)"）。
  *   - 未分房：按房型容量顺序打包（每满一间开下一间），房号续在已分房之后。
  */
-export function buildRoomAllocationSheets(items: RoomItemForExport[]): RoomAllocationSheet[] {
+export function buildRoomAllocationSheets(
+  items: RoomItemForExport[],
+  remainingLookup: Map<string, string> = new Map(),
+): RoomAllocationSheet[] {
   // 先收集中间形态（未编房号/序号），按入住日期聚
   const byDate = new Map<string, RoomEntry[]>();
 
@@ -193,7 +211,8 @@ export function buildRoomAllocationSheets(items: RoomItemForExport[]): RoomAlloc
 
     for (const p of order.passengers) {
       const group = roomGroups.find((g) => g.passengerIds.includes(p.id));
-      const hotelName = group?.hotelName || it.hotelRoomType.hotel.name;
+      const fkHotelName = it.hotelRoomType.hotel.name;
+      const hotelName = group?.hotelName || fkHotelName;
       // 分了房用 roomGroup 的房型（回落乘客床型偏好）；没分房回落行上房型床型
       const assignedRoomType = group ? group.roomType || p.bedPref || '' : '';
       const roomType = assignedRoomType || it.hotelRoomType.bedType || '';
@@ -201,6 +220,14 @@ export function buildRoomAllocationSheets(items: RoomItemForExport[]): RoomAlloc
       // 半间/拼房标记：roomFraction === 0.5 时在备注里点出（整间/缺省不标）
       const halfRoomNote = isHalf ? '半间/拼房' : '';
       const notes = [group?.notes, order.notes, halfRoomNote].filter(Boolean).join(' / ');
+
+      // 当日余房：分房组人工填的酒店名与行上 FK 关联酒店不一致时，无法确定该按哪家酒店的余量算——
+      // 绝不瞎标，直接 "—"（见 buildRoomAllocationSheets 顶部 JSDoc 的归属优先级说明）。
+      const hotelNameTrusted = !group?.hotelName || group.hotelName === fkHotelName;
+      const dailyRemaining =
+        hotelNameTrusted && it.hotelRoomType.hotelId
+          ? (remainingLookup.get(`${it.hotelRoomType.hotelId}|${checkInStr}`) ?? '—')
+          : '—';
 
       const row: Omit<RoomAllocationRow, 'seq' | 'roomNo'> = {
         agency,
@@ -217,6 +244,7 @@ export function buildRoomAllocationSheets(items: RoomItemForExport[]): RoomAlloc
         roomType,
         notes,
         upgradeReason: '',
+        dailyRemaining,
       };
 
       const list = byDate.get(checkInStr) ?? [];
@@ -285,6 +313,47 @@ function assignRoomNumbers(entries: RoomEntry[]): void {
 }
 
 /**
+ * 「当日余房」列取数：按 (hotelId, 入住日) 去重后批量查——同一酒店的多个入住日合并成一次
+ * getHotelNightlyRemaining 调用（内部一次 findMany 拉全部周期/占房行），而不是每个 (hotel,date)
+ * 各查一次，减少导出跨度内（≤14 天，ROOM_ALLOCATION_MAX_DAYS）的查库次数。
+ * 返回 `${hotelId}|${YYYY-MM-DD}` → 展示串（数字 / "未配" block=0 未覆盖 / 缺省未收录）。
+ */
+async function buildDailyRemainingLookup(
+  items: RoomItemForExport[],
+  client: PrismaClient,
+): Promise<Map<string, string>> {
+  const datesByHotel = new Map<string, Set<string>>();
+  for (const it of items) {
+    const hotelId = it.hotelRoomType?.hotelId;
+    if (!hotelId || !it.hotelCheckIn) continue;
+    const set = datesByHotel.get(hotelId) ?? new Set<string>();
+    set.add(fmtDate(it.hotelCheckIn));
+    datesByHotel.set(hotelId, set);
+  }
+
+  const perHotel = await Promise.all(
+    Array.from(datesByHotel.entries()).map(async ([hotelId, dateSet]) => {
+      const dates = Array.from(dateSet).sort();
+      const { remaining, block, hasBlock } = await getHotelNightlyRemaining(hotelId, dates, client);
+      return { hotelId, dates, remaining, block, hasBlock };
+    }),
+  );
+
+  const lookup = new Map<string, string>();
+  for (const { hotelId, dates, remaining, block, hasBlock } of perHotel) {
+    dates.forEach((date, i) => {
+      const key = `${hotelId}|${date}`;
+      if (!hasBlock || block[i] === 0) {
+        lookup.set(key, '未配');
+      } else {
+        lookup.set(key, String(remaining[i]));
+      }
+    });
+  }
+  return lookup;
+}
+
+/**
  * 构建分房表 xlsx。
  * @param range  入住日期范围 [from, to]（含两端，YYYY-MM-DD）；跨度超 14 天抛 400
  * @param client 可选注入用于测试；缺省取默认 prisma
@@ -312,7 +381,13 @@ export async function buildRoomAllocationWorkbook(
     orderBy: { createdAt: 'asc' },
     include: {
       hotelRoomType: {
-        select: { name: true, bedType: true, capacity: true, hotel: { select: { name: true } } },
+        select: {
+          hotelId: true,
+          name: true,
+          bedType: true,
+          capacity: true,
+          hotel: { select: { name: true } },
+        },
       },
       order: {
         include: {
@@ -329,7 +404,8 @@ export async function buildRoomAllocationWorkbook(
     },
   })) as RoomItemForExport[];
 
-  const sheets = buildRoomAllocationSheets(items);
+  const remainingLookup = await buildDailyRemainingLookup(items, client);
+  const sheets = buildRoomAllocationSheets(items, remainingLookup);
 
   const wb = new ExcelJS.Workbook();
   wb.creator = '分房表导出';

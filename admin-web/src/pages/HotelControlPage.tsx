@@ -11,15 +11,19 @@
  *
  * 口径：余量 = 包房（切房）− 用房（占房订单）；余量<0 红、=0 黄。
  */
-import { Fragment, useCallback, useEffect, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useState } from 'react';
+import { Link } from 'react-router-dom';
 import {
   api,
   ApiError,
+  hotelControlOpsApi,
   type BlockPeriodWriteInput,
   type HotelBlockPeriod,
   type HotelControlAlerts,
   type HotelControlBoard,
   type HotelControlForward,
+  type HotelNightlyRemainingResult,
+  type HotelOccupant,
   type OrderSummary,
   type RoomGroup,
 } from '../lib/api';
@@ -41,11 +45,42 @@ function fmtCny(n: number | null | undefined): string {
   if (n == null || !Number.isFinite(n)) return '—';
   return `¥${n.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}`;
 }
-/** 余量/余房单元格配色：<0 红底白字加粗（超卖醒目）、=0 黄 */
-function remainingCellCls(v: number): string {
-  if (v < 0) return 'bg-rose-600 font-bold text-white';
-  if (v === 0) return 'bg-amber-50 font-medium text-amber-700';
+/**
+ * 余量/余房单元格配色：
+ *   block=0 且 used>0（该晚根本没配包房周期，remaining=0-used 是误导性负数）→ 琥珀色「未配包房」；
+ *   block>0 且 remaining<0（真超卖）→ 红底白字加粗；
+ *   remaining=0（售罄）→ 浅黄；其余正常。
+ */
+function remainingCellCls(remaining: number, block: number, used: number): string {
+  if (block === 0 && used > 0) return 'bg-amber-200 font-semibold text-amber-900 ring-1 ring-amber-400';
+  if (remaining < 0) return 'bg-rose-600 font-bold text-white';
+  if (remaining === 0) return 'bg-amber-50 font-medium text-amber-700';
   return 'text-ink-soft';
+}
+
+/** 占房下钻订单状态中文名（只列 COUNTED_STATUSES 会出现的几种，够用即可）。 */
+const OCCUPANT_STATUS_LABEL: Record<string, string> = {
+  PENDING_PAYMENT: '待支付',
+  PAID: '已支付',
+  PROCESSING: '处理中',
+  TICKETED: '已出票',
+  COMPLETED: '已完成',
+  REFUND_REQUESTED: '退款申请中',
+  CHANGE_REQUESTED: '改期申请中',
+  CHANGED: '已改期',
+};
+
+/** 复制订单号到剪贴板——OrdersPage 暂不支持按订单号深链跳转搜索，退而求其次的下钻动作。*/
+function copyOrderNumber(orderNumber: string): void {
+  if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+    void navigator.clipboard.writeText(orderNumber);
+  }
+}
+
+/** 'YYYY-MM-DD' + 1 天。*/
+function nextDayStr(d: string): string {
+  const ms = new Date(`${d}T00:00:00.000Z`).getTime() + 24 * 60 * 60 * 1000;
+  return new Date(ms).toISOString().slice(0, 10);
 }
 
 /**
@@ -85,6 +120,14 @@ export function HotelControlPage() {
   const [error, setError] = useState<string | null>(null);
   // 周期 CRUD 后 +1 触发销控板/远期重拉
   const [boardNonce, setBoardNonce] = useState(0);
+  // 余量格点击下钻（某酒店某晚，谁占的）；null = 抽屉关闭
+  const [drill, setDrill] = useState<{
+    hotelId: string;
+    hotelName: string;
+    date: string;
+    block: number;
+    used: number;
+  } | null>(null);
 
   useEffect(() => {
     if (!token || !from || !to || from > to) return;
@@ -147,8 +190,11 @@ export function HotelControlPage() {
       {/* ── 分房表导出（成都格式 xlsx）──────────────────────────── */}
       <RoomAllocationExport token={token} />
 
+      {/* ── 房态导出（销控矩阵原样导出 xlsx）────────────────────── */}
+      <BoardExport token={token} />
+
       {/* ── 订单分房（按订单号查 → 拖拽分房）────────────────────── */}
-      <RoomingSection token={token} />
+      <RoomingSection token={token} board={board} />
 
       {/* ── 销控矩阵（按酒店 × 日期）──────────────────────────────── */}
       <section className="card">
@@ -236,14 +282,49 @@ export function HotelControlPage() {
                     </tr>
                     <tr className="border-b border-slate-100">
                       <td className={`${STICKY_COL2} py-1 pr-2 text-xs text-ink-muted`}>余量</td>
-                      {h.rows.remaining.map((v, i) => (
-                        <td key={i} className={`px-2 py-1 text-right ${remainingCellCls(v)}`}>{v}</td>
-                      ))}
+                      {h.rows.remaining.map((v, i) => {
+                        const block = h.rows.block[i];
+                        const used = h.rows.used[i];
+                        const unconfigured = block === 0 && used > 0;
+                        const date = board.dates[i];
+                        return (
+                          <td
+                            key={i}
+                            className={`cursor-pointer px-2 py-1 text-right transition hover:ring-1 hover:ring-brand/50 ${remainingCellCls(v, block, used)}`}
+                            title={
+                              unconfigured
+                                ? '未配包房：该晚无包房周期覆盖，此数字非真实超卖 · 点击查看占房订单'
+                                : '点击查看占房订单'
+                            }
+                            onClick={() =>
+                              setDrill({ hotelId: h.hotelId, hotelName: h.hotelName, date, block, used })
+                            }
+                          >
+                            {unconfigured ? '未配' : v}
+                          </td>
+                        );
+                      })}
                     </tr>
                   </Fragment>
                 ))}
               </tbody>
             </table>
+            {/* ── 图例 ─────────────────────────────────────────────── */}
+            <div className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-ink-muted">
+              <span className="inline-flex items-center gap-1.5">
+                <span className="inline-block h-3 w-3 rounded bg-rose-600" />
+                余量&lt;0 · 超卖需加房
+              </span>
+              <span className="inline-flex items-center gap-1.5">
+                <span className="inline-block h-3 w-3 rounded bg-amber-50 ring-1 ring-amber-300" />
+                余量=0 · 售罄
+              </span>
+              <span className="inline-flex items-center gap-1.5">
+                <span className="inline-block h-3 w-3 rounded bg-amber-200 ring-1 ring-amber-400" />
+                未配包房 · 该晚无包房周期，数字仅供参考
+              </span>
+              <span>点击任意「余量」格可查看当晚占房订单明细</span>
+            </div>
           </div>
         )}
       </section>
@@ -284,9 +365,16 @@ export function HotelControlPage() {
                 </tr>
                 <tr>
                   <td className={`${STICKY_COL1} py-1 pr-2 text-xs text-ink-muted`}>余房</td>
-                  {forward.remaining.map((v, i) => (
-                    <td key={i} className={`px-2 py-1 text-right ${remainingCellCls(v)}`}>{v}</td>
-                  ))}
+                  {forward.remaining.map((v, i) => {
+                    const held = forward.held[i];
+                    const occupied = forward.occupied[i];
+                    const unconfigured = held === 0 && occupied > 0;
+                    return (
+                      <td key={i} className={`px-2 py-1 text-right ${remainingCellCls(v, held, occupied)}`}>
+                        {unconfigured ? '未配' : v}
+                      </td>
+                    );
+                  })}
                 </tr>
               </tbody>
             </table>
@@ -296,7 +384,204 @@ export function HotelControlPage() {
 
       {/* ── 包房周期管理 ─────────────────────────────────────────── */}
       <BlockPeriodsEditor token={token} onChanged={() => setBoardNonce((n) => n + 1)} />
+
+      {/* ── 占房下钻抽屉（点击销控矩阵余量格弹出）──────────────────── */}
+      {drill && (
+        <OccupantsDrawer
+          token={token}
+          hotelId={drill.hotelId}
+          hotelName={drill.hotelName}
+          date={drill.date}
+          block={drill.block}
+          used={drill.used}
+          onClose={() => setDrill(null)}
+        />
+      )}
     </div>
+  );
+}
+
+// ── 占房下钻抽屉（GET /hotel-control/occupants；销控矩阵余量格点击用）───────
+function OccupantsDrawer({
+  token,
+  hotelId,
+  hotelName,
+  date,
+  block,
+  used,
+  onClose,
+}: {
+  token: string;
+  hotelId: string;
+  hotelName: string;
+  date: string;
+  block: number;
+  used: number;
+  onClose: () => void;
+}) {
+  const [occupants, setOccupants] = useState<HotelOccupant[] | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    setOccupants(null);
+    setErr(null);
+    hotelControlOpsApi
+      .getHotelOccupants(token, { hotelId, date })
+      .then((r) => {
+        if (!cancelled) setOccupants(r.occupants);
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) setErr(e instanceof ApiError ? e.message : '占房订单加载失败');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [token, hotelId, date]);
+
+  function handleCopy(orderId: string, orderNumber: string): void {
+    copyOrderNumber(orderNumber);
+    setCopiedId(orderId);
+    setTimeout(() => setCopiedId((cur) => (cur === orderId ? null : cur)), 1500);
+  }
+
+  // 面板头部说明：区分「未配包房」与「真超卖/正常已占」两类语义，绝不混为一谈
+  const headerNote =
+    block === 0
+      ? used > 0
+        ? `该晚未配置包房周期 · 已占 ${used} 间（先补配包房，再考虑挪单）`
+        : '该晚未配置包房周期 · 暂无占房'
+      : used > block
+        ? `包房 ${block} 间 · 超占 ${used - block} 间`
+        : `包房 ${block} 间 · 已占 ${used} 间`;
+
+  return (
+    <div className="fixed inset-0 z-50 flex justify-end bg-slate-900/40" onClick={onClose}>
+      <div
+        className="flex h-full w-full max-w-md flex-col overflow-y-auto bg-white shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="sticky top-0 flex items-start justify-between gap-2 border-b border-slate-200 bg-white px-4 py-3">
+          <div>
+            <h3 className="text-sm font-semibold text-ink">
+              {hotelName} · {date}
+            </h3>
+            <p className="mt-1 text-xs text-ink-muted">{headerNote}</p>
+          </div>
+          <button type="button" className="text-slate-400 hover:text-slate-700" onClick={onClose}>
+            ✕
+          </button>
+        </div>
+
+        <div className="flex-1 p-4">
+          {err ? (
+            <div className="rounded-lg bg-rose-50 px-3 py-2 text-sm text-rose-700">{err}</div>
+          ) : occupants == null ? (
+            <div className="text-sm text-ink-muted">加载中…</div>
+          ) : occupants.length === 0 ? (
+            <div className="py-6 text-center text-sm text-ink-muted">该晚无占房订单</div>
+          ) : (
+            <ul className="space-y-2">
+              {occupants.map((o, i) => (
+                <li
+                  key={`${o.orderId}-${i}`}
+                  className="rounded-lg border border-slate-200 p-3 text-sm shadow-sm"
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <span className="font-mono font-medium text-ink">{o.orderNumber}</span>
+                    <span className="badge-neutral">{OCCUPANT_STATUS_LABEL[o.status] ?? o.status}</span>
+                  </div>
+                  <div className="mt-1 text-ink-soft">
+                    {o.contactName} · {o.passengerCount} 人 · {o.rooms} 间
+                  </div>
+                  <div className="mt-0.5 text-xs text-ink-muted">
+                    {o.checkIn} ~ {o.checkOut} · {o.agentName}
+                  </div>
+                  <div className="mt-2 flex items-center gap-2">
+                    <button
+                      type="button"
+                      className="btn-secondary px-2 py-1 text-xs"
+                      onClick={() => handleCopy(o.orderId, o.orderNumber)}
+                    >
+                      {copiedId === o.orderId ? '已复制 ✓' : '复制订单号'}
+                    </button>
+                    <Link to="/orders" className="text-xs text-brand hover:text-brand-dark">
+                      去订单页 →
+                    </Link>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── 房态导出（GET /hotel-control/export；销控矩阵原样导出，含「未配包房」标记）───
+function BoardExport({ token }: { token: string }) {
+  const [exportFrom, setExportFrom] = useState<string>(todayStr());
+  const [exportTo, setExportTo] = useState<string>(plusDaysStr(30));
+  const [exporting, setExporting] = useState(false);
+
+  async function handleExport(): Promise<void> {
+    if (!token) return;
+    setExporting(true);
+    try {
+      const blob = await hotelControlOpsApi.downloadBoardExport(token, { from: exportFrom, to: exportTo });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `房控导出-${exportFrom}_${exportTo}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (e: unknown) {
+      alert(e instanceof ApiError ? `导出失败：${e.message}` : '导出失败');
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  return (
+    <section className="card">
+      <div className="flex flex-wrap items-end justify-between gap-3">
+        <div>
+          <h2 className="text-sm font-semibold text-ink">导出房态（销控矩阵）</h2>
+          <p className="mt-1 text-xs text-ink-muted">
+            xlsx：每家酒店 包房/用房/物理房间/余量 四行 × 日期列，与本页矩阵一致（最长 120 天，含「未配包房」标记）。
+          </p>
+        </div>
+        <div className="flex items-end gap-2">
+          <div>
+            <label className="label">起始</label>
+            <input
+              type="date"
+              className="input"
+              value={exportFrom}
+              onChange={(e) => setExportFrom(e.target.value)}
+            />
+          </div>
+          <div>
+            <label className="label">截止</label>
+            <input type="date" className="input" value={exportTo} onChange={(e) => setExportTo(e.target.value)} />
+          </div>
+          <button
+            type="button"
+            onClick={() => void handleExport()}
+            disabled={exporting || exportFrom > exportTo}
+            className="btn-primary"
+          >
+            {exporting ? '导出中…' : '导出房态'}
+          </button>
+        </div>
+      </div>
+      {exportFrom > exportTo && <div className="mt-2 text-xs text-amber-700">起始不能晚于截止</div>}
+    </section>
   );
 }
 
@@ -321,6 +606,53 @@ function hotelNameFromOrder(order: OrderSummary | null): string | undefined {
   return fromGroup || undefined;
 }
 
+/** 分房弹窗当日余房徽标要用的入住区间——从订单行取 hotelCheckIn/hotelCheckOut（同上取酒店名的行）。 */
+function hotelStayFromOrder(order: OrderSummary | null): { checkIn: string; checkOut: string } | null {
+  if (!order) return null;
+  const items = (order.items ?? []) as Array<{
+    hotelCheckIn?: string | null;
+    hotelCheckOut?: string | null;
+    kind?: string;
+    hotelName?: string | null;
+  }>;
+  const hotelItem = items.find(
+    (it) => (it.hotelName || it.kind === 'HOTEL') && it.hotelCheckIn && it.hotelCheckOut,
+  );
+  if (!hotelItem?.hotelCheckIn || !hotelItem?.hotelCheckOut) return null;
+  return { checkIn: hotelItem.hotelCheckIn, checkOut: hotelItem.hotelCheckOut };
+}
+
+/**
+ * 从已加载的销控板本地切出某酒店在 [checkIn, checkOut) 内的逐晚余量（零额外请求，见
+ * RoomingEditor.tsx nightlyRemaining 属性的 JSDoc）。该酒店不在当前 board.hotels（当前浏览的
+ * from~to 范围内该酒店既无周期也无占房）、或入住区间有任意一晚超出 board.dates 覆盖范围
+ * → 返回 null（宁可不显示徽标，不拿不完整数据拼凑误导）。
+ */
+function sliceBoardRemaining(
+  board: HotelControlBoard | null,
+  hotelId: string | undefined,
+  checkIn: string | undefined,
+  checkOut: string | undefined,
+): HotelNightlyRemainingResult | null {
+  if (!board || !hotelId || !checkIn || !checkOut || checkIn >= checkOut) return null;
+  const hotel = board.hotels.find((h) => h.hotelId === hotelId);
+  if (!hotel) return null;
+
+  const nights: string[] = [];
+  const MAX_NIGHTS = 60; // 安全上限，防止异常数据死循环
+  for (let d = checkIn; d < checkOut && nights.length < MAX_NIGHTS; d = nextDayStr(d)) {
+    nights.push(d);
+  }
+  if (nights.length === 0) return null;
+
+  const idxByDate = new Map(board.dates.map((d, i) => [d, i]));
+  if (!nights.every((n) => idxByDate.has(n))) return null;
+
+  const remaining = nights.map((n) => hotel.rows.remaining[idxByDate.get(n)!]);
+  const block = nights.map((n) => hotel.rows.block[idxByDate.get(n)!]);
+  return { dates: nights, remaining, block, hasBlock: true };
+}
+
 /** 占位出行人（纯酒店/接送用联系人占位 documentNumber='N/A'）不进分房池。 */
 function toRoomingPassengers(order: OrderSummary): RoomingPassenger[] {
   return order.passengers
@@ -332,7 +664,7 @@ function toRoomingPassengers(order: OrderSummary): RoomingPassenger[] {
     }));
 }
 
-function RoomingSection({ token }: { token: string }) {
+function RoomingSection({ token, board }: { token: string; board: HotelControlBoard | null }) {
   const [orderNo, setOrderNo] = useState('');
   const [order, setOrder] = useState<OrderSummary | null>(null);
   const [loading, setLoading] = useState(false);
@@ -374,6 +706,17 @@ function RoomingSection({ token }: { token: string }) {
   // 取 ' · ' 前段作酒店名），回退到已存分房组里带的 hotelName。这样新订单未存分房时也能显示真实酒店名，
   // 不再落到「N人同酒店」这类占位。
   const seedHotelName = hotelNameFromOrder(order);
+  const stay = hotelStayFromOrder(order);
+  // 按酒店名在已加载的销控板里反查 hotelId（board 本身没有按名索引，订单也不直接带 hotelId）
+  const hotelId = useMemo(
+    () => (seedHotelName ? board?.hotels.find((h) => h.hotelName === seedHotelName)?.hotelId : undefined),
+    [board, seedHotelName],
+  );
+  // 当日余房徽标数据：复用本页已拉的销控板本地切片，零额外请求（见 sliceBoardRemaining JSDoc）
+  const nightlyRemaining = useMemo(
+    () => sliceBoardRemaining(board, hotelId, stay?.checkIn, stay?.checkOut),
+    [board, hotelId, stay?.checkIn, stay?.checkOut],
+  );
 
   return (
     <section className="card">
@@ -419,6 +762,10 @@ function RoomingSection({ token }: { token: string }) {
                 passengers={roomingPassengers}
                 initial={order.roomAssignment?.roomGroups}
                 hotelName={seedHotelName ?? undefined}
+                hotelId={hotelId}
+                checkIn={stay?.checkIn}
+                checkOut={stay?.checkOut}
+                nightlyRemaining={nightlyRemaining}
                 onSave={handleSave}
                 onClose={() => setOrder(null)}
               />

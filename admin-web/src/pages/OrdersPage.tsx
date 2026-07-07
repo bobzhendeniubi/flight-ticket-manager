@@ -204,8 +204,9 @@ export function OrdersPage() {
     failureCount: number;
     failures: Array<{ id: string; error?: string }>;
   } | null>(null);
-  // 强制模式默认开（管理员手动改状态的核心场景就是绕开标准流转）
-  const [forceMode, setForceMode] = useState(true);
+  // 强制模式默认关：强制把已取消/超时等「非占座」订单拉回 PAID/PROCESSING 等「占座」状态时会
+  // 重新占座（余位不足会被拒绝），必须是运营每次主动勾选的动作，不能默认开着让人顺手误触。
+  const [forceMode, setForceMode] = useState(false);
   // 批量到账弹窗（选多单 → 逐单录到账金额 + 共享水单）
   const [showBatchPay, setShowBatchPay] = useState(false);
   // 批量创单弹窗 + 单笔录单弹窗 + 列表刷新计数（建单后 +1 触发重新拉单）
@@ -382,7 +383,7 @@ export function OrdersPage() {
   const applyBulkStatus = async () => {
     if (!tokens?.accessToken || !bulkStatus || selectedIds.size === 0) return;
     const confirmMsg = forceMode
-      ? `强制将 ${selectedIds.size} 条订单改为「${STATUS_LABEL[bulkStatus as OrderStatus]}」？此操作绕过状态机校验。`
+      ? `强制将 ${selectedIds.size} 条订单改为「${STATUS_LABEL[bulkStatus as OrderStatus]}」？此操作绕过状态机校验。\n\n强制把已取消/超时的订单拉回持有状态会重新占座（余位不足会被拒绝，订单状态不变）；此前版本存在不占座的漏洞，请确认余位充足后再操作。`
       : `按标准流转将 ${selectedIds.size} 条订单改为「${STATUS_LABEL[bulkStatus as OrderStatus]}」？不在允许路径的订单会失败。`;
     if (!window.confirm(confirmMsg)) return;
     setBulkSubmitting(true);
@@ -1005,7 +1006,7 @@ export function OrdersPage() {
                           const next = e.target.value as OrderStatus;
                           if (!next) return;
                           const msg = forceMode
-                            ? `强制将 ${order.orderNumber} 改为「${STATUS_LABEL[next]}」？此操作绕过状态机校验。`
+                            ? `强制将 ${order.orderNumber} 改为「${STATUS_LABEL[next]}」？此操作绕过状态机校验。\n\n强制把已取消/超时的订单拉回持有状态会重新占座（余位不足会被拒绝，订单状态不变）；此前版本存在不占座的漏洞，请确认余位充足后再操作。`
                             : `将 ${order.orderNumber} 改为「${STATUS_LABEL[next]}」？`;
                           if (window.confirm(msg)) void advance(order, next, undefined, forceMode);
                           e.target.value = '';

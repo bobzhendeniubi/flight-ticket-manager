@@ -1,8 +1,13 @@
 /**
  * 六档余位档位 computeAvailabilityTier · 纯函数单测（vitest）
  *
- * 阈值口径（AVAILABILITY_TIER_THRESHOLDS，运营可能调整）：
- *   >40 AMPLE；16-40 TIGHT；6-15 LOW；1-5 VERY_LOW；≤0 SOLD_OUT
+ * 阈值口径（AVAILABILITY_TIER_THRESHOLDS，运营可能调整；比例相对 capacity，非绝对张数）：
+ *   available ≤ 0                    → SOLD_OUT
+ *   available ≤ ceil(capacity×5%)    → VERY_LOW（夹到 < capacity）
+ *   available ≤ ceil(capacity×15%)   → LOW（夹到 < capacity）
+ *   available ≤ ceil(capacity×40%)   → TIGHT（夹到 < capacity）
+ *   否则                              → AMPLE
+ * capacity 缺省 100——数值上与旧版绝对阈值（5/15/40）完全等价，供历史调用方零行为变更接入。
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
@@ -54,8 +59,10 @@ import {
   FlightService,
 } from './flights.service.js';
 
-describe('computeAvailabilityTier', () => {
-  it('>40 → AMPLE', () => {
+describe('computeAvailabilityTier · 缺省 capacity（向后兼容旧版绝对阈值）', () => {
+  // 不传 capacity → 缺省 100，数值上与旧版绝对阈值（5/15/40）完全等价。
+  // 覆盖尚未接入真实 capacity 的历史调用方（如 bundle-availability.service）。
+  it('avail>40 → AMPLE', () => {
     expect(computeAvailabilityTier(41)).toBe('AMPLE');
     expect(computeAvailabilityTier(180)).toBe('AMPLE');
   });
@@ -80,12 +87,63 @@ describe('computeAvailabilityTier', () => {
     expect(computeAvailabilityTier(-3)).toBe('SOLD_OUT');
   });
 
-  it('阈值常量与档位边界一致（防止改常量漏改函数）', () => {
-    expect(computeAvailabilityTier(AVAILABILITY_TIER_THRESHOLDS.AMPLE_MIN)).toBe('AMPLE');
-    expect(computeAvailabilityTier(AVAILABILITY_TIER_THRESHOLDS.AMPLE_MIN - 1)).toBe('TIGHT');
-    expect(computeAvailabilityTier(AVAILABILITY_TIER_THRESHOLDS.TIGHT_MIN - 1)).toBe('LOW');
-    expect(computeAvailabilityTier(AVAILABILITY_TIER_THRESHOLDS.LOW_MIN - 1)).toBe('VERY_LOW');
-    expect(computeAvailabilityTier(AVAILABILITY_TIER_THRESHOLDS.VERY_LOW_MIN - 1)).toBe('SOLD_OUT');
+  it('阈值常量与档位边界一致，capacity=100（防止改比例常量漏改函数）', () => {
+    const cap = 100;
+    const veryLowCut = Math.ceil(cap * AVAILABILITY_TIER_THRESHOLDS.VERY_LOW_MAX_RATIO); // 5
+    const lowCut = Math.ceil(cap * AVAILABILITY_TIER_THRESHOLDS.LOW_MAX_RATIO); // 15
+    const tightCut = Math.ceil(cap * AVAILABILITY_TIER_THRESHOLDS.TIGHT_MAX_RATIO); // 40
+    expect(computeAvailabilityTier(veryLowCut, cap)).toBe('VERY_LOW');
+    expect(computeAvailabilityTier(veryLowCut + 1, cap)).toBe('LOW');
+    expect(computeAvailabilityTier(lowCut, cap)).toBe('LOW');
+    expect(computeAvailabilityTier(lowCut + 1, cap)).toBe('TIGHT');
+    expect(computeAvailabilityTier(tightCut, cap)).toBe('TIGHT');
+    expect(computeAvailabilityTier(tightCut + 1, cap)).toBe('AMPLE');
+  });
+});
+
+// ── 容量相对档位：这是本次改造的核心——修掉"小舱位常年误标紧张"的 bug ──────
+// 场景：业务方要把约 394 个班次的商务舱容量从 20 改到 7；改前改后，一个刚建好、
+// 一张没卖的商务舱（无论 7 座还是 20 座）都必须是 AMPLE，不能因为绝对张数小就紧张。
+describe('computeAvailabilityTier · 容量相对档位（真实 capacity）', () => {
+  it('20 座舱位满仓（20/20）→ AMPLE（不再因绝对张数 <41 被误标紧张）', () => {
+    expect(computeAvailabilityTier(20, 20)).toBe('AMPLE');
+  });
+
+  it('20 座舱位仅剩 2 张（2/20）→ VERY_LOW 或 LOW（占比 10%，明显紧张，但不是 AMPLE）', () => {
+    const tier = computeAvailabilityTier(2, 20);
+    expect(['VERY_LOW', 'LOW']).toContain(tier);
+  });
+
+  it('7 座舱位满仓（7/7，业务方目标容量）→ AMPLE', () => {
+    expect(computeAvailabilityTier(7, 7)).toBe('AMPLE');
+  });
+
+  it('7 座舱位仅剩 1 张 → VERY_LOW', () => {
+    expect(computeAvailabilityTier(1, 7)).toBe('VERY_LOW');
+  });
+
+  it('任意容量：available === capacity（满仓）恒为 AMPLE（含极小容量 1/1、2/2）', () => {
+    expect(computeAvailabilityTier(1, 1)).toBe('AMPLE');
+    expect(computeAvailabilityTier(2, 2)).toBe('AMPLE');
+    expect(computeAvailabilityTier(200, 200)).toBe('AMPLE');
+  });
+
+  it('大容量经济舱（200 座）：178/200 剩余充足 → AMPLE；20/200 → VERY_LOW（占比 10%）', () => {
+    expect(computeAvailabilityTier(178, 200)).toBe('AMPLE');
+    expect(computeAvailabilityTier(20, 200)).toBe('LOW');
+    expect(computeAvailabilityTier(9, 200)).toBe('VERY_LOW');
+  });
+
+  it('available ≤ 0 恒为 SOLD_OUT，与 capacity 无关', () => {
+    expect(computeAvailabilityTier(0, 20)).toBe('SOLD_OUT');
+    expect(computeAvailabilityTier(-3, 7)).toBe('SOLD_OUT');
+    expect(computeAvailabilityTier(0, 200)).toBe('SOLD_OUT');
+  });
+
+  it('档位随 capacity 单调：同一 available，capacity 越小越容易落入紧张档', () => {
+    // available=8：200 座里是 VERY_LOW 边缘充足；20 座里已经是 TIGHT
+    expect(computeAvailabilityTier(8, 200)).toBe('VERY_LOW');
+    expect(computeAvailabilityTier(8, 20)).toBe('TIGHT');
   });
 });
 
@@ -106,8 +164,8 @@ describe('capPublicAvailable · 公开口径余位封顶', () => {
     expect(capPublicAvailable(-3)).toBe(0);
   });
 
-  it('封顶不影响档位：档位仍按真实余量计算', () => {
-    expect(computeAvailabilityTier(178)).toBe('AMPLE');
+  it('封顶不影响档位：档位仍按真实余量（相对真实 capacity）计算', () => {
+    expect(computeAvailabilityTier(178, 200)).toBe('AMPLE');
     expect(capPublicAvailable(178)).toBe(9);
   });
 });
@@ -180,6 +238,43 @@ describe('FlightService.updateSchedule', () => {
     ).rejects.toMatchObject({ statusCode: 400 });
 
     // 校验失败 → 不进事务、不改任何 seatClass
+    expect(prismaMock.$transaction).not.toHaveBeenCalled();
+    expect(prismaMock.flightSeatClass.update).not.toHaveBeenCalled();
+  });
+
+  // ── 收缩守卫：容量可以下调，只要不低于已售（业务场景：商务舱 20→7）─────────
+  it('商务舱容量 20→7、已售 0：允许缩容（收缩不因绝对张数小被误挡）', async () => {
+    const schedule = baseSchedule();
+    schedule.seatClasses = [
+      { id: 'sc_biz', cabin: 'BUSINESS', capacity: 20, sold: 0, basePrice: decimal(9000) },
+    ];
+    prismaMock.flightSchedule.findUnique.mockResolvedValue(schedule);
+    const after = { ...schedule, seatClasses: [{ ...schedule.seatClasses[0], capacity: 7 }] };
+    prismaMock.flightSchedule.findUniqueOrThrow.mockResolvedValue(after);
+
+    const result = await service.updateSchedule('sched_1', {
+      seatClasses: [{ cabin: 'BUSINESS', capacity: 7 }],
+    });
+
+    expect(prismaMock.flightSeatClass.update).toHaveBeenCalledWith({
+      where: { id: 'sc_biz' },
+      data: { capacity: 7 },
+    });
+    expect(result.seatClasses[0]).toMatchObject({ cabin: 'BUSINESS', capacity: 7 });
+  });
+
+  it('商务舱目标容量 7、已售 8：拒 400（超过目标容量），不写库', async () => {
+    const schedule = baseSchedule();
+    schedule.seatClasses = [
+      { id: 'sc_biz', cabin: 'BUSINESS', capacity: 20, sold: 8, basePrice: decimal(9000) },
+    ];
+    prismaMock.flightSchedule.findUnique.mockResolvedValue(schedule);
+
+    await expect(
+      service.updateSchedule('sched_1', {
+        seatClasses: [{ cabin: 'BUSINESS', capacity: 7 }],
+      }),
+    ).rejects.toMatchObject({ statusCode: 400, message: '商务舱已售 8，容量不能低于 8' });
     expect(prismaMock.$transaction).not.toHaveBeenCalled();
     expect(prismaMock.flightSeatClass.update).not.toHaveBeenCalled();
   });
@@ -685,6 +780,141 @@ describe('FlightService.batchDeleteSchedules', () => {
       skipped: [
         { scheduleId: 'sched_a', reason: '已售' },
         { scheduleId: 'sched_b', reason: '已售' },
+      ],
+    });
+  });
+});
+
+// ── batchUpdateCapacity（按 scheduleId 列表批量改容量；命中守卫的班次跳过）─────
+// 复用与 updateSchedule 相同的"容量不能低于已售"守卫；不存在的班次 / 没有该舱位
+// 都不算失败，只是不产生变更（前者进 skipped，后者对该班次静默跳过这一项）。
+describe('FlightService.batchUpdateCapacity', () => {
+  const service = new FlightService();
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // $transaction 的数组形态：直接 resolve 传入的 promise 数组（与 batchDeleteSchedules 同口径）。
+    prismaMock.$transaction.mockImplementation(async (ops: unknown) =>
+      Array.isArray(ops) ? Promise.all(ops) : ops,
+    );
+    prismaMock.flightSeatClass.update.mockResolvedValue({});
+  });
+
+  it('业务场景：把命中班次的商务舱容量从 20 改到 7（已售 0）→ 全部 applied', async () => {
+    prismaMock.flightSchedule.findMany.mockResolvedValue([
+      {
+        id: 'sched_a',
+        seatClasses: [
+          { id: 'sc_a_biz', cabin: 'BUSINESS', capacity: 20, sold: 0 },
+          { id: 'sc_a_eco', cabin: 'ECONOMY', capacity: 180, sold: 50 },
+        ],
+      },
+      {
+        id: 'sched_b',
+        seatClasses: [{ id: 'sc_b_biz', cabin: 'BUSINESS', capacity: 20, sold: 0 }],
+      },
+    ]);
+
+    const result = await service.batchUpdateCapacity({
+      scheduleIds: ['sched_a', 'sched_b'],
+      seatClasses: [{ cabin: 'BUSINESS', capacity: 7 }],
+    });
+
+    expect(prismaMock.flightSeatClass.update).toHaveBeenCalledWith({
+      where: { id: 'sc_a_biz' },
+      data: { capacity: 7 },
+    });
+    expect(prismaMock.flightSeatClass.update).toHaveBeenCalledWith({
+      where: { id: 'sc_b_biz' },
+      data: { capacity: 7 },
+    });
+    expect(prismaMock.flightSeatClass.update).toHaveBeenCalledTimes(2);
+    expect(result).toEqual({ applied: 2, skipped: [] });
+  });
+
+  it('已售超过目标容量的班次自动跳过（不是整批失败），其余正常改', async () => {
+    prismaMock.flightSchedule.findMany.mockResolvedValue([
+      {
+        id: 'sched_ok',
+        seatClasses: [{ id: 'sc_ok', cabin: 'BUSINESS', capacity: 20, sold: 0 }],
+      },
+      {
+        id: 'sched_oversold',
+        seatClasses: [{ id: 'sc_over', cabin: 'BUSINESS', capacity: 20, sold: 8 }],
+      },
+    ]);
+
+    const result = await service.batchUpdateCapacity({
+      scheduleIds: ['sched_ok', 'sched_oversold'],
+      seatClasses: [{ cabin: 'BUSINESS', capacity: 7 }],
+    });
+
+    expect(prismaMock.flightSeatClass.update).toHaveBeenCalledTimes(1);
+    expect(prismaMock.flightSeatClass.update).toHaveBeenCalledWith({
+      where: { id: 'sc_ok' },
+      data: { capacity: 7 },
+    });
+    expect(result).toEqual({
+      applied: 1,
+      skipped: [{ scheduleId: 'sched_oversold', reason: '已售8超过目标容量7' }],
+    });
+  });
+
+  it('班次没有请求的舱位：该项静默跳过，不算失败（整条班次没有可改项则进 skipped）', async () => {
+    prismaMock.flightSchedule.findMany.mockResolvedValue([
+      {
+        id: 'sched_noeco',
+        // 只有经济舱，没有商务舱
+        seatClasses: [{ id: 'sc_eco', cabin: 'ECONOMY', capacity: 180, sold: 10 }],
+      },
+    ]);
+
+    const result = await service.batchUpdateCapacity({
+      scheduleIds: ['sched_noeco'],
+      seatClasses: [{ cabin: 'BUSINESS', capacity: 7 }],
+    });
+
+    // 该班次没有商务舱 → 这一项静默跳过；没有任何可改项 → 整个班次进 skipped
+    expect(prismaMock.flightSeatClass.update).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      applied: 0,
+      skipped: [{ scheduleId: 'sched_noeco', reason: '该班次没有匹配的舱位' }],
+    });
+  });
+
+  it('scheduleId 查无此班次：跳过并回报原因，不影响其它班次', async () => {
+    prismaMock.flightSchedule.findMany.mockResolvedValue([
+      { id: 'sched_real', seatClasses: [{ id: 'sc_real', cabin: 'BUSINESS', capacity: 20, sold: 0 }] },
+    ]);
+
+    const result = await service.batchUpdateCapacity({
+      scheduleIds: ['sched_real', 'sched_ghost'],
+      seatClasses: [{ cabin: 'BUSINESS', capacity: 7 }],
+    });
+
+    expect(result).toEqual({
+      applied: 1,
+      skipped: [{ scheduleId: 'sched_ghost', reason: '班次不存在' }],
+    });
+  });
+
+  it('全部命中守卫：applied=0、不调用 flightSeatClass.update、全部进 skipped', async () => {
+    prismaMock.flightSchedule.findMany.mockResolvedValue([
+      { id: 'sched_a', seatClasses: [{ id: 'sc_a', cabin: 'BUSINESS', capacity: 20, sold: 15 }] },
+      { id: 'sched_b', seatClasses: [{ id: 'sc_b', cabin: 'BUSINESS', capacity: 20, sold: 10 }] },
+    ]);
+
+    const result = await service.batchUpdateCapacity({
+      scheduleIds: ['sched_a', 'sched_b'],
+      seatClasses: [{ cabin: 'BUSINESS', capacity: 7 }],
+    });
+
+    expect(prismaMock.flightSeatClass.update).not.toHaveBeenCalled();
+    expect(result).toEqual({
+      applied: 0,
+      skipped: [
+        { scheduleId: 'sched_a', reason: '已售15超过目标容量7' },
+        { scheduleId: 'sched_b', reason: '已售10超过目标容量7' },
       ],
     });
   });

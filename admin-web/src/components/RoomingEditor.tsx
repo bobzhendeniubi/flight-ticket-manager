@@ -11,7 +11,7 @@
  * 保存：onSave 只收「至少 1 名出行人」的盒子，按 RoomGroup 形状回传。
  */
 import { useMemo, useState } from 'react';
-import type { HotelAvailabilityTier, RoomGroup } from '../lib/api';
+import type { HotelAvailabilityTier, HotelNightlyRemainingResult, RoomGroup } from '../lib/api';
 
 // ── 类型 ─────────────────────────────────────────────────────────────────
 export interface RoomingPassenger {
@@ -26,6 +26,18 @@ interface RoomingEditorProps {
   hotelName?: string;
   /** 该酒店在住宿区间的房量档位（只显档位不显数字，与六档余位同纪律）；null = 不展示。 */
   hotelTier?: HotelAvailabilityTier | null;
+  /** 当日余房徽标上下文（可选，仅用于展示/tooltip，不参与保存）。 */
+  hotelRoomTypeId?: string;
+  hotelId?: string;
+  checkIn?: string; // YYYY-MM-DD
+  checkOut?: string; // YYYY-MM-DD
+  /**
+   * 入住期逐晚余量原始数组——由调用方按各自数据源算好传入（未做汇总，本组件内部汇总展示）：
+   *   HotelControlPage 复用页面已拉的销控板本地切片（零额外请求）；
+   *   SingleOrderModal 走 GET /hotel-control/nightly-remaining。
+   * 缺省/null = 不展示徽标（不造假，与 hotelTier 查询失败时的降级原则一致）。
+   */
+  nightlyRemaining?: HotelNightlyRemainingResult | null;
   onSave: (groups: RoomGroup[]) => Promise<void>;
   onClose: () => void;
 }
@@ -37,6 +49,64 @@ const HOTEL_TIER_BADGE: Record<HotelAvailabilityTier, { label: string; cls: stri
   LOW: { label: '仅剩少量', cls: 'bg-amber-50 text-amber-700' },
   SOLD_OUT: { label: '已订满', cls: 'bg-rose-50 text-rose-700' },
 };
+
+// ── 当日余房徽标（ADMIN/STAFF 专用，直显数字——与上面只显档位的 hotelTier 不同纪律）──────
+type NightlyRemainingState =
+  | { kind: 'none' }
+  | { kind: 'unconfigured' }
+  | { kind: 'ok'; min: number };
+
+/**
+ * 把逐晚原始数组汇总成展示态：
+ *   - 整段没有任何包房周期（hasBlock=false）或入住期内有任意一晚 block<=0（该晚未被周期覆盖）
+ *     → "未配包房"（不拿 0-used 的误导性负数当真超卖显示）；
+ *   - 否则取入住期内最紧张一晚（min remaining）。
+ */
+function summarizeNightlyRemaining(
+  data: HotelNightlyRemainingResult | null | undefined,
+): NightlyRemainingState {
+  if (!data || data.dates.length === 0) return { kind: 'none' };
+  if (!data.hasBlock || data.block.some((b) => b <= 0)) return { kind: 'unconfigured' };
+  return { kind: 'ok', min: Math.min(...data.remaining) };
+}
+
+function NightlyRemainingBadge({
+  data,
+  checkIn,
+  checkOut,
+  compact,
+}: {
+  data: HotelNightlyRemainingResult | null | undefined;
+  checkIn?: string;
+  checkOut?: string;
+  compact?: boolean;
+}) {
+  const state = summarizeNightlyRemaining(data);
+  if (state.kind === 'none') return null;
+
+  const rangeNote = checkIn && checkOut ? `入住期 ${checkIn} ~ ${checkOut} ` : '入住期内';
+  if (state.kind === 'unconfigured') {
+    return (
+      <span
+        className="badge bg-amber-100 text-amber-800"
+        title={`${rangeNote}未配置包房周期（或部分晚未覆盖）：数字仅供参考，请先补配包房周期`}
+      >
+        未配包房
+      </span>
+    );
+  }
+  const cls =
+    state.min < 0
+      ? 'bg-rose-50 text-rose-700'
+      : state.min === 0
+        ? 'bg-amber-50 text-amber-700'
+        : 'bg-emerald-50 text-emerald-700';
+  return (
+    <span className={`badge ${cls}`} title={`${rangeNote}最紧张一晚的销控余量（含拼房床位口径）`}>
+      {compact ? `余${state.min}` : `当日余房 ${state.min}（入住期最低）`}
+    </span>
+  );
+}
 
 /** 编辑期房间盒子（roomFraction 必有值，保存时回写 RoomGroup）。 */
 interface RoomBox {
@@ -82,7 +152,17 @@ function seedBoxes(initial: RoomGroup[] | undefined): RoomBox[] {
 }
 
 // ── 组件 ─────────────────────────────────────────────────────────────────
-export function RoomingEditor({ passengers, initial, hotelName, hotelTier, onSave, onClose }: RoomingEditorProps) {
+export function RoomingEditor({
+  passengers,
+  initial,
+  hotelName,
+  hotelTier,
+  checkIn,
+  checkOut,
+  nightlyRemaining,
+  onSave,
+  onClose,
+}: RoomingEditorProps) {
   const [boxes, setBoxes] = useState<RoomBox[]>(() => seedBoxes(initial));
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -215,6 +295,7 @@ export function RoomingEditor({ passengers, initial, hotelName, hotelTier, onSav
                   {HOTEL_TIER_BADGE[hotelTier].label}
                 </span>
               )}
+              <NightlyRemainingBadge data={nightlyRemaining} checkIn={checkIn} checkOut={checkOut} />
             </div>
           ) : null}
           <p className="mt-0.5 text-xs text-ink-muted">
@@ -267,6 +348,7 @@ export function RoomingEditor({ passengers, initial, hotelName, hotelTier, onSav
                       🏨 {hotelName}
                     </span>
                   )}
+                  <NightlyRemainingBadge data={nightlyRemaining} checkIn={checkIn} checkOut={checkOut} compact />
                   {b.roomFraction === HALF_ROOM && <span className="badge-warning">½ 半间</span>}
                   <span className="text-xs font-normal text-ink-muted">{b.passengerIds.length} 人</span>
                 </span>

@@ -20,13 +20,19 @@ import { BundleBlackoutEditor, type BlackoutDateRow } from '../components/Bundle
 import { SearchSelect, type SearchSelectOption } from '../components/SearchSelect';
 
 // 0702 反馈 1：服务内容 / 单次最多停留天数 —— MockVisa/MockBundle（lib/mockData.ts）暂未声明这两个字段，
-// 用本页局部扩展类型承接，不改共享 mock 类型定义。
-type MockVisaWithStayDays = MockVisa & { stayDays?: number | null };
+// 用本页局部扩展类型承接，不改共享 mock 类型定义。0702 反馈 5：签证成本价同一批加进来，与 stayDays 挂同一个扩展类型。
+type MockVisaWithStayDays = MockVisa & { stayDays?: number | null; costPriceCny?: number | null };
 type MockBundleWithServiceNotes = MockBundle & { serviceNotes?: string | null };
 // 0702 反馈 3：起价拆解需要房型整间夜价 —— MockBundle.hotelRoomType（lib/mockData.ts）里没声明
 // nightlyPriceCny，但后端 serializeBundle 实际会发（见 products.service.ts BUNDLE_ROOM_INCLUDE /
 // serializeBundle），本页局部扩展类型承接，不改共享 mock 类型定义。
 type BundleHotelRoomTypeWithPrice = { id: string; name: string; hotelName: string; nightlyPriceCny?: number | null };
+
+// 0702 反馈 5：成本价（仅内部，前台不显示）—— mockData 共享类型（HotelRoomType/MockTransfer）未声明
+// costPriceCny，与上面 stayDays 同一手法，局部扩展类型承接，不改共享 mock 类型定义。
+type RoomTypeWithCost = HotelRoomType & { costPriceCny?: number | null };
+type MockHotelWithCost = Omit<MockHotel, 'roomTypes'> & { roomTypes: RoomTypeWithCost[] };
+type MockTransferWithCost = MockTransfer & { costPriceCny?: number | null };
 
 type Section = 'hotels' | 'transfers' | 'visas' | 'bundles';
 
@@ -51,7 +57,7 @@ function hotelPhotos(h: MockHotel): string[] {
 }
 
 // ─── API → Mock 适配器（保留现有 UI，不改子组件） ───────────────────
-function hotelApiToMock(h: Hotel): MockHotel {
+function hotelApiToMock(h: Hotel): MockHotelWithCost {
   return {
     id: h.id,
     code: h.code,
@@ -62,7 +68,11 @@ function hotelApiToMock(h: Hotel): MockHotel {
     address: h.address ?? '',
     stars: (h.starRating as 3 | 4 | 5) ?? 4,
     basePrice: Number(h.basePrice ?? 0),
-    rating: h.rating ? Number(h.rating) : 4.5,
+    // 0702 反馈 2：serializeHotel 现在发 rating:{average,count} 对象，不是旧 Decimal 字符串——
+    // Number(对象) = NaN，写回 create/update 会被 JSON 序列化成 null，后端 z.number() 校验直接拒绝
+    // （"Expected number, received null"，即"酒店编辑全挂"根因）。这里改读 average，且下面
+    // persistHotels 已彻底不再把 rating 回传给后端（表单本就没有编辑评分的入口）。
+    rating: h.rating?.average ?? 0,
     reviewCount: h.reviewCount ?? 0,
     emoji: h.emoji ?? '🏨',
     photo: h.photos[0] ?? '',
@@ -76,11 +86,14 @@ function hotelApiToMock(h: Hotel): MockHotel {
       bedType: rt.bedType ?? '',
       maxAdults: rt.maxAdults ?? 2,
       maxChildren: rt.maxChildren ?? 1,
+      // 净房价（仅内部）：匿名/未带 token 拿不到这个 key（见 api.ts listHotels 的 token 参数），
+      // 此处 ?? null 兜底成"未录"而不是误当 0。
+      costPriceCny: rt.costPriceCny != null ? Number(rt.costPriceCny) : null,
     })),
   };
 }
 
-function transferApiToMock(t: ApiTransfer): MockTransfer {
+function transferApiToMock(t: ApiTransfer): MockTransferWithCost {
   return {
     id: t.id,
     code: t.code,
@@ -94,6 +107,7 @@ function transferApiToMock(t: ApiTransfer): MockTransfer {
     photo: t.photo ?? '',
     features: t.features,
     duration: t.duration ?? '',
+    costPriceCny: t.costPriceCny != null ? Number(t.costPriceCny) : null,
   };
 }
 
@@ -113,6 +127,8 @@ function visaApiToMock(v: ApiVisa): MockVisaWithStayDays {
     highlight: v.highlight ?? undefined,
     // 单次入境最多可停留天数（订单详情行程单「最多可停留 X 天」用）
     stayDays: v.stayDays,
+    // 使馆/代办成本（仅内部）：匿名/未带 token 拿不到这个 key，?? null 兜底成"未录"。
+    costPriceCny: v.costPriceCny != null ? Number(v.costPriceCny) : null,
   };
 }
 
@@ -214,6 +230,8 @@ interface RoomTypeOption {
   label: string;
   /** 房型整间夜价（¥/晚，= 酒店每晚起价 × 价格系数，与后端 HotelRoomType.basePrice 落库口径一致）；只读展示用 */
   nightlyPriceCny: number;
+  /** 净房价（¥/晚，仅内部）：套餐向导「地面成本估算」用；未录/无权限看到 → null，绝不按 basePrice 估算替代。 */
+  costPriceCny: number | null;
 }
 
 /** 套餐表单的航班号下拉选项（航班号 · 航线，value = flightId）；保留航班号/航线字段以便提交时回建引用 */
@@ -266,11 +284,27 @@ function flightRefLabel(ref: BundleFlightRef | null | undefined): string | null 
   return `${ref.flightNumber} · ${ref.originCode}→${ref.destinationCode}`;
 }
 
+/**
+ * 0702 反馈 3「报错吞字段」：后端校验失败时已经把 details.fieldErrors（zod flatten()，
+ * 见 backend error-handler.ts）放进响应体，ApiError 也早就存了 .details（见 api.ts），
+ * 但四个 persist* 的 catch 只读了 e.message，具体哪个字段不合规被吞掉——运营看到
+ * "保存失败：Request validation failed" 却猜不出改哪。这里把 fieldErrors 逐条拼进提示。
+ */
+function formatApiError(e: unknown, fallback: string): string {
+  if (!(e instanceof ApiError)) return fallback;
+  const details = e.details as { fieldErrors?: Record<string, string[] | undefined> } | undefined;
+  const fieldErrors = details?.fieldErrors ?? {};
+  const lines = Object.entries(fieldErrors)
+    .filter((entry): entry is [string, string[]] => Array.isArray(entry[1]) && entry[1].length > 0)
+    .map(([field, msgs]) => `· ${field}：${msgs.join('；')}`);
+  return lines.length > 0 ? `${fallback}：${e.message}\n${lines.join('\n')}` : `${fallback}：${e.message}`;
+}
+
 export function ProductsPage() {
   const tokens = useAuth((s) => s.tokens);
   const [section, setSection] = useState<Section>('hotels');
-  const [hotels, setHotels] = useState<MockHotel[]>([]);
-  const [transfers, setTransfers] = useState<MockTransfer[]>([]);
+  const [hotels, setHotels] = useState<MockHotelWithCost[]>([]);
+  const [transfers, setTransfers] = useState<MockTransferWithCost[]>([]);
   const [visas, setVisas] = useState<MockVisaWithStayDays[]>([]);
   const [bundles, setBundles] = useState<MockBundleWithServiceNotes[]>([]);
   const [roomTypeOptions, setRoomTypeOptions] = useState<RoomTypeOption[]>([]);
@@ -285,9 +319,11 @@ export function ProductsPage() {
     let cancelled = false;
     setLoading(true);
     Promise.all([
-      api.listHotels(false),
-      api.listTransfers(false),
-      api.listVisas(false),
+      // 带 tk：匿名/游客拿不到 costPriceCny（0702 反馈 6·成本泄漏修复），本页是后台运营页，
+      // 必须带 ADMIN/STAFF token 才能看到/编辑成本价——否则「成本价进产品表单」的读回路会一直是空的。
+      api.listHotels(false, tk),
+      api.listTransfers(false, tk),
+      api.listVisas(false, tk),
       api.listBundles(false),
       api.listAllFlights(tk).catch(() => ({ flights: [] as AdminFlight[] })),
     ])
@@ -305,6 +341,7 @@ export function ProductsPage() {
               label: `${ht.name} · ${rt.name}`,
               // 整间夜价 = 房型自身 basePrice（服务端权威取价源，与 hotelRoomType.nightlyPriceCny 落库口径一致）。
               nightlyPriceCny: Math.round(Number(rt.basePrice)),
+              costPriceCny: rt.costPriceCny != null ? Number(rt.costPriceCny) : null,
             })),
           ),
         );
@@ -318,7 +355,7 @@ export function ProductsPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  async function persistHotels(next: MockHotel[]) {
+  async function persistHotels(next: MockHotelWithCost[]) {
     const prev = hotels;
     setHotels(next);
     try {
@@ -327,12 +364,19 @@ export function ProductsPage() {
         await api.createHotel(tk, {
           name: n.name, nameEn: n.nameEn, cityCode: n.cityCode, area: n.area,
           address: n.address || n.area, starRating: n.stars, basePrice: n.basePrice,
-          rating: n.rating, reviewCount: n.reviewCount, emoji: n.emoji,
+          // 0702 反馈 2：rating 不再回传——serializeHotel 现在发 {average,count} 聚合对象，
+          // 表单本就没有编辑评分的入口；旧代码 Number(对象)=NaN，JSON 序列化成 null，
+          // 后端 z.number() 校验直接拒绝（"酒店编辑全挂"根因）。评分改由 Review 真实评价聚合，
+          // 不该也不能由本表单手改。
+          reviewCount: n.reviewCount, emoji: n.emoji,
           highlight: n.highlight, amenities: n.amenities, photos: hotelPhotos(n),
           roomTypes: n.roomTypes.map((rt) => ({
             name: rt.name, bedType: rt.bedType, capacity: rt.sleeps,
             basePrice: n.basePrice * rt.priceMult, priceMultiplier: rt.priceMult,
             maxAdults: rt.maxAdults ?? 2, maxChildren: rt.maxChildren ?? 1,
+            // 净房价（仅内部，前台不展示）：留空 = 未录 → 省略字段（房型行是整行覆盖式提交，
+            // 后端把"省略"当"未录"清空，语义上与"不改"无关——新建本就没有"不改"这回事）。
+            costPriceCny: rt.costPriceCny ?? undefined,
           })),
         });
       }
@@ -342,26 +386,28 @@ export function ProductsPage() {
           await api.updateHotel(tk, n.id, {
             name: n.name, nameEn: n.nameEn, cityCode: n.cityCode, area: n.area,
             address: n.address || n.area, starRating: n.stars,
-            basePrice: n.basePrice, rating: n.rating, reviewCount: n.reviewCount,
+            basePrice: n.basePrice, reviewCount: n.reviewCount,
             emoji: n.emoji, highlight: n.highlight, amenities: n.amenities,
             photos: hotelPhotos(n),
             roomTypes: n.roomTypes.map((rt) => ({
               name: rt.name, bedType: rt.bedType, capacity: rt.sleeps,
               basePrice: n.basePrice * rt.priceMult, priceMultiplier: rt.priceMult,
               maxAdults: rt.maxAdults ?? 2, maxChildren: rt.maxChildren ?? 1,
+              // 留空 = 清空成本价（房型行整行覆盖式提交；表单已用现值预填，未改动就会原样送回）。
+              costPriceCny: rt.costPriceCny ?? undefined,
             })),
           });
         }
       }
-      const fresh = await api.listHotels(false);
+      const fresh = await api.listHotels(false, tk);
       setHotels(activeOnly(fresh.hotels).map(hotelApiToMock));
     } catch (e) {
-      alert(e instanceof ApiError ? `保存失败：${e.message}` : '保存失败');
+      alert(formatApiError(e, '保存失败'));
       setHotels(prev);
     }
   }
 
-  async function persistTransfers(next: MockTransfer[]) {
+  async function persistTransfers(next: MockTransferWithCost[]) {
     const prev = transfers;
     setTransfers(next);
     try {
@@ -370,7 +416,13 @@ export function ProductsPage() {
         await api.createTransfer(tk, {
           name: n.name, vehicleType: n.vehicleType, capacity: n.capacity,
           originArea: n.originArea, destArea: n.destArea, basePrice: n.basePrice,
-          features: n.features, duration: n.duration, emoji: n.emoji, photo: n.photo,
+          features: n.features, duration: n.duration, emoji: n.emoji,
+          // 0702 反馈 1「保存失败」根因：photo 是 z.string().url().optional()，空字符串不是合法 URL，
+          // 也不是"没填"——两者对 zod 是两码事。留空时必须整体不传这个键（mirror 下面 highlight
+          // 同款「假值 → undefined」写法），而不是发送 ''。
+          photo: n.photo || undefined,
+          // 净房价（仅内部，前台不展示）：留空 = 未录 → 省略字段。
+          costPriceCny: n.costPriceCny ?? undefined,
         });
       }
       for (const n of next) {
@@ -381,14 +433,18 @@ export function ProductsPage() {
             // PATCH 200 但价格没变（后端 undefined 字段=不改，静默丢弃）——0702 反馈的真实根因。
             name: n.name, vehicleType: n.vehicleType, capacity: n.capacity,
             originArea: n.originArea, destArea: n.destArea, basePrice: n.basePrice,
-            features: n.features, duration: n.duration, emoji: n.emoji, photo: n.photo,
+            features: n.features, duration: n.duration, emoji: n.emoji,
+            photo: n.photo || undefined,
+            // 留空 = 显式清空成本价（真·部分更新字段，null 会被后端当"主动清空"而非"不改"，
+            // 见 backend products.service.ts updateTransfer；表单已用现值预填，未改动会原样送回）。
+            costPriceCny: n.costPriceCny ?? null,
           });
         }
       }
-      const fresh = await api.listTransfers(false);
+      const fresh = await api.listTransfers(false, tk);
       setTransfers(activeOnly(fresh.transfers).map(transferApiToMock));
     } catch (e) {
-      alert(e instanceof ApiError ? `保存失败：${e.message}` : '保存失败');
+      alert(formatApiError(e, '保存失败'));
       setTransfers(prev);
     }
   }
@@ -406,6 +462,8 @@ export function ProductsPage() {
           validityMonths: n.validityMonths, highlight: n.highlight, requiredDocs: n.requiredDocs,
           // 单次入境最多可停留天数（选填）
           stayDays: n.stayDays ?? undefined,
+          // 使馆/代办成本（仅内部，前台不展示）：留空 = 未录 → 省略字段。
+          costPriceCny: n.costPriceCny ?? undefined,
         });
       }
       for (const n of next) {
@@ -419,13 +477,15 @@ export function ProductsPage() {
             validityMonths: n.validityMonths, highlight: n.highlight,
             requiredDocs: n.requiredDocs,
             stayDays: n.stayDays ?? undefined,
+            // 留空 = 显式清空成本价（真·部分更新字段，语义同 Transfer；表单已用现值预填）。
+            costPriceCny: n.costPriceCny ?? null,
           });
         }
       }
-      const fresh = await api.listVisas(false);
+      const fresh = await api.listVisas(false, tk);
       setVisas(activeOnly(fresh.visas).map(visaApiToMock));
     } catch (e) {
-      alert(e instanceof ApiError ? `保存失败：${e.message}` : '保存失败');
+      alert(formatApiError(e, '保存失败'));
       setVisas(prev);
     }
   }
@@ -492,7 +552,7 @@ export function ProductsPage() {
       const fresh = await api.listBundles(false);
       setBundles(activeOnly(fresh.bundles).map(bundleApiToMock));
     } catch (e) {
-      alert(e instanceof ApiError ? `保存失败：${e.message}` : '保存失败');
+      alert(formatApiError(e, '保存失败'));
       setBundles(prev);
     }
   }
@@ -555,9 +615,9 @@ export function ProductsPage() {
 }
 
 // ─── 酒店 ───────────────────────────────────────────────────────────
-function HotelsSection({ items, onChange }: { items: MockHotel[]; onChange: (v: MockHotel[]) => void }) {
+function HotelsSection({ items, onChange }: { items: MockHotelWithCost[]; onChange: (v: MockHotelWithCost[]) => void }) {
   const [showForm, setShowForm] = useState(false);
-  const [editing, setEditing] = useState<MockHotel | null>(null);
+  const [editing, setEditing] = useState<MockHotelWithCost | null>(null);
   return (
     <div className="space-y-3">
       <ActionBar active={items.length} onAdd={() => setShowForm(true)} addLabel="+ 新增酒店" />
@@ -626,9 +686,9 @@ function NewHotelForm({
   onSubmit,
 }: {
   onCancel: () => void;
-  onSubmit: (h: MockHotel) => void;
+  onSubmit: (h: MockHotelWithCost) => void;
 }) {
-  const blank: MockHotel = {
+  const blank: MockHotelWithCost = {
     id: 'h-' + Date.now(),
     name: '',
     nameEn: '',
@@ -644,7 +704,7 @@ function NewHotelForm({
     photos: [],
     amenities: ['免费 WiFi', '含早餐'],
     highlight: '',
-    roomTypes: [{ name: '标准房', priceMult: 1, sleeps: 2, bedType: '双床或大床', maxAdults: 2, maxChildren: 1 }],
+    roomTypes: [{ name: '标准房', priceMult: 1, sleeps: 2, bedType: '双床或大床', maxAdults: 2, maxChildren: 1, costPriceCny: null }],
   };
   return (
     <HotelEditorForm hotel={blank} title="新增酒店" submitLabel="添加" onCancel={onCancel} onSave={onSubmit} />
@@ -652,9 +712,9 @@ function NewHotelForm({
 }
 
 // ─── 接送 ───────────────────────────────────────────────────────────
-function TransfersSection({ items, onChange }: { items: MockTransfer[]; onChange: (v: MockTransfer[]) => void }) {
+function TransfersSection({ items, onChange }: { items: MockTransferWithCost[]; onChange: (v: MockTransferWithCost[]) => void }) {
   const [showForm, setShowForm] = useState(false);
-  const [editing, setEditing] = useState<MockTransfer | null>(null);
+  const [editing, setEditing] = useState<MockTransferWithCost | null>(null);
   return (
     <div className="space-y-3">
       {editing && (
@@ -781,7 +841,7 @@ function BundlesSection({
   roomTypeOptions: RoomTypeOption[];
   flightOptions: FlightOption[];
   /** 接送产品下拉选项（在售）；套餐 TRANSFER 组件只能挑产品，不再手填价 */
-  transfers: MockTransfer[];
+  transfers: MockTransferWithCost[];
   /** 签证产品下拉选项（在售）；套餐 VISA 组件只能挑产品，不再手填价 */
   visas: MockVisaWithStayDays[];
   onChange: (v: MockBundleWithServiceNotes[]) => void;
@@ -1058,7 +1118,7 @@ function NewBundleWizard({
   /** 可绑定的航班号选项（去程/回程下拉）；value = flight.id */
   flightOptions: FlightOption[];
   /** 接送产品下拉选项（在售）；TRANSFER 组件只能挑产品，价格只读来自产品 */
-  transfers: MockTransfer[];
+  transfers: MockTransferWithCost[];
   /** 签证产品下拉选项（在售）；VISA 组件只能挑产品，价格只读来自产品 */
   visas: MockVisaWithStayDays[];
   /** 传入既有套餐 = 编辑模式（各字段预填）；缺省 = 新建 */
@@ -1197,6 +1257,53 @@ function NewBundleWizard({
     transferTotal > 0 ? { label: `接送 ${transferTripsCount}趟`, amount: transferTotal } : null,
     visaPerPax > 0 ? { label: '签证', amount: visaPerPax } : null,
   ].filter((row): row is { label: string; amount: number } => row != null);
+
+  // ── 地面成本估算（仅内部，0702 反馈 5d）—— 与上面「起价/人」卖价拆解完全独立的另一套数：
+  // 用所挑产品的 costPriceCny（净成本，未录 = null）；绝不按 basePrice 打折估算替代
+  // （DB 注释里"NULL 时按 basePrice×0.7 估算"那套是财务对账用的兜底口径，不该在这里悄悄复用，
+  // 否则运营会把估算数当成真成本）。只做展示，不参与任何定价计算。
+  const hotelCostPerNightCny = selectedRoomType?.costPriceCny ?? null;
+  const transferCostById = useMemo(
+    () => new Map(transfers.map((t) => [t.id, t.costPriceCny ?? null])),
+    [transfers],
+  );
+  const visaCostById = useMemo(() => new Map(visas.map((v) => [v.id, v.costPriceCny ?? null])), [visas]);
+  const groundCostParts = useMemo(() => {
+    const parts: Array<{ label: string; amount: number | null }> = [];
+    if (hasHotelItem) {
+      parts.push({
+        label: `0.5间×${nightsForPricing}晚 房型成本`,
+        amount: hotelCostPerNightCny != null ? Math.round(0.5 * hotelCostPerNightCny * nightsForPricing) : null,
+      });
+    }
+    const transferRows = items.filter((i) => i.kind === 'TRANSFER');
+    if (transferRows.length > 0) {
+      let sum = 0;
+      let known = true;
+      for (const row of transferRows) {
+        const cost = row.transferId ? transferCostById.get(row.transferId) : undefined;
+        if (cost == null) { known = false; break; }
+        sum += cost * (row.qty ?? 0);
+      }
+      parts.push({ label: `接送成本×${transferTripsCount}趟`, amount: known ? Math.round(sum) : null });
+    }
+    const visaRows = items.filter((i) => i.kind === 'VISA');
+    if (visaRows.length > 0) {
+      let sum = 0;
+      let known = true;
+      for (const row of visaRows) {
+        // 按 1 人计入（忽略 qty），与上面卖价口径 visaPerPax 一致。
+        const cost = row.visaId ? visaCostById.get(row.visaId) : undefined;
+        if (cost == null) { known = false; break; }
+        sum += cost;
+      }
+      parts.push({ label: '签证成本', amount: known ? Math.round(sum) : null });
+    }
+    return parts;
+  }, [hasHotelItem, nightsForPricing, hotelCostPerNightCny, items, transferCostById, transferTripsCount, visaCostById]);
+  const groundCostKnownTotal = groundCostParts.reduce((s, p) => s + (p.amount ?? 0), 0);
+  const groundCostAllKnown = groundCostParts.every((p) => p.amount != null);
+
   // 运营录入「想卖的价格 / 人」(目标起价，基于 originalPerPaxCny)；系统反推折扣%。
   // 初值 = 现折后价/人(编辑，优先用服务端权威 originalPerPaxCny) 或 原价/人(新建·0折)。
   const [targetPerPax, setTargetPerPax] = useState<number | null>(
@@ -1473,7 +1580,8 @@ function NewBundleWizard({
                 // VISA 按 1 人计入起价（qty 不影响单价，与后端 originalPerPaxCny 口径一致）；其余按 qty × 单价。
                 const subtotal = it.kind === 'VISA' ? unitPriceReadOnly : (it.qty ?? 0) * unitPriceReadOnly;
                 return (
-                  <div key={idx} className="flex items-center gap-2 rounded-lg border border-slate-200 bg-canvas p-2">
+                  <div key={idx}>
+                  <div className="flex items-center gap-2 rounded-lg border border-slate-200 bg-canvas p-2">
                     <span className={`rounded px-1.5 py-0.5 text-xs font-medium ${KIND_LABEL[it.kind].color}`}>
                       {KIND_LABEL[it.kind].label}
                     </span>
@@ -1603,6 +1711,14 @@ function NewBundleWizard({
                       ×
                     </button>
                   </div>
+                  {/* 0702 反馈 7：酒店行 0.5 桥接（owner-approved wording）——只是把 hotelHalfShareCny
+                      换个「单价×晚数」的写法摊给运营看，不改任何定价数学，纯展示。 */}
+                  {isFirstHotelRow && hotelNightlyPriceCny > 0 && (
+                    <p className="pl-1 text-[11px] text-ink-muted">
+                      计入起价：¥{Math.round(0.5 * hotelNightlyPriceCny).toLocaleString()}×{nightsForPricing}晚（0.5间）
+                    </p>
+                  )}
+                  </div>
                 );
               })}
             </div>
@@ -1628,6 +1744,19 @@ function NewBundleWizard({
             )}
             {roomTypeOptions.length === 0 && hasHotelItem && (
               <p className="mt-1 text-xs text-amber-700">⚠️ 暂无可选房型，请先到 产品管理 › 酒店 里添加酒店/房型。</p>
+            )}
+            {/* 0702 反馈 5d：地面成本估算（仅内部）—— 与上面「起价/人」卖价拆解分开展示，用虚线框 + 「仅内部」
+                标签区隔，避免运营把两套数字混着看。未录成本的组件按「未录」显示，不拿挂牌价打折估算替代。 */}
+            {groundCostParts.length > 0 && (
+              <p className="mt-1.5 rounded-md border border-dashed border-slate-300 bg-slate-50 px-2 py-1 text-[11px] leading-relaxed text-ink-muted">
+                <span className="mr-1 rounded bg-slate-200 px-1 py-0.5 text-[10px] font-medium text-ink-soft">仅内部</span>
+                地面成本估算：
+                {groundCostParts
+                  .map((p) => `${p.label} ${p.amount != null ? `¥${p.amount.toLocaleString()}` : '未录'}`)
+                  .join(' + ')}
+                {' '}= ¥{groundCostKnownTotal.toLocaleString()}
+                {!groundCostAllKnown && '（未录成本的组件按未录显示，不估算）'}
+              </p>
             )}
           </div>
 
@@ -1792,7 +1921,7 @@ function ActionBar({ active, onAdd, addLabel }: { active: number; onAdd: () => v
 // 编辑表单：酒店 / 接送 / 签证
 // ═══════════════════════════════════════════════════════════════
 
-function EditHotelForm({ hotel, onCancel, onSave }: { hotel: MockHotel; onCancel: () => void; onSave: (h: MockHotel) => void }) {
+function EditHotelForm({ hotel, onCancel, onSave }: { hotel: MockHotelWithCost; onCancel: () => void; onSave: (h: MockHotelWithCost) => void }) {
   return (
     <HotelEditorForm
       hotel={hotel}
@@ -1816,11 +1945,11 @@ function HotelEditorForm({
   onCancel,
   onSave,
 }: {
-  hotel: MockHotel;
+  hotel: MockHotelWithCost;
   title: string;
   submitLabel: string;
   onCancel: () => void;
-  onSave: (h: MockHotel) => void;
+  onSave: (h: MockHotelWithCost) => void;
 }) {
   const [name, setName] = useState(hotel.name);
   const [nameEn, setNameEn] = useState(hotel.nameEn);
@@ -1836,8 +1965,10 @@ function HotelEditorForm({
     hotel.photos && hotel.photos.length > 0 ? hotel.photos : hotel.photo ? [hotel.photo] : [''],
   );
   const [amenities, setAmenities] = useState<string[]>(hotel.amenities);
-  const [roomTypes, setRoomTypes] = useState<HotelRoomType[]>(
-    hotel.roomTypes.length > 0 ? hotel.roomTypes : [{ name: '', priceMult: 1, sleeps: 2, bedType: '', maxAdults: 2, maxChildren: 1 }],
+  const [roomTypes, setRoomTypes] = useState<RoomTypeWithCost[]>(
+    hotel.roomTypes.length > 0
+      ? hotel.roomTypes
+      : [{ name: '', priceMult: 1, sleeps: 2, bedType: '', maxAdults: 2, maxChildren: 1, costPriceCny: null }],
   );
   const [saved, setSaved] = useState(false);
 
@@ -1847,7 +1978,7 @@ function HotelEditorForm({
     const cleanRooms = roomTypes
       .map((rt) => ({ ...rt, name: rt.name.trim(), bedType: rt.bedType.trim() }))
       .filter((rt) => rt.name);
-    const updated: MockHotel = {
+    const updated: MockHotelWithCost = {
       ...hotel,
       name: name.trim(),
       nameEn: nameEn.trim(),
@@ -1913,7 +2044,8 @@ function HotelEditorForm({
             <input className="input" value={address} onChange={(e) => setAddress(e.target.value)} placeholder="如 越南岘港市 Vo Nguyen Giap 路 5 号" />
           </div>
           <div>
-            <label className="label text-xs">每晚起价 (¥)</label>
+            {/* 0702 反馈 5c：与「成本价（仅内部）」并列时容易混——明确标成前台展示价。 */}
+            <label className="label text-xs">每晚起价（前台展示价）</label>
             <NumberInput min={0} className="input" value={basePrice} onChange={(n) => setBasePrice(n)} />
           </div>
         </div>
@@ -2040,9 +2172,9 @@ function AmenityChipsEditor({ amenities, onChange }: { amenities: string[]; onCh
   );
 }
 
-/** 房型管理：可增删行，每行 房型名 / 床型 / 人数 / 每晚价 / 价格系数 */
-function RoomTypesEditor({ roomTypes, onChange }: { roomTypes: HotelRoomType[]; onChange: (v: HotelRoomType[]) => void }) {
-  const setAt = (idx: number, patch: Partial<HotelRoomType>) =>
+/** 房型管理：可增删行，每行 房型名 / 床型 / 人数 / 每晚价 / 价格系数 / 成本价（仅内部） */
+function RoomTypesEditor({ roomTypes, onChange }: { roomTypes: RoomTypeWithCost[]; onChange: (v: RoomTypeWithCost[]) => void }) {
+  const setAt = (idx: number, patch: Partial<RoomTypeWithCost>) =>
     onChange(roomTypes.map((rt, i) => (i === idx ? { ...rt, ...patch } : rt)));
   const removeAt = (idx: number) => onChange(roomTypes.filter((_, i) => i !== idx));
   return (
@@ -2052,14 +2184,16 @@ function RoomTypesEditor({ roomTypes, onChange }: { roomTypes: HotelRoomType[]; 
         <button
           type="button"
           className="text-xs font-medium text-brand hover:text-brand-dark"
-          onClick={() => onChange([...roomTypes, { name: '', priceMult: 1, sleeps: 2, bedType: '', maxAdults: 2, maxChildren: 1 }])}
+          onClick={() => onChange([...roomTypes, { name: '', priceMult: 1, sleeps: 2, bedType: '', maxAdults: 2, maxChildren: 1, costPriceCny: null }])}
         >
           + 添加房型
         </button>
       </div>
       <div className="mt-2 space-y-2">
         {roomTypes.map((rt, idx) => (
-          <div key={idx} className="grid grid-cols-2 items-end gap-2 rounded-lg border border-slate-200 bg-canvas p-2 md:grid-cols-16">
+          // 0702 反馈 5b：新增「成本价」列，16 列的既有网格（tailwind.config.js 里专为这行配的）放不下，
+          // 用 arbitrary value 直接扩到 18 列，不改 tailwind 配置（不在本次改动的文件白名单里）。
+          <div key={idx} className="grid grid-cols-2 items-end gap-2 rounded-lg border border-slate-200 bg-canvas p-2 md:grid-cols-[repeat(18,minmax(0,1fr))]">
             <div className="col-span-2 md:col-span-3">
               <label className="label text-xs">房型名 *</label>
               <input className="input" value={rt.name} onChange={(e) => setAt(idx, { name: e.target.value })} placeholder="海景大床房" />
@@ -2084,6 +2218,16 @@ function RoomTypesEditor({ roomTypes, onChange }: { roomTypes: HotelRoomType[]; 
               <label className="label text-xs">价格系数</label>
               <NumberInput min={0.1} max={20} className="input" value={rt.priceMult} onChange={(n) => setAt(idx, { priceMult: n ?? 1 })} />
             </div>
+            <div className="md:col-span-2">
+              <label className="label text-xs">成本价（¥/晚，仅内部）</label>
+              <NumberInput
+                min={0}
+                className="input"
+                placeholder="未录"
+                value={rt.costPriceCny ?? null}
+                onChange={(n) => setAt(idx, { costPriceCny: n })}
+              />
+            </div>
             <div className="md:col-span-2 flex items-center justify-end pb-1">
               <button type="button" className="text-xs text-ink-muted hover:text-rose-600" onClick={() => removeAt(idx)}>
                 删除
@@ -2092,14 +2236,14 @@ function RoomTypesEditor({ roomTypes, onChange }: { roomTypes: HotelRoomType[]; 
           </div>
         ))}
       </div>
-      <p className="mt-1 text-xs text-ink-muted">每晚价 = 酒店每晚起价 × 价格系数（如标准房 1.0、海景房 1.15）。</p>
+      <p className="mt-1 text-xs text-ink-muted">每晚价 = 酒店每晚起价 × 价格系数（如标准房 1.0、海景房 1.15）。成本价仅内部核算用，前台不展示。</p>
     </div>
   );
 }
 
 /** 新增地面服务：复用统一编辑器，预填一份合理空白模板（弹窗内填好再 POST）。 */
-function NewTransferForm({ onCancel, onSubmit }: { onCancel: () => void; onSubmit: (t: MockTransfer) => void }) {
-  const blank: MockTransfer = {
+function NewTransferForm({ onCancel, onSubmit }: { onCancel: () => void; onSubmit: (t: MockTransferWithCost) => void }) {
+  const blank: MockTransferWithCost = {
     id: 't-' + Date.now(),
     name: '',
     vehicleType: '舒适型轿车',
@@ -2111,13 +2255,14 @@ function NewTransferForm({ onCancel, onSubmit }: { onCancel: () => void; onSubmi
     photo: '',
     features: ['含中文司机'],
     duration: '约 15 分钟',
+    costPriceCny: null,
   };
   return (
     <TransferEditorForm transfer={blank} title="新增地面服务" submitLabel="添加" onCancel={onCancel} onSave={onSubmit} />
   );
 }
 
-function EditTransferForm({ transfer, onCancel, onSave }: { transfer: MockTransfer; onCancel: () => void; onSave: (t: MockTransfer) => void }) {
+function EditTransferForm({ transfer, onCancel, onSave }: { transfer: MockTransferWithCost; onCancel: () => void; onSave: (t: MockTransferWithCost) => void }) {
   return (
     <TransferEditorForm
       transfer={transfer}
@@ -2136,24 +2281,26 @@ function TransferEditorForm({
   onCancel,
   onSave,
 }: {
-  transfer: MockTransfer;
+  transfer: MockTransferWithCost;
   title: string;
   submitLabel: string;
   onCancel: () => void;
-  onSave: (t: MockTransfer) => void;
+  onSave: (t: MockTransferWithCost) => void;
 }) {
   const [form, setForm] = useState({ ...transfer });
   const [basePrice, setBasePrice] = useState<number | null>(transfer.basePrice);
   const [capacity, setCapacity] = useState<number | null>(transfer.capacity);
+  const [costPrice, setCostPrice] = useState<number | null>(transfer.costPriceCny ?? null);
   const [featuresText, setFeaturesText] = useState(transfer.features.join(', '));
   const [saved, setSaved] = useState(false);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    const updated: MockTransfer = {
+    const updated: MockTransferWithCost = {
       ...form,
       basePrice: basePrice ?? 0,
       capacity: capacity ?? 1,
+      costPriceCny: costPrice,
       features: featuresText.split(',').map(s => s.trim()).filter(Boolean),
     };
     setSaved(true);
@@ -2172,7 +2319,8 @@ function TransferEditorForm({
           <input required className="input" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
         </div>
         <div>
-          <label className="label text-xs">起步价 (¥)</label>
+          {/* 0702 反馈 5c：与「成本价（仅内部）」并列时容易混——明确标成前台展示价。 */}
+          <label className="label text-xs">起步价（前台展示价）</label>
           <NumberInput min={0} className="input" value={basePrice} onChange={(n) => setBasePrice(n)} />
         </div>
         <div className="md:col-span-2">
@@ -2180,8 +2328,13 @@ function TransferEditorForm({
           <input className="input" value={form.vehicleType} onChange={(e) => setForm({ ...form, vehicleType: e.target.value })} />
         </div>
         <div>
-          <label className="label text-xs">最大乘客数</label>
-          <NumberInput min={1} max={20} className="input" value={capacity} onChange={(n) => setCapacity(n)} integerOnly />
+          {/* 0702 反馈 4：hint 曾停在旧上限 20，与后端 schema max 30 不一致，运营按 hint 会误以为填不了 25+ 人的车型。 */}
+          <label className="label text-xs">最大乘客数（≤30）</label>
+          <NumberInput min={1} max={30} className="input" value={capacity} onChange={(n) => setCapacity(n)} integerOnly />
+        </div>
+        <div>
+          <label className="label text-xs">成本价（¥，仅内部，前台不展示）</label>
+          <NumberInput min={0} className="input" placeholder="未录" value={costPrice} onChange={(n) => setCostPrice(n)} />
         </div>
         <div>
           <label className="label text-xs">出发区域</label>
@@ -2270,6 +2423,7 @@ function VisaEditorForm({
   const [validityMonths, setValidityMonths] = useState<number | null>(visa.validityMonths);
   // 单次入境最多可停留天数（选填；订单详情行程单「最多可停留 X 天」+ 推算生效/失效日期用）
   const [stayDays, setStayDays] = useState<number | null>(visa.stayDays ?? null);
+  const [costPrice, setCostPrice] = useState<number | null>(visa.costPriceCny ?? null);
   const [docsText, setDocsText] = useState(visa.requiredDocs.join(', '));
   const [saved, setSaved] = useState(false);
 
@@ -2284,6 +2438,7 @@ function VisaEditorForm({
       highlight: form.highlight || undefined,
       requiredDocs: docsText.split(',').map(s => s.trim()).filter(Boolean),
       stayDays: stayDays ?? undefined,
+      costPriceCny: costPrice,
     };
     setSaved(true);
     setTimeout(() => onSave(updated), 800);
@@ -2301,8 +2456,16 @@ function VisaEditorForm({
           <input required className="input" value={form.country} onChange={(e) => setForm({ ...form, country: e.target.value })} />
         </div>
         <div>
-          <label className="label text-xs">国家代码</label>
-          <input className="input" value={form.countryCode} onChange={(e) => setForm({ ...form, countryCode: e.target.value })} maxLength={3} />
+          {/* 0702 反馈 4：maxLength 曾放宽到 3，实际 ISO 3166-1 alpha-2 只有 2 位，
+              后端 destinationCountry: z.string().length(2) 对 3 位一律 400——运营填了却存不进去。 */}
+          <label className="label text-xs">国家代码（2 位，如 VN）</label>
+          <input
+            className="input"
+            value={form.countryCode}
+            onChange={(e) => setForm({ ...form, countryCode: e.target.value.toUpperCase() })}
+            maxLength={2}
+            placeholder="VN"
+          />
         </div>
         <div>
           <label className="label text-xs">国旗 Emoji</label>
@@ -2313,7 +2476,8 @@ function VisaEditorForm({
           <input required className="input" value={form.type} onChange={(e) => setForm({ ...form, type: e.target.value })} placeholder="如 电子签证 E-visa · 30 天单次" />
         </div>
         <div>
-          <label className="label text-xs">办理费 (¥)</label>
+          {/* 0702 反馈 5c：与「成本价（仅内部）」并列时容易混——明确标成前台展示价。 */}
+          <label className="label text-xs">办理费（前台展示价）</label>
           <NumberInput min={0} className="input" value={basePrice} onChange={(n) => setBasePrice(n)} />
         </div>
         <div>
@@ -2321,12 +2485,17 @@ function VisaEditorForm({
           <NumberInput min={0} className="input" value={expressSurcharge} onChange={(n) => setExpressSurcharge(n)} />
         </div>
         <div>
-          <label className="label text-xs">出签天数</label>
+          <label className="label text-xs">成本价（¥，仅内部，前台不展示）</label>
+          <NumberInput min={0} className="input" placeholder="未录" value={costPrice} onChange={(n) => setCostPrice(n)} />
+        </div>
+        <div>
+          <label className="label text-xs">出签天数（工作日）</label>
           <NumberInput min={1} max={60} className="input" value={processingDays} onChange={(n) => setProcessingDays(n)} integerOnly />
         </div>
         <div>
           <label className="label text-xs">有效期 (月)</label>
           <NumberInput min={1} max={120} className="input" value={validityMonths} onChange={(n) => setValidityMonths(n)} integerOnly />
+          <p className="mt-1 text-[11px] text-ink-muted">落地签/短签为出签当日生效，可留空，按「单次最多停留(天)」掌握</p>
         </div>
         <div>
           <label className="label text-xs">单次最多停留（天，选填）</label>

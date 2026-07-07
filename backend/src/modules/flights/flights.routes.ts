@@ -7,6 +7,7 @@ import { actorFromRequest } from '../../lib/audit.js';
 import { priceQuerySchema } from '../pricing/pricing.schemas.js';
 import {
   batchDeleteSchedulesBodySchema,
+  batchUpdateCapacityBodySchema,
   createFlightBodySchema,
   createScheduleBodySchema,
   flightSearchQuerySchema,
@@ -173,6 +174,20 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
     async (req) => {
       const body = batchDeleteSchedulesBodySchema.parse(req.body);
       const result = await service.batchDeleteSchedules(body, actorFromRequest(req));
+      return { result };
+    },
+  );
+
+  // 批量改容量（按 scheduleId 列表；已售超过目标容量的班次自动跳过，不影响其它班次）。
+  // 仅 ADMIN —— 与批量删除同权限口径，批量改动爆炸半径大；操作写审计留痕。
+  // body: { scheduleIds, seatClasses: [{cabin, capacity}] }
+  // 返回 { applied, skipped: [{ scheduleId, reason }] }。
+  app.post(
+    '/schedules/batch-update-capacity',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN)] },
+    async (req) => {
+      const body = batchUpdateCapacityBodySchema.parse(req.body);
+      const result = await service.batchUpdateCapacity(body, actorFromRequest(req));
       return { result };
     },
   );

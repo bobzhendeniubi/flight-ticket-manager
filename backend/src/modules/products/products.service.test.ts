@@ -16,11 +16,16 @@ import { Prisma } from '@prisma/client';
 const { mockPrisma } = vi.hoisted(() => ({
   mockPrisma: {
     bundle: { findFirst: vi.fn(), findUnique: vi.fn(), create: vi.fn(), update: vi.fn() },
-    hotelRoomType: { findUnique: vi.fn() },
-    transfer: { findMany: vi.fn() },
+    hotel: { findFirst: vi.fn(), findUnique: vi.fn(), findUniqueOrThrow: vi.fn(), create: vi.fn(), update: vi.fn() },
+    hotelRoomType: { findMany: vi.fn(), findUnique: vi.fn(), create: vi.fn(), update: vi.fn(), deleteMany: vi.fn() },
+    transfer: { findMany: vi.fn(), findUnique: vi.fn(), findFirst: vi.fn(), create: vi.fn(), update: vi.fn() },
     visa: { findMany: vi.fn(), findFirst: vi.fn(), create: vi.fn(), update: vi.fn(), findUnique: vi.fn() },
     flight: { findUnique: vi.fn() },
     flightSeatClass: { findMany: vi.fn() },
+    // 评价聚合（ReviewsService.getAggregates 内部用；listXxx/getXxx 的 includeCost 透传测试会走到这里）
+    review: { groupBy: vi.fn() },
+    // updateHotel 用 $transaction 包房型 upsert；测试里直接把 mockPrisma 自己当 tx 传回调（同款方法集）
+    $transaction: vi.fn(),
   },
 }));
 
@@ -30,6 +35,9 @@ import {
   ProductsService,
   deriveHotelNightsFromItems,
   resolveBundleItemPrices,
+  serializeHotel,
+  serializeTransfer,
+  serializeVisa,
 } from './products.service.js';
 import type { BundleItemInput } from './products.schemas.js';
 
@@ -778,5 +786,536 @@ describe('ProductsService · businessUpgradeCnyPerLeg 默认值（0702 反馈：
     const result = await service.updateBundle('bundle-1', { businessUpgradeCnyPerLeg: 0 });
 
     expect(result.businessUpgradeCnyPerLeg).toBe(0);
+  });
+});
+
+describe('ProductsService · costPriceCny 成本价往返（0702 后台反馈 5·成本价进产品表单）', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('createHotel：roomTypes[].costPriceCny 落库为 Decimal 并原样透出', async () => {
+    mockPrisma.hotel.findFirst.mockResolvedValueOnce(null);
+    mockPrisma.hotel.create.mockImplementationOnce(async ({ data }: { data: Record<string, unknown> }) => ({
+      id: 'hotel-1',
+      code: data.code,
+      name: data.name,
+      nameEn: null,
+      cityCode: 'DAD',
+      area: null,
+      address: '测试地址',
+      starRating: 4,
+      basePrice: null,
+      rating: null,
+      reviewCount: null,
+      soldCount: 0,
+      emoji: null,
+      highlight: null,
+      latitude: null,
+      longitude: null,
+      amenities: [],
+      photos: [],
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      roomTypes: (data.roomTypes as { create: Array<Record<string, unknown>> }).create.map((rt, i) => ({
+        id: `rt-${i}`,
+        hotelId: 'hotel-1',
+        ...rt,
+      })),
+    }));
+
+    const service = new ProductsService();
+    const result = await service.createHotel({
+      name: '测试酒店',
+      cityCode: 'DAD',
+      address: '测试地址',
+      starRating: 4,
+      isActive: true,
+      amenities: [],
+      photos: [],
+      roomTypes: [
+        { name: '标准房', capacity: 2, maxAdults: 2, maxChildren: 1, basePrice: 500, costPriceCny: 350 },
+      ],
+    });
+
+    expect(result.roomTypes[0].costPriceCny).toBe('350');
+    const callArg = mockPrisma.hotel.create.mock.calls[0][0] as {
+      data: { roomTypes: { create: Array<{ costPriceCny: Prisma.Decimal }> } };
+    };
+    expect(callArg.data.roomTypes.create[0].costPriceCny.toString()).toBe('350');
+  });
+
+  it('createHotel：roomTypes[].costPriceCny 省略 → 落库 null（未录，不是 0，也不报错）', async () => {
+    mockPrisma.hotel.findFirst.mockResolvedValueOnce(null);
+    mockPrisma.hotel.create.mockImplementationOnce(async ({ data }: { data: Record<string, unknown> }) => ({
+      id: 'hotel-1',
+      code: data.code,
+      name: data.name,
+      nameEn: null,
+      cityCode: 'DAD',
+      area: null,
+      address: '测试地址',
+      starRating: 4,
+      basePrice: null,
+      rating: null,
+      reviewCount: null,
+      soldCount: 0,
+      emoji: null,
+      highlight: null,
+      latitude: null,
+      longitude: null,
+      amenities: [],
+      photos: [],
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      roomTypes: (data.roomTypes as { create: Array<Record<string, unknown>> }).create.map((rt, i) => ({
+        id: `rt-${i}`,
+        hotelId: 'hotel-1',
+        ...rt,
+      })),
+    }));
+
+    const service = new ProductsService();
+    const result = await service.createHotel({
+      name: '测试酒店',
+      cityCode: 'DAD',
+      address: '测试地址',
+      starRating: 4,
+      isActive: true,
+      amenities: [],
+      photos: [],
+      roomTypes: [{ name: '标准房', capacity: 2, maxAdults: 2, maxChildren: 1, basePrice: 500 }],
+    });
+
+    expect(result.roomTypes[0].costPriceCny).toBeNull();
+  });
+
+  it('updateHotel：房型行编辑时把成本价字段留空提交 → 清空为 null（整行覆盖式提交，省略≠"不改"）', async () => {
+    mockPrisma.hotel.findUnique.mockResolvedValueOnce({ id: 'hotel-1' });
+    mockPrisma.$transaction.mockImplementationOnce(async (fn: (tx: typeof mockPrisma) => unknown) => fn(mockPrisma));
+    mockPrisma.hotel.update.mockResolvedValueOnce({});
+    mockPrisma.hotelRoomType.findMany.mockResolvedValueOnce([{ id: 'rt-1', name: '标准房' }]);
+    mockPrisma.hotelRoomType.update.mockResolvedValueOnce({});
+    mockPrisma.hotel.findUniqueOrThrow.mockResolvedValueOnce({
+      id: 'hotel-1',
+      code: 'H0001',
+      name: '测试酒店',
+      nameEn: null,
+      cityCode: 'DAD',
+      area: null,
+      address: '测试地址',
+      starRating: 4,
+      basePrice: null,
+      rating: null,
+      reviewCount: null,
+      soldCount: 0,
+      emoji: null,
+      highlight: null,
+      latitude: null,
+      longitude: null,
+      amenities: [],
+      photos: [],
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      roomTypes: [
+        {
+          id: 'rt-1',
+          hotelId: 'hotel-1',
+          name: '标准房',
+          bedType: null,
+          capacity: 2,
+          maxAdults: 2,
+          maxChildren: 1,
+          basePrice: new Prisma.Decimal(500),
+          priceMultiplier: null,
+          costPriceCny: null,
+          photos: [],
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      ],
+    });
+
+    const service = new ProductsService();
+    const result = await service.updateHotel('hotel-1', {
+      roomTypes: [
+        // costPriceCny 省略（表单里被清空提交）
+        { id: 'rt-1', name: '标准房', capacity: 2, maxAdults: 2, maxChildren: 1, basePrice: 500 },
+      ],
+    });
+
+    expect(result.roomTypes[0].costPriceCny).toBeNull();
+    expect(mockPrisma.hotelRoomType.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'rt-1' },
+        data: expect.objectContaining({ costPriceCny: null }),
+      }),
+    );
+  });
+
+  it('createTransfer：costPriceCny 落库为 Decimal 并原样透出', async () => {
+    mockPrisma.transfer.findFirst.mockResolvedValueOnce(null);
+    mockPrisma.transfer.create.mockImplementationOnce(async ({ data }: { data: Record<string, unknown> }) => ({
+      id: 'transfer-1',
+      code: data.code,
+      name: data.name,
+      vehicleType: data.vehicleType,
+      capacity: data.capacity,
+      originArea: data.originArea,
+      destArea: data.destArea,
+      basePrice: data.basePrice,
+      costPriceCny: data.costPriceCny,
+      features: [],
+      duration: null,
+      soldCount: 0,
+      emoji: null,
+      photo: null,
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    }));
+
+    const service = new ProductsService();
+    const result = await service.createTransfer({
+      name: '机场接送',
+      vehicleType: '轿车',
+      capacity: 3,
+      originArea: 'A',
+      destArea: 'B',
+      basePrice: 100,
+      features: [],
+      isActive: true,
+      costPriceCny: 65,
+    });
+
+    expect(result.costPriceCny).toBe('65');
+    const callArg = mockPrisma.transfer.create.mock.calls[0][0] as { data: { costPriceCny: Prisma.Decimal } };
+    expect(callArg.data.costPriceCny.toString()).toBe('65');
+  });
+
+  it('updateTransfer：省略 costPriceCny → 不写该字段（保留现值，不强行清空）', async () => {
+    mockPrisma.transfer.findUnique.mockResolvedValueOnce({ id: 'transfer-1' });
+    mockPrisma.transfer.update.mockResolvedValueOnce({
+      id: 'transfer-1',
+      code: 'T0001',
+      name: '改名后',
+      vehicleType: '轿车',
+      capacity: 3,
+      originArea: 'A',
+      destArea: 'B',
+      basePrice: new Prisma.Decimal(100),
+      costPriceCny: new Prisma.Decimal(65),
+      features: [],
+      duration: null,
+      soldCount: 0,
+      emoji: null,
+      photo: null,
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    const service = new ProductsService();
+    const result = await service.updateTransfer('transfer-1', { name: '改名后' });
+
+    expect(result.costPriceCny).toBe('65');
+    expect(mockPrisma.transfer.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.not.objectContaining({ costPriceCny: expect.anything() }),
+      }),
+    );
+  });
+
+  it('updateTransfer：显式传 null → 清空成本价为 null（运营主动清空已录的成本，不是"忘了填"）', async () => {
+    mockPrisma.transfer.findUnique.mockResolvedValueOnce({ id: 'transfer-1' });
+    mockPrisma.transfer.update.mockImplementationOnce(async ({ data }: { data: Record<string, unknown> }) => ({
+      id: 'transfer-1',
+      code: 'T0001',
+      name: '机场接送',
+      vehicleType: '轿车',
+      capacity: 3,
+      originArea: 'A',
+      destArea: 'B',
+      basePrice: new Prisma.Decimal(100),
+      costPriceCny: data.costPriceCny,
+      features: [],
+      duration: null,
+      soldCount: 0,
+      emoji: null,
+      photo: null,
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    }));
+
+    const service = new ProductsService();
+    const result = await service.updateTransfer('transfer-1', { costPriceCny: null });
+
+    expect(result.costPriceCny).toBeNull();
+    expect(mockPrisma.transfer.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ costPriceCny: null }) }),
+    );
+  });
+
+  it('createVisa：costPriceCny 落库为 Decimal 并原样透出', async () => {
+    mockPrisma.visa.findFirst.mockResolvedValueOnce(null);
+    mockPrisma.visa.create.mockImplementationOnce(async ({ data }: { data: Record<string, unknown> }) => ({
+      id: 'visa-1',
+      code: data.code,
+      destinationCountry: data.destinationCountry,
+      country: data.country ?? null,
+      visaType: data.visaType,
+      visaName: data.visaName ?? null,
+      flag: null,
+      photo: null,
+      processingDays: data.processingDays,
+      basePrice: new Prisma.Decimal(280),
+      expressSurcharge: null,
+      costPriceCny: data.costPriceCny,
+      validityMonths: data.validityMonths ?? null,
+      stayDays: data.stayDays ?? null,
+      highlight: null,
+      requiredDocs: [],
+      soldCount: 0,
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    }));
+
+    const service = new ProductsService();
+    const result = await service.createVisa({
+      destinationCountry: 'VN',
+      visaType: 'tourist',
+      processingDays: 3,
+      basePrice: 280,
+      isActive: true,
+      costPriceCny: 150,
+    });
+
+    expect(result.costPriceCny).toBe('150');
+    const callArg = mockPrisma.visa.create.mock.calls[0][0] as { data: { costPriceCny: Prisma.Decimal } };
+    expect(callArg.data.costPriceCny.toString()).toBe('150');
+  });
+
+  it('updateVisa：省略 costPriceCny → 不写该字段（保留现值）', async () => {
+    mockPrisma.visa.findUnique.mockResolvedValueOnce({ id: 'visa-1' });
+    mockPrisma.visa.update.mockResolvedValueOnce({
+      id: 'visa-1',
+      code: 'V0001',
+      destinationCountry: 'VN',
+      country: '越南',
+      visaType: 'tourist',
+      visaName: '电子签证',
+      flag: null,
+      photo: null,
+      processingDays: 3,
+      basePrice: new Prisma.Decimal(280),
+      expressSurcharge: null,
+      costPriceCny: new Prisma.Decimal(150),
+      validityMonths: null,
+      stayDays: null,
+      highlight: null,
+      requiredDocs: [],
+      soldCount: 0,
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    const service = new ProductsService();
+    const result = await service.updateVisa('visa-1', { highlight: '限时优惠' });
+
+    expect(result.costPriceCny).toBe('150');
+    expect(mockPrisma.visa.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.not.objectContaining({ costPriceCny: expect.anything() }),
+      }),
+    );
+  });
+});
+
+describe('serializeHotel / serializeTransfer / serializeVisa · includeCost 角色隔离（0702 反馈 6·成本泄漏修复）', () => {
+  const hotelRow = {
+    id: 'hotel-1',
+    code: 'H0001',
+    name: '测试酒店',
+    nameEn: null,
+    cityCode: 'DAD',
+    area: null,
+    address: '测试地址',
+    starRating: 4,
+    basePrice: new Prisma.Decimal(880),
+    rating: null,
+    reviewCount: 0,
+    soldCount: 0,
+    emoji: null,
+    highlight: null,
+    latitude: null,
+    longitude: null,
+    amenities: [] as string[],
+    photos: [] as string[],
+    isActive: true,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    roomTypes: [
+      {
+        id: 'rt-1',
+        hotelId: 'hotel-1',
+        name: '标准房',
+        bedType: null,
+        capacity: 2,
+        maxAdults: 2,
+        maxChildren: 1,
+        basePrice: new Prisma.Decimal(880),
+        priceMultiplier: null,
+        costPriceCny: new Prisma.Decimal(620),
+        photos: [] as string[],
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      },
+    ],
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  } as any;
+
+  const transferRow = {
+    id: 't1',
+    code: 'T0001',
+    name: '机场接送',
+    vehicleType: '轿车',
+    capacity: 3,
+    originArea: 'A',
+    destArea: 'B',
+    basePrice: new Prisma.Decimal(100),
+    costPriceCny: new Prisma.Decimal(65),
+    features: [] as string[],
+    duration: null,
+    soldCount: 0,
+    emoji: null,
+    photo: null,
+    isActive: true,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  } as any;
+
+  const visaRow = {
+    id: 'v1',
+    code: 'V0001',
+    destinationCountry: 'VN',
+    country: '越南',
+    visaType: 'tourist',
+    visaName: null,
+    flag: null,
+    photo: null,
+    processingDays: 3,
+    basePrice: new Prisma.Decimal(280),
+    expressSurcharge: null,
+    costPriceCny: new Prisma.Decimal(150),
+    validityMonths: 1,
+    stayDays: null,
+    highlight: null,
+    requiredDocs: [] as string[],
+    soldCount: 0,
+    isActive: true,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  } as any;
+
+  it('includeCost=false（匿名/游客）→ 三种产品序列化结果都完全不含 costPriceCny 这个 key（不是 null，是没有该 key）', () => {
+    const hotel = serializeHotel(hotelRow, undefined, false);
+    expect(hotel.roomTypes[0]).not.toHaveProperty('costPriceCny');
+
+    const transfer = serializeTransfer(transferRow, undefined, false);
+    expect(transfer).not.toHaveProperty('costPriceCny');
+
+    const visa = serializeVisa(visaRow, undefined, false);
+    expect(visa).not.toHaveProperty('costPriceCny');
+  });
+
+  it('includeCost=true（ADMIN/STAFF）→ 三种产品都正常下发 costPriceCny（转成字符串，与 basePrice 同款序列化口径）', () => {
+    const hotel = serializeHotel(hotelRow, undefined, true);
+    expect(hotel.roomTypes[0].costPriceCny).toBe('620');
+
+    const transfer = serializeTransfer(transferRow, undefined, true);
+    expect(transfer.costPriceCny).toBe('65');
+
+    const visa = serializeVisa(visaRow, undefined, true);
+    expect(visa.costPriceCny).toBe('150');
+  });
+
+  it('不传 includeCost（省略第三个参数）→ 默认 true，既有内部调用点（create/update 等）行为不受影响', () => {
+    const hotel = serializeHotel(hotelRow);
+    expect(hotel.roomTypes[0].costPriceCny).toBe('620');
+
+    const transfer = serializeTransfer(transferRow);
+    expect(transfer.costPriceCny).toBe('65');
+
+    const visa = serializeVisa(visaRow);
+    expect(visa.costPriceCny).toBe('150');
+  });
+
+  it('costPriceCny 本身为 null（未录）：includeCost=true → 下发 null；includeCost=false → 仍不含该 key', () => {
+    const rowNoCost = { ...transferRow, costPriceCny: null };
+    expect(serializeTransfer(rowNoCost, undefined, true).costPriceCny).toBeNull();
+    expect(serializeTransfer(rowNoCost, undefined, false)).not.toHaveProperty('costPriceCny');
+  });
+});
+
+describe('ProductsService.getTransfer/listTransfers · includeCost 透传（路由层按 req.user 角色算好后传入）', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockPrisma.review.groupBy.mockResolvedValue([]);
+  });
+
+  const row = {
+    id: 't1',
+    code: 'T0001',
+    name: '机场接送',
+    vehicleType: '轿车',
+    capacity: 3,
+    originArea: 'A',
+    destArea: 'B',
+    basePrice: new Prisma.Decimal(100),
+    costPriceCny: new Prisma.Decimal(65),
+    features: [] as string[],
+    duration: null,
+    soldCount: 0,
+    emoji: null,
+    photo: null,
+    isActive: true,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  };
+
+  it('getTransfer(id, false)（匿名请求）→ 结果不含 costPriceCny key', async () => {
+    mockPrisma.transfer.findUnique.mockResolvedValueOnce(row);
+    const service = new ProductsService();
+    const result = await service.getTransfer('t1', false);
+    expect(result).not.toHaveProperty('costPriceCny');
+  });
+
+  it('getTransfer(id, true)（ADMIN/STAFF 请求）→ 结果含 costPriceCny', async () => {
+    mockPrisma.transfer.findUnique.mockResolvedValueOnce(row);
+    const service = new ProductsService();
+    const result = await service.getTransfer('t1', true);
+    expect(result.costPriceCny).toBe('65');
+  });
+
+  it('listTransfers(false, false)（不带 token 的匿名列表）→ 每一条都不含 costPriceCny key', async () => {
+    mockPrisma.transfer.findMany.mockResolvedValueOnce([row]);
+    const service = new ProductsService();
+    const [result] = await service.listTransfers(false, false);
+    expect(result).not.toHaveProperty('costPriceCny');
+  });
+
+  it('listTransfers(false)（省略 includeCost）→ 默认 false，与 getXxx 系列同款「默认不下发」口径', async () => {
+    mockPrisma.transfer.findMany.mockResolvedValueOnce([row]);
+    const service = new ProductsService();
+    const [result] = await service.listTransfers(false);
+    expect(result).not.toHaveProperty('costPriceCny');
   });
 });

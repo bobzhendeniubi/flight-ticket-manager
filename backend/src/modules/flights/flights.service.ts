@@ -16,6 +16,7 @@ import type { FareBucketsInput } from '../pricing/pricing.schemas.js';
 import { localDate } from '../finances/finances.cost.service.js';
 import type {
   BaggagePolicyItem,
+  BatchUpdateCapacityBody,
   CreateFlightBody,
   CreateScheduleBody,
   FlightSearchQuery,
@@ -46,14 +47,28 @@ function fareBucketsToPrisma(
 }
 
 // ── 余位档位（服务端权威口径，前端只展示档位不展示精确数字）────────────────
-// 阈值（张）：>40 充足 AMPLE；16-40 偏紧 TIGHT；6-15 紧张 LOW；1-5 极少 VERY_LOW；≤0 售罄 SOLD_OUT
-// 注：运营可能随销售节奏调整这些阈值（改这里即可，全局唯一来源）。
+// 按"占舱位容量比例"分档（而非绝对张数）——固定张数口径下，一个 20 座商务舱订满
+// 也会被绝对阈值（原 41 张才算充足）误标"紧张"；改成比例后，满仓永远是 AMPLE，
+// 无论这个舱位是 7 座、20 座还是 200 座。
+//
+// 档位（available 相对 capacity 的占比，向上取整到"张"，并夹到 < capacity，
+// 保证 available === capacity 时必为 AMPLE）：
+//   available ≤ 0                              → SOLD_OUT 售罄
+//   available ≤ ceil(capacity × 5%)             → VERY_LOW 极少
+//   available ≤ ceil(capacity × 15%)            → LOW 紧张
+//   available ≤ ceil(capacity × 40%)            → TIGHT 偏紧
+//   否则                                         → AMPLE 充足
+// 注：运营可能随销售节奏调整这些比例（改这里即可，全局唯一来源）。
 export const AVAILABILITY_TIER_THRESHOLDS = {
-  AMPLE_MIN: 41,
-  TIGHT_MIN: 16,
-  LOW_MIN: 6,
-  VERY_LOW_MIN: 1,
+  VERY_LOW_MAX_RATIO: 0.05,
+  LOW_MAX_RATIO: 0.15,
+  TIGHT_MAX_RATIO: 0.4,
 } as const;
+
+// 未传 capacity 的历史调用方（如 bundle-availability.service 按日聚合多班次求和后的口径，
+// 那里没有单一 capacity 可传）沿用此参考容量——100 时新比例门槛 5/15/40 与旧版绝对阈值
+// 完全数值等价，因此这些调用方行为不受本次改动影响。
+const LEGACY_REFERENCE_CAPACITY = 100;
 
 export type AvailabilityTier = 'AMPLE' | 'TIGHT' | 'LOW' | 'VERY_LOW' | 'SOLD_OUT';
 
@@ -70,13 +85,24 @@ export function capPublicAvailable(available: number): number {
   return Math.min(Math.max(0, available), PUBLIC_AVAILABLE_CAP);
 }
 
-/** 把锁位感知的可售余量（available）折算成档位。 */
-export function computeAvailabilityTier(available: number): AvailabilityTier {
-  if (available >= AVAILABILITY_TIER_THRESHOLDS.AMPLE_MIN) return 'AMPLE';
-  if (available >= AVAILABILITY_TIER_THRESHOLDS.TIGHT_MIN) return 'TIGHT';
-  if (available >= AVAILABILITY_TIER_THRESHOLDS.LOW_MIN) return 'LOW';
-  if (available >= AVAILABILITY_TIER_THRESHOLDS.VERY_LOW_MIN) return 'VERY_LOW';
-  return 'SOLD_OUT';
+/**
+ * 把锁位感知的可售余量（available）相对舱位容量（capacity）折算成档位。
+ * capacity 缺省 = LEGACY_REFERENCE_CAPACITY（100）——未传时数值上完全复现旧版
+ * 绝对阈值（5/15/40），供尚未改造的历史调用方（不在本次改动范围内）零行为变更接入。
+ */
+export function computeAvailabilityTier(
+  available: number,
+  capacity: number = LEGACY_REFERENCE_CAPACITY,
+): AvailabilityTier {
+  if (available <= 0) return 'SOLD_OUT';
+  // 门槛 = ceil(capacity × ratio)，并夹到 capacity−1 以内——防止小容量舱位的门槛
+  // 反超总容量，导致满仓（available === capacity）也被误判进紧张档。
+  const cap = Math.max(capacity, 0);
+  const cut = (ratio: number) => Math.min(cap - 1, Math.ceil(cap * ratio));
+  if (available <= cut(AVAILABILITY_TIER_THRESHOLDS.VERY_LOW_MAX_RATIO)) return 'VERY_LOW';
+  if (available <= cut(AVAILABILITY_TIER_THRESHOLDS.LOW_MAX_RATIO)) return 'LOW';
+  if (available <= cut(AVAILABILITY_TIER_THRESHOLDS.TIGHT_MAX_RATIO)) return 'TIGHT';
+  return 'AMPLE';
 }
 
 export class FlightService {
@@ -173,7 +199,7 @@ export class FlightService {
               cabin: c.cabin,
               // 公开口径：不输出 capacity/sold/locked，余位数值 ≤9 封顶（档位仍按真值算）
               available: capPublicAvailable(avail),
-              availabilityTier: computeAvailabilityTier(avail),
+              availabilityTier: computeAvailabilityTier(avail, c.capacity),
               basePrice: c.basePrice.toString(),
               dynamicPrice,
               dateRank,
@@ -757,5 +783,86 @@ export class FlightService {
     }
 
     return { deleted: deletableIds.length, skipped };
+  }
+
+  /**
+   * 批量改容量（路由层限 ADMIN）。
+   * 场景：航司调整机型/客舱布局，运营要把一批班次的某舱位容量从旧值改到新值
+   * （如经济 180→184、商务 20→7），逐个点太慢。
+   * 按 scheduleId 列表逐条处理（scheduleId 由前端按"日期区间 + 星期几"筛出，
+   * 复用批量改价面板已有的班次选择范围）：
+   *   - 每条按 cabin 定位舱位，套用与单班次编辑（updateSchedule）同口径的
+   *     "容量不能低于已售"守卫：命中守卫 → 整个班次跳过（不改任何舱位），
+   *     记入 skipped（镜像 batchDeleteSchedules 的响应形状），不是整批失败；
+   *   - 该班次没有请求里的某个舱位 → 那一项静默跳过（不算失败）；
+   *   - 请求的舱位在该班次里一个都不存在 → 整个班次跳过，记入 skipped；
+   *   - scheduleId 查无此班次 → 跳过，记入 skipped。
+   * 可执行的改动一次事务写入，保证要么全部落库、要么整体回滚。
+   * 写审计留痕（改了几个班次 + 已改/跳过明细），批量操作爆炸半径大，必须可追溯。
+   */
+  async batchUpdateCapacity(body: BatchUpdateCapacityBody, actor?: AuditActor) {
+    const schedules = await prisma.flightSchedule.findMany({
+      where: { id: { in: body.scheduleIds } },
+      include: { seatClasses: true },
+    });
+    const scheduleById = new Map(schedules.map((s) => [s.id, s]));
+
+    const appliedIds: string[] = [];
+    const skipped: Array<{ scheduleId: string; reason: string }> = [];
+    const updates: Array<{ seatClassId: string; capacity: number }> = [];
+
+    for (const scheduleId of body.scheduleIds) {
+      const schedule = scheduleById.get(scheduleId);
+      if (!schedule) {
+        skipped.push({ scheduleId, reason: '班次不存在' });
+        continue;
+      }
+      const seatClassByCabin = new Map(schedule.seatClasses.map((c) => [c.cabin, c]));
+      const scheduleUpdates: Array<{ seatClassId: string; capacity: number }> = [];
+      let guardReason: string | null = null;
+      for (const item of body.seatClasses) {
+        const current = seatClassByCabin.get(item.cabin);
+        if (!current) continue; // 该班次没有此舱位：这一项静默跳过，不算失败
+        if (item.capacity < current.sold) {
+          guardReason = `已售${current.sold}超过目标容量${item.capacity}`;
+          break;
+        }
+        scheduleUpdates.push({ seatClassId: current.id, capacity: item.capacity });
+      }
+      if (guardReason) {
+        skipped.push({ scheduleId, reason: guardReason });
+        continue;
+      }
+      if (scheduleUpdates.length === 0) {
+        skipped.push({ scheduleId, reason: '该班次没有匹配的舱位' });
+        continue;
+      }
+      updates.push(...scheduleUpdates);
+      appliedIds.push(scheduleId);
+    }
+
+    if (updates.length > 0) {
+      await prisma.$transaction(
+        updates.map((u) =>
+          prisma.flightSeatClass.update({ where: { id: u.seatClassId }, data: { capacity: u.capacity } }),
+        ),
+      );
+
+      // 批量改动爆炸半径大 —— 写审计留痕（沿用 batchDeleteSchedules 的 fire-and-forget 口径）。
+      await writeAudit({
+        actor: actor ?? {},
+        action: 'BATCH_UPDATE_CAPACITY',
+        targetType: AuditTargetType.FLIGHT,
+        targetLabel: `批量改容量 ${appliedIds.length} 个班次`,
+        after: {
+          appliedScheduleIds: appliedIds,
+          skipped,
+          seatClasses: body.seatClasses,
+        },
+        severity: AuditSeverity.WARNING,
+      });
+    }
+
+    return { applied: appliedIds.length, skipped };
   }
 }

@@ -95,6 +95,8 @@ export const createHotelBodySchema = z.object({
       maxChildren: z.number().int().min(0).max(10).default(1),
       basePrice: z.number().nonnegative(),
       priceMultiplier: z.number().positive().optional(),
+      // 净房价（CNY/晚，仅内部，前台不下发）— 与 finances 成本维护同一列；省略/null = 未录。
+      costPriceCny: z.number().nonnegative().nullable().optional(),
     }),
   )
     // 同名房型会让 updateHotel 的 name 匹配二义（后写覆盖前写、静默丢一条）→ 直接拒绝
@@ -120,6 +122,8 @@ export const createTransferBodySchema = z.object({
   duration: z.string().max(50).optional(),
   emoji: z.string().max(10).optional(),
   photo: z.string().url().optional(),
+  // 司机/车队结算价（CNY，仅内部，前台不下发）— 与 finances 成本维护同一列；省略/null = 未录。
+  costPriceCny: z.number().nonnegative().nullable().optional(),
   isActive: z.boolean().default(true),
 });
 export type CreateTransferBody = z.infer<typeof createTransferBodySchema>;
@@ -142,6 +146,8 @@ export const createVisaBodySchema = z.object({
   stayDays: z.number().int().min(1).max(365).optional(),
   highlight: z.string().max(300).optional(),
   requiredDocs: z.array(z.string().max(100)).default([]),
+  // 使馆/代办成本（CNY，仅内部，前台不下发）— 与 finances 成本维护同一列；省略/null = 未录。
+  costPriceCny: z.number().nonnegative().nullable().optional(),
   isActive: z.boolean().default(true),
 });
 export type CreateVisaBody = z.infer<typeof createVisaBodySchema>;

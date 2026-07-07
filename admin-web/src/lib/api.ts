@@ -900,7 +900,10 @@ export interface Hotel {
   address: string;
   starRating: number;
   basePrice: string | null;
-  rating: string | null;
+  /** D3 真实评价聚合（来自 Review 表，非旧手填 Decimal）；恒为对象，无评价时 {average:0,count:0} */
+  rating: { average: number; count: number };
+  /** 旧手填 Decimal 评分兜底字段（serializeHotel 里改名保留）；本页未使用它做展示 */
+  ratingLegacy?: string | null;
   reviewCount: number | null;
   emoji: string | null;
   highlight: string | null;
@@ -1450,6 +1453,17 @@ export const api = {
       '/flights/schedules/batch-delete',
       { method: 'POST', token, body },
     ),
+  // 批量改容量（ADMIN）：scheduleIds 由前端按日期区间/星期几筛出（复用批量改价面板的
+  // 班次选择范围），seatClasses 按 cabin 套用到每个命中班次。后端逐条守 capacity ≥ sold，
+  // 命中守卫的班次跳过（不改），返回 { applied, skipped: [{ scheduleId, reason }] }。
+  batchUpdateCapacity: (
+    token: string,
+    body: { scheduleIds: string[]; seatClasses: Array<{ cabin: CabinClass; capacity: number }> },
+  ) =>
+    apiFetch<{ result: { applied: number; skipped: Array<{ scheduleId: string; reason: string }> } }>(
+      '/flights/schedules/batch-update-capacity',
+      { method: 'POST', token, body },
+    ),
   // 行李规则（航班 × 舱等；ADMIN/STAFF 维护）
   getBaggagePolicies: (token: string, flightId: string) =>
     apiFetch<{ policies: FlightBaggagePolicy[] }>(`/flights/${flightId}/baggage-policies`, { token }),
@@ -1852,8 +1866,10 @@ export const api = {
   },
 
   // Products — Hotels
-  listHotels: (activeOnly = false) =>
-    apiFetch<{ hotels: Hotel[] }>(`/products/hotels${activeOnly ? '?active=1' : ''}`),
+  // token 选填：带 ADMIN/STAFF token 时后端会下发 costPriceCny（成本价，仅内部）；
+  // 匿名/不传 token 时响应里完全不含这个 key（0702 反馈 6·成本泄漏修复，见 backend products.routes.ts isCostVisible）。
+  listHotels: (activeOnly = false, token?: string | null) =>
+    apiFetch<{ hotels: Hotel[] }>(`/products/hotels${activeOnly ? '?active=1' : ''}`, { token }),
   createHotel: (token: string, body: Record<string, unknown>) =>
     apiFetch<{ hotel: Hotel }>('/products/hotels', { method: 'POST', token, body }),
   updateHotel: (token: string, id: string, body: Record<string, unknown>) =>
@@ -1862,8 +1878,9 @@ export const api = {
     apiFetch<{ result: { id: string; isActive: boolean } }>(`/products/hotels/${id}`, { method: 'DELETE', token }),
 
   // Products — Transfers
-  listTransfers: (activeOnly = false) =>
-    apiFetch<{ transfers: Transfer[] }>(`/products/transfers${activeOnly ? '?active=1' : ''}`),
+  // token 选填：同 listHotels，带 ADMIN/STAFF token 才下发 costPriceCny。
+  listTransfers: (activeOnly = false, token?: string | null) =>
+    apiFetch<{ transfers: Transfer[] }>(`/products/transfers${activeOnly ? '?active=1' : ''}`, { token }),
   createTransfer: (token: string, body: Record<string, unknown>) =>
     apiFetch<{ transfer: Transfer }>('/products/transfers', { method: 'POST', token, body }),
   updateTransfer: (token: string, id: string, body: Record<string, unknown>) =>
@@ -1872,8 +1889,9 @@ export const api = {
     apiFetch<{ result: { id: string; isActive: boolean } }>(`/products/transfers/${id}`, { method: 'DELETE', token }),
 
   // Products — Visas
-  listVisas: (activeOnly = false) =>
-    apiFetch<{ visas: Visa[] }>(`/products/visas${activeOnly ? '?active=1' : ''}`),
+  // token 选填：同 listHotels，带 ADMIN/STAFF token 才下发 costPriceCny。
+  listVisas: (activeOnly = false, token?: string | null) =>
+    apiFetch<{ visas: Visa[] }>(`/products/visas${activeOnly ? '?active=1' : ''}`, { token }),
   createVisa: (token: string, body: Record<string, unknown>) =>
     apiFetch<{ visa: Visa }>('/products/visas', { method: 'POST', token, body }),
   updateVisa: (token: string, id: string, body: Record<string, unknown>) =>
@@ -2686,5 +2704,63 @@ export const agentRechargeApi = {
     apiFetch<{ ok: true; agentId: string; amount: number; balanceAfter: number; transactionId: string }>(
       '/agent-recharges/manual-adjust',
       { method: 'POST', token, body },
+    ),
+};
+
+// ── 房控导出 / 占房 / 余房（ADMIN/STAFF）── 独立命名空间，不改动上方既有 `api` /
+// `agentRechargeApi` 对象字面量（并发改动风险，同 PaymentChannelWithAgent 一带的写法）。
+// 对应 backend/src/modules/hotel-control/* 新增端点：
+//   GET /hotel-control/export?from&to          房态导出（xlsx，销控矩阵原样导出，含「未配包房」标记）
+//   GET /hotel-control/occupants?hotelId&date   占房下钻（某酒店某晚，谁占的）
+//   GET /hotel-control/nightly-remaining?hotelRoomTypeId&checkIn&checkOut  当日余量（分房弹窗徽标）
+
+/** GET /hotel-control/occupants 单条 —— 某酒店某晚的占房订单明细。 */
+export interface HotelOccupant {
+  orderId: string;
+  orderNumber: string;
+  status: OrderStatus;
+  contactName: string;
+  passengerCount: number;
+  /** 该占房行的间数（与销控板「用房」同口径） */
+  rooms: number;
+  checkIn: string; // YYYY-MM-DD（该行入住日）
+  checkOut: string; // YYYY-MM-DD（该行退房日）
+  agentName: string; // 无代理 = '直客'
+}
+
+/** GET /hotel-control/nightly-remaining —— 入住区间逐晚余量（原始数组，未汇总；由调用方按需汇总展示）。 */
+export interface HotelNightlyRemainingResult {
+  dates: string[]; // YYYY-MM-DD，[checkIn, checkOut) 逐晚
+  remaining: number[]; // 与 dates 一一对应；block=0 的晚也会给出（=-used，调用方应据 block 判断是否可信）
+  block: number[]; // 该晚包房周期覆盖的间数；0 = 未配置
+  hasBlock: boolean; // false = 整段查询范围内一条包房周期都没有（remaining/block 为空数组）
+}
+
+export const hotelControlOpsApi = {
+  /** 房态导出（xlsx）—— 销控矩阵原样导出；ADMIN/STAFF only。 */
+  downloadBoardExport: async (token: string, range: { from: string; to: string }): Promise<Blob> => {
+    const res = await fetch(
+      `${API_BASE}/hotel-control/export?from=${encodeURIComponent(range.from)}&to=${encodeURIComponent(range.to)}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) throw new ApiError(res.status, { code: 'EXPORT_FAILED', message: await res.text() });
+    return res.blob();
+  },
+
+  /** 占房下钻：某酒店某晚是谁占的（销控矩阵余量格点击用）。 */
+  getHotelOccupants: (token: string, params: { hotelId: string; date: string }) =>
+    apiFetch<{ occupants: HotelOccupant[] }>(
+      `/hotel-control/occupants?hotelId=${encodeURIComponent(params.hotelId)}&date=${encodeURIComponent(params.date)}`,
+      { token },
+    ),
+
+  /** 当日余房：给定房型 + 入住区间，逐晚余量（分房弹窗徽标用；ADMIN/STAFF 回原始数字，与公开端点的档位口径不同）。 */
+  getNightlyRemaining: (
+    token: string,
+    params: { hotelRoomTypeId: string; checkIn: string; checkOut: string },
+  ) =>
+    apiFetch<HotelNightlyRemainingResult>(
+      `/hotel-control/nightly-remaining?hotelRoomTypeId=${encodeURIComponent(params.hotelRoomTypeId)}&checkIn=${encodeURIComponent(params.checkIn)}&checkOut=${encodeURIComponent(params.checkOut)}`,
+      { token },
     ),
 };

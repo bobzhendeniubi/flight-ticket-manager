@@ -89,6 +89,33 @@ export const batchDeleteSchedulesBodySchema = z
   });
 export type BatchDeleteSchedulesBody = z.infer<typeof batchDeleteSchedulesBodySchema>;
 
+// ── 批量改容量（按 scheduleId 列表；镜像批量删除的响应形状）────────────────
+// scheduleIds 由前端按"日期区间 + 星期几"筛出（复用批量改价面板已有的班次选择范围）；
+// seatClasses 每条 {cabin, capacity} 套用到每个命中班次的对应舱位——该班次没有此舱位
+// 则这一项静默跳过；容量低于该班次已售张数则整条班次跳过（不改），回报 skipped。
+export const batchUpdateCapacityBodySchema = z.object({
+  scheduleIds: z.array(z.string().min(1)).min(1).max(2000),
+  seatClasses: z
+    .array(
+      z.object({
+        cabin: z.nativeEnum(CabinClass),
+        capacity: z.number().int().min(0).max(600),
+      }),
+    )
+    .min(1)
+    .max(4)
+    .superRefine((items, ctx) => {
+      const seen = new Set<CabinClass>();
+      for (const item of items) {
+        if (seen.has(item.cabin)) {
+          ctx.addIssue({ code: z.ZodIssueCode.custom, message: `舱等 ${item.cabin} 重复` });
+        }
+        seen.add(item.cabin);
+      }
+    }),
+});
+export type BatchUpdateCapacityBody = z.infer<typeof batchUpdateCapacityBodySchema>;
+
 // ── 单班次编辑（月历库存视图：改价 / 改容量 / 停用启用 / 改时刻）────────────
 // 全部可选，但至少给一个；seatClasses 内每条按 cabin 定位，basePrice/capacity 各自可选
 export const updateScheduleBodySchema = z

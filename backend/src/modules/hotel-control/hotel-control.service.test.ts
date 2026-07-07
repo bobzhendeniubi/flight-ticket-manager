@@ -17,6 +17,8 @@ import type { PrismaClient } from '@prisma/client';
 import {
   getAlerts,
   getBoard,
+  getOccupyingOrders,
+  getNightlyRemainingForRoomType,
   expandSharedHalfByDate,
   computePhysicalUsed,
 } from './hotel-control.service.js';
@@ -309,5 +311,151 @@ describe('getBoard physicalUsed / physicalRemaining', () => {
     expect(rows.physicalUsed).toEqual([2, 2, 0]);
     // 物理余量 = block(5) - physicalUsed
     expect(rows.physicalRemaining).toEqual([3, 3, 5]);
+  });
+});
+
+describe('getOccupyingOrders', () => {
+  function occupantsClient(items: unknown[]): PrismaClient {
+    return {
+      orderItem: { findMany: vi.fn().mockResolvedValue(items) },
+    } as unknown as PrismaClient;
+  }
+
+  it('查询过滤：hotelId + 覆盖当晚 [hotelCheckIn<=date<hotelCheckOut] + COUNTED_STATUSES', async () => {
+    const client = occupantsClient([]);
+    await getOccupyingOrders('h9', '2026-08-01', client);
+    const findMany = client.orderItem.findMany as unknown as ReturnType<typeof vi.fn>;
+    const where = findMany.mock.calls[0][0].where;
+    expect(where.hotelRoomTypeId).toEqual({ not: null });
+    expect(where.hotelRoomType).toEqual({ hotelId: 'h9' });
+    expect(where.hotelCheckIn).toEqual({ lte: new Date('2026-08-01T00:00:00.000Z') });
+    expect(where.hotelCheckOut).toEqual({ gt: new Date('2026-08-01T00:00:00.000Z') });
+    expect(where.order.status.in).toContain('PAID');
+    expect(where.order.status.in).not.toContain('CANCELLED');
+  });
+
+  it('返回订单/联系人/间数/入住区间/代理；占位联系人（documentNumber=N/A）不计入人数', async () => {
+    const client = occupantsClient([
+      {
+        roomsBilled: 1,
+        metadata: null,
+        hotelCheckIn: day(0),
+        hotelCheckOut: day(2),
+        order: {
+          id: 'o1',
+          orderNumber: 'ST-0001',
+          status: 'PAID',
+          contactName: '张三',
+          agent: { companyName: '成都国旅' },
+          passengers: [{ documentNumber: 'E1' }, { documentNumber: 'E2' }, { documentNumber: 'N/A' }],
+        },
+      },
+    ]);
+    const occupants = await getOccupyingOrders('h1', dayStr(0), client);
+    expect(occupants).toEqual([
+      {
+        orderId: 'o1',
+        orderNumber: 'ST-0001',
+        status: 'PAID',
+        contactName: '张三',
+        passengerCount: 2,
+        rooms: 1,
+        checkIn: dayStr(0),
+        checkOut: dayStr(2),
+        agentName: '成都国旅',
+      },
+    ]);
+  });
+
+  it('间数回落 metadata.roomsNeeded（roomsBilled 缺省）；无代理显示「直客」', async () => {
+    const client = occupantsClient([
+      {
+        roomsBilled: null,
+        metadata: { roomsNeeded: 3 },
+        hotelCheckIn: day(0),
+        hotelCheckOut: day(1),
+        order: {
+          id: 'o2',
+          orderNumber: 'ST-0002',
+          status: 'TICKETED',
+          contactName: '李四',
+          agent: null,
+          passengers: [{ documentNumber: 'E3' }],
+        },
+      },
+    ]);
+    const occupants = await getOccupyingOrders('h1', dayStr(0), client);
+    expect(occupants[0]!.rooms).toBe(3);
+    expect(occupants[0]!.agentName).toBe('直客');
+  });
+
+  it('同一酒店该晚多行占房（如两种房型）→ 逐行返回，不做订单级合并', async () => {
+    const base = {
+      hotelCheckIn: day(0),
+      hotelCheckOut: day(1),
+      roomsBilled: 1,
+      metadata: null,
+      order: {
+        id: 'o3',
+        orderNumber: 'ST-0003',
+        status: 'PAID',
+        contactName: '王五',
+        agent: null,
+        passengers: [{ documentNumber: 'E4' }],
+      },
+    };
+    const client = occupantsClient([base, { ...base, roomsBilled: 2 }]);
+    const occupants = await getOccupyingOrders('h1', dayStr(0), client);
+    expect(occupants).toHaveLength(2);
+    expect(occupants.map((o) => o.rooms)).toEqual([1, 2]);
+  });
+});
+
+describe('getNightlyRemainingForRoomType', () => {
+  function roomTypeClient(opts: {
+    hotelId: string | null;
+    periods: unknown[];
+    items: unknown[];
+  }): PrismaClient {
+    return {
+      hotelRoomType: {
+        findUnique: vi.fn().mockResolvedValue(opts.hotelId ? { hotelId: opts.hotelId } : null),
+      },
+      hotelBlockPeriod: { findMany: vi.fn().mockResolvedValue(opts.periods) },
+      orderItem: { findMany: vi.fn().mockResolvedValue(opts.items) },
+    } as unknown as PrismaClient;
+  }
+
+  it('房型不存在 → 抛「房型不存在」', async () => {
+    const client = roomTypeClient({ hotelId: null, periods: [], items: [] });
+    await expect(
+      getNightlyRemainingForRoomType('rt-missing', dayStr(0), dayStr(2), client),
+    ).rejects.toThrow('房型不存在');
+  });
+
+  it('解出 hotelId 后复用 getHotelNightlyRemaining：2 晚、包房 3 间、首晚 1 间占用 → remaining [2,3]', async () => {
+    const client = roomTypeClient({
+      hotelId: 'h1',
+      periods: [
+        { hotelId: 'h1', dateFrom: day(0), dateTo: day(5), rooms: 3, unitPrice: null, hotel: { name: 'X' } },
+      ],
+      items: [
+        { hotelCheckIn: day(0), hotelCheckOut: day(1), hotelRoomType: { hotelId: 'h1', hotel: { name: 'X' } } },
+      ],
+    });
+    const result = await getNightlyRemainingForRoomType('rt1', dayStr(0), dayStr(2), client);
+    expect(result.dates).toEqual([dayStr(0), dayStr(1)]);
+    expect(result.hasBlock).toBe(true);
+    expect(result.block).toEqual([3, 3]);
+    expect(result.remaining).toEqual([2, 3]);
+  });
+
+  it('整段无包房周期 → hasBlock=false；dates 仍按 [checkIn,checkOut) 给出，remaining/block 为空数组', async () => {
+    const client = roomTypeClient({ hotelId: 'h2', periods: [], items: [] });
+    const result = await getNightlyRemainingForRoomType('rt2', dayStr(0), dayStr(3), client);
+    expect(result.dates).toEqual([dayStr(0), dayStr(1), dayStr(2)]);
+    expect(result.hasBlock).toBe(false);
+    expect(result.remaining).toEqual([]);
+    expect(result.block).toEqual([]);
   });
 });

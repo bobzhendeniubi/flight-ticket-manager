@@ -41,3 +41,20 @@ export const alertsQuerySchema = z.object({
   days: z.coerce.number().int().min(1).max(60).default(14),
 });
 export type AlertsQuery = z.infer<typeof alertsQuerySchema>;
+
+// ── 占房下钻（某酒店某晚，谁占的；销控矩阵红/黄格点击用）────────────────────
+export const occupantsQuerySchema = z.object({
+  hotelId: z.string().min(1),
+  date: dateStr,
+});
+export type OccupantsQuery = z.infer<typeof occupantsQuerySchema>;
+
+// ── 当日余量（给定房型 + 入住区间逐晚展开；分房弹窗徽标用）───────────────────
+export const nightlyRemainingQuerySchema = z
+  .object({
+    hotelRoomTypeId: z.string().min(1),
+    checkIn: dateStr,
+    checkOut: dateStr,
+  })
+  .refine((q) => q.checkIn < q.checkOut, { message: '入住日必须早于退房日' });
+export type NightlyRemainingQuery = z.infer<typeof nightlyRemainingQuerySchema>;

@@ -187,8 +187,9 @@ export function expandBlockByDate(
 /**
  * 单行真实占房间数：roomsBilled（新列，支持 0.5 半间）→ metadata.roomsNeeded（套餐已写）
  * → metadata.rooms（酒店行写）→ 1（兜底）。任意值非有限正数都回落到下一优先级。
+ * export：占房下钻（getOccupyingOrders）复用同一口径，避免与销控板 used 计算漂移。
  */
-function itemRoomCount(it: {
+export function itemRoomCount(it: {
   roomsBilled?: Prisma.Decimal | number | null;
   metadata?: unknown;
 }): number {
@@ -609,4 +610,113 @@ export async function getForward(
   );
   const remaining = held.map((v, i) => v - occupied[i]);
   return { dates: board.dates, held, occupied, remaining };
+}
+
+// ── 占房下钻（某酒店某晚，谁占的；销控矩阵余量格点击下钻用）──────────────────
+export interface HotelOccupantDto {
+  orderId: string;
+  orderNumber: string;
+  status: OrderStatus;
+  contactName: string;
+  /** 该订单出行人数（占位联系人 documentNumber='N/A' 不计，口径同前台分房池） */
+  passengerCount: number;
+  /** 该占房行的间数（与销控板「用房」同口径，见 itemRoomCount） */
+  rooms: number;
+  checkIn: string; // YYYY-MM-DD（该行入住日）
+  checkOut: string; // YYYY-MM-DD（该行退房日）
+  agentName: string; // 无代理 = '直客'
+}
+
+/**
+ * 某酒店某晚的占房订单明细。过滤口径与 getHotelNightlyRemaining 的 used 完全一致
+ * （COUNTED_STATUSES + [checkIn, checkOut) 半开区间覆盖该晚）。
+ * 一个订单若有多行占该酒店该晚（如同订单订了两种房型）展开成多行、不做订单级合并——
+ * 每行对应一次真实占房，避免合并后间数/入住区间失真。
+ */
+export async function getOccupyingOrders(
+  hotelId: string,
+  date: string,
+  client: PrismaClient = defaultPrisma,
+): Promise<HotelOccupantDto[]> {
+  const d = toDateOnly(date);
+  const items = await client.orderItem.findMany({
+    where: {
+      hotelRoomTypeId: { not: null },
+      hotelRoomType: { hotelId },
+      hotelCheckIn: { lte: d },
+      hotelCheckOut: { gt: d },
+      order: { status: { in: COUNTED_STATUSES } },
+    },
+    orderBy: { hotelCheckIn: 'asc' },
+    select: {
+      roomsBilled: true,
+      metadata: true,
+      hotelCheckIn: true,
+      hotelCheckOut: true,
+      order: {
+        select: {
+          id: true,
+          orderNumber: true,
+          status: true,
+          contactName: true,
+          agent: { select: { companyName: true } },
+          passengers: { select: { documentNumber: true } },
+        },
+      },
+    },
+  });
+
+  return items
+    .filter((it) => it.hotelCheckIn != null && it.hotelCheckOut != null)
+    .map((it) => ({
+      orderId: it.order.id,
+      orderNumber: it.order.orderNumber,
+      status: it.order.status,
+      contactName: it.order.contactName,
+      passengerCount: it.order.passengers.filter((p) => p.documentNumber !== 'N/A').length,
+      rooms: itemRoomCount(it),
+      checkIn: fmtDateOnly(it.hotelCheckIn!),
+      checkOut: fmtDateOnly(it.hotelCheckOut!),
+      agentName: it.order.agent?.companyName ?? '直客',
+    }));
+}
+
+// ── 当日余量（给定房型 + 入住区间；分房弹窗徽标用）───────────────────────────
+export interface HotelNightlyRemainingResult {
+  dates: string[];
+  remaining: number[];
+  block: number[];
+  hasBlock: boolean;
+}
+
+/** [checkIn, checkOut) 逐晚展开为 YYYY-MM-DD（半开区间）。*/
+function buildNightDates(checkIn: string, checkOut: string): string[] {
+  const fromMs = toDateOnly(checkIn).getTime();
+  const toMs = toDateOnly(checkOut).getTime();
+  const nights = Math.max(0, Math.round((toMs - fromMs) / DAY_MS));
+  return Array.from({ length: nights }, (_, i) =>
+    new Date(fromMs + i * DAY_MS).toISOString().slice(0, 10),
+  );
+}
+
+/**
+ * 由 hotelRoomTypeId 解出 hotelId 后复用 getHotelNightlyRemaining——分房弹窗徽标（RoomingEditor）用。
+ * ADMIN/STAFF only：直接回原始数字，与前台 /products/hotel-availability 的档位口径不同（那是公开端点，
+ * 只回 tier 不回数字）。
+ */
+export async function getNightlyRemainingForRoomType(
+  hotelRoomTypeId: string,
+  checkIn: string,
+  checkOut: string,
+  client: PrismaClient = defaultPrisma,
+): Promise<HotelNightlyRemainingResult> {
+  const roomType = await client.hotelRoomType.findUnique({
+    where: { id: hotelRoomTypeId },
+    select: { hotelId: true },
+  });
+  if (!roomType) throw new NotFoundError('房型不存在');
+
+  const dates = buildNightDates(checkIn, checkOut);
+  const { remaining, block, hasBlock } = await getHotelNightlyRemaining(roomType.hotelId, dates, client);
+  return { dates, remaining, block, hasBlock };
 }

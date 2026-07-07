@@ -13,6 +13,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   api,
   ApiError,
+  hotelControlOpsApi,
   type AdminFlight,
   type AdminSchedule,
   type AgentListItem,
@@ -23,6 +24,7 @@ import {
   type CreateOrderItemInput,
   type Hotel,
   type HotelAvailabilityTier,
+  type HotelNightlyRemainingResult,
   type OrderPassengerInput,
   type OrderSummary,
   type RoomGroup,
@@ -909,6 +911,31 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     };
   }, [showRooming, roomingHotel]);
 
+  // 当日余房（分房弹窗徽标；ADMIN/STAFF 直显数字，与上面 hotelTier 只显档位的公开端点不同纪律）。
+  const [nightlyRemaining, setNightlyRemaining] = useState<HotelNightlyRemainingResult | null>(null);
+  useEffect(() => {
+    const rt = roomingHotel?.hotelRoomTypeId;
+    const ci = roomingHotel?.checkIn;
+    const co = roomingHotel?.checkOut;
+    if (!showRooming || !rt || !ci || !co) {
+      setNightlyRemaining(null);
+      return;
+    }
+    let cancelled = false;
+    hotelControlOpsApi
+      .getNightlyRemaining(token, { hotelRoomTypeId: rt, checkIn: ci, checkOut: co })
+      .then((r) => {
+        if (!cancelled) setNightlyRemaining(r);
+      })
+      .catch(() => {
+        // 查询失败按「无数据」处理：不展示徽标、不阻断分房（不造假）
+        if (!cancelled) setNightlyRemaining(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [showRooming, roomingHotel, token]);
+
   async function handleRoomingSave(groups: RoomGroup[]): Promise<void> {
     if (!createdOrder) return;
     // 录单→OCR→分房这一整段可能开很久，渲染时闭包捕获的 token 可能已被后台续期换掉而过期
@@ -960,6 +987,10 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                   initial={createdOrder?.roomAssignment?.roomGroups}
                   hotelName={roomingHotel?.hotelName}
                   hotelTier={hotelTier}
+                  hotelRoomTypeId={roomingHotel?.hotelRoomTypeId}
+                  checkIn={roomingHotel?.checkIn}
+                  checkOut={roomingHotel?.checkOut}
+                  nightlyRemaining={nightlyRemaining}
                   onSave={handleRoomingSave}
                   onClose={() => setShowRooming(false)}
                 />

@@ -2010,6 +2010,10 @@ export class OrderService {
 
     const wasHolding = SEAT_HOLDING_STATUSES.includes(order.status);
     const isReleasing = SEAT_RELEASING_STATUSES.includes(toStatus);
+    // 与 isReleasing 对称：目标状态是否落入"占座中"集合 —— 下面「非占座 → 占座」重新占座分支要用。
+    // 覆盖 force 路径（如 PAYMENT_TIMEOUT →(force) PAID）：座位释放时已经还库存，
+    // 拉回占座状态若不重新扣座，会出现"状态已占座、库存却没扣"的幽灵持有，导致超卖。
+    const isNewHolding = SEAT_HOLDING_STATUSES.includes(toStatus);
 
     const isSystemActor = requester.actorType === 'SYSTEM' || requester.userId.startsWith('system-');
 
@@ -2069,6 +2073,60 @@ export class OrderService {
         const split = computeBundleSeatSplit(item.flightCabin, item.quantity, rawUpgrade);
         await releaseSeat(item.flightScheduleId, 'BUSINESS', split.business);
         await releaseSeat(item.flightScheduleId, item.flightCabin, split.sameCabin);
+      }
+    } else if (!wasHolding && isNewHolding) {
+      // 释放分支的镜像：订单从「非占座」状态被拉回「占座中」状态（主要是 admin force 路径，
+      // 如 PAYMENT_TIMEOUT/CANCELLED/FAILED →(force) PAID/PROCESSING）—— 座位早已在释放时
+      // 还给库存，这里必须重新占座，否则订单变成"幽灵持有"：状态显示占座，FlightSeatClass.sold
+      // 却没有对应扣减，余票会被超卖。用与 createOrder 完全相同的原子 CAS（含他人 ACTIVE 锁位口径
+      // + 套餐升舱拆座），任何一段余位不足就整单抛错，事务回滚，订单状态不落地（不会出现"半占座"）。
+      const retakeSeat = async (
+        scheduleId: string,
+        cabin: import('@prisma/client').CabinClass,
+        qty: number,
+        itemLabel: string,
+      ): Promise<void> => {
+        if (qty <= 0) return;
+        // 锁位语义与下单/改期时一致：他人的 ACTIVE 未过期锁位占用余票（订单本人的锁位不挡自己；
+        // 游客单 order.userId=null → 不排除任何人，所有 ACTIVE 锁位都占余票）
+        const lockedAgg = await tx.seatLock.aggregate({
+          _sum: { qty: true },
+          where: {
+            seatClass: { scheduleId, cabin },
+            ...(order.userId ? { userId: { not: order.userId } } : {}),
+            status: SeatLockStatus.ACTIVE,
+            expiresAt: { gt: new Date() },
+          },
+        });
+        const lockedByOthers = lockedAgg._sum.qty ?? 0;
+        const affected = await tx.$executeRaw`
+          UPDATE "FlightSeatClass"
+          SET sold = sold + ${qty}, "updatedAt" = NOW()
+          WHERE "scheduleId" = ${scheduleId}
+            AND cabin = ${cabin}::"CabinClass"
+            AND sold + ${qty} + ${lockedByOthers} <= capacity
+        `;
+        if (affected !== 1) {
+          const sc = await tx.flightSeatClass.findFirst({
+            where: { scheduleId, cabin },
+            select: { capacity: true, sold: true },
+          });
+          const available = sc ? Math.max(0, sc.capacity - sc.sold - lockedByOthers) : 0;
+          throw new BadRequestError(
+            `恢复为持有座位状态需重新占座：${itemLabel}（${cabin}）余位不足，无法转换：需要 ${qty} 张，仅剩 ${available} 张`,
+          );
+        }
+      };
+
+      for (const item of order.items) {
+        if (item.kind !== 'FLIGHT' || !item.flightScheduleId || !item.flightCabin) continue;
+        // 套餐升舱拆座：与下单/释放同一口径，按 businessUpgradeCount 分拆两舱各自占座
+        // （否则会少占商务舱、多占经济舱，或漏占其中一段）。
+        const meta = (item.metadata ?? {}) as { businessUpgradeCount?: unknown };
+        const rawUpgrade = typeof meta.businessUpgradeCount === 'number' ? meta.businessUpgradeCount : 0;
+        const split = computeBundleSeatSplit(item.flightCabin, item.quantity, rawUpgrade);
+        await retakeSeat(item.flightScheduleId, 'BUSINESS', split.business, item.description);
+        await retakeSeat(item.flightScheduleId, item.flightCabin, split.sameCabin, item.description);
       }
     }
 

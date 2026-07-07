@@ -5,9 +5,6 @@ import { useAuth } from '../stores/auth';
 import { useFlightSeats } from '../stores/flightSeats';
 import { NumberInput } from '../components/NumberInput';
 
-// 余位低于此数时高亮提醒（与订单页座位预警口径一致）
-const LOW_SEAT_THRESHOLD = 20;
-
 interface ScheduleSeat {
   id: string;
   cabin: CabinClass;
@@ -260,6 +257,8 @@ export function FlightsPage() {
               <SchedulesList
                 schedules={schedulesByFlight[f.id] ?? null}
                 flightNumber={f.flightNumber}
+                originCode={f.originCode}
+                destinationCode={f.destinationCode}
                 canEdit={user.role === 'ADMIN'}
                 onRefresh={() => refreshSchedulesAndBump(f.id)}
               />
@@ -297,10 +296,23 @@ function utcYmd(iso: string): string {
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
 }
 
-// 经济舱余位的三档色：≤20 红 / ≤40 琥珀 / 其余 绿
-function seatTone(remaining: number): { text: string; dot: string } {
-  if (remaining <= LOW_SEAT_THRESHOLD) return { text: 'text-rose-600', dot: 'bg-rose-500' };
-  if (remaining <= 40) return { text: 'text-amber-600', dot: 'bg-amber-500' };
+// 单舱位余位是否"紧张"：按容量比例判断，不再用绝对 20 张——
+// 一个 20 座（甚至 2、7 座）商务舱订满时 remaining === capacity，绝不该判紧张。
+// 地板 5 张兜住极小舱位（避免比例算出 0～1 张这种没意义的门槛），但门槛本身
+// 夹到 < capacity——否则地板反超总容量，连"满仓"都会被误判紧张（真实发生过：
+// 2 座舱位满仓时 max(5, ceil(2*0.1))=5 ≥ capacity，2 <= 5 恒真）。
+function isSeatLow(remaining: number, capacity: number): boolean {
+  const cutoff = Math.min(capacity - 1, Math.max(5, Math.ceil(capacity * 0.1)));
+  return remaining <= cutoff;
+}
+
+// 舱位余位三档色（红/琥珀/绿）：红门槛与 isSeatLow 同口径，琥珀门槛加宽一倍（同样夹到 < capacity）。
+// 比例在 180~200 座经济舱下约等于旧版固定 20/40（基本不变行为）；
+// 小舱位（商务舱 2~20 座）不再因为绝对数字小而常年误报"紧张"。
+function seatTone(remaining: number, capacity: number): { text: string; dot: string } {
+  if (isSeatLow(remaining, capacity)) return { text: 'text-rose-600', dot: 'bg-rose-500' };
+  const amberCut = Math.min(capacity - 1, Math.max(10, Math.ceil(capacity * 0.2)));
+  if (remaining <= amberCut) return { text: 'text-amber-600', dot: 'bg-amber-500' };
   return { text: 'text-emerald-600', dot: 'bg-emerald-500' };
 }
 
@@ -374,6 +386,17 @@ function dayEconRemaining(daySchedules: AdminSchedule[]): number {
   return pool.reduce((sum, s) => {
     const econ = getCabin(s, 'ECONOMY');
     return sum + (econ ? econ.available : 0);
+  }, 0);
+}
+
+// 月历格用：经济舱容量合计——与 dayEconRemaining 同一个班次池，配对喂给 seatTone
+// 做"占比"判断（而不是让色阶继续用绝对张数）。
+function dayEconCapacity(daySchedules: AdminSchedule[]): number {
+  const active = daySchedules.filter((s) => s.isActive);
+  const pool = active.length > 0 ? active : daySchedules;
+  return pool.reduce((sum, s) => {
+    const econ = getCabin(s, 'ECONOMY');
+    return sum + (econ ? econ.capacity : 0);
   }, 0);
 }
 
@@ -493,11 +516,15 @@ function monthKeyOf(date: Date): string {
 function SchedulesList({
   schedules,
   flightNumber,
+  originCode,
+  destinationCode,
   canEdit,
   onRefresh,
 }: {
   schedules: AdminSchedule[] | null;
   flightNumber: string;
+  originCode: string;
+  destinationCode: string;
   canEdit: boolean;
   onRefresh: () => Promise<void> | void;
 }) {
@@ -633,6 +660,8 @@ function SchedulesList({
       ) : (
         <SchedulesTable
           schedules={schedules}
+          originCode={originCode}
+          destinationCode={destinationCode}
           exportingId={exporting}
           onExport={downloadOrdersBySchedule}
           exportingFull={exportingFull}
@@ -646,12 +675,16 @@ function SchedulesList({
 // ── 列表视图（保留原表格，行为不变）─────────────────────────────────────
 function SchedulesTable({
   schedules,
+  originCode,
+  destinationCode,
   exportingId,
   onExport,
   exportingFull,
   onExportFull,
 }: {
   schedules: AdminSchedule[];
+  originCode: string;
+  destinationCode: string;
   exportingId: string | null;
   onExport: (scheduleId: string, departureDate: string) => void;
   exportingFull: boolean;
@@ -734,19 +767,25 @@ function SchedulesTable({
                     <div className="font-medium text-ink">
                       {formatLocalDate(s.departureTime, s.departureTz)} {formatLocalTime(s.departureTime, s.departureTz)}
                     </div>
-                    <div className="text-xs text-ink-muted">{s.departureTz}</div>
+                    <div className="text-xs text-ink-muted">
+                      {airportLabel(originCode)}
+                      <span className="ml-1 text-[10px] text-ink-muted/70">({s.departureTz})</span>
+                    </div>
                   </td>
                   <td>
                     <div className="font-medium text-ink">
                       {formatLocalDate(s.arrivalTime, s.arrivalTz)} {formatLocalTime(s.arrivalTime, s.arrivalTz)}
                     </div>
-                    <div className="text-xs text-ink-muted">{s.arrivalTz}</div>
+                    <div className="text-xs text-ink-muted">
+                      {airportLabel(destinationCode)}
+                      <span className="ml-1 text-[10px] text-ink-muted/70">({s.arrivalTz})</span>
+                    </div>
                   </td>
                   <td>
                     <ul className="space-y-0.5">
                       {(s.seatClasses ?? []).map((c) => {
                         const remaining = c.available;
-                        const isLow = remaining <= LOW_SEAT_THRESHOLD;
+                        const isLow = isSeatLow(remaining, c.capacity);
                         return (
                           <li key={c.id}>
                             {CABIN_LABEL[c.cabin] ?? c.cabin}:{' '}
@@ -914,7 +953,7 @@ function MonthCalendar({
           // （修复 700/800 在售阶梯被 1480 已关班次盖掉的 bug）。
           const allInactive = daySchedules.every((s) => !s.isActive);
           const remaining = dayEconRemaining(daySchedules);
-          const tone = seatTone(remaining);
+          const tone = seatTone(remaining, dayEconCapacity(daySchedules));
           const priceRange = activeEconPriceRange(daySchedules); // null = 无在售班次
           // 「阶梯/固定价」一眼可辨：以在售班次为准（无在售时回退看全部）。
           const ladderPool = allInactive ? daySchedules : daySchedules.filter((s) => s.isActive);
@@ -1078,6 +1117,8 @@ function DaySchedule({
 
   const [econPrice, setEconPrice] = useState<number | null>(econ ? (Number(econ.basePrice) || 0) : null);
   const [bizPrice, setBizPrice] = useState<number | null>(biz ? (Number(biz.basePrice) || 0) : null);
+  const [econCapacity, setEconCapacity] = useState<number | null>(econ ? econ.capacity : null);
+  const [bizCapacity, setBizCapacity] = useState<number | null>(biz ? biz.capacity : null);
   const [saving, setSaving] = useState(false);
   const [toggling, setToggling] = useState(false);
   const [deleting, setDeleting] = useState(false);
@@ -1107,21 +1148,33 @@ function DaySchedule({
   const [ladderMsg, setLadderMsg] = useState<string | null>(null);
 
   const econRemaining = econ ? econ.available : 0;
-  const tone = seatTone(econRemaining);
+  const tone = seatTone(econRemaining, econ ? econ.capacity : 0);
   const isExporting = exportingId === schedule.id;
   const departureDate = utcYmd(schedule.departureTime);
 
-  const onSavePrices = async () => {
+  // 保存价格 + 容量（同一个按钮一次 PATCH）：容量的服务端守卫（不能低于已售）
+  // 命中时会抛 400，err 走下面统一的 catch 分支原样展示后端消息（已经是清楚的中文提示）。
+  const onSaveSeatChanges = async () => {
     if (!tokens || saving) return;
     setSaving(true);
     setErr(null);
     setSavedMsg(null);
     try {
-      const seatClasses: Array<{ cabin: CabinClass; basePrice?: number }> = [];
-      if (econ && econPrice != null) seatClasses.push({ cabin: 'ECONOMY', basePrice: econPrice });
-      if (biz && bizPrice != null) seatClasses.push({ cabin: 'BUSINESS', basePrice: bizPrice });
+      const seatClasses: Array<{ cabin: CabinClass; basePrice?: number; capacity?: number }> = [];
+      if (econ) {
+        const entry: { cabin: CabinClass; basePrice?: number; capacity?: number } = { cabin: 'ECONOMY' };
+        if (econPrice != null) entry.basePrice = econPrice;
+        if (econCapacity != null) entry.capacity = econCapacity;
+        if (entry.basePrice !== undefined || entry.capacity !== undefined) seatClasses.push(entry);
+      }
+      if (biz) {
+        const entry: { cabin: CabinClass; basePrice?: number; capacity?: number } = { cabin: 'BUSINESS' };
+        if (bizPrice != null) entry.basePrice = bizPrice;
+        if (bizCapacity != null) entry.capacity = bizCapacity;
+        if (entry.basePrice !== undefined || entry.capacity !== undefined) seatClasses.push(entry);
+      }
       if (seatClasses.length === 0) {
-        setErr('没有可保存的舱位价格');
+        setErr('没有可保存的舱位价格/容量');
         setSaving(false);
         return;
       }
@@ -1388,33 +1441,59 @@ function DaySchedule({
         </div>
       )}
 
-      {/* 改价（仅 ADMIN）：有阶梯时基础价不是现售价，标注清楚避免误改 */}
+      {/* 改价 / 改容量（仅 ADMIN）：有阶梯时基础价不是现售价，标注清楚避免误改 */}
       {canEdit && (
         <div className="mt-3 grid gap-3 sm:grid-cols-2">
           {econ && (
-            <div>
-              <label className="label">
-                {hasLadder(econ.fareBuckets) ? '经济舱基础价（未设阶梯时生效）(¥)' : '经济舱价 (¥)'}
-              </label>
-              <NumberInput min={0} className="input" value={econPrice} onChange={(n) => setEconPrice(n)} />
-              {hasLadder(econ.fareBuckets) && (
-                <p className="mt-0.5 text-[11px] text-ink-muted">
-                  当前按阶梯出售，此价仅在清除阶梯后才生效。
-                </p>
-              )}
+            <div className="space-y-2">
+              <div>
+                <label className="label">
+                  {hasLadder(econ.fareBuckets) ? '经济舱基础价（未设阶梯时生效）(¥)' : '经济舱价 (¥)'}
+                </label>
+                <NumberInput min={0} className="input" value={econPrice} onChange={(n) => setEconPrice(n)} />
+                {hasLadder(econ.fareBuckets) && (
+                  <p className="mt-0.5 text-[11px] text-ink-muted">
+                    当前按阶梯出售，此价仅在清除阶梯后才生效。
+                  </p>
+                )}
+              </div>
+              <div>
+                <label className="label">经济舱容量（已售 {econ.sold}）</label>
+                <NumberInput
+                  min={econ.sold}
+                  className="input"
+                  value={econCapacity}
+                  onChange={(n) => setEconCapacity(n)}
+                  integerOnly
+                />
+                <p className="mt-0.5 text-[11px] text-ink-muted">不能低于已售 {econ.sold} 张。</p>
+              </div>
             </div>
           )}
           {biz && (
-            <div>
-              <label className="label">
-                {hasLadder(biz.fareBuckets) ? '商务舱基础价（未设阶梯时生效）(¥)' : '商务舱价 (¥)'}
-              </label>
-              <NumberInput min={0} className="input" value={bizPrice} onChange={(n) => setBizPrice(n)} />
-              {hasLadder(biz.fareBuckets) && (
-                <p className="mt-0.5 text-[11px] text-ink-muted">
-                  当前按阶梯出售，此价仅在清除阶梯后才生效。
-                </p>
-              )}
+            <div className="space-y-2">
+              <div>
+                <label className="label">
+                  {hasLadder(biz.fareBuckets) ? '商务舱基础价（未设阶梯时生效）(¥)' : '商务舱价 (¥)'}
+                </label>
+                <NumberInput min={0} className="input" value={bizPrice} onChange={(n) => setBizPrice(n)} />
+                {hasLadder(biz.fareBuckets) && (
+                  <p className="mt-0.5 text-[11px] text-ink-muted">
+                    当前按阶梯出售，此价仅在清除阶梯后才生效。
+                  </p>
+                )}
+              </div>
+              <div>
+                <label className="label">商务舱容量（已售 {biz.sold}）</label>
+                <NumberInput
+                  min={biz.sold}
+                  className="input"
+                  value={bizCapacity}
+                  onChange={(n) => setBizCapacity(n)}
+                  integerOnly
+                />
+                <p className="mt-0.5 text-[11px] text-ink-muted">不能低于已售 {biz.sold} 张。</p>
+              </div>
             </div>
           )}
         </div>
@@ -1481,8 +1560,8 @@ function DaySchedule({
             >
               改时刻
             </button>
-            <button type="button" className="btn-primary text-xs" disabled={saving} onClick={onSavePrices}>
-              {saving ? '保存中…' : '保存价格'}
+            <button type="button" className="btn-primary text-xs" disabled={saving} onClick={onSaveSeatChanges}>
+              {saving ? '保存中…' : '保存价格/容量'}
             </button>
           </>
         )}
@@ -1545,7 +1624,7 @@ function DaySchedule({
 // ── 批量改价 / 批量仓位阶梯（日期范围 + 星期几 + 进度条；镜像 BulkScheduleForm）─
 // 注：批量「售罄/恢复销售」已移除（机位卖完即售罄，不需手动批量调）；
 // 单班次的售罄/恢复按钮保留在 DaySchedule。
-type BulkAction = 'setPrice' | 'addAmount' | 'addPercent' | 'setLadder' | 'clearLadder';
+type BulkAction = 'setPrice' | 'addAmount' | 'addPercent' | 'setLadder' | 'clearLadder' | 'setCapacity';
 type BulkCabinPick = 'ECONOMY' | 'BUSINESS' | 'ALL';
 
 function BulkEditPanel({
@@ -1576,6 +1655,9 @@ function BulkEditPanel({
   // 批量设阶梯用的统一阶梯草稿 + 舱位（仅经济/商务，不支持"全部"）
   const [ladderDraft, setLadderDraft] = useState<FareBucket[]>([]);
   const [ladderCabin, setLadderCabin] = useState<CabinClass>('ECONOMY');
+  // 批量改容量：经济/商务各一个目标值，留空 = 不改该舱位（走专用批量接口，非逐班次循环）
+  const [capEcon, setCapEcon] = useState<number | null>(null);
+  const [capBiz, setCapBiz] = useState<number | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [progress, setProgress] = useState({ done: 0, total: 0, errors: 0 });
   const [result, setResult] = useState<string | null>(null);
@@ -1583,6 +1665,7 @@ function BulkEditPanel({
 
   const isPriceAction = action === 'setPrice' || action === 'addAmount' || action === 'addPercent';
   const isLadderAction = action === 'setLadder' || action === 'clearLadder';
+  const isCapacityAction = action === 'setCapacity';
 
   // 命中的班次：本地出发日 ∈ [start,end] 且 星期几被选中
   const matched = useMemo(() => {
@@ -1641,6 +1724,12 @@ function BulkEditPanel({
     if (action === 'addAmount') return `${cab} 价上调 ¥${amount ?? 0}`;
     if (action === 'addPercent') return `${cab} 价上调 ${amount ?? 0}%`;
     if (action === 'setLadder') return `把 ${ladderCab} 设为 ${ladderDraft.length} 档仓位阶梯`;
+    if (action === 'setCapacity') {
+      const parts: string[] = [];
+      if (capEcon != null) parts.push(`经济舱→${capEcon}`);
+      if (capBiz != null) parts.push(`商务舱→${capBiz}`);
+      return parts.length > 0 ? `改容量：${parts.join('，')}（已售超过目标的班次自动跳过）` : '改容量（尚未填目标值）';
+    }
     return `清除 ${ladderCab} 仓位阶梯（恢复自动定价）`;
   };
 
@@ -1658,6 +1747,10 @@ function BulkEditPanel({
         return;
       }
     }
+    if (action === 'setCapacity' && capEcon == null && capBiz == null) {
+      setErrMsg('请至少填一个舱位的目标容量');
+      return;
+    }
     if (!confirm(`将对 ${matched.length} 个班次执行：${actionLabel()}，确认？`)) return;
 
     setErrMsg(null);
@@ -1665,6 +1758,38 @@ function BulkEditPanel({
     setSubmitting(true);
     setProgress({ done: 0, total: matched.length, errors: 0 });
 
+    // ── 改容量：走专用批量接口（服务端一次事务处理，逐班次守 capacity ≥ sold，
+    //    命中守卫的班次跳过而非整批失败），不是逐班次循环调用。
+    if (action === 'setCapacity') {
+      const seatClasses: Array<{ cabin: CabinClass; capacity: number }> = [];
+      if (capEcon != null) seatClasses.push({ cabin: 'ECONOMY', capacity: capEcon });
+      if (capBiz != null) seatClasses.push({ cabin: 'BUSINESS', capacity: capBiz });
+      try {
+        const { result: capResult } = await api.batchUpdateCapacity(tokens.accessToken, {
+          scheduleIds: matched.map((s) => s.id),
+          seatClasses,
+        });
+        setProgress({ done: capResult.applied, total: matched.length, errors: capResult.skipped.length });
+        const preview = capResult.skipped.slice(0, 3).map((s) => s.reason);
+        setResult(
+          `✅ 完成：改了 ${capResult.applied} 个${
+            capResult.skipped.length > 0
+              ? ` · 跳过 ${capResult.skipped.length} 个（${preview.join('；')}${
+                  capResult.skipped.length > preview.length ? ' 等' : ''
+                }）`
+              : ''
+          }`,
+        );
+      } catch (e2) {
+        setErrMsg(e2 instanceof ApiError ? e2.message : '批量改容量失败');
+      } finally {
+        setSubmitting(false);
+      }
+      await onDone();
+      return;
+    }
+
+    // ── 改价 / 仓位阶梯：仍逐班次调用（每班次当前价/校验各不相同，沿用既有循环）
     let done = 0;
     let errors = 0;
     let lastError = '';
@@ -1735,6 +1860,7 @@ function BulkEditPanel({
             <option value="addPercent">涨 X%</option>
             <option value="setLadder">设置仓位阶梯</option>
             <option value="clearLadder">清除仓位阶梯</option>
+            <option value="setCapacity">批量改容量</option>
           </select>
         </div>
         {isPriceAction && (
@@ -1764,6 +1890,35 @@ function BulkEditPanel({
             </select>
           </div>
         )}
+        {isCapacityAction && (
+          <>
+            <div>
+              <label className="label">经济舱目标容量</label>
+              <NumberInput
+                min={0}
+                className="input"
+                value={capEcon}
+                onChange={(n) => setCapEcon(n)}
+                integerOnly
+                placeholder="留空=不改"
+              />
+            </div>
+            <div>
+              <label className="label">商务舱目标容量</label>
+              <NumberInput
+                min={0}
+                className="input"
+                value={capBiz}
+                onChange={(n) => setCapBiz(n)}
+                integerOnly
+                placeholder="留空=不改"
+              />
+            </div>
+            <div className="md:col-span-4 text-[11px] text-ink-muted">
+              容量不能低于该班次已售张数；超出的班次会自动跳过（不改），下方会显示改了几个、跳过几个。
+            </div>
+          </>
+        )}
         {action === 'setLadder' && (
           <div className="md:col-span-4 rounded-md border border-slate-200 bg-white p-3">
             <div className="mb-2 text-xs font-medium text-ink-soft">
@@ -1789,7 +1944,7 @@ function BulkEditPanel({
                 />
               </div>
               <div className="text-xs text-slate-500 mt-1">
-                进度: {progress.done} / {progress.total} · 失败 {progress.errors}
+                进度: {progress.done} / {progress.total} · {isCapacityAction ? '跳过' : '失败'} {progress.errors}
               </div>
             </div>
           )}
