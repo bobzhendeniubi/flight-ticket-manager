@@ -470,11 +470,30 @@ describe('OrderService._updateStatusWithinTx · Bug 6：佣金创建幂等', () 
     vi.resetAllMocks();
   });
 
-  it('force REFUNDED → PAID：订单已有佣金记录 → 跳过创建，不重复计佣', async () => {
-    // HOTEL 行（非 FLIGHT）：force REFUNDED→PAID 的"非占座→占座"重新占座分支只处理 FLIGHT 行，
-    // 用非 FLIGHT 行可以不必额外搭 seatLock/$executeRaw 的 mock，聚焦测佣金幂等本身。
+  it('force REFUNDED → PAID：已退款是终态，禁止"复活"回占座/已支付（即使 admin force）', async () => {
+    // 产品决策：已退款订单强拉回 PAID 会让 Refund 记录停在 COMPLETED、订单却回 PAID，账目永久对不上；
+    // 硬规则拒绝该转换，要重开须走正规重新下单。佣金幂等（下一条）仍作为纵深防御保留在代码里。
     const order = buildOrder({
       status: OrderStatus.REFUNDED,
+      agentId: 'agent1',
+      items: [{ id: 'item1', kind: 'HOTEL', quantity: 1, flightScheduleId: null, flightCabin: null, metadata: null }],
+    });
+    mockPrisma.order.findUnique.mockResolvedValueOnce(order);
+
+    await expect(
+      service._updateStatusWithinTx(tx, 'ord1', OrderStatus.PAID, adminRequester, undefined, [], true, []),
+    ).rejects.toThrow('订单已退款（终态）');
+    // 禁转在改状态前抛出：不落新状态、不建/查佣金。
+    expect(mockPrisma.order.updateMany).not.toHaveBeenCalled();
+    expect(mockPrisma.commissionRecord.create).not.toHaveBeenCalled();
+  });
+
+  it('force CANCELLED → PAID：订单已有佣金记录 → 跳过创建，不重复计佣（幂等纵深防御）', async () => {
+    // HOTEL 行（非 FLIGHT）：force CANCELLED→PAID 的"非占座→占座"重新占座分支只处理 FLIGHT 行，
+    // 用非 FLIGHT 行可以不必额外搭 seatLock/$executeRaw 的 mock，聚焦测佣金幂等本身。
+    // （CANCELLED 非禁转终态，可复活；REFUNDED 已被上一条禁转拦下，故幂等改从 CANCELLED 路径验证。）
+    const order = buildOrder({
+      status: OrderStatus.CANCELLED,
       agentId: 'agent1',
       items: [{ id: 'item1', kind: 'HOTEL', quantity: 1, flightScheduleId: null, flightCabin: null, metadata: null }],
     });
@@ -495,7 +514,7 @@ describe('OrderService._updateStatusWithinTx · Bug 6：佣金创建幂等', () 
       adminRequester,
       undefined,
       [],
-      true, // force：REFUNDED 是终态，ALLOWED_TRANSITIONS[REFUNDED]=[]
+      true, // force：CANCELLED 是释放态，复活到 PAID 会触发 createCommissionsForOrder
       [],
     );
 

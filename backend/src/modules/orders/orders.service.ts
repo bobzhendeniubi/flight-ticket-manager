@@ -2052,6 +2052,15 @@ export class OrderService {
     // 拉回占座状态若不重新扣座，会出现"状态已占座、库存却没扣"的幽灵持有，导致超卖。
     const isNewHolding = SEAT_HOLDING_STATUSES.includes(toStatus);
 
+    // 硬规则（即使 admin force 也不许）：已退款（REFUNDED）是终态，不允许"复活"回占座/已支付状态。
+    // 强转虽已修佣金幂等 + 重新占座，但 Refund 记录会永久停在 COMPLETED、订单却回到 PAID，
+    // 收款/退款账目对不上；要重开须走正规重新下单，而非把退款单强拉回有效状态。
+    if (order.status === 'REFUNDED' && isNewHolding) {
+      throw new BadRequestError(
+        '订单已退款（终态），不能强制拉回占座/已支付状态；如需重开请重新下单',
+      );
+    }
+
     const isSystemActor = requester.actorType === 'SYSTEM' || requester.userId.startsWith('system-');
 
     // ── 原子 CAS：where 附加当前状态，防并发重复转移（如两个支付回调同时来）──
