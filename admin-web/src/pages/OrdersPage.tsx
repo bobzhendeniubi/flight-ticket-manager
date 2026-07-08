@@ -11,6 +11,7 @@ import { NumberInput } from '../components/NumberInput';
 import { OrderFinanceSection } from '../components/OrderFinanceSection';
 import { SingleOrderModal } from '../components/SingleOrderModal';
 import { RoomingEditor, type RoomingPassenger } from '../components/RoomingEditor';
+import { HotelSwapModal } from '../components/HotelSwapModal';
 import type { RoomGroup } from '../lib/api';
 
 // 本地可视化用的状态子集（后端 OrderStatus 更全，这里只列出常用 7 个做 filter）
@@ -2016,7 +2017,10 @@ function OrderItemRow({
 }) {
   const [rescheduling, setRescheduling] = useState(false);
   const [editingPrice, setEditingPrice] = useState(false);
+  const [swappingHotel, setSwappingHotel] = useState(false);
   const isFlight = item.kind === 'FLIGHT';
+  // HOTEL 行，或已盖章酒店房型的 BUNDLE 行（套餐没有独立 HOTEL 行，酒店盖在 BUNDLE 行上）
+  const isHotelRow = item.kind === 'HOTEL' || (item.kind === 'BUNDLE' && Boolean(item.hotelRoomTypeId));
 
   return (
     <li className="rounded-lg border border-slate-200 bg-slate-50/60 p-3">
@@ -2046,6 +2050,14 @@ function OrderItemRow({
               改结算价
             </button>
           )}
+          {isHotelRow && (
+            <button
+              className="text-[11px] font-medium text-brand hover:text-brand-dark"
+              onClick={() => setSwappingHotel(true)}
+            >
+              换酒店
+            </button>
+          )}
         </div>
       </div>
       {isFlight && rescheduling && (
@@ -2067,6 +2079,27 @@ function OrderItemRow({
           onCancel={() => setEditingPrice(false)}
           onSaved={(updated) => {
             setEditingPrice(false);
+            onOrderUpdated?.(updated);
+          }}
+        />
+      )}
+      {isHotelRow && swappingHotel && (
+        <HotelSwapModal
+          orderId={orderId}
+          item={{
+            id: item.id,
+            kind: item.kind,
+            hotelRoomTypeId: item.hotelRoomTypeId,
+            hotelCheckIn: item.hotelCheckIn,
+            hotelCheckOut: item.hotelCheckOut,
+            roomsBilled: item.roomsBilled,
+            quantity: item.quantity,
+            hotelName: item.hotelName,
+            roomTypeName: item.roomTypeName,
+          }}
+          onClose={() => setSwappingHotel(false)}
+          onSwapped={(updated) => {
+            setSwappingHotel(false);
             onOrderUpdated?.(updated);
           }}
         />

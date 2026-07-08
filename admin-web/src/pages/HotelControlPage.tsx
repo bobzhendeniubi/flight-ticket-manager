@@ -30,6 +30,7 @@ import {
 import { useAuth } from '../stores/auth';
 import { NumberInput } from '../components/NumberInput';
 import { RoomingEditor, type RoomingPassenger } from '../components/RoomingEditor';
+import { HotelSwapModal } from '../components/HotelSwapModal';
 
 // ── helpers ────────────────────────────────────────────────────────────────
 function todayStr(): string {
@@ -395,6 +396,7 @@ export function HotelControlPage() {
           block={drill.block}
           used={drill.used}
           onClose={() => setDrill(null)}
+          onChanged={() => setBoardNonce((n) => n + 1)}
         />
       )}
     </div>
@@ -410,6 +412,7 @@ function OccupantsDrawer({
   block,
   used,
   onClose,
+  onChanged,
 }: {
   token: string;
   hotelId: string;
@@ -418,28 +421,28 @@ function OccupantsDrawer({
   block: number;
   used: number;
   onClose: () => void;
+  /** 换酒店成功后通知父级（触发销控板重拉）。 */
+  onChanged?: () => void;
 }) {
   const [occupants, setOccupants] = useState<HotelOccupant[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  // 正在换酒店的占房行（null = 未打开换酒店弹窗）
+  const [swapTarget, setSwapTarget] = useState<HotelOccupant | null>(null);
 
-  useEffect(() => {
+  const loadOccupants = useCallback(() => {
     if (!token) return;
-    let cancelled = false;
-    setOccupants(null);
     setErr(null);
     hotelControlOpsApi
       .getHotelOccupants(token, { hotelId, date })
-      .then((r) => {
-        if (!cancelled) setOccupants(r.occupants);
-      })
-      .catch((e: unknown) => {
-        if (!cancelled) setErr(e instanceof ApiError ? e.message : '占房订单加载失败');
-      });
-    return () => {
-      cancelled = true;
-    };
+      .then((r) => setOccupants(r.occupants))
+      .catch((e: unknown) => setErr(e instanceof ApiError ? e.message : '占房订单加载失败'));
   }, [token, hotelId, date]);
+
+  useEffect(() => {
+    setOccupants(null);
+    loadOccupants();
+  }, [loadOccupants]);
 
   function handleCopy(orderId: string, orderNumber: string): void {
     copyOrderNumber(orderNumber);
@@ -507,6 +510,13 @@ function OccupantsDrawer({
                     >
                       {copiedId === o.orderId ? '已复制 ✓' : '复制订单号'}
                     </button>
+                    <button
+                      type="button"
+                      className="text-xs font-medium text-brand hover:text-brand-dark"
+                      onClick={() => setSwapTarget(o)}
+                    >
+                      换酒店
+                    </button>
                     <Link to="/orders" className="text-xs text-brand hover:text-brand-dark">
                       去订单页 →
                     </Link>
@@ -517,6 +527,19 @@ function OccupantsDrawer({
           )}
         </div>
       </div>
+
+      {swapTarget && (
+        <HotelSwapModal
+          orderId={swapTarget.orderId}
+          locateHint={{ hotelId, checkIn: swapTarget.checkIn, checkOut: swapTarget.checkOut }}
+          onClose={() => setSwapTarget(null)}
+          onSwapped={() => {
+            setSwapTarget(null);
+            loadOccupants(); // 抽屉：刷新占房列表
+            onChanged?.(); // 板：通知父级重拉销控板
+          }}
+        />
+      )}
     </div>
   );
 }

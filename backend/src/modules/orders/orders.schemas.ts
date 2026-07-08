@@ -451,3 +451,25 @@ export const updateItemSettlementPriceBodySchema = z.object({
 });
 export type UpdateItemSettlementPriceBody = z.infer<typeof updateItemSettlementPriceBodySchema>;
 
+// ── 售后改单：换酒店（hotel swap）───────────────────────────────────────────
+// PATCH /orders/:id/items/:itemId/hotel（ADMIN/STAFF）：把某条 HOTEL 行（或已盖章酒店的
+// BUNDLE 行）就地换到另一个房型/酒店。定价哲学（owner 批准 A+B）：价格默认冻结——绝不按新
+// 房型的 basePrice 重算 unitPrice/amount；feeCny 是可选的人工调整（可正可负，与改期费/换人费
+// 同一 adjustmentCny 机制）。0 没有意义（"不调整"应留空不传该字段），故显式拒绝。
+const hotelSwapFeeSchema = z
+  .number()
+  .int('金额必须为整数（CNY）')
+  .refine((v) => v !== 0, { message: '金额不能为 0（不调整价格请留空，不要传 0）' })
+  .refine((v) => Math.abs(v) <= POST_SALE_FEE_CAP_CNY, {
+    message: `金额超出上限（±${POST_SALE_FEE_CAP_CNY}）`,
+  })
+  .optional();
+
+export const swapItemHotelBodySchema = z.object({
+  newHotelRoomTypeId: z.string().min(1, 'newHotelRoomTypeId 必填'),
+  feeCny: hotelSwapFeeSchema, // 换酒店差价（CNY，整数，可负；不填/不传=不调整价格）
+  feeLabel: z.string().max(60).optional(), // 自定义费用名（缺省"换酒店差价"）
+  note: z.string().max(200).optional(),
+});
+export type SwapItemHotelBody = z.infer<typeof swapItemHotelBodySchema>;
+

@@ -1754,6 +1754,26 @@ export const api = {
       body,
     }),
 
+  // 换酒店：把某条 HOTEL 行（或已盖章酒店的 BUNDLE 行）换到另一个房型/酒店。
+  // 价格默认冻结（绝不按新房型 basePrice 重算 unitPrice/amount）；可选加/减「换酒店差价」
+  // （feeCny 可负，0 会被拒绝——不调整价格请不要传该字段）。返回更新后的订单。
+  swapItemHotel: (
+    token: string,
+    orderId: string,
+    itemId: string,
+    body: {
+      newHotelRoomTypeId: string;
+      feeCny?: number;
+      feeLabel?: string;
+      note?: string;
+    },
+  ) =>
+    apiFetch<{ order: OrderSummary }>(`/orders/${orderId}/items/${itemId}/hotel`, {
+      method: 'PATCH',
+      token,
+      body,
+    }),
+
   // ── 操作部待办 ───────────────────────────────────────────────────────
   listReminders: (
     token: string,

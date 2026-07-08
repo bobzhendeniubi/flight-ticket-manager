@@ -20,6 +20,7 @@ import {
   orderStructuredNotesShape,
   publicOrderLookupQuerySchema,
   rescheduleOrderBodySchema,
+  swapItemHotelBodySchema,
   swapPassengerBodySchema,
   updateItemSettlementPriceBodySchema,
   updateStatusBodySchema,
@@ -1026,6 +1027,38 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         resetVisa: audit.resetVisa,
         visaTasksReset: audit.visaTasksReset,
         feeCny: audit.feeCny,
+        note: body.note,
+      },
+      severity: 'WARNING',
+    });
+    return { order };
+  });
+
+  // ── 售后改单：换酒店（ADMIN/STAFF）──
+  // PATCH /orders/:id/items/:itemId/hotel  body: { newHotelRoomTypeId, feeCny?, feeLabel?, note? }
+  // 价格默认冻结（绝不按新房型 basePrice 重算 unitPrice/amount）；只换住哪，可选加/减差价。
+  app.patch('/:id/items/:itemId/hotel', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅运营/管理员可换酒店' });
+    }
+    const { id, itemId } = req.params as { id: string; itemId: string };
+    const body = swapItemHotelBodySchema.parse(req.body);
+    const { order, audit } = await service.swapItemHotel(id, itemId, body, {
+      userId: req.user.sub,
+      role,
+    });
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'SWAP_ORDER_ITEM_HOTEL',
+      targetType: 'ORDER',
+      targetId: id,
+      targetLabel: audit.orderNumber,
+      before: { orderItemId: audit.orderItemId, ...audit.before },
+      after: {
+        ...audit.after,
+        feeCny: audit.feeCny,
+        untrackedNights: audit.untrackedNights,
         note: body.note,
       },
       severity: 'WARNING',

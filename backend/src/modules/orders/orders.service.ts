@@ -47,6 +47,7 @@ import type {
   OrderItemInput,
   PassengerInput,
   PublicOrderLookupQuery,
+  SwapItemHotelBody,
   UpdateItemSettlementPriceBody,
 } from './orders.schemas.js';
 
@@ -2851,6 +2852,267 @@ export class OrderService {
         resetVisa: Boolean(input.resetVisa),
         visaTasksReset: result.visaTasksReset,
         feeCny,
+      },
+    };
+  }
+
+  /**
+   * 换酒店：把订单里某条 HOTEL 行（或已盖章酒店的 BUNDLE 行）就地换到另一个房型/酒店，
+   * 并（可选）加/减「换酒店差价」。
+   *
+   * 定价哲学（owner 批准 A+B）：价格默认冻结——客户已付的钱不变，换酒店只改「住哪」，
+   * 绝不用新房型的 basePrice 重算 unitPrice/amount。差价是可选的人工调整，走与改期费/
+   * 换人费相同的 adjustmentCny 机制，不填就是纯换房不改价。
+   *
+   * body：{ newHotelRoomTypeId, feeCny?, feeLabel?, note? }
+   *   - orderItemId 必须属于本订单且 kind=HOTEL，或 kind=BUNDLE 且已盖章 hotelRoomTypeId。
+   *   - newHotelRoomTypeId 必须存在、其酒店在架；与当前房型相同 → 400（无意义换房）。
+   *
+   * 逐晚余量校验（仅当换到不同酒店时才做——同酒店换房型净房量不变，不受本单自身占用影响）：
+   *   - block[i] > 0（该晚被房控周期管控）且 remaining[i] < 本行房间数 → 拒单，列出不足的夜晚。
+   *   - block[i] === 0，或整段查询范围内一条周期都没有（hasBlock=false）→ 放行，计入
+   *     untrackedNights（房控哲学：未配包房 = 未管控，不能拿来判"售罄"）。
+   *
+   * 单事务内：
+   *   1. 更新该行 hotelRoomTypeId（HOTEL 行按创建期同款格式重建 description；BUNDLE 行的
+   *      description 本就不含酒店名——由 serializer 实时联查 hotelRoomTypeId 得到，不用重建）。
+   *      amount/unitPrice/quantity/hotelCheckIn/hotelCheckOut/roomsBilled 一律不动（冻结）。
+   *   2. feeCny≠0 → order.adjustmentCny += feeCny，并 push 一条 adjustments 流水（HOTEL_SWAP_FEE）。
+   *   3. Order.roomAssignment.roomGroups 里 hotelName 等于旧酒店名的组 → 改成新酒店名（人工填的
+   *      其它酒店名不动——可能是老单据手填值，不该被这次换酒店误伤）。
+   *
+   * 返回值联查与 getOrder 同款富 include（hotelRoomType/bundle.hotelRoomType 等），确保响应
+   * 里的 hotelName/roomTypeName 立即正确，调用方不用再刷一次详情。
+   */
+  async swapItemHotel(
+    orderId: string,
+    itemId: string,
+    input: SwapItemHotelBody,
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
+    order: ReturnType<typeof serializeOrder>;
+    audit: {
+      orderNumber: string;
+      orderItemId: string;
+      before: { hotelRoomTypeId: string | null; hotelName: string | null; roomTypeName: string | null };
+      after: { hotelRoomTypeId: string; hotelName: string; roomTypeName: string };
+      feeCny: number;
+      untrackedNights: string[];
+    };
+  }> {
+    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+      throw new ForbiddenError('仅运营/管理员可换酒店');
+    }
+    const feeCny = Math.trunc(input.feeCny ?? 0);
+
+    const item = await prisma.orderItem.findUnique({
+      where: { id: itemId },
+      select: {
+        id: true,
+        orderId: true,
+        kind: true,
+        description: true,
+        quantity: true,
+        hotelRoomTypeId: true,
+        hotelCheckIn: true,
+        hotelCheckOut: true,
+        roomsBilled: true,
+      },
+    });
+    if (!item || item.orderId !== orderId) {
+      throw new NotFoundError('订单项不存在或不属于该订单');
+    }
+    const isHotelRow =
+      item.kind === OrderItemKind.HOTEL ||
+      (item.kind === OrderItemKind.BUNDLE && item.hotelRoomTypeId != null);
+    if (!isHotelRow || !item.hotelRoomTypeId) {
+      throw new BadRequestError('该行不含酒店，无法换酒店');
+    }
+    if (item.hotelRoomTypeId === input.newHotelRoomTypeId) {
+      throw new BadRequestError('目标房型与当前房型相同，无需更换');
+    }
+
+    const [oldRoomType, newRoomType] = await Promise.all([
+      prisma.hotelRoomType.findUnique({
+        where: { id: item.hotelRoomTypeId },
+        select: { id: true, name: true, hotelId: true, hotel: { select: { name: true } } },
+      }),
+      prisma.hotelRoomType.findUnique({
+        where: { id: input.newHotelRoomTypeId },
+        select: { id: true, name: true, hotelId: true, hotel: { select: { name: true, isActive: true } } },
+      }),
+    ]);
+    if (!newRoomType) throw new NotFoundError(`酒店房型 ${input.newHotelRoomTypeId} 不存在`);
+    if (!newRoomType.hotel.isActive) throw new BadRequestError('酒店已下架');
+    if (!oldRoomType) throw new NotFoundError('原酒店房型数据异常，无法换酒店');
+
+    // ── 逐晚余量校验（仅跨酒店换房时才需要；同酒店换房型净房量不变，不受本单占用影响）──
+    const roomsBilled = item.roomsBilled != null ? Number(item.roomsBilled) : 1;
+    const nightDates =
+      item.hotelCheckIn && item.hotelCheckOut
+        ? buildStayNightDates(item.hotelCheckIn, item.hotelCheckOut)
+        : [];
+    let untrackedNights: string[] = [];
+    if (oldRoomType.hotelId !== newRoomType.hotelId && nightDates.length > 0) {
+      const { remaining, hasBlock, block } = await getHotelNightlyRemaining(newRoomType.hotelId, nightDates);
+      if (hasBlock) {
+        const failing: Array<{ date: string; remaining: number }> = [];
+        nightDates.forEach((d, i) => {
+          if (block[i] > 0) {
+            if (remaining[i] < roomsBilled) failing.push({ date: d, remaining: remaining[i] });
+          } else {
+            untrackedNights.push(d);
+          }
+        });
+        if (failing.length > 0) {
+          const detail = failing
+            .map(
+              (f) =>
+                `目标酒店 ${formatMonthDay(new Date(`${f.date}T00:00:00.000Z`))}余房不足（余 ${f.remaining}，需 ${roomsBilled}）`,
+            )
+            .join('；');
+          throw new BadRequestError(detail);
+        }
+      } else {
+        // 整段查询范围内一条包房周期都没有 → 全部夜晚视为未管控（房控哲学：未配包房≠售罄）
+        untrackedNights = [...nightDates];
+      }
+    }
+
+    // ── HOTEL 行按创建期同款格式重建 description；BUNDLE 行不含酒店名，不用重建 ──
+    let newDescription = item.description;
+    if (item.kind === OrderItemKind.HOTEL && item.hotelCheckIn && item.hotelCheckOut) {
+      const roomsLabel = Number.isInteger(roomsBilled) ? String(roomsBilled) : roomsBilled.toFixed(1);
+      newDescription =
+        `${newRoomType.hotel.name} · ${newRoomType.name} · ` +
+        `${formatDateOnly(item.hotelCheckIn)}~${formatDateOnly(item.hotelCheckOut)} · ` +
+        `${item.quantity}晚 × ${roomsLabel}间`;
+    }
+
+    const scratch = await prisma.$transaction(async (tx) => {
+      const order = await tx.order.findUnique({
+        where: { id: orderId },
+        select: { id: true, orderNumber: true, adjustmentCny: true, adjustments: true, roomAssignment: true },
+      });
+      if (!order) throw new NotFoundError('订单不存在');
+
+      // ── 1. 更新订单行（只换房型引用 + 重建 description；金额/数量/日期/间数一律冻结）──
+      await tx.orderItem.update({
+        where: { id: item.id },
+        data: { hotelRoomTypeId: newRoomType.id, description: newDescription },
+      });
+
+      // ── 2. 可选换酒店差价（adjustmentCny + adjustments 流水，与改期费同机制）──
+      if (feeCny !== 0) {
+        const log = appendAdjustment(order.adjustments, {
+          type: 'HOTEL_SWAP_FEE',
+          label: input.feeLabel || '换酒店差价',
+          amountCny: feeCny,
+          at: new Date().toISOString(),
+          by: actor.userId,
+          note: input.note,
+        });
+        await tx.order.update({
+          where: { id: orderId },
+          data: { adjustmentCny: order.adjustmentCny + feeCny, adjustments: log },
+        });
+      }
+
+      // ── 3. 分房表里手填的旧酒店名 → 改成新酒店名（不匹配的组保持原样）──
+      const roomAssignmentRaw = order.roomAssignment;
+      if (roomAssignmentRaw && typeof roomAssignmentRaw === 'object' && !Array.isArray(roomAssignmentRaw)) {
+        const groups = (roomAssignmentRaw as { roomGroups?: unknown }).roomGroups;
+        if (Array.isArray(groups)) {
+          let changed = false;
+          const newGroups = groups.map((g) => {
+            if (
+              g != null &&
+              typeof g === 'object' &&
+              (g as { hotelName?: unknown }).hotelName === oldRoomType.hotel.name
+            ) {
+              changed = true;
+              return { ...(g as Record<string, unknown>), hotelName: newRoomType.hotel.name };
+            }
+            return g;
+          });
+          if (changed) {
+            await tx.order.update({
+              where: { id: orderId },
+              data: {
+                roomAssignment: {
+                  ...(roomAssignmentRaw as Record<string, unknown>),
+                  roomGroups: newGroups,
+                } as Prisma.InputJsonValue,
+              },
+            });
+          }
+        }
+      }
+
+      return { orderNumber: order.orderNumber };
+    });
+
+    // ── 返回值：与 getOrder 同款富联查，确保 hotelName/roomTypeName 立即正确 ──
+    const finalOrder = await prisma.order.findUniqueOrThrow({
+      where: { id: orderId },
+      include: {
+        items: {
+          include: {
+            hotelRoomType: { select: { name: true, hotel: { select: { name: true } } } },
+            flightSchedule: {
+              select: {
+                departureTime: true,
+                arrivalTime: true,
+                flight: { select: { flightNumber: true, originCode: true, destinationCode: true } },
+              },
+            },
+            visa: { select: { visaName: true, country: true, destinationCountry: true, stayDays: true } },
+            transfer: { select: { name: true } },
+            bundle: {
+              select: {
+                name: true,
+                serviceNotes: true,
+                items: true,
+                infantPriceCny: true,
+                childSeatDiscountCnyPerPerson: true,
+                hotelRoomTypeId: true,
+                hotelRoomType: { select: { name: true, hotel: { select: { name: true } } } },
+              },
+            },
+          },
+        },
+        passengers: true,
+        payments: true,
+        refunds: true,
+        statusEvents: { orderBy: { createdAt: 'asc' } },
+        agent: { select: { id: true, companyName: true, contactName: true, settlementMode: true, prepaymentBalance: true } },
+        user: { select: { id: true, displayName: true, email: true } },
+        claimedBy: { select: { id: true, displayName: true, email: true } },
+        reminders: {
+          orderBy: [{ status: 'asc' }, { priority: 'desc' }, { createdAt: 'desc' }],
+          include: { createdBy: { select: { id: true, displayName: true } } },
+        },
+      },
+    });
+    const visaStayDaysById = await this.loadBundleVisaStayDays(finalOrder.items);
+
+    return {
+      order: serializeOrder(finalOrder, { visaStayDaysById }),
+      audit: {
+        orderNumber: scratch.orderNumber,
+        orderItemId: item.id,
+        before: {
+          hotelRoomTypeId: item.hotelRoomTypeId,
+          hotelName: oldRoomType.hotel.name,
+          roomTypeName: oldRoomType.name,
+        },
+        after: {
+          hotelRoomTypeId: newRoomType.id,
+          hotelName: newRoomType.hotel.name,
+          roomTypeName: newRoomType.name,
+        },
+        feeCny,
+        untrackedNights,
       },
     };
   }

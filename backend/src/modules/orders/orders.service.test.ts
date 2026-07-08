@@ -95,6 +95,7 @@ import type { OrderItemInput } from './orders.schemas.js';
 import {
   batchCreateOrdersBodySchema,
   createOrderBodySchema,
+  swapItemHotelBodySchema,
   swapPassengerBodySchema,
 } from './orders.schemas.js';
 
@@ -2509,5 +2510,58 @@ describe('priceAndValidateItems · 酒店重算价来源 + 下架拦截', () => 
     const bundle = priced.find((p) => p.kind === 'BUNDLE')!;
     expect(bundle.roomsBilled).toBe(1); // 权威下限：max(0.5, 1) = 1
     expect(bundle.unitPrice).toBe(3840); // 按 1 间收，不给 0.5 少付
+  });
+});
+
+// ── 换酒店（hotel swap）body schema：feeCny 可负、拒绝 0、超上限拒绝 ─────────────
+// 服务层的事务行为（冻结定价 / 余量校验 / roomAssignment 改名等）见真 DB 集成测试
+// orders.hotel-swap.integration.test.ts（与 reschedule/swapPassenger 同款测试策略）。
+describe('swapItemHotelBodySchema', () => {
+  it('最小合法 body（仅 newHotelRoomTypeId）→ 通过，feeCny 缺省 undefined', () => {
+    const parsed = swapItemHotelBodySchema.parse({ newHotelRoomTypeId: 'rt_new' });
+    expect(parsed.newHotelRoomTypeId).toBe('rt_new');
+    expect(parsed.feeCny).toBeUndefined();
+  });
+
+  it('feeCny 可以是负数（减价）', () => {
+    const parsed = swapItemHotelBodySchema.parse({ newHotelRoomTypeId: 'rt_new', feeCny: -80 });
+    expect(parsed.feeCny).toBe(-80);
+  });
+
+  it('feeCny 可以是正数（加价）', () => {
+    const parsed = swapItemHotelBodySchema.parse({ newHotelRoomTypeId: 'rt_new', feeCny: 200 });
+    expect(parsed.feeCny).toBe(200);
+  });
+
+  it('feeCny = 0 → 拒绝（"不调整"应留空不传，而不是显式传 0）', () => {
+    expect(() => swapItemHotelBodySchema.parse({ newHotelRoomTypeId: 'rt_new', feeCny: 0 })).toThrow();
+  });
+
+  it('feeCny 非整数 → 拒绝', () => {
+    expect(() =>
+      swapItemHotelBodySchema.parse({ newHotelRoomTypeId: 'rt_new', feeCny: 49.5 }),
+    ).toThrow();
+  });
+
+  it('feeCny 超出上限（±100000）→ 拒绝（正负两侧）', () => {
+    expect(() =>
+      swapItemHotelBodySchema.parse({ newHotelRoomTypeId: 'rt_new', feeCny: 100_001 }),
+    ).toThrow();
+    expect(() =>
+      swapItemHotelBodySchema.parse({ newHotelRoomTypeId: 'rt_new', feeCny: -100_001 }),
+    ).toThrow();
+  });
+
+  it('newHotelRoomTypeId 缺失 → 拒绝', () => {
+    expect(() => swapItemHotelBodySchema.parse({ feeCny: 50 })).toThrow();
+  });
+
+  it('feeLabel 超 60 字 → 拒绝；note 超 200 字 → 拒绝', () => {
+    expect(() =>
+      swapItemHotelBodySchema.parse({ newHotelRoomTypeId: 'rt_new', feeLabel: '费'.repeat(61) }),
+    ).toThrow();
+    expect(() =>
+      swapItemHotelBodySchema.parse({ newHotelRoomTypeId: 'rt_new', note: '注'.repeat(201) }),
+    ).toThrow();
   });
 });
