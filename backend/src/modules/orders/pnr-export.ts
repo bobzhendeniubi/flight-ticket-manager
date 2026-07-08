@@ -96,7 +96,8 @@ export function passengerToRow(p: Passenger): PnrRow {
     passportFirst: firstName,
     passportNumber: p.documentNumber ?? '',
     passportNationality: toAlpha3(p.nationality),
-    passportIssueCountry: toAlpha3(p.passportIssueCountry),
+    // 旧开票模版此列填「签发地」文本（如「河北」「曼谷」），非 ISO 国家码 —— 对齐旧口径。
+    passportIssueCountry: p.passportIssuePlace ?? '',
     passportExpiry: formatPnrDate(p.passportExpiry),
     visaNumber: p.visaNumber ?? '',
     visaType: p.visaType ?? '',

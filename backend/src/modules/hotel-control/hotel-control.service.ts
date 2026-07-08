@@ -620,6 +620,11 @@ export interface HotelOccupantDto {
   contactName: string;
   /** 该订单出行人数（占位联系人 documentNumber='N/A' 不计，口径同前台分房池） */
   passengerCount: number;
+  /**
+   * 该订单出行人姓名（优先中文名，无则回落护照姓名；占位联系人 documentNumber='N/A' 不列）。
+   * 用于房控核对分房——一眼看清这几间房住的是哪几个人。
+   */
+  passengerNames: string[];
   /** 该占房行的间数（与销控板「用房」同口径，见 itemRoomCount） */
   rooms: number;
   checkIn: string; // YYYY-MM-DD（该行入住日）
@@ -660,7 +665,7 @@ export async function getOccupyingOrders(
           status: true,
           contactName: true,
           agent: { select: { companyName: true } },
-          passengers: { select: { documentNumber: true } },
+          passengers: { select: { documentNumber: true, chineseName: true, fullName: true } },
         },
       },
     },
@@ -674,6 +679,9 @@ export async function getOccupyingOrders(
       status: it.order.status,
       contactName: it.order.contactName,
       passengerCount: it.order.passengers.filter((p) => p.documentNumber !== 'N/A').length,
+      passengerNames: it.order.passengers
+        .filter((p) => p.documentNumber !== 'N/A')
+        .map((p) => p.chineseName?.trim() || p.fullName),
       rooms: itemRoomCount(it),
       checkIn: fmtDateOnly(it.hotelCheckIn!),
       checkOut: fmtDateOnly(it.hotelCheckOut!),

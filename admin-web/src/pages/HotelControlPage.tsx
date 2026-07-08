@@ -499,7 +499,18 @@ function OccupantsDrawer({
                   <div className="mt-1 text-ink-soft">
                     {o.contactName} · {o.passengerCount} 人 · {o.rooms} 间
                   </div>
-                  <div className="mt-0.5 text-xs text-ink-muted">
+                  {o.passengerNames.length > 0 ? (
+                    <div className="mt-1.5 flex flex-wrap gap-1">
+                      {o.passengerNames.map((name, ni) => (
+                        <span key={`${o.orderId}-p${ni}`} className="badge-neutral text-xs">
+                          {name}
+                        </span>
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="mt-1.5 text-xs text-ink-muted">该订单暂无出行人信息</div>
+                  )}
+                  <div className="mt-1.5 text-xs text-ink-muted">
                     {o.checkIn} ~ {o.checkOut} · {o.agentName}
                   </div>
                   <div className="mt-2 flex items-center gap-2">
@@ -924,20 +935,28 @@ function AlertsBanner({ token }: { token: string }) {
 }
 
 // ── 分房表导出（GET /orders/export-room-allocation；成都格式 xlsx）──────────
+// 两种口径：按「入住区间」选入住日；或按「出发日」选该日出发的订单、导出其整段入住晚。
 function RoomAllocationExport({ token }: { token: string }) {
+  const [mode, setMode] = useState<'range' | 'depart'>('range');
   const [exportFrom, setExportFrom] = useState<string>(todayStr());
   const [exportTo, setExportTo] = useState<string>(todayStr());
+  const [departDate, setDepartDate] = useState<string>(todayStr());
   const [exporting, setExporting] = useState(false);
+
+  const rangeInvalid = exportFrom > exportTo;
 
   async function handleExport(): Promise<void> {
     if (!token) return;
     setExporting(true);
     try {
-      const blob = await api.downloadRoomAllocation(token, { from: exportFrom, to: exportTo });
+      const params =
+        mode === 'depart' ? { departDate } : { from: exportFrom, to: exportTo };
+      const blob = await api.downloadRoomAllocation(token, params);
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `分房表-${exportFrom}.xlsx`;
+      a.download =
+        mode === 'depart' ? `分房表-出发${departDate}.xlsx` : `分房表-${exportFrom}.xlsx`;
       document.body.appendChild(a);
       a.click();
       a.remove();
@@ -955,39 +974,75 @@ function RoomAllocationExport({ token }: { token: string }) {
         <div>
           <h2 className="text-sm font-semibold text-ink">导出分房表</h2>
           <p className="mt-1 text-xs text-ink-muted">
-            成都格式 xlsx：每入住日期一个 sheet，按酒店分组（区间最长 14 天）。
+            {mode === 'depart'
+              ? '按出发日：选该日出发的订单，导出其整段入住晚（每入住日一个 sheet）。'
+              : '成都格式 xlsx：每入住日期一个 sheet，按酒店分组（区间最长 14 天）。'}
           </p>
+          <div className="mt-2 flex gap-3 text-xs">
+            <label className="inline-flex items-center gap-1">
+              <input
+                type="radio"
+                name="room-alloc-mode"
+                checked={mode === 'range'}
+                onChange={() => setMode('range')}
+              />
+              按入住区间
+            </label>
+            <label className="inline-flex items-center gap-1">
+              <input
+                type="radio"
+                name="room-alloc-mode"
+                checked={mode === 'depart'}
+                onChange={() => setMode('depart')}
+              />
+              按出发日
+            </label>
+          </div>
         </div>
         <div className="flex items-end gap-2">
-          <div>
-            <label className="label">入住起</label>
-            <input
-              type="date"
-              className="input"
-              value={exportFrom}
-              onChange={(e) => setExportFrom(e.target.value)}
-            />
-          </div>
-          <div>
-            <label className="label">入住止</label>
-            <input
-              type="date"
-              className="input"
-              value={exportTo}
-              onChange={(e) => setExportTo(e.target.value)}
-            />
-          </div>
+          {mode === 'depart' ? (
+            <div>
+              <label className="label">出发日</label>
+              <input
+                type="date"
+                className="input"
+                value={departDate}
+                onChange={(e) => setDepartDate(e.target.value)}
+              />
+            </div>
+          ) : (
+            <>
+              <div>
+                <label className="label">入住起</label>
+                <input
+                  type="date"
+                  className="input"
+                  value={exportFrom}
+                  onChange={(e) => setExportFrom(e.target.value)}
+                />
+              </div>
+              <div>
+                <label className="label">入住止</label>
+                <input
+                  type="date"
+                  className="input"
+                  value={exportTo}
+                  onChange={(e) => setExportTo(e.target.value)}
+                />
+              </div>
+            </>
+          )}
           <button
             type="button"
             onClick={() => void handleExport()}
-            disabled={exporting || exportFrom > exportTo}
+            disabled={exporting || (mode === 'depart' ? !departDate : rangeInvalid)}
             className="btn-primary"
           >
             {exporting ? '导出中…' : '导出分房表'}
           </button>
         </div>
       </div>
-      {exportFrom > exportTo && (
+      {mode === 'range' && rangeInvalid && (
         <div className="mt-2 text-xs text-amber-700">入住起不能晚于入住止</div>
       )}
     </section>

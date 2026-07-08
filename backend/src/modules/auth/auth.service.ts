@@ -3,7 +3,7 @@ import { type User, UserRole } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { hashPassword, verifyPassword } from '../../lib/password.js';
 import { generateRefreshToken, hashToken } from '../../lib/tokens.js';
-import { ConflictError, UnauthorizedError } from '../../lib/errors.js';
+import { AppError, ConflictError, UnauthorizedError } from '../../lib/errors.js';
 import { env } from '../../config/env.js';
 
 export interface AuthTokens {
@@ -21,6 +21,30 @@ export interface AuthResult {
 export interface IssueTokensContext {
   userAgent?: string;
   ipAddress?: string;
+}
+
+/**
+ * 刷新令牌轮换的「并发宽限窗」（毫秒）。
+ *
+ * refreshToken 一次性轮换：换新时旧 token 立即作废。但前端在正常使用中很容易同时
+ * 发出多个刷新（多标签页、定时续期与 401 重试撞车、开发期 StrictMode 双挂载），
+ * 它们带的是同一个尚未过期的旧 token —— 其中一个轮换成功，其余会撞到「已作废」。
+ *
+ * 若把这种毫秒级并发当成 token 重放去「撤销该用户所有会话」，正常使用会被瞬间踢下线。
+ * 因此：只有当旧 token 是「很久以前」被作废（超过本窗口）才判定为真正的重放并全撤销；
+ * 窗口内的并发只拒绝这一次请求（REFRESH_TOKEN_RACE，非 401），不牵连整个会话。
+ */
+const REFRESH_REUSE_GRACE_MS = 10_000;
+
+/** 并发刷新竞争：这一次刷新输给了同时发生的另一次轮换。非会话失效，调用方可忽略/重试。 */
+export class RefreshTokenRaceError extends AppError {
+  constructor() {
+    super('Refresh token was just rotated by a concurrent request; retry', {
+      statusCode: 409,
+      code: 'REFRESH_TOKEN_RACE',
+    });
+    this.name = 'RefreshTokenRaceError';
+  }
 }
 
 export class AuthService {
@@ -76,22 +100,34 @@ export class AuthService {
       where: { tokenHash },
       include: { user: true },
     });
-    if (!record || record.revokedAt || record.expiresAt < new Date()) {
+    if (!record || record.expiresAt < new Date()) {
       throw new UnauthorizedError('Invalid or expired refresh token');
     }
 
-    // ── 原子轮换：CAS revoke — 并发两个 refresh 只会有一个成功 ──
-    // 若已被撤销（count=0），视为 token 重放，撤销该用户所有 token 强制重登录
+    // 令牌已被作废：区分「真正的重放」与「客户端毫秒级并发轮换」。
+    // - 很久以前作废（超过宽限窗）→ 视为 token 重放 → 撤销该用户所有会话强制重登录。
+    // - 宽限窗内作废（另一并发刷新刚刚轮换掉它）→ 只拒绝这一次，不牵连整个会话。
+    if (record.revokedAt) {
+      const revokedAgeMs = Date.now() - record.revokedAt.getTime();
+      if (revokedAgeMs > REFRESH_REUSE_GRACE_MS) {
+        await prisma.refreshToken.updateMany({
+          where: { userId: record.userId, revokedAt: null },
+          data: { revokedAt: new Date() },
+        });
+        throw new UnauthorizedError('Refresh token reuse detected, please login again');
+      }
+      throw new RefreshTokenRaceError();
+    }
+
+    // ── 原子轮换：CAS revoke — 并发两个 refresh 只会有一个抢到（count=1）──
     const cas = await prisma.refreshToken.updateMany({
       where: { id: record.id, revokedAt: null },
       data: { revokedAt: new Date() },
     });
     if (cas.count !== 1) {
-      await prisma.refreshToken.updateMany({
-        where: { userId: record.userId, revokedAt: null },
-        data: { revokedAt: new Date() },
-      });
-      throw new UnauthorizedError('Refresh token reuse detected, please login again');
+      // 抢锁失败：在 findUnique 与本次 CAS 之间，另一并发刷新刚把它轮换掉了。
+      // 这是良性并发（真正的重放已在上面「已作废」分支按时效判定），只拒绝这一次。
+      throw new RefreshTokenRaceError();
     }
 
     return this.issueTokens(record.user, ctx);

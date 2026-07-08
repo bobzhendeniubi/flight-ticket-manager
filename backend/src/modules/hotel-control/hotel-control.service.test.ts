@@ -334,7 +334,7 @@ describe('getOccupyingOrders', () => {
     expect(where.order.status.in).not.toContain('CANCELLED');
   });
 
-  it('返回订单/联系人/间数/入住区间/代理；占位联系人（documentNumber=N/A）不计入人数', async () => {
+  it('返回订单/联系人/出行人姓名（中文名优先，无则回落护照名）/间数/入住区间/代理；占位联系人（documentNumber=N/A）不计入人数也不列名', async () => {
     const client = occupantsClient([
       {
         roomsBilled: 1,
@@ -347,7 +347,11 @@ describe('getOccupyingOrders', () => {
           status: 'PAID',
           contactName: '张三',
           agent: { companyName: '成都国旅' },
-          passengers: [{ documentNumber: 'E1' }, { documentNumber: 'E2' }, { documentNumber: 'N/A' }],
+          passengers: [
+            { documentNumber: 'E1', chineseName: '张三', fullName: 'ZHANG/SAN' },
+            { documentNumber: 'E2', chineseName: null, fullName: 'LI/SI' },
+            { documentNumber: 'N/A', chineseName: null, fullName: '占位联系人' },
+          ],
         },
       },
     ]);
@@ -359,6 +363,7 @@ describe('getOccupyingOrders', () => {
         status: 'PAID',
         contactName: '张三',
         passengerCount: 2,
+        passengerNames: ['张三', 'LI/SI'],
         rooms: 1,
         checkIn: dayStr(0),
         checkOut: dayStr(2),
@@ -380,7 +385,7 @@ describe('getOccupyingOrders', () => {
           status: 'TICKETED',
           contactName: '李四',
           agent: null,
-          passengers: [{ documentNumber: 'E3' }],
+          passengers: [{ documentNumber: 'E3', chineseName: '李四', fullName: 'LI/SI' }],
         },
       },
     ]);
@@ -401,7 +406,7 @@ describe('getOccupyingOrders', () => {
         status: 'PAID',
         contactName: '王五',
         agent: null,
-        passengers: [{ documentNumber: 'E4' }],
+        passengers: [{ documentNumber: 'E4', chineseName: '王五', fullName: 'WANG/WU' }],
       },
     };
     const client = occupantsClient([base, { ...base, roomsBilled: 2 }]);

@@ -29,7 +29,24 @@ type ApiRequestInit = Omit<RequestInit, 'body'> & {
   token?: string | null;
 };
 
+// ── Auth 续期桥：让请求层在 401 时静默换新 accessToken 并重试一次 ──────────────
+// 由 auth store 注册，避免 api.ts ↔ store 循环依赖。
+// 返回新的 accessToken；null = 续期失败（refresh token 失效），调用方放行 401 走登出。
+type RefreshAccessTokenFn = () => Promise<string | null>;
+let refreshAccessToken: RefreshAccessTokenFn | null = null;
+export function registerAuthRefresh(fn: RefreshAccessTokenFn): void {
+  refreshAccessToken = fn;
+}
+
 export async function apiFetch<T>(path: string, init: ApiRequestInit = {}): Promise<T> {
+  return apiFetchWithRetry<T>(path, init, true);
+}
+
+async function apiFetchWithRetry<T>(
+  path: string,
+  init: ApiRequestInit,
+  allowRefreshRetry: boolean,
+): Promise<T> {
   const headers = new Headers(init.headers);
   if (init.body !== undefined) headers.set('Content-Type', 'application/json');
   if (init.token) headers.set('Authorization', `Bearer ${init.token}`);
@@ -41,6 +58,15 @@ export async function apiFetch<T>(path: string, init: ApiRequestInit = {}): Prom
   });
 
   if (res.status === 204) return undefined as T;
+
+  // access token 过期 → 用 refreshToken 静默换新，带新 token 重试一次（仅一次，避免死循环）。
+  // 只对带 token 的请求生效；续期失败（返回 null）则放行原始 401，由上层走登出。
+  if (res.status === 401 && init.token && allowRefreshRetry && refreshAccessToken) {
+    const newToken = await refreshAccessToken();
+    if (newToken && newToken !== init.token) {
+      return apiFetchWithRetry<T>(path, { ...init, token: newToken }, false);
+    }
+  }
 
   const text = await res.text();
   // 容错解析：错误响应体未必是 JSON（如 nginx 的 413/502/504 是 HTML 错误页）。
@@ -1999,6 +2025,12 @@ export const api = {
   },
   listFulfillmentByOrder: (token: string, orderId: string) =>
     apiFetch<{ tasks: FulfillmentTask[] }>(`/fulfillment-tasks/by-order/${orderId}`, { token }),
+  // 按需拉取某订单乘客护照图（base64 data URL）——签证台展开某单时才取真图（列表已瘦身不带图）
+  listPassengerPhotos: (token: string, orderId: string) =>
+    apiFetch<{ photos: Array<{ id: string; passportPhotoUrl: string | null }> }>(
+      `/fulfillment-tasks/by-order/${orderId}/passenger-photos`,
+      { token },
+    ),
   // 批量改履约任务状态（签证台批量标"已送签"等；逐条校验，部分失败返回 failures）
   batchUpdateFulfillmentStatus: (token: string, taskIds: string[], toStatus: FulfillmentStatus) =>
     apiFetch<BatchFulfillmentStatusResult>('/fulfillment-tasks/batch-status', {
@@ -2220,14 +2252,19 @@ export const api = {
     apiFetch<HotelControlAlerts>(`/hotel-control/alerts?days=${days}`, { token }),
 
   // 分房表导出（成都格式：每入住日期一个 sheet；ADMIN/STAFF only）— Blob 直接下载
+  //   · { from, to }    按入住日区间选（跨度上限 14 天）
+  //   · { departDate }  按出发日选订单，导出其全部入住晚（后端 departDate 优先于 from/to）
   downloadRoomAllocation: async (
     token: string,
-    range: { from: string; to: string },
+    params: { from: string; to: string } | { departDate: string },
   ): Promise<Blob> => {
-    const res = await fetch(
-      `${API_BASE}/orders/export-room-allocation?from=${encodeURIComponent(range.from)}&to=${encodeURIComponent(range.to)}`,
-      { headers: { Authorization: `Bearer ${token}` } },
-    );
+    const qs =
+      'departDate' in params
+        ? `departDate=${encodeURIComponent(params.departDate)}`
+        : `from=${encodeURIComponent(params.from)}&to=${encodeURIComponent(params.to)}`;
+    const res = await fetch(`${API_BASE}/orders/export-room-allocation?${qs}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
     if (!res.ok) throw new ApiError(res.status, { code: 'EXPORT_FAILED', message: await res.text() });
     return res.blob();
   },
@@ -2748,6 +2785,8 @@ export interface HotelOccupant {
   status: OrderStatus;
   contactName: string;
   passengerCount: number;
+  /** 该订单出行人姓名（中文名优先，无则回落护照姓名；占位联系人不列）——房控核对分房用 */
+  passengerNames: string[];
   /** 该占房行的间数（与销控板「用房」同口径） */
   rooms: number;
   checkIn: string; // YYYY-MM-DD（该行入住日）

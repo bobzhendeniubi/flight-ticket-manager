@@ -31,6 +31,18 @@ export const fulfillmentRoutes: FastifyPluginAsync = async (app) => {
     return { tasks };
   });
 
+  /**
+   * GET /fulfillment-tasks/by-order/:orderId/passenger-photos
+   *
+   * 按需拉取某订单乘客的护照图（base64 data URL）。
+   * 列表接口为提速不随行回传大图；签证台展开某单时才调这里取真图。
+   */
+  app.get('/by-order/:orderId/passenger-photos', pre, async (req) => {
+    const { orderId } = req.params as { orderId: string };
+    const photos = await service.listPassengerPhotos(orderId);
+    return { photos };
+  });
+
   app.patch('/:id', pre, async (req) => {
     const { id } = req.params as { id: string };
     const body = updateFulfillmentBodySchema.parse(req.body);

@@ -59,35 +59,8 @@ const FULFILLMENT_STATUS_LABEL: Record<string, string> = {
   FAILED: '失败',
 };
 
-// 订单状态中文（与 orders.export.ts STATUS_LABEL 同口径，含释放型状态全量）。
-const ORDER_STATUS_LABEL: Record<string, string> = {
-  DRAFT: '草稿',
-  PENDING_PAYMENT: '待支付',
-  PAID: '已支付',
-  PROCESSING: '处理中',
-  TICKETED: '已出票',
-  COMPLETED: '已完成',
-  CANCELLED: '已取消',
-  PAYMENT_TIMEOUT: '支付超时',
-  FAILED: '失败',
-  REFUND_REQUESTED: '退款中',
-  REFUNDED: '已退款',
-  CHANGE_REQUESTED: '改期中',
-  CHANGED: '已改期',
-};
-
-const PASSENGER_TYPE_LABEL: Record<string, string> = {
-  ADULT: '成人',
-  CHILD: '儿童',
-  INFANT: '婴儿',
-};
-
-const GENDER_LABEL: Record<string, string> = { M: '男', F: '女', X: '其他' };
-
-const DOCUMENT_TYPE_LABEL: Record<string, string> = {
-  PASSPORT: '护照',
-  ID_CARD: '身份证',
-};
+// 注：《全岗可用》模版对齐旧系统口径 —— 乘客类型/性别/证件类型均按旧模版原样
+// 输出枚举/代码（ADULT、M、P），订单状态列旧模版不存在，故此处不再需要中文标签表。
 
 const CABIN_LABEL: Record<string, string> = {
   ECONOMY: '经济舱',
@@ -124,6 +97,15 @@ function fmtDateTime(d: Date | null | undefined): string {
   return `${fmtDate(d)} ${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
 }
 
+/** YYYY-MM-DD HH:MM:SS（旧《全岗可用》模版录入时间/到账时间含秒）*/
+function fmtDateTimeSec(d: Date | null | undefined): string {
+  if (!d) return '';
+  return `${fmtDateTime(d)}:${String(d.getUTCSeconds()).padStart(2, '0')}`;
+}
+
+/** 证件类型代码（旧模版此列填 'P'=护照，与航司/PNR 同款单字母口径）*/
+const DOCUMENT_TYPE_CODE: Record<string, string> = { PASSPORT: 'P', ID_CARD: 'I' };
+
 /** dd/mm/yyyy（越南签证表出生日期格式）*/
 function fmtDateDMYSlash(d: Date | null | undefined): string {
   if (!d) return '';
@@ -142,7 +124,7 @@ export function pnrName(p: { lastName: string | null; firstName: string | null; 
 }
 
 // ── 取数 ────────────────────────────────────────────────────────────────
-type OrderForTemplateExport = Prisma.OrderGetPayload<{
+export type OrderForTemplateExport = Prisma.OrderGetPayload<{
   include: {
     agent: { select: { companyName: true } };
     user: { select: { displayName: true; email: true } };
@@ -184,7 +166,7 @@ interface OrderContext {
   balancePerPax: number; // 尾款 = max(0, total - paidAmount) ÷ pax
 }
 
-function buildOrderContext(order: OrderForTemplateExport): OrderContext {
+export function buildOrderContext(order: OrderForTemplateExport): OrderContext {
   const paxCount = Math.max(1, order.passengers.length);
 
   // 航班段（按出发时间排序）
@@ -252,81 +234,85 @@ function buildOrderContext(order: OrderForTemplateExport): OrderContext {
   };
 }
 
-// ── 模板一：《全岗可用》49 列 ─────────────────────────────────────────────
+// ── 模板一：《全岗可用》57 列（与旧系统「全岗可用」表格模版同名同序）─────────
+// 头部两行：0..53 列为单行表头（纵向合并两行）；末尾「订单成本」为分组表头，
+// 跨「成本类型/子类型/金额」三子列（横向合并首行）。系统暂无数据的列一律留空，绝不编造。
 interface FullRow {
   seq: number;
-  productCodes: string;
-  hotelName: string;
-  agency: string;
-  notes: string;
-  hotelInfo: string;
-  chineseName: string;
-  passengerName: string;
-  flightCount: string; // 暂无数据 — 留空
-  travelDates: string;
-  flightNumbers: string;
-  route: string;
-  orderType: string;
-  status: string; // 订单状态中文
-  contactName: string;
-  contactPhone: string;
-  settlePrice: number;
-  settleReceived: number;
-  settleReceivedAt: string;
-  settleChannel: string;
-  balanceDue: number;
-  singleRoomDiff: string; // 暂无数据 — 留空
-  singleRoomDiffReceived: string; // 暂无数据 — 留空
-  visaAmount: number;
-  visaReceived: string; // 暂无数据 — 留空
-  offsetAmount: number;
-  offsetReceived: string; // 暂无数据 — 留空
-  offsetPerson: string; // 暂无数据 — 留空
-  offsetOrder: string; // 暂无数据 — 留空
-  settled: string;
-  refundAmount: number;
-  refundAt: string;
-  refundChannel: string; // 暂无数据 — 留空
-  invoiceStatusSys: string;
-  invoiceStatusManual: string; // 线下手工列 — 留空
-  visaStatus: string;
-  visaOption: string;
-  visaNote: string; // 暂无数据 — 留空
-  passportIssuePlace: string;
-  placeOfBirth: string;
-  orderNumber: string;
-  cabin: string;
-  dateOfBirth: string;
-  passengerType: string;
-  distribution: string;
-  gender: string;
-  nationality: string;
-  documentType: string;
-  documentNumber: string;
-  issueDate: string; // 暂无护照签发日期字段 — 留空
-  expiryDate: string;
-  infantWith: string; // 暂无数据 — 留空
-  recordedAt: string;
-  recordedBy: string;
+  isOriginalOrder: string; // 是否是原订单 — 暂无对应字段，留空
+  agency: string; // 代理机构
+  notes: string; // 备注
+  hotelInfo: string; // 酒店类型（酒店名 + 房型）
+  chineseName: string; // 中文名称
+  passengerName: string; // 乘客姓名 LAST/FIRST
+  flightCount: string; // 飞行次数 — 暂无数据，留空
+  travelDates: string; // 出发(往返)日期
+  flightNumbers: string; // 航班号
+  orderType: string; // 订单类型
+  deposit: string; // 定金 — 暂无定金概念，留空
+  depositReceived: string; // 定金到账金额 — 留空
+  depositReceivedAt: string; // 定金到账时间 — 留空
+  depositChannel: string; // 定金到账渠道 — 留空
+  settlePrice: number; // 结算价格（人均）
+  settleReceived: number; // 结算价到账金额（人均）
+  settleReceivedAt: string; // 结算价到账时间
+  settleChannel: string; // 结算价到账渠道
+  balanceDue: number; // 尾款金额（人均）
+  singleRoomDiff: string; // 单房差 — 暂无数据，留空
+  singleRoomDiffReceived: string; // 单房差到账金额 — 留空
+  visaAmount: number; // 签证金额（人均）
+  visaReceived: string; // 签证到账金额 — 留空
+  offsetAmount: number; // 抵扣金额（人均）
+  offsetReceived: string; // 抵扣到账金额 — 留空
+  offsetPerson: string; // 抵扣人员 — 留空
+  offsetOrder: string; // 抵扣订单 — 留空
+  settled: string; // 是否清账
+  refundAmount: number; // 退款金额（人均）
+  refundAt: string; // 退款时间
+  refundChannel: string; // 退款渠道 — 留空
+  invoiceStatusSys: string; // 系统开票状态
+  invoiceStatusManual: string; // 开票状态 — 线下手工列，留空
+  visaStatus: string; // 签证状态
+  visaOption: string; // 签证选项
+  visaNote: string; // 签证备注 — 留空
+  passportIssuePlace: string; // 护照签发地
+  placeOfBirth: string; // 出生地
+  orderNumber: string; // 订单编号
+  cabin: string; // 舱位等级
+  dateOfBirth: string; // 乘客生日 DD-MM-YYYY
+  passengerType: string; // 乘客类型（旧模版原样枚举 ADULT/CHILD/INFANT）
+  distribution: string; // 分销状态 — 暂无数据，留空
+  gender: string; // 性别（旧模版原样 M/F）
+  nationality: string; // 国籍 ISO alpha-3
+  documentType: string; // 证件类型（P=护照）
+  documentNumber: string; // 证件编号
+  issueDate: string; // 签发日期 DD-MM-YYYY
+  expiryDate: string; // 有效日期 DD-MM-YYYY
+  infantWith: string; // 婴儿随行成员 — 留空
+  recordedAt: string; // 录入时间 YYYY-MM-DD HH:MM:SS
+  recordedBy: string; // 录入人员
+  temp: string; // 临时 — 留空
+  costType: string; // 订单成本·成本类型 — 留空
+  costSubType: string; // 订单成本·子类型 — 留空
+  costAmount: string; // 订单成本·金额 — 留空
 }
 
-const FULL_COLUMNS: Array<{ header: string; key: keyof FullRow; width: number }> = [
+export const FULL_COLUMNS: Array<{ header: string; key: keyof FullRow; width: number }> = [
   { header: '序号', key: 'seq', width: 6 },
-  { header: '产品编号', key: 'productCodes', width: 14 },
-  { header: '酒店名称', key: 'hotelName', width: 20 },
+  { header: '是否是原订单', key: 'isOriginalOrder', width: 12 },
   { header: '代理机构', key: 'agency', width: 16 },
-  { header: '备注', key: 'notes', width: 20 },
+  { header: '备注', key: 'notes', width: 22 },
   { header: '酒店类型', key: 'hotelInfo', width: 24 },
   { header: '中文名称', key: 'chineseName', width: 12 },
   { header: '乘客姓名', key: 'passengerName', width: 18 },
   { header: '飞行次数', key: 'flightCount', width: 8 },
   { header: '出发(往返)日期', key: 'travelDates', width: 24 },
   { header: '航班号', key: 'flightNumbers', width: 18 },
-  { header: '航线', key: 'route', width: 14 },
   { header: '订单类型', key: 'orderType', width: 10 },
-  { header: '订单状态', key: 'status', width: 10 },
-  { header: '联系人', key: 'contactName', width: 12 },
-  { header: '联系电话', key: 'contactPhone', width: 14 },
+  { header: '定金', key: 'deposit', width: 8 },
+  { header: '定金到账金额', key: 'depositReceived', width: 12 },
+  { header: '定金到账时间', key: 'depositReceivedAt', width: 18 },
+  { header: '定金到账渠道', key: 'depositChannel', width: 12 },
   { header: '结算价格', key: 'settlePrice', width: 10 },
   { header: '结算价到账金额', key: 'settleReceived', width: 14 },
   { header: '结算价到账时间', key: 'settleReceivedAt', width: 18 },
@@ -363,20 +349,20 @@ const FULL_COLUMNS: Array<{ header: string; key: keyof FullRow; width: number }>
   { header: '签发日期', key: 'issueDate', width: 12 },
   { header: '有效日期', key: 'expiryDate', width: 12 },
   { header: '婴儿随行成员', key: 'infantWith', width: 12 },
-  { header: '录入时间', key: 'recordedAt', width: 18 },
+  { header: '录入时间', key: 'recordedAt', width: 20 },
   { header: '录入人员', key: 'recordedBy', width: 14 },
+  { header: '临时', key: 'temp', width: 8 },
+  // 「订单成本」分组下的三子列（表头首行合并为「订单成本」，见 applyFullHeader）。
+  { header: '成本类型', key: 'costType', width: 12 },
+  { header: '子类型', key: 'costSubType', width: 12 },
+  { header: '金额', key: 'costAmount', width: 10 },
 ];
 
-function orderToFullRows(order: OrderForTemplateExport, ctx: OrderContext): Omit<FullRow, 'seq'>[] {
-  // 产品编号：去重后的酒店/签证/接送/套餐编号
-  const codes = Array.from(
-    new Set(
-      order.items
-        .map((it) => it.hotelRoomType?.hotel.code ?? it.visa?.code ?? it.transfer?.code ?? it.bundle?.code)
-        .filter((c): c is string => Boolean(c)),
-    ),
-  );
+/** 末尾「订单成本」分组表头及其覆盖的子列数（成本类型/子类型/金额）。*/
+const FULL_COST_GROUP_HEADER = '订单成本';
+const FULL_COST_GROUP_SPAN = 3;
 
+export function orderToFullRows(order: OrderForTemplateExport, ctx: OrderContext): Omit<FullRow, 'seq'>[] {
   // 最近一笔成功收款（到账时间/渠道）
   const succeeded = order.payments
     .filter((p) => p.status === 'SUCCEEDED' && p.paidAt)
@@ -418,8 +404,7 @@ function orderToFullRows(order: OrderForTemplateExport, ctx: OrderContext): Omit
     const notes = [baseNotes, groupInfo].filter(Boolean).join(' / ');
 
     return {
-    productCodes: codes.join(' / '),
-    hotelName: ctx.hotelNames,
+    isOriginalOrder: '',
     agency: ctx.agency,
     notes,
     hotelInfo: ctx.hotelInfo,
@@ -428,14 +413,14 @@ function orderToFullRows(order: OrderForTemplateExport, ctx: OrderContext): Omit
     flightCount: '',
     travelDates: ctx.travelDates,
     flightNumbers: ctx.flightNumbers,
-    route: ctx.route,
     orderType: ctx.orderType,
-    status: ORDER_STATUS_LABEL[order.status] ?? order.status,
-    contactName: order.contactName,
-    contactPhone: order.contactPhone,
+    deposit: '',
+    depositReceived: '',
+    depositReceivedAt: '',
+    depositChannel: '',
     settlePrice: ctx.settlePerPax,
     settleReceived: ctx.paidPerPax,
-    settleReceivedAt: lastPayment ? fmtDateTime(lastPayment.paidAt) : '',
+    settleReceivedAt: lastPayment ? fmtDateTimeSec(lastPayment.paidAt) : '',
     settleChannel: lastPayment ? PAYMENT_METHOD_LABEL[lastPayment.method] ?? lastPayment.method : '',
     balanceDue: ctx.balancePerPax,
     singleRoomDiff: '',
@@ -448,7 +433,7 @@ function orderToFullRows(order: OrderForTemplateExport, ctx: OrderContext): Omit
     offsetOrder: '',
     settled,
     refundAmount: round2(refundTotal / ctx.paxCount),
-    refundAt: fmtDateTime(lastRefundAt),
+    refundAt: fmtDateTimeSec(lastRefundAt),
     refundChannel: '',
     invoiceStatusSys: INVOICE_STATUS_LABEL[order.invoiceStatus] ?? order.invoiceStatus,
     invoiceStatusManual: '',
@@ -459,33 +444,62 @@ function orderToFullRows(order: OrderForTemplateExport, ctx: OrderContext): Omit
     placeOfBirth: p.placeOfBirth ?? '',
     orderNumber: order.orderNumber,
     cabin: ctx.cabinLabels,
-    dateOfBirth: fmtDate(p.dateOfBirth),
-    passengerType: PASSENGER_TYPE_LABEL[p.passengerType] ?? p.passengerType,
-    distribution: order.agent ? '代理' : '直客',
-    gender: p.gender ? GENDER_LABEL[p.gender] ?? p.gender : '',
+    // 旧模版日期口径：生日/签发/有效期 = DD-MM-YYYY；录入时间含秒。
+    dateOfBirth: fmtDateDMYDash(p.dateOfBirth),
+    // 旧模版原样枚举（ADULT/CHILD/INFANT），不译中文。
+    passengerType: p.passengerType,
+    distribution: '',
+    // 旧模版原样代码（M/F），不译中文。
+    gender: p.gender ?? '',
     nationality: toAlpha3(p.nationality),
-    documentType: DOCUMENT_TYPE_LABEL[p.documentType] ?? p.documentType,
+    documentType: DOCUMENT_TYPE_CODE[p.documentType] ?? p.documentType,
     documentNumber: p.documentNumber,
-    issueDate: fmtDate(p.passportIssueDate),
-    expiryDate: fmtDate(p.passportExpiry),
+    issueDate: fmtDateDMYDash(p.passportIssueDate),
+    expiryDate: fmtDateDMYDash(p.passportExpiry),
     infantWith: '',
-    recordedAt: fmtDateTime(order.createdAt),
+    recordedAt: fmtDateTimeSec(order.createdAt),
     // 游客单 user=null：回退到游客联系人姓名
     recordedBy: order.user?.displayName ?? order.user?.email ?? order.guestName ?? '',
+    temp: '',
+    costType: '',
+    costSubType: '',
+    costAmount: '',
     };
   });
+}
+
+/** 《全岗可用》两行表头：0..N-4 单列纵向合并两行；末尾 3 列并入「订单成本」分组（首行横向合并）。*/
+function applyFullHeader(ws: ExcelJS.Worksheet): void {
+  const leafBeforeGroup = FULL_COLUMNS.length - FULL_COST_GROUP_SPAN;
+  const row1 = ws.getRow(1);
+  const row2 = ws.getRow(2);
+  FULL_COLUMNS.forEach((c, i) => {
+    const col = i + 1;
+    // 非分组列：表头文字放首行（随后与第二行纵向合并）；分组子列：叶子表头放第二行。
+    if (i < leafBeforeGroup) row1.getCell(col).value = c.header;
+    else row2.getCell(col).value = c.header;
+  });
+  // 「订单成本」分组标题落在首行、覆盖三子列。
+  row1.getCell(leafBeforeGroup + 1).value = FULL_COST_GROUP_HEADER;
+  for (let col = 1; col <= leafBeforeGroup; col += 1) ws.mergeCells(1, col, 2, col);
+  ws.mergeCells(1, leafBeforeGroup + 1, 1, FULL_COLUMNS.length);
+  for (const r of [row1, row2]) {
+    r.font = { bold: true };
+    r.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEFEFEF' } };
+    r.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+  }
 }
 
 // ── 模板二：《票务专用》27 列 = 代理 + 备注 + 航司 PNR 25 列 ───────────────
 type TicketingRow = { agency: string; notes: string } & PnrRow;
 
-const TICKETING_COLUMNS: Array<{ header: string; key: keyof TicketingRow; width: number }> = [
+export const TICKETING_COLUMNS: Array<{ header: string; key: keyof TicketingRow; width: number }> = [
   { header: '代理', key: 'agency', width: 16 },
   { header: '备注', key: 'notes', width: 20 },
   ...PNR_COLUMNS.map((c) => ({ header: c.header, key: c.key as keyof TicketingRow, width: 18 })),
 ];
 
-function orderToTicketingRows(order: OrderForTemplateExport, ctx: OrderContext): TicketingRow[] {
+export function orderToTicketingRows(order: OrderForTemplateExport, ctx: OrderContext): TicketingRow[] {
   return order.passengers.map<TicketingRow>((p) => ({
     agency: ctx.agency,
     notes: ctx.notes,
@@ -609,18 +623,19 @@ export async function buildOrderTemplateExportWorkbook(
   wb.created = new Date();
   const ws = wb.addWorksheet(ORDER_TEMPLATE_LABEL[query.template]);
 
+  // full 用两行表头（末列「订单成本」分组）；ticketing/visa 单行表头。
   if (query.template === 'full') {
-    ws.columns = FULL_COLUMNS.map((c) => ({ header: c.header, key: c.key, width: c.width }));
-  } else if (query.template === 'ticketing') {
-    ws.columns = TICKETING_COLUMNS.map((c) => ({ header: c.header, key: c.key, width: c.width }));
+    // 只设列 key/宽度，表头由 applyFullHeader 手工写两行（含合并）。
+    ws.columns = FULL_COLUMNS.map((c) => ({ key: c.key, width: c.width }));
+    applyFullHeader(ws);
   } else {
-    ws.columns = VISA_COLUMNS.map((c) => ({ header: c.header, key: c.key, width: c.width }));
+    const cols = query.template === 'ticketing' ? TICKETING_COLUMNS : VISA_COLUMNS;
+    ws.columns = cols.map((c) => ({ header: c.header, key: c.key, width: c.width }));
+    const headerRow = ws.getRow(1);
+    headerRow.font = { bold: true };
+    headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEFEFEF' } };
+    headerRow.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
   }
-
-  const headerRow = ws.getRow(1);
-  headerRow.font = { bold: true };
-  headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEFEFEF' } };
-  headerRow.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
 
   let seq = 0;
   for (const order of orders) {
@@ -643,7 +658,8 @@ export async function buildOrderTemplateExportWorkbook(
     }
   }
 
-  ws.views = [{ state: 'frozen', xSplit: 0, ySplit: 1 }];
+  // full 两行表头 → 冻结 2 行；其余单行表头 → 冻结 1 行。
+  ws.views = [{ state: 'frozen', xSplit: 0, ySplit: query.template === 'full' ? 2 : 1 }];
 
   const buf = await wb.xlsx.writeBuffer();
   return Buffer.from(buf);

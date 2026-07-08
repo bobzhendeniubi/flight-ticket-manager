@@ -12,6 +12,7 @@ vi.mock('../../db/prisma.js', () => ({ prisma: {} }));
 
 import { FulfillmentStatus } from '@prisma/client';
 import { NotFoundError } from '../../lib/errors.js';
+import { prisma } from '../../db/prisma.js';
 import { FulfillmentService } from './fulfillment.service.js';
 
 describe('FulfillmentService.batchUpdateStatus', () => {
@@ -55,5 +56,28 @@ describe('FulfillmentService.batchUpdateStatus', () => {
       failureCount: 1,
       failures: [{ id: 'x', error: '未知错误' }],
     });
+  });
+});
+
+describe('FulfillmentService.listPassengerPhotos', () => {
+  it('按订单只取 id + 护照图（列表瘦身后展开某单时按需拉真图）', async () => {
+    const findMany = vi.fn().mockResolvedValue([
+      { id: 'p1', passportPhotoUrl: 'data:image/jpeg;base64,AAA' },
+      { id: 'p2', passportPhotoUrl: null },
+    ]);
+    // 顶层 mock 的 prisma 是空对象；这里补上本用例需要的 passenger.findMany
+    (prisma as unknown as { passenger: { findMany: typeof findMany } }).passenger = { findMany };
+
+    const service = new FulfillmentService();
+    const res = await service.listPassengerPhotos('order-1');
+
+    expect(findMany).toHaveBeenCalledWith({
+      where: { orderId: 'order-1' },
+      select: { id: true, passportPhotoUrl: true },
+    });
+    expect(res).toEqual([
+      { id: 'p1', passportPhotoUrl: 'data:image/jpeg;base64,AAA' },
+      { id: 'p2', passportPhotoUrl: null },
+    ]);
   });
 });

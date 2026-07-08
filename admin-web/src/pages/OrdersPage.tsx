@@ -3049,10 +3049,13 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   const [outboundFlightId, setOutboundFlightId] = useState('');
   const [outboundSchedules, setOutboundSchedules] = useState<AdminSchedule[]>([]);
   const [outboundScheduleId, setOutboundScheduleId] = useState('');
+  // 起飞日期过滤（YYYY-MM-DD）：先选/手输日期，再从当日班次里挑，避免班次下拉过长。留空=显示全部班次。
+  const [outboundDate, setOutboundDate] = useState('');
 
   const [returnFlightId, setReturnFlightId] = useState('');
   const [returnSchedules, setReturnSchedules] = useState<AdminSchedule[]>([]);
   const [returnScheduleId, setReturnScheduleId] = useState('');
+  const [returnDate, setReturnDate] = useState('');
 
   const [cabin, setCabin] = useState<CabinClass | ''>('');
 
@@ -3110,7 +3113,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
 
   // 出港班次
   useEffect(() => {
-    if (!token || !outboundFlightId) { setOutboundSchedules([]); setOutboundScheduleId(''); return; }
+    if (!token || !outboundFlightId) { setOutboundSchedules([]); setOutboundScheduleId(''); setOutboundDate(''); return; }
     api.listSchedules(token, outboundFlightId)
       .then((r) => setOutboundSchedules(r.schedules))
       .catch(() => setErr('出港班次加载失败'));
@@ -3118,7 +3121,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
 
   // 回程班次
   useEffect(() => {
-    if (!token || !returnFlightId) { setReturnSchedules([]); setReturnScheduleId(''); return; }
+    if (!token || !returnFlightId) { setReturnSchedules([]); setReturnScheduleId(''); setReturnDate(''); return; }
     api.listSchedules(token, returnFlightId)
       .then((r) => setReturnSchedules(r.schedules))
       .catch(() => setErr('回程班次加载失败'));
@@ -3127,8 +3130,8 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   // 切换产品类型时清空相关选择
   function switchProductType(pt: BatchProductType): void {
     setProductType(pt);
-    setOutboundFlightId(''); setOutboundScheduleId(''); setOutboundSchedules([]);
-    setReturnFlightId(''); setReturnScheduleId(''); setReturnSchedules([]);
+    setOutboundFlightId(''); setOutboundScheduleId(''); setOutboundSchedules([]); setOutboundDate('');
+    setReturnFlightId(''); setReturnScheduleId(''); setReturnSchedules([]); setReturnDate('');
     setCabin('');
     setBundleId(''); setBundleNights(null); setBundleSingleCount(null); setBundleBusinessCount(null);
     setBundleAdultCount(1); setBundleChildCount(0); setBundleInfantCount(0);
@@ -3139,6 +3142,16 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   const outboundFlight = flights.find((f) => f.id === outboundFlightId);
   const outboundSchedule = outboundSchedules.find((s) => s.id === outboundScheduleId);
   const returnFlight = flights.find((f) => f.id === returnFlightId);
+
+  // 按起飞日期过滤班次；日期留空则显示全部（保留原有能力）。
+  const outboundSchedulesForDate = useMemo(
+    () => (outboundDate ? outboundSchedules.filter((s) => s.departureTime.slice(0, 10) === outboundDate) : outboundSchedules),
+    [outboundSchedules, outboundDate],
+  );
+  const returnSchedulesForDate = useMemo(
+    () => (returnDate ? returnSchedules.filter((s) => s.departureTime.slice(0, 10) === returnDate) : returnSchedules),
+    [returnSchedules, returnDate],
+  );
   const cabinOptions = outboundSchedule?.seatClasses ?? [];
   const selectedBundle = bundles.find((b) => b.id === bundleId);
 
@@ -3374,13 +3387,13 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                   <div className="mb-2 text-xs font-medium text-slate-600">
                     {productType === 'FLIGHT_ROUNDTRIP' ? '出港航班' : '航班'}
                   </div>
-                  <div className="grid gap-3 md:grid-cols-3">
+                  <div className="grid gap-3 md:grid-cols-4">
                     <label className="text-xs text-slate-500">
                       航班
                       <select
                         className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
                         value={outboundFlightId}
-                        onChange={(e) => { setOutboundFlightId(e.target.value); setOutboundScheduleId(''); setCabin(''); }}
+                        onChange={(e) => { setOutboundFlightId(e.target.value); setOutboundScheduleId(''); setOutboundDate(''); setCabin(''); }}
                         disabled={flightsLoading}
                       >
                         <option value="">选择航班…</option>
@@ -3392,20 +3405,33 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                       </select>
                     </label>
                     <label className="text-xs text-slate-500">
-                      班次（出发日期）
+                      起飞日期（可手输）
+                      <input
+                        type="date"
+                        className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                        value={outboundDate}
+                        onChange={(e) => { setOutboundDate(e.target.value); setOutboundScheduleId(''); setCabin(''); }}
+                        disabled={!outboundFlightId}
+                      />
+                    </label>
+                    <label className="text-xs text-slate-500">
+                      班次（出发时间）
                       <select
                         className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
                         value={outboundScheduleId}
                         onChange={(e) => { setOutboundScheduleId(e.target.value); setCabin(''); }}
                         disabled={!outboundFlightId}
                       >
-                        <option value="">选择班次…</option>
-                        {outboundSchedules.map((s) => (
+                        <option value="">{outboundDate ? '选择当日班次…' : '选择班次…'}</option>
+                        {outboundSchedulesForDate.map((s) => (
                           <option key={s.id} value={s.id}>
                             {s.departureTime.slice(0, 16).replace('T', ' ')}
                           </option>
                         ))}
                       </select>
+                      {outboundFlightId && outboundDate && outboundSchedulesForDate.length === 0 && (
+                        <span className="mt-1 block text-[11px] text-amber-600">该日期无班次，请换个日期或清空日期查看全部。</span>
+                      )}
                     </label>
                     <label className="text-xs text-slate-500">
                       舱位
@@ -3430,13 +3456,13 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                 {productType === 'FLIGHT_ROUNDTRIP' && (
                   <div className="rounded-md border border-slate-200 p-3">
                     <div className="mb-2 text-xs font-medium text-slate-600">回程航班</div>
-                    <div className="grid gap-3 md:grid-cols-2">
+                    <div className="grid gap-3 md:grid-cols-3">
                       <label className="text-xs text-slate-500">
                         航班
                         <select
                           className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
                           value={returnFlightId}
-                          onChange={(e) => { setReturnFlightId(e.target.value); setReturnScheduleId(''); }}
+                          onChange={(e) => { setReturnFlightId(e.target.value); setReturnScheduleId(''); setReturnDate(''); }}
                           disabled={flightsLoading}
                         >
                           <option value="">选择航班…</option>
@@ -3448,20 +3474,33 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                         </select>
                       </label>
                       <label className="text-xs text-slate-500">
-                        班次（出发日期）
+                        起飞日期（可手输）
+                        <input
+                          type="date"
+                          className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                          value={returnDate}
+                          onChange={(e) => { setReturnDate(e.target.value); setReturnScheduleId(''); }}
+                          disabled={!returnFlightId}
+                        />
+                      </label>
+                      <label className="text-xs text-slate-500">
+                        班次（出发时间）
                         <select
                           className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
                           value={returnScheduleId}
                           onChange={(e) => setReturnScheduleId(e.target.value)}
                           disabled={!returnFlightId}
                         >
-                          <option value="">选择班次…</option>
-                          {returnSchedules.map((s) => (
+                          <option value="">{returnDate ? '选择当日班次…' : '选择班次…'}</option>
+                          {returnSchedulesForDate.map((s) => (
                             <option key={s.id} value={s.id}>
                               {s.departureTime.slice(0, 16).replace('T', ' ')}
                             </option>
                           ))}
                         </select>
+                        {returnFlightId && returnDate && returnSchedulesForDate.length === 0 && (
+                          <span className="mt-1 block text-[11px] text-amber-600">该日期无班次，请换个日期或清空日期查看全部。</span>
+                        )}
                       </label>
                     </div>
                     <p className="mt-1.5 text-[11px] text-slate-400">

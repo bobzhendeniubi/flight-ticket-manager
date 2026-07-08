@@ -40,6 +40,7 @@ import {
 import {
   buildRoomAllocationWorkbook,
   roomAllocationExportFilename,
+  roomAllocationExportFilenameByDepart,
 } from './orders.export-room-allocation.js';
 import {
   buildMasterExportWorkbook,
@@ -512,25 +513,42 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   );
 
   // ── 分房表导出（成都格式：每入住日期一个 sheet，按酒店分组）──
-  // GET /orders/export-room-allocation?from&to — ADMIN/STAFF only
-  // 默认 from=to=今天；跨度上限 14 天（超出 service 抛 400）
+  // GET /orders/export-room-allocation?from&to — 或 ?departDate（ADMIN/STAFF only）
+  //   · from/to：按入住日区间选（默认 from=to=今天；跨度上限 14 天，超出 service 抛 400）
+  //   · departDate：按出发日选订单，导出其全部入住晚（给了它就优先，忽略 from/to）
   app.get(
     '/export-room-allocation',
     { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
     async (req, reply) => {
       const query = exportRoomAllocationQuerySchema.parse(req.query);
-      const today = new Date().toISOString().slice(0, 10);
-      const from = query.from ?? today;
-      const to = query.to ?? from; // 只给 from 时按单日导出
-      const buf = await buildRoomAllocationWorkbook({ from, to });
+
+      let buf: Buffer;
+      let filename: string;
+      let auditLabel: string;
+      let auditAfter: Record<string, string>;
+      if (query.departDate) {
+        // 按出发日：选该日出发的订单，导出整段入住晚
+        buf = await buildRoomAllocationWorkbook({ departDate: query.departDate });
+        filename = roomAllocationExportFilenameByDepart(query.departDate);
+        auditLabel = `分房表 出发日 ${query.departDate}`;
+        auditAfter = { departDate: query.departDate };
+      } else {
+        const today = new Date().toISOString().slice(0, 10);
+        const from = query.from ?? today;
+        const to = query.to ?? from; // 只给 from 时按单日导出
+        buf = await buildRoomAllocationWorkbook({ from, to });
+        filename = roomAllocationExportFilename(from, to);
+        auditLabel = `分房表 ${from} ~ ${to}`;
+        auditAfter = { from, to };
+      }
 
       void writeAudit({
         actor: actorFromRequest(req),
         action: 'EXPORT_ROOM_ALLOCATION',
         targetType: 'ORDER',
         targetId: 'room-allocation',
-        targetLabel: `分房表 ${from} ~ ${to}`,
-        after: { from, to },
+        targetLabel: auditLabel,
+        after: auditAfter,
       });
 
       return reply
@@ -540,7 +558,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         )
         .header(
           'Content-Disposition',
-          `attachment; filename="${encodeURIComponent(roomAllocationExportFilename(from, to))}"`,
+          `attachment; filename="${encodeURIComponent(filename)}"`,
         )
         .send(buf);
     },
@@ -553,6 +571,12 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     const requester = await buildRequester(req.user.sub, req.user.role);
     const order = await service.getOrder(id, requester);
     const passengers = await prisma.passenger.findMany({ where: { orderId: id } });
+    // 空订单（无出行人）→ 友好 400，避免下载到只有空表的 zip
+    if (passengers.length === 0) {
+      return reply
+        .status(400)
+        .send({ error: '该订单暂无出行人信息，无法生成出行人资料表' });
+    }
     const zipBuf = await buildPassportPhotoZip({ orderNumber: order.orderNumber, passengers });
 
     void writeAudit({

@@ -3,10 +3,12 @@
  *
  * 输入：订单 + 该订单的所有乘客（含 passportPhotoUrl）
  * 输出：zip Buffer，结构：
- *   FTM2026...../{LASTNAME}_{passportNumber}.{ext}
- *   FTM2026...../README.txt  （列出哪些乘客缺照片）
+ *   FTM2026...../{LASTNAME}_{passportNumber}.{ext}   （仅有图乘客）
+ *   FTM2026...../README.txt                          （列出哪些乘客缺照片）
+ *   FTM2026...../送签表.xlsx                         （始终附带：每位乘客一行）
  *
- * 缺失照片不报错 —— 写到 README.txt 让签证员一眼看到缺谁的。
+ * 缺失照片不报错 —— 写到 README.txt，并在送签表里每位乘客一行（无图乘客标「无护照图（手工录入）」），
+ * 保证「手工录入、没护照图」的订单也能下载到可用资料表。空订单（无乘客）由路由层返回 400。
  */
 import ExcelJS from 'exceljs';
 import JSZip from 'jszip';
@@ -79,11 +81,32 @@ async function loadVisaSheetContext(
   return { departureLocalDate, remark };
 }
 
+/**
+ * 护照姓名（LAST/FIRST 斜线格式）——
+ * 优先用已拆分的 lastName/firstName；手工录入未拆分时从 fullName 尽力拆（不编造，拆不出就整体呈现）。
+ * 保证「手工录入、没护照图」的乘客在送签表里也有可读姓名，不留空白。
+ */
+function passportSlashName(p: Passenger): string {
+  const last = (p.lastName ?? '').trim();
+  const first = (p.firstName ?? '').trim();
+  if (last || first) {
+    return [last.toUpperCase(), first.toUpperCase()].filter(Boolean).join('/');
+  }
+  const full = (p.fullName ?? '').trim();
+  if (!full) return '';
+  if (full.includes('/')) return full.toUpperCase();
+  const parts = full.split(/\s+/);
+  if (parts.length >= 2) {
+    const [ln, ...rest] = parts;
+    return `${ln.toUpperCase()}/${rest.join(' ').toUpperCase()}`;
+  }
+  return full.toUpperCase();
+}
+
 /** 送签表列定义（每乘客一行）— 表头中文，覆盖签证岗所需护照/签证字段 */
 const VISA_SHEET_COLUMNS: Array<{ header: string; key: string; width: number }> = [
   { header: '序号', key: 'seq', width: 6 },
-  { header: '英文姓', key: 'lastName', width: 16 },
-  { header: '英文名', key: 'firstName', width: 16 },
+  { header: '护照姓名(LAST/FIRST)', key: 'passportName', width: 24 },
   { header: '中文名', key: 'chineseName', width: 12 },
   { header: '性别', key: 'gender', width: 6 },
   { header: '出生日期', key: 'dateOfBirth', width: 14 },
@@ -98,7 +121,7 @@ const VISA_SHEET_COLUMNS: Array<{ header: string; key: string; width: number }> 
   { header: '签证有效期', key: 'visaExpiry', width: 14 },
   { header: '客人出发日期', key: 'departureDate', width: 14 },
   { header: '备注', key: 'remark', width: 24 },
-  { header: '是否有护照图', key: 'hasPhoto', width: 12 },
+  { header: '是否有护照图', key: 'hasPhoto', width: 20 },
 ];
 
 /** 构建「送签表」工作簿 Buffer（每乘客一行，缺值留空，绝不编造） */
@@ -120,8 +143,7 @@ async function buildVisaSheetBuffer(passengers: Passenger[]): Promise<Buffer> {
   passengers.forEach((p, i) => {
     ws.addRow({
       seq: i + 1,
-      lastName: p.lastName ?? '',
-      firstName: p.firstName ?? '',
+      passportName: passportSlashName(p),
       chineseName: p.chineseName ?? '',
       gender: p.gender ?? '',
       dateOfBirth: fmtDate(p.dateOfBirth),
@@ -136,7 +158,7 @@ async function buildVisaSheetBuffer(passengers: Passenger[]): Promise<Buffer> {
       visaExpiry: fmtDate(p.visaExpiry),
       departureDate: departureLocalDate,
       remark,
-      hasPhoto: p.passportPhotoUrl ? '有' : '缺',
+      hasPhoto: p.passportPhotoUrl ? '有护照图' : '无护照图（手工录入）',
     });
   });
 

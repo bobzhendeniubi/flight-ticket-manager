@@ -60,15 +60,25 @@ const FILTER_OPTIONS: Array<{ value: StatusFilter; label: string }> = [
 // ── 乘客行：名称 / 护照号 / 照片缩略图 ─────────────────────────────────────
 interface PassengerRowProps {
   passenger: VisaTaskPassenger;
+  /** 展开后按需拉取到的护照大图（覆盖列表里的 null）；未取到则回落到 passenger 上的值 */
+  photoUrl?: string | null;
+  /** 护照图仍在按需加载中 */
+  photosLoading?: boolean;
 }
-function PassengerRow({ passenger }: PassengerRowProps) {
+function PassengerRow({ passenger, photoUrl, photosLoading }: PassengerRowProps) {
   const [enlarged, setEnlarged] = useState(false);
+  // 优先用按需加载到的真图；否则回落到列表下发的值（现列表恒为 null）
+  const resolvedPhoto = photoUrl ?? passenger.passportPhotoUrl;
 
   return (
     <div className="flex items-center gap-3 py-1 text-xs">
       {/* 护照照片区 */}
       <div className="w-8 shrink-0">
-        {passenger.passportPhotoUrl ? (
+        {photosLoading && !resolvedPhoto ? (
+          <div className="flex h-8 w-8 items-center justify-center rounded border border-slate-200 bg-slate-50">
+            <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-brand border-t-transparent" />
+          </div>
+        ) : resolvedPhoto ? (
           <>
             <button
               type="button"
@@ -77,7 +87,7 @@ function PassengerRow({ passenger }: PassengerRowProps) {
               className="block h-8 w-8 overflow-hidden rounded border border-slate-200 hover:opacity-80 transition-opacity"
             >
               <img
-                src={passenger.passportPhotoUrl}
+                src={resolvedPhoto}
                 alt={`${passenger.fullName} 护照`}
                 className="h-full w-full object-cover"
               />
@@ -89,13 +99,13 @@ function PassengerRow({ passenger }: PassengerRowProps) {
               >
                 <div className="relative max-h-[90vh] max-w-[90vw]" onClick={(e) => e.stopPropagation()}>
                   <img
-                    src={passenger.passportPhotoUrl}
+                    src={resolvedPhoto}
                     alt={`${passenger.fullName} 护照`}
                     className="max-h-[85vh] max-w-[85vw] rounded-lg shadow-2xl"
                   />
                   <div className="mt-2 flex justify-center gap-3">
                     <a
-                      href={passenger.passportPhotoUrl}
+                      href={resolvedPhoto}
                       download={`passport-${passenger.documentNumber}.jpg`}
                       className="btn-secondary text-xs py-1"
                       onClick={(e) => e.stopPropagation()}
@@ -114,6 +124,11 @@ function PassengerRow({ passenger }: PassengerRowProps) {
               </div>
             )}
           </>
+        ) : passenger.hasPhoto ? (
+          // 有照片但本次未取到（加载失败）—— 与"缺照"区分，中性占位
+          <div className="flex h-8 w-8 items-center justify-center rounded border border-slate-200 bg-slate-50 text-[9px] text-ink-muted">
+            —
+          </div>
         ) : (
           <div className="flex h-8 w-8 items-center justify-center rounded border border-rose-200 bg-rose-50 text-[9px] font-semibold text-rose-600">
             缺
@@ -166,6 +181,12 @@ function TaskRow({ task, selected, onToggle, token, onChanged }: TaskRowProps) {
   const [expanded, setExpanded] = useState(false);
   const [downloading, setDownloading] = useState(false);
 
+  // 护照大图按需加载：列表已瘦身不带图，展开某单时才拉真图（避免整页数百 MB base64）
+  const [photoMap, setPhotoMap] = useState<Record<string, string | null>>({});
+  const [photosLoading, setPhotosLoading] = useState(false);
+  const [photosError, setPhotosError] = useState<string | null>(null);
+  const photosLoadedRef = useRef(false);
+
   // 备注 = 任务级 task.notes（可编辑），区别于订单级 order.notes（只读）
   const [noteDraft, setNoteDraft] = useState(task.notes ?? '');
   const [savingNote, setSavingNote] = useState(false);
@@ -180,6 +201,32 @@ function TaskRow({ task, selected, onToggle, token, onChanged }: TaskRowProps) {
   const passengers = task.passengers ?? [];
   const missingCount = passengers.filter((p) => !p.hasPhoto).length;
   const orderId = task.item.orderId;
+
+  // 按需拉取本单乘客护照真图（首次展开时；失败允许重试）
+  const loadPhotos = useCallback(() => {
+    if (!orderId || passengers.length === 0) return;
+    photosLoadedRef.current = true;
+    setPhotosLoading(true);
+    setPhotosError(null);
+    api
+      .listPassengerPhotos(token, orderId)
+      .then((res) => {
+        const m: Record<string, string | null> = {};
+        for (const ph of res.photos) m[ph.id] = ph.passportPhotoUrl;
+        setPhotoMap(m);
+      })
+      .catch((e: unknown) => {
+        photosLoadedRef.current = false; // 允许重试
+        setPhotosError(e instanceof ApiError ? e.message : '护照图加载失败');
+      })
+      .finally(() => setPhotosLoading(false));
+  }, [orderId, passengers.length, token]);
+
+  const toggleExpanded = () => {
+    const next = !expanded;
+    setExpanded(next);
+    if (next && !photosLoadedRef.current) loadPhotos();
+  };
 
   // 出发日期（本地化）：纯签证单无航班 → null
   const departureYmd =
@@ -279,7 +326,7 @@ function TaskRow({ task, selected, onToggle, token, onChanged }: TaskRowProps) {
         <td className="align-top text-center">
           <button
             type="button"
-            onClick={() => setExpanded((v) => !v)}
+            onClick={toggleExpanded}
             className="btn-ghost py-0.5 px-2 text-xs"
             title={expanded ? '收起乘客信息' : '查看乘客 / 护照'}
           >
@@ -297,11 +344,26 @@ function TaskRow({ task, selected, onToggle, token, onChanged }: TaskRowProps) {
             {passengers.length === 0 ? (
               <p className="text-xs text-ink-muted">无乘客数据</p>
             ) : (
-              <div className="max-w-lg divide-y divide-slate-100">
-                {passengers.map((p) => (
-                  <PassengerRow key={p.id} passenger={p} />
-                ))}
-              </div>
+              <>
+                {photosError && (
+                  <div className="mb-2 flex items-center gap-2 text-xs text-rose-600">
+                    <span>护照图加载失败：{photosError}</span>
+                    <button type="button" className="btn-ghost py-0.5 px-2 text-xs" onClick={loadPhotos}>
+                      重试
+                    </button>
+                  </div>
+                )}
+                <div className="max-w-lg divide-y divide-slate-100">
+                  {passengers.map((p) => (
+                    <PassengerRow
+                      key={p.id}
+                      passenger={p}
+                      photoUrl={photoMap[p.id]}
+                      photosLoading={photosLoading}
+                    />
+                  ))}
+                </div>
+              </>
             )}
 
             {passengers.length > 0 && (
@@ -501,8 +563,15 @@ export function VisaDeskPage() {
       </section>
 
       {error && (
-        <div className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
-          {error}
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
+          <span>{error}</span>
+          <button
+            type="button"
+            className="btn-secondary py-1 text-xs"
+            onClick={() => setRefreshNonce((n) => n + 1)}
+          >
+            重试
+          </button>
         </div>
       )}
 
@@ -585,7 +654,12 @@ export function VisaDeskPage() {
             <tbody>
               {loading ? (
                 <tr>
-                  <td colSpan={6} className="py-6 text-center text-ink-muted">加载签证任务…</td>
+                  <td colSpan={6} className="py-10 text-center text-ink-muted">
+                    <span className="inline-flex items-center gap-2">
+                      <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-brand border-t-transparent" />
+                      加载签证任务…
+                    </span>
+                  </td>
                 </tr>
               ) : filtered.length === 0 ? (
                 <tr>

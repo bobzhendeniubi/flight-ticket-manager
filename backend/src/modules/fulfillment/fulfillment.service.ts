@@ -81,6 +81,19 @@ export class FulfillmentService {
     );
   }
 
+  /**
+   * 按订单拉取乘客护照图（base64 data URL）—— 签证台展开某单时按需调用。
+   * 列表接口为提速已不随行回传大图（仅 hasPhoto）；点开某单才用这里取真图，
+   * 把「一次性数百 MB」摊薄成「按需一单几 MB」。
+   */
+  async listPassengerPhotos(orderId: string): Promise<Array<{ id: string; passportPhotoUrl: string | null }>> {
+    const rows = await prisma.passenger.findMany({
+      where: { orderId },
+      select: { id: true, passportPhotoUrl: true },
+    });
+    return rows.map((p) => ({ id: p.id, passportPhotoUrl: p.passportPhotoUrl }));
+  }
+
   async list(query: ListFulfillmentQuery) {
     const where: Prisma.FulfillmentTaskWhereInput = {};
     if (query.type) where.type = query.type;
@@ -137,24 +150,24 @@ export class FulfillmentService {
       id: string;
       fullName: string;
       documentNumber: string;
-      passportPhotoUrl: string | null;
+      hasPhoto: boolean;
     };
     type FlightLegRow = {
       orderId: string;
       flightSchedule: { departureTime: Date; departureTz: string } | null;
     };
     const [passengerRows, flightLegRows] = await Promise.all([
+      // 性能关键：护照图以 base64 data URL 落库（单人可达数 MB），列表页 200 行会放大成
+      // 数百 MB 的响应体（读库 + 序列化 + 传输都被拖垮，签证台加载卡到分钟级）。
+      // 这里改用原生 SQL 只在库内算出 hasPhoto（布尔），不把大字段拉到应用层；
+      // 真图在用户展开某单时按 orderId 单独按需拉取（见 listPassengerPhotos）。
       visaOrderIds.length
-        ? prisma.passenger.findMany({
-            where: { orderId: { in: visaOrderIds } },
-            select: {
-              orderId: true,
-              id: true,
-              fullName: true,
-              documentNumber: true,
-              passportPhotoUrl: true,
-            },
-          })
+        ? prisma.$queryRaw<PassengerRow[]>(Prisma.sql`
+            SELECT "orderId", "id", "fullName", "documentNumber",
+                   ("passportPhotoUrl" IS NOT NULL AND length("passportPhotoUrl") > 0) AS "hasPhoto"
+            FROM "Passenger"
+            WHERE "orderId" IN (${Prisma.join(visaOrderIds)})
+          `)
         : Promise.resolve([] as PassengerRow[]),
       orderIds.length
         ? prisma.orderItem.findMany({
@@ -207,9 +220,18 @@ export class FulfillmentService {
             departureTime: firstLeg ? firstLeg.departureTime.toISOString() : null,
             departureTz: firstLeg?.departureTz ?? null,
           },
-          // 签证任务附带乘客护照明细；其他类型不附带
+          // 签证任务附带乘客明细（轻量）：仅名称/证件号/hasPhoto，不含护照大图。
+          // 缺照标红只依赖 hasPhoto（库内算出，准确）；护照真图展开某单时按需拉取。
           ...(t.type === FulfillmentType.VISA_APPLICATION
-            ? { passengers: (passengersByOrder.get(order.id) ?? []).map(serializePassenger) }
+            ? {
+                passengers: (passengersByOrder.get(order.id) ?? []).map((p) => ({
+                  id: p.id,
+                  fullName: p.fullName,
+                  documentNumber: p.documentNumber,
+                  passportPhotoUrl: null as string | null,
+                  hasPhoto: p.hasPhoto,
+                })),
+              }
             : {}),
         };
       }),

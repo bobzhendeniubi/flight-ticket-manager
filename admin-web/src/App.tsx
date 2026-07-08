@@ -62,8 +62,27 @@ function AgentLanding() {
 
 void AGENT_ALLOWED_PATHS; // 将来可用于中间件白名单，目前通过 adminOnly 显式标注
 
-// access token TTL=1h；提前到 50 分钟续期，避免后台闲置掉登录
-const REFRESH_INTERVAL_MS = 50 * 60 * 1000;
+// 会话保活策略（对任意 access token TTL 都稳健）：
+// 每分钟体检一次，只有当 access token 进入「临期窗」（剩余 ≤ REFRESH_SKEW_MS）才续期。
+// 好处：刚登录 / token 还新时不做无谓轮换 —— 避免多标签/重复挂载并发轮换撞后端一次性轮换判定；
+// 真正过期的那一刻由 apiFetch 的 401 静默续期兜底。
+const SESSION_CHECK_INTERVAL_MS = 60 * 1000;
+const REFRESH_SKEW_MS = 5 * 60 * 1000;
+
+/** 解析 JWT 的 exp（毫秒时间戳）；解析失败/无 exp 返回 null（当作临期，交由续期兜底）。 */
+function getAccessTokenExpMs(token: string | null | undefined): number | null {
+  if (!token) return null;
+  const parts = token.split('.');
+  if (parts.length < 2) return null;
+  try {
+    const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/'))) as {
+      exp?: number;
+    };
+    return typeof payload.exp === 'number' ? payload.exp * 1000 : null;
+  } catch {
+    return null;
+  }
+}
 
 export function App() {
   const hasSession = useAuth((s) => Boolean(s.tokens?.refreshToken));
@@ -71,9 +90,30 @@ export function App() {
 
   useEffect(() => {
     if (!hasSession) return;
-    void refreshSession();
-    const id = setInterval(() => void refreshSession(), REFRESH_INTERVAL_MS);
-    return () => clearInterval(id);
+
+    // 只在临期时续期：新 token 不动，避免无谓（且可能并发）的刷新。
+    const maybeRefresh = () => {
+      const expMs = getAccessTokenExpMs(useAuth.getState().tokens?.accessToken);
+      if (expMs === null || expMs - Date.now() <= REFRESH_SKEW_MS) {
+        void refreshSession();
+      }
+    };
+
+    maybeRefresh();
+    const id = window.setInterval(maybeRefresh, SESSION_CHECK_INTERVAL_MS);
+
+    // 后台标签的 setInterval 会被浏览器节流：切回前台时先从存储同步（兄弟标签可能已轮换出新 token），
+    // 再体检续期，避免拿着过期 token 继续请求。
+    const onVisible = () => {
+      if (document.visibilityState !== 'visible') return;
+      void Promise.resolve(useAuth.persist?.rehydrate?.()).then(maybeRefresh);
+    };
+    document.addEventListener('visibilitychange', onVisible);
+
+    return () => {
+      window.clearInterval(id);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
   }, [hasSession, refreshSession]);
 
   return (

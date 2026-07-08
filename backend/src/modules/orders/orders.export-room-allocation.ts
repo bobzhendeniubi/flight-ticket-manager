@@ -15,7 +15,7 @@
  */
 import ExcelJS from 'exceljs';
 import type { Prisma, PrismaClient } from '@prisma/client';
-import { OrderStatus } from '@prisma/client';
+import { OrderStatus, OrderItemKind } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { BadRequestError } from '../../lib/errors.js';
 import { getHotelNightlyRemaining } from '../hotel-control/hotel-control.service.js';
@@ -409,57 +409,107 @@ async function buildDailyRemainingLookup(
   return lookup;
 }
 
-/**
- * 构建分房表 xlsx。
- * @param range  入住日期范围 [from, to]（含两端，YYYY-MM-DD）；跨度超 14 天抛 400
- * @param client 可选注入用于测试；缺省取默认 prisma
- */
-export async function buildRoomAllocationWorkbook(
-  range: { from: string; to: string },
-  client: PrismaClient = defaultPrisma,
-): Promise<Buffer> {
-  if (range.from > range.to) {
+/** 占房 item 取数的统一 include（区间口径 / 按出发日口径共用，保证行映射字段一致）。*/
+const ROOM_ITEM_INCLUDE = {
+  hotelRoomType: {
+    select: {
+      hotelId: true,
+      name: true,
+      bedType: true,
+      capacity: true,
+      hotel: { select: { name: true } },
+    },
+  },
+  order: {
+    include: {
+      agent: { select: { companyName: true } },
+      passengers: true,
+      items: {
+        select: {
+          kind: true,
+          flightSchedule: { select: { departureTime: true } },
+        },
+      },
+    },
+  },
+} satisfies Prisma.OrderItemInclude;
+
+/** 按入住日 [from, to] 选占房 item（旧口径：sheet 覆盖的入住日就是选中的入住日）。*/
+async function queryRoomItemsByCheckInRange(
+  from: string,
+  to: string,
+  client: PrismaClient,
+): Promise<RoomItemForExport[]> {
+  if (from > to) {
     throw new BadRequestError('起始日不能晚于结束日');
   }
-  const fromD = toDateOnly(range.from);
-  const toD = toDateOnly(range.to);
+  const fromD = toDateOnly(from);
+  const toD = toDateOnly(to);
   const days = Math.floor((toD.getTime() - fromD.getTime()) / (24 * 60 * 60 * 1000)) + 1;
   if (days > ROOM_ALLOCATION_MAX_DAYS) {
     throw new BadRequestError(`分房表导出跨度最多 ${ROOM_ALLOCATION_MAX_DAYS} 天`);
   }
-
-  const items = (await client.orderItem.findMany({
+  return (await client.orderItem.findMany({
     where: {
       hotelRoomTypeId: { not: null },
       hotelCheckIn: { gte: fromD, lte: toD },
       order: { status: { in: COUNTED_STATUSES } },
     },
     orderBy: { createdAt: 'asc' },
-    include: {
-      hotelRoomType: {
-        select: {
-          hotelId: true,
-          name: true,
-          bedType: true,
-          capacity: true,
-          hotel: { select: { name: true } },
-        },
-      },
+    include: ROOM_ITEM_INCLUDE,
+  })) as RoomItemForExport[];
+}
+
+/**
+ * 按「出发日」选占房 item（新口径）：先选出该日出发的订单，再导出这些订单的**全部**入住晚
+ * （不再按入住日切范围）——一张订单跨几晚就产出几个 sheet 上的行。
+ *
+ * 「该日出发」判定与 sheet 上「出发(往返)日期」列同口径（都用 UTC 日历日，见 fmtDate）：
+ *   - 主口径：订单任一 FLIGHT 行所在班次 departureTime 落在该 UTC 日（[dayStart, 次日) 半开区间；
+ *     departureTime 是含时刻的 UTC 时间戳）。
+ *   - 回落：订单**没有任何**挂了班次的 FLIGHT 行（纯酒店/未挂班次的套餐）时，按其占房 item 的
+ *     hotelCheckIn == 该日选中（套餐酒店盖章 hotelCheckIn 通常 = 出发日）。这与行映射里
+ *     travelDates「有航班用航班日、否则回落入住日」的回落规则一致。
+ */
+async function queryRoomItemsByDepartDate(
+  departDate: string,
+  client: PrismaClient,
+): Promise<RoomItemForExport[]> {
+  const dayStart = toDateOnly(departDate);
+  const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000);
+  return (await client.orderItem.findMany({
+    where: {
+      hotelRoomTypeId: { not: null },
       order: {
-        include: {
-          agent: { select: { companyName: true } },
-          passengers: true,
-          items: {
-            select: {
-              kind: true,
-              flightSchedule: { select: { departureTime: true } },
+        status: { in: COUNTED_STATUSES },
+        OR: [
+          {
+            items: {
+              some: {
+                kind: OrderItemKind.FLIGHT,
+                flightSchedule: { departureTime: { gte: dayStart, lt: dayEnd } },
+              },
             },
           },
-        },
+          {
+            AND: [
+              { items: { none: { kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } } } },
+              { items: { some: { hotelRoomTypeId: { not: null }, hotelCheckIn: dayStart } } },
+            ],
+          },
+        ],
       },
     },
+    orderBy: { createdAt: 'asc' },
+    include: ROOM_ITEM_INCLUDE,
   })) as RoomItemForExport[];
+}
 
+/** 把占房 item 集合渲染成分房表 xlsx（区间/出发日两口径共用的收尾）。*/
+async function buildWorkbookFromItems(
+  items: RoomItemForExport[],
+  client: PrismaClient,
+): Promise<Buffer> {
   const remainingLookup = await buildDailyRemainingLookup(items, client);
   const sheets = buildRoomAllocationSheets(items, remainingLookup);
 
@@ -470,13 +520,30 @@ export async function buildRoomAllocationWorkbook(
   for (const sheet of sheets) {
     addSheet(wb, sheet.name, sheet.rows);
   }
-  // 范围内没有任何占房数据 — 仍出一个带表头的空 sheet（无 sheet 的 xlsx 非法）
+  // 没有任何占房数据 — 仍出一个带表头的空 sheet（无 sheet 的 xlsx 非法）
   if (sheets.length === 0) {
     addSheet(wb, '无数据', []);
   }
 
   const buf = await wb.xlsx.writeBuffer();
   return Buffer.from(buf);
+}
+
+/**
+ * 构建分房表 xlsx。两种选单口径二选一：
+ * @param params `{ from, to }` 入住日区间（含两端，YYYY-MM-DD；跨度超 14 天抛 400）；
+ *               或 `{ departDate }` 按出发日选订单、导出其全部入住晚（YYYY-MM-DD）。
+ * @param client 可选注入用于测试；缺省取默认 prisma
+ */
+export async function buildRoomAllocationWorkbook(
+  params: { from: string; to: string } | { departDate: string },
+  client: PrismaClient = defaultPrisma,
+): Promise<Buffer> {
+  const items =
+    'departDate' in params
+      ? await queryRoomItemsByDepartDate(params.departDate, client)
+      : await queryRoomItemsByCheckInRange(params.from, params.to, client);
+  return buildWorkbookFromItems(items, client);
 }
 
 function addSheet(wb: ExcelJS.Workbook, name: string, rows: RoomAllocationRow[]): void {
@@ -495,4 +562,9 @@ function addSheet(wb: ExcelJS.Workbook, name: string, rows: RoomAllocationRow[])
 /** 文件名：`分房表_{from}.xlsx`（单日）/ `分房表_{from}_{to}.xlsx`（区间）。*/
 export function roomAllocationExportFilename(from: string, to: string): string {
   return from === to ? `分房表_${from}.xlsx` : `分房表_${from}_${to}.xlsx`;
+}
+
+/** 文件名（按出发日口径）：`分房表_出发{departDate}.xlsx`。*/
+export function roomAllocationExportFilenameByDepart(departDate: string): string {
+  return `分房表_出发${departDate}.xlsx`;
 }

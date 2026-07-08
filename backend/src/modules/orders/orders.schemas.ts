@@ -255,6 +255,8 @@ export type ExportTemplatesQuery = z.infer<typeof exportTemplatesQuerySchema>;
 export const exportRoomAllocationQuerySchema = z.object({
   from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, '日期格式应为 YYYY-MM-DD').optional(),
   to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, '日期格式应为 YYYY-MM-DD').optional(),
+  // 按出发日口径：选出该日出发的订单，导出其全部入住晚（与 from/to 互斥，给了它就优先）。
+  departDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, '日期格式应为 YYYY-MM-DD').optional(),
 });
 export type ExportRoomAllocationQuery = z.infer<typeof exportRoomAllocationQuerySchema>;
 

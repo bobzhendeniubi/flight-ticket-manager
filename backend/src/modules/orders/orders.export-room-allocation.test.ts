@@ -12,9 +12,12 @@ import { describe, it, expect, vi } from 'vitest';
 // 模块链路（orders.export-templates → orders.service）顶层引用 prisma —— mock 掉
 vi.mock('../../db/prisma.js', () => ({ prisma: {} }));
 
+import type { PrismaClient } from '@prisma/client';
 import {
   buildRoomAllocationSheets,
+  buildRoomAllocationWorkbook,
   roomAllocationExportFilename,
+  roomAllocationExportFilenameByDepart,
   type RoomItemForExport,
 } from './orders.export-room-allocation.js';
 
@@ -344,5 +347,73 @@ describe('roomAllocationExportFilename', () => {
     expect(roomAllocationExportFilename('2026-07-10', '2026-07-12')).toBe(
       '分房表_2026-07-10_2026-07-12.xlsx',
     );
+  });
+
+  it('按出发日文件名', () => {
+    expect(roomAllocationExportFilenameByDepart('2026-07-10')).toBe('分房表_出发2026-07-10.xlsx');
+  });
+});
+
+/**
+ * 选单口径（WHERE 构造）验证：注入捕获 findMany 参数的假 client，导出后断言查询条件。
+ * 不落库、不 mock 复杂返回——findMany 返回 []（导出走空 sheet 收尾），只校验选单意图。
+ */
+function captureClient(): { client: PrismaClient; findMany: ReturnType<typeof vi.fn> } {
+  const findMany = vi.fn().mockResolvedValue([]);
+  const client = { orderItem: { findMany } } as unknown as PrismaClient;
+  return { client, findMany };
+}
+
+const UTC = (s: string): Date => new Date(`${s}T00:00:00.000Z`);
+
+describe('buildRoomAllocationWorkbook 选单口径', () => {
+  it('按出发日：主口径按 FLIGHT departureTime 落在该 UTC 日选订单，且不按入住日切范围（导全部入住晚）', async () => {
+    const { client, findMany } = captureClient();
+    await buildRoomAllocationWorkbook({ departDate: '2026-07-10' }, client);
+
+    expect(findMany).toHaveBeenCalledTimes(1);
+    const where = findMany.mock.calls[0][0].where;
+
+    // 只取占房 item；关键：出发日口径**不**按 hotelCheckIn 切区间（要导整段入住晚）
+    expect(where.hotelRoomTypeId).toEqual({ not: null });
+    expect(where.hotelCheckIn).toBeUndefined();
+
+    // 主口径：该日出发的航班（[dayStart, 次日) 半开区间）
+    const [flightOr] = where.order.OR;
+    expect(flightOr.items.some.kind).toBe('FLIGHT');
+    expect(flightOr.items.some.flightSchedule.departureTime).toEqual({
+      gte: UTC('2026-07-10'),
+      lt: UTC('2026-07-11'),
+    });
+  });
+
+  it('按出发日：回落口径覆盖无航班订单（无挂班次 FLIGHT 行 + 占房 item hotelCheckIn == 该日）', async () => {
+    const { client, findMany } = captureClient();
+    await buildRoomAllocationWorkbook({ departDate: '2026-07-10' }, client);
+
+    const where = findMany.mock.calls[0][0].where;
+    const fallback = where.order.OR[1].AND;
+    // 该订单没有任何挂了班次的 FLIGHT 行
+    expect(fallback[0].items.none).toEqual({ kind: 'FLIGHT', flightScheduleId: { not: null } });
+    // 且有一条占房 item 在该日入住
+    expect(fallback[1].items.some.hotelRoomTypeId).toEqual({ not: null });
+    expect(fallback[1].items.some.hotelCheckIn).toEqual(UTC('2026-07-10'));
+  });
+
+  it('区间口径保持不变：按 hotelCheckIn [from,to] 选、无出发日 OR 分支', async () => {
+    const { client, findMany } = captureClient();
+    await buildRoomAllocationWorkbook({ from: '2026-07-10', to: '2026-07-12' }, client);
+
+    const where = findMany.mock.calls[0][0].where;
+    expect(where.hotelCheckIn).toEqual({ gte: UTC('2026-07-10'), lte: UTC('2026-07-12') });
+    expect(where.order.OR).toBeUndefined();
+  });
+
+  it('区间口径跨度超 14 天 → 抛 400，不落库', async () => {
+    const { client, findMany } = captureClient();
+    await expect(
+      buildRoomAllocationWorkbook({ from: '2026-07-01', to: '2026-08-01' }, client),
+    ).rejects.toThrow(/14/u);
+    expect(findMany).not.toHaveBeenCalled();
   });
 });
