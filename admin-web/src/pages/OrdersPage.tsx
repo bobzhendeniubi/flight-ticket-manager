@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { api, ApiError, duplicatePassengerConflictOrderNumbers, SETTLEMENT_MODE_LABEL, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle } from '../lib/api';
+import { api, ApiError, duplicatePassengerConflictOrderNumbers, SETTLEMENT_MODE_LABEL, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { useFlightSeats } from '../stores/flightSeats';
 import {
@@ -254,6 +254,12 @@ export function OrdersPage() {
   const [orders, setOrders] = useState<OrderSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // 回收站（仅 ADMIN）：已软删订单弹窗 + 恢复
+  const [showRecycleBin, setShowRecycleBin] = useState(false);
+  const [deletedOrders, setDeletedOrders] = useState<DeletedOrderSummary[]>([]);
+  const [recycleLoading, setRecycleLoading] = useState(false);
+  const [recycleError, setRecycleError] = useState<string | null>(null);
+  const [restoringId, setRestoringId] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<'' | OrderStatus>('');
   const [kindFilter, setKindFilter] = useState<'' | OrderItemKindLabel>('');
   const [channelFilter, setChannelFilter] = useState<'' | 'direct' | 'agent'>('');
@@ -437,6 +443,43 @@ export function OrdersPage() {
     } catch (err) {
       // 占座守卫等 4xx 的后端提示（如「请先取消订单释放座位，再删除」）直接透传。
       alert(err instanceof ApiError ? `删除失败：${err.message}` : '删除失败');
+    }
+  };
+
+  // 打开回收站（仅 ADMIN）→ 拉已软删订单列表
+  const openRecycleBin = async () => {
+    if (!tokens?.accessToken) return;
+    setShowRecycleBin(true);
+    setRecycleLoading(true);
+    setRecycleError(null);
+    try {
+      const res = await api.listDeletedOrders(tokens.accessToken, { pageSize: 200 });
+      setDeletedOrders(res.orders);
+    } catch (err) {
+      setRecycleError(err instanceof ApiError ? err.message : '加载回收站失败');
+    } finally {
+      setRecycleLoading(false);
+    }
+  };
+
+  // 恢复一单：deletedAt 置回 null → 从回收站表移除 + 刷新主列表（恢复的单重新出现）。
+  // 软删/恢复都不触碰座位账，无需广播座位变更。
+  const restoreOrder = async (o: DeletedOrderSummary) => {
+    if (!tokens?.accessToken) return;
+    const confirmed = window.confirm(
+      `恢复订单 ${o.orderNumber}？\n\n` +
+        `恢复后订单回到删除前状态（${STATUS_LABEL[o.status]}），重新出现在列表/导出/统计。不影响座位账。`,
+    );
+    if (!confirmed) return;
+    setRestoringId(o.id);
+    try {
+      await api.restoreOrder(tokens.accessToken, o.id);
+      setDeletedOrders((prev) => prev.filter((d) => d.id !== o.id));
+      setRefreshNonce((n) => n + 1);
+    } catch (err) {
+      alert(err instanceof ApiError ? `恢复失败：${err.message}` : '恢复失败');
+    } finally {
+      setRestoringId(null);
     }
   };
 
@@ -757,6 +800,16 @@ export function OrdersPage() {
           >
             🎫 票务开票导出
           </button>
+          {isAdmin && (
+            <button
+              type="button"
+              className="btn-ghost text-sm"
+              onClick={() => void openRecycleBin()}
+              title="查看已删除（软删）的订单，可恢复"
+            >
+              🗑 回收站
+            </button>
+          )}
           <p className="w-full text-right text-xs text-ink-muted">
             {selectedIds.size > 0
               ? `已勾选 ${selectedIds.size} 条：两个导出都只导勾选的这些订单（忽略上方筛选）；取消勾选恢复按筛选导出`
@@ -1332,6 +1385,84 @@ export function OrdersPage() {
             bumpSeats();
           }}
         />
+      )}
+
+      {/* 回收站（仅 ADMIN）：已软删订单表 + 每行恢复 */}
+      {showRecycleBin && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4"
+          onClick={() => setShowRecycleBin(false)}
+        >
+          <div
+            className="flex max-h-[92vh] w-full max-w-3xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-start justify-between gap-3 border-b border-slate-200 px-6 py-4">
+              <div className="min-w-0">
+                <h2 className="text-base font-semibold text-ink">🗑 订单回收站</h2>
+                <p className="mt-0.5 text-xs text-ink-muted">
+                  已删除的订单（不出现在列表/导出/统计）。恢复后回到删除前状态，重新可见；不影响座位账。
+                </p>
+              </div>
+              <button
+                className="btn-ghost px-2 py-1 text-xl leading-none"
+                onClick={() => setShowRecycleBin(false)}
+              >
+                ×
+              </button>
+            </div>
+            <div className="flex-1 overflow-auto px-6 py-5">
+              {recycleLoading ? (
+                <p className="py-8 text-center text-sm text-ink-muted">载入中…</p>
+              ) : recycleError ? (
+                <p className="py-8 text-center text-sm text-rose-600">{recycleError}</p>
+              ) : deletedOrders.length === 0 ? (
+                <p className="py-8 text-center text-sm text-ink-muted">回收站为空</p>
+              ) : (
+                <table className="w-full text-sm">
+                  <thead>
+                    <tr className="border-b border-slate-200 text-left text-xs text-ink-muted">
+                      <th className="py-2 pr-3 font-medium">订单号</th>
+                      <th className="py-2 pr-3 font-medium">客户</th>
+                      <th className="py-2 pr-3 font-medium">金额</th>
+                      <th className="py-2 pr-3 font-medium">原状态</th>
+                      <th className="py-2 pr-3 font-medium">删除时间</th>
+                      <th className="py-2 pr-3 font-medium text-right">操作</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {deletedOrders.map((o) => (
+                      <tr key={o.id} className="border-b border-slate-100">
+                        <td className="py-2 pr-3 font-mono text-xs">{o.orderNumber}</td>
+                        <td className="py-2 pr-3">{o.customerName}</td>
+                        <td className="nums py-2 pr-3">¥{Number(o.total).toLocaleString()}</td>
+                        <td className="py-2 pr-3">
+                          <span className={STATUS_COLOR[o.status]}>{STATUS_LABEL[o.status]}</span>
+                        </td>
+                        <td className="py-2 pr-3 text-xs text-ink-muted">
+                          {o.deletedAt ? new Date(o.deletedAt).toLocaleString('zh-CN') : '—'}
+                          {o.deletedBy ? (
+                            <span className="block text-[11px]">操作人：{o.deletedBy}</span>
+                          ) : null}
+                        </td>
+                        <td className="py-2 pr-3 text-right">
+                          <button
+                            type="button"
+                            className="btn-secondary text-xs"
+                            disabled={restoringId === o.id}
+                            onClick={() => void restoreOrder(o)}
+                          >
+                            {restoringId === o.id ? '恢复中…' : '恢复'}
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

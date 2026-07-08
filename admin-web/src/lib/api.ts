@@ -626,7 +626,8 @@ export interface OrderPassenger {
   gender?: 'M' | 'F' | 'X' | null;
   documentType?: DocumentType;
   documentNumber?: string;
-  dateOfBirth?: string;
+  // 换人未提供新生日时后端置 null（见 Passenger.dateOfBirth 可空）；展示处用 ?? '—'
+  dateOfBirth?: string | null;
   placeOfBirth?: string | null;
   nationality?: string;
   passengerType?: PassengerType;
@@ -723,6 +724,19 @@ export interface OrderAdjustment {
   at: string; // ISO 时间
   by: string | null; // 操作人 userId
   note?: string;
+}
+
+/** 回收站行（GET /orders/deleted）：只带回收站表所需的最小字段。 */
+export interface DeletedOrderSummary {
+  id: string;
+  orderNumber: string;
+  customerName: string;
+  total: string;
+  currency: string;
+  status: OrderStatus;
+  deletedAt: string | null;
+  /** 删除人（来自审计，可能缺失 → null） */
+  deletedBy: string | null;
 }
 
 export interface OrderSummary {
@@ -1662,6 +1676,25 @@ export const api = {
   deleteOrder: (token: string, id: string) =>
     apiFetch<{ ok: true; id: string; deletedAt: string | null }>(`/orders/${id}`, {
       method: 'DELETE',
+      token,
+    }),
+  // 回收站：列出已软删订单（仅 ADMIN）。删除人（deletedBy）来自审计，可能为 null。
+  listDeletedOrders: (token: string, query?: { page?: number; pageSize?: number }) => {
+    const qs = new URLSearchParams();
+    if (query) {
+      for (const [k, v] of Object.entries(query)) {
+        if (v !== undefined) qs.set(k, String(v));
+      }
+    }
+    return apiFetch<{
+      orders: DeletedOrderSummary[];
+      pagination: { page: number; pageSize: number; total: number };
+    }>(`/orders/deleted${qs.toString() ? '?' + qs.toString() : ''}`, { token });
+  },
+  // 从回收站恢复（仅 ADMIN）：deletedAt 置回 null，订单重新可见。软删/恢复都不触碰座位账。
+  restoreOrder: (token: string, id: string) =>
+    apiFetch<{ ok: true; id: string; deletedAt: string | null }>(`/orders/${id}/restore`, {
+      method: 'POST',
       token,
     }),
   batchUpdateOrderStatus: (

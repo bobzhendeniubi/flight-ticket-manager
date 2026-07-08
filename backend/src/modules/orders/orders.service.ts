@@ -13,6 +13,7 @@
  */
 import {
   AuditSeverity,
+  AuditTargetType,
   CommissionStatus,
   InvoiceStatus,
   OrderItemKind,
@@ -1431,6 +1432,114 @@ export class OrderService {
     const updated = await prisma.order.update({
       where: { id: order.id },
       data: { deletedAt: new Date() },
+      select: { id: true, orderNumber: true, status: true, deletedAt: true },
+    });
+    return { before: order, after: updated };
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  // 回收站：列出已软删订单 + 恢复（均仅 ADMIN）
+  // ════════════════════════════════════════════════════════════════════
+  /**
+   * 回收站列表：分页列出 deletedAt 非空的订单（按删除时间倒序）。
+   *
+   * 删除人（deletedBy）从 SOFT_DELETE_ORDER 审计取——每单取最近一条，关联 actor
+   * 拿 displayName/email。审计写入是 fire-and-forget，可能缺失；取不到就置 null，不硬凑。
+   * status 未被软删改动，故这里直接就是删除前的原状态。
+   *
+   * 仅 ADMIN 可看（与删除权限对称，STAFF 不行）。
+   */
+  async listDeletedOrders(
+    query: { page: number; pageSize: number },
+    requester: OrderRequester,
+  ) {
+    if (requester.role !== UserRole.ADMIN) {
+      throw new ForbiddenError('仅管理员可查看回收站');
+    }
+    const where: Prisma.OrderWhereInput = { deletedAt: { not: null } };
+    const [rows, total] = await prisma.$transaction([
+      prisma.order.findMany({
+        where,
+        select: {
+          id: true,
+          orderNumber: true,
+          contactName: true,
+          total: true,
+          currency: true,
+          status: true,
+          deletedAt: true,
+        },
+        orderBy: { deletedAt: 'desc' },
+        take: query.pageSize,
+        skip: (query.page - 1) * query.pageSize,
+      }),
+      prisma.order.count({ where }),
+    ]);
+
+    // 每单最近一条 SOFT_DELETE_ORDER 审计 → 删除人标签（缓存 actorLabel 优先，
+    // 回退到关联 actor 的 displayName/email）。desc 排序后每单首条即最近。
+    const orderIds = rows.map((o) => o.id);
+    const deletedByMap = new Map<string, string>();
+    if (orderIds.length > 0) {
+      const audits = await prisma.auditLog.findMany({
+        where: {
+          action: 'SOFT_DELETE_ORDER',
+          targetType: AuditTargetType.ORDER,
+          targetId: { in: orderIds },
+        },
+        orderBy: { createdAt: 'desc' },
+        select: {
+          targetId: true,
+          actorLabel: true,
+          actor: { select: { displayName: true, email: true } },
+        },
+      });
+      for (const a of audits) {
+        if (!a.targetId || deletedByMap.has(a.targetId)) continue;
+        const label = a.actorLabel ?? a.actor?.displayName ?? a.actor?.email ?? null;
+        if (label) deletedByMap.set(a.targetId, label);
+      }
+    }
+
+    return {
+      orders: rows.map((o) => ({
+        id: o.id,
+        orderNumber: o.orderNumber,
+        customerName: o.contactName,
+        total: o.total.toString(),
+        currency: o.currency,
+        status: o.status,
+        deletedAt: o.deletedAt,
+        deletedBy: deletedByMap.get(o.id) ?? null,
+      })),
+      pagination: { page: query.page, pageSize: query.pageSize, total },
+    };
+  }
+
+  /**
+   * 恢复软删订单：deletedAt 置回 null，订单重新出现在所有列表/导出/统计。
+   *
+   * 不占座依据（CRITICAL）：软删本身从不改 status（见 softDeleteOrder），且只有
+   * 已释放座位的订单（SEAT_RELEASING_STATUSES：CANCELLED/PAYMENT_TIMEOUT/REFUNDED/
+   * FAILED/DRAFT）才被允许删除。因此凡在回收站里的订单，其状态都是释放型——恢复只是
+   * 清 deletedAt 让它重新可见，绝不会凭空占座（不触碰任何库存/座位账），与删除对称。
+   *
+   * 仅 ADMIN 可恢复；返回 before/after 最小快照供路由层写审计。
+   * 未删 / 不存在的订单 → NotFound（findFirst 只匹配 deletedAt 非空，幂等）。
+   */
+  async restoreOrder(id: string, requester: OrderRequester) {
+    if (requester.role !== UserRole.ADMIN) {
+      throw new ForbiddenError('仅管理员可恢复订单');
+    }
+    const order = await prisma.order.findFirst({
+      where: { id, deletedAt: { not: null } },
+      select: { id: true, orderNumber: true, status: true, deletedAt: true },
+    });
+    if (!order) throw new NotFoundError('回收站中无此订单');
+
+    const updated = await prisma.order.update({
+      where: { id: order.id },
+      data: { deletedAt: null },
       select: { id: true, orderNumber: true, status: true, deletedAt: true },
     });
     return { before: order, after: updated };
@@ -3105,7 +3214,7 @@ export class OrderService {
       resetVisa: boolean;
       visaTasksReset: number;
       feeCny: number;
-      // 证件号变化触发的换人清洗：已清除旧出行人残留的护照/签证/出生地信息
+      // 证件号变化触发的换人清洗：已清除旧出行人残留的生日/护照/签证/出生地信息
       clearedProfile: boolean;
     };
   }> {
@@ -3153,7 +3262,7 @@ export class OrderService {
       if (input.nationality !== undefined) data.nationality = input.nationality;
 
       // ── 1b. 换人检测：证件号变化 = 真换人（非改错别字）→ 清除旧出行人残留的
-      //        护照 / 签证 / 出生地信息，避免新出行人套用前一个人的证件。
+      //        生日 / 护照 / 签证 / 出生地信息，避免新出行人套用前一个人的证件。
       //        「除非请求同时提供了新值」：上面已按 input 赋过新值的字段（chineseName / gender /
       //        dateOfBirth）保留新值；本请求没带的一律置空。证件号没变（改拼写）不触发。
       const newDocument = input.documentNumber?.trim();
@@ -3163,7 +3272,9 @@ export class OrderService {
         // 表单可编辑但本次没填 → 显式置空（不残留前一个人的值）
         if (data.chineseName === undefined) data.chineseName = null;
         if (data.gender === undefined) data.gender = null;
-        // dateOfBirth 为必填非空列，无法置空；带了新值即用新值，否则保留旧值（见遗留说明）。
+        // 生日随人走：带了新值即用新值（上面已赋），否则置空——列已改为可空
+        // （migration 20260708140000_passenger_dob_nullable），彻底解决换人残留旧生日。
+        if (data.dateOfBirth === undefined) data.dateOfBirth = null;
         data.placeOfBirth = null;
         // 护照证件信息随人走
         data.passportPhotoUrl = null;

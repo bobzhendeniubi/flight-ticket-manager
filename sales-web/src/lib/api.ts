@@ -30,7 +30,26 @@ type ApiRequestInit = Omit<RequestInit, 'body'> & {
   token?: string | null;
 };
 
+// ── Auth 续期桥：让请求层在 401 时静默换新 accessToken 并重试一次 ──────────────
+// 由 auth store 注册，避免 api.ts ↔ store 循环依赖。
+// 返回新的 accessToken；null = 续期失败（refresh token 失效），调用方放行 401 走登出。
+// ⚠️ 仅对「已带 token」的请求生效——游客态（无 token / token=null 的公开与访客下单路径）
+// 永不触发续期，见 apiFetchWithRetry 里的 init.token 守卫。
+type RefreshAccessTokenFn = () => Promise<string | null>;
+let refreshAccessToken: RefreshAccessTokenFn | null = null;
+export function registerAuthRefresh(fn: RefreshAccessTokenFn): void {
+  refreshAccessToken = fn;
+}
+
 export async function apiFetch<T>(path: string, init: ApiRequestInit = {}): Promise<T> {
+  return apiFetchWithRetry<T>(path, init, true);
+}
+
+async function apiFetchWithRetry<T>(
+  path: string,
+  init: ApiRequestInit,
+  allowRefreshRetry: boolean,
+): Promise<T> {
   const headers = new Headers(init.headers);
   if (init.body !== undefined) headers.set('Content-Type', 'application/json');
   if (init.token) headers.set('Authorization', `Bearer ${init.token}`);
@@ -42,6 +61,16 @@ export async function apiFetch<T>(path: string, init: ApiRequestInit = {}): Prom
   });
 
   if (res.status === 204) return undefined as T;
+
+  // access token 过期 → 用 refreshToken 静默换新，带新 token 重试一次（仅一次，避免死循环）。
+  // 只对带 token 的请求生效（游客态无 token，绝不波及）；续期失败（返回 null）则放行原始
+  // 401，由上层走登出。
+  if (res.status === 401 && init.token && allowRefreshRetry && refreshAccessToken) {
+    const newToken = await refreshAccessToken();
+    if (newToken && newToken !== init.token) {
+      return apiFetchWithRetry<T>(path, { ...init, token: newToken }, false);
+    }
+  }
 
   const text = await res.text();
   // 非 JSON 响应（如 nginx 的 HTML 502/404 页）不能直接 JSON.parse —— 否则抛
@@ -278,7 +307,8 @@ export interface OrderPassenger {
   fullName: string;
   documentType?: DocumentType;
   documentNumber?: string;
-  dateOfBirth?: string;
+  // 换人未提供新生日时后端置 null（Passenger.dateOfBirth 可空）；展示处用 ?? '—'
+  dateOfBirth?: string | null;
   nationality?: string;
   passengerType?: PassengerType;
 }

@@ -2286,7 +2286,8 @@ describe('swapPassenger · 证件号变化触发旧护照/签证清洗', () => {
     expect(data.visaExpiry).toBeNull();
     expect(data.visaPlaceOfIssue).toBeNull();
     expect(data.visaCountryOfApplication).toBeNull();
-    // 出生地 + 本次未填的中文名/性别 → 置空
+    // 生日 + 出生地 + 本次未填的中文名/性别 → 置空（换人不带生日 → 清空，不残留前一位）
+    expect(data.dateOfBirth).toBeNull();
     expect(data.placeOfBirth).toBeNull();
     expect(data.chineseName).toBeNull();
     expect(data.gender).toBeNull();
@@ -2310,9 +2311,10 @@ describe('swapPassenger · 证件号变化触发旧护照/签证清洗', () => {
     expect(data).not.toHaveProperty('passportExpiry');
     expect(data).not.toHaveProperty('visaNumber');
     expect(data).not.toHaveProperty('placeOfBirth');
-    // chineseName/gender 本次未传，且非换人 → 不应被塞 null
+    // chineseName/gender/dateOfBirth 本次未传，且非换人 → 不应被塞 null（生日不动）
     expect(data).not.toHaveProperty('chineseName');
     expect(data).not.toHaveProperty('gender');
+    expect(data).not.toHaveProperty('dateOfBirth');
     expect(audit.clearedProfile).toBe(false);
   });
 

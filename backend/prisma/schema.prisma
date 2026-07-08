@@ -1093,7 +1093,9 @@ model Passenger {
   gender         Gender?
   documentType   DocumentType
   documentNumber String
-  dateOfBirth    DateTime
+  // 建单时必填（见 orders.schemas passengerInputSchema）；可空仅服务「换人清除」——
+  // 换人后未提供新生日时置 null，避免残留前一位出行人的生日。
+  dateOfBirth    DateTime?
   placeOfBirth   String?
   nationality    String
   passengerType  PassengerType @default(ADULT)

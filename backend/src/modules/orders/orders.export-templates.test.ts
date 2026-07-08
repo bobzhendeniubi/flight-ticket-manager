@@ -342,3 +342,32 @@ describe('《票务专用》ticketing 模版 — 27 列 + 格式', () => {
     expect(r1.firstName).toBe('LIANBO');
   });
 });
+
+// ── 生日可空（换人清除后 dateOfBirth=null）→ 导出留空不 crash ────────────────
+// Passenger.dateOfBirth 已改为可空；换人未提供新生日时后端置 null。导出（全岗/票务）
+// 遇到 null 生日必须落空串（绝不编造、绝不抛错）。
+describe('导出 · 生日为空（dateOfBirth=null）', () => {
+  function fixtureNullDob(): OrderForTemplateExport {
+    const order = fixtureRoundTrip();
+    // 第一位乘客换人后无生日
+    (order.passengers[0] as { dateOfBirth: Date | null }).dateOfBirth = null;
+    return order;
+  }
+
+  it('《全岗可用》：null 生日 → 「乘客生日」列留空，不抛错', () => {
+    const order = fixtureNullDob();
+    const ctx = buildOrderContext(order);
+    const rows = orderToFullRows(order, ctx);
+    expect(rows[0].dateOfBirth).toBe('');
+    // 其余乘客仍正常
+    expect(rows[1].dateOfBirth).toBe('15-06-1990');
+  });
+
+  it('《票务专用》：null 生日 → DOB(PNR) 列留空，不抛错', () => {
+    const order = fixtureNullDob();
+    const ctx = buildOrderContext(order);
+    const rows = orderToTicketingRows(order, ctx);
+    expect(rows[0].dob).toBe('');
+    expect(rows[1].dob).toBe('15Jun90');
+  });
+});

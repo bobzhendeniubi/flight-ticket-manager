@@ -253,6 +253,24 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     },
   );
 
+  // ── 回收站：列出已软删订单（仅 ADMIN）──────────────────────────────
+  // GET /orders/deleted?page&pageSize —— 分页列出 deletedAt 非空的订单（订单号/客户/金额/
+  //   原状态/删除时间/删除人）。静态路由，Fastify 优先于 /:id 匹配，故不会被参数路由吞掉。
+  app.get(
+    '/deleted',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN)] },
+    async (req) => {
+      const q = z
+        .object({
+          page: z.coerce.number().int().min(1).default(1),
+          pageSize: z.coerce.number().int().min(1).max(200).default(50),
+        })
+        .parse(req.query);
+      const requester = await buildRequester(req.user.sub, req.user.role);
+      return service.listDeletedOrders(q, requester);
+    },
+  );
+
   // ── 详情 ────────────────────────────────────────────────────────
   app.get(
     '/:id',
@@ -705,6 +723,30 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         targetId: before.id,
         targetLabel: before.orderNumber,
         before: { status: before.status, deletedAt: null },
+        after: { status: after.status, deletedAt: after.deletedAt },
+        severity: 'WARNING',
+      });
+      return { ok: true, id: after.id, deletedAt: after.deletedAt };
+    },
+  );
+
+  // POST /orders/:id/restore — 从回收站恢复：deletedAt 置回 null，订单重新可见。
+  //   仅 ADMIN；只对已软删的订单生效（未删/不存在 → 404）。软删从不改 status，且回收站里
+  //   全是释放型状态，恢复绝不凭空占座（依据见 service.restoreOrder 注释）。审计 RESTORE_ORDER。
+  app.post(
+    '/:id/restore',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN)] },
+    async (req) => {
+      const { id } = req.params as { id: string };
+      const requester = await buildRequester(req.user.sub, req.user.role);
+      const { before, after } = await service.restoreOrder(id, requester);
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'RESTORE_ORDER',
+        targetType: 'ORDER',
+        targetId: before.id,
+        targetLabel: before.orderNumber,
+        before: { status: before.status, deletedAt: before.deletedAt },
         after: { status: after.status, deletedAt: after.deletedAt },
         severity: 'WARNING',
       });
