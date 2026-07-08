@@ -283,6 +283,17 @@ export const listOrdersQuerySchema = z.object({
   flightNumber: z.string().max(20).optional(),    // 订单含该航班号的 FLIGHT 行（不区分大小写）
   passengerName: z.string().max(120).optional(),  // 乘客姓名模糊匹配
   invoiceStatus: z.nativeEnum(InvoiceStatus).optional(),
+  // 六态开票筛选（组合式，取代旧的订单级 invoiceStatus 作为主口径）：
+  //   invoiceLeg = 维度（去程 outbound / 回程 return / 系统 system）
+  //   invoiced   = 该维度已开(true) / 未开(false)
+  // 二者需同时给出才生效——票务岗「出行日期=7/10 + 去程未开 → 导出」正走这条路径。
+  invoiceLeg: z.enum(['outbound', 'return', 'system']).optional(),
+  // query 参数是字符串，z.coerce.boolean 会把 "false" 也判成 true（非空字符串皆真）——
+  // 这里显式只认 'true'/'false'（或真布尔），避免 ?invoiced=false 被误判为已开。
+  invoiced: z
+    .union([z.boolean(), z.enum(['true', 'false'])])
+    .transform((v) => v === true || v === 'true')
+    .optional(),
   // 签证办理状态筛选 — 与列表「签证」列徽标同源（订单 VISA 行的 VISA_APPLICATION 履约任务状态）。
   //   signed   = 已签证：订单含 VISA 行且其签证办理任务已确认(CONFIRMED)
   //   unsigned = 未签证：订单含 VISA 行但签证办理任务尚未确认（待处理/处理中/已取消/失败或无任务）
@@ -329,6 +340,8 @@ export const exportTemplatesQuerySchema = listOrdersQuerySchema
     flightNumber: true,
     passengerName: true,
     invoiceStatus: true,
+    invoiceLeg: true,
+    invoiced: true,
     visaFulfillmentStatus: true,
   })
   .extend({

@@ -707,6 +707,9 @@ export interface HotelAvailabilityResult {
 
 export type InvoiceStatus = 'NONE' | 'REQUESTED' | 'ISSUED';
 
+/** 六态开票的维度：去程 / 回程 / 系统。 */
+export type InvoiceLeg = 'outbound' | 'return' | 'system';
+
 /**
  * 售后费用流水（改期费 / 换人费 / 换酒店差价）。
  * 对应后端 orders.service.ts 的 OrderAdjustmentEntry（Order.adjustments JSON 列，
@@ -729,6 +732,10 @@ export interface OrderSummary {
   agentId: string | null;
   status: OrderStatus;
   invoiceStatus?: InvoiceStatus;
+  // 六态开票（三个独立维度）：去程已开 / 回程已开 / 系统已开。缺省视为 false（未开）。
+  outboundInvoiced?: boolean;
+  returnInvoiced?: boolean;
+  systemInvoiced?: boolean;
   currency: string;
   subtotal: string;
   total: string;
@@ -806,6 +813,12 @@ export interface ListOrdersParams {
   passengerName?: string; // 乘客姓名模糊匹配
   invoiceStatus?: InvoiceStatus;
   /**
+   * 六态开票筛选（组合式）：invoiceLeg = 维度（去程/回程/系统），invoiced = 已开/未开。
+   * 二者需同时给出才生效。票务岗「出行日期=7/10 + 去程未开 → 导出」即 invoiceLeg=outbound & invoiced=false。
+   */
+  invoiceLeg?: InvoiceLeg;
+  invoiced?: boolean;
+  /**
    * 签证办理状态 — 与列表「签证」列徽标同源（VISA 行 VISA_APPLICATION 履约任务状态）。
    * signed=已签证（任务已确认）；unsigned=未签证（含 VISA 行但任务未确认）。无 VISA 行订单两者都不命中。
    */
@@ -833,6 +846,9 @@ export interface OrdersTemplateExportParams {
   flightNumber?: string;
   passengerName?: string;
   invoiceStatus?: InvoiceStatus;
+  /** 六态开票筛选（组合式）；与 listOrders 同款，用于「筛选后导出」。 */
+  invoiceLeg?: InvoiceLeg;
+  invoiced?: boolean;
   /** 签证办理状态（signed/unsigned）；与 listOrders 同款，用于「筛选后导出」。 */
   visaFulfillmentStatus?: 'signed' | 'unsigned';
   /** 勾选导出：给了就只导这批订单（后端以 id 集合为准，忽略其余筛选）。 */
@@ -1707,12 +1723,27 @@ export const api = {
   quoteOrder: (token: string, body: { items: CreateOrderItemInput[] }) =>
     apiFetch<QuoteOrderResult>('/orders/quote', { method: 'POST', token, body }),
 
-  // 设置开票状态（ADMIN/STAFF）
+  // 设置开票状态（ADMIN/STAFF）— 旧的订单级单值，兼容保留
   setInvoiceStatus: (token: string, id: string, invoiceStatus: InvoiceStatus) =>
     apiFetch<{ id: string; orderNumber: string; invoiceStatus: InvoiceStatus }>(
       `/orders/${id}/invoice-status`,
       { method: 'PATCH', token, body: { invoiceStatus } },
     ),
+
+  // 设置六态开票的三个布尔位（ADMIN/STAFF）：去程/回程/系统 各自独立。
+  // 翻某航段为已开时后端校验对应班次开票上限（超限 422）。
+  setInvoiceFlags: (
+    token: string,
+    id: string,
+    flags: { outboundInvoiced?: boolean; returnInvoiced?: boolean; systemInvoiced?: boolean },
+  ) =>
+    apiFetch<{
+      id: string;
+      orderNumber: string;
+      outboundInvoiced: boolean;
+      returnInvoiced: boolean;
+      systemInvoiced: boolean;
+    }>(`/orders/${id}/invoice-flags`, { method: 'PATCH', token, body: flags }),
 
   // 人工确认收款（线下收款 → 标记已付 + 上传截图）ADMIN/STAFF
   // 现已允许多付：amount 可超过尾款（paidAmount 可大于 total）。

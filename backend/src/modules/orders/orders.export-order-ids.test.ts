@@ -108,3 +108,37 @@ describe('buildOrderFilterWhere — 勾选导出 vs 筛选导出', () => {
     expect(where.AND).toEqual([{ status: { in: ['PAID'] } }]);
   });
 });
+
+describe('buildOrderFilterWhere — 六态开票筛选（invoiceLeg + invoiced）', () => {
+  type W = Record<string, unknown>;
+  const build = (q: Record<string, unknown>) =>
+    buildOrderFilterWhere(q as Parameters<typeof buildOrderFilterWhere>[0]) as W;
+
+  it('去程未开：invoiceLeg=outbound + invoiced=false → outboundInvoiced=false', () => {
+    const where = build({ invoiceLeg: 'outbound', invoiced: false });
+    expect(where.outboundInvoiced).toBe(false);
+  });
+
+  it('回程已开：invoiceLeg=return + invoiced=true → returnInvoiced=true', () => {
+    const where = build({ invoiceLeg: 'return', invoiced: true });
+    expect(where.returnInvoiced).toBe(true);
+  });
+
+  it('系统已开：invoiceLeg=system + invoiced=true → systemInvoiced=true', () => {
+    const where = build({ invoiceLeg: 'system', invoiced: true });
+    expect(where.systemInvoiced).toBe(true);
+  });
+
+  it('只给 invoiceLeg、缺 invoiced → 不生效（组合式，二者需同时给出）', () => {
+    const where = build({ invoiceLeg: 'outbound' });
+    expect(where.outboundInvoiced).toBeUndefined();
+    expect(where.returnInvoiced).toBeUndefined();
+    expect(where.systemInvoiced).toBeUndefined();
+  });
+
+  it('与出行日期组合（票务岗「7/10 + 去程未开」路径）：日期落 AND、航段落标量', () => {
+    const where = build({ travelFrom: '2026-07-10', travelTo: '2026-07-10', invoiceLeg: 'outbound', invoiced: false });
+    expect(where.outboundInvoiced).toBe(false);
+    expect(Array.isArray(where.AND)).toBe(true);
+  });
+});

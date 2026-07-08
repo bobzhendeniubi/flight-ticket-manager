@@ -1,33 +1,94 @@
 /**
- * 班次开票上限 — 航司运营限制：同一包机班次上 invoiceStatus=ISSUED 的乘客数
+ * 班次开票上限 — 航司运营限制：同一包机班次上「按航段」的已开票乘客数
  * 不得超过 FlightSchedule.ticketingCap（默认 191 张）。
  *
+ * 六态开票口径（不再按订单级 invoiceStatus=ISSUED 计）：
+ *   某班次的已开票乘客数 = Σ(该班次作为订单去程 ? outboundInvoiced : returnInvoiced) 为真的订单乘客数。
+ *   即每个班次只被「它自己那段」的开票占额——去程班次看 outboundInvoiced，回程班次看 returnInvoiced。
+ *
  * 被两处复用：
- * - OrderService.setInvoiceStatus：转 ISSUED 前校验，超限抛 422
+ * - OrderService.setInvoiceFlags：把某航段翻成已开票前校验对应班次上限，超限抛 422
  * - orders.export.ts（整班机导出）：表头显示「已开票 N / 上限 M 张」
  */
-import { InvoiceStatus, OrderItemKind } from '@prisma/client';
+import { OrderItemKind } from '@prisma/client';
 import type { Prisma, PrismaClient } from '@prisma/client';
 import { UnprocessableEntityError } from '../../lib/errors.js';
 
 type Db = PrismaClient | Prisma.TransactionClient;
 
-/** 某班次当前已开票（ISSUED）订单上的乘客总数。 */
-export async function countIssuedPassengers(db: Db, scheduleId: string): Promise<number> {
-  return db.passenger.count({
-    where: {
-      order: {
-        deletedAt: null, // 排除已软删订单（本查询只按 invoiceStatus 过滤，不看订单状态）
-        invoiceStatus: InvoiceStatus.ISSUED,
-        items: { some: { kind: OrderItemKind.FLIGHT, flightScheduleId: scheduleId } },
-      },
-    },
-  });
+/** determineFlightLegs 入参：只需班次 id 与出发时刻。 */
+export interface FlightLegItem {
+  flightScheduleId: string | null;
+  flightSchedule?: { departureTime: Date | string } | null;
 }
 
 /**
- * 校验：把 passengerCount 位乘客转为已开票后，涉及的每个班次是否仍在上限内。
+ * 订单去程/回程判定：FLIGHT 行按班次 departureTime 升序，第 1 段=去程、第 2 段=回程。
+ * 单程只有去程（returnScheduleId=null）；>2 段的罕见情形只认前两段
+ *（其余段不参与开票占额——六态模型只表达去程/回程两维）。
+ * 缺 departureTime 或 flightScheduleId 的行跳过（排序需要可比较的时刻）。
+ */
+export function determineFlightLegs(items: ReadonlyArray<FlightLegItem>): {
+  outboundScheduleId: string | null;
+  returnScheduleId: string | null;
+} {
+  const legs = items
+    .filter(
+      (i): i is FlightLegItem & { flightScheduleId: string } =>
+        i.flightScheduleId !== null &&
+        i.flightSchedule != null &&
+        i.flightSchedule.departureTime != null,
+    )
+    .map((i) => ({
+      scheduleId: i.flightScheduleId,
+      depart: new Date(i.flightSchedule!.departureTime).getTime(),
+    }))
+    .sort((a, b) => a.depart - b.depart);
+  return {
+    outboundScheduleId: legs[0]?.scheduleId ?? null,
+    returnScheduleId: legs[1]?.scheduleId ?? null,
+  };
+}
+
+/**
+ * 某班次当前「按航段」已开票的乘客总数。
+ * 逐订单判定该班次是本单的去程还是回程，再取对应布尔位（outboundInvoiced / returnInvoiced）。
+ */
+export async function countIssuedPassengers(db: Db, scheduleId: string): Promise<number> {
+  const orders = await db.order.findMany({
+    where: {
+      deletedAt: null, // 排除已软删订单
+      items: { some: { kind: OrderItemKind.FLIGHT, flightScheduleId: scheduleId } },
+    },
+    select: {
+      outboundInvoiced: true,
+      returnInvoiced: true,
+      _count: { select: { passengers: true } },
+      items: {
+        where: { kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
+        select: {
+          flightScheduleId: true,
+          flightSchedule: { select: { departureTime: true } },
+        },
+      },
+    },
+  });
+
+  let total = 0;
+  for (const o of orders) {
+    const { outboundScheduleId, returnScheduleId } = determineFlightLegs(o.items);
+    const invoiced =
+      (scheduleId === outboundScheduleId && o.outboundInvoiced) ||
+      (scheduleId === returnScheduleId && o.returnInvoiced);
+    if (invoiced) total += o._count.passengers;
+  }
+  return total;
+}
+
+/**
+ * 校验：把 passengerCount 位乘客在给定班次上翻成已开票后，涉及的每个班次是否仍在上限内。
  * 任一班次超限 → 抛 UnprocessableEntityError（HTTP 422）。
+ * 调用方按「正在翻开的航段」传入对应班次 id（去程班次或回程班次）。
  */
 export async function assertTicketingCap(
   db: Db,

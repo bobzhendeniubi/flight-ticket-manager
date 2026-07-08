@@ -460,7 +460,8 @@ model FlightSchedule {
   peakSurchargeCny   Decimal? @db.Decimal(10, 2)
   aircraftAdjustCny  Decimal? @db.Decimal(10, 2)
   takeoffDiscountCny Decimal? @db.Decimal(10, 2)
-  // 航司开票上限（张/班次）— 同一班次 invoiceStatus=ISSUED 的乘客数不得超过此值
+  // 航司开票上限（张/班次）— 同一班次「按航段」的已开票乘客数不得超过此值。
+  // 口径：该班次作为某订单去程时看 outboundInvoiced、作为回程时看 returnInvoiced（见 ticketing-cap.ts）。
   ticketingCap     Int      @default(191)
   isActive         Boolean  @default(true)
   createdAt        DateTime @default(now())
@@ -896,8 +897,16 @@ model Order {
   guestPhone       String?
   guestEmail       String?
   status           OrderStatus   @default(DRAFT)
-  // 开票状态（运营在订单管理里维护）
+  // 开票状态（旧的订单级单值，兼容保留）：REQUESTED 仍表示客户已要求开票；
+  // 已被下面三个「按航段/系统」的布尔位取代作为主口径（票务岗六态）。
   invoiceStatus    InvoiceStatus @default(NONE)
+  // 六态开票（三个独立维度，不是一个枚举六值）—— 票务岗需按航段分别开票并导出：
+  //   outboundInvoiced = 去程已开；returnInvoiced = 回程已开；systemInvoiced = 系统已开。
+  // 去程/回程判定：订单 FLIGHT 行按班次 departureTime 升序，第 1 段=去程、第 2 段=回程
+  //（单程只有去程；>2 段的罕见情形只认前两段）。存量 invoiceStatus=ISSUED 的单迁移回填三者=true。
+  outboundInvoiced Boolean       @default(false)
+  returnInvoiced   Boolean       @default(false)
+  systemInvoiced   Boolean       @default(false)
   currency         String        @default("CNY")
   subtotal         Decimal       @db.Decimal(12, 2)
   taxesAndFees     Decimal       @default(0) @db.Decimal(12, 2)

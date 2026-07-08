@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { api, ApiError, duplicatePassengerConflictOrderNumbers, SETTLEMENT_MODE_LABEL, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceStatus, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle } from '../lib/api';
+import { api, ApiError, duplicatePassengerConflictOrderNumbers, SETTLEMENT_MODE_LABEL, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { useFlightSeats } from '../stores/flightSeats';
 import {
@@ -51,6 +51,59 @@ const FILTER_STATUSES: OrderStatus[] = [
   'PENDING_PAYMENT', 'PAID', 'PROCESSING', 'TICKETED', 'COMPLETED', 'CANCELLED', 'REFUND_REQUESTED',
 ];
 
+// ── 状态机：标准流转允许的目标状态 ──────────────────────────────────────
+// 必须与后端 orders.service.ts 的 ALLOWED_TRANSITIONS 逐条保持一致：抽屉/工具条据此判断
+// 哪些「改状态」是合法流转（正常按钮），哪些需要管理员「强制」（绕过状态机）。改后端记得同步这里。
+const ALLOWED_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
+  DRAFT: ['PENDING_PAYMENT', 'CANCELLED'],
+  PENDING_PAYMENT: ['PAID', 'PAYMENT_TIMEOUT', 'CANCELLED'],
+  PAID: ['PROCESSING', 'TICKETED', 'REFUND_REQUESTED'],
+  PROCESSING: ['TICKETED', 'FAILED', 'REFUND_REQUESTED'],
+  TICKETED: ['COMPLETED', 'CHANGE_REQUESTED', 'REFUND_REQUESTED'],
+  COMPLETED: [],
+  PAYMENT_TIMEOUT: ['PENDING_PAYMENT', 'CANCELLED'],
+  CANCELLED: [],
+  REFUND_REQUESTED: ['REFUNDED', 'PROCESSING'],
+  REFUNDED: [],
+  CHANGE_REQUESTED: ['CHANGED', 'TICKETED'],
+  CHANGED: ['COMPLETED', 'REFUND_REQUESTED'],
+  FAILED: ['PROCESSING', 'REFUND_REQUESTED', 'CANCELLED'],
+};
+
+// 终态（无任何后续流转）——抽屉据此给出「为何没有可用操作」的说明，而不是空白的「无可用操作」。
+const TERMINAL_STATUSES: OrderStatus[] = (Object.keys(ALLOWED_TRANSITIONS) as OrderStatus[]).filter(
+  (s) => ALLOWED_TRANSITIONS[s].length === 0,
+);
+
+// 改状态动作的按钮文案（按「目标状态」）。个别流转的语义取决于来源状态（如退款申请中→处理中
+// 其实是「驳回退款」），用 TRANSITION_LABEL_FROM 覆盖；其余用通用文案。
+const TRANSITION_LABEL: Record<OrderStatus, string> = {
+  DRAFT: '退回草稿',
+  PENDING_PAYMENT: '恢复待支付',
+  PAID: '标记已支付',
+  PROCESSING: '进入处理',
+  TICKETED: '出票完成',
+  COMPLETED: '订单完结',
+  PAYMENT_TIMEOUT: '标记支付超时',
+  CANCELLED: '取消订单',
+  REFUND_REQUESTED: '申请退款',
+  REFUNDED: '同意退款',
+  CHANGE_REQUESTED: '申请改期',
+  CHANGED: '标记已改期',
+  FAILED: '出票失败',
+};
+
+// 来源状态相关的特殊文案（覆盖 TRANSITION_LABEL）。
+const TRANSITION_LABEL_FROM: Partial<Record<OrderStatus, Partial<Record<OrderStatus, string>>>> = {
+  REFUND_REQUESTED: { PROCESSING: '驳回退款（回退处理）' },
+  CHANGE_REQUESTED: { TICKETED: '驳回改期（回退出票）' },
+  FAILED: { PROCESSING: '重新处理' },
+};
+
+function transitionLabel(from: OrderStatus, to: OrderStatus): string {
+  return TRANSITION_LABEL_FROM[from]?.[to] ?? TRANSITION_LABEL[to];
+}
+
 type OrderItemKindLabel = OrderItem['kind'];
 const KIND_LABEL: Record<OrderItemKindLabel, string> = {
   FLIGHT: '机票',
@@ -71,13 +124,28 @@ const COMMISSION_RATE: Partial<Record<OrderItemKindLabel, number>> = {
   FLIGHT: 0.10, HOTEL: 0.08, TRANSFER: 0.15, VISA: 0.12,
 };
 
-// 开票状态
-const INVOICE_LABEL: Record<string, string> = { NONE: '未开', REQUESTED: '待开', ISSUED: '已开' };
-const INVOICE_COLOR: Record<string, string> = {
-  NONE: 'bg-slate-100 text-slate-500',
-  REQUESTED: 'bg-amber-100 text-amber-700',
-  ISSUED: 'bg-emerald-100 text-emerald-700',
-};
+// 六态开票筛选（组合式）：维度(去程/回程/系统) × 已开/未开。
+// value = `${leg}:${invoiced}`，'' = 全部。票务岗「7/10 去程未开」= 'outbound:false'。
+const INVOICE_LEG_FILTER_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: '', label: '全部' },
+  { value: 'outbound:false', label: '去程未开' },
+  { value: 'outbound:true', label: '去程已开' },
+  { value: 'return:false', label: '回程未开' },
+  { value: 'return:true', label: '回程已开' },
+  { value: 'system:false', label: '系统未开' },
+  { value: 'system:true', label: '系统已开' },
+];
+/** 把组合值拆成 { invoiceLeg, invoiced }；空/非法值返回 null（不筛选）。 */
+function parseInvoiceLegFilter(v: string): { invoiceLeg: InvoiceLeg; invoiced: boolean } | null {
+  if (!v) return null;
+  const [leg, inv] = v.split(':');
+  if (leg !== 'outbound' && leg !== 'return' && leg !== 'system') return null;
+  return { invoiceLeg: leg, invoiced: inv === 'true' };
+}
+/** 订单含几个航段（FLIGHT 行且有班次）；≥2 视为往返（有回程）。 */
+function flightLegCount(order: OrderSummary): number {
+  return (order.items ?? []).filter((it) => it.kind === 'FLIGHT' && it.flightScheduleId).length;
+}
 // 收款方式标签（线下确认收款用）
 const PAYMENT_METHOD_LABEL: Record<string, string> = {
   WECHAT_PAY: '微信', ALIPAY: '支付宝', BANK_CARD: '银行转账', AGENT_PREPAYMENT: '代理预付',
@@ -155,6 +223,29 @@ function BalanceBadge({ balance, settlementMode }: { balance: number; settlement
   );
 }
 
+// 列表「开票」列：六态紧凑三点式显示（去 / 回 / 系，✓已开、✗未开）。只读——切换在订单详情里。
+// 回程点仅在订单含 ≥2 航段时显示；无机票的订单只显示系统点。
+function InvoiceDots({ order }: { order: OrderSummary }) {
+  const legs = flightLegCount(order);
+  const dot = (label: string, on: boolean) => (
+    <span
+      className={`inline-flex items-center rounded px-1 text-[11px] font-medium ${
+        on ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-400'
+      }`}
+    >
+      {label}
+      {on ? '✓' : '✗'}
+    </span>
+  );
+  return (
+    <div className="flex items-center justify-center gap-0.5" title="开票：去程 / 回程 / 系统（在订单详情里切换）">
+      {legs >= 1 && dot('去', !!order.outboundInvoiced)}
+      {legs >= 2 && dot('回', !!order.returnInvoiced)}
+      {dot('系', !!order.systemInvoiced)}
+    </div>
+  );
+}
+
 export function OrdersPage() {
   const tokens = useAuth((s) => s.tokens);
   const user = useAuth((s) => s.user);
@@ -175,10 +266,11 @@ export function OrdersPage() {
   const [travelFrom, setTravelFrom] = useState('');
   const [travelTo, setTravelTo] = useState('');
   const [claimFilter, setClaimFilter] = useState<'' | 'unclaimed' | 'mine'>('');
-  // ops 确认的三个筛选（航班号 / 乘客姓名 / 开票状态）— 后端过滤
+  // ops 确认的筛选（航班号 / 乘客姓名 / 六态开票）— 后端过滤
   const [flightNumberFilter, setFlightNumberFilter] = useState('');
   const [passengerNameFilter, setPassengerNameFilter] = useState('');
-  const [invoiceFilter, setInvoiceFilter] = useState<'' | InvoiceStatus>('');
+  // 六态开票筛选：组合值 `${leg}:${invoiced}`（如 'outbound:false'=去程未开），''=全部
+  const [invoiceLegFilter, setInvoiceLegFilter] = useState('');
   // 签证办理状态筛选（后端过滤，与列表「签证」列徽标同源）：''=全部 / signed=已签证 / unsigned=未签证
   const [visaFilter, setVisaFilter] = useState<'' | 'signed' | 'unsigned'>('');
   // 文本筛选防抖：停止输入 400ms 后才请求后端，避免每个键击打一次接口
@@ -197,6 +289,12 @@ export function OrdersPage() {
   const [exporting, setExporting] = useState(false);
   // 全岗总表导出（一行/乘客·字段全）
   const [exportingMaster, setExportingMaster] = useState(false);
+  // 票务开票快捷导出 — 某日某航段需开票订单（《票务专用》= 航司 PNR 模板）
+  const [showTicketingQuick, setShowTicketingQuick] = useState(false);
+  const [tkDate, setTkDate] = useState(''); // 出发日期（必填）
+  const [tkLeg, setTkLeg] = useState<InvoiceLeg>('outbound'); // 航段，默认去程
+  const [tkInvoiced, setTkInvoiced] = useState(false); // 开票状态，默认「未开」
+  const [tkExporting, setTkExporting] = useState(false);
   const [selected, setSelected] = useState<OrderSummary | null>(null);
   // ── 批量管理状态 ─────────────────────────────────────
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -231,7 +329,11 @@ export function OrdersPage() {
     if (claimFilter === 'unclaimed') query.unclaimedOnly = '1';
     if (debouncedFlightNumber.trim()) query.flightNumber = debouncedFlightNumber.trim();
     if (debouncedPassengerName.trim()) query.passengerName = debouncedPassengerName.trim();
-    if (invoiceFilter) query.invoiceStatus = invoiceFilter;
+    const invoiceLegParsed = parseInvoiceLegFilter(invoiceLegFilter);
+    if (invoiceLegParsed) {
+      query.invoiceLeg = invoiceLegParsed.invoiceLeg;
+      query.invoiced = invoiceLegParsed.invoiced;
+    }
     if (visaFilter) query.visaFulfillmentStatus = visaFilter;
     api.listOrders(tokens.accessToken, query)
       .then((res) => {
@@ -246,7 +348,7 @@ export function OrdersPage() {
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [tokens?.accessToken, createdFrom, createdTo, travelFrom, travelTo, claimFilter, debouncedFlightNumber, debouncedPassengerName, invoiceFilter, visaFilter, refreshNonce]);
+  }, [tokens?.accessToken, createdFrom, createdTo, travelFrom, travelTo, claimFilter, debouncedFlightNumber, debouncedPassengerName, invoiceLegFilter, visaFilter, refreshNonce]);
 
   // 视图层把 OrderSummary 映射成便于筛选/展示的数据
   const ordersView = useMemo(
@@ -338,16 +440,6 @@ export function OrdersPage() {
     }
   };
 
-  const setInvoice = async (order: OrderSummary, invoiceStatus: InvoiceStatus) => {
-    if (!tokens?.accessToken) return;
-    try {
-      await api.setInvoiceStatus(tokens.accessToken, order.id, invoiceStatus);
-      setOrders((prev) => prev.map((o) => (o.id === order.id ? { ...o, invoiceStatus } : o)));
-    } catch (err) {
-      alert(err instanceof ApiError ? `开票状态更新失败：${err.message}` : '开票状态更新失败');
-    }
-  };
-
   // ── 批量管理 helpers ─────────────────────────────────
   const visibleIds = useMemo(() => filtered.map(({ order }) => order.id), [filtered]);
   const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.has(id));
@@ -436,7 +528,9 @@ export function OrdersPage() {
         travelTo: travelTo || undefined,
         flightNumber: flightNumberFilter.trim() || undefined,
         passengerName: passengerNameFilter.trim() || undefined,
-        invoiceStatus: invoiceFilter || undefined,
+        // 六态开票筛选（与列表同源）——票务岗「7/10 去程未开 → 导出」就走这条。
+        invoiceLeg: parseInvoiceLegFilter(invoiceLegFilter)?.invoiceLeg,
+        invoiced: parseInvoiceLegFilter(invoiceLegFilter)?.invoiced,
         // 签证办理状态（与列表「签证」筛选同源）——保持「导出=列表所见」一致。
         visaFulfillmentStatus: visaFilter || undefined,
         orderIds: selected.length > 0 ? selected : undefined,
@@ -453,6 +547,37 @@ export function OrdersPage() {
       alert(err instanceof ApiError ? `导出失败：${err.message}` : '导出失败');
     } finally {
       setExporting(false);
+    }
+  };
+
+  // 票务开票快捷导出 — 出发日=某日 + 航段 + 开票状态 → 一键调《票务专用》(ticketing) 三模板导出（航司 PNR 27 列）。
+  const handleTicketingQuickExport = async () => {
+    if (!tokens?.accessToken) return;
+    if (!tkDate) {
+      alert('请先选择出发日期');
+      return;
+    }
+    setTkExporting(true);
+    try {
+      const blob = await api.downloadOrdersTemplateExport(tokens.accessToken, {
+        template: 'ticketing',
+        travelFrom: tkDate, // 出发日当天（起=止）
+        travelTo: tkDate,
+        invoiceLeg: tkLeg, // 去程 / 回程
+        invoiced: tkInvoiced, // 未开 / 已开
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `订单导出-${TEMPLATE_LABEL.ticketing}-${tkDate}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (err) {
+      alert(err instanceof ApiError ? `导出失败：${err.message}` : '导出失败');
+    } finally {
+      setTkExporting(false);
     }
   };
 
@@ -623,11 +748,70 @@ export function OrdersPage() {
                 ? `📊 导出全岗总表（已选 ${selectedIds.size} 条）`
                 : '📊 导出全岗总表'}
           </button>
+          <button
+            type="button"
+            className={showTicketingQuick ? 'btn-primary text-sm' : 'btn-secondary text-sm'}
+            aria-expanded={showTicketingQuick}
+            onClick={() => setShowTicketingQuick((v) => !v)}
+            title="导出某日某航段需开票的订单（航司 PNR 模板）"
+          >
+            🎫 票务开票导出
+          </button>
           <p className="w-full text-right text-xs text-ink-muted">
             {selectedIds.size > 0
               ? `已勾选 ${selectedIds.size} 条：两个导出都只导勾选的这些订单（忽略上方筛选）；取消勾选恢复按筛选导出`
               : '《导出》按上方「下单时间」周期（佣金/提成/客户统计）；《全岗总表》按「出行日期」区间（综合台账，不填=全部）'}
           </p>
+          {/* 票务开票快捷入口：某日某航段需开票订单一键导《票务专用》（航司 PNR） */}
+          {showTicketingQuick && (
+            <div className="w-full rounded-lg border border-sky-200 bg-sky-50 px-3 py-2.5">
+              <div className="flex flex-wrap items-end gap-2">
+                <label className="flex flex-col gap-1 text-xs text-ink-muted">
+                  出发日期（必填）
+                  <input
+                    type="date"
+                    className="input py-1.5 text-sm"
+                    value={tkDate}
+                    onChange={(e) => setTkDate(e.target.value)}
+                  />
+                </label>
+                <label className="flex flex-col gap-1 text-xs text-ink-muted">
+                  航段
+                  <select
+                    className="input py-1.5 text-sm"
+                    value={tkLeg}
+                    onChange={(e) => setTkLeg(e.target.value as InvoiceLeg)}
+                  >
+                    <option value="outbound">去程</option>
+                    <option value="return">回程</option>
+                  </select>
+                </label>
+                <label className="flex flex-col gap-1 text-xs text-ink-muted">
+                  开票状态
+                  <select
+                    className="input py-1.5 text-sm"
+                    value={tkInvoiced ? 'true' : 'false'}
+                    onChange={(e) => setTkInvoiced(e.target.value === 'true')}
+                  >
+                    <option value="false">未开</option>
+                    <option value="true">已开</option>
+                  </select>
+                </label>
+                <button
+                  type="button"
+                  className="btn-primary text-sm"
+                  disabled={!tkDate || tkExporting}
+                  onClick={() => void handleTicketingQuickExport()}
+                  title="导出某日某航段需开票的订单（航司 PNR 模板）"
+                >
+                  {tkExporting ? '导出中…' : '📤 一键导出'}
+                </button>
+              </div>
+              <p className="mt-1.5 text-xs text-ink-muted">
+                按「出发日期」当天 + 所选航段 + 开票状态导出《票务专用》（航司 PNR）模板。
+              </p>
+            </div>
+          )}
         </div>
       </section>
 
@@ -811,15 +995,15 @@ export function OrdersPage() {
             </div>
           </div>
           <div>
-            <label className="label">开票状态</label>
+            <label className="label">开票筛选</label>
             <select
               className="input"
-              value={invoiceFilter}
-              onChange={(e) => setInvoiceFilter(e.target.value as '' | InvoiceStatus)}
+              value={invoiceLegFilter}
+              onChange={(e) => setInvoiceLegFilter(e.target.value)}
+              title="按航段/系统的开票状态筛选（六态）：可筛「去程/回程/系统 × 已开/未开」。票务岗「出行日期 + 去程未开」即用此项。"
             >
-              <option value="">全部</option>
-              {(['NONE', 'REQUESTED', 'ISSUED'] as InvoiceStatus[]).map((s) => (
-                <option key={s} value={s}>{INVOICE_LABEL[s]}</option>
+              {INVOICE_LEG_FILTER_OPTIONS.map((o) => (
+                <option key={o.value || 'all'} value={o.value}>{o.label}</option>
               ))}
             </select>
           </div>
@@ -846,14 +1030,14 @@ export function OrdersPage() {
             />
           </div>
         </div>
-        {(statusFilter || kindFilter || channelFilter || agentFilter || search || flightNumberFilter || passengerNameFilter || invoiceFilter || visaFilter || createdFrom || createdTo || travelFrom || travelTo) && (
+        {(statusFilter || kindFilter || channelFilter || agentFilter || search || flightNumberFilter || passengerNameFilter || invoiceLegFilter || visaFilter || createdFrom || createdTo || travelFrom || travelTo) && (
           <div className="mt-3 flex items-center justify-between text-xs text-slate-500">
             <span>显示 {filtered.length} 条订单</span>
             <button
               className="text-brand hover:text-brand-dark"
               onClick={() => {
                 setStatusFilter(''); setKindFilter(''); setChannelFilter(''); setAgentFilter(''); setSearch('');
-                setFlightNumberFilter(''); setPassengerNameFilter(''); setInvoiceFilter(''); setVisaFilter('');
+                setFlightNumberFilter(''); setPassengerNameFilter(''); setInvoiceLegFilter(''); setVisaFilter('');
                 setCreatedFrom(''); setCreatedTo(''); setTravelFrom(''); setTravelTo('');
               }}
             >
@@ -931,9 +1115,14 @@ export function OrdersPage() {
               </div>
               {bulkResult.failures.length > 0 && (
                 <ul className="mt-1 max-h-32 overflow-auto text-red-600">
-                  {bulkResult.failures.map((f) => (
-                    <li key={f.id} className="font-mono text-[11px]">· {f.id.slice(0, 8)}…：{f.error ?? '未知'}</li>
-                  ))}
+                  {bulkResult.failures.map((f) => {
+                    const orderNo = orders.find((o) => o.id === f.id)?.orderNumber ?? `${f.id.slice(0, 8)}…`;
+                    return (
+                      <li key={f.id} className="text-[11px]">
+                        · <span className="font-mono">{orderNo}</span>：{f.error ?? '未知原因'}
+                      </li>
+                    );
+                  })}
                 </ul>
               )}
             </div>
@@ -1027,16 +1216,7 @@ export function OrdersPage() {
                     })()}
                   </td>
                   <td className="text-center">
-                    <select
-                      className={`cursor-pointer rounded-md border-0 px-1.5 py-0.5 text-xs ${INVOICE_COLOR[order.invoiceStatus ?? 'NONE']}`}
-                      value={order.invoiceStatus ?? 'NONE'}
-                      onChange={(e) => void setInvoice(order, e.target.value as InvoiceStatus)}
-                      title="开票状态（点击切换）"
-                    >
-                      {(['NONE', 'REQUESTED', 'ISSUED'] as InvoiceStatus[]).map((s) => (
-                        <option key={s} value={s}>{INVOICE_LABEL[s]}</option>
-                      ))}
-                    </select>
+                    <InvoiceDots order={order} />
                   </td>
                   <td className="text-xs text-ink-muted">
                     {new Date(order.createdAt).toLocaleString('zh-CN', {
@@ -1103,7 +1283,7 @@ export function OrdersPage() {
         <OrderDrawer
           order={selected}
           onClose={() => setSelected(null)}
-          onAdvance={(next, reason) => advance(selected, next, reason)}
+          onAdvance={(next, reason, force) => advance(selected, next, reason, force)}
           onChanged={() => setRefreshNonce((n) => n + 1)}
           onOrderUpdated={(updated) => {
             setOrders((prev) => prev.map((o) => (o.id === updated.id ? updated : o)));
@@ -1222,7 +1402,7 @@ function OrderDrawer({
 }: {
   order: OrderSummary;
   onClose: () => void;
-  onAdvance: (next: OrderStatus, reason?: string) => void;
+  onAdvance: (next: OrderStatus, reason?: string, force?: boolean) => void;
   onChanged?: () => void;
   /** 售后改期/换人后用更新后的订单就地刷新抽屉与列表 */
   onOrderUpdated?: (order: OrderSummary) => void;
@@ -1272,38 +1452,19 @@ function OrderDrawer({
     onChanged?.();
   };
 
-  // 可行的下一步状态（与 backend orders.service ALLOWED_TRANSITIONS 保持一致的子集）
-  const nextSteps: Array<{ label: string; to: OrderStatus; style: string }> = (() => {
-    switch (o.status) {
-      case 'PENDING_PAYMENT':
-        return [
-          { label: '标记已支付', to: 'PAID', style: 'btn-primary' },
-          { label: '取消订单', to: 'CANCELLED', style: 'btn-secondary' },
-        ];
-      case 'PAID':
-        return [
-          { label: '进入处理', to: 'PROCESSING', style: 'btn-primary' },
-          { label: '直接出票', to: 'TICKETED', style: 'btn-secondary' },
-        ];
-      case 'PROCESSING':
-        return [
-          { label: '出票完成', to: 'TICKETED', style: 'btn-primary' },
-          { label: '出票失败', to: 'FAILED', style: 'btn-secondary' },
-        ];
-      case 'TICKETED':
-        return [
-          { label: '订单完结', to: 'COMPLETED', style: 'btn-primary' },
-          { label: '申请退款', to: 'REFUND_REQUESTED', style: 'btn-secondary' },
-        ];
-      case 'REFUND_REQUESTED':
-        return [
-          { label: '同意退款', to: 'REFUNDED', style: 'btn-primary' },
-          { label: '驳回回退处理', to: 'PROCESSING', style: 'btn-secondary' },
-        ];
-      default:
-        return [];
-    }
-  })();
+  // 可行的下一步状态：直接读 ALLOWED_TRANSITIONS（与后端逐条同步），列出当前状态的全部合法流转，
+  // 而非之前那套手写子集（会漏项——如 PAID/PROCESSING 缺「申请退款」按钮，导致「改状态没用」的观感）。
+  const allowedNext = ALLOWED_TRANSITIONS[o.status] ?? [];
+  const nextSteps: Array<{ label: string; to: OrderStatus; style: string }> = allowedNext.map(
+    (to, i) => ({ label: transitionLabel(o.status, to), to, style: i === 0 ? 'btn-primary' : 'btn-secondary' }),
+  );
+  const isTerminal = TERMINAL_STATUSES.includes(o.status);
+  // 管理员强制可选的「越过状态机」目标：所有其它状态里、不在标准流转内的（标准流转已经是普通按钮）。
+  const forceTargets: OrderStatus[] = isAdmin
+    ? (Object.keys(STATUS_LABEL) as OrderStatus[]).filter(
+        (s) => s !== o.status && !allowedNext.includes(s),
+      )
+    : [];
 
   return (
     <div
@@ -1455,6 +1616,9 @@ function OrderDrawer({
           {/* 乘客（读 hydrated → 护照号/生日/国籍/类型 真实显示）*/}
           <PassengersSection order={o} onOrderUpdated={handleOrderUpdated} />
 
+          {/* 开票（六态：去程 / 回程 / 系统 三个独立开关）*/}
+          <InvoiceFlagsSection order={o} onOrderUpdated={handleOrderUpdated} />
+
           {/* 收款（确认收款 / 代理余额抵扣 / 多付处理）*/}
           <ConfirmPaymentSection
             orderId={o.id}
@@ -1486,18 +1650,63 @@ function OrderDrawer({
             <div className="mt-3 flex flex-wrap gap-2">
               {nextSteps.length === 0 && (
                 <div className="w-full rounded-lg border border-slate-200 bg-slate-50/60 p-3 text-xs text-ink-muted">
-                  当前状态下无可用操作
+                  {isTerminal
+                    ? `当前为终态「${STATUS_LABEL[o.status]}」，没有后续流转。${
+                        isAdmin ? '如需异常订正，可用下方「管理员强制改状态」。' : ''
+                      }`
+                    : `「${STATUS_LABEL[o.status]}」状态下无标准流转操作。${
+                        isAdmin ? '如需异常订正，可用下方「管理员强制改状态」。' : ''
+                      }`}
                 </div>
               )}
               {nextSteps.map((s) => (
-                <button key={s.to} className={`${s.style} flex-1 text-sm`} onClick={() => onAdvance(s.to)}>
+                <button
+                  key={s.to}
+                  className={`${s.style} flex-1 text-sm`}
+                  onClick={() => onAdvance(s.to)}
+                  title={`按标准流转：${STATUS_LABEL[o.status]} → ${STATUS_LABEL[s.to]}`}
+                >
                   {s.label}
                 </button>
               ))}
             </div>
             <p className="mt-3 text-xs text-ink-muted">
-              ⓘ 状态变更会真实写入数据库并记录操作事件。
+              ⓘ 状态变更会真实写入数据库并记录操作事件。仅显示当前状态允许的流转；不在此列的目标需管理员强制。
             </p>
+
+            {/* 管理员强制改状态：越过状态机的目标（异常订正用）。被安全规则拦下的操作（如已退款订单
+                拉回占座、余位不足重新占座）后端会拒绝并弹出具体原因，不会静默失败。 */}
+            {isAdmin && forceTargets.length > 0 && (
+              <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50/70 p-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <label className="text-xs font-medium text-amber-800">管理员强制改状态</label>
+                  <select
+                    className="rounded-md border border-amber-300 bg-white px-2 py-1 text-xs text-ink-soft"
+                    value=""
+                    title="绕过状态机校验，用于异常订正。仍受安全规则约束（如已退款订单不能拉回占座、重新占座需余位充足），被拒时会弹出具体原因。"
+                    onChange={(e) => {
+                      const to = e.target.value as OrderStatus;
+                      e.currentTarget.value = '';
+                      if (!to) return;
+                      const ok = window.confirm(
+                        `强制将该订单从「${STATUS_LABEL[o.status]}」改为「${STATUS_LABEL[to]}」？\n\n` +
+                          '此操作绕过状态机校验，仅供异常订正。若目标为占座状态（已支付/处理中/出票等），' +
+                          '会重新占座（余位不足将被拒绝，状态不变）；被安全规则拦下的操作会弹出具体原因。',
+                      );
+                      if (ok) onAdvance(to, undefined, true);
+                    }}
+                  >
+                    <option value="">强制改为…</option>
+                    {forceTargets.map((s) => (
+                      <option key={s} value={s}>{STATUS_LABEL[s]}</option>
+                    ))}
+                  </select>
+                </div>
+                <p className="mt-1.5 text-[11px] text-amber-700">
+                  绕过状态机校验；若被安全规则拦下（如已退款订单不能拉回占座），会弹出具体原因。
+                </p>
+              </div>
+            )}
           </section>
 
           {isAdmin && onDelete && (
@@ -2959,6 +3168,102 @@ const STRUCTURED_NOTE_FIELDS = [
   { key: 'notePayment', label: '付款情况', placeholder: '收款进度/尾款/退款备注' },
   { key: 'noteSpecial', label: '特殊要求', placeholder: '客户其它特殊要求' },
 ] as const;
+
+// ── 开票（六态：去程 / 回程 / 系统 三个独立开关）───────────────────────────
+// 每个开关独立 PATCH /orders/:id/invoice-flags；翻某航段为已开时后端校验班次开票上限（超限 422）。
+// 去程/回程开关仅在订单含对应航段时显示（单程只有去程）；系统开关恒显示。
+function InvoiceFlagsSection({
+  order,
+  onOrderUpdated,
+}: {
+  order: OrderSummary;
+  onOrderUpdated: (updated: OrderSummary) => void;
+}) {
+  const tokens = useAuth((s) => s.tokens);
+  const [saving, setSaving] = useState<null | 'outbound' | 'return' | 'system'>(null);
+  const legs = flightLegCount(order);
+
+  const toggle = async (
+    key: 'outboundInvoiced' | 'returnInvoiced' | 'systemInvoiced',
+    which: 'outbound' | 'return' | 'system',
+  ) => {
+    if (!tokens?.accessToken || saving) return;
+    const next = !order[key];
+    setSaving(which);
+    try {
+      const res = await api.setInvoiceFlags(tokens.accessToken, order.id, { [key]: next });
+      onOrderUpdated({
+        ...order,
+        outboundInvoiced: res.outboundInvoiced,
+        returnInvoiced: res.returnInvoiced,
+        systemInvoiced: res.systemInvoiced,
+      });
+    } catch (err) {
+      alert(err instanceof ApiError ? `开票状态更新失败：${err.message}` : '开票状态更新失败');
+    } finally {
+      setSaving(null);
+    }
+  };
+
+  const Switch = ({
+    label,
+    on,
+    busy,
+    onClick,
+  }: {
+    label: string;
+    on: boolean;
+    busy: boolean;
+    onClick: () => void;
+  }) => (
+    <button
+      type="button"
+      disabled={busy}
+      onClick={onClick}
+      className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-sm font-medium transition disabled:opacity-50 ${
+        on
+          ? 'border-emerald-200 bg-emerald-50 text-emerald-700'
+          : 'border-slate-200 bg-white text-ink-soft hover:bg-slate-50'
+      }`}
+    >
+      <span className={`inline-block h-2 w-2 rounded-full ${on ? 'bg-emerald-500' : 'bg-slate-300'}`} />
+      {label}：{on ? '已开' : '未开'}
+    </button>
+  );
+
+  return (
+    <section>
+      <h3 className="text-xs font-semibold uppercase tracking-wide text-ink-muted">开票</h3>
+      <div className="mt-2 flex flex-wrap items-center gap-2">
+        {legs >= 1 && (
+          <Switch
+            label="去程"
+            on={!!order.outboundInvoiced}
+            busy={saving === 'outbound'}
+            onClick={() => void toggle('outboundInvoiced', 'outbound')}
+          />
+        )}
+        {legs >= 2 && (
+          <Switch
+            label="回程"
+            on={!!order.returnInvoiced}
+            busy={saving === 'return'}
+            onClick={() => void toggle('returnInvoiced', 'return')}
+          />
+        )}
+        <Switch
+          label="系统"
+          on={!!order.systemInvoiced}
+          busy={saving === 'system'}
+          onClick={() => void toggle('systemInvoiced', 'system')}
+        />
+      </div>
+      <p className="mt-1.5 text-[11px] text-ink-muted">
+        去程 / 回程按航段分别开票；翻为「已开」时会校验该班次开票上限。
+      </p>
+    </section>
+  );
+}
 
 function NotesSection({ order }: { order: OrderSummary }) {
   const tokens = useAuth((s) => s.tokens);

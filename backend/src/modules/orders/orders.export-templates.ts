@@ -15,6 +15,7 @@ import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { toAlpha3 } from './nationality.js';
 import { passengerToRow, type PnrRow, PNR_COLUMNS } from './pnr-export.js';
 import { buildOrderFilterWhere } from './orders.service.js';
+import { determineFlightLegs } from './ticketing-cap.js';
 import { parseRoomGroups } from './orders.export-room-allocation.js';
 import type { ExportTemplatesQuery } from './orders.schemas.js';
 
@@ -43,12 +44,6 @@ const PAYMENT_METHOD_LABEL: Record<string, string> = {
   ALIPAY: '支付宝',
   BANK_CARD: '银行卡',
   AGENT_PREPAYMENT: '代理预存',
-};
-
-const INVOICE_STATUS_LABEL: Record<string, string> = {
-  NONE: '未开',
-  REQUESTED: '已要求',
-  ISSUED: '已开',
 };
 
 const FULFILLMENT_STATUS_LABEL: Record<string, string> = {
@@ -270,8 +265,8 @@ interface FullRow {
   refundAmount: number; // 退款金额（人均）
   refundAt: string; // 退款时间
   refundChannel: string; // 退款渠道 — 留空
-  invoiceStatusSys: string; // 系统开票状态
-  invoiceStatusManual: string; // 开票状态 — 线下手工列，留空
+  invoiceStatusSys: string; // 系统开票状态（systemInvoiced：是/否）
+  invoiceStatusManual: string; // 开票状态 — 按航段已开的组合文本（去程已开/回程已开），都未开则留空
   visaStatus: string; // 签证状态
   visaOption: string; // 签证选项
   visaNote: string; // 签证备注 — 留空
@@ -389,6 +384,15 @@ export function orderToFullRows(order: OrderForTemplateExport, ctx: OrderContext
 
   const settled = dec(order.paidAmount) >= dec(order.total) ? '是' : '否';
 
+  // 六态开票（去程/回程/系统）——「系统开票状态」列反映 systemInvoiced；
+  // 「开票状态」列（原手工列）填按航段已开的组合文本：去程/回程分别判定，回程仅在存在回程班次时列出。
+  const invoiceStatusSys = order.systemInvoiced ? '是' : '否';
+  const { returnScheduleId } = determineFlightLegs(order.items);
+  const invoicedLegs: string[] = [];
+  if (order.outboundInvoiced) invoicedLegs.push('去程已开');
+  if (returnScheduleId && order.returnInvoiced) invoicedLegs.push('回程已开');
+  const invoiceStatusManual = invoicedLegs.join('/');
+
   // 备注列对标旧系统：结构化四栏 + 自由文本，再按乘客叠加其分房组（酒店/房型/组备注）。
   const baseNotes = [order.noteSpecial, order.noteHotel, order.noteVisa, order.notePayment, order.notes]
     .filter(Boolean)
@@ -435,8 +439,8 @@ export function orderToFullRows(order: OrderForTemplateExport, ctx: OrderContext
     refundAmount: round2(refundTotal / ctx.paxCount),
     refundAt: fmtDateTimeSec(lastRefundAt),
     refundChannel: '',
-    invoiceStatusSys: INVOICE_STATUS_LABEL[order.invoiceStatus] ?? order.invoiceStatus,
-    invoiceStatusManual: '',
+    invoiceStatusSys,
+    invoiceStatusManual,
     visaStatus: visaTask ? FULFILLMENT_STATUS_LABEL[visaTask.status] ?? visaTask.status : '',
     visaOption,
     visaNote: '',

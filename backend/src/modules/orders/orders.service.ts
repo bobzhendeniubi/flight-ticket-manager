@@ -42,7 +42,7 @@ import { PricingService } from '../pricing/pricing.service.js';
 import { createOpenReceiptWithinTx } from '../receipts/receipts.service.js';
 import { OPERATION_FEE_CNY_PER_ORDER } from './order-cost-items.service.js';
 import { bundleItemMetadataSchema } from './orders.schemas.js';
-import { assertTicketingCap } from './ticketing-cap.js';
+import { assertTicketingCap, determineFlightLegs } from './ticketing-cap.js';
 import { PRICE_ADJUSTMENT_REASON_LABEL } from './orders.schemas.js';
 import type {
   BatchCreateOrdersBody,
@@ -2279,6 +2279,70 @@ export class OrderService {
   }
 
   /**
+   * 设置六态开票的三个布尔位（路由层限 ADMIN/STAFF）：去程 / 回程 / 系统 各自独立。
+   * 仅当某航段「从未开翻成已开」时才校验对应班次的开票上限（翻回未开 / 无变化不校验）；
+   * 去程/回程班次由订单 FLIGHT 行按 departureTime 升序判定（determineFlightLegs）。
+   * 校验 + 更新同包一个事务，缩小并发开票越限窗口。systemInvoiced 不占班次额度、不校验。
+   */
+  async setInvoiceFlags(
+    id: string,
+    flags: { outboundInvoiced?: boolean; returnInvoiced?: boolean; systemInvoiced?: boolean },
+  ): Promise<{
+    id: string;
+    orderNumber: string;
+    outboundInvoiced: boolean;
+    returnInvoiced: boolean;
+    systemInvoiced: boolean;
+  }> {
+    return prisma.$transaction(async (tx) => {
+      const order = await tx.order.findUnique({
+        where: { id },
+        select: {
+          outboundInvoiced: true,
+          returnInvoiced: true,
+          systemInvoiced: true,
+          _count: { select: { passengers: true } },
+          items: {
+            where: { kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
+            select: {
+              flightScheduleId: true,
+              flightSchedule: { select: { departureTime: true } },
+            },
+          },
+        },
+      });
+      if (!order) throw new NotFoundError('订单不存在');
+
+      const { outboundScheduleId, returnScheduleId } = determineFlightLegs(order.items);
+
+      // 去程：从 false → true 且有去程班次时校验该班次上限
+      if (flags.outboundInvoiced === true && !order.outboundInvoiced && outboundScheduleId) {
+        await assertTicketingCap(tx, [outboundScheduleId], order._count.passengers);
+      }
+      // 回程：从 false → true 且有回程班次时校验该班次上限
+      if (flags.returnInvoiced === true && !order.returnInvoiced && returnScheduleId) {
+        await assertTicketingCap(tx, [returnScheduleId], order._count.passengers);
+      }
+
+      return tx.order.update({
+        where: { id },
+        data: {
+          ...(flags.outboundInvoiced !== undefined && { outboundInvoiced: flags.outboundInvoiced }),
+          ...(flags.returnInvoiced !== undefined && { returnInvoiced: flags.returnInvoiced }),
+          ...(flags.systemInvoiced !== undefined && { systemInvoiced: flags.systemInvoiced }),
+        },
+        select: {
+          id: true,
+          orderNumber: true,
+          outboundInvoiced: true,
+          returnInvoiced: true,
+          systemInvoiced: true,
+        },
+      });
+    });
+  }
+
+  /**
    * 事务内执行状态流转 —— 供 payments.handleCallback 等外部事务复用。
    * 调用方负责包 $transaction 且提交后 enqueue newTaskIdsOut 里的任务。
    */
@@ -3119,11 +3183,16 @@ export class OrderService {
 
       await tx.passenger.update({ where: { id: passengerId }, data });
 
-      // ── 2. resetInvoice → 开票状态回 NONE（新出行人重开票）──
+      // ── 2. resetInvoice → 开票状态回 NONE + 三维开票位（去/回/系统）一并清零（新出行人重开票）──
       if (input.resetInvoice) {
         await tx.order.update({
           where: { id: orderId },
-          data: { invoiceStatus: InvoiceStatus.NONE },
+          data: {
+            invoiceStatus: InvoiceStatus.NONE,
+            outboundInvoiced: false,
+            returnInvoiced: false,
+            systemInvoiced: false,
+          },
         });
       }
 
@@ -3516,6 +3585,8 @@ export type OrderListFilters = Pick<
   | 'flightNumber'
   | 'passengerName'
   | 'invoiceStatus'
+  | 'invoiceLeg'
+  | 'invoiced'
   | 'visaFulfillmentStatus'
 > & {
   /** 精确按班次过滤（整班·全岗导出用）；比 travelFrom/travelTo 更准，不受 ±1 天放宽影响。 */
@@ -3598,6 +3669,15 @@ export function buildOrderFilterWhere(query: OrderListFilters): Prisma.OrderWher
     andClauses.push({ items: { some: { flightScheduleId: query.scheduleId } } });
   }
   if (query.invoiceStatus) where.invoiceStatus = query.invoiceStatus;
+  // 六态开票筛选（组合式）：invoiceLeg 指航段/系统维度，invoiced 指该维度已开(true)/未开(false)。
+  // 二者需同时给出才生效——这正是票务岗「出行日期=7/10 + 去程未开 → 导出」的筛选路径。
+  //   outbound → outboundInvoiced；return → returnInvoiced；system → systemInvoiced。
+  if (query.invoiceLeg && query.invoiced !== undefined) {
+    const col = (
+      { outbound: 'outboundInvoiced', return: 'returnInvoiced', system: 'systemInvoiced' } as const
+    )[query.invoiceLeg];
+    where[col] = query.invoiced;
+  }
   // 签证办理状态筛选 — 与列表「签证」列徽标同源（VISA 行的 VISA_APPLICATION 履约任务状态）。
   //   signed  ：订单含 VISA 行且其签证办理任务「已确认(CONFIRMED)」= 已签证。
   //   unsigned：订单含 VISA 行、但无任何「已确认」的签证办理任务（待处理/处理中/取消/失败或无任务）= 未签证。

@@ -872,6 +872,38 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     return result;
   });
 
+  // ── 六态开票：去程/回程/系统 三个布尔位（ADMIN/STAFF）──
+  // PATCH /orders/:id/invoice-flags  body: { outboundInvoiced?, returnInvoiced?, systemInvoiced? }
+  // 翻某航段为已开时校验对应班次开票上限（超限 422）；systemInvoiced 不占额度。
+  app.patch('/:id/invoice-flags', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅运营/管理员可修改开票状态' });
+    }
+    const { id } = req.params as { id: string };
+    const body = z
+      .object({
+        outboundInvoiced: z.boolean().optional(),
+        returnInvoiced: z.boolean().optional(),
+        systemInvoiced: z.boolean().optional(),
+      })
+      .parse(req.body);
+    const result = await service.setInvoiceFlags(id, body);
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'UPDATE_INVOICE_STATUS',
+      targetType: 'ORDER',
+      targetId: id,
+      targetLabel: result.orderNumber,
+      after: {
+        outboundInvoiced: result.outboundInvoiced,
+        returnInvoiced: result.returnInvoiced,
+        systemInvoiced: result.systemInvoiced,
+      },
+    });
+    return result;
+  });
+
   // ── 预期到账金额（ADMIN/STAFF；锁定后仅 ADMIN）──
   // PATCH /orders/:id/expected-amount  body: { amountCny: number | null }
   app.patch('/:id/expected-amount', { preHandler: [app.authenticate] }, async (req, reply) => {
