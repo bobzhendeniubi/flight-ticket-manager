@@ -322,6 +322,10 @@ function BundleDetailContent({
   const childDiscount = b.childSeatDiscountCnyPerPerson != null ? num(b.childSeatDiscountCnyPerPerson) : 0;
   const infantPrice = b.infantPriceCny != null ? num(b.infantPriceCny) : 0;
   const bundleLegs = b.legs != null ? num(b.legs) : 2;
+  // 每人操作服务费（server-priced，Bundle.operationFeeCny）。老缓存缺字段时按 DB 默认 ¥20 兜底——
+  // 后端一定会收，这里少算才是「展示价 < 实扣价」偏差。按占座人数收（婴儿不收），
+  // 镜像后端 computeBundleOperationFeeTotal。
+  const operationFee = Math.max(0, b.operationFeeCny != null ? num(b.operationFeeCny) : 20);
 
   const queryGo = useDebouncedValue(goDate);
   const displayReturn = addDaysISO(goDate, nights);
@@ -386,6 +390,8 @@ function BundleDetailContent({
   // ── add-on 加价（镜像后端：单人入住/独住 = singleCount×supp×nights；升舱 = businessCount×upg×legs）──
   const singleAddOn = singleCount * (singleSupp ?? 0) * billNights;
   const businessAddOn = businessCount * (businessUpg ?? 0) * bundleLegs;
+  // 操作服务费 = 每人 × 占座人数（婴儿不占座不收；镜像后端加在套餐行、随整单 percent-off）。
+  const operationFeeTotal = operationFee * seatPax;
 
   // 计费房间比例（展示与提交口径一致）：单人拼房只占半间（0.5），其余按容量整数房间数 baseRooms。
   //   solo 拼房（singleCount=0）→ 0.5 间（拼房价 = 0.5×房价×晚，镜像后端 roomsBilled 缺省的半间口径）；
@@ -429,7 +435,8 @@ function BundleDetailContent({
   const hotelTotal = itemRows.filter((r) => r.kind === 'HOTEL').reduce((s, r) => s + r.computedTotal, 0);
   const otherTotal =
     itemRows.filter((r) => r.kind !== 'FLIGHT' && r.kind !== 'HOTEL').reduce((s, r) => s + r.computedTotal, 0);
-  const listTotal = flightTotal + hotelTotal + otherTotal + addOnTotal;
+  // 操作服务费与 addOnTotal 分开累加（镜像后端：opFee 不进 addOn 的向零夹逼，单独加到套餐行）。
+  const listTotal = flightTotal + hotelTotal + otherTotal + addOnTotal + operationFeeTotal;
   const total = Math.round(listTotal * (1 - pct / 100));
   const perPerson = headCount > 0 ? Math.round(total / headCount) : total;
 
@@ -911,6 +918,17 @@ function BundleDetailContent({
                     <span className="truncate text-slate-700">升级商务舱 ×{businessCount}</span>
                   </div>
                   <span className="nums whitespace-nowrap text-slate-600">+¥{businessAddOn.toLocaleString()}</span>
+                </div>
+              )}
+              {operationFeeTotal > 0 && (
+                <div className="flex items-center justify-between text-xs">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <span className="rounded bg-slate-200 px-1.5 py-0.5 font-medium text-slate-700">服务</span>
+                    <span className="truncate text-slate-700">
+                      操作服务费 ×{seatPax} · 每人 ¥{operationFee.toLocaleString()}
+                    </span>
+                  </div>
+                  <span className="nums whitespace-nowrap text-slate-600">+¥{operationFeeTotal.toLocaleString()}</span>
                 </div>
               )}
             </div>

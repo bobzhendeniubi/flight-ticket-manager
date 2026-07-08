@@ -602,6 +602,8 @@ export class ProductsService {
           ...(body.infantPriceCny != null ? { infantPriceCny: body.infantPriceCny } : {}),
           // 自备签证可减额：省略 / null 时落 DB 默认（0 = 不减）
           ...(body.selfVisaDeductCny != null ? { selfVisaDeductCny: body.selfVisaDeductCny } : {}),
+          // 每人操作费：省略 / null 时落 DB 默认 ¥20
+          ...(body.operationFeeCny != null ? { operationFeeCny: body.operationFeeCny } : {}),
           ...(body.legs != null ? { legs: body.legs } : {}),
           // 运营封盘日（省略 = DB 默认 []）；前台默认出发日（省略 = null）
           ...(body.blackoutDates != null
@@ -671,6 +673,9 @@ export class ProductsService {
     }
     if (body.selfVisaDeductCny != null) {
       data.selfVisaDeductCny = body.selfVisaDeductCny;
+    }
+    if (body.operationFeeCny != null) {
+      data.operationFeeCny = body.operationFeeCny;
     }
     if (body.legs !== undefined) data.legs = body.legs;
     if (body.blackoutDates !== undefined) {
@@ -795,6 +800,8 @@ export function serializeVisa(
  * Bundle 序列化 — admin 编辑器的定价 CONTRACT（本次改版新增/变更的字段见下方注释）：
  *
  *   originalPerPaxCny  — 起价 / 人（1 人 · 半间房拼房口径，唯一权威）；见 bundle-pricing 里的公式与出处。
+ *                        本次改版起含每人操作费（operationFeeCny，起价按 1 人加一次）。
+ *   operationFeeCny    — 每人操作费（CNY，计入起价/人 + 下单按人头收）；随 ...rest 下发，admin 表单读回编辑。
  *   originalAllInCny   — [未变] 整包原价锚点（地面 1 间房 + 机票×flightPax），admin-web 仍用它反推展示用机票价。
  *   discountPct        — [未变] 套餐唯一折扣杠杆。
  *   items[].unitPrice  — 服务端权威定价（HOTEL 已关联房型 / TRANSFER / VISA 均为产品价，只读展示）。
@@ -821,6 +828,7 @@ function serializeBundle(
     nights,
     hotelRoomTypeNightlyCny: hotelRoomType ? Number(hotelRoomType.basePrice) : null,
     flightRoundTripPerPaxCny: flightRefRoundTripCny,
+    operationFeePerPaxCny: b.operationFeeCny,
   });
   return {
     ...rest,

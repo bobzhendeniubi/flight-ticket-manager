@@ -1006,6 +1006,8 @@ export interface BundleWriteBody {
   childSeatDiscountCnyPerPerson?: number | null;
   selfVisaDeductCny?: number | null;
   infantPriceCny?: number | null;
+  /** 每人操作费（¥/人，整数，计入起价 + 下单按占座人头收）；null/省略 = 不改（DB 默认 ¥20） */
+  operationFeeCny?: number | null;
   legs?: number | null;
   blackoutDates?: BundleBlackoutDate[];
   defaultDepartDate?: string | null;
@@ -1069,6 +1071,8 @@ export interface Bundle {
   legs: number;
   /** 客人自备签证可扣减金额（CNY/单，整数，每张套餐减一次）；>0 时录单/前台显示"自备签证"勾选 */
   selfVisaDeductCny: number;
+  /** 每人操作费（CNY/人，整数，DB 默认 ¥20）：计入起价/人，下单按占座人头收（卖价侧，非财务成本口径） */
+  operationFeeCny: number;
   /** 按出发日的不可售日期（单套餐粒度）；缺省/空 = 不限制 */
   blackoutDates?: BundleBlackoutDate[];
   /** 前台默认出发日（不影响可售判定）；null = 无默认 */

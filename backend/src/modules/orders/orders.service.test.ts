@@ -95,6 +95,7 @@ import {
   resolveBundleOccupancy,
   computeRoomsNeeded,
   computeBundleRoomsCharged,
+  computeBundleOperationFeeTotal,
   createFulfillmentTasks,
   resolveOrderAgentId,
   buildStayNightDates,
@@ -1079,6 +1080,26 @@ describe('单独 HOTEL 单人（非套餐）→ 仍 1 整间（0.5 口径不外�
 
   it('1 成人（房型 2大1小）→ computeRoomsNeeded = 1 间（单独 HOTEL 分支不走 0.5）', () => {
     expect(computeRoomsNeeded(occ(1), room2A1C)).toBe(1);
+  });
+});
+
+// ── 套餐每人操作费：computeBundleOperationFeeTotal ────────────────────
+// 操作费 = max(0, trunc(operationFeeCny)) × 占座人数 seatPax（婴儿不占座不收）。
+describe('computeBundleOperationFeeTotal', () => {
+  it('默认 ¥20 × 占座人数（2 大 1 占座童 = 3 人 → ¥60）', () => {
+    expect(computeBundleOperationFeeTotal(20, 3)).toBe(60);
+  });
+
+  it('费率 0 → 不收；占座 0 人 → 不收', () => {
+    expect(computeBundleOperationFeeTotal(0, 5)).toBe(0);
+    expect(computeBundleOperationFeeTotal(20, 0)).toBe(0);
+  });
+
+  it('脏输入夹逼：负费率→0、小数截断、NaN/undefined→0（不产生负账/小数账）', () => {
+    expect(computeBundleOperationFeeTotal(-5, 3)).toBe(0);
+    expect(computeBundleOperationFeeTotal(20.9, 2)).toBe(40);
+    expect(computeBundleOperationFeeTotal(Number.NaN, 2)).toBe(0);
+    expect(computeBundleOperationFeeTotal(20, -1)).toBe(0);
   });
 });
 

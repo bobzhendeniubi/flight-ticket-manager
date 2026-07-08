@@ -836,6 +836,8 @@ export class OrderService {
             infantPriceCny: true,
             // 自备签证减免（出行人自行办妥签证时从套餐行扣减；server-priced）
             selfVisaDeductCny: true,
+            // 每人操作费（server-priced，从 DB 读，不信客户端）：下单按占座人数收，计入套餐地面金额。
+            operationFeeCny: true,
             legs: true,
             // 关联房型容量 → 算 roomsNeeded（自动加房，套餐酒店部分按房价 ×rooms 收费）
             // basePrice：套餐酒店行的权威每间每晚价（服务端重算，不信 items JSON 里的 unitPrice —
@@ -955,23 +957,46 @@ export class OrderService {
         // 注意：addOn.breakdown.businessCount 已夹到占座人数（seatPax）上限，婴儿不计入。
         bundleBusinessUpgradeCount += addOn.breakdown.businessCount;
 
+        // 每人操作费（server-authoritative，从 DB 读的 operationFeeCny，绝不信客户端）：
+        //   操作费 = operationFeeCny × 占座人数 seatPax（成人 + 占座儿童）。
+        //   婴儿不收操作费——与「婴儿按 infantPriceCny（默认 0/免费）计价、该价即婴儿全价」的惯例一致，
+        //   不在婴儿价之上再叠加操作费。计入套餐地面金额（随折扣一并 percent-off，与 起价 把操作费
+        //   计入 originalPerPaxCny 原价、再按 discountPct 打折的口径一致）。
+        const operationFeeTotal = computeBundleOperationFeeTotal(
+          bundle.operationFeeCny,
+          occupancy.seatPax,
+        );
+
         priced.push({
           kind: 'BUNDLE',
           description: item.description,
           quantity: item.quantity,
           unitPrice: bundleUnitPrice,
-          // 升级加价加在套餐行总额上（不摊进 unitPrice，保持基础单价语义不变）
-          amount: bundleUnitPrice * item.quantity + addOn.total,
+          // 升级加价 + 每人操作费加在套餐行总额上（不摊进 unitPrice，保持基础单价语义不变）
+          amount: bundleUnitPrice * item.quantity + addOn.total + operationFeeTotal,
           bundleId: item.bundleId,
           hotelRoomTypeId: hotelStamp?.hotelRoomTypeId,
           hotelCheckIn: hotelStamp?.hotelCheckIn,
           hotelCheckOut: hotelStamp?.hotelCheckOut,
           // 解析后的计费房间数（支持 0.5 间）落到 OrderItem.roomsBilled，供房控读取。
           roomsBilled: rooms,
-          // 把升级选择 + 重算明细 + roomsNeeded 落到订单行 metadata，供运营/财务查看
-          //（admin 内部仍可叫"单房差/升舱"；roomsNeeded 解释酒店部分为何按房价 ×rooms 收费）
-          metadata: addOn.hasAddOn || rooms > 1
-            ? { ...(item.metadata ?? {}), roomsNeeded: rooms, addOns: addOn.breakdown }
+          // 把升级选择 + 重算明细 + roomsNeeded + 操作费落到订单行 metadata，供运营/财务查看
+          //（admin 内部仍可叫"单房差/升舱"；roomsNeeded 解释酒店部分为何按房价 ×rooms 收费）。
+          // 操作费始终收（默认 ¥20），故只要 total>0 就记一份 operationFee 明细（perPaxCny/pax/totalCny）。
+          metadata: addOn.hasAddOn || rooms > 1 || operationFeeTotal > 0
+            ? {
+                ...(item.metadata ?? {}),
+                ...(addOn.hasAddOn || rooms > 1 ? { roomsNeeded: rooms, addOns: addOn.breakdown } : {}),
+                ...(operationFeeTotal > 0
+                  ? {
+                      operationFee: {
+                        perPaxCny: Math.max(0, Math.trunc(bundle.operationFeeCny)),
+                        pax: occupancy.seatPax,
+                        totalCny: operationFeeTotal,
+                      },
+                    }
+                  : {}),
+              }
             : item.metadata,
         });
       }
@@ -3582,6 +3607,20 @@ export function computeBundleRoomsCharged(params: {
  *
  * 导出仅供单测使用。
  */
+/**
+ * 套餐每人操作费总额（服务端权威，不信客户端）。
+ *   操作费 = max(0, trunc(operationFeeCny)) × seatPax（占座人数：成人 + 占座儿童；婴儿不收）
+ * operationFeeCny 由 Bundle.operationFeeCny 提供（DB @default(20)，运营可在套餐向导改）；
+ * 负值/小数夹到非负整数。计入套餐地面金额，随 discountPct 一并 percent-off，与起价把操作费
+ * 计入 originalPerPaxCny 原价再打折的口径一致。导出仅供单测使用。
+ */
+export function computeBundleOperationFeeTotal(operationFeeCny: number, seatPax: number): number {
+  // Number(x)||0 兜底：DB 有 @default(20) 保证非空，但防御旧数据/未选字段导致的 undefined→NaN。
+  const perPax = Math.max(0, Math.trunc(Number(operationFeeCny) || 0));
+  const pax = Math.max(0, Math.trunc(Number(seatPax) || 0));
+  return perPax * pax;
+}
+
 export function computeBundleAddOn(
   bundle: {
     hotelNights: number | null;

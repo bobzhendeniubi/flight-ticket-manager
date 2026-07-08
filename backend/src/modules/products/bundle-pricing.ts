@@ -11,6 +11,10 @@
  * 起价 = 1 人 · 半间房（拼房 twin-share），与下单时「1 成人独自报套餐 → 只收半间床位价」的
  * server-authoritative 口径（见 orders.service computeBundleRoomsCharged）完全对应——起价就是把
  * 那个下单场景的价格摆到套餐卡片上。单独入住是加购项（singleSupplementCnyPerNight/晚），不计入起价。
+ *
+ * 每人操作费（Bundle.operationFeeCny，默认 ¥20，运营可改）从本次改版起计入起价——起价本身就是
+ * 「1 人」口径，故直接加一次（不用再乘人数）。与订单侧 computeBundleAddOn 里按出行人头（seatPax）
+ * 收的操作费是同一份费率、两处独立计算，不互相派生。
  */
 import { prisma } from '../../db/prisma.js';
 import { parseFareBuckets } from '../pricing/pricing.schemas.js';
@@ -83,6 +87,8 @@ export function computeBundleOriginalAllInCny(
  *   transferTotal         = items 里所有 TRANSFER 组件 Σ(qty×unitPrice)（接送通常整车计价，不按人头拆分）
  *   visaPerPax             = items 里所有 VISA 组件 Σ(unitPrice)（每个签证组件按「1 人」的单价相加，
  *                             忽略 qty —— qty 在 VISA 行里历史上表达的是人数，起价只为 1 人定价）
+ *   operationFeePerPax     = Bundle.operationFeeCny（每人操作费，默认 ¥20，运营可改；起价本身是
+ *                             「1 人」口径，直接加一次，不再乘人数）
  *
  * 与下单时「1 成人独自报套餐、绑了套餐房型、不独住 → 只收半间床位价」完全对应
  * （orders.service computeBundleRoomsCharged 的 isSoloSharing 分支），起价就是把该下单结果摆上卡片。
@@ -93,8 +99,10 @@ export function computeBundleOriginalPerPaxCny(params: {
   nights: number;
   hotelRoomTypeNightlyCny: number | null;
   flightRoundTripPerPaxCny: number | null;
+  /** 每人操作费（Bundle.operationFeeCny，CNY，起价按「1 人」口径直接加一次）。 */
+  operationFeePerPaxCny: number;
 }): number {
-  const { items, nights, hotelRoomTypeNightlyCny, flightRoundTripPerPaxCny } = params;
+  const { items, nights, hotelRoomTypeNightlyCny, flightRoundTripPerPaxCny, operationFeePerPaxCny } = params;
   const safe = safeItems(items);
   const transferTotal = safe
     .filter((i) => i.kind === 'TRANSFER')
@@ -102,5 +110,6 @@ export function computeBundleOriginalPerPaxCny(params: {
   const visaPerPax = safe.filter((i) => i.kind === 'VISA').reduce((s, i) => s + i.unitPrice, 0);
   const hotelHalfShareTotal = hotelRoomTypeNightlyCny == null ? 0 : 0.5 * hotelRoomTypeNightlyCny * nights;
   const flightPerPax = flightRoundTripPerPaxCny ?? 0;
-  return Math.round(flightPerPax + hotelHalfShareTotal + transferTotal + visaPerPax);
+  const operationFeePerPax = Math.max(0, operationFeePerPaxCny);
+  return Math.round(flightPerPax + hotelHalfShareTotal + transferTotal + visaPerPax + operationFeePerPax);
 }

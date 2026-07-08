@@ -651,6 +651,11 @@ export interface Bundle {
   childSeatDiscountCnyPerPerson?: number | null;
   infantPriceCny?: number | null;
   /**
+   * 每人操作服务费（server-priced，整数 CNY，DB 默认 ¥20）：按占座人数收（婴儿不收），
+   * 加在套餐行、随整单 percent-off。缺省（老缓存）按 ¥20 兜底——后端一定会收。
+   */
+  operationFeeCny?: number | null;
+  /**
    * 套餐关联酒店房型（展示酒店名 + 房型名；null = 未关联）。
    * capacity/maxAdults/maxChildren 由后端 serializer 暴露（products.service serialize），
    * 供前台镜像 roomsNeeded 计算与展示（"每间最多 X 大 Y 小"）。全 optional，老缓存缺省按兜底处理。

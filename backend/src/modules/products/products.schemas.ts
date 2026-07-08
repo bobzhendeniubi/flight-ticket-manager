@@ -218,6 +218,9 @@ export const createBundleBodySchema = z.object({
   // 自备签证可减额（CNY，整数）：客人自带签证时从套餐价里扣减多少。
   // null / 省略时用 DB 默认（0 = 不减），与上面 server-priced 字段同款 != null 写入约定。
   selfVisaDeductCny: z.number().int().nonnegative().max(1_000_000).nullable().optional(),
+  // 每人操作费（CNY，整数）：计入起价/人，下单按出行人头收（买家实付的一部分，非财务成本口径）。
+  // null / 省略时用 DB 默认 ¥20，与上面 server-priced 字段同款 != null 写入约定。
+  operationFeeCny: z.number().int().nonnegative().max(100_000).nullable().optional(),
   // 机票航段数（来回 = 2，单程 = 1）
   legs: z.number().int().min(1).max(8).optional(),
   // 运营封盘日（按出发日 D）；该日整套餐不可售，优先级高于库存判定。省略 = 不改。

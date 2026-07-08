@@ -165,6 +165,8 @@ function bundleApiToMock(b: ApiBundle): MockBundleWithServiceNotes {
     businessUpgradeCnyPerLeg: b.businessUpgradeCnyPerLeg,
     childSeatDiscountCnyPerPerson: b.childSeatDiscountCnyPerPerson,
     selfVisaDeductCny: b.selfVisaDeductCny ?? null,
+    // 每人操作费（服务端恒返回 number，DB 默认 ¥20）；?? 20 只防老缓存缺字段。
+    operationFeeCny: b.operationFeeCny ?? 20,
     infantPriceCny: b.infantPriceCny,
     legs: b.legs,
     blackoutDates: b.blackoutDates ?? [],
@@ -510,6 +512,8 @@ export function ProductsPage() {
           businessUpgradeCnyPerLeg: n.businessUpgradeCnyPerLeg ?? 0,
           childSeatDiscountCnyPerPerson: n.childSeatDiscountCnyPerPerson ?? null,
           selfVisaDeductCny: n.selfVisaDeductCny ?? null,
+          // 显式发数值（同 businessUpgrade 的教训）：null 会被更新路径当「不改」，改回默认就改不动。
+          operationFeeCny: n.operationFeeCny ?? 20,
           infantPriceCny: n.infantPriceCny ?? null,
           legs: n.legs ?? 2,
           blackoutDates: n.blackoutDates ?? [],
@@ -538,6 +542,8 @@ export function ProductsPage() {
           businessUpgradeCnyPerLeg: n.businessUpgradeCnyPerLeg ?? 0,
             childSeatDiscountCnyPerPerson: n.childSeatDiscountCnyPerPerson ?? null,
             selfVisaDeductCny: n.selfVisaDeductCny ?? null,
+            // 显式发数值（同 businessUpgrade 的教训）：null 会被更新路径当「不改」，改回默认就改不动。
+            operationFeeCny: n.operationFeeCny ?? 20,
             infantPriceCny: n.infantPriceCny ?? null,
             legs: n.legs ?? 2,
             blackoutDates: n.blackoutDates ?? [],
@@ -940,6 +946,8 @@ function BundleCard({
   const visaPerPaxForBreakdown = safeBundleItems
     .filter((i) => i.kind === 'VISA')
     .reduce((s, i) => s + i.unitPrice, 0);
+  // 每人操作费（服务端起价已含；起价是 1 人口径 → 直接加一次，不乘人数）。
+  const operationFeeForBreakdown = Math.max(0, bundle.operationFeeCny ?? 20);
   const originalPerPaxBreakdown = [
     flight && flight.roundTrip > 0 ? { label: '机票往返(经济舱最低)', amount: flight.roundTrip } : null,
     hotelHalfShareForBreakdown > 0
@@ -949,6 +957,7 @@ function BundleCard({
       ? { label: `接送 ${transferTripsForBreakdown}趟`, amount: transferTotalForBreakdown }
       : null,
     visaPerPaxForBreakdown > 0 ? { label: '签证', amount: visaPerPaxForBreakdown } : null,
+    operationFeeForBreakdown > 0 ? { label: '操作费/人', amount: operationFeeForBreakdown } : null,
   ].filter((row): row is { label: string; amount: number } => row != null);
   return (
     <article className={`card transition hover:shadow-pop ${bundle.active ? '' : 'opacity-60'}`}>
@@ -1153,6 +1162,8 @@ function NewBundleWizard({
   // 大人/小孩区分（CNY；留空 = 用服务端默认：占座儿童差价 ¥30、婴儿价 ¥0）
   const [childSeatDiscount, setChildSeatDiscount] = useState<number | null>(initial?.childSeatDiscountCnyPerPerson ?? null);
   const [selfVisaDeduct, setSelfVisaDeduct] = useState<number | null>(initial?.selfVisaDeductCny ?? null);
+  // 每人操作费：新建默认 ¥20（= DB 默认）；编辑回读已存值。提交时留空按 20 显式发数值。
+  const [operationFee, setOperationFee] = useState<number | null>(initial?.operationFeeCny ?? 20);
   const [infantPrice, setInfantPrice] = useState<number | null>(initial?.infantPriceCny ?? null);
   const [legs, setLegs] = useState<number | null>(initial?.legs ?? 2);
   // Local draft shape allowing null for in-progress numeric edits.
@@ -1237,8 +1248,14 @@ function NewBundleWizard({
         .reduce((s, i) => s + (i.visaId ? (visaPriceById.get(i.visaId) ?? 0) : 0), 0),
     [items, visaPriceById],
   );
+  // 每人操作费预览值（起价 1 人口径直接加一次；留空按 DB 默认 ¥20，与提交口径一致）。
+  const operationFeePerPax = Math.max(0, operationFee ?? 20);
   const originalPerPax = Math.round(
-    (flightRefRoundTripCny ?? 0) + 0.5 * hotelNightlyPriceCny * nightsForPricing + transferTotal + visaPerPax,
+    (flightRefRoundTripCny ?? 0) +
+      0.5 * hotelNightlyPriceCny * nightsForPricing +
+      transferTotal +
+      visaPerPax +
+      operationFeePerPax,
   );
   // 起价拆解（0702 反馈：运营把 1400=经济舱700×2 误读成「升舱默认700×2」；此处逐项摊开，
   // 每项都用起价公式本身的同一组变量算出，四项相加 = originalPerPax，杜绝口径分叉）。
@@ -1257,6 +1274,7 @@ function NewBundleWizard({
       : null,
     transferTotal > 0 ? { label: `接送 ${transferTripsCount}趟`, amount: transferTotal } : null,
     visaPerPax > 0 ? { label: '签证', amount: visaPerPax } : null,
+    operationFeePerPax > 0 ? { label: '操作费/人', amount: operationFeePerPax } : null,
   ].filter((row): row is { label: string; amount: number } => row != null);
 
   // ── 地面成本估算（仅内部，0702 反馈 5d）—— 与上面「起价/人」卖价拆解完全独立的另一套数：
@@ -1547,6 +1565,21 @@ function NewBundleWizard({
                 onChange={(n) => setSelfVisaDeduct(n)}
                 integerOnly
               />
+            </div>
+            <div>
+              <label className="label">每人操作费（¥/人，计入起价，下单按占座人头收）</label>
+              <NumberInput
+                min={0}
+                max={100000}
+                className="input"
+                placeholder="留空 = 用默认 ¥20"
+                value={operationFee}
+                onChange={(n) => setOperationFee(n)}
+                integerOnly
+              />
+              <p className="mt-1 text-xs text-ink-muted">
+                卖价侧、随折扣一并打折；婴儿不收。与财务成本口径的按单操作费无关。
+              </p>
             </div>
           </div>
 
@@ -1891,6 +1924,8 @@ function NewBundleWizard({
                   businessUpgradeCnyPerLeg: businessUpgrade,
                   childSeatDiscountCnyPerPerson: childSeatDiscount,
                   selfVisaDeductCny: selfVisaDeduct,
+                  // 留空按默认 ¥20 显式落数值：null 在更新路径= 「不改」，改回默认就改不动。
+                  operationFeeCny: operationFee ?? 20,
                   infantPriceCny: infantPrice,
                   legs: legs ?? 2,
                   // 仅提交填了日期的封盘行；reason 去空格，空则省略

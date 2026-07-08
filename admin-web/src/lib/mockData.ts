@@ -864,6 +864,8 @@ export interface MockBundle {
   childSeatDiscountCnyPerPerson?: number | null;
   /** 自备签证可减额（¥/单，整数，每张套餐减一次，客人自备签证时减）；null/缺省 = 0（不减） */
   selfVisaDeductCny?: number | null;
+  /** 每人操作费（¥/人，整数，计入起价 + 下单按占座人头收）；null/缺省 = 服务端默认 ¥20 */
+  operationFeeCny?: number | null;
   /** 婴儿价（¥/人，整数，不占座婴儿）；null/缺省 = 用服务端默认 ¥0 */
   infantPriceCny?: number | null;
   /** 计费航段数（来回 = 2，单程 = 1）；null/缺省 = 用服务端默认 */

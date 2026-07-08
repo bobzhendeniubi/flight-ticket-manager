@@ -746,6 +746,12 @@ model Bundle {
   // 服务内容（订单详情 / 前台展示的服务说明，运营在套餐向导里填，每行一条，
   // 如「中文客服，越南当地机场助签」「举牌接机，送至酒店并协助分房」）
   serviceNotes   String?  @db.Text
+  // 每人操作费（CNY，整数，运营在套餐向导里可改，默认 ¥20）—— 计入起价/人，下单按出行人头收，
+  // 是买家实付的一部分（卖价侧）。注意：与 OrderCostItem.OPERATION_FEE /
+  // OPERATION_FEE_CNY_PER_ORDER（每单固定 ¥20，财务成本口径，订单创建自动计提）是两个完全独立的
+  // 概念——那个是成本侧、按单、系统固定，这个是卖价侧、按人、套餐可配置。两者恰好同名「操作费」，
+  // 互不影响、互不派生，不要合并读写。
+  operationFeeCny Int     @default(20)
   emoji          String?
   photo          String?
   // 套餐组件列表（JSON）: [{kind: 'HOTEL', productName, qty, unitPrice}, ...]

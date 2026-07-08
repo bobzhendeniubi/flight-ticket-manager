@@ -24,15 +24,39 @@ describe('computeBundleOriginalPerPaxCny · 起价/人（1人半间房）', () =
     { kind: 'VISA', qty: 2, unitPrice: 280 },
   ];
 
-  it('完整公式：flightRoundTripPerPax + 0.5×hotelNightly×nights + transferTotal + visaPerPax', () => {
+  it('完整公式：flightRoundTripPerPax + 0.5×hotelNightly×nights + transferTotal + visaPerPax（操作费=0 时回归旧公式）', () => {
     const result = computeBundleOriginalPerPaxCny({
       items,
       nights: 3,
       hotelRoomTypeNightlyCny: 2162,
       flightRoundTripPerPaxCny: 1380,
+      operationFeePerPaxCny: 0,
     });
     // 1380 + 0.5×2162×3 + (2×188) + 280 = 1380 + 3243 + 376 + 280 = 5279
     expect(result).toBe(5279);
+  });
+
+  it('operationFeePerPaxCny：默认 ¥20 直接加一次（起价已是 1 人口径，不再乘人数）', () => {
+    const result = computeBundleOriginalPerPaxCny({
+      items,
+      nights: 3,
+      hotelRoomTypeNightlyCny: 2162,
+      flightRoundTripPerPaxCny: 1380,
+      operationFeePerPaxCny: 20,
+    });
+    // 旧公式 5279 + 操作费 20 = 5299
+    expect(result).toBe(5299);
+  });
+
+  it('operationFeePerPaxCny 按套餐可配置（如 ¥30）→ 起价对应上调', () => {
+    const result = computeBundleOriginalPerPaxCny({
+      items: [],
+      nights: 1,
+      hotelRoomTypeNightlyCny: null,
+      flightRoundTripPerPaxCny: null,
+      operationFeePerPaxCny: 30,
+    });
+    expect(result).toBe(30);
   });
 
   it('transferTotal 按 Σ(qty×unitPrice)（多条 TRANSFER 组件累加，不按人头拆分）', () => {
@@ -45,8 +69,9 @@ describe('computeBundleOriginalPerPaxCny · 起价/人（1人半间房）', () =
       nights: 1,
       hotelRoomTypeNightlyCny: null,
       flightRoundTripPerPaxCny: null,
+      operationFeePerPaxCny: 0,
     });
-    // (2×188) + (1×588) = 964，其余项 0（无机票参考/无房型）
+    // (2×188) + (1×588) = 964，其余项 0（无机票参考/无房型/无操作费）
     expect(result).toBe(964);
   });
 
@@ -60,6 +85,7 @@ describe('computeBundleOriginalPerPaxCny · 起价/人（1人半间房）', () =
       nights: 1,
       hotelRoomTypeNightlyCny: null,
       flightRoundTripPerPaxCny: null,
+      operationFeePerPaxCny: 0,
     });
     expect(result).toBe(280 + 50);
   });
@@ -70,6 +96,7 @@ describe('computeBundleOriginalPerPaxCny · 起价/人（1人半间房）', () =
       nights: 5, // 即便 nights>0，没有房型夜价就无从计价，不应凭空产生费用
       hotelRoomTypeNightlyCny: null,
       flightRoundTripPerPaxCny: 1000,
+      operationFeePerPaxCny: 0,
     });
     expect(result).toBe(1000 + 100);
   });
@@ -80,6 +107,7 @@ describe('computeBundleOriginalPerPaxCny · 起价/人（1人半间房）', () =
       nights: 2,
       hotelRoomTypeNightlyCny: 1000,
       flightRoundTripPerPaxCny: null,
+      operationFeePerPaxCny: 0,
     });
     expect(result).toBe(0.5 * 1000 * 2);
   });
@@ -90,6 +118,7 @@ describe('computeBundleOriginalPerPaxCny · 起价/人（1人半间房）', () =
       nights: 2,
       hotelRoomTypeNightlyCny: 1000,
       flightRoundTripPerPaxCny: 500,
+      operationFeePerPaxCny: 0,
     });
     expect(result).toBe(500 + 0.5 * 1000 * 2);
   });
@@ -100,6 +129,7 @@ describe('computeBundleOriginalPerPaxCny · 起价/人（1人半间房）', () =
       nights: 1,
       hotelRoomTypeNightlyCny: 1, // 0.5×1×1 = 0.5 → 四舍五入
       flightRoundTripPerPaxCny: null,
+      operationFeePerPaxCny: 0,
     });
     expect(Number.isInteger(result)).toBe(true);
   });
