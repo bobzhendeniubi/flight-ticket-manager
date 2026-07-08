@@ -101,6 +101,7 @@ import {
   buildStayNightDates,
   summarizeBundleItems,
   deriveBundlePerAgeUnitPrices,
+  buildOrderFilterWhere,
 } from './orders.service.js';
 import type { OrderItemInput } from './orders.schemas.js';
 import {
@@ -2657,5 +2658,57 @@ describe('swapItemHotelBodySchema', () => {
     expect(() =>
       swapItemHotelBodySchema.parse({ newHotelRoomTypeId: 'rt_new', note: '注'.repeat(201) }),
     ).toThrow();
+  });
+});
+
+describe('buildOrderFilterWhere · 签证办理状态筛选（与列表徽标同源）', () => {
+  // 已签证 = 订单含 VISA 行且其 VISA_APPLICATION 履约任务已确认(CONFIRMED)。
+  const CONFIRMED_CLAUSE = {
+    items: {
+      some: {
+        kind: 'VISA',
+        fulfillmentTasks: {
+          some: { type: 'VISA_APPLICATION', status: 'CONFIRMED' },
+        },
+      },
+    },
+  };
+
+  it('不传 visaFulfillmentStatus → 不产生任何签证相关子句', () => {
+    const where = buildOrderFilterWhere({});
+    expect(where.AND).toBeUndefined();
+  });
+
+  it('signed → AND 含「VISA 行且签证办理任务已确认」子句', () => {
+    const where = buildOrderFilterWhere({ visaFulfillmentStatus: 'signed' });
+    expect(where.AND).toEqual([CONFIRMED_CLAUSE]);
+  });
+
+  it('unsigned → AND 含「有 VISA 行」且「无已确认签证任务」(NOT) 组合', () => {
+    const where = buildOrderFilterWhere({ visaFulfillmentStatus: 'unsigned' });
+    expect(where.AND).toEqual([
+      {
+        AND: [
+          { items: { some: { kind: 'VISA' } } },
+          { NOT: CONFIRMED_CLAUSE },
+        ],
+      },
+    ]);
+  });
+
+  it('signed 可与 kind 组合而不互相覆盖（各自独立叠加进 AND）', () => {
+    const where = buildOrderFilterWhere({ kind: 'VISA', visaFulfillmentStatus: 'signed' });
+    // kind 与 signed 分别是两条 { items: { some } } 子句，都进 AND，互不覆盖。
+    expect(Array.isArray(where.AND)).toBe(true);
+    expect(where.AND).toEqual([
+      { items: { some: { kind: 'VISA' } } },
+      CONFIRMED_CLAUSE,
+    ]);
+  });
+
+  it('signed 与 invoiceStatus 组合：签证走 AND、开票走顶层字段，互不干扰', () => {
+    const where = buildOrderFilterWhere({ invoiceStatus: 'ISSUED', visaFulfillmentStatus: 'signed' });
+    expect(where.invoiceStatus).toBe('ISSUED');
+    expect(where.AND).toEqual([CONFIRMED_CLAUSE]);
   });
 });

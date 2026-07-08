@@ -64,11 +64,34 @@ interface PassengerRowProps {
   photoUrl?: string | null;
   /** 护照图仍在按需加载中 */
   photosLoading?: boolean;
+  /** 点开「护照」时若本单尚未拉图，触发按需拉取（幂等：已加载/加载中则无操作） */
+  onRequestPhotos?: () => void;
 }
-function PassengerRow({ passenger, photoUrl, photosLoading }: PassengerRowProps) {
+function PassengerRow({ passenger, photoUrl, photosLoading, onRequestPhotos }: PassengerRowProps) {
   const [enlarged, setEnlarged] = useState(false);
   // 优先用按需加载到的真图；否则回落到列表下发的值（现列表恒为 null）
   const resolvedPhoto = photoUrl ?? passenger.passportPhotoUrl;
+
+  // 打开护照大图：若还没图，先触发本单按需拉取（modal 内展示 loading 态）
+  const openPassport = () => {
+    if (!resolvedPhoto) onRequestPhotos?.();
+    setEnlarged(true);
+  };
+
+  // 姓名按护照惯例展示为 姓/名（LAST/FIRST）；缺拆分字段时回退整名
+  const displayName =
+    passenger.lastName && passenger.firstName
+      ? `${passenger.lastName}/${passenger.firstName}`.toUpperCase()
+      : passenger.fullName || '—';
+  // 性别徽标：M→男 / F→女 / X→其他；无值显示 —
+  const genderLabel =
+    passenger.gender === 'M'
+      ? '男'
+      : passenger.gender === 'F'
+        ? '女'
+        : passenger.gender === 'X'
+          ? '其他'
+          : null;
 
   return (
     <div className="flex items-center gap-3 py-1 text-xs">
@@ -79,51 +102,18 @@ function PassengerRow({ passenger, photoUrl, photosLoading }: PassengerRowProps)
             <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-brand border-t-transparent" />
           </div>
         ) : resolvedPhoto ? (
-          <>
-            <button
-              type="button"
-              onClick={() => setEnlarged(true)}
-              title="点击查看大图"
-              className="block h-8 w-8 overflow-hidden rounded border border-slate-200 hover:opacity-80 transition-opacity"
-            >
-              <img
-                src={resolvedPhoto}
-                alt={`${passenger.fullName} 护照`}
-                className="h-full w-full object-cover"
-              />
-            </button>
-            {enlarged && (
-              <div
-                className="fixed inset-0 z-50 flex items-center justify-center bg-black/70"
-                onClick={() => setEnlarged(false)}
-              >
-                <div className="relative max-h-[90vh] max-w-[90vw]" onClick={(e) => e.stopPropagation()}>
-                  <img
-                    src={resolvedPhoto}
-                    alt={`${passenger.fullName} 护照`}
-                    className="max-h-[85vh] max-w-[85vw] rounded-lg shadow-2xl"
-                  />
-                  <div className="mt-2 flex justify-center gap-3">
-                    <a
-                      href={resolvedPhoto}
-                      download={`passport-${passenger.documentNumber}.jpg`}
-                      className="btn-secondary text-xs py-1"
-                      onClick={(e) => e.stopPropagation()}
-                    >
-                      下载此照片
-                    </a>
-                    <button
-                      type="button"
-                      className="btn-ghost text-xs py-1"
-                      onClick={() => setEnlarged(false)}
-                    >
-                      关闭
-                    </button>
-                  </div>
-                </div>
-              </div>
-            )}
-          </>
+          <button
+            type="button"
+            onClick={openPassport}
+            title="点击查看护照大图核对信息"
+            className="block h-8 w-8 overflow-hidden rounded border border-slate-200 hover:opacity-80 transition-opacity"
+          >
+            <img
+              src={resolvedPhoto}
+              alt={`${passenger.fullName} 护照`}
+              className="h-full w-full object-cover"
+            />
+          </button>
         ) : passenger.hasPhoto ? (
           // 有照片但本次未取到（加载失败）—— 与"缺照"区分，中性占位
           <div className="flex h-8 w-8 items-center justify-center rounded border border-slate-200 bg-slate-50 text-[9px] text-ink-muted">
@@ -138,7 +128,13 @@ function PassengerRow({ passenger, photoUrl, photosLoading }: PassengerRowProps)
 
       {/* 姓名 / 护照号 / 签证日期（若 payload 带了就显示，没带也不报错） */}
       <div className="min-w-0 flex-1">
-        <div className="font-medium text-ink truncate">{passenger.fullName || '—'}</div>
+        <div className="flex items-center gap-1.5">
+          <span className="font-medium text-ink truncate">{displayName}</span>
+          {passenger.chineseName && (
+            <span className="text-ink-muted truncate">{passenger.chineseName}</span>
+          )}
+          <span className="badge-neutral shrink-0 text-[10px]">{genderLabel ?? '—'}</span>
+        </div>
         <div className="font-mono text-ink-muted truncate">{passenger.documentNumber || '—'}</div>
         {(() => {
           // 签证日期目前未必在签证任务 payload 里 → 防御式读取，存在才显示。
@@ -160,9 +156,72 @@ function PassengerRow({ passenger, photoUrl, photosLoading }: PassengerRowProps)
         })()}
       </div>
 
-      {/* 缺护照标记 */}
-      {!passenger.hasPhoto && (
+      {/* 右侧标识：有图→可点「护照」（点开大图核对姓名）；无图→红「缺护照」 */}
+      {passenger.hasPhoto ? (
+        <button
+          type="button"
+          onClick={openPassport}
+          title="点击查看护照大图核对信息"
+          className="badge-info shrink-0 cursor-pointer text-[10px] hover:opacity-80 transition-opacity"
+        >
+          护照
+        </button>
+      ) : (
         <span className="badge-danger shrink-0 text-[10px]">缺护照</span>
+      )}
+
+      {/* 护照大图查看 —— 标题带乘客姓名，便于核对；图未取到时按需加载/兜底提示 */}
+      {enlarged && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
+          onClick={() => setEnlarged(false)}
+        >
+          <div
+            className="relative flex max-h-[90vh] max-w-[90vw] flex-col items-center"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="mb-2 max-w-full truncate text-center text-sm font-medium text-white">
+              {displayName}
+              {passenger.chineseName ? ` · ${passenger.chineseName}` : ''}
+              {passenger.documentNumber ? ` · ${passenger.documentNumber}` : ''}
+            </div>
+            {resolvedPhoto ? (
+              <img
+                src={resolvedPhoto}
+                alt={`${passenger.fullName} 护照`}
+                className="max-h-[80vh] max-w-[90vw] rounded-lg shadow-2xl"
+              />
+            ) : photosLoading ? (
+              <div className="flex h-40 w-64 items-center justify-center gap-2 rounded-lg bg-white/10 text-sm text-white">
+                <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-white border-t-transparent" />
+                护照加载中…
+              </div>
+            ) : (
+              <div className="flex h-40 w-64 items-center justify-center rounded-lg bg-white/10 px-4 text-center text-sm text-white">
+                护照图暂时无法加载，请收起后重试
+              </div>
+            )}
+            <div className="mt-3 flex justify-center gap-3">
+              {resolvedPhoto && (
+                <a
+                  href={resolvedPhoto}
+                  download={`passport-${passenger.documentNumber}.jpg`}
+                  className="btn-secondary text-xs py-1"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  下载此照片
+                </a>
+              )}
+              <button
+                type="button"
+                className="btn-ghost text-xs py-1 text-white"
+                onClick={() => setEnlarged(false)}
+              >
+                关闭
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );
@@ -221,6 +280,11 @@ function TaskRow({ task, selected, onToggle, token, onChanged }: TaskRowProps) {
       })
       .finally(() => setPhotosLoading(false));
   }, [orderId, passengers.length, token]);
+
+  // 点开「护照」时的按需拉取：仅在未加载且非加载中时触发（幂等，避免重复请求）
+  const ensurePhotos = useCallback(() => {
+    if (!photosLoadedRef.current && !photosLoading) loadPhotos();
+  }, [loadPhotos, photosLoading]);
 
   const toggleExpanded = () => {
     const next = !expanded;
@@ -360,6 +424,7 @@ function TaskRow({ task, selected, onToggle, token, onChanged }: TaskRowProps) {
                       passenger={p}
                       photoUrl={photoMap[p.id]}
                       photosLoading={photosLoading}
+                      onRequestPhotos={ensurePhotos}
                     />
                   ))}
                 </div>
@@ -401,6 +466,31 @@ export function VisaDeskPage() {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('OPEN');
   // 出发日期筛选（单日 YYYY-MM-DD）；空 = 不按出发日过滤
   const [departureDate, setDepartureDate] = useState('');
+  // 「按出发日打包下载该日签证资料」入口状态（合并签证名单 xlsx + 全部护照图）
+  const [bundleDownloading, setBundleDownloading] = useState(false);
+  const [bundleError, setBundleError] = useState<string | null>(null);
+
+  // 打包下载该出发日全部订单的签证资料（一张合并名单 + 全部护照图）
+  const handleDownloadVisaBundle = async () => {
+    if (!token || !departureDate || bundleDownloading) return;
+    setBundleDownloading(true);
+    setBundleError(null);
+    try {
+      const blob = await api.downloadVisaBundle(token, departureDate);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `签证资料_出发${departureDate}.zip`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e: unknown) {
+      setBundleError(e instanceof ApiError ? e.message : '打包下载失败，请重试');
+    } finally {
+      setBundleDownloading(false);
+    }
+  };
 
   // ── 批量选择 / 流转状态 ─────────────────────────────────
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -558,6 +648,22 @@ export function VisaDeskPage() {
               )}
             </div>
             <p className="mt-1 text-xs text-ink-muted">按客户出发日筛选（纯签证单无航班）</p>
+            {/* 按出发日一次性打包该日全部订单的签证资料（合并名单 xlsx + 全部护照图） */}
+            <div className="mt-2">
+              <button
+                type="button"
+                className="btn-secondary py-1.5 text-xs"
+                onClick={() => void handleDownloadVisaBundle()}
+                disabled={!departureDate || bundleDownloading}
+                title={departureDate ? '打包该出发日全部订单的签证名单与护照图' : '请先选择出发日期'}
+              >
+                {bundleDownloading ? '打包中…' : '打包下载该日签证资料'}
+              </button>
+              {!departureDate && (
+                <p className="mt-1 text-xs text-ink-muted">选择出发日期后可一键打包</p>
+              )}
+              {bundleError && <p className="mt-1 text-xs text-rose-600">{bundleError}</p>}
+            </div>
           </div>
         </div>
       </section>

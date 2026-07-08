@@ -149,6 +149,10 @@ export class FulfillmentService {
       orderId: string;
       id: string;
       fullName: string;
+      lastName: string | null;
+      firstName: string | null;
+      chineseName: string | null;
+      gender: string | null;
       documentNumber: string;
       hasPhoto: boolean;
     };
@@ -163,7 +167,8 @@ export class FulfillmentService {
       // 真图在用户展开某单时按 orderId 单独按需拉取（见 listPassengerPhotos）。
       visaOrderIds.length
         ? prisma.$queryRaw<PassengerRow[]>(Prisma.sql`
-            SELECT "orderId", "id", "fullName", "documentNumber",
+            SELECT "orderId", "id", "fullName", "lastName", "firstName",
+                   "chineseName", "gender"::text AS "gender", "documentNumber",
                    ("passportPhotoUrl" IS NOT NULL AND length("passportPhotoUrl") > 0) AS "hasPhoto"
             FROM "Passenger"
             WHERE "orderId" IN (${Prisma.join(visaOrderIds)})
@@ -220,13 +225,17 @@ export class FulfillmentService {
             departureTime: firstLeg ? firstLeg.departureTime.toISOString() : null,
             departureTz: firstLeg?.departureTz ?? null,
           },
-          // 签证任务附带乘客明细（轻量）：仅名称/证件号/hasPhoto，不含护照大图。
+          // 签证任务附带乘客明细（轻量）：名称/姓名拆分/性别/证件号/hasPhoto，不含护照大图。
           // 缺照标红只依赖 hasPhoto（库内算出，准确）；护照真图展开某单时按需拉取。
           ...(t.type === FulfillmentType.VISA_APPLICATION
             ? {
                 passengers: (passengersByOrder.get(order.id) ?? []).map((p) => ({
                   id: p.id,
                   fullName: p.fullName,
+                  lastName: p.lastName,
+                  firstName: p.firstName,
+                  chineseName: p.chineseName,
+                  gender: p.gender,
                   documentNumber: p.documentNumber,
                   passportPhotoUrl: null as string | null,
                   hasPhoto: p.hasPhoto,

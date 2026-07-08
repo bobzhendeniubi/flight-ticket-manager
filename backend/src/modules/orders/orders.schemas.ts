@@ -222,14 +222,39 @@ export const listOrdersQuerySchema = z.object({
   flightNumber: z.string().max(20).optional(),    // 订单含该航班号的 FLIGHT 行（不区分大小写）
   passengerName: z.string().max(120).optional(),  // 乘客姓名模糊匹配
   invoiceStatus: z.nativeEnum(InvoiceStatus).optional(),
+  // 签证办理状态筛选 — 与列表「签证」列徽标同源（订单 VISA 行的 VISA_APPLICATION 履约任务状态）。
+  //   signed   = 已签证：订单含 VISA 行且其签证办理任务已确认(CONFIRMED)
+  //   unsigned = 未签证：订单含 VISA 行但签证办理任务尚未确认（待处理/处理中/已取消/失败或无任务）
+  // 无 VISA 行的订单（列表签证列显示「—」）两个值都不命中，与徽标保持一致、不引入第三口径。
+  // 注：这是履约进度口径，区别于订单录单字段 Order.visaStatus（VisaRequirement 枚举）。
+  visaFulfillmentStatus: z.enum(['signed', 'unsigned']).optional(),
   page: z.coerce.number().int().min(1).default(1),
   pageSize: z.coerce.number().int().min(1).max(200).default(50),
 });
 export type ListOrdersQuery = z.infer<typeof listOrdersQuerySchema>;
 
+// ── 勾选导出：orderIds ───────────────────────────────────────────────────
+// 「只导出勾选的订单」——列表勾选后把选中订单 id 透传给导出。
+// 支持逗号分隔（?orderIds=a,b,c）或重复参数（?orderIds=a&orderIds=b），跟随现有 query 风格。
+// 规整为去重后的非空字符串数组；给上限防滥用（一次导出体量可控）。
+export const MAX_EXPORT_ORDER_IDS = 500;
+export const orderIdsQuerySchema = z
+  .union([z.string(), z.array(z.string())])
+  .optional()
+  .transform((v) => {
+    if (v === undefined) return undefined;
+    const raw = Array.isArray(v) ? v : v.split(',');
+    const ids = Array.from(new Set(raw.map((s) => s.trim()).filter(Boolean)));
+    return ids.length > 0 ? ids : undefined;
+  })
+  .refine((ids) => ids === undefined || ids.length <= MAX_EXPORT_ORDER_IDS, {
+    message: `一次最多导出 ${MAX_EXPORT_ORDER_IDS} 条勾选订单`,
+  });
+
 // ── 三模板筛选导出（全岗可用 / 票务专用 / 签证专用）────────────────────────
 // 与 listOrders 共用同一组筛选字段（status/agentId/kind/search/from/to/
 // travelFrom/travelTo/flightNumber/passengerName/invoiceStatus），外加 template。
+// 另可选 orderIds：给了就「只导勾选的这些订单」，忽略上述筛选（见 buildOrderFilterWhere）。
 export const exportTemplatesQuerySchema = listOrdersQuerySchema
   .pick({
     status: true,
@@ -243,11 +268,14 @@ export const exportTemplatesQuerySchema = listOrdersQuerySchema
     flightNumber: true,
     passengerName: true,
     invoiceStatus: true,
+    visaFulfillmentStatus: true,
   })
   .extend({
     template: z.enum(['full', 'ticketing', 'visa']),
     // 精确按班次（整班·全岗导出用）；优先于 travelFrom/travelTo，只导该班次订单。
     scheduleId: z.string().min(1).optional(),
+    // 勾选导出：给了就以这批 id 为准（忽略其余筛选），无则按上面的筛选条件。
+    orderIds: orderIdsQuerySchema,
   });
 export type ExportTemplatesQuery = z.infer<typeof exportTemplatesQuerySchema>;
 
@@ -259,6 +287,13 @@ export const exportRoomAllocationQuerySchema = z.object({
   departDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, '日期格式应为 YYYY-MM-DD').optional(),
 });
 export type ExportRoomAllocationQuery = z.infer<typeof exportRoomAllocationQuerySchema>;
+
+// ── 签证资料整日打包（zip：合并签证名单 xlsx + 全部护照图）─────────────────
+// 按出发日选订单（与分房表 departDate 同口径），一次导出该日所有订单的签证资料。
+export const visaBundleQuerySchema = z.object({
+  departDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, '日期格式应为 YYYY-MM-DD'),
+});
+export type VisaBundleQuery = z.infer<typeof visaBundleQuerySchema>;
 
 // ── 状态流转 ─────────────────────────────────────────────────────────────
 export const updateStatusBodySchema = z.object({

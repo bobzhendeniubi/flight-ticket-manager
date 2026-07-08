@@ -15,7 +15,7 @@ import JSZip from 'jszip';
 import { OrderItemKind, FulfillmentType, type Passenger } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 
-function sanitize(s: string): string {
+export function sanitize(s: string): string {
   return s.replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 80);
 }
 
@@ -168,12 +168,12 @@ async function buildVisaSheetBuffer(passengers: Passenger[]): Promise<Buffer> {
   return Buffer.from(buf);
 }
 
-function extFromUrl(u: string): string {
+export function extFromUrl(u: string): string {
   const m = u.match(/\.(jpe?g|png|webp|heic|gif)(?:\?|$)/i);
   return m ? m[1].toLowerCase().replace('jpeg', 'jpg') : 'jpg';
 }
 
-async function fetchPhoto(url: string): Promise<Buffer | null> {
+export async function fetchPhoto(url: string): Promise<Buffer | null> {
   try {
     const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
     if (!res.ok) return null;

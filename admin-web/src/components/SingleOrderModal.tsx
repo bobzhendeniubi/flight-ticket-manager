@@ -79,6 +79,8 @@ interface PassengerRow {
   dateOfBirth: string; // 原始输入，提交时解析为 ISO
   /** 中文姓名（可选；OCR 填写或手动输入） */
   chineseName?: string;
+  /** 性别 M/F/X（可选；OCR 识别带出或手选，随乘客提交给后端） */
+  gender?: 'M' | 'F' | 'X';
   /** 护照签发日期 YYYY-MM-DD（可选；OCR 填写或手动输入） */
   passportIssueDate?: string;
   /** 护照签发地点（自由文本，城市/机关；可选；OCR 填写或手动输入）。区别于 ISO-2 签发国。 */
@@ -255,11 +257,21 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const [idemKey, setIdemKey] = useState(makeIdemKey);
 
   // ── 机票 ──
+  // 单程 / 往返：往返时出港 + 回程各生成一条 FLIGHT 行（同一批出行人，人数不翻倍）。
+  const [flightTripType, setFlightTripType] = useState<'ONEWAY' | 'ROUNDTRIP'>('ONEWAY');
   const [flights, setFlights] = useState<AdminFlight[]>([]);
   const [flightId, setFlightId] = useState('');
   const [schedules, setSchedules] = useState<AdminSchedule[]>([]);
   const [scheduleId, setScheduleId] = useState('');
   const [cabin, setCabin] = useState<CabinClass | ''>('');
+  // 出港「起飞日期（可手输）」：先选/手输日期，再从当日班次里挑，避免班次下拉过长。留空=全部班次。
+  const [flightDate, setFlightDate] = useState('');
+  // 回程航段（仅往返）：可与出港不同航班/日期/舱位，各自生成一条 FLIGHT 行。
+  const [returnFlightId, setReturnFlightId] = useState('');
+  const [returnSchedules, setReturnSchedules] = useState<AdminSchedule[]>([]);
+  const [returnScheduleId, setReturnScheduleId] = useState('');
+  const [returnCabin, setReturnCabin] = useState<CabinClass | ''>('');
+  const [returnDate, setReturnDate] = useState('');
 
   // ── 酒店 ──
   const [hotels, setHotels] = useState<Hotel[]>([]);
@@ -322,6 +334,16 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     api.listSchedules(token, flightId).then((r) => setSchedules(r.schedules)).catch(() => setErr('班次加载失败'));
   }, [token, flightId]);
 
+  // 机票（往返）：选回程航班后拉回程班次
+  useEffect(() => {
+    if (!token || !returnFlightId) {
+      setReturnSchedules([]);
+      setReturnScheduleId('');
+      return;
+    }
+    api.listSchedules(token, returnFlightId).then((r) => setReturnSchedules(r.schedules)).catch(() => setErr('回程班次加载失败'));
+  }, [token, returnFlightId]);
+
   // 套餐机票航段：选了套餐 + 航班列表就绪后，预拉两个方向（去程 MFM→DAD / 回程 DAD→MFM）
   // 的全部班次池；后续按「出发日期」本地日期匹配派生具体班次。
   useEffect(() => {
@@ -381,6 +403,18 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const flight = flights.find((f) => f.id === flightId);
   const schedule = schedules.find((s) => s.id === scheduleId);
   const cabinOptions = schedule?.seatClasses ?? [];
+  const returnFlight = flights.find((f) => f.id === returnFlightId);
+  const returnSchedule = returnSchedules.find((s) => s.id === returnScheduleId);
+  const returnCabinOptions = returnSchedule?.seatClasses ?? [];
+  // 按「起飞日期」过滤班次（本地日期与下拉展示口径一致：localYmd）；日期留空则显示全部。
+  const schedulesForDate = useMemo(
+    () => (flightDate ? schedules.filter((s) => localYmd(s.departureTime, s.departureTz) === flightDate) : schedules),
+    [schedules, flightDate],
+  );
+  const returnSchedulesForDate = useMemo(
+    () => (returnDate ? returnSchedules.filter((s) => localYmd(s.departureTime, s.departureTz) === returnDate) : returnSchedules),
+    [returnSchedules, returnDate],
+  );
   const hotel = hotels.find((h) => h.id === hotelId);
   const roomType = hotel?.roomTypes.find((rt) => rt.id === roomTypeId);
   const visa = visas.find((v) => v.id === visaId);
@@ -588,6 +622,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
           if (s.fullName) patch.fullName = s.fullName;
           if (s.documentNumber) patch.documentNumber = s.documentNumber;
           if (s.dateOfBirth) patch.dateOfBirth = s.dateOfBirth;
+          if (s.gender) patch.gender = s.gender;
           if (s.chineseName) patch.chineseName = s.chineseName;
           if (s.passportIssueDate) patch.passportIssueDate = s.passportIssueDate;
           if (s.passportIssuePlace) patch.passportIssuePlace = s.passportIssuePlace;
@@ -628,6 +663,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       if (s.fullName) patch.fullName = s.fullName;
       if (s.passportNumber) patch.documentNumber = s.passportNumber;
       if (s.dateOfBirth) patch.dateOfBirth = s.dateOfBirth;
+      if (s.gender) patch.gender = s.gender;
       setPassenger(idx, patch);
     } catch {
       setPassenger(idx, { ocrPct: null, ocrStage: undefined, ocrEngine: null, ocrModel: null });
@@ -640,19 +676,37 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     | { items: CreateOrderItemInput[] }
     | { error: string } {
     if (kind === 'FLIGHT') {
-      if (!scheduleId || !cabin) return { error: '请选择航班班次和舱位' };
-      const departDateStr = schedule ? schedule.departureTime.slice(0, 10) : '';
-      const description =
-        `${flight?.flightNumber ?? ''} ${flight?.originCode ?? ''}→${flight?.destinationCode ?? ''} ${departDateStr} ${CABIN_ZH[cabin] ?? cabin}`.trim();
-      return {
-        item: {
-          kind: 'FLIGHT',
-          description,
-          quantity: Math.max(1, validPassengers.length || 1),
-          flightScheduleId: scheduleId,
-          flightCabin: cabin,
-        },
+      if (!scheduleId || !cabin) {
+        return { error: flightTripType === 'ROUNDTRIP' ? '请选择出港航班班次和舱位' : '请选择航班班次和舱位' };
+      }
+      // 往返同一批出行人 → 每条 FLIGHT 行的 quantity 都 = 出行人数（不翻倍）；
+      // unitPrice 占位 0，服务端按班次舱位权威重算（与套餐/批量创单同约定）。
+      const seatPax = Math.max(1, validPassengers.length || 1);
+      const outDateStr = schedule ? localYmd(schedule.departureTime, schedule.departureTz) : '';
+      const outLabel = flightTripType === 'ROUNDTRIP' ? '去程 ' : '';
+      const outboundLine = {
+        kind: 'FLIGHT' as const,
+        description:
+          `${outLabel}${flight?.flightNumber ?? ''} ${flight?.originCode ?? ''}→${flight?.destinationCode ?? ''} ${outDateStr} ${CABIN_ZH[cabin] ?? cabin}`.trim(),
+        quantity: seatPax,
+        flightScheduleId: scheduleId,
+        flightCabin: cabin,
       };
+      if (flightTripType === 'ONEWAY') {
+        return { item: outboundLine };
+      }
+      // 往返：回程再生成一条 FLIGHT 行（可与出港不同航班/日期/舱位）。
+      if (!returnScheduleId || !returnCabin) return { error: '往返需选择回程航班班次和舱位' };
+      const retDateStr = returnSchedule ? localYmd(returnSchedule.departureTime, returnSchedule.departureTz) : '';
+      const returnLine = {
+        kind: 'FLIGHT' as const,
+        description:
+          `回程 ${returnFlight?.flightNumber ?? ''} ${returnFlight?.originCode ?? ''}→${returnFlight?.destinationCode ?? ''} ${retDateStr} ${CABIN_ZH[returnCabin] ?? returnCabin}`.trim(),
+        quantity: seatPax,
+        flightScheduleId: returnScheduleId,
+        flightCabin: returnCabin,
+      };
+      return { items: [outboundLine, returnLine] };
     }
     if (kind === 'HOTEL') {
       if (!roomTypeId) return { error: '请选择酒店和房型' };
@@ -791,6 +845,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       documentNumber: p.documentNumber.trim(),
       dateOfBirth: parseDob(p.dateOfBirth) ?? '',
       nationality: 'CN',
+      ...(p.gender ? { gender: p.gender } : {}),
       ...(p.passportPhotoUrl ? { passportPhotoUrl: p.passportPhotoUrl } : {}),
       ...(p.chineseName?.trim() ? { chineseName: p.chineseName.trim() } : {}),
       ...(p.passportIssueDate?.trim() ? { passportIssueDate: p.passportIssueDate.trim() } : {}),
@@ -1056,39 +1111,124 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
             {/* 各类型字段 */}
             <div className="rounded-lg border border-slate-200 bg-slate-50/50 p-3">
               {kind === 'FLIGHT' && (
-                <div className="grid gap-3 md:grid-cols-3">
-                  <label className="text-xs text-slate-500">
-                    航班
-                    <select className={inputCls} value={flightId} onChange={(e) => { setFlightId(e.target.value); setScheduleId(''); setCabin(''); }}>
-                      <option value="">选择航班…</option>
-                      {flights.map((f) => (
-                        <option key={f.id} value={f.id}>{f.flightNumber} {f.originCode}→{f.destinationCode}</option>
+                <div className="space-y-3">
+                  {/* 单程 / 往返切换 */}
+                  <div>
+                    <span className="text-xs text-slate-500">行程类型</span>
+                    <div className="mt-1 flex gap-2">
+                      {([['ONEWAY', '单程'], ['ROUNDTRIP', '往返']] as const).map(([val, label]) => (
+                        <button
+                          key={val}
+                          type="button"
+                          className={`rounded-lg border px-3 py-1.5 text-sm transition ${
+                            flightTripType === val
+                              ? 'border-brand bg-brand-50 text-brand ring-1 ring-brand/20'
+                              : 'border-slate-200 text-ink-soft hover:border-slate-300 hover:bg-slate-50'
+                          }`}
+                          onClick={() => { setFlightTripType(val); setErr(null); }}
+                        >
+                          {label}
+                        </button>
                       ))}
-                    </select>
-                  </label>
-                  <label className="text-xs text-slate-500">
-                    班次（出发 · 当地时间）
-                    <select className={inputCls} value={scheduleId} onChange={(e) => { setScheduleId(e.target.value); setCabin(''); }} disabled={!flightId}>
-                      <option value="">选择班次…</option>
-                      {schedules.map((s) => (
-                        <option key={s.id} value={s.id}>
-                          {localYmd(s.departureTime, s.departureTz)} {formatLocalTime(s.departureTime, s.departureTz)}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <label className="text-xs text-slate-500">
-                    舱位
-                    <select className={inputCls} value={cabin} onChange={(e) => setCabin(e.target.value as CabinClass)} disabled={!scheduleId}>
-                      <option value="">选择舱位…</option>
-                      {cabinOptions.map((c) => (
-                        <option key={c.id} value={c.cabin}>
-                          {CABIN_ZH[c.cabin] ?? c.cabin}（余 {Math.max(0, c.available)}）¥{Number(c.basePrice).toFixed(0)}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-                  <p className="md:col-span-3 text-[11px] text-slate-400">数量按下方有效出行人数自动计（每人 1 张）。</p>
+                    </div>
+                  </div>
+
+                  {/* 出港航段 */}
+                  <div className="rounded-md border border-slate-200 bg-white/70 p-3">
+                    <div className="mb-2 text-xs font-medium text-slate-600">
+                      {flightTripType === 'ROUNDTRIP' ? '出港航班' : '航班'}
+                    </div>
+                    <div className="grid gap-3 md:grid-cols-4">
+                      <label className="text-xs text-slate-500">
+                        航班
+                        <select className={inputCls} value={flightId} onChange={(e) => { setFlightId(e.target.value); setScheduleId(''); setCabin(''); setFlightDate(''); }}>
+                          <option value="">选择航班…</option>
+                          {flights.map((f) => (
+                            <option key={f.id} value={f.id}>{f.flightNumber} {f.originCode}→{f.destinationCode}</option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="text-xs text-slate-500">
+                        起飞日期（可手输）
+                        <input type="date" className={inputCls} value={flightDate} onChange={(e) => { setFlightDate(e.target.value); setScheduleId(''); setCabin(''); }} disabled={!flightId} />
+                      </label>
+                      <label className="text-xs text-slate-500">
+                        班次（出发 · 当地时间）
+                        <select className={inputCls} value={scheduleId} onChange={(e) => { setScheduleId(e.target.value); setCabin(''); }} disabled={!flightId}>
+                          <option value="">{flightDate ? '选择当日班次…' : '选择班次…'}</option>
+                          {schedulesForDate.map((s) => (
+                            <option key={s.id} value={s.id}>
+                              {localYmd(s.departureTime, s.departureTz)} {formatLocalTime(s.departureTime, s.departureTz)}
+                            </option>
+                          ))}
+                        </select>
+                        {flightId && flightDate && schedulesForDate.length === 0 && (
+                          <span className="mt-1 block text-[11px] text-amber-600">该日期无班次，请换个日期或清空日期查看全部。</span>
+                        )}
+                      </label>
+                      <label className="text-xs text-slate-500">
+                        舱位
+                        <select className={inputCls} value={cabin} onChange={(e) => setCabin(e.target.value as CabinClass)} disabled={!scheduleId}>
+                          <option value="">选择舱位…</option>
+                          {cabinOptions.map((c) => (
+                            <option key={c.id} value={c.cabin}>
+                              {CABIN_ZH[c.cabin] ?? c.cabin}（余 {Math.max(0, c.available)}）¥{Number(c.basePrice).toFixed(0)}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
+                  </div>
+
+                  {/* 回程航段（仅往返） */}
+                  {flightTripType === 'ROUNDTRIP' && (
+                    <div className="rounded-md border border-slate-200 bg-white/70 p-3">
+                      <div className="mb-2 text-xs font-medium text-slate-600">回程航班</div>
+                      <div className="grid gap-3 md:grid-cols-4">
+                        <label className="text-xs text-slate-500">
+                          航班
+                          <select className={inputCls} value={returnFlightId} onChange={(e) => { setReturnFlightId(e.target.value); setReturnScheduleId(''); setReturnCabin(''); setReturnDate(''); }}>
+                            <option value="">选择航班…</option>
+                            {flights.map((f) => (
+                              <option key={f.id} value={f.id}>{f.flightNumber} {f.originCode}→{f.destinationCode}</option>
+                            ))}
+                          </select>
+                        </label>
+                        <label className="text-xs text-slate-500">
+                          起飞日期（可手输）
+                          <input type="date" className={inputCls} value={returnDate} onChange={(e) => { setReturnDate(e.target.value); setReturnScheduleId(''); setReturnCabin(''); }} disabled={!returnFlightId} />
+                        </label>
+                        <label className="text-xs text-slate-500">
+                          班次（出发 · 当地时间）
+                          <select className={inputCls} value={returnScheduleId} onChange={(e) => { setReturnScheduleId(e.target.value); setReturnCabin(''); }} disabled={!returnFlightId}>
+                            <option value="">{returnDate ? '选择当日班次…' : '选择班次…'}</option>
+                            {returnSchedulesForDate.map((s) => (
+                              <option key={s.id} value={s.id}>
+                                {localYmd(s.departureTime, s.departureTz)} {formatLocalTime(s.departureTime, s.departureTz)}
+                              </option>
+                            ))}
+                          </select>
+                          {returnFlightId && returnDate && returnSchedulesForDate.length === 0 && (
+                            <span className="mt-1 block text-[11px] text-amber-600">该日期无班次，请换个日期或清空日期查看全部。</span>
+                          )}
+                        </label>
+                        <label className="text-xs text-slate-500">
+                          舱位
+                          <select className={inputCls} value={returnCabin} onChange={(e) => setReturnCabin(e.target.value as CabinClass)} disabled={!returnScheduleId}>
+                            <option value="">选择舱位…</option>
+                            {returnCabinOptions.map((c) => (
+                              <option key={c.id} value={c.cabin}>
+                                {CABIN_ZH[c.cabin] ?? c.cabin}（余 {Math.max(0, c.available)}）¥{Number(c.basePrice).toFixed(0)}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                      </div>
+                      <p className="mt-1.5 text-[11px] text-slate-400">回程与出港可以是不同航班/日期，往返共用同一批出行人（人数不翻倍）。</p>
+                    </div>
+                  )}
+
+                  <p className="text-[11px] text-slate-400">数量按下方有效出行人数自动计（每人 1 张{flightTripType === 'ROUNDTRIP' ? '，去程/回程各一张' : ''}）。</p>
                 </div>
               )}
 
@@ -1425,6 +1565,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                       <th className="min-w-[140px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照号</th>
                       <th className="min-w-[120px] whitespace-nowrap px-2 py-1.5 text-left font-normal">出生日期</th>
                       <th className="min-w-[140px] whitespace-nowrap px-2 py-1.5 text-left font-normal">中文姓名</th>
+                      <th className="min-w-[90px] whitespace-nowrap px-2 py-1.5 text-left font-normal">性别</th>
                       <th className="min-w-[120px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照签发日期</th>
                       <th className="min-w-[160px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照签发地点</th>
                       <th className="min-w-[120px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照有效期</th>
@@ -1477,6 +1618,20 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                               value={p.chineseName ?? ''}
                               onChange={(e) => setPassenger(i, { chineseName: e.target.value })}
                             />
+                          </td>
+                          <td className="min-w-[90px] px-2 py-1 align-top">
+                            <select
+                              className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm"
+                              value={p.gender ?? ''}
+                              onChange={(e) =>
+                                setPassenger(i, { gender: (e.target.value || undefined) as 'M' | 'F' | 'X' | undefined })
+                              }
+                            >
+                              <option value="">未选</option>
+                              <option value="M">男 (M)</option>
+                              <option value="F">女 (F)</option>
+                              <option value="X">其他 (X)</option>
+                            </select>
                           </td>
                           <td className="min-w-[120px] px-2 py-1 align-top">
                             <input

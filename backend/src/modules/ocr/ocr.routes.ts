@@ -57,10 +57,12 @@ async function callQwenOcr(
   const systemPrompt =
     '你是护照 OCR 引擎。严格输出 JSON，不要任何注释或 markdown 代码块。' +
     '字段：lastName, firstName, fullName, chineseName, documentNumber, ' +
-    'dateOfBirth(YYYY-MM-DD), gender(M/F/X), nationality(ISO-3166 alpha-3), ' +
+    'dateOfBirth(YYYY-MM-DD), gender(必须识别，只输出 M/F/X 之一：男=M 女=F 无法判定=X), ' +
+    'nationality(ISO-3166 alpha-3), ' +
     'passportIssueCountry(ISO-3166 alpha-3), passportExpiry(YYYY-MM-DD), ' +
     'passportIssueDate(YYYY-MM-DD), passportIssuePlace(签发地点/签发机关文本，如"广东省广州市"), ' +
     'placeOfBirth。' +
+    '性别识别：优先读 MRZ 第二行第 21 位（M/F）；MRZ 缺失或模糊时读目视区「性别/Sex」栏（男/M→M，女/F→F）。' +
     '找不到的字段填 null。优先用 MRZ 机读区提取机读字段，中文姓名/签发日期/签发地点/出生地用目视区。';
 
   const url = `${cfg.baseUrl.replace(/\/$/, '')}/chat/completions`;

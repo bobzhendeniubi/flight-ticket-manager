@@ -179,6 +179,8 @@ export function OrdersPage() {
   const [flightNumberFilter, setFlightNumberFilter] = useState('');
   const [passengerNameFilter, setPassengerNameFilter] = useState('');
   const [invoiceFilter, setInvoiceFilter] = useState<'' | InvoiceStatus>('');
+  // 签证办理状态筛选（后端过滤，与列表「签证」列徽标同源）：''=全部 / signed=已签证 / unsigned=未签证
+  const [visaFilter, setVisaFilter] = useState<'' | 'signed' | 'unsigned'>('');
   // 文本筛选防抖：停止输入 400ms 后才请求后端，避免每个键击打一次接口
   const [debouncedFlightNumber, setDebouncedFlightNumber] = useState('');
   const [debouncedPassengerName, setDebouncedPassengerName] = useState('');
@@ -230,6 +232,7 @@ export function OrdersPage() {
     if (debouncedFlightNumber.trim()) query.flightNumber = debouncedFlightNumber.trim();
     if (debouncedPassengerName.trim()) query.passengerName = debouncedPassengerName.trim();
     if (invoiceFilter) query.invoiceStatus = invoiceFilter;
+    if (visaFilter) query.visaFulfillmentStatus = visaFilter;
     api.listOrders(tokens.accessToken, query)
       .then((res) => {
         if (cancelled) return;
@@ -243,7 +246,7 @@ export function OrdersPage() {
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [tokens?.accessToken, createdFrom, createdTo, travelFrom, travelTo, claimFilter, debouncedFlightNumber, debouncedPassengerName, invoiceFilter, refreshNonce]);
+  }, [tokens?.accessToken, createdFrom, createdTo, travelFrom, travelTo, claimFilter, debouncedFlightNumber, debouncedPassengerName, invoiceFilter, visaFilter, refreshNonce]);
 
   // 视图层把 OrderSummary 映射成便于筛选/展示的数据
   const ordersView = useMemo(
@@ -421,6 +424,8 @@ export function OrdersPage() {
     if (!tokens?.accessToken) return;
     setExporting(true);
     try {
+      // 有勾选就只导勾选的这批（后端以 id 集合为准，忽略下面的筛选条件）。
+      const selected = Array.from(selectedIds);
       const blob = await api.downloadOrdersTemplateExport(tokens.accessToken, {
         template: exportTemplate,
         // 不透传列表的"状态"筛选：整班/名单导出要覆盖全部「占座」订单（含未支付那单），
@@ -435,6 +440,9 @@ export function OrdersPage() {
         flightNumber: flightNumberFilter.trim() || undefined,
         passengerName: passengerNameFilter.trim() || undefined,
         invoiceStatus: invoiceFilter || undefined,
+        // 签证办理状态（与列表「签证」筛选同源）——保持「导出=列表所见」一致。
+        visaFulfillmentStatus: visaFilter || undefined,
+        orderIds: selected.length > 0 ? selected : undefined,
       });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -456,17 +464,22 @@ export function OrdersPage() {
     if (!tokens?.accessToken) return;
     setExportingMaster(true);
     try {
+      // 有勾选就只导勾选的这批（后端以 id 集合为准，忽略 from/to）。
+      const selected = Array.from(selectedIds);
       const blob = await api.exportMaster(tokens.accessToken, {
         from: travelFrom || undefined,
         to: travelTo || undefined,
         role: 'all',
+        orderIds: selected.length > 0 ? selected : undefined,
       });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      const rangeLabel = travelFrom || travelTo
-        ? `${travelFrom || '全部'}_${travelTo || travelFrom || '全部'}`
-        : '全部_全部';
+      const rangeLabel = selected.length > 0
+        ? `勾选${selected.length}条`
+        : travelFrom || travelTo
+          ? `${travelFrom || '全部'}_${travelTo || travelFrom || '全部'}`
+          : '全部_全部';
       a.download = `全岗总表_${rangeLabel}.xlsx`;
       document.body.appendChild(a);
       a.click();
@@ -585,20 +598,38 @@ export function OrdersPage() {
             className="btn-secondary text-sm"
             disabled={loading || exporting}
             onClick={() => void handleTemplateExport()}
-            title="导出按上方「下单时间」周期（录入日期），用于佣金/提成/客户统计"
+            title={
+              selectedIds.size > 0
+                ? `只导出已勾选的 ${selectedIds.size} 条订单`
+                : '导出按上方「下单时间」周期（录入日期），用于佣金/提成/客户统计'
+            }
           >
-            {exporting ? '导出中…' : '📤 导出'}
+            {exporting
+              ? '导出中…'
+              : selectedIds.size > 0
+                ? `📤 导出（已选 ${selectedIds.size} 条）`
+                : '📤 导出'}
           </button>
           <button
             className="btn-primary text-sm"
             disabled={loading || exportingMaster}
             onClick={() => void handleMasterExport()}
-            title="全岗综合台账：一行一位乘客，涵盖机票/酒店/签证/付款全字段。按上方「出行日期」区间选单，不填=全部。"
+            title={
+              selectedIds.size > 0
+                ? `只导出已勾选的 ${selectedIds.size} 条订单（全岗综合台账）`
+                : '全岗综合台账：一行一位乘客，涵盖机票/酒店/签证/付款全字段。按上方「出行日期」区间选单，不填=全部。'
+            }
           >
-            {exportingMaster ? '导出中…' : '📊 导出全岗总表'}
+            {exportingMaster
+              ? '导出中…'
+              : selectedIds.size > 0
+                ? `📊 导出全岗总表（已选 ${selectedIds.size} 条）`
+                : '📊 导出全岗总表'}
           </button>
           <p className="w-full text-right text-xs text-ink-muted">
-            《导出》按上方「下单时间」周期（佣金/提成/客户统计）；《全岗总表》按「出行日期」区间（综合台账，不填=全部）
+            {selectedIds.size > 0
+              ? `已勾选 ${selectedIds.size} 条：两个导出都只导勾选的这些订单（忽略上方筛选）；取消勾选恢复按筛选导出`
+              : '《导出》按上方「下单时间」周期（佣金/提成/客户统计）；《全岗总表》按「出行日期」区间（综合台账，不填=全部）'}
           </p>
         </div>
       </section>
@@ -795,6 +826,19 @@ export function OrdersPage() {
               ))}
             </select>
           </div>
+          <div>
+            <label className="label">签证状态</label>
+            <select
+              className="input"
+              value={visaFilter}
+              onChange={(e) => setVisaFilter(e.target.value as '' | 'signed' | 'unsigned')}
+              title="按签证办理状态筛选（与列表「签证」列一致）：已签证=签证办理已确认；未签证=含签证但尚未确认。无签证的订单不计入。"
+            >
+              <option value="">全部</option>
+              <option value="signed">已签证</option>
+              <option value="unsigned">未签证</option>
+            </select>
+          </div>
           <div className="md:col-span-5">
             <label className="label">搜索（订单号 / 客户 / 代理）</label>
             <input
@@ -805,14 +849,14 @@ export function OrdersPage() {
             />
           </div>
         </div>
-        {(statusFilter || kindFilter || channelFilter || agentFilter || search || flightNumberFilter || passengerNameFilter || invoiceFilter || createdFrom || createdTo || travelFrom || travelTo) && (
+        {(statusFilter || kindFilter || channelFilter || agentFilter || search || flightNumberFilter || passengerNameFilter || invoiceFilter || visaFilter || createdFrom || createdTo || travelFrom || travelTo) && (
           <div className="mt-3 flex items-center justify-between text-xs text-slate-500">
             <span>显示 {filtered.length} 条订单</span>
             <button
               className="text-brand hover:text-brand-dark"
               onClick={() => {
                 setStatusFilter(''); setKindFilter(''); setChannelFilter(''); setAgentFilter(''); setSearch('');
-                setFlightNumberFilter(''); setPassengerNameFilter(''); setInvoiceFilter('');
+                setFlightNumberFilter(''); setPassengerNameFilter(''); setInvoiceFilter(''); setVisaFilter('');
                 setCreatedFrom(''); setCreatedTo(''); setTravelFrom(''); setTravelTo('');
               }}
             >
@@ -918,6 +962,7 @@ export function OrdersPage() {
                 <th className="text-left">订单号</th>
                 <th className="text-left">客户 / 代理</th>
                 <th className="text-left">内容</th>
+                <th className="whitespace-nowrap text-left">出发日期</th>
                 <th className="text-right">金额</th>
                 <th className="text-center">尾款</th>
                 <th className="text-center">状态</th>
@@ -957,6 +1002,9 @@ export function OrdersPage() {
                       <span className="rounded bg-slate-100 px-1.5 py-0.5">{KIND_LABEL[view.itemKind]}</span>
                       <span><span className="nums font-medium text-ink">{order.passengers.length}</span> 人</span>
                     </div>
+                  </td>
+                  <td className="nums whitespace-nowrap text-left text-xs text-ink-soft">
+                    {order.departDate ?? <span className="text-ink-muted">—</span>}
                   </td>
                   <td className="nums text-right font-medium text-ink">
                     ¥{view.totalNum.toLocaleString()}

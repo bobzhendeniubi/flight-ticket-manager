@@ -305,6 +305,8 @@ export interface OrderPassengerInput {
   dateOfBirth: string; // YYYY-MM-DD
   nationality?: string; // ISO alpha-2，默认 CN
   passengerType?: PassengerType;
+  /** 性别（M/F/X；OCR 识别或手选，镜像后端 passengerInputSchema） */
+  gender?: 'M' | 'F' | 'X';
   /** 护照图 data URL（OCR 识别后附带，后端持久化为 Passenger.passportPhotoUrl） */
   passportPhotoUrl?: string;
   /** 中文姓名（可选；OCR 能识别时带出） */
@@ -664,6 +666,8 @@ export interface OrderSummary {
   contactEmail: string | null;
   createdAt: string;
   updatedAt: string;
+  // 出发日期（YYYY-MM-DD）：FLIGHT 最早班次当地出发日 → 回退最早酒店入住日 → null（列表列用）
+  departDate?: string | null;
   items: OrderItem[];
   passengers: OrderPassenger[];
   agent: {
@@ -725,6 +729,11 @@ export interface ListOrdersParams {
   flightNumber?: string; // 订单含该航班号的 FLIGHT 行（不区分大小写）
   passengerName?: string; // 乘客姓名模糊匹配
   invoiceStatus?: InvoiceStatus;
+  /**
+   * 签证办理状态 — 与列表「签证」列徽标同源（VISA 行 VISA_APPLICATION 履约任务状态）。
+   * signed=已签证（任务已确认）；unsigned=未签证（含 VISA 行但任务未确认）。无 VISA 行订单两者都不命中。
+   */
+  visaFulfillmentStatus?: 'signed' | 'unsigned';
   page?: number;
   pageSize?: number;
 }
@@ -748,6 +757,10 @@ export interface OrdersTemplateExportParams {
   flightNumber?: string;
   passengerName?: string;
   invoiceStatus?: InvoiceStatus;
+  /** 签证办理状态（signed/unsigned）；与 listOrders 同款，用于「筛选后导出」。 */
+  visaFulfillmentStatus?: 'signed' | 'unsigned';
+  /** 勾选导出：给了就只导这批订单（后端以 id 集合为准，忽略其余筛选）。 */
+  orderIds?: string[];
 }
 
 export interface OrderPayment {
@@ -830,6 +843,14 @@ export interface VisaTaskPassenger {
   id: string;
   fullName: string;
   documentNumber: string;
+  /** 护照姓（LAST）；用于签证台按 姓/名 格式展示，缺失回退 fullName */
+  lastName?: string | null;
+  /** 护照名（FIRST） */
+  firstName?: string | null;
+  /** 中文名；护照拉丁名旁并列显示便于核对 */
+  chineseName?: string | null;
+  /** 性别 M/F/X；签证台展示性别徽标 */
+  gender?: string | null;
   /** 护照图 URL；null = 未上传 */
   passportPhotoUrl: string | null;
   /** passportPhotoUrl 非空 → true；缺照时签证台标红用 */
@@ -1674,7 +1695,13 @@ export const api = {
   ): Promise<Blob> => {
     const qs = new URLSearchParams();
     for (const [k, v] of Object.entries(params)) {
-      if (v !== undefined && v !== '') qs.set(k, String(v));
+      if (v === undefined || v === '') continue;
+      // orderIds 以逗号分隔透传（后端两种风格都收）；其余标量直接 set。
+      if (k === 'orderIds' && Array.isArray(v)) {
+        if (v.length > 0) qs.set('orderIds', v.join(','));
+        continue;
+      }
+      qs.set(k, String(v));
     }
     const res = await fetch(`${API_BASE}/orders/export-templates?${qs.toString()}`, {
       headers: { Authorization: `Bearer ${token}` },
@@ -1686,12 +1713,14 @@ export const api = {
   // GET /orders/export/master?from&to&role — 按出发日期区间选单；缺省 = 全部。返回 Blob 直接下载。
   exportMaster: async (
     token: string,
-    params?: { from?: string; to?: string; role?: 'all' | 'ticketing' | 'visa' },
+    params?: { from?: string; to?: string; role?: 'all' | 'ticketing' | 'visa'; orderIds?: string[] },
   ): Promise<Blob> => {
     const qs = new URLSearchParams();
     if (params?.from) qs.set('from', params.from);
     if (params?.to) qs.set('to', params.to);
     if (params?.role) qs.set('role', params.role);
+    // 勾选导出：给了就只导这批订单（逗号分隔透传，后端以 id 集合为准）。
+    if (params?.orderIds && params.orderIds.length > 0) qs.set('orderIds', params.orderIds.join(','));
     const suffix = qs.toString() ? `?${qs.toString()}` : '';
     const res = await fetch(`${API_BASE}/orders/export/master${suffix}`, {
       headers: { Authorization: `Bearer ${token}` },
@@ -2266,6 +2295,16 @@ export const api = {
       headers: { Authorization: `Bearer ${token}` },
     });
     if (!res.ok) throw new ApiError(res.status, { code: 'EXPORT_FAILED', message: await res.text() });
+    return res.blob();
+  },
+
+  // 签证资料整日打包（ADMIN/STAFF）：合并签证名单 xlsx + 全部护照图，按出发日一次导出
+  downloadVisaBundle: async (token: string, departDate: string): Promise<Blob> => {
+    const res = await fetch(
+      `${API_BASE}/orders/visa-bundle.zip?departDate=${encodeURIComponent(departDate)}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) throw new ApiError(res.status, { code: 'ZIP_FAILED', message: await res.text() });
     return res.blob();
   },
 

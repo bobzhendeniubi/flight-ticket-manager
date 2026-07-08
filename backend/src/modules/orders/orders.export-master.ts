@@ -39,6 +39,8 @@ export interface MasterExportQuery {
   to?: string;
   /** 岗位视图，默认 all（完整全岗表）*/
   role?: MasterExportRole;
+  /** 勾选导出：给了就只导这批订单（以 id 集合为准，忽略 from/to）。 */
+  orderIds?: string[];
 }
 
 /** 运营口径：所有「占座中」订单（与财务/整班/分房导出同口径，排除释放型状态）。*/
@@ -470,9 +472,11 @@ export async function buildMasterExportWorkbook(
 
   // 按出发日期区间选单：复用 buildOrderFilterWhere 的 travelFrom/travelTo 口径，
   // 再强制排除释放型状态。与整班/全岗导出选单方式一致。
+  // 勾选导出：orderIds 给了就以 id 集合为准（buildOrderFilterWhere 内部忽略 from/to）。
   const where = buildOrderFilterWhere({
     travelFrom: query.from,
     travelTo: query.to,
+    orderIds: query.orderIds,
   } as Parameters<typeof buildOrderFilterWhere>[0]);
   const and = Array.isArray(where.AND) ? where.AND : where.AND ? [where.AND] : [];
   and.push({ status: { in: COUNTED_STATUSES } });

@@ -17,6 +17,7 @@ import {
   exportRoomAllocationQuerySchema,
   exportTemplatesQuerySchema,
   listOrdersQuerySchema,
+  orderIdsQuerySchema,
   orderStructuredNotesShape,
   publicOrderLookupQuerySchema,
   rescheduleOrderBodySchema,
@@ -24,6 +25,7 @@ import {
   swapPassengerBodySchema,
   updateItemSettlementPriceBodySchema,
   updateStatusBodySchema,
+  visaBundleQuerySchema,
 } from './orders.schemas.js';
 import { prisma } from '../../db/prisma.js';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
@@ -42,6 +44,10 @@ import {
   roomAllocationExportFilename,
   roomAllocationExportFilenameByDepart,
 } from './orders.export-room-allocation.js';
+import {
+  buildVisaBundleZip,
+  visaBundleZipFilename,
+} from './orders.export-visa-bundle.js';
 import {
   buildMasterExportWorkbook,
   masterExportFilename,
@@ -486,6 +492,8 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
           from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, '日期格式应为 YYYY-MM-DD').optional(),
           to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, '日期格式应为 YYYY-MM-DD').optional(),
           role: z.enum(['all', 'ticketing', 'visa']).optional(),
+          // 勾选导出：给了就只导这批订单（以 id 集合为准，忽略 from/to）。
+          orderIds: orderIdsQuerySchema,
         })
         .parse(req.query);
       const buf = await buildMasterExportWorkbook(query);
@@ -495,8 +503,15 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         action: 'EXPORT_ORDER_MASTER',
         targetType: 'ORDER',
         targetId: 'master',
-        targetLabel: `全岗总表 ${query.from ?? '全部'} ~ ${query.to ?? query.from ?? '全部'}`,
-        after: { from: query.from ?? null, to: query.to ?? null, role: query.role ?? 'all' },
+        targetLabel: query.orderIds
+          ? `全岗总表 · 勾选 ${query.orderIds.length} 条`
+          : `全岗总表 ${query.from ?? '全部'} ~ ${query.to ?? query.from ?? '全部'}`,
+        after: {
+          from: query.from ?? null,
+          to: query.to ?? null,
+          role: query.role ?? 'all',
+          selectedCount: query.orderIds?.length ?? null,
+        },
       });
 
       return reply
@@ -561,6 +576,35 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
           `attachment; filename="${encodeURIComponent(filename)}"`,
         )
         .send(buf);
+    },
+  );
+
+  // ── 签证资料整日打包 zip（合并签证名单 xlsx + 全部护照图）──
+  // GET /orders/visa-bundle.zip?departDate=YYYY-MM-DD（ADMIN/STAFF only）
+  // 按出发日选订单（与分房表 departDate 同口径）；一次导出该日全部订单的签证资料。
+  app.get(
+    '/visa-bundle.zip',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    async (req, reply) => {
+      const query = visaBundleQuerySchema.parse(req.query);
+      const zipBuf = await buildVisaBundleZip({ departDate: query.departDate });
+
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'DOWNLOAD_VISA_BUNDLE',
+        targetType: 'ORDER',
+        targetId: 'visa-bundle',
+        targetLabel: `签证资料 出发日 ${query.departDate}`,
+        after: { departDate: query.departDate },
+      });
+
+      return reply
+        .header('Content-Type', 'application/zip')
+        .header(
+          'Content-Disposition',
+          `attachment; filename="${encodeURIComponent(visaBundleZipFilename(query.departDate))}"`,
+        )
+        .send(zipBuf);
     },
   );
 

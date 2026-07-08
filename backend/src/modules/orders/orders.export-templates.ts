@@ -508,7 +508,7 @@ export function orderToTicketingRows(order: OrderForTemplateExport, ctx: OrderCo
 }
 
 // ── 模板三：《签证专用》20 列（含越文表头）───────────────────────────────
-interface VisaRow {
+export interface VisaRow {
   stt: number;
   agency: string;
   notes: string;
@@ -531,7 +531,7 @@ interface VisaRow {
   departDate: string;
 }
 
-const VISA_COLUMNS: Array<{ header: string; key: keyof VisaRow; width: number }> = [
+export const VISA_COLUMNS: Array<{ header: string; key: keyof VisaRow; width: number }> = [
   { header: 'STT', key: 'stt', width: 6 },
   { header: '代理机构', key: 'agency', width: 16 },
   { header: '备注信息', key: 'notes', width: 20 },
@@ -543,7 +543,7 @@ const VISA_COLUMNS: Array<{ header: string; key: keyof VisaRow; width: number }>
   { header: '中文姓名', key: 'chineseName', width: 12 },
   { header: 'Họ và tên (*)\n姓名', key: 'name', width: 20 },
   { header: 'Ngày, tháng, năm sinh (*)\n出生日期', key: 'dateOfBirth', width: 16 },
-  { header: 'Giới tính (*)', key: 'gender', width: 8 },
+  { header: 'Giới tính (*)\n性别', key: 'gender', width: 8 },
   { header: 'Quốc tịch hiện nay (*)', key: 'nationalityNow', width: 12 },
   { header: 'Quốc tịch gốc', key: 'nationalityOrigin', width: 12 },
   { header: 'Nghề nghiệp (*)\n职业', key: 'occupation', width: 12 },
@@ -554,7 +554,7 @@ const VISA_COLUMNS: Array<{ header: string; key: keyof VisaRow; width: number }>
   { header: '出发日期', key: 'departDate', width: 24 },
 ];
 
-function orderToVisaRows(order: OrderForTemplateExport, ctx: OrderContext): Omit<VisaRow, 'stt'>[] {
+export function orderToVisaRows(order: OrderForTemplateExport, ctx: OrderContext): Omit<VisaRow, 'stt'>[] {
   return order.passengers.map<Omit<VisaRow, 'stt'>>((p) => ({
     agency: ctx.agency,
     notes: ctx.notes,

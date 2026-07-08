@@ -1119,8 +1119,14 @@ export class OrderService {
       prisma.order.findMany({
         where,
         include: {
-          // 带上 fulfillment 任务(类型+状态)，前端据此派生「签证状态」列
-          items: { include: { fulfillmentTasks: { select: { type: true, status: true } } } },
+          // 带上 fulfillment 任务(类型+状态)，前端据此派生「签证状态」列；
+          // 再联查班次出发时间（轻量 select），用于派生订单级「出发日期」列（deriveOrderDepartDate）。
+          items: {
+            include: {
+              fulfillmentTasks: { select: { type: true, status: true } },
+              flightSchedule: { select: { departureTime: true } },
+            },
+          },
           passengers: { select: { id: true, fullName: true } },
           agent: { select: { id: true, companyName: true, contactName: true, settlementMode: true, prepaymentBalance: true } },
           user: { select: { id: true, displayName: true, email: true } },
@@ -3245,9 +3251,15 @@ export type OrderListFilters = Pick<
   | 'flightNumber'
   | 'passengerName'
   | 'invoiceStatus'
+  | 'visaFulfillmentStatus'
 > & {
   /** 精确按班次过滤（整班·全岗导出用）；比 travelFrom/travelTo 更准，不受 ±1 天放宽影响。 */
   scheduleId?: string;
+  /**
+   * 勾选导出：给了非空数组就「只导这批订单」——以 id 集合为准，忽略其余筛选条件
+   *（COUNTED_STATUSES 保护仍由各导出入口叠加）。仅导出路径设置，listOrders 不用。
+   */
+  orderIds?: string[];
 };
 
 /**
@@ -3256,6 +3268,11 @@ export type OrderListFilters = Pick<
  * 注意：不含 RBAC（userId/可见代理集合）、claimedById/unclaimedOnly、分页 —— 由调用方叠加。
  */
 export function buildOrderFilterWhere(query: OrderListFilters): Prisma.OrderWhereInput {
+  // 勾选导出：给了 orderIds 就以「勾选的 id 集合」为准，忽略其余筛选条件
+  //（导出=用户勾了哪些就导哪些；不计数状态的 COUNTED_STATUSES 保护由各导出入口叠加）。
+  if (query.orderIds && query.orderIds.length > 0) {
+    return { id: { in: query.orderIds } };
+  }
   const where: Prisma.OrderWhereInput = {};
   // 多个 items 维度的筛选必须用 AND 叠加（每个 { items: { some } } 各自独立成立），
   // 否则直接赋值 where.items 会互相覆盖 —— 历史上 kind 与 travelFrom/travelTo 同时传时
@@ -3312,6 +3329,31 @@ export function buildOrderFilterWhere(query: OrderListFilters): Prisma.OrderWher
     andClauses.push({ items: { some: { flightScheduleId: query.scheduleId } } });
   }
   if (query.invoiceStatus) where.invoiceStatus = query.invoiceStatus;
+  // 签证办理状态筛选 — 与列表「签证」列徽标同源（VISA 行的 VISA_APPLICATION 履约任务状态）。
+  //   signed  ：订单含 VISA 行且其签证办理任务「已确认(CONFIRMED)」= 已签证。
+  //   unsigned：订单含 VISA 行、但无任何「已确认」的签证办理任务（待处理/处理中/取消/失败或无任务）= 未签证。
+  // 无 VISA 行的订单两者都不命中（列表徽标显示「—」），刻意保持一致、不制造第三口径。
+  // 走 andClauses 叠加，可与 kind / 出行日期 / 航班号等 items 维度组合而不互相覆盖。
+  const VISA_APPLICATION_CONFIRMED: Prisma.OrderWhereInput = {
+    items: {
+      some: {
+        kind: OrderItemKind.VISA,
+        fulfillmentTasks: {
+          some: { type: FulfillmentType.VISA_APPLICATION, status: FulfillmentStatus.CONFIRMED },
+        },
+      },
+    },
+  };
+  if (query.visaFulfillmentStatus === 'signed') {
+    andClauses.push(VISA_APPLICATION_CONFIRMED);
+  } else if (query.visaFulfillmentStatus === 'unsigned') {
+    andClauses.push({
+      AND: [
+        { items: { some: { kind: OrderItemKind.VISA } } },
+        { NOT: VISA_APPLICATION_CONFIRMED },
+      ],
+    });
+  }
   // 航班号筛选 — 订单需含该航班号的 FLIGHT 行（同样走 AND 叠加，可与 kind/出行日期组合）
   if (query.flightNumber) {
     andClauses.push({
@@ -3984,6 +4026,36 @@ function formatDateOnly(d: Date): string {
   return d.toISOString().slice(0, 10);
 }
 
+/**
+ * 订单「出发日期」派生（列表列展示用；YYYY-MM-DD 或 null）。
+ * 口径：本单 FLIGHT 行里最早班次的当地出发日；无航班的纯地面单回退到最早的酒店入住日；
+ * 两者都没有 → null（前端显示「—」）。
+ * 依赖已联查的行数据，不另发查询；未联查 flightSchedule（如扁平 items:true）时航班部分
+ * 安全落空，仅按酒店入住日回退。
+ */
+function deriveOrderDepartDate(items: ReadonlyArray<Record<string, unknown>>): string | null {
+  let earliestFlight: Date | null = null;
+  let earliestHotel: Date | null = null;
+  for (const i of items) {
+    const schedule = i.flightSchedule as { departureTime?: Date | string } | null | undefined;
+    if (schedule?.departureTime) {
+      const d = new Date(schedule.departureTime);
+      if (!Number.isNaN(d.getTime()) && (earliestFlight === null || d < earliestFlight)) {
+        earliestFlight = d;
+      }
+    }
+    const checkIn = i.hotelCheckIn as Date | string | null | undefined;
+    if (checkIn) {
+      const d = new Date(checkIn);
+      if (!Number.isNaN(d.getTime()) && (earliestHotel === null || d < earliestHotel)) {
+        earliestHotel = d;
+      }
+    }
+  }
+  const picked = earliestFlight ?? earliestHotel;
+  return picked ? formatDateOnly(picked) : null;
+}
+
 /** Prisma.Decimal | null | undefined → number | null（JSON 序列化前统一转换，未联查/未盖章时安全落 null）。 */
 function decimalOrNull(d: Prisma.Decimal | null | undefined): number | null {
   return d == null ? null : Number(d);
@@ -4238,6 +4310,8 @@ function serializeOrder<T extends OrderLike>(
     adjustmentCny,
     effectivePayable: effectivePayable.toString(),
     balanceDue: balanceDue.toString(),
+    // 订单「出发日期」（列表列用；FLIGHT 最早班次当地出发日 → 回退最早酒店入住日 → null）
+    departDate: deriveOrderDepartDate(order.items),
     // 出行人数（按 Passenger.passengerType 统计；套餐行程单「人数：成人 X · 儿童 X · 婴儿 X」用）
     adultCount,
     childCount,
