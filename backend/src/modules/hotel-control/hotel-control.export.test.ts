@@ -110,6 +110,76 @@ describe('buildHotelControlBoardWorkbook', () => {
     const ws = wb.getWorksheet('销控矩阵');
     expect(ws).toBeTruthy();
     expect(String(ws!.getRow(2).getCell(1).value)).toContain('无');
+    // 无酒店数据时不追加汇总/图例（没有可汇总/可解释的矩阵）
+    expect(ws!.rowCount).toBe(2);
+  });
+
+  it('多酒店：交替底色 banding + 汇总 3 行 + 图例', async () => {
+    // 单日矩阵，两家酒店，zh-CN 排序 海景酒店(索引0,无底色) 排在 山景酒店(索引1,浅灰底) 前面
+    const client = boardClient(
+      [
+        // 海景酒店：block=3 用房=1 → 余量=2（正常，无高亮）
+        {
+          hotelCheckIn: day(0),
+          hotelCheckOut: day(1),
+          roomsBilled: 1,
+          hotelRoomType: { hotelId: 'hA', hotel: { name: '海景酒店' } },
+        },
+        // 山景酒店：无周期（block=0）但用房=2 → 「未配包房」
+        {
+          hotelCheckIn: day(0),
+          hotelCheckOut: day(1),
+          roomsBilled: 1,
+          hotelRoomType: { hotelId: 'hB', hotel: { name: '山景酒店' } },
+        },
+        {
+          hotelCheckIn: day(0),
+          hotelCheckOut: day(1),
+          roomsBilled: 1,
+          hotelRoomType: { hotelId: 'hB', hotel: { name: '山景酒店' } },
+        },
+      ],
+      [{ hotelId: 'hA', dateFrom: day(0), dateTo: day(0), rooms: 3, unitPrice: 100, hotel: { name: '海景酒店' } }],
+    );
+
+    const buf = await buildHotelControlBoardWorkbook({ from: dayStr(0), to: dayStr(0) }, client);
+    const wb = await loadWorkbook(buf);
+    const ws = wb.getWorksheet('销控矩阵')!;
+
+    // 海景酒店（第一家，索引0）：4 行在 2-5，无 banding（默认留白）
+    expect(ws.getRow(2).getCell(3).value).toBe('包房');
+    expect(ws.getRow(2).getCell(4).fill).toBeUndefined();
+    expect(ws.getCell(2, 1).value).toBe('海景酒店');
+
+    // 山景酒店（第二家，索引1）：4 行在 6-9，非高亮单元格带浅灰 banding
+    expect(ws.getRow(6).getCell(3).value).toBe('包房');
+    expect(ws.getRow(6).getCell(4).fill).toMatchObject({ fgColor: { argb: 'FFF3F4F6' } });
+    // 酒店名合并单元格（列1，行6=startRow）同样带 banding
+    expect(ws.getCell(6, 1).fill).toMatchObject({ fgColor: { argb: 'FFF3F4F6' } });
+    // 山景酒店余量行（第 9 行）：未配包房高亮覆盖在 banding 之上
+    expect(ws.getRow(9).getCell(4).value).toBe('未配包房');
+    expect(ws.getRow(9).getCell(4).fill).toMatchObject({ fgColor: { argb: 'FFFDE68A' } });
+
+    // 3 行跨酒店汇总紧跟在最后一家酒店之后（第 10-12 行）
+    expect(ws.getRow(10).getCell(3).value).toBe('当日包房累计');
+    expect(ws.getRow(10).getCell(4).value).toBe(3); // 海景 block=3 + 山景 block=0
+    expect(ws.getRow(10).font).toMatchObject({ bold: true });
+
+    expect(ws.getRow(11).getCell(3).value).toBe('当日用房累计');
+    // 人工核对：海景 used=1 + 山景 used=2 = 3（与两家酒店「用房(床位)」行手工相加一致）
+    expect(ws.getRow(11).getCell(4).value).toBe(3);
+
+    expect(ws.getRow(12).getCell(3).value).toBe('当日余房累计');
+    // 海景 remaining=2（正常）+ 山景「未配包房」按 0 计入（不计其误导性 -2）= 2
+    expect(ws.getRow(12).getCell(4).value).toBe(2);
+
+    // 图例：标题 + 未配包房说明 + 超卖说明 + 余房累计口径说明
+    expect(ws.getRow(14).getCell(1).value).toBe('图例');
+    expect(String(ws.getRow(15).getCell(2).value)).toContain('未配包房 = 该晚有客占房');
+    expect(ws.getRow(15).getCell(1).fill).toMatchObject({ fgColor: { argb: 'FFFDE68A' } });
+    expect(String(ws.getRow(16).getCell(2).value)).toContain('超卖 = 该晚包房周期已设置');
+    expect(String(ws.getRow(17).getCell(2).value)).toContain('当日余房累计');
+    expect(String(ws.getRow(17).getCell(2).value)).toContain('按 0 计入');
   });
 });
 

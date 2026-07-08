@@ -497,7 +497,7 @@ function BundleDetailContent({
 
   // 可选升级现作为前台 add-on 即选即享（下方配置器内选购），不再走客服线下办理。
 
-  const rating = b.productRating;
+  const rating = b.rating;
   const soldCount = b.soldCount ?? 0;
   const showScarcity = !soldOut && soldCount >= SOLD_RECENTLY_THRESHOLD;
 

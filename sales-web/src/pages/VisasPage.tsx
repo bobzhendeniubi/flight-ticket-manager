@@ -15,7 +15,7 @@ import { Seo } from '../components/Seo';
 
 /** 列表用签证：MockVisa + 评分/销量（用于 StarRating、热度排序）。 */
 type ListVisa = MockVisa & {
-  productRating?: ProductRating;
+  rating?: ProductRating;
   soldCount?: number;
 };
 
@@ -27,7 +27,7 @@ function visaApiToMock(v: Visa): ListVisa {
     expressSurcharge: v.expressSurcharge ? Number(v.expressSurcharge) : 0,
     requiredDocs: v.requiredDocs, validityMonths: v.validityMonths ?? 1,
     highlight: v.highlight ?? undefined,
-    productRating: v.productRating,
+    rating: v.rating,
     soldCount: v.soldCount,
   };
 }
@@ -55,7 +55,7 @@ function sortVisas(list: ListVisa[], sort: SortKey): ListVisa[] {
     case 'price':
       return copy.sort((a, b) => a.basePrice - b.basePrice);
     case 'rating':
-      return copy.sort((a, b) => (b.productRating?.average ?? 0) - (a.productRating?.average ?? 0));
+      return copy.sort((a, b) => (b.rating?.average ?? 0) - (a.rating?.average ?? 0));
     case 'popular':
       return copy.sort((a, b) => (b.soldCount ?? 0) - (a.soldCount ?? 0));
     default:
@@ -170,7 +170,7 @@ export function VisasPage() {
       {status === 'ready' && filtered.length > 0 && (
         <section className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
           {filtered.map((v) => {
-            const rating = v.productRating;
+            const rating = v.rating;
             return (
               <article key={v.id} className="card-interactive group flex flex-col overflow-hidden p-0">
                 <Link

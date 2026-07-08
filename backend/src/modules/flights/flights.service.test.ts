@@ -57,6 +57,7 @@ import {
   capPublicAvailable,
   computeAvailabilityTier,
   FlightService,
+  sanitizePublicSeatBreakdown,
 } from './flights.service.js';
 
 describe('computeAvailabilityTier · 缺省 capacity（向后兼容旧版绝对阈值）', () => {
@@ -167,6 +168,55 @@ describe('capPublicAvailable · 公开口径余位封顶', () => {
   it('封顶不影响档位：档位仍按真实余量（相对真实 capacity）计算', () => {
     expect(computeAvailabilityTier(178, 200)).toBe('AMPLE');
     expect(capPublicAvailable(178)).toBe(9);
+  });
+});
+
+// ── sanitizePublicSeatBreakdown（公开 /flights/price 的 seatIndex 脱敏：防反推 sold）──────
+// 回归用例：真实 sold=1 时，未脱敏的匿名 /flights/price?qty=1 会返回 seatIndex=2（=sold+1），
+// 泄露 sold=1；脱敏后必须变成相对索引 1，不再能反推历史销量。
+describe('sanitizePublicSeatBreakdown · 公开口径 seatIndex 脱敏（防反推 sold）', () => {
+  it('回归：sold=1 的单张查询，脱敏前 seatIndex=2（=sold+1）会暴露 sold，脱敏后必须是相对值 1', () => {
+    const sold = 1;
+    const raw = [{ seatIndex: sold + 1, bucket: 0, bucketMultiplier: 1, unitPrice: 1000 }];
+    expect(raw[0].seatIndex).toBe(2); // 脱敏前：能直接反推 sold = seatIndex - 1 = 1
+    const sanitized = sanitizePublicSeatBreakdown(raw);
+    expect(sanitized[0].seatIndex).toBe(1); // 脱敏后：相对索引，不含 sold 信息
+  });
+
+  it('qty=N 时重编号为连续的 1..N（不管原始绝对张数 sold+1..sold+N 是多少）', () => {
+    const sold = 187; // 任意较大的历史销量
+    const raw = Array.from({ length: 5 }, (_, i) => ({
+      seatIndex: sold + 1 + i,
+      bucket: 0,
+      bucketMultiplier: 1,
+      unitPrice: 1000,
+    }));
+    const sanitized = sanitizePublicSeatBreakdown(raw);
+    expect(sanitized.map((s) => s.seatIndex)).toEqual([1, 2, 3, 4, 5]);
+  });
+
+  it('不改变价格/档位字段，只重编号 seatIndex（价格展示不受影响）', () => {
+    const raw = [
+      { seatIndex: 51, bucket: 2, bucketMultiplier: 1, unitPrice: 1500 },
+      { seatIndex: 52, bucket: 3, bucketMultiplier: 1, unitPrice: 1800 },
+    ];
+    const sanitized = sanitizePublicSeatBreakdown(raw);
+    expect(sanitized).toEqual([
+      { seatIndex: 1, bucket: 2, bucketMultiplier: 1, unitPrice: 1500 },
+      { seatIndex: 2, bucket: 3, bucketMultiplier: 1, unitPrice: 1800 },
+    ]);
+  });
+
+  it('空数组（qty 校验层已挡下 <1，但函数本身也不应崩）→ 返回空数组', () => {
+    expect(sanitizePublicSeatBreakdown([])).toEqual([]);
+  });
+
+  it('不修改输入数组（不可变）', () => {
+    const raw = [{ seatIndex: 42, bucket: 0, bucketMultiplier: 1, unitPrice: 1000 }];
+    const sanitized = sanitizePublicSeatBreakdown(raw);
+    expect(raw[0].seatIndex).toBe(42); // 原数组未被就地修改
+    expect(sanitized).not.toBe(raw);
+    expect(sanitized[0]).not.toBe(raw[0]);
   });
 });
 

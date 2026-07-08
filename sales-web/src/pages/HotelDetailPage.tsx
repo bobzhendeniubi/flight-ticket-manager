@@ -217,7 +217,7 @@ export default function HotelDetailPage() {
     return combined.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
   }, [hotel, realReviews]);
 
-  // 评分聚合：优先后端 productRating；否则用合并后的评价口径
+  // 评分聚合：优先后端 rating（{average,count} 真实聚合）；否则用合并后的评价口径
   const ratingSummary = useMemo(() => {
     const dist: Record<'5' | '4' | '3' | '2' | '1', number> = { '5': 0, '4': 0, '3': 0, '2': 0, '1': 0 };
     for (const r of allReviews) {
@@ -227,7 +227,7 @@ export default function HotelDetailPage() {
     const count = allReviews.length;
     const sum = allReviews.reduce((s, r) => s + r.rating, 0);
     const computedAvg = count > 0 ? sum / count : 0;
-    const pr = hotel?.productRating;
+    const pr = hotel?.rating;
     return {
       average: pr && pr.count > 0 ? pr.average : computedAvg,
       count: pr && pr.count > 0 ? Math.max(pr.count, count) : count,

@@ -15,7 +15,7 @@ import { Seo } from '../components/Seo';
 
 /** 列表用车型：MockTransfer + 评分/销量（用于 StarRating、热度排序）。 */
 type ListTransfer = MockTransfer & {
-  productRating?: ProductRating;
+  rating?: ProductRating;
   soldCount?: number;
 };
 
@@ -25,7 +25,7 @@ function transferApiToMock(t: ApiTransfer): ListTransfer {
     basePrice: Number(t.basePrice), originArea: t.originArea, destArea: t.destArea,
     emoji: t.emoji ?? '🚗', photo: t.photo ?? '',
     features: t.features, duration: t.duration ?? '',
-    productRating: t.productRating,
+    rating: t.rating,
     soldCount: t.soldCount,
   };
 }
@@ -59,7 +59,7 @@ function sortTransfers(list: ListTransfer[], sort: SortKey): ListTransfer[] {
     case 'price':
       return copy.sort((a, b) => a.basePrice - b.basePrice);
     case 'rating':
-      return copy.sort((a, b) => (b.productRating?.average ?? 0) - (a.productRating?.average ?? 0));
+      return copy.sort((a, b) => (b.rating?.average ?? 0) - (a.rating?.average ?? 0));
     case 'popular':
       return copy.sort((a, b) => (b.soldCount ?? 0) - (a.soldCount ?? 0));
     default:
@@ -196,7 +196,7 @@ export function TransfersPage() {
         {status === 'ready' && filtered.length > 0 && (
           <div className="space-y-3">
             {filtered.map((t) => {
-              const rating = t.productRating;
+              const rating = t.rating;
               return (
                 <article key={t.id} className="card-interactive group flex flex-col gap-4 p-4 sm:flex-row sm:items-center sm:gap-6">
                   <Link

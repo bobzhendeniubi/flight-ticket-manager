@@ -86,6 +86,21 @@ export function capPublicAvailable(available: number): number {
 }
 
 /**
+ * 公开端点 /flights/price 的 perSeatBreakdown 脱敏。
+ * seatIndex 原值 = sold + 1 + i（该班次这个舱位历史上第几张票，绝对张数）——匿名端拿到后
+ * 可直接反推 sold（如 qty=1 时 sold = seatIndex − 1），是与 capPublicAvailable 同一类侧信道
+ * 泄露（都能重建实时销量），只是走的是 perSeatBreakdown 而非 currentBucketRemaining。
+ * 改成相对索引 1..qty（本次请求内第几张，不含历史销量信息）；bucket/unitPrice 等计价字段不变，
+ * 价格展示不受影响。仅供公开路由调用——需要真实 seatIndex 的内部调用方（如下单时写入订单行
+ * metadata 存证）直接用 PricingService.calculatePrice 的原始结果，不经过这层脱敏。
+ */
+export function sanitizePublicSeatBreakdown<T extends { seatIndex: number }>(
+  breakdown: readonly T[],
+): T[] {
+  return breakdown.map((seat, i) => ({ ...seat, seatIndex: i + 1 }));
+}
+
+/**
  * 把锁位感知的可售余量（available）相对舱位容量（capacity）折算成档位。
  * capacity 缺省 = LEGACY_REFERENCE_CAPACITY（100）——未传时数值上完全复现旧版
  * 绝对阈值（5/15/40），供尚未改造的历史调用方（不在本次改动范围内）零行为变更接入。

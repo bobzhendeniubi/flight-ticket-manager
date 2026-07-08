@@ -523,10 +523,10 @@ export interface CreateOrderInput {
 /**
  * 产品评分聚合（后端 list/detail 现在按 item 一并返回）。
  *
- * 注意命名：历史上 Hotel 已有 `rating: string`（单值字符串）与 `reviewCount`，
- * 为了不破坏既有页面对这两个字段的消费，结构化的评分聚合统一放在
- * `productRating`（不与旧 `rating` 冲突）。Phase-3 详情页消费评分聚合时
- * 读 `productRating`（{average,count}），需要展示销量读 `soldCount`。
+ * 注意命名：后端已将结构化评分聚合直接放在 `rating` 字段上（{average,count}，
+ * 来自真实 Review 聚合）；历史上 Hotel 的单值字符串评分改名为 `ratingLegacy`
+ * 让位给这个新形状。**不存在** `productRating` 字段——消费方一律读 `rating`。
+ * 需要展示销量读 `soldCount`。
  * 全部 optional，老缓存/未配置时为 undefined，前端按"不展示"处理。
  */
 export interface ProductRating {
@@ -553,7 +553,10 @@ export interface Hotel {
   address: string;
   starRating: number;
   basePrice: string | null;
-  rating: string | null;
+  /** 评分聚合（结构化，来自真实 Review 聚合）；count 为 0 表示暂无评价——不展示假分数 */
+  rating?: ProductRating;
+  /** @deprecated 旧的单值字符串评分（改名让位给结构化 `rating`），不再消费 */
+  ratingLegacy?: string | null;
   reviewCount: number | null;
   emoji: string | null;
   highlight: string | null;
@@ -562,8 +565,6 @@ export interface Hotel {
   isActive: boolean;
   roomTypes: HotelRoomType[];
   createdAt: string;
-  /** 评分聚合（结构化；旧 `rating: string` 仍保留兼容，新代码读这里） */
-  productRating?: ProductRating;
   /** 累计销量（null/缺省 = 不展示） */
   soldCount?: number;
 }
@@ -581,7 +582,7 @@ export interface Transfer {
   emoji: string | null;
   photo: string | null;
   isActive: boolean;
-  productRating?: ProductRating;
+  rating?: ProductRating;
   reviewCount?: number;
   soldCount?: number;
 }
@@ -601,7 +602,7 @@ export interface Visa {
   highlight: string | null;
   requiredDocs: string[];
   isActive: boolean;
-  productRating?: ProductRating;
+  rating?: ProductRating;
   reviewCount?: number;
   soldCount?: number;
 }
@@ -685,7 +686,7 @@ export interface Bundle {
    */
   defaultDepartDate?: string | null;
   /** 评分聚合 + 销量（后端 list/detail 现按 item 返回；全 optional 不破坏老页面） */
-  productRating?: ProductRating;
+  rating?: ProductRating;
   reviewCount?: number;
   soldCount?: number;
 }

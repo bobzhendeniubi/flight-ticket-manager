@@ -1,7 +1,7 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { UserRole } from '@prisma/client';
-import { FlightService, capPublicAvailable } from './flights.service.js';
+import { FlightService, capPublicAvailable, sanitizePublicSeatBreakdown } from './flights.service.js';
 import { PricingService } from '../pricing/pricing.service.js';
 import { actorFromRequest } from '../../lib/audit.js';
 import { priceQuerySchema } from '../pricing/pricing.schemas.js';
@@ -30,10 +30,17 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
   app.get('/price', async (req) => {
     const q = priceQuerySchema.parse(req.query);
     const pricing = await pricingService.calculatePrice(q.scheduleId, q.cabin, q.qty);
-    // 公开端点余位封顶：currentBucketRemaining 是精确档内剩余（内部计价要真值），
-    // 对匿名端 ≤9 封顶输出，防止轮询重建实时销量；价格/档位字段不受影响。
+    // 公开端点双重脱敏（同一类"重建实时销量"侧信道）：
+    // 1) currentBucketRemaining 是精确档内剩余（内部计价要真值），对匿名端 ≤9 封顶输出；
+    // 2) perSeatBreakdown[].seatIndex 原值 = sold+1+i（绝对张数），匿名端能直接反推 sold
+    //    （如 qty=1 时 sold = seatIndex-1），改成相对索引 1..qty。
+    // 价格/档位字段均不受影响；这条路由本身就只对外公开，没有带权变体需要保留真实 seatIndex。
     return {
-      pricing: { ...pricing, currentBucketRemaining: capPublicAvailable(pricing.currentBucketRemaining) },
+      pricing: {
+        ...pricing,
+        currentBucketRemaining: capPublicAvailable(pricing.currentBucketRemaining),
+        perSeatBreakdown: sanitizePublicSeatBreakdown(pricing.perSeatBreakdown),
+      },
     };
   });
 

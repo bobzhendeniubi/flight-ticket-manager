@@ -266,6 +266,113 @@ describe('OrderService.swapItemHotel · 真 DB E2E', () => {
     expect(log[0].amountCny).toBe(-80);
   });
 
+  // ── Bug 3：减价没有相对订单价值的下限，能把 effectivePayable 冲成任意负数 ─────────────
+  it('减价超过当前应付 → 400 拒绝，订单/订单行完全不被改动（Bug 3 修复）', async () => {
+    const actor = await adminActor();
+    const src = await createHotelWithRoomType();
+    const dest = await createHotelWithRoomType();
+    // amount = 600 × 2 晚 × 1 间 = 1200；adjustmentCny 起始 0 → effectivePayable = 1200。
+    const order = await createHotelOrder({
+      roomTypeId: src.roomType.id,
+      hotelName: src.hotel.name,
+      roomTypeName: src.roomType.name,
+      checkIn: '2026-08-01',
+      checkOut: '2026-08-03',
+      nights: 2,
+      unitPrice: 600,
+    });
+
+    await expect(
+      service.swapItemHotel(
+        order.id,
+        order.items[0].id,
+        { newHotelRoomTypeId: dest.roomType.id, feeCny: -1201 }, // 1200 - 1201 = -1，越界
+        actor,
+      ),
+    ).rejects.toThrow(/减价金额不能超过当前应付/);
+
+    const reloaded = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(reloaded.adjustmentCny).toBe(0); // 未被改动
+    expect(reloaded.adjustments).toEqual([]);
+    const item = await prisma.orderItem.findUniqueOrThrow({ where: { id: order.items[0].id } });
+    expect(item.hotelRoomTypeId).toBe(src.roomType.id); // 房型也没被换——拒单必须整体不生效
+  });
+
+  it('减价刚好把应付冲到 0（边界值）→ 放行，不多不少', async () => {
+    const actor = await adminActor();
+    const src = await createHotelWithRoomType();
+    const dest = await createHotelWithRoomType();
+    const order = await createHotelOrder({
+      roomTypeId: src.roomType.id,
+      hotelName: src.hotel.name,
+      roomTypeName: src.roomType.name,
+      checkIn: '2026-08-01',
+      checkOut: '2026-08-03',
+      nights: 2,
+      unitPrice: 600, // amount = 1200
+    });
+
+    await service.swapItemHotel(
+      order.id,
+      order.items[0].id,
+      { newHotelRoomTypeId: dest.roomType.id, feeCny: -1200 },
+      actor,
+    );
+
+    const reloaded = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(reloaded.adjustmentCny).toBe(-1200); // 应付冲到 0，允许（不是负数）
+    const item = await prisma.orderItem.findUniqueOrThrow({ where: { id: order.items[0].id } });
+    expect(item.hotelRoomTypeId).toBe(dest.roomType.id); // 放行时房型正常换成功
+  });
+
+  it('减价按已有 adjustmentCny 累计应付判断——第二次减价把叠加后的应付冲负 → 拒绝，第一次的结果保留', async () => {
+    const actor = await adminActor();
+    const src = await createHotelWithRoomType();
+    const mid = await createHotelWithRoomType();
+    const dest = await createHotelWithRoomType();
+    const order = await createHotelOrder({
+      roomTypeId: src.roomType.id,
+      hotelName: src.hotel.name,
+      roomTypeName: src.roomType.name,
+      checkIn: '2026-08-01',
+      checkOut: '2026-08-03',
+      nights: 2,
+      unitPrice: 600, // amount = 1200
+    });
+
+    // 第一次：减 700（合法，剩余应付 500）
+    await service.swapItemHotel(order.id, order.items[0].id, { newHotelRoomTypeId: mid.roomType.id, feeCny: -700 }, actor);
+    // 第二次：再减 600（应付只剩 500，减 600 会冲到 -100）→ 拒绝
+    await expect(
+      service.swapItemHotel(order.id, order.items[0].id, { newHotelRoomTypeId: dest.roomType.id, feeCny: -600 }, actor),
+    ).rejects.toThrow(/减价金额不能超过当前应付/);
+
+    const reloaded = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(reloaded.adjustmentCny).toBe(-700); // 停在第一次的结果，第二次没生效
+    const item = await prisma.orderItem.findUniqueOrThrow({ where: { id: order.items[0].id } });
+    expect(item.hotelRoomTypeId).toBe(mid.roomType.id); // 第二次没换成功
+  });
+
+  it('加价（正 feeCny）不受应付下限约束——照常放行', async () => {
+    const actor = await adminActor();
+    const src = await createHotelWithRoomType();
+    const dest = await createHotelWithRoomType();
+    const order = await createHotelOrder({
+      roomTypeId: src.roomType.id,
+      hotelName: src.hotel.name,
+      roomTypeName: src.roomType.name,
+      checkIn: '2026-08-01',
+      checkOut: '2026-08-03',
+      nights: 2,
+      unitPrice: 600,
+    });
+
+    await service.swapItemHotel(order.id, order.items[0].id, { newHotelRoomTypeId: dest.roomType.id, feeCny: 5000 }, actor);
+
+    const reloaded = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(reloaded.adjustmentCny).toBe(5000);
+  });
+
   it('目标酒店余房不足 → 拒单并在错误信息里列出不足的夜晚；订单行不被改动', async () => {
     const actor = await adminActor();
     const src = await createHotelWithRoomType();
@@ -384,7 +491,7 @@ describe('OrderService.swapItemHotel · 真 DB E2E', () => {
     expect(result.audit.untrackedNights).toEqual([]); // 同酒店跳过校验，未产生 untracked 标记
   });
 
-  it('Order.roomAssignment.roomGroups 里匹配旧酒店名的组被改名，不匹配的组保持原样', async () => {
+  it('Order.roomAssignment.roomGroups 里匹配旧酒店名+旧房型的组被改名+改房型，不匹配的组保持原样', async () => {
     const actor = await adminActor();
     const src = await createHotelWithRoomType();
     const dest = await createHotelWithRoomType();
@@ -406,10 +513,110 @@ describe('OrderService.swapItemHotel · 真 DB E2E', () => {
     await service.swapItemHotel(order.id, order.items[0].id, { newHotelRoomTypeId: dest.roomType.id }, actor);
 
     const reloaded = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
-    const groups = (reloaded.roomAssignment as { roomGroups: Array<{ id: string; hotelName: string }> })
-      .roomGroups;
+    const groups = (
+      reloaded.roomAssignment as { roomGroups: Array<{ id: string; hotelName: string; roomType: string }> }
+    ).roomGroups;
     expect(groups.find((g) => g.id === 'g1')?.hotelName).toBe(dest.hotel.name);
+    // Bug 4 修复：roomType 也要同步改写为新房型名（旧版只改 hotelName，留下一个目标酒店根本
+    // 不存在的旧房型名，分房表货不对板）。
+    expect(groups.find((g) => g.id === 'g1')?.roomType).toBe(dest.roomType.name);
     expect(groups.find((g) => g.id === 'g2')?.hotelName).toBe('别的手填酒店名'); // 不匹配，保持原样
+    expect(groups.find((g) => g.id === 'g2')?.roomType).toBe('别的房型');
+  });
+
+  it('Bug 4 修复：一个订单里 2 条 HOTEL 行同住一家酒店（不同房型）——只换其中一行时，只有那一行对应的分房组被改名+改房型，另一行的组完全不受影响（旧版会用纯 hotelName 匹配把两组都误伤改名）', async () => {
+    const actor = await adminActor();
+    const sharedHotel = await prisma.hotel.create({
+      data: { name: uniq('SharedHotel'), cityCode: 'DAD', address: 'Test address', starRating: 4, isActive: true },
+    });
+    const roomTypeA = await prisma.hotelRoomType.create({
+      data: {
+        hotelId: sharedHotel.id,
+        name: uniq('Standard'),
+        capacity: 2,
+        maxAdults: 2,
+        maxChildren: 1,
+        basePrice: new Prisma.Decimal(600),
+      },
+    });
+    const roomTypeB = await prisma.hotelRoomType.create({
+      data: {
+        hotelId: sharedHotel.id,
+        name: uniq('Deluxe'),
+        capacity: 2,
+        maxAdults: 2,
+        maxChildren: 1,
+        basePrice: new Prisma.Decimal(800),
+      },
+    });
+    const dest = await createHotelWithRoomType();
+
+    const order = await prisma.order.create({
+      data: {
+        orderNumber: uniq('ORD'),
+        status: OrderStatus.PAID,
+        subtotal: new Prisma.Decimal(2800),
+        total: new Prisma.Decimal(2800),
+        paidAmount: new Prisma.Decimal(2800),
+        contactName: 'Test User',
+        contactPhone: '13800138000',
+        roomAssignment: {
+          roomGroups: [
+            { id: 'gA', hotelName: sharedHotel.name, roomType: roomTypeA.name, passengerIds: [] },
+            { id: 'gB', hotelName: sharedHotel.name, roomType: roomTypeB.name, passengerIds: [] },
+          ],
+        },
+        items: {
+          create: [
+            {
+              kind: OrderItemKind.HOTEL,
+              description: `${sharedHotel.name} · ${roomTypeA.name} · 2026-08-01~2026-08-03 · 2晚 × 1间`,
+              quantity: 2,
+              unitPrice: new Prisma.Decimal(600),
+              amount: new Prisma.Decimal(1200),
+              hotelRoomTypeId: roomTypeA.id,
+              hotelCheckIn: new Date('2026-08-01T00:00:00.000Z'),
+              hotelCheckOut: new Date('2026-08-03T00:00:00.000Z'),
+              roomsBilled: new Prisma.Decimal(1),
+            },
+            {
+              kind: OrderItemKind.HOTEL,
+              description: `${sharedHotel.name} · ${roomTypeB.name} · 2026-08-01~2026-08-03 · 2晚 × 1间`,
+              quantity: 2,
+              unitPrice: new Prisma.Decimal(800),
+              amount: new Prisma.Decimal(1600),
+              hotelRoomTypeId: roomTypeB.id,
+              hotelCheckIn: new Date('2026-08-01T00:00:00.000Z'),
+              hotelCheckOut: new Date('2026-08-03T00:00:00.000Z'),
+              roomsBilled: new Prisma.Decimal(1),
+            },
+          ],
+        },
+      },
+      include: { items: true },
+    });
+    const itemA = order.items.find((i) => i.hotelRoomTypeId === roomTypeA.id)!;
+    const itemB = order.items.find((i) => i.hotelRoomTypeId === roomTypeB.id)!;
+
+    // 只换 A 行到 dest 酒店
+    await service.swapItemHotel(order.id, itemA.id, { newHotelRoomTypeId: dest.roomType.id }, actor);
+
+    const reloaded = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    const groups = (
+      reloaded.roomAssignment as { roomGroups: Array<{ id: string; hotelName: string; roomType: string }> }
+    ).roomGroups;
+    const gA = groups.find((g) => g.id === 'gA')!;
+    const gB = groups.find((g) => g.id === 'gB')!;
+    expect(gA.hotelName).toBe(dest.hotel.name); // A 组正确改名
+    expect(gA.roomType).toBe(dest.roomType.name);
+    expect(gB.hotelName).toBe(sharedHotel.name); // B 组完全不受影响（旧版会被误伤改成 dest）
+    expect(gB.roomType).toBe(roomTypeB.name);
+
+    // 订单行本身也各改各的：A 行换了，B 行的 hotelRoomTypeId 原样不动。
+    const itemAReloaded = await prisma.orderItem.findUniqueOrThrow({ where: { id: itemA.id } });
+    const itemBReloaded = await prisma.orderItem.findUniqueOrThrow({ where: { id: itemB.id } });
+    expect(itemAReloaded.hotelRoomTypeId).toBe(dest.roomType.id);
+    expect(itemBReloaded.hotelRoomTypeId).toBe(roomTypeB.id);
   });
 
   it('非酒店行（VISA）调用换酒店 → 拒绝', async () => {

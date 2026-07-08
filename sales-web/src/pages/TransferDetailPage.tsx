@@ -223,7 +223,7 @@ export default function TransferDetailPage() {
     );
   }
 
-  const rating = transfer.productRating;
+  const rating = transfer.rating;
 
   const jsonLd = {
     '@context': 'https://schema.org',

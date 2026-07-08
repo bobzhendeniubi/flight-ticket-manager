@@ -41,6 +41,16 @@ const { mockPrisma, mockComputeQuote, mockGetHotelNightlyRemaining } = vi.hoiste
     bundle: {
       findUnique: vi.fn(),
     },
+    // priceAndValidateItems 的 FLIGHT 分支走 PricingService.calculatePrice（真实动态定价，非 mock
+    // 出来的 stub）——它也是从 '../../db/prisma.js' 拿 prisma 单例，这里的 mock 全局生效。
+    // Bug 2a（metadata.businessUpgradeCount 伪造）测试需要一条最小可用的 FlightSeatClass +
+    // DateRanking 查询链（固定底价模式：不配仓位阶梯，走 round(basePrice) 分支）。
+    flightSeatClass: {
+      findFirst: vi.fn(),
+    },
+    dateRanking: {
+      findUnique: vi.fn(),
+    },
     // getOrder 的 loadBundleVisaStayDays 用它批量查套餐 VISA 组件的 stayDays（不 mock 时默认
     // undefined，调用即抛错——loadBundleVisaStayDays 有 try/catch best-effort 降级，不影响
     // 既有未涉及签证的测试；专门测 visa 板块的用例会显式 mock 这个方法）。
@@ -2290,6 +2300,9 @@ describe('priceAndValidateItems · 酒店重算价来源 + 下架拦截', () => 
         amount: number;
         hotelRoomTypeId?: string;
         roomsBilled?: number;
+        // Bug 2a（businessUpgradeCount 伪造）测试要看 FLIGHT 行落库前的 metadata/类型化字段。
+        metadata?: Record<string, unknown>;
+        businessUpgradeCount?: number;
       }>>;
     }).priceAndValidateItems(items);
 
@@ -2510,6 +2523,66 @@ describe('priceAndValidateItems · 酒店重算价来源 + 下架拦截', () => 
     const bundle = priced.find((p) => p.kind === 'BUNDLE')!;
     expect(bundle.roomsBilled).toBe(1); // 权威下限：max(0.5, 1) = 1
     expect(bundle.unitPrice).toBe(3840); // 按 1 间收，不给 0.5 少付
+  });
+
+  // ── Bug 2a：普通 FLIGHT 行的 metadata.businessUpgradeCount 只能来自套餐升舱内部派生，
+  // 客户端伪造的值必须在下单时被剥离——否则退座/admin force 重新占座会按这个伪造值拆分商务舱
+  // 库存，把从未真正占用过的 BUSINESS sold 冲成负数（见 orders.status-seats.test.ts 里
+  // releaseSeatFloored 的第二层防线；这里测的是第一层：源头不让伪造值落库）。────────────────
+  it('Bug 2a：动态定价分支剥离客户端伪造的 metadata.businessUpgradeCount', async () => {
+    mockPrisma.flightSeatClass.findFirst.mockResolvedValue({
+      capacity: 10,
+      sold: 0,
+      basePrice: dec2(500),
+      fareBuckets: null,
+      schedule: { departureTz: 'Asia/Macau', departureTime: new Date('2026-08-01T03:00:00.000Z') },
+    });
+    mockPrisma.dateRanking.findUnique.mockResolvedValue(null);
+
+    const priced = await price([
+      {
+        kind: 'FLIGHT',
+        description: 'CA123 上海→东京',
+        quantity: 3,
+        flightScheduleId: 'sched1',
+        flightCabin: 'ECONOMY',
+        // 客户端伪造：这是一条普通机票行，从未走套餐升舱，正常不该有这个字段。
+        metadata: { businessUpgradeCount: 999 },
+      } as OrderItemInput,
+    ]);
+
+    const flight = priced.find((p) => p.kind === 'FLIGHT')!;
+    // 扣座真正读的类型化字段本就不受 metadata 影响（旧行为），这里断言的是落库后的 metadata——
+    // 退座/重新占座分支读的正是这个字段，必须确认伪造键被剥掉了。
+    expect(flight.businessUpgradeCount).toBeUndefined();
+    expect(flight.metadata?.businessUpgradeCount).toBeUndefined();
+  });
+
+  it('Bug 2a：团队议价结算价（flightSettlementPriceCny）分支同样剥离伪造值，其余合法 metadata 不受影响', async () => {
+    const priced = await (
+      service as unknown as {
+        priceAndValidateItems(
+          i: OrderItemInput[],
+          s?: number,
+        ): Promise<Array<{ kind: string; metadata?: Record<string, unknown> }>>;
+      }
+    ).priceAndValidateItems(
+      [
+        {
+          kind: 'FLIGHT',
+          description: 'CA123 上海→东京',
+          quantity: 2,
+          flightScheduleId: 'sched1',
+          flightCabin: 'ECONOMY',
+          metadata: { businessUpgradeCount: 50, someClientNote: 'keep-me' },
+        } as OrderItemInput,
+      ],
+      600, // flightSettlementPriceCny：走团队议价分支，短路动态定价，不查 flightSeatClass
+    );
+    const flight = priced.find((p) => p.kind === 'FLIGHT')!;
+    expect(flight.metadata?.businessUpgradeCount).toBeUndefined();
+    expect(flight.metadata?.someClientNote).toBe('keep-me'); // 无关的客户端 metadata 键不受牵连
+    expect(flight.metadata?.priceOverride).toBe('TEAM_SETTLEMENT'); // 合法内部写入的键仍正常生效
   });
 });
 

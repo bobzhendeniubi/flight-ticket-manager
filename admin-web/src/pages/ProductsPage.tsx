@@ -985,11 +985,12 @@ function BundleCard({
               // 签证按 1 人计入起价，qty 不影响单价 → 展示「/人」而非误导性的 qty×单价。
               <span className="text-ink-muted nums whitespace-nowrap">¥{i.unitPrice.toLocaleString()}/人</span>
             ) : (
+              // 酒店行按双人拼房半间展示（单价/小计都是 unitPrice 的一半）——落库的 unitPrice 仍是整间夜价，
+              // 只是这里展示换算，不改任何存量数值；与下方起价拆解的「酒店 0.5间×N晚」口径保持一致。
               <span className="text-ink-muted nums whitespace-nowrap">
                 {i.kind === 'HOTEL'
-                  ? `${i.qty} 晚 × ¥${i.unitPrice}/晚 = ¥`
-                  : `${i.qty} 趟 × ¥${i.unitPrice}/趟 = ¥`}
-                {(i.qty * i.unitPrice).toLocaleString()}
+                  ? `${i.qty} 晚 × ¥${Math.round(i.unitPrice / 2).toLocaleString()}/晚·半间 = ¥${Math.round((i.qty * i.unitPrice) / 2).toLocaleString()}`
+                  : `${i.qty} 趟 × ¥${i.unitPrice}/趟 = ¥${(i.qty * i.unitPrice).toLocaleString()}`}
               </span>
             )}
           </div>
@@ -1065,14 +1066,14 @@ function BundleCard({
       <div className="mt-4 rounded-lg border border-brand-200 bg-brand-50/60 p-3">
         <div className="flex items-end justify-between">
           <span className="text-sm text-ink-soft">
-            起价 / 人<span className="ml-1 text-xs text-ink-muted">(from · 拼房)</span>
+            起价 / 人<span className="ml-1 text-xs text-ink-muted">(拼房)</span>
           </span>
           <div className="text-right">
             {cardDiscountPct > 0 && (
               <span className="mr-2 text-sm text-ink-muted line-through nums">¥{cardOriginalPerPax.toLocaleString()}</span>
             )}
             <span className="text-2xl font-semibold text-brand-700 nums">
-              from ¥{cardDiscountedPerPax.toLocaleString()}
+              ¥{cardDiscountedPerPax.toLocaleString()}
             </span>
             {cardDiscountPct > 0 && <span className="badge-danger ml-2">省 {cardDiscountPct}%</span>}
           </div>
@@ -1579,6 +1580,12 @@ function NewBundleWizard({
                         : 0;
                 // VISA 按 1 人计入起价（qty 不影响单价，与后端 originalPerPaxCny 口径一致）；其余按 qty × 单价。
                 const subtotal = it.kind === 'VISA' ? unitPriceReadOnly : (it.qty ?? 0) * unitPriceReadOnly;
+                // 展示专用：酒店组件按双人拼房半间计价展示（unitPriceReadOnly/subtotal 仍是整间口径，
+                // 用于其它计算不受影响）——只有这两个 display* 变量把半间数字渲染给运营看，
+                // 与起价拆解的「酒店 0.5间×N晚」、订单实际定价的 0.5×整间口径保持一致。
+                const displayUnitPrice = it.kind === 'HOTEL' ? Math.round(0.5 * unitPriceReadOnly) : unitPriceReadOnly;
+                const displaySubtotal =
+                  it.kind === 'HOTEL' ? Math.round(0.5 * unitPriceReadOnly * (it.qty ?? 0)) : subtotal;
                 return (
                   <div key={idx}>
                   <div className="flex items-center gap-2 rounded-lg border border-slate-200 bg-canvas p-2">
@@ -1692,16 +1699,18 @@ function NewBundleWizard({
                         <span className="text-[10px] leading-tight text-ink-muted">最便宜起价·自动</span>
                       </div>
                     ) : (
-                      // 只读价格：来自产品（HOTEL=整间夜价 / TRANSFER=整车/趟 / VISA=每人价），运营不可手改。
+                      // 只读价格：来自产品（HOTEL=半间夜价·拼房 / TRANSFER=整车/趟 / VISA=每人价），运营不可手改。
+                      // 酒店按双人拼房半间展示（displayUnitPrice/displaySubtotal 已折半）——与起价公式、
+                      // 订单实际定价的 0.5×整间口径一致；提交时仍用整间口径的 unitPriceReadOnly，不受影响。
                       <span className="input flex w-24 flex-col items-end justify-center bg-canvas text-xs text-ink-muted nums leading-tight">
-                        <span>¥{unitPriceReadOnly.toLocaleString()}</span>
+                        <span>¥{displayUnitPrice.toLocaleString()}</span>
                         <span className="text-[10px] text-ink-muted">
-                          {it.kind === 'HOTEL' ? '/晚·整间' : it.kind === 'TRANSFER' ? '/趟·整车' : '/人'}
+                          {it.kind === 'HOTEL' ? '/晚·半间(拼房)' : it.kind === 'TRANSFER' ? '/趟·整车' : '/人'}
                         </span>
                       </span>
                     )}
                     <span className="text-xs text-ink-muted w-20 text-right nums">
-                      {it.kind === 'FLIGHT' ? '实时' : `¥${subtotal.toLocaleString()}`}
+                      {it.kind === 'FLIGHT' ? '实时' : `¥${displaySubtotal.toLocaleString()}`}
                     </span>
                     <button
                       type="button"
@@ -1711,11 +1720,11 @@ function NewBundleWizard({
                       ×
                     </button>
                   </div>
-                  {/* 0702 反馈 7：酒店行 0.5 桥接（owner-approved wording）——只是把 hotelHalfShareCny
-                      换个「单价×晚数」的写法摊给运营看，不改任何定价数学，纯展示。 */}
+                  {/* 酒店行已按半间展示（上面 displayUnitPrice/displaySubtotal），这里补一句说明半间口径的来由，
+                      并指向单人独住时该用的加项——避免运营看到「半间」误以为漏收单人差价。 */}
                   {isFirstHotelRow && hotelNightlyPriceCny > 0 && (
                     <p className="pl-1 text-[11px] text-ink-muted">
-                      计入起价：¥{Math.round(0.5 * hotelNightlyPriceCny).toLocaleString()}×{nightsForPricing}晚（0.5间）
+                      酒店按双人拼房半间计价；单人独住请加「单房差」
                     </p>
                   )}
                   </div>
@@ -1763,7 +1772,7 @@ function NewBundleWizard({
           <div className="rounded-lg border border-slate-100 bg-canvas p-3 space-y-2">
             <div className="flex items-center justify-between text-sm">
               <span className="text-ink-soft">
-                起价 / 人<span className="ml-1 text-xs text-ink-muted">(from，1 人·半间房拼房口径)</span>
+                起价 / 人<span className="ml-1 text-xs text-ink-muted">(1 人·半间房拼房口径)</span>
               </span>
               <span className="font-medium text-ink nums">¥{originalPerPax.toLocaleString()}</span>
             </div>
@@ -1813,7 +1822,7 @@ function NewBundleWizard({
             <p className="text-[11px] leading-relaxed text-ink-muted">
               💡 机票按<strong>航班最便宜那天</strong>做起价（已含在"起价"里，你不用在套餐里填机票价）；酒店按<strong>关联房型整间夜价的一半</strong>（拼房）计入起价。你填
               <strong>想卖的价格</strong>、或直接改<strong>折扣%</strong>都行，两个会自动联动。实际下单：整个全包价按
-              <strong>出发日实时机票</strong>浮动 ×(1−{pct}%)，前台买家看到「起价 from ¥X/人 → 省 {pct}%」。
+              <strong>出发日实时机票</strong>浮动 ×(1−{pct}%)，前台买家看到「起价 ¥X/人 → 省 {pct}%」。
             </p>
             {pct > 0 && (
               <div className="text-right text-xs text-emerald-700">

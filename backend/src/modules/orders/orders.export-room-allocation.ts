@@ -3,9 +3,13 @@
  * sheet 内按酒店分组（自然按酒店名排序，组间不插空行），一行/乘客。
  *
  * 行来源：占房订单行（OrderItem 带 hotelRoomTypeId + hotelCheckIn，含已盖章
- * 酒店明细的 BUNDLE 行）× 该订单全部乘客；hotelCheckIn 落在 [from, to] 即归入当日 sheet。
+ * 酒店明细的 BUNDLE 行）；按订单分组后，每位乘客 correlate 到「他实际占用的那条占房 item」
+ * （见 correlateItem）—— 一位乘客恰好一行，不对订单每条占房 item 都遍历全部乘客
+ * （同订单多条占房 item 时旧实现会做 item × 乘客笛卡尔积，产生重复行 + 张冠李戴的房型/酒店组合，
+ * 已修复，回归覆盖见 orders.export-room-allocation.test.ts）。
+ * hotelCheckIn 落在 [from, to] 即归入当日 sheet（同订单多条 item 入住日不同则分归不同 sheet）。
  * 酒店归属优先 order.roomAssignment.roomGroups 的 hotelName（人工分房结果），
- * 否则回落到行上 hotelRoomType.hotel.name。
+ * 否则回落到 correlate 到的 item 上 hotelRoomType.hotel.name。
  *
  * 暂无数据的列（飞行次数/签发日期/升级原因）保留表头、内容留空 —— 与三模板导出同约定。
  */
@@ -173,6 +177,47 @@ function formatRoomNo(order: number, isHalf: boolean): string {
   return isHalf ? `房${order}(½)` : `房${order}`;
 }
 
+/** 占房 item 上 hotelCheckIn / hotelRoomType 均非空后的窄化类型（correlate 阶段用）。*/
+type AllocatableItem = RoomItemForExport & {
+  hotelCheckIn: NonNullable<RoomItemForExport['hotelCheckIn']>;
+  hotelRoomType: NonNullable<RoomItemForExport['hotelRoomType']>;
+};
+
+function isAllocatable(it: RoomItemForExport): it is AllocatableItem {
+  return it.hotelCheckIn != null && it.hotelRoomType != null;
+}
+
+/**
+ * 把一位乘客 correlate 到「他实际占用的那条占房 item」——同订单可能有多条占房 item
+ * （如两种房型 / 跨酒店），不能对每条 item 都遍历全部乘客（会产生重复行 + 张冠李戴，
+ * 见本文件顶部 JSDoc 的回归说明）。
+ *   - 单条 item 的订单：无歧义，直接用它（兼容未分房乘客的老口径——单房型订单里
+ *     谁都在这一间/这一批房源里，不需要 roomGroup 也能归属）。
+ *   - 多条 item 的订单：优先用 roomGroup.hotelName（+ roomType 更精确）匹配到对应 item；
+ *     分房组酒店名在本单占房 item 里找不到匹配（人工填写与 FK 不同步）、或压根没分房——
+ *     无法可靠 correlate，兜底用订单第一条占房 item（保证每位乘客恰好一行，不重复也不丢单；
+ *     「归属哪家酒店」在此兜底下是尽力而为，dailyRemaining 会用「—」标出这种不确定性）。
+ */
+function correlateItem(
+  group: RoomGroup | undefined,
+  orderItems: readonly AllocatableItem[],
+): AllocatableItem {
+  if (orderItems.length === 1) return orderItems[0];
+  if (group) {
+    const exact = orderItems.find(
+      (it) =>
+        it.hotelRoomType.hotel.name === group.hotelName &&
+        (!group.roomType ||
+          it.hotelRoomType.name === group.roomType ||
+          it.hotelRoomType.bedType === group.roomType),
+    );
+    if (exact) return exact;
+    const byHotelOnly = orderItems.find((it) => it.hotelRoomType.hotel.name === group.hotelName);
+    if (byHotelOnly) return byHotelOnly;
+  }
+  return orderItems[0];
+}
+
 /**
  * 把占房订单行展开为按入住日期分 sheet 的行集合（纯函数，便于单测）。
  *
@@ -180,26 +225,31 @@ function formatRoomNo(order: number, isHalf: boolean): string {
  * 房间号分配（per 入住日期 × 酒店）：
  *   - 已分房：同一 roomGroup.id 共用一个房号（半间/拼房组房号标 "房N(½)"）。
  *   - 未分房：按房型容量顺序打包（每满一间开下一间），房号续在已分房之后。
+ *
+ * 乘客 ↔ item correlate（见 correlateItem）：一位乘客恰好产出一行，不做 item × 乘客笛卡尔积。
  */
 export function buildRoomAllocationSheets(
   items: RoomItemForExport[],
   remainingLookup: Map<string, string> = new Map(),
 ): RoomAllocationSheet[] {
-  // 先收集中间形态（未编房号/序号），按入住日期聚
+  // 先按订单分组占房 item（同订单可能有多条，需要整单一起 correlate 乘客归属）
+  const itemsByOrder = new Map<string, AllocatableItem[]>();
+  for (const it of items) {
+    if (!isAllocatable(it)) continue;
+    const list = itemsByOrder.get(it.orderId) ?? [];
+    list.push(it);
+    itemsByOrder.set(it.orderId, list);
+  }
+
+  // 中间形态（未编房号/序号），按入住日期聚
   const byDate = new Map<string, RoomEntry[]>();
 
-  for (const it of items) {
-    if (!it.hotelCheckIn || !it.hotelRoomType) continue;
-    const checkInStr = fmtDate(it.hotelCheckIn);
-    const order = it.order;
+  for (const orderItems of itemsByOrder.values()) {
+    const order = orderItems[0].order;
     const roomGroups = parseRoomGroups(order.roomAssignment);
     const agency = order.agent?.companyName ?? '直客';
-    // 房型容量（未分房乘客打包用）；fixture/缺数据回落 2 人/间
-    const capacity = it.hotelRoomType.capacity && it.hotelRoomType.capacity > 0
-      ? it.hotelRoomType.capacity
-      : 2;
 
-    // 出发(往返)日期：订单全部 FLIGHT 行的出发日（去重升序）；无航班回落入住日
+    // 出发(往返)日期：订单全部 FLIGHT 行的出发日（去重升序）；无航班回落各自入住日
     const flightDates = Array.from(
       new Set(
         order.items
@@ -207,13 +257,19 @@ export function buildRoomAllocationSheets(
           .map((x) => fmtDate(x.flightSchedule!.departureTime)),
       ),
     ).sort();
-    const travelDates = flightDates.length > 0 ? flightDates.join(' / ') : checkInStr;
 
     for (const p of order.passengers) {
       const group = roomGroups.find((g) => g.passengerIds.includes(p.id));
+      const it = correlateItem(group, orderItems);
+      const checkInStr = fmtDate(it.hotelCheckIn);
       const fkHotelName = it.hotelRoomType.hotel.name;
       const hotelName = group?.hotelName || fkHotelName;
-      // 分了房用 roomGroup 的房型（回落乘客床型偏好）；没分房回落行上房型床型
+      // 房型容量（未分房乘客打包用）；fixture/缺数据回落 2 人/间
+      const capacity =
+        it.hotelRoomType.capacity && it.hotelRoomType.capacity > 0 ? it.hotelRoomType.capacity : 2;
+      const travelDates = flightDates.length > 0 ? flightDates.join(' / ') : checkInStr;
+
+      // 分了房用 roomGroup 的房型（回落乘客床型偏好）；没分房回落 correlate 到的 item 房型床型
       const assignedRoomType = group ? group.roomType || p.bedPref || '' : '';
       const roomType = assignedRoomType || it.hotelRoomType.bedType || '';
       const isHalf = !!group && group.roomFraction === 0.5;
@@ -221,8 +277,8 @@ export function buildRoomAllocationSheets(
       const halfRoomNote = isHalf ? '半间/拼房' : '';
       const notes = [group?.notes, order.notes, halfRoomNote].filter(Boolean).join(' / ');
 
-      // 当日余房：分房组人工填的酒店名与行上 FK 关联酒店不一致时，无法确定该按哪家酒店的余量算——
-      // 绝不瞎标，直接 "—"（见 buildRoomAllocationSheets 顶部 JSDoc 的归属优先级说明）。
+      // 当日余房：分房组人工填的酒店名与 correlate 到的 item FK 关联酒店不一致时，
+      // 无法确定该按哪家酒店的余量算——绝不瞎标，直接 "—"（见文件顶部 JSDoc 归属优先级说明）。
       const hotelNameTrusted = !group?.hotelName || group.hotelName === fkHotelName;
       const dailyRemaining =
         hotelNameTrusted && it.hotelRoomType.hotelId

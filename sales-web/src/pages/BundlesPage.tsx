@@ -88,7 +88,7 @@ interface BundleView extends MockBundle {
   returnFlightNumber: string | null;
   /** 套餐默认出发日（管理员设；null = 未设，前端回退 today+3） */
   defaultDepartDate: string | null;
-  productRating: ProductRating | null;
+  rating: ProductRating | null;
   reviewCount: number | null;
   soldCount: number | null;
 }
@@ -119,7 +119,7 @@ function bundleApiToView(b: ApiBundle): BundleView {
     outboundFlightNumber: b.outboundFlight?.flightNumber ?? null,
     returnFlightNumber: b.returnFlight?.flightNumber ?? null,
     defaultDepartDate: b.defaultDepartDate ?? null,
-    productRating: b.productRating ?? null,
+    rating: b.rating ?? null,
     reviewCount: b.reviewCount ?? null,
     soldCount: b.soldCount ?? null,
   };
@@ -166,7 +166,7 @@ function sortBundles(list: BundleView[], sort: SortKey): BundleView[] {
       case 'price_desc':
         return bundleFloorPrice(y.b) - bundleFloorPrice(x.b) || x.i - y.i;
       case 'rating':
-        return (y.b.productRating?.average ?? 0) - (x.b.productRating?.average ?? 0) || x.i - y.i;
+        return (y.b.rating?.average ?? 0) - (x.b.rating?.average ?? 0) || x.i - y.i;
       case 'popular':
         return (y.b.soldCount ?? 0) - (x.b.soldCount ?? 0) || x.i - y.i;
       default:
@@ -756,8 +756,8 @@ function ConfigurableBundleCard({
   // 紧迫感徽章（对标 Klook/携程"近期热订"）：仅当销量达阈值才贴，绝不暴露原始库存数字。
   const showScarcity = !soldOut && (b.soldCount ?? 0) >= SOLD_RECENTLY_THRESHOLD;
 
-  // 评分行（productRating 优先；缺省则不展示，不造假分数）
-  const rating = b.productRating;
+  // 评分行（rating 缺省/count=0 则不展示，不造假分数）
+  const rating = b.rating;
   const reviewCount = b.reviewCount ?? rating?.count ?? 0;
   const soldCount = b.soldCount ?? 0;
 
@@ -1238,8 +1238,10 @@ function HotelInfoModal({
                 <Icon key={i} name="star" className="h-3.5 w-3.5 text-amber-500" />
               ))}
             </span>
-            {hotel.rating && (
-              <span className="rating">{hotel.rating} / 5</span>
+            {hotel.rating && hotel.rating.count > 0 && (
+              <span className="rating">
+                {hotel.rating.average.toFixed(1)} / 5（{hotel.rating.count} 条评价）
+              </span>
             )}
             <span className="inline-flex items-center gap-1 text-ink-muted">
               <Icon name="mapPin" className="h-3.5 w-3.5" />

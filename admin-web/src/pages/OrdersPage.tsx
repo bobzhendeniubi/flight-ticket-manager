@@ -2359,7 +2359,9 @@ function SettlementPriceForm({
   );
 }
 
-// ── 售后费用（改期费 / 换人费）明细展示 ───────────────────────────────
+// ── 售后费用（改期费 / 换人费 / 换酒店差价）明细展示 ───────────────────────────────
+// 运行时结构见 lib/api.ts 的 OrderAdjustment（= 后端 OrderAdjustmentEntry）：
+// { type, label, amountCny(number), at(ISO), by, note? }，无 id / createdAt。
 function AdjustmentsSection({ order }: { order: OrderSummary }) {
   const adjustments = order.adjustments ?? [];
   if (adjustments.length === 0) return null;
@@ -2367,16 +2369,25 @@ function AdjustmentsSection({ order }: { order: OrderSummary }) {
     <section>
       <h3 className="text-xs font-semibold uppercase tracking-wide text-ink-muted">售后费用</h3>
       <ul className="mt-2 space-y-1.5 text-sm">
-        {adjustments.map((a) => (
-          <li key={a.id} className="flex items-start justify-between gap-2 rounded-md border border-amber-200 bg-amber-50/60 p-2.5">
-            <div className="flex-1">
-              <div className="text-ink">{a.label}</div>
-              {a.note && <div className="mt-0.5 text-xs text-ink-muted">{a.note}</div>}
-              <div className="mt-0.5 text-[11px] text-ink-muted">{new Date(a.createdAt).toLocaleString('zh-CN')}</div>
-            </div>
-            <div className="nums text-sm font-medium text-amber-700">+¥{Number(a.amountCny).toLocaleString()}</div>
-          </li>
-        ))}
+        {adjustments.map((a, i) => {
+          const amountCny = Number(a.amountCny);
+          const sign = amountCny < 0 ? '-' : '+';
+          return (
+            <li
+              key={`${a.at}-${a.type}-${i}`}
+              className="flex items-start justify-between gap-2 rounded-md border border-amber-200 bg-amber-50/60 p-2.5"
+            >
+              <div className="flex-1">
+                <div className="text-ink">{a.label}</div>
+                {a.note && <div className="mt-0.5 text-xs text-ink-muted">{a.note}</div>}
+                <div className="mt-0.5 text-[11px] text-ink-muted">{new Date(a.at).toLocaleString('zh-CN')}</div>
+              </div>
+              <div className="nums text-sm font-medium text-amber-700">
+                {sign}¥{Math.abs(amountCny).toLocaleString()}
+              </div>
+            </li>
+          );
+        })}
       </ul>
     </section>
   );

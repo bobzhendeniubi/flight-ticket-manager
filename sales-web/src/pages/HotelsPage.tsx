@@ -116,7 +116,7 @@ export function HotelsPage() {
         sorted.sort((a, b) => basePriceNum(b) - basePriceNum(a));
         break;
       case 'rating':
-        sorted.sort((a, b) => (b.productRating?.average ?? 0) - (a.productRating?.average ?? 0));
+        sorted.sort((a, b) => (b.rating?.average ?? 0) - (a.rating?.average ?? 0));
         break;
       case 'sold':
         sorted.sort((a, b) => (b.soldCount ?? 0) - (a.soldCount ?? 0));
@@ -330,7 +330,7 @@ interface HotelCardProps {
 const CARD_AMENITIES = 3;
 
 function HotelCard({ hotel, onOpen, onQuickAdd }: HotelCardProps) {
-  const rating = hotel.productRating;
+  const rating = hotel.rating;
   const extraAmenities = hotel.amenities.length - CARD_AMENITIES;
 
   return (

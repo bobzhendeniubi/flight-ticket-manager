@@ -226,7 +226,7 @@ export default function VisaDetailPage() {
     );
   }
 
-  const rating = visa.productRating;
+  const rating = visa.rating;
 
   const jsonLd = {
     '@context': 'https://schema.org',

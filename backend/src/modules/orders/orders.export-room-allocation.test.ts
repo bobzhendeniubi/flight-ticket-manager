@@ -89,11 +89,13 @@ function fixtureItems(): RoomItemForExport[] {
 
   return [
     {
+      orderId: 'o1',
       hotelCheckIn: D('2026-07-10'),
       hotelRoomType: { name: '标准双床', bedType: '双床', hotel: { name: 'B酒店' } },
       order: o1,
     },
     {
+      orderId: 'o2',
       hotelCheckIn: D('2026-07-11'),
       hotelRoomType: { name: '高级房', bedType: null, hotel: { name: 'C酒店' } },
       order: o2,
@@ -175,6 +177,8 @@ function roomNoItem(opts: {
   }>;
 }): RoomItemForExport {
   return {
+    // 单元测试各自独立一单一 item，orderId 用酒店名即可保证跨用例不撞号
+    orderId: `order-${opts.hotelName}`,
     hotelCheckIn: D(opts.checkIn),
     hotelRoomType: {
       name: '双床',
@@ -249,6 +253,88 @@ describe('buildRoomAllocationSheets 房间号', () => {
       }),
     ]);
     expect(sheet.rows.map((r) => r.roomNo)).toEqual(['房1(½)', '房1(½)']);
+  });
+});
+
+/**
+ * 回归：同订单 2 条占房 item（2 家酒店/2 种房型），4 位乘客分两组各自入住一家。
+ * 旧实现对每条 item 都遍历订单全部 4 位乘客 → 2 item × 4 乘客 = 8 行（2N，N=4），
+ * 其中一半是「张冠李戴」的 Frankenstein 组合（正确的酒店名配上另一条 item 的房型名）。
+ * 修复后应 correlate 到各自 roomGroup 归属的 item，恰好 4 行（N），无重复、无错配。
+ */
+function twoHotelItemOrderFixture(): RoomItemForExport[] {
+  const order = {
+    notes: null,
+    roomAssignment: {
+      roomGroups: [
+        { id: 'gX', hotelName: '酒店X', roomType: '大床房', passengerIds: ['p1', 'p2'] },
+        { id: 'gY', hotelName: '酒店Y', roomType: '双床房', passengerIds: ['p3', 'p4'] },
+      ],
+    },
+    agent: null,
+    items: [{ kind: 'HOTEL', flightSchedule: null }],
+    passengers: ['p1', 'p2', 'p3', 'p4'].map((id, i) => ({
+      id,
+      fullName: `客${id}`,
+      lastName: null,
+      firstName: null,
+      gender: null,
+      dateOfBirth: D('1990-01-01'),
+      documentNumber: `M${i}`,
+      passportExpiry: null,
+      bedPref: null,
+    })),
+  };
+
+  const itemX = {
+    orderId: 'ord-multi',
+    hotelCheckIn: D('2026-09-01'),
+    hotelRoomType: {
+      hotelId: 'hx',
+      name: '大床房',
+      bedType: '大床',
+      capacity: 2,
+      hotel: { name: '酒店X' },
+    },
+    order,
+  };
+  const itemY = {
+    orderId: 'ord-multi',
+    hotelCheckIn: D('2026-09-01'),
+    hotelRoomType: {
+      hotelId: 'hy',
+      name: '双床房',
+      bedType: '双床',
+      capacity: 2,
+      hotel: { name: '酒店Y' },
+    },
+    order,
+  };
+
+  return [itemX, itemY] as unknown as RoomItemForExport[];
+}
+
+describe('buildRoomAllocationSheets 多 item 订单（回归：曾经 item×乘客笛卡尔积产生重复行）', () => {
+  it('2 hotel item 的订单 → 恰好 N=4 行（不是 2N=8），酒店/房型按 roomGroup 正确配对不串号', () => {
+    const sheets = buildRoomAllocationSheets(twoHotelItemOrderFixture());
+
+    // 同一入住日 → 只有 1 个 sheet
+    expect(sheets).toHaveLength(1);
+    // 修复前：2 item × 4 乘客 = 8 行；修复后：每位乘客 correlate 到自己的房间，恰好 4 行
+    expect(sheets[0].rows).toHaveLength(4);
+
+    const byName = new Map(sheets[0].rows.map((r) => [r.chineseName, r]));
+    // p1/p2 → 酒店X · 大床房；p3/p4 → 酒店Y · 双床房（不是 Frankenstein 组合）
+    expect(byName.get('客p1')?.hotelType).toBe('酒店X · 大床房');
+    expect(byName.get('客p2')?.hotelType).toBe('酒店X · 大床房');
+    expect(byName.get('客p3')?.hotelType).toBe('酒店Y · 双床房');
+    expect(byName.get('客p4')?.hotelType).toBe('酒店Y · 双床房');
+
+    // 同组共号，且两家酒店各自独立编号
+    expect(byName.get('客p1')?.roomNo).toBe('房1');
+    expect(byName.get('客p2')?.roomNo).toBe('房1');
+    expect(byName.get('客p3')?.roomNo).toBe('房1');
+    expect(byName.get('客p4')?.roomNo).toBe('房1');
   });
 });
 

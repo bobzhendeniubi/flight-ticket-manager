@@ -80,11 +80,25 @@ const SEAT_HOLDING_STATUSES: OrderStatus[] = [
   'REFUND_REQUESTED',
 ];
 
+// DRAFT 归类为"释放型"而非"既不占座也不释放"的中间地带（CRITICAL 修复）：
+//   createOrder 唯一的建单路径（~389）永远显式写 status: PENDING_PAYMENT（扣座与建单同一事务原子发生），
+//   从未有代码路径以 DRAFT 建单后才占座 —— 所以 DRAFT 状态本身从未持有真实库存。
+//   若把 DRAFT 排除在 SEAT_HOLDING/SEAT_RELEASING 之外（旧版行为），admin force 可以拿它当"座位账
+//   死区"套利：force H→DRAFT（宣称释放）不触发释放分支（因为 DRAFT 不在 RELEASING 集合，wasHolding
+//   && isReleasing 为 false）→ sold 原地不动；再 force DRAFT→PAID 时 isNewHolding 为真、wasHolding 假
+//   → 触发"非占座→占座"分支重新占座一次 → sold 又 +qty。反复横跳 H→DRAFT→PAID 每次 +qty，sold 无界
+//   增长，单订单就能把某舱位账面"卖爆"（实际库存没变化，纯粹是账被做出来的）。
+//   把 DRAFT 并入 SEAT_RELEASING（而不是单独拒绝 force 到 DRAFT）是安全的且对称：
+//     H→DRAFT：wasHolding=true, isReleasing=true → 正常释放（座位真还给库存，账目诚实）
+//     DRAFT→H：wasHolding=false, isNewHolding=true → 走"重新占座"分支，原子 CAS + 余位校验（与从
+//              CANCELLED/PAYMENT_TIMEOUT 拉回占座完全同一套保护，不会超卖）
+//     DRAFT→R（如 CANCELLED）：wasHolding=false → 释放→释放，短路不触碰库存（幂等，不会二次释放）
 const SEAT_RELEASING_STATUSES: OrderStatus[] = [
   'CANCELLED',
   'PAYMENT_TIMEOUT',
   'REFUNDED',
   'FAILED',
+  'DRAFT',
 ];
 
 // 服务端价格校验容差（CNY）：客户端提交金额与服务端权威重算金额相差超过此值则拒单（A3）
@@ -94,6 +108,28 @@ const PRICE_TOLERANCE_CNY = 1.0;
 const PASSPORT_EXPIRY_BLOCK_DAYS = 90; // 不足 90 天禁止下单
 const PASSPORT_EXPIRY_SURCHARGE_DAYS = 180; // 不足 6 个月加收附加费
 const NEAR_EXPIRY_SURCHARGE_CNY = 200; // 每位临期乘客附加费
+
+/**
+ * 剥离 FLIGHT 行 metadata 里客户端可能伪造的 businessUpgradeCount（HIGH 修复）。
+ *
+ * 这个字段只应该由「套餐升舱」内部派生路径写入（见 priceAndValidateItems 里
+ * `leg.metadata = { ...leg.metadata, businessUpgradeCount: bundleBusinessUpgradeCount }` 那段——
+ * 它在算完真实升舱人数后整体覆盖，不受本函数影响）。POST /orders 用 optionalAuthenticate
+ * （匿名可达），flightItemSchema.metadata 是 `z.record(z.unknown())` 完全开放透传；建单本身虽然
+ * 不读 metadata.businessUpgradeCount 来决定扣座（扣座用的是 priced 数组自己的类型化字段，套餐路径
+ * 才会赋值），但会把客户端塞进来的 metadata 原样落库。取消/超时释放（~2072）和 admin force 重新
+ * 占座（~2126）读的正是这条落库的 metadata.businessUpgradeCount 来做「套餐升舱拆座」镜像还原——
+ * 一个伪造了 businessUpgradeCount 的普通机票行，因此能在退座时把从未真正占用过的 BUSINESS 舱
+ * sold 减成负数（且永久卡在负数，见下方 releaseSeatFloored 的第二层防线）。
+ * 建单时无条件剥掉这个键，之后套餐路径再按真实升舱人数重新写入 —— 客户端永远无法自己塞值进去。
+ */
+function sanitizeFlightItemMetadata(
+  metadata: Record<string, unknown> | undefined,
+): Record<string, unknown> {
+  if (!metadata) return {};
+  const { businessUpgradeCount: _ignoredClientValue, ...rest } = metadata;
+  return rest;
+}
 
 // ── 类型 ────────────────────────────────────────────────────────────────
 export interface OrderRequester {
@@ -673,7 +709,7 @@ export class OrderService {
             flightCabin: item.flightCabin,
             bundleId: item.bundleId,
             metadata: {
-              ...(item.metadata ?? {}),
+              ...sanitizeFlightItemMetadata(item.metadata),
               // 审计：标记本行价格来自团队议价结算价（非动态价）
               priceOverride: 'TEAM_SETTLEMENT',
               settlementPriceCny: flightSettlementPriceCny,
@@ -697,7 +733,7 @@ export class OrderService {
           flightCabin: item.flightCabin,
           bundleId: item.bundleId,
           metadata: {
-            ...(item.metadata ?? {}),
+            ...sanitizeFlightItemMetadata(item.metadata),
             dateRank: pricing.dateRank,
             dateMultiplier: pricing.dateMultiplier,
             perSeatBreakdown: pricing.perSeatBreakdown,
@@ -2051,10 +2087,7 @@ export class OrderService {
         qty: number,
       ): Promise<void> => {
         if (qty <= 0) return;
-        await tx.flightSeatClass.updateMany({
-          where: { scheduleId, cabin },
-          data: { sold: { decrement: qty } },
-        });
+        await releaseSeatFloored(tx, scheduleId, cabin, qty);
         // 收集释放座位的舱位 id —— 调用方提交事务后排队候补检查
         if (releasedSeatClassIdsOut) {
           const sc = await tx.flightSeatClass.findFirst({
@@ -2992,9 +3025,29 @@ export class OrderService {
     const scratch = await prisma.$transaction(async (tx) => {
       const order = await tx.order.findUnique({
         where: { id: orderId },
-        select: { id: true, orderNumber: true, adjustmentCny: true, adjustments: true, roomAssignment: true },
+        select: {
+          id: true,
+          orderNumber: true,
+          adjustmentCny: true,
+          adjustments: true,
+          roomAssignment: true,
+          total: true,
+        },
       });
       if (!order) throw new NotFoundError('订单不存在');
+
+      // ── 0. 减价不能把应付冲成负数（HIGH 修复）──
+      // 减价（feeCny<0）是合法操作（"我方缺房挪客不变价"里客人主动少收），但没有下限就能把
+      // effectivePayable（= total + adjustmentCny，客户实际应付）冲到任意负数，系统账面上就
+      // 变成"欠客户钱"，而这笔"欠款"并非真实退款（没有对应的 Refund/退款流水）。
+      // 只挡「减到应付为负」这一种；加价（feeCny>0）不受限（已有 schema 层 ±10 万绝对上限）。
+      if (feeCny < 0) {
+        const currentPayable = round2(Number(order.total.toString()) + order.adjustmentCny);
+        const newPayable = round2(currentPayable + feeCny);
+        if (newPayable < 0) {
+          throw new BadRequestError('减价金额不能超过当前应付（最多减到应付为 0）');
+        }
+      }
 
       // ── 1. 更新订单行（只换房型引用 + 重建 description；金额/数量/日期/间数一律冻结）──
       await tx.orderItem.update({
@@ -3018,7 +3071,15 @@ export class OrderService {
         });
       }
 
-      // ── 3. 分房表里手填的旧酒店名 → 改成新酒店名（不匹配的组保持原样）──
+      // ── 3. 分房表里属于本行（旧酒店+旧房型）的组 → 改名到新酒店+新房型（HIGH 修复）──
+      // RoomGroup 没有 orderItemId 字段（Passenger 挂在 Order 上，不挂具体 OrderItem），所以本来就
+      // 没法从数据模型上百分百确认"这组人是不是这一行的客人"。旧版只用 hotelName 一个维度匹配——
+      // 一个订单有 2 条 HOTEL 行都住"同一家酒店"（不同房型/不同批客人）时，只换其中一行，会把另一
+      // 行的组也误伤改名，把它的客人错误地"送去"了目标酒店。
+      // 用 (hotelName, roomType) 二元组匹配，精确到"这一行原来的房型"——两条同酒店的 HOTEL 行几乎
+      // 必然是不同房型（否则本就是同一份预订，误伤后果也无实际差异），比单凭酒店名更贴近"这条订单
+      // 行"的身份。同时把 roomType 也一并改写到新房型名（旧版只改 hotelName，遗留一个在目标酒店根本
+      // 不存在的旧房型名，分房表看着货不对板）。
       const roomAssignmentRaw = order.roomAssignment;
       if (roomAssignmentRaw && typeof roomAssignmentRaw === 'object' && !Array.isArray(roomAssignmentRaw)) {
         const groups = (roomAssignmentRaw as { roomGroups?: unknown }).roomGroups;
@@ -3028,10 +3089,15 @@ export class OrderService {
             if (
               g != null &&
               typeof g === 'object' &&
-              (g as { hotelName?: unknown }).hotelName === oldRoomType.hotel.name
+              (g as { hotelName?: unknown }).hotelName === oldRoomType.hotel.name &&
+              (g as { roomType?: unknown }).roomType === oldRoomType.name
             ) {
               changed = true;
-              return { ...(g as Record<string, unknown>), hotelName: newRoomType.hotel.name };
+              return {
+                ...(g as Record<string, unknown>),
+                hotelName: newRoomType.hotel.name,
+                roomType: newRoomType.name,
+              };
             }
             return g;
           });
@@ -3706,6 +3772,32 @@ async function releaseSeatWithinTx(
     where: { scheduleId, cabin },
     data: { sold: { decrement: qty } },
   });
+}
+
+/**
+ * 释放座位——下限钳制在 0（HIGH 修复第二层防线）。
+ *
+ * `sold = GREATEST(0, sold - qty)`（原子 SQL）取代普通 `decrement`：即便 businessUpgradeCount
+ * 被伪造导致某个分支想释放一个从未真正占用过的舱位（见 sanitizeFlightItemMetadata 的注释——那是
+ * 第一层防线，从源头不让伪造值落库），这里也不会把 sold 打成负数并永久卡住（旧版 decrement 没有
+ * 下限，负数会一直累积，直到人工去 DB 手动修）。
+ *
+ * 供状态机释放分支（_updateStatusWithinTx）和 30 分钟超时 worker（queues/worker.ts）复用——两处
+ * 都要按 computeBundleSeatSplit 拆分释放，口径必须一致。
+ */
+export async function releaseSeatFloored(
+  tx: Prisma.TransactionClient,
+  scheduleId: string,
+  cabin: import('@prisma/client').CabinClass,
+  qty: number,
+): Promise<void> {
+  if (qty <= 0) return;
+  await tx.$executeRaw`
+    UPDATE "FlightSeatClass"
+    SET sold = GREATEST(0, sold - ${qty}), "updatedAt" = NOW()
+    WHERE "scheduleId" = ${scheduleId}
+      AND cabin = ${cabin}::"CabinClass"
+  `;
 }
 
 /** 一条售后费用流水（写入 Order.adjustments）。 */
@@ -4463,6 +4555,19 @@ async function createCommissionsForOrder(
   orderId: string,
   sellerAgentId: string,
 ) {
+  // 0. 幂等：该订单已有佣金记录就跳过（MEDIUM 修复）。
+  // _updateStatusWithinTx 只在 toStatus==='PAID' 时调用本函数，正常状态机每单只会经过一次
+  // PENDING_PAYMENT→PAID，所以只会跑一次。唯一能让同一订单二次触达 PAID 的路径是 admin force
+  // （如误操作 force REFUNDED→PAID"复活"一张已退款单）——没有这层幂等保护就会对同一笔订单重复
+  // 计佣（下面按链路逐级 create 一遍 CommissionRecord，两次共 2N 条，代理端看见的应得佣金翻倍）。
+  // 不区分 status（ACCRUED/REVERSED/SETTLED 都算"已生成过"）——只要 orderId 下已经有任意一条
+  // CommissionRecord，就说明佣金链路已经跑过一次，不再重跑（reconcile/冲销走别的机制，不是这里）。
+  const existing = await tx.commissionRecord.findFirst({
+    where: { orderId },
+    select: { id: true },
+  });
+  if (existing) return;
+
   // 1. 拉订单项
   const items = await tx.orderItem.findMany({ where: { orderId } });
   if (items.length === 0) return;

@@ -11,7 +11,16 @@
 import { Worker } from 'bullmq';
 import { prisma } from '../db/prisma.js';
 import { env } from '../config/env.js';
-import { FulfillmentStatus, FulfillmentType, OrderStatus, Prisma, SeatLockStatus, WaitlistStatus } from '@prisma/client';
+import {
+  CabinClass,
+  FulfillmentStatus,
+  FulfillmentType,
+  OrderItemKind,
+  OrderStatus,
+  Prisma,
+  SeatLockStatus,
+  WaitlistStatus,
+} from '@prisma/client';
 import {
   bullRedis,
   enqueueWaitlistCheck,
@@ -23,6 +32,41 @@ import {
 } from './queue.js';
 import { closeMailer } from '../lib/mailer.js';
 import { sendItineraryEmail } from '../lib/itinerary-email.js';
+import { computeBundleSeatSplit, releaseSeatFloored } from '../modules/orders/orders.service.js';
+
+/**
+ * 超时释放某订单占用的座位——套餐升舱拆座感知 + 下限钳制在 0（MEDIUM 修复）。
+ *
+ * 抽成独立函数（而不是内联在 seatHoldWorker 的匿名回调里）供单测直接驱动——BullMQ 的
+ * `new Worker(name, processor, opts)` 的 processor 是匿名回调，不好单独调用/断言。
+ *
+ * 与状态机释放分支（orders.service.ts `_updateStatusWithinTx` 的 releaseSeat）同一口径：
+ *   - 按 item.metadata.businessUpgradeCount 拆分 BUSINESS/原舱位分别释放——旧版这里是扁平
+ *     `sold - quantity` 只退原舱位，套餐升舱订单超时会漏退 BUSINESS、多退 ECONOMY（净释放量算
+ *     对了但退错了舱，两边台账都不诚实）。
+ *   - 用 releaseSeatFloored（GREATEST(0, sold-qty)）取代旧版 `sold >= qty` 才更新的写法——两者
+ *     都不会打出负数，但 floor 版本即使某一侧 sold 已经因为其他 bug 偏离预期也不会卡死整条更新
+ *     （旧版 `sold >= qty` 不满足时整条 UPDATE 直接不生效，released 状态和库存会不一致）。
+ */
+export async function releaseOrderSeatsForTimeout(
+  tx: Prisma.TransactionClient,
+  items: ReadonlyArray<{
+    kind: OrderItemKind;
+    flightScheduleId: string | null;
+    flightCabin: CabinClass | null;
+    quantity: number;
+    metadata: Prisma.JsonValue;
+  }>,
+): Promise<void> {
+  for (const item of items) {
+    if (item.kind !== OrderItemKind.FLIGHT || !item.flightScheduleId || !item.flightCabin) continue;
+    const meta = (item.metadata ?? {}) as { businessUpgradeCount?: unknown };
+    const rawUpgrade = typeof meta.businessUpgradeCount === 'number' ? meta.businessUpgradeCount : 0;
+    const split = computeBundleSeatSplit(item.flightCabin, item.quantity, rawUpgrade);
+    await releaseSeatFloored(tx, item.flightScheduleId, CabinClass.BUSINESS, split.business);
+    await releaseSeatFloored(tx, item.flightScheduleId, item.flightCabin, split.sameCabin);
+  }
+}
 
 // ══════════════════════════════════════════════════════════════════
 // Fulfillment Worker — 处理出票 / 酒店预订 / 签证 / 接送
@@ -142,7 +186,8 @@ fulfillmentWorker.on('failed', (job, err) => {
 // 触发：createOrder 时排队 delay = paymentExpiresAt - now（~30 min）。
 // 执行：
 //   1. 查订单；若已 PAID / CANCELLED / PAYMENT_TIMEOUT 直接退出（幂等）
-//   2. 对每个 FLIGHT item 做 `UPDATE sold = sold - qty WHERE sold >= qty`（CAS 防负值）
+//   2. releaseOrderSeatsForTimeout：按套餐升舱拆座（BUSINESS/原舱位分别退）+ 下限钳制在 0
+//      （GREATEST(0, sold-qty)，见该函数注释）
 //   3. 订单状态 → PAYMENT_TIMEOUT + 写 OrderStatusEvent
 // ══════════════════════════════════════════════════════════════════
 const seatHoldWorker = new Worker<SeatHoldJobData>(
@@ -170,16 +215,7 @@ const seatHoldWorker = new Worker<SeatHoldJobData>(
 
     // 事务：释放座位 + 标订单 PAYMENT_TIMEOUT
     await prisma.$transaction(async (tx) => {
-      for (const item of order.items) {
-        if (item.kind !== 'FLIGHT' || !item.flightScheduleId || !item.flightCabin) continue;
-        await tx.$executeRaw`
-          UPDATE "FlightSeatClass"
-          SET sold = sold - ${item.quantity}, "updatedAt" = NOW()
-          WHERE "scheduleId" = ${item.flightScheduleId}
-            AND cabin = ${item.flightCabin}::"CabinClass"
-            AND sold >= ${item.quantity}
-        `;
-      }
+      await releaseOrderSeatsForTimeout(tx, order.items);
 
       // 二次 CAS — 只在状态仍是 PENDING_PAYMENT 时更新
       // 如果别人刚刚改了状态（e.g. 支付到达），抛错让整个 tx 回滚（包括座位释放）

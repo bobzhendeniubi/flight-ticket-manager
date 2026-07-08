@@ -604,15 +604,18 @@ export interface HotelAvailabilityResult {
 export type InvoiceStatus = 'NONE' | 'REQUESTED' | 'ISSUED';
 
 /**
- * 售后费用记录（改期费 / 换人费）。total = 产品金额；
- * adjustmentCny = 售后费用合计；尾款 = total + adjustmentCny − paidAmount。
+ * 售后费用流水（改期费 / 换人费 / 换酒店差价）。
+ * 对应后端 orders.service.ts 的 OrderAdjustmentEntry（Order.adjustments JSON 列，
+ * serializeOrder 原样透传，不做 Decimal 字符串化）：amountCny 是原始 number，
+ * 日期字段是 at（ISO），没有 id / createdAt。
  */
 export interface OrderAdjustment {
-  id: string;
-  amountCny: string;
+  type: 'RESCHEDULE_FEE' | 'SWAP_FEE' | string;
   label: string;
-  note: string | null;
-  createdAt: string;
+  amountCny: number;
+  at: string; // ISO 时间
+  by: string | null; // 操作人 userId
+  note?: string;
 }
 
 export interface OrderSummary {

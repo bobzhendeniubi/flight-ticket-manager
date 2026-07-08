@@ -29,6 +29,12 @@ const { mockPrisma } = vi.hoisted(() => ({
     flightSeatClass: { updateMany: vi.fn(), findFirst: vi.fn() },
     seatLock: { aggregate: vi.fn() },
     refund: { updateMany: vi.fn() },
+    // Bug 6（佣金幂等）用：createCommissionsForOrder 只在 order.agentId 非空且 toStatus===PAID 时触达。
+    // findMany 另外还被"释放型流转的佣金冲销"步骤用到（wasHolding&&isReleasing 且非 PENDING_PAYMENT
+    // 来源时无条件触达，即便订单没有代理——见 Bug 1 的 H→DRAFT 测试）。
+    commissionRecord: { findFirst: vi.fn(), create: vi.fn(), findMany: vi.fn() },
+    agent: { findUnique: vi.fn() },
+    commissionRule: { findMany: vi.fn() },
     $executeRaw: vi.fn(),
   },
 }));
@@ -217,12 +223,14 @@ describe('OrderService._updateStatusWithinTx · 既有释放/占座路径不受�
     vi.resetAllMocks();
   });
 
-  it('PENDING_PAYMENT → PAYMENT_TIMEOUT：正常超时释放座位，行为不变', async () => {
+  it('PENDING_PAYMENT → PAYMENT_TIMEOUT：正常超时释放座位，走 floor 后的原子 SQL（Bug 2b 修复）', async () => {
     const order = buildOrder({ status: OrderStatus.PENDING_PAYMENT });
     mockPrisma.order.findUnique.mockResolvedValueOnce(order);
     mockPrisma.order.updateMany.mockResolvedValueOnce({ count: 1 });
     mockPrisma.orderStatusEvent.create.mockResolvedValueOnce({});
-    mockPrisma.flightSeatClass.updateMany.mockResolvedValueOnce({ count: 1 });
+    // 释放分支改走 releaseSeatFloored（GREATEST(0, sold-qty) 原子 SQL），不再是普通 decrement——
+    // 防止伪造 businessUpgradeCount 之类的场景把 sold 打成负数并卡死（见 Bug 2b）。
+    mockPrisma.$executeRaw.mockResolvedValueOnce(1);
     mockPrisma.flightSeatClass.findFirst.mockResolvedValueOnce({ id: 'sc1' });
     mockPrisma.order.findUniqueOrThrow.mockResolvedValueOnce({ ...order, status: OrderStatus.PAYMENT_TIMEOUT });
 
@@ -238,14 +246,19 @@ describe('OrderService._updateStatusWithinTx · 既有释放/占座路径不受�
       releasedIds,
     );
 
-    expect(mockPrisma.flightSeatClass.updateMany).toHaveBeenCalledWith({
-      where: { scheduleId: 'sched1', cabin: CabinClass.ECONOMY },
-      data: { sold: { decrement: 1 } },
-    });
+    // 旧路径（普通 decrement）不再使用。
+    expect(mockPrisma.flightSeatClass.updateMany).not.toHaveBeenCalled();
+    // 新路径：GREATEST(0, sold - qty) 原子 SQL；${qty} 第 1 个占位符、${scheduleId} 第 2 个、
+    // ${cabin} 第 3 个（UPDATE ... SET sold = GREATEST(0, sold - ${qty}) ... WHERE "scheduleId" =
+    // ${scheduleId} AND cabin = ${cabin}...），与重新占座分支的既有测试同款断言风格。
+    expect(mockPrisma.$executeRaw).toHaveBeenCalledTimes(1);
+    const releaseCall = mockPrisma.$executeRaw.mock.calls[0];
+    expect(releaseCall[1]).toBe(1); // qty
+    expect(releaseCall[2]).toBe('sched1'); // scheduleId
+    expect(releaseCall[3]).toBe(CabinClass.ECONOMY); // cabin
     expect(releasedIds).toEqual(['sc1']);
     // 新增的重新占座分支绝不应该触发（新状态不是"占座中"）。
     expect(mockPrisma.seatLock.aggregate).not.toHaveBeenCalled();
-    expect(mockPrisma.$executeRaw).not.toHaveBeenCalled();
   });
 
   it('PAID → PROCESSING：占座 → 占座之间不触碰座位台账（不会双重扣减）', async () => {
@@ -293,5 +306,246 @@ describe('OrderService._updateStatusWithinTx · 既有释放/占座路径不受�
     expect(mockPrisma.flightSeatClass.updateMany).not.toHaveBeenCalled();
     expect(mockPrisma.seatLock.aggregate).not.toHaveBeenCalled();
     expect(mockPrisma.$executeRaw).not.toHaveBeenCalled();
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════
+// Bug 1（CRITICAL）：DRAFT 座位账死区
+//
+// 修复前 DRAFT 既不在 SEAT_HOLDING_STATUSES 也不在 SEAT_RELEASING_STATUSES —— admin force 可以拿它
+// 当套利死区：force H→DRAFT 不触发释放（sold 原地不动），再 force DRAFT→PAID 触发"非占座→占座"
+// 分支重新占座一次（sold 又 +qty）。反复横跳每次 +qty，单订单就能让 sold 无界增长（超卖 DoS）。
+// 修复：把 DRAFT 并入 SEAT_RELEASING_STATUSES（订单创建路径永远直接落 PENDING_PAYMENT 并与扣座同一
+// 事务原子发生，从未有 DRAFT 状态本身持有真实库存的场景，归类为"释放型"是安全的）。
+// ════════════════════════════════════════════════════════════════════════
+describe('OrderService._updateStatusWithinTx · Bug 1：DRAFT 座位账死区闭环', () => {
+  const service = new OrderService();
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+  });
+
+  it('force PAID → DRAFT：H→DRAFT 走释放分支还库存（不再是死区）', async () => {
+    const order = buildOrder({ status: OrderStatus.PAID });
+    mockPrisma.order.findUnique.mockResolvedValueOnce(order); // toStatus 不是 PAID，无第二次读
+    mockPrisma.order.updateMany.mockResolvedValueOnce({ count: 1 });
+    mockPrisma.orderStatusEvent.create.mockResolvedValueOnce({});
+    mockPrisma.$executeRaw.mockResolvedValueOnce(1); // releaseSeatFloored 命中
+    mockPrisma.flightSeatClass.findFirst.mockResolvedValueOnce({ id: 'sc1' });
+    // wasHolding(PAID)&&isReleasing(DRAFT) 为真且来源不是 PENDING_PAYMENT → 无条件触达佣金冲销
+    // 步骤（即便订单没有代理），_computeRefundRatioByKind 对非 REFUNDED 目标状态直接短路返回，
+    // 不碰 tx；随后的 commissionRecord.findMany 需要显式 mock 成空数组（无代理→无佣金记录可冲）。
+    mockPrisma.commissionRecord.findMany.mockResolvedValueOnce([]);
+    mockPrisma.order.findUniqueOrThrow.mockResolvedValueOnce({ ...order, status: OrderStatus.DRAFT });
+
+    const releasedIds: string[] = [];
+    const result = await service._updateStatusWithinTx(
+      tx,
+      'ord1',
+      OrderStatus.DRAFT,
+      adminRequester,
+      undefined,
+      [],
+      true, // force：ALLOWED_TRANSITIONS[PAID] 不含 DRAFT
+      releasedIds,
+    );
+
+    expect(result.status).toBe(OrderStatus.DRAFT);
+    // 释放走 floor 后的原子 SQL，跟其余释放路径同一口径。
+    expect(mockPrisma.$executeRaw).toHaveBeenCalledTimes(1);
+    const releaseCall = mockPrisma.$executeRaw.mock.calls[0];
+    expect(releaseCall[1]).toBe(1); // qty
+    expect(releaseCall[2]).toBe('sched1'); // scheduleId
+    expect(releaseCall[3]).toBe(CabinClass.ECONOMY); // cabin
+    expect(releasedIds).toEqual(['sc1']);
+    // 重新占座分支绝不应该同时触发（这是释放，不是占座）。
+    expect(mockPrisma.seatLock.aggregate).not.toHaveBeenCalled();
+  });
+
+  it('force DRAFT → PAID：DRAFT→H 对称地重新占座（原子 CAS 命中）', async () => {
+    const order = buildOrder({ status: OrderStatus.DRAFT });
+    mockPrisma.order.findUnique
+      .mockResolvedValueOnce(order) // _updateStatusWithinTx 自己的读
+      .mockResolvedValueOnce({ visaStatus: null }); // createFulfillmentTasks 内部读（toStatus===PAID 必经）
+    mockPrisma.order.updateMany.mockResolvedValueOnce({ count: 1 });
+    mockPrisma.orderStatusEvent.create.mockResolvedValueOnce({});
+    mockPrisma.seatLock.aggregate.mockResolvedValueOnce({ _sum: { qty: null } });
+    mockPrisma.$executeRaw.mockResolvedValueOnce(1); // CAS 命中：sold = sold + qty 成功
+    mockPrisma.orderItem.findMany.mockResolvedValueOnce([]); // createFulfillmentTasks：无行可建任务
+    mockPrisma.order.findUniqueOrThrow.mockResolvedValueOnce({ ...order, status: OrderStatus.PAID });
+
+    const result = await service._updateStatusWithinTx(
+      tx,
+      'ord1',
+      OrderStatus.PAID,
+      adminRequester,
+      undefined,
+      [],
+      true, // force：ALLOWED_TRANSITIONS[DRAFT] 只含 PENDING_PAYMENT/CANCELLED，不含 PAID
+      [],
+    );
+
+    expect(result.status).toBe(OrderStatus.PAID);
+    expect(mockPrisma.$executeRaw).toHaveBeenCalledTimes(1);
+    const retakeCall = mockPrisma.$executeRaw.mock.calls[0];
+    expect(retakeCall[1]).toBe(1); // qty
+    expect(retakeCall[2]).toBe('sched1'); // scheduleId
+    expect(retakeCall[3]).toBe(CabinClass.ECONOMY); // cabin
+    // 释放分支绝不会跟重新占座分支同时触发。
+    expect(mockPrisma.flightSeatClass.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('force DRAFT → PAID：余位不足则拒绝（与其它释放态拉回占座同一保护，不会超卖）', async () => {
+    const order = buildOrder({
+      status: OrderStatus.DRAFT,
+      items: [flightItem({ quantity: 2 })],
+    });
+    mockPrisma.order.findUnique.mockResolvedValueOnce(order);
+    mockPrisma.order.updateMany.mockResolvedValueOnce({ count: 1 });
+    mockPrisma.orderStatusEvent.create.mockResolvedValueOnce({});
+    mockPrisma.seatLock.aggregate.mockResolvedValueOnce({ _sum: { qty: null } });
+    mockPrisma.$executeRaw.mockResolvedValueOnce(0); // CAS 未命中：余位不足
+    mockPrisma.flightSeatClass.findFirst.mockResolvedValueOnce({ capacity: 2, sold: 2 }); // 已售罄
+
+    let caught: unknown;
+    try {
+      await service._updateStatusWithinTx(
+        tx,
+        'ord1',
+        OrderStatus.PAID,
+        adminRequester,
+        undefined,
+        [],
+        true, // force
+        [],
+      );
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(BadRequestError);
+    expect((caught as Error).message).toMatch(/恢复为持有座位状态需重新占座/);
+    // 拒单必须在拿到"转换后"的最终订单之前中止 —— 调用方的 $transaction 才能整体回滚。
+    expect(mockPrisma.order.findUniqueOrThrow).not.toHaveBeenCalled();
+  });
+
+  it('force DRAFT → CANCELLED：释放 → 释放之间不触碰座位台账（DRAFT 本就没持有真实库存）', async () => {
+    const order = buildOrder({ status: OrderStatus.DRAFT });
+    mockPrisma.order.findUnique.mockResolvedValueOnce(order);
+    mockPrisma.order.updateMany.mockResolvedValueOnce({ count: 1 });
+    mockPrisma.orderStatusEvent.create.mockResolvedValueOnce({});
+    mockPrisma.refund.updateMany.mockResolvedValueOnce({ count: 0 }); // toStatus===CANCELLED 的 refund 同步步骤
+    mockPrisma.order.findUniqueOrThrow.mockResolvedValueOnce({ ...order, status: OrderStatus.CANCELLED });
+
+    await service._updateStatusWithinTx(
+      tx,
+      'ord1',
+      OrderStatus.CANCELLED,
+      adminRequester,
+      undefined,
+      [],
+      true, // force（非强制其实也允许，DRAFT→CANCELLED 在 ALLOWED_TRANSITIONS 里，这里统一用 force 复现场景）
+      [],
+    );
+
+    // DRAFT 本身不在 SEAT_HOLDING_STATUSES，wasHolding=false → 释放分支短路，不会二次释放。
+    expect(mockPrisma.flightSeatClass.updateMany).not.toHaveBeenCalled();
+    expect(mockPrisma.$executeRaw).not.toHaveBeenCalled();
+    expect(mockPrisma.seatLock.aggregate).not.toHaveBeenCalled();
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════
+// Bug 6（MEDIUM）：force REFUNDED → PAID 佣金幂等
+//
+// createCommissionsForOrder 原本没有任何幂等保护——正常状态机每单只会经过一次 PENDING_PAYMENT→PAID，
+// 但 admin force 能让同一订单二次触达 toStatus===PAID（例如误操作 force REFUNDED→PAID"复活"一张
+// 已退款单），导致同一订单的佣金链路被重新跑一遍，代理端看见的应得佣金翻倍。
+// 修复：createCommissionsForOrder 开头查该订单是否已有 CommissionRecord，有则直接跳过。
+// ════════════════════════════════════════════════════════════════════════
+describe('OrderService._updateStatusWithinTx · Bug 6：佣金创建幂等', () => {
+  const service = new OrderService();
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+  });
+
+  it('force REFUNDED → PAID：订单已有佣金记录 → 跳过创建，不重复计佣', async () => {
+    // HOTEL 行（非 FLIGHT）：force REFUNDED→PAID 的"非占座→占座"重新占座分支只处理 FLIGHT 行，
+    // 用非 FLIGHT 行可以不必额外搭 seatLock/$executeRaw 的 mock，聚焦测佣金幂等本身。
+    const order = buildOrder({
+      status: OrderStatus.REFUNDED,
+      agentId: 'agent1',
+      items: [{ id: 'item1', kind: 'HOTEL', quantity: 1, flightScheduleId: null, flightCabin: null, metadata: null }],
+    });
+    mockPrisma.order.findUnique
+      .mockResolvedValueOnce(order)
+      .mockResolvedValueOnce({ visaStatus: null }); // createFulfillmentTasks 内部读
+    mockPrisma.order.updateMany.mockResolvedValueOnce({ count: 1 });
+    mockPrisma.orderStatusEvent.create.mockResolvedValueOnce({});
+    // 幂等命中：已有佣金记录 → createCommissionsForOrder 直接 return，不查链路/不建新记录。
+    mockPrisma.commissionRecord.findFirst.mockResolvedValueOnce({ id: 'existing-commission' });
+    mockPrisma.orderItem.findMany.mockResolvedValueOnce([]); // createFulfillmentTasks：无行可建任务
+    mockPrisma.order.findUniqueOrThrow.mockResolvedValueOnce({ ...order, status: OrderStatus.PAID });
+
+    await service._updateStatusWithinTx(
+      tx,
+      'ord1',
+      OrderStatus.PAID,
+      adminRequester,
+      undefined,
+      [],
+      true, // force：REFUNDED 是终态，ALLOWED_TRANSITIONS[REFUNDED]=[]
+      [],
+    );
+
+    expect(mockPrisma.commissionRecord.findFirst).toHaveBeenCalledWith({
+      where: { orderId: 'ord1' },
+      select: { id: true },
+    });
+    expect(mockPrisma.commissionRecord.create).not.toHaveBeenCalled();
+    // 幂等提前 return，链路解析（agent.findUnique/commissionRule.findMany）也不该被无谓触达。
+    expect(mockPrisma.agent.findUnique).not.toHaveBeenCalled();
+    expect(mockPrisma.commissionRule.findMany).not.toHaveBeenCalled();
+  });
+
+  it('正常路径（无既有佣金记录）：仍然按代理链路创建佣金——幂等修复没有破坏首次创建', async () => {
+    const order = buildOrder({
+      status: OrderStatus.PENDING_PAYMENT,
+      agentId: 'agent1',
+      items: [{ id: 'item1', kind: 'HOTEL', quantity: 1, flightScheduleId: null, flightCabin: null, metadata: null }],
+    });
+    mockPrisma.order.findUnique
+      .mockResolvedValueOnce(order)
+      .mockResolvedValueOnce({ visaStatus: null });
+    mockPrisma.order.updateMany.mockResolvedValueOnce({ count: 1 });
+    mockPrisma.orderStatusEvent.create.mockResolvedValueOnce({});
+    mockPrisma.commissionRecord.findFirst.mockResolvedValueOnce(null); // 首次 → 无既有记录
+    mockPrisma.orderItem.findMany
+      .mockResolvedValueOnce([{ id: 'item1', kind: 'HOTEL', amount: 1000 }]) // createCommissionsForOrder 的读
+      .mockResolvedValueOnce([]); // createFulfillmentTasks 的读
+    mockPrisma.agent.findUnique.mockResolvedValueOnce({ parentAgentId: null }); // 单级代理，无上级
+    mockPrisma.commissionRule.findMany.mockResolvedValueOnce([
+      { agentId: 'agent1', rate: 0.1, effectiveFrom: new Date('2020-01-01'), effectiveTo: null },
+    ]);
+    mockPrisma.commissionRecord.create.mockResolvedValueOnce({});
+    mockPrisma.order.findUniqueOrThrow.mockResolvedValueOnce({ ...order, status: OrderStatus.PAID });
+
+    await service._updateStatusWithinTx(
+      tx,
+      'ord1',
+      OrderStatus.PAID,
+      adminRequester,
+      undefined,
+      [],
+      false,
+      [],
+    );
+
+    expect(mockPrisma.commissionRecord.create).toHaveBeenCalledTimes(1);
+    const createCall = mockPrisma.commissionRecord.create.mock.calls[0][0];
+    expect(createCall.data.agentId).toBe('agent1');
+    expect(createCall.data.orderId).toBe('ord1');
+    expect(Number(createCall.data.amount)).toBe(100); // 1000 × 10%
   });
 });
