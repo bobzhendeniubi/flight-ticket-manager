@@ -285,6 +285,7 @@ export async function buildOrdersBySchedule(
   // 避免漏掉批量导入单 / 改期后仍在本班次的单 / 含套餐行但无独立 FLIGHT 行的单。
   const orders = (await client.order.findMany({
     where: {
+      deletedAt: null, // 排除已软删订单
       status: { in: SEAT_HOLDING_STATUSES },
       items: {
         some: {

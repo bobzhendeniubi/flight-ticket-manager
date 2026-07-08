@@ -72,8 +72,8 @@ describe('buildOrderFilterWhere — 勾选导出 vs 筛选导出', () => {
       travelTo: '2026-07-31',
       flightNumber: 'QH9589',
     } as Parameters<typeof buildOrderFilterWhere>[0]);
-    // 只剩 id 集合，其余筛选一律不落到 where（导出=勾了哪些就导哪些）。
-    expect(where).toEqual({ id: { in: ['a', 'b'] } });
+    // 只剩 id 集合（+软删排除），其余筛选一律不落到 where（导出=勾了哪些就导哪些）。
+    expect(where).toEqual({ id: { in: ['a', 'b'] }, deletedAt: null });
   });
 
   it('空 orderIds 数组：视同没勾选，回落到现有筛选', () => {

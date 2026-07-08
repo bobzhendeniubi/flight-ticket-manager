@@ -22,6 +22,18 @@ export class BadRequestError extends AppError {
   }
 }
 
+/**
+ * 同一航班班次的「占座中」订单里已有同证件号乘客。
+ * 稳定 code=DUPLICATE_PASSENGER，前端据此弹「确认重复录入」二次确认（不靠中文文案匹配）；
+ * details.conflicts 带证件号 + 冲突订单号，供前端组织确认文案。
+ */
+export class DuplicatePassengerError extends AppError {
+  constructor(message = '存在重复乘客', details?: unknown) {
+    super(message, { statusCode: 400, code: 'DUPLICATE_PASSENGER', details });
+    this.name = 'DuplicatePassengerError';
+  }
+}
+
 export class UnauthorizedError extends AppError {
   constructor(message = 'Unauthorized') {
     super(message, { statusCode: 401, code: 'UNAUTHORIZED' });

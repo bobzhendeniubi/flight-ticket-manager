@@ -390,7 +390,7 @@ export async function buildFinanceExportWorkbook(
   const toD = new Date(Date.UTC(y2, m2 - 1, d2, 23, 59, 59, 999));
 
   const orders = (await client.order.findMany({
-    where: { createdAt: { gte: fromD, lte: toD }, status: { in: COUNTED_STATUSES } },
+    where: { deletedAt: null, createdAt: { gte: fromD, lte: toD }, status: { in: COUNTED_STATUSES } },
     orderBy: { createdAt: 'asc' },
     include: {
       agent: { select: { companyName: true, contactName: true } },

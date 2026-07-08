@@ -37,9 +37,10 @@ export class DashboardService {
       revenueAndCount(yesterdayStart, todayStart),
       revenueAndCount(thisMonthStart, tomorrowStart),
       revenueAndCount(lastMonthStart, thisMonthStart),
-      prisma.order.count({ where: { status: 'PENDING_PAYMENT' } }),
+      prisma.order.count({ where: { deletedAt: null, status: 'PENDING_PAYMENT' } }),
       prisma.order.findMany({
         where: {
+          deletedAt: null, // 排除已软删订单（本查询无状态过滤）
           agentId: { not: null },
           createdAt: { gte: activeWindow },
         },
@@ -82,6 +83,7 @@ export class DashboardService {
       FROM "Order"
       WHERE "createdAt" >= ${windowStart}
         AND "createdAt" < ${windowEnd}
+        AND "deletedAt" IS NULL
         AND status IN ('PAID','PROCESSING','TICKETED','COMPLETED','CHANGE_REQUESTED','CHANGED')
       GROUP BY day
       ORDER BY day ASC
@@ -115,6 +117,7 @@ export class DashboardService {
     const rows = await prisma.order.groupBy({
       by: ['agentId'],
       where: {
+        deletedAt: null,
         agentId: { not: null },
         status: { in: PAID_LIKE_STATUSES },
         createdAt: { gte: monthStart },
@@ -158,6 +161,7 @@ function pctChange(cur: number, prev: number): number {
 async function revenueAndCount(gte: Date, lt: Date): Promise<{ revenue: number; orders: number }> {
   const agg = await prisma.order.aggregate({
     where: {
+      deletedAt: null,
       status: { in: PAID_LIKE_STATUSES },
       createdAt: { gte, lt },
     },

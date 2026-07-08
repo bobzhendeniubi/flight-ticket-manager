@@ -197,7 +197,7 @@ export async function getFinancesSummary(
 
   // ── 1) 拉订单 + items（含 flightSchedule 全成本字段、产品成本、座位）+ passengers 数 + costItems ──
   const orders = await client.order.findMany({
-    where: { createdAt: { gte: from, lte: to }, status: { in: COUNTED_STATUSES } },
+    where: { deletedAt: null, createdAt: { gte: from, lte: to }, status: { in: COUNTED_STATUSES } },
     select: {
       id: true,
       total: true,
@@ -490,7 +490,7 @@ export async function getFlightPnl(
       seatClasses: { select: { capacity: true, sold: true } },
       orderItems: {
         where: {
-          order: { status: { in: COUNTED_STATUSES } },
+          order: { deletedAt: null, status: { in: COUNTED_STATUSES } },
         },
         select: { amount: true },
       },
@@ -541,6 +541,7 @@ export async function getOrderPnl(
 
   const orders = await client.order.findMany({
     where: {
+      deletedAt: null,
       createdAt: { gte: from, lte: to },
       status: { in: COUNTED_STATUSES },
     },

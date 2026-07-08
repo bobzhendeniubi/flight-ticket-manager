@@ -20,6 +20,7 @@ import {
   orderIdsQuerySchema,
   orderStructuredNotesShape,
   publicOrderLookupQuerySchema,
+  quoteOrderBodySchema,
   rescheduleOrderBodySchema,
   swapItemHotelBodySchema,
   swapPassengerBodySchema,
@@ -97,6 +98,19 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         },
       });
       return reply.status(201).send({ order });
+    },
+  );
+
+  // ── 录单前试算（quote，只算不落库）— ADMIN/STAFF ──────────────────────
+  // POST /orders/quote：body 为 createOrder items 子集，走同一权威定价 priceAndValidateItems，
+  // 只算价格、绝不写库/扣座。录单页填完产品/人数即可拿到「系统价」在提交前展示。
+  app.post(
+    '/quote',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    async (req, reply) => {
+      const body = quoteOrderBodySchema.parse(req.body);
+      const quote = await service.quoteOrder(body);
+      return reply.send(quote);
     },
   );
 
@@ -673,6 +687,31 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     return { ok: true, claimedBy: updated.claimedBy };
   });
 
+  // ── 软删除订单（仅 ADMIN）──
+  // DELETE /orders/:id — 软删：从所有列表/导出/统计里消失，数据保留可追溯（审计记录谁删的）。
+  //   前置守卫（service.softDeleteOrder）：仍占座的订单拒删（需先取消释放座位），只允许删已释放型
+  //   状态（CANCELLED/PAYMENT_TIMEOUT/REFUNDED/FAILED/DRAFT）。删除本身绝不触碰库存/座位账。
+  app.delete(
+    '/:id',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN)] },
+    async (req) => {
+      const { id } = req.params as { id: string };
+      const requester = await buildRequester(req.user.sub, req.user.role);
+      const { before, after } = await service.softDeleteOrder(id, requester);
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'SOFT_DELETE_ORDER',
+        targetType: 'ORDER',
+        targetId: before.id,
+        targetLabel: before.orderNumber,
+        before: { status: before.status, deletedAt: null },
+        after: { status: after.status, deletedAt: after.deletedAt },
+        severity: 'WARNING',
+      });
+      return { ok: true, id: after.id, deletedAt: after.deletedAt };
+    },
+  );
+
   // ── 套票分房（管理员设置 / 修改）──
   // PUT /orders/:id/room-assignment
   app.put('/:id/room-assignment', { preHandler: [app.authenticate] }, async (req, reply) => {
@@ -1096,6 +1135,11 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         visaTasksReset: audit.visaTasksReset,
         feeCny: audit.feeCny,
         note: body.note,
+        // 换人（证件号变化）时清除了旧出行人的护照/签证/出生地信息
+        clearedProfile: audit.clearedProfile,
+        clearedProfileNote: audit.clearedProfile
+          ? `换人：${audit.before.documentNumber || '—'}→${audit.after.documentNumber || '—'}，已清除旧护照/签证信息`
+          : undefined,
       },
       severity: 'WARNING',
     });

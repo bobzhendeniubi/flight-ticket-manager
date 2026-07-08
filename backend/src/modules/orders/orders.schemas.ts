@@ -17,6 +17,52 @@ export const SETTLEMENT_PRICE_CAP_CNY = 100_000;
 // 售后费用（改期费/换人费）上限（CNY）。防误输天价；正常售后费远低于此。
 export const POST_SALE_FEE_CAP_CNY = 100_000;
 
+// ── 录单调价/加项（ADMIN/STAFF 录单专用）──────────────────────────────────
+// 业务场景：录单时有优惠 / 行程变更 / 升舱 / 升级酒店 / 签证改多签等需要在系统权威价上
+// 手工加减金额。此处只承载「一笔调整」的金额 + 原因；不放开裸手填整单价（服务端权威定价
+// 仍是安全底线）。金额（CNY，整数）可正（加钱）可负（减价/优惠），0 无意义 → 拒绝。
+export const PRICE_ADJUSTMENT_CAP_CNY = 100_000;
+
+// 调整原因下拉（枚举 + 其它自由文本）。label 供服务端拼调整行描述用（前后端各存一份，避免耦合）。
+export const PRICE_ADJUSTMENT_REASON = [
+  'DISCOUNT', // 优惠
+  'CHANGE', // 变更
+  'UPGRADE_CABIN', // 升舱
+  'UPGRADE_HOTEL', // 升级酒店
+  'VISA_MULTI', // 签证改多签
+  'OTHER', // 其它（配合 reasonText）
+] as const;
+export type PriceAdjustmentReason = (typeof PRICE_ADJUSTMENT_REASON)[number];
+
+export const PRICE_ADJUSTMENT_REASON_LABEL: Record<PriceAdjustmentReason, string> = {
+  DISCOUNT: '优惠',
+  CHANGE: '变更',
+  UPGRADE_CABIN: '升舱',
+  UPGRADE_HOTEL: '升级酒店',
+  VISA_MULTI: '签证改多签',
+  OTHER: '其它',
+};
+
+export const priceAdjustmentSchema = z
+  .object({
+    // 可正（加钱）可负（减价），整数 CNY；0 无意义（不调整就别传该字段）。
+    amountCny: z
+      .number()
+      .int('调整金额必须为整数（CNY）')
+      .refine((v) => v !== 0, { message: '调整金额不能为 0（不调整请勿传该字段）' })
+      .refine((v) => Math.abs(v) <= PRICE_ADJUSTMENT_CAP_CNY, {
+        message: `调整金额超出上限（±${PRICE_ADJUSTMENT_CAP_CNY}）`,
+      }),
+    reasonCode: z.enum(PRICE_ADJUSTMENT_REASON),
+    reasonText: z.string().max(200).optional(),
+  })
+  // 「其它」必须补一句文本，避免出现无从追溯的匿名调价。
+  .refine((v) => v.reasonCode !== 'OTHER' || Boolean(v.reasonText?.trim()), {
+    message: '选择「其它」时必须填写调整原因说明',
+    path: ['reasonText'],
+  });
+export type PriceAdjustmentInput = z.infer<typeof priceAdjustmentSchema>;
+
 // ── 订单级签证状态 + 结构化备注四栏（录单/编辑共用）─────────────────────────
 // 全部 optional：老客户端不传则字段留空，与旧行为一致。每栏限 ~300 字。
 const STRUCTURED_NOTE_MAX = 300;
@@ -201,8 +247,23 @@ export const createOrderBodySchema = z.object({
     .min(0)
     .max(SETTLEMENT_PRICE_CAP_CNY)
     .optional(),
+  // 录单调价/加项（仅 ADMIN/STAFF 录单生效）。服务端按认证身份判权限：公开散客/客户/代理
+  // 携带此字段一律 400（见 createOrder）。落一条独立 OrderItem 计入 total，并写审计。
+  priceAdjustment: priceAdjustmentSchema.optional(),
+  // 允许重复乘客强录（仅 ADMIN/STAFF 后台录入生效）。客人重复订票且已付款场景：
+  // 同班次同证件号本会被拦，运营确认后带此 flag 放行，服务端写审计 + 订单备注留痕。
+  // 服务端按认证身份判权限：散客/AGENT 携带此字段无效，照旧拦（见 createOrder）。
+  allowDuplicatePassengers: z.boolean().optional(),
 });
 export type CreateOrderBody = z.infer<typeof createOrderBodySchema>;
+
+// ── 录单前试算（quote，只算不落库；ADMIN/STAFF）───────────────────────────
+// body 为 createOrder items 子集：填完产品/人数即可拿到「系统权威价」，供录单页展示。
+// 复用 priceAndValidateItems 的权威定价逻辑，绝不写库、绝不扣座。
+export const quoteOrderBodySchema = z.object({
+  items: z.array(orderItemInputSchema).min(1).max(20),
+});
+export type QuoteOrderBody = z.infer<typeof quoteOrderBodySchema>;
 
 // ── 列表 / 详情 ─────────────────────────────────────────────────────────
 export const listOrdersQuerySchema = z.object({
@@ -379,7 +440,14 @@ export const batchCreateOrdersBodySchema = z
       .optional(),
     // 团期备注（写入每张子单 notes + noteSpecial）
     groupNote: z.string().max(500).optional(),
-    passengers: z.array(passengerInputSchema).min(1).max(100), // 每位 → 一单
+    // 允许重复乘客强录（仅 ADMIN/STAFF 生效；透传给每张子单的 createOrder）。
+    // 客人重复订票且已付款场景：同班次同证件号本会整批拒，运营确认后带此 flag 放行。
+    allowDuplicatePassengers: z.boolean().optional(),
+    // 每位 → 一单。note 为该乘客个别备注（选填），与整批备注合并写入本人订单 notes。
+    passengers: z
+      .array(passengerInputSchema.extend({ note: z.string().max(500).optional() }))
+      .min(1)
+      .max(100),
   })
   .superRefine((val, ctx) => {
     const pt = val.productType;

@@ -24,6 +24,29 @@ export class ApiError extends Error {
   }
 }
 
+/**
+ * 重复乘客拦截错误的稳定 code（后端 DuplicatePassengerError）。前端按 code 判，
+ * 绝不靠中文文案匹配。命中即弹「确认仍要录入」二次确认，确认后带 allowDuplicatePassengers 重试。
+ */
+export const DUPLICATE_PASSENGER_CODE = 'DUPLICATE_PASSENGER';
+
+/** 从 DUPLICATE_PASSENGER 错误的 details 里提取冲突订单号（去重）。非该错误 / 结构异常 → []。 */
+export function duplicatePassengerConflictOrderNumbers(err: unknown): string[] {
+  if (!(err instanceof ApiError) || err.code !== DUPLICATE_PASSENGER_CODE) return [];
+  const details = err.details;
+  if (!details || typeof details !== 'object') return [];
+  const conflicts = (details as { conflicts?: unknown }).conflicts;
+  if (!Array.isArray(conflicts)) return [];
+  const orderNumbers = new Set<string>();
+  for (const c of conflicts) {
+    const nums = (c as { orderNumbers?: unknown }).orderNumbers;
+    if (Array.isArray(nums)) {
+      for (const n of nums) if (typeof n === 'string') orderNumbers.add(n);
+    }
+  }
+  return [...orderNumbers];
+}
+
 type ApiRequestInit = Omit<RequestInit, 'body'> & {
   body?: unknown;
   token?: string | null;
@@ -224,6 +247,8 @@ export interface BatchOrderPassenger {
   firstName?: string;
   gender?: 'M' | 'F';
   passportExpiry?: string;
+  /** 该乘客个别备注（选填）：与整批备注合并写入该乘客订单。 */
+  note?: string;
 }
 export interface BatchCreateOrdersInput {
   productType?: BatchProductType;
@@ -258,6 +283,11 @@ export interface BatchCreateOrdersInput {
   settlementPriceCny?: number;
   /** 团期备注（如「2026 春节团 7 日」），写入每单。 */
   groupNote?: string;
+  /**
+   * 允许重复乘客强录（仅 ADMIN/STAFF 生效）。同班次同证件号本会整批拒（DUPLICATE_PASSENGER），
+   * 运营二次确认后带 true 重试。透传给每张子单。
+   */
+  allowDuplicatePassengers?: boolean;
 }
 
 /** POST /orders/roster/parse 返回的一行（11 列新模版；字段可缺省，后续手录补全） */
@@ -383,6 +413,45 @@ export interface OrderStructuredNotes {
   noteSpecial?: string;
 }
 
+// 录单调价/加项（仅 ADMIN/STAFF 录单）：在系统权威价上手工加减一笔金额 + 原因。
+// 金额（CNY 整数）可正（加钱：升舱/多签/变更…）可负（减价/优惠）；服务端按认证身份判权限。
+export type PriceAdjustmentReason =
+  | 'DISCOUNT'
+  | 'CHANGE'
+  | 'UPGRADE_CABIN'
+  | 'UPGRADE_HOTEL'
+  | 'VISA_MULTI'
+  | 'OTHER';
+
+export const PRICE_ADJUSTMENT_REASON_LABEL: Record<PriceAdjustmentReason, string> = {
+  DISCOUNT: '优惠',
+  CHANGE: '变更',
+  UPGRADE_CABIN: '升舱',
+  UPGRADE_HOTEL: '升级酒店',
+  VISA_MULTI: '签证改多签',
+  OTHER: '其它',
+};
+
+export interface PriceAdjustmentInput {
+  amountCny: number;
+  reasonCode: PriceAdjustmentReason;
+  reasonText?: string;
+}
+
+// 录单前试算（系统价）。items 与 createOrder 同结构。
+export interface QuoteOrderResult {
+  currency: string;
+  subtotal: number;
+  total: number;
+  items: Array<{
+    kind: OrderItemKind;
+    description: string;
+    quantity: number;
+    unitPrice: number;
+    amount: number;
+  }>;
+}
+
 export interface CreateOrderInput extends OrderStructuredNotes {
   contactName?: string;
   contactPhone?: string;
@@ -392,12 +461,19 @@ export interface CreateOrderInput extends OrderStructuredNotes {
   passengers: OrderPassengerInput[];
   notes?: string;
   idempotencyKey?: string;
+  /** 录单调价/加项（ADMIN/STAFF 录单专用；服务端按认证身份判权限） */
+  priceAdjustment?: PriceAdjustmentInput;
   /**
    * 代为某代理录单（ADMIN/STAFF 用）。直客/无代理 = 不传。
    * 注：服务端创单接口对 agentId 的归属支持为后端配套改动；本字段为前向兼容透传，
    * 服务端未启用时会被静默忽略（不报错）。
    */
   agentId?: string;
+  /**
+   * 允许重复乘客强录（仅 ADMIN/STAFF 生效）。客人重复订票且已付款场景：同班次同证件号本会
+   * 被拦（错误 code=DUPLICATE_PASSENGER），运营二次确认后带 true 重试。服务端按认证身份判权限。
+   */
+  allowDuplicatePassengers?: boolean;
 }
 
 /**
@@ -1565,6 +1641,13 @@ export const api = {
       token,
       body: { toStatus, reason, force },
     }),
+  // 软删订单（仅 ADMIN）：从所有列表/导出/统计里消失，数据保留可追溯，不影响座位账。
+  // 后端守卫：仍占座的订单会 4xx（需先取消释放座位）。
+  deleteOrder: (token: string, id: string) =>
+    apiFetch<{ ok: true; id: string; deletedAt: string | null }>(`/orders/${id}`, {
+      method: 'DELETE',
+      token,
+    }),
   batchUpdateOrderStatus: (
     token: string,
     ids: string[],
@@ -1619,6 +1702,10 @@ export const api = {
   // 单笔录单（按产品类型 机票/酒店/签证/套餐/接送）。服务端按产品权威重算价格 + 校验余票。
   createOrder: (token: string, body: CreateOrderInput) =>
     apiFetch<{ order: OrderSummary }>('/orders/', { method: 'POST', token, body }),
+
+  // 录单前试算「系统价」（只算不落库；ADMIN/STAFF）。items 与 createOrder 同结构。
+  quoteOrder: (token: string, body: { items: CreateOrderItemInput[] }) =>
+    apiFetch<QuoteOrderResult>('/orders/quote', { method: 'POST', token, body }),
 
   // 设置开票状态（ADMIN/STAFF）
   setInvoiceStatus: (token: string, id: string, invoiceStatus: InvoiceStatus) =>

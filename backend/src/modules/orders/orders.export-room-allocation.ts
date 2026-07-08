@@ -453,7 +453,7 @@ async function queryRoomItemsByCheckInRange(
     where: {
       hotelRoomTypeId: { not: null },
       hotelCheckIn: { gte: fromD, lte: toD },
-      order: { status: { in: COUNTED_STATUSES } },
+      order: { deletedAt: null, status: { in: COUNTED_STATUSES } },
     },
     orderBy: { createdAt: 'asc' },
     include: ROOM_ITEM_INCLUDE,
@@ -481,6 +481,7 @@ async function queryRoomItemsByDepartDate(
     where: {
       hotelRoomTypeId: { not: null },
       order: {
+        deletedAt: null, // 排除已软删订单
         status: { in: COUNTED_STATUSES },
         OR: [
           {

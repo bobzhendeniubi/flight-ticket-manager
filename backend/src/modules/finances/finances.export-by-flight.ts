@@ -141,7 +141,7 @@ export async function buildFinanceExportByFlightWorkbook(
   const flightItems = await client.orderItem.findMany({
     where: {
       flightScheduleId: { in: scheduleIds },
-      order: { status: { in: COUNTED_STATUSES } },
+      order: { deletedAt: null, status: { in: COUNTED_STATUSES } },
     },
     select: { orderId: true, flightScheduleId: true },
   });

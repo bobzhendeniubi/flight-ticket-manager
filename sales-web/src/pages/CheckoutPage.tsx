@@ -279,8 +279,12 @@ export function CheckoutPage() {
           <p className="mt-1 inline-block rounded-xl bg-canvas px-4 py-1.5 font-mono text-lg font-semibold text-ink nums">
             {done.orderNumber}
           </p>
-          {done.paymentExpiresAt && (
+          {done.paymentExpiresAt ? (
             <HoldCountdown expiresAt={done.paymentExpiresAt} />
+          ) : (
+            <div className="mt-4 rounded-xl border border-slate-200/80 bg-canvas px-3 py-2.5 text-sm text-ink-soft">
+              🎫 座位已锁定，线下结算 · 不限时
+            </div>
           )}
           <p className="mt-4 text-sm text-ink-muted">
             订单已创建，状态为 <span className="badge-sun">待确认</span>。

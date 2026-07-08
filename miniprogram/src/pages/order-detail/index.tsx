@@ -129,6 +129,9 @@ export default function OrderDetailPage() {
               : '支付超时，座位已释放'}
           </Text>
         )}
+        {order.status === 'PENDING_PAYMENT' && !order.paymentExpiresAt && (
+          <Text className='sub'>座位已锁定 · 线下结算 · 不限时</Text>
+        )}
       </View>
 
       <View className='card'>

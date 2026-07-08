@@ -208,8 +208,14 @@ const seatHoldWorker = new Worker<SeatHoldJobData>(
       return { skipped: true, reason: `status=${order.status}` };
     }
 
+    // 不限时订单（后台/代理录入，paymentExpiresAt=null）→ 机位永不自动释放，直接跳过。
+    // 正常路径下这类单不会入队；此为防御性兜底，避免 null 被当成「已超时」而误放机位。
+    if (!order.paymentExpiresAt) {
+      return { skipped: true, reason: 'no payment timeout (staff/agent-entered)' };
+    }
+
     // 已手动延长过期时间（e.g. 客户协商）→ 重新排队剩余时长
-    if (order.paymentExpiresAt && order.paymentExpiresAt.getTime() > Date.now()) {
+    if (order.paymentExpiresAt.getTime() > Date.now()) {
       return { skipped: true, reason: 'expiresAt extended', requeueSuggested: true };
     }
 

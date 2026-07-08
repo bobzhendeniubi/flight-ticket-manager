@@ -17,6 +17,7 @@ export async function countIssuedPassengers(db: Db, scheduleId: string): Promise
   return db.passenger.count({
     where: {
       order: {
+        deletedAt: null, // 排除已软删订单（本查询只按 invoiceStatus 过滤，不看订单状态）
         invoiceStatus: InvoiceStatus.ISSUED,
         items: { some: { kind: OrderItemKind.FLIGHT, flightScheduleId: scheduleId } },
       },

@@ -61,6 +61,7 @@ export async function queryOrdersByDepartDateForVisa(
   const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000);
   return (await client.order.findMany({
     where: {
+      deletedAt: null, // 排除已软删订单
       status: { in: COUNTED_STATUSES },
       OR: [
         {

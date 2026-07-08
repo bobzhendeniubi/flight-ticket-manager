@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from 'react';
-import { api, ApiError, SETTLEMENT_MODE_LABEL, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceStatus, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle } from '../lib/api';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { api, ApiError, duplicatePassengerConflictOrderNumbers, SETTLEMENT_MODE_LABEL, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceStatus, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { useFlightSeats } from '../stores/flightSeats';
 import {
@@ -321,22 +321,19 @@ export function OrdersPage() {
   const deleteOrder = async (order: OrderSummary) => {
     if (!tokens?.accessToken) return;
     const confirmed = window.confirm(
-      `删除订单 ${order.orderNumber}？\n\n删除后机位/酒店将退回库存，且不可恢复。`,
+      `删除订单 ${order.orderNumber}？\n\n` +
+        `软删除：订单从所有列表/导出/统计里消失，数据保留可追溯（审计记录），不影响座位账。\n` +
+        `注意：仍占座的订单需先取消订单释放座位，才能删除。`,
     );
     if (!confirmed) return;
     try {
-      const res = await api.updateOrderStatus(
-        tokens.accessToken,
-        order.id,
-        'CANCELLED',
-        '录入错误删除',
-        true, // force
-      );
-      setOrders((prev) => prev.map((o) => (o.id === order.id ? res.order : o)));
-      setSelected((prev) => (prev && prev.id === order.id ? res.order : prev));
-      // 删除（强制取消）会退回机位库存 → 广播座位变更。
-      bumpSeats();
+      await api.deleteOrder(tokens.accessToken, order.id);
+      // 软删后该单从列表隐藏 → 从本地列表移除，并关闭抽屉（若打开的是这单）。
+      setOrders((prev) => prev.filter((o) => o.id !== order.id));
+      setSelected((prev) => (prev && prev.id === order.id ? null : prev));
+      // 软删不触碰库存/座位账，无需广播座位变更。
     } catch (err) {
+      // 占座守卫等 4xx 的后端提示（如「请先取消订单释放座位，再删除」）直接透传。
       alert(err instanceof ApiError ? `删除失败：${err.message}` : '删除失败');
     }
   };
@@ -1512,7 +1509,7 @@ function OrderDrawer({
                 删除订单（ADMIN）
               </button>
               <p className="mt-1 text-[11px] text-rose-400">
-                删除后机位/酒店将退回库存，且不可恢复。
+                软删除：从列表/导出/统计隐藏，数据可追溯，不影响座位账。仍占座需先取消订单释放座位。
               </p>
             </section>
           )}
@@ -2441,8 +2438,26 @@ function AdjustmentsSection({ order }: { order: OrderSummary }) {
   );
 }
 
+/** 护照姓名按航司/证件口径显示为「姓/名」斜线格式（大写），无拆分时回退全名 */
+function toSlashName(p: { lastName?: string | null; firstName?: string | null; fullName: string }): string {
+  const last = (p.lastName ?? '').trim().toUpperCase();
+  const first = (p.firstName ?? '').trim().toUpperCase();
+  if (last && first) return `${last}/${first}`;
+  if (last || first) return last || first;
+  return p.fullName;
+}
+
+/** 性别徽标文案（缺失显示 —，OCR 未取到时不留空） */
+function genderLabel(gender?: 'M' | 'F' | 'X' | null): string {
+  if (gender === 'M') return '男';
+  if (gender === 'F') return '女';
+  if (gender === 'X') return '其他';
+  return '—';
+}
+
 function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onOrderUpdated?: (order: OrderSummary) => void }) {
   const [editingId, setEditingId] = useState<string | null>(null);
+  const [lightbox, setLightbox] = useState<{ photoUrl: string; title: string } | null>(null);
   return (
     <section>
       <h3 className="text-sm font-medium text-slate-700">乘客 ({order.passengers.length})</h3>
@@ -2471,8 +2486,9 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
               <div className="flex items-start justify-between gap-2">
                 <div className="flex-1">
                   <div className="font-medium text-slate-900">
-                    {p.fullName}
-                    {p.gender && <span className="ml-2 text-xs text-slate-500">{p.gender === 'M' ? '男' : p.gender === 'F' ? '女' : '其他'}</span>}
+                    <span className="font-mono tracking-wide">{toSlashName(p)}</span>
+                    {p.chineseName && <span className="ml-2 font-normal text-slate-600">{p.chineseName}</span>}
+                    <span className="ml-2 text-xs font-normal text-slate-500">{genderLabel(p.gender)}</span>
                     <button
                       className="ml-2 text-[11px] font-normal text-brand hover:text-brand-dark"
                       onClick={() => setEditingId(p.id)}
@@ -2480,11 +2496,11 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
                       换人/编辑
                     </button>
                   </div>
-                  <div className="mt-0.5 text-xs">
-                    {p.chineseName
-                      ? <span className="text-slate-700">{p.chineseName}</span>
-                      : <span className="text-slate-400">未录中文名</span>}
-                  </div>
+                  {!p.chineseName && (
+                    <div className="mt-0.5 text-xs">
+                      <span className="text-slate-400">未录中文名</span>
+                    </div>
+                  )}
                   <dl className="mt-1 grid grid-cols-2 gap-x-3 gap-y-0.5 text-[11px] text-slate-600">
                     <dt>护照号</dt><dd className="font-mono">{p.documentNumber ?? '—'}</dd>
                     <dt>出生日期</dt><dd className="font-mono">{p.dateOfBirth?.slice(0, 10) ?? '—'}</dd>
@@ -2516,16 +2532,141 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
                   </dl>
                 </div>
                 {p.passportPhotoUrl && (
-                  <a href={p.passportPhotoUrl} target="_blank" rel="noreferrer" className="shrink-0">
-                    <img src={p.passportPhotoUrl} alt="passport" className="h-14 w-14 rounded border border-slate-300 object-cover" />
-                  </a>
+                  <button
+                    type="button"
+                    className="shrink-0 cursor-zoom-in rounded border border-slate-300 transition-shadow hover:shadow-md focus:outline-none focus:ring-2 focus:ring-brand/50"
+                    title="点击放大核对护照信息（可拖动 / 缩放）"
+                    onClick={() =>
+                      setLightbox({
+                        photoUrl: p.passportPhotoUrl!,
+                        title: [toSlashName(p), p.chineseName, p.documentNumber].filter(Boolean).join(' · '),
+                      })
+                    }
+                  >
+                    <img src={p.passportPhotoUrl} alt="护照" className="h-14 w-14 rounded object-cover" />
+                  </button>
                 )}
               </div>
             </li>
           );
         })}
       </ul>
+      {lightbox && (
+        <PassportLightbox
+          photoUrl={lightbox.photoUrl}
+          title={lightbox.title}
+          onClose={() => setLightbox(null)}
+        />
+      )}
     </section>
+  );
+}
+
+// ── 护照大图查看层（可拖动定位 + 缩放，便于挪到一侧对照乘客信息核对）─────────────
+// 采用「浮动面板」而非全屏遮罩：不遮挡抽屉里的乘客信息，方便左右并排核对。
+function PassportLightbox({
+  photoUrl,
+  title,
+  onClose,
+}: {
+  photoUrl: string;
+  title: string;
+  onClose: () => void;
+}) {
+  const MIN_SCALE = 0.5;
+  const MAX_SCALE = 5;
+  const SCALE_STEP = 0.25;
+  const clampScale = (s: number): number => Math.min(MAX_SCALE, Math.max(MIN_SCALE, s));
+
+  // 面板初始落在偏右位置，避免开局就压住左侧乘客信息
+  const [pos, setPos] = useState<{ x: number; y: number }>(() => ({
+    x: typeof window !== 'undefined' ? Math.round(window.innerWidth * 0.52) : 400,
+    y: 72,
+  }));
+  const [scale, setScale] = useState(1);
+  const dragRef = useRef<{ startX: number; startY: number; baseX: number; baseY: number } | null>(null);
+
+  useEffect(() => {
+    function onKey(e: KeyboardEvent): void {
+      if (e.key === 'Escape') onClose();
+    }
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  function startDrag(e: React.PointerEvent<HTMLDivElement>): void {
+    e.preventDefault();
+    e.currentTarget.setPointerCapture(e.pointerId);
+    dragRef.current = { startX: e.clientX, startY: e.clientY, baseX: pos.x, baseY: pos.y };
+  }
+  function onDrag(e: React.PointerEvent<HTMLDivElement>): void {
+    const d = dragRef.current;
+    if (!d) return;
+    setPos({ x: d.baseX + (e.clientX - d.startX), y: d.baseY + (e.clientY - d.startY) });
+  }
+  function endDrag(e: React.PointerEvent<HTMLDivElement>): void {
+    dragRef.current = null;
+    e.currentTarget.releasePointerCapture(e.pointerId);
+  }
+  function onWheel(e: React.WheelEvent<HTMLDivElement>): void {
+    setScale((s) => clampScale(s + (e.deltaY < 0 ? SCALE_STEP : -SCALE_STEP)));
+  }
+
+  const btnCls =
+    'flex h-6 w-6 items-center justify-center rounded text-white/90 hover:bg-white/20 disabled:opacity-40';
+
+  return (
+    <div
+      className="fixed z-50 flex max-h-[82vh] w-[min(440px,88vw)] flex-col overflow-hidden rounded-lg border border-white/10 bg-slate-900/95 shadow-2xl"
+      style={{ left: pos.x, top: pos.y }}
+    >
+      {/* 拖动条：按住此处可把大图挪到任意位置，与左侧信息并排核对 */}
+      <div
+        className="flex cursor-move items-center gap-1 bg-slate-800 px-2 py-1.5 text-white select-none"
+        onPointerDown={startDrag}
+        onPointerMove={onDrag}
+        onPointerUp={endDrag}
+        onPointerCancel={endDrag}
+      >
+        <span className="mr-auto max-w-[200px] truncate text-xs font-medium" title={title}>
+          {title || '护照'}
+        </span>
+        <button type="button" className={btnCls} title="缩小" onClick={() => setScale((s) => clampScale(s - SCALE_STEP))}>
+          −
+        </button>
+        <span className="w-10 text-center text-[11px] tabular-nums text-white/80">{Math.round(scale * 100)}%</span>
+        <button type="button" className={btnCls} title="放大" onClick={() => setScale((s) => clampScale(s + SCALE_STEP))}>
+          +
+        </button>
+        <button type="button" className={`${btnCls} w-auto px-1.5 text-[11px]`} title="复位" onClick={() => setScale(1)}>
+          复位
+        </button>
+        <a
+          href={photoUrl}
+          download="passport.jpg"
+          className={`${btnCls} w-auto px-1.5 text-[11px]`}
+          title="下载此护照图"
+        >
+          下载
+        </a>
+        <button type="button" className={btnCls} title="关闭（Esc）" onClick={onClose}>
+          ✕
+        </button>
+      </div>
+      {/* 图片区：溢出可滚动；滚轮缩放 */}
+      <div className="min-h-0 flex-1 overflow-auto bg-slate-950/40 p-2" onWheel={onWheel}>
+        <img
+          src={photoUrl}
+          alt="护照大图"
+          draggable={false}
+          style={{ width: `${scale * 100}%` }}
+          className="mx-auto block max-w-none rounded"
+        />
+      </div>
+      <p className="bg-slate-800 px-2 py-1 text-center text-[10px] text-white/60 select-none">
+        拖动标题栏移动 · 滚轮或 +/− 缩放 · Esc 关闭
+      </p>
+    </div>
   );
 }
 
@@ -2568,7 +2709,14 @@ function PassengerEditForm({
       if (!parsed) { setErr('出生日期格式不正确（示例：1990-01-01）'); return; }
       dobValue = parsed;
     }
-    if (!confirm('确认保存出行人改动？如勾选了重置开票/签证将清除对应状态，填了换人费将计入订单尾款。')) return;
+    // 证件号变化 = 真换人：后端会清除旧出行人残留的护照/签证信息，需显式二次确认防误清。
+    const newDoc = documentNumber.trim();
+    const isRealSwap = newDoc !== '' && newDoc !== (passenger.documentNumber ?? '');
+    if (isRealSwap) {
+      if (!confirm('确认换人？证件号已变更，原出行人的护照/签证信息（护照照片、签发地、有效期、签证号等）将被清除，仅保留本次填写的新值。此操作会记入审计。')) return;
+    } else {
+      if (!confirm('确认保存出行人改动？如勾选了重置开票/签证将清除对应状态，填了换人费将计入订单尾款。')) return;
+    }
     setSubmitting(true);
     try {
       const res = await api.updateOrderPassenger(token, orderId, passenger.id, {
@@ -3055,6 +3203,8 @@ interface BatchRow {
   documentNumber: string;
   /** 用户原始输入（如 1990-01-01 / 1990/1/1），提交时统一解析为 ISO。 */
   dateOfBirth: string;
+  /** 该乘客的个别备注（选填）：客人各自的特殊要求，随本人订单单独存。留空则只写整批备注。 */
+  note?: string;
 }
 
 /**
@@ -3292,37 +3442,62 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
       settlementPriceCny !== null && Number.isFinite(settlementPriceCny) && settlementPriceCny > 0
         ? settlementPriceCny : undefined;
 
+    const batchPayload = {
+      productType,
+      ...(productType === 'FLIGHT_ONEWAY' || productType === 'FLIGHT_ROUNDTRIP'
+        ? {
+            outboundScheduleId,
+            ...(productType === 'FLIGHT_ROUNDTRIP' ? { returnScheduleId } : {}),
+            flightCabin: cabin as CabinClass,
+          }
+        : {
+            bundleId,
+            ...(bundleNights !== null ? { bundleNights } : {}),
+            ...(bundleSingleCount !== null ? { bundleSingleCount } : {}),
+            ...(bundleBusinessCount !== null ? { bundleBusinessCount } : {}),
+            ...(bundleAdultCount !== null ? { adultCount: bundleAdultCount } : {}),
+            ...(bundleChildCount !== null ? { childCount: bundleChildCount } : {}),
+            ...(bundleInfantCount !== null ? { infantCount: bundleInfantCount } : {}),
+          }),
+      description,
+      notes: notes.trim() || undefined,
+      passengers: validRows.map((r) => ({
+        fullName: r.fullName.trim(),
+        documentNumber: r.documentNumber.trim(),
+        dateOfBirth: parseDob(r.dateOfBirth) ?? '',
+        nationality: 'CN',
+        note: r.note?.trim() || undefined,
+      })),
+      ...(teamPrice !== undefined
+        ? { settlementPriceCny: teamPrice, groupNote: groupNote.trim() || undefined }
+        : {}),
+    };
+
     setSubmitting(true);
     try {
-      const res = await api.batchCreateOrders(token, {
-        productType,
-        ...(productType === 'FLIGHT_ONEWAY' || productType === 'FLIGHT_ROUNDTRIP'
-          ? {
-              outboundScheduleId,
-              ...(productType === 'FLIGHT_ROUNDTRIP' ? { returnScheduleId } : {}),
-              flightCabin: cabin as CabinClass,
-            }
-          : {
-              bundleId,
-              ...(bundleNights !== null ? { bundleNights } : {}),
-              ...(bundleSingleCount !== null ? { bundleSingleCount } : {}),
-              ...(bundleBusinessCount !== null ? { bundleBusinessCount } : {}),
-              ...(bundleAdultCount !== null ? { adultCount: bundleAdultCount } : {}),
-              ...(bundleChildCount !== null ? { childCount: bundleChildCount } : {}),
-              ...(bundleInfantCount !== null ? { infantCount: bundleInfantCount } : {}),
-            }),
-        description,
-        notes: notes.trim() || undefined,
-        passengers: validRows.map((r) => ({
-          fullName: r.fullName.trim(),
-          documentNumber: r.documentNumber.trim(),
-          dateOfBirth: parseDob(r.dateOfBirth) ?? '',
-          nationality: 'CN',
-        })),
-        ...(teamPrice !== undefined
-          ? { settlementPriceCny: teamPrice, groupNote: groupNote.trim() || undefined }
-          : {}),
-      });
+      let res;
+      try {
+        res = await api.batchCreateOrders(token, batchPayload);
+      } catch (e: unknown) {
+        // 重复乘客：后端稳定 code=DUPLICATE_PASSENGER（不靠中文文案匹配）。整批预检命中会整批拒；
+        // 客人重复订票且已付款场景：二次确认后带 allowDuplicatePassengers 强录一次（透传每张子单）。
+        if (e instanceof ApiError && e.code === 'DUPLICATE_PASSENGER') {
+          const orderNos = duplicatePassengerConflictOrderNumbers(e);
+          const msg = orderNos.length
+            ? `名单中有乘客与订单 ${orderNos.join('、')} 同班次重复。确认仍要录入吗？（客人重复订票、已付款场景）`
+            : '名单中有乘客与已有订单同班次重复。确认仍要录入吗？（客人重复订票、已付款场景）';
+          if (!window.confirm(msg)) {
+            setSubmitting(false);
+            return;
+          }
+          res = await api.batchCreateOrders(token, {
+            ...batchPayload,
+            allowDuplicatePassengers: true,
+          });
+        } else {
+          throw e;
+        }
+      }
       setResult(res);
       if (res.successCount > 0) onCreated();
     } catch (e: unknown) {
@@ -3702,8 +3877,8 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                 </div>
               </div>
               <label className="text-xs text-slate-500">
-                备注（选填，写入每单）
-                <input className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm" value={notes} onChange={(e) => setNotes(e.target.value)} />
+                整批备注（选填，写入每单）
+                <input className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm" value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="全团共用；每位乘客可在下方名单里单独补充" />
               </label>
             </div>
 
@@ -3763,6 +3938,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                       <th className="px-2 py-1.5 text-left font-normal">姓名</th>
                       <th className="px-2 py-1.5 text-left font-normal">护照号</th>
                       <th className="px-2 py-1.5 text-left font-normal">出生日期</th>
+                      <th className="px-2 py-1.5 text-left font-normal">备注（选填）</th>
                       <th className="px-2 py-1.5"></th>
                     </tr>
                   </thead>
@@ -3794,6 +3970,14 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                               </>
                             );
                           })()}
+                        </td>
+                        <td className="px-2 py-1">
+                          <input
+                            className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm"
+                            placeholder="靠窗 / 素食 / 换人…"
+                            value={r.note ?? ''}
+                            onChange={(e) => setRow(i, { note: e.target.value })}
+                          />
                         </td>
                         <td className="px-2 py-1 text-right">
                           <button className="text-xs text-slate-400 hover:text-rose-600" onClick={() => removeRow(i)} disabled={rows.length <= 1}>删</button>

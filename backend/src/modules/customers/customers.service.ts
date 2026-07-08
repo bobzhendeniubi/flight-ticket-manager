@@ -60,7 +60,7 @@ export class CustomersService {
     if (userIds.length > 0) {
       const rows = await prisma.order.groupBy({
         by: ['userId'],
-        where: { userId: { in: userIds }, status: { in: PAID_STATUSES } },
+        where: { deletedAt: null, userId: { in: userIds }, status: { in: PAID_STATUSES } },
         _count: { _all: true },
         _sum: { total: true },
         _max: { createdAt: true },
@@ -97,7 +97,7 @@ export class CustomersService {
     }
 
     const agg = await prisma.order.aggregate({
-      where: { userId: id, status: { in: PAID_STATUSES } },
+      where: { deletedAt: null, userId: id, status: { in: PAID_STATUSES } },
       _count: { _all: true },
       _sum: { total: true },
       _max: { createdAt: true },
@@ -105,7 +105,7 @@ export class CustomersService {
 
     // 顺便返回最近 5 笔订单
     const recentOrders = await prisma.order.findMany({
-      where: { userId: id },
+      where: { deletedAt: null, userId: id }, // 排除已软删订单（该查询无状态过滤，会看见全部状态）
       orderBy: { createdAt: 'desc' },
       take: 5,
       include: { items: { select: { description: true, kind: true } } },

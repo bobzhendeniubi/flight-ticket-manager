@@ -353,19 +353,27 @@ describe('OrderService 重复乘客校验', () => {
     );
   });
 
-  it('查重无命中 → 校验通过（不抛重复错误）', async () => {
+  it('查重无命中 → 校验通过（返回空冲突数组，不抛重复错误）', async () => {
     mockPrisma.passenger.findMany.mockResolvedValue([]);
-    // 直接调私有校验方法：通过 = resolve，不抛
+    // 直接调私有校验方法：通过 = resolve 空数组，不抛
     await expect(
       (service as unknown as {
-        assertNoDuplicatePassengersOnFlights(s: string[], d: string[]): Promise<void>;
+        assertNoDuplicatePassengersOnFlights(
+          s: string[],
+          d: string[],
+          allow?: boolean,
+        ): Promise<unknown[]>;
       }).assertNoDuplicatePassengersOnFlights(['sched-1'], ['E12345678']),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual([]);
   });
 
   it('无 FLIGHT 班次（纯酒店/签证单）→ 跳过查重，不查库', async () => {
     await (service as unknown as {
-      assertNoDuplicatePassengersOnFlights(s: string[], d: string[]): Promise<void>;
+      assertNoDuplicatePassengersOnFlights(
+        s: string[],
+        d: string[],
+        allow?: boolean,
+      ): Promise<unknown[]>;
     }).assertNoDuplicatePassengersOnFlights([], ['E12345678']);
     expect(mockPrisma.passenger.findMany).not.toHaveBeenCalled();
   });
@@ -2223,6 +2231,115 @@ describe('swapPassengerBodySchema · chineseName', () => {
       where: { id: 'px1' },
       data: { chineseName: '庄宇' },
     });
+  });
+});
+
+// ── swapPassenger · 换人清洗（证件号变化清除旧护照/签证信息）─────────────
+// 语义：换人后不残留前一个人的任何证件/签证信息；改错别字（证件号不变）不触发；
+// 本请求带了新值就用新值（护照/证件相关字段随人走）。
+describe('swapPassenger · 证件号变化触发旧护照/签证清洗', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function armSwapMocks(existingDoc: string) {
+    mockPrisma.order.findUnique.mockResolvedValueOnce({ id: 'ord1', adjustmentCny: 0, adjustments: [] });
+    mockPrisma.passenger.findUnique.mockResolvedValueOnce({
+      id: 'px1',
+      orderId: 'ord1',
+      fullName: 'OLD, PERSON',
+      documentNumber: existingDoc,
+    });
+    mockPrisma.passenger.update.mockResolvedValueOnce({});
+    mockPrisma.passenger.findUniqueOrThrow.mockResolvedValueOnce({
+      fullName: 'NEW, PERSON',
+      documentNumber: 'NEW999',
+    });
+    mockPrisma.order.findUniqueOrThrow.mockResolvedValueOnce(fakeFullOrder({ id: 'ord1' }));
+  }
+
+  it('证件号变化 → 清空旧护照/签证/出生地字段（本次没带新值的一律置 null）', async () => {
+    const service = new OrderService();
+    armSwapMocks('OLD111');
+
+    const { audit } = await service.swapPassenger(
+      'ord1',
+      'px1',
+      { fullName: 'NEW PERSON', documentNumber: 'NEW999' },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    const data = mockPrisma.passenger.update.mock.calls[0][0].data;
+    // 新身份字段用新值
+    expect(data.documentNumber).toBe('NEW999');
+    // 护照证件信息随人走 → 置空
+    expect(data.passportPhotoUrl).toBeNull();
+    expect(data.passportIssueDate).toBeNull();
+    expect(data.passportIssueCountry).toBeNull();
+    expect(data.passportIssuePlace).toBeNull();
+    expect(data.passportExpiry).toBeNull();
+    // 已签发签证信息随人走 → 置空
+    expect(data.visaNumber).toBeNull();
+    expect(data.visaType).toBeNull();
+    expect(data.visaIssueDate).toBeNull();
+    expect(data.visaEffectiveDate).toBeNull();
+    expect(data.visaExpiry).toBeNull();
+    expect(data.visaPlaceOfIssue).toBeNull();
+    expect(data.visaCountryOfApplication).toBeNull();
+    // 出生地 + 本次未填的中文名/性别 → 置空
+    expect(data.placeOfBirth).toBeNull();
+    expect(data.chineseName).toBeNull();
+    expect(data.gender).toBeNull();
+    // 审计标记
+    expect(audit.clearedProfile).toBe(true);
+  });
+
+  it('证件号不变（仅改拼写/其它字段）→ 不清除任何护照/签证信息', async () => {
+    const service = new OrderService();
+    armSwapMocks('SAME123');
+
+    const { audit } = await service.swapPassenger(
+      'ord1',
+      'px1',
+      { fullName: 'FIXED SPELLING', documentNumber: 'SAME123' },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    const data = mockPrisma.passenger.update.mock.calls[0][0].data;
+    expect(data).not.toHaveProperty('passportPhotoUrl');
+    expect(data).not.toHaveProperty('passportExpiry');
+    expect(data).not.toHaveProperty('visaNumber');
+    expect(data).not.toHaveProperty('placeOfBirth');
+    // chineseName/gender 本次未传，且非换人 → 不应被塞 null
+    expect(data).not.toHaveProperty('chineseName');
+    expect(data).not.toHaveProperty('gender');
+    expect(audit.clearedProfile).toBe(false);
+  });
+
+  it('证件号变化但同时提供新值（中文名/性别/生日）→ 用新值，不置空', async () => {
+    const service = new OrderService();
+    armSwapMocks('OLD111');
+
+    await service.swapPassenger(
+      'ord1',
+      'px1',
+      {
+        fullName: 'NEW PERSON',
+        documentNumber: 'NEW999',
+        chineseName: '新客',
+        gender: 'F',
+        dateOfBirth: '1992-03-04',
+      },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    const data = mockPrisma.passenger.update.mock.calls[0][0].data;
+    expect(data.chineseName).toBe('新客');
+    expect(data.gender).toBe('F');
+    expect(data.dateOfBirth).toEqual(new Date('1992-03-04'));
+    // 表单没有的护照字段仍随人清空
+    expect(data.passportPhotoUrl).toBeNull();
+    expect(data.visaExpiry).toBeNull();
   });
 });
 

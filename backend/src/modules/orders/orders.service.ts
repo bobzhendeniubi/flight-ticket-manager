@@ -12,6 +12,7 @@
  * 4. 幂等：idempotencyKey 存在则直接返回已有订单（保护客户端重试）
  */
 import {
+  AuditSeverity,
   CommissionStatus,
   InvoiceStatus,
   OrderItemKind,
@@ -30,9 +31,11 @@ import { prisma } from '../../db/prisma.js';
 import {
   BadRequestError,
   ConflictError,
+  DuplicatePassengerError,
   ForbiddenError,
   NotFoundError,
 } from '../../lib/errors.js';
+import { writeAudit } from '../../lib/audit.js';
 import { resolveBundleNights } from '../products/bundle-nights.js';
 import { getHotelNightlyRemaining } from '../hotel-control/hotel-control.service.js';
 import { PricingService } from '../pricing/pricing.service.js';
@@ -40,13 +43,16 @@ import { createOpenReceiptWithinTx } from '../receipts/receipts.service.js';
 import { OPERATION_FEE_CNY_PER_ORDER } from './order-cost-items.service.js';
 import { bundleItemMetadataSchema } from './orders.schemas.js';
 import { assertTicketingCap } from './ticketing-cap.js';
+import { PRICE_ADJUSTMENT_REASON_LABEL } from './orders.schemas.js';
 import type {
   BatchCreateOrdersBody,
   CreateOrderBody,
   ListOrdersQuery,
   OrderItemInput,
   PassengerInput,
+  PriceAdjustmentInput,
   PublicOrderLookupQuery,
+  QuoteOrderBody,
   SwapItemHotelBody,
   UpdateItemSettlementPriceBody,
 } from './orders.schemas.js';
@@ -151,6 +157,25 @@ export interface GuestRequester {
 
 function isGuestRequester(r: OrderRequester | GuestRequester): r is GuestRequester {
   return 'guest' in r;
+}
+
+/** 前台散客单的支付超时（未支付即自动释放机位的时长）。 */
+const RETAIL_PAYMENT_TIMEOUT_MS = 30 * 60 * 1000;
+
+/** 后台/代理录入身份：这些认证角色录的单默认「肯定要飞」，不设支付超时。 */
+const STAFF_ENTRY_ROLES: readonly UserRole[] = [UserRole.AGENT, UserRole.STAFF, UserRole.ADMIN];
+
+/**
+ * 支付超时口径（0708 业务定）：机位是否会因未支付被自动退回，只看**服务端认证身份**。
+ *   - 后台/代理录入（AGENT / STAFF / ADMIN，含批量建单）→ true：不设支付超时（paymentExpiresAt=null），
+ *     机位永不自动释放。这类订单默认「肯定要飞」、多为 T+1 线下结算；要退机位必须由运营手动取消/改状态。
+ *   - 前台散客（匿名游客 / 登录 CUSTOMER）→ false：保留 30 分钟未支付自动释放，防匿名占坑锁库存。
+ * 用角色允许名单（而非「非 CUSTOMER」）判定：未知/新增角色默认按散客处理（保留超时），是更安全的兜底。
+ * 绝不信任 body 里的字段——POST /orders 是 optionalAuthenticate 公开可达，身份必须来自 JWT / 游客上下文。
+ */
+function isStaffEnteredOrder(requester: OrderRequester | GuestRequester): boolean {
+  if (isGuestRequester(requester)) return false;
+  return STAFF_ENTRY_ROLES.includes(requester.role);
 }
 
 /**
@@ -272,6 +297,40 @@ export function buildBatchItems(
   ];
 }
 
+/**
+ * 录单调价/加项 → 一条独立 OrderItem 定价行（计入 subtotal/total）。
+ *   - 金额可正可负（整数 CNY）：正=加钱（升舱/多签/变更…），负=减价（优惠/让利）。
+ *   - kind 复用现有枚举：正 → FEE、负 → DISCOUNT，让财务分类诚实（不新增枚举/迁移）。
+ *   - 描述可读（详情页自然显示），如「价格调整：升舱（+¥700）」/「价格调整：优惠（−¥200）」。
+ *   - metadata 打标 priceAdjustment=true + reasonCode/reasonText，供审计与后续识别。
+ * 导出供单测复用。
+ */
+export function buildPriceAdjustmentItem(adj: PriceAdjustmentInput): {
+  kind: OrderItemKind;
+  description: string;
+  quantity: number;
+  unitPrice: number;
+  amount: number;
+  metadata: Record<string, unknown>;
+} {
+  const label = PRICE_ADJUSTMENT_REASON_LABEL[adj.reasonCode];
+  const reasonText = adj.reasonText?.trim() || undefined;
+  const signed = `${adj.amountCny > 0 ? '+' : '−'}¥${Math.abs(adj.amountCny)}`;
+  const suffix = reasonText ? `：${reasonText}` : '';
+  return {
+    kind: adj.amountCny > 0 ? OrderItemKind.FEE : OrderItemKind.DISCOUNT,
+    description: `价格调整：${label}（${signed}）${suffix}`,
+    quantity: 1,
+    unitPrice: adj.amountCny,
+    amount: adj.amountCny,
+    metadata: {
+      priceAdjustment: true,
+      reasonCode: adj.reasonCode,
+      reasonText: reasonText ?? null,
+    },
+  };
+}
+
 export class OrderService {
   private readonly pricing = new PricingService();
 
@@ -283,6 +342,28 @@ export class OrderService {
     const isGuest = isGuestRequester(requester);
     const ownerUserId: string | null = isGuest ? null : requester.userId;
     const guest = isGuest ? requester.guest : null;
+
+    // 录单调价/加项：仅 ADMIN/STAFF 录单可用。服务端按认证身份判权限（不信前端）——
+    // 公开散客/客户/代理携带此字段直接 400，杜绝对外接口被绕过手工改价。
+    if (body.priceAdjustment) {
+      const role = isGuest ? undefined : requester.role;
+      if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+        throw new BadRequestError('无权调整订单价格');
+      }
+    }
+
+    // 重复乘客强录：同上口径，仅 ADMIN/STAFF 后台录入生效。服务端按认证身份判权限（不信前端）——
+    // 散客/客户/AGENT 携带此 flag 一律无效（照旧拦），杜绝公开接口绕过同班次同证件号占座校验。
+    const requesterRole = isGuest ? undefined : requester.role;
+    const allowDuplicatePassengers =
+      body.allowDuplicatePassengers === true &&
+      (requesterRole === UserRole.ADMIN || requesterRole === UserRole.STAFF);
+
+    // 支付超时（见 isStaffEnteredOrder 注释）：后台/代理录入 → null（机位永不自动退，靠运营手动释放）；
+    // 前台散客（匿名/登录 CUSTOMER）→ now+30min（未支付自动释放机位，防匿名占坑锁库存）。
+    const paymentExpiresAt: Date | null = isStaffEnteredOrder(requester)
+      ? null
+      : new Date(Date.now() + RETAIL_PAYMENT_TIMEOUT_MS);
     // 幂等：提前查 key 是否已存在
     if (body.idempotencyKey) {
       const existing = await prisma.order.findUnique({
@@ -331,10 +412,27 @@ export class OrderService {
           .map((i) => i.flightScheduleId),
       ),
     ];
-    await this.assertNoDuplicatePassengersOnFlights(
-      flightScheduleIds,
-      body.passengers.map((px) => px.documentNumber),
-    );
+    // allowDuplicatePassengers（ADMIN/STAFF 已在上方按身份收口）为真时不拦，返回冲突明细供审计 + 备注留痕；
+    // 否则命中即抛 DuplicatePassengerError（code=DUPLICATE_PASSENGER）。无冲突恒返回 []。
+    // `?? []`：payment-timeout 等既有测试把此私有方法 mock 成 resolve(undefined)，防 .length 读空。
+    const duplicateConflicts =
+      (await this.assertNoDuplicatePassengersOnFlights(
+        flightScheduleIds,
+        body.passengers.map((px) => px.documentNumber),
+        allowDuplicatePassengers,
+      )) ?? [];
+
+    // 重复乘客强录留痕：附加一行「重复乘客强录：与订单 XXX 同班次同证件号」到订单备注（可追溯）。
+    // 仅 allowDuplicatePassengers 放行且确有冲突时非空（其余情况 conflicts 恒为 []）。
+    const duplicateForceNote =
+      duplicateConflicts.length > 0
+        ? `重复乘客强录：与订单 ${[
+            ...new Set(duplicateConflicts.flatMap((c) => c.orderNumbers)),
+          ].join('、')} 同班次同证件号`
+        : null;
+    const finalNotes = duplicateForceNote
+      ? [body.notes, duplicateForceNote].filter(Boolean).join(' · ')
+      : body.notes;
 
     // 先查所有 FLIGHT item 对应的 FlightSeatClass + 计算动态价（在事务外查，避免长事务）
     // body.flightSettlementPriceCny 存在 → 团队议价结算价覆盖机票价（鉴权在路由/批量层完成）。
@@ -348,6 +446,11 @@ export class OrderService {
 
     // 护照有效期规则（相对出发日）：<90 天禁止下单；不足 6 个月每人 +200 临期附加费
     await this.applyPassportExpiryRule(body, pricedItems);
+
+    // 录单调价/加项（权限已在上方按认证身份校验）：追加一条独立定价行，计入 subtotal/total。
+    if (body.priceAdjustment) {
+      pricedItems.push(buildPriceAdjustmentItem(body.priceAdjustment));
+    }
 
     const subtotal = pricedItems.reduce((sum, p) => sum + p.amount, 0);
     const total = subtotal; // 目前没有 taxes / discount，直接等于 subtotal
@@ -438,9 +541,9 @@ export class OrderService {
           contactName,
           contactPhone,
           contactEmail: body.contactEmail,
-          paymentExpiresAt: new Date(Date.now() + 30 * 60 * 1000), // 30 分钟后超时
+          paymentExpiresAt, // 前台散客=now+30min；后台/代理录入=null（不限时）
           idempotencyKey: body.idempotencyKey,
-          notes: body.notes,
+          notes: finalNotes,
           // 订单级签证状态 + 结构化备注四栏（可选；不传则留空，与旧行为一致）
           visaStatus: body.visaStatus ?? null,
           noteHotel: body.noteHotel ?? null,
@@ -540,20 +643,85 @@ export class OrderService {
       }
     }
 
-    // 事务成功后：排队 seat-hold 自动释放任务（订单未在 paymentExpiresAt 内支付则取消）
-    const holdMs = order.paymentExpiresAt
-      ? Math.max(0, order.paymentExpiresAt.getTime() - Date.now())
-      : 30 * 60 * 1000;
-    try {
-      const { scheduleSeatHoldRelease } = await import('../../queues/queue.js');
-      await scheduleSeatHoldRelease(order.id, holdMs);
-    } catch (err) {
-      // 排队失败不阻塞下单 —— 但记录到日志，值班可能要手动兜底
-      // eslint-disable-next-line no-console
-      console.error('[orders] failed to schedule seat-hold release for', order.id, err);
+    // 事务成功后：排队 seat-hold 自动释放任务（订单未在 paymentExpiresAt 内支付则取消）。
+    // 后台/代理录入单 paymentExpiresAt=null → 不入队：机位永不自动退，只能由运营手动释放。
+    if (order.paymentExpiresAt) {
+      const holdMs = Math.max(0, order.paymentExpiresAt.getTime() - Date.now());
+      try {
+        const { scheduleSeatHoldRelease } = await import('../../queues/queue.js');
+        await scheduleSeatHoldRelease(order.id, holdMs);
+      } catch (err) {
+        // 排队失败不阻塞下单 —— 但记录到日志，值班可能要手动兜底
+        // eslint-disable-next-line no-console
+        console.error('[orders] failed to schedule seat-hold release for', order.id, err);
+      }
+    }
+
+    // 录单调价/加项审计（原价 / 调整额 / 原因 / 操作人）。权限已在入口断言 → 此处必为 ADMIN/STAFF。
+    // await（非 fire-and-forget）：调价是财务敏感动作，落审计后再返回，便于对账与追责。
+    if (body.priceAdjustment && !isGuest) {
+      const { amountCny, reasonCode, reasonText } = body.priceAdjustment;
+      const adjustedTotal = Number(order.total);
+      await writeAudit({
+        actor: { userId: requester.userId, role: requester.role },
+        action: 'ADJUST_ORDER_PRICE',
+        targetType: 'ORDER',
+        targetId: order.id,
+        targetLabel: order.orderNumber,
+        before: { total: (adjustedTotal - amountCny).toString() },
+        after: {
+          total: adjustedTotal.toString(),
+          amountCny,
+          reasonCode,
+          reasonLabel: PRICE_ADJUSTMENT_REASON_LABEL[reasonCode],
+          reasonText: reasonText?.trim() || null,
+        },
+      });
+    }
+
+    // 重复乘客强录审计（证件号 + 冲突订单号 + 操作人）。权限已在入口按身份收口 → 此处必为 ADMIN/STAFF。
+    // WARNING 级：越过同班次占座校验是需要留痕复核的动作。!isGuest 让 TS 收窄到 OrderRequester。
+    if (duplicateConflicts.length > 0 && !isGuest) {
+      await writeAudit({
+        actor: { userId: requester.userId, role: requester.role },
+        action: 'FORCE_DUPLICATE_PASSENGERS',
+        targetType: 'ORDER',
+        targetId: order.id,
+        targetLabel: order.orderNumber,
+        after: { conflicts: duplicateConflicts },
+        severity: AuditSeverity.WARNING,
+      });
     }
 
     return order;
+  }
+
+  /**
+   * 录单前试算（quote）：复用权威定价 priceAndValidateItems，只算不落库、不扣座。
+   * 返回各行明细 + subtotal/total（CNY），供录单页在提交前展示「系统价」。
+   */
+  async quoteOrder(body: QuoteOrderBody): Promise<{
+    currency: string;
+    subtotal: number;
+    total: number;
+    items: Array<{
+      kind: OrderItemKind;
+      description: string;
+      quantity: number;
+      unitPrice: number;
+      amount: number;
+    }>;
+  }> {
+    const priced = await this.priceAndValidateItems(body.items);
+    const items = priced.map((p) => ({
+      kind: p.kind,
+      description: p.description,
+      quantity: p.quantity,
+      unitPrice: p.unitPrice,
+      amount: p.amount,
+    }));
+    const subtotal = items.reduce((sum, p) => sum + p.amount, 0);
+    return { currency: 'CNY', subtotal, total: subtotal, items };
   }
 
   // ════════════════════════════════════════════════════════════════════
@@ -616,13 +784,20 @@ export class OrderService {
   /**
    * 重复乘客校验：同一航班班次的「占座中」订单（SEAT_HOLDING_STATUSES）里，
    * 同证件号乘客不允许再次下单 —— 已取消/已退款/超时的订单不算占座，可重订。
-   * 命中则抛 BadRequestError，列出证件号与冲突订单号。
+   *
+   *   - allowDuplicate=false（默认；前台散客 / 未授权）：命中即抛 DuplicatePassengerError
+   *     （code=DUPLICATE_PASSENGER，details.conflicts 带证件号 + 冲突订单号），拒绝下单。
+   *   - allowDuplicate=true（仅 ADMIN/STAFF 后台录入，权限已在 createOrder 入口按身份收口）：
+   *     命中不拦，返回冲突明细，由调用方写审计 + 订单备注留痕（客人重复订票且已付款场景）。
+   *
+   * 无冲突恒返回 []（含无 FLIGHT 班次 / 无乘客的快速返回）。
    */
   private async assertNoDuplicatePassengersOnFlights(
     flightScheduleIds: string[],
     documentNumbers: string[],
-  ): Promise<void> {
-    if (flightScheduleIds.length === 0 || documentNumbers.length === 0) return;
+    allowDuplicate = false,
+  ): Promise<Array<{ documentNumber: string; orderNumbers: string[] }>> {
+    if (flightScheduleIds.length === 0 || documentNumbers.length === 0) return [];
 
     const conflicts = await prisma.passenger.findMany({
       where: {
@@ -637,7 +812,7 @@ export class OrderService {
         order: { select: { orderNumber: true } },
       },
     });
-    if (conflicts.length === 0) return;
+    if (conflicts.length === 0) return [];
 
     const orderNumbersByDoc = new Map<string, Set<string>>();
     for (const c of conflicts) {
@@ -645,11 +820,20 @@ export class OrderService {
       orderNumbers.add(c.order.orderNumber);
       orderNumbersByDoc.set(c.documentNumber, orderNumbers);
     }
-    const detail = [...orderNumbersByDoc.entries()]
-      .map(([doc, orderNumbers]) => `${doc}（订单 ${[...orderNumbers].join('、')}）`)
+    const conflictList = [...orderNumbersByDoc.entries()].map(([documentNumber, orderNumbers]) => ({
+      documentNumber,
+      orderNumbers: [...orderNumbers],
+    }));
+
+    // 授权强录 → 不拦，把明细交回调用方做审计 + 备注。
+    if (allowDuplicate) return conflictList;
+
+    const detail = conflictList
+      .map(({ documentNumber, orderNumbers }) => `${documentNumber}（订单 ${orderNumbers.join('、')}）`)
       .join('；');
-    throw new BadRequestError(
+    throw new DuplicatePassengerError(
       `以下乘客证件号已在同航班的有效订单中，不能重复下单：${detail}`,
+      { conflicts: conflictList },
     );
   }
 
@@ -1210,6 +1394,46 @@ export class OrderService {
     // Visa.stayDays（best-effort：查询失败/无签证组件时给空表，itineraryFieldsForItem 照常降级为 null）。
     const visaStayDaysById = await this.loadBundleVisaStayDays(order.items);
     return serializeOrder(order, { visaStayDaysById });
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  // 软删除（仅 ADMIN）
+  // ════════════════════════════════════════════════════════════════════
+  /**
+   * 软删除订单：置 deletedAt，使订单从所有列表/导出/统计里消失，但整行数据保留可追溯。
+   *
+   * 前置守卫（CRITICAL）：只允许删「已释放座位」的订单——status ∈ SEAT_RELEASING_STATUSES
+   *   (CANCELLED / PAYMENT_TIMEOUT / REFUNDED / FAILED / DRAFT)。仍占座的订单
+   *   (SEAT_HOLDING_STATUSES) 拒删，提示先取消释放座位——绝不在删除里偷偷做释放
+   *   （否则绕过状态机的座位账扣减，会把 sold 账做坏）。删除本身不触碰任何库存/座位账。
+   *
+   * 仅 ADMIN 可删（STAFF 不行）；返回删除前后的最小快照供路由层写审计。
+   */
+  async softDeleteOrder(id: string, requester: OrderRequester) {
+    if (requester.role !== UserRole.ADMIN) {
+      throw new ForbiddenError('仅管理员可删除订单');
+    }
+    // 只找未删的订单（已删的再次删 → 视为不存在，幂等）
+    const order = await prisma.order.findFirst({
+      where: { id, deletedAt: null },
+      select: { id: true, orderNumber: true, status: true },
+    });
+    if (!order) throw new NotFoundError('订单不存在');
+
+    if (SEAT_HOLDING_STATUSES.includes(order.status)) {
+      throw new BadRequestError('该订单仍占用座位，请先取消订单释放座位，再删除');
+    }
+    // 双重保险：只有释放型状态才允许删（与守卫语义对称，防未来新增状态漏网）
+    if (!SEAT_RELEASING_STATUSES.includes(order.status)) {
+      throw new BadRequestError('该订单当前状态不允许删除');
+    }
+
+    const updated = await prisma.order.update({
+      where: { id: order.id },
+      data: { deletedAt: new Date() },
+      select: { id: true, orderNumber: true, status: true, deletedAt: true },
+    });
+    return { before: order, after: updated };
   }
 
   /**
@@ -1792,9 +2016,15 @@ export class OrderService {
         : ([outbound, productType === 'FLIGHT_ROUNDTRIP' ? body.returnScheduleId : undefined].filter(
             (id): id is string => Boolean(id),
           ) as string[]);
+    // 重复乘客强录：仅 ADMIN/STAFF 生效（AGENT 携带此 flag 无效，整批照旧拦）。
+    // 放行时整批预检不抛，改由逐单 createOrder 各自查重 + 审计 + 备注留痕（透传同一 flag）。
+    const allowDuplicatePassengers =
+      body.allowDuplicatePassengers === true &&
+      (requester.role === UserRole.ADMIN || requester.role === UserRole.STAFF);
     await this.assertNoDuplicatePassengersOnFlights(
       dedupScheduleIds,
       body.passengers.map((px) => px.documentNumber),
+      allowDuplicatePassengers,
     );
 
     // BUNDLE：房控/销控要计入套餐占房，需把酒店房型 + 入住日期盖到订单行。
@@ -1845,8 +2075,8 @@ export class OrderService {
             contactPhone,
             contactEmail: body.contactEmail,
             paymentMethod: body.paymentMethod,
-            // 团期备注合并进每张子单 notes
-            notes: mergedNotes,
+            // 该乘客个别备注（选填）叠加整批备注，合并写入本人订单 notes；无个别备注则只落整批备注。
+            notes: [passenger.note, mergedNotes].filter(Boolean).join(' · ') || undefined,
             // 签证状态 + 结构化备注四栏（整批共用，写入每张子单）
             visaStatus: body.visaStatus,
             noteHotel: body.noteHotel,
@@ -1859,6 +2089,8 @@ export class OrderService {
             // 团队议价结算价（CNY/人）覆盖机票动态价；仅 ADMIN/STAFF（路由层已断言）。
             // 仅作用于 FLIGHT 行；BUNDLE 走 createOrder 的 server-priced 套餐定价，此值对其无效。
             flightSettlementPriceCny: body.settlementPriceCny,
+            // 透传重复乘客强录 flag（createOrder 内再按身份收口 + 逐单审计/备注留痕）。
+            allowDuplicatePassengers,
             items: batchItems,
             passengers: [passenger],
           },
@@ -2809,6 +3041,8 @@ export class OrderService {
       resetVisa: boolean;
       visaTasksReset: number;
       feeCny: number;
+      // 证件号变化触发的换人清洗：已清除旧出行人残留的护照/签证/出生地信息
+      clearedProfile: boolean;
     };
   }> {
     if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
@@ -2853,6 +3087,36 @@ export class OrderService {
       if (input.dateOfBirth !== undefined) data.dateOfBirth = new Date(input.dateOfBirth);
       if (input.gender !== undefined) data.gender = input.gender;
       if (input.nationality !== undefined) data.nationality = input.nationality;
+
+      // ── 1b. 换人检测：证件号变化 = 真换人（非改错别字）→ 清除旧出行人残留的
+      //        护照 / 签证 / 出生地信息，避免新出行人套用前一个人的证件。
+      //        「除非请求同时提供了新值」：上面已按 input 赋过新值的字段（chineseName / gender /
+      //        dateOfBirth）保留新值；本请求没带的一律置空。证件号没变（改拼写）不触发。
+      const newDocument = input.documentNumber?.trim();
+      const documentChanged =
+        newDocument !== undefined && newDocument !== '' && newDocument !== passenger.documentNumber;
+      if (documentChanged) {
+        // 表单可编辑但本次没填 → 显式置空（不残留前一个人的值）
+        if (data.chineseName === undefined) data.chineseName = null;
+        if (data.gender === undefined) data.gender = null;
+        // dateOfBirth 为必填非空列，无法置空；带了新值即用新值，否则保留旧值（见遗留说明）。
+        data.placeOfBirth = null;
+        // 护照证件信息随人走
+        data.passportPhotoUrl = null;
+        data.passportIssueDate = null;
+        data.passportIssueCountry = null;
+        data.passportIssuePlace = null;
+        data.passportExpiry = null;
+        // 已签发签证信息随人走
+        data.visaNumber = null;
+        data.visaType = null;
+        data.visaIssueDate = null;
+        data.visaEffectiveDate = null;
+        data.visaExpiry = null;
+        data.visaPlaceOfIssue = null;
+        data.visaCountryOfApplication = null;
+      }
+
       await tx.passenger.update({ where: { id: passengerId }, data });
 
       // ── 2. resetInvoice → 开票状态回 NONE（新出行人重开票）──
@@ -2903,7 +3167,7 @@ export class OrderService {
         select: { fullName: true, documentNumber: true },
       });
 
-      return { beforeIdentity, afterIdentity: afterPassenger, visaTasksReset };
+      return { beforeIdentity, afterIdentity: afterPassenger, visaTasksReset, clearedProfile: documentChanged };
     });
 
     const finalOrder = await prisma.order.findUniqueOrThrow({
@@ -2925,6 +3189,7 @@ export class OrderService {
         resetVisa: Boolean(input.resetVisa),
         visaTasksReset: result.visaTasksReset,
         feeCny,
+        clearedProfile: result.clearedProfile,
       },
     };
   }
@@ -3270,10 +3535,14 @@ export type OrderListFilters = Pick<
 export function buildOrderFilterWhere(query: OrderListFilters): Prisma.OrderWhereInput {
   // 勾选导出：给了 orderIds 就以「勾选的 id 集合」为准，忽略其余筛选条件
   //（导出=用户勾了哪些就导哪些；不计数状态的 COUNTED_STATUSES 保护由各导出入口叠加）。
+  // deletedAt: null —— 已软删的订单即便被显式勾中也不导出（从所有列表/导出里消失）。
   if (query.orderIds && query.orderIds.length > 0) {
-    return { id: { in: query.orderIds } };
+    return { id: { in: query.orderIds }, deletedAt: null };
   }
-  const where: Prisma.OrderWhereInput = {};
+  // 软删除排除：listOrders 与所有复用本 where 的导出（三模板 / 全岗总表）统一排除已删订单。
+  // listOrders 会展示全部状态（含 CANCELLED/REFUNDED 等释放型），是唯一会「看见」已删订单的口径，
+  // 故必须在此挂 deletedAt: null（各导出另叠 COUNTED_STATUSES，本就不含释放型，此处为对齐兜底）。
+  const where: Prisma.OrderWhereInput = { deletedAt: null };
   // 多个 items 维度的筛选必须用 AND 叠加（每个 { items: { some } } 各自独立成立），
   // 否则直接赋值 where.items 会互相覆盖 —— 历史上 kind 与 travelFrom/travelTo 同时传时
   // 后者会清掉前者，造成漏单（结构性根因）。统一往 andClauses 里推。

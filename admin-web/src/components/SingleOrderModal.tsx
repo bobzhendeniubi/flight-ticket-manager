@@ -13,6 +13,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   api,
   ApiError,
+  duplicatePassengerConflictOrderNumbers,
   hotelControlOpsApi,
   type AdminFlight,
   type AdminSchedule,
@@ -28,9 +29,11 @@ import {
   type OrderPassengerInput,
   type OrderSummary,
   type RoomGroup,
+  type PriceAdjustmentReason,
   type Transfer,
   type Visa,
   type VisaStatusInput,
+  PRICE_ADJUSTMENT_REASON_LABEL,
   VISA_STATUS_LABEL,
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
@@ -256,6 +259,16 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       : `so-${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
   const [idemKey, setIdemKey] = useState(makeIdemKey);
 
+  // ── 系统价试算（quote）+ 录单调价/加项 ────────────────────────────────
+  // 系统价：填完产品/人数后向后端 /orders/quote 试算权威价（只算不落库），提交前展示。
+  const [quoteTotal, setQuoteTotal] = useState<number | null>(null);
+  const [quoting, setQuoting] = useState(false);
+  const [quoteErr, setQuoteErr] = useState<string | null>(null);
+  // 调价：金额（CNY，整数，可正可负）+ 原因（下拉）+ 其它说明。空/0 = 不调整（不发该字段）。
+  const [adjustAmount, setAdjustAmount] = useState<number | null>(null);
+  const [adjustReason, setAdjustReason] = useState<PriceAdjustmentReason>('DISCOUNT');
+  const [adjustText, setAdjustText] = useState('');
+
   // ── 机票 ──
   // 单程 / 往返：往返时出港 + 回程各生成一条 FLIGHT 行（同一批出行人，人数不翻倍）。
   const [flightTripType, setFlightTripType] = useState<'ONEWAY' | 'ROUNDTRIP'>('ONEWAY');
@@ -462,6 +475,12 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const validPassengers = passengers.filter(
     (p) => p.fullName.trim() && p.documentNumber.trim() && parseDob(p.dateOfBirth),
   );
+
+  // 调价有效性：金额为非 0 整数即视为「要调价」；「其它」原因必须补说明。
+  const adjustIsInteger = adjustAmount !== null && Number.isInteger(adjustAmount) && adjustAmount !== 0;
+  const adjustNeedsText = adjustReason === 'OTHER' && adjustText.trim().length === 0;
+  const hasValidAdjustment = adjustIsInteger && !adjustNeedsText;
+  const adjustError = adjustIsInteger && adjustNeedsText ? '选择「其它」时请填写调整原因说明' : null;
 
   function setPassenger(i: number, patch: Partial<PassengerRow>): void {
     setPassengers((prev) => {
@@ -822,6 +841,54 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     };
   }
 
+  // 系统价试算：产品/人数变化后（去抖 400ms）向后端 /orders/quote 拿权威价。
+  // buildItem() 返回 error（选择不完整）时清空系统价，不打后端。调价金额不参与试算——
+  // 系统价是「未调整前」的权威价，最终应付 = 系统价 + 调整额（下方界面单独展示）。
+  useEffect(() => {
+    if (!token) {
+      setQuoteTotal(null);
+      setQuoteErr(null);
+      return;
+    }
+    const built = buildItem();
+    if ('error' in built) {
+      setQuoteTotal(null);
+      setQuoteErr(null);
+      return;
+    }
+    const items = 'items' in built ? built.items : [built.item];
+    let cancelled = false;
+    setQuoting(true);
+    const timer = setTimeout(() => {
+      api
+        .quoteOrder(token, { items })
+        .then((r) => {
+          if (cancelled) return;
+          setQuoteTotal(r.total);
+          setQuoteErr(null);
+        })
+        .catch((e: unknown) => {
+          if (cancelled) return;
+          setQuoteTotal(null);
+          setQuoteErr(e instanceof ApiError ? e.message : '系统价试算失败');
+        })
+        .finally(() => {
+          if (!cancelled) setQuoting(false);
+        });
+    }, 400);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+    // buildItem 读取下列定价相关状态；变化即重新试算（依赖数组显式列出，避免陈旧闭包）。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    token, kind, flightTripType, scheduleId, cabin, returnScheduleId, returnCabin,
+    roomTypeId, rooms, visaId, visaQty, bundleId, departDate,
+    adultCount, childCount, infantCount, singleCount, businessCount, selfProvidedVisa,
+    transferId, transferQty, validPassengers.length,
+  ]);
+
   async function submit(): Promise<void> {
     if (!token || submitting) return;
     setErr(null);
@@ -837,6 +904,11 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
 
     if (passengersRequired && validPassengers.length === 0) {
       setErr('该产品类型需至少一位完整出行人（姓名 + 护照号 + 出生日期）');
+      return;
+    }
+
+    if (adjustError) {
+      setErr(adjustError);
       return;
     }
 
@@ -879,11 +951,39 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       noteSpecial: noteSpecial.trim() || undefined,
       idempotencyKey: idemKey,
       ...(agentId ? { agentId } : {}),
+      ...(hasValidAdjustment
+        ? {
+            priceAdjustment: {
+              amountCny: adjustAmount as number,
+              reasonCode: adjustReason,
+              ...(adjustText.trim() ? { reasonText: adjustText.trim() } : {}),
+            },
+          }
+        : {}),
     };
 
     setSubmitting(true);
     try {
-      const res = await api.createOrder(token, body);
+      let res;
+      try {
+        res = await api.createOrder(token, body);
+      } catch (e: unknown) {
+        // 重复乘客：后端稳定 code=DUPLICATE_PASSENGER（不靠中文文案匹配）。
+        // 客人重复订票且已付款场景：二次确认后带 allowDuplicatePassengers 强录一次。
+        if (e instanceof ApiError && e.code === 'DUPLICATE_PASSENGER') {
+          const orderNos = duplicatePassengerConflictOrderNumbers(e);
+          const msg = orderNos.length
+            ? `该乘客与订单 ${orderNos.join('、')} 同班次重复。确认仍要录入吗？（客人重复订票、已付款场景）`
+            : '该乘客与已有订单同班次重复。确认仍要录入吗？（客人重复订票、已付款场景）';
+          if (!window.confirm(msg)) {
+            setSubmitting(false);
+            return;
+          }
+          res = await api.createOrder(token, { ...body, allowDuplicatePassengers: true });
+        } else {
+          throw e;
+        }
+      }
       setOkOrderNumber(res.order.orderNumber);
       setCreatedOrder(res.order);
       setRoomingSaved(false);
@@ -1015,6 +1115,10 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     setNotePayment('');
     setNoteSpecial('');
     setSelfProvidedVisa(false);
+    // 清掉上一单的调价（避免误带到下一单）；系统价随产品状态复位后由 effect 自动重算。
+    setAdjustAmount(null);
+    setAdjustReason('DISCOUNT');
+    setAdjustText('');
   }
 
   const inputCls = 'mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm';
@@ -1792,8 +1896,82 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
               )}
             </div>
 
+            {/* 系统价（服务端权威试算）+ 录单调价/加项 */}
+            <div className="rounded-lg border border-slate-200 p-3">
+              <div className="flex items-center justify-between">
+                <span className="text-sm font-medium text-slate-700">系统价（权威）</span>
+                <span className="text-sm font-semibold text-slate-900">
+                  {quoting
+                    ? '试算中…'
+                    : quoteTotal !== null
+                      ? `¥${quoteTotal.toLocaleString('zh-CN')}`
+                      : '—'}
+                </span>
+              </div>
+              {quoteErr && <p className="mt-1 text-[11px] text-rose-500">{quoteErr}</p>}
+              {quoteTotal === null && !quoting && !quoteErr && (
+                <p className="mt-1 text-[11px] text-slate-400">填完产品与人数后自动按系统权威价试算。</p>
+              )}
+
+              <div className="mt-3 border-t border-slate-100 pt-3">
+                <div className="mb-1.5 text-xs font-medium text-slate-600">
+                  价格调整（选填）— 优惠 / 变更 / 升舱 / 升级酒店 / 签证改多签
+                </div>
+                <div className="grid gap-2 md:grid-cols-3">
+                  <label className="text-xs text-slate-500">
+                    调整金额（¥，可负=优惠）
+                    <NumberInput
+                      className={inputCls}
+                      value={adjustAmount}
+                      onChange={setAdjustAmount}
+                      integerOnly
+                      allowNegative
+                      placeholder="如 700 或 -200"
+                    />
+                  </label>
+                  <label className="text-xs text-slate-500">
+                    原因
+                    <select
+                      className={inputCls}
+                      value={adjustReason}
+                      onChange={(e) => setAdjustReason(e.target.value as PriceAdjustmentReason)}
+                    >
+                      {(Object.keys(PRICE_ADJUSTMENT_REASON_LABEL) as PriceAdjustmentReason[]).map((r) => (
+                        <option key={r} value={r}>{PRICE_ADJUSTMENT_REASON_LABEL[r]}</option>
+                      ))}
+                    </select>
+                  </label>
+                  <label className="text-xs text-slate-500">
+                    说明{adjustReason === 'OTHER' ? <span className="text-rose-500"> *</span> : '（选填）'}
+                    <input
+                      className={inputCls}
+                      value={adjustText}
+                      maxLength={200}
+                      onChange={(e) => setAdjustText(e.target.value)}
+                      placeholder={adjustReason === 'OTHER' ? '必填：说明调整原因' : '可补充说明'}
+                    />
+                  </label>
+                </div>
+                {adjustError && <p className="mt-1 text-[11px] text-rose-500">{adjustError}</p>}
+                {hasValidAdjustment && quoteTotal !== null && (
+                  <div className="mt-2 flex items-center justify-between rounded-md bg-slate-50 px-2.5 py-1.5">
+                    <span className="text-xs text-slate-500">调整后应付</span>
+                    <span className="text-sm font-semibold text-slate-900">
+                      ¥{(quoteTotal + (adjustAmount ?? 0)).toLocaleString('zh-CN')}
+                      <span className="ml-1.5 text-[11px] font-normal text-slate-400">
+                        （系统价 {(adjustAmount ?? 0) > 0 ? '+' : '−'}¥{Math.abs(adjustAmount ?? 0).toLocaleString('zh-CN')}）
+                      </span>
+                    </span>
+                  </div>
+                )}
+                <p className="mt-1.5 text-[11px] text-slate-400">
+                  调价只在系统权威价上加减一笔并留审计记录；不会改动机票/酒店等基础项的权威价。
+                </p>
+              </div>
+            </div>
+
             <div className="flex items-center justify-between border-t border-slate-200 pt-3">
-              <span className="text-xs text-slate-500">价格由系统按所选产品权威计算，无需手填金额。</span>
+              <span className="text-xs text-slate-500">价格由系统按所选产品权威计算；如有优惠/加项请用上方「价格调整」。</span>
               <div className="flex gap-2">
                 <button className="btn-secondary text-sm" onClick={onClose} type="button">取消</button>
                 <button className="btn-primary text-sm disabled:opacity-50" onClick={submit} disabled={submitting} type="button">

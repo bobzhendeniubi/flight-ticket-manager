@@ -319,7 +319,7 @@ export async function getHotelNightlyRemaining(
       hotelRoomType: { hotelId },
       hotelCheckIn: { lte: toD },
       hotelCheckOut: { gt: fromD },
-      order: { status: { in: COUNTED_STATUSES } },
+      order: { deletedAt: null, status: { in: COUNTED_STATUSES } },
     },
     select: { hotelCheckIn: true, hotelCheckOut: true, roomsBilled: true, metadata: true },
   });
@@ -396,7 +396,7 @@ export async function getBoard(
       hotelRoomTypeId: { not: null },
       hotelCheckIn: { lte: toD },
       hotelCheckOut: { gt: fromD },
-      order: { status: { in: COUNTED_STATUSES } },
+      order: { deletedAt: null, status: { in: COUNTED_STATUSES } },
     },
     select: {
       hotelCheckIn: true,
@@ -568,6 +568,7 @@ export async function getAlerts(
       client.passenger.count({
         where: {
           order: {
+            deletedAt: null, // 排除已软删订单
             status: { in: COUNTED_STATUSES },
             items: { some: { kind: OrderItemKind.FLIGHT, flightScheduleId: s.id } },
           },
@@ -650,7 +651,7 @@ export async function getOccupyingOrders(
       hotelRoomType: { hotelId },
       hotelCheckIn: { lte: d },
       hotelCheckOut: { gt: d },
-      order: { status: { in: COUNTED_STATUSES } },
+      order: { deletedAt: null, status: { in: COUNTED_STATUSES } },
     },
     orderBy: { hotelCheckIn: 'asc' },
     select: {
