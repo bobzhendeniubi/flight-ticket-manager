@@ -34,6 +34,7 @@ import {
   type Visa,
   type VisaStatusInput,
   PRICE_ADJUSTMENT_REASON_LABEL,
+  PRICE_ADJUSTMENT_REASON_OPTIONS,
   VISA_STATUS_LABEL,
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
@@ -1915,8 +1916,11 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
 
               <div className="mt-3 border-t border-slate-100 pt-3">
                 <div className="mb-1.5 text-xs font-medium text-slate-600">
-                  价格调整（选填）— 优惠 / 变更 / 升舱 / 升级酒店 / 签证改多签
+                  价格调整（选填）— 优惠 / 补收杂费 / 变更改期费
                 </div>
+                <p className="mb-1.5 text-[11px] text-slate-400">
+                  升舱/单人入住请用套餐加购选项（占真实库存）；换酒店走订单详情「换酒店」；签证改多签请更换签证产品——这些操作不要走调价，否则相关岗位看不到。
+                </p>
                 <div className="grid gap-2 md:grid-cols-3">
                   <label className="text-xs text-slate-500">
                     调整金额（¥，可负=优惠）
@@ -1936,7 +1940,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                       value={adjustReason}
                       onChange={(e) => setAdjustReason(e.target.value as PriceAdjustmentReason)}
                     >
-                      {(Object.keys(PRICE_ADJUSTMENT_REASON_LABEL) as PriceAdjustmentReason[]).map((r) => (
+                      {PRICE_ADJUSTMENT_REASON_OPTIONS.map((r) => (
                         <option key={r} value={r}>{PRICE_ADJUSTMENT_REASON_LABEL[r]}</option>
                       ))}
                     </select>

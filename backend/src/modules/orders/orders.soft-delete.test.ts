@@ -66,14 +66,20 @@ describe('softDeleteOrder · 前置守卫（占座状态拒删）', () => {
   ];
 
   it.each(SEAT_HOLDING)('占座状态 %s 拒删 → BadRequestError，update 从不被调用', async (status) => {
-    mockPrisma.order.findFirst.mockResolvedValue({ id: 'o1', orderNumber: 'FTM1', status });
+    mockPrisma.order.findFirst.mockResolvedValue({
+      id: 'o1',
+      orderNumber: 'FTM1',
+      status,
+      paidAmount: 0,
+      refunds: [],
+    });
     await expect(service.softDeleteOrder('o1', ADMIN)).rejects.toBeInstanceOf(BadRequestError);
     // CRITICAL：删除绝不偷偷释放座位——拒删路径不得触碰任何写
     expect(mockPrisma.order.update).not.toHaveBeenCalled();
   });
 });
 
-describe('softDeleteOrder · 已释放型状态可删', () => {
+describe('softDeleteOrder · 已释放型状态可删（零收款）', () => {
   const SEAT_RELEASING: OrderStatus[] = [
     OrderStatus.CANCELLED,
     OrderStatus.PAYMENT_TIMEOUT,
@@ -84,7 +90,13 @@ describe('softDeleteOrder · 已释放型状态可删', () => {
 
   it.each(SEAT_RELEASING)('%s 可删：置 deletedAt，返回 before/after 供审计', async (status) => {
     const deletedAt = new Date('2026-07-08T12:00:00Z');
-    mockPrisma.order.findFirst.mockResolvedValue({ id: 'o1', orderNumber: 'FTM1', status });
+    mockPrisma.order.findFirst.mockResolvedValue({
+      id: 'o1',
+      orderNumber: 'FTM1',
+      status,
+      paidAmount: 0,
+      refunds: [],
+    });
     mockPrisma.order.update.mockResolvedValue({ id: 'o1', orderNumber: 'FTM1', status, deletedAt });
 
     const res = await service.softDeleteOrder('o1', ADMIN);
@@ -101,6 +113,77 @@ describe('softDeleteOrder · 已释放型状态可删', () => {
     // 返回审计快照
     expect(res.before).toEqual({ id: 'o1', orderNumber: 'FTM1', status });
     expect(res.after.deletedAt).toBe(deletedAt);
+  });
+});
+
+describe('softDeleteOrder · 净收款守卫', () => {
+  it('已确认收款未退（paidAmount>0，无退款记录）→ BadRequestError，金额带进提示，update 从不被调用', async () => {
+    mockPrisma.order.findFirst.mockResolvedValue({
+      id: 'o1',
+      orderNumber: 'FTM1',
+      status: OrderStatus.CANCELLED,
+      paidAmount: 3000,
+      refunds: [],
+    });
+
+    await expect(service.softDeleteOrder('o1', ADMIN)).rejects.toThrow(
+      /该订单尚有已收款 ¥3000\.00 未退，请先完成退款再删除/,
+    );
+    expect(mockPrisma.order.update).not.toHaveBeenCalled();
+  });
+
+  it('已收款但部分退款未退完（paidAmount=3000，已完成退款=1000）→ 按差额拒删', async () => {
+    mockPrisma.order.findFirst.mockResolvedValue({
+      id: 'o1',
+      orderNumber: 'FTM1',
+      status: OrderStatus.REFUNDED,
+      paidAmount: 3000,
+      refunds: [{ amount: 1000 }],
+    });
+
+    await expect(service.softDeleteOrder('o1', ADMIN)).rejects.toThrow(
+      /该订单尚有已收款 ¥2000\.00 未退，请先完成退款再删除/,
+    );
+    expect(mockPrisma.order.update).not.toHaveBeenCalled();
+  });
+
+  it('收退已平（paidAmount=3000，已完成退款合计=3000）→ 可删', async () => {
+    const deletedAt = new Date('2026-07-08T12:00:00Z');
+    mockPrisma.order.findFirst.mockResolvedValue({
+      id: 'o1',
+      orderNumber: 'FTM1',
+      status: OrderStatus.REFUNDED,
+      paidAmount: 3000,
+      refunds: [{ amount: 1800 }, { amount: 1200 }],
+    });
+    mockPrisma.order.update.mockResolvedValue({
+      id: 'o1',
+      orderNumber: 'FTM1',
+      status: OrderStatus.REFUNDED,
+      deletedAt,
+    });
+
+    const res = await service.softDeleteOrder('o1', ADMIN);
+    expect(res.after.deletedAt).toBe(deletedAt);
+  });
+
+  it('待处理退款（REQUESTED/PROCESSING）不算已退——查询只挑 COMPLETED，净收款仍未退，拒删', async () => {
+    mockPrisma.order.findFirst.mockResolvedValue({
+      id: 'o1',
+      orderNumber: 'FTM1',
+      status: OrderStatus.CANCELLED,
+      paidAmount: 3000,
+      // findFirst 的 where: { status: 'COMPLETED' } 已在查询层过滤，这里模拟「查出来是空」
+      // 因为 REQUESTED/PROCESSING 状态的退款不会被这个 include 选中
+      refunds: [],
+    });
+
+    await expect(service.softDeleteOrder('o1', ADMIN)).rejects.toBeInstanceOf(BadRequestError);
+    expect(mockPrisma.order.update).not.toHaveBeenCalled();
+
+    // 断言 findFirst 的 select 只挑 COMPLETED 的退款（口径核实：不把待处理退款当已退）
+    const call = mockPrisma.order.findFirst.mock.calls[0][0];
+    expect(call.select.refunds.where).toEqual({ status: 'COMPLETED' });
   });
 });
 

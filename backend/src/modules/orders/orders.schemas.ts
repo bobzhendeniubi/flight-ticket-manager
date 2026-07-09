@@ -18,29 +18,44 @@ export const SETTLEMENT_PRICE_CAP_CNY = 100_000;
 export const POST_SALE_FEE_CAP_CNY = 100_000;
 
 // ── 录单调价/加项（ADMIN/STAFF 录单专用）──────────────────────────────────
-// 业务场景：录单时有优惠 / 行程变更 / 升舱 / 升级酒店 / 签证改多签等需要在系统权威价上
-// 手工加减金额。此处只承载「一笔调整」的金额 + 原因；不放开裸手填整单价（服务端权威定价
-// 仍是安全底线）。金额（CNY，整数）可正（加钱）可负（减价/优惠），0 无意义 → 拒绝。
+// 业务场景：录单时有优惠 / 补收杂费 / 行程变更改期费等需要在系统权威价上手工加减金额。
+// 此处只承载「一笔调整」的金额 + 原因；不放开裸手填整单价（服务端权威定价仍是安全底线）。
+// 金额（CNY，整数）可正（加钱）可负（减价/优惠），0 无意义 → 拒绝。
+//
+// 原因收窄为纯财务类：升舱/升级酒店/签证改多签曾经也在这个下拉里，但会造成运营隐形——
+// 升舱不占套餐结构化商务舱库存、升级酒店不走「换酒店」（房控看不到）、改多签不换签证产品
+// （签证岗看不到）。这三类改动必须走各自的结构化功能，不能再通过调价旁路，故从可录入枚举
+// 中移除；升舱/单人入住用套餐加购，换酒店用订单详情「换酒店」，改多签需更换签证产品。
 export const PRICE_ADJUSTMENT_CAP_CNY = 100_000;
 
-// 调整原因下拉（枚举 + 其它自由文本）。label 供服务端拼调整行描述用（前后端各存一份，避免耦合）。
+// 可录入原因（当前）：仅财务口径的四类。
 export const PRICE_ADJUSTMENT_REASON = [
   'DISCOUNT', // 优惠
-  'CHANGE', // 变更
-  'UPGRADE_CABIN', // 升舱
-  'UPGRADE_HOTEL', // 升级酒店
-  'VISA_MULTI', // 签证改多签
+  'MISC_FEE', // 补收杂费
+  'CHANGE', // 变更改期费
   'OTHER', // 其它（配合 reasonText）
 ] as const;
 export type PriceAdjustmentReason = (typeof PRICE_ADJUSTMENT_REASON)[number];
 
-export const PRICE_ADJUSTMENT_REASON_LABEL: Record<PriceAdjustmentReason, string> = {
+// 历史全集（含已下线、不再允许新录入的原因值）——仅用于展示旧订单行 label，避免老数据
+// 的 metadata.reasonCode 在 label 查找时变成 undefined。新录入一律走上面收窄后的枚举。
+export const PRICE_ADJUSTMENT_REASON_LEGACY = [
+  'UPGRADE_CABIN', // 升舱（已下线，历史展示用）
+  'UPGRADE_HOTEL', // 升级酒店（已下线，历史展示用）
+  'VISA_MULTI', // 签证改多签（已下线，历史展示用）
+] as const;
+export type PriceAdjustmentReasonDisplay =
+  | PriceAdjustmentReason
+  | (typeof PRICE_ADJUSTMENT_REASON_LEGACY)[number];
+
+export const PRICE_ADJUSTMENT_REASON_LABEL: Record<PriceAdjustmentReasonDisplay, string> = {
   DISCOUNT: '优惠',
-  CHANGE: '变更',
+  MISC_FEE: '补收杂费',
+  CHANGE: '变更改期费',
+  OTHER: '其它',
   UPGRADE_CABIN: '升舱',
   UPGRADE_HOTEL: '升级酒店',
   VISA_MULTI: '签证改多签',
-  OTHER: '其它',
 };
 
 export const priceAdjustmentSchema = z

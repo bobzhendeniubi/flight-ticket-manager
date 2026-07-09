@@ -59,7 +59,7 @@ describe('createOrder · 录单调价/加项（真 DB）', () => {
         contactPhone: '13800138000',
         items: transferItems(150),
         passengers: [passenger(1)],
-        priceAdjustment: { amountCny: 700, reasonCode: 'UPGRADE_CABIN' },
+        priceAdjustment: { amountCny: 700, reasonCode: 'MISC_FEE' },
       },
       requester,
     );
@@ -77,8 +77,8 @@ describe('createOrder · 录单调价/加项（真 DB）', () => {
     expect(adjRow).toBeTruthy();
     expect(adjRow!.kind).toBe(OrderItemKind.FEE);
     expect(Number(adjRow!.amount)).toBe(700);
-    expect(adjRow!.description).toContain('升舱');
-    expect((adjRow!.metadata as Record<string, unknown>).reasonCode).toBe('UPGRADE_CABIN');
+    expect(adjRow!.description).toContain('补收杂费');
+    expect((adjRow!.metadata as Record<string, unknown>).reasonCode).toBe('MISC_FEE');
   });
 
   it('(b) 负调整（优惠）→ DISCOUNT 行，total 下调', async () => {
@@ -115,7 +115,7 @@ describe('createOrder · 录单调价/加项（真 DB）', () => {
         contactPhone: '13800138000',
         items: transferItems(150),
         passengers: [passenger(3)],
-        priceAdjustment: { amountCny: 700, reasonCode: 'UPGRADE_CABIN' },
+        priceAdjustment: { amountCny: 700, reasonCode: 'MISC_FEE' },
       },
       requester,
     );
@@ -129,8 +129,8 @@ describe('createOrder · 录单调价/加项（真 DB）', () => {
     expect(before.total).toBe('150'); // 原价（调整前）
     expect(after.total).toBe('850'); // 调整后
     expect(after.amountCny).toBe(700);
-    expect(after.reasonCode).toBe('UPGRADE_CABIN');
-    expect(after.reasonLabel).toBe('升舱');
+    expect(after.reasonCode).toBe('MISC_FEE');
+    expect(after.reasonLabel).toBe('补收杂费');
     expect(audit!.actorUserId).toBe(requester.userId);
   });
 
@@ -144,7 +144,7 @@ describe('createOrder · 录单调价/加项（真 DB）', () => {
           contactPhone: '13800138000',
           items: transferItems(150),
           passengers: [passenger(4)],
-          priceAdjustment: { amountCny: 700, reasonCode: 'UPGRADE_CABIN' },
+          priceAdjustment: { amountCny: 700, reasonCode: 'MISC_FEE' },
           idempotencyKey,
         },
         { userId: cust.id, role: UserRole.CUSTOMER },

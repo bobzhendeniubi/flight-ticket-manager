@@ -28,7 +28,7 @@ import {
   buildPriceAdjustmentItem,
 } from './orders.service.js';
 import { BadRequestError } from '../../lib/errors.js';
-import type { CreateOrderBody } from './orders.schemas.js';
+import { priceAdjustmentSchema, type CreateOrderBody } from './orders.schemas.js';
 
 const service = new OrderService();
 
@@ -38,13 +38,13 @@ beforeEach(() => {
 
 describe('buildPriceAdjustmentItem', () => {
   it('正金额 → FEE 行，金额与描述正确，metadata 打标', () => {
-    const row = buildPriceAdjustmentItem({ amountCny: 700, reasonCode: 'UPGRADE_CABIN' });
+    const row = buildPriceAdjustmentItem({ amountCny: 700, reasonCode: 'MISC_FEE' });
     expect(row.kind).toBe('FEE');
     expect(row.amount).toBe(700);
     expect(row.unitPrice).toBe(700);
     expect(row.quantity).toBe(1);
-    expect(row.description).toBe('价格调整：升舱（+¥700）');
-    expect(row.metadata).toMatchObject({ priceAdjustment: true, reasonCode: 'UPGRADE_CABIN' });
+    expect(row.description).toBe('价格调整：补收杂费（+¥700）');
+    expect(row.metadata).toMatchObject({ priceAdjustment: true, reasonCode: 'MISC_FEE' });
   });
 
   it('负金额 → DISCOUNT 行，描述用负号（−）', () => {
@@ -58,6 +58,35 @@ describe('buildPriceAdjustmentItem', () => {
     const row = buildPriceAdjustmentItem({ amountCny: 300, reasonCode: 'OTHER', reasonText: '临时加派车' });
     expect(row.description).toBe('价格调整：其它（+¥300）：临时加派车');
     expect(row.metadata.reasonText).toBe('临时加派车');
+  });
+});
+
+describe('priceAdjustmentSchema · 原因收窄为纯财务类（堵运营旁路）', () => {
+  it.each(['UPGRADE_CABIN', 'UPGRADE_HOTEL', 'VISA_MULTI'])(
+    '旧原因 %s 被拒绝（不再是可录入值）',
+    (reasonCode) => {
+      const result = priceAdjustmentSchema.safeParse({ amountCny: 700, reasonCode });
+      expect(result.success).toBe(false);
+    },
+  );
+
+  it.each(['DISCOUNT', 'MISC_FEE', 'CHANGE'])('新原因 %s 可用', (reasonCode) => {
+    const result = priceAdjustmentSchema.safeParse({ amountCny: 700, reasonCode });
+    expect(result.success).toBe(true);
+  });
+
+  it('OTHER 未填 reasonText → 拒绝', () => {
+    const result = priceAdjustmentSchema.safeParse({ amountCny: 700, reasonCode: 'OTHER' });
+    expect(result.success).toBe(false);
+  });
+
+  it('OTHER 填了 reasonText → 通过', () => {
+    const result = priceAdjustmentSchema.safeParse({
+      amountCny: 700,
+      reasonCode: 'OTHER',
+      reasonText: '临时加派车',
+    });
+    expect(result.success).toBe(true);
   });
 });
 
@@ -85,7 +114,7 @@ describe('OrderService.createOrder · priceAdjustment 权限（服务端按认�
     passengers: [
       { fullName: '张三', documentNumber: 'E1234567', dateOfBirth: '1990-01-01', nationality: 'CN' },
     ],
-    priceAdjustment: { amountCny: 700, reasonCode: 'UPGRADE_CABIN' },
+    priceAdjustment: { amountCny: 700, reasonCode: 'MISC_FEE' },
   } as unknown as CreateOrderBody;
 
   it('游客携带 priceAdjustment → BadRequestError（散客 400），且未触库', async () => {

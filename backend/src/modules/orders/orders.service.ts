@@ -300,10 +300,12 @@ export function buildBatchItems(
 
 /**
  * 录单调价/加项 → 一条独立 OrderItem 定价行（计入 subtotal/total）。
- *   - 金额可正可负（整数 CNY）：正=加钱（升舱/多签/变更…），负=减价（优惠/让利）。
+ *   - 金额可正可负（整数 CNY）：正=加钱（补收杂费/变更改期费…），负=减价（优惠/让利）。
  *   - kind 复用现有枚举：正 → FEE、负 → DISCOUNT，让财务分类诚实（不新增枚举/迁移）。
- *   - 描述可读（详情页自然显示），如「价格调整：升舱（+¥700）」/「价格调整：优惠（−¥200）」。
+ *   - 描述可读（详情页自然显示），如「价格调整：补收杂费（+¥700）」/「价格调整：优惠（−¥200）」。
  *   - metadata 打标 priceAdjustment=true + reasonCode/reasonText，供审计与后续识别。
+ *   - adj.reasonCode 类型收窄为纯财务四类（DISCOUNT/MISC_FEE/CHANGE/OTHER）；label 查表用
+ *     PRICE_ADJUSTMENT_REASON_LABEL（覆盖历史三个已下线原因值，避免旧订单行 label 缺失）。
  * 导出供单测复用。
  */
 export function buildPriceAdjustmentItem(adj: PriceAdjustmentInput): {
@@ -1408,6 +1410,12 @@ export class OrderService {
    *   (SEAT_HOLDING_STATUSES) 拒删，提示先取消释放座位——绝不在删除里偷偷做释放
    *   （否则绕过状态机的座位账扣减，会把 sold 账做坏）。删除本身不触碰任何库存/座位账。
    *
+   * 净收款守卫（CRITICAL）：状态守卫通过后，再查「净收款」= 已确认收款(order.paidAmount，
+   *   增量维护的权威字段，覆盖人工确认收款/挂账认领/代理余额抵扣等全部入账路径) − 已完成退款
+   *   (Refund.status=COMPLETED 之和；REQUESTED/APPROVED/PROCESSING/REJECTED 都不算——钱还在
+   *   公司手上，没退出去)。净收款 > 0 → 拒删，防止「已取消但钱没退完」的订单被删掉后从所有
+   *   列表消失、退款义务没人追。净收款 ≤ 0（零收款或已退平）才放行。
+   *
    * 仅 ADMIN 可删（STAFF 不行）；返回删除前后的最小快照供路由层写审计。
    */
   async softDeleteOrder(id: string, requester: OrderRequester) {
@@ -1417,7 +1425,13 @@ export class OrderService {
     // 只找未删的订单（已删的再次删 → 视为不存在，幂等）
     const order = await prisma.order.findFirst({
       where: { id, deletedAt: null },
-      select: { id: true, orderNumber: true, status: true },
+      select: {
+        id: true,
+        orderNumber: true,
+        status: true,
+        paidAmount: true,
+        refunds: { where: { status: 'COMPLETED' }, select: { amount: true } },
+      },
     });
     if (!order) throw new NotFoundError('订单不存在');
 
@@ -1429,12 +1443,21 @@ export class OrderService {
       throw new BadRequestError('该订单当前状态不允许删除');
     }
 
+    const refundedTotal = order.refunds.reduce((sum, r) => sum + Number(r.amount), 0);
+    const netReceived = round2(Number(order.paidAmount) - refundedTotal);
+    if (netReceived > 0) {
+      throw new BadRequestError(
+        `该订单尚有已收款 ¥${netReceived.toFixed(2)} 未退，请先完成退款再删除`,
+      );
+    }
+
+    const before = { id: order.id, orderNumber: order.orderNumber, status: order.status };
     const updated = await prisma.order.update({
       where: { id: order.id },
       data: { deletedAt: new Date() },
       select: { id: true, orderNumber: true, status: true, deletedAt: true },
     });
-    return { before: order, after: updated };
+    return { before, after: updated };
   }
 
   // ════════════════════════════════════════════════════════════════════

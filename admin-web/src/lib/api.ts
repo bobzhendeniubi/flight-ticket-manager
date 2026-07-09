@@ -414,22 +414,34 @@ export interface OrderStructuredNotes {
 }
 
 // 录单调价/加项（仅 ADMIN/STAFF 录单）：在系统权威价上手工加减一笔金额 + 原因。
-// 金额（CNY 整数）可正（加钱：升舱/多签/变更…）可负（减价/优惠）；服务端按认证身份判权限。
-export type PriceAdjustmentReason =
-  | 'DISCOUNT'
-  | 'CHANGE'
-  | 'UPGRADE_CABIN'
-  | 'UPGRADE_HOTEL'
-  | 'VISA_MULTI'
-  | 'OTHER';
+// 金额（CNY 整数）可正（加钱：补收杂费/变更改期费…）可负（减价/优惠）；服务端按认证身份判权限。
+//
+// 原因收窄为纯财务类：升舱/升级酒店/签证改多签曾在下拉里，但会造成运营隐形——升舱不占
+// 套餐结构化商务舱库存、升级酒店不走「换酒店」（房控看不到）、改多签不换签证产品（签证岗
+// 看不到）。新录入只允许下面四个财务口径值；旧三值仍保留在展示 label 映射里，避免历史订单行
+// 的 reasonCode 找不到 label 而显示 undefined。
+export type PriceAdjustmentReason = 'DISCOUNT' | 'MISC_FEE' | 'CHANGE' | 'OTHER';
 
-export const PRICE_ADJUSTMENT_REASON_LABEL: Record<PriceAdjustmentReason, string> = {
+// 可录入原因（下拉用）——与后端 priceAdjustmentSchema 的枚举保持一致。
+export const PRICE_ADJUSTMENT_REASON_OPTIONS: PriceAdjustmentReason[] = [
+  'DISCOUNT',
+  'MISC_FEE',
+  'CHANGE',
+  'OTHER',
+];
+
+// 历史全集（含已下线、不再允许新录入的原因值）——仅用于展示旧订单行 label。
+type PriceAdjustmentReasonLegacy = 'UPGRADE_CABIN' | 'UPGRADE_HOTEL' | 'VISA_MULTI';
+type PriceAdjustmentReasonDisplay = PriceAdjustmentReason | PriceAdjustmentReasonLegacy;
+
+export const PRICE_ADJUSTMENT_REASON_LABEL: Record<PriceAdjustmentReasonDisplay, string> = {
   DISCOUNT: '优惠',
-  CHANGE: '变更',
+  MISC_FEE: '补收杂费',
+  CHANGE: '变更改期费',
+  OTHER: '其它',
   UPGRADE_CABIN: '升舱',
   UPGRADE_HOTEL: '升级酒店',
   VISA_MULTI: '签证改多签',
-  OTHER: '其它',
 };
 
 export interface PriceAdjustmentInput {
