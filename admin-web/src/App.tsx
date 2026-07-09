@@ -20,6 +20,9 @@ import { ReconciliationPage } from './pages/ReconciliationPage';
 import { HotelControlPage } from './pages/HotelControlPage';
 import { VisaDeskPage } from './pages/VisaDeskPage';
 import { AiOcrSettingsPage } from './pages/AiOcrSettingsPage';
+import { RemindersPage } from './pages/RemindersPage';
+import { ReportsPage } from './pages/ReportsPage';
+import { FulfillmentBoardPage } from './pages/FulfillmentBoardPage';
 import { useAuth } from './stores/auth';
 
 // AGENT 可访问的页面集合（其他页面默认 ADMIN/STAFF 专属）
@@ -256,6 +259,30 @@ export function App() {
           element={
             <Protected adminOnly>
               <VisaDeskPage />
+            </Protected>
+          }
+        />
+        <Route
+          path="/reminders"
+          element={
+            <Protected adminOnly>
+              <RemindersPage />
+            </Protected>
+          }
+        />
+        <Route
+          path="/fulfillment-board"
+          element={
+            <Protected adminOnly>
+              <FulfillmentBoardPage />
+            </Protected>
+          }
+        />
+        <Route
+          path="/reports"
+          element={
+            <Protected adminOnly>
+              <ReportsPage />
             </Protected>
           }
         />

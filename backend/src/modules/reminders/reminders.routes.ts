@@ -6,8 +6,9 @@
  *   - 票务组：往返航班拆开开票、需要批文+酒店单过海关
  *   - 仪表盘"我的待办"小窗口 + 详情页"加待办"按钮
  *
- * GET    /reminders          列表（含我的/未认领过滤）
+ * GET    /reminders          列表（含我的/未认领/来源过滤）
  * POST   /reminders          新建
+ * POST   /reminders/generate 规则化自动生成（幂等，按 ruleKey 去重）
  * PATCH  /reminders/:id      编辑（标题/正文/dueAt/priority）
  * POST   /reminders/:id/claim     认领（设 claimedById = 自己）
  * POST   /reminders/:id/release   释放（claimedById → null）
@@ -23,6 +24,7 @@ import {
   resolveReminderSchema,
   updateReminderSchema,
 } from './reminders.schemas.js';
+import { generateRuleReminders } from './reminders.rules.js';
 
 export const reminderRoutes: FastifyPluginAsync = async (app) => {
   const requireOps = {
@@ -36,6 +38,9 @@ export const reminderRoutes: FastifyPluginAsync = async (app) => {
     if (q.priority) where.priority = q.priority;
     if (q.orderId) where.orderId = q.orderId;
     if (q.mine) where.claimedById = req.user.sub;
+    // 来源过滤：auto = 规则自动生成（ruleKey 非空）；manual = 手工创建
+    if (q.source === 'auto') where.ruleKey = { not: null };
+    else if (q.source === 'manual') where.ruleKey = null;
 
     const [rows, total] = await prisma.$transaction([
       prisma.operationalReminder.findMany({
@@ -86,6 +91,19 @@ export const reminderRoutes: FastifyPluginAsync = async (app) => {
       after: { priority: body.priority, dueAt: body.dueAt, orderId: body.orderId },
     });
     return { reminder: created };
+  });
+
+  // 规则化自动生成（催尾款/出行提醒/护照有效期/签证缺件）。
+  // 幂等：同 ruleKey 只生成一次，重复调用返回 created=0。
+  app.post('/generate', requireOps, async (req) => {
+    const result = await generateRuleReminders(prisma, req.user.sub);
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'GENERATE_RULE_REMINDERS',
+      targetType: 'SYSTEM',
+      after: { created: result.created, skipped: result.skipped, byRule: result.byRule },
+    });
+    return result;
   });
 
   app.patch('/:id', requireOps, async (req, reply) => {

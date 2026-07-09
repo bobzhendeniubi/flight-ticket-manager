@@ -701,6 +701,65 @@ export interface OperationalReminder {
   createdBy: { id: string; email: string | null; displayName: string | null };
   claimedBy: { id: string; email: string | null; displayName: string | null } | null;
   order?: { id: string; orderNumber: string; status: OrderStatus; contactName: string } | null;
+  /** 自动生成规则键（BALANCE_DUE / DEPARTURE_SOON / …）；null/缺失 = 手动创建 */
+  ruleKey?: string | null;
+}
+
+// ── 经营报表（ADMIN-only）────────────────────────────────────────────────
+export type SalesReportDim = 'kind' | 'channel' | 'agent';
+
+export interface SalesReportRow {
+  key: string;
+  label: string;
+  orderCount: number;
+  revenueCny: number;
+  costCny: number;
+  grossMarginCny: number;
+  /** 小数分数（0.3456 = 34.56%） */
+  marginPct: number;
+  missingCostItemCount: number;
+}
+
+export interface SalesReport {
+  rows: SalesReportRow[];
+  totals: SalesReportRow;
+}
+
+export type ReceivablesBucket = '0-7' | '8-30' | '31-60' | '61+';
+
+export interface ReceivableRow {
+  orderId: string;
+  orderNumber: string;
+  contactName: string;
+  agentLabel: string;
+  status: OrderStatus;
+  totalCny: number;
+  paidCny: number;
+  balanceCny: number;
+  ageDays: number;
+  bucket: ReceivablesBucket;
+}
+
+export interface ReceivablesReport {
+  rows: ReceivableRow[];
+  summary: {
+    totalBalanceCny: number;
+    buckets: Record<ReceivablesBucket, { count: number; amountCny: number }>;
+    /** rows 超过上限（500）被截断；汇总仍为全量 */
+    truncated?: boolean;
+  };
+}
+
+export interface AgentDebtRow {
+  agentId: string;
+  agentLabel: string;
+  orderCount: number;
+  outstandingCny: number;
+  prepaymentBalanceCny: number;
+}
+
+export interface AgentDebtsReport {
+  rows: AgentDebtRow[];
 }
 
 export interface RoomGroup {
@@ -2015,6 +2074,8 @@ export const api = {
       priority?: ReminderPriority;
       orderId?: string;
       mine?: boolean;
+      /** auto = 规则自动生成（ruleKey 非空）；manual = 手动创建 */
+      source?: 'auto' | 'manual';
       page?: number;
       pageSize?: number;
     },
@@ -2084,6 +2145,12 @@ export const api = {
       token,
       body,
     }),
+  // 按规则批量生成今日提醒（催尾款/出行提醒/护照有效期/签证缺件…）；幂等，已存在的跳过
+  generateReminders: (token: string) =>
+    apiFetch<{ created: number; skipped: number; byRule: Record<string, number> }>(
+      '/reminders/generate',
+      { method: 'POST', token, body: {} },
+    ),
 
   // Settlements
   listSettlements: (token: string, query?: { period?: string; agentId?: string; status?: SettlementStatus; page?: number; pageSize?: number }) => {
@@ -2417,6 +2484,34 @@ export const api = {
   ): Promise<Blob> => {
     const res = await fetch(
       `${API_BASE}/finances/export-by-flight?from=${encodeURIComponent(range.from)}&to=${encodeURIComponent(range.to)}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) throw new ApiError(res.status, { code: 'EXPORT_FAILED', message: await res.text() });
+    return res.blob();
+  },
+
+  // ── 经营报表（ADMIN-only）— 销售毛利 / 应收账龄 / 代理欠款 ────────────
+  getSalesReport: (
+    token: string,
+    params: { from?: string; to?: string; dim: SalesReportDim },
+  ) => {
+    const qs = new URLSearchParams();
+    if (params.from) qs.set('from', params.from);
+    if (params.to) qs.set('to', params.to);
+    qs.set('dim', params.dim);
+    return apiFetch<SalesReport>(`/reports/sales?${qs.toString()}`, { token });
+  },
+  getReceivablesReport: (token: string) =>
+    apiFetch<ReceivablesReport>('/reports/receivables', { token }),
+  getAgentDebtsReport: (token: string) =>
+    apiFetch<AgentDebtsReport>('/reports/agent-debts', { token }),
+  // 经营报表 xlsx 导出（Blob 直接下载）
+  downloadReportsXlsx: async (
+    token: string,
+    range: { from: string; to: string },
+  ): Promise<Blob> => {
+    const res = await fetch(
+      `${API_BASE}/reports/export?from=${encodeURIComponent(range.from)}&to=${encodeURIComponent(range.to)}`,
       { headers: { Authorization: `Bearer ${token}` } },
     );
     if (!res.ok) throw new ApiError(res.status, { code: 'EXPORT_FAILED', message: await res.text() });

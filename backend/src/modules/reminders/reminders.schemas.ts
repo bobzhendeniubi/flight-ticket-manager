@@ -28,6 +28,8 @@ export const listRemindersQuerySchema = z.object({
   priority: z.nativeEnum(ReminderPriority).optional(),
   orderId: z.string().optional(),
   mine: z.coerce.boolean().optional(),
+  // auto = 规则自动生成（ruleKey 非空）；manual = 手工创建（ruleKey 为空）
+  source: z.enum(['auto', 'manual']).optional(),
   page: z.coerce.number().int().min(1).default(1),
   pageSize: z.coerce.number().int().min(1).max(200).default(50),
 });

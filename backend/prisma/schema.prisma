@@ -1467,6 +1467,9 @@ model OperationalReminder {
   priority      ReminderPriority @default(NORMAL)
   status        ReminderStatus   @default(OPEN)
   attachmentUrl String? // 截图 / 文件链接（小程序/客人发来的）
+  // 规则化自动生成的幂等键（如 BALANCE:{orderId}:{出发日}）；手工创建的为 null。
+  // 同一 ruleKey 只生成一次，重复跑生成任务不刷屏。
+  ruleKey       String?          @unique
   resolvedAt    DateTime?
   resolvedNote  String? // 完成或跳过的说明
   createdAt     DateTime         @default(now())

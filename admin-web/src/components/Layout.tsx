@@ -25,6 +25,8 @@ const NAV: Array<{
   { to: '/seat-allocation', label: '切位（包位）', roles: ['ADMIN', 'STAFF'],          section: '运营' },
   { to: '/hotel-control',   label: '房控',        roles: ['ADMIN', 'STAFF'],          section: '运营' },
   { to: '/visa-desk',       label: '签证台',      roles: ['ADMIN', 'STAFF'],          section: '运营' },
+  { to: '/reminders',       label: '提醒中心',    roles: ['ADMIN', 'STAFF'],          section: '运营' },
+  { to: '/fulfillment-board', label: '工单看板',  roles: ['ADMIN', 'STAFF'],          section: '运营' },
   { to: '/products',        label: '产品管理',    roles: ['ADMIN', 'STAFF'],          section: '产品' },
   { to: '/cancellation-policies', label: '取消政策', roles: ['ADMIN', 'STAFF'],       section: '产品' },
   { to: '/agents',          label: '代理管理',    roles: ['ADMIN', 'STAFF', 'AGENT'], section: '客户' },
@@ -34,6 +36,7 @@ const NAV: Array<{
   { to: '/agent-balance',   label: '余额与认款',  roles: ['ADMIN', 'STAFF', 'AGENT'], section: '财务' },
   { to: '/reconciliation',  label: '收款对账台',  roles: ['ADMIN', 'STAFF'],          section: '财务' },
   { to: '/finances',        label: '财务',        roles: ['ADMIN'],                   section: '财务' },
+  { to: '/reports',         label: '经营报表',    roles: ['ADMIN'],                   section: '财务' },
   { to: '/audit-logs',      label: '审计日志',    roles: ['ADMIN', 'STAFF'],          section: '系统' },
   { to: '/settings/ai-ocr', label: 'AI 识别设置', roles: ['ADMIN'],                   section: '系统' },
 ];
