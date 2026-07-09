@@ -341,6 +341,63 @@ describe('buildRoomAllocationSheets 多 item 订单（回归：曾经 item×乘�
   });
 });
 
+/** 单乘客极简 item（专测「中文名称」列取值优先级：chineseName → fullName 含中文 → 留空）。*/
+function chineseNameItem(passenger: { fullName: string; chineseName?: string | null }): RoomItemForExport {
+  return {
+    orderId: `order-cn-${passenger.fullName}`,
+    hotelCheckIn: D('2026-08-10'),
+    hotelRoomType: {
+      name: '双床',
+      bedType: '双床',
+      capacity: 2,
+      hotel: { name: 'G酒店' },
+    },
+    order: {
+      notes: null,
+      roomAssignment: null,
+      agent: null,
+      items: [{ kind: 'HOTEL', flightSchedule: null }],
+      passengers: [
+        {
+          id: 'cn1',
+          fullName: passenger.fullName,
+          chineseName: passenger.chineseName ?? null,
+          lastName: null,
+          firstName: null,
+          gender: null,
+          dateOfBirth: D('1990-01-01'),
+          documentNumber: 'X0',
+          passportExpiry: null,
+          bedPref: null,
+        },
+      ],
+    },
+  } as unknown as RoomItemForExport;
+}
+
+describe('buildRoomAllocationSheets 中文名称列取值优先级', () => {
+  it('有 chineseName → 优先取 chineseName（即便 fullName 是拼音）', () => {
+    const [sheet] = buildRoomAllocationSheets([
+      chineseNameItem({ fullName: 'YANG, MIAOMIAO', chineseName: '杨苗苗' }),
+    ]);
+    expect(sheet.rows[0].chineseName).toBe('杨苗苗');
+  });
+
+  it('无 chineseName 但 fullName 是中文（直客直接录中文名）→ 用 fullName', () => {
+    const [sheet] = buildRoomAllocationSheets([
+      chineseNameItem({ fullName: '王小明', chineseName: null }),
+    ]);
+    expect(sheet.rows[0].chineseName).toBe('王小明');
+  });
+
+  it('chineseName 为空白字符串、fullName 是拼音 → 都取不到，留空', () => {
+    const [sheet] = buildRoomAllocationSheets([
+      chineseNameItem({ fullName: 'ZHANG, SAN', chineseName: '   ' }),
+    ]);
+    expect(sheet.rows[0].chineseName).toBe('');
+  });
+});
+
 describe('roomAllocationExportFilename', () => {
   it('单日 / 区间两种文件名', () => {
     expect(roomAllocationExportFilename('2026-07-10', '2026-07-10')).toBe('分房表_2026-07-10.xlsx');

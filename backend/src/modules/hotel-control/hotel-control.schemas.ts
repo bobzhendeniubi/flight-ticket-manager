@@ -36,6 +36,16 @@ export const boardQuerySchema = z.object({
 });
 export type BoardQuery = z.infer<typeof boardQuerySchema>;
 
+// ── 按酒店导出护照 zip（选酒店 + 入住日期区间）────────────────────────────
+export const hotelPassportsQuerySchema = z
+  .object({
+    hotelId: z.string().min(1),
+    from: dateStr,
+    to: dateStr,
+  })
+  .refine((q) => q.from <= q.to, { message: '起始日不能晚于结束日' });
+export type HotelPassportsQuery = z.infer<typeof hotelPassportsQuerySchema>;
+
 // ── 提醒线（超卖加房 / 富余退房 / 班次超开票上限）─────────────────────────
 export const alertsQuerySchema = z.object({
   days: z.coerce.number().int().min(1).max(60).default(14),

@@ -191,8 +191,8 @@ export function HotelControlPage() {
       {/* ── 分房表导出（成都格式 xlsx）──────────────────────────── */}
       <RoomAllocationExport token={token} />
 
-      {/* ── 房态导出（销控矩阵原样导出 xlsx）────────────────────── */}
-      <BoardExport token={token} />
+      {/* ── 房态导出（销控矩阵原样导出 xlsx）+ 按酒店导出护照 zip ── */}
+      <BoardExport token={token} board={board} />
 
       {/* ── 订单分房（按订单号查 → 拖拽分房）────────────────────── */}
       <RoomingSection token={token} board={board} />
@@ -556,7 +556,9 @@ function OccupantsDrawer({
 }
 
 // ── 房态导出（GET /hotel-control/export；销控矩阵原样导出，含「未配包房」标记）───
-function BoardExport({ token }: { token: string }) {
+// 同卡片内附「导出护照」：选一家酒店 + 入住日期区间，打包该期间入住客人护照图 zip
+// （GET /hotel-control/passports.zip；按订单分文件夹，缺图乘客写进 README）。
+function BoardExport({ token, board }: { token: string; board: HotelControlBoard | null }) {
   const [exportFrom, setExportFrom] = useState<string>(todayStr());
   const [exportTo, setExportTo] = useState<string>(plusDaysStr(30));
   const [exporting, setExporting] = useState(false);
@@ -581,8 +583,42 @@ function BoardExport({ token }: { token: string }) {
     }
   }
 
+  // ── 导出护照 ──
+  const hotelOptions = board?.hotels ?? [];
+  const [passportHotelId, setPassportHotelId] = useState<string>('');
+  const [passportFrom, setPassportFrom] = useState<string>(todayStr());
+  const [passportTo, setPassportTo] = useState<string>(plusDaysStr(30));
+  const [passporting, setPassporting] = useState(false);
+
+  async function handlePassportExport(): Promise<void> {
+    if (!token || !passportHotelId) return;
+    setPassporting(true);
+    try {
+      const blob = await hotelControlOpsApi.downloadHotelPassportsZip(token, {
+        hotelId: passportHotelId,
+        from: passportFrom,
+        to: passportTo,
+      });
+      const hotelName = hotelOptions.find((h) => h.hotelId === passportHotelId)?.hotelName ?? passportHotelId;
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `护照-${hotelName}-${passportFrom}_${passportTo}.zip`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (e: unknown) {
+      alert(e instanceof ApiError ? `导出失败：${e.message}` : '导出失败');
+    } finally {
+      setPassporting(false);
+    }
+  }
+
+  const passportRangeInvalid = passportFrom > passportTo;
+
   return (
-    <section className="card">
+    <section className="card space-y-4">
       <div className="flex flex-wrap items-end justify-between gap-3">
         <div>
           <h2 className="text-sm font-semibold text-ink">导出房态（销控矩阵）</h2>
@@ -614,7 +650,66 @@ function BoardExport({ token }: { token: string }) {
           </button>
         </div>
       </div>
-      {exportFrom > exportTo && <div className="mt-2 text-xs text-amber-700">起始不能晚于截止</div>}
+      {exportFrom > exportTo && <div className="text-xs text-amber-700">起始不能晚于截止</div>}
+
+      {/* 导出护照：选酒店 + 入住日期区间 → 打包该期间入住客人护照图 zip */}
+      <div className="border-t border-slate-200 pt-4">
+        <div className="flex flex-wrap items-end justify-between gap-3">
+          <div>
+            <h2 className="text-sm font-semibold text-ink">导出护照（按酒店）</h2>
+            <p className="mt-1 text-xs text-ink-muted">
+              zip：选一家酒店 + 入住日期区间，打包该期间所有入住客人的护照图，按订单号分文件夹；缺护照图的客人会列进 README.txt。
+            </p>
+          </div>
+          <div className="flex items-end gap-2">
+            <div>
+              <label className="label">酒店</label>
+              <select
+                className="input"
+                value={passportHotelId}
+                onChange={(e) => setPassportHotelId(e.target.value)}
+              >
+                <option value="">请选择酒店</option>
+                {hotelOptions.map((h) => (
+                  <option key={h.hotelId} value={h.hotelId}>
+                    {h.hotelName}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="label">入住起</label>
+              <input
+                type="date"
+                className="input"
+                value={passportFrom}
+                onChange={(e) => setPassportFrom(e.target.value)}
+              />
+            </div>
+            <div>
+              <label className="label">入住止</label>
+              <input
+                type="date"
+                className="input"
+                value={passportTo}
+                onChange={(e) => setPassportTo(e.target.value)}
+              />
+            </div>
+            <button
+              type="button"
+              onClick={() => void handlePassportExport()}
+              disabled={passporting || !passportHotelId || passportRangeInvalid}
+              className="btn-primary"
+            >
+              {passporting ? '导出中…' : '导出护照'}
+            </button>
+          </div>
+        </div>
+        {passportRangeInvalid && <div className="mt-2 text-xs text-amber-700">入住起不能晚于入住止</div>}
+        {hotelOptions.length === 0 && (
+          <div className="mt-2 text-xs text-ink-muted">当前查询范围内暂无酒店，调整上方销控板日期范围后再选。</div>
+        )}
+      </div>
     </section>
   );
 }
@@ -653,7 +748,10 @@ function hotelStayFromOrder(order: OrderSummary | null): { checkIn: string; chec
     (it) => (it.hotelName || it.kind === 'HOTEL') && it.hotelCheckIn && it.hotelCheckOut,
   );
   if (!hotelItem?.hotelCheckIn || !hotelItem?.hotelCheckOut) return null;
-  return { checkIn: hotelItem.hotelCheckIn, checkOut: hotelItem.hotelCheckOut };
+  // 后端 serializeOrder 原样透出 Prisma DateTime，序列化后是完整 ISO 串（2026-07-10T00:00:00.000Z）；
+  // 本页销控板日期与 nextDayStr 都只认 YYYY-MM-DD，不归一会让 nextDayStr 拼出 Invalid Date
+  // 并在 toISOString 处抛 "Invalid time value" 崩整页。
+  return { checkIn: hotelItem.hotelCheckIn.slice(0, 10), checkOut: hotelItem.hotelCheckOut.slice(0, 10) };
 }
 
 /**

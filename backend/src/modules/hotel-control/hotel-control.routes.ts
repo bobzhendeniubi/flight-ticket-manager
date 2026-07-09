@@ -18,9 +18,16 @@ import { UserRole } from '@prisma/client';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
 import { buildHotelControlBoardWorkbook, hotelControlExportFilename } from './hotel-control.export.js';
 import {
+  buildHotelPassportsZip,
+  collectHotelPassportGroups,
+  hasAnyPassportPhoto,
+  hotelPassportsZipFilename,
+} from './hotel-control.passports.js';
+import {
   alertsQuerySchema,
   boardQuerySchema,
   createBlockPeriodBodySchema,
+  hotelPassportsQuerySchema,
   listBlockPeriodsQuerySchema,
   nightlyRemainingQuerySchema,
   occupantsQuerySchema,
@@ -142,6 +149,46 @@ export const hotelControlRoutes: FastifyPluginAsync = async (app) => {
       .header(
         'Content-Disposition',
         `attachment; filename="${encodeURIComponent(hotelControlExportFilename(q.from, q.to))}"`,
+      )
+      .send(buf);
+  });
+
+  // ── 按酒店一键导出护照 zip（选酒店 + 入住日期区间；按订单分文件夹）────────
+  app.get('/passports.zip', requireStaff, async (req, reply) => {
+    const q = hotelPassportsQuerySchema.parse(req.query);
+    const selection = await collectHotelPassportGroups(q);
+
+    // 无命中订单 → 友好 400（避免下载到只有一个 README 的空 zip）
+    if (selection.groups.length === 0) {
+      return reply
+        .status(400)
+        .send({ error: '所选酒店在该入住日期区间内没有可导出的入住订单' });
+    }
+    // 全员都没上传护照图 → 400（没有可打包的护照）
+    if (!hasAnyPassportPhoto(selection.groups)) {
+      return reply
+        .status(400)
+        .send({ error: '所选区间内的入住客人均未上传护照图，暂无可打包的护照' });
+    }
+
+    const { buf, photoCount } = await buildHotelPassportsZip(selection, q);
+
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'DOWNLOAD_HOTEL_PASSPORTS',
+      targetType: 'PRODUCT',
+      targetId: q.hotelId,
+      targetLabel: `${selection.hotelName ?? q.hotelId} ${q.from}~${q.to}`,
+      after: { orderCount: selection.groups.length, photoCount },
+    });
+
+    return reply
+      .header('Content-Type', 'application/zip')
+      .header(
+        'Content-Disposition',
+        `attachment; filename="${encodeURIComponent(
+          hotelPassportsZipFilename(selection.hotelName, q.hotelId, q.from, q.to),
+        )}"`,
       )
       .send(buf);
   });

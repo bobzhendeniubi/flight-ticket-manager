@@ -3023,6 +3023,19 @@ export const hotelControlOpsApi = {
     return res.blob();
   },
 
+  /** 按酒店导出护照 zip：选酒店 + 入住日期区间，打包该酒店该期间入住客人的护照图；ADMIN/STAFF only。 */
+  downloadHotelPassportsZip: async (
+    token: string,
+    params: { hotelId: string; from: string; to: string },
+  ): Promise<Blob> => {
+    const res = await fetch(
+      `${API_BASE}/hotel-control/passports.zip?hotelId=${encodeURIComponent(params.hotelId)}&from=${encodeURIComponent(params.from)}&to=${encodeURIComponent(params.to)}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) throw new ApiError(res.status, { code: 'ZIP_FAILED', message: await res.text() });
+    return res.blob();
+  },
+
   /** 占房下钻：某酒店某晚是谁占的（销控矩阵余量格点击用）。 */
   getHotelOccupants: (token: string, params: { hotelId: string; date: string }) =>
     apiFetch<{ occupants: HotelOccupant[] }>(

@@ -177,6 +177,20 @@ function formatRoomNo(order: number, isHalf: boolean): string {
   return isHalf ? `房${order}(½)` : `房${order}`;
 }
 
+/**
+ * 「中文名称」列取值优先级：
+ *   1. Passenger.chineseName（OCR 识别或手工填写），trim 后非空才采用；
+ *   2. fullName 本身含中文（直客常直接把中文名录入 fullName）→ 用 fullName；
+ *   3. 都不满足（多数国际票 fullName 是拼音，如 "YANG, MIAOMIAO"）→ 留空，
+ *      让操作部一眼看出谁还没录中文名，而不是把拼音误当中文名展示。
+ */
+function resolveChineseName(p: { chineseName?: string | null; fullName: string }): string {
+  const cn = p.chineseName?.trim();
+  if (cn) return cn;
+  if (/[一-鿿]/u.test(p.fullName)) return p.fullName;
+  return '';
+}
+
 /** 占房 item 上 hotelCheckIn / hotelRoomType 均非空后的窄化类型（correlate 阶段用）。*/
 type AllocatableItem = RoomItemForExport & {
   hotelCheckIn: NonNullable<RoomItemForExport['hotelCheckIn']>;
@@ -288,7 +302,7 @@ export function buildRoomAllocationSheets(
       const row: Omit<RoomAllocationRow, 'seq' | 'roomNo'> = {
         agency,
         hotelType: `${hotelName} · ${it.hotelRoomType.name}`,
-        chineseName: p.fullName,
+        chineseName: resolveChineseName(p),
         pnrName: pnrName(p),
         flightCount: '',
         travelDates,
