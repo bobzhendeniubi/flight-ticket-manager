@@ -423,7 +423,8 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     // service.getOrder 已含 RBAC（CUSTOMER 只能看自己；AGENT 看自己 + 下级；ADMIN/STAFF 看全部）
     const order = await service.getOrder(id, requester);
     const passengers = await prisma.passenger.findMany({ where: { orderId: id } });
-    const buf = await buildPnrWorkbook({ orderNumber: order.orderNumber, passengers });
+    // items 传入用于按「出发日 − 出生日期」自动推 PTC（见 pnr-export.ts derivePtcByAge）
+    const buf = await buildPnrWorkbook({ orderNumber: order.orderNumber, passengers, items: order.items });
 
     void writeAudit({
       actor: actorFromRequest(req),

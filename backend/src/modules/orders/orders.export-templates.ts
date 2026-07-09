@@ -13,7 +13,7 @@ import type { Prisma, PrismaClient } from '@prisma/client';
 import { OrderItemKind, OrderStatus } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { toAlpha3 } from './nationality.js';
-import { passengerToRow, type PnrRow, PNR_COLUMNS } from './pnr-export.js';
+import { passengerToRow, earliestFlightDeparture, type PnrRow, PNR_COLUMNS } from './pnr-export.js';
 import { buildOrderFilterWhere } from './orders.service.js';
 import { determineFlightLegs } from './ticketing-cap.js';
 import { parseRoomGroups } from './orders.export-room-allocation.js';
@@ -504,10 +504,12 @@ export const TICKETING_COLUMNS: Array<{ header: string; key: keyof TicketingRow;
 ];
 
 export function orderToTicketingRows(order: OrderForTemplateExport, ctx: OrderContext): TicketingRow[] {
+  // PTC 按「出发日 − 出生日期」自动推算 —— 取订单 FLIGHT 行里最早的出发时间（去程）。
+  const departureDate = earliestFlightDeparture(order.items);
   return order.passengers.map<TicketingRow>((p) => ({
     agency: ctx.agency,
     notes: ctx.notes,
-    ...passengerToRow(p),
+    ...passengerToRow(p, departureDate),
   }));
 }
 

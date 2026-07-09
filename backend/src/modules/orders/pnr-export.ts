@@ -18,9 +18,56 @@ export function formatPnrDate(d: Date | null | undefined): string {
   return `${day}${mon}${yr}`;
 }
 
-/** PTC code: ADT (adult) / CHD (child) / INF (infant) */
+/** PTC code: ADT (adult) / CHD (child) / INF (infant) —— 录入 passengerType 直译，仅作年龄无法推算时的回退口径。*/
 function passengerTypeCode(t: string): string {
   return { ADULT: 'ADT', CHILD: 'CHD', INFANT: 'INF' }[t] ?? 'ADT';
+}
+
+/** 实足年龄（周岁）：at 相对 dob 按公历年/月/日比较，不满整年不进位。*/
+function ageInYearsAt(dob: Date, at: Date): number {
+  let age = at.getUTCFullYear() - dob.getUTCFullYear();
+  const monthDiff = at.getUTCMonth() - dob.getUTCMonth();
+  if (monthDiff < 0 || (monthDiff === 0 && at.getUTCDate() < dob.getUTCDate())) {
+    age -= 1;
+  }
+  return age;
+}
+
+/**
+ * PTC 按「出发日 − 出生日期」实足年龄推算（航司口径）：<2 岁 INF、2–<12 岁 CHD、≥12 岁 ADT。
+ * 出生日期缺失、或出发日取不到（纯地面单/无航班行）→ 回退录入的 passengerType，不阻断导出。
+ */
+export function derivePtcByAge(
+  dob: Date | null | undefined,
+  departureDate: Date | null | undefined,
+  fallbackPassengerType: string,
+): string {
+  if (!dob || !departureDate) return passengerTypeCode(fallbackPassengerType);
+  const age = ageInYearsAt(dob, departureDate);
+  if (age < 0) return passengerTypeCode(fallbackPassengerType); // 生日晚于出发日：数据异常，回退录入值
+  if (age < 2) return 'INF';
+  if (age < 12) return 'CHD';
+  return 'ADT';
+}
+
+/** Title 联动：派生为 CHD/INF 且未录入 Title 时按性别给 MSTR（男）/MISS（女）；成人缺失维持现状（留空）。*/
+function deriveTitle(title: string | null | undefined, ptc: string, gender: string | null | undefined): string {
+  if (title) return title;
+  if (ptc !== 'CHD' && ptc !== 'INF') return '';
+  if (gender === 'M') return 'MSTR';
+  if (gender === 'F') return 'MISS';
+  return '';
+}
+
+/** 订单 FLIGHT 行里最早的出发时间（票务岗口径的"去程"）；无 FLIGHT 行（纯地面单）→ null。*/
+export function earliestFlightDeparture(
+  items: Array<{ kind: string; flightSchedule?: { departureTime: Date } | null }> | null | undefined,
+): Date | null {
+  const departures = (items ?? [])
+    .filter((it) => it.kind === 'FLIGHT' && it.flightSchedule)
+    .map((it) => it.flightSchedule!.departureTime);
+  if (departures.length === 0) return null;
+  return departures.reduce((min, d) => (d < min ? d : min));
 }
 
 export interface PnrRow {
@@ -79,17 +126,20 @@ export const PNR_COLUMNS: Array<{ header: string; key: keyof PnrRow }> = [
   { header: 'Address Zip Code', key: 'addressZip' },
 ];
 
-export function passengerToRow(p: Passenger): PnrRow {
-  // 优先用拆分字段；fullName 兜底（按空格切）
-  const [autoLast, ...rest] = (p.fullName || '').trim().split(/\s+/);
+export function passengerToRow(p: Passenger, departureDate?: Date | null): PnrRow {
+  // 优先用拆分字段；姓名缺失（含空串，`||` 语义）兜底按 fullName 拆分——支持空格或斜线：
+  // OCR/OTA/老数据常见 "CHEN/HAOLIANG" 斜线格式，若只按空格切，整串会掉进 Last Name。
+  const [autoLast, ...rest] = (p.fullName || '').trim().split(/[\s/]+/);
   const autoFirst = rest.join(' ');
-  const lastName = (p.lastName ?? autoLast ?? '').toUpperCase();
-  const firstName = (p.firstName ?? autoFirst ?? '').toUpperCase();
+  const lastName = (p.lastName || autoLast || '').toUpperCase();
+  const firstName = (p.firstName || autoFirst || '').toUpperCase();
+  const ptc = derivePtcByAge(p.dateOfBirth, departureDate, p.passengerType);
+  const title = deriveTitle(p.title, ptc, p.gender);
   return {
     lastName,
     firstName,
-    title: p.title ?? '',
-    ptc: passengerTypeCode(p.passengerType),
+    title,
+    ptc,
     gender: p.gender ?? '',
     dob: formatPnrDate(p.dateOfBirth),
     passportLast: lastName,
@@ -115,7 +165,15 @@ export function passengerToRow(p: Passenger): PnrRow {
   };
 }
 
-export async function buildPnrWorkbook(order: { orderNumber: string; passengers: Passenger[] }): Promise<Buffer> {
+export interface PnrOrderInput {
+  orderNumber: string;
+  passengers: Passenger[];
+  // FLIGHT 行（含关联班次出发时间）—— 用于按「出发日 − 出生日期」自动推 PTC；
+  // 纯地面单（无机票行）传空/不传，PTC 回退录入的 passengerType。
+  items?: Array<{ kind: string; flightSchedule?: { departureTime: Date } | null }>;
+}
+
+export async function buildPnrWorkbook(order: PnrOrderInput): Promise<Buffer> {
   const wb = new ExcelJS.Workbook();
   wb.creator = 'Citur Travel · PNR Export';
   wb.created = new Date();
@@ -129,8 +187,9 @@ export async function buildPnrWorkbook(order: { orderNumber: string; passengers:
   headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEFEFEF' } };
   headerRow.alignment = { vertical: 'middle' };
 
+  const departureDate = earliestFlightDeparture(order.items);
   for (const p of order.passengers) {
-    ws.addRow(passengerToRow(p));
+    ws.addRow(passengerToRow(p, departureDate));
   }
 
   wb.subject = `PNR ${order.orderNumber}`;

@@ -3134,7 +3134,7 @@ export class OrderService {
 
       // 套餐升舱拆座：该行下单时可能把 businessUpgradeCount 个座拆到了商务舱。
       // 改期同样按原拆分「先放旧、再拿新」，否则商务/经济会错位泄漏。
-      const meta = (item.metadata ?? {}) as { businessUpgradeCount?: unknown };
+      const meta = (item.metadata ?? {}) as Record<string, unknown> & { businessUpgradeCount?: unknown };
       const rawUpgrade = typeof meta.businessUpgradeCount === 'number' ? meta.businessUpgradeCount : 0;
 
       if (!sameSeat) {
@@ -3150,10 +3150,36 @@ export class OrderService {
         await takeSeatWithinTx(tx, newScheduleId, newCabin, newSplit.sameCabin, null);
       }
 
+      // 航变标记：仅当班次真的换了（换到另一趟班次）才在该行 metadata 打「航变」标，
+      // 供后台（代理）与前台（直客）看见——同班次仅改舱位不算航变，不打标。
+      // 记录原班次号/原起飞时间，前端可醒目标红并悬浮显示「原 XX 航班 原起飞 → 新起飞」。
+      const scheduleChanged = oldScheduleId !== newScheduleId;
+      let flightChangedMeta: Record<string, unknown> | null = null;
+      if (scheduleChanged) {
+        const oldSchedInfo = await tx.flightSchedule.findUnique({
+          where: { id: oldScheduleId },
+          select: { departureTime: true, flight: { select: { flightNumber: true } } },
+        });
+        flightChangedMeta = {
+          at: new Date().toISOString(),
+          fromScheduleId: oldScheduleId,
+          fromFlightNumber: oldSchedInfo?.flight?.flightNumber ?? null,
+          fromDeparture: oldSchedInfo?.departureTime?.toISOString() ?? null,
+          toScheduleId: newScheduleId,
+        };
+      }
+
       // ── 3. 更新订单行的班次/舱位（amount/quantity 不变：机票基础价不重算）──
       await tx.orderItem.update({
         where: { id: item.id },
-        data: { flightScheduleId: newScheduleId, flightCabin: newCabin },
+        data: {
+          flightScheduleId: newScheduleId,
+          flightCabin: newCabin,
+          // 换班次 → 落「航变」标记（保留该行原有 metadata，如套餐升舱拆座计数）
+          ...(flightChangedMeta
+            ? { metadata: { ...meta, flightChanged: flightChangedMeta } as Prisma.InputJsonValue }
+            : {}),
+        },
       });
 
       // ── 4. 加改期费（adjustmentCny + adjustments 流水）──
@@ -4890,6 +4916,7 @@ export interface MaskedOrderView {
     quantity: number;
     amount: string;
     travelDate: string | null; // 出行/入住日期（仅日期，无时间）
+    flightChanged: boolean; // 该航段是否发生过航变改班（前台标红提示「留意新起飞时间」）
   }>;
   passengers: Array<{ name: string }>; // 仅名（given name），姓氏脱敏
 }
@@ -4946,9 +4973,18 @@ function maskOrderForPublic(order: OrderForMasking): MaskedOrderView {
       quantity: it.quantity,
       amount: it.amount.toString(),
       travelDate: maskedItemTravelDate(it),
+      // 仅暴露「是否航变」这个客户可见事实布尔，不带任何内部班次 id/明细（脱敏口径）。
+      flightChanged: hasFlightChanged((it as { metadata?: unknown }).metadata),
     })),
     passengers: order.passengers.map((p) => ({ name: maskFamilyName(p.fullName) })),
   };
+}
+
+/** 该订单行是否带「航变」标记（rescheduleOrderItem 换班次时落在 metadata.flightChanged）。 */
+function hasFlightChanged(metadata: unknown): boolean {
+  if (!metadata || typeof metadata !== 'object') return false;
+  const mark = (metadata as { flightChanged?: unknown }).flightChanged;
+  return Boolean(mark) && typeof mark === 'object';
 }
 
 /** 行的出行/入住日期（仅日期字符串）；HOTEL→入住日，FLIGHT→出发日，否则 null。 */

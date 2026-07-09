@@ -101,4 +101,23 @@
   .page-sub {
     @apply mt-0.5 text-sm text-ink-soft;
   }
+
+  /* ── 常显滚动条（弹窗内可滚动表格：macOS 悬浮滚动条不拖动就隐身，
+     运营找不到「杠杠」——录单/批量创单弹窗的乘客表格用这个类让滚动条常显可拖）── */
+  .scrollbar-visible {
+    scrollbar-width: thin;
+  }
+  .scrollbar-visible::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  .scrollbar-visible::-webkit-scrollbar-track {
+    @apply bg-slate-100;
+  }
+  .scrollbar-visible::-webkit-scrollbar-thumb {
+    @apply rounded-full bg-slate-300;
+  }
+  .scrollbar-visible::-webkit-scrollbar-thumb:hover {
+    @apply bg-slate-400;
+  }
 }

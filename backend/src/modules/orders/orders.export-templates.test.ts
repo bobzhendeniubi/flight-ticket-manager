@@ -119,7 +119,8 @@ function fixtureRoundTrip(): OrderForTemplateExport {
         firstName: null,
         title: null,
         gender: 'F',
-        dateOfBirth: D('1990-06-15'),
+        // 去程 2026-07-13 时实足 7 岁 → PTC 按年龄推算 = CHD，与录入 passengerType 口径一致。
+        dateOfBirth: D('2019-06-15'),
         passengerType: 'CHILD',
         nationality: 'CN',
         documentType: 'PASSPORT',
@@ -323,6 +324,11 @@ describe('《票务专用》ticketing 模版 — 27 列 + 格式', () => {
     expect(r2.ptc).toBe('CHD');
   });
 
+  it('PTC 按订单去程（最早 FLIGHT 行出发时间）自动推算，联动 Title：儿童缺 Title 按性别给 MISS', () => {
+    // 订单去程 = 2026-07-13（fixtureRoundTrip 两段航班中较早一段），r2 生日 2019-06-15 → 实足 7 岁 = CHD。
+    expect(r2.title).toBe('MISS');
+  });
+
   it('Date of Birth / Passport Expiry：DDMonYY 航司格式', () => {
     expect(r1.dob).toBe('04Feb84');
     expect(r1.passportExpiry).toBe('11Dec34');
@@ -360,7 +366,7 @@ describe('导出 · 生日为空（dateOfBirth=null）', () => {
     const rows = orderToFullRows(order, ctx);
     expect(rows[0].dateOfBirth).toBe('');
     // 其余乘客仍正常
-    expect(rows[1].dateOfBirth).toBe('15-06-1990');
+    expect(rows[1].dateOfBirth).toBe('15-06-2019');
   });
 
   it('《票务专用》：null 生日 → DOB(PNR) 列留空，不抛错', () => {
@@ -368,6 +374,6 @@ describe('导出 · 生日为空（dateOfBirth=null）', () => {
     const ctx = buildOrderContext(order);
     const rows = orderToTicketingRows(order, ctx);
     expect(rows[0].dob).toBe('');
-    expect(rows[1].dob).toBe('15Jun90');
+    expect(rows[1].dob).toBe('15Jun19');
   });
 });

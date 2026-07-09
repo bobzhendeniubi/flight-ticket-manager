@@ -79,6 +79,25 @@ function KindIcon({ kind, className }: { kind: string; className?: string }) {
   return <Icon name={KIND_ICON[kind] ?? 'package'} className={className ?? 'h-3.5 w-3.5'} />;
 }
 
+// 航变标记：我们因航司航变为你调整了航班班次，落在该航段的 metadata.flightChanged。
+type FlightChangedMark = { fromDeparture?: string | null };
+
+/** 从订单项 metadata 读「航变」标记；无标记时返回 null。 */
+function readFlightChanged(metadata: unknown): FlightChangedMark | null {
+  if (!metadata || typeof metadata !== 'object') return null;
+  const mark = (metadata as { flightChanged?: unknown }).flightChanged;
+  if (!mark || typeof mark !== 'object') return null;
+  return mark as FlightChangedMark;
+}
+
+/** ISO 起飞时间 → "M月D日 HH:MM"（航变提示里展示原起飞时间）。 */
+function formatDepart(iso?: string | null): string | null {
+  if (!iso) return null;
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return null;
+  return d.toLocaleString('zh-CN', { month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
 const CANCELLABLE = new Set<OrderStatus>(['PAID', 'PROCESSING', 'TICKETED']);
 // 仍需付款的状态：订单未结清时露出收款方式 + 上传凭证（买家可稍后回来付）。
 // 已取消 / 退款 / 失败 / 超时等终态不再展示收款入口。
@@ -393,18 +412,40 @@ export function MyOrdersPage() {
                 <div>
                   <div className="mb-1.5 text-xs font-bold uppercase tracking-wide text-ink-muted">项目明细</div>
                   <ul className="space-y-1.5">
-                    {o.items.map((it) => (
-                      <li key={it.id} className="flex items-center justify-between rounded-xl border border-slate-100 bg-surface px-3 py-2.5">
-                        <div className="inline-flex items-center gap-1.5 text-ink">
-                          <KindIcon kind={it.kind} className="h-4 w-4 text-ink-muted" />
-                          {it.description}
-                          {it.quantity > 1 && <span className="text-ink-muted"> × {it.quantity}</span>}
-                        </div>
-                        <div className="font-semibold text-ink nums">
-                          ¥{Number(it.amount).toLocaleString()}
-                        </div>
-                      </li>
-                    ))}
+                    {o.items.map((it) => {
+                      const changed = readFlightChanged(it.metadata);
+                      const oldDepart = changed ? formatDepart(changed.fromDeparture) : null;
+                      const newDepart =
+                        it.departureDate && it.departureTime
+                          ? `${it.departureDate} ${it.departureTime}`
+                          : it.departureDate ?? null;
+                      return (
+                        <li key={it.id} className="rounded-xl border border-slate-100 bg-surface px-3 py-2.5">
+                          <div className="flex items-center justify-between">
+                            <div className="inline-flex flex-wrap items-center gap-1.5 text-ink">
+                              <KindIcon kind={it.kind} className="h-4 w-4 text-ink-muted" />
+                              {it.description}
+                              {it.quantity > 1 && <span className="text-ink-muted"> × {it.quantity}</span>}
+                              {changed && (
+                                <span className="inline-flex items-center gap-0.5 rounded-full border border-rose-200 bg-rose-50 px-2 py-0.5 text-xs font-semibold text-rose-600">
+                                  航变
+                                </span>
+                              )}
+                            </div>
+                            <div className="font-semibold text-ink nums">
+                              ¥{Number(it.amount).toLocaleString()}
+                            </div>
+                          </div>
+                          {changed && (
+                            <div className="mt-1.5 rounded-lg bg-rose-50 px-2.5 py-1.5 text-xs leading-relaxed text-rose-700">
+                              航班有调整，请留意新的起飞时间
+                              {newDepart && <>：<span className="font-semibold">{newDepart}</span></>}
+                              {oldDepart && <span className="text-rose-400"> · 原 {oldDepart}</span>}
+                            </div>
+                          )}
+                        </li>
+                      );
+                    })}
                   </ul>
                 </div>
 

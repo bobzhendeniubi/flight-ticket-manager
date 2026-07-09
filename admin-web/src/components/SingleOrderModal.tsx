@@ -1658,7 +1658,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                   <button className="text-sm text-brand hover:text-brand-dark" onClick={addPassenger} type="button">＋ 加一位</button>
                 </div>
               </div>
-              <div className="max-h-[28rem] overflow-x-auto overflow-y-auto rounded-md border border-slate-200">
+              <div className="scrollbar-visible max-h-[28rem] overflow-x-auto overflow-y-auto rounded-md border border-slate-200">
                 {/* 列宽用固定 min-width 直接标在每个 th/td 上（不用 col min-width——部分浏览器
                     的 auto-layout 表格不认 <col> 上的 min-width，只认 width，等于没生效）。
                     日期列需完整显示 YYYY-MM-DD 不被截断成「2026-」，姓名类列需够宽可读；

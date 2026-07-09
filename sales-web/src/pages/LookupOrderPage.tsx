@@ -259,21 +259,34 @@ function MaskedOrderCard({ order }: { order: MaskedOrder }) {
           {order.items.map((it, idx) => (
             <li
               key={`${it.productName}-${idx}`}
-              className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-slate-100 bg-surface px-3 py-2.5"
+              className="rounded-xl border border-slate-100 bg-surface px-3 py-2.5"
             >
-              <div className="inline-flex min-w-0 items-center gap-1.5 text-ink">
-                <Icon name={kindIcon(it.kind)} className="h-4 w-4 shrink-0 text-ink-muted" />
-                <span className="truncate">{it.productName}</span>
-                {it.quantity > 1 && <span className="shrink-0 text-ink-muted"> × {it.quantity}</span>}
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="inline-flex min-w-0 items-center gap-1.5 text-ink">
+                  <Icon name={kindIcon(it.kind)} className="h-4 w-4 shrink-0 text-ink-muted" />
+                  <span className="truncate">{it.productName}</span>
+                  {it.quantity > 1 && <span className="shrink-0 text-ink-muted"> × {it.quantity}</span>}
+                  {it.flightChanged && (
+                    <span className="inline-flex shrink-0 items-center gap-0.5 rounded-full border border-rose-200 bg-rose-50 px-2 py-0.5 text-xs font-semibold text-rose-600">
+                      航变
+                    </span>
+                  )}
+                </div>
+                <div className="flex items-center gap-3">
+                  {it.travelDate && (
+                    <span className="inline-flex items-center gap-1 text-xs text-ink-soft">
+                      <Icon name="calendar" className="h-3.5 w-3.5" /> {fmtDate(it.travelDate)}
+                    </span>
+                  )}
+                  <span className="font-semibold text-ink nums">¥{fmt(it.amount)}</span>
+                </div>
               </div>
-              <div className="flex items-center gap-3">
-                {it.travelDate && (
-                  <span className="inline-flex items-center gap-1 text-xs text-ink-soft">
-                    <Icon name="calendar" className="h-3.5 w-3.5" /> {fmtDate(it.travelDate)}
-                  </span>
-                )}
-                <span className="font-semibold text-ink nums">¥{fmt(it.amount)}</span>
-              </div>
+              {it.flightChanged && (
+                <div className="mt-1.5 rounded-lg bg-rose-50 px-2.5 py-1.5 text-xs leading-relaxed text-rose-700">
+                  航班有调整，请留意新的起飞时间
+                  {it.travelDate && <>：<span className="font-semibold">{fmtDate(it.travelDate)}</span></>}
+                </div>
+              )}
             </li>
           ))}
         </ul>

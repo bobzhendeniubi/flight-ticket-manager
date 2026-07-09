@@ -300,6 +300,13 @@ export interface OrderItem {
   visaId: string | null;
   metadata: unknown;
   createdAt: string;
+  // ── 行程单渲染字段（ADDITIVE；serializeOrder 联查后附加，未联查时为 null）──
+  /** FLIGHT 行：航班号 */
+  flightNumber?: string | null;
+  /** FLIGHT 行：出发日期（YYYY-MM-DD） */
+  departureDate?: string | null;
+  /** FLIGHT 行：出发时间（HH:MM） */
+  departureTime?: string | null;
 }
 
 export interface OrderPassenger {
@@ -832,6 +839,8 @@ export interface MaskedOrderItem {
   amount: string;
   /** 出行日期（ISO 字符串）；不适用时 null */
   travelDate: string | null;
+  /** 该航段是否发生过航变改班（前台标红提示「留意新起飞时间」）；后端脱敏后仅暴露此布尔 */
+  flightChanged?: boolean;
 }
 
 /** GET /orders/lookup 返回的脱敏订单（无需登录，订单号 + 手机号或邮箱即可查） */

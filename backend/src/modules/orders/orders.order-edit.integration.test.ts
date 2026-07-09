@@ -173,6 +173,19 @@ describe('OrderService.rescheduleOrderItem · 真 DB E2E', () => {
     // 机票基础价不重算
     expect(Number(item.amount)).toBe(1000);
 
+    // 航变标记：换班次后该行 metadata 落 flightChanged（后台代理 + 前台直客据此标红）
+    const changedMeta = (item.metadata as { flightChanged?: Record<string, unknown> } | null)
+      ?.flightChanged;
+    expect(changedMeta).toBeTruthy();
+    expect(changedMeta?.fromScheduleId).toBe(from.schedule.id);
+    expect(changedMeta?.toScheduleId).toBe(to.schedule.id);
+    expect(typeof changedMeta?.at).toBe('string');
+    // 序列化后的订单行也应随行下发该标记（前端从这里读）
+    const serializedItem = result.order.items.find((it) => it.id === order.items[0].id);
+    expect(
+      (serializedItem?.metadata as { flightChanged?: unknown } | null)?.flightChanged,
+    ).toBeTruthy();
+
     // 改期费 → adjustmentCny + adjustments 流水
     const reloaded = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
     expect(reloaded.adjustmentCny).toBe(300);

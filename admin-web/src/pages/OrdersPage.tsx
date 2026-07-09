@@ -302,6 +302,8 @@ export function OrdersPage() {
   const [tkDate, setTkDate] = useState(''); // 出发日期（必填）
   const [tkLeg, setTkLeg] = useState<InvoiceLeg>('outbound'); // 航段，默认去程
   const [tkInvoiced, setTkInvoiced] = useState(false); // 开票状态，默认「未开」
+  const [tkFlightNumber, setTkFlightNumber] = useState(''); // 航班号（选填，缩小同日多航班范围）
+  const [tkKind, setTkKind] = useState<'' | 'FLIGHT' | 'BUNDLE'>(''); // 订单类型（选填：机票单/套餐单，避免同航班混单）
   const [tkExporting, setTkExporting] = useState(false);
   const [selected, setSelected] = useState<OrderSummary | null>(null);
   // ── 批量管理状态 ─────────────────────────────────────
@@ -604,12 +606,15 @@ export function OrdersPage() {
     }
     setTkExporting(true);
     try {
+      const trimmedFlightNumber = tkFlightNumber.trim();
       const blob = await api.downloadOrdersTemplateExport(tokens.accessToken, {
         template: 'ticketing',
         travelFrom: tkDate, // 出发日当天（起=止）
         travelTo: tkDate,
         invoiceLeg: tkLeg, // 去程 / 回程
         invoiced: tkInvoiced, // 未开 / 已开
+        flightNumber: trimmedFlightNumber || undefined, // 航班号（选填，缩小同日多航班范围）
+        kind: tkKind || undefined, // 订单类型（选填：机票单/套餐单，避免同航班混单）
       });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
@@ -852,6 +857,28 @@ export function OrdersPage() {
                     <option value="true">已开</option>
                   </select>
                 </label>
+                <label className="flex flex-col gap-1 text-xs text-ink-muted">
+                  航班号（选填）
+                  <input
+                    type="text"
+                    className="input py-1.5 text-sm"
+                    placeholder="如 QH9588"
+                    value={tkFlightNumber}
+                    onChange={(e) => setTkFlightNumber(e.target.value)}
+                  />
+                </label>
+                <label className="flex flex-col gap-1 text-xs text-ink-muted">
+                  订单类型
+                  <select
+                    className="input py-1.5 text-sm"
+                    value={tkKind}
+                    onChange={(e) => setTkKind(e.target.value as '' | 'FLIGHT' | 'BUNDLE')}
+                  >
+                    <option value="">全部</option>
+                    <option value="FLIGHT">仅机票单</option>
+                    <option value="BUNDLE">仅套餐单</option>
+                  </select>
+                </label>
                 <button
                   type="button"
                   className="btn-primary text-sm"
@@ -863,7 +890,7 @@ export function OrdersPage() {
                 </button>
               </div>
               <p className="mt-1.5 text-xs text-ink-muted">
-                按「出发日期」当天 + 所选航段 + 开票状态导出《票务专用》（航司 PNR）模板。
+                按「出发日期」当天 + 所选航段 + 开票状态导出《票务专用》（航司 PNR）模板，可再按航班号/订单类型缩小范围。
               </p>
             </div>
           )}
@@ -2390,6 +2417,30 @@ function BundleItineraryCard({ items, order }: { items: OrderItem[]; order: Orde
   );
 }
 
+// 航变标记（后端 rescheduleOrderItem 换班次时落在该 FLIGHT 行 metadata.flightChanged）
+type FlightChangedMark = {
+  at?: string;
+  fromFlightNumber?: string | null;
+  fromDeparture?: string | null;
+  toScheduleId?: string | null;
+};
+
+/** 从订单行 metadata 读「航变」标记；无标记或结构不符时返回 null。 */
+function readFlightChanged(metadata: unknown): FlightChangedMark | null {
+  if (!metadata || typeof metadata !== 'object') return null;
+  const mark = (metadata as { flightChanged?: unknown }).flightChanged;
+  if (!mark || typeof mark !== 'object') return null;
+  return mark as FlightChangedMark;
+}
+
+/** ISO → "M月D日 HH:MM"（航变悬浮里展示原起飞时间）；无值时返回「原班次」。 */
+function formatChangedDeparture(iso?: string | null): string {
+  if (!iso) return '原班次';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '原班次';
+  return d.toLocaleString('zh-CN', { month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
 // ── 产品内容行：FLIGHT 项可「改期」（换班次/日期 + 改舱位 + 改期费）──────
 function OrderItemRow({
   orderId,
@@ -2408,16 +2459,38 @@ function OrderItemRow({
   const isFlight = item.kind === 'FLIGHT';
   // HOTEL 行，或已盖章酒店房型的 BUNDLE 行（套餐没有独立 HOTEL 行，酒店盖在 BUNDLE 行上）
   const isHotelRow = item.kind === 'HOTEL' || (item.kind === 'BUNDLE' && Boolean(item.hotelRoomTypeId));
+  // 航变：管理员因航变换过班次的机票行，标红醒目提示，悬浮看原班次→新班次
+  const flightChanged = readFlightChanged(item.metadata);
+  const changedHint = flightChanged
+    ? `航变：原 ${flightChanged.fromFlightNumber ?? '班次'}（${formatChangedDeparture(
+        flightChanged.fromDeparture,
+      )}）→ 现 ${item.flightNumber ?? '新班次'}${
+        item.departureDate ? `（${item.departureDate}${item.departureTime ? ` ${item.departureTime}` : ''}）` : ''
+      }`
+    : '';
 
   return (
     <li className="rounded-lg border border-slate-200 bg-slate-50/60 p-3">
       <div className="flex items-start justify-between gap-2">
         <div className="flex-1">
-          <div className="text-ink">{item.description}</div>
+          <div className="flex flex-wrap items-center gap-1.5 text-ink">
+            <span>{item.description}</span>
+            {flightChanged && (
+              <span
+                className="inline-flex items-center gap-0.5 rounded border border-red-300 bg-red-50 px-1.5 py-0.5 text-[11px] font-semibold text-red-600"
+                title={changedHint}
+              >
+                ✈ 航变
+              </span>
+            )}
+          </div>
           <div className="mt-0.5 text-xs text-ink-muted">
             {KIND_LABEL[item.kind]} · 数量 {item.quantity} · 单价 ¥{Number(item.unitPrice).toLocaleString()}
             {item.flightCabin && <> · {CABIN_ZH[item.flightCabin] ?? item.flightCabin}</>}
           </div>
+          {flightChanged && (
+            <div className="mt-1 text-[11px] leading-snug text-red-600">{changedHint}</div>
+          )}
         </div>
         <div className="flex flex-col items-end gap-1">
           <div className="nums text-sm font-medium text-ink">¥{Number(item.amount).toLocaleString()}</div>
@@ -4577,7 +4650,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                 <span className="text-sm font-medium text-slate-700">乘客名单（每位一单 · 共 {validRows.length} 位有效）</span>
                 <button className="text-sm text-brand hover:text-brand-dark" onClick={addRow}>＋ 加一行</button>
               </div>
-              <div className="max-h-60 overflow-y-auto rounded-md border border-slate-200">
+              <div className="scrollbar-visible max-h-60 overflow-y-auto rounded-md border border-slate-200">
                 <table className="w-full text-sm">
                   <thead className="sticky top-0 bg-slate-50 text-xs text-slate-500">
                     <tr>
