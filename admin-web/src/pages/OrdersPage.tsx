@@ -8,6 +8,8 @@ import {
 import { exportToCSV } from '../lib/csvExport';
 import { AIRPORTS } from '../lib/airports';
 import { NumberInput } from '../components/NumberInput';
+import { parseOtaRoster } from '../lib/parseOtaRoster';
+import type { AgentListItem } from '../lib/api';
 import { OrderFinanceSection } from '../components/OrderFinanceSection';
 import { SingleOrderModal } from '../components/SingleOrderModal';
 import { RoomingEditor, type RoomingPassenger } from '../components/RoomingEditor';
@@ -3641,6 +3643,16 @@ interface BatchRow {
   dateOfBirth: string;
   /** 该乘客的个别备注（选填）：客人各自的特殊要求，随本人订单单独存。留空则只写整批备注。 */
   note?: string;
+  // ── OTA 名单解析带出的护照字段（选填；粘贴导入时填充，随提交发给后端）──────
+  lastName?: string;
+  firstName?: string;
+  gender?: 'M' | 'F';
+  /** 2 位国家码（如 CN） */
+  nationality?: string;
+  /** 护照签发国（2 位国家码，如 CN） */
+  passportIssueCountry?: string;
+  /** 护照有效期（YYYY-MM-DD） */
+  passportExpiry?: string;
 }
 
 /**
@@ -3704,9 +3716,25 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   const [bundleChildCount, setBundleChildCount] = useState<number | null>(0);
   const [bundleInfantCount, setBundleInfantCount] = useState<number | null>(0);
 
+  // 仅 ADMIN/STAFF 可用运营专属能力（手动结算单价、代为归属代理）。
+  const isOps = user?.role === 'ADMIN' || user?.role === 'STAFF';
+
   // ── 结算价（FLIGHT 类型专用）+ 团期备注 ──────────────────────────────────
   const [settlementPriceCny, setSettlementPriceCny] = useState<number | null>(null);
   const [groupNote, setGroupNote] = useState('');
+
+  // ── OTA 手动结算单价（仅 ADMIN/STAFF）：不覆盖机票权威价，后端按差额追加调整行调到此价 ──
+  const [manualUnitPriceCny, setManualUnitPriceCny] = useState<number | null>(null);
+
+  // ── 归属代理（ADMIN/STAFF 代为录单；'' = 直客/无代理）───────────────────────
+  const [agents, setAgents] = useState<AgentListItem[]>([]);
+  const [agentId, setAgentId] = useState('');
+  const [agentSearch, setAgentSearch] = useState('');
+
+  // ── OTA 名单粘贴导入（📋）：文本 → parseOtaRoster → 填乘客 + 选航班/班次 + 预填结算价 ──
+  const [otaText, setOtaText] = useState('');
+  // 解析出的班次日期：待出港班次加载后自动选中当日班次（复用按日过滤交互）。
+  const [pendingSchedDate, setPendingSchedDate] = useState('');
 
   // ── 备注 ──────────────────────────────────────────────────────────────────
   const [notes, setNotes] = useState('');
@@ -3745,6 +3773,24 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
     api.listBundles(false).then((r) => setBundles(r.bundles)).catch(() => {/* 忽略，套餐下拉空白时用户可重选 */});
   }, [token, productType]);
 
+  // 代理列表（仅 ADMIN/STAFF 需要；用于归属选择。无代理不致命）
+  useEffect(() => {
+    if (!token || !isOps) return;
+    api.listAgents(token).then((r) => setAgents(r.agents)).catch(() => undefined);
+  }, [token, isOps]);
+
+  const filteredAgents = useMemo(() => {
+    const q = agentSearch.trim().toLowerCase();
+    if (!q) return agents.slice(0, 50);
+    return agents
+      .filter((a) =>
+        [a.companyName, a.contactName, a.contactPhone]
+          .filter(Boolean)
+          .some((s) => String(s).toLowerCase().includes(q)),
+      )
+      .slice(0, 50);
+  }, [agents, agentSearch]);
+
   // 出港班次
   useEffect(() => {
     if (!token || !outboundFlightId) { setOutboundSchedules([]); setOutboundScheduleId(''); setOutboundDate(''); return; }
@@ -3770,6 +3816,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
     setBundleId(''); setBundleNights(null); setBundleSingleCount(null); setBundleBusinessCount(null);
     setBundleAdultCount(1); setBundleChildCount(0); setBundleInfantCount(0);
     setSettlementPriceCny(null); setGroupNote('');
+    setManualUnitPriceCny(null); setPendingSchedDate('');
     setErr(null);
   }
 
@@ -3786,6 +3833,22 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
     () => (returnDate ? returnSchedules.filter((s) => s.departureTime.slice(0, 10) === returnDate) : returnSchedules),
     [returnSchedules, returnDate],
   );
+
+  // OTA 导入后自动选中当日出港班次：班次异步加载完成后触发一次。
+  //   当日恰 1 班 → 直接选中；多班 → 留给运营手动选并提示；无班 → 提示换日期。
+  useEffect(() => {
+    if (!pendingSchedDate || outboundScheduleId) return;
+    const sameDay = outboundSchedules.filter((s) => s.departureTime.slice(0, 10) === pendingSchedDate);
+    if (outboundSchedules.length === 0) return; // 班次尚未加载，等下次
+    if (sameDay.length === 1) {
+      setOutboundScheduleId(sameDay[0].id);
+    } else if (sameDay.length > 1) {
+      setRosterWarnings((prev) => [...prev, `${pendingSchedDate} 有多个班次，请手动选择班次`]);
+    } else {
+      setRosterWarnings((prev) => [...prev, `未找到 ${pendingSchedDate} 的班次，请换个日期或手动选择`]);
+    }
+    setPendingSchedDate('');
+  }, [outboundSchedules, pendingSchedDate, outboundScheduleId]);
   const cabinOptions = outboundSchedule?.seatClasses ?? [];
   const selectedBundle = bundles.find((b) => b.id === bundleId);
 
@@ -3806,6 +3869,60 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
       })
       .filter((r) => r.fullName);
     if (parsed.length > 0) setRows(parsed);
+  }
+
+  // 📋 OTA 名单粘贴导入：解析 → 填乘客行（含护照字段）+ 选航班/起飞日 + 预填结算单价 + 展示解析提醒。
+  function importOtaRoster(): void {
+    setErr(null);
+    const result = parseOtaRoster(otaText);
+    const warnings = [...result.warnings];
+
+    if (result.passengers.length > 0) {
+      setRows(
+        result.passengers.map((p) => ({
+          fullName: p.fullName,
+          documentNumber: p.documentNumber ?? '',
+          dateOfBirth: p.dateOfBirth ?? '',
+          lastName: p.lastName,
+          firstName: p.firstName,
+          gender: p.gender,
+          nationality: p.nationality,
+          passportIssueCountry: p.passportIssueCountry,
+          passportExpiry: p.passportExpiry,
+        })),
+      );
+    }
+
+    // 结算单价预填（仅 ADMIN/STAFF 可见/可用该字段）
+    if (isOps && result.settlementUnitPriceCny !== undefined) {
+      setManualUnitPriceCny(result.settlementUnitPriceCny);
+    }
+
+    // 航班/班次自动选中：OTA 名单是单程机票 → 若当前为套餐，切回单程机票。
+    const f = result.flight;
+    if (f?.flightNumber) {
+      if (productType === 'BUNDLE') setProductType('FLIGHT_ONEWAY');
+      const match = flights.find((x) => {
+        if (x.flightNumber.toUpperCase() !== f.flightNumber.toUpperCase()) return false;
+        // origin/dest 有解析到就一并校验，避免同号不同航段误选
+        if (f.origin && x.originCode.toUpperCase() !== f.origin) return false;
+        if (f.destination && x.destinationCode.toUpperCase() !== f.destination) return false;
+        return true;
+      });
+      if (match) {
+        setOutboundFlightId(match.id);
+        setOutboundScheduleId('');
+        setCabin('');
+        if (f.departDate) {
+          setOutboundDate(f.departDate);
+          setPendingSchedDate(f.departDate); // 班次加载后由下方 effect 自动选中当日班次
+        }
+      } else {
+        warnings.push(`名单航班 ${f.flightNumber}${f.origin && f.destination ? `（${f.origin}→${f.destination}）` : ''} 未在航班库中找到，请手动选择航班`);
+      }
+    }
+
+    setRosterWarnings(warnings);
   }
 
   async function downloadTemplate(): Promise<void> {
@@ -3878,6 +3995,16 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
       settlementPriceCny !== null && Number.isFinite(settlementPriceCny) && settlementPriceCny > 0
         ? settlementPriceCny : undefined;
 
+    // OTA 手动结算单价（仅 ADMIN/STAFF）：与团队议价结算价互斥（后端也会 400）——前端先友好拦截。
+    const manualPrice =
+      isOps && productType !== 'BUNDLE' &&
+      manualUnitPriceCny !== null && Number.isFinite(manualUnitPriceCny) && manualUnitPriceCny > 0
+        ? manualUnitPriceCny : undefined;
+    if (teamPrice !== undefined && manualPrice !== undefined) {
+      setErr('「结算单价（手动）」与「团队议价结算价」二选一，请只填其中一个');
+      return;
+    }
+
     const batchPayload = {
       productType,
       ...(productType === 'FLIGHT_ONEWAY' || productType === 'FLIGHT_ROUNDTRIP'
@@ -3897,16 +4024,25 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
           }),
       description,
       notes: notes.trim() || undefined,
+      // 归属代理（ADMIN/STAFF 代为录单；直客留空）。非 ops 不发。
+      ...(isOps && agentId ? { agentId } : {}),
       passengers: validRows.map((r) => ({
         fullName: r.fullName.trim(),
         documentNumber: r.documentNumber.trim(),
         dateOfBirth: parseDob(r.dateOfBirth) ?? '',
-        nationality: 'CN',
+        // 优先用 OTA 解析出的国籍/签发国；缺省回落 CN（与既有默认一致）。
+        nationality: r.nationality?.trim() || 'CN',
+        ...(r.lastName?.trim() ? { lastName: r.lastName.trim() } : {}),
+        ...(r.firstName?.trim() ? { firstName: r.firstName.trim() } : {}),
+        ...(r.gender ? { gender: r.gender } : {}),
+        ...(r.passportIssueCountry?.trim() ? { passportIssueCountry: r.passportIssueCountry.trim() } : {}),
+        ...(r.passportExpiry?.trim() ? { passportExpiry: r.passportExpiry.trim() } : {}),
         note: r.note?.trim() || undefined,
       })),
       ...(teamPrice !== undefined
         ? { settlementPriceCny: teamPrice, groupNote: groupNote.trim() || undefined }
         : {}),
+      ...(manualPrice !== undefined ? { manualUnitPriceCny: manualPrice } : {}),
     };
 
     setSubmitting(true);
@@ -3993,6 +4129,8 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                   setResult(null);
                   setRows([{ fullName: '', documentNumber: '', dateOfBirth: '' }]);
                   setRosterWarnings([]);
+                  setOtaText('');
+                  setManualUnitPriceCny(null);
                 }}
               >
                 再建一批
@@ -4198,6 +4336,28 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                     ⓘ 填了结算价后，每位乘客按此价建单，覆盖仓位阶梯 / 自动定价。
                   </p>
                 </div>
+
+                {/* OTA 结算单价（手动录入 · 仅 ADMIN/STAFF）——与上方团队结算价二选一 */}
+                {isOps && (
+                  <div className="rounded-md border border-slate-200 bg-sky-50/50 p-3">
+                    <div className="mb-2 text-sm font-medium text-slate-700">OTA 线上单（选填）</div>
+                    <label className="block text-xs text-slate-500 md:w-1/2">
+                      结算单价（¥/人 · 手动录入）
+                      <NumberInput
+                        className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                        value={manualUnitPriceCny}
+                        onChange={setManualUnitPriceCny}
+                        min={0}
+                        step={1}
+                        integerOnly
+                        placeholder="OTA 名单结算价，如 1000"
+                      />
+                    </label>
+                    <p className="mt-2 text-[11px] text-sky-700">
+                      ⓘ 不改机票权威价：仍按系统价建单，再按差额自动加一条价格调整行把订单总额调到此结算单价（系统价/差额可追溯、审计留痕）。与上方「团队议价结算价」二选一。
+                    </p>
+                  </div>
+                )}
               </>
             )}
 
@@ -4303,6 +4463,31 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
               </div>
             )}
 
+            {/* 归属代理（ADMIN/STAFF 代为录单；直客/OTA 代理账号在此选） */}
+            {isOps && (
+              <div className="text-xs text-slate-500">
+                归属代理（代为录单；直客留空）
+                <input
+                  className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                  placeholder="搜索代理：公司名 / 联系人 / 电话"
+                  value={agentSearch}
+                  onChange={(e) => setAgentSearch(e.target.value)}
+                />
+                <select
+                  className="mt-2 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                  value={agentId}
+                  onChange={(e) => setAgentId(e.target.value)}
+                >
+                  <option value="">— 无代理 / 直客 —</option>
+                  {filteredAgents.map((a) => (
+                    <option key={a.id} value={a.id}>
+                      {a.companyName ? `${a.companyName} · ` : ''}{a.contactName}（{a.contactPhone}）
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+
             {/* 录入人 + 备注 */}
             <div className="grid gap-3 md:grid-cols-2">
               <div className="text-xs text-slate-500">
@@ -4316,6 +4501,31 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                 整批备注（选填，写入每单）
                 <input className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm" value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="全团共用；每位乘客可在下方名单里单独补充" />
               </label>
+            </div>
+
+            {/* 📋 OTA 名单粘贴导入：首行航段 + 每位乘客段 + 结算价，一键解析填充 */}
+            <div className="rounded-md border border-slate-200 bg-slate-50/60 p-3">
+              <div className="mb-1.5 flex items-center justify-between">
+                <span className="text-sm font-medium text-slate-700">📋 粘贴名单导入（OTA 线上单）</span>
+                <button
+                  type="button"
+                  className="btn-primary text-xs disabled:opacity-50"
+                  onClick={importOtaRoster}
+                  disabled={!otaText.trim()}
+                >
+                  解析并填充
+                </button>
+              </div>
+              <textarea
+                className="block w-full rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs"
+                rows={5}
+                value={otaText}
+                onChange={(e) => setOtaText(e.target.value)}
+                placeholder={'QH9588 DAD-MFM 2026-08-15\n乘机人：WU/FEILAI\n性别：男\n出生年月：1983-09-20\n护照：EB9452866\n签发国：CN\n有效期：2028-01-02\n乘机人：WANG/LIQING\n...\n结算价1000元X10个。'}
+              />
+              <p className="mt-1 text-[11px] text-slate-400">
+                自动识别：首行航班/航段/日期 → 选中航班与当日班次（舱位仍请手动确认）；每位乘客姓名(LAST/FIRST)、性别、出生日期、护照号、签发国、有效期；结算价 → 预填 OTA 结算单价。解析问题会在下方提醒里逐条列出。
+              </p>
             </div>
 
             {/* 名单导入 */}
@@ -4383,6 +4593,15 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                       <tr key={i} className="border-t border-slate-100">
                         <td className="px-2 py-1">
                           <input className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm" value={r.fullName} onChange={(e) => setRow(i, { fullName: e.target.value })} />
+                          {(r.gender || r.passportIssueCountry || r.passportExpiry) && (
+                            <span className="mt-0.5 block text-[10px] text-slate-400">
+                              {[
+                                r.gender === 'M' ? '男' : r.gender === 'F' ? '女' : null,
+                                r.passportIssueCountry ? `签发国 ${r.passportIssueCountry}` : null,
+                                r.passportExpiry ? `有效期 ${r.passportExpiry}` : null,
+                              ].filter(Boolean).join(' · ')}
+                            </span>
+                          )}
                         </td>
                         <td className="px-2 py-1">
                           <input className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm" value={r.documentNumber} onChange={(e) => setRow(i, { documentNumber: e.target.value })} />

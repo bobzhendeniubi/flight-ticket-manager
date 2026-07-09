@@ -466,6 +466,17 @@ export const batchCreateOrdersBodySchema = z
       .min(0, '结算价不能为负')
       .max(SETTLEMENT_PRICE_CAP_CNY, `结算价超出上限（${SETTLEMENT_PRICE_CAP_CNY}）`)
       .optional(),
+    // OTA 线上单快速入单：手动录入的每人结算单价（CNY）。仅 ADMIN/STAFF 生效
+    // （路由层 403 早拦 + 服务端按认证身份 400，见 batchCreateOrders）。
+    // 与 settlementPriceCny（团队议价，直接覆盖机票行权威价）不同：此值不改机票权威价，
+    // 而是由服务端算出系统权威价后，追加一条价格调整行（差额 = 手动价 − 系统价）把订单总额
+    // 调到该手动结算价——系统价 / 差额全程可追溯、审计照记。二者互斥（同传 → 路由层 400）。
+    manualUnitPriceCny: z
+      .number()
+      .int('结算单价必须为整数（CNY）')
+      .min(0, '结算单价不能为负')
+      .max(SETTLEMENT_PRICE_CAP_CNY, `结算单价超出上限（${SETTLEMENT_PRICE_CAP_CNY}）`)
+      .optional(),
     // 团期备注（写入每张子单 notes + noteSpecial）
     groupNote: z.string().max(500).optional(),
     // 允许重复乘客强录（仅 ADMIN/STAFF 生效；透传给每张子单的 createOrder）。

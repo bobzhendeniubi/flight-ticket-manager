@@ -246,6 +246,8 @@ export interface BatchOrderPassenger {
   lastName?: string;
   firstName?: string;
   gender?: 'M' | 'F';
+  /** 护照签发国（2 位国家码，如 CN）。OTA 名单「签发国」列解析而来。 */
+  passportIssueCountry?: string;
   passportExpiry?: string;
   /** 该乘客个别备注（选填）：与整批备注合并写入该乘客订单。 */
   note?: string;
@@ -281,6 +283,12 @@ export interface BatchCreateOrdersInput {
    * 仅对 FLIGHT 行生效；BUNDLE 走套餐定价逻辑。
    */
   settlementPriceCny?: number;
+  /**
+   * OTA 线上单手动结算单价（每人 CNY）。仅 ADMIN/STAFF 生效。
+   * 与 settlementPriceCny 互斥：不覆盖机票权威价，而是由后端算出系统权威价后追加一条差额调整行，
+   * 把订单总额调到该手动结算价（系统价 / 差额可追溯、审计照记）。
+   */
+  manualUnitPriceCny?: number;
   /** 团期备注（如「2026 春节团 7 日」），写入每单。 */
   groupNote?: string;
   /**

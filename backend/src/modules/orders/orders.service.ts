@@ -2111,6 +2111,16 @@ export class OrderService {
       error?: string;
     }>;
   }> {
+    // OTA 手动结算单价权限（服务端按认证身份判，不信前端；与 createOrder 的 priceAdjustment 同口径）：
+    // 仅 ADMIN/STAFF 可用，散客/AGENT 携带一律 400。放在最顶端（早于任何 prisma 调用）→ 未触库即拒。
+    if (
+      body.manualUnitPriceCny !== undefined &&
+      requester.role !== UserRole.ADMIN &&
+      requester.role !== UserRole.STAFF
+    ) {
+      throw new BadRequestError('无权手动录入结算单价');
+    }
+
     // 录入人 = 登录账号：查登录用户名作为联系人兜底（body 未传时用）。
     // Order.contactName/contactPhone 是非空列，createOrder 又要求 min(1)，故需落具体值。
     const recorder = await prisma.user.findUnique({
@@ -2187,6 +2197,25 @@ export class OrderService {
     //                      盖酒店房型/入住日期到订单行 → 房控/销控自动计入套餐占房）
     const batchItems: OrderItemInput[] = buildBatchItems(body, productType, outbound, bundleDates);
 
+    // OTA 手动结算单价（权限已在方法顶端按身份收口）：不覆盖机票权威价，而是先算系统权威价，
+    // 再据差额追加一条价格调整行把每单总额调到手动结算价。系统权威价对同批每张子单一致
+    // （同班次/舱位、quantity=1，机票定价与乘客无关），故循环外只算一次。
+    //   差额 = 手动价 − 系统价：正 → MISC_FEE（补收），负 → DISCOUNT（优惠）；0 → 不加调整行。
+    //   reasonText 记「OTA 结算价 ¥X/人」，随 createOrder 的 priceAdjustment 审计路径落库（审计照记）。
+    let manualPriceAdjustment: PriceAdjustmentInput | undefined;
+    if (body.manualUnitPriceCny !== undefined) {
+      const priced = await this.priceAndValidateItems(batchItems);
+      const systemTotal = priced.reduce((sum, p) => sum + p.amount, 0);
+      const diff = Math.round(body.manualUnitPriceCny - systemTotal);
+      if (diff !== 0) {
+        manualPriceAdjustment = {
+          amountCny: diff,
+          reasonCode: diff > 0 ? 'MISC_FEE' : 'DISCOUNT',
+          reasonText: `OTA 结算价 ¥${body.manualUnitPriceCny}/人`,
+        };
+      }
+    }
+
     const results: Array<{
       index: number;
       passengerName: string;
@@ -2221,6 +2250,8 @@ export class OrderService {
             // 团队议价结算价（CNY/人）覆盖机票动态价；仅 ADMIN/STAFF（路由层已断言）。
             // 仅作用于 FLIGHT 行；BUNDLE 走 createOrder 的 server-priced 套餐定价，此值对其无效。
             flightSettlementPriceCny: body.settlementPriceCny,
+            // OTA 手动结算单价 → 差额调整行（每单一致；createOrder 再按身份复核权限 + 审计落库）。
+            priceAdjustment: manualPriceAdjustment,
             // 透传重复乘客强录 flag（createOrder 内再按身份收口 + 逐单审计/备注留痕）。
             allowDuplicatePassengers,
             items: batchItems,

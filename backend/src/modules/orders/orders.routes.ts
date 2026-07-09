@@ -155,6 +155,14 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       if (body.settlementPriceCny !== undefined && !isOps) {
         return reply.status(403).send({ error: '仅运营/管理员可指定团队议价结算价' });
       }
+      // OTA 手动结算单价：仅 ADMIN/STAFF 可用（AGENT 自助批量建单不得手动定价）。
+      if (body.manualUnitPriceCny !== undefined && !isOps) {
+        return reply.status(403).send({ error: '仅运营/管理员可手动录入结算单价' });
+      }
+      // 手动结算单价与团队议价结算价语义冲突（前者保留系统权威价 + 调差，后者直接覆盖机票价）→ 二选一。
+      if (body.manualUnitPriceCny !== undefined && body.settlementPriceCny !== undefined) {
+        return reply.status(400).send({ error: '结算单价与团队议价结算价二选一，请勿同时填写' });
+      }
       const requester = await buildRequester(req.user.sub, req.user.role);
       const result = await service.batchCreateOrders(body, requester);
       void writeAudit({
@@ -171,12 +179,23 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
           failureCount: result.failureCount,
           // 团队议价结算价覆盖（如有）— 审计谁、改成多少、团期备注
           settlementPriceCny: body.settlementPriceCny ?? null,
-          priceOverride: body.settlementPriceCny !== undefined ? 'TEAM_SETTLEMENT' : null,
+          // OTA 手动结算单价（如有）— 保留系统权威价 + 差额调整行，此处记录录入的每人结算单价
+          manualUnitPriceCny: body.manualUnitPriceCny ?? null,
+          priceOverride:
+            body.settlementPriceCny !== undefined
+              ? 'TEAM_SETTLEMENT'
+              : body.manualUnitPriceCny !== undefined
+                ? 'OTA_MANUAL'
+                : null,
           groupNote: body.groupNote ?? null,
         },
         // 改价是敏感操作 → 提级到 WARNING（便于审计检索）
         severity:
-          result.failureCount > 0 || body.settlementPriceCny !== undefined ? 'WARNING' : 'INFO',
+          result.failureCount > 0 ||
+          body.settlementPriceCny !== undefined ||
+          body.manualUnitPriceCny !== undefined
+            ? 'WARNING'
+            : 'INFO',
       });
       return reply.status(201).send(result);
     },
