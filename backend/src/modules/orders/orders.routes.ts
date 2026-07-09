@@ -13,6 +13,7 @@ import { OrderService, type OrderRequester } from './orders.service.js';
 import {
   batchCreateOrdersBodySchema,
   batchUpdateStatusBodySchema,
+  changeRequestBodySchema,
   createOrderBodySchema,
   exportRoomAllocationQuerySchema,
   exportTemplatesQuerySchema,
@@ -22,12 +23,14 @@ import {
   publicOrderLookupQuerySchema,
   quoteOrderBodySchema,
   rescheduleOrderBodySchema,
+  selfUpdatePassengerBodySchema,
   swapItemHotelBodySchema,
   swapPassengerBodySchema,
   updateItemSettlementPriceBodySchema,
   updateStatusBodySchema,
   visaBundleQuerySchema,
 } from './orders.schemas.js';
+import { renderItineraryPdf } from '../../lib/itinerary-pdf.js';
 import { prisma } from '../../db/prisma.js';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
 import { computeCancellationQuote } from '../../lib/cancellation.js';
@@ -412,6 +415,65 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       });
 
       return result;
+    },
+  );
+
+  /**
+   * POST /orders/:id/change-request
+   * 前台自助改签申请：订单转 CHANGE_REQUESTED（记 OrderStatusEvent）+ 建 HIGH 优先级
+   * 运营待办提醒。仅 PAID/PROCESSING/TICKETED 可申请（否则 409 ORDER_NOT_CHANGEABLE）；
+   * 已是 CHANGE_REQUESTED 幂等返回当前订单。归属校验同 getOrder。
+   */
+  app.post(
+    '/:id/change-request',
+    { preHandler: [app.authenticate] },
+    async (req) => {
+      const { id } = req.params as { id: string };
+      const body = changeRequestBodySchema.parse(req.body);
+      const requester = await buildRequester(req.user.sub, req.user.role);
+      const result = await service.requestChange(id, body.reason, requester);
+
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'REQUEST_CHANGE',
+        targetType: 'ORDER',
+        targetId: result.order.id,
+        targetLabel: result.order.orderNumber,
+        after: { reason: body.reason, idempotent: result.idempotent },
+        severity: 'WARNING',
+      });
+
+      return { order: result.order };
+    },
+  );
+
+  /**
+   * GET /orders/:id/itinerary.pdf
+   * 前台客户下载电子行程单（PDF 附件）。归属校验同 getOrder；订单确认（付款）后可下载
+   * （否则 409 ITINERARY_NOT_READY）；无航班行的纯地面单 409 NO_FLIGHT_ITEMS。
+   */
+  app.get(
+    '/:id/itinerary.pdf',
+    { preHandler: [app.authenticate] },
+    async (req, reply) => {
+      const { id } = req.params as { id: string };
+      const requester = await buildRequester(req.user.sub, req.user.role);
+      const { orderNumber, itinerary } = await service.getOrderItineraryData(id, requester);
+      const pdf = await renderItineraryPdf(itinerary);
+
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'DOWNLOAD_ITINERARY',
+        targetType: 'ORDER',
+        targetId: id,
+        targetLabel: orderNumber,
+        after: { flightCount: itinerary.flights.length, passengerCount: itinerary.passengers.length },
+      });
+
+      return reply
+        .header('Content-Type', 'application/pdf')
+        .header('Content-Disposition', `attachment; filename="itinerary-${orderNumber}.pdf"`)
+        .send(pdf);
     },
   );
 
@@ -1199,17 +1261,39 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     return { order };
   });
 
-  // ── 售后改单：换人（ADMIN/STAFF）──
+  // ── 出行人资料（同一路径，双通道）──
   // PATCH /orders/:id/passengers/:passengerId
+  //
+  // ① 前台自助补录（CUSTOMER / AGENT）：
+  //   body: { chineseName?, gender?, documentNumber?, dateOfBirth?, nationality?,
+  //           passportExpiry?, passportIssueDate?, passportIssueCountry?,
+  //           passportIssuePlace?, passportPhotoUrl? }（至少一个；不允许改 fullName——换人请联系客服）
+  //   归属校验同 getOrder（客户仅本人单、代理仅自己+下级）；仅 PENDING_PAYMENT/PAID/PROCESSING
+  //   可改，否则 409 ORDER_LOCKED。返回 { passenger }（含 hasPassportPhoto，不回传大图）。
+  //
+  // ② 售后改单：换人（ADMIN/STAFF）：
   //   body: { lastName?, firstName?, fullName?, documentNumber?, dateOfBirth?, gender?,
   //           nationality?, resetInvoice?, resetVisa?, feeCny?, feeLabel?, note? }
-  // 就地把出行人换成新人；resetInvoice→开票 NONE、resetVisa→签证任务 PENDING；可选加换人费。
-  app.patch('/:id/passengers/:passengerId', { preHandler: [app.authenticate] }, async (req, reply) => {
+  //   就地把出行人换成新人；resetInvoice→开票 NONE、resetVisa→签证任务 PENDING；可选加换人费。
+  app.patch('/:id/passengers/:passengerId', { preHandler: [app.authenticate] }, async (req) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
-      return reply.status(403).send({ error: '仅运营/管理员可换人' });
-    }
     const { id, passengerId } = req.params as { id: string; passengerId: string };
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      // ① 前台自助补录通道（归属/状态校验在 service 内；越权 403、锁定 409 由错误处理器统一格式化）
+      const selfBody = selfUpdatePassengerBodySchema.parse(req.body);
+      const requester = await buildRequester(req.user.sub, role);
+      const result = await service.selfUpdatePassenger(id, passengerId, selfBody, requester);
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'SELF_UPDATE_PASSENGER',
+        targetType: 'TRAVELER',
+        targetId: passengerId,
+        targetLabel: result.orderNumber,
+        // PII 红线：只记改了哪些字段名，绝不落护照号/照片/身份字段值
+        after: { fields: result.changedFields },
+      });
+      return { passenger: result.passenger };
+    }
     const body = swapPassengerBodySchema.parse(req.body);
     const { order, audit } = await service.swapPassenger(id, passengerId, body, {
       userId: req.user.sub,

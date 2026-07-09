@@ -11,6 +11,9 @@
  *   GET /orders/:id              → 详情（用列表数据足够，不必再请求）
  *   GET /orders/:id/refund-quote → 退款报价（看一眼，不动状态）
  *   POST /orders/:id/cancel      → 申请取消（建 Refund + 状态 → REFUND_REQUESTED）
+ *   PATCH /orders/:id/passengers/:pid → 出行人护照资料自助补录（弹窗见 PassengerPassportModal）
+ *   POST /orders/:id/change-request   → 申请改签（状态 → CHANGE_REQUESTED，弹窗见 ChangeRequestDialog）
+ *   GET /orders/:id/itinerary.pdf     → 下载行程单 PDF（fetch blob → 浏览器下载）
  */
 import { useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
@@ -19,6 +22,7 @@ import {
   ApiError,
   type MySeatLock,
   type MyWaitlistEntry,
+  type OrderPassengerDetail,
   type OrderSummary,
   type OrderStatus,
   type RefundQuote,
@@ -30,6 +34,8 @@ import { Icon, type IconName } from '../components/Icon';
 import { Modal } from '../components/Modal';
 import { PaymentPanel } from '../components/PaymentPanel';
 import { WriteReviewForm, type WriteReviewFormData } from '../components/WriteReviewForm';
+import { ChangeRequestDialog } from '../components/ChangeRequestDialog';
+import { PassengerPassportModal } from '../components/PassengerPassportModal';
 
 const STATUS_LABEL: Record<OrderStatus, string> = {
   DRAFT: '草稿',
@@ -99,6 +105,20 @@ function formatDepart(iso?: string | null): string | null {
 }
 
 const CANCELLABLE = new Set<OrderStatus>(['PAID', 'PROCESSING', 'TICKETED']);
+// 可申请改签的状态（与后端 POST /orders/:id/change-request 守卫一致）
+const CHANGEABLE = new Set<OrderStatus>(['PAID', 'PROCESSING', 'TICKETED']);
+// 可下载行程单的状态（与后端 GET /orders/:id/itinerary.pdf 守卫一致）
+const ITINERARY_READY = new Set<OrderStatus>([
+  'PAID',
+  'PROCESSING',
+  'TICKETED',
+  'COMPLETED',
+  'CHANGE_REQUESTED',
+  'CHANGED',
+]);
+// 出行人护照资料可自助补录的状态（与后端 PATCH /orders/:id/passengers/:pid 守卫一致；
+// 出票后（TICKETED 及之后）资料已锁定，改动请走客服）
+const PASSENGER_EDITABLE = new Set<OrderStatus>(['PENDING_PAYMENT', 'PAID', 'PROCESSING']);
 // 仍需付款的状态：订单未结清时露出收款方式 + 上传凭证（买家可稍后回来付）。
 // 已取消 / 退款 / 失败 / 超时等终态不再展示收款入口。
 const PAYABLE_STATUS = new Set<OrderStatus>([
@@ -139,6 +159,22 @@ export function MyOrdersPage() {
   const [cancelLoading, setCancelLoading] = useState(false);
   const [cancelReason, setCancelReason] = useState('');
   const [cancelError, setCancelError] = useState<string | null>(null);
+
+  // 护照补录流程状态：target = 正在补录的 (orderId, passenger)；saved = 行内成功提示
+  const [passportTarget, setPassportTarget] = useState<{
+    orderId: string;
+    passenger: OrderPassengerDetail;
+  } | null>(null);
+  const [passportSaved, setPassportSaved] = useState<{ orderId: string; fullName: string } | null>(
+    null,
+  );
+
+  // 改签申请流程状态
+  const [changeTarget, setChangeTarget] = useState<OrderSummary | null>(null);
+
+  // 行程单下载状态：下载中的订单 id + 按订单的错误提示
+  const [downloadingId, setDownloadingId] = useState<string | null>(null);
+  const [itineraryErrors, setItineraryErrors] = useState<Record<string, string>>({});
 
   // 写评价流程状态
   const [reviewTarget, setReviewTarget] = useState<OrderSummary | null>(null);
@@ -207,6 +243,66 @@ export function MyOrdersPage() {
       } catch {
         // 详情拉不到就用列表数据 fallback（passenger 只有 fullName）
       }
+    }
+  };
+
+  /** 护照补录保存成功：更新 detailCache 里该乘客（含最新 hasPassportPhoto）→ 关弹窗 + 行内提示 */
+  const handlePassportSaved = (orderId: string, updated: OrderPassengerDetail) => {
+    setDetailCache((prev) => {
+      const cur = prev[orderId];
+      if (!cur) return prev;
+      return {
+        ...prev,
+        [orderId]: {
+          ...cur,
+          passengers: cur.passengers.map((p) => (p.id === updated.id ? { ...p, ...updated } : p)),
+        },
+      };
+    });
+    setPassportTarget(null);
+    setPassportSaved({ orderId, fullName: updated.fullName });
+  };
+
+  /** 提交改签申请：成功就地更新订单状态（→ 改签审核中）；失败抛给弹窗内展示 */
+  const submitChangeRequest = async (reason: string) => {
+    if (!changeTarget) return;
+    const r = await api.requestOrderChange(token, changeTarget.id, { reason });
+    setOrders((prev) => prev.map((o) => (o.id === r.order.id ? { ...o, status: r.order.status } : o)));
+    setDetailCache((prev) =>
+      prev[r.order.id] ? { ...prev, [r.order.id]: { ...prev[r.order.id], status: r.order.status } } : prev,
+    );
+    setChangeTarget(null);
+  };
+
+  /** 下载行程单 PDF：fetch blob → 触发浏览器下载「行程单-{订单号}.pdf」 */
+  const downloadItinerary = async (order: OrderSummary) => {
+    setDownloadingId(order.id);
+    setItineraryErrors((prev) => {
+      if (!(order.id in prev)) return prev;
+      const next = { ...prev };
+      delete next[order.id];
+      return next;
+    });
+    try {
+      const blob = await api.downloadOrderItinerary(token, order.id);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `行程单-${order.orderNumber}.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      const msg =
+        e instanceof ApiError && e.code === 'NO_FLIGHT_ITEMS'
+          ? '该订单不含航班，暂不支持行程单'
+          : e instanceof ApiError && e.code === 'ITINERARY_NOT_READY'
+            ? '行程单还在准备中，请稍后再试'
+            : '行程单下载失败，请稍后重试';
+      setItineraryErrors((prev) => ({ ...prev, [order.id]: msg }));
+    } finally {
+      setDownloadingId(null);
     }
   };
 
@@ -328,10 +424,17 @@ export function MyOrdersPage() {
       {orders.map((o) => {
         const expanded = expandedId === o.id;
         const cancellable = CANCELLABLE.has(o.status);
+        const changeable = CHANGEABLE.has(o.status);
+        const itineraryReady = ITINERARY_READY.has(o.status);
+        const passengerEditable = PASSENGER_EDITABLE.has(o.status);
         const reviewable = REVIEWABLE.has(o.status);
         const reviewed = reviewedIds.has(o.id);
         // 展开后用 detail（详情拉到的完整 passenger）；详情没拿到时 fallback 到列表
         const detail = detailCache[o.id] ?? o;
+        // 缺护照人数：只有详情接口带 hasPassportPhoto（列表窄 select 没有）→ 未拉详情时算 0
+        const missingPassportCount = detail.passengers.filter(
+          (p) => p.hasPassportPhoto === false,
+        ).length;
         return (
           <article key={o.id} className="card-interactive space-y-3 p-4 md:p-5">
             <header className="flex flex-wrap items-center justify-between gap-2">
@@ -363,6 +466,14 @@ export function MyOrdersPage() {
               {o.items.length > 3 && <span className="text-ink-muted">…等 {o.items.length} 项</span>}
             </div>
 
+            {/* 改签审核中：给买家一个进度预期 */}
+            {o.status === 'CHANGE_REQUESTED' && (
+              <div className="flex items-center gap-1.5 rounded-xl bg-sky-50 px-3 py-2 text-xs font-medium text-sky-700">
+                <Icon name="clock" className="h-3.5 w-3.5 shrink-0" />
+                改签申请处理中，如需补充信息请联系客服
+              </div>
+            )}
+
             <footer className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 pt-3">
               <button
                 type="button"
@@ -387,6 +498,26 @@ export function MyOrdersPage() {
                     </button>
                   )
                 )}
+                {itineraryReady && (
+                  <button
+                    type="button"
+                    disabled={downloadingId === o.id}
+                    onClick={() => downloadItinerary(o)}
+                    className="inline-flex items-center gap-1 rounded-lg border border-brand/40 bg-white px-3 py-1.5 text-sm font-medium text-brand-700 transition hover:bg-brand-50 disabled:opacity-50"
+                  >
+                    <Icon name="plane" className="h-4 w-4" />
+                    {downloadingId === o.id ? '生成中…' : '下载行程单'}
+                  </button>
+                )}
+                {changeable && (
+                  <button
+                    type="button"
+                    onClick={() => setChangeTarget(o)}
+                    className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-sm font-medium text-ink-soft transition hover:bg-canvas hover:text-ink"
+                  >
+                    申请改签
+                  </button>
+                )}
                 {cancellable && (
                   <button
                     type="button"
@@ -399,8 +530,24 @@ export function MyOrdersPage() {
               </div>
             </footer>
 
+            {/* 行程单下载失败提示（不含航班 / 未就绪 / 网络） */}
+            {itineraryErrors[o.id] && (
+              <div className="flex items-center gap-1.5 rounded-xl border border-sun/40 bg-sun-light px-3 py-2 text-xs font-medium text-amber-800" role="alert">
+                <Icon name="info" className="h-3.5 w-3.5 shrink-0" />
+                {itineraryErrors[o.id]}
+              </div>
+            )}
+
             {expanded && (
               <div className="animate-fade-in space-y-3 border-t border-slate-100 pt-3 text-sm">
+                {/* 缺护照横幅：详情已加载 + 订单可补录 + 有人缺护照图（出票需要护照资料） */}
+                {passengerEditable && missingPassportCount > 0 && (
+                  <div className="flex items-center gap-1.5 rounded-xl border border-sun/40 bg-sun-light px-3 py-2.5 text-xs font-medium text-amber-800">
+                    <Icon name="info" className="h-4 w-4 shrink-0" />
+                    待补护照资料 {missingPassportCount} 人 — 出票需要护照信息，请在下方出行人处点「补充护照资料」完成。
+                  </div>
+                )}
+
                 {/* 联系人 */}
                 <div className="rounded-xl bg-canvas p-3.5">
                   <div className="mb-1 text-xs font-bold uppercase tracking-wide text-ink-muted">联系人</div>
@@ -449,20 +596,61 @@ export function MyOrdersPage() {
                   </ul>
                 </div>
 
-                {/* 出行人（用 detail，因为列表只 select fullName，没有 documentType/Number） */}
+                {/* 出行人（用 detail，因为列表只 select fullName，没有 documentType/Number）
+                    护照资料徽章只在详情态渲染（hasPassportPhoto 仅详情接口带；列表 fallback 为 undefined 不显示） */}
                 {detail.passengers.length > 0 && (
                   <div>
                     <div className="mb-1.5 text-xs font-bold uppercase tracking-wide text-ink-muted">出行人</div>
-                    <ul className="space-y-1">
+                    {passportSaved?.orderId === o.id && (
+                      <div className="mb-1.5 inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2.5 py-1 text-xs font-medium text-emerald-700">
+                        <Icon name="check" className="h-3.5 w-3.5" />
+                        {passportSaved.fullName} 的护照资料已更新
+                      </div>
+                    )}
+                    <ul className="space-y-1.5">
                       {detail.passengers.map((p) => (
-                        <li key={p.id} className="text-ink-soft">
-                          <span className="font-medium text-ink">{p.fullName}</span>
-                          {p.documentNumber && (
-                            <>
-                              {' · '}
-                              {p.documentType === 'PASSPORT' ? '护照' : p.documentType ?? '证件'} {p.documentNumber}
-                            </>
-                          )}
+                        <li
+                          key={p.id}
+                          className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-ink-soft"
+                        >
+                          <span>
+                            <span className="font-medium text-ink">{p.fullName}</span>
+                            {p.documentNumber && (
+                              <>
+                                {' · '}
+                                {p.documentType === 'PASSPORT' ? '护照' : p.documentType ?? '证件'} {p.documentNumber}
+                              </>
+                            )}
+                          </span>
+                          <span className="flex items-center gap-2">
+                            {p.hasPassportPhoto === true && (
+                              <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-semibold text-emerald-700">
+                                <Icon name="check" className="h-3 w-3" /> 护照已上传
+                              </span>
+                            )}
+                            {p.hasPassportPhoto === false && passengerEditable && (
+                              <span className="inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-xs font-semibold text-amber-800">
+                                待补护照
+                              </span>
+                            )}
+                            {p.hasPassportPhoto === false && !passengerEditable && (
+                              <span className="rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-500">
+                                未上传护照
+                              </span>
+                            )}
+                            {passengerEditable && p.hasPassportPhoto !== undefined && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setPassportSaved(null);
+                                  setPassportTarget({ orderId: o.id, passenger: p });
+                                }}
+                                className="rounded-lg border border-brand/40 bg-white px-2.5 py-1 text-xs font-medium text-brand-700 transition hover:bg-brand-50"
+                              >
+                                {p.hasPassportPhoto ? '修改护照资料' : '补充护照资料'}
+                              </button>
+                            )}
+                          </span>
                         </li>
                       ))}
                     </ul>
@@ -499,6 +687,27 @@ export function MyOrdersPage() {
             setCancelError(null);
           }}
           onConfirm={confirmCancel}
+        />
+      )}
+
+      {/* 申请改签弹窗 */}
+      {changeTarget && (
+        <ChangeRequestDialog
+          order={changeTarget}
+          onClose={() => setChangeTarget(null)}
+          onSubmit={submitChangeRequest}
+        />
+      )}
+
+      {/* 护照资料补充弹窗（key 按乘客：每次打开都重新挂载、从最新 passenger 取初值） */}
+      {passportTarget && (
+        <PassengerPassportModal
+          key={passportTarget.passenger.id}
+          token={token}
+          orderId={passportTarget.orderId}
+          passenger={passportTarget.passenger}
+          onClose={() => setPassportTarget(null)}
+          onSaved={(p) => handlePassportSaved(passportTarget.orderId, p)}
         />
       )}
 

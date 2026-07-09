@@ -318,6 +318,39 @@ export interface OrderPassenger {
   dateOfBirth?: string | null;
   nationality?: string;
   passengerType?: PassengerType;
+  // ── 详情接口（GET /orders/:id）才带的护照扩展字段；列表窄 select 无 ────────
+  chineseName?: string | null;
+  gender?: 'M' | 'F' | 'X' | null;
+  passportExpiry?: string | null;
+  passportIssueDate?: string | null;
+  passportIssueCountry?: string | null;
+  passportIssuePlace?: string | null;
+  /**
+   * 是否已上传护照图。详情响应剥离 passportPhotoUrl 大图、以此布尔代替；
+   * 列表接口（窄 select）不带该字段 → undefined = 未知，前端只在详情态渲染徽章。
+   */
+  hasPassportPhoto?: boolean;
+}
+
+/** 详情/自助补录返回的出行人（与 OrderPassenger 同构；PATCH 补录响应复用）。 */
+export type OrderPassengerDetail = OrderPassenger;
+
+/**
+ * 前台自助护照补录入参（镜像后端 selfUpdatePassengerBodySchema）。
+ * 全部可选但至少一个；刻意不含 fullName —— 换人/改名请联系客服。
+ */
+export interface UpdatePassengerInput {
+  chineseName?: string;
+  gender?: 'M' | 'F' | 'X';
+  documentNumber?: string;
+  dateOfBirth?: string; // YYYY-MM-DD
+  nationality?: string; // ISO-2
+  passportExpiry?: string; // YYYY-MM-DD
+  passportIssueDate?: string; // YYYY-MM-DD
+  passportIssueCountry?: string; // ISO-2
+  passportIssuePlace?: string;
+  /** 护照图 data-URL（≤3MB；前端已压缩到 ~700KB） */
+  passportPhotoUrl?: string;
 }
 
 export interface OrderSummary {
@@ -1049,6 +1082,62 @@ export const api = {
       `/orders/${id}/cancel`,
       { method: 'POST', token, body: { reason } },
     ),
+  /**
+   * 前台自助护照补录：仅更新传入字段（至少一个；不允许 fullName）。
+   * 订单状态不在 PENDING_PAYMENT/PAID/PROCESSING → 409 ORDER_LOCKED。
+   * 返回的 passenger 含 hasPassportPhoto 布尔，不回传照片大图。
+   */
+  updateOrderPassenger: (
+    token: string,
+    orderId: string,
+    passengerId: string,
+    body: UpdatePassengerInput,
+  ) =>
+    apiFetch<{ passenger: OrderPassengerDetail }>(
+      `/orders/${orderId}/passengers/${passengerId}`,
+      { method: 'PATCH', token, body },
+    ),
+  /**
+   * 申请改签（客户/代理）：状态不在 PAID/PROCESSING/TICKETED → 409 ORDER_NOT_CHANGEABLE；
+   * 已是 CHANGE_REQUESTED 幂等返回 200。
+   */
+  requestOrderChange: (token: string, orderId: string, body: { reason: string }) =>
+    apiFetch<{ order: OrderSummary }>(`/orders/${orderId}/change-request`, {
+      method: 'POST',
+      token,
+      body,
+    }),
+  /**
+   * 下载行程单 PDF（二进制，绕过 apiFetch 的 JSON 解析）。
+   * 409：ITINERARY_NOT_READY（状态未就绪）/ NO_FLIGHT_ITEMS（订单不含航班）。
+   * 与 apiFetch 一致：401 时静默续期一次再重试。
+   */
+  downloadOrderItinerary: async (token: string, orderId: string): Promise<Blob> => {
+    const doFetch = (tk: string) =>
+      fetch(`${API_BASE}/orders/${orderId}/itinerary.pdf`, {
+        headers: { Authorization: `Bearer ${tk}` },
+      });
+    let res = await doFetch(token);
+    if (res.status === 401 && refreshAccessToken) {
+      const newToken = await refreshAccessToken();
+      if (newToken && newToken !== token) res = await doFetch(newToken);
+    }
+    if (!res.ok) {
+      // 错误体是 JSON（{ error: { code, message } }）；非 JSON（网关 HTML）时用兜底
+      let errBody: ApiErrorBody['error'] = {
+        code: 'UNKNOWN',
+        message: res.statusText || `HTTP ${res.status}`,
+      };
+      try {
+        const parsed = (await res.json()) as ApiErrorBody | undefined;
+        if (parsed?.error) errBody = parsed.error;
+      } catch {
+        // 保留兜底 errBody
+      }
+      throw new ApiError(res.status, errBody);
+    }
+    return res.blob();
+  },
 
   // 锁位 — 下单前临时占座（单次 ≤9 张 / 固定 10 分钟 / 到期自动回收）
   createSeatLock: (

@@ -30,12 +30,14 @@ import {
 import { randomInt } from 'node:crypto';
 import { prisma } from '../../db/prisma.js';
 import {
+  AppError,
   BadRequestError,
   ConflictError,
   DuplicatePassengerError,
   ForbiddenError,
   NotFoundError,
 } from '../../lib/errors.js';
+import type { ItineraryData } from '../../lib/itinerary-pdf.js';
 import { writeAudit } from '../../lib/audit.js';
 import { resolveBundleNights } from '../products/bundle-nights.js';
 import { getHotelNightlyRemaining } from '../hotel-control/hotel-control.service.js';
@@ -54,6 +56,7 @@ import type {
   PriceAdjustmentInput,
   PublicOrderLookupQuery,
   QuoteOrderBody,
+  SelfUpdatePassengerBody,
   SwapItemHotelBody,
   UpdateItemSettlementPriceBody,
 } from './orders.schemas.js';
@@ -62,8 +65,9 @@ import type {
 const ALLOWED_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
   DRAFT: ['PENDING_PAYMENT', 'CANCELLED'],
   PENDING_PAYMENT: ['PAID', 'PAYMENT_TIMEOUT', 'CANCELLED'],
-  PAID: ['PROCESSING', 'TICKETED', 'REFUND_REQUESTED'],
-  PROCESSING: ['TICKETED', 'FAILED', 'REFUND_REQUESTED'],
+  // CHANGE_REQUESTED：前台改签申请可在出票前（PAID/PROCESSING）就发起 —— 与 TICKETED 一致进入白名单
+  PAID: ['PROCESSING', 'TICKETED', 'REFUND_REQUESTED', 'CHANGE_REQUESTED'],
+  PROCESSING: ['TICKETED', 'FAILED', 'REFUND_REQUESTED', 'CHANGE_REQUESTED'],
   TICKETED: ['COMPLETED', 'CHANGE_REQUESTED', 'REFUND_REQUESTED'],
   COMPLETED: [], // 终态
   PAYMENT_TIMEOUT: ['PENDING_PAYMENT', 'CANCELLED'],
@@ -106,6 +110,21 @@ const SEAT_RELEASING_STATUSES: OrderStatus[] = [
   'REFUNDED',
   'FAILED',
   'DRAFT',
+];
+
+// ── 前台自助端点的状态闸 ────────────────────────────────────────────────
+// 出行人护照资料自助补录：出票流程启动前（含处理中）可改；出票后锁定走客服。
+const SELF_EDITABLE_PASSENGER_STATUSES: OrderStatus[] = ['PENDING_PAYMENT', 'PAID', 'PROCESSING'];
+// 改签申请：已付款到已出票之间可申请。
+const CHANGE_REQUESTABLE_STATUSES: OrderStatus[] = ['PAID', 'PROCESSING', 'TICKETED'];
+// 电子行程单下载：订单确认（付款）后即可（含改签中/已改签——旅客仍需凭行程单出行）。
+const ITINERARY_READY_STATUSES: OrderStatus[] = [
+  'PAID',
+  'PROCESSING',
+  'TICKETED',
+  'COMPLETED',
+  'CHANGE_REQUESTED',
+  'CHANGED',
 ];
 
 // 服务端价格校验容差（CNY）：客户端提交金额与服务端权威重算金额相差超过此值则拒单（A3）
@@ -1396,7 +1415,10 @@ export class OrderService {
     // 套餐 VISA 组件的「最多可停留天数」不在 bundle.items JSON 里（那只存 visaId），需按 visaId 批量查
     // Visa.stayDays（best-effort：查询失败/无签证组件时给空表，itineraryFieldsForItem 照常降级为 null）。
     const visaStayDaysById = await this.loadBundleVisaStayDays(order.items);
-    return serializeOrder(order, { visaStayDaysById });
+    // 护照大图仅后台角色返回：admin 订单抽屉直接渲染缩略图；客户/代理端剥离（响应瘦身 + 少暴露 PII）
+    const includePassportPhotos =
+      requester.role === UserRole.ADMIN || requester.role === UserRole.STAFF;
+    return serializeOrder(order, { visaStayDaysById, includePassportPhotos });
   }
 
   // ════════════════════════════════════════════════════════════════════
@@ -2871,6 +2893,195 @@ export class OrderService {
   }
 
   // ════════════════════════════════════════════════════════════════════
+  // 前台自助（客户/代理侧）：护照资料补录 / 改签申请 / 电子行程单
+  // ════════════════════════════════════════════════════════════════════
+
+  /**
+   * 出行人护照资料自助补录（前台客户本人 / 代理树内订单）。
+   *
+   * 规则：
+   *   - 归属校验与 getOrder 同口径（assertCanView：客户仅本人单、代理仅自己+下级）。
+   *   - 状态闸：仅 PENDING_PAYMENT / PAID / PROCESSING 可改；出票后锁定 → 409 ORDER_LOCKED。
+   *   - 不允许改 fullName（换人请联系客服）——schema 层已拦，service 只接白名单字段。
+   *   - passengerId 必须属于该订单，否则 404。
+   *
+   * 返回更新后的出行人（与 getOrder 详情同款序列化：剥离 passportPhotoUrl 大图，
+   * 以 hasPassportPhoto 布尔代替）+ 改动字段名列表（审计用，绝不含字段值——PII 红线）。
+   */
+  async selfUpdatePassenger(
+    orderId: string,
+    passengerId: string,
+    input: SelfUpdatePassengerBody,
+    requester: OrderRequester,
+  ): Promise<{
+    passenger: Record<string, unknown>;
+    changedFields: string[];
+    orderNumber: string;
+  }> {
+    const order = await prisma.order.findUnique({
+      where: { id: orderId },
+      select: { id: true, status: true, userId: true, agentId: true, orderNumber: true },
+    });
+    if (!order) throw new NotFoundError('订单不存在');
+    await this.assertCanView(order, requester);
+
+    if (!SELF_EDITABLE_PASSENGER_STATUSES.includes(order.status)) {
+      throw new AppError('当前订单状态不可修改出行人资料，请联系客服', {
+        statusCode: 409,
+        code: 'ORDER_LOCKED',
+      });
+    }
+
+    const passenger = await prisma.passenger.findUnique({
+      where: { id: passengerId },
+      select: { id: true, orderId: true },
+    });
+    if (!passenger || passenger.orderId !== orderId) {
+      throw new NotFoundError('出行人不存在或不属于该订单');
+    }
+
+    // 仅映射传入字段（与 swapPassenger 同款「undefined 即不动」口径）；日期字符串 → Date。
+    const data: Prisma.PassengerUpdateInput = {};
+    const changedFields: string[] = [];
+    if (input.chineseName !== undefined) { data.chineseName = input.chineseName; changedFields.push('chineseName'); }
+    if (input.gender !== undefined) { data.gender = input.gender; changedFields.push('gender'); }
+    if (input.documentNumber !== undefined) { data.documentNumber = input.documentNumber; changedFields.push('documentNumber'); }
+    if (input.dateOfBirth !== undefined) { data.dateOfBirth = new Date(input.dateOfBirth); changedFields.push('dateOfBirth'); }
+    if (input.nationality !== undefined) { data.nationality = input.nationality; changedFields.push('nationality'); }
+    if (input.passportExpiry !== undefined) { data.passportExpiry = new Date(input.passportExpiry); changedFields.push('passportExpiry'); }
+    if (input.passportIssueDate !== undefined) { data.passportIssueDate = new Date(input.passportIssueDate); changedFields.push('passportIssueDate'); }
+    if (input.passportIssueCountry !== undefined) { data.passportIssueCountry = input.passportIssueCountry; changedFields.push('passportIssueCountry'); }
+    if (input.passportIssuePlace !== undefined) { data.passportIssuePlace = input.passportIssuePlace; changedFields.push('passportIssuePlace'); }
+    if (input.passportPhotoUrl !== undefined) { data.passportPhotoUrl = input.passportPhotoUrl; changedFields.push('passportPhotoUrl'); }
+
+    const updated = await prisma.passenger.update({ where: { id: passengerId }, data });
+    return {
+      passenger: serializePassengerRecord(updated as unknown as Record<string, unknown>),
+      changedFields,
+      orderNumber: order.orderNumber,
+    };
+  }
+
+  /**
+   * 改签申请（前台客户本人 / 代理树内订单）。
+   *
+   * 规则：
+   *   - 状态闸：仅 PAID / PROCESSING / TICKETED 可申请；否则 409 ORDER_NOT_CHANGEABLE。
+   *   - 幂等：已是 CHANGE_REQUESTED 直接返回当前订单（200，不重复建提醒）。
+   *   - 事务内：走 _updateStatusWithinTx（记 OrderStatusEvent、并发 CAS 保护）+
+   *     创建 OperationalReminder（HIGH 优先级，运营待办台接单跟进）。
+   */
+  // 返回类型交给推断：serializeOrder 是泛型，显式写 ReturnType<typeof serializeOrder> 会
+  // 塌缩到 OrderLike 约束（丢失 id/orderNumber 等具体字段），路由层审计取不到订单号。
+  async requestChange(orderId: string, reason: string, requester: OrderRequester) {
+    const order = await prisma.order.findUnique({
+      where: { id: orderId },
+      select: { id: true, status: true, userId: true, agentId: true, orderNumber: true },
+    });
+    if (!order) throw new NotFoundError('订单不存在');
+    await this.assertCanView(order, requester);
+
+    // 幂等：重复点「申请改签」不报错、不重复建提醒，返回当前订单。
+    if (order.status === OrderStatus.CHANGE_REQUESTED) {
+      return { order: await this.getOrder(orderId, requester), idempotent: true };
+    }
+    if (!CHANGE_REQUESTABLE_STATUSES.includes(order.status)) {
+      throw new AppError('当前订单状态不可申请改签', {
+        statusCode: 409,
+        code: 'ORDER_NOT_CHANGEABLE',
+      });
+    }
+
+    // CHANGE_REQUESTED 与来源状态同属占座集合：无座位/佣金/履约副作用，无需事务后处理。
+    const pendingTaskIds: string[] = [];
+    const updated = await prisma.$transaction(async (tx) => {
+      const u = await this._updateStatusWithinTx(
+        tx,
+        orderId,
+        OrderStatus.CHANGE_REQUESTED,
+        requester,
+        reason,
+        pendingTaskIds,
+      );
+      await tx.operationalReminder.create({
+        data: {
+          orderId,
+          createdById: requester.userId,
+          title: `【改签申请】${order.orderNumber}`,
+          body: reason,
+          priority: 'HIGH',
+        },
+      });
+      return u;
+    });
+    return { order: serializeOrder(updated), idempotent: false };
+  }
+
+  /**
+   * 电子行程单数据（前台客户下载 PDF 用；归属校验同 getOrder）。
+   *
+   * 状态闸：订单确认（付款）后才可下载 —— PAID / PROCESSING / TICKETED / COMPLETED /
+   * CHANGE_REQUESTED / CHANGED；否则 409 ITINERARY_NOT_READY。
+   * 无 FLIGHT 行（纯地面产品单）→ 409 NO_FLIGHT_ITEMS（与行程单邮件 no_flights 语义对齐）。
+   */
+  async getOrderItineraryData(
+    orderId: string,
+    requester: OrderRequester,
+  ): Promise<{ orderNumber: string; itinerary: ItineraryData }> {
+    const order = await prisma.order.findUnique({
+      where: { id: orderId },
+      include: {
+        items: { include: { flightSchedule: { include: { flight: true } } } },
+        passengers: true,
+      },
+    });
+    if (!order) throw new NotFoundError('订单不存在');
+    await this.assertCanView(order, requester);
+
+    if (!ITINERARY_READY_STATUSES.includes(order.status)) {
+      throw new AppError('订单确认后可下载行程单', {
+        statusCode: 409,
+        code: 'ITINERARY_NOT_READY',
+      });
+    }
+
+    const flightItems = order.items.filter((i) => i.kind === 'FLIGHT' && i.flightSchedule);
+    if (flightItems.length === 0) {
+      throw new AppError('该订单暂不支持生成行程单', {
+        statusCode: 409,
+        code: 'NO_FLIGHT_ITEMS',
+      });
+    }
+
+    return {
+      orderNumber: order.orderNumber,
+      itinerary: {
+        orderNumber: order.orderNumber,
+        contactName: order.contactName,
+        contactPhone: order.contactPhone,
+        contactEmail: order.contactEmail,
+        total: order.total.toFixed(2),
+        currency: order.currency,
+        createdAt: order.createdAt,
+        flights: flightItems.map((i) => ({
+          flightNumber: i.flightSchedule!.flight.flightNumber,
+          origin: i.flightSchedule!.flight.originCode,
+          destination: i.flightSchedule!.flight.destinationCode,
+          departureTime: i.flightSchedule!.departureTime,
+          arrivalTime: i.flightSchedule!.arrivalTime,
+          cabin: i.flightCabin ?? 'ECONOMY',
+        })),
+        passengers: order.passengers.map((p) => ({
+          fullName: p.fullName,
+          passportNumber: p.documentNumber,
+          pnr: p.pnr,
+          eticketNumber: p.eticketNumber,
+        })),
+      },
+    };
+  }
+
+  // ════════════════════════════════════════════════════════════════════
   // 权限校验
   // ════════════════════════════════════════════════════════════════════
   private async assertCanView(order: { userId: string | null; agentId: string | null }, requester: OrderRequester) {
@@ -2899,13 +3110,14 @@ export class OrderService {
       // 客户允许的状态流转：
       //   1. PENDING_PAYMENT → CANCELLED （直接取消未支付订单）
       //   2. PAID / PROCESSING / TICKETED → REFUND_REQUESTED （申请取消已支付订单）
+      //   3. PAID / PROCESSING / TICKETED → CHANGE_REQUESTED （前台自助改签申请）
       const allowed =
         (toStatus === 'CANCELLED' && order.status === 'PENDING_PAYMENT') ||
-        (toStatus === 'REFUND_REQUESTED' &&
+        ((toStatus === 'REFUND_REQUESTED' || toStatus === 'CHANGE_REQUESTED') &&
           (order.status === 'PAID' || order.status === 'PROCESSING' || order.status === 'TICKETED'));
       if (!allowed) {
         throw new ForbiddenError(
-          `客户不可将订单 ${order.status} → ${toStatus}（仅允许取消待支付订单 / 申请已支付订单退款）`,
+          `客户不可将订单 ${order.status} → ${toStatus}（仅允许取消待支付订单 / 申请已支付订单退款或改签）`,
         );
       }
       return;
@@ -2915,12 +3127,12 @@ export class OrderService {
       if (!order.agentId || !ids.includes(order.agentId)) {
         throw new ForbiddenError('无权操作该订单');
       }
-      // 代理替自己树内客户申请退款
-      if (toStatus === 'REFUND_REQUESTED' &&
+      // 代理替自己树内客户申请退款 / 改签
+      if ((toStatus === 'REFUND_REQUESTED' || toStatus === 'CHANGE_REQUESTED') &&
           (order.status === 'PAID' || order.status === 'PROCESSING' || order.status === 'TICKETED')) {
         return;
       }
-      throw new ForbiddenError('代理仅可代客户申请取消（其他状态流转请联系运营）');
+      throw new ForbiddenError('代理仅可代客户申请取消或改签（其他状态流转请联系运营）');
     }
   }
 
@@ -4812,9 +5024,30 @@ function findBundlePricingConfig(
   return null;
 }
 
+/**
+ * 详情/自助补录共用的出行人序列化：默认剥离 passportPhotoUrl 大图（data-URL 可达 MB 级，
+ * 会把订单详情响应撑爆），以 hasPassportPhoto 布尔代替。
+ * keepPhotoUrl=true 时保留大图（后台订单详情的护照缩略图直接读该字段，剥掉会瞎）。
+ * 窄 select（如 listOrders 只带 id/fullName）不含该字段 → 原样透传，不硬加布尔。
+ */
+function serializePassengerRecord<P extends Record<string, unknown>>(
+  p: P,
+  opts: { keepPhotoUrl?: boolean } = {},
+): Record<string, unknown> {
+  if (!('passportPhotoUrl' in p)) return p;
+  const hasPassportPhoto = p.passportPhotoUrl != null;
+  if (opts.keepPhotoUrl) return { ...p, hasPassportPhoto };
+  const { passportPhotoUrl: _stripped, ...rest } = p;
+  return { ...rest, hasPassportPhoto };
+}
+
 function serializeOrder<T extends OrderLike>(
   order: T,
-  ctx: { visaStayDaysById?: ReadonlyMap<string, number | null> } = {},
+  ctx: {
+    visaStayDaysById?: ReadonlyMap<string, number | null>;
+    /** 后台（ADMIN/STAFF）详情需要护照大图渲染缩略图；客户/代理侧剥离瘦身。缺省保留（兼容既有调用方）。 */
+    includePassportPhotos?: boolean;
+  } = {},
 ) {
   const visaStayDaysById = ctx.visaStayDaysById ?? new Map<string, number | null>();
   // 售后费用叠加后的口径：
@@ -4860,6 +5093,11 @@ function serializeOrder<T extends OrderLike>(
     infantUnitPriceCny: perAgePrices?.infantUnitPriceCny ?? null,
     childUnitPriceCny: perAgePrices?.childUnitPriceCny ?? null,
     adultUnitPriceCny: perAgePrices?.adultUnitPriceCny ?? null,
+    // 出行人：客户/代理侧剥离 passportPhotoUrl 大图（详情响应瘦身），以 hasPassportPhoto
+    // 布尔代替；后台详情保留大图（订单抽屉护照缩略图依赖）。窄 select 无该字段时原样透传。
+    passengers: (order.passengers ?? []).map((p) =>
+      serializePassengerRecord(p, { keepPhotoUrl: ctx.includePassportPhotos !== false }),
+    ),
     // 暴露代理结算模式 + 余额（前端据 settlementMode=MONTHLY 把订单显示成「月结」而非「欠款」）
     agent:
       order.agent == null

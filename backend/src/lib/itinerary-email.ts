@@ -95,8 +95,9 @@ export async function sendItineraryEmail(orderId: string): Promise<ItineraryResu
 
   const mailResult = await sendMail({
     to: order.contactEmail,
-    subject: `【世途旅行】您的电子行程单 · ${order.orderNumber}`,
-    text: `您好 ${order.contactName}，\n\n附件是您订单 ${order.orderNumber} 的电子行程单。请凭 PNR + 护照原件在机场柜台办理登机手续。\n\n如有疑问请联系 support@citur.com / +853 2888 8888。\n\n—— 世途旅行 Citur Travel`,
+    // 前台品牌：椰岛假期 / Coco Holiday（客户可见邮件不露出法律主体）
+    subject: `【椰岛假期】您的电子行程单 · ${order.orderNumber}`,
+    text: `您好 ${order.contactName}，\n\n附件是您订单 ${order.orderNumber} 的电子行程单。请凭 PNR + 护照原件在机场柜台办理登机手续。\n\n如有疑问请联系椰岛假期客服。\n\n—— 椰岛假期 Coco Holiday`,
     html: `
       <div style="font-family: 'Helvetica Neue', Helvetica, Arial, sans-serif; color: #0f172a; line-height: 1.6;">
         <h2 style="color:#1e40af">您的电子行程单</h2>
@@ -112,7 +113,7 @@ export async function sendItineraryEmail(orderId: string): Promise<ItineraryResu
           `).join('')}
         </table>
         <p style="margin-top:20px;color:#64748b;font-size:13px">
-          如有疑问请联系 support@citur.com / +853 2888 8888。
+          如有疑问请联系椰岛假期客服。
         </p>
       </div>
     `,

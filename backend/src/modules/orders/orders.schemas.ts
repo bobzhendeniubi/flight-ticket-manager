@@ -138,6 +138,40 @@ export const passengerInputSchema = z.object({
 });
 export type PassengerInput = z.infer<typeof passengerInputSchema>;
 
+// ── 前台自助：出行人护照资料补录（PATCH /orders/:id/passengers/:passengerId，客户/代理侧）──
+// 字段校验规则与 passengerInputSchema 完全同款；全部可选但至少给一个。
+// 刻意不含 fullName / lastName / firstName —— 换人请联系客服（身份字段前台锁定），
+// .strict() 让误传 fullName 的客户端拿到明确校验错误而不是被静默忽略。
+export const selfUpdatePassengerBodySchema = z
+  .object({
+    chineseName: z.string().max(120).optional(),
+    gender: z.enum(['M', 'F', 'X']).optional(),
+    documentNumber: z.string().min(3).max(40).optional(),
+    dateOfBirth: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    nationality: z.string().length(2).optional(),
+    passportExpiry: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    passportIssueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    passportIssueCountry: z.string().length(2).optional(),
+    passportIssuePlace: z.string().max(120).optional(),
+    // 护照图 data-URL；3MB 上限与下单口径一致（超大图快速失败，而非整请求 413 黑盒）
+    passportPhotoUrl: z.string().url().max(3_000_000, '护照图过大，请压缩后重试').optional(),
+  })
+  .strict()
+  .refine((v) => Object.values(v).some((x) => x !== undefined), {
+    message: '请至少提供一个需要更新的字段',
+  });
+export type SelfUpdatePassengerBody = z.infer<typeof selfUpdatePassengerBodySchema>;
+
+// ── 前台自助：改签申请（POST /orders/:id/change-request）──
+export const changeRequestBodySchema = z.object({
+  reason: z
+    .string()
+    .trim()
+    .min(2, '请填写改签原因（至少 2 个字）')
+    .max(500, '改签原因最多 500 字'),
+});
+export type ChangeRequestBody = z.infer<typeof changeRequestBodySchema>;
+
 // 订单行（OrderItem）— 前端用 kind 区分是机票/酒店/接送/签证
 // FLIGHT 必须带 flightScheduleId + flightCabin + quantity；后端会重算价格并校验余票
 // HOTEL/TRANSFER/VISA 暂时"信任前端价格"（产品 CRUD P1 补齐后改为后端查）

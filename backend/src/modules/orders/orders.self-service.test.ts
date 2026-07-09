@@ -1,0 +1,293 @@
+/**
+ * 前台自助端点（M2）· 服务级测试（vitest，vi.mock Prisma，不依赖真 DB）
+ *
+ * 覆盖三个 service 方法的关键口径：
+ *   1. selfUpdatePassenger：状态闸（出票后锁定 409 ORDER_LOCKED）、passengerId 归属校验、
+ *      仅更新传入字段、返回剥离 passportPhotoUrl 大图 + hasPassportPhoto 布尔、越权 403
+ *   2. requestChange：状态闸（409 ORDER_NOT_CHANGEABLE）、幂等（已是 CHANGE_REQUESTED
+ *      直接返回不再写库）、happy path 走状态机（记 OrderStatusEvent）+ 建 HIGH 运营提醒
+ *   3. getOrderItineraryData：状态闸（409 ITINERARY_NOT_READY）、无航班行 409
+ *      NO_FLIGHT_ITEMS、happy path 航段/乘客映射
+ */
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { UserRole } from '@prisma/client';
+
+const { mockPrisma } = vi.hoisted(() => ({
+  mockPrisma: {
+    order: {
+      findUnique: vi.fn(),
+    },
+    passenger: {
+      findUnique: vi.fn(),
+      update: vi.fn(),
+    },
+    $transaction: vi.fn(),
+  },
+}));
+
+vi.mock('../../db/prisma.js', () => ({ prisma: mockPrisma }));
+
+// audit 由路由层调用；mock 掉避免真写库
+vi.mock('../../lib/audit.js', () => ({
+  writeAudit: vi.fn(),
+  actorFromRequest: vi.fn(() => ({})),
+}));
+
+import { OrderService } from './orders.service.js';
+import { AppError, ForbiddenError, NotFoundError } from '../../lib/errors.js';
+
+const service = new OrderService();
+const OWNER = { userId: 'u1', role: UserRole.CUSTOMER };
+
+/** 最小 Decimal 桩：serializeOrder 只用 toString / greaterThan / toFixed。 */
+const dec = (s: string) => ({
+  toString: () => s,
+  toFixed: () => s,
+  greaterThan: () => false,
+});
+
+beforeEach(() => {
+  mockPrisma.order.findUnique.mockReset();
+  mockPrisma.passenger.findUnique.mockReset();
+  mockPrisma.passenger.update.mockReset();
+  mockPrisma.$transaction.mockReset();
+});
+
+// ── 1. selfUpdatePassenger ─────────────────────────────────────────────
+describe('selfUpdatePassenger', () => {
+  const orderRow = {
+    id: 'o1',
+    status: 'PAID',
+    userId: 'u1',
+    agentId: null,
+    orderNumber: 'FTM20260709001',
+  };
+
+  it('出票后（TICKETED）→ 409 ORDER_LOCKED，不写库', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue({ ...orderRow, status: 'TICKETED' });
+    const err = await service
+      .selfUpdatePassenger('o1', 'p1', { chineseName: '张三' }, OWNER)
+      .then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(AppError);
+    expect((err as AppError).statusCode).toBe(409);
+    expect((err as AppError).code).toBe('ORDER_LOCKED');
+    expect(mockPrisma.passenger.update).not.toHaveBeenCalled();
+  });
+
+  it('passengerId 不属于该订单 → 404', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(orderRow);
+    mockPrisma.passenger.findUnique.mockResolvedValue({ id: 'p1', orderId: 'other-order' });
+    await expect(
+      service.selfUpdatePassenger('o1', 'p1', { chineseName: '张三' }, OWNER),
+    ).rejects.toBeInstanceOf(NotFoundError);
+    expect(mockPrisma.passenger.update).not.toHaveBeenCalled();
+  });
+
+  it('非本人订单（CUSTOMER）→ 403', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue({ ...orderRow, userId: 'someone-else' });
+    await expect(
+      service.selfUpdatePassenger('o1', 'p1', { chineseName: '张三' }, OWNER),
+    ).rejects.toBeInstanceOf(ForbiddenError);
+  });
+
+  it('happy path：仅更新传入字段；返回剥离大图 + hasPassportPhoto', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(orderRow);
+    mockPrisma.passenger.findUnique.mockResolvedValue({ id: 'p1', orderId: 'o1' });
+    mockPrisma.passenger.update.mockResolvedValue({
+      id: 'p1',
+      fullName: 'ZHANG SAN',
+      chineseName: '张三',
+      passportExpiry: new Date('2030-01-01'),
+      passportPhotoUrl: 'data:image/jpeg;base64,xxxx',
+    });
+
+    const result = await service.selfUpdatePassenger(
+      'o1',
+      'p1',
+      { chineseName: '张三', passportExpiry: '2030-01-01' },
+      OWNER,
+    );
+
+    // 仅传入字段进 update.data；日期字符串转 Date
+    const updateArg = mockPrisma.passenger.update.mock.calls[0][0];
+    expect(Object.keys(updateArg.data).sort()).toEqual(['chineseName', 'passportExpiry']);
+    expect(updateArg.data.passportExpiry).toBeInstanceOf(Date);
+    expect(result.changedFields.sort()).toEqual(['chineseName', 'passportExpiry']);
+
+    // 序列化：大图剥离，布尔代替
+    expect(result.passenger).not.toHaveProperty('passportPhotoUrl');
+    expect(result.passenger.hasPassportPhoto).toBe(true);
+    expect(result.orderNumber).toBe('FTM20260709001');
+  });
+});
+
+// ── 2. requestChange ───────────────────────────────────────────────────
+describe('requestChange', () => {
+  const orderRow = {
+    id: 'o1',
+    status: 'PAID',
+    userId: 'u1',
+    agentId: null,
+    orderNumber: 'FTM20260709001',
+  };
+
+  it('待支付订单 → 409 ORDER_NOT_CHANGEABLE，不开事务', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue({ ...orderRow, status: 'PENDING_PAYMENT' });
+    const err = await service
+      .requestChange('o1', '想改到 7 月 20 日出发', OWNER)
+      .then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(AppError);
+    expect((err as AppError).statusCode).toBe(409);
+    expect((err as AppError).code).toBe('ORDER_NOT_CHANGEABLE');
+    expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('幂等：已是 CHANGE_REQUESTED → 直接返回当前订单，不再写库', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue({ ...orderRow, status: 'CHANGE_REQUESTED' });
+    const getOrderSpy = vi
+      .spyOn(service, 'getOrder')
+      .mockResolvedValue({ id: 'o1', orderNumber: 'FTM20260709001', status: 'CHANGE_REQUESTED' } as never);
+
+    const result = await service.requestChange('o1', '想改到 7 月 20 日出发', OWNER);
+    expect(result.idempotent).toBe(true);
+    expect(getOrderSpy).toHaveBeenCalledWith('o1', OWNER);
+    expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+    getOrderSpy.mockRestore();
+  });
+
+  it('happy path（PAID）：走状态机记 OrderStatusEvent + 建 HIGH 运营提醒', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(orderRow);
+
+    const fullOrder = {
+      id: 'o1',
+      orderNumber: 'FTM20260709001',
+      status: 'CHANGE_REQUESTED',
+      subtotal: dec('100.00'),
+      taxesAndFees: dec('0.00'),
+      discountTotal: dec('0.00'),
+      total: dec('100.00'),
+      paidAmount: dec('100.00'),
+      prepaymentOffset: dec('0.00'),
+      adjustmentCny: 0,
+      items: [],
+      passengers: [],
+      payments: [],
+      refunds: [],
+      statusEvents: [],
+      agent: null,
+      user: null,
+    };
+    const tx = {
+      order: {
+        // _updateStatusWithinTx 内部按当前状态做 CAS
+        findUnique: vi.fn().mockResolvedValue({ ...orderRow, items: [], paidAmount: dec('100.00'), total: dec('100.00') }),
+        updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+        findUniqueOrThrow: vi.fn().mockResolvedValue(fullOrder),
+      },
+      orderStatusEvent: { create: vi.fn() },
+      operationalReminder: { create: vi.fn() },
+    };
+    mockPrisma.$transaction.mockImplementation(async (fn: (t: unknown) => Promise<unknown>) => fn(tx));
+
+    const result = await service.requestChange('o1', '想改到 7 月 20 日出发', OWNER);
+
+    expect(result.idempotent).toBe(false);
+    expect(result.order.status).toBe('CHANGE_REQUESTED');
+    // 状态机 CAS + 事件（PAID → CHANGE_REQUESTED 已进白名单）
+    expect(tx.order.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: 'o1', status: 'PAID' } }),
+    );
+    expect(tx.orderStatusEvent.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ fromStatus: 'PAID', toStatus: 'CHANGE_REQUESTED' }),
+      }),
+    );
+    // 运营待办提醒（HIGH）
+    expect(tx.operationalReminder.create).toHaveBeenCalledWith({
+      data: {
+        orderId: 'o1',
+        createdById: 'u1',
+        title: '【改签申请】FTM20260709001',
+        body: '想改到 7 月 20 日出发',
+        priority: 'HIGH',
+      },
+    });
+  });
+});
+
+// ── 3. getOrderItineraryData ───────────────────────────────────────────
+describe('getOrderItineraryData', () => {
+  const baseOrder = {
+    id: 'o1',
+    status: 'TICKETED',
+    userId: 'u1',
+    agentId: null,
+    orderNumber: 'FTM20260709001',
+    contactName: '张三',
+    contactPhone: '13800000000',
+    contactEmail: null,
+    total: dec('1234.00'),
+    currency: 'CNY',
+    createdAt: new Date('2026-07-09T00:00:00Z'),
+    passengers: [
+      { fullName: 'ZHANG SAN', documentNumber: 'E12345678', pnr: 'ABC123', eticketNumber: null },
+    ],
+    items: [] as unknown[],
+  };
+
+  it('未付款（PENDING_PAYMENT）→ 409 ITINERARY_NOT_READY', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue({ ...baseOrder, status: 'PENDING_PAYMENT' });
+    const err = await service
+      .getOrderItineraryData('o1', OWNER)
+      .then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(AppError);
+    expect((err as AppError).statusCode).toBe(409);
+    expect((err as AppError).code).toBe('ITINERARY_NOT_READY');
+  });
+
+  it('纯地面单（无 FLIGHT 行）→ 409 NO_FLIGHT_ITEMS', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue({
+      ...baseOrder,
+      items: [{ kind: 'HOTEL', flightSchedule: null }],
+    });
+    const err = await service
+      .getOrderItineraryData('o1', OWNER)
+      .then(() => null, (e: unknown) => e);
+    expect(err).toBeInstanceOf(AppError);
+    expect((err as AppError).code).toBe('NO_FLIGHT_ITEMS');
+  });
+
+  it('happy path：映射航段 + 乘客（护照号 = documentNumber）', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue({
+      ...baseOrder,
+      items: [
+        {
+          kind: 'FLIGHT',
+          flightCabin: 'ECONOMY',
+          flightSchedule: {
+            departureTime: new Date('2026-07-13T08:30:00Z'),
+            arrivalTime: new Date('2026-07-13T10:00:00Z'),
+            flight: { flightNumber: 'VJ2534', originCode: 'MFM', destinationCode: 'DAD' },
+          },
+        },
+      ],
+    });
+
+    const { orderNumber, itinerary } = await service.getOrderItineraryData('o1', OWNER);
+    expect(orderNumber).toBe('FTM20260709001');
+    expect(itinerary.flights).toHaveLength(1);
+    expect(itinerary.flights[0]).toMatchObject({
+      flightNumber: 'VJ2534',
+      origin: 'MFM',
+      destination: 'DAD',
+      cabin: 'ECONOMY',
+    });
+    expect(itinerary.passengers[0]).toEqual({
+      fullName: 'ZHANG SAN',
+      passportNumber: 'E12345678',
+      pnr: 'ABC123',
+      eticketNumber: null,
+    });
+    expect(itinerary.total).toBe('1234.00');
+  });
+});

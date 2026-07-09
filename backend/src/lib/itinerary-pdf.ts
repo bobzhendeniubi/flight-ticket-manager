@@ -51,7 +51,8 @@ export async function renderItineraryPdf(data: ItineraryData): Promise<Buffer> {
       doc.on('error', reject);
 
       // ── 标题 ────────────────────────────────────────
-      doc.fontSize(20).text('Citur Travel / 世途旅行', { align: 'center' });
+      // 前台品牌：椰岛假期 / Coco Holiday（世途/Citur 仅法律主体，客户可见文档绝不露出）
+      doc.fontSize(20).text('Coco Holiday / 椰岛假期', { align: 'center' });
       doc.moveDown(0.3);
       doc.fontSize(14).fillColor('#475569').text('Electronic Itinerary & E-Ticket', { align: 'center' });
       doc.moveDown(1);
@@ -115,7 +116,7 @@ export async function renderItineraryPdf(data: ItineraryData): Promise<Buffer> {
         { align: 'center' },
       );
       doc.text(
-        'Contact: support@citur.com  /  +853 2888 8888',
+        'For assistance, please contact Coco Holiday customer service. 如有疑问请联系椰岛假期客服。',
         { align: 'center' },
       );
 
