@@ -102,6 +102,7 @@ import {
   summarizeBundleItems,
   deriveBundlePerAgeUnitPrices,
   buildOrderFilterWhere,
+  filterOrderIdsByDepartDate,
 } from './orders.service.js';
 import type { OrderItemInput } from './orders.schemas.js';
 import {
@@ -2781,11 +2782,15 @@ describe('swapItemHotelBodySchema', () => {
 });
 
 describe('buildOrderFilterWhere · 签证办理状态筛选（与列表徽标同源）', () => {
-  // 已签证 = 订单含 VISA 行且其 VISA_APPLICATION 履约任务已确认(CONFIRMED)。
+  // 已签证 = 订单存在已确认(CONFIRMED)的签证办理任务 VISA_APPLICATION。
+  // 关键口径：按履约任务判定、不限 item kind —— 签证任务常挂在 BUNDLE 行或首个订单项上
+  //（套餐订单没有独立 VISA 行）；强求 kind=VISA 会漏掉套餐签证单，导致 signed/unsigned 双 0。
+  const HAS_VISA_TASK_CLAUSE = {
+    items: { some: { fulfillmentTasks: { some: { type: 'VISA_APPLICATION' } } } },
+  };
   const CONFIRMED_CLAUSE = {
     items: {
       some: {
-        kind: 'VISA',
         fulfillmentTasks: {
           some: { type: 'VISA_APPLICATION', status: 'CONFIRMED' },
         },
@@ -2798,26 +2803,24 @@ describe('buildOrderFilterWhere · 签证办理状态筛选（与列表徽标同
     expect(where.AND).toBeUndefined();
   });
 
-  it('signed → AND 含「VISA 行且签证办理任务已确认」子句', () => {
+  it('signed → AND 含「存在已确认签证办理任务」子句（不限 item kind）', () => {
     const where = buildOrderFilterWhere({ visaFulfillmentStatus: 'signed' });
     expect(where.AND).toEqual([CONFIRMED_CLAUSE]);
+    // 回归守卫：签证子句不得再要求 kind=VISA（否则套餐签证单漏召回 = 双 0 bug 复现）。
+    expect(JSON.stringify(where.AND)).not.toContain('"kind"');
   });
 
-  it('unsigned → AND 含「有 VISA 行」且「无已确认签证任务」(NOT) 组合', () => {
+  it('unsigned → AND 含「有签证办理任务」且「无已确认」(NOT) 组合，不限 kind', () => {
     const where = buildOrderFilterWhere({ visaFulfillmentStatus: 'unsigned' });
     expect(where.AND).toEqual([
-      {
-        AND: [
-          { items: { some: { kind: 'VISA' } } },
-          { NOT: CONFIRMED_CLAUSE },
-        ],
-      },
+      { AND: [HAS_VISA_TASK_CLAUSE, { NOT: CONFIRMED_CLAUSE }] },
     ]);
+    expect(JSON.stringify(where.AND)).not.toContain('"kind"');
   });
 
   it('signed 可与 kind 组合而不互相覆盖（各自独立叠加进 AND）', () => {
     const where = buildOrderFilterWhere({ kind: 'VISA', visaFulfillmentStatus: 'signed' });
-    // kind 与 signed 分别是两条 { items: { some } } 子句，都进 AND，互不覆盖。
+    // kind 筛选（显式选了「签证」产品类型）与 signed 分别是两条子句，都进 AND，互不覆盖。
     expect(Array.isArray(where.AND)).toBe(true);
     expect(where.AND).toEqual([
       { items: { some: { kind: 'VISA' } } },
@@ -2829,5 +2832,49 @@ describe('buildOrderFilterWhere · 签证办理状态筛选（与列表徽标同
     const where = buildOrderFilterWhere({ invoiceStatus: 'ISSUED', visaFulfillmentStatus: 'signed' });
     expect(where.invoiceStatus).toBe('ISSUED');
     expect(where.AND).toEqual([CONFIRMED_CLAUSE]);
+  });
+});
+
+// ── 出行日期精确细筛（整单出发日 = deriveOrderDepartDate 同口径；列表所见 = 筛选所得）──
+describe('filterOrderIdsByDepartDate · 按整单出发日精确细筛', () => {
+  // departureTime 以「本地时刻当作 UTC」存取（与仓库其余时间口径一致）——
+  // deriveOrderDepartDate 取最早航段 departureTime 的 date-only 作整单出发日。
+  const flightItem = (isoDepart: string) => ({
+    hotelCheckIn: null,
+    flightSchedule: { departureTime: new Date(isoDepart) },
+  });
+  const hotelItem = (isoCheckIn: string) => ({
+    hotelCheckIn: new Date(isoCheckIn),
+    flightSchedule: null,
+  });
+
+  it('往返单（去程 7/10、回程 7/11），travelFrom=7/11 → 不命中（整单出发日=去程 7/10 < 7/11）', () => {
+    const roundTrip = {
+      id: 'rt',
+      // 顺序刻意先回程后去程，验证取的是「最早」而非「第一条」。
+      items: [flightItem('2026-07-11T09:00:00Z'), flightItem('2026-07-10T08:00:00Z')],
+    };
+    expect(filterOrderIdsByDepartDate([roundTrip], '2026-07-11', undefined)).toEqual([]);
+  });
+
+  it('7/11 出发的单 → travelFrom=7/11 命中（含起始边界）', () => {
+    const dep0711 = { id: 'a', items: [flightItem('2026-07-11T06:00:00Z')] };
+    expect(filterOrderIdsByDepartDate([dep0711], '2026-07-11', undefined)).toEqual(['a']);
+  });
+
+  it('区间 [7/11, 7/12] 同时筛掉早于起始与晚于结束者，保留区间内（含边界）', () => {
+    const before = { id: 'b', items: [flightItem('2026-07-10T23:00:00Z')] }; // 7/10 < 7/11
+    const onFrom = { id: 'f', items: [flightItem('2026-07-11T02:00:00Z')] }; // 7/11 边界
+    const onTo = { id: 't', items: [flightItem('2026-07-12T22:00:00Z')] }; // 7/12 边界
+    const after = { id: 'z', items: [flightItem('2026-07-13T01:00:00Z')] }; // 7/13 > 7/12
+    const ids = filterOrderIdsByDepartDate([before, onFrom, onTo, after], '2026-07-11', '2026-07-12');
+    expect(ids).toEqual(['f', 't']);
+  });
+
+  it('无航班的纯地面单回退酒店入住日；既无航班也无酒店 → 不命中', () => {
+    const hotelOnly = { id: 'h', items: [hotelItem('2026-07-11T00:00:00Z')] };
+    const empty = { id: 'e', items: [] };
+    const ids = filterOrderIdsByDepartDate([hotelOnly, empty], '2026-07-11', '2026-07-11');
+    expect(ids).toEqual(['h']);
   });
 });

@@ -411,12 +411,15 @@ export const exportRoomAllocationQuerySchema = z.object({
 });
 export type ExportRoomAllocationQuery = z.infer<typeof exportRoomAllocationQuerySchema>;
 
-// ── 签证资料整日打包（zip：合并签证名单 xlsx + 全部护照图）─────────────────
-// 按出发日选订单（与分房表 departDate 同口径），一次导出该日所有订单的签证资料。
-export const visaBundleQuerySchema = z.object({
-  departDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, '日期格式应为 YYYY-MM-DD'),
+// ── 签证资料合并打包（zip：合并签证名单 xlsx + 全部护照图）─────────────────
+// 按勾选的订单 id 列表选单，一次导出这些订单的签证资料（不再按出发日整日打包）。
+export const visaBundleBodySchema = z.object({
+  orderIds: z
+    .array(z.string().min(1))
+    .min(1, '请至少勾选一个订单')
+    .max(200, '单次最多打包 200 个订单，请分批操作'),
 });
-export type VisaBundleQuery = z.infer<typeof visaBundleQuerySchema>;
+export type VisaBundleBody = z.infer<typeof visaBundleBodySchema>;
 
 // ── 状态流转 ─────────────────────────────────────────────────────────────
 export const updateStatusBodySchema = z.object({

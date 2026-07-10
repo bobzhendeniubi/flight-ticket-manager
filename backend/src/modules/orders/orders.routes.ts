@@ -28,7 +28,7 @@ import {
   swapPassengerBodySchema,
   updateItemSettlementPriceBodySchema,
   updateStatusBodySchema,
-  visaBundleQuerySchema,
+  visaBundleBodySchema,
 } from './orders.schemas.js';
 import { renderItineraryPdf } from '../../lib/itinerary-pdf.js';
 import { prisma } from '../../db/prisma.js';
@@ -693,30 +693,30 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     },
   );
 
-  // ── 签证资料整日打包 zip（合并签证名单 xlsx + 全部护照图）──
-  // GET /orders/visa-bundle.zip?departDate=YYYY-MM-DD（ADMIN/STAFF only）
-  // 按出发日选订单（与分房表 departDate 同口径）；一次导出该日全部订单的签证资料。
-  app.get(
+  // ── 签证资料合并打包 zip（合并签证名单 xlsx + 全部护照图）──
+  // POST /orders/visa-bundle.zip  body { orderIds: string[] }（ADMIN/STAFF only）
+  // 按勾选的订单一次导出这些订单的签证资料（状态不合格/查不到的单在 zip 内 README 点名跳过）。
+  app.post(
     '/visa-bundle.zip',
     { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
     async (req, reply) => {
-      const query = visaBundleQuerySchema.parse(req.query);
-      const zipBuf = await buildVisaBundleZip({ departDate: query.departDate });
+      const body = visaBundleBodySchema.parse(req.body);
+      const zipBuf = await buildVisaBundleZip({ orderIds: body.orderIds });
 
       void writeAudit({
         actor: actorFromRequest(req),
         action: 'DOWNLOAD_VISA_BUNDLE',
         targetType: 'ORDER',
         targetId: 'visa-bundle',
-        targetLabel: `签证资料 出发日 ${query.departDate}`,
-        after: { departDate: query.departDate },
+        targetLabel: `签证资料 勾选 ${body.orderIds.length} 单`,
+        after: { orderCount: body.orderIds.length },
       });
 
       return reply
         .header('Content-Type', 'application/zip')
         .header(
           'Content-Disposition',
-          `attachment; filename="${encodeURIComponent(visaBundleZipFilename(query.departDate))}"`,
+          `attachment; filename="${encodeURIComponent(visaBundleZipFilename(body.orderIds.length))}"`,
         )
         .send(zipBuf);
     },

@@ -2564,12 +2564,13 @@ export const api = {
     return res.blob();
   },
 
-  // 签证资料整日打包（ADMIN/STAFF）：合并签证名单 xlsx + 全部护照图，按出发日一次导出
-  downloadVisaBundle: async (token: string, departDate: string): Promise<Blob> => {
-    const res = await fetch(
-      `${API_BASE}/orders/visa-bundle.zip?departDate=${encodeURIComponent(departDate)}`,
-      { headers: { Authorization: `Bearer ${token}` } },
-    );
+  // 签证资料合并打包（ADMIN/STAFF）：合并签证名单 xlsx + 全部护照图，按勾选的订单一次导出
+  downloadVisaBundle: async (token: string, orderIds: string[]): Promise<Blob> => {
+    const res = await fetch(`${API_BASE}/orders/visa-bundle.zip`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ orderIds }),
+    });
     if (!res.ok) throw new ApiError(res.status, { code: 'ZIP_FAILED', message: await res.text() });
     return res.blob();
   },

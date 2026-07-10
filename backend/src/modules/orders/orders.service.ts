@@ -1321,6 +1321,29 @@ export class OrderService {
     if (query.claimedById) where.claimedById = query.claimedById;
     if (query.unclaimedOnly) where.claimedById = null;
 
+    // 出行日期精确细筛（两段式）：buildOrderFilterWhere 的 travelFrom/travelTo 只做 ±1 天粗窗口
+    //（防 UTC/本地日边界漏单），会把「去程 7/10、回程 7/11」这类整单出发日在窗口外的往返单也粗召回。
+    // 这里在分页/计数之前，先按粗窗口 + 全部筛选 + RBAC 圈出候选订单的最早航段/酒店时间（只取必要字段），
+    // 在 JS 里按整单出发日（deriveOrderDepartDate 同口径，= 列表「出发日期」列）精确判定，
+    // 再把命中 id 作为 id in (...) 并回 where —— 保证分页 take/skip 与总数都在精确过滤之后计算，
+    // 且「列表所见 = 筛选所得」。orderIds 勾选导出不走 listOrders，此处无需考虑。
+    if (query.travelFrom || query.travelTo) {
+      const candidates = await prisma.order.findMany({
+        where,
+        select: {
+          id: true,
+          items: {
+            select: {
+              hotelCheckIn: true,
+              flightSchedule: { select: { departureTime: true } },
+            },
+          },
+        },
+      });
+      const preciseIds = filterOrderIdsByDepartDate(candidates, query.travelFrom, query.travelTo);
+      where.id = { in: preciseIds };
+    }
+
     const [rows, total] = await prisma.$transaction([
       prisma.order.findMany({
         where,
@@ -4081,15 +4104,23 @@ export function buildOrderFilterWhere(query: OrderListFilters): Prisma.OrderWher
     )[query.invoiceLeg];
     where[col] = query.invoiced;
   }
-  // 签证办理状态筛选 — 与列表「签证」列徽标同源（VISA 行的 VISA_APPLICATION 履约任务状态）。
-  //   signed  ：订单含 VISA 行且其签证办理任务「已确认(CONFIRMED)」= 已签证。
-  //   unsigned：订单含 VISA 行、但无任何「已确认」的签证办理任务（待处理/处理中/取消/失败或无任务）= 未签证。
-  // 无 VISA 行的订单两者都不命中（列表徽标显示「—」），刻意保持一致、不制造第三口径。
+  // 签证办理状态筛选 — 与列表「签证」列徽标同源（签证办理履约任务 VISA_APPLICATION 的状态）。
+  //   signed  ：订单存在「已确认(CONFIRMED)」的签证办理任务 = 已签证。
+  //   unsigned：订单存在签证办理任务、但无任何「已确认」的（待处理/处理中/取消/失败）= 未签证。
+  // 按履约任务判定、不限 item kind —— 签证任务常挂在 BUNDLE 行或首个订单项上（套餐订单没有
+  // 独立 VISA 行），若强求 kind=VISA 会漏掉套餐签证单（signed/unsigned 双 0）。
+  // 无任何签证办理任务的订单两者都不命中（列表徽标显示「—」），与徽标口径一致、不制造第三口径。
   // 走 andClauses 叠加，可与 kind / 出行日期 / 航班号等 items 维度组合而不互相覆盖。
+  const HAS_VISA_TASK: Prisma.OrderWhereInput = {
+    items: {
+      some: {
+        fulfillmentTasks: { some: { type: FulfillmentType.VISA_APPLICATION } },
+      },
+    },
+  };
   const VISA_APPLICATION_CONFIRMED: Prisma.OrderWhereInput = {
     items: {
       some: {
-        kind: OrderItemKind.VISA,
         fulfillmentTasks: {
           some: { type: FulfillmentType.VISA_APPLICATION, status: FulfillmentStatus.CONFIRMED },
         },
@@ -4100,10 +4131,7 @@ export function buildOrderFilterWhere(query: OrderListFilters): Prisma.OrderWher
     andClauses.push(VISA_APPLICATION_CONFIRMED);
   } else if (query.visaFulfillmentStatus === 'unsigned') {
     andClauses.push({
-      AND: [
-        { items: { some: { kind: OrderItemKind.VISA } } },
-        { NOT: VISA_APPLICATION_CONFIRMED },
-      ],
+      AND: [HAS_VISA_TASK, { NOT: VISA_APPLICATION_CONFIRMED }],
     });
   }
   // 航班号筛选 — 订单需含该航班号的 FLIGHT 行（同样走 AND 叠加，可与 kind/出行日期组合）
@@ -4806,6 +4834,29 @@ function deriveOrderDepartDate(items: ReadonlyArray<Record<string, unknown>>): s
   }
   const picked = earliestFlight ?? earliestHotel;
   return picked ? formatDateOnly(picked) : null;
+}
+
+/**
+ * 出行日期精确细筛：把「粗窗口候选订单」按整单出发日（deriveOrderDepartDate 同口径）精确
+ * 过滤到 [travelFrom, travelTo] 内，返回命中的订单 id。
+ * 口径复用 deriveOrderDepartDate（列表「出发日期」列同一函数）——保证「列表所见 = 筛选所得」。
+ *   无出发日（既无航班也无酒店）→ 不命中；YYYY-MM-DD 字符串按字典序即日期序，可直接比较。
+ * 两端半闭区间含边界（travelFrom/travelTo 各自可选）。导出供 listOrders 调用 + 单测。
+ */
+export function filterOrderIdsByDepartDate(
+  candidates: ReadonlyArray<{ id: string; items: ReadonlyArray<Record<string, unknown>> }>,
+  travelFrom?: string,
+  travelTo?: string,
+): string[] {
+  const result: string[] = [];
+  for (const o of candidates) {
+    const departDate = deriveOrderDepartDate(o.items);
+    if (departDate === null) continue;
+    if (travelFrom && departDate < travelFrom) continue;
+    if (travelTo && departDate > travelTo) continue;
+    result.push(o.id);
+  }
+  return result;
 }
 
 /** Prisma.Decimal | null | undefined → number | null（JSON 序列化前统一转换，未联查/未盖章时安全落 null）。 */

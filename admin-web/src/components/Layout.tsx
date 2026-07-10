@@ -55,6 +55,11 @@ export function Layout() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const closeDrawer = () => setDrawerOpen(false);
 
+  // 点击"当前所在页"的菜单项时 react-router 不会触发导航（路径未变），
+  // 页面组件也就不会重挂、不会重新拉数。这里用一个自增 tick 强制 Outlet
+  // 重挂，让点击菜单始终有"刷新页面"的效果。
+  const [refreshTick, setRefreshTick] = useState(0);
+
   /**
    * 启动时向后端验证 token 是否真有效 + 角色是否对得上。
    * 解决"篡改 localStorage 伪造身份进后台壳"的攻击场景。
@@ -127,7 +132,14 @@ export function Layout() {
                 <li key={n.to}>
                   <NavLink
                     to={n.to}
-                    onClick={closeDrawer}
+                    onClick={() => {
+                      closeDrawer();
+                      // 已经在这个页面上再点一次同一项：路径不变，路由不会
+                      // 重新导航，主动 +1 触发下方 Outlet 重挂刷新数据。
+                      if (location.pathname.startsWith(n.to)) {
+                        setRefreshTick((t) => t + 1);
+                      }
+                    }}
                     className={({ isActive }) =>
                       `relative flex items-center rounded-lg px-3 py-2 text-sm font-medium transition ${
                         isActive
@@ -236,8 +248,8 @@ export function Layout() {
 
         <main className="flex-1">
           <div className="mx-auto w-full max-w-[1400px] px-4 py-6 md:px-6 lg:px-8">
-            <ErrorBoundary resetKey={location.pathname}>
-              <Outlet />
+            <ErrorBoundary resetKey={`${location.pathname}#${refreshTick}`}>
+              <Outlet key={`${location.pathname}#${refreshTick}`} />
             </ErrorBoundary>
           </div>
         </main>

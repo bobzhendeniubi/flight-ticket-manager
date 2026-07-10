@@ -17,7 +17,9 @@ vi.mock('../../db/prisma.js', () => ({ prisma: {} }));
 import {
   orderToFullRows,
   orderToTicketingRows,
+  orderToVisaRows,
   buildOrderContext,
+  pnrName,
   FULL_COLUMNS,
   TICKETING_COLUMNS,
   type OrderForTemplateExport,
@@ -346,6 +348,42 @@ describe('《票务专用》ticketing 模版 — 27 列 + 格式', () => {
   it('姓名大写拆分', () => {
     expect(r1.lastName).toBe('WANG');
     expect(r1.firstName).toBe('LIANBO');
+  });
+});
+
+// ── pnrName · 护照逗号剥离 ─────────────────────────────────────────────────
+// 源 fullName "WEI, HAIYANG" 按空白拆名会把逗号留在姓里（"WEI," / "HAIYANG"），
+// pnrName 必须剥离逗号+空白再拼，不得产出 "WEI,/HAIYANG"。fullName 回退分支同样规范逗号。
+describe('pnrName — 护照逗号剥离', () => {
+  it('lastName/firstName 拆分：正常 → LAST/FIRST 大写', () => {
+    expect(pnrName({ lastName: 'WANG', firstName: 'LIANBO', fullName: 'x' })).toBe('WANG/LIANBO');
+  });
+
+  it('拆分字段残留逗号/空白 → 剥离后再拼（不产出 "WEI,/HAIYANG"）', () => {
+    expect(pnrName({ lastName: 'WEI,', firstName: 'HAIYANG', fullName: 'x' })).toBe('WEI/HAIYANG');
+    expect(pnrName({ lastName: ' WEI , ', firstName: ' HAIYANG ', fullName: 'x' })).toBe('WEI/HAIYANG');
+  });
+
+  it('fullName 回退：护照逗号格式 "WEI, HAIYANG" → "WEI/HAIYANG"', () => {
+    expect(pnrName({ lastName: null, firstName: null, fullName: 'WEI, HAIYANG' })).toBe('WEI/HAIYANG');
+  });
+
+  it('fullName 回退：中文名无逗号 → 原样返回', () => {
+    expect(pnrName({ lastName: null, firstName: null, fullName: '李四' })).toBe('李四');
+  });
+});
+
+// ── 《签证专用》visa 行 · 中文姓名取值 ──────────────────────────────────────
+// 「中文姓名」列须优先 chineseName（缺失才回落 fullName），与《全岗可用》口径一致，
+// 避免中文名列显示成英文名。
+describe('《签证专用》visa 行 — 中文姓名取值', () => {
+  const order = fixtureRoundTrip();
+  const ctx = buildOrderContext(order);
+  const rows = orderToVisaRows(order, ctx);
+
+  it('优先 chineseName，缺省回落 fullName', () => {
+    expect(rows[0].chineseName).toBe('王连波');
+    expect(rows[1].chineseName).toBe('李四');
   });
 });
 

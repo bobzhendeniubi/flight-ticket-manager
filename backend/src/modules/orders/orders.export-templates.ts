@@ -113,9 +113,21 @@ export function fmtDateDMYDash(d: Date | null | undefined): string {
   return `${String(d.getUTCDate()).padStart(2, '0')}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${d.getUTCFullYear()}`;
 }
 
-/** 乘客姓名 LASTNAME/FIRSTNAME（与 orders.export.ts 同款拆分）*/
+/**
+ * 乘客姓名 LASTNAME/FIRSTNAME（与 orders.export.ts 同款拆分）。
+ * 拆分字段里可能残留护照逗号格式（源 fullName "WEI, HAIYANG" 按空白拆名时逗号会留在姓里 →
+ * "WEI," / "HAIYANG"），先剥掉逗号与首尾空白再拼，避免产出 "WEI,/HAIYANG"。
+ * fullName 回退分支同样把首个 ", " 规范成 "/" 并去掉残留逗号。
+ */
 export function pnrName(p: { lastName: string | null; firstName: string | null; fullName: string }): string {
-  return p.lastName && p.firstName ? `${p.lastName}/${p.firstName}`.toUpperCase() : p.fullName;
+  const strip = (s: string): string => s.replace(/,/gu, '').trim();
+  if (p.lastName && p.firstName) {
+    return `${strip(p.lastName)}/${strip(p.firstName)}`.toUpperCase();
+  }
+  // 回退：护照逗号格式 "WEI, HAIYANG" → "WEI/HAIYANG"；无逗号（如中文名"李四"）原样返回
+  return p.fullName.includes(',')
+    ? p.fullName.replace(/\s*,\s*/u, '/').replace(/,/gu, '').trim()
+    : p.fullName;
 }
 
 // ── 取数 ────────────────────────────────────────────────────────────────
@@ -569,7 +581,8 @@ export function orderToVisaRows(order: OrderForTemplateExport, ctx: OrderContext
     settlePrice: ctx.settlePerPax,
     paidAmount: ctx.paidPerPax,
     balanceDue: ctx.balancePerPax,
-    chineseName: p.fullName,
+    // 与《全岗可用》模板一致：优先中文名，缺失才回退 fullName（避免中文名列显示成英文名）
+    chineseName: p.chineseName ?? p.fullName,
     name: pnrName(p),
     dateOfBirth: fmtDateDMYSlash(p.dateOfBirth),
     gender: p.gender ?? '',

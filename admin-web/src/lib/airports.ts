@@ -31,6 +31,19 @@ export function airportLabel(code: string): string {
   return a ? `${a.name} (${code})` : code;
 }
 
+/** IANA 时区 → 中文时区名。未知时区回退原始 IANA 串。 */
+const TZ_LABEL: Record<string, string> = {
+  'Asia/Ho_Chi_Minh': '越南时间',
+  'Asia/Macau': '澳门时间',
+  'Asia/Shanghai': '北京时间',
+  'Asia/Hong_Kong': '香港时间',
+  'Asia/Bangkok': '泰国时间',
+};
+
+export function tzLabel(tz: string): string {
+  return TZ_LABEL[tz] ?? tz;
+}
+
 export const CABIN_LABEL: Record<string, string> = {
   ECONOMY: '经济舱',
   PREMIUM_ECONOMY: '超级经济舱',

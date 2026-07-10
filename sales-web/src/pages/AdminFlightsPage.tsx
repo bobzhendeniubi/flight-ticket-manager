@@ -1,6 +1,6 @@
 import { FormEvent, useCallback, useEffect, useState } from 'react';
 import { api, ApiError, type AdminFlight, type CabinClass } from '../lib/api';
-import { AIRPORT_OPTIONS, CABIN_LABEL, airportLabel, formatLocalDate, formatLocalTime } from '../lib/airports';
+import { AIRPORT_OPTIONS, CABIN_LABEL, airportLabel, formatLocalDate, formatLocalTime, tzLabel } from '../lib/airports';
 import { useAuth } from '../stores/auth';
 
 interface ScheduleSeat {
@@ -256,13 +256,13 @@ function SchedulesList({
                 <div className="font-medium text-slate-900">
                   {formatLocalDate(s.departureTime, s.departureTz)} {formatLocalTime(s.departureTime, s.departureTz)}
                 </div>
-                <div className="text-xs text-slate-500">{s.departureTz}</div>
+                <div className="text-xs text-slate-500">{tzLabel(s.departureTz)}</div>
               </td>
               <td className="px-3 py-2">
                 <div className="font-medium text-slate-900">
                   {formatLocalDate(s.arrivalTime, s.arrivalTz)} {formatLocalTime(s.arrivalTime, s.arrivalTz)}
                 </div>
-                <div className="text-xs text-slate-500">{s.arrivalTz}</div>
+                <div className="text-xs text-slate-500">{tzLabel(s.arrivalTz)}</div>
               </td>
               <td className="px-3 py-2">
                 <ul className="space-y-0.5">

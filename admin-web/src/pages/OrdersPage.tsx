@@ -162,12 +162,17 @@ const TEMPLATE_LABEL: Record<OrderExportTemplate, string> = {
 
 // 签证状态复用下方 FF_STATUS_LABEL / FF_STATUS_COLOR（履约任务状态映射）
 
-// 派生「签证状态」：订单有 VISA 项时，取其 VISA_APPLICATION 履约任务状态；无签证则 null
+// 派生「签证状态」：扫描全单履约任务里的 VISA_APPLICATION（不限 item kind——签证任务常挂在
+// BUNDLE 行或首个订单项上，套餐订单没有独立 VISA 行；只看 kind==='VISA' 会漏掉套餐签证单）。
+// 无签证任务 → null（显示「—」）；有「已确认」→ CONFIRMED（已签证）；否则取首个签证任务状态。
+// 与后端 signed/unsigned 筛选同源，保证「列表所见 = 筛选所得」。
 function deriveVisaStatus(o: OrderSummary): ApiFfStatus | null {
-  const visaItem = (o.items ?? []).find((i) => i.kind === 'VISA');
-  if (!visaItem) return null;
-  const task = visaItem.fulfillmentTasks?.find((t) => t.type === 'VISA_APPLICATION');
-  return task?.status ?? 'PENDING';
+  const visaTasks = (o.items ?? []).flatMap((i) =>
+    (i.fulfillmentTasks ?? []).filter((t) => t.type === 'VISA_APPLICATION'),
+  );
+  if (visaTasks.length === 0) return null;
+  if (visaTasks.some((t) => t.status === 'CONFIRMED')) return 'CONFIRMED';
+  return visaTasks[0].status ?? 'PENDING';
 }
 
 // ── 辅助：从 OrderSummary 派生视图字段 ──────────────────────────────

@@ -1,8 +1,10 @@
 /**
- * 签证资料整日打包 · 单元测试（vitest）
+ * 签证资料合并打包 · 单元测试（vitest）
  *
- * 覆盖 0708 签证岗反馈：「同一天出发的所有订单，签证名单导出在同一张表格上，护照也一起下载」。
- *   - 合并选单口径：queryOrdersByDepartDateForVisa 按出发日选订单（FLIGHT 班次 UTC 日 / 无航班回退入住日）
+ * 覆盖签证岗反馈：「勾选若干订单，把这些订单的签证名单导出在同一张表格上，护照也一起下载」。
+ *   - 选单口径：queryOrdersByIdsForVisa 按勾选订单 id 取单（软删排除，空列表短路不查库）
+ *   - 状态过滤在 buildVisaBundleZip：被勾选但状态不合格的单跳过并在 README 点名
+ *   - 排序：sortOrdersForVisa 按「代理机构名 → 订单号」分组，直客（无代理）排最后
  *   - xlsx 含性别列，且每位乘客一行合并（跨订单）
  *   - 护照图文件名规则：{订单号}-{LASTNAME}_{FIRSTNAME}.{ext}，无图乘客缺文件但仍有行
  */
@@ -16,7 +18,8 @@ vi.mock('../../db/prisma.js', () => ({ prisma: {} }));
 import {
   buildVisaBundleXlsx,
   buildVisaBundleZip,
-  queryOrdersByDepartDateForVisa,
+  queryOrdersByIdsForVisa,
+  sortOrdersForVisa,
   visaBundleZipFilename,
 } from './orders.export-visa-bundle.js';
 import type { OrderForTemplateExport } from './orders.export-templates.js';
@@ -70,14 +73,16 @@ function pax(overrides: Record<string, unknown>): OrderForTemplateExport['passen
   } as OrderForTemplateExport['passengers'][number];
 }
 
-/** 造一张订单（一段机票 + 若干乘客）。*/
+/** 造一张订单（一段机票 + 若干乘客）。overrides 可覆盖 status / agent 等。*/
 function makeOrder(
   orderNumber: string,
   passengers: OrderForTemplateExport['passengers'],
+  overrides: Record<string, unknown> = {},
 ): OrderForTemplateExport {
   return {
     id: `id_${orderNumber}`,
     orderNumber,
+    status: 'PAID',
     agent: { companyName: '测试代理' },
     user: null,
     guestName: null,
@@ -112,6 +117,7 @@ function makeOrder(
         fulfillmentTasks: [],
       },
     ],
+    ...overrides,
   } as unknown as OrderForTemplateExport;
 }
 
@@ -190,31 +196,47 @@ describe('buildVisaBundleXlsx — 合并签证名单', () => {
   });
 });
 
-describe('queryOrdersByDepartDateForVisa — 合并选单口径', () => {
-  it('按出发日 UTC 半开区间选订单（FLIGHT 班次日 / 无航班回退入住日），排除未计数状态', async () => {
+describe('queryOrdersByIdsForVisa — 按 id 选单', () => {
+  it('按订单 id 列表取单，软删排除；状态过滤不在这里做', async () => {
     const findMany = vi.fn().mockResolvedValue([]);
     const client = { order: { findMany } } as unknown as Parameters<
-      typeof queryOrdersByDepartDateForVisa
+      typeof queryOrdersByIdsForVisa
     >[1];
 
-    await queryOrdersByDepartDateForVisa('2026-07-10', client);
+    await queryOrdersByIdsForVisa(['id_a', 'id_b'], client);
 
     expect(findMany).toHaveBeenCalledTimes(1);
     const arg = findMany.mock.calls[0][0];
-    // 状态过滤：不计入草稿/取消/退款等
-    expect(arg.where.status.in).toContain('PAID');
-    expect(arg.where.status.in).not.toContain('CANCELLED');
+    expect(arg.where.id.in).toEqual(['id_a', 'id_b']);
+    expect(arg.where.deletedAt).toBeNull();
+    // 状态过滤放到 buildVisaBundleZip，这里不加 status 条件（否则不合格单查不回来、无法在 README 点名）
+    expect(arg.where.status).toBeUndefined();
+  });
 
-    // 出发日 OR：航班班次落在 [dayStart, 次日)
-    const flightBranch = arg.where.OR[0].items.some;
-    expect(flightBranch.kind).toBe('FLIGHT');
-    expect(flightBranch.flightSchedule.departureTime.gte).toEqual(D('2026-07-10'));
-    expect(flightBranch.flightSchedule.departureTime.lt).toEqual(D('2026-07-11'));
+  it('空 id 列表 → 短路，不查库', async () => {
+    const findMany = vi.fn();
+    const client = { order: { findMany } } as unknown as Parameters<
+      typeof queryOrdersByIdsForVisa
+    >[1];
+    const res = await queryOrdersByIdsForVisa([], client);
+    expect(res).toEqual([]);
+    expect(findMany).not.toHaveBeenCalled();
+  });
+});
 
-    // 回退分支：无挂班次航班 + 占房 item 入住日 == 出发日
-    const fallback = arg.where.OR[1].AND;
-    expect(fallback[0].items.none.kind).toBe('FLIGHT');
-    expect(fallback[1].items.some.hotelCheckIn).toEqual(D('2026-07-10'));
+describe('sortOrdersForVisa — 代理→订单号分组，直客排最后', () => {
+  it('按代理机构名、再订单号排序；无代理归为一组排最后', () => {
+    const o = (num: string, company: string | null): OrderForTemplateExport =>
+      ({ orderNumber: num, agent: company ? { companyName: company } : null }) as OrderForTemplateExport;
+    const sorted = sortOrdersForVisa([
+      o('B2', '乙代理'),
+      o('D1', null), // 直客
+      o('A1', '甲代理'),
+      o('B1', '乙代理'),
+      o('C1', '甲代理'),
+    ]);
+    // 甲代理(A1,C1) → 乙代理(B1,B2) → 直客(D1)
+    expect(sorted.map((s) => s.orderNumber)).toEqual(['A1', 'C1', 'B1', 'B2', 'D1']);
   });
 });
 
@@ -234,12 +256,12 @@ describe('buildVisaBundleZip — 打包结构 + 护照文件名规则', () => {
       .spyOn(globalThis, 'fetch')
       .mockResolvedValue(new Response(new Uint8Array([1, 2, 3, 4]), { status: 200 }));
 
-    const zipBuf = await buildVisaBundleZip({ departDate: '2026-07-10' }, client);
+    const zipBuf = await buildVisaBundleZip({ orderIds: ['id_FTM2026071000001'] }, client);
     const zip = await JSZip.loadAsync(zipBuf);
     const names = Object.keys(zip.files);
 
-    // 合并签证名单 xlsx 存在
-    expect(names).toContain('签证专用_出发2026-07-10.xlsx');
+    // 合并签证名单 xlsx 存在（命名不再依赖日期）
+    expect(names).toContain('签证专用_合并名单.xlsx');
 
     // 有图乘客：文件名 = 订单号-LASTNAME_FIRSTNAME.jpg
     expect(names).toContain('FTM2026071000001-WANG_LIANBO.jpg');
@@ -248,17 +270,73 @@ describe('buildVisaBundleZip — 打包结构 + 护照文件名规则', () => {
     expect(names.some((n) => n.includes('LI_SI'))).toBe(false);
 
     // 名单里两人都在（含无图那位）
-    const xlsxEntry = zip.file('签证专用_出发2026-07-10.xlsx')!;
+    const xlsxEntry = zip.file('签证专用_合并名单.xlsx')!;
     const rows = await readVisaSheet(await xlsxEntry.async('nodebuffer'));
     expect(rows).toHaveLength(2);
     expect(rows.map((r) => r['有无护照图'])).toEqual(['有护照图', '无护照图（手工录入）']);
 
     fetchSpy.mockRestore();
   });
+
+  it('被勾选但状态不合格的单跳过、不进名单，并在 README 点名', async () => {
+    const paid = makeOrder('FTM2026071000001', [
+      pax({ id: 'a1', lastName: 'WANG', firstName: 'LIANBO', passportPhotoUrl: null }),
+    ]);
+    const cancelled = makeOrder(
+      'FTM2026071000009',
+      [pax({ id: 'z1', lastName: 'ZHAO', firstName: 'WU', passportPhotoUrl: null })],
+      { status: 'CANCELLED' },
+    );
+    const findMany = vi.fn().mockResolvedValue([paid, cancelled]);
+    const client = { order: { findMany } } as unknown as Parameters<typeof buildVisaBundleZip>[1];
+
+    const zipBuf = await buildVisaBundleZip(
+      { orderIds: ['id_FTM2026071000001', 'id_FTM2026071000009', 'id_missing'] },
+      client,
+    );
+    const zip = await JSZip.loadAsync(zipBuf);
+
+    // 名单只含合格单（1 人）
+    const rows = await readVisaSheet(
+      await zip.file('签证专用_合并名单.xlsx')!.async('nodebuffer'),
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0][NAME_HEADER]).toBe('WANG/LIANBO');
+
+    // README 点名跳过的状态不合格单 + 查不到的 id
+    const readme = await zip.file('README.txt')!.async('string');
+    expect(readme).toContain('勾选订单数：3');
+    expect(readme).toContain('已打包订单数：1');
+    expect(readme).toContain('FTM2026071000009（CANCELLED）');
+    expect(readme).toContain('id_missing');
+  });
+
+  it('合并名单按「代理→订单号」分组排序，STT 跨订单连续', async () => {
+    const orders = [
+      makeOrder('B1', [pax({ id: 'b1', lastName: 'BB', firstName: 'ONE' })], {
+        agent: { companyName: '乙代理' },
+      }),
+      makeOrder('A1', [pax({ id: 'a1', lastName: 'AA', firstName: 'ONE' })], {
+        agent: { companyName: '甲代理' },
+      }),
+    ];
+    const findMany = vi.fn().mockResolvedValue(orders);
+    const client = { order: { findMany } } as unknown as Parameters<typeof buildVisaBundleZip>[1];
+
+    const zipBuf = await buildVisaBundleZip({ orderIds: ['id_B1', 'id_A1'] }, client);
+    const zip = await JSZip.loadAsync(zipBuf);
+    const rows = await readVisaSheet(
+      await zip.file('签证专用_合并名单.xlsx')!.async('nodebuffer'),
+    );
+    // 甲代理(A1) 在前、乙代理(B1) 在后；STT 连续 1,2
+    expect(rows.map((r) => r['STT'])).toEqual(['1', '2']);
+    expect(rows.map((r) => r['代理机构'])).toEqual(['甲代理', '乙代理']);
+    expect(rows.map((r) => r[NAME_HEADER])).toEqual(['AA/ONE', 'BB/ONE']);
+  });
 });
 
 describe('visaBundleZipFilename', () => {
-  it('文件名带出发日', () => {
-    expect(visaBundleZipFilename('2026-07-10')).toBe('签证资料_出发2026-07-10.zip');
+  it('文件名带订单数（不再依赖出发日）', () => {
+    expect(visaBundleZipFilename(3)).toMatch(/^签证资料_3单_\d{8}导出\.zip$/u);
   });
 });

@@ -466,31 +466,9 @@ export function VisaDeskPage() {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('OPEN');
   // 出发日期筛选（单日 YYYY-MM-DD）；空 = 不按出发日过滤
   const [departureDate, setDepartureDate] = useState('');
-  // 「按出发日打包下载该日签证资料」入口状态（合并签证名单 xlsx + 全部护照图）
+  // 「打包下载勾选订单签证资料」入口状态（合并签证名单 xlsx + 全部护照图）
   const [bundleDownloading, setBundleDownloading] = useState(false);
   const [bundleError, setBundleError] = useState<string | null>(null);
-
-  // 打包下载该出发日全部订单的签证资料（一张合并名单 + 全部护照图）
-  const handleDownloadVisaBundle = async () => {
-    if (!token || !departureDate || bundleDownloading) return;
-    setBundleDownloading(true);
-    setBundleError(null);
-    try {
-      const blob = await api.downloadVisaBundle(token, departureDate);
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `签证资料_出发${departureDate}.zip`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
-    } catch (e: unknown) {
-      setBundleError(e instanceof ApiError ? e.message : '打包下载失败，请重试');
-    } finally {
-      setBundleDownloading(false);
-    }
-  };
 
   // ── 批量选择 / 流转状态 ─────────────────────────────────
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -570,6 +548,42 @@ export function VisaDeskPage() {
     setBatchResult(null);
   }, []);
 
+  // 勾选的任务 id → 去重后的订单 id 列表（一单可能有多条签证任务/多位乘客，去重成订单）
+  const selectedOrderIds = useMemo(
+    () =>
+      Array.from(
+        new Set(
+          tasks
+            .filter((t) => selectedIds.has(t.id))
+            .map((t) => t.item.orderId)
+            .filter((id): id is string => Boolean(id)),
+        ),
+      ),
+    [tasks, selectedIds],
+  );
+
+  // 打包下载勾选订单的签证资料（一张合并名单 + 全部护照图）
+  const handleDownloadVisaBundle = async () => {
+    if (!token || selectedOrderIds.length === 0 || bundleDownloading) return;
+    setBundleDownloading(true);
+    setBundleError(null);
+    try {
+      const blob = await api.downloadVisaBundle(token, selectedOrderIds);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `签证资料_${selectedOrderIds.length}单.zip`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e: unknown) {
+      setBundleError(e instanceof ApiError ? e.message : '打包下载失败，请重试');
+    } finally {
+      setBundleDownloading(false);
+    }
+  };
+
   const applyBatch = async () => {
     if (!token || selectedIds.size === 0) return;
     if (selectedIds.size > BATCH_LIMIT) {
@@ -648,22 +662,6 @@ export function VisaDeskPage() {
               )}
             </div>
             <p className="mt-1 text-xs text-ink-muted">按客户出发日筛选（纯签证单无航班）</p>
-            {/* 按出发日一次性打包该日全部订单的签证资料（合并名单 xlsx + 全部护照图） */}
-            <div className="mt-2">
-              <button
-                type="button"
-                className="btn-secondary py-1.5 text-xs"
-                onClick={() => void handleDownloadVisaBundle()}
-                disabled={!departureDate || bundleDownloading}
-                title={departureDate ? '打包该出发日全部订单的签证名单与护照图' : '请先选择出发日期'}
-              >
-                {bundleDownloading ? '打包中…' : '打包下载该日签证资料'}
-              </button>
-              {!departureDate && (
-                <p className="mt-1 text-xs text-ink-muted">选择出发日期后可一键打包</p>
-              )}
-              {bundleError && <p className="mt-1 text-xs text-rose-600">{bundleError}</p>}
-            </div>
           </div>
         </div>
       </section>
@@ -714,7 +712,23 @@ export function VisaDeskPage() {
             >
               清除选择
             </button>
+            <span className="text-slate-300">|</span>
+            {/* 打包下载勾选订单的签证资料（合并名单 xlsx + 全部护照图） */}
+            <button
+              type="button"
+              className="btn-secondary py-1.5"
+              onClick={() => void handleDownloadVisaBundle()}
+              disabled={selectedOrderIds.length === 0 || bundleDownloading}
+              title="打包勾选订单的签证名单与护照图（多条任务/乘客同单会自动去重）"
+            >
+              {bundleDownloading
+                ? '打包中…'
+                : `打包下载勾选订单签证资料${
+                    selectedOrderIds.length > 0 ? `（${selectedOrderIds.length}单）` : ''
+                  }`}
+            </button>
           </div>
+          {bundleError && <p className="mt-2 text-xs text-rose-600">{bundleError}</p>}
           {batchResult && (
             <div className="mt-3 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs">
               <div className="text-ink-soft">

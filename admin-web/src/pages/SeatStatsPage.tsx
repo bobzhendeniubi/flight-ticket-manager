@@ -10,7 +10,7 @@
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, ApiError, type RangeSchedule } from '../lib/api';
-import { airportLabel, CABIN_LABEL, formatLocalDate, formatLocalTime, localYmd } from '../lib/airports';
+import { airportLabel, CABIN_LABEL, formatLocalDate, formatLocalTime, localYmd, tzLabel } from '../lib/airports';
 import { useAuth } from '../stores/auth';
 import { useFlightSeats } from '../stores/flightSeats';
 
@@ -95,14 +95,17 @@ export function SeatStatsPage() {
         occupancy: totalCapacity > 0 ? totalSold / totalCapacity : 0,
       };
     });
+    // 业务上澳门（MFM）出发 = 去程，其余 = 回程；同一天内统一「先去后回」排列
+    const directionRank = (originCode: string) => (originCode === 'MFM' ? 0 : 1);
     return result.sort(
       (a, b) =>
         // 主键用含年份的本地日期 YYYY-MM-DD，跨月/跨年才不会乱序（formatLocalDate 无年份）
         localYmd(a.departureTime, a.departureTz).localeCompare(
           localYmd(b.departureTime, b.departureTz),
         ) ||
-        a.flightNumber.localeCompare(b.flightNumber) ||
-        a.departureTime.localeCompare(b.departureTime),
+        directionRank(a.origin) - directionRank(b.origin) ||
+        a.departureTime.localeCompare(b.departureTime) ||
+        a.flightNumber.localeCompare(b.flightNumber),
     );
   }, [schedules]);
 
@@ -223,7 +226,7 @@ export function SeatStatsPage() {
                         {formatLocalDate(s.departureTime, s.departureTz)}
                       </div>
                       <div className="text-xs text-ink-muted">
-                        {formatLocalTime(s.departureTime, s.departureTz)} {s.departureTz}
+                        {formatLocalTime(s.departureTime, s.departureTz)} {tzLabel(s.departureTz)}
                       </div>
                     </td>
                     <td>

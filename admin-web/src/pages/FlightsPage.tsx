@@ -1,6 +1,6 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import { api, ApiError, type AdminFlight, type BaggagePolicyInput, type CabinClass, type FareBucket, type FlightBaggagePolicy } from '../lib/api';
-import { AIRPORT_OPTIONS, CABIN_LABEL, airportLabel, formatLocalDate, formatLocalTime } from '../lib/airports';
+import { AIRPORT_OPTIONS, CABIN_LABEL, airportLabel, formatLocalDate, formatLocalTime, tzLabel } from '../lib/airports';
 import { useAuth } from '../stores/auth';
 import { useFlightSeats } from '../stores/flightSeats';
 import { NumberInput } from '../components/NumberInput';
@@ -39,10 +39,15 @@ export function FlightsPage() {
   const [expanded, setExpanded] = useState<string | null>(null);
   const [schedulesByFlight, setSchedulesByFlight] = useState<Record<string, AdminSchedule[]>>({});
   const [showNewFlight, setShowNewFlight] = useState(false);
-  const [addingScheduleFor, setAddingScheduleFor] = useState<string | null>(null);
-  const [bulkAddingFor, setBulkAddingFor] = useState<string | null>(null);
-  const [batchDeletingFor, setBatchDeletingFor] = useState<string | null>(null);
+  // 批量删除班次 / +新班次 / 批量加班次 三个内联面板互斥：同一时间全站只允许一个展开。
+  const [activePanel, setActivePanel] = useState<{ id: string; panel: 'bulkDelete' | 'addOne' | 'bulkAdd' } | null>(
+    null,
+  );
   const [baggageFor, setBaggageFor] = useState<string | null>(null);
+
+  const togglePanel = (id: string, panel: 'bulkDelete' | 'addOne' | 'bulkAdd') => {
+    setActivePanel((prev) => (prev && prev.id === id && prev.panel === panel ? null : { id, panel }));
+  };
 
   const reload = useCallback(async () => {
     if (!tokens) return;
@@ -177,7 +182,7 @@ export function FlightsPage() {
                   type="button"
                   className="btn-secondary text-sm"
                   title="按出发日区间批量删除该航班班次（已售班次自动跳过）"
-                  onClick={() => setBatchDeletingFor((prev) => (prev === f.id ? null : f.id))}
+                  onClick={() => togglePanel(f.id, 'bulkDelete')}
                 >
                   🗑️ 批量删除班次
                 </button>
@@ -186,14 +191,14 @@ export function FlightsPage() {
                     <button
                       type="button"
                       className="btn-secondary text-sm"
-                      onClick={() => setAddingScheduleFor(f.id)}
+                      onClick={() => togglePanel(f.id, 'addOne')}
                     >
                       + 新班次
                     </button>
                     <button
                       type="button"
                       className="btn-primary text-sm"
-                      onClick={() => setBulkAddingFor(f.id)}
+                      onClick={() => togglePanel(f.id, 'bulkAdd')}
                     >
                       📅 批量加班次
                     </button>
@@ -210,12 +215,12 @@ export function FlightsPage() {
               </div>
             </div>
 
-            {addingScheduleFor === f.id && (
+            {activePanel?.id === f.id && activePanel.panel === 'addOne' && (
               <NewScheduleForm
                 flight={f}
-                onCancel={() => setAddingScheduleFor(null)}
+                onCancel={() => setActivePanel(null)}
                 onCreated={async () => {
-                  setAddingScheduleFor(null);
+                  setActivePanel(null);
                   await reload();
                   if (expanded === f.id) await refreshSchedules(f.id);
                   bumpSeats();
@@ -223,12 +228,12 @@ export function FlightsPage() {
               />
             )}
 
-            {bulkAddingFor === f.id && (
+            {activePanel?.id === f.id && activePanel.panel === 'bulkAdd' && (
               <BulkScheduleForm
                 flight={f}
-                onCancel={() => setBulkAddingFor(null)}
+                onCancel={() => setActivePanel(null)}
                 onCreated={async () => {
-                  setBulkAddingFor(null);
+                  setActivePanel(null);
                   await reload();
                   if (expanded === f.id) await refreshSchedules(f.id);
                   bumpSeats();
@@ -236,16 +241,16 @@ export function FlightsPage() {
               />
             )}
 
-            {batchDeletingFor === f.id && (
+            {activePanel?.id === f.id && activePanel.panel === 'bulkDelete' && (
               <BatchDeleteScheduleForm
                 flight={f}
-                onCancel={() => setBatchDeletingFor(null)}
+                onCancel={() => setActivePanel(null)}
                 onDone={async () => {
                   await reload();
                   if (expanded === f.id) await refreshSchedules(f.id);
                   bumpSeats();
                 }}
-                onClose={() => setBatchDeletingFor(null)}
+                onClose={() => setActivePanel(null)}
               />
             )}
 
@@ -769,7 +774,7 @@ function SchedulesTable({
                     </div>
                     <div className="text-xs text-ink-muted">
                       {airportLabel(originCode)}
-                      <span className="ml-1 text-[10px] text-ink-muted/70">({s.departureTz})</span>
+                      <span className="ml-1 text-[10px] text-ink-muted/70">({tzLabel(s.departureTz)})</span>
                     </div>
                   </td>
                   <td>
@@ -778,7 +783,7 @@ function SchedulesTable({
                     </div>
                     <div className="text-xs text-ink-muted">
                       {airportLabel(destinationCode)}
-                      <span className="ml-1 text-[10px] text-ink-muted/70">({s.arrivalTz})</span>
+                      <span className="ml-1 text-[10px] text-ink-muted/70">({tzLabel(s.arrivalTz)})</span>
                     </div>
                   </td>
                   <td>
