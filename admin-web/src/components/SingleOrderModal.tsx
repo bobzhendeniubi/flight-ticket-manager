@@ -144,6 +144,25 @@ const BUNDLE_GO_DEST = 'DAD';
 /** 套餐未配置 hotelNights 且无 HOTEL 组件时的兜底晚数（与后端 bundle-nights.ts 一致）。 */
 const DEFAULT_BUNDLE_NIGHTS = 1;
 
+/** 同一航线上合并拉取多个航班班次时的并发上限，避免航班数多时一次性打爆 /flights/:id/schedules 触发限流（100/分钟）。 */
+const SCHEDULE_FETCH_CONCURRENCY = 5;
+
+/** 分批（限并发）拉取多个航班的班次并合并成一份列表；单个航班拉取失败不阻断其余航班。 */
+async function fetchSchedulesMerged(
+  token: string,
+  flightIds: string[],
+): Promise<AdminSchedule[]> {
+  const merged: AdminSchedule[] = [];
+  for (let i = 0; i < flightIds.length; i += SCHEDULE_FETCH_CONCURRENCY) {
+    const batch = flightIds.slice(i, i + SCHEDULE_FETCH_CONCURRENCY);
+    const results = await Promise.all(
+      batch.map((id) => api.listSchedules(token, id).catch(() => ({ schedules: [] as AdminSchedule[] }))),
+    );
+    merged.push(...results.flatMap((r) => r.schedules));
+  }
+  return merged;
+}
+
 /** 从 Bundle.items 取第一个 HOTEL 组件的 qty（即真实住宿晚数）；找不到返回 null。 */
 function firstHotelQty(items: ReadonlyArray<{ kind: string; qty: number }>): number | null {
   for (const it of items) {
@@ -269,6 +288,9 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const [adjustAmount, setAdjustAmount] = useState<number | null>(null);
   const [adjustReason, setAdjustReason] = useState<PriceAdjustmentReason>('DISCOUNT');
   const [adjustText, setAdjustText] = useState('');
+  // 结算价（纯前端辅助录入，不提交）：填最终想收的价，自动换算差额回填 adjustAmount，
+  // 免得每次都要自己心算「结算价 − 系统价」。留空不影响 adjustAmount 的正常手填。
+  const [settlementPrice, setSettlementPrice] = useState<number | null>(null);
 
   // ── 机票 ──
   // 单程 / 往返：往返时出港 + 回程各生成一条 FLIGHT 行（同一批出行人，人数不翻倍）。
@@ -380,15 +402,15 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       (f) => f.isActive && f.originCode === BUNDLE_GO_DEST && f.destinationCode === BUNDLE_GO_ORIGIN,
     );
     if (goFlights.length > 0) {
-      Promise.all(goFlights.map((f) => api.listSchedules(token, f.id)))
-        .then((results) => setBundleGoSchedulePool(results.flatMap((r) => r.schedules)))
+      fetchSchedulesMerged(token, goFlights.map((f) => f.id))
+        .then(setBundleGoSchedulePool)
         .catch(() => setErr('去程班次加载失败'));
     } else {
       setBundleGoSchedulePool([]);
     }
     if (retFlights.length > 0) {
-      Promise.all(retFlights.map((f) => api.listSchedules(token, f.id)))
-        .then((results) => setBundleRetSchedulePool(results.flatMap((r) => r.schedules)))
+      fetchSchedulesMerged(token, retFlights.map((f) => f.id))
+        .then(setBundleRetSchedulePool)
         .catch(() => setErr('回程班次加载失败'));
     } else {
       setBundleRetSchedulePool([]);
@@ -446,26 +468,94 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const bundle = bundles.find((b) => b.id === bundleId);
   const transfer = transfers.find((t) => t.id === transferId);
 
-  // 套餐航段自动派生：出发日期 → 去程班次（MFM→DAD，本地日期 == departDate）；
-  // 晚数 → 回程日期 → 回程班次（DAD→MFM，本地日期 == returnDate）。仅往返套餐(legs≥2)派生回程。
+  // 套餐是否往返（legs≥2）：决定要不要派生回程航段。
+  const bundleIsRoundTrip = (bundle?.legs ?? 2) >= 2;
+
+  // 同路线在飞候选航班（去程 MFM→DAD / 回程 DAD→MFM）：用于「未绑定航班号」时判断是否需运营手选。
+  const bundleGoFlights = useMemo(
+    () =>
+      kind === 'BUNDLE'
+        ? flights.filter(
+            (f) => f.isActive && f.originCode === BUNDLE_GO_ORIGIN && f.destinationCode === BUNDLE_GO_DEST,
+          )
+        : [],
+    [kind, flights],
+  );
+  const bundleRetFlights = useMemo(
+    () =>
+      kind === 'BUNDLE'
+        ? flights.filter(
+            (f) => f.isActive && f.originCode === BUNDLE_GO_DEST && f.destinationCode === BUNDLE_GO_ORIGIN,
+          )
+        : [],
+    [kind, flights],
+  );
+
+  // 该套餐去程/回程是否需要运营手选航班号：未绑定 + 同路线有 ≥2 个在飞航班时才需要。
+  const bundleGoNeedsPick = !!bundle && !bundle.outboundFlight && bundleGoFlights.length >= 2;
+  const bundleRetNeedsPick =
+    !!bundle && bundleIsRoundTrip && !bundle.returnFlight && bundleRetFlights.length >= 2;
+
+  // 去程/回程最终采用的航班号 id（唯一权威口径）：
+  //   ① 套餐已绑定航班号 → 用绑定（忽略同路线其它航班）；
+  //   ② 未绑定且仅一个候选 → 自动用该候选（不打扰运营）；
+  //   ③ 未绑定且多个候选 → 用运营手选（未选则 null，界面提示先选）；
+  //   ④ 无候选 → null（下方派生为空 → 提示无匹配班次）。
+  const bundleGoFlightIdResolved = useMemo<string | null>(() => {
+    if (!bundle) return null;
+    if (bundle.outboundFlight) return bundle.outboundFlight.id;
+    if (bundleGoFlights.length === 1) return bundleGoFlights[0].id;
+    if (bundleGoFlights.length >= 2) return bundleGoFlightId || null;
+    return null;
+  }, [bundle, bundleGoFlights, bundleGoFlightId]);
+  const bundleRetFlightIdResolved = useMemo<string | null>(() => {
+    if (!bundle || !bundleIsRoundTrip) return null;
+    if (bundle.returnFlight) return bundle.returnFlight.id;
+    if (bundleRetFlights.length === 1) return bundleRetFlights[0].id;
+    if (bundleRetFlights.length >= 2) return bundleRetFlightId || null;
+    return null;
+  }, [bundle, bundleIsRoundTrip, bundleRetFlights, bundleRetFlightId]);
+
+  // 套餐航段自动派生：出发日期 → 去程班次（已定航班号 + 本地日期 == departDate）；
+  // 晚数 → 回程日期 → 回程班次（已定航班号 + 本地日期 == returnDate）。仅往返套餐派生回程。
+  // 关键：只在池子里挑 flightId == 已定航班号 的班次，绝不盲取同路线第一班。
   const bundleLegs = useMemo(() => {
     if (!bundle || !departDate) {
       return { go: null as AdminSchedule | null, ret: null as AdminSchedule | null, returnDate: '' };
     }
-    const go =
-      bundleGoSchedulePool
-        .filter((s) => s.isActive && localYmd(s.departureTime, s.departureTz) === departDate)
-        .sort((a, b) => a.departureTime.localeCompare(b.departureTime))[0] ?? null;
-    const isRoundTrip = (bundle.legs ?? 2) >= 2;
-    const nights = resolveBundleNights(bundle.items, bundle.hotelNights);
-    const returnDate = isRoundTrip ? addDays(departDate, nights) : '';
-    const ret = isRoundTrip
-      ? bundleRetSchedulePool
-          .filter((s) => s.isActive && localYmd(s.departureTime, s.departureTz) === returnDate)
+    const go = bundleGoFlightIdResolved
+      ? bundleGoSchedulePool
+          .filter(
+            (s) =>
+              s.isActive &&
+              s.flightId === bundleGoFlightIdResolved &&
+              localYmd(s.departureTime, s.departureTz) === departDate,
+          )
           .sort((a, b) => a.departureTime.localeCompare(b.departureTime))[0] ?? null
       : null;
+    const nights = resolveBundleNights(bundle.items, bundle.hotelNights);
+    const returnDate = bundleIsRoundTrip ? addDays(departDate, nights) : '';
+    const ret =
+      bundleIsRoundTrip && bundleRetFlightIdResolved
+        ? bundleRetSchedulePool
+            .filter(
+              (s) =>
+                s.isActive &&
+                s.flightId === bundleRetFlightIdResolved &&
+                localYmd(s.departureTime, s.departureTz) === returnDate,
+            )
+            .sort((a, b) => a.departureTime.localeCompare(b.departureTime))[0] ?? null
+        : null;
     return { go, ret, returnDate };
-  }, [bundle, departDate, bundleGoSchedulePool, bundleRetSchedulePool]);
+  }, [
+    bundle,
+    departDate,
+    bundleIsRoundTrip,
+    bundleGoSchedulePool,
+    bundleRetSchedulePool,
+    bundleGoFlightIdResolved,
+    bundleRetFlightIdResolved,
+  ]);
 
   const filteredAgents = useMemo(() => {
     const q = agentSearch.trim().toLowerCase();
@@ -900,6 +990,15 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     adultCount, childCount, infantCount, singleCount, businessCount, selfProvidedVisa,
     transferId, transferQty, validPassengers.length,
   ]);
+
+  // 系统价试算完成/刷新后，若运营已经填过「结算价」，用新的系统价重新换算调整金额，
+  // 避免系统价试算完才发现结算价对应的调整额是按旧系统价算的。
+  useEffect(() => {
+    if (settlementPrice === null || quoteTotal === null) return;
+    setAdjustAmount(Math.round(settlementPrice - quoteTotal));
+    // 只在系统价变化时重新换算；结算价变化本身已经在输入框 onChange 里同步过了。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [quoteTotal]);
 
   async function submit(): Promise<void> {
     if (!token || submitting) return;
@@ -1431,8 +1530,30 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                       <p className="text-[11px] text-slate-400">选择套餐和出发日期后自动派生航段…</p>
                     ) : (
                       <>
-                        {/* 去程 */}
-                        {bundleLegs.go ? (
+                        {/* 去程航班号手选：套餐未绑定航班号且该路线有多个在飞航班时，必须由运营指定，避免默认取第一班 */}
+                        {bundleGoNeedsPick && (
+                          <label className="text-[11px] text-slate-500">
+                            去程航班号（该路线有多个航班，请选择）
+                            <select
+                              className={inputCls}
+                              value={bundleGoFlightId}
+                              onChange={(e) => setBundleGoFlightId(e.target.value)}
+                            >
+                              <option value="">选择去程航班…</option>
+                              {bundleGoFlights.map((f) => (
+                                <option key={f.id} value={f.id}>
+                                  {f.flightNumber} {f.originCode}→{f.destinationCode}
+                                </option>
+                              ))}
+                            </select>
+                          </label>
+                        )}
+                        {/* 去程班次状态 */}
+                        {bundleGoNeedsPick && !bundleGoFlightId ? (
+                          <div className="text-[11px] text-amber-600">
+                            该路线有多个航班号，请先选择去程航班号
+                          </div>
+                        ) : bundleLegs.go ? (
                           <div className="flex items-center gap-2 text-xs text-slate-700">
                             <span className="rounded bg-brand-50 px-1.5 py-0.5 text-[11px] font-medium text-brand">去程</span>
                             <span className="font-medium">{BUNDLE_GO_ORIGIN}→{BUNDLE_GO_DEST}</span>
@@ -1447,21 +1568,46 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                           </div>
                         )}
                         {/* 回程（仅往返套餐） */}
-                        {(bundle.legs ?? 2) >= 2 &&
-                          (bundleLegs.ret ? (
-                            <div className="flex items-center gap-2 text-xs text-slate-700">
-                              <span className="rounded bg-brand-50 px-1.5 py-0.5 text-[11px] font-medium text-brand">回程</span>
-                              <span className="font-medium">{BUNDLE_GO_DEST}→{BUNDLE_GO_ORIGIN}</span>
-                              <span className="text-slate-500">
-                                {localYmd(bundleLegs.ret.departureTime, bundleLegs.ret.departureTz)}{' '}
-                                {formatLocalTime(bundleLegs.ret.departureTime, bundleLegs.ret.departureTz)}
-                              </span>
-                            </div>
-                          ) : (
-                            <div className="text-[11px] text-rose-600">
-                              ⚠ 回程日期 {bundleLegs.returnDate} 没有匹配的回程班次（{BUNDLE_GO_DEST}→{BUNDLE_GO_ORIGIN}），请核对套餐晚数/排班
-                            </div>
-                          ))}
+                        {bundleIsRoundTrip && (
+                          <>
+                            {/* 回程航班号手选：同去程逻辑 */}
+                            {bundleRetNeedsPick && (
+                              <label className="text-[11px] text-slate-500">
+                                回程航班号（该路线有多个航班，请选择）
+                                <select
+                                  className={inputCls}
+                                  value={bundleRetFlightId}
+                                  onChange={(e) => setBundleRetFlightId(e.target.value)}
+                                >
+                                  <option value="">选择回程航班…</option>
+                                  {bundleRetFlights.map((f) => (
+                                    <option key={f.id} value={f.id}>
+                                      {f.flightNumber} {f.originCode}→{f.destinationCode}
+                                    </option>
+                                  ))}
+                                </select>
+                              </label>
+                            )}
+                            {bundleRetNeedsPick && !bundleRetFlightId ? (
+                              <div className="text-[11px] text-amber-600">
+                                该路线有多个航班号，请先选择回程航班号
+                              </div>
+                            ) : bundleLegs.ret ? (
+                              <div className="flex items-center gap-2 text-xs text-slate-700">
+                                <span className="rounded bg-brand-50 px-1.5 py-0.5 text-[11px] font-medium text-brand">回程</span>
+                                <span className="font-medium">{BUNDLE_GO_DEST}→{BUNDLE_GO_ORIGIN}</span>
+                                <span className="text-slate-500">
+                                  {localYmd(bundleLegs.ret.departureTime, bundleLegs.ret.departureTz)}{' '}
+                                  {formatLocalTime(bundleLegs.ret.departureTime, bundleLegs.ret.departureTz)}
+                                </span>
+                              </div>
+                            ) : (
+                              <div className="text-[11px] text-rose-600">
+                                ⚠ 回程日期 {bundleLegs.returnDate} 没有匹配的回程班次（{BUNDLE_GO_DEST}→{BUNDLE_GO_ORIGIN}），请核对套餐晚数/排班
+                              </div>
+                            )}
+                          </>
+                        )}
                       </>
                     )}
                   </div>
@@ -1931,6 +2077,23 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                 </div>
                 <p className="mb-1.5 text-[11px] text-slate-400">
                   升舱/单人入住请用套餐加购选项（占真实库存）；换酒店走订单详情「换酒店」；签证改多签请更换签证产品——这些操作不要走调价，否则相关岗位看不到。
+                </p>
+                <label className="mb-2 block text-xs text-slate-500">
+                  结算价（¥，可选：直接填最终收款价）
+                  <NumberInput
+                    className={inputCls}
+                    value={settlementPrice}
+                    onChange={(n) => {
+                      setSettlementPrice(n);
+                      if (n === null || quoteTotal === null) return;
+                      setAdjustAmount(Math.round(n - quoteTotal));
+                    }}
+                    allowNegative
+                    placeholder={quoteTotal !== null ? `如 ${Math.round(quoteTotal)}` : '如 1500'}
+                  />
+                </label>
+                <p className="mb-1.5 text-[11px] text-slate-400">
+                  填这里会自动算出与系统价的差额，回填到下方「调整金额」；留空不影响手动填调整金额。
                 </p>
                 <div className="grid gap-2 md:grid-cols-3">
                   <label className="text-xs text-slate-500">

@@ -549,6 +549,13 @@ export function OrdersPage() {
         failureCount: res.failureCount,
         failures: res.results.filter((r) => !r.success).map((r) => ({ id: r.id, error: r.error })),
       });
+      if (res.failureCount > 0) {
+        window.alert(
+          `有 ${res.failureCount} 条订单未能变更为「${STATUS_LABEL[bulkStatus as OrderStatus]}」。\n` +
+          `原因通常是状态机不允许该跳转（例如"待支付"须先变为"已支付"才能到"已出票"）。\n` +
+          `如确需强制变更，请勾选「强制」后重试。具体失败原因见下方列表。`,
+        );
+      }
       if (res.failureCount === 0) {
         setSelectedIds(new Set());
         setBulkStatus('');
@@ -603,10 +610,12 @@ export function OrdersPage() {
   };
 
   // 票务开票快捷导出 — 出发日=某日 + 航段 + 开票状态 → 一键调《票务专用》(ticketing) 三模板导出（航司 PNR 27 列）。
+  // 有勾选订单时，优先只导勾选的这批（后端以 id 集合为准，忽略下面的出发日/航段/开票状态等筛选）。
   const handleTicketingQuickExport = async () => {
     if (!tokens?.accessToken) return;
-    if (!tkDate) {
-      alert('请先选择出发日期');
+    const selected = Array.from(selectedIds);
+    if (selected.length === 0 && !tkDate) {
+      alert('请先选择出发日期，或先勾选要导出的订单');
       return;
     }
     setTkExporting(true);
@@ -614,17 +623,18 @@ export function OrdersPage() {
       const trimmedFlightNumber = tkFlightNumber.trim();
       const blob = await api.downloadOrdersTemplateExport(tokens.accessToken, {
         template: 'ticketing',
-        travelFrom: tkDate, // 出发日当天（起=止）
-        travelTo: tkDate,
+        travelFrom: tkDate || undefined, // 出发日当天（起=止）
+        travelTo: tkDate || undefined,
         invoiceLeg: tkLeg, // 去程 / 回程
         invoiced: tkInvoiced, // 未开 / 已开
         flightNumber: trimmedFlightNumber || undefined, // 航班号（选填，缩小同日多航班范围）
         kind: tkKind || undefined, // 订单类型（选填：机票单/套餐单，避免同航班混单）
+        orderIds: selected.length > 0 ? selected : undefined,
       });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `订单导出-${TEMPLATE_LABEL.ticketing}-${tkDate}.xlsx`;
+      a.download = `订单导出-${TEMPLATE_LABEL.ticketing}-${tkDate || new Date().toISOString().slice(0, 10)}.xlsx`;
       document.body.appendChild(a);
       a.click();
       a.remove();
@@ -824,8 +834,8 @@ export function OrdersPage() {
           )}
           <p className="w-full text-right text-xs text-ink-muted">
             {selectedIds.size > 0
-              ? `已勾选 ${selectedIds.size} 条：两个导出都只导勾选的这些订单（忽略上方筛选）；取消勾选恢复按筛选导出`
-              : '《导出》按上方「下单时间」周期（佣金/提成/客户统计）；《全岗总表》按「出行日期」区间（综合台账，不填=全部）'}
+              ? `已勾选 ${selectedIds.size} 条：三个导出都只导勾选的这些订单（忽略上方筛选）；取消勾选恢复按筛选导出`
+              : '《导出》按上方「下单时间」周期（佣金/提成/客户统计）；《全岗总表》按「出行日期」区间（综合台账，不填=全部）；《票务开票导出》按出发日/航段/开票状态'}
           </p>
           {/* 票务开票快捷入口：某日某航段需开票订单一键导《票务专用》（航司 PNR） */}
           {showTicketingQuick && (
@@ -887,15 +897,25 @@ export function OrdersPage() {
                 <button
                   type="button"
                   className="btn-primary text-sm"
-                  disabled={!tkDate || tkExporting}
+                  disabled={(!tkDate && selectedIds.size === 0) || tkExporting}
                   onClick={() => void handleTicketingQuickExport()}
-                  title="导出某日某航段需开票的订单（航司 PNR 模板）"
+                  title={
+                    selectedIds.size > 0
+                      ? `只导出已勾选的 ${selectedIds.size} 条订单（航司 PNR 模板，忽略下方出发日/航段等筛选）`
+                      : '导出某日某航段需开票的订单（航司 PNR 模板）'
+                  }
                 >
-                  {tkExporting ? '导出中…' : '📤 一键导出'}
+                  {tkExporting
+                    ? '导出中…'
+                    : selectedIds.size > 0
+                      ? `📤 一键导出（已选 ${selectedIds.size} 条）`
+                      : '📤 一键导出'}
                 </button>
               </div>
               <p className="mt-1.5 text-xs text-ink-muted">
-                按「出发日期」当天 + 所选航段 + 开票状态导出《票务专用》（航司 PNR）模板，可再按航班号/订单类型缩小范围。
+                {selectedIds.size > 0
+                  ? `已勾选 ${selectedIds.size} 条：优先只导出勾选的订单（忽略下方出发日/航段/开票状态等筛选）；取消勾选恢复按筛选导出。`
+                  : '按「出发日期」当天 + 所选航段 + 开票状态导出《票务专用》（航司 PNR）模板，可再按航班号/订单类型缩小范围。'}
               </p>
             </div>
           )}
@@ -982,23 +1002,45 @@ export function OrdersPage() {
           </div>
           <div>
             <label className="label">出行日期 · 起始</label>
-            <input
-              type="date"
-              className="input"
-              value={travelFrom}
-              onChange={(e) => setTravelFrom(e.target.value)}
-              title="按乘客实际出行日期筛选（与下单时间不同）"
-            />
+            <div className="flex items-center gap-1">
+              <input
+                type="date"
+                className="input"
+                value={travelFrom}
+                onChange={(e) => setTravelFrom(e.target.value)}
+                title="按乘客实际出行日期筛选（与下单时间不同）"
+              />
+              <button
+                type="button"
+                className="btn-ghost shrink-0 whitespace-nowrap px-2 text-sm"
+                disabled={!travelFrom}
+                onClick={() => setTravelTo(travelFrom)}
+                title="只填一个日期框会查出一整段区间；点击把「截止」也设为同一天，只看这一天"
+              >
+                仅当天
+              </button>
+            </div>
           </div>
           <div>
             <label className="label">出行日期 · 截止</label>
-            <input
-              type="date"
-              className="input"
-              value={travelTo}
-              onChange={(e) => setTravelTo(e.target.value)}
-              title="按乘客实际出行日期筛选（与下单时间不同）"
-            />
+            <div className="flex items-center gap-1">
+              <input
+                type="date"
+                className="input"
+                value={travelTo}
+                onChange={(e) => setTravelTo(e.target.value)}
+                title="按乘客实际出行日期筛选（与下单时间不同）"
+              />
+              <button
+                type="button"
+                className="btn-ghost shrink-0 whitespace-nowrap px-2 text-sm"
+                disabled={!travelTo}
+                onClick={() => setTravelFrom(travelTo)}
+                title="只填一个日期框会查出一整段区间；点击把「起始」也设为同一天，只看这一天"
+              >
+                仅当天
+              </button>
+            </div>
           </div>
           <div>
             <label className="label">接单状态</label>
@@ -1193,19 +1235,34 @@ export function OrdersPage() {
             </button>
           </div>
           {bulkResult && (
-            <div className="mt-3 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs">
-              <div className="text-ink-soft">
+            <div
+              className={`mt-3 rounded-lg border-2 px-4 py-3 text-sm ${
+                bulkResult.failureCount > 0
+                  ? 'border-rose-300 bg-rose-50'
+                  : 'border-emerald-200 bg-emerald-50'
+              }`}
+            >
+              <div
+                className={`font-semibold ${
+                  bulkResult.failureCount > 0 ? 'text-rose-700' : 'text-emerald-700'
+                }`}
+              >
                 ✓ 成功 {bulkResult.successCount} 条
                 {bulkResult.failureCount > 0 && (
-                  <span className="ml-3 text-rose-600">✗ 失败 {bulkResult.failureCount} 条</span>
+                  <span className="ml-3">✗ 失败 {bulkResult.failureCount} 条</span>
                 )}
               </div>
+              {bulkResult.failureCount > 0 && (
+                <div className="mt-1 text-xs text-rose-700">
+                  失败订单未按状态机允许路径流转（例如"待支付"须先变为"已支付"才能到"已出票"）。如需强制变更，请勾选上方「强制」后重试。
+                </div>
+              )}
               {bulkResult.failures.length > 0 && (
-                <ul className="mt-1 max-h-32 overflow-auto text-red-600">
+                <ul className="mt-2 max-h-40 overflow-auto rounded border border-rose-200 bg-white px-2 py-1.5 text-red-600">
                   {bulkResult.failures.map((f) => {
                     const orderNo = orders.find((o) => o.id === f.id)?.orderNumber ?? `${f.id.slice(0, 8)}…`;
                     return (
-                      <li key={f.id} className="text-[11px]">
+                      <li key={f.id} className="py-0.5 text-[11px]">
                         · <span className="font-mono">{orderNo}</span>：{f.error ?? '未知原因'}
                       </li>
                     );
