@@ -13,6 +13,7 @@ import {
   getCheapestRoundTripEconomyCny,
   computeBundleOriginalAllInCny,
   computeBundleOriginalPerPaxCny,
+  type BundleFlightBinding,
 } from './bundle-pricing.js';
 import type {
   BundleItemInput,
@@ -28,6 +29,14 @@ import type {
 
 /** hotelNights 的 DB/zod 取值上限（schema: int 1..30）。 */
 const HOTEL_NIGHTS_MAX = 30;
+
+/**
+ * 单房差 / 儿童差价的默认值（须与 schema.prisma 的 @default 一致，也与前端表单占位符
+ * 「留空 = 用默认 ¥80/¥30」承诺一致）。更新已存在的行时 DB @default 只在 INSERT 生效，
+ * 故 updateBundle 里运营显式清空（传 null）需由服务端主动写回这两个默认值。
+ */
+const DEFAULT_SINGLE_SUPPLEMENT_CNY_PER_NIGHT = 80;
+const DEFAULT_CHILD_SEAT_DISCOUNT_CNY_PER_PERSON = 30;
 
 /**
  * 写入不变量：套餐 items 含 HOTEL 组件时，hotelNights 必须等于该 HOTEL 组件的 qty
@@ -534,9 +543,31 @@ export class ProductsService {
       include: BUNDLE_ROOM_INCLUDE,
     });
     const ratings = await this.reviews.getAggregates(ProductReviewType.BUNDLE, rows.map((r) => r.id));
-    // 当前最低来回机票（缓存），喂给每个套餐算「原价（含机票）」，供后台目标价↔折扣% 换算。
-    const flightRef = await getCheapestRoundTripEconomyCny(new Date());
-    return rows.map((b) => serializeBundle(b, ratings.get(b.id) ?? ZERO_RATING, flightRef));
+    // 当前最低来回机票，喂给每个套餐算「原价（含机票）」，供后台目标价↔折扣% 换算。
+    // 按 (去程航班, 回程航班) 组合去重后各查一次：绑了航班的用该航班班次价，未绑的按航线兜底。
+    // 业务航线有限（通常 1~3 种组合），既避免 N+1 逐套餐查库，也不让全局最低价污染所有套餐起价。
+    const now = new Date();
+    const bindingKey = (ob: string | null, rt: string | null) => `${ob ?? 'route'}|${rt ?? 'route'}`;
+    const uniqueBindings = new Map<string, BundleFlightBinding>();
+    for (const b of rows) {
+      const key = bindingKey(b.outboundFlightId, b.returnFlightId);
+      if (!uniqueBindings.has(key)) {
+        uniqueBindings.set(key, { outboundFlightId: b.outboundFlightId, returnFlightId: b.returnFlightId });
+      }
+    }
+    const flightRefByKey = new Map<string, number | null>();
+    await Promise.all(
+      [...uniqueBindings].map(async ([key, binding]) => {
+        flightRefByKey.set(key, await getCheapestRoundTripEconomyCny(now, binding));
+      }),
+    );
+    return rows.map((b) =>
+      serializeBundle(
+        b,
+        ratings.get(b.id) ?? ZERO_RATING,
+        flightRefByKey.get(bindingKey(b.outboundFlightId, b.returnFlightId)) ?? null,
+      ),
+    );
   }
 
   async getBundle(id: string) {
@@ -546,7 +577,11 @@ export class ProductsService {
     });
     if (!b) throw new NotFoundError('套餐不存在');
     const ratings = await this.reviews.getAggregates(ProductReviewType.BUNDLE, [id]);
-    const flightRef = await getCheapestRoundTripEconomyCny(new Date());
+    // 机票参考价按本套餐绑定的去/回程航班取价（未绑则按航线兜底），不再共用全局最低价。
+    const flightRef = await getCheapestRoundTripEconomyCny(new Date(), {
+      outboundFlightId: b.outboundFlightId,
+      returnFlightId: b.returnFlightId,
+    });
     return serializeBundle(b, ratings.get(id) ?? ZERO_RATING, flightRef);
   }
 
@@ -615,9 +650,12 @@ export class ProductsService {
         include: BUNDLE_ROOM_INCLUDE,
       }),
     );
-    // 与 getBundle/listBundles 同口径喂机票参考价，保证创建响应里的 originalPerPaxCny/originalAllInCny
-    // 与随后 GET 到的值一致（不留「刚创建时是 0，下次 GET 才对」的窗口）。
-    const flightRef = await getCheapestRoundTripEconomyCny(new Date());
+    // 与 getBundle/listBundles 同口径喂机票参考价（按本套餐绑定航班取价），保证创建响应里的
+    // originalPerPaxCny/originalAllInCny 与随后 GET 到的值一致（不留「刚创建时是 0，下次 GET 才对」窗口）。
+    const flightRef = await getCheapestRoundTripEconomyCny(new Date(), {
+      outboundFlightId: b.outboundFlightId,
+      returnFlightId: b.returnFlightId,
+    });
     return serializeBundle(b, ZERO_RATING, flightRef);
   }
 
@@ -657,16 +695,21 @@ export class ProductsService {
       const derived = deriveHotelNightsFromItems(body.items);
       if (derived !== undefined) data.hotelNights = derived;
     }
-    // 用 != null（排除 null 与 undefined）：列非空有默认，前端"留空=用默认"会传 null，
-    // 不能把 null 写进 Prisma（会报错）。null/省略一律视为"不改"，与 createBundle 的 != null 一致。
-    if (body.singleSupplementCnyPerNight != null) {
-      data.singleSupplementCnyPerNight = body.singleSupplementCnyPerNight;
+    // 单房差 / 儿童差价：用 !== undefined 区分「请求没带这个字段（不改）」与「显式传 null（运营清空
+    // 输入框，前端占位符承诺"留空=用默认"）」。显式 null → 写回文档承诺的默认值（列非空、不能落 null，
+    // 且 DB @default 只在 INSERT 生效，UPDATE 不会自动回落）。这兑现了前端「留空=用默认 ¥80/¥30」。
+    if (body.singleSupplementCnyPerNight !== undefined) {
+      data.singleSupplementCnyPerNight =
+        body.singleSupplementCnyPerNight ?? DEFAULT_SINGLE_SUPPLEMENT_CNY_PER_NIGHT;
     }
+    // 升舱商务：保持 != null 原口径不变（省略/null=不改）——见 createBundle 处 0702 反馈注释，
+    // 「留空=不提供」由前端显式发 0 达成，本字段不随本次单房差/儿童差价改动。
     if (body.businessUpgradeCnyPerLeg != null) {
       data.businessUpgradeCnyPerLeg = body.businessUpgradeCnyPerLeg;
     }
-    if (body.childSeatDiscountCnyPerPerson != null) {
-      data.childSeatDiscountCnyPerPerson = body.childSeatDiscountCnyPerPerson;
+    if (body.childSeatDiscountCnyPerPerson !== undefined) {
+      data.childSeatDiscountCnyPerPerson =
+        body.childSeatDiscountCnyPerPerson ?? DEFAULT_CHILD_SEAT_DISCOUNT_CNY_PER_PERSON;
     }
     if (body.infantPriceCny != null) {
       data.infantPriceCny = body.infantPriceCny;
@@ -688,8 +731,11 @@ export class ProductsService {
       data,
       include: BUNDLE_ROOM_INCLUDE,
     });
-    // 与 getBundle/listBundles/createBundle 同口径喂机票参考价（见 createBundle 同款注释）。
-    const flightRef = await getCheapestRoundTripEconomyCny(new Date());
+    // 与 getBundle/listBundles/createBundle 同口径喂机票参考价（按更新后生效的绑定航班取价）。
+    const flightRef = await getCheapestRoundTripEconomyCny(new Date(), {
+      outboundFlightId: b.outboundFlightId,
+      returnFlightId: b.returnFlightId,
+    });
     return serializeBundle(b, ZERO_RATING, flightRef);
   }
 

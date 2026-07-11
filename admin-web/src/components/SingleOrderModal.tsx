@@ -312,10 +312,14 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const [businessCount, setBusinessCount] = useState<number | null>(0);
   // 客人自备签证（套餐含签证时可勾选；勾选后服务端扣减 bundle.selfVisaDeductCny）
   const [selfProvidedVisa, setSelfProvidedVisa] = useState(false);
-  // 套餐机票航段：不再手选，按「出发日期」自动派生。
-  // 预拉两个方向的全部班次池，再按本地日期匹配去程（MFM→DAD）/回程（DAD→MFM）。
+  // 套餐机票航段：优先按套餐绑定的航班号；未绑定且同路线仅一个在飞航班时自动派生；
+  // 未绑定且同路线有多个在飞航班时，由运营手选航班号（下方两个状态）。
+  // 均先预拉两个方向的全部班次池，再按航班号 + 本地出发日期匹配去程（MFM→DAD）/回程（DAD→MFM）。
   const [bundleGoSchedulePool, setBundleGoSchedulePool] = useState<AdminSchedule[]>([]);
   const [bundleRetSchedulePool, setBundleRetSchedulePool] = useState<AdminSchedule[]>([]);
+  // 运营手选的去程/回程航班号（仅「未绑定 + 多个候选航班」场景需要；空 = 未选）。
+  const [bundleGoFlightId, setBundleGoFlightId] = useState('');
+  const [bundleRetFlightId, setBundleRetFlightId] = useState('');
 
   // ── 接送 ──
   const [transfers, setTransfers] = useState<Transfer[]>([]);
@@ -360,35 +364,42 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
 
   // 套餐机票航段：选了套餐 + 航班列表就绪后，预拉两个方向（去程 MFM→DAD / 回程 DAD→MFM）
   // 的全部班次池；后续按「出发日期」本地日期匹配派生具体班次。
+  // 注意：同一航线上可能有多家航空公司的在飞航班，必须合并所有匹配航班的班次，
+  // 不能只取第一条命中航班——否则该航线上其余航空公司的班次会被漏查，
+  // 出现"某月份明明有班次却提示没有匹配班次"的假阴性（取决于航班列表返回顺序）。
   useEffect(() => {
     if (!token || kind !== 'BUNDLE' || !bundleId || flights.length === 0) {
       setBundleGoSchedulePool([]);
       setBundleRetSchedulePool([]);
       return;
     }
-    const goFlight = flights.find(
+    const goFlights = flights.filter(
       (f) => f.isActive && f.originCode === BUNDLE_GO_ORIGIN && f.destinationCode === BUNDLE_GO_DEST,
     );
-    const retFlight = flights.find(
+    const retFlights = flights.filter(
       (f) => f.isActive && f.originCode === BUNDLE_GO_DEST && f.destinationCode === BUNDLE_GO_ORIGIN,
     );
-    if (goFlight) {
-      api
-        .listSchedules(token, goFlight.id)
-        .then((r) => setBundleGoSchedulePool(r.schedules))
+    if (goFlights.length > 0) {
+      Promise.all(goFlights.map((f) => api.listSchedules(token, f.id)))
+        .then((results) => setBundleGoSchedulePool(results.flatMap((r) => r.schedules)))
         .catch(() => setErr('去程班次加载失败'));
     } else {
       setBundleGoSchedulePool([]);
     }
-    if (retFlight) {
-      api
-        .listSchedules(token, retFlight.id)
-        .then((r) => setBundleRetSchedulePool(r.schedules))
+    if (retFlights.length > 0) {
+      Promise.all(retFlights.map((f) => api.listSchedules(token, f.id)))
+        .then((results) => setBundleRetSchedulePool(results.flatMap((r) => r.schedules)))
         .catch(() => setErr('回程班次加载失败'));
     } else {
       setBundleRetSchedulePool([]);
     }
   }, [token, kind, bundleId, flights]);
+
+  // 切换套餐后清空运营手选的航班号：不同套餐的绑定/候选航班不同，避免带入上一套餐的选择。
+  useEffect(() => {
+    setBundleGoFlightId('');
+    setBundleRetFlightId('');
+  }, [bundleId]);
 
   // 酒店列表
   useEffect(() => {

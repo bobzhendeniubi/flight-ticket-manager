@@ -40,6 +40,11 @@ import {
   serializeVisa,
 } from './products.service.js';
 import type { BundleItemInput } from './products.schemas.js';
+import {
+  getCheapestRoundTripEconomyCny,
+  resetCheapestFlightRefCache,
+} from './bundle-pricing.js';
+import { BUNDLE_ROUTE } from './bundle-availability.service.js';
 
 describe('deriveHotelNightsFromItems · 套餐写入不变量', () => {
   it('items 含 HOTEL 组件 → hotelNights = HOTEL.qty（真实晚数）', () => {
@@ -786,6 +791,171 @@ describe('ProductsService · businessUpgradeCnyPerLeg 默认值（0702 反馈：
     const result = await service.updateBundle('bundle-1', { businessUpgradeCnyPerLeg: 0 });
 
     expect(result.businessUpgradeCnyPerLeg).toBe(0);
+  });
+});
+
+describe('ProductsService · updateBundle 单房差/儿童差价「留空=用默认」写回（编辑路径修复）', () => {
+  // 前端表单占位符承诺「留空 = 用默认 ¥80（单房差）/ ¥30（儿童差价）」，清空输入框时前端显式发 null。
+  // 更新已存在行时 DB @default 不生效，旧逻辑把 null 当「不改」→ 默认功能形同虚设。修复：显式 null → 写回默认。
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockPrisma.flightSeatClass.findMany.mockResolvedValue([]);
+  });
+
+  function mockUpdateReturns() {
+    mockPrisma.bundle.findUnique.mockResolvedValueOnce({
+      id: 'bundle-1',
+      hotelRoomTypeId: null,
+      outboundFlightId: null,
+      returnFlightId: null,
+    });
+    mockPrisma.bundle.update.mockImplementationOnce(async ({ data }: { data: Record<string, unknown> }) => ({
+      id: 'bundle-1',
+      code: 'B0001',
+      name: '既有套餐',
+      tagline: null,
+      serviceNotes: null,
+      emoji: null,
+      photo: null,
+      items: [],
+      flightPax: 1,
+      discountPct: 0,
+      groundDiscount: new Prisma.Decimal(0),
+      suitableFor: null,
+      hotelRoomTypeId: null,
+      hotelNights: null,
+      outboundFlightId: null,
+      returnFlightId: null,
+      // 落库现值故意设成非默认值（运营此前改过），用来验证清空后是否真的回落默认
+      singleSupplementCnyPerNight: data.singleSupplementCnyPerNight ?? 150,
+      businessUpgradeCnyPerLeg: 0,
+      childSeatDiscountCnyPerPerson: data.childSeatDiscountCnyPerPerson ?? 99,
+      infantPriceCny: 0,
+      selfVisaDeductCny: 0,
+      legs: 2,
+      blackoutDates: [],
+      defaultDepartDate: null,
+      soldCount: 0,
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      hotelRoomType: null,
+      outboundFlight: null,
+      returnFlight: null,
+    }));
+  }
+
+  it('显式传 null（运营清空单房差输入框）→ 写回默认 ¥80', async () => {
+    mockUpdateReturns();
+    const service = new ProductsService();
+    await service.updateBundle('bundle-1', { singleSupplementCnyPerNight: null });
+    expect(mockPrisma.bundle.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ singleSupplementCnyPerNight: 80 }) }),
+    );
+  });
+
+  it('显式传 null（运营清空儿童差价输入框）→ 写回默认 ¥30', async () => {
+    mockUpdateReturns();
+    const service = new ProductsService();
+    await service.updateBundle('bundle-1', { childSeatDiscountCnyPerPerson: null });
+    expect(mockPrisma.bundle.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ childSeatDiscountCnyPerPerson: 30 }) }),
+    );
+  });
+
+  it('显式传数字 → 原样写入（不回落默认）', async () => {
+    mockUpdateReturns();
+    const service = new ProductsService();
+    await service.updateBundle('bundle-1', {
+      singleSupplementCnyPerNight: 120,
+      childSeatDiscountCnyPerPerson: 45,
+    });
+    expect(mockPrisma.bundle.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          singleSupplementCnyPerNight: 120,
+          childSeatDiscountCnyPerPerson: 45,
+        }),
+      }),
+    );
+  });
+
+  it('请求未带这两个字段（undefined）→ 不写这两个键（保持现值，不强刷默认）', async () => {
+    mockUpdateReturns();
+    const service = new ProductsService();
+    await service.updateBundle('bundle-1', { tagline: '只改文案' });
+    expect(mockPrisma.bundle.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.not.objectContaining({ singleSupplementCnyPerNight: expect.anything() }),
+      }),
+    );
+    expect(mockPrisma.bundle.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.not.objectContaining({ childSeatDiscountCnyPerPerson: expect.anything() }),
+      }),
+    );
+  });
+});
+
+describe('getCheapestRoundTripEconomyCny · 机票参考价范围限定（按航线/绑定航班过滤）', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetCheapestFlightRefCache();
+  });
+
+  it('未绑航班 → 按套餐固定航线过滤（去程 origin→destination，回程 destination→origin），绝不扫全库', async () => {
+    // 去程最低 700、回程最低 750 → 来回 = 1450（两段各自估价相加）
+    mockPrisma.flightSeatClass.findMany
+      .mockResolvedValueOnce([{ basePrice: new Prisma.Decimal(700), fareBuckets: null }])
+      .mockResolvedValueOnce([{ basePrice: new Prisma.Decimal(750), fareBuckets: null }]);
+
+    const value = await getCheapestRoundTripEconomyCny(new Date());
+
+    expect(value).toBe(1450);
+    const calls = mockPrisma.flightSeatClass.findMany.mock.calls;
+    expect(calls).toHaveLength(2);
+    // 去程航线过滤
+    expect(calls[0][0].where.schedule.flight).toEqual({
+      originCode: BUNDLE_ROUTE.origin,
+      destinationCode: BUNDLE_ROUTE.destination,
+    });
+    // 回程航线过滤（方向相反）
+    expect(calls[1][0].where.schedule.flight).toEqual({
+      originCode: BUNDLE_ROUTE.destination,
+      destinationCode: BUNDLE_ROUTE.origin,
+    });
+  });
+
+  it('绑定了去/回程航班 → 只看那趟航班的班次价（schedule.flightId 过滤，优先于航线兜底）', async () => {
+    mockPrisma.flightSeatClass.findMany
+      .mockResolvedValueOnce([{ basePrice: new Prisma.Decimal(720), fareBuckets: null }])
+      .mockResolvedValueOnce([{ basePrice: new Prisma.Decimal(720), fareBuckets: null }]);
+
+    const value = await getCheapestRoundTripEconomyCny(new Date(), {
+      outboundFlightId: 'flight-out',
+      returnFlightId: 'flight-back',
+    });
+
+    expect(value).toBe(1440);
+    const calls = mockPrisma.flightSeatClass.findMany.mock.calls;
+    expect(calls[0][0].where.schedule.flightId).toBe('flight-out');
+    expect(calls[0][0].where.schedule.flight).toBeUndefined();
+    expect(calls[1][0].where.schedule.flightId).toBe('flight-back');
+  });
+
+  it('某段查不到班次 → 用另一段 ×2 兜底（对称假设）', async () => {
+    mockPrisma.flightSeatClass.findMany
+      .mockResolvedValueOnce([{ basePrice: new Prisma.Decimal(700), fareBuckets: null }])
+      .mockResolvedValueOnce([]); // 回程无班次
+
+    const value = await getCheapestRoundTripEconomyCny(new Date());
+    expect(value).toBe(1400);
+  });
+
+  it('两段都查不到班次 → null（套餐原价退化为仅地面）', async () => {
+    mockPrisma.flightSeatClass.findMany.mockResolvedValue([]);
+    const value = await getCheapestRoundTripEconomyCny(new Date());
+    expect(value).toBeNull();
   });
 });
 

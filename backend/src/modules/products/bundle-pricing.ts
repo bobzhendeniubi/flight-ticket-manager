@@ -16,11 +16,29 @@
  * 「1 人」口径，故直接加一次（不用再乘人数）。与订单侧 computeBundleAddOn 里按出行人头（seatPax）
  * 收的操作费是同一份费率、两处独立计算，不互相派生。
  */
+import { Prisma } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { parseFareBuckets } from '../pricing/pricing.schemas.js';
+import { BUNDLE_ROUTE } from './bundle-availability.service.js';
 
 const CACHE_TTL_MS = 5 * 60 * 1000;
-let cache: { value: number | null; at: number } | null = null;
+/**
+ * 机票参考价内存缓存，按「绑定组合」分键（去程航班 id / 回程航班 id，未绑 = 'route'）。
+ * 单一全局缓存曾让不同套餐互相污染起价（任一套餐先算出的值被所有套餐共享）；按 key 分桶后
+ * 各绑定组合独立缓存，既不退化成每次都查库，也不再串味。
+ */
+const cacheByKey = new Map<string, { value: number | null; at: number }>();
+
+/** 套餐绑定的去/回程航班（模板绑法：只绑航班号，不绑某天）；null/省略 = 未绑，按航线兜底。 */
+export interface BundleFlightBinding {
+  outboundFlightId?: string | null;
+  returnFlightId?: string | null;
+}
+
+/** 供测试/运维在需要时清空机票参考价缓存（避免跨用例的缓存串味）。 */
+export function resetCheapestFlightRefCache(): void {
+  cacheByKey.clear();
+}
 
 /** 套餐组件行的最小形状（items JSON 单元素）；unitPrice 落库前已由服务端按产品定价覆盖。 */
 export interface BundleItemPriceInput {
@@ -30,24 +48,74 @@ export interface BundleItemPriceInput {
 }
 
 /**
- * 当前「最低来回经济舱机票 / 人」(CNY)。
- * 取所有未来经济舱仓位里最便宜的一档（有阶梯用 fareBuckets[0].price，否则 basePrice），×2 估来回。
- * 查不到任何未来经济舱班次 → null（套餐原价退化为仅地面）。带 5 分钟内存缓存（单航线、低频变化）。
+ * 单段「最低经济舱机票 / 人」(CNY)：给定班次过滤条件下，取所有未来经济舱仓位里最便宜的一档
+ * （有阶梯用 fareBuckets[0].price，否则 basePrice）。查不到任何班次 → null。
  */
-export async function getCheapestRoundTripEconomyCny(now: Date): Promise<number | null> {
-  if (cache && now.getTime() - cache.at < CACHE_TTL_MS) return cache.value;
+async function cheapestOneWayEconomyCny(
+  scheduleWhere: Prisma.FlightScheduleWhereInput,
+): Promise<number | null> {
   const seatClasses = await prisma.flightSeatClass.findMany({
-    where: { cabin: 'ECONOMY', schedule: { departureTime: { gte: now } } },
+    where: { cabin: 'ECONOMY', schedule: scheduleWhere },
     select: { basePrice: true, fareBuckets: true },
   });
-  let minOneWay: number | null = null;
+  let min: number | null = null;
   for (const sc of seatClasses) {
     const buckets = parseFareBuckets(sc.fareBuckets);
     const cheapest = buckets && buckets.length > 0 ? Number(buckets[0].price) : Number(sc.basePrice);
-    if (Number.isFinite(cheapest) && (minOneWay == null || cheapest < minOneWay)) minOneWay = cheapest;
+    if (Number.isFinite(cheapest) && (min == null || cheapest < min)) min = cheapest;
   }
-  const value = minOneWay == null ? null : Math.round(minOneWay * 2);
-  cache = { value, at: now.getTime() };
+  return min;
+}
+
+/** 去 + 回两段相加为来回价；只有一段能估到价 → 该段 ×2 兜底（去/回票价对称假设）。 */
+function combineRoundTrip(outboundMin: number | null, returnMin: number | null): number | null {
+  if (outboundMin != null && returnMin != null) return Math.round(outboundMin + returnMin);
+  const single = outboundMin ?? returnMin;
+  return single == null ? null : Math.round(single * 2);
+}
+
+/**
+ * 当前「最低来回经济舱机票 / 人」(CNY)。
+ *
+ * 范围限定（务必按航线/航班过滤，绝不扫全库 —— 否则任一无关航线的低价会污染所有套餐起价）：
+ *   - 绑定了具体航班（outboundFlightId/returnFlightId 非空）→ 该段只看那趟航班的班次价；
+ *   - 未绑航班 → 按套餐固定航线兜底：去程 BUNDLE_ROUTE.origin→destination，回程 destination→origin。
+ * 来回价 = 去程最低 + 回程最低（两段各自估价再相加，贴合运营「按段结算」口径）；
+ * 某段查不到任何班次 → 用另一段 ×2 兜底（对称假设），两段皆空 → null（套餐原价退化为仅地面）。
+ *
+ * 缓存：按 (outboundFlightId ?? 'route')|(returnFlightId ?? 'route') 分键，5 分钟 TTL；
+ * 不同绑定组合互不串味（旧版单一全局缓存会让所有套餐共享同一份可能不准的参考价）。
+ */
+export async function getCheapestRoundTripEconomyCny(
+  now: Date,
+  binding?: BundleFlightBinding,
+): Promise<number | null> {
+  const outboundFlightId = binding?.outboundFlightId ?? null;
+  const returnFlightId = binding?.returnFlightId ?? null;
+  const cacheKey = `${outboundFlightId ?? 'route'}|${returnFlightId ?? 'route'}`;
+  const cached = cacheByKey.get(cacheKey);
+  if (cached && now.getTime() - cached.at < CACHE_TTL_MS) return cached.value;
+
+  const outboundSchedule: Prisma.FlightScheduleWhereInput = outboundFlightId
+    ? { flightId: outboundFlightId, departureTime: { gte: now } }
+    : {
+        departureTime: { gte: now },
+        flight: { originCode: BUNDLE_ROUTE.origin, destinationCode: BUNDLE_ROUTE.destination },
+      };
+  const returnSchedule: Prisma.FlightScheduleWhereInput = returnFlightId
+    ? { flightId: returnFlightId, departureTime: { gte: now } }
+    : {
+        departureTime: { gte: now },
+        flight: { originCode: BUNDLE_ROUTE.destination, destinationCode: BUNDLE_ROUTE.origin },
+      };
+
+  const [outboundMin, returnMin] = await Promise.all([
+    cheapestOneWayEconomyCny(outboundSchedule),
+    cheapestOneWayEconomyCny(returnSchedule),
+  ]);
+
+  const value = combineRoundTrip(outboundMin, returnMin);
+  cacheByKey.set(cacheKey, { value, at: now.getTime() });
   return value;
 }
 

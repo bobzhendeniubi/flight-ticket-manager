@@ -620,31 +620,57 @@ export function ProductsPage() {
   );
 }
 
+// ─── 新增/编辑表单的互斥状态 + 弹框外壳（酒店 / 接送 / 签证共用） ───────
+/**
+ * 卡片列表小节（酒店/接送/签证）统一用这个 union 类型管理「新增表单」「编辑表单」的显隐，
+ * 天然互斥——同一时刻只可能是 closed / new / edit 三者之一，不会出现新增和编辑表单同时挂载。
+ */
+type FormMode<T> = { type: 'closed' } | { type: 'new' } | { type: 'edit'; item: T };
+
+/** 新增/编辑表单的弹框外壳：遮罩层 + 居中卡片，点遮罩层或按 Esc 关闭；点表单内部不冒泡关闭。 */
+function FormModal({ onClose, children }: { onClose: () => void; children: React.ReactNode }) {
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [onClose]);
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/40 p-4 backdrop-blur-sm" onClick={onClose}>
+      <div className="w-full max-w-2xl max-h-[90vh] overflow-auto" onClick={(e) => e.stopPropagation()}>
+        {children}
+      </div>
+    </div>
+  );
+}
+
 // ─── 酒店 ───────────────────────────────────────────────────────────
 function HotelsSection({ items, onChange }: { items: MockHotelWithCost[]; onChange: (v: MockHotelWithCost[]) => void }) {
-  const [showForm, setShowForm] = useState(false);
-  const [editing, setEditing] = useState<MockHotelWithCost | null>(null);
+  // 互斥：同一时刻只可能是「关闭」「新增」「编辑某一项」之一，从根上杜绝新增/编辑表单同时出现。
+  const [mode, setMode] = useState<FormMode<MockHotelWithCost>>({ type: 'closed' });
+  const closeModal = () => setMode({ type: 'closed' });
   return (
     <div className="space-y-3">
-      <ActionBar active={items.length} onAdd={() => setShowForm(true)} addLabel="+ 新增酒店" />
-      {editing && (
-        // key=编辑目标 id：强制每次「编辑」都重挂载表单，用最新 hotel 重新播种内部 state。
-        // 缺 key 时表单实例被复用，新建酒店后刷新列表（id 变、对象换新）会让二次编辑打不开/带旧数据。
-        <EditHotelForm
-          key={editing.id}
-          hotel={editing}
-          onCancel={() => setEditing(null)}
-          onSave={(h) => { onChange(items.map((x) => x.id === h.id ? h : x)); setEditing(null); }}
-        />
-      )}
-      {showForm && (
-        <NewHotelForm
-          onCancel={() => setShowForm(false)}
-          onSubmit={(h) => {
-            onChange([h, ...items]);
-            setShowForm(false);
-          }}
-        />
+      <ActionBar active={items.length} onAdd={() => setMode({ type: 'new' })} addLabel="+ 新增酒店" />
+      {mode.type !== 'closed' && (
+        <FormModal onClose={closeModal}>
+          {mode.type === 'edit' ? (
+            // key=编辑目标 id：强制每次「编辑」都重挂载表单，用最新 hotel 重新播种内部 state。
+            // 缺 key 时表单实例被复用，新建酒店后刷新列表（id 变、对象换新）会让二次编辑打不开/带旧数据。
+            <EditHotelForm
+              key={mode.item.id}
+              hotel={mode.item}
+              onCancel={closeModal}
+              onSave={(h) => { onChange(items.map((x) => x.id === h.id ? h : x)); closeModal(); }}
+            />
+          ) : (
+            <NewHotelForm
+              onCancel={closeModal}
+              onSubmit={(h) => { onChange([h, ...items]); closeModal(); }}
+            />
+          )}
+        </FormModal>
       )}
       <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
         {items.map((h) => (
@@ -670,7 +696,7 @@ function HotelsSection({ items, onChange }: { items: MockHotelWithCost[]; onChan
                 <div className="text-lg font-semibold text-ink nums">¥{h.basePrice}</div>
               </div>
               <div className="flex gap-3 text-xs">
-                <button className="font-medium text-brand hover:text-brand-dark" onClick={() => setEditing(h)}>编辑</button>
+                <button className="font-medium text-brand hover:text-brand-dark" onClick={() => setMode({ type: 'edit', item: h })}>编辑</button>
                 <button
                   className="text-ink-muted hover:text-rose-600"
                   onClick={() => { if (confirm(`删除 ${h.name}？`)) onChange(items.filter((x) => x.id !== h.id)); }}
@@ -719,27 +745,31 @@ function NewHotelForm({
 
 // ─── 接送 ───────────────────────────────────────────────────────────
 function TransfersSection({ items, onChange }: { items: MockTransferWithCost[]; onChange: (v: MockTransferWithCost[]) => void }) {
-  const [showForm, setShowForm] = useState(false);
-  const [editing, setEditing] = useState<MockTransferWithCost | null>(null);
+  // 互斥：同一时刻只可能是「关闭」「新增」「编辑某一项」之一，从根上杜绝新增/编辑表单同时出现。
+  const [mode, setMode] = useState<FormMode<MockTransferWithCost>>({ type: 'closed' });
+  const closeModal = () => setMode({ type: 'closed' });
   return (
     <div className="space-y-3">
-      {editing && (
-        // key=编辑目标 id：强制每次「编辑」都重挂载表单，用最新对象重新播种内部 state。
-        // 缺 key 时表单实例被复用，新建后刷新列表（id 变、对象换新）会让二次编辑打不开/带旧数据。
-        <EditTransferForm
-          key={editing.id}
-          transfer={editing}
-          onCancel={() => setEditing(null)}
-          onSave={(t) => { onChange(items.map((x) => x.id === t.id ? t : x)); setEditing(null); }}
-        />
+      {mode.type !== 'closed' && (
+        <FormModal onClose={closeModal}>
+          {mode.type === 'edit' ? (
+            // key=编辑目标 id：强制每次「编辑」都重挂载表单，用最新对象重新播种内部 state。
+            // 缺 key 时表单实例被复用，新建后刷新列表（id 变、对象换新）会让二次编辑打不开/带旧数据。
+            <EditTransferForm
+              key={mode.item.id}
+              transfer={mode.item}
+              onCancel={closeModal}
+              onSave={(t) => { onChange(items.map((x) => x.id === t.id ? t : x)); closeModal(); }}
+            />
+          ) : (
+            <NewTransferForm
+              onCancel={closeModal}
+              onSubmit={(t) => { onChange([t, ...items]); closeModal(); }}
+            />
+          )}
+        </FormModal>
       )}
-      {showForm && (
-        <NewTransferForm
-          onCancel={() => setShowForm(false)}
-          onSubmit={(t) => { onChange([t, ...items]); setShowForm(false); }}
-        />
-      )}
-      <ActionBar active={items.length} onAdd={() => setShowForm(true)} addLabel="+ 新增车型" />
+      <ActionBar active={items.length} onAdd={() => setMode({ type: 'new' })} addLabel="+ 新增车型" />
       <div className="space-y-3">
         {items.map((t) => (
           <article key={t.id} className="card flex items-center gap-6 transition hover:shadow-pop">
@@ -756,7 +786,7 @@ function TransfersSection({ items, onChange }: { items: MockTransferWithCost[]; 
               <div className="text-xs text-ink-muted">起步价</div>
               <div className="text-xl font-semibold text-ink nums">¥{t.basePrice}</div>
               <div className="mt-1 flex justify-end gap-3 text-xs">
-                <button className="font-medium text-brand hover:text-brand-dark" onClick={() => setEditing(t)}>编辑</button>
+                <button className="font-medium text-brand hover:text-brand-dark" onClick={() => setMode({ type: 'edit', item: t })}>编辑</button>
                 <button
                   className="text-ink-muted hover:text-rose-600"
                   onClick={() => { if (confirm(`删除 ${t.name}？`)) onChange(items.filter((x) => x.id !== t.id)); }}
@@ -774,27 +804,31 @@ function TransfersSection({ items, onChange }: { items: MockTransferWithCost[]; 
 
 // ─── 签证 ───────────────────────────────────────────────────────────
 function VisasSection({ items, onChange }: { items: MockVisaWithStayDays[]; onChange: (v: MockVisaWithStayDays[]) => void }) {
-  const [showForm, setShowForm] = useState(false);
-  const [editing, setEditing] = useState<MockVisaWithStayDays | null>(null);
+  // 互斥：同一时刻只可能是「关闭」「新增」「编辑某一项」之一，从根上杜绝新增/编辑表单同时出现。
+  const [mode, setMode] = useState<FormMode<MockVisaWithStayDays>>({ type: 'closed' });
+  const closeModal = () => setMode({ type: 'closed' });
   return (
     <div className="space-y-3">
-      {editing && (
-        // key=编辑目标 id：强制每次「编辑」都重挂载表单，用最新对象重新播种内部 state。
-        // 缺 key 时表单实例被复用，新建后刷新列表（id 变、对象换新）会让二次编辑打不开/带旧数据。
-        <EditVisaForm
-          key={editing.id}
-          visa={editing}
-          onCancel={() => setEditing(null)}
-          onSave={(v) => { onChange(items.map((x) => x.id === v.id ? v : x)); setEditing(null); }}
-        />
+      {mode.type !== 'closed' && (
+        <FormModal onClose={closeModal}>
+          {mode.type === 'edit' ? (
+            // key=编辑目标 id：强制每次「编辑」都重挂载表单，用最新对象重新播种内部 state。
+            // 缺 key 时表单实例被复用，新建后刷新列表（id 变、对象换新）会让二次编辑打不开/带旧数据。
+            <EditVisaForm
+              key={mode.item.id}
+              visa={mode.item}
+              onCancel={closeModal}
+              onSave={(v) => { onChange(items.map((x) => x.id === v.id ? v : x)); closeModal(); }}
+            />
+          ) : (
+            <NewVisaForm
+              onCancel={closeModal}
+              onSubmit={(v) => { onChange([v, ...items]); closeModal(); }}
+            />
+          )}
+        </FormModal>
       )}
-      {showForm && (
-        <NewVisaForm
-          onCancel={() => setShowForm(false)}
-          onSubmit={(v) => { onChange([v, ...items]); setShowForm(false); }}
-        />
-      )}
-      <ActionBar active={items.length} onAdd={() => setShowForm(true)} addLabel="+ 新增签证产品" />
+      <ActionBar active={items.length} onAdd={() => setMode({ type: 'new' })} addLabel="+ 新增签证产品" />
       <div className="grid gap-3 md:grid-cols-2 lg:grid-cols-3">
         {items.map((v) => (
           <div key={v.id} className="card transition hover:shadow-pop">
@@ -818,7 +852,7 @@ function VisasSection({ items, onChange }: { items: MockVisaWithStayDays[]; onCh
                 <div className="text-lg font-semibold text-ink nums">¥{v.basePrice}</div>
               </div>
               <div className="flex gap-3 text-xs">
-                <button className="font-medium text-brand hover:text-brand-dark" onClick={() => setEditing(v)}>编辑</button>
+                <button className="font-medium text-brand hover:text-brand-dark" onClick={() => setMode({ type: 'edit', item: v })}>编辑</button>
                 <button
                   className="text-ink-muted hover:text-rose-600"
                   onClick={() => { if (confirm(`删除 ${v.country} · ${v.type}？`)) onChange(items.filter((x) => x.id !== v.id)); }}
