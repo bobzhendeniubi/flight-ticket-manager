@@ -11,10 +11,27 @@
  * MVP 同步实现：运营手动在 admin 里更新状态 + 数据。
  * V2 引入 BullMQ 后会变成自动触发供应商 API。
  */
-import { FulfillmentStatus, FulfillmentType, OrderItemKind, Prisma } from '@prisma/client';
+import { FulfillmentStatus, FulfillmentType, OrderItemKind, OrderStatus, Prisma } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { ConflictError, NotFoundError } from '../../lib/errors.js';
 import type { ListFulfillmentQuery, UpdateFulfillmentBody } from './fulfillment.schemas.js';
+
+/**
+ * 计入履约任务列表 / 签证台的父订单状态——与订单/财务导出的 COUNTED_STATUSES 同一补集口径：
+ * 排除 DRAFT（草稿未提交）/ PAYMENT_TIMEOUT（支付超时）/ CANCELLED（已取消）/
+ * REFUNDED（已退款）/ FAILED（失败）这些"取消族"状态。
+ * 订单一旦落入取消族，其履约任务（尤其签证送签）不应再残留在运营看板上。
+ */
+const COUNTED_STATUSES: OrderStatus[] = [
+  OrderStatus.PENDING_PAYMENT,
+  OrderStatus.PAID,
+  OrderStatus.PROCESSING,
+  OrderStatus.TICKETED,
+  OrderStatus.COMPLETED,
+  OrderStatus.REFUND_REQUESTED,
+  OrderStatus.CHANGE_REQUESTED,
+  OrderStatus.CHANGED,
+];
 
 const KIND_TO_TYPE: Record<OrderItemKind, FulfillmentType | null> = {
   FLIGHT: FulfillmentType.FLIGHT_TICKETING,
@@ -61,7 +78,9 @@ export class FulfillmentService {
     // 乘客明细一次性取出（按 orderId），避免后续 VISA 任务 N+1 查乘客
     const [items, passengers] = await prisma.$transaction([
       prisma.orderItem.findMany({
-        where: { orderId },
+        // 父订单已软删 / 落入取消族（见 COUNTED_STATUSES）时不返回其任务——
+        // 避免已取消/已删订单的签证等任务残留在运营视图里。
+        where: { orderId, order: { deletedAt: null, status: { in: COUNTED_STATUSES } } },
         include: { fulfillmentTasks: { orderBy: { createdAt: 'asc' } } },
       }),
       prisma.passenger.findMany({
@@ -96,12 +115,20 @@ export class FulfillmentService {
   }
 
   async list(query: ListFulfillmentQuery) {
-    const where: Prisma.FulfillmentTaskWhereInput = {};
+    // 父订单已软删 / 落入取消族（见 COUNTED_STATUSES）时不进列表——
+    // 签证台等运营看板不应残留已取消/已删订单的任务。
+    // 注：orderItem 关系过滤单独成型再赋值（Prisma 的关系 where 是 XOR 联合类型，
+    // 先赋后展开再并 orderId 会触发 TS2322，无法安全收窄）。
+    const orderItemWhere: Prisma.OrderItemWhereInput = {
+      order: { deletedAt: null, status: { in: COUNTED_STATUSES } },
+    };
+    if (query.orderId) orderItemWhere.orderId = query.orderId;
+
+    const where: Prisma.FulfillmentTaskWhereInput = { orderItem: orderItemWhere };
     if (query.type) where.type = query.type;
     if (query.status) where.status = query.status;
     if (query.assigneeUserId) where.assigneeUserId = query.assigneeUserId;
     if (query.orderItemId) where.orderItemId = query.orderItemId;
-    if (query.orderId) where.orderItem = { orderId: query.orderId };
 
     // 性能（签证台加载慢根因修复）：
     // 旧实现在每行 task 的 order include 里嵌套 passengers[] + 关系排序的最早机票子查询，

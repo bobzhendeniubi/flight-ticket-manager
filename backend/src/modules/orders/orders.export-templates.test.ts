@@ -461,6 +461,23 @@ describe('《签证专用》visa 行 — 中文姓名取值', () => {
   });
 });
 
+// ── 《签证专用》visa 行 · 签发日期 ──────────────────────────────────────────
+// 曾经硬编码 issueDate:''，签证名单「签发日期」列永远空白；现改接
+// Passenger.passportIssueDate（同「有效日期」列口径，dd-mm-yyyy，缺省留空）。
+describe('《签证专用》visa 行 — 签发日期', () => {
+  const order = fixtureRoundTrip();
+  const ctx = buildOrderContext(order);
+  const rows = orderToVisaRows(order, ctx);
+
+  it('有 passportIssueDate → DD-MM-YYYY', () => {
+    expect(rows[0].issueDate).toBe('12-12-2024');
+  });
+
+  it('缺省 passportIssueDate → 留空（不编造）', () => {
+    expect(rows[1].issueDate).toBe('');
+  });
+});
+
 // ── 生日可空（换人清除后 dateOfBirth=null）→ 导出留空不 crash ────────────────
 // Passenger.dateOfBirth 已改为可空；换人未提供新生日时后端置 null。导出（全岗/票务）
 // 遇到 null 生日必须落空串（绝不编造、绝不抛错）。

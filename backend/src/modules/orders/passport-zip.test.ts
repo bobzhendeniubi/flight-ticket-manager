@@ -22,7 +22,7 @@ vi.mock('../../db/prisma.js', () => ({
   },
 }));
 
-import { buildPassportPhotoZip } from './passport-zip.js';
+import { buildPassportPhotoZip, extFromUrl } from './passport-zip.js';
 
 /** 造一个乘客 fixture，只填测试关心的字段，其余给合理默认 */
 function makePassenger(overrides: Partial<Passenger>): Passenger {
@@ -102,6 +102,35 @@ async function readVisaSheetRows(
   });
   return rows;
 }
+
+// ── extFromUrl · data URI 扩展名识别 ────────────────────────────────────────
+// 曾经只匹配 URL 路径后缀，data:image/png;base64,... 这类内嵌图（OCR/小程序直传常见）
+// 没有路径后缀可匹配，一律被误标成 .jpg（图内容与文件后缀不符）。
+describe('extFromUrl', () => {
+  it('data URI：按 MIME type 映射扩展名（png/webp/gif 各自识别，不再回落 jpg）', () => {
+    expect(extFromUrl('data:image/png;base64,AAAA')).toBe('png');
+    expect(extFromUrl('data:image/webp;base64,AAAA')).toBe('webp');
+    expect(extFromUrl('data:image/gif;base64,AAAA')).toBe('gif');
+  });
+
+  it('data URI：jpeg → jpg（与非 data URI 口径一致，扩展名不用 jpeg）', () => {
+    expect(extFromUrl('data:image/jpeg;base64,AAAA')).toBe('jpg');
+  });
+
+  it('data URI：未知/不支持的 MIME 兜底 jpg（不引入未知后缀）', () => {
+    expect(extFromUrl('data:image/svg+xml;base64,AAAA')).toBe('jpg');
+  });
+
+  it('普通 URL：维持原口径，按路径末尾扩展名匹配', () => {
+    expect(extFromUrl('https://cdn.example.com/passports/a.png')).toBe('png');
+    expect(extFromUrl('https://cdn.example.com/passports/a.jpeg?x=1')).toBe('jpg');
+    expect(extFromUrl('https://cdn.example.com/passports/a.webp')).toBe('webp');
+  });
+
+  it('普通 URL：无可识别后缀 → 兜底 jpg', () => {
+    expect(extFromUrl('https://cdn.example.com/passports/no-ext')).toBe('jpg');
+  });
+});
 
 describe('buildPassportPhotoZip — 送签表覆盖手工录入/无图乘客', () => {
   it('无图乘客也出现在送签表，并标记「无护照图（手工录入）」', async () => {

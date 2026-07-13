@@ -25,6 +25,7 @@ import {
   publicOrderLookupQuerySchema,
   quoteOrderBodySchema,
   rescheduleOrderBodySchema,
+  resolvePassengerPatchChannel,
   selfUpdatePassengerBodySchema,
   swapItemHotelBodySchema,
   swapPassengerBodySchema,
@@ -1299,22 +1300,26 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // ── 出行人资料（同一路径，双通道）──
   // PATCH /orders/:id/passengers/:passengerId
   //
-  // ① 前台自助补录（CUSTOMER / AGENT）：
+  // ① 补录护照/证件资料（selfUpdatePassengerBodySchema）：
   //   body: { chineseName?, gender?, documentNumber?, dateOfBirth?, nationality?,
   //           passportExpiry?, passportIssueDate?, passportIssueCountry?,
   //           passportIssuePlace?, passportPhotoUrl? }（至少一个；不允许改 fullName——换人请联系客服）
-  //   归属校验同 getOrder（客户仅本人单、代理仅自己+下级）；仅 PENDING_PAYMENT/PAID/PROCESSING
-  //   可改，否则 409 ORDER_LOCKED。返回 { passenger }（含 hasPassportPhoto，不回传大图）。
+  //   走此路的角色：CUSTOMER/AGENT 一律走；ADMIN/STAFF 在「请求体不含任何换人语义字段」时也走此路
+  //   ——运营只想补 passportIssueDate/passportExpiry/护照图 等证件资料时，不该被换人 schema 400（换人
+  //   schema 无护照字段）。归属/状态校验在 service 内（assertCanView 对 ADMIN/STAFF 直接放行；
+  //   仅 PENDING_PAYMENT/PAID/PROCESSING 可改，否则 409 ORDER_LOCKED）。返回 { passenger }。
   //
-  // ② 售后改单：换人（ADMIN/STAFF）：
+  // ② 售后改单：换人（仅 ADMIN/STAFF；请求体带 lastName/firstName/fullName/resetInvoice/resetVisa/
+  //   feeCny/feeLabel/note 任一「换人语义字段」即判为换人，见 resolvePassengerPatchChannel）：
   //   body: { lastName?, firstName?, fullName?, documentNumber?, dateOfBirth?, gender?,
   //           nationality?, resetInvoice?, resetVisa?, feeCny?, feeLabel?, note? }
   //   就地把出行人换成新人；resetInvoice→开票 NONE、resetVisa→签证任务 PENDING；可选加换人费。
   app.patch('/:id/passengers/:passengerId', { preHandler: [app.authenticate] }, async (req) => {
     const role = req.user.role;
     const { id, passengerId } = req.params as { id: string; passengerId: string };
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
-      // ① 前台自助补录通道（归属/状态校验在 service 内；越权 403、锁定 409 由错误处理器统一格式化）
+    if (resolvePassengerPatchChannel(role, req.body) === 'SELF_UPDATE') {
+      // ① 补录护照/证件资料通道（CUSTOMER/AGENT 全部走此路；ADMIN/STAFF 无换人语义字段时也走此路）。
+      //   归属/状态校验在 service 内；越权 403、锁定 409 由错误处理器统一格式化。
       const selfBody = selfUpdatePassengerBodySchema.parse(req.body);
       const requester = await buildRequester(req.user.sub, role);
       const result = await service.selfUpdatePassenger(id, passengerId, selfBody, requester);
@@ -1329,6 +1334,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       });
       return { passenger: result.passenger };
     }
+    // ② 换人通道（仅 ADMIN/STAFF——resolvePassengerPatchChannel 已保证前台角色永不到此）。
     const body = swapPassengerBodySchema.parse(req.body);
     const { order, audit } = await service.swapPassenger(id, passengerId, body, {
       userId: req.user.sub,

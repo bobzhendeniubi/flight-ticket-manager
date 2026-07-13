@@ -196,6 +196,12 @@ interface RoomEntry {
   isHalf: boolean;
   /** 该乘客所在房型容量（用于未分房乘客按容量打包；缺省 2）。*/
   capacity: number;
+  /**
+   * 乘客性别原值（Passenger.gender：'M' / 'F' / 'X' / null）——未人工分房时
+   * assignRoomNumbers 按此分组打包，异性不拼同房号（口径同房控物理房间：
+   * hotel-control.service.ts computePhysicalUsed 的"异性不能拼一间"）。
+   */
+  gender: string | null;
   /** 分配后的房间序号（per hotel；排序用）。*/
   roomOrder: number;
   row: Omit<RoomAllocationRow, 'seq' | 'roomNo'>;
@@ -355,7 +361,15 @@ export function buildRoomAllocationSheets(
       };
 
       const list = byDate.get(checkInStr) ?? [];
-      list.push({ hotelName, groupId: group?.id ?? null, isHalf, capacity, roomOrder: 0, row });
+      list.push({
+        hotelName,
+        groupId: group?.id ?? null,
+        isHalf,
+        capacity,
+        gender: p.gender ?? null,
+        roomOrder: 0,
+        row,
+      });
       byDate.set(checkInStr, list);
     }
   }
@@ -380,22 +394,36 @@ export function buildRoomAllocationSheets(
     });
 }
 
+/** 未分房乘客打包分组键：M/F 各自一组，其余（X / 未知）不与任何人拼房，各自单间。*/
+type PackGenderKey = 'M' | 'F' | 'U';
+
+function packGenderKeyOf(gender: string | null): PackGenderKey {
+  return gender === 'M' ? 'M' : gender === 'F' ? 'F' : 'U';
+}
+
 /**
  * 给同一入住日期内的乘客分配房间号（per 酒店，按取数顺序）。就地写回 entry.roomOrder。
- *   - 已分房：同 groupId 共用一个房号（首次出现时分配）。
- *   - 未分房：按容量打包（每满 capacity 人开下一间），续在已分房之后。
+ *   - 已分房：同 groupId 共用一个房号（首次出现时分配）——人工分房结果不受性别分组影响。
+ *   - 未分房：按性别分组分别打包——M 一组、F 一组各自按容量打包（每满 capacity 人开下一间），
+ *     性别未知/X 保守视同"潜在异性"，各自单间不与任何人拼房；异性不能拼同一物理房间，
+ *     口径与销控物理房间一致（见 hotel-control.service.ts computePhysicalUsed 的 JSDoc）。
+ *     未分房房号续在已分房之后。
  */
 function assignRoomNumbers(entries: RoomEntry[]): void {
-  // 每个酒店各自的分配状态
+  // 每个酒店各自的分配状态；未分房乘客按性别分组各自维护「当前开放房间」
   const perHotel = new Map<
     string,
-    { next: number; groupRoom: Map<string, number>; openRoom: number | null; openLeft: number }
+    {
+      next: number;
+      groupRoom: Map<string, number>;
+      openRoomByGender: Map<PackGenderKey, { room: number; left: number }>;
+    }
   >();
 
   for (const e of entries) {
     let st = perHotel.get(e.hotelName);
     if (!st) {
-      st = { next: 1, groupRoom: new Map(), openRoom: null, openLeft: 0 };
+      st = { next: 1, groupRoom: new Map(), openRoomByGender: new Map() };
       perHotel.set(e.hotelName, st);
     }
 
@@ -407,15 +435,24 @@ function assignRoomNumbers(entries: RoomEntry[]): void {
         st.groupRoom.set(e.groupId, room);
       }
       e.roomOrder = room;
-    } else {
-      // 未分房：按容量打包到当前开放房间；满则开新房
-      if (st.openRoom === null || st.openLeft <= 0) {
-        st.openRoom = st.next++;
-        st.openLeft = e.capacity;
-      }
-      e.roomOrder = st.openRoom;
-      st.openLeft -= 1;
+      continue;
     }
+
+    const genderKey = packGenderKeyOf(e.gender);
+    if (genderKey === 'U') {
+      // 性别未知/X：不与任何人拼房，各自单间
+      e.roomOrder = st.next++;
+      continue;
+    }
+
+    // 未分房（性别已知）：按容量打包到该性别当前开放房间；满则开新房
+    let open = st.openRoomByGender.get(genderKey);
+    if (!open || open.left <= 0) {
+      open = { room: st.next++, left: e.capacity };
+    }
+    e.roomOrder = open.room;
+    open.left -= 1;
+    st.openRoomByGender.set(genderKey, open);
   }
 }
 
@@ -425,7 +462,7 @@ function assignRoomNumbers(entries: RoomEntry[]): void {
  * 各查一次，减少导出跨度内（≤14 天，ROOM_ALLOCATION_MAX_DAYS）的查库次数。
  * 返回 `${hotelId}|${YYYY-MM-DD}` → 展示串（数字 / "未配" block=0 未覆盖 / 缺省未收录）。
  */
-async function buildDailyRemainingLookup(
+export async function buildDailyRemainingLookup(
   items: RoomItemForExport[],
   client: PrismaClient,
 ): Promise<Map<string, string>> {
@@ -441,19 +478,25 @@ async function buildDailyRemainingLookup(
   const perHotel = await Promise.all(
     Array.from(datesByHotel.entries()).map(async ([hotelId, dateSet]) => {
       const dates = Array.from(dateSet).sort();
-      const { remaining, block, hasBlock } = await getHotelNightlyRemaining(hotelId, dates, client);
-      return { hotelId, dates, remaining, block, hasBlock };
+      const { physicalRemaining, block, hasBlock } = await getHotelNightlyRemaining(
+        hotelId,
+        dates,
+        client,
+      );
+      return { hotelId, dates, physicalRemaining, block, hasBlock };
     }),
   );
 
   const lookup = new Map<string, string>();
-  for (const { hotelId, dates, remaining, block, hasBlock } of perHotel) {
+  for (const { hotelId, dates, physicalRemaining, block, hasBlock } of perHotel) {
     dates.forEach((date, i) => {
       const key = `${hotelId}|${date}`;
       if (!hasBlock || block[i] === 0) {
         lookup.set(key, '未配');
       } else {
-        lookup.set(key, String(remaining[i]));
+        // 物理房间口径（与销控板/房态导出同口径）——不用床位口径 remaining，
+        // 否则"男+女各半间"这类拼房会出现 8.5 这种物理上不存在的半间余量。
+        lookup.set(key, String(physicalRemaining[i]));
       }
     });
   }

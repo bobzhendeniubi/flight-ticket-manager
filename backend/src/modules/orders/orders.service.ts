@@ -1232,8 +1232,11 @@ export class OrderService {
           description: item.description,
           quantity: item.quantity,
           unitPrice: bundleUnitPrice,
-          // 升级加价 + 每人操作费加在套餐行总额上（不摊进 unitPrice，保持基础单价语义不变）
-          amount: bundleUnitPrice * item.quantity + addOn.total + operationFeeTotal,
+          // 升级加价 + 每人操作费加在套餐行总额上（不摊进 unitPrice，保持基础单价语义不变）。
+          // addOn.total 可为负（自备签/儿童折扣减免）——非负保护在此行金额层统一夹到 0：
+          //   减免先正常抵扣套餐地面价 + 操作费，只有减免大于地面总价的极端场景才夹到 0（不出现负行金额）。
+          // 折扣（percent-off）在此之后另行处理，顺序不变。
+          amount: Math.max(0, bundleUnitPrice * item.quantity + addOn.total + operationFeeTotal),
           bundleId: item.bundleId,
           hotelRoomTypeId: hotelStamp?.hotelRoomTypeId,
           hotelCheckIn: hotelStamp?.hotelCheckIn,
@@ -4817,15 +4820,16 @@ export function computeBundleAddOn(
   const infantPriceTotal = occupancy.infantCount * infantRate;
   // 自备签证：自行办妥签证的人数 × 每人减免（乘客级各减一次；旧整单口径 count=1 即整单减一次）
   const selfVisaDeductTotal = selfVisaCount * selfVisaRate;
-  // 升级加价 + 婴儿价 − 儿童折扣 − 自备签证减免（向上夹到 0，避免套餐行出现负总额）
-  const total = Math.max(
-    0,
+  // 升级加价 + 婴儿价 − 儿童折扣 − 自备签证减免。
+  // 加项净额**允许为负**：自备签/儿童折扣可以大于其它加价，甚至在无任何其它加价时单独存在。
+  // 绝不在此「加项净额」层夹到 0——否则减免只能抵扣其它加价、无加价时一分不减（把套餐行整体价算高）。
+  // 非负保护下沉到 BUNDLE 行金额层（unitPrice×qty + total + 操作费）再统一夹到 0，减免可正常抵扣套餐地面价。
+  const total =
     singleSupplementTotal +
-      businessUpgradeTotal +
-      infantPriceTotal -
-      childSeatDiscountTotal -
-      selfVisaDeductTotal,
-  );
+    businessUpgradeTotal +
+    infantPriceTotal -
+    childSeatDiscountTotal -
+    selfVisaDeductTotal;
 
   return {
     total,
@@ -5437,6 +5441,37 @@ function serializePassengerRecord<P extends Record<string, unknown>>(
   return { ...rest, hasPassportPhoto };
 }
 
+/**
+ * 对外脱敏（A15）会从订单行 metadata 剥离的「我方内部计价明细」键。
+ * item.unitPrice / item.amount 已在 serializeOrder 里对外剥离，但 metadata 里还藏着逐座 / 逐加项的
+ * 计价拆解（如 perSeatBreakdown[].unitPrice、addOns 的各项费率与小计、operationFee、折扣百分比）——
+ * 代理凭此能反推我方成本与加价。对外角色一律剥掉这些**计价键**，保留非价格业务键
+ *（goDate/returnDate/roomsNeeded/hotelNights/pax/adultCount/childCount/infantCount/selfProvidedVisa…
+ * 代理要凭此替客人办事）。采用「剥离已知计价键」黑名单：新增业务键默认保留、不会被误删。
+ */
+const REDACTED_ITEM_METADATA_KEYS: readonly string[] = [
+  'perSeatBreakdown', // FLIGHT 逐座定价阶梯（含 unitPrice/bucket，能反推实时销量与档位价）
+  'addOns', // BUNDLE 升级重算明细（含单房差/升舱/儿童折扣/婴儿价/自备签费率与各项小计、total）
+  'operationFee', // BUNDLE 每人操作费（perPaxCny/totalCny）
+  'bundleDiscountPct', // BUNDLE 套餐折扣百分比
+  'perNightCny', // 补收单房差每晚价（售后调价行）
+  'unitPrice', // 任何行级单价明细
+];
+
+/**
+ * 对外脱敏：从订单行 metadata 剥离计价键，保留非价格业务键。
+ * metadata 为空 / 非对象 → 原样返回（不强行造对象）。
+ */
+function redactItemMetadataForExternal(metadata: unknown): unknown {
+  if (metadata == null || typeof metadata !== 'object' || Array.isArray(metadata)) return metadata;
+  const rest: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(metadata as Record<string, unknown>)) {
+    if (REDACTED_ITEM_METADATA_KEYS.includes(key)) continue;
+    rest[key] = value;
+  }
+  return rest;
+}
+
 // 导出供单测直接验证脱敏口径（redactForExternal）；运行时仍由本模块内部各读取/流转处调用。
 export function serializeOrder<T extends OrderLike>(
   order: T,
@@ -5552,6 +5587,11 @@ export function serializeOrder<T extends OrderLike>(
         //   保留 kind / description / quantity / 行程信息（航班号、出发日期等）等非价格字段。
         unitPrice: redact ? undefined : i.unitPrice.toString(),
         amount: redact ? undefined : i.amount.toString(),
+        // 对外脱敏：metadata 里的计价明细（perSeatBreakdown[].unitPrice、addOns、operationFee、
+        //   bundleDiscountPct…）同样是我方内部口径——剥离计价键，保留非价格业务键（内部角色原样透传）。
+        ...(redact
+          ? { metadata: redactItemMetadataForExternal((i as { metadata?: unknown }).metadata) }
+          : {}),
         hotelName: ownHotelName ?? bundleFallback?.hotelRoomType?.hotel?.name ?? null,
         // 计费房间数（Decimal → number；未联查/未盖章时为 null，原样透出不强行转换）。
         roomsBilled: decimalOrNull((i as { roomsBilled?: Prisma.Decimal | null }).roomsBilled),

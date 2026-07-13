@@ -336,8 +336,10 @@ export async function getHotelNightlyRemaining(
   hotelId: string,
   nightDates: readonly string[],
   client: PrismaClient = defaultPrisma,
-): Promise<{ remaining: number[]; hasBlock: boolean; block: number[] }> {
-  if (nightDates.length === 0) return { remaining: [], hasBlock: false, block: [] };
+): Promise<{ remaining: number[]; hasBlock: boolean; block: number[]; physicalRemaining: number[] }> {
+  if (nightDates.length === 0) {
+    return { remaining: [], hasBlock: false, block: [], physicalRemaining: [] };
+  }
   const fromD = toDateOnly(nightDates[0]);
   const toD = toDateOnly(nightDates[nightDates.length - 1]);
 
@@ -345,7 +347,9 @@ export async function getHotelNightlyRemaining(
     where: { hotelId, dateFrom: { lte: toD }, dateTo: { gte: fromD } },
     select: { dateFrom: true, dateTo: true, rooms: true },
   });
-  if (periods.length === 0) return { remaining: [], hasBlock: false, block: [] };
+  if (periods.length === 0) {
+    return { remaining: [], hasBlock: false, block: [], physicalRemaining: [] };
+  }
 
   // 占晚区间 [checkIn, checkOut) 与夜晚集合有交集 ⇔ checkIn <= 最后一晚 && checkOut > 第一晚
   const items = await client.orderItem.findMany({
@@ -356,12 +360,30 @@ export async function getHotelNightlyRemaining(
       hotelCheckOut: { gt: fromD },
       order: { deletedAt: null, status: { in: COUNTED_STATUSES } },
     },
-    select: { hotelCheckIn: true, hotelCheckOut: true, roomsBilled: true, metadata: true },
+    select: {
+      hotelCheckIn: true,
+      hotelCheckOut: true,
+      roomsBilled: true,
+      metadata: true,
+      // 拼房客性别（异性不能拼一间）——物理房间口径 physicalRemaining 需要，口径同 getBoard
+      order: { select: { passengers: { select: { gender: true } } } },
+    },
   });
 
   const block = expandBlockByDate(periods, nightDates);
   const used = expandUsedByDate(items, nightDates);
-  return { remaining: block.map((b, i) => b - used[i]), hasBlock: true, block };
+  // 物理房间口径（与销控板 getBoard / 房态导出同口径）：按性别分桶推算真实占用整间数，
+  // 而不是直接对床位用量取 ceil——避免"男+女各半间"被误算成 1 间（异性不能拼）。
+  const buckets = expandSharedHalfByDate(items, nightDates);
+  const physicalUsed = computePhysicalUsed(used, buckets);
+  const physicalRemaining = block.map((b, i) => round2(b - physicalUsed[i]));
+
+  return {
+    remaining: block.map((b, i) => b - used[i]),
+    hasBlock: true,
+    block,
+    physicalRemaining,
+  };
 }
 
 // ── 销控板（按酒店 × 日期）────────────────────────────────────────────────

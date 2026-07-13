@@ -12,10 +12,19 @@ import { describe, it, expect, vi } from 'vitest';
 // 模块链路（orders.export-templates → orders.service）顶层引用 prisma —— mock 掉
 vi.mock('../../db/prisma.js', () => ({ prisma: {} }));
 
+// 当日余房取数（buildDailyRemainingLookup）委托 getHotelNightlyRemaining —— mock 掉，
+// 单测只关心「拿到 physicalRemaining/remaining 后怎么选」，不重复覆盖房控内部查库逻辑
+// （房控自己的 getHotelNightlyRemaining 单测见 hotel-control.service.test.ts）。
+vi.mock('../hotel-control/hotel-control.service.js', () => ({
+  getHotelNightlyRemaining: vi.fn(),
+}));
+
 import type { PrismaClient } from '@prisma/client';
+import { getHotelNightlyRemaining } from '../hotel-control/hotel-control.service.js';
 import {
   buildRoomAllocationSheets,
   buildRoomAllocationWorkbook,
+  buildDailyRemainingLookup,
   roomAllocationExportFilename,
   roomAllocationExportFilenameByDepart,
   COLUMNS,
@@ -230,6 +239,8 @@ function roomNoItem(opts: {
     roomFraction?: number;
     passengerIds: string[];
   }>;
+  /** passengerId → 性别（'M'/'F'/'X'/null）；缺省视为未知（null）。*/
+  genders?: Record<string, string | null>;
 }): RoomItemForExport {
   return {
     // 单元测试各自独立一单一 item，orderId 用酒店名即可保证跨用例不撞号
@@ -251,7 +262,7 @@ function roomNoItem(opts: {
         fullName: `客${id}`,
         lastName: null,
         firstName: null,
-        gender: null,
+        gender: opts.genders?.[id] ?? null,
         dateOfBirth: D('1990-01-01'),
         documentNumber: `X${i}`,
         passportExpiry: null,
@@ -269,13 +280,14 @@ describe('buildRoomAllocationSheets 房间号', () => {
     expect(r2.roomNo).toBe('房1'); // p2 → B酒店，另一酒店独立从 1 起
   });
 
-  it('同酒店未分房乘客按容量打包：满 capacity 开新房', () => {
+  it('同酒店未分房乘客按容量打包：满 capacity 开新房（同性别才拼房）', () => {
     const [sheet] = buildRoomAllocationSheets([
       roomNoItem({
         checkIn: '2026-08-01',
         hotelName: 'D酒店',
         capacity: 2,
         passengerIds: ['a', 'b', 'c'],
+        genders: { a: 'M', b: 'M', c: 'M' },
       }),
     ]);
     expect(sheet.rows.map((r) => r.roomNo)).toEqual(['房1', '房1', '房2']);
@@ -308,6 +320,70 @@ describe('buildRoomAllocationSheets 房间号', () => {
       }),
     ]);
     expect(sheet.rows.map((r) => r.roomNo)).toEqual(['房1(½)', '房1(½)']);
+  });
+});
+
+/**
+ * 回归：自动打包（未人工分房）曾经按取数顺序无视性别按容量硬拼，会把一男一女塞进同一
+ * 物理房间号——与销控"异性不能拼一间"口径矛盾（见 hotel-control.service.ts
+ * computePhysicalUsed 的 JSDoc）。修复后未分房乘客先按性别分组，组内再按容量打包。
+ */
+describe('buildRoomAllocationSheets 房间号 — 自动打包按性别分组（异性不拼同房号）', () => {
+  it('一男一女两个未分房乘客 → 各自开新房，不是同一个房号', () => {
+    const [sheet] = buildRoomAllocationSheets([
+      roomNoItem({
+        checkIn: '2026-08-05',
+        hotelName: 'H酒店',
+        capacity: 2,
+        passengerIds: ['m1', 'f1'],
+        genders: { m1: 'M', f1: 'F' },
+      }),
+    ]);
+    const byDoc = new Map(sheet.rows.map((r) => [r.documentNumber, r.roomNo]));
+    expect(byDoc.get('X0')).toBe('房1'); // m1
+    expect(byDoc.get('X1')).toBe('房2'); // f1
+    expect(sheet.rows.map((r) => r.roomNo)).toEqual(['房1', '房2']);
+  });
+
+  it('2 男 + 1 女未分房：男生两两拼房，女生单独开房，互不混住', () => {
+    const [sheet] = buildRoomAllocationSheets([
+      roomNoItem({
+        checkIn: '2026-08-06',
+        hotelName: 'I酒店',
+        capacity: 2,
+        passengerIds: ['m1', 'm2', 'f1'],
+        genders: { m1: 'M', m2: 'M', f1: 'F' },
+      }),
+    ]);
+    // m1/m2 同房（男生组按容量打包）；f1 女生组另开一间——不是 3 人硬凑成 2 间混住
+    expect(sheet.rows.map((r) => r.roomNo)).toEqual(['房1', '房1', '房2']);
+  });
+
+  it('性别未知（X / 缺失）不与任何人拼房，各自单间', () => {
+    const [sheet] = buildRoomAllocationSheets([
+      roomNoItem({
+        checkIn: '2026-08-07',
+        hotelName: 'J酒店',
+        capacity: 2,
+        passengerIds: ['u1', 'u2'],
+        genders: { u1: 'X', u2: null },
+      }),
+    ]);
+    expect(sheet.rows.map((r) => r.roomNo)).toEqual(['房1', '房2']);
+  });
+
+  it('人工分房组不受性别分组影响：组内异性仍共号（人工分房为准）', () => {
+    const [sheet] = buildRoomAllocationSheets([
+      roomNoItem({
+        checkIn: '2026-08-08',
+        hotelName: 'K酒店',
+        capacity: 2,
+        passengerIds: ['m1', 'f1'],
+        genders: { m1: 'M', f1: 'F' },
+        roomGroups: [{ id: 'grpMF', hotelName: 'K酒店', passengerIds: ['m1', 'f1'] }],
+      }),
+    ]);
+    expect(sheet.rows.map((r) => r.roomNo)).toEqual(['房1', '房1']);
   });
 });
 
@@ -460,6 +536,52 @@ describe('roomAllocationExportFilename', () => {
 
   it('按出发日文件名', () => {
     expect(roomAllocationExportFilenameByDepart('2026-07-10')).toBe('分房表_出发2026-07-10.xlsx');
+  });
+});
+
+/**
+ * 回归：「当日余房」列曾经取床位口径 remaining（拼房场景会出现 8.5 这种物理上不存在的
+ * 半间余量），与房态导出/销控板的物理房间口径不一致。修复后改取 getHotelNightlyRemaining
+ * 新增的 physicalRemaining。这里 mock 掉 getHotelNightlyRemaining 本身（其内部查库口径由
+ * hotel-control.service.test.ts 覆盖），只验证 buildDailyRemainingLookup 选用了哪个字段。
+ */
+describe('buildDailyRemainingLookup — 当日余房取物理房间口径（不是床位口径）', () => {
+  it('remaining=8.5（床位口径）而 physicalRemaining=8（物理口径）时，取 8', async () => {
+    vi.mocked(getHotelNightlyRemaining).mockResolvedValue({
+      remaining: [8.5],
+      physicalRemaining: [8],
+      block: [10],
+      hasBlock: true,
+    });
+
+    const items = [
+      {
+        hotelRoomType: { hotelId: 'h1' },
+        hotelCheckIn: D('2026-09-01'),
+      },
+    ] as unknown as RoomItemForExport[];
+
+    const lookup = await buildDailyRemainingLookup(items, {} as PrismaClient);
+
+    expect(lookup.get('h1|2026-09-01')).toBe('8');
+    expect(getHotelNightlyRemaining).toHaveBeenCalledWith('h1', ['2026-09-01'], {});
+  });
+
+  it('block[i]===0（该晚无周期覆盖）→ "未配"，不据 physicalRemaining 判断', async () => {
+    vi.mocked(getHotelNightlyRemaining).mockResolvedValue({
+      remaining: [3],
+      physicalRemaining: [3],
+      block: [0],
+      hasBlock: true,
+    });
+
+    const items = [
+      { hotelRoomType: { hotelId: 'h2' }, hotelCheckIn: D('2026-09-02') },
+    ] as unknown as RoomItemForExport[];
+
+    const lookup = await buildDailyRemainingLookup(items, {} as PrismaClient);
+
+    expect(lookup.get('h2|2026-09-02')).toBe('未配');
   });
 });
 

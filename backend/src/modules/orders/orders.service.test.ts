@@ -793,7 +793,7 @@ describe('computeBundleAddOn', () => {
     const r = computeBundleAddOn(bundle, stamp, 0, 0, occ(2, 1, 0), 3);
     expect(r.breakdown.childSeatDiscountTotal).toBe(30);
     expect(r.breakdown.infantPriceTotal).toBe(0);
-    expect(r.total).toBe(0); // 0 升级 + 0 婴儿 − 30 折扣 → clamp 到 0（无其他正向项时）
+    expect(r.total).toBe(-30); // 0 升级 + 0 婴儿 − 30 折扣（加项净额允许为负；非负保护在行金额层）
     expect(r.hasAddOn).toBe(true);
     expect(r.breakdown).toMatchObject({ adultCount: 2, childCount: 1, infantCount: 0, seatPax: 3, headCount: 3 });
   });
@@ -816,7 +816,7 @@ describe('computeBundleAddOn', () => {
     expect(r.hasAddOn).toBe(true);
   });
 
-  it('2 大 1 小 1 婴（折扣 30、婴儿价 0）→ 折扣 30、婴儿 0、净 0（升级机票仍在 FLIGHT 行）', () => {
+  it('2 大 1 小 1 婴（折扣 30、婴儿价 0）→ 折扣 30、婴儿 0、净 −30（升级机票仍在 FLIGHT 行）', () => {
     const r = computeBundleAddOn(bundle, stamp, 0, 0, occ(2, 1, 1), 3);
     expect(r.breakdown).toMatchObject({
       adultCount: 2,
@@ -828,7 +828,7 @@ describe('computeBundleAddOn', () => {
       childSeatDiscountTotal: 30,
       infantPriceTotal: 0,
     });
-    expect(r.total).toBe(0); // 升级 0 + 婴儿 0 − 折扣 30 → clamp 0
+    expect(r.total).toBe(-30); // 升级 0 + 婴儿 0 − 折扣 30（加项净额允许为负；非负保护在行金额层）
   });
 
   it('businessCount 夹到占座人数（seatPax）上限：2 大 0 小，businessCount=5 → 只算 2 段商务', () => {
@@ -845,12 +845,12 @@ describe('computeBundleAddOn', () => {
   // ── 自备签证减钱（旧整单口径：count=1）────────────────────────────────
   it('自备签证：selfProvidedVisaCount=1（整单减一次）→ 套餐行净减该套餐配置的 selfVisaDeductCny', () => {
     const cfg = { ...bundle, selfVisaDeductCny: 600 };
-    // 单人入住 1 人 × 80 × 3 = 240；自备签证减 600 → 240 − 600 → clamp 0
+    // 单人入住 1 人 × 80 × 3 = 240；自备签证减 600 → 240 − 600 = −360（加项净额允许为负）
     const withDeduct = computeBundleAddOn(cfg, stamp, 1, 0, occ(2), 3, 1);
     expect(withDeduct.breakdown.selfVisaDeductTotal).toBe(600);
     expect(withDeduct.breakdown.selfProvidedVisaCount).toBe(1);
     expect(withDeduct.breakdown.selfProvidedVisa).toBe(true);
-    expect(withDeduct.total).toBe(0); // 240 − 600 clamp 0
+    expect(withDeduct.total).toBe(-360); // 240 − 600（非负保护下沉到行金额层，不在此夹 0）
     expect(withDeduct.hasAddOn).toBe(true);
     // 升级足够大时确实减进去：升舱 1 人 × 700 × 2 = 1400 − 600 = 800
     const r = computeBundleAddOn(cfg, stamp, 0, 1, occ(2), 3, 1);
@@ -883,6 +883,68 @@ describe('computeBundleAddOn', () => {
     expect(r.breakdown.selfProvidedVisaCount).toBe(2);
     expect(r.breakdown.selfVisaDeductTotal).toBe(1000);
     expect(r.total).toBe(1800);
+  });
+});
+
+// ── 套餐行金额：自备签减免正常抵扣地面价（693 场景）+ 减免超地面价夹 0 ──────────────
+// createOrder 的 BUNDLE 行金额口径：amount = max(0, bundleUnitPrice×qty + addOn.total + operationFeeTotal)，
+// 之后再对该套餐的 BUNDLE/FLIGHT 行整体 percent-off。这里在纯函数层复刻这条流水线，验证减免不再被
+// 「加项净额层夹 0」吞掉（修复前 addOn.total 被 max(0,…) 钳成 0，无其它加价时减免一分不减）。
+describe('套餐行金额：自备签减免抵扣 + 极端夹 0（复刻 createOrder BUNDLE 行）', () => {
+  const stamp = {
+    hotelCheckIn: new Date('2026-07-01'),
+    hotelCheckOut: new Date('2026-07-04'), // 3 晚
+  };
+  const occ = (adultCount: number, childCount = 0, infantCount = 0) =>
+    resolveBundleOccupancy({ adultCount, childCount, infantCount });
+
+  /** 复刻 createOrder：套餐行金额（含非负保护），再套 percent-off。 */
+  const bundleLineAmount = (
+    bundleUnitPrice: number,
+    qty: number,
+    addOnTotal: number,
+    operationFeeTotal: number,
+  ) => Math.max(0, bundleUnitPrice * qty + addOnTotal + operationFeeTotal);
+  const applyDiscount = (amount: number, pct: number) => Math.round(amount * ((100 - pct) / 100));
+
+  it('693 场景：1 成人仅自备签（visaExempt）→ (600 地面 + 300 签证 − 150 减免 + 20 操作费) × 0.9 = 693', () => {
+    // 仅配自备签减免（其它加项费率全 0），验证减免单独存在时也能抵扣：
+    const cfg = {
+      hotelNights: 3,
+      singleSupplementCnyPerNight: 0,
+      businessUpgradeCnyPerLeg: 0,
+      childSeatDiscountCnyPerPerson: 0,
+      infantPriceCny: 0,
+      selfVisaDeductCny: 150,
+      legs: 2,
+    };
+    // 1 成人，自备签 1 人 → addOn.total = −150（修复前会被夹成 0）
+    const addOn = computeBundleAddOn(cfg, stamp, 0, 0, occ(1), 3, 1);
+    expect(addOn.total).toBe(-150);
+    expect(addOn.breakdown.selfVisaDeductTotal).toBe(150);
+
+    // bundleUnitPrice = 地面价 = 3 晚 × 400 × 0.5 间(600) + 签证 300 = 900；操作费 20；qty 1
+    const amount = bundleLineAmount(900, 1, addOn.total, 20);
+    expect(amount).toBe(770); // 900 − 150 + 20（修复前为 900 − 0 + 20 = 920）
+    expect(applyDiscount(amount, 10)).toBe(693); // 770 × 0.9（修复前 920 × 0.9 = 828）
+  });
+
+  it('极端：自备签减免大于地面总价 → 行金额夹到 0，绝不为负', () => {
+    const cfg = {
+      hotelNights: 3,
+      singleSupplementCnyPerNight: 0,
+      businessUpgradeCnyPerLeg: 0,
+      childSeatDiscountCnyPerPerson: 0,
+      infantPriceCny: 0,
+      selfVisaDeductCny: 600,
+      legs: 2,
+    };
+    const addOn = computeBundleAddOn(cfg, stamp, 0, 0, occ(1), 3, 1);
+    expect(addOn.total).toBe(-600);
+    // 地面 300 + 操作费 20 = 320，减免 600 → 320 − 600 = −280 → 夹到 0
+    const amount = bundleLineAmount(300, 1, addOn.total, 20);
+    expect(amount).toBe(0);
+    expect(applyDiscount(amount, 10)).toBe(0); // 折扣作用在 0 上仍为 0，不为负
   });
 });
 

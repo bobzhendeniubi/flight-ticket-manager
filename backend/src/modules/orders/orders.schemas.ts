@@ -8,6 +8,7 @@ import {
   OrderStatus,
   PassengerType,
   PaymentMethod,
+  UserRole,
   VisaRequirement,
 } from '@prisma/client';
 
@@ -647,6 +648,43 @@ export const swapPassengerBodySchema = z
     { message: '换人请求需至少包含一项身份变更 / 重置 / 费用' },
   );
 export type SwapPassengerBody = z.infer<typeof swapPassengerBodySchema>;
+
+/**
+ * PATCH /orders/:id/passengers/:passengerId 的「换人语义字段」——只出现在换人（swap）语义里、
+ * 补录 schema（selfUpdatePassengerBodySchema）里没有的键。请求体带其中任一，即表达「换成另一个人 /
+ * 重置开票或签证 / 收换人费」的意图，唯一指向换人分支。
+ * （chineseName/documentNumber/dateOfBirth/gender/nationality 两个 schema 都有，不能用来区分，故不列。）
+ */
+export const SWAP_PASSENGER_SEMANTIC_FIELDS: readonly string[] = [
+  'lastName',
+  'firstName',
+  'fullName',
+  'resetInvoice',
+  'resetVisa',
+  'feeCny',
+  'feeLabel',
+  'note',
+];
+
+/**
+ * 同一路径双通道判定（纯函数，供路由与单测复用）：返回 'SWAP' 走换人分支，'SELF_UPDATE' 走补录分支。
+ *
+ * 判定规则：
+ *   - CUSTOMER / AGENT（前台）：一律 'SELF_UPDATE'（自助补录护照/证件资料；换人只能联系客服）。
+ *   - ADMIN / STAFF（运营）：请求体带任一「换人语义字段」→ 'SWAP'（换人）；否则 → 'SELF_UPDATE'
+ *     （运营只想补 passportIssueDate/passportExpiry/护照图 等证件资料时，走补录同款更新路径，
+ *      不该被换人 schema 400——换人 schema 无护照字段）。
+ */
+export function resolvePassengerPatchChannel(
+  role: UserRole,
+  body: unknown,
+): 'SWAP' | 'SELF_UPDATE' {
+  const isInternal = role === UserRole.ADMIN || role === UserRole.STAFF;
+  if (!isInternal) return 'SELF_UPDATE';
+  const raw = (body ?? {}) as Record<string, unknown>;
+  const hasSwapSemantics = SWAP_PASSENGER_SEMANTIC_FIELDS.some((key) => raw[key] !== undefined);
+  return hasSwapSemantics ? 'SWAP' : 'SELF_UPDATE';
+}
 
 // ── B4: 改结算价（ADMIN/STAFF）────────────────────────────────────────────────
 // PATCH /orders/:id/items/:itemId/settlement-price

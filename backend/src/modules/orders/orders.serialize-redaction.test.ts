@@ -68,6 +68,38 @@ function buildOrder() {
         quantity: 2,
         unitPrice: dec(500),
         amount: dec(1000),
+        // metadata 混合：计价键（perSeatBreakdown 含逐座 unitPrice）+ 业务键（出发日期）
+        metadata: {
+          perSeatBreakdown: [
+            { seatIndex: 1, bucket: 0, bucketMultiplier: 1, unitPrice: 480 },
+            { seatIndex: 2, bucket: 0, bucketMultiplier: 1, unitPrice: 520 },
+          ],
+          goDate: '2026-08-01',
+          businessUpgradeCount: 0,
+        },
+      },
+      {
+        id: 'it2',
+        kind: 'BUNDLE',
+        description: '三亚 5 日跟团套餐',
+        quantity: 1,
+        unitPrice: dec(3000),
+        amount: dec(3200),
+        // metadata 混合：计价键（addOns/operationFee/bundleDiscountPct）+ 业务键（房间/晚数/乘客构成）
+        metadata: {
+          addOns: {
+            singleSupplementCnyPerNight: 80,
+            selfVisaDeductCny: 150,
+            total: -150,
+          },
+          operationFee: { perPaxCny: 20, pax: 2, totalCny: 40 },
+          bundleDiscountPct: 10,
+          roomsNeeded: 1,
+          hotelNights: 4,
+          adultCount: 2,
+          childCount: 0,
+          infantCount: 0,
+        },
       },
     ],
   };
@@ -120,6 +152,14 @@ describe('serializeOrder · ADMIN/STAFF 视角（不脱敏）', () => {
     expect(out.passengers[0].passportPhotoUrl).toBe('data:image/png;base64,AAAA');
     expect(out.passengers[0].hasPassportPhoto).toBe(true);
   });
+
+  it('保留订单行 metadata 计价明细（perSeatBreakdown / addOns / operationFee / bundleDiscountPct）', () => {
+    expect(out.items[0].metadata.perSeatBreakdown).toHaveLength(2);
+    expect(out.items[0].metadata.perSeatBreakdown[0].unitPrice).toBe(480);
+    expect(out.items[1].metadata.addOns.total).toBe(-150);
+    expect(out.items[1].metadata.operationFee.totalCny).toBe(40);
+    expect(out.items[1].metadata.bundleDiscountPct).toBe(10);
+  });
 });
 
 describe('serializeOrder · AGENT/CUSTOMER 视角（脱敏）', () => {
@@ -154,6 +194,22 @@ describe('serializeOrder · AGENT/CUSTOMER 视角（脱敏）', () => {
     expect(out.passengers[0].documentNumber).toBe('E12345678');
     expect(out.passengers[0].passportPhotoUrl).toBeUndefined();
     expect(out.passengers[0].hasPassportPhoto).toBe(true);
+  });
+
+  it('剥离订单行 metadata 计价明细（perSeatBreakdown/addOns/operationFee/bundleDiscountPct），保留非价格业务键', () => {
+    // FLIGHT 行：逐座定价明细（含 unitPrice）剥离，出发日期等业务键保留
+    expect(out.items[0].metadata.perSeatBreakdown).toBeUndefined();
+    expect(out.items[0].metadata.goDate).toBe('2026-08-01');
+    expect(out.items[0].metadata.businessUpgradeCount).toBe(0);
+    // BUNDLE 行：加项/操作费/折扣百分比剥离，房间数/晚数/乘客构成计数保留
+    expect(out.items[1].metadata.addOns).toBeUndefined();
+    expect(out.items[1].metadata.operationFee).toBeUndefined();
+    expect(out.items[1].metadata.bundleDiscountPct).toBeUndefined();
+    expect(out.items[1].metadata.roomsNeeded).toBe(1);
+    expect(out.items[1].metadata.hotelNights).toBe(4);
+    expect(out.items[1].metadata.adultCount).toBe(2);
+    expect(out.items[1].metadata.childCount).toBe(0);
+    expect(out.items[1].metadata.infantCount).toBe(0);
   });
 
   it('保留订单总价与派生结清口径（= 该角色自己的结算价）以及非金额代理字段', () => {

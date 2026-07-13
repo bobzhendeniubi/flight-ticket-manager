@@ -34,6 +34,7 @@ vi.mock('../../lib/audit.js', () => ({
 }));
 
 import { OrderService } from './orders.service.js';
+import { resolvePassengerPatchChannel } from './orders.schemas.js';
 import { AppError, ForbiddenError, NotFoundError } from '../../lib/errors.js';
 
 const service = new OrderService();
@@ -118,6 +119,63 @@ describe('selfUpdatePassenger', () => {
     expect(result.passenger).not.toHaveProperty('passportPhotoUrl');
     expect(result.passenger.hasPassportPhoto).toBe(true);
     expect(result.orderNumber).toBe('FTM20260709001');
+  });
+
+  it('运营补录（ADMIN/STAFF）：非本人单也放行、仅更新证件字段', async () => {
+    // 归属校验对 ADMIN/STAFF 直接放行（assertCanView）——运营可替任意订单补录护照资料。
+    const OPS = { userId: 'admin1', role: UserRole.STAFF };
+    mockPrisma.order.findUnique.mockResolvedValue({ ...orderRow, userId: 'someone-else' });
+    mockPrisma.passenger.findUnique.mockResolvedValue({ id: 'p1', orderId: 'o1' });
+    mockPrisma.passenger.update.mockResolvedValue({
+      id: 'p1',
+      fullName: 'ZHANG SAN',
+      passportIssueDate: new Date('2020-03-15'),
+      passportExpiry: new Date('2030-03-14'),
+    });
+
+    const result = await service.selfUpdatePassenger(
+      'o1',
+      'p1',
+      { passportIssueDate: '2020-03-15', passportExpiry: '2030-03-14' },
+      OPS,
+    );
+    const updateArg = mockPrisma.passenger.update.mock.calls[0][0];
+    expect(Object.keys(updateArg.data).sort()).toEqual(['passportExpiry', 'passportIssueDate']);
+    expect(result.changedFields.sort()).toEqual(['passportExpiry', 'passportIssueDate']);
+  });
+});
+
+// ── 1b. resolvePassengerPatchChannel（补录 vs 换人 双通道判定）──────────────────
+describe('resolvePassengerPatchChannel', () => {
+  it('前台角色（CUSTOMER/AGENT）一律走补录', () => {
+    for (const role of [UserRole.CUSTOMER, UserRole.AGENT]) {
+      expect(resolvePassengerPatchChannel(role, { passportExpiry: '2030-01-01' })).toBe('SELF_UPDATE');
+      // 前台即便误带换人语义字段也判为补录（后续 schema 严格解析会自然拒绝换人字段）
+      expect(resolvePassengerPatchChannel(role, { fullName: 'NEW PERSON' })).toBe('SELF_UPDATE');
+    }
+  });
+
+  it('运营（ADMIN/STAFF）仅护照/证件字段（无换人语义字段）→ 补录', () => {
+    for (const role of [UserRole.ADMIN, UserRole.STAFF]) {
+      expect(
+        resolvePassengerPatchChannel(role, { passportIssueDate: '2020-03-15', passportPhotoUrl: 'data:image/png;base64,AAAA' }),
+      ).toBe('SELF_UPDATE');
+      expect(resolvePassengerPatchChannel(role, { documentNumber: 'E12345678', dateOfBirth: '1990-01-01' })).toBe('SELF_UPDATE');
+    }
+  });
+
+  it('运营（ADMIN/STAFF）带换人语义字段 → 换人', () => {
+    for (const role of [UserRole.ADMIN, UserRole.STAFF]) {
+      expect(resolvePassengerPatchChannel(role, { fullName: 'NEW PERSON' })).toBe('SWAP');
+      expect(resolvePassengerPatchChannel(role, { resetVisa: true })).toBe('SWAP');
+      expect(resolvePassengerPatchChannel(role, { feeCny: 100 })).toBe('SWAP');
+    }
+  });
+
+  it('运营字段混合（证件字段 + 换人语义字段）→ 换人（换人语义字段一票判定）', () => {
+    expect(
+      resolvePassengerPatchChannel(UserRole.ADMIN, { documentNumber: 'E99', fullName: 'NEW PERSON' }),
+    ).toBe('SWAP');
   });
 });
 

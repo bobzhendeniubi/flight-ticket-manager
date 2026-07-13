@@ -168,7 +168,22 @@ async function buildVisaSheetBuffer(passengers: Passenger[]): Promise<Buffer> {
   return Buffer.from(buf);
 }
 
+/**
+ * 从图片来源推断文件扩展名（打包 zip 时用于命名）。
+ *   - data URI（`data:image/<mime>;base64,...`，OCR/小程序直传常见落库形态）：
+ *     按 MIME type 映射扩展名——原实现只匹配 URL 路径后缀，data URI 没有路径后缀可匹配，
+ *     导致 PNG/WEBP/GIF 图一律被误标成 .jpg（图内容与后缀不符，部分看图软件打不开）。
+ *   - 普通 URL：维持原口径，按路径末尾扩展名匹配。
+ *   - 都匹配不到：兜底 .jpg（沿用原有行为）。
+ */
 export function extFromUrl(u: string): string {
+  const dataUriMatch = u.match(/^data:image\/([a-z0-9.+-]+)/i);
+  if (dataUriMatch) {
+    const mime = dataUriMatch[1].toLowerCase();
+    if (mime === 'png' || mime === 'webp' || mime === 'gif') return mime;
+    if (mime === 'jpeg' || mime === 'jpg') return 'jpg';
+    return 'jpg'; // 其余/未知 MIME（如 svg+xml）沿用兜底，不引入未知后缀
+  }
   const m = u.match(/\.(jpe?g|png|webp|heic|gif)(?:\?|$)/i);
   return m ? m[1].toLowerCase().replace('jpeg', 'jpg') : 'jpg';
 }

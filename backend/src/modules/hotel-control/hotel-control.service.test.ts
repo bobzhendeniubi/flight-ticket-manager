@@ -24,6 +24,7 @@ import {
   getBoard,
   getOccupyingOrders,
   getNightlyRemainingForRoomType,
+  getHotelNightlyRemaining,
   expandSharedHalfByDate,
   computePhysicalUsed,
 } from './hotel-control.service.js';
@@ -387,6 +388,62 @@ describe('getBoard physicalUsed / physicalRemaining', () => {
     expect(rows.physicalRemaining).toEqual([8]);
     // 两位都落单（无法互相配对）
     expect(rows.sharedUnpaired).toEqual([2]);
+  });
+});
+
+/**
+ * getHotelNightlyRemaining 返回物理房间口径 physicalRemaining（分房表「当日余房」列消费）：
+ * 与 getBoard 的 physicalRemaining 同公式（expandSharedHalfByDate + computePhysicalUsed），
+ * 床位口径 remaining 保持原值不动——既有调用方（前台可售/下单校验等）不受影响。
+ */
+describe('getHotelNightlyRemaining physicalRemaining（物理房间口径）', () => {
+  const male = { order: { passengers: [{ gender: 'M' }] } };
+  const female = { order: { passengers: [{ gender: 'F' }] } };
+
+  function nightlyClient(orderItems: unknown[], rooms = 10): PrismaClient {
+    return {
+      hotelBlockPeriod: {
+        findMany: vi.fn().mockResolvedValue([
+          { hotelId: 'h1', dateFrom: day(0), dateTo: day(2), rooms },
+        ]),
+      },
+      orderItem: { findMany: vi.fn().mockResolvedValue(orderItems) },
+    } as unknown as PrismaClient;
+  }
+
+  it('一男一女各 1 位拼房客（block=10）→ remaining=9（床位）、physicalRemaining=8（物理）', async () => {
+    const client = nightlyClient([
+      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.5, ...male },
+      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.5, ...female },
+    ]);
+    const res = await getHotelNightlyRemaining('h1', [dayStr(0)], client);
+    expect(res.hasBlock).toBe(true);
+    // 床位口径维持原值（0.5+0.5=1 → 10-1=9）
+    expect(res.remaining).toEqual([9]);
+    // 物理口径：异性不能拼一间 → 各占 1 间 → 10-2=8（不是 8.5/9）
+    expect(res.physicalRemaining).toEqual([8]);
+  });
+
+  it('两男拼房 + 1 整间 → remaining=8（床位 2）、physicalRemaining=8（物理 2，同性可拼）', async () => {
+    const client = nightlyClient([
+      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.5, ...male },
+      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.5, ...male },
+      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 1, ...male },
+    ]);
+    const res = await getHotelNightlyRemaining('h1', [dayStr(0)], client);
+    expect(res.remaining).toEqual([8]);
+    expect(res.physicalRemaining).toEqual([8]);
+  });
+
+  it('无周期（hasBlock=false）→ physicalRemaining 同为空数组', async () => {
+    const client = {
+      hotelBlockPeriod: { findMany: vi.fn().mockResolvedValue([]) },
+      orderItem: { findMany: vi.fn() },
+    } as unknown as PrismaClient;
+    const res = await getHotelNightlyRemaining('h1', [dayStr(0)], client);
+    expect(res.hasBlock).toBe(false);
+    expect(res.remaining).toEqual([]);
+    expect(res.physicalRemaining).toEqual([]);
   });
 });
 

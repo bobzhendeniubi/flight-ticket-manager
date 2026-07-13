@@ -593,7 +593,7 @@ export interface VisaRow {
   occupation: string; // 暂无数据 — 留空
   workplace: string; // 暂无数据 — 留空
   passportNumber: string;
-  issueDate: string; // 暂无数据 — 留空
+  issueDate: string; // Passenger.passportIssueDate（dd-mm-yyyy），缺失留空
   expiryDate: string;
   departDate: string;
 }
@@ -642,7 +642,7 @@ export function orderToVisaRows(order: OrderForTemplateExport, ctx: OrderContext
     occupation: '',
     workplace: '',
     passportNumber: p.documentNumber,
-    issueDate: '',
+    issueDate: fmtDateDMYDash(p.passportIssueDate),
     expiryDate: fmtDateDMYDash(p.passportExpiry),
     departDate: ctx.travelDates,
   }));

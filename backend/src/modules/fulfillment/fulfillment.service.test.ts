@@ -82,6 +82,87 @@ describe('FulfillmentService.listByOrder — 签证台过滤自备签乘客', ()
       select: { id: true, fullName: true, documentNumber: true, passportPhotoUrl: true },
     });
   });
+
+  it('过滤父订单：已软删（deletedAt 非空）/ 取消族状态的订单任务不再出现', async () => {
+    const orderItemFindMany = vi.fn().mockResolvedValue([]);
+    const passengerFindMany = vi.fn().mockResolvedValue([]);
+    const p = prisma as unknown as {
+      orderItem: { findMany: typeof orderItemFindMany };
+      passenger: { findMany: typeof passengerFindMany };
+      $transaction: (ops: unknown[]) => Promise<unknown[]>;
+    };
+    p.orderItem = { findMany: orderItemFindMany };
+    p.passenger = { findMany: passengerFindMany };
+    p.$transaction = async (ops: unknown[]) => Promise.all(ops as Promise<unknown>[]);
+
+    const service = new FulfillmentService();
+    await service.listByOrder('order-9');
+
+    // 与订单/财务导出同一补集口径：排除 DRAFT/PAYMENT_TIMEOUT/CANCELLED/REFUNDED/FAILED
+    const { where } = orderItemFindMany.mock.calls[0][0] as {
+      where: { orderId: string; order: { deletedAt: null; status: { in: string[] } } };
+    };
+    expect(where.orderId).toBe('order-9');
+    expect(where.order.deletedAt).toBeNull();
+    const counted = where.order.status.in;
+    for (const excluded of ['DRAFT', 'PAYMENT_TIMEOUT', 'CANCELLED', 'REFUNDED', 'FAILED']) {
+      expect(counted).not.toContain(excluded);
+    }
+    expect(counted).toContain('PAID');
+    expect(counted).toContain('REFUND_REQUESTED'); // 退款申请中仍在册（未终态）
+  });
+});
+
+describe('FulfillmentService.list — 签证台列表过滤已取消/软删父订单', () => {
+  it('主查询 where 恒挂父订单过滤（deletedAt=null + 取消族排除）；orderId 筛选与之合并', async () => {
+    const taskFindMany = vi.fn().mockResolvedValue([]);
+    const taskCount = vi.fn().mockResolvedValue(0);
+    const p = prisma as unknown as {
+      fulfillmentTask: { findMany: typeof taskFindMany; count: typeof taskCount };
+      $transaction: (ops: unknown[]) => Promise<unknown[]>;
+    };
+    p.fulfillmentTask = { findMany: taskFindMany, count: taskCount };
+    p.$transaction = async (ops: unknown[]) => Promise.all(ops as Promise<unknown>[]);
+
+    const service = new FulfillmentService();
+    await service.list({ orderId: 'order-1', page: 1, pageSize: 50 });
+
+    const { where } = taskFindMany.mock.calls[0][0] as {
+      where: {
+        orderItem: { orderId?: string; order: { deletedAt: null; status: { in: string[] } } };
+      };
+    };
+    // orderId 筛选与父订单过滤合并在同一个 orderItem 关系过滤里（不互相覆盖）
+    expect(where.orderItem.orderId).toBe('order-1');
+    expect(where.orderItem.order.deletedAt).toBeNull();
+    for (const excluded of ['DRAFT', 'PAYMENT_TIMEOUT', 'CANCELLED', 'REFUNDED', 'FAILED']) {
+      expect(where.orderItem.order.status.in).not.toContain(excluded);
+    }
+  });
+
+  it('无 orderId 筛选时父订单过滤依旧存在（全局签证台视图也不残留取消单）', async () => {
+    const taskFindMany = vi.fn().mockResolvedValue([]);
+    const taskCount = vi.fn().mockResolvedValue(0);
+    const p = prisma as unknown as {
+      fulfillmentTask: { findMany: typeof taskFindMany; count: typeof taskCount };
+      $transaction: (ops: unknown[]) => Promise<unknown[]>;
+    };
+    p.fulfillmentTask = { findMany: taskFindMany, count: taskCount };
+    p.$transaction = async (ops: unknown[]) => Promise.all(ops as Promise<unknown>[]);
+
+    const service = new FulfillmentService();
+    await service.list({ page: 1, pageSize: 50 });
+
+    const { where } = taskFindMany.mock.calls[0][0] as {
+      where: {
+        orderItem: { orderId?: string; order: { deletedAt: null; status: { in: string[] } } };
+      };
+    };
+    expect(where.orderItem.orderId).toBeUndefined();
+    expect(where.orderItem.order.deletedAt).toBeNull();
+    expect(where.orderItem.order.status.in).toContain('PAID');
+    expect(where.orderItem.order.status.in).not.toContain('CANCELLED');
+  });
 });
 
 describe('FulfillmentService.listPassengerPhotos', () => {
