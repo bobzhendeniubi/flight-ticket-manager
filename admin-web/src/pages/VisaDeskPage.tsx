@@ -7,6 +7,7 @@
  *   GET  /orders/:id/passport-photos.zip                   下载护照包（送签用）
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
 import {
   api,
   ApiError,
@@ -41,20 +42,32 @@ const BATCH_TARGETS: Array<{ value: FulfillmentStatus; label: string }> = [
   { value: 'CONFIRMED', label: '已送签' },
 ];
 
-// 后端 batch-status 单次最多 100 条
+// 后端 batch-status / batch-notes 单次最多 100 条
 const BATCH_LIMIT = 100;
+
+// 列表单页拉取上限（与后端一致）；命中总数超过时列表提示「仅显示前 N 条」，引导用筛选缩小范围
+const PAGE_SIZE = 200;
 
 // 状态筛选：OPEN = 待处理 + 材料准备（默认）；ALL = 全部
 type StatusFilter = 'OPEN' | 'ALL' | FulfillmentStatus;
 
+// 状态筛选收敛到签证岗真正会用的 4 档（后端参数不变，纯前端收敛）
 const FILTER_OPTIONS: Array<{ value: StatusFilter; label: string }> = [
-  { value: 'OPEN', label: '待处理 + 材料准备（默认）' },
-  { value: 'CONFIRMED', label: '已处理（已送签）' },
+  { value: 'OPEN', label: '待办（待处理 + 材料准备，默认）' },
   { value: 'PENDING', label: '仅待处理' },
-  { value: 'IN_PROGRESS', label: '仅已送签材料准备' },
-  { value: 'CANCELLED', label: '仅已取消' },
-  { value: 'FAILED', label: '仅失败' },
+  { value: 'CONFIRMED', label: '已送签' },
   { value: 'ALL', label: '全部状态' },
+];
+
+// 签证签发方式筛选（前端过滤；未标注 = visaIssuanceMethod 为空）
+type IssuanceFilter = '' | 'E_VISA' | 'STICKER' | 'ARRIVAL' | 'NONE';
+
+const ISSUANCE_FILTER_OPTIONS: Array<{ value: IssuanceFilter; label: string }> = [
+  { value: '', label: '全部' },
+  { value: 'E_VISA', label: '电子签' },
+  { value: 'STICKER', label: '贴纸签' },
+  { value: 'ARRIVAL', label: '落地签' },
+  { value: 'NONE', label: '未标注' },
 ];
 
 // ── 乘客行：名称 / 护照号 / 照片缩略图 ─────────────────────────────────────
@@ -298,13 +311,31 @@ function TaskRow({ task, selected, onToggle, token, onChanged }: TaskRowProps) {
       ? localYmd(task.order.departureTime, task.order.departureTz)
       : null;
 
-  // 单次/多次签徽章：从签证产品名启发式判断
+  // 类型徽章：优先结构化字段（入境次数 / 签发方式）；缺失时回退产品名正则猜测（浅色示区分）
   const visaName = task.visaName ?? '';
-  const visaEntryBadge = /多次/.test(visaName)
-    ? '多次签'
-    : /单次/.test(visaName)
-      ? '单次签'
-      : null;
+  const entryTypeLabel =
+    task.visaEntryType === 'SINGLE'
+      ? '单次'
+      : task.visaEntryType === 'MULTIPLE'
+        ? '多次'
+        : null;
+  // 结构化入境次数缺失 → 从产品名猜测（渲染为浅色，示意"推测非确证"）
+  const entryGuess = entryTypeLabel
+    ? null
+    : /多次/.test(visaName)
+      ? '多次'
+      : /单次/.test(visaName)
+        ? '单次'
+        : null;
+  const issuanceLabel =
+    task.visaIssuanceMethod === 'E_VISA'
+      ? '电子签'
+      : task.visaIssuanceMethod === 'STICKER'
+        ? '贴纸签'
+        : task.visaIssuanceMethod === 'ARRIVAL'
+          ? '落地签'
+          : null;
+  const hasTypeBadge = Boolean(entryTypeLabel || entryGuess || issuanceLabel);
 
   const saveNote = async () => {
     if (savingNote) return; // 防重入：Enter→blur 可能重复触发
@@ -354,7 +385,20 @@ function TaskRow({ task, selected, onToggle, token, onChanged }: TaskRowProps) {
           />
         </td>
         <td className="align-top font-mono text-xs text-ink">
-          <div>{task.order?.orderNumber ?? '—'}</div>
+          {/* 订单号深链跳订单管理（?q= 承接搜索 + 唯一命中自动开详情抽屉）；等宽 + 悬浮变色 */}
+          <div>
+            {task.order?.orderNumber ? (
+              <Link
+                to={`/orders?q=${encodeURIComponent(task.order.orderNumber)}`}
+                className="text-brand hover:text-brand-dark hover:underline"
+                title="在订单管理中打开该订单"
+              >
+                {task.order.orderNumber}
+              </Link>
+            ) : (
+              '—'
+            )}
+          </div>
           {/* 出发日期（不是录入日期）；纯签证单无航班 → — */}
           <div className="mt-0.5 font-sans text-[10px] text-ink-muted">
             出发 {departureYmd ?? '—'}
@@ -381,9 +425,22 @@ function TaskRow({ task, selected, onToggle, token, onChanged }: TaskRowProps) {
           <span className={VISA_STATUS_BADGE[task.status]}>
             {VISA_STATUS_LABEL[task.status]}
           </span>
-          {visaEntryBadge && (
-            <div className="mt-1">
-              <span className="badge-neutral text-[10px]">{visaEntryBadge}</span>
+          {hasTypeBadge && (
+            <div className="mt-1 flex flex-wrap items-center justify-center gap-1">
+              {entryTypeLabel && (
+                <span className="badge-neutral text-[10px]">{entryTypeLabel}</span>
+              )}
+              {entryGuess && (
+                <span
+                  className="badge-neutral text-[10px] opacity-60"
+                  title="按产品名推测，未结构化标注"
+                >
+                  {entryGuess}·推测
+                </span>
+              )}
+              {issuanceLabel && (
+                <span className="badge-neutral text-[10px]">{issuanceLabel}</span>
+              )}
             </div>
           )}
         </td>
@@ -461,11 +518,22 @@ export function VisaDeskPage() {
   const token = tokens?.accessToken ?? '';
 
   const [tasks, setTasks] = useState<FulfillmentTask[]>([]);
+  // 后端命中总数（pagination.total）；> 已加载条数时列表提示截断，引导用筛选缩小范围
+  const [totalCount, setTotalCount] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('OPEN');
+  // 签证签发方式筛选（前端过滤；未标注 = visaIssuanceMethod 为空）
+  const [issuanceFilter, setIssuanceFilter] = useState<IssuanceFilter>('');
   // 出发日期筛选（单日 YYYY-MM-DD）；空 = 不按出发日过滤
   const [departureDate, setDepartureDate] = useState('');
+  // 备注搜索（走后端 notesQuery，避免 200 条截断漏筛）；400ms 防抖
+  const [notesQueryInput, setNotesQueryInput] = useState('');
+  const [debouncedNotesQuery, setDebouncedNotesQuery] = useState('');
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedNotesQuery(notesQueryInput.trim()), 400);
+    return () => clearTimeout(t);
+  }, [notesQueryInput]);
   // 「下载名单表 / 下载护照包」入口状态（0713 签证岗反馈：拆开分别下载，不再合并 zip）
   const [rosterDownloading, setRosterDownloading] = useState(false);
   const [passportsDownloading, setPassportsDownloading] = useState(false);
@@ -481,6 +549,9 @@ export function VisaDeskPage() {
     failures: Array<{ id: string; error: string }>;
   } | null>(null);
   const [refreshNonce, setRefreshNonce] = useState(0);
+  // 批量备注（独立于批量改状态）：覆盖所选订单的现有备注，走后端 batch-notes
+  const [batchNote, setBatchNote] = useState('');
+  const [batchNoteSubmitting, setBatchNoteSubmitting] = useState(false);
 
   // 拉签证任务 — 单状态筛选直接走后端；OPEN/ALL 拉全量后前端过滤
   useEffect(() => {
@@ -494,11 +565,13 @@ export function VisaDeskPage() {
       .listFulfillmentTasks(token, {
         type: 'VISA_APPLICATION',
         status: backendStatus,
-        pageSize: 200,
+        notesQuery: debouncedNotesQuery || undefined,
+        pageSize: PAGE_SIZE,
       })
       .then((res) => {
         if (cancelled) return;
         setTasks(res.tasks);
+        setTotalCount(res.pagination?.total ?? res.tasks.length);
       })
       .catch((e: unknown) => {
         if (!cancelled) setError(e instanceof ApiError ? e.message : '签证任务加载失败');
@@ -507,12 +580,18 @@ export function VisaDeskPage() {
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [token, statusFilter, refreshNonce]);
+  }, [token, statusFilter, debouncedNotesQuery, refreshNonce]);
 
   const filtered = useMemo(() => {
     let list = tasks;
     if (statusFilter === 'OPEN') {
       list = list.filter((t) => t.status === 'PENDING' || t.status === 'IN_PROGRESS');
+    }
+    // 签证类型过滤（客户端）：按 visaIssuanceMethod 匹配；未标注 = 该字段为空
+    if (issuanceFilter) {
+      list = list.filter((t) =>
+        issuanceFilter === 'NONE' ? !t.visaIssuanceMethod : t.visaIssuanceMethod === issuanceFilter,
+      );
     }
     // 出发日期过滤（客户端）：选了日期时按本地出发日比对；纯签证单无航班 → 保留可见（不被日期筛选误隐藏）
     if (departureDate) {
@@ -522,7 +601,7 @@ export function VisaDeskPage() {
       });
     }
     return list;
-  }, [tasks, statusFilter, departureDate]);
+  }, [tasks, statusFilter, issuanceFilter, departureDate]);
 
   // ── 勾选 helpers（镜像 OrdersPage 批量管理）────────────────
   const visibleIds = useMemo(() => filtered.map((t) => t.id), [filtered]);
@@ -629,6 +708,34 @@ export function VisaDeskPage() {
     }
   };
 
+  // 批量备注：覆盖所选任务的现有备注（可为空 = 批量清空）；沿用 BATCH_LIMIT 上限
+  const applyBatchNote = async () => {
+    if (!token || selectedIds.size === 0 || batchNoteSubmitting) return;
+    if (selectedIds.size > BATCH_LIMIT) {
+      alert(`单次最多批量处理 ${BATCH_LIMIT} 条，请分批操作（当前已选 ${selectedIds.size} 条）`);
+      return;
+    }
+    const next = batchNote.trim();
+    if (
+      !window.confirm(
+        `将覆盖所选 ${selectedIds.size} 单的现有备注为「${next || '（空）'}」？此操作不可撤销。`,
+      )
+    )
+      return;
+    setBatchNoteSubmitting(true);
+    setBatchResult(null);
+    try {
+      const res = await api.batchUpdateFulfillmentNotes(token, Array.from(selectedIds), next);
+      setBatchResult(res);
+      if (res.failureCount === 0) setBatchNote('');
+      setRefreshNonce((n) => n + 1);
+    } catch (e: unknown) {
+      alert(e instanceof ApiError ? `批量备注失败：${e.message}` : '批量备注失败');
+    } finally {
+      setBatchNoteSubmitting(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
       <section className="flex flex-wrap items-end justify-between gap-3">
@@ -660,6 +767,22 @@ export function VisaDeskPage() {
             <p className="mt-1 text-xs text-ink-muted">新录入的待送签单在『待处理』里</p>
           </div>
           <div>
+            <label className="label">签证类型</label>
+            <select
+              className="input max-w-[10rem] py-1.5"
+              value={issuanceFilter}
+              onChange={(e) => {
+                setIssuanceFilter(e.target.value as IssuanceFilter);
+                clearSelection();
+              }}
+            >
+              {ISSUANCE_FILTER_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>{o.label}</option>
+              ))}
+            </select>
+            <p className="mt-1 text-xs text-ink-muted">按签发方式筛选（前端过滤）</p>
+          </div>
+          <div>
             <label className="label">出发日期</label>
             <div className="flex items-center gap-2">
               <input
@@ -685,6 +808,34 @@ export function VisaDeskPage() {
               )}
             </div>
             <p className="mt-1 text-xs text-ink-muted">按客户出发日筛选（纯签证单无航班）</p>
+          </div>
+          <div>
+            <label className="label">备注搜索</label>
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                className="input max-w-[14rem] py-1.5"
+                value={notesQueryInput}
+                placeholder="按备注内容筛选…"
+                onChange={(e) => {
+                  setNotesQueryInput(e.target.value);
+                  clearSelection();
+                }}
+              />
+              {notesQueryInput && (
+                <button
+                  type="button"
+                  className="btn-ghost py-1.5 text-xs"
+                  onClick={() => {
+                    setNotesQueryInput('');
+                    clearSelection();
+                  }}
+                >
+                  清除
+                </button>
+              )}
+            </div>
+            <p className="mt-1 text-xs text-ink-muted">服务端按备注模糊匹配（不受 200 条截断影响）</p>
           </div>
         </div>
       </section>
@@ -760,6 +911,30 @@ export function VisaDeskPage() {
                 : `下载护照包${selectedOrderIds.length > 0 ? `（${selectedOrderIds.length}单）` : ''}`}
             </button>
           </div>
+          {/* 批量备注：覆盖所选订单现有备注（走后端 batch-notes，沿用 100 条上限） */}
+          <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-brand-200/60 pt-3">
+            <label className="text-sm text-ink-soft">批量备注：</label>
+            <input
+              type="text"
+              className="input max-w-xs py-1.5 text-sm"
+              value={batchNote}
+              placeholder="填写后覆盖所选订单备注…"
+              disabled={batchNoteSubmitting || submitting}
+              onChange={(e) => setBatchNote(e.target.value)}
+            />
+            <button
+              type="button"
+              className="btn-secondary py-1.5"
+              onClick={() => void applyBatchNote()}
+              disabled={batchNoteSubmitting || submitting}
+              title={`将覆盖所选 ${selectedIds.size} 单的现有备注（上限 ${BATCH_LIMIT} 条）`}
+            >
+              {batchNoteSubmitting ? '保存中…' : '应用备注'}
+            </button>
+            <span className="text-[11px] text-ink-muted">
+              会覆盖所选订单的现有备注（上限 {BATCH_LIMIT} 条）
+            </span>
+          </div>
           {downloadError && <p className="mt-2 text-xs text-rose-600">{downloadError}</p>}
           {batchResult && (
             <div className="mt-3 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs">
@@ -779,6 +954,20 @@ export function VisaDeskPage() {
             </div>
           )}
         </section>
+      )}
+
+      {/* 命中总数 + 截断警示（后端单页最多 PAGE_SIZE 条，超出需用筛选缩小范围） */}
+      {!loading && totalCount != null && (
+        <div className="flex flex-wrap items-center gap-2 text-xs text-ink-muted">
+          <span>
+            共 <span className="font-semibold text-ink">{totalCount}</span> 条签证任务
+          </span>
+          {totalCount > tasks.length && (
+            <span className="badge-warning">
+              仅显示前 {tasks.length} 条，请用筛选缩小范围
+            </span>
+          )}
+        </div>
       )}
 
       {/* ── 任务列表 ─────────────────────────────────────────── */}

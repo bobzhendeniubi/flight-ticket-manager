@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { api, ApiError, duplicatePassengerConflictOrderNumbers, SETTLEMENT_MODE_LABEL, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { useFlightSeats } from '../stores/flightSeats';
@@ -267,6 +268,8 @@ export function OrdersPage() {
   const user = useAuth((s) => s.user);
   const bumpSeats = useFlightSeats((s) => s.bumpSeats);
   const isAdmin = user?.role === 'ADMIN';
+  // 深链承接：从签证台等页面带 ?q=订单号 跳入时用于填充搜索框并自动开详情抽屉
+  const [searchParams] = useSearchParams();
   const [orders, setOrders] = useState<OrderSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -476,6 +479,49 @@ export function OrdersPage() {
       return true;
     });
   }, [ordersView, statusFilter, kindFilter, channelFilter, agentFilter, search]);
+
+  // ── 深链承接（?q=订单号）─────────────────────────────────────
+  // 从签证台订单号点入时：先把订单号填进搜索框（前端过滤已支持订单号），
+  // 待列表加载完且过滤后唯一/精确命中时自动打开详情抽屉；命中不在默认查询范围时后端兜底查一次。
+  const deepLinkSearchRef = useRef(false); // 只填一次搜索框，之后不覆盖用户输入
+  const deepLinkOpenRef = useRef(false); // 只自动开一次抽屉
+  useEffect(() => {
+    const q = searchParams.get('q')?.trim();
+    if (!q || deepLinkSearchRef.current) return;
+    deepLinkSearchRef.current = true;
+    setSearch(q);
+  }, [searchParams]);
+  useEffect(() => {
+    const q = searchParams.get('q')?.trim();
+    if (!q || deepLinkOpenRef.current || loading) return;
+    // 等 setSearch 生效、filtered 已按订单号收敛后再判定
+    if (search.trim().toLowerCase() !== q.toLowerCase()) return;
+    const exact = filtered.find(
+      ({ order }) => order.orderNumber.toLowerCase() === q.toLowerCase(),
+    );
+    if (exact || filtered.length === 1) {
+      deepLinkOpenRef.current = true;
+      setSelected((exact ?? filtered[0]).order);
+      return;
+    }
+    if (filtered.length === 0) {
+      // 不在默认查询范围 → 后端按订单号精确查一次兜底（只查一次）
+      deepLinkOpenRef.current = true;
+      const t = tokens?.accessToken;
+      if (!t) return;
+      api
+        .listOrders(t, { search: q, pageSize: 20 })
+        .then((res) => {
+          const found =
+            res.orders.find((o) => o.orderNumber.toLowerCase() === q.toLowerCase()) ?? null;
+          if (found) setSelected(found);
+        })
+        .catch(() => {
+          /* 深链兜底失败静默：不打断主列表 */
+        });
+    }
+    // filtered.length > 1 且无精确命中：保留搜索结果，不自动开抽屉（用户手动挑）
+  }, [searchParams, search, loading, filtered, tokens?.accessToken]);
 
   // 代理维度统计
   const agentStats = useMemo(() => {
@@ -2835,11 +2881,24 @@ function BundleItineraryCard({ items, order }: { items: OrderItem[]; order: Orde
   const visaEffectiveDate = outboundDate && visaStayDays ? outboundDate : null;
   const visaExpiryDate = outboundDate && visaStayDays ? addDaysToDateOnly(outboundDate, visaStayDays) : null;
 
+  // 乘客级选项统计（自备签证 / 单住）：基数 = 本单乘客数；用于产品名/签证段/酒店段标注。
+  const passengerBase = order.passengers.length;
+  const visaExemptCount = order.passengers.filter((p) => p.visaExempt).length;
+  const singleRoomCount = order.passengers.filter((p) => p.singleRoom).length;
+  // 全员自备（需真有乘客且全部自备）→ 签证段改「无需送签」；部分自备 → 拆分随团/自备人数。
+  const allVisaExempt = passengerBase > 0 && visaExemptCount === passengerBase;
+  const partialVisaExempt = visaExemptCount > 0 && !allVisaExempt;
+
   return (
     <div className="rounded-xl border border-brand-200 bg-brand-50/40 p-3 text-sm">
       <div>
         <div className="text-xs font-medium text-ink-muted">产品名称</div>
-        <div className="mt-0.5 font-semibold text-ink">{productName}</div>
+        <div className="mt-0.5 flex flex-wrap items-center gap-1.5">
+          <span className="font-semibold text-ink">{productName}</span>
+          {visaExemptCount > 0 && (
+            <span className="badge-warning text-[10px]">含 {visaExemptCount} 人自备签</span>
+          )}
+        </div>
       </div>
 
       <dl className="mt-2.5 space-y-1.5 text-xs text-ink-soft">
@@ -2888,6 +2947,9 @@ function BundleItineraryCard({ items, order }: { items: OrderItem[]; order: Orde
               {roomTypeName && ` ${roomTypeName}`}
               {rooms != null && ` × ${rooms}间`}
               {nights != null && nights > 0 && ` × ${nights}晚`}
+              {singleRoomCount > 0 && (
+                <span className="badge-warning ml-1.5 text-[10px]">{singleRoomCount} 人单住</span>
+              )}
             </dd>
           </div>
         )}
@@ -2897,10 +2959,21 @@ function BundleItineraryCard({ items, order }: { items: OrderItem[]; order: Orde
             <dd className="mt-0.5">
               {visa.name}
               {visaStayDays != null && `；最多可停留：${visaStayDays}天`}
-              {visaEffectiveDate && visaExpiryDate && (
+              {/* 全员自备时预计生效/失效日期不适用，避免与「无需送签」矛盾 */}
+              {!allVisaExempt && visaEffectiveDate && visaExpiryDate && (
                 <span className="ml-1 text-ink-muted">
                   （签证生效日期(预计)={visaEffectiveDate}、失效日期(预计)={visaExpiryDate}，以实际出签为准）
                 </span>
+              )}
+              {allVisaExempt && (
+                <div className="mt-1 inline-block rounded bg-amber-100 px-1.5 py-0.5 font-medium text-amber-800">
+                  全员自备签证 · 无需送签（生效/失效日期不适用）
+                </div>
+              )}
+              {partialVisaExempt && (
+                <div className="mt-1 text-ink-muted">
+                  {passengerBase - visaExemptCount} 人随团办理 / {visaExemptCount} 人自备（详见下方乘客名单）
+                </div>
               )}
             </dd>
           </div>
