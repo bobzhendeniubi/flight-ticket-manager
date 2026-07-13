@@ -3,7 +3,7 @@
  */
 import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { api, ApiError, SETTLEMENT_MODE_LABEL, type AgentListItem, type CreateChildAgentInput, type CustomerSummary, type SettlementMode } from '../lib/api';
+import { api, ApiError, SETTLEMENT_MODE_LABEL, type AgentListItem, type CreateChildAgentInput, type CustomerSummary, type SettlementMode, type UpdateAgentInput } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { NumberInput } from '../components/NumberInput';
 
@@ -386,7 +386,33 @@ function AgentDetailDrawer({
   onClose: () => void;
   onChanged: (updated: AgentListItem) => void | Promise<void>;
 }) {
+  const user = useAuth((s) => s.user);
+  const tokens = useAuth((s) => s.tokens);
   const [tab, setTab] = useState<'info' | 'commission' | 'balance' | 'customers'>('info');
+  const [statusSaving, setStatusSaving] = useState(false);
+  const [statusErr, setStatusErr] = useState<string | null>(null);
+  // AGENT 只能编辑自己的信息；ADMIN/STAFF 可编辑任意代理（与后端 updateAgent 权限口径一致）
+  const canEditInfo = isAdmin || agent.userId === user?.id;
+
+  const toggleStatus = async () => {
+    if (!tokens || statusSaving) return;
+    const next = !agent.isActive;
+    const label = agent.companyName || agent.contactName;
+    const msg = next
+      ? `确认启用「${label}」？启用后该代理可重新登录。`
+      : `确认停用「${label}」？停用后该代理账号将无法登录（下级代理不受影响，如需一并处理请逐个停用）。`;
+    if (!window.confirm(msg)) return;
+    setStatusSaving(true);
+    setStatusErr(null);
+    try {
+      const res = await api.setAgentStatus(tokens.accessToken, agent.id, next);
+      await onChanged(res.agent);
+    } catch (e) {
+      setStatusErr(e instanceof ApiError ? e.message : '修改状态失败');
+    } finally {
+      setStatusSaving(false);
+    }
+  };
 
   return (
     <div className="fixed inset-0 z-50 flex justify-end bg-slate-900/50" onClick={onClose}>
@@ -400,10 +426,28 @@ function AgentDetailDrawer({
                   {TIER_LABEL[agent.tier]}
                 </span>
                 <span className="text-xs text-slate-500">{agent.contactName} · {agent.contactPhone}</span>
+                {!agent.isActive && <span className="badge-neutral">已停用</span>}
               </div>
             </div>
-            <button className="text-slate-400 hover:text-slate-700 text-xl" onClick={onClose}>×</button>
+            <div className="flex items-center gap-2">
+              {isAdmin && (
+                <button
+                  type="button"
+                  className={`rounded-md border px-2.5 py-1.5 text-xs font-medium ${
+                    agent.isActive
+                      ? 'border-rose-200 text-rose-600 hover:bg-rose-50'
+                      : 'border-emerald-200 text-emerald-700 hover:bg-emerald-50'
+                  }`}
+                  disabled={statusSaving}
+                  onClick={toggleStatus}
+                >
+                  {statusSaving ? '处理中…' : agent.isActive ? '停用' : '启用'}
+                </button>
+              )}
+              <button className="text-slate-400 hover:text-slate-700 text-xl" onClick={onClose}>×</button>
+            </div>
           </div>
+          {statusErr && <div className="mt-2 rounded bg-rose-50 px-2 py-1 text-xs text-rose-700">{statusErr}</div>}
           <nav className="mt-3 flex gap-1 border-b border-slate-200 -mb-4">
             {[
               { k: 'info', label: '基本信息' },
@@ -422,7 +466,7 @@ function AgentDetailDrawer({
           </nav>
         </div>
         <div className="px-6 py-5 space-y-4">
-          {tab === 'info' && <InfoTab agent={agent} isAdmin={isAdmin} onChanged={onChanged} />}
+          {tab === 'info' && <InfoTab agent={agent} isAdmin={isAdmin} canEdit={canEditInfo} onChanged={onChanged} />}
           {tab === 'commission' && <CommissionTab agent={agent} />}
           {tab === 'balance' && <BalanceTab agent={agent} />}
           {tab === 'customers' && <CustomersTab agent={agent} />}
@@ -435,30 +479,131 @@ function AgentDetailDrawer({
 function InfoTab({
   agent,
   isAdmin,
+  canEdit,
   onChanged,
 }: {
   agent: AgentListItem;
   isAdmin: boolean;
+  canEdit: boolean;
   onChanged: (updated: AgentListItem) => void | Promise<void>;
 }) {
+  const tokens = useAuth((s) => s.tokens);
+  const [editing, setEditing] = useState(false);
+  const [form, setForm] = useState({
+    companyName: agent.companyName ?? '',
+    contactName: agent.contactName,
+    contactPhone: agent.contactPhone,
+    email: agent.email ?? '',
+    notes: agent.notes ?? '',
+  });
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const startEdit = () => {
+    setForm({
+      companyName: agent.companyName ?? '',
+      contactName: agent.contactName,
+      contactPhone: agent.contactPhone,
+      email: agent.email ?? '',
+      notes: agent.notes ?? '',
+    });
+    setErr(null);
+    setEditing(true);
+  };
+
+  const onSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!tokens || saving) return;
+    setSaving(true);
+    setErr(null);
+    try {
+      const body: UpdateAgentInput = {};
+      if (form.companyName !== (agent.companyName ?? '')) body.companyName = form.companyName;
+      if (form.contactName !== agent.contactName) body.contactName = form.contactName;
+      if (form.contactPhone !== agent.contactPhone) body.contactPhone = form.contactPhone;
+      if (form.email !== (agent.email ?? '')) body.email = form.email;
+      if (form.notes !== (agent.notes ?? '')) body.notes = form.notes;
+      if (Object.keys(body).length === 0) {
+        setEditing(false);
+        return;
+      }
+      const res = await api.updateAgent(tokens.accessToken, agent.id, body);
+      await onChanged(res.agent);
+      setEditing(false);
+    } catch (error) {
+      setErr(error instanceof ApiError ? error.message : '保存失败');
+    } finally {
+      setSaving(false);
+    }
+  };
+
   return (
     <div className="space-y-4">
       <SettlementModeCard agent={agent} isAdmin={isAdmin} onChanged={onChanged} />
-      <dl className="space-y-2 text-sm">
-        <Row label="公司名" value={agent.companyName ?? '—'} />
-        <Row label="联系人" value={agent.contactName} />
-        <Row label="电话" value={agent.contactPhone} />
-        <Row label="邮箱" value={agent.email ?? '—'} />
-        <Row label="层级" value={TIER_LABEL[agent.tier]} />
-        <Row label="预存余额" value={<span className="font-semibold text-emerald-700">¥{Number(agent.prepaymentBalance).toLocaleString()}</span>} />
-        <Row label="上级" value={agent.parent ? (agent.parent.companyName ?? agent.parent.contactName) : '无（顶级）'} />
-        <Row label="下级数" value={agent.childCount.toString()} />
-        <Row label="订单数" value={agent.orderCount.toString()} />
-        <Row label="状态" value={agent.isActive ? '✅ 在用' : '⏸ 停用'} />
-        <Row label="注册时间" value={new Date(agent.createdAt).toLocaleString('zh-CN')} />
-        <Row label="上次登录" value={agent.lastLoginAt ? new Date(agent.lastLoginAt).toLocaleString('zh-CN') : '从未登录'} />
-        {agent.notes && <Row label="备注" value={agent.notes} />}
-      </dl>
+
+      {canEdit && !editing && (
+        <div className="flex justify-end">
+          <button type="button" className="text-xs font-medium text-brand hover:text-brand-dark" onClick={startEdit}>
+            ✎ 编辑信息
+          </button>
+        </div>
+      )}
+
+      {editing ? (
+        <form className="space-y-3 rounded-md border border-brand/30 bg-brand-50/40 p-3" onSubmit={onSubmit}>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <div>
+              <label className="label text-xs">公司名</label>
+              <input className="input" value={form.companyName} onChange={(e) => setForm({ ...form, companyName: e.target.value })} />
+            </div>
+            <div>
+              <label className="label text-xs">联系人 *</label>
+              <input required className="input" value={form.contactName} onChange={(e) => setForm({ ...form, contactName: e.target.value })} />
+            </div>
+            <div>
+              <label className="label text-xs">电话 *</label>
+              <input required className="input" value={form.contactPhone} onChange={(e) => setForm({ ...form, contactPhone: e.target.value })} />
+            </div>
+            <div>
+              <label className="label text-xs">邮箱</label>
+              <input type="email" className="input" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} />
+            </div>
+          </div>
+          <div>
+            <label className="label text-xs">备注</label>
+            <input className="input" value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} />
+          </div>
+          {err && <div className="rounded-md bg-rose-50 px-2 py-1 text-xs text-rose-700">{err}</div>}
+          <div className="flex justify-end gap-2">
+            <button
+              type="button"
+              className="btn-secondary text-xs px-3 py-1.5"
+              onClick={() => { setEditing(false); setErr(null); }}
+            >
+              取消
+            </button>
+            <button type="submit" className="btn-primary text-xs px-3 py-1.5" disabled={saving}>
+              {saving ? '保存中…' : '保存'}
+            </button>
+          </div>
+        </form>
+      ) : (
+        <dl className="space-y-2 text-sm">
+          <Row label="公司名" value={agent.companyName ?? '—'} />
+          <Row label="联系人" value={agent.contactName} />
+          <Row label="电话" value={agent.contactPhone} />
+          <Row label="邮箱" value={agent.email ?? '—'} />
+          <Row label="层级" value={TIER_LABEL[agent.tier]} />
+          <Row label="预存余额" value={<span className="font-semibold text-emerald-700">¥{Number(agent.prepaymentBalance).toLocaleString()}</span>} />
+          <Row label="上级" value={agent.parent ? (agent.parent.companyName ?? agent.parent.contactName) : '无（顶级）'} />
+          <Row label="下级数" value={agent.childCount.toString()} />
+          <Row label="订单数" value={agent.orderCount.toString()} />
+          <Row label="状态" value={agent.isActive ? '✅ 在用' : '⏸ 停用'} />
+          <Row label="注册时间" value={new Date(agent.createdAt).toLocaleString('zh-CN')} />
+          <Row label="上次登录" value={agent.lastLoginAt ? new Date(agent.lastLoginAt).toLocaleString('zh-CN') : '从未登录'} />
+          {agent.notes && <Row label="备注" value={agent.notes} />}
+        </dl>
+      )}
     </div>
   );
 }

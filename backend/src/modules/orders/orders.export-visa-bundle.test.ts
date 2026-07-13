@@ -167,8 +167,8 @@ describe('buildVisaBundleXlsx — 合并签证名单', () => {
     expect(rows).toHaveLength(3);
     expect(rows.map((r) => r['STT'])).toEqual(['1', '2', '3']);
 
-    // 姓名（LAST/FIRST）合并正确
-    expect(rows.map((r) => r[NAME_HEADER])).toEqual(['WANG/LIANBO', 'LI/SI', 'ZHAO/WU']);
+    // 姓名（LAST/FIRST）合并正确；末尾附称谓（均为成人，按性别 MR/MS —— 0711 反馈缺 MR/MS）
+    expect(rows.map((r) => r[NAME_HEADER])).toEqual(['WANG/LIANBO MR', 'LI/SI MS', 'ZHAO/WU MR']);
 
     // 性别列存在且逐行正确
     expect(rows.map((r) => r[GENDER_HEADER])).toEqual(['M', 'F', 'M']);
@@ -301,7 +301,7 @@ describe('buildVisaBundleZip — 打包结构 + 护照文件名规则', () => {
       await zip.file('签证专用_合并名单.xlsx')!.async('nodebuffer'),
     );
     expect(rows).toHaveLength(1);
-    expect(rows[0][NAME_HEADER]).toBe('WANG/LIANBO');
+    expect(rows[0][NAME_HEADER]).toBe('WANG/LIANBO MR');
 
     // README 点名跳过的状态不合格单 + 查不到的 id
     const readme = await zip.file('README.txt')!.async('string');
@@ -331,7 +331,7 @@ describe('buildVisaBundleZip — 打包结构 + 护照文件名规则', () => {
     // 甲代理(A1) 在前、乙代理(B1) 在后；STT 连续 1,2
     expect(rows.map((r) => r['STT'])).toEqual(['1', '2']);
     expect(rows.map((r) => r['代理机构'])).toEqual(['甲代理', '乙代理']);
-    expect(rows.map((r) => r[NAME_HEADER])).toEqual(['AA/ONE', 'BB/ONE']);
+    expect(rows.map((r) => r[NAME_HEADER])).toEqual(['AA/ONE MR', 'BB/ONE MR']);
   });
 });
 

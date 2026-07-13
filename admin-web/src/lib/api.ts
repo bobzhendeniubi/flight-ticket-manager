@@ -541,6 +541,15 @@ export interface CreateChildAgentInput {
   notes?: string;
 }
 
+/** PATCH /agents/:id 请求体：所有字段可选，至少传一个 */
+export interface UpdateAgentInput {
+  companyName?: string;
+  contactName?: string;
+  contactPhone?: string;
+  email?: string;
+  notes?: string;
+}
+
 // ── Orders ────────────────────────────────────────────────────────────────
 export type OrderStatus =
   | 'DRAFT'
@@ -1217,6 +1226,15 @@ export interface BundleFlightRef {
 }
 
 /**
+ * `/products/bundles/flight-ref` 响应：给定去/回程航班绑定下，当前最低来回经济舱机票 / 人（CNY）。
+ * null = 该绑定下查不到任何可估班次（起价里的机票项按 0 计）。后台套餐表单据此按「本套餐自己的绑定」
+ * 实时取机票基数，反推想卖价↔折扣%，与套餐卡片起价同源。
+ */
+export interface BundleFlightRefPrice {
+  flightRefRoundTripCny: number | null;
+}
+
+/**
  * 套餐写入体（create / update 共用；update 时字段可省略 = 不改）。
  * outboundFlightId / returnFlightId：航班号绑定 —— string=绑该 Flight.id，null=解绑（不指定）。
  */
@@ -1728,6 +1746,16 @@ export const api = {
       token,
       body: { settlementMode },
     }),
+  // 编辑代理基础联系信息（公司名/联系人/电话/邮箱/备注）；ADMIN/STAFF 可改任意代理，AGENT 只能改自己
+  updateAgent: (token: string, id: string, body: UpdateAgentInput) =>
+    apiFetch<{ agent: AgentListItem }>(`/agents/${id}`, { method: 'PATCH', token, body }),
+  // 停用/启用代理登录；仅 ADMIN
+  setAgentStatus: (token: string, id: string, isActive: boolean) =>
+    apiFetch<{ agent: AgentListItem }>(`/agents/${id}/status`, {
+      method: 'PATCH',
+      token,
+      body: { isActive },
+    }),
 
   // Orders
   listOrders: (token: string, query?: ListOrdersParams) => {
@@ -2222,6 +2250,18 @@ export const api = {
   // Products — Bundles
   listBundles: (activeOnly = false) =>
     apiFetch<{ bundles: Bundle[] }>(`/products/bundles${activeOnly ? '?active=1' : ''}`),
+  // 套餐机票参考价（ADMIN/STAFF）：按去/回程航班号取当前最低来回经济舱机票/人；
+  // 两者留空 = 按套餐航线兜底。空串按「未绑」处理（不带该 query 参数），与后端 schema 归一口径一致。
+  getBundleFlightRef: (
+    token: string,
+    params: { outboundFlightId?: string | null; returnFlightId?: string | null },
+  ) => {
+    const qs = new URLSearchParams();
+    if (params.outboundFlightId) qs.set('outboundFlightId', params.outboundFlightId);
+    if (params.returnFlightId) qs.set('returnFlightId', params.returnFlightId);
+    const q = qs.toString();
+    return apiFetch<BundleFlightRefPrice>(`/products/bundles/flight-ref${q ? `?${q}` : ''}`, { token });
+  },
   createBundle: (token: string, body: BundleWriteBody) =>
     apiFetch<{ bundle: Bundle }>('/products/bundles', { method: 'POST', token, body }),
   updateBundle: (token: string, id: string, body: BundleWriteBody) =>

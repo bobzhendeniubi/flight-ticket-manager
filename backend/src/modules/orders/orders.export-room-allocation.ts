@@ -11,7 +11,9 @@
  * 酒店归属优先 order.roomAssignment.roomGroups 的 hotelName（人工分房结果），
  * 否则回落到 correlate 到的 item 上 hotelRoomType.hotel.name。
  *
- * 暂无数据的列（飞行次数/签发日期/升级原因）保留表头、内容留空 —— 与三模板导出同约定。
+ * 列序对齐旧系统（0713 房控反馈）：旧系统 16 列原序 + 当前系统特有 3 列（房间号/升级原因/
+ * 当日余房）追加在末尾，见 COLUMNS。仍暂无数据的列（飞行次数/升级原因）保留表头、内容留空 ——
+ * 与三模板导出同约定；「酒店类型」列拼法（酒店名 · 房型名）口径同样缓办，维持现状不动。
  */
 import ExcelJS from 'exceljs';
 import type { Prisma, PrismaClient } from '@prisma/client';
@@ -41,19 +43,21 @@ const GENDER_MF: Record<string, string> = { M: 'M', F: 'F' };
 export interface RoomAllocationRow {
   seq: number;
   agency: string;
-  hotelType: string;
-  roomNo: string; // 房间号（同房同号；半间/拼房组标 "房N(½)"）
+  notes: string;
+  hotelType: string; // 现状拼法：酒店名 · 房型名（口径缓办，维持不动）
   chineseName: string;
   pnrName: string;
-  flightCount: string; // 系统暂无数据 — 留空
+  flightCount: string; // 系统暂无数据 — 留空（口径未定，缓办）
   travelDates: string; // 'YYYY-MM-DD / YYYY-MM-DD'
+  settlePrice: number; // 结算价格（人均）：round2(order.total / 乘客数)
   dateOfBirth: string; // dd-mm-yyyy
   gender: string; // M / F
   documentNumber: string;
-  issueDate: string; // 系统暂无数据 — 留空
+  issueDate: string; // dd-mm-yyyy（Passenger.passportIssueDate）
   passportExpiry: string; // dd-mm-yyyy
+  enteredAt: string; // 录入时间 YYYY-MM-DD HH:MM:SS（Order.createdAt）
   roomType: string;
-  notes: string;
+  roomNo: string; // 房间号（同房同号；半间/拼房组标 "房N(½)"）
   upgradeReason: string; // 系统暂无数据 — 留空
   /**
    * 该乘客入住日、其所在酒店当晚的销控余量（与房控销控板/导出同口径）：
@@ -64,22 +68,29 @@ export interface RoomAllocationRow {
   dailyRemaining: string;
 }
 
-const COLUMNS: Array<{ header: string; key: keyof RoomAllocationRow; width: number }> = [
+/**
+ * 列序对齐旧系统（0713 房控反馈 W5）：前 16 列 = 旧系统原序；
+ * 后 3 列（房间号/升级原因/当日余房）= 当前系统特有列，追加在旧表末位之后。
+ * 导出为便于测试直接断言列序，无其他消费方引用。
+ */
+export const COLUMNS: Array<{ header: string; key: keyof RoomAllocationRow; width: number }> = [
   { header: '序号', key: 'seq', width: 6 },
   { header: '代理机构', key: 'agency', width: 16 },
+  { header: '备注', key: 'notes', width: 24 },
   { header: '酒店类型', key: 'hotelType', width: 26 },
-  { header: '房间号', key: 'roomNo', width: 10 },
   { header: '中文名称', key: 'chineseName', width: 12 },
   { header: '乘客姓名', key: 'pnrName', width: 20 },
   { header: '飞行次数', key: 'flightCount', width: 10 },
   { header: '出发(往返)日期', key: 'travelDates', width: 26 },
+  { header: '结算价格', key: 'settlePrice', width: 12 },
   { header: '乘客生日', key: 'dateOfBirth', width: 12 },
   { header: '性别', key: 'gender', width: 6 },
   { header: '证件编号', key: 'documentNumber', width: 16 },
   { header: '签发日期', key: 'issueDate', width: 12 },
   { header: '有效日期', key: 'passportExpiry', width: 12 },
+  { header: '录入时间', key: 'enteredAt', width: 18 },
   { header: '房型', key: 'roomType', width: 14 },
-  { header: '备注', key: 'notes', width: 24 },
+  { header: '房间号', key: 'roomNo', width: 10 },
   { header: '升级原因', key: 'upgradeReason', width: 12 },
   { header: '当日余房', key: 'dailyRemaining', width: 12 },
 ];
@@ -98,6 +109,24 @@ export interface RoomGroup {
 function fmtDate(d: Date | null | undefined): string {
   if (!d) return '';
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+}
+
+/** YYYY-MM-DD HH:MM:SS（录入时间列含秒，与旧系统样例格式一致）。
+ * 复制自 orders.export-templates.ts 的同名私有函数（未导出，按约定不改其导出面，就地复制）。*/
+function fmtDateTimeSec(d: Date | null | undefined): string {
+  if (!d) return '';
+  const time = `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}:${String(d.getUTCSeconds()).padStart(2, '0')}`;
+  return `${fmtDate(d)} ${time}`;
+}
+
+/** Prisma.Decimal | number | null → number（与其它导出同款）。*/
+function dec(v: Prisma.Decimal | number | null | undefined): number {
+  if (v == null) return 0;
+  return typeof v === 'number' ? v : Number(v.toString());
+}
+
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
 }
 
 function toDateOnly(s: string): Date {
@@ -263,6 +292,12 @@ export function buildRoomAllocationSheets(
     const roomGroups = parseRoomGroups(order.roomAssignment);
     const agency = order.agent?.companyName ?? '直客';
 
+    // 结算价格（人均）：订单总价 / 乘客数，与 orders.export-master.ts 的 settlePerPax 同口径；
+    // 除零保护 —— 乘客数至少按 1 算，避免空乘客订单除以 0。
+    const paxCount = Math.max(1, order.passengers.length);
+    const settlePrice = round2(dec(order.total) / paxCount);
+    const enteredAt = fmtDateTimeSec(order.createdAt);
+
     // 出发(往返)日期：订单全部 FLIGHT 行的出发日（去重升序）；无航班回落各自入住日
     const flightDates = Array.from(
       new Set(
@@ -301,18 +336,20 @@ export function buildRoomAllocationSheets(
 
       const row: Omit<RoomAllocationRow, 'seq' | 'roomNo'> = {
         agency,
+        notes,
         hotelType: `${hotelName} · ${it.hotelRoomType.name}`,
         chineseName: resolveChineseName(p),
         pnrName: pnrName(p),
         flightCount: '',
         travelDates,
+        settlePrice,
         dateOfBirth: fmtDateDMYDash(p.dateOfBirth),
         gender: p.gender ? GENDER_MF[p.gender] ?? '' : '',
         documentNumber: p.documentNumber,
-        issueDate: '',
+        issueDate: fmtDateDMYDash(p.passportIssueDate),
         passportExpiry: fmtDateDMYDash(p.passportExpiry),
+        enteredAt,
         roomType,
-        notes,
         upgradeReason: '',
         dailyRemaining,
       };

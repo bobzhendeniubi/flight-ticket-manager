@@ -181,6 +181,34 @@ describe('buildHotelControlBoardWorkbook', () => {
     expect(String(ws.getRow(17).getCell(2).value)).toContain('当日余房累计');
     expect(String(ws.getRow(17).getCell(2).value)).toContain('按 0 计入');
   });
+
+  it('余量行按物理房间口径（异性拼房：床位余 9 但物理余 8）', async () => {
+    const male = { order: { passengers: [{ gender: 'M' }] } };
+    const female = { order: { passengers: [{ gender: 'F' }] } };
+    const rt = { hotelRoomType: { hotelId: 'h1', hotel: { name: '卢瑟特里' } } };
+    const client = boardClient(
+      [
+        // 一男一女各 1 位拼房客（异性不能拼）→ 床位 1.0、物理 2 间
+        { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.5, ...male, ...rt },
+        { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.5, ...female, ...rt },
+      ],
+      [{ hotelId: 'h1', dateFrom: day(0), dateTo: day(0), rooms: 10, unitPrice: 200, hotel: { name: '卢瑟特里' } }],
+    );
+
+    const buf = await buildHotelControlBoardWorkbook({ from: dayStr(0), to: dayStr(0) }, client);
+    const wb = await loadWorkbook(buf);
+    const ws = wb.getWorksheet('销控矩阵')!;
+
+    // 行序：包房(2)/用房床位(3)/物理房间(4)/余量(5)；日期列 col4=D0
+    expect(ws.getRow(3).getCell(4).value).toBe(1); // 用房(床位) = 1.0
+    expect(ws.getRow(4).getCell(4).value).toBe(2); // 物理房间 = 2
+    // 余量 = 物理余量 10 − 2 = 8（非床位余量 9），且正常余量无高亮
+    expect(ws.getRow(5).getCell(4).value).toBe(8);
+    expect(ws.getRow(5).getCell(4).fill).toBeUndefined();
+    // 当日余房累计（汇总，第 8 行）也按物理口径 = 8
+    expect(ws.getRow(8).getCell(3).value).toBe('当日余房累计');
+    expect(ws.getRow(8).getCell(4).value).toBe(8);
+  });
 });
 
 describe('hotelControlExportFilename', () => {

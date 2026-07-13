@@ -12,6 +12,7 @@ import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { toAlpha3 } from './nationality.js';
 import { countIssuedPassengers } from './ticketing-cap.js';
 import { parseRoomGroups } from './orders.export-room-allocation.js';
+import { nameWithTitle } from './orders.export-templates.js';
 
 /**
  * 整班运营导出口径（SEAT_HOLDING）：所有「占座中」订单。
@@ -212,8 +213,8 @@ function orderToRows(order: OrderForExport): OrderRow[] {
   const recordedAt = fmtDateTime(order.createdAt);
 
   return order.passengers.map<OrderRow>((p) => {
-    const pnrName =
-      p.lastName && p.firstName ? `${p.lastName}/${p.firstName}`.toUpperCase() : p.fullName;
+    // 称谓（MR/MS/MSTR/MISS）按订单去程（最早 FLIGHT 行出发时间，departDates 已排序）派生年龄。
+    const pnrName = nameWithTitle(p, departDates[0] ?? null);
 
     // 每行酒店名优先用该订单项自带的酒店名（多酒店行程才不会被并成一个酒店）；
     // 仅当订单项没带酒店名时，才回退到该乘客的人工分房组酒店名。

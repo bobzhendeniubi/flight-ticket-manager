@@ -959,6 +959,46 @@ describe('getCheapestRoundTripEconomyCny · 机票参考价范围限定（按航
   });
 });
 
+describe('ProductsService.getBundleFlightRef · 后台起价换算用机票参考价端点', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetCheapestFlightRefCache();
+  });
+
+  it('按传入绑定取当前最低来回机票，包成 { flightRefRoundTripCny }（去程 720 + 回程 720 = 1440）', async () => {
+    mockPrisma.flightSeatClass.findMany
+      .mockResolvedValueOnce([{ basePrice: new Prisma.Decimal(720), fareBuckets: null }])
+      .mockResolvedValueOnce([{ basePrice: new Prisma.Decimal(720), fareBuckets: null }]);
+
+    const service = new ProductsService();
+    const res = await service.getBundleFlightRef({
+      outboundFlightId: 'flight-out',
+      returnFlightId: 'flight-back',
+    });
+
+    expect(res).toEqual({ flightRefRoundTripCny: 1440 });
+    // 绑定透传：按航班 id 过滤，不落到航线兜底
+    const calls = mockPrisma.flightSeatClass.findMany.mock.calls;
+    expect(calls[0][0].where.schedule.flightId).toBe('flight-out');
+    expect(calls[1][0].where.schedule.flightId).toBe('flight-back');
+  });
+
+  it('未绑航班（两参数都空）→ 按套餐航线兜底；查不到任何班次 → { flightRefRoundTripCny: null }', async () => {
+    mockPrisma.flightSeatClass.findMany.mockResolvedValue([]);
+
+    const service = new ProductsService();
+    const res = await service.getBundleFlightRef({ outboundFlightId: null, returnFlightId: null });
+
+    expect(res).toEqual({ flightRefRoundTripCny: null });
+    const calls = mockPrisma.flightSeatClass.findMany.mock.calls;
+    // 航线兜底：按 origin→destination / destination→origin 过滤，不是 flightId
+    expect(calls[0][0].where.schedule.flight).toEqual({
+      originCode: BUNDLE_ROUTE.origin,
+      destinationCode: BUNDLE_ROUTE.destination,
+    });
+  });
+});
+
 describe('ProductsService · costPriceCny 成本价往返（0702 后台反馈 5·成本价进产品表单）', () => {
   beforeEach(() => {
     vi.clearAllMocks();

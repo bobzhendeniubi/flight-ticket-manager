@@ -87,10 +87,12 @@ function nextDayStr(d: string): string {
 /**
  * 拼房客（0.5 半间）逐日附加口径 + 物理房间口径 — 后端 board.hotels[].rows 新增（附加字段，向后兼容）。
  * api.ts 的 HotelControlBoardHotel.rows 尚未声明这些列，这里按可选读取，缺省即降级不显示。
- * physicalUsed = ceil(拼房客数/2) + 整间预订数；两位拼房共用 1 间，落单 1 位向上取整独占 1 间。
+ * 异性不能拼一间：physicalUsed = ceil(男/2) + ceil(女/2) + 未知 + 整间预订数；
+ * 落单数 sharedUnpaired = 男%2 + 女%2 + 未知（同性配对后余数 + 未知全算落单）。
  */
 type SharedRows = {
   sharedHalfCount?: number[];
+  sharedUnpaired?: number[];
   sharedOdd?: boolean[];
   physicalUsed?: number[];
   physicalRemaining?: number[];
@@ -99,6 +101,7 @@ function readShared(rows: unknown): SharedRows {
   const r = rows as SharedRows;
   return {
     sharedHalfCount: r.sharedHalfCount,
+    sharedUnpaired: r.sharedUnpaired,
     sharedOdd: r.sharedOdd,
     physicalUsed: r.physicalUsed,
     physicalRemaining: r.physicalRemaining,
@@ -201,10 +204,10 @@ export function HotelControlPage() {
       <section className="card">
         <h2 className="text-sm font-semibold text-ink">销控矩阵（按酒店 × 日期）</h2>
         <p className="mt-1 text-xs text-ink-muted">
-          每家酒店四行：包房 / 用房（床位口径）/ 物理房间 / 余量。横向滚动看更多日期（最长 120 天）。用房格出现
+          每家酒店四行：包房 / 用房（床位口径）/ 物理房间 / 余量（物理房间口径 = 包房 − 物理房间）。横向滚动看更多日期（最长 120 天）。用房格出现
           <span className="mx-1 inline-flex h-4 min-w-[1rem] items-center justify-center rounded-full bg-amber-100 px-1 text-[10px] font-semibold leading-none text-amber-700 ring-1 ring-amber-300">拼</span>
-          表示当晚拼房客为奇数，有 1 位无法配对（需补单房差或另行配对）。
-          「用房」为床位口径（拼房客各计 0.5，可为小数）；「物理房间」是实际占用的整间数（两位拼房共用 1 间，落单 1 位仍独占 1 间）。
+          表示当晚有拼房客无法配对（异性不能拼一间、性别未知按每人独占），需补单房差或另行配对。
+          「用房」为床位口径（拼房客各计 0.5，可为小数）；「物理房间」是实际占用的整间数（同性两位拼 1 间、落单或未知各独占 1 间）；「余量」按物理房间口径。
         </p>
         {loading ? (
           <div className="mt-3 text-sm text-ink-muted">加载销控板…</div>
@@ -248,7 +251,9 @@ export function HotelControlPage() {
                       {h.rows.used.map((v, i) => {
                         const shared = readShared(h.rows);
                         const odd = shared.sharedOdd?.[i] === true;
-                        const n = shared.sharedHalfCount?.[i] ?? 0;
+                        const total = shared.sharedHalfCount?.[i] ?? 0;
+                        const unpaired = shared.sharedUnpaired?.[i] ?? 0;
+                        const tip = `本日 ${total} 位拼房客，其中 ${unpaired} 位无法配对（异性不能拼一间、性别未知按每人独占）——需补单房差或另行配对`;
                         return (
                           <td key={i} className="px-2 py-1 text-right text-ink-soft">
                             <span className="inline-flex items-center gap-1">
@@ -256,8 +261,8 @@ export function HotelControlPage() {
                               {odd && (
                                 <span
                                   className="inline-flex h-4 min-w-[1rem] items-center justify-center rounded-full bg-amber-100 px-1 text-[10px] font-semibold leading-none text-amber-700 ring-1 ring-amber-300"
-                                  title={`本日有 ${n} 位拼房客（奇数）——1 位需补单房差或另行配对`}
-                                  aria-label={`本日有 ${n} 位拼房客（奇数），1 位需补单房差或另行配对`}
+                                  title={tip}
+                                  aria-label={tip}
                                 >
                                   拼
                                 </span>
@@ -283,25 +288,28 @@ export function HotelControlPage() {
                     </tr>
                     <tr className="border-b border-slate-100">
                       <td className={`${STICKY_COL2} py-1 pr-2 text-xs text-ink-muted`}>余量</td>
-                      {h.rows.remaining.map((v, i) => {
+                      {h.rows.remaining.map((bedRem, i) => {
                         const block = h.rows.block[i];
                         const used = h.rows.used[i];
+                        const shared = readShared(h.rows);
+                        // 余量按物理房间口径（block − physicalUsed）；后端缺省时回落床位余量
+                        const physRem = shared.physicalRemaining?.[i] ?? bedRem;
                         const unconfigured = block === 0 && used > 0;
                         const date = board.dates[i];
                         return (
                           <td
                             key={i}
-                            className={`cursor-pointer px-2 py-1 text-right transition hover:ring-1 hover:ring-brand/50 ${remainingCellCls(v, block, used)}`}
+                            className={`cursor-pointer px-2 py-1 text-right transition hover:ring-1 hover:ring-brand/50 ${remainingCellCls(physRem, block, used)}`}
                             title={
                               unconfigured
                                 ? '未配包房：该晚无包房周期覆盖，此数字非真实超卖 · 点击查看占房订单'
-                                : '点击查看占房订单'
+                                : '余量按物理房间口径（用房行为床位口径）· 点击查看占房订单'
                             }
                             onClick={() =>
                               setDrill({ hotelId: h.hotelId, hotelName: h.hotelName, date, block, used })
                             }
                           >
-                            {unconfigured ? '未配' : v}
+                            {unconfigured ? '未配' : physRem}
                           </td>
                         );
                       })}
@@ -1020,7 +1028,7 @@ function AlertsBanner({ token }: { token: string }) {
                   className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700"
                 >
                   <span className="font-semibold">拼房落单 ⚠</span> {a.hotelName}{' '}
-                  {fmtMonthDay(a.date)} 有 {a.sharedHalfCount} 位拼房客（奇数）临近出发仍未配对 ·
+                  {fmtMonthDay(a.date)} 有 {a.sharedHalfCount} 位拼房客临近出发仍未配对（异性不能拼一间）·
                   补单房差或另配
                 </div>
               ))}

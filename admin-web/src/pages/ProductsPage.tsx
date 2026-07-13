@@ -177,23 +177,6 @@ function bundleApiToMock(b: ApiBundle): MockBundleWithServiceNotes {
 }
 
 /**
- * 从已有套餐反推「当前最低来回机票 / 人」(CNY)：后端给的 originalAllInCny = 地面 + 机票×flightPax，
- * 故 机票 = (originalAllInCny − 地面) / flightPax。新建套餐用它把「想卖的价格」换算成折扣%。
- * 取第一个能算出正值的套餐；都算不出 → null（新建时退化为仅地面口径）。
- */
-function deriveFlightRefRoundTrip(bundles: MockBundle[]): number | null {
-  for (const b of bundles) {
-    if (b.originalAllInCny == null || !b.flightPax) continue;
-    const ground = b.items
-      .filter((i) => i.kind !== 'FLIGHT')
-      .reduce((s, i) => s + (i.qty ?? 0) * (i.unitPrice ?? 0), 0);
-    const ref = Math.round((b.originalAllInCny - ground) / b.flightPax);
-    if (ref > 0) return ref;
-  }
-  return null;
-}
-
-/**
  * 单套餐机票口径（展示用）：从 originalAllInCny 反推「每人来回机票」= (原价 − 地面) / flightPax，
  * 来回价再对半拆成去程 / 回程（去回两程等价，各占一半，向下取整、回程补差保证 去+回=来回）。
  * 只做展示，不改任何定价数学。算不出正值（缺 originalAllInCny / 无机票项）→ null。
@@ -613,6 +596,7 @@ export function ProductsPage() {
           flightOptions={flightOptions}
           transfers={transfers}
           visas={visas}
+          token={tk}
           onChange={persistBundles}
         />
       )}
@@ -875,6 +859,7 @@ function BundlesSection({
   flightOptions,
   transfers,
   visas,
+  token,
   onChange,
 }: {
   items: MockBundleWithServiceNotes[];
@@ -884,6 +869,8 @@ function BundlesSection({
   transfers: MockTransferWithCost[];
   /** 签证产品下拉选项（在售）；套餐 VISA 组件只能挑产品，不再手填价 */
   visas: MockVisaWithStayDays[];
+  /** ADMIN/STAFF token：套餐表单据此调 /products/bundles/flight-ref 取本套餐机票参考价 */
+  token: string;
   onChange: (v: MockBundleWithServiceNotes[]) => void;
 }) {
   const [showWizard, setShowWizard] = useState(false);
@@ -908,7 +895,7 @@ function BundlesSection({
           flightOptions={flightOptions}
           transfers={transfers}
           visas={visas}
-          flightRefRoundTripCny={deriveFlightRefRoundTrip(items)}
+          token={token}
           onCancel={() => setShowWizard(false)}
           onSubmit={(b) => {
             onChange([b, ...items]);
@@ -924,7 +911,7 @@ function BundlesSection({
           transfers={transfers}
           visas={visas}
           initial={editing}
-          flightRefRoundTripCny={deriveFlightRefRoundTrip(items)}
+          token={token}
           onCancel={() => setEditing(null)}
           onSubmit={(b) => {
             // 更新既有套餐（保留 id + 顺序）；persistBundles 走 update 分支
@@ -1154,7 +1141,7 @@ function NewBundleWizard({
   transfers,
   visas,
   initial,
-  flightRefRoundTripCny,
+  token,
   onCancel,
   onSubmit,
 }: {
@@ -1167,8 +1154,8 @@ function NewBundleWizard({
   visas: MockVisaWithStayDays[];
   /** 传入既有套餐 = 编辑模式（各字段预填）；缺省 = 新建 */
   initial?: MockBundleWithServiceNotes;
-  /** 当前最低来回机票 / 人（CNY）：起价 / 人公式里的机票项；页面从已有套餐推得 */
-  flightRefRoundTripCny?: number | null;
+  /** ADMIN/STAFF token：据此调 /products/bundles/flight-ref 按「本套餐自己的绑定」取机票参考价 */
+  token: string;
   onCancel: () => void;
   onSubmit: (b: MockBundleWithServiceNotes) => void;
 }) {
@@ -1190,6 +1177,46 @@ function NewBundleWizard({
   // 绑定航班号（去程/回程）：存 flight.id，空串 = 不指定（按最便宜航班）。编辑时从已绑航班预填。
   const [outboundFlightId, setOutboundFlightId] = useState<string>(initial?.outboundFlight?.id ?? '');
   const [returnFlightId, setReturnFlightId] = useState<string>(initial?.returnFlight?.id ?? '');
+  // 机票参考价（起价 / 人公式里的机票项）—— 按「本套餐自己绑定的去/回程航班」实时取，与套餐卡片同源：
+  //   • 唯一来源 = 后端 /products/bundles/flight-ref（内部即卡片起价用的 getCheapestRoundTripEconomyCny + 同一 binding），
+  //     因此同一绑定下向导预览起价与卡片起价必然一致（修 A11「1560→1760」漂移的根因：旧逻辑从别的套餐借基数）。
+  //   • 编辑初值先用卡片同款反推（bundleFlightRoundTrip 来自服务端 originalAllInCny，与端点同绑定同值），保证「打开即与卡片一致」，
+  //     不用干等接口；接口就绪后覆盖成权威值（数值相同 → 无跳变）。新建初值 null（首查前机票项按 0）。
+  const [flightRefRoundTripCny, setFlightRefRoundTripCny] = useState<number | null>(
+    initial ? bundleFlightRoundTrip(initial)?.roundTrip ?? null : null,
+  );
+  const [flightRefLoading, setFlightRefLoading] = useState(false);
+  const [flightRefError, setFlightRefError] = useState(false);
+  // 打开表单 + 去/回程航班变化时，按当前绑定查机票参考价（300ms 防抖 + 竞态守卫：只认最后一次结果）。
+  // 失败：提示（flightRefError）+ 保留已有基数不污染 —— 编辑保留卡片同款反推/上次成功值（避免瞬时网络抖动
+  // 把机票项清零、再次引发起价漂移），新建首查失败时初值本就是 null（即「回退 null」）。
+  useEffect(() => {
+    if (!token) return;
+    let stale = false;
+    setFlightRefLoading(true);
+    setFlightRefError(false);
+    const timer = setTimeout(() => {
+      api
+        .getBundleFlightRef(token, {
+          outboundFlightId: outboundFlightId || null,
+          returnFlightId: returnFlightId || null,
+        })
+        .then((res) => {
+          if (stale) return;
+          setFlightRefRoundTripCny(res.flightRefRoundTripCny);
+          setFlightRefLoading(false);
+        })
+        .catch(() => {
+          if (stale) return;
+          setFlightRefError(true);
+          setFlightRefLoading(false);
+        });
+    }, 300);
+    return () => {
+      stale = true;
+      clearTimeout(timer);
+    };
+  }, [token, outboundFlightId, returnFlightId]);
   // 自愿升级展示价（CNY；留空 = 前台不展示该升级项）
   const [singleSupplement, setSingleSupplement] = useState<number | null>(initial?.singleSupplementCnyPerNight ?? null);
   const [businessUpgrade, setBusinessUpgrade] = useState<number | null>(initial?.businessUpgradeCnyPerLeg ?? null);
@@ -1848,6 +1875,14 @@ function NewBundleWizard({
               // 避免运营把机票/酒店/升舱几项数字混在一起猜（如把 1400=经济舱700×2 误读成升舱默认）。
               <p className="text-[11px] leading-relaxed text-ink-muted nums">
                 = {originalPerPaxBreakdown.map((row) => `${row.label} ¥${row.amount.toLocaleString()}`).join(' + ')} /人
+              </p>
+            )}
+            {flightRefLoading && (
+              <p className="text-[11px] text-ink-muted">机票参考价计算中…</p>
+            )}
+            {flightRefError && !flightRefLoading && (
+              <p className="text-[11px] text-amber-700">
+                ⚠️ 机票参考价获取失败，起价里的机票项可能不准，请稍后重试或检查网络。
               </p>
             )}
             <p className="text-[11px] leading-relaxed text-ink-muted">

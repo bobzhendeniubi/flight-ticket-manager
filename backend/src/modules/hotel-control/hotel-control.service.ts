@@ -12,7 +12,7 @@
  *
  * 写操作由 routes 层负责 ADMIN/STAFF 鉴权 + 审计日志（镜像 finances 成本周期风格）。
  */
-import { OrderItemKind, OrderStatus, Prisma, type PrismaClient } from '@prisma/client';
+import { OrderItemKind, OrderStatus, Prisma, type Gender, type PrismaClient } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { BadRequestError, NotFoundError } from '../../lib/errors.js';
 import type { CreateBlockPeriodBody, UpdateBlockPeriodBody } from './hotel-control.schemas.js';
@@ -239,52 +239,87 @@ function isHalfRoom(it: { roomsBilled?: Prisma.Decimal | number | null }): boole
 }
 
 /**
- * dates 上逐日累计「拼房客」人数：roomsBilled == 0.5 的占房行，
- * 入住区间 [checkIn, checkOut) 覆盖该晚即 +1（每行 = 1 位拼房客）。
- * 用于「奇数拼房客落单」提醒：两位 0.5 拼一间，奇数则有 1 位无法配对。
+ * 拼房客逐日按性别分桶计数（异性不能拼一间）。每桶数组与 dates 等长。
+ *   m/f = 明确性别为 男/女 的拼房客数；
+ *   u   = 性别未知（Passenger.gender 为 null 或 X）的拼房客数——保守口径每人独占 1 间。
+ */
+export interface SharedGenderBuckets {
+  m: number[];
+  f: number[];
+  u: number[];
+}
+
+/**
+ * 取拼房单出行人的性别：拼房单（roomsBilled==0.5）恒为 adultCount===1 的套餐单，
+ * 正常只 1 位真实出行人。取第一位性别为 M/F 的出行人；X / null / 无出行人一律视为「未知」。
+ * 订单若含多位出行人（异常兜底），取第一位有明确性别（M/F）者，其余忽略。
+ */
+function pickSoloGender(
+  passengers: ReadonlyArray<{ gender: Gender | null }> | null | undefined,
+): 'M' | 'F' | 'U' {
+  if (!passengers) return 'U';
+  for (const p of passengers) {
+    if (p.gender === 'M' || p.gender === 'F') return p.gender;
+  }
+  return 'U';
+}
+
+/**
+ * dates 上逐日按性别累计「拼房客」人数：roomsBilled == 0.5 的占房行，
+ * 入住区间 [checkIn, checkOut) 覆盖该晚即按其出行人性别 +1（每行 = 1 位拼房客）。
+ * 异性不能拼一间 → 男/女各自两两配对、未知每人独占，用于物理房间与落单口径。
+ *
+ * TODO(房控-下一波): 运营故意混拼（Order.roomAssignment 分房表已指定同房不同性别）时，
+ * 应读分房表覆盖此按性别的保守推算；当前迭代不做（分房表覆盖留待后续）。
  */
 export function expandSharedHalfByDate(
   items: ReadonlyArray<{
     hotelCheckIn: Date | null;
     hotelCheckOut: Date | null;
     roomsBilled?: Prisma.Decimal | number | null;
+    order?: { passengers: Array<{ gender: Gender | null }> } | null;
   }>,
   dates: readonly string[],
-): number[] {
-  const count = new Array<number>(dates.length).fill(0);
+): SharedGenderBuckets {
+  const m = new Array<number>(dates.length).fill(0);
+  const f = new Array<number>(dates.length).fill(0);
+  const u = new Array<number>(dates.length).fill(0);
   for (const it of items) {
     if (!it.hotelCheckIn || !it.hotelCheckOut) continue;
     if (!isHalfRoom(it)) continue;
+    const g = pickSoloGender(it.order?.passengers);
+    const bucket = g === 'M' ? m : g === 'F' ? f : u;
     const checkIn = fmtDateOnly(it.hotelCheckIn);
     const checkOut = fmtDateOnly(it.hotelCheckOut);
     for (let i = 0; i < dates.length; i++) {
-      if (checkIn <= dates[i] && dates[i] < checkOut) count[i] += 1;
+      if (checkIn <= dates[i] && dates[i] < checkOut) bucket[i] += 1;
     }
   }
-  return count;
+  return { m, f, u };
 }
 
 /**
  * 物理房间口径占房：逐日真实占用的整间数（可由销控板既有数组在内存推导，无需查库）。
- *   physicalUsed[i] = ceil(拼房客数 / 2) + 整间预订数
- * 其中：
- *   sharedHalfCount[i] * 0.5 = 拼房客贡献的床位当量；
- *   used[i] - sharedHalfCount[i] * 0.5 = 整间预订当量（整数），即整间预订数；
- *   两位拼房客共用 1 间物理房，落单 1 位向上取整独占 1 间 ⇒ ceil(拼房客数 / 2)。
- * 防浮点误差：整间余数按最近的 0.5 取整后再运算，最后 round2 输出。
+ *   physicalUsed[i] = ceil(m/2) + ceil(f/2) + u + 整间预订数
+ * 其中（按性别分组，异性不能拼一间）：
+ *   m/f = 当晚男/女拼房客数 → 同性两两配对、落单向上取整独占 ⇒ ceil(m/2)+ceil(f/2)；
+ *   u   = 性别未知拼房客数 → 保守口径每人独占 1 间；
+ *   整间预订数 = (used*2 的 half-unit 总量 − 拼房客 half-unit) / 2（应为整数）。
+ * 防浮点误差：used 由 Decimal 0.5 累加而来，先按 0.5 网格对齐消除 0.999… 类误差，最后 round2 输出。
  */
 export function computePhysicalUsed(
   used: readonly number[],
-  sharedHalfCount: readonly number[],
+  buckets: SharedGenderBuckets,
 ): number[] {
-  return used.map((u, i) => {
-    const solos = sharedHalfCount[i] ?? 0;
+  return used.map((bedUsed, i) => {
+    const m = buckets.m[i] ?? 0;
+    const f = buckets.f[i] ?? 0;
+    const u = buckets.u[i] ?? 0;
+    const solos = m + f + u; // 拼房客总数（各 = 0.5 = 1 个 half-unit）
     // used 由 Decimal 0.5 累加而来，先按 0.5 网格对齐消除 0.999… 类误差
-    const usedHalfUnits = Math.round(u * 2);
-    const soloHalfUnits = solos; // 每位拼房客 = 0.5 = 1 个 half-unit
-    const wholeRoomHalfUnits = usedHalfUnits - soloHalfUnits; // 整间部分（half-unit 计）
-    const wholeRooms = wholeRoomHalfUnits / 2; // 整间预订数（应为整数）
-    return round2(Math.ceil(solos / 2) + wholeRooms);
+    const usedHalfUnits = Math.round(bedUsed * 2);
+    const wholeRooms = (usedHalfUnits - solos) / 2; // 整间预订数（应为整数）
+    return round2(Math.ceil(m / 2) + Math.ceil(f / 2) + u + wholeRooms);
   });
 }
 
@@ -343,14 +378,19 @@ export interface HotelControlBoard {
       used: number[];
       /** 床位口径余量 = block - used，逐日 */
       remaining: number[];
-      /** 当晚拼房客（roomsBilled==0.5）人数，逐日 */
+      /** 当晚拼房客（roomsBilled==0.5）总人数（含各性别），逐日 */
       sharedHalfCount: number[];
-      /** 当晚拼房客人数为奇数 ⇒ 有 1 位无法配对（需补单房差或另行配对），逐日 */
+      /**
+       * 当晚无法配对的拼房客数（落单数），逐日。
+       * = m%2 + f%2 + u（同性两两配对后的余数 + 未知性别全算落单）。
+       */
+      sharedUnpaired: number[];
+      /** 当晚有拼房客无法配对（sharedUnpaired > 0，需补单房差或另行配对），逐日 */
       sharedOdd: boolean[];
       /**
        * 物理房间口径占房：真实占用的整间数，逐日。
-       * = ceil(拼房客数 / 2) + 整间预订数
-       *   两位拼房客共用 1 间物理房；落单的 1 位仍独占 1 间（向上取整）。
+       * = ceil(男/2) + ceil(女/2) + 未知 + 整间预订数
+       *   异性不能拼一间：男/女各自两两共用 1 间、落单向上取整独占；未知每人独占 1 间。
        */
       physicalUsed: number[];
       /** 物理房间口径余量 = block - physicalUsed，逐日 */
@@ -404,6 +444,9 @@ export async function getBoard(
       roomsBilled: true,
       metadata: true,
       hotelRoomType: { select: { hotelId: true, hotel: { select: { name: true } } } },
+      // 拼房客性别（异性不能拼一间）——拼房单恒为 adultCount===1 的套餐单，取其出行人性别；
+      // 仅取 gender 字段、批量随主查带回，不额外查库（见 expandSharedHalfByDate / pickSoloGender）。
+      order: { select: { passengers: { select: { gender: true } } } },
     },
   });
 
@@ -423,13 +466,16 @@ export async function getBoard(
       const hotelItems = items.filter((it) => it.hotelRoomType?.hotelId === hotelId);
       const block = expandBlockByDate(hotelPeriods, dates);
       const used = expandUsedByDate(hotelItems, dates);
-      // 拼房客（0.5 半间）逐日人数 + 奇数标记（同一份占房行复用，O(items)）
-      const sharedHalfCount = expandSharedHalfByDate(hotelItems, dates);
-      const sharedOdd = sharedHalfCount.map((n) => n % 2 === 1);
+      // 拼房客（0.5 半间）逐日按性别分桶（异性不能拼一间；同一份占房行复用，O(items)）
+      const buckets = expandSharedHalfByDate(hotelItems, dates);
+      const sharedHalfCount = buckets.m.map((mv, i) => mv + buckets.f[i] + buckets.u[i]);
+      // 落单数 = 同性两两配对后的余数 + 未知性别（全算落单）
+      const sharedUnpaired = buckets.m.map((mv, i) => (mv % 2) + (buckets.f[i] % 2) + buckets.u[i]);
+      const sharedOdd = sharedUnpaired.map((n) => n > 0);
 
       const remaining = block.map((b, i) => b - used[i]);
       // 物理房间口径（内存推导，无额外查库）：整间占用数 + 余量
-      const physicalUsed = computePhysicalUsed(used, sharedHalfCount);
+      const physicalUsed = computePhysicalUsed(used, buckets);
       const physicalRemaining = block.map((b, i) => round2(b - physicalUsed[i]));
       const latestPriced = hotelPeriods.find((p) => p.unitPrice != null);
       const unitPrice = latestPriced ? round2(dec(latestPriced.unitPrice)!) : null;
@@ -443,6 +489,7 @@ export async function getBoard(
           used,
           remaining,
           sharedHalfCount,
+          sharedUnpaired,
           sharedOdd,
           physicalUsed,
           physicalRemaining,
@@ -473,14 +520,14 @@ export interface HotelControlAlerts {
     paxCount: number;
   }>;
   /**
-   * 入住临近（SHARED_ODD_NEAR_DAYS 天内）当晚拼房客为奇数：有 1 位无法配对，
-   * 需趁出发前补单房差或另配。被动的销控板「拼」角标之外的主动推送。
+   * 入住临近（SHARED_ODD_NEAR_DAYS 天内）当晚有拼房客无法配对（落单数 > 0，异性不能拼、
+   * 未知性别每人独占）：需趁出发前补单房差或另配。被动的销控板「拼」角标之外的主动推送。
    */
   sharedOddNear: Array<{
     hotelId: string;
     hotelName: string;
     date: string; // YYYY-MM-DD（入住晚）
-    sharedHalfCount: number; // 当晚拼房客总人数（奇数）
+    sharedHalfCount: number; // 当晚拼房客总人数（触发条件是落单数 > 0）
   }>;
 }
 
@@ -490,7 +537,7 @@ const SURPLUS_WINDOW_DAYS = 3;
 /** 班次超员检查窗口（天）。*/
 const SCHEDULE_ALERT_WINDOW_DAYS = 30;
 
-/** 拼房客落单主动提醒窗口（天）— 入住在此天数内且当晚拼房客为奇数就推送。*/
+/** 拼房客落单主动提醒窗口（天）— 入住在此天数内且当晚有拼房客落单（落单数>0）就推送。*/
 const SHARED_ODD_NEAR_DAYS = 7;
 
 /**
@@ -537,9 +584,10 @@ export async function getAlerts(
       if (date < surplusCutoff && block > 0 && remaining > 0) {
         surplusSoon.push({ hotelName: hotel.hotelName, date, surplus: remaining });
       }
-      // 拼房客奇数（有 1 位落单）且入住临近 → 主动提醒补单房差 / 另配
+      // 有拼房客落单（异性不能拼、未知独占后仍无法配对）且入住临近 → 主动提醒补单房差 / 另配
       const shared = hotel.rows.sharedHalfCount[i];
-      if (date < sharedOddCutoff && shared > 0 && shared % 2 === 1) {
+      const unpaired = hotel.rows.sharedUnpaired[i];
+      if (date < sharedOddCutoff && unpaired > 0) {
         sharedOddNear.push({
           hotelId: hotel.hotelId,
           hotelName: hotel.hotelName,

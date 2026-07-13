@@ -273,7 +273,8 @@ describe('orderToMasterRows', () => {
 
     // 姓名 / 中文名 / 类型 / 性别 / 国籍 / 证件类型
     expect(r1.chineseName).toBe('张三');
-    expect(r1.passengerName).toBe('ZHANG/SAN');
+    // 称谓（0711 反馈「订单导出缺 MR/MS」）：成人男性 → 姓名后加 " MR"。
+    expect(r1.passengerName).toBe('ZHANG/SAN MR');
     expect(r2.chineseName).toBe('李四'); // chineseName 缺 → 回落 fullName
     expect(r1.passengerType).toBe('成人');
     expect(r2.passengerType).toBe('儿童');

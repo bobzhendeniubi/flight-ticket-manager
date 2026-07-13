@@ -20,6 +20,7 @@ import {
   orderToVisaRows,
   buildOrderContext,
   pnrName,
+  nameWithTitle,
   FULL_COLUMNS,
   TICKETING_COLUMNS,
   type OrderForTemplateExport,
@@ -234,9 +235,10 @@ describe('《全岗可用》full 模版 — 逐列取值/格式', () => {
     expect(r2.chineseName).toBe('李四');
   });
 
-  it('乘客姓名：LAST/FIRST 斜线拼接，缺省回落 fullName', () => {
-    expect(r1.passengerName).toBe('WANG/LIANBO');
-    expect(r2.passengerName).toBe('李四');
+  it('乘客姓名：LAST/FIRST 斜线拼接，缺省回落 fullName；末尾附称谓（0711 反馈缺 MR/MS）', () => {
+    // r1 成人男性（按出发日实足 42 岁）→ MR；r2 按出发日实足 7 岁 = 儿童、性别 F → MISS。
+    expect(r1.passengerName).toBe('WANG/LIANBO MR');
+    expect(r2.passengerName).toBe('李四 MISS');
   });
 
   it('出发(往返)日期 / 航班号 / 订单类型：往返票口径', () => {
@@ -370,6 +372,78 @@ describe('pnrName — 护照逗号剥离', () => {
 
   it('fullName 回退：中文名无逗号 → 原样返回', () => {
     expect(pnrName({ lastName: null, firstName: null, fullName: '李四' })).toBe('李四');
+  });
+});
+
+// ── nameWithTitle — 姓名 + 称谓（0711 反馈「订单导出缺 MR/MS」）───────────────
+// 口径：成人（按出发日实足年龄 ≥12 或无生日数据）M→MR / F→MS；
+// 儿童（2–<12）/ 婴儿（<2）M→MSTR / F→MISS；性别 X/未知 → 不加称谓；已有手录 title 优先。
+describe('nameWithTitle — 姓名 + 称谓', () => {
+  const depart = D('2026-07-13'); // 参照订单去程日
+
+  it('成人男性 → 姓名后加 " MR"', () => {
+    const p = { lastName: 'ZHAO', firstName: 'WEI', fullName: 'x', gender: 'M', dateOfBirth: D('1990-01-01') };
+    expect(nameWithTitle(p, depart)).toBe('ZHAO/WEI MR');
+  });
+
+  it('成人女性 → 姓名后加 " MS"', () => {
+    const p = { lastName: 'ZHAO', firstName: 'WEI', fullName: 'x', gender: 'F', dateOfBirth: D('1990-01-01') };
+    expect(nameWithTitle(p, depart)).toBe('ZHAO/WEI MS');
+  });
+
+  it('儿童（2–<12 岁）男性 → 姓名后加 " MSTR"', () => {
+    // 出发日 2026-07-13 − 生日 2018-01-01 → 实足 8 岁 = 儿童
+    const p = { lastName: 'ZHAO', firstName: 'WEI', fullName: 'x', gender: 'M', dateOfBirth: D('2018-01-01') };
+    expect(nameWithTitle(p, depart)).toBe('ZHAO/WEI MSTR');
+  });
+
+  it('儿童女性 → 姓名后加 " MISS"', () => {
+    const p = { lastName: 'ZHAO', firstName: 'WEI', fullName: 'x', gender: 'F', dateOfBirth: D('2018-01-01') };
+    expect(nameWithTitle(p, depart)).toBe('ZHAO/WEI MISS');
+  });
+
+  it('婴儿（<2 岁）男性 → 姓名后加 " MSTR"（同儿童规则）', () => {
+    // 出发日 2026-07-13 − 生日 2025-01-01 → 实足 1 岁 = 婴儿
+    const p = { lastName: 'ZHAO', firstName: 'WEI', fullName: 'x', gender: 'M', dateOfBirth: D('2025-01-01') };
+    expect(nameWithTitle(p, depart)).toBe('ZHAO/WEI MSTR');
+  });
+
+  it('婴儿女性 → 姓名后加 " MISS"（同儿童规则）', () => {
+    const p = { lastName: 'ZHAO', firstName: 'WEI', fullName: 'x', gender: 'F', dateOfBirth: D('2025-01-01') };
+    expect(nameWithTitle(p, depart)).toBe('ZHAO/WEI MISS');
+  });
+
+  it('性别未知（X）→ 不加称谓，原样返回 pnrName 结果（无尾随空格）', () => {
+    const p = { lastName: 'ZHAO', firstName: 'WEI', fullName: 'x', gender: 'X', dateOfBirth: D('1990-01-01') };
+    expect(nameWithTitle(p, depart)).toBe('ZHAO/WEI');
+  });
+
+  it('性别缺失（null）→ 不加称谓', () => {
+    const p = { lastName: 'ZHAO', firstName: 'WEI', fullName: 'x', gender: null, dateOfBirth: D('1990-01-01') };
+    expect(nameWithTitle(p, depart)).toBe('ZHAO/WEI');
+  });
+
+  it('无生日数据 → 按成人处理（不受未传 passengerType 影响），男性仍给 MR', () => {
+    const p = { lastName: 'ZHAO', firstName: 'WEI', fullName: 'x', gender: 'M', dateOfBirth: null };
+    expect(nameWithTitle(p, depart)).toBe('ZHAO/WEI MR');
+  });
+
+  it('已有手录 title → 优先直接用（原样大写），不再按年龄/性别派生', () => {
+    // 生日按年龄本应派生为儿童 MSTR，但手录 title 优先生效。
+    const p = {
+      lastName: 'ZHAO',
+      firstName: 'WEI',
+      fullName: 'x',
+      title: 'mrs',
+      gender: 'M',
+      dateOfBirth: D('2018-01-01'),
+    };
+    expect(nameWithTitle(p, depart)).toBe('ZHAO/WEI MRS');
+  });
+
+  it('未传出发日 → 按当前日期近似估算年龄（老生日仍稳定判成人，不受测试运行时间影响）', () => {
+    const p = { lastName: 'ZHAO', firstName: 'WEI', fullName: 'x', gender: 'M', dateOfBirth: D('1950-01-01') };
+    expect(nameWithTitle(p)).toBe('ZHAO/WEI MR');
   });
 });
 

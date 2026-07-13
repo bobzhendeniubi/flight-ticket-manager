@@ -2,9 +2,75 @@ import { Prisma, SettlementMode, UserRole } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { hashPassword } from '../../lib/password.js';
 import { ConflictError, ForbiddenError, NotFoundError } from '../../lib/errors.js';
-import type { CreateChildAgentBody } from './agents.schemas.js';
+import type { CreateChildAgentBody, UpdateAgentBody } from './agents.schemas.js';
+
+// 详情查询共用的 include：列表 / 编辑后回显 / 停用启用后回显都要同一份投影，
+// 避免三处字段拼写各自维护、逐渐漂移。
+const AGENT_DETAIL_INCLUDE = {
+  user: {
+    select: { id: true, email: true, displayName: true, lastLoginAt: true, createdAt: true },
+  },
+  parentAgent: {
+    select: { id: true, companyName: true, contactName: true, tier: true },
+  },
+  _count: { select: { childAgents: true, orders: true } },
+} satisfies Prisma.AgentInclude;
+
+type AgentWithDetail = Prisma.AgentGetPayload<{ include: typeof AGENT_DETAIL_INCLUDE }>;
 
 export class AgentService {
+  /** 与 listVisibleAgents 单条记录同形状的投影，供更新类接口直接把最新状态回传给前端。 */
+  private mapAgentRow(a: AgentWithDetail) {
+    return {
+      id: a.id,
+      userId: a.userId,
+      tier: a.tier,
+      parentAgentId: a.parentAgentId,
+      parent: a.parentAgent,
+      companyName: a.companyName,
+      contactName: a.contactName,
+      contactPhone: a.contactPhone,
+      prepaymentBalance: a.prepaymentBalance.toString(),
+      settlementMode: a.settlementMode,
+      isActive: a.isActive,
+      notes: a.notes,
+      email: a.user.email,
+      displayName: a.user.displayName,
+      lastLoginAt: a.user.lastLoginAt?.toISOString() ?? null,
+      createdAt: a.createdAt.toISOString(),
+      childCount: a._count.childAgents,
+      orderCount: a._count.orders,
+    };
+  }
+
+  private async getAgentDetail(agentId: string) {
+    const a = await prisma.agent.findUnique({ where: { id: agentId }, include: AGENT_DETAIL_INCLUDE });
+    if (!a) throw new NotFoundError('代理不存在');
+    return this.mapAgentRow(a);
+  }
+
+  /**
+   * 服务层操作日志（app.log 级别）：只记录操作者 id / 目标代理 id / 变更字段名，
+   * 不记录变更后的具体值（联系方式等不进日志）。需要留痕具体前后值的走 route 层 writeAudit()。
+   */
+  private logOperation(
+    action: string,
+    meta: { actorUserId: string; targetAgentId: string; changedFields: string[] },
+  ): void {
+    // eslint-disable-next-line no-console
+    console.log(
+      JSON.stringify({
+        level: 'info',
+        type: 'agent_operation',
+        action,
+        actorUserId: meta.actorUserId,
+        targetAgentId: meta.targetAgentId,
+        changedFields: meta.changedFields,
+        at: new Date().toISOString(),
+      }),
+    );
+  }
+
   /** 读取当前登录用户的 agent profile。CUSTOMER/STAFF 返回 null */
   async getByUserId(userId: string) {
     return prisma.agent.findUnique({ where: { userId } });
@@ -43,37 +109,10 @@ export class AgentService {
     const agents = await prisma.agent.findMany({
       where,
       orderBy: [{ tier: 'asc' }, { createdAt: 'asc' }],
-      include: {
-        user: {
-          select: { id: true, email: true, displayName: true, lastLoginAt: true, createdAt: true },
-        },
-        parentAgent: {
-          select: { id: true, companyName: true, contactName: true, tier: true },
-        },
-        _count: { select: { childAgents: true, orders: true } },
-      },
+      include: AGENT_DETAIL_INCLUDE,
     });
 
-    return agents.map((a) => ({
-      id: a.id,
-      userId: a.userId,
-      tier: a.tier,
-      parentAgentId: a.parentAgentId,
-      parent: a.parentAgent,
-      companyName: a.companyName,
-      contactName: a.contactName,
-      contactPhone: a.contactPhone,
-      prepaymentBalance: a.prepaymentBalance.toString(),
-      settlementMode: a.settlementMode,
-      isActive: a.isActive,
-      notes: a.notes,
-      email: a.user.email,
-      displayName: a.user.displayName,
-      lastLoginAt: a.user.lastLoginAt?.toISOString() ?? null,
-      createdAt: a.createdAt.toISOString(),
-      childCount: a._count.childAgents,
-      orderCount: a._count.orders,
-    }));
+    return agents.map((a) => this.mapAgentRow(a));
   }
 
   /**
@@ -187,5 +226,123 @@ export class AgentService {
       previousMode: agent.settlementMode,
       contactName: updated.contactName,
     };
+  }
+
+  /**
+   * 编辑代理基础联系信息（公司名/联系人/电话/邮箱/备注）。
+   * - ADMIN/STAFF：可改任意代理。
+   * - AGENT：只能改自己（userId 必须匹配当前登录用户）。
+   * email 落在 User 表（唯一），其余字段落在 Agent 表 —— 一次事务内一起改，避免半写。
+   */
+  async updateAgent(input: {
+    currentUserId: string;
+    currentRole: UserRole;
+    targetAgentId: string;
+    body: UpdateAgentBody;
+  }) {
+    const { currentUserId, currentRole, targetAgentId, body } = input;
+
+    const target = await prisma.agent.findUnique({
+      where: { id: targetAgentId },
+      include: { user: { select: { id: true, email: true } } },
+    });
+    if (!target) throw new NotFoundError('代理不存在');
+
+    if (currentRole === UserRole.AGENT) {
+      if (target.userId !== currentUserId) {
+        throw new ForbiddenError('只能修改自己的代理信息');
+      }
+    } else if (currentRole !== UserRole.ADMIN && currentRole !== UserRole.STAFF) {
+      throw new ForbiddenError('无权限修改代理信息');
+    }
+
+    if (body.email !== undefined && body.email !== target.user.email) {
+      const existing = await prisma.user.findUnique({ where: { email: body.email } });
+      if (existing && existing.id !== target.userId) {
+        throw new ConflictError('邮箱已被其他账号使用');
+      }
+    }
+
+    // 只对比实际传入且发生变化的字段：before/after 只含改动过的字段，供 route 层写审计。
+    const before: Record<string, unknown> = {};
+    const after: Record<string, unknown> = {};
+    const changedFields: string[] = [];
+    const trackChange = (field: string, prevVal: unknown, nextVal: unknown) => {
+      if (nextVal === undefined || nextVal === prevVal) return;
+      before[field] = prevVal;
+      after[field] = nextVal;
+      changedFields.push(field);
+    };
+    trackChange('companyName', target.companyName, body.companyName);
+    trackChange('contactName', target.contactName, body.contactName);
+    trackChange('contactPhone', target.contactPhone, body.contactPhone);
+    trackChange('notes', target.notes, body.notes);
+    trackChange('email', target.user.email, body.email);
+
+    if (changedFields.length > 0) {
+      await prisma.$transaction(async (tx) => {
+        const agentData: Prisma.AgentUpdateInput = {};
+        if (body.companyName !== undefined) agentData.companyName = body.companyName;
+        if (body.contactName !== undefined) agentData.contactName = body.contactName;
+        if (body.contactPhone !== undefined) agentData.contactPhone = body.contactPhone;
+        if (body.notes !== undefined) agentData.notes = body.notes;
+        if (Object.keys(agentData).length > 0) {
+          await tx.agent.update({ where: { id: targetAgentId }, data: agentData });
+        }
+        if (body.email !== undefined && body.email !== target.user.email) {
+          await tx.user.update({ where: { id: target.userId }, data: { email: body.email } });
+        }
+      });
+
+      this.logOperation('UPDATE_AGENT', { actorUserId: currentUserId, targetAgentId, changedFields });
+    }
+
+    return { agent: await this.getAgentDetail(targetAgentId), changedFields, before, after };
+  }
+
+  /**
+   * 停用/启用代理登录。仅 ADMIN。
+   *
+   * 行为说明：
+   * - 只影响该代理本身能否登录（Agent.isActive=false → 登录时被拒绝，见 AuthService.login）。
+   * - 不级联停用下级代理 —— 上级停用不代表下级立即失联，下级是否继续可登录由其自身
+   *   isActive 独立决定，需要另行逐个处理（避免一次误操作停掉一整条线的下级）。
+   * - 不允许停用当前操作者自己账号所属的代理（自锁保护）。
+   */
+  async setActive(input: {
+    currentUserId: string;
+    currentRole: UserRole;
+    targetAgentId: string;
+    isActive: boolean;
+  }) {
+    const { currentUserId, currentRole, targetAgentId, isActive } = input;
+    if (currentRole !== UserRole.ADMIN) {
+      throw new ForbiddenError('仅管理员可停用/启用代理');
+    }
+
+    const target = await prisma.agent.findUnique({
+      where: { id: targetAgentId },
+      select: { id: true, userId: true, isActive: true },
+    });
+    if (!target) throw new NotFoundError('代理不存在');
+
+    if (target.userId === currentUserId) {
+      throw new ForbiddenError('不能停用自己账号所属的代理');
+    }
+
+    if (target.isActive === isActive) {
+      // 幂等：状态未变化，直接回显当前详情，不写操作日志/审计（没有实际变更）。
+      return { agent: await this.getAgentDetail(targetAgentId), changed: false };
+    }
+
+    await prisma.agent.update({ where: { id: targetAgentId }, data: { isActive } });
+
+    this.logOperation(isActive ? 'ACTIVATE_AGENT' : 'DEACTIVATE_AGENT', {
+      actorUserId: currentUserId,
+      targetAgentId,
+      changedFields: ['isActive'],
+    });
+
+    return { agent: await this.getAgentDetail(targetAgentId), changed: true };
   }
 }

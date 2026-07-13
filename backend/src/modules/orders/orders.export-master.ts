@@ -25,7 +25,7 @@ import { prisma as defaultPrisma } from '../../db/prisma.js';
 import type { BundleItemJson } from '../../lib/json-types.js';
 import { toAlpha3 } from './nationality.js';
 import { parseRoomGroups } from './orders.export-room-allocation.js';
-import { pnrName } from './orders.export-templates.js';
+import { nameWithTitle } from './orders.export-templates.js';
 import { buildOrderFilterWhere } from './orders.service.js';
 
 // ── 岗位视图 ──────────────────────────────────────────────────────────────
@@ -425,7 +425,8 @@ export function orderToMasterRows(order: OrderForMasterExport): Omit<MasterRow, 
       notes,
       hotelName: hotelNames,
       chineseName: p.chineseName ?? p.fullName,
-      passengerName: pnrName(p),
+      // 称谓（MR/MS/MSTR/MISS）按订单去程（最早 FLIGHT 行出发时间，legs 已按出发时间排序）派生年龄。
+      passengerName: nameWithTitle(p, legs[0]?.departureTime ?? null),
       flightCount,
       travelDates,
       flightNumbers,

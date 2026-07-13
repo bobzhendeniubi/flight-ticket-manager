@@ -18,10 +18,13 @@ import {
   buildRoomAllocationWorkbook,
   roomAllocationExportFilename,
   roomAllocationExportFilenameByDepart,
+  COLUMNS,
   type RoomItemForExport,
 } from './orders.export-room-allocation.js';
 
 const D = (s: string): Date => new Date(`${s}T00:00:00.000Z`);
+/** 带时分秒的完整 ISO 时间戳（录入时间 enteredAt 断言用，D() 只到日粒度）。*/
+const D2 = (iso: string): Date => new Date(iso);
 
 /** 两单 fixture：O1 有分房 + 两段航班；O2 无分房、无航班、有代理。*/
 function fixtureItems(): RoomItemForExport[] {
@@ -39,6 +42,8 @@ function fixtureItems(): RoomItemForExport[] {
       ],
     },
     agent: null,
+    total: 4800,
+    createdAt: D2('2026-07-01T13:04:02.000Z'),
     passengers: [
       {
         id: 'p1',
@@ -48,6 +53,7 @@ function fixtureItems(): RoomItemForExport[] {
         gender: 'M',
         dateOfBirth: D('1997-12-11'),
         documentNumber: 'E12345678',
+        passportIssueDate: D('2020-06-15'),
         passportExpiry: D('2030-01-05'),
         bedPref: null,
       },
@@ -59,6 +65,7 @@ function fixtureItems(): RoomItemForExport[] {
         gender: 'F',
         dateOfBirth: D('2000-01-02'),
         documentNumber: 'E87654321',
+        passportIssueDate: null,
         passportExpiry: null,
         bedPref: null,
       },
@@ -74,6 +81,8 @@ function fixtureItems(): RoomItemForExport[] {
     notes: null,
     roomAssignment: null,
     agent: { companyName: '成都国旅' },
+    total: 1000,
+    createdAt: D2('2026-07-02T09:30:00.000Z'),
     passengers: [
       {
         id: 'p3',
@@ -83,6 +92,7 @@ function fixtureItems(): RoomItemForExport[] {
         gender: null,
         dateOfBirth: D('1988-03-09'),
         documentNumber: 'E00000001',
+        passportIssueDate: null,
         passportExpiry: D('2031-12-31'),
         bedPref: null,
       },
@@ -134,7 +144,7 @@ describe('buildRoomAllocationSheets', () => {
     expect(r1.dateOfBirth).toBe('11-12-1997');
     expect(r1.gender).toBe('M');
     expect(r1.documentNumber).toBe('E12345678');
-    expect(r1.issueDate).toBe('');
+    expect(r1.issueDate).toBe('15-06-2020');
     expect(r1.passportExpiry).toBe('05-01-2030');
     expect(r1.roomType).toBe('大床房'); // roomGroup.roomType 优先
     expect(r1.notes).toBe('蜜月 / 尽量高层'); // 组备注 + 订单备注
@@ -143,9 +153,21 @@ describe('buildRoomAllocationSheets', () => {
     // 李四：未分房 → 姓名回落 fullName、房型回落行上床型、备注只剩订单备注
     expect(r2.pnrName).toBe('李四');
     expect(r2.gender).toBe('F');
+    expect(r2.issueDate).toBe(''); // passportIssueDate 缺失 → 留空
     expect(r2.passportExpiry).toBe('');
     expect(r2.roomType).toBe('双床');
     expect(r2.notes).toBe('尽量高层');
+  });
+
+  it('结算价格 = 订单总价 / 乘客数（人均，同订单每行相同）；录入时间取 order.createdAt 含秒', () => {
+    const sheets = buildRoomAllocationSheets(fixtureItems());
+    const [r1, r2] = sheets[0].rows;
+
+    // o1：total=4800，2 位乘客 → 人均 2400，两行相同
+    expect(r1.settlePrice).toBe(2400);
+    expect(r2.settlePrice).toBe(2400);
+    expect(r1.enteredAt).toBe('2026-07-01 13:04:02');
+    expect(r2.enteredAt).toBe('2026-07-01 13:04:02');
   });
 
   it('无航班订单出发日期回落入住日；床型缺失时房型留空；代理显示公司名', () => {
@@ -158,10 +180,40 @@ describe('buildRoomAllocationSheets', () => {
     expect(r3.roomType).toBe('');
     expect(r3.notes).toBe('');
     expect(r3.hotelType).toBe('C酒店 · 高级房');
+    // o2：total=1000，1 位乘客 → 人均 1000；录入时间取自己订单的 createdAt
+    expect(r3.settlePrice).toBe(1000);
+    expect(r3.enteredAt).toBe('2026-07-02 09:30:00');
+    expect(r3.issueDate).toBe(''); // 王五未录 passportIssueDate
   });
 
   it('空输入 → 无 sheet', () => {
     expect(buildRoomAllocationSheets([])).toEqual([]);
+  });
+});
+
+describe('COLUMNS 列序（对齐旧系统 0713 房控反馈）', () => {
+  it('旧系统 16 列原序 + 当前系统特有 3 列（房间号/升级原因/当日余房）追加末位', () => {
+    expect(COLUMNS.map((c) => c.header)).toEqual([
+      '序号',
+      '代理机构',
+      '备注',
+      '酒店类型',
+      '中文名称',
+      '乘客姓名',
+      '飞行次数',
+      '出发(往返)日期',
+      '结算价格',
+      '乘客生日',
+      '性别',
+      '证件编号',
+      '签发日期',
+      '有效日期',
+      '录入时间',
+      '房型',
+      '房间号',
+      '升级原因',
+      '当日余房',
+    ]);
   });
 });
 

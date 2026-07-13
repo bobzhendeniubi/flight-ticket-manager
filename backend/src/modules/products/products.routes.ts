@@ -15,6 +15,7 @@ import { ProductsService } from './products.service.js';
 import { getHotelAvailability } from './hotel-availability.service.js';
 import { getBundleSellableDates } from './bundle-availability.service.js';
 import {
+  bundleFlightRefQuerySchema,
   bundleSellableDatesQuerySchema,
   createBundleBodySchema,
   createHotelBodySchema,
@@ -138,6 +139,14 @@ export const productRoutes: FastifyPluginAsync = async (app) => {
   app.get('/bundles', async (req) => {
     const { active } = req.query as { active?: string };
     return { bundles: await service.listBundles(active === '1' || active === 'true') };
+  });
+
+  // 套餐机票参考价（ADMIN/STAFF）：按传入去/回程航班号取当前最低来回经济舱机票/人；
+  // 两者都空 = 按套餐航线兜底。后台套餐表单据此按「本套餐自己的绑定」实时反推想卖价↔折扣%，
+  // 保证向导预览起价与卡片同源。静态路径注册在 /bundles/:id 之前，避免被参数路由吃掉。
+  app.get('/bundles/flight-ref', adminPre, async (req) => {
+    const binding = bundleFlightRefQuerySchema.parse(req.query);
+    return await service.getBundleFlightRef(binding);
   });
 
   app.get('/bundles/:id', async (req) => {

@@ -144,6 +144,14 @@ function parseInvoiceLegFilter(v: string): { invoiceLeg: InvoiceLeg; invoiced: b
   if (leg !== 'outbound' && leg !== 'return' && leg !== 'system') return null;
   return { invoiceLeg: leg, invoiced: inv === 'true' };
 }
+// 出行日期单日筛选（票务反馈 A9）：两个框原来独立生效，只填一个会被后端当开区间处理
+// （如只填"起始"＝从那天起所有未来订单都命中，用户以为是"只看这天"）。这里统一收窄：
+// 只填一项＝自动把另一项补成同一天（单日查询）；两项都填且不同才是真正的区间。
+function resolveTravelDateRange(from: string, to: string): { travelFrom?: string; travelTo?: string } {
+  if (from && !to) return { travelFrom: from, travelTo: from };
+  if (to && !from) return { travelFrom: to, travelTo: to };
+  return { travelFrom: from || undefined, travelTo: to || undefined };
+}
 /** 订单含几个航段（FLIGHT 行且有班次）；≥2 视为往返（有回程）。 */
 function flightLegCount(order: OrderSummary): number {
   return (order.items ?? []).filter((it) => it.kind === 'FLIGHT' && it.flightScheduleId).length;
@@ -310,6 +318,12 @@ export function OrdersPage() {
   const [tkFlightNumber, setTkFlightNumber] = useState(''); // 航班号（选填，缩小同日多航班范围）
   const [tkKind, setTkKind] = useState<'' | 'FLIGHT' | 'BUNDLE'>(''); // 订单类型（选填：机票单/套餐单，避免同航班混单）
   const [tkExporting, setTkExporting] = useState(false);
+  // 票务快捷面板预览（票务反馈 T4）：字段变化时防抖查一次「匹配 N 条」，导出前就能确认范围对不对，
+  // 而不是导出完打开表格才发现——面板本身此前不触发任何查询，是「筛了没生效」错觉的另一个来源。
+  const [tkPreviewLoading, setTkPreviewLoading] = useState(false);
+  const [tkPreviewError, setTkPreviewError] = useState<string | null>(null);
+  const [tkPreviewTotal, setTkPreviewTotal] = useState<number | null>(null);
+  const [tkPreviewOrders, setTkPreviewOrders] = useState<OrderSummary[]>([]);
   const [selected, setSelected] = useState<OrderSummary | null>(null);
   // ── 批量管理状态 ─────────────────────────────────────
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -339,8 +353,9 @@ export function OrdersPage() {
     const query: ListOrdersParams = { pageSize: 200 };
     if (createdFrom) query.from = createdFrom; // 下单日期起（createdAt）
     if (createdTo) query.to = createdTo; // 下单日期止（createdAt）
-    if (travelFrom) query.travelFrom = travelFrom;
-    if (travelTo) query.travelTo = travelTo;
+    const resolvedTravel = resolveTravelDateRange(travelFrom, travelTo);
+    if (resolvedTravel.travelFrom) query.travelFrom = resolvedTravel.travelFrom;
+    if (resolvedTravel.travelTo) query.travelTo = resolvedTravel.travelTo;
     if (claimFilter === 'unclaimed') query.unclaimedOnly = '1';
     if (debouncedFlightNumber.trim()) query.flightNumber = debouncedFlightNumber.trim();
     if (debouncedPassengerName.trim()) query.passengerName = debouncedPassengerName.trim();
@@ -364,6 +379,69 @@ export function OrdersPage() {
       });
     return () => { cancelled = true; };
   }, [tokens?.accessToken, createdFrom, createdTo, travelFrom, travelTo, claimFilter, debouncedFlightNumber, debouncedPassengerName, invoiceLegFilter, visaFilter, refreshNonce]);
+
+  // 勾选随后端筛选结果收敛（票务反馈 T2）：筛选变化重新拉单后，勾选集合里若还留着不在新结果中的
+  // id，会被悄悄带进导出（例如先宽筛选全选，再收窄筛选，导出仍按旧勾选出全团期订单，含已开票的）。
+  // 每次后端订单列表更新后收敛为交集，「已选 N 条」提示条和三个导出按钮据此天然保持准确。
+  useEffect(() => {
+    setSelectedIds((prev) => {
+      if (prev.size === 0) return prev;
+      const validIds = new Set(orders.map((o) => o.id));
+      let changed = false;
+      const next = new Set<string>();
+      prev.forEach((id) => {
+        if (validIds.has(id)) next.add(id);
+        else changed = true;
+      });
+      return changed ? next : prev;
+    });
+  }, [orders]);
+
+  // 票务快捷面板预览（票务反馈 T4）：面板打开且未勾选订单时，出发日期/航段/开票状态/航班号/
+  // 订单类型任一变化，400ms 防抖后查一次匹配数——面板本身不参与主列表筛选，之前完全没有反馈。
+  useEffect(() => {
+    if (!showTicketingQuick || !tokens?.accessToken) return;
+    if (selectedIds.size > 0) {
+      // 有勾选就按勾选导出，忽略面板筛选，不用查预览。
+      setTkPreviewTotal(null);
+      setTkPreviewOrders([]);
+      setTkPreviewError(null);
+      setTkPreviewLoading(false);
+      return;
+    }
+    if (!tkDate) {
+      setTkPreviewTotal(null);
+      setTkPreviewOrders([]);
+      setTkPreviewError(null);
+      setTkPreviewLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setTkPreviewLoading(true);
+    const t = setTimeout(() => {
+      const query: ListOrdersParams = { pageSize: 5, travelFrom: tkDate, travelTo: tkDate, invoiceLeg: tkLeg, invoiced: tkInvoiced };
+      const trimmedFlightNumber = tkFlightNumber.trim();
+      if (trimmedFlightNumber) query.flightNumber = trimmedFlightNumber;
+      if (tkKind) query.kind = tkKind;
+      api.listOrders(tokens.accessToken as string, query)
+        .then((res) => {
+          if (cancelled) return;
+          setTkPreviewTotal(res.pagination.total);
+          setTkPreviewOrders(res.orders.slice(0, 5));
+          setTkPreviewError(null);
+        })
+        .catch((err: unknown) => {
+          if (cancelled) return;
+          setTkPreviewError(err instanceof ApiError ? err.message : '预览失败');
+          setTkPreviewTotal(null);
+          setTkPreviewOrders([]);
+        })
+        .finally(() => {
+          if (!cancelled) setTkPreviewLoading(false);
+        });
+    }, 400);
+    return () => { cancelled = true; clearTimeout(t); };
+  }, [showTicketingQuick, tokens?.accessToken, tkDate, tkLeg, tkInvoiced, tkFlightNumber, tkKind, selectedIds]);
 
   // 视图层把 OrderSummary 映射成便于筛选/展示的数据
   const ordersView = useMemo(
@@ -574,6 +652,9 @@ export function OrdersPage() {
     try {
       // 有勾选就只导勾选的这批（后端以 id 集合为准，忽略下面的筛选条件）。
       const selected = Array.from(selectedIds);
+      // 出行日期单日筛选（A9）：与主列表同一条规则——只填一项＝当天，两项都填才是区间，
+      // 保证「导出＝列表所见」不因导出走了另一套日期语义而多带出其他日期的订单。
+      const resolvedTravel = resolveTravelDateRange(travelFrom, travelTo);
       const blob = await api.downloadOrdersTemplateExport(tokens.accessToken, {
         template: exportTemplate,
         // 不透传列表的"状态"筛选：整班/名单导出要覆盖全部「占座」订单（含未支付那单），
@@ -583,8 +664,8 @@ export function OrdersPage() {
         search: search.trim() || undefined,
         from: createdFrom || undefined, // 下单日期起（createdAt）— "当天进单多少"导出
         to: createdTo || undefined, // 下单日期止（createdAt）
-        travelFrom: travelFrom || undefined,
-        travelTo: travelTo || undefined,
+        travelFrom: resolvedTravel.travelFrom,
+        travelTo: resolvedTravel.travelTo,
         flightNumber: flightNumberFilter.trim() || undefined,
         passengerName: passengerNameFilter.trim() || undefined,
         // 六态开票筛选（与列表同源）——票务岗「7/10 去程未开 → 导出」就走这条。
@@ -653,9 +734,11 @@ export function OrdersPage() {
     try {
       // 有勾选就只导勾选的这批（后端以 id 集合为准，忽略 from/to）。
       const selected = Array.from(selectedIds);
+      // 出行日期单日筛选（A9）：与主列表/三模板导出同一条规则——只填一项＝当天。
+      const resolvedTravel = resolveTravelDateRange(travelFrom, travelTo);
       const blob = await api.exportMaster(tokens.accessToken, {
-        from: travelFrom || undefined,
-        to: travelTo || undefined,
+        from: resolvedTravel.travelFrom,
+        to: resolvedTravel.travelTo,
         role: 'all',
         orderIds: selected.length > 0 ? selected : undefined,
       });
@@ -664,8 +747,8 @@ export function OrdersPage() {
       a.href = url;
       const rangeLabel = selected.length > 0
         ? `勾选${selected.length}条`
-        : travelFrom || travelTo
-          ? `${travelFrom || '全部'}_${travelTo || travelFrom || '全部'}`
+        : resolvedTravel.travelFrom || resolvedTravel.travelTo
+          ? `${resolvedTravel.travelFrom || '全部'}_${resolvedTravel.travelTo || resolvedTravel.travelFrom || '全部'}`
           : '全部_全部';
       a.download = `全岗总表_${rangeLabel}.xlsx`;
       document.body.appendChild(a);
@@ -690,13 +773,23 @@ export function OrdersPage() {
         </div>
         <div className="flex flex-wrap items-center justify-end gap-2">
           {(() => {
-            const isFiltered = filtered.length !== orders.length;
+            // 筛选是否生效的徽标（票务反馈 T1）：此前只看前端二次过滤（状态/产品/渠道/代理/搜索），
+            // 而出行日期/开票/签证/航班号/乘客名等大多在后端过滤——只用这些字段时 filtered.length
+            // 始终等于 orders.length，徽标误报「未筛选」，让人以为筛选没生效。这里把后端筛选参数
+            // 也纳入判定，只要任一条件生效就高亮显示「已筛选」。
+            const hasBackendFilter = Boolean(
+              createdFrom || createdTo || travelFrom || travelTo ||
+              flightNumberFilter.trim() || passengerNameFilter.trim() ||
+              invoiceLegFilter || visaFilter || claimFilter,
+            );
+            const hasFrontendFilter = filtered.length !== orders.length;
+            const isFiltered = hasBackendFilter || hasFrontendFilter;
             return (
               <span className={isFiltered ? 'badge-info' : 'badge-neutral'}>
                 {loading
                   ? '加载中…'
                   : isFiltered
-                    ? `${filtered.length} / ${orders.length} 条`
+                    ? `已筛选 · ${filtered.length} 条`
                     : `共 ${orders.length} 条`}
               </span>
             );
@@ -914,8 +1007,35 @@ export function OrdersPage() {
               </div>
               <p className="mt-1.5 text-xs text-ink-muted">
                 {selectedIds.size > 0
-                  ? `已勾选 ${selectedIds.size} 条：优先只导出勾选的订单（忽略下方出发日/航段/开票状态等筛选）；取消勾选恢复按筛选导出。`
+                  ? `已勾选优先：三个导出按钮都只导出勾选的订单，下方出发日/航段/开票状态等筛选此时不生效；取消勾选恢复按筛选导出。`
                   : '按「出发日期」当天 + 所选航段 + 开票状态导出《票务专用》（航司 PNR）模板，可再按航班号/订单类型缩小范围。'}
+              </p>
+              {/* 匹配预览（票务反馈 T4）：导出前先看清楚范围，而不是导出完打开表格才发现筛多了/筛少了。 */}
+              <p className="mt-1 text-xs">
+                {selectedIds.size > 0 ? (
+                  <span className="font-medium text-brand">将按勾选导出 {selectedIds.size} 条（忽略上方筛选）</span>
+                ) : !tkDate ? (
+                  <span className="text-ink-muted">请先选择出发日期以预览匹配订单</span>
+                ) : tkPreviewLoading ? (
+                  <span className="text-ink-muted">匹配中…</span>
+                ) : tkPreviewError ? (
+                  <span className="text-rose-600">预览失败：{tkPreviewError}</span>
+                ) : (
+                  <>
+                    <span className={tkPreviewTotal === 0 ? 'font-medium text-amber-600' : 'font-medium text-brand'}>
+                      匹配 {tkPreviewTotal ?? 0} 条
+                    </span>
+                    {tkPreviewOrders.length > 0 && (
+                      <span className="ml-2 text-ink-muted">
+                        {tkPreviewOrders.map((o) => o.orderNumber).join('、')}
+                        {(tkPreviewTotal ?? 0) > tkPreviewOrders.length ? ' 等' : ''}
+                      </span>
+                    )}
+                    {tkPreviewTotal === 0 && (
+                      <span className="ml-2 text-ink-muted">没有匹配订单，检查上方筛选条件后再导出</span>
+                    )}
+                  </>
+                )}
               </p>
             </div>
           )}
@@ -1002,45 +1122,23 @@ export function OrdersPage() {
           </div>
           <div>
             <label className="label">出行日期 · 起始</label>
-            <div className="flex items-center gap-1">
-              <input
-                type="date"
-                className="input"
-                value={travelFrom}
-                onChange={(e) => setTravelFrom(e.target.value)}
-                title="按乘客实际出行日期筛选（与下单时间不同）"
-              />
-              <button
-                type="button"
-                className="btn-ghost shrink-0 whitespace-nowrap px-2 text-sm"
-                disabled={!travelFrom}
-                onClick={() => setTravelTo(travelFrom)}
-                title="只填一个日期框会查出一整段区间；点击把「截止」也设为同一天，只看这一天"
-              >
-                仅当天
-              </button>
-            </div>
+            <input
+              type="date"
+              className="input"
+              value={travelFrom}
+              onChange={(e) => setTravelFrom(e.target.value)}
+              title="按乘客实际出行日期筛选（与下单时间不同）：只填这一项＝只看这一天，两项都填才是区间"
+            />
           </div>
           <div>
             <label className="label">出行日期 · 截止</label>
-            <div className="flex items-center gap-1">
-              <input
-                type="date"
-                className="input"
-                value={travelTo}
-                onChange={(e) => setTravelTo(e.target.value)}
-                title="按乘客实际出行日期筛选（与下单时间不同）"
-              />
-              <button
-                type="button"
-                className="btn-ghost shrink-0 whitespace-nowrap px-2 text-sm"
-                disabled={!travelTo}
-                onClick={() => setTravelFrom(travelTo)}
-                title="只填一个日期框会查出一整段区间；点击把「起始」也设为同一天，只看这一天"
-              >
-                仅当天
-              </button>
-            </div>
+            <input
+              type="date"
+              className="input"
+              value={travelTo}
+              onChange={(e) => setTravelTo(e.target.value)}
+              title="按乘客实际出行日期筛选（与下单时间不同）：只填这一项＝只看这一天，两项都填才是区间"
+            />
           </div>
           <div>
             <label className="label">接单状态</label>
@@ -1161,7 +1259,22 @@ export function OrdersPage() {
         </div>
         {(statusFilter || kindFilter || channelFilter || agentFilter || search || flightNumberFilter || passengerNameFilter || invoiceLegFilter || visaFilter || createdFrom || createdTo || travelFrom || travelTo) && (
           <div className="mt-3 flex items-center justify-between text-xs text-slate-500">
-            <span>显示 {filtered.length} 条订单</span>
+            <span>
+              显示 {filtered.length} 条订单
+              {(travelFrom || travelTo) && (() => {
+                // 出行日期活动筛选摘要（A9）：单日显示「= X」，区间显示「X ~ Y」，与实际生效的
+                // 查询范围（resolveTravelDateRange 收窄后的结果）保持一致，避免摘要和真实筛选对不上。
+                const resolved = resolveTravelDateRange(travelFrom, travelTo);
+                const label = resolved.travelFrom && resolved.travelTo && resolved.travelFrom !== resolved.travelTo
+                  ? `${resolved.travelFrom} ~ ${resolved.travelTo}`
+                  : `= ${resolved.travelFrom || resolved.travelTo}`;
+                return (
+                  <span className="ml-2 rounded bg-brand-50 px-1.5 py-0.5 font-medium text-brand">
+                    出行日期 {label}
+                  </span>
+                );
+              })()}
+            </span>
             <button
               className="text-brand hover:text-brand-dark"
               onClick={() => {
@@ -4024,6 +4137,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
           nationality: p.nationality,
           passportIssueCountry: p.passportIssueCountry,
           passportExpiry: p.passportExpiry,
+          note: p.note,
         })),
       );
     }

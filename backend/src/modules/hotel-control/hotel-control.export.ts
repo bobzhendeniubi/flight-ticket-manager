@@ -2,11 +2,12 @@
  * 房态导出（xlsx）— 把销控矩阵（getBoard 输出）原样导出成表格，与页面上的矩阵一一对应：
  * 每家酒店 4 行（包房 / 用房(床位) / 物理房间 / 余量）× 日期列；酒店名 + 单价在前导列
  * （跨该酒店 4 行合并单元格，镜像页面 rowSpan=4 的视觉）。
+ * 「余量」= 物理房间口径（block − physicalUsed，异性不能拼一间）；「用房(床位)」行才是床位口径。
  *
  * 「未配包房」语义（与销控矩阵页面 + 分房表导出「当日余房」列同一口径，见 hotel-control.service.ts
  * getHotelNightlyRemaining 的 JSDoc）：某晚 block=0 但 used>0，说明这晚根本没配包房周期，
- * 此时 remaining = 0-used 是个具体误导的负数（"超卖"假象）——余量行改渲染文本「未配包房」
- * 并用琥珀色高亮，不再输出裸负数；真正的超卖（block>0 且 remaining<0）保留红底高亮。
+ * 此时余量是个误导的负数（"超卖"假象）——余量行改渲染文本「未配包房」并用琥珀色高亮，
+ * 不再输出裸负数；真正的超卖（block>0 且 physicalRemaining<0）保留红底高亮。
  * 矩阵下方追加图例区块解释这两种高亮的触发条件（只解释，不改变触发条件本身）。
  *
  * 密集矩阵可读性：每家酒店的 4 行按酒店交替加浅底色（banding），便于横向扫读时区分酒店边界；
@@ -69,7 +70,8 @@ export async function buildHotelControlBoardWorkbook(
     包房: h.rows.block,
     '用房(床位)': h.rows.used,
     物理房间: h.rows.physicalUsed,
-    余量: h.rows.remaining,
+    // 余量 = 物理房间口径（block − physicalUsed）；「用房(床位)」行才是床位口径
+    余量: h.rows.physicalRemaining,
   });
 
   let rowIdx = 2;
@@ -97,7 +99,8 @@ export async function buildHotelControlBoardWorkbook(
           const cell = row.getCell(4 + i);
           const block = hotel.rows.block[i];
           const used = hotel.rows.used[i];
-          const remaining = hotel.rows.remaining[i];
+          // 余量行为物理口径 → 真超卖判定用物理余量（block − physicalUsed）
+          const remaining = hotel.rows.physicalRemaining[i];
           if (block === 0 && used > 0) {
             cell.fill = { ...UNCONFIGURED_FILL };
             cell.font = { ...UNCONFIGURED_FONT };
@@ -135,11 +138,11 @@ export async function buildHotelControlBoardWorkbook(
  *   包房累计(d) = Σ 各酒店 block(d)；用房累计(d) = Σ 各酒店 used(d)——与远期视图 getForward 的
  *   held/occupied 同口径（此处直接在内存里对已取回的 board.hotels 求和，不再重复查库）。
  *
- *   余房累计(d) = Σ 各酒店 remaining(d)，但「未配包房」（block=0 且 used>0）的酒店当晚按 0 计入——
- *   这晚根本没有房控在管，不该把它的误导性负数（0-used）计进「总缺口」，否则会让运营误以为
- *   系统性超卖，实际只是那家酒店那晚没配周期（见文件顶部「未配包房」语义）。真超卖
- *   （block>0 且 remaining<0）仍按负值计入，因为那才是需要实际协调加房的真实缺口——
- *   这样「当日余房累计」才对容量规划有意义（不被未配置的酒店拉低）。
+ *   余房累计(d) = Σ 各酒店 physicalRemaining(d)（物理房间口径，与「余量」行一致），但「未配包房」
+ *   （block=0 且 used>0）的酒店当晚按 0 计入——这晚根本没有房控在管，不该把它的误导性负数计进
+ *   「总缺口」，否则会让运营误以为系统性超卖，实际只是那家酒店那晚没配周期（见文件顶部「未配包房」
+ *   语义）。真超卖（block>0 且 physicalRemaining<0）仍按负值计入，因为那才是需要实际协调加房的真实
+ *   缺口——这样「当日余房累计」才对容量规划有意义（不被未配置的酒店拉低）。
  */
 function appendSummaryRows(ws: ExcelJS.Worksheet, board: HotelControlBoard, lastCol: number): void {
   const heldTotal = board.dates.map((_, i) =>
@@ -152,7 +155,8 @@ function appendSummaryRows(ws: ExcelJS.Worksheet, board: HotelControlBoard, last
     round2(
       board.hotels.reduce((sum, h) => {
         const unconfigured = h.rows.block[i] === 0 && h.rows.used[i] > 0;
-        return sum + (unconfigured ? 0 : h.rows.remaining[i]);
+        // 余房口径与「余量」行一致 = 物理余量（block − physicalUsed）
+        return sum + (unconfigured ? 0 : h.rows.physicalRemaining[i]);
       }, 0),
     ),
   );

@@ -7,6 +7,7 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { FastifyInstance } from 'fastify';
+import { UserRole } from '@prisma/client';
 
 const prismaMock = vi.hoisted(() => {
   const mock: {
@@ -15,21 +16,28 @@ const prismaMock = vi.hoisted(() => {
       updateMany: ReturnType<typeof vi.fn>;
       create: ReturnType<typeof vi.fn>;
     };
-    user: { update: ReturnType<typeof vi.fn> };
+    user: { findUnique: ReturnType<typeof vi.fn>; update: ReturnType<typeof vi.fn> };
+    agent: { findUnique: ReturnType<typeof vi.fn> };
   } = {
     refreshToken: {
       findUnique: vi.fn(),
       updateMany: vi.fn(),
       create: vi.fn(),
     },
-    user: { update: vi.fn() },
+    user: { findUnique: vi.fn(), update: vi.fn() },
+    agent: { findUnique: vi.fn() },
   };
   return mock;
 });
 vi.mock('../../db/prisma.js', () => ({ prisma: prismaMock }));
 
+const passwordMock = vi.hoisted(() => ({
+  verifyPassword: vi.fn(),
+}));
+vi.mock('../../lib/password.js', () => passwordMock);
+
 import { AuthService, RefreshTokenRaceError } from './auth.service.js';
-import { UnauthorizedError } from '../../lib/errors.js';
+import { ForbiddenError, UnauthorizedError } from '../../lib/errors.js';
 
 const fakeApp = {
   jwt: { sign: vi.fn(() => 'header.payload.signature') },
@@ -124,5 +132,64 @@ describe('AuthService.refresh · 轮换 + 宽限窗', () => {
     );
     await expect(service.refresh('expired')).rejects.toBeInstanceOf(UnauthorizedError);
     expect(prismaMock.refreshToken.updateMany).not.toHaveBeenCalled();
+  });
+});
+
+describe('AuthService.login · 代理停用拦截', () => {
+  const agentUser = { ...baseUser, id: 'agent-user-1', role: UserRole.AGENT, passwordHash: 'hash' };
+
+  it('role=AGENT 且 Agent.isActive=false → 403，不签发 token / 不更新 lastLoginAt', async () => {
+    prismaMock.user.findUnique.mockResolvedValue(agentUser);
+    passwordMock.verifyPassword.mockResolvedValue(true);
+    prismaMock.agent.findUnique.mockResolvedValue({ isActive: false });
+
+    await expect(
+      service.login({ email: agentUser.email, password: 'correct-password' }),
+    ).rejects.toBeInstanceOf(ForbiddenError);
+    await expect(
+      service.login({ email: agentUser.email, password: 'correct-password' }),
+    ).rejects.toThrow(/账号已停用/);
+
+    expect(prismaMock.user.update).not.toHaveBeenCalled();
+    expect(fakeApp.jwt.sign).not.toHaveBeenCalled();
+  });
+
+  it('role=AGENT 且 Agent.isActive=true → 正常登录发 token', async () => {
+    prismaMock.user.findUnique.mockResolvedValue(agentUser);
+    passwordMock.verifyPassword.mockResolvedValue(true);
+    prismaMock.agent.findUnique.mockResolvedValue({ isActive: true });
+    prismaMock.user.update.mockResolvedValue({});
+    prismaMock.refreshToken.create.mockResolvedValue({});
+
+    const result = await service.login({ email: agentUser.email, password: 'correct-password' });
+
+    expect(result.tokens.accessToken).toBe('header.payload.signature');
+    expect(prismaMock.user.update).toHaveBeenCalledWith({
+      where: { id: agentUser.id },
+      data: { lastLoginAt: expect.any(Date) },
+    });
+  });
+
+  it('role≠AGENT（如 STAFF）→ 不查 Agent.isActive，正常登录', async () => {
+    const staffUser = { ...baseUser, passwordHash: 'hash' }; // baseUser.role === 'STAFF'
+    prismaMock.user.findUnique.mockResolvedValue(staffUser);
+    passwordMock.verifyPassword.mockResolvedValue(true);
+    prismaMock.user.update.mockResolvedValue({});
+    prismaMock.refreshToken.create.mockResolvedValue({});
+
+    const result = await service.login({ email: staffUser.email, password: 'correct-password' });
+
+    expect(result.tokens.accessToken).toBe('header.payload.signature');
+    expect(prismaMock.agent.findUnique).not.toHaveBeenCalled();
+  });
+
+  it('密码错误 → 401（先于停用检查）', async () => {
+    prismaMock.user.findUnique.mockResolvedValue(agentUser);
+    passwordMock.verifyPassword.mockResolvedValue(false);
+
+    await expect(
+      service.login({ email: agentUser.email, password: 'wrong-password' }),
+    ).rejects.toBeInstanceOf(UnauthorizedError);
+    expect(prismaMock.agent.findUnique).not.toHaveBeenCalled();
   });
 });

@@ -13,7 +13,13 @@ import type { Prisma, PrismaClient } from '@prisma/client';
 import { OrderItemKind, OrderStatus } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { toAlpha3 } from './nationality.js';
-import { passengerToRow, earliestFlightDeparture, type PnrRow, PNR_COLUMNS } from './pnr-export.js';
+import {
+  passengerToRow,
+  earliestFlightDeparture,
+  derivePtcByAge,
+  type PnrRow,
+  PNR_COLUMNS,
+} from './pnr-export.js';
 import { buildOrderFilterWhere } from './orders.service.js';
 import { determineFlightLegs } from './ticketing-cap.js';
 import { parseRoomGroups } from './orders.export-room-allocation.js';
@@ -128,6 +134,46 @@ export function pnrName(p: { lastName: string | null; firstName: string | null; 
   return p.fullName.includes(',')
     ? p.fullName.replace(/\s*,\s*/u, '/').replace(/,/gu, '').trim()
     : p.fullName;
+}
+
+/**
+ * 乘客姓名 + 称谓（如 "ZHAO/WEI MR"）—— 0711 反馈「订单导出缺 MR/MS」。
+ * 称谓口径：
+ *   - 已手录 Passenger.title（如运营手工补录过）→ 优先直接用，原样大写。
+ *   - 否则按「出发日 − 出生日期」实足年龄派生（复用 pnr-export.ts 的 derivePtcByAge，
+ *     不改该函数；固定传 'ADULT' 作为兜底口径 —— 生日缺失时按成人处理，与录入的
+ *     passengerType 无关，对齐「无生日数据 → 按成人」的口径）：
+ *       成人（年龄 ≥12 或无生日数据）：M→MR，F→MS；性别未知/X → 不加称谓。
+ *       儿童（2–<12）/ 婴儿（<2）：M→MSTR，F→MISS；性别未知/X → 不加称谓。
+ *   - 出发日：调用方应传订单首航段（最早 FLIGHT 行）出发日；传空（纯地面单等取不到
+ *     航段出发日的场景）时按当前日期近似估算年龄 —— 口径近似，不代表真实出行日。
+ * 输出：pnrName(p) 后面空格 + 称谓；无称谓时原样返回 pnrName(p)，不产出多余尾随空格。
+ */
+export function nameWithTitle(
+  p: {
+    lastName: string | null;
+    firstName: string | null;
+    fullName: string;
+    title?: string | null;
+    gender?: string | null;
+    dateOfBirth?: Date | null;
+  },
+  departDate?: Date | null,
+): string {
+  const name = pnrName(p);
+  const manualTitle = p.title?.trim().toUpperCase();
+  const title = manualTitle || deriveTitleByAge(p.dateOfBirth ?? null, p.gender ?? null, departDate ?? null);
+  return title ? `${name} ${title}` : name;
+}
+
+function deriveTitleByAge(dob: Date | null, gender: string | null, departDate: Date | null): string {
+  // 出发日拿不到 → 用当前日期近似（见 nameWithTitle 顶部注释的口径说明）。
+  const at = departDate ?? new Date();
+  const ptc = derivePtcByAge(dob, at, 'ADULT');
+  const isMinor = ptc === 'CHD' || ptc === 'INF';
+  if (gender === 'M') return isMinor ? 'MSTR' : 'MR';
+  if (gender === 'F') return isMinor ? 'MISS' : 'MS';
+  return '';
 }
 
 // ── 取数 ────────────────────────────────────────────────────────────────
@@ -370,6 +416,9 @@ const FULL_COST_GROUP_HEADER = '订单成本';
 const FULL_COST_GROUP_SPAN = 3;
 
 export function orderToFullRows(order: OrderForTemplateExport, ctx: OrderContext): Omit<FullRow, 'seq'>[] {
+  // 乘客姓名列称谓（MR/MS/MSTR/MISS）按订单去程（最早 FLIGHT 行出发时间）派生年龄。
+  const departureDate = earliestFlightDeparture(order.items);
+
   // 最近一笔成功收款（到账时间/渠道）
   const succeeded = order.payments
     .filter((p) => p.status === 'SUCCEEDED' && p.paidAt)
@@ -425,7 +474,7 @@ export function orderToFullRows(order: OrderForTemplateExport, ctx: OrderContext
     notes,
     hotelInfo: ctx.hotelInfo,
     chineseName: p.chineseName ?? p.fullName,
-    passengerName: pnrName(p),
+    passengerName: nameWithTitle(p, departureDate),
     flightCount: '',
     travelDates: ctx.travelDates,
     flightNumbers: ctx.flightNumbers,
@@ -573,6 +622,8 @@ export const VISA_COLUMNS: Array<{ header: string; key: keyof VisaRow; width: nu
 ];
 
 export function orderToVisaRows(order: OrderForTemplateExport, ctx: OrderContext): Omit<VisaRow, 'stt'>[] {
+  // 姓名列称谓（MR/MS/MSTR/MISS）按订单去程（最早 FLIGHT 行出发时间）派生年龄。
+  const departureDate = earliestFlightDeparture(order.items);
   return order.passengers.map<Omit<VisaRow, 'stt'>>((p) => ({
     agency: ctx.agency,
     notes: ctx.notes,
@@ -583,7 +634,7 @@ export function orderToVisaRows(order: OrderForTemplateExport, ctx: OrderContext
     balanceDue: ctx.balancePerPax,
     // 与《全岗可用》模板一致：优先中文名，缺失才回退 fullName（避免中文名列显示成英文名）
     chineseName: p.chineseName ?? p.fullName,
-    name: pnrName(p),
+    name: nameWithTitle(p, departureDate),
     dateOfBirth: fmtDateDMYSlash(p.dateOfBirth),
     gender: p.gender ?? '',
     nationalityNow: toAlpha3(p.nationality),

@@ -585,6 +585,20 @@ export class ProductsService {
     return serializeBundle(b, ratings.get(id) ?? ZERO_RATING, flightRef);
   }
 
+  /**
+   * 单个「绑定组合」当前最低来回经济舱机票 / 人（CNY，null = 无可估班次）。
+   *
+   * 供后台套餐表单按「这个套餐自己绑定的去/回程航班」实时取机票基数，反推「想卖的价格」↔折扣%，
+   * 保证向导预览起价与卡片展示同源（两处都调 getCheapestRoundTripEconomyCny + 同一 binding）。
+   * binding 两参数都空 = 按套餐航线兜底（由 getCheapestRoundTripEconomyCny 内部处理）。只读，不落库。
+   */
+  async getBundleFlightRef(
+    binding: BundleFlightBinding,
+  ): Promise<{ flightRefRoundTripCny: number | null }> {
+    const flightRefRoundTripCny = await getCheapestRoundTripEconomyCny(new Date(), binding);
+    return { flightRefRoundTripCny };
+  }
+
   async createBundle(body: CreateBundleBody) {
     await this.assertHotelRoomTypeExists(body.hotelRoomTypeId);
     await this.assertFlightExists(body.outboundFlightId);

@@ -13,7 +13,12 @@ import { describe, it, expect, vi } from 'vitest';
 // 默认 prisma 不参与（全部走注入 client）—— 仍需 mock 掉避免真实连接配置
 vi.mock('../../db/prisma.js', () => ({ prisma: {} }));
 
-import type { PrismaClient } from '@prisma/client';
+import type { Gender, PrismaClient } from '@prisma/client';
+
+/** 拼房单出行人性别 fixture：单出行人套餐单的 order.passengers 形状（gender 明确类型，避免 string 收窄丢失）。*/
+const solo = (gender: Gender | null): { order: { passengers: { gender: Gender | null }[] } } => ({
+  order: { passengers: [{ gender }] },
+});
 import {
   getAlerts,
   getBoard,
@@ -149,66 +154,97 @@ describe('getAlerts sharedOddNear（拼房落单临近推送）', () => {
     } as unknown as PrismaClient;
   }
 
-  it('临近日（窗口内）拼房客奇数 → 报，且带酒店/日期/人数', async () => {
-    // D+3 三位拼房客（奇数，落单）——入住临近（< 7 天）
+  const male = { order: { passengers: [{ gender: 'M' }] } };
+  const female = { order: { passengers: [{ gender: 'F' }] } };
+
+  it('临近日（窗口内）有拼房客落单（异性不能拼）→ 报，且带酒店/日期/总人数', async () => {
+    // D+3 一男一女拼房客（异性不能拼，2 位落单）——入住临近（< 7 天）
     const client = sharedClient([
-      { hotelCheckIn: day(3), hotelCheckOut: day(4), roomsBilled: 0.5, ...rt },
-      { hotelCheckIn: day(3), hotelCheckOut: day(4), roomsBilled: 0.5, ...rt },
-      { hotelCheckIn: day(3), hotelCheckOut: day(4), roomsBilled: 0.5, ...rt },
+      { hotelCheckIn: day(3), hotelCheckOut: day(4), roomsBilled: 0.5, ...male, ...rt },
+      { hotelCheckIn: day(3), hotelCheckOut: day(4), roomsBilled: 0.5, ...female, ...rt },
     ]);
     const alerts = await getAlerts(30, client);
+    // sharedHalfCount = 当晚拼房客总人数（2）；触发条件是落单数 > 0
     expect(alerts.sharedOddNear).toEqual([
-      { hotelId: 'h1', hotelName: '美溪海滩酒店', date: dayStr(3), sharedHalfCount: 3 },
+      { hotelId: 'h1', hotelName: '美溪海滩酒店', date: dayStr(3), sharedHalfCount: 2 },
     ]);
   });
 
-  it('远期日（窗口外）拼房客奇数 → 不报', async () => {
-    // D+10 一位拼房客（奇数）——超出 7 天窗口
+  it('远期日（窗口外）有落单 → 不报', async () => {
+    // D+10 一位拼房客（落单）——超出 7 天窗口
     const client = sharedClient([
-      { hotelCheckIn: day(10), hotelCheckOut: day(11), roomsBilled: 0.5, ...rt },
+      { hotelCheckIn: day(10), hotelCheckOut: day(11), roomsBilled: 0.5, ...male, ...rt },
     ]);
     const alerts = await getAlerts(30, client);
     expect(alerts.sharedOddNear).toEqual([]);
   });
 
-  it('临近日拼房客偶数 → 不报（两两成对，无人落单）', async () => {
-    // D+2 两位拼房客（偶数）
+  it('临近日两位同性拼房客 → 不报（同性两两成对，无人落单）', async () => {
+    // D+2 两位男性拼房客（同性可拼一间，无落单）
     const client = sharedClient([
-      { hotelCheckIn: day(2), hotelCheckOut: day(3), roomsBilled: 0.5, ...rt },
-      { hotelCheckIn: day(2), hotelCheckOut: day(3), roomsBilled: 0.5, ...rt },
+      { hotelCheckIn: day(2), hotelCheckOut: day(3), roomsBilled: 0.5, ...male, ...rt },
+      { hotelCheckIn: day(2), hotelCheckOut: day(3), roomsBilled: 0.5, ...male, ...rt },
     ]);
     const alerts = await getAlerts(30, client);
     expect(alerts.sharedOddNear).toEqual([]);
   });
 });
 
-describe('expandSharedHalfByDate', () => {
+describe('expandSharedHalfByDate（按性别分桶）', () => {
   const dates = [dayStr(0), dayStr(1), dayStr(2)];
+  const male = solo('M');
+  const female = solo('F');
 
-  it('只数 roomsBilled==0.5 的行，整间/其它房量不计', () => {
+  it('只数 roomsBilled==0.5 的行，按出行人性别分入 m/f/u；整间/其它房量不计', () => {
     const items = [
-      // 拼房客 A：D0..D1 覆盖 D0
-      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.5 },
+      // 男拼房客 A：D0..D1 覆盖 D0
+      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.5, ...male },
       // 整间：不计
-      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 1 },
-      // 拼房客 B：D0..D2 覆盖 D0、D1
-      { hotelCheckIn: day(0), hotelCheckOut: day(2), roomsBilled: 0.5 },
+      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 1, ...male },
+      // 女拼房客 B：D0..D2 覆盖 D0、D1
+      { hotelCheckIn: day(0), hotelCheckOut: day(2), roomsBilled: 0.5, ...female },
     ];
-    // D0: A+B=2；D1: B=1；D2: 0
-    expect(expandSharedHalfByDate(items, dates)).toEqual([2, 1, 0]);
+    // m: A → D0；f: B → D0、D1
+    expect(expandSharedHalfByDate(items, dates)).toEqual({
+      m: [1, 0, 0],
+      f: [1, 1, 0],
+      u: [0, 0, 0],
+    });
+  });
+
+  it('性别为 X / null / 缺出行人 → 归入未知桶 u', () => {
+    const items = [
+      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.5, ...solo('X') },
+      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.5, ...solo(null) },
+      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.5, order: { passengers: [] as { gender: Gender | null }[] } },
+    ];
+    // 三位都归入 u（D0）
+    expect(expandSharedHalfByDate(items, dates)).toEqual({
+      m: [0, 0, 0],
+      f: [0, 0, 0],
+      u: [3, 0, 0],
+    });
   });
 
   it('缺 check-in/out 或非 0.5 的行跳过', () => {
     const items = [
-      { hotelCheckIn: null, hotelCheckOut: day(1), roomsBilled: 0.5 },
-      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: null },
-      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.25 },
+      { hotelCheckIn: null, hotelCheckOut: day(1), roomsBilled: 0.5, ...male },
+      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: null, ...male },
+      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.25, ...male },
     ];
-    expect(expandSharedHalfByDate(items, dates)).toEqual([0, 0, 0]);
+    expect(expandSharedHalfByDate(items, dates)).toEqual({
+      m: [0, 0, 0],
+      f: [0, 0, 0],
+      u: [0, 0, 0],
+    });
   });
 });
 
-describe('getBoard sharedHalfCount / sharedOdd', () => {
+describe('getBoard sharedHalfCount / sharedUnpaired / sharedOdd', () => {
+  const rtName = { hotelId: 'h1', hotel: { name: '美溪海滩酒店' } };
+  const male = { order: { passengers: [{ gender: 'M' }] } };
+  const female = { order: { passengers: [{ gender: 'F' }] } };
+
   function boardClient(orderItems: unknown[]): PrismaClient {
     return {
       hotelBlockPeriod: {
@@ -227,53 +263,73 @@ describe('getBoard sharedHalfCount / sharedOdd', () => {
     } as unknown as PrismaClient;
   }
 
-  it('拼房客奇数标 sharedOdd，偶数不标；整间不影响', async () => {
+  it('同性两位不落单（sharedOdd=false）；异性两位全落单（sharedOdd=true）；整间不影响', async () => {
     const client = boardClient([
-      // D0 两位拼房（偶数）+ 一整间
-      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.5, hotelRoomType: { hotelId: 'h1', hotel: { name: '美溪海滩酒店' } } },
-      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.5, hotelRoomType: { hotelId: 'h1', hotel: { name: '美溪海滩酒店' } } },
-      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 1, hotelRoomType: { hotelId: 'h1', hotel: { name: '美溪海滩酒店' } } },
-      // D1 一位拼房（奇数）→ 落单
-      { hotelCheckIn: day(1), hotelCheckOut: day(2), roomsBilled: 0.5, hotelRoomType: { hotelId: 'h1', hotel: { name: '美溪海滩酒店' } } },
+      // D0 两位男拼房（同性可配对，落单 0）+ 一整间
+      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.5, ...male, hotelRoomType: rtName },
+      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.5, ...male, hotelRoomType: rtName },
+      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 1, ...male, hotelRoomType: rtName },
+      // D1 一男一女拼房（异性不能拼，落单 2）
+      { hotelCheckIn: day(1), hotelCheckOut: day(2), roomsBilled: 0.5, ...male, hotelRoomType: rtName },
+      { hotelCheckIn: day(1), hotelCheckOut: day(2), roomsBilled: 0.5, ...female, hotelRoomType: rtName },
     ]);
     const board = await getBoard({ from: dayStr(0), to: dayStr(2) }, client);
     const rows = board.hotels[0]!.rows;
-    // D0=2（偶）, D1=1（奇）, D2=0
-    expect(rows.sharedHalfCount).toEqual([2, 1, 0]);
+    // 总人数 D0=2, D1=2, D2=0
+    expect(rows.sharedHalfCount).toEqual([2, 2, 0]);
+    // 落单数：D0 两男 → 0；D1 一男一女 → 2；D2 → 0
+    expect(rows.sharedUnpaired).toEqual([0, 2, 0]);
     expect(rows.sharedOdd).toEqual([false, true, false]);
     // 既有口径不受影响
     expect(rows.remaining.length).toBe(3);
   });
 });
 
-describe('computePhysicalUsed', () => {
-  it('3 位拼房客 → 床位 1.5，物理 ceil(3/2)+0 = 2 间', () => {
-    // used = 3 * 0.5 = 1.5；无整间预订
-    expect(computePhysicalUsed([1.5], [3])).toEqual([2]);
+describe('computePhysicalUsed（按性别分组，异性不能拼）', () => {
+  const b = (m: number, f: number, u: number) => ({ m: [m], f: [f], u: [u] });
+
+  it('一男一女 → 床位 1.0，物理 ceil(1/2)+ceil(1/2)+0 = 2 间', () => {
+    expect(computePhysicalUsed([1.0], b(1, 1, 0))).toEqual([2]);
   });
 
-  it('2 位拼房客 + 1 整间 → 床位 2.0，物理 ceil(2/2)+1 = 2 间', () => {
+  it('两男 → 床位 1.0，物理 ceil(2/2)+0+0 = 1 间', () => {
+    expect(computePhysicalUsed([1.0], b(2, 0, 0))).toEqual([1]);
+  });
+
+  it('两男一女 → 床位 1.5，物理 ceil(2/2)+ceil(1/2)+0 = 2 间', () => {
+    expect(computePhysicalUsed([1.5], b(2, 1, 0))).toEqual([2]);
+  });
+
+  it('一男一未知 → 床位 1.0，物理 ceil(1/2)+0+1 = 2 间（未知每人独占）', () => {
+    expect(computePhysicalUsed([1.0], b(1, 0, 1))).toEqual([2]);
+  });
+
+  it('两位拼房客 + 1 整间（同性）→ 床位 2.0，物理 ceil(2/2)+1 = 2 间', () => {
     // used = 2*0.5 + 1 = 2.0
-    expect(computePhysicalUsed([2.0], [2])).toEqual([2]);
+    expect(computePhysicalUsed([2.0], b(2, 0, 0))).toEqual([2]);
   });
 
   it('0 拼房客、2 整间 → 物理 = 2（与床位口径一致）', () => {
-    expect(computePhysicalUsed([2], [0])).toEqual([2]);
+    expect(computePhysicalUsed([2], b(0, 0, 0))).toEqual([2]);
   });
 
   it('仅 1 位拼房客 → 床位 0.5，落单向上取整为整间 → 物理 1', () => {
-    expect(computePhysicalUsed([0.5], [1])).toEqual([1]);
+    expect(computePhysicalUsed([0.5], b(1, 0, 0))).toEqual([1]);
   });
 
   it('浮点误差（0.5 累加）不影响整间余数取整', () => {
-    // 3 位拼房 + 2 整间：床位 = 1.5 + 2 = 3.5（可能带 0.999… 误差）
+    // 3 位拼房（两男一女）+ 2 整间：床位 = 1.5 + 2 = 3.5（可能带 0.999… 误差）
     const usedWithError = 0.5 + 0.5 + 0.5 + 1 + 1; // = 3.5，构造累加路径
-    expect(computePhysicalUsed([usedWithError], [3])).toEqual([2 + 2]); // ceil(3/2)=2, 整间 2 → 4
+    // ceil(2/2)+ceil(1/2)=2, 整间 2 → 4
+    expect(computePhysicalUsed([usedWithError], b(2, 1, 0))).toEqual([4]);
   });
 });
 
 describe('getBoard physicalUsed / physicalRemaining', () => {
-  function boardClient(orderItems: unknown[]): PrismaClient {
+  const male = { order: { passengers: [{ gender: 'M' }] } };
+  const female = { order: { passengers: [{ gender: 'F' }] } };
+
+  function boardClient(orderItems: unknown[], rooms = 5): PrismaClient {
     return {
       hotelBlockPeriod: {
         findMany: vi.fn().mockResolvedValue([
@@ -281,7 +337,7 @@ describe('getBoard physicalUsed / physicalRemaining', () => {
             hotelId: 'h1',
             dateFrom: day(0),
             dateTo: day(2),
-            rooms: 5,
+            rooms,
             unitPrice: null,
             hotel: { name: '美溪海滩酒店' },
           },
@@ -291,17 +347,17 @@ describe('getBoard physicalUsed / physicalRemaining', () => {
     } as unknown as PrismaClient;
   }
 
-  it('销控板输出物理房间口径（block=5，D0 3 拼房→物理 2，余 3）', async () => {
+  it('销控板输出物理房间口径（block=5，D0 两男一女→物理 2，余 3）', async () => {
     const rt = { hotelRoomType: { hotelId: 'h1', hotel: { name: '美溪海滩酒店' } } };
     const client = boardClient([
-      // D0：3 位拼房客（奇数，落单）→ 床位 1.5、物理 2
-      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.5, ...rt },
-      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.5, ...rt },
-      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.5, ...rt },
-      // D1：2 位拼房客 + 1 整间 → 床位 2.0、物理 2
-      { hotelCheckIn: day(1), hotelCheckOut: day(2), roomsBilled: 0.5, ...rt },
-      { hotelCheckIn: day(1), hotelCheckOut: day(2), roomsBilled: 0.5, ...rt },
-      { hotelCheckIn: day(1), hotelCheckOut: day(2), roomsBilled: 1, ...rt },
+      // D0：两男一女拼房客 → 床位 1.5、物理 ceil(2/2)+ceil(1/2)=2
+      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.5, ...male, ...rt },
+      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.5, ...male, ...rt },
+      { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.5, ...female, ...rt },
+      // D1：两男拼房客 + 1 整间 → 床位 2.0、物理 ceil(2/2)+1=2
+      { hotelCheckIn: day(1), hotelCheckOut: day(2), roomsBilled: 0.5, ...male, ...rt },
+      { hotelCheckIn: day(1), hotelCheckOut: day(2), roomsBilled: 0.5, ...male, ...rt },
+      { hotelCheckIn: day(1), hotelCheckOut: day(2), roomsBilled: 1, ...male, ...rt },
     ]);
     const board = await getBoard({ from: dayStr(0), to: dayStr(2) }, client);
     const rows = board.hotels[0]!.rows;
@@ -311,6 +367,26 @@ describe('getBoard physicalUsed / physicalRemaining', () => {
     expect(rows.physicalUsed).toEqual([2, 2, 0]);
     // 物理余量 = block(5) - physicalUsed
     expect(rows.physicalRemaining).toEqual([3, 3, 5]);
+  });
+
+  it('反馈场景：卢瑟特里同晚一男一女各 1 位拼房客（block=10）→ 物理 2、余量 8', async () => {
+    const rt = { hotelRoomType: { hotelId: 'h1', hotel: { name: '卢瑟特里' } } };
+    const client = boardClient(
+      [
+        // 订单甲：1 位男拼房客；订单乙：1 位女拼房客；异性不能拼 → 各占 1 间
+        { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.5, ...male, ...rt },
+        { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.5, ...female, ...rt },
+      ],
+      10,
+    );
+    const board = await getBoard({ from: dayStr(0), to: dayStr(0) }, client);
+    const rows = board.hotels[0]!.rows;
+    // 床位口径 used = 1.0，但物理房间 = 2（异性各占 1 间），余量 = 10 − 2 = 8
+    expect(rows.used).toEqual([1]);
+    expect(rows.physicalUsed).toEqual([2]);
+    expect(rows.physicalRemaining).toEqual([8]);
+    // 两位都落单（无法互相配对）
+    expect(rows.sharedUnpaired).toEqual([2]);
   });
 });
 

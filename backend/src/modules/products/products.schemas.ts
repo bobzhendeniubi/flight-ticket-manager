@@ -66,6 +66,22 @@ export const bundleSellableDatesQuerySchema = z
   });
 export type BundleSellableDatesQuery = z.infer<typeof bundleSellableDatesQuerySchema>;
 
+// ── 套餐机票参考价（后台起价换算用，ADMIN/STAFF）──────────────────────────────
+/**
+ * 空串 / 省略 = 该程未绑航班（后端按套餐航线兜底取最低价）；非空 = 绑定该 Flight.id。
+ * query string 会把「未指定」传成 '' ，这里统一归一到 null，交给 getCheapestRoundTripEconomyCny 走航线兜底。
+ */
+const optionalFlightIdQuery = z
+  .string()
+  .optional()
+  .transform((v) => (v && v.length > 0 ? v : null));
+
+export const bundleFlightRefQuerySchema = z.object({
+  outboundFlightId: optionalFlightIdQuery,
+  returnFlightId: optionalFlightIdQuery,
+});
+export type BundleFlightRefQuery = z.infer<typeof bundleFlightRefQuerySchema>;
+
 // ── Hotel ────────────────────────────────────────────────────────────────
 export const createHotelBodySchema = z.object({
   name: z.string().min(1).max(200),

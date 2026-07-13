@@ -3,7 +3,7 @@ import { type User, UserRole } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { hashPassword, verifyPassword } from '../../lib/password.js';
 import { generateRefreshToken, hashToken } from '../../lib/tokens.js';
-import { AppError, ConflictError, UnauthorizedError } from '../../lib/errors.js';
+import { AppError, ConflictError, ForbiddenError, UnauthorizedError } from '../../lib/errors.js';
 import { env } from '../../config/env.js';
 
 export interface AuthTokens {
@@ -84,6 +84,18 @@ export class AuthService {
     }
     const ok = await verifyPassword(user.passwordHash, input.password);
     if (!ok) throw new UnauthorizedError('Invalid email or password');
+
+    // 代理账号停用拦截：仅在登录时校验（此处不牵连已持有 access/refresh token 的存量会话——
+    // 已登录设备在 access token 到期前仍可继续访问，是已知的遗留风险，非本次范围内解决）。
+    if (user.role === UserRole.AGENT) {
+      const agent = await prisma.agent.findUnique({
+        where: { userId: user.id },
+        select: { isActive: true },
+      });
+      if (agent && !agent.isActive) {
+        throw new ForbiddenError('账号已停用，请联系管理员');
+      }
+    }
 
     await prisma.user.update({ where: { id: user.id }, data: { lastLoginAt: new Date() } });
 
