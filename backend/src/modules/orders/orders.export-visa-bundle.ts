@@ -1,17 +1,14 @@
 /**
- * 签证资料合并打包 zip — 签证岗反馈：勾选若干订单，把这些订单的签证名单导出在同一张表格上，
+ * 签证资料导出 — 签证岗反馈：勾选若干订单，把这些订单的签证名单导出在同一张表格上，
  * 护照也一起下载。原先按订单一份份导（10 单导 10 次再手工拼），易漏人。
  *
- * 入参：勾选的订单 id 列表。被勾选但状态不合格（草稿/取消/退款等，见 COUNTED_STATUSES）的订单
- *      跳过，并在 README.txt 里注明；查不到的 id 同样在 README 里注明。
- * 输出：单个 zip Buffer：
- *   签证专用_合并名单.xlsx   —— 勾选订单乘客合并，一行一人（《签证专用》模板 + 性别
- *                             + 末列「有无护照图」，沿用送签表口径）
- *   {订单号}-{LASTNAME}_{FIRSTNAME}.{ext}  —— 全部乘客护照图（订单号前缀避免跨单撞名；无图乘客
- *                                            自然缺文件，xlsx 里有「有无护照图」标注）
+ * 0713 签证岗反馈 V1：合并 zip 一起打包不方便（多一步解压），有些只需要表或只需要护照，
+ * 希望能拆开分别下载。故拆成两个独立导出：
+ *   buildVisaRosterXlsx   —— 仅合并签证名单 xlsx（勾选订单乘客合并，一行一人）
+ *   buildVisaPassportsZip —— 仅护照图 zip（不再打包 xlsx），缺图/跳过明细走 README.txt
  *
- * 护照图逐个 fetch → 立即写入 zip（不先把所有图读进一个数组），沿用 passport-zip.ts 的取图口径。
- * 无合格订单时仍产出仅含空表（带表头）的 xlsx，避免下载到非法 zip。
+ * 入参：勾选的订单 id 列表。被勾选但状态不合格（草稿/取消/退款等，见 COUNTED_STATUSES）的订单
+ *      跳过：名单里静默不出现；护照包在 README.txt 里点名（查不到的 id 同样点名）。
  *
  * 排序：合并名单按「代理机构名 → 订单号 → 乘客原始顺序」分组（同代理相邻，便于按代理核对）；
  *      无代理的直客归为一组排在最后。STT 跨订单连续累加。
@@ -46,8 +43,8 @@ const COUNTED_STATUSES: OrderStatus[] = [
 const HAS_PHOTO_COLUMN = { header: '有无护照图', key: 'hasPhoto', width: 20 } as const;
 
 /**
- * 按勾选的订单 id 列表取单（软删排除；状态过滤放到 buildVisaBundleZip，以便把「被勾选但状态
- * 不合格」的订单在 README 里点名跳过，而不是静默漏掉）。复用三模板导出的 include 形状。
+ * 按勾选的订单 id 列表取单（软删排除；状态过滤放到 partitionOrdersForVisa，以便把「被勾选但状态
+ * 不合格」的订单在护照包 README 里点名跳过，而不是静默漏掉）。复用三模板导出的 include 形状。
  */
 export async function queryOrdersByIdsForVisa(
   orderIds: string[],
@@ -142,33 +139,65 @@ export async function buildVisaBundleXlsx(orders: OrderForTemplateExport[]): Pro
 }
 
 /**
- * 构建签证资料合并 zip：勾选订单的合并签证名单 xlsx + 全部乘客护照图。
- * 护照图文件名：`{订单号}-{LASTNAME}_{FIRSTNAME}[_序号].{ext}`（订单号前缀避免跨单撞名；
- * 同单同名再加序号后缀）。无图/下载失败的乘客自然缺文件，README.txt 记录明细。
- *
- * 状态过滤在此处做：被勾选但状态不合格（草稿/取消/退款等）或查不到的订单跳过并在 README 点名。
+ * 状态过滤 + 排序（合并名单/护照包共用）：勾选订单里状态不合格（草稿/取消/退款等）的挑出来，
+ * 查不到的 id 也一并列出，交给调用方各自决定怎么呈现（名单静默不含；护照包在 README 点名）。
  */
-export async function buildVisaBundleZip(
-  params: { orderIds: string[] },
-  client: PrismaClient = defaultPrisma,
-): Promise<Buffer> {
-  const fetched = await queryOrdersByIdsForVisa(params.orderIds, client);
-
-  // 状态合格才进名单；不合格 / 查不到的另行在 README 点名，避免静默漏单
+function partitionOrdersForVisa(
+  orderIds: string[],
+  fetched: OrderForTemplateExport[],
+): {
+  qualified: OrderForTemplateExport[];
+  skippedByStatus: OrderForTemplateExport[];
+  notFoundIds: string[];
+} {
   const qualified = sortOrdersForVisa(
     fetched.filter((o) => COUNTED_STATUSES.includes(o.status)),
   );
   const skippedByStatus = fetched.filter((o) => !COUNTED_STATUSES.includes(o.status));
   const foundIds = new Set(fetched.map((o) => o.id));
-  const notFoundIds = params.orderIds.filter((id) => !foundIds.has(id));
+  const notFoundIds = orderIds.filter((id) => !foundIds.has(id));
+  return { qualified, skippedByStatus, notFoundIds };
+}
 
-  const orders = qualified;
+/**
+ * 签证名单 xlsx（不含护照图）：按勾选订单 id 取单 → 状态过滤 → 排序 → 合并成一张《签证专用》表。
+ * 状态不合格 / 查不到的订单静默不计入（名单本身只需要合格单；跳过明细见护照包端的 README）。
+ * 无合格订单时仍产出带表头的空表，避免下载到内容为空但打不开的文件。
+ */
+export async function buildVisaRosterXlsx(
+  orderIds: string[],
+  client: PrismaClient = defaultPrisma,
+): Promise<Buffer> {
+  const fetched = await queryOrdersByIdsForVisa(orderIds, client);
+  const { qualified } = partitionOrdersForVisa(orderIds, fetched);
+  return buildVisaBundleXlsx(qualified);
+}
+
+/** 文件名：`签证名单_{订单数}单_{YYYY-MM-DD}.xlsx`。*/
+export function visaRosterXlsxFilename(orderCount: number): string {
+  const ymd = new Date().toISOString().slice(0, 10);
+  return `签证名单_${orderCount}单_${ymd}.xlsx`;
+}
+
+/**
+ * 护照图 zip（不含 xlsx 名单）：勾选订单的全部乘客护照图，按订单号前缀分组打包。
+ * 文件名：`{订单号}-{LASTNAME}_{FIRSTNAME}[_序号].{ext}`（订单号前缀避免跨单撞名；
+ * 同单同名再加序号后缀）。护照图逐个 fetch → 立即写入 zip，沿用 passport-zip.ts 的取图口径。
+ *
+ * 状态过滤在此处做：被勾选但状态不合格（草稿/取消/退款等）或查不到的订单跳过，
+ * 连同缺图/下载失败的乘客一起记入 README.txt，避免静默漏单/漏人。
+ */
+export async function buildVisaPassportsZip(
+  orderIds: string[],
+  client: PrismaClient = defaultPrisma,
+): Promise<Buffer> {
+  const fetched = await queryOrdersByIdsForVisa(orderIds, client);
+  const { qualified: orders, skippedByStatus, notFoundIds } = partitionOrdersForVisa(
+    orderIds,
+    fetched,
+  );
 
   const zip = new JSZip();
-
-  // 合并签证名单（始终附带，哪怕无合格单也出带表头的空表）
-  const xlsxBuf = await buildVisaBundleXlsx(orders);
-  zip.file(`签证专用_合并名单.xlsx`, xlsxBuf);
 
   const usedNames = new Set<string>();
   const missing: string[] = [];
@@ -206,20 +235,20 @@ export async function buildVisaBundleZip(
   }
 
   const readme = [
-    `签证资料合并打包`,
+    `签证护照打包`,
     `打包时间：${new Date().toISOString()}`,
-    `勾选订单数：${params.orderIds.length}`,
+    `勾选订单数：${orderIds.length}`,
     `已打包订单数：${orders.length}`,
     `乘客总数：${paxTotal}`,
     `护照图成功：${ok.length}`,
     `护照图缺失/失败：${missing.length}`,
     '',
     ...(orders.length
-      ? ['已打包订单（含在合并名单）：', ...orders.map((o) => `  · ${o.orderNumber}`), '']
+      ? ['已打包订单：', ...orders.map((o) => `  · ${o.orderNumber}`), '']
       : []),
     ...(skippedByStatus.length
       ? [
-          '⚠ 已跳过（订单状态不合格，未计入名单）：',
+          '⚠ 已跳过（订单状态不合格）：',
           ...skippedByStatus.map((o) => `  · ${o.orderNumber}（${o.status}）`),
           '',
         ]
@@ -236,9 +265,8 @@ export async function buildVisaBundleZip(
   return out;
 }
 
-/** 文件名：`签证资料_{订单数}单_{YYYYMMDD}导出.zip`（不再依赖出发日）。*/
-export function visaBundleZipFilename(orderCount: number): string {
-  const d = new Date();
-  const ymd = `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}${String(d.getUTCDate()).padStart(2, '0')}`;
-  return `签证资料_${orderCount}单_${ymd}导出.zip`;
+/** 文件名：`签证护照_{订单数}单_{YYYY-MM-DD}.zip`。*/
+export function visaPassportsZipFilename(orderCount: number): string {
+  const ymd = new Date().toISOString().slice(0, 10);
+  return `签证护照_${orderCount}单_${ymd}.zip`;
 }

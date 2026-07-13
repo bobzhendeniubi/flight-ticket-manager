@@ -361,6 +361,10 @@ export interface OrderPassengerInput {
   visaEffectiveDate?: string;
   /** 签证有效期 YYYY-MM-DD（可选） */
   visaExpiry?: string;
+  /** 套餐乘客级选项：客人自备签证（无需送签；套餐价按人扣减 selfVisaDeductCny）。缺省 false。 */
+  visaExempt?: boolean;
+  /** 套餐乘客级选项：单住（不拼房，按人收单房差）。缺省 false = 拼房。 */
+  singleRoom?: boolean;
 }
 
 interface OrderItemBase {
@@ -696,6 +700,12 @@ export interface OrderPassenger {
   passportPhotoUrl?: string | null;
   pnr?: string | null;
   eticketNumber?: string | null;
+
+  // 套餐乘客级选项（详情展示 badge 用；serializeOrder 全量 spread 标量自动带出）
+  /** 客人自备签证（无需送签） */
+  visaExempt?: boolean | null;
+  /** 单住（不拼房，按人收单房差） */
+  singleRoom?: boolean | null;
 }
 
 export type ReminderStatus = 'OPEN' | 'IN_PROGRESS' | 'DONE' | 'SKIPPED';
@@ -1867,8 +1877,14 @@ export const api = {
     apiFetch<{ order: OrderSummary }>('/orders/', { method: 'POST', token, body }),
 
   // 录单前试算「系统价」（只算不落库；ADMIN/STAFF）。items 与 createOrder 同结构。
-  quoteOrder: (token: string, body: { items: CreateOrderItemInput[] }) =>
-    apiFetch<QuoteOrderResult>('/orders/quote', { method: 'POST', token, body }),
+  // passengers（可选）：套餐乘客级住宿/签证选项，让系统价随每人选择实时变化（缺省回落 item 级旧口径）。
+  quoteOrder: (
+    token: string,
+    body: {
+      items: CreateOrderItemInput[];
+      passengers?: Array<{ visaExempt?: boolean; singleRoom?: boolean }>;
+    },
+  ) => apiFetch<QuoteOrderResult>('/orders/quote', { method: 'POST', token, body }),
 
   // 设置开票状态（ADMIN/STAFF）— 旧的订单级单值，兼容保留
   setInvoiceStatus: (token: string, id: string, invoiceStatus: InvoiceStatus) =>
@@ -2638,9 +2654,21 @@ export const api = {
     return res.blob();
   },
 
-  // 签证资料合并打包（ADMIN/STAFF）：合并签证名单 xlsx + 全部护照图，按勾选的订单一次导出
-  downloadVisaBundle: async (token: string, orderIds: string[]): Promise<Blob> => {
-    const res = await fetch(`${API_BASE}/orders/visa-bundle.zip`, {
+  // 签证名单表（ADMIN/STAFF）：勾选订单合并成一张签证名单 xlsx（不含护照图）
+  // 0713 签证岗反馈：原合并 zip 多一步解压不方便，拆成名单表 / 护照包分开下载
+  downloadVisaRoster: async (token: string, orderIds: string[]): Promise<Blob> => {
+    const res = await fetch(`${API_BASE}/orders/visa-roster.xlsx`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ orderIds }),
+    });
+    if (!res.ok) throw new ApiError(res.status, { code: 'XLSX_FAILED', message: await res.text() });
+    return res.blob();
+  },
+
+  // 签证护照包（ADMIN/STAFF）：勾选订单的全部乘客护照图打包 zip（不含名单表）
+  downloadVisaPassports: async (token: string, orderIds: string[]): Promise<Blob> => {
+    const res = await fetch(`${API_BASE}/orders/visa-passports.zip`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ orderIds }),

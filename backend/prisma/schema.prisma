@@ -1130,6 +1130,13 @@ model Passenger {
   needsInfantBassinet Boolean @default(false)
   // 拼房用 — 客人偏好：SINGLE/DOUBLE/TWIN/SHARE_OK
   bedPref             String?
+
+  // ── 套餐乘客级选项（购物车模式：同一订单每人各选自己的住宿方式 + 签证；价差全部系统算）──
+  //   visaExempt = 客人自备签证（无需送签）：签证台按此过滤掉该乘客，套餐价按人扣减 selfVisaDeductCny。
+  //   singleRoom = 单住（不拼房，按人收单房差）；默认 false = 拼房。
+  // 均 @default(false) → 旧数据/旧客户端天然回落「随套餐办签 + 拼房」，与扩展前定价完全一致。
+  visaExempt          Boolean @default(false)
+  singleRoom          Boolean @default(false)
   // 护照照片（OCR 上传或人工补传）
   passportPhotoUrl    String?
 

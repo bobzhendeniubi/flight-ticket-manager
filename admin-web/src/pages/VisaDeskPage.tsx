@@ -466,9 +466,10 @@ export function VisaDeskPage() {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('OPEN');
   // 出发日期筛选（单日 YYYY-MM-DD）；空 = 不按出发日过滤
   const [departureDate, setDepartureDate] = useState('');
-  // 「打包下载勾选订单签证资料」入口状态（合并签证名单 xlsx + 全部护照图）
-  const [bundleDownloading, setBundleDownloading] = useState(false);
-  const [bundleError, setBundleError] = useState<string | null>(null);
+  // 「下载名单表 / 下载护照包」入口状态（0713 签证岗反馈：拆开分别下载，不再合并 zip）
+  const [rosterDownloading, setRosterDownloading] = useState(false);
+  const [passportsDownloading, setPassportsDownloading] = useState(false);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
 
   // ── 批量选择 / 流转状态 ─────────────────────────────────
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -562,25 +563,47 @@ export function VisaDeskPage() {
     [tasks, selectedIds],
   );
 
-  // 打包下载勾选订单的签证资料（一张合并名单 + 全部护照图）
-  const handleDownloadVisaBundle = async () => {
-    if (!token || selectedOrderIds.length === 0 || bundleDownloading) return;
-    setBundleDownloading(true);
-    setBundleError(null);
+  // 下载勾选订单的签证名单表（合并成一张 xlsx，不含护照图）
+  const handleDownloadVisaRoster = async () => {
+    if (!token || selectedOrderIds.length === 0 || rosterDownloading) return;
+    setRosterDownloading(true);
+    setDownloadError(null);
     try {
-      const blob = await api.downloadVisaBundle(token, selectedOrderIds);
+      const blob = await api.downloadVisaRoster(token, selectedOrderIds);
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `签证资料_${selectedOrderIds.length}单.zip`;
+      a.download = `签证名单_${selectedOrderIds.length}单.xlsx`;
       document.body.appendChild(a);
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
     } catch (e: unknown) {
-      setBundleError(e instanceof ApiError ? e.message : '打包下载失败，请重试');
+      setDownloadError(e instanceof ApiError ? e.message : '名单下载失败，请重试');
     } finally {
-      setBundleDownloading(false);
+      setRosterDownloading(false);
+    }
+  };
+
+  // 下载勾选订单的护照图打包（不含名单表）
+  const handleDownloadVisaPassports = async () => {
+    if (!token || selectedOrderIds.length === 0 || passportsDownloading) return;
+    setPassportsDownloading(true);
+    setDownloadError(null);
+    try {
+      const blob = await api.downloadVisaPassports(token, selectedOrderIds);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `签证护照_${selectedOrderIds.length}单.zip`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e: unknown) {
+      setDownloadError(e instanceof ApiError ? e.message : '护照包下载失败，请重试');
+    } finally {
+      setPassportsDownloading(false);
     }
   };
 
@@ -713,22 +736,31 @@ export function VisaDeskPage() {
               清除选择
             </button>
             <span className="text-slate-300">|</span>
-            {/* 打包下载勾选订单的签证资料（合并名单 xlsx + 全部护照图） */}
+            {/* 下载勾选订单的签证名单表 / 护照包（0713 签证岗反馈：拆开分别下载，不再合并 zip） */}
             <button
               type="button"
               className="btn-secondary py-1.5"
-              onClick={() => void handleDownloadVisaBundle()}
-              disabled={selectedOrderIds.length === 0 || bundleDownloading}
-              title="打包勾选订单的签证名单与护照图（多条任务/乘客同单会自动去重）"
+              onClick={() => void handleDownloadVisaRoster()}
+              disabled={selectedOrderIds.length === 0 || rosterDownloading}
+              title="下载勾选订单的合并签证名单表（多条任务/乘客同单会自动去重）"
             >
-              {bundleDownloading
+              {rosterDownloading
                 ? '打包中…'
-                : `打包下载勾选订单签证资料${
-                    selectedOrderIds.length > 0 ? `（${selectedOrderIds.length}单）` : ''
-                  }`}
+                : `下载名单表${selectedOrderIds.length > 0 ? `（${selectedOrderIds.length}单）` : ''}`}
+            </button>
+            <button
+              type="button"
+              className="btn-secondary py-1.5"
+              onClick={() => void handleDownloadVisaPassports()}
+              disabled={selectedOrderIds.length === 0 || passportsDownloading}
+              title="下载勾选订单的护照图打包（多条任务/乘客同单会自动去重）"
+            >
+              {passportsDownloading
+                ? '打包中…'
+                : `下载护照包${selectedOrderIds.length > 0 ? `（${selectedOrderIds.length}单）` : ''}`}
             </button>
           </div>
-          {bundleError && <p className="mt-2 text-xs text-rose-600">{bundleError}</p>}
+          {downloadError && <p className="mt-2 text-xs text-rose-600">{downloadError}</p>}
           {batchResult && (
             <div className="mt-3 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs">
               <div className="text-ink-soft">

@@ -3424,6 +3424,13 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
                     <span className="font-mono tracking-wide">{toSlashName(p)}</span>
                     {p.chineseName && <span className="ml-2 font-normal text-slate-600">{p.chineseName}</span>}
                     <span className="ml-2 text-xs font-normal text-slate-500">{genderLabel(p.gender)}</span>
+                    {/* 套餐乘客级选项徽标（购物车模式：每人各选住宿方式 + 签证） */}
+                    {p.singleRoom && (
+                      <span className="ml-2 rounded bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-amber-200">单住</span>
+                    )}
+                    {p.visaExempt && (
+                      <span className="ml-2 rounded bg-sky-50 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 ring-1 ring-sky-200">自备签</span>
+                    )}
                     <button
                       className="ml-2 text-[11px] font-normal text-brand hover:text-brand-dark"
                       onClick={() => setEditingId(p.id)}

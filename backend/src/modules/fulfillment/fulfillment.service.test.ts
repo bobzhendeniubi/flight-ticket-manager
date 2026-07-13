@@ -59,6 +59,31 @@ describe('FulfillmentService.batchUpdateStatus', () => {
   });
 });
 
+describe('FulfillmentService.listByOrder — 签证台过滤自备签乘客', () => {
+  it('乘客查询排除 visaExempt=true（客人自备签证不进签证台）', async () => {
+    const orderItemFindMany = vi.fn().mockResolvedValue([]);
+    const passengerFindMany = vi.fn().mockResolvedValue([]);
+    // listByOrder 用 prisma.$transaction([orderItem.findMany(...), passenger.findMany(...)])：
+    // 数组元素在传入前已被同步调用（下面的 spy 因此能捕获 where），$transaction 只需汇总结果。
+    const p = prisma as unknown as {
+      orderItem: { findMany: typeof orderItemFindMany };
+      passenger: { findMany: typeof passengerFindMany };
+      $transaction: (ops: unknown[]) => Promise<unknown[]>;
+    };
+    p.orderItem = { findMany: orderItemFindMany };
+    p.passenger = { findMany: passengerFindMany };
+    p.$transaction = async (ops: unknown[]) => Promise.all(ops as Promise<unknown>[]);
+
+    const service = new FulfillmentService();
+    await service.listByOrder('order-9');
+
+    expect(passengerFindMany).toHaveBeenCalledWith({
+      where: { orderId: 'order-9', visaExempt: false },
+      select: { id: true, fullName: true, documentNumber: true, passportPhotoUrl: true },
+    });
+  });
+});
+
 describe('FulfillmentService.listPassengerPhotos', () => {
   it('按订单只取 id + 护照图（列表瘦身后展开某单时按需拉真图）', async () => {
     const findMany = vi.fn().mockResolvedValue([

@@ -111,6 +111,11 @@ interface PassengerRow {
   visaExpiry?: string;
   /** 护照图 base64 data URL（OCR 识别后存入，随乘客一起提交给后端） */
   passportPhotoUrl?: string;
+  // ── 套餐乘客级选项（购物车模式：每人各选自己的住宿方式 + 签证；价差全部系统算）──
+  /** 客人自备签证（无需送签；套餐价按人扣减 selfVisaDeductCny）。缺省 false = 随套餐办签。 */
+  visaExempt?: boolean;
+  /** 单住（不拼房，按人收单房差）。缺省 false = 拼房。 */
+  singleRoom?: boolean;
   /** OCR 识别进度 0-100；null = 未识别 */
   ocrPct?: number | null;
   /** OCR 识别阶段描述 */
@@ -344,11 +349,9 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const [adultCount, setAdultCount] = useState<number | null>(1);
   const [childCount, setChildCount] = useState<number | null>(0);
   const [infantCount, setInfantCount] = useState<number | null>(0);
-  // 单人入住（单房差）和商务舱升级，范围 0..(成人+儿童)
-  const [singleCount, setSingleCount] = useState<number | null>(0);
+  // 商务舱升级人数，范围 0..(成人+儿童)。
+  // 单住 / 自备签已改为「乘客级」（购物车模式，每人各选，见出行人表的两列）——不再有整单聚合状态。
   const [businessCount, setBusinessCount] = useState<number | null>(0);
-  // 客人自备签证（套餐含签证时可勾选；勾选后服务端扣减 bundle.selfVisaDeductCny）
-  const [selfProvidedVisa, setSelfProvidedVisa] = useState(false);
   // 套餐机票航段：优先按套餐绑定的航班号；未绑定且同路线仅一个在飞航班时自动派生；
   // 未绑定且同路线有多个在飞航班时，由运营手选航班号（下方两个状态）。
   // 均先预拉两个方向的全部班次池，再按航班号 + 本地出发日期匹配去程（MFM→DAD）/回程（DAD→MFM）。
@@ -367,7 +370,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   // 切换产品类型时，若用户没手动改过签证状态下拉，自动跟随新 kind 的默认值
   // （如从「套餐」切到「机票」，未手动改过则从「需要」自动回落到「不需要」）；
   // 一旦用户手动改过下拉，touched 记住这次选择，后续再切 kind 也不会覆盖。
-  // 「客人自备签证」勾选联动（见下方 selfProvidedVisa）不发生 kind 切换，不受此 effect 影响。
+  // 注：乘客级「自备签」是逐位定价项，不再联动订单级签证状态——部分乘客自备签不代表整单不需要送签。
   useEffect(() => {
     if (visaStatusTouchedRef.current) return;
     setVisaStatus(DEFAULT_VISA_STATUS[kind]);
@@ -614,6 +617,20 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const validPassengers = passengers.filter(
     (p) => p.fullName.trim() && p.documentNumber.trim() && parseDob(p.dateOfBirth),
   );
+
+  // ── 套餐乘客级「住宿方式 + 签证」（购物车模式）──
+  // 住宿列：套餐单都显示；签证列：仅当所选套餐配了自备签减免额（selfVisaDeductCny>0）才显示
+  //   （否则自备签不产生价差，展示无意义，与旧整单勾选框的显示条件一致）。
+  const showRoomingCol = kind === 'BUNDLE';
+  const showVisaExemptCol = kind === 'BUNDLE' && (bundle?.selfVisaDeductCny ?? 0) > 0;
+  // 派生勾选人数（驱动系统价试算重算 + 描述/明细展示）：以行标记为准。
+  const singleRoomCount = passengers.filter((p) => p.singleRoom).length;
+  const visaExemptCount = passengers.filter((p) => p.visaExempt).length;
+  // 每人构成小字用的费率（展示口径，与后端 computeBundleAddOn 一致）：
+  //   单房差/人 = singleSupplementCnyPerNight × 套餐晚数；自备签减免/人 = selfVisaDeductCny。
+  const bundleNightsForHint = bundle ? resolveBundleNights(bundle.items, bundle.hotelNights) : 0;
+  const singleSupplementPerPax = bundle ? (bundle.singleSupplementCnyPerNight ?? 0) * bundleNightsForHint : 0;
+  const selfVisaDeductPerPax = bundle?.selfVisaDeductCny ?? 0;
 
   // 调价有效性：金额为非 0 整数即视为「要调价」；「其它」原因必须补说明。
   const adjustIsInteger = adjustAmount !== null && Number.isInteger(adjustAmount) && adjustAmount !== 0;
@@ -923,7 +940,10 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
         return { error: `回程日期 ${bundleLegs.returnDate} 没有匹配的回程班次（${BUNDLE_GO_DEST}→${BUNDLE_GO_ORIGIN}），请核对套餐晚数/排班` };
       }
       const maxSingleBusiness = adults + children;
-      const singles = Math.min(Math.max(0, singleCount ?? 0), maxSingleBusiness);
+      // 单住 / 自备签为乘客级派生（购物车模式：每人各选，见出行人表两列）——从行标记统计人数。
+      // 权威定价由后端按 passengers 数组的 singleRoom/visaExempt 重算；此处仅用于描述/明细展示。
+      const singles = validPassengers.filter((p) => p.singleRoom).length;
+      const visaExempts = validPassengers.filter((p) => p.visaExempt).length;
       const businesses = Math.min(Math.max(0, businessCount ?? 0), maxSingleBusiness);
       // 机票航段：去程 +（往返套餐）回程；占座人数 = 成人 + 儿童（婴儿不占座），舱位固定经济舱。
       const seatPax = Math.max(1, adults + children);
@@ -951,8 +971,10 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
         `${adults}成人${children ? `/${children}儿童` : ''}${infants ? `/${infants}婴儿` : ''}`,
         singles > 0 ? `单住×${singles}` : null,
         businesses > 0 ? `商务×${businesses}` : null,
-        selfProvidedVisa ? '自备签证' : null,
+        visaExempts > 0 ? `自备签×${visaExempts}` : null,
       ].filter(Boolean).join(' · ');
+      // 单住 / 自备签不再落 item 级聚合字段（singleCount/selfProvidedVisa）——
+      // 后端从 passengers 数组的 singleRoom/visaExempt 逐位派生权威定价（购物车模式）。
       const bundleLine = {
         kind: 'BUNDLE' as const,
         description: descParts,
@@ -962,9 +984,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
         adultCount: adults,
         childCount: children,
         infantCount: infants,
-        singleCount: singles,
         businessCount: businesses,
-        ...(selfProvidedVisa ? { selfProvidedVisa: true } : {}),
         metadata,
       };
       // 机票航段在前 + 地面套餐行在后：与前台商城同结构，服务端按航段扣座、套餐行只算地面。
@@ -996,11 +1016,17 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       return;
     }
     const items = 'items' in built ? built.items : [built.item];
+    // 套餐乘客级住宿/签证选项：让系统价随每人「拼房/单住 · 随套餐/自备签」选择实时变化。
+    // 仅套餐单发送（其余产品与乘客级选项无关，后端也只在 BUNDLE 分支读取）。
+    const quotePassengers =
+      kind === 'BUNDLE'
+        ? validPassengers.map((p) => ({ visaExempt: !!p.visaExempt, singleRoom: !!p.singleRoom }))
+        : undefined;
     let cancelled = false;
     setQuoting(true);
     const timer = setTimeout(() => {
       api
-        .quoteOrder(token, { items })
+        .quoteOrder(token, { items, ...(quotePassengers ? { passengers: quotePassengers } : {}) })
         .then((r) => {
           if (cancelled) return;
           setQuoteTotal(r.total);
@@ -1024,7 +1050,9 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   }, [
     token, kind, flightTripType, scheduleId, cabin, returnScheduleId, returnCabin,
     roomTypeId, rooms, visaId, visaQty, bundleId, departDate,
-    adultCount, childCount, infantCount, singleCount, businessCount, selfProvidedVisa,
+    adultCount, childCount, infantCount, businessCount,
+    // 乘客级单住/自备签勾选数变化 → 重新试算系统价（购物车模式）。
+    singleRoomCount, visaExemptCount,
     transferId, transferQty, validPassengers.length,
   ]);
 
@@ -1084,6 +1112,8 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       ...(p.visaIssueDate?.trim() ? { visaIssueDate: p.visaIssueDate.trim() } : {}),
       ...(p.visaEffectiveDate?.trim() ? { visaEffectiveDate: p.visaEffectiveDate.trim() } : {}),
       ...(p.visaExpiry?.trim() ? { visaExpiry: p.visaExpiry.trim() } : {}),
+      // 套餐乘客级选项（购物车模式）：仅套餐单显式发送；后端据此逐位派生权威定价 + 签证台过滤。
+      ...(kind === 'BUNDLE' ? { visaExempt: !!p.visaExempt, singleRoom: !!p.singleRoom } : {}),
     }));
     // 纯酒店/接送且未填出行人：后端 passengers 至少 1 条，用联系人（或录入人）占位一位出行人。
     if (passengerPayload.length === 0) {
@@ -1272,7 +1302,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     setNoteVisa('');
     setNotePayment('');
     setNoteSpecial('');
-    setSelfProvidedVisa(false);
+    // 单住 / 自备签是乘客级标记，随 setPassengers([emptyPassenger()]) 一并复位（无独立状态）。
     // 清掉上一单的调价（避免误带到下一单）；系统价随产品状态复位后由 effect 自动重算。
     setAdjustAmount(null);
     setAdjustReason('DISCOUNT');
@@ -1673,20 +1703,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                       <NumberInput className={inputCls} value={infantCount} onChange={setInfantCount} integerOnly min={0} placeholder="0" />
                     </label>
                   </div>
-                  {/* 单人入住（单房差）与商务舱升级 — 与前台同口径 */}
-                  <label className="text-xs text-slate-500">
-                    单人入住人数（单房差）
-                    <NumberInput
-                      className={inputCls}
-                      value={singleCount}
-                      onChange={setSingleCount}
-                      integerOnly
-                      min={0}
-                      max={Math.max(0, (adultCount ?? 0) + (childCount ?? 0))}
-                      placeholder="0"
-                    />
-                    <span className="mt-0.5 block text-[11px] text-slate-400">最多 {(adultCount ?? 0) + (childCount ?? 0)} 人</span>
-                  </label>
+                  {/* 商务舱升级（整单人数口径不变）。单住 / 自备签已改为「逐位选择」，见下方出行人表两列。 */}
                   <label className="text-xs text-slate-500">
                     商务舱升级人数
                     <NumberInput
@@ -1700,25 +1717,10 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                     />
                     <span className="mt-0.5 block text-[11px] text-slate-400">最多 {(adultCount ?? 0) + (childCount ?? 0)} 人</span>
                   </label>
-                  {/* 客人自备签证：仅当套餐配置了可扣减金额时显示 */}
-                  {bundle && bundle.selfVisaDeductCny > 0 && (
-                    <label className="md:col-span-2 flex items-center gap-2 text-xs text-slate-600">
-                      <input
-                        type="checkbox"
-                        className="h-4 w-4 rounded border-slate-300 text-brand focus:ring-brand"
-                        checked={selfProvidedVisa}
-                        onChange={(e) => {
-                          const next = e.target.checked;
-                          setSelfProvidedVisa(next);
-                          // 勾选时把订单级签证状态同步为「不需要」，与套餐价扣减口径一致；取消勾选不强行回写。
-                          if (next) setVisaStatus('NOT_NEEDED');
-                        }}
-                      />
-                      客人自备签证（−¥{bundle.selfVisaDeductCny}/单）
-                    </label>
-                  )}
                   <p className="md:col-span-2 text-[11px] text-slate-400">
-                    成人 + 儿童 + 婴儿都是出行人（都需护照，下方逐位填）。机票/房/价格由系统按套餐权威重算。
+                    成人 + 儿童 + 婴儿都是出行人（都需护照，下方逐位填）。
+                    <span className="text-slate-500">住宿（拼房/单住）与签证（随套餐/自备签）在下方出行人表里每人各选</span>，
+                    机票/房/价格由系统按套餐权威重算。
                   </p>
                 </div>
               )}
@@ -1832,6 +1834,11 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
               <p className="mt-2 text-[11px] text-slate-400">
                 默认按产品类型：签证 / 套餐默认「需要」，机票 / 酒店 / 接送默认「不需要」；切换产品类型后若未手动改过本下拉会自动跟随新默认值，手动选过则不再自动改。
               </p>
+              {showVisaExemptCol && (
+                <p className="mt-1 text-[11px] text-slate-400">
+                  本订单级签证状态与出行人「自备签」互相独立——部分乘客自备签不改变订单级状态；自备签乘客不进签证台、套餐价按人扣减。
+                </p>
+              )}
             </div>
 
             {/* 出行人 */}
@@ -1877,6 +1884,8 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                   <thead className="sticky top-0 bg-slate-50 text-xs text-slate-500">
                     <tr>
                       <th className="min-w-[140px] whitespace-nowrap px-2 py-1.5 text-left font-normal">姓名</th>
+                      {showRoomingCol && <th className="min-w-[150px] whitespace-nowrap px-2 py-1.5 text-left font-normal">住宿</th>}
+                      {showVisaExemptCol && <th className="min-w-[120px] whitespace-nowrap px-2 py-1.5 text-left font-normal">签证</th>}
                       <th className="min-w-[140px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照号</th>
                       <th className="min-w-[120px] whitespace-nowrap px-2 py-1.5 text-left font-normal">出生日期</th>
                       <th className="min-w-[140px] whitespace-nowrap px-2 py-1.5 text-left font-normal">中文姓名</th>
@@ -1913,6 +1922,40 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                           <td className="min-w-[140px] px-2 py-1 align-top">
                             <input className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm" value={p.fullName} onChange={(e) => setPassenger(i, { fullName: e.target.value })} />
                           </td>
+                          {/* 套餐乘客级：住宿方式（拼房默认/单住）+ 本人构成小字（能算则显示） */}
+                          {showRoomingCol && (
+                            <td className="min-w-[150px] px-2 py-1 align-top">
+                              <select
+                                className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm"
+                                value={p.singleRoom ? 'single' : 'share'}
+                                onChange={(e) => setPassenger(i, { singleRoom: e.target.value === 'single' })}
+                              >
+                                <option value="share">拼房</option>
+                                <option value="single">单住</option>
+                              </select>
+                              {(() => {
+                                const parts: string[] = ['套餐价'];
+                                if (p.singleRoom && singleSupplementPerPax > 0) parts.push(`+单房差¥${singleSupplementPerPax.toLocaleString('zh-CN')}`);
+                                if (p.visaExempt && selfVisaDeductPerPax > 0) parts.push(`−自备签¥${selfVisaDeductPerPax.toLocaleString('zh-CN')}`);
+                                return parts.length > 1 ? (
+                                  <span className="mt-0.5 block whitespace-nowrap text-[11px] text-slate-400">本人构成：{parts.join(' ')}</span>
+                                ) : null;
+                              })()}
+                            </td>
+                          )}
+                          {/* 套餐乘客级：签证（随套餐默认/自备签）——仅套餐配了自备签减免额时显示 */}
+                          {showVisaExemptCol && (
+                            <td className="min-w-[120px] px-2 py-1 align-top">
+                              <select
+                                className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm"
+                                value={p.visaExempt ? 'self' : 'bundle'}
+                                onChange={(e) => setPassenger(i, { visaExempt: e.target.value === 'self' })}
+                              >
+                                <option value="bundle">随套餐</option>
+                                <option value="self">自备签</option>
+                              </select>
+                            </td>
+                          )}
                           <td className="min-w-[140px] px-2 py-1 align-top">
                             <input className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm" value={p.documentNumber} onChange={(e) => setPassenger(i, { documentNumber: e.target.value })} />
                           </td>

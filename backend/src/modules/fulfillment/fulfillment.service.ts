@@ -65,7 +65,8 @@ export class FulfillmentService {
         include: { fulfillmentTasks: { orderBy: { createdAt: 'asc' } } },
       }),
       prisma.passenger.findMany({
-        where: { orderId },
+        // 自备签证乘客（visaExempt=true）不进签证台：客人自行办妥签证，无需送签。
+        where: { orderId, visaExempt: false },
         select: { id: true, fullName: true, documentNumber: true, passportPhotoUrl: true },
       }),
     ]);
@@ -172,6 +173,7 @@ export class FulfillmentService {
                    ("passportPhotoUrl" IS NOT NULL AND length("passportPhotoUrl") > 0) AS "hasPhoto"
             FROM "Passenger"
             WHERE "orderId" IN (${Prisma.join(visaOrderIds)})
+              AND "visaExempt" = false
           `)
         : Promise.resolve([] as PassengerRow[]),
       orderIds.length

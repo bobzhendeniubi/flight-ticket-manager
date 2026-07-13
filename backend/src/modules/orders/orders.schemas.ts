@@ -145,6 +145,14 @@ export const passengerInputSchema = z.object({
   bedPref: z.enum(['SINGLE', 'DOUBLE', 'TWIN', 'SHARE_OK']).optional(),
   // 护照图 data-URL；3MB 上限让单张超大图快速失败（清晰报错，而非整请求 413 黑盒）
   passportPhotoUrl: z.string().url().max(3_000_000, '护照图过大，请压缩后重试').optional(),
+
+  // ── 套餐乘客级选项（购物车模式：同一订单每人各选住宿方式 + 签证）──
+  //   visaExempt = 客人自备签证（无需送签，签证台过滤 + 套餐价按人扣减 selfVisaDeductCny）
+  //   singleRoom = 单住（不拼房，按人收单房差）
+  // 均 optional 布尔：向后兼容——不传时 service 回落旧的整单聚合口径（bundleItem.selfProvidedVisa /
+  //   bundleSingleCount）；任一乘客显式提供时以乘客级派生为权威（优先级见 orders.service）。
+  visaExempt: z.boolean().optional(),
+  singleRoom: z.boolean().optional(),
 });
 export type PassengerInput = z.infer<typeof passengerInputSchema>;
 
@@ -319,8 +327,19 @@ export type CreateOrderBody = z.infer<typeof createOrderBodySchema>;
 // ── 录单前试算（quote，只算不落库；ADMIN/STAFF）───────────────────────────
 // body 为 createOrder items 子集：填完产品/人数即可拿到「系统权威价」，供录单页展示。
 // 复用 priceAndValidateItems 的权威定价逻辑，绝不写库、绝不扣座。
+//
+// passengers（可选）：套餐乘客级住宿/签证选项的试算输入。试算只需定价相关的两维布尔，
+//   不需要完整身份字段（区别于 createOrder 的 passengerInputSchema）。缺省则回落 item 级
+//   旧聚合口径，与 createOrder 同一优先级（见 priceAndValidateItems）。
+export const quotePassengerOptionSchema = z.object({
+  visaExempt: z.boolean().optional(),
+  singleRoom: z.boolean().optional(),
+});
+export type QuotePassengerOption = z.infer<typeof quotePassengerOptionSchema>;
+
 export const quoteOrderBodySchema = z.object({
   items: z.array(orderItemInputSchema).min(1).max(20),
+  passengers: z.array(quotePassengerOptionSchema).max(20).optional(),
 });
 export type QuoteOrderBody = z.infer<typeof quoteOrderBodySchema>;
 

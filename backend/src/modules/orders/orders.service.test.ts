@@ -96,6 +96,8 @@ import {
   computeRoomsNeeded,
   computeBundleRoomsCharged,
   computeBundleOperationFeeTotal,
+  derivePerPaxBundleOptions,
+  passengerToData,
   createFulfillmentTasks,
   resolveOrderAgentId,
   buildStayNightDates,
@@ -840,26 +842,130 @@ describe('computeBundleAddOn', () => {
     expect(r.breakdown.businessCount).toBe(2);
   });
 
-  // ── 自备签证减钱 ────────────────────────────────────────────────────
-  it('自备签证：selfProvidedVisa=true → 套餐行净减该套餐配置的 selfVisaDeductCny', () => {
+  // ── 自备签证减钱（旧整单口径：count=1）────────────────────────────────
+  it('自备签证：selfProvidedVisaCount=1（整单减一次）→ 套餐行净减该套餐配置的 selfVisaDeductCny', () => {
     const cfg = { ...bundle, selfVisaDeductCny: 600 };
     // 单人入住 1 人 × 80 × 3 = 240；自备签证减 600 → 240 − 600 → clamp 0
-    const withDeduct = computeBundleAddOn(cfg, stamp, 1, 0, occ(2), 3, true);
+    const withDeduct = computeBundleAddOn(cfg, stamp, 1, 0, occ(2), 3, 1);
     expect(withDeduct.breakdown.selfVisaDeductTotal).toBe(600);
+    expect(withDeduct.breakdown.selfProvidedVisaCount).toBe(1);
     expect(withDeduct.breakdown.selfProvidedVisa).toBe(true);
     expect(withDeduct.total).toBe(0); // 240 − 600 clamp 0
     expect(withDeduct.hasAddOn).toBe(true);
     // 升级足够大时确实减进去：升舱 1 人 × 700 × 2 = 1400 − 600 = 800
-    const r = computeBundleAddOn(cfg, stamp, 0, 1, occ(2), 3, true);
+    const r = computeBundleAddOn(cfg, stamp, 0, 1, occ(2), 3, 1);
     expect(r.total).toBe(800);
   });
 
-  it('自备签证缺省 false → 不减（向后兼容，selfVisaDeductTotal=0）', () => {
+  it('自备签证缺省 0 → 不减（向后兼容，selfVisaDeductTotal=0）', () => {
     const cfg = { ...bundle, selfVisaDeductCny: 600 };
     const r = computeBundleAddOn(cfg, stamp, 0, 1, occ(2), 3);
     expect(r.breakdown.selfVisaDeductTotal).toBe(0);
+    expect(r.breakdown.selfProvidedVisaCount).toBe(0);
     expect(r.breakdown.selfProvidedVisa).toBe(false);
     expect(r.total).toBe(1400); // 升舱 1400，无减免
+  });
+
+  // ── 自备签证减钱（新乘客级口径：count=勾选人数，每人各减一次）───────────────
+  it('乘客级自备签：selfProvidedVisaCount=2 → 减免 = 2 × selfVisaDeductCny（每人各减一次）', () => {
+    const cfg = { ...bundle, selfVisaDeductCny: 300 };
+    // 3 大同行，2 人自备签；升舱 3 人 × 700 × 2 = 4200；减 2 × 300 = 600 → 3600
+    const r = computeBundleAddOn(cfg, stamp, 0, 3, occ(3), 3, 2);
+    expect(r.breakdown.selfProvidedVisaCount).toBe(2);
+    expect(r.breakdown.selfVisaDeductTotal).toBe(600);
+    expect(r.total).toBe(4200 - 600);
+  });
+
+  it('自备签人数夹到 headCount 上限：headCount=2 但传 count=5 → 只减 2 人份', () => {
+    const cfg = { ...bundle, selfVisaDeductCny: 500 };
+    // 升舱 2 人 × 700 × 2 = 2800；count 夹到 headCount(2) → 减 2 × 500 = 1000 → 1800
+    const r = computeBundleAddOn(cfg, stamp, 0, 2, occ(2), 3, 5);
+    expect(r.breakdown.selfProvidedVisaCount).toBe(2);
+    expect(r.breakdown.selfVisaDeductTotal).toBe(1000);
+    expect(r.total).toBe(1800);
+  });
+});
+
+// ── 套餐乘客级住宿/签证派生：derivePerPaxBundleOptions（新旧口径优先级）──────────
+describe('derivePerPaxBundleOptions', () => {
+  it('无 passengers（老客户端）→ 回落 item 级旧聚合口径', () => {
+    const r = derivePerPaxBundleOptions(
+      { selfProvidedVisa: true, singleCount: 2 },
+      undefined,
+    );
+    // 旧整单布尔 true → count=1（整单减一次）；singleCount 用 item 聚合值
+    expect(r).toEqual({ selfProvidedVisaCount: 1, singleCount: 2 });
+  });
+
+  it('item 布尔 false / 无 singleCount → count=0 / singleCount=undefined', () => {
+    const r = derivePerPaxBundleOptions({}, undefined);
+    expect(r).toEqual({ selfProvidedVisaCount: 0, singleCount: undefined });
+  });
+
+  it('乘客级提供 → 以勾选人数为权威（覆盖 item 旧值）', () => {
+    const passengers = [
+      { visaExempt: true, singleRoom: false },
+      { visaExempt: false, singleRoom: true },
+      { visaExempt: true, singleRoom: true },
+    ];
+    // item 上的旧值应被乘客级派生覆盖：自备签 2 人、单住 2 人
+    const r = derivePerPaxBundleOptions(
+      { selfProvidedVisa: false, singleCount: 0 },
+      passengers,
+    );
+    expect(r).toEqual({ selfProvidedVisaCount: 2, singleCount: 2 });
+  });
+
+  it('两维各自独立判定：只结构化住宿、签证仍走旧布尔', () => {
+    const passengers = [{ singleRoom: true }, { singleRoom: false }];
+    // singleRoom 有提供 → 单住派生 1；visaExempt 无人提供 → 回落 item.selfProvidedVisa(true) → 1
+    const r = derivePerPaxBundleOptions(
+      { selfProvidedVisa: true, singleCount: 9 },
+      passengers,
+    );
+    expect(r).toEqual({ selfProvidedVisaCount: 1, singleCount: 1 });
+  });
+
+  it('乘客级全 false（显式提供）→ 派生 0，覆盖 item 旧聚合值', () => {
+    const passengers = [
+      { visaExempt: false, singleRoom: false },
+      { visaExempt: false, singleRoom: false },
+    ];
+    const r = derivePerPaxBundleOptions(
+      { selfProvidedVisa: true, singleCount: 2 },
+      passengers,
+    );
+    expect(r).toEqual({ selfProvidedVisaCount: 0, singleCount: 0 });
+  });
+});
+
+// ── 乘客字段落库映射：passengerToData（0713 反馈批新增 visaExempt/singleRoom）──────
+describe('passengerToData — 套餐乘客级选项落库', () => {
+  const base = {
+    fullName: 'ZHANG SAN',
+    documentType: 'PASSPORT' as const,
+    documentNumber: 'E12345678',
+    dateOfBirth: '1990-01-01',
+    nationality: 'CN',
+    passengerType: 'ADULT' as const,
+  };
+
+  it('显式提供 → 原样落库', () => {
+    const data = passengerToData({ ...base, visaExempt: true, singleRoom: true });
+    expect(data.visaExempt).toBe(true);
+    expect(data.singleRoom).toBe(true);
+  });
+
+  it('缺省 → 落 false（拼房 + 随套餐办签，与旧行为一致）', () => {
+    const data = passengerToData(base);
+    expect(data.visaExempt).toBe(false);
+    expect(data.singleRoom).toBe(false);
+  });
+
+  it('单维提供：仅自备签 true，单住缺省 false', () => {
+    const data = passengerToData({ ...base, visaExempt: true });
+    expect(data.visaExempt).toBe(true);
+    expect(data.singleRoom).toBe(false);
   });
 });
 

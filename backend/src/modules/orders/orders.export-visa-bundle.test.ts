@@ -1,12 +1,13 @@
 /**
- * 签证资料合并打包 · 单元测试（vitest）
+ * 签证资料导出 · 单元测试（vitest）
  *
- * 覆盖签证岗反馈：「勾选若干订单，把这些订单的签证名单导出在同一张表格上，护照也一起下载」。
+ * 覆盖签证岗反馈：「勾选若干订单，把这些订单的签证名单导出在同一张表格上，护照也一起下载」，
+ * 以及 0713 拆分反馈：「表单独、护照打包」——合并名单 xlsx 与护照图 zip 分开两个导出。
  *   - 选单口径：queryOrdersByIdsForVisa 按勾选订单 id 取单（软删排除，空列表短路不查库）
- *   - 状态过滤在 buildVisaBundleZip：被勾选但状态不合格的单跳过并在 README 点名
+ *   - 状态过滤：buildVisaRosterXlsx 静默不计入不合格单；buildVisaPassportsZip 在 README 点名跳过
  *   - 排序：sortOrdersForVisa 按「代理机构名 → 订单号」分组，直客（无代理）排最后
- *   - xlsx 含性别列，且每位乘客一行合并（跨订单）
- *   - 护照图文件名规则：{订单号}-{LASTNAME}_{FIRSTNAME}.{ext}，无图乘客缺文件但仍有行
+ *   - xlsx 含性别列，且每位乘客一行合并（跨订单）；名单不再打包进 zip
+ *   - 护照图文件名规则：{订单号}-{LASTNAME}_{FIRSTNAME}.{ext}，无图乘客缺文件；zip 内不含 xlsx
  */
 import { describe, it, expect, vi } from 'vitest';
 import JSZip from 'jszip';
@@ -17,10 +18,12 @@ vi.mock('../../db/prisma.js', () => ({ prisma: {} }));
 
 import {
   buildVisaBundleXlsx,
-  buildVisaBundleZip,
+  buildVisaRosterXlsx,
+  buildVisaPassportsZip,
   queryOrdersByIdsForVisa,
   sortOrdersForVisa,
-  visaBundleZipFilename,
+  visaRosterXlsxFilename,
+  visaPassportsZipFilename,
 } from './orders.export-visa-bundle.js';
 import type { OrderForTemplateExport } from './orders.export-templates.js';
 
@@ -209,7 +212,7 @@ describe('queryOrdersByIdsForVisa — 按 id 选单', () => {
     const arg = findMany.mock.calls[0][0];
     expect(arg.where.id.in).toEqual(['id_a', 'id_b']);
     expect(arg.where.deletedAt).toBeNull();
-    // 状态过滤放到 buildVisaBundleZip，这里不加 status 条件（否则不合格单查不回来、无法在 README 点名）
+    // 状态过滤放到 partitionOrdersForVisa（名单/护照包共用），这里不加 status 条件（否则不合格单查不回来）
     expect(arg.where.status).toBeUndefined();
   });
 
@@ -240,78 +243,8 @@ describe('sortOrdersForVisa — 代理→订单号分组，直客排最后', () 
   });
 });
 
-describe('buildVisaBundleZip — 打包结构 + 护照文件名规则', () => {
-  it('zip 含合并 xlsx；护照图文件名带订单号+姓名前缀；无图乘客缺文件但仍在名单', async () => {
-    const orders = [
-      makeOrder('FTM2026071000001', [
-        pax({ id: 'a1', lastName: 'WANG', firstName: 'LIANBO', passportPhotoUrl: 'https://x.test/wang.jpg' }),
-        pax({ id: 'a2', lastName: 'LI', firstName: 'SI', passportPhotoUrl: null }),
-      ]),
-    ];
-    const findMany = vi.fn().mockResolvedValue(orders);
-    const client = { order: { findMany } } as unknown as Parameters<typeof buildVisaBundleZip>[1];
-
-    // 有图乘客触发 fetch —— 返回一小段图字节
-    const fetchSpy = vi
-      .spyOn(globalThis, 'fetch')
-      .mockResolvedValue(new Response(new Uint8Array([1, 2, 3, 4]), { status: 200 }));
-
-    const zipBuf = await buildVisaBundleZip({ orderIds: ['id_FTM2026071000001'] }, client);
-    const zip = await JSZip.loadAsync(zipBuf);
-    const names = Object.keys(zip.files);
-
-    // 合并签证名单 xlsx 存在（命名不再依赖日期）
-    expect(names).toContain('签证专用_合并名单.xlsx');
-
-    // 有图乘客：文件名 = 订单号-LASTNAME_FIRSTNAME.jpg
-    expect(names).toContain('FTM2026071000001-WANG_LIANBO.jpg');
-
-    // 无图乘客：无对应护照文件
-    expect(names.some((n) => n.includes('LI_SI'))).toBe(false);
-
-    // 名单里两人都在（含无图那位）
-    const xlsxEntry = zip.file('签证专用_合并名单.xlsx')!;
-    const rows = await readVisaSheet(await xlsxEntry.async('nodebuffer'));
-    expect(rows).toHaveLength(2);
-    expect(rows.map((r) => r['有无护照图'])).toEqual(['有护照图', '无护照图（手工录入）']);
-
-    fetchSpy.mockRestore();
-  });
-
-  it('被勾选但状态不合格的单跳过、不进名单，并在 README 点名', async () => {
-    const paid = makeOrder('FTM2026071000001', [
-      pax({ id: 'a1', lastName: 'WANG', firstName: 'LIANBO', passportPhotoUrl: null }),
-    ]);
-    const cancelled = makeOrder(
-      'FTM2026071000009',
-      [pax({ id: 'z1', lastName: 'ZHAO', firstName: 'WU', passportPhotoUrl: null })],
-      { status: 'CANCELLED' },
-    );
-    const findMany = vi.fn().mockResolvedValue([paid, cancelled]);
-    const client = { order: { findMany } } as unknown as Parameters<typeof buildVisaBundleZip>[1];
-
-    const zipBuf = await buildVisaBundleZip(
-      { orderIds: ['id_FTM2026071000001', 'id_FTM2026071000009', 'id_missing'] },
-      client,
-    );
-    const zip = await JSZip.loadAsync(zipBuf);
-
-    // 名单只含合格单（1 人）
-    const rows = await readVisaSheet(
-      await zip.file('签证专用_合并名单.xlsx')!.async('nodebuffer'),
-    );
-    expect(rows).toHaveLength(1);
-    expect(rows[0][NAME_HEADER]).toBe('WANG/LIANBO MR');
-
-    // README 点名跳过的状态不合格单 + 查不到的 id
-    const readme = await zip.file('README.txt')!.async('string');
-    expect(readme).toContain('勾选订单数：3');
-    expect(readme).toContain('已打包订单数：1');
-    expect(readme).toContain('FTM2026071000009（CANCELLED）');
-    expect(readme).toContain('id_missing');
-  });
-
-  it('合并名单按「代理→订单号」分组排序，STT 跨订单连续', async () => {
+describe('buildVisaRosterXlsx — 仅名单 xlsx（不含护照图）', () => {
+  it('按勾选订单 id 取单、状态过滤、排序后合并成一张名单', async () => {
     const orders = [
       makeOrder('B1', [pax({ id: 'b1', lastName: 'BB', firstName: 'ONE' })], {
         agent: { companyName: '乙代理' },
@@ -321,22 +254,113 @@ describe('buildVisaBundleZip — 打包结构 + 护照文件名规则', () => {
       }),
     ];
     const findMany = vi.fn().mockResolvedValue(orders);
-    const client = { order: { findMany } } as unknown as Parameters<typeof buildVisaBundleZip>[1];
+    const client = { order: { findMany } } as unknown as Parameters<typeof buildVisaRosterXlsx>[1];
 
-    const zipBuf = await buildVisaBundleZip({ orderIds: ['id_B1', 'id_A1'] }, client);
-    const zip = await JSZip.loadAsync(zipBuf);
-    const rows = await readVisaSheet(
-      await zip.file('签证专用_合并名单.xlsx')!.async('nodebuffer'),
-    );
+    const xlsxBuf = await buildVisaRosterXlsx(['id_B1', 'id_A1'], client);
+    const rows = await readVisaSheet(xlsxBuf);
+
     // 甲代理(A1) 在前、乙代理(B1) 在后；STT 连续 1,2
     expect(rows.map((r) => r['STT'])).toEqual(['1', '2']);
     expect(rows.map((r) => r['代理机构'])).toEqual(['甲代理', '乙代理']);
     expect(rows.map((r) => r[NAME_HEADER])).toEqual(['AA/ONE MR', 'BB/ONE MR']);
   });
+
+  it('被勾选但状态不合格 / 查不到的单静默不计入名单（无 README，纯 xlsx）', async () => {
+    const paid = makeOrder('FTM2026071000001', [
+      pax({ id: 'a1', lastName: 'WANG', firstName: 'LIANBO', passportPhotoUrl: null }),
+    ]);
+    const cancelled = makeOrder(
+      'FTM2026071000009',
+      [pax({ id: 'z1', lastName: 'ZHAO', firstName: 'WU', passportPhotoUrl: null })],
+      { status: 'CANCELLED' },
+    );
+    const findMany = vi.fn().mockResolvedValue([paid, cancelled]);
+    const client = { order: { findMany } } as unknown as Parameters<typeof buildVisaRosterXlsx>[1];
+
+    const xlsxBuf = await buildVisaRosterXlsx(
+      ['id_FTM2026071000001', 'id_FTM2026071000009', 'id_missing'],
+      client,
+    );
+    const rows = await readVisaSheet(xlsxBuf);
+
+    // 名单只含合格单（1 人）；状态不合格 / 查不到的单静默不出现
+    expect(rows).toHaveLength(1);
+    expect(rows[0][NAME_HEADER]).toBe('WANG/LIANBO MR');
+  });
 });
 
-describe('visaBundleZipFilename', () => {
-  it('文件名带订单数（不再依赖出发日）', () => {
-    expect(visaBundleZipFilename(3)).toMatch(/^签证资料_3单_\d{8}导出\.zip$/u);
+describe('buildVisaPassportsZip — 仅护照图 zip（不含 xlsx 名单）', () => {
+  it('zip 不含 xlsx；护照图文件名带订单号+姓名前缀；无图乘客缺文件', async () => {
+    const orders = [
+      makeOrder('FTM2026071000001', [
+        pax({ id: 'a1', lastName: 'WANG', firstName: 'LIANBO', passportPhotoUrl: 'https://x.test/wang.jpg' }),
+        pax({ id: 'a2', lastName: 'LI', firstName: 'SI', passportPhotoUrl: null }),
+      ]),
+    ];
+    const findMany = vi.fn().mockResolvedValue(orders);
+    const client = { order: { findMany } } as unknown as Parameters<typeof buildVisaPassportsZip>[1];
+
+    // 有图乘客触发 fetch —— 返回一小段图字节
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response(new Uint8Array([1, 2, 3, 4]), { status: 200 }));
+
+    const zipBuf = await buildVisaPassportsZip(['id_FTM2026071000001'], client);
+    const zip = await JSZip.loadAsync(zipBuf);
+    const names = Object.keys(zip.files);
+
+    // 不再打包 xlsx 名单
+    expect(names).not.toContain('签证专用_合并名单.xlsx');
+    expect(names.some((n) => n.endsWith('.xlsx'))).toBe(false);
+
+    // 有图乘客：文件名 = 订单号-LASTNAME_FIRSTNAME.jpg
+    expect(names).toContain('FTM2026071000001-WANG_LIANBO.jpg');
+
+    // 无图乘客：无对应护照文件
+    expect(names.some((n) => n.includes('LI_SI'))).toBe(false);
+
+    // README 存在且记录缺图明细
+    const readme = await zip.file('README.txt')!.async('string');
+    expect(readme).toContain('护照图成功：1');
+    expect(readme).toContain('护照图缺失/失败：1');
+
+    fetchSpy.mockRestore();
+  });
+
+  it('被勾选但状态不合格的单跳过、不打包护照图，并在 README 点名（连同查不到的 id）', async () => {
+    const paid = makeOrder('FTM2026071000001', [
+      pax({ id: 'a1', lastName: 'WANG', firstName: 'LIANBO', passportPhotoUrl: null }),
+    ]);
+    const cancelled = makeOrder(
+      'FTM2026071000009',
+      [pax({ id: 'z1', lastName: 'ZHAO', firstName: 'WU', passportPhotoUrl: null })],
+      { status: 'CANCELLED' },
+    );
+    const findMany = vi.fn().mockResolvedValue([paid, cancelled]);
+    const client = { order: { findMany } } as unknown as Parameters<typeof buildVisaPassportsZip>[1];
+
+    const zipBuf = await buildVisaPassportsZip(
+      ['id_FTM2026071000001', 'id_FTM2026071000009', 'id_missing'],
+      client,
+    );
+    const zip = await JSZip.loadAsync(zipBuf);
+
+    const readme = await zip.file('README.txt')!.async('string');
+    expect(readme).toContain('勾选订单数：3');
+    expect(readme).toContain('已打包订单数：1');
+    expect(readme).toContain('FTM2026071000009（CANCELLED）');
+    expect(readme).toContain('id_missing');
+  });
+});
+
+describe('visaRosterXlsxFilename', () => {
+  it('文件名带订单数与 YYYY-MM-DD 日期', () => {
+    expect(visaRosterXlsxFilename(3)).toMatch(/^签证名单_3单_\d{4}-\d{2}-\d{2}\.xlsx$/u);
+  });
+});
+
+describe('visaPassportsZipFilename', () => {
+  it('文件名带订单数与 YYYY-MM-DD 日期', () => {
+    expect(visaPassportsZipFilename(3)).toMatch(/^签证护照_3单_\d{4}-\d{2}-\d{2}\.zip$/u);
   });
 });

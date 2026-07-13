@@ -499,6 +499,8 @@ export class OrderService {
     const pricedItems = await this.priceAndValidateItems(
       body.items,
       body.flightSettlementPriceCny,
+      // 套餐乘客级住宿/签证选项：从下单乘客数组派生每人差异定价（优先级见 priceAndValidateItems）。
+      body.passengers,
     );
 
     // 签证订单规则：含 VISA 行时每位出行人必须填写护照有效期（送签材料必填）
@@ -772,7 +774,8 @@ export class OrderService {
       amount: number;
     }>;
   }> {
-    const priced = await this.priceAndValidateItems(body.items);
+    // 试算带上乘客级住宿/签证选项（缺省则回落 item 级旧口径），使系统价随每人选择实时变化。
+    const priced = await this.priceAndValidateItems(body.items, undefined, body.passengers);
     const items = priced.map((p) => ({
       kind: p.kind,
       description: p.description,
@@ -902,10 +905,15 @@ export class OrderService {
    *   动态价：unitPrice = 结算价，amount = 结算价 × quantity。仅改价格，绝不动
    *   quantity / flightScheduleId / flightCabin —— 扣座（CAS）仍按 quantity 执行。
    *   缺省 → 走动态定价（旧行为）。
+   * @param passengers 套餐乘客级住宿/签证选项（只用 visaExempt / singleRoom 两维派生套餐定价）。
+   *   优先级（BUNDLE 分支，两维各自独立判定）：任一乘客显式提供了对应布尔字段时，以乘客级勾选
+   *   人数为权威；否则回落 item 级旧聚合口径（bundleItem.selfProvidedVisa 布尔 / singleCount）。
+   *   缺省（老客户端不传 passengers）→ 全部回落旧口径，定价与扩展前完全一致。
    */
   private async priceAndValidateItems(
     items: OrderItemInput[],
     flightSettlementPriceCny?: number,
+    passengers?: ReadonlyArray<{ visaExempt?: boolean; singleRoom?: boolean }>,
   ) {
     const priced: Array<{
       kind: OrderItemKind;
@@ -1118,6 +1126,13 @@ export class OrderService {
           quantity: item.quantity,
           metadata: item.metadata,
         });
+
+        // ── 乘客级「住宿方式 + 签证」派生（0713 反馈批：购物车模式，每人各选自己的码）──
+        // 单一权威口径由 derivePerPaxBundleOptions 提供（纯函数，单测共用，避免漂移）：
+        //   任一乘客显式提供对应布尔 → 以乘客级勾选人数为权威；否则回落 item 级旧聚合口径。
+        const { selfProvidedVisaCount, singleCount: derivedSingleCount } =
+          derivePerPaxBundleOptions(item, passengers);
+
         // 计费房间数（server-authoritative，钱路径权威计算）：
         //   · 容量口径 physicalRooms = computeRoomsNeeded（选的人数一间坐不下自动加房）：
         //       max( ceil(成人/maxAdults), ceil(占座儿童/maxChildren), 1 )；缺房型回退默认 2大1小。
@@ -1129,7 +1144,8 @@ export class OrderService {
           occupancy,
           capacity: bundle.hotelRoomType,
           hotelRoomTypeId: bundle.hotelRoomTypeId,
-          singleCount: item.singleCount,
+          // 单住派生：任一乘客勾了 singleRoom → 该单不是「独自拼房 0.5 间」，按整间收 + 单房差。
+          singleCount: derivedSingleCount,
           clientRoomsBilled: item.roomsBilled,
         });
 
@@ -1191,11 +1207,11 @@ export class OrderService {
         const addOn = computeBundleAddOn(
           bundle,
           hotelStamp,
-          item.singleCount,
+          derivedSingleCount,
           item.businessCount,
           occupancy,
           nights,
-          item.selfProvidedVisa,
+          selfProvidedVisaCount,
         );
         // 累计本单的升舱人数（多份套餐叠加），下方循环结束后统一分摊到经济舱航段并预检商务舱余位。
         // 注意：addOn.breakdown.businessCount 已夹到占座人数（seatPax）上限，婴儿不计入。
@@ -4548,13 +4564,14 @@ export interface BundleAddOnBreakdown {
   businessUpgradeCnyPerLeg: number; // 该套餐配置的升舱/航段
   childSeatDiscountCnyPerPerson: number; // 该套餐配置的占座儿童折扣/人
   infantPriceCny: number; // 该套餐配置的婴儿价/人
-  selfProvidedVisa: boolean; // 是否自备签证（自行办妥签证）
-  selfVisaDeductCny: number; // 该套餐配置的自备签证减免/单
+  selfProvidedVisaCount: number; // 自备签证（自行办妥签证）人数：乘客级勾选数 / 旧整单布尔 → 1
+  selfProvidedVisa: boolean; // 是否有自备签证乘客（= selfProvidedVisaCount > 0；向后兼容展示用）
+  selfVisaDeductCny: number; // 该套餐配置的自备签证减免/人
   singleSupplementTotal: number; // = singleCount × rate × nights
   businessUpgradeTotal: number; // = businessCount × rate × legs
   childSeatDiscountTotal: number; // = childCount × childSeatDiscountCnyPerPerson（机票折扣，负向计入套餐行）
   infantPriceTotal: number; // = infantCount × infantPriceCny（婴儿机票价，正向计入套餐行）
-  selfVisaDeductTotal: number; // = selfProvidedVisa ? selfVisaDeductCny : 0（自备签证减免，负向计入套餐行）
+  selfVisaDeductTotal: number; // = selfProvidedVisaCount × selfVisaDeductCny（自备签证减免，负向计入套餐行）
   total: number; // 升级加价 + 婴儿价 − 儿童折扣 − 自备签证减免 的净额（计入套餐行总额）
 }
 
@@ -4693,8 +4710,13 @@ export function computeBundleRoomsCharged(params: {
  *   legs   = bundle.legs（来回默认 2）
  *   单人入住房差 = singleCount × singleSupplementCnyPerNight × nights
  *   升舱商务加价 = businessCount × businessUpgradeCnyPerLeg × legs
- *   自备签证减免 = selfProvidedVisa ? selfVisaDeductCny : 0（自行办妥签证，从套餐行扣减）
- * singleCount / businessCount 缺省 0、selfProvidedVisa 缺省 false → total=0 → 套餐价与旧版完全一致（向后兼容）。
+ *   自备签证减免 = selfProvidedVisaCount × selfVisaDeductCny（自行办妥签证的人数，从套餐行扣减）
+ * singleCount / businessCount / selfProvidedVisaCount 缺省 0 → total=0 → 套餐价与旧版完全一致（向后兼容）。
+ *
+ * selfProvidedVisaCount 语义（两种模式，调用处 priceAndValidateItems 决定 count）：
+ *   · 旧整单口径：录单勾「客人自备签证」布尔 true → count=1（整单减一次 −selfVisaDeductCny）。
+ *   · 新乘客级：同一订单各乘客各选 → count=勾「自备签」的人数（每人减一次）。
+ * count 夹到 [0, headCount]（自备签是按人的，最多全体出行人）。
  *
  * 导出仅供单测使用。
  */
@@ -4710,6 +4732,34 @@ export function computeBundleOperationFeeTotal(operationFeeCny: number, seatPax:
   const perPax = Math.max(0, Math.trunc(Number(operationFeeCny) || 0));
   const pax = Math.max(0, Math.trunc(Number(seatPax) || 0));
   return perPax * pax;
+}
+
+/**
+ * 套餐乘客级「住宿方式 + 签证」派生（纯函数，向后兼容）。
+ *
+ * 购物车模式：同一订单每人各选自己的住宿方式（拼房/单住）与签证（随套餐/自备签），价差全部系统算。
+ * 优先级（两维各自独立判定，互不干扰）：
+ *   · 自备签：passengers 里任一乘客显式提供 visaExempt（true/false 均算「提供」）→ 以勾 true 的人数为权威；
+ *            否则回落 item.selfProvidedVisa 布尔（旧整单口径 true → 记 1 次，整单减一次）。
+ *   · 单住：  passengers 里任一乘客显式提供 singleRoom → 以勾 true 的人数为权威；
+ *            否则回落 item.singleCount（旧 bundleSingleCount 聚合口径）。
+ * passengers 缺省（老客户端不传）→ 全部回落旧口径，定价与扩展前完全一致。
+ *
+ * 导出供单测与 createOrder/quoteOrder 的 priceAndValidateItems BUNDLE 分支共用。
+ */
+export function derivePerPaxBundleOptions(
+  item: { selfProvidedVisa?: boolean; singleCount?: number },
+  passengers: ReadonlyArray<{ visaExempt?: boolean; singleRoom?: boolean }> | undefined,
+): { selfProvidedVisaCount: number; singleCount: number | undefined } {
+  const paxVisaProvided = passengers?.some((px) => px.visaExempt !== undefined) ?? false;
+  const paxSingleProvided = passengers?.some((px) => px.singleRoom !== undefined) ?? false;
+  const selfProvidedVisaCount = paxVisaProvided
+    ? (passengers?.filter((px) => px.visaExempt === true).length ?? 0)
+    : (item.selfProvidedVisa === true ? 1 : 0);
+  const singleCount = paxSingleProvided
+    ? (passengers?.filter((px) => px.singleRoom === true).length ?? 0)
+    : item.singleCount;
+  return { selfProvidedVisaCount, singleCount };
 }
 
 export function computeBundleAddOn(
@@ -4728,14 +4778,22 @@ export function computeBundleAddOn(
   occupancy: BundleOccupancy,
   /** 调用方按 resolveBundleNights 解析的单一权威晚数（无盖章时的回退口径）。 */
   resolvedNights: number,
-  /** 自备签证（出行人自行办妥签证）→ 从套餐行扣减 selfVisaDeductCny。缺省 false。 */
-  selfProvidedVisa?: boolean,
+  /**
+   * 自备签证（出行人自行办妥签证）人数 → 每人从套餐行扣减 selfVisaDeductCny。缺省 0。
+   * 旧整单布尔口径由调用处归一化为 count（true → 1）；新乘客级口径为勾选人数。
+   */
+  selfProvidedVisaCount?: number,
 ): { total: number; hasAddOn: boolean; breakdown: BundleAddOnBreakdown } {
   const single = Math.max(0, Math.trunc(singleCount ?? 0));
   // businessCount 不能超过占座人数（成人 + 占座儿童）；婴儿不占座、不能升舱
   const business = Math.min(
     Math.max(0, Math.trunc(businessCount ?? 0)),
     occupancy.seatPax,
+  );
+  // 自备签人数：夹到 [0, headCount]（按人减免，最多全体出行人）。旧整单布尔已在调用处归一化为 0/1。
+  const selfVisaCount = Math.min(
+    Math.max(0, Math.trunc(selfProvidedVisaCount ?? 0)),
+    occupancy.headCount,
   );
   // 计费晚数：优先用盖章推导的真实入住区间，否则回退套餐默认晚数（≥1）
   const nights = hotelStamp
@@ -4750,7 +4808,6 @@ export function computeBundleAddOn(
   const childDiscountRate = Math.max(0, bundle.childSeatDiscountCnyPerPerson);
   const infantRate = Math.max(0, bundle.infantPriceCny);
   const selfVisaRate = Math.max(0, bundle.selfVisaDeductCny);
-  const selfVisa = selfProvidedVisa === true;
 
   const singleSupplementTotal = single * singleRate * nights;
   const businessUpgradeTotal = business * businessRate * legs;
@@ -4758,8 +4815,8 @@ export function computeBundleAddOn(
   const childSeatDiscountTotal = occupancy.childCount * childDiscountRate;
   // 不占座婴儿机票收婴儿价（不走经济舱全价）→ 套餐行净加 infantCount × 婴儿价
   const infantPriceTotal = occupancy.infantCount * infantRate;
-  // 自备签证：出行人自行办妥签证 → 套餐行净减该套餐配置的自备签证减免
-  const selfVisaDeductTotal = selfVisa ? selfVisaRate : 0;
+  // 自备签证：自行办妥签证的人数 × 每人减免（乘客级各减一次；旧整单口径 count=1 即整单减一次）
+  const selfVisaDeductTotal = selfVisaCount * selfVisaRate;
   // 升级加价 + 婴儿价 − 儿童折扣 − 自备签证减免（向上夹到 0，避免套餐行出现负总额）
   const total = Math.max(
     0,
@@ -4794,7 +4851,8 @@ export function computeBundleAddOn(
       businessUpgradeCnyPerLeg: businessRate,
       childSeatDiscountCnyPerPerson: childDiscountRate,
       infantPriceCny: infantRate,
-      selfProvidedVisa: selfVisa,
+      selfProvidedVisaCount: selfVisaCount,
+      selfProvidedVisa: selfVisaCount > 0,
       selfVisaDeductCny: selfVisaRate,
       singleSupplementTotal,
       businessUpgradeTotal,
@@ -4985,7 +5043,8 @@ export function computeBundleSeatSplit(
   return { sameCabin: quantity - upgrade, business: upgrade };
 }
 
-function passengerToData(p: PassengerInput) {
+// 导出供单测验证乘客字段落库映射（含 0713 反馈批新增 visaExempt/singleRoom）。
+export function passengerToData(p: PassengerInput) {
   // 自动拆 fullName → lastName/firstName，如果客户端没传
   const [autoLast, ...rest] = (p.fullName || '').trim().split(/\s+/);
   const autoFirst = rest.join(' ');
@@ -5024,6 +5083,9 @@ function passengerToData(p: PassengerInput) {
     needsInfantBassinet: p.needsInfantBassinet ?? false,
     bedPref: p.bedPref ?? null,
     passportPhotoUrl: p.passportPhotoUrl ?? null,
+    // 套餐乘客级选项（购物车模式）：缺省 false = 随套餐办签 + 拼房（与旧行为一致）。
+    visaExempt: p.visaExempt ?? false,
+    singleRoom: p.singleRoom ?? false,
   };
 }
 

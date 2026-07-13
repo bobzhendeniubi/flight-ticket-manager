@@ -51,8 +51,10 @@ import {
   roomAllocationExportFilenameByDepart,
 } from './orders.export-room-allocation.js';
 import {
-  buildVisaBundleZip,
-  visaBundleZipFilename,
+  buildVisaRosterXlsx,
+  visaRosterXlsxFilename,
+  buildVisaPassportsZip,
+  visaPassportsZipFilename,
 } from './orders.export-visa-bundle.js';
 import {
   buildMasterExportWorkbook,
@@ -695,22 +697,53 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     },
   );
 
-  // ── 签证资料合并打包 zip（合并签证名单 xlsx + 全部护照图）──
-  // POST /orders/visa-bundle.zip  body { orderIds: string[] }（ADMIN/STAFF only）
-  // 按勾选的订单一次导出这些订单的签证资料（状态不合格/查不到的单在 zip 内 README 点名跳过）。
+  // ── 签证资料导出：名单表 / 护照包 分开下载（0713 签证岗反馈：合并 zip 多一步解压不方便）──
+  // POST /orders/visa-roster.xlsx  body { orderIds: string[] }（ADMIN/STAFF only）
+  // 按勾选的订单导出合并签证名单 xlsx（状态不合格/查不到的单静默不计入，仅出合格单）。
   app.post(
-    '/visa-bundle.zip',
+    '/visa-roster.xlsx',
     { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
     async (req, reply) => {
       const body = visaBundleBodySchema.parse(req.body);
-      const zipBuf = await buildVisaBundleZip({ orderIds: body.orderIds });
+      const xlsxBuf = await buildVisaRosterXlsx(body.orderIds);
 
       void writeAudit({
         actor: actorFromRequest(req),
-        action: 'DOWNLOAD_VISA_BUNDLE',
+        action: 'DOWNLOAD_VISA_ROSTER',
         targetType: 'ORDER',
-        targetId: 'visa-bundle',
-        targetLabel: `签证资料 勾选 ${body.orderIds.length} 单`,
+        targetId: 'visa-roster',
+        targetLabel: `签证名单 勾选 ${body.orderIds.length} 单`,
+        after: { orderCount: body.orderIds.length },
+      });
+
+      return reply
+        .header(
+          'Content-Type',
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
+        .header(
+          'Content-Disposition',
+          `attachment; filename="${encodeURIComponent(visaRosterXlsxFilename(body.orderIds.length))}"`,
+        )
+        .send(xlsxBuf);
+    },
+  );
+
+  // POST /orders/visa-passports.zip  body { orderIds: string[] }（ADMIN/STAFF only）
+  // 按勾选的订单导出全部乘客护照图 zip（不含名单 xlsx）；状态不合格/查不到的单及缺图明细见 zip 内 README。
+  app.post(
+    '/visa-passports.zip',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    async (req, reply) => {
+      const body = visaBundleBodySchema.parse(req.body);
+      const zipBuf = await buildVisaPassportsZip(body.orderIds);
+
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'DOWNLOAD_VISA_PASSPORTS',
+        targetType: 'ORDER',
+        targetId: 'visa-passports',
+        targetLabel: `签证护照 勾选 ${body.orderIds.length} 单`,
         after: { orderCount: body.orderIds.length },
       });
 
@@ -718,7 +751,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         .header('Content-Type', 'application/zip')
         .header(
           'Content-Disposition',
-          `attachment; filename="${encodeURIComponent(visaBundleZipFilename(body.orderIds.length))}"`,
+          `attachment; filename="${encodeURIComponent(visaPassportsZipFilename(body.orderIds.length))}"`,
         )
         .send(zipBuf);
     },
