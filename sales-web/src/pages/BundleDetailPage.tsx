@@ -424,20 +424,35 @@ function BundleDetailContent({
       };
     }
     if (item.kind === 'VISA') {
-      return { ...item, computedTotal: item.unitPrice * item.qty, label: item.productName };
+      // 签证按办签人数收（S2）：办签人数 = 出行总人数 headCount（成人+儿童+婴儿，都需签证）。
+      // 前台无「自备签」选择 → 自备签 = 0，办签人数 = headCount。与后端 groundTotal VISA 分支恒等。
+      return { ...item, computedTotal: item.unitPrice * headCount, label: item.productName };
     }
+    // TRANSFER — 固定价（按趟不按人头，不随人数缩放）
     return { ...item, computedTotal: item.unitPrice * item.qty, label: item.productName };
   });
 
-  const flightTotal = itemRows.filter((r) => r.kind === 'FLIGHT').reduce((s, r) => s + r.computedTotal, 0);
-  // 套餐 add-on 净额（镜像后端 computeBundleAddOn：升级加价 + 婴儿价 − 儿童折扣，向上夹到 0）。
-  const addOnTotal = Math.max(0, singleAddOn + businessAddOn + infantPriceTotal - childDiscountTotal);
+  // 机票块（S1）：套餐内嵌 FLIGHT 行 → 沿用其行价（已是 pricePerPerson×seatPax）；未内嵌但去/回航段已解析
+  //   → 按 pricePerPerson×seatPax 派生（与 CheckoutPage 下单拆腿口径恒等：outLeg/retLeg 各拆一条经济舱腿）。
+  //   不补 → flightTotal 恒 0，卡片机票显示 ¥0 但下单实扣真实机票价。
+  const hasEmbeddedFlight = itemRows.some((r) => r.kind === 'FLIGHT');
+  const flightTotal = hasEmbeddedFlight
+    ? itemRows.filter((r) => r.kind === 'FLIGHT').reduce((s, r) => s + r.computedTotal, 0)
+    : outLeg && retLeg
+      ? pricePerPerson * seatPax
+      : 0;
   const hotelTotal = itemRows.filter((r) => r.kind === 'HOTEL').reduce((s, r) => s + r.computedTotal, 0);
   const otherTotal =
     itemRows.filter((r) => r.kind !== 'FLIGHT' && r.kind !== 'HOTEL').reduce((s, r) => s + r.computedTotal, 0);
-  // 操作服务费与 addOnTotal 分开累加（镜像后端：opFee 不进 addOn 的向零夹逼，单独加到套餐行）。
-  const listTotal = flightTotal + hotelTotal + otherTotal + addOnTotal + operationFeeTotal;
-  const total = Math.round(listTotal * (1 - pct / 100));
+  // 加项净额（不预夹 0；镜像后端 computeBundleAddOn.total：升级 + 婴儿价 − 儿童折扣，前台无自备签）。
+  //   非负夹逼下沉到「地面 + 加项 + 操作费」整体层 → 儿童折扣可正常抵扣地面价（与后端 BUNDLE 行口径一致）。
+  const addOnNet = singleAddOn + businessAddOn + infantPriceTotal - childDiscountTotal;
+  // 套餐行（镜像后端 createOrder BUNDLE 行金额）：max(0, round(地面) + 加项净额 + 操作费)。
+  const bundleRow = Math.max(0, Math.round(hotelTotal + otherTotal) + addOnNet + operationFeeTotal);
+  const factor = (100 - pct) / 100;
+  // 划线原价（未打折全包价）；权威总价逐块取整（机票块 + 套餐行各自 round），与后端逐行 round 偏差 ≤1 元。
+  const listTotal = flightTotal + bundleRow;
+  const total = Math.round(flightTotal * factor) + Math.round(bundleRow * factor);
   const perPerson = headCount > 0 ? Math.round(total / headCount) : total;
 
   const soldOut = goTier === 'SOLD_OUT' || retTier === 'SOLD_OUT' || hotelTier === 'SOLD_OUT';
@@ -871,6 +886,23 @@ function BundleDetailContent({
 
             {/* 明细 */}
             <div className="space-y-1.5 border-t border-slate-200/70 pt-3">
+              {/* S1：套餐未内嵌 FLIGHT 行时，用实时解析的去/回航段派生一条机票明细（与下单拆腿口径恒等），
+                  避免机票展示 ¥0；内嵌 FLIGHT 行的套餐则由下方 itemRows 正常展示。 */}
+              {!hasEmbeddedFlight && outLeg && retLeg && (
+                <div className="flex items-center justify-between text-xs">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <span className={`rounded px-1.5 py-0.5 font-medium ${KIND_LABEL.FLIGHT.color}`}>
+                      {KIND_LABEL.FLIGHT.label}
+                    </span>
+                    <span className="truncate text-slate-700">
+                      来回{isBiz ? '商务' : '经济'}舱 · {formatOccupancy(adultCount, childCount, infantCount)}
+                    </span>
+                  </div>
+                  <span className="nums whitespace-nowrap text-slate-600">
+                    ¥{(pricePerPerson * seatPax).toLocaleString()}
+                  </span>
+                </div>
+              )}
               {itemRows.map((r, idx) => (
                 <div key={idx} className="flex items-center justify-between text-xs">
                   <div className="flex min-w-0 items-center gap-2">

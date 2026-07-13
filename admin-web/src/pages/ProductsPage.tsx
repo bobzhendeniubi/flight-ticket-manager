@@ -13,7 +13,7 @@ import {
   type MockBundle,
   type BundleItem,
 } from '../lib/mockData';
-import { api, ApiError, type Hotel, type Transfer as ApiTransfer, type Visa as ApiVisa, type Bundle as ApiBundle, type AdminFlight, type BundleFlightRef } from '../lib/api';
+import { api, ApiError, type Hotel, type Transfer as ApiTransfer, type Visa as ApiVisa, type VisaIssuanceMethod, type VisaEntryType, type Bundle as ApiBundle, type AdminFlight, type BundleFlightRef } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { NumberInput } from '../components/NumberInput';
 import { BundleBlackoutEditor, type BlackoutDateRow } from '../components/BundleBlackoutEditor';
@@ -21,7 +21,13 @@ import { SearchSelect, type SearchSelectOption } from '../components/SearchSelec
 
 // 0702 反馈 1：服务内容 / 单次最多停留天数 —— MockVisa/MockBundle（lib/mockData.ts）暂未声明这两个字段，
 // 用本页局部扩展类型承接，不改共享 mock 类型定义。0702 反馈 5：签证成本价同一批加进来，与 stayDays 挂同一个扩展类型。
-type MockVisaWithStayDays = MockVisa & { stayDays?: number | null; costPriceCny?: number | null };
+// 签证台批 VD1：签发方式/入境次数结构化分类同一批局部扩展承接（未设置 = null/undefined，表单留空）。
+type MockVisaWithStayDays = MockVisa & {
+  stayDays?: number | null;
+  costPriceCny?: number | null;
+  issuanceMethod?: VisaIssuanceMethod | null;
+  entryType?: VisaEntryType | null;
+};
 type MockBundleWithServiceNotes = MockBundle & { serviceNotes?: string | null };
 // 0702 反馈 3：起价拆解需要房型整间夜价 —— MockBundle.hotelRoomType（lib/mockData.ts）里没声明
 // nightlyPriceCny，但后端 serializeBundle 实际会发（见 products.service.ts BUNDLE_ROOM_INCLUDE /
@@ -129,6 +135,9 @@ function visaApiToMock(v: ApiVisa): MockVisaWithStayDays {
     stayDays: v.stayDays,
     // 使馆/代办成本（仅内部）：匿名/未带 token 拿不到这个 key，?? null 兜底成"未录"。
     costPriceCny: v.costPriceCny != null ? Number(v.costPriceCny) : null,
+    // 签发方式 / 入境次数（结构化分类）：未设置（含旧数据未回填命中）= null
+    issuanceMethod: v.issuanceMethod,
+    entryType: v.entryType,
   };
 }
 
@@ -449,6 +458,9 @@ export function ProductsPage() {
           stayDays: n.stayDays ?? undefined,
           // 使馆/代办成本（仅内部，前台不展示）：留空 = 未录 → 省略字段。
           costPriceCny: n.costPriceCny ?? undefined,
+          // 签发方式 / 入境次数（结构化分类，选填）：留空 = 未设置 → 省略字段。
+          issuanceMethod: n.issuanceMethod ?? undefined,
+          entryType: n.entryType ?? undefined,
         });
       }
       for (const n of next) {
@@ -464,6 +476,9 @@ export function ProductsPage() {
             stayDays: n.stayDays ?? undefined,
             // 留空 = 显式清空成本价（真·部分更新字段，语义同 Transfer；表单已用现值预填）。
             costPriceCny: n.costPriceCny ?? null,
+            // 留空 = 显式清空签发方式/入境次数为未设置（同款真·部分更新字段）。
+            issuanceMethod: n.issuanceMethod ?? null,
+            entryType: n.entryType ?? null,
           });
         }
       }
@@ -2537,6 +2552,9 @@ function VisaEditorForm({
   // 单次入境最多可停留天数（选填；订单详情行程单「最多可停留 X 天」+ 推算生效/失效日期用）
   const [stayDays, setStayDays] = useState<number | null>(visa.stayDays ?? null);
   const [costPrice, setCostPrice] = useState<number | null>(visa.costPriceCny ?? null);
+  // 签发方式 / 入境次数（结构化分类，选填）：留空 = 未设置
+  const [issuanceMethod, setIssuanceMethod] = useState<VisaIssuanceMethod | null>(visa.issuanceMethod ?? null);
+  const [entryType, setEntryType] = useState<VisaEntryType | null>(visa.entryType ?? null);
   const [docsText, setDocsText] = useState(visa.requiredDocs.join(', '));
   const [saved, setSaved] = useState(false);
 
@@ -2552,6 +2570,8 @@ function VisaEditorForm({
       requiredDocs: docsText.split(',').map(s => s.trim()).filter(Boolean),
       stayDays: stayDays ?? undefined,
       costPriceCny: costPrice,
+      issuanceMethod,
+      entryType,
     };
     setSaved(true);
     setTimeout(() => onSave(updated), 800);
@@ -2613,6 +2633,32 @@ function VisaEditorForm({
         <div>
           <label className="label text-xs">单次最多停留（天，选填）</label>
           <NumberInput min={1} max={365} className="input" value={stayDays} onChange={(n) => setStayDays(n)} integerOnly placeholder="不限则留空" />
+        </div>
+        <div>
+          <label className="label text-xs">签发方式（选填）</label>
+          <select
+            className="input"
+            value={issuanceMethod ?? ''}
+            onChange={(e) => setIssuanceMethod(e.target.value ? (e.target.value as VisaIssuanceMethod) : null)}
+          >
+            <option value="">未设置</option>
+            <option value="E_VISA">电子签</option>
+            <option value="STICKER">贴纸签</option>
+            <option value="ARRIVAL">落地签</option>
+            <option value="OTHER">其他</option>
+          </select>
+        </div>
+        <div>
+          <label className="label text-xs">入境次数（选填）</label>
+          <select
+            className="input"
+            value={entryType ?? ''}
+            onChange={(e) => setEntryType(e.target.value ? (e.target.value as VisaEntryType) : null)}
+          >
+            <option value="">未设置</option>
+            <option value="SINGLE">单次</option>
+            <option value="MULTIPLE">多次</option>
+          </select>
         </div>
         <div className="md:col-span-2">
           <label className="label text-xs">卖点（如"最热销"）</label>

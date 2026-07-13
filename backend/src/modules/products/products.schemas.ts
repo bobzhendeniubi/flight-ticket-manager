@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { VisaEntryType, VisaIssuanceMethod } from '@prisma/client';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -152,6 +153,10 @@ export const createVisaBodySchema = z.object({
   country: z.string().max(50).optional(),
   visaType: z.string().min(1).max(100),
   visaName: z.string().max(200).optional(),
+  // 签发方式 / 入境次数（结构化分类，选填）：省略 = 不改（update）/ 未设置（create）；
+  // 显式 null = 清空为未设置；与 costPriceCny 同款"真·部分更新"约定。
+  issuanceMethod: z.nativeEnum(VisaIssuanceMethod).nullable().optional(),
+  entryType: z.nativeEnum(VisaEntryType).nullable().optional(),
   flag: z.string().max(10).optional(),
   photo: z.string().url().optional(),
   processingDays: z.number().int().min(0).max(365),

@@ -502,6 +502,9 @@ export function CheckoutPage() {
         return [];
       }),
       idempotencyKey,
+      // 前台展示总价兜底（S1）：带上结算页看到的合计，后端权威商品价与之偏差 > 1 元 → 回 PRICE_CHANGED，
+      // 防止「展示价与实收价背离」时静默多收（如套餐机票展示 ¥0、下单拆腿按真实机票价实扣）。
+      expectedTotalCny: Math.round(total),
     };
 
     const orderedIds = items.map((i) => i.id);
@@ -522,6 +525,9 @@ export function CheckoutPage() {
       if (err instanceof ApiError && err.status === 401) {
         setSessionExpired(true);
         setErrorMsg(null);
+      } else if (err instanceof ApiError && err.code === 'PRICE_CHANGED') {
+        // 价格漂移兜底（S1）：展示价与后端权威价不一致 → 明确提示刷新重下，绝不让用户按旧价被多收。
+        setErrorMsg('价格已更新，请刷新页面后重新下单（航班或产品价格发生了变化）。');
       } else if (err instanceof ApiError) {
         setErrorMsg(`下单失败：${err.message}`);
       } else {

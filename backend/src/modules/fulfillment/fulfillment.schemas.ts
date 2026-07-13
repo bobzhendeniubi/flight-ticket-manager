@@ -7,6 +7,8 @@ export const listFulfillmentQuerySchema = z.object({
   type: z.nativeEnum(FulfillmentType).optional(),
   status: z.nativeEnum(FulfillmentStatus).optional(),
   assigneeUserId: z.string().optional(),
+  // 备注文本筛选（不区分大小写子串匹配）；省略/空串 = 不筛
+  notesQuery: z.string().max(100).optional(),
   page: z.coerce.number().int().min(1).default(1),
   pageSize: z.coerce.number().int().min(1).max(200).default(50),
 });
@@ -28,3 +30,11 @@ export const batchFulfillmentStatusBodySchema = z.object({
   toStatus: z.nativeEnum(FulfillmentStatus),
 });
 export type BatchFulfillmentStatusBody = z.infer<typeof batchFulfillmentStatusBodySchema>;
+
+// ── 批量改备注（独立于批量改状态，不动 status）─────────────────────────
+export const batchFulfillmentNotesBodySchema = z.object({
+  taskIds: z.array(z.string().min(1)).min(1).max(100),
+  // 允许空串（= 批量清空备注），与单条 PATCH notes 语义一致
+  notes: z.string().max(1000),
+});
+export type BatchFulfillmentNotesBody = z.infer<typeof batchFulfillmentNotesBodySchema>;

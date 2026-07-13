@@ -322,6 +322,10 @@ export const createOrderBodySchema = z.object({
   // 同班次同证件号本会被拦，运营确认后带此 flag 放行，服务端写审计 + 订单备注留痕。
   // 服务端按认证身份判权限：散客/AGENT 携带此字段无效，照旧拦（见 createOrder）。
   allowDuplicatePassengers: z.boolean().optional(),
+  // 前台展示总价兜底（正整数 CNY，仅前台散客结账带；admin/批量/quote 一律不带 → 跳过比对，不影响录单路径）。
+  // 后端权威商品价（护照临期费/录单调价之前）与此偏差 > 1 元 → 抛 PRICE_CHANGED（见 createOrder），
+  // 防止「展示价与实收价背离」时静默按新价多收（如套餐机票展示 ¥0 实扣真实机票价）。
+  expectedTotalCny: z.number().int().positive().optional(),
 });
 export type CreateOrderBody = z.infer<typeof createOrderBodySchema>;
 

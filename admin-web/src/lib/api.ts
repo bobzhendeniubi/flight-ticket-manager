@@ -1098,6 +1098,10 @@ export interface FulfillmentTask {
   };
   /** 签证产品名（含"…单次"/"…多次"）；非签证任务或缺失 → null */
   visaName?: string | null;
+  /** 签证产品签发方式（结构化分类）；非签证任务/未设置/缺失 → null */
+  visaIssuanceMethod?: VisaIssuanceMethod | null;
+  /** 签证产品入境次数（结构化分类）；非签证任务/未设置/缺失 → null */
+  visaEntryType?: VisaEntryType | null;
   /** 仅 type=VISA_APPLICATION 时后端附带，其余任务类型无此字段 */
   passengers?: VisaTaskPassenger[];
 }
@@ -1109,6 +1113,8 @@ export interface ListFulfillmentParams {
   type?: FulfillmentType;
   status?: FulfillmentStatus;
   assigneeUserId?: string;
+  /** 备注文本筛选（不区分大小写子串匹配）；省略/空串 = 不筛 */
+  notesQuery?: string;
   page?: number;
   pageSize?: number;
 }
@@ -1194,6 +1200,11 @@ export interface Transfer {
   createdAt: string;
 }
 
+/** 签证签发方式（结构化分类，替代靠产品名正则猜测） */
+export type VisaIssuanceMethod = 'E_VISA' | 'STICKER' | 'ARRIVAL' | 'OTHER';
+/** 签证入境次数 */
+export type VisaEntryType = 'SINGLE' | 'MULTIPLE';
+
 export interface Visa {
   id: string;
   /** 产品编号（服务端生成，如 V0001）；老数据可能为 null */
@@ -1202,6 +1213,10 @@ export interface Visa {
   country: string | null;
   visaType: string;
   visaName: string | null;
+  /** 签发方式（电子签/贴纸签/落地签/其他）；未设置（含旧数据未回填命中）= null */
+  issuanceMethod: VisaIssuanceMethod | null;
+  /** 入境次数（单次/多次）；未设置 = null */
+  entryType: VisaEntryType | null;
   flag: string | null;
   processingDays: number;
   basePrice: string;
@@ -2394,6 +2409,13 @@ export const api = {
       method: 'POST',
       token,
       body: { taskIds, toStatus },
+    }),
+  // 批量改履约任务备注（独立于批量改状态，不动 status；notes 允许空串 = 批量清空）
+  batchUpdateFulfillmentNotes: (token: string, taskIds: string[], notes: string) =>
+    apiFetch<BatchFulfillmentStatusResult>('/fulfillment-tasks/batch-notes', {
+      method: 'POST',
+      token,
+      body: { taskIds, notes },
     }),
   updateFulfillmentTask: (token: string, id: string, body: Record<string, unknown>) =>
     apiFetch<{ task: FulfillmentTask }>(`/fulfillment-tasks/${id}`, { method: 'PATCH', token, body }),

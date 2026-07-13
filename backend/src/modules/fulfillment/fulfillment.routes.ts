@@ -1,15 +1,17 @@
 /**
  * 履约任务 API（ADMIN/STAFF）
  *
- * GET  /fulfillment-tasks            列表（按 order/status/type 过滤）
+ * GET  /fulfillment-tasks            列表（按 order/status/type/notesQuery 过滤）
  * GET  /fulfillment-tasks/by-order/:orderId   某订单的全部任务
  * PATCH /fulfillment-tasks/:id       更新状态/PNR/确认号/司机等
  * POST /fulfillment-tasks/batch-status        批量改状态（签证批量"已送签"）
+ * POST /fulfillment-tasks/batch-notes         批量改备注（独立于批量改状态）
  */
 import type { FastifyPluginAsync } from 'fastify';
 import { UserRole } from '@prisma/client';
 import { FulfillmentService } from './fulfillment.service.js';
 import {
+  batchFulfillmentNotesBodySchema,
   batchFulfillmentStatusBodySchema,
   listFulfillmentQuerySchema,
   updateFulfillmentBodySchema,
@@ -84,6 +86,33 @@ export const fulfillmentRoutes: FastifyPluginAsync = async (app) => {
         failureCount: result.failureCount,
       },
       severity: result.failureCount > 0 || body.toStatus === 'FAILED' ? 'WARNING' : 'INFO',
+    });
+
+    return result;
+  });
+
+  /**
+   * POST /fulfillment-tasks/batch-notes
+   *
+   * 批量更新任务备注（独立于批量改状态，不动 status）。
+   * 逐条复用单任务 update 的写入；partial failure 返回 failures 明细。
+   */
+  app.post('/batch-notes', pre, async (req) => {
+    const body = batchFulfillmentNotesBodySchema.parse(req.body);
+    const result = await service.batchUpdateNotes(body.taskIds, body.notes);
+
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'BATCH_UPDATE_FULFILLMENT_NOTES',
+      targetType: 'ORDER',
+      targetId: 'batch',
+      targetLabel: `${result.successCount}/${body.taskIds.length} tasks notes updated`,
+      after: {
+        requestedCount: body.taskIds.length,
+        successCount: result.successCount,
+        failureCount: result.failureCount,
+      },
+      severity: result.failureCount > 0 ? 'WARNING' : 'INFO',
     });
 
     return result;

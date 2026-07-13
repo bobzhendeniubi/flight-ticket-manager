@@ -36,6 +36,7 @@ import {
   DuplicatePassengerError,
   ForbiddenError,
   NotFoundError,
+  PriceChangedError,
 } from '../../lib/errors.js';
 import type { ItineraryData } from '../../lib/itinerary-pdf.js';
 import { writeAudit } from '../../lib/audit.js';
@@ -354,6 +355,22 @@ export function buildPriceAdjustmentItem(adj: PriceAdjustmentInput): {
 }
 
 /**
+ * 前台展示价兜底校验（S1）：expectedTotalCny 存在且与「服务端权威商品价」偏差 > 容差（PRICE_TOLERANCE_CNY，
+ * 1 元，容忍逐行取整）→ 抛 PRICE_CHANGED（前台提示刷新重下，绝不静默按新价多收）。
+ * 缺省（admin/批量/quote 不带 expectedTotalCny）→ 直接返回，跳过比对（录单路径不受影响）。
+ * 导出供单测（匹配通过 / 偏差拒单 / 不传跳过）与 createOrder 共用同一口径，避免漂移。
+ */
+export function assertDisplayedTotalMatches(
+  productTotalCny: number,
+  expectedTotalCny?: number | null,
+): void {
+  if (expectedTotalCny == null) return;
+  if (Math.abs(productTotalCny - expectedTotalCny) > PRICE_TOLERANCE_CNY) {
+    throw new PriceChangedError();
+  }
+}
+
+/**
  * 事后补收单房差 → 一条 FEE 定价行（计入 subtotal/total）。
  *   - 金额 = perNightCny × nights（都为正整数 CNY；校验由 roomSupplementBodySchema 完成）。
  *   - 描述可读「补收单房差 ¥X/晚 × N晚」（备注不拼进描述，另落 metadata.note 与审计流水 note）。
@@ -501,6 +518,17 @@ export class OrderService {
       body.flightSettlementPriceCny,
       // 套餐乘客级住宿/签证选项：从下单乘客数组派生每人差异定价（优先级见 priceAndValidateItems）。
       body.passengers,
+    );
+
+    // ── 前台展示价兜底校验（S1）：下单前比对「前台展示总价」与「服务端权威商品价」──────────────
+    // 基准取 pricedItems 逐行金额之和 —— **在护照临期附加费 / 录单调价之前**：这两项前台展示时并不知道
+    //   （临期费依下单时护照有效期派生），不该计入比对，否则会误伤正常单。
+    // expectedTotalCny 为可选，仅前台散客结账带（admin/批量/quote 不带 → assertDisplayedTotalMatches 内部跳过，
+    // 不影响录单路径）。偏差 > 容差（1 元，容忍逐行取整误差）→ 抛 PRICE_CHANGED，让前台提示刷新重下，
+    // 绝不静默按新价多收（典型：套餐机票展示 ¥0，下单拆腿按真实机票价实扣）。
+    assertDisplayedTotalMatches(
+      pricedItems.reduce((sum, p) => sum + p.amount, 0),
+      body.expectedTotalCny,
     );
 
     // 签证订单规则：含 VISA 行时每位出行人必须填写护照有效期（送签材料必填）
@@ -1164,6 +1192,11 @@ export class OrderService {
         //   bundleGround = Σ(HOTEL×rooms) + Σ(其它非机票)。折扣不在此扣 —— 改由循环后的
         //   percent-off 后处理对「机票腿 + 套餐行」整体 ×(1−discountPct/100)（旧的固定 groundDiscount 已弃用）。
         const bundleItems = (bundle.items as Array<{ kind: string; qty: number; unitPrice: number }>) ?? [];
+        // 签证按「办签人数」收费（S2）：办签人数 = 出行总人数(headCount，含婴儿，都需护照/签证)
+        //   − 自备签人数（自行办妥签证的乘客）。headCount 基数与 computeBundleAddOn 里 selfProvidedVisaCount
+        //   的夹逼基数（occupancy.headCount，含婴儿）完全一致，两处同源不漂移。夹到 ≥0（自备签人数超过出行人
+        //   时不出现负份）。修复前 VISA 行按模板静态 qty×unitPrice 收（2 成人只收 1 份）→ 真少收。
+        const visaHeadCount = Math.max(0, occupancy.headCount - selfProvidedVisaCount);
         const groundTotal = bundleItems
           .filter((b) => b.kind !== 'FLIGHT')
           .reduce((s, b) => {
@@ -1171,6 +1204,11 @@ export class OrderService {
               const nightlyPrice = linkedHotelNightlyPrice ?? b.unitPrice;
               return s + b.qty * nightlyPrice * rooms;
             }
+            if (b.kind === 'VISA') {
+              // 每份签证单价（unitPrice 写入时已由 products.service 覆盖为 Visa.basePrice/人）× 办签人数。
+              return s + visaHeadCount * b.unitPrice;
+            }
+            // TRANSFER 等：固定 qty×unitPrice（整车/整趟计价，按趟不按人头，不随人数缩放）。
             return s + b.qty * b.unitPrice;
           }, 0);
         const bundleUnitPrice = Math.max(0, Math.round(groundTotal));

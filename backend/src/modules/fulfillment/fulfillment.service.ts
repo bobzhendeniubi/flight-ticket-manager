@@ -81,7 +81,11 @@ export class FulfillmentService {
         // 父订单已软删 / 落入取消族（见 COUNTED_STATUSES）时不返回其任务——
         // 避免已取消/已删订单的签证等任务残留在运营视图里。
         where: { orderId, order: { deletedAt: null, status: { in: COUNTED_STATUSES } } },
-        include: { fulfillmentTasks: { orderBy: { createdAt: 'asc' } } },
+        include: {
+          fulfillmentTasks: { orderBy: { createdAt: 'asc' } },
+          // 本签证 item 关联的签证产品结构化分类（签发方式/入境次数），与 visaName 平级下发
+          visa: { select: { visaName: true, issuanceMethod: true, entryType: true } },
+        },
       }),
       prisma.passenger.findMany({
         // 自备签证乘客（visaExempt=true）不进签证台：客人自行办妥签证，无需送签。
@@ -93,9 +97,15 @@ export class FulfillmentService {
     return items.flatMap((it) =>
       it.fulfillmentTasks.map((t) => ({
         ...serializeTask(t, it),
-        // 签证任务附带乘客护照明细；其他类型任务不返回（undefined 被 JSON 序列化忽略）
+        // 签证任务附带乘客护照明细 + 签证产品结构化分类；其他类型任务不返回
+        // （undefined 被 JSON 序列化忽略）
         ...(t.type === FulfillmentType.VISA_APPLICATION
-          ? { passengers: serializedPassengers }
+          ? {
+              passengers: serializedPassengers,
+              visaName: it.visa?.visaName ?? null,
+              visaIssuanceMethod: it.visa?.issuanceMethod ?? null,
+              visaEntryType: it.visa?.entryType ?? null,
+            }
           : {}),
       })),
     );
@@ -129,6 +139,7 @@ export class FulfillmentService {
     if (query.status) where.status = query.status;
     if (query.assigneeUserId) where.assigneeUserId = query.assigneeUserId;
     if (query.orderItemId) where.orderItemId = query.orderItemId;
+    if (query.notesQuery) where.notes = { contains: query.notesQuery, mode: 'insensitive' };
 
     // 性能（签证台加载慢根因修复）：
     // 旧实现在每行 task 的 order include 里嵌套 passengers[] + 关系排序的最早机票子查询，
@@ -140,8 +151,8 @@ export class FulfillmentService {
         include: {
           orderItem: {
             include: {
-              // 本签证 item 关联的签证产品（用于 #7：单次/多次签名称）
-              visa: { select: { visaName: true } },
+              // 本签证 item 关联的签证产品（用于 #7：单次/多次签名称 + 结构化签发方式/入境次数分类）
+              visa: { select: { visaName: true, issuanceMethod: true, entryType: true } },
               order: {
                 select: {
                   id: true,
@@ -248,6 +259,10 @@ export class FulfillmentService {
           ...serializeTask(t, t.orderItem),
           // #7：本签证产品名称（单次/多次签等）置于任务顶层
           visaName: t.orderItem.visa?.visaName ?? null,
+          // 签证产品结构化分类（签发方式/入境次数）；未设置（含旧数据未回填命中）= null，
+          // 与 visaName 平级下发，供签证台后续替换正则猜测的展示逻辑用（本次不改 VisaDeskPage）。
+          visaIssuanceMethod: t.orderItem.visa?.issuanceMethod ?? null,
+          visaEntryType: t.orderItem.visa?.entryType ?? null,
           order: {
             ...order,
             // #6：出发日期 + 时区（ISO 字符串 / null）
@@ -348,6 +363,32 @@ export class FulfillmentService {
     for (const id of taskIds) {
       try {
         await this.update(id, { status: toStatus });
+        successCount += 1;
+      } catch (err) {
+        failures.push({ id, error: err instanceof Error ? err.message : '未知错误' });
+      }
+    }
+    return { successCount, failureCount: failures.length, failures };
+  }
+
+  /**
+   * 批量改备注（独立于批量改状态，不动 status）。
+   * 逐条复用 update() 的单任务写入；单条失败不影响其余，返回 failures 明细。
+   * notes 允许空串（= 批量清空），与单条 PATCH notes 语义一致。
+   */
+  async batchUpdateNotes(
+    taskIds: string[],
+    notes: string,
+  ): Promise<{
+    successCount: number;
+    failureCount: number;
+    failures: Array<{ id: string; error: string }>;
+  }> {
+    let successCount = 0;
+    const failures: Array<{ id: string; error: string }> = [];
+    for (const id of taskIds) {
+      try {
+        await this.update(id, { notes });
         successCount += 1;
       } catch (err) {
         failures.push({ id, error: err instanceof Error ? err.message : '未知错误' });

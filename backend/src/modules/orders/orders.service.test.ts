@@ -105,7 +105,9 @@ import {
   deriveBundlePerAgeUnitPrices,
   buildOrderFilterWhere,
   filterOrderIdsByDepartDate,
+  assertDisplayedTotalMatches,
 } from './orders.service.js';
+import { PriceChangedError } from '../../lib/errors.js';
 import type { OrderItemInput } from './orders.schemas.js';
 import {
   batchCreateOrdersBodySchema,
@@ -945,6 +947,130 @@ describe('套餐行金额：自备签减免抵扣 + 极端夹 0（复刻 createO
     const amount = bundleLineAmount(300, 1, addOn.total, 20);
     expect(amount).toBe(0);
     expect(applyDiscount(amount, 10)).toBe(0); // 折扣作用在 0 上仍为 0，不为负
+  });
+});
+
+// ── 套餐签证按办签人数计费（S2 修复：复刻 createOrder 套餐子项 groundTotal + BUNDLE 行）──────────
+// createOrder 里 VISA 子项定价：办签人数 = occupancy.headCount − selfProvidedVisaCount（夹到 ≥0），
+// 份数 = 办签人数 × unitPrice（TRANSFER 仍固定 qty×unitPrice）。这里在纯函数层复刻同一 reduce，
+// 验证「随人数收费」+「自备签减免与办签份数联动后 BUNDLE 行金额不为负」。
+describe('套餐签证按办签人数计费（S2·复刻 createOrder groundTotal）', () => {
+  const stamp = {
+    hotelCheckIn: new Date('2026-07-01'),
+    hotelCheckOut: new Date('2026-07-04'), // 3 晚
+  };
+  const occ = (adultCount: number, childCount = 0, infantCount = 0) =>
+    resolveBundleOccupancy({ adultCount, childCount, infantCount });
+
+  /** 复刻 createOrder 套餐子项 groundTotal（含 S2 的 VISA 按办签人数缩放）。 */
+  const bundleGroundTotal = (
+    items: Array<{ kind: string; qty: number; unitPrice: number }>,
+    headCount: number,
+    selfProvidedVisaCount: number,
+    rooms: number,
+    linkedHotelNightlyPrice: number | null = null,
+  ) => {
+    const visaHeadCount = Math.max(0, headCount - selfProvidedVisaCount);
+    return items
+      .filter((b) => b.kind !== 'FLIGHT')
+      .reduce((s, b) => {
+        if (b.kind === 'HOTEL') {
+          const nightlyPrice = linkedHotelNightlyPrice ?? b.unitPrice;
+          return s + b.qty * nightlyPrice * rooms;
+        }
+        if (b.kind === 'VISA') return s + visaHeadCount * b.unitPrice;
+        return s + b.qty * b.unitPrice;
+      }, 0);
+  };
+  /** 复刻 createOrder：BUNDLE 行金额（含非负保护）。 */
+  const bundleLineAmount = (ground: number, addOnTotal: number, opFee: number) =>
+    Math.max(0, Math.round(ground) + addOnTotal + opFee);
+
+  const visaItems = [{ kind: 'VISA', qty: 1, unitPrice: 220 }];
+
+  it('2 成人套餐 → 签证收 2 份（headCount=2、无自备签 → 办签 2 人 × ¥220 = 440）', () => {
+    expect(bundleGroundTotal(visaItems, occ(2).headCount, 0, 1)).toBe(440);
+  });
+
+  it('婴儿也计入办签人数（headCount 含婴儿，与自备签减免同基数）：2 成人 1 婴儿 → 收 3 份', () => {
+    // 修复前静态 qty=1 只收 1 份；办签人数 = headCount(3) − 0 = 3 → 3 × 220 = 660。
+    expect(bundleGroundTotal(visaItems, occ(2, 0, 1).headCount, 0, 1)).toBe(660);
+  });
+
+  it('1 人自备签 → 只收 (headCount−1) 份（2 成人、1 人自备 → 办签 1 人 × ¥220 = 220）', () => {
+    expect(bundleGroundTotal(visaItems, occ(2).headCount, 1, 1)).toBe(220);
+  });
+
+  it('自备签人数超过出行人 → 办签份数夹到 0（不出现负份）', () => {
+    expect(bundleGroundTotal(visaItems, occ(2).headCount, 5, 1)).toBe(0);
+  });
+
+  it('自备签减免与办签份数联动后 BUNDLE 行金额不为负（自备者不收签证 + 减免叠加 → 夹到 0）', () => {
+    // 1 成人独自自备签：办签人数 = 1 − 1 = 0 → 签证地面 = 0；再叠加 selfVisaDeductCny=150 减免。
+    const cfg = {
+      hotelNights: 3,
+      singleSupplementCnyPerNight: 0,
+      businessUpgradeCnyPerLeg: 0,
+      childSeatDiscountCnyPerPerson: 0,
+      infantPriceCny: 0,
+      selfVisaDeductCny: 150,
+      legs: 2,
+    };
+    const ground = bundleGroundTotal(visaItems, occ(1).headCount, 1, 1); // = 0（自备者不收签证）
+    expect(ground).toBe(0);
+    const addOn = computeBundleAddOn(cfg, stamp, 0, 0, occ(1), 3, 1); // 减免 −150
+    expect(addOn.total).toBe(-150);
+    // 行金额 = max(0, 0 − 150 + 操作费 20) = max(0, −130) = 0（联动后不为负）。
+    expect(bundleLineAmount(ground, addOn.total, 20)).toBe(0);
+  });
+
+  it('多人单：部分自备签仍随办签人数正常收费（净额为正、诚实抵扣）', () => {
+    // 2 成人、1 人自备签：办签 1 人；酒店 3 晚 × ¥400 × 1 间 + 签证 1 × ¥220 = 1420。
+    const items = [
+      { kind: 'HOTEL', qty: 3, unitPrice: 400 },
+      { kind: 'VISA', qty: 1, unitPrice: 220 },
+    ];
+    const cfg = {
+      hotelNights: 3,
+      singleSupplementCnyPerNight: 0,
+      businessUpgradeCnyPerLeg: 0,
+      childSeatDiscountCnyPerPerson: 0,
+      infantPriceCny: 0,
+      selfVisaDeductCny: 150,
+      legs: 2,
+    };
+    const ground = bundleGroundTotal(items, occ(2).headCount, 1, 1, 400);
+    expect(ground).toBe(1420);
+    const addOn = computeBundleAddOn(cfg, stamp, 0, 0, occ(2), 3, 1); // 减免 −150
+    expect(addOn.total).toBe(-150);
+    // 操作费 = 20 × seatPax(2) = 40 → 行金额 = max(0, 1420 − 150 + 40) = 1310（诚实抵扣、为正）。
+    expect(bundleLineAmount(ground, addOn.total, 40)).toBe(1310);
+  });
+});
+
+// ── 前台展示价兜底：assertDisplayedTotalMatches（S1，匹配通过 / 偏差拒单 / 不传跳过）──────────
+describe('assertDisplayedTotalMatches（前台展示价兜底 S1）', () => {
+  it('匹配（含 ≤1 元取整误差）→ 通过，不抛', () => {
+    expect(() => assertDisplayedTotalMatches(3200, 3200)).not.toThrow();
+    expect(() => assertDisplayedTotalMatches(3200, 3199)).not.toThrow(); // 差 1 元容忍
+    expect(() => assertDisplayedTotalMatches(3200, 3201)).not.toThrow();
+  });
+
+  it('偏差 > 1 元 → 抛 PriceChangedError（code=PRICE_CHANGED）', () => {
+    // 典型：套餐机票展示 547，实扣 ~3200。
+    expect(() => assertDisplayedTotalMatches(3200, 547)).toThrow(PriceChangedError);
+    try {
+      assertDisplayedTotalMatches(3200, 547);
+    } catch (e) {
+      expect((e as PriceChangedError).code).toBe('PRICE_CHANGED');
+      expect((e as PriceChangedError).statusCode).toBe(400);
+    }
+    expect(() => assertDisplayedTotalMatches(3200, 3202)).toThrow(PriceChangedError); // 差 2 元即拒
+  });
+
+  it('不传 expectedTotalCny（undefined/null）→ 跳过比对，不抛（admin/批量路径不受影响）', () => {
+    expect(() => assertDisplayedTotalMatches(3200, undefined)).not.toThrow();
+    expect(() => assertDisplayedTotalMatches(3200, null)).not.toThrow();
   });
 });
 

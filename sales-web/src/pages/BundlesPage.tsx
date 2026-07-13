@@ -71,6 +71,8 @@ interface BundleView extends MockBundle {
   childSeatDiscount: number | null;
   /** 不占座婴儿每人机票价（CNY）；null = 不收婴儿价 */
   infantPrice: number | null;
+  /** 每人操作服务费（CNY，DB 默认 ¥20，按占座人数收）；缺省按 ¥20 兜底——后端一定会收 */
+  operationFee: number;
   legs: number;
   // capacity/maxAdults/maxChildren 用于镜像后端 roomsNeeded（房间数按房型能住几大几小算）。
   hotelRoomType: {
@@ -112,6 +114,8 @@ function bundleApiToView(b: ApiBundle): BundleView {
     childSeatDiscount:
       b.childSeatDiscountCnyPerPerson != null ? Number(b.childSeatDiscountCnyPerPerson) : null,
     infantPrice: b.infantPriceCny != null ? Number(b.infantPriceCny) : null,
+    // 操作服务费：老缓存缺字段时按 DB 默认 ¥20 兜底（后端一定按占座人数收，展示价须计入以对齐实收）。
+    operationFee: b.operationFeeCny != null ? Number(b.operationFeeCny) : 20,
     legs: b.legs != null ? Number(b.legs) : 2,
     hotelRoomType: b.hotelRoomType ?? null,
     hotelRoomTypeId: b.hotelRoomTypeId ?? null,
@@ -673,6 +677,10 @@ function ConfigurableBundleCard({
   // 占座模型报价（镜像后端 flight 公式）：占座儿童每人减 childDiscount；不占座婴儿每人收 infantPrice。
   const childDiscount = b.childSeatDiscount ?? 0;
   const infantPrice = b.infantPrice ?? 0;
+  // 操作服务费（server-priced；镜像后端 computeBundleOperationFeeTotal：每人 × 占座人数 seatPax，婴儿不收）。
+  // 修复前卡片漏计此项 → 展示价比实收低一份操作费；补上以对齐下单权威价（避免 expectedTotalCny 误伤）。
+  const operationFee = b.operationFee;
+  const operationFeeTotal = operationFee * seatPax;
   const childDiscountTotal = childCount * childDiscount;
   const infantPriceTotal = infantCount * infantPrice;
   // ── add-on 加价（镜像后端：单人入住/独住 = singleCount×supp×nights；升舱 = businessCount×upg×legs）──
@@ -711,26 +719,40 @@ function ConfigurableBundleCard({
       };
     }
     if (item.kind === 'VISA') {
-      return { ...item, computedTotal: item.unitPrice * item.qty, label: item.productName };
+      // 签证按办签人数收（S2）：办签人数 = 出行总人数 headCount（成人+儿童+婴儿，都需签证）。
+      // 前台无「自备签」选择 → 自备签 = 0，办签人数 = headCount。与后端 groundTotal VISA 分支恒等。
+      return { ...item, computedTotal: item.unitPrice * headCount, label: item.productName };
     }
-    // TRANSFER — 固定价（按趟不按人头）
+    // TRANSFER — 固定价（按趟不按人头，不随人数缩放）
     return { ...item, computedTotal: item.unitPrice * item.qty, label: item.productName };
   });
 
-  const flightTotal = itemRows.filter((r) => r.kind === 'FLIGHT').reduce((s, r) => s + r.computedTotal, 0);
-  // 套餐 add-on 净额（镜像后端 computeBundleAddOn：升级加价 + 婴儿价 − 儿童折扣，向上夹到 0）。
-  // 单人入住 / 升舱是正向加价，儿童折扣负向，婴儿价正向；夹 0 避免套餐行出现负总额。
-  const addOnTotal = Math.max(0, singleAddOn + businessAddOn + infantPriceTotal - childDiscountTotal);
-  // 展示用拆分：酒店并入单人入住加价，其他并入升舱（仅供 UI 拆条，total 以 addOnTotal 为准）。
+  // 机票块（S1）：套餐内嵌 FLIGHT 行 → 沿用其行价（已是 pricePerPerson×seatPax）；未内嵌但去/回航段已解析
+  //   → 按 pricePerPerson×seatPax 派生（与 CheckoutPage 下单拆腿口径恒等：outLeg/retLeg 各拆一条经济舱腿）。
+  //   不补 → flightTotal 恒 0，卡片机票显示 ¥0 但下单实扣真实机票价（展示 ~547 / 实扣 ~3200）。
+  const hasEmbeddedFlight = itemRows.some((r) => r.kind === 'FLIGHT');
+  const flightTotal = hasEmbeddedFlight
+    ? itemRows.filter((r) => r.kind === 'FLIGHT').reduce((s, r) => s + r.computedTotal, 0)
+    : outLeg && retLeg
+      ? pricePerPerson * seatPax
+      : 0;
   const hotelTotal = itemRows.filter((r) => r.kind === 'HOTEL').reduce((s, r) => s + r.computedTotal, 0);
   const otherTotal =
     itemRows.filter((r) => r.kind !== 'FLIGHT' && r.kind !== 'HOTEL').reduce((s, r) => s + r.computedTotal, 0);
-  // 地面总价（套餐固定份数）；listTotal 用于展示原价（划线价）。
-  const groundTotal = hotelTotal + otherTotal;
-  const listTotal = flightTotal + groundTotal + addOnTotal;
-  // 整单 percent off：套餐总价 = 全包价（机票+酒店+其他+加项）× (1 − discountPct/100)。
+  // 加项净额（不预夹 0；镜像后端 computeBundleAddOn.total：升级 + 婴儿价 − 儿童折扣，前台无自备签）。
+  //   非负夹逼下沉到「地面 + 加项 + 操作费」整体层 → 儿童折扣可正常抵扣地面价（与后端 BUNDLE 行口径一致）。
+  const addOnNet = singleAddOn + businessAddOn + infantPriceTotal - childDiscountTotal;
+  // 「升级/差价」概览值（仅价格构成提示行用，非负）；儿童折扣等明细另按逐条行展示。
+  const addOnTotal = Math.max(0, addOnNet);
+  // 套餐行（镜像后端 createOrder BUNDLE 行金额）：max(0, round(地面) + 加项净额 + 操作费)。
+  const bundleRow = Math.max(0, Math.round(hotelTotal + otherTotal) + addOnNet + operationFeeTotal);
   const pct = b.discountPct ?? 0;
-  const total = Math.round(listTotal * (1 - pct / 100));
+  const factor = (100 - pct) / 100;
+  // 划线原价（未打折全包价，展示用）。
+  const listTotal = flightTotal + bundleRow;
+  // 权威总价：逐块取整（机票块 + 套餐行各自 round 后相加），与后端「FLIGHT 腿 + BUNDLE 行逐行 round」
+  //   总价偏差 ≤1 元（不触发下单 expectedTotalCny 兜底拒单）。
+  const total = Math.round(flightTotal * factor) + Math.round(bundleRow * factor);
   const perPerson = headCount > 0 ? Math.round(total / headCount) : total;
 
   // 售罄拦截：去/回任一航段或酒店售罄 → 禁止加购
@@ -952,6 +974,23 @@ function ConfigurableBundleCard({
 
       {/* 明细 */}
       <div className="mt-4 space-y-1.5">
+        {/* S1：套餐未内嵌 FLIGHT 行时，用实时解析的去/回航段派生一条机票明细（与下单拆腿口径恒等），
+            避免机票展示 ¥0；内嵌 FLIGHT 行的套餐则由下方 itemRows 正常展示。 */}
+        {!hasEmbeddedFlight && outLeg && retLeg && (
+          <div className="flex items-center justify-between text-xs">
+            <div className="flex items-center gap-2 min-w-0">
+              <span className={`rounded px-1.5 py-0.5 font-medium ${KIND_LABEL.FLIGHT.color}`}>
+                {KIND_LABEL.FLIGHT.label}
+              </span>
+              <span className="text-slate-700 truncate">
+                来回{isBiz ? '商务' : '经济'}舱 · {formatOccupancy(adultCount, childCount, infantCount)}
+              </span>
+            </div>
+            <span className="text-slate-600 tabular-nums whitespace-nowrap">
+              ¥{(pricePerPerson * seatPax).toLocaleString()}
+            </span>
+          </div>
+        )}
         {itemRows.map((r, idx) => (
           <div key={idx} className="flex items-center justify-between text-xs">
             <div className="flex items-center gap-2 min-w-0">
@@ -1003,6 +1042,16 @@ function ConfigurableBundleCard({
               <span className="text-slate-700 truncate">升级商务舱 ×{businessCount}</span>
             </div>
             <span className="text-slate-600 tabular-nums whitespace-nowrap">+¥{businessAddOn.toLocaleString()}</span>
+          </div>
+        )}
+        {/* 操作服务费明细行（按占座人数收，与后端一致；补上以让明细行加总 == 展示总价）。 */}
+        {operationFeeTotal > 0 && (
+          <div className="flex items-center justify-between text-xs">
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="rounded bg-slate-200 px-1.5 py-0.5 font-medium text-slate-700">服务</span>
+              <span className="text-slate-700 truncate">操作服务费 ×{seatPax} · 每人 ¥{operationFee.toLocaleString()}</span>
+            </div>
+            <span className="text-slate-600 tabular-nums whitespace-nowrap">+¥{operationFeeTotal.toLocaleString()}</span>
           </div>
         )}
       </div>
@@ -1086,6 +1135,7 @@ function ConfigurableBundleCard({
           <span>
             机票 ¥{flightTotal.toLocaleString()} + 酒店 ¥{hotelTotal.toLocaleString()} + 其他 ¥{otherTotal.toLocaleString()}
             {addOnTotal > 0 && ` + 升级/差价 ¥${addOnTotal.toLocaleString()}`}
+            {operationFeeTotal > 0 && ` + 服务费 ¥${operationFeeTotal.toLocaleString()}`}
             {pct > 0 && ` − 已省 ${pct}%`}
           </span>
         </div>

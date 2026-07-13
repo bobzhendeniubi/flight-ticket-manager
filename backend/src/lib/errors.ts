@@ -34,6 +34,18 @@ export class DuplicatePassengerError extends AppError {
   }
 }
 
+/**
+ * 前台展示价与服务端权威商品价不一致（下单前的价格漂移兜底）。
+ * 稳定 code=PRICE_CHANGED，前端据此提示「价格已更新，请刷新页面后重新下单」（不靠中文文案匹配），
+ * 绝不静默按新价多收 —— 见 createOrder 里 expectedTotalCny 比对。
+ */
+export class PriceChangedError extends AppError {
+  constructor(message = '价格已更新，请刷新页面后重新下单', details?: unknown) {
+    super(message, { statusCode: 400, code: 'PRICE_CHANGED', details });
+    this.name = 'PriceChangedError';
+  }
+}
+
 export class UnauthorizedError extends AppError {
   constructor(message = 'Unauthorized') {
     super(message, { statusCode: 401, code: 'UNAUTHORIZED' });

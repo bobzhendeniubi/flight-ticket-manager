@@ -588,6 +588,11 @@ export interface CreateOrderInput {
   }>;
   notes?: string;
   idempotencyKey?: string;
+  /**
+   * 前台展示总价（正整数 CNY）。提交时带上「用户在结算页看到的合计」，后端权威商品价与之偏差 > 1 元
+   * → 回 PRICE_CHANGED（前台提示刷新重下），防止展示价与实收价背离时静默多收。仅前台散客结账带。
+   */
+  expectedTotalCny?: number;
 }
 
 // ── Products ─────────────────────────────────────────────────────────────

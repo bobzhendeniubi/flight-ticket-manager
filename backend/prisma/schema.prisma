@@ -708,6 +708,20 @@ model Transfer {
   orderItems OrderItem[]
 }
 
+// 签证签发方式（产品结构化分类，替代靠产品名正则猜测）
+enum VisaIssuanceMethod {
+  E_VISA // 电子签
+  STICKER // 贴纸签
+  ARRIVAL // 落地签
+  OTHER
+}
+
+// 签证入境次数
+enum VisaEntryType {
+  SINGLE // 单次
+  MULTIPLE // 多次
+}
+
 model Visa {
   id                 String   @id @default(cuid())
   // 产品编号（V0001、V0002...）
@@ -716,6 +730,10 @@ model Visa {
   country            String? // 中文国名（"越南"）
   visaType           String // e.g., "tourist", "business"
   visaName           String? // 完整签证名称（"电子签证 E-visa · 30 天单次"）
+  // 签发方式（电子签/贴纸签/落地签/其他）；未设置 = null，签证台徽章按此展示，缺失时回退旧的产品名正则猜测
+  issuanceMethod     VisaIssuanceMethod?
+  // 入境次数（单次/多次）；未设置 = null
+  entryType          VisaEntryType?
   flag               String? // emoji flag
   photo              String? // 卡片展示图（URL）
   processingDays     Int

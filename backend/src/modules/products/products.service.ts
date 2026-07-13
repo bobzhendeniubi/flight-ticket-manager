@@ -509,6 +509,9 @@ export class ProductsService {
     if (body.visaType !== undefined) data.visaType = body.visaType;
     if (body.visaName !== undefined) data.visaName = body.visaName;
     if (body.flag !== undefined) data.flag = body.flag;
+    // 签发方式 / 入境次数：省略 = 不改；显式 null = 清空为未设置；枚举值 = 覆盖（同 costPriceCny 约定）。
+    if (body.issuanceMethod !== undefined) data.issuanceMethod = body.issuanceMethod;
+    if (body.entryType !== undefined) data.entryType = body.entryType;
     if (body.processingDays !== undefined) data.processingDays = body.processingDays;
     if (body.basePrice !== undefined) data.basePrice = new Prisma.Decimal(body.basePrice);
     if (body.expressSurcharge !== undefined) data.expressSurcharge = new Prisma.Decimal(body.expressSurcharge);
@@ -877,6 +880,17 @@ function serializeBundle(
 ) {
   const { hotelRoomType, outboundFlight, returnFlight, ...rest } = b;
   const bItems = Array.isArray(b.items) ? (b.items as Array<{ kind: string; qty: number; unitPrice: number }>) : [];
+  // 机票参考价缺失（无可估来回经济舱班次）→ 原价/起价里机票项静默按 0 计（见 bundle-pricing
+  //   computeBundleOriginalAllInCny / computeBundleOriginalPerPaxCny）。纯函数拿不到 logger 也没有 bundleId
+  //   上下文，故在此调用方按仓库惯例（console.warn '[products]'）留痕，带 bundleId/绑定航班，便于排查
+  //   「套餐起价缺机票」这类静默降级（不阻断序列化，只是可观测）。
+  if (flightRefRoundTripCny == null) {
+    console.warn('[products] bundle flight reference price unavailable → flight priced as 0 in original/per-pax', {
+      bundleId: b.id,
+      outboundFlightId: b.outboundFlightId ?? null,
+      returnFlightId: b.returnFlightId ?? null,
+    });
+  }
   // 原价（含当前最低来回机票）：后台「想卖的价格」录入据此反推 discountPct + 展示「原价划线/省X%」。
   // 估算锚点，不参与买家实际计价（买家价 = 实时全包 ×(1 − discountPct/100)）。公式/口径未变。
   const originalAllInCny = computeBundleOriginalAllInCny(bItems, b.flightPax, flightRefRoundTripCny);
