@@ -14,6 +14,7 @@ import { OrderFinanceSection } from '../components/OrderFinanceSection';
 import { SingleOrderModal } from '../components/SingleOrderModal';
 import { RoomingEditor, type RoomingPassenger } from '../components/RoomingEditor';
 import { HotelSwapModal } from '../components/HotelSwapModal';
+import { SearchSelect, type SearchSelectOption } from '../components/SearchSelect';
 import type { RoomGroup } from '../lib/api';
 
 // 本地可视化用的状态子集（后端 OrderStatus 更全，这里只列出常用 7 个做 filter）
@@ -3650,7 +3651,8 @@ function NotesSection({ order }: { order: OrderSummary }) {
   const tokens = useAuth((s) => s.tokens);
   const [customerNotes, setCustomerNotes] = useState(order.notes ?? '');
   const [internalNotes, setInternalNotes] = useState(order.internalNotes ?? '');
-  const [visaStatus, setVisaStatus] = useState<VisaStatusInput>(order.visaStatus ?? 'NEEDED');
+  // 订单 visaStatus 为 null = 未设置/不需要，初值不得回落成 NEEDED（否则顺手保存会把 null 静默升级成"需要"）。
+  const [visaStatus, setVisaStatus] = useState<VisaStatusInput>(order.visaStatus ?? 'NOT_NEEDED');
   const [structured, setStructured] = useState({
     noteHotel: order.noteHotel ?? '',
     noteVisa: order.noteVisa ?? '',
@@ -3663,7 +3665,7 @@ function NotesSection({ order }: { order: OrderSummary }) {
   const dirty =
     customerNotes !== (order.notes ?? '') ||
     internalNotes !== (order.internalNotes ?? '') ||
-    visaStatus !== (order.visaStatus ?? 'NEEDED') ||
+    visaStatus !== (order.visaStatus ?? 'NOT_NEEDED') ||
     structured.noteHotel !== (order.noteHotel ?? '') ||
     structured.noteVisa !== (order.noteVisa ?? '') ||
     structured.notePayment !== (order.notePayment ?? '') ||
@@ -3951,7 +3953,8 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   const [returnScheduleId, setReturnScheduleId] = useState('');
   const [returnDate, setReturnDate] = useState('');
 
-  const [cabin, setCabin] = useState<CabinClass | ''>('');
+  // 默认经济舱（③拍板）：弹窗打开与 OTA 导入均默认经济舱，用户可手动改（含商务舱）。
+  const [cabin, setCabin] = useState<CabinClass | ''>('ECONOMY');
 
   // ── 套餐 ──────────────────────────────────────────────────────────────────
   const [bundles, setBundles] = useState<Bundle[]>([]);
@@ -4099,6 +4102,17 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   }, [outboundSchedules, pendingSchedDate, outboundScheduleId]);
   const cabinOptions = outboundSchedule?.seatClasses ?? [];
   const selectedBundle = bundles.find((b) => b.id === bundleId);
+  // 套餐搜索下拉（W3）：套餐多时原生 select 找不到，换 SearchSelect 按名称/编号搜索；
+  // priceLabel 用折后起价/人 = originalPerPaxCny ×(1−discountPct/100)，与套餐页卡片口径一致。
+  const bundleOptions: SearchSelectOption[] = useMemo(
+    () =>
+      bundles.map((b) => ({
+        id: b.id,
+        label: `${b.code ? `[${b.code}] ` : ''}${b.name}`,
+        priceLabel: String(Math.round((b.originalPerPaxCny ?? 0) * (1 - (b.discountPct ?? 0) / 100))),
+      })),
+    [bundles],
+  );
 
   const validRows = rows.filter((r) => r.fullName.trim() && r.documentNumber.trim() && parseDob(r.dateOfBirth));
 
@@ -4161,7 +4175,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
       if (match) {
         setOutboundFlightId(match.id);
         setOutboundScheduleId('');
-        setCabin('');
+        setCabin('ECONOMY'); // 舱位默认经济舱（③拍板），OTA 未解析出舱位时兜底，用户可手动改
         if (f.departDate) {
           setOutboundDate(f.departDate);
           setPendingSchedDate(f.departDate); // 班次加载后由下方 effect 自动选中当日班次
@@ -4223,6 +4237,16 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   async function submit(): Promise<void> {
     setErr(null);
     if (validRows.length === 0) { setErr('至少要有一位完整乘客（姓名 + 护照号 + 出生日期）'); return; }
+
+    // 性别必填（业务拍板）：姓名/护照号/出生日期均已填的有效行不许缺性别，阻断提交并指明具体行号。
+    const missingGenderLines = rows
+      .map((r, idx) => ({ r, line: idx + 1 }))
+      .filter(({ r }) => r.fullName.trim() && r.documentNumber.trim() && parseDob(r.dateOfBirth) && !r.gender)
+      .map(({ line }) => line);
+    if (missingGenderLines.length > 0) {
+      setErr(`第 ${missingGenderLines.join('、')} 行乘客未选择性别，请补全后再提交`);
+      return;
+    }
 
     let description = '';
     if (productType === 'FLIGHT_ONEWAY') {
@@ -4617,18 +4641,13 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                 <div className="grid gap-3 md:grid-cols-2">
                   <label className="text-xs text-slate-500">
                     选择套餐
-                    <select
-                      className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                    <SearchSelect
+                      className="mt-1"
+                      options={bundleOptions}
                       value={bundleId}
-                      onChange={(e) => setBundleId(e.target.value)}
-                    >
-                      <option value="">选择套餐…</option>
-                      {bundles.map((b) => (
-                        <option key={b.id} value={b.id}>
-                          {b.code ? `[${b.code}] ` : ''}{b.name}
-                        </option>
-                      ))}
-                    </select>
+                      onChange={setBundleId}
+                      placeholder="搜索套餐：编号 / 名称…"
+                    />
                   </label>
                   <label className="text-xs text-slate-500">
                     入住晚数（选填）
@@ -4773,7 +4792,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                 placeholder={'QH9588 DAD-MFM 2026-08-15\n乘机人：WU/FEILAI\n性别：男\n出生年月：1983-09-20\n护照：EB9452866\n签发国：CN\n有效期：2028-01-02\n乘机人：WANG/LIQING\n...\n结算价1000元X10个。'}
               />
               <p className="mt-1 text-[11px] text-slate-400">
-                自动识别：首行航班/航段/日期 → 选中航班与当日班次（舱位仍请手动确认）；每位乘客姓名(LAST/FIRST)、性别、出生日期、护照号、签发国、有效期；结算价 → 预填 OTA 结算单价。解析问题会在下方提醒里逐条列出。
+                自动识别：首行航班/航段/日期 → 选中航班与当日班次（舱位默认经济舱，如商务舱请手动改选）；每位乘客姓名(LAST/FIRST)、性别、出生日期、护照号、签发国、有效期；结算价 → 预填 OTA 结算单价。解析问题会在下方提醒里逐条列出。
               </p>
             </div>
 
@@ -4826,34 +4845,41 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                 <span className="text-sm font-medium text-slate-700">乘客名单（每位一单 · 共 {validRows.length} 位有效）</span>
                 <button className="text-sm text-brand hover:text-brand-dark" onClick={addRow}>＋ 加一行</button>
               </div>
-              <div className="scrollbar-visible max-h-60 overflow-y-auto rounded-md border border-slate-200">
-                <table className="w-full text-sm">
+              <div className="scrollbar-visible max-h-60 overflow-x-auto overflow-y-auto rounded-md border border-slate-200">
+                <table className="min-w-[820px] w-full text-sm">
                   <thead className="sticky top-0 bg-slate-50 text-xs text-slate-500">
                     <tr>
-                      <th className="px-2 py-1.5 text-left font-normal">姓名</th>
-                      <th className="px-2 py-1.5 text-left font-normal">护照号</th>
-                      <th className="px-2 py-1.5 text-left font-normal">出生日期</th>
-                      <th className="px-2 py-1.5 text-left font-normal">备注（选填）</th>
-                      <th className="px-2 py-1.5"></th>
+                      <th className="min-w-[130px] whitespace-nowrap px-2 py-1.5 text-left font-normal">姓名</th>
+                      <th className="min-w-[120px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照号</th>
+                      <th className="min-w-[70px] whitespace-nowrap px-2 py-1.5 text-left font-normal">性别</th>
+                      <th className="min-w-[110px] whitespace-nowrap px-2 py-1.5 text-left font-normal">出生日期</th>
+                      <th className="min-w-[130px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照有效期</th>
+                      <th className="min-w-[130px] whitespace-nowrap px-2 py-1.5 text-left font-normal">备注（选填）</th>
+                      <th className="min-w-[36px] px-2 py-1.5"></th>
                     </tr>
                   </thead>
                   <tbody>
                     {rows.map((r, i) => (
                       <tr key={i} className="border-t border-slate-100">
-                        <td className="px-2 py-1">
+                        <td className="px-2 py-1 align-top">
                           <input className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm" value={r.fullName} onChange={(e) => setRow(i, { fullName: e.target.value })} />
-                          {(r.gender || r.passportIssueCountry || r.passportExpiry) && (
-                            <span className="mt-0.5 block text-[10px] text-slate-400">
-                              {[
-                                r.gender === 'M' ? '男' : r.gender === 'F' ? '女' : null,
-                                r.passportIssueCountry ? `签发国 ${r.passportIssueCountry}` : null,
-                                r.passportExpiry ? `有效期 ${r.passportExpiry}` : null,
-                              ].filter(Boolean).join(' · ')}
-                            </span>
+                          {r.passportIssueCountry && (
+                            <span className="mt-0.5 block text-[10px] text-slate-400">签发国 {r.passportIssueCountry}</span>
                           )}
                         </td>
-                        <td className="px-2 py-1">
+                        <td className="px-2 py-1 align-top">
                           <input className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm" value={r.documentNumber} onChange={(e) => setRow(i, { documentNumber: e.target.value })} />
+                        </td>
+                        <td className="px-2 py-1 align-top">
+                          <select
+                            className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm"
+                            value={r.gender ?? ''}
+                            onChange={(e) => setRow(i, { gender: (e.target.value || undefined) as 'M' | 'F' | undefined })}
+                          >
+                            <option value="">未选</option>
+                            <option value="M">男</option>
+                            <option value="F">女</option>
+                          </select>
                         </td>
                         <td className="px-2 py-1 align-top">
                           {(() => {
@@ -4875,7 +4901,15 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                             );
                           })()}
                         </td>
-                        <td className="px-2 py-1">
+                        <td className="px-2 py-1 align-top">
+                          <input
+                            type="date"
+                            className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm"
+                            value={r.passportExpiry ?? ''}
+                            onChange={(e) => setRow(i, { passportExpiry: e.target.value || undefined })}
+                          />
+                        </td>
+                        <td className="px-2 py-1 align-top">
                           <input
                             className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm"
                             placeholder="靠窗 / 素食 / 换人…"
@@ -4883,7 +4917,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                             onChange={(e) => setRow(i, { note: e.target.value })}
                           />
                         </td>
-                        <td className="px-2 py-1 text-right">
+                        <td className="px-2 py-1 text-right align-top">
                           <button className="text-xs text-slate-400 hover:text-rose-600" onClick={() => removeRow(i)} disabled={rows.length <= 1}>删</button>
                         </td>
                       </tr>

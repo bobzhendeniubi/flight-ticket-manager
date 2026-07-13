@@ -3172,6 +3172,17 @@ export const hotelControlOpsApi = {
     return res.blob();
   },
 
+  /** 按姓名批量导出护照 zip：不限酒店/入住日期，直接按乘客姓名列表打包命中客人的护照图；ADMIN/STAFF only。 */
+  downloadHotelPassportsByNamesZip: async (token: string, names: string[]): Promise<Blob> => {
+    const res = await fetch(`${API_BASE}/hotel-control/passports-by-names.zip`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ names }),
+    });
+    if (!res.ok) throw new ApiError(res.status, { code: 'ZIP_FAILED', message: await res.text() });
+    return res.blob();
+  },
+
   /** 占房下钻：某酒店某晚是谁占的（销控矩阵余量格点击用）。 */
   getHotelOccupants: (token: string, params: { hotelId: string; date: string }) =>
     apiFetch<{ occupants: HotelOccupant[] }>(

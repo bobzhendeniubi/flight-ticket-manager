@@ -19,9 +19,12 @@ vi.mock('../../db/prisma.js', () => ({ prisma: {} }));
 import type { PrismaClient } from '@prisma/client';
 import {
   buildHotelPassportsZip,
+  buildPassportsByNamesZip,
   collectHotelPassportGroups,
+  collectPassportGroupsByNames,
   hasAnyPassportPhoto,
   type HotelPassportSelection,
+  type HotelPassportsByNamesSelection,
 } from './hotel-control.passports.js';
 
 const D = (s: string): Date => new Date(`${s}T00:00:00.000Z`);
@@ -215,5 +218,151 @@ describe('buildHotelPassportsZip — zip 结构', () => {
     expect(readme).toContain('下载失败');
 
     fetchSpy.mockRestore();
+  });
+});
+
+// ── 按姓名批量导出 ──────────────────────────────────────────────────────
+
+function fakePassengerClient(passengers: unknown[]): PrismaClient {
+  return {
+    passenger: { findMany: vi.fn().mockResolvedValue(passengers) },
+  } as unknown as PrismaClient;
+}
+
+/** 造一条命中乘客（带 order），只填测试关心的字段。*/
+function makePassenger(opts: {
+  id: string;
+  orderId: string;
+  orderNumber: string;
+  fullName?: string;
+  lastName?: string | null;
+  firstName?: string | null;
+  chineseName?: string | null;
+  documentNumber: string;
+  passportPhotoUrl?: string | null;
+}) {
+  return {
+    id: opts.id,
+    fullName: opts.fullName ?? 'ZHANG SAN',
+    lastName: opts.lastName ?? null,
+    firstName: opts.firstName ?? null,
+    chineseName: opts.chineseName ?? null,
+    documentNumber: opts.documentNumber,
+    passportPhotoUrl: opts.passportPhotoUrl ?? null,
+    order: { id: opts.orderId, orderNumber: opts.orderNumber },
+  };
+}
+
+describe('collectPassportGroupsByNames — 取数过滤', () => {
+  it('where 命中：排除取消/软删；姓名去重后各自构造 OR（fullName 不敏感 + chineseName 精确）', async () => {
+    const client = fakePassengerClient([]);
+    await collectPassportGroupsByNames(['张三', ' ZHANG SAN '], client);
+    const findMany = client.passenger.findMany as unknown as ReturnType<typeof vi.fn>;
+    const where = findMany.mock.calls[0][0].where;
+
+    expect(where.order.deletedAt).toBeNull();
+    expect(where.order.status.in).toContain('PAID');
+    expect(where.order.status.in).not.toContain('CANCELLED');
+    expect(where.OR).toHaveLength(2);
+    expect(where.OR[1].OR).toEqual([
+      { fullName: { equals: 'ZHANG SAN', mode: 'insensitive' } },
+      { chineseName: 'ZHANG SAN' },
+    ]);
+  });
+
+  it('姓名去重去空白：重复/纯空白项只查一次', async () => {
+    const client = fakePassengerClient([]);
+    await collectPassportGroupsByNames(['张三', '张三', '  ', ' 张三 '], client);
+    const findMany = client.passenger.findMany as unknown as ReturnType<typeof vi.fn>;
+    const where = findMany.mock.calls[0][0].where;
+    expect(where.OR).toHaveLength(1);
+  });
+
+  it('全部为空白 → 不查库，直接返回空结果', async () => {
+    const client = fakePassengerClient([]);
+    const sel = await collectPassportGroupsByNames(['  ', ''], client);
+    const findMany = client.passenger.findMany as unknown as ReturnType<typeof vi.fn>;
+    expect(findMany).not.toHaveBeenCalled();
+    expect(sel).toEqual({ groups: [], notFoundNames: [] });
+  });
+
+  it('fullName 大小写不敏感命中 + chineseName 精确 trim 命中', async () => {
+    const client = fakePassengerClient([
+      makePassenger({ id: 'p1', orderId: 'o1', orderNumber: 'FTM2026080100001', fullName: 'zhang san', documentNumber: 'E1' }),
+      makePassenger({ id: 'p2', orderId: 'o2', orderNumber: 'FTM2026080100002', fullName: 'LI SI', chineseName: '李四', documentNumber: 'E2' }),
+    ]);
+    const sel = await collectPassportGroupsByNames(['ZHANG SAN', '李四'], client);
+    expect(sel.notFoundNames).toEqual([]);
+    expect(sel.groups).toHaveLength(2);
+    expect(sel.groups.map((g) => g.orderNumber).sort()).toEqual([
+      'FTM2026080100001',
+      'FTM2026080100002',
+    ]);
+  });
+
+  it('未命中的姓名单独列出（保持输入顺序，去重）', async () => {
+    const client = fakePassengerClient([
+      makePassenger({ id: 'p1', orderId: 'o1', orderNumber: 'FTM2026080100001', fullName: 'ZHANG SAN', documentNumber: 'E1' }),
+    ]);
+    const sel = await collectPassportGroupsByNames(['张三', '李四', '王五'], client);
+    expect(sel.notFoundNames).toEqual(['张三', '李四', '王五']);
+  });
+
+  it('同名同证件号跨订单命中多单：全部打包，按订单分组（现有结构天然消歧）', async () => {
+    const client = fakePassengerClient([
+      makePassenger({ id: 'p1', orderId: 'o1', orderNumber: 'FTM2026080100001', fullName: 'ZHANG SAN', documentNumber: 'E1' }),
+      makePassenger({ id: 'p2', orderId: 'o2', orderNumber: 'FTM2026080100002', fullName: 'ZHANG SAN', documentNumber: 'E1' }),
+    ]);
+    const sel = await collectPassportGroupsByNames(['ZHANG SAN'], client);
+    expect(sel.notFoundNames).toEqual([]);
+    expect(sel.groups).toHaveLength(2);
+    expect(sel.groups.map((g) => g.orderNumber).sort()).toEqual([
+      'FTM2026080100001',
+      'FTM2026080100002',
+    ]);
+  });
+});
+
+describe('buildPassportsByNamesZip — zip 结构', () => {
+  it('结构与按酒店导出一致；README 额外追加未命中姓名段落', async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response(new Uint8Array([1, 2, 3]), { status: 200 }));
+
+    const selection: HotelPassportsByNamesSelection = {
+      groups: [
+        {
+          orderNumber: 'FTM2026080100001',
+          passengers: [
+            { id: 'p1', fullName: 'ZHANG SAN', lastName: 'ZHANG', firstName: 'SAN', documentNumber: 'E1', passportPhotoUrl: 'https://x/a.jpg' },
+          ],
+        },
+      ],
+      notFoundNames: ['李四', '王五'],
+    };
+
+    const { buf, photoCount } = await buildPassportsByNamesZip(selection);
+
+    expect(photoCount).toBe(1);
+    const paths = await zipPaths(buf);
+    expect(paths).toContain('FTM2026080100001/ZHANG_E1.jpg');
+    expect(paths).toContain('README.txt');
+
+    const readme = await readText(buf, 'README.txt');
+    expect(readme).toContain('以下姓名未找到任何客人');
+    expect(readme).toContain('李四');
+    expect(readme).toContain('王五');
+
+    fetchSpy.mockRestore();
+  });
+
+  it('无未命中姓名时不追加该段落', async () => {
+    const selection: HotelPassportsByNamesSelection = {
+      groups: [],
+      notFoundNames: [],
+    };
+    const { buf } = await buildPassportsByNamesZip(selection);
+    const readme = await readText(buf, 'README.txt');
+    expect(readme).not.toContain('未找到任何客人');
   });
 });

@@ -40,6 +40,7 @@ import {
 import { useAuth } from '../stores/auth';
 import { NumberInput } from './NumberInput';
 import { RoomingEditor, type RoomingPassenger } from './RoomingEditor';
+import { SearchSelect, type SearchSelectOption } from './SearchSelect';
 import { type OcrResult } from '../lib/passportOcr';
 import { formatLocalTime } from '../lib/airports';
 
@@ -68,6 +69,17 @@ const PASSENGERS_REQUIRED: Record<ProductKind, boolean> = {
   VISA: true,
   HOTEL: false,
   TRANSFER: false,
+};
+
+// 签证状态默认值按产品类型派生（反馈：单机票/纯酒店/纯接送不可能需要签证台跟进）：
+// 签证 / 套餐本身涉及签证 → 默认「需要」；机票 / 酒店 / 接送 → 默认「不需要」。
+// 仅作为「未手动改过」时的跟随默认值，见 visaStatusTouchedRef。
+const DEFAULT_VISA_STATUS: Record<ProductKind, VisaStatusInput> = {
+  FLIGHT: 'NOT_NEEDED',
+  HOTEL: 'NOT_NEEDED',
+  TRANSFER: 'NOT_NEEDED',
+  BUNDLE: 'NEEDED',
+  VISA: 'NEEDED',
 };
 
 // 护照图上限（一单）：每张存库 base64 约 0.7–1MB，后端单次请求上限 25MB，留足余量取 20。
@@ -244,7 +256,10 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
 
   const [notes, setNotes] = useState('');
   // 签证状态 + 结构化备注（酒店/签证/付款/特殊要求）
-  const [visaStatus, setVisaStatus] = useState<VisaStatusInput>('NEEDED');
+  // 默认值按当前产品类型派生（见 DEFAULT_VISA_STATUS）；用户手动改过下拉后，
+  // 由 visaStatusTouchedRef 记住，kind 再切换也不会覆盖用户的手动选择。
+  const [visaStatus, setVisaStatus] = useState<VisaStatusInput>(() => DEFAULT_VISA_STATUS[kind]);
+  const visaStatusTouchedRef = useRef(false);
   const [noteHotel, setNoteHotel] = useState('');
   const [noteVisa, setNoteVisa] = useState('');
   const [notePayment, setNotePayment] = useState('');
@@ -348,6 +363,15 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const [transferId, setTransferId] = useState('');
   const [transferDate, setTransferDate] = useState('');
   const [transferQty, setTransferQty] = useState<number | null>(1);
+
+  // 切换产品类型时，若用户没手动改过签证状态下拉，自动跟随新 kind 的默认值
+  // （如从「套餐」切到「机票」，未手动改过则从「需要」自动回落到「不需要」）；
+  // 一旦用户手动改过下拉，touched 记住这次选择，后续再切 kind 也不会覆盖。
+  // 「客人自备签证」勾选联动（见下方 selfProvidedVisa）不发生 kind 切换，不受此 effect 影响。
+  useEffect(() => {
+    if (visaStatusTouchedRef.current) return;
+    setVisaStatus(DEFAULT_VISA_STATUS[kind]);
+  }, [kind]);
 
   // 代理列表（ADMIN/STAFF/AGENT 都能拉自己可见的代理；用于归属选择）
   useEffect(() => {
@@ -467,6 +491,19 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const visa = visas.find((v) => v.id === visaId);
   const bundle = bundles.find((b) => b.id === bundleId);
   const transfer = transfers.find((t) => t.id === transferId);
+
+  // 套餐 SearchSelect 选项：label 有编号时带 `[code] name`，方便按编号搜；
+  // priceLabel 用折后起价/人 = originalPerPaxCny ×(1−discountPct/100)，与套餐页卡片「¥X 起/人」
+  // 口径一致（原价 originalPerPaxCny 本身不是「起价」，起价已经折过）。
+  const bundleSelectOptions: SearchSelectOption[] = useMemo(
+    () =>
+      bundles.map((b) => ({
+        id: b.id,
+        label: b.code ? `[${b.code}] ${b.name}` : b.name,
+        priceLabel: String(Math.round((b.originalPerPaxCny ?? 0) * (1 - (b.discountPct ?? 0) / 100))),
+      })),
+    [bundles],
+  );
 
   // 套餐是否往返（legs≥2）：决定要不要派生回程航段。
   const bundleIsRoundTrip = (bundle?.legs ?? 2) >= 2;
@@ -1018,6 +1055,16 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       return;
     }
 
+    // 性别必填（业务口径）：任何已填姓名+护照号的出行人行，性别必须是 M/F 才能提交
+    // （X/未选都算未定性别，阻断提交；仅前端校验，不改后端 schema）。
+    const genderMissingRows = passengers
+      .map((p, idx) => ({ ...p, rowNumber: idx + 1 }))
+      .filter((p) => p.fullName.trim() && p.documentNumber.trim() && p.gender !== 'M' && p.gender !== 'F');
+    if (genderMissingRows.length > 0) {
+      setErr(`第 ${genderMissingRows.map((p) => p.rowNumber).join('、')} 位出行人未选择性别，请完善后再提交`);
+      return;
+    }
+
     if (adjustError) {
       setErr(adjustError);
       return;
@@ -1510,12 +1557,13 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                 <div className="grid gap-3 md:grid-cols-2">
                   <label className="text-xs text-slate-500 md:col-span-2">
                     套餐
-                    <select className={inputCls} value={bundleId} onChange={(e) => setBundleId(e.target.value)}>
-                      <option value="">选择套餐…</option>
-                      {bundles.map((b) => (
-                        <option key={b.id} value={b.id}>{b.name}</option>
-                      ))}
-                    </select>
+                    <SearchSelect
+                      className="mt-1"
+                      options={bundleSelectOptions}
+                      value={bundleId || null}
+                      onChange={setBundleId}
+                      placeholder="搜索套餐（编号 / 名称）…"
+                    />
                   </label>
                   <label className="text-xs text-slate-500">
                     出发日期
@@ -1754,7 +1802,10 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                   <select
                     className={inputCls}
                     value={visaStatus}
-                    onChange={(e) => setVisaStatus(e.target.value as VisaStatusInput)}
+                    onChange={(e) => {
+                      visaStatusTouchedRef.current = true;
+                      setVisaStatus(e.target.value as VisaStatusInput);
+                    }}
                   >
                     {(Object.keys(VISA_STATUS_LABEL) as VisaStatusInput[]).map((v) => (
                       <option key={v} value={v}>{VISA_STATUS_LABEL[v]}</option>
@@ -1778,7 +1829,9 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                   <input className={inputCls} value={noteSpecial} maxLength={300} onChange={(e) => setNoteSpecial(e.target.value)} />
                 </label>
               </div>
-              <p className="mt-2 text-[11px] text-slate-400">机票 / 套餐默认「需要」签证；不涉及签证可选「不需要」。</p>
+              <p className="mt-2 text-[11px] text-slate-400">
+                默认按产品类型：签证 / 套餐默认「需要」，机票 / 酒店 / 接送默认「不需要」；切换产品类型后若未手动改过本下拉会自动跟随新默认值，手动选过则不再自动改。
+              </p>
             </div>
 
             {/* 出行人 */}
@@ -1827,7 +1880,9 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                       <th className="min-w-[140px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照号</th>
                       <th className="min-w-[120px] whitespace-nowrap px-2 py-1.5 text-left font-normal">出生日期</th>
                       <th className="min-w-[140px] whitespace-nowrap px-2 py-1.5 text-left font-normal">中文姓名</th>
-                      <th className="min-w-[90px] whitespace-nowrap px-2 py-1.5 text-left font-normal">性别</th>
+                      <th className="min-w-[90px] whitespace-nowrap px-2 py-1.5 text-left font-normal">
+                        性别<span className="text-rose-500"> *</span>
+                      </th>
                       <th className="min-w-[120px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照签发日期</th>
                       <th className="min-w-[160px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照签发地点</th>
                       <th className="min-w-[120px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照有效期</th>

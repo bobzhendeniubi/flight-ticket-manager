@@ -46,6 +46,17 @@ function fmtCny(n: number | null | undefined): string {
   if (n == null || !Number.isFinite(n)) return '—';
   return `¥${n.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}`;
 }
+/** 按姓名批量导出：把textarea原始输入按 逗号/顿号/空格/换行 拆成姓名列表，trim + 去空 + 去重。 */
+function parseNamesInput(raw: string): string[] {
+  return Array.from(
+    new Set(
+      raw
+        .split(/[,，、\s]+/u)
+        .map((s) => s.trim())
+        .filter(Boolean),
+    ),
+  );
+}
 /**
  * 余量/余房单元格配色：
  *   block=0 且 used>0（该晚根本没配包房周期，remaining=0-used 是误导性负数）→ 琥珀色「未配包房」；
@@ -625,6 +636,32 @@ function BoardExport({ token, board }: { token: string; board: HotelControlBoard
 
   const passportRangeInvalid = passportFrom > passportTo;
 
+  // ── 导出护照（按姓名，不限酒店/日期）──
+  const [namesInput, setNamesInput] = useState<string>('');
+  const [namesExporting, setNamesExporting] = useState(false);
+  const parsedNames = useMemo(() => parseNamesInput(namesInput), [namesInput]);
+  const namesTooMany = parsedNames.length > 100;
+
+  async function handlePassportByNamesExport(): Promise<void> {
+    if (!token || parsedNames.length === 0 || namesTooMany) return;
+    setNamesExporting(true);
+    try {
+      const blob = await hotelControlOpsApi.downloadHotelPassportsByNamesZip(token, parsedNames);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `护照-按姓名-${parsedNames.length}人.zip`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (e: unknown) {
+      alert(e instanceof ApiError ? `导出失败：${e.message}` : '导出失败');
+    } finally {
+      setNamesExporting(false);
+    }
+  }
+
   return (
     <section className="card space-y-4">
       <div className="flex flex-wrap items-end justify-between gap-3">
@@ -717,6 +754,36 @@ function BoardExport({ token, board }: { token: string; board: HotelControlBoard
         {hotelOptions.length === 0 && (
           <div className="mt-2 text-xs text-ink-muted">当前查询范围内暂无酒店，调整上方销控板日期范围后再选。</div>
         )}
+      </div>
+
+      {/* 导出护照：按姓名批量导出（不限酒店/入住日期，直接按乘客姓名命中） */}
+      <div className="border-t border-slate-200 pt-4">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="min-w-[280px] flex-1">
+            <h2 className="text-sm font-semibold text-ink">导出护照（按姓名）</h2>
+            <p className="mt-1 text-xs text-ink-muted">
+              不限酒店/入住日期，直接按姓名列表打包命中客人的护照图（护照姓名不分大小写，或中文姓名精确匹配）；逗号/顿号/空格/换行分隔均可，一次最多 100 个姓名。
+            </p>
+            <textarea
+              className="input mt-2 w-full"
+              rows={3}
+              placeholder="张永亮，张永顺，孟令宝，陆敏"
+              value={namesInput}
+              onChange={(e) => setNamesInput(e.target.value)}
+            />
+            <div className={`mt-1 text-xs ${namesTooMany ? 'text-rose-700' : 'text-ink-muted'}`}>
+              已识别 {parsedNames.length} 个姓名{namesTooMany && '（超过单次上限 100 个，请分批导出）'}
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={() => void handlePassportByNamesExport()}
+            disabled={namesExporting || parsedNames.length === 0 || namesTooMany}
+            className="btn-primary"
+          >
+            {namesExporting ? '导出中…' : '导出护照(按姓名)'}
+          </button>
+        </div>
       </div>
     </section>
   );

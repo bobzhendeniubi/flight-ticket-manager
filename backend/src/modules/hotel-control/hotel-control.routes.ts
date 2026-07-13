@@ -12,6 +12,8 @@
  *   GET    /hotel-control/occupants?hotelId&date   占房下钻（某酒店某晚，谁占的）
  *   GET    /hotel-control/nightly-remaining?hotelRoomTypeId&checkIn&checkOut  当日余量（分房弹窗徽标）
  *   GET    /hotel-control/export?from&to           房态导出（xlsx，销控矩阵原样导出）
+ *   GET    /hotel-control/passports.zip?hotelId&from&to     按酒店导出护照 zip
+ *   POST   /hotel-control/passports-by-names.zip    按姓名批量导出护照 zip（body { names: string[] }）
  */
 import type { FastifyPluginAsync } from 'fastify';
 import { UserRole } from '@prisma/client';
@@ -19,14 +21,18 @@ import { actorFromRequest, writeAudit } from '../../lib/audit.js';
 import { buildHotelControlBoardWorkbook, hotelControlExportFilename } from './hotel-control.export.js';
 import {
   buildHotelPassportsZip,
+  buildPassportsByNamesZip,
   collectHotelPassportGroups,
+  collectPassportGroupsByNames,
   hasAnyPassportPhoto,
   hotelPassportsZipFilename,
+  passportsByNamesZipFilename,
 } from './hotel-control.passports.js';
 import {
   alertsQuerySchema,
   boardQuerySchema,
   createBlockPeriodBodySchema,
+  hotelPassportsByNamesBodySchema,
   hotelPassportsQuerySchema,
   listBlockPeriodsQuerySchema,
   nightlyRemainingQuerySchema,
@@ -189,6 +195,44 @@ export const hotelControlRoutes: FastifyPluginAsync = async (app) => {
         `attachment; filename="${encodeURIComponent(
           hotelPassportsZipFilename(selection.hotelName, q.hotelId, q.from, q.to),
         )}"`,
+      )
+      .send(buf);
+  });
+
+  // ── 按姓名批量导出护照 zip（不限酒店/日期；按订单分文件夹，未命中姓名写进 README）────
+  app.post('/passports-by-names.zip', requireStaff, async (req, reply) => {
+    const body = hotelPassportsByNamesBodySchema.parse(req.body);
+    const selection = await collectPassportGroupsByNames(body.names);
+
+    // 一个客人都没命中 → 友好 400（避免下载到只有一个 README 的空 zip）
+    if (selection.groups.length === 0) {
+      return reply
+        .status(400)
+        .send({ error: '所提供的姓名均未找到任何客人' });
+    }
+    // 命中的客人全都没上传护照图 → 400（没有可打包的护照）
+    if (!hasAnyPassportPhoto(selection.groups)) {
+      return reply
+        .status(400)
+        .send({ error: '命中的客人均未上传护照图，暂无可打包的护照' });
+    }
+
+    const { buf, photoCount } = await buildPassportsByNamesZip(selection);
+
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'DOWNLOAD_HOTEL_PASSPORTS_BY_NAMES',
+      targetType: 'PRODUCT',
+      targetId: 'passports-by-names',
+      targetLabel: `按姓名导出护照 ${body.names.length} 个姓名`,
+      after: { nameCount: body.names.length, orderCount: selection.groups.length, photoCount, notFoundCount: selection.notFoundNames.length },
+    });
+
+    return reply
+      .header('Content-Type', 'application/zip')
+      .header(
+        'Content-Disposition',
+        `attachment; filename="${encodeURIComponent(passportsByNamesZipFilename(body.names))}"`,
       )
       .send(buf);
   });
