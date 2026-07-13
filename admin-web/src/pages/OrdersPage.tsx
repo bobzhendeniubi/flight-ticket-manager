@@ -1726,6 +1726,27 @@ function roomingSummary(order: OrderSummary): string {
     .join('；');
 }
 
+// 推导住宿晚数（补收单房差表单的「晚数」默认值，可改）。
+// 优先 HOTEL 行 checkIn/checkOut 日差 → 回退任意行描述里的「N晚」→ 兜底 1。
+function deriveStayNights(order: OrderSummary): number {
+  const items = order.items ?? [];
+  const hotel = items.find((it) => it.kind === 'HOTEL' && it.hotelCheckIn && it.hotelCheckOut);
+  if (hotel?.hotelCheckIn && hotel?.hotelCheckOut) {
+    const nights = Math.round(
+      (new Date(hotel.hotelCheckOut).getTime() - new Date(hotel.hotelCheckIn).getTime()) / 86_400_000,
+    );
+    if (nights >= 1) return nights;
+  }
+  for (const it of items) {
+    const m = /(\d+)\s*晚/.exec(it.description ?? '');
+    if (m) {
+      const n = Number(m[1]);
+      if (n >= 1 && n <= 60) return n;
+    }
+  }
+  return 1;
+}
+
 // ── Drawer ─────────────────────────────────────────────────────────────
 function OrderDrawer({
   order,
@@ -1748,6 +1769,9 @@ function OrderDrawer({
 }) {
   const tokens = useAuth((s) => s.tokens);
   const token = tokens?.accessToken ?? '';
+  const role = useAuth((s) => s.user?.role);
+  // 内部角色（ADMIN/STAFF）才看逐项拆价折叠区；AGENT/CUSTOMER 只看「产品内容 + 订单总价」，不露内部金额明细。
+  const canSeeInternal = role === 'ADMIN' || role === 'STAFF';
   // #8 修复：列表行的 passengers 只有 {id, fullName}（后端 listOrders select 精简），护照号/生日/国籍/类型
   // 恒显示「—」。抽屉打开时用 getOrder 拉全量详情，之后所有子区块都读 hydrated（拿不到时兜底列表行）。
   const [hydrated, setHydrated] = useState<OrderSummary | null>(null);
@@ -1777,6 +1801,10 @@ function OrderDrawer({
   const needsRooming = orderNeedsRooming(o);
   const hasRooming = orderHasRooming(o);
   const [roomingOpen, setRoomingOpen] = useState(false);
+  // 运营专属（ADMIN/STAFF）：更改归属代理 + 事后补收单房差。复用上面已解析的 role。
+  const isOps = role === 'ADMIN' || role === 'STAFF';
+  const [agentEditOpen, setAgentEditOpen] = useState(false);
+  const [roomSupplementOpen, setRoomSupplementOpen] = useState(false);
 
   const saveRooming = async (groups: RoomGroup[]): Promise<void> => {
     if (!token) return;
@@ -1842,7 +1870,23 @@ function OrderDrawer({
               <div className="mt-1.5 text-sm font-medium text-ink">{view.customerName}</div>
               <div className="text-xs text-ink-soft">{o.contactPhone}</div>
               {o.contactEmail && <div className="truncate text-xs text-ink-muted">{o.contactEmail}</div>}
-              {view.agentName && <div className="mt-1 badge-info">{view.agentName}</div>}
+              {/* 归属代理徽标 + 更改（仅 ADMIN/STAFF；口径 C 任何状态都能改，留审计） */}
+              <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                {view.agentName ? (
+                  <span className="badge-info">{view.agentName}</span>
+                ) : (
+                  <span className="text-[11px] text-ink-muted">直客（无代理）</span>
+                )}
+                {isOps && (
+                  <button
+                    type="button"
+                    className="text-[11px] font-medium text-brand hover:text-brand-dark"
+                    onClick={() => setAgentEditOpen(true)}
+                  >
+                    更改
+                  </button>
+                )}
+              </div>
               <div className="mt-1 text-[11px] text-ink-muted">下单 {new Date(o.createdAt).toLocaleString('zh-CN')}</div>
             </div>
 
@@ -1869,26 +1913,39 @@ function OrderDrawer({
             {/* 酒店情况（酒店中文名 + 拼房/整间 摘要 = 旧系统备注）*/}
             {(needsRooming || hotelName) && (
               <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3 sm:col-span-2">
-                <div className="flex items-center justify-between">
+                <div className="flex items-center justify-between gap-2">
                   <div className="text-xs font-semibold uppercase tracking-wide text-ink-muted">酒店情况 · 拼房</div>
-                  {needsRooming && (
-                    hasRooming ? (
+                  <div className="flex items-center gap-2">
+                    {/* 事后补收单房差（仅 ADMIN/STAFF）：X元/晚 × N晚，记账、房控可见 */}
+                    {isOps && (
                       <button
-                        className="text-[11px] font-medium text-brand hover:text-brand-dark"
-                        onClick={() => setRoomingOpen(true)}
+                        type="button"
+                        className="text-[11px] font-medium text-amber-700 hover:text-amber-800"
+                        onClick={() => setRoomSupplementOpen(true)}
+                        title="按每晚金额 × 晚数补收单房差，计入订单应收/尾款"
                       >
-                        调整分房
+                        补收单房差
                       </button>
-                    ) : (
-                      <button
-                        className="rounded bg-brand px-2 py-0.5 text-[11px] font-medium text-white hover:bg-brand-dark"
-                        onClick={() => setRoomingOpen(true)}
-                        title="该订单含酒店但尚未分房 — 点此分房（拖名字到房间）"
-                      >
-                        🛏 分房
-                      </button>
-                    )
-                  )}
+                    )}
+                    {needsRooming && (
+                      hasRooming ? (
+                        <button
+                          className="text-[11px] font-medium text-brand hover:text-brand-dark"
+                          onClick={() => setRoomingOpen(true)}
+                        >
+                          调整分房
+                        </button>
+                      ) : (
+                        <button
+                          className="rounded bg-brand px-2 py-0.5 text-[11px] font-medium text-white hover:bg-brand-dark"
+                          onClick={() => setRoomingOpen(true)}
+                          title="该订单含酒店但尚未分房 — 点此分房（拖名字到房间）"
+                        >
+                          🛏 分房
+                        </button>
+                      )
+                    )}
+                  </div>
                 </div>
                 <div className="mt-1.5 text-sm font-medium text-ink">🏨 {hotelName ?? '（未识别酒店名）'}</div>
                 <div className={`mt-0.5 text-xs ${hasRooming ? 'text-ink-soft' : 'text-amber-700'}`}>
@@ -1913,23 +1970,26 @@ function OrderDrawer({
                   <BundleItineraryCard items={o.items ?? []} order={o} />
                 </div>
                 {/* 套餐订单：原始行金额明细折叠隐藏（公测反馈原始金额行「不太实用」），
-                    默认收起，点开仍可见 + 改期/改结算价 操作照旧可用。非套餐订单不受影响（见下方 else 分支）。 */}
-                <details className="mt-2 rounded-lg border border-slate-200 bg-white">
-                  <summary className="cursor-pointer select-none px-3 py-2 text-xs font-medium text-ink-muted hover:text-ink">
-                    金额明细（点开）
-                  </summary>
-                  <ul className="space-y-2 border-t border-slate-100 p-3 text-sm">
-                    {(o.items ?? []).map((it) => (
-                      <OrderItemRow
-                        key={it.id}
-                        orderId={o.id}
-                        item={it}
-                        onOrderUpdated={handleOrderUpdated}
-                        isAdmin={isAdmin}
-                      />
-                    ))}
-                  </ul>
-                </details>
+                    默认收起，点开仍可见 + 改期/改结算价 操作照旧可用。非套餐订单不受影响（见下方 else 分支）。
+                    对外脱敏：整段是逐项拆价（我方内部口径），仅内部角色可见；AGENT/CUSTOMER 只看上方产品内容 + 订单总价。 */}
+                {canSeeInternal && (
+                  <details className="mt-2 rounded-lg border border-slate-200 bg-white">
+                    <summary className="cursor-pointer select-none px-3 py-2 text-xs font-medium text-ink-muted hover:text-ink">
+                      金额明细（点开）
+                    </summary>
+                    <ul className="space-y-2 border-t border-slate-100 p-3 text-sm">
+                      {(o.items ?? []).map((it) => (
+                        <OrderItemRow
+                          key={it.id}
+                          orderId={o.id}
+                          item={it}
+                          onOrderUpdated={handleOrderUpdated}
+                          isAdmin={isAdmin}
+                        />
+                      ))}
+                    </ul>
+                  </details>
+                )}
               </>
             ) : (
               <ul className="mt-2 space-y-2 text-sm">
@@ -2082,6 +2142,59 @@ function OrderDrawer({
           </div>
         </div>
       )}
+
+      {/* 更改归属代理弹窗（ADMIN/STAFF） */}
+      {agentEditOpen && (
+        <div
+          className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/50 p-4"
+          onClick={() => setAgentEditOpen(false)}
+        >
+          <div
+            className="max-h-[90vh] w-full max-w-md overflow-auto rounded-2xl bg-white p-5 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <ChangeAgentPanel
+              orderId={o.id}
+              currentAgentId={o.agentId ?? null}
+              onCancel={() => setAgentEditOpen(false)}
+              onSaved={(updated, warning) => {
+                handleOrderUpdated(updated);
+                setAgentEditOpen(false);
+                onChanged?.();
+                if (warning) alert(warning);
+              }}
+            />
+          </div>
+        </div>
+      )}
+
+      {/* 事后补收单房差弹窗（ADMIN/STAFF） */}
+      {roomSupplementOpen && (
+        <div
+          className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/50 p-4"
+          onClick={() => setRoomSupplementOpen(false)}
+        >
+          <div
+            className="max-h-[90vh] w-full max-w-md overflow-auto rounded-2xl bg-white p-5 shadow-2xl"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <RoomSupplementForm
+              orderId={o.id}
+              defaultNights={deriveStayNights(o)}
+              onCancel={() => setRoomSupplementOpen(false)}
+              onSaved={async () => {
+                // 重拉详情（保留联查酒店名等），刷新金额/尾款/售后费用区
+                if (token) {
+                  const r = await api.getOrder(token, o.id);
+                  setHydrated(r.order);
+                }
+                setRoomSupplementOpen(false);
+                onChanged?.();
+              }}
+            />
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -2091,6 +2204,232 @@ function Row({ label, value }: { label: string; value: React.ReactNode }) {
     <div className="flex justify-between gap-4">
       <dt className="text-ink-muted">{label}</dt>
       <dd className="text-right text-ink">{value}</dd>
+    </div>
+  );
+}
+
+// ── 更改归属代理小面板（ADMIN/STAFF）──────────────────────────────────────────
+// 代理搜索下拉（参考建单归属选择器）+ 原因输入 + 确认（提示财务不回溯口径）。
+// agentId='' = 直客/无代理。保存成功由父级同步整单 + 弹 warning（若曾用原代理余额抵扣）。
+function ChangeAgentPanel({
+  orderId,
+  currentAgentId,
+  onCancel,
+  onSaved,
+}: {
+  orderId: string;
+  currentAgentId: string | null;
+  onCancel: () => void;
+  onSaved: (order: OrderSummary, warning: string | null) => void;
+}) {
+  const tokens = useAuth((s) => s.tokens);
+  const token = tokens?.accessToken ?? '';
+  const [agents, setAgents] = useState<AgentListItem[]>([]);
+  const [agentId, setAgentId] = useState<string>(currentAgentId ?? '');
+  const [search, setSearch] = useState('');
+  const [reason, setReason] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    api.listAgents(token)
+      .then((r) => { if (!cancelled) setAgents(r.agents); })
+      .catch(() => { if (!cancelled) setErr('代理列表加载失败'); });
+    return () => { cancelled = true; };
+  }, [token]);
+
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    const base = q
+      ? agents.filter((a) =>
+          [a.companyName, a.contactName, a.contactPhone]
+            .filter(Boolean)
+            .some((s) => String(s).toLowerCase().includes(q)),
+        )
+      : agents;
+    return base.slice(0, 50);
+  }, [agents, search]);
+
+  const submit = async () => {
+    if (!token || submitting) return;
+    const next = agentId || null;
+    if (next === (currentAgentId ?? null)) { setErr('归属代理未变化'); return; }
+    if (
+      !confirm(
+        '确认更改归属代理？\n\n财务不回溯：已发生的收款 / 代理余额抵扣 / 佣金流水按原归属保留，不回滚；变更后新产生的按新归属。',
+      )
+    ) {
+      return;
+    }
+    setErr(null);
+    setSubmitting(true);
+    try {
+      const res = await api.changeOrderAgent(token, orderId, {
+        agentId: next,
+        reason: reason.trim() || undefined,
+      });
+      onSaved(res.order, res.warning);
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : '更改失败');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="space-y-3 text-sm">
+      <div className="text-base font-semibold text-ink">更改归属代理</div>
+      <p className="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-700">
+        财务不回溯：已发生的收款 / 代理余额抵扣 / 佣金流水按原归属保留；变更后新产生的按新归属。
+      </p>
+      <label className="block text-xs text-ink-muted">
+        搜索代理
+        <input
+          className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+          placeholder="公司名 / 联系人 / 电话"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+        />
+      </label>
+      <label className="block text-xs text-ink-muted">
+        归属代理
+        <select
+          className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+          value={agentId}
+          onChange={(e) => setAgentId(e.target.value)}
+        >
+          <option value="">— 直客 / 无代理 —</option>
+          {filtered.map((a) => (
+            <option key={a.id} value={a.id}>
+              {a.companyName ? `${a.companyName} · ` : ''}{a.contactName}（{a.contactPhone}）
+            </option>
+          ))}
+        </select>
+      </label>
+      <label className="block text-xs text-ink-muted">
+        更改原因（选填）
+        <input
+          className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+          placeholder="如：归属订正 / 客户改由代理下单"
+          value={reason}
+          onChange={(e) => setReason(e.target.value)}
+        />
+      </label>
+      {err && <div className="text-xs text-rose-600">{err}</div>}
+      <div className="flex justify-end gap-2">
+        <button type="button" className="btn-ghost text-sm" onClick={onCancel} disabled={submitting}>取消</button>
+        <button type="button" className="btn-primary text-sm disabled:opacity-50" onClick={submit} disabled={submitting}>
+          {submitting ? '保存中…' : '确认更改'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── 事后补收单房差小表单（ADMIN/STAFF）───────────────────────────────────────
+// 每晚金额 × 晚数（默认=套餐晚数，可改）+ 备注；显示自动算的合计；确认后后端新增 FEE 行 + 重算尾款。
+function RoomSupplementForm({
+  orderId,
+  defaultNights,
+  onCancel,
+  onSaved,
+}: {
+  orderId: string;
+  defaultNights: number;
+  onCancel: () => void;
+  onSaved: () => void;
+}) {
+  const tokens = useAuth((s) => s.tokens);
+  const token = tokens?.accessToken ?? '';
+  const [perNightCny, setPerNightCny] = useState<number | null>(null);
+  const [nights, setNights] = useState<number>(defaultNights >= 1 ? defaultNights : 1);
+  const [note, setNote] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const amount = (perNightCny ?? 0) * (nights || 0);
+
+  const submit = async () => {
+    if (!token || submitting) return;
+    setErr(null);
+    if (!perNightCny || perNightCny <= 0 || !Number.isInteger(perNightCny)) {
+      setErr('请填写每晚金额（大于 0 的整数）');
+      return;
+    }
+    if (!nights || nights < 1 || nights > 60 || !Number.isInteger(nights)) {
+      setErr('晚数需为 1–60 的整数');
+      return;
+    }
+    if (!confirm(`确认补收单房差 ¥${perNightCny}/晚 × ${nights}晚 = ¥${amount}？\n\n将新增一条费用行并计入订单应收/尾款。`)) {
+      return;
+    }
+    setSubmitting(true);
+    try {
+      await api.addRoomSupplement(token, orderId, {
+        perNightCny,
+        nights,
+        note: note.trim() || undefined,
+      });
+      onSaved();
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : '补收失败');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="space-y-3 text-sm">
+      <div className="text-base font-semibold text-ink">补收单房差</div>
+      <p className="text-xs text-ink-muted">按「每晚金额 × 晚数」补收；后端新增一条费用行并计入应收/尾款，房控可见。</p>
+      <div className="grid grid-cols-2 gap-3">
+        <label className="block text-xs text-ink-muted">
+          每晚金额（¥）
+          <input
+            type="number"
+            min={1}
+            step={1}
+            className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+            value={perNightCny ?? ''}
+            onChange={(e) => setPerNightCny(e.target.value ? Math.trunc(Number(e.target.value)) : null)}
+            placeholder="如 300"
+          />
+        </label>
+        <label className="block text-xs text-ink-muted">
+          晚数（默认=套餐晚数）
+          <input
+            type="number"
+            min={1}
+            max={60}
+            step={1}
+            className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+            value={nights}
+            onChange={(e) => setNights(e.target.value ? Math.trunc(Number(e.target.value)) : 0)}
+          />
+        </label>
+      </div>
+      <label className="block text-xs text-ink-muted">
+        备注（选填）
+        <input
+          className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+          value={note}
+          onChange={(e) => setNote(e.target.value)}
+          placeholder="如：客户单人入住"
+        />
+      </label>
+      <div className="rounded-md bg-slate-50 px-3 py-2 text-sm">
+        合计：<span className="nums font-semibold text-emerald-700">¥{amount.toLocaleString()}</span>
+        <span className="ml-1 text-xs text-ink-muted">（{perNightCny ?? 0} × {nights || 0}）</span>
+      </div>
+      {err && <div className="text-xs text-rose-600">{err}</div>}
+      <div className="flex justify-end gap-2">
+        <button type="button" className="btn-ghost text-sm" onClick={onCancel} disabled={submitting}>取消</button>
+        <button type="button" className="btn-primary text-sm disabled:opacity-50" onClick={submit} disabled={submitting}>
+          {submitting ? '补收中…' : '确认补收'}
+        </button>
+      </div>
     </div>
   );
 }
@@ -2661,7 +3000,9 @@ function OrderItemRow({
             )}
           </div>
           <div className="mt-0.5 text-xs text-ink-muted">
-            {KIND_LABEL[item.kind]} · 数量 {item.quantity} · 单价 ¥{Number(item.unitPrice).toLocaleString()}
+            {KIND_LABEL[item.kind]} · 数量 {item.quantity}
+            {/* 单价是逐项拆价，属我方内部口径：后端对 AGENT/CUSTOMER 不下发 unitPrice，缺失时不渲染（避免 ¥undefined/¥NaN）。 */}
+            {item.unitPrice != null && <> · 单价 ¥{Number(item.unitPrice).toLocaleString()}</>}
             {item.flightCabin && <> · {CABIN_ZH[item.flightCabin] ?? item.flightCabin}</>}
           </div>
           {flightChanged && (
@@ -2669,7 +3010,10 @@ function OrderItemRow({
           )}
         </div>
         <div className="flex flex-col items-end gap-1">
-          <div className="nums text-sm font-medium text-ink">¥{Number(item.amount).toLocaleString()}</div>
+          {/* 行级小计同属内部拆价口径：AGENT/CUSTOMER 只看订单总价，行级金额缺失时不渲染。 */}
+          {item.amount != null && (
+            <div className="nums text-sm font-medium text-ink">¥{Number(item.amount).toLocaleString()}</div>
+          )}
           {isFlight && !rescheduling && !editingPrice && (
             <button
               className="text-[11px] font-medium text-brand hover:text-brand-dark"
@@ -3649,6 +3993,7 @@ function InvoiceFlagsSection({
 
 function NotesSection({ order }: { order: OrderSummary }) {
   const tokens = useAuth((s) => s.tokens);
+  const role = useAuth((s) => s.user?.role);
   const [customerNotes, setCustomerNotes] = useState(order.notes ?? '');
   const [internalNotes, setInternalNotes] = useState(order.internalNotes ?? '');
   // 订单 visaStatus 为 null = 未设置/不需要，初值不得回落成 NEEDED（否则顺手保存会把 null 静默升级成"需要"）。
@@ -3692,6 +4037,10 @@ function NotesSection({ order }: { order: OrderSummary }) {
       setSaving(false);
     }
   };
+
+  // 签证状态 / 内部备注（含内部备注、结构化四栏）只对内部角色开放；AGENT/CUSTOMER 整块不渲染
+  //（后端对这些角色本就不下发 internalNotes/note* 等字段，前端再挡一层，避免代理误看/误改内部口径）。
+  if (role !== 'ADMIN' && role !== 'STAFF') return null;
 
   return (
     <section>
@@ -3766,6 +4115,7 @@ function NotesSection({ order }: { order: OrderSummary }) {
 
 function RemindersSection({ order }: { order: OrderSummary }) {
   const tokens = useAuth((s) => s.tokens);
+  const role = useAuth((s) => s.user?.role);
   const [reminders, setReminders] = useState(order.reminders ?? []);
   const [newTitle, setNewTitle] = useState('');
   const [newPriority, setNewPriority] = useState<'LOW' | 'NORMAL' | 'HIGH' | 'CRITICAL'>('NORMAL');
@@ -3804,6 +4154,9 @@ function RemindersSection({ order }: { order: OrderSummary }) {
 
   const PRIORITY_LABEL: Record<string, string> = { LOW: '低', NORMAL: '中', HIGH: '高', CRITICAL: '🔴 紧急' };
   const STATUS_LABEL: Record<string, string> = { OPEN: '未处理', IN_PROGRESS: '处理中', DONE: '✓ 完成', SKIPPED: '⊘ 跳过' };
+
+  // 运营待办/提醒是内部协作口径，只对内部角色开放；AGENT/CUSTOMER 整块不渲染（后端对其也不下发 reminders）。
+  if (role !== 'ADMIN' && role !== 'STAFF') return null;
 
   return (
     <section>
@@ -4961,10 +5314,11 @@ function ConfirmPaymentSection({
   const token = tokens?.accessToken ?? '';
   const [payments, setPayments] = useState<OrderPayment[]>([]);
   const [paid, setPaid] = useState(paidAmount);
-  // 代理预存余额本地副本（抵扣/存入后即时刷新展示，不必等父级 onChanged 重拉）
-  const [agentBalance, setAgentBalance] = useState<number>(agent ? Number(agent.prepaymentBalance) : 0);
+  // 代理预存余额本地副本（抵扣/存入后即时刷新展示，不必等父级 onChanged 重拉）。
+  // 对外脱敏：后端对 AGENT/CUSTOMER 不下发 prepaymentBalance，Number(undefined)=NaN，故用 || 0 兜底避免 ¥NaN。
+  const [agentBalance, setAgentBalance] = useState<number>(agent ? Number(agent.prepaymentBalance) || 0 : 0);
   useEffect(() => {
-    setAgentBalance(agent ? Number(agent.prepaymentBalance) : 0);
+    setAgentBalance(agent ? Number(agent.prepaymentBalance) || 0 : 0);
   }, [agent]);
   const [amount, setAmount] = useState<number | null>(null);
   const [method, setMethod] = useState<PaymentMethod>('BANK_CARD');

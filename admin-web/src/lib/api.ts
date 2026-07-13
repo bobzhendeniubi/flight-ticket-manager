@@ -440,7 +440,13 @@ export const PRICE_ADJUSTMENT_REASON_OPTIONS: PriceAdjustmentReason[] = [
 
 // 历史全集（含已下线、不再允许新录入的原因值）——仅用于展示旧订单行 label。
 type PriceAdjustmentReasonLegacy = 'UPGRADE_CABIN' | 'UPGRADE_HOTEL' | 'VISA_MULTI';
-type PriceAdjustmentReasonDisplay = PriceAdjustmentReason | PriceAdjustmentReasonLegacy;
+// 专用端点产生、不在录单可选枚举里的原因（仅展示 label）。ROOM_DIFF 走订单详情「补收单房差」
+// 专用通道（POST /orders/:id/room-supplement），不进录单调价下拉（PRICE_ADJUSTMENT_REASON_OPTIONS）。
+type PriceAdjustmentReasonEndpointOnly = 'ROOM_DIFF';
+type PriceAdjustmentReasonDisplay =
+  | PriceAdjustmentReason
+  | PriceAdjustmentReasonLegacy
+  | PriceAdjustmentReasonEndpointOnly;
 
 export const PRICE_ADJUSTMENT_REASON_LABEL: Record<PriceAdjustmentReasonDisplay, string> = {
   DISCOUNT: '优惠',
@@ -450,6 +456,7 @@ export const PRICE_ADJUSTMENT_REASON_LABEL: Record<PriceAdjustmentReasonDisplay,
   UPGRADE_CABIN: '升舱',
   UPGRADE_HOTEL: '升级酒店',
   VISA_MULTI: '签证改多签',
+  ROOM_DIFF: '补收单房差',
 };
 
 export interface PriceAdjustmentInput {
@@ -2090,6 +2097,33 @@ export const api = {
   ) =>
     apiFetch<{ order: OrderSummary }>(`/orders/${orderId}/items/${itemId}/hotel`, {
       method: 'PATCH',
+      token,
+      body,
+    }),
+
+  // 更改订单归属代理（T5；ADMIN/STAFF）。agentId=null（或空串归一）= 转直客；任何状态都能改，留审计。
+  // 财务不回溯（已发生的收款/代理余额抵扣/佣金按原归属，不回滚；变更后新产生的按新归属）。
+  // 若订单曾用原代理预存余额抵扣，响应带非空 warning 提醒核对财务归属（不阻断）。
+  changeOrderAgent: (
+    token: string,
+    orderId: string,
+    body: { agentId: string | null; reason?: string },
+  ) =>
+    apiFetch<{ order: OrderSummary; warning: string | null }>(`/orders/${orderId}/agent`, {
+      method: 'PATCH',
+      token,
+      body,
+    }),
+
+  // 事后补收单房差（ADMIN/STAFF）：金额 = perNightCny × nights；后端新增一条 FEE 行 + 重算 total
+  // + 追加审计流水。仅含 BUNDLE/HOTEL 行的订单可用（纯机票单 400）。返回更新后的订单。
+  addRoomSupplement: (
+    token: string,
+    orderId: string,
+    body: { perNightCny: number; nights: number; note?: string },
+  ) =>
+    apiFetch<{ order: OrderSummary }>(`/orders/${orderId}/room-supplement`, {
+      method: 'POST',
       token,
       body,
     }),

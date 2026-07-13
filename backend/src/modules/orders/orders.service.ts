@@ -353,6 +353,44 @@ export function buildPriceAdjustmentItem(adj: PriceAdjustmentInput): {
   };
 }
 
+/**
+ * 事后补收单房差 → 一条 FEE 定价行（计入 subtotal/total）。
+ *   - 金额 = perNightCny × nights（都为正整数 CNY；校验由 roomSupplementBodySchema 完成）。
+ *   - 描述可读「补收单房差 ¥X/晚 × N晚」（备注不拼进描述，另落 metadata.note 与审计流水 note）。
+ *   - metadata 打标 priceAdjustment=true + reasonCode='ROOM_DIFF' + perNightCny/nights，
+ *     便于识别与后续对账；label 展示走 PRICE_ADJUSTMENT_REASON_LABEL['ROOM_DIFF']。
+ * 导出供单测复用（金额计算 / 描述 / metadata）。
+ */
+export function buildRoomSupplementItem(input: {
+  perNightCny: number;
+  nights: number;
+  note?: string;
+}): {
+  kind: OrderItemKind;
+  description: string;
+  quantity: number;
+  unitPrice: number;
+  amount: number;
+  metadata: Record<string, unknown>;
+} {
+  const amount = input.perNightCny * input.nights;
+  const note = input.note?.trim() || undefined;
+  return {
+    kind: OrderItemKind.FEE,
+    description: `补收单房差 ¥${input.perNightCny}/晚 × ${input.nights}晚`,
+    quantity: 1,
+    unitPrice: amount,
+    amount,
+    metadata: {
+      priceAdjustment: true,
+      reasonCode: 'ROOM_DIFF',
+      perNightCny: input.perNightCny,
+      nights: input.nights,
+      note: note ?? null,
+    },
+  };
+}
+
 export class OrderService {
   private readonly pricing = new PricingService();
 
@@ -1368,12 +1406,14 @@ export class OrderService {
       prisma.order.count({ where }),
     ]);
 
+    // 对外脱敏口径按请求者角色一次算好（列表所有行同角色），AGENT/CUSTOMER 剥离内部字段 + 逐项拆价。
+    const serializeCtx = orderSerializeRoleCtx(requester.role);
     return {
       // 显式包一层箭头函数——serializeOrder 现在带一个可选的第二参数（ctx），直接把它当
       // Array.map 回调传会让 map 的 index 顶进 ctx 位置（number 不是合法 ctx，TS 会报错，
       // 运行时也会把 index 当 ctx.visaStayDaysById 用，产生诡异行为）。listOrders 未联查
-      // bundle.items，本来就没有 visaStayDaysById 可传，这里显式只传 order，用默认空表。
-      orders: rows.map((order) => serializeOrder(order)),
+      // bundle.items，没有 visaStayDaysById 可传，这里只传 order + 角色脱敏口径，用默认空表。
+      orders: rows.map((order) => serializeOrder(order, serializeCtx)),
       pagination: { page: query.page, pageSize: query.pageSize, total },
     };
   }
@@ -1438,10 +1478,12 @@ export class OrderService {
     // 套餐 VISA 组件的「最多可停留天数」不在 bundle.items JSON 里（那只存 visaId），需按 visaId 批量查
     // Visa.stayDays（best-effort：查询失败/无签证组件时给空表，itineraryFieldsForItem 照常降级为 null）。
     const visaStayDaysById = await this.loadBundleVisaStayDays(order.items);
-    // 护照大图仅后台角色返回：admin 订单抽屉直接渲染缩略图；客户/代理端剥离（响应瘦身 + 少暴露 PII）
-    const includePassportPhotos =
-      requester.role === UserRole.ADMIN || requester.role === UserRole.STAFF;
-    return serializeOrder(order, { visaStayDaysById, includePassportPhotos });
+    // 按角色一次算好脱敏口径：ADMIN/STAFF 看全量（含护照大图）；AGENT/CUSTOMER 剥离内部字段 + 逐项拆价
+    // （护照大图同口径剥离——响应瘦身 + 少暴露 PII，与既有 includePassportPhotos 行为一致）。
+    return serializeOrder(order, {
+      visaStayDaysById,
+      ...orderSerializeRoleCtx(requester.role),
+    });
   }
 
   // ════════════════════════════════════════════════════════════════════
@@ -2100,7 +2142,8 @@ export class OrderService {
       }
     }
 
-    return serializeOrder(updated);
+    // 对外脱敏按请求者角色：AGENT/CUSTOMER 自助改状态的返回也剥离内部字段（getOrder/listOrders 同口径）。
+    return serializeOrder(updated, orderSerializeRoleCtx(requester.role));
   }
 
   /**
@@ -2426,7 +2469,8 @@ export class OrderService {
     });
 
     return {
-      order: serializeOrder(finalOrder),
+      // 对外脱敏：改结算价的返回也按操作者角色脱敏（ADMIN/STAFF 全量，其余剥离内部字段 + 逐项拆价）。
+      order: serializeOrder(finalOrder, orderSerializeRoleCtx(actor.role)),
       audit: {
         orderNumber: scratch.orderNumber,
         orderItemId: itemId,
@@ -3037,7 +3081,8 @@ export class OrderService {
       });
       return u;
     });
-    return { order: serializeOrder(updated), idempotent: false };
+    // 申请改签是 AGENT/CUSTOMER 自助动作，返回订单同样按角色脱敏（不回传内部备注/逐项拆价等）。
+    return { order: serializeOrder(updated, orderSerializeRoleCtx(requester.role)), idempotent: false };
   }
 
   /**
@@ -3212,7 +3257,7 @@ export class OrderService {
       // 始终重算最新 quote（不用 snapshot），保证客户端拿到的 shape 一致 + 费率最新
       // 历史 snapshot 留在 refund.gatewayPayload.quoteSnapshot 供审计追溯
       const quote = await computeCancellationQuote(id);
-      return { order: serializeOrder(updated), refund: existing, quote, isNew: false };
+      return { order: serializeOrder(updated, orderSerializeRoleCtx(requester.role)), refund: existing, quote, isNew: false };
     }
 
     // 计算 quote（包含可取消性判断）
@@ -3264,7 +3309,8 @@ export class OrderService {
       where: { id },
       include: ORDER_FULL_INCLUDE,
     });
-    return { order: serializeOrder(finalOrder), refund: result.refund, quote, isNew: true };
+    // 申请取消是 AGENT/CUSTOMER 自助动作，返回订单按角色脱敏（与幂等分支同口径）。
+    return { order: serializeOrder(finalOrder, orderSerializeRoleCtx(requester.role)), refund: result.refund, quote, isNew: true };
   }
 
   // ════════════════════════════════════════════════════════════════════
@@ -3469,7 +3515,8 @@ export class OrderService {
     ]);
 
     return {
-      order: serializeOrder(finalOrder),
+      // 对外脱敏：改期（AGENT/CUSTOMER 侧也有入口）的返回按操作者角色脱敏。
+      order: serializeOrder(finalOrder, orderSerializeRoleCtx(actor.role)),
       audit: {
         orderNumber: finalOrder.orderNumber,
         orderItemId: input.orderItemId,
@@ -3671,7 +3718,8 @@ export class OrderService {
     });
 
     return {
-      order: serializeOrder(finalOrder),
+      // 对外脱敏：换人的返回按操作者角色脱敏（ADMIN/STAFF 全量，其余剥离内部字段 + 逐项拆价）。
+      order: serializeOrder(finalOrder, orderSerializeRoleCtx(actor.role)),
       audit: {
         orderNumber: finalOrder.orderNumber,
         passengerId,
@@ -3963,7 +4011,8 @@ export class OrderService {
     const visaStayDaysById = await this.loadBundleVisaStayDays(finalOrder.items);
 
     return {
-      order: serializeOrder(finalOrder, { visaStayDaysById }),
+      // 对外脱敏：换酒店（AGENT/CUSTOMER 侧也有入口）的返回按操作者角色脱敏。
+      order: serializeOrder(finalOrder, { visaStayDaysById, ...orderSerializeRoleCtx(actor.role) }),
       audit: {
         orderNumber: scratch.orderNumber,
         orderItemId: item.id,
@@ -3979,6 +4028,226 @@ export class OrderService {
         },
         feeCny,
         untrackedNights,
+      },
+    };
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  // T5：更改订单归属代理（口径 C：任何状态都能改，留审计）
+  // 全程 ADMIN/STAFF（路由层 + 服务层双断言）。
+  //
+  // 财务口径（不回溯）：改归属绝不回滚任何已发生的资金账 —— 已收的款、已用原代理预存余额抵扣、
+  // 已计提的佣金流水，一律按「事发时」的归属保留，不因本次改归属而重算或退回；本次变更只影响
+  // 变更之后新产生的佣金/结算按新归属计。若该订单曾用（原代理）预存余额抵扣，返回 warning 提醒
+  // 运营核对财务归属（不阻断改归属——阻断反而会卡住合理的归属订正）。
+  // ════════════════════════════════════════════════════════════════════
+  async changeOrderAgent(
+    orderId: string,
+    input: { agentId: string | null; reason?: string },
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
+    order: ReturnType<typeof serializeOrder>;
+    warning: string | null;
+    audit: {
+      orderNumber: string;
+      before: { agentId: string | null; agentName: string | null };
+      after: { agentId: string | null; agentName: string | null };
+      reason?: string;
+      usedAgentBalance: boolean;
+    };
+  }> {
+    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+      throw new ForbiddenError('仅运营/管理员可更改订单归属代理');
+    }
+    const newAgentId = input.agentId ?? null;
+
+    const order = await prisma.order.findUnique({
+      where: { id: orderId },
+      select: { id: true, orderNumber: true, agentId: true },
+    });
+    if (!order) throw new NotFoundError('订单不存在');
+
+    const oldAgentId = order.agentId;
+    if (oldAgentId === newAgentId) {
+      throw new BadRequestError('归属代理未变化');
+    }
+
+    // 目标代理校验（转直客 newAgentId=null 时跳过）：必须存在且在用，与建单归属同口径。
+    let newAgentName: string | null = null;
+    if (newAgentId) {
+      const agent = await prisma.agent.findUnique({
+        where: { id: newAgentId },
+        select: { id: true, isActive: true, companyName: true, contactName: true },
+      });
+      if (!agent) throw new NotFoundError(`指定的代理不存在：${newAgentId}`);
+      if (!agent.isActive) throw new BadRequestError('指定的代理已停用，无法归属订单');
+      newAgentName = agent.companyName ?? agent.contactName;
+    }
+
+    // 旧代理名（审计/展示用；代理已被删/查不到时安全落 null）。
+    let oldAgentName: string | null = null;
+    if (oldAgentId) {
+      const old = await prisma.agent.findUnique({
+        where: { id: oldAgentId },
+        select: { companyName: true, contactName: true },
+      });
+      oldAgentName = old ? old.companyName ?? old.contactName : null;
+    }
+
+    // 财务口径警告：该订单是否曾用（原代理）预存余额抵扣（applyAgentBalanceToOrder 会挂一条
+    // PrepaymentTransaction(type=OFFSET, orderId)）。不回溯、不阻断——仅提醒运营核对财务归属。
+    const balanceOffset = await prisma.prepaymentTransaction.findFirst({
+      where: { orderId, type: PrepaymentTxType.OFFSET },
+      select: { id: true },
+    });
+    const usedAgentBalance = balanceOffset != null;
+
+    await prisma.order.update({
+      where: { id: orderId },
+      data: { agentId: newAgentId },
+    });
+
+    const finalOrder = await prisma.order.findUniqueOrThrow({
+      where: { id: orderId },
+      include: ORDER_FULL_INCLUDE,
+    });
+
+    const warning = usedAgentBalance
+      ? '该订单曾用原代理预存余额抵扣；已发生的收款/余额抵扣/佣金流水不回溯（按原归属保留），请核对财务归属。'
+      : null;
+
+    return {
+      order: serializeOrder(finalOrder),
+      warning,
+      audit: {
+        orderNumber: order.orderNumber,
+        before: { agentId: oldAgentId, agentName: oldAgentName },
+        after: { agentId: newAgentId, agentName: newAgentName },
+        reason: input.reason,
+        usedAgentBalance,
+      },
+    };
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  // 事后补收单房差（ADMIN/STAFF）
+  // 建单后按「每晚金额 × 晚数」补收单房差：单事务内新增一条 FEE 调整行 + 重算 order.subtotal/total
+  // + 追加 order.adjustments 审计流水（参考改期费的 appendAdjustment 模式）。
+  //
+  // 钱口径：金额随新 FEE 行进入 subtotal/total（应付/尾款自然增加）——不走 adjustmentCny（那是
+  // 改期费/换人费的机制），避免与本行重复计钱。order.adjustments 只作审计流水（不参与金额合计）。
+  // 仅含 BUNDLE/HOTEL 行的订单可用（纯机票单无住宿 → 400）。
+  // ════════════════════════════════════════════════════════════════════
+  async addRoomSupplement(
+    orderId: string,
+    input: { perNightCny: number; nights: number; note?: string },
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
+    order: ReturnType<typeof serializeOrder>;
+    audit: {
+      orderNumber: string;
+      itemId: string;
+      perNightCny: number;
+      nights: number;
+      amountCny: number;
+      before: { subtotal: string; total: string };
+      after: { subtotal: string; total: string };
+      note?: string;
+    };
+  }> {
+    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+      throw new ForbiddenError('仅运营/管理员可补收单房差');
+    }
+    const { perNightCny, nights } = input;
+    const amount = perNightCny * nights;
+    const row = buildRoomSupplementItem(input);
+
+    const scratch = await prisma.$transaction(async (tx) => {
+      const order = await tx.order.findUnique({
+        where: { id: orderId },
+        select: {
+          id: true,
+          orderNumber: true,
+          subtotal: true,
+          total: true,
+          adjustments: true,
+          items: { select: { id: true, kind: true, amount: true } },
+        },
+      });
+      if (!order) throw new NotFoundError('订单不存在');
+
+      // 仅含 BUNDLE/HOTEL 行的订单可补收单房差（纯机票单无住宿 → 拒绝）。
+      const hasStay = order.items.some(
+        (it) => it.kind === OrderItemKind.HOTEL || it.kind === OrderItemKind.BUNDLE,
+      );
+      if (!hasStay) {
+        throw new BadRequestError('该订单不含酒店/套餐行，无法补收单房差');
+      }
+
+      // ── 1. 新增一条 FEE 调整行（描述含 ¥X/晚 × N晚，metadata 记 perNightCny/nights）──
+      const created = await tx.orderItem.create({
+        data: {
+          orderId,
+          kind: OrderItemKind.FEE,
+          description: row.description,
+          quantity: 1,
+          unitPrice: new Prisma.Decimal(row.unitPrice),
+          amount: new Prisma.Decimal(row.amount),
+          metadata: row.metadata as Prisma.InputJsonValue,
+        },
+      });
+
+      // ── 2. 用所有既有行 + 新行重算 subtotal/total（当前无 taxes/discount，total = subtotal）──
+      const newSubtotal = round2(
+        order.items.reduce((sum, it) => sum + Number(it.amount.toString()), 0) + amount,
+      );
+      const newTotal = newSubtotal;
+
+      // ── 3. 审计流水（appendAdjustment；仅记录用，钱走上面的 total，不进 adjustmentCny）──
+      const log = appendAdjustment(order.adjustments, {
+        type: 'ROOM_SUPPLEMENT',
+        label: row.description,
+        amountCny: amount,
+        at: new Date().toISOString(),
+        by: actor.userId,
+        note: input.note,
+      });
+
+      await tx.order.update({
+        where: { id: orderId },
+        data: {
+          subtotal: new Prisma.Decimal(newSubtotal),
+          total: new Prisma.Decimal(newTotal),
+          adjustments: log,
+        },
+      });
+
+      return {
+        orderNumber: order.orderNumber,
+        itemId: created.id,
+        beforeSubtotal: order.subtotal.toString(),
+        beforeTotal: order.total.toString(),
+        afterSubtotal: newSubtotal.toString(),
+        afterTotal: newTotal.toString(),
+      };
+    });
+
+    const finalOrder = await prisma.order.findUniqueOrThrow({
+      where: { id: orderId },
+      include: ORDER_FULL_INCLUDE,
+    });
+
+    return {
+      order: serializeOrder(finalOrder),
+      audit: {
+        orderNumber: scratch.orderNumber,
+        itemId: scratch.itemId,
+        perNightCny,
+        nights,
+        amountCny: amount,
+        before: { subtotal: scratch.beforeSubtotal, total: scratch.beforeTotal },
+        after: { subtotal: scratch.afterSubtotal, total: scratch.afterTotal },
+        note: input.note,
       },
     };
   }
@@ -4785,6 +5054,20 @@ interface OrderLike {
   items: Array<{ unitPrice: Prisma.Decimal; amount: Prisma.Decimal } & Record<string, unknown>>;
   // 可选嵌套代理（含余额 Decimal + 结算模式）；不同 include 下可能不带或带 null
   agent?: ({ prepaymentBalance?: Prisma.Decimal | null } & Record<string, unknown>) | null;
+  // ── 对外脱敏（redactForExternal）会剥离的内部字段（均可选：不同 include/select 下形状不同）──
+  //   内部备注 + 结构化四栏备注 + 出纳期望到账 + 售后审计流水 + 接单运营 + 运营待办。
+  //   声明为可选是为了让 serializeOrder 能安全读取并按角色覆盖（listOrders/getOrder 都联查了这些）。
+  internalNotes?: string | null;
+  noteHotel?: string | null;
+  noteVisa?: string | null;
+  notePayment?: string | null;
+  noteSpecial?: string | null;
+  expectedAmountCny?: Prisma.Decimal | null;
+  expectedAmountLocked?: boolean;
+  adjustments?: Prisma.JsonValue;
+  claimedById?: string | null;
+  claimedBy?: Record<string, unknown> | null;
+  reminders?: Array<Record<string, unknown>>;
   // 出行人（用于套餐行程单「人数」——按 passengerType 计数；不同 include 下 select 形状不同，
   // 如 listOrders 只 select id/fullName，无 passengerType 字段，故用 Record<string, unknown> 兜底，
   // 与本接口 items/agent 的处理方式一致）。
@@ -5092,15 +5375,24 @@ function serializePassengerRecord<P extends Record<string, unknown>>(
   return { ...rest, hasPassportPhoto };
 }
 
-function serializeOrder<T extends OrderLike>(
+// 导出供单测直接验证脱敏口径（redactForExternal）；运行时仍由本模块内部各读取/流转处调用。
+export function serializeOrder<T extends OrderLike>(
   order: T,
   ctx: {
     visaStayDaysById?: ReadonlyMap<string, number | null>;
     /** 后台（ADMIN/STAFF）详情需要护照大图渲染缩略图；客户/代理侧剥离瘦身。缺省保留（兼容既有调用方）。 */
     includePassportPhotos?: boolean;
+    /**
+     * 对外脱敏（A15）：AGENT / CUSTOMER 视角只该看到 产品名 / 航班号 / 接待服务标准 / 自己的结算价（订单总价）。
+     * 置 true 时剥离「我方内部口径」——内部备注、结构化四栏、出纳期望到账、售后审计流水、接单运营、运营待办、
+     * 代理预存余额、以及逐项拆价（item.unitPrice / item.amount）。缺省 false（ADMIN/STAFF 看全量，兼容既有调用方）。
+     */
+    redactForExternal?: boolean;
   } = {},
 ) {
   const visaStayDaysById = ctx.visaStayDaysById ?? new Map<string, number | null>();
+  // 对外脱敏开关：仅当显式传 true（AGENT/CUSTOMER 上下文）才剥离内部字段；缺省保留全量。
+  const redact = ctx.redactForExternal === true;
   // 售后费用叠加后的口径：
   //   effectivePayable = total + adjustmentCny（客户实际应付）
   //   balanceDue       = effectivePayable − paidAmount（尾款；负数表示多付）
@@ -5144,6 +5436,21 @@ function serializeOrder<T extends OrderLike>(
     infantUnitPriceCny: perAgePrices?.infantUnitPriceCny ?? null,
     childUnitPriceCny: perAgePrices?.childUnitPriceCny ?? null,
     adultUnitPriceCny: perAgePrices?.adultUnitPriceCny ?? null,
+    // ── 对外脱敏（redact）：内部备注 / 结构化四栏 / 出纳期望到账 / 售后审计流水 / 接单运营 / 运营待办一律不下发。
+    //    这些键都来自上面的 ...order 展开，这里放在其后按角色覆盖：置 undefined 时 JSON.stringify 会自动省略该键。
+    //    保留订单级金额（total/subtotal/paidAmount/effectivePayable/balanceDue = 该角色自己的结算价）与出行人证件
+    //    （代理要凭此替客人办事）；只剥离「我方内部口径」，不影响 ADMIN/STAFF（redact=false 时原样透传）。
+    internalNotes: redact ? undefined : order.internalNotes,
+    noteHotel: redact ? undefined : order.noteHotel,
+    noteVisa: redact ? undefined : order.noteVisa,
+    notePayment: redact ? undefined : order.notePayment,
+    noteSpecial: redact ? undefined : order.noteSpecial,
+    expectedAmountCny: redact ? undefined : order.expectedAmountCny,
+    expectedAmountLocked: redact ? undefined : order.expectedAmountLocked,
+    adjustments: redact ? undefined : order.adjustments,
+    claimedById: redact ? undefined : order.claimedById,
+    claimedBy: redact ? undefined : order.claimedBy,
+    reminders: redact ? [] : order.reminders,
     // 出行人：客户/代理侧剥离 passportPhotoUrl 大图（详情响应瘦身），以 hasPassportPhoto
     // 布尔代替；后台详情保留大图（订单抽屉护照缩略图依赖）。窄 select 无该字段时原样透传。
     passengers: (order.passengers ?? []).map((p) =>
@@ -5155,8 +5462,10 @@ function serializeOrder<T extends OrderLike>(
         ? order.agent
         : {
             ...order.agent,
-            prepaymentBalance:
-              order.agent.prepaymentBalance == null
+            // 对外脱敏：代理预存余额是我方内部结算口径，AGENT/CUSTOMER 不下发（保留结算模式等非金额字段）。
+            prepaymentBalance: redact
+              ? undefined
+              : order.agent.prepaymentBalance == null
                 ? null
                 : order.agent.prepaymentBalance.toString(),
           },
@@ -5177,8 +5486,10 @@ function serializeOrder<T extends OrderLike>(
         (i as { hotelRoomType?: { name?: string | null } | null }).hotelRoomType?.name ?? null;
       return {
         ...i,
-        unitPrice: i.unitPrice.toString(),
-        amount: i.amount.toString(),
+        // 对外脱敏：逐项拆价（单价/小计）是我方内部口径，AGENT/CUSTOMER 只看订单总价，不下发行级金额。
+        //   保留 kind / description / quantity / 行程信息（航班号、出发日期等）等非价格字段。
+        unitPrice: redact ? undefined : i.unitPrice.toString(),
+        amount: redact ? undefined : i.amount.toString(),
         hotelName: ownHotelName ?? bundleFallback?.hotelRoomType?.hotel?.name ?? null,
         // 计费房间数（Decimal → number；未联查/未盖章时为 null，原样透出不强行转换）。
         roomsBilled: decimalOrNull((i as { roomsBilled?: Prisma.Decimal | null }).roomsBilled),
@@ -5190,6 +5501,21 @@ function serializeOrder<T extends OrderLike>(
       };
     }),
   };
+}
+
+/**
+ * 按请求者角色推导 serializeOrder 的对外脱敏口径（A15）。
+ *   - 内部角色（ADMIN / STAFF）：看全量（含护照大图、内部备注、逐项拆价、代理余额…）。
+ *   - 对外角色（AGENT / CUSTOMER）：只看 产品名 / 航班号 / 接待服务标准 / 自己的结算价（订单总价），
+ *     其余「我方内部口径」一律剥离（见 serializeOrder 的 redactForExternal）。
+ * 供订单读取/流转的各调用处统一复用，避免各处重复写角色判断。
+ */
+export function orderSerializeRoleCtx(role: UserRole): {
+  includePassportPhotos: boolean;
+  redactForExternal: boolean;
+} {
+  const isInternal = role === UserRole.ADMIN || role === UserRole.STAFF;
+  return { includePassportPhotos: isInternal, redactForExternal: !isInternal };
 }
 
 // ── 公开订单脱敏视图（A4）────────────────────────────────────────────

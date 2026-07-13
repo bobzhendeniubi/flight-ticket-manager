@@ -44,9 +44,18 @@ export const PRICE_ADJUSTMENT_REASON_LEGACY = [
   'UPGRADE_HOTEL', // 升级酒店（已下线，历史展示用）
   'VISA_MULTI', // 签证改多签（已下线，历史展示用）
 ] as const;
+
+// 专用端点产生、不在录单可选枚举里的 reasonCode（仅用于行 label 展示）。
+// ROOM_DIFF「补收单房差」走订单详情专用「补收单房差」通道（POST /orders/:id/room-supplement），
+// 不通过录单调价旁路——口径同升级酒店必须走「换酒店」：结构化改动不走调价，避免运营隐形。
+export const PRICE_ADJUSTMENT_REASON_ENDPOINT_ONLY = [
+  'ROOM_DIFF', // 补收单房差（由 room-supplement 端点产生，展示用）
+] as const;
+
 export type PriceAdjustmentReasonDisplay =
   | PriceAdjustmentReason
-  | (typeof PRICE_ADJUSTMENT_REASON_LEGACY)[number];
+  | (typeof PRICE_ADJUSTMENT_REASON_LEGACY)[number]
+  | (typeof PRICE_ADJUSTMENT_REASON_ENDPOINT_ONLY)[number];
 
 export const PRICE_ADJUSTMENT_REASON_LABEL: Record<PriceAdjustmentReasonDisplay, string> = {
   DISCOUNT: '优惠',
@@ -56,6 +65,7 @@ export const PRICE_ADJUSTMENT_REASON_LABEL: Record<PriceAdjustmentReasonDisplay,
   UPGRADE_CABIN: '升舱',
   UPGRADE_HOTEL: '升级酒店',
   VISA_MULTI: '签证改多签',
+  ROOM_DIFF: '补收单房差',
 };
 
 export const priceAdjustmentSchema = z
@@ -653,4 +663,33 @@ export const swapItemHotelBodySchema = z.object({
   note: z.string().max(200).optional(),
 });
 export type SwapItemHotelBody = z.infer<typeof swapItemHotelBodySchema>;
+
+// ── T5：更改订单归属代理（PATCH /orders/:id/agent；ADMIN/STAFF）─────────────────
+// 口径 C：任何状态都能改，留审计。agentId=null（或空串归一为 null）= 转直客。
+// 财务不回溯：已发生的收款/代理余额抵扣/佣金流水按原归属，不因改归属而回滚；变更后新产生的按新归属。
+export const changeOrderAgentBodySchema = z.object({
+  // 空串归一为 null（前端「直客」选项传空串）；非空则须是有效代理 id（服务端再校验存在且在用）。
+  agentId: z.preprocess((v) => (v === '' ? null : v), z.string().min(1).nullable()),
+  reason: z.string().max(500).optional(),
+});
+export type ChangeOrderAgentBody = z.infer<typeof changeOrderAgentBodySchema>;
+
+// ── 事后补收单房差（POST /orders/:id/room-supplement；ADMIN/STAFF）───────────────
+// 金额 = perNightCny × nights；新增一条 FEE 调整行 + 重算 order.subtotal/total + 追加审计流水。
+// 仅含 BUNDLE/HOTEL 行的订单可用（纯机票单无住宿 → 服务端拒绝）。
+export const ROOM_SUPPLEMENT_MAX_NIGHTS = 60;
+export const roomSupplementBodySchema = z.object({
+  perNightCny: z
+    .number()
+    .int('每晚金额必须为整数（CNY）')
+    .positive('每晚金额必须大于 0')
+    .max(POST_SALE_FEE_CAP_CNY, `每晚金额超出上限（${POST_SALE_FEE_CAP_CNY}）`),
+  nights: z
+    .number()
+    .int('晚数必须为整数')
+    .min(1, '晚数至少 1')
+    .max(ROOM_SUPPLEMENT_MAX_NIGHTS, `晚数最多 ${ROOM_SUPPLEMENT_MAX_NIGHTS}`),
+  note: z.string().max(500).optional(),
+});
+export type RoomSupplementBody = z.infer<typeof roomSupplementBodySchema>;
 

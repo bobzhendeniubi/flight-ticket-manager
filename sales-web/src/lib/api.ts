@@ -289,8 +289,10 @@ export interface OrderItem {
   kind: OrderItemKind;
   description: string;
   quantity: number;
-  unitPrice: string;
-  amount: string;
+  // 逐项拆价（单价/小计）是我方内部口径：后端对 CUSTOMER/AGENT 视角不下发（见 serializeOrder 脱敏），
+  // 故为可选。前台只按「产品名 + 订单总价」打包展示，不逐项拆价。
+  unitPrice?: string;
+  amount?: string;
   flightScheduleId: string | null;
   flightCabin: CabinClass | null;
   hotelRoomTypeId: string | null;

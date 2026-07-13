@@ -13,8 +13,10 @@ import { OrderService, type OrderRequester } from './orders.service.js';
 import {
   batchCreateOrdersBodySchema,
   batchUpdateStatusBodySchema,
+  changeOrderAgentBodySchema,
   changeRequestBodySchema,
   createOrderBodySchema,
+  roomSupplementBodySchema,
   exportRoomAllocationQuerySchema,
   exportTemplatesQuerySchema,
   listOrdersQuerySchema,
@@ -1350,6 +1352,75 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         feeCny: audit.feeCny,
         untrackedNights: audit.untrackedNights,
         note: body.note,
+      },
+      severity: 'WARNING',
+    });
+    return { order };
+  });
+
+  // ── T5 更改订单归属代理（ADMIN/STAFF）──
+  // PATCH /orders/:id/agent  body: { agentId: string | null, reason? }
+  // 口径 C：任何状态都能改，留审计。财务不回溯（已发生的收款/余额抵扣/佣金按原归属，不回滚；
+  // 变更后新产生的按新归属）。若曾用原代理预存余额抵扣，响应带 warning 提醒核对财务归属。
+  app.patch('/:id/agent', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅运营/管理员可更改订单归属代理' });
+    }
+    const { id } = req.params as { id: string };
+    const body = changeOrderAgentBodySchema.parse(req.body);
+    const { order, warning, audit } = await service.changeOrderAgent(id, body, {
+      userId: req.user.sub,
+      role,
+    });
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'CHANGE_ORDER_AGENT',
+      targetType: 'ORDER',
+      targetId: id,
+      targetLabel: audit.orderNumber,
+      before: { agentId: audit.before.agentId, agentName: audit.before.agentName },
+      after: {
+        agentId: audit.after.agentId,
+        agentName: audit.after.agentName,
+        reason: audit.reason,
+        usedAgentBalance: audit.usedAgentBalance,
+      },
+      severity: 'WARNING',
+    });
+    return { order, warning };
+  });
+
+  // ── 事后补收单房差（ADMIN/STAFF）──
+  // POST /orders/:id/room-supplement  body: { perNightCny, nights, note? }
+  // 金额 = perNightCny × nights；新增 FEE 行 + 重算 order.subtotal/total + 追加审计流水。
+  // 仅含 BUNDLE/HOTEL 行的订单可用（纯机票单无住宿 → 400）。
+  app.post('/:id/room-supplement', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅运营/管理员可补收单房差' });
+    }
+    const { id } = req.params as { id: string };
+    const body = roomSupplementBodySchema.parse(req.body);
+    const { order, audit } = await service.addRoomSupplement(id, body, {
+      userId: req.user.sub,
+      role,
+    });
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'ADD_ROOM_SUPPLEMENT',
+      targetType: 'ORDER',
+      targetId: id,
+      targetLabel: audit.orderNumber,
+      before: { subtotal: audit.before.subtotal, total: audit.before.total },
+      after: {
+        subtotal: audit.after.subtotal,
+        total: audit.after.total,
+        perNightCny: audit.perNightCny,
+        nights: audit.nights,
+        amountCny: audit.amountCny,
+        itemId: audit.itemId,
+        note: audit.note,
       },
       severity: 'WARNING',
     });

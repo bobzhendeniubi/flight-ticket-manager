@@ -579,9 +579,6 @@ export function MyOrdersPage() {
                                 </span>
                               )}
                             </div>
-                            <div className="font-semibold text-ink nums">
-                              ¥{Number(it.amount).toLocaleString()}
-                            </div>
                           </div>
                           {changed && (
                             <div className="mt-1.5 rounded-lg bg-rose-50 px-2.5 py-1.5 text-xs leading-relaxed text-rose-700">
@@ -594,6 +591,11 @@ export function MyOrdersPage() {
                       );
                     })}
                   </ul>
+                  {/* 打包展示订单总价（= 买家自己的结算价）；行级金额属我方内部口径，后端对 CUSTOMER 不下发，故不逐项拆价。 */}
+                  <div className="mt-2 flex items-center justify-between border-t border-slate-100 pt-2 text-sm">
+                    <span className="text-ink-muted">订单总额</span>
+                    <span className="price">¥{(Number(o.total) || 0).toLocaleString()}</span>
+                  </div>
                 </div>
 
                 {/* 出行人（用 detail，因为列表只 select fullName，没有 documentType/Number）
