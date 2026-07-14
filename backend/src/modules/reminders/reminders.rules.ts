@@ -5,7 +5,12 @@
  *   1. BALANCE_DUE      催尾款：临近出发仍有尾款未收
  *   2. DEPARTURE_SOON   出行提醒：3 天内出发的已付订单
  *   3. PASSPORT_EXPIRY  护照有效期：距出发不足 6 个月
- *   4. VISA_MISSING     签证缺件：在办签证任务下有乘客缺护照照片
+ *   4. VISA_MISSING     签证缺件：在办签证任务下有乘客缺护照照片（排除自备签乘客，见下）
+ *
+ * 各规则与「自备签证」（Passenger.visaExempt=true：客人自行办妥签证，无需送签）的口径：
+ *   - 规则 4 签证缺件：按签证台同口径排除自备签乘客（visaExempt=true）——客人自备签证
+ *     不需要我们收护照照片，不应被催缺件。
+ *   - 规则 3 护照有效期：不排除。护照有效期是所有出行乘客的通用要求，与签证是否自备无关。
  *
  * 幂等：每条候选算出确定性 ruleKey（唯一索引），已存在同 key 的跳过；
  * 重复触发生成不会刷屏。所有日期比较用 UTC 日期字符串（YYYY-MM-DD），
@@ -185,7 +190,7 @@ export interface RuleVisaTask {
   orderId: string;
   orderNumber: string;
   items: DepartureSourceItem[];
-  /** 缺护照照片的乘客姓名（已在库内过滤，不拉大字段） */
+  /** 缺护照照片的乘客姓名（已在库内过滤：不拉大字段 + 排除自备签乘客 visaExempt=true） */
   missingPassengerNames: string[];
 }
 
@@ -338,9 +343,13 @@ export async function generateRuleReminders(
                     flightSchedule: { select: { departureTime: true, departureTz: true } },
                   },
                 },
-                // 只取缺照片乘客的姓名；护照大图（base64 可达数 MB）绝不拉到应用层
+                // 只取缺照片乘客的姓名；护照大图（base64 可达数 MB）绝不拉到应用层。
+                // 自备签证乘客（visaExempt=true）不催缺件——与签证台同口径（见 fulfillment.service.ts listByOrder）。
                 passengers: {
-                  where: { OR: [{ passportPhotoUrl: null }, { passportPhotoUrl: '' }] },
+                  where: {
+                    visaExempt: false,
+                    OR: [{ passportPhotoUrl: null }, { passportPhotoUrl: '' }],
+                  },
                   select: { fullName: true },
                 },
               },

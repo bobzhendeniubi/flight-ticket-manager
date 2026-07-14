@@ -3,7 +3,8 @@
  *
  * 覆盖：
  *   1. determineFlightLegs：去程/回程按 departureTime 升序判定；单程/多段/缺字段
- *   2. countIssuedPassengers：某班次已开票乘客数按「该班次是订单去程 ? outboundInvoiced : returnInvoiced」计
+ *   2. countIssuedPassengers：某班次已开票乘客数按「该班次是订单去程 ? outboundInvoiced : returnInvoiced」计，
+ *      且订单状态需在 COUNTED_STATUSES 内——取消族订单（如已开票后转 CANCELLED）不再占额度
  *   3. assertTicketingCap：未超限放行 / 恰好到上限放行 / 超限抛 422 / 班次不存在跳过 / 去重 / 自定义上限
  *   4. OrderService.setInvoiceFlags：翻某航段为已开时校验对应班次上限；翻回未开/系统开不校验；订单不存在 404
  */
@@ -11,6 +12,7 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { OrderStatus } from '@prisma/client';
 import {
   assertTicketingCap,
   countIssuedPassengers,
@@ -39,6 +41,7 @@ import { OrderService } from './orders.service.js';
 // ── 测试数据小工具 ─────────────────────────────────────────────────────────
 type Leg = [scheduleId: string, departISO: string];
 interface FakeOrder {
+  status: OrderStatus;
   outboundInvoiced: boolean;
   returnInvoiced: boolean;
   _count: { passengers: number };
@@ -47,9 +50,10 @@ interface FakeOrder {
 function fakeOrder(
   pax: number,
   legs: Leg[],
-  flags: { out?: boolean; ret?: boolean } = {},
+  flags: { out?: boolean; ret?: boolean; status?: OrderStatus } = {},
 ): FakeOrder {
   return {
+    status: flags.status ?? OrderStatus.PAID, // 未指定时默认落在 COUNTED_STATUSES 内，保持既有用例行为
     outboundInvoiced: flags.out ?? false,
     returnInvoiced: flags.ret ?? false,
     _count: { passengers: pax },
@@ -61,6 +65,8 @@ function fakeOrder(
 }
 
 // assertTicketingCap / countIssuedPassengers 用的轻量 fake db（无需 vi.mock，直接传参）
+// order.findMany 会按传入的 where.status.in 实际过滤 opts.orders —— 用来验证
+// countIssuedPassengers 真的把 status 过滤条件下推给了查询，而不是查回全部订单再各自判定。
 function fakeDb(opts: { cap: number | null; orders: FakeOrder[] }) {
   return {
     flightSchedule: {
@@ -68,7 +74,17 @@ function fakeDb(opts: { cap: number | null; orders: FakeOrder[] }) {
         .fn()
         .mockResolvedValue(opts.cap === null ? null : { ticketingCap: opts.cap }),
     },
-    order: { findMany: vi.fn().mockResolvedValue(opts.orders) },
+    order: {
+      findMany: vi
+        .fn()
+        .mockImplementation((args: { where?: { status?: { in: OrderStatus[] } } } = {}) => {
+          const allowed = args.where?.status?.in;
+          const filtered = allowed
+            ? opts.orders.filter((o) => allowed.includes(o.status))
+            : opts.orders;
+          return Promise.resolve(filtered);
+        }),
+    },
   };
 }
 type FakeDb = ReturnType<typeof fakeDb>;
@@ -173,6 +189,35 @@ describe('countIssuedPassengers', () => {
       ],
     });
     await expect(countIssuedPassengers(asDb(db), SHARED)).resolves.toBe(9);
+  });
+
+  it('已开票后订单转 CANCELLED → 不再计入 issued，额度释放（P1-11）', async () => {
+    const db = fakeDb({
+      cap: 191,
+      orders: [
+        // 已开票但订单已取消 → 不应计入占额
+        fakeOrder(3, [[OUT, OUT_ISO]], { out: true, status: OrderStatus.CANCELLED }),
+        // 已开票且订单仍是有效状态 → 正常计入
+        fakeOrder(2, [[OUT, OUT_ISO]], { out: true, status: OrderStatus.TICKETED }),
+      ],
+    });
+    await expect(countIssuedPassengers(asDb(db), OUT)).resolves.toBe(2);
+  });
+
+  it('已开票后订单转 REFUNDED / PAYMENT_TIMEOUT / FAILED / DRAFT → 均不计入 issued', async () => {
+    const cancelFamily = [
+      OrderStatus.REFUNDED,
+      OrderStatus.PAYMENT_TIMEOUT,
+      OrderStatus.FAILED,
+      OrderStatus.DRAFT,
+    ];
+    for (const status of cancelFamily) {
+      const db = fakeDb({
+        cap: 191,
+        orders: [fakeOrder(5, [[OUT, OUT_ISO]], { out: true, status })],
+      });
+      await expect(countIssuedPassengers(asDb(db), OUT)).resolves.toBe(0);
+    }
   });
 });
 

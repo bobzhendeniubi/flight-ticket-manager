@@ -1,7 +1,12 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { UserRole } from '@prisma/client';
-import { FlightService, capPublicAvailable, sanitizePublicSeatBreakdown } from './flights.service.js';
+import {
+  FlightService,
+  capPublicAvailable,
+  sanitizePublicSeatBreakdown,
+  serializeScheduleForAgent,
+} from './flights.service.js';
 import { PricingService } from '../pricing/pricing.service.js';
 import { actorFromRequest } from '../../lib/audit.js';
 import { priceQuerySchema } from '../pricing/pricing.schemas.js';
@@ -81,16 +86,10 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
     async (req) => {
       const { flightId } = req.params as { flightId: string };
       const schedules = await service.listSchedules(flightId);
-      // 代理可读班次（批量创单需要），但不可见成本字段 —— 剥离防泄露毛利
+      // 代理可读班次（批量创单需要），但不可见成本字段 —— 走白名单序列化防泄露毛利
+      // （黑名单式逐字段剥离在 FlightSchedule 新增成本字段时会漏改，见 serializeScheduleForAgent 注释）
       if (req.user.role === UserRole.AGENT) {
-        const sanitized = schedules.map((s) => {
-          const { charterCostCny, airportTaxDepCny, airportTaxArrCny, ...rest } = s;
-          void charterCostCny;
-          void airportTaxDepCny;
-          void airportTaxArrCny;
-          return rest;
-        });
-        return { schedules: sanitized };
+        return { schedules: schedules.map(serializeScheduleForAgent) };
       }
       return { schedules };
     },

@@ -14,6 +14,10 @@
  *   - 仅已售部分毛利 = revenue - 已售座位成本（忽略空座）
  *
  * 老数据（cost 字段为 NULL）会被自动跳过统计，并在响应里标 missingCostItemCount。
+ *
+ * REFUNDED 订单：不计入按 OrderItem 展开的分品类收入/成本（COUNTED_STATUSES 里明确排除），
+ * 但会按订单级"已收-已退净额"（paidAmount − 已完成退款）补一笔负项到
+ * revenueBreakdown.refund / revenueCny，避免"先收后退"的订单整单从统计消失、长期对不平。
  */
 import type { Prisma, PrismaClient } from '@prisma/client';
 import { OrderStatus } from '@prisma/client';
@@ -40,7 +44,7 @@ export interface CategoryBreakdown {
   orderItemCount: number;
 }
 
-/** 收入细分（财务口径，10 项；机场税收入按 pass-through = 对应 leg 机场税成本） */
+/** 收入细分（财务口径；机场税收入按 pass-through = 对应 leg 机场税成本；refund 见下） */
 export interface RevenueBreakdown {
   outboundFlight: number;     // 去程机票收入
   returnFlight: number;       // 返程机票收入
@@ -53,6 +57,17 @@ export interface RevenueBreakdown {
   upgradeChange: number;      // 升舱+改期收入
   oversale: number;           // 超售收入
   uncategorized: number;      // 上面没归类的（FEE/DISCOUNT/INSURANCE/BUNDLE 等）
+  /**
+   * REFUNDED 订单的已收-已退净额，按订单一次性计入（该订单 createdAt 落在本区间内即计）。
+   * = Σ(paidAmount − 已完成退款金额)，逐单累加。
+   * 通常 ≥ 0（全额退款 = 0；退款时扣手续费/违约金留存 = 正数）；若出现负数，说明退款
+   * 金额超过实收，属数据异常，建议核查（这里不做 clamp，保留真实数值便于发现问题）。
+   * 修复点：REFUNDED 不在 COUNTED_STATUSES 里，之前这类订单的收入会整单从统计消失，
+   * 导致 revenue 与实收长期对不平；现在按订单级净额补一笔，而不是让它蒸发。
+   * 注意：这笔净额不参与上面的分品类明细（不逐 OrderItem 展开），也不计入 costCny/
+   * costBreakdown（成本快照口径不变）——刻意的最小侵入取舍，避免打乱现有分品类成本结构。
+   */
+  refund: number;
   total: number;              // 总和
 }
 
@@ -79,7 +94,14 @@ export interface CostBreakdown {
 
 export interface FinancesSummary {
   range: DateRange;
-  /** 已下单总收入（OrderItem.amount，未扣税费）— 含尚未支付的订单 */
+  /**
+   * 总收入口径 = 已下单收入（OrderItem.amount，未扣税费；含 PENDING_PAYMENT，即"预期/已下单
+   * 收入"口径，不是"已收款"口径——是否需要另开"只算实收"口径待确认，不擅自改，
+   * 见 COUNTED_STATUSES 上方注释）+ REFUNDED 订单的已收-已退净额（revenueBreakdown.refund，
+   * 避免"先收后退"的订单整单从收入消失）。
+   * 与 costCny 的口径不对称：costCny 不含 REFUNDED 订单的成本快照（保持现有分品类成本
+   * 结构不变，是刻意的最小侵入取舍）。
+   */
   revenueCny: number;
   /** 已锁定成本总额 */
   costCny: number;
@@ -91,11 +113,13 @@ export interface FinancesSummary {
   emptySeatSunkCostCny: number;
   /** 航班贡献毛利（财务定名，原"净利"）= grossMargin - emptySeatSunkCost，未扣公司期间费用 */
   netMarginCny: number;
-  /** 该区间内的订单数（不含 DRAFT / CANCELLED） */
+  /** 该区间内的订单数（不含 DRAFT / CANCELLED）；不含 REFUNDED（REFUNDED 订单只贡献
+   *  revenueBreakdown.refund 这一笔净额，不计入这里的订单数） */
   orderCount: number;
   /** 该区间内 OrderItem 没填 cost 的条目数（用于提醒补录） */
   missingCostItemCount: number;
-  /** 旧 UI 兼容：按 OrderItem.kind 粗分 */
+  /** 旧 UI 兼容：按 OrderItem.kind 粗分——不含 REFUNDED 订单的已收-已退净额（那笔净额只在
+   *  revenueBreakdown.refund 里），故这里各行相加可能与 revenueCny 略有差异，是预期行为 */
   categories: CategoryBreakdown[];
   /** 新：按财务口径细分 */
   revenueBreakdown: RevenueBreakdown;
@@ -150,6 +174,15 @@ export interface MonthlyPoint {
 }
 
 // 计入营收的订单状态：排除 DRAFT/CANCELLED/PAYMENT_TIMEOUT/REFUNDED/FAILED
+//
+// 口径待确认（不擅自改，标注）：这里含 PENDING_PAYMENT——未付款的订单也计入 revenueCny。
+// 这大概率是有意的"预期/已下单收入"口径（下单即算，不等实际到账），而非"已收款"口径。
+// 如果财务需要的是"只算实收"，需要另开一个单独的实收统计，不应直接从这个口径改，
+// 否则会跟当前依赖它的报表/导出产生连锁变化。
+//
+// REFUNDED 不在这个列表里（明确排除，不是遗漏）：REFUNDED 订单不走下面按 OrderItem 展开
+// 的分品类逻辑，而是在 getFinancesSummary 里单独查询、按订单级"已收-已退净额"补一笔负项
+// 到 revenueBreakdown.refund（见该字段注释）——避免"先收后退"的订单整单从统计消失。
 const COUNTED_STATUSES: OrderStatus[] = [
   OrderStatus.PENDING_PAYMENT,
   OrderStatus.PAID,
@@ -247,7 +280,7 @@ export async function getFinancesSummary(
   const rev: RevenueBreakdown = {
     outboundFlight: 0, returnFlight: 0, outboundTax: 0, returnTax: 0,
     hotel: 0, visa: 0, transfer: 0, guide: 0, upgradeChange: 0, oversale: 0,
-    uncategorized: 0, total: 0,
+    uncategorized: 0, refund: 0, total: 0,
   };
   const cost: CostBreakdown = {
     outboundCharter: 0, returnCharter: 0, outboundTax: 0, returnTax: 0,
@@ -396,13 +429,32 @@ export async function getFinancesSummary(
     }
   }
 
+  // ── 4) REFUNDED 订单：已收-已退净额，按订单一次性补一笔负项到 revenue（而非蒸发）──
+  // 见 RevenueBreakdown.refund 的字段注释：REFUNDED 订单不在上面的 COUNTED_STATUSES 查询里，
+  // 不逐 OrderItem 展开（不影响分品类明细/costCny/costBreakdown），只按订单级净额累加。
+  const refundedOrders = await client.order.findMany({
+    where: { deletedAt: null, createdAt: { gte: from, lte: to }, status: OrderStatus.REFUNDED },
+    select: {
+      paidAmount: true,
+      refunds: { where: { status: 'COMPLETED' }, select: { amount: true } },
+    },
+  });
+  let refundedNetCny = 0;
+  for (const o of refundedOrders) {
+    const refundedTotal = o.refunds.reduce((sum, r) => sum + dec(r.amount), 0);
+    refundedNetCny += dec(o.paidAmount) - refundedTotal;
+  }
+  rev.refund += refundedNetCny;
+  revenueCny += refundedNetCny;
+
   // 总计 + 四舍五入
   const round = (n: number): number => round2(n);
   for (const k of Object.keys(rev) as (keyof RevenueBreakdown)[]) rev[k] = round(rev[k]);
   for (const k of Object.keys(cost) as (keyof CostBreakdown)[]) cost[k] = round(cost[k]);
   rev.total = round(
     rev.outboundFlight + rev.returnFlight + rev.outboundTax + rev.returnTax +
-    rev.hotel + rev.visa + rev.transfer + rev.guide + rev.upgradeChange + rev.oversale + rev.uncategorized,
+    rev.hotel + rev.visa + rev.transfer + rev.guide + rev.upgradeChange + rev.oversale +
+    rev.uncategorized + rev.refund,
   );
   cost.total = round(
     cost.outboundCharter + cost.returnCharter + cost.outboundTax + cost.returnTax +

@@ -174,13 +174,17 @@ export class AgentService {
         },
       });
 
+      // 余额恒为 0：不在建代理时裸设初始余额（会绕过流水与审计）。
+      // Agent.prepaymentBalance 有 @default(0)，此处不写该字段即落 0。
+      // 若确有「开户预存」需求，建完代理后走已有认款通道 —— agent-recharges 的
+      // manualAdjust（人工调整）或 confirm（认款到账），两者都在同一事务内
+      // 原子生成 PrepaymentTransaction 并加余额，留有流水+审计。铁律：余额只能这样产生。
       const agent = await tx.agent.create({
         data: {
           userId: user.id,
           companyName: body.companyName,
           contactName: body.contactName,
           contactPhone: body.contactPhone,
-          prepaymentBalance: body.prepaymentBalance,
           parentAgentId: resolvedParentId,
           tier: parentTier + 1,
           notes: body.notes,

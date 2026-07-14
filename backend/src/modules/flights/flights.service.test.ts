@@ -10,6 +10,7 @@
  * capacity 缺省 100——数值上与旧版绝对阈值（5/15/40）完全等价，供历史调用方零行为变更接入。
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import type { Prisma } from '@prisma/client';
 
 // flights.service 顶层会实例化 PricingService 并引用 prisma —— 先 mock 掉。
 // vi.mock 工厂会被 hoist 到文件顶部，故用 vi.hoisted 构造 prismaMock 供工厂与用例共用。
@@ -58,6 +59,7 @@ import {
   computeAvailabilityTier,
   FlightService,
   sanitizePublicSeatBreakdown,
+  serializeScheduleForAgent,
 } from './flights.service.js';
 
 describe('computeAvailabilityTier · 缺省 capacity（向后兼容旧版绝对阈值）', () => {
@@ -217,6 +219,125 @@ describe('sanitizePublicSeatBreakdown · 公开口径 seatIndex 脱敏（防反�
     expect(raw[0].seatIndex).toBe(42); // 原数组未被就地修改
     expect(sanitized).not.toBe(raw);
     expect(sanitized[0]).not.toBe(raw[0]);
+  });
+});
+
+// ── serializeScheduleForAgent（AGENT 视角班次白名单：防成本字段泄露反推毛利）──────
+// 回归：GET /flights/:id/schedules 曾用黑名单只删 charterCostCny/airportTaxDepCny/
+// airportTaxArrCny 三项，漏了 FlightSchedule 上后补的 fuelCostCny/peakSurchargeCny/
+// aircraftAdjustCny/takeoffDiscountCny 四个 per-passenger 成本字段——随响应下发给 AGENT。
+// 改成白名单（只选 AGENT 需要的字段）后，任何现有或未来新增的成本字段都不会再漏出去。
+describe('serializeScheduleForAgent · AGENT 视角班次白名单（防成本字段泄露）', () => {
+  const decimal = (n: number) => ({ toString: () => String(n) }) as unknown as Prisma.Decimal;
+
+  // 完整 listSchedules() 返回形：顶层 FlightSchedule 全字段（含 7 个成本字段）+
+  // seatClasses 带 locked/available（另外塞一个未来可能新增的成本字段，验证白名单
+  // 不依赖字段名单，而是不认识的字段一律不进白名单——不会因为漏改字段名而复发）。
+  const fullSchedule = () => ({
+    id: 'sched_1',
+    flightId: 'flight_1',
+    departureTime: new Date('2026-08-01T01:00:00.000Z'),
+    arrivalTime: new Date('2026-08-01T04:00:00.000Z'),
+    departureTz: 'Asia/Shanghai',
+    arrivalTz: 'Asia/Macau',
+    charterCostCny: decimal(80000),
+    airportTaxDepCny: decimal(120),
+    airportTaxArrCny: decimal(150),
+    fuelCostCny: decimal(200),
+    peakSurchargeCny: decimal(300),
+    aircraftAdjustCny: decimal(-50),
+    takeoffDiscountCny: decimal(-20),
+    ticketingCap: 191,
+    isActive: true,
+    createdAt: new Date('2026-01-01T00:00:00.000Z'),
+    updatedAt: new Date('2026-01-02T00:00:00.000Z'),
+    // 未来新增的成本字段（假设名字完全不含 Cost/Surcharge/Adjust/Discount）——
+    // 白名单靠"只挑需要的字段"而非"认字段名黑名单"，这类字段同样必须被挡掉。
+    futureMysteryMarginField: decimal(999),
+    seatClasses: [
+      {
+        id: 'sc_eco',
+        scheduleId: 'sched_1',
+        cabin: 'ECONOMY' as const,
+        capacity: 200,
+        sold: 30,
+        basePrice: decimal(3000),
+        fareBuckets: [{ quota: 20, price: 3200 }],
+        createdAt: new Date('2026-01-01T00:00:00.000Z'),
+        updatedAt: new Date('2026-01-02T00:00:00.000Z'),
+        locked: 5,
+        available: 165,
+      },
+    ],
+  });
+
+  it('剥离全部 7 个已知成本字段（charter/机场税×2/燃油/高峰/机型调整/起降折扣）', () => {
+    const result = serializeScheduleForAgent(fullSchedule());
+    const keys = Object.keys(result);
+    expect(keys).not.toContain('charterCostCny');
+    expect(keys).not.toContain('airportTaxDepCny');
+    expect(keys).not.toContain('airportTaxArrCny');
+    expect(keys).not.toContain('fuelCostCny');
+    expect(keys).not.toContain('peakSurchargeCny');
+    expect(keys).not.toContain('aircraftAdjustCny');
+    expect(keys).not.toContain('takeoffDiscountCny');
+  });
+
+  it('响应（含 seatClasses 内）不含任何 *CostCny/*SurchargeCny/*AdjustCny/*DiscountCny 字段', () => {
+    const result = serializeScheduleForAgent(fullSchedule());
+    const costFieldPattern = /CostCny$|SurchargeCny$|AdjustCny$|DiscountCny$/u;
+    const topLevelKeys = Object.keys(result);
+    expect(topLevelKeys.some((k) => costFieldPattern.test(k))).toBe(false);
+    for (const seatClass of result.seatClasses) {
+      const seatClassKeys = Object.keys(seatClass);
+      expect(seatClassKeys.some((k) => costFieldPattern.test(k))).toBe(false);
+    }
+  });
+
+  it('白名单是"选字段"而非"删字段"：不认识的字段（含未来新增）一律不透传', () => {
+    const result = serializeScheduleForAgent(fullSchedule());
+    expect(result).not.toHaveProperty('futureMysteryMarginField');
+    expect(result).not.toHaveProperty('createdAt');
+    expect(result).not.toHaveProperty('updatedAt');
+    expect(result.seatClasses[0]).not.toHaveProperty('scheduleId');
+    expect(result.seatClasses[0]).not.toHaveProperty('createdAt');
+    expect(result.seatClasses[0]).not.toHaveProperty('updatedAt');
+  });
+
+  it('保留 AGENT 批量创单需要的字段：航班/时刻/舱位/余位/售价类', () => {
+    const result = serializeScheduleForAgent(fullSchedule());
+    expect(result).toMatchObject({
+      id: 'sched_1',
+      flightId: 'flight_1',
+      departureTz: 'Asia/Shanghai',
+      arrivalTz: 'Asia/Macau',
+      ticketingCap: 191,
+      isActive: true,
+    });
+    expect(result.departureTime).toEqual(new Date('2026-08-01T01:00:00.000Z'));
+    expect(result.arrivalTime).toEqual(new Date('2026-08-01T04:00:00.000Z'));
+    expect(result.seatClasses).toHaveLength(1);
+    // basePrice 用 toString() 比较（而非 toEqual 整个 seatClass）——decimal() 每次调用
+    // 都新建一个带 toString 闭包的替身对象，toEqual 对函数属性按引用比较会误判不等。
+    expect(result.seatClasses[0].basePrice.toString()).toBe('3000');
+    expect(result.seatClasses[0]).toMatchObject({
+      id: 'sc_eco',
+      cabin: 'ECONOMY',
+      capacity: 200,
+      sold: 30,
+      fareBuckets: [{ quota: 20, price: 3200 }],
+      locked: 5,
+      available: 165,
+    });
+  });
+
+  it('多班次批量映射（route 层 schedules.map(serializeScheduleForAgent) 的实际用法）', () => {
+    const schedules = [fullSchedule(), { ...fullSchedule(), id: 'sched_2', seatClasses: [] }];
+    const result = schedules.map(serializeScheduleForAgent);
+    expect(result).toHaveLength(2);
+    expect(result[0].id).toBe('sched_1');
+    expect(result[1]).toMatchObject({ id: 'sched_2', seatClasses: [] });
+    result.forEach((r) => expect(r).not.toHaveProperty('charterCostCny'));
   });
 });
 

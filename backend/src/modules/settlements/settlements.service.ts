@@ -27,6 +27,7 @@ import {
 import { prisma } from '../../db/prisma.js';
 import {
   BadRequestError,
+  ConflictError,
   ForbiddenError,
   NotFoundError,
 } from '../../lib/errors.js';
@@ -90,13 +91,17 @@ export class SettlementService {
       const settlement = await prisma.$transaction(async (tx) => {
         let s;
         if (existing) {
-          // 先解绑旧 records（回到 unlinked 状态），再更新主体
-          await tx.commissionRecord.updateMany({
-            where: { settlementId: existing.id },
-            data: { settlementId: null },
-          });
-          s = await tx.settlement.update({
-            where: { id: existing.id },
+          // ── 原子 CAS：只允许「非已审核/已支付」的当期结算单被重算 ──
+          // existing.status 是事务外读的快照；此后可能被并发 updateStatus 推到 APPROVED/PAID。
+          // 无 CAS 时 overwrite 分支会无条件把它打回 DRAFT 并解绑 records —— 若已 PAID：offset 已扣、
+          // records 已 SETTLED 却被解绑回 unlinked → 账面孤儿 + 下期 generate 重复计入双付。
+          // 用 updateMany 附加 status notIn[APPROVED,PAID] 一步完成「检查+重置」：拿到行锁的同时确认
+          // 状态可重算，命中 count=1；被并发推进到 APPROVED/PAID 则 count=0 → 拒绝重算（整体回滚）。
+          const casReset = await tx.settlement.updateMany({
+            where: {
+              id: existing.id,
+              status: { notIn: [SettlementStatus.APPROVED, SettlementStatus.PAID] },
+            },
             data: {
               orderCount: computed.orderCount,
               grossRevenue: new Prisma.Decimal(computed.grossRevenue),
@@ -111,6 +116,17 @@ export class SettlementService {
               paidAt: null,
             },
           });
+          if (casReset.count !== 1) {
+            throw new ConflictError(
+              `结算单 ${period} 已被并发推进到已审核/已支付，拒绝重算；如需重算请先作废该单`,
+            );
+          }
+          // 状态已确认可重算且行锁在手：解绑旧 records（回 unlinked），下方再按新计算重新绑定。
+          await tx.commissionRecord.updateMany({
+            where: { settlementId: existing.id },
+            data: { settlementId: null },
+          });
+          s = await tx.settlement.findUniqueOrThrow({ where: { id: existing.id } });
         } else {
           s = await tx.settlement.create({
             data: {
@@ -394,6 +410,30 @@ export class SettlementService {
     }
 
     const updated = await prisma.$transaction(async (tx) => {
+      // ── 原子 CAS：where 附加事务外读到的当前状态，一步完成「校验+推进」──
+      // 铁律：一笔钱最多入账/扣账一次。两个并发的 APPROVED→PAID（或 APPROVED→PAID 与
+      // APPROVED→VOIDED 抢跑）都能基于同一份事务外快照进事务；仅靠 Agent FOR UPDATE 只串行化
+      // 余额扣减本身，挡不住第二个事务再按同一 prepaymentOffset 写一条 OFFSET、再扣一次余额、
+      // 把结算单二次标 PAID / records 二次 SETTLED。这里先对 Settlement 行做 CAS 抢锁：
+      // 第一个事务把 status 从快照值改成 toStatus（拿到行锁，count=1）；第二个事务的 UPDATE
+      // 在 READ COMMITTED 下阻塞到第一个提交后，重判 where（status 已非快照值）→ count=0 →
+      // 抛 Conflict 整体回滚，绝不进入后面的扣余额 / 写 OFFSET / 翻 records。CAS 先于所有副作用，
+      // 因此第二个事务连 Agent FOR UPDATE 都到不了（天然无锁序死锁）。
+      const casResult = await tx.settlement.updateMany({
+        where: { id, status: s.status },
+        data: {
+          status: toStatus,
+          notes: notes ?? s.notes,
+          approvedAt: toStatus === 'APPROVED' ? new Date() : s.approvedAt,
+          paidAt: toStatus === 'PAID' ? new Date() : s.paidAt,
+        },
+      });
+      if (casResult.count !== 1) {
+        throw new ConflictError(
+          `结算单状态已被并发修改（期望 ${s.status}，请重试）`,
+        );
+      }
+
       // 标记 PAID：records SETTLED + 写 PrepaymentTransaction（若 offset>0）
       if (toStatus === 'PAID') {
         await tx.commissionRecord.updateMany({
@@ -436,22 +476,21 @@ export class SettlementService {
         }
       }
 
-      // VOIDED：records 回 ACCRUED（可重算）
+      // VOIDED：records 回 ACCRUED（可重算）。CAS 已抢到本次流转，故这里的 records 回滚
+      // 每单只会执行一次；并发的第二个 VOID（或 PAID 抢跑）已在 CAS 处被挡下回滚。
+      // 解绑 where 额外押 status=ACCRUED：绝不碰已 SETTLED 的记录 —— 那属于已扣 offset 的
+      // 已支付结算单，若被解绑回 unlinked 会被下期 generate 重复计入 → 佣金双付。此过滤与
+      // PAID 分支的 ACCRUED→SETTLED 天然互斥：同一条记录不会同时被两个方向命中。
       if (toStatus === 'VOIDED') {
         await tx.commissionRecord.updateMany({
-          where: { settlementId: s.id },
-          data: { settlementId: null, status: CommissionStatus.ACCRUED, settledAt: null },
+          where: { settlementId: s.id, status: CommissionStatus.ACCRUED },
+          data: { settlementId: null, settledAt: null },
         });
       }
 
-      return tx.settlement.update({
+      // 状态/notes/时间戳已由上面的 CAS 原子写入；这里只读回带 include 的完整结算单返回。
+      return tx.settlement.findUniqueOrThrow({
         where: { id },
-        data: {
-          status: toStatus,
-          notes: notes ?? s.notes,
-          approvedAt: toStatus === 'APPROVED' ? new Date() : s.approvedAt,
-          paidAt: toStatus === 'PAID' ? new Date() : s.paidAt,
-        },
         include: {
           agent: {
             select: {

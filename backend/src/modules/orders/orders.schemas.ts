@@ -513,6 +513,10 @@ export const batchCreateOrdersBodySchema = z
 
     // ── BUNDLE ─────────────────────────────────────────────────────────────────
     bundleId: z.string().optional(),
+    // 套餐出发日期（YYYY-MM-DD）：批量套餐子单据此匹配套餐绑定航班的当日班次，注入去/回程 FLIGHT 行
+    //   → 机票座位 + 房控盖章一次对上。缺省回落 bundle.defaultDepartDate（service 层解析）；两者都缺则该批
+    //   逐单优雅失败（不阻断整批）。
+    bundleDepartDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
     // 套餐入住晚数 / 占座等（透传给 bundleItemSchema add-on 字段）
     bundleNights: z.number().int().min(1).max(30).optional(),
     bundleSingleCount: z.number().int().min(0).max(20).optional(),
@@ -553,6 +557,10 @@ export const batchCreateOrdersBodySchema = z
     // 允许重复乘客强录（仅 ADMIN/STAFF 生效；透传给每张子单的 createOrder）。
     // 客人重复订票且已付款场景：同班次同证件号本会整批拒，运营确认后带此 flag 放行。
     allowDuplicatePassengers: z.boolean().optional(),
+    // 批量幂等键（前端每次提交生成一个 UUID）：整批 HTTP 重试/双击时，每张子单派生稳定幂等键
+    // `batch:{batchId}:{index}` 复用 createOrder 的幂等回放 → 同批重复提交每子单只建一次、不双占座。
+    // 缺省时后端生成一个同批共享的（仅防同一请求内重复，跨请求重试防不住，故前端应传）。
+    batchId: z.string().min(8).max(100).optional(),
     // 每位 → 一单。note 为该乘客个别备注（选填），与整批备注合并写入本人订单 notes。
     passengers: z
       .array(passengerInputSchema.extend({ note: z.string().max(500).optional() }))
@@ -628,7 +636,16 @@ export const swapPassengerBodySchema = z
     documentNumber: z.string().max(60).optional(),
     dateOfBirth: z.string().optional(), // ISO 日期字符串
     gender: z.nativeEnum(Gender).optional(),
+    // 国籍：换人时的新出行人国籍。证件号变化（= 真换人）时「建议必填」——新出行人不应沿用旧国籍。
+    //   注：Zod superRefine 只能硬性 400，而「建议必填」是软约束（不改现有不传国籍即换人的行为、不误伤既有
+    //   调用/测试），故此处不做条件强制；由前端在证件号变化时提示补录国籍（真正的硬校验留待后续按业务定夺）。
     nationality: z.string().max(60).optional(),
+    // 换人可显式带的新出行人属性（service.swapPassenger 早已按可选接收，此前 schema 未暴露 → 前端传不进来）：
+    //   title（称谓）/ passengerType（成人·儿童·婴儿）/ visaExempt（自备签）/ singleRoom（单住）。
+    title: z.enum(['MR', 'MRS', 'MS', 'MSTR', 'MISS', 'DR']).optional(),
+    passengerType: z.nativeEnum(PassengerType).optional(),
+    visaExempt: z.boolean().optional(),
+    singleRoom: z.boolean().optional(),
     resetInvoice: z.boolean().optional(), // → 开票状态回 NONE
     resetVisa: z.boolean().optional(), // → 该订单 VISA 履约任务回 PENDING
     feeCny: postSaleFeeSchema, // 换人费（CNY，整数；0/缺省=不收）
@@ -646,6 +663,10 @@ export const swapPassengerBodySchema = z
       b.dateOfBirth !== undefined ||
       b.gender !== undefined ||
       b.nationality !== undefined ||
+      b.title !== undefined ||
+      b.passengerType !== undefined ||
+      b.visaExempt !== undefined ||
+      b.singleRoom !== undefined ||
       b.resetInvoice === true ||
       b.resetVisa === true ||
       (b.feeCny ?? 0) > 0,

@@ -1397,7 +1397,7 @@ function SummaryTab({ token, range }: { token: string; range: { from: string; to
 }
 
 // ── Summary · 收入细分（财务口径 10 项）─────────────────────────────────────
-const REVENUE_ITEMS: { key: keyof Omit<FinanceSummary['revenueBreakdown'], 'uncategorized' | 'total'>; label: string }[] = [
+const REVENUE_ITEMS: { key: keyof Omit<FinanceSummary['revenueBreakdown'], 'uncategorized' | 'refund' | 'total'>; label: string }[] = [
   { key: 'outboundFlight', label: '去程机票收入' },
   { key: 'returnFlight', label: '返程机票收入' },
   { key: 'outboundTax', label: '去程机场税(过手)' },
@@ -1439,6 +1439,11 @@ function RevenueBreakdownTable({ data }: { data: FinanceSummary }) {
               <td className="py-1.5 text-right tabular-nums">{fmtCny(rb.uncategorized)}</td>
               <td className="py-1.5 text-right tabular-nums">{fmtPct(pct(rb.uncategorized))}</td>
             </tr>
+            <tr className="border-b border-slate-100 text-slate-500">
+              <td className="py-1.5 italic" title="先收后退的净退款额">退款（净）</td>
+              <td className="py-1.5 text-right tabular-nums">{fmtCny(rb.refund)}</td>
+              <td className="py-1.5 text-right tabular-nums">{fmtPct(pct(rb.refund))}</td>
+            </tr>
             <tr className="border-t-2 border-slate-300 font-semibold text-slate-900">
               <td className="py-2">合计</td>
               <td className="py-2 text-right tabular-nums">{fmtCny(rb.total)}</td>
@@ -1447,6 +1452,9 @@ function RevenueBreakdownTable({ data }: { data: FinanceSummary }) {
           </tbody>
         </table>
       </div>
+      <p className="mt-2 text-xs text-ink-muted">
+        退款（净）= 先收后退的净退款额（已收 − 已完成退款，逐单累加）；与上面各行相加 = 合计。
+      </p>
     </div>
   );
 }

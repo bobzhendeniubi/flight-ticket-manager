@@ -216,7 +216,11 @@ interface OrderContext {
   orderType: string;
   settlePerPax: number; // 结算价格 = total ÷ pax
   paidPerPax: number; // 到账金额 = paidAmount ÷ pax
-  balancePerPax: number; // 尾款 = max(0, total - paidAmount) ÷ pax
+  // 尾款 = max(0, total + adjustmentCny − paidAmount − prepaymentOffset) ÷ pax。含售后费（改期费/
+  // 换人费等走 adjustmentCny，不在 total 里）与代理预付款抵扣（prepaymentOffset）——漏掉任一项都会让
+  // 尾款偏大（售后费消失 P1-9/P2-15b、抵扣过的代理订单尾款虚高），口径与 reminders.rules.ts
+  // computeBalance / reports.service.ts balanceOf 对齐。
+  balancePerPax: number;
 }
 
 export function buildOrderContext(order: OrderForTemplateExport): OrderContext {
@@ -266,8 +270,13 @@ export function buildOrderContext(order: OrderForTemplateExport): OrderContext {
   }
   const hotelNames = Array.from(hotelNameSet).join(' / ');
 
+  // per-pax 均摊口径（结算/到账/尾款）：订单总额 ÷ 乘客数，与订单详情页按年龄段反推价格的
+  // 另一套口径不同（P2-15c，待产品统一），此处不擅自改成年龄段口径——会改变现有导出数字。
+  // 尾款口径与财务/提醒/报表对齐：应付 = total + adjustmentCny − prepaymentOffset（代理预付款抵扣）。
   const total = dec(order.total);
   const paid = dec(order.paidAmount);
+  const adjustment = order.adjustmentCny ?? 0;
+  const prepaymentOffset = dec(order.prepaymentOffset);
 
   return {
     paxCount,
@@ -283,7 +292,7 @@ export function buildOrderContext(order: OrderForTemplateExport): OrderContext {
     orderType,
     settlePerPax: round2(total / paxCount),
     paidPerPax: round2(paid / paxCount),
-    balancePerPax: round2(Math.max(0, total - paid) / paxCount),
+    balancePerPax: round2(Math.max(0, total + adjustment - paid - prepaymentOffset) / paxCount),
   };
 }
 
@@ -443,7 +452,13 @@ export function orderToFullRows(order: OrderForTemplateExport, ctx: OrderContext
     .flatMap((it) => it.fulfillmentTasks)
     .find((t) => t.type === 'VISA_APPLICATION');
 
-  const settled = dec(order.paidAmount) >= dec(order.total) ? '是' : '否';
+  // 是否清账：已付 + 预付款抵扣 ≥ 应付（total + adjustmentCny），与上面 ctx.balancePerPax 同口径。
+  // 不含 adjustmentCny 会出现"尾款>0 但已清账"的自相矛盾（P2-15b 连带修）；漏 prepaymentOffset
+  // 则用预付款抵扣过的代理订单会已结清却误显示未结清。
+  const settled =
+    dec(order.paidAmount) + dec(order.prepaymentOffset) >= dec(order.total) + (order.adjustmentCny ?? 0)
+      ? '是'
+      : '否';
 
   // 六态开票（去程/回程/系统）——「系统开票状态」列反映 systemInvoiced；
   // 「开票状态」列（原手工列）填按航段已开的组合文本：去程/回程分别判定，回程仅在存在回程班次时列出。
@@ -624,7 +639,14 @@ export const VISA_COLUMNS: Array<{ header: string; key: keyof VisaRow; width: nu
 export function orderToVisaRows(order: OrderForTemplateExport, ctx: OrderContext): Omit<VisaRow, 'stt'>[] {
   // 姓名列称谓（MR/MS/MSTR/MISS）按订单去程（最早 FLIGHT 行出发时间）派生年龄。
   const departureDate = earliestFlightDeparture(order.items);
-  return order.passengers.map<Omit<VisaRow, 'stt'>>((p) => ({
+  // 自备签乘客（visaExempt=true）不进送签名单：客人已自行办妥签证，无需送签——与签证台
+  // 同口径（backend/src/modules/fulfillment/fulfillment.service.ts 的 listByOrder 同样过滤
+  // passengers 时排除 visaExempt=true）。此函数是「签证专用」模板导出 + 签证批量合并名单
+  // （orders.export-visa-bundle.ts）共用的唯一取数点，这里过滤即两处一起生效（P1-13）。
+  // 金额仍按订单全部乘客均摊（ctx.paxCount 不受影响）——只影响谁出现在名单里。
+  return order.passengers
+    .filter((p) => p.visaExempt !== true)
+    .map<Omit<VisaRow, 'stt'>>((p) => ({
     agency: ctx.agency,
     notes: ctx.notes,
     hotelInfo: ctx.hotelInfo,

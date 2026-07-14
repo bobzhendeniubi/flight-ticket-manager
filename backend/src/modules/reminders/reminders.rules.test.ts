@@ -368,4 +368,21 @@ describe('generateRuleReminders 幂等', () => {
     expect(raw.operationalReminder.findMany).not.toHaveBeenCalled();
     expect(raw.operationalReminder.createMany).not.toHaveBeenCalled();
   });
+
+  it('签证缺件查询按签证台同口径排除自备签乘客（visaExempt: false），自备签乘客缺护照图不触发 VISA_MISSING', async () => {
+    const { mock, raw } = makeMockPrisma([], []);
+    await generateRuleReminders(mock, 'user_sys');
+    const queryArgs = (raw.fulfillmentTask.findMany.mock.calls[0] as unknown[])[0] as {
+      select: {
+        orderItem: {
+          select: { order: { select: { passengers: { where: Record<string, unknown> } } } };
+        };
+      };
+    };
+    const passengersWhere = queryArgs.select.orderItem.select.order.select.passengers.where;
+    expect(passengersWhere).toEqual({
+      visaExempt: false,
+      OR: [{ passportPhotoUrl: null }, { passportPhotoUrl: '' }],
+    });
+  });
 });

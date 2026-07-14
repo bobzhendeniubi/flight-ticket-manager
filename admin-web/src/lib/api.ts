@@ -265,6 +265,8 @@ export interface BatchCreateOrdersInput {
   bundleNights?: number;
   bundleSingleCount?: number;
   bundleBusinessCount?: number;
+  /** 套餐出发日期（YYYY-MM-DD）；缺省回落套餐的 defaultDepartDate */
+  bundleDepartDate?: string;
   adultCount?: number;
   childCount?: number;
   infantCount?: number;
@@ -296,6 +298,11 @@ export interface BatchCreateOrdersInput {
    * 运营二次确认后带 true 重试。透传给每张子单。
    */
   allowDuplicatePassengers?: boolean;
+  /**
+   * 批量幂等键（每次提交生成一个 UUID）：整批 HTTP 重试/双击时，后端为每张子单派生稳定幂等键
+   * `batch:{batchId}:{index}`，同批重复提交每子单只建一次、不重复占座。
+   */
+  batchId?: string;
 }
 
 /** POST /orders/roster/parse 返回的一行（11 列新模版；字段可缺省，后续手录补全） */
@@ -548,7 +555,7 @@ export interface CreateChildAgentInput {
   contactName: string;
   contactPhone: string;
   companyName?: string;
-  prepaymentBalance?: number;
+  // 不含 prepaymentBalance：建代理余额恒为 0，事后走认款通道（有流水+审计）产生。
   notes?: string;
 }
 
@@ -860,7 +867,7 @@ export interface OrderSummary {
   total: string;
   paidAmount: string;
   /** 售后费用合计（改期费 + 换人费）；尾款 = total + adjustmentCny − paidAmount。后端未启用时缺省 */
-  adjustmentCny?: string;
+  adjustmentCny?: number;
   /** 售后费用明细（改期费 / 换人费）；列表可能为空，详情带出 */
   adjustments?: OrderAdjustment[];
   contactName: string;
@@ -1044,6 +1051,134 @@ export interface Traveler {
   tripCount: number;
   lastTripAt: string | null;
   createdAt: string;
+}
+
+// ── 旅客档案（TravelerProfile：按证件号聚合全量订单乘机人的常旅客画像）──
+
+export interface TravelerProfileHotelStay {
+  hotelName: string;
+  roomType: string | null;
+  checkIn: string | null; // YYYY-MM-DD
+  checkOut: string | null;
+  orderNumber: string;
+}
+
+export interface TravelerProfileCompanion {
+  documentType: DocumentType;
+  documentNumber: string;
+  fullName: string;
+  tripsTogether: number;
+}
+
+export interface TravelerProfile {
+  id: string;
+  /** 常旅客号（服务端已格式化，如 "CT-000123"） */
+  travelerNo: string;
+  /** 已并入的主档案 id；null = 正常档案。列表接口只返回未被合并的档案。 */
+  mergedIntoId: string | null;
+  documentType: DocumentType;
+  documentNumber: string;
+  fullName: string;
+  chineseName: string | null;
+  gender: string | null;
+  dateOfBirth: string | null;
+  nationality: string | null;
+  passportExpiry: string | null;
+  tripCount: number;
+  orderCount: number;
+  firstTripAt: string | null;
+  lastTripAt: string | null;
+  nextTripAt: string | null;
+  totalSpendCny: string; // 人均平摊口径，两位小数字符串
+  prefCabin: string | null;
+  prefBed: string | null;
+  prefMeal: string | null;
+  prefSingleRoom: boolean;
+  needsWheelchair: boolean;
+  hotelHistory: TravelerProfileHotelStay[];
+  companions: TravelerProfileCompanion[];
+  linkedUserId: string | null;
+  notes: string | null;
+  refreshedAt: string;
+}
+
+export interface TravelerProfileTrip {
+  orderId: string;
+  orderNumber: string;
+  status: OrderStatus;
+  departAt: string | null;
+  returnAt: string | null;
+  route: string | null; // "MFM→DAD"
+  flightNumbers: string[];
+  cabin: string | null;
+  hotels: TravelerProfileHotelStay[];
+  paxCount: number;
+  spendShareCny: number;
+  flown: boolean;
+}
+
+export interface ListTravelerProfilesResult {
+  profiles: TravelerProfile[];
+  pagination: { page: number; pageSize: number; total: number };
+  meta: { totalProfiles: number; totalTrips: number; refreshedAt: string | null };
+}
+
+/** 录单联想候选可整行回填的乘机人字段（后端提炼自最近一次乘机记录；整体可能为 null）。日期均为 ISO 字符串。 */
+export interface TravelerProfileFillFields {
+  lastName: string | null;
+  firstName: string | null;
+  title: string | null;
+  gender: string | null; // 后端枚举，如 MALE / FEMALE
+  chineseName: string | null;
+  dateOfBirth: string | null;
+  placeOfBirth: string | null;
+  nationality: string | null;
+  documentType: DocumentType | null;
+  documentNumber: string | null;
+  passportIssueDate: string | null;
+  passportIssueCountry: string | null;
+  passportIssuePlace: string | null;
+  passportExpiry: string | null;
+  mealPreference: string | null;
+  bedPref: string | null;
+  needsWheelchair: boolean | null;
+  needsInfantBassinet: boolean | null;
+  passengerType: PassengerType | null;
+}
+
+/** 录单联想候选（GET /travelers/profiles/suggest；ADMIN/STAFF） */
+export interface TravelerProfileSuggestion {
+  id: string;
+  travelerNo: string;
+  fullName: string;
+  chineseName: string | null;
+  gender: string | null;
+  dateOfBirth: string | null;
+  nationality: string | null;
+  documentType: DocumentType;
+  documentNumber: string;
+  passportExpiry: string | null;
+  tripCount: number;
+  lastTripAt: string | null;
+  prefCabin: string | null;
+  prefBed: string | null;
+  prefMeal: string | null;
+  prefSingleRoom: boolean;
+  needsWheelchair: boolean;
+  fillFields: TravelerProfileFillFields | null;
+}
+
+/** 合并档案返回：profile/trips = 合并后实时重算的主档案；merged = 被并入的旧档案摘要 */
+export interface MergeTravelerProfileResult {
+  profile: TravelerProfile;
+  trips: TravelerProfileTrip[];
+  merged: {
+    id: string;
+    travelerNo: string;
+    documentType: DocumentType;
+    documentNumber: string;
+    fullName: string;
+  };
 }
 
 export type FulfillmentType = 'FLIGHT_TICKETING' | 'HOTEL_BOOKING' | 'VISA_APPLICATION' | 'TRANSFER_DISPATCH' | 'BUNDLE_COMPOSITE';
@@ -1941,11 +2076,14 @@ export const api = {
 
   // 批量到账（选多笔订单 → 逐单录入到账金额 + 共享水单）ADMIN/STAFF。
   // 逐单入账：单条失败不影响其它（每条返回 ok / error + 最新 paidAmount/status）。
+  // batchId：调用方为「本次提交」生成的稳定幂等键（表单打开时生成一次，成功后换新）——
+  // 同一 batchId 重复提交（双击/网络重试）同一订单不会二次入账。
   batchConfirmPayments: (
     token: string,
     body: {
       items: Array<{ orderId: string; amount: number; method?: PaymentMethod; proofUrl?: string; note?: string }>;
       sharedProofUrl?: string;
+      batchId?: string;
     },
   ) =>
     apiFetch<{
@@ -2382,6 +2520,54 @@ export const api = {
   deleteTraveler: (token: string, id: string) =>
     apiFetch<{ result: { id: string } }>(`/travelers/${id}`, { method: 'DELETE', token }),
 
+  // Traveler Profiles（旅客档案：常旅客画像，ADMIN/STAFF）
+  listTravelerProfiles: (token: string, query?: Record<string, string | number | undefined>) => {
+    const qs = new URLSearchParams();
+    if (query) for (const [k, v] of Object.entries(query)) if (v !== undefined && v !== '') qs.set(k, String(v));
+    return apiFetch<ListTravelerProfilesResult>(
+      `/travelers/profiles${qs.toString() ? '?' + qs.toString() : ''}`,
+      { token },
+    );
+  },
+  getTravelerProfile: (token: string, id: string) =>
+    apiFetch<{ profile: TravelerProfile; trips: TravelerProfileTrip[] }>(
+      `/travelers/profiles/${id}`,
+      { token },
+    ),
+  updateTravelerProfileNotes: (token: string, id: string, notes: string | null) =>
+    apiFetch<{ profile: TravelerProfile }>(`/travelers/profiles/${id}/notes`, {
+      method: 'PATCH',
+      token,
+      body: { notes },
+    }),
+  rebuildTravelerProfiles: (token: string) =>
+    apiFetch<{ result: { built: number; removed: number } }>('/travelers/profiles/rebuild', {
+      method: 'POST',
+      token,
+      body: {},
+    }),
+  // 录单联想：按姓名/证件号联想常旅客档案（q<2 字符后端返回空；limit 默认 8）
+  suggestTravelerProfiles: (
+    token: string,
+    q: string,
+    limit?: number,
+    opts?: { signal?: AbortSignal },
+  ) => {
+    const qs = new URLSearchParams({ q });
+    if (limit !== undefined) qs.set('limit', String(limit));
+    return apiFetch<{ suggestions: TravelerProfileSuggestion[] }>(
+      `/travelers/profiles/suggest?${qs.toString()}`,
+      { token, signal: opts?.signal },
+    );
+  },
+  // 合并档案：把 id（被并方）并进 intoId（保留方）；被并号保留为旧证指针，操作不可撤销
+  mergeTravelerProfile: (token: string, id: string, intoId: string) =>
+    apiFetch<MergeTravelerProfileResult>(`/travelers/profiles/${id}/merge`, {
+      method: 'POST',
+      token,
+      body: { intoId },
+    }),
+
   // Fulfillment
   listFulfillmentTasks: (token: string, query?: ListFulfillmentParams) => {
     const qs = new URLSearchParams();
@@ -2789,7 +2975,7 @@ export interface CategoryBreakdown {
   marginPct: number | null;
   orderItemCount: number;
 }
-/** 财务口径：收入细分（10 项 + 未分类 + 总和） */
+/** 财务口径：收入细分（10 项 + 未分类 + 退款净额 + 总和） */
 export interface RevenueBreakdown {
   outboundFlight: number;
   returnFlight: number;
@@ -2802,6 +2988,8 @@ export interface RevenueBreakdown {
   upgradeChange: number;
   oversale: number;
   uncategorized: number;
+  /** REFUNDED 订单的已收-已退净额（先收后退的净退款额），逐单累加计入 total */
+  refund: number;
   total: number;
 }
 /** 财务口径：成本细分（16 项 + 总和） */

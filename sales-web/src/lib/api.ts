@@ -279,7 +279,18 @@ export type OrderStatus =
   | 'CHANGED'
   | 'FAILED';
 
-export type OrderItemKind = 'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA' | 'INSURANCE' | 'FEE' | 'DISCOUNT';
+export type OrderItemKind =
+  | 'FLIGHT'
+  | 'HOTEL'
+  | 'TRANSFER'
+  | 'VISA'
+  | 'BUNDLE'
+  | 'INSURANCE'
+  | 'FEE'
+  | 'DISCOUNT'
+  | 'GUIDE'
+  | 'UPGRADE_CHANGE'
+  | 'OVERSALE';
 export type DocumentType = 'PASSPORT' | 'ID_CARD' | 'OTHER';
 export type PassengerType = 'ADULT' | 'CHILD' | 'INFANT';
 export type PaymentMethod = 'WECHAT_PAY' | 'ALIPAY' | 'BANK_CARD' | 'AGENT_PREPAYMENT';

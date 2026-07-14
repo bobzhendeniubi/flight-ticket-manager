@@ -1,0 +1,639 @@
+/**
+ * 旅客档案服务 —— TravelerProfile 快照表的读写与重建。
+ *
+ * 架构：订单是真值，快照表只是缓存。
+ *   - 列表读快照（可排序/分页）；空表惰性 bootstrap，过期(>6h)后台自动重建。
+ *   - 详情实时从订单重算（永远准确）并回写快照。
+ *   - 重建绝不覆盖 notes（运营手工输入）。
+ * 不 hook 订单写路径 —— 纯读侧聚合，对钱路径零风险。
+ */
+import { OrderStatus, Prisma, type DocumentType } from '@prisma/client';
+import { prisma } from '../../db/prisma.js';
+import { BadRequestError, ConflictError, NotFoundError } from '../../lib/errors.js';
+import {
+  buildTravelerAggregates,
+  docKey,
+  type AggOrder,
+  type TravelerAggregate,
+  type TripSummary,
+} from './traveler-profiles.aggregate.js';
+import type { ListTravelerProfilesQuery } from './travelers.schemas.js';
+
+/** 有效订单口径：排除未成交/已取消/全退（proposal 拍板清单的默认值） */
+const EXCLUDED_ORDER_STATUSES: OrderStatus[] = [
+  OrderStatus.DRAFT,
+  OrderStatus.PENDING_PAYMENT,
+  OrderStatus.PAYMENT_TIMEOUT,
+  OrderStatus.CANCELLED,
+  OrderStatus.FAILED,
+  OrderStatus.REFUNDED,
+];
+
+/** 快照过期阈值：超过后列表访问会触发后台重建（不阻塞本次响应） */
+const SNAPSHOT_STALE_MS = 6 * 60 * 60 * 1000;
+
+/** 常旅客号展示格式：CT- + 6 位补零（服务端统一格式化，前端不拼） */
+export function formatTravelerNo(no: number): string {
+  return `CT-${String(no).padStart(6, '0')}`;
+}
+
+/** 档案合并解析用的最小行（全表小数据量，一次拉全量在内存里解析链） */
+interface ProfileRef {
+  id: string;
+  travelerNo: number;
+  documentType: DocumentType;
+  documentNumber: string;
+  mergedIntoId: string | null;
+}
+
+interface DocPair {
+  documentType: DocumentType;
+  documentNumber: string;
+}
+
+const orderSelect = {
+  id: true,
+  orderNumber: true,
+  status: true,
+  createdAt: true,
+  paidAmount: true,
+  passengers: {
+    select: {
+      fullName: true,
+      chineseName: true,
+      gender: true,
+      documentType: true,
+      documentNumber: true,
+      dateOfBirth: true,
+      nationality: true,
+      passportExpiry: true,
+      mealPreference: true,
+      bedPref: true,
+      needsWheelchair: true,
+      singleRoom: true,
+    },
+  },
+  items: {
+    select: {
+      kind: true,
+      flightCabin: true,
+      hotelCheckIn: true,
+      hotelCheckOut: true,
+      flightSchedule: {
+        select: {
+          departureTime: true,
+          flight: { select: { flightNumber: true, originCode: true, destinationCode: true } },
+        },
+      },
+      hotelRoomType: { select: { name: true, hotel: { select: { name: true } } } },
+    },
+  },
+} satisfies Prisma.OrderSelect;
+
+type OrderRow = Prisma.OrderGetPayload<{ select: typeof orderSelect }>;
+
+function toAggOrder(o: OrderRow): AggOrder {
+  return {
+    id: o.id,
+    orderNumber: o.orderNumber,
+    status: o.status,
+    createdAt: o.createdAt,
+    paidAmountCny: Number(o.paidAmount),
+    passengers: o.passengers,
+    items: o.items.map((i) => ({
+      kind: i.kind,
+      flightCabin: i.flightCabin,
+      departureTime: i.flightSchedule?.departureTime ?? null,
+      flightNumber: i.flightSchedule?.flight.flightNumber ?? null,
+      originCode: i.flightSchedule?.flight.originCode ?? null,
+      destinationCode: i.flightSchedule?.flight.destinationCode ?? null,
+      hotelName: i.hotelRoomType?.hotel.name ?? null,
+      roomTypeName: i.hotelRoomType?.name ?? null,
+      hotelCheckIn: i.hotelCheckIn,
+      hotelCheckOut: i.hotelCheckOut,
+    })),
+  };
+}
+
+/** 聚合 → 快照行（不含 notes：重建/回写永不覆盖运营备注） */
+function toProfileData(agg: TravelerAggregate, linkedUserId: string | null) {
+  return {
+    documentType: agg.documentType,
+    documentNumber: agg.documentNumber,
+    fullName: agg.fullName,
+    chineseName: agg.chineseName,
+    gender: agg.gender,
+    dateOfBirth: agg.dateOfBirth,
+    nationality: agg.nationality,
+    passportExpiry: agg.passportExpiry,
+    tripCount: agg.tripCount,
+    orderCount: agg.orderCount,
+    firstTripAt: agg.firstTripAt,
+    lastTripAt: agg.lastTripAt,
+    nextTripAt: agg.nextTripAt,
+    totalSpendCny: new Prisma.Decimal(agg.totalSpendCny.toFixed(2)),
+    prefCabin: agg.prefCabin,
+    prefBed: agg.prefBed,
+    prefMeal: agg.prefMeal,
+    prefSingleRoom: agg.prefSingleRoom,
+    needsWheelchair: agg.needsWheelchair,
+    hotelHistory: agg.hotelHistory as unknown as Prisma.InputJsonValue,
+    companions: agg.companions as unknown as Prisma.InputJsonValue,
+    linkedUserId,
+    refreshedAt: new Date(),
+  };
+}
+
+export class TravelerProfilesService {
+  /** 并发重建去重：同一时刻只跑一次全量重建 */
+  private rebuildInFlight: Promise<{ built: number; removed: number }> | null = null;
+
+  async list(query: ListTravelerProfilesQuery) {
+    await this.ensureFresh();
+
+    // 列表只出 canonical 行；被合并的指针行只做归拢，不再单独展示
+    const where: Prisma.TravelerProfileWhereInput = { mergedIntoId: null };
+    if (query.search) {
+      where.OR = [
+        { fullName: { contains: query.search, mode: 'insensitive' } },
+        { chineseName: { contains: query.search, mode: 'insensitive' } },
+        { documentNumber: { contains: query.search, mode: 'insensitive' } },
+      ];
+    }
+    if (query.minTrips !== undefined) where.tripCount = { gte: query.minTrips };
+
+    const orderBy: Prisma.TravelerProfileOrderByWithRelationInput =
+      query.sort === 'totalSpendCny'
+        ? { totalSpendCny: query.order }
+        : query.sort === 'tripCount'
+          ? { tripCount: query.order }
+          : query.sort === 'nextTripAt'
+            ? { nextTripAt: { sort: query.order, nulls: 'last' } }
+            : { lastTripAt: { sort: query.order, nulls: 'last' } };
+
+    const [rows, total, stats] = await prisma.$transaction([
+      prisma.travelerProfile.findMany({
+        where,
+        orderBy,
+        take: query.pageSize,
+        skip: (query.page - 1) * query.pageSize,
+      }),
+      prisma.travelerProfile.count({ where }),
+      prisma.travelerProfile.aggregate({
+        where: { mergedIntoId: null },
+        _count: { _all: true },
+        _sum: { tripCount: true },
+        _max: { refreshedAt: true },
+      }),
+    ]);
+
+    return {
+      profiles: rows.map(serializeProfile),
+      pagination: { page: query.page, pageSize: query.pageSize, total },
+      meta: {
+        totalProfiles: stats._count._all,
+        totalTrips: stats._sum.tripCount ?? 0,
+        refreshedAt: stats._max.refreshedAt,
+      },
+    };
+  }
+
+  /**
+   * 详情：实时从订单重算（含出行时间线），并回写快照。
+   * 传入指针行（已被合并的档案）id 时直接解析并返回主档案详情；
+   * 重算查订单覆盖主档案本证 + 所有并入它的旧证件号。
+   */
+  async getDetail(id: string) {
+    const row = await prisma.travelerProfile.findUnique({ where: { id } });
+    if (!row) throw new NotFoundError('旅客档案不存在');
+
+    const refs = await this.loadProfileRefs();
+    const masterRef = resolveMasterRef(refs.get(row.id)!, refs);
+    const master =
+      masterRef.id === row.id
+        ? row
+        : await prisma.travelerProfile.findUnique({ where: { id: masterRef.id } });
+    if (!master) throw new NotFoundError('旅客档案不存在');
+
+    const { aliasMap, docPairsByMasterId } = buildAliasIndex(refs);
+    const docPairs = docPairsByMasterId.get(master.id) ?? [
+      { documentType: master.documentType, documentNumber: master.documentNumber },
+    ];
+    const orders = await this.loadValidOrders({
+      passengers: { some: { OR: docPairs } },
+    });
+    const key = docKey(master.documentType, master.documentNumber);
+    const agg = buildTravelerAggregates(orders, new Date(), aliasMap).get(key);
+
+    // 订单已全部失效/删除 → 快照保留旧值展示，不臆造
+    if (!agg) {
+      return { profile: serializeProfile(master), trips: [] as TripSummary[] };
+    }
+
+    const linkedUserId = await this.resolveLinkedUser(master.documentType, master.documentNumber);
+    // 证件字段钉死为主档案现值：防聚合取到旧证/大小写变体后，update 撞指针行的唯一键
+    const data = {
+      ...toProfileData(agg, linkedUserId),
+      documentType: master.documentType,
+      documentNumber: master.documentNumber,
+    };
+    const updated = await prisma.travelerProfile.update({ where: { id: master.id }, data });
+    return { profile: serializeProfile(updated), trips: agg.trips };
+  }
+
+  async updateNotes(id: string, notes: string | null) {
+    const existing = await prisma.travelerProfile.findUnique({ where: { id } });
+    if (!existing) throw new NotFoundError('旅客档案不存在');
+    const updated = await prisma.travelerProfile.update({ where: { id }, data: { notes } });
+    return serializeProfile(updated);
+  }
+
+  /**
+   * 档案合并（同人换证归一）：把 sourceId 并进 intoId。
+   * source 保留为「指针行」（mergedIntoId 指向主档案），不做解除合并；
+   * source 的手工备注拼进主档案（带来源常旅客号标注），合并后立即对主档案实时重算回写。
+   */
+  async merge(sourceId: string, intoId: string) {
+    if (sourceId === intoId) throw new BadRequestError('不能把档案并入自己');
+    const [source, target] = await Promise.all([
+      prisma.travelerProfile.findUnique({ where: { id: sourceId } }),
+      prisma.travelerProfile.findUnique({ where: { id: intoId } }),
+    ]);
+    if (!source) throw new NotFoundError('待合并的旅客档案不存在');
+    if (!target) throw new NotFoundError('目标旅客档案不存在');
+    if (source.mergedIntoId) throw new ConflictError('该档案已被合并过，不能再次合并');
+    // 目标是指针行时报错让运营改选主档案，不自动跟随 —— 避免误点旧档案还静默成功
+    if (target.mergedIntoId) throw new ConflictError('目标档案已被并入其他档案，请直接选择其主档案');
+
+    // source 的运营备注非空时拼进主档案，标注来源常旅客号；主档案原来为空则直接沿用
+    const mergedNotes = source.notes
+      ? target.notes
+        ? `${target.notes}\n[并入 ${formatTravelerNo(source.travelerNo)}] ${source.notes}`
+        : source.notes
+      : target.notes;
+
+    await prisma.$transaction([
+      prisma.travelerProfile.update({
+        where: { id: source.id },
+        data: { mergedIntoId: target.id },
+      }),
+      prisma.travelerProfile.update({ where: { id: target.id }, data: { notes: mergedNotes } }),
+    ]);
+
+    // 合并后立即实时重算主档案（getDetail 自带回写快照）
+    const detail = await this.getDetail(target.id);
+    return {
+      profile: detail.profile,
+      trips: detail.trips,
+      source: {
+        id: source.id,
+        travelerNo: formatTravelerNo(source.travelerNo),
+        documentType: source.documentType,
+        documentNumber: source.documentNumber,
+        fullName: source.fullName,
+      },
+      targetBefore: {
+        id: target.id,
+        travelerNo: formatTravelerNo(target.travelerNo),
+        documentType: target.documentType,
+        documentNumber: target.documentNumber,
+        fullName: target.fullName,
+      },
+    };
+  }
+
+  /**
+   * 录单联想：q 匹配证件号/姓名（startsWith）或中文名（contains），按 tripCount 倒序。
+   * 只出 canonical 行；q 命中被合并旧证时解析出其主档案。
+   * 每条建议带 fillFields —— 该人最近一张有效订单的乘机人完整快照，录单表单一键回填。
+   */
+  async suggest(qRaw: string, limit: number) {
+    const q = qRaw.trim();
+    if (q.length < 2) return [];
+
+    const refs = await this.loadProfileRefs();
+    const { docPairsByMasterId } = buildAliasIndex(refs);
+
+    // canonical 行直接匹配
+    const direct = await prisma.travelerProfile.findMany({
+      where: {
+        mergedIntoId: null,
+        OR: [
+          { documentNumber: { startsWith: q, mode: 'insensitive' } },
+          { fullName: { startsWith: q, mode: 'insensitive' } },
+          { chineseName: { contains: q, mode: 'insensitive' } },
+        ],
+      },
+      orderBy: { tripCount: 'desc' },
+      take: limit,
+    });
+
+    // q 命中指针行的证件号（客人报旧护照号）→ 解析出主档案
+    const pointerHits = await prisma.travelerProfile.findMany({
+      where: {
+        mergedIntoId: { not: null },
+        documentNumber: { startsWith: q, mode: 'insensitive' },
+      },
+      select: { id: true },
+    });
+    const extraMasterIds = new Set<string>();
+    for (const hit of pointerHits) {
+      const ref = refs.get(hit.id);
+      if (!ref) continue;
+      const master = resolveMasterRef(ref, refs);
+      if (master.mergedIntoId === null && !direct.some((d) => d.id === master.id)) {
+        extraMasterIds.add(master.id);
+      }
+    }
+    const viaPointer = extraMasterIds.size
+      ? await prisma.travelerProfile.findMany({ where: { id: { in: [...extraMasterIds] } } })
+      : [];
+
+    const profiles = [...direct, ...viaPointer]
+      .sort((a, b) => b.tripCount - a.tripCount)
+      .slice(0, limit);
+
+    return Promise.all(
+      profiles.map(async (p) => ({
+        id: p.id,
+        travelerNo: formatTravelerNo(p.travelerNo),
+        fullName: p.fullName,
+        chineseName: p.chineseName,
+        gender: p.gender,
+        dateOfBirth: p.dateOfBirth,
+        nationality: p.nationality,
+        documentType: p.documentType,
+        documentNumber: p.documentNumber,
+        passportExpiry: p.passportExpiry,
+        tripCount: p.tripCount,
+        lastTripAt: p.lastTripAt,
+        prefCabin: p.prefCabin,
+        prefBed: p.prefBed,
+        prefMeal: p.prefMeal,
+        prefSingleRoom: p.prefSingleRoom,
+        needsWheelchair: p.needsWheelchair,
+        fillFields: await this.loadFillFields(
+          { documentType: p.documentType, documentNumber: p.documentNumber },
+          docPairsByMasterId.get(p.id) ?? [],
+        ),
+      })),
+    );
+  }
+
+  /**
+   * 全量重建：扫全部有效订单 → 聚合 → upsert 快照（保留 notes）→ 清掉已消失的档案。
+   * 内部量级（包机生意，订单数千级）全量跑很快；并发调用共享同一次执行。
+   */
+  async rebuildAll(): Promise<{ built: number; removed: number }> {
+    if (this.rebuildInFlight) return this.rebuildInFlight;
+    this.rebuildInFlight = this.doRebuildAll().finally(() => {
+      this.rebuildInFlight = null;
+    });
+    return this.rebuildInFlight;
+  }
+
+  private async doRebuildAll(): Promise<{ built: number; removed: number }> {
+    // 先从指针行构建别名映射：旧证订单归拢进主档案，而不是重建出一个新档案
+    const refs = await this.loadProfileRefs();
+    const { aliasMap } = buildAliasIndex(refs);
+    const masterByKey = new Map<string, ProfileRef>();
+    for (const ref of refs.values()) {
+      if (ref.mergedIntoId === null) {
+        masterByKey.set(docKey(ref.documentType, ref.documentNumber), ref);
+      }
+    }
+
+    const orders = await this.loadValidOrders();
+    const aggregates = buildTravelerAggregates(orders, new Date(), aliasMap);
+
+    // SavedPassenger 证件号 → 唯一归属账号（多账号存同一证件时不猜，置空）
+    const savedRows = await prisma.savedPassenger.findMany({
+      select: { userId: true, documentType: true, documentNumber: true },
+    });
+    const linkMap = new Map<string, string | null>();
+    for (const s of savedRows) {
+      const k = docKey(s.documentType, s.documentNumber);
+      linkMap.set(k, linkMap.has(k) && linkMap.get(k) !== s.userId ? null : s.userId);
+    }
+
+    const keptIds: string[] = [];
+    for (const [key, agg] of aggregates) {
+      // 已有主档案：证件字段钉死为其现值（防聚合取到大小写变体后 upsert 撞不上原行，
+      // 导致主档案被 prune、指针行悬空）；全新旅客才用聚合出的证件
+      const master = masterByKey.get(key);
+      const identity: DocPair = {
+        documentType: master?.documentType ?? agg.documentType,
+        documentNumber: master?.documentNumber ?? agg.documentNumber,
+      };
+      const data = {
+        ...toProfileData(agg, linkMap.get(key) ?? null),
+        ...identity,
+      };
+      const row = await prisma.travelerProfile.upsert({
+        where: { documentType_documentNumber: identity },
+        create: data,
+        update: data, // 不含 notes / travelerNo / mergedIntoId → 手工备注、常旅客号、合并关系都保留
+        select: { id: true },
+      });
+      keptIds.push(row.id);
+    }
+
+    // prune 只清 canonical 行：指针行没有对应聚合（订单都归拢进主档案了），必须保留合并关系
+    const { count: removed } = await prisma.travelerProfile.deleteMany({
+      where: { id: { notIn: keptIds }, mergedIntoId: null },
+    });
+    return { built: keptIds.length, removed };
+  }
+
+  // ── private ──
+
+  /** 全表最小行（含指针行），供别名解析；内部量级（千级档案）一次拉全量可接受 */
+  private async loadProfileRefs(): Promise<Map<string, ProfileRef>> {
+    const rows = await prisma.travelerProfile.findMany({
+      select: {
+        id: true,
+        travelerNo: true,
+        documentType: true,
+        documentNumber: true,
+        mergedIntoId: true,
+      },
+    });
+    return new Map(rows.map((r) => [r.id, r]));
+  }
+
+  /**
+   * 录单回填快照：取该人（主证 + 并入的旧证）最近一张有效订单的乘机人行。
+   * 先只查主证 —— 回填的证件号必须是主档案当前证件，不能把旧证回填进新单；
+   * 主证下没有订单（合并后还没用新证下过单）才退回全证件取最近行。
+   */
+  private async loadFillFields(masterDoc: DocPair, allDocPairs: DocPair[]) {
+    const validOrder = { deletedAt: null, status: { notIn: EXCLUDED_ORDER_STATUSES } };
+    const select = {
+      lastName: true,
+      firstName: true,
+      title: true,
+      gender: true,
+      chineseName: true,
+      dateOfBirth: true,
+      placeOfBirth: true,
+      nationality: true,
+      documentType: true,
+      documentNumber: true,
+      passportIssueDate: true,
+      passportIssueCountry: true,
+      passportIssuePlace: true,
+      passportExpiry: true,
+      mealPreference: true,
+      bedPref: true,
+      needsWheelchair: true,
+      needsInfantBassinet: true,
+      passengerType: true,
+    } satisfies Prisma.PassengerSelect;
+    const orderBy: Prisma.PassengerOrderByWithRelationInput[] = [
+      { order: { createdAt: 'desc' } },
+      { createdAt: 'desc' },
+    ];
+
+    const fromMasterDoc = await prisma.passenger.findFirst({
+      where: { ...masterDoc, order: validOrder },
+      orderBy,
+      select,
+    });
+    if (fromMasterDoc) return fromMasterDoc;
+
+    const fallbackPairs = allDocPairs.length ? allDocPairs : [masterDoc];
+    return prisma.passenger.findFirst({
+      where: { OR: fallbackPairs, order: validOrder },
+      orderBy,
+      select,
+    });
+  }
+
+  private async loadValidOrders(extra?: Prisma.OrderWhereInput): Promise<AggOrder[]> {
+    const rows = await prisma.order.findMany({
+      where: {
+        deletedAt: null,
+        status: { notIn: EXCLUDED_ORDER_STATUSES },
+        ...extra,
+      },
+      select: orderSelect,
+    });
+    return rows.map(toAggOrder);
+  }
+
+  private async resolveLinkedUser(
+    documentType: DocumentType,
+    documentNumber: string,
+  ): Promise<string | null> {
+    const matches = await prisma.savedPassenger.findMany({
+      where: { documentType, documentNumber },
+      select: { userId: true },
+    });
+    const distinct = [...new Set(matches.map((m) => m.userId))];
+    return distinct.length === 1 ? distinct[0] : null;
+  }
+
+  /** 空表惰性 bootstrap（阻塞首个请求）；过期则后台重建（不阻塞） */
+  private async ensureFresh(): Promise<void> {
+    const stats = await prisma.travelerProfile.aggregate({
+      _count: { _all: true },
+      _max: { refreshedAt: true },
+    });
+    if (stats._count._all === 0) {
+      const anyPassenger = await prisma.passenger.findFirst({ select: { id: true } });
+      if (anyPassenger) await this.rebuildAll();
+      return;
+    }
+    const newest = stats._max.refreshedAt;
+    if (newest && Date.now() - newest.getTime() > SNAPSHOT_STALE_MS) {
+      void this.rebuildAll().catch(() => {
+        /* 后台重建失败不影响本次读；下次访问会再试 */
+      });
+    }
+  }
+}
+
+/**
+ * 沿 mergedIntoId 链解析到最终主档案。
+ * 数据上不该有链（合并时禁止把档案并进指针行），但解析要健壮：
+ * 断链（主档案被删）/ 环（脏数据）时停在当前行，不抛错不死循环。
+ */
+function resolveMasterRef(start: ProfileRef, byId: Map<string, ProfileRef>): ProfileRef {
+  let current = start;
+  const seen = new Set<string>([current.id]);
+  while (current.mergedIntoId) {
+    const next = byId.get(current.mergedIntoId);
+    if (!next || seen.has(next.id)) break;
+    seen.add(next.id);
+    current = next;
+  }
+  return current;
+}
+
+/**
+ * 从指针行构建别名索引：
+ *   aliasMap           — 旧证 docKey → 主档案 docKey（喂给聚合做归拢）
+ *   docPairsByMasterId — 主档案 id → 全部证件对（本证 + 并入的旧证），查订单乘机人用
+ */
+function buildAliasIndex(byId: Map<string, ProfileRef>): {
+  aliasMap: Map<string, string>;
+  docPairsByMasterId: Map<string, DocPair[]>;
+} {
+  const aliasMap = new Map<string, string>();
+  const docPairsByMasterId = new Map<string, DocPair[]>();
+  for (const ref of byId.values()) {
+    if (ref.mergedIntoId === null) {
+      docPairsByMasterId.set(ref.id, [
+        { documentType: ref.documentType, documentNumber: ref.documentNumber },
+      ]);
+    }
+  }
+  for (const ref of byId.values()) {
+    if (ref.mergedIntoId === null) continue;
+    const master = resolveMasterRef(ref, byId);
+    // 断链/环解析不到 canonical 行 → 该指针放弃归拢（只影响这一条，不拖垮整体）
+    if (master.id === ref.id || master.mergedIntoId !== null) continue;
+    aliasMap.set(
+      docKey(ref.documentType, ref.documentNumber),
+      docKey(master.documentType, master.documentNumber),
+    );
+    docPairsByMasterId
+      .get(master.id)!
+      .push({ documentType: ref.documentType, documentNumber: ref.documentNumber });
+  }
+  return { aliasMap, docPairsByMasterId };
+}
+
+type ProfileRow = Prisma.TravelerProfileGetPayload<Record<string, never>>;
+
+function serializeProfile(row: ProfileRow) {
+  return {
+    id: row.id,
+    travelerNo: formatTravelerNo(row.travelerNo),
+    documentType: row.documentType,
+    documentNumber: row.documentNumber,
+    fullName: row.fullName,
+    chineseName: row.chineseName,
+    gender: row.gender,
+    dateOfBirth: row.dateOfBirth,
+    nationality: row.nationality,
+    passportExpiry: row.passportExpiry,
+    tripCount: row.tripCount,
+    orderCount: row.orderCount,
+    firstTripAt: row.firstTripAt,
+    lastTripAt: row.lastTripAt,
+    nextTripAt: row.nextTripAt,
+    totalSpendCny: row.totalSpendCny.toFixed(2),
+    prefCabin: row.prefCabin,
+    prefBed: row.prefBed,
+    prefMeal: row.prefMeal,
+    prefSingleRoom: row.prefSingleRoom,
+    needsWheelchair: row.needsWheelchair,
+    hotelHistory: row.hotelHistory,
+    companions: row.companions,
+    linkedUserId: row.linkedUserId,
+    notes: row.notes,
+    mergedIntoId: row.mergedIntoId,
+    refreshedAt: row.refreshedAt,
+  };
+}

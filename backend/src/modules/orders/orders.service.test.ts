@@ -23,11 +23,16 @@ const { mockPrisma, mockComputeQuote, mockGetHotelNightlyRemaining } = vi.hoiste
     },
     passenger: {
       findMany: vi.fn(),
-      // findUnique/update/findUniqueOrThrow: 只有 swapPassenger 的换人测试用（其余既有测试不碰这几个
-      // 方法，新增不影响它们）。
+      // findUnique/update/findUniqueOrThrow/findFirst: 只有 swapPassenger 的换人测试用（其余既有测试
+      // 不碰这几个方法，新增不影响它们）。findFirst = 换人重复证件号校验（P1-8）。
       findUnique: vi.fn(),
+      findFirst: vi.fn(),
       update: vi.fn(),
       findUniqueOrThrow: vi.fn(),
+    },
+    // swapPassenger 换人重复证件号校验：查本订单 FLIGHT 行的 flightScheduleId（P1-8）。
+    orderItem: {
+      findMany: vi.fn(),
     },
     user: {
       findUnique: vi.fn(),
@@ -63,6 +68,9 @@ const { mockPrisma, mockComputeQuote, mockGetHotelNightlyRemaining } = vi.hoiste
       updateMany: vi.fn(),
     },
     $transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn(mockTx)),
+    // R2：rescheduleOrderItem 事务开头对 Order 行 FOR UPDATE（tx.$queryRaw）。默认返回一行（订单存在）
+    // → 锁通过、继续走占座守卫；具体守卫用例仍由 order.findUnique 决定拒绝原因。
+    $queryRaw: vi.fn(async () => [{ id: 'ord1' }]),
   },
   mockComputeQuote: vi.fn(),
   mockGetHotelNightlyRemaining: vi.fn(),
@@ -2534,6 +2542,8 @@ describe('swapPassengerBodySchema · chineseName', () => {
 // 本请求带了新值就用新值（护照/证件相关字段随人走）。
 describe('swapPassenger · 证件号变化触发旧护照/签证清洗', () => {
   beforeEach(() => {
+    // clearAllMocks（保留模块级 $transaction 等实现）；orderItem.findMany 用持久 stub（见 armSwapMocks）
+    // 而非 once，避免证件号不变用例不消费它时把 once 队列串到后续用例。
     vi.clearAllMocks();
   });
 
@@ -2545,6 +2555,9 @@ describe('swapPassenger · 证件号变化触发旧护照/签证清洗', () => {
       fullName: 'OLD, PERSON',
       documentNumber: existingDoc,
     });
+    // 重复证件号校验（P1-8）：本订单无 FLIGHT 行 → 无班次 → 短路，不触达 passenger.findFirst。
+    // 持久 stub（非 once）：证件号不变用例不消费它，避免 once 队列串到后续用例。
+    mockPrisma.orderItem.findMany.mockResolvedValue([]);
     mockPrisma.passenger.update.mockResolvedValueOnce({});
     mockPrisma.passenger.findUniqueOrThrow.mockResolvedValueOnce({
       fullName: 'NEW, PERSON',
@@ -2586,6 +2599,15 @@ describe('swapPassenger · 证件号变化触发旧护照/签证清洗', () => {
     expect(data.placeOfBirth).toBeNull();
     expect(data.chineseName).toBeNull();
     expect(data.gender).toBeNull();
+    // 航司票号随人走 → 置空（旧人的 PNR / 电子票号绝不能留给新人）
+    expect(data.pnr).toBeNull();
+    expect(data.eticketNumber).toBeNull();
+    // 乘客级选项回落安全默认（未显式带新值）：自备签 false（新人不会被签证台漏）、拼房 false、
+    // 敬称 null、乘客类型回 ADULT（schema 默认）
+    expect(data.visaExempt).toBe(false);
+    expect(data.singleRoom).toBe(false);
+    expect(data.title).toBeNull();
+    expect(data.passengerType).toBe('ADULT');
     // 审计标记
     expect(audit.clearedProfile).toBe(true);
   });
@@ -2637,6 +2659,84 @@ describe('swapPassenger · 证件号变化触发旧护照/签证清洗', () => {
     // 表单没有的护照字段仍随人清空
     expect(data.passportPhotoUrl).toBeNull();
     expect(data.visaExpiry).toBeNull();
+  });
+
+  it('证件号变化但换入证件号已在同航班占座订单中 → DuplicatePassengerError，不落库', async () => {
+    const service = new OrderService();
+    mockPrisma.order.findUnique.mockResolvedValueOnce({ id: 'ord1', adjustmentCny: 0, adjustments: [] });
+    mockPrisma.passenger.findUnique.mockResolvedValueOnce({
+      id: 'px1',
+      orderId: 'ord1',
+      fullName: 'OLD, PERSON',
+      documentNumber: 'OLD111',
+    });
+    // 本订单有一条 FLIGHT 行 → 有班次 → 触发重复证件号校验
+    mockPrisma.orderItem.findMany.mockResolvedValueOnce([{ flightScheduleId: 'sched1' }]);
+    // 同班次占座订单里已存在换入的证件号 → 命中冲突
+    mockPrisma.passenger.findFirst.mockResolvedValueOnce({ order: { orderNumber: 'ORD-CONFLICT' } });
+
+    await expect(
+      service.swapPassenger(
+        'ord1',
+        'px1',
+        { fullName: 'NEW PERSON', documentNumber: 'DUP777' },
+        { userId: 'admin1', role: 'ADMIN' },
+      ),
+    ).rejects.toMatchObject({ code: 'DUPLICATE_PASSENGER' });
+    // 冲突时在 update 之前中止 → 绝不落库
+    expect(mockPrisma.passenger.update).not.toHaveBeenCalled();
+  });
+});
+
+// ── P0-1：改期占座状态守卫（拒绝对已取消/已退款/软删单改期）─────────────
+// 背景：改期要"放旧座 + 拿新座"，只有订单真持有座位时才成立；对非占座态改期会二次释放旧座
+// （打成负数卡账）+ 新座挂死单永不释放（超卖）。入口硬性要求 deletedAt=null 且 status ∈ 占座态。
+describe('OrderService.rescheduleOrderItem · 占座状态守卫', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // R2：FOR UPDATE 锁默认返回一行（订单存在）→ 锁通过后走占座守卫（守卫拒绝原因由 findUnique 决定）。
+    mockPrisma.$queryRaw.mockResolvedValue([{ id: 'ord1' }]);
+  });
+
+  it('已取消订单（CANCELLED，非占座态）→ 拒绝改期（400），不触碰座位台账', async () => {
+    const service = new OrderService();
+    mockPrisma.order.findUnique.mockResolvedValueOnce({
+      id: 'ord1',
+      status: 'CANCELLED',
+      deletedAt: null,
+      adjustmentCny: 0,
+      adjustments: [],
+    });
+
+    await expect(
+      service.rescheduleOrderItem(
+        'ord1',
+        { orderItemId: 'it1', newScheduleId: 'sched2' },
+        { userId: 'admin1', role: 'ADMIN' },
+      ),
+    ).rejects.toMatchObject({ statusCode: 400 });
+    // 守卫在取订单项/搬座位之前中止
+    expect(mockPrisma.flightSeatClass.findFirst).not.toHaveBeenCalled();
+  });
+
+  it('软删单（deletedAt 非空）→ 拒绝改期（400，提示先恢复）', async () => {
+    const service = new OrderService();
+    mockPrisma.order.findUnique.mockResolvedValueOnce({
+      id: 'ord1',
+      status: 'PAID', // 即便占座态，软删也拒
+      deletedAt: new Date('2026-07-01T00:00:00.000Z'),
+      adjustmentCny: 0,
+      adjustments: [],
+    });
+
+    await expect(
+      service.rescheduleOrderItem(
+        'ord1',
+        { orderItemId: 'it1', newScheduleId: 'sched2' },
+        { userId: 'admin1', role: 'ADMIN' },
+      ),
+    ).rejects.toMatchObject({ statusCode: 400 });
+    expect(mockPrisma.flightSeatClass.findFirst).not.toHaveBeenCalled();
   });
 });
 

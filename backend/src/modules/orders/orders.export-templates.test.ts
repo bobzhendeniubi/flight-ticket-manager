@@ -311,6 +311,50 @@ describe('《全岗可用》full 模版 — 逐列取值/格式', () => {
   });
 });
 
+// ── 代理预付款抵扣（prepaymentOffset）· 尾款/清账口径 ──────────────────────────
+// 尾款 = max(0, total + adjustmentCny − paid − prepaymentOffset) / 人数；
+// 已清账 = paid + prepaymentOffset ≥ total + adjustmentCny。与财务/提醒/报表口径一致，
+// 避免用预付款抵扣过的代理订单尾款偏大、已结清误显示未结清。
+describe('《全岗可用》full 模版 — 代理预付款抵扣（prepaymentOffset）', () => {
+  function fixtureWithOffset(over: {
+    total?: number;
+    paidAmount?: number;
+    prepaymentOffset?: number;
+    adjustmentCny?: number;
+  }): OrderForTemplateExport {
+    const order = fixtureRoundTrip();
+    Object.assign(order as Record<string, unknown>, {
+      total: over.total ?? 2536,
+      paidAmount: over.paidAmount ?? 0,
+      prepaymentOffset: over.prepaymentOffset ?? 0,
+      adjustmentCny: over.adjustmentCny ?? 0,
+    });
+    return order;
+  }
+
+  it('尾款扣减预付款抵扣（2 人均摊）', () => {
+    // total 2536 − paid 1000 − offset 500 = 1036 → /2人 = 518
+    const order = fixtureWithOffset({ paidAmount: 1000, prepaymentOffset: 500 });
+    const rows = orderToFullRows(order, buildOrderContext(order));
+    expect(rows[0].balanceDue).toBe(518);
+    expect(rows[0].settled).toBe('否');
+  });
+
+  it('已付 + 预付款抵扣 ≥ 应付 → 尾款 0 且已清账', () => {
+    // paid 2036 + offset 500 = 2536 ≥ total 2536 → 已清账、尾款 0
+    const order = fixtureWithOffset({ paidAmount: 2036, prepaymentOffset: 500 });
+    const rows = orderToFullRows(order, buildOrderContext(order));
+    expect(rows[0].balanceDue).toBe(0);
+    expect(rows[0].settled).toBe('是');
+  });
+
+  it('抵扣金额列人均摊（offsetAmount）', () => {
+    const order = fixtureWithOffset({ prepaymentOffset: 500 });
+    const rows = orderToFullRows(order, buildOrderContext(order));
+    expect(rows[0].offsetAmount).toBe(250); // 500 / 2人
+  });
+});
+
 describe('《票务专用》ticketing 模版 — 27 列 + 格式', () => {
   it('TICKETING_COLUMNS 列名列序与旧模版 27 列完全一致', () => {
     expect(TICKETING_COLUMNS.map((c) => c.header)).toEqual(OLD_TICKETING_HEADERS);

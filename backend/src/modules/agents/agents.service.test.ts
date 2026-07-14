@@ -16,16 +16,20 @@ const { mockPrisma } = vi.hoisted(() => ({
     agent: {
       findUnique: vi.fn(),
       update: vi.fn(),
+      create: vi.fn(),
     },
     user: {
       findUnique: vi.fn(),
       update: vi.fn(),
+      create: vi.fn(),
     },
     $transaction: vi.fn(),
   },
 }));
 
 vi.mock('../../db/prisma.js', () => ({ prisma: mockPrisma }));
+// 建代理会走真实 argon2 哈希；单测里替换成占位实现，保持快速与确定性。
+vi.mock('../../lib/password.js', () => ({ hashPassword: vi.fn(async () => 'hashed-pw') }));
 
 import { AgentService } from './agents.service.js';
 import { ForbiddenError, NotFoundError } from '../../lib/errors.js';
@@ -91,6 +95,37 @@ describe('AgentService', () => {
     mockPrisma.$transaction.mockImplementation(async (cb: (tx: typeof mockPrisma) => Promise<unknown>) =>
       cb(mockPrisma),
     );
+  });
+
+  // ══════════════════════════════════════════════════════════════════════
+  describe('createChildAgent() · 建代理不接受初始余额（余额恒为 0）', () => {
+    it('ADMIN 建 1 级代理 → agent.create 不写 prepaymentBalance（落库走 @default(0)）', async () => {
+      mockPrisma.user.findUnique.mockResolvedValueOnce(null); // 邮箱未注册
+      mockPrisma.user.create.mockResolvedValueOnce({ id: 'user-new', email: 'new@test.com', displayName: '新代理' });
+      mockPrisma.agent.create.mockResolvedValueOnce({
+        id: 'agent-new', tier: 1, parentAgentId: null, contactName: '新联系人',
+      });
+
+      await service.createChildAgent({
+        currentUserId: 'admin-1',
+        currentRole: UserRole.ADMIN,
+        parentAgentId: null,
+        body: {
+          email: 'new@test.com',
+          password: 'password123',
+          displayName: '新代理',
+          contactName: '新联系人',
+          contactPhone: '+85360000000',
+        },
+      });
+
+      expect(mockPrisma.agent.create).toHaveBeenCalledTimes(1);
+      const createArg = mockPrisma.agent.create.mock.calls[0][0] as { data: Record<string, unknown> };
+      // 关键断言：建代理数据里绝不含 prepaymentBalance（不裸设余额，落库靠默认值 0）
+      expect(createArg.data).not.toHaveProperty('prepaymentBalance');
+      expect(createArg.data.tier).toBe(1);
+      expect(createArg.data.parentAgentId).toBeNull();
+    });
   });
 
   // ══════════════════════════════════════════════════════════════════════

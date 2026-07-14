@@ -952,6 +952,11 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         ...orderStructuredNotesShape,
       })
       .parse(req.body);
+    // 归属校验（IDOR 修复）：与同文件 cancel/change-request 等 :id 路由一致，先过 service.getOrder
+    // （内含 assertCanView：CUSTOMER 仅本人单、AGENT 仅自己+下级、ADMIN/STAFF 全部），
+    // 否则任意登录用户都能改他人订单的 plain notes（不存在 → 404，无权 → 403）。
+    const requester = await buildRequester(req.user.sub, req.user.role);
+    await service.getOrder(id, requester);
     const role = req.user.role;
     const isOps = role === UserRole.ADMIN || role === UserRole.STAFF;
     // internalNotes / 签证状态 / 结构化备注四栏 只有 ADMIN/STAFF 可改

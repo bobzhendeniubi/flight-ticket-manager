@@ -184,6 +184,36 @@ describe('buildVisaBundleXlsx — 合并签证名单', () => {
     ]);
   });
 
+  // ── 自备签乘客（visaExempt=true）不进送签名单（P1-13）───────────────────────
+  // 客人已自行办妥签证，无需送签；与签证台 fulfillment.service.ts 同口径。
+  it('自备签乘客（visaExempt=true）不出现在合并名单里，且不错位到相邻乘客的行', async () => {
+    const orders = [
+      makeOrder('FTM2026071000010', [
+        pax({ id: 'a1', lastName: 'WANG', firstName: 'LIANBO', passportPhotoUrl: 'https://x.test/w.jpg' }),
+        // 自备签乘客：夹在中间，验证过滤后不把它后面乘客的护照图状态错位提前
+        pax({ id: 'a2', lastName: 'ZI', firstName: 'BEI', visaExempt: true, passportPhotoUrl: null }),
+        pax({ id: 'a3', lastName: 'LI', firstName: 'SI', passportPhotoUrl: null }),
+      ]),
+    ];
+
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response(new Uint8Array([1, 2, 3, 4]), { status: 200 }));
+
+    const buf = await buildVisaBundleXlsx(orders);
+    const rows = await readVisaSheet(buf);
+
+    // 自备签乘客（ZI/BEI）不上表；只剩 2 人
+    expect(rows).toHaveLength(2);
+    expect(rows.map((r) => r[NAME_HEADER])).toEqual(['WANG/LIANBO MR', 'LI/SI MR']);
+    // 护照图状态按过滤后位置对齐，不因中间被过滤的乘客而错位
+    // （若按未过滤的 order.passengers 下标取，第 2 行会误把 ZI/BEI 的"无图"标给 LI/SI 之前，
+    // 这里验证的是 LI/SI 自己的图状态——本人无图应仍是"无护照图（手工录入）"）
+    expect(rows.map((r) => r['有无护照图'])).toEqual(['有护照图', '无护照图（手工录入）']);
+
+    fetchSpy.mockRestore();
+  });
+
   it('无订单时仍产出带表头的空表（含性别列）', async () => {
     const buf = await buildVisaBundleXlsx([]);
     const rows = await readVisaSheet(buf);

@@ -15,7 +15,7 @@
  *   - mock 只需覆盖 _updateStatusWithinTx 实际会碰的 tx.* 方法，比全量搭 updateStatus 的依赖链省得多。
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { CabinClass, OrderStatus, UserRole } from '@prisma/client';
+import { CabinClass, FulfillmentStatus, OrderStatus, UserRole } from '@prisma/client';
 
 const { mockPrisma } = vi.hoisted(() => ({
   mockPrisma: {
@@ -29,6 +29,11 @@ const { mockPrisma } = vi.hoisted(() => ({
     flightSeatClass: { updateMany: vi.fn(), findFirst: vi.fn() },
     seatLock: { aggregate: vi.fn() },
     refund: { updateMany: vi.fn() },
+    // 转 PAID 时按 SUCCEEDED Payment 台账认实收（不再因转 PAID 这个动作本身凭空补满额）。
+    // updateMany：R4 转 PAID 时作废其它 PENDING 兄弟 Payment（FAILED + supersededByPaid）。
+    payment: { aggregate: vi.fn(), updateMany: vi.fn() },
+    // 取消族终态化履约任务（CANCELLED/REFUNDED/PAYMENT_TIMEOUT/FAILED）。
+    fulfillmentTask: { updateMany: vi.fn() },
     // Bug 6（佣金幂等）用：createCommissionsForOrder 只在 order.agentId 非空且 toStatus===PAID 时触达。
     // findMany 另外还被"释放型流转的佣金冲销"步骤用到（wasHolding&&isReleasing 且非 PENDING_PAYMENT
     // 来源时无条件触达，即便订单没有代理——见 Bug 1 的 H→DRAFT 测试）。
@@ -36,6 +41,9 @@ const { mockPrisma } = vi.hoisted(() => ({
     agent: { findUnique: vi.fn() },
     commissionRule: { findMany: vi.fn() },
     $executeRaw: vi.fn(),
+    // R5：转 PAID 分支对 Order 行 FOR UPDATE 读最新 paidAmount。mock 返回 []（无 DB）→ 代码回退到
+    // findUnique 读到的 order.paidAmount，与旧口径完全一致（真 DB FOR UPDATE 主路径由集成测试覆盖）。
+    $queryRaw: vi.fn(),
   },
 }));
 // _updateStatusWithinTx 直接传 tx 参数，这里的 mockTx 即传入的事务句柄（同一批 vi.fn()）。
@@ -95,6 +103,13 @@ describe('OrderService._updateStatusWithinTx · 非占座 → 占座 重新占�
   // 必须连实现一起清空，避免上一条用例没消费完的排队值串到下一条。
   beforeEach(() => {
     vi.resetAllMocks();
+    // 默认：无 SUCCEEDED Payment（转 PAID 不抬 paidAmount）+ 履约任务终态化 no-op（用例可覆写）
+    mockPrisma.payment.aggregate.mockResolvedValue({ _sum: { amount: null } });
+    mockPrisma.fulfillmentTask.updateMany.mockResolvedValue({ count: 0 });
+    // 转 PAID 分支 FOR UPDATE 读 paidAmount：mock 返回 [] → 回退到 findUnique 的 order.paidAmount。
+    mockPrisma.$queryRaw.mockResolvedValue([]);
+    // 转 PAID 作废其它 PENDING 兄弟 Payment（默认无兄弟 → count 0）。
+    mockPrisma.payment.updateMany.mockResolvedValue({ count: 0 });
   });
 
   it('force PAYMENT_TIMEOUT → PAID：命中原子 CAS 重新占座', async () => {
@@ -221,6 +236,13 @@ describe('OrderService._updateStatusWithinTx · 既有释放/占座路径不受�
 
   beforeEach(() => {
     vi.resetAllMocks();
+    // 默认：无 SUCCEEDED Payment（转 PAID 不抬 paidAmount）+ 履约任务终态化 no-op（用例可覆写）
+    mockPrisma.payment.aggregate.mockResolvedValue({ _sum: { amount: null } });
+    mockPrisma.fulfillmentTask.updateMany.mockResolvedValue({ count: 0 });
+    // 转 PAID 分支 FOR UPDATE 读 paidAmount：mock 返回 [] → 回退到 findUnique 的 order.paidAmount。
+    mockPrisma.$queryRaw.mockResolvedValue([]);
+    // 转 PAID 作废其它 PENDING 兄弟 Payment（默认无兄弟 → count 0）。
+    mockPrisma.payment.updateMany.mockResolvedValue({ count: 0 });
   });
 
   it('PENDING_PAYMENT → PAYMENT_TIMEOUT：正常超时释放座位，走 floor 后的原子 SQL（Bug 2b 修复）', async () => {
@@ -323,6 +345,13 @@ describe('OrderService._updateStatusWithinTx · Bug 1：DRAFT 座位账死区闭
 
   beforeEach(() => {
     vi.resetAllMocks();
+    // 默认：无 SUCCEEDED Payment（转 PAID 不抬 paidAmount）+ 履约任务终态化 no-op（用例可覆写）
+    mockPrisma.payment.aggregate.mockResolvedValue({ _sum: { amount: null } });
+    mockPrisma.fulfillmentTask.updateMany.mockResolvedValue({ count: 0 });
+    // 转 PAID 分支 FOR UPDATE 读 paidAmount：mock 返回 [] → 回退到 findUnique 的 order.paidAmount。
+    mockPrisma.$queryRaw.mockResolvedValue([]);
+    // 转 PAID 作废其它 PENDING 兄弟 Payment（默认无兄弟 → count 0）。
+    mockPrisma.payment.updateMany.mockResolvedValue({ count: 0 });
   });
 
   it('force PAID → DRAFT：H→DRAFT 走释放分支还库存（不再是死区）', async () => {
@@ -468,6 +497,13 @@ describe('OrderService._updateStatusWithinTx · Bug 6：佣金创建幂等', () 
 
   beforeEach(() => {
     vi.resetAllMocks();
+    // 默认：无 SUCCEEDED Payment（转 PAID 不抬 paidAmount）+ 履约任务终态化 no-op（用例可覆写）
+    mockPrisma.payment.aggregate.mockResolvedValue({ _sum: { amount: null } });
+    mockPrisma.fulfillmentTask.updateMany.mockResolvedValue({ count: 0 });
+    // 转 PAID 分支 FOR UPDATE 读 paidAmount：mock 返回 [] → 回退到 findUnique 的 order.paidAmount。
+    mockPrisma.$queryRaw.mockResolvedValue([]);
+    // 转 PAID 作废其它 PENDING 兄弟 Payment（默认无兄弟 → count 0）。
+    mockPrisma.payment.updateMany.mockResolvedValue({ count: 0 });
   });
 
   it('force REFUNDED → PAID：已退款是终态，禁止"复活"回占座/已支付（即使 admin force）', async () => {
@@ -566,5 +602,155 @@ describe('OrderService._updateStatusWithinTx · Bug 6：佣金创建幂等', () 
     expect(createCall.data.agentId).toBe('agent1');
     expect(createCall.data.orderId).toBe('ord1');
     expect(Number(createCall.data.amount)).toBe(100); // 1000 × 10%
+  });
+});
+
+// ── P0-3：转 PAID 不再"因转成 PAID 这个动作本身"隐式补满额 ────────────────
+// paidAmount 只反映真实到账证据（SUCCEEDED Payment 台账 与 已记录 order.paidAmount 的较大者），
+// 无流水则保留原值（订单可 PAID 但尾款如实 > 0），杜绝 STAFF/ADMIN 经 PATCH status 白得"已收全款"。
+describe('OrderService._updateStatusWithinTx · P0-3：转 PAID 按真实到账证据', () => {
+  const service = new OrderService();
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockPrisma.payment.aggregate.mockResolvedValue({ _sum: { amount: null } });
+    mockPrisma.fulfillmentTask.updateMany.mockResolvedValue({ count: 0 });
+    // 转 PAID 分支 FOR UPDATE 读 paidAmount：mock 返回 [] → 回退到 findUnique 的 order.paidAmount。
+    mockPrisma.$queryRaw.mockResolvedValue([]);
+    // 转 PAID 作废其它 PENDING 兄弟 Payment（默认无兄弟 → count 0）。
+    mockPrisma.payment.updateMany.mockResolvedValue({ count: 0 });
+  });
+
+  function armPaidTransition(order: Record<string, unknown>) {
+    mockPrisma.order.findUnique
+      .mockResolvedValueOnce(order) // _updateStatusWithinTx 自己的读
+      .mockResolvedValueOnce({ visaStatus: null }); // createFulfillmentTasks 内部读
+    mockPrisma.order.updateMany.mockResolvedValueOnce({ count: 1 });
+    mockPrisma.orderStatusEvent.create.mockResolvedValueOnce({});
+    mockPrisma.orderItem.findMany.mockResolvedValueOnce([]); // createFulfillmentTasks：无行可建
+    mockPrisma.order.findUniqueOrThrow.mockResolvedValueOnce({ ...order, status: OrderStatus.PAID });
+  }
+
+  it('有 SUCCEEDED Payment 台账（≥ total）→ paidAmount 抬到实收（网关回调口径）', async () => {
+    const order = buildOrder({ status: OrderStatus.PENDING_PAYMENT, paidAmount: decimalLike(0), items: [flightItem()] });
+    armPaidTransition(order);
+    mockPrisma.payment.aggregate.mockResolvedValueOnce({ _sum: { amount: 1000 } });
+
+    await service._updateStatusWithinTx(tx, 'ord1', OrderStatus.PAID, adminRequester, undefined, [], false, []);
+
+    const casData = mockPrisma.order.updateMany.mock.calls[0][0].data;
+    expect(casData.status).toBe(OrderStatus.PAID);
+    expect(Number(casData.paidAmount.toString())).toBe(1000);
+  });
+
+  it('多付：Payment 台账 > total → paidAmount 保留多付额（不回压到 total）', async () => {
+    const order = buildOrder({ status: OrderStatus.PENDING_PAYMENT, paidAmount: decimalLike(0), items: [flightItem()] });
+    armPaidTransition(order);
+    mockPrisma.payment.aggregate.mockResolvedValueOnce({ _sum: { amount: 1200 } });
+
+    await service._updateStatusWithinTx(tx, 'ord1', OrderStatus.PAID, adminRequester, undefined, [], false, []);
+
+    const casData = mockPrisma.order.updateMany.mock.calls[0][0].data;
+    expect(Number(casData.paidAmount.toString())).toBe(1200);
+  });
+
+  it('无收款流水（admin force→PAID）→ 不写 paidAmount（保留原值，绝不伪造满额）', async () => {
+    const order = buildOrder({ status: OrderStatus.PENDING_PAYMENT, paidAmount: decimalLike(0), items: [flightItem()] });
+    armPaidTransition(order);
+    // 默认 payment.aggregate → { _sum: { amount: null } }（无 SUCCEEDED Payment）
+
+    await service._updateStatusWithinTx(tx, 'ord1', OrderStatus.PAID, adminRequester, undefined, [], false, []);
+
+    const casData = mockPrisma.order.updateMany.mock.calls[0][0].data;
+    expect(casData.status).toBe(OrderStatus.PAID);
+    // 关键：不因转 PAID 就把 paidAmount 补到 total —— 台账无证据时不写该字段
+    expect(casData.paidAmount).toBeUndefined();
+  });
+
+  it('调用方已累加 order.paidAmount（人工/余额抵扣，≥ total）→ 保留，不被更小的 Payment 台账回压', async () => {
+    // 余额抵扣走 prepaymentTransaction 不入 Payment 台账 → 台账合计可能 < total，但 order.paidAmount 已满额
+    const order = buildOrder({ status: OrderStatus.PENDING_PAYMENT, paidAmount: decimalLike(1000), items: [flightItem()] });
+    armPaidTransition(order);
+    mockPrisma.payment.aggregate.mockResolvedValueOnce({ _sum: { amount: 0 } });
+
+    await service._updateStatusWithinTx(tx, 'ord1', OrderStatus.PAID, adminRequester, undefined, [], false, []);
+
+    const casData = mockPrisma.order.updateMany.mock.calls[0][0].data;
+    // 台账(0) 不大于 已记录(1000) → 不改写 paidAmount，保留 1000
+    expect(casData.paidAmount).toBeUndefined();
+  });
+});
+
+// ── P1-7 / P2-16 / P1-14：退款回退置 REJECTED、取消族终态化履约任务、软删单拒状态流转 ──
+describe('OrderService._updateStatusWithinTx · 退款回退 / 任务终态化 / 软删守卫', () => {
+  const service = new OrderService();
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockPrisma.payment.aggregate.mockResolvedValue({ _sum: { amount: null } });
+    mockPrisma.fulfillmentTask.updateMany.mockResolvedValue({ count: 0 });
+    // 转 PAID 分支 FOR UPDATE 读 paidAmount：mock 返回 [] → 回退到 findUnique 的 order.paidAmount。
+    mockPrisma.$queryRaw.mockResolvedValue([]);
+    // 转 PAID 作废其它 PENDING 兄弟 Payment（默认无兄弟 → count 0）。
+    mockPrisma.payment.updateMany.mockResolvedValue({ count: 0 });
+  });
+
+  it('P1-7 REFUND_REQUESTED → PROCESSING（退款被拒回退）→ 关联 REQUESTED Refund 置 REJECTED', async () => {
+    const order = buildOrder({ status: OrderStatus.REFUND_REQUESTED, items: [flightItem()] });
+    mockPrisma.order.findUnique.mockResolvedValueOnce(order);
+    mockPrisma.order.updateMany.mockResolvedValueOnce({ count: 1 });
+    mockPrisma.orderStatusEvent.create.mockResolvedValueOnce({});
+    mockPrisma.refund.updateMany.mockResolvedValueOnce({ count: 1 });
+    mockPrisma.order.findUniqueOrThrow.mockResolvedValueOnce({ ...order, status: OrderStatus.PROCESSING });
+
+    await service._updateStatusWithinTx(tx, 'ord1', OrderStatus.PROCESSING, adminRequester, undefined, []);
+
+    expect(mockPrisma.refund.updateMany).toHaveBeenCalledWith({
+      where: { orderId: 'ord1', status: 'REQUESTED' },
+      data: { status: 'REJECTED', processedAt: expect.any(Date) },
+    });
+  });
+
+  it('P2-16 → CANCELLED：把该订单 PENDING/IN_PROGRESS 履约任务终态化为 CANCELLED', async () => {
+    // 用 HOTEL 行避开释放分支的座位 mock；PENDING_PAYMENT→CANCELLED 是允许转移（无需 force）。
+    const order = buildOrder({
+      status: OrderStatus.PENDING_PAYMENT,
+      items: [{ id: 'item1', kind: 'HOTEL', quantity: 1, flightScheduleId: null, flightCabin: null, metadata: null }],
+    });
+    mockPrisma.order.findUnique.mockResolvedValueOnce(order);
+    mockPrisma.order.updateMany.mockResolvedValueOnce({ count: 1 });
+    mockPrisma.orderStatusEvent.create.mockResolvedValueOnce({});
+    mockPrisma.refund.updateMany.mockResolvedValueOnce({ count: 0 });
+    mockPrisma.order.findUniqueOrThrow.mockResolvedValueOnce({ ...order, status: OrderStatus.CANCELLED });
+
+    await service._updateStatusWithinTx(tx, 'ord1', OrderStatus.CANCELLED, adminRequester, undefined, []);
+
+    expect(mockPrisma.fulfillmentTask.updateMany).toHaveBeenCalledWith({
+      where: {
+        orderItem: { orderId: 'ord1' },
+        status: { in: [FulfillmentStatus.PENDING, FulfillmentStatus.IN_PROGRESS] },
+      },
+      data: { status: FulfillmentStatus.CANCELLED, completedAt: expect.any(Date) },
+    });
+  });
+
+  it('P2-16 → PROCESSING（非取消族）：不终态化履约任务', async () => {
+    const order = buildOrder({ status: OrderStatus.PAID, items: [{ id: 'item1', kind: 'HOTEL', quantity: 1, flightScheduleId: null, flightCabin: null, metadata: null }] });
+    mockPrisma.order.findUnique.mockResolvedValueOnce(order);
+    mockPrisma.order.updateMany.mockResolvedValueOnce({ count: 1 });
+    mockPrisma.orderStatusEvent.create.mockResolvedValueOnce({});
+    mockPrisma.order.findUniqueOrThrow.mockResolvedValueOnce({ ...order, status: OrderStatus.PROCESSING });
+
+    await service._updateStatusWithinTx(tx, 'ord1', OrderStatus.PROCESSING, adminRequester, undefined, []);
+
+    expect(mockPrisma.fulfillmentTask.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('P1-14 软删单（deletedAt 非空）→ 拒绝状态流转（BadRequestError），不落新状态', async () => {
+    const order = buildOrder({ status: OrderStatus.CANCELLED, deletedAt: new Date('2026-07-01T00:00:00.000Z') });
+    mockPrisma.order.findUnique.mockResolvedValueOnce(order);
+
+    await expect(
+      service._updateStatusWithinTx(tx, 'ord1', OrderStatus.PAID, adminRequester, undefined, [], true, []),
+    ).rejects.toBeInstanceOf(BadRequestError);
+    expect(mockPrisma.order.updateMany).not.toHaveBeenCalled();
   });
 });

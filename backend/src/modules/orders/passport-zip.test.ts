@@ -132,6 +132,43 @@ describe('extFromUrl', () => {
   });
 });
 
+describe('buildPassportPhotoZip — 送签表排除自备签乘客（P1-13）', () => {
+  // 自备签乘客（visaExempt=true）已自行办妥签证，不需要送签——与签证台
+  // fulfillment.service.ts 同口径。护照 zip 图片本身仍打包（业务上护照图可能仍有用途），
+  // 只有"送签表"这张名单排除，避免签证岗把自备签客人也当送签对象核对/催材料。
+  it('自备签乘客不出现在送签表，但其护照图仍打包进 zip', async () => {
+    const orderNumber = 'FTM2026070800005';
+    const passengers = [
+      makePassenger({
+        id: 'p1',
+        fullName: 'ZHANG SAN',
+        chineseName: '张三',
+        visaExempt: true,
+        passportPhotoUrl: 'https://x.test/zhang.jpg',
+      }),
+      makePassenger({ id: 'p2', fullName: 'LI SI', chineseName: '李四', visaExempt: false }),
+    ];
+
+    const fetchSpy = vi
+      .spyOn(globalThis, 'fetch')
+      .mockResolvedValue(new Response(new Uint8Array([1, 2, 3, 4]), { status: 200 }));
+
+    const zipBuf = await buildPassportPhotoZip({ orderNumber, passengers });
+
+    // 送签表：只剩非自备签的「李四」
+    const rows = await readVisaSheetRows(zipBuf, orderNumber);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]['中文名']).toBe('李四');
+
+    // 护照图 zip：自备签乘客「张三」的图仍打包（不受送签表过滤影响）
+    const zip = await JSZip.loadAsync(zipBuf);
+    const names = Object.keys(zip.files);
+    expect(names.some((n) => n.includes('ZHANG'))).toBe(true);
+
+    fetchSpy.mockRestore();
+  });
+});
+
 describe('buildPassportPhotoZip — 送签表覆盖手工录入/无图乘客', () => {
   it('无图乘客也出现在送签表，并标记「无护照图（手工录入）」', async () => {
     const orderNumber = 'FTM2026070800001';

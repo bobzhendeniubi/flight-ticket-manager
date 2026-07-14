@@ -2030,7 +2030,7 @@ function OrderDrawer({
                           orderId={o.id}
                           item={it}
                           onOrderUpdated={handleOrderUpdated}
-                          isAdmin={isAdmin}
+                          canEditSettlementPrice={isOps}
                         />
                       ))}
                     </ul>
@@ -2045,7 +2045,7 @@ function OrderDrawer({
                     orderId={o.id}
                     item={it}
                     onOrderUpdated={handleOrderUpdated}
-                    isAdmin={isAdmin}
+                    canEditSettlementPrice={isOps}
                   />
                 ))}
               </ul>
@@ -3034,12 +3034,13 @@ function OrderItemRow({
   orderId,
   item,
   onOrderUpdated,
-  isAdmin,
+  canEditSettlementPrice,
 }: {
   orderId: string;
   item: OrderItem;
   onOrderUpdated?: (order: OrderSummary) => void;
-  isAdmin?: boolean;
+  /** 改结算价：后端 PATCH settlement-price 放行 ADMIN/STAFF，这里同口径（非纯 ADMIN） */
+  canEditSettlementPrice?: boolean;
 }) {
   const [rescheduling, setRescheduling] = useState(false);
   const [editingPrice, setEditingPrice] = useState(false);
@@ -3095,7 +3096,7 @@ function OrderItemRow({
               改期
             </button>
           )}
-          {isFlight && isAdmin && !rescheduling && !editingPrice && (
+          {isFlight && canEditSettlementPrice && !rescheduling && !editingPrice && (
             <button
               className="text-[11px] font-medium text-amber-600 hover:text-amber-800"
               onClick={() => setEditingPrice(true)}
@@ -4370,6 +4371,13 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   // ── 产品类型 ──────────────────────────────────────────────────────────────
   const [productType, setProductType] = useState<BatchProductType>('FLIGHT_ONEWAY');
 
+  // 幂等 batchId：同一次批量提交（含双击/网络重试）每张子单只建一次；成功后换新（与批量到账同款模式）。
+  const makeBatchId = () =>
+    typeof crypto !== 'undefined' && 'randomUUID' in crypto
+      ? crypto.randomUUID()
+      : `bc-${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
+  const [batchId, setBatchId] = useState(makeBatchId);
+
   // ── 航班：出港（单程 + 往返）+ 回程（仅往返）────────────────────────────
   const [flights, setFlights] = useState<AdminFlight[]>([]);
   const [flightsErr, setFlightsErr] = useState<string | null>(null);
@@ -4392,6 +4400,9 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   // ── 套餐 ──────────────────────────────────────────────────────────────────
   const [bundles, setBundles] = useState<Bundle[]>([]);
   const [bundleId, setBundleId] = useState('');
+  // 套餐出发日期（YYYY-MM-DD）：后端据此匹配套餐绑定航班的当日班次，注入去/回程机票航段行 → 真正扣座 + 房控盖章。
+  // 留空则后端回落套餐默认出发日期；两者都无 → 该批逐单优雅失败（提示配置出发日期/排班）。
+  const [bundleDepartDate, setBundleDepartDate] = useState('');
   const [bundleNights, setBundleNights] = useState<number | null>(null);
   const [bundleSingleCount, setBundleSingleCount] = useState<number | null>(null);
   const [bundleBusinessCount, setBundleBusinessCount] = useState<number | null>(null);
@@ -4721,6 +4732,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
           }
         : {
             bundleId,
+            ...(bundleDepartDate ? { bundleDepartDate } : {}),
             ...(bundleNights !== null ? { bundleNights } : {}),
             ...(bundleSingleCount !== null ? { bundleSingleCount } : {}),
             ...(bundleBusinessCount !== null ? { bundleBusinessCount } : {}),
@@ -4749,6 +4761,8 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
         ? { settlementPriceCny: teamPrice, groupNote: groupNote.trim() || undefined }
         : {}),
       ...(manualPrice !== undefined ? { manualUnitPriceCny: manualPrice } : {}),
+      // 幂等 batchId：整批重试/双击每张子单只建一次（后端派生 `batch:{batchId}:{index}`）。
+      batchId,
     };
 
     setSubmitting(true);
@@ -4777,6 +4791,8 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
         }
       }
       setResult(res);
+      // 成功后换新 batchId：下一批提交是全新的一批，不复用上一批的幂等键。
+      setBatchId(makeBatchId());
       if (res.successCount > 0) onCreated();
     } catch (e: unknown) {
       setErr(e instanceof ApiError ? e.message : '批量创建失败');
@@ -5081,6 +5097,18 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                       onChange={setBundleId}
                       placeholder="搜索套餐：编号 / 名称…"
                     />
+                  </label>
+                  <label className="text-xs text-slate-500">
+                    出发日期（选填）
+                    <input
+                      type="date"
+                      className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                      value={bundleDepartDate}
+                      onChange={(e) => setBundleDepartDate(e.target.value)}
+                    />
+                    <span className="mt-1 block text-[11px] leading-tight text-slate-400">
+                      按此匹配套餐航班当日班次并占座；留空则用套餐默认出发日期
+                    </span>
                   </label>
                   <label className="text-xs text-slate-500">
                     入住晚数（选填）
@@ -5789,6 +5817,13 @@ function BatchPayModal({
     Array<{ orderId: string; ok: boolean; error?: string; paidAmount: number; status: OrderStatus }> | null
   >(null);
 
+  // 幂等 batchId：同一次批量提交（含双击/网络重试）只入账一次；成功后换新
+  const makeBatchId = () =>
+    typeof crypto !== 'undefined' && 'randomUUID' in crypto
+      ? crypto.randomUUID()
+      : `bc-${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
+  const [batchId, setBatchId] = useState(makeBatchId);
+
   function setRowAmount(orderId: string, amount: number | null): void {
     setRows((prev) => prev.map((r) => (r.orderId === orderId ? { ...r, amount } : r)));
   }
@@ -5825,8 +5860,10 @@ function BatchPayModal({
           note: sharedNote.trim() || undefined,
         })),
         sharedProofUrl: sharedProofUrl ?? undefined,
+        batchId,
       });
       setResults(res.results);
+      setBatchId(makeBatchId());
       const succeeded = res.results.filter((r) => r.ok).map((r) => r.orderId);
       onDone(succeeded);
     } catch (e: unknown) {

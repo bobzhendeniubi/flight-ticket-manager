@@ -5,7 +5,6 @@ import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api, ApiError, SETTLEMENT_MODE_LABEL, type AgentListItem, type CreateChildAgentInput, type CustomerSummary, type SettlementMode, type UpdateAgentInput } from '../lib/api';
 import { useAuth } from '../stores/auth';
-import { NumberInput } from '../components/NumberInput';
 
 const TIER_LABEL = ['', '1级·总代', '2级·区代', '3级·门店', '4级', '5级'];
 const TIER_COLOR = ['', 'bg-red-100 text-red-700', 'bg-amber-100 text-amber-700', 'bg-blue-100 text-blue-700', 'bg-slate-100 text-slate-600', 'bg-slate-100 text-slate-600'];
@@ -873,11 +872,10 @@ function CreateAgentForm({
 }) {
   const tokens = useAuth((s) => s.tokens);
   const [parentId, setParentId] = useState(initialParentId ?? '');
-  const [form, setForm] = useState<Omit<CreateChildAgentInput, 'prepaymentBalance'>>({
+  const [form, setForm] = useState<CreateChildAgentInput>({
     email: '', password: '', displayName: '', contactName: '', contactPhone: '',
     companyName: '', notes: '',
   });
-  const [prepaymentBalance, setPrepaymentBalance] = useState<number | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const parentOptions = useMemo(() => agents.filter((a) => a.isActive && a.tier < 5), [agents]);
@@ -889,7 +887,7 @@ function CreateAgentForm({
     try {
       await api.createChildAgent(
         tokens.accessToken,
-        { ...form, prepaymentBalance: prepaymentBalance ?? 0 },
+        form,
         parentId || undefined,
       );
       onCreated();
@@ -924,7 +922,7 @@ function CreateAgentForm({
         <div><label className="label">公司名</label><input className="input" value={form.companyName ?? ''} onChange={(e) => setForm({ ...form, companyName: e.target.value })} /></div>
         <div><label className="label">联系人 *</label><input required className="input" value={form.contactName} onChange={(e) => setForm({ ...form, contactName: e.target.value })} /></div>
         <div><label className="label">联系电话 *</label><input required className="input" value={form.contactPhone} onChange={(e) => setForm({ ...form, contactPhone: e.target.value })} /></div>
-        <div><label className="label">初始预付余额（¥）</label><NumberInput min={0} className="input" value={prepaymentBalance} onChange={(n) => setPrepaymentBalance(n)} /></div>
+        {/* 无「初始预付余额」输入：建代理余额恒为 0，事后走认款通道（有流水+审计）产生。 */}
         <div><label className="label">备注</label><input className="input" value={form.notes ?? ''} onChange={(e) => setForm({ ...form, notes: e.target.value })} /></div>
         {err && <div className="md:col-span-2 rounded-md bg-red-50 px-3 py-2 text-sm text-red-700">{err}</div>}
         <div className="md:col-span-2 flex justify-end gap-3">

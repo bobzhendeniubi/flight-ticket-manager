@@ -223,3 +223,35 @@ describe('serializeOrder · AGENT/CUSTOMER 视角（脱敏）', () => {
     expect(out.agent.settlementMode).toBe('MONTHLY');
   });
 });
+
+// ── B2：派生结清口径纳入 prepaymentOffset（与 reports/reminders/导出全局清账公式一字一致）──
+describe('serializeOrder · balanceDue 纳入 prepaymentOffset', () => {
+  it('尾款 = total + adjustmentCny − paidAmount − prepaymentOffset（含改期费与预存抵扣）', () => {
+    const out = serializeOrder(
+      { ...buildOrder(), total: dec(5000), adjustmentCny: 500, paidAmount: dec(3000), prepaymentOffset: dec(1000) },
+      orderSerializeRoleCtx(UserRole.ADMIN),
+    ) as Record<string, any>;
+    // effectivePayable = 5000 + 500（应付含改期费，不减预存）
+    expect(out.effectivePayable).toBe('5500');
+    // balanceDue = 5500 − 3000（已付）− 1000（预存抵扣）= 1500
+    expect(out.balanceDue).toBe('1500');
+  });
+
+  it('预存抵扣把尾款抵成负数 → 视为多付（balanceDue<0 语义保持）', () => {
+    const out = serializeOrder(
+      { ...buildOrder(), total: dec(1000), adjustmentCny: 0, paidAmount: dec(800), prepaymentOffset: dec(300) },
+      orderSerializeRoleCtx(UserRole.ADMIN),
+    ) as Record<string, any>;
+    // balanceDue = 1000 − 800 − 300 = −100（多付）
+    expect(out.balanceDue).toBe('-100');
+  });
+
+  it('prepaymentOffset=0 时与旧口径一致（无回归）', () => {
+    const out = serializeOrder(
+      { ...buildOrder(), total: dec(1000), adjustmentCny: 200, paidAmount: dec(1000), prepaymentOffset: dec(0) },
+      orderSerializeRoleCtx(UserRole.ADMIN),
+    ) as Record<string, any>;
+    expect(out.effectivePayable).toBe('1200');
+    expect(out.balanceDue).toBe('200'); // 1200 − 1000 − 0
+  });
+});

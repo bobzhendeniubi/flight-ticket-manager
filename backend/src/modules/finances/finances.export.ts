@@ -9,6 +9,15 @@
  *   签证成本(RMB)  = visa.costPriceCny
  * 机票成本按"包机单座成本"算（与航班毛利视图一致）；酒店/车费/签证按订单总额 ÷ 人数 均摊。
  * 收入按 order.total ÷ 人数 均摊到每位乘客。
+ *
+ * 是否清账（settledStatus）口径：应收合计 = total + adjustmentCny（改期费/换人费等售后费用）；
+ * 已收合计 = paidAmount + prepaymentOffset（代理预付款抵扣）；清账 = 已收合计 ≥ 应收合计，
+ * 不带"应收合计>0"前置——与 orders.export-master.ts / orders.export-templates.ts /
+ * reports.service.ts 三处口径字字对齐，避免"改期费/换人费未收"被误标为已清账，也让零额单
+ * （免费单/全减免单，应收=已收=0）正常判"已清账"而非"未清账"。
+ * 注：本导出的"收入"各列（flightRevenue/totalRevenue/客单收入 等）仍只按 order.total /
+ * OrderItem.amount 计，不含 adjustmentCny——改期费/换人费目前没有独立的收入列，只在
+ * settledStatus 这个应收口径里生效，这是已知的口径局限，不在本次改动范围内。
  */
 import ExcelJS from 'exceljs';
 import type { Prisma, PrismaClient } from '@prisma/client';
@@ -280,7 +289,14 @@ function orderToRows(order: OrderForExport, periodsMap: PeriodsMap): FinanceRow[
   const orderType = kinds.join('+');
 
   const agency = order.agent?.companyName ?? order.agent?.contactName ?? '直销';
-  const settled = dec(order.paidAmount) >= totalRevenue && totalRevenue > 0 ? '是' : '否';
+  // 是否清账：应收合计 = total + adjustmentCny（改期费/换人费等售后费用，不改 total 本身，
+  // 单独叠加在这笔调整字段上）；已收合计 = paidAmount + prepaymentOffset（代理预付款抵扣）。
+  // 与 reports.service.ts 的应收余额口径（total + adjustmentCny − paidAmount − prepaymentOffset）
+  // 对齐——此前这里只比较 paidAmount 和 total，忽略了 adjustmentCny，导致有未收改期费/换人费
+  // 的订单被错误标为"已清账"。
+  const payableCny = round2(totalRevenue + (order.adjustmentCny ?? 0));
+  const receivedCny = round2(dec(order.paidAmount) + dec(order.prepaymentOffset));
+  const settled = receivedCny >= payableCny ? '是' : '否';
 
   const hotelPerPax = hotelCostCnyOrder / paxCount;
   const transferPerPax = transferCostCnyOrder / paxCount;

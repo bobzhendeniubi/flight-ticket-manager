@@ -23,9 +23,51 @@ import {
   UserRole,
 } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
-import { OrderService } from './orders.service.js';
+import {
+  OrderService,
+  releaseSeatFloored,
+  computeBundleSeatSplit,
+  createFulfillmentTasks,
+} from './orders.service.js';
 
 const service = new OrderService();
+
+/**
+ * 忠实复刻 queues/worker.ts 超时释放事务（FOR UPDATE 锁 Order 行 → 事务内读 items → 释放 → CAS
+ * PAYMENT_TIMEOUT）。直接 import worker.ts 会在模块加载时 new Worker(...) 连 Redis，故此处内联复刻，
+ * 用于验证「改期侧 FOR UPDATE」与超时侧共享同一把行锁、严格串行（R2）。
+ */
+async function simulateSeatHoldTimeout(orderId: string): Promise<'released' | 'skipped'> {
+  let released = false;
+  await prisma.$transaction(async (tx) => {
+    const locked = await tx.$queryRaw<
+      Array<{ id: string; status: OrderStatus; paymentExpiresAt: Date | null }>
+    >`SELECT id, status, "paymentExpiresAt" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+    const row = locked[0];
+    if (!row) return;
+    if (row.status !== OrderStatus.PENDING_PAYMENT) return;
+    if (!row.paymentExpiresAt || row.paymentExpiresAt.getTime() > Date.now()) return;
+    const items = await tx.orderItem.findMany({
+      where: { orderId },
+      select: { kind: true, flightScheduleId: true, flightCabin: true, quantity: true, metadata: true },
+    });
+    for (const item of items) {
+      if (item.kind !== OrderItemKind.FLIGHT || !item.flightScheduleId || !item.flightCabin) continue;
+      const meta = (item.metadata ?? {}) as { businessUpgradeCount?: unknown };
+      const rawUpgrade = typeof meta.businessUpgradeCount === 'number' ? meta.businessUpgradeCount : 0;
+      const split = computeBundleSeatSplit(item.flightCabin, item.quantity, rawUpgrade);
+      await releaseSeatFloored(tx, item.flightScheduleId, CabinClass.BUSINESS, split.business);
+      await releaseSeatFloored(tx, item.flightScheduleId, item.flightCabin, split.sameCabin);
+    }
+    const upd = await tx.order.updateMany({
+      where: { id: orderId, status: OrderStatus.PENDING_PAYMENT },
+      data: { status: OrderStatus.PAYMENT_TIMEOUT },
+    });
+    if (upd.count === 0) throw new Error('ORDER_STATUS_CHANGED_DURING_EXPIRY');
+    released = true;
+  });
+  return released ? 'released' : 'skipped';
+}
 
 // ── Fixtures ───────────────────────────────────────────────────────────────
 function uniq(prefix: string): string {
@@ -134,6 +176,112 @@ async function adminActor() {
 async function soldCount(scheduleId: string, cabin: CabinClass): Promise<number> {
   const sc = await prisma.flightSeatClass.findFirstOrThrow({ where: { scheduleId, cabin } });
   return sc.sold;
+}
+
+/** 建一个 PENDING_PAYMENT 散客单（paymentExpiresAt 可设为过去 → 超时 worker 会释放机位），含 1 个 FLIGHT 行。 */
+async function createPendingFlightOrder(opts: {
+  scheduleId: string;
+  cabin: CabinClass;
+  expired?: boolean;
+  total?: number;
+}) {
+  const total = opts.total ?? 1000;
+  return prisma.order.create({
+    data: {
+      orderNumber: uniq('ORD'),
+      status: OrderStatus.PENDING_PAYMENT,
+      // 前台散客单：过期时间；expired=true → 设为过去（超时释放条件成立）。
+      paymentExpiresAt: new Date(Date.now() + (opts.expired ? -60_000 : 30 * 60_000)),
+      subtotal: new Prisma.Decimal(total),
+      total: new Prisma.Decimal(total),
+      paidAmount: new Prisma.Decimal(0),
+      contactName: 'Test User',
+      contactPhone: '13800138000',
+      items: {
+        create: [
+          {
+            kind: OrderItemKind.FLIGHT,
+            description: 'TEST MFM→DAD',
+            quantity: 1,
+            unitPrice: new Prisma.Decimal(total),
+            amount: new Prisma.Decimal(total),
+            flightScheduleId: opts.scheduleId,
+            flightCabin: opts.cabin,
+          },
+        ],
+      },
+      passengers: {
+        create: [
+          {
+            fullName: 'WANG XIAO',
+            lastName: 'WANG',
+            firstName: 'XIAO',
+            documentType: 'PASSPORT',
+            documentNumber: uniq('P'),
+            dateOfBirth: new Date('1990-01-01'),
+            nationality: 'CHN',
+          },
+        ],
+      },
+    },
+    include: { items: true, passengers: true },
+  });
+}
+
+/**
+ * 建一个含自备签减免的 BUNDLE 订单（BUNDLE 行 metadata.addOns 记 selfProvidedVisaCount/selfVisaDeductCny），
+ * 出行人 visaExempt 可设。用于验证换人价回滚（true→false 撤销自备签减免）。
+ * 不含 FLIGHT 行 → 换人时跳过基于班次的重复证件校验，聚焦价回滚逻辑。
+ */
+async function createBundleOrderWithSelfVisa(opts: {
+  selfVisaDeductCny: number;
+  visaExempt: boolean;
+  total?: number;
+}) {
+  const total = opts.total ?? 5000;
+  return prisma.order.create({
+    data: {
+      orderNumber: uniq('BND'),
+      status: OrderStatus.PAID,
+      subtotal: new Prisma.Decimal(total),
+      total: new Prisma.Decimal(total),
+      paidAmount: new Prisma.Decimal(total),
+      contactName: 'Test User',
+      contactPhone: '13800138000',
+      items: {
+        create: [
+          {
+            kind: OrderItemKind.BUNDLE,
+            description: '测试套餐',
+            quantity: 1,
+            unitPrice: new Prisma.Decimal(total),
+            amount: new Prisma.Decimal(total),
+            metadata: {
+              addOns: {
+                selfProvidedVisaCount: opts.visaExempt ? 1 : 0,
+                selfVisaDeductCny: opts.selfVisaDeductCny,
+              },
+            },
+          },
+        ],
+      },
+      passengers: {
+        create: [
+          {
+            fullName: 'WANG XIAO',
+            lastName: 'WANG',
+            firstName: 'XIAO',
+            documentType: 'PASSPORT',
+            documentNumber: uniq('P'),
+            dateOfBirth: new Date('1990-01-01'),
+            nationality: 'CHN',
+            visaExempt: opts.visaExempt,
+          },
+        ],
+      },
+    },
+    include: { items: true, passengers: true },
+  });
 }
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -280,6 +428,46 @@ describe('OrderService.rescheduleOrderItem · 真 DB E2E', () => {
       ),
     ).rejects.toThrow(/只能对机票行/);
   });
+
+  it('R2 改期 vs 超时释放并发 → Order 行 FOR UPDATE 串行：座位账一致（无旧舱双放 / 新舱幽灵持有）', async () => {
+    const actor = await adminActor();
+    const from = await createScheduleWithSeats({ cabin: CabinClass.ECONOMY, capacity: 50, sold: 1 });
+    const to = await createScheduleWithSeats({ cabin: CabinClass.ECONOMY, capacity: 50, sold: 0 });
+    // PENDING_PAYMENT 且已过期：超时 worker 会释放机位；同时该态占座、可改期。
+    const order = await createPendingFlightOrder({
+      scheduleId: from.schedule.id,
+      cabin: CabinClass.ECONOMY,
+      expired: true,
+    });
+
+    // 并发跑：改期（旧 from → 新 to）与超时释放。两者都对同一 Order 行 FOR UPDATE → 严格串行。
+    // 用 allSettled：某一序（超时先提交）下改期会被占座守卫拒（PAYMENT_TIMEOUT 不可改期），属预期。
+    const [reschedRes, timeoutRes] = await Promise.allSettled([
+      service.rescheduleOrderItem(
+        order.id,
+        { orderItemId: order.items[0].id, newScheduleId: to.schedule.id },
+        actor,
+      ),
+      simulateSeatHoldTimeout(order.id),
+    ]);
+    // 两个操作都已结束（各自 fulfilled/rejected，不 hang）
+    expect(['fulfilled', 'rejected']).toContain(reschedRes.status);
+    expect(['fulfilled', 'rejected']).toContain(timeoutRes.status);
+
+    const dbOrder = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    const fromSold = await soldCount(from.schedule.id, CabinClass.ECONOMY);
+    const toSold = await soldCount(to.schedule.id, CabinClass.ECONOMY);
+
+    // 两种串行序都收敛到同一一致态（PENDING_PAYMENT→CHANGED 不在白名单，改期后仍 PENDING_PAYMENT，
+    // 故不论谁先拿锁，最终订单都超时、其当前所持机位被恰好释放一次）：
+    //   · 改期先提交：座搬到 to，随后超时读到最新 items 释放 to → from=0, to=0, PAYMENT_TIMEOUT。
+    //   · 超时先提交：释放 from → PAYMENT_TIMEOUT，改期被守卫拒 → from=0, to=0, PAYMENT_TIMEOUT。
+    expect(dbOrder.status).toBe(OrderStatus.PAYMENT_TIMEOUT);
+    expect(fromSold).toBe(0); // 旧舱：恰好释放一次（无双放；floored 亦不为负）
+    expect(toSold).toBe(0); // 新舱：无幽灵持有（超时单绝不留占座）
+    // 不变量：无负库存、无净泄漏占座
+    expect(fromSold + toSold).toBe(0);
+  });
 });
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -316,6 +504,9 @@ describe('OrderService.swapPassenger · 真 DB E2E', () => {
         fullName: 'LI MING',
         documentNumber: 'E99999999',
         nationality: 'CHN',
+        // P1-8：这些字段此前 swapPassengerBodySchema 未暴露（前端传不进来）；补齐后应透传落库。
+        visaExempt: true,
+        singleRoom: true,
         resetInvoice: true,
         resetVisa: true,
         feeCny: 200,
@@ -330,6 +521,9 @@ describe('OrderService.swapPassenger · 真 DB E2E', () => {
     expect(px.lastName).toBe('LI');
     expect(px.firstName).toBe('MING');
     expect(px.documentNumber).toBe('E99999999');
+    // P1-8：换人可显式带的乘客级属性（自备签 / 单住）落库
+    expect(px.visaExempt).toBe(true);
+    expect(px.singleRoom).toBe(true);
 
     // resetInvoice → NONE
     const reloaded = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
@@ -388,5 +582,204 @@ describe('OrderService.swapPassenger · 真 DB E2E', () => {
         { userId: customer.id, role: UserRole.CUSTOMER },
       ),
     ).rejects.toThrow(/仅运营\/管理员/);
+  });
+
+  // ── 换人价回滚（自备签 true→false 撤销自备签减免；null 审计发现）──────────────────
+  it('换人 visaExempt true→false（证件变更强制随团办签）→ 撤销自备签减免、尾款回收', async () => {
+    const actor = await adminActor();
+    // 套餐单：出行人自备签（visaExempt=true），套餐每人自备签减免 500，订单已全额付清。
+    const order = await createBundleOrderWithSelfVisa({ selfVisaDeductCny: 500, visaExempt: true, total: 5000 });
+
+    const result = await service.swapPassenger(
+      order.id,
+      order.passengers[0].id,
+      { fullName: 'LI MING', documentNumber: 'E77777777', nationality: 'CHN' },
+      actor,
+    );
+
+    // 证件变更 → visaExempt 回落 false（新客进签证台随团办签）
+    const px = await prisma.passenger.findUniqueOrThrow({ where: { id: order.passengers[0].id } });
+    expect(px.visaExempt).toBe(false);
+
+    // 撤销自备签减免：adjustmentCny += 500，adjustments 记一条 SWAP_VISA_DEDUCT_REVERSAL
+    const reloaded = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(reloaded.adjustmentCny).toBe(500);
+    const log = reloaded.adjustments as Array<{ type: string; amountCny: number }>;
+    expect(log.some((e) => e.type === 'SWAP_VISA_DEDUCT_REVERSAL' && e.amountCny === 500)).toBe(true);
+
+    // 钱回收：effectivePayable = 5000 + 500；balanceDue = 5500 − 5000 = 500（原本已付清，现应补 500）
+    expect(result.order.effectivePayable).toBe('5500');
+    expect(result.order.balanceDue).toBe('500');
+  });
+
+  it('换人 true→false 且带换人费 → 撤销减免 + 换人费合并进 adjustmentCny（两条流水、一次写）', async () => {
+    const actor = await adminActor();
+    const order = await createBundleOrderWithSelfVisa({ selfVisaDeductCny: 500, visaExempt: true, total: 5000 });
+
+    await service.swapPassenger(
+      order.id,
+      order.passengers[0].id,
+      { fullName: 'LI MING', documentNumber: 'E88888888', nationality: 'CHN', feeCny: 200, feeLabel: '换人费' },
+      actor,
+    );
+
+    const reloaded = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(reloaded.adjustmentCny).toBe(700); // 500（撤销减免）+ 200（换人费）
+    const log = reloaded.adjustments as Array<{ type: string; amountCny: number }>;
+    expect(log.some((e) => e.type === 'SWAP_VISA_DEDUCT_REVERSAL' && e.amountCny === 500)).toBe(true);
+    expect(log.some((e) => e.type === 'SWAP_FEE' && e.amountCny === 200)).toBe(true);
+  });
+
+  it('换人未改证件号（visaExempt 保持 true）→ 不撤销减免', async () => {
+    const actor = await adminActor();
+    const order = await createBundleOrderWithSelfVisa({ selfVisaDeductCny: 500, visaExempt: true, total: 5000 });
+
+    // 仅改姓名（不改证件号）→ documentChanged=false，visaExempt 不动 → 不产生撤销减免。
+    await service.swapPassenger(order.id, order.passengers[0].id, { fullName: 'WANG DA' }, actor);
+
+    const reloaded = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(reloaded.adjustmentCny).toBe(0);
+    const px = await prisma.passenger.findUniqueOrThrow({ where: { id: order.passengers[0].id } });
+    expect(px.visaExempt).toBe(true);
+  });
+
+  it('旧客本非自备签（visaExempt false）→ 换人不产生撤销减免', async () => {
+    const actor = await adminActor();
+    const order = await createBundleOrderWithSelfVisa({ selfVisaDeductCny: 500, visaExempt: false, total: 5000 });
+
+    await service.swapPassenger(
+      order.id,
+      order.passengers[0].id,
+      { fullName: 'LI MING', documentNumber: 'E99990000', nationality: 'CHN' },
+      actor,
+    );
+
+    const reloaded = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(reloaded.adjustmentCny).toBe(0);
+  });
+
+  // ── A1：resetVisa 绝不复活 CANCELLED 履约任务（取消族终态化留下的记录）──────────────────
+  it('resetVisa 只重置活动态（FAILED→PENDING），CANCELLED 任务保持终态不复活', async () => {
+    const actor = await adminActor();
+    const from = await createScheduleWithSeats({ sold: 1 });
+    const order = await createPaidFlightOrder({ scheduleId: from.schedule.id, cabin: CabinClass.ECONOMY });
+
+    // 预置两条 VISA 任务：一条 CANCELLED（取消族终态化留下），一条 FAILED（活动态、应被重置）。
+    const cancelledTask = await prisma.fulfillmentTask.create({
+      data: {
+        orderItemId: order.items[0].id,
+        type: FulfillmentType.VISA_APPLICATION,
+        status: FulfillmentStatus.CANCELLED,
+        completedAt: new Date(),
+      },
+    });
+    const failedTask = await prisma.fulfillmentTask.create({
+      data: {
+        orderItemId: order.items[0].id,
+        type: FulfillmentType.VISA_APPLICATION,
+        status: FulfillmentStatus.FAILED,
+        failureReason: '上次送签被拒',
+      },
+    });
+
+    const result = await service.swapPassenger(
+      order.id,
+      order.passengers[0].id,
+      { fullName: 'LI MING', documentNumber: 'E12312312', nationality: 'CHN', resetVisa: true },
+      actor,
+    );
+
+    // FAILED → PENDING（重开送签），CANCELLED 保持不动（绝不复活）
+    const failedAfter = await prisma.fulfillmentTask.findUniqueOrThrow({ where: { id: failedTask.id } });
+    expect(failedAfter.status).toBe(FulfillmentStatus.PENDING);
+    expect(failedAfter.failureReason).toBeNull();
+    const cancelledAfter = await prisma.fulfillmentTask.findUniqueOrThrow({ where: { id: cancelledTask.id } });
+    expect(cancelledAfter.status).toBe(FulfillmentStatus.CANCELLED); // 未被复活
+    expect(result.audit.visaTasksReset).toBe(1); // 只重置了 FAILED 那一条
+  });
+
+  // ── SWAP：换人价回滚幂等（同一乘客的自备签减免只冲一次，多次换人不过冲）──────────────────
+  it('多次换人 true→false：同一乘客的自备签减免只冲一次（幂等，不过冲多收）', async () => {
+    const actor = await adminActor();
+    const order = await createBundleOrderWithSelfVisa({ selfVisaDeductCny: 500, visaExempt: true, total: 5000 });
+    const passengerId = order.passengers[0].id;
+
+    // 换人 1：证件变更 → visaExempt true→false → 撤销减免 +500（记 passengerId）。
+    await service.swapPassenger(
+      order.id,
+      passengerId,
+      { fullName: 'LI MING', documentNumber: 'E55550001', nationality: 'CHN' },
+      actor,
+    );
+    let reloaded = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(reloaded.adjustmentCny).toBe(500);
+
+    // 模拟该乘客又被改回自备签（false→true 不自动撤，业务上可能显式回填）。
+    await prisma.passenger.update({ where: { id: passengerId }, data: { visaExempt: true } });
+
+    // 换人 2：再次证件变更 → true→false 又命中撤销条件，但同一乘客已冲过 → 幂等跳过，不再 +500。
+    await service.swapPassenger(
+      order.id,
+      passengerId,
+      { fullName: 'ZHAO LEI', documentNumber: 'E55550002', nationality: 'CHN' },
+      actor,
+    );
+    reloaded = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(reloaded.adjustmentCny).toBe(500); // 仍是 500（未过冲成 1000）
+    const log = reloaded.adjustments as Array<{ type: string; passengerId?: string }>;
+    const reversals = log.filter((e) => e.type === 'SWAP_VISA_DEDUCT_REVERSAL');
+    expect(reversals).toHaveLength(1); // 只冲一次
+    expect(reversals[0].passengerId).toBe(passengerId); // 按乘客留痕
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// A2：createFulfillmentTasks 去重口径按「(type, 非终态)」—— force 复活重建任务
+// ══════════════════════════════════════════════════════════════════════════
+describe('createFulfillmentTasks · CANCELLED 视为不存在（force 复活重建 PENDING）', () => {
+  it('取消族终态化后复活：CANCELLED 任务不挡路，缺失活动任务重建 PENDING', async () => {
+    const from = await createScheduleWithSeats({ sold: 1 });
+    const order = await createPaidFlightOrder({ scheduleId: from.schedule.id, cabin: CabinClass.ECONOMY });
+    const itemId = order.items[0].id;
+
+    // 首次生成：1 个 PENDING FLIGHT_TICKETING 任务
+    const first = await prisma.$transaction((tx) => createFulfillmentTasks(tx, order.id));
+    expect(first).toHaveLength(1);
+    const t1 = await prisma.fulfillmentTask.findUniqueOrThrow({ where: { id: first[0] } });
+    expect(t1.type).toBe(FulfillmentType.FLIGHT_TICKETING);
+    expect(t1.status).toBe(FulfillmentStatus.PENDING);
+
+    // 模拟取消族终态化：任务 → CANCELLED
+    await prisma.fulfillmentTask.update({
+      where: { id: t1.id },
+      data: { status: FulfillmentStatus.CANCELLED, completedAt: new Date() },
+    });
+
+    // 复活（再跑 createFulfillmentTasks）：CANCELLED 视为不存在 → 重建一条新的 PENDING
+    const second = await prisma.$transaction((tx) => createFulfillmentTasks(tx, order.id));
+    expect(second).toHaveLength(1);
+    const t2 = await prisma.fulfillmentTask.findUniqueOrThrow({ where: { id: second[0] } });
+    expect(t2.id).not.toBe(t1.id);
+    expect(t2.status).toBe(FulfillmentStatus.PENDING);
+    // 旧的 CANCELLED 仍冻结为终态（历史记录，不被复活）
+    const cancelled = await prisma.fulfillmentTask.findUniqueOrThrow({ where: { id: t1.id } });
+    expect(cancelled.status).toBe(FulfillmentStatus.CANCELLED);
+    // 该订单项现有 2 条任务：1 CANCELLED + 1 PENDING
+    const all = await prisma.fulfillmentTask.findMany({ where: { orderItemId: itemId } });
+    expect(all).toHaveLength(2);
+  });
+
+  it('活动任务（CONFIRMED）算已存在 → 不重复建（幂等，不误伤已完成的工单）', async () => {
+    const from = await createScheduleWithSeats({ sold: 1 });
+    const order = await createPaidFlightOrder({ scheduleId: from.schedule.id, cabin: CabinClass.ECONOMY });
+
+    const first = await prisma.$transaction((tx) => createFulfillmentTasks(tx, order.id));
+    await prisma.fulfillmentTask.update({
+      where: { id: first[0] },
+      data: { status: FulfillmentStatus.CONFIRMED, completedAt: new Date() },
+    });
+    // 再跑：CONFIRMED 是活动/已完成态，算已存在 → 不重复建
+    const second = await prisma.$transaction((tx) => createFulfillmentTasks(tx, order.id));
+    expect(second).toHaveLength(0);
   });
 });

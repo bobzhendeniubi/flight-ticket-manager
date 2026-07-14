@@ -47,6 +47,17 @@ export const agentRoutes: FastifyPluginAsync = async (app) => {
         parentAgentId: parentId ?? null,
         body,
       });
+      // 建代理留审计：记操作人 + 新代理 id + 层级/上级（不记余额——建代理余额恒为 0，
+      // 余额变动一律走认款通道并在那里各自留审计）。
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'CREATE_CHILD_AGENT',
+        targetType: 'AGENT',
+        targetId: result.agent.id,
+        targetLabel: result.agent.contactName,
+        after: { tier: result.agent.tier, parentAgentId: result.agent.parentAgentId },
+        severity: 'WARNING',
+      });
       return reply.status(201).send(result);
     },
   );

@@ -14,6 +14,7 @@ import { PricingService } from '../pricing/pricing.service.js';
 import { parseFareBuckets } from '../pricing/pricing.schemas.js';
 import type { FareBucketsInput } from '../pricing/pricing.schemas.js';
 import { localDate } from '../finances/finances.cost.service.js';
+import type { FareBucket } from '../pricing/pricing.calc.js';
 import type {
   BaggagePolicyItem,
   BatchUpdateCapacityBody,
@@ -98,6 +99,82 @@ export function sanitizePublicSeatBreakdown<T extends { seatIndex: number }>(
   breakdown: readonly T[],
 ): T[] {
   return breakdown.map((seat, i) => ({ ...seat, seatIndex: i + 1 }));
+}
+
+/** AGENT 视角班次的座位舱位——只含余位/售价类字段，不含任何成本字段。 */
+export interface AgentScheduleSeatClassView {
+  id: string;
+  cabin: CabinClass;
+  capacity: number;
+  sold: number;
+  basePrice: Prisma.Decimal;
+  fareBuckets: FareBucket[] | null;
+  locked: number;
+  available: number;
+}
+
+/** AGENT 视角班次——只含航班/时刻/舱位/余位/售价类字段，不含任何成本字段。 */
+export interface AgentScheduleView {
+  id: string;
+  flightId: string;
+  departureTime: Date;
+  arrivalTime: Date;
+  departureTz: string;
+  arrivalTz: string;
+  ticketingCap: number;
+  isActive: boolean;
+  seatClasses: AgentScheduleSeatClassView[];
+}
+
+/**
+ * AGENT 视角 schedule 序列化——白名单而非黑名单。
+ *
+ * `FlightSchedule`（schema.prisma）上挂了一串 per-passenger 成本字段：
+ * charterCostCny / airportTaxDepCny / airportTaxArrCny / fuelCostCny / peakSurchargeCny /
+ * aircraftAdjustCny / takeoffDiscountCny —— 这些字段能直接反推毛利，绝不能下发给 AGENT。
+ * 只挑 AGENT 批量创单实际需要的字段（航班/时刻/舱位/余位/售价类）逐个搬进返回值；
+ * 以后 FlightSchedule 上再加成本字段，不会因为这里是"删字段"的黑名单而漏改自动泄露。
+ */
+export function serializeScheduleForAgent(schedule: {
+  id: string;
+  flightId: string;
+  departureTime: Date;
+  arrivalTime: Date;
+  departureTz: string;
+  arrivalTz: string;
+  ticketingCap: number;
+  isActive: boolean;
+  seatClasses: readonly {
+    id: string;
+    cabin: CabinClass;
+    capacity: number;
+    sold: number;
+    basePrice: Prisma.Decimal;
+    fareBuckets: FareBucket[] | null;
+    locked: number;
+    available: number;
+  }[];
+}): AgentScheduleView {
+  return {
+    id: schedule.id,
+    flightId: schedule.flightId,
+    departureTime: schedule.departureTime,
+    arrivalTime: schedule.arrivalTime,
+    departureTz: schedule.departureTz,
+    arrivalTz: schedule.arrivalTz,
+    ticketingCap: schedule.ticketingCap,
+    isActive: schedule.isActive,
+    seatClasses: schedule.seatClasses.map((c) => ({
+      id: c.id,
+      cabin: c.cabin,
+      capacity: c.capacity,
+      sold: c.sold,
+      basePrice: c.basePrice,
+      fareBuckets: c.fareBuckets,
+      locked: c.locked,
+      available: c.available,
+    })),
+  };
 }
 
 /**

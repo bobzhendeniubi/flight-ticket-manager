@@ -108,6 +108,10 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
       .min(1)
       .max(100),
     sharedProofUrl: z.string().max(6_000_000).optional(),
+    // 幂等：前端为「本次提交」生成一个稳定 batchId（表单打开时生成一次，成功后换新）。
+    // 同一 batchId 重复提交（双击/网络重试/表单重发）时，同一 orderId 只入账一次——
+    // 逐单幂等键 = `batch:{batchId}:{orderId}`，复用单笔 manual-confirm 的唯一约束 + 回放逻辑。
+    batchId: z.string().min(8).max(64).optional(),
   });
   app.post('/batch-confirm', { preHandler: [app.authenticate] }, async (req, reply) => {
     if (req.user.role !== UserRole.ADMIN && req.user.role !== UserRole.STAFF) {
@@ -115,7 +119,7 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
     }
     const body = batchConfirmSchema.parse(req.body);
     const result = await service.batchConfirmManualPayment(
-      { items: body.items, sharedProofUrl: body.sharedProofUrl },
+      { items: body.items, sharedProofUrl: body.sharedProofUrl, batchId: body.batchId },
       { userId: req.user.sub, role: req.user.role },
     );
     const okCount = result.results.filter((r) => r.ok).length;

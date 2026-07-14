@@ -34,7 +34,11 @@ function fixtureRoundTripBundle(): OrderForMasterExport {
     id: 'o1',
     orderNumber: 'FTM2026070100001',
     status: 'PAID',
-    invoiceStatus: 'NONE',
+    invoiceStatus: 'NONE', // 旧字段：六态开票改造后不再回写，导出不应再读它（P2-15a）
+    outboundInvoiced: false,
+    returnInvoiced: false,
+    systemInvoiced: false,
+    adjustmentCny: 0,
     visaStatus: 'E_VISA',
     total: 10000,
     paidAmount: 4000,
@@ -100,6 +104,8 @@ function fixtureRoundTripBundle(): OrderForMasterExport {
         hotelRoomTypeId: null,
         amount: 0,
         metadata: null,
+        // flightScheduleId 供 determineFlightLegs 判定去程/回程（P2-15a 开票状态列用到）
+        flightScheduleId: 'fs-out',
         flightSchedule: {
           departureTime: D('2026-07-10'),
           flight: { flightNumber: 'ZJ8888', originCode: 'CTU', destinationCode: 'CXR' },
@@ -114,6 +120,7 @@ function fixtureRoundTripBundle(): OrderForMasterExport {
         hotelRoomTypeId: null,
         amount: 0,
         metadata: null,
+        flightScheduleId: 'fs-ret',
         flightSchedule: {
           departureTime: D('2026-07-14'),
           flight: { flightNumber: 'ZJ8889', originCode: 'CXR', destinationCode: 'CTU' },
@@ -321,6 +328,108 @@ describe('orderToMasterRows', () => {
     expect(r1.visaAmount).toBe(220);
     // 签证履约任务挂在 BUNDLE 行上、订单级 visaStatus 缺省 → 回落任务状态"处理中"
     expect(r1.visaStatus).toBe('处理中');
+  });
+
+  // ── 开票状态：改读三布尔，不再读旧字段 invoiceStatus（P2-15a）──────────────
+  // 六态开票只写 outboundInvoiced/returnInvoiced/systemInvoiced，旧字段不再回写；
+  // 旧实现读 order.invoiceStatus 会让已开票订单在这张表上恒显示"未开"。
+  describe('开票状态：三布尔组合文案（P2-15a）', () => {
+    it('去程已开 + 系统已开（回程未开）→ "去程已开/系统已开"，旧字段 invoiceStatus 不影响结果', () => {
+      const order = fixtureRoundTripBundle();
+      (order as unknown as { invoiceStatus: string }).invoiceStatus = 'ISSUED'; // 旧字段刻意给"已开"，验证不被读取
+      (order as unknown as { outboundInvoiced: boolean }).outboundInvoiced = true;
+      (order as unknown as { returnInvoiced: boolean }).returnInvoiced = false;
+      (order as unknown as { systemInvoiced: boolean }).systemInvoiced = true;
+      const [r1] = orderToMasterRows(order);
+      expect(r1.invoiceStatus).toBe('去程已开/系统已开');
+    });
+
+    it('去程+回程都已开 → "去程已开/回程已开"（往返单，两段都判定为占额航段）', () => {
+      const order = fixtureRoundTripBundle();
+      (order as unknown as { outboundInvoiced: boolean }).outboundInvoiced = true;
+      (order as unknown as { returnInvoiced: boolean }).returnInvoiced = true;
+      const [r1] = orderToMasterRows(order);
+      expect(r1.invoiceStatus).toBe('去程已开/回程已开');
+    });
+
+    it('单程订单：returnInvoiced=true 但无回程航段 → 不计入"回程已开"（与 full 模板同口径）', () => {
+      const order = fixtureRoundTripBundle();
+      (order.items as unknown[]).splice(1, 1); // 去掉回程段 → 单程
+      (order as unknown as { outboundInvoiced: boolean }).outboundInvoiced = true;
+      (order as unknown as { returnInvoiced: boolean }).returnInvoiced = true; // 脏数据：单程单不该有回程已开
+      const [r1] = orderToMasterRows(order);
+      expect(r1.invoiceStatus).toBe('去程已开');
+    });
+
+    it('三布尔全 false → "未开"', () => {
+      const [r1] = orderToMasterRows(fixtureRoundTripBundle());
+      expect(r1.invoiceStatus).toBe('未开');
+    });
+  });
+
+  // ── 尾款含售后调整 adjustmentCny（P1-9 / P2-15b）──────────────────────────
+  describe('尾款/是否清账含 adjustmentCny', () => {
+    it('尾款 = max(0, total + adjustmentCny - paid) / 人数，不再漏掉改期费/换人费', () => {
+      const order = fixtureRoundTripBundle();
+      // total 10000 / paid 4000 / adjustment +800（如改期费）→ 应付 10800，尾款 6800/2人=3400
+      (order as unknown as { adjustmentCny: number }).adjustmentCny = 800;
+      const [r1] = orderToMasterRows(order);
+      expect(r1.balanceDue).toBe(3400);
+      expect(r1.settled).toBe('否');
+    });
+
+    it('paid 覆盖 total 但不覆盖 adjustmentCny → 仍未清账、尾款>0（此前会被误判"已清账"）', () => {
+      const order = fixtureRoundTripBundle();
+      (order as unknown as { paidAmount: number }).paidAmount = 10000; // 已付清基础价
+      (order as unknown as { adjustmentCny: number }).adjustmentCny = 500; // 后加的换人费未付
+      const [r1] = orderToMasterRows(order);
+      expect(r1.balanceDue).toBe(250); // 500/2人
+      expect(r1.settled).toBe('否');
+    });
+
+    it('adjustmentCny 为负（如减免）→ 应付相应减少，仍不产出负数尾款', () => {
+      const order = fixtureRoundTripBundle();
+      (order as unknown as { paidAmount: number }).paidAmount = 10000;
+      (order as unknown as { adjustmentCny: number }).adjustmentCny = -2000; // 减免
+      const [r1] = orderToMasterRows(order);
+      expect(r1.balanceDue).toBe(0); // max(0, 10000-2000-10000)=0，不产出负数
+      expect(r1.settled).toBe('是');
+    });
+  });
+
+  // ── 尾款/是否清账含代理预付款抵扣 prepaymentOffset（与财务/提醒/报表口径一致）──────
+  // 尾款 = max(0, total + adjustmentCny − paid − prepaymentOffset) / 人数；
+  // 已清账 = paid + prepaymentOffset ≥ total + adjustmentCny。
+  // 漏掉抵扣会让用预付款抵扣过的代理订单尾款偏大、已结清误显示未结清。
+  describe('尾款/是否清账含 prepaymentOffset', () => {
+    it('尾款扣减预付款抵扣（2 人均摊）', () => {
+      const order = fixtureRoundTripBundle();
+      // total 10000 / paid 4000 / offset 2000 → 应付余额 4000，尾款 4000/2人=2000
+      (order as unknown as { prepaymentOffset: number }).prepaymentOffset = 2000;
+      const [r1] = orderToMasterRows(order);
+      expect(r1.balanceDue).toBe(2000);
+      expect(r1.settled).toBe('否');
+    });
+
+    it('已付 + 预付款抵扣 ≥ 应付 → 尾款 0 且已清账', () => {
+      const order = fixtureRoundTripBundle();
+      // paid 8000 + offset 2000 = 10000 ≥ total 10000 → 已清账、尾款 0
+      (order as unknown as { paidAmount: number }).paidAmount = 8000;
+      (order as unknown as { prepaymentOffset: number }).prepaymentOffset = 2000;
+      const [r1] = orderToMasterRows(order);
+      expect(r1.balanceDue).toBe(0);
+      expect(r1.settled).toBe('是');
+    });
+
+    it('售后调整与预付款抵扣同时生效（应付 = total + adjustment − paid − offset）', () => {
+      const order = fixtureRoundTripBundle();
+      // total 10000 + adjustment 800 − paid 4000 − offset 2000 = 4800 → /2人 = 2400
+      (order as unknown as { adjustmentCny: number }).adjustmentCny = 800;
+      (order as unknown as { prepaymentOffset: number }).prepaymentOffset = 2000;
+      const [r1] = orderToMasterRows(order);
+      expect(r1.balanceDue).toBe(2400);
+      expect(r1.settled).toBe('否');
+    });
   });
 });
 

@@ -27,6 +27,7 @@ import { toAlpha3 } from './nationality.js';
 import { parseRoomGroups } from './orders.export-room-allocation.js';
 import { nameWithTitle } from './orders.export-templates.js';
 import { buildOrderFilterWhere } from './orders.service.js';
+import { determineFlightLegs } from './ticketing-cap.js';
 
 // ── 岗位视图 ──────────────────────────────────────────────────────────────
 /** 岗位视图：all=完整全岗（默认）；ticketing=票务；visa=签证。仅裁列，不改数据/取数。*/
@@ -56,11 +57,10 @@ const COUNTED_STATUSES: OrderStatus[] = [
 ];
 
 // ── 中文标签表 ──────────────────────────────────────────────────────────────
-const INVOICE_STATUS_LABEL: Record<string, string> = {
-  NONE: '未开',
-  REQUESTED: '已要求',
-  ISSUED: '已开',
-};
+// 注：开票状态不再用这张表——旧字段 Order.invoiceStatus 是六态开票改造前的单一态字段，
+// 改造后系统只写三布尔（outboundInvoiced/returnInvoiced/systemInvoiced），旧字段不再回写，
+// 读它会让「去程已开」等新状态在这张表上恒显示"未开"（P2-15a）。开票状态改由
+// orderToMasterRows 内联拼三布尔文案，与 orders.export-templates.ts 的 full 模板同口径。
 
 const FULFILLMENT_STATUS_LABEL: Record<string, string> = {
   PENDING: '待处理',
@@ -149,12 +149,12 @@ export interface MasterRow {
   orderType: string; // 往返票/单程票/品类
   cabin: string; // 舱位等级
   settlePrice: number; // 结算价格（人均）
-  balanceDue: number; // 尾款金额（人均）
+  balanceDue: number; // 尾款金额（人均）= max(0, total + adjustmentCny − paid − prepaymentOffset) / 人数，含售后调整与预付款抵扣
   settleReceived: number; // 已到账金额（人均）
   singleRoomDiff: number; // 单房差（人均）
   visaAmount: number; // 签证金额（人均）
   visaStatus: string; // 签证状态（订单级 + 履约任务，取更具体者）
-  invoiceStatus: string; // 开票状态
+  invoiceStatus: string; // 开票状态：三布尔（去程/回程/系统）组合文案，'/' 连接；都未开 = "未开"
   settled: string; // 是否清账（结清）
   refundAmount: number; // 退款金额（人均，已完成退款）
   passportIssuePlace: string; // 护照签发地 ?? 颁发国
@@ -320,12 +320,20 @@ export function orderToMasterRows(order: OrderForMasterExport): Omit<MasterRow, 
   ).join(' / ');
 
   // ── 金额口径（均摊到人）──
+  // per-pax 采用「订单总额÷乘客数」均摊，与详情页按年龄段反推的另一套口径不同（P2-15c，
+  // 待产品统一口径，此处不擅自改成年龄段——会改变现有导出数字）。
   const total = dec(order.total);
   const paid = dec(order.paidAmount);
+  // 售后费（改期费/换人费等）走 adjustmentCny，不在 total 里；代理预付款抵扣走 prepaymentOffset。
+  // 尾款/是否清账都要把两者算进「应付」，否则售后费从表上直接消失（P1-9），且用预付款抵扣过的
+  // 代理订单会尾款偏大、已结清误显示未结清。口径与 reminders.rules.ts computeBalance /
+  // reports.service.ts balanceOf 对齐：应付 = total + adjustmentCny − prepaymentOffset。
+  const adjustment = order.adjustmentCny ?? 0;
+  const prepaymentOffset = dec(order.prepaymentOffset);
   const settlePerPax = round2(total / paxCount);
   const paidPerPax = round2(paid / paxCount);
-  const balancePerPax = round2(Math.max(0, total - paid) / paxCount);
-  const settled = paid >= total ? '是' : '否';
+  const balancePerPax = round2(Math.max(0, total + adjustment - paid - prepaymentOffset) / paxCount);
+  const settled = paid + prepaymentOffset >= total + adjustment ? '是' : '否';
 
   // ── 签证：金额 + 状态 ──
   // 独立 VISA 行的实收金额（客人单买签证时的口径）。
@@ -387,7 +395,16 @@ export function orderToMasterRows(order: OrderForMasterExport): Omit<MasterRow, 
     .join(' / ');
 
   const agency = order.agent?.companyName ?? '直客';
-  const invoiceStatus = INVOICE_STATUS_LABEL[order.invoiceStatus] ?? order.invoiceStatus;
+  // 开票状态（P2-15a）：六态开票只写三布尔（outboundInvoiced/returnInvoiced/systemInvoiced），
+  // 旧字段 order.invoiceStatus 不再回写 → 读旧字段会让已开票订单恒显示"未开"。改读三布尔，
+  // 文案与 orders.export-templates.ts 的 full 模板（invoiceStatusSys/invoiceStatusManual，
+  // 见该文件 448-455 行）同口径，三态合并进一列：去程已开/回程已开/系统已开（'/' 连接）。
+  const { returnScheduleId } = determineFlightLegs(order.items);
+  const invoicedParts: string[] = [];
+  if (order.outboundInvoiced) invoicedParts.push('去程已开');
+  if (returnScheduleId && order.returnInvoiced) invoicedParts.push('回程已开');
+  if (order.systemInvoiced) invoicedParts.push('系统已开');
+  const invoiceStatus = invoicedParts.length > 0 ? invoicedParts.join('/') : '未开';
   const recordedAt = fmtDateTime(order.createdAt);
   const recordedBy = order.user?.displayName ?? order.user?.email ?? order.guestName ?? '';
   const roomGroups = parseRoomGroups(order.roomAssignment);

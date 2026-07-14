@@ -123,10 +123,12 @@ export async function buildVisaBundleXlsx(orders: OrderForTemplateExport[]): Pro
     if (order.passengers.length === 0) continue;
     const ctx = buildOrderContext(order);
     const rows = orderToVisaRows(order, ctx);
+    // orderToVisaRows 内部已排除自备签乘客（visaExempt=true，见该函数注释 P1-13）——
+    // 护照图有无按位对齐同样要用过滤后的乘客列表，否则行数不等长会把图状态错位标给下一位乘客。
+    const visaPassengers = order.passengers.filter((p) => p.visaExempt !== true);
     rows.forEach((row, i) => {
       stt += 1;
-      // orderToVisaRows 逐 order.passengers 映射 → 第 i 行即第 i 位乘客，据此取其护照图有无
-      const hasPhoto = order.passengers[i]?.passportPhotoUrl
+      const hasPhoto = visaPassengers[i]?.passportPhotoUrl
         ? '有护照图'
         : '无护照图（手工录入）';
       ws.addRow({ stt, ...row, hasPhoto });

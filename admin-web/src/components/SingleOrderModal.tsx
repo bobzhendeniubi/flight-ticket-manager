@@ -31,6 +31,7 @@ import {
   type RoomGroup,
   type PriceAdjustmentReason,
   type Transfer,
+  type TravelerProfileSuggestion,
   type Visa,
   type VisaStatusInput,
   PRICE_ADJUSTMENT_REASON_LABEL,
@@ -39,6 +40,7 @@ import {
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { NumberInput } from './NumberInput';
+import { PassengerSuggestInput } from './PassengerSuggestInput';
 import { RoomingEditor, type RoomingPassenger } from './RoomingEditor';
 import { SearchSelect, type SearchSelectOption } from './SearchSelect';
 import { type OcrResult } from '../lib/passportOcr';
@@ -651,6 +653,39 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       passengersRef.current = next;
       return next;
     });
+  }
+
+  /**
+   * 常旅客联想点选 → 整行回填：优先用 fillFields（最近一次乘机人明细），
+   * 为 null 时退回档案摘要字段。日期统一转 YYYY-MM-DD；性别 MALE→M / FEMALE→F，
+   * 其他/空不覆盖。不动该行已有的 visaExempt/singleRoom 勾选和 OCR 相关字段。
+   */
+  function applyProfileSuggestion(i: number, s: TravelerProfileSuggestion): void {
+    const ymd = (iso: string | null | undefined): string | undefined =>
+      iso ? iso.slice(0, 10) : undefined;
+    const mapGender = (g: string | null | undefined): 'M' | 'F' | undefined =>
+      g === 'MALE' ? 'M' : g === 'FEMALE' ? 'F' : undefined;
+
+    const f = s.fillFields;
+    const patch: Partial<PassengerRow> = {};
+
+    const composedName = f ? [f.lastName, f.firstName].filter(Boolean).join(' ').trim() : '';
+    patch.fullName = composedName || s.fullName;
+    patch.documentNumber = f?.documentNumber || s.documentNumber;
+
+    const dob = ymd(f?.dateOfBirth ?? s.dateOfBirth);
+    if (dob) patch.dateOfBirth = dob;
+    const chineseName = f?.chineseName ?? s.chineseName;
+    if (chineseName) patch.chineseName = chineseName;
+    const gender = mapGender(f?.gender ?? s.gender);
+    if (gender) patch.gender = gender;
+    const issueDate = ymd(f?.passportIssueDate);
+    if (issueDate) patch.passportIssueDate = issueDate;
+    if (f?.passportIssuePlace) patch.passportIssuePlace = f.passportIssuePlace;
+    const expiry = ymd(f?.passportExpiry ?? s.passportExpiry);
+    if (expiry) patch.passportExpiry = expiry;
+
+    setPassenger(i, patch);
   }
   function removePassenger(i: number): void {
     setPassengers((prev) => {
@@ -1920,7 +1955,13 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                       return (
                         <tr key={i} className="border-t border-slate-100">
                           <td className="min-w-[140px] px-2 py-1 align-top">
-                            <input className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm" value={p.fullName} onChange={(e) => setPassenger(i, { fullName: e.target.value })} />
+                            {/* 姓名联想：≥2 字符调常旅客 suggest，点选整行回填（AGENT 无联想） */}
+                            <PassengerSuggestInput
+                              className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm"
+                              value={p.fullName}
+                              onChange={(v) => setPassenger(i, { fullName: v })}
+                              onPick={(s) => applyProfileSuggestion(i, s)}
+                            />
                           </td>
                           {/* 套餐乘客级：住宿方式（拼房默认/单住）+ 本人构成小字（能算则显示） */}
                           {showRoomingCol && (
@@ -1957,7 +1998,13 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                             </td>
                           )}
                           <td className="min-w-[140px] px-2 py-1 align-top">
-                            <input className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm" value={p.documentNumber} onChange={(e) => setPassenger(i, { documentNumber: e.target.value })} />
+                            {/* 证件号联想：与姓名共用同一联想组件与整行回填 */}
+                            <PassengerSuggestInput
+                              className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm"
+                              value={p.documentNumber}
+                              onChange={(v) => setPassenger(i, { documentNumber: v })}
+                              onPick={(s) => applyProfileSuggestion(i, s)}
+                            />
                           </td>
                           <td className="min-w-[120px] px-2 py-1 align-top">
                             <input

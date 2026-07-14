@@ -6,6 +6,9 @@ export const setSettlementModeBodySchema = z.object({
 });
 export type SetSettlementModeBody = z.infer<typeof setSettlementModeBodySchema>;
 
+// 建代理不接受初始余额：余额恒为 0，只能事后经认款通道（agent-recharges 的
+// confirm/manualAdjust）流水化产生，每次变动必有 PrepaymentTransaction + 审计。
+// 详见 createChildAgent() 服务层注释与 schema.prisma 的 AgentRechargeRequest 口径。
 export const createChildAgentBodySchema = z.object({
   email: z.string().email().max(255),
   password: z.string().min(8).max(128),
@@ -13,7 +16,6 @@ export const createChildAgentBodySchema = z.object({
   contactName: z.string().min(1).max(50),
   contactPhone: z.string().min(6).max(30),
   companyName: z.string().max(100).optional(),
-  prepaymentBalance: z.number().min(0).max(10_000_000).default(0),
   notes: z.string().max(500).optional(),
 });
 export type CreateChildAgentBody = z.infer<typeof createChildAgentBodySchema>;

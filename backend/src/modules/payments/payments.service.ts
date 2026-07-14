@@ -40,6 +40,19 @@ const MAX_SINGLE_PAYMENT_CNY = 1_000_000;
 /** 批量到账单次最多处理的订单数。 */
 const MAX_BATCH_ITEMS = 100;
 
+/**
+ * 该 Payment 是否为「订单转 PAID 时被作废的兄弟单」（FAILED + gatewayPayload.supersededByPaid）。
+ * 用于区分「作废兜底」与「金额不匹配失败」：仅前者在真收到网关回调时被复活成可见多付（R4 point 3）。
+ */
+function isSupersededByPaidPayload(payload: Prisma.JsonValue | null | undefined): boolean {
+  return (
+    typeof payload === 'object' &&
+    payload !== null &&
+    !Array.isArray(payload) &&
+    (payload as Record<string, unknown>).supersededByPaid === true
+  );
+}
+
 export class PaymentsService {
   private readonly orderService = new OrderService();
 
@@ -157,7 +170,12 @@ export class PaymentsService {
       return { ok: true, paymentId: payment.id, orderId: payment.orderId };
     }
 
-    if (payment.status !== PaymentStatus.PENDING) {
+    // R4（point 3）：被「订单转 PAID 时作废兄弟 Payment」标记（FAILED + supersededByPaid）作废的那笔，
+    // 若之后真收到网关回调（客户确实又付了一次）→ 不当作普通 FAILED 拒掉，而是复活成 SUCCEEDED 并把
+    // 金额计入 paidAmount 形成可见多付（下方事务处理）。据此判定这笔是否可继续处理。
+    const wasSupersededByPaid =
+      payment.status === PaymentStatus.FAILED && isSupersededByPaidPayload(payment.gatewayPayload);
+    if (payment.status !== PaymentStatus.PENDING && !wasSupersededByPaid) {
       return { ok: false, reason: `payment already ${payment.status}` };
     }
 
@@ -170,10 +188,15 @@ export class PaymentsService {
       return { ok: false, reason: `amount mismatch (expected ${payment.amount}, got ${verification.amountYuan})` };
     }
 
-    // 订单已 CANCELLED/PAYMENT_TIMEOUT：资金要退回
+    // 订单已 CANCELLED/PAYMENT_TIMEOUT：这笔钱进来时订单已死（取消/超时），资金原路退回，标 REFUNDED。
+    // 「已死订单的迟到款标 REFUNDED」是正确口径——订单已取消，钱该退。
+    // 并发/幂等：用 CAS（where id + 回调进来时读到的原状态 payment.status）改状态，押住 payment 原始状态，
+    // 只让一个并发回调胜出，绝不覆盖已被别的通道改过的 payment。count=0（已被并发抢改）仍抛 ConflictError：
+    // 结果一致（钱都会退回），网关重试也幂等。与下方 superseded 复活路径不冲突——superseded 复活只在
+    // 事务内对「活订单」生效，这里订单已是取消/超时态，不会误入复活分支。
     if (payment.order.status === OrderStatus.CANCELLED || payment.order.status === OrderStatus.PAYMENT_TIMEOUT) {
-      await prisma.payment.update({
-        where: { id: payment.id },
+      await prisma.payment.updateMany({
+        where: { id: payment.id, status: payment.status },
         data: {
           status: PaymentStatus.REFUNDED,
           paidAt: new Date(),
@@ -183,13 +206,14 @@ export class PaymentsService {
       throw new ConflictError(`订单已 ${payment.order.status}，资金将原路退回`);
     }
 
-    // ── 原子事务：Payment SUCCEEDED + Order PAID + 佣金 + 履约任务 一起成功或一起回滚 ──
+    // ── 原子事务：Payment SUCCEEDED + Order PAID/多付 + 佣金 + 履约任务 一起成功或一起回滚 ──
     const pendingFulfillmentTaskIds: string[] = [];
     try {
       await prisma.$transaction(async (tx) => {
-        // 1. Payment → SUCCEEDED (CAS 防并发)
+        // 1. Payment → SUCCEEDED (CAS 防并发)。where 用回调进来时的原状态（PENDING，或被作废的
+        //    FAILED-superseded），确保同一笔并发回调只有一个胜出、绝不二次入账。
         const casPayment = await tx.payment.updateMany({
-          where: { id: payment.id, status: PaymentStatus.PENDING },
+          where: { id: payment.id, status: payment.status },
           data: {
             status: PaymentStatus.SUCCEEDED,
             paidAt: verification.paidAt ?? new Date(),
@@ -201,8 +225,17 @@ export class PaymentsService {
           throw new ConflictError('payment status changed during callback');
         }
 
-        // 2. Order → PAID（若仍在 PENDING_PAYMENT；共用同一事务）
-        if (payment.order.status === OrderStatus.PENDING_PAYMENT) {
+        // 2. 对 Order 行 FOR UPDATE 并事务内复核最新状态（回调进来到此刻订单可能已被别的通道推 PAID）。
+        //    与 _updateStatusWithinTx / confirmManualPayment / 余额抵扣共用同一把行锁，串行、防旧快照。
+        const rows = await tx.$queryRaw<
+          Array<{ status: OrderStatus; paidAmount: Prisma.Decimal }>
+        >`SELECT status, "paidAmount" FROM "Order" WHERE id = ${payment.orderId} FOR UPDATE`;
+        const o = rows[0];
+        if (!o) throw new NotFoundError('订单不存在');
+
+        if (o.status === OrderStatus.PENDING_PAYMENT) {
+          // 正常路径：订单仍待支付 → 推 PAID。PAID 分支按台账聚合 SUCCEEDED（含本笔）抬 paidAmount，
+          // 并作废其它 PENDING 兄弟（本笔已 SUCCEEDED，天然被排除）。
           await this.orderService._updateStatusWithinTx(
             tx,
             payment.orderId,
@@ -211,6 +244,23 @@ export class PaymentsService {
             `支付成功（${method}，txId=${verification.transactionId}）`,
             pendingFulfillmentTaskIds,
           );
+        } else if (
+          o.status === OrderStatus.CANCELLED ||
+          o.status === OrderStatus.PAYMENT_TIMEOUT ||
+          o.status === OrderStatus.REFUNDED
+        ) {
+          // 拿锁后发现订单已进入释放/退款态（回调与取消/超时竞态）→ 回滚，让网关重试后走上面的退款分支。
+          throw new ConflictError(`订单已 ${o.status}，资金将原路退回`);
+        } else {
+          // 订单已 PAID / 其它持有态（迟到回调、兄弟 Payment、或被作废后又真到账）→ 本笔是真实到账，
+          // 直接累加进 paidAmount 形成可见多付（paidAmount > total），走既有 creditOverpayToAgent /
+          // overpayToPool 处置入口。绝不只标 SUCCEEDED 让钱在 paidAmount 上"消失"。
+          // 幂等：本笔 Payment 已 CAS 成 SUCCEEDED，回调重试会在函数顶端 SUCCEEDED 短路，绝不二次累加。
+          const newPaid = Number(o.paidAmount.toString()) + Number(payment.amount.toString());
+          await tx.order.update({
+            where: { id: payment.orderId },
+            data: { paidAmount: new Prisma.Decimal(newPaid) },
+          });
         }
       });
     } catch (e) {
@@ -261,11 +311,14 @@ export class PaymentsService {
       if (existing) {
         const o = await prisma.order.findUniqueOrThrow({
           where: { id: existing.orderId },
-          select: { orderNumber: true, total: true, paidAmount: true, status: true },
+          select: { orderNumber: true, total: true, adjustmentCny: true, paidAmount: true, prepaymentOffset: true, status: true },
         });
         const t = Number(o.total);
         const p = Number(o.paidAmount);
-        return { ok: true, paymentId: existing.id, paidAmount: p, total: t, fullyPaid: p + 0.001 >= t, orderNumber: o.orderNumber, status: o.status };
+        // 清账口径：fullyPaid = paidAmount + prepaymentOffset >= total + adjustmentCny
+        //（与 reports/reminders/serializeOrder 全局清账公式一字一致，含改期费与预存抵扣）。
+        const fullyPaid = p + Number(o.prepaymentOffset) + 0.001 >= t + o.adjustmentCny;
+        return { ok: true, paymentId: existing.id, paidAmount: p, total: t, fullyPaid, orderNumber: o.orderNumber, status: o.status };
       }
     }
 
@@ -281,14 +334,20 @@ export class PaymentsService {
       await prisma.$transaction(async (tx) => {
       // FOR UPDATE 行锁 + 事务内读余额：并发确认不会用旧快照双计 paidAmount
       const rows = await tx.$queryRaw<
-        Array<{ id: string; orderNumber: string; total: Prisma.Decimal; paidAmount: Prisma.Decimal; status: OrderStatus }>
-      >`SELECT id, "orderNumber", total, "paidAmount", status FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+        Array<{ id: string; orderNumber: string; total: Prisma.Decimal; adjustmentCny: number; paidAmount: Prisma.Decimal; prepaymentOffset: Prisma.Decimal; status: OrderStatus }>
+      >`SELECT id, "orderNumber", total, "adjustmentCny", "paidAmount", "prepaymentOffset", status FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
       const order = rows[0];
       if (!order) throw new NotFoundError('订单不存在');
 
       total = Number(order.total);
       const already = Number(order.paidAmount);
-      const remaining = Math.max(0, total - already);
+      // 清账口径（与 reports/reminders/serializeOrder 全局公式一字一致）：
+      //   应付 = total + adjustmentCny（含改期费/换人费等售后调整）
+      //   尾款 = 应付 − paidAmount − prepaymentOffset（预存抵扣视同已付）
+      // 默认收款金额取尾款：有改期费的单，默认要连费一起收齐才不再有尾款（否则报表仍挂应收）。
+      const effectivePayable = total + order.adjustmentCny;
+      const prepaymentOffset = Number(order.prepaymentOffset);
+      const remaining = Math.max(0, effectivePayable - already - prepaymentOffset);
       const amount = input.amount ?? remaining;
       if (amount <= 0) throw new BadRequestError('收款金额必须大于 0');
       // 允许多付：到账金额可超过应收余额（结算价≠到账金额时常见），paidAmount 据此可超 total，
@@ -302,7 +361,9 @@ export class PaymentsService {
         );
       }
       newPaid = already + amount;
-      fullyPaid = newPaid + 0.001 >= total;
+      // 清账阈值：paidAmount + prepaymentOffset >= total + adjustmentCny 才算收齐（自动转 PAID）。
+      // 有改期费的单要连费一起收齐才自动 PAID——与全局清账口径一致；force→PAID 走别的入口不受此影响。
+      fullyPaid = newPaid + prepaymentOffset + 0.001 >= effectivePayable;
       orderNumber = order.orderNumber;
       statusBefore = order.status;
 
@@ -397,8 +458,8 @@ export class PaymentsService {
   }> {
     // FOR UPDATE 行锁 + 事务内读余额：与 confirmManualPayment 完全一致的并发安全口径
     const rows = await tx.$queryRaw<
-      Array<{ id: string; orderNumber: string; total: Prisma.Decimal; paidAmount: Prisma.Decimal; status: OrderStatus }>
-    >`SELECT id, "orderNumber", total, "paidAmount", status FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+      Array<{ id: string; orderNumber: string; total: Prisma.Decimal; adjustmentCny: number; paidAmount: Prisma.Decimal; prepaymentOffset: Prisma.Decimal; status: OrderStatus }>
+    >`SELECT id, "orderNumber", total, "adjustmentCny", "paidAmount", "prepaymentOffset", status FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
     const order = rows[0];
     if (!order) throw new NotFoundError('订单不存在');
 
@@ -414,7 +475,9 @@ export class PaymentsService {
       );
     }
     const newPaid = already + amount;
-    const fullyPaid = newPaid + 0.001 >= total;
+    // 清账口径（与 confirmManualPayment 一字一致）：paidAmount + prepaymentOffset >= total + adjustmentCny
+    const effectivePayable = total + order.adjustmentCny;
+    const fullyPaid = newPaid + Number(order.prepaymentOffset) + 0.001 >= effectivePayable;
 
     const payment = await tx.payment.create({
       data: {
@@ -461,6 +524,11 @@ export class PaymentsService {
    * 逐单复用 confirmManualPayment（每单独立行锁 + 幂等 + 审计），互不影响：
    * 某一单失败（订单不存在/金额异常等）不会中断其余订单，结果逐单收集返回。
    * sharedProofUrl 作为没有单独 proofUrl 的订单的回退凭证（如一张合并转账截图）。
+   *
+   * 幂等：整批共用一个 batchId（前端表单打开时生成一次，成功后换新；不传则不做批量去重，
+   * 等价于旧行为）。逐单幂等键 = `batch:{batchId}:{orderId}`，透传给 confirmManualPayment，
+   * 复用它已有的唯一约束 + 回放逻辑——同一 batchId 重复提交（双击/网络重试/表单重发），
+   * 同一 orderId 只入账一次，回放返回首次入账结果，绝不二次累计。
    */
   async batchConfirmManualPayment(
     input: {
@@ -472,6 +540,7 @@ export class PaymentsService {
         note?: string;
       }>;
       sharedProofUrl?: string;
+      batchId?: string;
     },
     actor: { userId: string; role: UserRole },
   ): Promise<{
@@ -505,6 +574,9 @@ export class PaymentsService {
     // 逐单串行处理：每单一个事务/行锁，一坏不连累其余（收集错误而非整体回滚）
     for (const item of input.items) {
       try {
+        // 同一 batchId 下逐单幂等键固定为 batch:{batchId}:{orderId}，
+        // 重复提交同一批次时 confirmManualPayment 会走回放分支，不会二次入账。
+        const idempotencyKey = input.batchId ? `batch:${input.batchId}:${item.orderId}` : undefined;
         const result = await this.confirmManualPayment(
           item.orderId,
           {
@@ -512,6 +584,7 @@ export class PaymentsService {
             method: item.method ?? PaymentMethod.BANK_CARD,
             proofUrl: item.proofUrl ?? input.sharedProofUrl,
             note: item.note,
+            idempotencyKey,
           },
           actor,
         );

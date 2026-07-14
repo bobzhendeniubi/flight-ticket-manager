@@ -1,12 +1,20 @@
 /**
- * 旅客管理 — 所有订单里出现的出行人（去重）
- * 关键 query: 姓名 + 生日（核实身份常用组合）
+ * 旅客页入口 —— 按角色分流：
+ *   - ADMIN/STAFF → 旅客档案（TravelerProfilesView：全量订单按证件号聚合的常旅客画像）
+ *   - AGENT       → 常用乘机人管理（SavedTravelersView：树内客户的 SavedPassenger，原有功能）
  */
 import { useEffect, useMemo, useState } from 'react';
 import { type MockTraveler } from '../lib/mockData';
 import { exportToCSV } from '../lib/csvExport';
 import { api, ApiError, type Traveler } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { TravelerProfilesView } from './TravelerProfilesView';
+
+export function TravelersPage() {
+  const user = useAuth((s) => s.user);
+  if (user?.role === 'AGENT') return <SavedTravelersView />;
+  return <TravelerProfilesView />;
+}
 
 function travelerApiToMock(t: Traveler): MockTraveler {
   return {
@@ -23,7 +31,7 @@ function travelerApiToMock(t: Traveler): MockTraveler {
   };
 }
 
-export function TravelersPage() {
+function SavedTravelersView() {
   const tokens = useAuth((s) => s.tokens);
   const [travelers, setTravelers] = useState<MockTraveler[]>([]);
   const [loading, setLoading] = useState(true);

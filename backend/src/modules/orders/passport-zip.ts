@@ -124,11 +124,21 @@ const VISA_SHEET_COLUMNS: Array<{ header: string; key: string; width: number }> 
   { header: '是否有护照图', key: 'hasPhoto', width: 20 },
 ];
 
-/** 构建「送签表」工作簿 Buffer（每乘客一行，缺值留空，绝不编造） */
+/**
+ * 构建「送签表」工作簿 Buffer（每乘客一行，缺值留空，绝不编造）。
+ *
+ * 自备签乘客（visaExempt=true）不上这张表：客人已自行办妥签证，无需送签，与签证台过滤
+ * 同口径（fulfillment.service.ts 的 listByOrder 同样排除 visaExempt=true 的乘客）——
+ * 送签表是签证岗拿去申请的名单，混入自备签客人只会让签证岗多余核对/误送签。护照图片
+ * 本身仍打包进 zip（见 buildPassportPhotoZip 的乘客循环，用的是未过滤的入参 passengers），
+ * 只有这张「送签表」名单排除（P1-13）。
+ */
 async function buildVisaSheetBuffer(passengers: Passenger[]): Promise<Buffer> {
-  // 出发日期 + 备注为订单级信息（全订单乘客共用）—— 只查一次
+  // 出发日期 + 备注为订单级信息（全订单乘客共用）—— 只查一次；orderId 从未过滤的入参取，
+  // 哪怕全员自备签也能查到订单上下文。
   const orderId = passengers[0]?.orderId;
   const { departureLocalDate, remark } = await loadVisaSheetContext(orderId);
+  const visaPassengers = passengers.filter((p) => p.visaExempt !== true);
 
   const wb = new ExcelJS.Workbook();
   wb.created = new Date();
@@ -140,7 +150,7 @@ async function buildVisaSheetBuffer(passengers: Passenger[]): Promise<Buffer> {
   headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEFEFEF' } };
   headerRow.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
 
-  passengers.forEach((p, i) => {
+  visaPassengers.forEach((p, i) => {
     ws.addRow({
       seq: i + 1,
       passportName: passportSlashName(p),
