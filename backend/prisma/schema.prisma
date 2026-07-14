@@ -126,6 +126,47 @@ model SavedPassenger {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Traveler Profile — 常旅客画像（按证件号聚合全量订单乘机人；travelerNo=常旅客号）
+// ─────────────────────────────────────────────────────────────────────────────
+model TravelerProfile {
+  id              String       @id @default(cuid())
+  documentType    DocumentType
+  documentNumber  String
+  fullName        String
+  chineseName     String?
+  gender          Gender?
+  dateOfBirth     DateTime?
+  nationality     String?
+  passportExpiry  DateTime?    @db.Date
+  tripCount       Int          @default(0)
+  orderCount      Int          @default(0)
+  firstTripAt     DateTime?
+  lastTripAt      DateTime?
+  nextTripAt      DateTime?
+  totalSpendCny   Decimal      @default(0) @db.Decimal(12, 2)
+  prefCabin       CabinClass?
+  prefBed         String?
+  prefMeal        String?
+  prefSingleRoom  Boolean      @default(false)
+  needsWheelchair Boolean      @default(false)
+  hotelHistory    Json         @default("[]")
+  companions      Json         @default("[]")
+  linkedUserId    String?
+  notes           String?
+  travelerNo      Int          @unique @default(autoincrement())
+  mergedIntoId    String?
+  refreshedAt     DateTime     @default(now())
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  @@unique([documentType, documentNumber])
+  @@index([fullName])
+  @@index([lastTripAt])
+  @@index([tripCount])
+  @@index([mergedIntoId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Customer Profile — 客户画像（User.role=CUSTOMER 的扩展信息）
 // ─────────────────────────────────────────────────────────────────────────────
 model CustomerProfile {
