@@ -27,7 +27,19 @@ import {
   getHotelNightlyRemaining,
   expandSharedHalfByDate,
   computePhysicalUsed,
+  assignedPhysicalRooms,
+  expandAssignedPhysicalByDate,
 } from './hotel-control.service.js';
+
+/** 权威分房表 fixture：groupSizes[i] = 第 i 个房间盒子的乘客数（形状同 orders 模块分房保存）。*/
+const roomAssignmentOf = (groupSizes: number[]) => ({
+  roomGroups: groupSizes.map((size, i) => ({
+    id: `g${i + 1}`,
+    hotelName: '美溪海滩酒店',
+    roomType: '',
+    passengerIds: Array.from({ length: size }, (_, j) => `p${i + 1}-${j + 1}`),
+  })),
+});
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const todayStr = new Date().toISOString().slice(0, 10);
@@ -447,6 +459,202 @@ describe('getHotelNightlyRemaining physicalRemaining（物理房间口径）', (
   });
 });
 
+// ── 权威分房表优先（Order.roomAssignment.roomGroups → 物理间数直计）──────────
+describe('assignedPhysicalRooms（分房表物理间数）', () => {
+  it('两个有乘客的房间盒子 → 2；空乘客盒子不计', () => {
+    expect(assignedPhysicalRooms(roomAssignmentOf([1, 1]))).toBe(2);
+    expect(
+      assignedPhysicalRooms({
+        roomGroups: [
+          { id: 'g1', passengerIds: ['p1', 'p2'] },
+          { id: 'g2', passengerIds: [] },
+        ],
+      }),
+    ).toBe(1);
+  });
+
+  it('无分房表 / 形状不符 / 全盒子无人 → null（走性别推算 fallback）', () => {
+    expect(assignedPhysicalRooms(null)).toBeNull();
+    expect(assignedPhysicalRooms(undefined)).toBeNull();
+    expect(assignedPhysicalRooms('bogus')).toBeNull();
+    expect(assignedPhysicalRooms({})).toBeNull();
+    expect(assignedPhysicalRooms({ roomGroups: [] })).toBeNull();
+    expect(assignedPhysicalRooms({ roomGroups: 'oops' })).toBeNull();
+    expect(assignedPhysicalRooms({ roomGroups: [{ id: 'g1', passengerIds: [] }] })).toBeNull();
+  });
+});
+
+describe('expandAssignedPhysicalByDate（拆分 + 订单级去重）', () => {
+  const dates = [dayStr(0), dayStr(1), dayStr(2)];
+
+  it('分房表订单逐日直计间数；无分房表行原样进 fallback', () => {
+    const assigned = {
+      hotelCheckIn: day(0),
+      hotelCheckOut: day(2),
+      roomsBilled: 1,
+      order: { id: 'o1', roomAssignment: roomAssignmentOf([1, 1]), passengers: [] },
+    };
+    const fallback = {
+      hotelCheckIn: day(0),
+      hotelCheckOut: day(1),
+      roomsBilled: 0.5,
+      order: { id: 'o2', roomAssignment: null, passengers: [] },
+    };
+    const res = expandAssignedPhysicalByDate([assigned, fallback], dates);
+    // 分房表 2 个有乘客盒子 → D0、D1 各 2 间
+    expect(res.assignedPhysical).toEqual([2, 2, 0]);
+    expect(res.fallbackItems).toEqual([fallback]);
+  });
+
+  it('同单多行（分段住 / 两房型）订单级去重：每晚只按分房表间数计一次', () => {
+    const order = { id: 'o1', roomAssignment: roomAssignmentOf([1, 1]), passengers: [] };
+    const rows = [
+      // 分段住：D0..D1 + D1..D2；D1 由两行同时覆盖也只计一次
+      { hotelCheckIn: day(0), hotelCheckOut: day(2), roomsBilled: 2, order },
+      { hotelCheckIn: day(1), hotelCheckOut: day(2), roomsBilled: null, order },
+    ];
+    const res = expandAssignedPhysicalByDate(rows, dates);
+    expect(res.assignedPhysical).toEqual([2, 2, 0]);
+    expect(res.fallbackItems).toEqual([]);
+  });
+});
+
+describe('getBoard 权威分房表优先（物理口径）', () => {
+  const rt = { hotelRoomType: { hotelId: 'h1', hotel: { name: '美溪海滩酒店' } } };
+
+  function boardClient(orderItems: unknown[], rooms = 10): PrismaClient {
+    return {
+      hotelBlockPeriod: {
+        findMany: vi.fn().mockResolvedValue([
+          {
+            hotelId: 'h1',
+            dateFrom: day(0),
+            dateTo: day(2),
+            rooms,
+            unitPrice: null,
+            hotel: { name: '美溪海滩酒店' },
+          },
+        ]),
+      },
+      orderItem: { findMany: vi.fn().mockResolvedValue(orderItems) },
+    } as unknown as PrismaClient;
+  }
+
+  it('运营反馈场景：一男一女各半间已分 2 房（roomsBilled 塌缩为 1.0）→ 物理 2、余 8、不标「拼」', async () => {
+    const client = boardClient([
+      {
+        hotelCheckIn: day(0),
+        hotelCheckOut: day(1),
+        roomsBilled: 1, // 分房保存把 Σ roomFraction(0.5+0.5) 塌缩写进首个酒店行
+        order: {
+          id: 'o1',
+          roomAssignment: roomAssignmentOf([1, 1]), // 房间1 + 房间2
+          passengers: [{ gender: 'M' }, { gender: 'F' }],
+        },
+        ...rt,
+      },
+    ]);
+    const board = await getBoard({ from: dayStr(0), to: dayStr(0) }, client);
+    const rows = board.hotels[0]!.rows;
+    // 床位口径不变（roomsBilled=1.0）
+    expect(rows.used).toEqual([1]);
+    // 物理间数 = 分房表有乘客盒子数 = 2（不再按塌缩后的 roomsBilled 推算成 1）
+    expect(rows.physicalUsed).toEqual([2]);
+    expect(rows.physicalRemaining).toEqual([8]);
+    // 已有完整分房表 → 不进拼房桶、不标「拼」
+    expect(rows.sharedHalfCount).toEqual([0]);
+    expect(rows.sharedUnpaired).toEqual([0]);
+    expect(rows.sharedOdd).toEqual([false]);
+  });
+
+  it('分房表半间单不再按性别落单；无分房表 fallback 单维持原推算', async () => {
+    const client = boardClient([
+      // 有分房表的半间单：物理 1 间、不落单
+      {
+        hotelCheckIn: day(0),
+        hotelCheckOut: day(1),
+        roomsBilled: 0.5,
+        order: { id: 'o1', roomAssignment: roomAssignmentOf([1]), passengers: [{ gender: 'M' }] },
+        ...rt,
+      },
+      // fallback 半间单（无分房表）：仍按性别推算，落单 1
+      {
+        hotelCheckIn: day(0),
+        hotelCheckOut: day(1),
+        roomsBilled: 0.5,
+        order: { id: 'o2', roomAssignment: null, passengers: [{ gender: 'F' }] },
+        ...rt,
+      },
+    ]);
+    const board = await getBoard({ from: dayStr(0), to: dayStr(0) }, client);
+    const rows = board.hotels[0]!.rows;
+    // 拼房口径只数 fallback 拼房客
+    expect(rows.sharedHalfCount).toEqual([1]);
+    expect(rows.sharedUnpaired).toEqual([1]);
+    expect(rows.sharedOdd).toEqual([true]);
+    // 物理 = 分房表 1 + fallback 落单 1 = 2
+    expect(rows.physicalUsed).toEqual([2]);
+    expect(rows.physicalRemaining).toEqual([8]);
+  });
+
+  it('fallback 回归：无分房表的同性两半间仍配成 1 间', async () => {
+    const client = boardClient([
+      {
+        hotelCheckIn: day(0),
+        hotelCheckOut: day(1),
+        roomsBilled: 0.5,
+        order: { id: 'o1', roomAssignment: null, passengers: [{ gender: 'M' }] },
+        ...rt,
+      },
+      {
+        hotelCheckIn: day(0),
+        hotelCheckOut: day(1),
+        roomsBilled: 0.5,
+        order: { id: 'o2', passengers: [{ gender: 'M' }] }, // roomAssignment 字段缺省同样走 fallback
+        ...rt,
+      },
+    ]);
+    const board = await getBoard({ from: dayStr(0), to: dayStr(0) }, client);
+    const rows = board.hotels[0]!.rows;
+    expect(rows.used).toEqual([1]);
+    expect(rows.physicalUsed).toEqual([1]);
+    expect(rows.sharedUnpaired).toEqual([0]);
+    expect(rows.physicalRemaining).toEqual([9]);
+  });
+});
+
+describe('getHotelNightlyRemaining 权威分房表优先（物理口径）', () => {
+  it('一男一女各半间已分 2 房（塌缩 roomsBilled=1.0，block=10）→ 床位余 9、物理余 8', async () => {
+    const client = {
+      hotelBlockPeriod: {
+        findMany: vi.fn().mockResolvedValue([
+          { hotelId: 'h1', dateFrom: day(0), dateTo: day(2), rooms: 10 },
+        ]),
+      },
+      orderItem: {
+        findMany: vi.fn().mockResolvedValue([
+          {
+            hotelCheckIn: day(0),
+            hotelCheckOut: day(1),
+            roomsBilled: 1,
+            order: {
+              id: 'o1',
+              roomAssignment: roomAssignmentOf([1, 1]),
+              passengers: [{ gender: 'M' }, { gender: 'F' }],
+            },
+          },
+        ]),
+      },
+    } as unknown as PrismaClient;
+    const res = await getHotelNightlyRemaining('h1', [dayStr(0)], client);
+    expect(res.hasBlock).toBe(true);
+    // 床位口径维持原值（10 - 1.0 = 9）
+    expect(res.remaining).toEqual([9]);
+    // 物理口径按分房表直计 2 间 → 10 - 2 = 8
+    expect(res.physicalRemaining).toEqual([8]);
+  });
+});
+
 describe('getOccupyingOrders', () => {
   function occupantsClient(items: unknown[]): PrismaClient {
     return {
@@ -525,6 +733,31 @@ describe('getOccupyingOrders', () => {
     const occupants = await getOccupyingOrders('h1', dayStr(0), client);
     expect(occupants[0]!.rooms).toBe(3);
     expect(occupants[0]!.agentName).toBe('直客');
+  });
+
+  it('有权威分房表的订单：间数按有乘客的房间盒子数展示（覆盖被塌缩的 roomsBilled）', async () => {
+    const client = occupantsClient([
+      {
+        roomsBilled: 1, // 分房保存塌缩后的床位数
+        metadata: null,
+        hotelCheckIn: day(0),
+        hotelCheckOut: day(1),
+        order: {
+          id: 'o9',
+          orderNumber: 'ST-0009',
+          status: 'PAID',
+          contactName: '张三',
+          agent: null,
+          roomAssignment: roomAssignmentOf([1, 1]),
+          passengers: [
+            { documentNumber: 'E1', chineseName: null, fullName: 'ZHANG/SAN' },
+            { documentNumber: 'E2', chineseName: null, fullName: 'LI/SI' },
+          ],
+        },
+      },
+    ]);
+    const occupants = await getOccupyingOrders('h1', dayStr(0), client);
+    expect(occupants[0]!.rooms).toBe(2);
   });
 
   it('同一酒店该晚多行占房（如两种房型）→ 逐行返回，不做订单级合并', async () => {

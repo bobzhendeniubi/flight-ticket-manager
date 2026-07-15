@@ -6,22 +6,25 @@
  *      入住该酒店、hotelCheckIn 落在区间内的占房订单行（HOTEL 行 + 套餐盖章 hotelRoomTypeId 的
  *      BUNDLE 行都命中），排除已取消/软删订单（与销控板/分房表同口径 COUNTED_STATUSES）。
  *      同一订单区间内多晚/多行只归并一次；同一乘客不重复打包。
- *   2. 按姓名批量导出（collectPassportGroupsByNames）：不限酒店/日期，直接按姓名列表命中乘客
+ *   2. 按姓名批量导出（collectPassportGroupsByNames）：不限酒店，直接按姓名列表命中乘客
  *      （fullName 大小写不敏感 或 chineseName 精确 trim 匹配，命中任一即可），排除已取消/软删订单
- *      （同 COUNTED_STATUSES）。同名同证件号跨订单命中多单时全部打包（按订单分文件夹天然消歧）；
- *      未命中的姓名单独返回，供路由/前端提示。
+ *      （同 COUNTED_STATUSES）。可选按出发日期区间 [from, to]（含两端）过滤：口径 = 订单最早一段
+ *      FLIGHT 的 departureTime 按 departureTz 折算的「出发地本地日」（复用 fmtDepartureLocalDate，
+ *      不做 UTC 比较，避免跨时区错日）；无航班的订单没有出发日，传了区间时一律不命中。
+ *      同名跨订单命中多单时全部打包（证件号进文件名天然消歧）；未命中的姓名单独返回，供路由/前端提示。
  *
- * 输出：zip Buffer，结构：
- *   {orderNumber}/{LASTNAME}_{护照号}.{ext}   （仅有图乘客）
- *   README.txt                                （zip 根部；列出哪单哪人缺护照图，按姓名导出时
- *                                                额外列出未命中的姓名）
+ * 输出：zip Buffer，结构（两个入口不同——按酒店给房控对订单，按姓名给运营按出发日找人）：
+ *   按酒店：{orderNumber}/{LASTNAME}_{护照号}.{ext}
+ *   按姓名：{出发日期 YYYY-MM-DD 或 无出发日期}/{中文名或LASTNAME_FIRSTNAME}_{护照号}.{ext}
+ *   README.txt   （zip 根部；列出哪单哪人缺护照图；按姓名导出时额外列出
+ *                   每个文件对应的订单号（查单用）+ 未命中的姓名）
  *
  * 缺照片不报错 —— 写进根部 README.txt。无命中订单、或全员都没上传护照图，由路由层返回 400。
  */
 import JSZip from 'jszip';
-import type { PrismaClient } from '@prisma/client';
+import { OrderItemKind, type PrismaClient } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
-import { sanitize, extFromUrl, fetchPhoto } from '../orders/passport-zip.js';
+import { sanitize, extFromUrl, fetchPhoto, fmtDepartureLocalDate } from '../orders/passport-zip.js';
 import { COUNTED_STATUSES } from './hotel-control.service.js';
 
 /** 打包用的最小乘客形态（只取护照打包/命名所需字段）。*/
@@ -30,6 +33,8 @@ export interface PassportPassenger {
   fullName: string;
   lastName: string | null;
   firstName: string | null;
+  /** 中文姓名 —— 按姓名导出的文件命名优先用它；按酒店导出不取（可缺省）。*/
+  chineseName?: string | null;
   documentNumber: string;
   passportPhotoUrl: string | null;
 }
@@ -37,6 +42,11 @@ export interface PassportPassenger {
 /** 一张订单的待打包乘客集合（区间内多晚/多行已归并为一份）。*/
 export interface HotelPassportGroup {
   orderNumber: string;
+  /**
+   * 订单最早一段 FLIGHT 的出发地本地日（YYYY-MM-DD；无航班 ''）。
+   * 仅按姓名导出取数时填（zip 按它分文件夹）；按酒店导出不取（可缺省）。
+   */
+  departureLocalDate?: string;
   passengers: PassportPassenger[];
 }
 
@@ -67,6 +77,29 @@ function lastNameOf(p: PassportPassenger): string {
   if (!full) return '';
   if (full.includes('/')) return full.split('/')[0].toUpperCase();
   return full.split(/\s+/u)[0].toUpperCase();
+}
+
+/**
+ * 按姓名导出的文件名用「姓名」：优先中文姓名；无中文名用 LASTNAME_FIRSTNAME
+ * （未拆分时回退 fullName 尽力拆，斜线 LAST/FIRST 或空格分隔），不编造，取不到留空
+ * （文件名还有证件号兜底消歧）。
+ */
+function displayNameOf(p: PassportPassenger): string {
+  const cn = (p.chineseName ?? '').trim();
+  if (cn) return cn;
+  const last = (p.lastName ?? '').trim().toUpperCase();
+  const first = (p.firstName ?? '').trim().toUpperCase();
+  if (last || first) return [last, first].filter(Boolean).join('_');
+  const full = (p.fullName ?? '').trim().toUpperCase();
+  if (!full) return '';
+  if (full.includes('/')) {
+    return full
+      .split('/')
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .join('_');
+  }
+  return full.split(/\s+/u).join('_');
 }
 
 /**
@@ -130,17 +163,21 @@ export function hasAnyPassportPhoto(groups: HotelPassportGroup[]): boolean {
 }
 
 /**
- * 按姓名列表查乘客（不限酒店/日期）：fullName 大小写不敏感 或 chineseName 精确 trim 匹配，
+ * 按姓名列表查乘客（不限酒店）：fullName 大小写不敏感 或 chineseName 精确 trim 匹配，
  * 命中任一即算命中。仅关联订单未软删且状态在 COUNTED_STATUSES（同销控板/分房表口径）。
- * 同名同证件号跨订单命中多单时全部打包，按订单分文件夹天然消歧。
- * @param names 姓名列表（允许含前后空白，函数内部会 trim + 去重后再查）。
+ * 可选按出发日期过滤：每订单取最早一段 FLIGHT 的 departureTime，按 departureTz 折算成
+ * 「出发地本地日」YYYY-MM-DD 字符串后与 from/to 比较（不做 UTC gte/lte，避免跨时区错日）；
+ * 无航班订单出发日为 ''，传了区间时一律不命中。被日期过滤掉的姓名计入 notFoundNames。
+ * 同名跨订单命中多单时全部打包（证件号进文件名天然消歧）。
+ * @param args.names 姓名列表（允许含前后空白，函数内部会 trim + 去重后再查）。
+ * @param args.from / args.to 可选出发日期区间（YYYY-MM-DD，含两端；可只传一端）。
  * @param client 可注入用于测试；缺省取默认 prisma。
  */
 export async function collectPassportGroupsByNames(
-  names: string[],
+  args: { names: string[]; from?: string; to?: string },
   client: PrismaClient = defaultPrisma,
 ): Promise<HotelPassportsByNamesSelection> {
-  const uniqueNames = Array.from(new Set(names.map((n) => n.trim()).filter(Boolean)));
+  const uniqueNames = Array.from(new Set(args.names.map((n) => n.trim()).filter(Boolean)));
 
   if (uniqueNames.length === 0) {
     return { groups: [], notFoundNames: [] };
@@ -162,13 +199,34 @@ export async function collectPassportGroupsByNames(
       chineseName: true,
       documentNumber: true,
       passportPhotoUrl: true,
-      order: { select: { id: true, orderNumber: true } },
+      order: {
+        select: {
+          id: true,
+          orderNumber: true,
+          // 最早一段机票 → 出发日（与送签表 departureLocalDate 同口径）
+          items: {
+            where: { kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
+            orderBy: { flightSchedule: { departureTime: 'asc' } },
+            take: 1,
+            select: { flightSchedule: { select: { departureTime: true, departureTz: true } } },
+          },
+        },
+      },
     },
   });
 
   const byOrder = new Map<string, HotelPassportGroup>();
   const matchedNames = new Set<string>();
   for (const p of passengers) {
+    const fs = p.order.items[0]?.flightSchedule ?? null;
+    const departureLocalDate = fmtDepartureLocalDate(
+      fs?.departureTime ?? null,
+      fs?.departureTz ?? null,
+    );
+    // 出发地本地日字符串比较（YYYY-MM-DD 字典序 = 日期序）；无出发日在传区间时不命中
+    if (args.from && (!departureLocalDate || departureLocalDate < args.from)) continue;
+    if (args.to && (!departureLocalDate || departureLocalDate > args.to)) continue;
+
     const fullNameLower = (p.fullName ?? '').trim().toLowerCase();
     const chineseName = (p.chineseName ?? '').trim();
     for (const name of uniqueNames) {
@@ -178,12 +236,15 @@ export async function collectPassportGroupsByNames(
     }
 
     const key = p.order.id;
-    const group = byOrder.get(key) ?? { orderNumber: p.order.orderNumber, passengers: [] };
+    const group =
+      byOrder.get(key) ??
+      { orderNumber: p.order.orderNumber, departureLocalDate, passengers: [] };
     group.passengers.push({
       id: p.id,
       fullName: p.fullName,
       lastName: p.lastName,
       firstName: p.firstName,
+      chineseName: p.chineseName,
       documentNumber: p.documentNumber,
       passportPhotoUrl: p.passportPhotoUrl,
     });
@@ -193,6 +254,49 @@ export async function collectPassportGroupsByNames(
   const notFoundNames = uniqueNames.filter((n) => !matchedNames.has(n));
 
   return { groups: Array.from(byOrder.values()), notFoundNames };
+}
+
+/** 按姓名导出 zip 里无航班订单的文件夹名。*/
+const NO_DEPARTURE_FOLDER = '无出发日期';
+
+/**
+ * 按姓名导出专用打包：顶层文件夹 = 出发日期（YYYY-MM-DD；无航班订单归「无出发日期」），
+ * 文件名 = {姓名}_{证件号}.{ext}（姓名优先中文名）。缺图/下载失败记入 missing；
+ * 成功打入的文件逐个记入 manifest（文件 ← 订单号，供运营查单）。
+ * 「按酒店」导出仍走 packGroupsIntoZip（按订单号分文件夹），两者结构互不影响。
+ */
+async function packGroupsByDepartureDateIntoZip(
+  zip: JSZip,
+  groups: HotelPassportGroup[],
+): Promise<{ missing: string[]; manifest: string[]; photoCount: number; passengerCount: number }> {
+  const missing: string[] = [];
+  const manifest: string[] = [];
+  let photoCount = 0;
+  let passengerCount = 0;
+
+  for (const group of groups) {
+    const folderName = (group.departureLocalDate ?? '').trim() || NO_DEPARTURE_FOLDER;
+    const folder = zip.folder(folderName) ?? zip;
+    for (const p of group.passengers) {
+      passengerCount += 1;
+      const slug = sanitize(`${displayNameOf(p)}_${p.documentNumber}`);
+      if (!p.passportPhotoUrl) {
+        missing.push(`${group.orderNumber}  ·  ${slug}  — 该乘客没传护照照片`);
+        continue;
+      }
+      const buf = await fetchPhoto(p.passportPhotoUrl);
+      if (!buf) {
+        missing.push(`${group.orderNumber}  ·  ${slug}  — 护照图下载失败 (${p.passportPhotoUrl})`);
+        continue;
+      }
+      const fileName = `${slug}.${extFromUrl(p.passportPhotoUrl)}`;
+      folder.file(fileName, buf);
+      manifest.push(`${folderName}/${fileName}  ←  订单 ${group.orderNumber}`);
+      photoCount += 1;
+    }
+  }
+
+  return { missing, manifest, photoCount, passengerCount };
 }
 
 /**
@@ -260,29 +364,45 @@ export async function buildHotelPassportsZip(
 }
 
 /**
- * 把按姓名命中的乘客打成 zip：结构与 buildHotelPassportsZip 一致（按订单分文件夹），
- * README.txt 里除缺图客人外，未命中的姓名单独列一段。
+ * 把按姓名命中的乘客打成 zip：顶层文件夹 = 出发日期（无航班订单归「无出发日期」），
+ * 文件名 = {姓名}_{证件号}.{ext}（姓名优先中文名）。README.txt 里列出每个文件对应的
+ * 订单号（查单用）、缺图客人、未命中的姓名；传了出发日期区间时一并记入抬头。
  * @returns zip Buffer + 实际成功打入的照片数（photoCount）。
  */
 export async function buildPassportsByNamesZip(
   selection: HotelPassportsByNamesSelection,
+  meta?: { from?: string; to?: string },
 ): Promise<{ buf: Buffer; photoCount: number }> {
   const zip = new JSZip();
-  const { missing, photoCount, passengerCount } = await packGroupsIntoZip(zip, selection.groups);
+  const { missing, manifest, photoCount, passengerCount } = await packGroupsByDepartureDateIntoZip(
+    zip,
+    selection.groups,
+  );
 
+  const hasRange = Boolean(meta?.from || meta?.to);
   const readme = [
-    '按姓名批量导出护照',
+    '按姓名批量导出护照（按出发日期分文件夹）',
+    ...(hasRange ? [`出发日期区间：${meta?.from ?? '不限'} ~ ${meta?.to ?? '不限'}（出发地本地日）`] : []),
     `打包时间：${new Date().toISOString()}`,
     `订单数：${selection.groups.length}`,
     `乘客总数：${passengerCount}`,
     `成功打包护照图：${photoCount}`,
     `缺失/失败：${missing.length}`,
     '',
+    ...(manifest.length
+      ? ['文件 ↔ 订单对照（查单用）：', ...manifest.map((s) => `  · ${s}`), '']
+      : []),
     ...(missing.length
       ? ['⚠ 缺护照图（订单 · 乘客）：', ...missing.map((s) => `  · ${s}`)]
       : ['✓ 所有乘客护照图均已打包']),
     ...(selection.notFoundNames.length
-      ? ['', '⚠ 以下姓名未找到任何客人：', ...selection.notFoundNames.map((n) => `  · ${n}`)]
+      ? [
+          '',
+          hasRange
+            ? '⚠ 以下姓名未找到任何客人（含不在所选出发日期范围内的）：'
+            : '⚠ 以下姓名未找到任何客人：',
+          ...selection.notFoundNames.map((n) => `  · ${n}`),
+        ]
       : []),
   ].join('\n');
   zip.file('README.txt', readme);
@@ -301,8 +421,16 @@ export function hotelPassportsZipFilename(
   return `护照_${sanitize(hotelName ?? hotelId)}_${from}_${to}.zip`;
 }
 
-/** 文件名：`护照_按姓名_{n}人_{YYYY-MM-DD}.zip`。*/
-export function passportsByNamesZipFilename(names: string[]): string {
+/**
+ * 文件名：`护照_按姓名_{n}人_{YYYY-MM-DD}.zip`；
+ * 传了出发日期区间时插入 `_出发{from}至{to}`（单端缺省记「不限」）。
+ */
+export function passportsByNamesZipFilename(
+  names: string[],
+  range?: { from?: string; to?: string },
+): string {
   const stamp = new Date().toISOString().slice(0, 10);
-  return `护照_按姓名_${names.length}人_${stamp}.zip`;
+  const rangePart =
+    range?.from || range?.to ? `_出发${range?.from ?? '不限'}至${range?.to ?? '不限'}` : '';
+  return `护照_按姓名_${names.length}人${rangePart}_${stamp}.zip`;
 }

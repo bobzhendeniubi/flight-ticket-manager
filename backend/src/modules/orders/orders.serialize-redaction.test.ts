@@ -82,6 +82,8 @@ function buildOrder() {
         id: 'it2',
         kind: 'BUNDLE',
         description: '三亚 5 日跟团套餐',
+        // 录单自定义产品名称快照（详情页「产品名称」优先展示；无值行应序列化为 null）
+        productNameOverride: '三亚湾往返机票+酒店+接送机服务',
         quantity: 1,
         unitPrice: dec(3000),
         amount: dec(3200),
@@ -159,6 +161,11 @@ describe('serializeOrder · ADMIN/STAFF 视角（不脱敏）', () => {
     expect(out.items[1].metadata.addOns.total).toBe(-150);
     expect(out.items[1].metadata.operationFee.totalCny).toBe(40);
     expect(out.items[1].metadata.bundleDiscountPct).toBe(10);
+  });
+
+  it('录单自定义产品名称（productNameOverride）随行下发；无值行规整为 null', () => {
+    expect(out.items[1].productNameOverride).toBe('三亚湾往返机票+酒店+接送机服务');
+    expect(out.items[0].productNameOverride).toBeNull();
   });
 });
 

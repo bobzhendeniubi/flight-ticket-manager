@@ -9,6 +9,9 @@
  *                  注：BUNDLE 行如带房型+入住日期同样计入；当前套餐下单不写这些字段，
  *                  纯 bundleId 的行（Bundle.items JSON 无房型/日期）无法归属酒店，跳过。
  *   remaining(d) = block(d) - used(d)
+ *   physical(d)  = 物理房间口径：有权威分房表（Order.roomAssignment.roomGroups）的订单
+ *                  按「有乘客的房间盒子数」直计（见 expandAssignedPhysicalByDate）；
+ *                  其余订单按拼房性别推算（异性不能拼一间，见 computePhysicalUsed）。
  *
  * 写操作由 routes 层负责 ADMIN/STAFF 鉴权 + 审计日志（镜像 finances 成本周期风格）。
  */
@@ -269,8 +272,8 @@ function pickSoloGender(
  * 入住区间 [checkIn, checkOut) 覆盖该晚即按其出行人性别 +1（每行 = 1 位拼房客）。
  * 异性不能拼一间 → 男/女各自两两配对、未知每人独占，用于物理房间与落单口径。
  *
- * TODO(房控-下一波): 运营故意混拼（Order.roomAssignment 分房表已指定同房不同性别）时，
- * 应读分房表覆盖此按性别的保守推算；当前迭代不做（分房表覆盖留待后续）。
+ * 注：有权威分房表的订单（含运营故意混拼）已由 expandAssignedPhysicalByDate 在上游拆分
+ * 排除——物理口径调用方应只传拆分后的 fallback 行，分房表订单不进此保守推算。
  */
 export function expandSharedHalfByDate(
   items: ReadonlyArray<{
@@ -323,6 +326,84 @@ export function computePhysicalUsed(
   });
 }
 
+// ── 权威分房表（Order.roomAssignment）────────────────────────────────────
+/**
+ * 权威分房表的物理间数：Order.roomAssignment.roomGroups（orders 模块分房保存的 JSON）中
+ * 「至少 1 名出行人」的房间盒子数量。返回 null = 无有效分房表（未分房 / 形状不符 /
+ * 全部盒子无人）→ 调用方走拼房性别推算 fallback。防御式解析，形状不符不抛错。
+ *
+ * 背景：分房保存把 Σ roomFraction 塌缩写进首个酒店行的 roomsBilled（床位/计费口径），
+ * "男+女各半间分 2 房"会塌缩成 1.0——物理间数必须回读分房表，不能只看 roomsBilled。
+ */
+export function assignedPhysicalRooms(roomAssignment: unknown): number | null {
+  if (roomAssignment == null || typeof roomAssignment !== 'object') return null;
+  const groups = (roomAssignment as { roomGroups?: unknown }).roomGroups;
+  if (!Array.isArray(groups) || groups.length === 0) return null;
+  const withPassengers = groups.filter((g) => {
+    if (g == null || typeof g !== 'object') return false;
+    const ids = (g as { passengerIds?: unknown }).passengerIds;
+    return Array.isArray(ids) && ids.length > 0;
+  }).length;
+  return withPassengers > 0 ? withPassengers : null;
+}
+
+/** 占房行（物理口径拆分用）：订单级分房表 + 拼房性别 fallback 所需字段。*/
+export interface PhysicalOccupancyItem {
+  hotelCheckIn: Date | null;
+  hotelCheckOut: Date | null;
+  roomsBilled?: Prisma.Decimal | number | null;
+  metadata?: unknown;
+  order?: {
+    id?: string;
+    roomAssignment?: unknown;
+    passengers: Array<{ gender: Gender | null }>;
+  } | null;
+}
+
+/**
+ * 物理房间口径拆分：有权威分房表的订单逐日按「有乘客的 roomGroup 数」直计物理间数
+ * （assignedPhysical），其余行原样返回（fallbackItems）走性别推算（expandSharedHalfByDate
+ * + computePhysicalUsed）。分房表订单不再参与 isHalfRoom / 性别配对 / 整间推算，
+ * 也不进「拼」落单口径（sharedUnpaired）。
+ *
+ * 订单级去重：分房是订单级、占房行是行级——同一订单在同酒店的多行（两种房型 / 分段住）
+ * 只按分房表间数计一次/晚：对该单所有行的 [checkIn, checkOut) 取并集覆盖，
+ * 覆盖到的每晚 += 分房表间数（日期展开方式对齐 expandUsedByDate 的半开区间）。
+ */
+export function expandAssignedPhysicalByDate<T extends PhysicalOccupancyItem>(
+  items: ReadonlyArray<T>,
+  dates: readonly string[],
+): { assignedPhysical: number[]; fallbackItems: T[] } {
+  const assignedPhysical = new Array<number>(dates.length).fill(0);
+  const fallbackItems: T[] = [];
+  const byOrder = new Map<string, { rooms: number; covered: boolean[] }>();
+  items.forEach((it, idx) => {
+    const rooms = assignedPhysicalRooms(it.order?.roomAssignment);
+    if (rooms == null || !it.hotelCheckIn || !it.hotelCheckOut) {
+      fallbackItems.push(it);
+      return;
+    }
+    // 订单 id 缺失（异常兜底）按行独立计，避免静默丢占房
+    const key = it.order?.id ?? `__row_${idx}`;
+    const entry = byOrder.get(key) ?? {
+      rooms,
+      covered: new Array<boolean>(dates.length).fill(false),
+    };
+    if (!byOrder.has(key)) byOrder.set(key, entry);
+    const checkIn = fmtDateOnly(it.hotelCheckIn);
+    const checkOut = fmtDateOnly(it.hotelCheckOut);
+    for (let i = 0; i < dates.length; i++) {
+      if (checkIn <= dates[i] && dates[i] < checkOut) entry.covered[i] = true;
+    }
+  });
+  for (const { rooms, covered } of byOrder.values()) {
+    for (let i = 0; i < dates.length; i++) {
+      if (covered[i]) assignedPhysical[i] += rooms;
+    }
+  }
+  return { assignedPhysical, fallbackItems };
+}
+
 /**
  * 单酒店逐晚余量（remaining = block - used），口径与销控板 getBoard 完全一致。
  * 一次 findMany 拉周期 + 一次 findMany 拉占房行，JS 内展开（无逐日查询）。
@@ -365,17 +446,23 @@ export async function getHotelNightlyRemaining(
       hotelCheckOut: true,
       roomsBilled: true,
       metadata: true,
-      // 拼房客性别（异性不能拼一间）——物理房间口径 physicalRemaining 需要，口径同 getBoard
-      order: { select: { passengers: { select: { gender: true } } } },
+      // 物理房间口径 physicalRemaining 需要（口径同 getBoard）：
+      //   roomAssignment = 权威分房表（优先直计物理间数）；passengers.gender = fallback 性别推算
+      order: {
+        select: { id: true, roomAssignment: true, passengers: { select: { gender: true } } },
+      },
     },
   });
 
   const block = expandBlockByDate(periods, nightDates);
   const used = expandUsedByDate(items, nightDates);
-  // 物理房间口径（与销控板 getBoard / 房态导出同口径）：按性别分桶推算真实占用整间数，
-  // 而不是直接对床位用量取 ceil——避免"男+女各半间"被误算成 1 间（异性不能拼）。
-  const buckets = expandSharedHalfByDate(items, nightDates);
-  const physicalUsed = computePhysicalUsed(used, buckets);
+  // 物理房间口径（与销控板 getBoard / 房态导出同口径）：权威分房表订单按「有乘客的
+  // roomGroup 数」直计整间；无分房表订单按性别分桶推算真实占用整间数（异性不能拼）——
+  // 避免"男+女各半间已分 2 房"被塌缩的 roomsBilled=1.0 误算成 1 间。
+  const { assignedPhysical, fallbackItems } = expandAssignedPhysicalByDate(items, nightDates);
+  const buckets = expandSharedHalfByDate(fallbackItems, nightDates);
+  const fallbackPhysical = computePhysicalUsed(expandUsedByDate(fallbackItems, nightDates), buckets);
+  const physicalUsed = fallbackPhysical.map((v, i) => round2(v + assignedPhysical[i]));
   const physicalRemaining = block.map((b, i) => round2(b - physicalUsed[i]));
 
   return {
@@ -400,10 +487,11 @@ export interface HotelControlBoard {
       used: number[];
       /** 床位口径余量 = block - used，逐日 */
       remaining: number[];
-      /** 当晚拼房客（roomsBilled==0.5）总人数（含各性别），逐日 */
+      /** 当晚拼房客（roomsBilled==0.5，仅无分房表的 fallback 订单）总人数（含各性别），逐日 */
       sharedHalfCount: number[];
       /**
-       * 当晚无法配对的拼房客数（落单数），逐日。
+       * 当晚无法配对的拼房客数（落单数），逐日。仅统计无分房表的 fallback 订单——
+       * 已有权威分房表的订单不再标为落单。
        * = m%2 + f%2 + u（同性两两配对后的余数 + 未知性别全算落单）。
        */
       sharedUnpaired: number[];
@@ -411,7 +499,8 @@ export interface HotelControlBoard {
       sharedOdd: boolean[];
       /**
        * 物理房间口径占房：真实占用的整间数，逐日。
-       * = ceil(男/2) + ceil(女/2) + 未知 + 整间预订数
+       * 有权威分房表（Order.roomAssignment.roomGroups）的订单 = 有乘客的房间盒子数（直计）；
+       * 其余订单 = ceil(男/2) + ceil(女/2) + 未知 + 整间预订数
        *   异性不能拼一间：男/女各自两两共用 1 间、落单向上取整独占；未知每人独占 1 间。
        */
       physicalUsed: number[];
@@ -466,9 +555,12 @@ export async function getBoard(
       roomsBilled: true,
       metadata: true,
       hotelRoomType: { select: { hotelId: true, hotel: { select: { name: true } } } },
-      // 拼房客性别（异性不能拼一间）——拼房单恒为 adultCount===1 的套餐单，取其出行人性别；
-      // 仅取 gender 字段、批量随主查带回，不额外查库（见 expandSharedHalfByDate / pickSoloGender）。
-      order: { select: { passengers: { select: { gender: true } } } },
+      // roomAssignment = 权威分房表（优先直计物理间数，订单级去重需 id）；
+      // passengers.gender = fallback 拼房性别推算（异性不能拼一间）——拼房单恒为
+      // adultCount===1 的套餐单，取其出行人性别；批量随主查带回，不额外查库。
+      order: {
+        select: { id: true, roomAssignment: true, passengers: { select: { gender: true } } },
+      },
     },
   });
 
@@ -488,16 +580,20 @@ export async function getBoard(
       const hotelItems = items.filter((it) => it.hotelRoomType?.hotelId === hotelId);
       const block = expandBlockByDate(hotelPeriods, dates);
       const used = expandUsedByDate(hotelItems, dates);
-      // 拼房客（0.5 半间）逐日按性别分桶（异性不能拼一间；同一份占房行复用，O(items)）
-      const buckets = expandSharedHalfByDate(hotelItems, dates);
+      // 权威分房表订单直计物理间数并退出拼房口径；其余行（fallback）按性别推算
+      const { assignedPhysical, fallbackItems } = expandAssignedPhysicalByDate(hotelItems, dates);
+      // 拼房客（0.5 半间）逐日按性别分桶（仅 fallback 订单；异性不能拼一间；
+      // 已有分房表的订单不进拼房桶、不标「拼」落单）
+      const buckets = expandSharedHalfByDate(fallbackItems, dates);
       const sharedHalfCount = buckets.m.map((mv, i) => mv + buckets.f[i] + buckets.u[i]);
       // 落单数 = 同性两两配对后的余数 + 未知性别（全算落单）
       const sharedUnpaired = buckets.m.map((mv, i) => (mv % 2) + (buckets.f[i] % 2) + buckets.u[i]);
       const sharedOdd = sharedUnpaired.map((n) => n > 0);
 
       const remaining = block.map((b, i) => b - used[i]);
-      // 物理房间口径（内存推导，无额外查库）：整间占用数 + 余量
-      const physicalUsed = computePhysicalUsed(used, buckets);
+      // 物理房间口径（内存推导，无额外查库）：分房表直计 + fallback 性别推算
+      const fallbackPhysical = computePhysicalUsed(expandUsedByDate(fallbackItems, dates), buckets);
+      const physicalUsed = fallbackPhysical.map((v, i) => round2(v + assignedPhysical[i]));
       const physicalRemaining = block.map((b, i) => round2(b - physicalUsed[i]));
       const latestPriced = hotelPeriods.find((p) => p.unitPrice != null);
       const unitPrice = latestPriced ? round2(dec(latestPriced.unitPrice)!) : null;
@@ -696,7 +792,11 @@ export interface HotelOccupantDto {
    * 用于房控核对分房——一眼看清这几间房住的是哪几个人。
    */
   passengerNames: string[];
-  /** 该占房行的间数（与销控板「用房」同口径，见 itemRoomCount） */
+  /**
+   * 该占房行的间数。有权威分房表（Order.roomAssignment.roomGroups）的订单按
+   * 「有乘客的房间盒子数」展示（物理间数，覆盖被塌缩的 roomsBilled）；
+   * 否则与销控板「用房」同口径（见 itemRoomCount）。
+   */
   rooms: number;
   checkIn: string; // YYYY-MM-DD（该行入住日）
   checkOut: string; // YYYY-MM-DD（该行退房日）
@@ -735,6 +835,7 @@ export async function getOccupyingOrders(
           orderNumber: true,
           status: true,
           contactName: true,
+          roomAssignment: true, // 权威分房表——间数展示优先按「有乘客的房间盒子数」
           agent: { select: { companyName: true } },
           passengers: { select: { documentNumber: true, chineseName: true, fullName: true } },
         },
@@ -753,7 +854,7 @@ export async function getOccupyingOrders(
       passengerNames: it.order.passengers
         .filter((p) => p.documentNumber !== 'N/A')
         .map((p) => p.chineseName?.trim() || p.fullName),
-      rooms: itemRoomCount(it),
+      rooms: assignedPhysicalRooms(it.order.roomAssignment) ?? itemRoomCount(it),
       checkIn: fmtDateOnly(it.hotelCheckIn!),
       checkOut: fmtDateOnly(it.hotelCheckOut!),
       agentName: it.order.agent?.companyName ?? '直客',

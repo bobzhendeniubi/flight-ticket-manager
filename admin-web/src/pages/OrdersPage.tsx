@@ -2980,9 +2980,14 @@ function BundleItineraryCard({ items, order }: { items: OrderItem[]; order: Orde
   if (bundleKinds.includes('HOTEL') || bundleLine.roomTypeName || bundleLine.hotelName) componentParts.push('酒店');
   if (bundleKinds.includes('VISA') || visa) componentParts.push('签证');
   if (bundleKinds.includes('TRANSFER') || transfers.length > 0) componentParts.push('接送机服务');
-  const productName = routeLabel
-    ? `${routeLabel}${componentParts.join('+')}`
-    : bundleLine.bundleName ?? bundleLine.description;
+  // 录单自定义名称（productNameOverride）最高优先：运营录单时手改过的名字原样展示；
+  // 未自定义（NULL/空白）→ 维持既有自动拼装逻辑。
+  const overrideName = bundleLine.productNameOverride?.trim();
+  const productName = overrideName
+    ? overrideName
+    : routeLabel
+      ? `${routeLabel}${componentParts.join('+')}`
+      : bundleLine.bundleName ?? bundleLine.description;
 
   const adultCount = order.adultCount ?? 0;
   const childCount = order.childCount ?? 0;
@@ -4534,6 +4539,9 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   const [bundleAdultCount, setBundleAdultCount] = useState<number | null>(1);
   const [bundleChildCount, setBundleChildCount] = useState<number | null>(0);
   const [bundleInfantCount, setBundleInfantCount] = useState<number | null>(0);
+  // 产品名称（可改）：默认回填所选套餐名；运营改过（与套餐名不同）才作为 productNameOverride 传后端。
+  const [bundleProductName, setBundleProductName] = useState('');
+  const [bundleProductNameTouched, setBundleProductNameTouched] = useState(false);
 
   // 仅 ADMIN/STAFF 可用运营专属能力（手动结算单价、代为归属代理）。
   const isOps = user?.role === 'ADMIN' || user?.role === 'STAFF';
@@ -4670,6 +4678,12 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   }, [outboundSchedules, pendingSchedDate, outboundScheduleId]);
   const cabinOptions = outboundSchedule?.seatClasses ?? [];
   const selectedBundle = bundles.find((b) => b.id === bundleId);
+
+  // 换套餐时把「产品名称（可改）」回填为新套餐名（运营尚未手改过才同步，避免覆盖手输内容）。
+  useEffect(() => {
+    if (!bundleProductNameTouched) setBundleProductName(selectedBundle?.name ?? '');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bundleId, selectedBundle?.name]);
   // 套餐搜索下拉（W3）：套餐多时原生 select 找不到，换 SearchSelect 按名称/编号搜索；
   // priceLabel 用折后起价/人 = originalPerPaxCny ×(1−discountPct/100)，与套餐页卡片口径一致。
   const bundleOptions: SearchSelectOption[] = useMemo(
@@ -4831,6 +4845,13 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
       description = selectedBundle?.name ?? bundleId;
     }
 
+    // 产品名称（可改）：与自动派生名（套餐名）不同才作为 override 传后端；留空/未改 = 不传（详情页自动拼装）。
+    const trimmedProductName = bundleProductName.trim();
+    const bundleNameOverride =
+      productType === 'BUNDLE' && trimmedProductName && trimmedProductName !== (selectedBundle?.name ?? bundleId)
+        ? trimmedProductName
+        : undefined;
+
     const teamPrice =
       productType !== 'BUNDLE' &&
       settlementPriceCny !== null && Number.isFinite(settlementPriceCny) && settlementPriceCny > 0
@@ -4856,6 +4877,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
           }
         : {
             bundleId,
+            ...(bundleNameOverride ? { productNameOverride: bundleNameOverride } : {}),
             ...(bundleDepartDate ? { bundleDepartDate } : {}),
             ...(bundleNights !== null ? { bundleNights } : {}),
             ...(bundleSingleCount !== null ? { bundleSingleCount } : {}),
@@ -5221,6 +5243,20 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                       onChange={setBundleId}
                       placeholder="搜索套餐：编号 / 名称…"
                     />
+                  </label>
+                  <label className="text-xs text-slate-500">
+                    产品名称（可改，选填）
+                    <input
+                      type="text"
+                      className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                      value={bundleProductName}
+                      maxLength={200}
+                      onChange={(e) => { setBundleProductName(e.target.value); setBundleProductNameTouched(true); }}
+                      placeholder="默认用套餐名"
+                    />
+                    <span className="mt-1 block text-[11px] leading-tight text-slate-400">
+                      订单详情「产品名称」按此显示；不改则按套餐组件自动拼装
+                    </span>
                   </label>
                   <label className="text-xs text-slate-500">
                     出发日期（选填）

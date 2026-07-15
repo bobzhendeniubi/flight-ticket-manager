@@ -14,19 +14,20 @@ import ExcelJS from 'exceljs';
 import JSZip from 'jszip';
 import { OrderItemKind, FulfillmentType, type Passenger } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
+import { fetchImageSafely } from '../../lib/safe-fetch.js';
 
 export function sanitize(s: string): string {
   return s.replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 80);
 }
 
 /** YYYY-MM-DD（null → ''），与导出模板同口径，按 UTC 取值避免时区漂移 */
-function fmtDate(d: Date | null | undefined): string {
+export function fmtDate(d: Date | null | undefined): string {
   if (!d) return '';
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
 }
 
 /** 按出发地 IANA 时区把出发时刻转成本地日 YYYY-MM-DD（tz 不识别时回退 UTC） */
-function fmtDepartureLocalDate(departure: Date | null, tz: string | null): string {
+export function fmtDepartureLocalDate(departure: Date | null, tz: string | null): string {
   if (!departure) return '';
   if (!tz) return fmtDate(departure);
   try {
@@ -198,15 +199,12 @@ export function extFromUrl(u: string): string {
   return m ? m[1].toLowerCase().replace('jpeg', 'jpg') : 'jpg';
 }
 
+/**
+ * 护照图抓取。委托给 SSRF 安全实现（data-URL 本地解码；远程仅 https 且拒私网/元数据；
+ * 无重定向；字节封顶）。所有 ZIP 构建共用此出口。
+ */
 export async function fetchPhoto(url: string): Promise<Buffer | null> {
-  try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(10_000) });
-    if (!res.ok) return null;
-    const ab = await res.arrayBuffer();
-    return Buffer.from(ab);
-  } catch {
-    return null;
-  }
+  return fetchImageSafely(url);
 }
 
 export async function buildPassportPhotoZip(args: {

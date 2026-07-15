@@ -267,6 +267,8 @@ export interface BatchCreateOrdersInput {
   bundleBusinessCount?: number;
   /** 套餐出发日期（YYYY-MM-DD）；缺省回落套餐的 defaultDepartDate */
   bundleDepartDate?: string;
+  /** 录单自定义产品名称（可选；写入每张子单 BUNDLE 行，仅后台展示。缺省 = 详情页自动拼装） */
+  productNameOverride?: string;
   adultCount?: number;
   childCount?: number;
   infantCount?: number;
@@ -405,6 +407,8 @@ export type CreateOrderItemInput =
       selfProvidedVisa?: boolean;
       /** 计费间数（0.5 步进；分房半间用）；缺省 = 按人数推算 */
       roomsBilled?: number;
+      /** 录单自定义产品名称（可选快照，仅后台展示。缺省 = 详情页自动拼装） */
+      productNameOverride?: string;
     });
 
 // 签证状态（录单/详情用）；后端 enum → 中文：
@@ -648,6 +652,8 @@ export interface OrderItem {
   visaStayDays?: number | null;
   /** TRANSFER 行（独立提交时）：接送产品名称 */
   transferProductName?: string | null;
+  /** BUNDLE 行：录单自定义产品名称快照（有值时「产品名称」优先展示它；NULL = 自动拼装） */
+  productNameOverride?: string | null;
   /** BUNDLE 行：套餐名 */
   bundleName?: string | null;
   /** BUNDLE 行：服务内容（每行一条，运营在套餐向导里填） */
@@ -3496,12 +3502,20 @@ export const hotelControlOpsApi = {
     return res.blob();
   },
 
-  /** 按姓名批量导出护照 zip：不限酒店/入住日期，直接按乘客姓名列表打包命中客人的护照图；ADMIN/STAFF only。 */
-  downloadHotelPassportsByNamesZip: async (token: string, names: string[]): Promise<Blob> => {
+  /**
+   * 按姓名批量导出护照 zip：不限酒店，按乘客姓名列表打包命中客人的护照图；
+   * 可选 from/to 按出发日期（出发地本地日）过滤，zip 按出发日期分文件夹、按姓名命名文件；
+   * ADMIN/STAFF only。
+   */
+  downloadHotelPassportsByNamesZip: async (
+    token: string,
+    params: { names: string[]; from?: string; to?: string },
+  ): Promise<Blob> => {
     const res = await fetch(`${API_BASE}/hotel-control/passports-by-names.zip`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ names }),
+      // JSON.stringify 会丢弃 undefined 键 → 未填的日期不随请求发送
+      body: JSON.stringify({ names: params.names, from: params.from, to: params.to }),
     });
     if (!res.ok) throw new ApiError(res.status, { code: 'ZIP_FAILED', message: await res.text() });
     return res.blob();

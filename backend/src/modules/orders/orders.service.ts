@@ -85,8 +85,10 @@ const ALLOWED_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
   CANCELLED: [], // 终态
   REFUND_REQUESTED: ['REFUNDED', 'PROCESSING'], // 被拒回退到 PROCESSING
   REFUNDED: [], // 终态
-  CHANGE_REQUESTED: ['CHANGED', 'TICKETED'],
-  CHANGED: ['COMPLETED', 'REFUND_REQUESTED'],
+  // 改签申请可从 PAID/PROCESSING（出票前）发起，故驳回要能退回出票前流程，
+  // 批准（CHANGED）后也要能继续走出票——否则未出票单被迫落"已出票"，或改签后卡死只能 force。
+  CHANGE_REQUESTED: ['CHANGED', 'PAID', 'PROCESSING', 'TICKETED'], // 驳回→PAID/PROCESSING，批准→CHANGED，已出票改签→TICKETED
+  CHANGED: ['PROCESSING', 'TICKETED', 'COMPLETED', 'REFUND_REQUESTED'], // 改签后继续出票流程或直接完结/退款
   FAILED: ['PROCESSING', 'REFUND_REQUESTED', 'CANCELLED'],
 };
 
@@ -330,6 +332,8 @@ export function buildBatchItems(
         // 可选升级 add-on 份数（缺省 0 = 无升级）
         singleCount: body.bundleSingleCount ?? 0,
         businessCount: body.bundleBusinessCount ?? 0,
+        // 录单自定义产品名称（可选快照，写入每张子单的 BUNDLE 行，仅后台展示）。
+        ...(body.productNameOverride ? { productNameOverride: body.productNameOverride } : {}),
         ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
       },
     ];
@@ -577,6 +581,8 @@ export class OrderService {
       body.flightSettlementPriceCny,
       // 套餐乘客级住宿/签证选项：从下单乘客数组派生每人差异定价（优先级见 priceAndValidateItems）。
       body.passengers,
+      // 仅后台/代理录单可用「无产品 id 的自定义价地面行」；对外角色（游客/CUSTOMER）一律走系统产品价。
+      isStaffEnteredOrder(requester),
     );
 
     // ── 前台展示价兜底校验（S1）：下单前比对「前台展示总价」与「服务端权威商品价」──────────────
@@ -716,6 +722,8 @@ export class OrderService {
               bundleId: p.bundleId ?? null,
               // 计费房间数（支持 0.5 间）：套餐/酒店行解析后落库，供房控读取。
               roomsBilled: p.roomsBilled != null ? new Prisma.Decimal(p.roomsBilled) : null,
+              // 录单自定义产品名称（BUNDLE 行可选快照，仅后台展示；NULL = 未自定义）。
+              productNameOverride: p.productNameOverride ?? null,
               metadata: (p.metadata ?? undefined) as Prisma.InputJsonValue | undefined,
             })),
           },
@@ -862,7 +870,8 @@ export class OrderService {
     }>;
   }> {
     // 试算带上乘客级住宿/签证选项（缺省则回落 item 级旧口径），使系统价随每人选择实时变化。
-    const priced = await this.priceAndValidateItems(body.items, undefined, body.passengers);
+    // quote 仅 ADMIN/STAFF 路由可达，允许自由行手录价试算。
+    const priced = await this.priceAndValidateItems(body.items, undefined, body.passengers, true);
     const items = priced.map((p) => ({
       kind: p.kind,
       description: p.description,
@@ -1001,6 +1010,10 @@ export class OrderService {
     items: OrderItemInput[],
     flightSettlementPriceCny?: number,
     passengers?: ReadonlyArray<{ visaExempt?: boolean; singleRoom?: boolean }>,
+    // 是否允许「无产品 id 的地面行按前端传入价格成交」。仅后台/代理录单（自由行手录）为 true；
+    // 对外角色（游客 / CUSTOMER）为 false —— 否则公开 POST /orders 可提交 1 元酒店行，
+    // 且 expectedTotalCny 兜底以这个被信任的价为基准，形同虚设。
+    allowClientPricedGround = false,
   ) {
     const priced: Array<{
       kind: OrderItemKind;
@@ -1021,6 +1034,8 @@ export class OrderService {
       bundleId?: string;
       // 解析后的计费房间数（支持 0.5 间）。落到 OrderItem.roomsBilled 供房控读取。
       roomsBilled?: number;
+      // 录单自定义产品名称（BUNDLE 行，仅后台展示的订单行级快照；缺省 = 前端自动拼装）。
+      productNameOverride?: string;
       metadata?: Record<string, unknown>;
     }> = [];
 
@@ -1095,6 +1110,9 @@ export class OrderService {
           // A3：拒绝偏离服务端权威价超容差的提交（仅有产品 id 时校验，无 id 走信任旧路径）。
           // 0.5 间：金额随 roomsBilled 缩放，容差按同一房间数口径比较，避免误判价格变动。
           assertAmountWithinTolerance('酒店', item.unitPrice, unitPrice, item.quantity * rooms);
+        } else if (!allowClientPricedGround) {
+          // 无产品 id = 按前端传入价成交。仅后台/代理手录自由行允许；对外角色一律拒。
+          throw new BadRequestError('酒店行必须选择系统内的酒店房型，不能自定义价格');
         }
         priced.push({
           kind: 'HOTEL',
@@ -1120,6 +1138,8 @@ export class OrderService {
           if (!t.isActive) throw new BadRequestError('接送产品已下架');
           unitPrice = Number(t.basePrice);
           assertAmountWithinTolerance('接送', item.unitPrice, unitPrice, item.quantity);
+        } else if (!allowClientPricedGround) {
+          throw new BadRequestError('接送行必须选择系统内的接送产品，不能自定义价格');
         }
         priced.push({
           kind: 'TRANSFER',
@@ -1145,6 +1165,8 @@ export class OrderService {
             ? baseUnitPrice + Number(v.expressSurcharge)
             : baseUnitPrice;
           assertAmountWithinTolerance('签证', item.unitPrice, unitPrice, item.quantity);
+        } else if (!allowClientPricedGround) {
+          throw new BadRequestError('签证行必须选择系统内的签证产品，不能自定义价格');
         }
         priced.push({
           kind: 'VISA',
@@ -1340,6 +1362,8 @@ export class OrderService {
           hotelCheckOut: hotelStamp?.hotelCheckOut,
           // 解析后的计费房间数（支持 0.5 间）落到 OrderItem.roomsBilled，供房控读取。
           roomsBilled: rooms,
+          // 录单自定义产品名称（可选快照，仅后台展示；缺省 undefined → 落库 NULL，前端自动拼装）。
+          productNameOverride: item.productNameOverride,
           // 把升级选择 + 重算明细 + roomsNeeded + 操作费落到订单行 metadata，供运营/财务查看
           //（admin 内部仍可叫"单房差/升舱"；roomsNeeded 解释酒店部分为何按房价 ×rooms 收费）。
           // 操作费始终收（默认 ¥20），故只要 total>0 就记一份 operationFee 明细（perPaxCny/pax/totalCny）。
@@ -2459,7 +2483,8 @@ export class OrderService {
     let manualPriceAdjustment: PriceAdjustmentInput | undefined;
     // 套餐航段解析失败时跳过系统权威价试算（batchItems 只含地面行、且整批将逐单失败，试算无意义）。
     if (body.manualUnitPriceCny !== undefined && !bundleLegResolutionError) {
-      const priced = await this.priceAndValidateItems(batchItems);
+      // 批量录单为 ADMIN/STAFF 专用路径，允许自由行手录价地面行。
+      const priced = await this.priceAndValidateItems(batchItems, undefined, undefined, true);
       const systemTotal = priced.reduce((sum, p) => sum + p.amount, 0);
       const diff = Math.round(body.manualUnitPriceCny - systemTotal);
       if (diff !== 0) {
@@ -5951,6 +5976,8 @@ function itineraryFieldsForItem(
     // ── TRANSFER 行（独立提交时）──
     transferProductName: transfer?.name ?? null,
     // ── BUNDLE 行 ──
+    // 录单自定义产品名称（订单行级快照）：有值时前端「产品名称」优先展示它；NULL/未联查 → 自动拼装。
+    productNameOverride: (i.productNameOverride as string | null | undefined) ?? null,
     bundleName: bundle?.name ?? null,
     serviceNotes: bundle?.serviceNotes ?? null,
     // 套餐组件构成（该套餐 items 里实际有哪些类型）——「产品名称」自动拼装用

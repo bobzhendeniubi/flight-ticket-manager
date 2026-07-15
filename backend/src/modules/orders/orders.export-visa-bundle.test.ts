@@ -323,17 +323,14 @@ describe('buildVisaPassportsZip — 仅护照图 zip（不含 xlsx 名单）', (
   it('zip 不含 xlsx；护照图文件名带订单号+姓名前缀；无图乘客缺文件', async () => {
     const orders = [
       makeOrder('FTM2026071000001', [
-        pax({ id: 'a1', lastName: 'WANG', firstName: 'LIANBO', passportPhotoUrl: 'https://x.test/wang.jpg' }),
+        // data URI 本地解码、不出网——护照图抓取已收口到 safe-fetch（真实 DNS 解析），
+        // mock 全局 fetch 拦不住，测试一律用 data URI。
+        pax({ id: 'a1', lastName: 'WANG', firstName: 'LIANBO', passportPhotoUrl: 'data:image/jpeg;base64,AQIDBA==' }),
         pax({ id: 'a2', lastName: 'LI', firstName: 'SI', passportPhotoUrl: null }),
       ]),
     ];
     const findMany = vi.fn().mockResolvedValue(orders);
     const client = { order: { findMany } } as unknown as Parameters<typeof buildVisaPassportsZip>[1];
-
-    // 有图乘客触发 fetch —— 返回一小段图字节
-    const fetchSpy = vi
-      .spyOn(globalThis, 'fetch')
-      .mockResolvedValue(new Response(new Uint8Array([1, 2, 3, 4]), { status: 200 }));
 
     const zipBuf = await buildVisaPassportsZip(['id_FTM2026071000001'], client);
     const zip = await JSZip.loadAsync(zipBuf);
@@ -353,8 +350,6 @@ describe('buildVisaPassportsZip — 仅护照图 zip（不含 xlsx 名单）', (
     const readme = await zip.file('README.txt')!.async('string');
     expect(readme).toContain('护照图成功：1');
     expect(readme).toContain('护照图缺失/失败：1');
-
-    fetchSpy.mockRestore();
   });
 
   it('被勾选但状态不合格的单跳过、不打包护照图，并在 README 点名（连同查不到的 id）', async () => {

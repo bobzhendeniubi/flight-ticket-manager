@@ -636,21 +636,30 @@ function BoardExport({ token, board }: { token: string; board: HotelControlBoard
 
   const passportRangeInvalid = passportFrom > passportTo;
 
-  // ── 导出护照（按姓名，不限酒店/日期）──
+  // ── 导出护照（按姓名，不限酒店；可选按出发日期过滤）──
   const [namesInput, setNamesInput] = useState<string>('');
   const [namesExporting, setNamesExporting] = useState(false);
+  const [namesDepFrom, setNamesDepFrom] = useState<string>(''); // 出发起（留空=不限）
+  const [namesDepTo, setNamesDepTo] = useState<string>(''); // 出发止（留空=不限）
   const parsedNames = useMemo(() => parseNamesInput(namesInput), [namesInput]);
   const namesTooMany = parsedNames.length > 100;
+  const namesDepRangeInvalid = namesDepFrom !== '' && namesDepTo !== '' && namesDepFrom > namesDepTo;
 
   async function handlePassportByNamesExport(): Promise<void> {
-    if (!token || parsedNames.length === 0 || namesTooMany) return;
+    if (!token || parsedNames.length === 0 || namesTooMany || namesDepRangeInvalid) return;
     setNamesExporting(true);
     try {
-      const blob = await hotelControlOpsApi.downloadHotelPassportsByNamesZip(token, parsedNames);
+      const blob = await hotelControlOpsApi.downloadHotelPassportsByNamesZip(token, {
+        names: parsedNames,
+        from: namesDepFrom || undefined,
+        to: namesDepTo || undefined,
+      });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `护照-按姓名-${parsedNames.length}人.zip`;
+      const rangePart =
+        namesDepFrom || namesDepTo ? `-出发${namesDepFrom || '不限'}至${namesDepTo || '不限'}` : '';
+      a.download = `护照-按姓名-${parsedNames.length}人${rangePart}.zip`;
       document.body.appendChild(a);
       a.click();
       a.remove();
@@ -756,13 +765,13 @@ function BoardExport({ token, board }: { token: string; board: HotelControlBoard
         )}
       </div>
 
-      {/* 导出护照：按姓名批量导出（不限酒店/入住日期，直接按乘客姓名命中） */}
+      {/* 导出护照：按姓名批量导出（不限酒店；可选按出发日期过滤，zip 按出发日期分文件夹） */}
       <div className="border-t border-slate-200 pt-4">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-[280px] flex-1">
             <h2 className="text-sm font-semibold text-ink">导出护照（按姓名）</h2>
             <p className="mt-1 text-xs text-ink-muted">
-              不限酒店/入住日期，直接按姓名列表打包命中客人的护照图（护照姓名不分大小写，或中文姓名精确匹配）；逗号/顿号/空格/换行分隔均可，一次最多 100 个姓名。
+              不限酒店；可选按出发日期过滤（留空=不限），zip 按出发日期分文件夹、按姓名命名文件。姓名匹配：护照姓名不分大小写，或中文姓名精确匹配；逗号/顿号/空格/换行分隔均可，一次最多 100 个姓名。
             </p>
             <textarea
               className="input mt-2 w-full"
@@ -775,15 +784,36 @@ function BoardExport({ token, board }: { token: string; board: HotelControlBoard
               已识别 {parsedNames.length} 个姓名{namesTooMany && '（超过单次上限 100 个，请分批导出）'}
             </div>
           </div>
-          <button
-            type="button"
-            onClick={() => void handlePassportByNamesExport()}
-            disabled={namesExporting || parsedNames.length === 0 || namesTooMany}
-            className="btn-primary"
-          >
-            {namesExporting ? '导出中…' : '导出护照(按姓名)'}
-          </button>
+          <div className="flex items-end gap-2">
+            <div>
+              <label className="label">出发起</label>
+              <input
+                type="date"
+                className="input"
+                value={namesDepFrom}
+                onChange={(e) => setNamesDepFrom(e.target.value)}
+              />
+            </div>
+            <div>
+              <label className="label">出发止</label>
+              <input
+                type="date"
+                className="input"
+                value={namesDepTo}
+                onChange={(e) => setNamesDepTo(e.target.value)}
+              />
+            </div>
+            <button
+              type="button"
+              onClick={() => void handlePassportByNamesExport()}
+              disabled={namesExporting || parsedNames.length === 0 || namesTooMany || namesDepRangeInvalid}
+              className="btn-primary"
+            >
+              {namesExporting ? '导出中…' : '导出护照(按姓名)'}
+            </button>
+          </div>
         </div>
+        {namesDepRangeInvalid && <div className="mt-2 text-xs text-amber-700">出发起不能晚于出发止</div>}
       </div>
     </section>
   );

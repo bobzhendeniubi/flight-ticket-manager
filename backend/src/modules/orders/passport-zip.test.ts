@@ -144,14 +144,12 @@ describe('buildPassportPhotoZip — 送签表排除自备签乘客（P1-13）', 
         fullName: 'ZHANG SAN',
         chineseName: '张三',
         visaExempt: true,
-        passportPhotoUrl: 'https://x.test/zhang.jpg',
+        // data URI 本地解码、不出网——护照图抓取已收口到 safe-fetch（真实 DNS 解析），
+        // mock 全局 fetch 拦不住，测试一律用 data URI。
+        passportPhotoUrl: 'data:image/jpeg;base64,AQIDBA==',
       }),
       makePassenger({ id: 'p2', fullName: 'LI SI', chineseName: '李四', visaExempt: false }),
     ];
-
-    const fetchSpy = vi
-      .spyOn(globalThis, 'fetch')
-      .mockResolvedValue(new Response(new Uint8Array([1, 2, 3, 4]), { status: 200 }));
 
     const zipBuf = await buildPassportPhotoZip({ orderNumber, passengers });
 
@@ -164,8 +162,6 @@ describe('buildPassportPhotoZip — 送签表排除自备签乘客（P1-13）', 
     const zip = await JSZip.loadAsync(zipBuf);
     const names = Object.keys(zip.files);
     expect(names.some((n) => n.includes('ZHANG'))).toBe(true);
-
-    fetchSpy.mockRestore();
   });
 });
 

@@ -46,13 +46,18 @@ export const hotelPassportsQuerySchema = z
   .refine((q) => q.from <= q.to, { message: '起始日不能晚于结束日' });
 export type HotelPassportsQuery = z.infer<typeof hotelPassportsQuerySchema>;
 
-// ── 按姓名批量导出护照 zip（不限酒店/日期，直接按姓名命中乘客）───────────
-export const hotelPassportsByNamesBodySchema = z.object({
-  names: z
-    .array(z.string().trim().min(1).max(60))
-    .min(1, '请至少输入一个姓名')
-    .max(100, '单次最多按 100 个姓名导出，请分批操作'),
-});
+// ── 按姓名批量导出护照 zip（不限酒店，按姓名命中乘客；可选按出发日期过滤）──
+export const hotelPassportsByNamesBodySchema = z
+  .object({
+    names: z
+      .array(z.string().trim().min(1).max(60))
+      .min(1, '请至少输入一个姓名')
+      .max(100, '单次最多按 100 个姓名导出，请分批操作'),
+    // 可选出发日期区间（出发地本地日，含两端；可只传一端）
+    from: dateStr.optional(),
+    to: dateStr.optional(),
+  })
+  .refine((b) => !b.from || !b.to || b.from <= b.to, { message: '出发起不能晚于出发止' });
 export type HotelPassportsByNamesBody = z.infer<typeof hotelPassportsByNamesBodySchema>;
 
 // ── 提醒线（超卖加房 / 富余退房 / 班次超开票上限）─────────────────────────

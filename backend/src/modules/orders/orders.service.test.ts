@@ -2880,8 +2880,31 @@ describe('priceAndValidateItems · 酒店重算价来源 + 下架拦截', () => 
     expect(mockPrisma.hotelRoomType.findUnique).toHaveBeenCalled();
   });
 
-  it('HOTEL 行无房型（未绑）→ 信任前端 unitPrice（JSON fallback 路径，不查库）', async () => {
-    const priced = await price([
+  it('HOTEL 行无房型（未绑）+ 对外角色 → 拒绝自定义价（防公开下单提交 1 元酒店行）', async () => {
+    await expect(
+      price([
+        {
+          kind: 'HOTEL',
+          description: '自由行酒店',
+          quantity: 3,
+          unitPrice: 900,
+          // 无 hotelRoomTypeId，且未开 allowClientPricedGround（对外角色缺省）
+        } as OrderItemInput,
+      ]),
+    ).rejects.toThrow('酒店行必须选择系统内的酒店房型');
+  });
+
+  it('HOTEL 行无房型（未绑）+ 后台/代理手录（allowClientPricedGround）→ 信任前端 unitPrice，不查库', async () => {
+    const priceTrusted = (items: OrderItemInput[]) =>
+      (service as unknown as {
+        priceAndValidateItems(
+          i: OrderItemInput[],
+          s?: number,
+          p?: unknown,
+          allow?: boolean,
+        ): ReturnType<typeof price>;
+      }).priceAndValidateItems(items, undefined, undefined, true);
+    const priced = await priceTrusted([
       {
         kind: 'HOTEL',
         description: '自由行酒店',

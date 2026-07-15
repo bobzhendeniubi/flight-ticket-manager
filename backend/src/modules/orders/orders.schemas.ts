@@ -267,6 +267,9 @@ export const bundleItemSchema = baseItemSchema.extend({
   kind: z.literal('BUNDLE'),
   bundleId: z.string().min(1),
   unitPrice: z.number().nonnegative(),
+  // 录单自定义产品名称（可选，订单行级快照，仅后台展示）：缺省 = 前端按套餐组件自动拼装。
+  // 与 description 分离——description 会被换酒店/补房差等流程自动重写，此字段一经写入不再变动。
+  productNameOverride: z.string().trim().min(1).max(200).optional(),
   // 可选升级 add-on（server-priced，整数份数；缺省 0 = 无升级，价格与旧版完全一致）：
   //   singleCount   = 选「一个人住酒店（单人入住）」的人数 → 每人每晚加 singleSupplementCnyPerNight
   //   businessCount = 选「升舱商务」的人数 → 每人每航段加 businessUpgradeCnyPerLeg（占用真实商务舱库存）
@@ -568,6 +571,8 @@ export const batchCreateOrdersBodySchema = z
     bundleNights: z.number().int().min(1).max(30).optional(),
     bundleSingleCount: z.number().int().min(0).max(20).optional(),
     bundleBusinessCount: z.number().int().min(0).max(20).optional(),
+    // 录单自定义产品名称（可选，写入每张子单 BUNDLE 行的 productNameOverride，仅后台展示）。
+    productNameOverride: z.string().trim().min(1).max(200).optional(),
 
     // ── 公共字段 ────────────────────────────────────────────────────────────────
     description: z.string().min(1).max(200), // 航段/套餐描述（每张子单写入 item.description）

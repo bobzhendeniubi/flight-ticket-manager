@@ -184,11 +184,11 @@ export function RoomingEditor({
 
   const poolPassengers = passengers.filter((p) => !assignedIds.has(p.id));
 
-  // 占用总间数（半间累加）
-  const totalRooms = useMemo(
-    () => boxes.filter((b) => b.passengerIds.length > 0).reduce((sum, b) => sum + b.roomFraction, 0),
-    [boxes],
-  );
+  // 占用间数：物理间数 = 非空房间盒子数（与销控矩阵物理口径一致）；
+  // 床位口径 = Σ roomFraction（半间累加，计费用）——不再拿床位数单独当间数展示。
+  const occupiedBoxes = useMemo(() => boxes.filter((b) => b.passengerIds.length > 0), [boxes]);
+  const physicalRooms = occupiedBoxes.length;
+  const totalBeds = occupiedBoxes.reduce((sum, b) => sum + b.roomFraction, 0);
 
   // ── 移动出行人（统一入口：从任意来源移到目标盒子，或回池 target=null）──
   function movePassenger(passengerId: string, targetBoxId: string | null): void {
@@ -303,7 +303,8 @@ export function RoomingEditor({
           </p>
         </div>
         <div className="text-xs text-ink-soft">
-          占用 <b className="text-ink">{totalRooms}</b> 间 · 共 {passengers.length} 人
+          占用 <b className="text-ink">{physicalRooms}</b> 间
+          {totalBeds !== physicalRooms ? ` · 床位 ${totalBeds}` : ''} · 共 {passengers.length} 人
         </div>
       </div>
 
