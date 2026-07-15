@@ -6396,8 +6396,9 @@ async function resolveBundleFulfillmentTypes(
  *   旧的 `fulfillmentTasks.length > 0` 单值守卫会漏建剩余类型，故改为按类型去重）。
  */
 async function createFulfillmentTasks(tx: Prisma.TransactionClient, orderId: string): Promise<string[]> {
-  // 订单级签证状态：visaStatus='NEEDED' 的订单即便没有 VISA 行/套餐签证组件，
-  // 也要进签证台（让签证岗看见）。NOT_NEEDED/HAS_VISA/E_VISA 不开任务。
+  // 订单级签证状态：visaStatus=NEEDED / E_VISA（电子签·三个月多次，同样需要送签办理）
+  // 的订单即便没有 VISA 行/套餐签证组件，也要进签证台（让签证岗看见并按类型筛选）。
+  // NOT_NEEDED/HAS_VISA 不开任务。
   const order = await tx.order.findUnique({
     where: { id: orderId },
     select: { visaStatus: true },
@@ -6452,10 +6453,15 @@ async function createFulfillmentTasks(tx: Prisma.TransactionClient, orderId: str
     }
   }
 
-  // 订单级「需要签证」：visaStatus='NEEDED' 且本单全程没有任何签证任务（VISA 行 / 套餐签证组件
-  // 都没产生）→ 补一条 VISA_APPLICATION，挂到首个订单项（FulfillmentTask 仅有 orderItemId 外键，
-  // 无 Order 直挂）。已有签证任务则跳过，保证重跑 PAID 不重复建（幂等）。
-  if (order?.visaStatus === 'NEEDED' && !hasVisaTask && items.length > 0) {
+  // 订单级「需要签证」：visaStatus=NEEDED / E_VISA 且本单全程没有任何签证任务（VISA 行 /
+  // 套餐签证组件都没产生）→ 补一条 VISA_APPLICATION，挂到首个订单项（FulfillmentTask 仅有
+  // orderItemId 外键，无 Order 直挂）。已有签证任务则跳过，保证重跑 PAID 不重复建（幂等）。
+  if (
+    (order?.visaStatus === VisaRequirement.NEEDED ||
+      order?.visaStatus === VisaRequirement.E_VISA) &&
+    !hasVisaTask &&
+    items.length > 0
+  ) {
     const task = await tx.fulfillmentTask.create({
       data: {
         orderItemId: items[0].id,
@@ -6476,7 +6482,7 @@ async function createFulfillmentTasks(tx: Prisma.TransactionClient, orderId: str
  * 这里只在下单时**提前补签证那一项**，其余岗位任务仍留到 PAID。
  *
  * 「需要签证」判定（任一成立，与 PAID 路径一致）：
- *   - 订单级 visaStatus = NEEDED
+ *   - 订单级 visaStatus = NEEDED / E_VISA
  *   - 含 VISA 订单项
  *   - 含 BUNDLE 订单项，且该套餐组件含 VISA
  *
@@ -6525,9 +6531,13 @@ async function createVisaTaskAtCreation(
     }
   }
   // 订单级「需要签证」兜底：挂到首个订单项。判定与 PAID 路径（createFulfillmentTasks）
-  // 完全一致——仅 visaStatus='NEEDED'（E_VISA/电子签按既有口径不开签证台任务），
+  // 完全一致——visaStatus=NEEDED / E_VISA（电子签·三个月多次同样需送签，签证台按类型可筛），
   // 保证两条路径触发条件相同、重跑 PAID 幂等、不产生不对称的兜底缺口。
-  if (!anchorItemId && order?.visaStatus === VisaRequirement.NEEDED) {
+  if (
+    !anchorItemId &&
+    (order?.visaStatus === VisaRequirement.NEEDED ||
+      order?.visaStatus === VisaRequirement.E_VISA)
+  ) {
     anchorItemId = items[0].id;
   }
   if (!anchorItemId) return [];

@@ -10,10 +10,15 @@ import { describe, it, expect, vi } from 'vitest';
 // fulfillment.service 顶层引用 prisma —— 先 mock 掉（本测试只 spy update，不碰 DB）
 vi.mock('../../db/prisma.js', () => ({ prisma: {} }));
 
-import { FulfillmentStatus } from '@prisma/client';
+import {
+  FulfillmentStatus,
+  VisaEntryType,
+  VisaIssuanceMethod,
+  VisaRequirement,
+} from '@prisma/client';
 import { NotFoundError } from '../../lib/errors.js';
 import { prisma } from '../../db/prisma.js';
-import { FulfillmentService } from './fulfillment.service.js';
+import { FulfillmentService, effectiveVisaClassification } from './fulfillment.service.js';
 
 describe('FulfillmentService.batchUpdateStatus', () => {
   it('逐条复用单任务 update()（同参数透传），全部成功', async () => {
@@ -260,5 +265,107 @@ describe('FulfillmentService.listPassengerPhotos', () => {
       { id: 'p1', passportPhotoUrl: 'data:image/jpeg;base64,AAA' },
       { id: 'p2', passportPhotoUrl: null },
     ]);
+  });
+});
+
+describe('effectiveVisaClassification — 签证分类：产品结构化字段优先，缺失回退录单签证状态', () => {
+  it('产品字段齐全 → 原样返回（订单级状态不覆盖产品）', () => {
+    expect(
+      effectiveVisaClassification(
+        { issuanceMethod: VisaIssuanceMethod.STICKER, entryType: VisaEntryType.SINGLE },
+        VisaRequirement.E_VISA,
+      ),
+    ).toEqual({ issuanceMethod: 'STICKER', entryType: 'SINGLE' });
+  });
+
+  it('无产品 + 录单签证状态=E_VISA（电子签·三个月多次）→ 电子签 + 多次', () => {
+    expect(effectiveVisaClassification(null, VisaRequirement.E_VISA)).toEqual({
+      issuanceMethod: 'E_VISA',
+      entryType: 'MULTIPLE',
+    });
+  });
+
+  it('产品字段部分缺失 → 只补缺失的那一项', () => {
+    expect(
+      effectiveVisaClassification(
+        { issuanceMethod: VisaIssuanceMethod.E_VISA, entryType: null },
+        VisaRequirement.E_VISA,
+      ),
+    ).toEqual({ issuanceMethod: 'E_VISA', entryType: 'MULTIPLE' });
+  });
+
+  it('无产品 + 录单签证状态=NEEDED/HAS_VISA/NOT_NEEDED/null → 未标注（null/null）', () => {
+    for (const status of [
+      VisaRequirement.NEEDED,
+      VisaRequirement.HAS_VISA,
+      VisaRequirement.NOT_NEEDED,
+      null,
+    ]) {
+      expect(effectiveVisaClassification(null, status)).toEqual({
+        issuanceMethod: null,
+        entryType: null,
+      });
+    }
+  });
+});
+
+describe('FulfillmentService.list — 签证类型回退录单签证状态（签证台筛选口径打通）', () => {
+  it('无签证产品的 E_VISA 录单单 → 任务下发 visaIssuanceMethod=E_VISA / visaEntryType=MULTIPLE', async () => {
+    const now = new Date('2026-07-15T00:00:00Z');
+    const row = {
+      id: 'task-1',
+      orderItemId: 'itm-1',
+      type: 'VISA_APPLICATION',
+      status: 'PENDING',
+      data: null,
+      notes: null,
+      attempts: 0,
+      scheduledAt: null,
+      startedAt: null,
+      completedAt: null,
+      failureReason: null,
+      assigneeUserId: null,
+      createdAt: now,
+      updatedAt: now,
+      orderItem: {
+        id: 'itm-1',
+        kind: 'FLIGHT',
+        description: '机票行',
+        quantity: 1,
+        orderId: 'ord-1',
+        visa: null, // 录单单子无签证产品 item
+        order: {
+          id: 'ord-1',
+          orderNumber: 'FTM-TEST-1',
+          contactName: '联系人',
+          contactPhone: '100',
+          status: 'PAID',
+          notes: null,
+          visaStatus: 'E_VISA', // 录单签证状态：电子签(三个月多次)
+        },
+      },
+    };
+    const taskFindMany = vi.fn().mockResolvedValue([row]);
+    const taskCount = vi.fn().mockResolvedValue(1);
+    const queryRaw = vi.fn().mockResolvedValue([]); // 乘客批量查询（本用例无乘客）
+    const orderItemFindMany = vi.fn().mockResolvedValue([]); // 机票段批量查询
+    const p = prisma as unknown as {
+      fulfillmentTask: { findMany: typeof taskFindMany; count: typeof taskCount };
+      orderItem: { findMany: typeof orderItemFindMany };
+      $queryRaw: typeof queryRaw;
+      $transaction: (ops: unknown[]) => Promise<unknown[]>;
+    };
+    p.fulfillmentTask = { findMany: taskFindMany, count: taskCount };
+    p.orderItem = { findMany: orderItemFindMany };
+    p.$queryRaw = queryRaw;
+    p.$transaction = async (ops: unknown[]) => Promise.all(ops as Promise<unknown>[]);
+
+    const service = new FulfillmentService();
+    const res = await service.list({ page: 1, pageSize: 50 });
+
+    expect(res.tasks).toHaveLength(1);
+    const task = res.tasks[0] as { visaIssuanceMethod: string | null; visaEntryType: string | null };
+    expect(task.visaIssuanceMethod).toBe('E_VISA');
+    expect(task.visaEntryType).toBe('MULTIPLE');
   });
 });

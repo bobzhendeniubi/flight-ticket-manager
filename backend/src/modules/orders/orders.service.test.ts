@@ -1814,8 +1814,21 @@ describe('createFulfillmentTasks · 套餐 fan-out 到地面岗', () => {
     expect(ids).toHaveLength(0);
   });
 
-  it('visaStatus=NOT_NEEDED/HAS_VISA/E_VISA → 不补订单级签证任务', async () => {
-    for (const visaStatus of ['NOT_NEEDED', 'HAS_VISA', 'E_VISA']) {
+  it('visaStatus=E_VISA（电子签·三个月多次，需送签）→ 同 NEEDED 补一条 VISA_APPLICATION', async () => {
+    const { tx, created } = makeTx({
+      items: [{ id: 'itm_flight', kind: 'FLIGHT' }],
+      visaStatus: 'E_VISA',
+    });
+    await run(tx);
+    expect(created).toContainEqual({
+      orderItemId: 'itm_flight',
+      type: 'VISA_APPLICATION',
+      status: 'PENDING',
+    });
+  });
+
+  it('visaStatus=NOT_NEEDED/HAS_VISA → 不补订单级签证任务', async () => {
+    for (const visaStatus of ['NOT_NEEDED', 'HAS_VISA']) {
       const { tx, created } = makeTx({
         items: [{ id: 'itm_flight', kind: 'FLIGHT' }],
         visaStatus,
