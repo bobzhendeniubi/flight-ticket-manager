@@ -85,29 +85,6 @@ describe('buildBatchItems · BUNDLE 航段注入', () => {
     expect(items.map((i) => i.kind)).toEqual(['BUNDLE']);
   });
 
-  it('录单自定义产品名称：body.productNameOverride 写入 BUNDLE 行；缺省则不带该字段', () => {
-    const named = buildBatchItems(
-      baseBundleBody({ productNameOverride: '海岛往返机票+酒店+接送机服务' } as Partial<BatchCreateOrdersBody>),
-      'BUNDLE',
-      undefined,
-      { goDate: '2026-09-15' },
-      [{ scheduleId: 'sch-go', label: '去程' }],
-    );
-    const namedBundleRow = named.find(
-      (i): i is Extract<(typeof named)[number], { kind: 'BUNDLE' }> => i.kind === 'BUNDLE',
-    )!;
-    expect(namedBundleRow.productNameOverride).toBe('海岛往返机票+酒店+接送机服务');
-    // 机票腿不带自定义名（仅地面 BUNDLE 行承载快照）
-    expect(named.find((i) => i.kind === 'FLIGHT')).not.toHaveProperty('productNameOverride');
-
-    const plain = buildBatchItems(body, 'BUNDLE', undefined, { goDate: '2026-09-15' }, [
-      { scheduleId: 'sch-go', label: '去程' },
-    ]);
-    const plainBundleRow = plain.find(
-      (i): i is Extract<(typeof plain)[number], { kind: 'BUNDLE' }> => i.kind === 'BUNDLE',
-    )!;
-    expect(plainBundleRow).not.toHaveProperty('productNameOverride');
-  });
 });
 
 // ── (2) addDaysToYmd 纯函数 ────────────────────────────────────────────────

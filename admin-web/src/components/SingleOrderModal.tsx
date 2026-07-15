@@ -404,9 +404,6 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   // ── 套餐 ──
   const [bundles, setBundles] = useState<Bundle[]>([]);
   const [bundleId, setBundleId] = useState('');
-  // 产品名称（可改）：默认回填所选套餐名；运营改过（与套餐名不同）才作为 productNameOverride 传后端。
-  const [bundleProductName, setBundleProductName] = useState('');
-  const [bundleProductNameTouched, setBundleProductNameTouched] = useState(false);
   const [departDate, setDepartDate] = useState('');
   const [adultCount, setAdultCount] = useState<number | null>(1);
   const [childCount, setChildCount] = useState<number | null>(0);
@@ -556,11 +553,6 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const visa = visas.find((v) => v.id === visaId);
   const bundle = bundles.find((b) => b.id === bundleId);
 
-  // 换套餐时把「产品名称（可改）」回填为新套餐名（运营尚未手改过才同步，避免覆盖手输内容）。
-  useEffect(() => {
-    if (!bundleProductNameTouched) setBundleProductName(bundle?.name ?? '');
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [bundleId, bundle?.name]);
   const transfer = transfers.find((t) => t.id === transferId);
 
   // 套餐 SearchSelect 选项：label 有编号时带 `[code] name`，方便按编号搜；
@@ -1099,10 +1091,6 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
         businesses > 0 ? `商务×${businesses}` : null,
         visaExempts > 0 ? `自备签×${visaExempts}` : null,
       ].filter(Boolean).join(' · ');
-      // 产品名称（可改）：与默认回填的套餐名不同才作为 override 传后端；留空/未改 = 不传（详情页自动拼装）。
-      const trimmedProductName = bundleProductName.trim();
-      const productNameOverride =
-        trimmedProductName && trimmedProductName !== (bundle?.name ?? '') ? trimmedProductName : undefined;
       // 单住 / 自备签不再落 item 级聚合字段（singleCount/selfProvidedVisa）——
       // 后端从 passengers 数组的 singleRoom/visaExempt 逐位派生权威定价（购物车模式）。
       const bundleLine = {
@@ -1115,7 +1103,6 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
         childCount: children,
         infantCount: infants,
         businessCount: businesses,
-        ...(productNameOverride ? { productNameOverride } : {}),
         metadata,
       };
       // 机票航段在前 + 地面套餐行在后：与前台商城同结构，服务端按航段扣座、套餐行只算地面。
@@ -1723,18 +1710,6 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                       onChange={setBundleId}
                       placeholder="搜索套餐（编号 / 名称）…"
                     />
-                  </label>
-                  <label className="text-xs text-slate-500 md:col-span-2">
-                    产品名称（可改，选填）
-                    <input
-                      type="text"
-                      className={inputCls}
-                      value={bundleProductName}
-                      maxLength={200}
-                      onChange={(e) => { setBundleProductName(e.target.value); setBundleProductNameTouched(true); }}
-                      placeholder="默认用套餐名"
-                    />
-                    <span className="mt-0.5 block text-[11px] text-slate-400">订单详情「产品名称」按此显示；不改则按套餐组件自动拼装</span>
                   </label>
                   <label className="text-xs text-slate-500">
                     出发日期

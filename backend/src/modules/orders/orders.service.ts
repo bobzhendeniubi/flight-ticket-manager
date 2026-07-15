@@ -332,8 +332,6 @@ export function buildBatchItems(
         // 可选升级 add-on 份数（缺省 0 = 无升级）
         singleCount: body.bundleSingleCount ?? 0,
         businessCount: body.bundleBusinessCount ?? 0,
-        // 录单自定义产品名称（可选快照，写入每张子单的 BUNDLE 行，仅后台展示）。
-        ...(body.productNameOverride ? { productNameOverride: body.productNameOverride } : {}),
         ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
       },
     ];
@@ -722,8 +720,6 @@ export class OrderService {
               bundleId: p.bundleId ?? null,
               // 计费房间数（支持 0.5 间）：套餐/酒店行解析后落库，供房控读取。
               roomsBilled: p.roomsBilled != null ? new Prisma.Decimal(p.roomsBilled) : null,
-              // 录单自定义产品名称（BUNDLE 行可选快照，仅后台展示；NULL = 未自定义）。
-              productNameOverride: p.productNameOverride ?? null,
               metadata: (p.metadata ?? undefined) as Prisma.InputJsonValue | undefined,
             })),
           },
@@ -1034,8 +1030,6 @@ export class OrderService {
       bundleId?: string;
       // 解析后的计费房间数（支持 0.5 间）。落到 OrderItem.roomsBilled 供房控读取。
       roomsBilled?: number;
-      // 录单自定义产品名称（BUNDLE 行，仅后台展示的订单行级快照；缺省 = 前端自动拼装）。
-      productNameOverride?: string;
       metadata?: Record<string, unknown>;
     }> = [];
 
@@ -1362,8 +1356,6 @@ export class OrderService {
           hotelCheckOut: hotelStamp?.hotelCheckOut,
           // 解析后的计费房间数（支持 0.5 间）落到 OrderItem.roomsBilled，供房控读取。
           roomsBilled: rooms,
-          // 录单自定义产品名称（可选快照，仅后台展示；缺省 undefined → 落库 NULL，前端自动拼装）。
-          productNameOverride: item.productNameOverride,
           // 把升级选择 + 重算明细 + roomsNeeded + 操作费落到订单行 metadata，供运营/财务查看
           //（admin 内部仍可叫"单房差/升舱"；roomsNeeded 解释酒店部分为何按房价 ×rooms 收费）。
           // 操作费始终收（默认 ¥20），故只要 total>0 就记一份 operationFee 明细（perPaxCny/pax/totalCny）。
@@ -5976,8 +5968,6 @@ function itineraryFieldsForItem(
     // ── TRANSFER 行（独立提交时）──
     transferProductName: transfer?.name ?? null,
     // ── BUNDLE 行 ──
-    // 录单自定义产品名称（订单行级快照）：有值时前端「产品名称」优先展示它；NULL/未联查 → 自动拼装。
-    productNameOverride: (i.productNameOverride as string | null | undefined) ?? null,
     bundleName: bundle?.name ?? null,
     serviceNotes: bundle?.serviceNotes ?? null,
     // 套餐组件构成（该套餐 items 里实际有哪些类型）——「产品名称」自动拼装用
