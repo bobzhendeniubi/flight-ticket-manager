@@ -369,3 +369,127 @@ describe('OrderService.setInvoiceFlags', () => {
     );
   });
 });
+
+// ── OrderService.batchSetInvoiceFlags（票务岗批量开票，逐单复用 setInvoiceFlags）───
+describe('OrderService.batchSetInvoiceFlags', () => {
+  const service = new OrderService();
+  const OUT = 'schOut';
+  const OUT_ISO = '2026-07-10T02:00:00Z';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function orderRow(overrides: Partial<FakeOrder> = {}): FakeOrder {
+    return {
+      status: OrderStatus.PAID,
+      outboundInvoiced: false,
+      returnInvoiced: false,
+      _count: { passengers: 2 },
+      items: [{ flightScheduleId: OUT, flightSchedule: { departureTime: new Date(OUT_ISO) } }],
+      ...overrides,
+    };
+  }
+
+  it('批量标去程已开：全部成功', async () => {
+    txMock.order.findUnique.mockResolvedValueOnce(orderRow()).mockResolvedValueOnce(orderRow());
+    txMock.flightSchedule.findUnique.mockResolvedValue({ ticketingCap: 191 });
+    txMock.order.findMany.mockResolvedValue([]); // 该班次无其他已开票乘客，两单均放行
+    txMock.order.update
+      .mockResolvedValueOnce({
+        id: 'ord1',
+        orderNumber: 'ORD-001',
+        outboundInvoiced: true,
+        returnInvoiced: false,
+        systemInvoiced: false,
+      })
+      .mockResolvedValueOnce({
+        id: 'ord2',
+        orderNumber: 'ORD-002',
+        outboundInvoiced: true,
+        returnInvoiced: false,
+        systemInvoiced: false,
+      });
+
+    const result = await service.batchSetInvoiceFlags(['ord1', 'ord2'], { outboundInvoiced: true });
+
+    expect(result).toEqual({
+      succeeded: 2,
+      failed: 0,
+      results: [
+        {
+          id: 'ord1',
+          orderNumber: 'ORD-001',
+          ok: true,
+          outboundInvoiced: true,
+          returnInvoiced: false,
+          systemInvoiced: false,
+        },
+        {
+          id: 'ord2',
+          orderNumber: 'ORD-002',
+          ok: true,
+          outboundInvoiced: true,
+          returnInvoiced: false,
+          systemInvoiced: false,
+        },
+      ],
+    });
+  });
+
+  it('其中一单超班次开票上限 → 该单失败，其余成功', async () => {
+    txMock.order.findUnique.mockResolvedValueOnce(orderRow()).mockResolvedValueOnce(orderRow());
+    txMock.flightSchedule.findUnique.mockResolvedValue({ ticketingCap: 191 });
+    // ord1：该班次已开 191（+本单 2 人 = 193 > 191）→ 超限；ord2：无占额 → 放行
+    txMock.order.findMany
+      .mockResolvedValueOnce([fakeOrder(191, [[OUT, OUT_ISO]], { out: true })])
+      .mockResolvedValueOnce([]);
+    txMock.order.update.mockResolvedValueOnce({
+      id: 'ord2',
+      orderNumber: 'ORD-002',
+      outboundInvoiced: true,
+      returnInvoiced: false,
+      systemInvoiced: false,
+    });
+
+    const result = await service.batchSetInvoiceFlags(['ord1', 'ord2'], { outboundInvoiced: true });
+
+    expect(result.succeeded).toBe(1);
+    expect(result.failed).toBe(1);
+    expect(result.results[0]).toMatchObject({ id: 'ord1', ok: false });
+    expect(result.results[0].error).toMatch(/已开票 191 张，最多 191 张/);
+    expect(result.results[1]).toEqual({
+      id: 'ord2',
+      orderNumber: 'ORD-002',
+      ok: true,
+      outboundInvoiced: true,
+      returnInvoiced: false,
+      systemInvoiced: false,
+    });
+    // ord1 超限未被更新，只有 ord2 一次 update
+    expect(txMock.order.update).toHaveBeenCalledTimes(1);
+  });
+
+  it('订单不存在（单单失败）→ 记为失败并附错误信息，不影响其余单', async () => {
+    txMock.order.findUnique.mockResolvedValueOnce(null).mockResolvedValueOnce(orderRow());
+    txMock.flightSchedule.findUnique.mockResolvedValue({ ticketingCap: 191 });
+    txMock.order.findMany.mockResolvedValue([]);
+    txMock.order.update.mockResolvedValueOnce({
+      id: 'ord2',
+      orderNumber: 'ORD-002',
+      outboundInvoiced: true,
+      returnInvoiced: false,
+      systemInvoiced: false,
+    });
+
+    const result = await service.batchSetInvoiceFlags(['missing', 'ord2'], {
+      outboundInvoiced: true,
+    });
+
+    expect(result.succeeded).toBe(1);
+    expect(result.failed).toBe(1);
+    expect(result.results[0].ok).toBe(false);
+    expect(result.results[0].error).toMatch(/不存在/);
+    expect(result.results[1].ok).toBe(true);
+  });
+});

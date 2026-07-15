@@ -35,6 +35,22 @@ const STATUS_LABEL: Record<OrderStatus, string> = {
   FAILED: '出票失败',
 };
 
+// 批量开票下拉的六个选项（票务岗 0715 反馈）：按航段/系统三个布尔位各自「标已开/标未开」，
+// 对应逐单调用 setInvoiceFlags 时传的 flags 字段。
+type BulkInvoiceFlagOption = 'OUT_ON' | 'OUT_OFF' | 'RET_ON' | 'RET_OFF' | 'SYS_ON' | 'SYS_OFF';
+const BULK_INVOICE_FLAG_OPTIONS: Array<{
+  value: BulkInvoiceFlagOption;
+  label: string;
+  flags: { outboundInvoiced?: boolean; returnInvoiced?: boolean; systemInvoiced?: boolean };
+}> = [
+  { value: 'OUT_ON', label: '去程标已开', flags: { outboundInvoiced: true } },
+  { value: 'OUT_OFF', label: '去程标未开', flags: { outboundInvoiced: false } },
+  { value: 'RET_ON', label: '回程标已开', flags: { returnInvoiced: true } },
+  { value: 'RET_OFF', label: '回程标未开', flags: { returnInvoiced: false } },
+  { value: 'SYS_ON', label: '系统标已开', flags: { systemInvoiced: true } },
+  { value: 'SYS_OFF', label: '系统标未开', flags: { systemInvoiced: false } },
+];
+
 const STATUS_COLOR: Record<OrderStatus, string> = {
   DRAFT: 'badge-neutral',
   PENDING_PAYMENT: 'badge-warning',
@@ -338,6 +354,14 @@ export function OrdersPage() {
     failureCount: number;
     failures: Array<{ id: string; error?: string }>;
   } | null>(null);
+  // 批量开票（票务岗 0715 反馈）：按航段/系统三个布尔位批量翻转，逐单复用单条开票的上限校验。
+  const [bulkInvoiceFlag, setBulkInvoiceFlag] = useState<BulkInvoiceFlagOption | ''>('');
+  const [bulkInvoiceSubmitting, setBulkInvoiceSubmitting] = useState(false);
+  const [bulkInvoiceResult, setBulkInvoiceResult] = useState<{
+    succeeded: number;
+    failed: number;
+    failures: Array<{ id: string; error?: string }>;
+  } | null>(null);
   // 强制模式默认关：强制把已取消/超时等「非占座」订单拉回 PAID/PROCESSING 等「占座」状态时会
   // 重新占座（余位不足会被拒绝），必须是运营每次主动勾选的动作，不能默认开着让人顺手误触。
   const [forceMode, setForceMode] = useState(false);
@@ -637,7 +661,7 @@ export function OrdersPage() {
       return next;
     });
   };
-  const clearSelection = () => { setSelectedIds(new Set()); setBulkResult(null); };
+  const clearSelection = () => { setSelectedIds(new Set()); setBulkResult(null); setBulkInvoiceResult(null); };
 
   // 当前选中的订单对象（批量到账弹窗用）
   const selectedOrders = useMemo(
@@ -689,6 +713,42 @@ export function OrdersPage() {
       alert(err instanceof ApiError ? `批量操作失败：${err.message}` : '批量操作失败');
     } finally {
       setBulkSubmitting(false);
+    }
+  };
+
+  // 批量开票（票务岗 0715 反馈）：逐单复用单条 setInvoiceFlags 的班次开票上限校验，
+  // 单单超限失败不影响其余单；结果展示与 applyBulkStatus 同款（成功/失败汇总 + 失败清单）。
+  const applyBulkInvoiceFlags = async () => {
+    if (!tokens?.accessToken || !bulkInvoiceFlag || selectedIds.size === 0) return;
+    const opt = BULK_INVOICE_FLAG_OPTIONS.find((o) => o.value === bulkInvoiceFlag);
+    if (!opt) return;
+    if (!window.confirm(`将 ${selectedIds.size} 条订单批量「${opt.label}」？`)) return;
+    setBulkInvoiceSubmitting(true);
+    setBulkInvoiceResult(null);
+    try {
+      const ids = Array.from(selectedIds);
+      const res = await api.batchInvoiceFlags(tokens.accessToken, ids, opt.flags);
+      const updated = await api.listOrders(tokens.accessToken, { pageSize: 200 });
+      setOrders(updated.orders);
+      setBulkInvoiceResult({
+        succeeded: res.succeeded,
+        failed: res.failed,
+        failures: res.results.filter((r) => !r.ok).map((r) => ({ id: r.id, error: r.error })),
+      });
+      if (res.failed > 0) {
+        window.alert(
+          `有 ${res.failed} 条订单未能「${opt.label}」。\n` +
+          `常见原因是超出该班次的开票上限。具体失败原因见下方列表。`,
+        );
+      }
+      if (res.failed === 0) {
+        setSelectedIds(new Set());
+        setBulkInvoiceFlag('');
+      }
+    } catch (err) {
+      alert(err instanceof ApiError ? `批量开票失败：${err.message}` : '批量开票失败');
+    } finally {
+      setBulkInvoiceSubmitting(false);
     }
   };
 
@@ -1352,9 +1412,13 @@ export function OrdersPage() {
               disabled={bulkSubmitting}
             >
               <option value="">选择目标状态…</option>
-              {(Object.keys(STATUS_LABEL) as OrderStatus[]).map((s) => (
-                <option key={s} value={s}>{STATUS_LABEL[s]}</option>
-              ))}
+              {/* 票务按航段批量开票（见下方「批量开票」控件），整单「已出票」不在批量目标状态里放开——
+                  票务岗口径：批量只做"去程/回程已出票"这类航段级标记，整单终态仍走逐单详情页确认。 */}
+              {(Object.keys(STATUS_LABEL) as OrderStatus[])
+                .filter((s) => s !== 'TICKETED')
+                .map((s) => (
+                  <option key={s} value={s}>{STATUS_LABEL[s]}</option>
+                ))}
             </select>
             <label className="flex items-center gap-1.5 text-sm text-ink-soft">
               <input
@@ -1394,6 +1458,66 @@ export function OrdersPage() {
               清除选择
             </button>
           </div>
+          {/* 批量开票（票务岗 0715 反馈）：单条详情页逐个翻转太麻烦，这里一次给勾选的这批订单
+              统一打航段/系统开票标记；单单超班次开票上限会失败，其余单不受影响。 */}
+          <div className="mt-3 flex flex-wrap items-center gap-3 border-t border-brand/15 pt-3">
+            <label className="text-sm text-ink-soft">批量开票：</label>
+            <select
+              className="input max-w-[10rem] py-1.5"
+              value={bulkInvoiceFlag}
+              onChange={(e) => setBulkInvoiceFlag(e.target.value as BulkInvoiceFlagOption | '')}
+              disabled={bulkInvoiceSubmitting}
+            >
+              <option value="">选择开票标记…</option>
+              {BULK_INVOICE_FLAG_OPTIONS.map((opt) => (
+                <option key={opt.value} value={opt.value}>{opt.label}</option>
+              ))}
+            </select>
+            <button
+              className="btn-primary text-sm py-1.5 disabled:opacity-50"
+              onClick={() => void applyBulkInvoiceFlags()}
+              disabled={!bulkInvoiceFlag || bulkInvoiceSubmitting}
+            >
+              {bulkInvoiceSubmitting ? '处理中…' : `应用到 ${selectedIds.size} 条`}
+            </button>
+          </div>
+          {bulkInvoiceResult && (
+            <div
+              className={`mt-3 rounded-lg border-2 px-4 py-3 text-sm ${
+                bulkInvoiceResult.failed > 0
+                  ? 'border-rose-300 bg-rose-50'
+                  : 'border-emerald-200 bg-emerald-50'
+              }`}
+            >
+              <div
+                className={`font-semibold ${
+                  bulkInvoiceResult.failed > 0 ? 'text-rose-700' : 'text-emerald-700'
+                }`}
+              >
+                ✓ 成功 {bulkInvoiceResult.succeeded} 条
+                {bulkInvoiceResult.failed > 0 && (
+                  <span className="ml-3">✗ 失败 {bulkInvoiceResult.failed} 条</span>
+                )}
+              </div>
+              {bulkInvoiceResult.failed > 0 && (
+                <div className="mt-1 text-xs text-rose-700">
+                  失败订单常见原因是超出该班次的开票上限，详见下方列表。
+                </div>
+              )}
+              {bulkInvoiceResult.failures.length > 0 && (
+                <ul className="mt-2 max-h-40 overflow-auto rounded border border-rose-200 bg-white px-2 py-1.5 text-red-600">
+                  {bulkInvoiceResult.failures.map((f) => {
+                    const orderNo = orders.find((o) => o.id === f.id)?.orderNumber ?? `${f.id.slice(0, 8)}…`;
+                    return (
+                      <li key={f.id} className="py-0.5 text-[11px]">
+                        · <span className="font-mono">{orderNo}</span>：{f.error ?? '未知原因'}
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+            </div>
+          )}
           {bulkResult && (
             <div
               className={`mt-3 rounded-lg border-2 px-4 py-3 text-sm ${

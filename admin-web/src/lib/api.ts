@@ -687,10 +687,11 @@ export interface OrderPassenger {
   passportIssuePlace?: string | null;
   passportExpiry?: string | null;
 
-  // 签证
+  // 签证（出签日/生效日/有效期由签证台在出签后补录，见 updatePassengerVisaDates）
   visaNumber?: string | null;
   visaType?: string | null;
   visaIssueDate?: string | null;
+  visaEffectiveDate?: string | null;
   visaExpiry?: string | null;
   visaPlaceOfIssue?: string | null;
   visaCountryOfApplication?: string | null;
@@ -2058,6 +2059,27 @@ export const api = {
       systemInvoiced: boolean;
     }>(`/orders/${id}/invoice-flags`, { method: 'PATCH', token, body: flags }),
 
+  // 批量设置六态开票的三个布尔位（票务岗批量操作，ADMIN/STAFF）：逐单复用单条校验语义，
+  // 单单失败（如超班次开票上限）不影响其余单；返回逐单结果 + 汇总，供前端展示成功/失败清单。
+  batchInvoiceFlags: (
+    token: string,
+    orderIds: string[],
+    flags: { outboundInvoiced?: boolean; returnInvoiced?: boolean; systemInvoiced?: boolean },
+  ) =>
+    apiFetch<{
+      succeeded: number;
+      failed: number;
+      results: Array<{
+        id: string;
+        orderNumber?: string;
+        ok: boolean;
+        error?: string;
+        outboundInvoiced?: boolean;
+        returnInvoiced?: boolean;
+        systemInvoiced?: boolean;
+      }>;
+    }>('/orders/batch-invoice-flags', { method: 'POST', token, body: { orderIds, flags } }),
+
   // 人工确认收款（线下收款 → 标记已付 + 上传截图）ADMIN/STAFF
   // 现已允许多付：amount 可超过尾款（paidAmount 可大于 total）。
   confirmPayment: (
@@ -2249,6 +2271,25 @@ export const api = {
       token,
       body,
     }),
+
+  // 签证台：出签后补录出行人的 出签日/生效日/有效期（仅 ADMIN/STAFF）。
+  // 这三项是签证岗出签后才拿得到的信息，录单时无法预先知道（票务岗反馈：录单时不需要，
+  // 已从录单表单移除），改由签证台在出签后调用本端点补录。
+  // YYYY-MM-DD 字符串写入该字段；null 清空该字段；未传的字段不动。
+  updatePassengerVisaDates: (
+    token: string,
+    orderId: string,
+    passengerId: string,
+    body: {
+      visaIssueDate?: string | null;
+      visaEffectiveDate?: string | null;
+      visaExpiry?: string | null;
+    },
+  ) =>
+    apiFetch<{ passenger: { id: string } }>(
+      `/orders/${orderId}/passengers/${passengerId}/visa-dates`,
+      { method: 'PATCH', token, body },
+    ),
 
   // 换酒店：把某条 HOTEL 行（或已盖章酒店的 BUNDLE 行）换到另一个房型/酒店。
   // 价格默认冻结（绝不按新房型 basePrice 重算 unitPrice/amount）；可选加/减「换酒店差价」
@@ -3217,6 +3258,12 @@ export interface AiOcrSuggested {
   placeOfBirth?: string;
 }
 
+/** OCR 字段人工核对提示（field 对应 AiOcrSuggested 键名，reason 为中文提示文案） */
+export interface AiOcrReviewField {
+  field: string;
+  reason: string;
+}
+
 /** POST /ocr/passport 响应 */
 export type AiOcrPassportResult =
   | { configured: false }
@@ -3226,6 +3273,11 @@ export type AiOcrPassportResult =
       model: string;
       suggested: AiOcrSuggested | null;
       error?: string;
+      /** MRZ 校验 + 需人工核对字段（票务岗反馈：护照反光致目视区误读时提示二次核对） */
+      verify?: {
+        mrzValid: boolean;
+        reviewFields: AiOcrReviewField[];
+      };
     };
 
 /** GET /settings/ai-ocr 响应（PUT 同形） */

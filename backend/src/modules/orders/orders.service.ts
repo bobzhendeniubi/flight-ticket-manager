@@ -43,6 +43,11 @@ import {
 } from '../../lib/errors.js';
 import type { ItineraryData } from '../../lib/itinerary-pdf.js';
 import { writeAudit } from '../../lib/audit.js';
+import {
+  assertOrderAcceptsFunds,
+  assertOrderAllowsFundsDisposal,
+  sumCompletedRefundsWithinTx,
+} from '../../lib/funds-guard.js';
 import { resolveBundleNights } from '../products/bundle-nights.js';
 import { localDate } from '../finances/finances.cost.service.js';
 import { getHotelNightlyRemaining } from '../hotel-control/hotel-control.service.js';
@@ -64,6 +69,7 @@ import type {
   SelfUpdatePassengerBody,
   SwapItemHotelBody,
   UpdateItemSettlementPriceBody,
+  UpdatePassengerVisaDatesBody,
 } from './orders.schemas.js';
 
 // ── 状态机：允许的转移 ──────────────────────────────────────────────────
@@ -1839,21 +1845,28 @@ export class OrderService {
           adjustmentCny: number;
           paidAmount: Prisma.Decimal;
           prepaymentOffset: Prisma.Decimal;
+          status: OrderStatus;
+          deletedAt: Date | null;
         }>
-      >`SELECT id, "orderNumber", "agentId", total, "adjustmentCny", "paidAmount", "prepaymentOffset" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+      >`SELECT id, "orderNumber", "agentId", total, "adjustmentCny", "paidAmount", "prepaymentOffset", status, "deletedAt" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
       const order = rows[0];
       if (!order) throw new NotFoundError('订单不存在');
+      // 资金处置闸：死单/软删单不许再动钱（避免账实分叉）
+      assertOrderAllowsFundsDisposal(order, '将多付存入代理余额');
       if (!order.agentId) throw new BadRequestError('该订单无归属代理，无法存入代理余额');
 
       const total = Number(order.total);
       const paid = Number(order.paidAmount);
+      // 已完成退款必须先从 paidAmount 里扣掉再算多付：退款完成不减 paidAmount（REFUNDED 只翻 Refund 状态），
+      // 不扣就会把同一笔多付「先退给客户、再转存代理余额」取两次（公司净损失）。
+      const refunded = await sumCompletedRefundsWithinTx(tx, orderId);
       // 多付 = 清账口径下的负尾款（含改期费/预存抵扣），与 serializeOrder.balanceDue<0 一字一致：
-      //   overpay = paidAmount + prepaymentOffset − (total + adjustmentCny)
+      //   overpay = (paidAmount − 已退款) + prepaymentOffset − (total + adjustmentCny)
       // 不能只按 paid−total，否则有改期费的单会把「还没收齐的改期费」误当多付存进代理余额。
       const clearingPoint = round2(total + order.adjustmentCny - Number(order.prepaymentOffset));
-      const overpay = round2(paid - clearingPoint);
+      const overpay = round2(paid - refunded - clearingPoint);
       if (overpay <= 0) {
-        throw new BadRequestError('该订单没有多付金额（paidAmount ≤ 应付），无可存入余额');
+        throw new BadRequestError('该订单没有多付金额（已付款扣除已退款 ≤ 应付），无可存入余额');
       }
 
       // 代理余额行锁 + 事务内累加（与 settlements PAID 抵扣同一并发安全口径）
@@ -1867,10 +1880,12 @@ export class OrderService {
         where: { id: order.agentId },
         data: { prepaymentBalance: new Prisma.Decimal(balanceAfter) },
       });
-      // 多付回压：订单 paidAmount 降回清账点（total+adjustmentCny−prepaymentOffset），订单恰好结清、不再显示多付。
+      // 多付回压：paidAmount 只扣掉本次转存的 overpay（无退款时等于降回清账点，与旧行为一致）。
+      // 不直接写 clearingPoint：那样会把「已退款但仍留在 paidAmount 里」的部分也一并抹掉，
+      // 与系统其它处（退款不减 paidAmount）的口径冲突。
       await tx.order.update({
         where: { id: orderId },
-        data: { paidAmount: new Prisma.Decimal(clearingPoint) },
+        data: { paidAmount: new Prisma.Decimal(round2(paid - overpay)) },
       });
       await tx.prepaymentTransaction.create({
         data: {
@@ -1890,7 +1905,7 @@ export class OrderService {
         orderNumber: order.orderNumber,
         agentId: order.agentId,
         creditedAmount: overpay,
-        newPaidAmount: clearingPoint,
+        newPaidAmount: round2(paid - overpay),
         total,
         agentBalanceAfter: balanceAfter,
       };
@@ -1940,10 +1955,13 @@ export class OrderService {
           paidAmount: Prisma.Decimal;
           prepaymentOffset: Prisma.Decimal;
           status: OrderStatus;
+          deletedAt: Date | null;
         }>
-      >`SELECT id, "orderNumber", "agentId", total, "adjustmentCny", "paidAmount", "prepaymentOffset", status FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+      >`SELECT id, "orderNumber", "agentId", total, "adjustmentCny", "paidAmount", "prepaymentOffset", status, "deletedAt" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
       const order = rows[0];
       if (!order) throw new NotFoundError('订单不存在');
+      // 资金闸：用代理余额抵扣 = 往订单里灌钱，死单/软删单一律拒绝（否则钱进死单无出口）。
+      assertOrderAcceptsFunds(order);
       if (!order.agentId) throw new BadRequestError('该订单无归属代理，无法用代理余额抵扣');
 
       const total = Number(order.total);
@@ -2069,18 +2087,22 @@ export class OrderService {
     return prisma.$transaction(async (tx) => {
       // 订单行锁 + 事务内读最新 paidAmount/total（与并发到账/抵扣同一并发安全口径）
       const rows = await tx.$queryRaw<
-        Array<{ id: string; orderNumber: string; total: Prisma.Decimal; adjustmentCny: number; paidAmount: Prisma.Decimal; prepaymentOffset: Prisma.Decimal }>
-      >`SELECT id, "orderNumber", total, "adjustmentCny", "paidAmount", "prepaymentOffset" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+        Array<{ id: string; orderNumber: string; total: Prisma.Decimal; adjustmentCny: number; paidAmount: Prisma.Decimal; prepaymentOffset: Prisma.Decimal; status: OrderStatus; deletedAt: Date | null }>
+      >`SELECT id, "orderNumber", total, "adjustmentCny", "paidAmount", "prepaymentOffset", status, "deletedAt" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
       const order = rows[0];
       if (!order) throw new NotFoundError('订单不存在');
+      // 资金处置闸：死单/软删单不许再动钱。
+      assertOrderAllowsFundsDisposal(order, '将多付转入挂账池');
 
       const total = Number(order.total);
       const paid = Number(order.paidAmount);
+      // 已完成退款先扣（同 creditOverpayToAgent 口径），避免多付被退款+转挂账池取两次。
+      const refunded = await sumCompletedRefundsWithinTx(tx, orderId);
       // 多付 = 清账口径下的负尾款（含改期费/预存抵扣），与 creditOverpayToAgent / serializeOrder.balanceDue<0 一字一致。
       const clearingPoint = round2(total + order.adjustmentCny - Number(order.prepaymentOffset));
-      const overpay = round2(paid - clearingPoint);
+      const overpay = round2(paid - refunded - clearingPoint);
       if (overpay <= 0) {
-        throw new BadRequestError('该订单没有多付金额（paidAmount ≤ 应付），无可转入挂账池');
+        throw new BadRequestError('该订单没有多付金额（已付款扣除已退款 ≤ 应付），无可转入挂账池');
       }
 
       // method 兜底：取最近一笔 Payment 的 method，否则 WECHAT_PAY
@@ -2091,10 +2113,10 @@ export class OrderService {
       });
       const method = latestPayment?.method ?? PaymentMethod.WECHAT_PAY;
 
-      // 多付回压：订单 paidAmount 降回清账点（total+adjustmentCny−prepaymentOffset），订单恰好结清、不再显示多付。
+      // 多付回压：paidAmount 只扣掉本次转出的 overpay（无退款时等于降回清账点，与旧行为一致）。
       await tx.order.update({
         where: { id: orderId },
-        data: { paidAmount: new Prisma.Decimal(clearingPoint) },
+        data: { paidAmount: new Prisma.Decimal(round2(paid - overpay)) },
       });
 
       // 建一笔 OPEN 进账（挂账池），来源标记订单超额
@@ -2112,7 +2134,7 @@ export class OrderService {
         orderId,
         orderNumber: order.orderNumber,
         movedAmount: overpay,
-        newPaidAmount: clearingPoint,
+        newPaidAmount: round2(paid - overpay),
         total,
         receiptId: receipt.id,
         receiptNo: receipt.receiptNo,
@@ -2663,6 +2685,8 @@ export class OrderService {
         select: {
           id: true,
           orderNumber: true,
+          status: true,
+          deletedAt: true,
           subtotal: true,
           total: true,
           items: {
@@ -2671,6 +2695,9 @@ export class OrderService {
         },
       });
       if (!order) throw new NotFoundError('订单不存在');
+      // 资金处置闸：结算价直接改 item.amount 与 order.total（也是取消手续费基数），
+      // 死单/软删单不许改——否则可在退款前偷偷抬价操纵应退额，或改回收站单的应收。
+      assertOrderAllowsFundsDisposal(order, '修改结算价');
 
       const target = order.items.find((it) => it.id === itemId);
       if (!target) {
@@ -2850,6 +2877,60 @@ export class OrderService {
         },
       });
     });
+  }
+
+  /**
+   * 批量设置六态开票的三个布尔位（票务岗批量操作，ADMIN/STAFF）。
+   * 逐单复用 setInvoiceFlags（保持其班次开票上限校验语义不变），每单独立事务，
+   * 单单失败（如超班次开票上限）不影响其余单；逐单结果 + 汇总一并返回，
+   * 供路由层逐单写审计、前端展示成功/失败清单（失败列出订单号+原因）。
+   */
+  async batchSetInvoiceFlags(
+    ids: string[],
+    flags: { outboundInvoiced?: boolean; returnInvoiced?: boolean; systemInvoiced?: boolean },
+  ): Promise<{
+    succeeded: number;
+    failed: number;
+    results: Array<{
+      id: string;
+      orderNumber?: string;
+      ok: boolean;
+      error?: string;
+      outboundInvoiced?: boolean;
+      returnInvoiced?: boolean;
+      systemInvoiced?: boolean;
+    }>;
+  }> {
+    const results: Array<{
+      id: string;
+      orderNumber?: string;
+      ok: boolean;
+      error?: string;
+      outboundInvoiced?: boolean;
+      returnInvoiced?: boolean;
+      systemInvoiced?: boolean;
+    }> = [];
+    let succeeded = 0;
+    let failed = 0;
+    for (const id of ids) {
+      try {
+        const order = await this.setInvoiceFlags(id, flags);
+        results.push({
+          id,
+          orderNumber: order.orderNumber,
+          ok: true,
+          outboundInvoiced: order.outboundInvoiced,
+          returnInvoiced: order.returnInvoiced,
+          systemInvoiced: order.systemInvoiced,
+        });
+        succeeded += 1;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : '未知错误';
+        results.push({ id, ok: false, error: message });
+        failed += 1;
+      }
+    }
+    return { succeeded, failed, results };
   }
 
   /**
@@ -3361,6 +3442,83 @@ export class OrderService {
       passenger: serializePassengerRecord(updated as unknown as Record<string, unknown>),
       changedFields,
       orderNumber: order.orderNumber,
+    };
+  }
+
+  /**
+   * 签证台：出签后补录出行人的 出签日/生效日/有效期（仅 ADMIN/STAFF）。
+   *
+   * 规则：
+   *   - 这三项是签证岗出签后才拿得到的信息，录单时无法预先知道（票务岗反馈：录单时不需要），
+   *     已从录单表单移除；改由签证台在出签后走本方法补录。
+   *   - passengerId 必须属于该订单，否则 404。
+   *   - 字段值为 YYYY-MM-DD 字符串写入；null 清空该字段；undefined（未传）不动。
+   *   - 无状态闸——出签后各订单状态（PAID/PROCESSING/TICKETED…）都可能需要补录/更正，不比照
+   *     selfUpdatePassenger 的 SELF_EDITABLE_PASSENGER_STATUSES 限制（那是前台自助补护照资料的口径）。
+   *
+   * 返回更新后的出行人（同 selfUpdatePassenger 序列化口径）+ before/after（审计用）。
+   */
+  async updatePassengerVisaDates(
+    orderId: string,
+    passengerId: string,
+    input: UpdatePassengerVisaDatesBody,
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
+    passenger: Record<string, unknown>;
+    orderNumber: string;
+    before: { visaIssueDate: string | null; visaEffectiveDate: string | null; visaExpiry: string | null };
+    after: { visaIssueDate: string | null; visaEffectiveDate: string | null; visaExpiry: string | null };
+  }> {
+    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+      throw new ForbiddenError('仅运营/管理员可录入签证日期');
+    }
+
+    const order = await prisma.order.findUnique({
+      where: { id: orderId },
+      select: { id: true, orderNumber: true },
+    });
+    if (!order) throw new NotFoundError('订单不存在');
+
+    const passenger = await prisma.passenger.findUnique({
+      where: { id: passengerId },
+      select: {
+        id: true,
+        orderId: true,
+        visaIssueDate: true,
+        visaEffectiveDate: true,
+        visaExpiry: true,
+      },
+    });
+    if (!passenger || passenger.orderId !== orderId) {
+      throw new NotFoundError('出行人不存在或不属于该订单');
+    }
+
+    const toYmd = (d: Date | null): string | null => (d ? d.toISOString().slice(0, 10) : null);
+    const before = {
+      visaIssueDate: toYmd(passenger.visaIssueDate),
+      visaEffectiveDate: toYmd(passenger.visaEffectiveDate),
+      visaExpiry: toYmd(passenger.visaExpiry),
+    };
+
+    const toDateOrNull = (v: string | null | undefined): Date | null | undefined =>
+      v === undefined ? undefined : v === null ? null : new Date(v);
+    const data: Prisma.PassengerUpdateInput = {};
+    if (input.visaIssueDate !== undefined) data.visaIssueDate = toDateOrNull(input.visaIssueDate);
+    if (input.visaEffectiveDate !== undefined) data.visaEffectiveDate = toDateOrNull(input.visaEffectiveDate);
+    if (input.visaExpiry !== undefined) data.visaExpiry = toDateOrNull(input.visaExpiry);
+
+    const updated = await prisma.passenger.update({ where: { id: passengerId }, data });
+    const after = {
+      visaIssueDate: toYmd(updated.visaIssueDate),
+      visaEffectiveDate: toYmd(updated.visaEffectiveDate),
+      visaExpiry: toYmd(updated.visaExpiry),
+    };
+
+    return {
+      passenger: serializePassengerRecord(updated as unknown as Record<string, unknown>),
+      orderNumber: order.orderNumber,
+      before,
+      after,
     };
   }
 

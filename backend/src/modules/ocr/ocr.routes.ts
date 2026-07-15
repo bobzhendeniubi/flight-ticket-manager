@@ -17,6 +17,7 @@ import { UserRole } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { env } from '../../config/env.js';
 import { dataUrlImageSchema } from '../../lib/proof-url.js';
+import { applyOcrPostProcessing, type RawOcrFields } from './ocr.postprocess.js';
 
 const DEFAULT_MODEL = 'qwen3-vl-plus';
 
@@ -53,7 +54,7 @@ async function resolveOcrConfig(): Promise<{
 async function callQwenOcr(
   imageDataUrl: string,
   cfg: { apiKey: string; baseUrl: string; model: string },
-): Promise<Record<string, string | null>> {
+): Promise<Record<string, unknown>> {
   const systemPrompt =
     '你是护照 OCR 引擎。严格输出 JSON，不要任何注释或 markdown 代码块。' +
     '字段：lastName, firstName, fullName, chineseName, documentNumber, ' +
@@ -62,6 +63,9 @@ async function callQwenOcr(
     'passportIssueCountry(ISO-3166 alpha-3), passportExpiry(YYYY-MM-DD), ' +
     'passportIssueDate(YYYY-MM-DD), passportIssuePlace(签发地点/签发机关文本，如"广东省广州市"), ' +
     'placeOfBirth。' +
+    '另外输出 mrzLine1、mrzLine2：护照底部机读区(MRZ)两行原文，逐字符抄录（含填充符 <，每行 44 字符），' +
+    '无法读到机读区则填 null。' +
+    '再输出 fieldConfidence：一个对象，键为上述各字段名，值为 0-100 的整数识别置信度（越高越确信）。' +
     '性别识别：优先读 MRZ 第二行第 21 位（M/F）；MRZ 缺失或模糊时读目视区「性别/Sex」栏（男/M→M，女/F→F）。' +
     '找不到的字段填 null。优先用 MRZ 机读区提取机读字段，中文姓名/签发日期/签发地点/出生地用目视区。';
 
@@ -115,7 +119,7 @@ async function callQwenOcr(
   // 去掉可能的 markdown 代码块包裹
   const cleaned = content.replace(/^```json?\s*/i, '').replace(/\s*```$/, '').trim();
 
-  const parsed = JSON.parse(cleaned) as Record<string, string | null>;
+  const parsed = JSON.parse(cleaned) as Record<string, unknown>;
   return parsed;
 }
 
@@ -134,12 +138,16 @@ export const ocrRoutes: FastifyPluginAsync = async (app) => {
       }
 
       try {
-        const suggested = await callQwenOcr(body.imageDataUrl, cfg);
+        const raw = await callQwenOcr(body.imageDataUrl, cfg);
+        const { suggested, verify } = applyOcrPostProcessing(
+          raw as RawOcrFields,
+        );
         return {
           configured: true,
           engine: 'qwen',
           model: cfg.model,
           suggested,
+          verify,
         };
       } catch (err) {
         const message =

@@ -70,6 +70,13 @@ const ISSUANCE_FILTER_OPTIONS: Array<{ value: IssuanceFilter; label: string }> =
   { value: 'NONE', label: '未标注' },
 ];
 
+/** 出行人签证日期三项（出签日/生效日/有效期）；null = 该字段未录入 */
+interface PassengerVisaDates {
+  visaIssueDate: string | null;
+  visaEffectiveDate: string | null;
+  visaExpiry: string | null;
+}
+
 // ── 乘客行：名称 / 护照号 / 照片缩略图 ─────────────────────────────────────
 interface PassengerRowProps {
   passenger: VisaTaskPassenger;
@@ -79,9 +86,66 @@ interface PassengerRowProps {
   photosLoading?: boolean;
   /** 点开「护照」时若本单尚未拉图，触发按需拉取（幂等：已加载/加载中则无操作） */
   onRequestPhotos?: () => void;
+  /** 出签日/生效日/有效期当前值；undefined = 尚未拉到（展开时按需加载，见 TaskRow.loadVisaDates） */
+  visaDates?: PassengerVisaDates;
+  /** 签证日期仍在按需加载中（未加载完成前不放开编辑，避免草稿以空值覆盖尚未拉到的真实值） */
+  visaDatesLoading?: boolean;
+  /** 出签日/生效日/有效期改由签证台在出签后补录（票务岗反馈：录单时不需要）。
+   *  提供时才展示「编辑」入口；保存调用 PATCH /orders/:id/passengers/:passengerId/visa-dates。 */
+  onSaveVisaDates?: (passengerId: string, next: PassengerVisaDates) => Promise<void>;
 }
-function PassengerRow({ passenger, photoUrl, photosLoading, onRequestPhotos }: PassengerRowProps) {
+function PassengerRow({
+  passenger,
+  photoUrl,
+  photosLoading,
+  onRequestPhotos,
+  visaDates,
+  visaDatesLoading,
+  onSaveVisaDates,
+}: PassengerRowProps) {
   const [enlarged, setEnlarged] = useState(false);
+  // 签证日期行内编辑（出签后补录；见票务岗 0715 反馈：录单时不需要，改到签证台录）
+  const [editingVisaDates, setEditingVisaDates] = useState(false);
+  const [visaDraft, setVisaDraft] = useState<PassengerVisaDates>({
+    visaIssueDate: null,
+    visaEffectiveDate: null,
+    visaExpiry: null,
+  });
+  const [savingVisaDates, setSavingVisaDates] = useState(false);
+  const [visaDatesError, setVisaDatesError] = useState<string | null>(null);
+
+  const startEditVisaDates = () => {
+    setVisaDraft({
+      visaIssueDate: visaDates?.visaIssueDate ?? null,
+      visaEffectiveDate: visaDates?.visaEffectiveDate ?? null,
+      visaExpiry: visaDates?.visaExpiry ?? null,
+    });
+    setVisaDatesError(null);
+    setEditingVisaDates(true);
+  };
+
+  const saveVisaDates = async () => {
+    if (!onSaveVisaDates || savingVisaDates) return;
+    setSavingVisaDates(true);
+    setVisaDatesError(null);
+    try {
+      await onSaveVisaDates(passenger.id, visaDraft);
+      setEditingVisaDates(false);
+    } catch (e: unknown) {
+      setVisaDatesError(e instanceof ApiError ? e.message : '保存失败，请重试');
+    } finally {
+      setSavingVisaDates(false);
+    }
+  };
+
+  // 展示用：出签日/生效日/有效期三项拼一行；均未录入则显示提示语
+  const visaDatesParts = visaDates
+    ? [
+        visaDates.visaIssueDate ? `出签日 ${visaDates.visaIssueDate}` : null,
+        visaDates.visaEffectiveDate ? `生效日 ${visaDates.visaEffectiveDate}` : null,
+        visaDates.visaExpiry ? `有效期 ${visaDates.visaExpiry}` : null,
+      ].filter((x): x is string => Boolean(x))
+    : [];
   // 优先用按需加载到的真图；否则回落到列表下发的值（现列表恒为 null）
   const resolvedPhoto = photoUrl ?? passenger.passportPhotoUrl;
 
@@ -149,24 +213,87 @@ function PassengerRow({ passenger, photoUrl, photosLoading, onRequestPhotos }: P
           <span className="badge-neutral shrink-0 text-[10px]">{genderLabel ?? '—'}</span>
         </div>
         <div className="font-mono text-ink-muted truncate">{passenger.documentNumber || '—'}</div>
-        {(() => {
-          // 签证日期目前未必在签证任务 payload 里 → 防御式读取，存在才显示。
-          const v = passenger as {
-            visaIssueDate?: string | null;
-            visaEffectiveDate?: string | null;
-            visaExpiry?: string | null;
-          };
-          const parts = [
-            v.visaIssueDate ? `出签日 ${v.visaIssueDate}` : null,
-            v.visaEffectiveDate ? `生效日 ${v.visaEffectiveDate}` : null,
-            v.visaExpiry ? `有效期 ${v.visaExpiry}` : null,
-          ].filter(Boolean);
-          return parts.length > 0 ? (
-            <div className="text-[10px] text-ink-muted truncate" title={parts.join(' · ')}>
-              {parts.join(' · ')}
-            </div>
-          ) : null;
-        })()}
+
+        {/* 出签日/生效日/有效期：签证台在出签后于此补录（票务岗反馈：录单时不需要，已从录单表单移除） */}
+        {editingVisaDates ? (
+          <div className="mt-1 flex flex-wrap items-center gap-1.5">
+            <label className="flex items-center gap-1 text-[10px] text-ink-muted">
+              出签日
+              <input
+                type="date"
+                className="input w-[9.5rem] py-0.5 text-[11px]"
+                value={visaDraft.visaIssueDate ?? ''}
+                onChange={(e) =>
+                  setVisaDraft((d) => ({ ...d, visaIssueDate: e.target.value || null }))
+                }
+                disabled={savingVisaDates}
+              />
+            </label>
+            <label className="flex items-center gap-1 text-[10px] text-ink-muted">
+              生效日
+              <input
+                type="date"
+                className="input w-[9.5rem] py-0.5 text-[11px]"
+                value={visaDraft.visaEffectiveDate ?? ''}
+                onChange={(e) =>
+                  setVisaDraft((d) => ({ ...d, visaEffectiveDate: e.target.value || null }))
+                }
+                disabled={savingVisaDates}
+              />
+            </label>
+            <label className="flex items-center gap-1 text-[10px] text-ink-muted">
+              有效期
+              <input
+                type="date"
+                className="input w-[9.5rem] py-0.5 text-[11px]"
+                value={visaDraft.visaExpiry ?? ''}
+                onChange={(e) => setVisaDraft((d) => ({ ...d, visaExpiry: e.target.value || null }))}
+                disabled={savingVisaDates}
+              />
+            </label>
+            <button
+              type="button"
+              className="btn-primary py-0.5 px-2 text-[10px]"
+              onClick={() => void saveVisaDates()}
+              disabled={savingVisaDates}
+            >
+              {savingVisaDates ? '保存中…' : '保存'}
+            </button>
+            <button
+              type="button"
+              className="btn-ghost py-0.5 px-2 text-[10px]"
+              onClick={() => setEditingVisaDates(false)}
+              disabled={savingVisaDates}
+            >
+              取消
+            </button>
+            {visaDatesError && <span className="text-[10px] text-rose-600">{visaDatesError}</span>}
+          </div>
+        ) : (
+          <div className="mt-0.5 flex items-center gap-1.5">
+            {visaDatesLoading && visaDates === undefined ? (
+              <span className="text-[10px] text-ink-muted">签证日期加载中…</span>
+            ) : visaDatesParts.length > 0 ? (
+              <span
+                className="truncate text-[10px] text-ink-muted"
+                title={visaDatesParts.join(' · ')}
+              >
+                {visaDatesParts.join(' · ')}
+              </span>
+            ) : (
+              <span className="text-[10px] text-ink-muted">未录入签证日期</span>
+            )}
+            {onSaveVisaDates && visaDates !== undefined && (
+              <button
+                type="button"
+                className="shrink-0 text-[10px] text-brand hover:text-brand-dark hover:underline"
+                onClick={startEditVisaDates}
+              >
+                编辑
+              </button>
+            )}
+          </div>
+        )}
       </div>
 
       {/* 右侧标识：有图→可点「护照」（点开大图核对姓名）；无图→红「缺护照」 */}
@@ -299,10 +426,53 @@ function TaskRow({ task, selected, onToggle, token, onChanged }: TaskRowProps) {
     if (!photosLoadedRef.current && !photosLoading) loadPhotos();
   }, [loadPhotos, photosLoading]);
 
+  // 出签日/生效日/有效期按需加载：签证任务 payload 不带这三项（履约任务列表接口未联查），
+  // 展开某单时通过 GET /orders/:id 取一次订单详情，从出行人里取权威当前值供编辑表单预填。
+  const [visaDatesMap, setVisaDatesMap] = useState<Record<string, PassengerVisaDates>>({});
+  const [visaDatesLoading, setVisaDatesLoading] = useState(false);
+  const [visaDatesLoadError, setVisaDatesLoadError] = useState<string | null>(null);
+  const visaDatesLoadedRef = useRef(false);
+
+  const loadVisaDates = useCallback(() => {
+    if (!orderId || passengers.length === 0) return;
+    visaDatesLoadedRef.current = true;
+    setVisaDatesLoading(true);
+    setVisaDatesLoadError(null);
+    api
+      .getOrder(token, orderId)
+      .then((res) => {
+        const m: Record<string, PassengerVisaDates> = {};
+        for (const p of res.order.passengers ?? []) {
+          m[p.id] = {
+            visaIssueDate: p.visaIssueDate ?? null,
+            visaEffectiveDate: p.visaEffectiveDate ?? null,
+            visaExpiry: p.visaExpiry ?? null,
+          };
+        }
+        setVisaDatesMap(m);
+      })
+      .catch((e: unknown) => {
+        visaDatesLoadedRef.current = false; // 允许重试（展开态下再次触发）
+        setVisaDatesLoadError(e instanceof ApiError ? e.message : '签证日期加载失败');
+      })
+      .finally(() => setVisaDatesLoading(false));
+  }, [orderId, passengers.length, token]);
+
+  // 保存单个出行人的签证日期（PassengerRow 内表单提交）；成功后局部更新本地 map（不整页刷新）。
+  const saveVisaDates = useCallback(
+    async (passengerId: string, next: PassengerVisaDates) => {
+      if (!orderId) throw new Error('缺少订单号，无法保存');
+      await api.updatePassengerVisaDates(token, orderId, passengerId, next);
+      setVisaDatesMap((prev) => ({ ...prev, [passengerId]: next }));
+    },
+    [orderId, token],
+  );
+
   const toggleExpanded = () => {
     const next = !expanded;
     setExpanded(next);
     if (next && !photosLoadedRef.current) loadPhotos();
+    if (next && !visaDatesLoadedRef.current) loadVisaDates();
   };
 
   // 出发日期（本地化）：纯签证单无航班 → null
@@ -474,6 +644,14 @@ function TaskRow({ task, selected, onToggle, token, onChanged }: TaskRowProps) {
                     </button>
                   </div>
                 )}
+                {visaDatesLoadError && (
+                  <div className="mb-2 flex items-center gap-2 text-xs text-rose-600">
+                    <span>签证日期加载失败：{visaDatesLoadError}</span>
+                    <button type="button" className="btn-ghost py-0.5 px-2 text-xs" onClick={loadVisaDates}>
+                      重试
+                    </button>
+                  </div>
+                )}
                 <div className="max-w-lg divide-y divide-slate-100">
                   {passengers.map((p) => (
                     <PassengerRow
@@ -482,6 +660,9 @@ function TaskRow({ task, selected, onToggle, token, onChanged }: TaskRowProps) {
                       photoUrl={photoMap[p.id]}
                       photosLoading={photosLoading}
                       onRequestPhotos={ensurePhotos}
+                      visaDates={visaDatesMap[p.id]}
+                      visaDatesLoading={visaDatesLoading}
+                      onSaveVisaDates={saveVisaDates}
                     />
                   ))}
                 </div>

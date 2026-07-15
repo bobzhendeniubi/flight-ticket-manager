@@ -11,6 +11,7 @@ import {
   UserRole,
   VisaRequirement,
 } from '@prisma/client';
+import { normalizePassengerFullName } from '../../lib/passenger-name.js';
 
 // 团队议价结算价上限（CNY/人）。防误输天价；正常机票远低于此。
 export const SETTLEMENT_PRICE_CAP_CNY = 100_000;
@@ -100,10 +101,25 @@ export const orderStructuredNotesShape = {
   noteSpecial: z.string().max(STRUCTURED_NOTE_MAX).optional(),
 } as const;
 
+// 可选字符串字段的姓名规范化 transform：undefined 原样透传，避免把「不传该字段」误变成空字符串。
+// 票务岗反馈：护照 OCR/手输姓名格式脏数据（如 `ZHENG,/QINQIN`）入库污染导出名单，
+// 在 schema 层兜底规范化，与前端 admin-web/src/lib/passengerName.ts 同一套规则。
+function optionalNormalizedName(max: number) {
+  return z
+    .string()
+    .max(max)
+    .optional()
+    .transform((v) => (v === undefined ? v : normalizePassengerFullName(v)));
+}
+
 // ── 下单 ─────────────────────────────────────────────────────────────────
 // 乘客信息 — 注：所有新字段都是 optional，老客户端可继续工作
 export const passengerInputSchema = z.object({
-  fullName: z.string().min(1).max(120),
+  fullName: z
+    .string()
+    .min(1)
+    .max(120)
+    .transform((v) => normalizePassengerFullName(v)),
   // 航司 PNR 拆分姓/名（fullName 仍必填做兼容）
   lastName: z.string().max(60).optional(),
   firstName: z.string().max(80).optional(),
@@ -180,6 +196,22 @@ export const selfUpdatePassengerBodySchema = z
     message: '请至少提供一个需要更新的字段',
   });
 export type SelfUpdatePassengerBody = z.infer<typeof selfUpdatePassengerBodySchema>;
+
+// ── 签证台：出签后补录 出签日/生效日/有效期（PATCH /orders/:id/passengers/:passengerId/visa-dates；ADMIN/STAFF）──
+// 这三项是签证岗出签后才拿得到的信息，录单时无法预先知道（票务岗反馈：录单时不需要，
+// 已从录单表单移除），改由签证台在出签后补录。YYYY-MM-DD 字符串；null 表示清空该字段；
+// 三个字段均可选，但至少要提供一个（不然这次调用没有意义）。
+export const updatePassengerVisaDatesBodySchema = z
+  .object({
+    visaIssueDate: z.union([z.string().regex(/^\d{4}-\d{2}-\d{2}$/), z.null()]).optional(),
+    visaEffectiveDate: z.union([z.string().regex(/^\d{4}-\d{2}-\d{2}$/), z.null()]).optional(),
+    visaExpiry: z.union([z.string().regex(/^\d{4}-\d{2}-\d{2}$/), z.null()]).optional(),
+  })
+  .strict()
+  .refine((v) => Object.values(v).some((x) => x !== undefined), {
+    message: '请至少提供一个需要更新的字段',
+  });
+export type UpdatePassengerVisaDatesBody = z.infer<typeof updatePassengerVisaDatesBodySchema>;
 
 // ── 前台自助：改签申请（POST /orders/:id/change-request）──
 export const changeRequestBodySchema = z.object({
@@ -473,6 +505,21 @@ export const batchUpdateStatusBodySchema = z.object({
 });
 export type BatchUpdateStatusBody = z.infer<typeof batchUpdateStatusBodySchema>;
 
+// ── 批量开票（票务岗，ADMIN/STAFF）─────────────────────────────────────────
+// 逐单按航段翻转 outboundInvoiced/returnInvoiced/systemInvoiced（复用单条 setInvoiceFlags 语义）；
+// flags 至少选一项，orderIds 上限对齐 batchUpdateStatusBodySchema。
+export const batchSetInvoiceFlagsBodySchema = z.object({
+  orderIds: z.array(z.string().min(1)).min(1).max(100),
+  flags: z
+    .object({
+      outboundInvoiced: z.boolean().optional(),
+      returnInvoiced: z.boolean().optional(),
+      systemInvoiced: z.boolean().optional(),
+    })
+    .refine((f) => Object.keys(f).length > 0, { message: '请至少选择一项开票标记' }),
+});
+export type BatchSetInvoiceFlagsBody = z.infer<typeof batchSetInvoiceFlagsBodySchema>;
+
 // ── 批量散客建单（后台）─────────────────────────────────────────────────────
 // 选一个航班班次 + 舱位 + 共享联系人 → 名单里每位乘客各成一单（FLIGHT × 1）
 // ── 公开订单查询（免登录，A4）──────────────────────────────────────────────
@@ -628,9 +675,10 @@ export type RescheduleOrderBody = z.infer<typeof rescheduleOrderBodySchema>;
 // PATCH /orders/:id/passengers/:passengerId（ADMIN/STAFF）：就地改出行人身份 + 可选重置开票/签证 + 换人费。
 export const swapPassengerBodySchema = z
   .object({
-    lastName: z.string().max(120).optional(),
-    firstName: z.string().max(120).optional(),
-    fullName: z.string().max(120).optional(),
+    // lastName/firstName 各自单段规范化（不做斜线拼接）；fullName 整体规范化。
+    lastName: optionalNormalizedName(120),
+    firstName: optionalNormalizedName(120),
+    fullName: optionalNormalizedName(120),
     // 中文姓名（护照扩展字段；下单时已支持，此处补录/编辑用同一约束）
     chineseName: z.string().max(120).optional(),
     documentNumber: z.string().max(60).optional(),

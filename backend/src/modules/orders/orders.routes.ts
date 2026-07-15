@@ -12,6 +12,7 @@ import { InvoiceStatus, Prisma, UserRole } from '@prisma/client';
 import { OrderService, type OrderRequester } from './orders.service.js';
 import {
   batchCreateOrdersBodySchema,
+  batchSetInvoiceFlagsBodySchema,
   batchUpdateStatusBodySchema,
   changeOrderAgentBodySchema,
   changeRequestBodySchema,
@@ -30,6 +31,7 @@ import {
   swapItemHotelBodySchema,
   swapPassengerBodySchema,
   updateItemSettlementPriceBodySchema,
+  updatePassengerVisaDatesBodySchema,
   updateStatusBodySchema,
   visaBundleBodySchema,
 } from './orders.schemas.js';
@@ -1069,6 +1071,39 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     return result;
   });
 
+  // ── 批量开票：票务岗一次给多单勾同一批航段/系统开票标记（ADMIN/STAFF）──
+  // POST /orders/batch-invoice-flags  body: { orderIds: string[], flags: { outboundInvoiced?, returnInvoiced?, systemInvoiced? } }
+  // 逐单复用 setInvoiceFlags（保持班次开票上限校验语义不变），单单失败（如超限）不影响其余单；
+  // 每个成功单各写一条 UPDATE_INVOICE_STATUS 审计（after 字段对齐单条 PATCH 端点）。
+  app.post(
+    '/batch-invoice-flags',
+    { preHandler: [app.authenticate] },
+    async (req, reply) => {
+      const role = req.user.role;
+      if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+        return reply.status(403).send({ error: '仅运营/管理员可批量修改开票状态' });
+      }
+      const body = batchSetInvoiceFlagsBodySchema.parse(req.body);
+      const result = await service.batchSetInvoiceFlags(body.orderIds, body.flags);
+      for (const r of result.results) {
+        if (!r.ok) continue;
+        void writeAudit({
+          actor: actorFromRequest(req),
+          action: 'UPDATE_INVOICE_STATUS',
+          targetType: 'ORDER',
+          targetId: r.id,
+          targetLabel: r.orderNumber,
+          after: {
+            outboundInvoiced: r.outboundInvoiced,
+            returnInvoiced: r.returnInvoiced,
+            systemInvoiced: r.systemInvoiced,
+          },
+        });
+      }
+      return result;
+    },
+  );
+
   // ── 预期到账金额（ADMIN/STAFF；锁定后仅 ADMIN）──
   // PATCH /orders/:id/expected-amount  body: { amountCny: number | null }
   app.patch('/:id/expected-amount', { preHandler: [app.authenticate] }, async (req, reply) => {
@@ -1369,6 +1404,39 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     });
     return { order };
   });
+
+  // ── 签证台：出签后补录 出签日/生效日/有效期（ADMIN/STAFF）──
+  // PATCH /orders/:id/passengers/:passengerId/visa-dates
+  // body: { visaIssueDate?: string|null, visaEffectiveDate?: string|null, visaExpiry?: string|null }
+  //   （YYYY-MM-DD 或 null=清空该字段；至少提供一个）
+  // 这三项是签证岗出签后才拿得到的信息，录单时无法预先知道（票务岗反馈：录单时不需要，
+  // 已从录单表单移除）——改由签证台在出签后走本端点补录。
+  app.patch(
+    '/:id/passengers/:passengerId/visa-dates',
+    { preHandler: [app.authenticate] },
+    async (req, reply) => {
+      const role = req.user.role;
+      if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+        return reply.status(403).send({ error: '仅运营/管理员可录入签证日期' });
+      }
+      const { id, passengerId } = req.params as { id: string; passengerId: string };
+      const body = updatePassengerVisaDatesBodySchema.parse(req.body);
+      const result = await service.updatePassengerVisaDates(id, passengerId, body, {
+        userId: req.user.sub,
+        role,
+      });
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'UPDATE_PASSENGER_VISA_DATES',
+        targetType: 'TRAVELER',
+        targetId: passengerId,
+        targetLabel: result.orderNumber,
+        before: result.before,
+        after: result.after,
+      });
+      return { passenger: result.passenger };
+    },
+  );
 
   // ── 售后改单：换酒店（ADMIN/STAFF）──
   // PATCH /orders/:id/items/:itemId/hotel  body: { newHotelRoomTypeId, feeCny?, feeLabel?, note? }

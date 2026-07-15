@@ -9,7 +9,7 @@
  *
  * 与「批量创单」并存：批量创单服务票务整班散客；本弹窗服务单笔多产品类型录单。
  */
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import {
   api,
   ApiError,
@@ -45,6 +45,7 @@ import { RoomingEditor, type RoomingPassenger } from './RoomingEditor';
 import { SearchSelect, type SearchSelectOption } from './SearchSelect';
 import { type OcrResult } from '../lib/passportOcr';
 import { formatLocalTime } from '../lib/airports';
+import { composePassengerFullName, normalizePassengerFullName } from '../lib/passengerName';
 
 // ── 产品类型 ──────────────────────────────────────────────────────────
 type ProductKind = 'FLIGHT' | 'HOTEL' | 'VISA' | 'BUNDLE' | 'TRANSFER';
@@ -105,12 +106,8 @@ interface PassengerRow {
   passportIssuePlace?: string;
   /** 护照有效期 YYYY-MM-DD（可选；OCR 填写或手动输入） */
   passportExpiry?: string;
-  /** 签证出签日 YYYY-MM-DD（可选；手动输入） */
-  visaIssueDate?: string;
-  /** 签证生效日 YYYY-MM-DD（可选；手动输入） */
-  visaEffectiveDate?: string;
-  /** 签证有效期 YYYY-MM-DD（可选；手动输入） */
-  visaExpiry?: string;
+  // 签证出签日/生效日/有效期不在此录入：这三项是签证岗出签后才拿得到的信息，录单时无法
+  // 预先知道（票务岗反馈：录单时不需要），改由签证台在出签后补录（PATCH .../visa-dates）。
   /** 护照图 base64 data URL（OCR 识别后存入，随乘客一起提交给后端） */
   passportPhotoUrl?: string;
   // ── 套餐乘客级选项（购物车模式：每人各选自己的住宿方式 + 签证；价差全部系统算）──
@@ -126,6 +123,66 @@ interface PassengerRow {
   ocrEngine?: 'ai' | 'local' | 'ai-fallback' | null;
   /** AI 识别时使用的模型名 */
   ocrModel?: string | null;
+  /**
+   * AI OCR 校验结果：需要人工核对的字段（field 为 PassengerRow 键名，reason 为提示文案）。
+   * 仅 AI 识别路径（POST /ocr/passport 返回 verify）回填；用户手动改动某字段后会从此列表移除。
+   */
+  reviewFields?: Array<{ field: string; reason: string }>;
+  /** 护照 MRZ（机读区）校验是否通过；false = 未通过，提示语气升级；undefined/null = 无 MRZ 信息（本地识别）。 */
+  mrzValid?: boolean | null;
+  /** 本地 Tesseract 兜底识别提示：精度有限，整行核对（AI 未配置或识别失败走本地时置位）。 */
+  localOcrCaveat?: boolean;
+}
+
+/** OCR 校验字段名 → 中文标签（覆盖后端 verify.reviewFields 可能出现的全部字段名） */
+const OCR_FIELD_LABELS: Record<string, string> = {
+  fullName: '姓名',
+  lastName: '姓',
+  firstName: '名',
+  chineseName: '中文姓名',
+  documentNumber: '护照号',
+  dateOfBirth: '出生日期',
+  gender: '性别',
+  nationality: '国籍',
+  passportIssueCountry: '签发国',
+  passportExpiry: '护照有效期',
+  passportIssueDate: '护照签发日期',
+  passportIssuePlace: '护照签发地点',
+  placeOfBirth: '出生地',
+};
+
+/** 出行人表格里实际存在输入框、可高亮警示的字段（PassengerRow 键名）。 */
+const OCR_HIGHLIGHTABLE_FIELDS = new Set([
+  'fullName',
+  'chineseName',
+  'documentNumber',
+  'dateOfBirth',
+  'gender',
+  'passportIssueDate',
+  'passportIssuePlace',
+  'passportExpiry',
+]);
+
+/** 该行是否有某字段的 AI 核对警示（表格里存在的字段才高亮，避免高亮不存在的输入框）。 */
+function hasFieldReview(p: PassengerRow, field: string): boolean {
+  if (!OCR_HIGHLIGHTABLE_FIELDS.has(field)) return false;
+  return Boolean(p.reviewFields?.some((r) => r.field === field));
+}
+
+/** 出行人行下方的紧凑提示文案；无需提示返回 null。 */
+function ocrReviewHint(p: PassengerRow): string | null {
+  if (p.reviewFields && p.reviewFields.length > 0) {
+    const prefix =
+      p.mrzValid === false ? '护照机读区未能校验，请逐项核对：' : 'AI 识别建议人工核对：';
+    const items = p.reviewFields.map(
+      (r) => `${OCR_FIELD_LABELS[r.field] ?? r.field}（${r.reason}）`,
+    );
+    return `${prefix}${items.join('、')}`;
+  }
+  if (p.localOcrCaveat) {
+    return '本地识别精度有限，请逐项核对';
+  }
+  return null;
 }
 
 const emptyPassenger = (): PassengerRow => ({ fullName: '', documentNumber: '', dateOfBirth: '' });
@@ -614,8 +671,6 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   }, [agents, agentSearch]);
 
   const passengersRequired = PASSENGERS_REQUIRED[kind];
-  // 签证日期列仅在涉及签证的产品（签证 / 套餐）下显示，避免无关订单把出行人表撑宽
-  const showVisaCols = kind === 'VISA' || kind === 'BUNDLE';
   const validPassengers = passengers.filter(
     (p) => p.fullName.trim() && p.documentNumber.trim() && parseDob(p.dateOfBirth),
   );
@@ -625,6 +680,9 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   //   （否则自备签不产生价差，展示无意义，与旧整单勾选框的显示条件一致）。
   const showRoomingCol = kind === 'BUNDLE';
   const showVisaExemptCol = kind === 'BUNDLE' && (bundle?.selfVisaDeductCny ?? 0) > 0;
+  // 出行人表格总列数（姓名/护照号/出生日期/中文姓名/性别/签发日期/签发地点/有效期/护照图/操作 10 列 +
+  //   可选的住宿/签证列）；AI 核对提示行需要 colSpan 撑满整行。
+  const passengerColCount = 10 + (showRoomingCol ? 1 : 0) + (showVisaExemptCol ? 1 : 0);
   // 派生勾选人数（驱动系统价试算重算 + 描述/明细展示）：以行标记为准。
   const singleRoomCount = passengers.filter((p) => p.singleRoom).length;
   const visaExemptCount = passengers.filter((p) => p.visaExempt).length;
@@ -644,6 +702,18 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     setPassengers((prev) => {
       const next = prev.map((r, idx) => (idx === i ? { ...r, ...patch } : r));
       passengersRef.current = next; // 即时同步 ref：并发 OCR 的上限计数读最新值
+      return next;
+    });
+  }
+  /** 用户手动改动某字段后清除该字段的 AI 核对警示（该字段既已人工看过，警示已完成使命）。 */
+  function clearReviewField(i: number, field: string): void {
+    setPassengers((prev) => {
+      const row = prev[i];
+      if (!row?.reviewFields?.some((r) => r.field === field)) return prev;
+      const next = prev.map((r, idx) =>
+        idx === i ? { ...r, reviewFields: r.reviewFields!.filter((rf) => rf.field !== field) } : r,
+      );
+      passengersRef.current = next;
       return next;
     });
   }
@@ -669,9 +739,12 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     const f = s.fillFields;
     const patch: Partial<PassengerRow> = {};
 
-    const composedName = f ? [f.lastName, f.firstName].filter(Boolean).join(' ').trim() : '';
-    patch.fullName = composedName || s.fullName;
+    // 姓/名都有时按 LAST/FIRST 斜线拼接（与后端 composePassengerFullName 同规则），
+    // 而非早前的空格 join——避免联想回填出 "ZHANG SAN" 这类无法区分姓名边界的格式。
+    const composedName = f ? composePassengerFullName(f.lastName, f.firstName) : null;
+    patch.fullName = composedName || normalizePassengerFullName(s.fullName);
     patch.documentNumber = f?.documentNumber || s.documentNumber;
+    clearReviewField(i, 'fullName');
 
     const dob = ymd(f?.dateOfBirth ?? s.dateOfBirth);
     if (dob) patch.dateOfBirth = dob;
@@ -828,8 +901,13 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
             ocrStage: '识别完成',
             ocrEngine: 'ai',
             ocrModel: aiRes.model ?? null,
+            // 护照反光等致目视区误读——票务岗反馈：录单人不知道哪里要二次核对。
+            // 后端 verify 直接带回需人工核对的字段列表 + MRZ 校验结果，整行展示提示。
+            reviewFields: aiRes.verify?.reviewFields ?? undefined,
+            mrzValid: aiRes.verify?.mrzValid ?? null,
+            localOcrCaveat: false,
           };
-          if (s.fullName) patch.fullName = s.fullName;
+          if (s.fullName) patch.fullName = normalizePassengerFullName(s.fullName);
           if (s.documentNumber) patch.documentNumber = s.documentNumber;
           if (s.dateOfBirth) patch.dateOfBirth = s.dateOfBirth;
           if (s.gender) patch.gender = s.gender;
@@ -869,8 +947,12 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
         ocrStage: result.success ? '识别完成' : '识别不完整，请核对',
         ocrEngine: engine,
         ocrModel: null,
+        // 本地 Tesseract 兜底没有 verify（无逐字段核对信息），给整行一条通用提示。
+        reviewFields: undefined,
+        mrzValid: null,
+        localOcrCaveat: true,
       };
-      if (s.fullName) patch.fullName = s.fullName;
+      if (s.fullName) patch.fullName = normalizePassengerFullName(s.fullName);
       if (s.passportNumber) patch.documentNumber = s.passportNumber;
       if (s.dateOfBirth) patch.dateOfBirth = s.dateOfBirth;
       if (s.gender) patch.gender = s.gender;
@@ -1144,9 +1226,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       ...(p.passportIssueDate?.trim() ? { passportIssueDate: p.passportIssueDate.trim() } : {}),
       ...(p.passportIssuePlace?.trim() ? { passportIssuePlace: p.passportIssuePlace.trim() } : {}),
       ...(p.passportExpiry?.trim() ? { passportExpiry: p.passportExpiry.trim() } : {}),
-      ...(p.visaIssueDate?.trim() ? { visaIssueDate: p.visaIssueDate.trim() } : {}),
-      ...(p.visaEffectiveDate?.trim() ? { visaEffectiveDate: p.visaEffectiveDate.trim() } : {}),
-      ...(p.visaExpiry?.trim() ? { visaExpiry: p.visaExpiry.trim() } : {}),
+      // 签证出签日/生效日/有效期不在录单时采集：改由签证台在出签后补录（见 PassengerRow 类型定义注释）。
       // 套餐乘客级选项（购物车模式）：仅套餐单显式发送；后端据此逐位派生权威定价 + 签证台过滤。
       ...(kind === 'BUNDLE' ? { visaExempt: !!p.visaExempt, singleRoom: !!p.singleRoom } : {}),
     }));
@@ -1930,9 +2010,8 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                       <th className="min-w-[120px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照签发日期</th>
                       <th className="min-w-[160px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照签发地点</th>
                       <th className="min-w-[120px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照有效期</th>
-                      {showVisaCols && <th className="min-w-[120px] whitespace-nowrap px-2 py-1.5 text-left font-normal">签证出签日</th>}
-                      {showVisaCols && <th className="min-w-[120px] whitespace-nowrap px-2 py-1.5 text-left font-normal">签证生效日</th>}
-                      {showVisaCols && <th className="min-w-[120px] whitespace-nowrap px-2 py-1.5 text-left font-normal">签证有效期</th>}
+                      {/* 签证出签日/生效日/有效期不在此处录入：这三项是签证岗出签后才拿得到的信息，
+                          录单时无法预先知道（票务岗反馈：录单时不需要），改由签证台在出签后补录。 */}
                       <th className="min-w-[110px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照图</th>
                       <th className="min-w-[40px] px-2 py-1.5"></th>
                     </tr>
@@ -1945,21 +2024,27 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                       const issueBad = issueTouched && parseDob(p.passportIssueDate ?? '') === null;
                       const ppExpiryTouched = (p.passportExpiry ?? '').trim().length > 0;
                       const ppExpiryBad = ppExpiryTouched && parseDob(p.passportExpiry ?? '') === null;
-                      const visaIssueTouched = (p.visaIssueDate ?? '').trim().length > 0;
-                      const visaIssueBad = visaIssueTouched && parseDob(p.visaIssueDate ?? '') === null;
-                      const visaEffTouched = (p.visaEffectiveDate ?? '').trim().length > 0;
-                      const visaEffBad = visaEffTouched && parseDob(p.visaEffectiveDate ?? '') === null;
-                      const visaExpiryTouched = (p.visaExpiry ?? '').trim().length > 0;
-                      const visaExpiryBad = visaExpiryTouched && parseDob(p.visaExpiry ?? '') === null;
                       const isOcring = p.ocrPct !== null && p.ocrPct !== undefined && p.ocrPct < 100;
+                      const reviewHint = ocrReviewHint(p);
                       return (
-                        <tr key={i} className="border-t border-slate-100">
-                          <td className="min-w-[140px] px-2 py-1 align-top">
+                        <Fragment key={i}>
+                        <tr className="border-t border-slate-100">
+                          <td
+                            className="min-w-[140px] px-2 py-1 align-top"
+                            onBlur={() => {
+                              // 姓名脏格式（如 `ZHENG,/QINQIN`）在此边界统一规范化，避免污染导出名单。
+                              const normalized = normalizePassengerFullName(p.fullName);
+                              if (normalized !== p.fullName) setPassenger(i, { fullName: normalized });
+                            }}
+                          >
                             {/* 姓名联想：≥2 字符调常旅客 suggest，点选整行回填（AGENT 无联想） */}
                             <PassengerSuggestInput
-                              className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm"
+                              className={`w-full rounded border px-1.5 py-1 text-sm ${hasFieldReview(p, 'fullName') ? 'border-amber-400 bg-amber-50' : 'border-slate-300'}`}
                               value={p.fullName}
-                              onChange={(v) => setPassenger(i, { fullName: v })}
+                              onChange={(v) => {
+                                setPassenger(i, { fullName: v });
+                                clearReviewField(i, 'fullName');
+                              }}
                               onPick={(s) => applyProfileSuggestion(i, s)}
                             />
                           </td>
@@ -2000,9 +2085,12 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                           <td className="min-w-[140px] px-2 py-1 align-top">
                             {/* 证件号联想：与姓名共用同一联想组件与整行回填 */}
                             <PassengerSuggestInput
-                              className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm"
+                              className={`w-full rounded border px-1.5 py-1 text-sm ${hasFieldReview(p, 'documentNumber') ? 'border-amber-400 bg-amber-50' : 'border-slate-300'}`}
                               value={p.documentNumber}
-                              onChange={(v) => setPassenger(i, { documentNumber: v })}
+                              onChange={(v) => {
+                                setPassenger(i, { documentNumber: v });
+                                clearReviewField(i, 'documentNumber');
+                              }}
                               onPick={(s) => applyProfileSuggestion(i, s)}
                             />
                           </td>
@@ -2010,29 +2098,36 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                             <input
                               type="text"
                               inputMode="numeric"
-                              className={`w-full rounded border px-1.5 py-1 text-sm ${dobBad ? 'border-rose-400 bg-rose-50' : 'border-slate-300'}`}
+                              className={`w-full rounded border px-1.5 py-1 text-sm ${dobBad ? 'border-rose-400 bg-rose-50' : hasFieldReview(p, 'dateOfBirth') ? 'border-amber-400 bg-amber-50' : 'border-slate-300'}`}
                               placeholder="YYYY-MM-DD"
                               value={p.dateOfBirth}
-                              onChange={(e) => setPassenger(i, { dateOfBirth: e.target.value })}
+                              onChange={(e) => {
+                                setPassenger(i, { dateOfBirth: e.target.value });
+                                clearReviewField(i, 'dateOfBirth');
+                              }}
                             />
                             {dobBad && <span className="mt-0.5 block whitespace-nowrap text-[11px] text-rose-500">格式如 1990-01-01</span>}
                           </td>
                           <td className="min-w-[140px] px-2 py-1 align-top">
                             <input
                               type="text"
-                              className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm"
+                              className={`w-full rounded border px-1.5 py-1 text-sm ${hasFieldReview(p, 'chineseName') ? 'border-amber-400 bg-amber-50' : 'border-slate-300'}`}
                               placeholder="中文姓名（选填）"
                               value={p.chineseName ?? ''}
-                              onChange={(e) => setPassenger(i, { chineseName: e.target.value })}
+                              onChange={(e) => {
+                                setPassenger(i, { chineseName: e.target.value });
+                                clearReviewField(i, 'chineseName');
+                              }}
                             />
                           </td>
                           <td className="min-w-[90px] px-2 py-1 align-top">
                             <select
-                              className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm"
+                              className={`w-full rounded border px-1.5 py-1 text-sm ${hasFieldReview(p, 'gender') ? 'border-amber-400 bg-amber-50' : 'border-slate-300'}`}
                               value={p.gender ?? ''}
-                              onChange={(e) =>
-                                setPassenger(i, { gender: (e.target.value || undefined) as 'M' | 'F' | 'X' | undefined })
-                              }
+                              onChange={(e) => {
+                                setPassenger(i, { gender: (e.target.value || undefined) as 'M' | 'F' | 'X' | undefined });
+                                clearReviewField(i, 'gender');
+                              }}
                             >
                               <option value="">未选</option>
                               <option value="M">男 (M)</option>
@@ -2044,72 +2139,43 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                             <input
                               type="text"
                               inputMode="numeric"
-                              className={`w-full rounded border px-1.5 py-1 text-sm ${issueBad ? 'border-rose-400 bg-rose-50' : 'border-slate-300'}`}
+                              className={`w-full rounded border px-1.5 py-1 text-sm ${issueBad ? 'border-rose-400 bg-rose-50' : hasFieldReview(p, 'passportIssueDate') ? 'border-amber-400 bg-amber-50' : 'border-slate-300'}`}
                               placeholder="YYYY-MM-DD（选填）"
                               value={p.passportIssueDate ?? ''}
-                              onChange={(e) => setPassenger(i, { passportIssueDate: e.target.value })}
+                              onChange={(e) => {
+                                setPassenger(i, { passportIssueDate: e.target.value });
+                                clearReviewField(i, 'passportIssueDate');
+                              }}
                             />
                             {issueBad && <span className="mt-0.5 block whitespace-nowrap text-[11px] text-rose-500">格式如 2018-01-01</span>}
                           </td>
                           <td className="min-w-[160px] px-2 py-1 align-top">
                             <input
                               type="text"
-                              className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm"
+                              className={`w-full rounded border px-1.5 py-1 text-sm ${hasFieldReview(p, 'passportIssuePlace') ? 'border-amber-400 bg-amber-50' : 'border-slate-300'}`}
                               placeholder="如 广东省广州市（选填）"
                               value={p.passportIssuePlace ?? ''}
-                              onChange={(e) => setPassenger(i, { passportIssuePlace: e.target.value })}
+                              onChange={(e) => {
+                                setPassenger(i, { passportIssuePlace: e.target.value });
+                                clearReviewField(i, 'passportIssuePlace');
+                              }}
                             />
                           </td>
                           <td className="min-w-[120px] px-2 py-1 align-top">
                             <input
                               type="text"
                               inputMode="numeric"
-                              className={`w-full rounded border px-1.5 py-1 text-sm ${ppExpiryBad ? 'border-rose-400 bg-rose-50' : 'border-slate-300'}`}
+                              className={`w-full rounded border px-1.5 py-1 text-sm ${ppExpiryBad ? 'border-rose-400 bg-rose-50' : hasFieldReview(p, 'passportExpiry') ? 'border-amber-400 bg-amber-50' : 'border-slate-300'}`}
                               placeholder="YYYY-MM-DD（选填）"
                               value={p.passportExpiry ?? ''}
-                              onChange={(e) => setPassenger(i, { passportExpiry: e.target.value })}
+                              onChange={(e) => {
+                                setPassenger(i, { passportExpiry: e.target.value });
+                                clearReviewField(i, 'passportExpiry');
+                              }}
                             />
                             {ppExpiryBad && <span className="mt-0.5 block whitespace-nowrap text-[11px] text-rose-500">格式如 2030-01-01</span>}
                           </td>
-                          {showVisaCols && (
-                            <td className="min-w-[120px] px-2 py-1 align-top">
-                              <input
-                                type="text"
-                                inputMode="numeric"
-                                className={`w-full rounded border px-1.5 py-1 text-sm ${visaIssueBad ? 'border-rose-400 bg-rose-50' : 'border-slate-300'}`}
-                                placeholder="YYYY-MM-DD（选填）"
-                                value={p.visaIssueDate ?? ''}
-                                onChange={(e) => setPassenger(i, { visaIssueDate: e.target.value })}
-                              />
-                              {visaIssueBad && <span className="mt-0.5 block whitespace-nowrap text-[11px] text-rose-500">格式如 2026-01-01</span>}
-                            </td>
-                          )}
-                          {showVisaCols && (
-                            <td className="min-w-[120px] px-2 py-1 align-top">
-                              <input
-                                type="text"
-                                inputMode="numeric"
-                                className={`w-full rounded border px-1.5 py-1 text-sm ${visaEffBad ? 'border-rose-400 bg-rose-50' : 'border-slate-300'}`}
-                                placeholder="YYYY-MM-DD（选填）"
-                                value={p.visaEffectiveDate ?? ''}
-                                onChange={(e) => setPassenger(i, { visaEffectiveDate: e.target.value })}
-                              />
-                              {visaEffBad && <span className="mt-0.5 block whitespace-nowrap text-[11px] text-rose-500">格式如 2026-01-01</span>}
-                            </td>
-                          )}
-                          {showVisaCols && (
-                            <td className="min-w-[120px] px-2 py-1 align-top">
-                              <input
-                                type="text"
-                                inputMode="numeric"
-                                className={`w-full rounded border px-1.5 py-1 text-sm ${visaExpiryBad ? 'border-rose-400 bg-rose-50' : 'border-slate-300'}`}
-                                placeholder="YYYY-MM-DD（选填）"
-                                value={p.visaExpiry ?? ''}
-                                onChange={(e) => setPassenger(i, { visaExpiry: e.target.value })}
-                              />
-                              {visaExpiryBad && <span className="mt-0.5 block whitespace-nowrap text-[11px] text-rose-500">格式如 2026-06-01</span>}
-                            </td>
-                          )}
+                          {/* 签证出签日/生效日/有效期不在此处录入：改由签证台在出签后补录（见表头注释） */}
                           <td className="min-w-[110px] px-2 py-1 align-top">
                             {/* 隐藏 file input */}
                             <input
@@ -2142,7 +2208,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                                   <button
                                     type="button"
                                     className="text-[10px] text-slate-400 hover:text-rose-500"
-                                    onClick={() => setPassenger(i, { passportPhotoUrl: undefined, ocrPct: null, ocrStage: undefined, ocrEngine: null, ocrModel: null })}
+                                    onClick={() => setPassenger(i, { passportPhotoUrl: undefined, ocrPct: null, ocrStage: undefined, ocrEngine: null, ocrModel: null, reviewFields: undefined, mrzValid: null, localOcrCaveat: false })}
                                     title="移除图片"
                                   >✕</button>
                                 </div>
@@ -2186,13 +2252,21 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                             <button className="text-xs text-slate-400 hover:text-rose-600" onClick={() => removePassenger(i)} disabled={passengers.length <= 1} type="button">删</button>
                           </td>
                         </tr>
+                        {reviewHint && (
+                          <tr className="border-t-0">
+                            <td colSpan={passengerColCount} className="bg-amber-50 px-2 py-1 text-[11px] text-amber-700">
+                              ⚠️ {reviewHint}
+                            </td>
+                          </tr>
+                        )}
+                        </Fragment>
                       );
                     })}
                   </tbody>
                 </table>
               </div>
               <p className="mt-1 text-[11px] text-slate-400">
-                📷「批量传护照」可一次多选，自动逐张识别并生成出行人；护照图最多 {MAX_PHOTO_PASSENGERS} 张/单，超出请分单录入。识别后请核对<span className="text-slate-500">中文名 / 签发日期</span>。
+                📷「批量传护照」可一次多选，自动逐张识别并生成出行人；护照图最多 {MAX_PHOTO_PASSENGERS} 张/单，超出请分单录入。识别有需人工核对的字段时会在对应行下方标黄提示。
               </p>
               {!passengersRequired && (
                 <p className="mt-1 text-[11px] text-slate-400">纯酒店/接送可不填出行人；留空时系统用联系人占位一位出行人。</p>
