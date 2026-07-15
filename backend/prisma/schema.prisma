@@ -1070,7 +1070,6 @@ model OrderItem {
   description      String
   // 录单时自定义的产品名称快照（仅后台展示用）：NULL = 未自定义，前端按既有逻辑自动拼装。
   // 与 description 分离——description 会被换酒店/补房差等流程自动重写，此字段一经写入不再变动。
-  productNameOverride String?
   quantity         Int           @default(1)
   unitPrice        Decimal       @db.Decimal(10, 2)
   amount           Decimal       @db.Decimal(12, 2)
