@@ -11,7 +11,16 @@
  * MVP 同步实现：运营手动在 admin 里更新状态 + 数据。
  * V2 引入 BullMQ 后会变成自动触发供应商 API。
  */
-import { FulfillmentStatus, FulfillmentType, OrderItemKind, OrderStatus, Prisma } from '@prisma/client';
+import {
+  FulfillmentStatus,
+  FulfillmentType,
+  OrderItemKind,
+  OrderStatus,
+  Prisma,
+  VisaEntryType,
+  VisaIssuanceMethod,
+  VisaRequirement,
+} from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { ConflictError, NotFoundError } from '../../lib/errors.js';
 import type { ListFulfillmentQuery, UpdateFulfillmentBody } from './fulfillment.schemas.js';
@@ -46,6 +55,29 @@ const KIND_TO_TYPE: Record<OrderItemKind, FulfillmentType | null> = {
   UPGRADE_CHANGE: null, // 升舱/改期收入：财务记账类
   OVERSALE: null, // 超售收入：财务记账类
 };
+
+/**
+ * 任务的有效签证分类（签发方式 / 入境次数）。
+ *
+ * 优先取签证产品的结构化字段；产品缺失（录单单子多为纯机票行，签证信息只落在
+ * 订单级「签证状态」）时回退录单口径：visaStatus=E_VISA（电子签·三个月多次）
+ * 视为 签发方式=电子签、入境次数=多次。签证台「签证类型」筛选与录单侧由此打通
+ * （公测反馈：仅认产品字段时录单单子全部落入"未标注"，筛不出来）。
+ */
+export function effectiveVisaClassification(
+  visa:
+    | { issuanceMethod: VisaIssuanceMethod | null; entryType: VisaEntryType | null }
+    | null
+    | undefined,
+  orderVisaStatus: VisaRequirement | null | undefined,
+): { issuanceMethod: VisaIssuanceMethod | null; entryType: VisaEntryType | null } {
+  const isOrderLevelEVisa = orderVisaStatus === VisaRequirement.E_VISA;
+  return {
+    issuanceMethod:
+      visa?.issuanceMethod ?? (isOrderLevelEVisa ? VisaIssuanceMethod.E_VISA : null),
+    entryType: visa?.entryType ?? (isOrderLevelEVisa ? VisaEntryType.MULTIPLE : null),
+  };
+}
 
 export class FulfillmentService {
   /**
@@ -85,6 +117,8 @@ export class FulfillmentService {
           fulfillmentTasks: { orderBy: { createdAt: 'asc' } },
           // 本签证 item 关联的签证产品结构化分类（签发方式/入境次数），与 visaName 平级下发
           visa: { select: { visaName: true, issuanceMethod: true, entryType: true } },
+          // 订单级录单签证状态 —— 产品结构化字段缺失时的分类回退来源
+          order: { select: { visaStatus: true } },
         },
       }),
       prisma.passenger.findMany({
@@ -94,8 +128,10 @@ export class FulfillmentService {
       }),
     ]);
     const serializedPassengers = passengers.map(serializePassenger);
-    return items.flatMap((it) =>
-      it.fulfillmentTasks.map((t) => ({
+    return items.flatMap((it) => {
+      // 分类回退：产品结构化字段缺失 → 订单级录单签证状态（E_VISA=电子签·多次）
+      const visaClass = effectiveVisaClassification(it.visa, it.order.visaStatus);
+      return it.fulfillmentTasks.map((t) => ({
         ...serializeTask(t, it),
         // 签证任务附带乘客护照明细 + 签证产品结构化分类；其他类型任务不返回
         // （undefined 被 JSON 序列化忽略）
@@ -103,12 +139,12 @@ export class FulfillmentService {
           ? {
               passengers: serializedPassengers,
               visaName: it.visa?.visaName ?? null,
-              visaIssuanceMethod: it.visa?.issuanceMethod ?? null,
-              visaEntryType: it.visa?.entryType ?? null,
+              visaIssuanceMethod: visaClass.issuanceMethod,
+              visaEntryType: visaClass.entryType,
             }
           : {}),
-      })),
-    );
+      }));
+    });
   }
 
   /**
@@ -161,6 +197,8 @@ export class FulfillmentService {
                   contactPhone: true,
                   status: true,
                   notes: true,
+                  // 订单级录单签证状态 —— 产品结构化字段缺失时的分类回退来源
+                  visaStatus: true,
                 },
               },
             },
@@ -255,14 +293,16 @@ export class FulfillmentService {
         const order = t.orderItem.order;
         // 最早一段机票的出发时间/时区（无机票则 null）— 供签证台显示出发日期
         const firstLeg = earliestLegByOrder.get(order.id) ?? null;
+        // 分类回退：产品结构化字段缺失 → 订单级录单签证状态（E_VISA=电子签·多次），
+        // 签证台「签证类型」筛选/徽章两边口径由此对齐
+        const visaClass = effectiveVisaClassification(t.orderItem.visa, order.visaStatus);
         return {
           ...serializeTask(t, t.orderItem),
           // #7：本签证产品名称（单次/多次签等）置于任务顶层
           visaName: t.orderItem.visa?.visaName ?? null,
-          // 签证产品结构化分类（签发方式/入境次数）；未设置（含旧数据未回填命中）= null，
-          // 与 visaName 平级下发，供签证台后续替换正则猜测的展示逻辑用（本次不改 VisaDeskPage）。
-          visaIssuanceMethod: t.orderItem.visa?.issuanceMethod ?? null,
-          visaEntryType: t.orderItem.visa?.entryType ?? null,
+          // 签证结构化分类（签发方式/入境次数）；产品与订单级都未标注 = null
+          visaIssuanceMethod: visaClass.issuanceMethod,
+          visaEntryType: visaClass.entryType,
           order: {
             ...order,
             // #6：出发日期 + 时区（ISO 字符串 / null）
@@ -295,9 +335,27 @@ export class FulfillmentService {
   async update(id: string, body: UpdateFulfillmentBody) {
     const existing = await prisma.fulfillmentTask.findUnique({
       where: { id },
-      include: { orderItem: true },
+      include: { orderItem: { include: { order: { select: { status: true, deletedAt: true } } } } },
     });
     if (!existing) throw new NotFoundError('履约任务不存在');
+
+    if (body.status !== undefined && body.status !== existing.status) {
+      // CANCELLED 是终态，不许复活（终态化不变式的主写入口守卫，与 resetVisa / worker CAS 同口径）。
+      if (existing.status === FulfillmentStatus.CANCELLED) {
+        throw new ConflictError('任务已取消（终态），不可再改状态');
+      }
+      // 死单/软删单不许把任务写成活动态——否则 worker 可能给死单出票、或签证台复活隐藏任务。
+      const ord = existing.orderItem.order;
+      const toActive =
+        body.status === FulfillmentStatus.PENDING ||
+        body.status === FulfillmentStatus.IN_PROGRESS ||
+        body.status === FulfillmentStatus.CONFIRMED;
+      if (toActive && (ord.deletedAt || !COUNTED_STATUSES.includes(ord.status))) {
+        throw new ConflictError(
+          `父订单状态为 ${ord.status}${ord.deletedAt ? '（已在回收站）' : ''}，不可将任务改为活动态`,
+        );
+      }
+    }
 
     const data: Prisma.FulfillmentTaskUpdateInput = {};
     if (body.status !== undefined) {
@@ -407,11 +465,19 @@ export class FulfillmentService {
   async reissue(id: string) {
     const existing = await prisma.fulfillmentTask.findUnique({
       where: { id },
-      include: { orderItem: true },
+      include: { orderItem: { include: { order: { select: { status: true, deletedAt: true } } } } },
     });
     if (!existing) throw new NotFoundError('履约任务不存在');
     if (existing.type !== FulfillmentType.FLIGHT_TICKETING) {
       throw new NotFoundError('reissue 仅支持 FLIGHT_TICKETING 任务');
+    }
+    // 父订单存活闸：已退款/取消/软删的订单不许重新出票——否则会给死单生成新 PNR、
+    // 清空乘客票号、并给已退款客人发行程单邮件（接真实供应商即真金白银出票）。
+    const parentOrder = existing.orderItem.order;
+    if (parentOrder.deletedAt || !COUNTED_STATUSES.includes(parentOrder.status)) {
+      throw new ConflictError(
+        `订单当前状态为 ${parentOrder.status}${parentOrder.deletedAt ? '（已在回收站）' : ''}，不可重新出票`,
+      );
     }
     if (
       existing.status !== FulfillmentStatus.CONFIRMED &&
@@ -477,9 +543,15 @@ export class FulfillmentService {
   async resendItinerary(orderId: string) {
     const order = await prisma.order.findUnique({
       where: { id: orderId },
-      select: { id: true, orderNumber: true, contactEmail: true },
+      select: { id: true, orderNumber: true, contactEmail: true, status: true, deletedAt: true },
     });
     if (!order) throw new NotFoundError('订单不存在');
+    // 死单/软删单不许重发行程单——不给已取消/退款客人发出行凭证。
+    if (order.deletedAt || !COUNTED_STATUSES.includes(order.status)) {
+      throw new ConflictError(
+        `订单当前状态为 ${order.status}${order.deletedAt ? '（已在回收站）' : ''}，不可重发行程单`,
+      );
+    }
     if (!order.contactEmail) {
       throw new NotFoundError('订单没有联系邮箱，无法发送行程单');
     }

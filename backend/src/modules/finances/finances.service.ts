@@ -352,14 +352,17 @@ export async function getFinancesSummary(
       cost.aircraftAdjust += adj * paxCount;
       cost.takeoffDiscount += disc * paxCount;
 
-      // 收入：FLIGHT amount 按 leg 分（去程 / 返程），机场税 pass-through
+      // 收入：FLIGHT amount 按 leg 分（去程 / 返程）。机场税已含在票价 amt 里（无单独向客人收税的行），
+      // 故把税从票款里"拆出来单列"，而非在 amt 之外再加一遍——否则 rev.total 会比顶部 KPI(revenueCny)
+      // 恒多出机场税总额（细分合计对不上总收入）。拆分后 outboundFlight + outboundTax == amt。
       const amt = dec(it.amount);
+      const taxRev = Math.min(taxCost, amt); // 税不应超过票价本身（异常配置兜底）
       if (isOutbound) {
-        rev.outboundFlight += amt;
-        rev.outboundTax += taxCost;
+        rev.outboundFlight += amt - taxRev;
+        rev.outboundTax += taxRev;
       } else {
-        rev.returnFlight += amt;
-        rev.returnTax += taxCost;
+        rev.returnFlight += amt - taxRev;
+        rev.returnTax += taxRev;
       }
     });
 

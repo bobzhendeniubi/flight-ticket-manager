@@ -23,6 +23,7 @@ import {
 import { getPaymentAdapter } from './payment-adapters.js';
 import { OrderService } from '../orders/orders.service.js';
 import { getDescendantAgentIds } from '../../lib/agent-tree.js';
+import { assertOrderAcceptsFunds } from '../../lib/funds-guard.js';
 
 export interface PaymentRequester {
   userId: string;
@@ -334,10 +335,13 @@ export class PaymentsService {
       await prisma.$transaction(async (tx) => {
       // FOR UPDATE 行锁 + 事务内读余额：并发确认不会用旧快照双计 paidAmount
       const rows = await tx.$queryRaw<
-        Array<{ id: string; orderNumber: string; total: Prisma.Decimal; adjustmentCny: number; paidAmount: Prisma.Decimal; prepaymentOffset: Prisma.Decimal; status: OrderStatus }>
-      >`SELECT id, "orderNumber", total, "adjustmentCny", "paidAmount", "prepaymentOffset", status FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+        Array<{ id: string; orderNumber: string; total: Prisma.Decimal; adjustmentCny: number; paidAmount: Prisma.Decimal; prepaymentOffset: Prisma.Decimal; status: OrderStatus; deletedAt: Date | null }>
+      >`SELECT id, "orderNumber", total, "adjustmentCny", "paidAmount", "prepaymentOffset", status, "deletedAt" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
       const order = rows[0];
       if (!order) throw new NotFoundError('订单不存在');
+      // 资金闸：已取消/已退款/支付超时/草稿/回收站的单一律拒绝入账——
+      // 钱记到死单上没有任何出口，且软删单不进任何统计，实收与报表会永久对不平。
+      assertOrderAcceptsFunds(order);
 
       total = Number(order.total);
       const already = Number(order.paidAmount);
@@ -458,10 +462,12 @@ export class PaymentsService {
   }> {
     // FOR UPDATE 行锁 + 事务内读余额：与 confirmManualPayment 完全一致的并发安全口径
     const rows = await tx.$queryRaw<
-      Array<{ id: string; orderNumber: string; total: Prisma.Decimal; adjustmentCny: number; paidAmount: Prisma.Decimal; prepaymentOffset: Prisma.Decimal; status: OrderStatus }>
-    >`SELECT id, "orderNumber", total, "adjustmentCny", "paidAmount", "prepaymentOffset", status FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+      Array<{ id: string; orderNumber: string; total: Prisma.Decimal; adjustmentCny: number; paidAmount: Prisma.Decimal; prepaymentOffset: Prisma.Decimal; status: OrderStatus; deletedAt: Date | null }>
+    >`SELECT id, "orderNumber", total, "adjustmentCny", "paidAmount", "prepaymentOffset", status, "deletedAt" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
     const order = rows[0];
     if (!order) throw new NotFoundError('订单不存在');
+    // 资金闸（与 confirmManualPayment 同一处实现）：死单/回收站单不许入账
+    assertOrderAcceptsFunds(order);
 
     const total = Number(order.total);
     const already = Number(order.paidAmount);

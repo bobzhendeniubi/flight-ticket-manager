@@ -56,6 +56,10 @@ const CANCELLABLE_STATUSES = new Set([
   'PAID',
   'PROCESSING',
   'TICKETED',
+  // 改签中/已改签也允许走退款取消——状态机矩阵允许 CHANGED→REFUND_REQUESTED、
+  // CHANGE_REQUESTED 亦从占座态发起，quote 层此前漏放导致这两态客户无法自助取消。
+  'CHANGE_REQUESTED',
+  'CHANGED',
   // PENDING_PAYMENT 的取消走另一条路（直接释放座位 + 0 费用），不走 refund
 ]);
 
@@ -95,7 +99,8 @@ export async function computeCancellationQuote(
 
   const totalFee = round2(items.reduce((s, i) => s + i.feeAmount, 0));
   const paidAmount = Number(order.paidAmount);
-  const totalRefund = round2(Math.max(0, paidAmount - totalFee));
+  // 应退硬上限 = 实收金额：绝不退超过客户实际付进来的钱（防负手续费/口径漂移把应退顶穿实收）。
+  const totalRefund = round2(Math.max(0, Math.min(paidAmount, paidAmount - totalFee)));
 
   return {
     orderId: order.id,
@@ -119,6 +124,27 @@ async function quoteItem(
   cancelAt: Date,
 ): Promise<ItemQuote> {
   const amount = Number(item.amount);
+
+  // 非正金额行（优惠/减免 DISCOUNT 等）：不进费率引擎。
+  // 否则"保守按 100% 收费"会算出负手续费，抵减总手续费、把应退顶高（甚至超过实收）。
+  // 优惠对应退的影响已经体现在订单实收 paidAmount 里，这里 fee=0 即可。
+  if (amount <= 0) {
+    return {
+      itemId: item.id,
+      kind: item.kind,
+      description: item.description,
+      amount,
+      hoursLeft: null,
+      policyId: null,
+      policyName: '（优惠/减免行，不计手续费）',
+      matchedTier: null,
+      feePercent: 0,
+      feeAmount: 0,
+      refundAmount: 0,
+      reason: '优惠/减免行不参与取消手续费计算',
+      fulfilled: false,
+    };
+  }
 
   // 1. 找 policy（先精确 scope 匹配，否则 isDefault）
   const scopeId =
