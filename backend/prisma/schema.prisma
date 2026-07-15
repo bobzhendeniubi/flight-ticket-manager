@@ -270,6 +270,7 @@ model Agent {
   settlements            Settlement[]
   orders                 Order[]
   customers              CustomerProfile[]
+  seatAllocations        SeatAllocation[]
 
   @@index([isActive])
   @@index([parentAgentId])
@@ -460,8 +461,8 @@ model Flight {
   costPeriods     FlightCostPeriod[]
   baggagePolicies FlightBaggagePolicy[]
   // 套餐绑定的航班号（模板绑法：只绑航班号，不绑某天；买家选出发日再解析具体班次）
-  outboundBundles Bundle[] @relation("BundleOutboundFlight")
-  returnBundles   Bundle[] @relation("BundleReturnFlight")
+  outboundBundles Bundle[]              @relation("BundleOutboundFlight")
+  returnBundles   Bundle[]              @relation("BundleReturnFlight")
 
   @@unique([flightNumber])
   @@index([originCode, destinationCode])
@@ -485,17 +486,17 @@ model FlightBaggagePolicy {
 }
 
 model FlightSchedule {
-  id               String   @id @default(cuid())
-  flightId         String
-  departureTime    DateTime // UTC
-  arrivalTime      DateTime // UTC
-  departureTz      String // IANA tz, e.g., "Asia/Shanghai"
-  arrivalTz        String
+  id                 String   @id @default(cuid())
+  flightId           String
+  departureTime      DateTime // UTC
+  arrivalTime        DateTime // UTC
+  departureTz        String // IANA tz, e.g., "Asia/Shanghai"
+  arrivalTz          String
   // 包机总成本（CNY）— 整班次付给航司的包机价；按"卖出座位 / 总成本"算单座分摊
-  charterCostCny   Decimal? @db.Decimal(12, 2)
+  charterCostCny     Decimal? @db.Decimal(12, 2)
   // 机场税（CNY/人）— 出发地 / 目的地分开（岘港、澳门税率不同）
-  airportTaxDepCny Decimal? @db.Decimal(10, 2)
-  airportTaxArrCny Decimal? @db.Decimal(10, 2)
+  airportTaxDepCny   Decimal? @db.Decimal(10, 2)
+  airportTaxArrCny   Decimal? @db.Decimal(10, 2)
   // 财务追加成本（CNY/人；起降折扣可填负数代表减项）—— 都是 per-passenger
   fuelCostCny        Decimal? @db.Decimal(10, 2)
   peakSurchargeCny   Decimal? @db.Decimal(10, 2)
@@ -503,34 +504,35 @@ model FlightSchedule {
   takeoffDiscountCny Decimal? @db.Decimal(10, 2)
   // 航司开票上限（张/班次）— 同一班次「按航段」的已开票乘客数不得超过此值。
   // 口径：该班次作为某订单去程时看 outboundInvoiced、作为回程时看 returnInvoiced（见 ticketing-cap.ts）。
-  ticketingCap     Int      @default(191)
-  isActive         Boolean  @default(true)
-  createdAt        DateTime @default(now())
-  updatedAt        DateTime @updatedAt
+  ticketingCap       Int      @default(191)
+  isActive           Boolean  @default(true)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
 
-  flight        Flight            @relation(fields: [flightId], references: [id], onDelete: Cascade)
-  seatClasses   FlightSeatClass[]
-  orderItems    OrderItem[]
-  pricingConfig PricingConfig?
-  seatLocks     SeatLock[]
-  seatWaitlists SeatWaitlist[]
+  flight          Flight            @relation(fields: [flightId], references: [id], onDelete: Cascade)
+  seatClasses     FlightSeatClass[]
+  orderItems      OrderItem[]
+  pricingConfig   PricingConfig?
+  seatLocks       SeatLock[]
+  seatWaitlists   SeatWaitlist[]
+  seatAllocations SeatAllocation[]
 
   @@index([flightId, departureTime])
   @@index([departureTime])
 }
 
 model FlightSeatClass {
-  id         String     @id @default(cuid())
-  scheduleId String
-  cabin      CabinClass
-  capacity   Int // base capacity
-  sold       Int        @default(0) // source of truth; Redis is cache
-  basePrice  Decimal    @db.Decimal(10, 2) // CNY
+  id          String     @id @default(cuid())
+  scheduleId  String
+  cabin       CabinClass
+  capacity    Int // base capacity
+  sold        Int        @default(0) // source of truth; Redis is cache
+  basePrice   Decimal    @db.Decimal(10, 2) // CNY
   // 仓位阶梯（显式动态加价）：有序数组 [{ quota, price }]，最便宜的在前；售罄一档开下一档。
   // null / [] = 未配置阶梯 = 回退旧版 basePrice×日期倍率×余位倍率自动定价。
-  fareBuckets Json?     // [{ "quota": 20, "price": 1280 }, ...]（quota int≥1, price≥0）
-  createdAt  DateTime   @default(now())
-  updatedAt  DateTime   @updatedAt
+  fareBuckets Json? // [{ "quota": 20, "price": 1280 }, ...]（quota int≥1, price≥0）
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
 
   schedule      FlightSchedule @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
   seatLocks     SeatLock[]
@@ -570,6 +572,37 @@ model SeatLock {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 切位（包位）— 从散客池里划出 N 座给某代理专卖；到期未售回散客池。
+// 与锁位/已售的关系（散客池口径）：
+//   散客池余票 = capacity − sold − ACTIVE 未过期锁位 − Σ(ACTIVE 切位 seats)
+// 被切出的座位不是消失：代理仍可卖（走同一 FlightSeatClass.sold 扣减），只是不进散客池。
+// ─────────────────────────────────────────────────────────────────────────────
+enum SeatAllocationStatus {
+  ACTIVE // 生效中，占用散客池
+  RECLAIMED // 已回收（未售部分归还散客池）
+}
+
+model SeatAllocation {
+  id                String               @id @default(cuid())
+  flightScheduleId  String
+  cabin             CabinClass // 定位到 FlightSeatClass（scheduleId + cabin 唯一）
+  agentId           String
+  seats             Int // 切给该代理的座位数
+  unitPriceCny      Int? // 约定单价（选填；null=按常规售价）
+  reclaimDaysBefore Int                  @default(7) // 出发前多少天回收未售部分
+  status            SeatAllocationStatus @default(ACTIVE)
+  notes             String?
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime             @updatedAt
+
+  flightSchedule FlightSchedule @relation(fields: [flightScheduleId], references: [id], onDelete: Cascade)
+  agent          Agent          @relation(fields: [agentId], references: [id], onDelete: Cascade)
+
+  @@index([flightScheduleId, cabin, status])
+  @@index([agentId, status])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // 候补 — 舱位售罄/余票不足时登记；座位释放后 worker 按先来先到标 NOTIFIED
 // ─────────────────────────────────────────────────────────────────────────────
 enum WaitlistStatus {
@@ -603,23 +636,23 @@ model SeatWaitlist {
 // 仍存在并作为"单班次 override"优先生效（resolution: schedule ?? period ?? null）
 // ─────────────────────────────────────────────────────────────────────────────
 model FlightCostPeriod {
-  id               String   @id @default(cuid())
-  flightId         String
+  id                 String   @id @default(cuid())
+  flightId           String
   // 周期生效起止日（date-only；按航班出发地时区匹配班次日期）
-  effectiveFrom    DateTime @db.Date
-  effectiveTo      DateTime @db.Date
+  effectiveFrom      DateTime @db.Date
+  effectiveTo        DateTime @db.Date
   // 周期默认成本（CNY；任一为 null 表示该字段不通过 period 提供，由班次 override 或留空）
-  charterCostCny   Decimal? @db.Decimal(12, 2)
-  airportTaxDepCny Decimal? @db.Decimal(10, 2)
-  airportTaxArrCny Decimal? @db.Decimal(10, 2)
+  charterCostCny     Decimal? @db.Decimal(12, 2)
+  airportTaxDepCny   Decimal? @db.Decimal(10, 2)
+  airportTaxArrCny   Decimal? @db.Decimal(10, 2)
   // 财务追加成本（per-pax CNY；同 FlightSchedule）
   fuelCostCny        Decimal? @db.Decimal(10, 2)
   peakSurchargeCny   Decimal? @db.Decimal(10, 2)
   aircraftAdjustCny  Decimal? @db.Decimal(10, 2)
   takeoffDiscountCny Decimal? @db.Decimal(10, 2)
-  note             String?
-  createdAt        DateTime @default(now())
-  updatedAt        DateTime @updatedAt
+  note               String?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
 
   flight Flight @relation(fields: [flightId], references: [id], onDelete: Cascade)
 
@@ -764,9 +797,9 @@ enum VisaEntryType {
 }
 
 model Visa {
-  id                 String   @id @default(cuid())
+  id                 String              @id @default(cuid())
   // 产品编号（V0001、V0002...）
-  code               String?  @unique
+  code               String?             @unique
   destinationCountry String // ISO 3166-1 alpha-2 (e.g., "VN")
   country            String? // 中文国名（"越南"）
   visaType           String // e.g., "tourist", "business"
@@ -778,18 +811,18 @@ model Visa {
   flag               String? // emoji flag
   photo              String? // 卡片展示图（URL）
   processingDays     Int
-  basePrice          Decimal  @db.Decimal(10, 2)
-  expressSurcharge   Decimal? @db.Decimal(10, 2)
+  basePrice          Decimal             @db.Decimal(10, 2)
+  expressSurcharge   Decimal?            @db.Decimal(10, 2)
   // 使馆/代办成本（CNY）— NULL 时按 basePrice × 0.55 估算（签证毛利通常更高）
-  costPriceCny       Decimal? @db.Decimal(10, 2)
+  costPriceCny       Decimal?            @db.Decimal(10, 2)
   validityMonths     Int? // 签证有效期（月）
   stayDays           Int? // 单次入境最多可停留天数（订单详情「最多可停留 X 天」展示用）
   highlight          String? // "最热销 · 全流程线上"
   requiredDocs       String[] // e.g., ["passport_scan", "photo", "itinerary"]
-  soldCount          Int      @default(0) // 已售份数（展示用，seed 填充）
-  isActive           Boolean  @default(true)
-  createdAt          DateTime @default(now())
-  updatedAt          DateTime @updatedAt
+  soldCount          Int                 @default(0) // 已售份数（展示用，seed 填充）
+  isActive           Boolean             @default(true)
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
 
   orderItems OrderItem[]
 }
@@ -798,72 +831,72 @@ model Visa {
 // Products — Bundles (打包套餐)
 // ─────────────────────────────────────────────────────────────────────────────
 model Bundle {
-  id             String   @id @default(cuid())
+  id                            String   @id @default(cuid())
   // 产品编号（B0001、B0002...）
-  code           String?  @unique
-  name           String
-  tagline        String?
+  code                          String?  @unique
+  name                          String
+  tagline                       String?
   // 服务内容（订单详情 / 前台展示的服务说明，运营在套餐向导里填，每行一条，
   // 如「中文客服，越南当地机场助签」「举牌接机，送至酒店并协助分房」）
-  serviceNotes   String?  @db.Text
+  serviceNotes                  String?  @db.Text
   // 每人操作费（CNY，整数，运营在套餐向导里可改，默认 ¥20）—— 计入起价/人，下单按出行人头收，
   // 是买家实付的一部分（卖价侧）。注意：与 OrderCostItem.OPERATION_FEE /
   // OPERATION_FEE_CNY_PER_ORDER（每单固定 ¥20，财务成本口径，订单创建自动计提）是两个完全独立的
   // 概念——那个是成本侧、按单、系统固定，这个是卖价侧、按人、套餐可配置。两者恰好同名「操作费」，
   // 互不影响、互不派生，不要合并读写。
-  operationFeeCny Int     @default(20)
-  emoji          String?
-  photo          String?
+  operationFeeCny               Int      @default(20)
+  emoji                         String?
+  photo                         String?
   // 套餐组件列表（JSON）: [{kind: 'HOTEL', productName, qty, unitPrice}, ...]
   // 注意：FLIGHT 组件的 unitPrice=0，客户端选日期后调 /flights/price 实时取价
-  items          Json
-  flightPax      Int      @default(1) // 机票组件含多少人
+  items                         Json
+  flightPax                     Int      @default(1) // 机票组件含多少人
   // 套餐折扣（百分比，0–100）：整个全包价(实时机票+地面+加项) × (1 − discountPct/100)。
   // 这是套餐唯一的折扣口径，随出发日自动浮动（机票实时）。运营只填这一个数。
-  discountPct    Int      @default(0)
+  discountPct                   Int      @default(0)
   // [已弃用] 旧的固定 CNY 让利；被 discountPct 取代，新逻辑不再读取（列暂留，避免破坏性迁移）。
-  groundDiscount Decimal  @default(0) @db.Decimal(10, 2)
-  suitableFor    String? // "2 人 · 情侣/家庭"
+  groundDiscount                Decimal  @default(0) @db.Decimal(10, 2)
+  suitableFor                   String? // "2 人 · 情侣/家庭"
   // 套餐关联酒店房型 — 下单时把房型+入住日期盖到订单行上，房控板自动计入套餐占房
-  hotelRoomTypeId String?
-  hotelNights     Int? // 默认入住晚数（客户没填回程日期时按 goDate + hotelNights 推 checkOut）
+  hotelRoomTypeId               String?
+  hotelNights                   Int? // 默认入住晚数（客户没填回程日期时按 goDate + hotelNights 推 checkOut）
   // 套餐绑定的去程 / 回程航班号（模板绑法：只绑航班号，不绑某天）。
   // 买家选出发日后按该航班号 + 本地出发日解析出具体班次（一个航班号一天只有一班）。
   // onDelete SetNull：删航班不删套餐，只解除绑定。
-  outboundFlightId String?
-  returnFlightId   String?
+  outboundFlightId              String?
+  returnFlightId                String?
   // 可选升级加价（CNY，按产品可配置；运营在后台改）— 都是 server-priced add-on：
   //   singleSupplementCnyPerNight = 一个人住酒店（单人入住）/晚 的房差，运营默认 ¥80
   //   businessUpgradeCnyPerLeg    = 升舱商务 /航段 的加价，运营默认 ¥700
   // 注意：豪华/五星套餐（洲际半岛、四季）的单人入住房差远高于平价默认值，故 seed 里按产品上调。
-  singleSupplementCnyPerNight Int @default(80)
-  businessUpgradeCnyPerLeg    Int @default(700)
+  singleSupplementCnyPerNight   Int      @default(80)
+  businessUpgradeCnyPerLeg      Int      @default(700)
   // 占座儿童 / 不占座婴儿定价（按产品可配置；运营在后台改）：
   //   childSeatDiscountCnyPerPerson = 占座儿童比成人每人便宜多少 CNY（运营默认 ¥30，可改）
   //   infantPriceCny                = 不占座婴儿每人价 CNY（默认免费 0，可改）
   // 占座儿童与成人同占 1 座（机票按成人价减此折扣）；婴儿不占座、不占房，仍需护照。
-  childSeatDiscountCnyPerPerson Int @default(30)
-  infantPriceCny                Int @default(0)
+  childSeatDiscountCnyPerPerson Int      @default(30)
+  infantPriceCny                Int      @default(0)
   // 自备签证可减额（CNY）：套餐含签证费时，客人自备签证（不需要送签）则从套餐价减此额。
   // 运营在后台改；0 = 不允许减。录单勾"客人自备签证"时由 computeBundleAddOn 扣减。
-  selfVisaDeductCny             Int @default(0)
+  selfVisaDeductCny             Int      @default(0)
   // 机票航段数（来回 = 2，单程 = 1）— 升舱加价 = businessUpgradeCnyPerLeg × legs × businessCount
-  legs           Int      @default(2)
+  legs                          Int      @default(2)
   // 运营封盘日（按出发日 D）：该日整套餐不可售，优先级高于库存判定。
   //   形如 [{date:"2026-02-15", reason:"春节封盘"}]；reason 可选。
-  blackoutDates     Json    @default("[]")
+  blackoutDates                 Json     @default("[]")
   // 该套餐前台默认出发日（YYYY-MM-DD）；null = 用全局默认。
   //   仅影响前台初始选中的出发日，不参与"可售判定"。
-  defaultDepartDate String?
-  soldCount      Int      @default(0) // 已售份数（展示用，seed 填充）
-  isActive       Boolean  @default(true)
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  defaultDepartDate             String?
+  soldCount                     Int      @default(0) // 已售份数（展示用，seed 填充）
+  isActive                      Boolean  @default(true)
+  createdAt                     DateTime @default(now())
+  updatedAt                     DateTime @updatedAt
 
-  hotelRoomType HotelRoomType? @relation(fields: [hotelRoomTypeId], references: [id])
-  outboundFlight Flight? @relation("BundleOutboundFlight", fields: [outboundFlightId], references: [id], onDelete: SetNull)
-  returnFlight   Flight? @relation("BundleReturnFlight", fields: [returnFlightId], references: [id], onDelete: SetNull)
-  orderItems    OrderItem[]
+  hotelRoomType  HotelRoomType? @relation(fields: [hotelRoomTypeId], references: [id])
+  outboundFlight Flight?        @relation("BundleOutboundFlight", fields: [outboundFlightId], references: [id], onDelete: SetNull)
+  returnFlight   Flight?        @relation("BundleReturnFlight", fields: [returnFlightId], references: [id], onDelete: SetNull)
+  orderItems     OrderItem[]
 
   @@index([isActive])
 }
@@ -935,9 +968,9 @@ enum OrderItemKind {
   INSURANCE
   FEE // airport construction / fuel surcharge
   DISCOUNT
-  GUIDE          // 导游服务费收入（财务细分）
+  GUIDE // 导游服务费收入（财务细分）
   UPGRADE_CHANGE // 升舱 / 改期收入
-  OVERSALE       // 超售收入
+  OVERSALE // 超售收入
 }
 
 enum InvoiceStatus {
@@ -947,67 +980,67 @@ enum InvoiceStatus {
 }
 
 model Order {
-  id               String        @id @default(cuid())
-  orderNumber      String        @unique // human-friendly, e.g., "FTM2026041400001"
-  userId           String? // null for guest (no-login) checkout
-  agentId          String? // non-null when placed by an agent
+  id                   String           @id @default(cuid())
+  orderNumber          String           @unique // human-friendly, e.g., "FTM2026041400001"
+  userId               String? // null for guest (no-login) checkout
+  agentId              String? // non-null when placed by an agent
   // 游客下单（免登录）联系人 —— userId=null 时用于公开订单查询匹配 + 履约联系
-  guestName        String?
-  guestPhone       String?
-  guestEmail       String?
-  status           OrderStatus   @default(DRAFT)
+  guestName            String?
+  guestPhone           String?
+  guestEmail           String?
+  status               OrderStatus      @default(DRAFT)
   // 开票状态（旧的订单级单值，兼容保留）：REQUESTED 仍表示客户已要求开票；
   // 已被下面三个「按航段/系统」的布尔位取代作为主口径（票务岗六态）。
-  invoiceStatus    InvoiceStatus @default(NONE)
+  invoiceStatus        InvoiceStatus    @default(NONE)
   // 六态开票（三个独立维度，不是一个枚举六值）—— 票务岗需按航段分别开票并导出：
   //   outboundInvoiced = 去程已开；returnInvoiced = 回程已开；systemInvoiced = 系统已开。
   // 去程/回程判定：订单 FLIGHT 行按班次 departureTime 升序，第 1 段=去程、第 2 段=回程
   //（单程只有去程；>2 段的罕见情形只认前两段）。存量 invoiceStatus=ISSUED 的单迁移回填三者=true。
-  outboundInvoiced Boolean       @default(false)
-  returnInvoiced   Boolean       @default(false)
-  systemInvoiced   Boolean       @default(false)
-  currency         String        @default("CNY")
-  subtotal         Decimal       @db.Decimal(12, 2)
-  taxesAndFees     Decimal       @default(0) @db.Decimal(12, 2)
-  discountTotal    Decimal       @default(0) @db.Decimal(12, 2)
-  total            Decimal       @db.Decimal(12, 2)
-  paidAmount       Decimal       @default(0) @db.Decimal(12, 2)
-  prepaymentOffset Decimal       @default(0) @db.Decimal(12, 2)
-  contactName      String
-  contactPhone     String
-  contactEmail     String?
-  paymentExpiresAt DateTime?
-  idempotencyKey   String?       @unique
-  notes            String? // 客户填写的特殊说明（兼容保留：老的自由文本备注框）
-  internalNotes    String? // 运营/客服内部备忘（客户看不到）
+  outboundInvoiced     Boolean          @default(false)
+  returnInvoiced       Boolean          @default(false)
+  systemInvoiced       Boolean          @default(false)
+  currency             String           @default("CNY")
+  subtotal             Decimal          @db.Decimal(12, 2)
+  taxesAndFees         Decimal          @default(0) @db.Decimal(12, 2)
+  discountTotal        Decimal          @default(0) @db.Decimal(12, 2)
+  total                Decimal          @db.Decimal(12, 2)
+  paidAmount           Decimal          @default(0) @db.Decimal(12, 2)
+  prepaymentOffset     Decimal          @default(0) @db.Decimal(12, 2)
+  contactName          String
+  contactPhone         String
+  contactEmail         String?
+  paymentExpiresAt     DateTime?
+  idempotencyKey       String?          @unique
+  notes                String? // 客户填写的特殊说明（兼容保留：老的自由文本备注框）
+  internalNotes        String? // 运营/客服内部备忘（客户看不到）
   // 订单级签证状态（录单时选择）
-  visaStatus       VisaRequirement?
+  visaStatus           VisaRequirement?
   // 结构化备注四栏（取代「一个框 + 手工排序」的老做法）；与 notes 并存，互不影响
-  noteHotel        String? // 酒店
-  noteVisa         String? // 签证
-  notePayment      String? // 付款
-  noteSpecial      String? // 特殊
+  noteHotel            String? // 酒店
+  noteVisa             String? // 签证
+  notePayment          String? // 付款
+  noteSpecial          String? // 特殊
   // 防漏单：哪位运营接的单 + 接单时间
-  claimedById      String?
-  claimedAt        DateTime?
+  claimedById          String?
+  claimedAt            DateTime?
   // 套票拼房分配 — { roomGroups: [{ id, hotelName, roomType, passengerIds: [], notes }] }
-  roomAssignment   Json?
+  roomAssignment       Json?
   // 出纳：预期到账总额（CNY）+ 锁定标记。锁定后只 ADMIN 能改，避免运营随便改。
-  expectedAmountCny    Decimal? @db.Decimal(12, 2)
-  expectedAmountLocked Boolean  @default(false)
+  expectedAmountCny    Decimal?         @db.Decimal(12, 2)
+  expectedAmountLocked Boolean          @default(false)
   // 售后费用（改期费 / 换人费等）：累计客户应补付的金额（CNY，整数）。
   // 应付 = total + adjustmentCny；尾款 = total + adjustmentCny − paidAmount。
   // 不改 total/subtotal（机票基础价不重算），只在结清口径上叠加。
-  adjustmentCny    Int           @default(0)
+  adjustmentCny        Int              @default(0)
   // 售后费用流水（审计）：[{ type, label, amountCny, at, by }]
   // type ∈ RESCHEDULE_FEE | SWAP_FEE | ...；by = 操作人 userId（无则 null）
-  adjustments      Json          @default("[]")
+  adjustments          Json             @default("[]")
   // 软删除：非空 = 已删。删除 = 从所有列表/导出/统计里消失，但整行数据保留可追溯。
   // 仅 ADMIN 可删，且只允许删「已释放座位」的订单（守卫见 orders.service.softDeleteOrder），
   // 删除本身绝不触碰库存/座位账（不偷偷释放）。查询口径统一挂 deletedAt: null 排除。
-  deletedAt        DateTime?
-  createdAt        DateTime      @default(now())
-  updatedAt        DateTime      @updatedAt
+  deletedAt            DateTime?
+  createdAt            DateTime         @default(now())
+  updatedAt            DateTime         @updatedAt
 
   user              User?                 @relation("OrderUser", fields: [userId], references: [id])
   agent             Agent?                @relation(fields: [agentId], references: [id])
@@ -1078,10 +1111,10 @@ model OrderItem {
 // ─────────────────────────────────────────────────────────────────────────────
 enum OrderCostCategory {
   GUIDE_SERVICE // 导游服务费
-  COMP_GIFT     // 赠送费用
-  HANDLING_FEE  // 手续费
+  COMP_GIFT // 赠送费用
+  HANDLING_FEE // 手续费
   OPERATION_FEE // 操作费（订单录入/服务人员费，每单固定）
-  OTHER         // 其他
+  OTHER // 其他
 }
 
 model OrderCostItem {
@@ -1163,7 +1196,7 @@ model Passenger {
   passengerType  PassengerType @default(ADULT)
 
   // ── 护照扩展（出票 + 签证用）──
-  chineseName          String?   // 中文姓名（OCR 识别或手工填写）
+  chineseName          String? // 中文姓名（OCR 识别或手工填写）
   passportIssueDate    DateTime? @db.Date // 护照签发日期
   passportIssueCountry String? // 颁发国 ISO-2，如 CHN
   passportIssuePlace   String? // 护照签发地点（城市/机关文本，OCR 识别或手填，选填）
@@ -1197,10 +1230,10 @@ model Passenger {
   //   visaExempt = 客人自备签证（无需送签）：签证台按此过滤掉该乘客，套餐价按人扣减 selfVisaDeductCny。
   //   singleRoom = 单住（不拼房，按人收单房差）；默认 false = 拼房。
   // 均 @default(false) → 旧数据/旧客户端天然回落「随套餐办签 + 拼房」，与扩展前定价完全一致。
-  visaExempt          Boolean @default(false)
-  singleRoom          Boolean @default(false)
+  visaExempt       Boolean @default(false)
+  singleRoom       Boolean @default(false)
   // 护照照片（OCR 上传或人工补传）
-  passportPhotoUrl    String?
+  passportPhotoUrl String?
 
   pnr           String? // booked PNR from airline
   eticketNumber String?
@@ -1560,7 +1593,7 @@ model OperationalReminder {
 model AiOcrConfig {
   id          String   @id @default(cuid())
   provider    String   @default("QWEN")
-  apiKey      String?  // 明文存库；序列化给前端时打码（不返回原文）
+  apiKey      String? // 明文存库；序列化给前端时打码（不返回原文）
   baseUrl     String?
   model       String?
   enabled     Boolean  @default(true)

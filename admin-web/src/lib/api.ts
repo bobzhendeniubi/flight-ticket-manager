@@ -572,6 +572,60 @@ export interface UpdateAgentInput {
   notes?: string;
 }
 
+// ── 切位（包位）── 与 backend seat-allocation 模块对齐
+export type SeatAllocationStatus = 'ACTIVE' | 'RECLAIMED';
+
+export interface CreateSeatAllocationInput {
+  flightScheduleId: string;
+  cabin: CabinClass;
+  agentId: string;
+  /** 切给代理的座位数（≥1，绝不超过散客池余量） */
+  seats: number;
+  /** 约定单价（每人 CNY，整数）；null / 省略 = 按常规售价 */
+  unitPriceCny?: number | null;
+  /** 出发前多少天回收未售部分（默认 7；0..365） */
+  reclaimDaysBefore?: number;
+  notes?: string | null;
+}
+
+// 创建后端返回的原始切位记录（POST 响应）
+export interface SeatAllocationRecord {
+  id: string;
+  flightScheduleId: string;
+  cabin: CabinClass;
+  agentId: string;
+  seats: number;
+  unitPriceCny: number | null;
+  reclaimDaysBefore: number;
+  status: SeatAllocationStatus;
+  notes: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+// 列表项（GET 响应）—— 含代理与班次冗余字段，供 UI 直接渲染
+export interface SeatAllocationListItem {
+  id: string;
+  flightScheduleId: string;
+  cabin: CabinClass;
+  agentId: string;
+  agent: { id: string; companyName: string | null; contactName: string; tier: number };
+  seats: number;
+  unitPriceCny: number | null;
+  reclaimDaysBefore: number;
+  status: SeatAllocationStatus;
+  notes: string | null;
+  flightNumber: string;
+  originCode: string;
+  destinationCode: string;
+  departureTime: string;
+  departureTz: string;
+  /** 是否已过回收截止（仅 ACTIVE 有意义）；供 UI 高亮「可回收」 */
+  expired: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
 // ── Orders ────────────────────────────────────────────────────────────────
 export type OrderStatus =
   | 'DRAFT'
@@ -1930,6 +1984,29 @@ export const api = {
       token,
       body: { isActive },
     }),
+
+  // 切位（包位）——从散客池划座给代理专卖，到期未售回散客池（ADMIN/STAFF）
+  createSeatAllocation: (token: string, body: CreateSeatAllocationInput) =>
+    apiFetch<{ allocation: SeatAllocationRecord }>('/seat-allocations/', {
+      method: 'POST',
+      token,
+      body,
+    }),
+  listSeatAllocations: (
+    token: string,
+    filter?: { flightScheduleId?: string; agentId?: string },
+  ) => {
+    const params = new URLSearchParams();
+    if (filter?.flightScheduleId) params.set('flightScheduleId', filter.flightScheduleId);
+    if (filter?.agentId) params.set('agentId', filter.agentId);
+    const qs = params.toString() ? `?${params.toString()}` : '';
+    return apiFetch<{ allocations: SeatAllocationListItem[] }>(`/seat-allocations/${qs}`, { token });
+  },
+  reclaimSeatAllocation: (token: string, id: string) =>
+    apiFetch<{ result: { id: string; status: SeatAllocationStatus } }>(
+      `/seat-allocations/${id}/reclaim`,
+      { method: 'POST', token },
+    ),
 
   // Orders
   listOrders: (token: string, query?: ListOrdersParams) => {
