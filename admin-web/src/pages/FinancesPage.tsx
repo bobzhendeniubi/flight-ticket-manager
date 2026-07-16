@@ -1790,15 +1790,27 @@ function MonthlyTab({ token }: { token: string }) {
         {points.map((p) => {
           const revenuePct = p.revenueCny / maxRevenue;
           const costPct = p.costCny / maxRevenue;
-          const marginTone = p.grossMarginCny < 0 ? 'text-rose-700' : 'text-emerald-700';
+          // 毛利 null = 本月有订单项缺成本快照 → 显示「未知」而非 ¥0（0 和未知是两件事）。
+          const margin = p.grossMarginCny;
+          const marginTone =
+            margin == null
+              ? 'text-slate-400'
+              : margin < 0
+                ? 'text-rose-700'
+                : 'text-emerald-700';
           return (
             <div key={p.month} className="space-y-1">
               <div className="flex items-center justify-between text-xs">
                 <span className="font-medium text-slate-700">{fmtMonth(p.month)}</span>
                 <span className="text-slate-500">
                   收入 {fmtCny(p.revenueCny)} · 成本 {fmtCny(p.costCny)} ·{' '}
-                  <span className={marginTone}>毛利 {fmtCny(p.grossMarginCny)}</span> ·{' '}
-                  {p.orderCount} 单
+                  <span className={marginTone}>
+                    毛利 {margin != null ? fmtCny(margin) : '未知'}
+                  </span>
+                  {margin == null && (
+                    <span className="text-slate-400">（{p.missingCostItemCount} 项缺成本）</span>
+                  )}{' '}
+                  · {p.orderCount} 单
                 </span>
               </div>
               <div className="relative h-3 w-full overflow-hidden rounded-full bg-slate-100">

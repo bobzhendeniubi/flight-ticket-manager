@@ -3292,7 +3292,9 @@ export interface MonthlyPoint {
   month: string;
   revenueCny: number;
   costCny: number;
-  grossMarginCny: number;
+  // 缺任一件成本 → null（未知，非 0）。成本快照上线前的历史月份多为 null。
+  grossMarginCny: number | null;
+  missingCostItemCount: number;
   orderCount: number;
 }
 

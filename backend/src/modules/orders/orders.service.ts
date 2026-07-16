@@ -736,6 +736,9 @@ export class OrderService {
               bundleId: p.bundleId ?? null,
               // 计费房间数（支持 0.5 间）：套餐/酒店行解析后落库，供房控读取。
               roomsBilled: p.roomsBilled != null ? new Prisma.Decimal(p.roomsBilled) : null,
+              // 产品类成本快照（房/签/车）：NULL = 产品未录成本或 FLIGHT 行（机票走班次重算）。
+              unitCostCny: p.unitCostCny != null ? new Prisma.Decimal(p.unitCostCny) : null,
+              totalCostCny: p.totalCostCny != null ? new Prisma.Decimal(p.totalCostCny) : null,
               metadata: (p.metadata ?? undefined) as Prisma.InputJsonValue | undefined,
             })),
           },
@@ -1052,6 +1055,13 @@ export class OrderService {
       bundleId?: string;
       // 解析后的计费房间数（支持 0.5 间）。落到 OrderItem.roomsBilled 供房控读取。
       roomsBilled?: number;
+      // 产品类成本快照（房/签/车，下单时已知）。落到 OrderItem.unitCostCny/totalCostCny，
+      // 供财务毛利真账。FLIGHT 不写这两栏：包机成本是下单之后才由财务按班次填的，
+      // 下单那一刻它根本不存在，且本就是航班级属性 —— 硬快照只会造出永久 NULL。
+      // 机票毛利永远走班次成本周期重算（见 finances 成本口径），不在此快照。
+      // 产品未录成本（costPriceCny 为 NULL）→ 快照留 undefined → 毛利显示「未知」，不虚高。
+      unitCostCny?: number;
+      totalCostCny?: number;
       metadata?: Record<string, unknown>;
     }> = [];
 
@@ -1115,14 +1125,18 @@ export class OrderService {
         // 计费房间数（支持 0.5 间）：录单方显式传 roomsBilled 时按其缩放，缺省 1（与旧版一致）。
         // 单独 HOTEL 行无套餐占座模型，故不走 computeRoomsNeeded（那是套餐容量口径）。
         const rooms = item.roomsBilled ?? 1;
+        // 成本快照（每间每晚）：仅有产品 id 时可从 DB 取；无 id 的自由行手录成本未知 → 留空。
+        let hotelUnitCost: number | undefined;
         if (item.hotelRoomTypeId) {
           const rt = await prisma.hotelRoomType.findUnique({
             where: { id: item.hotelRoomTypeId },
-            select: { basePrice: true, hotel: { select: { isActive: true } } },
+            select: { basePrice: true, costPriceCny: true, hotel: { select: { isActive: true } } },
           });
           if (!rt) throw new NotFoundError(`酒店房型 ${item.hotelRoomTypeId} 不存在`);
           if (!rt.hotel.isActive) throw new BadRequestError('酒店已下架');
           unitPrice = Number(rt.basePrice);
+          // 成本快照（每间每晚）：产品未录成本 → undefined → 毛利「未知」，不落 0 虚高。
+          hotelUnitCost = rt.costPriceCny != null ? Number(rt.costPriceCny) : undefined;
           // A3：拒绝偏离服务端权威价超容差的提交（仅有产品 id 时校验，无 id 走信任旧路径）。
           // 0.5 间：金额随 roomsBilled 缩放，容差按同一房间数口径比较，避免误判价格变动。
           assertAmountWithinTolerance('酒店', item.unitPrice, unitPrice, item.quantity * rooms);
@@ -1141,18 +1155,24 @@ export class OrderService {
           hotelCheckIn: item.checkIn ? new Date(item.checkIn) : undefined,
           hotelCheckOut: item.checkOut ? new Date(item.checkOut) : undefined,
           roomsBilled: rooms,
+          unitCostCny: hotelUnitCost,
+          // 总成本与 amount 同口径缩放（×qty×rooms），保证毛利 = amount − totalCostCny 诚实。
+          totalCostCny:
+            hotelUnitCost != null ? Math.round(hotelUnitCost * item.quantity * rooms) : undefined,
           metadata: item.metadata,
         });
       } else if (item.kind === 'TRANSFER') {
         let unitPrice = item.unitPrice;
+        let transferUnitCost: number | undefined;
         if (item.transferId) {
           const t = await prisma.transfer.findUnique({
             where: { id: item.transferId },
-            select: { basePrice: true, isActive: true },
+            select: { basePrice: true, costPriceCny: true, isActive: true },
           });
           if (!t) throw new NotFoundError(`接送产品 ${item.transferId} 不存在`);
           if (!t.isActive) throw new BadRequestError('接送产品已下架');
           unitPrice = Number(t.basePrice);
+          transferUnitCost = t.costPriceCny != null ? Number(t.costPriceCny) : undefined;
           assertAmountWithinTolerance('接送', item.unitPrice, unitPrice, item.quantity);
         } else if (!allowClientPricedGround) {
           throw new BadRequestError('接送行必须选择系统内的接送产品，不能自定义价格');
@@ -1164,14 +1184,18 @@ export class OrderService {
           unitPrice,
           amount: Math.round(unitPrice * item.quantity),
           transferId: item.transferId,
+          unitCostCny: transferUnitCost,
+          totalCostCny:
+            transferUnitCost != null ? Math.round(transferUnitCost * item.quantity) : undefined,
           metadata: item.metadata,
         });
       } else if (item.kind === 'VISA') {
         let unitPrice = item.unitPrice;
+        let visaUnitCost: number | undefined;
         if (item.visaId) {
           const v = await prisma.visa.findUnique({
             where: { id: item.visaId },
-            select: { basePrice: true, expressSurcharge: true, isActive: true },
+            select: { basePrice: true, expressSurcharge: true, costPriceCny: true, isActive: true },
           });
           if (!v) throw new NotFoundError(`签证产品 ${item.visaId} 不存在`);
           if (!v.isActive) throw new BadRequestError('签证产品已下架');
@@ -1180,6 +1204,9 @@ export class OrderService {
           unitPrice = express && v.expressSurcharge
             ? baseUnitPrice + Number(v.expressSurcharge)
             : baseUnitPrice;
+          // 成本快照 = 送签成本（costPriceCny），不含加急费：加急是纯毛利（卖的是速度，
+          // 送签成本不变），系统尚无独立加急成本字段。加急成本口径待后续单独接入。
+          visaUnitCost = v.costPriceCny != null ? Number(v.costPriceCny) : undefined;
           assertAmountWithinTolerance('签证', item.unitPrice, unitPrice, item.quantity);
         } else if (!allowClientPricedGround) {
           throw new BadRequestError('签证行必须选择系统内的签证产品，不能自定义价格');
@@ -1191,6 +1218,9 @@ export class OrderService {
           unitPrice,
           amount: Math.round(unitPrice * item.quantity),
           visaId: item.visaId,
+          unitCostCny: visaUnitCost,
+          totalCostCny:
+            visaUnitCost != null ? Math.round(visaUnitCost * item.quantity) : undefined,
           metadata: item.metadata,
         });
       } else if (item.kind === 'BUNDLE') {

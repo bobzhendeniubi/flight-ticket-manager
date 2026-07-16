@@ -169,7 +169,14 @@ export interface MonthlyPoint {
   month: string;
   revenueCny: number;
   costCny: number;
-  grossMarginCny: number;
+  /**
+   * 毛利 = 收入 − 成本；缺任一件成本 → null（「未知」，非 0）。与 orderPnl 同口径：
+   * 把缺成本当 0 会让毛利系统性虚高，一旦被信任上报就收不回；空毛利补了成本即恢复。
+   * 成本快照上线前的历史月份多为 null，属预期。
+   */
+  grossMarginCny: number | null;
+  /** 本月缺成本快照的订单项数（>0 时毛利为 null，供 UI 标「未知」）。 */
+  missingCostItemCount: number;
   orderCount: number;
 }
 
@@ -665,18 +672,23 @@ export async function getMonthlyTrend(
 
     let revenue = 0;
     let cost = 0;
+    let missingCostItemCount = 0;
     for (const o of orders) {
       for (const it of o.items) {
         revenue += dec(it.amount);
         if (it.totalCostCny != null) cost += dec(it.totalCostCny);
+        else missingCostItemCount += 1;
       }
     }
 
+    // 缺任一件成本 → 毛利 null（未知），不把缺失当 0 造成系统性虚高。
+    const grossMarginCny = missingCostItemCount === 0 ? round2(revenue - cost) : null;
     points.push({
       month: monthKey,
       revenueCny: round2(revenue),
       costCny: round2(cost),
-      grossMarginCny: round2(revenue - cost),
+      grossMarginCny,
+      missingCostItemCount,
       orderCount: orders.length,
     });
   }

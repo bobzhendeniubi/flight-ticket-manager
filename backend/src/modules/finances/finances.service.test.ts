@@ -23,7 +23,7 @@ import { describe, it, expect, vi } from 'vitest';
 vi.mock('../../db/prisma.js', () => ({ prisma: {} }));
 
 import type { PrismaClient } from '@prisma/client';
-import { getFinancesSummary } from './finances.service.js';
+import { getFinancesSummary, getMonthlyTrend } from './finances.service.js';
 
 const RANGE = { from: '2026-01-01', to: '2026-01-31' };
 
@@ -179,5 +179,41 @@ describe('getFinancesSummary — REFUNDED 订单已收-已退净额', () => {
 
     expect(summary.revenueBreakdown.refund).toBe(-300);
     expect(summary.revenueCny).toBe(-300);
+  });
+});
+
+describe('getMonthlyTrend — 缺成本 → 毛利 null（未知，非 0）', () => {
+  function trendClient(items: { amount: number; totalCostCny: number | null }[]): PrismaClient {
+    return {
+      order: {
+        // n=1 → 只查当月一次；返回同一批订单项即可
+        findMany: vi.fn(async () => [{ items }]),
+      },
+    } as unknown as PrismaClient;
+  }
+
+  it('全部有成本 → 毛利 = 收入 − 成本，missingCostItemCount = 0', async () => {
+    const points = await getMonthlyTrend(1, trendClient([
+      { amount: 1000, totalCostCny: 600 },
+      { amount: 500, totalCostCny: 200 },
+    ]));
+    expect(points).toHaveLength(1);
+    expect(points[0].revenueCny).toBe(1500);
+    expect(points[0].costCny).toBe(800);
+    expect(points[0].grossMarginCny).toBe(700);
+    expect(points[0].missingCostItemCount).toBe(0);
+  });
+
+  it('有一件缺成本 → 毛利 null，不把缺失当 0 造成虚高', async () => {
+    const points = await getMonthlyTrend(1, trendClient([
+      { amount: 1000, totalCostCny: 600 },
+      { amount: 500, totalCostCny: null }, // 缺成本
+    ]));
+    // 收入/成本仍如实累加（成本只累加已知件）
+    expect(points[0].revenueCny).toBe(1500);
+    expect(points[0].costCny).toBe(600);
+    // 但毛利不显示 900（=1500−600 的虚高值），而是 null
+    expect(points[0].grossMarginCny).toBeNull();
+    expect(points[0].missingCostItemCount).toBe(1);
   });
 });
