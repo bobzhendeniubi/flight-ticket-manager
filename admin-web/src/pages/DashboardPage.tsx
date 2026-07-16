@@ -3,13 +3,14 @@ import { Link } from 'react-router-dom';
 import { api, ApiError, type DashboardKpi, type DashboardWeeklyPoint, type DashboardTopAgent, type OrderSummary } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { RealtimeActivity } from '../components/RealtimeActivity';
+import { PendingAgingCard } from '../components/dashboard/PendingAgingCard';
 
 const STATUS_LABEL: Record<string, string> = {
   DRAFT: '草稿',
   PENDING_PAYMENT: '待支付',
   PAID: '已支付',
   PROCESSING: '处理中',
-  TICKETED: '已出票',
+  TICKETED: '出票完成',
   COMPLETED: '已完成',
   PAYMENT_TIMEOUT: '超时',
   CANCELLED: '已取消',
@@ -102,8 +103,8 @@ export function DashboardPage() {
         <KpiCard
           title="待支付订单"
           value={kpi ? kpi.pendingOrders.toString() : '—'}
-          change="需人工跟进"
-          sub="PENDING_PAYMENT 状态"
+          change="都在占着机位"
+          sub="账龄明细见下方卡片"
         />
         <KpiCard
           title="活跃代理"
@@ -112,6 +113,8 @@ export function DashboardPage() {
           sub="含所有层级"
         />
       </section>
+
+      <PendingAgingCard />
 
       <section className="grid gap-4 lg:grid-cols-3">
         <div className="card lg:col-span-2">

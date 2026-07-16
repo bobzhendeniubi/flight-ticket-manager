@@ -17,7 +17,7 @@ const STATUS_BADGE: Record<string, { label: string; color: string }> = {
   PENDING_PAYMENT: { label: '待支付', color: 'badge-warning' },
   PAID: { label: '已支付', color: 'badge-success' },
   PROCESSING: { label: '处理中', color: 'badge-info' },
-  TICKETED: { label: '已出票', color: 'badge-success' },
+  TICKETED: { label: '出票完成', color: 'badge-success' },
   COMPLETED: { label: '已完成', color: 'badge-neutral' },
   PAYMENT_TIMEOUT: { label: '超时', color: 'badge-neutral' },
   CANCELLED: { label: '已取消', color: 'badge-neutral' },

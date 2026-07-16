@@ -11,6 +11,7 @@ import { BadRequestError, ConflictError, NotFoundError } from '../../lib/errors.
 import { writeAudit } from '../../lib/audit.js';
 import type { AuditActor } from '../../lib/audit.js';
 import { PricingService } from '../pricing/pricing.service.js';
+import type { PriceResult } from '../pricing/pricing.service.js';
 import { parseFareBuckets } from '../pricing/pricing.schemas.js';
 import type { FareBucketsInput } from '../pricing/pricing.schemas.js';
 import { localDate } from '../finances/finances.cost.service.js';
@@ -86,19 +87,132 @@ export function capPublicAvailable(available: number): number {
   return Math.min(Math.max(0, available), PUBLIC_AVAILABLE_CAP);
 }
 
+// ── 公开响应白名单序列化（唯一出口）──────────────────────────────────────────
+// 口径：公开端点（/flights/search、/flights/price）一律「选字段」而非「删字段」。
+// 逐字段剥离（`({ availExact: _a, ...pub })`）只挡得住写它时想到的那几个字段——内部对象
+// 后补的字段会原样透传出去。dateRank（公司内部日期等级 A/B/C/D）就是这么漏出去的：
+// 剥离那行只摘了 availExact。白名单反过来：默认不透传，要给客户看的字段必须显式写进来。
+// 带角色守卫的内部路由不经过这层（运营内部参考仍需 dateRank 等字段），见 serializeScheduleForAgent。
+
+/** 公开口径的 perSeatBreakdown 单项——只含计价展示字段。 */
+export interface PublicSeatBreakdownView {
+  seatIndex: number;
+  bucket: number;
+  bucketMultiplier: number;
+  unitPrice: number;
+}
+
 /**
- * 公开端点 /flights/price 的 perSeatBreakdown 脱敏。
+ * 公开端点 /flights/price 的 perSeatBreakdown 白名单 + seatIndex 脱敏。
  * seatIndex 原值 = sold + 1 + i（该班次这个舱位历史上第几张票，绝对张数）——匿名端拿到后
  * 可直接反推 sold（如 qty=1 时 sold = seatIndex − 1），是与 capPublicAvailable 同一类侧信道
  * 泄露（都能重建实时销量），只是走的是 perSeatBreakdown 而非 currentBucketRemaining。
  * 改成相对索引 1..qty（本次请求内第几张，不含历史销量信息）；bucket/unitPrice 等计价字段不变，
- * 价格展示不受影响。仅供公开路由调用——需要真实 seatIndex 的内部调用方（如下单时写入订单行
- * metadata 存证）直接用 PricingService.calculatePrice 的原始结果，不经过这层脱敏。
+ * 价格展示不受影响。需要真实 seatIndex 的内部调用方（如下单时写入订单行 metadata 存证）
+ * 直接用 PricingService.calculatePrice 的原始结果，不经过这层。
  */
-export function sanitizePublicSeatBreakdown<T extends { seatIndex: number }>(
-  breakdown: readonly T[],
-): T[] {
-  return breakdown.map((seat, i) => ({ ...seat, seatIndex: i + 1 }));
+export function toPublicSeatBreakdown(
+  breakdown: readonly PublicSeatBreakdownView[],
+): PublicSeatBreakdownView[] {
+  return breakdown.map((seat, i) => ({
+    seatIndex: i + 1, // 相对索引，不含历史销量信息
+    bucket: seat.bucket,
+    bucketMultiplier: seat.bucketMultiplier,
+    unitPrice: seat.unitPrice,
+  }));
+}
+
+/** 公开口径的 /flights/price 响应——不含 dateRank/dateMultiplier。 */
+export interface PublicPriceView {
+  scheduleId: string;
+  cabin: CabinClass;
+  qty: number;
+  pricingMode: 'LADDER' | 'AUTO';
+  basePrice: number;
+  bucketSize: number;
+  totalBuckets: number;
+  currentBucket: number;
+  currentBucketRemaining: number;
+  perSeatBreakdown: PublicSeatBreakdownView[];
+  totalPrice: number;
+  averageUnitPrice: number;
+}
+
+/**
+ * 公开端点 /flights/price 的响应白名单。
+ * 剔除 dateRank（内部日期等级，不对客户输出）与 dateMultiplier（恒为 1，对客户零信息量）；
+ * currentBucketRemaining 封顶、perSeatBreakdown 走 toPublicSeatBreakdown（防反推实时销量）。
+ */
+export function toPublicPrice(pricing: PriceResult): PublicPriceView {
+  return {
+    scheduleId: pricing.scheduleId,
+    cabin: pricing.cabin,
+    qty: pricing.qty,
+    pricingMode: pricing.pricingMode,
+    basePrice: pricing.basePrice,
+    bucketSize: pricing.bucketSize,
+    totalBuckets: pricing.totalBuckets,
+    currentBucket: pricing.currentBucket,
+    // 精确档内剩余是内部计价真值，对匿名端封顶输出
+    currentBucketRemaining: capPublicAvailable(pricing.currentBucketRemaining),
+    perSeatBreakdown: toPublicSeatBreakdown(pricing.perSeatBreakdown),
+    totalPrice: pricing.totalPrice,
+    averageUnitPrice: pricing.averageUnitPrice,
+  };
+}
+
+/** 公开口径的行李额——未配置 = null。 */
+export interface PublicBaggageView {
+  checkedKg: number | null;
+  checkedPieces: number | null;
+  carryOnKg: number | null;
+  note: string | null;
+}
+
+/** 公开口径的搜索结果舱位——不含 availExact/capacity/sold/locked/dateRank/dateMultiplier。 */
+export interface PublicSeatClassView {
+  seatClassId: string;
+  cabin: CabinClass;
+  available: number;
+  availabilityTier: AvailabilityTier;
+  basePrice: string;
+  dynamicPrice: string;
+  totalForQty: number;
+  baggage: PublicBaggageView | null;
+}
+
+/**
+ * 公开端点 /flights/search 的舱位白名单。
+ * 入参是内部计算对象（带 availExact 精确余位真值、dateRank 内部日期等级等）；
+ * 出参只含客户该看到的字段——余位只给封顶值 + 档位，日期等级一律不出现。
+ */
+export function toPublicSeatClass(seat: {
+  seatClassId: string;
+  cabin: CabinClass;
+  available: number;
+  availabilityTier: AvailabilityTier;
+  basePrice: string;
+  dynamicPrice: string;
+  totalForQty: number;
+  baggage: PublicBaggageView | null;
+}): PublicSeatClassView {
+  return {
+    seatClassId: seat.seatClassId, // 锁位接口（POST /seat-locks）需要
+    cabin: seat.cabin,
+    available: seat.available, // 调用方已过 capPublicAvailable
+    availabilityTier: seat.availabilityTier,
+    basePrice: seat.basePrice,
+    dynamicPrice: seat.dynamicPrice,
+    totalForQty: seat.totalForQty,
+    baggage: seat.baggage
+      ? {
+          checkedKg: seat.baggage.checkedKg,
+          checkedPieces: seat.baggage.checkedPieces,
+          carryOnKg: seat.baggage.carryOnKg,
+          note: seat.baggage.note,
+        }
+      : null,
+  };
 }
 
 /** AGENT 视角班次的座位舱位——只含余位/售价类字段，不含任何成本字段。 */
@@ -121,7 +235,6 @@ export interface AgentScheduleView {
   arrivalTime: Date;
   departureTz: string;
   arrivalTz: string;
-  ticketingCap: number;
   isActive: boolean;
   seatClasses: AgentScheduleSeatClassView[];
 }
@@ -142,7 +255,6 @@ export function serializeScheduleForAgent(schedule: {
   arrivalTime: Date;
   departureTz: string;
   arrivalTz: string;
-  ticketingCap: number;
   isActive: boolean;
   seatClasses: readonly {
     id: string;
@@ -162,7 +274,6 @@ export function serializeScheduleForAgent(schedule: {
     arrivalTime: schedule.arrivalTime,
     departureTz: schedule.departureTz,
     arrivalTz: schedule.arrivalTz,
-    ticketingCap: schedule.ticketingCap,
     isActive: schedule.isActive,
     seatClasses: schedule.seatClasses.map((c) => ({
       id: c.id,
@@ -285,8 +396,11 @@ export class FlightService {
             }
             const baggage = baggageByFlightCabin.get(`${s.flightId}:${c.cabin}`);
             return {
-              // 内部真值：hasSpace 过滤用，返回前会剥掉（不出现在公开响应里）
+              // 内部真值：hasSpace 过滤用，不出现在公开响应里（toPublicSeatClass 不选它）
               availExact: avail,
+              // 内部日期等级：公司内部口径，不对客户输出（同上，白名单不选它）
+              dateRank,
+              dateMultiplier,
               seatClassId: c.id, // 锁位接口（POST /seat-locks）需要
               cabin: c.cabin,
               // 公开口径：不输出 capacity/sold/locked，余位数值 ≤9 封顶（档位仍按真值算）
@@ -294,8 +408,6 @@ export class FlightService {
               availabilityTier: computeAvailabilityTier(avail, c.capacity),
               basePrice: c.basePrice.toString(),
               dynamicPrice,
-              dateRank,
-              dateMultiplier,
               totalForQty,
               // 行李规则（按 航班×舱等 配置；未配置 = null，前端不展示）
               baggage: baggage
@@ -322,8 +434,8 @@ export class FlightService {
           departureTz: s.departureTz,
           arrivalTz: s.arrivalTz,
           durationMinutes: Math.round((s.arrivalTime.getTime() - s.departureTime.getTime()) / 60000),
-          // 剥掉内部真值字段，公开响应只带封顶后的 available + 档位
-          seatClasses: availableSeats.map(({ availExact: _availExact, ...pub }) => pub),
+          // 白名单序列化：内部字段（availExact/dateRank/…）默认不透传，见 toPublicSeatClass
+          seatClasses: availableSeats.map(toPublicSeatClass),
           hasSpace,
         };
       }),
@@ -460,7 +572,6 @@ export class FlightService {
       destinationCode: s.flight.destinationCode,
       departureTime: s.departureTime.toISOString(),
       departureTz: s.departureTz,
-      ticketingCap: s.ticketingCap,
       seatClasses: s.seatClasses.map((c) => {
         const locked = lockedMap.get(c.id) ?? 0;
         return {
@@ -519,7 +630,6 @@ export class FlightService {
         arrivalTime: arr,
         departureTz: body.departureTz,
         arrivalTz: body.arrivalTz,
-        ...(body.ticketingCap !== undefined && { ticketingCap: body.ticketingCap }),
         seatClasses: {
           create: seats.map((c) => ({
             cabin: c.cabin,
@@ -535,16 +645,8 @@ export class FlightService {
     return this.serializeSchedule(schedule);
   }
 
-  /** 调整班次开票上限（航司临时放宽/收紧时运营改）。 */
-  async updateTicketingCap(scheduleId: string, ticketingCap: number) {
-    const schedule = await prisma.flightSchedule.findUnique({ where: { id: scheduleId } });
-    if (!schedule) throw new NotFoundError('班次不存在');
-    return prisma.flightSchedule.update({
-      where: { id: scheduleId },
-      data: { ticketingCap },
-      select: { id: true, ticketingCap: true },
-    });
-  }
+  // 开票上限无独立写入口：上限 = Σ 舱位 capacity（见 orders/ticketing-cap.ts）。
+  // 要放宽/收紧上限就是改舱位容量 —— 走下面的 updateSchedule（seatClasses[].capacity）。
 
   /**
    * 单班次编辑（月历库存视图：改价 / 改容量 / 停用启用 / 改时刻）。

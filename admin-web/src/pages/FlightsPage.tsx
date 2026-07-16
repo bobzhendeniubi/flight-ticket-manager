@@ -366,8 +366,26 @@ function scheduleHasLadder(s: AdminSchedule): boolean {
   return (s.seatClasses ?? []).some((c) => hasLadder(c.fareBuckets));
 }
 
+// ── 售罄 vs 已下架：两个状态，两套判据，互不替代 ───────────────────────────
+// 售罄 = 派生：所有舱位余位 ≤ 0（与后端余位档位 available ≤ 0 → SOLD_OUT 同源）。
+//        机位卖完即售罄，没有、也不需要人工开关。
+// 已下架 = 人工：isActive === false。运营主动收起，前台不可售，可调价后重新上架。
+// 两者可以同时成立（卖完了、又被下架），因此徽标并存而不互斥。
+function isScheduleSoldOut(s: AdminSchedule): boolean {
+  const seats = s.seatClasses ?? [];
+  return seats.length > 0 && seats.every((c) => c.available <= 0);
+}
+
+// 月历格「无在售」的原因：售罄与已下架是两件事，据实说明是哪一种。
+function noSaleReason(daySchedules: AdminSchedule[]): string {
+  const soldOut = daySchedules.filter(isScheduleSoldOut).length;
+  if (soldOut === daySchedules.length) return '当天所有班次均已售罄';
+  if (soldOut === 0) return '当天所有班次均已下架';
+  return '当天所有班次已售罄或已下架';
+}
+
 // 月历格用：在「在售」班次里取经济舱当前售价区间。
-// 关键修复：售罄/停售班次绝不参与价格展示，避免显示已关班次的高价。
+// 关键修复：已下架班次绝不参与价格展示，避免显示已关班次的高价。
 function activeEconPriceRange(daySchedules: AdminSchedule[]): {
   min: number;
   max: number;
@@ -384,7 +402,7 @@ function activeEconPriceRange(daySchedules: AdminSchedule[]): {
 }
 
 // 月历格用：在「在售」班次里取经济舱余位合计（无在售班次则回退到全部班次的合计，
-// 用于展示"已全部售罄"的余位读数）。
+// 用于展示"已全部下架"的余位读数）。
 function dayEconRemaining(daySchedules: AdminSchedule[]): number {
   const active = daySchedules.filter((s) => s.isActive);
   const pool = active.length > 0 ? active : daySchedules;
@@ -805,11 +823,20 @@ function SchedulesTable({
                     </ul>
                   </td>
                   <td>
-                    {s.isActive ? (
-                      <span className="badge-success">在售</span>
-                    ) : (
-                      <span className="badge-neutral">售罄/暂停销售</span>
-                    )}
+                    {/* 售罄（余位卖完，派生）与已下架（人工收起）分开渲染，可同时出现 */}
+                    <div className="flex flex-wrap items-center gap-1">
+                      {isScheduleSoldOut(s) && (
+                        <span className="badge-neutral" title="机位已售完（自动判定，无需人工操作）">
+                          售罄
+                        </span>
+                      )}
+                      {!s.isActive && (
+                        <span className="badge-neutral" title="已下架：前台不可售，可调价后重新上架">
+                          已下架
+                        </span>
+                      )}
+                      {s.isActive && !isScheduleSoldOut(s) && <span className="badge-success">在售</span>}
+                    </div>
                   </td>
                   <td>
                     <div className="flex flex-wrap gap-1">
@@ -954,7 +981,7 @@ function MonthCalendar({
             );
           }
 
-          // 多班次时：价格/余位只看「在售」班次，售罄/停售班次绝不参与展示
+          // 多班次时：价格/余位只看「在售」班次，已下架班次绝不参与展示
           // （修复 700/800 在售阶梯被 1480 已关班次盖掉的 bug）。
           const allInactive = daySchedules.every((s) => !s.isActive);
           const remaining = dayEconRemaining(daySchedules);
@@ -995,7 +1022,7 @@ function MonthCalendar({
                     </span>
                   )}
                   {allInactive && (
-                    <span className="text-[10px] leading-none text-slate-400" title="售罄/暂停销售">
+                    <span className="text-[10px] leading-none text-slate-400" title="当天所有班次均已下架">
                       ✕
                     </span>
                   )}
@@ -1025,7 +1052,7 @@ function MonthCalendar({
                   )}
                 </div>
               ) : (
-                <div className="text-[11px] text-slate-400" title="当天所有班次均已售罄/停售">
+                <div className="text-[11px] text-slate-400" title={noSaleReason(daySchedules)}>
                   无在售
                 </div>
               )}
@@ -1051,7 +1078,7 @@ function MonthCalendar({
   );
 }
 
-// ── 某一天的内联编辑器（改经济/商务价 + 售罄/恢复销售 + 导出整班订单）────────
+// ── 某一天的内联编辑器（改经济/商务价 + 下架/重新上架 + 导出整班订单）────────
 function DayCellEditor({
   ymd,
   schedules,
@@ -1154,6 +1181,8 @@ function DaySchedule({
 
   const econRemaining = econ ? econ.available : 0;
   const tone = seatTone(econRemaining, econ ? econ.capacity : 0);
+  // 售罄是算出来的（余位卖完），与人工的「已下架」(isActive) 无关，两者可同时成立。
+  const soldOut = isScheduleSoldOut(schedule);
   const isExporting = exportingId === schedule.id;
   const departureDate = utcYmd(schedule.departureTime);
 
@@ -1213,7 +1242,7 @@ function DaySchedule({
   const onDelete = async () => {
     if (!tokens || deleting) return;
     if (totalSold > 0) {
-      setErr('已有销售，不能删除（请用售罄）');
+      setErr('已有销售，不能删除（请用下架）');
       return;
     }
     const depTime = formatLocalTime(schedule.departureTime, schedule.departureTz);
@@ -1392,11 +1421,18 @@ function DaySchedule({
               固定价
             </span>
           )}
-          {schedule.isActive ? (
-            <span className="badge-success">在售</span>
-          ) : (
-            <span className="badge-neutral">售罄/暂停销售</span>
+          {/* 售罄（余位卖完，派生）与已下架（人工收起）分开渲染，可同时出现 */}
+          {soldOut && (
+            <span className="badge-neutral" title="机位已售完（自动判定，无需人工操作）">
+              售罄
+            </span>
           )}
+          {!schedule.isActive && (
+            <span className="badge-neutral" title="已下架：前台不可售，可调价后重新上架">
+              已下架
+            </span>
+          )}
+          {schedule.isActive && !soldOut && <span className="badge-success">在售</span>}
         </div>
       </div>
 
@@ -1542,7 +1578,7 @@ function DaySchedule({
             <button
               type="button"
               className="btn-secondary text-xs text-rose-600 hover:bg-rose-50 disabled:text-slate-300 disabled:hover:bg-transparent"
-              title={totalSold > 0 ? '已有销售，不能删除（请用售罄）' : '彻底删除该班次（不可恢复）'}
+              title={totalSold > 0 ? '已有销售，不能删除（请用下架）' : '彻底删除该班次（不可恢复）'}
               disabled={deleting || totalSold > 0}
               onClick={onDelete}
             >
@@ -1551,11 +1587,11 @@ function DaySchedule({
             <button
               type="button"
               className="btn-secondary text-xs"
-              title="只对该单个班次售罄或恢复销售"
+              title="下架后前台不可售，可调价后重新上架（只对该单个班次）"
               disabled={toggling}
               onClick={onToggle}
             >
-              {toggling ? '处理中…' : schedule.isActive ? '售罄' : '恢复销售'}
+              {toggling ? '处理中…' : schedule.isActive ? '下架' : '重新上架'}
             </button>
             <button
               type="button"
@@ -1627,8 +1663,8 @@ function DaySchedule({
 }
 
 // ── 批量改价 / 批量仓位阶梯（日期范围 + 星期几 + 进度条；镜像 BulkScheduleForm）─
-// 注：批量「售罄/恢复销售」已移除（机位卖完即售罄，不需手动批量调）；
-// 单班次的售罄/恢复按钮保留在 DaySchedule。
+// 注：批量「售罄/恢复销售」已移除——售罄是余位卖完后自动派生的，从来就没有开关可调。
+// 留下的那个人工开关是「下架/重新上架」(isActive)，是另一件事，按钮保留在 DaySchedule。
 type BulkAction = 'setPrice' | 'addAmount' | 'addPercent' | 'setLadder' | 'clearLadder' | 'setCapacity';
 type BulkCabinPick = 'ECONOMY' | 'BUSINESS' | 'ALL';
 
@@ -1664,7 +1700,7 @@ function BulkEditPanel({
   const [capEcon, setCapEcon] = useState<number | null>(null);
   const [capBiz, setCapBiz] = useState<number | null>(null);
   const [submitting, setSubmitting] = useState(false);
-  const [progress, setProgress] = useState({ done: 0, total: 0, errors: 0 });
+  const [progress, setProgress] = useState({ done: 0, total: 0, errors: 0, skipped: 0 });
   const [result, setResult] = useState<string | null>(null);
   const [errMsg, setErrMsg] = useState<string | null>(null);
 
@@ -1683,6 +1719,21 @@ function BulkEditPanel({
       return weekdays.has(dow);
     });
   }, [schedules, startDate, endDate, weekdays]);
+
+  // 改价类操作（设为指定价/涨¥X/涨X%）只写 basePrice，而配了仓位阶梯的班次按阶梯出售、
+  // 永远不看 basePrice —— 对这些班次改价等于没改。所以先把命中班次分成两组：
+  //   fixed  = 固定价班次，本次改价真正生效
+  //   ladder = 阶梯班次，本次改价无效 → 显式跳过（完全不写 basePrice）
+  // 为什么是"跳过"而不是"写了但不生效"：basePrice 在阶梯班次上并非死值，一旦有人点
+  // 「清除仓位阶梯」，basePrice 会立刻变成成交价。若这里偷偷写入一个当时没生效的新价，
+  // 它会潜伏到某次清除阶梯时突然跳出来，变成一次没人预期的价格变动。宁可不写。
+  const priceSplit = useMemo(() => {
+    if (!isPriceAction) return { fixed: matched, ladder: [] as AdminSchedule[] };
+    const fixed: AdminSchedule[] = [];
+    const ladder: AdminSchedule[] = [];
+    for (const s of matched) (scheduleHasLadder(s) ? ladder : fixed).push(s);
+    return { fixed, ladder };
+  }, [matched, isPriceAction]);
 
   const toggleWeekday = (day: number) => {
     setWeekdays((prev) => {
@@ -1707,6 +1758,9 @@ function BulkEditPanel({
       if (action === 'clearLadder') return { seatClasses: [{ cabin: ladderCabin, fareBuckets: [] }] };
       return { seatClasses: [{ cabin: ladderCabin, fareBuckets: ladderDraft }] };
     }
+    // 阶梯班次不接受改价：声明式挡在这里，确保跳过 = 一个字节都不写 basePrice。
+    // （onSubmit 已按 priceSplit 分流并计数，这一行是第二道闸，防止日后新增调用点漏掉分流。）
+    if (!isLadderAction && scheduleHasLadder(s)) return null;
     const cabins = cabinsToEdit(s);
     if (cabins.length === 0) return null;
     const amt = amount ?? 0;
@@ -1756,12 +1810,38 @@ function BulkEditPanel({
       setErrMsg('请至少填一个舱位的目标容量');
       return;
     }
-    if (!confirm(`将对 ${matched.length} 个班次执行：${actionLabel()}，确认？`)) return;
+    // 改价撞上阶梯班次：先把"有多少个改不动"摆到运营面前，再让他决定要不要对其余的执行。
+    if (isPriceAction && priceSplit.ladder.length > 0) {
+      if (priceSplit.fixed.length === 0) {
+        setErrMsg(
+          `命中的 ${matched.length} 个班次都在用仓位阶梯，改价对它们无效。` +
+            `要调阶梯班次的价格，请用「设置仓位阶梯」重设各档价格。`,
+        );
+        return;
+      }
+      const names = priceSplit.ladder
+        .slice(0, 5)
+        .map((s) => localYmd(s.departureTime, s.departureTz))
+        .join('、');
+      const more = priceSplit.ladder.length > 5 ? ` 等 ${priceSplit.ladder.length} 个` : '';
+      if (
+        !confirm(
+          `命中 ${matched.length} 个班次，其中 ${priceSplit.ladder.length} 个在用仓位阶梯，` +
+            `本次改价对它们无效（阶梯班次请用「设置仓位阶梯」）。\n\n` +
+            `将跳过：${names}${more}\n\n` +
+            `要继续对其余 ${priceSplit.fixed.length} 个执行「${actionLabel()}」吗？`,
+        )
+      ) {
+        return;
+      }
+    } else if (!confirm(`将对 ${matched.length} 个班次执行：${actionLabel()}，确认？`)) {
+      return;
+    }
 
     setErrMsg(null);
     setResult(null);
     setSubmitting(true);
-    setProgress({ done: 0, total: matched.length, errors: 0 });
+    setProgress({ done: 0, total: matched.length, errors: 0, skipped: 0 });
 
     // ── 改容量：走专用批量接口（服务端一次事务处理，逐班次守 capacity ≥ sold，
     //    命中守卫的班次跳过而非整批失败），不是逐班次循环调用。
@@ -1774,7 +1854,12 @@ function BulkEditPanel({
           scheduleIds: matched.map((s) => s.id),
           seatClasses,
         });
-        setProgress({ done: capResult.applied, total: matched.length, errors: capResult.skipped.length });
+        setProgress({
+          done: capResult.applied,
+          total: matched.length,
+          errors: 0,
+          skipped: capResult.skipped.length,
+        });
         const preview = capResult.skipped.slice(0, 3).map((s) => s.reason);
         setResult(
           `✅ 完成：改了 ${capResult.applied} 个${
@@ -1795,14 +1880,27 @@ function BulkEditPanel({
     }
 
     // ── 改价 / 仓位阶梯：仍逐班次调用（每班次当前价/校验各不相同，沿用既有循环）
+    // 计数分三档，互不混淆：done=真的改了、skipped*=没调接口、errors=调了但失败。
+    // 旧写法把"跳过"算进 done，于是进度条走满变绿、运营以为改完了 —— 这正是要杜绝的假绿。
     let done = 0;
     let errors = 0;
+    let skippedLadder = 0; // 阶梯班次：改价对它无效，完全不写 basePrice
+    let skippedNoCabin = 0; // 该班次没有所选舱位
     let lastError = '';
+    const bump = () =>
+      setProgress({
+        done: done + errors + skippedLadder + skippedNoCabin,
+        total: matched.length,
+        errors,
+        skipped: skippedLadder + skippedNoCabin,
+      });
     for (const s of matched) {
       const body = buildBody(s);
       if (!body) {
-        done++;
-        setProgress({ done: done + errors, total: matched.length, errors });
+        // buildBody 只在两种情况下返回 null，分开记账，结果条才敢说实话。
+        if (isPriceAction && scheduleHasLadder(s)) skippedLadder++;
+        else skippedNoCabin++;
+        bump();
         continue;
       }
       try {
@@ -1812,11 +1910,15 @@ function BulkEditPanel({
         errors++;
         lastError = e2 instanceof ApiError ? e2.message : '失败';
       }
-      setProgress({ done: done + errors, total: matched.length, errors });
+      bump();
     }
 
     setSubmitting(false);
-    setResult(`✅ 完成：成功 ${done} 个${errors > 0 ? ` · 失败 ${errors} 个（${lastError}）` : ''}`);
+    const parts = [`已改 ${done} 个`];
+    if (skippedLadder > 0) parts.push(`跳过 ${skippedLadder} 个（阶梯班次，改价对它们无效）`);
+    if (skippedNoCabin > 0) parts.push(`跳过 ${skippedNoCabin} 个（无所选舱位）`);
+    if (errors > 0) parts.push(`失败 ${errors} 个（${lastError}）`);
+    setResult(`${errors > 0 ? '⚠️' : '✅'} 完成：${parts.join(' · ')}`);
     await onDone();
   };
 
@@ -1940,6 +2042,17 @@ function BulkEditPanel({
             <span className="text-2xl font-bold text-brand">{matched.length} 个</span>
           </div>
           <div className="mt-1 text-xs text-slate-500">将执行：{actionLabel()}</div>
+          {/* 改价撞上阶梯班次：点「执行」之前就把改不动的数量摆出来，别等结果条才说 */}
+          {isPriceAction && priceSplit.ladder.length > 0 && (
+            <div className="mt-2 rounded-md border border-amber-300 bg-amber-50 p-2 text-xs text-amber-900">
+              其中 <b>{priceSplit.ladder.length} 个</b>班次在用仓位阶梯，按各档价格出售，
+              <b>本次改价对它们无效</b>，会自动跳过（价格保持不变）。
+              实际生效：<b>{priceSplit.fixed.length} 个</b>固定价班次。
+              <div className="mt-1 text-amber-800">
+                要调阶梯班次的价格，请把操作换成「设置仓位阶梯」重设各档价格。
+              </div>
+            </div>
+          )}
           {submitting && (
             <div className="mt-2">
               <div className="h-2 bg-slate-200 rounded-full overflow-hidden">
@@ -1949,7 +2062,9 @@ function BulkEditPanel({
                 />
               </div>
               <div className="text-xs text-slate-500 mt-1">
-                进度: {progress.done} / {progress.total} · {isCapacityAction ? '跳过' : '失败'} {progress.errors}
+                进度: {progress.done} / {progress.total}
+                {progress.skipped > 0 && ` · 跳过 ${progress.skipped}`}
+                {progress.errors > 0 && ` · 失败 ${progress.errors}`}
               </div>
             </div>
           )}

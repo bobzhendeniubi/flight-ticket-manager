@@ -30,19 +30,6 @@ const CheckoutPage = lazy(() =>
 const MyOrdersPage = lazy(() =>
   import('./pages/MyOrdersPage').then((m) => ({ default: m.MyOrdersPage })),
 );
-const AdminFlightsPage = lazy(() =>
-  import('./pages/AdminFlightsPage').then((m) => ({ default: m.AdminFlightsPage })),
-);
-const AdminDashboardPage = lazy(() =>
-  import('./pages/admin/DashboardPage').then((m) => ({ default: m.AdminDashboardPage })),
-);
-const AdminOrdersPage = lazy(() =>
-  import('./pages/admin/OrdersPage').then((m) => ({ default: m.AdminOrdersPage })),
-);
-const AdminPricingPage = lazy(() =>
-  import('./pages/admin/PricingPage').then((m) => ({ default: m.AdminPricingPage })),
-);
-
 // 新增公开页（详情/搜索/帮助/查单/404）—— 默认导出，直接 lazy。
 const BundleDetailPage = lazy(() => import('./pages/BundleDetailPage'));
 const HotelDetailPage = lazy(() => import('./pages/HotelDetailPage'));
@@ -202,40 +189,6 @@ export function App() {
               element={
                 <Protected roles={['AGENT', 'ADMIN', 'STAFF']}>
                   <MyCommissionsPage />
-                </Protected>
-              }
-            />
-
-            {/* 后台 admin */}
-            <Route
-              path="admin/dashboard"
-              element={
-                <Protected roles={['ADMIN', 'STAFF']}>
-                  <AdminDashboardPage />
-                </Protected>
-              }
-            />
-            <Route
-              path="admin/orders"
-              element={
-                <Protected roles={['ADMIN', 'STAFF']}>
-                  <AdminOrdersPage />
-                </Protected>
-              }
-            />
-            <Route
-              path="admin/flights"
-              element={
-                <Protected roles={['ADMIN', 'STAFF']}>
-                  <AdminFlightsPage />
-                </Protected>
-              }
-            />
-            <Route
-              path="admin/pricing"
-              element={
-                <Protected roles={['ADMIN', 'STAFF']}>
-                  <AdminPricingPage />
                 </Protected>
               }
             />

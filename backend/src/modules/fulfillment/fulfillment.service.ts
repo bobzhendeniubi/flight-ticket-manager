@@ -57,12 +57,27 @@ const KIND_TO_TYPE: Record<OrderItemKind, FulfillmentType | null> = {
 };
 
 /**
- * 任务的有效签证分类（签发方式 / 入境次数）。
+ * 分类值的出处 —— 下发给前端决定「这个值有多确凿」：
+ *   PRODUCT      = 签证产品的结构化字段（业务真的标注过）→ 前端实色展示
+ *   ORDER_STATUS = 从订单级录单「签证状态」回退推出（录单员只表达了签发方式）→ 前端浅色 +「·录单」
+ * null = 无值。
+ */
+export type VisaClassificationSource = 'PRODUCT' | 'ORDER_STATUS';
+
+/**
+ * 任务的有效签证分类（签发方式 / 入境次数）+ 各自的出处。
  *
- * 优先取签证产品的结构化字段；产品缺失（录单单子多为纯机票行，签证信息只落在
- * 订单级「签证状态」）时回退录单口径：visaStatus=E_VISA（电子签·三个月多次）
- * 视为 签发方式=电子签、入境次数=多次。签证台「签证类型」筛选与录单侧由此打通
- * （公测反馈：仅认产品字段时录单单子全部落入"未标注"，筛不出来）。
+ * **签发方式**优先取签证产品的结构化字段；产品缺失（录单单子多为纯机票行，签证信息只落在
+ * 订单级「签证状态」）时回退录单口径：visaStatus=E_VISA 视为 签发方式=电子签
+ * （录单的下拉选项**本身就写着「电子签」**，回退有据）。签证台「签证类型」筛选与录单侧
+ * 由此打通（公测反馈：仅认产品字段时录单单子全部落入"未标注"，筛不出来）。
+ *
+ * **入境次数**只认签证产品的结构化字段，**没有录单回退**：录单的「签证状态」从未表达过
+ * 入境次数，任何由它推出的「单次/多次」都是无据猜测，且是**静默的错**（不报错、只标错）。
+ * 宁可留空让签证岗看到「未标注」，也不给一个看起来权威的假值。
+ * 入境次数应由签证产品的 entryType 结构化标注。
+ *
+ * 回退有据的那一半留下（签发方式），没据的那一半不做（入境次数）。
  */
 export function effectiveVisaClassification(
   visa:
@@ -70,13 +85,68 @@ export function effectiveVisaClassification(
     | null
     | undefined,
   orderVisaStatus: VisaRequirement | null | undefined,
-): { issuanceMethod: VisaIssuanceMethod | null; entryType: VisaEntryType | null } {
+): {
+  issuanceMethod: VisaIssuanceMethod | null;
+  entryType: VisaEntryType | null;
+  issuanceSource: VisaClassificationSource | null;
+  entrySource: VisaClassificationSource | null;
+} {
   const isOrderLevelEVisa = orderVisaStatus === VisaRequirement.E_VISA;
+  const issuanceFromProduct = visa?.issuanceMethod ?? null;
+  const issuanceMethod =
+    issuanceFromProduct ?? (isOrderLevelEVisa ? VisaIssuanceMethod.E_VISA : null);
+  const entryType = visa?.entryType ?? null;
   return {
-    issuanceMethod:
-      visa?.issuanceMethod ?? (isOrderLevelEVisa ? VisaIssuanceMethod.E_VISA : null),
-    entryType: visa?.entryType ?? (isOrderLevelEVisa ? VisaEntryType.MULTIPLE : null),
+    issuanceMethod,
+    entryType,
+    issuanceSource: issuanceFromProduct
+      ? 'PRODUCT'
+      : issuanceMethod
+        ? 'ORDER_STATUS'
+        : null,
+    // 入境次数无回退来源 → 有值必来自产品
+    entrySource: entryType ? 'PRODUCT' : null,
   };
+}
+
+/**
+ * 「签发方式」筛选下沉到查询层 —— 与 effectiveVisaClassification 的内存口径逐字对齐：
+ *
+ *   有效签发方式 = 签证产品 issuanceMethod ?? (订单级 visaStatus = E_VISA ? E_VISA : null)
+ *
+ * 回退命中的条件是「产品侧未标注（无关联签证产品，或关联了但 issuanceMethod 为空）
+ * 且订单级 visaStatus = E_VISA」——这个 `??` 回退在关系过滤里能完整表达，
+ * 所以下沉后筛选结果与旧的前端过滤一致（回退出来的电子签单**照样筛得到**）。
+ *
+ * 注意：回退只产出 E_VISA；其余签发方式没有回退来源，只认产品结构化字段。
+ * 本函数只**镜像** effectiveVisaClassification 的口径，不重新定义它。
+ */
+export function issuanceMethodWhere(
+  filter: VisaIssuanceMethod | 'NONE',
+): Prisma.OrderItemWhereInput {
+  // 产品侧未标注 = 没关联签证产品，或关联了但 issuanceMethod 为空
+  const productUnset: Prisma.OrderItemWhereInput = {
+    OR: [{ visa: { is: null } }, { visa: { is: { issuanceMethod: null } } }],
+  };
+  // 订单级不是电子签（含 visaStatus 为 NULL）——显式列出 NULL，
+  // 不依赖 `not` 对可空列是否兜 NULL 的实现细节（SQL 里 NULL <> 'E_VISA' 得 NULL 而非真）。
+  const orderNotEVisa: Prisma.OrderItemWhereInput = {
+    order: { OR: [{ visaStatus: null }, { visaStatus: { not: VisaRequirement.E_VISA } }] },
+  };
+
+  if (filter === 'NONE') {
+    // 未标注 = 产品侧未标注 且 订单级也不是 E_VISA（否则会回退成电子签，就不算未标注了）
+    return { AND: [productUnset, orderNotEVisa] };
+  }
+  if (filter === VisaIssuanceMethod.E_VISA) {
+    return {
+      OR: [
+        { visa: { is: { issuanceMethod: VisaIssuanceMethod.E_VISA } } },
+        { AND: [productUnset, { order: { visaStatus: VisaRequirement.E_VISA } }] },
+      ],
+    };
+  }
+  return { visa: { is: { issuanceMethod: filter } } };
 }
 
 export class FulfillmentService {
@@ -129,7 +199,8 @@ export class FulfillmentService {
     ]);
     const serializedPassengers = passengers.map(serializePassenger);
     return items.flatMap((it) => {
-      // 分类回退：产品结构化字段缺失 → 订单级录单签证状态（E_VISA=电子签·多次）
+      // 分类回退：签发方式在产品字段缺失时回退订单级录单签证状态（E_VISA=电子签）；
+      // 入境次数只认产品字段。两者各自带 source 下发，前端据此区分实色/浅色
       const visaClass = effectiveVisaClassification(it.visa, it.order.visaStatus);
       return it.fulfillmentTasks.map((t) => ({
         ...serializeTask(t, it),
@@ -141,6 +212,9 @@ export class FulfillmentService {
               visaName: it.visa?.visaName ?? null,
               visaIssuanceMethod: visaClass.issuanceMethod,
               visaEntryType: visaClass.entryType,
+              // 出处标：PRODUCT=产品结构化标注（确证）/ ORDER_STATUS=录单回退（推断）
+              visaIssuanceSource: visaClass.issuanceSource,
+              visaEntrySource: visaClass.entrySource,
             }
           : {}),
       }));
@@ -160,6 +234,52 @@ export class FulfillmentService {
     return rows.map((p) => ({ id: p.id, passportPhotoUrl: p.passportPhotoUrl }));
   }
 
+  /**
+   * 「出发日期」筛选下沉到查询层，口径与列表回传的 departureTime 逐字一致：
+   * **每订单最早一段 FLIGHT** 的 departureTime，按该班次 departureTz 折算成出发地本地日。
+   *
+   * 两个必须守住的点：
+   * 1. 纯签证单/纯酒店单**无航班 → 保留可见**（不被日期筛选误隐藏）——与护照按姓名导出同口径
+   *    （见 hotel-control.passports.ts collectPassportGroupsByNames），别让两边分叉。
+   * 2. 取**最早**一段而非任意一段：否则回程恰好落在该日的订单会被误命中。
+   *    「最早一段」是聚合语义，关系过滤表达不了，故先用一条原生 SQL 算出命中的 orderId 集合，
+   *    再并回关系过滤 —— 这样 findMany 与 count 仍共用同一个 where。
+   *
+   * 时区换算方向：departureTime 是 TIMESTAMP(3) **without time zone** 且存的是 UTC，
+   * 所以必须先 `AT TIME ZONE 'UTC'` 还原成 timestamptz，再 `AT TIME ZONE departureTz`
+   * 落到出发地本地时刻。少了第一跳会把 UTC 时刻当成本地时刻，日期整体错位。
+   */
+  private async departureDateWhere(departureDate: string): Promise<Prisma.OrderItemWhereInput> {
+    const rows = await prisma.$queryRaw<Array<{ orderId: string }>>(Prisma.sql`
+      SELECT DISTINCT oi."orderId" AS "orderId"
+      FROM "OrderItem" oi
+      JOIN "FlightSchedule" fs ON fs."id" = oi."flightScheduleId"
+      WHERE oi."kind"::text = 'FLIGHT'
+        AND fs."departureTime" = (
+          SELECT MIN(fs2."departureTime")
+          FROM "OrderItem" oi2
+          JOIN "FlightSchedule" fs2 ON fs2."id" = oi2."flightScheduleId"
+          WHERE oi2."orderId" = oi."orderId" AND oi2."kind"::text = 'FLIGHT'
+        )
+        AND to_char(
+          fs."departureTime" AT TIME ZONE 'UTC' AT TIME ZONE fs."departureTz",
+          'YYYY-MM-DD'
+        ) = ${departureDate}
+    `);
+    const orderIds = rows.map((r) => r.orderId);
+
+    return {
+      order: {
+        OR: [
+          // 最早一段机票的出发地本地日 = 所选日期
+          { id: { in: orderIds } },
+          // 无航班订单（纯签证单等）→ 保留可见
+          { items: { none: { kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } } } },
+        ],
+      },
+    };
+  }
+
   async list(query: ListFulfillmentQuery) {
     // 父订单已软删 / 落入取消族（见 COUNTED_STATUSES）时不进列表——
     // 签证台等运营看板不应残留已取消/已删订单的任务。
@@ -170,9 +290,20 @@ export class FulfillmentService {
     };
     if (query.orderId) orderItemWhere.orderId = query.orderId;
 
+    // 签证台三个筛选（状态 / 签发方式 / 出发日期）全部下沉到 where —— 必须与 count 共用同一个
+    // where，分页和 total 才有意义。任何一个退回前端过滤，都会让「总数」和「实际能翻到的行数」
+    // 对不上，并且跨页的匹配项永远凑不齐（签证岗按「待办」翻页会漏单）。
+    const orderItemAnd: Prisma.OrderItemWhereInput[] = [];
+    if (query.issuanceMethod) orderItemAnd.push(issuanceMethodWhere(query.issuanceMethod));
+    if (query.departureDate) {
+      orderItemAnd.push(await this.departureDateWhere(query.departureDate));
+    }
+    if (orderItemAnd.length) orderItemWhere.AND = orderItemAnd;
+
     const where: Prisma.FulfillmentTaskWhereInput = { orderItem: orderItemWhere };
     if (query.type) where.type = query.type;
-    if (query.status) where.status = query.status;
+    // 多状态：「待办」= PENDING + IN_PROGRESS 在后端表达；省略 = 「全部状态」不加条件
+    if (query.status?.length) where.status = { in: query.status };
     if (query.assigneeUserId) where.assigneeUserId = query.assigneeUserId;
     if (query.orderItemId) where.orderItemId = query.orderItemId;
     if (query.notesQuery) where.notes = { contains: query.notesQuery, mode: 'insensitive' };
@@ -293,8 +424,9 @@ export class FulfillmentService {
         const order = t.orderItem.order;
         // 最早一段机票的出发时间/时区（无机票则 null）— 供签证台显示出发日期
         const firstLeg = earliestLegByOrder.get(order.id) ?? null;
-        // 分类回退：产品结构化字段缺失 → 订单级录单签证状态（E_VISA=电子签·多次），
-        // 签证台「签证类型」筛选/徽章两边口径由此对齐
+        // 分类回退：签发方式在产品字段缺失时回退订单级录单签证状态（E_VISA=电子签），
+        // 签证台「签证类型」筛选/徽章两边口径由此对齐（见 issuanceMethodWhere）；
+        // 入境次数只认产品字段，无回退
         const visaClass = effectiveVisaClassification(t.orderItem.visa, order.visaStatus);
         return {
           ...serializeTask(t, t.orderItem),
@@ -303,6 +435,9 @@ export class FulfillmentService {
           // 签证结构化分类（签发方式/入境次数）；产品与订单级都未标注 = null
           visaIssuanceMethod: visaClass.issuanceMethod,
           visaEntryType: visaClass.entryType,
+          // 出处标：PRODUCT=产品结构化标注（确证）/ ORDER_STATUS=录单回退（推断）
+          visaIssuanceSource: visaClass.issuanceSource,
+          visaEntrySource: visaClass.entrySource,
           order: {
             ...order,
             // #6：出发日期 + 时区（ISO 字符串 / null）

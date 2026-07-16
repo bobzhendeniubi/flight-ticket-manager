@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
-import { type MockTransfer } from '../lib/mockData';
 import { api, type Transfer as ApiTransfer, type ProductRating } from '../lib/api';
 import { useCart } from '../stores/cart';
 import { Icon } from '../components/Icon';
@@ -13,13 +12,28 @@ import { ErrorRetry } from '../components/ErrorRetry';
 import { EmptyState } from '../components/EmptyState';
 import { Seo } from '../components/Seo';
 
-/** 列表用车型：MockTransfer + 评分/销量（用于 StarRating、热度排序）。 */
-type ListTransfer = MockTransfer & {
+/** 接送车型的展示结构（由接口原始数据归一化而来：价格转数字、可空字段填默认值）。 */
+export interface Transfer {
+  id: string;
+  name: string;
+  vehicleType: string;
+  capacity: number;
+  basePrice: number;
+  originArea: string;
+  destArea: string;
+  emoji: string;
+  photo: string;
+  features: string[];
+  duration: string;
+}
+
+/** 列表用车型：Transfer + 评分/销量（用于 StarRating、热度排序）。 */
+type ListTransfer = Transfer & {
   rating?: ProductRating;
   soldCount?: number;
 };
 
-function transferApiToMock(t: ApiTransfer): ListTransfer {
+function transferApiToView(t: ApiTransfer): ListTransfer {
   return {
     id: t.id, name: t.name, vehicleType: t.vehicleType, capacity: t.capacity,
     basePrice: Number(t.basePrice), originArea: t.originArea, destArea: t.destArea,
@@ -94,7 +108,7 @@ export function TransfersPage() {
       .listTransfers()
       .then((r) => {
         if (cancelled) return;
-        setTransfers(r.transfers.map(transferApiToMock));
+        setTransfers(r.transfers.map(transferApiToView));
         setStatus('ready');
       })
       .catch(() => {
@@ -276,7 +290,7 @@ export function TransfersPage() {
 }
 
 function BookModal(props: {
-  transfer: MockTransfer;
+  transfer: Transfer;
   pickupAddress: string;
   pickupDate: string;
   pickupTime: string;

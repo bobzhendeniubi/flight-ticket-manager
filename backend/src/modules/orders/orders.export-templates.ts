@@ -296,9 +296,11 @@ export function buildOrderContext(order: OrderForTemplateExport): OrderContext {
   };
 }
 
-// ── 模板一：《全岗可用》57 列（与旧系统「全岗可用」表格模版同名同序）─────────
-// 头部两行：0..53 列为单行表头（纵向合并两行）；末尾「订单成本」为分组表头，
+// ── 模板一：《全岗可用》53 列（与「全岗可用」表格模版同名同序）───────────────
+// 头部两行：0..49 列为单行表头（纵向合并两行）；末尾「订单成本」为分组表头，
 // 跨「成本类型/子类型/金额」三子列（横向合并首行）。系统暂无数据的列一律留空，绝不编造。
+// 定金组四列（定金/到账金额/到账时间/到账渠道）已移除：系统无定金模型，四列恒空，
+// 且现行模版本身已删除该组。收款一律走 paidAmount + 收款流水。
 interface FullRow {
   seq: number;
   isOriginalOrder: string; // 是否是原订单 — 暂无对应字段，留空
@@ -311,10 +313,6 @@ interface FullRow {
   travelDates: string; // 出发(往返)日期
   flightNumbers: string; // 航班号
   orderType: string; // 订单类型
-  deposit: string; // 定金 — 暂无定金概念，留空
-  depositReceived: string; // 定金到账金额 — 留空
-  depositReceivedAt: string; // 定金到账时间 — 留空
-  depositChannel: string; // 定金到账渠道 — 留空
   settlePrice: number; // 结算价格（人均）
   settleReceived: number; // 结算价到账金额（人均）
   settleReceivedAt: string; // 结算价到账时间
@@ -371,10 +369,6 @@ export const FULL_COLUMNS: Array<{ header: string; key: keyof FullRow; width: nu
   { header: '出发(往返)日期', key: 'travelDates', width: 24 },
   { header: '航班号', key: 'flightNumbers', width: 18 },
   { header: '订单类型', key: 'orderType', width: 10 },
-  { header: '定金', key: 'deposit', width: 8 },
-  { header: '定金到账金额', key: 'depositReceived', width: 12 },
-  { header: '定金到账时间', key: 'depositReceivedAt', width: 18 },
-  { header: '定金到账渠道', key: 'depositChannel', width: 12 },
   { header: '结算价格', key: 'settlePrice', width: 10 },
   { header: '结算价到账金额', key: 'settleReceived', width: 14 },
   { header: '结算价到账时间', key: 'settleReceivedAt', width: 18 },
@@ -494,10 +488,6 @@ export function orderToFullRows(order: OrderForTemplateExport, ctx: OrderContext
     travelDates: ctx.travelDates,
     flightNumbers: ctx.flightNumbers,
     orderType: ctx.orderType,
-    deposit: '',
-    depositReceived: '',
-    depositReceivedAt: '',
-    depositChannel: '',
     settlePrice: ctx.settlePerPax,
     settleReceived: ctx.paidPerPax,
     settleReceivedAt: lastPayment ? fmtDateTimeSec(lastPayment.paidAt) : '',

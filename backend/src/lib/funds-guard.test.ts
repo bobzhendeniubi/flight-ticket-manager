@@ -56,6 +56,22 @@ describe('funds-guard · 处置闸 assertOrderAllowsFundsDisposal', () => {
     );
   });
 
+  /**
+   * 退款审批中 = 退款义务已成立、但 Refund 仍停在 REQUESTED（不计入「已完成退款」）的窗口期。
+   * 此时放行多付处置 → 同一笔钱先按多付转走、再按退款快照退给客户，公司净损失。
+   */
+  it('处置闸拉黑 REFUND_REQUESTED：退款审批中的单不许动资金处置', () => {
+    expect(FUNDS_DISPOSE_BLOCKED_STATUSES).toContain(OrderStatus.REFUND_REQUESTED);
+    expect(() =>
+      assertOrderAllowsFundsDisposal(live(OrderStatus.REFUND_REQUESTED), '将多付存入代理余额'),
+    ).toThrow(BadRequestError);
+  });
+
+  it('收款闸不拉黑 REFUND_REQUESTED：退款审批中仍可补收（只挡处置，不挡进钱）', () => {
+    expect(FUNDS_CREDIT_BLOCKED_STATUSES).not.toContain(OrderStatus.REFUND_REQUESTED);
+    expect(() => assertOrderAcceptsFunds(live(OrderStatus.REFUND_REQUESTED))).not.toThrow();
+  });
+
   it('拒绝对死单/软删单处置', () => {
     for (const s of FUNDS_DISPOSE_BLOCKED_STATUSES) {
       expect(() => assertOrderAllowsFundsDisposal(live(s), '测试')).toThrow(BadRequestError);

@@ -17,7 +17,6 @@
  */
 import { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
-import { type MockBundle, type BundleItem } from '../lib/mockData';
 import { api, type Bundle as ApiBundle, type Hotel, type AvailabilityTier, type FlightSearchResult, type ProductRating } from '../lib/api';
 import { formatLocalTime } from '../lib/airports';
 import { BED_TYPE_NOTE } from '../lib/notices';
@@ -63,8 +62,46 @@ const FALLBACK_PRICE = {
   BUSINESS: { go: 4380, ret: 4280 },
 } as const;
 
-/** MockBundle + 后端新增展示字段（升级价 / 关联房型 / 实时库存所需 id+晚数 / 评分销量） */
-interface BundleView extends MockBundle {
+export type BundleItemKind = 'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA';
+
+/** 套餐内的单个产品项。 */
+export interface BundleItem {
+  kind: BundleItemKind;
+  /** 显示用名称；真接 API 后改为 productId 引用 */
+  productName: string;
+  /** 数量或晚数 */
+  qty: number;
+  /** 单价，¥ */
+  unitPrice: number;
+}
+
+/** 套餐的展示结构。 */
+export interface Bundle {
+  id: string;
+  name: string;
+  tagline: string;
+  emoji: string;
+  photo: string;
+  /** 含哪些产品 */
+  items: BundleItem[];
+  /** 单卖总价（计算自 items；机票为可选基准价，运营未填=0 则仅含地面项） */
+  listPrice: number;
+  /** 套餐价（机票基准价计入，未填=0 则仅地面，卡内按出发日实时重算含机票真实价） */
+  bundlePrice: number;
+  /** 整单折扣百分比（整数 0–100）：套餐总价 = 全包价 × (1 − discountPct/100） */
+  discountPct: number;
+  /** @deprecated 已弃用的固定让利金额；前台改用 discountPct（整单 percent off） */
+  groundDiscount: number;
+  /** 机票对应人数（用于调 /flights/price） */
+  flightPax: number;
+  /** 适合人数 */
+  suitableFor: string;
+  /** 当前状态 */
+  active: boolean;
+}
+
+/** Bundle + 后端新增展示字段（升级价 / 关联房型 / 实时库存所需 id+晚数 / 评分销量） */
+interface BundleView extends Bundle {
   singleSupplementPerNight: number | null;
   businessUpgradePerLeg: number | null;
   /** 占座儿童每人比成人便宜多少（机票折扣，CNY）；null = 不优惠 */

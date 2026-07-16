@@ -459,10 +459,7 @@ export async function getHotelNightlyRemaining(
   // 物理房间口径（与销控板 getBoard / 房态导出同口径）：权威分房表订单按「有乘客的
   // roomGroup 数」直计整间；无分房表订单按性别分桶推算真实占用整间数（异性不能拼）——
   // 避免"男+女各半间已分 2 房"被塌缩的 roomsBilled=1.0 误算成 1 间。
-  const { assignedPhysical, fallbackItems } = expandAssignedPhysicalByDate(items, nightDates);
-  const buckets = expandSharedHalfByDate(fallbackItems, nightDates);
-  const fallbackPhysical = computePhysicalUsed(expandUsedByDate(fallbackItems, nightDates), buckets);
-  const physicalUsed = fallbackPhysical.map((v, i) => round2(v + assignedPhysical[i]));
+  const physicalUsed = computePhysicalUsedForItems(items, nightDates, null);
   const physicalRemaining = block.map((b, i) => round2(b - physicalUsed[i]));
 
   return {
@@ -471,6 +468,186 @@ export async function getHotelNightlyRemaining(
     block,
     physicalRemaining,
   };
+}
+
+// ── 物理房间口径前瞻闸（下单 / 换酒店 / 分房写入共用）──────────────────────
+/**
+ * 本次操作**打算新增**的占房——前瞻闸的输入。
+ *   wholeRooms = 新增整间数（非负整数）；
+ *   solos      = 新增拼房客逐人性别（'M'/'F'/'U'；未知按保守口径每人独占 1 间）。
+ *
+ * 为什么必须拆这两维、而不是拿 `physicalRemaining >= rooms` 直接比：
+ *   1) 量纲不同 —— rooms 可能是 0.5（单人拼房的床位/计费口径），物理余量是整间；
+ *   2) **一个新拼房客的物理增量是 0 还是 1，取决于当晚有没有可配对的同性落单** ——
+ *      这在「余量」这个存量数字里根本看不出来。往「已有 1 位男拼房客」里再加 1 位男
+ *      → ceil(2/2)=1 → 增量 0（放行）；往「0 位男」里加 → 增量 1。
+ *   所以只能把人真的塞进性别桶里、按 computePhysicalUsed 重算一遍，才是权威判定。
+ */
+export interface ProspectiveOccupancy {
+  wholeRooms: number;
+  solos: ReadonlyArray<'M' | 'F' | 'U'>;
+}
+
+/** 前瞻闸判定为「装不下」的某一晚。*/
+export interface PhysicalFitViolation {
+  index: number; // 在 nightDates 中的下标
+  date: string; // YYYY-MM-DD
+  block: number; // 该晚包房间数
+  physicalUsed: number; // 本次操作后该晚需要的物理间数
+  shortfall: number; // = physicalUsed − block（超出的物理间数）
+}
+
+export interface PhysicalFitResult {
+  /** false = 整段没有任何包房周期（未配房控）→ 调用方不应据此拦截。*/
+  hasBlock: boolean;
+  block: number[];
+  physicalUsedBefore: number[];
+  physicalUsedAfter: number[];
+  violations: PhysicalFitViolation[];
+}
+
+/**
+ * 物理房间口径占房（逐晚），可选叠加一笔「打算新增的占房」。
+ * 口径与销控板 getBoard / physicalRemaining 完全一致，纯内存推算，不额外查库。
+ */
+function computePhysicalUsedForItems<T extends PhysicalOccupancyItem>(
+  items: ReadonlyArray<T>,
+  dates: readonly string[],
+  prospective: ProspectiveOccupancy | null,
+): number[] {
+  const { assignedPhysical, fallbackItems } = expandAssignedPhysicalByDate(items, dates);
+  const baseBuckets = expandSharedHalfByDate(fallbackItems, dates);
+  const baseUsed = expandUsedByDate(fallbackItems, dates);
+
+  const solos = prospective?.solos ?? [];
+  // 防御：整间数按非负整数取，避免调用方误传 0.5（0.5 间的语义是「拼房客」，应走 solos）。
+  const extraWhole = prospective ? Math.max(0, Math.ceil(prospective.wholeRooms)) : 0;
+  const soloCount = (g: 'M' | 'F' | 'U'): number => solos.filter((s) => s === g).length;
+  const buckets: SharedGenderBuckets = {
+    m: baseBuckets.m.map((v) => v + soloCount('M')),
+    f: baseBuckets.f.map((v) => v + soloCount('F')),
+    u: baseBuckets.u.map((v) => v + soloCount('U')),
+  };
+  // 拼房客各 0.5 间 + 新增整间，一并加进床位口径 used —— computePhysicalUsed 由
+  // (usedHalfUnits − solos)/2 反推整间数，两边必须同步加，否则整间数会被算成负。
+  const used = baseUsed.map((v) => round2(v + solos.length * 0.5 + extraWhole));
+
+  const fallbackPhysical = computePhysicalUsed(used, buckets);
+  return fallbackPhysical.map((v, i) => round2(v + assignedPhysical[i]));
+}
+
+/**
+ * 前瞻闸：把 prospective 的新增占房塞进当晚的性别桶后重算物理间数，逐晚判定装不装得下。
+ *   逐晚拒绝条件：block[i] > 0（该晚确被包房周期管控）且 block[i] − physicalUsedAfter[i] < 0。
+ *   block[i] === 0（未被任何周期覆盖）→ 视为未管控，不据此拦截（房控哲学：未配包房 ≠ 售罄）。
+ *
+ * @param excludeOrderId 改存量单（换酒店 / 重排分房）时排除该单自身的既有占房，避免把自己算两遍。
+ */
+export async function checkHotelPhysicalFit(
+  hotelId: string,
+  nightDates: readonly string[],
+  prospective: ProspectiveOccupancy,
+  opts: { excludeOrderId?: string } = {},
+  client: PrismaClient = defaultPrisma,
+): Promise<PhysicalFitResult> {
+  const empty: PhysicalFitResult = {
+    hasBlock: false,
+    block: [],
+    physicalUsedBefore: [],
+    physicalUsedAfter: [],
+    violations: [],
+  };
+  if (nightDates.length === 0) return empty;
+
+  const fromD = toDateOnly(nightDates[0]);
+  const toD = toDateOnly(nightDates[nightDates.length - 1]);
+  const periods = await client.hotelBlockPeriod.findMany({
+    where: { hotelId, dateFrom: { lte: toD }, dateTo: { gte: fromD } },
+    select: { dateFrom: true, dateTo: true, rooms: true },
+  });
+  if (periods.length === 0) return empty;
+
+  // 过滤口径与 getHotelNightlyRemaining / getBoard 的 used 完全一致
+  const items = await client.orderItem.findMany({
+    where: {
+      hotelRoomTypeId: { not: null },
+      hotelRoomType: { hotelId },
+      hotelCheckIn: { lte: toD },
+      hotelCheckOut: { gt: fromD },
+      order: {
+        deletedAt: null,
+        status: { in: COUNTED_STATUSES },
+        ...(opts.excludeOrderId ? { id: { not: opts.excludeOrderId } } : {}),
+      },
+    },
+    select: {
+      hotelCheckIn: true,
+      hotelCheckOut: true,
+      roomsBilled: true,
+      metadata: true,
+      order: {
+        select: { id: true, roomAssignment: true, passengers: { select: { gender: true } } },
+      },
+    },
+  });
+
+  const block = expandBlockByDate(periods, nightDates);
+  const physicalUsedBefore = computePhysicalUsedForItems(items, nightDates, null);
+  const physicalUsedAfter = computePhysicalUsedForItems(items, nightDates, prospective);
+
+  const violations: PhysicalFitViolation[] = [];
+  nightDates.forEach((date, i) => {
+    if (block[i] > 0 && block[i] - physicalUsedAfter[i] < 0) {
+      violations.push({
+        index: i,
+        date,
+        block: block[i],
+        physicalUsed: physicalUsedAfter[i],
+        shortfall: round2(physicalUsedAfter[i] - block[i]),
+      });
+    }
+  });
+
+  return { hasBlock: true, block, physicalUsedBefore, physicalUsedAfter, violations };
+}
+
+/**
+ * checkHotelPhysicalFit 的抛错版：装不下就抛 BadRequestError。
+ *
+ * @param opts.allowNonWorsening 只拦「让某晚更差」的操作。存量单可能**已经**物理超卖
+ *   （切闸前累积的），运营重排分房去补救时不该被自己造成的存量超卖挡在门外 —— 这类
+ *   「改完不比改前差」的操作放行。新增占房（下单/换酒店）不应开这个豁免。
+ * @param opts.buildMessage 定制错误文案（对外端点用中性话术，后台可回明细）。
+ */
+export async function assertHotelPhysicalFit(
+  hotelId: string,
+  nightDates: readonly string[],
+  prospective: ProspectiveOccupancy,
+  opts: {
+    excludeOrderId?: string;
+    allowNonWorsening?: boolean;
+    buildMessage?: (violations: readonly PhysicalFitViolation[]) => string;
+  } = {},
+  client: PrismaClient = defaultPrisma,
+): Promise<void> {
+  const fit = await checkHotelPhysicalFit(
+    hotelId,
+    nightDates,
+    prospective,
+    { excludeOrderId: opts.excludeOrderId },
+    client,
+  );
+  if (!fit.hasBlock || fit.violations.length === 0) return;
+  if (
+    opts.allowNonWorsening &&
+    fit.violations.every((v) => fit.physicalUsedAfter[v.index] <= fit.physicalUsedBefore[v.index])
+  ) {
+    return;
+  }
+  const message = opts.buildMessage
+    ? opts.buildMessage(fit.violations)
+    : `酒店实际房间不足（${fit.violations[0].date} 包房 ${fit.violations[0].block} 间，本次操作后需 ${fit.violations[0].physicalUsed} 间）`;
+  throw new BadRequestError(message);
 }
 
 // ── 销控板（按酒店 × 日期）────────────────────────────────────────────────
@@ -725,7 +902,9 @@ export async function getAlerts(
     select: {
       id: true,
       departureTime: true,
-      ticketingCap: true,
+      // 座位库存 = Σ 各舱位 capacity（商务 + 经济 + …），与开票上限同源（见 orders/ticketing-cap.ts）。
+      // 曾经这里读 FlightSchedule.ticketingCap（常量 191）—— 那是与真实座位数从不对账的第二本账，已删。
+      seatClasses: { select: { capacity: true } },
       flight: { select: { flightNumber: true } },
     },
   });
@@ -744,7 +923,11 @@ export async function getAlerts(
   );
   const overCapacitySchedules: HotelControlAlerts['overCapacitySchedules'] = [];
   schedules.forEach((s, i) => {
-    if (paxCounts[i] > s.ticketingCap) {
+    // 一个舱位都没配的班次 → 无库存可比，跳过（与 getScheduleSeatCapacity 同口径：
+    // 这种班次本来就卖不出座，把上限当 0 会把它全部报成超员）。
+    if (s.seatClasses.length === 0) return;
+    const seatCapacity = s.seatClasses.reduce((sum, sc) => sum + sc.capacity, 0);
+    if (paxCounts[i] > seatCapacity) {
       overCapacitySchedules.push({
         flightNumber: s.flight.flightNumber,
         departureDate: fmtDateOnly(s.departureTime),
@@ -883,6 +1066,10 @@ function buildNightDates(checkIn: string, checkOut: string): string[] {
  * 由 hotelRoomTypeId 解出 hotelId 后复用 getHotelNightlyRemaining——分房弹窗徽标（RoomingEditor）用。
  * ADMIN/STAFF only：直接回原始数字，与前台 /products/hotel-availability 的档位口径不同（那是公开端点，
  * 只回 tier 不回数字）。
+ *
+ * `remaining` 回的是**物理房间口径**（physicalRemaining），与销控板看板 / 房态导出 / 下单闸完全一致：
+ * 分房是按真实房间盒子摆人的，徽标必须回真实可用整间数。床位口径（block − Σ roomsBilled）会把
+ * 「男+女各一位拼房客」算成 1 间、把落单拼房客算成半间，分房时照着摆必然摆不下。
  */
 export async function getNightlyRemainingForRoomType(
   hotelRoomTypeId: string,
@@ -897,6 +1084,10 @@ export async function getNightlyRemainingForRoomType(
   if (!roomType) throw new NotFoundError('房型不存在');
 
   const dates = buildNightDates(checkIn, checkOut);
-  const { remaining, block, hasBlock } = await getHotelNightlyRemaining(roomType.hotelId, dates, client);
-  return { dates, remaining, block, hasBlock };
+  const { physicalRemaining, block, hasBlock } = await getHotelNightlyRemaining(
+    roomType.hotelId,
+    dates,
+    client,
+  );
+  return { dates, remaining: physicalRemaining, block, hasBlock };
 }

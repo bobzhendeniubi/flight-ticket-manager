@@ -52,6 +52,39 @@ export function normalizePassengerFullName(raw: string): string {
 }
 
 /**
+ * 从完整姓名反推 { lastName, firstName }（录单只给了 fullName 时的兜底）。
+ *
+ * 口径：**斜线优先，其次空格**。
+ *  - `ZHANG/SAN`      → last=`ZHANG`, first=`SAN`（航司标准 LAST/FIRST）
+ *  - `VAN DER/PIET`   → last=`VAN DER`, first=`PIET`（斜线才是分隔符，空格不是）
+ *  - `WANG LIANBO`    → last=`WANG`, first=`LIANBO`（无斜线才按首个空格拆）
+ *  - `MADONNA`        → last=`MADONNA`, first=`''`（拆不出就不编造）
+ *
+ * 为什么必须先看斜线：fullName **允许**带斜线（斜线在全名里是合法分隔符，
+ * 入口 schema 只禁止 lastName/firstName 两栏带斜线）。若只按空格拆，
+ * `ZHANG/SAN` 会整串掉进 lastName，把「姓」这一栏污染成整个姓名——
+ * 而 lastName 一旦落库是脏的，下游各导出的 fullName 兜底逻辑就再也救不回来了
+ * （兜底只在 lastName 为空时才触发）。
+ */
+export function splitPassengerFullName(full?: string | null): {
+  lastName: string;
+  firstName: string;
+} {
+  const s = (full ?? '').trim();
+  if (!s) return { lastName: '', firstName: '' };
+
+  const slash = s.indexOf('/');
+  if (slash > 0) {
+    const last = s.slice(0, slash).trim();
+    const first = s.slice(slash + 1).trim();
+    if (last && first) return { lastName: last, firstName: first };
+  }
+
+  const [head, ...rest] = s.split(/\s+/);
+  return { lastName: head ?? '', firstName: rest.join(' ') };
+}
+
+/**
  * 由姓、名分别组合出完整姓名 `LAST/FIRST NAMES`（各自内部先规范化）。
  * 只有一个字段 → 规范化后原样返回；两者皆空 → null。
  */

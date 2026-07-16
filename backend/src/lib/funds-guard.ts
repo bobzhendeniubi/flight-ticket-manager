@@ -38,6 +38,13 @@ export const FUNDS_CREDIT_BLOCKED_STATUSES: OrderStatus[] = [
  * 拒绝「处置订单资金」类操作（多付转存代理余额 / 多付转挂账池 / 改结算价）的订单状态。
  *
  * 比收款闸更严：软删单与取消族终态一律不许再动钱，避免账实分叉后无人对得平。
+ *
+ * REFUND_REQUESTED（退款申请中）同样在闸内 —— 这是「退款义务已成立、但退款尚未完成」的窗口期：
+ * 此时 Refund 停在 REQUESTED，不计入「已完成退款」（见 sumCompletedRefundsWithinTx），
+ * 多付处置会把同一笔钱先按「多付」转走一次、再按退款快照退给客户一次（公司净损失）；
+ * 改结算价同理可在批准退款前抬高 total 操纵应退额。
+ * 口径：退款审批中的单不许动资金处置。确需改价或处置多付的，
+ * 先把退款申请驳回（状态机允许 REFUND_REQUESTED → PROCESSING）再操作。
  */
 export const FUNDS_DISPOSE_BLOCKED_STATUSES: OrderStatus[] = [
   OrderStatus.CANCELLED,
@@ -45,6 +52,7 @@ export const FUNDS_DISPOSE_BLOCKED_STATUSES: OrderStatus[] = [
   OrderStatus.PAYMENT_TIMEOUT,
   OrderStatus.DRAFT,
   OrderStatus.FAILED,
+  OrderStatus.REFUND_REQUESTED,
 ];
 
 const STATUS_LABEL: Record<OrderStatus, string> = {
@@ -52,7 +60,7 @@ const STATUS_LABEL: Record<OrderStatus, string> = {
   PENDING_PAYMENT: '待付款',
   PAID: '已付款',
   PROCESSING: '处理中',
-  TICKETED: '已出票',
+  TICKETED: '出票完成',
   COMPLETED: '已完成',
   PAYMENT_TIMEOUT: '支付超时',
   CANCELLED: '已取消',

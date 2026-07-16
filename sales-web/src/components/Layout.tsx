@@ -24,8 +24,7 @@ const ROLE_LABEL: Record<string, string> = {
   ADMIN: '管理员',
 };
 
-// 管理后台已拆分到 admin-web (:5174)。前台不再展示后台入口。
-// /admin/* 路由仍保留可访问（向后兼容旧链接），但不在 nav 中显示。
+// 管理后台在 admin-web (:5174)。前台不展示后台入口，也不实现后台页面。
 
 // 桌面端导航 pill：激活态用 brand-50 底 + brand-700 字（平滑高亮），默认态柔和悬停
 const navPill = (isActive: boolean) =>

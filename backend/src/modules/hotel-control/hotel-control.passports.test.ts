@@ -9,6 +9,9 @@
  *   5. 空结果 / 全员无照片 → hasAnyPassportPhoto 判定（路由据此 400）
  *   6. 按姓名导出：出发日期过滤（出发地本地日口径）+ zip 按出发日期分文件夹、按姓名命名文件；
  *      按酒店导出结构保持不变（仍按订单号分文件夹，见第 3 点用例）
+ *   7. 归因分离：查无此人 → notFoundNames；找到了人但出发日不在区间 → excludedByDateNames。
+ *      两者互斥，被日期排除的人绝不能假冒「查无此人」（否则会被误导去改姓名，真因却是日期）。
+ *   8. 无出发日的单（纯签证单/纯酒店单）：传了区间也不被筛掉，归「无出发日期」文件夹
  *
  * 无图路径不触发 fetch(照片)，不 mock 网络；默认 prisma 不参与（全走注入 client）。
  */
@@ -307,7 +310,7 @@ describe('collectPassportGroupsByNames — 取数过滤', () => {
     const sel = await collectPassportGroupsByNames({ names: ['  ', ''] }, client);
     const findMany = client.passenger.findMany as unknown as ReturnType<typeof vi.fn>;
     expect(findMany).not.toHaveBeenCalled();
-    expect(sel).toEqual({ groups: [], notFoundNames: [] });
+    expect(sel).toEqual({ groups: [], notFoundNames: [], excludedByDateNames: [] });
   });
 
   it('fullName 大小写不敏感命中 + chineseName 精确 trim 命中', async () => {
@@ -370,9 +373,10 @@ describe('collectPassportGroupsByNames — 出发日期过滤（出发地本地�
     );
     expect(sel.groups).toHaveLength(1);
     expect(sel.notFoundNames).toEqual([]);
+    expect(sel.excludedByDateNames).toEqual([]);
   });
 
-  it('区间落空：按 UTC 日会误命中的班次，本地日口径正确排除；被过滤的姓名计入未命中', async () => {
+  it('区间落空：按 UTC 日会误命中的班次，本地日口径正确排除', async () => {
     const client = fakePassengerClient([
       makePassenger({ id: 'p1', orderId: 'o1', orderNumber: 'FTM2026080100001', fullName: 'ZHANG SAN', documentNumber: 'E1', departure: CROSS_DAY }),
     ]);
@@ -382,10 +386,40 @@ describe('collectPassportGroupsByNames — 出发日期过滤（出发地本地�
       client,
     );
     expect(sel.groups).toHaveLength(0);
-    expect(sel.notFoundNames).toEqual(['ZHANG SAN']);
+    // 归因：人找到了，是日期没对上 —— 不能假冒「查无此人」
+    expect(sel.excludedByDateNames).toEqual(['ZHANG SAN']);
+    expect(sel.notFoundNames).toEqual([]);
   });
 
-  it('无航班订单：不传区间时保留（departureLocalDate 空串）；传了区间一律不命中', async () => {
+  it('归因分离：日期排除的进 excludedByDateNames，真查不到的才进 notFoundNames', async () => {
+    const client = fakePassengerClient([
+      // 人在库里，但出发日在区间外
+      makePassenger({ id: 'p1', orderId: 'o1', orderNumber: 'FTM2026080100001', fullName: 'ZHANG SAN', documentNumber: 'E1', departure: { time: '2026-07-01T02:00:00.000Z', tz: 'Asia/Shanghai' } }),
+    ]);
+    const sel = await collectPassportGroupsByNames(
+      { names: ['ZHANG SAN', '查无此人'], from: '2026-08-01', to: '2026-08-31' },
+      client,
+    );
+    expect(sel.groups).toHaveLength(0);
+    expect(sel.excludedByDateNames).toEqual(['ZHANG SAN']);
+    expect(sel.notFoundNames).toEqual(['查无此人']);
+  });
+
+  it('同名跨订单：只要有一单落在区间内就照常导出，不算被日期排除', async () => {
+    const client = fakePassengerClient([
+      makePassenger({ id: 'p1', orderId: 'o1', orderNumber: 'FTM2026080100001', fullName: 'ZHANG SAN', documentNumber: 'E1', departure: { time: '2026-07-01T02:00:00.000Z', tz: 'Asia/Shanghai' } }),
+      makePassenger({ id: 'p2', orderId: 'o2', orderNumber: 'FTM2026080100002', fullName: 'ZHANG SAN', documentNumber: 'E1', departure: { time: '2026-08-05T02:00:00.000Z', tz: 'Asia/Shanghai' } }),
+    ]);
+    const sel = await collectPassportGroupsByNames(
+      { names: ['ZHANG SAN'], from: '2026-08-01', to: '2026-08-31' },
+      client,
+    );
+    expect(sel.groups.map((g) => g.orderNumber)).toEqual(['FTM2026080100002']);
+    expect(sel.excludedByDateNames).toEqual([]);
+    expect(sel.notFoundNames).toEqual([]);
+  });
+
+  it('无航班订单（纯签证单/纯酒店单）：传了区间也保留，不被日期筛掉、不进任何未导出名单', async () => {
     const noFlight = makePassenger({
       id: 'p1',
       orderId: 'o1',
@@ -398,23 +432,27 @@ describe('collectPassportGroupsByNames — 出发日期过滤（出发地本地�
     expect(selAll.groups).toHaveLength(1);
     expect(selAll.groups[0].departureLocalDate).toBe('');
 
+    // 与签证台同口径：无航班 → 不被出发日区间隐藏
     const client2 = fakePassengerClient([noFlight]);
     const selRanged = await collectPassportGroupsByNames(
-      { names: ['ZHANG SAN'], from: '2026-08-01' },
+      { names: ['ZHANG SAN'], from: '2026-08-01', to: '2026-08-31' },
       client2,
     );
-    expect(selRanged.groups).toHaveLength(0);
-    expect(selRanged.notFoundNames).toEqual(['ZHANG SAN']);
+    expect(selRanged.groups).toHaveLength(1);
+    expect(selRanged.groups[0].departureLocalDate).toBe('');
+    expect(selRanged.notFoundNames).toEqual([]);
+    expect(selRanged.excludedByDateNames).toEqual([]);
   });
 
-  it('只传单端：from 之前的排除、之后的保留', async () => {
+  it('只传单端：from 之前的排除（计入 excludedByDateNames）、之后的保留', async () => {
     const client = fakePassengerClient([
       makePassenger({ id: 'p1', orderId: 'o1', orderNumber: 'FTM2026080100001', fullName: 'ZHANG SAN', documentNumber: 'E1', departure: { time: '2026-08-05T02:00:00.000Z', tz: 'Asia/Shanghai' } }),
       makePassenger({ id: 'p2', orderId: 'o2', orderNumber: 'FTM2026080100002', fullName: 'LI SI', documentNumber: 'E2', departure: { time: '2026-07-01T02:00:00.000Z', tz: 'Asia/Shanghai' } }),
     ]);
     const sel = await collectPassportGroupsByNames({ names: ['ZHANG SAN', 'LI SI'], from: '2026-08-01' }, client);
     expect(sel.groups.map((g) => g.orderNumber)).toEqual(['FTM2026080100001']);
-    expect(sel.notFoundNames).toEqual(['LI SI']);
+    expect(sel.excludedByDateNames).toEqual(['LI SI']);
+    expect(sel.notFoundNames).toEqual([]);
   });
 });
 
@@ -436,6 +474,7 @@ describe('buildPassportsByNamesZip — zip 结构（按出发日期分文件夹�
         },
       ],
       notFoundNames: ['王五'],
+      excludedByDateNames: [],
     };
 
     const { buf, photoCount } = await buildPassportsByNamesZip(selection);
@@ -457,7 +496,7 @@ describe('buildPassportsByNamesZip — zip 结构（按出发日期分文件夹�
     expect(readme).toContain('王五');
   });
 
-  it('无航班订单归「无出发日期」文件夹；缺图乘客写 README 不落文件', async () => {
+  it('无航班订单归「无出发日期」文件夹；缺图乘客写 README 不落文件；README 明写归类原因（不静默）', async () => {
     const selection: HotelPassportsByNamesSelection = {
       groups: [
         {
@@ -470,9 +509,13 @@ describe('buildPassportsByNamesZip — zip 结构（按出发日期分文件夹�
         },
       ],
       notFoundNames: [],
+      excludedByDateNames: [],
     };
 
-    const { buf, photoCount } = await buildPassportsByNamesZip(selection);
+    const { buf, photoCount } = await buildPassportsByNamesZip(selection, {
+      from: '2026-08-01',
+      to: '2026-08-31',
+    });
 
     expect(photoCount).toBe(1);
     const paths = await zipPaths(buf);
@@ -483,12 +526,47 @@ describe('buildPassportsByNamesZip — zip 结构（按出发日期分文件夹�
     expect(readme).toContain('FTM2026080100003');
     expect(readme).toContain('ZHAO_LIU_E8');
     expect(readme).toContain('没传护照照片');
+    // 无出发日的单要明说归到哪、为什么，别让人以为漏导
+    expect(readme).toContain('2 位客人所在订单没有机票');
+    expect(readme).toContain('无出发日期');
+    expect(readme).toContain('不受出发日期区间过滤');
+  });
+
+  it('被日期排除的姓名单独成段，且不写成「查无此人」（归因不能错）', async () => {
+    const selection: HotelPassportsByNamesSelection = {
+      groups: [
+        {
+          orderNumber: 'FTM2026080100001',
+          departureLocalDate: '2026-08-02',
+          passengers: [
+            { id: 'p1', fullName: 'ZHANG SAN', lastName: 'ZHANG', firstName: 'SAN', chineseName: '张三', documentNumber: 'E1', passportPhotoUrl: PHOTO },
+          ],
+        },
+      ],
+      notFoundNames: ['查无此人'],
+      excludedByDateNames: ['李四'],
+    };
+
+    const { buf } = await buildPassportsByNamesZip(selection, { from: '2026-08-01', to: '2026-08-05' });
+    const readme = await readText(buf, 'README.txt');
+
+    // 日期排除段：点名李四，并指路「改日期区间」
+    expect(readme).toContain('出发日期不在所选区间');
+    expect(readme).toContain('要导出请改日期区间');
+    expect(readme).toContain('李四');
+    // 查无此人段：点名「查无此人」，指路改姓名
+    expect(readme).toContain('未找到任何客人');
+    expect(readme).toContain('姓名可能写错');
+    // 李四绝不能出现在「查无此人」那一段（旧版就是这么误导人的）
+    const notFoundSection = readme.slice(readme.indexOf('未找到任何客人'));
+    expect(notFoundSection).not.toContain('李四');
   });
 
   it('传了出发日期区间 → README 抬头记区间；无未命中姓名时不追加该段落', async () => {
     const selection: HotelPassportsByNamesSelection = {
       groups: [],
       notFoundNames: [],
+      excludedByDateNames: [],
     };
     const { buf } = await buildPassportsByNamesZip(selection, { from: '2026-08-01', to: '2026-08-05' });
     const readme = await readText(buf, 'README.txt');
@@ -497,7 +575,7 @@ describe('buildPassportsByNamesZip — zip 结构（按出发日期分文件夹�
   });
 
   it('不传区间 → README 无区间行', async () => {
-    const selection: HotelPassportsByNamesSelection = { groups: [], notFoundNames: [] };
+    const selection: HotelPassportsByNamesSelection = { groups: [], notFoundNames: [], excludedByDateNames: [] };
     const { buf } = await buildPassportsByNamesZip(selection);
     const readme = await readText(buf, 'README.txt');
     expect(readme).not.toContain('出发日期区间');

@@ -502,9 +502,8 @@ model FlightSchedule {
   peakSurchargeCny   Decimal? @db.Decimal(10, 2)
   aircraftAdjustCny  Decimal? @db.Decimal(10, 2)
   takeoffDiscountCny Decimal? @db.Decimal(10, 2)
-  // 航司开票上限（张/班次）— 同一班次「按航段」的已开票乘客数不得超过此值。
-  // 口径：该班次作为某订单去程时看 outboundInvoiced、作为回程时看 returnInvoiced（见 ticketing-cap.ts）。
-  ticketingCap       Int      @default(191)
+  // 开票上限不再是本表上的独立字段：上限 = 该班次座位库存 = Σ FlightSeatClass.capacity
+  //（多少商务舱 + 多少经济舱）。卖票与开票共用同一本账，见 ticketing-cap.ts。
   isActive           Boolean  @default(true)
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
@@ -951,11 +950,16 @@ enum OrderStatus {
   FAILED
 }
 
-// 订单级签证状态（录单时选择）：不需要 / 需要 / 电子签(三个月多次) / 已签证
+// 订单级签证状态（录单时选择）：不需要 / 需要 / 电子签 / 已签证
+//
+// 本枚举只表达**签发方式层面的录单口径**，不表达入境次数：
+// 入境次数（单次/多次）由签证产品的 Visa.entryType 决定，**不由本枚举表达**。
+// （历史上 E_VISA 曾注为「电子签（三个月多次）」——那是某个具体签证产品的属性，
+//  被误当成枚举语义后，代码据此把所有 E_VISA 单硬编码成「多次」，静默标错。）
 enum VisaRequirement {
   NOT_NEEDED // 不需要
   NEEDED // 需要
-  E_VISA // 电子签（三个月多次）
+  E_VISA // 电子签
   HAS_VISA // 已签证
 }
 

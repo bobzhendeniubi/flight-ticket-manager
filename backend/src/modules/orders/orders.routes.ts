@@ -8,8 +8,9 @@
  */
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
-import { InvoiceStatus, Prisma, UserRole } from '@prisma/client';
-import { OrderService, type OrderRequester } from './orders.service.js';
+import { InvoiceStatus, Prisma, UserRole, type Passenger } from '@prisma/client';
+import { buildStayNightDates, OrderService, type OrderRequester } from './orders.service.js';
+import { assertHotelPhysicalFit } from '../hotel-control/hotel-control.service.js';
 import {
   batchCreateOrdersBodySchema,
   batchSetInvoiceFlagsBodySchema,
@@ -68,6 +69,32 @@ import {
   parseRosterXlsx,
   rosterTemplateFilename,
 } from './roster.js';
+
+// ── 出纳「预期到账金额」上限（CNY，整单总额）──────────────────────────────
+// 取 40_000_000 的依据（非拍脑袋）：
+//   1. 物理上限靠不住 —— expectedAmountCny 落 Decimal(12, 2)，DB 侧能存到
+//      9,999,999,999.99，超界/三位小数只会在写库那一刻炸成 500，不是校验。
+//   2. 不能直接套 SETTLEMENT_PRICE_CAP_CNY（100_000）—— 那是「每人单价」上限，
+//      而本字段是「整单总额」，一单可能几十人，套 10 万会误拒正常大团。
+//   3. 取订单结构上限：createOrder 的 items ≤ 20 行，每行 quantity ≤ 20 人，
+//      每人结算价 ≤ SETTLEMENT_PRICE_CAP_CNY(100_000) → 20 × 20 × 100_000
+//      = 40_000_000。即「本系统自己能产生的最大整单总额」都不会被误拒，
+//      同时把多打几个 0 / 误按「分」填这类手滑挡在 DB 之外。
+export const EXPECTED_AMOUNT_CAP_CNY = 40_000_000;
+
+// 预期到账金额入参：finite（挡 NaN/Infinity）+ 非负 + 最多两位小数（对齐 Decimal(12,2)）+ 上限。
+// null = 清空，是合法操作（出纳撤回已填值），放行。
+// 权宜：金额 schema 本应在 orders.schemas.ts 统一收编（当前该文件有并行改动，先就近具名导出避免冲突）。
+export const expectedAmountBodySchema = z.object({
+  amountCny: z
+    .number()
+    .finite('预期到账金额必须为有效数字')
+    .nonnegative('预期到账金额不能为负数')
+    .max(EXPECTED_AMOUNT_CAP_CNY, `预期到账金额超出上限（¥${EXPECTED_AMOUNT_CAP_CNY}）`)
+    // 两位小数校验用 toFixed 回比，避开 multipleOf(0.01) 的浮点余数误判（如 1234.56 % 0.01 ≠ 0）。
+    .refine((v) => Number(v.toFixed(2)) === v, { message: '预期到账金额最多两位小数（元）' })
+    .nullable(),
+});
 
 export const orderRoutes: FastifyPluginAsync = async (app) => {
   const service = new OrderService();
@@ -489,9 +516,14 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   app.get('/:id/pnr-export', { preHandler: [app.authenticate] }, async (req, reply) => {
     const { id } = req.params as { id: string };
     const requester = await buildRequester(req.user.sub, req.user.role);
-    // service.getOrder 已含 RBAC（CUSTOMER 只能看自己；AGENT 看自己 + 下级；ADMIN/STAFF 看全部）
+    // service.getOrder 已含 RBAC（CUSTOMER 只能看自己；AGENT 看自己 + 下级；ADMIN/STAFF 看全部），
+    // 且已按角色脱敏（AGENT/CUSTOMER 侧剥离 passportPhotoUrl 护照大图）。
     const order = await service.getOrder(id, requester);
-    const passengers = await prisma.passenger.findMany({ where: { orderId: id } });
+    // 出行人一律取 getOrder 已脱敏的 order.passengers —— 绝不另起 prisma.passenger.findMany 裸查。
+    // 本路由是 authenticate-only（AGENT 可达），裸查会绕开脱敏、把护照大图塞进导出给代理。
+    // PNR 25 列（见 pnr-export.ts passengerToRow / PNR_COLUMNS）只读姓名/性别/生日/证件/签证/地址
+    // 等文本字段，不含护照大图 → 脱敏结果的字段已够用，无需向 getOrder 额外索要任何字段。
+    const passengers = order.passengers as unknown as Passenger[];
     // items 传入用于按「出发日 − 出生日期」自动推 PTC（见 pnr-export.ts derivePtcByAge）
     const buf = await buildPnrWorkbook({ orderNumber: order.orderNumber, passengers, items: order.items });
 
@@ -903,6 +935,48 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       select: { orderNumber: true, roomAssignment: true },
     });
     if (!before) return reply.status(404).send({ error: '订单不存在' });
+
+    // ── 物理房间口径前瞻闸（口径同下单闸 / 销控板看板）────────────────────────
+    // 分房表一旦落库，销控板就按「有乘客的房间盒子数」直计本单物理间数（assignedPhysicalRooms）——
+    // 也就是说分房本身会改变物理占房。多开一个房间盒子 = 多占一间，必须过闸。
+    // 逐酒店判定：本单在该酒店的所有行取住宿区间并集（对齐 expandAssignedPhysicalByDate 的订单级去重）。
+    // allowNonWorsening：存量单可能在切闸前就已物理超卖，房控重排分房去补救时不该被自己造成的
+    // 存量超卖挡住 —— 只拦「改完比改前更差」的操作。
+    const assignedRooms = body.roomGroups.filter((g) => g.passengerIds.length > 0).length;
+    if (assignedRooms > 0) {
+      const hotelItems = await prisma.orderItem.findMany({
+        where: { orderId: id, hotelRoomTypeId: { not: null } },
+        select: {
+          hotelCheckIn: true,
+          hotelCheckOut: true,
+          hotelRoomType: { select: { hotelId: true } },
+        },
+      });
+      const nightsByHotel = new Map<string, Set<string>>();
+      for (const it of hotelItems) {
+        const hotelId = it.hotelRoomType?.hotelId;
+        if (!hotelId || !it.hotelCheckIn || !it.hotelCheckOut) continue;
+        const nights = nightsByHotel.get(hotelId) ?? new Set<string>();
+        if (!nightsByHotel.has(hotelId)) nightsByHotel.set(hotelId, nights);
+        for (const d of buildStayNightDates(it.hotelCheckIn, it.hotelCheckOut)) nights.add(d);
+      }
+      for (const [hotelId, nights] of nightsByHotel) {
+        await assertHotelPhysicalFit(
+          hotelId,
+          [...nights].sort(),
+          { wholeRooms: assignedRooms, solos: [] },
+          {
+            excludeOrderId: id,
+            allowNonWorsening: true,
+            buildMessage: (violations) =>
+              `分房间数超出该酒店包房量：${violations
+                .map((v) => `${v.date}（包房 ${v.block} 间，分完后需 ${v.physicalUsed} 间）`)
+                .join('；')}。请减少房间数，或联系房控加房 / 换酒店。`,
+          },
+        );
+      }
+    }
+
     // 分房总间数（含 0.5 拼房）→ 写回酒店订单行的 roomsBilled，房控据此按真实间数计（如 7 人 3.5 间）。
     const totalRooms = body.roomGroups.reduce((s, g) => s + (g.roomFraction ?? 1), 0);
     await prisma.$transaction(async (tx) => {
@@ -1112,7 +1186,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       return reply.status(403).send({ error: '仅运营/管理员可修改预期到账金额' });
     }
     const { id } = req.params as { id: string };
-    const body = z.object({ amountCny: z.number().nullable() }).parse(req.body);
+    const body = expectedAmountBodySchema.parse(req.body);
     const order = await prisma.order.findUnique({
       where: { id },
       select: { id: true, orderNumber: true, expectedAmountLocked: true, expectedAmountCny: true },

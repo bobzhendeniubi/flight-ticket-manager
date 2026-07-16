@@ -9,7 +9,7 @@ import {
   formatLocalDate,
   formatLocalTime,
 } from '../lib/airports';
-import { DANANG_HIGHLIGHTS } from '../lib/mockData';
+import { DANANG_HIGHLIGHTS } from '../lib/content';
 import { useDebouncedValue } from '../lib/useDebouncedValue';
 import { BenefitsStrip } from '../components/BenefitsStrip';
 import { FlightSeatCard } from '../components/FlightSeatCard';

@@ -112,6 +112,21 @@ function optionalNormalizedName(max: number) {
     .transform((v) => (v === undefined ? v : normalizePassengerFullName(v)));
 }
 
+// 拉丁姓/名的「单段」字段（PNR 姓名里的 LAST 一段或 FIRST 一段）：规范化后不允许再含 '/'。
+// 为什么斜线一定是脏数据、而不是某国的合法姓氏：
+//   - 在航司 PNR 姓名里 '/' 是且仅是「姓/名」分隔符；护照 MRZ（ICAO 9303）的字符集里根本没有
+//     '/'（分隔用 '<<'）。所以单段字段里出现 '/' 只可能是把整个姓名塞进了姓（或名）一栏。
+//   - 放过去的后果是静默的：导出层把两段无脑拼成 `LAST/FIRST`，于是
+//     lastName='ZHENG/QIN' + firstName='MEI' → `ZHENG/QIN/MEI` 三段名，航司系统拒收，
+//     而错误要到出票时才暴露。故在入口就 400，把问题挡在还能改的地方。
+// normalize 已经吃掉首尾斜线并把连续斜线折叠成一个，所以这里只会拦到真正内嵌的分隔符；
+// 空格分隔的复姓（如 VAN DER BERG）不受影响。
+function optionalPnrSegmentName(max: number) {
+  return optionalNormalizedName(max).refine((v) => v === undefined || !v.includes('/'), {
+    message: '姓、名请分开填写：该栏不能包含「/」（整个姓名请分别填入姓与名两栏）',
+  });
+}
+
 // ── 下单 ─────────────────────────────────────────────────────────────────
 // 乘客信息 — 注：所有新字段都是 optional，老客户端可继续工作
 export const passengerInputSchema = z.object({
@@ -121,8 +136,10 @@ export const passengerInputSchema = z.object({
     .max(120)
     .transform((v) => normalizePassengerFullName(v)),
   // 航司 PNR 拆分姓/名（fullName 仍必填做兼容）
-  lastName: z.string().max(60).optional(),
-  firstName: z.string().max(80).optional(),
+  // 与 fullName 同样在 schema 层兜底规范化：前端 blur 只挡人手录单，任何非 UI 路径
+  // （代理 API / 批量导入 / 前台）都能把 `ZHENG,` 直接写进 lastName，必须在边界收口。
+  lastName: optionalPnrSegmentName(60),
+  firstName: optionalPnrSegmentName(80),
   title: z.enum(['MR', 'MRS', 'MS', 'MSTR', 'MISS', 'DR']).optional(),
   gender: z.enum(['M', 'F', 'X']).optional(),
   documentType: z.nativeEnum(DocumentType).default('PASSPORT'),
@@ -675,9 +692,11 @@ export type RescheduleOrderBody = z.infer<typeof rescheduleOrderBodySchema>;
 // PATCH /orders/:id/passengers/:passengerId（ADMIN/STAFF）：就地改出行人身份 + 可选重置开票/签证 + 换人费。
 export const swapPassengerBodySchema = z
   .object({
-    // lastName/firstName 各自单段规范化（不做斜线拼接）；fullName 整体规范化。
-    lastName: optionalNormalizedName(120),
-    firstName: optionalNormalizedName(120),
+    // lastName/firstName 各自单段规范化（不做斜线拼接）：与录单入口同款，单段里不允许出现 '/'
+    // ——换人同样会把姓名写进库、同样喂给导出层拼 `LAST/FIRST`，正门堵了这扇窗也不能留。
+    // fullName 是整名，斜线在这里是合法分隔符，故仍走不带斜线校验的 optionalNormalizedName。
+    lastName: optionalPnrSegmentName(120),
+    firstName: optionalPnrSegmentName(120),
     fullName: optionalNormalizedName(120),
     // 中文姓名（护照扩展字段；下单时已支持，此处补录/编辑用同一约束）
     chineseName: z.string().max(120).optional(),

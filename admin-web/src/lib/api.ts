@@ -204,8 +204,6 @@ export interface RangeSchedule {
   /** ISO datetime 字符串 */
   departureTime: string;
   departureTz: string;
-  /** 出票上限（座位 ≤ 此值时仍按此封顶）；null = 不限 */
-  ticketingCap: number | null;
   seatClasses: RangeScheduleSeat[];
 }
 
@@ -912,6 +910,13 @@ export interface OrderSummary {
   userId: string;
   agentId: string | null;
   status: OrderStatus;
+  /**
+   * 本单当前状态下的**合法流转**（状态机真源，由后端 serializeOrder 逐单下发）。
+   * 前端**不要**再手抄一份状态机——抄的那份漂移过，把后端合法的流转当成「需管理员强制」，
+   * 逼运营走 force 通道，正常操作被记成 FORCE_ORDER_STATUS + WARNING 审计，淹没真正的强制。
+   * 旧后端/窄接口未下发时为 undefined，消费方按空集处理（宁可少给按钮，不可谎报合法）。
+   */
+  allowedTransitions?: OrderStatus[];
   invoiceStatus?: InvoiceStatus;
   // 六态开票（三个独立维度）：去程已开 / 回程已开 / 系统已开。缺省视为 false（未开）。
   outboundInvoiced?: boolean;

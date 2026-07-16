@@ -103,6 +103,7 @@ import {
   resolveBundleOccupancy,
   computeRoomsNeeded,
   computeBundleRoomsCharged,
+  toProspectiveOccupancy,
   computeBundleOperationFeeTotal,
   derivePerPaxBundleOptions,
   passengerToData,
@@ -1163,6 +1164,32 @@ describe('passengerToData — 套餐乘客级选项落库', () => {
     expect(data.visaExempt).toBe(true);
     expect(data.singleRoom).toBe(false);
   });
+
+  // fullName 允许带斜线（合法分隔符），lastName/firstName 两栏不允许。
+  // 从 fullName 反推时若只按空格拆，斜线会整串落进 lastName，绕过入口的禁斜线校验。
+  it('fullName 带斜线：ZHANG/SAN → 姓 ZHANG（不含斜线）、名 SAN', () => {
+    const data = passengerToData({ ...base, fullName: 'ZHANG/SAN' });
+    expect(data.lastName).toBe('ZHANG');
+    expect(data.lastName).not.toContain('/');
+    expect(data.firstName).toBe('SAN');
+  });
+
+  it('fullName 按空格拆：ZHANG SAN → 姓 ZHANG、名 SAN', () => {
+    const data = passengerToData(base);
+    expect(data.lastName).toBe('ZHANG');
+    expect(data.firstName).toBe('SAN');
+  });
+
+  it('显式传入的姓/名优先于 fullName 反推', () => {
+    const data = passengerToData({
+      ...base,
+      fullName: 'ZHANG/SAN',
+      lastName: 'LI',
+      firstName: 'SI',
+    });
+    expect(data.lastName).toBe('LI');
+    expect(data.firstName).toBe('SI');
+  });
 });
 
 // ── 按房型容量算所需房间数：computeRoomsNeeded（C-v2 核心）──────────────
@@ -1195,6 +1222,35 @@ describe('computeRoomsNeeded', () => {
   it('容量缺失 / 无房型 → 回退默认 2大1小：4 大 → 2 间', () => {
     expect(computeRoomsNeeded(occ(4), null)).toBe(2);
     expect(computeRoomsNeeded(occ(4), {})).toBe(2);
+  });
+
+  // ── 单人入住（singleCount）计入间数（A6）──────────────────────────────
+  // 原口径把 singleCount 完全排除在 roomsNeeded 外 → 「2 大都勾单人入住 = 1 间」，
+  // 房量校验据此少算 → 超卖；而这个 rooms 正是喂给物理房间前瞻闸的整间数输入。
+  it('2 大都勾单人入住（房型 2大1小）→ 2 间（各自独住，不是挤 1 间）', () => {
+    expect(computeRoomsNeeded(occ(2), room2A1C, 2)).toBe(2);
+  });
+
+  it('2 大其中 1 位勾单人入住 → 1 间独住 + 1 间给剩下那位 = 2 间', () => {
+    expect(computeRoomsNeeded(occ(2), room2A1C, 1)).toBe(2);
+  });
+
+  it('1 大勾单人入住 → 1 间（不因独住而多开）', () => {
+    expect(computeRoomsNeeded(occ(1), room2A1C, 1)).toBe(1);
+  });
+
+  it('4 大其中 2 位勾单人入住 → 2 间独住 + ceil(2/2)=1 间 = 3 间', () => {
+    expect(computeRoomsNeeded(occ(4), room2A1C, 2)).toBe(3);
+  });
+
+  it('singleCount 缺省 / 0 → 与加入该维度之前完全一致（老调用方零影响）', () => {
+    expect(computeRoomsNeeded(occ(2), room2A1C)).toBe(computeRoomsNeeded(occ(2), room2A1C, 0));
+    expect(computeRoomsNeeded(occ(4), room2A1C, 0)).toBe(2);
+  });
+
+  it('singleCount 夹到 [0, 成人数]：脏输入（负数 / 超过成人数）不放大间数', () => {
+    expect(computeRoomsNeeded(occ(2), room2A1C, -3)).toBe(1); // 负 → 按 0
+    expect(computeRoomsNeeded(occ(2), room2A1C, 99)).toBe(2); // 超 → 夹到 2 大
   });
 
   it('大房型 4大2小：6 大 → ceil(6/4)=2 间；4 小 → ceil(4/2)=2 间', () => {
@@ -1638,12 +1694,17 @@ describe('createFulfillmentTasks · 套餐 fan-out 到地面岗', () => {
     bundleItems?: Array<{ kind: string }> | null;
     // 订单级签证状态（缺省 null = 不需要订单级补签证任务）
     visaStatus?: string | null;
+    // 乘客级自备签（缺省一位随团办签 → 签证任务照建，与本组用例原有意图一致）
+    passengers?: Array<{ visaExempt: boolean }>;
   }) {
     const created: Array<{ orderItemId: string; type: string; status: string }> = [];
     let seq = 0;
     const tx = {
       order: {
         findUnique: vi.fn().mockResolvedValue({ visaStatus: opts.visaStatus ?? null }),
+      },
+      passenger: {
+        findMany: vi.fn().mockResolvedValue(opts.passengers ?? [{ visaExempt: false }]),
       },
       orderItem: {
         findMany: vi.fn().mockResolvedValue(
@@ -1705,6 +1766,50 @@ describe('createFulfillmentTasks · 套餐 fan-out 到地面岗', () => {
     expect(types).not.toContain('VISA_APPLICATION');
     expect(types).toContain('HOTEL_BOOKING');
     expect(types).toContain('TRANSFER_DISPATCH');
+  });
+
+  // ── 乘客级一票否决（口径：本单存在至少一位需要我方代办签证的乘客）──────────
+  // 签证台按 visaExempt=false 过滤乘客展示，全员自备签若仍建任务 → 点进去零乘客的空壳。
+  it('混合单：一位自备签 + 一位要代办 → 签证任务照建', async () => {
+    const { tx, created } = makeTx({
+      items: [{ id: 'itm_bundle', kind: 'BUNDLE', bundleId: 'bdl_visa' }],
+      bundleItems: [{ kind: 'HOTEL' }, { kind: 'VISA' }],
+      passengers: [{ visaExempt: true }, { visaExempt: false }],
+    });
+    await run(tx);
+    expect(created.map((c) => c.type)).toContain('VISA_APPLICATION');
+  });
+
+  it('全员自备签 + 套餐含 VISA 组件 → 不建签证任务，酒店任务不受影响', async () => {
+    const { tx, created } = makeTx({
+      items: [{ id: 'itm_bundle', kind: 'BUNDLE', bundleId: 'bdl_visa' }],
+      bundleItems: [{ kind: 'HOTEL' }, { kind: 'VISA' }],
+      passengers: [{ visaExempt: true }, { visaExempt: true }],
+    });
+    await run(tx);
+    const types = created.map((c) => c.type);
+    expect(types).not.toContain('VISA_APPLICATION');
+    expect(types).toContain('HOTEL_BOOKING');
+  });
+
+  it('全员自备签 + 订单级 visaStatus=NEEDED → 订单级兜底也不建', async () => {
+    const { tx, created } = makeTx({
+      items: [{ id: 'itm_flight', kind: 'FLIGHT' }],
+      visaStatus: 'NEEDED',
+      passengers: [{ visaExempt: true }],
+    });
+    await run(tx);
+    expect(created.map((c) => c.type)).not.toContain('VISA_APPLICATION');
+  });
+
+  it('未录乘客 + 订单级 visaStatus=NEEDED → 仍建（空名单 ≠ 无人需要，不漏单）', async () => {
+    const { tx, created } = makeTx({
+      items: [{ id: 'itm_flight', kind: 'FLIGHT' }],
+      visaStatus: 'NEEDED',
+      passengers: [],
+    });
+    await run(tx);
+    expect(created.map((c) => c.type)).toContain('VISA_APPLICATION');
   });
 
   it('套餐组件解析不到（套餐被删）→ 优雅降级至少建 HOTEL_BOOKING', async () => {
@@ -3306,5 +3411,36 @@ describe('filterOrderIdsByDepartDate · 按整单出发日精确细筛', () => {
     const empty = { id: 'e', items: [] };
     const ids = filterOrderIdsByDepartDate([hotelOnly, empty], '2026-07-11', '2026-07-11');
     expect(ids).toEqual(['h']);
+  });
+});
+
+// ── 床位/计费口径 → 物理房间前瞻闸输入的翻译：toProspectiveOccupancy ────────────
+describe('toProspectiveOccupancy', () => {
+  it('0.5 间（单人拼房）→ 1 位拼房客，按第一位 M/F 出行人的性别进桶', () => {
+    expect(toProspectiveOccupancy(0.5, [{ gender: 'M' }])).toEqual({ wholeRooms: 0, solos: ['M'] });
+    expect(toProspectiveOccupancy(0.5, [{ gender: 'F' }])).toEqual({ wholeRooms: 0, solos: ['F'] });
+  });
+
+  it('拼房客性别未知（X / 未填 / 无出行人）→ U，独占一间、不参与自动配对', () => {
+    expect(toProspectiveOccupancy(0.5, [{ gender: 'X' }])).toEqual({ wholeRooms: 0, solos: ['U'] });
+    expect(toProspectiveOccupancy(0.5, [{}])).toEqual({ wholeRooms: 0, solos: ['U'] });
+    expect(toProspectiveOccupancy(0.5, [])).toEqual({ wholeRooms: 0, solos: ['U'] });
+    expect(toProspectiveOccupancy(0.5, undefined)).toEqual({ wholeRooms: 0, solos: ['U'] });
+  });
+
+  it('多位出行人（异常兜底）→ 取第一位有明确性别者，口径同房控 pickSoloGender', () => {
+    expect(toProspectiveOccupancy(0.5, [{ gender: 'X' }, { gender: 'F' }])).toEqual({
+      wholeRooms: 0,
+      solos: ['F'],
+    });
+  });
+
+  it('整间数 → wholeRooms，不进拼房桶（不参与性别配对）', () => {
+    expect(toProspectiveOccupancy(1, [{ gender: 'M' }])).toEqual({ wholeRooms: 1, solos: [] });
+    expect(toProspectiveOccupancy(3, [{ gender: 'M' }])).toEqual({ wholeRooms: 3, solos: [] });
+  });
+
+  it('脏小数（如 1.5 间）→ 向上取整为整间，绝不少算', () => {
+    expect(toProspectiveOccupancy(1.5, [])).toEqual({ wholeRooms: 2, solos: [] });
   });
 });

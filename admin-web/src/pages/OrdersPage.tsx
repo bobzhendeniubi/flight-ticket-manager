@@ -24,7 +24,9 @@ const STATUS_LABEL: Record<OrderStatus, string> = {
   PENDING_PAYMENT: '待支付',
   PAID: '已支付',
   PROCESSING: '处理中',
-  TICKETED: '已出票',
+  // 订单履约阶段，与航段级「去程/回程已出票」（开票进度）不是一回事——
+  // 叫「出票完成」以免运营在整单状态里误当成航段开票标记。
+  TICKETED: '出票完成',
   COMPLETED: '已完成',
   PAYMENT_TIMEOUT: '超时',
   CANCELLED: '已取消',
@@ -72,28 +74,17 @@ const FILTER_STATUSES: OrderStatus[] = [
 ];
 
 // ── 状态机：标准流转允许的目标状态 ──────────────────────────────────────
-// 必须与后端 orders.service.ts 的 ALLOWED_TRANSITIONS 逐条保持一致：抽屉/工具条据此判断
-// 哪些「改状态」是合法流转（正常按钮），哪些需要管理员「强制」（绕过状态机）。改后端记得同步这里。
-const ALLOWED_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
-  DRAFT: ['PENDING_PAYMENT', 'CANCELLED'],
-  PENDING_PAYMENT: ['PAID', 'PAYMENT_TIMEOUT', 'CANCELLED'],
-  PAID: ['PROCESSING', 'TICKETED', 'REFUND_REQUESTED'],
-  PROCESSING: ['TICKETED', 'FAILED', 'REFUND_REQUESTED'],
-  TICKETED: ['COMPLETED', 'CHANGE_REQUESTED', 'REFUND_REQUESTED'],
-  COMPLETED: [],
-  PAYMENT_TIMEOUT: ['PENDING_PAYMENT', 'CANCELLED'],
-  CANCELLED: [],
-  REFUND_REQUESTED: ['REFUNDED', 'PROCESSING'],
-  REFUNDED: [],
-  CHANGE_REQUESTED: ['CHANGED', 'TICKETED'],
-  CHANGED: ['COMPLETED', 'REFUND_REQUESTED'],
-  FAILED: ['PROCESSING', 'REFUND_REQUESTED', 'CANCELLED'],
-};
-
-// 终态（无任何后续流转）——抽屉据此给出「为何没有可用操作」的说明，而不是空白的「无可用操作」。
-const TERMINAL_STATUSES: OrderStatus[] = (Object.keys(ALLOWED_TRANSITIONS) as OrderStatus[]).filter(
-  (s) => ALLOWED_TRANSITIONS[s].length === 0,
-);
+// 这里**不再手抄**后端的 ALLOWED_TRANSITIONS —— 手抄版漂移过四行（PAID/PROCESSING 少
+// CHANGE_REQUESTED、CHANGE_REQUESTED 少 PAID/PROCESSING、CHANGED 少 PROCESSING/TICKETED），
+// 结果后端合法的流转在前端被当成「需要管理员强制」，运营被迫走 force 通道，把正常操作
+// 污染成 FORCE_ORDER_STATUS + WARNING 的强制审计记录，真正该警觉的强制反而被淹没。
+// 真源在后端 orders.service.ts 的 ALLOWED_TRANSITIONS，经 serializeOrder 逐单下发到
+// order.allowedTransitions；抽屉直接消费它（见 allowedNextOf）。改状态机只需改后端一处。
+//
+// 缺省空集（fail-closed）：老后端/窄接口没下发时，宁可少给几个「标准流转」按钮
+//（管理员仍可用强制通道兜底），也不谎报某个流转合法、让运营点了才被后端拒。
+const allowedNextOf = (o: Pick<OrderSummary, 'allowedTransitions'>): OrderStatus[] =>
+  o.allowedTransitions ?? [];
 
 // 改状态动作的按钮文案（按「目标状态」）。个别流转的语义取决于来源状态（如退款申请中→处理中
 // 其实是「驳回退款」），用 TRANSITION_LABEL_FROM 覆盖；其余用通用文案。
@@ -162,13 +153,20 @@ function parseInvoiceLegFilter(v: string): { invoiceLeg: InvoiceLeg; invoiced: b
   if (leg !== 'outbound' && leg !== 'return' && leg !== 'system') return null;
   return { invoiceLeg: leg, invoiced: inv === 'true' };
 }
-// 出行日期单日筛选（票务反馈 A9）：两个框原来独立生效，只填一个会被后端当开区间处理
-// （如只填"起始"＝从那天起所有未来订单都命中，用户以为是"只看这天"）。这里统一收窄：
-// 只填一项＝自动把另一项补成同一天（单日查询）；两项都填且不同才是真正的区间。
-function resolveTravelDateRange(from: string, to: string): { travelFrom?: string; travelTo?: string } {
-  if (from && !to) return { travelFrom: from, travelTo: from };
-  if (to && !from) return { travelFrom: to, travelTo: to };
+// 出行日期筛选的唯一口径 — 主列表 / 三模板导出 / 全岗总表导出三处共用，
+// 保证「导出＝列表所见」，不会因为导出走了另一套日期语义而多带或漏掉订单。
+// 两个框各自独立生效，端点就是端点：只填「从」＝从那天起的全部订单；只填「到」＝那天及之前
+// 的全部订单；两项都填＝闭区间；两项填同一天＝只看那一天（筛选区的「只看某一天」按钮即做这件事）。
+function travelDateRange(from: string, to: string): { travelFrom?: string; travelTo?: string } {
   return { travelFrom: from || undefined, travelTo: to || undefined };
+}
+// 日期筛选回显 — 用大白话说清「现在到底在筛什么」，尤其是只填一个框时的开区间，
+// 免得填了「从」拿到一堆更晚的订单还以为筛选没生效。无筛选返回 null。
+function describeDateRange(from: string, to: string): string | null {
+  if (!from && !to) return null;
+  if (from && to) return from === to ? `${from} 当天` : `${from} 至 ${to}`;
+  if (from) return `${from} 起（未设截止）`;
+  return `${to} 及之前（未设起始）`;
 }
 /** 订单含几个航段（FLIGHT 行且有班次）；≥2 视为往返（有回程）。 */
 function flightLegCount(order: OrderSummary): number {
@@ -381,7 +379,7 @@ export function OrdersPage() {
     const query: ListOrdersParams = { pageSize: 200 };
     if (createdFrom) query.from = createdFrom; // 下单日期起（createdAt）
     if (createdTo) query.to = createdTo; // 下单日期止（createdAt）
-    const resolvedTravel = resolveTravelDateRange(travelFrom, travelTo);
+    const resolvedTravel = travelDateRange(travelFrom, travelTo);
     if (resolvedTravel.travelFrom) query.travelFrom = resolvedTravel.travelFrom;
     if (resolvedTravel.travelTo) query.travelTo = resolvedTravel.travelTo;
     if (claimFilter === 'unclaimed') query.unclaimedOnly = '1';
@@ -701,7 +699,7 @@ export function OrdersPage() {
       if (res.failureCount > 0) {
         window.alert(
           `有 ${res.failureCount} 条订单未能变更为「${STATUS_LABEL[bulkStatus as OrderStatus]}」。\n` +
-          `原因通常是状态机不允许该跳转（例如"待支付"须先变为"已支付"才能到"已出票"）。\n` +
+          `原因通常是状态机不允许该跳转（例如"待支付"须先变为"已支付"才能到"出票完成"）。\n` +
           `如确需强制变更，请勾选「强制」后重试。具体失败原因见下方列表。`,
         );
       }
@@ -759,9 +757,8 @@ export function OrdersPage() {
     try {
       // 有勾选就只导勾选的这批（后端以 id 集合为准，忽略下面的筛选条件）。
       const selected = Array.from(selectedIds);
-      // 出行日期单日筛选（A9）：与主列表同一条规则——只填一项＝当天，两项都填才是区间，
-      // 保证「导出＝列表所见」不因导出走了另一套日期语义而多带出其他日期的订单。
-      const resolvedTravel = resolveTravelDateRange(travelFrom, travelTo);
+      // 出行日期：与主列表同一条口径（travelDateRange），保证「导出＝列表所见」。
+      const resolvedTravel = travelDateRange(travelFrom, travelTo);
       const blob = await api.downloadOrdersTemplateExport(tokens.accessToken, {
         template: exportTemplate,
         // 不透传列表的"状态"筛选：整班/名单导出要覆盖全部「占座」订单（含未支付那单），
@@ -841,8 +838,8 @@ export function OrdersPage() {
     try {
       // 有勾选就只导勾选的这批（后端以 id 集合为准，忽略 from/to）。
       const selected = Array.from(selectedIds);
-      // 出行日期单日筛选（A9）：与主列表/三模板导出同一条规则——只填一项＝当天。
-      const resolvedTravel = resolveTravelDateRange(travelFrom, travelTo);
+      // 出行日期：与主列表/三模板导出同一条口径（travelDateRange）。
+      const resolvedTravel = travelDateRange(travelFrom, travelTo);
       const blob = await api.exportMaster(tokens.accessToken, {
         from: resolvedTravel.travelFrom,
         to: resolvedTravel.travelTo,
@@ -855,7 +852,7 @@ export function OrdersPage() {
       const rangeLabel = selected.length > 0
         ? `勾选${selected.length}条`
         : resolvedTravel.travelFrom || resolvedTravel.travelTo
-          ? `${resolvedTravel.travelFrom || '全部'}_${resolvedTravel.travelTo || resolvedTravel.travelFrom || '全部'}`
+          ? `${resolvedTravel.travelFrom || '全部'}_${resolvedTravel.travelTo || '全部'}`
           : '全部_全部';
       a.download = `全岗总表_${rangeLabel}.xlsx`;
       document.body.appendChild(a);
@@ -1228,24 +1225,41 @@ export function OrdersPage() {
             />
           </div>
           <div>
-            <label className="label">出行日期 · 起始</label>
+            <label className="label">出行日期（从）</label>
             <input
               type="date"
               className="input"
               value={travelFrom}
+              max={travelTo || undefined}
               onChange={(e) => setTravelFrom(e.target.value)}
-              title="按乘客实际出行日期筛选（与下单时间不同）：只填这一项＝只看这一天，两项都填才是区间"
+              title="按乘客实际出行日期筛选（与下单时间不同）。只填这一项＝这天起的全部订单；只想看某一天，用右边的「只看某一天」"
             />
           </div>
           <div>
-            <label className="label">出行日期 · 截止</label>
+            <label className="label">出行日期（到）</label>
             <input
               type="date"
               className="input"
               value={travelTo}
+              min={travelFrom || undefined}
               onChange={(e) => setTravelTo(e.target.value)}
-              title="按乘客实际出行日期筛选（与下单时间不同）：只填这一项＝只看这一天，两项都填才是区间"
+              title="按乘客实际出行日期筛选（与下单时间不同）。只填这一项＝这天及之前的全部订单；只想看某一天，用下面的「只看某一天」"
             />
+            {/* 「只看某一天」— 高频场景做成一等公民：把两个框都设成同一天，而不是让「从」偷偷变成单日。 */}
+            <button
+              type="button"
+              className="mt-1 text-xs text-brand hover:text-brand-dark disabled:cursor-not-allowed disabled:text-slate-300"
+              disabled={!travelFrom && !travelTo}
+              title={travelFrom || travelTo ? '把「从」和「到」都设成这一天，只看当天出行的订单' : '先在「从」或「到」里选一个日期'}
+              onClick={() => {
+                const day = travelFrom || travelTo;
+                if (!day) return;
+                setTravelFrom(day);
+                setTravelTo(day);
+              }}
+            >
+              只看某一天
+            </button>
           </div>
           <div>
             <label className="label">接单状态</label>
@@ -1366,19 +1380,26 @@ export function OrdersPage() {
         </div>
         {(statusFilter || kindFilter || channelFilter || agentFilter || search || flightNumberFilter || passengerNameFilter || invoiceLegFilter || visaFilter || createdFrom || createdTo || travelFrom || travelTo) && (
           <div className="mt-3 flex items-center justify-between text-xs text-slate-500">
-            <span>
-              显示 {filtered.length} 条订单
-              {(travelFrom || travelTo) && (() => {
-                // 出行日期活动筛选摘要（A9）：单日显示「= X」，区间显示「X ~ Y」，与实际生效的
-                // 查询范围（resolveTravelDateRange 收窄后的结果）保持一致，避免摘要和真实筛选对不上。
-                const resolved = resolveTravelDateRange(travelFrom, travelTo);
-                const label = resolved.travelFrom && resolved.travelTo && resolved.travelFrom !== resolved.travelTo
-                  ? `${resolved.travelFrom} ~ ${resolved.travelTo}`
-                  : `= ${resolved.travelFrom || resolved.travelTo}`;
+            {/* 日期筛选回显 — 两个框各自独立生效，只填一个就是开区间；把当前生效的条件和命中单数
+                摊开写清楚，填了「从」却看到更晚的订单时一眼就知道为什么，不用猜。 */}
+            <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
+              <span>显示 {filtered.length} 条订单</span>
+              {(() => {
+                const travelEcho = describeDateRange(travelFrom, travelTo);
+                const createdEcho = describeDateRange(createdFrom, createdTo);
                 return (
-                  <span className="ml-2 rounded bg-brand-50 px-1.5 py-0.5 font-medium text-brand">
-                    出行日期 {label}
-                  </span>
+                  <>
+                    {travelEcho && (
+                      <span className="rounded bg-brand-50 px-1.5 py-0.5 font-medium text-brand">
+                        出行日期：{travelEcho} · 命中 {filtered.length} 单
+                      </span>
+                    )}
+                    {createdEcho && (
+                      <span className="rounded bg-brand-50 px-1.5 py-0.5 font-medium text-brand">
+                        下单时间：{createdEcho}
+                      </span>
+                    )}
+                  </>
                 );
               })()}
             </span>
@@ -1412,7 +1433,7 @@ export function OrdersPage() {
               disabled={bulkSubmitting}
             >
               <option value="">选择目标状态…</option>
-              {/* 票务按航段批量开票（见下方「批量开票」控件），整单「已出票」不在批量目标状态里放开——
+              {/* 票务按航段批量开票（见下方「批量开票」控件），整单「出票完成」不在批量目标状态里放开——
                   票务岗口径：批量只做"去程/回程已出票"这类航段级标记，整单终态仍走逐单详情页确认。 */}
               {(Object.keys(STATUS_LABEL) as OrderStatus[])
                 .filter((s) => s !== 'TICKETED')
@@ -1538,7 +1559,7 @@ export function OrdersPage() {
               </div>
               {bulkResult.failureCount > 0 && (
                 <div className="mt-1 text-xs text-rose-700">
-                  失败订单未按状态机允许路径流转（例如"待支付"须先变为"已支付"才能到"已出票"）。如需强制变更，请勾选上方「强制」后重试。
+                  失败订单未按状态机允许路径流转（例如"待支付"须先变为"已支付"才能到"出票完成"）。如需强制变更，请勾选上方「强制」后重试。
                 </div>
               )}
               {bulkResult.failures.length > 0 && (
@@ -1986,13 +2007,14 @@ function OrderDrawer({
     onChanged?.();
   };
 
-  // 可行的下一步状态：直接读 ALLOWED_TRANSITIONS（与后端逐条同步），列出当前状态的全部合法流转，
-  // 而非之前那套手写子集（会漏项——如 PAID/PROCESSING 缺「申请退款」按钮，导致「改状态没用」的观感）。
-  const allowedNext = ALLOWED_TRANSITIONS[o.status] ?? [];
+  // 可行的下一步状态：直接消费后端逐单下发的 allowedTransitions（状态机真源），列出当前状态的
+  // 全部合法流转，而非手抄一份（抄的会漂移——漂移后合法流转被逼进 force 通道，污染强制审计）。
+  const allowedNext = allowedNextOf(o);
   const nextSteps: Array<{ label: string; to: OrderStatus; style: string }> = allowedNext.map(
     (to, i) => ({ label: transitionLabel(o.status, to), to, style: i === 0 ? 'btn-primary' : 'btn-secondary' }),
   );
-  const isTerminal = TERMINAL_STATUSES.includes(o.status);
+  // 终态 = 后端下发的合法流转为空（据此说明「为何没有可用操作」，而不是渲染空白工具条）。
+  const isTerminal = allowedNext.length === 0;
   // 管理员强制可选的「越过状态机」目标：所有其它状态里、不在标准流转内的（标准流转已经是普通按钮）。
   const forceTargets: OrderStatus[] = isAdmin
     ? (Object.keys(STATUS_LABEL) as OrderStatus[]).filter(

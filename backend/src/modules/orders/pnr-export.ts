@@ -7,6 +7,7 @@
 import ExcelJS from 'exceljs';
 import type { Passenger } from '@prisma/client';
 import { toAlpha3 } from './nationality.js';
+import { splitPassengerFullName } from '../../lib/passenger-name.js';
 
 /** 日期 → DDMmmYY 格式，如 24Oct95 / 12Dec34（航司标准）*/
 export function formatPnrDate(d: Date | null | undefined): string {
@@ -129,8 +130,7 @@ export const PNR_COLUMNS: Array<{ header: string; key: keyof PnrRow }> = [
 export function passengerToRow(p: Passenger, departureDate?: Date | null): PnrRow {
   // 优先用拆分字段；姓名缺失（含空串，`||` 语义）兜底按 fullName 拆分——支持空格或斜线：
   // OCR/OTA/老数据常见 "CHEN/HAOLIANG" 斜线格式，若只按空格切，整串会掉进 Last Name。
-  const [autoLast, ...rest] = (p.fullName || '').trim().split(/[\s/]+/);
-  const autoFirst = rest.join(' ');
+  const { lastName: autoLast, firstName: autoFirst } = splitPassengerFullName(p.fullName);
   const lastName = (p.lastName || autoLast || '').toUpperCase();
   const firstName = (p.firstName || autoFirst || '').toUpperCase();
   const ptc = derivePtcByAge(p.dateOfBirth, departureDate, p.passengerType);

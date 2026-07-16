@@ -10,7 +10,7 @@ import type { Prisma, PrismaClient } from '@prisma/client';
 import { OrderStatus } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { toAlpha3 } from './nationality.js';
-import { countIssuedPassengers } from './ticketing-cap.js';
+import { countIssuedPassengers, getScheduleSeatCapacity } from './ticketing-cap.js';
 import { parseRoomGroups } from './orders.export-room-allocation.js';
 import { nameWithTitle } from './orders.export-templates.js';
 
@@ -34,7 +34,7 @@ const STATUS_LABEL: Record<string, string> = {
   PENDING_PAYMENT: '待支付',
   PAID: '已支付',
   PROCESSING: '处理中',
-  TICKETED: '已出票',
+  TICKETED: '出票完成',
   COMPLETED: '已完成',
   REFUND_REQUESTED: '退款中',
   CHANGE_REQUESTED: '改期中',
@@ -272,12 +272,10 @@ export async function buildOrdersBySchedule(
   scheduleId: string,
   client: PrismaClient = defaultPrisma,
 ): Promise<Buffer> {
-  // 开票进度（航司上限指示）：已开票乘客数 vs 班次 ticketingCap
-  const [schedule, issuedCount] = await Promise.all([
-    client.flightSchedule.findUnique({
-      where: { id: scheduleId },
-      select: { ticketingCap: true },
-    }),
+  // 开票进度（座位库存指示）：已开票座位数 vs 该班次座位库存（Σ 舱位 capacity）。
+  // seatCapacity 为 null = 班次已删 / 未配舱位 → 无上限可显示，跳过该行（见 getScheduleSeatCapacity）。
+  const [seatCapacity, issuedCount] = await Promise.all([
+    getScheduleSeatCapacity(client, scheduleId),
     countIssuedPassengers(client, scheduleId),
   ]);
 
@@ -332,13 +330,13 @@ export async function buildOrdersBySchedule(
   // ExcelJS 的 insertRow+mergeCells 连续调用同一行号有 bug（"Cannot merge already merged cells"）。
   // 绕过方式：先写汇总行（不依赖 ws.columns），再配列定义，再追加数据行。
   // 最终布局：
-  //   - schedule 存在：row1=开票进度，row2=乘客数，row3=表头，row4+=数据
-  //   - schedule 不存在：row1=乘客数，row2=表头，row3+=数据
+  //   - 班次有座位库存：row1=开票进度，row2=乘客数，row3=表头，row4+=数据
+  //   - 班次已删 / 未配舱位：row1=乘客数，row2=表头，row3+=数据
 
   let headerRowNumber = 1;
 
-  if (schedule) {
-    const cap = schedule.ticketingCap;
+  if (seatCapacity !== null) {
+    const cap = seatCapacity;
     const r1 = ws.addRow([`开票进度：已开票 ${issuedCount} / 上限 ${cap} 张`]);
     ws.mergeCells(r1.number, 1, r1.number, COLUMNS.length);
     r1.font = {

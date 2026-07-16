@@ -58,8 +58,10 @@ import {
   capPublicAvailable,
   computeAvailabilityTier,
   FlightService,
-  sanitizePublicSeatBreakdown,
   serializeScheduleForAgent,
+  toPublicPrice,
+  toPublicSeatBreakdown,
+  toPublicSeatClass,
 } from './flights.service.js';
 
 describe('computeAvailabilityTier · 缺省 capacity（向后兼容旧版绝对阈值）', () => {
@@ -173,15 +175,15 @@ describe('capPublicAvailable · 公开口径余位封顶', () => {
   });
 });
 
-// ── sanitizePublicSeatBreakdown（公开 /flights/price 的 seatIndex 脱敏：防反推 sold）──────
+// ── toPublicSeatBreakdown（公开 /flights/price 的 seatIndex 脱敏：防反推 sold）──────
 // 回归用例：真实 sold=1 时，未脱敏的匿名 /flights/price?qty=1 会返回 seatIndex=2（=sold+1），
 // 泄露 sold=1；脱敏后必须变成相对索引 1，不再能反推历史销量。
-describe('sanitizePublicSeatBreakdown · 公开口径 seatIndex 脱敏（防反推 sold）', () => {
+describe('toPublicSeatBreakdown · 公开口径 seatIndex 脱敏（防反推 sold）', () => {
   it('回归：sold=1 的单张查询，脱敏前 seatIndex=2（=sold+1）会暴露 sold，脱敏后必须是相对值 1', () => {
     const sold = 1;
     const raw = [{ seatIndex: sold + 1, bucket: 0, bucketMultiplier: 1, unitPrice: 1000 }];
     expect(raw[0].seatIndex).toBe(2); // 脱敏前：能直接反推 sold = seatIndex - 1 = 1
-    const sanitized = sanitizePublicSeatBreakdown(raw);
+    const sanitized = toPublicSeatBreakdown(raw);
     expect(sanitized[0].seatIndex).toBe(1); // 脱敏后：相对索引，不含 sold 信息
   });
 
@@ -193,7 +195,7 @@ describe('sanitizePublicSeatBreakdown · 公开口径 seatIndex 脱敏（防反�
       bucketMultiplier: 1,
       unitPrice: 1000,
     }));
-    const sanitized = sanitizePublicSeatBreakdown(raw);
+    const sanitized = toPublicSeatBreakdown(raw);
     expect(sanitized.map((s) => s.seatIndex)).toEqual([1, 2, 3, 4, 5]);
   });
 
@@ -202,7 +204,7 @@ describe('sanitizePublicSeatBreakdown · 公开口径 seatIndex 脱敏（防反�
       { seatIndex: 51, bucket: 2, bucketMultiplier: 1, unitPrice: 1500 },
       { seatIndex: 52, bucket: 3, bucketMultiplier: 1, unitPrice: 1800 },
     ];
-    const sanitized = sanitizePublicSeatBreakdown(raw);
+    const sanitized = toPublicSeatBreakdown(raw);
     expect(sanitized).toEqual([
       { seatIndex: 1, bucket: 2, bucketMultiplier: 1, unitPrice: 1500 },
       { seatIndex: 2, bucket: 3, bucketMultiplier: 1, unitPrice: 1800 },
@@ -210,15 +212,221 @@ describe('sanitizePublicSeatBreakdown · 公开口径 seatIndex 脱敏（防反�
   });
 
   it('空数组（qty 校验层已挡下 <1，但函数本身也不应崩）→ 返回空数组', () => {
-    expect(sanitizePublicSeatBreakdown([])).toEqual([]);
+    expect(toPublicSeatBreakdown([])).toEqual([]);
   });
 
   it('不修改输入数组（不可变）', () => {
     const raw = [{ seatIndex: 42, bucket: 0, bucketMultiplier: 1, unitPrice: 1000 }];
-    const sanitized = sanitizePublicSeatBreakdown(raw);
+    const sanitized = toPublicSeatBreakdown(raw);
     expect(raw[0].seatIndex).toBe(42); // 原数组未被就地修改
     expect(sanitized).not.toBe(raw);
     expect(sanitized[0]).not.toBe(raw[0]);
+  });
+
+  it('白名单是"选字段"而非"删字段"：计价项上的未知字段不透传', () => {
+    const raw = [
+      {
+        seatIndex: 9,
+        bucket: 0,
+        bucketMultiplier: 1,
+        unitPrice: 1000,
+        futureInternalMarginField: 'internal',
+      },
+    ];
+    const sanitized = toPublicSeatBreakdown(raw);
+    expect(sanitized[0]).not.toHaveProperty('futureInternalMarginField');
+    expect(Object.keys(sanitized[0]).sort()).toEqual([
+      'bucket',
+      'bucketMultiplier',
+      'seatIndex',
+      'unitPrice',
+    ]);
+  });
+});
+
+// ── toPublicPrice（公开 /flights/price 响应白名单：防内部日期等级泄露）────────────
+// 回归：这条路由曾用 `{ ...pricing, currentBucketRemaining, perSeatBreakdown }` 展开 PriceResult，
+// 只覆盖了两个字段——PriceResult 上的 dateRank（公司内部日期等级 A/B/C/D）与 dateMultiplier
+// 就跟着展开原样发给了未鉴权的匿名调用方。改白名单后内部字段默认不透传。
+describe('toPublicPrice · 公开 /flights/price 响应白名单', () => {
+  const internalPriceResult = () => ({
+    scheduleId: 'sched_1',
+    cabin: 'ECONOMY' as const,
+    qty: 2,
+    pricingMode: 'AUTO' as const,
+    basePrice: 1000,
+    dateRank: 'A', // 内部日期等级——绝不对客户输出
+    dateMultiplier: 1, // 恒为 1，对客户零信息量
+    bucketSize: 0,
+    totalBuckets: 1,
+    currentBucket: 0,
+    currentBucketRemaining: 178, // 精确档内剩余（内部真值）
+    perSeatBreakdown: [
+      { seatIndex: 3, bucket: 0, bucketMultiplier: 1, unitPrice: 1000 },
+      { seatIndex: 4, bucket: 0, bucketMultiplier: 1, unitPrice: 1000 },
+    ],
+    totalPrice: 2000,
+    averageUnitPrice: 1000,
+  });
+
+  it('回归：响应不含 dateRank（内部日期等级）与 dateMultiplier', () => {
+    const pub = toPublicPrice(internalPriceResult());
+    expect(pub).not.toHaveProperty('dateRank');
+    expect(pub).not.toHaveProperty('dateMultiplier');
+  });
+
+  it('回归：整个响应序列化后不出现内部日期等级字面量（含嵌套）', () => {
+    const serialized = JSON.stringify(toPublicPrice(internalPriceResult()));
+    expect(serialized).not.toContain('dateRank');
+    expect(serialized).not.toContain('dateMultiplier');
+  });
+
+  it('白名单是"选字段"而非"删字段"：PriceResult 上未来新增的内部字段一律不透传', () => {
+    const pub = toPublicPrice({
+      ...internalPriceResult(),
+      futureInternalCostField: 12345,
+    } as unknown as Parameters<typeof toPublicPrice>[0]);
+    expect(pub).not.toHaveProperty('futureInternalCostField');
+    expect(Object.keys(pub).sort()).toEqual([
+      'averageUnitPrice',
+      'basePrice',
+      'bucketSize',
+      'cabin',
+      'currentBucket',
+      'currentBucketRemaining',
+      'perSeatBreakdown',
+      'pricingMode',
+      'qty',
+      'scheduleId',
+      'totalBuckets',
+      'totalPrice',
+    ]);
+  });
+
+  it('沿用既有公开脱敏：currentBucketRemaining 封顶 9、seatIndex 重编号为 1..qty', () => {
+    const pub = toPublicPrice(internalPriceResult());
+    expect(pub.currentBucketRemaining).toBe(9); // 真值 178 → 封顶 9
+    expect(pub.perSeatBreakdown.map((s) => s.seatIndex)).toEqual([1, 2]); // 真值 3,4 → 相对索引
+  });
+
+  it('保留客户要看的计价字段（价格展示不受影响）', () => {
+    const pub = toPublicPrice(internalPriceResult());
+    expect(pub).toMatchObject({
+      scheduleId: 'sched_1',
+      cabin: 'ECONOMY',
+      qty: 2,
+      pricingMode: 'AUTO',
+      basePrice: 1000,
+      totalPrice: 2000,
+      averageUnitPrice: 1000,
+    });
+  });
+});
+
+// ── toPublicSeatClass（公开 /flights/search 舱位白名单：防内部日期等级 / 精确余位泄露）──
+// 回归：GET /flights/search 完全未鉴权（同文件其余端点都有 authenticate+requireRole），
+// 曾用 `({ availExact: _a, ...pub })` 逐字段剥离——只摘掉了 availExact，内部对象上的
+// dateRank/dateMultiplier 原样进了公开响应。改白名单后内部字段默认不透传。
+describe('toPublicSeatClass · 公开 /flights/search 舱位白名单', () => {
+  const internalSeat = () => ({
+    availExact: 178, // 精确余位真值（hasSpace 过滤用）
+    dateRank: 'A', // 内部日期等级——绝不对客户输出
+    dateMultiplier: 1,
+    seatClassId: 'sc_eco',
+    cabin: 'ECONOMY' as const,
+    available: 9, // 已封顶
+    availabilityTier: 'AMPLE' as const,
+    basePrice: '1000',
+    dynamicPrice: '1000',
+    totalForQty: 2000,
+    baggage: { checkedKg: 20, checkedPieces: 1, carryOnKg: 7, note: null },
+  });
+
+  it('回归：公开舱位不含 dateRank / dateMultiplier / availExact', () => {
+    const pub = toPublicSeatClass(internalSeat());
+    expect(pub).not.toHaveProperty('dateRank');
+    expect(pub).not.toHaveProperty('dateMultiplier');
+    expect(pub).not.toHaveProperty('availExact');
+  });
+
+  it('公开舱位不含 capacity / sold / locked（精确销量口径）', () => {
+    const pub = toPublicSeatClass({
+      ...internalSeat(),
+      capacity: 180,
+      sold: 2,
+      locked: 0,
+    } as unknown as Parameters<typeof toPublicSeatClass>[0]);
+    expect(pub).not.toHaveProperty('capacity');
+    expect(pub).not.toHaveProperty('sold');
+    expect(pub).not.toHaveProperty('locked');
+  });
+
+  it('白名单是"选字段"而非"删字段"：不认识的字段（含未来新增）一律不透传', () => {
+    const pub = toPublicSeatClass({
+      ...internalSeat(),
+      futureInternalMarginField: 'internal',
+    } as unknown as Parameters<typeof toPublicSeatClass>[0]);
+    expect(pub).not.toHaveProperty('futureInternalMarginField');
+    expect(Object.keys(pub).sort()).toEqual([
+      'availabilityTier',
+      'available',
+      'baggage',
+      'basePrice',
+      'cabin',
+      'dynamicPrice',
+      'seatClassId',
+      'totalForQty',
+    ]);
+  });
+
+  it('保留客户要看的字段：锁位用的 seatClassId、封顶余位、档位、价格、行李额', () => {
+    const pub = toPublicSeatClass(internalSeat());
+    expect(pub).toEqual({
+      seatClassId: 'sc_eco',
+      cabin: 'ECONOMY',
+      available: 9,
+      availabilityTier: 'AMPLE',
+      basePrice: '1000',
+      dynamicPrice: '1000',
+      totalForQty: 2000,
+      baggage: { checkedKg: 20, checkedPieces: 1, carryOnKg: 7, note: null },
+    });
+  });
+
+  it('行李额未配置 → null（不透传空对象）', () => {
+    const pub = toPublicSeatClass({ ...internalSeat(), baggage: null });
+    expect(pub.baggage).toBeNull();
+  });
+
+  it('行李额也走白名单：行李对象上的未知字段不透传', () => {
+    const pub = toPublicSeatClass({
+      ...internalSeat(),
+      baggage: {
+        checkedKg: 20,
+        checkedPieces: 1,
+        carryOnKg: 7,
+        note: null,
+        flightId: 'flight_1', // 内部关联字段
+        internalCostCny: 88,
+      },
+    } as unknown as Parameters<typeof toPublicSeatClass>[0]);
+    expect(pub.baggage).not.toHaveProperty('flightId');
+    expect(pub.baggage).not.toHaveProperty('internalCostCny');
+  });
+
+  it('回归：整个舱位序列化后不出现内部日期等级字面量', () => {
+    const serialized = JSON.stringify(toPublicSeatClass(internalSeat()));
+    expect(serialized).not.toContain('dateRank');
+    expect(serialized).not.toContain('dateMultiplier');
+    expect(serialized).not.toContain('availExact');
+  });
+
+  it('批量映射（service 层 availableSeats.map(toPublicSeatClass) 的实际用法）', () => {
+    const seats = [internalSeat(), { ...internalSeat(), seatClassId: 'sc_biz', cabin: 'BUSINESS' as const }];
+    const pub = seats.map(toPublicSeatClass);
+    expect(pub).toHaveLength(2);
+    expect(pub[1]).toMatchObject({ seatClassId: 'sc_biz', cabin: 'BUSINESS' });
+    pub.forEach((p) => expect(p).not.toHaveProperty('dateRank'));
   });
 });
 
@@ -247,7 +455,6 @@ describe('serializeScheduleForAgent · AGENT 视角班次白名单（防成本�
     peakSurchargeCny: decimal(300),
     aircraftAdjustCny: decimal(-50),
     takeoffDiscountCny: decimal(-20),
-    ticketingCap: 191,
     isActive: true,
     createdAt: new Date('2026-01-01T00:00:00.000Z'),
     updatedAt: new Date('2026-01-02T00:00:00.000Z'),
@@ -311,7 +518,6 @@ describe('serializeScheduleForAgent · AGENT 视角班次白名单（防成本�
       flightId: 'flight_1',
       departureTz: 'Asia/Shanghai',
       arrivalTz: 'Asia/Macau',
-      ticketingCap: 191,
       isActive: true,
     });
     expect(result.departureTime).toEqual(new Date('2026-08-01T01:00:00.000Z'));

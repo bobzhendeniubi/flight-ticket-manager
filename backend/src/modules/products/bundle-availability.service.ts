@@ -245,6 +245,10 @@ export async function getBundleSellableDates(
     });
     if (roomType) {
       hotelNightDates = buildDateRange(from, addDaysISO(to, nights - 1));
+      // 取床位口径 remaining（**不是** physicalRemaining）：前台可售日历是**乐观提示**，
+      // 买家此刻还没填性别，无从判断能否与当晚落单拼房客配对，硬套物理口径会大面积少卖。
+      // 权威拒绝在下单闸（orders.service createOrder 的 assertHotelPhysicalFit）。
+      // 详见 hotel-availability.service.ts 头部的两层口径说明。
       const res = await getHotelNightlyRemaining(roomType.hotelId, hotelNightDates, client);
       hotelRemaining = res.remaining;
       hotelHasBlock = res.hasBlock;

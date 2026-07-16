@@ -161,7 +161,7 @@ export interface FlightSeatAvailability {
   seatClassId: string; // 锁位接口（POST /seat-locks）需要
   cabin: CabinClass;
   // ⚠️ capacity/sold/locked：公开 /flights/search 已不返回（防匿名爬取实时销量），
-  // 仅带权的班次接口（listSchedules，AdminFlightsPage 用）仍有；search 消费方请勿读取。
+  // 仅带权的班次接口仍有；search 消费方请勿读取。
   capacity: number;
   sold: number;
   locked: number;
@@ -214,17 +214,6 @@ export interface FlightSearchResult {
   durationMinutes: number;
   seatClasses: FlightSeatAvailability[];
   hasSpace: boolean;
-}
-
-export interface AdminFlight {
-  id: string;
-  flightNumber: string;
-  originCode: string;
-  destinationCode: string;
-  aircraftType: string | null;
-  isActive: boolean;
-  scheduleCount: number;
-  createdAt: string;
 }
 
 export interface AgentListItem {
@@ -1007,29 +996,6 @@ export const api = {
     });
     return apiFetch<{ pricing: PriceResult }>(`/flights/price?${qs.toString()}`);
   },
-
-  // 管理员航班
-  listAllFlights: (token: string) =>
-    apiFetch<{ flights: AdminFlight[] }>('/flights/', { token }),
-  createFlight: (
-    token: string,
-    body: { flightNumber: string; originCode: string; destinationCode: string; aircraftType?: string },
-  ) => apiFetch<{ flight: AdminFlight }>('/flights/', { method: 'POST', token, body }),
-  toggleFlight: (token: string, flightId: string) =>
-    apiFetch<{ flight: AdminFlight }>(`/flights/${flightId}/toggle`, { method: 'POST', token }),
-  listSchedules: (token: string, flightId: string) =>
-    apiFetch<{ schedules: unknown[] }>(`/flights/${flightId}/schedules`, { token }),
-  createSchedule: (
-    token: string,
-    body: {
-      flightId: string;
-      departureTime: string;
-      arrivalTime: string;
-      departureTz?: string;
-      arrivalTz?: string;
-      seatClasses: Array<{ cabin: CabinClass; capacity: number; basePrice: number }>;
-    },
-  ) => apiFetch<{ schedule: unknown }>('/flights/schedules', { method: 'POST', token, body }),
 
   // 代理
   listAgents: (token: string) =>

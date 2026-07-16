@@ -3,9 +3,11 @@
  *
  * 只测纯函数 orderToMasterRows / visibleColumns / masterExportFilename 的映射口径：
  *   - 一行/乘客；金额均摊到人
- *   - 关键列填满：酒店中文名、结算价格、航段数（飞行次数）、护照签发地回落、分房情况、订单成本
+ *   - 关键列填满：酒店中文名、结算价格、护照签发地回落、分房情况、订单成本
+ *   - 飞行次数 = 常旅客档案历史飞行次数（每位乘客各不相同，不是本单航段数）
  *   - role 裁列（票务/签证视图隐藏无关列，通用列保留）
- * 取数 SQL（COUNTED_STATUSES、出发日期区间）由集成环境验证，不在此 mock prisma 查询。
+ * 取数 SQL（COUNTED_STATUSES、出发日期区间）由集成环境验证，不在此 mock prisma 查询；
+ * loadTripCountMap 的档案取数/合并指针跟随用注入的假 client 驱动（见文末 describe）。
  */
 import { describe, it, expect, vi } from 'vitest';
 
@@ -14,10 +16,13 @@ vi.mock('../../db/prisma.js', () => ({ prisma: {} }));
 
 import {
   orderToMasterRows,
+  loadTripCountMap,
   visibleColumns,
   masterExportFilename,
   type OrderForMasterExport,
+  type TripCountMap,
 } from './orders.export-master.js';
+import { docKey } from '../travelers/traveler-profiles.aggregate.js';
 
 const D = (s: string): Date => new Date(`${s}T00:00:00.000Z`);
 
@@ -235,7 +240,7 @@ describe('orderToMasterRows', () => {
     expect(rows).toHaveLength(2);
   });
 
-  it('关键列填满：酒店中文名、结算价格、航段数、护照签发地回落、分房情况、订单成本', () => {
+  it('关键列填满：酒店中文名、结算价格、航班/日期、护照签发地回落、分房情况、订单成本', () => {
     const [r1, r2] = orderToMasterRows(fixtureRoundTripBundle());
 
     // 酒店中文名（来自 hotelRoomType.hotel.name）
@@ -247,8 +252,7 @@ describe('orderToMasterRows', () => {
     expect(r1.balanceDue).toBe(3000);
     expect(r1.settled).toBe('否'); // paid < total
 
-    // 飞行次数 = 航段数（往返 → 2）；订单类型往返票
-    expect(r1.flightCount).toBe('2');
+    // 订单类型往返票（飞行次数不再由航段推导 —— 见「飞行次数」describe）
     expect(r1.orderType).toBe('往返票');
     expect(r1.flightNumbers).toBe('ZJ8888 ⇌ ZJ8889');
     expect(r1.travelDates).toBe('2026-07-10 / 2026-07-14');
@@ -300,14 +304,61 @@ describe('orderToMasterRows', () => {
     expect(r1.notes).toContain('蜜月');
   });
 
-  it('单程订单 → 航段数=1、订单类型单程票', () => {
+  it('单程订单 → 订单类型单程票', () => {
     const order = fixtureRoundTripBundle();
     // 去掉回程 → 单程
     (order.items as unknown[]).splice(1, 1);
     const [r1] = orderToMasterRows(order);
-    expect(r1.flightCount).toBe('1');
     expect(r1.orderType).toBe('单程票');
     expect(r1.flightNumbers).toBe('ZJ8888');
+  });
+
+  // ── 飞行次数 = 常旅客历史飞行次数（B23）───────────────────────────────────
+  // 旧实现填的是「本单航段数」（往返2/单程1），且按订单算一次贴给该单每位乘客 ——
+  // 同一订单所有乘客恒等、与「这个人飞过几次」零关系。改接 TravelerProfile.tripCount
+  // （按证件号归拢，只计去程已起飞的行程）后，每位乘客各不相同。
+  describe('飞行次数 = 常旅客档案历史飞行次数', () => {
+    it('同一订单不同乘客的飞行次数各按本人证件取，不再恒等（旧口径下两人都是航段数 2）', () => {
+      const order = fixtureRoundTripBundle(); // p1=E12345678、p2=E87654321，往返 2 段
+      const tripCounts: TripCountMap = new Map([
+        [docKey('PASSPORT', 'E12345678'), 7], // 老客
+        [docKey('PASSPORT', 'E87654321'), 1], // 飞过一次
+      ]);
+      const [r1, r2] = orderToMasterRows(order, tripCounts);
+
+      expect(r1.flightCount).toBe('7');
+      expect(r2.flightCount).toBe('1');
+      // 关键回归：同单两位乘客不再相同，也不再等于航段数
+      expect(r1.flightCount).not.toBe(r2.flightCount);
+      expect(r1.flightCount).not.toBe('2');
+    });
+
+    it('匹配不上档案的乘客（新客）→ 留空，不写 0', () => {
+      const tripCounts: TripCountMap = new Map([[docKey('PASSPORT', 'E12345678'), 7]]);
+      const [r1, r2] = orderToMasterRows(fixtureRoundTripBundle(), tripCounts);
+      expect(r1.flightCount).toBe('7');
+      expect(r2.flightCount).toBe(''); // 档案里没有 → 留空（0 会被读成"从没飞过"）
+    });
+
+    it('档案里 tripCount=0（已建档但去程都还没起飞）→ 如实写 0，与"匹配不上"区分', () => {
+      const tripCounts: TripCountMap = new Map([[docKey('PASSPORT', 'E12345678'), 0]]);
+      const [r1] = orderToMasterRows(fixtureRoundTripBundle(), tripCounts);
+      expect(r1.flightCount).toBe('0');
+    });
+
+    it('证件号大小写/空格变体 → 仍按 docKey 归一命中（与档案聚合同款归一）', () => {
+      const order = fixtureRoundTripBundle();
+      (order.passengers[0] as { documentNumber: string }).documentNumber = ' e12345678 ';
+      const tripCounts: TripCountMap = new Map([[docKey('PASSPORT', 'E12345678'), 7]]);
+      const [r1] = orderToMasterRows(order, tripCounts);
+      expect(r1.flightCount).toBe('7');
+    });
+
+    it('缺省 tripCounts（未传）→ 整列留空，绝不回落成航段数', () => {
+      const [r1, r2] = orderToMasterRows(fixtureRoundTripBundle());
+      expect(r1.flightCount).toBe('');
+      expect(r2.flightCount).toBe('');
+    });
   });
 
   it('无乘客 → 空数组', () => {
@@ -472,6 +523,162 @@ describe('visibleColumns（role 裁列）', () => {
       expect(headers).toContain('乘客中文名');
       expect(headers).toContain('订单编号');
     }
+  });
+});
+
+// ── 档案取数：一次查询 + mergedIntoId 指针跟随（B23）────────────────────────
+// 合并过的档案 tripCount 累积在主档案上，指针行留的是合并前的残值 —— 直读源档案会少算。
+describe('loadTripCountMap', () => {
+  const REFRESHED = new Date('2026-07-15T03:00:00.000Z');
+
+  /** 假 client：记录每次 findMany 的 where，按 OR 证件对 / id in 两种形态返回预置行。*/
+  function fakeClient(rows: Record<string, unknown>[]) {
+    const calls: Record<string, unknown>[] = [];
+    const client = {
+      travelerProfile: {
+        findMany: vi.fn(async ({ where }: { where: Record<string, unknown> }) => {
+          calls.push(where);
+          if (Array.isArray(where.OR)) {
+            const pairs = where.OR as { documentType: string; documentNumber: string }[];
+            return rows.filter((r) =>
+              pairs.some(
+                (p) =>
+                  p.documentType === r.documentType && p.documentNumber === r.documentNumber,
+              ),
+            );
+          }
+          const ids = (where.id as { in: string[] }).in;
+          return rows.filter((r) => ids.includes(r.id as string));
+        }),
+      },
+    };
+    return { client, calls };
+  }
+
+  const profile = (over: Record<string, unknown>) => ({
+    id: 'tp1',
+    documentType: 'PASSPORT',
+    documentNumber: 'E12345678',
+    tripCount: 0,
+    refreshedAt: REFRESHED,
+    mergedIntoId: null,
+    ...over,
+  });
+
+  it('canonical 档案：一条查询拉回全部乘客 → docKey → tripCount', async () => {
+    const { client, calls } = fakeClient([
+      profile({ id: 'tp1', documentNumber: 'E12345678', tripCount: 7 }),
+      profile({ id: 'tp2', documentNumber: 'E87654321', tripCount: 1 }),
+    ]);
+    const { tripCounts, oldestRefreshedAt } = await loadTripCountMap(
+      [
+        { documentType: 'PASSPORT', documentNumber: 'E12345678' },
+        { documentType: 'PASSPORT', documentNumber: 'E87654321' },
+      ],
+      client as never,
+    );
+
+    expect(tripCounts.get(docKey('PASSPORT', 'E12345678'))).toBe(7);
+    expect(tripCounts.get(docKey('PASSPORT', 'E87654321'))).toBe(1);
+    // 无 N+1：两位乘客只有一条查询（没有指针行 → 不需要补拉主档案）
+    expect(calls).toHaveLength(1);
+    expect(oldestRefreshedAt).toEqual(REFRESHED);
+  });
+
+  it('几百位乘客（含大量重复证件）仍只有一条查询，证件对去重后再查', async () => {
+    const { client, calls } = fakeClient([
+      profile({ id: 'tp1', documentNumber: 'E12345678', tripCount: 7 }),
+    ]);
+    const passengers = Array.from({ length: 300 }, () => ({
+      documentType: 'PASSPORT' as const,
+      documentNumber: 'E12345678',
+    }));
+    await loadTripCountMap(passengers, client as never);
+
+    expect(calls).toHaveLength(1);
+    expect((calls[0].OR as unknown[]).length).toBe(1); // 300 位 → 去重成 1 个证件对
+  });
+
+  it('命中指针行（客人报旧护照号）→ 跟 mergedIntoId 取主档案的 tripCount，不是残值', async () => {
+    const { client, calls } = fakeClient([
+      // 旧证：合并前只飞过 2 次的残值，且指向主档案
+      profile({ id: 'tp-old', documentNumber: 'E00000001', tripCount: 2, mergedIntoId: 'tp-master' }),
+      // 主档案：归一后的真实次数
+      profile({ id: 'tp-master', documentNumber: 'E99999999', tripCount: 9 }),
+    ]);
+    const { tripCounts } = await loadTripCountMap(
+      [{ documentType: 'PASSPORT', documentNumber: 'E00000001' }],
+      client as never,
+    );
+
+    // 旧证件号这一行应拿到主档案的 9，而不是指针行残值 2
+    expect(tripCounts.get(docKey('PASSPORT', 'E00000001'))).toBe(9);
+    expect(calls).toHaveLength(2); // 一条查证件对 + 一条按 id 补拉主档案
+  });
+
+  it('合并链（脏数据：指针→指针→主）→ 跟到最终主档案', async () => {
+    const { client } = fakeClient([
+      profile({ id: 'tp-a', documentNumber: 'E00000001', tripCount: 1, mergedIntoId: 'tp-b' }),
+      profile({ id: 'tp-b', documentNumber: 'E00000002', tripCount: 3, mergedIntoId: 'tp-c' }),
+      profile({ id: 'tp-c', documentNumber: 'E00000003', tripCount: 9 }),
+    ]);
+    const { tripCounts } = await loadTripCountMap(
+      [{ documentType: 'PASSPORT', documentNumber: 'E00000001' }],
+      client as never,
+    );
+    expect(tripCounts.get(docKey('PASSPORT', 'E00000001'))).toBe(9);
+  });
+
+  it('环（脏数据：a→b→a）→ 停在当前行，不死循环', async () => {
+    const { client } = fakeClient([
+      profile({ id: 'tp-a', documentNumber: 'E00000001', tripCount: 4, mergedIntoId: 'tp-b' }),
+      profile({ id: 'tp-b', documentNumber: 'E00000002', tripCount: 5, mergedIntoId: 'tp-a' }),
+    ]);
+    const { tripCounts } = await loadTripCountMap(
+      [{ documentType: 'PASSPORT', documentNumber: 'E00000001' }],
+      client as never,
+    );
+    // 不抛错、不挂起；取到环上停下那一行的值（脏数据只影响这一条）
+    expect(tripCounts.get(docKey('PASSPORT', 'E00000001'))).toBe(5);
+  });
+
+  it('断链（主档案已被删）→ 用指针行残值兜底，不抛错', async () => {
+    const { client } = fakeClient([
+      profile({ id: 'tp-old', documentNumber: 'E00000001', tripCount: 2, mergedIntoId: 'gone' }),
+    ]);
+    const { tripCounts } = await loadTripCountMap(
+      [{ documentType: 'PASSPORT', documentNumber: 'E00000001' }],
+      client as never,
+    );
+    expect(tripCounts.get(docKey('PASSPORT', 'E00000001'))).toBe(2);
+  });
+
+  it('乘客证件号缺失 / 一位乘客都没有 → 不查库，返回空 Map', async () => {
+    const { client, calls } = fakeClient([]);
+    const a = await loadTripCountMap([], client as never);
+    const b = await loadTripCountMap(
+      [{ documentType: 'PASSPORT', documentNumber: '' }],
+      client as never,
+    );
+    expect(a.tripCounts.size).toBe(0);
+    expect(b.tripCounts.size).toBe(0);
+    expect(calls).toHaveLength(0);
+  });
+
+  it('快照新鲜度：取用到的档案里最旧的一条 refreshedAt（表头批注标出这列有多旧）', async () => {
+    const older = new Date('2026-07-01T00:00:00.000Z');
+    const { client } = fakeClient([
+      profile({ id: 'tp1', documentNumber: 'E12345678', tripCount: 7, refreshedAt: REFRESHED }),
+      profile({ id: 'tp2', documentNumber: 'E87654321', tripCount: 1, refreshedAt: older }),
+    ]);
+    const { oldestRefreshedAt } = await loadTripCountMap(
+      [
+        { documentType: 'PASSPORT', documentNumber: 'E12345678' },
+        { documentType: 'PASSPORT', documentNumber: 'E87654321' },
+      ],
+      client as never,
+    );
+    expect(oldestRefreshedAt).toEqual(older);
   });
 });
 

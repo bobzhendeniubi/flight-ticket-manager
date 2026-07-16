@@ -53,7 +53,7 @@ const STATUS_LABEL: Record<string, string> = {
   PENDING_PAYMENT: '待支付',
   PAID: '已支付',
   PROCESSING: '处理中',
-  TICKETED: '已出票',
+  TICKETED: '出票完成',
   COMPLETED: '已完成',
   REFUND_REQUESTED: '退款中',
   CHANGE_REQUESTED: '改期中',

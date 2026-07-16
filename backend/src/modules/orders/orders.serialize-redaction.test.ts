@@ -125,6 +125,39 @@ describe('orderSerializeRoleCtx', () => {
   });
 });
 
+/**
+ * 护照大图缺省口径（N6）：serializeOrder 的 includePassportPhotos 是 **fail-closed**。
+ * 不传 ctx / 传空 ctx / 显式 false 一律拿不到 passportPhotoUrl，只拿 hasPassportPhoto 布尔。
+ * 这条闸的意义：新写的 serializeOrder(order) 调用方漏传角色 ctx 时「少给」而非「泄漏证件大图」。
+ */
+describe('serializeOrder · 护照大图缺省 fail-closed', () => {
+  it('不传 ctx → 剥离护照大图，只留 hasPassportPhoto', () => {
+    const out = serializeOrder(buildOrder()) as Record<string, any>;
+    expect(out.passengers[0].passportPhotoUrl).toBeUndefined();
+    expect(out.passengers[0].hasPassportPhoto).toBe(true);
+  });
+
+  it('传空 ctx → 同样剥离护照大图', () => {
+    const out = serializeOrder(buildOrder(), {}) as Record<string, any>;
+    expect(out.passengers[0].passportPhotoUrl).toBeUndefined();
+    expect(out.passengers[0].hasPassportPhoto).toBe(true);
+  });
+
+  it('只传 visaStayDaysById（不带角色 ctx）→ 仍剥离护照大图', () => {
+    const out = serializeOrder(buildOrder(), {
+      visaStayDaysById: new Map<string, number | null>(),
+    }) as Record<string, any>;
+    expect(out.passengers[0].passportPhotoUrl).toBeUndefined();
+    expect(out.passengers[0].hasPassportPhoto).toBe(true);
+  });
+
+  it('显式 includePassportPhotos: true → 才保留护照大图', () => {
+    const out = serializeOrder(buildOrder(), { includePassportPhotos: true }) as Record<string, any>;
+    expect(out.passengers[0].passportPhotoUrl).toBe('data:image/png;base64,AAAA');
+    expect(out.passengers[0].hasPassportPhoto).toBe(true);
+  });
+});
+
 describe('serializeOrder · ADMIN/STAFF 视角（不脱敏）', () => {
   const out = serializeOrder(buildOrder(), orderSerializeRoleCtx(UserRole.ADMIN)) as Record<string, any>;
 

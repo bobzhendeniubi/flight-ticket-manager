@@ -13,6 +13,7 @@ import {
   ApiError,
   type FulfillmentStatus,
   type FulfillmentTask,
+  type ListFulfillmentParams,
   type VisaTaskPassenger,
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
@@ -51,7 +52,22 @@ const PAGE_SIZE = 200;
 // 状态筛选：OPEN = 待处理 + 材料准备（默认）；ALL = 全部
 type StatusFilter = 'OPEN' | 'ALL' | FulfillmentStatus;
 
-// 状态筛选收敛到签证岗真正会用的 4 档（后端参数不变，纯前端收敛）
+/**
+ * 状态筛选 → 后端 status 参数（逗号分隔多状态）。
+ * 「待办」= 待处理 + 材料准备，在**后端**用 status:{in:[...]} 表达，不再拉全量回前端筛；
+ * 「全部状态」= 不传该参数 = 不加条件（与旧行为一致）。
+ */
+const STATUS_FILTER_PARAM: Record<StatusFilter, string | undefined> = {
+  OPEN: 'PENDING,IN_PROGRESS',
+  ALL: undefined,
+  PENDING: 'PENDING',
+  IN_PROGRESS: 'IN_PROGRESS',
+  CONFIRMED: 'CONFIRMED',
+  CANCELLED: 'CANCELLED',
+  FAILED: 'FAILED',
+};
+
+// 状态筛选收敛到签证岗真正会用的 4 档（下拉选项不变；每档经 STATUS_FILTER_PARAM 落到后端 status）
 const FILTER_OPTIONS: Array<{ value: StatusFilter; label: string }> = [
   { value: 'OPEN', label: '待办（待处理 + 材料准备，默认）' },
   { value: 'PENDING', label: '仅待处理' },
@@ -59,8 +75,62 @@ const FILTER_OPTIONS: Array<{ value: StatusFilter; label: string }> = [
   { value: 'ALL', label: '全部状态' },
 ];
 
-// 签证签发方式筛选（前端过滤；未标注 = visaIssuanceMethod 为空）
+// 签证签发方式筛选（走后端 issuanceMethod 参数；'NONE' = 未标注，'' = 全部不筛）
 type IssuanceFilter = '' | 'E_VISA' | 'STICKER' | 'ARRIVAL' | 'NONE';
+
+/**
+ * 签证台列表查询参数。
+ *
+ * 过渡类型：`status`（多状态逗号串）/ `issuanceMethod` / `departureDate` 三个参数后端已支持，
+ * 但 api.ts 的 ListFulfillmentParams 还是「单状态、无这两个字段」的旧形状（该文件另有改动在途，
+ * 本批不动它）。这里本地声明 + 调用点单次断言过渡；api.ts 的类型补齐后可删掉本类型直接用
+ * ListFulfillmentParams。运行时无差别：listFulfillmentTasks 用 Object.entries 泛化拼 query string。
+ */
+type VisaTaskQuery = Omit<ListFulfillmentParams, 'status'> & {
+  status?: string;
+  issuanceMethod?: Exclude<IssuanceFilter, ''>;
+  departureDate?: string;
+};
+
+/**
+ * 分类值的出处（后端 fulfillment.service 的 VisaClassificationSource 随任务下发）。
+ *
+ * 过渡类型：api.ts 的 FulfillmentTask 尚无这两个字段（该文件另有改动在途，本批不动它）。
+ * 这里本地交叉声明过渡；api.ts 的类型补齐后可删掉 VisaTask 直接用 FulfillmentTask。
+ */
+type VisaClassificationSource = 'PRODUCT' | 'ORDER_STATUS';
+type VisaTask = FulfillmentTask & {
+  visaIssuanceSource?: VisaClassificationSource | null;
+  visaEntrySource?: VisaClassificationSource | null;
+};
+
+/**
+ * 类型徽章的证据档位 —— 三档统一成一套视觉，让签证岗一眼分得清「这个值有多确凿」：
+ *   PRODUCT      签证产品结构化标注   → 实色（确证）
+ *   ORDER_STATUS 订单级录单状态回退   → 浅色 +「·录单」（推断）
+ *   NAME_GUESS   产品名正则猜测       → 浅色 +「·推测」（猜测）
+ *
+ * 旧实现的判据是「结构化值是否为空」，而回退值也被塞进了同一个字段 → 推断值渲染得和确证值
+ * 一模一样，比正则猜测显得更权威。现改为按 source 判据，出处决定视觉。
+ */
+type BadgeEvidence = 'PRODUCT' | 'ORDER_STATUS' | 'NAME_GUESS';
+const EVIDENCE_STYLE: Record<BadgeEvidence, { suffix: string; className: string; title: string }> = {
+  PRODUCT: {
+    suffix: '',
+    className: 'badge-neutral text-[10px]',
+    title: '签证产品已结构化标注',
+  },
+  ORDER_STATUS: {
+    suffix: '·录单',
+    className: 'badge-neutral text-[10px] opacity-60',
+    title: '按录单「签证状态」推断，签证产品未结构化标注',
+  },
+  NAME_GUESS: {
+    suffix: '·推测',
+    className: 'badge-neutral text-[10px] opacity-60',
+    title: '按产品名推测，未结构化标注',
+  },
+};
 
 const ISSUANCE_FILTER_OPTIONS: Array<{ value: IssuanceFilter; label: string }> = [
   { value: '', label: '全部' },
@@ -369,7 +439,7 @@ function PassengerRow({
 
 // ── 可展开的任务行 ────────────────────────────────────────────────────────────
 interface TaskRowProps {
-  task: FulfillmentTask;
+  task: VisaTask;
   selected: boolean;
   onToggle: () => void;
   token: string;
@@ -481,22 +551,27 @@ function TaskRow({ task, selected, onToggle, token, onChanged }: TaskRowProps) {
       ? localYmd(task.order.departureTime, task.order.departureTz)
       : null;
 
-  // 类型徽章：优先结构化字段（入境次数 / 签发方式）；缺失时回退产品名正则猜测（浅色示区分）
+  // 类型徽章：每档取值都带出处（见 EVIDENCE_STYLE），视觉由出处决定，不由「值是否为空」决定
   const visaName = task.visaName ?? '';
-  const entryTypeLabel =
-    task.visaEntryType === 'SINGLE'
-      ? '单次'
-      : task.visaEntryType === 'MULTIPLE'
-        ? '多次'
-        : null;
-  // 结构化入境次数缺失 → 从产品名猜测（渲染为浅色，示意"推测非确证"）
-  const entryGuess = entryTypeLabel
-    ? null
-    : /多次/.test(visaName)
-      ? '多次'
-      : /单次/.test(visaName)
-        ? '单次'
-        : null;
+  const typeBadges: Array<{ key: string; text: string; evidence: BadgeEvidence }> = [];
+
+  // 入境次数：只认签证产品的结构化字段（后端已不再从录单状态硬编码「多次」）；
+  // 产品未标注 → 退到产品名正则，浅色标「·推测」
+  const entryLabel =
+    task.visaEntryType === 'SINGLE' ? '单次' : task.visaEntryType === 'MULTIPLE' ? '多次' : null;
+  if (entryLabel) {
+    typeBadges.push({
+      key: 'entry',
+      text: entryLabel,
+      // 入境次数无回退来源，有值即来自产品；source 缺省（旧后端）时同样按产品处理
+      evidence: task.visaEntrySource === 'ORDER_STATUS' ? 'ORDER_STATUS' : 'PRODUCT',
+    });
+  } else {
+    const guess = /多次/.test(visaName) ? '多次' : /单次/.test(visaName) ? '单次' : null;
+    if (guess) typeBadges.push({ key: 'entry', text: guess, evidence: 'NAME_GUESS' });
+  }
+
+  // 签发方式：产品结构化字段，或订单级录单「签证状态」回退（回退有据——录单下拉选的就是「电子签」）
   const issuanceLabel =
     task.visaIssuanceMethod === 'E_VISA'
       ? '电子签'
@@ -505,7 +580,13 @@ function TaskRow({ task, selected, onToggle, token, onChanged }: TaskRowProps) {
         : task.visaIssuanceMethod === 'ARRIVAL'
           ? '落地签'
           : null;
-  const hasTypeBadge = Boolean(entryTypeLabel || entryGuess || issuanceLabel);
+  if (issuanceLabel) {
+    typeBadges.push({
+      key: 'issuance',
+      text: issuanceLabel,
+      evidence: task.visaIssuanceSource === 'ORDER_STATUS' ? 'ORDER_STATUS' : 'PRODUCT',
+    });
+  }
 
   const saveNote = async () => {
     if (savingNote) return; // 防重入：Enter→blur 可能重复触发
@@ -595,22 +676,17 @@ function TaskRow({ task, selected, onToggle, token, onChanged }: TaskRowProps) {
           <span className={VISA_STATUS_BADGE[task.status]}>
             {VISA_STATUS_LABEL[task.status]}
           </span>
-          {hasTypeBadge && (
+          {typeBadges.length > 0 && (
             <div className="mt-1 flex flex-wrap items-center justify-center gap-1">
-              {entryTypeLabel && (
-                <span className="badge-neutral text-[10px]">{entryTypeLabel}</span>
-              )}
-              {entryGuess && (
-                <span
-                  className="badge-neutral text-[10px] opacity-60"
-                  title="按产品名推测，未结构化标注"
-                >
-                  {entryGuess}·推测
-                </span>
-              )}
-              {issuanceLabel && (
-                <span className="badge-neutral text-[10px]">{issuanceLabel}</span>
-              )}
+              {typeBadges.map((b) => {
+                const style = EVIDENCE_STYLE[b.evidence];
+                return (
+                  <span key={b.key} className={style.className} title={style.title}>
+                    {b.text}
+                    {style.suffix}
+                  </span>
+                );
+              })}
             </div>
           )}
         </td>
@@ -704,9 +780,9 @@ export function VisaDeskPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('OPEN');
-  // 签证签发方式筛选（前端过滤；未标注 = visaIssuanceMethod 为空）
+  // 签证签发方式筛选（走后端 issuanceMethod；未标注 = 'NONE'）
   const [issuanceFilter, setIssuanceFilter] = useState<IssuanceFilter>('');
-  // 出发日期筛选（单日 YYYY-MM-DD）；空 = 不按出发日过滤
+  // 出发日期筛选（走后端 departureDate，单日 YYYY-MM-DD）；空 = 不按出发日过滤
   const [departureDate, setDepartureDate] = useState('');
   // 备注搜索（走后端 notesQuery，避免 200 条截断漏筛）；400ms 防抖
   const [notesQueryInput, setNotesQueryInput] = useState('');
@@ -734,21 +810,25 @@ export function VisaDeskPage() {
   const [batchNote, setBatchNote] = useState('');
   const [batchNoteSubmitting, setBatchNoteSubmitting] = useState(false);
 
-  // 拉签证任务 — 单状态筛选直接走后端；OPEN/ALL 拉全量后前端过滤
+  // 拉签证任务 —— 状态 / 签证类型 / 出发日期三个筛选**全部走后端**，前端不再二次过滤。
+  // 这样 pagination.total 与列表实际能翻到的行数才是同一个口径：
+  // 旧实现服务端只筛状态、其余在前端过滤，总数却按服务端全量算 → 显示「共 200 条」但列表只剩 3 行；
+  // 且每页各自过滤，跨页的匹配项永远凑不齐（签证岗按「待办」翻页会漏掉本该处理的单）。
   useEffect(() => {
     if (!token) return;
     let cancelled = false;
     setLoading(true);
     setError(null);
-    const backendStatus =
-      statusFilter === 'OPEN' || statusFilter === 'ALL' ? undefined : statusFilter;
+    const query: VisaTaskQuery = {
+      type: 'VISA_APPLICATION',
+      status: STATUS_FILTER_PARAM[statusFilter],
+      issuanceMethod: issuanceFilter || undefined,
+      departureDate: departureDate || undefined,
+      notesQuery: debouncedNotesQuery || undefined,
+      pageSize: PAGE_SIZE,
+    };
     api
-      .listFulfillmentTasks(token, {
-        type: 'VISA_APPLICATION',
-        status: backendStatus,
-        notesQuery: debouncedNotesQuery || undefined,
-        pageSize: PAGE_SIZE,
-      })
+      .listFulfillmentTasks(token, query as unknown as ListFulfillmentParams)
       .then((res) => {
         if (cancelled) return;
         setTasks(res.tasks);
@@ -761,31 +841,10 @@ export function VisaDeskPage() {
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [token, statusFilter, debouncedNotesQuery, refreshNonce]);
-
-  const filtered = useMemo(() => {
-    let list = tasks;
-    if (statusFilter === 'OPEN') {
-      list = list.filter((t) => t.status === 'PENDING' || t.status === 'IN_PROGRESS');
-    }
-    // 签证类型过滤（客户端）：按 visaIssuanceMethod 匹配；未标注 = 该字段为空
-    if (issuanceFilter) {
-      list = list.filter((t) =>
-        issuanceFilter === 'NONE' ? !t.visaIssuanceMethod : t.visaIssuanceMethod === issuanceFilter,
-      );
-    }
-    // 出发日期过滤（客户端）：选了日期时按本地出发日比对；纯签证单无航班 → 保留可见（不被日期筛选误隐藏）
-    if (departureDate) {
-      list = list.filter((t) => {
-        if (!t.order?.departureTime || !t.order?.departureTz) return true;
-        return localYmd(t.order.departureTime, t.order.departureTz) === departureDate;
-      });
-    }
-    return list;
-  }, [tasks, statusFilter, issuanceFilter, departureDate]);
+  }, [token, statusFilter, issuanceFilter, departureDate, debouncedNotesQuery, refreshNonce]);
 
   // ── 勾选 helpers（镜像 OrdersPage 批量管理）────────────────
-  const visibleIds = useMemo(() => filtered.map((t) => t.id), [filtered]);
+  const visibleIds = useMemo(() => tasks.map((t) => t.id), [tasks]);
   const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.has(id));
   const someVisibleSelected = !allVisibleSelected && visibleIds.some((id) => selectedIds.has(id));
 
@@ -961,7 +1020,7 @@ export function VisaDeskPage() {
                 <option key={o.value} value={o.value}>{o.label}</option>
               ))}
             </select>
-            <p className="mt-1 text-xs text-ink-muted">按签发方式筛选（前端过滤）</p>
+            <p className="mt-1 text-xs text-ink-muted">按签发方式筛选</p>
           </div>
           <div>
             <label className="label">出发日期</label>
@@ -1183,14 +1242,14 @@ export function VisaDeskPage() {
                     </span>
                   </td>
                 </tr>
-              ) : filtered.length === 0 ? (
+              ) : tasks.length === 0 ? (
                 <tr>
                   <td colSpan={6} className="py-6 text-center text-ink-muted">
                     该筛选条件下暂无签证任务
                   </td>
                 </tr>
               ) : (
-                filtered.map((task) => (
+                tasks.map((task) => (
                   <TaskRow
                     key={task.id}
                     task={task}

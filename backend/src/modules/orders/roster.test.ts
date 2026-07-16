@@ -18,6 +18,8 @@ import {
   buildRosterTemplateWorkbook,
   parseRosterXlsx,
   rosterTemplateFilename,
+  parseDateCell,
+  parseDateCellDetailed,
   parseDobCell,
   parseGenderCell,
   ROSTER_MAX_ROWS,
@@ -56,8 +58,9 @@ function newRow(opts: {
   nationality?: string;
   docType?: string;
   docNum?: string;
-  issueDate?: string;
-  expiryDate?: string;
+  // 日期列同 dob：允许 Date，用于构造「Excel 日期格」用例
+  issueDate?: string | Date;
+  expiryDate?: string | Date;
   infant?: string;
   remarks?: string;
 }): Array<string | Date | number | null> {
@@ -94,6 +97,40 @@ describe('roster 模版生成', () => {
     expect(String(ws.getRow(1).getCell(7).value)).toContain('证件号');
     // 示例行存在（列1 中文姓名）
     expect(String(ws.getRow(2).getCell(1).value)).toBe('张三');
+  });
+
+  it('日期列（出生日期/签发日期/证件有效期）单元格格式为文本 → Excel 不再自作主张转换', async () => {
+    const buf = await buildRosterTemplateWorkbook();
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(buf as unknown as Parameters<typeof wb.xlsx.load>[0]);
+    const ws = wb.worksheets[0];
+
+    // 4 = 出生日期、8 = 签发日期、9 = 证件有效期
+    for (const col of [4, 8, 9]) {
+      expect(ws.getColumn(col).numFmt).toBe('@');
+      // 示例行也要是文本格式（列级 style 在部分 Excel/WPS 版本里不回落到已有单元格）
+      expect(ws.getRow(2).getCell(col).numFmt).toBe('@');
+      expect(ws.getRow(3).getCell(col).numFmt).toBe('@');
+    }
+  });
+
+  it('日期列表头写明 YYYY-MM-DD；示例行只示范这一种写法', async () => {
+    const buf = await buildRosterTemplateWorkbook();
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(buf as unknown as Parameters<typeof wb.xlsx.load>[0]);
+    const ws = wb.worksheets[0];
+
+    expect(String(ws.getRow(1).getCell(4).value)).toBe('出生日期(YYYY-MM-DD)');
+    expect(String(ws.getRow(1).getCell(8).value)).toBe('签发日期(YYYY-MM-DD)');
+    expect(String(ws.getRow(1).getCell(9).value)).toBe('证件有效期(YYYY-MM-DD)');
+
+    // 两行示例的日期全部是 YYYY-MM-DD —— 模版不再示范 dd-MM-yyyy，
+    // 混用会造出「日、月都 ≤12」这种事后无法分辨的格子。
+    for (const rowNumber of [2, 3]) {
+      for (const col of [4, 8, 9]) {
+        expect(String(ws.getRow(rowNumber).getCell(col).value)).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+      }
+    }
   });
 
   it('文件名形如 名单模版_YYYY-MM-DD.xlsx', () => {
@@ -160,6 +197,64 @@ describe('roster 解析（新模版 11 列）', () => {
     ]);
     const { rows } = await parseRosterXlsx(b64);
     expect(rows[0].dateOfBirth).toBe('1992-12-25');
+  });
+
+  it('Excel 日期格：仍然接受，但必须发 warning 并回显解析结果供核对', async () => {
+    // Excel 按 locale 把 01-07-1990 存成日期格时，原始文本已永久丢失 →
+    // 我们只能接受它的解释，但不能装作这没发生过。
+    const b64 = await rowsToXlsxBase64([
+      NEW_HEADER,
+      newRow({ fullName: '张三', docNum: 'E1', dob: new Date(Date.UTC(1990, 6, 1)) }), // 1990-07-01
+    ]);
+    const { rows, warnings } = await parseRosterXlsx(b64);
+    expect(rows[0].dateOfBirth).toBe('1990-07-01');
+
+    const w = warnings.find((x) => x.includes('出生日期'));
+    expect(w).toBeDefined();
+    expect(w).toContain('Excel');
+    expect(w).toContain('1990-07-01'); // 回显解析结果，人才能核
+    expect(w).toContain('日-月-年');
+  });
+
+  it('证件有效期是 Excel 日期格 → 同样发 warning（错的有效期＝拒登机）', async () => {
+    const b64 = await rowsToXlsxBase64([
+      NEW_HEADER,
+      newRow({ fullName: '张三', docNum: 'E1', expiryDate: new Date(Date.UTC(2030, 2, 9)) }),
+    ]);
+    const { rows, warnings } = await parseRosterXlsx(b64);
+    expect(rows[0].passportExpiry).toBe('2030-03-09');
+    expect(warnings.some((w) => w.includes('证件有效期') && w.includes('Excel'))).toBe(true);
+  });
+
+  it('三段全 ≤31 的日期（05-06-07）→ 拒收留空 + warning，绝不静默猜一个', async () => {
+    // 旧行为：兜底当"年在前" + 两位年扩展 → 静默产出 2005-06-07，无任何提示。
+    const b64 = await rowsToXlsxBase64([
+      NEW_HEADER,
+      newRow({ fullName: '张三', docNum: 'E1', dob: '05-06-07', expiryDate: '01-07-30' }),
+    ]);
+    const { rows, warnings } = await parseRosterXlsx(b64);
+
+    expect(rows).toHaveLength(1);           // 行保留
+    expect(rows[0].dateOfBirth).toBeUndefined();
+    expect(rows[0].dob).toBeUndefined();
+    expect(rows[0].passportExpiry).toBeUndefined();
+
+    expect(warnings.some((w) => w.includes('出生日期') && w.includes('05-06-07'))).toBe(true);
+    expect(warnings.some((w) => w.includes('证件有效期') && w.includes('01-07-30'))).toBe(true);
+    // 明确不得出现旧的静默猜测结果
+    expect(warnings.some((w) => w.includes('2005-06-07'))).toBe(false);
+  });
+
+  it('能自证的日期不发 warning：年在前 / 日在前（末段是四位年）', async () => {
+    const b64 = await rowsToXlsxBase64([
+      NEW_HEADER,
+      newRow({ fullName: '张三', docNum: 'E1', dob: '1990-01-15' }),   // 首段 >31 → 年在前
+      newRow({ fullName: '李四', docNum: 'E2', dob: '15-07-1988' }),   // 末段 >31 → 日在前
+    ]);
+    const { rows, warnings } = await parseRosterXlsx(b64);
+    expect(rows[0].dateOfBirth).toBe('1990-01-15');
+    expect(rows[1].dateOfBirth).toBe('1988-07-15');
+    expect(warnings).toHaveLength(0);
   });
 
   it('无法识别的性别只收 warning（不丢行）', async () => {
@@ -246,6 +341,33 @@ describe('roster 单格解析工具', () => {
     expect(parseDobCell('garbage')).toBeNull();
     expect(parseDobCell('1990-13-01')).toBeNull(); // 非法月份
     expect(parseDobCell(null)).toBeNull();
+  });
+
+  it('parseDateCellDetailed：只在能自证时才判年月日顺序', () => {
+    // 首段 >31 → 只可能是年 → 年在前
+    expect(parseDateCellDetailed('1990-01-15')).toEqual({ iso: '1990-01-15', doubt: null });
+    expect(parseDateCellDetailed('90-01-15')).toEqual({ iso: '1990-01-15', doubt: null });
+    // 末段 >31 → 只可能是年 → 日在前（航司口径）
+    expect(parseDateCellDetailed('15-07-1988')).toEqual({ iso: '1988-07-15', doubt: null });
+    expect(parseDateCellDetailed('15-07-88')).toEqual({ iso: '1988-07-15', doubt: null });
+    // 两头都 ≤31 → 无法自证 → 拒收，不猜
+    expect(parseDateCellDetailed('05-06-07')).toEqual({ iso: null, doubt: 'DAY_MONTH_AMBIGUOUS' });
+    expect(parseDateCellDetailed('01-07-30')).toEqual({ iso: null, doubt: 'DAY_MONTH_AMBIGUOUS' });
+    // 25-06-07：25 不可能是月，但「2025-06-07」和「25 Jun 2007」都成立 → 一样拒收
+    expect(parseDateCellDetailed('25-06-07')).toEqual({ iso: null, doubt: 'DAY_MONTH_AMBIGUOUS' });
+    // Excel 日期格 → 接受但标存疑
+    expect(parseDateCellDetailed(new Date(Date.UTC(1990, 0, 15)))).toEqual({
+      iso: '1990-01-15',
+      doubt: 'EXCEL_DATE',
+    });
+    // 压根不是日期 → 无值也无"存疑"（是解析失败，不是歧义）
+    expect(parseDateCellDetailed('garbage')).toEqual({ iso: null, doubt: null });
+    expect(parseDateCellDetailed(null)).toEqual({ iso: null, doubt: null });
+  });
+
+  it('parseDateCell：歧义格回 null（薄封装，丢掉存疑信息）', () => {
+    expect(parseDateCell('05-06-07')).toBeNull();
+    expect(parseDateCell('1990-01-15')).toBe('1990-01-15');
   });
 
   it('parseGenderCell：M/F、男/女、male/female', () => {

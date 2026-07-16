@@ -3,9 +3,8 @@ import { z } from 'zod';
 import { UserRole } from '@prisma/client';
 import {
   FlightService,
-  capPublicAvailable,
-  sanitizePublicSeatBreakdown,
   serializeScheduleForAgent,
+  toPublicPrice,
 } from './flights.service.js';
 import { PricingService } from '../pricing/pricing.service.js';
 import { actorFromRequest } from '../../lib/audit.js';
@@ -31,22 +30,15 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
     return { query: q, results };
   });
 
-  // ── 动态定价查询（公共） ──
+  // ── 动态定价查询（公共，未鉴权） ──
+  // 响应必须走 toPublicPrice 白名单——不要用 `...pricing` 展开：PriceResult 带内部字段
+  // （dateRank 内部日期等级、dateMultiplier 恒 1、精确 currentBucketRemaining、绝对 seatIndex），
+  // 展开会把它们连同将来 PriceResult 新增的任何字段一起发给匿名调用方。
+  // 这条路由只有公开形态，没有需要内部字段的带权变体。
   app.get('/price', async (req) => {
     const q = priceQuerySchema.parse(req.query);
     const pricing = await pricingService.calculatePrice(q.scheduleId, q.cabin, q.qty);
-    // 公开端点双重脱敏（同一类"重建实时销量"侧信道）：
-    // 1) currentBucketRemaining 是精确档内剩余（内部计价要真值），对匿名端 ≤9 封顶输出；
-    // 2) perSeatBreakdown[].seatIndex 原值 = sold+1+i（绝对张数），匿名端能直接反推 sold
-    //    （如 qty=1 时 sold = seatIndex-1），改成相对索引 1..qty。
-    // 价格/档位字段均不受影响；这条路由本身就只对外公开，没有带权变体需要保留真实 seatIndex。
-    return {
-      pricing: {
-        ...pricing,
-        currentBucketRemaining: capPublicAvailable(pricing.currentBucketRemaining),
-        perSeatBreakdown: sanitizePublicSeatBreakdown(pricing.perSeatBreakdown),
-      },
-    };
+    return { pricing: toPublicPrice(pricing) };
   });
 
   // ── 管理员航班 CRUD ──
@@ -144,19 +136,8 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
     },
   );
 
-  // 班次开票上限（航司限制；默认 191，运营可按班次调整）
-  app.patch(
-    '/schedules/:scheduleId/ticketing-cap',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN)] },
-    async (req) => {
-      const { scheduleId } = req.params as { scheduleId: string };
-      const body = z
-        .object({ ticketingCap: z.number().int().min(1).max(600) })
-        .parse(req.body);
-      const schedule = await service.updateTicketingCap(scheduleId, body.ticketingCap);
-      return { schedule };
-    },
-  );
+  // 开票上限已无独立端点：上限 = 该班次座位库存（Σ 舱位 capacity），
+  // 改上限 = 改舱位容量，走下面的单班次编辑（PATCH /schedules/:scheduleId）。
 
   // 单班次编辑（月历库存视图：改价 / 改容量 / 停用启用 / 改时刻）。ADMIN/STAFF 都可改。
   app.patch(

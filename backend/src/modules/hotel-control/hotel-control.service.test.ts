@@ -4,7 +4,7 @@
  * 注入 fake PrismaClient（getBoard/getAlerts 都支持 client 参数），覆盖三类提醒：
  *   1. oversold        余量 < 0 → 提醒加房（deficit = used - block）
  *   2. surplusSoon     距今 3 天内 block > 0 且 remaining > 0 → 提示退房
- *   3. overCapacity    出发 30 天内班次计入口径乘客数 > ticketingCap（默认 191）
+ *   3. overCapacity    出发 30 天内班次计入口径乘客数 > 座位库存（Σ 各舱位 capacity）
  *
  * 日期 fixture 全部相对"今天"动态生成，避免用例随日历过期。
  */
@@ -29,6 +29,8 @@ import {
   computePhysicalUsed,
   assignedPhysicalRooms,
   expandAssignedPhysicalByDate,
+  checkHotelPhysicalFit,
+  assertHotelPhysicalFit,
 } from './hotel-control.service.js';
 
 /** 权威分房表 fixture：groupSizes[i] = 第 i 个房间盒子的乘客数（形状同 orders 模块分房保存）。*/
@@ -84,13 +86,15 @@ function fakeClient(opts: { paxCounts: number[] }): PrismaClient {
         {
           id: 's1',
           departureTime: day(1),
-          ticketingCap: 191,
+          // 座位库存 = Σ 各舱位 capacity（12 商务 + 179 经济 = 191），与开票上限同源。
+          seatClasses: [{ capacity: 12 }, { capacity: 179 }],
           flight: { flightNumber: 'QH9589' },
         },
         {
           id: 's2',
           departureTime: day(2),
-          ticketingCap: 191,
+          // 座位库存 = Σ 各舱位 capacity（12 商务 + 179 经济 = 191），与开票上限同源。
+          seatClasses: [{ capacity: 12 }, { capacity: 179 }],
           flight: { flightNumber: 'QH9590' },
         },
       ]),
@@ -828,5 +832,122 @@ describe('getNightlyRemainingForRoomType', () => {
     expect(result.hasBlock).toBe(false);
     expect(result.remaining).toEqual([]);
     expect(result.block).toEqual([]);
+  });
+});
+
+// ── 物理房间口径前瞻闸：checkHotelPhysicalFit / assertHotelPhysicalFit ──────────
+/**
+ * 卖货闸从「床位口径」切到「物理房间口径」后的核心保护网。
+ *
+ * 为什么不能拿 physicalRemaining >= rooms 直接比：一个**新**拼房客的物理增量是 0 还是 1，
+ * 取决于当晚有没有可配对的同性落单——存量余量数字里根本看不出来。所以必须把人塞进
+ * 性别桶后重算（前瞻闸）。下面的用例逐条钉死这件事。
+ */
+describe('checkHotelPhysicalFit（物理房间口径前瞻闸）', () => {
+  function fitClient(orderItems: unknown[], rooms: number): PrismaClient {
+    return {
+      hotelBlockPeriod: {
+        findMany: vi.fn().mockResolvedValue([{ hotelId: 'h1', dateFrom: day(0), dateTo: day(2), rooms }]),
+      },
+      orderItem: { findMany: vi.fn().mockResolvedValue(orderItems) },
+    } as unknown as PrismaClient;
+  }
+  /** n 位同性拼房客（各 roomsBilled=0.5，占 day0 当晚）。*/
+  const solosOf = (gender: Gender, n: number) =>
+    Array.from({ length: n }, () => ({
+      hotelCheckIn: day(0),
+      hotelCheckOut: day(1),
+      roomsBilled: 0.5,
+      ...solo(gender),
+    }));
+
+  it('超卖路径：包房 20 间 + 已有 20男19女 拼房客 → 再来 1 位男（21男19女）需 21 间 → 拒；同一状态下来 1 位女（20男20女）需 20 间 → 放行', async () => {
+    // 床位口径：Σ roomsBilled = 39×0.5 = 19.5 → 余 0.5 → 「还够卖半间」，两种性别都会被放行。
+    // 物理口径：ceil(m/2)+ceil(f/2) —— 性别决定成败，这一维床位口径永远看不见。
+    const client = fitClient([...solosOf('M', 20), ...solosOf('F', 19)], 20);
+
+    const male = await checkHotelPhysicalFit('h1', [dayStr(0)], { wholeRooms: 0, solos: ['M'] }, {}, client);
+    // 21 男 → ceil(21/2)=11；19 女 → ceil(19/2)=10 → 共 21 间 > 包房 20 间
+    expect(male.physicalUsedAfter).toEqual([21]);
+    expect(male.violations).toHaveLength(1);
+    expect(male.violations[0]).toMatchObject({ date: dayStr(0), block: 20, physicalUsed: 21, shortfall: 1 });
+
+    const female = await checkHotelPhysicalFit('h1', [dayStr(0)], { wholeRooms: 0, solos: ['F'] }, {}, client);
+    // 20 男 → 10；20 女 → 10 → 共 20 间 == 包房 20 间 → 装得下
+    expect(female.physicalUsedAfter).toEqual([20]);
+    expect(female.violations).toEqual([]);
+  });
+
+  it('配对语义：physicalRemaining=0 但当晚有同性落单 → 同性拼房客增量 0 → 放行；异性 / 性别未知 → 增量 1 → 拒', async () => {
+    // 包房 1 间 + 已有 1 位男拼房客 → physicalUsed=1 → physicalRemaining=0。
+    // 「physicalRemaining >= rooms」这种比法会把三种情况**一律**拒掉——那是错的。
+    const client = fitClient(solosOf('M', 1), 1);
+    const at = async (g: 'M' | 'F' | 'U') =>
+      checkHotelPhysicalFit('h1', [dayStr(0)], { wholeRooms: 0, solos: [g] }, {}, client);
+
+    const male = await at('M'); // 男+男 → ceil(2/2)=1 → 增量 0
+    expect(male.physicalUsedBefore).toEqual([1]);
+    expect(male.physicalUsedAfter).toEqual([1]);
+    expect(male.violations).toEqual([]);
+
+    const female = await at('F'); // 男+女不能拼 → 1+1=2 → 增量 1
+    expect(female.physicalUsedAfter).toEqual([2]);
+    expect(female.violations).toHaveLength(1);
+
+    // 「拼单性别未知就把它单独出来」：不参与自动配对，保守独占 1 间
+    const unknown = await at('U');
+    expect(unknown.physicalUsedAfter).toEqual([2]);
+    expect(unknown.violations).toHaveLength(1);
+  });
+
+  it('看板 8 / 系统别再卖第 9 间：block=10 一男一女各 1 位拼房客（床位余 9、物理余 8）→ 9 间整房单被拒、8 间放行', async () => {
+    const client = fitClient(
+      [
+        { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.5, ...solo('M') },
+        { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.5, ...solo('F') },
+      ],
+      10,
+    );
+    // 床位口径 used=1 → 余 9：旧闸会放行 9 间整房单（1+9=10 <= 10）——那正是超卖。
+    const nine = await checkHotelPhysicalFit('h1', [dayStr(0)], { wholeRooms: 9, solos: [] }, {}, client);
+    expect(nine.physicalUsedAfter).toEqual([11]); // 异性各占 1 间 = 2，+9 = 11 > 10
+    expect(nine.violations).toHaveLength(1);
+
+    const eight = await checkHotelPhysicalFit('h1', [dayStr(0)], { wholeRooms: 8, solos: [] }, {}, client);
+    expect(eight.physicalUsedAfter).toEqual([10]);
+    expect(eight.violations).toEqual([]);
+  });
+
+  it('未配包房周期 → hasBlock=false，不拦截（房控哲学：未配包房 ≠ 售罄）', async () => {
+    const client = {
+      hotelBlockPeriod: { findMany: vi.fn().mockResolvedValue([]) },
+      orderItem: { findMany: vi.fn() },
+    } as unknown as PrismaClient;
+    const fit = await checkHotelPhysicalFit('h1', [dayStr(0)], { wholeRooms: 99, solos: [] }, {}, client);
+    expect(fit.hasBlock).toBe(false);
+    expect(fit.violations).toEqual([]);
+    await expect(
+      assertHotelPhysicalFit('h1', [dayStr(0)], { wholeRooms: 99, solos: [] }, {}, client),
+    ).resolves.toBeUndefined();
+  });
+
+  it('excludeOrderId 透传到查询：改存量单时排除该单自身既有占房，避免算两遍', async () => {
+    const client = fitClient([], 5);
+    await checkHotelPhysicalFit('h1', [dayStr(0)], { wholeRooms: 1, solos: [] }, { excludeOrderId: 'o9' }, client);
+    const where = (client.orderItem.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0].where;
+    expect(where.order.id).toEqual({ not: 'o9' });
+  });
+
+  it('assertHotelPhysicalFit：装不下抛 BadRequestError；allowNonWorsening 放行「改完不比改前差」的重排', async () => {
+    // 包房 1 间，已有 2 位性别未知拼房客（各独占 1 间）→ 存量已物理超卖（need 2 > block 1）
+    const client = fitClient(solosOf('X' as Gender, 2), 1);
+    // 新增占房 → 更差 → 必须拒
+    await expect(
+      assertHotelPhysicalFit('h1', [dayStr(0)], { wholeRooms: 1, solos: [] }, {}, client),
+    ).rejects.toThrow(/房间不足/);
+    // 不新增占房（重排）→ after == before → allowNonWorsening 放行，运营才能去补救存量超卖
+    await expect(
+      assertHotelPhysicalFit('h1', [dayStr(0)], { wholeRooms: 0, solos: [] }, { allowNonWorsening: true }, client),
+    ).resolves.toBeUndefined();
   });
 });

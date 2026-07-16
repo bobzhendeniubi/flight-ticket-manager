@@ -2,7 +2,62 @@ import { describe, it, expect } from 'vitest';
 import {
   normalizePassengerFullName,
   composePassengerFullName,
+  splitPassengerFullName,
 } from './passenger-name.js';
+
+describe('splitPassengerFullName', () => {
+  it('斜线格式：ZHANG/SAN → 姓 ZHANG、名 SAN，且姓里不含斜线', () => {
+    const { lastName, firstName } = splitPassengerFullName('ZHANG/SAN');
+    expect(lastName).toBe('ZHANG');
+    expect(firstName).toBe('SAN');
+    expect(lastName).not.toContain('/');
+  });
+
+  it('斜线优先于空格：VAN DER/PIET → 姓 VAN DER、名 PIET', () => {
+    expect(splitPassengerFullName('VAN DER/PIET')).toEqual({
+      lastName: 'VAN DER',
+      firstName: 'PIET',
+    });
+  });
+
+  it('斜线后含多段名：WONG/TAK MING → 姓 WONG、名 TAK MING', () => {
+    expect(splitPassengerFullName('WONG/TAK MING')).toEqual({
+      lastName: 'WONG',
+      firstName: 'TAK MING',
+    });
+  });
+
+  it('无斜线：按首个空格拆 WANG LIANBO → 姓 WANG、名 LIANBO', () => {
+    expect(splitPassengerFullName('WANG LIANBO')).toEqual({
+      lastName: 'WANG',
+      firstName: 'LIANBO',
+    });
+  });
+
+  it('斜线两侧留空格：ZHANG / SAN → 照样拆干净', () => {
+    expect(splitPassengerFullName('ZHANG / SAN')).toEqual({
+      lastName: 'ZHANG',
+      firstName: 'SAN',
+    });
+  });
+
+  it('拆不出就不编造：单段名 MADONNA → 姓 MADONNA、名空', () => {
+    expect(splitPassengerFullName('MADONNA')).toEqual({
+      lastName: 'MADONNA',
+      firstName: '',
+    });
+  });
+
+  it('首字符即斜线（脏数据 /SAN）→ 不拆，整串进姓，不产生空姓', () => {
+    expect(splitPassengerFullName('/SAN')).toEqual({ lastName: '/SAN', firstName: '' });
+  });
+
+  it('空 / null / undefined → 两栏皆空串', () => {
+    expect(splitPassengerFullName('')).toEqual({ lastName: '', firstName: '' });
+    expect(splitPassengerFullName(null)).toEqual({ lastName: '', firstName: '' });
+    expect(splitPassengerFullName(undefined)).toEqual({ lastName: '', firstName: '' });
+  });
+});
 
 describe('normalizePassengerFullName', () => {
   it('姓里带逗号紧贴斜线：ZHENG,/QINQIN → ZHENG/QINQIN', () => {

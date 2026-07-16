@@ -2,7 +2,7 @@
  * 三模板筛选导出 · 单元测试（vitest）
  *
  * 只测纯映射：orderToFullRows / orderToTicketingRows / buildOrderContext + 列定义，
- * 逐列对齐旧系统模版（《全岗可用》57 列、《票务专用》27 列）：
+ * 逐列对齐现用模版（《全岗可用》53 列、《票务专用》27 列）：
  *   - 列名列序与旧模版一致
  *   - 日期格式：生日/签发/有效 = DD-MM-YYYY；录入时间含秒；DOB(PNR) = DDMonYY
  *   - 姓名斜线拼接；乘客类型/性别/证件类型按旧模版原样枚举/代码
@@ -28,11 +28,14 @@ import {
 
 const D = (s: string): Date => new Date(s.length <= 10 ? `${s}T00:00:00.000Z` : `${s}Z`);
 
-/** 旧《全岗可用》模版 57 列表头（叶子列；末尾三列并入「订单成本」分组）。*/
-const OLD_FULL_HEADERS = [
+/**
+ * 《全岗可用》模版 53 列表头（叶子列；末尾三列并入「订单成本」分组）。
+ * 定金组四列已移除：系统无定金模型，四列恒空，且现行模版本身已删除该组。
+ */
+const FULL_HEADERS = [
   '序号', '是否是原订单', '代理机构', '备注', '酒店类型', '中文名称', '乘客姓名',
-  '飞行次数', '出发(往返)日期', '航班号', '订单类型', '定金', '定金到账金额',
-  '定金到账时间', '定金到账渠道', '结算价格', '结算价到账金额', '结算价到账时间',
+  '飞行次数', '出发(往返)日期', '航班号', '订单类型',
+  '结算价格', '结算价到账金额', '结算价到账时间',
   '结算价到账渠道', '尾款金额', '单房差', '单房差到账金额', '签证金额', '签证到账金额',
   '抵扣金额', '抵扣到账金额', '抵扣人员', '抵扣订单', '是否清账', '退款金额', '退款时间',
   '退款渠道', '系统开票状态', '开票状态', '签证状态', '签证选项', '签证备注', '护照签发地',
@@ -214,9 +217,13 @@ function fixtureRoundTrip(): OrderForTemplateExport {
   } as unknown as OrderForTemplateExport;
 }
 
-describe('《全岗可用》full 模版 — 列定义对齐旧 57 列', () => {
-  it('FULL_COLUMNS 列名列序与旧模版 57 列完全一致', () => {
-    expect(FULL_COLUMNS.map((c) => c.header)).toEqual(OLD_FULL_HEADERS);
+describe('《全岗可用》full 模版 — 列定义对齐 53 列', () => {
+  it('FULL_COLUMNS 列名列序与模版 53 列完全一致', () => {
+    expect(FULL_COLUMNS.map((c) => c.header)).toEqual(FULL_HEADERS);
+  });
+
+  it('不输出定金组列（系统无定金模型，现行模版已删该组）', () => {
+    expect(FULL_COLUMNS.map((c) => c.header).filter((h) => h.startsWith('定金'))).toEqual([]);
   });
 });
 
@@ -288,8 +295,6 @@ describe('《全岗可用》full 模版 — 逐列取值/格式', () => {
     for (const r of rows) {
       expect(r.isOriginalOrder).toBe('');
       expect(r.flightCount).toBe('');
-      expect(r.deposit).toBe('');
-      expect(r.depositReceived).toBe('');
       expect(r.singleRoomDiff).toBe('');
       expect(r.offsetPerson).toBe('');
       expect(r.offsetOrder).toBe('');

@@ -20,15 +20,25 @@ const ROSTER_HEADERS = [
   '中文姓名',
   '乘客姓名(PNR，LAST/FIRST 或用/分隔)',
   '性别(M/F/男/女)',
-  '出生日期',
+  '出生日期(YYYY-MM-DD)',
   '国籍(CN/CHN等)',
   '证件类型(护照/PASSPORT/身份证)',
   '证件号',
-  '签发日期',
-  '有效日期',
+  '签发日期(YYYY-MM-DD)',
+  '证件有效期(YYYY-MM-DD)',
   '婴儿同行成人姓名',
   '备注',
 ] as const;
+
+/**
+ * 日期列（1-based）：出生日期 / 签发日期 / 证件有效期。
+ * 模版把这三列设成文本格式，从源头掐掉「Excel 按 locale 自作主张把 01-07-1990
+ * 转成日期单元格」——一旦转了，原始文本永久丢失，解析侧再聪明也无从校正。
+ */
+const ROSTER_DATE_COLS = [4, 8, 9] as const;
+
+/** Excel「文本」单元格格式代码。*/
+const TEXT_NUMFMT = '@';
 
 /** 列索引（1-based，对应 ExcelJS row.getCell(n)）。*/
 export const ROSTER_COL = {
@@ -100,12 +110,20 @@ export async function buildRosterTemplateWorkbook(): Promise<Buffer> {
     { header: ROSTER_HEADERS[10], key: 'remarks',       width: 24 }, // 11 备注
   ];
 
+  // 日期列设为文本格式：Excel 对文本列不做 locale 日期转换，用户敲什么存什么。
+  // 列级 numFmt 会写进 xlsx 的 <col style>，对用户之后新敲进这一列的单元格同样生效。
+  for (const col of ROSTER_DATE_COLS) {
+    ws.getColumn(col).numFmt = TEXT_NUMFMT;
+  }
+
   const headerRow = ws.getRow(1);
   headerRow.font = { bold: true };
   headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEFEFEF' } };
   headerRow.alignment = { vertical: 'middle', horizontal: 'center' };
 
-  // 示例行（行2/行3）：提示格式，日期 YYYY-MM-DD 或 dd-MM-yyyy 均可
+  // 示例行（行2/行3）：一律演示 YYYY-MM-DD —— 模版只教一种写法。
+  // 解析侧仍兼容 dd-MM-yyyy（老文件要能用），但模版不再示范它：示范了就等于
+  // 邀请两种写法混在同一列里，而「日、月都 ≤12」时没有任何办法事后分辨谁是谁。
   ws.addRow({
     fullName: '张三',
     pnrName: 'ZHANG/SAN',
@@ -123,7 +141,7 @@ export async function buildRosterTemplateWorkbook(): Promise<Buffer> {
     fullName: '李四',
     pnrName: 'LI/SI',
     gender: 'F',
-    dateOfBirth: '15-07-1988',   // 演示 dd-MM-yyyy 格式也接受
+    dateOfBirth: '1988-07-15',
     nationality: 'CN',
     documentType: '护照',
     documentNumber: 'E87654321',
@@ -132,6 +150,13 @@ export async function buildRosterTemplateWorkbook(): Promise<Buffer> {
     infantCompanion: '',
     remarks: '',
   });
+
+  // 逐格再设一次：列级 style 在部分 Excel/WPS 版本里不会回落到已有单元格上。
+  for (const rowNumber of [2, 3]) {
+    for (const col of ROSTER_DATE_COLS) {
+      ws.getRow(rowNumber).getCell(col).numFmt = TEXT_NUMFMT;
+    }
+  }
 
   ws.views = [{ state: 'frozen', xSplit: 0, ySplit: 1 }];
 
@@ -179,26 +204,49 @@ function excelDateToIso(d: Date): string | null {
 }
 
 /**
- * 通用日期单元格解析器 → 'YYYY-MM-DD' | null。
+ * 日期单元格的「存疑原因」——解析出了值不等于这个值可信。
+ *
+ *   EXCEL_DATE          Excel 已把原文转成日期单元格。我们拿到的是**被 Excel 按它的
+ *                       locale 解释过的结果**，原始文本不在文件里了 → 无从校正，只能
+ *                       接受并让人回头核。
+ *   DAY_MONTH_AMBIGUOUS 三段数字都 ≤31（如 05-06-07），年/月/日顺序无法自证 → 不猜。
+ */
+export type DateCellDoubt = 'EXCEL_DATE' | 'DAY_MONTH_AMBIGUOUS';
+
+export interface DateCellParse {
+  /** 'YYYY-MM-DD'；无法解析或拒收 → null。 */
+  iso: string | null;
+  /** 非空 = 这一格存疑，调用方必须发 warning。 */
+  doubt: DateCellDoubt | null;
+}
+
+/**
+ * 通用日期单元格解析器（详版）→ { iso, doubt }。
  *
  * 接受（自动判别，全部容错）：
- *   - Excel 日期序列格
- *   - YYYY-MM-DD / YYYY/M/D / YYYY.M.D（年在前）
- *   - dd-MM-yyyy / dd/MM/yyyy / dd.MM.yyyy（日在前，航司口径：01-07-1990 = 1990-07-01）
+ *   - Excel 日期序列格 → 接受，但标 EXCEL_DATE（见上）
+ *   - YYYY-MM-DD / YYYY/M/D / YYYY.M.D（年在前；首段 >31 可自证）
+ *   - dd-MM-yyyy / dd/MM/yyyy / dd.MM.yyyy（日在前；末段 >31 可自证，如 15-07-1988）
  *
- * 判别规则：首段数字 > 31 则视为"年在前"，否则视为"日在前"。
- * 无法解析 → null（不抛错，调用方收 warning）。
+ * 判别规则：**只在能自证时才判**——
+ *   首段 >31 → 只可能是年 → 年在前；
+ *   末段 >31 → 只可能是年 → 日在前（航司口径）；
+ *   两头都 ≤31 → 无法自证 → 拒收（iso=null + DAY_MONTH_AMBIGUOUS）。
+ *
+ * 拒收而非兜底猜测：错的证件有效期要到送签/值机柜台才暴露（拒登机），
+ * 代价远高于「这一格没填」。留空会在下游被必填校验/空白单元格抓到，猜错不会。
  */
-export function parseDateCell(value: ExcelJS.CellValue | undefined): string | null {
-  if (value === null || value === undefined) return null;
-  if (value instanceof Date) return excelDateToIso(value);
+export function parseDateCellDetailed(value: ExcelJS.CellValue | undefined): DateCellParse {
+  if (value === null || value === undefined) return { iso: null, doubt: null };
+  // Excel 已经解释过了：原文丢失，只能接受 + 标存疑。
+  if (value instanceof Date) return { iso: excelDateToIso(value), doubt: 'EXCEL_DATE' };
 
   const text = cellText(value).trim();
-  if (!text) return null;
+  if (!text) return { iso: null, doubt: null };
 
   // ── 分隔符通配（-、/、.）────────────────────────────────────────────────
   const m = /^(\d{1,4})[-/.](\d{1,2})[-/.](\d{1,4})$/.exec(text);
-  if (!m) return null;
+  if (!m) return { iso: null, doubt: null };
 
   const a = Number(m[1]);
   const b = Number(m[2]);
@@ -207,21 +255,34 @@ export function parseDateCell(value: ExcelJS.CellValue | undefined): string | nu
   let year: number, month: number, day: number;
 
   if (a > 31) {
-    // 年在前：YYYY-MM-DD
+    // 年在前：YYYY-MM-DD（首段 >31 → 只可能是年）
     year = a; month = b; day = c;
   } else if (c > 31) {
-    // 日在前：dd-MM-YYYY（航司口径）
+    // 日在前：dd-MM-YYYY（末段 >31 → 只可能是年）
     day = a; month = b; year = c;
   } else {
-    // 首段 ≤ 31、末段 ≤ 31：无法区分，兜底年在前（如 YY-MM-DD 罕见，不处理）
-    year = a; month = b; day = c;
+    // 两头都 ≤31：05-06-07 既可能是 2005-06-07 也可能是 2007-06-05 或 2005 年 7 月 6 日…
+    // 从前兜底当"年在前"并静默入库；现在拒收。
+    return { iso: null, doubt: 'DAY_MONTH_AMBIGUOUS' };
   }
 
-  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  if (month < 1 || month > 12 || day < 1 || day > 31) return { iso: null, doubt: null };
   // 两位年扩展：0-68 → 2000s，69-99 → 1900s
+  // 仅在年份已自证（>31）时才走到这里，如 '90-01-15' / '15-07-88'。
   if (year < 100) year += year < 69 ? 2000 : 1900;
 
-  return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  return {
+    iso: `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`,
+    doubt: null,
+  };
+}
+
+/**
+ * 通用日期单元格解析器 → 'YYYY-MM-DD' | null。
+ * 丢掉存疑信息的薄封装；要发 warning 的调用方请用 parseDateCellDetailed。
+ */
+export function parseDateCell(value: ExcelJS.CellValue | undefined): string | null {
+  return parseDateCellDetailed(value).iso;
 }
 
 /**
@@ -229,6 +290,53 @@ export function parseDateCell(value: ExcelJS.CellValue | undefined): string | nu
  */
 export function parseDobCell(value: ExcelJS.CellValue | undefined): string | null {
   return parseDateCell(value);
+}
+
+/**
+ * 读一个日期列 → 'YYYY-MM-DD' | null，并把「存疑 / 解析失败」写进 warnings。
+ *
+ * 空格 → null 且不发 warning（等同没填）。
+ * 存疑的三种归宿：
+ *   EXCEL_DATE          → 接受解析结果，但回显出来让人核（原文已被 Excel 吃掉）
+ *   DAY_MONTH_AMBIGUOUS → 留空 + warning（不猜，理由见 parseDateCellDetailed）
+ *   解析不了             → 留空 + warning
+ */
+function readDateField(
+  raw: ExcelJS.CellValue | undefined,
+  label: string,
+  rowNumber: number,
+  displayName: string,
+  warnings: string[],
+): string | null {
+  const text = cellText(raw).trim();
+  if (!text) return null; // 没填 → 不是错误
+
+  const { iso, doubt } = parseDateCellDetailed(raw);
+
+  if (doubt === 'EXCEL_DATE' && iso) {
+    warnings.push(
+      `第 ${rowNumber} 行（${displayName}）：${label}该单元格被 Excel 识别为日期，` +
+        `已按 ${iso} 读取（年-月-日）。若原文是「日-月-年」请核对；` +
+        `原始文本已被 Excel 覆盖，系统无法自行校正。` +
+        `建议重新下载模版填写——模版的日期列已设为文本格式，不会再被转换。`,
+    );
+    return iso;
+  }
+
+  if (doubt === 'DAY_MONTH_AMBIGUOUS') {
+    warnings.push(
+      `第 ${rowNumber} 行（${displayName}）：${label}「${text}」各段数字均 ≤31，` +
+        `无法判定年/月/日顺序，已留空（不猜）。请改用 YYYY-MM-DD 重填，如 1990-01-15。`,
+    );
+    return null;
+  }
+
+  if (!iso) {
+    warnings.push(`第 ${rowNumber} 行（${displayName}）：${label}「${text}」无法解析，已留空`);
+    return null;
+  }
+
+  return iso;
 }
 
 /** 解析性别单元格 → 'M' | 'F' | null。接受 M/F、男/女、male/female（不区分大小写）。*/
@@ -303,8 +411,13 @@ function normalizeDocumentType(text: string): string {
  * - 整行空白 → 跳过，不计数、不 warning。
  * - 姓名或证件号都缺 → 收 warning 跳过。
  * - 日期/性别单格不可解析 → 收 warning，字段留空，保留该行。
+ * - 日期存疑（Excel 转过 / 年月日顺序无法自证）→ 一律 warning，见 readDateField。
+ *   **容错 ≠ 静默**：宽容是指"不整文件抛错"，不是"猜一个看起来合理的值塞进去"。
  * - 超过 ROSTER_MAX_ROWS 行 → 截断并 warning。
  * - 文件损坏/非 xlsx → 抛错由路由层转 400。
+ *
+ * warnings 由 POST /orders/roster/parse 原样返回给后台（见 orders.routes.ts），
+ * 后台在导入预览里展示 → 操作人逐条核。
  */
 export async function parseRosterXlsx(fileBase64: string): Promise<RosterParseResult> {
   const buf = Buffer.from(fileBase64, 'base64');
@@ -369,11 +482,8 @@ export async function parseRosterXlsx(fileBase64: string): Promise<RosterParseRe
         documentNumber: passportNo || undefined,
       };
 
-      if (dobText) {
-        const dob = parseDateCell(dobRaw);
-        if (dob) { out.dob = dob; out.dateOfBirth = dob; }
-        else warnings.push(`第 ${rowNumber} 行（${nameCell}）：出生日期「${dobText}」无法解析，已留空`);
-      }
+      const dob = readDateField(dobRaw, '出生日期', rowNumber, nameCell, warnings);
+      if (dob) { out.dob = dob; out.dateOfBirth = dob; }
 
       if (genderText) {
         const gender = parseGenderCell(genderRaw);
@@ -449,12 +559,8 @@ export async function parseRosterXlsx(fileBase64: string): Promise<RosterParseRe
     }
 
     // 出生日期
-    const dobText = cellText(dobRaw).trim();
-    if (dobText) {
-      const dob = parseDateCell(dobRaw);
-      if (dob) { out.dateOfBirth = dob; out.dob = dob; }
-      else warnings.push(`第 ${rowNumber} 行（${displayName}）：出生日期「${dobText}」无法解析，已留空`);
-    }
+    const dob = readDateField(dobRaw, '出生日期', rowNumber, displayName, warnings);
+    if (dob) { out.dateOfBirth = dob; out.dob = dob; }
 
     // 国籍
     if (nationalityT) out.nationality = normalizeNationality(nationalityT);
@@ -466,24 +572,15 @@ export async function parseRosterXlsx(fileBase64: string): Promise<RosterParseRe
     if (docNumT) { out.documentNumber = docNumT; out.passportNo = docNumT; }
 
     // 签发日期（护照签发日期；同时保留已废弃的 visaIssueDate 别名）
-    const issueText = cellText(issueDateRaw).trim();
-    if (issueText) {
-      const d = parseDateCell(issueDateRaw);
-      if (d) {
-        out.passportIssueDate = d;
-        out.visaIssueDate     = d; // 向后兼容
-      } else {
-        warnings.push(`第 ${rowNumber} 行（${displayName}）：签发日期「${issueText}」无法解析，已留空`);
-      }
+    const issueDate = readDateField(issueDateRaw, '签发日期', rowNumber, displayName, warnings);
+    if (issueDate) {
+      out.passportIssueDate = issueDate;
+      out.visaIssueDate     = issueDate; // 向后兼容
     }
 
-    // 有效日期
-    const expiryText = cellText(expiryDateRaw).trim();
-    if (expiryText) {
-      const d = parseDateCell(expiryDateRaw);
-      if (d) out.passportExpiry = d;
-      else warnings.push(`第 ${rowNumber} 行（${displayName}）：有效日期「${expiryText}」无法解析，已留空`);
-    }
+    // 证件有效期 —— 错了要到送签/值机柜台才暴露，所以存疑一律不猜（见 readDateField）
+    const expiry = readDateField(expiryDateRaw, '证件有效期', rowNumber, displayName, warnings);
+    if (expiry) out.passportExpiry = expiry;
 
     if (infantT) out.infantCompanion = infantT;
     if (remarksT) out.remarks = remarksT;

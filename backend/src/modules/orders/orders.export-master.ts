@@ -13,16 +13,20 @@
  * 无论 role 如何，都是同一份数据、同一个端点 —— role 仅做列可见性裁剪。
  *
  * 诚实口径：
- *   - 飞行次数 = 航段数（往返2 / 单程1）。运营「飞行次数」口径尚未确认，表头附批注说明，
- *     等确认后再调整（切勿冒充真实值）。
+ *   - 飞行次数 = 该乘客的常旅客历史飞行次数（按证件号归拢，只计去程已起飞的行程），
+ *     取自 TravelerProfile.tripCount —— 是「这个人跟我们飞过几次」，与本单航段数无关，
+ *     故同一订单不同乘客的飞行次数互不相同。匹配不到档案（新客/证件号对不上）→ 留空。
+ *     该列读自档案快照表（值是上次重建时的，见 TravelerProfile.refreshedAt）；导出不触发
+ *     重建（全量重建太慢，不能挂在导出请求上）。
  *   - 金额列（结算价/到账/尾款/单房差/签证/退款/订单成本）均为「每位出行人」均摊，
  *     与《全岗可用》模板同口径，避免按订单总额被误读为每人都付了全款。
  */
 import ExcelJS from 'exceljs';
-import type { Prisma, PrismaClient } from '@prisma/client';
+import type { DocumentType, Prisma, PrismaClient } from '@prisma/client';
 import { OrderStatus } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import type { BundleItemJson } from '../../lib/json-types.js';
+import { docKey } from '../travelers/traveler-profiles.aggregate.js';
 import { toAlpha3 } from './nationality.js';
 import { parseRoomGroups } from './orders.export-room-allocation.js';
 import { nameWithTitle } from './orders.export-templates.js';
@@ -143,7 +147,9 @@ export interface MasterRow {
   hotelName: string; // 酒店中文名称（hotelRoomType.hotel.name 去重）
   chineseName: string;
   passengerName: string; // 拼音/PNR：LAST/FIRST
-  flightCount: string; // 航段数（往返2/单程1）—— 口径待确认，见表头批注
+  // 常旅客历史飞行次数（TravelerProfile.tripCount 快照）：按证件号归拢、只计去程已起飞的行程。
+  // 每位乘客各不相同；匹配不到档案 → 留空。与本单航段数无关。
+  flightCount: string;
   travelDates: string; // 出发(往返)日期
   flightNumbers: string; // 航班号（去⇌回）
   orderType: string; // 往返票/单程票/品类
@@ -199,7 +205,10 @@ const MASTER_COLUMNS: MasterColumn[] = [
     header: '飞行次数',
     key: 'flightCount',
     width: 8,
-    note: '航段数（往返2 / 单程1）。运营「飞行次数」口径待确认。',
+    note:
+      '常旅客历史飞行次数：按证件号归拢，只计去程已起飞的行程（不是本单航段数）。\n' +
+      '匹配不到旅客档案（新客/证件号对不上）留空。\n' +
+      '数据为旅客档案快照，非导出时实时重算。',
     roles: ['all', 'ticketing'],
   },
   { header: '出发(往返)日期', key: 'travelDates', width: 24 },
@@ -265,12 +274,124 @@ export const MASTER_EXPORT_INCLUDE = {
 
 export type OrderForMasterExport = Prisma.OrderGetPayload<{ include: typeof MASTER_EXPORT_INCLUDE }>;
 
+// ── 常旅客历史飞行次数（TravelerProfile.tripCount）─────────────────────────────
+/** docKey(证件类型|证件号) → 该旅客历史飞行次数。渲染纯函数只认这张 Map，不碰 DB。*/
+export type TripCountMap = Map<string, number>;
+
+/** 快照新鲜度：本次导出用到的档案里最旧的一条重建时间（null = 一条都没匹配上）。*/
+export interface TripCountLookup {
+  tripCounts: TripCountMap;
+  /** 表头批注用：让读表的人知道这列是快照、有多旧。*/
+  oldestRefreshedAt: Date | null;
+}
+
+/** mergedIntoId 指针链解析用的最小行。*/
+interface ProfileRef {
+  id: string;
+  documentType: DocumentType;
+  documentNumber: string;
+  tripCount: number;
+  refreshedAt: Date;
+  mergedIntoId: string | null;
+}
+
+/** 合并链最大跟随跳数：merge() 禁止并入指针行 → 数据上不该有链；给足冗余并防脏数据死循环。*/
+const MAX_MERGE_HOPS = 4;
+
+/**
+ * 拉取本次导出全部乘客的常旅客档案 → docKey → tripCount。
+ *
+ * 无 N+1：先按 (证件类型,证件号) 组合一次 findMany（走 @@unique([documentType, documentNumber])），
+ * 再对「命中的档案是指针行（mergedIntoId 非空）」的情况按 id 批量补拉主档案 —— 每一跳一条查询，
+ * 实践中最多一跳（合并时禁止把档案并入指针行，链深恒为 1）。几百位乘客也只有 1~2 条查询。
+ *
+ * mergedIntoId：合并过的档案 tripCount 累积在主档案上，指针行留的是合并前的残值 ——
+ * 直读源档案会少算。命中指针行时沿链跟随到主档案取值（防环：记录已访问 id）。
+ * 客人报旧护照号下的单，也能因此拿到归一后的真实飞行次数。
+ */
+export async function loadTripCountMap(
+  passengers: readonly { documentType: DocumentType; documentNumber: string }[],
+  client: PrismaClient = defaultPrisma,
+): Promise<TripCountLookup> {
+  const select = {
+    id: true,
+    documentType: true,
+    documentNumber: true,
+    tripCount: true,
+    refreshedAt: true,
+    mergedIntoId: true,
+  } as const;
+
+  // 证件对去重（同一旅客在多张订单里重复出现 → 只查一次）
+  const pairByKey = new Map<string, { documentType: DocumentType; documentNumber: string }>();
+  for (const p of passengers) {
+    if (!p.documentNumber) continue; // 证件号缺失 → 无从匹配，留空
+    pairByKey.set(docKey(p.documentType, p.documentNumber), {
+      documentType: p.documentType,
+      documentNumber: p.documentNumber,
+    });
+  }
+  if (pairByKey.size === 0) return { tripCounts: new Map(), oldestRefreshedAt: null };
+
+  const matched = (await client.travelerProfile.findMany({
+    where: { OR: [...pairByKey.values()] },
+    select,
+  })) as ProfileRef[];
+
+  // 指针行 → 批量补拉主档案（按 id in，逐跳；命中即停）
+  const byId = new Map<string, ProfileRef>(matched.map((r) => [r.id, r]));
+  for (let hop = 0; hop < MAX_MERGE_HOPS; hop += 1) {
+    const wanted = [...byId.values()]
+      .map((r) => r.mergedIntoId)
+      .filter((id): id is string => id !== null && !byId.has(id));
+    if (wanted.length === 0) break;
+    const masters = (await client.travelerProfile.findMany({
+      where: { id: { in: [...new Set(wanted)] } },
+      select,
+    })) as ProfileRef[];
+    if (masters.length === 0) break; // 断链（主档案被删）→ 停在当前行，用其残值而非空
+    for (const m of masters) byId.set(m.id, m);
+  }
+
+  const tripCounts: TripCountMap = new Map();
+  let oldestRefreshedAt: Date | null = null;
+  for (const row of matched) {
+    const master = resolveMaster(row, byId);
+    tripCounts.set(docKey(row.documentType, row.documentNumber), master.tripCount);
+    if (!oldestRefreshedAt || master.refreshedAt < oldestRefreshedAt) {
+      oldestRefreshedAt = master.refreshedAt;
+    }
+  }
+  return { tripCounts, oldestRefreshedAt };
+}
+
+/**
+ * 沿 mergedIntoId 链解析到主档案。
+ * 与 travelers/traveler-profiles.service.ts 的 resolveMasterRef 同款口径（该函数为模块私有、
+ * 未导出，本文件不改 travelers/ 故就近实现）：断链（主档案被删）/ 环（脏数据）时停在当前行，
+ * 不抛错不死循环 —— 脏数据只会让这一条取到残值，不拖垮整表导出。
+ */
+function resolveMaster(start: ProfileRef, byId: Map<string, ProfileRef>): ProfileRef {
+  let current = start;
+  const seen = new Set<string>([current.id]);
+  while (current.mergedIntoId) {
+    const next = byId.get(current.mergedIntoId);
+    if (!next || seen.has(next.id)) break;
+    seen.add(next.id);
+    current = next;
+  }
+  return current;
+}
+
 // ── 订单 → 每位乘客一行 ─────────────────────────────────────────────────────
 /**
  * 把一张订单展开成 N 行（每位乘客一行），字段尽量填满系统真实存有的数据。
  * 纯函数（不碰 DB），便于单测；金额均为「每位出行人」均摊。
  */
-export function orderToMasterRows(order: OrderForMasterExport): Omit<MasterRow, 'seq'>[] {
+export function orderToMasterRows(
+  order: OrderForMasterExport,
+  tripCounts: TripCountMap = new Map(),
+): Omit<MasterRow, 'seq'>[] {
   const paxCount = Math.max(1, order.passengers.length);
 
   // ── 航段（按出发时间排序）──
@@ -293,8 +414,6 @@ export function orderToMasterRows(order: OrderForMasterExport): Omit<MasterRow, 
   const cabinLabels = Array.from(
     new Set(legs.filter((l) => l.cabin).map((l) => CABIN_LABEL[l.cabin!] ?? l.cabin!)),
   ).join(' / ');
-  // 飞行次数 = 航段数（往返2 / 单程1）。无机票行 → 留空（口径待确认，见表头批注）。
-  const flightCount = legs.length > 0 ? String(legs.length) : '';
 
   // ── 订单类型：两段及以上=往返票 / 一段=单程票 / 无机票按品类 ──
   let orderType: string;
@@ -437,6 +556,12 @@ export function orderToMasterRows(order: OrderForMasterExport): Omit<MasterRow, 
       : '';
     const notes = [baseNotes, groupInfo].filter(Boolean).join(' / ');
 
+    // 飞行次数：按本乘客证件号取常旅客档案的历史飞行次数（每人各不相同）。
+    // 匹配不到档案（新客/证件号对不上）→ 留空，不臆造 0（0 会被读成"从没飞过"的结论）。
+    const tripCount = p.documentNumber
+      ? tripCounts.get(docKey(p.documentType, p.documentNumber))
+      : undefined;
+
     return {
       agency,
       notes,
@@ -444,7 +569,7 @@ export function orderToMasterRows(order: OrderForMasterExport): Omit<MasterRow, 
       chineseName: p.chineseName ?? p.fullName,
       // 称谓（MR/MS/MSTR/MISS）按订单去程（最早 FLIGHT 行出发时间，legs 已按出发时间排序）派生年龄。
       passengerName: nameWithTitle(p, legs[0]?.departureTime ?? null),
-      flightCount,
+      flightCount: tripCount === undefined ? '' : String(tripCount),
       travelDates,
       flightNumbers,
       orderType,
@@ -506,6 +631,14 @@ export async function buildMasterExportWorkbook(
     include: MASTER_EXPORT_INCLUDE,
   })) as OrderForMasterExport[];
 
+  // 飞行次数：一次性拉回本次导出所有乘客的常旅客档案（无 N+1；几百行也只有 1~2 条查询）。
+  // 刻意不触发档案重建 —— 全量重建太慢，不能挂在导出请求上；读到的是上次重建的快照，
+  // 快照时间随表头批注一起标出，让读表的人知道这列有多旧。
+  const { tripCounts, oldestRefreshedAt } = await loadTripCountMap(
+    orders.flatMap((o) => o.passengers),
+    client,
+  );
+
   const cols = visibleColumns(role);
 
   const wb = new ExcelJS.Workbook();
@@ -518,17 +651,21 @@ export async function buildMasterExportWorkbook(
   headerRow.font = { bold: true };
   headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEFEFEF' } };
   headerRow.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
-  // 表头批注（诚实口径说明，如飞行次数=航段数）
+  // 表头批注（诚实口径说明）。飞行次数额外标出快照时间 —— 该列读自旅客档案快照表，
+  // 导出不重建，所以要让读表的人看到这批数字是什么时候算的。
   cols.forEach((c, i) => {
-    if (c.note) {
-      ws.getRow(1).getCell(i + 1).note = c.note;
-    }
+    if (!c.note) return;
+    const note =
+      c.key === 'flightCount' && oldestRefreshedAt
+        ? `${c.note}\n档案快照时间：${fmtDateTime(oldestRefreshedAt)}（UTC）`
+        : c.note;
+    ws.getRow(1).getCell(i + 1).note = note;
   });
 
   let seq = 0;
   for (const order of orders) {
     if (order.passengers.length === 0) continue;
-    for (const row of orderToMasterRows(order)) {
+    for (const row of orderToMasterRows(order, tripCounts)) {
       seq += 1;
       // key-based addRow 只取可见列对应的 key，多余字段忽略 —— role 裁列天然生效
       ws.addRow({ seq, ...row });

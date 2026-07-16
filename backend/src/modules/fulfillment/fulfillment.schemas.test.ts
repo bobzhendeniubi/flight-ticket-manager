@@ -72,3 +72,62 @@ describe('listFulfillmentQuerySchema — notesQuery', () => {
     expect(result.success).toBe(false);
   });
 });
+
+describe('listFulfillmentQuerySchema — status 多状态', () => {
+  it('单状态（老调用）→ 归一成单元素数组，向后兼容', () => {
+    const parsed = listFulfillmentQuerySchema.parse({ status: 'PENDING' });
+    expect(parsed.status).toEqual(['PENDING']);
+  });
+
+  it('逗号分隔多状态 → 数组（签证台「待办」= 待处理 + 材料准备）', () => {
+    const parsed = listFulfillmentQuerySchema.parse({ status: 'PENDING,IN_PROGRESS' });
+    expect(parsed.status).toEqual(['PENDING', 'IN_PROGRESS']);
+  });
+
+  it('重复 query 参数（?status=A&status=B）→ 数组', () => {
+    const parsed = listFulfillmentQuerySchema.parse({ status: ['PENDING', 'CONFIRMED'] });
+    expect(parsed.status).toEqual(['PENDING', 'CONFIRMED']);
+  });
+
+  it('逗号串带空白 → trim 后仍解析', () => {
+    const parsed = listFulfillmentQuerySchema.parse({ status: ' PENDING , IN_PROGRESS ' });
+    expect(parsed.status).toEqual(['PENDING', 'IN_PROGRESS']);
+  });
+
+  it('省略 / 空串 → undefined（「全部状态」不加条件）', () => {
+    expect(listFulfillmentQuerySchema.parse({}).status).toBeUndefined();
+    expect(listFulfillmentQuerySchema.parse({ status: '' }).status).toBeUndefined();
+  });
+
+  it('非法状态值 → 拒绝（不静默丢弃）', () => {
+    expect(listFulfillmentQuerySchema.safeParse({ status: 'NOT_A_STATUS' }).success).toBe(false);
+    expect(listFulfillmentQuerySchema.safeParse({ status: 'PENDING,NOPE' }).success).toBe(false);
+  });
+});
+
+describe('listFulfillmentQuerySchema — issuanceMethod / departureDate', () => {
+  it('issuanceMethod 接受签发方式枚举与 NONE（未标注）', () => {
+    expect(listFulfillmentQuerySchema.parse({ issuanceMethod: 'E_VISA' }).issuanceMethod).toBe(
+      'E_VISA',
+    );
+    expect(listFulfillmentQuerySchema.parse({ issuanceMethod: 'NONE' }).issuanceMethod).toBe('NONE');
+  });
+
+  it('issuanceMethod 非法值 → 拒绝', () => {
+    expect(listFulfillmentQuerySchema.safeParse({ issuanceMethod: 'BOGUS' }).success).toBe(false);
+  });
+
+  it('departureDate 接受 YYYY-MM-DD，其他格式拒绝', () => {
+    expect(listFulfillmentQuerySchema.parse({ departureDate: '2026-07-20' }).departureDate).toBe(
+      '2026-07-20',
+    );
+    expect(listFulfillmentQuerySchema.safeParse({ departureDate: '2026/07/20' }).success).toBe(false);
+    expect(listFulfillmentQuerySchema.safeParse({ departureDate: '20260720' }).success).toBe(false);
+  });
+
+  it('两者省略 → undefined（不筛）', () => {
+    const parsed = listFulfillmentQuerySchema.parse({});
+    expect(parsed.issuanceMethod).toBeUndefined();
+    expect(parsed.departureDate).toBeUndefined();
+  });
+});

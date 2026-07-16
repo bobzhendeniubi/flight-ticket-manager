@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
-import { type MockVisa } from '../lib/mockData';
-import { api, type Visa, type ProductRating } from '../lib/api';
+import { api, type Visa as ApiVisa, type ProductRating } from '../lib/api';
 import { useCart } from '../stores/cart';
 import { Icon } from '../components/Icon';
 import { Img } from '../components/Img';
@@ -13,13 +12,29 @@ import { ErrorRetry } from '../components/ErrorRetry';
 import { EmptyState } from '../components/EmptyState';
 import { Seo } from '../components/Seo';
 
-/** 列表用签证：MockVisa + 评分/销量（用于 StarRating、热度排序）。 */
-type ListVisa = MockVisa & {
+/** 签证产品的展示结构（由接口原始数据归一化而来：价格转数字、可空字段填默认值）。 */
+export interface Visa {
+  id: string;
+  country: string;
+  countryCode: string;
+  flag: string;
+  photo: string;
+  type: string;
+  processingDays: number;
+  basePrice: number;
+  expressSurcharge: number;
+  requiredDocs: string[];
+  validityMonths: number;
+  highlight?: string;
+}
+
+/** 列表用签证：Visa + 评分/销量（用于 StarRating、热度排序）。 */
+type ListVisa = Visa & {
   rating?: ProductRating;
   soldCount?: number;
 };
 
-function visaApiToMock(v: Visa): ListVisa {
+function visaApiToView(v: ApiVisa): ListVisa {
   return {
     id: v.id, country: v.country ?? v.destinationCountry, countryCode: v.destinationCountry,
     flag: v.flag ?? '🌐', photo: v.photo ?? '', type: v.visaName ?? v.visaType,
@@ -87,7 +102,7 @@ export function VisasPage() {
       .listVisas()
       .then((r) => {
         if (cancelled) return;
-        setVisas(r.visas.map(visaApiToMock));
+        setVisas(r.visas.map(visaApiToView));
         setStatus('ready');
       })
       .catch(() => {
@@ -244,7 +259,7 @@ export function VisasPage() {
   );
 }
 
-function VisaDetailModal({ visa, onClose }: { visa: MockVisa; onClose: () => void }) {
+function VisaDetailModal({ visa, onClose }: { visa: Visa; onClose: () => void }) {
   const [express, setExpress] = useState(false);
   const [count, setCount] = useState(1);
   const add = useCart((s) => s.add);

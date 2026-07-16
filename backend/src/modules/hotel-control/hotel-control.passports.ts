@@ -10,8 +10,13 @@
  *      （fullName 大小写不敏感 或 chineseName 精确 trim 匹配，命中任一即可），排除已取消/软删订单
  *      （同 COUNTED_STATUSES）。可选按出发日期区间 [from, to]（含两端）过滤：口径 = 订单最早一段
  *      FLIGHT 的 departureTime 按 departureTz 折算的「出发地本地日」（复用 fmtDepartureLocalDate，
- *      不做 UTC 比较，避免跨时区错日）；无航班的订单没有出发日，传了区间时一律不命中。
- *      同名跨订单命中多单时全部打包（证件号进文件名天然消歧）；未命中的姓名单独返回，供路由/前端提示。
+ *      不做 UTC 比较，避免跨时区错日）；无航班的订单（纯签证单/纯酒店单）没有出发日 → 不被区间筛掉，
+ *      归入「无出发日期」文件夹（与签证台出发日过滤同口径）。
+ *      同名跨订单命中多单时全部打包（证件号进文件名天然消歧）。
+ *      两类「没导出来」的姓名分开返回，避免错误归因：
+ *        · notFoundNames        —— 库里压根没这个人（姓名写错/没录单）→ 改姓名重试才有用
+ *        · excludedByDateNames  —— 人找到了，但出发日不在所选区间 → 该改的是日期区间
+ *      早先版本把后者混进 notFoundNames，看到的是「查无此人」，会去改名字，永远查不到真因。
  *
  * 输出：zip Buffer，结构（两个入口不同——按酒店给房控对订单，按姓名给运营按出发日找人）：
  *   按酒店：{orderNumber}/{LASTNAME}_{护照号}.{ext}
@@ -55,10 +60,19 @@ export interface HotelPassportSelection {
   groups: HotelPassportGroup[];
 }
 
-/** 按姓名批量导出的取数结果：命中的乘客（按订单分组）+ 未命中的姓名列表。*/
+/**
+ * 按姓名批量导出的取数结果：命中的乘客（按订单分组）+ 两类没导出来的姓名（互斥，别混）。
+ */
 export interface HotelPassportsByNamesSelection {
   groups: HotelPassportGroup[];
+  /** 库里查无此人（姓名写错 / 还没录单）。改姓名重试才有用。*/
   notFoundNames: string[];
+  /**
+   * 人找到了，但订单出发日不在所选区间 → 未导出。该改的是日期区间，不是姓名。
+   * 只包含「所有命中单都被区间排除」的姓名；同名跨订单只要有一单落在区间内就不算。
+   * 无出发日的订单（纯签证单/纯酒店单）不算被日期排除 —— 它们归「无出发日期」文件夹照常导出。
+   */
+  excludedByDateNames: string[];
 }
 
 function toDateOnly(s: string): Date {
@@ -167,8 +181,12 @@ export function hasAnyPassportPhoto(groups: HotelPassportGroup[]): boolean {
  * 命中任一即算命中。仅关联订单未软删且状态在 COUNTED_STATUSES（同销控板/分房表口径）。
  * 可选按出发日期过滤：每订单取最早一段 FLIGHT 的 departureTime，按 departureTz 折算成
  * 「出发地本地日」YYYY-MM-DD 字符串后与 from/to 比较（不做 UTC gte/lte，避免跨时区错日）；
- * 无航班订单出发日为 ''，传了区间时一律不命中。被日期过滤掉的姓名计入 notFoundNames。
+ * 无航班订单出发日为 ''，不被区间筛掉（归「无出发日期」文件夹）。
  * 同名跨订单命中多单时全部打包（证件号进文件名天然消歧）。
+ *
+ * 姓名匹配先于日期过滤 —— 被日期排除的人已经算「找到了」，只会进 excludedByDateNames，
+ * 绝不会假冒 notFoundNames 的「查无此人」（否则会被误导去改姓名，而真因是日期区间）。
+ *
  * @param args.names 姓名列表（允许含前后空白，函数内部会 trim + 去重后再查）。
  * @param args.from / args.to 可选出发日期区间（YYYY-MM-DD，含两端；可只传一端）。
  * @param client 可注入用于测试；缺省取默认 prisma。
@@ -180,7 +198,7 @@ export async function collectPassportGroupsByNames(
   const uniqueNames = Array.from(new Set(args.names.map((n) => n.trim()).filter(Boolean)));
 
   if (uniqueNames.length === 0) {
-    return { groups: [], notFoundNames: [] };
+    return { groups: [], notFoundNames: [], excludedByDateNames: [] };
   }
 
   const passengers = await client.passenger.findMany({
@@ -216,24 +234,34 @@ export async function collectPassportGroupsByNames(
   });
 
   const byOrder = new Map<string, HotelPassportGroup>();
+  /** 库里查到了这个人（不论出发日是否落在区间内）—— 定 notFoundNames 用。*/
   const matchedNames = new Set<string>();
+  /** 这个人真的被打进了 zip —— 定 excludedByDateNames 用。*/
+  const includedNames = new Set<string>();
   for (const p of passengers) {
     const fs = p.order.items[0]?.flightSchedule ?? null;
     const departureLocalDate = fmtDepartureLocalDate(
       fs?.departureTime ?? null,
       fs?.departureTz ?? null,
     );
-    // 出发地本地日字符串比较（YYYY-MM-DD 字典序 = 日期序）；无出发日在传区间时不命中
-    if (args.from && (!departureLocalDate || departureLocalDate < args.from)) continue;
-    if (args.to && (!departureLocalDate || departureLocalDate > args.to)) continue;
 
+    // 姓名匹配必须先于日期过滤：被日期排除的人也算「找到了」，否则会假冒「查无此人」
     const fullNameLower = (p.fullName ?? '').trim().toLowerCase();
     const chineseName = (p.chineseName ?? '').trim();
-    for (const name of uniqueNames) {
-      if (fullNameLower === name.toLowerCase() || (chineseName && chineseName === name)) {
-        matchedNames.add(name);
-      }
+    const hitNames = uniqueNames.filter(
+      (name) => fullNameLower === name.toLowerCase() || (chineseName && chineseName === name),
+    );
+    for (const name of hitNames) matchedNames.add(name);
+
+    // 出发地本地日字符串比较（YYYY-MM-DD 字典序 = 日期序）。
+    // 无出发日（纯签证单/纯酒店单）→ 不被日期区间筛掉，归入「无出发日期」文件夹。
+    // 与签证台 departureDate 过滤同口径（纯签证单无航班 → 保留可见）。
+    if (departureLocalDate) {
+      if (args.from && departureLocalDate < args.from) continue;
+      if (args.to && departureLocalDate > args.to) continue;
     }
+
+    for (const name of hitNames) includedNames.add(name);
 
     const key = p.order.id;
     const group =
@@ -251,34 +279,45 @@ export async function collectPassportGroupsByNames(
     byOrder.set(key, group);
   }
 
+  // 两类分开（互斥）：查无此人 vs 找到了但出发日不在区间。混在一起就是错误归因。
   const notFoundNames = uniqueNames.filter((n) => !matchedNames.has(n));
+  const excludedByDateNames = uniqueNames.filter((n) => matchedNames.has(n) && !includedNames.has(n));
 
-  return { groups: Array.from(byOrder.values()), notFoundNames };
+  return { groups: Array.from(byOrder.values()), notFoundNames, excludedByDateNames };
 }
 
-/** 按姓名导出 zip 里无航班订单的文件夹名。*/
+/** 按姓名导出 zip 里无航班订单（纯签证单/纯酒店单）的文件夹名。*/
 const NO_DEPARTURE_FOLDER = '无出发日期';
 
 /**
  * 按姓名导出专用打包：顶层文件夹 = 出发日期（YYYY-MM-DD；无航班订单归「无出发日期」），
  * 文件名 = {姓名}_{证件号}.{ext}（姓名优先中文名）。缺图/下载失败记入 missing；
- * 成功打入的文件逐个记入 manifest（文件 ← 订单号，供运营查单）。
+ * 成功打入的文件逐个记入 manifest（文件 ← 订单号，供查单）。
+ * noDepartureCount = 归进「无出发日期」文件夹的乘客数，供 README 明写（不能静默）。
  * 「按酒店」导出仍走 packGroupsIntoZip（按订单号分文件夹），两者结构互不影响。
  */
 async function packGroupsByDepartureDateIntoZip(
   zip: JSZip,
   groups: HotelPassportGroup[],
-): Promise<{ missing: string[]; manifest: string[]; photoCount: number; passengerCount: number }> {
+): Promise<{
+  missing: string[];
+  manifest: string[];
+  photoCount: number;
+  passengerCount: number;
+  noDepartureCount: number;
+}> {
   const missing: string[] = [];
   const manifest: string[] = [];
   let photoCount = 0;
   let passengerCount = 0;
+  let noDepartureCount = 0;
 
   for (const group of groups) {
     const folderName = (group.departureLocalDate ?? '').trim() || NO_DEPARTURE_FOLDER;
     const folder = zip.folder(folderName) ?? zip;
     for (const p of group.passengers) {
       passengerCount += 1;
+      if (folderName === NO_DEPARTURE_FOLDER) noDepartureCount += 1;
       const slug = sanitize(`${displayNameOf(p)}_${p.documentNumber}`);
       if (!p.passportPhotoUrl) {
         missing.push(`${group.orderNumber}  ·  ${slug}  — 该乘客没传护照照片`);
@@ -296,7 +335,7 @@ async function packGroupsByDepartureDateIntoZip(
     }
   }
 
-  return { missing, manifest, photoCount, passengerCount };
+  return { missing, manifest, photoCount, passengerCount, noDepartureCount };
 }
 
 /**
@@ -366,7 +405,8 @@ export async function buildHotelPassportsZip(
 /**
  * 把按姓名命中的乘客打成 zip：顶层文件夹 = 出发日期（无航班订单归「无出发日期」），
  * 文件名 = {姓名}_{证件号}.{ext}（姓名优先中文名）。README.txt 里列出每个文件对应的
- * 订单号（查单用）、缺图客人、未命中的姓名；传了出发日期区间时一并记入抬头。
+ * 订单号（查单用）、缺图客人、以及两类没导出来的姓名（查无此人 / 出发日不在区间）——
+ * 两类分开写，别让「日期没对上」看着像「人不存在」。传了出发日期区间时一并记入抬头。
  * @returns zip Buffer + 实际成功打入的照片数（photoCount）。
  */
 export async function buildPassportsByNamesZip(
@@ -374,10 +414,8 @@ export async function buildPassportsByNamesZip(
   meta?: { from?: string; to?: string },
 ): Promise<{ buf: Buffer; photoCount: number }> {
   const zip = new JSZip();
-  const { missing, manifest, photoCount, passengerCount } = await packGroupsByDepartureDateIntoZip(
-    zip,
-    selection.groups,
-  );
+  const { missing, manifest, photoCount, passengerCount, noDepartureCount } =
+    await packGroupsByDepartureDateIntoZip(zip, selection.groups);
 
   const hasRange = Boolean(meta?.from || meta?.to);
   const readme = [
@@ -395,14 +433,25 @@ export async function buildPassportsByNamesZip(
     ...(missing.length
       ? ['⚠ 缺护照图（订单 · 乘客）：', ...missing.map((s) => `  · ${s}`)]
       : ['✓ 所有乘客护照图均已打包']),
-    ...(selection.notFoundNames.length
+    // 无出发日的单（纯签证单/纯酒店单）照常导出，但要明说，别让人以为漏了
+    ...(noDepartureCount
       ? [
           '',
-          hasRange
-            ? '⚠ 以下姓名未找到任何客人（含不在所选出发日期范围内的）：'
-            : '⚠ 以下姓名未找到任何客人：',
-          ...selection.notFoundNames.map((n) => `  · ${n}`),
+          `ℹ ${noDepartureCount} 位客人所在订单没有机票（纯签证单/纯酒店单），无出发日期，`,
+          `  已归入「${NO_DEPARTURE_FOLDER}」文件夹${hasRange ? '（不受出发日期区间过滤）' : ''}。`,
         ]
+      : []),
+    // 找到了人、但出发日不在区间 → 该改的是日期区间，不是姓名
+    ...(selection.excludedByDateNames.length
+      ? [
+          '',
+          '⚠ 以下姓名找到了客人，但订单出发日期不在所选区间，未导出（要导出请改日期区间）：',
+          ...selection.excludedByDateNames.map((n) => `  · ${n}`),
+        ]
+      : []),
+    // 真·查无此人 → 该改的是姓名
+    ...(selection.notFoundNames.length
+      ? ['', '⚠ 以下姓名未找到任何客人（姓名可能写错，或该客人还没录单）：', ...selection.notFoundNames.map((n) => `  · ${n}`)]
       : []),
   ].join('\n');
   zip.file('README.txt', readme);
