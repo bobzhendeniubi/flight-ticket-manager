@@ -123,6 +123,9 @@ export const updateScheduleBodySchema = z
     // 航司改点：ISO datetime 字符串（本地时间带时区或 UTC）
     departureTime: z.string().datetime().optional(),
     arrivalTime: z.string().datetime().optional(),
+    // A11 二次确认：已售班次改时刻影响存量订单（客人通知/签证/酒店/已导名单），
+    // 必须显式带上此标志才放行；缺省 false → 已售班次改点被 400 拦下并回报影响面。
+    confirmSoldTimeChange: z.boolean().optional(),
     seatClasses: z
       .array(
         z.object({

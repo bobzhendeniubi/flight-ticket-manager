@@ -279,6 +279,17 @@ export function SeatAllocationPage() {
         </p>
       </section>
 
+      {/* ⚠ 切位新建已暂停：切位未接入公共库存，切出的座散客仍可购买（专卖不专），
+          在补齐库存联动前禁止新建，避免运营依赖不成立的库存承诺。列表/回收仍可用于清理存量。 */}
+      <section className="card border-amber-300 bg-amber-50">
+        <p className="text-sm text-amber-800">
+          ⚠ <b>切位新建已暂停。</b>{' '}
+          当前切位<b>未接入公共库存</b>：切给代理的座位，散客在前台/下单时<b>仍可照常买走</b>
+          （"专卖"并不真正独占）。为避免超卖，已暂停新建切位；已存在的切位<b>仅供查看与回收</b>，
+          请勿依赖其余量数字。待库存联动补齐后再重新开放。
+        </p>
+      </section>
+
       {/* 班次选择：拆分为 出发日期 + 航班号 + 班次时刻（切位以单程班次为单位，无返程维度） */}
       <section className="card">
         <div className="grid gap-3 md:grid-cols-[1fr_1fr_1fr_auto]">
@@ -330,13 +341,19 @@ export function SeatAllocationPage() {
             <button className="btn-secondary text-sm" onClick={recycleExpired} disabled={busy}>
               一键回收过期切位
             </button>
-            <button className="btn-secondary text-sm" onClick={() => setShowBulk(true)} disabled={busy}>
+            <button
+              className="btn-secondary text-sm"
+              onClick={() => setShowBulk(true)}
+              disabled
+              title="切位新建已暂停（未接入公共库存，切出的座散客仍可购买）"
+            >
               📦 批量切位
             </button>
             <button
               className="btn-primary text-sm"
               onClick={() => setShowForm(true)}
-              disabled={busy || !selected}
+              disabled
+              title="切位新建已暂停（未接入公共库存，切出的座散客仍可购买）"
             >
               + 新建切位
             </button>

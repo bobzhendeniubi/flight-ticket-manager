@@ -1904,6 +1904,8 @@ export const api = {
       /** 改时刻：ISO datetime 字符串（本地时间带时区或 UTC） */
       departureTime?: string;
       arrivalTime?: string;
+      /** A11：已售班次改时刻的二次确认标志——首次调用被 400 拦下后，确认再带 true 重试。 */
+      confirmSoldTimeChange?: boolean;
       // fareBuckets：数组=设阶梯；null 或 [] = 清除阶梯（恢复自动定价）；
       // 单独传 fareBuckets 即为有效修改（无需同时传 basePrice/capacity）。
       seatClasses?: Array<{
@@ -2083,7 +2085,7 @@ export const api = {
     itemId: string,
     body: { unitPriceCny: number; reason?: string },
   ) =>
-    apiFetch<{ order: OrderSummary }>(`/orders/${orderId}/items/${itemId}/settlement-price`, {
+    apiFetch<{ order: OrderSummary; warning?: string | null }>(`/orders/${orderId}/items/${itemId}/settlement-price`, {
       method: 'PATCH',
       token,
       body,
@@ -2286,9 +2288,9 @@ export const api = {
       `/orders/${orderId}/claim`,
       { method: 'POST', token, body: {} },
     ),
-  // 套票分房
+  // 套票分房（warnings：B10 金额分叉/混性别/多酒店行提示，弹给运营看，不阻断）
   updateRoomAssignment: (token: string, orderId: string, roomGroups: RoomGroup[]) =>
-    apiFetch<{ ok: boolean }>(`/orders/${orderId}/room-assignment`, {
+    apiFetch<{ ok: boolean; warnings?: string[] }>(`/orders/${orderId}/room-assignment`, {
       method: 'PUT',
       token,
       body: { roomGroups },
@@ -2412,9 +2414,17 @@ export const api = {
   addRoomSupplement: (
     token: string,
     orderId: string,
-    body: { perNightCny: number; nights: number; note?: string },
+    body: {
+      perNightCny: number;
+      nights: number;
+      note?: string;
+      /** 幂等键：同 key 重试只入账一次（防双击/超时重发叠加多条 FEE 行）。 */
+      idempotencyKey?: string;
+      /** 转单住的乘客（A15 房控联动）：同事务标记 singleRoom + 重算套餐行计费房数。 */
+      passengerId?: string;
+    },
   ) =>
-    apiFetch<{ order: OrderSummary }>(`/orders/${orderId}/room-supplement`, {
+    apiFetch<{ order: OrderSummary; roomControl: string | null }>(`/orders/${orderId}/room-supplement`, {
       method: 'POST',
       token,
       body,
@@ -2741,26 +2751,23 @@ export const api = {
         | { status: 'no_flights' };
     }>(`/fulfillment-tasks/by-order/${orderId}/resend-itinerary`, { method: 'POST', token }),
 
-  // Pricing — 日期等级
-  listDateRankings: (token: string, from: string, to: string) =>
+  // 佣金规则（A1）：读=当前生效费率（每产品一条）；写=仅 ADMIN，追加新生效规则（历史保留）
+  getCommissionRules: (token: string, agentId: string) =>
     apiFetch<{
-      rankings: Array<{
-        date: string;
-        rank: 'A' | 'B' | 'C' | 'D';
-        reason: string | null;
-        isManual: boolean;
-        source: 'db' | 'default';
-      }>;
-    }>(`/pricing/date-rankings?from=${from}&to=${to}`, { token }),
-  overrideDateRanking: (
+      rules: Record<'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA', { rate: number; effectiveFrom: string } | null>;
+    }>(`/agents/${agentId}/commission-rules`, { token }),
+  setCommissionRules: (
     token: string,
-    date: string,
-    body: { rank: 'A' | 'B' | 'C' | 'D'; reason?: string },
-  ) => apiFetch<{ ranking: unknown }>(`/pricing/date-rankings/${date}`, {
-    method: 'PATCH', token, body,
-  }),
-  resetDateRanking: (token: string, date: string) =>
-    apiFetch<{ ok: boolean }>(`/pricing/date-rankings/${date}`, { method: 'DELETE', token }),
+    agentId: string,
+    rates: Partial<Record<'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA', number>>,
+  ) =>
+    apiFetch<{ ok: boolean; rates: Record<string, number>; effectiveFrom: string }>(
+      `/agents/${agentId}/commission-rules`,
+      { method: 'PUT', token, body: { rates } },
+    ),
+
+  // Pricing — 日期等级 CRUD 已砍除（2026-07-17 审计 #19）：定价不消费其倍率、无后台页面调用，
+  // 端点与 client 一并移除；DateRanking 表保留（getDateRank 只读路径仍在，查不到走 DOW 兜底）。
 
   // Cancellation policies
   listCancellationPolicies: (token: string) =>
@@ -3139,10 +3146,10 @@ export interface FinanceSummary {
   range: { from: string; to: string };
   revenueCny: number;
   costCny: number;
-  grossMarginCny: number;
+  grossMarginCny: number | null; // A5：缺成本时 null（未知）
   marginPct: number | null;
   emptySeatSunkCostCny: number;
-  netMarginCny: number;
+  netMarginCny: number | null; // A5：毛利未知时 null
   orderCount: number;
   missingCostItemCount: number;
   categories: CategoryBreakdown[];
@@ -3256,6 +3263,11 @@ export interface CostPeriodWriteInput {
   peakSurchargeCny?: number | null;
   aircraftAdjustCny?: number | null;
   takeoffDiscountCny?: number | null;
+  /** A2 汇率四元组（选填）：包机原币种/原币金额/汇率/折算日 —— 审计留痕，CNY 仍是入账口径 */
+  charterSourceCurrency?: string | null;
+  charterSourceAmount?: number | null;
+  charterFxRate?: number | null;
+  charterFxDate?: string | null;
   note?: string | null;
 }
 

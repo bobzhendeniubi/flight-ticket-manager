@@ -2,15 +2,21 @@
  * 套餐房间数（roomsNeeded）前台镜像 —— 与后端 orders.service.computeRoomsNeeded 一一对应。
  *
  * 业务口径（verbatim）：「选的人数一间房坐不下时，自动加房、加的房按房价收钱；
- * 房间数按房型能住几大人几小孩算。」
+ * 房间数按房型能住几大人几小孩算。」外加「选了单人入住的人，每人自己独占一间」。
  *
- *   roomsNeeded = max( ceil(成人 / maxAdults), ceil(占座儿童 / maxChildren), 1 )
+ *   soloRooms   = clamp(singleCount, 0, 成人数)          // 独住者每人 1 间
+ *   sharedAdults= 成人数 − soloRooms                      // 其余成人才参与拼间
+ *   roomsNeeded = max( soloRooms + max( ceil(sharedAdults / maxAdults),
+ *                                       ceil(占座儿童 / maxChildren) ), 1 )
  *
  * - 婴儿不占床 → 不参与计算。
  * - 套餐没绑房型 / 容量缺失 → 回退默认 2 大 1 小（DEFAULT_ROOM_MAX_*）。
- * - maxChildren=0 且有占座儿童时：把儿童并入成人维度 ceil((成人+儿童)/maxAdults)（避免除 0）。
- * - 单人入住（singleCount）是独立自愿加价项，**不**计入 roomsNeeded —— 容量驱动房间数，
- *   单人入住是另算的 opt-in 房差。
+ * - maxChildren=0 且有占座儿童时：把儿童并入成人维度 ceil((sharedAdults+儿童)/maxAdults)（避免除 0）。
+ * - singleCount 缺省 0 → 与未加该维度前完全一致（拼房单/普通多人单零影响）。
+ *
+ * ⚠ 必须与后端 orders.service.computeRoomsNeeded 逐行一致：后端已把「独住者各占一间」计入
+ *   权威房数（2 成人都勾单住 = 2 间）。前台若仍算 1 间，展示价与后端实收分叉，checkout 带
+ *   expectedTotalCny 会被后端判 PRICE_CHANGED 拒单。单人入住房差仍是独立加价项，不重复计价。
  *
  * 仅作展示与价格镜像；下单时服务端 computeRoomsNeeded 重算为权威值。
  */
@@ -40,25 +46,33 @@ export function resolveRoomCapacity(capacity: RoomCapacity | null | undefined): 
 
 /**
  * 按房型容量算所需房间数。镜像 backend orders.service.computeRoomsNeeded（逐行对应）。
- * @param adultCount 成人（占座）
- * @param childCount 占座儿童
- * @param capacity   套餐关联房型容量（null/缺省 → 兜底 2 大 1 小）
+ * @param adultCount  成人（占座）
+ * @param childCount  占座儿童
+ * @param capacity    套餐关联房型容量（null/缺省 → 兜底 2 大 1 小）
+ * @param singleCount 单人独住份数（各占一间；缺省 0）。夹到 [0, 成人数]。
  */
 export function computeRoomsNeeded(
   adultCount: number,
   childCount: number,
   capacity: RoomCapacity | null | undefined,
+  singleCount = 0,
 ): number {
   const { maxAdults, maxChildren } = resolveRoomCapacity(capacity);
   const adults = Math.max(0, adultCount);
   const children = Math.max(0, childCount);
+  // 独住人数夹到 [0, 成人数]：单人入住是成人维度的选项，不能超过成人数、也不能为负。
+  const soloRooms = Math.min(Math.max(0, Math.trunc(singleCount)), adults);
+  const sharedAdults = adults - soloRooms;
 
-  const adultRooms = Math.ceil(adults / maxAdults);
+  const adultRooms = Math.ceil(sharedAdults / maxAdults);
   // maxChildren=0 → 该房型不单独承载儿童；把儿童并入成人维度（lone-child packing edge case）。
   const childRooms =
-    maxChildren > 0 ? Math.ceil(children / maxChildren) : Math.ceil((adults + children) / maxAdults);
+    maxChildren > 0
+      ? Math.ceil(children / maxChildren)
+      : Math.ceil((sharedAdults + children) / maxAdults);
 
-  return Math.max(adultRooms, childRooms, 1);
+  // 独住间与「其余人拼出来的间」相加；整单至少 1 间（0 成人 0 儿童兜底）。
+  return Math.max(soloRooms + Math.max(adultRooms, childRooms), 1);
 }
 
 // ── SOLO 拼房 / 独住（半间口径）─────────────────────────────────────────────

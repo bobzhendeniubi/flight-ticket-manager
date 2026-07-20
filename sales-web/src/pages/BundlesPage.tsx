@@ -608,15 +608,16 @@ function ConfigurableBundleCard({
   //   headCount= 成人 + 占座儿童 + 不占座婴儿（出行人总数，都要护照）
   const seatPax = adultCount + childCount;
   const headCount = adultCount + childCount + infantCount;
+  // 单人入住份数（升级 add-on；默认 0；范围 0..seatPax — 婴儿不占座、不能升舱/不算单人入住房）。
+  // 单人预订时 singleCount 同时充当「拼房(0) / 独住(1)」开关（默认拼房）。
+  // 声明在 baseRooms 之前：独住者各占一间要计入 computeRoomsNeeded（与后端一致，否则被 PRICE_CHANGED 拒单）。
+  const [singleCount, setSingleCount] = useState(0); // 一个人住酒店（单人入住 / 独住）
   // 房间数按关联房型容量算（镜像后端 computeRoomsNeeded）：一间坐不下就自动加房，
-  // 加的房按房价收钱。容量缺失/未绑房型 → 兜底 2 大 1 小。婴儿不占床、单人入住独立不计入。
+  // 加的房按房价收钱。容量缺失/未绑房型 → 兜底 2 大 1 小。婴儿不占床。独住者（singleCount）各占一间、计入房数。
   const roomCapacity = resolveRoomCapacity(b.hotelRoomType);
-  const baseRooms = computeRoomsNeeded(adultCount, childCount, b.hotelRoomType);
+  const baseRooms = computeRoomsNeeded(adultCount, childCount, b.hotelRoomType, singleCount);
   // 单人预订（1 成人、0 儿童）：默认拼房（与同行客共一间双人房，只占半间）。
   const isSolo = isSoloOccupancy(adultCount, childCount);
-  // 可选升级 add-on（默认 0；范围 0..seatPax — 婴儿不占座、不能升舱/不算单人入住房）。
-  // 单人预订时 singleCount 同时充当「拼房(0) / 独住(1)」开关（默认拼房）。
-  const [singleCount, setSingleCount] = useState(0); // 一个人住酒店（单人入住 / 独住）
   const [businessCount, setBusinessCount] = useState(0); // 升级商务舱
 
   // 日期输入框 ref：售罄时"看看其它日期"聚焦并弹出原生日期选择器（不暴露原始库存）。

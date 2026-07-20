@@ -36,6 +36,8 @@ interface OrderFinanceSectionProps {
   orderId: string;
   initialExpectedAmountCny: string | null | undefined;
   initialExpectedAmountLocked: boolean | undefined;
+  /** 权威应付（= total + adjustmentCny）——B20 差额展示用；不传则不显示差额提示。 */
+  payableCny?: number | null;
   /** 任一字段保存成功后调一次，父级可借此刷新订单列表/详情。 */
   onChanged?: () => void;
 }
@@ -44,6 +46,7 @@ export function OrderFinanceSection({
   orderId,
   initialExpectedAmountCny,
   initialExpectedAmountLocked,
+  payableCny,
   onChanged,
 }: OrderFinanceSectionProps) {
   const user = useAuth((s) => s.user);
@@ -62,6 +65,7 @@ export function OrderFinanceSection({
         isAdmin={role === 'ADMIN'}
         initialAmountCny={initialExpectedAmountCny}
         initialLocked={initialExpectedAmountLocked}
+        payableCny={payableCny}
         onChanged={onChanged}
       />
       <CostItemsCard token={token} orderId={orderId} onChanged={onChanged} />
@@ -76,6 +80,7 @@ function ExpectedAmountCard({
   isAdmin,
   initialAmountCny,
   initialLocked,
+  payableCny,
   onChanged,
 }: {
   token: string;
@@ -83,6 +88,7 @@ function ExpectedAmountCard({
   isAdmin: boolean;
   initialAmountCny: string | null | undefined;
   initialLocked: boolean | undefined;
+  payableCny?: number | null;
   onChanged?: () => void;
 }) {
   const parseAmt = (v: string | number | null | undefined): number | null => {
@@ -227,6 +233,21 @@ function ExpectedAmountCard({
 
         {ok && <span className="text-xs font-medium text-emerald-700">{ok}</span>}
       </div>
+
+      {/* B20 差额展示（非阻断）：预期到账是出纳手账，与权威应付允许不同（分次到账/售后调整/
+          预存抵扣都会造成差异）——但差多少必须看得见，不能两本账静默各走各的。 */}
+      {amount != null && payableCny != null && Math.abs(amount - payableCny) >= 0.01 && (
+        <div className="mt-2 rounded-lg border border-amber-200 bg-amber-50 px-2 py-1.5 text-xs text-amber-800">
+          与权威应付 <span className="nums font-semibold">¥{payableCny.toLocaleString()}</span> 相差{' '}
+          <span className="nums font-semibold">
+            {amount > payableCny ? '+' : '−'}¥{Math.abs(amount - payableCny).toLocaleString()}
+          </span>
+          ——两数允许不同（分次到账 / 售后调整 / 预存抵扣等），请确认差异原因。
+        </div>
+      )}
+      {amount != null && payableCny != null && Math.abs(amount - payableCny) < 0.01 && (
+        <p className="mt-2 text-xs text-emerald-700">✓ 与权威应付一致（¥{payableCny.toLocaleString()}）</p>
+      )}
 
       <p className="mt-2 text-xs text-ink-muted">
         出纳填客户应付到账金额；admin 锁定后非管理员无法修改。

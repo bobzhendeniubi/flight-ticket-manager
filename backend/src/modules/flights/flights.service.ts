@@ -682,6 +682,23 @@ export class FlightService {
       // 同航班号已有班次占用的那一天 → 拒绝，避免编辑绕过创建时的当天唯一性校验。
       // 用出发地时区把出发时间折成本地日比较（复用 createSchedule 的 localDate 折叠，避免 UTC 边界跨天误判）。
       // updateSchedule 不改时区，故沿用本班次现有 departureTz；仅当本地出发日实际改变才校验。
+      // ── A11 已售班次改点闸（2026-07-17）：时刻真实变化 && 已售 > 0 → 必须显式二次确认 ──
+      // 改点影响存量订单的客人通知/护照签证时点/酒店入住/已导出的航司名单，不能一改了之。
+      // 旧行为只写 WARNING 审计（留痕不是防线）；现改为：不带 confirmSoldTimeChange 一律拦下，
+      // 报文里带上已售座数让运营看清影响面，确认后放行（审计照记 WARNING）。
+      const timeActuallyChanged =
+        newDep.getTime() !== schedule.departureTime.getTime() ||
+        newArr.getTime() !== schedule.arrivalTime.getTime();
+      if (timeActuallyChanged) {
+        const soldTotal = schedule.seatClasses.reduce((sum, c) => sum + c.sold, 0);
+        if (soldTotal > 0 && body.confirmSoldTimeChange !== true) {
+          throw new BadRequestError(
+            `该班次已售 ${soldTotal} 座，改时刻将影响存量订单（客人通知/签证时点/酒店入住/已提交航司的名单）。` +
+              '请确认后重试（带确认标志）；改点后请逐项跟进：通知客人、复核护照/签证有效期、核对酒店入住日、重新导出航司名单。',
+          );
+        }
+      }
+
       const oldLocalDay = localDate(schedule.departureTime, schedule.departureTz);
       const newLocalDay = localDate(newDep, schedule.departureTz);
       if (newLocalDay !== oldLocalDay) {

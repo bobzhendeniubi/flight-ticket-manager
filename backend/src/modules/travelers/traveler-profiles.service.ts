@@ -144,6 +144,13 @@ function toProfileData(agg: TravelerAggregate, linkedUserId: string | null) {
   };
 }
 
+/** 证件号脱敏（前2后2）：E12345678 → E1*****78；过短(≤4)全打码。列表/导出用。 */
+function maskDocumentNumber(doc: string): string {
+  const d = (doc ?? '').trim();
+  if (d.length <= 4) return '*'.repeat(Math.max(d.length, 2));
+  return `${d.slice(0, 2)}${'*'.repeat(d.length - 4)}${d.slice(-2)}`;
+}
+
 export class TravelerProfilesService {
   /** 并发重建去重：同一时刻只跑一次全量重建 */
   private rebuildInFlight: Promise<{ built: number; removed: number }> | null = null;
@@ -151,8 +158,13 @@ export class TravelerProfilesService {
   async list(query: ListTravelerProfilesQuery) {
     await this.ensureFresh();
 
-    // 列表只出 canonical 行；被合并的指针行只做归拢，不再单独展示
-    const where: Prisma.TravelerProfileWhereInput = { mergedIntoId: null };
+    // 列表只出 canonical 行；被合并的指针行只做归拢，不再单独展示。
+    // 排除占位档案（N/A 证件）：纯酒店/接送单塞的占位出行人不是真人，重建后会被 prune，
+    // 这里再加一道防线，避免重建前的存量 N/A 档案在列表/导出里露出（聚合已不再产生新的）。
+    const where: Prisma.TravelerProfileWhereInput = {
+      mergedIntoId: null,
+      documentNumber: { not: 'N/A' },
+    };
     if (query.search) {
       where.OR = [
         { fullName: { contains: query.search, mode: 'insensitive' } },
@@ -188,7 +200,13 @@ export class TravelerProfilesService {
     ]);
 
     return {
-      profiles: rows.map(serializeProfile),
+      // N4（提案 §1.4 隐私口径，2026-07-17 收口）：列表/导出默认脱敏证件号（前2后2）。
+      // 前端 CSV 导出直接用列表数据 → 服务端一脱敏，导出自动是脱敏版，不再能批量导全号。
+      // 全号只在详情页（getDetail，逐人查看）与录单联想（suggest，定向回填）返回。
+      profiles: rows.map((r) => {
+        const p = serializeProfile(r);
+        return { ...p, documentNumber: maskDocumentNumber(p.documentNumber) };
+      }),
       pagination: { page: query.page, pageSize: query.pageSize, total },
       meta: {
         totalProfiles: stats._count._all,
@@ -318,6 +336,7 @@ export class TravelerProfilesService {
     const direct = await prisma.travelerProfile.findMany({
       where: {
         mergedIntoId: null,
+        documentNumber: { not: 'N/A' }, // 占位档案不进录单联想（避免把假人回填进新单）
         OR: [
           { documentNumber: { startsWith: q, mode: 'insensitive' } },
           { fullName: { startsWith: q, mode: 'insensitive' } },

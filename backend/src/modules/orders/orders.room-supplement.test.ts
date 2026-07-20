@@ -105,6 +105,8 @@ describe('OrderService.addRoomSupplement · 纯机票单拒绝（事务内早拦
   it('订单只含 FLIGHT 行 → BadRequestError，不新增 FEE 行', async () => {
     // 让 $transaction 就地执行回调，注入只含 FLIGHT 行的订单。
     const tx = {
+      // FOR UPDATE 行锁：事务开头执行，测试里 no-op。
+      $queryRaw: vi.fn().mockResolvedValue([]),
       order: {
         findUnique: vi.fn().mockResolvedValue({
           id: 'o1',
@@ -114,9 +116,10 @@ describe('OrderService.addRoomSupplement · 纯机票单拒绝（事务内早拦
           adjustments: [],
           items: [{ id: 'i1', kind: 'FLIGHT', amount: new Prisma.Decimal(1000) }],
         }),
+        findUniqueOrThrow: vi.fn(),
         update: vi.fn(),
       },
-      orderItem: { create: vi.fn() },
+      orderItem: { create: vi.fn(), findUnique: vi.fn() },
     };
     mockPrisma.$transaction.mockImplementation(async (fn: (t: typeof tx) => unknown) => fn(tx));
 

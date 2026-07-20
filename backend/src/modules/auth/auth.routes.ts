@@ -1,4 +1,5 @@
 import type { FastifyPluginAsync } from 'fastify';
+import { UserRole } from '@prisma/client';
 import { z } from 'zod';
 import {
   loginBodySchema,
@@ -21,14 +22,21 @@ const wechatLoginBodySchema = z.object({
 export const authRoutes: FastifyPluginAsync = async (app) => {
   const service = new AuthService(app);
 
-  app.post('/register', async (req, reply) => {
-    const body = registerBodySchema.parse(req.body);
-    const result = await service.register(body, {
-      userAgent: req.headers['user-agent'],
-      ipAddress: req.ip,
-    });
-    return reply.status(201).send(result);
-  });
+  // 客户账号由后台（销售/客服）开通，不开放匿名自助注册。
+  // 匿名 /register 会直接建 CUSTOMER 并发 token —— 前端虽已把注册页重定向到登录，
+  // 后端裸开=UI 伪装而非权限。游客可免登录下单，正式账号走此受控入口或 /wechat 微信登录。
+  app.post(
+    '/register',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    async (req, reply) => {
+      const body = registerBodySchema.parse(req.body);
+      const result = await service.register(body, {
+        userAgent: req.headers['user-agent'],
+        ipAddress: req.ip,
+      });
+      return reply.status(201).send(result);
+    },
+  );
 
   app.post(
     '/login',

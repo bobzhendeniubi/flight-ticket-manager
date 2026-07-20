@@ -494,6 +494,13 @@ model FlightSchedule {
   arrivalTz          String
   // 包机总成本（CNY）— 整班次付给航司的包机价；按"卖出座位 / 总成本"算单座分摊
   charterCostCny     Decimal? @db.Decimal(12, 2)
+  // 包机成本汇率四元组（A2，2026-07-17 拍板：可空，审计留痕用）——
+  // 财务口径：包机常以外币（USD/VND/MOP）实付，charterCostCny 只是人脑折算后的死数，
+  // 复核时查不到「按哪天哪个汇率折的」。四字段把折算依据留下来；最终入账额仍以 CNY 字段为准。
+  charterSourceCurrency String?  @db.VarChar(3) // ISO 4217，如 USD/VND/MOP
+  charterSourceAmount   Decimal? @db.Decimal(14, 2) // 原币金额
+  charterFxRate         Decimal? @db.Decimal(12, 6) // 折算汇率（原币→CNY）
+  charterFxDate         DateTime? @db.Date // 折算/付款日
   // 机场税（CNY/人）— 出发地 / 目的地分开（岘港、澳门税率不同）
   airportTaxDepCny   Decimal? @db.Decimal(10, 2)
   airportTaxArrCny   Decimal? @db.Decimal(10, 2)
@@ -642,6 +649,11 @@ model FlightCostPeriod {
   effectiveTo        DateTime @db.Date
   // 周期默认成本（CNY；任一为 null 表示该字段不通过 period 提供，由班次 override 或留空）
   charterCostCny     Decimal? @db.Decimal(12, 2)
+  // 包机成本汇率四元组（A2；同 FlightSchedule，可空审计留痕）
+  charterSourceCurrency String?  @db.VarChar(3)
+  charterSourceAmount   Decimal? @db.Decimal(14, 2)
+  charterFxRate         Decimal? @db.Decimal(12, 6)
+  charterFxDate         DateTime? @db.Date
   airportTaxDepCny   Decimal? @db.Decimal(10, 2)
   airportTaxArrCny   Decimal? @db.Decimal(10, 2)
   // 财务追加成本（per-pax CNY；同 FlightSchedule）
@@ -1094,6 +1106,8 @@ model OrderItem {
   // 计费/占房间数（允许 0.5，用于拼房：7 人 3.5 间、1 人占半间）。
   // NULL = 老数据/未显式分房 → 房控按容量算法或 metadata.roomsNeeded 回落。
   roomsBilled      Decimal?      @db.Decimal(4, 1)
+  // 幂等键（仅补房差等事后追加 FEE 行用）：同 key 重试只入账一次，防双击/网络重发叠加多条 FEE。
+  idempotencyKey   String?       @unique
   createdAt        DateTime      @default(now())
 
   order            Order             @relation(fields: [orderId], references: [id], onDelete: Cascade)

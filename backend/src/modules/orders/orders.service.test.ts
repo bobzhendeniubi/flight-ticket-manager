@@ -429,16 +429,16 @@ describe('OrderService 重复乘客校验', () => {
     ).rejects.toThrow(/G88888888.*FTM-TEST-009/);
   });
 
-  it('batchCreateOrders：不传 contactName/contactPhone → 录入人=登录账号（displayName 落 contactName）', async () => {
+  it('batchCreateOrders：不传 contactName → 联系人=本单乘客本人（B9：不再冒充录单员）', async () => {
     // 无重复 → 进入逐单建单
     mockPrisma.passenger.findMany.mockResolvedValue([]);
-    // 登录用户：录入人 = 王操作（displayName）
+    // 登录用户：录入人 = 王操作（displayName）——只作电话兜底，不再落 contactName
     mockPrisma.user.findUnique.mockResolvedValue({
       displayName: '王操作',
       email: 'op@example.com',
       phone: '13900000000',
     });
-    // 隔离 createOrder：只断言传入的 contact 是登录账号，不跑真事务
+    // 隔离 createOrder：断言子单联系人是乘客本人（每人一单，「联系人」回答的是找哪个客人）
     const createSpy = vi
       .spyOn(service, 'createOrder')
       .mockResolvedValue({ id: 'ord-1', orderNumber: 'FTM-001' } as never);
@@ -458,9 +458,9 @@ describe('OrderService 重复乘客校验', () => {
       where: { id: 'u1' },
       select: { displayName: true, email: true, phone: true },
     });
-    // 录入人即登录账号：contactName=displayName，contactPhone=登录账号 phone
+    // B9 口径：contactName=本单乘客姓名；contactPhone 系统不采集乘客电话 → 录入人电话兜底
     expect(createSpy).toHaveBeenCalledWith(
-      expect.objectContaining({ contactName: '王操作', contactPhone: '13900000000' }),
+      expect.objectContaining({ contactName: '张三', contactPhone: '13900000000' }),
       { userId: 'u1', role: 'STAFF' },
     );
     expect(result.successCount).toBe(1);

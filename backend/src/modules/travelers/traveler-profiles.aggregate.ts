@@ -118,6 +118,17 @@ export function docKey(documentType: DocumentType, documentNumber: string): stri
 }
 
 /**
+ * 占位出行人：纯酒店/接送单无真实乘机人时，前端会塞一位 documentNumber='N/A' 的占位行
+ * （见 admin-web SingleOrderModal）。这不是真人，绝不能进画像聚合——否则不同客户的占位行
+ * 会按同一个 'N/A' 证件 key 串成一个假人，把各自的消费/姓名/同行关系全聚到一起。
+ * 空证件号同理无法作为人键，一并排除。
+ */
+export function isPlaceholderTraveler(documentNumber: string | null | undefined): boolean {
+  const n = (documentNumber ?? '').trim().toUpperCase();
+  return n === '' || n === 'N/A';
+}
+
+/**
  * 别名解析：docKey → 最终主档案 docKey。
  * service 层构建 aliasMap 时已解析到最终主档案，但这里仍按链循环跟随并防环 ——
  * 数据上不该有链/环，健壮性兜底（脏数据只会归拢不全，不会死循环）。
@@ -216,6 +227,8 @@ export function buildTravelerAggregates(
     // 同单同证件号去重（强录回补会出现重复）；canonical 后同 key 也视为重复（旧证+新证同录一单）
     const seen = new Set<string>();
     const uniquePassengers = order.passengers.filter((p) => {
+      // 占位出行人（N/A / 空证件号）不进画像：既不建档案，也不算别人的同行人（下方同行人遍历同一数组）。
+      if (isPlaceholderTraveler(p.documentNumber)) return false;
       const k = resolveCanonical(docKey(p.documentType, p.documentNumber), aliasMap);
       if (seen.has(k)) return false;
       seen.add(k);

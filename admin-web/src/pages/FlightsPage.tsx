@@ -1336,10 +1336,24 @@ function DaySchedule({
     try {
       // datetime-local 值形如 "2026-07-01T10:30"，附加系统时区偏移后传给后端。
       const toIso = (local: string) => new Date(local).toISOString();
-      await api.updateSchedule(tokens.accessToken, schedule.id, {
-        departureTime: toIso(timeDep),
-        arrivalTime: toIso(timeArr),
-      });
+      const body = { departureTime: toIso(timeDep), arrivalTime: toIso(timeArr) };
+      try {
+        await api.updateSchedule(tokens.accessToken, schedule.id, body);
+      } catch (e) {
+        // A11：已售班次改点被后端拦下（400 报文含影响面）→ 弹确认，确认后带标志重试。
+        if (e instanceof ApiError && e.message.includes('已售') && e.message.includes('改时刻')) {
+          if (!window.confirm(`${e.message}\n\n确认仍要修改时刻？`)) {
+            setTimeSaving(false);
+            return;
+          }
+          await api.updateSchedule(tokens.accessToken, schedule.id, {
+            ...body,
+            confirmSoldTimeChange: true,
+          });
+        } else {
+          throw e;
+        }
+      }
       setTimeMsg('✅ 时刻已更新');
       setShowTimeEdit(false);
       await onSaved();

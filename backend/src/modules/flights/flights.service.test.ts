@@ -800,6 +800,7 @@ describe('FlightService.updateSchedule · 改点当天唯一性', () => {
       service.updateSchedule('sched_1', {
         departureTime: '2026-07-05T09:00:00.000Z',
         arrivalTime: '2026-07-05T12:00:00.000Z',
+        confirmSoldTimeChange: true, // fixture sold=30：先过 A11 已售确认闸，聚焦唯一性断言
       }),
     ).rejects.toMatchObject({
       statusCode: 400,
@@ -828,6 +829,7 @@ describe('FlightService.updateSchedule · 改点当天唯一性', () => {
     const result = await service.updateSchedule('sched_1', {
       departureTime: '2026-07-06T09:00:00.000Z',
       arrivalTime: '2026-07-06T12:00:00.000Z',
+      confirmSoldTimeChange: true, // fixture sold=30：先过 A11 已售确认闸
     });
     expect(result.departureTime).toBe('2026-07-06T09:00:00.000Z');
     expect(prismaMock.flightSchedule.update).toHaveBeenCalled();
@@ -843,6 +845,7 @@ describe('FlightService.updateSchedule · 改点当天唯一性', () => {
     await service.updateSchedule('sched_1', {
       departureTime: '2026-07-01T06:00:00.000Z',
       arrivalTime: '2026-07-01T09:00:00.000Z',
+      confirmSoldTimeChange: true, // fixture sold=30：先过 A11 已售确认闸
     });
     // 本地日未变（都是 2026-07-01）→ 不查同航班号当天班次
     expect(prismaMock.flightSchedule.findMany).not.toHaveBeenCalled();
@@ -860,6 +863,37 @@ describe('FlightService.updateSchedule · 改点当天唯一性', () => {
     });
     expect(prismaMock.flightSchedule.findMany).not.toHaveBeenCalled();
     expect(prismaMock.flightSeatClass.update).toHaveBeenCalled();
+  });
+
+  // ── A11 已售班次改点闸（2026-07-17）：sold>0 改时刻必须显式确认 ──
+  it('已售班次改时刻、未带确认标志 → 400 拦下（报文含已售座数），不写库', async () => {
+    prismaMock.flightSchedule.findUnique.mockResolvedValue(baseSchedule());
+
+    await expect(
+      service.updateSchedule('sched_1', {
+        departureTime: '2026-07-01T06:00:00.000Z',
+        arrivalTime: '2026-07-01T09:00:00.000Z',
+      }),
+    ).rejects.toMatchObject({ statusCode: 400, message: expect.stringContaining('已售 30 座') });
+    expect(prismaMock.flightSchedule.update).not.toHaveBeenCalled();
+  });
+
+  it('零已售班次改时刻 → 无需确认标志直接放行', async () => {
+    const fresh = baseSchedule();
+    fresh.seatClasses = [
+      { id: 'sc_eco', cabin: 'ECONOMY', capacity: 200, sold: 0, basePrice: decimal(3000) },
+    ];
+    prismaMock.flightSchedule.findUnique.mockResolvedValue(fresh);
+    const after = baseSchedule();
+    after.departureTime = new Date('2026-07-01T06:00:00.000Z');
+    after.arrivalTime = new Date('2026-07-01T09:00:00.000Z');
+    prismaMock.flightSchedule.findUniqueOrThrow.mockResolvedValue(after);
+
+    await service.updateSchedule('sched_1', {
+      departureTime: '2026-07-01T06:00:00.000Z',
+      arrivalTime: '2026-07-01T09:00:00.000Z',
+    });
+    expect(prismaMock.flightSchedule.update).toHaveBeenCalled();
   });
 });
 

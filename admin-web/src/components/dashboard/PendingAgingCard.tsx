@@ -8,10 +8,12 @@
  *   这里把账龄摊开成四档，并单独标出「无支付时限」的单，点开就能看到是谁的单、
  *   哪天出发、冻了几个座。
  *
- * 只做「看得见」：不回收、不退位、不改任何订单。释放机位仍走订单页人工操作。
+ * A12（2026-07-17）：从「只看得见」升级为「看得见 + 一键处置」——下钻明细可勾选订单
+ * 批量取消（走状态机 PENDING_PAYMENT→CANCELLED，自动还座）。仍是人工决策：
+ * 录单单永不自动过期是拍板口径（"肯定要飞"），这里只是把人工释放从翻订单列表缩短成一次勾选。
  */
 import { useCallback, useEffect, useState } from 'react';
-import { apiFetch, ApiError } from '../../lib/api';
+import { api, apiFetch, ApiError } from '../../lib/api';
 import { useAuth } from '../../stores/auth';
 
 type PendingAgingBucket = 'LT_24H' | 'D1_3' | 'D3_7' | 'GT_7D';
@@ -141,6 +143,55 @@ export function PendingAgingCard() {
 
   function toggleBucket(bucket: PendingAgingBucket) {
     setOpenBucket((cur) => (cur === bucket ? null : bucket));
+    setSelected(new Set()); // 切档清空勾选，避免跨档误操作
+    setReleaseMsg(null);
+  }
+
+  // ── A12 一键处置：勾选 → 批量取消（状态机自动还座）──
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [releasing, setReleasing] = useState(false);
+  const [releaseMsg, setReleaseMsg] = useState<string | null>(null);
+
+  const toggleRow = (id: string) =>
+    setSelected((cur) => {
+      const next = new Set(cur);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+
+  async function releaseSelected() {
+    if (!token || releasing || selected.size === 0) return;
+    const totalSeats = rows.filter((r) => selected.has(r.id)).reduce((sum, r) => sum + r.seats, 0);
+    if (
+      !window.confirm(
+        `确认取消所选 ${selected.size} 单（释放约 ${totalSeats} 个机位）？\n\n` +
+          '订单将转为「已取消」，座位自动归还销售；此操作不可批量撤销（可逐单拉回待支付）。',
+      )
+    ) {
+      return;
+    }
+    setReleasing(true);
+    setReleaseMsg(null);
+    try {
+      const res = await api.batchUpdateOrderStatus(
+        token,
+        [...selected],
+        'CANCELLED',
+        '账龄处置：人工释放机位（待支付超期）',
+      );
+      setReleaseMsg(
+        res.failureCount > 0
+          ? `⚠️ 已取消 ${res.successCount} 单，失败 ${res.failureCount} 单（${res.results.find((r) => !r.success)?.error ?? ''}）`
+          : `✅ 已取消 ${res.successCount} 单，机位已归还销售`,
+      );
+      setSelected(new Set());
+      if (openBucket) loadRows(openBucket, noClockOnly); // 重拉明细与汇总
+    } catch (e) {
+      setReleaseMsg(e instanceof ApiError ? e.message : '批量取消失败');
+    } finally {
+      setReleasing(false);
+    }
   }
 
   return (
@@ -205,16 +256,32 @@ export function PendingAgingCard() {
                 {rowsTotal > DRILL_PAGE_SIZE && ` · 只显示最久的 ${DRILL_PAGE_SIZE} 单`}
               </span>
             </h3>
-            <label className="flex cursor-pointer items-center gap-2 text-xs text-ink-soft">
-              <input
-                type="checkbox"
-                checked={noClockOnly}
-                onChange={(e) => setNoClockOnly(e.target.checked)}
-                className="rounded border-slate-300"
-              />
-              只看无支付时限的单
-            </label>
+            <div className="flex flex-wrap items-center gap-3">
+              <label className="flex cursor-pointer items-center gap-2 text-xs text-ink-soft">
+                <input
+                  type="checkbox"
+                  checked={noClockOnly}
+                  onChange={(e) => setNoClockOnly(e.target.checked)}
+                  className="rounded border-slate-300"
+                />
+                只看无支付时限的单
+              </label>
+              <button
+                type="button"
+                className="btn-secondary text-xs disabled:opacity-50"
+                onClick={releaseSelected}
+                disabled={releasing || selected.size === 0}
+                title="取消所选待支付订单，座位自动归还销售（状态机保护，可逐单拉回）"
+              >
+                {releasing ? '释放中…' : `释放所选机位（${selected.size}）`}
+              </button>
+            </div>
           </div>
+          {releaseMsg && (
+            <div className="mt-2 rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs text-ink">
+              {releaseMsg}
+            </div>
+          )}
 
           {rowsError && (
             <div className="mt-3 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
@@ -226,6 +293,17 @@ export function PendingAgingCard() {
             <table className="table-admin">
               <thead>
                 <tr>
+                  <th className="w-8">
+                    <input
+                      type="checkbox"
+                      className="rounded border-slate-300"
+                      checked={rows.length > 0 && selected.size === rows.length}
+                      onChange={(e) =>
+                        setSelected(e.target.checked ? new Set(rows.map((r) => r.id)) : new Set())
+                      }
+                      title="全选当前页"
+                    />
+                  </th>
                   <th className="text-left">订单号</th>
                   <th className="text-left">代理</th>
                   <th className="text-left">联系人</th>
@@ -238,6 +316,14 @@ export function PendingAgingCard() {
               <tbody>
                 {rows.map((r) => (
                   <tr key={r.id}>
+                    <td>
+                      <input
+                        type="checkbox"
+                        className="rounded border-slate-300"
+                        checked={selected.has(r.id)}
+                        onChange={() => toggleRow(r.id)}
+                      />
+                    </td>
                     <td className="font-mono text-xs text-ink-soft">{r.orderNumber}</td>
                     <td className="text-ink">
                       {r.agentName ?? <span className="text-ink-muted">直客</span>}
@@ -259,14 +345,14 @@ export function PendingAgingCard() {
                 ))}
                 {rowsLoading && (
                   <tr>
-                    <td colSpan={7} className="py-8 text-center text-ink-muted">
+                    <td colSpan={8} className="py-8 text-center text-ink-muted">
                       加载中…
                     </td>
                   </tr>
                 )}
                 {!rowsLoading && rows.length === 0 && !rowsError && (
                   <tr>
-                    <td colSpan={7} className="py-8 text-center text-ink-muted">
+                    <td colSpan={8} className="py-8 text-center text-ink-muted">
                       这一档没有待支付订单
                     </td>
                   </tr>

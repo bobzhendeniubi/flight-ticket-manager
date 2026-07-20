@@ -670,25 +670,156 @@ function SettlementModeCard({
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 佣金规则
+// 佣金规则（A1，2026-07-17 上线管理端读写）
 // ───────────────────────────────────────────────────────────────
-// 后端 CommissionRule 模型（按 agentId + productKind 存费率）已存在并驱动实际结算，
-// 但目前没有管理端 API 读取/编辑它。此 tab 在该 API 上线前只做诚实占位，
-// 不展示编造的费率表或下级列表。
+// 读：当前生效费率（每产品一条，与计提口径一致）。写：仅 ADMIN，保存即追加
+// 新生效规则（历史保留，旧单不受影响）。无规则 = 计提按 0 —— 醒目标红，不再静默。
 // ═══════════════════════════════════════════════════════════════
 
+const COMMISSION_KIND_LABEL: Record<'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA', string> = {
+  FLIGHT: '机票',
+  HOTEL: '酒店',
+  TRANSFER: '接送',
+  VISA: '签证',
+};
+
 function CommissionTab({ agent }: { agent: AgentListItem }) {
-  const parentLabel = agent.tier === 1 ? '平台（世途旅行）' : `${agent.tier - 1} 级代理`;
+  const tokens = useAuth((s) => s.tokens);
+  const token = tokens?.accessToken ?? '';
+  const role = useAuth((s) => s.user?.role);
+  const canEdit = role === 'ADMIN';
+  type Kind = keyof typeof COMMISSION_KIND_LABEL;
+  const KINDS: Kind[] = ['FLIGHT', 'HOTEL', 'TRANSFER', 'VISA'];
+
+  const [rules, setRules] = useState<Record<Kind, { rate: number; effectiveFrom: string } | null> | null>(null);
+  // 编辑值以「百分数」呈现（5 = 5%），提交时 /100 —— 运营口径是百分比，别让人填 0.05。
+  const [draft, setDraft] = useState<Record<Kind, string>>({ FLIGHT: '', HOTEL: '', TRANSFER: '', VISA: '' });
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [ok, setOk] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    setLoading(true);
+    setErr(null);
+    api
+      .getCommissionRules(token, agent.id)
+      .then((r) => {
+        if (cancelled) return;
+        setRules(r.rules);
+        setDraft({
+          FLIGHT: r.rules.FLIGHT ? String(r.rules.FLIGHT.rate * 100) : '',
+          HOTEL: r.rules.HOTEL ? String(r.rules.HOTEL.rate * 100) : '',
+          TRANSFER: r.rules.TRANSFER ? String(r.rules.TRANSFER.rate * 100) : '',
+          VISA: r.rules.VISA ? String(r.rules.VISA.rate * 100) : '',
+        });
+      })
+      .catch((e) => {
+        if (!cancelled) setErr(e instanceof ApiError ? e.message : '加载佣金规则失败');
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [token, agent.id]);
+
+  const save = async () => {
+    if (!token || saving) return;
+    setErr(null);
+    setOk(null);
+    const rates: Partial<Record<Kind, number>> = {};
+    for (const k of KINDS) {
+      const v = draft[k].trim();
+      if (v === '') continue; // 留空 = 不改该产品
+      const pct = Number(v);
+      if (!Number.isFinite(pct) || pct < 0 || pct > 50) {
+        setErr(`${COMMISSION_KIND_LABEL[k]}费率需为 0–50 之间的百分数`);
+        return;
+      }
+      rates[k] = Math.round(pct * 100) / 10000; // 百分数 → 小数（保留 2 位百分比精度）
+    }
+    if (Object.keys(rates).length === 0) {
+      setErr('请至少填写一个产品的费率');
+      return;
+    }
+    if (!window.confirm('确认保存佣金费率？保存后立即对新计提生效（历史订单不回溯），并记入审计。')) return;
+    setSaving(true);
+    try {
+      await api.setCommissionRules(token, agent.id, rates);
+      const r = await api.getCommissionRules(token, agent.id);
+      setRules(r.rules);
+      setOk('已保存，新费率立即生效');
+      window.setTimeout(() => setOk(null), 2500);
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : '保存失败');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (loading) return <div className="py-6 text-center text-sm text-slate-400">加载中…</div>;
 
   return (
     <div className="space-y-4">
-      <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2.5 text-sm text-amber-800">
-        佣金规则查看/编辑暂未开通此管理端入口。本级佣金率由「{parentLabel}」在系统中配置并用于实际结算，
-        如需调整请走线下流程，待 GET/PATCH /agents/:id/commission-rules 接口上线后在此处提供。
-      </div>
-      <div className="rounded-md bg-slate-50 border border-slate-200 p-3 text-xs text-slate-500">
-        下级数：{agent.childCount}（下级各自的佣金规则同样暂无管理端入口，此处不展示）
-      </div>
+      {err && <div className="rounded bg-rose-50 px-3 py-2 text-xs text-rose-700">{err}</div>}
+      {ok && <div className="rounded bg-emerald-50 px-3 py-2 text-xs text-emerald-700">{ok}</div>}
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="border-b border-slate-200 text-left text-xs text-slate-500">
+            <th className="py-2">产品</th>
+            <th className="py-2">当前生效费率</th>
+            <th className="py-2">生效自</th>
+            {canEdit && <th className="py-2">新费率（%）</th>}
+          </tr>
+        </thead>
+        <tbody>
+          {KINDS.map((k) => {
+            const cur = rules?.[k] ?? null;
+            return (
+              <tr key={k} className="border-b border-slate-100">
+                <td className="py-2">{COMMISSION_KIND_LABEL[k]}</td>
+                <td className="py-2 nums">
+                  {cur ? (
+                    `${(cur.rate * 100).toFixed(2)}%`
+                  ) : (
+                    <span className="font-medium text-rose-600">无规则 · 计提按 0</span>
+                  )}
+                </td>
+                <td className="py-2 text-xs text-slate-500">
+                  {cur ? cur.effectiveFrom.slice(0, 10) : '—'}
+                </td>
+                {canEdit && (
+                  <td className="py-2">
+                    <input
+                      className="w-24 rounded-md border border-slate-300 px-2 py-1 text-sm nums"
+                      value={draft[k]}
+                      onChange={(e) => setDraft((d) => ({ ...d, [k]: e.target.value }))}
+                      placeholder="如 5"
+                    />
+                  </td>
+                )}
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      {canEdit ? (
+        <div className="flex items-center justify-between gap-3">
+          <p className="text-xs text-slate-500">
+            按百分数填（5 = 5%），留空 = 不改；保存即追加新生效规则，历史订单不回溯。
+            层级不变式（下级 ≤ 上级）由结算侧守护：负价差自动跳过计提。
+          </p>
+          <button className="btn-primary text-sm disabled:opacity-50" onClick={save} disabled={saving}>
+            {saving ? '保存中…' : '保存费率'}
+          </button>
+        </div>
+      ) : (
+        <p className="text-xs text-slate-500">费率由管理员配置；此处只读。</p>
+      )}
     </div>
   );
 }

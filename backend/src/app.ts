@@ -30,7 +30,6 @@ import { paymentChannelRoutes } from './modules/payment-channels/payment-channel
 import { agentRechargeRoutes } from './modules/agent-recharges/agent-recharges.routes.js';
 import { receiptRoutes } from './modules/receipts/receipts.routes.js';
 import { publicRoutes } from './modules/public/public.routes.js';
-import { pricingRoutes } from './modules/pricing/pricing.routes.js';
 import { cancellationRoutes } from './modules/cancellation/cancellation.routes.js';
 import { reminderRoutes } from './modules/reminders/reminders.routes.js';
 import { financesRoutes } from './modules/finances/finances.routes.js';
@@ -109,7 +108,6 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(agentRechargeRoutes, { prefix: '/agent-recharges' });
   await app.register(receiptRoutes, { prefix: '/receipts' });
   await app.register(publicRoutes, { prefix: '/public' });
-  await app.register(pricingRoutes, { prefix: '/pricing' });
   await app.register(cancellationRoutes, { prefix: '/cancellation-policies' });
   await app.register(reminderRoutes, { prefix: '/reminders' });
   await app.register(financesRoutes, { prefix: '/finances' });

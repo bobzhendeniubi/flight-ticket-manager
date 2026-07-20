@@ -105,14 +105,17 @@ export interface FinancesSummary {
   revenueCny: number;
   /** 已锁定成本总额 */
   costCny: number;
-  /** revenue - cost；不包含空座沉没成本 */
-  grossMarginCny: number;
-  /** grossMargin / revenue */
+  /** revenue - cost；不包含空座沉没成本。
+   *  A5（2026-07-17 收口）：missingCostItemCount>0 时为 null（「未知」）——
+   *  与月度趋势同口径。此前概览把缺成本项跳过后照报数字毛利，同一页两种诚实度：
+   *  月度说「未知」、首页 KPI 给一个虚高的精确数。缺成本的毛利就是未知，不装知道。 */
+  grossMarginCny: number | null;
+  /** grossMargin / revenue（毛利未知时同为 null） */
   marginPct: number | null;
   /** 含已售/未售座位推算的"应负担"包机沉没成本（仅 charterCostCny 已填的航班） */
   emptySeatSunkCostCny: number;
-  /** 航班贡献毛利（财务定名，原"净利"）= grossMargin - emptySeatSunkCost，未扣公司期间费用 */
-  netMarginCny: number;
+  /** 航班贡献毛利（财务定名，原"净利"）= grossMargin - emptySeatSunkCost；毛利未知时为 null */
+  netMarginCny: number | null;
   /** 该区间内的订单数（不含 DRAFT / CANCELLED）；不含 REFUNDED（REFUNDED 订单只贡献
    *  revenueBreakdown.refund 这一笔净额，不计入这里的订单数） */
   orderCount: number;
@@ -516,16 +519,18 @@ export async function getFinancesSummary(
     }))
     .sort((a, b) => b.revenueCny - a.revenueCny);
 
-  const grossMarginCny = round(revenueCny - costCny);
+  // A5：有任何缺成本快照的订单项 → 总毛利/净利报「未知」（null），不给虚高数字。
+  const marginKnown = missingCostItemCount === 0;
+  const grossMarginCny = marginKnown ? round(revenueCny - costCny) : null;
 
   return {
     range,
     revenueCny: round(revenueCny),
     costCny: round(costCny),
     grossMarginCny,
-    marginPct: revenueCny > 0 ? round(grossMarginCny / revenueCny) : null,
+    marginPct: grossMarginCny !== null && revenueCny > 0 ? round(grossMarginCny / revenueCny) : null,
     emptySeatSunkCostCny: round(emptySeatSunkCostCny),
-    netMarginCny: round(grossMarginCny - emptySeatSunkCostCny),
+    netMarginCny: grossMarginCny !== null ? round(grossMarginCny - emptySeatSunkCostCny) : null,
     orderCount: orders.length,
     missingCostItemCount,
     categories,
@@ -664,6 +669,7 @@ export async function getMonthlyTrend(
 
     const orders = await client.order.findMany({
       where: {
+        deletedAt: null,
         createdAt: { gte: monthStart, lt: monthEnd },
         status: { in: COUNTED_STATUSES },
       },

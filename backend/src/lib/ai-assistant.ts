@@ -306,12 +306,12 @@ async function executeSearchFlights(input: Record<string, unknown>): Promise<Too
         const cabinDetails = await Promise.all(
           seats.map(async (c) => {
             let dynamicPrice = Number(c.basePrice);
-            let dateRank = 'C';
             try {
               if (c.capacity - c.sold >= passengers) {
                 const pr = await pricingService.calculatePrice(s.id, c.cabin, passengers);
                 dynamicPrice = pr.averageUnitPrice;
-                dateRank = pr.dateRank;
+                // 只取动态成交价；pr.dateRank（内部日期分档 A/B/C/D）绝不进模型上下文 ——
+                // 此前它随工具结果喂给模型、仅靠系统提示词「不要告诉客户」保密，一次越狱即泄漏。
               }
             } catch {
               /* fallback */
@@ -321,7 +321,6 @@ async function executeSearchFlights(input: Record<string, unknown>): Promise<Too
               available: c.capacity - c.sold,
               basePrice: Number(c.basePrice),
               dynamicPrice,
-              dateRank,
             };
           }),
         );

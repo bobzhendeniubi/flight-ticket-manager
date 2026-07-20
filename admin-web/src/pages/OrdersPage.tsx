@@ -1999,7 +1999,9 @@ function OrderDrawer({
 
   const saveRooming = async (groups: RoomGroup[]): Promise<void> => {
     if (!token) return;
-    await api.updateRoomAssignment(token, o.id, groups);
+    const res = await api.updateRoomAssignment(token, o.id, groups);
+    // B10：金额分叉 / 混性别 / 多酒店行提示——运营必须看见，但不阻断保存。
+    if (res.warnings?.length) alert(res.warnings.join('\n\n'));
     // 重拉详情让「酒店情况」摘要与按钮态即时刷新
     const r = await api.getOrder(token, o.id);
     setHydrated(r.order);
@@ -2227,6 +2229,7 @@ function OrderDrawer({
             orderId={o.id}
             initialExpectedAmountCny={o.expectedAmountCny}
             initialExpectedAmountLocked={o.expectedAmountLocked}
+            payableCny={Number(o.total) + Number(o.adjustmentCny ?? 0)}
             onChanged={onChanged}
           />
 
@@ -2373,6 +2376,11 @@ function OrderDrawer({
             <RoomSupplementForm
               orderId={o.id}
               defaultNights={deriveStayNights(o)}
+              passengers={(o.passengers ?? []).map((p) => ({
+                id: p.id,
+                fullName: p.fullName,
+                singleRoom: (p as { singleRoom?: boolean }).singleRoom,
+              }))}
               onCancel={() => setRoomSupplementOpen(false)}
               onSaved={async () => {
                 // 重拉详情（保留联查酒店名等），刷新金额/尾款/售后费用区
@@ -2525,11 +2533,14 @@ function ChangeAgentPanel({
 function RoomSupplementForm({
   orderId,
   defaultNights,
+  passengers,
   onCancel,
   onSaved,
 }: {
   orderId: string;
   defaultNights: number;
+  /** 本单出行人（A15：可选择「谁转单住」联动房控；singleRoom=true 的置灰防重复） */
+  passengers: Array<{ id: string; fullName: string; singleRoom?: boolean }>;
   onCancel: () => void;
   onSaved: () => void;
 }) {
@@ -2538,6 +2549,10 @@ function RoomSupplementForm({
   const [perNightCny, setPerNightCny] = useState<number | null>(null);
   const [nights, setNights] = useState<number>(defaultNights >= 1 ? defaultNights : 1);
   const [note, setNote] = useState('');
+  // 转单住乘客（可选）：选了则后端同事务标记 singleRoom + 重算套餐行计费房数（房控/分房自动跟）。
+  const [passengerId, setPassengerId] = useState('');
+  // 幂等键：表单打开生成一次，双击/超时重发同 key 只入账一次（配合 N8 后端回放）。
+  const [idempotencyKey] = useState(() => `rs-${crypto.randomUUID()}`);
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -2559,11 +2574,14 @@ function RoomSupplementForm({
     }
     setSubmitting(true);
     try {
-      await api.addRoomSupplement(token, orderId, {
+      const res = await api.addRoomSupplement(token, orderId, {
         perNightCny,
         nights,
         note: note.trim() || undefined,
+        idempotencyKey,
+        ...(passengerId ? { passengerId } : {}),
       });
+      if (res.roomControl) alert(res.roomControl); // 房控联动结果（谁转单住、计费房数变化）
       onSaved();
     } catch (e) {
       setErr(e instanceof ApiError ? e.message : '补收失败');
@@ -2602,6 +2620,25 @@ function RoomSupplementForm({
           />
         </label>
       </div>
+      <label className="block text-xs text-ink-muted">
+        转单住乘客（选填 · 联动房控）
+        <select
+          className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+          value={passengerId}
+          onChange={(e) => setPassengerId(e.target.value)}
+        >
+          <option value="">不联动（仅收钱，房控不变）</option>
+          {passengers.map((p) => (
+            <option key={p.id} value={p.id} disabled={p.singleRoom === true}>
+              {p.fullName}
+              {p.singleRoom === true ? '（已单住）' : ''}
+            </option>
+          ))}
+        </select>
+        <span className="mt-1 block text-[11px] text-ink-muted">
+          选择后该乘客标记为单人入住，套餐计费房数按「独住各占一间」重算，房控/分房自动跟进。
+        </span>
+      </label>
       <label className="block text-xs text-ink-muted">
         备注（选填）
         <input
@@ -3505,6 +3542,8 @@ function SettlementPriceForm({
         unitPriceCny: newPrice,
         reason: reason.trim() || undefined,
       });
+      // B12：已付款单改价的资金后果（多付/新尾款）——后端算清楚，这里必须让运营看见。
+      if (res.warning) alert(res.warning);
       onSaved(res.order);
     } catch (e: unknown) {
       setErr(e instanceof ApiError ? e.message : '改价失败');
@@ -3614,6 +3653,8 @@ function genderLabel(gender?: 'M' | 'F' | 'X' | null): string {
 function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onOrderUpdated?: (order: OrderSummary) => void }) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [lightbox, setLightbox] = useState<{ photoUrl: string; title: string } | null>(null);
+  // B1：签证日期内联编辑（订单侧入口——HAS_VISA/全员自备签的单进不了签证台，这里是它们唯一可达的录入口）
+  const [visaEditId, setVisaEditId] = useState<string | null>(null);
   return (
     <section>
       <h3 className="text-sm font-medium text-slate-700">乘客 ({order.passengers.length})</h3>
@@ -3622,6 +3663,21 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
           const passDaysLeft = daysUntil(p.passportExpiry);
           const passWarn = passDaysLeft !== null && passDaysLeft < 180;
           const passBlock = passDaysLeft !== null && passDaysLeft < 90;
+          if (visaEditId === p.id) {
+            return (
+              <li key={p.id} className="rounded-md border border-sky-300 bg-sky-50/50 p-3">
+                <PassengerVisaDatesInline
+                  orderId={order.id}
+                  passenger={p}
+                  onCancel={() => setVisaEditId(null)}
+                  onSaved={(updated) => {
+                    setVisaEditId(null);
+                    onOrderUpdated?.(updated);
+                  }}
+                />
+              </li>
+            );
+          }
           if (editingId === p.id) {
             return (
               <li key={p.id} className="rounded-md border border-brand/40 bg-brand/5 p-3">
@@ -3657,6 +3713,13 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
                       onClick={() => setEditingId(p.id)}
                     >
                       换人/编辑
+                    </button>
+                    <button
+                      className="ml-2 text-[11px] font-normal text-sky-700 hover:text-sky-900"
+                      onClick={() => setVisaEditId(p.id)}
+                      title="出签日/生效日/有效期——已持签/自备签乘客的唯一录入口（不进签证台）"
+                    >
+                      签证日期
                     </button>
                   </div>
                   {!p.chineseName && (
@@ -3829,6 +3892,78 @@ function PassportLightbox({
       <p className="bg-slate-800 px-2 py-1 text-center text-[10px] text-white/60 select-none">
         拖动标题栏移动 · 滚轮或 +/− 缩放 · Esc 关闭
       </p>
+    </div>
+  );
+}
+
+// ── B1 签证日期内联编辑（订单侧入口）─────────────────────────────────
+// 签证台三日期编辑器只覆盖「有签证任务」的单；HAS_VISA（已持签）与全员自备签的单不建任务，
+// 那些乘客的签证日期此前无处可录。本组件挂在订单抽屉乘客卡上，任何乘客可达，调同一端点。
+function PassengerVisaDatesInline({
+  orderId,
+  passenger,
+  onCancel,
+  onSaved,
+}: {
+  orderId: string;
+  passenger: { id: string; fullName: string; visaIssueDate?: string | null; visaEffectiveDate?: string | null; visaExpiry?: string | null };
+  onCancel: () => void;
+  onSaved: (updated: OrderSummary) => void;
+}) {
+  const tokens = useAuth((s) => s.tokens);
+  const token = tokens?.accessToken ?? '';
+  const d10 = (v: string | null | undefined) => (v ? v.slice(0, 10) : '');
+  const [issueDate, setIssueDate] = useState(d10(passenger.visaIssueDate));
+  const [effectiveDate, setEffectiveDate] = useState(d10(passenger.visaEffectiveDate));
+  const [expiry, setExpiry] = useState(d10(passenger.visaExpiry));
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const save = async () => {
+    if (!token || saving) return;
+    setSaving(true);
+    setErr(null);
+    try {
+      await api.updatePassengerVisaDates(token, orderId, passenger.id, {
+        visaIssueDate: issueDate || null,
+        visaEffectiveDate: effectiveDate || null,
+        visaExpiry: expiry || null,
+      });
+      const r = await api.getOrder(token, orderId); // 重拉整单让抽屉/列表同步
+      onSaved(r.order);
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : '保存失败');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const inputCls = 'mt-0.5 w-full rounded-md border border-slate-300 px-2 py-1 text-xs';
+  return (
+    <div className="space-y-2 text-xs">
+      <div className="font-medium text-slate-900">签证日期 · {passenger.fullName}</div>
+      <div className="grid grid-cols-3 gap-2">
+        <label className="block text-[11px] text-slate-500">
+          出签日
+          <input type="date" className={inputCls} value={issueDate} onChange={(e) => setIssueDate(e.target.value)} />
+        </label>
+        <label className="block text-[11px] text-slate-500">
+          生效日
+          <input type="date" className={inputCls} value={effectiveDate} onChange={(e) => setEffectiveDate(e.target.value)} />
+        </label>
+        <label className="block text-[11px] text-slate-500">
+          有效期至
+          <input type="date" className={inputCls} value={expiry} onChange={(e) => setExpiry(e.target.value)} />
+        </label>
+      </div>
+      <p className="text-[11px] text-slate-400">留空 = 清除该字段；仅改填写的字段。</p>
+      {err && <div className="text-[11px] text-rose-600">{err}</div>}
+      <div className="flex justify-end gap-2">
+        <button type="button" className="btn-ghost text-xs" onClick={onCancel} disabled={saving}>取消</button>
+        <button type="button" className="btn-primary text-xs disabled:opacity-50" onClick={save} disabled={saving}>
+          {saving ? '保存中…' : '保存'}
+        </button>
+      </div>
     </div>
   );
 }
@@ -4867,6 +5002,15 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
     if (teamPrice !== undefined && manualPrice !== undefined) {
       setErr('「结算单价（手动）」与「团队议价结算价」二选一，请只填其中一个');
       return;
+    }
+    // 手填价复读确认（A17）：肥指错误（¥1000 打成 ¥100/¥0）靠让录单人重读一遍数字拦一道。
+    // 服务端另有硬闸：低于系统参考价 10% 一律拒绝；±50% 外的偏离会写进调整行审计文本。
+    if (manualPrice !== undefined) {
+      const ok = window.confirm(
+        `请确认 OTA 结算单价：每人 ¥${manualPrice}\n\n` +
+          `将按此价生成价格调整行（差额=手动价−系统价，全程留痕）。\n数字打错是最常见的录入事故，请再看一眼。`,
+      );
+      if (!ok) return;
     }
 
     const batchPayload = {

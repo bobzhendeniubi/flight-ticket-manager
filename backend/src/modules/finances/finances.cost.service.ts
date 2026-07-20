@@ -206,6 +206,11 @@ type PeriodWriteInput = {
   peakSurchargeCny?: number | null;
   aircraftAdjustCny?: number | null;
   takeoffDiscountCny?: number | null;
+  // A2 汇率四元组（可空审计留痕）：包机原币种/原币金额/汇率/折算日；CNY 仍是唯一入账口径
+  charterSourceCurrency?: string | null;
+  charterSourceAmount?: number | null;
+  charterFxRate?: number | null;
+  charterFxDate?: string | null; // YYYY-MM-DD
   note?: string | null;
 };
 
@@ -316,6 +321,10 @@ export async function createCostPeriod(
       peakSurchargeCny: input.peakSurchargeCny ?? null,
       aircraftAdjustCny: input.aircraftAdjustCny ?? null,
       takeoffDiscountCny: input.takeoffDiscountCny ?? null,
+      charterSourceCurrency: input.charterSourceCurrency ?? null,
+      charterSourceAmount: input.charterSourceAmount ?? null,
+      charterFxRate: input.charterFxRate ?? null,
+      charterFxDate: input.charterFxDate ? toDateOnly(input.charterFxDate) : null,
       note: input.note ?? null,
     },
     include: {
@@ -347,6 +356,11 @@ export async function updateCostPeriod(
   if (input.peakSurchargeCny !== undefined) data.peakSurchargeCny = input.peakSurchargeCny ?? null;
   if (input.aircraftAdjustCny !== undefined) data.aircraftAdjustCny = input.aircraftAdjustCny ?? null;
   if (input.takeoffDiscountCny !== undefined) data.takeoffDiscountCny = input.takeoffDiscountCny ?? null;
+  if (input.charterSourceCurrency !== undefined) data.charterSourceCurrency = input.charterSourceCurrency ?? null;
+  if (input.charterSourceAmount !== undefined) data.charterSourceAmount = input.charterSourceAmount ?? null;
+  if (input.charterFxRate !== undefined) data.charterFxRate = input.charterFxRate ?? null;
+  if (input.charterFxDate !== undefined)
+    data.charterFxDate = input.charterFxDate ? toDateOnly(input.charterFxDate) : null;
   if (input.note !== undefined) data.note = input.note ?? null;
   const row = await client.flightCostPeriod.update({
     where: { id },

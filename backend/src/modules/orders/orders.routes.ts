@@ -977,8 +977,39 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       }
     }
 
+    // ── B10 提示收集（不阻断，回给前端弹给运营看）───────────────────────────
+    const warnings: string[] = [];
+
+    // 混性别房间提示：异性不拼间是缺省口径，但运营故意混拼（夫妻/家庭）合法——只提示不拦。
+    const paxRows = await prisma.passenger.findMany({
+      where: { orderId: id },
+      select: { id: true, gender: true },
+    });
+    const genderById = new Map(paxRows.map((p) => [p.id, p.gender]));
+    for (const g of body.roomGroups) {
+      if (g.passengerIds.length < 2) continue;
+      const genders = new Set(
+        g.passengerIds.map((pid) => genderById.get(pid)).filter((x) => x === 'M' || x === 'F'),
+      );
+      if (genders.size > 1) {
+        warnings.push(
+          `房间「${g.hotelName}·${g.roomType}」混拼了异性乘客——家庭/夫妻属正常，其他情况请确认（销控板按异性不拼口径计物理间数）。`,
+        );
+      }
+    }
+
     // 分房总间数（含 0.5 拼房）→ 写回酒店订单行的 roomsBilled，房控据此按真实间数计（如 7 人 3.5 间）。
     const totalRooms = body.roomGroups.reduce((s, g) => s + (g.roomFraction ?? 1), 0);
+    // 金额分叉提示（B10）：roomsBilled 是房控口径也是计价参照——拖拽改它不会重算订单金额。
+    // 把「计费房数变了但钱没变」明示给运营，需要调价走补房差 / 改结算价通道，别让两本账静默漂移。
+    const prevAgg = await prisma.orderItem.aggregate({
+      where: { orderId: id, hotelRoomTypeId: { not: null } },
+      _sum: { roomsBilled: true },
+    });
+    const prevRooms = prevAgg._sum.roomsBilled == null ? null : Number(prevAgg._sum.roomsBilled.toString());
+    const hotelItemCount = await prisma.orderItem.count({
+      where: { orderId: id, hotelRoomTypeId: { not: null } },
+    });
     await prisma.$transaction(async (tx) => {
       await tx.order.update({
         where: { id },
@@ -1004,16 +1035,26 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         }
       }
     });
+    if (prevRooms !== null && totalRooms > 0 && Math.abs(totalRooms - prevRooms) >= 0.5) {
+      warnings.push(
+        `计费房数由 ${prevRooms} 变为 ${totalRooms}，订单金额不会自动重算——如需按新房数调价，请走「补收单房差」或改结算价通道。`,
+      );
+    }
+    if (hotelItemCount > 1) {
+      warnings.push(
+        `本单有 ${hotelItemCount} 条酒店行，分房间数已合并记在首条酒店行（房控合计口径不受影响，按行看会有偏差）。`,
+      );
+    }
     void writeAudit({
       actor: actorFromRequest(req),
       action: 'UPDATE_ROOM_ASSIGNMENT',
       targetType: 'ORDER',
       targetId: id,
       targetLabel: before.orderNumber,
-      before: { roomAssignment: before.roomAssignment },
-      after: { roomAssignment: body },
+      before: { roomAssignment: before.roomAssignment, roomsBilled: prevRooms },
+      after: { roomAssignment: body, roomsBilled: totalRooms, warnings },
     });
-    return { ok: true };
+    return { ok: true, warnings };
   });
 
   // ── 更新订单内部备注 / 客户备注 ──
@@ -1394,7 +1435,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     }
     const { id, itemId } = req.params as { id: string; itemId: string };
     const body = updateItemSettlementPriceBodySchema.parse(req.body);
-    const { order, audit } = await service.updateItemSettlementPrice(id, itemId, body, {
+    const { order, warning, audit } = await service.updateItemSettlementPrice(id, itemId, body, {
       userId: req.user.sub,
       role,
     });
@@ -1408,7 +1449,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       after: { ...audit.after, reason: audit.reason },
       severity: 'WARNING',
     });
-    return { order };
+    return { order, warning };
   });
 
   // ── 出行人资料（同一路径，双通道）──
@@ -1607,10 +1648,11 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         amountCny: audit.amountCny,
         itemId: audit.itemId,
         note: audit.note,
+        roomControl: audit.roomControl,
       },
       severity: 'WARNING',
     });
-    return { order };
+    return { order, roomControl: audit.roomControl };
   });
 };
 

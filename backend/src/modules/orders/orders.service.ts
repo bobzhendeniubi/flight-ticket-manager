@@ -2439,13 +2439,15 @@ export class OrderService {
     // allowDuplicate 批无查重兜底时）。前端传 batchId 才能跨请求重试防重；后端兜底只防同一请求内。
     const batchId = body.batchId ?? `bc-${randomUUID()}`;
 
-    // 录入人 = 登录账号：查登录用户名作为联系人兜底（body 未传时用）。
+    // 联系人口径（B9，2026-07-17）：批量单是「每人一单」，子单联系人默认落**该单乘客本人**——
+    // 「联系人」列回答的是「航变/接送/售后该找哪个客人」，不是「谁录的单」（录入人在审计里）。
+    // 显式传 body.contactName 仍最优先（真有统一领队联系人时用）；录入人只作最后兜底。
     // Order.contactName/contactPhone 是非空列，createOrder 又要求 min(1)，故需落具体值。
     const recorder = await prisma.user.findUnique({
       where: { id: requester.userId },
       select: { displayName: true, email: true, phone: true },
     });
-    const contactName = body.contactName ?? recorder?.displayName ?? recorder?.email ?? '系统录入';
+    const recorderName = recorder?.displayName ?? recorder?.email ?? '系统录入';
     const contactPhone = body.contactPhone ?? recorder?.phone ?? '-';
 
     // 团期备注：写入每张子单的 notes（与既有 notes 合并）+ noteSpecial（结构化「特殊」栏）。
@@ -2536,12 +2538,26 @@ export class OrderService {
       // 批量录单为 ADMIN/STAFF 专用路径，允许自由行手录价地面行。
       const priced = await this.priceAndValidateItems(batchItems, undefined, undefined, true);
       const systemTotal = priced.reduce((sum, p) => sum + p.amount, 0);
+      // 相对合理性硬闸（A17/A18，2026-07-17 拍板）：手填价 < 系统权威价 10% 一律拒绝——
+      // 这是「¥1000 打成 ¥100 / ¥0」的肥指区间，真实 OTA 成交价不会低到系统价一折以下。
+      // 绝对上限（SETTLEMENT_PRICE_CAP_CNY）挡不住这类少打一个零的错误，审计留痕只能追责不能防损。
+      // 系统价不可得（systemTotal ≤ 0，如纯手录地面行）时跳过比值判断，仍受绝对上限约束。
+      if (systemTotal > 0 && body.manualUnitPriceCny < systemTotal * 0.1) {
+        throw new BadRequestError(
+          `OTA 结算单价 ¥${body.manualUnitPriceCny}/人 低于系统参考价 ¥${Math.round(systemTotal)} 的 10%，` +
+            '疑似录入错误已拒绝。如确为特批价，请先调整产品定价或联系管理员走结算价通道。',
+        );
+      }
       const diff = Math.round(body.manualUnitPriceCny - systemTotal);
       if (diff !== 0) {
+        // 偏离度写进审计文本：>±50% 的单在流水里一眼可见，便于财务复核（前端另有确认提示）。
+        const pct = systemTotal > 0 ? Math.round((body.manualUnitPriceCny / systemTotal) * 100) : null;
         manualPriceAdjustment = {
           amountCny: diff,
           reasonCode: diff > 0 ? 'MISC_FEE' : 'DISCOUNT',
-          reasonText: `OTA 结算价 ¥${body.manualUnitPriceCny}/人`,
+          reasonText:
+            `OTA 结算价 ¥${body.manualUnitPriceCny}/人` +
+            (pct !== null && (pct < 50 || pct > 200) ? `（系统参考价 ¥${Math.round(systemTotal)} 的 ${pct}%，请复核）` : ''),
         };
       }
     }
@@ -2574,7 +2590,8 @@ export class OrderService {
       try {
         const order = await this.createOrder(
           {
-            contactName,
+            // 联系人=本单乘客（body 显式传联系人则整批统一用它；录入人仅兜底）。
+            contactName: body.contactName ?? passenger.fullName ?? recorderName,
             contactPhone,
             contactEmail: body.contactEmail,
             paymentMethod: body.paymentMethod,
@@ -2741,6 +2758,8 @@ export class OrderService {
     actor: { userId: string; role: UserRole },
   ): Promise<{
     order: ReturnType<typeof serializeOrder>;
+    /** B12：已付款单改价的资金后果提示（多付/新尾款）；无后果时 null。*/
+    warning: string | null;
     audit: {
       orderNumber: string;
       orderItemId: string;
@@ -2768,13 +2787,25 @@ export class OrderService {
           deletedAt: Date | null;
           subtotal: Prisma.Decimal;
           total: Prisma.Decimal;
+          paidAmount: Prisma.Decimal;
+          outboundInvoiced: boolean;
+          returnInvoiced: boolean;
+          systemInvoiced: boolean;
         }>
-      >`SELECT id, "orderNumber", status, "deletedAt", subtotal, total FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+      >`SELECT id, "orderNumber", status, "deletedAt", subtotal, total, "paidAmount", "outboundInvoiced", "returnInvoiced", "systemInvoiced" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
       const order = rows[0];
       if (!order) throw new NotFoundError('订单不存在');
       // 资金处置闸：结算价直接改 item.amount 与 order.total（也是取消手续费基数），
       // 死单/软删单不许改——否则可在退款前偷偷抬价操纵应退额，或改回收站单的应收。
       assertOrderAllowsFundsDisposal(order, '修改结算价');
+      // 开票闸（B12）：任一维度已开票后改结算价，发票金额与订单金额必然脱钩——
+      // 发票是已交付下游的凭证，改价必须先冲开票状态（票务台改回未开）、改完价再重开。
+      if (order.outboundInvoiced || order.returnInvoiced || order.systemInvoiced) {
+        throw new BadRequestError(
+          '该订单已有开票记录（去程/回程/系统任一已开），改结算价会使发票与订单金额不一致。' +
+            '请先在票务台把对应开票状态改回「未开」，改价后再重新开票。',
+        );
+      }
 
       // 锁**之后**才读 items：锁之前读到的快照可能已被并发改价写脏，拿它重算等于锁了个寂寞。
       const items = await tx.orderItem.findMany({
@@ -2821,6 +2852,23 @@ export class OrderService {
         select: { subtotal: true, total: true },
       });
 
+      // 已付资金后果（B12）：改价后 total 变、paidAmount 不变 —— 把差额算清楚交给运营处置，
+      // 不再让「total ≠ 已收」静默存在。多付走既有多付处置（转余额/挂账/退款），欠款去催收。
+      const paid = Number(order.paidAmount.toString());
+      let warning: string | null = null;
+      if (paid > 0) {
+        const gap = round2(newTotal - paid);
+        if (gap < 0) {
+          warning =
+            `该单已收 ¥${paid}，改价后应收 ¥${newTotal}，形成多付 ¥${Math.abs(gap)}。` +
+            '请在订单资金区做多付处置（转代理余额 / 转挂账池 / 退款）。';
+        } else if (gap > 0 && (order.status === OrderStatus.PAID || order.status === OrderStatus.PROCESSING || order.status === OrderStatus.TICKETED || order.status === OrderStatus.COMPLETED)) {
+          warning =
+            `该单状态为已付款族（${order.status}）但改价后新增尾款 ¥${gap}（已收 ¥${paid} / 应收 ¥${newTotal}）。` +
+            '请补收该差额或确认本次改价金额无误。';
+        }
+      }
+
       return {
         orderNumber: order.orderNumber,
         beforeUnitPrice,
@@ -2831,6 +2879,7 @@ export class OrderService {
         afterAmount: newAmount,
         afterSubtotal: updated.subtotal.toString(),
         afterTotal: updated.total.toString(),
+        warning,
       };
     });
 
@@ -2842,6 +2891,7 @@ export class OrderService {
     return {
       // 对外脱敏：改结算价的返回也按操作者角色脱敏（ADMIN/STAFF 全量，其余剥离内部字段 + 逐项拆价）。
       order: serializeOrder(finalOrder, orderSerializeRoleCtx(actor.role)),
+      warning: scratch.warning,
       audit: {
         orderNumber: scratch.orderNumber,
         orderItemId: itemId,
@@ -4871,9 +4921,20 @@ export class OrderService {
 
     const order = await prisma.order.findUnique({
       where: { id: orderId },
-      select: { id: true, orderNumber: true, agentId: true },
+      select: { id: true, orderNumber: true, agentId: true, status: true, deletedAt: true },
     });
     if (!order) throw new NotFoundError('订单不存在');
+
+    // 状态/软删守卫（A16）：回收站单与已退款单不该再改归属——
+    //   · 回收站单（deletedAt≠null）：已软删隐身，改归属只会在恢复后制造一个归属被人动过的幽灵单。
+    //   · 已退款单（REFUNDED，终态）：钱已结清，改代理无业务意义，只会污染报表归属。
+    // 此前 select 连 status/deletedAt 都不取，这两类单都能被静默改归属。
+    if (order.deletedAt) {
+      throw new BadRequestError('回收站订单不能更改归属代理，请先恢复订单');
+    }
+    if (order.status === OrderStatus.REFUNDED) {
+      throw new BadRequestError('已退款订单不能更改归属代理');
+    }
 
     const oldAgentId = order.agentId;
     if (oldAgentId === newAgentId) {
@@ -4902,13 +4963,21 @@ export class OrderService {
       oldAgentName = old ? old.companyName ?? old.contactName : null;
     }
 
-    // 财务口径警告：该订单是否曾用（原代理）预存余额抵扣（applyAgentBalanceToOrder 会挂一条
-    // PrepaymentTransaction(type=OFFSET, orderId)）。不回溯、不阻断——仅提醒运营核对财务归属。
+    // 资金纠缠阻断（A16b，2026-07-17 拍板：有余额纠缠时阻断、强制先结清）：
+    // 该订单若曾用（原代理）预存余额抵扣（applyAgentBalanceToOrder 挂 PrepaymentTransaction(OFFSET)），
+    // 改归属后「多付转余额」会按新 agentId 入账 —— 原代理 A 的钱会变成新代理 B 的余额。
+    // 旧口径只给警告不阻断；现改为硬阻断：先由财务把原代理的抵扣结清/冲回，再改归属。
     const balanceOffset = await prisma.prepaymentTransaction.findFirst({
       where: { orderId, type: PrepaymentTxType.OFFSET },
       select: { id: true },
     });
-    const usedAgentBalance = balanceOffset != null;
+    if (balanceOffset != null) {
+      throw new BadRequestError(
+        '该订单曾用原代理预存余额抵扣，直接改归属会把原代理的钱记到新归属名下。' +
+          '请先由财务结清/冲回该笔余额抵扣，再更改归属代理。',
+      );
+    }
+    const usedAgentBalance = false; // 走到这里必然无 OFFSET（保留字段以稳定 API 形状）
 
     await prisma.order.update({
       where: { id: orderId },
@@ -4920,9 +4989,7 @@ export class OrderService {
       include: ORDER_FULL_INCLUDE,
     });
 
-    const warning = usedAgentBalance
-      ? '该订单曾用原代理预存余额抵扣；已发生的收款/余额抵扣/佣金流水不回溯（按原归属保留），请核对财务归属。'
-      : null;
+    const warning = null;
 
     return {
       // 显式按角色推导序列化口径（本入口已断言 ADMIN/STAFF → 保留护照大图，与改归属前的返回一致）。
@@ -4950,7 +5017,13 @@ export class OrderService {
   // ════════════════════════════════════════════════════════════════════
   async addRoomSupplement(
     orderId: string,
-    input: { perNightCny: number; nights: number; note?: string },
+    input: {
+      perNightCny: number;
+      nights: number;
+      note?: string;
+      idempotencyKey?: string;
+      passengerId?: string;
+    },
     actor: { userId: string; role: UserRole },
   ): Promise<{
     order: ReturnType<typeof serializeOrder>;
@@ -4963,6 +5036,8 @@ export class OrderService {
       before: { subtotal: string; total: string };
       after: { subtotal: string; total: string };
       note?: string;
+      /** A15 房控联动结果说明（未传 passengerId / 幂等回放时为 null）。*/
+      roomControl: string | null;
     };
   }> {
     if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
@@ -4973,6 +5048,39 @@ export class OrderService {
     const row = buildRoomSupplementItem(input);
 
     const scratch = await prisma.$transaction(async (tx) => {
+      // 行锁：先锁住订单行，串行化并发补房差。否则两个并发请求各读旧 items、各加一条 FEE、
+      // 各按「旧合计 + 一次房差」写 total → 丢失更新（两条 FEE 行，但 total 只含一条）。
+      await tx.$queryRaw`SELECT id FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+
+      // 幂等回放：同 idempotencyKey 已入账（双击/超时重发）→ 直接返回当时结果，绝不二次追加 FEE。
+      if (input.idempotencyKey) {
+        const dup = await tx.orderItem.findUnique({
+          where: { idempotencyKey: input.idempotencyKey },
+          select: { id: true, orderId: true },
+        });
+        if (dup) {
+          if (dup.orderId !== orderId) {
+            throw new BadRequestError('幂等键已用于其它订单，不能复用');
+          }
+          const cur = await tx.order.findUniqueOrThrow({
+            where: { id: orderId },
+            select: { orderNumber: true, subtotal: true, total: true },
+          });
+          // 回放：金额不变（before === after），审计流水不重复追加。
+          return {
+            orderNumber: cur.orderNumber,
+            itemId: dup.id,
+            beforeSubtotal: cur.subtotal.toString(),
+            beforeTotal: cur.total.toString(),
+            afterSubtotal: cur.subtotal.toString(),
+            afterTotal: cur.total.toString(),
+            roomControl: null, // 回放：首次调用已完成房控联动，不重复
+          };
+        }
+      }
+
+      // items 在 FOR UPDATE 之后读取 → 看到的是已提交状态（含前一并发请求刚落的 FEE 行），
+      // 据此重聚合 total，杜绝「基于锁前陈旧快照重算」的错账。
       const order = await tx.order.findUnique({
         where: { id: orderId },
         select: {
@@ -5000,6 +5108,74 @@ export class OrderService {
         throw new BadRequestError('该订单不含酒店/套餐行，无法补收单房差');
       }
 
+      // ── 0. 房控联动（A15，2026-07-17 拍板：带 passengerId 的编辑住宿通道）────────────
+      // 收钱的同时把「谁转单住」落到库存侧：Passenger.singleRoom=true + 套餐行 roomsBilled
+      // 按权威公式重算。房控销控板/分房/超卖提醒全是派生账（每次现查订单），这两个字段
+      // 一更新即自动跟上 —— 房量不够时提醒线会自动亮「该加房」，无需在此另设闸。
+      let roomControl: string | null = null;
+      if (input.passengerId) {
+        const pax = await tx.passenger.findUnique({
+          where: { id: input.passengerId },
+          select: { id: true, orderId: true, fullName: true, singleRoom: true },
+        });
+        if (!pax || pax.orderId !== orderId) {
+          throw new BadRequestError('指定的乘客不存在或不属于本订单');
+        }
+        if (pax.singleRoom) {
+          throw new BadRequestError(`乘客 ${pax.fullName} 已是单人入住，请勿重复补收单房差`);
+        }
+        await tx.passenger.update({
+          where: { id: pax.id },
+          data: { singleRoom: true },
+        });
+        roomControl = `乘客 ${pax.fullName} 已标记单人入住`;
+
+        // 套餐行：按权威公式重算计费房数（独住者各占一间；只升不降，防误缩）。
+        // 纯 HOTEL 行的房数由运营在分房里直接管理，这里只落 singleRoom 标记。
+        const bundleItem = await tx.orderItem.findFirst({
+          where: { orderId, kind: OrderItemKind.BUNDLE },
+          orderBy: { createdAt: 'asc' },
+          select: {
+            id: true,
+            metadata: true,
+            roomsBilled: true,
+            bundle: {
+              select: {
+                hotelRoomTypeId: true,
+                hotelRoomType: { select: { maxAdults: true, maxChildren: true } },
+              },
+            },
+          },
+        });
+        if (bundleItem?.bundle) {
+          const newSingleCount = await tx.passenger.count({
+            where: { orderId, singleRoom: true },
+          });
+          const occupancy = resolveBundleOccupancy({
+            metadata: (bundleItem.metadata ?? {}) as Record<string, unknown>,
+          });
+          const roomsCharged = computeBundleRoomsCharged({
+            occupancy,
+            capacity: bundleItem.bundle.hotelRoomType,
+            hotelRoomTypeId: bundleItem.bundle.hotelRoomTypeId,
+            singleCount: newSingleCount,
+            clientRoomsBilled: undefined,
+          });
+          const before = bundleItem.roomsBilled == null ? null : Number(bundleItem.roomsBilled.toString());
+          if (before == null || roomsCharged > before) {
+            await tx.orderItem.update({
+              where: { id: bundleItem.id },
+              data: { roomsBilled: new Prisma.Decimal(roomsCharged) },
+            });
+            roomControl += `；套餐行计费房数 ${before ?? '未设'} → ${roomsCharged}（房控/分房自动跟进）`;
+          } else {
+            roomControl += `；计费房数维持 ${before}（权威重算 ${roomsCharged} 未超过现值，只升不降）`;
+          }
+        } else {
+          roomControl += '；本单为酒店行订单，房数请在分房面板调整（单住标记已生效）';
+        }
+      }
+
       // ── 1. 新增一条 FEE 调整行（描述含 ¥X/晚 × N晚，metadata 记 perNightCny/nights）──
       const created = await tx.orderItem.create({
         data: {
@@ -5010,6 +5186,7 @@ export class OrderService {
           unitPrice: new Prisma.Decimal(row.unitPrice),
           amount: new Prisma.Decimal(row.amount),
           metadata: row.metadata as Prisma.InputJsonValue,
+          idempotencyKey: input.idempotencyKey ?? null,
         },
       });
 
@@ -5045,6 +5222,7 @@ export class OrderService {
         beforeTotal: order.total.toString(),
         afterSubtotal: newSubtotal.toString(),
         afterTotal: newTotal.toString(),
+        roomControl,
       };
     });
 
@@ -5066,6 +5244,7 @@ export class OrderService {
         before: { subtotal: scratch.beforeSubtotal, total: scratch.beforeTotal },
         after: { subtotal: scratch.afterSubtotal, total: scratch.afterTotal },
         note: input.note,
+        roomControl: scratch.roomControl,
       },
     };
   }

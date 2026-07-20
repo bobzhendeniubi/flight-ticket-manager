@@ -5,11 +5,16 @@
  *   body: { messages: ChatMessage[], userMessage: string, passengers? }
  *   返回: { reply, proposals[], messages, debug, mocked }
  *
- * 不要求登录 —— 任何访客都能聊；下单时才需要登录（前端在「确认下单」时跳登录）
+ * 匿名可聊（访客下单前就能问）—— 但每个 AI 回合会真实调用 OpenAI（烧 token/花钱），
+ * 所以本路由额外挂一道**更严的按 IP 限流**（严于全局 100/min），防匿名刷爆账单。
+ * 下单时才需要登录（前端在「确认下单」时跳登录）。
  */
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { runChatTurn, type ChatMessage } from '../../lib/ai-assistant.js';
+
+// AI 回合按 IP 限流：每分钟最多 10 次真实模型调用/IP（每次可能多轮 tool-use，成本高）。
+const AI_CHAT_RATE_LIMIT = { max: 10, timeWindow: '1 minute' } as const;
 
 const chatBodySchema = z.object({
   // 历史 messages 让前端管理（无服务端 session 状态）
@@ -19,7 +24,7 @@ const chatBodySchema = z.object({
 });
 
 export const aiRoutes: FastifyPluginAsync = async (app) => {
-  app.post('/chat', async (req, reply) => {
+  app.post('/chat', { config: { rateLimit: AI_CHAT_RATE_LIMIT } }, async (req, reply) => {
     const body = chatBodySchema.parse(req.body);
 
     try {

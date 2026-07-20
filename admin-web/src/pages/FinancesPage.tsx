@@ -8,7 +8,7 @@
  *   GET /finances/orders   - 按订单分组的 P&L
  *   GET /finances/monthly  - 最近 N 个月趋势
  *
- * 成本更新：未填的 cost 由 backend/scripts/backfill-finance-costs.ts 用 demo 估算回填；
+ * 成本更新：demo 估算回填脚本已删除（2026-07-17 审计 #19：按售价比例伪造成本是给事故写邀请函）——缺成本一律如实留空/标未知；
  * 真实生产应由 staff 在 Flights/Hotels/Visa/Transfer 管理页录入。
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
@@ -516,6 +516,11 @@ function CostPeriodNewForm({
   const [aircraft, setAircraft] = useState<number | null>(null);
   const [takeoff, setTakeoff] = useState<number | null>(null);
   const [note, setNote] = useState<string>('');
+  // A2 汇率四元组（选填审计留痕）：包机原币/金额/汇率/折算日；CNY 仍是入账口径
+  const [fxCurrency, setFxCurrency] = useState('');
+  const [fxAmount, setFxAmount] = useState<number | null>(null);
+  const [fxRate, setFxRate] = useState<number | null>(null);
+  const [fxDate, setFxDate] = useState('');
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -545,6 +550,10 @@ function CostPeriodNewForm({
         peakSurchargeCny: peak,
         aircraftAdjustCny: aircraft,
         takeoffDiscountCny: takeoff,
+        charterSourceCurrency: fxCurrency.trim() === '' ? null : fxCurrency.trim().toUpperCase(),
+        charterSourceAmount: fxAmount,
+        charterFxRate: fxRate,
+        charterFxDate: fxDate === '' ? null : fxDate,
         note: note.trim() === '' ? null : note.trim(),
       };
       await api.createCostPeriod(token, body);
@@ -594,6 +603,30 @@ function CostPeriodNewForm({
             onChange={(e) => setTo(e.target.value)}
             className={`mt-1 block w-full ${inputCls}`}
           />
+        </label>
+        {/* A2 汇率四元组（选填）：记下包机 CNY 数是按哪天哪个汇率从哪种原币折来的 */}
+        <label className="text-xs text-ink-soft">
+          包机原币种（选填）
+          <input type="text" maxLength={3} placeholder="USD/VND/MOP" value={fxCurrency}
+            onChange={(e) => setFxCurrency(e.target.value.toUpperCase())}
+            className={`mt-1 block w-full ${inputCls}`} />
+        </label>
+        <label className="text-xs text-ink-soft">
+          原币金额（选填）
+          <input type="number" min={0} value={fxAmount ?? ''} placeholder="如 96000"
+            onChange={(e) => setFxAmount(e.target.value === '' ? null : Number(e.target.value))}
+            className={`mt-1 block w-full ${inputCls}`} />
+        </label>
+        <label className="text-xs text-ink-soft">
+          折算汇率（原币→CNY，选填）
+          <input type="number" min={0} step="0.000001" value={fxRate ?? ''} placeholder="如 7.25"
+            onChange={(e) => setFxRate(e.target.value === '' ? null : Number(e.target.value))}
+            className={`mt-1 block w-full ${inputCls}`} />
+        </label>
+        <label className="text-xs text-ink-soft">
+          折算/付款日（选填）
+          <input type="date" value={fxDate} onChange={(e) => setFxDate(e.target.value)}
+            className={`mt-1 block w-full ${inputCls}`} />
         </label>
         <label className="text-xs text-ink-soft">
           备注
@@ -1307,9 +1340,14 @@ function SummaryTab({ token, range }: { token: string; range: { from: string; to
   if (err) return <div className="text-sm text-rose-600">加载失败：{err}</div>;
   if (!data) return null;
 
-  const marginTone =
-    data.grossMarginCny > 0 ? 'pos' : data.grossMarginCny < 0 ? 'neg' : 'neutral';
-  const netTone = data.netMarginCny > 0 ? 'pos' : data.netMarginCny < 0 ? 'neg' : 'neutral';
+  // A5：缺成本时后端毛利/净利返回 null（未知）——KPI 卡如实标「未知」，不显示虚高数字。
+  const marginUnknown = data.grossMarginCny == null;
+  const marginTone = marginUnknown
+    ? 'warn'
+    : data.grossMarginCny! > 0 ? 'pos' : data.grossMarginCny! < 0 ? 'neg' : 'neutral';
+  const netTone = marginUnknown
+    ? 'warn'
+    : data.netMarginCny! > 0 ? 'pos' : data.netMarginCny! < 0 ? 'neg' : 'neutral';
 
   return (
     <section className="space-y-5">
@@ -1327,14 +1365,14 @@ function SummaryTab({ token, range }: { token: string; range: { from: string; to
         />
         <KpiCard
           label="毛利（含未售空座）"
-          value={fmtCny(data.grossMarginCny)}
-          hint={`毛利率 ${fmtPct(data.marginPct)}`}
+          value={marginUnknown ? '未知' : fmtCny(data.grossMarginCny!)}
+          hint={marginUnknown ? `缺 ${data.missingCostItemCount} 项成本，补录后显示` : `毛利率 ${fmtPct(data.marginPct)}`}
           tone={marginTone}
         />
         <KpiCard
           label="航班贡献毛利（扣空座损失）"
-          value={fmtCny(data.netMarginCny)}
-          hint={`空座损失 ${fmtCny(-data.emptySeatSunkCostCny)}（卖不掉的空座 × 单座成本）`}
+          value={marginUnknown ? '未知' : fmtCny(data.netMarginCny!)}
+          hint={marginUnknown ? '毛利未知时不推算' : `空座损失 ${fmtCny(-data.emptySeatSunkCostCny)}（卖不掉的空座 × 单座成本）`}
           tone={netTone}
         />
       </div>

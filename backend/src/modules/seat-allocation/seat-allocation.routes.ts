@@ -17,14 +17,21 @@ import { actorFromRequest } from '../../lib/audit.js';
 export const seatAllocationRoutes: FastifyPluginAsync = async (app) => {
   const service = new SeatAllocationService();
 
-  // ── 创建切位 ────────────────────────────────────────────────────
+  // ── 创建切位（已暂停）────────────────────────────────────────────
+  // ⚠ 切位「专卖」当前未接入公共库存：散客搜索(search/listSchedules)与下单 CAS
+  //   （sold+qty+locked ≤ capacity）都不扣 ACTIVE 切位（见 seat-allocation.service 头注释），
+  //   所以切给代理的座散客照样能买光——「专卖不专」。在补齐「公共池扣切位 + 代理单消费切位余额
+  //   + 回收只回未售量」这条完整库存链之前，禁止新建切位，避免运营依赖一个不成立的库存承诺。
+  //   列表 / 回收保持开放，供清理存量切位。
   app.post(
     '/',
     { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
     async (req, reply) => {
-      const body = createSeatAllocationBodySchema.parse(req.body);
-      const allocation = await service.createAllocation(body, actorFromRequest(req));
-      return reply.status(201).send({ allocation });
+      createSeatAllocationBodySchema.parse(req.body); // 仍校验请求形状，但下方一律拒绝
+      return reply.status(409).send({
+        error:
+          '切位功能暂停开放：当前切出的座位散客仍可购买（未接入公共库存扣减），为避免超卖已禁止新建。已存在的切位可继续查看与回收，库存联动补齐后再启用。',
+      });
     },
   );
 

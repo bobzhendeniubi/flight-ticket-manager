@@ -1,5 +1,8 @@
 import type { FastifyPluginAsync } from 'fastify';
-import { UserRole } from '@prisma/client';
+import { Prisma, ProductKind, UserRole } from '@prisma/client';
+import { z } from 'zod';
+import { prisma } from '../../db/prisma.js';
+import { NotFoundError } from '../../lib/errors.js';
 import { AgentService } from './agents.service.js';
 import {
   createChildAgentBodySchema,
@@ -144,6 +147,105 @@ export const agentRoutes: FastifyPluginAsync = async (app) => {
         });
       }
       return { agent: result.agent };
+    },
+  );
+
+  // ── 佣金规则（A1，2026-07-17）：CommissionRule 此前全仓只读（写入口仅 seed），
+  // 缺规则时计提静默按 0 佣金——代理拿不到钱还查无此账。这里补上管理端读写：
+  //   GET  /:id/commission-rules   当前生效费率（每 productKind 一条，取最新生效）
+  //   PUT  /:id/commission-rules   仅 ADMIN；每个传入的 kind 追加一条 effectiveFrom=now 的新规则
+  //                                （历史保留；计提读「最新生效」自然切换，不改旧账）
+  const COMMISSION_KINDS = [
+    ProductKind.FLIGHT,
+    ProductKind.HOTEL,
+    ProductKind.TRANSFER,
+    ProductKind.VISA,
+  ] as const;
+  const putCommissionRulesBodySchema = z.object({
+    rates: z
+      .record(
+        z.enum(['FLIGHT', 'HOTEL', 'TRANSFER', 'VISA']),
+        z
+          .number()
+          .min(0, '费率不能为负')
+          .max(0.5, '费率超出上限（50%）——按小数填，如 0.05 = 5%'),
+      )
+      .refine((r) => Object.keys(r).length > 0, '至少提供一个产品类型的费率'),
+  });
+
+  app.get(
+    '/:id/commission-rules',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    async (req) => {
+      const { id } = req.params as { id: string };
+      const agent = await prisma.agent.findUnique({ where: { id }, select: { id: true } });
+      if (!agent) throw new NotFoundError('代理不存在');
+      const now = new Date();
+      // 与计提口径（createCommissionsForOrder）完全一致：生效中，按 effectiveFrom DESC 每 kind 取第一条
+      const rows = await prisma.commissionRule.findMany({
+        where: {
+          agentId: id,
+          effectiveFrom: { lte: now },
+          OR: [{ effectiveTo: null }, { effectiveTo: { gte: now } }],
+        },
+        orderBy: { effectiveFrom: 'desc' },
+      });
+      const current: Record<string, { rate: number; effectiveFrom: string } | null> = {};
+      for (const kind of COMMISSION_KINDS) {
+        const hit = rows.find((r) => r.productKind === kind);
+        current[kind] = hit
+          ? { rate: Number(hit.rate), effectiveFrom: hit.effectiveFrom.toISOString() }
+          : null; // null = 无规则 → 计提按 0（缺规则不再是隐形的）
+      }
+      return { rules: current };
+    },
+  );
+
+  app.put(
+    '/:id/commission-rules',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN)] },
+    async (req) => {
+      const { id } = req.params as { id: string };
+      const body = putCommissionRulesBodySchema.parse(req.body);
+      const agent = await prisma.agent.findUnique({
+        where: { id },
+        select: { id: true, companyName: true, contactName: true },
+      });
+      if (!agent) throw new NotFoundError('代理不存在');
+
+      const now = new Date();
+      const entries = Object.entries(body.rates) as Array<[keyof typeof body.rates, number]>;
+      const written: Record<string, number> = {};
+      for (const [kind, rate] of entries) {
+        // 追加新规则（同 agent+kind+effectiveFrom 唯一；同毫秒重复提交由唯一约束兜底 upsert）
+        await prisma.commissionRule.upsert({
+          where: {
+            agentId_productKind_effectiveFrom: {
+              agentId: id,
+              productKind: kind as ProductKind,
+              effectiveFrom: now,
+            },
+          },
+          update: { rate: new Prisma.Decimal(rate) },
+          create: {
+            agentId: id,
+            productKind: kind as ProductKind,
+            rate: new Prisma.Decimal(rate),
+            effectiveFrom: now,
+          },
+        });
+        written[kind] = rate;
+      }
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'SET_COMMISSION_RULES',
+        targetType: 'AGENT',
+        targetId: id,
+        targetLabel: agent.companyName ?? agent.contactName,
+        after: { rates: written, effectiveFrom: now.toISOString() },
+        severity: 'WARNING', // 动费率=动钱，留痕等级同停用
+      });
+      return { ok: true, rates: written, effectiveFrom: now.toISOString() };
     },
   );
 };

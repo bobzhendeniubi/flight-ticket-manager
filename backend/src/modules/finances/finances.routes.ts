@@ -188,6 +188,11 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
     peakSurchargeCny: costNum,
     aircraftAdjustCny: costNum,
     takeoffDiscountCny: signedCostNum,
+    // A2 汇率四元组（可空）：包机原币种(ISO 4217)/原币金额/汇率/折算日——审计留痕，CNY 仍是入账口径
+    charterSourceCurrency: z.string().regex(/^[A-Z]{3}$/, '币种须为 3 位大写代码，如 USD').nullable().optional(),
+    charterSourceAmount: z.number().min(0).max(99_999_999).nullable().optional(),
+    charterFxRate: z.number().gt(0).max(100_000).nullable().optional(),
+    charterFxDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'YYYY-MM-DD').nullable().optional(),
     note: z.string().max(200).nullable().optional(),
   });
   const periodPatchSchema = z.object({
@@ -200,6 +205,11 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
     peakSurchargeCny: costNum,
     aircraftAdjustCny: costNum,
     takeoffDiscountCny: signedCostNum,
+    // A2 汇率四元组（可空）：包机原币种(ISO 4217)/原币金额/汇率/折算日——审计留痕，CNY 仍是入账口径
+    charterSourceCurrency: z.string().regex(/^[A-Z]{3}$/, '币种须为 3 位大写代码，如 USD').nullable().optional(),
+    charterSourceAmount: z.number().min(0).max(99_999_999).nullable().optional(),
+    charterFxRate: z.number().gt(0).max(100_000).nullable().optional(),
+    charterFxDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'YYYY-MM-DD').nullable().optional(),
     note: z.string().max(200).nullable().optional(),
   });
 

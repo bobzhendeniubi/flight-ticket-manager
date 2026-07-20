@@ -839,6 +839,12 @@ export const roomSupplementBodySchema = z.object({
     .min(1, '晚数至少 1')
     .max(ROOM_SUPPLEMENT_MAX_NIGHTS, `晚数最多 ${ROOM_SUPPLEMENT_MAX_NIGHTS}`),
   note: z.string().max(500).optional(),
+  // 幂等键（可选，客户端生成）：同 key 重试只入账一次，防双击/超时重发叠加多条 FEE 行。
+  idempotencyKey: z.string().min(8).max(128).optional(),
+  // 转单住的乘客（可选，A15 房控联动）：传了则同事务把该乘客标记 singleRoom=true，
+  // 并按权威公式重算套餐行计费房数 —— 房控销控板/分房/超卖提醒是派生账，随之自动跟上。
+  // 不传 = 旧行为（只收钱，房控不动），兼容存量调用方。
+  passengerId: z.string().min(1).max(64).optional(),
 });
 export type RoomSupplementBody = z.infer<typeof roomSupplementBodySchema>;
 

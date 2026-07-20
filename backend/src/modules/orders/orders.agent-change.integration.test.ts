@@ -106,7 +106,7 @@ describe('OrderService.changeOrderAgent · 真 DB E2E', () => {
     expect(result.audit.after.agentId).toBeNull();
   });
 
-  it('曾用原代理预存余额抵扣 → 改归属成功但 warning 非空（不回溯）', async () => {
+  it('曾用原代理预存余额抵扣 → 阻断（先结清再改归属，A16b 拍板）', async () => {
     const actor = await adminActor();
     const oldAgent = await createAgent({ companyName: '原代理' });
     const newAgent = await createAgent({ companyName: '新代理' });
@@ -124,12 +124,13 @@ describe('OrderService.changeOrderAgent · 真 DB E2E', () => {
       },
     });
 
-    const result = await service.changeOrderAgent(order.id, { agentId: newAgent.id }, actor);
+    // 旧口径：改归属成功 + warning。新口径（2026-07-17 拍板）：硬阻断，归属不变。
+    await expect(
+      service.changeOrderAgent(order.id, { agentId: newAgent.id }, actor),
+    ).rejects.toThrow(/余额抵扣/);
 
     const reloaded = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
-    expect(reloaded.agentId).toBe(newAgent.id); // 改归属成功（不阻断）
-    expect(result.warning).not.toBeNull(); // 提醒核对财务归属
-    expect(result.audit.usedAgentBalance).toBe(true);
+    expect(reloaded.agentId).toBe(oldAgent.id); // 归属未被改动
   });
 
   it('目标代理已停用 → BadRequestError，不更新', async () => {
