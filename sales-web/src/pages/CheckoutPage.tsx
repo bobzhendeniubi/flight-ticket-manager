@@ -394,29 +394,68 @@ export function CheckoutPage() {
           }];
         }
         if (i.kind === 'HOTEL') {
+          // H12：散客单买酒店必 400 的根因——这里以前只发 description/quantity/unitPrice，
+          // 丢了 hotelRoomTypeId。后端对游客/CUSTOMER（allowClientPricedGround=false）无 id 的
+          // 地面行一律拒单（"必须选择系统内的…产品，不能自定义价格"）。
+          // hotelRoomTypeId 在加购时已存进 meta（见 HotelDetailPage.tsx handleAdd）。
+          //
+          // 购物车里 i.unitPrice = 总价（每晚价 × 晚数 × 房数，qty 固定 1，见 HotelDetailPage.tsx
+          // 的 total = perNight * nights * rooms）。后端权威重算口径是
+          // 「hotelRoomTypeId 查到的每晚价 × quantity(晚数) × roomsBilled(房数)」，且带 id 时会用
+          // assertAmountWithinTolerance 比对 unitPrice×quantity —— quantity 必须传晚数、
+          // unitPrice 必须还原成每晚价，否则会被误判成价格漂移（PRICE_CHANGED）而拒单。
+          const nights = Math.max(1, Math.round(Number(i.meta?.nights)) || 1);
+          const rooms = Math.max(1, Math.round(Number(i.meta?.rooms)) || 1);
+          // HotelsPage.tsx 列表页"卡片内直接加购"在酒店没有房型时会写入空串兜底 —— 空串会被
+          // 后端 z.string().min(1) 拒成生硬的校验错误，这里当无 id 处理（退化到旧的拒单文案）。
+          const hotelRoomTypeId =
+            typeof i.meta?.hotelRoomTypeId === 'string' && i.meta.hotelRoomTypeId.length > 0
+              ? i.meta.hotelRoomTypeId
+              : undefined;
+          const perNightPrice = Math.round(i.unitPrice / (nights * rooms)) || 0;
           return [{
             kind: 'HOTEL',
             description: i.name,
-            quantity: i.qty,
-            unitPrice: i.unitPrice,
+            quantity: nights,
+            unitPrice: perNightPrice,
+            hotelRoomTypeId,
             checkIn: i.meta?.checkIn ? String(i.meta.checkIn) : undefined,
             checkOut: i.meta?.checkOut ? String(i.meta.checkOut) : undefined,
+            roomsBilled: rooms,
           }];
         }
         if (i.kind === 'TRANSFER') {
+          // H12：同上——接送产品 id（transfer.id）加购时就是 i.productId（见 TransferDetailPage.tsx /
+          // TransfersPage.tsx 的 add()），这里以前没透传，导致游客单买接送必 400。
           return [{
             kind: 'TRANSFER',
             description: i.name,
             quantity: i.qty,
             unitPrice: i.unitPrice,
+            transferId: i.productId,
           }];
         }
         if (i.kind === 'VISA') {
+          // H12：签证同理。但签证的 productId 在加购时被拼成了 `visa.id + '-express'`
+          // （VisaDetailPage.tsx 加急项要与普通项区分购物车行），不能直接当 visaId 用。
+          // 真实 visaId 已在加购时顺手存进 meta.visaId；老购物车数据（升级前已加购、只有拼串
+          // 没有 meta.visaId）才退化为剥 '-express' 后缀兜底。
+          const visaId =
+            typeof i.meta?.visaId === 'string'
+              ? i.meta.visaId
+              : i.productId.endsWith('-express')
+                ? i.productId.slice(0, -'-express'.length)
+                : i.productId;
           return [{
             kind: 'VISA',
             description: i.name,
             quantity: i.qty,
             unitPrice: i.unitPrice,
+            visaId,
+            // 加急附加费：后端 unitPrice = basePrice + (metadata.express ? expressSurcharge : 0)，
+            // 前端购物车 unitPrice 在加购时就是这个口径（VisaDetailPage.tsx），两边一致，
+            // 只要把 express 标记带过去即可，不会触发容差拒单。
+            ...(i.meta?.express ? { metadata: { express: true } } : {}),
           }];
         }
         if (i.kind === 'BUNDLE') {

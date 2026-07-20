@@ -277,7 +277,13 @@ function VisaDetailModal({ visa, onClose }: { visa: Visa; onClose: () => void })
       emoji: visa.flag,
       unitPrice,
       qty: count,
-      meta: { express, processingDays: express ? visa.processingDays - 2 : visa.processingDays },
+      // H12：同 VisaDetailPage.tsx —— productId 被拼了 '-express' 后缀，不能直接当 visaId，
+      // 干净的真实 id 单独存一份到 meta，结账页优先读这个。
+      meta: {
+        express,
+        processingDays: express ? visa.processingDays - 2 : visa.processingDays,
+        visaId: visa.id,
+      },
     });
     onClose();
     if (goCart) navigate('/cart');

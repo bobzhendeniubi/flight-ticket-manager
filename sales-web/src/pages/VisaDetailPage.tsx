@@ -189,7 +189,9 @@ export default function VisaDetailPage() {
       emoji: flag,
       unitPrice,
       qty: count,
-      meta: { express, processingDays: express ? expressDays : processingDays },
+      // H12：productId 在上面被拼成了 visa.id + '-express'（用来把加急/不加急区分成两条购物车行），
+      // 不能直接当后端要的 visaId 用；干净的真实 id 单独存一份到 meta，结账页优先读这个。
+      meta: { express, processingDays: express ? expressDays : processingDays, visaId: visa.id },
     });
     if (goCart) navigate('/cart');
   };

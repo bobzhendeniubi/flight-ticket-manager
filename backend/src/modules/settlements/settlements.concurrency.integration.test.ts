@@ -3,14 +3,19 @@
  *
  * 覆盖 codex+fable 交叉审计发现的三条同类并发路径（均因「状态事务外读、事务内无 status CAS」）：
  *
- *   R1-PAID  两个并发 APPROVED→PAID：修复前第二个事务会按同一 prepaymentOffset 再扣一次余额、
- *            再写一条 OFFSET、二次标 PAID。修后事务内先对 Settlement 做原子 CAS，只一次成功。
- *   R1-VOID  并发 APPROVED→PAID 与 APPROVED→VOIDED 交错：修前可能 PAID 已扣 offset+records SETTLED，
+ *   R1-PAID  两个并发 APPROVED→PAID：修前第二个事务会二次标 PAID / records 二次 SETTLED。
+ *            修后事务内先对 Settlement 做原子 CAS，只一次成功。
+ *   R1-VOID  并发 APPROVED→PAID 与 APPROVED→VOIDED 交错：修前可能 PAID 已把 records SETTLED，
  *            VOIDED 又把 records 解绑回 ACCRUED → 下期重复计入双付。修后 CAS 互斥 + VOID 解绑押 status。
  *   R9       generate(overwrite) 与审批赛跑：修前 overwrite 无条件把单打回 DRAFT + 解绑 records，
  *            并发已 APPROVED/PAID 会被静默重置成账面孤儿。修后 overwrite 用 status CAS 拒绝重算终态单。
  *
- * 铁律：一笔钱最多入账/扣账一次；已扣 offset 的 records 绝不被解绑回 unlinked。
+ * 铁律：一笔钱最多入账一次；已 SETTLED 的 records 绝不被解绑回 unlinked。
+ *
+ * 预付余额抵扣已停用（H1 修复）：以下用例特意在 seedSettlement 里保留一笔历史遗留的
+ * prepaymentOffset=50（模拟旧版本生成、尚未走到 PAID 的结算单），用来断言 PAID/VOIDED
+ * 流转不会再读/扣 Agent.prepaymentBalance、不会再写 PrepaymentTransaction(OFFSET) ——
+ * 即代理预存余额全程保持 100 不变，OFFSET 流水恒为 0 条。
  *
  * 跑：
  *   1. docker compose -f ../docker-compose.test.yml up -d
@@ -42,8 +47,9 @@ function currentPeriod(): string {
 }
 
 /**
- * 造一张结算单（默认 APPROVED）：代理预存 100，本单抵扣 50，绑定一条 ACCRUED 佣金（50）。
- * 若并发双扣，余额会被扣到 0 且冒出两条 OFFSET —— 正是这些测试要挡下的。
+ * 造一张结算单（默认 APPROVED）：代理预存 100，绑定一条 ACCRUED 佣金（50）。
+ * prepaymentOffset=50 是历史遗留字段值（模拟 H1 修复前生成的结算单）——PAID/VOIDED
+ * 流转必须安全忽略它：余额全程不变、绝不出现 OFFSET 流水。
  */
 async function seedSettlement(status: SettlementStatus = SettlementStatus.APPROVED) {
   const admin = await prisma.user.create({
@@ -109,8 +115,8 @@ async function seedSettlement(status: SettlementStatus = SettlementStatus.APPROV
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-describe('R1-PAID · 并发转 PAID 只成功一次、余额只扣一次（CAS 防双扣）', () => {
-  it('两个并发 APPROVED→PAID：恰一成功一失败，余额扣 50 一次，只一条 OFFSET，records SETTLED', async () => {
+describe('R1-PAID · 并发转 PAID 只成功一次（CAS 防双重 SETTLED），预付余额全程不受影响', () => {
+  it('两个并发 APPROVED→PAID：恰一成功一失败，records SETTLED，余额不变，无 OFFSET 流水', async () => {
     const { admin, agentId, settlementId, recordId } = await seedSettlement();
 
     const results = await Promise.allSettled([
@@ -126,17 +132,15 @@ describe('R1-PAID · 并发转 PAID 只成功一次、余额只扣一次（CAS �
     const finalS = await prisma.settlement.findUniqueOrThrow({ where: { id: settlementId } });
     expect(finalS.status).toBe(SettlementStatus.PAID);
 
-    // 余额只被扣一次：100 - 50 = 50（双扣会变成 0）
+    // 预付余额抵扣已停用：即便本单 prepaymentOffset 历史值=50，PAID 也绝不扣余额
     const finalAgent = await prisma.agent.findUniqueOrThrow({ where: { id: agentId } });
-    expect(Number(finalAgent.prepaymentBalance)).toBe(50);
+    expect(Number(finalAgent.prepaymentBalance)).toBe(100);
 
-    // 只有一条 OFFSET 流水，金额 = -50（双扣会有两条）
+    // 绝不写 OFFSET 流水
     const offsets = await prisma.prepaymentTransaction.findMany({
       where: { agentId, type: PrepaymentTxType.OFFSET },
     });
-    expect(offsets).toHaveLength(1);
-    expect(Number(offsets[0].amount)).toBe(-50);
-    expect(Number(offsets[0].balanceAfter)).toBe(50);
+    expect(offsets).toHaveLength(0);
 
     const rec = await prisma.commissionRecord.findUniqueOrThrow({ where: { id: recordId } });
     expect(rec.status).toBe(CommissionStatus.SETTLED);
@@ -144,8 +148,8 @@ describe('R1-PAID · 并发转 PAID 只成功一次、余额只扣一次（CAS �
 });
 
 // ══════════════════════════════════════════════════════════════════════════
-describe('R1-VOID · 并发 PAID 与 VOIDED 交错：绝不出现「已扣 offset 又把 records 解绑回 ACCRUED」', () => {
-  it('APPROVED→PAID 与 APPROVED→VOIDED 并发：恰一成功，账/记录一致（无双付孤儿）', async () => {
+describe('R1-VOID · 并发 PAID 与 VOIDED 交错：绝不出现「已 SETTLED 又把 records 解绑回 ACCRUED」', () => {
+  it('APPROVED→PAID 与 APPROVED→VOIDED 并发：恰一成功，账/记录一致（无双付孤儿），预付余额全程不变', async () => {
     const { admin, agentId, settlementId, recordId } = await seedSettlement();
 
     const results = await Promise.allSettled([
@@ -162,19 +166,19 @@ describe('R1-VOID · 并发 PAID 与 VOIDED 交错：绝不出现「已扣 offse
       where: { agentId, type: PrepaymentTxType.OFFSET },
     });
 
+    // 预付余额抵扣已停用：无论 PAID 还是 VOIDED 赢，余额都保持 100 不变，绝不出现 OFFSET 流水。
+    expect(Number(finalAgent.prepaymentBalance)).toBe(100);
+    expect(offsets).toHaveLength(0);
+
     if (finalS.status === SettlementStatus.PAID) {
-      // PAID 赢：offset 扣一次、records SETTLED 且仍绑定
+      // PAID 赢：records SETTLED 且仍绑定
       expect(rec.status).toBe(CommissionStatus.SETTLED);
       expect(rec.settlementId).toBe(settlementId);
-      expect(Number(finalAgent.prepaymentBalance)).toBe(50);
-      expect(offsets).toHaveLength(1);
     } else {
-      // VOIDED 赢：绝不扣 offset、records 解绑回 ACCRUED、余额原样
+      // VOIDED 赢：records 解绑回 ACCRUED
       expect(finalS.status).toBe(SettlementStatus.VOIDED);
       expect(rec.status).toBe(CommissionStatus.ACCRUED);
       expect(rec.settlementId).toBeNull();
-      expect(Number(finalAgent.prepaymentBalance)).toBe(100);
-      expect(offsets).toHaveLength(0);
     }
   });
 });

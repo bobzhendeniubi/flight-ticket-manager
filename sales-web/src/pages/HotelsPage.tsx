@@ -134,14 +134,12 @@ export function HotelsPage() {
 
   /** 卡片内直接加购：取最便宜房型 × 1 间 × nights 晚（不打断列表流，详情页可精选房型）。 */
   const quickAdd = (h: Hotel) => {
+    // basePrice 已是该房型最终单价（含倍率），priceMultiplier 为遗留字段，不再参与计价，
+    // 否则会与后端收款口径（只认 basePrice）不一致，导致下单被拒。
     const cheapest = [...h.roomTypes].sort(
-      (a, b) =>
-        Number(a.basePrice) * Number(a.priceMultiplier ?? 1) -
-        Number(b.basePrice) * Number(b.priceMultiplier ?? 1),
+      (a, b) => Number(a.basePrice) - Number(b.basePrice),
     )[0];
-    const perNight = cheapest
-      ? Math.round(Number(cheapest.basePrice) * Number(cheapest.priceMultiplier ?? 1))
-      : basePriceNum(h);
+    const perNight = cheapest ? Math.round(Number(cheapest.basePrice)) : basePriceNum(h);
     const roomName = cheapest?.name ?? '标准房';
     add({
       kind: 'HOTEL',

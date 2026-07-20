@@ -5,7 +5,11 @@
  *   （updateMany where:{id,status:期望值}）。当 CAS 落空（count=0，代表并发的第二个请求
  *   基于同一份「事务外读到的 APPROVED」快照进来，但第一个已推进）时：
  *     - 必须抛 ConflictError；
- *     - 绝不再扣余额、绝不再写 OFFSET 流水、绝不再翻 records —— 一笔钱只入账/扣账一次。
+ *     - 绝不再翻 records —— 一笔钱只入账一次。
+ *
+ * 预付余额抵扣已停用（H1 修复）：PAID 分支不再读/扣 Agent.prepaymentBalance、不再写
+ * PrepaymentTransaction(OFFSET)，即便结算单上的 prepaymentOffset 是历史遗留的非零值
+ * （见下方 approvedSettlementRow 里刻意保留的 Decimal(50)，用来验证它被安全忽略）。
  *
  * 真实 DB 层的行锁串行化（第二个 UPDATE 阻塞→重判→count=0）由并发集成测试覆盖，
  * 这里用 mock 把「CAS 落空」这一分支钉死为确定性用例。
@@ -105,16 +109,13 @@ describe('SettlementService.updateStatus · 并发 CAS 落空必须整体回滚�
     expect(tx.commissionRecord.updateMany).not.toHaveBeenCalled();
   });
 
-  it('CAS 命中（count=1）时不抛 Conflict —— 正常流转继续走下去（PAID 分支扣一次余额）', async () => {
+  it('CAS 命中（count=1）时不抛 Conflict —— 正常流转继续走下去（PAID 分支不再碰预存款余额）', async () => {
     const service = new SettlementService();
+    // 结算单上的 prepaymentOffset=50 是历史遗留值（H1 修复前生成）；PAID 分支必须安全忽略它。
     mockedPrisma.settlement.findUnique.mockResolvedValue(approvedSettlementRow());
 
     const tx = makeTxMock(1); // CAS 命中
     tx.commissionRecord.updateMany.mockResolvedValue({ count: 1 });
-    // Agent FOR UPDATE 读到足额余额（100 ≥ offset 50）
-    tx.$queryRaw.mockResolvedValue([{ prepaymentBalance: new Prisma.Decimal(100) }]);
-    tx.agent.update.mockResolvedValue({});
-    tx.prepaymentTransaction.create.mockResolvedValue({});
     tx.settlement.findUniqueOrThrow.mockResolvedValue(serializableSettlement());
     mockedPrisma.$transaction.mockImplementation(async (cb: (t: unknown) => unknown) => cb(tx));
 
@@ -122,12 +123,12 @@ describe('SettlementService.updateStatus · 并发 CAS 落空必须整体回滚�
       service.updateStatus('s-1', SettlementStatus.PAID, ADMIN),
     ).resolves.toBeTruthy();
 
-    // 恰好一次扣减 + 恰好一条 OFFSET 流水（金额 = -offset）
-    expect(tx.agent.update).toHaveBeenCalledTimes(1);
-    expect(tx.prepaymentTransaction.create).toHaveBeenCalledTimes(1);
-    const offsetArg = tx.prepaymentTransaction.create.mock.calls[0][0].data;
-    expect(Number(offsetArg.amount)).toBe(-50);
-    expect(Number(offsetArg.balanceAfter)).toBe(50); // 100 - 50，只扣一次
+    // records 翻 SETTLED 照常发生
+    expect(tx.commissionRecord.updateMany).toHaveBeenCalledTimes(1);
+    // 预付余额抵扣已停用：绝不读余额、绝不扣余额、绝不写 OFFSET 流水
+    expect(tx.$queryRaw).not.toHaveBeenCalled();
+    expect(tx.agent.update).not.toHaveBeenCalled();
+    expect(tx.prepaymentTransaction.create).not.toHaveBeenCalled();
   });
 });
 

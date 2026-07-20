@@ -10,17 +10,24 @@
  *   commissionPaidToChildren = Σ CommissionRecord.amount for descendant agents, on orders this agent is in chain of
  *                             （信息展示字段；不影响 netCommission 的计算，因 records 已是净额）
  *   netCommission           = commissionEarned（records 本身已经是链路扣除后的净额）
- *   prepaymentOffset        = min(netCommission, agent.prepaymentBalance) —— 抵扣预付余额
- *   payableToAgent          = netCommission - prepaymentOffset
+ *   prepaymentOffset        = 恒为 0（已停用，见下方说明）；历史结算单上的非零值仅保留展示/对账用途
+ *   payableToAgent          = max(0, netCommission)
+ *
+ * ⚠️ 预付余额抵扣已停用（资金双吃修复）：
+ *   代理的预存款是代理自己预先充值进来的钱（Agent.prepaymentBalance 语义 = 代理的资产余额，
+ *   不是平台欠代理的债务，也不许赊账）。旧实现会在结算单转 PAID 时，把「平台应付给代理的佣金」
+ *   去抵扣代理自己的预存款余额——但预存款本来就是代理的钱，根本不存在"欠款"可抵，实质是让
+ *   代理自掏腰包抵自己该收的佣金：该收的佣金没收到，预存款还被扣掉，两头受损。
+ *   若未来要做"佣金转存款"，应做成代理预存款余额的显式增加（入账流水），而不是从应付佣金里
+ *   反向扣减——那不在本次修复范围内。
  *
  * 状态机：DRAFT → PENDING_APPROVAL → APPROVED → PAID
- *   PAID 时：  CommissionRecord.status ACCRUED → SETTLED；PrepaymentTransaction 写一条 OFFSET
+ *   PAID 时：  CommissionRecord.status ACCRUED → SETTLED（不再扣预存款余额、不再写 OFFSET 流水）
  *   VOIDED 时：关联 records 回 ACCRUED（可重算）
  */
 import {
   CommissionStatus,
   Prisma,
-  PrepaymentTxType,
   SettlementStatus,
   UserRole,
 } from '@prisma/client';
@@ -284,13 +291,9 @@ export class SettlementService {
     //   records 本身已是链路净额；reversalAmount 把退款追回的部分扣回（可使 net 变小甚至为负）。
     const netCommission = commissionEarned + reversalAmount;
 
-    // 4. 预付抵扣：取 min(netCommission, 当前 prepaymentBalance)
-    const agent = await prisma.agent.findUnique({
-      where: { id: agentId },
-      select: { prepaymentBalance: true },
-    });
-    const balance = Number(agent?.prepaymentBalance ?? 0);
-    const prepaymentOffset = Math.max(0, Math.min(netCommission, balance));
+    // 4. 预付抵扣已停用：预存款是代理自己的资产，不存在可抵的欠款场景（见文件头说明）。
+    // prepaymentOffset 恒为 0；payableToAgent 直接等于净佣金（负数钳 0 是 H2，本次不动）。
+    const prepaymentOffset = 0;
     const payableToAgent = Math.max(0, netCommission - prepaymentOffset);
 
     return {
@@ -412,13 +415,11 @@ export class SettlementService {
     const updated = await prisma.$transaction(async (tx) => {
       // ── 原子 CAS：where 附加事务外读到的当前状态，一步完成「校验+推进」──
       // 铁律：一笔钱最多入账/扣账一次。两个并发的 APPROVED→PAID（或 APPROVED→PAID 与
-      // APPROVED→VOIDED 抢跑）都能基于同一份事务外快照进事务；仅靠 Agent FOR UPDATE 只串行化
-      // 余额扣减本身，挡不住第二个事务再按同一 prepaymentOffset 写一条 OFFSET、再扣一次余额、
-      // 把结算单二次标 PAID / records 二次 SETTLED。这里先对 Settlement 行做 CAS 抢锁：
+      // APPROVED→VOIDED 抢跑）都能基于同一份事务外快照进事务；无 CAS 会导致结算单二次
+      // 标 PAID / records 二次 SETTLED。这里先对 Settlement 行做 CAS 抢锁：
       // 第一个事务把 status 从快照值改成 toStatus（拿到行锁，count=1）；第二个事务的 UPDATE
       // 在 READ COMMITTED 下阻塞到第一个提交后，重判 where（status 已非快照值）→ count=0 →
-      // 抛 Conflict 整体回滚，绝不进入后面的扣余额 / 写 OFFSET / 翻 records。CAS 先于所有副作用，
-      // 因此第二个事务连 Agent FOR UPDATE 都到不了（天然无锁序死锁）。
+      // 抛 Conflict 整体回滚，绝不进入后面翻 records。CAS 先于所有副作用。
       const casResult = await tx.settlement.updateMany({
         where: { id, status: s.status },
         data: {
@@ -434,46 +435,15 @@ export class SettlementService {
         );
       }
 
-      // 标记 PAID：records SETTLED + 写 PrepaymentTransaction（若 offset>0）
+      // 标记 PAID：records SETTLED。
+      // 预付余额抵扣已停用（见文件头说明）：不再读/扣 Agent.prepaymentBalance，
+      // 不再写 PrepaymentTransaction(OFFSET)——即便本单 prepaymentOffset 是历史遗留的非零值
+      // （旧版本生成、尚未走到 PAID 的结算单），转 PAID 时也不再触发任何余额扣减。
       if (toStatus === 'PAID') {
         await tx.commissionRecord.updateMany({
           where: { settlementId: s.id, status: CommissionStatus.ACCRUED },
           data: { status: CommissionStatus.SETTLED, settledAt: new Date() },
         });
-
-        const offset = Number(s.prepaymentOffset);
-        if (offset > 0) {
-          // FOR UPDATE 行锁：两张结算单并发批准时防止用同一余额快照双扣（透支）
-          const agentRows = await tx.$queryRaw<Array<{ prepaymentBalance: Prisma.Decimal }>>`
-            SELECT "prepaymentBalance" FROM "Agent" WHERE id = ${s.agentId} FOR UPDATE
-          `;
-          if (!agentRows[0]) throw new NotFoundError('代理不存在');
-          const freshBalance = Number(agentRows[0].prepaymentBalance);
-          // prepaymentOffset 是「生成结算单当时」的余额快照；生成后余额可能已被订单抵扣消耗。
-          // 余额不允许为负（不许赊账），且已审核的结算数字不悄悄改 ——
-          // 余额不足以覆盖快照抵扣时拒绝转 PAID，让财务作废本单后按当前余额重新生成。
-          if (offset > freshBalance + 0.001) {
-            throw new BadRequestError(
-              `代理当前预存余额 ¥${freshBalance.toFixed(2)} 已不足以覆盖本单抵扣 ¥${offset.toFixed(2)}` +
-                '（生成结算单后余额有新消耗）；请作废本单后重新生成',
-            );
-          }
-          const newBalance = round2(freshBalance - offset);
-          await tx.agent.update({
-            where: { id: s.agentId },
-            data: { prepaymentBalance: new Prisma.Decimal(newBalance) },
-          });
-          await tx.prepaymentTransaction.create({
-            data: {
-              agentId: s.agentId,
-              amount: new Prisma.Decimal(-offset),
-              balanceAfter: new Prisma.Decimal(newBalance),
-              type: PrepaymentTxType.OFFSET,
-              description: `结算单 ${s.period} 抵扣`,
-              createdById: requester.userId,
-            },
-          });
-        }
       }
 
       // VOIDED：records 回 ACCRUED（可重算）。CAS 已抢到本次流转，故这里的 records 回滚

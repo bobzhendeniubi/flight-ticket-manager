@@ -51,8 +51,10 @@ function nightsBetween(checkIn: string, checkOut: string): number {
   );
 }
 
+// basePrice 已是该房型最终单价（含倍率），priceMultiplier 为遗留字段，不再参与计价，
+// 否则会与后端收款口径（只认 basePrice）不一致，导致下单被拒。
 function roomPerNight(rt: HotelRoomType): number {
-  return Math.round(Number(rt.basePrice) * Number(rt.priceMultiplier ?? 1));
+  return Math.round(Number(rt.basePrice));
 }
 
 // ── 评论：make up（按需求写的样例评价）；与后端真实评价合并展示 ──────────────

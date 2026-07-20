@@ -506,6 +506,8 @@ export interface CreateOrderInput {
         hotelRoomTypeId?: string;
         checkIn?: string;
         checkOut?: string;
+        /** 计费房间数（支持 0.5 间）；缺省按 1 间处理。房控板据此统计占房。 */
+        roomsBilled?: number;
         metadata?: Record<string, unknown>;
       }
     | {

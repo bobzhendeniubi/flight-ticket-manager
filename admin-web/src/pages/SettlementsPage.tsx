@@ -124,7 +124,7 @@ export function SettlementsPage() {
     <div className="space-y-4">
       <section>
         <h1 className="page-title">结算单管理</h1>
-        <p className="page-sub">每月自动/手动生成每个代理的结算单 · GMV → 佣金 → 预付抵扣 → 应付</p>
+        <p className="page-sub">每月自动/手动生成每个代理的结算单 · GMV → 佣金 → 应付（预付抵扣列已停用，仅历史结算单可能有非零值）</p>
       </section>
 
       <section className="grid gap-3 md:grid-cols-5">
@@ -174,7 +174,7 @@ export function SettlementsPage() {
               { key: 'commissionEarned', label: '应得佣金', format: (v) => `¥${Number(v).toLocaleString()}` },
               { key: 'paidToChildren', label: '分给下级', format: (v) => `¥${Number(v).toLocaleString()}` },
               { key: 'netCommission', label: '净佣金', format: (v) => `¥${Number(v).toLocaleString()}` },
-              { key: 'prepaymentOffset', label: '预付抵扣', format: (v) => `¥${Number(v).toLocaleString()}` },
+              { key: 'prepaymentOffset', label: '预付抵扣（已停用，历史值）', format: (v) => `¥${Number(v).toLocaleString()}` },
               { key: 'payable', label: '应付', format: (v) => `¥${Number(v).toLocaleString()}` },
               { key: 'status', label: '状态' },
               { key: 'paidAt', label: '支付时间' },
@@ -225,7 +225,7 @@ export function SettlementsPage() {
                 <th className="text-right">应得</th>
                 <th className="text-right">分下级</th>
                 <th className="text-right">净佣金</th>
-                <th className="text-right">预付抵</th>
+                <th className="text-right" title="预付余额抵扣已停用，仅显示历史结算单的旧值">预付抵(停用)</th>
                 <th className="text-right">应付</th>
                 <th className="text-center">状态</th>
               </tr>
@@ -324,7 +324,7 @@ function SettlementDrawer({
           <Row label="应得佣金" value={<span className="text-green-700 font-medium">+¥{Number(settlement.commissionEarned).toLocaleString()}</span>} />
           <Row label="分给下级" value={<span className="text-amber-700">−¥{Number(settlement.commissionPaidToChildren).toLocaleString()}</span>} />
           <Row label="净佣金" value={<span className="font-bold text-green-700">¥{Number(settlement.netCommission).toLocaleString()}</span>} />
-          <Row label="预付余额抵扣" value={<span className="text-red-600">−¥{Number(settlement.prepaymentOffset).toLocaleString()}</span>} />
+          <Row label="预付余额抵扣（已停用，历史值）" value={<span className="text-red-600">−¥{Number(settlement.prepaymentOffset).toLocaleString()}</span>} />
           <div className="border-t-2 border-slate-300 pt-2 mt-2"></div>
           <Row label={<strong>应付给代理</strong>} value={<strong className="text-2xl text-brand">¥{Number(settlement.payableToAgent).toLocaleString()}</strong>} />
         </div>
