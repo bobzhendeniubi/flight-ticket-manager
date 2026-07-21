@@ -293,6 +293,8 @@ export function OrdersPage() {
   const [recycleLoading, setRecycleLoading] = useState(false);
   const [recycleError, setRecycleError] = useState<string | null>(null);
   const [restoringId, setRestoringId] = useState<string | null>(null);
+  // 回收站搜索：订单号/联系人名/乘客姓名（含中文名），走后端 search 参数模糊匹配
+  const [recycleSearch, setRecycleSearch] = useState('');
   const [statusFilter, setStatusFilter] = useState<'' | OrderStatus>('');
   const [kindFilter, setKindFilter] = useState<'' | OrderItemKindLabel>('');
   const [channelFilter, setChannelFilter] = useState<'' | 'direct' | 'agent'>('');
@@ -602,14 +604,16 @@ export function OrdersPage() {
     }
   };
 
-  // 打开回收站（仅 ADMIN）→ 拉已软删订单列表
-  const openRecycleBin = async () => {
+  // 拉已软删订单列表；search 非空时走后端模糊匹配（订单号/联系人名/乘客姓名含中文名）。
+  const fetchDeletedOrders = async (search: string) => {
     if (!tokens?.accessToken) return;
-    setShowRecycleBin(true);
     setRecycleLoading(true);
     setRecycleError(null);
     try {
-      const res = await api.listDeletedOrders(tokens.accessToken, { pageSize: 200 });
+      const res = await api.listDeletedOrders(tokens.accessToken, {
+        pageSize: 200,
+        search: search.trim() || undefined,
+      });
       setDeletedOrders(res.orders);
     } catch (err) {
       setRecycleError(err instanceof ApiError ? err.message : '加载回收站失败');
@@ -617,6 +621,23 @@ export function OrdersPage() {
       setRecycleLoading(false);
     }
   };
+
+  // 打开回收站（仅 ADMIN）→ 重置搜索框 + 拉已软删订单列表
+  const openRecycleBin = async () => {
+    setShowRecycleBin(true);
+    setRecycleSearch('');
+    await fetchDeletedOrders('');
+  };
+
+  // 搜索框输入变化后 400ms 防抖重查；仅在弹窗打开时生效，关闭后不空跑。
+  useEffect(() => {
+    if (!showRecycleBin) return;
+    const timer = setTimeout(() => {
+      void fetchDeletedOrders(recycleSearch);
+    }, 400);
+    return () => clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [recycleSearch, showRecycleBin]);
 
   // 恢复一单：deletedAt 置回 null → 从回收站表移除 + 刷新主列表（恢复的单重新出现）。
   // 软删/恢复都不触碰座位账，无需广播座位变更。
@@ -1619,7 +1640,16 @@ export function OrdersPage() {
                       onChange={() => toggleRow(order.id)}
                     />
                   </td>
-                  <td className="font-mono text-xs text-ink-soft">{order.orderNumber}</td>
+                  <td className="text-xs">
+                    <button
+                      type="button"
+                      className="font-mono text-brand hover:text-brand-dark hover:underline"
+                      onClick={() => setSelected(order)}
+                      title="查看详情"
+                    >
+                      {order.orderNumber}
+                    </button>
+                  </td>
                   <td>
                     <div className="font-medium text-ink">{view.customerName}</div>
                     <div className="text-xs text-ink-muted">{order.contactPhone}</div>
@@ -1637,6 +1667,16 @@ export function OrdersPage() {
                       <span className="rounded bg-slate-100 px-1.5 py-0.5">{KIND_LABEL[view.itemKind]}</span>
                       <span><span className="nums font-medium text-ink">{order.passengers.length}</span> 人</span>
                     </div>
+                    {order.passengers.length > 0 && (() => {
+                      const names = order.passengers.map((p) => p.chineseName?.trim() || p.fullName);
+                      const shown = names.slice(0, 3);
+                      const hasMore = names.length > shown.length;
+                      return (
+                        <div className="mt-0.5 max-w-xs truncate text-[11px] text-ink-muted" title={names.join('、')}>
+                          {shown.join('、')}{hasMore ? ` 等${names.length}人` : ''}
+                        </div>
+                      );
+                    })()}
                   </td>
                   <td className="nums whitespace-nowrap text-left text-xs text-ink-soft">
                     {order.departDate ?? <span className="text-ink-muted">—</span>}
@@ -1807,19 +1847,30 @@ export function OrdersPage() {
                 ×
               </button>
             </div>
+            <div className="border-b border-slate-200 px-6 py-3">
+              <input
+                type="search"
+                value={recycleSearch}
+                onChange={(e) => setRecycleSearch(e.target.value)}
+                placeholder="搜索订单号 / 乘客姓名…"
+                className="w-full rounded-md border border-slate-200 px-3 py-1.5 text-sm text-ink placeholder:text-ink-muted focus:border-brand focus:outline-none"
+              />
+            </div>
             <div className="flex-1 overflow-auto px-6 py-5">
               {recycleLoading ? (
                 <p className="py-8 text-center text-sm text-ink-muted">载入中…</p>
               ) : recycleError ? (
                 <p className="py-8 text-center text-sm text-rose-600">{recycleError}</p>
               ) : deletedOrders.length === 0 ? (
-                <p className="py-8 text-center text-sm text-ink-muted">回收站为空</p>
+                <p className="py-8 text-center text-sm text-ink-muted">
+                  {recycleSearch ? '没有匹配的已删除订单' : '回收站为空'}
+                </p>
               ) : (
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="border-b border-slate-200 text-left text-xs text-ink-muted">
                       <th className="py-2 pr-3 font-medium">订单号</th>
-                      <th className="py-2 pr-3 font-medium">客户</th>
+                      <th className="py-2 pr-3 font-medium">客户 / 乘客</th>
                       <th className="py-2 pr-3 font-medium">金额</th>
                       <th className="py-2 pr-3 font-medium">原状态</th>
                       <th className="py-2 pr-3 font-medium">删除时间</th>
@@ -1827,32 +1878,47 @@ export function OrdersPage() {
                     </tr>
                   </thead>
                   <tbody>
-                    {deletedOrders.map((o) => (
-                      <tr key={o.id} className="border-b border-slate-100">
-                        <td className="py-2 pr-3 font-mono text-xs">{o.orderNumber}</td>
-                        <td className="py-2 pr-3">{o.customerName}</td>
-                        <td className="nums py-2 pr-3">¥{Number(o.total).toLocaleString()}</td>
-                        <td className="py-2 pr-3">
-                          <span className={STATUS_COLOR[o.status]}>{STATUS_LABEL[o.status]}</span>
-                        </td>
-                        <td className="py-2 pr-3 text-xs text-ink-muted">
-                          {o.deletedAt ? new Date(o.deletedAt).toLocaleString('zh-CN') : '—'}
-                          {o.deletedBy ? (
-                            <span className="block text-[11px]">操作人：{o.deletedBy}</span>
-                          ) : null}
-                        </td>
-                        <td className="py-2 pr-3 text-right">
-                          <button
-                            type="button"
-                            className="btn-secondary text-xs"
-                            disabled={restoringId === o.id}
-                            onClick={() => void restoreOrder(o)}
-                          >
-                            {restoringId === o.id ? '恢复中…' : '恢复'}
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
+                    {deletedOrders.map((o) => {
+                      const names = o.passengerNames ?? [];
+                      const shownNames = names.slice(0, 3);
+                      const hasMoreNames = names.length > shownNames.length;
+                      return (
+                        <tr key={o.id} className="border-b border-slate-100">
+                          <td className="py-2 pr-3 font-mono text-xs">{o.orderNumber}</td>
+                          <td className="py-2 pr-3">
+                            <div>{o.customerName}</div>
+                            {names.length > 0 && (
+                              <div
+                                className="mt-0.5 max-w-[220px] truncate text-[11px] text-ink-muted"
+                                title={names.join('、')}
+                              >
+                                {shownNames.join('、')}{hasMoreNames ? ` 等${names.length}人` : ''}
+                              </div>
+                            )}
+                          </td>
+                          <td className="nums py-2 pr-3">¥{Number(o.total).toLocaleString()}</td>
+                          <td className="py-2 pr-3">
+                            <span className={STATUS_COLOR[o.status]}>{STATUS_LABEL[o.status]}</span>
+                          </td>
+                          <td className="py-2 pr-3 text-xs text-ink-muted">
+                            {o.deletedAt ? new Date(o.deletedAt).toLocaleString('zh-CN') : '—'}
+                            {o.deletedBy ? (
+                              <span className="block text-[11px]">操作人：{o.deletedBy}</span>
+                            ) : null}
+                          </td>
+                          <td className="py-2 pr-3 text-right">
+                            <button
+                              type="button"
+                              className="btn-secondary text-xs"
+                              disabled={restoringId === o.id}
+                              onClick={() => void restoreOrder(o)}
+                            >
+                              {restoringId === o.id ? '恢复中…' : '恢复'}
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
                   </tbody>
                 </table>
               )}
@@ -2056,57 +2122,17 @@ function OrderDrawer({
         </div>
 
         <div className="flex-1 space-y-5 overflow-auto px-6 py-5">
-          {/* ── 概览：最常查的信息一屏看全（客户 / 付款 / 签证 / 酒店拼房）── */}
-          <section className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-            {/* 客户 */}
-            <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3">
-              <div className="text-xs font-semibold uppercase tracking-wide text-ink-muted">客户</div>
-              <div className="mt-1.5 text-sm font-medium text-ink">{view.customerName}</div>
-              <div className="text-xs text-ink-soft">{o.contactPhone}</div>
-              {o.contactEmail && <div className="truncate text-xs text-ink-muted">{o.contactEmail}</div>}
-              {/* 归属代理徽标 + 更改（仅 ADMIN/STAFF；口径 C 任何状态都能改，留审计） */}
-              <div className="mt-1 flex flex-wrap items-center gap-1.5">
-                {view.agentName ? (
-                  <span className="badge-info">{view.agentName}</span>
-                ) : (
-                  <span className="text-[11px] text-ink-muted">直客（无代理）</span>
-                )}
-                {isOps && (
-                  <button
-                    type="button"
-                    className="text-[11px] font-medium text-brand hover:text-brand-dark"
-                    onClick={() => setAgentEditOpen(true)}
-                  >
-                    更改
-                  </button>
-                )}
-              </div>
-              <div className="mt-1 text-[11px] text-ink-muted">下单 {new Date(o.createdAt).toLocaleString('zh-CN')}</div>
-            </div>
+          {/* 乘客（读 hydrated → 护照号/生日/国籍/类型 真实显示）*/}
+          <PassengersSection order={o} onOrderUpdated={handleOrderUpdated} />
 
-            {/* 付款情况（与列表尾款/状态一致；抵扣读 notePayment）*/}
-            <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3">
-              <div className="text-xs font-semibold uppercase tracking-wide text-ink-muted">付款情况</div>
-              <div className="mt-1.5 flex items-baseline gap-1 text-sm">
-                <span className="nums text-lg font-semibold text-emerald-700">¥{bal.paid.toLocaleString()}</span>
-                <span className="text-ink-muted"> / 应收 ¥{(bal.total + bal.adjustment).toLocaleString()}</span>
-              </div>
-              <div className="mt-1 flex flex-wrap items-center gap-1.5">
-                <BalanceBadge balance={bal.balance} settlementMode={o.agent?.settlementMode} />
-                {bal.adjustment !== 0 && (
-                  <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[11px] text-amber-700">含售后费 ¥{bal.adjustment.toLocaleString()}</span>
-                )}
-              </div>
-              {o.notePayment && (
-                <div className="mt-1.5 rounded bg-white px-2 py-1 text-[11px] text-ink-soft">
-                  <span className="text-ink-muted">抵扣/备注：</span>{o.notePayment}
-                </div>
-              )}
-            </div>
+          {/* 开票（六态：去程 / 回程 / 系统 三个独立开关）*/}
+          <InvoiceFlagsSection order={o} onOrderUpdated={handleOrderUpdated} />
 
+          {/* ── 酒店：拼房卡 + 酒店备注（紧跟乘客区，运营排序需求）── */}
+          <section className="space-y-3">
             {/* 酒店情况（酒店中文名 + 拼房/整间 摘要 = 旧系统备注）*/}
             {(needsRooming || hotelName) && (
-              <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3 sm:col-span-2">
+              <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3">
                 <div className="flex items-center justify-between gap-2">
                   <div className="text-xs font-semibold uppercase tracking-wide text-ink-muted">酒店情况 · 拼房</div>
                   <div className="flex items-center gap-2">
@@ -2155,6 +2181,50 @@ function OrderDrawer({
             )}
           </section>
 
+          {/* 客户备注 */}
+          <NotesSection order={o} />
+
+          {/* ── 付款：付款情况卡 + 收款操作（相邻摆放，运营排序需求）── */}
+          <section className="space-y-3">
+            {/* 付款情况（与列表尾款/状态一致；抵扣读 notePayment）*/}
+            <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3">
+              <div className="text-xs font-semibold uppercase tracking-wide text-ink-muted">付款情况</div>
+              <div className="mt-1.5 flex items-baseline gap-1 text-sm">
+                <span className="nums text-lg font-semibold text-emerald-700">¥{bal.paid.toLocaleString()}</span>
+                <span className="text-ink-muted"> / 应收 ¥{(bal.total + bal.adjustment).toLocaleString()}</span>
+              </div>
+              <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                <BalanceBadge balance={bal.balance} settlementMode={o.agent?.settlementMode} />
+                {bal.adjustment !== 0 && (
+                  <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[11px] text-amber-700">含售后费 ¥{bal.adjustment.toLocaleString()}</span>
+                )}
+              </div>
+              {o.notePayment && (
+                <div className="mt-1.5 rounded bg-white px-2 py-1 text-[11px] text-ink-soft">
+                  <span className="text-ink-muted">抵扣/备注：</span>{o.notePayment}
+                </div>
+              )}
+            </div>
+
+            {/* 收款（确认收款 / 代理余额抵扣 / 多付处理）*/}
+            <ConfirmPaymentSection
+              orderId={o.id}
+              total={view.totalNum + (Number(o.adjustmentCny) || 0)}
+              paidAmount={Number(o.paidAmount)}
+              agent={o.agent}
+              onChanged={onChanged}
+            />
+          </section>
+
+          {/* 财务/出纳：预期到账金额 + 订单杂项成本（仅 ADMIN/STAFF 可见，组件内做权限判断） */}
+          <OrderFinanceSection
+            orderId={o.id}
+            initialExpectedAmountCny={o.expectedAmountCny}
+            initialExpectedAmountLocked={o.expectedAmountLocked}
+            payableCny={Number(o.total) + Number(o.adjustmentCny ?? 0)}
+            onChanged={onChanged}
+          />
+
           {/* 产品内容 */}
           <section>
             <h3 className="text-xs font-semibold uppercase tracking-wide text-ink-muted">产品内容</h3>
@@ -2198,44 +2268,52 @@ function OrderDrawer({
                 ))}
               </ul>
             )}
-            <p className="mt-2 text-xs text-ink-muted">共 {o.passengers.length} 位乘客</p>
+            <p className="mt-2 text-xs text-ink-muted">
+              共 {o.passengers.length} 位乘客
+              {o.passengers.length > 0 && (
+                <>：{o.passengers.map((p) => p.chineseName?.trim() || p.fullName).join('、')}</>
+              )}
+            </p>
           </section>
 
           <AdjustmentsSection order={o} />
 
-          {/* 乘客（读 hydrated → 护照号/生日/国籍/类型 真实显示）*/}
-          <PassengersSection order={o} onOrderUpdated={handleOrderUpdated} />
-
-          {/* 开票（六态：去程 / 回程 / 系统 三个独立开关）*/}
-          <InvoiceFlagsSection order={o} onOrderUpdated={handleOrderUpdated} />
-
-          {/* 收款（确认收款 / 代理余额抵扣 / 多付处理）*/}
-          <ConfirmPaymentSection
-            orderId={o.id}
-            total={view.totalNum + (Number(o.adjustmentCny) || 0)}
-            paidAmount={Number(o.paidAmount)}
-            agent={o.agent}
-            onChanged={onChanged}
-          />
-
           <OpsToolbar order={o} onAdvance={onAdvance} />
 
-          <NotesSection order={o} />
+          {/* 客户（含归属代理 + 更改；运营排序需求置底部区）*/}
+          <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3">
+            <div className="text-xs font-semibold uppercase tracking-wide text-ink-muted">客户</div>
+            <div className="mt-1.5 text-sm font-medium text-ink">{view.customerName}</div>
+            <div className="text-xs text-ink-soft">{o.contactPhone}</div>
+            {o.contactEmail && <div className="truncate text-xs text-ink-muted">{o.contactEmail}</div>}
+            {/* 归属代理徽标 + 更改（仅 ADMIN/STAFF；口径 C 任何状态都能改，留审计） */}
+            <div className="mt-1 flex flex-wrap items-center gap-1.5">
+              {view.agentName ? (
+                <span className="badge-info">{view.agentName}</span>
+              ) : (
+                <span className="text-[11px] text-ink-muted">直客（无代理）</span>
+              )}
+              {isOps && (
+                <button
+                  type="button"
+                  className="text-[11px] font-medium text-brand hover:text-brand-dark"
+                  onClick={() => setAgentEditOpen(true)}
+                >
+                  更改
+                </button>
+              )}
+            </div>
+            <div className="mt-1 text-[11px] text-ink-muted">下单 {new Date(o.createdAt).toLocaleString('zh-CN')}</div>
+          </div>
 
           <RemindersSection order={o} />
 
-          {/* 财务/出纳：预期到账金额 + 订单杂项成本（仅 ADMIN/STAFF 可见，组件内做权限判断） */}
-          <OrderFinanceSection
-            orderId={o.id}
-            initialExpectedAmountCny={o.expectedAmountCny}
-            initialExpectedAmountLocked={o.expectedAmountLocked}
-            payableCny={Number(o.total) + Number(o.adjustmentCny ?? 0)}
-            onChanged={onChanged}
-          />
-
-          {/* 履约 Fulfillment — PNR 为演示自动出票（非真实航司 PNR），组件内已加标注 */}
-          <FulfillmentSection orderId={o.id} />
-
+          {/* 更多操作：状态流转 + 管理员强制改状态（运营要求收进默认折叠块；展开后行为与权限逻辑不变） */}
+          <details className="rounded-xl border border-slate-200 bg-white">
+            <summary className="cursor-pointer select-none px-4 py-3 text-xs font-semibold uppercase tracking-wide text-ink-muted hover:text-ink">
+              更多操作（状态流转）
+            </summary>
+            <div className="border-t border-slate-100 px-4 pb-4">
           <section>
             <h3 className="text-xs font-semibold uppercase tracking-wide text-ink-muted">状态流转</h3>
             <div className="mt-3 flex flex-wrap gap-2">
@@ -2299,6 +2377,8 @@ function OrderDrawer({
               </div>
             )}
           </section>
+            </div>
+          </details>
 
           {isAdmin && onDelete && (
             <section className="border-t border-rose-100 pt-3">
@@ -2687,7 +2767,8 @@ const FF_TYPE_LABEL: Record<FulfillmentTask['type'], { icon: string; label: stri
   BUNDLE_COMPOSITE: { icon: '🎁', label: '套餐履约' },
 };
 
-function FulfillmentSection({ orderId }: { orderId: string }) {
+// 履约进度已按运营要求移出订单详情抽屉；组件保留（导出以备后续页面复用，也避免未引用告警）。
+export function FulfillmentSection({ orderId }: { orderId: string }) {
   const tokens = useAuth((s) => s.tokens);
   const [tasks, setTasks] = useState<FulfillmentTask[]>([]);
   const [loading, setLoading] = useState(true);
@@ -3048,16 +3129,6 @@ function BundleItineraryCard({ items, order }: { items: OrderItem[]; order: Orde
   const childCount = order.childCount ?? 0;
   const infantCount = order.infantCount ?? 0;
   const totalCount = adultCount + childCount + infantCount;
-  const adultPrice = order.adultUnitPriceCny ?? null;
-  const childPrice = order.childUnitPriceCny ?? null;
-  const infantPrice = order.infantUnitPriceCny ?? null;
-
-  const nights = bundleLine.hotelCheckIn && bundleLine.hotelCheckOut
-    ? Math.round((new Date(bundleLine.hotelCheckOut).getTime() - new Date(bundleLine.hotelCheckIn).getTime()) / 86_400_000)
-    : null;
-  const rooms = bundleLine.roomsBilled ?? null;
-  const hotelName = bundleLine.hotelName ?? null;
-  const roomTypeName = bundleLine.roomTypeName ?? null;
 
   // 签证生效/失效预计日期：去程出发日 + stayDays（都存在时才推算；标注「预计/以实际出签为准」）。
   const outboundDate = flightLegs[0]?.departureDate ?? null;
@@ -3065,10 +3136,9 @@ function BundleItineraryCard({ items, order }: { items: OrderItem[]; order: Orde
   const visaEffectiveDate = outboundDate && visaStayDays ? outboundDate : null;
   const visaExpiryDate = outboundDate && visaStayDays ? addDaysToDateOnly(outboundDate, visaStayDays) : null;
 
-  // 乘客级选项统计（自备签证 / 单住）：基数 = 本单乘客数；用于产品名/签证段/酒店段标注。
+  // 乘客级选项统计（自备签证）：基数 = 本单乘客数；用于产品名/签证段标注。
   const passengerBase = order.passengers.length;
   const visaExemptCount = order.passengers.filter((p) => p.visaExempt).length;
-  const singleRoomCount = order.passengers.filter((p) => p.singleRoom).length;
   // 全员自备（需真有乘客且全部自备）→ 签证段改「无需送签」；部分自备 → 拆分随团/自备人数。
   const allVisaExempt = passengerBase > 0 && visaExemptCount === passengerBase;
   const partialVisaExempt = visaExemptCount > 0 && !allVisaExempt;
@@ -3086,17 +3156,15 @@ function BundleItineraryCard({ items, order }: { items: OrderItem[]; order: Orde
       </div>
 
       <dl className="mt-2.5 space-y-1.5 text-xs text-ink-soft">
-        {/* 人数：总数 ／ 按年龄段分列人数+单价（价格来自 order.total 反推，非套餐订单/查不到定价配置时为 null） */}
+        {/* 人数：总数 ／ 按年龄段分列。运营要求产品内容展示不露每人价格与均摊口径——只改展示，
+            订单上的分龄单价数据（adult/child/infantUnitPriceCny）原样保留，金额明细折叠区仍可查。 */}
         <div>
           <dt className="font-medium text-ink-muted">人数</dt>
           <dd className="mt-0.5">
             {totalCount}
-            {' ／ '}成人：{adultCount}{adultPrice != null && `，价格${adultPrice.toLocaleString()}`}
-            {' ／ '}2-12岁儿童：{childCount}{childPrice != null && `，价格${childPrice.toLocaleString()}`}
-            {' ／ '}2岁以下婴儿：{infantCount}{infantPrice != null && `，价格${infantPrice.toLocaleString()}`}
-            {(adultPrice != null || childPrice != null || infantPrice != null) && (
-              <div className="mt-0.5 text-[11px] text-ink-muted">价格口径：按本单实付均摊</div>
-            )}
+            {' ／ '}成人：{adultCount}位
+            {' ／ '}2-12岁儿童：{childCount}位
+            {' ／ '}2岁以下婴儿：{infantCount}位
           </dd>
         </div>
 
@@ -3123,20 +3191,8 @@ function BundleItineraryCard({ items, order }: { items: OrderItem[]; order: Orde
             </dd>
           </div>
         )}
-        {(hotelName || roomTypeName) && (
-          <div>
-            <dt className="font-medium text-ink-muted">酒店</dt>
-            <dd className="mt-0.5">
-              {hotelName ?? ''}
-              {roomTypeName && ` ${roomTypeName}`}
-              {rooms != null && ` × ${rooms}间`}
-              {nights != null && nights > 0 && ` × ${nights}晚`}
-              {singleRoomCount > 0 && (
-                <span className="badge-warning ml-1.5 text-[10px]">{singleRoomCount} 人单住</span>
-              )}
-            </dd>
-          </div>
-        )}
+        {/* 「酒店：xxx」文字行已按运营要求移除——与抽屉上方可操作的「酒店情况 · 拼房」卡重复；
+            仅去展示，下单时盖章的酒店快照数据（hotelName/roomTypeName/roomsBilled/入退日期）原样保留。 */}
         {visa && (
           <div>
             <dt className="font-medium text-ink-muted">签证</dt>
@@ -3213,6 +3269,47 @@ function formatChangedDeparture(iso?: string | null): string {
   return d.toLocaleString('zh-CN', { month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' });
 }
 
+// ── 金额明细「怎么算出来的」轻量说明：读 metadata 里 backend 落的计价痕迹，字段缺失一律不显示 ──
+
+/** BUNDLE 行操作费 metadata（backend orders.service.ts 写入 {perPaxCny,pax,totalCny}）；结构不符返回 null。 */
+function readOperationFee(metadata: unknown): { perPaxCny: number; pax: number; totalCny: number } | null {
+  if (!metadata || typeof metadata !== 'object') return null;
+  const fee = (metadata as { operationFee?: unknown }).operationFee;
+  if (!fee || typeof fee !== 'object') return null;
+  const { perPaxCny, pax, totalCny } = fee as Record<string, unknown>;
+  if (typeof perPaxCny !== 'number' || typeof pax !== 'number' || typeof totalCny !== 'number') return null;
+  return { perPaxCny, pax, totalCny };
+}
+
+/** BUNDLE 行加项明细（单房差/升舱/儿童优惠/自备签证减免等，来自 metadata.addOns 即 BundleAddOnBreakdown）；解析失败返回空数组。 */
+function readAddOnLines(metadata: unknown): Array<{ label: string; amount: number }> {
+  if (!metadata || typeof metadata !== 'object') return [];
+  const addOns = (metadata as { addOns?: unknown }).addOns;
+  if (!addOns || typeof addOns !== 'object') return [];
+  const b = addOns as Record<string, unknown>;
+  const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+  const lines: Array<{ label: string; amount: number }> = [];
+  if (num(b.singleSupplementTotal) > 0) lines.push({ label: '单房差', amount: num(b.singleSupplementTotal) });
+  if (num(b.businessUpgradeTotal) > 0) lines.push({ label: '升舱', amount: num(b.businessUpgradeTotal) });
+  if (num(b.infantPriceTotal) > 0) lines.push({ label: '婴儿费用', amount: num(b.infantPriceTotal) });
+  if (num(b.childSeatDiscountTotal) > 0) lines.push({ label: '儿童优惠', amount: -num(b.childSeatDiscountTotal) });
+  if (num(b.selfVisaDeductTotal) > 0) lines.push({ label: '自备签证减免', amount: -num(b.selfVisaDeductTotal) });
+  return lines;
+}
+
+/** BUNDLE/FLIGHT 行套餐折扣百分比（metadata.bundleDiscountPct，0..100）；缺失或非法值返回 0。 */
+function readBundleDiscountPct(metadata: unknown): number {
+  if (!metadata || typeof metadata !== 'object') return 0;
+  const pct = (metadata as { bundleDiscountPct?: unknown }).bundleDiscountPct;
+  return typeof pct === 'number' && Number.isFinite(pct) && pct > 0 ? pct : 0;
+}
+
+/** FLIGHT 行价格来源：metadata.priceOverride==='TEAM_SETTLEMENT' → 团队议价结算价；否则按出发日实时舱位价。 */
+function readIsTeamSettlementPrice(metadata: unknown): boolean {
+  if (!metadata || typeof metadata !== 'object') return false;
+  return (metadata as { priceOverride?: unknown }).priceOverride === 'TEAM_SETTLEMENT';
+}
+
 // ── 产品内容行：FLIGHT 项可「改期」（换班次/日期 + 改舱位 + 改期费）──────
 function OrderItemRow({
   orderId,
@@ -3241,6 +3338,13 @@ function OrderItemRow({
         item.departureDate ? `（${item.departureDate}${item.departureTime ? ` ${item.departureTime}` : ''}）` : ''
       }`
     : '';
+  // 金额明细「怎么算出来的」：只在字段真实存在时展示，绝不臆测口径。
+  const operationFee = readOperationFee(item.metadata);
+  const addOnLines = readAddOnLines(item.metadata);
+  const bundleDiscountPct = readBundleDiscountPct(item.metadata);
+  const isTeamSettlementPrice = isFlight && readIsTeamSettlementPrice(item.metadata);
+  const hasPriceExplain =
+    (operationFee !== null && operationFee.totalCny > 0) || addOnLines.length > 0 || bundleDiscountPct > 0 || isFlight;
 
   return (
     <li className="rounded-lg border border-slate-200 bg-slate-50/60 p-3">
@@ -3263,6 +3367,23 @@ function OrderItemRow({
             {item.unitPrice != null && <> · 单价 ¥{Number(item.unitPrice).toLocaleString()}</>}
             {item.flightCabin && <> · {CABIN_ZH[item.flightCabin] ?? item.flightCabin}</>}
           </div>
+          {hasPriceExplain && (
+            <div className="mt-0.5 space-y-0.5 text-[11px] leading-snug text-ink-muted">
+              {operationFee && operationFee.totalCny > 0 && (
+                <div>
+                  含操作费 ¥{operationFee.perPaxCny.toLocaleString()}/人 × {operationFee.pax}人 = ¥
+                  {operationFee.totalCny.toLocaleString()}
+                </div>
+              )}
+              {addOnLines.map((line) => (
+                <div key={line.label}>
+                  {line.label} {line.amount < 0 ? '−' : ''}¥{Math.abs(line.amount).toLocaleString()}
+                </div>
+              ))}
+              {bundleDiscountPct > 0 && <div>已按套餐折扣 {bundleDiscountPct}% 计价</div>}
+              {isFlight && <div>{isTeamSettlementPrice ? '团队议价结算价' : '按出发日实时舱位价'}</div>}
+            </div>
+          )}
           {flightChanged && (
             <div className="mt-1 text-[11px] leading-snug text-red-600">{changedHint}</div>
           )}
@@ -3810,6 +3931,8 @@ function PassportLightbox({
     y: 72,
   }));
   const [scale, setScale] = useState(1);
+  // 顺时针旋转角（0/90/180/270）；护照有时扫描/拍照方向不对，需要转正才能核对
+  const [rotation, setRotation] = useState(0);
   const dragRef = useRef<{ startX: number; startY: number; baseX: number; baseY: number } | null>(null);
 
   useEffect(() => {
@@ -3836,6 +3959,10 @@ function PassportLightbox({
   }
   function onWheel(e: React.WheelEvent<HTMLDivElement>): void {
     setScale((s) => clampScale(s + (e.deltaY < 0 ? SCALE_STEP : -SCALE_STEP)));
+  }
+  // 顺时针转 90°，360° 归零（浮点安全：整数取模）
+  function rotate(): void {
+    setRotation((r) => (r + 90) % 360);
   }
 
   const btnCls =
@@ -3864,7 +3991,15 @@ function PassportLightbox({
         <button type="button" className={btnCls} title="放大" onClick={() => setScale((s) => clampScale(s + SCALE_STEP))}>
           +
         </button>
-        <button type="button" className={`${btnCls} w-auto px-1.5 text-[11px]`} title="复位" onClick={() => setScale(1)}>
+        <button type="button" className={btnCls} title="顺时针旋转 90°" onClick={rotate}>
+          ⟳
+        </button>
+        <button
+          type="button"
+          className={`${btnCls} w-auto px-1.5 text-[11px]`}
+          title="复位"
+          onClick={() => { setScale(1); setRotation(0); }}
+        >
           复位
         </button>
         <a
@@ -3879,18 +4014,18 @@ function PassportLightbox({
           ✕
         </button>
       </div>
-      {/* 图片区：溢出可滚动；滚轮缩放 */}
-      <div className="min-h-0 flex-1 overflow-auto bg-slate-950/40 p-2" onWheel={onWheel}>
+      {/* 图片区：溢出可滚动（含旋转后的视觉溢出）；滚轮缩放 */}
+      <div className="min-h-0 flex-1 overflow-auto bg-slate-950/40 p-6" onWheel={onWheel}>
         <img
           src={photoUrl}
           alt="护照大图"
           draggable={false}
-          style={{ width: `${scale * 100}%` }}
-          className="mx-auto block max-w-none rounded"
+          style={{ width: `${scale * 100}%`, transform: `rotate(${rotation}deg)` }}
+          className="mx-auto block max-w-none rounded transition-transform"
         />
       </div>
       <p className="bg-slate-800 px-2 py-1 text-center text-[10px] text-white/60 select-none">
-        拖动标题栏移动 · 滚轮或 +/− 缩放 · Esc 关闭
+        拖动标题栏移动 · 滚轮或 +/− 缩放 · ⟳ 旋转 · Esc 关闭
       </p>
     </div>
   );
@@ -4619,6 +4754,8 @@ interface BatchRow {
   passportIssueCountry?: string;
   /** 护照有效期（YYYY-MM-DD） */
   passportExpiry?: string;
+  /** 订座编码（PNR）：OTA 名单识别到唯一编码时全员同值（一码多人），随提交落 Passenger.pnr。 */
+  pnr?: string;
 }
 
 /**
@@ -4877,6 +5014,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
           nationality: p.nationality,
           passportIssueCountry: p.passportIssueCountry,
           passportExpiry: p.passportExpiry,
+          pnr: p.pnr, // 唯一编码 token → 全员同 PNR（一码多人）
           note: p.note,
         })),
       );
@@ -5046,6 +5184,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
         ...(r.gender ? { gender: r.gender } : {}),
         ...(r.passportIssueCountry?.trim() ? { passportIssueCountry: r.passportIssueCountry.trim() } : {}),
         ...(r.passportExpiry?.trim() ? { passportExpiry: r.passportExpiry.trim() } : {}),
+        ...(r.pnr?.trim() ? { pnr: r.pnr.trim().toUpperCase() } : {}),
         note: r.note?.trim() || undefined,
       })),
       ...(teamPrice !== undefined
@@ -5155,7 +5294,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
           <div className="space-y-4 p-5">
             {err && <div className="rounded-md bg-rose-50 px-4 py-2 text-sm text-rose-700">{err}</div>}
 
-            {/* 产品类型选择 */}
+            {/* A 产品类型选择 */}
             <div>
               <div className="mb-1.5 text-xs font-medium text-slate-500">产品类型</div>
               <div className="flex gap-2">
@@ -5176,7 +5315,32 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
               </div>
             </div>
 
-            {/* ── 航班类型：出港 ── */}
+            {/* B 归属代理（ADMIN/STAFF 代为录单；直客/OTA 代理账号在此选） */}
+            {isOps && (
+              <div className="text-xs text-slate-500">
+                归属代理（代为录单；直客留空）
+                <input
+                  className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                  placeholder="搜索代理：公司名 / 联系人 / 电话"
+                  value={agentSearch}
+                  onChange={(e) => setAgentSearch(e.target.value)}
+                />
+                <select
+                  className="mt-2 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                  value={agentId}
+                  onChange={(e) => setAgentId(e.target.value)}
+                >
+                  <option value="">— 无代理 / 直客 —</option>
+                  {filteredAgents.map((a) => (
+                    <option key={a.id} value={a.id}>
+                      {a.companyName ? `${a.companyName} · ` : ''}{a.contactName}（{a.contactPhone}）
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
+
+            {/* C 航班类型：出港 + 回程 */}
             {(productType === 'FLIGHT_ONEWAY' || productType === 'FLIGHT_ROUNDTRIP') && (
               <>
                 {flightsErr && (
@@ -5318,63 +5482,10 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                     </p>
                   </div>
                 )}
-
-                {/* 结算价（FLIGHT 专用） */}
-                <div className="rounded-md border border-slate-200 bg-slate-50/60 p-3">
-                  <div className="mb-2 text-sm font-medium text-slate-700">旅游团（选填）</div>
-                  <div className="grid gap-3 md:grid-cols-2">
-                    <label className="text-xs text-slate-500">
-                      结算价/人（¥）
-                      <NumberInput
-                        className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
-                        value={settlementPriceCny}
-                        onChange={setSettlementPriceCny}
-                        min={0}
-                        step={1}
-                        integerOnly
-                        placeholder="留空 = 按动态定价"
-                      />
-                    </label>
-                    <label className="text-xs text-slate-500">
-                      团期备注
-                      <input
-                        className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
-                        value={groupNote}
-                        onChange={(e) => setGroupNote(e.target.value)}
-                        placeholder="如 2026 春节团 7 日"
-                      />
-                    </label>
-                  </div>
-                  <p className="mt-2 text-[11px] text-amber-700">
-                    ⓘ 填了结算价后，每位乘客按此价建单，覆盖仓位阶梯 / 自动定价。
-                  </p>
-                </div>
-
-                {/* OTA 结算单价（手动录入 · 仅 ADMIN/STAFF）——与上方团队结算价二选一 */}
-                {isOps && (
-                  <div className="rounded-md border border-slate-200 bg-sky-50/50 p-3">
-                    <div className="mb-2 text-sm font-medium text-slate-700">OTA 线上单（选填）</div>
-                    <label className="block text-xs text-slate-500 md:w-1/2">
-                      结算单价（¥/人 · 手动录入）
-                      <NumberInput
-                        className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
-                        value={manualUnitPriceCny}
-                        onChange={setManualUnitPriceCny}
-                        min={0}
-                        step={1}
-                        integerOnly
-                        placeholder="OTA 名单结算价，如 1000"
-                      />
-                    </label>
-                    <p className="mt-2 text-[11px] text-sky-700">
-                      ⓘ 不改机票权威价：仍按系统价建单，再按差额自动加一条价格调整行把订单总额调到此结算单价（系统价/差额可追溯、审计留痕）。与上方「团队议价结算价」二选一。
-                    </p>
-                  </div>
-                )}
               </>
             )}
 
-            {/* ── 套餐类型 ── */}
+            {/* C 套餐类型 */}
             {productType === 'BUNDLE' && (
               <div className="rounded-md border border-slate-200 p-3">
                 <div className="mb-2 text-xs font-medium text-slate-600">套餐</div>
@@ -5483,115 +5594,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
               </div>
             )}
 
-            {/* 归属代理（ADMIN/STAFF 代为录单；直客/OTA 代理账号在此选） */}
-            {isOps && (
-              <div className="text-xs text-slate-500">
-                归属代理（代为录单；直客留空）
-                <input
-                  className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
-                  placeholder="搜索代理：公司名 / 联系人 / 电话"
-                  value={agentSearch}
-                  onChange={(e) => setAgentSearch(e.target.value)}
-                />
-                <select
-                  className="mt-2 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
-                  value={agentId}
-                  onChange={(e) => setAgentId(e.target.value)}
-                >
-                  <option value="">— 无代理 / 直客 —</option>
-                  {filteredAgents.map((a) => (
-                    <option key={a.id} value={a.id}>
-                      {a.companyName ? `${a.companyName} · ` : ''}{a.contactName}（{a.contactPhone}）
-                    </option>
-                  ))}
-                </select>
-              </div>
-            )}
-
-            {/* 录入人 + 备注 */}
-            <div className="grid gap-3 md:grid-cols-2">
-              <div className="text-xs text-slate-500">
-                录入人
-                <div className="mt-1 flex h-[34px] items-center rounded-md bg-slate-50 px-2.5 text-sm text-slate-700">
-                  {recorderLabel}
-                  <span className="ml-2 text-xs text-slate-400">（系统自动记录）</span>
-                </div>
-              </div>
-              <label className="text-xs text-slate-500">
-                整批备注（选填，写入每单）
-                <input className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm" value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="全团共用；每位乘客可在下方名单里单独补充" />
-              </label>
-            </div>
-
-            {/* 📋 OTA 名单粘贴导入：首行航段 + 每位乘客段 + 结算价，一键解析填充 */}
-            <div className="rounded-md border border-slate-200 bg-slate-50/60 p-3">
-              <div className="mb-1.5 flex items-center justify-between">
-                <span className="text-sm font-medium text-slate-700">📋 粘贴名单导入（OTA 线上单）</span>
-                <button
-                  type="button"
-                  className="btn-primary text-xs disabled:opacity-50"
-                  onClick={importOtaRoster}
-                  disabled={!otaText.trim()}
-                >
-                  解析并填充
-                </button>
-              </div>
-              <textarea
-                className="block w-full rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs"
-                rows={5}
-                value={otaText}
-                onChange={(e) => setOtaText(e.target.value)}
-                placeholder={'QH9588 DAD-MFM 2026-08-15\n乘机人：WU/FEILAI\n性别：男\n出生年月：1983-09-20\n护照：EB9452866\n签发国：CN\n有效期：2028-01-02\n乘机人：WANG/LIQING\n...\n结算价1000元X10个。'}
-              />
-              <p className="mt-1 text-[11px] text-slate-400">
-                自动识别：首行航班/航段/日期 → 选中航班与当日班次（舱位默认经济舱，如商务舱请手动改选）；每位乘客姓名(LAST/FIRST)、性别、出生日期、护照号、签发国、有效期；结算价 → 预填 OTA 结算单价。解析问题会在下方提醒里逐条列出。
-              </p>
-            </div>
-
-            {/* 名单导入 */}
-            <div className="flex flex-wrap items-center gap-3">
-              <button
-                type="button"
-                className="btn-secondary text-sm disabled:opacity-50"
-                onClick={() => void downloadTemplate()}
-                disabled={templateBusy}
-              >
-                {templateBusy ? '生成中…' : '下载名单模版'}
-              </button>
-              <label className="btn-secondary cursor-pointer text-sm">
-                {rosterBusy ? '解析中…' : '上传名单 Excel'}
-                <input
-                  type="file"
-                  accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                  className="hidden"
-                  onChange={onRosterFile}
-                  disabled={rosterBusy}
-                />
-              </label>
-              <span className="text-[11px] text-slate-400">上传后自动填充下方名单；也可手动录入。</span>
-            </div>
-
-            {rosterWarnings.length > 0 && (
-              <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
-                <div className="font-medium">名单解析提醒（{rosterWarnings.length} 条）：</div>
-                <ul className="mt-1 max-h-32 list-disc space-y-0.5 overflow-auto pl-5">
-                  {rosterWarnings.map((w, i) => <li key={i}>{w}</li>)}
-                </ul>
-              </div>
-            )}
-
-            <details className="text-xs text-slate-500">
-              <summary className="cursor-pointer">快速粘贴（每行一位：姓名 — 或 姓名,护照号,生日）</summary>
-              <textarea
-                className="mt-2 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
-                rows={3}
-                placeholder={'张三\n李四,E12345678,1990-01-01\n王五  G87654321  1985/12/3'}
-                onChange={(e) => pasteRows(e.target.value)}
-              />
-              <p className="mt-1 text-[11px] text-slate-400">分隔符支持逗号 / Tab / 空格；只填姓名也行，护照号、生日可留空后续手录。</p>
-            </details>
-
-            {/* 乘客表格 */}
+            {/* D 乘客名单：乘客表格 */}
             <div>
               <div className="mb-1 flex items-center justify-between">
                 <span className="text-sm font-medium text-slate-700">乘客名单（每位一单 · 共 {validRows.length} 位有效）</span>
@@ -5677,6 +5680,148 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                   </tbody>
                 </table>
               </div>
+            </div>
+
+            {/* D 解析提醒 */}
+            {rosterWarnings.length > 0 && (
+              <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                <div className="font-medium">名单解析提醒（{rosterWarnings.length} 条）：</div>
+                <ul className="mt-1 max-h-32 list-disc space-y-0.5 overflow-auto pl-5">
+                  {rosterWarnings.map((w, i) => <li key={i}>{w}</li>)}
+                </ul>
+              </div>
+            )}
+
+            {/* E 📋 OTA 名单粘贴导入：首行航段 + 每位乘客段 + 结算价，一键解析填充 */}
+            <div className="rounded-md border border-slate-200 bg-slate-50/60 p-3">
+              <div className="mb-1.5 flex items-center justify-between">
+                <span className="text-sm font-medium text-slate-700">📋 粘贴名单导入（OTA 线上单）</span>
+                <button
+                  type="button"
+                  className="btn-primary text-xs disabled:opacity-50"
+                  onClick={importOtaRoster}
+                  disabled={!otaText.trim()}
+                >
+                  解析并填充
+                </button>
+              </div>
+              <textarea
+                className="block w-full rounded-md border border-slate-300 px-2 py-1.5 font-mono text-xs"
+                rows={5}
+                value={otaText}
+                onChange={(e) => setOtaText(e.target.value)}
+                placeholder={'QH9588 DAD-MFM 2026-08-15\n乘机人：WU/FEILAI\n性别：男\n出生年月：1983-09-20\n护照：EB9452866\n签发国：CN\n有效期：2028-01-02\n乘机人：WANG/LIQING\n...\n结算价1000元X10个。'}
+              />
+              <p className="mt-1 text-[11px] text-slate-400">
+                自动识别：首行航班/航段/日期 → 选中航班与当日班次（舱位默认经济舱，如商务舱请手动改选）；每位乘客姓名(LAST/FIRST)、性别、出生日期、护照号、签发国、有效期；结算价 → 预填 OTA 结算单价。解析问题会在下方提醒里逐条列出。
+              </p>
+            </div>
+
+            {/* E 快速粘贴 */}
+            <details className="text-xs text-slate-500">
+              <summary className="cursor-pointer">快速粘贴（每行一位：姓名 — 或 姓名,护照号,生日）</summary>
+              <textarea
+                className="mt-2 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                rows={3}
+                placeholder={'张三\n李四,E12345678,1990-01-01\n王五  G87654321  1985/12/3'}
+                onChange={(e) => pasteRows(e.target.value)}
+              />
+              <p className="mt-1 text-[11px] text-slate-400">分隔符支持逗号 / Tab / 空格；只填姓名也行，护照号、生日可留空后续手录。</p>
+            </details>
+
+            {/* F 名单导入：下载模版 / 上传名单 */}
+            <div className="flex flex-wrap items-center gap-3">
+              <button
+                type="button"
+                className="btn-secondary text-sm disabled:opacity-50"
+                onClick={() => void downloadTemplate()}
+                disabled={templateBusy}
+              >
+                {templateBusy ? '生成中…' : '下载名单模版'}
+              </button>
+              <label className="btn-secondary cursor-pointer text-sm">
+                {rosterBusy ? '解析中…' : '上传名单 Excel'}
+                <input
+                  type="file"
+                  accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                  className="hidden"
+                  onChange={onRosterFile}
+                  disabled={rosterBusy}
+                />
+              </label>
+              <span className="text-[11px] text-slate-400">上传后自动填充下方名单；也可手动录入。</span>
+            </div>
+
+            {/* G 价格（选填）：旅游团结算价 / OTA 线上单结算价 */}
+            {(productType === 'FLIGHT_ONEWAY' || productType === 'FLIGHT_ROUNDTRIP') && (
+              <>
+                <div className="rounded-md border border-slate-200 bg-slate-50/60 p-3">
+                  <div className="mb-2 text-sm font-medium text-slate-700">旅游团（选填）</div>
+                  <div className="grid gap-3 md:grid-cols-2">
+                    <label className="text-xs text-slate-500">
+                      结算价/人（¥）
+                      <NumberInput
+                        className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                        value={settlementPriceCny}
+                        onChange={setSettlementPriceCny}
+                        min={0}
+                        step={1}
+                        integerOnly
+                        placeholder="留空 = 按动态定价"
+                      />
+                    </label>
+                    <label className="text-xs text-slate-500">
+                      团期备注
+                      <input
+                        className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                        value={groupNote}
+                        onChange={(e) => setGroupNote(e.target.value)}
+                        placeholder="如 2026 春节团 7 日"
+                      />
+                    </label>
+                  </div>
+                  <p className="mt-2 text-[11px] text-amber-700">
+                    ⓘ 填了结算价后，每位乘客按此价建单，覆盖仓位阶梯 / 自动定价。
+                  </p>
+                </div>
+
+                {/* OTA 结算单价（手动录入 · 仅 ADMIN/STAFF）——与上方团队结算价二选一 */}
+                {isOps && (
+                  <div className="rounded-md border border-slate-200 bg-sky-50/50 p-3">
+                    <div className="mb-2 text-sm font-medium text-slate-700">OTA 线上单（选填）</div>
+                    <label className="block text-xs text-slate-500 md:w-1/2">
+                      结算单价（¥/人 · 手动录入）
+                      <NumberInput
+                        className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                        value={manualUnitPriceCny}
+                        onChange={setManualUnitPriceCny}
+                        min={0}
+                        step={1}
+                        integerOnly
+                        placeholder="OTA 名单结算价，如 1000"
+                      />
+                    </label>
+                    <p className="mt-2 text-[11px] text-sky-700">
+                      ⓘ 不改机票权威价：仍按系统价建单，再按差额自动加一条价格调整行把订单总额调到此结算单价（系统价/差额可追溯、审计留痕）。与上方「团队议价结算价」二选一。
+                    </p>
+                  </div>
+                )}
+              </>
+            )}
+
+            {/* H 录入人 + 整批备注 */}
+            <div className="grid gap-3 md:grid-cols-2">
+              <div className="text-xs text-slate-500">
+                录入人
+                <div className="mt-1 flex h-[34px] items-center rounded-md bg-slate-50 px-2.5 text-sm text-slate-700">
+                  {recorderLabel}
+                  <span className="ml-2 text-xs text-slate-400">（系统自动记录）</span>
+                </div>
+              </div>
+              <label className="text-xs text-slate-500">
+                整批备注（选填，写入每单）
+                <input className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm" value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="全团共用；每位乘客可在下方名单里单独补充" />
+              </label>
             </div>
 
             <div className="flex items-center justify-between border-t border-slate-200 pt-3">

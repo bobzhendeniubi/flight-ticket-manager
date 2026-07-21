@@ -55,12 +55,22 @@ enum ReminderPriority {
   CRITICAL // 签证截止/航班延误等
 }
 
+// 内部岗位（A20 岗位细分，2026-07-20 拍板「全改」）：STAFF 的子角色。
+// null = 通用运营（全模板可导）；专岗账号导出被强制裁到本岗模板，不再信 query 参数。
+enum StaffRole {
+  VISA_DESK // 签证岗
+  TICKETING // 票务岗
+  ROOM_CONTROL // 房控岗
+}
+
 model User {
   id            String    @id @default(cuid())
   email         String?   @unique
   phone         String?   @unique
   passwordHash  String? // null for WeChat-only users
   role          UserRole  @default(CUSTOMER)
+  // 内部岗位（仅 role=STAFF 有意义；ADMIN/AGENT/CUSTOMER 恒 null）
+  staffRole     StaffRole?
   displayName   String?
   emailVerified Boolean   @default(false)
   phoneVerified Boolean   @default(false)

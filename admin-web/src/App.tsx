@@ -13,6 +13,7 @@ import { AgentBalancePage } from './pages/AgentBalancePage';
 import { CustomersPage } from './pages/CustomersPage';
 import { TravelersPage } from './pages/TravelersPage';
 import { AuditLogsPage } from './pages/AuditLogsPage';
+import { StaffRolesPage } from './pages/StaffRolesPage';
 import { SettlementsPage } from './pages/SettlementsPage';
 import { CancellationPoliciesPage } from './pages/CancellationPoliciesPage';
 import { FinancesPage } from './pages/FinancesPage';
@@ -291,6 +292,14 @@ export function App() {
           element={
             <Protected adminOnly>
               <AiOcrSettingsPage />
+            </Protected>
+          }
+        />
+        <Route
+          path="/settings/staff-roles"
+          element={
+            <Protected adminOnly>
+              <StaffRolesPage />
             </Protected>
           }
         />

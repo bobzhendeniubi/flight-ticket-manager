@@ -39,6 +39,7 @@ const NAV: Array<{
   { to: '/reports',         label: '经营报表',    roles: ['ADMIN'],                   section: '财务' },
   { to: '/audit-logs',      label: '审计日志',    roles: ['ADMIN', 'STAFF'],          section: '系统' },
   { to: '/settings/ai-ocr', label: 'AI 识别设置', roles: ['ADMIN'],                   section: '系统' },
+  { to: '/settings/staff-roles', label: '岗位管理',    roles: ['ADMIN'],                   section: '系统' },
 ];
 
 // 侧栏分组渲染顺序（NAV 里出现的 section 都在这里列一遍）

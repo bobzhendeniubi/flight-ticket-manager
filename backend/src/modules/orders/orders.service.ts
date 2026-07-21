@@ -1398,6 +1398,17 @@ export class OrderService {
           occupancy.seatPax,
         );
 
+        // B14 签证挂牌价快照（2026-07-20 拍板「应该改」）：套餐内签证金额此前由导出时从
+        // 套餐**现行**定义反推（qty×unitPrice）——运营改套餐价，历史订单导出跟着变。
+        // 下单时把 VISA 组件挂牌价合计快照进行 metadata，历史导出从此钉死在下单时点。
+        // （自备签减免与此无关：减免额是套餐配置 selfVisaDeductCny，本就与挂牌价解耦。）
+        const bundleComponents = Array.isArray(bundle.items)
+          ? (bundle.items as Array<{ kind?: string; qty?: unknown; unitPrice?: unknown }>)
+          : [];
+        const visaListSnapshotCny = bundleComponents
+          .filter((c) => c && c.kind === 'VISA')
+          .reduce((acc, c) => acc + (Number(c.qty) || 0) * (Number(c.unitPrice) || 0), 0);
+
         priced.push({
           kind: 'BUNDLE',
           description: item.description,
@@ -1414,24 +1425,23 @@ export class OrderService {
           hotelCheckOut: hotelStamp?.hotelCheckOut,
           // 解析后的计费房间数（支持 0.5 间）落到 OrderItem.roomsBilled，供房控读取。
           roomsBilled: rooms,
-          // 把升级选择 + 重算明细 + roomsNeeded + 操作费落到订单行 metadata，供运营/财务查看
+          // 把升级选择 + 重算明细 + roomsNeeded + 操作费 + 签证挂牌价快照落到订单行 metadata。
           //（admin 内部仍可叫"单房差/升舱"；roomsNeeded 解释酒店部分为何按房价 ×rooms 收费）。
-          // 操作费始终收（默认 ¥20），故只要 total>0 就记一份 operationFee 明细（perPaxCny/pax/totalCny）。
-          metadata: addOn.hasAddOn || rooms > 1 || operationFeeTotal > 0
-            ? {
-                ...(item.metadata ?? {}),
-                ...(addOn.hasAddOn || rooms > 1 ? { roomsNeeded: rooms, addOns: addOn.breakdown } : {}),
-                ...(operationFeeTotal > 0
-                  ? {
-                      operationFee: {
-                        perPaxCny: Math.max(0, Math.trunc(bundle.operationFeeCny)),
-                        pax: occupancy.seatPax,
-                        totalCny: operationFeeTotal,
-                      },
-                    }
-                  : {}),
-              }
-            : item.metadata,
+          metadata: {
+            ...(item.metadata ?? {}),
+            ...(addOn.hasAddOn || rooms > 1 ? { roomsNeeded: rooms, addOns: addOn.breakdown } : {}),
+            ...(operationFeeTotal > 0
+              ? {
+                  operationFee: {
+                    perPaxCny: Math.max(0, Math.trunc(bundle.operationFeeCny)),
+                    pax: occupancy.seatPax,
+                    totalCny: operationFeeTotal,
+                  },
+                }
+              : {}),
+            // 快照恒写（含 0）：0 也是有效事实（该套餐当时不含签证组件），导出据此不再回读现行定义。
+            visaListSnapshotCny,
+          },
         });
       }
     }
@@ -1584,7 +1594,7 @@ export class OrderService {
               flightSchedule: { select: { departureTime: true } },
             },
           },
-          passengers: { select: { id: true, fullName: true } },
+          passengers: { select: { id: true, fullName: true, chineseName: true } },
           agent: { select: { id: true, companyName: true, contactName: true, settlementMode: true, prepaymentBalance: true } },
           user: { select: { id: true, displayName: true, email: true } },
           claimedBy: { select: { id: true, displayName: true, email: true } },
@@ -1750,13 +1760,32 @@ export class OrderService {
    * 仅 ADMIN 可看（与删除权限对称，STAFF 不行）。
    */
   async listDeletedOrders(
-    query: { page: number; pageSize: number },
+    query: { page: number; pageSize: number; search?: string },
     requester: OrderRequester,
   ) {
     if (requester.role !== UserRole.ADMIN) {
       throw new ForbiddenError('仅管理员可查看回收站');
     }
     const where: Prisma.OrderWhereInput = { deletedAt: { not: null } };
+    // 搜索：订单号 / 联系人名 / 乘客姓名（含中文名）模糊匹配，任一命中即可。
+    // 只在 search 非空时叠加，避免默认路径的 where 形状变化（单测断言精确匹配）。
+    if (query.search) {
+      const term = query.search;
+      where.OR = [
+        { orderNumber: { contains: term, mode: 'insensitive' } },
+        { contactName: { contains: term, mode: 'insensitive' } },
+        {
+          passengers: {
+            some: {
+              OR: [
+                { fullName: { contains: term, mode: 'insensitive' } },
+                { chineseName: { contains: term, mode: 'insensitive' } },
+              ],
+            },
+          },
+        },
+      ];
+    }
     const [rows, total] = await prisma.$transaction([
       prisma.order.findMany({
         where,
@@ -1768,6 +1797,8 @@ export class OrderService {
           currency: true,
           status: true,
           deletedAt: true,
+          // 只取姓名字段（不整对象）：回收站行展示用，供运营按乘客名找回误删单。
+          passengers: { select: { fullName: true, chineseName: true } },
         },
         orderBy: { deletedAt: 'desc' },
         take: query.pageSize,
@@ -1811,6 +1842,8 @@ export class OrderService {
         status: o.status,
         deletedAt: o.deletedAt,
         deletedBy: deletedByMap.get(o.id) ?? null,
+        // 乘客姓名（中文名优先，缺失回退证件姓名）：回收站行展示 + 前端搜索命中辅助定位。
+        passengerNames: o.passengers.map((p) => p.chineseName?.trim() || p.fullName),
       })),
       pagination: { page: query.page, pageSize: query.pageSize, total },
     };
@@ -2975,7 +3008,7 @@ export class OrderService {
     returnInvoiced: boolean;
     systemInvoiced: boolean;
   }> {
-    return prisma.$transaction(async (tx) => {
+    const updated = await prisma.$transaction(async (tx) => {
       const order = await tx.order.findUnique({
         where: { id },
         select: {
@@ -3033,6 +3066,44 @@ export class OrderService {
         },
       });
     });
+
+    // ── TICKETED 派生·反向自动（2026-07-20 拍板「合一」）：航段标记翻齐 → 订单自动推进 ──
+    // 票务台标完最后一段，订单从 PROCESSING 自动进「出票完成」，运营不用再手动改一次状态。
+    // 只在 PROCESSING 时推（PAID 还没进处理、其它状态不该被开票动作牵着走）；
+    // 推进失败绝不回滚开票标记（标记是事实，状态推进只是跟随），静默放过。
+    try {
+      const after = await prisma.order.findUnique({
+        where: { id },
+        select: {
+          status: true,
+          outboundInvoiced: true,
+          returnInvoiced: true,
+          items: {
+            where: { kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
+            select: { flightScheduleId: true },
+          },
+        },
+      });
+      if (after && after.status === OrderStatus.PROCESSING) {
+        const legCount = new Set(after.items.map((it) => it.flightScheduleId)).size;
+        const legsDone =
+          legCount >= 1 &&
+          after.outboundInvoiced &&
+          (legCount < 2 || after.returnInvoiced);
+        if (legsDone) {
+          await this.updateStatus(
+            id,
+            OrderStatus.TICKETED,
+            { userId: 'system:auto-ticketed', role: UserRole.ADMIN },
+            '航段开票标记齐全，自动推进「出票完成」（TICKETED 派生口径）',
+          );
+        }
+      }
+    } catch {
+      /* 自动推进失败不影响开票标记本身（如并发状态变化）；下次翻标记或手动推进即可 */
+    }
+
+    return updated;
   }
 
   /**
@@ -3124,6 +3195,36 @@ export class OrderService {
       throw new BadRequestError(
         `不允许从 ${order.status} 转移到 ${toStatus}（允许：${allowed.join(', ') || '无'}）`,
       );
+    }
+
+    // ── TICKETED 派生闸（2026-07-20 拍板「合一」）：订单级「出票完成」不再是第二本账——
+    // 它是航段开票标记的派生：有航段的单，去程（及往返单的回程）标记没打齐就不许推进。
+    // 唯一真源在票务台的航段标记；标记翻齐会自动推进（见 setInvoiceFlags 尾部），
+    // 这里的手动推进只在标记已齐时放行。纯地面单（无航段）无票可出，放行不拦。
+    // ADMIN force 可跳过（应急通道，审计照记）。
+    if (toStatus === OrderStatus.TICKETED && !isAdminForce) {
+      const inv = await tx.order.findUnique({
+        where: { id },
+        select: {
+          outboundInvoiced: true,
+          returnInvoiced: true,
+          items: {
+            where: { kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
+            select: { flightScheduleId: true },
+          },
+        },
+      });
+      const legCount = new Set((inv?.items ?? []).map((it) => it.flightScheduleId)).size;
+      if (legCount >= 1 && !inv?.outboundInvoiced) {
+        throw new BadRequestError(
+          '去程尚未标记开票，不能推进到「出票完成」。请先在票务台标记去程已开票——标齐后订单会自动推进。',
+        );
+      }
+      if (legCount >= 2 && !inv?.returnInvoiced) {
+        throw new BadRequestError(
+          '回程尚未标记开票，不能推进到「出票完成」。请先在票务台标记回程已开票——标齐后订单会自动推进。',
+        );
+      }
     }
 
     const wasHolding = SEAT_HOLDING_STATUSES.includes(order.status);
@@ -6094,6 +6195,7 @@ export function passengerToData(p: PassengerInput) {
     passportIssueCountry: p.passportIssueCountry ?? null,
     passportIssuePlace: p.passportIssuePlace ?? null,
     passportExpiry: p.passportExpiry ? new Date(p.passportExpiry) : null,
+    pnr: p.pnr ?? null, // 订座编码：录单带入（共用编码=多行同值）；出票回填会覆盖
     visaNumber: p.visaNumber ?? null,
     visaType: p.visaType ?? null,
     visaIssueDate: p.visaIssueDate ? new Date(p.visaIssueDate) : null,

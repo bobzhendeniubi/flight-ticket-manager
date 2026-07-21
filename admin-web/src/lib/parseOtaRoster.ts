@@ -92,6 +92,8 @@ export interface ParsedOtaPassenger {
   passportExpiry?: string;
   /** 附加信息（如识别到的订座编码行），前端回填到该乘客的个别备注；未识别到则不设。 */
   note?: string;
+  /** 订座编码（PNR）：全篇恰好识别到一个编码 token 时全员同值（一码多人）；多个/没有则不设。 */
+  pnr?: string;
 }
 
 export interface OtaRosterParseResult {
@@ -180,35 +182,100 @@ function parseGender(raw: string): 'M' | 'F' | null {
   return null;
 }
 
-/** 常见 3 位国家/地区码 → 2 位 ISO（覆盖港澳台及周边热门客源地/目的地）。 */
+/**
+ * 3 位国家/地区码 → 2 位 ISO，ISO 3166-1 标准全集（与 backend/src/lib/country-codes.ts
+ * 的 COUNTRY_ALPHA3_TO_ALPHA2 保持数据口径一致——两端各自维护一份，前后端无共享 TS 包基建，
+ * 重复一份小表比引入跨项目依赖更简单）。0720 反馈：此前只有 16 条常见码，表外 3 位码
+ * （如护照 MRZ 常见的多数国家码）原样透传到后端，被 nationality: z.string().length(2) 拒绝，
+ * 整批建单 400。
+ */
 const COUNTRY_3TO2: Record<string, string> = {
-  CHN: 'CN',
-  MAC: 'MO',
-  HKG: 'HK',
-  TWN: 'TW',
-  SGP: 'SG',
-  MYS: 'MY',
-  KOR: 'KR',
-  JPN: 'JP',
-  VNM: 'VN',
-  USA: 'US',
-  THA: 'TH',
-  PHL: 'PH',
-  IDN: 'ID',
-  GBR: 'GB',
-  AUS: 'AU',
-  CAN: 'CA',
+  AND: 'AD', ARE: 'AE', AFG: 'AF', ATG: 'AG', AIA: 'AI', ALB: 'AL', ARM: 'AM',
+  AGO: 'AO', ATA: 'AQ', ARG: 'AR', ASM: 'AS', AUT: 'AT', AUS: 'AU', ABW: 'AW',
+  ALA: 'AX', AZE: 'AZ', BIH: 'BA', BRB: 'BB', BGD: 'BD', BEL: 'BE', BFA: 'BF',
+  BGR: 'BG', BHR: 'BH', BDI: 'BI', BEN: 'BJ', BLM: 'BL', BMU: 'BM', BRN: 'BN',
+  BOL: 'BO', BES: 'BQ', BRA: 'BR', BHS: 'BS', BTN: 'BT', BVT: 'BV', BWA: 'BW',
+  BLR: 'BY', BLZ: 'BZ', CAN: 'CA', CCK: 'CC', COD: 'CD', CAF: 'CF', COG: 'CG',
+  CHE: 'CH', CIV: 'CI', COK: 'CK', CHL: 'CL', CMR: 'CM', CHN: 'CN', COL: 'CO',
+  CRI: 'CR', CUB: 'CU', CPV: 'CV', CUW: 'CW', CXR: 'CX', CYP: 'CY', CZE: 'CZ',
+  DEU: 'DE', DJI: 'DJ', DNK: 'DK', DMA: 'DM', DOM: 'DO', DZA: 'DZ', ECU: 'EC',
+  EST: 'EE', EGY: 'EG', ESH: 'EH', ERI: 'ER', ESP: 'ES', ETH: 'ET', FIN: 'FI',
+  FJI: 'FJ', FLK: 'FK', FSM: 'FM', FRO: 'FO', FRA: 'FR', GAB: 'GA', GBR: 'GB',
+  GRD: 'GD', GEO: 'GE', GUF: 'GF', GGY: 'GG', GHA: 'GH', GIB: 'GI', GRL: 'GL',
+  GMB: 'GM', GIN: 'GN', GLP: 'GP', GNQ: 'GQ', GRC: 'GR', SGS: 'GS', GTM: 'GT',
+  GUM: 'GU', GNB: 'GW', GUY: 'GY', HKG: 'HK', HMD: 'HM', HND: 'HN', HRV: 'HR',
+  HTI: 'HT', HUN: 'HU', IDN: 'ID', IRL: 'IE', ISR: 'IL', IMN: 'IM', IND: 'IN',
+  IOT: 'IO', IRQ: 'IQ', IRN: 'IR', ISL: 'IS', ITA: 'IT', JEY: 'JE', JAM: 'JM',
+  JOR: 'JO', JPN: 'JP', KEN: 'KE', KGZ: 'KG', KHM: 'KH', KIR: 'KI', COM: 'KM',
+  KNA: 'KN', PRK: 'KP', KOR: 'KR', KWT: 'KW', CYM: 'KY', KAZ: 'KZ', LAO: 'LA',
+  LBN: 'LB', LCA: 'LC', LIE: 'LI', LKA: 'LK', LBR: 'LR', LSO: 'LS', LTU: 'LT',
+  LUX: 'LU', LVA: 'LV', LBY: 'LY', MAR: 'MA', MCO: 'MC', MDA: 'MD', MNE: 'ME',
+  MAF: 'MF', MDG: 'MG', MHL: 'MH', MKD: 'MK', MLI: 'ML', MMR: 'MM', MNG: 'MN',
+  MAC: 'MO', MNP: 'MP', MTQ: 'MQ', MRT: 'MR', MSR: 'MS', MLT: 'MT', MUS: 'MU',
+  MDV: 'MV', MWI: 'MW', MEX: 'MX', MYS: 'MY', MOZ: 'MZ', NAM: 'NA', NCL: 'NC',
+  NER: 'NE', NFK: 'NF', NGA: 'NG', NIC: 'NI', NLD: 'NL', NOR: 'NO', NPL: 'NP',
+  NRU: 'NR', NIU: 'NU', NZL: 'NZ', OMN: 'OM', PAN: 'PA', PER: 'PE', PYF: 'PF',
+  PNG: 'PG', PHL: 'PH', PAK: 'PK', POL: 'PL', SPM: 'PM', PCN: 'PN', PRI: 'PR',
+  PSE: 'PS', PRT: 'PT', PLW: 'PW', PRY: 'PY', QAT: 'QA', REU: 'RE', ROU: 'RO',
+  SRB: 'RS', RUS: 'RU', RWA: 'RW', SAU: 'SA', SLB: 'SB', SYC: 'SC', SDN: 'SD',
+  SWE: 'SE', SGP: 'SG', SHN: 'SH', SVN: 'SI', SJM: 'SJ', SVK: 'SK', SLE: 'SL',
+  SMR: 'SM', SEN: 'SN', SOM: 'SO', SUR: 'SR', SSD: 'SS', STP: 'ST', SLV: 'SV',
+  SXM: 'SX', SYR: 'SY', SWZ: 'SZ', TCA: 'TC', TCD: 'TD', ATF: 'TF', TGO: 'TG',
+  THA: 'TH', TJK: 'TJ', TKL: 'TK', TLS: 'TL', TKM: 'TM', TUN: 'TN', TON: 'TO',
+  TUR: 'TR', TTO: 'TT', TUV: 'TV', TWN: 'TW', TZA: 'TZ', UKR: 'UA', UGA: 'UG',
+  UMI: 'UM', USA: 'US', URY: 'UY', UZB: 'UZ', VAT: 'VA', VCT: 'VC', VEN: 'VE',
+  VGB: 'VG', VIR: 'VI', VNM: 'VN', VUT: 'VU', WLF: 'WF', WSM: 'WS', YEM: 'YE',
+  MYT: 'YT', ZAF: 'ZA', ZMB: 'ZM', ZWE: 'ZW',
 };
 
 /**
- * 国家 → 2 位码：中国别名（中国/中国大陆/CHN/CHINA）→ CN；2 位字母码原样大写；
- * 3 位字母码查表归一，查不到时原样保留（调用方用 isUnmappedThreeLetterCountry 判断是否需要 warning 提示核对）。
- * 无法识别（非 2/3 位字母、非中国别名）返回 null。
+ * 中文国家/地区名 → 2 位 ISO 码（覆盖出行常见国家地区；中国大陆本身在 parseCountry 里
+ * 单独处理，不放这里）。0720 反馈：此前「越南」等非「中国」的中文国名一律 parseCountry
+ * 返回 null，前端提交时静默回落成 'CN'，外籍乘客国籍被写错且没有 warning 提示。
+ */
+const COUNTRY_CN_NAME_TO_2: Record<string, string> = {
+  '中国香港': 'HK', '香港': 'HK',
+  '中国澳门': 'MO', '澳门': 'MO',
+  '中国台湾': 'TW', '台湾': 'TW',
+  '越南': 'VN',
+  '日本': 'JP',
+  '韩国': 'KR', '南韩': 'KR', '大韩民国': 'KR',
+  '朝鲜': 'KP', '北韩': 'KP',
+  '泰国': 'TH',
+  '新加坡': 'SG',
+  '马来西亚': 'MY',
+  '菲律宾': 'PH',
+  '印尼': 'ID', '印度尼西亚': 'ID',
+  '柬埔寨': 'KH',
+  '老挝': 'LA',
+  '缅甸': 'MM',
+  '美国': 'US',
+  '英国': 'GB',
+  '加拿大': 'CA',
+  '澳大利亚': 'AU', '澳洲': 'AU',
+  '俄罗斯': 'RU', '俄国': 'RU',
+  '印度': 'IN',
+  '德国': 'DE',
+  '法国': 'FR',
+  '意大利': 'IT',
+  '西班牙': 'ES',
+  '荷兰': 'NL',
+  '瑞士': 'CH',
+  '新西兰': 'NZ',
+  '土耳其': 'TR',
+};
+
+/**
+ * 国家 → 2 位码：中国别名（中国/中国大陆/CHN/CHINA）→ CN；常见中文国名（越南/日本/…）查表；
+ * 2 位字母码原样大写；3 位字母码查表归一，查不到时原样保留（调用方用
+ * isUnmappedThreeLetterCountry 判断是否需要 warning 提示核对）。
+ * 无法识别（非 2/3 位字母、非中国别名、非已知中文国名）返回 null。
  */
 function parseCountry(raw: string): string | null {
   const v = raw.trim();
   if (!v) return null;
   if (/^中国(大陆)?(地区)?$/.test(v)) return 'CN';
+  if (v in COUNTRY_CN_NAME_TO_2) return COUNTRY_CN_NAME_TO_2[v];
   const upper = v.toUpperCase();
   if (upper === 'CN' || upper === 'CHN' || upper === 'CHINA') return 'CN';
   if (/^[A-Z]{2}$/.test(upper)) return upper;
@@ -531,7 +598,22 @@ export function parseOtaRoster(text: string): OtaRosterParseResult {
     passengers.forEach((px) => {
       px.note = px.note ? `${px.note}；${noteJoined}` : noteJoined;
     });
-    warnings.push(`识别到订座编码信息「${noteJoined}」，已写入每位乘客备注，请核对`);
+    // 结构化落 PNR：全篇恰好一个编码 token（5~6 位字母+数字）→ 全员 pnr 同值（一码多人，
+    // 与航司模型一致，落 Passenger.pnr 可查可导）。识别到多个编码时不猜归属，只留备注。
+    const tokens = new Set<string>();
+    for (const noteText of bookingCodeNotes) {
+      const m = noteText.toUpperCase().match(/\b(?=[A-Z0-9]{5,6}\b)(?=[A-Z0-9]*[A-Z])(?=[A-Z0-9]*[0-9])[A-Z0-9]{5,6}\b/g);
+      for (const t of m ?? []) tokens.add(t);
+    }
+    if (tokens.size === 1) {
+      const pnr = [...tokens][0]!;
+      passengers.forEach((px) => {
+        px.pnr = pnr;
+      });
+      warnings.push(`识别到订座编码「${pnr}」，已写入每位乘客的 PNR 字段（一码多人）+ 备注，请核对`);
+    } else {
+      warnings.push(`识别到订座编码信息「${noteJoined}」，已写入每位乘客备注，请核对`);
+    }
   }
 
   // 航段校验

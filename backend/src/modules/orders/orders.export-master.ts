@@ -463,7 +463,15 @@ export function orderToMasterRows(
   // 让套餐单的签证金额不再显示 0。口径说明：客人付的是折后套餐总价，本列反映的是
   // 套餐里签证部分的「挂牌价」（list price），仅供运营核对签证分摊，非实收拆分额。
   const visaAmountBundle = order.items.reduce((s, it) => {
-    if (it.kind !== 'BUNDLE' || !it.bundle) return s;
+    if (it.kind !== 'BUNDLE') return s;
+    // B14 快照优先（2026-07-20）：新单下单时把签证挂牌价快照进行 metadata.visaListSnapshotCny
+    //（含 0 = 当时不含签证组件），历史导出钉死在下单时点，不再随套餐改价漂移。
+    // 老单（无快照字段）回退现行定义反推——行为与旧版一致，仅供核对，非实收拆分。
+    const meta = (it.metadata ?? null) as { visaListSnapshotCny?: unknown } | null;
+    if (meta && typeof meta.visaListSnapshotCny === 'number') {
+      return s + meta.visaListSnapshotCny;
+    }
+    if (!it.bundle) return s;
     const components = Array.isArray(it.bundle.items)
       ? (it.bundle.items as unknown as BundleItemJson[])
       : [];

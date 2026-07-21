@@ -902,6 +902,8 @@ export interface DeletedOrderSummary {
   deletedAt: string | null;
   /** 删除人（来自审计，可能缺失 → null） */
   deletedBy: string | null;
+  /** 乘客姓名（中文名优先，缺失回退证件姓名） */
+  passengerNames: string[];
 }
 
 export interface OrderSummary {
@@ -2038,7 +2040,8 @@ export const api = {
       token,
     }),
   // 回收站：列出已软删订单（仅 ADMIN）。删除人（deletedBy）来自审计，可能为 null。
-  listDeletedOrders: (token: string, query?: { page?: number; pageSize?: number }) => {
+  // search：模糊匹配订单号/联系人名/乘客姓名（含中文名），透传给后端 query 参数。
+  listDeletedOrders: (token: string, query?: { page?: number; pageSize?: number; search?: string }) => {
     const qs = new URLSearchParams();
     if (query) {
       for (const [k, v] of Object.entries(query)) {
@@ -2751,6 +2754,16 @@ export const api = {
         | { status: 'no_flights' };
     }>(`/fulfillment-tasks/by-order/${orderId}/resend-itinerary`, { method: 'POST', token }),
 
+  // 岗位管理（A20，仅 ADMIN）：内部账号列表 + 赋岗位（岗位决定导出裁剪，服务端强制）
+  listStaff: (token: string) =>
+    apiFetch<{ staff: StaffUser[] }>(`/users/staff`, { token }),
+  setStaffRole: (token: string, userId: string, staffRole: StaffRole | null) =>
+    apiFetch<{ ok: boolean; staffRole: StaffRole | null }>(`/users/${userId}/staff-role`, {
+      method: 'PATCH',
+      token,
+      body: { staffRole },
+    }),
+
   // 佣金规则（A1）：读=当前生效费率（每产品一条）；写=仅 ADMIN，追加新生效规则（历史保留）
   getCommissionRules: (token: string, agentId: string) =>
     apiFetch<{
@@ -3176,6 +3189,17 @@ export interface FlightPnlRow {
 }
 
 export type CostSource = 'override' | 'period' | 'none';
+
+/** 内部岗位（A20）：null=通用运营。专岗账号的全岗总表导出被服务端强制裁到本岗模板。 */
+export type StaffRole = 'VISA_DESK' | 'TICKETING' | 'ROOM_CONTROL';
+export interface StaffUser {
+  id: string;
+  email: string | null;
+  displayName: string | null;
+  role: 'ADMIN' | 'STAFF';
+  staffRole: StaffRole | null;
+  lastLoginAt: string | null;
+}
 
 /**
  * 班次成本明细行（admin-only · 用于"航班成本"维护页）

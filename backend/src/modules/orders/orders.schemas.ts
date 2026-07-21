@@ -12,6 +12,7 @@ import {
   VisaRequirement,
 } from '@prisma/client';
 import { normalizePassengerFullName } from '../../lib/passenger-name.js';
+import { COUNTRY_ALPHA3_TO_ALPHA2 } from '../../lib/country-codes.js';
 
 // 团队议价结算价上限（CNY/人）。防误输天价；正常机票远低于此。
 export const SETTLEMENT_PRICE_CAP_CNY = 100_000;
@@ -127,6 +128,35 @@ function optionalPnrSegmentName(max: number) {
   });
 }
 
+// 国家码字段（nationality / passportIssueCountry）：录单表单/前端已归一 2 位，但 OTA 名单粘贴解析
+// （admin-web parseOtaRoster.ts）、护照 OCR、代理侧 API 等非受控输入常见 3 位码（护照 MRZ 本身
+// 就是 3 位，如 CHN/USA/VNM）。此前用 z.string().length(2) 死板拒绝 → 整批建单 400，
+// 且报错笼统成 "Request validation failed"，运营看不出到底哪个字段哪个值有问题（0720 反馈）。
+// 现改为接受 2 或 3 位字母：3 位查表（与 admin-web 同一口径的 COUNTRY_ALPHA3_TO_ALPHA2）归一成
+// 2 位；查不到映射的 3 位码 / 其它非法格式，直接在这条 issue 上给出「哪个字段、哪个值」的中文提示
+// （而不是让全局错误处理器的兜底文案吞掉）。
+function countryCodeSchema(fieldLabel: string) {
+  return z.string().transform((raw, ctx) => {
+    const trimmed = raw.trim();
+    const upper = trimmed.toUpperCase();
+    if (/^[A-Z]{2}$/.test(upper)) return upper;
+    if (/^[A-Z]{3}$/.test(upper)) {
+      const mapped = COUNTRY_ALPHA3_TO_ALPHA2[upper];
+      if (mapped) return mapped;
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `${fieldLabel}「${trimmed}」是未识别的 3 位国家/地区码，请改用 2 位 ISO 码（如 CN/US/VN）或核对拼写`,
+      });
+      return z.NEVER;
+    }
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: `${fieldLabel}「${trimmed}」不是合法的国家码，应为 2 位或 3 位字母（如 CN 或 CHN）`,
+    });
+    return z.NEVER;
+  });
+}
+
 // ── 下单 ─────────────────────────────────────────────────────────────────
 // 乘客信息 — 注：所有新字段都是 optional，老客户端可继续工作
 export const passengerInputSchema = z.object({
@@ -146,16 +176,19 @@ export const passengerInputSchema = z.object({
   documentNumber: z.string().min(3).max(40),
   dateOfBirth: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   placeOfBirth: z.string().max(60).optional(),
-  nationality: z.string().length(2).default('CN'),
+  nationality: countryCodeSchema('国籍').default('CN'),
   passengerType: z.nativeEnum(PassengerType).default('ADULT'),
 
   // 护照扩展
   chineseName: z.string().max(120).optional(),                                  // 中文姓名
   passportIssueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),       // 护照签发日期
-  passportIssueCountry: z.string().length(2).optional(),
+  passportIssueCountry: countryCodeSchema('护照签发国').optional(),
   passportIssuePlace: z.string().max(120).optional(),                          // 护照签发地点（城市/机关文本，OCR 或手填，选填）
   passportExpiry: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
 
+  // 订座编码（PNR）：录单时可直接带入（如 OTA 名单里的共用编码——多人同一 PNR 各行填同值，
+  // 与航司「一码多人」模型一致）。出票后 demo worker 也会回填/覆盖。
+  pnr: z.string().max(20).optional(),
   // 签证
   visaNumber: z.string().max(40).optional(),
   visaType: z.string().max(40).optional(),

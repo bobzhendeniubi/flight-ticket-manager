@@ -310,8 +310,9 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   );
 
   // ── 回收站：列出已软删订单（仅 ADMIN）──────────────────────────────
-  // GET /orders/deleted?page&pageSize —— 分页列出 deletedAt 非空的订单（订单号/客户/金额/
-  //   原状态/删除时间/删除人）。静态路由，Fastify 优先于 /:id 匹配，故不会被参数路由吞掉。
+  // GET /orders/deleted?page&pageSize&search —— 分页列出 deletedAt 非空的订单（订单号/客户/金额/
+  //   原状态/删除时间/删除人）。search 模糊匹配订单号/联系人名/乘客姓名（含中文名）。
+  //   静态路由，Fastify 优先于 /:id 匹配，故不会被参数路由吞掉。
   app.get(
     '/deleted',
     { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN)] },
@@ -320,6 +321,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         .object({
           page: z.coerce.number().int().min(1).default(1),
           pageSize: z.coerce.number().int().min(1).max(200).default(50),
+          search: z.string().trim().min(1).optional(),
         })
         .parse(req.query);
       const requester = await buildRequester(req.user.sub, req.user.role);
@@ -636,6 +638,11 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // GET /orders/export/master?from=YYYY-MM-DD&to=YYYY-MM-DD&role=all|ticketing|visa
   // 按出发日期区间选单（同整班/全岗口径）；role 缺省=完整全岗表，仅裁与岗位无关的列。
   // ADMIN/STAFF only（与其它导出一致：代理/客户不放行）。
+  // A20 岗位细分（2026-07-20 拍板「全改」）：role 不再单信 query 参数——专岗账号
+  //（User.staffRole）被强制裁到本岗模板，改参数也拿不到订单成本/结算价等全岗列：
+  //   ADMIN / 通用 STAFF（staffRole=null）→ 尊重 query（现状，可信运营）
+  //   VISA_DESK → 强制 'visa'；TICKETING → 强制 'ticketing'
+  //   ROOM_CONTROL → 强制 'visa'（总表内金额暴露面最小的模板；房控本职导出在房控模块）
   app.get(
     '/export/master',
     { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
@@ -649,6 +656,19 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
           orderIds: orderIdsQuerySchema,
         })
         .parse(req.query);
+      if (req.user.role === UserRole.STAFF) {
+        const me = await prisma.user.findUnique({
+          where: { id: req.user.sub },
+          select: { staffRole: true },
+        });
+        const forced =
+          me?.staffRole === 'VISA_DESK' || me?.staffRole === 'ROOM_CONTROL'
+            ? ('visa' as const)
+            : me?.staffRole === 'TICKETING'
+              ? ('ticketing' as const)
+              : null;
+        if (forced) query.role = forced;
+      }
       const buf = await buildMasterExportWorkbook(query);
 
       void writeAudit({

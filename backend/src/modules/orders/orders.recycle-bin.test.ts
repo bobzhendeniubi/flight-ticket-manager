@@ -77,6 +77,7 @@ describe('listDeletedOrders · 口径与映射', () => {
         currency: 'CNY',
         status: OrderStatus.CANCELLED,
         deletedAt,
+        passengers: [{ fullName: 'ZHANG SAN', chineseName: '张三' }],
       },
       {
         id: 'o2',
@@ -86,6 +87,8 @@ describe('listDeletedOrders · 口径与映射', () => {
         currency: 'CNY',
         status: OrderStatus.REFUNDED,
         deletedAt,
+        // 无中文名 → 回退证件姓名
+        passengers: [{ fullName: 'LI SI', chineseName: null }],
       },
     ]);
     mockPrisma.order.count.mockResolvedValue(2);
@@ -98,10 +101,12 @@ describe('listDeletedOrders · 口径与映射', () => {
 
     const res = await service.listDeletedOrders({ page: 1, pageSize: 50 }, ADMIN);
 
-    // findMany 只取 deletedAt 非空、倒序
+    // findMany 只取 deletedAt 非空、倒序；未传 search 时 where 形状不变（无 OR）
     const findArg = mockPrisma.order.findMany.mock.calls[0][0];
     expect(findArg.where).toEqual({ deletedAt: { not: null } });
     expect(findArg.orderBy).toEqual({ deletedAt: 'desc' });
+    // select 只取乘客姓名字段（不整对象）
+    expect(findArg.select.passengers).toEqual({ select: { fullName: true, chineseName: true } });
     // 审计按目标订单 + 动作查
     const auditArg = mockPrisma.auditLog.findMany.mock.calls[0][0];
     expect(auditArg.where.action).toBe('SOFT_DELETE_ORDER');
@@ -117,8 +122,11 @@ describe('listDeletedOrders · 口径与映射', () => {
       status: OrderStatus.CANCELLED,
       deletedAt,
       deletedBy: 'ops@coco',
+      passengerNames: ['张三'],
     });
     expect(res.orders[1].deletedBy).toBe('运营小组');
+    // 中文名缺失 → 回退证件姓名（fullName）
+    expect(res.orders[1].passengerNames).toEqual(['LI SI']);
   });
 
   it('审计缺失时 deletedBy 置 null（不硬凑）', async () => {
@@ -132,6 +140,7 @@ describe('listDeletedOrders · 口径与映射', () => {
         currency: 'CNY',
         status: OrderStatus.PAYMENT_TIMEOUT,
         deletedAt,
+        passengers: [],
       },
     ]);
     mockPrisma.order.count.mockResolvedValue(1);
@@ -139,6 +148,7 @@ describe('listDeletedOrders · 口径与映射', () => {
 
     const res = await service.listDeletedOrders({ page: 1, pageSize: 50 }, ADMIN);
     expect(res.orders[0].deletedBy).toBeNull();
+    expect(res.orders[0].passengerNames).toEqual([]);
   });
 
   it('无已删订单时不查审计（省一次查询）', async () => {
@@ -148,6 +158,47 @@ describe('listDeletedOrders · 口径与映射', () => {
     const res = await service.listDeletedOrders({ page: 1, pageSize: 50 }, ADMIN);
     expect(res.orders).toEqual([]);
     expect(mockPrisma.auditLog.findMany).not.toHaveBeenCalled();
+  });
+});
+
+describe('listDeletedOrders · search 模糊匹配（订单号/联系人名/乘客姓名含中文名）', () => {
+  it('不传 search 时 where 不含 OR（保持原口径）', async () => {
+    mockPrisma.order.findMany.mockResolvedValue([]);
+    mockPrisma.order.count.mockResolvedValue(0);
+
+    await service.listDeletedOrders({ page: 1, pageSize: 50 }, ADMIN);
+
+    const findArg = mockPrisma.order.findMany.mock.calls[0][0];
+    expect(findArg.where).toEqual({ deletedAt: { not: null } });
+  });
+
+  it('传 search 时 where 加 OR：订单号 / 联系人名 / 乘客姓名（含中文名）模糊匹配', async () => {
+    mockPrisma.order.findMany.mockResolvedValue([]);
+    mockPrisma.order.count.mockResolvedValue(0);
+
+    await service.listDeletedOrders({ page: 1, pageSize: 50, search: '张三' }, ADMIN);
+
+    const findArg = mockPrisma.order.findMany.mock.calls[0][0];
+    expect(findArg.where).toEqual({
+      deletedAt: { not: null },
+      OR: [
+        { orderNumber: { contains: '张三', mode: 'insensitive' } },
+        { contactName: { contains: '张三', mode: 'insensitive' } },
+        {
+          passengers: {
+            some: {
+              OR: [
+                { fullName: { contains: '张三', mode: 'insensitive' } },
+                { chineseName: { contains: '张三', mode: 'insensitive' } },
+              ],
+            },
+          },
+        },
+      ],
+    });
+    // count 也要用同一个 where（分页 total 与筛选口径一致）
+    const countArg = mockPrisma.order.count.mock.calls[0][0];
+    expect(countArg.where).toEqual(findArg.where);
   });
 });
 
