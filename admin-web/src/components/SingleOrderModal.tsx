@@ -367,8 +367,9 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const [adjustAmount, setAdjustAmount] = useState<number | null>(null);
   const [adjustReason, setAdjustReason] = useState<PriceAdjustmentReason>('DISCOUNT');
   const [adjustText, setAdjustText] = useState('');
-  // 结算价（纯前端辅助录入，不提交）：填最终想收的价，自动换算差额回填 adjustAmount，
-  // 免得每次都要自己心算「结算价 − 系统价」。留空不影响 adjustAmount 的正常手填。
+  // 本单结算总价（仅 ADMIN/STAFF 可见；提交为 settlementTotalCny）：代理单一口价，系统照此收钱。
+  // 服务端按「结算价 − 权威合计」自动生成一条「代理结算价」（SETTLEMENT）差额行——不改任何
+  // 明细行价格，原价/差额留痕可审计。与下方手工「调整金额」互斥（服务端 400，前端也阻断提交）。
   const [settlementPrice, setSettlementPrice] = useState<number | null>(null);
 
   // ── 机票 ──
@@ -698,6 +699,29 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const adjustNeedsText = adjustReason === 'OTHER' && adjustText.trim().length === 0;
   const hasValidAdjustment = adjustIsInteger && !adjustNeedsText;
   const adjustError = adjustIsInteger && adjustNeedsText ? '选择「其它」时请填写调整原因说明' : null;
+
+  // ── 本单结算总价（仅 ADMIN/STAFF）──
+  const isStaffUser = user?.role === 'ADMIN' || user?.role === 'STAFF';
+  // 差额上限（镜像后端 PRICE_ADJUSTMENT_CAP_CNY）：超出直接前端阻断，省一次必败的提交。
+  const SETTLEMENT_DIFF_CAP_CNY = 100_000;
+  // 差额 = 结算价 − 系统价（表单当前试算值；对齐到分，避免浮点尾差）。系统价不可用时为 null。
+  const settlementDiff =
+    settlementPrice !== null && quoteTotal !== null
+      ? Math.round((settlementPrice - quoteTotal) * 100) / 100
+      : null;
+  const settlementError =
+    settlementPrice === null
+      ? null
+      : Number(settlementPrice.toFixed(2)) !== settlementPrice
+        ? '结算总价最多两位小数'
+        : settlementDiff !== null && Math.abs(settlementDiff) > SETTLEMENT_DIFF_CAP_CNY
+          ? `结算总价与系统价差额超出调价上限（±¥${SETTLEMENT_DIFF_CAP_CNY.toLocaleString('zh-CN')}），请复核`
+          : null;
+  // 与手工调价互斥（服务端也会 400）：两个改价通道同时填会双重砸价，前端先拦。
+  const settlementConflict =
+    settlementPrice !== null && adjustIsInteger
+      ? '「本单结算总价」与「调整金额」不能同时填写（两者互斥）；请清空其中一个'
+      : null;
 
   function setPassenger(i: number, patch: Partial<PassengerRow>): void {
     setPassengers((prev) => {
@@ -1174,14 +1198,8 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     transferId, transferQty, validPassengers.length,
   ]);
 
-  // 系统价试算完成/刷新后，若运营已经填过「结算价」，用新的系统价重新换算调整金额，
-  // 避免系统价试算完才发现结算价对应的调整额是按旧系统价算的。
-  useEffect(() => {
-    if (settlementPrice === null || quoteTotal === null) return;
-    setAdjustAmount(Math.round(settlementPrice - quoteTotal));
-    // 只在系统价变化时重新换算；结算价变化本身已经在输入框 onChange 里同步过了。
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [quoteTotal]);
+  // 注：结算总价不再回填「调整金额」——settlementTotalCny 直接提交给服务端，由服务端按
+  // 权威价自动生成差额行（前端只做预览），两个通道互斥。
 
   async function submit(): Promise<void> {
     if (!token || submitting) return;
@@ -1213,6 +1231,16 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
 
     if (adjustError) {
       setErr(adjustError);
+      return;
+    }
+
+    // 本单结算总价：格式/上限错误或与手工调价同时填 → 阻断提交（镜像服务端校验，先给可读提示）
+    if (settlementError) {
+      setErr(settlementError);
+      return;
+    }
+    if (settlementConflict) {
+      setErr(settlementConflict);
       return;
     }
 
@@ -1264,6 +1292,9 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
             },
           }
         : {}),
+      // 本单结算总价（仅 ADMIN/STAFF；与 priceAdjustment 互斥，上方已阻断同时填写）：
+      // 服务端按「结算价 − 权威合计」自动生成「代理结算价」差额行，系统照此收钱。
+      ...(isStaffUser && settlementPrice !== null ? { settlementTotalCny: settlementPrice } : {}),
     };
 
     setSubmitting(true);
@@ -2298,23 +2329,34 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                 <p className="mb-1.5 text-[11px] text-slate-400">
                   升舱/单人入住请用套餐加购选项（占真实库存）；换酒店走订单详情「换酒店」；签证改多签请更换签证产品——这些操作不要走调价，否则相关岗位看不到。
                 </p>
-                <label className="mb-2 block text-xs text-slate-500">
-                  结算价（¥，可选：直接填最终收款价）
-                  <NumberInput
-                    className={inputCls}
-                    value={settlementPrice}
-                    onChange={(n) => {
-                      setSettlementPrice(n);
-                      if (n === null || quoteTotal === null) return;
-                      setAdjustAmount(Math.round(n - quoteTotal));
-                    }}
-                    allowNegative
-                    placeholder={quoteTotal !== null ? `如 ${Math.round(quoteTotal)}` : '如 1500'}
-                  />
-                </label>
-                <p className="mb-1.5 text-[11px] text-slate-400">
-                  填这里会自动算出与系统价的差额，回填到下方「调整金额」；留空不影响手动填调整金额。
-                </p>
+                {isStaffUser && (
+                  <>
+                    <label className="mb-2 block text-xs text-slate-500">
+                      本单结算总价（¥，选填：与代理谈定的一口价，系统照此收钱）
+                      <NumberInput
+                        className={inputCls}
+                        value={settlementPrice}
+                        onChange={setSettlementPrice}
+                        placeholder={quoteTotal !== null ? `如 ${Math.round(quoteTotal)}` : '如 1500'}
+                      />
+                    </label>
+                    {settlementPrice !== null && !settlementError && (
+                      <div className="mb-1.5 flex items-center justify-between rounded-md bg-slate-50 px-2.5 py-1.5">
+                        <span className="text-xs text-slate-500">结算价预览</span>
+                        <span className="text-xs font-medium text-slate-700">
+                          {settlementDiff !== null && quoteTotal !== null
+                            ? `系统价 ¥${quoteTotal.toLocaleString('zh-CN')} · 结算价 ¥${settlementPrice.toLocaleString('zh-CN')} · 差额 ${settlementDiff >= 0 ? '+' : '−'}¥${Math.abs(settlementDiff).toLocaleString('zh-CN')}`
+                            : `结算价 ¥${settlementPrice.toLocaleString('zh-CN')}（系统价试算中/不可用，差额以提交后服务端权威价为准）`}
+                        </span>
+                      </div>
+                    )}
+                    {settlementError && <p className="mb-1.5 text-[11px] text-rose-500">{settlementError}</p>}
+                    {settlementConflict && <p className="mb-1.5 text-[11px] text-rose-500">{settlementConflict}</p>}
+                    <p className="mb-1.5 text-[11px] text-slate-400">
+                      填写后系统按「结算价 − 系统价」自动生成一条「代理结算价」调价行（不改明细行价格，留痕可审计）；与下方「调整金额」互斥，二选一。
+                    </p>
+                  </>
+                )}
                 <div className="grid gap-2 md:grid-cols-3">
                   <label className="text-xs text-slate-500">
                     调整金额（¥，可负=优惠）

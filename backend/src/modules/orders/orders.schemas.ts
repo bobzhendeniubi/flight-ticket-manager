@@ -53,6 +53,9 @@ export const PRICE_ADJUSTMENT_REASON_LEGACY = [
 // 不通过录单调价旁路——口径同升级酒店必须走「换酒店」：结构化改动不走调价，避免运营隐形。
 export const PRICE_ADJUSTMENT_REASON_ENDPOINT_ONLY = [
   'ROOM_DIFF', // 补收单房差（由 room-supplement 端点产生，展示用）
+  // 代理结算价：录单填「本单结算总价」（settlementTotalCny）时由系统按「结算价 − 权威合计」
+  // 自动生成的差额行。**只能系统生成**，不进人工调价下拉（PRICE_ADJUSTMENT_REASON 不含它）。
+  'SETTLEMENT',
 ] as const;
 
 export type PriceAdjustmentReasonDisplay =
@@ -69,6 +72,7 @@ export const PRICE_ADJUSTMENT_REASON_LABEL: Record<PriceAdjustmentReasonDisplay,
   UPGRADE_HOTEL: '升级酒店',
   VISA_MULTI: '签证改多签',
   ROOM_DIFF: '补收单房差',
+  SETTLEMENT: '代理结算价',
 };
 
 export const priceAdjustmentSchema = z
@@ -400,6 +404,16 @@ export const createOrderBodySchema = z.object({
   // 录单调价/加项（仅 ADMIN/STAFF 录单生效）。服务端按认证身份判权限：公开散客/客户/代理
   // 携带此字段一律 400（见 createOrder）。落一条独立 OrderItem 计入 total，并写审计。
   priceAdjustment: priceAdjustmentSchema.optional(),
+  // 本单结算总价（CNY，≥0，最多两位小数；仅 ADMIN/STAFF 录单生效，服务端按认证身份判权限）。
+  // 业务场景：代理单与代理谈定整单一口价，系统照此收钱。实现上**不改任何明细行价格**：
+  // 服务端算完权威合计后，按「结算价 − 权威合计」自动生成一条 reasonCode=SETTLEMENT 的调价行
+  // （原价/差额/原因留痕可审计），总额=Σitems 不变式保持。差额受 PRICE_ADJUSTMENT_CAP_CNY 约束；
+  // 与 priceAdjustment 互斥（同时传 400，见 createOrder），避免双重砸价。
+  settlementTotalCny: z
+    .number()
+    .min(0, '结算总价不能为负')
+    .refine((v) => Number(v.toFixed(2)) === v, { message: '结算总价最多两位小数（元）' })
+    .optional(),
   // 允许重复乘客强录（仅 ADMIN/STAFF 后台录入生效）。客人重复订票且已付款场景：
   // 同班次同证件号本会被拦，运营确认后带此 flag 放行，服务端写审计 + 订单备注留痕。
   // 服务端按认证身份判权限：散客/AGENT 携带此字段无效，照旧拦（见 createOrder）。

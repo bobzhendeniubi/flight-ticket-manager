@@ -451,7 +451,9 @@ export const PRICE_ADJUSTMENT_REASON_OPTIONS: PriceAdjustmentReason[] = [
 type PriceAdjustmentReasonLegacy = 'UPGRADE_CABIN' | 'UPGRADE_HOTEL' | 'VISA_MULTI';
 // 专用端点产生、不在录单可选枚举里的原因（仅展示 label）。ROOM_DIFF 走订单详情「补收单房差」
 // 专用通道（POST /orders/:id/room-supplement），不进录单调价下拉（PRICE_ADJUSTMENT_REASON_OPTIONS）。
-type PriceAdjustmentReasonEndpointOnly = 'ROOM_DIFF';
+// SETTLEMENT 由录单「本单结算总价」（settlementTotalCny）触发、服务端自动生成差额行——
+// **只能系统生成**，同样不进人工调价下拉。
+type PriceAdjustmentReasonEndpointOnly = 'ROOM_DIFF' | 'SETTLEMENT';
 type PriceAdjustmentReasonDisplay =
   | PriceAdjustmentReason
   | PriceAdjustmentReasonLegacy
@@ -466,6 +468,7 @@ export const PRICE_ADJUSTMENT_REASON_LABEL: Record<PriceAdjustmentReasonDisplay,
   UPGRADE_HOTEL: '升级酒店',
   VISA_MULTI: '签证改多签',
   ROOM_DIFF: '补收单房差',
+  SETTLEMENT: '代理结算价',
 };
 
 export interface PriceAdjustmentInput {
@@ -499,6 +502,13 @@ export interface CreateOrderInput extends OrderStructuredNotes {
   idempotencyKey?: string;
   /** 录单调价/加项（ADMIN/STAFF 录单专用；服务端按认证身份判权限） */
   priceAdjustment?: PriceAdjustmentInput;
+  /**
+   * 本单结算总价（CNY，≥0，最多两位小数；ADMIN/STAFF 录单专用，服务端按认证身份判权限）。
+   * 代理单一口价场景：系统照此收钱——服务端按「结算价 − 权威合计」自动生成一条
+   * reasonCode=SETTLEMENT 的差额调价行（不改任何明细行价格，原价/差额留痕可审计）。
+   * 与 priceAdjustment 互斥（同时传服务端 400）。
+   */
+  settlementTotalCny?: number;
   /**
    * 代为某代理录单（ADMIN/STAFF 用）。直客/无代理 = 不传。
    * 注：服务端创单接口对 agentId 的归属支持为后端配套改动；本字段为前向兼容透传，

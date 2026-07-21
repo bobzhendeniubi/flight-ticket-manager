@@ -70,7 +70,7 @@ import {
   assertTicketingCap,
   determineFlightLegs,
 } from './ticketing-cap.js';
-import { PRICE_ADJUSTMENT_REASON_LABEL } from './orders.schemas.js';
+import { PRICE_ADJUSTMENT_CAP_CNY, PRICE_ADJUSTMENT_REASON_LABEL } from './orders.schemas.js';
 import type {
   BatchCreateOrdersBody,
   CreateOrderBody,
@@ -432,6 +432,45 @@ export function buildPriceAdjustmentItem(adj: PriceAdjustmentInput): {
 }
 
 /**
+ * 本单结算总价 → 一条系统生成的 SETTLEMENT 差额行（计入 subtotal/total）。
+ *   - 业务：代理单与代理谈定整单一口价（结算价），系统照此收钱；服务端权威定价不破坏——
+ *     **绝不改各明细行价格**，只按「结算价 − 权威合计」追加一条差额行（原价/差额/原因留痕可审计）。
+ *   - diffCny 可正可负（最多两位小数）：正 → FEE、负 → DISCOUNT（与录单调价同口径，财务分类诚实）。
+ *   - 描述可读，如「价格调整：代理结算价（−¥5684）」；金额为 0 的场景由调用方跳过（不生成行）。
+ *   - metadata 打标 priceAdjustment=true + reasonCode='SETTLEMENT'（只能系统生成，不在人工下拉里）
+ *     + settlementPrice=true + 权威合计/结算价快照，供审计与对账识别。
+ * 导出供单测复用。
+ */
+export function buildSettlementTotalItem(input: {
+  diffCny: number;
+  authoritativeTotalCny: number;
+  settlementTotalCny: number;
+}): {
+  kind: OrderItemKind;
+  description: string;
+  quantity: number;
+  unitPrice: number;
+  amount: number;
+  metadata: Record<string, unknown>;
+} {
+  const signed = `${input.diffCny > 0 ? '+' : '−'}¥${Math.abs(input.diffCny)}`;
+  return {
+    kind: input.diffCny > 0 ? OrderItemKind.FEE : OrderItemKind.DISCOUNT,
+    description: `价格调整：${PRICE_ADJUSTMENT_REASON_LABEL.SETTLEMENT}（${signed}）`,
+    quantity: 1,
+    unitPrice: input.diffCny,
+    amount: input.diffCny,
+    metadata: {
+      priceAdjustment: true,
+      reasonCode: 'SETTLEMENT',
+      settlementPrice: true,
+      authoritativeTotalCny: input.authoritativeTotalCny,
+      settlementTotalCny: input.settlementTotalCny,
+    },
+  };
+}
+
+/**
  * 前台展示价兜底校验（S1）：expectedTotalCny 存在且与「服务端权威商品价」偏差 > 容差（PRICE_TOLERANCE_CNY，
  * 1 元，容忍逐行取整）→ 抛 PRICE_CHANGED（前台提示刷新重下，绝不静默按新价多收）。
  * 缺省（admin/批量/quote 不带 expectedTotalCny）→ 直接返回，跳过比对（录单路径不受影响）。
@@ -497,12 +536,16 @@ export class OrderService {
     const ownerUserId: string | null = isGuest ? null : requester.userId;
     const guest = isGuest ? requester.guest : null;
 
-    // 录单调价/加项：仅 ADMIN/STAFF 录单可用。服务端按认证身份判权限（不信前端）——
-    // 公开散客/客户/代理携带此字段直接 400，杜绝对外接口被绕过手工改价。
-    if (body.priceAdjustment) {
+    // 录单调价/加项 + 本单结算总价：仅 ADMIN/STAFF 录单可用。服务端按认证身份判权限（不信前端）——
+    // 公开散客/客户/代理携带这些字段直接 400，杜绝对外接口被绕过手工改价。
+    if (body.priceAdjustment || body.settlementTotalCny !== undefined) {
       const role = isGuest ? undefined : requester.role;
       if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
         throw new BadRequestError('无权调整订单价格');
+      }
+      // 两个改价通道互斥：结算总价本身就是「把总额收敛到一个数」，再叠加手工调价会双重砸价。
+      if (body.priceAdjustment && body.settlementTotalCny !== undefined) {
+        throw new BadRequestError('「本单结算总价」与「价格调整」不能同时填写（两者互斥，避免双重调价）');
       }
     }
 
@@ -619,6 +662,34 @@ export class OrderService {
     // 录单调价/加项（权限已在上方按认证身份校验）：追加一条独立定价行，计入 subtotal/total。
     if (body.priceAdjustment) {
       pricedItems.push(buildPriceAdjustmentItem(body.priceAdjustment));
+    }
+
+    // 本单结算总价（权限/与 priceAdjustment 的互斥已在入口断言）：按「结算价 − 权威合计」
+    // 自动生成一条 SETTLEMENT 差额行，把 total 收敛到结算价。权威合计取此刻 pricedItems 之和
+    // （含护照临期附加费等系统费行）——结算价语义是「本单最终收多少钱」。
+    // 绝不改各明细行价格；diff=0 不生成行（系统价即结算价）；|diff| 超调价上限 → 400。
+    let settlementAuthoritativeTotalCny: number | null = null;
+    let settlementDiffCny: number | null = null;
+    if (body.settlementTotalCny !== undefined) {
+      const authoritativeTotalCny = pricedItems.reduce((sum, p) => sum + p.amount, 0);
+      // 两位小数取整：结算价最多两位小数（schema 已校验），差额对齐到分，避免浮点尾差。
+      const diffCny = Math.round((body.settlementTotalCny - authoritativeTotalCny) * 100) / 100;
+      if (Math.abs(diffCny) > PRICE_ADJUSTMENT_CAP_CNY) {
+        throw new BadRequestError(
+          `结算总价与系统价（¥${authoritativeTotalCny}）差额 ¥${Math.abs(diffCny)} 超出调价上限（±¥${PRICE_ADJUSTMENT_CAP_CNY}），请复核结算价`,
+        );
+      }
+      if (diffCny !== 0) {
+        pricedItems.push(
+          buildSettlementTotalItem({
+            diffCny,
+            authoritativeTotalCny,
+            settlementTotalCny: body.settlementTotalCny,
+          }),
+        );
+      }
+      settlementAuthoritativeTotalCny = authoritativeTotalCny;
+      settlementDiffCny = diffCny;
     }
 
     const subtotal = pricedItems.reduce((sum, p) => sum + p.amount, 0);
@@ -848,6 +919,29 @@ export class OrderService {
           reasonLabel: PRICE_ADJUSTMENT_REASON_LABEL[reasonCode],
           reasonText: reasonText?.trim() || null,
         },
+      });
+    }
+
+    // 本单结算总价审计（权威合计 / 结算价 / 差额 / 操作人）。权限已在入口断言 → 此处必为 ADMIN/STAFF。
+    // WARNING 级：整单收款额被收敛到人工谈定的结算价，是需要留痕复核的财务动作。
+    // diff=0（未生成差额行、总额未变）不写审计，避免无操作的 WARNING 噪音淹没真正该警觉的调价。
+    // await（非 fire-and-forget）：与录单调价同口径，落审计后再返回，便于对账与追责。
+    if (settlementDiffCny !== null && settlementDiffCny !== 0 && !isGuest) {
+      await writeAudit({
+        actor: { userId: requester.userId, role: requester.role },
+        action: 'APPLY_SETTLEMENT_TOTAL',
+        targetType: 'ORDER',
+        targetId: order.id,
+        targetLabel: order.orderNumber,
+        before: { total: settlementAuthoritativeTotalCny?.toString() ?? null },
+        after: {
+          total: Number(order.total).toString(),
+          settlementTotalCny: body.settlementTotalCny,
+          diffCny: settlementDiffCny,
+          reasonCode: 'SETTLEMENT',
+          reasonLabel: PRICE_ADJUSTMENT_REASON_LABEL.SETTLEMENT,
+        },
+        severity: AuditSeverity.WARNING,
       });
     }
 
@@ -6672,10 +6766,11 @@ export function serializeOrder<T extends OrderLike>(
     adultCount,
     childCount,
     infantCount,
-    // 套餐订单按人头单价（由 total 反推，非套餐订单/查不到套餐定价配置时为 null；「产品内容」卡片用）
-    infantUnitPriceCny: perAgePrices?.infantUnitPriceCny ?? null,
-    childUnitPriceCny: perAgePrices?.childUnitPriceCny ?? null,
-    adultUnitPriceCny: perAgePrices?.adultUnitPriceCny ?? null,
+    // 套餐订单按人头单价（由 total 反推，非套餐订单/查不到套餐定价配置时为 null）。
+    // 内部均摊口径，仅 ADMIN/STAFF 可见：客户/代理端页面不渲染它，响应体也不该带（redact 时置 null）。
+    infantUnitPriceCny: redact ? null : (perAgePrices?.infantUnitPriceCny ?? null),
+    childUnitPriceCny: redact ? null : (perAgePrices?.childUnitPriceCny ?? null),
+    adultUnitPriceCny: redact ? null : (perAgePrices?.adultUnitPriceCny ?? null),
     // ── 对外脱敏（redact）：内部备注 / 结构化四栏 / 出纳期望到账 / 售后审计流水 / 接单运营 / 运营待办一律不下发。
     //    这些键都来自上面的 ...order 展开，这里放在其后按角色覆盖：置 undefined 时 JSON.stringify 会自动省略该键。
     //    保留订单级金额（total/subtotal/paidAmount/effectivePayable/balanceDue = 该角色自己的结算价）与出行人证件
