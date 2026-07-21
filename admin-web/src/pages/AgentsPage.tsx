@@ -3,7 +3,7 @@
  */
 import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { api, ApiError, SETTLEMENT_MODE_LABEL, type AgentListItem, type CreateChildAgentInput, type CustomerSummary, type SettlementMode, type UpdateAgentInput } from '../lib/api';
+import { api, ApiError, ROSTER_FORMAT_LABEL, SETTLEMENT_MODE_LABEL, type AgentListItem, type CreateChildAgentInput, type CustomerSummary, type RosterFormat, type SettlementMode, type UpdateAgentInput } from '../lib/api';
 import { useAuth } from '../stores/auth';
 
 const TIER_LABEL = ['', '1级·总代', '2级·区代', '3级·门店', '4级', '5级'];
@@ -494,6 +494,9 @@ function InfoTab({
     contactPhone: agent.contactPhone,
     email: agent.email ?? '',
     notes: agent.notes ?? '',
+    rosterFormat: (agent.rosterFormat ?? '') as RosterFormat | '',
+    // 识别词条编辑态为逗号分隔文本，保存时拆数组
+    rosterKeywordsText: (agent.rosterKeywords ?? []).join('，'),
   });
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -505,6 +508,8 @@ function InfoTab({
       contactPhone: agent.contactPhone,
       email: agent.email ?? '',
       notes: agent.notes ?? '',
+      rosterFormat: (agent.rosterFormat ?? '') as RosterFormat | '',
+      rosterKeywordsText: (agent.rosterKeywords ?? []).join('，'),
     });
     setErr(null);
     setEditing(true);
@@ -522,6 +527,14 @@ function InfoTab({
       if (form.contactPhone !== agent.contactPhone) body.contactPhone = form.contactPhone;
       if (form.email !== (agent.email ?? '')) body.email = form.email;
       if (form.notes !== (agent.notes ?? '')) body.notes = form.notes;
+      if ((form.rosterFormat || null) !== (agent.rosterFormat ?? null)) {
+        body.rosterFormat = form.rosterFormat === '' ? null : form.rosterFormat;
+      }
+      // 逗号（中英文）分隔 → trim → 去空；与服务端口径一致
+      const keywords = form.rosterKeywordsText.split(/[,，]/).map((k) => k.trim()).filter(Boolean);
+      if (JSON.stringify(keywords) !== JSON.stringify(agent.rosterKeywords ?? [])) {
+        body.rosterKeywords = keywords;
+      }
       if (Object.keys(body).length === 0) {
         setEditing(false);
         return;
@@ -568,6 +581,30 @@ function InfoTab({
               <input type="email" className="input" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} />
             </div>
           </div>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <div>
+              <label className="label text-xs">名单格式</label>
+              <select
+                className="input"
+                value={form.rosterFormat}
+                onChange={(e) => setForm({ ...form, rosterFormat: e.target.value as RosterFormat | '' })}
+              >
+                <option value="">未登记</option>
+                <option value="COLON_MULTILINE_YMD">{ROSTER_FORMAT_LABEL.COLON_MULTILINE_YMD}</option>
+                <option value="INLINE_NUMBERED">{ROSTER_FORMAT_LABEL.INLINE_NUMBERED}</option>
+                <option value="COLON_MULTILINE_DMY">{ROSTER_FORMAT_LABEL.COLON_MULTILINE_DMY}</option>
+              </select>
+            </div>
+            <div>
+              <label className="label text-xs">识别词条（逗号分隔，每条 ≤20 字，最多 10 条）</label>
+              <input
+                className="input"
+                placeholder="如：某某备注词，某某群名"
+                value={form.rosterKeywordsText}
+                onChange={(e) => setForm({ ...form, rosterKeywordsText: e.target.value })}
+              />
+            </div>
+          </div>
           <div>
             <label className="label text-xs">备注</label>
             <input className="input" value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} />
@@ -600,6 +637,10 @@ function InfoTab({
           <Row label="状态" value={agent.isActive ? '✅ 在用' : '⏸ 停用'} />
           <Row label="注册时间" value={new Date(agent.createdAt).toLocaleString('zh-CN')} />
           <Row label="上次登录" value={agent.lastLoginAt ? new Date(agent.lastLoginAt).toLocaleString('zh-CN') : '从未登录'} />
+          <Row label="名单格式" value={agent.rosterFormat ? ROSTER_FORMAT_LABEL[agent.rosterFormat] : '未登记'} />
+          {(agent.rosterKeywords?.length ?? 0) > 0 && (
+            <Row label="识别词条" value={agent.rosterKeywords.join('、')} />
+          )}
           {agent.notes && <Row label="备注" value={agent.notes} />}
         </dl>
       )}

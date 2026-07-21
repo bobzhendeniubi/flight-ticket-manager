@@ -524,6 +524,15 @@ export const SETTLEMENT_MODE_LABEL: Record<SettlementMode, string> = {
   MONTHLY: '月结',
 };
 
+// ── 名单格式绑定（批量创单防呆）── 与 backend agents.schemas ROSTER_FORMATS 对齐
+export type RosterFormat = 'COLON_MULTILINE_YMD' | 'INLINE_NUMBERED' | 'COLON_MULTILINE_DMY';
+
+export const ROSTER_FORMAT_LABEL: Record<RosterFormat, string> = {
+  COLON_MULTILINE_YMD: '冒号多行（年-月-日）',
+  INLINE_NUMBERED: '编号单行',
+  COLON_MULTILINE_DMY: '冒号多行（日-月-年）',
+};
+
 export interface AgentListItem {
   id: string;
   userId: string;
@@ -538,6 +547,10 @@ export interface AgentListItem {
   settlementMode: SettlementMode;
   isActive: boolean;
   notes: string | null;
+  /** 名单格式绑定：该代理惯用的粘贴名单格式；null = 未登记 */
+  rosterFormat: RosterFormat | null;
+  /** 识别词条（全局唯一，一词只归一家） */
+  rosterKeywords: string[];
   email: string | null;
   displayName: string | null;
   lastLoginAt: string | null;
@@ -555,6 +568,10 @@ export interface CreateChildAgentInput {
   companyName?: string;
   // 不含 prepaymentBalance：建代理余额恒为 0，事后走认款通道（有流水+审计）产生。
   notes?: string;
+  /** 名单格式绑定（可选） */
+  rosterFormat?: RosterFormat | null;
+  /** 识别词条（每条 ≤20 字，最多 10 条；服务端全局查重） */
+  rosterKeywords?: string[];
 }
 
 /** PATCH /agents/:id 请求体：所有字段可选，至少传一个 */
@@ -564,6 +581,10 @@ export interface UpdateAgentInput {
   contactPhone?: string;
   email?: string;
   notes?: string;
+  /** 名单格式绑定；null = 清除登记 */
+  rosterFormat?: RosterFormat | null;
+  /** 识别词条（每条 ≤20 字，最多 10 条；服务端全局查重） */
+  rosterKeywords?: string[];
 }
 
 // ── 切位（包位）── 与 backend seat-allocation 模块对齐

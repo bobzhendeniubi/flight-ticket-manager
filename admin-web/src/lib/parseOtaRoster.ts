@@ -103,8 +103,24 @@ export interface OtaRosterParseResult {
   settlementUnitPriceCny?: number;
   /** 名单标注的人数（「X10 个」中的 10），用于与乘客数核对 */
   settlementCount?: number;
+  /**
+   * 实际命中的乘客格式：COLON_MULTILINE（冒号多行，「乘机人：…」段式）/
+   * INLINE_NUMBERED（编号单行空格式）。两种都命中或都没命中时不设——
+   * 供上层与代理登记的名单格式做防呆比对（比不出来就不比，不误报）。
+   */
+  passengerFormat?: 'COLON_MULTILINE' | 'INLINE_NUMBERED';
   /** 解析提醒（定位到段 / 字段），前端原样展示；绝不静默丢人。 */
   warnings: string[];
+}
+
+export interface ParseOtaRosterOptions {
+  /**
+   * 日期读法：DMY = 按「日-月-年」读 DD-MM-YYYY 类日期（如 16-06-1987 → 1987-06-16），
+   * 且不再对「日≤12」的歧义日期追加「请核对」提醒（代理已登记该格式，视为确定）。
+   * 省略 / YMD = 维持现状推断（日>12 判日在前；日≤12 按日在前解析并提示核对）。
+   * 年在前（YYYY-MM-DD）日期不受此参数影响，始终按年-月-日读。
+   */
+  dateOrder?: 'YMD' | 'DMY';
 }
 
 /** 解析过程中给乘客临时打的「字段无法解析/需要核对」标记（finalize 时消费成 warnings，不外泄到结果类型）。 */
@@ -418,8 +434,10 @@ function assignDobAndExpiry(dates: string[]): { dob?: string; expiry?: string } 
  *   以「姓/名」开头 + 含性别 token + 含证件号 token（字母+数字混合、长度≥6）。
  * 不满足特征一律返回 null（交由其它分支处理，绝不强行拆字段）。
  */
-function parseLoosePassengerLine(line: string): WorkPassenger | null {
-  const nameMatch = line.match(/^([A-Za-z]+)\/([A-Za-z]+)\b\s*(.*)$/);
+function parseLoosePassengerLine(line: string, dmy = false): WorkPassenger | null {
+  // 编号单行式的行首序号（「1 」「2. 」「3、」等）先剥掉，再按「姓/名」开头判定。
+  const stripped = line.replace(/^\d{1,3}\s*[.、)]?\s+/, '');
+  const nameMatch = stripped.match(/^([A-Za-z]+)\/([A-Za-z]+)\b\s*(.*)$/);
   if (!nameMatch) return null;
   const [, last, first, restRaw] = nameMatch;
   const tokens = restRaw.split(' ').map((t) => t.trim()).filter(Boolean);
@@ -453,19 +471,19 @@ function parseLoosePassengerLine(line: string): WorkPassenger | null {
   if (dob) {
     px.dateOfBirth = dob;
     const rawTok = dateTokens[dates.indexOf(dob)];
-    if (rawTok && isAmbiguousDayFirstDate(rawTok)) px.__dobAmbiguous = rawTok;
+    if (rawTok && !dmy && isAmbiguousDayFirstDate(rawTok)) px.__dobAmbiguous = rawTok;
   }
   if (expiry) {
     px.passportExpiry = expiry;
     const rawTok = dateTokens[dates.indexOf(expiry)];
-    if (rawTok && isAmbiguousDayFirstDate(rawTok)) px.__expiryAmbiguous = rawTok;
+    if (rawTok && !dmy && isAmbiguousDayFirstDate(rawTok)) px.__expiryAmbiguous = rawTok;
   }
 
   return px;
 }
 
 /** 把一段字段行灌进乘客对象；未识别字段忽略（不报错，避免误伤自由文本）。 */
-function applyField(px: WorkPassenger, key: string, value: string): void {
+function applyField(px: WorkPassenger, key: string, value: string, dmy = false): void {
   const k = key.trim().toLowerCase();
   if (/性别|gender/.test(k)) {
     const g = parseGender(value);
@@ -475,7 +493,7 @@ function applyField(px: WorkPassenger, key: string, value: string): void {
     const d = parseLooseDate(value);
     if (d) {
       px.dateOfBirth = d;
-      if (isAmbiguousDayFirstDate(value)) px.__dobAmbiguous = value.trim();
+      if (!dmy && isAmbiguousDayFirstDate(value)) px.__dobAmbiguous = value.trim();
     } else px.__dobBad = value.trim() || true;
   } else if (/护照|证件|passport|doc/.test(k)) {
     px.documentNumber = value.replace(/\s+/g, '').trim() || undefined;
@@ -495,12 +513,13 @@ function applyField(px: WorkPassenger, key: string, value: string): void {
     const d = parseLooseDate(value);
     if (d) {
       px.passportExpiry = d;
-      if (isAmbiguousDayFirstDate(value)) px.__expiryAmbiguous = value.trim();
+      if (!dmy && isAmbiguousDayFirstDate(value)) px.__expiryAmbiguous = value.trim();
     } else px.__expiryBad = value.trim() || true;
   }
 }
 
-export function parseOtaRoster(text: string): OtaRosterParseResult {
+export function parseOtaRoster(text: string, opts?: ParseOtaRosterOptions): OtaRosterParseResult {
+  const dmy = opts?.dateOrder === 'DMY';
   const warnings: string[] = [];
   const rawLines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   if (rawLines.length === 0) {
@@ -513,6 +532,9 @@ export function parseOtaRoster(text: string): OtaRosterParseResult {
   const passengers: WorkPassenger[] = [];
   const bookingCodeNotes: string[] = [];
   let current: WorkPassenger | null = null;
+  // 乘客格式计数：冒号多行（乘机人：段式）vs 编号单行——供 passengerFormat 判定。
+  let colonStyleCount = 0;
+  let inlineStyleCount = 0;
 
   const pushCurrent = (): void => {
     if (current) passengers.push(current);
@@ -528,6 +550,31 @@ export function parseOtaRoster(text: string): OtaRosterParseResult {
       if (st.price !== undefined) settlementUnitPriceCny = st.price;
       if (st.count !== undefined) settlementCount = st.count;
       continue;
+    }
+
+    // 裸「价格×人数」行（如「970*2」，无「结算价」关键字）：有乘客/航段上下文时按结算价识别。
+    const bareQty = line.match(/^(\d{3,6})\s*[X×*x]\s*(\d{1,3})\s*个?$/);
+    if (bareQty && (current || passengers.length > 0 || flight)) {
+      const price = Number(bareQty[1]);
+      if (price >= 100 && price <= 99999) {
+        settlementUnitPriceCny = price;
+        settlementCount = Number(bareQty[2]);
+        warnings.push(`按价格行识别：¥${price} ×${settlementCount} 个，请核对`);
+        continue;
+      }
+    }
+
+    // 「价格 + 编码」同行（如「1030 单独编码」）：拆成裸价格 + 订座编码两段各自入账。
+    const priceWithCode = line.match(/^(\d{3,6})\s+(.+)$/);
+    if (priceWithCode && (current || passengers.length > 0 || flight)) {
+      const price = parseBarePriceLine(priceWithCode[1]);
+      const codeRest = detectBookingCodeNote(priceWithCode[2]);
+      if (price !== null && codeRest) {
+        settlementUnitPriceCny = price;
+        warnings.push(`按价格行识别：¥${price}，请核对`);
+        bookingCodeNotes.push(codeRest);
+        continue;
+      }
     }
 
     // 订座编码行（共用编码轻方案）：含「编码」字样，或独占一行的 5~6 位字母+数字 token。
@@ -549,22 +596,25 @@ export function parseOtaRoster(text: string): OtaRosterParseResult {
         px.firstName = rest.join('/').trim() || undefined;
       }
       current = px;
+      colonStyleCount += 1;
       continue;
     }
 
-    // 乘客行（格式一：单行空格分隔，姓/名开头 + 性别 + 证件号 token）——命中就整行收尾，
-    // 不留 current，避免挡住后续航段/价格行识别；同时保证先判乘客行特征，不会把生日误当航班日期。
-    const looseP = parseLoosePassengerLine(line);
+    // 乘客行（格式一：单行空格分隔，姓/名开头 + 性别 + 证件号 token；行首编号「1 」可有）——
+    // 命中就整行收尾，不留 current，避免挡住后续航段/价格行识别；同时保证先判乘客行特征，
+    // 不会把生日误当航班日期。
+    const looseP = parseLoosePassengerLine(line, dmy);
     if (looseP) {
       pushCurrent();
       passengers.push(looseP);
+      inlineStyleCount += 1;
       continue;
     }
 
     // 字段行（key:value，格式二）——仅在已进入某乘客段时消费
     const colon = line.indexOf(':');
     if (current && colon > 0) {
-      applyField(current, line.slice(0, colon), line.slice(colon + 1));
+      applyField(current, line.slice(0, colon), line.slice(colon + 1), dmy);
       continue;
     }
 
@@ -673,5 +723,13 @@ export function parseOtaRoster(text: string): OtaRosterParseResult {
     warnings.push(`结算价标注 ${settlementCount} 个与解析出的 ${passengers.length} 位乘客不一致，请核对名单`);
   }
 
-  return { flight, passengers, settlementUnitPriceCny, settlementCount, warnings };
+  // 乘客格式判定：单一格式命中才回传；两种混出现/都没有 → 不设（防呆比对宁缺毋滥）。
+  const passengerFormat =
+    colonStyleCount > 0 && inlineStyleCount === 0
+      ? ('COLON_MULTILINE' as const)
+      : inlineStyleCount > 0 && colonStyleCount === 0
+        ? ('INLINE_NUMBERED' as const)
+        : undefined;
+
+  return { flight, passengers, settlementUnitPriceCny, settlementCount, passengerFormat, warnings };
 }

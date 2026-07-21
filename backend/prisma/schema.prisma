@@ -266,6 +266,14 @@ model Agent {
   // 代理层级 — 1 级代理 parentAgentId = null；上级创建下级时 tier = parent.tier + 1
   parentAgentId     String?
   tier              Int            @default(1)
+  // 名单格式绑定（批量创单防呆）：该代理惯用的粘贴名单格式；NULL = 未登记，不参与格式校验。
+  // 取值三选一（字符串常量，中性描述名）：
+  //   COLON_MULTILINE_YMD  冒号多行 · 日期年-月-日
+  //   INLINE_NUMBERED      编号单行空格式
+  //   COLON_MULTILINE_DMY  冒号多行 · 日期日-月-年
+  rosterFormat      String?
+  // 识别词条：粘贴名单文本中扫到词条即提示/预填归属；保存时做全局查重（一词只归一家）。
+  rosterKeywords    String[]       @default([])
   createdAt         DateTime       @default(now())
   updatedAt         DateTime       @updatedAt
 

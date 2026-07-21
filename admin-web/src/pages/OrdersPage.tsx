@@ -4894,15 +4894,22 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
 
   const filteredAgents = useMemo(() => {
     const q = agentSearch.trim().toLowerCase();
-    if (!q) return agents.slice(0, 50);
-    return agents
-      .filter((a) =>
-        [a.companyName, a.contactName, a.contactPhone]
-          .filter(Boolean)
-          .some((s) => String(s).toLowerCase().includes(q)),
-      )
-      .slice(0, 50);
-  }, [agents, agentSearch]);
+    const base = !q
+      ? agents.slice(0, 50)
+      : agents
+          .filter((a) =>
+            [a.companyName, a.contactName, a.contactPhone]
+              .filter(Boolean)
+              .some((s) => String(s).toLowerCase().includes(q)),
+          )
+          .slice(0, 50);
+    // 已选代理（如词条自动预填）不在截断列表里时补进来，否则下拉会显示成「直客」
+    if (agentId && !base.some((a) => a.id === agentId)) {
+      const selected = agents.find((a) => a.id === agentId);
+      if (selected) return [selected, ...base];
+    }
+    return base;
+  }, [agents, agentSearch, agentId]);
 
   // 出港班次
   useEffect(() => {
@@ -4997,10 +5004,46 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   }
 
   // 📋 OTA 名单粘贴导入：解析 → 填乘客行（含护照字段）+ 选航班/起飞日 + 预填结算单价 + 展示解析提醒。
+  // 已选代理且登记了名单格式 → 按其推导日期读法（冒号多行·日-月-年 → DMY）；并做两类防呆
+  // （格式不符 / 撞到别家识别词条）+ 未选代理时按词条唯一命中自动预填（只提示，绝不静默改已选代理）。
   function importOtaRoster(): void {
     setErr(null);
-    const result = parseOtaRoster(otaText);
+    const agentDisplayName = (a: AgentListItem | undefined): string =>
+      a ? (a.companyName ?? a.contactName) : '未知代理';
+    const selectedAgent = agents.find((a) => a.id === agentId);
+    const dateOrder =
+      selectedAgent?.rosterFormat === 'COLON_MULTILINE_DMY'
+        ? ('DMY' as const)
+        : selectedAgent?.rosterFormat
+          ? ('YMD' as const)
+          : undefined;
+    const result = parseOtaRoster(otaText, dateOrder ? { dateOrder } : undefined);
     const warnings = [...result.warnings];
+
+    // 防呆①：命中格式与所选代理登记的名单格式不符（比不出来就不比，不误报）
+    if (selectedAgent?.rosterFormat && result.passengerFormat) {
+      const expectedFormat =
+        selectedAgent.rosterFormat === 'INLINE_NUMBERED' ? 'INLINE_NUMBERED' : 'COLON_MULTILINE';
+      if (result.passengerFormat !== expectedFormat) {
+        warnings.push('这份名单的格式与所选代理登记的名单格式不符，请确认归属代理没选错');
+      }
+    }
+
+    // 防呆②③：识别词条扫描（词条全局唯一，一词只归一家）
+    const keywordHits = agents.filter((a) =>
+      (a.rosterKeywords ?? []).some((kw) => kw && otaText.includes(kw)),
+    );
+    if (agentId) {
+      for (const other of keywordHits.filter((a) => a.id !== agentId)) {
+        warnings.push(
+          `名单中出现了代理「${agentDisplayName(other)}」的识别词条，当前归属为「${agentDisplayName(selectedAgent)}」，请确认`,
+        );
+      }
+    } else if (keywordHits.length === 1) {
+      // 尚未选代理且唯一命中 → 自动预填（仅预填 + 提示，绝不静默改已选代理）
+      setAgentId(keywordHits[0].id);
+      warnings.push(`已按识别词条自动选择归属代理「${agentDisplayName(keywordHits[0])}」，请确认`);
+    }
 
     if (result.passengers.length > 0) {
       setRows(

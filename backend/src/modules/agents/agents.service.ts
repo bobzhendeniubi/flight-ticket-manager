@@ -1,7 +1,7 @@
 import { Prisma, SettlementMode, UserRole } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { hashPassword } from '../../lib/password.js';
-import { ConflictError, ForbiddenError, NotFoundError } from '../../lib/errors.js';
+import { BadRequestError, ConflictError, ForbiddenError, NotFoundError } from '../../lib/errors.js';
 import type { CreateChildAgentBody, UpdateAgentBody } from './agents.schemas.js';
 
 // 详情查询共用的 include：列表 / 编辑后回显 / 停用启用后回显都要同一份投影，
@@ -34,6 +34,8 @@ export class AgentService {
       settlementMode: a.settlementMode,
       isActive: a.isActive,
       notes: a.notes,
+      rosterFormat: a.rosterFormat,
+      rosterKeywords: a.rosterKeywords,
       email: a.user.email,
       displayName: a.user.displayName,
       lastLoginAt: a.user.lastLoginAt?.toISOString() ?? null,
@@ -69,6 +71,29 @@ export class AgentService {
         at: new Date().toISOString(),
       }),
     );
+  }
+
+  /**
+   * 识别词条全局查重：一条词条只能归属一家代理。命中其它代理已注册的词条 → 400，
+   * 报错指明词条与占用方。excludeAgentId = 本次保存的代理自身（改自己的词条不算冲突）。
+   * 说明：应用层校验（无 DB 级数组元素唯一约束），并发同词条保存存在极小竞窗，可接受。
+   */
+  private async assertRosterKeywordsAvailable(keywords: string[], excludeAgentId?: string): Promise<void> {
+    if (keywords.length === 0) return;
+    const holder = await prisma.agent.findFirst({
+      where: {
+        ...(excludeAgentId ? { id: { not: excludeAgentId } } : {}),
+        rosterKeywords: { hasSome: keywords },
+      },
+      select: { id: true, companyName: true, contactName: true, rosterKeywords: true },
+    });
+    if (holder) {
+      const taken = keywords.filter((k) => holder.rosterKeywords.includes(k));
+      const holderName = holder.companyName ?? holder.contactName;
+      throw new BadRequestError(
+        `识别词条「${taken.join('、')}」已被代理「${holderName}」注册，请更换词条或先在对方处移除`,
+      );
+    }
   }
 
   /** 读取当前登录用户的 agent profile。CUSTOMER/STAFF 返回 null */
@@ -161,6 +186,9 @@ export class AgentService {
     const existing = await prisma.user.findUnique({ where: { email: body.email } });
     if (existing) throw new ConflictError('邮箱已注册');
 
+    // 识别词条全局查重（一词只归一家）
+    await this.assertRosterKeywordsAvailable(body.rosterKeywords ?? []);
+
     const passwordHash = await hashPassword(body.password);
 
     return prisma.$transaction(async (tx) => {
@@ -188,6 +216,8 @@ export class AgentService {
           parentAgentId: resolvedParentId,
           tier: parentTier + 1,
           notes: body.notes,
+          rosterFormat: body.rosterFormat ?? null,
+          rosterKeywords: body.rosterKeywords ?? [],
         },
       });
 
@@ -282,6 +312,18 @@ export class AgentService {
     trackChange('contactPhone', target.contactPhone, body.contactPhone);
     trackChange('notes', target.notes, body.notes);
     trackChange('email', target.user.email, body.email);
+    trackChange('rosterFormat', target.rosterFormat, body.rosterFormat);
+    // 数组字段：按内容比较（引用比较永远不等）
+    const keywordsChanged =
+      body.rosterKeywords !== undefined &&
+      JSON.stringify(body.rosterKeywords) !== JSON.stringify(target.rosterKeywords);
+    if (keywordsChanged && body.rosterKeywords !== undefined) {
+      before.rosterKeywords = target.rosterKeywords;
+      after.rosterKeywords = body.rosterKeywords;
+      changedFields.push('rosterKeywords');
+      // 识别词条全局查重（排除自己）
+      await this.assertRosterKeywordsAvailable(body.rosterKeywords, targetAgentId);
+    }
 
     if (changedFields.length > 0) {
       await prisma.$transaction(async (tx) => {
@@ -290,6 +332,10 @@ export class AgentService {
         if (body.contactName !== undefined) agentData.contactName = body.contactName;
         if (body.contactPhone !== undefined) agentData.contactPhone = body.contactPhone;
         if (body.notes !== undefined) agentData.notes = body.notes;
+        if (body.rosterFormat !== undefined) agentData.rosterFormat = body.rosterFormat;
+        if (keywordsChanged && body.rosterKeywords !== undefined) {
+          agentData.rosterKeywords = body.rosterKeywords;
+        }
         if (Object.keys(agentData).length > 0) {
           await tx.agent.update({ where: { id: targetAgentId }, data: agentData });
         }
