@@ -5672,10 +5672,15 @@ export function buildOrderFilterWhere(query: OrderListFilters): Prisma.OrderWher
       },
     });
   }
-  // 乘客姓名模糊匹配
+  // 乘客姓名模糊匹配（公测反馈：中文名搜不到——拼音 fullName 与中文名 chineseName 任一命中即可）
   if (query.passengerName) {
     where.passengers = {
-      some: { fullName: { contains: query.passengerName, mode: 'insensitive' } },
+      some: {
+        OR: [
+          { fullName: { contains: query.passengerName, mode: 'insensitive' } },
+          { chineseName: { contains: query.passengerName, mode: 'insensitive' } },
+        ],
+      },
     };
   }
   if (query.search) {
@@ -5683,6 +5688,17 @@ export function buildOrderFilterWhere(query: OrderListFilters): Prisma.OrderWher
       { orderNumber: { contains: query.search, mode: 'insensitive' } },
       { contactName: { contains: query.search, mode: 'insensitive' } },
       { contactPhone: { contains: query.search } },
+      // 乘客中/英文名（公测反馈：搜索框要能按乘客姓名搜到订单；与回收站搜索同口径）
+      {
+        passengers: {
+          some: {
+            OR: [
+              { fullName: { contains: query.search, mode: 'insensitive' } },
+              { chineseName: { contains: query.search, mode: 'insensitive' } },
+            ],
+          },
+        },
+      },
     ];
   }
 

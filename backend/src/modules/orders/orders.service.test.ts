@@ -3469,3 +3469,29 @@ describe('toProspectiveOccupancy', () => {
     expect(toProspectiveOccupancy(1.5, [])).toEqual({ wholeRooms: 2, solos: [] });
   });
 });
+
+describe('buildOrderFilterWhere · 搜索/乘客姓名含中文名（公测反馈：中文名搜不到）', () => {
+  it('search → OR 含乘客 fullName/chineseName 模糊匹配', () => {
+    const where = buildOrderFilterWhere({ search: '张伟' });
+    const passengerClause = (where.OR as Array<Record<string, unknown>>).find((c) => 'passengers' in c) as {
+      passengers: { some: { OR: Array<Record<string, unknown>> } };
+    };
+    expect(passengerClause).toBeDefined();
+    expect(passengerClause.passengers.some.OR).toEqual([
+      { fullName: { contains: '张伟', mode: 'insensitive' } },
+      { chineseName: { contains: '张伟', mode: 'insensitive' } },
+    ]);
+  });
+
+  it('passengerName → fullName 与 chineseName 任一命中', () => {
+    const where = buildOrderFilterWhere({ passengerName: '李娜' });
+    expect(where.passengers).toEqual({
+      some: {
+        OR: [
+          { fullName: { contains: '李娜', mode: 'insensitive' } },
+          { chineseName: { contains: '李娜', mode: 'insensitive' } },
+        ],
+      },
+    });
+  });
+});
