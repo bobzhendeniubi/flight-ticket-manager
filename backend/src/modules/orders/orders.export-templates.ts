@@ -1,9 +1,9 @@
 /**
  * 三模板筛选导出 — 与订单列表共用筛选条件（buildOrderFilterWhere），一行/乘客。
  *
- *   full      《全岗可用》54 列 — 运营/财务/签证全岗位通用台账（53 列旧模版 + 纯拼音名）
+ *   full      《全岗可用》55 列 — 运营/财务/签证全岗位通用台账（53 列旧模版 + 纯拼音名 + 签证公司）
  *   ticketing 《票务专用》27 列 — 代理+备注 + 航司 PNR 提交 25 列（仅含机票的订单）
- *   visa      《签证专用》20 列 — 越南签证申请表抬头（含越文表头）
+ *   visa      《签证专用》21 列 — 越南签证申请表抬头（含越文表头，含签证公司列）
  *
  * 注意：系统暂无数据的列（飞行次数/单房差/抵扣人员等）保留表头、内容留空，
  * 绝不编造数据 —— 这些列是线下手工台账的占位，等后续字段补齐再填。
@@ -347,6 +347,7 @@ interface FullRow {
   invoiceStatusManual: string; // 开票状态 — 按航段已开的组合文本（去程已开/回程已开），都未开则留空
   visaStatus: string; // 签证状态
   visaOption: string; // 签证选项（独立签证行产品名 + 套餐签证组件名）
+  visaSupplier: string; // 签证公司（供应商）— 财务对账用，与《签证专用》同口径
   visaNote: string; // 签证备注 = 订单「签证备注」结构化栏（noteVisa）
   passportIssuePlace: string; // 护照签发地
   placeOfBirth: string; // 出生地
@@ -404,6 +405,7 @@ export const FULL_COLUMNS: Array<{ header: string; key: keyof FullRow; width: nu
   { header: '开票状态', key: 'invoiceStatusManual', width: 10 },
   { header: '签证状态', key: 'visaStatus', width: 10 },
   { header: '签证选项', key: 'visaOption', width: 20 },
+  { header: '签证公司', key: 'visaSupplier', width: 16 },
   { header: '签证备注', key: 'visaNote', width: 14 },
   { header: '护照签发地', key: 'passportIssuePlace', width: 10 },
   { header: '出生地', key: 'placeOfBirth', width: 10 },
@@ -543,6 +545,7 @@ export function orderToFullRows(order: OrderForTemplateExport, ctx: OrderContext
     invoiceStatusManual,
     visaStatus,
     visaOption,
+    visaSupplier: visaSupplierOf(order),
     visaNote: order.noteVisa ?? '',
     passportIssuePlace: p.passportIssuePlace ?? p.passportIssueCountry ?? '',
     placeOfBirth: p.placeOfBirth ?? '',
@@ -613,7 +616,7 @@ export function orderToTicketingRows(order: OrderForTemplateExport, ctx: OrderCo
   }));
 }
 
-// ── 模板三：《签证专用》20 列（含越文表头）───────────────────────────────
+// ── 模板三：《签证专用》21 列（含越文表头）───────────────────────────────
 export interface VisaRow {
   stt: number;
   agency: string;
@@ -662,16 +665,21 @@ export const VISA_COLUMNS: Array<{ header: string; key: keyof VisaRow; width: nu
   { header: '出发日期', key: 'departDate', width: 24 },
 ];
 
-export function orderToVisaRows(order: OrderForTemplateExport, ctx: OrderContext): Omit<VisaRow, 'stt'>[] {
-  // 签证公司（财务反馈：需清晰核对某笔签证金额属于哪家供应商）：取订单 VISA 行关联产品的 supplier，
-  // 多签证产品去重后逗号拼接；无 supplier 留空。仅认独立 VISA 行——套餐内签证组件无独立供应商字段。
-  const visaSupplier = Array.from(
+// 签证公司（财务反馈：需清晰核对某笔签证金额属于哪家供应商）：取订单 VISA 行关联产品的 supplier，
+// 多签证产品去重后逗号拼接；无 supplier 留空。仅认独立 VISA 行——套餐内签证组件无独立供应商字段。
+// 《全岗可用》与《签证专用》共用取数点。
+export function visaSupplierOf(order: OrderForTemplateExport): string {
+  return Array.from(
     new Set(
       order.items
         .filter((it) => it.kind === 'VISA' && it.visa?.supplier)
         .map((it) => it.visa!.supplier!),
     ),
   ).join(', ');
+}
+
+export function orderToVisaRows(order: OrderForTemplateExport, ctx: OrderContext): Omit<VisaRow, 'stt'>[] {
+  const visaSupplier = visaSupplierOf(order);
   // 自备签乘客（visaExempt=true）不进送签名单：客人已自行办妥签证，无需送签——与签证台
   // 同口径（backend/src/modules/fulfillment/fulfillment.service.ts 的 listByOrder 同样过滤
   // passengers 时排除 visaExempt=true）。此函数是「签证专用」模板导出 + 签证批量合并名单
