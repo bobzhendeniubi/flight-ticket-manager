@@ -1477,7 +1477,7 @@ export function OrdersPage() {
             </select>
           </div>
           <div className="md:col-span-5">
-            <label className="label">搜索（订单号 / 客户 / 代理）</label>
+            <label className="label">搜索（订单号 / 客户 / 乘客中英文名 / 代理）</label>
             <input
               className="input"
               placeholder="如 FTM2026 或 张伟 或 总代"
