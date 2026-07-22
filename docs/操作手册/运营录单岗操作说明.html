@@ -1,0 +1,583 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>运营·录单岗操作说明 — 世途旅行·运营控制台</title>
+<style>
+  :root{
+    --indigo:#4F46E5; --indigo-dark:#4338CA; --indigo-50:#EEF2FF;
+    --ink:#0F172A; --ink-soft:#334155; --muted:#64748B;
+    --bg:#F1F5F9; --card:#FFFFFF; --line:#E2E8F0;
+    --amber:#D97706; --amber-bg:#FFFBEB; --amber-line:#FDE68A;
+    --green:#059669; --green-bg:#ECFDF5;
+    --red:#DC2626; --red-bg:#FEF2F2;
+    --blue:#2563EB; --blue-bg:#EFF6FF;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:'Inter','PingFang SC','Hiragino Sans GB','Microsoft YaHei',system-ui,-apple-system,sans-serif;color:var(--ink-soft);background:var(--bg);line-height:1.75;font-size:15px}
+  .page{max-width:900px;margin:0 auto;background:var(--card);padding:40px 44px 72px;box-shadow:0 0 24px rgba(15,23,42,.06)}
+  h1,h2,h3,h4{color:var(--ink);line-height:1.35}
+  h1{font-size:26px;margin:0 0 6px}
+  h2{font-size:20px;margin:44px 0 12px;padding:10px 14px;background:var(--indigo-50);border-left:5px solid var(--indigo);border-radius:0 8px 8px 0}
+  h3{font-size:16.5px;margin:26px 0 8px;color:var(--indigo-dark)}
+  h4{font-size:14.5px;margin:18px 0 6px}
+  p{margin:8px 0}
+  .sub{color:var(--muted);font-size:13.5px;margin:0 0 4px}
+  .cover{border-bottom:3px solid var(--indigo);padding-bottom:18px;margin-bottom:22px}
+  .cover .brand{display:inline-block;background:var(--indigo);color:#fff;font-weight:700;font-size:13px;padding:3px 12px;border-radius:999px;letter-spacing:.5px;margin-bottom:12px}
+  /* 目录 */
+  .toc{background:#F8FAFC;border:1px solid var(--line);border-radius:12px;padding:16px 22px;margin:18px 0 8px}
+  .toc ol{margin:6px 0;padding-left:22px}
+  .toc li{margin:3px 0}
+  .toc a{color:var(--indigo-dark);text-decoration:none}
+  .toc a:hover{text-decoration:underline}
+  /* 步骤列表 */
+  ol.steps{counter-reset:st;list-style:none;padding-left:0;margin:10px 0}
+  ol.steps>li{counter-increment:st;position:relative;padding:4px 0 4px 40px;margin:6px 0}
+  ol.steps>li::before{content:counter(st);position:absolute;left:0;top:7px;width:26px;height:26px;border-radius:50%;background:var(--indigo);color:#fff;font-weight:700;font-size:13.5px;line-height:26px;text-align:center}
+  /* 提示框 */
+  .tip,.warn,.info{border-radius:10px;padding:10px 14px 10px 42px;margin:12px 0;position:relative;font-size:14px}
+  .tip::before,.warn::before,.info::before{position:absolute;left:13px;top:9px;font-size:16px}
+  .tip{background:var(--green-bg);border:1px solid #A7F3D0}.tip::before{content:"💡"}
+  .warn{background:var(--amber-bg);border:1px solid var(--amber-line)}.warn::before{content:"⚠️"}
+  .info{background:var(--blue-bg);border:1px solid #BFDBFE}.info::before{content:"ℹ️"}
+  /* 表格 */
+  table.doc{width:100%;border-collapse:collapse;margin:12px 0;font-size:13.5px}
+  table.doc th{background:var(--indigo-50);color:var(--indigo-dark);text-align:left;padding:8px 10px;border:1px solid var(--line);white-space:nowrap}
+  table.doc td{padding:8px 10px;border:1px solid var(--line);vertical-align:top}
+  table.doc tr:nth-child(even) td{background:#FAFBFF}
+  /* ── 界面示意图（模拟 Console 风格）── */
+  .mock{border:1px solid #CBD5E1;border-radius:12px;overflow:hidden;margin:16px 0;background:#F8FAFC;box-shadow:0 2px 6px rgba(15,23,42,.08);font-size:12.5px;color:#334155}
+  .mock-bar{display:flex;align-items:center;gap:6px;background:#E2E8F0;padding:7px 12px;font-size:11.5px;color:#64748B}
+  .dot{width:9px;height:9px;border-radius:50%;display:inline-block}
+  .mock-body{padding:14px 16px}
+  .mtitle{font-size:15px;font-weight:700;color:#0F172A;margin-bottom:2px}
+  .msub{font-size:11.5px;color:#94A3B8;margin-bottom:10px}
+  .mrow{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:8px 0}
+  .mbtn{display:inline-block;border:1px solid #CBD5E1;background:#fff;border-radius:8px;padding:4px 11px;font-size:12px;color:#334155;white-space:nowrap}
+  .mbtn.primary{background:var(--indigo);border-color:var(--indigo);color:#fff;font-weight:600}
+  .mbtn.ghost{border-style:dashed;color:#64748B}
+  .msel{display:inline-block;border:1px solid #CBD5E1;background:#fff;border-radius:8px;padding:4px 9px;font-size:12px;color:#64748B;white-space:nowrap}
+  .msel::after{content:" ▾";font-size:10px}
+  .minput{display:inline-block;border:1px solid #CBD5E1;background:#fff;border-radius:8px;padding:4px 9px;font-size:12px;color:#94A3B8;white-space:nowrap}
+  .mlabel{font-size:11px;color:#94A3B8;display:block;margin-bottom:2px}
+  .fgroup{display:inline-block;vertical-align:top;margin:3px 6px 3px 0}
+  .badge{display:inline-block;border-radius:999px;padding:1px 9px;font-size:11px;font-weight:600}
+  .b-amber{background:#FEF3C7;color:#B45309}.b-green{background:#D1FAE5;color:#047857}.b-blue{background:#DBEAFE;color:#1D4ED8}.b-red{background:#FEE2E2;color:#B91C1C}.b-gray{background:#E2E8F0;color:#475569}.b-indigo{background:var(--indigo-50);color:var(--indigo-dark)}
+  table.mtab{width:100%;border-collapse:collapse;font-size:11.5px;background:#fff;border-radius:8px;overflow:hidden}
+  table.mtab th{background:#F1F5F9;color:#64748B;font-weight:600;text-align:left;padding:5px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+  table.mtab td{padding:5px 8px;border-bottom:1px solid #F1F5F9;white-space:nowrap}
+  /* 高亮标注 */
+  .hl{position:relative;outline:2.5px solid var(--red);outline-offset:2px;border-radius:8px}
+  .hl.a{outline-color:var(--amber)}
+  .tag{position:absolute;top:-12px;left:-12px;width:21px;height:21px;border-radius:50%;background:var(--red);color:#fff;font-size:12.5px;line-height:21px;text-align:center;font-weight:700;z-index:2;box-shadow:0 1px 3px rgba(0,0,0,.3)}
+  .hl.a>.tag{background:var(--amber)}
+  .legend{background:#FFF;border:1px dashed #CBD5E1;border-radius:10px;padding:8px 14px;margin:8px 0 16px;font-size:13.5px}
+  .legend b.n{display:inline-block;width:19px;height:19px;border-radius:50%;background:var(--red);color:#fff;font-size:11.5px;line-height:19px;text-align:center;margin-right:6px}
+  .legend .row{margin:4px 0}
+  /* 状态流 */
+  .flow{display:flex;flex-wrap:wrap;align-items:center;gap:4px;margin:10px 0;font-size:13px}
+  .pill{display:inline-block;border-radius:999px;padding:3px 13px;font-weight:600;font-size:12.5px;border:1.5px solid var(--line);background:#fff;color:var(--ink-soft)}
+  .pill.main{border-color:var(--indigo);background:var(--indigo-50);color:var(--indigo-dark)}
+  .pill.bad{border-color:#FCA5A5;background:var(--red-bg);color:#B91C1C}
+  .fa{color:#94A3B8;font-weight:700;padding:0 2px}
+  .kbd{display:inline-block;border:1px solid #CBD5E1;border-bottom-width:2px;border-radius:6px;background:#F8FAFC;padding:0 7px;font-size:12.5px;color:var(--ink);font-weight:600;white-space:nowrap}
+  .btnref{display:inline-block;background:var(--indigo);color:#fff;border-radius:7px;padding:0 8px;font-size:12.5px;font-weight:600;white-space:nowrap}
+  .btnref.sec{background:#fff;color:var(--ink-soft);border:1px solid #CBD5E1}
+  /* 抽屉示意 */
+  .drawer{border:1px solid #CBD5E1;border-radius:12px;background:#fff;max-width:430px;margin:14px auto;box-shadow:0 6px 18px rgba(15,23,42,.14);font-size:12px;overflow:hidden}
+  .drawer .dh{background:#F8FAFC;border-bottom:1px solid var(--line);padding:9px 14px;font-weight:700;color:#0F172A;font-size:13px}
+  .drawer .sec{padding:9px 14px;border-bottom:1px solid #F1F5F9}
+  .drawer .sec .st{font-size:10.5px;font-weight:700;color:#94A3B8;letter-spacing:1px;margin-bottom:5px}
+  .marea{display:block;border:1px solid #CBD5E1;border-radius:8px;background:#fff;padding:4px 9px;font-size:11.5px;color:#94A3B8;margin:3px 0}
+  .marea.amber{border-color:var(--amber-line);background:var(--amber-bg)}
+  /* 看板 */
+  .board{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:8px 0}
+  .bcol{background:#F1F5F9;border-radius:10px;padding:8px}
+  .bcol h5{margin:0 0 7px;font-size:12px;color:#0F172A;display:flex;justify-content:space-between}
+  .bcard{background:#fff;border:1px solid var(--line);border-radius:9px;padding:7px 9px;margin-bottom:7px;font-size:11px}
+  .bcard.red{border-color:#FCA5A5}.bcard.amberb{border-color:#FCD34D}
+  .statrow{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:8px 0}
+  .stat{background:#fff;border:1px solid var(--line);border-radius:10px;padding:8px 12px}
+  .stat .sl{font-size:10.5px;color:#94A3B8}.stat .sv{font-size:18px;font-weight:700;color:#0F172A}.stat .sv.red{color:#B91C1C}
+  .faq dt{font-weight:700;color:var(--ink);margin:16px 0 4px}
+  .faq dt::before{content:"Q：";color:var(--indigo)}
+  .faq dd{margin:0 0 4px;padding-left:26px;position:relative}
+  .faq dd::before{content:"答：";position:absolute;left:0;color:var(--muted)}
+  .footer{margin-top:48px;border-top:1px solid var(--line);padding-top:14px;font-size:12.5px;color:var(--muted)}
+  /* 打印 */
+  @media print{
+    body{background:#fff}
+    .page{box-shadow:none;padding:0 8mm;max-width:none}
+    h2{break-after:avoid}
+    .mock,.drawer,table.doc,.tip,.warn,.info,.legend,.board{break-inside:avoid}
+    a{color:inherit;text-decoration:none}
+    @page{size:A4;margin:14mm 12mm}
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+<!-- ═════════ 封面 ═════════ -->
+<header class="cover">
+  <span class="brand">世途旅行 · 运营控制台</span>
+  <h1>运营 / 录单岗 操作说明（图文版）</h1>
+  <p class="sub">适用岗位：录单、改单、跟单、导出台账的运营同事 · 零基础可读</p>
+  <p class="sub">配套页面：订单管理 · 产品管理 · 工单看板 · 提醒中心 &nbsp;|&nbsp; 建议打印后放手边随时翻</p>
+</header>
+
+<div class="info">怎么进系统：用浏览器打开公司发你的后台地址，输入<b>邮箱 + 密码</b>登录（账号找管理员开通）。登录后看左边菜单，本手册讲的功能都在「运营」和「产品」这两组里。文中示意图是<b>简化画法</b>，真实页面按钮位置一致、样子略有出入，认准按钮上的字就行。</div>
+
+<!-- ═════════ 目录 ═════════ -->
+<nav class="toc">
+  <b>目录</b>
+  <ol>
+    <li><a href="#s1">先认识订单页（每天工作的大本营）</a></li>
+    <li><a href="#s2">录单：单笔录单</a></li>
+    <li><a href="#s3">录单：批量创单（整班散客 / OTA 名单粘贴）</a></li>
+    <li><a href="#s4">订单状态：每个状态什么意思、什么时候点什么</a></li>
+    <li><a href="#s5">收钱：确认收款 / 批量到账 / 多付与欠款</a></li>
+    <li><a href="#s6">改签（改期）与换人</a></li>
+    <li><a href="#s7">备注四栏怎么用</a></li>
+    <li><a href="#s8">导出：五个导出按钮各是干嘛的</a></li>
+    <li><a href="#s9">删单与回收站</a></li>
+    <li><a href="#s10">跟单利器：提醒中心 + 工单看板</a></li>
+    <li><a href="#s11">常见问题 FAQ</a></li>
+  </ol>
+</nav>
+
+<!-- ═════════ 1 订单页 ═════════ -->
+<h2 id="s1">一、先认识订单页（每天工作的大本营）</h2>
+<p>点左边菜单「运营 → 订单」。这一页从上到下分三块：<b>顶部按钮条</b>（建单和导出）、<b>筛选区</b>（找单）、<b>订单表格</b>（点任意一行打开订单详情）。</p>
+
+<div class="mock">
+  <div class="mock-bar"><span class="dot" style="background:#F87171"></span><span class="dot" style="background:#FBBF24"></span><span class="dot" style="background:#34D399"></span>&nbsp;运营控制台 — 订单管理</div>
+  <div class="mock-body">
+    <div class="mtitle">订单管理</div>
+    <div class="msub">建单、收款、流转、导出，订单全生命周期都在这一页</div>
+    <div class="mrow">
+      <span class="hl"><span class="tag">1</span><span class="mbtn primary">＋ 录单</span></span>
+      <span class="hl"><span class="tag">2</span><span class="mbtn primary">＋ 批量创单</span></span>
+      <span style="flex:1"></span>
+      <span class="mbtn">📥 导出 CSV</span>
+      <span class="hl a"><span class="tag">3</span><span class="msel">导出模板：全岗可用</span><span class="mbtn">📤 导出</span></span>
+      <span class="hl a"><span class="tag">4</span><span class="mbtn">📊 导出全岗总表</span></span>
+      <span class="hl a"><span class="tag">5</span><span class="mbtn">🎫 票务开票导出</span></span>
+      <span class="mbtn ghost">🗑 回收站</span>
+    </div>
+    <div class="mrow" style="border-top:1px dashed var(--line);padding-top:10px">
+      <span class="fgroup"><span class="mlabel">状态</span><span class="msel">全部</span></span>
+      <span class="fgroup"><span class="mlabel">产品类型</span><span class="msel">全部</span></span>
+      <span class="fgroup"><span class="mlabel">渠道</span><span class="msel">全部</span></span>
+      <span class="fgroup"><span class="mlabel">代理</span><span class="msel">全部</span></span>
+      <span class="fgroup"><span class="mlabel">接单状态</span><span class="msel">🆕 未接单</span></span>
+      <span class="fgroup"><span class="mlabel">开票</span><span class="msel">去程·未开</span></span>
+      <span class="fgroup"><span class="mlabel">签证</span><span class="msel">全部</span></span>
+    </div>
+    <div class="mrow">
+      <span class="fgroup"><span class="mlabel">关键词</span><span class="minput">订单号 / 联系人…</span></span>
+      <span class="fgroup"><span class="mlabel">航班号</span><span class="minput">如 XX123</span></span>
+      <span class="fgroup"><span class="mlabel">乘客姓名</span><span class="minput">中文名或拼音</span></span>
+      <span class="hl a" style="display:inline-block"><span class="tag">6</span><span class="fgroup"><span class="mlabel">下单时间</span><span class="minput">起</span> ~ <span class="minput">止</span></span>
+      <span class="fgroup"><span class="mlabel">出行日期</span><span class="minput">起</span> ~ <span class="minput">止</span></span></span>
+    </div>
+    <table class="mtab" style="margin-top:8px">
+      <tr><th></th><th>订单号</th><th>状态</th><th>乘客</th><th>出行日期</th><th>尾款</th><th>开票(去·回·系统)</th></tr>
+      <tr><td>☐</td><td>FT2607…01</td><td><span class="badge b-amber">待支付</span></td><td>张三 等2人</td><td>08-01</td><td><span class="badge b-amber">欠 ¥1,200</span></td><td>✗ ✗ ✗</td></tr>
+      <tr><td>☑</td><td>FT2607…02</td><td><span class="badge b-blue">处理中</span></td><td>李四</td><td>08-03</td><td><span class="badge b-green">已结清</span></td><td>✓ ✗ ✓</td></tr>
+      <tr><td>☐</td><td>FT2607…03</td><td><span class="badge b-green">已出票</span></td><td>王五 等3人</td><td>08-05</td><td><span class="badge b-blue">多付 ¥300</span></td><td>✓ ✓ ✓</td></tr>
+    </table>
+  </div>
+</div>
+<div class="legend">
+  <div class="row"><b class="n">1</b>单笔录单：一次录一张单，机票/酒店/签证/套餐/接送都能录 → 见第二章</div>
+  <div class="row"><b class="n">2</b>批量创单：整班散客名单一次录完，<b>每位乘客生成一张单</b> → 见第三章</div>
+  <div class="row"><b class="n" style="background:var(--amber)">3</b><b class="n" style="background:var(--amber)">4</b><b class="n" style="background:var(--amber)">5</b>三类导出按钮，各有用途和日期口径 → 见第八章</div>
+  <div class="row"><b class="n" style="background:var(--amber)">6</b>两组日期筛选<b>含义不同</b>：「下单时间」= 哪天录的单；「出行日期」= 客人哪天出发。导出时选错口径是最常见的错，第八章细讲</div>
+</div>
+
+<h3>表格上一眼看什么</h3>
+<ul>
+  <li><b>尾款列颜色</b>：<span class="badge b-amber">琥珀</span>= 还欠钱要催；<span class="badge b-green">绿</span>= 结清了；<span class="badge b-blue">蓝</span>= 客人多付了（要处理，见第五章）。月结代理的单显示中性蓝「月结挂账」，<b>不用催</b>，月末统一对账。</li>
+  <li><b>开票列</b>：三个符号依次是 去程·回程·系统，✓ 已开、✗ 未开。</li>
+  <li><b>接单状态筛「🆕 未接单」</b>：能看到还没人认领的新单。打开单子点 <span class="btnref sec">🙋 我来接单</span>，这单跟单责任就是你的了。</li>
+</ul>
+<div class="tip">左边还有一张「代理分销统计」卡，点某个代理的名字，列表直接过滤成他的单，对账时很省事。</div>
+
+<!-- ═════════ 2 单笔录单 ═════════ -->
+<h2 id="s2">二、录单：单笔录单</h2>
+<p>客人（或代理）要买东西，你手工替他下一张单，就用 <span class="btnref">＋ 录单</span>。</p>
+
+<div class="mock">
+  <div class="mock-bar"><span class="dot" style="background:#F87171"></span><span class="dot" style="background:#FBBF24"></span><span class="dot" style="background:#34D399"></span>&nbsp;弹窗 — 单笔录单</div>
+  <div class="mock-body">
+    <div class="mrow">
+      <span class="hl"><span class="tag">1</span><span class="mbtn primary">✈️ 机票</span><span class="mbtn">🏨 酒店</span><span class="mbtn">🛂 签证</span><span class="mbtn">🎁 套餐</span><span class="mbtn">🚐 接送</span></span>
+    </div>
+    <div class="mrow">
+      <span class="fgroup"><span class="mlabel">航班</span><span class="msel">选航线</span></span>
+      <span class="fgroup"><span class="mlabel">起飞日期</span><span class="minput">2026-08-01</span></span>
+      <span class="fgroup"><span class="mlabel">班次</span><span class="msel">当日班次</span></span>
+      <span class="fgroup"><span class="mlabel">舱位</span><span class="msel">经济舱</span></span>
+    </div>
+    <div class="mrow">
+      <span class="fgroup"><span class="mlabel">归属代理</span><span class="hl a" style="display:inline-block"><span class="tag">2</span><span class="msel">直客（无代理）</span></span></span>
+    </div>
+    <div style="border-top:1px dashed var(--line);margin-top:8px;padding-top:8px">
+      <span class="mlabel">出行人</span>
+      <table class="mtab">
+        <tr><th>姓名(拼音)</th><th>中文名</th><th>证件号</th><th>出生日期</th><th>护照照片</th></tr>
+        <tr><td>ZHANG/SAN</td><td>张三</td><td>E12345678</td><td>1990-01-01</td><td><span class="hl a" style="display:inline-block"><span class="tag">3</span><span class="mbtn" style="font-size:11px">📷 传护照图自动识别</span></span></td></tr>
+      </table>
+      <div class="mrow"><span class="mbtn ghost">＋ 加一位出行人</span></div>
+    </div>
+    <div class="mrow" style="justify-content:flex-end"><span class="mbtn">取消</span><span class="mbtn primary">提交建单</span></div>
+  </div>
+</div>
+<div class="legend">
+  <div class="row"><b class="n">1</b>先选产品类型页签，下面的表单会跟着变</div>
+  <div class="row"><b class="n" style="background:var(--amber)">2</b>是代理的客人就选对应代理，散客选「直客」</div>
+  <div class="row"><b class="n" style="background:var(--amber)">3</b>传护照照片可自动识别姓名/证件号/生日等，识别完自己再核对一遍</div>
+</div>
+
+<ol class="steps">
+  <li><b>选产品类型</b>：机票 / 酒店 / 签证 / 套餐 / 接送，五选一。</li>
+  <li><b>填该类型的内容</b>：机票选「航线 → 起飞日期 → 当日班次 → 舱位」；酒店选酒店和入住日期；套餐选套餐和出发日期，依此类推。</li>
+  <li><b>选归属代理</b>：这单是哪个代理带来的就选谁；散客选「直客」。</li>
+  <li><b>录出行人</b>：机票 / 套餐 / 签证<b>必须</b>填出行人；纯酒店、纯接送可以不填（系统会用联系人占位）。有护照照片就点「传护照图自动识别」，省得手敲——一单最多传 20 张护照图，人再多就分单录。</li>
+  <li><b>核对后提交</b>。价格不用你算：系统按产品当前价自动算总价，提交后订单出现在列表里，状态是「待支付」。</li>
+</ol>
+<div class="warn">识别出的护照信息<b>一定要人工核对</b>一遍再提交，尤其姓名拼音和证件号——出票后改人是要走「换人」流程的（见第六章）。</div>
+
+<!-- ═════════ 3 批量创单 ═════════ -->
+<h2 id="s3">三、录单：批量创单（整班散客 / OTA 名单粘贴）</h2>
+<p>一个班次要录十几二十个散客时，别一张张点，用 <span class="btnref">＋ 批量创单</span>——名单一次录完，系统<b>给每位乘客各生成一张单</b>，方便之后按人收款、按人退改。</p>
+
+<div class="mock">
+  <div class="mock-bar"><span class="dot" style="background:#F87171"></span><span class="dot" style="background:#FBBF24"></span><span class="dot" style="background:#34D399"></span>&nbsp;弹窗 — 批量创单</div>
+  <div class="mock-body">
+    <div class="mrow">
+      <span class="fgroup"><span class="mlabel">产品类型</span><span class="msel">单程机票</span></span>
+      <span class="fgroup"><span class="mlabel">航班</span><span class="msel">选航线</span></span>
+      <span class="fgroup"><span class="mlabel">起飞日期</span><span class="minput">2026-08-01</span></span>
+      <span class="fgroup"><span class="mlabel">班次</span><span class="msel">当日班次</span></span>
+      <span class="fgroup"><span class="mlabel">舱位</span><span class="msel">经济舱（默认）</span></span>
+      <span class="fgroup"><span class="mlabel">归属代理</span><span class="msel">直客</span></span>
+    </div>
+    <div class="hl" style="display:block;margin:12px 2px"><span class="tag">1</span>
+      <div style="padding:8px 12px;background:#fff;border-radius:8px">
+        <b style="font-size:12px">📋 粘贴名单导入（OTA 线上单）</b>
+        <span class="marea" style="height:44px">把 OTA 发来的名单文本整段粘进来：首行航段+日期，每人一段（姓名 LAST/FIRST、性别、出生日期、护照号、签发国、有效期），结算价…</span>
+        <span class="mbtn">解析填充</span> <span style="font-size:11px;color:#94A3B8">解析不了的会在下方逐条提醒</span>
+      </div>
+    </div>
+    <div>
+      <span class="mlabel">名单（也可以手填 / 下载模板批量传）</span>
+      <table class="mtab">
+        <tr><th>姓名</th><th>证件号</th><th>出生日期</th><th>备注（选填）</th></tr>
+        <tr><td>ZHANG/SAN</td><td>E12345678</td><td>1990-01-01</td><td>靠窗 / 素食…</td></tr>
+        <tr><td>LI/SI</td><td>E87654321</td><td>1985-05-20</td><td></td></tr>
+      </table>
+      <div class="mrow"><span class="mbtn ghost">＋ 加一行</span><span class="mbtn">下载模板</span><span class="mbtn">上传名单</span></div>
+    </div>
+    <div class="hl a" style="display:block;margin:12px 2px"><span class="tag">2</span>
+      <div style="padding:8px 12px;background:#fff;border-radius:8px">
+        <b style="font-size:12px">价格（选填，二选一）</b>
+        <div class="mrow"><span class="fgroup"><span class="mlabel">结算价/人（团队议价）</span><span class="minput">如 980</span></span><span style="color:#94A3B8;font-size:11px">或</span><span class="fgroup"><span class="mlabel">OTA 结算单价（手动）</span><span class="minput">如 1000</span></span></div>
+      </div>
+    </div>
+    <div class="mrow"><span class="fgroup"><span class="mlabel">整批备注（写入每单）</span><span class="minput" style="min-width:260px">例：XX 平台 8/1 团</span></span></div>
+    <div class="mrow" style="justify-content:flex-end"><span class="mbtn">取消</span><span class="mbtn primary">批量建单</span></div>
+  </div>
+</div>
+<div class="legend">
+  <div class="row"><b class="n">1</b>OTA 名单直接整段粘贴，系统自动认航班、选当日班次、填乘客和护照信息、预填结算价——有认不出的地方会逐条提示，照着改就行</div>
+  <div class="row"><b class="n" style="background:var(--amber)">2</b>两个价格框<b>只能填一个</b>：团队谈好的价填左边「结算价/人」；OTA 线上单填右边「OTA 结算单价」，和系统价的差额会自动生成一条价格调整，不会乱账</div>
+</div>
+
+<ol class="steps">
+  <li><b>选产品类型</b>：单程机票 / 往返机票 / 套餐。往返要再选回程航班和班次；套餐要选套餐和出发日期。</li>
+  <li><b>选航班和班次</b>：先填「起飞日期」过滤，再从当天班次里挑，免得下拉太长。舱位默认经济舱，卖的是商务舱记得手动改。</li>
+  <li><b>录名单</b>：三种方式任选——手工一行行填；下载模板填好再上传；OTA 单直接用「📋 粘贴名单导入」。生日写 1990-01-01 或 1990/1/1 都认。某个客人有单独要求（靠窗、素食）写在他那行的备注里，会单独存进他自己的订单。</li>
+  <li><b>填价格（可不填）</b>：不填就按系统当前卖价；团队议价填「结算价/人」；OTA 单填「OTA 结算单价」。</li>
+  <li><b>点「批量建单」</b>：系统逐人建单，哪一单建失败会单独列出来（比如班次卖满了），成功的不受影响。</li>
+</ol>
+<div class="tip">提交按钮防手抖：连点两下、网络卡了重试，都不会重复建单，放心点。</div>
+
+<!-- ═════════ 4 状态流转 ═════════ -->
+<h2 id="s4">四、订单状态：每个状态什么意思、什么时候点什么</h2>
+<p>一张单的正常一生是这样走的：</p>
+<div class="flow">
+  <span class="pill">草稿</span><span class="fa">→</span>
+  <span class="pill main">待支付</span><span class="fa">→</span>
+  <span class="pill main">已支付</span><span class="fa">→</span>
+  <span class="pill main">处理中</span><span class="fa">→</span>
+  <span class="pill main">已出票</span><span class="fa">→</span>
+  <span class="pill">已完成</span>
+</div>
+<p>旁边还有几条「岔路」：</p>
+<div class="flow">
+  <span class="pill bad">已取消</span><span class="pill bad">支付超时</span><span class="pill bad">退款申请中</span><span class="pill bad">已退款</span><span class="pill">改期申请中</span><span class="pill">已改期</span><span class="pill bad">出票失败</span>
+</div>
+
+<table class="doc">
+  <tr><th>状态</th><th>什么意思</th><th>轮到你做什么</th></tr>
+  <tr><td><b>待支付</b></td><td>单建好了，钱还没到</td><td>收到钱后在详情里点 <span class="btnref sec">确认收款</span>（见第五章），再点 <span class="btnref">标记已支付</span></td></tr>
+  <tr><td><b>已支付</b></td><td>钱齐了</td><td>点 <span class="btnref">进入处理</span>，交给出票/订房流程（工单也会自动生成）</td></tr>
+  <tr><td><b>处理中</b></td><td>票务/酒店/签证在办</td><td>办妥后点 <span class="btnref">出票完成</span>；办砸了点 <span class="btnref sec">出票失败</span></td></tr>
+  <tr><td><b>已出票</b></td><td>出行凭证都齐了</td><td>客人回来、无售后，点 <span class="btnref">订单完结</span> 收尾</td></tr>
+  <tr><td><b>退款申请中</b></td><td>客人在前台申请了退款</td><td>核实后二选一：<span class="btnref">同意退款</span> 或 <span class="btnref sec">驳回退款（回退处理）</span></td></tr>
+  <tr><td><b>改期申请中</b></td><td>客人在前台申请了改期</td><td>联系客人确认新班次 → 做改期（见第六章）→ <span class="btnref">标记已改期</span>；不同意就 <span class="btnref sec">驳回改期（回退出票）</span></td></tr>
+  <tr><td><b>出票失败</b></td><td>没出成票</td><td>解决问题后点 <span class="btnref sec">重新处理</span>，或走退款</td></tr>
+  <tr><td><b>已取消 / 支付超时</b></td><td>单子作废，<b>座位已释放</b></td><td>一般不用管；要复活找管理员（见下方提醒）</td></tr>
+</table>
+
+<p><b>在哪点：</b>打开订单详情，顶部只会出现<b>当前状态允许走</b>的那几个按钮——不用背整张状态表，看见什么按钮就是能点什么。</p>
+<div class="warn">两个要命的点：① 管理员有「强制改状态」权限，把<b>已取消的单强拉回来会重新占座</b>，拉之前先确认那个班次还有位；② 状态只是「标签」，收钱是收钱、改状态是改状态，<b>先收钱再改状态</b>，别反过来。</div>
+
+<!-- ═════════ 5 收款 ═════════ -->
+<h2 id="s5">五、收钱：确认收款 / 批量到账 / 多付与欠款</h2>
+<p>系统<b>不会自动知道</b>客人打钱了——所有到账都要人工确认。打开订单详情，找「收款」区：</p>
+
+<div class="drawer">
+  <div class="dh">订单详情 — FT2607…01 · 张三 等2人</div>
+  <div class="sec"><div class="st">收款</div>
+    <div class="mrow"><span class="fgroup"><span class="mlabel">收款金额</span><span class="hl" style="display:inline-block"><span class="tag">1</span><span class="minput">默认尾款 ¥1,200</span></span></span>
+    <span class="fgroup"><span class="mlabel">收款方式</span><span class="msel">微信 / 支付宝 / 银行卡 / 代理预存</span></span></div>
+    <div class="mrow"><span class="mbtn">📷 上传收款截图</span><span class="minput" style="min-width:120px">备注（选填）</span><span class="mbtn primary">确认收款</span></div>
+    <div class="mrow"><span class="badge b-amber">欠款且是代理单 → 出现「用代理余额抵」</span></div>
+    <div class="mrow"><span class="badge b-blue">多付了 → 出现「转挂账池」（钱进收款对账台等财务认领）</span></div>
+  </div>
+</div>
+<div class="legend"><div class="row"><b class="n">1</b>金额默认帮你填好 = 这单还差的尾款，收多少改多少，支持分几次收</div></div>
+
+<ol class="steps">
+  <li>核对客人转账金额 → 填「收款金额」（默认就是尾款数）。</li>
+  <li>选对「收款方式」：微信 / 支付宝 / 银行卡 / 代理预存。</li>
+  <li><b>上传水单截图</b>（转账凭证），方便财务对账。</li>
+  <li>点 <span class="btnref">确认收款</span>。尾款清零后表格里这单变绿「已结清」。</li>
+</ol>
+
+<h3>几种特殊情况</h3>
+<table class="doc">
+  <tr><th>情况</th><th>怎么办</th></tr>
+  <tr><td>客人<b>多付了</b>（尾款列是蓝色）</td><td>详情里点 <span class="btnref sec">转挂账池</span>，钱进「收款对账台」等财务认领；如果是代理的单，也可以「存入代理余额」留着下次用</td></tr>
+  <tr><td>代理单欠尾款，但代理账上<b>有预存余额</b></td><td>详情里会出现绿色的「用代理余额抵」，金额默认取尾款和余额里的小值，点一下就抵掉</td></tr>
+  <tr><td><b>月结代理</b>的单</td><td>尾款显示中性蓝「月结挂账」——不用催，月末财务统一结</td></tr>
+  <tr><td>一次到账一笔钱，<b>覆盖好几张单</b>（团款）</td><td>列表里勾选这几张单 → 点底部工具条 <span class="btnref">💰 批量到账</span> → 每单金额默认=各自尾款（可改）→ 选一个共享收款方式 + 传一张共享水单 → 提交，逐单入账</td></tr>
+</table>
+<div class="tip">已结清的单还能继续录收款（客人硬要多付的场景），多付部分按上面「多付了」处理。</div>
+
+<!-- ═════════ 6 改期换人 ═════════ -->
+<h2 id="s6">六、改签（改期）与换人</h2>
+
+<h3>6.1 改期（换班次 / 换日期 / 换舱位）</h3>
+<ol class="steps">
+  <li>打开订单详情，找到<b>机票那一行</b>，点行上的 <span class="btnref sec">改期</span>。</li>
+  <li>选新的班次（可换日期、换舱位）。</li>
+  <li>要收改期费就填「改期费（¥）」，不收留空；备注里写清原因（如：客户主动改期 / 航变）。</li>
+  <li>点 <span class="btnref">确认改期</span>。座位会自动从旧班次挪到新班次；<b>新班次卖满了会被系统拒绝</b>，先换个班次再试。改期费会自动记进订单尾款，记得按第五章收钱。</li>
+</ol>
+<div class="info">客人自己在前台申请的改期，订单会变成「改期申请中」，提醒中心也会有待办——你先联系客人确认好新班次，再按上面步骤操作，最后点「标记已改期」。</div>
+
+<h3>6.2 换人 / 改出行人信息</h3>
+<ol class="steps">
+  <li>订单详情 → 乘客区 → 点该乘客的 <span class="btnref sec">换人/编辑</span>。</li>
+  <li>只是改错别字、补生日：直接改完保存即可。</li>
+  <li><b>换成另一个人（证件号变了）</b>：系统会弹确认——原来那个人的护照照片、签发地、有效期、签证号等会被<b>清空重来</b>，只留你这次填的新信息。看清楚再点确认。</li>
+  <li>要收换人费就填「换人费（¥）」，会记进订单尾款。</li>
+  <li>如果这单已经开过票 / 办过签证，按提示勾选「重置开票 / 签证」，让票务岗、签证岗重新跟进新乘客。</li>
+</ol>
+<div class="warn">换人是「真换一个人」的大动作，会记入系统操作记录。拿不准就先问带教同事，别硬点。</div>
+
+<!-- ═════════ 7 备注四栏 ═════════ -->
+<h2 id="s7">七、备注四栏怎么用</h2>
+<p>订单详情里有一块「签证状态 / 备注」。别把所有事都堆在一个框里——按栏分开写，签证岗、财务、操作部各看各的栏，才不会漏。</p>
+
+<div class="drawer">
+  <div class="dh">订单详情 — 签证状态 / 备注</div>
+  <div class="sec">
+    <div class="mrow"><span class="fgroup"><span class="mlabel">签证状态</span><span class="msel">不需要 / 需要 / 电子签 / 已签证</span></span></div>
+    <span class="mlabel">酒店情况</span><span class="marea">房型 / 入住时间 / 特殊安排</span>
+    <span class="mlabel">签证情况</span><span class="marea">材料进度 / 批文 / 送签情况</span>
+    <span class="mlabel">付款情况</span><span class="marea">收款进度 / 尾款 / 退款备注</span>
+    <span class="mlabel">特殊要求</span><span class="marea">客户其它特殊要求</span>
+    <span class="mlabel">客户备注（客户可见）</span><span class="marea">客人在前台能看到这里写的内容</span>
+    <span class="mlabel">内部备注（仅运营可见）</span><span class="hl a" style="display:block"><span class="tag">!</span><span class="marea amber">跨班次/跨部门的私下备忘——客人和代理都看不到</span></span>
+    <div class="mrow" style="justify-content:flex-end"><span class="mbtn primary">保存备注</span></div>
+  </div>
+</div>
+
+<table class="doc">
+  <tr><th>栏</th><th>写什么</th><th>谁会看</th></tr>
+  <tr><td><b>酒店情况</b></td><td>房型、入住时间、拼房/单住等特殊安排</td><td>房控、操作部</td></tr>
+  <tr><td><b>签证情况</b></td><td>材料收齐没有、批文进度、送签情况</td><td>签证岗</td></tr>
+  <tr><td><b>付款情况</b></td><td>收款进度、分期约定、退款说明</td><td>财务、跟单的你</td></tr>
+  <tr><td><b>特殊要求</b></td><td>其它客户要求（轮椅、儿童餐、蜜月布置…）</td><td>操作部</td></tr>
+  <tr><td><b>客户备注</b></td><td>需要<b>让客人看到</b>的说明</td><td style="color:#B91C1C"><b>客人自己也能看到！</b>别写内部信息</td></tr>
+  <tr><td><b>内部备注</b>（琥珀色框）</td><td>只给自己人看的备忘</td><td>仅内部运营，客人、代理都看不到</td></tr>
+</table>
+<div class="warn">改完备注一定点 <span class="btnref">保存备注</span>，出现绿色「✓ 已保存」才算存上。顺手改「签证状态」下拉时看清楚——它决定这单会不会进签证岗的工作台。每栏最多 300 字，写重点。</div>
+
+<!-- ═════════ 8 导出 ═════════ -->
+<h2 id="s8">八、导出：五个导出按钮各是干嘛的</h2>
+<p>订单页顶部一共五个导出入口，最容易搞混的就是这里。先记一张总表：</p>
+
+<table class="doc">
+  <tr><th>按钮</th><th>出什么</th><th>给谁用</th><th>按什么日期筛</th></tr>
+  <tr><td><b>📥 导出 CSV</b></td><td>当前列表所见的订单，存成 CSV</td><td>自己快速核数、临时拉个清单</td><td>跟列表筛选完全一致</td></tr>
+  <tr><td><b>📤 导出</b>（先在旁边下拉选模板）</td><td>三种正式表格（xlsx）：<br>·《全岗可用》49 列 — 通用台账<br>·《票务专用》27 列 — 航司订座名单<br>·《签证专用》20 列 — 越南签证申请表（带越文表头）</td><td>全岗通用 / 票务岗 / 签证岗</td><td><b>按「下单时间」</b>（哪天录的单）——算佣金、提成、客户统计用这个口径。筛选区旁有「本周/本月」等快捷键一点就设好</td></tr>
+  <tr><td><b>📊 导出全岗总表</b></td><td>一行一位乘客、字段最全的综合台账（酒店、分房、结算、退款、单房差都有）</td><td><b>日常对账首选</b>，全岗都能用</td><td><b>按「出行日期」区间</b>（客人哪天出发）；不填日期 = 全部导</td></tr>
+  <tr><td><b>🎫 票务开票导出</b></td><td>某天某航段还需开票订单的航司订座名单（同《票务专用》格式）</td><td>票务岗交航司出票</td><td>面板里选「出发日 + 航段 + 开票状态」；下方会先显示「匹配 N 条」，确认范围对了再点导出</td></tr>
+  <tr><td><b>整班导出</b>（在「航班管理」页每个班次上）</td><td>该班次全部订单 / 全岗表</td><td>按班次盯团的同事</td><td>就是那一个班次</td></tr>
+</table>
+
+<h3>三条铁规则，导错表基本都是栽在这</h3>
+<ol class="steps">
+  <li><b>勾选优先</b>：只要你在列表里勾选了订单，「📤 导出」「📊 全岗总表」「🎫 票务开票导出」就<b>只导勾选的这些单</b>，上面的筛选和日期全部不生效。页面会有提示条「已勾选 N 条」。想按筛选导，先把勾选取消掉。</li>
+  <li><b>日期口径别选错</b>：「📤 导出」看的是<b>下单时间</b>，「📊 全岗总表」看的是<b>出行日期</b>。想导「8 月出发的客人名单」却去设「下单时间 8 月」，出来的表肯定不对。</li>
+  <li><b>名单类导出不看列表的状态筛选</b>：为了名单齐全，导出会覆盖所有还占着座位的单（<b>包括还没付款的</b>）；而草稿、已取消、支付超时、已退款、出票失败的单<b>不会</b>出现在导出里。列表里筛了「已支付」再导，导出的份数和列表对不上是正常的。</li>
+</ol>
+<div class="info">《全岗可用》表里有几列（飞行次数、单房差、抵扣人员等）经常是空的——那是照着旧手工台账搬过来的<b>占位列</b>，系统没有的数据宁可留空也不乱填。<b>日常对账建议直接用「📊 导出全岗总表」</b>，它把系统里真实有的字段全填满了。另外全岗总表里的金额是<b>按每位出行人均摊</b>的，几个人的单每行只显示他那一份，别当成每人都付了全款。</div>
+
+<!-- ═════════ 9 回收站 ═════════ -->
+<h2 id="s9">九、删单与回收站</h2>
+<h3>删单</h3>
+<ol class="steps">
+  <li>打开订单详情，最底部有「删除订单」。删除是<b>软删除</b>：单子从列表、导出、统计里消失，但数据还在，可以恢复。</li>
+  <li>两种单删不掉，系统会拦：①<b>还占着座位的单</b>——先把订单取消（释放座位）再删；②<b>收过钱还没退完的单</b>——先把退款处理完。</li>
+</ol>
+<h3>回收站（仅管理员能看）</h3>
+<ol class="steps">
+  <li>订单页顶部点 <span class="btnref sec">🗑 回收站</span>，弹窗列出所有已删除订单，可按订单号 / 联系人 / 乘客姓名搜。</li>
+  <li>点某单的「恢复」→ 单子回到<b>删除前的状态</b>，重新出现在列表、导出和统计里。恢复不影响座位账。</li>
+  <li>误删了单又不是管理员？找管理员帮你从回收站捞回来。</li>
+</ol>
+
+<!-- ═════════ 10 提醒中心 + 工单看板 ═════════ -->
+<h2 id="s10">十、跟单利器：提醒中心 + 工单看板</h2>
+<p>录完单不是结束——催款、证件、出票、送签都要有人盯。系统给了两个页面配合着用：<b>提醒中心</b>管「你个人的待办清单」，<b>工单看板</b>管「操作部各环节办到哪了」。</p>
+
+<h3>10.1 提醒中心（运营 → 提醒中心）——每天上班第一件事</h3>
+<div class="mock">
+  <div class="mock-bar"><span class="dot" style="background:#F87171"></span><span class="dot" style="background:#FBBF24"></span><span class="dot" style="background:#34D399"></span>&nbsp;运营控制台 — 提醒中心</div>
+  <div class="mock-body">
+    <div class="mrow"><span class="mtitle" style="margin:0">提醒中心</span><span style="flex:1"></span><span class="hl"><span class="tag">1</span><span class="mbtn primary">⚡ 生成今日提醒</span></span></div>
+    <div class="statrow">
+      <div class="stat"><div class="sl">待处理</div><div class="sv">12</div></div>
+      <div class="stat"><div class="sl">进行中</div><div class="sv">3</div></div>
+      <div class="stat"><div class="sl">今日新增</div><div class="sv">7</div></div>
+      <div class="stat"><div class="sl">紧急（未完成）</div><div class="sv red">2</div></div>
+    </div>
+    <div class="mrow"><span class="msel">状态</span><span class="msel">优先级</span><span class="msel">来源</span><span style="font-size:11.5px">☐ 只看我认领的</span></div>
+    <table class="mtab">
+      <tr><th>优先级</th><th>标题</th><th>关联订单</th><th>到期日</th><th>状态</th><th>操作</th></tr>
+      <tr><td><span class="badge b-red">紧急</span></td><td>催尾款 <span class="badge b-gray">自动</span></td><td>FT2607…01</td><td><span style="color:#B91C1C;font-weight:700">07-20 逾期</span></td><td><span class="badge b-amber">待处理</span></td><td><span class="hl a" style="display:inline-block"><span class="tag">2</span><span class="mbtn" style="font-size:11px">认领</span></span></td></tr>
+      <tr><td><span class="badge b-amber">高</span></td><td>护照有效期 <span class="badge b-gray">自动</span></td><td>FT2607…02</td><td>07-25</td><td><span class="badge b-blue">进行中</span></td><td><span class="mbtn" style="font-size:11px">完成</span><span class="mbtn" style="font-size:11px">跳过</span><span class="mbtn" style="font-size:11px">释放</span></td></tr>
+    </table>
+  </div>
+</div>
+<div class="legend">
+  <div class="row"><b class="n">1</b>每天上班点一次——系统按规则扫全库生成今天的待办；已有的自动跳过，<b>连点也不会重复生成</b></div>
+  <div class="row"><b class="n" style="background:var(--amber)">2</b>看到自己该管的先「认领」，认领了才有「完成 / 跳过 / 释放」按钮</div>
+</div>
+<p>自动生成的四类提醒：</p>
+<table class="doc">
+  <tr><th>类型</th><th>什么条件会冒出来</th><th>你该干嘛</th></tr>
+  <tr><td><b>催尾款</b></td><td>14 天内出发还欠尾款（3 天内出发升级为「紧急」）</td><td>联系客人/代理催款 → 到账走第五章确认收款 → 点「完成」</td></tr>
+  <tr><td><b>出行提醒</b></td><td>3 天内出发的单</td><td>跟客人确认集合、证件、接送</td></tr>
+  <tr><td><b>护照有效期</b></td><td>乘客护照距出发不足 6 个月</td><td>通知客人换证或确认目的地政策</td></tr>
+  <tr><td><b>签证缺件</b></td><td>在办签证但缺护照照片</td><td>找客人补照片，传到订单里</td></tr>
+</table>
+<ul>
+  <li>操作口诀：<b>认领 → 办完点「完成」；不用办点「跳过」（必须写原因）；接不动点「释放」</b>让别人接。</li>
+  <li>过了到期日还没完成的会标红「逾期」，先清逾期的。</li>
+  <li>手动待办哪来的？在订单详情里点 <span class="btnref sec">＋ 加待办</span>（可设优先级和到期日，比如「2 日内拿批文」），就会出现在提醒中心。</li>
+</ul>
+
+<h3>10.2 工单看板（运营 → 工单看板）——看每单办到哪一步了</h3>
+<p>订单付款进入处理后，系统会按内容自动生成履约工单：<b>出票、酒店确认、签证送签、接送安排、套餐</b>五类。看板四列就是工单的四种进度：</p>
+<div class="mock">
+  <div class="mock-bar"><span class="dot" style="background:#F87171"></span><span class="dot" style="background:#FBBF24"></span><span class="dot" style="background:#34D399"></span>&nbsp;运营控制台 — 工单看板</div>
+  <div class="mock-body">
+    <div class="mrow"><span class="mbtn primary" style="border-radius:999px">全部</span><span class="mbtn" style="border-radius:999px">出票</span><span class="mbtn" style="border-radius:999px">酒店确认</span><span class="mbtn" style="border-radius:999px">签证送签</span><span class="mbtn" style="border-radius:999px">接送安排</span><span class="mbtn" style="border-radius:999px">套餐</span><span style="font-size:11.5px;margin-left:6px">☐ 只看指派给我的</span></div>
+    <div class="board">
+      <div class="bcol"><h5>待处理 <span class="badge b-gray">4</span></h5>
+        <div class="hl" style="display:block"><span class="tag">1</span><div class="bcard red" style="margin-bottom:0"><span class="badge b-blue">出票</span> <span class="badge b-red">⏰ ≤48h</span><br><b>FT2607…05</b><br>出发 07-22 09:30 ☐</div></div>
+        <div class="bcard amberb" style="margin-top:7px"><span class="badge b-amber">签证送签</span> <span class="badge b-amber">⏰ ≤72h</span><br><b>FT2607…08</b><br>出发 07-23 14:00 ☐</div>
+      </div>
+      <div class="bcol"><h5>进行中 <span class="badge b-gray">2</span></h5><div class="bcard"><span class="badge b-green">酒店确认</span><br><b>FT2607…03</b><br>出发 07-28 10:10 ☐</div></div>
+      <div class="bcol"><h5>已确认 <span class="badge b-gray">9</span></h5><div class="bcard"><span class="badge b-blue">出票</span><br><b>FT2607…02</b><br>出发 08-01 08:00 ☐</div></div>
+      <div class="bcol"><h5>失败 <span class="badge b-gray">1</span></h5><div class="bcard"><span class="badge b-gray">接送安排</span><br><b>FT2607…09</b><br>出发 07-30 12:00 ☐</div></div>
+    </div>
+    <div class="mrow" style="background:#F8FAFC;border-radius:8px;padding:6px 10px"><b style="font-size:11.5px">已选 2 项</b><span class="msel">确认完成</span><span class="mbtn primary">应用</span><span class="mbtn">取消选择</span></div>
+  </div>
+</div>
+<div class="legend"><div class="row"><b class="n">1</b>红框卡片 = 距出发不到 48 小时还没办完（琥珀 = 不到 72 小时；「已过出发」= 已经误机级别）。<b>每天先清红卡</b></div></div>
+<ol class="steps">
+  <li>用顶部圆形按钮筛类型（比如只看「出票」），或勾「只看指派给我的」。</li>
+  <li>每列卡片按出发时间从近到远排，红卡永远在最上面附近——优先处理。</li>
+  <li>开始办某几件事：勾选卡片 → 底部工具条选「开始处理」→ 应用；办妥选「确认完成」；办砸选「标记失败」。</li>
+  <li>批量操作如果有个别失败，页面会逐条列出是哪几张、什么原因。</li>
+</ol>
+<div class="tip">两页配合的日常动线：上班 → 提醒中心点「⚡ 生成今日提醒」清个人待办 → 工单看板扫红卡盯进度 → 订单页处理新单和收款。</div>
+
+<!-- ═════════ 产品页附带 ═════════ -->
+<h3>10.3 顺带认识：产品管理（产品 → 产品）</h3>
+<p>录单时下拉里能选到的酒店、车、签证、套餐，都是在这一页维护的。四个页签：<b>酒店 / 接送（车型）/ 签证 / 套餐</b>，各自有「＋ 新增 / 编辑 / 删除」。要点三条：</p>
+<ul>
+  <li><b>删除 = 下架</b>，不是抹掉——历史订单完全不受影响，只是以后录单选不到它了。</li>
+  <li><b>套餐向导</b>：把机票+酒店+接送+签证组合起来卖。定价时填「想卖的价」，系统自动换算成整单折扣；机票部分随出发日浮动，所以不同出发日的套餐最终价会不一样，这是正常的。</li>
+  <li>套餐可设停售日和团期。改产品价格会<b>立即</b>影响新录的单，改之前跟管理员打个招呼。</li>
+</ul>
+
+<!-- ═════════ 11 FAQ ═════════ -->
+<h2 id="s11">十一、常见问题 FAQ</h2>
+<dl class="faq">
+  <dt>导出的《全岗可用》表里，「飞行次数」「单房差」这些列怎么是空的？表坏了吗？</dt>
+  <dd>没坏。《全岗可用》是照旧手工台账原样复刻的，有些列系统暂时没有对应数据，<b>宁可留空也不编数</b>，属于占位列。日常对账请改用「📊 导出全岗总表」，那张表把系统真实有的字段全填满了。</dd>
+
+  <dt>我明明设了日期筛选，导出的单子却不是那批？</dt>
+  <dd>九成是<b>勾选没取消</b>。只要列表里勾了单，三个导出按钮都只导勾选的那些，日期和筛选全部失效——看一眼有没有「已勾选 N 条」的提示条。另外注意口径：「📤 导出」按<b>下单时间</b>，「📊 全岗总表」按<b>出行日期</b>，别用错。</dd>
+
+  <dt>列表筛了「已支付」，导出来的却混着没付款的单？</dt>
+  <dd>正常。名单类导出为保证名单完整，覆盖所有还占座位的单（含未付款的），且自动排除草稿/已取消/超时/已退款/出票失败——它不吃列表的「状态」筛选。</dd>
+
+  <dt>全岗总表里的金额，跟订单总价对不上？</dt>
+  <dd>那张表<b>一行是一位乘客</b>，金额（结算、到账、尾款、单房差、退款等）都是按人头均摊后的数。一单 3 个人，每行只显示三分之一，加起来才是整单。</dd>
+
+  <dt>全岗总表的「飞行次数」有的有数有的空，同一单还不一样？</dt>
+  <dd>它是「这位客人历史上跟我们飞过几次」，按证件号从老客档案里查的——同单不同人当然不一样；新客或证件号对不上档案就是空。它不是本单的航段数。</dd>
+
+  <dt>客人说付了钱，订单怎么还是「待支付」？</dt>
+  <dd>到账全靠人工确认，系统不会自动变。核对到账后要你在详情里点「确认收款」，再点「标记已支付」。客人自己在前台传的付款凭证，会进财务的「收款对账台」等认领——拿不准就问财务这笔认了没有。</dd>
+
+  <dt>「删除订单」点了没反应 / 报错？</dt>
+  <dd>还占座位的单不能删，先取消订单（释放座位）再删；收过钱没退完的也不能删，先处理退款。删掉的单进回收站，管理员能恢复。</dd>
+
+  <dt>改期为什么被拒绝了？</dt>
+  <dd>新班次卖满了。换个班次或日期再试；确实要挤进满班找管理员处理。</dd>
+
+  <dt>提醒中心一条都没有？</dt>
+  <dd>要先点「⚡ 生成今日提醒」才会扫描生成。它只在有人点的时候跑一次，每天上班点一下就好；重复点不会生成重复条目。</dd>
+
+  <dt>月结代理的单一直挂着尾款，要不要催？</dt>
+  <dd>不用。月结代理的单显示蓝色「月结挂账」是正常状态，月末财务统一对账收款。要催的是琥珀色「欠款」的单。</dd>
+
+  <dt>批量创单为什么有几单失败了？</dt>
+  <dd>批量是逐人建单，个别失败（最常见是班次卖满、生日格式不对）不影响其他人。看弹窗里逐条的失败原因，改好后把失败那几个人再建一次即可。</dd>
+
+  <dt>备注写了怎么客人看到了？</dt>
+  <dd>「客户备注」这一栏客人在前台是能看到的——内部话请写「内部备注」（琥珀色那个框）或四栏里，客人和代理都看不到。</dd>
+</dl>
+
+<footer class="footer">
+  世途旅行 · 运营控制台 — 运营/录单岗操作说明 · 2026-07 版<br>
+  内容与线上系统当前功能一致；系统更新后以页面实际显示为准。使用中卡住了，先翻第十一章 FAQ，再找带教同事或管理员。
+</footer>
+
+</div>
+</body>
+</html>

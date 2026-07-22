@@ -1,7 +1,7 @@
 /**
  * 三模板筛选导出 — 与订单列表共用筛选条件（buildOrderFilterWhere），一行/乘客。
  *
- *   full      《全岗可用》49 列 — 运营/财务/签证全岗位通用台账
+ *   full      《全岗可用》54 列 — 运营/财务/签证全岗位通用台账（53 列旧模版 + 纯拼音名）
  *   ticketing 《票务专用》27 列 — 代理+备注 + 航司 PNR 提交 25 列（仅含机票的订单）
  *   visa      《签证专用》20 列 — 越南签证申请表抬头（含越文表头）
  *
@@ -12,6 +12,7 @@ import ExcelJS from 'exceljs';
 import type { Prisma, PrismaClient } from '@prisma/client';
 import { OrderItemKind, OrderStatus } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
+import type { BundleItemJson } from '../../lib/json-types.js';
 import { toAlpha3 } from './nationality.js';
 import {
   passengerToRow,
@@ -58,6 +59,14 @@ const FULFILLMENT_STATUS_LABEL: Record<string, string> = {
   CONFIRMED: '已确认',
   CANCELLED: '已取消',
   FAILED: '失败',
+};
+
+/** 订单级签证状态（录单时选择，与履约任务状态区分）。全岗总表导出（orders.export-master.ts）共用。*/
+export const VISA_REQUIREMENT_LABEL: Record<string, string> = {
+  NOT_NEEDED: '不需要',
+  NEEDED: '需要',
+  E_VISA: '电子签',
+  HAS_VISA: '已签证',
 };
 
 // 注：《全岗可用》模版对齐旧系统口径 —— 乘客类型/性别/证件类型均按旧模版原样
@@ -194,7 +203,7 @@ export type OrderForTemplateExport = Prisma.OrderGetPayload<{
         hotelRoomType: { select: { name: true; hotel: { select: { name: true; code: true } } } };
         visa: { select: { code: true; visaName: true; visaType: true } };
         transfer: { select: { code: true } };
-        bundle: { select: { code: true } };
+        bundle: { select: { code: true; items: true } };
         fulfillmentTasks: { select: { type: true; status: true } };
       };
     };
@@ -259,12 +268,14 @@ export function buildOrderContext(order: OrderForTemplateExport): OrderContext {
     orderType = kind ? ORDER_KIND_LABEL[kind] : '';
   }
 
-  // 酒店类型 = 酒店名 + 房型名
-  const hotelParts: string[] = [];
+  // 酒店类型 = 酒店名 + 房型名。任何「关联了酒店房型」的订单行都算（不限 kind）：
+  // 套餐(BUNDLE)把房型盖在 BUNDLE 行上、无独立 HOTEL 行，只认 kind==='HOTEL' 会让
+  // 套餐单的酒店列整列空白（0720 公测反馈：导出缺酒店信息）。Set 去重防同名重复。
+  const hotelPartSet = new Set<string>();
   const hotelNameSet = new Set<string>();
   for (const it of order.items) {
-    if (it.kind === 'HOTEL' && it.hotelRoomType) {
-      hotelParts.push(`${it.hotelRoomType.hotel.name} ${it.hotelRoomType.name}`);
+    if (it.hotelRoomType) {
+      hotelPartSet.add(`${it.hotelRoomType.hotel.name} ${it.hotelRoomType.name}`);
       hotelNameSet.add(it.hotelRoomType.hotel.name);
     }
   }
@@ -282,7 +293,7 @@ export function buildOrderContext(order: OrderForTemplateExport): OrderContext {
     paxCount,
     agency: order.agent?.companyName ?? '直客',
     notes: order.notes ?? '',
-    hotelInfo: hotelParts.join(' + '),
+    hotelInfo: Array.from(hotelPartSet).join(' + '),
     hotelNames,
     travelDates,
     flightNumbers,
@@ -296,7 +307,7 @@ export function buildOrderContext(order: OrderForTemplateExport): OrderContext {
   };
 }
 
-// ── 模板一：《全岗可用》53 列（与「全岗可用」表格模版同名同序）───────────────
+// ── 模板一：《全岗可用》54 列（旧模版 53 列同名同序 + 「纯拼音名」对数列）──────
 // 头部两行：0..49 列为单行表头（纵向合并两行）；末尾「订单成本」为分组表头，
 // 跨「成本类型/子类型/金额」三子列（横向合并首行）。系统暂无数据的列一律留空，绝不编造。
 // 定金组四列（定金/到账金额/到账时间/到账渠道）已移除：系统无定金模型，四列恒空，
@@ -308,7 +319,8 @@ interface FullRow {
   notes: string; // 备注
   hotelInfo: string; // 酒店类型（酒店名 + 房型）
   chineseName: string; // 中文名称
-  passengerName: string; // 乘客姓名 LAST/FIRST
+  passengerName: string; // 乘客姓名 LAST/FIRST + 称谓（航司口径）
+  cleanName: string; // 纯拼音名 LAST/FIRST（无 MR/MS 称谓）— 财务对数/名单匹配用
   flightCount: string; // 飞行次数 — 暂无数据，留空
   travelDates: string; // 出发(往返)日期
   flightNumbers: string; // 航班号
@@ -333,8 +345,8 @@ interface FullRow {
   invoiceStatusSys: string; // 系统开票状态（systemInvoiced：是/否）
   invoiceStatusManual: string; // 开票状态 — 按航段已开的组合文本（去程已开/回程已开），都未开则留空
   visaStatus: string; // 签证状态
-  visaOption: string; // 签证选项
-  visaNote: string; // 签证备注 — 留空
+  visaOption: string; // 签证选项（独立签证行产品名 + 套餐签证组件名）
+  visaNote: string; // 签证备注 = 订单「签证备注」结构化栏（noteVisa）
   passportIssuePlace: string; // 护照签发地
   placeOfBirth: string; // 出生地
   orderNumber: string; // 订单编号
@@ -365,6 +377,7 @@ export const FULL_COLUMNS: Array<{ header: string; key: keyof FullRow; width: nu
   { header: '酒店类型', key: 'hotelInfo', width: 24 },
   { header: '中文名称', key: 'chineseName', width: 12 },
   { header: '乘客姓名', key: 'passengerName', width: 18 },
+  { header: '纯拼音名', key: 'cleanName', width: 16 },
   { header: '飞行次数', key: 'flightCount', width: 8 },
   { header: '出发(往返)日期', key: 'travelDates', width: 24 },
   { header: '航班号', key: 'flightNumbers', width: 18 },
@@ -436,15 +449,34 @@ export function orderToFullRows(order: OrderForTemplateExport, ctx: OrderContext
     .filter((d): d is Date => Boolean(d))
     .sort((a, b) => b.getTime() - a.getTime())[0];
 
-  // 签证：金额合计 / 选项（产品名）/ 履约状态
+  // 签证：金额合计 / 选项（产品名）/ 状态。
+  // 套餐(BUNDLE)含签证时没有独立 VISA 行：签证履约任务挂在 BUNDLE 行上、签证组件名
+  // 在套餐定义 items JSON 里 —— 只认 VISA 行会让套餐单的签证状态/选项整列空白
+  //（0720 公测反馈：导出缺签证信息）。选项补套餐签证组件名；任务跨全部行找；
+  // 状态优先订单级录单签证状态 —— 与全岗总表（orders.export-master.ts）同口径。
   const visaItems = order.items.filter((it) => it.kind === 'VISA');
   const visaAmountOrder = visaItems.reduce((s, it) => s + dec(it.amount), 0);
-  const visaOption = visaItems
-    .map((it) => it.visa?.visaName ?? it.visa?.visaType ?? it.description)
+  const bundleVisaNames = order.items.flatMap((it) => {
+    if (it.kind !== 'BUNDLE' || !it.bundle) return [];
+    const components = Array.isArray(it.bundle.items)
+      ? (it.bundle.items as unknown as BundleItemJson[])
+      : [];
+    return components.filter((c) => c && c.kind === 'VISA').map((c) => c.productName);
+  });
+  const visaOption = [
+    ...visaItems.map((it) => it.visa?.visaName ?? it.visa?.visaType ?? it.description),
+    ...bundleVisaNames,
+  ]
+    .filter(Boolean)
     .join(' + ');
-  const visaTask = visaItems
+  const visaTask = order.items
     .flatMap((it) => it.fulfillmentTasks)
     .find((t) => t.type === 'VISA_APPLICATION');
+  const visaStatus = order.visaStatus
+    ? VISA_REQUIREMENT_LABEL[order.visaStatus] ?? order.visaStatus
+    : visaTask
+      ? FULFILLMENT_STATUS_LABEL[visaTask.status] ?? visaTask.status
+      : '';
 
   // 是否清账：已付 + 预付款抵扣 ≥ 应付（total + adjustmentCny），与上面 ctx.balancePerPax 同口径。
   // 不含 adjustmentCny 会出现"尾款>0 但已清账"的自相矛盾（P2-15b 连带修）；漏 prepaymentOffset
@@ -484,6 +516,7 @@ export function orderToFullRows(order: OrderForTemplateExport, ctx: OrderContext
     hotelInfo: ctx.hotelInfo,
     chineseName: p.chineseName ?? p.fullName,
     passengerName: nameWithTitle(p, departureDate),
+    cleanName: pnrName(p),
     flightCount: '',
     travelDates: ctx.travelDates,
     flightNumbers: ctx.flightNumbers,
@@ -507,9 +540,9 @@ export function orderToFullRows(order: OrderForTemplateExport, ctx: OrderContext
     refundChannel: '',
     invoiceStatusSys,
     invoiceStatusManual,
-    visaStatus: visaTask ? FULFILLMENT_STATUS_LABEL[visaTask.status] ?? visaTask.status : '',
+    visaStatus,
     visaOption,
-    visaNote: '',
+    visaNote: order.noteVisa ?? '',
     passportIssuePlace: p.passportIssuePlace ?? p.passportIssueCountry ?? '',
     placeOfBirth: p.placeOfBirth ?? '',
     orderNumber: order.orderNumber,
@@ -693,7 +726,7 @@ export async function buildOrderTemplateExportWorkbook(
           hotelRoomType: { select: { name: true, hotel: { select: { name: true, code: true } } } },
           visa: { select: { code: true, visaName: true, visaType: true } },
           transfer: { select: { code: true } },
-          bundle: { select: { code: true } },
+          bundle: { select: { code: true, items: true } },
           fulfillmentTasks: { select: { type: true, status: true } },
         },
       },

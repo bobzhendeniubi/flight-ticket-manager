@@ -1,0 +1,518 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>票务岗操作说明 · 世途旅行运营控制台</title>
+<style>
+  :root{ --brand:#4F46E5; --brand-50:#EEF2FF; --brand-100:#E0E7FF; --brand-700:#4338CA; --ink:#0F172A; --ink-soft:#334155; --ink-muted:#64748B; --line:#E2E8F0; --bg:#F8FAFC; --green:#059669; --green-bg:#ECFDF5; --amber:#B45309; --amber-bg:#FFFBEB; --rose:#E11D48; --rose-bg:#FFF1F2; --sky-bg:#F0F9FF; --sky-line:#BAE6FD; }
+  *{ box-sizing:border-box; margin:0; padding:0; }
+  body{ font-family:"PingFang SC","Microsoft YaHei","Hiragino Sans GB",sans-serif; color:var(--ink); background:var(--bg); line-height:1.75; font-size:15px; }
+  .page{ max-width:860px; margin:0 auto; padding:32px 28px 80px; background:#fff; }
+  header.cover{ border-bottom:4px solid var(--brand); padding-bottom:24px; margin-bottom:28px; }
+  header.cover .brand{ display:inline-block; background:var(--brand); color:#fff; font-weight:700; padding:4px 12px; border-radius:8px; font-size:13px; letter-spacing:.05em; }
+  header.cover h1{ font-size:30px; margin-top:14px; letter-spacing:.02em; }
+  header.cover p{ color:var(--ink-muted); margin-top:6px; font-size:14px; }
+  h2{ font-size:21px; margin:44px 0 12px; padding-left:12px; border-left:5px solid var(--brand); }
+  h3{ font-size:16.5px; margin:26px 0 8px; color:var(--brand-700); }
+  p{ margin:8px 0; color:var(--ink-soft); }
+  strong{ color:var(--ink); }
+  ul,ol{ margin:8px 0 8px 1.6em; color:var(--ink-soft); }
+  li{ margin:4px 0; }
+  /* 目录 */
+  nav.toc{ background:var(--brand-50); border:1px solid var(--brand-100); border-radius:12px; padding:18px 22px; }
+  nav.toc h2{ border:none; padding:0; margin:0 0 10px; font-size:17px; color:var(--brand-700); }
+  nav.toc ol{ margin-left:1.4em; }
+  nav.toc a{ color:var(--ink-soft); text-decoration:none; }
+  nav.toc a:hover{ color:var(--brand); }
+  /* 提示框 */
+  .tip,.warn,.note{ border-radius:10px; padding:10px 14px; margin:12px 0; font-size:14px; }
+  .tip{ background:var(--green-bg); border:1px solid #A7F3D0; color:#065F46; }
+  .warn{ background:var(--amber-bg); border:1px solid #FDE68A; color:var(--amber); }
+  .note{ background:var(--brand-50); border:1px solid var(--brand-100); color:var(--brand-700); }
+  /* 步骤 */
+  .steps{ counter-reset:step; margin:12px 0; }
+  .step{ position:relative; padding:10px 14px 10px 46px; border:1px solid var(--line); border-radius:10px; margin:8px 0; background:#fff; }
+  .step::before{ counter-increment:step; content:counter(step); position:absolute; left:12px; top:12px; width:24px; height:24px; border-radius:50%; background:var(--brand); color:#fff; font-weight:700; font-size:13px; display:flex; align-items:center; justify-content:center; }
+  /* 界面示意图（纯 CSS 模拟） */
+  .figure{ border:1px solid var(--line); border-radius:12px; background:var(--bg); padding:14px; margin:14px 0; font-size:13px; }
+  .figure .cap{ font-size:12px; color:var(--ink-muted); margin-bottom:10px; }
+  .mock{ background:#fff; border:1px solid var(--line); border-radius:10px; padding:12px; }
+  .mock-row{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:6px 0; }
+  .btn-p{ display:inline-block; background:var(--brand); color:#fff; border-radius:8px; padding:5px 12px; font-size:12.5px; font-weight:600; }
+  .btn-s{ display:inline-block; background:#fff; color:var(--ink-soft); border:1px solid #CBD5E1; border-radius:8px; padding:5px 12px; font-size:12.5px; }
+  .btn-dis{ display:inline-block; background:#F1F5F9; color:#94A3B8; border:1px dashed #CBD5E1; border-radius:8px; padding:5px 12px; font-size:12.5px; }
+  .inp{ display:inline-block; background:#fff; border:1px solid #CBD5E1; border-radius:8px; padding:5px 10px; font-size:12.5px; color:var(--ink-muted); min-width:110px; }
+  .lbl{ font-size:11.5px; color:var(--ink-muted); display:block; margin-bottom:2px; }
+  .hl{ outline:3px solid #F59E0B; outline-offset:2px; border-radius:8px; }
+  .point{ color:var(--amber); font-size:12px; font-weight:600; margin-top:8px; }
+  .badge-g{ display:inline-block; background:var(--green-bg); color:var(--green); border-radius:6px; padding:1px 8px; font-size:11.5px; font-weight:600; }
+  .badge-n{ display:inline-block; background:#F1F5F9; color:var(--ink-muted); border-radius:6px; padding:1px 8px; font-size:11.5px; font-weight:600; }
+  .badge-a{ display:inline-block; background:#FEF3C7; color:var(--amber); border-radius:6px; padding:1px 8px; font-size:11.5px; font-weight:600; }
+  .badge-r{ display:inline-block; background:var(--rose-bg); color:var(--rose); border-radius:6px; padding:1px 8px; font-size:11.5px; font-weight:600; }
+  .badge-b{ display:inline-block; background:#DBEAFE; color:#1D4ED8; border-radius:6px; padding:1px 8px; font-size:11.5px; font-weight:600; }
+  .dot-on{ display:inline-block; background:var(--green-bg); color:var(--green); border-radius:4px; padding:0 5px; font-size:11px; font-weight:600; }
+  .dot-off{ display:inline-block; background:#F1F5F9; color:#94A3B8; border-radius:4px; padding:0 5px; font-size:11px; font-weight:600; }
+  .switch-on{ display:inline-flex; align-items:center; gap:6px; border:1px solid #A7F3D0; background:var(--green-bg); color:var(--green); border-radius:10px; padding:6px 12px; font-size:12.5px; font-weight:600; }
+  .switch-off{ display:inline-flex; align-items:center; gap:6px; border:1px solid var(--line); background:#fff; color:var(--ink-soft); border-radius:10px; padding:6px 12px; font-size:12.5px; font-weight:600; }
+  .switch-on i,.switch-off i{ width:8px; height:8px; border-radius:50%; display:inline-block; }
+  .switch-on i{ background:#10B981; } .switch-off i{ background:#CBD5E1; }
+  /* 侧边导航示意 */
+  .sidebar{ width:170px; background:#1E1B4B; color:#C7D2FE; border-radius:10px; padding:10px 0; font-size:12.5px; }
+  .sidebar .grp{ padding:6px 14px 2px; font-size:10.5px; color:#818CF8; letter-spacing:.1em; }
+  .sidebar .it{ padding:5px 14px; }
+  .sidebar .it.on{ background:var(--brand); color:#fff; border-radius:0 16px 16px 0; margin-right:12px; font-weight:600; }
+  /* 表格 */
+  table{ border-collapse:collapse; width:100%; margin:10px 0; font-size:13.5px; background:#fff; }
+  th{ background:var(--brand-50); color:var(--brand-700); text-align:left; padding:7px 10px; border:1px solid var(--brand-100); font-size:12.5px; }
+  td{ padding:7px 10px; border:1px solid var(--line); color:var(--ink-soft); vertical-align:top; }
+  .mono{ font-family:ui-monospace,Menlo,Consolas,monospace; font-size:12.5px; color:var(--brand-700); }
+  /* 日历格示意 */
+  .cal-cell{ width:120px; border:1px solid var(--line); border-radius:8px; background:#fff; padding:8px; }
+  .cal-cell .d{ font-size:11px; color:var(--ink-muted); display:flex; justify-content:space-between; }
+  .cal-cell .seat{ font-size:15px; font-weight:700; color:var(--green); }
+  .cal-cell .price{ font-size:11.5px; color:var(--ink-soft); }
+  .tag-ladder{ background:var(--brand-50); color:var(--brand-700); border-radius:4px; padding:0 4px; font-size:9.5px; font-weight:600; }
+  /* FAQ */
+  .faq{ border:1px solid var(--line); border-radius:10px; margin:10px 0; overflow:hidden; }
+  .faq .q{ background:var(--brand-50); padding:9px 14px; font-weight:700; color:var(--brand-700); font-size:14.5px; }
+  .faq .a{ padding:10px 14px; font-size:14px; color:var(--ink-soft); background:#fff; }
+  /* 打印 */
+  @media print{
+    body{ background:#fff; font-size:12.5px; }
+    .page{ max-width:100%; padding:0; }
+    h2{ page-break-after:avoid; margin-top:28px; }
+    .figure,.step,.faq,table{ page-break-inside:avoid; }
+    a{ color:inherit; text-decoration:none; }
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+<header class="cover">
+  <span class="brand">世途旅行 · 运营控制台</span>
+  <h1>票务岗操作说明（图文版）</h1>
+  <p>适用岗位：票务（航班/舱位维护 · 余位查看 · 切位 · 出票与开票标记 · 改期单 · PNR 提交表导出）</p>
+  <p>阅读对象：零基础同事 · 建议打印一份放手边 · 更新日期：2026-07-21</p>
+</header>
+
+<nav class="toc">
+  <h2>目录</h2>
+  <ol>
+    <li><a href="#s0">开始之前：登录与你会用到的页面</a></li>
+    <li><a href="#s1">航班与班期维护（航班管理页）</a></li>
+    <li><a href="#s2">座位统计：余位怎么看</a></li>
+    <li><a href="#s3">切位（包位）：现在只能看和回收</a></li>
+    <li><a href="#s4">订单页的票务视角：哪些单该出票</a></li>
+    <li><a href="#s5">六态开票：去程 / 回程 / 系统 怎么勾</a></li>
+    <li><a href="#s6">改期（改签）单怎么处理</a></li>
+    <li><a href="#s7">《票务专用》导出与 PNR 提交表</a></li>
+    <li><a href="#s8">🎫 票务开票导出：按出发日 / 航段 / 开票状态筛</a></li>
+    <li><a href="#s9">常见问题 FAQ</a></li>
+  </ol>
+</nav>
+
+<!-- ─────────────── 0 ─────────────── -->
+<h2 id="s0">〇、开始之前：登录与你会用到的页面</h2>
+<p>用浏览器打开 <span class="mono">http://47.83.249.163:8080/</span>（浏览器提示"不安全"时点"继续访问"，网址前面<strong>不要</strong>加 https 的 s），输入邮箱和密码登录。账号由管理员开通。</p>
+<div class="figure">
+  <div class="cap">图 0-1 · 左侧导航（票务岗常用的几项已高亮）</div>
+  <div class="mock-row" style="align-items:flex-start;">
+    <div class="sidebar">
+      <div class="grp">概览</div><div class="it">仪表盘</div>
+      <div class="grp">运营</div>
+      <div class="it on">订单</div>
+      <div class="it on">航班</div>
+      <div class="it on">座位统计</div>
+      <div class="it on">切位</div>
+      <div class="it">房控</div><div class="it">签证台</div><div class="it">提醒中心</div><div class="it on">工单看板</div>
+    </div>
+    <div style="flex:1; min-width:240px;">
+      <p style="font-size:13px;">票务岗每天主要在左边这 5 个页面来回：</p>
+      <ul style="font-size:13px;">
+        <li><strong>工单看板</strong>：筛"出票"类工单，先清红卡（出发 48 小时内还没完成的）。</li>
+        <li><strong>订单</strong>：找该出票的单、勾开票标记、导《票务专用》表。</li>
+        <li><strong>航班</strong>：看班次、班期、价格与库存。</li>
+        <li><strong>座位统计</strong>：一屏看所有班次余位。</li>
+        <li><strong>切位</strong>：查看/回收给代理锁的库存份额。</li>
+      </ul>
+    </div>
+  </div>
+</div>
+<div class="note"><strong>票务岗的一天（速查动线）：</strong>工单看板筛"出票"清红卡 → 订单页「🎫 票务开票导出」出 PNR 提交表 → 拿表去开票系统出票 → 回来把对应订单的开票开关翻成"已开"。</div>
+<div class="tip">有些按钮（如"+ 新建航班""+ 新班次""保存价格/容量""批量改价"）只有<strong>管理员账号</strong>能看到。你的账号里没有这些按钮属于正常，不是坏了；需要改价、加班次时找管理员操作。</div>
+
+<!-- ─────────────── 1 ─────────────── -->
+<h2 id="s1">一、航班与班期维护（航班管理页）</h2>
+<p>左侧导航点「航班」。这一页管所有自营航线：每条航线一张卡片，卡片里能翻看它的全部班次（班期）。</p>
+
+<h3>1.1 航线卡片上的按钮</h3>
+<div class="figure">
+  <div class="cap">图 1-1 · 航线卡片（点「查看班次」展开班期）</div>
+  <div class="mock">
+    <div class="mock-row">
+      <span style="background:var(--brand-50); color:var(--brand-700); font-weight:700; border-radius:6px; padding:2px 8px;">QH9588</span>
+      <span>澳门 → 岘港 · 机型：Airbus A321 · 共 62 个班次</span>
+    </div>
+    <div class="mock-row">
+      <span class="btn-s hl">查看班次</span>
+      <span class="btn-s">🧳 行李规则</span>
+      <span class="btn-s">🗑️ 批量删除班次</span>
+      <span class="btn-s">+ 新班次</span>
+      <span class="btn-p">📅 批量加班次</span>
+      <span class="btn-s">整线停售</span>
+    </div>
+  </div>
+  <div class="point">▲ 重点：日常先点「查看班次」。右边几个新建/停售按钮是管理员的；「批量删除班次」按出发日区间删，<strong>已经卖出座位的班次会自动跳过</strong>，删不掉。</div>
+</div>
+
+<h3>1.2 班次的两种看法：月历 和 列表</h3>
+<p>展开后默认是<strong>📅 月历</strong>视图：一天一格，一眼看整月的余位和价格；也可以切到<strong>📋 列表</strong>视图（可按月份或具体日期筛）。</p>
+<div class="figure">
+  <div class="cap">图 1-2 · 月历里的一个日期格（数字含义）</div>
+  <div class="mock-row">
+    <div class="cal-cell">
+      <div class="d"><span>18</span><span class="tag-ladder">阶梯</span></div>
+      <div class="seat" style="margin-top:4px;">● 37 <span style="font-size:10px; color:var(--ink-muted); font-weight:400;">余位</span></div>
+      <div class="price">¥800～880 <span style="color:var(--ink-muted);">在售2班</span></div>
+    </div>
+    <div class="cal-cell">
+      <div class="d"><span>19</span><span class="tag-ladder" style="background:#F1F5F9; color:#64748B;">固定价</span></div>
+      <div class="seat" style="color:var(--rose); margin-top:4px;">● 6 <span style="font-size:10px; color:var(--ink-muted); font-weight:400;">余位</span></div>
+      <div class="price" style="color:#94A3B8;">无在售</div>
+    </div>
+    <div style="flex:1; min-width:220px; font-size:13px;">
+      <ul>
+        <li><strong>余位数字</strong>：绿=充足，黄=偏紧，<span style="color:var(--rose); font-weight:700;">红=紧张</span>（按占容量比例判断）。</li>
+        <li><strong>价格</strong>：只统计"在售"班次的经济舱现价；多班在售显示最低～最高。</li>
+        <li><strong>阶梯 / 固定价</strong>：阶梯=分档卖，卖满一档自动跳下一档价；固定价=写多少卖多少。</li>
+        <li>格子右上有 <strong>✕</strong> = 当天班次全部已下架；显示"无在售" = 当天已售罄或已下架。</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<h3>1.3 点一个日期格：当天班次的操作面板</h3>
+<div class="figure">
+  <div class="cap">图 1-3 · 当天班次面板（票务岗最常用右下两个导出按钮）</div>
+  <div class="mock">
+    <div class="mock-row">
+      <strong>出发 10:30</strong><span style="color:var(--ink-muted);">· 到达 12:30</span>
+      <span class="badge-g">在售</span>
+    </div>
+    <div class="mock-row" style="font-size:12.5px; color:var(--ink-soft);">经济舱余位 <strong style="color:var(--green);">37</strong> / 150（已售 113）· 商务舱余位 <strong>5</strong> / 8（已售 3）</div>
+    <div class="mock-row" style="justify-content:flex-end;">
+      <span class="btn-s hl">📋 导出整班订单</span>
+      <span class="btn-s hl">📋 导出整班·全岗</span>
+      <span class="btn-s">下架</span>
+      <span class="btn-s">改时刻</span>
+      <span class="btn-p">保存价格/容量</span>
+    </div>
+  </div>
+  <div class="point">▲ 重点：「导出整班订单」= 该班次全部订单明细 xlsx；「导出整班·全岗」= 该班次的全岗名单（一行一乘客，带金额与票务/签证列）。核对某个班次名单时用它们最快。</div>
+</div>
+<ul>
+  <li><strong>售罄 vs 已下架，是两回事：</strong>「售罄」是余位卖完系统自动显示的，没有开关；「已下架」是人工点"下架"收起来的，前台买不到，调完价可"重新上架"。两个徽章可能同时出现。</li>
+  <li><strong>改容量</strong>不能低于已售张数；<strong>删除班次</strong>只有一张没卖出去时才可以，已有销售只能"下架"。</li>
+  <li><strong>改时刻</strong>（航司改点）：已售班次改点系统会先弹确认，确认影响面后再改。</li>
+  <li>改容量/价格后，前台余位显示<strong>立即</strong>跟着变。</li>
+</ul>
+
+<!-- ─────────────── 2 ─────────────── -->
+<h2 id="s2">二、座位统计：余位怎么看</h2>
+<p>左侧导航点「座位统计」。这是一个<strong>只读看板</strong>（不能改任何东西），默认显示未来 30 天所有班次。</p>
+<div class="figure">
+  <div class="cap">图 2-1 · 座位统计页（筛选 + 余位表）</div>
+  <div class="mock">
+    <div class="mock-row">
+      <span><span class="lbl">航班</span><span class="inp">全部航班 ▾</span></span>
+      <span><span class="lbl">出发日期 · 起始</span><span class="inp">2026-07-21</span></span>
+      <span><span class="lbl">出发日期 · 截止</span><span class="inp">2026-08-20</span></span>
+      <span class="btn-s">未来 30 天</span><span class="btn-s">刷新</span>
+    </div>
+    <table>
+      <tr><th>出发</th><th>航班 / 路线</th><th>舱位明细</th><th>总座位</th><th>已售</th><th>余票</th><th>占用率</th></tr>
+      <tr><td>7月25日<br><span style="font-size:11px; color:var(--ink-muted);">10:30 当地</span></td><td class="mono">QH9588<br><span style="color:var(--ink-muted); font-size:11px;">澳门 → 岘港</span></td><td style="font-size:12px;">经济舱: 113/150 ¥800<br>商务舱: 3/8 ¥3000</td><td>158</td><td>116</td><td><strong style="color:var(--green);">42</strong></td><td>73.4%</td></tr>
+      <tr><td>7月25日<br><span style="font-size:11px; color:var(--ink-muted);">13:30 当地</span></td><td class="mono">QH9589<br><span style="color:var(--ink-muted); font-size:11px;">岘港 → 澳门</span></td><td style="font-size:12px;">经济舱: 138/150 ¥820</td><td>150</td><td>138</td><td><strong style="color:var(--rose);">🔴 12</strong></td><td>92.0%</td></tr>
+    </table>
+  </div>
+  <div class="point">▲ 重点：<strong>余票少于 20 张会标红 🔴</strong>——看到红的，及时提醒管理员关注或调价。</div>
+</div>
+<div class="note"><strong>余票口径（记住这一条就够）：</strong>余票 = 舱位容量 − 已售 − 锁位中的座位。和前台客人看到的余量是同一套数字。排序规则：同一天里先显示澳门出发的去程，再显示回程。</div>
+
+<!-- ─────────────── 3 ─────────────── -->
+<h2 id="s3">三、切位（包位）：现在只能看和回收</h2>
+<p>左侧导航点「切位」。切位是把某班次的一部分座位"份额"锁给某个代理去卖，到期没卖完的座位收回来。</p>
+<div class="warn"><strong>⚠ 重要：新建切位目前已暂停。</strong>页面顶部有一条琥珀色提示——因为切位暂时没有真正锁住公共库存，切给代理的座位散客照样能买走。所以「+ 新建切位」和「📦 批量切位」两个按钮是灰的点不了，<strong>现阶段这一页只做两件事：查看存量切位、把过期的收回来</strong>。等系统补齐库存联动后才会重新放开新建。</div>
+<div class="figure">
+  <div class="cap">图 3-1 · 切位页（选班次 → 看明细 → 回收）</div>
+  <div class="mock">
+    <div class="mock-row">
+      <span><span class="lbl">出发日期</span><span class="inp">2026-07-25 ▾</span></span>
+      <span><span class="lbl">航班号</span><span class="inp">QH9588 · MFM → DAD ▾</span></span>
+      <span><span class="lbl">班次时刻</span><span class="inp">10:30 出发 ▾</span></span>
+      <span class="btn-s hl">一键回收过期切位</span>
+      <span class="btn-dis">📦 批量切位</span>
+      <span class="btn-dis">+ 新建切位</span>
+    </div>
+    <table>
+      <tr><th>代理</th><th>舱位</th><th>切位数</th><th>约定单价</th><th>回收条件</th><th>状态</th><th></th></tr>
+      <tr><td>某某国旅（2 级）</td><td>经济舱</td><td>20</td><td>¥750</td><td>出发前 7 天回收</td><td><span class="badge-r">已过期·待回收</span></td><td><span style="color:var(--rose); font-weight:600;" class="hl">回收</span></td></tr>
+      <tr><td>某某假期（1 级）</td><td>经济舱</td><td>15</td><td>常规售价</td><td>出发前 14 天回收</td><td><span class="badge-g">生效中</span></td><td style="color:var(--rose);">回收</td></tr>
+      <tr style="background:var(--green-bg);"><td>📦 散客池（公共可售）</td><td>经济舱</td><td>2</td><td>—</td><td>不回收</td><td>公共</td><td></td></tr>
+    </table>
+  </div>
+  <div class="point">▲ 重点：先用上面三个下拉定位到具体班次（出发日期 → 航班号 → 时刻），下面就是这个班次的切位账。橙底行 = 已到回收期还没收，点行尾「回收」，未售部分就归还散客池；懒得逐条点就用「一键回收过期切位」。</div>
+</div>
+<ul>
+  <li>页面中部还有各舱位的汇总卡：已切给代理几座、散客池还剩几座、已售几座，配色条一眼看占比。</li>
+  <li>每条切位有"出发前 N 天回收"的约定，到期后行会变橙提醒你回收。</li>
+  <li>回收只是把份额收回，<strong>不影响已经卖出去的座位</strong>。</li>
+</ul>
+
+<!-- ─────────────── 4 ─────────────── -->
+<h2 id="s4">四、订单页的票务视角：哪些单该出票</h2>
+<p>左侧导航点「订单」。订单从建立到收尾的状态流是：</p>
+<div class="figure">
+  <div class="cap">图 4-1 · 订单状态流（票务岗盯中间三步）</div>
+  <div class="mock-row" style="justify-content:center;">
+    <span class="badge-n">草稿</span>→<span class="badge-n">待付款</span>→<span class="badge-b hl">已付款</span>→<span class="badge-b hl">处理中</span>→<span class="badge-g hl">出票完成</span>→<span class="badge-n">已完成</span>
+  </div>
+  <p style="font-size:12.5px; color:var(--ink-muted); text-align:center;">旁路状态：已取消 / 支付超时 / 退款申请中 / 已退款 / 改签申请中 / 已改签 / 出票失败</p>
+  <div class="point">▲ 票务岗的口径：<strong>「已付款」「处理中」的含机票订单 = 该出票的单</strong>。在开票系统出完票后回来做两件事：① 把该单的开票开关翻"已开"（见第五节）；② 整单出完后把状态点成「出票完成」。</div>
+</div>
+
+<h3>4.1 怎么把该出票的单筛出来</h3>
+<div class="figure">
+  <div class="cap">图 4-2 · 筛选区（票务岗常用的四个筛选已高亮）</div>
+  <div class="mock">
+    <div class="mock-row">
+      <span><span class="lbl">状态</span><span class="inp">已付款 ▾</span></span>
+      <span><span class="lbl">出行日期（从）</span><span class="inp hl">2026-07-25</span></span>
+      <span><span class="lbl">出行日期（到）</span><span class="inp hl">2026-07-25</span></span>
+      <span><span class="lbl">航班号</span><span class="inp hl">QH9588</span></span>
+      <span><span class="lbl">开票筛选</span><span class="inp hl">去程未开 ▾</span></span>
+      <span><span class="lbl">乘客姓名</span><span class="inp">模糊匹配</span></span>
+    </div>
+  </div>
+  <div class="point">▲ 最常用的组合：「出行日期 = 某一天」+「开票筛选 = 去程未开」→ 这天该出票还没出的单全出来了。选完日期点日期框下面的小字「只看某一天」，就是只看当天。</div>
+</div>
+<ul>
+  <li><strong>开票筛选</strong>有六个档：去程未开 / 去程已开 / 回程未开 / 回程已开 / 系统未开 / 系统已开。</li>
+  <li>出行日期两个框各自独立：只填"从" = 那天起的全部；只填"到" = 那天及以前的全部；都填 = 区间。</li>
+  <li>筛完的结果和导出是一致的——<strong>列表里看到几条，导出就是这几条</strong>。</li>
+</ul>
+
+<h3>4.2 列表上直接能看的票务信息</h3>
+<div class="figure">
+  <div class="cap">图 4-3 · 订单列表行（「开票」列三个小点）</div>
+  <div class="mock">
+    <table>
+      <tr><th></th><th>订单号</th><th>乘客</th><th>航班</th><th>尾款</th><th>开票</th></tr>
+      <tr><td>☑</td><td class="mono">FTM20260721001</td><td>张三 等2人</td><td class="mono">QH9588 ⇌ QH9589</td><td><span class="badge-g">已结清</span></td><td><span class="dot-on">去✓</span> <span class="dot-off hl">回✗</span> <span class="dot-off">系✗</span></td></tr>
+      <tr><td>☐</td><td class="mono">FTM20260721002</td><td>李四</td><td class="mono">QH9588</td><td><span class="badge-a">欠 ¥800</span></td><td><span class="dot-off">去✗</span> <span class="dot-off">系✗</span></td></tr>
+    </table>
+  </div>
+  <div class="point">▲ 「开票」列：去=去程、回=回程、系=系统开票；✓绿=已开、✗灰=未开。<strong>单程订单没有"回"点</strong>。这里只能看，要改去订单详情里点（下一节）。尾款列：琥珀=还欠钱、绿=结清、蓝=多付。</div>
+</div>
+<div class="tip">点任意一行打开<strong>订单详情抽屉</strong>。看到没人负责的新单，可以点「🙋 我来接单」把跟单责任认领到自己名下，避免两个人重复出票或没人管。</div>
+
+<!-- ─────────────── 5 ─────────────── -->
+<h2 id="s5">五、六态开票：去程 / 回程 / 系统 怎么勾</h2>
+<p>每张订单有三个<strong>互相独立</strong>的开票开关：<strong>去程、回程、系统</strong>。每个开关有"已开 / 未开"两种状态，所以叫"六态"。出一段票就翻一段的开关，实事求是。</p>
+
+<h3>5.1 在订单详情里翻开关</h3>
+<div class="steps">
+  <div class="step">在订单列表点开要操作的订单，详情抽屉里靠上的位置有「开票」区。</div>
+  <div class="step">出完哪一段的票，就点哪一段的按钮：去程出了点「去程」、回程出了点「回程」。「系统」开关表示在开票系统里的整体开票动作，按你们的对账口径勾。</div>
+  <div class="step">点一下 = 翻转一次（未开→已开，或已开→未开）。点错了再点一下就翻回去。</div>
+</div>
+<div class="figure">
+  <div class="cap">图 5-1 · 详情抽屉「开票」区（往返订单显示三个开关；单程只有去程+系统）</div>
+  <div class="mock">
+    <div style="font-size:11px; color:var(--ink-muted); letter-spacing:.1em; margin-bottom:8px;">开票</div>
+    <div class="mock-row">
+      <span class="switch-on hl"><i></i>去程：已开</span>
+      <span class="switch-off hl"><i></i>回程：未开</span>
+      <span class="switch-off"><i></i>系统：未开</span>
+    </div>
+    <p style="font-size:11.5px; color:var(--ink-muted); margin-top:6px;">去程 / 回程按航段分别开票；翻为「已开」时会校验该班次开票上限。</p>
+  </div>
+</div>
+
+<h3>5.2 去程 / 回程是怎么认定的？</h3>
+<p>不用你判断——系统把订单里的机票段按<strong>出发时间先后排序</strong>：<strong>飞得早的那段是去程，第二段是回程</strong>。只有一段机票就是单程，只显示去程开关。</p>
+
+<h3>5.3 翻"已开"时系统会把三道关</h3>
+<table>
+  <tr><th>拦截情形</th><th>系统提示的意思</th><th>你该怎么办</th></tr>
+  <tr><td><strong>超班次开票上限</strong></td><td>「该班次已开票 N 张，座位库存共 M 张，无法继续开票」。上限 = 该班次<strong>各舱位容量之和</strong>（商务+经济），等于这班机真实能卖的座位数。</td><td>先核对是不是重复标了；确实要放宽找管理员调该班次的舱位容量。</td></tr>
+  <tr><td>订单已取消 / 已退款 / 支付超时 / 草稿</td><td>这种状态的单不占开票额度，也不允许标开票，避免账目失真。</td><td>如确需开票，先让运营把订单恢复到有效状态（如已付款/处理中）。</td></tr>
+  <tr><td>订单在回收站（已删除）</td><td>回收站里的单不能标开票。</td><td>找管理员先「恢复」订单。</td></tr>
+</table>
+<div class="note"><strong>上限计数的两个贴心口径（不用你操作，系统自动算）：</strong>① 婴儿票"有票无座"，<strong>不占</strong>开票额度；② 同一位客人（同一个证件号）在同一班次上有两张单，也只占 <strong>1</strong> 个座，不会重复扣额度。翻回"未开"永远不拦——纠错随时可以。</div>
+
+<h3>5.4 批量开票：一次给一批单打标记</h3>
+<div class="figure">
+  <div class="cap">图 5-2 · 勾选多单后出现的批量工具条（右侧「批量开票」）</div>
+  <div class="mock">
+    <div class="mock-row">
+      <strong>已选 12 条订单</strong><span style="color:#CBD5E1;">|</span>
+      <span>批量开票：</span><span class="inp hl">去程标已开 ▾</span>
+      <span class="btn-p hl">应用到 12 条</span>
+    </div>
+  </div>
+  <div class="point">▲ 下拉有六个选项：去程标已开 / 去程标未开 / 回程标已开 / 回程标未开 / 系统标已开 / 系统标未开。逐单执行，<strong>某一单超上限只有它自己失败</strong>（失败原因会列出来），其他单照常成功。</div>
+</div>
+<div class="warn">批量改状态的下拉里<strong>故意没有「出票完成」</strong>：批量只做去程/回程这类航段级标记；整单"出票完成"这个终态请逐单进详情确认后再点，防止一把梭把没出完票的单也标成完成。</div>
+
+<!-- ─────────────── 6 ─────────────── -->
+<h2 id="s6">六、改期（改签）单怎么处理</h2>
+<p>客人在前台申请改签后，订单状态会变成<strong>「改签申请中」</strong>（提醒中心也会出现对应待办）。票务岗联系确认后，在订单详情里实际执行改期。</p>
+<div class="steps">
+  <div class="step">在订单列表用状态筛「改签申请中」找到单子，点开详情。</div>
+  <div class="step">找到「产品内容」（套餐单点开「金额明细」折叠区），在<strong>机票行</strong>右侧点「改期」。</div>
+  <div class="step">在改期表单里依次选：<strong>航班 → 新班次 → 新舱位（不换就选"沿用原舱位"）</strong>；要收改期费就填金额（会自动计入订单尾款），可加备注（如"客户主动改期 / 航变"）。</div>
+  <div class="step">点「确认改期」。座位会自动从原班次挪到新班次；<strong>新班次售罄会被系统拒绝</strong>，需另选班次。</div>
+  <div class="step">改完后把订单状态点成「标记已改签」；如果和客人确认不改了，点「驳回改签（回退出票）」把状态退回去。</div>
+</div>
+<div class="figure">
+  <div class="cap">图 6-1 · 机票行的改期表单</div>
+  <div class="mock" style="max-width:420px;">
+    <div style="color:var(--brand); font-weight:600; font-size:13px;">改期 · 当前：QH9588 澳门→岘港 · 经济舱</div>
+    <div class="mock-row"><span style="width:100%;"><span class="lbl">选航班</span><span class="inp" style="width:100%;">QH9588 · MFM→DAD ▾</span></span></div>
+    <div class="mock-row"><span style="width:100%;"><span class="lbl">新班次</span><span class="inp hl" style="width:100%;">7月28日 10:30 ▾</span></span></div>
+    <div class="mock-row"><span style="width:100%;"><span class="lbl">新舱位（可选）</span><span class="inp" style="width:100%;">沿用原舱位 ▾</span></span></div>
+    <div class="mock-row"><span style="width:100%;"><span class="lbl">改期费（¥，可选）</span><span class="inp" style="width:100%;">不收改期费则留空</span></span></div>
+    <div class="mock-row"><span class="btn-p">确认改期</span><span class="btn-s">取消</span></div>
+  </div>
+</div>
+<ul>
+  <li><strong>航变</strong>（航司改班）导致换过班次的机票行，会带一个红色「✈ 航变」小标，鼠标悬上去能看到"原班次 → 新班次"。</li>
+  <li>改期后如果票要重出：先把老票对应的开票开关翻回"未开"，出完新票再翻"已开"，账才对得上。</li>
+  <li>换乘机人（详情里编辑出行人）时，表单里有「重置开票状态（开票 → 未开）」勾选项——换了人票作废重出的，记得勾上。</li>
+</ul>
+
+<!-- ─────────────── 7 ─────────────── -->
+<h2 id="s7">七、《票务专用》导出与 PNR 提交表</h2>
+<p>把乘客名单按航司要求的格式导成 Excel，拿去开票系统提交，共有两个入口：</p>
+
+<h3>7.1 入口一：单笔订单——详情里的「运营工具」</h3>
+<div class="figure">
+  <div class="cap">图 7-1 · 订单详情底部「运营工具」区</div>
+  <div class="mock">
+    <div class="mock-row" style="justify-content:space-between;">
+      <strong style="color:var(--brand); font-size:13px;">运营工具</strong>
+      <span class="btn-s" style="background:#F59E0B; color:#fff; border:none;">🙋 我来接单</span>
+    </div>
+    <div class="mock-row">
+      <span class="btn-s hl" style="background:#2563EB; color:#fff; border:none;">📄 导出 PNR Excel</span>
+      <span class="btn-s" style="background:#059669; color:#fff; border:none;">📦 打包护照图片</span>
+    </div>
+  </div>
+  <div class="point">▲ 「导出 PNR Excel」= 只导这一单的乘客，25 列航司格式，文件名如 <span class="mono">PNR_FTM20260721001.xlsx</span>。「打包护照图片」把本单乘客护照照片打成 zip，方便核对。</div>
+</div>
+
+<h3>7.2 入口二：批量——列表顶部的「模板导出」选《票务专用》</h3>
+<p>先按第四节的方法筛选（或直接勾选订单），再在列表上方的模板导出里选<strong>《票务专用》</strong>。规则：</p>
+<ul>
+  <li><strong>勾选了订单 → 只导勾选的这些</strong>（忽略筛选条件）；没勾选 → 按当前筛选条件导出。</li>
+  <li>《票务专用》共 27 列 = <strong>代理、备注</strong> 两列 + 后面 25 列航司 PNR 格式，一行一位乘客。</li>
+  <li>只会导出<strong>含机票的订单</strong>；已取消 / 已退款 / 支付超时 / 出票失败 / 草稿的订单<strong>不会</strong>进表。</li>
+  <li>文件名如 <span class="mono">订单导出_票务专用_2026-07-21.xlsx</span>。</li>
+</ul>
+
+<h3>7.3 表里的姓名为什么带 MR / MS / MSTR / MISS？</h3>
+<p>这是<strong>航司要求的称谓</strong>，系统按乘客<strong>在出发那天的实足年龄</strong>自动算出来，不用手填：</p>
+<table>
+  <tr><th>出发日年龄</th><th>类型（PTC 列）</th><th>男</th><th>女</th></tr>
+  <tr><td>满 12 岁及以上（或没录生日）</td><td>成人 ADT</td><td><strong>MR</strong></td><td><strong>MS</strong></td></tr>
+  <tr><td>满 2 岁、不满 12 岁</td><td>儿童 CHD</td><td><strong>MSTR</strong></td><td><strong>MISS</strong></td></tr>
+  <tr><td>不满 2 岁</td><td>婴儿 INF</td><td><strong>MSTR</strong></td><td><strong>MISS</strong></td></tr>
+</table>
+<ul>
+  <li>"出发那天"取订单里<strong>最早起飞的那段机票</strong>的出发日（即去程日）。所以同一个孩子，出行晚一年可能就从儿童变成人——这是按航司口径算的，不是错。</li>
+  <li>如果订单里手工录过称谓，以手录的为准；没录性别的乘客不加称谓。</li>
+  <li>没录生日的乘客按成人处理——所以<strong>提交前请补齐生日</strong>，称谓和婴童类型才准。</li>
+</ul>
+<div class="figure">
+  <div class="cap">图 7-2 · 《票务专用》表头节选（前几列）与示例行</div>
+  <div style="overflow-x:auto;">
+    <table style="font-size:12px; white-space:nowrap;">
+      <tr><th>代理</th><th>备注</th><th>Last Name</th><th>First Name and Middle Name</th><th>Title</th><th>PTC</th><th>Gender</th><th>Date of Birth</th><th>Passport Number</th><th>…</th></tr>
+      <tr><td>某某国旅</td><td>靠窗</td><td>ZHANG</td><td>SAN</td><td class="hl">MR</td><td>ADT</td><td>M</td><td>24Oct95</td><td>E12345678</td><td>…</td></tr>
+      <tr><td>某某国旅</td><td></td><td>ZHANG</td><td>XIAOBAO</td><td class="hl">MSTR</td><td>CHD</td><td>M</td><td>03Mar19</td><td>E87654321</td><td>…</td></tr>
+    </table>
+  </div>
+  <div class="point">▲ 25 列 PNR 格式还包括：护照姓名 / 护照号 / 国籍（三字码）/ 签发地 / 护照有效期 / 签证信息 / 地址等。日期一律是航司格式（如 24Oct95）。姓名自动转大写、按"姓/名"拆开。</div>
+</div>
+
+<!-- ─────────────── 8 ─────────────── -->
+<h2 id="s8">八、🎫 票务开票导出：按出发日 / 航段 / 开票状态筛</h2>
+<p>这是给票务岗的<strong>一键快捷入口</strong>——"某天某个方向、还没开票的单，直接出一张 PNR 提交表"。每天导出核对一次，配合班次开票上限把关。</p>
+<div class="steps">
+  <div class="step">订单页顶部点「🎫 票务开票导出」按钮，展开浅蓝色面板。</div>
+  <div class="step">选<strong>出发日期</strong>（必填）→ 选<strong>航段</strong>（去程 / 回程）→ 选<strong>开票状态</strong>（默认"未开"）。需要的话再用<strong>航班号</strong>、<strong>订单类型</strong>（全部 / 仅机票单 / 仅套餐单）收窄范围。</div>
+  <div class="step">看面板下方的<strong>匹配预览</strong>："匹配 N 条 + 订单号"。数字对得上再导，导出前就能发现筛多了还是筛少了。</div>
+  <div class="step">点「📤 一键导出」，得到一份《票务专用》（27 列，含航司 PNR 格式）xlsx。</div>
+  <div class="step">出完票回来，把这批订单的对应航段开关翻成"已开"（可用第五节的批量开票）。明天再筛"未开"时它们就不会再出现。</div>
+</div>
+<div class="figure">
+  <div class="cap">图 8-1 · 票务开票导出面板</div>
+  <div class="mock" style="background:var(--sky-bg); border-color:var(--sky-line);">
+    <div class="mock-row">
+      <span><span class="lbl">出发日期（必填）</span><span class="inp hl">2026-07-25</span></span>
+      <span><span class="lbl">航段</span><span class="inp hl">去程 ▾</span></span>
+      <span><span class="lbl">开票状态</span><span class="inp hl">未开 ▾</span></span>
+      <span><span class="lbl">航班号（选填）</span><span class="inp">如 QH9588</span></span>
+      <span><span class="lbl">订单类型</span><span class="inp">全部 ▾</span></span>
+      <span class="btn-p">📤 一键导出</span>
+    </div>
+    <p style="font-size:12px; color:var(--brand-700); margin-top:6px;"><strong>匹配 3 条</strong> <span style="color:var(--ink-muted);">FTM20260721001、FTM20260721002、FTM20260721005</span></p>
+  </div>
+  <div class="point">▲ 如果列表里<strong>已勾选</strong>了订单，这个按钮会变成「一键导出（已选 N 条）」——只导勾选的，面板里的日期/航段筛选此时不生效；取消勾选就恢复按筛选导出。</div>
+</div>
+<div class="note"><strong>"航段 + 开票状态"是什么意思：</strong>选"去程 + 未开" = 这天出发、去程票还没标"已开"的订单；选"回程 + 未开" = 这天出发、回程票还没标的。它和订单详情里的开票开关是同一套标记——所以<strong>出完票及时翻开关</strong>，第二天的导出才干净。</div>
+
+<!-- ─────────────── 9 ─────────────── -->
+<h2 id="s9">九、常见问题 FAQ</h2>
+
+<div class="faq"><div class="q">Q1：乘客姓名后面的 MR / MS / MSTR / MISS 是哪来的？能改吗？</div>
+<div class="a">航司要求的称谓，系统按"出发日 − 出生日期"的实足年龄自动派生：成人男 MR、成人女 MS、儿童/婴儿男 MSTR、女 MISS（详见第七节表格）。一般不用改；个别乘客有特殊要求时，在订单里手工录入称谓，导出会优先用手录的。</div></div>
+
+<div class="faq"><div class="q">Q2：点"已开"报错「无法继续开票」怎么办？</div>
+<div class="a">说明这个班次按航段统计的已开票座位数已达上限。上限不是拍脑袋的数字，就是这个班次<strong>各舱位容量之和</strong>（能卖多少座就能开多少票）。先核对是否重复标记；确实要放宽，请管理员调整该班次的舱位容量。另外婴儿不占额度、同一证件号跨订单只占一个座——这些系统都自动处理了。</div></div>
+
+<div class="faq"><div class="q">Q3：已取消的订单为什么不让标开票？</div>
+<div class="a">已取消 / 已退款 / 支付超时 / 草稿以及回收站里的订单不占班次开票额度，标了标记也不计数，只会让导出和财务的账变乱，所以系统直接拦住。确需开票，先让运营把订单恢复到有效状态（如已付款/处理中）。反过来，把"已开"翻回"未开"任何时候都不拦。</div></div>
+
+<div class="faq"><div class="q">Q4：「售罄」和「已下架」有什么区别？</div>
+<div class="a">「售罄」是余位卖完系统自动显示的，没有任何开关；「已下架」是人工把班次收起来（前台不可售），调完价可以"重新上架"。一个班次可能又售罄又被下架，两个徽章同时出现是正常的。</div></div>
+
+<div class="faq"><div class="q">Q5：切位页的「新建切位」按钮为什么是灰的？</div>
+<div class="a">故意的，不是坏了。切位暂时没有真正锁住公共库存（切给代理的座散客照样能买），为避免超卖已暂停新建。现阶段这一页只用来查看存量和回收过期切位，请勿把切位余量当成可承诺的库存。</div></div>
+
+<div class="faq"><div class="q">Q6：批量改状态里为什么没有「出票完成」？</div>
+<div class="a">故意的。批量场景只放开"去程/回程/系统标已开（未开）"这类航段级标记（用旁边的「批量开票」下拉）；整单"出票完成"是终态，请逐单进详情确认后再点，防止把没出完票的单一起标成完成。</div></div>
+
+<div class="faq"><div class="q">Q7：导出的《票务专用》表里为什么少了几张单？</div>
+<div class="a">三种正常情况：① 该模板只导<strong>含机票</strong>的订单，纯酒店/纯签证单不进表；② 已取消/已退款/支付超时/出票失败/草稿的订单一律不导；③ 列表里勾选了订单时，导出只包含勾选的那几条（提示条会写明），取消勾选即恢复按筛选导出。</div></div>
+
+<div class="faq"><div class="q">Q8：改期后座位和票怎么处理？</div>
+<div class="a">在详情的机票行点「改期」选新班次确认后，座位自动从原班次挪到新班次（新班次售罄会被拒）；改期费填了会计入订单尾款。票要重出的：先把原航段开票开关翻回"未开"，新票出完再翻"已开"。最后记得把订单状态点成「标记已改签」。</div></div>
+
+<div class="faq"><div class="q">Q9：我看不到"改价 / 新班次 / 保存价格"这些按钮？</div>
+<div class="a">这些操作只对管理员账号开放，票务岗账号看不到是权限设计，不是故障。需要调价、改容量、加班次时，把班次和目标价报给管理员处理；改完立即生效，前台余位显示实时更新。</div></div>
+
+<div class="faq"><div class="q">Q10：座位统计的"余票"和前台客人看到的一样吗？</div>
+<div class="a">同一套数字：余票 = 容量 − 已售 − 锁位。区别只在展示方式——后台给你看精确张数，前台对客人只显示"充足/紧张/少量"这类档位，不露具体数字。余票少于 20 会标红 🔴，看到红的及时关注。</div></div>
+
+<div class="faq"><div class="q">Q11：每天下班前，票务岗要核对什么？</div>
+<div class="a">用「🎫 票务开票导出」把当天/近几天出发的"未开"单导出来过一遍：该出的票是否都出了、开关是否都翻了；再瞄一眼各班次开票数有没有贴近上限的异常。工单看板上"出票"类的红卡（出发 48 小时内未完成）必须当天清零。</div></div>
+
+<p style="margin-top:40px; padding-top:16px; border-top:1px solid var(--line); font-size:12.5px; color:var(--ink-muted);">本说明与控制台当前版本功能一致；界面示意图为简化画法，以实际页面为准。操作中遇到与本说明不符的情况，请先截图反馈给运营，不要凭感觉重复点击。</p>
+
+</div>
+</body>
+</html>

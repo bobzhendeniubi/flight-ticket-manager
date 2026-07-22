@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>后台使用反馈表 · 世途旅行运营控制台</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  body {
+    font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Inter", system-ui, sans-serif;
+    background: #f6f7fb; color: #1f2437; line-height: 1.75; font-size: 14px;
+  }
+  .page { max-width: 840px; margin: 0 auto; padding: 28px 24px 48px; }
+  .cover {
+    background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+    border-radius: 14px; color: #fff; padding: 34px 36px; margin-bottom: 22px;
+  }
+  .cover .tag {
+    display: inline-block; background: rgba(255,255,255,.16); border: 1px solid rgba(255,255,255,.35);
+    border-radius: 999px; padding: 3px 14px; font-size: 12px; letter-spacing: 1px; margin-bottom: 14px;
+  }
+  .cover h1 { font-size: 30px; letter-spacing: 1px; margin-bottom: 10px; }
+  .cover p { color: rgba(255,255,255,.92); font-size: 13.5px; }
+  .cover b { color: #fff; }
+  .card {
+    background: #fff; border: 1px solid #e6e8f0; border-radius: 12px;
+    padding: 22px 26px; margin-bottom: 18px;
+  }
+  h2 {
+    font-size: 18px; color: #1f2437; margin-bottom: 12px;
+    padding-left: 10px; border-left: 4px solid #4f46e5;
+  }
+  .steps { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 4px; }
+  .step {
+    flex: 1 1 150px; background: #f4f5ff; border: 1px solid #e0e3ff; border-radius: 10px;
+    padding: 10px 12px; font-size: 13px;
+  }
+  .step .no {
+    display: inline-flex; width: 20px; height: 20px; border-radius: 50%; background: #4f46e5; color: #fff;
+    align-items: center; justify-content: center; font-size: 12px; font-weight: 700; margin-right: 6px;
+  }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+  th, td { border: 1px solid #d9dcea; padding: 8px 10px; font-size: 13px; vertical-align: top; }
+  th { background: #eef0ff; color: #333a56; font-weight: 600; text-align: left; white-space: nowrap; }
+  td.blank { height: 46px; }
+  .example td { background: #fbfbfe; color: #6b7194; }
+  .muted { color: #6b7194; font-size: 12.5px; }
+  .pill { display: inline-block; border-radius: 999px; padding: 1px 10px; font-size: 12px; font-weight: 600; margin-right: 6px; white-space: nowrap; }
+  .p-red { background: #fde8e8; color: #c0392b; }
+  .p-yellow { background: #fff4d6; color: #9a6b00; }
+  .p-green { background: #e5f7ec; color: #1e7a44; }
+  .tip {
+    background: #fffbea; border-left: 4px solid #f0b429; border-radius: 8px;
+    padding: 10px 14px; font-size: 13px; margin-top: 12px;
+  }
+  .info-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 24px; margin-top: 4px; }
+  .info-item { border-bottom: 1px dashed #c9cde0; padding: 7px 2px; font-size: 13.5px; }
+  .info-item b { color: #333a56; margin-right: 8px; }
+  .shots { border: 2px dashed #c9cde0; border-radius: 10px; min-height: 150px; padding: 12px 14px; color: #9aa0bb; font-size: 13px; margin-top: 8px; }
+  .foot { text-align: center; color: #9aa0bb; font-size: 12px; margin-top: 10px; }
+  @media print {
+    body { background: #fff; }
+    .page { padding: 0; max-width: none; }
+    .card { break-inside: avoid; }
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <div class="cover">
+    <span class="tag">内部反馈 · 一个问题一行</span>
+    <h1>后台使用反馈表</h1>
+    <p>世途旅行 · 运营控制台（后台）｜配合《岗位操作说明》使用</p>
+    <p style="margin-top:10px">用着<b>不顺手的、卡住的、看不懂的、想要的</b>，都往这张表里记。
+    不用懂技术，大白话写「在哪个页面 → 想干嘛 → 实际怎样」就行，越具体修得越快。</p>
+  </div>
+
+  <div class="card">
+    <h2>怎么用（30 秒）</h2>
+    <div class="steps">
+      <div class="step"><span class="no">1</span>遇到问题先<b>截图</b>（连页面顶部一起截）</div>
+      <div class="step"><span class="no">2</span>在下表<b>一个问题写一行</b>，写清订单号更好</div>
+      <div class="step"><span class="no">3</span>攒几条就<b>发回群里</b>，不用等填满</div>
+      <div class="step"><span class="no">4</span>「用不了」级别的<b>别攒，当场发</b></div>
+    </div>
+    <div class="tip">💡 分不清是不是自己操作的问题？照样记——「不会用」本身就是最有价值的反馈，我们会补文档或改页面。</div>
+  </div>
+
+  <div class="card">
+    <h2>你的信息（填一次）</h2>
+    <div class="info-grid">
+      <div class="info-item"><b>称呼</b>＿＿＿＿＿＿＿＿</div>
+      <div class="info-item"><b>岗位</b>运营录单 / 票务 / 签证 / 财务 / 房控 / 其他＿＿＿</div>
+      <div class="info-item"><b>日期</b>＿＿＿＿年＿＿月＿＿日</div>
+      <div class="info-item"><b>设备</b>电脑-Chrome / 电脑-其他浏览器 / 手机</div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>反馈记录（一个问题一行）</h2>
+    <p class="muted">影响程度：
+      <span class="pill p-red">用不了</span>这一步彻底卡死，活干不下去
+      <span class="pill p-yellow">绕得开</span>能干活但很别扭/费时间
+      <span class="pill p-green">小建议</span>不影响干活，改了更好
+    </p>
+    <table>
+      <tr>
+        <th style="width:26px">#</th>
+        <th style="width:150px">在哪个页面 / 哪一步</th>
+        <th>想干嘛 → 实际怎样（大白话）</th>
+        <th style="width:110px">订单号/航班号<br>（有就填）</th>
+        <th style="width:66px">影响程度</th>
+        <th style="width:56px">出现<br>频率</th>
+      </tr>
+      <tr class="example">
+        <td>例</td>
+        <td>订单管理 · 导出</td>
+        <td>想导一份带酒店信息的名单给酒店，点了「导出」选《全岗可用》，打开酒店那列是空的</td>
+        <td>FTM2026xxxxx</td>
+        <td>绕得开</td>
+        <td>每次</td>
+      </tr>
+      <tr><td>1</td><td class="blank"></td><td class="blank"></td><td class="blank"></td><td class="blank"></td><td class="blank"></td></tr>
+      <tr><td>2</td><td class="blank"></td><td class="blank"></td><td class="blank"></td><td class="blank"></td><td class="blank"></td></tr>
+      <tr><td>3</td><td class="blank"></td><td class="blank"></td><td class="blank"></td><td class="blank"></td><td class="blank"></td></tr>
+      <tr><td>4</td><td class="blank"></td><td class="blank"></td><td class="blank"></td><td class="blank"></td><td class="blank"></td></tr>
+      <tr><td>5</td><td class="blank"></td><td class="blank"></td><td class="blank"></td><td class="blank"></td><td class="blank"></td></tr>
+      <tr><td>6</td><td class="blank"></td><td class="blank"></td><td class="blank"></td><td class="blank"></td><td class="blank"></td></tr>
+      <tr><td>7</td><td class="blank"></td><td class="blank"></td><td class="blank"></td><td class="blank"></td><td class="blank"></td></tr>
+      <tr><td>8</td><td class="blank"></td><td class="blank"></td><td class="blank"></td><td class="blank"></td><td class="blank"></td></tr>
+    </table>
+    <p class="muted" style="margin-top:6px">行数不够？复制一行接着加；用 Excel 版的直接往下填。</p>
+  </div>
+
+  <div class="card">
+    <h2>截图区</h2>
+    <div class="shots">把截图贴在这里（标一下对应上面第几条）；微信直接发群里也行，说一句"对应第 N 条"。</div>
+  </div>
+
+  <div class="card">
+    <h2>最后三个小问题（随便答）</h2>
+    <p>1. 和老办法（手工台账/微信接龙）比，<b>最省事</b>的地方是？</p>
+    <p style="border-bottom:1px dashed #c9cde0; height:30px"></p>
+    <p style="margin-top:10px">2. <b>最不习惯 / 最想改</b>的一个地方是？</p>
+    <p style="border-bottom:1px dashed #c9cde0; height:30px"></p>
+    <p style="margin-top:10px">3. 有没有哪件事系统里<b>还做不了</b>、你还得靠线下表格？</p>
+    <p style="border-bottom:1px dashed #c9cde0; height:30px"></p>
+  </div>
+
+  <div class="foot">世途旅行 · 运营控制台 内部反馈表 ｜ 配套文档：《运营录单 / 票务 / 签证 / 财务 / 房控 岗位操作说明》</div>
+</div>
+</body>
+</html>

@@ -29,7 +29,7 @@ import type { BundleItemJson } from '../../lib/json-types.js';
 import { docKey } from '../travelers/traveler-profiles.aggregate.js';
 import { toAlpha3 } from './nationality.js';
 import { parseRoomGroups } from './orders.export-room-allocation.js';
-import { nameWithTitle } from './orders.export-templates.js';
+import { nameWithTitle, pnrName, VISA_REQUIREMENT_LABEL } from './orders.export-templates.js';
 import { buildOrderFilterWhere } from './orders.service.js';
 import { determineFlightLegs } from './ticketing-cap.js';
 
@@ -74,13 +74,7 @@ const FULFILLMENT_STATUS_LABEL: Record<string, string> = {
   FAILED: '失败',
 };
 
-/** 订单级签证状态（录单时选择，与履约任务状态区分）。*/
-const VISA_REQUIREMENT_LABEL: Record<string, string> = {
-  NOT_NEEDED: '不需要',
-  NEEDED: '需要',
-  E_VISA: '电子签',
-  HAS_VISA: '已签证',
-};
+// 注：订单级签证状态标签表（VISA_REQUIREMENT_LABEL）与三模板导出共用，见 orders.export-templates.ts。
 
 const PASSENGER_TYPE_LABEL: Record<string, string> = {
   ADULT: '成人',
@@ -146,7 +140,8 @@ export interface MasterRow {
   notes: string;
   hotelName: string; // 酒店中文名称（hotelRoomType.hotel.name 去重）
   chineseName: string;
-  passengerName: string; // 拼音/PNR：LAST/FIRST
+  passengerName: string; // 拼音/PNR：LAST/FIRST + 称谓（航司口径）
+  cleanName: string; // 纯拼音名 LAST/FIRST（无 MR/MS 称谓）— 财务对数/名单匹配用
   // 常旅客历史飞行次数（TravelerProfile.tripCount 快照）：按证件号归拢、只计去程已起飞的行程。
   // 每位乘客各不相同；匹配不到档案 → 留空。与本单航段数无关。
   flightCount: string;
@@ -201,6 +196,7 @@ const MASTER_COLUMNS: MasterColumn[] = [
   { header: '酒店中文名称', key: 'hotelName', width: 20, roles: ['all', 'visa'] },
   { header: '乘客中文名', key: 'chineseName', width: 12 },
   { header: '乘客拼音名', key: 'passengerName', width: 18 },
+  { header: '纯拼音名', key: 'cleanName', width: 16 },
   {
     header: '飞行次数',
     key: 'flightCount',
@@ -577,6 +573,7 @@ export function orderToMasterRows(
       chineseName: p.chineseName ?? p.fullName,
       // 称谓（MR/MS/MSTR/MISS）按订单去程（最早 FLIGHT 行出发时间，legs 已按出发时间排序）派生年龄。
       passengerName: nameWithTitle(p, legs[0]?.departureTime ?? null),
+      cleanName: pnrName(p),
       flightCount: tripCount === undefined ? '' : String(tripCount),
       travelDates,
       flightNumbers,

@@ -1,0 +1,472 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>财务岗操作说明 · 世途旅行运营控制台</title>
+<style>
+  :root{
+    --brand:#4F46E5; --brand-dark:#4338CA; --brand-50:#EEF2FF; --brand-100:#E0E7FF;
+    --ink:#0F172A; --ink-soft:#334155; --ink-muted:#64748B;
+    --bg:#F8FAFC; --card:#FFFFFF; --line:#E2E8F0;
+    --amber:#B45309; --amber-bg:#FEF3C7; --amber-line:#FDE68A;
+    --green:#047857; --green-bg:#D1FAE5; --green-line:#A7F3D0;
+    --blue:#1D4ED8; --blue-bg:#DBEAFE; --blue-line:#BFDBFE;
+    --rose:#BE123C; --rose-bg:#FFE4E6; --rose-line:#FECDD3;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  body{font-family:"Inter","PingFang SC","Microsoft YaHei","Hiragino Sans GB",sans-serif; color:var(--ink); background:var(--bg); line-height:1.75; font-size:15px;}
+  .page{max-width:880px; margin:0 auto; padding:32px 24px 80px;}
+  /* ── 封面 ── */
+  .cover{background:linear-gradient(135deg,var(--brand) 0%,#6D28D9 100%); color:#fff; border-radius:16px; padding:40px 36px; margin-bottom:28px;}
+  .cover .tag{display:inline-block; background:rgba(255,255,255,.18); border:1px solid rgba(255,255,255,.35); border-radius:999px; padding:2px 14px; font-size:13px; letter-spacing:.05em;}
+  .cover h1{font-size:30px; margin:14px 0 6px; letter-spacing:.02em;}
+  .cover p{color:#E0E7FF; font-size:14px;}
+  /* ── 标题 ── */
+  h2{font-size:22px; margin:44px 0 6px; padding-left:12px; border-left:5px solid var(--brand);}
+  h2 .no{color:var(--brand); margin-right:6px;}
+  h3{font-size:16.5px; margin:26px 0 8px; color:var(--ink);}
+  h3::before{content:"◆"; color:var(--brand); font-size:11px; margin-right:7px; vertical-align:2px;}
+  p{margin:8px 0;}
+  .sub{color:var(--ink-muted); font-size:13.5px; margin-bottom:14px;}
+  /* ── 目录 ── */
+  .toc{background:var(--card); border:1px solid var(--line); border-radius:12px; padding:20px 26px;}
+  .toc h2{margin-top:0; border:none; padding-left:0; font-size:18px;}
+  .toc ol{margin:8px 0 0 20px;}
+  .toc li{margin:5px 0;}
+  .toc a{color:var(--brand); text-decoration:none; font-weight:500;}
+  .toc a:hover{text-decoration:underline;}
+  .toc .sm{color:var(--ink-muted); font-size:12.5px; margin-left:6px; font-weight:400;}
+  /* ── 卡片/提示 ── */
+  .card{background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px 20px; margin:14px 0;}
+  .tip{border-left:4px solid var(--brand); background:var(--brand-50); border-radius:8px; padding:10px 16px; margin:12px 0; font-size:14px;}
+  .warn{border-left:4px solid var(--amber); background:var(--amber-bg); border-radius:8px; padding:10px 16px; margin:12px 0; font-size:14px;}
+  .danger{border-left:4px solid var(--rose); background:var(--rose-bg); border-radius:8px; padding:10px 16px; margin:12px 0; font-size:14px;}
+  .formula{background:#1E1B4B; color:#E0E7FF; border-radius:10px; padding:14px 20px; margin:14px 0; font-size:15px; font-weight:600; letter-spacing:.02em;}
+  .formula small{display:block; color:#A5B4FC; font-weight:400; font-size:12.5px; margin-top:6px; line-height:1.6;}
+  /* ── 步骤 ── */
+  .steps{counter-reset:step; margin:12px 0; padding:0; list-style:none;}
+  .steps li{position:relative; padding:0 0 14px 44px;}
+  .steps li::before{counter-increment:step; content:counter(step); position:absolute; left:0; top:1px; width:28px; height:28px; border-radius:50%; background:var(--brand); color:#fff; font-weight:700; font-size:14px; display:flex; align-items:center; justify-content:center;}
+  .steps li:not(:last-child)::after{content:""; position:absolute; left:13.5px; top:31px; bottom:2px; width:1.5px; background:var(--brand-100);}
+  /* ── 表格 ── */
+  table{border-collapse:collapse; width:100%; margin:12px 0; font-size:13.5px; background:#fff;}
+  th{background:var(--brand-50); color:var(--ink-soft); text-align:left; padding:8px 12px; border:1px solid var(--line); font-size:12.5px;}
+  td{padding:8px 12px; border:1px solid var(--line); vertical-align:top;}
+  /* ── 界面示意图（纯 CSS 画的简化后台） ── */
+  .shot{border:1px solid var(--line); border-radius:12px; overflow:hidden; margin:14px 0; box-shadow:0 2px 10px rgba(15,23,42,.06); background:#fff; break-inside:avoid;}
+  .shot-bar{background:#F1F5F9; border-bottom:1px solid var(--line); padding:7px 14px; display:flex; align-items:center; gap:6px; font-size:12px; color:var(--ink-muted);}
+  .dot{width:9px; height:9px; border-radius:50%; display:inline-block;}
+  .dot.r{background:#FCA5A5;} .dot.y{background:#FCD34D;} .dot.g{background:#86EFAC;}
+  .shot-title{margin-left:8px; font-weight:600; color:var(--ink-soft);}
+  .shot-body{padding:16px 18px; font-size:13px;}
+  .caption{font-size:12.5px; color:var(--ink-muted); text-align:center; margin:-6px 0 16px;}
+  /* mock 元件 */
+  .mrow{display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:8px 0;}
+  .mbtn{display:inline-block; border-radius:8px; padding:5px 14px; font-size:12.5px; font-weight:600; border:1px solid var(--line); background:#fff; color:var(--ink-soft); white-space:nowrap;}
+  .mbtn.p{background:var(--brand); border-color:var(--brand); color:#fff;}
+  .mbtn.d{background:#fff; border-color:var(--rose-line); color:var(--rose);}
+  .minput{display:inline-block; border:1px solid #CBD5E1; border-radius:8px; padding:5px 12px; font-size:12.5px; color:var(--ink-muted); background:#fff; min-width:120px;}
+  .mtab{display:inline-block; border:1px solid var(--line); border-radius:8px; padding:4px 14px; font-size:12.5px; font-weight:500; color:var(--ink-soft); background:#fff;}
+  .mtab.on{background:var(--brand); border-color:var(--brand); color:#fff;}
+  .badge{display:inline-block; border-radius:6px; padding:1px 8px; font-size:11.5px; font-weight:600; white-space:nowrap;}
+  .b-amber{background:var(--amber-bg); color:var(--amber);}
+  .b-green{background:var(--green-bg); color:var(--green);}
+  .b-blue{background:var(--blue-bg); color:var(--blue);}
+  .b-rose{background:var(--rose-bg); color:var(--rose);}
+  .b-gray{background:#F1F5F9; color:var(--ink-muted);}
+  .mtable{width:100%; border-collapse:collapse; font-size:12px; margin:8px 0;}
+  .mtable th{background:#F8FAFC; color:var(--ink-muted); font-weight:600; padding:5px 8px; border:1px solid #EDF2F7; font-size:11.5px;}
+  .mtable td{padding:5px 8px; border:1px solid #EDF2F7;}
+  .kpi3{display:flex; gap:10px; margin:8px 0; flex-wrap:wrap;}
+  .kpi{flex:1; min-width:130px; border:1px solid var(--line); border-radius:10px; padding:8px 12px; background:#fff;}
+  .kpi .kl{font-size:11px; color:var(--ink-muted);}
+  .kpi .kv{font-size:17px; font-weight:700;}
+  .panel{border:1px solid var(--line); border-radius:10px; padding:10px 12px; margin:8px 0; background:#FCFDFF;}
+  .panel .pt{font-size:11px; color:var(--ink-muted); text-transform:uppercase; letter-spacing:.06em; font-weight:700; margin-bottom:4px;}
+  /* 高亮要点按钮 */
+  .hl{position:relative; outline:2.5px solid #F59E0B; outline-offset:2px; border-radius:8px; box-shadow:0 0 0 6px rgba(245,158,11,.15);}
+  .mark{display:inline-flex; align-items:center; justify-content:center; width:20px; height:20px; border-radius:50%; background:#F59E0B; color:#fff; font-size:12px; font-weight:800; margin-right:4px; vertical-align:middle;}
+  .legend .mark{width:17px;height:17px;font-size:11px;}
+  /* 开关 mock */
+  .switch{display:inline-flex; align-items:center; gap:6px; font-size:12.5px; margin-right:16px;}
+  .sw{width:34px; height:18px; border-radius:999px; background:#CBD5E1; position:relative; display:inline-block;}
+  .sw::after{content:""; position:absolute; top:2px; left:2px; width:14px; height:14px; border-radius:50%; background:#fff;}
+  .sw.on{background:var(--brand);}
+  .sw.on::after{left:auto; right:2px;}
+  /* FAQ */
+  .faq{border:1px solid var(--line); border-radius:10px; background:#fff; margin:10px 0; padding:12px 18px; break-inside:avoid;}
+  .faq .q{font-weight:700; color:var(--ink);}
+  .faq .q::before{content:"Q"; display:inline-flex; align-items:center; justify-content:center; width:20px; height:20px; border-radius:6px; background:var(--brand); color:#fff; font-size:12px; margin-right:8px;}
+  .faq .a{margin-top:6px; color:var(--ink-soft); font-size:14px;}
+  .faq .a::before{content:"A"; display:inline-flex; align-items:center; justify-content:center; width:20px; height:20px; border-radius:6px; background:var(--green-bg); color:var(--green); font-size:12px; font-weight:700; margin-right:8px;}
+  code{background:#EEF2FF; color:var(--brand-dark); border-radius:4px; padding:1px 6px; font-size:12.5px; font-family:ui-monospace,Menlo,monospace;}
+  strong{color:var(--ink);}
+  ul{margin:6px 0 6px 22px;} li{margin:3px 0;}
+  /* 打印 */
+  @media print{
+    body{background:#fff; font-size:12px;}
+    .page{max-width:100%; padding:0;}
+    .cover{border-radius:0; -webkit-print-color-adjust:exact; print-color-adjust:exact;}
+    *{-webkit-print-color-adjust:exact; print-color-adjust:exact;}
+    h2{break-after:avoid; page-break-after:avoid;}
+    .shot,.card,.faq,.formula,table{break-inside:avoid; page-break-inside:avoid;}
+    @page{size:A4; margin:14mm 12mm;}
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+<div class="cover">
+  <span class="tag">内部培训资料 · 图文版</span>
+  <h1>财务岗操作说明</h1>
+  <p>世途旅行 · 运营控制台（后台）｜覆盖：收款认款 → 对账 → 结算单 → 开票 → 导出 → 报表</p>
+  <p style="margin-top:10px; font-size:13px;">怎么进后台：浏览器打开 <b style="color:#fff;">http://47.83.249.163:8080/</b>（提示"不安全"点继续访问，别加 https 的 s），用财务的邮箱+密码登录。<br>提示：「财务」「经营报表」这两个页面只有<b style="color:#fff;">管理员账号</b>能看到，财务岗请使用管理员权限的账号；每次打开财务页系统都会记一条访问日志，属正常留痕。</p>
+</div>
+
+<nav class="toc">
+  <h2>目录</h2>
+  <ol>
+    <li><a href="#s1">先把金额口径搞明白</a><span class="sm">尾款怎么算 / 什么叫"人均均摊" / 预存款是什么</span></li>
+    <li><a href="#s2">收款与认款</a><span class="sm">扫码收款后怎么登记 / 代理余额抵扣 / 多付处理 / 月结 / 批量到账</span></li>
+    <li><a href="#s3">代理预存款：认款审核与余额调整</a><span class="sm">余额与认款页</span></li>
+    <li><a href="#s4">收款对账台：每天怎么核</a><span class="sm">登记进账 / 认领到订单 / 退款 / 全部流水 / 收款渠道</span></li>
+    <li><a href="#s5">结算单：每月给代理结佣金</a><span class="sm">生成 / 核对 / 审批流转</span></li>
+    <li><a href="#s6">开票怎么勾（六态开票）</a><span class="sm">去程 / 回程 / 系统 三个独立开关</span></li>
+    <li><a href="#s7">订单列表怎么读</a><span class="sm">尾款列颜色 / 开票列 / 筛选</span></li>
+    <li><a href="#s8">导出对账用哪张表</a><span class="sm">推荐「导出全岗总表」及各导出的区别</span></li>
+    <li><a href="#s9">经营报表怎么看</a><span class="sm">销售毛利 / 应收账龄 / 代理欠款</span></li>
+    <li><a href="#s10">财务页：成本必须录，毛利才准</a></li>
+    <li><a href="#s11">常见问题 FAQ</a></li>
+  </ol>
+</nav>
+
+<!-- ═══════════ 1 金额口径 ═══════════ -->
+<h2 id="s1"><span class="no">一、</span>先把金额口径搞明白</h2>
+<p class="sub">后面所有页面的数字都建立在这三个概念上，先花五分钟读完，后面就不会对不上账。</p>
+
+<h3>1. 尾款怎么算</h3>
+<div class="formula">尾款 ＝ （订单总价 ＋ 售后调整费） − 已到账金额
+<small>· "售后调整费"指下单之后补收的钱，比如补收单房差、改期费——它们会加进应收里。<br>· "已到账"包括所有确认过的收款，也包括用代理预存余额抵掉的部分。<br>· 尾款是<b>正数</b>＝客人还欠钱；<b>等于 0</b>＝结清；<b>负数</b>＝客人多付了（多付的钱有两个去处，见第二章）。</small></div>
+
+<h3>2. 什么叫"人均均摊"（导出表的金额口径）</h3>
+<p>导出的对账表（比如「导出全岗总表」）是<strong>一行一位乘客</strong>。为了不让人误以为"每个人都付了全款"，表里所有金额列（结算价格、尾款金额、已到账金额、单房差、签证金额、退款金额、订单成本）都是<strong>订单金额 ÷ 出行人数</strong>的均摊值。</p>
+<div class="card">
+  <b>举例：</b>一张订单 3 位乘客、总价 ¥30,000、已收 ¥21,000。<br>
+  · 订单页显示：应收 ¥30,000 / 已付 ¥21,000 / 尾款 ¥9,000（整单口径）<br>
+  · 导出表里每一行显示：结算价格 ¥10,000 / 已到账 ¥7,000 / 尾款 ¥3,000（每人均摊）<br>
+  <span style="color:var(--ink-muted); font-size:13px;">所以"导出金额 × 人数 ≈ 订单总价"，两边并不矛盾——只是一个按单、一个按人。</span>
+</div>
+
+<h3>3. 代理预存款（预存余额）是什么</h3>
+<p>代理可以先把钱打给公司存成"预存余额"，之后下单欠尾款时直接从余额里扣，不用一单一单转账。围绕它有三件事，都是财务的活：</p>
+<ul>
+  <li><strong>充值（认款）</strong>：代理打款后在后台申报，财务在「余额与认款」页审核确认，钱才进余额。→ 第三章</li>
+  <li><strong>抵扣</strong>：代理订单欠尾款且余额够时，在订单详情里点"用代理余额抵"。→ 第二章</li>
+  <li><strong>回存</strong>：代理订单多付时，可以把多出的钱存回该代理的余额。→ 第二章</li>
+</ul>
+<div class="warn">⚠ 注意区分：<b>预存余额</b>（代理充值的钱）和<b>挂账池</b>（对不上号、待认领的进账）是两个池子。预存余额跟着某个代理走；挂账池的钱不属于谁，要在「收款对账台」认领到具体订单。</div>
+
+<!-- ═══════════ 2 收款与认款 ═══════════ -->
+<h2 id="s2"><span class="no">二、</span>收款与认款</h2>
+<p class="sub">现阶段收钱全靠"扫码收款 + 人工登记"：客人/代理扫我们的收款码付钱 → 财务见到钱 → 在系统里把这笔钱登记到订单上。<b>系统不会自动到账</b>，客人传了付款截图订单状态也不会自己变，必须人工确认。</p>
+
+<h3>1. 给订单确认收款（最常用）</h3>
+<ol class="steps">
+  <li>左侧导航 → <b>运营 → 订单</b>，找到那张订单（可按订单号/乘客名/航班号筛），点开订单详情。</li>
+  <li>往下翻到「<b>收款</b>」区域：先看清"已付 / 应收"和尾款徽标，确认这单确实还欠多少。</li>
+  <li>填<b>收款金额</b>——输入框默认提示就是当前尾款，收多少填多少（可以分多次收）。</li>
+  <li>选<b>收款方式</b>：银行转账 / 微信 / 支付宝 / 代理预付，按实际打款渠道选。</li>
+  <li>上传<b>水单截图</b>（转账凭证，4MB 以内），备注选填（比如"客人分两笔转"）。</li>
+  <li>点「<b>确认收款</b>」。已付金额立刻更新，尾款重新计算；收款记录会留在下方列表里，可随时点开截图复查。</li>
+</ol>
+<div class="shot">
+  <div class="shot-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="shot-title">订单详情 · 收款区（示意）</span></div>
+  <div class="shot-body">
+    <div class="mrow" style="justify-content:space-between;"><span style="color:var(--ink-muted);">已付 / 应收</span><span><b style="color:var(--green);">¥21,000</b> <span style="color:#94A3B8;">/ ¥30,000</span>&nbsp;<span class="badge b-amber"><span class="mark">1</span>欠款 ¥9,000</span></span></div>
+    <div class="panel"><div class="pt">代理信息</div>代理 <b>某某旅行社</b> <span class="badge b-gray">逐单到账</span>&nbsp;&nbsp;代理余额 <b style="color:var(--green);">¥12,000</b></div>
+    <div class="mrow"><span class="minput"><span class="mark">2</span>收款金额（默认尾款 ¥9,000）</span><span class="minput">收款方式：银行转账 ▾</span></div>
+    <div class="mrow"><span class="minput" style="min-width:220px;">备注（选填）</span><span class="mbtn">📷 上传水单截图</span></div>
+    <div class="mrow"><span class="mbtn p hl"><span class="mark">3</span>确认收款</span></div>
+  </div>
+</div>
+<p class="caption">① 先看尾款徽标 → ② 金额默认＝尾款，可改 → ③ 点确认收款入账</p>
+<div class="tip">💡 已结清的订单也能继续录收款（会变成"多付"状态）；系统有防重复机制，手抖双击不会入两笔账。</div>
+
+<h3>2. 欠款的代理订单：用代理余额抵</h3>
+<p>如果订单归属某个代理、还欠尾款、且该代理预存余额大于 0，收款区会多出一行"<b>用代理余额抵</b>"。填抵扣金额（不能超过尾款、也不能超过余额）后确认，余额被扣掉、订单已付相应增加；抵满尾款后订单自动变为"已支付"。</p>
+
+<h3>3. 客人多付了怎么办（尾款是负数）</h3>
+<p>多付时收款区会出现处理入口，两个去处按情况选：</p>
+<div class="shot">
+  <div class="shot-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="shot-title">订单详情 · 多付处理（示意）</span></div>
+  <div class="shot-body">
+    <div class="mrow" style="justify-content:space-between;"><span style="color:var(--ink-muted);">已付 / 应收</span><span><b style="color:var(--green);">¥32,000</b> <span style="color:#94A3B8;">/ ¥30,000</span>&nbsp;<span class="badge b-blue">多付 ¥2,000</span></span></div>
+    <div class="panel" style="background:var(--blue-bg); border-color:var(--blue-line);">多付 ¥2,000 可存入代理余额&nbsp;&nbsp;<span class="mbtn hl"><span class="mark">A</span>存入代理余额</span></div>
+    <div class="panel" style="background:var(--amber-bg); border-color:var(--amber-line);">多付 ¥2,000 可转挂账池（在收款对账台待认领）&nbsp;&nbsp;<span class="mbtn hl"><span class="mark">B</span>转挂账池</span></div>
+  </div>
+</div>
+<table>
+  <tr><th style="width:32%;">按钮</th><th>什么情况用</th><th>钱去了哪</th></tr>
+  <tr><td><span class="mark">A</span><b>存入代理余额</b>（只有代理订单有）</td><td>代理多转了，钱留着下次抵扣</td><td>进该代理的预存余额，订单回到刚好结清</td></tr>
+  <tr><td><span class="mark">B</span><b>转挂账池</b>（散客/代理订单都有）</td><td>说不清这笔多付该归谁，或后面要退/要挪到别的订单</td><td>生成一条"订单多付"进账，去「收款对账台」等认领；订单回到刚好结清</td></tr>
+</table>
+
+<h3>4. 月结代理：不催尾款</h3>
+<p>结算方式为"<b>月结</b>"的代理，订单欠尾款时不显示琥珀色欠款告警，而是蓝色「<span class="badge b-blue">月结挂账 ¥9,000</span>」——意思是这笔挂到月底统一对账，<strong>不需要逐单催款</strong>。代理是逐单到账还是月结，在「客户 → 代理」详情里由管理员设置。</p>
+
+<h3>5. 批量到账：一次收了好几单的钱</h3>
+<p>代理一笔转账付了多张订单时：在订单列表<b>勾选</b>这几张单 → 点「<b>💰 批量到账</b>」→ 弹窗里逐单填到账金额（默认＝各单尾款）→ 共用同一张水单截图 → 提交。已结清/多付的单不会出现在批量到账里，避免重复入账。</p>
+
+<!-- ═══════════ 3 代理预存款 ═══════════ -->
+<h2 id="s3"><span class="no">三、</span>代理预存款：认款审核与余额调整</h2>
+<p class="sub">位置：左侧导航 → <b>财务 → 余额与认款</b>。代理打款充值后在这页申报，财务在这页审核；同一页还能手动修正余额。</p>
+
+<h3>1. 代理那边看到的是什么（了解即可）</h3>
+<p>代理登录后台看到的是自己的视角：当前预存余额、我们的收款码（有专属码显示专属码，没有就显示公司统一码）、"提交认款申请"表单（申报金额 + 备注 + 1~3 张付款凭证截图）、以及自己历次申请的审核结果。</p>
+
+<h3>2. 财务怎么审（核心操作）</h3>
+<ol class="steps">
+  <li>打开「余额与认款」，最上面就是「<b>待审核认款</b>」队列，右上角有待处理条数。</li>
+  <li>逐笔核对：代理是谁、申报金额多少、点开<b>凭证缩略图</b>看转账截图，和银行/微信实际到账对上。</li>
+  <li>对上了 → 点「<b>确认</b>」。到账金额默认按申报金额带出，<b>实际到账和申报不一致时可以直接修正</b>（比如申报 ¥10,000 实到 ¥9,998），可填核实备注，点「确认到账」——钱即刻加进该代理的预存余额。</li>
+  <li>对不上/有问题 → 点「<b>驳回</b>」，<b>必须填驳回原因</b>（代理那边能看到），钱不入账。</li>
+</ol>
+<div class="shot">
+  <div class="shot-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="shot-title">余额与认款 · 待审核队列（示意）</span></div>
+  <div class="shot-body">
+    <div class="mrow" style="justify-content:space-between;"><b>待审核认款</b><span class="badge b-amber">2 条待处理</span></div>
+    <table class="mtable">
+      <tr><th>代理</th><th>申报金额</th><th>备注</th><th>凭证</th><th>提交时间</th><th>操作</th></tr>
+      <tr><td>某某旅行社</td><td>¥10,000.00</td><td>两笔货款合并</td><td>🖼 🖼</td><td>7/21 09:12</td><td><span class="mbtn hl" style="padding:2px 10px;"><span class="mark">1</span>确认</span> <span class="mbtn d" style="padding:2px 10px;">驳回</span></td></tr>
+      <tr><td colspan="6" style="background:#F8FAFC;"><span class="mark">2</span>到账金额（默认按申报）<span class="minput" style="min-width:90px;">¥ 9,998</span>&nbsp;核实备注<span class="minput">选填</span>&nbsp;<span class="mbtn p" style="padding:3px 12px;">确认到账</span></td></tr>
+    </table>
+  </div>
+</div>
+<p class="caption">① 点确认展开审核行 → ② 实际到账可修正后再确认；驳回必须写原因</p>
+
+<h3>3. 手动调整余额（线下对账修正用）</h3>
+<p>页面最下方「<b>手动调整余额</b>」：选代理 → 填调整金额（<b>正数加、负数扣</b>）→ <b>必填调整原因</b> → 提交。用于线下对账发现的差异修正。两条硬规则：<b>扣减不能把余额扣成负数</b>（会被系统拦下）；<b>每次调整都写入审计日志</b>，有据可查。</p>
+
+<!-- ═══════════ 4 收款对账台 ═══════════ -->
+<h2 id="s4"><span class="no">四、</span>收款对账台：每天怎么核</h2>
+<p class="sub">位置：左侧导航 → <b>财务 → 收款对账台</b>。这是所有进账的总台：银行/微信到了一笔对不上号的钱、客人前台自己传的付款凭证、订单多付转挂账的钱……都汇到这里等财务处理。</p>
+
+<h3>1. 页面长什么样</h3>
+<div class="shot">
+  <div class="shot-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="shot-title">收款对账台（示意）</span></div>
+  <div class="shot-body">
+    <div class="mrow" style="justify-content:space-between;"><b style="font-size:14px;">收款对账台</b><span class="mbtn p hl"><span class="mark">1</span>＋ 登记新进账</span></div>
+    <div class="kpi3">
+      <div class="kpi"><div class="kl">挂账余额（待认领剩余）</div><div class="kv" style="color:var(--amber);">¥5,200.00</div></div>
+      <div class="kpi"><div class="kl">今日进账</div><div class="kv" style="color:var(--green);">¥38,400.00</div></div>
+      <div class="kpi"><div class="kl">待认领笔数</div><div class="kv">3</div></div>
+    </div>
+    <div class="mrow"><span class="mtab on"><span class="mark">2</span>待认领</span><span class="mtab">已认领</span><span class="mtab">已退款</span><span class="mtab">全部流水</span><span class="mtab">收款渠道</span><span class="minput" style="margin-left:auto;">搜进账号 / 付款备注</span></div>
+    <table class="mtable">
+      <tr><th>进账号</th><th>金额</th><th>剩余</th><th>方式</th><th>付款人/备注</th><th>状态</th><th>操作</th></tr>
+      <tr><td>RCP2607…</td><td>¥3,000.00</td><td style="color:var(--amber);"><b>¥3,000.00</b></td><td>微信</td><td>王先生 尾号1234</td><td><span class="badge b-amber">待认领</span></td><td><span class="mbtn hl" style="padding:2px 10px;"><span class="mark">3</span>认领</span> <span class="mbtn d" style="padding:2px 10px;">退款</span></td></tr>
+      <tr><td>RCP2607…</td><td>¥5,000.00</td><td style="color:var(--amber);"><b>¥2,200.00</b></td><td>银行转账</td><td>某某旅行社</td><td><span class="badge b-blue">部分认领</span></td><td><span class="mbtn" style="padding:2px 10px;">认领</span> <span class="mbtn d" style="padding:2px 10px;">退款</span></td></tr>
+    </table>
+  </div>
+</div>
+<p class="caption">① 手工登记新进账 → ② 五个页签切视图 → ③ 每笔可认领到订单或退款</p>
+
+<h3>2. 登记新进账</h3>
+<p>银行/微信到了一笔钱但暂时对不上是哪个订单的？先点「<b>＋ 登记新进账</b>」记下来：金额（人民币）、收款方式、付款人备注（比如"王先生 微信尾号1234"）、订单提示号（客户自报的订单号，帮助之后认领，选填）、到账时间（默认现在）、收款截图（6MB 以内，选填）。登记后这笔钱进入"待认领"，挂账余额会加上它。</p>
+
+<h3>3. 认领到订单</h3>
+<ol class="steps">
+  <li>在"待认领"页签找到那笔进账，点「<b>认领</b>」。</li>
+  <li>输入<b>订单号</b>点「查找」——系统带出该订单的联系人、应收和当前尾款，先核对是不是这单。</li>
+  <li>填认领金额（默认＝这笔进账的剩余金额，不能超过剩余）。<b>支持部分认领</b>：一笔进账可以拆着认领到多张订单，认完为止。</li>
+  <li>点「确认认领」，二次确认后钱记到订单上，订单已付随之增加。</li>
+</ol>
+
+<h3>4. 退款</h3>
+<div class="danger">🚨 点「退款」把剩余金额标记退掉时<b>必须填退款备注</b>（如"重复付款，原路退回"），并且<b>退款后这笔钱不能再认领</b>——点之前想清楚。系统里的"退款"只是记账标记，真正把钱退给客人还是要在银行/微信里人工操作。</div>
+
+<h3>5. 另外两个页签</h3>
+<ul>
+  <li><b>全部流水</b>：进账 + 订单收款合并的只读流水，按时间倒序，日常抽查、和银行流水总额核对用。</li>
+  <li><b>收款渠道</b>：维护对外展示的收款码——前台客人付款页、代理认款页看到的二维码就是这里配的。换码、加银行账户信息都在这。</li>
+</ul>
+
+<h3>6. 建议的每日动线</h3>
+<div class="card">☀ <b>每天上班</b>：打开对账台 → 看"待认领笔数"清零它（逐笔认领/退款）→ 对一眼"今日进账"和银行/微信实际到账 → 切到「余额与认款」清掉待审核认款 → 顺手看一眼经营报表的代理欠款（第九章）。</div>
+
+<!-- ═══════════ 5 结算单 ═══════════ -->
+<h2 id="s5"><span class="no">五、</span>结算单：每月给代理结佣金</h2>
+<p class="sub">位置：左侧导航 → <b>财务 → 结算单</b>。每个代理每个月一张结算单，算清"这个月我们该付给这个代理多少佣金"。</p>
+
+<h3>1. 一张结算单的账怎么看</h3>
+<div class="formula">应付给代理 ＝ 应得佣金 − 分给下级佣金 （＝净佣金）
+<small>· <b>GMV</b>：该代理当月订单总额（销售额），是算佣金的基数，不是要付的钱。<br>· <b>分给下级</b>：多级代理体系里，从他的佣金里分给下级代理的部分。<br>· 表里还有一列「预付抵(停用)」：早期版本曾用预存余额抵佣金，<b>该功能已停用</b>，只有历史结算单可能带非零旧值，新结算单恒为 0，对不上账时别被它迷惑。</small></div>
+
+<h3>2. 每月流程</h3>
+<ol class="steps">
+  <li><b>月初生成</b>：在右上生成卡里输入月份（格式 <code>2026-06</code>）→ 点「<b>生成/重算</b>」。系统按订单数据给每个代理各生成一张；重复点是"重算"，但<b>已核准、已支付的结算单不会被覆盖</b>，放心。</li>
+  <li><b>核对</b>：点任意一行打开详情抽屉，逐项看 GMV → 应得佣金 → 分给下级 → 净佣金 → 应付；下方「佣金明细」逐单列出订单号、佣金基数、费率、金额，可以逐笔追查。</li>
+  <li><b>走审批</b>：核对无误 → 「提交审核」；复核人在待审核状态下点「核准」（有问题就「打回草稿」）。</li>
+  <li><b>付款并标记</b>：线下把钱付给代理后，回来点「<b>💰 标记已支付</b>」收尾。付错了还没付？「撤回审核」退回上一步。</li>
+</ol>
+<div class="shot">
+  <div class="shot-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="shot-title">结算单列表 + 详情抽屉（示意）</span></div>
+  <div class="shot-body">
+    <div class="mrow"><span class="minput">结算月份 2026-06 ▾</span><span class="minput">代理：全部 ▾</span><span class="minput">状态：全部 ▾</span><span class="minput" style="min-width:80px;">2026-07</span><span class="mbtn p hl"><span class="mark">1</span>生成/重算</span><span class="mbtn">📥 导出 CSV</span></div>
+    <table class="mtable">
+      <tr><th>月份</th><th>代理</th><th>GMV</th><th>应得</th><th>分下级</th><th>净佣金</th><th>应付</th><th>状态</th></tr>
+      <tr><td>2026-06</td><td>某某旅行社</td><td>¥182,000</td><td>¥9,100</td><td style="color:var(--amber);">-¥1,200</td><td style="color:var(--green);"><b>¥7,900</b></td><td style="color:var(--brand);"><b>¥7,900</b></td><td><span class="badge b-amber"><span class="mark">2</span>待审核</span></td></tr>
+      <tr><td>2026-06</td><td>另一家门店</td><td>¥56,000</td><td>¥2,240</td><td>-¥0</td><td style="color:var(--green);"><b>¥2,240</b></td><td style="color:var(--brand);"><b>¥2,240</b></td><td><span class="badge b-green">已支付</span></td></tr>
+    </table>
+    <div class="panel"><div class="pt">详情抽屉 · 流转按钮随状态变化</div>
+    <span class="badge b-gray">草稿</span> → 提交审核/作废　<span class="badge b-amber">待审核</span> → 核准/打回草稿　<span class="badge b-blue">已核准</span> → <span class="mbtn p hl" style="padding:2px 10px;"><span class="mark">3</span>💰 标记已支付</span>/撤回审核</div>
+  </div>
+</div>
+<p class="caption">① 输入月份生成/重算 → ② 点行进详情逐项核对 → ③ 线下付完款回来标记已支付</p>
+<div class="tip">💡 需要给老板/代理留底时点「📥 导出 CSV」，导出的就是当前筛选出来的这批结算单。</div>
+
+<!-- ═══════════ 6 六态开票 ═══════════ -->
+<h2 id="s6"><span class="no">六、</span>开票怎么勾（六态开票）</h2>
+<p class="sub">这里的"开票"指的是给航司出票/系统开票的进度标记（不是发票）。每张订单有 <b>三个独立开关</b>：<b>去程、回程、系统</b>，各自可以是"已开/未开"——三个开关 × 两种状态，习惯叫"六态开票"。</p>
+<div class="shot">
+  <div class="shot-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="shot-title">订单详情 · 开票区（示意）</span></div>
+  <div class="shot-body">
+    <span class="switch"><span class="sw on"></span>去程 已开</span>
+    <span class="switch"><span class="sw"></span>回程 未开</span>
+    <span class="switch"><span class="sw on"></span>系统 已开</span>
+    <div style="margin-top:8px; color:var(--ink-muted); font-size:12px;">去程 / 回程按航段分别开票；翻为「已开」时会校验该班次开票上限。</div>
+  </div>
+</div>
+<ul>
+  <li><b>在哪切换</b>：订单详情里的「开票」区，点开关即改，立即保存。列表页的开票列只能看不能点。</li>
+  <li><b>上限校验</b>：把某航段翻成"已开"时，系统会检查该航班班次的开票上限，超限会被拒绝并提示原因——这不是故障，是防超开。</li>
+  <li><b>批量打标</b>：订单列表勾选多单后，用「批量开票」下拉一次打标（去程/回程/系统 × 标已开/标未开 共六个选项）；个别订单超上限会单独失败，不影响其他单。</li>
+  <li><b>财务用途</b>：对账时用列表的「开票筛选」把"去程已开但没收够钱""回程未开"这类单筛出来核（见下一章）。</li>
+</ul>
+
+<!-- ═══════════ 7 订单列表怎么读 ═══════════ -->
+<h2 id="s7"><span class="no">七、</span>订单列表怎么读（财务视角）</h2>
+<div class="shot">
+  <div class="shot-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="shot-title">订单列表 · 尾款列与开票列（示意）</span></div>
+  <div class="shot-body">
+    <table class="mtable">
+      <tr><th>订单号</th><th>客户</th><th style="text-align:center;">尾款 <span class="mark">1</span></th><th style="text-align:center;">开票 <span class="mark">2</span></th><th>状态</th></tr>
+      <tr><td>ORD2607…</td><td>王××</td><td style="text-align:center;"><span class="badge b-amber">欠款 ¥9,000</span></td><td style="text-align:center;">✓ ✗ ✓</td><td><span class="badge b-blue">已支付</span></td></tr>
+      <tr><td>ORD2607…</td><td>某某旅行社</td><td style="text-align:center;"><span class="badge b-blue">月结挂账 ¥5,600</span></td><td style="text-align:center;">✓ ✓ ✓</td><td><span class="badge b-blue">处理中</span></td></tr>
+      <tr><td>ORD2607…</td><td>李××</td><td style="text-align:center;"><span class="badge b-green">已结清</span></td><td style="text-align:center;">✗ ✗ ✗</td><td><span class="badge b-green">已出票</span></td></tr>
+      <tr><td>ORD2607…</td><td>张××</td><td style="text-align:center;"><span class="badge b-blue">多付 ¥2,000</span></td><td style="text-align:center;">✓ ✓ ✗</td><td><span class="badge b-green">已完成</span></td></tr>
+    </table>
+  </div>
+</div>
+<p class="caption">① 尾款列一眼看钱：琥珀＝还欠钱、绿＝结清、蓝＝多付或月结挂账　② 开票列三个点＝去程/回程/系统（✓已开 ✗未开）</p>
+<ul>
+  <li><b>尾款列</b>已经把售后调整费算进去了，和订单详情里的数一致。</li>
+  <li><b>开票筛选</b>：筛选区可按"去程/回程/系统 × 已开/未开"组合筛，配合出行日期区间用，比如"本周出发 + 去程未开"。</li>
+  <li><b>订单详情里还有两块财务专区</b>：①「预期到账金额」——出纳填这单预计要收的钱，管理员核过后可<b>锁定</b>，锁定后别人改不了；②「订单杂项成本」——导游服务费、赠送费用、手续费、操作费（每单固定 ¥20 系统自动计提，可改可删）、其他，这些会进成本核算。</li>
+  <li><b>整单状态"出票完成"≠开票列</b>：前者是订单整体推进阶段，后者是逐航段的开票标记，对账以开票列为准。</li>
+</ul>
+
+<!-- ═══════════ 8 导出 ═══════════ -->
+<h2 id="s8"><span class="no">八、</span>导出对账用哪张表</h2>
+<p class="sub">订单列表上方有一排导出按钮，财务日常对账<b>认准「📊 导出全岗总表」</b>，其他的了解用途即可。</p>
+<div class="shot">
+  <div class="shot-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="shot-title">订单列表 · 导出按钮区（示意）</span></div>
+  <div class="shot-body">
+    <div class="mrow"><span class="mbtn">📥 导出 CSV</span><span class="minput">模板：全岗可用 ▾</span><span class="mbtn">📤 导出</span><span class="mbtn p hl"><span class="mark">★</span>📊 导出全岗总表</span><span class="mbtn">🎫 票务开票导出</span></div>
+    <div style="color:var(--ink-muted); font-size:12px;">《导出》按「下单时间」周期（佣金/提成/客户统计）；《全岗总表》按「出行日期」区间（综合台账，不填＝全部）；勾选了订单则三个导出都只导勾选的。</div>
+  </div>
+</div>
+<h3>推荐：📊 导出全岗总表</h3>
+<ul>
+  <li><b>一行一位乘客</b>的完整台账 xlsx：代理机构、乘客中文名、<b>乘客拼音名</b>、出发(往返)日期、航班号、舱位、<b>结算价格、尾款金额、已到账金额、单房差、签证金额、退款金额、是否清账、开票状态</b>、证件信息、分房情况、订单成本、录入时间/人员等，系统里真实存有的字段全部填满。</li>
+  <li><b>金额列全部是每人均摊口径</b>（见第一章）；每人尾款＝(总价＋售后调整−已到账−预存抵扣) ÷ 人数，不会出现负数（多付按 0 算清）。</li>
+  <li><b>范围怎么定</b>：按列表上方「出行日期」区间选单（不填＝全部）；如果勾选了订单，就只导勾选的这批。</li>
+  <li><b>自动排除</b>：草稿、已取消、支付超时、失败、已退款的订单不进这张表（它们不占座也不计收）。</li>
+</ul>
+<h3>其他导出的区别</h3>
+<table>
+  <tr><th style="width:26%;">按钮</th><th>口径与用途</th></tr>
+  <tr><td><b>📊 导出全岗总表</b> ★推荐</td><td>综合对账台账，一行一乘客，金额人均均摊，字段最全。<b>财务对账用这张。</b></td></tr>
+  <tr><td>📤 导出（三模板：全岗可用 / 票务专用 / 签证专用）</td><td>《全岗可用》是<b>复刻旧手工台账的格式</b>，为对齐旧表列序，<b>部分列是占位留空的</b>——不是数据丢了，是旧表有这列而系统没有对应字段。别拿它对金额，对金额用全岗总表。票务/签证模板是给对应岗位用的。</td></tr>
+  <tr><td>📥 导出 CSV</td><td>把当前列表筛选结果原样导成 CSV，按「下单时间」周期看"这段时间录了多少单"，算佣金/提成/客户统计用。</td></tr>
+  <tr><td>🎫 票务开票导出</td><td>票务岗的：选出发日＋航段＋开票状态，直接出航司 PNR 出票模板。财务一般用不到。</td></tr>
+</table>
+
+<!-- ═══════════ 9 经营报表 ═══════════ -->
+<h2 id="s9"><span class="no">九、</span>经营报表怎么看</h2>
+<p class="sub">位置：左侧导航 → <b>财务 → 经营报表</b>（仅管理员）。顶部选日期区间（快捷键：最近 30 天 / 最近 90 天 / 本月），右上「⬇ 导出 xlsx」一键把几张报表打包成一个文件。三个页签：</p>
+<h3>1. 销售毛利</h3>
+<p>可按<b>产品线 / 渠道（代理分销·会员直订·游客）/ 销售代理</b>三个维度切换，每行显示订单数、收入、成本、毛利、毛利率和毛利占比条。<b>重点看黄色徽标</b>：</p>
+<div class="shot">
+  <div class="shot-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="shot-title">经营报表 · 销售毛利（示意）</span></div>
+  <div class="shot-body">
+    <div class="mrow"><span class="mtab on">产品线</span><span class="mtab">渠道</span><span class="mtab">销售代理</span></div>
+    <table class="mtable">
+      <tr><th>产品线</th><th>订单数</th><th>收入</th><th>成本</th><th>毛利</th><th>毛利率</th></tr>
+      <tr><td>套餐</td><td>42</td><td>¥812,000</td><td>¥650,000</td><td style="color:var(--green);"><b>¥162,000</b></td><td>20.0%</td></tr>
+      <tr><td>机票</td><td>65</td><td>¥520,000</td><td>¥360,000</td><td style="color:var(--green);"><b>¥160,000</b></td><td>30.8% <span class="badge b-amber hl">⚠︎缺3项成本</span></td></tr>
+    </table>
+  </div>
+</div>
+<p class="caption">「⚠︎缺 N 项成本」＝这一行有 N 项成本没录，毛利被<b>高估</b>了——先去财务页把成本补上再看数（第十章）</p>
+<h3>2. 应收账龄——谁欠钱、欠多久</h3>
+<p>顶部是总应收和四个账龄桶汇总（<b>0–7 天 / 8–30 天 / 31–60 天 / 61 天以上</b>），下方是逐单明细（应收合计 / 已收 / 余额 / 账龄天数 / 所在桶），按欠款金额从大到小排。61 天以上是红色，优先处理。明细最多显示前 500 条，但顶部汇总是全量的。</p>
+<h3>3. 代理欠款——催款名单直接用这张</h3>
+<p>按代理汇总：欠款订单数、应收余额、预存余额，欠得多的排前面。看到"应收余额大、预存余额也大"的代理，可以和对方约定用预存余额抵欠款（在订单里逐单抵，见第二章）。</p>
+
+<!-- ═══════════ 10 财务页 ═══════════ -->
+<h2 id="s10"><span class="no">十、</span>财务页：成本必须录，毛利才准</h2>
+<p class="sub">位置：左侧导航 → <b>财务 → 财务</b>（仅管理员，每次打开记审计日志）。这是最细的成本核算页，五个页签：概览 / 航班毛利 / 订单毛利 / 月度趋势 / <b>成本维护</b>。</p>
+<div class="danger">🚨 <b>财务日常最重要的一件事：录成本。</b>成本不录，系统不会报错，毛利会直接虚高——只在报表上给你一个"⚠︎缺 N 项成本"的提示。看到就去补。</div>
+<ul>
+  <li><b>成本维护</b>三个入口：①<b>航班成本周期</b>（主用）——按"航班号 × 日期段"录一组成本（包机总价、机场税去/回、燃油、旺季附加、机型调整、起降折扣/机场补贴可为负数），区间内班次自动套用；②<b>单班次覆盖</b>——个别班次特殊价单独录，优先于周期；③<b>产品成本</b>——酒店净房价 / 签证成本 / 车队结算价（日常由操作部在产品管理维护，财务可查）。</li>
+  <li><b>只调未来日期段</b>：修改航班成本周期会实时重算覆盖区间的历史毛利，所以<b>过去的日期段不要动</b>，避免历史账面变动。</li>
+  <li><b>机票成本口径</b>：包机总成本 ÷ 总座位数，每位乘客摊一个座位；没卖掉的座位摊到的成本单列为"空座沉没"，不摊进客人头上。</li>
+  <li><b>两个导出</b>：「⬇ 全量汇总（按乘客）」＝一行一乘客的成本利润明细；「⬇ 按航班分组」＝一行一个班次的整班盈亏（含载客率、空座沉没）。</li>
+</ul>
+
+<!-- ═══════════ 11 FAQ ═══════════ -->
+<h2 id="s11"><span class="no">十一、</span>常见问题 FAQ</h2>
+
+<div class="faq"><div class="q">导出表里的金额和订单总价对不上？</div>
+<div class="a">正常。导出是<b>一行一乘客</b>，所有金额列都是<b>每人均摊</b>（订单金额 ÷ 出行人数）。把同一订单几行加起来才约等于订单总价。见第一章的例子。</div></div>
+
+<div class="faq"><div class="q">票务名单里乘客姓名后面带 MR / MS / MSTR / MISS，和我的底表对不上名字？</div>
+<div class="a">那是<b>航司出票要求</b>的称谓后缀（按乘客年龄性别自动加的），只出现在票务出票类表里。财务对人名请用「全岗总表」里专门的<b>「乘客拼音名」</b>（纯拼音，无称谓）和<b>「乘客中文名」</b>两列。</div></div>
+
+<div class="faq"><div class="q">客人说付了钱，订单怎么还显示欠款？</div>
+<div class="a">系统<b>不自动到账</b>，客人传了付款截图状态也不会自己变。财务/运营要人工处理：钱能对上订单 → 订单详情「确认收款」；对不上 → 先在收款对账台登记进账，之后再认领。</div></div>
+
+<div class="faq"><div class="q">结算单里「预付抵(停用)」这列怎么有数字？要不要处理？</div>
+<div class="a">不用处理。用预存余额抵佣金的老功能<b>已经停用</b>，这列只在历史结算单上留有旧值；新生成的结算单该列恒为 0，应付＝净佣金。</div></div>
+
+<div class="faq"><div class="q">尾款显示蓝色的"多付"，钱要退吗？</div>
+<div class="a">不一定退。两个去处：代理订单可「存入代理余额」留着下次抵扣；说不清归属就「转挂账池」，之后在收款对账台认领到别的订单或走退款。见第二章第 3 节。</div></div>
+
+<div class="faq"><div class="q">月结代理一堆订单欠尾款，要逐单催吗？</div>
+<div class="a">不用。月结代理的欠款显示为蓝色「月结挂账」，月底统一对账收款。真正要催的是琥珀色"欠款"的单（逐单到账代理和散客）。</div></div>
+
+<div class="faq"><div class="q">报表毛利看着高得不对劲？</div>
+<div class="a">先看行末有没有黄色「⚠︎缺 N 项成本」——缺成本时毛利是被高估的。去财务页 → 成本维护把航班/产品成本补齐再看。另外仪表盘首页的"今日营收"是当日订单额（GMV）口径，和财务页的核算口径本来就不是一回事，别拿它们互相对。</div></div>
+
+<div class="faq"><div class="q">对账台里点了"退款"的钱还能再认领吗？</div>
+<div class="a">不能，退款是终点站。所以退款前必须填备注、系统还会弹窗二次确认。点错了请联系管理员按审计日志核实处理。</div></div>
+
+<div class="faq"><div class="q">导出全岗总表里怎么少了几张订单？</div>
+<div class="a">两个常见原因：①草稿/已取消/支付超时/失败/已退款的订单不进该表；②该表按<b>出行日期</b>区间选单，你可能想找的是按<b>下单时间</b>录入的单——换「📥 导出 CSV / 📤 导出」按下单时间导。另外如果列表里勾选了订单，导出只含勾选的那批。</div></div>
+
+<div class="faq"><div class="q">开票开关怎么翻不过去？</div>
+<div class="a">每个航班班次设有开票上限，把航段翻成"已开"时超限会被系统拒绝并提示，防止超开。找票务岗/管理员确认该班次的上限设置。</div></div>
+
+<div class="faq"><div class="q">手动调余额 / 改数据出了错，找谁查？</div>
+<div class="a">系统 → 审计日志。谁在什么时间从哪个 IP 做了什么（收款、余额调整、财务查看、删单……）全部留痕，可看逐字段改动前后对比。余额手动调整、认款确认都在里面。</div></div>
+
+<div style="margin-top:48px; padding-top:16px; border-top:1px solid var(--line); color:var(--ink-muted); font-size:12.5px; text-align:center;">
+世途旅行 · 运营控制台 财务岗操作说明 ｜ 依据系统当前版本编写（2026-07）· 界面示意图为简化示意，以实际系统为准 ｜ 建议 A4 打印留存
+</div>
+
+</div>
+</body>
+</html>

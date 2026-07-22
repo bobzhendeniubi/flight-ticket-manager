@@ -1,0 +1,327 @@
+<meta charset="utf-8">
+<title>房控岗操作说明 · 世途旅行运营控制台</title>
+<style>
+:root{--brand:#4F46E5;--brand-dark:#4338CA;--brand-50:#EEF2FF;--brand-100:#E0E7FF;--ink:#1E293B;--ink-soft:#475569;--ink-muted:#64748B;--line:#E2E8F0;--canvas:#F8FAFC;--rose:#E11D48;--rose-bg:#FFE4E6;--amber:#B45309;--amber-bg:#FEF3C7;--green:#047857;--green-bg:#D1FAE5;}
+*{box-sizing:border-box;}
+body{margin:0;padding:0;font-family:"PingFang SC","Microsoft YaHei","Hiragino Sans GB",sans-serif;color:var(--ink);background:#fff;line-height:1.75;font-size:15px;}
+.page{max-width:860px;margin:0 auto;padding:32px 28px 80px;}
+h1{font-size:26px;margin:0 0 4px;}
+h2{font-size:20px;margin:48px 0 12px;padding:10px 14px;background:var(--brand-50);border-left:5px solid var(--brand);border-radius:0 8px 8px 0;}
+h3{font-size:16px;margin:26px 0 8px;color:var(--brand-dark);}
+p{margin:8px 0;}
+.sub{color:var(--ink-muted);font-size:13px;margin-bottom:20px;}
+.toc{background:var(--canvas);border:1px solid var(--line);border-radius:12px;padding:16px 22px;margin:20px 0;}
+.toc b{display:block;margin-bottom:6px;}
+.toc ol{margin:0;padding-left:22px;}
+.toc a{color:var(--brand);text-decoration:none;}
+.toc a:hover{text-decoration:underline;}
+.step{background:#fff;border:1px solid var(--line);border-radius:10px;padding:12px 16px;margin:10px 0;}
+.step .n{display:inline-block;background:var(--brand);color:#fff;border-radius:50%;width:22px;height:22px;line-height:22px;text-align:center;font-size:13px;font-weight:700;margin-right:8px;}
+.tip{background:var(--brand-50);border:1px solid var(--brand-100);border-radius:10px;padding:10px 14px;margin:12px 0;font-size:14px;}
+.tip::before{content:"💡 小提示：";font-weight:700;}
+.warn{background:var(--amber-bg);border:1px solid #FDE68A;border-radius:10px;padding:10px 14px;margin:12px 0;font-size:14px;}
+.warn::before{content:"⚠️ 注意：";font-weight:700;color:var(--amber);}
+table.doc{border-collapse:collapse;width:100%;margin:12px 0;font-size:14px;}
+table.doc th,table.doc td{border:1px solid var(--line);padding:7px 10px;text-align:left;vertical-align:top;}
+table.doc th{background:var(--canvas);font-weight:600;}
+.btn{display:inline-block;border-radius:7px;padding:2px 10px;font-size:13px;background:var(--brand);color:#fff;font-weight:600;}
+.btn2{display:inline-block;border-radius:7px;padding:2px 10px;font-size:13px;background:#fff;border:1px solid var(--line);color:var(--ink-soft);font-weight:600;}
+.tag{display:inline-block;border-radius:999px;padding:1px 9px;font-size:12px;font-weight:600;}
+.tag-red{background:var(--rose);color:#fff;}
+.tag-yellow{background:var(--amber-bg);color:var(--amber);border:1px solid #FCD34D;}
+.tag-amber{background:#FDE68A;color:#78350F;}
+.tag-green{background:var(--green-bg);color:var(--green);}
+.tag-blue{background:var(--brand-100);color:var(--brand-dark);}
+/* ── 界面示意图通用 ── */
+.mock{border:1px solid var(--line);border-radius:14px;background:var(--canvas);padding:14px;margin:14px 0;box-shadow:0 1px 3px rgba(15,23,42,.06);page-break-inside:avoid;}
+.mock .cap{font-size:12px;color:var(--ink-muted);margin-top:10px;text-align:center;}
+.mock .bar{background:#fff;border:1px solid var(--line);border-radius:10px;padding:8px 12px;font-weight:600;font-size:14px;display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;}
+.mock .body{background:#fff;border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin-top:8px;font-size:13px;}
+.mbtn{display:inline-block;background:var(--brand);color:#fff;border-radius:8px;padding:4px 12px;font-size:13px;font-weight:600;}
+.mbtn2{display:inline-block;background:#fff;border:1px solid var(--line);color:var(--ink-soft);border-radius:8px;padding:4px 12px;font-size:13px;}
+.minput{display:inline-block;background:#fff;border:1px solid #CBD5E1;border-radius:8px;padding:3px 10px;font-size:13px;color:var(--ink-muted);min-width:110px;}
+.hl{outline:3px solid #F59E0B;outline-offset:2px;border-radius:8px;}
+.mock table{border-collapse:collapse;font-size:12.5px;width:100%;}
+.mock table th,.mock table td{border:1px solid var(--line);padding:4px 8px;text-align:center;}
+.mock table th{background:var(--canvas);color:var(--ink-muted);font-weight:600;}
+.cell-red{background:var(--rose);color:#fff;font-weight:700;}
+.cell-yellow{background:#FEF9C3;color:var(--amber);font-weight:600;}
+.cell-amber{background:#FDE68A;color:#78350F;font-weight:700;}
+.chip{display:inline-block;background:#fff;border:1px solid var(--line);border-radius:8px;padding:3px 10px;font-size:13px;margin:2px;box-shadow:0 1px 2px rgba(15,23,42,.08);}
+.chip .m{color:var(--brand);font-size:11px;}
+.chip .f{color:var(--rose);font-size:11px;}
+.roombox{border:1px solid var(--line);border-radius:10px;background:#fff;padding:8px 10px;margin-top:8px;}
+.pool{border:1.5px dashed #CBD5E1;border-radius:10px;background:var(--canvas);padding:8px 10px;}
+.alert-line{border-radius:8px;padding:6px 10px;margin-top:6px;font-size:13px;}
+.al-red{background:var(--rose-bg);border:1px solid #FECDD3;color:#9F1239;}
+.al-yellow{background:var(--amber-bg);border:1px solid #FDE68A;color:var(--amber);}
+.faq dt{font-weight:700;margin-top:16px;color:var(--brand-dark);}
+.faq dd{margin:4px 0 0 0;}
+.small{font-size:13px;color:var(--ink-muted);}
+@media print{
+ body{font-size:12.5px;}
+ .page{max-width:100%;padding:0;}
+ h2{page-break-after:avoid;break-after:avoid;}
+ .mock,.step,.tip,.warn,table.doc{page-break-inside:avoid;break-inside:avoid;}
+ a{color:inherit;text-decoration:none;}
+}
+</style>
+
+<div class="page">
+<h1>🏨 房控岗操作说明</h1>
+<p class="sub">世途旅行 · 运营控制台（后台）｜适用岗位：房控（管酒店房态、给订单分房、给酒店递入住名单）｜看不懂的地方随时问运营同事</p>
+
+<div class="toc"><b>📖 目录</b><ol>
+<li><a href="#s1">先认识你每天要用的两个页面</a></li>
+<li><a href="#s2">酒店和房型怎么维护（产品管理 › 酒店）</a></li>
+<li><a href="#s3">包房周期：告诉系统「我们切了多少间房」</a></li>
+<li><a href="#s4">房控页怎么看房态（销控矩阵 + 提醒线）</a></li>
+<li><a href="#s5">给订单分房（拼房 / 整间 / 单人入住差价）</a></li>
+<li><a href="#s6">导出分房表：给酒店递名单（怎么读「房N」）</a></li>
+<li><a href="#s7">导出房态 / 导出护照（按酒店、按姓名）</a></li>
+<li><a href="#s8">和运营、录单同事怎么配合</a></li>
+<li><a href="#s9">常见问题 FAQ</a></li>
+</ol></div>
+
+<h2 id="s1">一、先认识你每天要用的两个页面</h2>
+<p>登录后台后，左边导航栏里你主要用两个地方：</p>
+<table class="doc">
+<tr><th>页面</th><th>在哪</th><th>干什么用</th></tr>
+<tr><td><b>房控</b></td><td>左侧导航 → 运营 → <b>房控</b></td><td>你的主战场：看每家酒店每天「切了多少间、订单占了多少间、还剩多少间」，录包房周期，给订单分房，导分房表、导房态、导护照。</td></tr>
+<tr><td><b>产品管理 › 酒店</b></td><td>左侧导航 → 产品 → 产品 → 「🏨 酒店」页签</td><td>维护酒店档案：新酒店上架、改介绍图片、加房型。房控页的酒店下拉菜单里能选到的酒店，都来自这里。</td></tr>
+</table>
+<p>另外，<b>订单管理</b>（运营 → 订单）里点开任何一张订单，也能直接给这张订单分房、补收单房差——第五章会讲。</p>
+<div class="tip">建议每天上班动线：打开房控页 → 先看顶上的「提醒线」有没有红字（超卖要加房）→ 再扫一眼销控矩阵 → 出发前一两天把分房表 / 护照包导出来发给酒店和地接。</div>
+
+<h2 id="s2">二、酒店和房型怎么维护（产品管理 › 酒店）</h2>
+<p>新合作一家酒店，或者要改酒店资料、加房型时，来这里。</p>
+<div class="step"><span class="n">1</span>左侧导航进 <b>产品 → 产品</b>，点上面的「🏨 酒店」页签。</div>
+<div class="step"><span class="n">2</span>点 <span class="btn">+ 新增酒店</span>（改已有酒店就点那家卡片上的「编辑」）。会弹出一个表单。</div>
+<div class="step"><span class="n">3</span>把表单填好（带 * 的必填），点 <span class="btn">添加</span> / 保存。</div>
+
+<div class="mock">
+<div class="bar">新增酒店 <span class="mbtn2">×</span></div>
+<div class="body">
+<div>中文名 * <span class="minput">岘港海岸酒店</span>　英文名 <span class="minput">Danang Coast Hotel</span>　Emoji <span class="minput">🏨</span></div>
+<div style="margin-top:6px;">城市代码 <span class="minput">DAD 岘港 ▾</span>　区域 <span class="minput">美溪海滩</span>　星级 <span class="minput">四星 ▾</span></div>
+<div style="margin-top:6px;">详细地址 <span class="minput" style="min-width:280px;">越南岘港市 Vo Nguyen Giap 路 5 号</span>　每晚起价（前台展示价）<span class="minput">880</span></div>
+<div style="margin-top:6px;">详细介绍 / 亮点 <span class="minput" style="min-width:300px;">酒店卖点、位置、特色服务（客人会看到）</span></div>
+<div style="margin-top:6px;">图片 URL（第一张为封面）　设施标签（输入后回车，如 私人海滩、泳池、含早餐）</div>
+<div class="roombox hl"><b>房型管理</b>　<span style="color:var(--brand);font-size:12px;">+ 添加房型</span><br>
+房型名 * <span class="minput">海景大床房</span> 床型 <span class="minput">1 张大床</span> 可住人数 <span class="minput" style="min-width:40px;">2</span> 可住大人 <span class="minput" style="min-width:40px;">2</span> 可加小孩 <span class="minput" style="min-width:40px;">1</span> 价格系数 <span class="minput" style="min-width:50px;">1.15</span> 成本价(¥/晚，仅内部) <span class="minput" style="min-width:60px;">650</span></div>
+<div style="margin-top:8px;text-align:right;"><span class="mbtn2">取消</span> <span class="mbtn">添加</span></div>
+</div>
+<div class="cap">酒店表单示意图 · 橙框圈出的「房型管理」是重点：每家酒店至少要有一个房型</div>
+</div>
+
+<p>几个字段的意思，用大白话说：</p>
+<table class="doc">
+<tr><th>字段</th><th>怎么填</th></tr>
+<tr><td>每晚起价（前台展示价）</td><td>客人在前台商城看到的价格起点。<b>不是</b>我们跟酒店的进货价。</td></tr>
+<tr><td>价格系数</td><td>每个房型的实际每晚价 = 每晚起价 × 这个系数。标准房填 1.0，海景房贵一点就填 1.15 之类。</td></tr>
+<tr><td>成本价（¥/晚，仅内部）</td><td>我们拿房的净房价，只有内部同事能看到，客人看不到。填了财务算毛利才准，尽量别空着。</td></tr>
+<tr><td>可住人数 / 大人 / 小孩</td><td>这间房睡几个人。分房的时候系统按它判断一间房装几个人。</td></tr>
+</table>
+<div class="warn">删除酒店 = 下架，不会把历史订单弄丢；但已上架卖过的酒店别随便删，先问运营。</div>
+<div class="tip">在房控页的酒店下拉菜单里找不到某家酒店？就是这里还没录——先来这里新增，再回房控页。</div>
+
+<h2 id="s3">三、包房周期：告诉系统「我们切了多少间房」</h2>
+<p>「包房周期」就是记账：某家酒店、某段日期，我们切（包）了多少间、单价多少。<b>不录周期，系统就不知道你手里有多少房</b>，销控矩阵会显示「未配」。</p>
+<p>位置：房控页拉到最下面的「包房周期管理」卡片。</p>
+<div class="step"><span class="n">1</span>点右上 <span class="btn">+ 新增周期</span>。</div>
+<div class="step"><span class="n">2</span>选酒店 → 填起始日、结束日 → 填「间数」（这段日期每天切几间）→ 填「切房单价(¥/间/晚)」→ 备注可空 → <span class="btn">保存</span>。</div>
+<div class="step"><span class="n">3</span>要改就点那一行的 <span class="btn2">改</span>，要删点 <span class="btn2">删</span>（会弹确认：删了之后那段日期的「包房」数会跟着减少）。</div>
+
+<div class="mock">
+<div class="bar">包房周期管理（按 酒店 × 日期段 定切房间数 / 单价；周期可叠加）<span class="mbtn hl">+ 新增周期</span></div>
+<div class="body"><table>
+<tr><th>酒店</th><th>起始</th><th>结束</th><th>间数</th><th>单价(¥/间/晚)</th><th>备注</th><th></th></tr>
+<tr><td>岘港海岸酒店</td><td>2026-08-01</td><td>2026-08-31</td><td>10</td><td>¥650</td><td>8月切位</td><td><span class="mbtn2">改</span> <span class="mbtn2">删</span></td></tr>
+<tr><td>岘港海岸酒店</td><td>2026-08-15</td><td>2026-08-20</td><td>5</td><td>¥700</td><td>旺季加切</td><td><span class="mbtn2">改</span> <span class="mbtn2">删</span></td></tr>
+</table></div>
+<div class="cap">周期可以叠加：上面例子里 8月15–20日 这家酒店每天的「包房」= 10 + 5 = 15 间</div>
+</div>
+<div class="tip">酒店临时给你加房？不用改旧周期，直接再加一条新周期叠上去就行，方便日后对账。</div>
+
+<h2 id="s4">四、房控页怎么看房态（销控矩阵 + 提醒线）</h2>
+<h3>4.1 顶部：日期范围 + 提醒线</h3>
+<p>页面右上角选「起始 / 截止」日期（默认今天起 30 天，最长 120 天），下面所有表都跟着变。</p>
+<p>日期下面是<b>提醒线横幅</b>——系统自动帮你盯出来的事，每天先看这里：</p>
+<div class="mock">
+<div class="bar">提醒线（超卖加房 / 富余退房 / 班次超开票上限 / 拼房落单）<span class="tag tag-red">3</span><span class="mbtn2">收起 ▲</span></div>
+<div class="body">
+<div class="alert-line al-red"><b>超卖 ⚠</b> 岘港海岸酒店 8/15 <b>12/10</b> 缺 2 间 · 让地接加房</div>
+<div class="alert-line al-yellow"><b>富余提醒</b> 巴拿山庄园 8/20 还剩 6 间 · 考虑退房</div>
+<div class="alert-line al-yellow"><b>拼房落单 ⚠</b> 岘港海岸酒店 8/16 有 1 位拼房客临近出发仍未配对（异性不能拼一间）· 补单房差或另配</div>
+</div>
+<div class="cap">红色最急：占的比切的多，赶紧找地接加房。黄色两种：房多了考虑退、拼房客落单要处理</div>
+</div>
+<p class="small">提醒线里偶尔还会出现紫色的「票务 ⚠ 某班次收客超过开票上限」——那是给票务岗看的，转告一声就行。</p>
+
+<h3>4.2 销控矩阵：一家酒店四行数字</h3>
+<div class="mock">
+<div class="bar">销控矩阵（按酒店 × 日期）</div>
+<div class="body"><table>
+<tr><th>酒店</th><th></th><th>08-14</th><th>08-15</th><th>08-16</th><th>08-17</th></tr>
+<tr><td rowspan="4"><b>岘港海岸酒店</b><br><span class="small">单价 ¥650/晚</span></td><td>包房</td><td>10</td><td>10</td><td>10</td><td>0</td></tr>
+<tr><td>用房<span class="small">床位</span></td><td>6.5 <span class="tag tag-yellow">拼</span></td><td>12</td><td>10</td><td>3</td></tr>
+<tr><td>物理房间</td><td>7</td><td>12</td><td>10</td><td>3</td></tr>
+<tr><td>余量</td><td>3</td><td class="cell-red">-2</td><td class="cell-yellow">0</td><td class="cell-amber">未配</td></tr>
+</table></div>
+<div class="cap">看最后一行「余量」的颜色就够了：<span class="tag tag-red">红 = 超卖，缺房</span>　<span class="tag tag-yellow">浅黄 = 0，卖光了</span>　<span class="tag tag-amber">未配 = 那天没录包房周期</span>（不是超卖，先去补周期）</div>
+</div>
+<p>四行分别是什么：</p>
+<table class="doc">
+<tr><th>行</th><th>意思</th></tr>
+<tr><td>包房</td><td>那天我们切了多少间（= 当天所有包房周期的间数加起来）。</td></tr>
+<tr><td>用房（床位）</td><td>订单占了多少「床位」。拼房的客人一个人算 0.5，所以可能出现 6.5 这种小数。这是算钱用的口径。</td></tr>
+<tr><td>物理房间</td><td>实际要开几间房。规矩：同性两位拼房客拼 1 间；<b>男女不能拼一间</b>；落单的、性别没填的，各自独占 1 间。</td></tr>
+<tr><td>余量</td><td>= 包房 − 物理房间。真正能不能收客看这行。</td></tr>
+</table>
+<p>「用房」格子上带 <span class="tag tag-yellow">拼</span> 小标：当晚有拼房客配不上对（比如 3 男 2 女，落单 1 男）——要么补收单房差让他单住，要么再想办法配对。</p>
+
+<h3>4.3 点余量格子：看是谁占的房</h3>
+<p>任何一个「余量」格子都能点。点开右侧弹出小抽屉，列出当晚每一张占房订单：订单号、状态、联系人、几人几间、乘客名单、入住~退房、归属代理。每张订单下面有三个动作：</p>
+<table class="doc">
+<tr><th>按钮</th><th>干什么</th></tr>
+<tr><td><span class="btn2">复制订单号</span></td><td>把订单号复制走，去订单页粘贴搜索。</td></tr>
+<tr><td><span class="btn2">换酒店</span></td><td>超卖了要挪单？直接在这里给这张订单换一家酒店，换完矩阵自动刷新。</td></tr>
+<tr><td><span class="btn2">去订单页 →</span></td><td>跳到订单管理页看详情。</td></tr>
+</table>
+
+<h3>4.4 远期总量</h3>
+<p>销控矩阵下面还有一张「远期总量」表：不分酒店，按天合计——<b>收客</b>（订单占的）/ <b>控房</b>（切的）/ <b>余房</b>（差值）。用来看大盘：未来哪几天房紧、哪几天房松。</p>
+
+<h2 id="s5">五、给订单分房（拼房 / 整间 / 单人入住差价）</h2>
+<h3>5.1 两个入口，用哪个都一样</h3>
+<table class="doc">
+<tr><th>入口</th><th>怎么走</th><th>适合什么时候</th></tr>
+<tr><td>房控页</td><td>房控页「订单分房（拖拽）」卡片 → 输订单号（如 ST-20260625-0001）→ <span class="btn">查订单</span></td><td>手里有订单号，批量处理一串订单时。</td></tr>
+<tr><td>订单页</td><td>运营 → 订单 → 点开某张订单 → 「酒店情况 · 拼房」卡片 → <span class="btn">🛏 分房</span>（已分过则显示「调整分房」）</td><td>正在看这张订单时顺手分。含酒店但还没分房的订单，这里会用黄字提醒「应分房 · 尚未分房」。</td></tr>
+</table>
+
+<h3>5.2 分房就是「拖名字进房间」</h3>
+<div class="mock">
+<div class="bar">分房（拖名字到房间）　🏨 岘港海岸酒店 <span class="tag tag-green">房量充足</span><span style="font-weight:400;font-size:12px;color:var(--ink-muted);">占用 2 间 · 共 5 人</span></div>
+<div class="body" style="display:flex;gap:10px;flex-wrap:wrap;">
+<div class="pool" style="flex:1;min-width:150px;"><div class="small" style="margin-bottom:4px;">未分房 <span class="tag tag-blue">1</span></div><span class="chip">王小五 <span class="m">男</span></span></div>
+<div style="flex:2;min-width:280px;">
+<div class="roombox"><b>房间 1</b> <span class="small">2 人</span>　<span class="mbtn2">半间(拼房)</span> <span class="mbtn2">删房间</span><br><span class="chip">张三 <span class="m">男</span></span><span class="chip">李四 <span class="m">男</span></span><br><span class="minput">房型（选填，如 大床房 / 双床房）</span> <span class="minput">备注（选填，如「和某人不分开」）</span></div>
+<div class="roombox"><b>房间 2</b> <span class="tag tag-yellow">½ 半间</span> <span class="small">2 人</span>　<span class="mbtn2 hl">半间(拼房)</span> <span class="mbtn2">删房间</span><br><span class="chip">赵梅 <span class="f">女</span></span><span class="chip">钱丽 <span class="f">女</span></span></div>
+<div class="mbtn2" style="display:block;text-align:center;margin-top:8px;">+ 加房间</div>
+</div>
+</div>
+<div class="body" style="text-align:right;"><span class="mbtn2">取消</span> <span class="mbtn">保存分房</span></div>
+<div class="cap">左边是还没分的人（名字旁标男/女），把名字拖进右边的房间盒子；「半间(拼房)」按钮是拼房的开关</div>
+</div>
+<div class="step"><span class="n">1</span>左边「未分房」池子里是这张订单的出行人。用鼠标把名字<b>拖</b>到右边的房间盒子里，谁和谁一间就拖进同一个盒子。拖错了可以拖回池子，也可以在盒子之间互拖。</div>
+<div class="step"><span class="n">2</span>房间不够点 <span class="btn2">+ 加房间</span>；空房间可以 <span class="btn2">删房间</span>（<b>盒子里有人时删不了</b>，先把人拖走）。</div>
+<div class="step"><span class="n">3</span>每个盒子下面两个小格：<b>房型</b>（选填，如「大床房」「双床房」）、<b>备注</b>（选填）。备注会一路带进分房表，酒店和地接都看得到——见 5.4。</div>
+<div class="step"><span class="n">4</span>点 <span class="btn">保存分房</span>。只有装了人的盒子会被保存。保存后如果系统弹出提示（比如混性别、金额有分叉），<b>不会拦着你保存</b>，但一定要读一眼，有问题找运营核。</div>
+
+<h3>5.3 「半间(拼房)」和「整间」是什么意思</h3>
+<table class="doc">
+<tr><th></th><th>整间（默认）</th><th>半间(拼房)</th></tr>
+<tr><td>什么情况用</td><td>这个盒子里的人独占一整间房（一个人单住、一家人一间，都算整间）。</td><td>盒子里的客人是「拼房价」卖出去的——每人只买了半间床位。点一下 <span class="btn2">半间(拼房)</span> 按钮，盒子上出现 <span class="tag tag-yellow">½ 半间</span> 标。</td></tr>
+<tr><td>算账口径</td><td>算 1 间。</td><td>每盒算 0.5 间。比如 7 个拼房客 = 3.5 间床位。</td></tr>
+<tr><td>分房表里</td><td>房号显示「房3」。</td><td>房号显示「房3(½)」，备注自动带「半间/拼房」。</td></tr>
+</table>
+<div class="warn">男女不能拼一间。拼房客如果凑不成对（奇数、或性别没录），销控矩阵会标 <span class="tag tag-yellow">拼</span>、临近出发提醒线会报「拼房落单」——处理办法就两条：让客人补单人入住差价改单住，或者另找同性客人配对。</div>
+
+<h3>5.4 单人入住差价（补收单房差）</h3>
+<p>拼房客最后没人跟他拼、要一个人住一间时，公司要多收「单房差」。操作在<b>订单详情</b>里：</p>
+<div class="step"><span class="n">1</span>订单管理 → 点开这张订单 → 「酒店情况 · 拼房」卡片右上角，点黄色小字 <span class="btn2" style="color:var(--amber);">补收单房差</span>。</div>
+<div class="step"><span class="n">2</span>填「每晚金额」（整数，比如 300）×「晚数」（默认按套餐晚数带出，可改，1–60）；下面会自动算合计。备注可写「客户单人入住」。</div>
+<div class="step"><span class="n">3</span><b>「转单住乘客」下拉（重要）</b>：选出是<b>哪位客人</b>转单住——选了之后系统会把他标记为单人入住，套餐的计费房数自动按「独住占一间」重算，<b>房控和分房自动跟着变</b>。如果只是收钱、房态不用动，就选「不联动」。已经标过单住的人是灰的，不能重复选。</div>
+<div class="step"><span class="n">4</span>点 <span class="btn">确认补收</span> → 再确认一次弹窗。系统会在订单里加一条费用行，钱计入这张订单的应收 / 尾款，收款由运营 / 财务跟进。</div>
+<div class="tip">这笔差价多少钱，按公司当期的口径收，拿不准先问运营，别自己拍。</div>
+
+<h2 id="s6">六、导出分房表：给酒店递名单</h2>
+<p>位置：房控页上方「导出分房表」卡片。这是你交给酒店 / 地接的入住名单（Excel）。</p>
+<h3>6.1 两种导出口径，先选对</h3>
+<table class="doc">
+<tr><th>口径</th><th>选什么</th><th>导出来的是</th><th>什么时候用</th></tr>
+<tr><td>按入住区间</td><td>入住起 ~ 入住止（<b>最长 14 天</b>，超了会报错）</td><td>这段日期入住的所有客人。每个入住日期一个工作表（表名像「7-10」），表内按酒店分组。</td><td>给某家酒店对某几天的房。</td></tr>
+<tr><td>按出发日</td><td>一个出发日</td><td>那天出发的所有订单的<b>整段</b>住宿——住几晚就出现在几个工作表里。</td><td>按团（出发日）给地接发整团名单。</td></tr>
+</table>
+<div class="step"><span class="n">1</span>点选「按入住区间」或「按出发日」→ 选日期 → 点 <span class="btn">导出分房表</span>，浏览器会下载一个 .xlsx 文件。</div>
+
+<h3>6.2 表里的列怎么读</h3>
+<p>一行 = 一位客人。前面是老样式名单一样的列（代理机构、备注、酒店类型、中文名称、乘客姓名、出发(往返)日期、结算价格、生日、性别、证件编号、签发/有效日期、录入时间、房型），<b>最后三列是新系统特有的，重点看两列：</b></p>
+<div class="mock">
+<div class="body"><table>
+<tr><th>序号</th><th>中文名称</th><th>乘客姓名</th><th>房型</th><th class="hl">房间号</th><th>升级原因</th><th class="hl">当日余房</th><th>备注</th></tr>
+<tr><td>1</td><td>张三</td><td>ZHANG, SAN</td><td>双床房</td><td><b>房1</b></td><td></td><td>3</td><td></td></tr>
+<tr><td>2</td><td>李四</td><td>LI, SI</td><td>双床房</td><td><b>房1</b></td><td></td><td>3</td><td></td></tr>
+<tr><td>3</td><td>赵梅</td><td>ZHAO, MEI</td><td>大床房</td><td><b>房2(½)</b></td><td></td><td>3</td><td>要高楼层 / 半间/拼房</td></tr>
+<tr><td>4</td><td></td><td>WANG, WU</td><td>大床房</td><td><b>房3</b></td><td></td><td>3</td><td></td></tr>
+</table></div>
+<div class="cap">同一个「房N」= 住同一间；带「(½)」= 拼房半间。中文名空着 = 这位客人还没录中文名，去订单里补</div>
+</div>
+<table class="doc">
+<tr><th>房间号列显示</th><th>意思</th></tr>
+<tr><td>房1、房2…（同号相邻）</td><td>号一样的人住同一间。你手工分的房，原样按组出。</td></tr>
+<tr><td>房2(½)</td><td>这一间是「半间/拼房」组，备注列也会自动带「半间/拼房」字样。</td></tr>
+<tr><td>没手工分房的客人</td><td>系统自动编号：男客一批、女客一批，按房型能住的人数装满一间开下一间；<b>性别没录的客人各自单独一间</b>（保险起见不给拼）。自动编的房号排在手工分的后面。所以名单不会有人漏房号——但自动分的只是兜底，正式名单前最好还是手工分好。</td></tr>
+</table>
+<table class="doc">
+<tr><th>当日余房列显示</th><th>意思</th></tr>
+<tr><td>数字（如 3）</td><td>这位客人入住当晚，这家酒店在销控上还剩几间。负数 = 已超卖。</td></tr>
+<tr><td>未配</td><td>那晚没录包房周期——回第三章补。</td></tr>
+<tr><td>—</td><td>系统对不上这位客人到底归哪家酒店（一般是手工分房时填的酒店名和订单里的酒店对不上），宁可空着不瞎标。碰到就把分房重新保存一遍或找运营看。</td></tr>
+</table>
+<p class="small">另外：「结算价格」列是人均（订单总价 ÷ 人数）；「飞行次数」「升级原因」两列目前系统没有数据，固定留空，是正常的。</p>
+
+<h2 id="s7">七、导出房态 / 导出护照</h2>
+<h3>7.1 导出房态</h3>
+<p>房控页「导出房态（销控矩阵）」卡片：选起始 / 截止（最长 120 天）→ 点 <span class="btn">导出房态</span>。导出的 Excel 和你屏幕上看到的销控矩阵一模一样（每家酒店 包房/用房/物理房间/余量 四行，含「未配包房」标记），发群里汇报房态很方便。</p>
+<h3>7.2 导出护照（按酒店）——给酒店 / 地接递证件</h3>
+<div class="step"><span class="n">1</span>还是这张卡片里，下半部分「导出护照（按酒店）」：选一家酒店 + 入住起 / 入住止。</div>
+<div class="step"><span class="n">2</span>点 <span class="btn">导出护照</span> → 下载一个 zip 压缩包：这段日期入住这家酒店的所有客人的护照图片，<b>按订单号分文件夹</b>。</div>
+<div class="step"><span class="n">3</span><b>先打开包里的 README.txt 看一眼</b>：哪位客人还没传护照图，都列在里面——缺的去催运营 / 客人补。</div>
+<p class="small">酒店下拉里只有当前销控板日期范围内出现过的酒店；找不到就先把页面顶部的日期范围调大。</p>
+<h3>7.3 导出护照（按姓名）——临时凑名单用</h3>
+<p>不限酒店，把一串姓名（逗号、顿号、空格、换行分隔都行，<b>一次最多 100 个</b>）贴进输入框，可以再选一个出发日期范围过滤（留空 = 不限），点 <span class="btn">导出护照(按姓名)</span>。zip 按出发日期分文件夹、按姓名命名文件。中文名要一字不差；护照上的拼音名不分大小写。</p>
+
+<h2 id="s8">八、和运营、录单同事怎么配合</h2>
+<table class="doc">
+<tr><th>场景</th><th>约定的做法</th></tr>
+<tr><td>客人有酒店方面的要求<br>（指定酒店、要拼房、要高楼层、蜜月布置…）</td><td>让<b>录单同事</b>在录单时填进「酒店情况（选填）」这一栏。它会显示在订单详情的「酒店备注」里——你分房前<b>先看这一栏</b>，再照着落实到分房上。</td></tr>
+<tr><td>要求落到分房上</td><td>能用结构表达的用结构：谁和谁一间 = 拖进同一个盒子；拼房 = 切「半间(拼房)」。剩下没法结构化的（「和某人不分开」「要高楼层」）写进<b>房间盒子的备注</b>——它会带进分房表的备注列，酒店直接看得到。</td></tr>
+<tr><td>订单里看拼房情况</td><td>订单详情「酒店情况 · 拼房」卡片会显示一句摘要，比如「整间 双床房：张三、李四；半间(拼房)：赵梅、钱丽」。没分房会黄字提醒「应分房 · 尚未分房」。</td></tr>
+<tr><td>客人改单住 / 收单房差</td><td>你在订单详情点「补收单房差」并选好「转单住乘客」（见 5.4）；<b>收钱</b>这一步由运营 / 财务在订单里确认收款，你不用碰钱。</td></tr>
+<tr><td>超卖挪单 / 换酒店</td><td>小范围直接在余量格下钻抽屉里「换酒店」；牵扯客人沟通的，先跟运营打招呼再动。</td></tr>
+<tr><td>酒店确认工单</td><td>「工单看板」里的酒店确认类工单归操作部跟；你负责的是房态账和名单准确。</td></tr>
+<tr><td>名单里客人少了一个？</td><td>纯占位的联系人（证件号是 N/A 的）不进分房池、不上名单，这是正常的，不用慌。</td></tr>
+</table>
+
+<h2 id="s9">九、常见问题 FAQ</h2>
+<dl class="faq">
+<dt>Q1：余量是红色负数，怎么办？</dt>
+<dd>真超卖了。两条路：① 找地接 / 酒店加房，加到了就去「包房周期管理」加一条周期把账补平；② 加不到就挑订单「换酒店」挪走。提醒线每天都会用红条催你。</dd>
+<dt>Q2：格子显示「未配」是坏了吗？</dt>
+<dd>不是坏了，也不是超卖——那天你还没录包房周期，系统没法算余量。去「包房周期管理」把那段日期的切房录进去就好了。</dd>
+<dt>Q3：「用房」怎么会有 6.5 间这种小数？</dt>
+<dd>那是床位口径：拼房客一人算 0.5。看实际要开几间房，看下面的「物理房间」行；看能不能收客，看「余量」行。</dd>
+<dt>Q4：「拼」的小黄标是什么意思？</dt>
+<dd>当晚有拼房客配不上对（男女不能拼一间；性别没录的也不给拼）。要么补收单房差让他单住，要么再配一位同性拼房客。临近出发还没处理，提醒线会报「拼房落单」。</dd>
+<dt>Q5：分房时房间盒子删不掉？</dt>
+<dd>盒子里还有人。先把名字拖回左边池子（或拖去别的盒子），空盒子才能删。另外至少要留一个盒子。</dd>
+<dt>Q6：没分房的订单，分房表里会不会漏人？</dt>
+<dd>不会漏。没手工分的客人系统会自动按性别、按房型人数打包编房号兜底。但自动分的不懂客人的要求，正式给酒店的名单，出发前尽量都手工分好。</dd>
+<dt>Q7：分房表「中文名称」一列是空的？</dt>
+<dd>这位客人还没录中文名（系统不会拿护照拼音充数）。去订单详情的乘客区把中文名补上再导。</dd>
+<dt>Q8：导出分房表提示「跨度最多 14 天」？</dt>
+<dd>按入住区间导出一次最多 14 天，分两次导。导房态最长 120 天。</dd>
+<dt>Q9：保存分房时弹出一堆提示，是不是没保存上？</dt>
+<dd>保存上了。那些提示（金额有分叉、一间房里男女混住、订单里有多条酒店行之类）是让你复核的，不拦保存——但别直接点掉不看，有疑问找运营。</dd>
+<dt>Q10：护照 zip 里少了几个人的护照？</dt>
+<dd>打开压缩包里的 README.txt，缺图的客人都列在那——是还没上传护照照片，去催补，不是导出丢了。</dd>
+<dt>Q11：新增包房周期时下拉里没有那家酒店？</dt>
+<dd>酒店还没建档。去 产品管理 › 酒店 新增（第二章），回来就有了。</dd>
+<dt>Q12：补收单房差点了「不联动」，房控数字没变，正常吗？</dt>
+<dd>正常——「不联动」就是只收钱不动房。要让房控 / 分房跟着按单住重算，得在下拉里选出转单住的那位乘客。</dd>
+</dl>
+
+<p class="small" style="margin-top:40px;border-top:1px solid var(--line);padding-top:12px;">本说明按系统当前版本编写；界面以线上实际为准，遇到和说明对不上的地方请反馈给运营。可直接用浏览器「打印」保存为 PDF（A4）。</p>
+</div>

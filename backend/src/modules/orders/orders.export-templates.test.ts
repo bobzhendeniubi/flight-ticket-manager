@@ -29,12 +29,13 @@ import {
 const D = (s: string): Date => new Date(s.length <= 10 ? `${s}T00:00:00.000Z` : `${s}Z`);
 
 /**
- * 《全岗可用》模版 53 列表头（叶子列；末尾三列并入「订单成本」分组）。
+ * 《全岗可用》模版 54 列表头（叶子列；末尾三列并入「订单成本」分组）。
  * 定金组四列已移除：系统无定金模型，四列恒空，且现行模版本身已删除该组。
+ * 「纯拼音名」为旧模版之外新增：无 MR/MS 称谓的 LAST/FIRST，财务对数/名单匹配用。
  */
 const FULL_HEADERS = [
   '序号', '是否是原订单', '代理机构', '备注', '酒店类型', '中文名称', '乘客姓名',
-  '飞行次数', '出发(往返)日期', '航班号', '订单类型',
+  '纯拼音名', '飞行次数', '出发(往返)日期', '航班号', '订单类型',
   '结算价格', '结算价到账金额', '结算价到账时间',
   '结算价到账渠道', '尾款金额', '单房差', '单房差到账金额', '签证金额', '签证到账金额',
   '抵扣金额', '抵扣到账金额', '抵扣人员', '抵扣订单', '是否清账', '退款金额', '退款时间',
@@ -217,8 +218,8 @@ function fixtureRoundTrip(): OrderForTemplateExport {
   } as unknown as OrderForTemplateExport;
 }
 
-describe('《全岗可用》full 模版 — 列定义对齐 53 列', () => {
-  it('FULL_COLUMNS 列名列序与模版 53 列完全一致', () => {
+describe('《全岗可用》full 模版 — 列定义对齐 54 列', () => {
+  it('FULL_COLUMNS 列名列序与模版 54 列完全一致', () => {
     expect(FULL_COLUMNS.map((c) => c.header)).toEqual(FULL_HEADERS);
   });
 
@@ -246,6 +247,11 @@ describe('《全岗可用》full 模版 — 逐列取值/格式', () => {
     // r1 成人男性（按出发日实足 42 岁）→ MR；r2 按出发日实足 7 岁 = 儿童、性别 F → MISS。
     expect(r1.passengerName).toBe('WANG/LIANBO MR');
     expect(r2.passengerName).toBe('李四 MISS');
+  });
+
+  it('纯拼音名：LAST/FIRST 不带称谓（财务对数用，0720 公测反馈 MR/MS 影响匹配）', () => {
+    expect(r1.cleanName).toBe('WANG/LIANBO');
+    expect(r2.cleanName).toBe('李四');
   });
 
   it('出发(往返)日期 / 航班号 / 订单类型：往返票口径', () => {
@@ -300,7 +306,7 @@ describe('《全岗可用》full 模版 — 逐列取值/格式', () => {
       expect(r.offsetOrder).toBe('');
       expect(r.refundChannel).toBe('');
       expect(r.invoiceStatusManual).toBe('');
-      expect(r.visaNote).toBe('');
+      expect(r.visaNote).toBe(''); // 本 fixture noteVisa=null → 留空（有值时填真值，见下）
       expect(r.distribution).toBe('');
       expect(r.infantWith).toBe('');
       expect(r.temp).toBe('');
@@ -313,6 +319,73 @@ describe('《全岗可用》full 模版 — 逐列取值/格式', () => {
   it('签证状态/选项：填真值', () => {
     expect(r1.visaStatus).toBe('处理中');
     expect(r1.visaOption).toBe('越南电子签');
+  });
+});
+
+// ── 套餐(BUNDLE)单：酒店/签证信息不再整列空白（0720 公测反馈）────────────────
+// 套餐把房型盖在 BUNDLE 行上、签证任务也挂在 BUNDLE 行上、签证组件名在套餐定义
+// items JSON 里 —— 修复前只认 kind==='HOTEL'/'VISA' 行，套餐单三列全空。
+describe('《全岗可用》full 模版 — 套餐单酒店/签证/备注取值', () => {
+  function fixtureBundle(): OrderForTemplateExport {
+    const order = fixtureRoundTrip();
+    const o = order as unknown as {
+      visaStatus: string | null;
+      noteVisa: string | null;
+      items: unknown[];
+    };
+    o.noteVisa = '自备签，随团免签名单已交';
+    o.visaStatus = null; // 订单级缺省 → 回落 BUNDLE 行任务状态
+    // 只留两段航班 + 一个 BUNDLE 行（无独立 HOTEL/VISA 行）
+    o.items = [
+      ...order.items.filter((it) => it.kind === 'FLIGHT'),
+      {
+        kind: 'BUNDLE',
+        flightCabin: null,
+        amount: 3000,
+        description: '岘港3天2晚随机 · 回程（经济舱）',
+        metadata: null,
+        hotelRoomTypeId: 'hrt9',
+        flightSchedule: null,
+        hotelRoomType: { name: '高级双床', hotel: { name: '岘港五星', code: 'DN5' } },
+        visa: null,
+        transfer: null,
+        bundle: {
+          code: 'BND1',
+          items: [
+            { kind: 'HOTEL', productName: '岘港五星', qty: 1, unitPrice: 800 },
+            { kind: 'VISA', productName: '越南电子签(套餐)', qty: 2, unitPrice: 250 },
+          ],
+        },
+        fulfillmentTasks: [{ type: 'VISA_APPLICATION', status: 'IN_PROGRESS' }],
+      },
+    ];
+    return order;
+  }
+
+  const order = fixtureBundle();
+  const [r1] = orderToFullRows(order, buildOrderContext(order));
+
+  it('酒店类型：BUNDLE 行上的房型也算（酒店名 + 房型名）', () => {
+    expect(r1.hotelInfo).toBe('岘港五星 高级双床');
+  });
+
+  it('签证状态：回落 BUNDLE 行上的签证履约任务', () => {
+    expect(r1.visaStatus).toBe('处理中');
+  });
+
+  it('签证选项：取套餐定义里的签证组件名', () => {
+    expect(r1.visaOption).toBe('越南电子签(套餐)');
+  });
+
+  it('签证备注：填订单「签证备注」结构化栏', () => {
+    expect(r1.visaNote).toBe('自备签，随团免签名单已交');
+  });
+
+  it('订单级签证状态优先于履约任务（与全岗总表同口径）', () => {
+    const o2 = fixtureBundle();
+    (o2 as unknown as { visaStatus: string }).visaStatus = 'E_VISA';
+    const [row] = orderToFullRows(o2, buildOrderContext(o2));
+    expect(row.visaStatus).toBe('电子签');
   });
 });
 
