@@ -29,6 +29,7 @@ import {
 import { useAuth } from '../stores/auth';
 import { NumberInput } from '../components/NumberInput';
 import { PaymentChannelsManager } from '../components/PaymentChannelsManager';
+import { StatementReconciliation } from '../components/StatementReconciliation';
 
 // 收款方式选项（与订单收款一致）
 const METHOD_OPTIONS: PaymentMethod[] = ['WECHAT_PAY', 'ALIPAY', 'BANK_CARD', 'AGENT_PREPAYMENT'];
@@ -36,8 +37,8 @@ const METHOD_OPTIONS: PaymentMethod[] = ['WECHAT_PAY', 'ALIPAY', 'BANK_CARD', 'A
 // 进账截图最大 6MB（与后端 proofUrlSchema 对齐）
 const MAX_PROOF_BYTES = 6 * 1024 * 1024;
 
-// 顶部过滤页签
-type Tab = 'open' | 'allocated' | 'refunded' | 'ledger' | 'channels';
+// 顶部过滤页签（statement = 流水认款工作台：导入二维码流水 + 分房式拖拽配对）
+type Tab = 'open' | 'statement' | 'allocated' | 'refunded' | 'ledger' | 'channels';
 
 // 状态徽标 → Console badge
 function statusBadge(status: ReceiptStatus): string {
@@ -123,7 +124,7 @@ export function ReconciliationPage() {
   }, [token]);
 
   useEffect(() => {
-    if (tab === 'channels') return; // 渠道管理自带加载
+    if (tab === 'channels' || tab === 'statement') return; // 渠道管理/流水工作台自带加载
     if (tab === 'ledger') loadLedger();
     else loadReceipts();
   }, [tab, loadReceipts, loadLedger]);
@@ -175,7 +176,7 @@ export function ReconciliationPage() {
             一处看所有进账 · 把挂账 / 超额 / 认不出的钱认领到订单或退款 · 配置统一收款码
           </p>
         </div>
-        {tab !== 'channels' && (
+        {tab !== 'channels' && tab !== 'statement' && (
           <button type="button" className="btn-primary text-sm" onClick={() => setShowRegister(true)}>
             + 登记新进账
           </button>
@@ -203,6 +204,9 @@ export function ReconciliationPage() {
         <TabBtn active={tab === 'open'} onClick={() => setTab('open')}>
           待认领
         </TabBtn>
+        <TabBtn active={tab === 'statement'} onClick={() => setTab('statement')}>
+          流水认款
+        </TabBtn>
         <TabBtn active={tab === 'allocated'} onClick={() => setTab('allocated')}>
           已认领
         </TabBtn>
@@ -216,11 +220,11 @@ export function ReconciliationPage() {
           收款渠道
         </TabBtn>
 
-        {tab !== 'channels' && tab !== 'ledger' && (
+        {tab !== 'channels' && tab !== 'ledger' && tab !== 'statement' && (
           <div className="ml-auto">
             <input
               className="input py-1.5"
-              placeholder="搜进账号 / 付款备注 / 订单提示"
+              placeholder="搜进账号 / 流水号 / 付款备注 / 订单提示"
               value={q}
               onChange={(e) => setQ(e.target.value)}
               onKeyDown={(e) => {
@@ -239,6 +243,8 @@ export function ReconciliationPage() {
 
       {tab === 'channels' ? (
         <PaymentChannelsManager />
+      ) : tab === 'statement' ? (
+        <StatementReconciliation token={token} onMutated={loadReceipts} />
       ) : tab === 'ledger' ? (
         <LedgerTable rows={ledger} loading={loading} />
       ) : (

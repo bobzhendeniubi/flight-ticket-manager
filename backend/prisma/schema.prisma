@@ -1388,6 +1388,7 @@ enum ReceiptSource {
   CUSTOMER_UPLOAD // 客户上传付款凭证（仅声明）
   STAFF_ENTRY // 财务/客服后台登记
   ORDER_OVERPAY // 订单超额转入挂账池
+  STATEMENT_IMPORT // 收单平台二维码流水导入（按交易流水号去重）
 }
 
 // 一笔到账（统一收款码收到的钱）。
@@ -1399,6 +1400,8 @@ model Receipt {
   method       PaymentMethod
   proofUrl     String?       @db.Text // 付款凭证截图（data URL，≤6MB）
   payerNote    String? // 付款人备注（客户填的订单号/留言）
+  // 收单平台交易流水号（流水导入专用；唯一 → 同一笔流水绝不重复入池）
+  externalTxnId String? @unique
   orderHintId  String? // 疑似归属订单（客户上传时带的；仅提示，不等于已认领）
   receivedAt   DateTime // 到账时间（财务可手填）
   source       ReceiptSource

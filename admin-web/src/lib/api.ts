@@ -1780,8 +1780,8 @@ export interface UpdatePaymentChannelInput {
 
 /** 进账状态：未认领 / 部分认领 / 已认领 / 已退款 */
 export type ReceiptStatus = 'OPEN' | 'PARTIALLY_ALLOCATED' | 'ALLOCATED' | 'REFUNDED';
-/** 进账来源：客户上传 / 后台录入 / 订单超额转入 */
-export type ReceiptSource = 'CUSTOMER_UPLOAD' | 'STAFF_ENTRY' | 'ORDER_OVERPAY';
+/** 进账来源：客户上传 / 后台录入 / 订单超额转入 / 二维码流水导入 */
+export type ReceiptSource = 'CUSTOMER_UPLOAD' | 'STAFF_ENTRY' | 'ORDER_OVERPAY' | 'STATEMENT_IMPORT';
 
 export const RECEIPT_STATUS_LABEL: Record<ReceiptStatus, string> = {
   OPEN: '待认领',
@@ -1793,7 +1793,64 @@ export const RECEIPT_SOURCE_LABEL: Record<ReceiptSource, string> = {
   CUSTOMER_UPLOAD: '客户上传',
   STAFF_ENTRY: '后台录入',
   ORDER_OVERPAY: '订单超额',
+  STATEMENT_IMPORT: '流水导入',
 };
+
+/** 流水预览行处置：ok=可导入；dup_in_db=库里已有；dup_in_file=文件内重复；skipped_status=非支付成功；invalid=解析失败 */
+export type StatementDisposition = 'ok' | 'dup_in_db' | 'dup_in_file' | 'skipped_status' | 'invalid';
+
+/** 流水解析预览行（POST /receipts/statement/parse） */
+export interface StatementPreviewRow {
+  rowNumber: number;
+  externalTxnId: string;
+  receivedAt: string | null;
+  amountCny: number | null;
+  method: PaymentMethod;
+  rawMethod: string;
+  rawStatus: string;
+  payerNote: string | null;
+  disposition: StatementDisposition;
+  /**
+   * disposition=dup_in_db 时附现库进账号 + 认款状态（重复导入不丢已认状态的证明）；
+   * amountMismatch=true 表示同流水号但金额与库中不一致（数据冲突，需人工核）。
+   */
+  existing: { receiptNo: string; status: ReceiptStatus; amountCny: string; amountMismatch: boolean } | null;
+}
+
+export interface StatementPreviewResult {
+  rows: StatementPreviewRow[];
+  warnings: string[];
+  summary: {
+    total: number;
+    importable: number;
+    dupInDb: number;
+    dupInFile: number;
+    skippedStatus: number;
+    invalid: number;
+  };
+}
+
+/** 流水导入提交行（预览 ok 行原样回传） */
+export interface StatementImportRow {
+  externalTxnId: string;
+  amountCny: number;
+  method: PaymentMethod;
+  receivedAt: string;
+  payerNote?: string;
+}
+
+/** 认款工作台待收款订单候选（GET /receipts/match-candidates） */
+export interface ReceiptMatchCandidate {
+  orderId: string;
+  orderNumber: string;
+  contactName: string;
+  agentName: string | null;
+  status: OrderStatus;
+  createdAt: string;
+  totalPayable: number;
+  paidAmount: number;
+  balanceDue: number;
+}
 
 /** 单笔进账的认领分配（嵌在 Receipt.allocations[]；金额为 Decimal→string） */
 export interface ReceiptAllocation {
@@ -1814,6 +1871,8 @@ export interface Receipt {
   method: PaymentMethod;
   proofUrl: string | null;
   payerNote: string | null;
+  /** 收单平台交易流水号（流水导入的进账才有；唯一） */
+  externalTxnId: string | null;
   orderHintId: string | null;
   receivedAt: string;
   source: ReceiptSource;
@@ -1828,7 +1887,9 @@ export interface Receipt {
 /** GET /receipts 查询参数 */
 export interface ListReceiptsParams {
   status?: ReceiptStatus;
-  q?: string; // 匹配 receiptNo / payerNote / orderHintId
+  /** '1' = 只回未认完的（OPEN + 部分认款）——认款工作台专用 */
+  unallocatedOnly?: '1';
+  q?: string; // 匹配 receiptNo / payerNote / orderHintId / externalTxnId
 }
 
 /** POST /receipts body（后台登记新进账） */
@@ -3150,6 +3211,36 @@ export const api = {
       `/receipts/${id}/refund`,
       { method: 'POST', token, body: { note } },
     ),
+
+  // ── 二维码流水导入 + 认款工作台（ADMIN/STAFF）──
+  // 解析收单平台流水 xlsx（base64）→ 预览行 + 处置判定（不写库）
+  parseReceiptStatement: (token: string, fileBase64: string) =>
+    apiFetch<StatementPreviewResult>('/receipts/statement/parse', {
+      method: 'POST',
+      token,
+      body: { fileBase64 },
+    }),
+  // 流水入池：预览确认后提交；服务端按交易流水号唯一索引兜底去重（重复导入幂等）
+  importReceiptStatement: (token: string, rows: StatementImportRow[]) =>
+    apiFetch<{ ok: true; requested: number; imported: number; skipped: number }>(
+      '/receipts/statement/import',
+      { method: 'POST', token, body: { rows } },
+    ),
+  // 认款工作台：近 400 单里尾款 > 0 的待收款订单候选（最多 200）
+  getReceiptMatchCandidates: (token: string) =>
+    apiFetch<{ orders: ReceiptMatchCandidate[] }>('/receipts/match-candidates', { token }),
+  // 流水核对表导出（xlsx；含认款状态/认到订单/认款人列）。返回 Blob 直接下载。
+  exportReceiptStatement: async (token: string, query?: { from?: string; to?: string }): Promise<Blob> => {
+    const qs = new URLSearchParams();
+    if (query?.from) qs.set('from', query.from);
+    if (query?.to) qs.set('to', query.to);
+    const res = await fetch(
+      `${API_BASE}/receipts/statement/export${qs.toString() ? '?' + qs.toString() : ''}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) throw new ApiError(res.status, { code: 'EXPORT_FAILED', message: await res.text() });
+    return res.blob();
+  },
 
   // ── 订单超额转挂账池（ADMIN/STAFF）──
   // 把订单多付（paidAmount−total）转入挂账池：生成一条 ORDER_OVERPAY 进账，订单回到刚好结清。

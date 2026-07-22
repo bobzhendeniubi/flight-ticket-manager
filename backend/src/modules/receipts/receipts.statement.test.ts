@@ -1,0 +1,265 @@
+/**
+ * 二维码流水解析单测（纯内存，不碰 DB）。
+ *
+ * 覆盖：
+ *   - 表头行自动定位（收单平台原表第 1 行是「订单」占位行，表头在第 2 行）
+ *   - 列序按表头名对号（打乱列顺序仍解析正确）
+ *   - 仅「支付成功」可导入；未支付/订单已关闭标 skipped_status
+ *   - 文件内流水号重复 → 后行标 dup_in_file
+ *   - 金额/时间/流水号缺失或不可解析 → invalid + warning
+ *   - 支付方式映射（微信/支付宝/其它）
+ *   - 交易时间按 +08:00 墙钟解释
+ *   - 备注列合并进 payerNote
+ *   - 核对表导出工作簿列头与行内容
+ */
+import { describe, it, expect } from 'vitest';
+import ExcelJS from 'exceljs';
+import {
+  parseStatementXlsx,
+  buildStatementExportWorkbook,
+  STATEMENT_MAX_ROWS,
+  type StatementExportEntry,
+} from './receipts.statement.js';
+
+const HEADERS = [
+  '商户名称',
+  '商户订单号',
+  '交易流水号',
+  '交易时间',
+  '交易金额',
+  '支付方式',
+  '交易状态',
+  '二维码备注',
+  '支付付款方备注',
+];
+
+/** 造一个收单平台风格的流水 xlsx（首行「订单」占位 + 第二行表头 + 数据行）→ base64。 */
+async function buildStatementBase64(
+  dataRows: Array<Array<string | number>>,
+  opts: { headers?: string[]; skipPlaceholderRow?: boolean } = {},
+): Promise<string> {
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet('订单');
+  if (!opts.skipPlaceholderRow) {
+    ws.addRow(HEADERS.map(() => '订单'));
+  }
+  ws.addRow(opts.headers ?? HEADERS);
+  for (const r of dataRows) ws.addRow(r);
+  const buf = await wb.xlsx.writeBuffer();
+  return Buffer.from(buf as ArrayBuffer).toString('base64');
+}
+
+function row(
+  txnId: string,
+  time: string,
+  amount: string | number,
+  method: string,
+  status: string,
+  qrRemark = '',
+  payerRemark = '',
+): Array<string | number> {
+  return ['测试商户', '', txnId, time, amount, method, status, qrRemark, payerRemark];
+}
+
+describe('parseStatementXlsx', () => {
+  it('解析标准流水：支付成功入池、其它状态标跳过', async () => {
+    const b64 = await buildStatementBase64([
+      row('TXN001', '2026-07-21 23:20:17', '300.00', '微信', '支付成功'),
+      row('TXN002', '2026-07-21 23:19:47', '300.00', '微信', '未支付'),
+      row('TXN003', '2026-07-21 22:25:36', '1558.00', '支付宝', '支付成功'),
+      row('TXN004', '2026-07-21 21:56:00', '1810.00', '支付宝', '订单已关闭'),
+    ]);
+    const { rows, warnings } = await parseStatementXlsx(b64);
+    expect(rows).toHaveLength(4);
+    expect(rows[0].disposition).toBe('ok');
+    expect(rows[1].disposition).toBe('skipped_status');
+    expect(rows[2].disposition).toBe('ok');
+    expect(rows[3].disposition).toBe('skipped_status');
+    expect(warnings).toHaveLength(0);
+  });
+
+  it('交易时间按北京时 +08:00 解释', async () => {
+    const b64 = await buildStatementBase64([
+      row('TXN001', '2026-07-21 23:20:17', 300, '微信', '支付成功'),
+    ]);
+    const { rows } = await parseStatementXlsx(b64);
+    // 北京 23:20:17 = UTC 15:20:17
+    expect(rows[0].receivedAt?.toISOString()).toBe('2026-07-21T15:20:17.000Z');
+  });
+
+  it('支付方式映射：微信/支付宝/其它', async () => {
+    const b64 = await buildStatementBase64([
+      row('TXN001', '2026-07-21 10:00:00', 100, '微信', '支付成功'),
+      row('TXN002', '2026-07-21 10:01:00', 100, '支付宝', '支付成功'),
+      row('TXN003', '2026-07-21 10:02:00', 100, '云闪付', '支付成功'),
+    ]);
+    const { rows } = await parseStatementXlsx(b64);
+    expect(rows.map((r) => r.method)).toEqual(['WECHAT_PAY', 'ALIPAY', 'BANK_CARD']);
+  });
+
+  it('文件内流水号重复 → 后行 dup_in_file + warning', async () => {
+    const b64 = await buildStatementBase64([
+      row('TXN-DUP', '2026-07-21 10:00:00', 100, '微信', '支付成功'),
+      row('TXN-DUP', '2026-07-21 10:00:00', 100, '微信', '支付成功'),
+    ]);
+    const { rows, warnings } = await parseStatementXlsx(b64);
+    expect(rows[0].disposition).toBe('ok');
+    expect(rows[1].disposition).toBe('dup_in_file');
+    expect(warnings.some((w) => w.includes('TXN-DUP'))).toBe(true);
+  });
+
+  it('缺流水号 / 金额不可解析 / 时间不可解析 → invalid + warning', async () => {
+    const b64 = await buildStatementBase64([
+      row('', '2026-07-21 10:00:00', 100, '微信', '支付成功'),
+      row('TXN002', '2026-07-21 10:00:00', '不是数', '微信', '支付成功'),
+      row('TXN003', '时间坏了', 100, '微信', '支付成功'),
+    ]);
+    const { rows, warnings } = await parseStatementXlsx(b64);
+    expect(rows.map((r) => r.disposition)).toEqual(['invalid', 'invalid', 'invalid']);
+    expect(warnings).toHaveLength(3);
+  });
+
+  it('金额吃千分位字符串；零金额/分以下金额（round 成 0）无效', async () => {
+    const b64 = await buildStatementBase64([
+      row('TXN001', '2026-07-21 10:00:00', '1,558.00', '微信', '支付成功'),
+      row('TXN002', '2026-07-21 10:01:00', '0', '微信', '支付成功'),
+      row('TXN003', '2026-07-21 10:02:00', 0.001, '微信', '支付成功'),
+    ]);
+    const { rows } = await parseStatementXlsx(b64);
+    expect(rows[0].amountCny).toBe(1558);
+    expect(rows[0].disposition).toBe('ok');
+    expect(rows[1].disposition).toBe('invalid');
+    // 0.001 若不拦会 round 成 0 元僵尸进账（认不了款也退不了款）
+    expect(rows[2].disposition).toBe('invalid');
+  });
+
+  it('流水号超长（>64 字符）标 invalid，不等提交时整批被拒', async () => {
+    const longId = 'X'.repeat(65);
+    const b64 = await buildStatementBase64([
+      row(longId, '2026-07-21 10:00:00', 100, '微信', '支付成功'),
+      row('TXN-OK', '2026-07-21 10:01:00', 100, '微信', '支付成功'),
+    ]);
+    const { rows, warnings } = await parseStatementXlsx(b64);
+    expect(rows[0].disposition).toBe('invalid');
+    expect(rows[1].disposition).toBe('ok');
+    expect(warnings.some((w) => w.includes('长度异常'))).toBe(true);
+  });
+
+  it('备注超长截断到 500 字符（与 schema 上限对齐，不拒行）', async () => {
+    const longNote = '备'.repeat(600);
+    const b64 = await buildStatementBase64([
+      row('TXN001', '2026-07-21 10:00:00', 100, '微信', '支付成功', longNote),
+    ]);
+    const { rows } = await parseStatementXlsx(b64);
+    expect(rows[0].disposition).toBe('ok');
+    expect(rows[0].payerNote?.length).toBe(500);
+  });
+
+  it('缺「交易状态」/「支付方式」列 → 显式 warning 而非静默', async () => {
+    const headers = ['交易流水号', '交易时间', '交易金额'];
+    const b64 = await buildStatementBase64(
+      [['TXN001', '2026-07-21 10:00:00', 100]],
+      { headers, skipPlaceholderRow: true },
+    );
+    const { rows, warnings } = await parseStatementXlsx(b64);
+    // 无状态列 → rawStatus 空 ≠ 支付成功 → 全部按非成功跳过，且必须有警告说明原因
+    expect(rows[0].disposition).toBe('skipped_status');
+    expect(warnings.some((w) => w.includes('交易状态'))).toBe(true);
+    expect(warnings.some((w) => w.includes('支付方式'))).toBe(true);
+  });
+
+  it('列序打乱仍按表头名对号解析', async () => {
+    const shuffled = ['交易状态', '交易金额', '交易流水号', '支付方式', '交易时间'];
+    const b64 = await buildStatementBase64(
+      [['支付成功', 520, 'TXN-X', '支付宝', '2026-07-21 08:00:00']],
+      { headers: shuffled, skipPlaceholderRow: true },
+    );
+    const { rows } = await parseStatementXlsx(b64);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].externalTxnId).toBe('TXN-X');
+    expect(rows[0].amountCny).toBe(520);
+    expect(rows[0].method).toBe('ALIPAY');
+    expect(rows[0].disposition).toBe('ok');
+  });
+
+  it('备注两列合并进 payerNote', async () => {
+    const b64 = await buildStatementBase64([
+      row('TXN001', '2026-07-21 10:00:00', 100, '微信', '支付成功', '码A', '张三 FTM123'),
+    ]);
+    const { rows } = await parseStatementXlsx(b64);
+    expect(rows[0].payerNote).toBe('码A / 张三 FTM123');
+  });
+
+  it('找不到表头行 → 空结果 + warning', async () => {
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet('随便');
+    ws.addRow(['姓名', '护照号']);
+    ws.addRow(['张三', 'E12345678']);
+    const buf = await wb.xlsx.writeBuffer();
+    const { rows, warnings } = await parseStatementXlsx(
+      Buffer.from(buf as ArrayBuffer).toString('base64'),
+    );
+    expect(rows).toHaveLength(0);
+    expect(warnings.some((w) => w.includes('表头'))).toBe(true);
+  });
+
+  it(`超过 ${STATEMENT_MAX_ROWS} 行截断 + warning`, async () => {
+    const many = Array.from({ length: STATEMENT_MAX_ROWS + 5 }, (_, i) =>
+      row(`TXN${i}`, '2026-07-21 10:00:00', 100, '微信', '支付成功'),
+    );
+    const b64 = await buildStatementBase64(many);
+    const { rows, warnings } = await parseStatementXlsx(b64);
+    expect(rows).toHaveLength(STATEMENT_MAX_ROWS);
+    expect(warnings.some((w) => w.includes('仅解析前'))).toBe(true);
+  }, 30_000);
+});
+
+describe('buildStatementExportWorkbook', () => {
+  it('列头齐全，认款标识/订单/认款人落到行里', () => {
+    const entries: StatementExportEntry[] = [
+      {
+        receivedAt: new Date('2026-07-21T15:20:17.000Z'), // 北京 23:20
+        externalTxnId: 'TXN001',
+        receiptNo: 'RCP20260721ABC',
+        amountCny: 300,
+        methodLabel: '微信',
+        sourceLabel: '流水导入',
+        statusLabel: '已认款',
+        allocatedCny: 300,
+        remainingCny: 0,
+        allocationsText: 'FTM2026072100001 ¥300.00',
+        lastAllocatedAt: new Date('2026-07-22T02:00:00.000Z'),
+        allocatorNames: '财务甲',
+        payerNote: null,
+        refundNote: null,
+      },
+    ];
+    const wb = buildStatementExportWorkbook(entries);
+    const ws = wb.getWorksheet('流水核对表');
+    expect(ws).toBeDefined();
+    const headerTexts: string[] = [];
+    ws!.getRow(1).eachCell((c) => headerTexts.push(String(c.value)));
+    expect(headerTexts).toEqual([
+      '到账时间',
+      '交易流水号',
+      '进账号',
+      '金额',
+      '收款方式',
+      '来源',
+      '认款状态',
+      '已认金额',
+      '未认余额',
+      '认到订单',
+      '最近认款时间',
+      '认款人',
+      '付款备注',
+      '退款备注',
+    ]);
+    const r2 = ws!.getRow(2);
+    expect(r2.getCell(1).value).toBe('2026-07-21 23:20'); // 北京墙钟
+    expect(r2.getCell(2).value).toBe('TXN001');
+    expect(r2.getCell(7).value).toBe('已认款');
+    expect(r2.getCell(10).value).toBe('FTM2026072100001 ¥300.00');
+    expect(r2.getCell(12).value).toBe('财务甲');
+  });
+});

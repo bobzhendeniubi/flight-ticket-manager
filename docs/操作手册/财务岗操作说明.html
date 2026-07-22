@@ -132,6 +132,7 @@
     <li><a href="#s2">收款与认款</a><span class="sm">扫码收款后怎么登记 / 代理余额抵扣 / 多付处理 / 月结 / 批量到账</span></li>
     <li><a href="#s3">代理预存款：认款审核与余额调整</a><span class="sm">余额与认款页</span></li>
     <li><a href="#s4">收款对账台：每天怎么核</a><span class="sm">登记进账 / 认领到订单 / 退款 / 全部流水 / 收款渠道</span></li>
+    <li><a href="#s4b">流水认款工作台（新）</a><span class="sm">导入二维码流水 / 拖拽认款 / 一键配对 / 导出核对表</span></li>
     <li><a href="#s5">结算单：每月给代理结佣金</a><span class="sm">生成 / 核对 / 审批流转</span></li>
     <li><a href="#s6">开票怎么勾（六态开票）</a><span class="sm">去程 / 回程 / 系统 三个独立开关</span></li>
     <li><a href="#s7">订单列表怎么读</a><span class="sm">尾款列颜色 / 开票列 / 筛选</span></li>
@@ -297,6 +298,52 @@
 <div class="card">☀ <b>每天上班</b>：打开对账台 → 看"待认领笔数"清零它（逐笔认领/退款）→ 对一眼"今日进账"和银行/微信实际到账 → 切到「余额与认款」清掉待审核认款 → 顺手看一眼经营报表的代理欠款（第九章）。</div>
 
 <!-- ═══════════ 5 结算单 ═══════════ -->
+<h2 id="s4b"><span class="no">四之二、</span>流水认款工作台（新）</h2>
+<p class="sub">位置：<b>收款对账台 → 「流水认款」页签</b>。解决的问题：以前系统认不出二维码流水里哪些款已经认过，只能靠线下 Excel 勾——现在把收单平台的流水表导进系统，每笔流水自带「已认款 / 未认款」标识，认款直接拖一下。</p>
+
+<h3>1. 第一步：从收单平台导出流水，导入系统</h3>
+<ol class="steps">
+  <li>在收单平台（商户后台）按日期导出流水表（就是平时下载的那张「订单下载_xxx.xlsx」，<b>不用改任何格式，原表直接传</b>）。</li>
+  <li>系统里点 <b>📄 导入二维码流水</b> → 选文件 → 出现导入预览。</li>
+  <li>预览里每行有个「处置」标签：<b>可导入</b>（绿）＝支付成功的新流水；<b>已在系统</b>（蓝）＝以前导过，自动跳过；<b>非支付成功</b>（灰）＝未支付/订单已关闭的行，不算钱，自动跳过。</li>
+  <li>确认无误点 <b>「导入 N 笔」</b>。导入的流水全部进入左侧「未认款流水」池。</li>
+</ol>
+<div class="card">✅ <b>重复导入不怕。</b>同一笔流水（按交易流水号识别）系统只收一次：今天导了 7/21 的表，明天不小心又导一遍，已认过款的那些行状态原封不动，一分钱不会重复入账。</div>
+<div class="warn">⚠ 预览里若出现红色「<b>金额冲突</b>」标签＝同一个流水号、金额却和系统里已存的对不上（可能平台改过单，也可能表格被人改过）。这种行不会自动导入，请人工核对后再处理。</div>
+
+<h3>2. 第二步：认款——三种做法，随便挑</h3>
+<div class="shot">
+  <div class="shot-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="shot-title">流水认款工作台（示意）</span></div>
+  <div class="shot-body">
+    <div class="panel" style="border-color:#A7F3D0;background:#ECFDF5;"><div class="pt">自动配对建议（金额一对一吻合）· 1 组</div><div class="mrow" style="justify-content:space-between;"><span><b>¥1,810.00</b> <span style="color:#94A3B8;">7/21 21:58 …95101313</span> → <b>FTM2026072100123</b> 张三</span><span class="mbtn"><span class="mark">1</span>一键认款</span></div></div>
+    <div class="mrow" style="gap:12px;align-items:flex-start;">
+      <span class="panel" style="min-width:180px;"><div class="pt"><span class="mark">2</span>未认款流水（拖我）</div><b style="color:var(--green);">微</b> <b>¥544.00</b> <span class="badge b-blue">部分</span><br/><span style="color:#94A3B8;font-size:11px;">7/21 22:27 · …99377527</span></span>
+      <span class="panel" style="flex:1;border-style:dashed;"><div class="pt"><span class="mark">3</span>待收款订单（拖到这）</div><b>FTM2026072100456</b> 李四 <span class="badge b-green">金额吻合</span><br/><span style="color:#94A3B8;font-size:11px;">应收 ¥3,840 · 已收 ¥3,296 · <b style="color:var(--amber);">尾款 ¥544</b></span></span>
+    </div>
+  </div>
+</div>
+<ol class="steps">
+  <li><b>最快：一键认款。</b>顶部绿色「自动配对建议」列出金额一对一吻合的组合（恰好一笔流水 ↔ 恰好一张订单），核对无误直接点「一键认款」。</li>
+  <li><b>最直观：拖拽。</b>左边流水池里把一笔流水<b>拖</b>到右边订单卡上，弹出金额确认（默认帮你填好），点「确认认款」。</li>
+  <li><b>不爱拖：点选。</b>点一下流水（高亮选中）→ 每张订单卡上出现「认款到此单」按钮 → 点目标订单的按钮即可。</li>
+</ol>
+<div class="card">💡 <b>绿框 = 该放哪。</b>选中/拖动流水时，尾款和这笔钱正好相等的订单会亮绿框＋「金额吻合」标签。<br/>💡 <b>钱比尾款多？</b>比如流水 ¥544、订单尾款只差 ¥300：系统默认只认 ¥300，剩下 ¥244 留在池子里（流水显示蓝色「部分」标签），继续认给其他订单。一笔钱付了几张订单、几笔钱凑一张订单，都这么处理。</div>
+
+<h3>3. 第三步：导出核对表（代替线下勾表）</h3>
+<ol class="steps">
+  <li>页签右上选日期区间（可留空＝全部）→ 点 <b>⬇ 导出核对表</b>。</li>
+  <li>导出的 Excel 里每笔流水一行：交易流水号、金额、<b>认款状态（未认款 / 部分认款 / 已认款 / 已退款）</b>、已认金额、未认余额、<b>认到了哪张订单</b>、认款人、认款时间。拿这张表就能直接对账，不用再手工勾。</li>
+</ol>
+
+<div class="faq"><div class="q">导入时提示"未找到表头行"？</div>
+<div class="a">传的不是收单平台的原表（表里必须有「交易流水号 / 交易时间 / 交易金额」这几列）。去平台重新导一份原始流水，不要用改过列名的表。</div></div>
+<div class="faq"><div class="q">流水里的"未支付""订单已关闭"去哪了？</div>
+<div class="a">没进系统——这些行没有真的收到钱，导入时自动跳过（预览里灰色标注）。只有「支付成功」的行才入池。</div></div>
+<div class="faq"><div class="q">认错单了怎么办？</div>
+<div class="a">认款走的是和「确认收款」同一条资金通道，写入后有完整审计。请联系管理员按审计日志核实冲正，不要自己再认一笔"负数"。</div></div>
+<div class="faq"><div class="q">工作台右边找不到我要的订单？</div>
+<div class="a">右栏只列"近 400 张单里尾款 &gt; 0"的订单，可用搜索框按订单号/联系人/代理筛。更早的旧单：回「待认领」页签，在流水行上点「认领」按订单号查找认领。</div></div>
+
 <h2 id="s5"><span class="no">五、</span>结算单：每月给代理结佣金</h2>
 <p class="sub">位置：左侧导航 → <b>财务 → 结算单</b>。每个代理每个月一张结算单，算清"这个月我们该付给这个代理多少佣金"。</p>
 

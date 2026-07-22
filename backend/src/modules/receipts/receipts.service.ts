@@ -15,6 +15,7 @@
  */
 import {
   Prisma,
+  OrderStatus,
   PaymentMethod,
   ReceiptSource,
   ReceiptStatus,
@@ -25,13 +26,21 @@ import {
 import { randomBytes } from 'node:crypto';
 import { prisma } from '../../db/prisma.js';
 import { BadRequestError, NotFoundError } from '../../lib/errors.js';
+import { FUNDS_CREDIT_BLOCKED_STATUSES } from '../../lib/funds-guard.js';
 import { writeAudit } from '../../lib/audit.js';
 import { PaymentsService } from '../payments/payments.service.js';
 import type {
   AllocateReceiptInput,
+  ExportStatementQuery,
+  ImportStatementInput,
   ListReceiptsQuery,
   RegisterReceiptInput,
 } from './receipts.schemas.js';
+import {
+  parseStatementXlsx,
+  buildStatementExportWorkbook,
+  type StatementExportEntry,
+} from './receipts.statement.js';
 
 /** 金额保留 2 位小数（CNY，避免浮点累计误差）。 */
 function round2(n: number): number {
@@ -65,6 +74,7 @@ export async function createOpenReceiptWithinTx(
     orderHintId?: string | null;
     receivedAt?: Date;
     createdById?: string | null;
+    externalTxnId?: string | null;
   },
 ): Promise<Receipt> {
   // receiptNo 在调用前一次性生成（12 位高熵随机，撞唯一索引概率天文级小）。
@@ -84,6 +94,7 @@ export async function createOpenReceiptWithinTx(
       orderHintId: data.orderHintId ?? null,
       receivedAt: data.receivedAt ?? new Date(),
       createdById: data.createdById ?? null,
+      externalTxnId: data.externalTxnId ?? null,
     },
   });
 }
@@ -103,6 +114,7 @@ export function serializeReceipt(r: ReceiptWithAllocations) {
     method: r.method,
     proofUrl: r.proofUrl,
     payerNote: r.payerNote,
+    externalTxnId: r.externalTxnId,
     orderHintId: r.orderHintId,
     receivedAt: r.receivedAt,
     source: r.source,
@@ -130,11 +142,16 @@ export class ReceiptsService {
   async list(query: ListReceiptsQuery) {
     const where: Prisma.ReceiptWhereInput = {};
     if (query.status) where.status = query.status;
+    // 认款工作台专用：只回未认完的，避免 take 500 被已认款记录占满挤出旧 OPEN 流水
+    if (query.unallocatedOnly === '1') {
+      where.status = { in: [ReceiptStatus.OPEN, ReceiptStatus.PARTIALLY_ALLOCATED] };
+    }
     if (query.q) {
       where.OR = [
         { receiptNo: { contains: query.q, mode: 'insensitive' } },
         { payerNote: { contains: query.q, mode: 'insensitive' } },
         { orderHintId: { contains: query.q, mode: 'insensitive' } },
+        { externalTxnId: { contains: query.q, mode: 'insensitive' } },
       ];
     }
     const rows = await prisma.receipt.findMany({
@@ -442,5 +459,308 @@ export class ReceiptsService {
       amountCny: receipt.amountCny.toString(),
       status: receipt.status,
     };
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  // 二维码流水导入：解析预览（不写库）
+  // ════════════════════════════════════════════════════════════════════
+  /**
+   * 解析收单平台流水 xlsx → 预览行 + 处置判定。
+   * 行内判定（parseStatementXlsx）之外，再对照现库：已存在同 externalTxnId 的行
+   * 标 dup_in_db 并附现有进账号/认款状态——重复导入天然幂等，已认过的行状态不丢。
+   */
+  async previewStatement(fileBase64: string) {
+    const { rows, warnings } = await parseStatementXlsx(fileBase64);
+    const okIds = rows.filter((r) => r.disposition === 'ok').map((r) => r.externalTxnId);
+    const existing = okIds.length
+      ? await prisma.receipt.findMany({
+          where: { externalTxnId: { in: okIds } },
+          select: { externalTxnId: true, receiptNo: true, status: true, amountCny: true },
+        })
+      : [];
+    const byTxn = new Map(existing.map((e) => [e.externalTxnId as string, e]));
+
+    const preview = rows.map((r) => {
+      const dbHit = r.disposition === 'ok' ? byTxn.get(r.externalTxnId) : undefined;
+      // 同流水号但金额与库中不一致 = 数据冲突（平台改单/人为改表），必须显式亮出来，
+      // 不能只报「已存在」让财务误以为无事发生（审计发现#3）
+      const amountMismatch =
+        dbHit != null &&
+        r.amountCny != null &&
+        Math.abs(Number(dbHit.amountCny) - r.amountCny) >= 0.005;
+      return {
+        rowNumber: r.rowNumber,
+        externalTxnId: r.externalTxnId,
+        receivedAt: r.receivedAt ? r.receivedAt.toISOString() : null,
+        amountCny: r.amountCny,
+        method: r.method,
+        rawMethod: r.rawMethod,
+        rawStatus: r.rawStatus,
+        payerNote: r.payerNote,
+        disposition: dbHit ? ('dup_in_db' as const) : r.disposition,
+        existing: dbHit
+          ? {
+              receiptNo: dbHit.receiptNo,
+              status: dbHit.status,
+              amountCny: dbHit.amountCny.toString(),
+              amountMismatch,
+            }
+          : null,
+      };
+    });
+
+    const count = (d: string) => preview.filter((r) => r.disposition === d).length;
+    return {
+      rows: preview,
+      warnings,
+      summary: {
+        total: preview.length,
+        importable: count('ok'),
+        dupInDb: count('dup_in_db'),
+        dupInFile: count('dup_in_file'),
+        skippedStatus: count('skipped_status'),
+        invalid: count('invalid'),
+      },
+    };
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  // 二维码流水导入：入库（createMany + skipDuplicates，流水号唯一索引兜底）
+  // ════════════════════════════════════════════════════════════════════
+  /**
+   * 把预览确认后的流水行入池（source=STATEMENT_IMPORT，status=OPEN）。
+   * 防重三层：请求内去重 → 预查现库剔除 → createMany skipDuplicates 靠
+   * externalTxnId 唯一索引兜底（并发导入也绝不重复入池）。
+   */
+  async importStatement(input: ImportStatementInput, actor: { userId: string; role: UserRole }) {
+    const seen = new Set<string>();
+    const unique = input.rows.filter((r) =>
+      seen.has(r.externalTxnId) ? false : (seen.add(r.externalTxnId), true),
+    );
+
+    const existing = await prisma.receipt.findMany({
+      where: { externalTxnId: { in: unique.map((r) => r.externalTxnId) } },
+      select: { externalTxnId: true },
+    });
+    const existingSet = new Set(existing.map((e) => e.externalTxnId));
+    const fresh = unique.filter((r) => !existingSet.has(r.externalTxnId));
+
+    const data = await Promise.all(
+      fresh.map(async (r) => ({
+        receiptNo: await generateReceiptNo(),
+        amountCny: new Prisma.Decimal(round2(r.amountCny)),
+        allocatedCny: new Prisma.Decimal(0),
+        method: r.method,
+        source: ReceiptSource.STATEMENT_IMPORT,
+        status: ReceiptStatus.OPEN,
+        payerNote: r.payerNote ?? null,
+        externalTxnId: r.externalTxnId,
+        receivedAt: r.receivedAt,
+        createdById: actor.userId,
+      })),
+    );
+    const created = data.length
+      ? await prisma.receipt.createMany({ data, skipDuplicates: true })
+      : { count: 0 };
+
+    void writeAudit({
+      actor: { userId: actor.userId, role: actor.role },
+      action: 'IMPORT_RECEIPT_STATEMENT',
+      targetType: 'SYSTEM',
+      targetId: 'receipt-statement-import',
+      targetLabel: '二维码流水导入',
+      after: { requested: input.rows.length, imported: created.count },
+      severity: 'WARNING',
+    });
+
+    return {
+      ok: true as const,
+      requested: input.rows.length,
+      imported: created.count,
+      skipped: input.rows.length - created.count,
+    };
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  // 认款工作台：待收款订单候选（近 400 单里尾款 > 0 的，最多回 200）
+  // ════════════════════════════════════════════════════════════════════
+  /**
+   * 尾款 = total + adjustmentCny − paidAmount − prepaymentOffset（与
+   * serializeOrder.balanceDue 一字一致）；排除草稿/取消/已退/超时单。
+   * 只回轻量字段供工作台配对展示，不含乘客明细。
+   */
+  async matchCandidates() {
+    const orders = await prisma.order.findMany({
+      where: {
+        // 与收款资金闸同源（FUNDS_CREDIT_BLOCKED_STATUSES）：候选规则和入账内核
+        // 用同一张状态名单，不会出现「工作台推荐了、点认款却被资金闸拒」的漂移；
+        // 软删单（回收站）同样排除——入账内核会拒，不该出现在候选里。
+        status: { notIn: FUNDS_CREDIT_BLOCKED_STATUSES },
+        deletedAt: null,
+      },
+      select: {
+        id: true,
+        orderNumber: true,
+        contactName: true,
+        status: true,
+        createdAt: true,
+        total: true,
+        paidAmount: true,
+        prepaymentOffset: true,
+        adjustmentCny: true,
+        agent: { select: { companyName: true, contactName: true } },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 400,
+    });
+
+    const out: Array<{
+      orderId: string;
+      orderNumber: string;
+      contactName: string;
+      agentName: string | null;
+      status: OrderStatus;
+      createdAt: Date;
+      totalPayable: number;
+      paidAmount: number;
+      balanceDue: number;
+    }> = [];
+    for (const o of orders) {
+      const totalPayable = round2(Number(o.total) + (o.adjustmentCny ?? 0));
+      const balanceDue = round2(
+        totalPayable - Number(o.paidAmount) - Number(o.prepaymentOffset),
+      );
+      if (balanceDue <= 0.005) continue;
+      out.push({
+        orderId: o.id,
+        orderNumber: o.orderNumber,
+        contactName: o.contactName,
+        agentName: o.agent ? o.agent.companyName || o.agent.contactName : null,
+        status: o.status,
+        createdAt: o.createdAt,
+        totalPayable,
+        paidAmount: Number(o.paidAmount),
+        balanceDue,
+      });
+      if (out.length >= 200) break;
+    }
+    return out;
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  // 流水核对表导出（进账 + 认款标识，替代财务线下勾表）
+  // ════════════════════════════════════════════════════════════════════
+  async exportStatement(query: ExportStatementQuery) {
+    const where: Prisma.ReceiptWhereInput = {};
+    if (query.from || query.to) {
+      where.receivedAt = {
+        ...(query.from ? { gte: new Date(`${query.from}T00:00:00+08:00`) } : {}),
+        ...(query.to ? { lte: new Date(`${query.to}T23:59:59.999+08:00`) } : {}),
+      };
+    }
+    // 全量分页读取：绝不静默截断——核对表少一行，财务就会把那笔钱当作不存在（审计发现#4）。
+    // 单页 1000 条循环取完；上限 50000 条纯属防失控（远超当前业务量），触顶报错而非截断。
+    const EXPORT_PAGE = 1000;
+    const EXPORT_HARD_CAP = 50_000;
+    type ReceiptWithAllocs = Prisma.ReceiptGetPayload<{ include: { allocations: true } }>;
+    const receipts: ReceiptWithAllocs[] = [];
+    for (;;) {
+      const page = await prisma.receipt.findMany({
+        where,
+        include: { allocations: true },
+        orderBy: [{ receivedAt: 'desc' }, { id: 'desc' }],
+        skip: receipts.length,
+        take: EXPORT_PAGE,
+      });
+      receipts.push(...page);
+      if (page.length < EXPORT_PAGE) break;
+      if (receipts.length >= EXPORT_HARD_CAP) {
+        throw new BadRequestError(
+          `导出条数超过 ${EXPORT_HARD_CAP} 上限，请用「从/到」缩小日期区间后再导`,
+        );
+      }
+    }
+
+    const orderIds = [...new Set(receipts.flatMap((r) => r.allocations.map((a) => a.orderId)))];
+    const orders = orderIds.length
+      ? await prisma.order.findMany({
+          where: { id: { in: orderIds } },
+          select: { id: true, orderNumber: true },
+        })
+      : [];
+    const orderNoById = new Map(orders.map((o) => [o.id, o.orderNumber]));
+
+    const userIds = [
+      ...new Set(
+        receipts.flatMap((r) => r.allocations.map((a) => a.createdById)).filter(Boolean),
+      ),
+    ] as string[];
+    const users = userIds.length
+      ? await prisma.user.findMany({
+          where: { id: { in: userIds } },
+          select: { id: true, displayName: true, email: true },
+        })
+      : [];
+    const nameById = new Map(
+      users.map((u) => [u.id, u.displayName || u.email || u.id.slice(0, 8)]),
+    );
+
+    const METHOD_LABEL: Record<PaymentMethod, string> = {
+      WECHAT_PAY: '微信',
+      ALIPAY: '支付宝',
+      BANK_CARD: '银行卡',
+      AGENT_PREPAYMENT: '代理预存',
+    };
+    const SOURCE_LABEL: Record<ReceiptSource, string> = {
+      CUSTOMER_UPLOAD: '客户上传',
+      STAFF_ENTRY: '后台登记',
+      ORDER_OVERPAY: '订单多付',
+      STATEMENT_IMPORT: '流水导入',
+    };
+    const STATUS_LABEL: Record<ReceiptStatus, string> = {
+      OPEN: '未认款',
+      PARTIALLY_ALLOCATED: '部分认款',
+      ALLOCATED: '已认款',
+      REFUNDED: '已退款',
+    };
+
+    const entries: StatementExportEntry[] = receipts.map((r) => {
+      const allocs = [...r.allocations].sort(
+        (a, b) => a.createdAt.getTime() - b.createdAt.getTime(),
+      );
+      const allocationsText = allocs
+        .map(
+          (a) =>
+            `${orderNoById.get(a.orderId) ?? a.orderId.slice(0, 8)} ¥${Number(a.amountCny).toFixed(2)}`,
+        )
+        .join('；');
+      const allocatorNames = [
+        ...new Set(
+          allocs
+            .map((a) => (a.createdById ? nameById.get(a.createdById) : null))
+            .filter(Boolean),
+        ),
+      ].join('、');
+      const amount = Number(r.amountCny);
+      const allocated = Number(r.allocatedCny);
+      return {
+        receivedAt: r.receivedAt,
+        externalTxnId: r.externalTxnId,
+        receiptNo: r.receiptNo,
+        amountCny: amount,
+        methodLabel: METHOD_LABEL[r.method],
+        sourceLabel: SOURCE_LABEL[r.source],
+        statusLabel: STATUS_LABEL[r.status],
+        allocatedCny: allocated,
+        remainingCny: round2(amount - allocated),
+        allocationsText,
+        lastAllocatedAt: allocs.length > 0 ? allocs[allocs.length - 1].createdAt : null,
+        allocatorNames,
+        payerNote: r.payerNote,
+        refundNote: r.refundNote,
+      };
+    });
+
+    return buildStatementExportWorkbook(entries);
   }
 }
