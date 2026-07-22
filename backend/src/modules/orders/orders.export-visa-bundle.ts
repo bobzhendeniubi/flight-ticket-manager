@@ -72,7 +72,7 @@ export async function queryOrdersByIdsForVisa(
             },
           },
           hotelRoomType: { select: { name: true, hotel: { select: { name: true, code: true } } } },
-          visa: { select: { code: true, visaName: true, visaType: true } },
+          visa: { select: { code: true, visaName: true, visaType: true, supplier: true } },
           transfer: { select: { code: true } },
           bundle: { select: { code: true } },
           fulfillmentTasks: { select: { type: true, status: true } },

@@ -170,8 +170,9 @@ describe('buildVisaBundleXlsx — 合并签证名单', () => {
     expect(rows).toHaveLength(3);
     expect(rows.map((r) => r['STT'])).toEqual(['1', '2', '3']);
 
-    // 姓名（LAST/FIRST）合并正确；末尾附称谓（均为成人，按性别 MR/MS —— 0711 反馈缺 MR/MS）
-    expect(rows.map((r) => r[NAME_HEADER])).toEqual(['WANG/LIANBO MR', 'LI/SI MS', 'ZHAO/WU MR']);
+    // 姓名（LAST/FIRST）合并正确，纯拼音名不带性别称谓（签证岗反馈：英文名不需要带性别；
+    // 本表另有独立「性别」列 Giới tính）
+    expect(rows.map((r) => r[NAME_HEADER])).toEqual(['WANG/LIANBO', 'LI/SI', 'ZHAO/WU']);
 
     // 性别列存在且逐行正确
     expect(rows.map((r) => r[GENDER_HEADER])).toEqual(['M', 'F', 'M']);
@@ -205,7 +206,7 @@ describe('buildVisaBundleXlsx — 合并签证名单', () => {
 
     // 自备签乘客（ZI/BEI）不上表；只剩 2 人
     expect(rows).toHaveLength(2);
-    expect(rows.map((r) => r[NAME_HEADER])).toEqual(['WANG/LIANBO MR', 'LI/SI MR']);
+    expect(rows.map((r) => r[NAME_HEADER])).toEqual(['WANG/LIANBO', 'LI/SI']);
     // 护照图状态按过滤后位置对齐，不因中间被过滤的乘客而错位
     // （若按未过滤的 order.passengers 下标取，第 2 行会误把 ZI/BEI 的"无图"标给 LI/SI 之前，
     // 这里验证的是 LI/SI 自己的图状态——本人无图应仍是"无护照图（手工录入）"）
@@ -292,7 +293,8 @@ describe('buildVisaRosterXlsx — 仅名单 xlsx（不含护照图）', () => {
     // 甲代理(A1) 在前、乙代理(B1) 在后；STT 连续 1,2
     expect(rows.map((r) => r['STT'])).toEqual(['1', '2']);
     expect(rows.map((r) => r['代理机构'])).toEqual(['甲代理', '乙代理']);
-    expect(rows.map((r) => r[NAME_HEADER])).toEqual(['AA/ONE MR', 'BB/ONE MR']);
+    // 纯拼音名不带性别称谓（签证岗反馈：英文名不需要带性别）
+    expect(rows.map((r) => r[NAME_HEADER])).toEqual(['AA/ONE', 'BB/ONE']);
   });
 
   it('被勾选但状态不合格 / 查不到的单静默不计入名单（无 README，纯 xlsx）', async () => {
@@ -315,7 +317,7 @@ describe('buildVisaRosterXlsx — 仅名单 xlsx（不含护照图）', () => {
 
     // 名单只含合格单（1 人）；状态不合格 / 查不到的单静默不出现
     expect(rows).toHaveLength(1);
-    expect(rows[0][NAME_HEADER]).toBe('WANG/LIANBO MR');
+    expect(rows[0][NAME_HEADER]).toBe('WANG/LIANBO');
   });
 });
 

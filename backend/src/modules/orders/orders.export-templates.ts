@@ -202,7 +202,7 @@ export type OrderForTemplateExport = Prisma.OrderGetPayload<{
           };
         };
         hotelRoomType: { select: { name: true; hotel: { select: { name: true; code: true } } } };
-        visa: { select: { code: true; visaName: true; visaType: true } };
+        visa: { select: { code: true; visaName: true; visaType: true; supplier: true } };
         transfer: { select: { code: true } };
         bundle: { select: { code: true; items: true } };
         fulfillmentTasks: { select: { type: true; status: true } };
@@ -623,6 +623,7 @@ export interface VisaRow {
   settlePrice: number;
   paidAmount: number;
   balanceDue: number;
+  visaSupplier: string; // 签证公司（供应商/代办渠道）— 财务对账用，多签证去重逗号拼接，缺失留空
   chineseName: string;
   name: string;
   dateOfBirth: string;
@@ -646,6 +647,7 @@ export const VISA_COLUMNS: Array<{ header: string; key: keyof VisaRow; width: nu
   { header: '结算价格', key: 'settlePrice', width: 10 },
   { header: '到账金额', key: 'paidAmount', width: 10 },
   { header: '尾款金额', key: 'balanceDue', width: 10 },
+  { header: '签证公司', key: 'visaSupplier', width: 16 },
   { header: '中文姓名', key: 'chineseName', width: 12 },
   { header: 'Họ và tên (*)\n姓名', key: 'name', width: 20 },
   { header: 'Ngày, tháng, năm sinh (*)\n出生日期', key: 'dateOfBirth', width: 16 },
@@ -661,8 +663,15 @@ export const VISA_COLUMNS: Array<{ header: string; key: keyof VisaRow; width: nu
 ];
 
 export function orderToVisaRows(order: OrderForTemplateExport, ctx: OrderContext): Omit<VisaRow, 'stt'>[] {
-  // 姓名列称谓（MR/MS/MSTR/MISS）按订单去程（最早 FLIGHT 行出发时间）派生年龄。
-  const departureDate = earliestFlightDeparture(order.items);
+  // 签证公司（财务反馈：需清晰核对某笔签证金额属于哪家供应商）：取订单 VISA 行关联产品的 supplier，
+  // 多签证产品去重后逗号拼接；无 supplier 留空。仅认独立 VISA 行——套餐内签证组件无独立供应商字段。
+  const visaSupplier = Array.from(
+    new Set(
+      order.items
+        .filter((it) => it.kind === 'VISA' && it.visa?.supplier)
+        .map((it) => it.visa!.supplier!),
+    ),
+  ).join(', ');
   // 自备签乘客（visaExempt=true）不进送签名单：客人已自行办妥签证，无需送签——与签证台
   // 同口径（backend/src/modules/fulfillment/fulfillment.service.ts 的 listByOrder 同样过滤
   // passengers 时排除 visaExempt=true）。此函数是「签证专用」模板导出 + 签证批量合并名单
@@ -678,9 +687,12 @@ export function orderToVisaRows(order: OrderForTemplateExport, ctx: OrderContext
     settlePrice: ctx.settlePerPax,
     paidAmount: ctx.paidPerPax,
     balanceDue: ctx.balancePerPax,
+    visaSupplier,
     // 与《全岗可用》模板一致：优先中文名，缺失才回退 fullName（避免中文名列显示成英文名）
     chineseName: p.chineseName ?? p.fullName,
-    name: nameWithTitle(p, departureDate),
+    // 签证名单姓名列只填纯拼音名 LAST/FIRST（签证岗反馈：英文名不需要带性别称谓——
+    // 本表另有独立「性别」列 Giới tính，无需在姓名里体现 MR/MS）。
+    name: pnrName(p),
     dateOfBirth: fmtDateDMYSlash(p.dateOfBirth),
     gender: p.gender ?? '',
     nationalityNow: toAlpha3(p.nationality),
@@ -725,7 +737,7 @@ export async function buildOrderTemplateExportWorkbook(
             include: { flight: { select: { flightNumber: true, originCode: true, destinationCode: true } } },
           },
           hotelRoomType: { select: { name: true, hotel: { select: { name: true, code: true } } } },
-          visa: { select: { code: true, visaName: true, visaType: true } },
+          visa: { select: { code: true, visaName: true, visaType: true, supplier: true } },
           transfer: { select: { code: true } },
           bundle: { select: { code: true, items: true } },
           fulfillmentTasks: { select: { type: true, status: true } },
@@ -754,9 +766,13 @@ export async function buildOrderTemplateExportWorkbook(
     // 只设列 key/宽度，表头由 applyFullHeader 手工写两行（含合并）。
     ws.columns = FULL_COLUMNS.map((c) => ({ key: c.key, width: c.width }));
     applyFullHeader(ws);
+  } else if (query.template === 'ticketing') {
+    // 《票务专用》对齐航司 PNR 原版样例的朴素样式（票务反馈「改成原版，表格看起来简洁一些」）：
+    // 列名/列序/日期格式（DDMonYY）本就与样例一致，此处只去掉加粗/底色/居中换行等装饰 ——
+    // 样例表头为默认字体、无填充、无居中换行，故这里不给表头设任何样式。
+    ws.columns = TICKETING_COLUMNS.map((c) => ({ header: c.header, key: c.key, width: c.width }));
   } else {
-    const cols = query.template === 'ticketing' ? TICKETING_COLUMNS : VISA_COLUMNS;
-    ws.columns = cols.map((c) => ({ header: c.header, key: c.key, width: c.width }));
+    ws.columns = VISA_COLUMNS.map((c) => ({ header: c.header, key: c.key, width: c.width }));
     const headerRow = ws.getRow(1);
     headerRow.font = { bold: true };
     headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEFEFEF' } };

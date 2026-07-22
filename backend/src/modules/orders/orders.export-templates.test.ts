@@ -26,6 +26,7 @@ import {
   nameWithTitle,
   FULL_COLUMNS,
   TICKETING_COLUMNS,
+  VISA_COLUMNS,
   type OrderForTemplateExport,
 } from './orders.export-templates.js';
 
@@ -212,7 +213,7 @@ function fixtureRoundTrip(): OrderForTemplateExport {
         hotelRoomTypeId: null,
         flightSchedule: null,
         hotelRoomType: null,
-        visa: { code: 'VN-EVISA', visaName: '越南电子签', visaType: 'E-visa' },
+        visa: { code: 'VN-EVISA', visaName: '越南电子签', visaType: 'E-visa', supplier: '越南领区签证代办' },
         transfer: null,
         bundle: null,
         fulfillmentTasks: [{ type: 'VISA_APPLICATION', status: 'IN_PROGRESS' }],
@@ -600,6 +601,116 @@ describe('《签证专用》visa 行 — 签发日期', () => {
 
   it('缺省 passportIssueDate → 留空（不编造）', () => {
     expect(rows[1].issueDate).toBe('');
+  });
+});
+
+// ── 《签证专用》visa 行 · 姓名不带称谓（签证岗反馈：英文名不需要带性别）───────────
+// 送签名单本有独立「性别」列 Giới tính，姓名列只填纯拼音名 LAST/FIRST，不再附 MR/MS。
+// 《全岗可用》「乘客拼音名」（带称谓，航司口径）与「纯拼音名」两列、票务专用 Title 列均不受影响。
+describe('《签证专用》visa 行 — 姓名不带称谓', () => {
+  const order = fixtureRoundTrip();
+  const rows = orderToVisaRows(order, buildOrderContext(order));
+
+  it('姓名列 = 纯拼音名 LAST/FIRST，不带 MR/MS 称谓', () => {
+    // r1 成人男性（全岗/票务口径会给 MR），签证名单不给称谓
+    expect(rows[0].name).toBe('WANG/LIANBO');
+    // r2 无拼音名 → 回落 fullName「李四」，同样不加称谓
+    expect(rows[1].name).toBe('李四');
+  });
+});
+
+// ── 《签证专用》visa 行 · 签证公司列（财务反馈：核对签证金额属于哪家供应商）──────
+describe('《签证专用》visa 行 — 签证公司列', () => {
+  it('VISA_COLUMNS 含「签证公司」，紧邻金额列（尾款金额之后）', () => {
+    const headers = VISA_COLUMNS.map((c) => c.header);
+    expect(headers).toContain('签证公司');
+    expect(headers[headers.indexOf('尾款金额') + 1]).toBe('签证公司');
+  });
+
+  it('取订单 VISA 行关联产品的 supplier', () => {
+    const order = fixtureRoundTrip();
+    const rows = orderToVisaRows(order, buildOrderContext(order));
+    expect(rows[0].visaSupplier).toBe('越南领区签证代办');
+  });
+
+  it('多签证产品 → supplier 去重逗号拼接', () => {
+    const order = fixtureRoundTrip();
+    (order.items as unknown[]).push({
+      kind: 'VISA',
+      flightCabin: null,
+      amount: 0,
+      description: '',
+      metadata: null,
+      hotelRoomTypeId: null,
+      flightSchedule: null,
+      hotelRoomType: null,
+      visa: { code: 'VN-STICKER', visaName: '越南贴纸签', visaType: 'sticker', supplier: '岘港代办B' },
+      transfer: null,
+      bundle: null,
+      fulfillmentTasks: [],
+    });
+    const rows = orderToVisaRows(order, buildOrderContext(order));
+    expect(rows[0].visaSupplier).toBe('越南领区签证代办, 岘港代办B');
+  });
+
+  it('VISA 行 supplier 缺失 → 签证公司列留空（不编造）', () => {
+    const order = fixtureRoundTrip();
+    const visaItem = order.items.find((it) => (it as { kind: string }).kind === 'VISA') as {
+      visa: { supplier: string | null };
+    };
+    visaItem.visa.supplier = null;
+    const rows = orderToVisaRows(order, buildOrderContext(order));
+    expect(rows[0].visaSupplier).toBe('');
+  });
+});
+
+// ── 《票务专用》ticketing 工作簿 · 对齐航司 PNR 原版样例的朴素样式（票务反馈）──────
+// 原版样例：单 sheet 27 列，表头默认字体、无填充、无居中换行；日期 DDMonYY。列名/列序本就
+// 与样例一致，本批只去掉加粗/底色/居中换行等装饰；《签证专用》表头样式不受影响。
+describe('《票务专用》ticketing 工作簿 — 朴素样式对齐原版样例', () => {
+  function fakeClient(orders: OrderForTemplateExport[]): PrismaClient {
+    return { order: { findMany: vi.fn().mockResolvedValue(orders) } } as unknown as PrismaClient;
+  }
+
+  async function loadTicketingSheet(): Promise<ExcelJS.Worksheet> {
+    const buf = await buildOrderTemplateExportWorkbook(
+      { template: 'ticketing' } as Parameters<typeof buildOrderTemplateExportWorkbook>[0],
+      fakeClient([fixtureRoundTrip()]),
+    );
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(buf as unknown as Parameters<typeof wb.xlsx.load>[0]);
+    const ws = wb.getWorksheet('票务专用');
+    if (!ws) throw new Error('票务专用 sheet 不存在');
+    return ws;
+  }
+
+  function headerRow(ws: ExcelJS.Worksheet): string[] {
+    const headers: string[] = [];
+    ws.getRow(1).eachCell((cell, col) => (headers[col - 1] = String(cell.value ?? '')));
+    return headers;
+  }
+
+  it('表头 27 列，列名列序与原版样例完全一致', async () => {
+    const ws = await loadTicketingSheet();
+    expect(headerRow(ws)).toEqual(OLD_TICKETING_HEADERS);
+  });
+
+  it('表头朴素：不加粗、无底色填充（对齐样例简洁风）', async () => {
+    const ws = await loadTicketingSheet();
+    const cell = ws.getRow(1).getCell(1);
+    expect(cell.font?.bold ?? false).toBe(false);
+    const fill = cell.fill as { pattern?: string } | undefined;
+    expect(fill?.pattern ?? 'none').not.toBe('solid');
+  });
+
+  it('日期列 DDMonYY 航司格式（Date of Birth / Passport Expiry Date）', async () => {
+    const ws = await loadTicketingSheet();
+    const headers = headerRow(ws);
+    const dobCol = headers.indexOf('Date of Birth') + 1;
+    const expiryCol = headers.indexOf('Passport Expiry Date') + 1;
+    // 第 2 行 = 首位乘客（王连波：生日 1984-02-04、护照有效期 2034-12-11）
+    expect(String(ws.getRow(2).getCell(dobCol).value)).toBe('04Feb84');
+    expect(String(ws.getRow(2).getCell(expiryCol).value)).toBe('11Dec34');
   });
 });
 

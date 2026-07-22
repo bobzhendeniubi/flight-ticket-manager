@@ -154,7 +154,7 @@ function fixtureRoundTripBundle(): OrderForMasterExport {
         metadata: null,
         flightSchedule: null,
         hotelRoomType: null,
-        visa: { visaName: '越南电子签', visaType: 'E-visa' },
+        visa: { visaName: '越南电子签', visaType: 'E-visa', supplier: '越南A签证公司' },
         fulfillmentTasks: [{ type: 'VISA_APPLICATION', status: 'IN_PROGRESS' }],
       },
     ],
@@ -282,6 +282,9 @@ describe('orderToMasterRows', () => {
 
     // 签证状态：订单级 E_VISA 优先 → 电子签
     expect(r1.visaStatus).toBe('电子签');
+
+    // 签证公司（财务反馈：核对签证金额属于哪家供应商）：取 VISA 行关联产品的 supplier
+    expect(r1.visaSupplier).toBe('越南A签证公司');
 
     // 姓名 / 中文名 / 类型 / 性别 / 国籍 / 证件类型
     expect(r1.chineseName).toBe('张三');
@@ -511,6 +514,7 @@ describe('visibleColumns（role 裁列）', () => {
     const headers = visibleColumns('visa').map((c) => c.header);
     expect(headers).toContain('酒店中文名称');
     expect(headers).toContain('签证金额');
+    expect(headers).toContain('签证公司');
     expect(headers).toContain('护照签发地');
     expect(headers).toContain('证件有效期');
     // 航班/财务列隐藏

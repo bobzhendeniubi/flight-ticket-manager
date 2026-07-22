@@ -155,6 +155,7 @@ export interface MasterRow {
   settleReceived: number; // 已到账金额（人均）
   singleRoomDiff: number; // 单房差（人均）
   visaAmount: number; // 签证金额（人均）
+  visaSupplier: string; // 签证公司（供应商/代办渠道，多签证去重逗号拼接）— 财务对账用，缺失留空
   visaStatus: string; // 签证状态（订单级 + 履约任务，取更具体者）
   invoiceStatus: string; // 开票状态：三布尔（去程/回程/系统）组合文案，'/' 连接；都未开 = "未开"
   settled: string; // 是否清账（结清）
@@ -217,6 +218,7 @@ const MASTER_COLUMNS: MasterColumn[] = [
   { header: '已到账金额', key: 'settleReceived', width: 12, roles: ['all'] },
   { header: '单房差', key: 'singleRoomDiff', width: 8, roles: ['all'] },
   { header: '签证金额', key: 'visaAmount', width: 10, roles: ['all', 'visa'] },
+  { header: '签证公司', key: 'visaSupplier', width: 16, roles: ['all', 'visa'] },
   { header: '签证状态', key: 'visaStatus', width: 10, roles: ['all', 'visa'] },
   { header: '开票状态', key: 'invoiceStatus', width: 10, roles: ['all'] },
   { header: '是否清账', key: 'settled', width: 8, roles: ['all'] },
@@ -261,7 +263,7 @@ export const MASTER_EXPORT_INCLUDE = {
         },
       },
       hotelRoomType: { select: { name: true, hotel: { select: { name: true } } } },
-      visa: { select: { visaName: true, visaType: true } },
+      visa: { select: { visaName: true, visaType: true, supplier: true } },
       // 套餐(BUNDLE)行关联的套餐定义：取 items JSON 以捞出签证组件的挂牌价（qty×unitPrice）。
       bundle: { select: { items: true } },
       fulfillmentTasks: { select: { type: true, status: true } },
@@ -489,6 +491,15 @@ export function orderToMasterRows(
     : visaTask
       ? FULFILLMENT_STATUS_LABEL[visaTask.status] ?? visaTask.status
       : '';
+  // 签证公司（财务反馈：需清晰核对某笔签证金额属于哪家供应商）：取独立 VISA 行关联产品的 supplier，
+  // 多签证产品去重后逗号拼接；无 supplier 留空。套餐内签证组件无独立供应商字段，故只认 VISA 行。
+  const visaSupplier = Array.from(
+    new Set(
+      order.items
+        .filter((it) => it.kind === 'VISA' && it.visa?.supplier)
+        .map((it) => it.visa!.supplier!),
+    ),
+  ).join(', ');
 
   // ── 单房差：从酒店/套餐行 metadata.singleRoomDiff 汇总（系统若无该字段 → 0）──
   const singleRoomDiffOrder = order.items.reduce((s, it) => {
@@ -585,6 +596,7 @@ export function orderToMasterRows(
       settleReceived: paidPerPax,
       singleRoomDiff: round2(singleRoomDiffOrder / paxCount),
       visaAmount: round2(visaAmountOrder / paxCount),
+      visaSupplier,
       visaStatus,
       invoiceStatus,
       settled,
