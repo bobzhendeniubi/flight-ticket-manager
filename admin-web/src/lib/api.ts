@@ -1456,6 +1456,8 @@ export interface Visa {
   requiredDocs: string[];
   isActive: boolean;
   costPriceCny: string | null;
+  /** 签证公司/代办渠道名（财务对账用——核对某笔签证金额属于哪家供应商的账单）；未录为 null */
+  supplier: string | null;
   createdAt: string;
 }
 
@@ -1525,6 +1527,8 @@ export interface BundleWriteBody {
   outboundFlightId?: string | null;
   /** 绑定回程航班号：Flight.id 绑定；null 解绑；省略 = 不改 */
   returnFlightId?: string | null;
+  /** 管理端可编辑排序值：数字小的排前面（列表 + 录单套餐下拉同口径）；留空排最后；省略 = 不改 */
+  sortOrder?: number | null;
   isActive?: boolean;
 }
 
@@ -1587,6 +1591,8 @@ export interface Bundle {
   blackoutDates?: BundleBlackoutDate[];
   /** 前台默认出发日（不影响可售判定）；null = 无默认 */
   defaultDepartDate?: string | null;
+  /** 管理端可编辑排序值：数字小的排前面（列表 + 录单套餐下拉同口径）；null = 排最后 */
+  sortOrder: number | null;
   isActive: boolean;
   createdAt: string;
 }
@@ -2302,6 +2308,23 @@ export const api = {
     if (!res.ok) throw new ApiError(res.status, { code: 'EXPORT_FAILED', message: await res.text() });
     return res.blob();
   },
+  // 进单统计导出（公测反馈·票务）；ADMIN/STAFF only。
+  // GET /orders/export/intake + listOrders 同款筛选（尤其 from/to 下单时间窗口，可带时间到分钟）。
+  // 按「出发日期 × 产品/团期」聚合，返回 Blob 直接下载。
+  exportIntake: async (token: string, params?: ListOrdersParams): Promise<Blob> => {
+    const qs = new URLSearchParams();
+    if (params) {
+      for (const [k, v] of Object.entries(params)) {
+        if (v !== undefined && v !== '') qs.set(k, String(v));
+      }
+    }
+    const suffix = qs.toString() ? `?${qs.toString()}` : '';
+    const res = await fetch(`${API_BASE}/orders/export/intake${suffix}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) throw new ApiError(res.status, { code: 'EXPORT_FAILED', message: await res.text() });
+    return res.blob();
+  },
   // 把订单多付（paidAmount−total）转入其代理预存余额；订单回到刚好结清。ADMIN/STAFF
   creditOverpayToAgent: (token: string, orderId: string) =>
     apiFetch<{ order: OrderSummary }>(`/orders/${orderId}/credit-overpay-to-agent`, {
@@ -2385,6 +2408,28 @@ export const api = {
     },
   ) =>
     apiFetch<{ order: OrderSummary }>(`/orders/${orderId}/passengers/${passengerId}`, {
+      method: 'PATCH',
+      token,
+      body,
+    }),
+
+  // 换人后为新出行人补录护照资料（护照图/有效期/签发日/签发地/签发国）。
+  // 走同一 PATCH /orders/:id/passengers/:passengerId 端点的「补录」通道（不含换人语义字段 →
+  // 落在 SELF_UPDATE 分支，返回 { passenger }）：换人本身会清空旧人的护照资料，这一步再把
+  // OCR 识别到的新人护照资料写回，不削弱换人的清除语义。ISO-2 国家码。
+  supplementOrderPassengerPassport: (
+    token: string,
+    orderId: string,
+    passengerId: string,
+    body: {
+      passportPhotoUrl?: string;
+      passportExpiry?: string;
+      passportIssueDate?: string;
+      passportIssuePlace?: string;
+      passportIssueCountry?: string;
+    },
+  ) =>
+    apiFetch<{ passenger: unknown }>(`/orders/${orderId}/passengers/${passengerId}`, {
       method: 'PATCH',
       token,
       body,

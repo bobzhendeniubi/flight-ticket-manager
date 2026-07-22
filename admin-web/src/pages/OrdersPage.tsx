@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { api, ApiError, duplicatePassengerConflictOrderNumbers, SETTLEMENT_MODE_LABEL, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary } from '../lib/api';
+import { api, ApiError, duplicatePassengerConflictOrderNumbers, SETTLEMENT_MODE_LABEL, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { useFlightSeats } from '../stores/flightSeats';
 import {
@@ -17,6 +17,7 @@ import { RoomingEditor, type RoomingPassenger } from '../components/RoomingEdito
 import { HotelSwapModal } from '../components/HotelSwapModal';
 import { SearchSelect, type SearchSelectOption } from '../components/SearchSelect';
 import type { RoomGroup } from '../lib/api';
+import { countryIso3ToIso2 } from '../lib/passportOcr';
 
 // 本地可视化用的状态子集（后端 OrderStatus 更全，这里只列出常用 7 个做 filter）
 const STATUS_LABEL: Record<OrderStatus, string> = {
@@ -300,9 +301,15 @@ export function OrdersPage() {
   const [channelFilter, setChannelFilter] = useState<'' | 'direct' | 'agent'>('');
   const [agentFilter, setAgentFilter] = useState<string>('');
   const [search, setSearch] = useState('');
+  // 公测反馈：中文名/拼音名搜不到 —— 搜索改接后端（防抖后透传 search，匹配订单号/联系人/乘客中英文名）。
+  const [debouncedSearch, setDebouncedSearch] = useState('');
   // 6/16 反馈（业务反馈）：按下单日期(createdAt)筛 — 用于"当天进单多少"的导出
   const [createdFrom, setCreatedFrom] = useState('');
   const [createdTo, setCreatedTo] = useState('');
+  // 公测反馈：下单时间可精确到几点几分（统计某时段进单）。日期旁配可选时间输入（HH:mm）；
+  // 留空＝整天（历史口径）。快捷预设仍只设日期，时间留空。
+  const [createdFromTime, setCreatedFromTime] = useState('');
+  const [createdToTime, setCreatedToTime] = useState('');
   // 5/20 反馈：按出行日期筛 + 是否已认领
   const [travelFrom, setTravelFrom] = useState('');
   const [travelTo, setTravelTo] = useState('');
@@ -325,11 +332,41 @@ export function OrdersPage() {
     const t = setTimeout(() => setDebouncedPassengerName(passengerNameFilter), 400);
     return () => clearTimeout(t);
   }, [passengerNameFilter]);
+  // 搜索防抖 300ms 后透传后端（乘客中英文名可搜）；深链 ?q= 也走这条，命中订单会被后端召回。
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedSearch(search), 300);
+    return () => clearTimeout(t);
+  }, [search]);
+  // 下单时间起/止：日期 + 可选时间（HH:mm）→ datetime-local 口径 YYYY-MM-DDTHH:mm；无时间＝纯日期（整天）。
+  const createdFromParam = createdFrom ? (createdFromTime ? `${createdFrom}T${createdFromTime}` : createdFrom) : '';
+  const createdToParam = createdTo ? (createdToTime ? `${createdTo}T${createdToTime}` : createdTo) : '';
+  // 列表/导出共用的后端筛选（不含仅前端的 status/kind/channel/agent，与三模板/全岗导出口径一致）。
+  const filterQuery = useMemo<ListOrdersParams>(() => {
+    const q: ListOrdersParams = {};
+    if (createdFromParam) q.from = createdFromParam;
+    if (createdToParam) q.to = createdToParam;
+    const resolvedTravel = travelDateRange(travelFrom, travelTo);
+    if (resolvedTravel.travelFrom) q.travelFrom = resolvedTravel.travelFrom;
+    if (resolvedTravel.travelTo) q.travelTo = resolvedTravel.travelTo;
+    if (claimFilter === 'unclaimed') q.unclaimedOnly = '1';
+    if (debouncedFlightNumber.trim()) q.flightNumber = debouncedFlightNumber.trim();
+    if (debouncedPassengerName.trim()) q.passengerName = debouncedPassengerName.trim();
+    const invoiceLegParsed = parseInvoiceLegFilter(invoiceLegFilter);
+    if (invoiceLegParsed) {
+      q.invoiceLeg = invoiceLegParsed.invoiceLeg;
+      q.invoiced = invoiceLegParsed.invoiced;
+    }
+    if (visaFilter) q.visaFulfillmentStatus = visaFilter;
+    if (debouncedSearch.trim()) q.search = debouncedSearch.trim();
+    return q;
+  }, [createdFromParam, createdToParam, travelFrom, travelTo, claimFilter, debouncedFlightNumber, debouncedPassengerName, invoiceLegFilter, visaFilter, debouncedSearch]);
   // 三模板筛选导出（全岗可用/票务专用/签证专用）
   const [exportTemplate, setExportTemplate] = useState<OrderExportTemplate>('full');
   const [exporting, setExporting] = useState(false);
   // 全岗总表导出（一行/乘客·字段全）
   const [exportingMaster, setExportingMaster] = useState(false);
+  // 进单统计导出（公测反馈·票务：出发日期 × 产品/团期 × 人数）
+  const [exportingIntake, setExportingIntake] = useState(false);
   // 票务开票快捷导出 — 某日某航段需开票订单（《票务专用》= 航司 PNR 模板）
   const [showTicketingQuick, setShowTicketingQuick] = useState(false);
   const [tkDate, setTkDate] = useState(''); // 出发日期（必填）
@@ -378,22 +415,7 @@ export function OrdersPage() {
     let cancelled = false;
     setLoading(true);
     setError(null);
-    const query: ListOrdersParams = { pageSize: 200 };
-    if (createdFrom) query.from = createdFrom; // 下单日期起（createdAt）
-    if (createdTo) query.to = createdTo; // 下单日期止（createdAt）
-    const resolvedTravel = travelDateRange(travelFrom, travelTo);
-    if (resolvedTravel.travelFrom) query.travelFrom = resolvedTravel.travelFrom;
-    if (resolvedTravel.travelTo) query.travelTo = resolvedTravel.travelTo;
-    if (claimFilter === 'unclaimed') query.unclaimedOnly = '1';
-    if (debouncedFlightNumber.trim()) query.flightNumber = debouncedFlightNumber.trim();
-    if (debouncedPassengerName.trim()) query.passengerName = debouncedPassengerName.trim();
-    const invoiceLegParsed = parseInvoiceLegFilter(invoiceLegFilter);
-    if (invoiceLegParsed) {
-      query.invoiceLeg = invoiceLegParsed.invoiceLeg;
-      query.invoiced = invoiceLegParsed.invoiced;
-    }
-    if (visaFilter) query.visaFulfillmentStatus = visaFilter;
-    api.listOrders(tokens.accessToken, query)
+    api.listOrders(tokens.accessToken, { ...filterQuery, pageSize: 200 })
       .then((res) => {
         if (cancelled) return;
         setOrders(res.orders);
@@ -406,7 +428,7 @@ export function OrdersPage() {
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [tokens?.accessToken, createdFrom, createdTo, travelFrom, travelTo, claimFilter, debouncedFlightNumber, debouncedPassengerName, invoiceLegFilter, visaFilter, refreshNonce]);
+  }, [tokens?.accessToken, filterQuery, refreshNonce]);
 
   // 勾选随后端筛选结果收敛（票务反馈 T2）：筛选变化重新拉单后，勾选集合里若还留着不在新结果中的
   // id，会被悄悄带进导出（例如先宽筛选全选，再收窄筛选，导出仍按旧勾选出全团期订单，含已开票的）。
@@ -491,14 +513,19 @@ export function OrdersPage() {
       if (channelFilter === 'direct' && view.agentName) return false;
       if (channelFilter === 'agent' && !view.agentName) return false;
       if (agentFilter && view.agentName !== agentFilter) return false;
-      if (search) {
-        const q = search.toLowerCase();
-        if (
-          !order.orderNumber.toLowerCase().includes(q) &&
-          !view.customerName.toLowerCase().includes(q) &&
-          !(view.agentName?.toLowerCase().includes(q) ?? false)
-        )
-          return false;
+      if (search.trim()) {
+        const q = search.trim().toLowerCase();
+        // 与后端 search 口径对齐的超集（订单号/客户/联系人/电话/代理/乘客中英文名），
+        // 保证后端召回的单不会被前端二次过滤误藏；并为已加载页补上乘客名的即时匹配。
+        const hay = [
+          order.orderNumber,
+          view.customerName,
+          order.contactName,
+          order.contactPhone,
+          view.agentName ?? '',
+          ...order.passengers.flatMap((p) => [p.fullName, p.chineseName ?? '']),
+        ];
+        if (!hay.some((s) => s.toLowerCase().includes(q))) return false;
       }
       return true;
     });
@@ -692,6 +719,11 @@ export function OrdersPage() {
     () => selectedOrders.filter((o) => deriveBalance(o).balance > 0),
     [selectedOrders],
   );
+  // 已选订单的乘客总人数（票务开票凑人数用：套票几十人一起开票，选够 46 人不用手算）。
+  const selectedPax = useMemo(
+    () => selectedOrders.reduce((sum, o) => sum + o.passengers.length, 0),
+    [selectedOrders],
+  );
 
   const applyBulkStatus = async () => {
     if (!tokens?.accessToken || !bulkStatus || selectedIds.size === 0) return;
@@ -787,8 +819,8 @@ export function OrdersPage() {
         // 后端已限定在 COUNTED_STATUSES（占座状态）范围内。
         kind: kindFilter || undefined,
         search: search.trim() || undefined,
-        from: createdFrom || undefined, // 下单日期起（createdAt）— "当天进单多少"导出
-        to: createdTo || undefined, // 下单日期止（createdAt）
+        from: createdFromParam || undefined, // 下单时间起（createdAt，可带时间到分）— "当天进单多少"导出
+        to: createdToParam || undefined, // 下单时间止（createdAt，可带时间到分）
         travelFrom: resolvedTravel.travelFrom,
         travelTo: resolvedTravel.travelTo,
         flightNumber: flightNumberFilter.trim() || undefined,
@@ -884,6 +916,31 @@ export function OrdersPage() {
       alert(err instanceof ApiError ? `导出失败：${err.message}` : '导出失败');
     } finally {
       setExportingMaster(false);
+    }
+  };
+
+  // 进单统计导出（公测反馈·票务）— 按当前筛选（尤其下单时间窗口）导出「出发日期 × 产品/团期」进单表。
+  const handleIntakeExport = async () => {
+    if (!tokens?.accessToken) return;
+    setExportingIntake(true);
+    try {
+      // 与列表同源的后端筛选（含下单时间可到分钟）；勾选场景不适用（进单统计是按筛选统计，不按勾选）。
+      const blob = await api.exportIntake(tokens.accessToken, filterQuery);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      const rangeLabel = createdFromParam || createdToParam
+        ? `${(createdFromParam || '起始').replace(/:/g, '-')}_${(createdToParam || '至今').replace(/:/g, '-')}`
+        : '全部';
+      a.download = `进单统计_${rangeLabel}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (err) {
+      alert(err instanceof ApiError ? `导出失败：${err.message}` : '导出失败');
+    } finally {
+      setExportingIntake(false);
     }
   };
 
@@ -1030,6 +1087,14 @@ export function OrdersPage() {
               : selectedIds.size > 0
                 ? `📊 导出全岗总表（已选 ${selectedIds.size} 条）`
                 : '📊 导出全岗总表'}
+          </button>
+          <button
+            className="btn-secondary text-sm"
+            disabled={loading || exportingIntake}
+            onClick={() => void handleIntakeExport()}
+            title="进单统计：按当前筛选（尤其上方「下单时间」窗口，可精确到分）导出「出发日期 × 产品/团期」的订单数、人数，末行总计。按筛选统计，不按勾选。"
+          >
+            {exportingIntake ? '导出中…' : '📈 进单统计'}
           </button>
           <button
             type="button"
@@ -1225,25 +1290,47 @@ export function OrdersPage() {
           </div>
           <div>
             <label className="label">下单时间 · 起始</label>
-            <input
-              type="date"
-              className="input"
-              value={createdFrom}
-              max={createdTo || undefined}
-              onChange={(e) => setCreatedFrom(e.target.value)}
-              title="按下单日期（录入/创建时间）筛选，配合导出看当天进单量"
-            />
+            <div className="flex gap-1">
+              <input
+                type="date"
+                className="input flex-1"
+                value={createdFrom}
+                max={createdTo || undefined}
+                onChange={(e) => setCreatedFrom(e.target.value)}
+                title="按下单日期（录入/创建时间）筛选，配合导出看当天进单量"
+              />
+              {/* 可选时间（HH:mm）：留空＝当天 00:00 起；填了＝精确到分统计某时段进单 */}
+              <input
+                type="time"
+                className="input w-24"
+                value={createdFromTime}
+                disabled={!createdFrom}
+                onChange={(e) => setCreatedFromTime(e.target.value)}
+                title="可选：起始时间（几点几分）。留空＝当天 00:00 起。需先选起始日期"
+              />
+            </div>
           </div>
           <div>
             <label className="label">下单时间 · 截止</label>
-            <input
-              type="date"
-              className="input"
-              value={createdTo}
-              min={createdFrom || undefined}
-              onChange={(e) => setCreatedTo(e.target.value)}
-              title="按下单日期（录入/创建时间）筛选，配合导出看当天进单量"
-            />
+            <div className="flex gap-1">
+              <input
+                type="date"
+                className="input flex-1"
+                value={createdTo}
+                min={createdFrom || undefined}
+                onChange={(e) => setCreatedTo(e.target.value)}
+                title="按下单日期（录入/创建时间）筛选，配合导出看当天进单量"
+              />
+              {/* 可选时间（HH:mm）：留空＝当天 23:59 止；填了＝精确到分 */}
+              <input
+                type="time"
+                className="input w-24"
+                value={createdToTime}
+                disabled={!createdTo}
+                onChange={(e) => setCreatedToTime(e.target.value)}
+                title="可选：截止时间（几点几分）。留空＝当天 23:59 止。需先选截止日期"
+              />
+            </div>
           </div>
           <div>
             <label className="label">出行日期（从）</label>
@@ -1429,7 +1516,7 @@ export function OrdersPage() {
               onClick={() => {
                 setStatusFilter(''); setKindFilter(''); setChannelFilter(''); setAgentFilter(''); setSearch('');
                 setFlightNumberFilter(''); setPassengerNameFilter(''); setInvoiceLegFilter(''); setVisaFilter('');
-                setCreatedFrom(''); setCreatedTo(''); setTravelFrom(''); setTravelTo('');
+                setCreatedFrom(''); setCreatedTo(''); setCreatedFromTime(''); setCreatedToTime(''); setTravelFrom(''); setTravelTo('');
               }}
             >
               清除所有过滤
@@ -1444,6 +1531,8 @@ export function OrdersPage() {
           <div className="flex flex-wrap items-center gap-3">
             <span className="text-sm font-semibold text-ink">
               已选 <span className="text-brand">{selectedIds.size}</span> 条订单
+              {' · 共 '}
+              <span className="text-brand">{selectedPax}</span> 人
             </span>
             <span className="text-slate-300">|</span>
             <label className="text-sm text-ink-soft">改为：</label>
@@ -1669,6 +1758,24 @@ export function OrdersPage() {
                     </div>
                     {order.passengers.length > 0 && (() => {
                       const names = order.passengers.map((p) => p.chineseName?.trim() || p.fullName);
+                      const q = search.trim().toLowerCase();
+                      // 搜索命中某乘客时优先展示命中者（「张三 +3 同行」），不再平铺全部同行人。
+                      const hitIdx = q
+                        ? order.passengers.findIndex(
+                            (p) =>
+                              (p.chineseName?.toLowerCase().includes(q) ?? false) ||
+                              p.fullName.toLowerCase().includes(q),
+                          )
+                        : -1;
+                      if (hitIdx >= 0) {
+                        const companions = names.length - 1;
+                        return (
+                          <div className="mt-0.5 max-w-xs truncate text-[11px] text-ink-muted" title={names.join('、')}>
+                            <span className="font-medium text-brand">{names[hitIdx]}</span>
+                            {companions > 0 ? ` +${companions} 同行` : ''}
+                          </div>
+                        );
+                      }
                       const shown = names.slice(0, 3);
                       const hasMore = names.length > shown.length;
                       return (
@@ -3771,11 +3878,116 @@ function genderLabel(gender?: 'M' | 'F' | 'X' | null): string {
   return '—';
 }
 
+// 换人历史一条记录的形状（从 SWAP_ORDER_PASSENGER 审计的 before/after 读；旧记录字段可能缺）
+type SwapHistoryEntry = {
+  id: string;
+  at: string; // ISO 时间
+  actor: string | null; // 经手（actorLabel）
+  passengerId?: string;
+  beforeName?: string;
+  beforeDoc?: string;
+  afterName?: string;
+  afterDoc?: string;
+};
+
+// 从审计 payload 安全取字段（旧记录可能缺 fullName/documentNumber，缺了就不显示，不造数据）
+function readSwapSide(payload: unknown): { name?: string; doc?: string; passengerId?: string } {
+  if (!payload || typeof payload !== 'object') return {};
+  const p = payload as Record<string, unknown>;
+  return {
+    name: typeof p.fullName === 'string' ? p.fullName : undefined,
+    doc: typeof p.documentNumber === 'string' ? p.documentNumber : undefined,
+    passengerId: typeof p.passengerId === 'string' ? p.passengerId : undefined,
+  };
+}
+
+function auditToSwapHistory(logs: AuditLog[]): SwapHistoryEntry[] {
+  return logs
+    .filter((l) => l.action === 'SWAP_ORDER_PASSENGER')
+    .map((l) => {
+      const before = readSwapSide(l.before);
+      const after = readSwapSide(l.after);
+      return {
+        id: l.id,
+        at: l.createdAt,
+        actor: l.actorLabel,
+        passengerId: before.passengerId,
+        beforeName: before.name,
+        beforeDoc: before.doc,
+        afterName: after.name,
+        afterDoc: after.doc,
+      };
+    });
+}
+
+function fmtSwapTime(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+// 单个乘客卡下方的换人历史（时间 · 旧人姓名/证件号 → 新人 · 经手；含多次换人，最新在上）
+function PassengerSwapHistory({ entries }: { entries: SwapHistoryEntry[] }) {
+  if (entries.length === 0) return null;
+  return (
+    <details className="mt-2 rounded border border-slate-200 bg-slate-50/70 px-2 py-1 text-[11px]">
+      <summary className="cursor-pointer select-none text-slate-500 hover:text-slate-700">
+        换人历史（{entries.length} 次）
+      </summary>
+      <ul className="mt-1 space-y-1.5">
+        {entries.map((e) => (
+          <li key={e.id} className="border-l-2 border-amber-300 pl-2">
+            <div className="text-slate-400">{fmtSwapTime(e.at)}{e.actor ? ` · 经手 ${e.actor}` : ''}</div>
+            <div className="text-slate-700">
+              <span className="text-slate-500">换前：</span>
+              <span className="font-medium">{e.beforeName ?? '—'}</span>
+              {e.beforeDoc && <span className="ml-1 font-mono text-slate-500">{e.beforeDoc}</span>}
+            </div>
+            <div className="text-slate-700">
+              <span className="text-slate-500">换后：</span>
+              <span className="font-medium">{e.afterName ?? '—'}</span>
+              {e.afterDoc && <span className="ml-1 font-mono text-slate-500">{e.afterDoc}</span>}
+            </div>
+          </li>
+        ))}
+      </ul>
+    </details>
+  );
+}
+
 function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onOrderUpdated?: (order: OrderSummary) => void }) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [lightbox, setLightbox] = useState<{ photoUrl: string; title: string } | null>(null);
   // B1：签证日期内联编辑（订单侧入口——HAS_VISA/全员自备签的单进不了签证台，这里是它们唯一可达的录入口）
   const [visaEditId, setVisaEditId] = useState<string | null>(null);
+
+  // 换人历史：读订单维度的 SWAP_ORDER_PASSENGER 审计（before/after 已含旧/新姓名+证件号、经手、时间）。
+  // 复用已有 audit 数据源，无需后端改动；按 before.passengerId 归到各乘客卡下方。
+  const token = useAuth((s) => s.tokens)?.accessToken ?? '';
+  const [swapHistory, setSwapHistory] = useState<SwapHistoryEntry[]>([]);
+  const [historyReloadKey, setHistoryReloadKey] = useState(0);
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    api
+      .listAuditLogs(token, {
+        targetType: 'ORDER',
+        targetId: order.id,
+        action: 'SWAP_ORDER_PASSENGER',
+        pageSize: 100,
+      })
+      .then((r) => {
+        if (!cancelled) setSwapHistory(auditToSwapHistory(r.logs));
+      })
+      .catch(() => {
+        /* 历史读取失败不阻断详情展示 */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [token, order.id, historyReloadKey]);
+
   return (
     <section>
       <h3 className="text-sm font-medium text-slate-700">乘客 ({order.passengers.length})</h3>
@@ -3809,6 +4021,7 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
                   onSaved={(updated) => {
                     setEditingId(null);
                     onOrderUpdated?.(updated);
+                    setHistoryReloadKey((k) => k + 1); // 换人后重拉换人历史
                   }}
                 />
               </li>
@@ -3894,6 +4107,7 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
                   </button>
                 )}
               </div>
+              <PassengerSwapHistory entries={swapHistory.filter((h) => h.passengerId === p.id)} />
             </li>
           );
         })}
@@ -4132,6 +4346,140 @@ function PassengerEditForm({
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
+  // 护照有效期（可见字段；换人后经补录通道随新人写回）+ OCR 识别到的其余护照资料（隐藏携带）。
+  const [passportExpiry, setPassportExpiry] = useState(passenger.passportExpiry?.slice(0, 10) ?? '');
+  const [passportPhotoUrl, setPassportPhotoUrl] = useState<string | null>(passenger.passportPhotoUrl ?? null);
+  const [passportIssueDate, setPassportIssueDate] = useState<string | null>(null);
+  const [passportIssuePlace, setPassportIssuePlace] = useState<string | null>(null);
+  const [passportIssueCountry, setPassportIssueCountry] = useState<string | null>(null);
+
+  // OCR 状态（与录单同款：进度/阶段/引擎标签）
+  const [ocrPct, setOcrPct] = useState<number | null>(null);
+  const [ocrStage, setOcrStage] = useState<string>('');
+  const [ocrEngine, setOcrEngine] = useState<'ai' | 'local' | 'ai-fallback' | null>(null);
+  const ocrInputRef = useRef<HTMLInputElement | null>(null);
+
+  /**
+   * 换人表单护照 OCR：与录单（SingleOrderModal）完全一致的流程与交互——
+   * 先压缩存库图 → 尝试后端 AI 识别（POST /ocr/passport）→ 未配置/失败回退本地 Tesseract。
+   * 识别结果预填 姓/名/全名/中文名/证件号/出生日期/性别/国籍/护照有效期；
+   * 护照图 + 签发日/签发地/签发国 作为「补录资料」随提交（换人后经补录通道写回新人）。
+   */
+  const applyOcrSuggested = (s: {
+    lastName?: string;
+    firstName?: string;
+    fullName?: string;
+    chineseName?: string;
+    documentNumber?: string;
+    dateOfBirth?: string;
+    gender?: 'M' | 'F' | 'X';
+    nationality?: string;
+    passportExpiry?: string;
+    passportIssueDate?: string;
+    passportIssuePlace?: string;
+    passportIssueCountry?: string;
+  }, iso3: boolean) => {
+    if (s.lastName) setLastName(s.lastName);
+    if (s.firstName) setFirstName(s.firstName);
+    if (s.fullName) setFullName(s.fullName);
+    if (s.chineseName) setChineseName(s.chineseName);
+    if (s.documentNumber) setDocumentNumber(s.documentNumber);
+    if (s.dateOfBirth) setDob(s.dateOfBirth);
+    if (s.gender) setGender(s.gender);
+    // AI 返回 ISO-3 国籍/签发国 → 转 ISO-2（本地 OCR 已是 ISO-2，原样用）
+    if (s.nationality) setNationality(iso3 ? countryIso3ToIso2(s.nationality) : s.nationality);
+    if (s.passportExpiry) setPassportExpiry(s.passportExpiry);
+    if (s.passportIssueDate) setPassportIssueDate(s.passportIssueDate);
+    if (s.passportIssuePlace) setPassportIssuePlace(s.passportIssuePlace);
+    if (s.passportIssueCountry) {
+      const iso2 = iso3 ? countryIso3ToIso2(s.passportIssueCountry) : s.passportIssueCountry;
+      setPassportIssueCountry(iso2.length === 2 ? iso2 : null); // 补录通道要 ISO-2，转不出就不带
+    }
+  };
+
+  const handleOcrFile = async (file: File) => {
+    setErr(null);
+    setOcrPct(0);
+    setOcrStage('加载中…');
+    setOcrEngine(null);
+    // 存库图压缩
+    let dataUrl = '';
+    try {
+      const { passportPhotoToDataUrl } = await import('../lib/passportOcr');
+      dataUrl = await passportPhotoToDataUrl(file);
+    } catch {
+      dataUrl = '';
+    }
+    if (dataUrl) setPassportPhotoUrl(dataUrl);
+
+    // 本地 Tesseract 兜底
+    const runLocal = async (engine: 'local' | 'ai-fallback') => {
+      try {
+        const { ocrPassport } = await import('../lib/passportOcr');
+        const result = await ocrPassport(file, (pct, stage) => {
+          setOcrPct(20 + Math.round(pct * 0.8));
+          setOcrStage(stage);
+        });
+        const s = result.suggested;
+        applyOcrSuggested(
+          {
+            fullName: s.fullName,
+            documentNumber: s.passportNumber,
+            dateOfBirth: s.dateOfBirth,
+            gender: s.gender,
+            nationality: s.nationality,
+            passportExpiry: s.passportExpiry,
+            passportIssueCountry: s.passportIssueCountry,
+          },
+          false,
+        );
+        setOcrPct(100);
+        setOcrStage(result.success ? '识别完成，请核对' : '识别不完整，请核对');
+        setOcrEngine(engine);
+      } catch {
+        setOcrPct(null);
+        setOcrStage('');
+        setOcrEngine(null);
+        setErr('护照识别失败，请手工填写');
+      }
+    };
+
+    // 优先后端 AI 识别
+    if (token) {
+      try {
+        setOcrPct(20);
+        setOcrStage('AI 识别中…');
+        const imageDataUrl =
+          dataUrl ||
+          (await new Promise<string>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () =>
+              typeof reader.result === 'string' ? resolve(reader.result) : reject(new Error('读取失败'));
+            reader.onerror = () => reject(new Error('读取失败'));
+            reader.readAsDataURL(file);
+          }));
+        const aiRes = await api.ocrPassportAi(token, imageDataUrl);
+        if (!aiRes.configured) {
+          await runLocal('local');
+          return;
+        }
+        if (aiRes.suggested) {
+          applyOcrSuggested(aiRes.suggested, true);
+          setOcrPct(100);
+          setOcrStage('识别完成，请核对');
+          setOcrEngine('ai');
+          return;
+        }
+        await runLocal('ai-fallback');
+        return;
+      } catch {
+        await runLocal('ai-fallback');
+        return;
+      }
+    }
+    await runLocal('local');
+  };
+
   const submit = async () => {
     if (!token || submitting) return;
     setErr(null);
@@ -4150,6 +4498,12 @@ function PassengerEditForm({
     } else {
       if (!confirm('确认保存出行人改动？如勾选了重置开票/签证将清除对应状态，填了换人费将计入订单尾款。')) return;
     }
+    // 护照有效期填了就要合法（YYYY-MM-DD）
+    const expiryValue = passportExpiry.trim();
+    if (expiryValue && !/^\d{4}-\d{2}-\d{2}$/.test(expiryValue)) {
+      setErr('护照有效期格式不正确（示例：2030-01-01）');
+      return;
+    }
     setSubmitting(true);
     try {
       const res = await api.updateOrderPassenger(token, orderId, passenger.id, {
@@ -4167,6 +4521,40 @@ function PassengerEditForm({
         feeLabel: feeCny != null && feeCny > 0 ? '换人费' : undefined,
         note: note.trim() || undefined,
       });
+
+      // 换人本身会清空旧人护照资料；这里把 OCR 识别到的新人护照资料（护照图/有效期/签发日/签发地/签发国）
+      // 经「补录」通道写回，不削弱换人的清除语义。只在确有新护照资料时才发第二次请求。
+      // 与旧值一致的字段不重复提交（passportPhotoUrl 是 data-URL，与旧照相同则跳过）。
+      const supplement: {
+        passportPhotoUrl?: string;
+        passportExpiry?: string;
+        passportIssueDate?: string;
+        passportIssuePlace?: string;
+        passportIssueCountry?: string;
+      } = {};
+      if (passportPhotoUrl && passportPhotoUrl !== (passenger.passportPhotoUrl ?? null)) {
+        supplement.passportPhotoUrl = passportPhotoUrl;
+      }
+      if (expiryValue && expiryValue !== (passenger.passportExpiry?.slice(0, 10) ?? '')) {
+        supplement.passportExpiry = expiryValue;
+      }
+      if (passportIssueDate) supplement.passportIssueDate = passportIssueDate;
+      if (passportIssuePlace) supplement.passportIssuePlace = passportIssuePlace;
+      if (passportIssueCountry) supplement.passportIssueCountry = passportIssueCountry;
+
+      if (Object.keys(supplement).length > 0) {
+        try {
+          await api.supplementOrderPassengerPassport(token, orderId, passenger.id, supplement);
+          const refreshed = await api.getOrder(token, orderId);
+          onSaved(refreshed.order);
+          return;
+        } catch {
+          // 换人已成功，仅护照资料补录失败：不回滚，提示可稍后在「补录护照」重试。
+          setErr('换人已保存，但护照资料补录失败，请稍后重新上传护照。');
+          onSaved(res.order);
+          return;
+        }
+      }
       onSaved(res.order);
     } catch (e) {
       setErr(e instanceof ApiError ? e.message : '保存失败');
@@ -4176,10 +4564,52 @@ function PassengerEditForm({
   };
 
   const inputCls = 'mt-0.5 w-full rounded border border-slate-300 px-2 py-1 text-xs';
+  const ocring = ocrPct !== null && ocrPct < 100;
+  const ocrEngineLabel =
+    ocrEngine === 'ai' ? 'AI 识别' : ocrEngine === 'local' ? '本地识别' : ocrEngine === 'ai-fallback' ? 'AI 失败·本地兜底' : '';
 
   return (
     <div className="space-y-2 text-xs">
       <div className="font-medium text-brand">换人/编辑 · {passenger.fullName}</div>
+
+      {/* 护照 OCR：上传照片自动识别并预填下方字段（与录单同款，AI 优先、本地兜底）。用户可改后提交。 */}
+      <div className="flex items-center gap-2 rounded border border-dashed border-brand/40 bg-brand/5 px-2 py-1.5">
+        <input
+          type="file"
+          accept="image/*"
+          ref={ocrInputRef}
+          className="hidden"
+          onChange={(e) => {
+            const f = e.target.files?.[0];
+            e.target.value = ''; // 允许重复选同一文件
+            if (f) void handleOcrFile(f);
+          }}
+        />
+        {ocring ? (
+          <div className="flex-1">
+            <div className="h-1.5 w-full overflow-hidden rounded bg-slate-200">
+              <div className="h-full bg-brand transition-all" style={{ width: `${ocrPct ?? 0}%` }} />
+            </div>
+            <span className="text-[10px] text-slate-400">{ocrStage}</span>
+          </div>
+        ) : (
+          <>
+            <button
+              type="button"
+              className="rounded bg-brand px-2 py-1 font-medium text-white disabled:opacity-50"
+              onClick={() => ocrInputRef.current?.click()}
+              disabled={submitting}
+            >
+              📷 上传护照识别
+            </button>
+            {passportPhotoUrl && (
+              <img src={passportPhotoUrl} alt="护照" className="h-8 w-8 rounded object-cover" />
+            )}
+            {ocrEngineLabel && <span className="text-[10px] text-slate-500">{ocrEngineLabel}</span>}
+            <span className="ml-auto text-[10px] text-slate-400">识别结果可修改后提交</span>
+          </>
+        )}
+      </div>
 
       <div className="grid grid-cols-2 gap-2">
         <label className="block">
@@ -4223,10 +4653,16 @@ function PassengerEditForm({
         </label>
       </div>
 
-      <label className="block">
-        <span className="text-slate-500">国籍（ISO，如 CN）</span>
-        <input className={inputCls} value={nationality} onChange={(e) => setNationality(e.target.value)} placeholder="CN" />
-      </label>
+      <div className="grid grid-cols-2 gap-2">
+        <label className="block">
+          <span className="text-slate-500">国籍（ISO，如 CN）</span>
+          <input className={inputCls} value={nationality} onChange={(e) => setNationality(e.target.value)} placeholder="CN" />
+        </label>
+        <label className="block">
+          <span className="text-slate-500">护照有效期</span>
+          <input className={`${inputCls} font-mono`} value={passportExpiry} onChange={(e) => setPassportExpiry(e.target.value)} placeholder="2030-01-01" />
+        </label>
+      </div>
 
       <div className="space-y-1 rounded border border-slate-200 bg-white p-2">
         <label className="flex items-center gap-2">

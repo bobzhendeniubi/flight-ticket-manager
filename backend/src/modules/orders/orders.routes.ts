@@ -65,6 +65,10 @@ import {
   masterExportFilename,
 } from './orders.export-master.js';
 import {
+  buildIntakeExportWorkbook,
+  intakeExportFilename,
+} from './orders.export-intake.js';
+import {
   buildRosterTemplateWorkbook,
   parseRosterXlsx,
   rosterTemplateFilename,
@@ -695,6 +699,57 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         .header(
           'Content-Disposition',
           `attachment; filename="${encodeURIComponent(masterExportFilename(query.from, query.to))}"`,
+        )
+        .send(buf);
+    },
+  );
+
+  // ── 进单统计导出（公测反馈·票务）──
+  // GET /orders/export/intake + listOrders 同款筛选（尤其 from/to 下单时间窗口，可带时间到分钟）
+  // 按「出发日期 × 产品/团期」聚合，列：出发日期 / 产品/团期 / 订单数 / 人数，末行总计。
+  // ADMIN/STAFF only（与其它导出一致：代理/客户不放行）。
+  app.get(
+    '/export/intake',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    async (req, reply) => {
+      // 复用 listOrders 的筛选字段（含放宽后的 from/to），保证「导出=列表所见」。
+      const query = listOrdersQuerySchema
+        .pick({
+          status: true,
+          agentId: true,
+          kind: true,
+          search: true,
+          from: true,
+          to: true,
+          travelFrom: true,
+          travelTo: true,
+          flightNumber: true,
+          passengerName: true,
+          invoiceLeg: true,
+          invoiced: true,
+          visaFulfillmentStatus: true,
+        })
+        .extend({ orderIds: orderIdsQuerySchema })
+        .parse(req.query);
+      const buf = await buildIntakeExportWorkbook(query);
+
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'EXPORT_ORDER_INTAKE',
+        targetType: 'ORDER',
+        targetId: 'intake',
+        targetLabel: `进单统计 ${query.from ?? '全部'} ~ ${query.to ?? query.from ?? '全部'}`,
+        after: { from: query.from ?? null, to: query.to ?? null },
+      });
+
+      return reply
+        .header(
+          'Content-Type',
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
+        .header(
+          'Content-Disposition',
+          `attachment; filename="${encodeURIComponent(intakeExportFilename(query.from, query.to))}"`,
         )
         .send(buf);
     },

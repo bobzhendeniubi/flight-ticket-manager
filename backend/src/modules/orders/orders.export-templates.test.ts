@@ -14,11 +14,14 @@ import { describe, it, expect, vi } from 'vitest';
 // 模块链路（orders.export-templates → orders.service）顶层引用 prisma —— mock 掉
 vi.mock('../../db/prisma.js', () => ({ prisma: {} }));
 
+import ExcelJS from 'exceljs';
+import type { PrismaClient } from '@prisma/client';
 import {
   orderToFullRows,
   orderToTicketingRows,
   orderToVisaRows,
   buildOrderContext,
+  buildOrderTemplateExportWorkbook,
   pnrName,
   nameWithTitle,
   FULL_COLUMNS,
@@ -626,5 +629,57 @@ describe('导出 · 生日为空（dateOfBirth=null）', () => {
     const rows = orderToTicketingRows(order, ctx);
     expect(rows[0].dob).toBe('');
     expect(rows[1].dob).toBe('15Jun19');
+  });
+});
+
+// ── 出发日期精确细筛在 buildOrderTemplateExportWorkbook 生效（0722 财务反馈）─────────
+// fixtureRoundTrip：去程 2026-07-13、返程 2026-07-14 → 整单出发日 = 07-13。
+// 取数 where 宽召回会把它带进「07-14」的窗口（返程段命中），导出层须按整单出发日剔除。
+describe('buildOrderTemplateExportWorkbook 出发日精确细筛', () => {
+  function fakeClient(orders: OrderForTemplateExport[]): PrismaClient {
+    return { order: { findMany: vi.fn().mockResolvedValue(orders) } } as unknown as PrismaClient;
+  }
+
+  /** 加载 xlsx，返回指定 sheet 的数据行数（扣除表头）。*/
+  async function dataRowCount(buf: Buffer, sheetName: string): Promise<number> {
+    const wb = new ExcelJS.Workbook();
+    // ExcelJS 的 xlsx.load 形参用旧版 Buffer 类型，与新版 @types/node 的 Buffer<ArrayBufferLike>
+    // 泛型不完全兼容（仅类型层，运行时无碍；仓库其它测试同款）——按其形参类型收敛，避免 tsc 噪声。
+    await wb.xlsx.load(buf as unknown as Parameters<typeof wb.xlsx.load>[0]);
+    const ws = wb.getWorksheet(sheetName);
+    return ws ? Math.max(0, ws.actualRowCount - 1) : 0;
+  }
+
+  it('按返程日 07-14 导出 → 整单出发日 07-13 的往返单被剔除（0 数据行）', async () => {
+    const buf = await buildOrderTemplateExportWorkbook(
+      { template: 'visa', travelFrom: '2026-07-14', travelTo: '2026-07-14' } as Parameters<
+        typeof buildOrderTemplateExportWorkbook
+      >[0],
+      fakeClient([fixtureRoundTrip()]),
+    );
+    expect(await dataRowCount(buf, '签证专用')).toBe(0);
+  });
+
+  it('按出发日 07-13 导出 → 该往返单保留（2 位乘客 = 2 数据行）', async () => {
+    const buf = await buildOrderTemplateExportWorkbook(
+      { template: 'visa', travelFrom: '2026-07-13', travelTo: '2026-07-13' } as Parameters<
+        typeof buildOrderTemplateExportWorkbook
+      >[0],
+      fakeClient([fixtureRoundTrip()]),
+    );
+    expect(await dataRowCount(buf, '签证专用')).toBe(2);
+  });
+
+  it('scheduleId（整班·全岗精确导出）→ 不做出发日细筛，原样保留', async () => {
+    const buf = await buildOrderTemplateExportWorkbook(
+      {
+        template: 'visa',
+        scheduleId: 'fs-out',
+        travelFrom: '2026-07-14',
+        travelTo: '2026-07-14',
+      } as Parameters<typeof buildOrderTemplateExportWorkbook>[0],
+      fakeClient([fixtureRoundTrip()]),
+    );
+    expect(await dataRowCount(buf, '签证专用')).toBe(2);
   });
 });

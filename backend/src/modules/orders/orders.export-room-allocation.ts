@@ -22,6 +22,7 @@ import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { BadRequestError } from '../../lib/errors.js';
 import { getHotelNightlyRemaining } from '../hotel-control/hotel-control.service.js';
 import { fmtDateDMYDash, pnrName } from './orders.export-templates.js';
+import { earliestFlightDeparture } from './pnr-export.js';
 
 /** 与财务/订单导出一致：草稿 / 已取消 / 已退款 / 支付超时 / 失败 不计入。*/
 const COUNTED_STATUSES: OrderStatus[] = [
@@ -571,7 +572,7 @@ async function queryRoomItemsByDepartDate(
 ): Promise<RoomItemForExport[]> {
   const dayStart = toDateOnly(departDate);
   const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000);
-  return (await client.orderItem.findMany({
+  const fetched = (await client.orderItem.findMany({
     where: {
       hotelRoomTypeId: { not: null },
       order: {
@@ -598,6 +599,27 @@ async function queryRoomItemsByDepartDate(
     orderBy: { createdAt: 'asc' },
     include: ROOM_ITEM_INCLUDE,
   })) as RoomItemForExport[];
+  return filterRoomItemsByDepartDate(fetched, departDate);
+}
+
+/**
+ * 出发日精确细筛（0722 房控反馈）：取数 where 的主口径用 `items.some.kind=FLIGHT` 命中**任意**
+ * 航段落在该 UTC 日 —— 会把「去程 21 号、回程 22 号」这类整单出发日不在该日的往返单也召回
+ * （返程段落在该日）。这里按整单「出发日」= 最早 FLIGHT 行出发日（earliestFlightDeparture，
+ * 与 sheet「出发(往返)日期」列同口径，UTC 日历日）二次过滤：
+ *   - 含航班的订单：最早航段出发日须 === departDate，否则剔除（去程 21/回程 22 被排除）；
+ *   - 无任何 FLIGHT 行的订单（纯酒店/未挂班次套餐）：earliestFlightDeparture 返回 null，
+ *     由取数回落分支（hotelCheckIn === 该日）已精确命中，此处一律放行、不动其回落口径。
+ * 纯函数（按 item.order.items 判定），导出调用 + 单测复用。
+ */
+export function filterRoomItemsByDepartDate(
+  items: RoomItemForExport[],
+  departDate: string,
+): RoomItemForExport[] {
+  return items.filter((it) => {
+    const earliest = earliestFlightDeparture(it.order.items);
+    return earliest === null || fmtDate(earliest) === departDate;
+  });
 }
 
 /** 把占房 item 集合渲染成分房表 xlsx（区间/出发日两口径共用的收尾）。*/

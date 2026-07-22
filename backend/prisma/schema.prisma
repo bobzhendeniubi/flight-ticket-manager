@@ -848,6 +848,8 @@ model Visa {
   stayDays           Int? // 单次入境最多可停留天数（订单详情「最多可停留 X 天」展示用）
   highlight          String? // "最热销 · 全流程线上"
   requiredDocs       String[] // e.g., ["passport_scan", "photo", "itinerary"]
+  // 签证公司/代办渠道名（财务对账用——核对某笔签证金额属于哪家供应商的账单）
+  supplier           String?
   soldCount          Int                 @default(0) // 已售份数（展示用，seed 填充）
   isActive           Boolean             @default(true)
   createdAt          DateTime            @default(now())
@@ -919,6 +921,9 @@ model Bundle {
   defaultDepartDate             String?
   soldCount                     Int      @default(0) // 已售份数（展示用，seed 填充）
   isActive                      Boolean  @default(true)
+  // 管理端可编辑的排序值：列表按 sortOrder 升序展示（数字小的排前面），null 排最后。
+  // 运营用它把常用套餐置顶（如录单选套餐时）。
+  sortOrder                     Int?
   createdAt                     DateTime @default(now())
   updatedAt                     DateTime @updatedAt
 

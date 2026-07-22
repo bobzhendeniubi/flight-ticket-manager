@@ -22,6 +22,7 @@ import {
   type OrderForMasterExport,
   type TripCountMap,
 } from './orders.export-master.js';
+import { filterExportOrdersByDepartDate } from './orders.export-depart-filter.js';
 import { docKey } from '../travelers/traveler-profiles.aggregate.js';
 
 const D = (s: string): Date => new Date(`${s}T00:00:00.000Z`);
@@ -689,5 +690,76 @@ describe('masterExportFilename', () => {
     expect(masterExportFilename('2026-07-01', '2026-07-31')).toBe('全岗总表_2026-07-01_2026-07-31.xlsx');
     expect(masterExportFilename('2026-07-10')).toBe('全岗总表_2026-07-10_2026-07-10.xlsx');
     expect(masterExportFilename()).toBe('全岗总表_全部_全部.xlsx');
+  });
+});
+
+// ── 出发日期精确细筛（0722 财务反馈）──────────────────────────────────────────
+// 共享 helper（全岗总表 / 三模板共用）：取回内存后按整单「出发日」（列表列同口径）二次过滤，
+// 把取数 where 宽召回带进来的「返程日 / ±1 天邻日在窗口内、但整单出发日不在区间」的单剔除。
+describe('filterExportOrdersByDepartDate（出发日精确细筛）', () => {
+  const flight = (departISO: string) => ({
+    kind: 'FLIGHT',
+    flightSchedule: { departureTime: new Date(departISO) },
+    hotelCheckIn: null,
+  });
+  const hotel = (checkIn: string) => ({
+    kind: 'HOTEL',
+    flightSchedule: null,
+    hotelCheckIn: new Date(`${checkIn}T00:00:00.000Z`),
+  });
+  const mkOrder = (id: string, items: unknown[]) => ({ id, items });
+
+  it('去程 21 号、返程 22 号的往返单 → 按 22 号导出时被排除（整单出发日=21）', () => {
+    const orders = [
+      mkOrder('roundtrip-21-22', [
+        flight('2026-07-21T02:00:00.000Z'),
+        flight('2026-07-22T05:00:00.000Z'),
+      ]),
+      mkOrder('depart-22', [flight('2026-07-22T09:00:00.000Z')]),
+    ];
+    const kept = filterExportOrdersByDepartDate(orders, '2026-07-22', '2026-07-22');
+    expect(kept.map((o) => o.id)).toEqual(['depart-22']);
+  });
+
+  it('22 号 00:xx 出发（+8 当地时刻按 UTC 分量存）→ 归入 22 号，不漏', () => {
+    const orders = [mkOrder('early-22', [flight('2026-07-22T00:30:00.000Z')])];
+    const kept = filterExportOrdersByDepartDate(orders, '2026-07-22', '2026-07-22');
+    expect(kept.map((o) => o.id)).toEqual(['early-22']);
+  });
+
+  it('无航班的酒店单 → 按最早入住日归日（22 号入住命中、21 号入住排除）', () => {
+    const orders = [
+      mkOrder('hotel-in-22', [hotel('2026-07-22')]),
+      mkOrder('hotel-in-21', [hotel('2026-07-21')]),
+    ];
+    const kept = filterExportOrdersByDepartDate(orders, '2026-07-22', '2026-07-22');
+    expect(kept.map((o) => o.id)).toEqual(['hotel-in-22']);
+  });
+
+  it('纯签证单（既无航班也无入住日）→ 无出发日，带出发区间导出时维持现状口径被排除', () => {
+    const orders = [
+      mkOrder('visa-only', [{ kind: 'VISA', flightSchedule: null, hotelCheckIn: null }]),
+      mkOrder('depart-22', [flight('2026-07-22T09:00:00.000Z')]),
+    ];
+    const kept = filterExportOrdersByDepartDate(orders, '2026-07-22', '2026-07-22');
+    expect(kept.map((o) => o.id)).toEqual(['depart-22']);
+  });
+
+  it('未给 travelFrom/travelTo（如勾选/整班导出）→ 原样放行，不过滤', () => {
+    const orders = [
+      mkOrder('a', [flight('2026-07-21T02:00:00.000Z')]),
+      mkOrder('b', [{ kind: 'VISA', flightSchedule: null, hotelCheckIn: null }]),
+    ];
+    const kept = filterExportOrdersByDepartDate(orders, undefined, undefined);
+    expect(kept.map((o) => o.id)).toEqual(['a', 'b']);
+  });
+
+  it('开区间：只给 travelFrom（含起点及之后）', () => {
+    const orders = [
+      mkOrder('d20', [flight('2026-07-20T02:00:00.000Z')]),
+      mkOrder('d22', [flight('2026-07-22T02:00:00.000Z')]),
+    ];
+    const kept = filterExportOrdersByDepartDate(orders, '2026-07-21', undefined);
+    expect(kept.map((o) => o.id)).toEqual(['d22']);
   });
 });

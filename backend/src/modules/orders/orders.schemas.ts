@@ -450,8 +450,11 @@ export const listOrdersQuerySchema = z.object({
   agentId: z.string().optional(),
   kind: z.nativeEnum(OrderItemKind).optional(),
   search: z.string().max(120).optional(), // 订单号/姓名/电话
-  from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),  // 下单日期起
-  to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),    // 下单日期止
+  // 下单时间起/止 — 兼容两种口径（公测反馈：需精确到几点几分统计当日进单）：
+  //   · 纯日期 YYYY-MM-DD（历史口径，行为不变：当日整天）
+  //   · 带时间 YYYY-MM-DDTHH:mm[:ss]（datetime-local 口径，按录单人所见的北京时精确卡界）
+  from: z.string().regex(/^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2})?)?$/).optional(),  // 下单时间起
+  to: z.string().regex(/^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2})?)?$/).optional(),    // 下单时间止
   // 按出行日期筛选（票务/签证流程按日期批量处理，反馈高优需求）
   travelFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   travelTo: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),

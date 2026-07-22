@@ -292,13 +292,22 @@ function yymmddToIso(yymmdd: string, isBirth: boolean): string {
   return `${year}-${mm}-${dd}`;
 }
 
-/** MRZ 国籍代码 CHN → ISO-2 CN；HKG → HK；MAC → MO */
-function mrzNationalityToISO(code: string): string {
+/**
+ * ISO-3166 alpha-3 国家码 → alpha-2（CHN→CN、HKG→HK、MAC→MO…）。
+ * 换人表单复用：AI OCR 返回 ISO-3 国籍/签发国，而后端补录通道要 ISO-2。映射不到时原样返回，
+ * 调用方自行决定是否采用（避免把 3 字母误发给要求 length(2) 的字段）。
+ */
+export function countryIso3ToIso2(code: string): string {
   const map: Record<string, string> = {
     CHN: 'CN', HKG: 'HK', MAC: 'MO', TWN: 'TW',
     USA: 'US', GBR: 'GB', JPN: 'JP', KOR: 'KR', VNM: 'VN',
   };
-  return map[code] ?? code;
+  return map[(code ?? '').toUpperCase()] ?? code;
+}
+
+/** MRZ 国籍代码 CHN → ISO-2 CN；HKG → HK；MAC → MO */
+function mrzNationalityToISO(code: string): string {
+  return countryIso3ToIso2(code);
 }
 
 /** MRZ 名字格式：SURNAME<<GIVEN<NAMES → "GIVEN NAMES SURNAME"（护照英文拼音名） */

@@ -1361,6 +1361,31 @@ export class OrderService {
         if (bundle.hotelRoomType && !bundle.hotelRoomType.hotel.isActive) {
           throw new BadRequestError('酒店已下架');
         }
+        // ── 座位账诚实收口：套餐含机票组件 → 本单必须带对应机票航段行 ────────────────
+        // 套餐定义（bundle.items）里含 FLIGHT 组件时，本单却没有对应的机票航段（FLIGHT 行）→
+        // 会落一张「无航段、不占座、出行日期无从派生」的套餐单：签证台/订单列表/详情/导出都推不出
+        // 出发日期，且机位从未被占（座位账少了一笔）。机票航段本应由建单方（前台购物车 / 单笔录单 /
+        // 批量创单）按出发日期匹配当日班次后随 items 一并提交；这里做最后一道防御性断言——匹配不到
+        // 班次 / 建单方漏发航段时**明确拒单**，绝不静默落无航段套餐单。
+        //   合法路径都会带机票航段：批量创单与前台购物车给航段打 bundleId 标；单笔录单发不带标的航段。
+        //   故判定 = 本单存在 FLIGHT 行且（打了本套餐的标 或 未打任何套餐标）。
+        //   航段真正扣座沿用既有 decrementSeat 链路（占/放对称），本断言不新增任何占座/放座逻辑。
+        const bundleComponentList = Array.isArray(bundle.items)
+          ? (bundle.items as Array<{ kind?: string }>)
+          : [];
+        const bundleHasFlightComponent = bundleComponentList.some((c) => c?.kind === 'FLIGHT');
+        if (bundleHasFlightComponent) {
+          const hasMatchingFlightLeg = items.some(
+            (it) =>
+              it.kind === 'FLIGHT' && (it.bundleId === item.bundleId || it.bundleId == null),
+          );
+          if (!hasMatchingFlightLeg) {
+            throw new BadRequestError(
+              '该套餐含机票，但本单未匹配到对应的机票航段，无法占座、也无从确定出发日期。' +
+                '请确认该套餐所选出发日期有可用班次后重试（如反复出现，请检查套餐的航班绑定与当日排班）。',
+            );
+          }
+        }
         // 记下该套餐折扣（%），循环后对本套餐的 BUNDLE 行 + 关联 FLIGHT 腿逐行打折。
         if (item.bundleId) bundleDiscountPct.set(item.bundleId, bundle.discountPct ?? 0);
         // 住宿晚数：单一权威口径（hotelNights ?? 首个 HOTEL 组件 qty ?? 默认）。
@@ -5486,6 +5511,24 @@ export type OrderListFilters = Pick<
 };
 
 /**
+ * 下单时间（createdAt）筛选边界解析（公测反馈：需精确到几点几分统计当日进单）。
+ * - 纯日期 YYYY-MM-DD：保持历史口径不变 —— from → 当日 00:00:00Z（gte）；to → 当日 23:59:59Z（lte）。
+ * - 带时间 YYYY-MM-DDTHH:mm[:ss]（datetime-local 口径）：按录单人所见的北京时（+08:00）墙钟时刻精确
+ *   卡界。列表「下单时间」列用浏览器本地时区（北京 +8）渲染 createdAt，故按 +08:00 解释输入才与所见
+ *   一致；若按 UTC 解释会整体偏 8 小时。缺秒补 :00。
+ */
+const BUSINESS_UTC_OFFSET = '+08:00';
+function resolveCreatedAtBoundary(value: string, edge: 'from' | 'to'): Date {
+  if (value.includes('T')) {
+    const withSeconds = /T\d{2}:\d{2}$/.test(value) ? `${value}:00` : value;
+    return new Date(`${withSeconds}${BUSINESS_UTC_OFFSET}`);
+  }
+  return edge === 'from'
+    ? new Date(`${value}T00:00:00Z`)
+    : new Date(`${value}T23:59:59Z`);
+}
+
+/**
  * 把列表/导出共用的筛选参数转成 Prisma where。
  * listOrders 与 orders.export-templates.ts 三模板导出共用，避免两处过滤逻辑漂移。
  * 注意：不含 RBAC（userId/可见代理集合）、claimedById/unclaimedOnly、分页 —— 由调用方叠加。
@@ -5511,8 +5554,8 @@ export function buildOrderFilterWhere(query: OrderListFilters): Prisma.OrderWher
   if (query.kind) andClauses.push({ items: { some: { kind: query.kind } } });
   if (query.from || query.to) {
     where.createdAt = {
-      ...(query.from ? { gte: new Date(`${query.from}T00:00:00Z`) } : {}),
-      ...(query.to ? { lte: new Date(`${query.to}T23:59:59Z`) } : {}),
+      ...(query.from ? { gte: resolveCreatedAtBoundary(query.from, 'from') } : {}),
+      ...(query.to ? { lte: resolveCreatedAtBoundary(query.to, 'to') } : {}),
     };
   }
   // 按出行日期筛选 — 跨 OrderItem 多种字段

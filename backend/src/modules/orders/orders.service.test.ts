@@ -3370,6 +3370,31 @@ describe('buildOrderFilterWhere · 签证办理状态筛选（与列表徽标同
   });
 });
 
+// ── 下单时间 from/to 边界（公测反馈：需精确到几点几分统计当日进单）──
+// 纯日期保持历史口径；带时间按录单人所见的北京时（+08:00）墙钟精确卡界。
+describe('buildOrderFilterWhere · 下单时间 from/to 边界解析', () => {
+  it('纯日期口径不变：from→当日 00:00:00Z（gte），to→当日 23:59:59Z（lte）', () => {
+    const where = buildOrderFilterWhere({ from: '2026-07-21', to: '2026-07-21' });
+    const createdAt = where.createdAt as { gte: Date; lte: Date };
+    expect(createdAt.gte.toISOString()).toBe('2026-07-21T00:00:00.000Z');
+    expect(createdAt.lte.toISOString()).toBe('2026-07-21T23:59:59.000Z');
+  });
+
+  it('带时间（datetime-local）按 +08:00 精确卡界：14:30 北京 = 06:30Z', () => {
+    const where = buildOrderFilterWhere({ from: '2026-07-21T14:30', to: '2026-07-21T18:00' });
+    const createdAt = where.createdAt as { gte: Date; lte: Date };
+    expect(createdAt.gte.toISOString()).toBe('2026-07-21T06:30:00.000Z');
+    expect(createdAt.lte.toISOString()).toBe('2026-07-21T10:00:00.000Z');
+  });
+
+  it('只给 from（带时间）→ 只产生 gte，无 lte', () => {
+    const where = buildOrderFilterWhere({ from: '2026-07-21T09:00:00' });
+    const createdAt = where.createdAt as { gte: Date; lte?: Date };
+    expect(createdAt.gte.toISOString()).toBe('2026-07-21T01:00:00.000Z');
+    expect(createdAt.lte).toBeUndefined();
+  });
+});
+
 // ── 出行日期精确细筛（整单出发日 = deriveOrderDepartDate 同口径；列表所见 = 筛选所得）──
 describe('filterOrderIdsByDepartDate · 按整单出发日精确细筛', () => {
   // departureTime 以「本地时刻当作 UTC」存取（与仓库其余时间口径一致）——

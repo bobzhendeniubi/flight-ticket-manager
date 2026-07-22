@@ -27,8 +27,14 @@ type MockVisaWithStayDays = MockVisa & {
   costPriceCny?: number | null;
   issuanceMethod?: VisaIssuanceMethod | null;
   entryType?: VisaEntryType | null;
+  /** 签证公司/代办渠道名（财务对账用——核对某笔签证金额属于哪家供应商的账单）；未录为 null */
+  supplier?: string | null;
 };
-type MockBundleWithServiceNotes = MockBundle & { serviceNotes?: string | null };
+type MockBundleWithServiceNotes = MockBundle & {
+  serviceNotes?: string | null;
+  /** 管理端可编辑排序值：数字小的排前面（列表 + 录单套餐下拉同口径）；留空排最后 */
+  sortOrder?: number | null;
+};
 // 0702 反馈 3：起价拆解需要房型整间夜价 —— MockBundle.hotelRoomType（lib/mockData.ts）里没声明
 // nightlyPriceCny，但后端 serializeBundle 实际会发（见 products.service.ts BUNDLE_ROOM_INCLUDE /
 // serializeBundle），本页局部扩展类型承接，不改共享 mock 类型定义。
@@ -138,6 +144,8 @@ function visaApiToMock(v: ApiVisa): MockVisaWithStayDays {
     // 签发方式 / 入境次数（结构化分类）：未设置（含旧数据未回填命中）= null
     issuanceMethod: v.issuanceMethod,
     entryType: v.entryType,
+    // 签证公司/代办渠道名（财务对账用）；未录为 null
+    supplier: v.supplier,
   };
 }
 
@@ -182,6 +190,8 @@ function bundleApiToMock(b: ApiBundle): MockBundleWithServiceNotes {
     defaultDepartDate: b.defaultDepartDate ?? null,
     outboundFlight: b.outboundFlight ?? null,
     returnFlight: b.returnFlight ?? null,
+    // 管理端可编辑排序值：数字小的排前面（列表 + 录单套餐下拉同口径）；null = 排最后
+    sortOrder: b.sortOrder,
   };
 }
 
@@ -461,6 +471,8 @@ export function ProductsPage() {
           // 签发方式 / 入境次数（结构化分类，选填）：留空 = 未设置 → 省略字段。
           issuanceMethod: n.issuanceMethod ?? undefined,
           entryType: n.entryType ?? undefined,
+          // 签证公司/代办渠道名（选填，仅内部，财务对账用）：留空 = 未录 → 省略字段。
+          supplier: n.supplier || undefined,
         });
       }
       for (const n of next) {
@@ -479,6 +491,8 @@ export function ProductsPage() {
             // 留空 = 显式清空签发方式/入境次数为未设置（同款真·部分更新字段）。
             issuanceMethod: n.issuanceMethod ?? null,
             entryType: n.entryType ?? null,
+            // 留空 = 显式清空签证公司为未录（真·部分更新字段，表单已用现值预填）。
+            supplier: n.supplier || null,
           });
         }
       }
@@ -519,6 +533,8 @@ export function ProductsPage() {
           // 绑定航班号（去程/回程）：选了 = flight.id；不指定 = null。
           outboundFlightId: n.outboundFlight?.id ?? null,
           returnFlightId: n.returnFlight?.id ?? null,
+          // 管理端可编辑排序值（选填）：留空 = 排最后 → 省略字段。
+          sortOrder: n.sortOrder ?? undefined,
         });
       }
       for (const n of next) {
@@ -549,6 +565,8 @@ export function ProductsPage() {
             // 绑定航班号（去程/回程）：选了 = flight.id；不指定 = null（解绑）。
             outboundFlightId: n.outboundFlight?.id ?? null,
             returnFlightId: n.returnFlight?.id ?? null,
+            // 留空 = 显式清空排序值为未设（排最后，真·部分更新字段，表单已用现值预填）。
+            sortOrder: n.sortOrder ?? null,
             isActive: n.active,
           });
         }
@@ -1180,6 +1198,8 @@ function NewBundleWizard({
   const [serviceNotes, setServiceNotes] = useState(initial?.serviceNotes ?? '');
   const [emoji, setEmoji] = useState(initial?.emoji ?? '🎁');
   const [suitableFor, setSuitableFor] = useState(initial?.suitableFor ?? '2 大人');
+  // 管理端可编辑排序值（选填）：数字小的排前面，留空排最后（列表 + 录单套餐下拉同口径）
+  const [sortOrder, setSortOrder] = useState<number | null>(initial?.sortOrder ?? null);
   const [hotelRoomTypeId, setHotelRoomTypeId] = useState(initial?.hotelRoomTypeId ?? '');
   // 住宿晚数 = 唯一真源：同时驱动 hotelNights + 首个 HOTEL 项的 qty。
   // 预填：旧数据 hotelNights 可能为 null，回退到 HOTEL 项 qty，再回退 1。
@@ -1509,9 +1529,22 @@ function NewBundleWizard({
               placeholder={'中文客服，越南当地机场助签\n举牌接机，送至酒店并协助分房\n离境日通知旅客，送往机场并辅助值机'}
             />
           </div>
-          <div>
-            <label className="label">适合人群</label>
-            <input className="input" value={suitableFor} onChange={(e) => setSuitableFor(e.target.value)} />
+          <div className="grid gap-3 md:grid-cols-3">
+            <div className="md:col-span-2">
+              <label className="label">适合人群</label>
+              <input className="input" value={suitableFor} onChange={(e) => setSuitableFor(e.target.value)} />
+            </div>
+            <div>
+              <label className="label">排序值（选填）</label>
+              <NumberInput
+                className="input"
+                placeholder="留空排最后"
+                value={sortOrder}
+                onChange={(n) => setSortOrder(n)}
+                integerOnly
+              />
+              <p className="mt-1 text-[11px] text-ink-muted">数字小的排前面</p>
+            </div>
           </div>
           {/* 关联酒店房型 / 住宿晚数：不再单独占一块表单，控件已移进下方「套餐内容」里的首个 HOTEL 行
               （SearchSelect 搜索房型 + 行内可编辑晚数），避免同一件事有两个入口。state 仍在这里（hotelRoomTypeId /
@@ -2001,6 +2034,8 @@ function NewBundleWizard({
                   flightPax: 2,
                   suitableFor,
                   active: initial?.active ?? true,
+                  // 管理端可编辑排序值：留空 = 排最后
+                  sortOrder,
                   hotelRoomTypeId: hotelRoomTypeId || null,
                   // 住宿晚数唯一真源：含 HOTEL 项即提交晚数（与首个 HOTEL 项 qty 一致），与是否关联房型无关。
                   hotelNights: hasHotelItem ? hotelNights ?? 1 : null,
@@ -2555,6 +2590,8 @@ function VisaEditorForm({
   // 签发方式 / 入境次数（结构化分类，选填）：留空 = 未设置
   const [issuanceMethod, setIssuanceMethod] = useState<VisaIssuanceMethod | null>(visa.issuanceMethod ?? null);
   const [entryType, setEntryType] = useState<VisaEntryType | null>(visa.entryType ?? null);
+  // 签证公司/代办渠道名（选填，仅内部，财务对账用——核对某笔签证金额属于哪家供应商的账单）
+  const [supplier, setSupplier] = useState(visa.supplier ?? '');
   const [docsText, setDocsText] = useState(visa.requiredDocs.join(', '));
   const [saved, setSaved] = useState(false);
 
@@ -2572,6 +2609,7 @@ function VisaEditorForm({
       costPriceCny: costPrice,
       issuanceMethod,
       entryType,
+      supplier: supplier.trim() || null,
     };
     setSaved(true);
     setTimeout(() => onSave(updated), 800);
@@ -2620,6 +2658,15 @@ function VisaEditorForm({
         <div>
           <label className="label text-xs">成本价（¥，仅内部，前台不展示）</label>
           <NumberInput min={0} className="input" placeholder="未录" value={costPrice} onChange={(n) => setCostPrice(n)} />
+        </div>
+        <div>
+          <label className="label text-xs">签证公司（选填，仅内部，财务对账用）</label>
+          <input
+            className="input"
+            placeholder="如 XX签证代办"
+            value={supplier}
+            onChange={(e) => setSupplier(e.target.value)}
+          />
         </div>
         <div>
           <label className="label text-xs">出签天数（工作日）</label>

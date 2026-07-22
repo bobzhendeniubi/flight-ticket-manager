@@ -169,6 +169,9 @@ export const createVisaBodySchema = z.object({
   requiredDocs: z.array(z.string().max(100)).default([]),
   // 使馆/代办成本（CNY，仅内部，前台不下发）— 与 finances 成本维护同一列；省略/null = 未录。
   costPriceCny: z.number().nonnegative().nullable().optional(),
+  // 签证公司/代办渠道名（财务对账用——核对某笔签证金额属于哪家供应商的账单）；
+  // 仅内部，前台不下发。省略 = 不改（update）/ 未录（create）；显式 null = 清空。
+  supplier: z.string().max(100).nullable().optional(),
   isActive: z.boolean().default(true),
 });
 export type CreateVisaBody = z.infer<typeof createVisaBodySchema>;
@@ -252,6 +255,9 @@ export const createBundleBodySchema = z.object({
     .regex(/^\d{4}-\d{2}-\d{2}$/u, '日期格式应为 YYYY-MM-DD')
     .nullable()
     .optional(),
+  // 管理端可编辑排序值：列表按 sortOrder 升序展示（数字小的排前面），留空排最后。
+  // 运营用它把常用套餐置顶（如录单选套餐时）。省略 = 不改；显式 null = 清空（排到最后）。
+  sortOrder: z.number().int().min(-100_000).max(100_000).nullable().optional(),
   isActive: z.boolean().default(true),
 });
 export type CreateBundleBody = z.infer<typeof createBundleBodySchema>;

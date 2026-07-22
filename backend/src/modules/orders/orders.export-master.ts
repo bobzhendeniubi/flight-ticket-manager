@@ -30,6 +30,7 @@ import { docKey } from '../travelers/traveler-profiles.aggregate.js';
 import { toAlpha3 } from './nationality.js';
 import { parseRoomGroups } from './orders.export-room-allocation.js';
 import { nameWithTitle, pnrName, VISA_REQUIREMENT_LABEL } from './orders.export-templates.js';
+import { filterExportOrdersByDepartDate } from './orders.export-depart-filter.js';
 import { buildOrderFilterWhere } from './orders.service.js';
 import { determineFlightLegs } from './ticketing-cap.js';
 
@@ -630,11 +631,20 @@ export async function buildMasterExportWorkbook(
   and.push({ status: { in: COUNTED_STATUSES } });
   where.AND = and;
 
-  const orders = (await client.order.findMany({
+  const fetched = (await client.order.findMany({
     where,
     orderBy: { createdAt: 'desc' },
     include: MASTER_EXPORT_INCLUDE,
   })) as OrderForMasterExport[];
+
+  // 出发日期精确细筛（0722 财务反馈）：取数 where 的 travelFrom/travelTo（=from/to）故意宽召回
+  // （±1 天 + 命中任意航段/入住日），会把返程日或邻日落在窗口内、但整单出发日不在区间的往返单
+  // 也捞进来。这里按整单「出发日」（= 列表「出发日期」列同口径）二次过滤到 [from, to]。
+  // 勾选导出（orderIds）：用户勾了哪些就导哪些，from/to 已被 buildOrderFilterWhere 忽略，不再二次筛。
+  const orders =
+    query.orderIds && query.orderIds.length > 0
+      ? fetched
+      : filterExportOrdersByDepartDate(fetched, query.from, query.to);
 
   // 飞行次数：一次性拉回本次导出所有乘客的常旅客档案（无 N+1；几百行也只有 1~2 条查询）。
   // 刻意不触发档案重建 —— 全量重建太慢，不能挂在导出请求上；读到的是上次重建的快照，

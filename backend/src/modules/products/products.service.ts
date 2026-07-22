@@ -523,6 +523,8 @@ export class ProductsService {
     if (body.costPriceCny !== undefined) {
       data.costPriceCny = body.costPriceCny === null ? null : new Prisma.Decimal(body.costPriceCny);
     }
+    // 签证公司/代办渠道名（财务对账用）：省略 = 不改；显式 null = 清空。
+    if (body.supplier !== undefined) data.supplier = body.supplier;
     if (body.isActive !== undefined) data.isActive = body.isActive;
     const v = await prisma.visa.update({ where: { id }, data });
     return serializeVisa(v);
@@ -542,7 +544,9 @@ export class ProductsService {
   async listBundles(activeOnly = false) {
     const rows = await prisma.bundle.findMany({
       where: activeOnly ? { isActive: true } : undefined,
-      orderBy: { createdAt: 'asc' },
+      // 管理端可编辑排序（数字小的排前面，留空排最后），同 sortOrder 再按创建时间兜底；
+      // 录单套餐下拉/列表走同一条查询，故此处排序对两处都生效。
+      orderBy: [{ sortOrder: { sort: 'asc', nulls: 'last' } }, { createdAt: 'asc' }],
       include: BUNDLE_ROOM_INCLUDE,
     });
     const ratings = await this.reviews.getAggregates(ProductReviewType.BUNDLE, rows.map((r) => r.id));
@@ -662,6 +666,8 @@ export class ProductsService {
             ? { blackoutDates: body.blackoutDates as unknown as Prisma.InputJsonValue }
             : {}),
           defaultDepartDate: body.defaultDepartDate ?? null,
+          // 管理端可编辑排序值：省略/null = 排最后（DB 默认 null）
+          sortOrder: body.sortOrder ?? null,
           isActive: body.isActive,
         },
         include: BUNDLE_ROOM_INCLUDE,
@@ -742,6 +748,8 @@ export class ProductsService {
       data.blackoutDates = body.blackoutDates as unknown as Prisma.InputJsonValue;
     }
     if (body.defaultDepartDate !== undefined) data.defaultDepartDate = body.defaultDepartDate;
+    // 管理端可编辑排序值：省略 = 不改；显式 null = 清空（排到最后）。
+    if (body.sortOrder !== undefined) data.sortOrder = body.sortOrder;
     if (body.isActive !== undefined) data.isActive = body.isActive;
     const b = await prisma.bundle.update({
       where: { id },

@@ -25,6 +25,7 @@ import {
   buildRoomAllocationSheets,
   buildRoomAllocationWorkbook,
   buildDailyRemainingLookup,
+  filterRoomItemsByDepartDate,
   roomAllocationExportFilename,
   roomAllocationExportFilenameByDepart,
   COLUMNS,
@@ -646,5 +647,50 @@ describe('buildRoomAllocationWorkbook 选单口径', () => {
       buildRoomAllocationWorkbook({ from: '2026-07-01', to: '2026-08-01' }, client),
     ).rejects.toThrow(/14/u);
     expect(findMany).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * 出发日精确细筛（0722 房控反馈）：取数主口径按「任意 FLIGHT 段落在该日」召回，会把
+ * 「去程 21 号、回程 22 号」的往返单也带进 22 号表；这里按整单最早航段出发日二次剔除。
+ * 纯酒店/未挂班次单（无航班段）由取数回落分支已精确命中，本过滤放行不动。
+ */
+describe('filterRoomItemsByDepartDate（出发日精确细筛）', () => {
+  const roomItem = (
+    orderId: string,
+    flightDepartures: string[],
+    checkIn: string,
+  ): RoomItemForExport =>
+    ({
+      orderId,
+      hotelCheckIn: D(checkIn),
+      hotelRoomType: { name: '标准双床', bedType: '双床', hotel: { name: 'B酒店' } },
+      order: {
+        items: flightDepartures.map((iso) => ({
+          kind: 'FLIGHT',
+          flightSchedule: { departureTime: new Date(iso) },
+        })),
+      },
+    }) as unknown as RoomItemForExport;
+
+  it('去程 21 号、返程 22 号的往返单 → 按 22 号导出被剔除；当天出发单保留', () => {
+    const items = [
+      roomItem('roundtrip-21-22', ['2026-07-21T02:00:00.000Z', '2026-07-22T05:00:00.000Z'], '2026-07-22'),
+      roomItem('depart-22', ['2026-07-22T09:00:00.000Z'], '2026-07-22'),
+    ];
+    const kept = filterRoomItemsByDepartDate(items, '2026-07-22');
+    expect(kept.map((it) => it.orderId)).toEqual(['depart-22']);
+  });
+
+  it('22 号 00:xx 出发（+8 当地时刻按 UTC 分量存）→ 归入 22 号，不漏', () => {
+    const items = [roomItem('early-22', ['2026-07-22T00:30:00.000Z'], '2026-07-22')];
+    const kept = filterRoomItemsByDepartDate(items, '2026-07-22');
+    expect(kept.map((it) => it.orderId)).toEqual(['early-22']);
+  });
+
+  it('纯酒店/未挂班次单（无航班段）→ 无出发日判定，按 check-in 命中的回落分支放行不动', () => {
+    const items = [roomItem('hotel-only', [], '2026-07-22')];
+    const kept = filterRoomItemsByDepartDate(items, '2026-07-22');
+    expect(kept.map((it) => it.orderId)).toEqual(['hotel-only']);
   });
 });
