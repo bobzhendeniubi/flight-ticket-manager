@@ -3161,7 +3161,7 @@ export const api = {
       { method: 'POST', token, body: { locked } },
     ),
 
-  // 班次成本明细（admin · 用于"航班成本"维护页；带"单座(已售)成本"动态指标）
+  // 班次成本明细（admin · 用于"航班成本"维护页；带单座成本与空座成本动态指标）
   listFinanceSchedules: (
     token: string,
     range?: { from?: string; to?: string },
@@ -3513,11 +3513,11 @@ export interface FlightPnlRow {
   loadPct: number;
   revenueCny: number;
   soldSeatAllocCostCny: number | null;
-  emptySeatSunkCostCny: number | null;
+  emptySeatCostCny: number | null;
   netMarginCny: number | null;
   grossOnSoldCny: number | null;
-  /** 单座(已售)成本 = charterCostCny ÷ soldSeats；charter 或 sold 为 0 时 null */
-  perSoldSeatCostCny: number | null;
+  /** 财务口径：包机费 ÷ 全部座位；包机或总座位为 0 时 null */
+  perSeatCostCny: number | null;
 }
 
 export type CostSource = 'override' | 'period' | 'none';
@@ -3585,8 +3585,10 @@ export interface FinanceScheduleRow {
   // 座位
   totalSeats: number;
   soldSeats: number;
-  /** 单座(已售)成本 = charterCostCny ÷ soldSeats；charter 或 sold 为 0 时 null */
-  perSoldSeatCostCny: number | null;
+  /** 财务口径：包机费 ÷ 全部座位；包机或总座位为 0 时 null */
+  perSeatCostCny: number | null;
+  /** 财务口径：单座成本 × 未售座位数；包机或总座位为 0 时 null */
+  emptySeatCostCny: number | null;
 }
 
 /** 航班成本周期（按 (航班, 日期段) 定包机/机场税/4 个新成本字段） */

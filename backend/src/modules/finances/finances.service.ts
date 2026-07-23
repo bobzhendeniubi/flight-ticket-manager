@@ -142,14 +142,14 @@ export interface FlightPnlRow {
   revenueCny: number;
   /** 已售部分应分摊成本 = soldSeats × perSeatCost */
   soldSeatAllocCostCny: number | null;
-  /** 空座沉没成本 = (totalSeats - soldSeats) × perSeatCost */
-  emptySeatSunkCostCny: number | null;
+  /** 财务口径：空座成本 = (totalSeats - soldSeats) × 单座成本 */
+  emptySeatCostCny: number | null;
   /** 整包机航班贡献毛利（财务定名，原"净利"）= revenue - charterCost */
   netMarginCny: number | null;
   /** 已售部分毛利 = revenue - 已售分摊成本 */
   grossOnSoldCny: number | null;
-  /** 单座(已售)成本 = charterCostCny ÷ soldSeats —— 帮定价的"保本线"，每卖一张就下降；charter 缺失或 0 座售出时 null */
-  perSoldSeatCostCny: number | null;
+  /** 财务口径：包机费 ÷ 全部座位；包机费缺失或总座位为 0 时 null */
+  perSeatCostCny: number | null;
 }
 
 export interface OrderPnlRow {
@@ -700,11 +700,11 @@ export async function getFlightPnl(
     const charter = s.charterCostCny == null ? null : dec(s.charterCostCny);
     const perSeat = charter != null && totalSeats > 0 ? charter / totalSeats : null;
     const soldAlloc = perSeat == null ? null : perSeat * soldSeats;
-    const emptySunk = perSeat == null ? null : perSeat * (totalSeats - soldSeats);
     const netMargin = charter == null ? null : revenue - charter;
     const grossOnSold = soldAlloc == null ? null : revenue - soldAlloc;
-    // 单座(已售)成本：帮定价用的实时"保本线" —— 跟 perSeat 的会计口径不同
-    const perSoldSeat = charter != null && soldSeats > 0 ? charter / soldSeats : null;
+    // 财务口径：包机费÷全部座位，空座成本单列。
+    const perSeatCost = perSeat;
+    const emptySeatCost = perSeat == null ? null : perSeat * (totalSeats - soldSeats);
     return {
       scheduleId: s.id,
       flightNumber: s.flight.flightNumber,
@@ -717,10 +717,10 @@ export async function getFlightPnl(
       loadPct: Math.round(loadPct * 10000) / 10000,
       revenueCny: round2(revenue),
       soldSeatAllocCostCny: soldAlloc == null ? null : round2(soldAlloc),
-      emptySeatSunkCostCny: emptySunk == null ? null : round2(emptySunk),
+      emptySeatCostCny: emptySeatCost == null ? null : round2(emptySeatCost),
       netMarginCny: netMargin == null ? null : round2(netMargin),
       grossOnSoldCny: grossOnSold == null ? null : round2(grossOnSold),
-      perSoldSeatCostCny: perSoldSeat == null ? null : round2(perSoldSeat),
+      perSeatCostCny: perSeatCost == null ? null : round2(perSeatCost),
     };
   });
 }

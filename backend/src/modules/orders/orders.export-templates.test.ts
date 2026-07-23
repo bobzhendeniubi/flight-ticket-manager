@@ -255,9 +255,9 @@ describe('《全岗可用》full 模版 — 逐列取值/格式', () => {
   });
 
   it('乘客姓名：LAST/FIRST 斜线拼接，缺省回落 fullName；末尾附称谓（0711 反馈缺 MR/MS）', () => {
-    // r1 成人男性（按出发日实足 42 岁）→ MR；r2 按出发日实足 7 岁 = 儿童、性别 F → MISS。
+    // 称谓不分年龄（0723 票务口径）：r1 男 → MR；r2 儿童、性别 F → 同样 MS。
     expect(r1.passengerName).toBe('WANG/LIANBO MR');
-    expect(r2.passengerName).toBe('李四 MISS');
+    expect(r2.passengerName).toBe('李四 MS');
   });
 
   it('纯拼音名：LAST/FIRST 不带称谓（财务对数用，0720 公测反馈 MR/MS 影响匹配）', () => {
@@ -597,8 +597,8 @@ describe('pnrName — 护照逗号剥离', () => {
 });
 
 // ── nameWithTitle — 姓名 + 称谓（0711 反馈「订单导出缺 MR/MS」）───────────────
-// 口径：成人（按出发日实足年龄 ≥12 或无生日数据）M→MR / F→MS；
-// 儿童（2–<12）/ 婴儿（<2）M→MSTR / F→MISS；性别 X/未知 → 不加称谓；已有手录 title 优先。
+// 口径（0723 票务确认）：不分年龄，全员按性别 M→MR / F→MS；
+// 性别 X/未知 → 不加称谓；已有手录 title 优先。
 describe('nameWithTitle — 姓名 + 称谓', () => {
   const depart = D('2026-07-13'); // 参照订单去程日
 
@@ -612,26 +612,26 @@ describe('nameWithTitle — 姓名 + 称谓', () => {
     expect(nameWithTitle(p, depart)).toBe('ZHAO/WEI MS');
   });
 
-  it('儿童（2–<12 岁）男性 → 姓名后加 " MSTR"', () => {
-    // 出发日 2026-07-13 − 生日 2018-01-01 → 实足 8 岁 = 儿童
+  it('儿童（2–<12 岁）男性 → 同样按性别给 " MR"（不分年龄）', () => {
+    // 出发日 2026-07-13 − 生日 2018-01-01 → 实足 8 岁 = 儿童，但称谓不分年龄
     const p = { lastName: 'ZHAO', firstName: 'WEI', fullName: 'x', gender: 'M', dateOfBirth: D('2018-01-01') };
-    expect(nameWithTitle(p, depart)).toBe('ZHAO/WEI MSTR');
+    expect(nameWithTitle(p, depart)).toBe('ZHAO/WEI MR');
   });
 
-  it('儿童女性 → 姓名后加 " MISS"', () => {
+  it('儿童女性 → 同样按性别给 " MS"（不分年龄）', () => {
     const p = { lastName: 'ZHAO', firstName: 'WEI', fullName: 'x', gender: 'F', dateOfBirth: D('2018-01-01') };
-    expect(nameWithTitle(p, depart)).toBe('ZHAO/WEI MISS');
+    expect(nameWithTitle(p, depart)).toBe('ZHAO/WEI MS');
   });
 
-  it('婴儿（<2 岁）男性 → 姓名后加 " MSTR"（同儿童规则）', () => {
-    // 出发日 2026-07-13 − 生日 2025-01-01 → 实足 1 岁 = 婴儿
+  it('婴儿（<2 岁）男性 → 同样按性别给 " MR"（不分年龄）', () => {
+    // 出发日 2026-07-13 − 生日 2025-01-01 → 实足 1 岁 = 婴儿，但称谓不分年龄
     const p = { lastName: 'ZHAO', firstName: 'WEI', fullName: 'x', gender: 'M', dateOfBirth: D('2025-01-01') };
-    expect(nameWithTitle(p, depart)).toBe('ZHAO/WEI MSTR');
+    expect(nameWithTitle(p, depart)).toBe('ZHAO/WEI MR');
   });
 
-  it('婴儿女性 → 姓名后加 " MISS"（同儿童规则）', () => {
+  it('婴儿女性 → 同样按性别给 " MS"（不分年龄）', () => {
     const p = { lastName: 'ZHAO', firstName: 'WEI', fullName: 'x', gender: 'F', dateOfBirth: D('2025-01-01') };
-    expect(nameWithTitle(p, depart)).toBe('ZHAO/WEI MISS');
+    expect(nameWithTitle(p, depart)).toBe('ZHAO/WEI MS');
   });
 
   it('性别未知（X）→ 不加称谓，原样返回 pnrName 结果（无尾随空格）', () => {
@@ -649,8 +649,8 @@ describe('nameWithTitle — 姓名 + 称谓', () => {
     expect(nameWithTitle(p, depart)).toBe('ZHAO/WEI MR');
   });
 
-  it('已有手录 title → 优先直接用（原样大写），不再按年龄/性别派生', () => {
-    // 生日按年龄本应派生为儿童 MSTR，但手录 title 优先生效。
+  it('已有手录 title → 优先直接用（原样大写），不再按性别派生', () => {
+    // 按性别本应派生为 MR，但手录 title 优先生效。
     const p = {
       lastName: 'ZHAO',
       firstName: 'WEI',

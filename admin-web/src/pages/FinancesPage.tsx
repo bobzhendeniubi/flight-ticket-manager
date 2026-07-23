@@ -350,7 +350,7 @@ function CostsTab({ token }: { token: string }) {
       <ProductCostEditors token={token} />
 
       <p className="text-xs text-ink-muted">
-        说明：成本统一人民币。「班次」= 某一天的一趟具体航班（同一航班号不同出发日期就是不同班次）。航班按班次维护「包机/机场税/燃油/旺季附加/机型调整/起降折扣」，系统实时算出"单座(已售)成本"供定价参考。班次留空则回退到所匹配「周期」的默认值。
+        说明：成本统一人民币。「班次」= 某一天的一趟具体航班（同一航班号不同出发日期就是不同班次）。航班按班次维护「包机/机场税/燃油/旺季附加/机型调整/起降折扣」，系统按财务口径实时算出单座成本（包机费 ÷ 全部座位）和空座成本。班次留空则回退到所匹配「周期」的默认值。
       </p>
     </section>
   );
@@ -886,7 +886,7 @@ function CostPeriodRow({
   );
 }
 
-// ── 航班成本（按班次）─ 编辑包机/机场税，并实时显示「单座(已售)成本」─────────
+// ── 航班成本（按班次）─ 编辑包机/机场税，并实时显示「单座成本(÷总座)」─────────
 function FlightScheduleCostEditors({ token }: { token: string }) {
   const [rows, setRows] = useState<FinanceScheduleRow[]>([]);
   const [loading, setLoading] = useState(true);
@@ -919,7 +919,7 @@ function FlightScheduleCostEditors({ token }: { token: string }) {
     <div className="card">
       <h2 className="text-sm font-semibold text-ink">航班成本（按班次）</h2>
       <p className="mt-1 text-xs text-slate-500">
-        编辑包机/机场税/燃油/旺季附加/机型调整/起降折扣。空白时显示周期默认值（灰字 placeholder）。系统会算出「单座(已售)成本 = 包机总额 ÷ 已售座位数」——帮你定价时看保本线（卖价低于它就亏）。
+        编辑包机/机场税/燃油/旺季附加/机型调整/起降折扣。空白时显示周期默认值（灰字 placeholder）。单座成本按财务口径计算：包机总额 ÷ 全部座位，空座成本单列。
       </p>
 
       {loading ? (
@@ -943,16 +943,17 @@ function FlightScheduleCostEditors({ token }: { token: string }) {
                 <th className="py-2 text-right font-normal">起降折扣/机场补贴(¥)</th>
                 <th className="py-2 text-right font-normal">已售/总座</th>
                 <th className="py-2 text-right font-normal text-blue-700">
-                  单座(已售)成本(¥)
-                  <span className="block font-normal normal-case tracking-normal text-ink-muted">= 包机总额 ÷ 已售座位（定价参考）</span>
+                  单座成本(÷总座)(¥)
+                  <span className="block font-normal normal-case tracking-normal text-ink-muted">= 包机总额 ÷ 全部座位</span>
                 </th>
+                <th className="py-2 text-right font-normal">空座成本(¥)</th>
                 <th className="py-2 text-right font-normal"></th>
               </tr>
             </thead>
             <tbody>
               {rows.length === 0 && (
                 <tr>
-                  <td colSpan={13} className="py-4 text-center text-ink-muted">
+                  <td colSpan={14} className="py-4 text-center text-ink-muted">
                     暂无班次
                   </td>
                 </tr>
@@ -1016,8 +1017,8 @@ function FlightScheduleCostRow({
     }
   }
 
-  const perSeatTooltip = row.perSoldSeatCostCny == null
-    ? (row.charterCostCny == null ? '包机成本未填' : '还没卖出')
+  const perSeatTooltip = row.perSeatCostCny == null
+    ? (row.charterCostCny == null ? '包机成本未填' : '总座位数为 0')
     : '';
 
   const ph = (period: number | null): string => (period == null ? '' : String(period));
@@ -1109,7 +1110,10 @@ function FlightScheduleCostRow({
         className="py-2 text-right tabular-nums font-semibold text-blue-700"
         title={perSeatTooltip}
       >
-        {fmtCny(row.perSoldSeatCostCny)}
+        {fmtCny(row.perSeatCostCny)}
+      </td>
+      <td className="py-2 text-right tabular-nums text-slate-600">
+        {fmtCny(row.emptySeatCostCny)}
       </td>
       <td className="py-2 text-right">
         <button
@@ -1607,7 +1611,7 @@ function FlightsTab({ token, range }: { token: string; range: { from: string; to
     <section className="card">
       <h2 className="text-sm font-semibold text-ink">按航班 P&L（最多 100 条）</h2>
       <p className="mt-1 text-xs text-slate-500">
-        机票成本按"卖出座位 × (包机总成本 / 总座位数)"分摊；空座损失（空座沉没）= 剩余空座 × 单座成本，负数=亏损。
+        机票成本按财务口径分摊：卖出座位 ×（包机总成本 ÷ 全部座位）；空座成本单列为剩余空座 × 单座成本，并从航班贡献毛利中扣除。
       </p>
       <div className="mt-3 overflow-x-auto">
         <table className="w-full text-sm">
@@ -1619,8 +1623,8 @@ function FlightsTab({ token, range }: { token: string; range: { from: string; to
               <th className="py-2 text-right font-normal">载客率</th>
               <th className="py-2 text-right font-normal">收入</th>
               <th className="py-2 text-right font-normal">包机成本</th>
-              <th className="py-2 text-right font-normal text-blue-700">单座(已售)成本</th>
-              <th className="py-2 text-right font-normal" title="卖不掉的空座 × 单座成本；负数=亏损">空座损失</th>
+              <th className="py-2 text-right font-normal text-blue-700">单座成本(÷总座)</th>
+              <th className="py-2 text-right font-normal" title="空座数 × 单座成本">空座成本</th>
               <th className="py-2 text-right font-normal">航班贡献毛利</th>
             </tr>
           </thead>
@@ -1665,10 +1669,10 @@ function FlightsTab({ token, range }: { token: string; range: { from: string; to
                     {fmtCny(f.charterCostCny)}
                   </td>
                   <td className="py-2 text-right tabular-nums font-semibold text-blue-700">
-                    {fmtCny(f.perSoldSeatCostCny)}
+                    {fmtCny(f.perSeatCostCny)}
                   </td>
-                  <td className="py-2 text-right tabular-nums text-rose-600">
-                    {f.emptySeatSunkCostCny == null ? '—' : `-${fmtCny(f.emptySeatSunkCostCny)}`}
+                  <td className="py-2 text-right tabular-nums text-slate-600">
+                    {fmtCny(f.emptySeatCostCny)}
                   </td>
                   <td className={`py-2 text-right tabular-nums font-medium ${netTone}`}>
                     {fmtCny(f.netMarginCny)}

@@ -11,10 +11,10 @@
  *   房费/签证/车费/订单杂项：从落在该班次上的订单聚合 — 多腿订单按 legCount 平摊避免重复
  *
  * 行级派生：
- *   总成本(不含空座沉没) = 上面汇总
+ *   总成本(不含空座成本) = 上面汇总
  *   整班毛利            = 总收入 - 总成本
- *   单座(已售)成本       = charter ÷ soldSeats（保本线参考；soldSeats=0 时 null）
- *   空座沉没            = charter × (1 - soldSeats/totalSeats)（参考；不计入毛利）
+ *   单座成本             = charter ÷ totalSeats（财务口径；totalSeats=0 时 null）
+ *   空座成本             = 单座成本 × (totalSeats - soldSeats)（不计入已售座位成本）
  */
 import ExcelJS from 'exceljs';
 import type { Prisma, PrismaClient } from '@prisma/client';
@@ -61,8 +61,8 @@ interface FlightRow {
   miscOrderCost: number; // 订单 OrderCostItem 汇总（4 类合一）
   totalCost: number;
   grossMargin: number;
-  perSoldSeatCost: number | null;
-  emptySeatSunk: number;
+  perSeatCost: number | null;
+  emptySeatCost: number | null;
 }
 
 const COLUMNS: Array<{ header: string; key: keyof FlightRow; width: number }> = [
@@ -86,10 +86,10 @@ const COLUMNS: Array<{ header: string; key: keyof FlightRow; width: number }> = 
   { header: '签证费', key: 'visaCost', width: 12 },
   { header: '车费', key: 'transferCost', width: 12 },
   { header: '杂项成本', key: 'miscOrderCost', width: 12 },
-  { header: '总成本(不含空座沉没)', key: 'totalCost', width: 18 },
+  { header: '总成本(不含空座成本)', key: 'totalCost', width: 18 },
   { header: '整班毛利', key: 'grossMargin', width: 12 },
-  { header: '单座(已售)成本', key: 'perSoldSeatCost', width: 14 },
-  { header: '空座沉没', key: 'emptySeatSunk', width: 12 },
+  { header: '单座成本(÷总座)', key: 'perSeatCost', width: 16 },
+  { header: '空座成本', key: 'emptySeatCost', width: 12 },
 ];
 
 function dec(v: Prisma.Decimal | number | null | undefined): number {
@@ -185,15 +185,13 @@ export async function buildFinanceExportByFlightWorkbook(
     const matched = findMatchedPeriod(s, periodsForFlight);
     const eff = resolveScheduleCost(s, matched);
 
-    // 包机成本：单座 × 已售（已售座位真实占用的那部分；空座作为沉没另列）
+    // 包机成本：单座 × 已售；空座成本单列。
+    // 财务口径：包机费÷全部座位，空座成本单列。
     const charterPerSeat =
-      eff.charterCostCny != null && totalSeats > 0 ? eff.charterCostCny / totalSeats : 0;
-    const charterCost = charterPerSeat * soldSeats;
-    const charterTotal = eff.charterCostCny ?? 0;
-    const emptySeatSunk =
-      totalSeats > 0 && charterTotal > 0
-        ? charterTotal * (1 - soldSeats / totalSeats)
-        : 0;
+      eff.charterCostCny != null && totalSeats > 0 ? eff.charterCostCny / totalSeats : null;
+    const charterCost = (charterPerSeat ?? 0) * soldSeats;
+    const emptySeatCost =
+      charterPerSeat == null ? null : charterPerSeat * (totalSeats - soldSeats);
 
     // 其余 per-pax 字段：× 已售座位（座位 = 占用乘客数）
     const airportTaxDepCost = (eff.airportTaxDepCny ?? 0) * soldSeats;
@@ -297,9 +295,6 @@ export async function buildFinanceExportByFlightWorkbook(
       transferCost +
       miscOrderCost;
     const grossMargin = totalRevenue - totalCost;
-    const perSoldSeatCost =
-      eff.charterCostCny != null && soldSeats > 0 ? eff.charterCostCny / soldSeats : null;
-
     return {
       flightNumber: s.flight.flightNumber,
       route: `${s.flight.originCode}→${s.flight.destinationCode}`,
@@ -323,8 +318,8 @@ export async function buildFinanceExportByFlightWorkbook(
       miscOrderCost: round2(miscOrderCost),
       totalCost: round2(totalCost),
       grossMargin: round2(grossMargin),
-      perSoldSeatCost: perSoldSeatCost == null ? null : round2(perSoldSeatCost),
-      emptySeatSunk: round2(emptySeatSunk),
+      perSeatCost: charterPerSeat == null ? null : round2(charterPerSeat),
+      emptySeatCost: emptySeatCost == null ? null : round2(emptySeatCost),
     };
   });
 

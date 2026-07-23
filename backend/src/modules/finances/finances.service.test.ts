@@ -25,10 +25,62 @@ vi.mock('../../db/prisma.js', () => ({ prisma: {} }));
 import type { PrismaClient } from '@prisma/client';
 import {
   getFinancesSummary,
+  getFlightPnl,
   getMonthlyTrend,
   getOrderPnlDetail,
   visaItemCostCny,
 } from './finances.service.js';
+
+describe('getFlightPnl — 财务口径：包机费÷全部座位，空座成本单列', () => {
+  function schedule(opts: {
+    id: string;
+    charterCostCny: number | null;
+    seatClasses: { capacity: number; sold: number }[];
+    amount?: number;
+  }) {
+    return {
+      id: opts.id,
+      departureTime: new Date('2026-07-22T10:00:00.000Z'),
+      charterCostCny: opts.charterCostCny,
+      seatClasses: opts.seatClasses,
+      orderItems: opts.amount == null ? [] : [{ amount: opts.amount }],
+      flight: { flightNumber: 'FT100', originCode: 'AAA', destinationCode: 'BBB' },
+    };
+  }
+
+  it('单座成本使用总座位分母，并单列空座成本', async () => {
+    const client = {
+      flightSchedule: {
+        findMany: vi.fn().mockResolvedValue([
+          schedule({ id: 's1', charterCostCny: 1000, seatClasses: [{ capacity: 10, sold: 2 }], amount: 300 }),
+        ]),
+      },
+    } as unknown as PrismaClient;
+
+    const [row] = await getFlightPnl({ from: '2026-07-22', to: '2026-07-22' }, 100, client);
+
+    expect(row.perSeatCostCny).toBe(100);
+    expect(row.soldSeatAllocCostCny).toBe(200);
+    expect(row.emptySeatCostCny).toBe(800);
+    expect(row.grossOnSoldCny).toBe(100);
+  });
+
+  it('总座位为 0 或包机费缺失时，单座和空座成本均为 null', async () => {
+    const client = {
+      flightSchedule: {
+        findMany: vi.fn().mockResolvedValue([
+          schedule({ id: 'zero-seats', charterCostCny: 1000, seatClasses: [] }),
+          schedule({ id: 'no-charter', charterCostCny: null, seatClasses: [{ capacity: 10, sold: 2 }] }),
+        ]),
+      },
+    } as unknown as PrismaClient;
+
+    const rows = await getFlightPnl({ from: '2026-07-22', to: '2026-07-22' }, 100, client);
+
+    expect(rows[0]).toMatchObject({ perSeatCostCny: null, emptySeatCostCny: null });
+    expect(rows[1]).toMatchObject({ perSeatCostCny: null, emptySeatCostCny: null });
+  });
+});
 
 describe('visaItemCostCny — 签证成本取值口径（财务汇总/导出共用，两处逐字一致）', () => {
   it('任务填了结构化人均成本 → visaUnitCostCny × 需签乘客数（新口径优先，压过快照/产品）', () => {

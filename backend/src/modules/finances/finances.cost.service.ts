@@ -428,8 +428,10 @@ export interface FinanceScheduleRow {
   // 座位 + 派生
   totalSeats: number;
   soldSeats: number;
-  /** 单座(已售)成本 = 生效 charter ÷ soldSeats —— "保本线"；charter 缺失或 0 座售出时 null */
-  perSoldSeatCostCny: number | null;
+  /** 财务口径：包机费 ÷ 全部座位；包机费缺失或总座位为 0 时 null */
+  perSeatCostCny: number | null;
+  /** 财务口径：单座成本 × 未售座位数；包机费缺失或总座位为 0 时 null */
+  emptySeatCostCny: number | null;
 }
 
 export async function listSchedulesWithCost(
@@ -500,8 +502,10 @@ export async function listSchedulesWithCost(
       const d = dec(v ?? null);
       return d == null ? null : round2(d);
     };
-    const perSoldSeat =
-      eff.charterCostCny != null && soldSeats > 0 ? eff.charterCostCny / soldSeats : null;
+    // 财务口径：包机费÷全部座位，空座成本单列。
+    const perSeat =
+      eff.charterCostCny != null && totalSeats > 0 ? eff.charterCostCny / totalSeats : null;
+    const emptySeatCost = perSeat == null ? null : perSeat * (totalSeats - soldSeats);
     return {
       scheduleId: s.id,
       flightId: s.flight.id,
@@ -546,7 +550,8 @@ export async function listSchedulesWithCost(
       matchedPeriodTo: matched ? fmtDateOnly(matched.effectiveTo) : null,
       totalSeats,
       soldSeats,
-      perSoldSeatCostCny: perSoldSeat == null ? null : round2(perSoldSeat),
+      perSeatCostCny: perSeat == null ? null : round2(perSeat),
+      emptySeatCostCny: emptySeatCost == null ? null : round2(emptySeatCost),
     };
   });
 }

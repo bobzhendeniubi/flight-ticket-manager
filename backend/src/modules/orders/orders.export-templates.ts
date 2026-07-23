@@ -169,13 +169,9 @@ export function pnrName(p: { lastName: string | null; firstName: string | null; 
  * 乘客姓名 + 称谓（如 "ZHAO/WEI MR"）—— 0711 反馈「订单导出缺 MR/MS」。
  * 称谓口径：
  *   - 已手录 Passenger.title（如运营手工补录过）→ 优先直接用，原样大写。
- *   - 否则按「出发日 − 出生日期」实足年龄派生（复用 pnr-export.ts 的 derivePtcByAge，
- *     不改该函数；固定传 'ADULT' 作为兜底口径 —— 生日缺失时按成人处理，与录入的
- *     passengerType 无关，对齐「无生日数据 → 按成人」的口径）：
- *       成人（年龄 ≥12 或无生日数据）：M→MR，F→MS；性别未知/X → 不加称谓。
- *       儿童（2–<12）/ 婴儿（<2）：M→MSTR，F→MISS；性别未知/X → 不加称谓。
- *   - 出发日：调用方应传订单首航段（最早 FLIGHT 行）出发日；传空（纯地面单等取不到
- *     航段出发日的场景）时按当前日期近似估算年龄 —— 口径近似，不代表真实出行日。
+ *   - 否则按性别派生：M→MR，F→MS；性别未知/X → 不加称谓。
+ *     不分年龄（0723 票务口径：航司系统只认 MR/MS，儿童/婴儿同样按性别给）。
+ *   - departDate 参数保留（历史签名兼容 + PTC 等其他年龄派生仍在用），称谓不再依赖它。
  * 输出：pnrName(p) 后面空格 + 称谓；无称谓时原样返回 pnrName(p)，不产出多余尾随空格。
  */
 export function nameWithTitle(
@@ -196,12 +192,12 @@ export function nameWithTitle(
 }
 
 function deriveTitleByAge(dob: Date | null, gender: string | null, departDate: Date | null): string {
-  // 出发日拿不到 → 用当前日期近似（见 nameWithTitle 顶部注释的口径说明）。
-  const at = departDate ?? new Date();
-  const ptc = derivePtcByAge(dob, at, 'ADULT');
-  const isMinor = ptc === 'CHD' || ptc === 'INF';
-  if (gender === 'M') return isMinor ? 'MSTR' : 'MR';
-  if (gender === 'F') return isMinor ? 'MISS' : 'MS';
+  // 票务口径（0723 确认）：称谓不分年龄，全员按性别 MR/MS——航司系统只认这两种。
+  // dob/departDate 参数保留（PTC 等其他派生仍需年龄），此处不再参与称谓判定。
+  void dob;
+  void departDate;
+  if (gender === 'M') return 'MR';
+  if (gender === 'F') return 'MS';
   return '';
 }
 
@@ -456,7 +452,7 @@ const FULL_COST_GROUP_HEADER = '订单成本';
 const FULL_COST_GROUP_SPAN = 3;
 
 export function orderToFullRows(order: OrderForTemplateExport, ctx: OrderContext): Omit<FullRow, 'seq'>[] {
-  // 乘客姓名列称谓（MR/MS/MSTR/MISS）按订单去程（最早 FLIGHT 行出发时间）派生年龄。
+  // 乘客姓名列称谓统一 MR/MS（不分年龄，0723 票务口径）。
   const departureDate = earliestFlightDeparture(order.items);
 
   // 最近一笔成功收款（到账时间/渠道）

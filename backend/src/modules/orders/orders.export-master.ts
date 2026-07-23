@@ -586,7 +586,7 @@ export function orderToMasterRows(
       // 无分房组 → 回退订单项口径 hotelNamesFallback（现状值），绝不留空。
       hotelName: resolveExportHotelName(group, hotelNamesFallback),
       chineseName: p.chineseName ?? p.fullName,
-      // 称谓（MR/MS/MSTR/MISS）按订单去程（最早 FLIGHT 行出发时间，legs 已按出发时间排序）派生年龄。
+      // 称谓统一 MR/MS（不分年龄，0723 票务口径）；出发日仅供其他年龄派生场景沿用签名。
       passengerName: nameWithTitle(p, legs[0]?.departureTime ?? null),
       cleanName: pnrName(p),
       flightCount: tripCount === undefined ? '' : String(tripCount),
