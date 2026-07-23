@@ -1081,6 +1081,10 @@ model Order {
   // 出纳：预期到账总额（CNY）+ 锁定标记。锁定后只 ADMIN 能改，避免运营随便改。
   expectedAmountCny    Decimal?         @db.Decimal(12, 2)
   expectedAmountLocked Boolean          @default(false)
+  // 结算价锁定：核对完成后写保护，解锁后才允许通过改结算价端点修改。
+  settlementLocked     Boolean          @default(false)
+  settlementLockedAt   DateTime?
+  settlementLockedBy   String? // userId
   // 售后费用（改期费 / 换人费等）：累计客户应补付的金额（CNY，整数）。
   // 应付 = total + adjustmentCny；尾款 = total + adjustmentCny − paidAmount。
   // 不改 total/subtotal（机票基础价不重算），只在结清口径上叠加。

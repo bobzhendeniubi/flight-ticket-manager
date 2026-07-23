@@ -607,6 +607,13 @@ export const batchSetInvoiceFlagsBodySchema = z.object({
 });
 export type BatchSetInvoiceFlagsBody = z.infer<typeof batchSetInvoiceFlagsBodySchema>;
 
+// ── 批量锁定/解锁结算价（ADMIN/STAFF）──────────────────────────────────────
+export const batchSettlementLockBodySchema = z.object({
+  orderIds: z.array(z.string().min(1)).min(1).max(500),
+  lock: z.boolean(),
+});
+export type BatchSettlementLockBody = z.infer<typeof batchSettlementLockBodySchema>;
+
 // ── 批量散客建单（后台）─────────────────────────────────────────────────────
 // 选一个航班班次 + 舱位 + 共享联系人 → 名单里每位乘客各成一单（FLIGHT × 1）
 // ── 公开订单查询（免登录，A4）──────────────────────────────────────────────
@@ -917,4 +924,3 @@ export const roomSupplementBodySchema = z.object({
   passengerId: z.string().min(1).max(64).optional(),
 });
 export type RoomSupplementBody = z.infer<typeof roomSupplementBodySchema>;
-
