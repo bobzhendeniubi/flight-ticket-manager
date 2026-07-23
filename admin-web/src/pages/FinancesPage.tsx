@@ -29,6 +29,7 @@ import {
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { NumberInput } from '../components/NumberInput';
+import { UsdRateInput } from '../components/UsdRateInput';
 
 type Tab = 'summary' | 'flights' | 'orders' | 'monthly' | 'costs';
 
@@ -97,6 +98,104 @@ function daysAgoStr(n: number): string {
   const d = new Date();
   d.setDate(d.getDate() - n);
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+type FlightOption = {
+  id: string;
+  label: string;
+  flightNumber: string;
+  originCode: string;
+  destinationCode: string;
+};
+
+function reversePeriod(
+  period: CostPeriodDto,
+  periods: CostPeriodDto[],
+  effectiveFrom = period.effectiveFrom,
+  effectiveTo = period.effectiveTo,
+): CostPeriodDto | null {
+  const matches = periods.filter(
+    (candidate) =>
+      candidate.flightId !== period.flightId &&
+      candidate.origin === period.destination &&
+      candidate.destination === period.origin &&
+      candidate.effectiveFrom === effectiveFrom &&
+      candidate.effectiveTo === effectiveTo,
+  );
+  return matches.length === 1 ? matches[0]! : null;
+}
+
+function reverseFlightOption(flightId: string, options: FlightOption[]): FlightOption | null {
+  const current = options.find((option) => option.id === flightId);
+  if (!current) return null;
+  const matches = options.filter(
+    (option) =>
+      option.id !== flightId &&
+      option.originCode === current.destinationCode &&
+      option.destinationCode === current.originCode,
+  );
+  return matches.length === 1 ? matches[0]! : null;
+}
+
+function datePart(iso: string): string {
+  return iso.slice(0, 10);
+}
+
+function reverseSchedule(
+  row: FinanceScheduleRow,
+  rows: FinanceScheduleRow[],
+): FinanceScheduleRow | null {
+  const matches = rows.filter(
+    (candidate) =>
+      candidate.scheduleId !== row.scheduleId &&
+      datePart(candidate.departureTime) === datePart(row.departureTime) &&
+      candidate.originCode === row.destinationCode &&
+      candidate.destinationCode === row.originCode,
+  );
+  return matches.length === 1 ? matches[0]! : null;
+}
+
+function UsdCostInput({
+  value,
+  onChange,
+  placeholder,
+  className,
+  allowNegative = false,
+}: {
+  value: number | null;
+  onChange: (n: number | null) => void;
+  placeholder?: string;
+  className: string;
+  allowNegative?: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <span className="relative inline-flex items-center gap-0.5">
+      <NumberInput
+        className={className}
+        step={0.01}
+        value={value}
+        placeholder={placeholder}
+        allowNegative={allowNegative}
+        onChange={onChange}
+      />
+      <button
+        type="button"
+        aria-label="美元换算"
+        title="美元 × 汇率"
+        className="rounded border border-slate-200 px-1 py-0.5 text-xs font-medium text-brand hover:bg-brand-50"
+        onClick={() => setOpen((v) => !v)}
+      >
+        $
+      </button>
+      {open && (
+        <span className="absolute right-0 top-full z-20 mt-1 rounded-lg border border-slate-200 bg-white p-2 shadow-lg">
+          <UsdRateInput onFill={onChange} />
+        </span>
+      )}
+    </span>
+  );
 }
 
 // ── shared UI atoms ────────────────────────────────────────────────────────
@@ -361,7 +460,7 @@ function FlightCostPeriodsEditor({ token }: { token: string }) {
   const [periods, setPeriods] = useState<CostPeriodDto[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
-  const [flightOptions, setFlightOptions] = useState<{ id: string; label: string }[]>([]);
+  const [flightOptions, setFlightOptions] = useState<FlightOption[]>([]);
   const [showNew, setShowNew] = useState(false);
 
   const load = useCallback(() => {
@@ -398,14 +497,19 @@ function FlightCostPeriodsEditor({ token }: { token: string }) {
       .listFinanceSchedules(token)
       .then((d) => {
         if (cancelled) return;
-        const map = new Map<string, string>();
+        const map = new Map<string, FlightOption>();
         for (const r of d.schedules) {
           if (!map.has(r.flightId)) {
-            map.set(r.flightId, `${r.flightNumber} · ${r.origin}→${r.destination}`);
+            map.set(r.flightId, {
+              id: r.flightId,
+              label: `${r.flightNumber} · ${r.origin}→${r.destination}`,
+              flightNumber: r.flightNumber,
+              originCode: r.originCode,
+              destinationCode: r.destinationCode,
+            });
           }
         }
-        const opts = Array.from(map.entries())
-          .map(([id, label]) => ({ id, label }))
+        const opts = Array.from(map.values())
           .sort((a, b) => a.label.localeCompare(b.label));
         setFlightOptions(opts);
       })
@@ -497,6 +601,7 @@ function FlightCostPeriodsEditor({ token }: { token: string }) {
                 <CostPeriodRow
                   key={p.id}
                   period={p}
+                  periods={periods}
                   token={token}
                   onSaved={load}
                   onDelete={() => onDelete(p.id)}
@@ -517,7 +622,7 @@ function CostPeriodNewForm({
   onCancel,
 }: {
   token: string;
-  flightOptions: { id: string; label: string }[];
+  flightOptions: FlightOption[];
   onSaved: () => void;
   onCancel: () => void;
 }) {
@@ -539,6 +644,9 @@ function CostPeriodNewForm({
   const [fxDate, setFxDate] = useState('');
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [syncPair, setSyncPair] = useState(true);
+
+  const pairedFlight = reverseFlightOption(flightId, flightOptions);
 
   // 默认下拉同步
   useEffect(() => {
@@ -573,6 +681,16 @@ function CostPeriodNewForm({
         note: note.trim() === '' ? null : note.trim(),
       };
       await api.createCostPeriod(token, body);
+      if (syncPair && pairedFlight) {
+        try {
+          await api.createCostPeriod(token, { ...body, flightId: pairedFlight.id });
+        } catch (e: unknown) {
+          setErr(
+            `已保存 ${flightOptions.find((option) => option.id === flightId)?.flightNumber ?? flightId}，同步 ${pairedFlight.flightNumber} 失败：${e instanceof ApiError ? e.message : '保存失败'}`,
+          );
+          return;
+        }
+      }
       onSaved();
     } catch (e: unknown) {
       setErr(e instanceof ApiError ? e.message : '创建失败');
@@ -660,52 +778,47 @@ function CostPeriodNewForm({
           包机总额(¥)
           <NumberInput
             className={`mt-1 block w-full ${numCls}`}
-            step={1}
+            step={0.01}
             value={charter}
             onChange={setCharter}
           />
         </label>
         <label className="text-xs text-ink-soft">
           去程机场税(¥/座)
-          <NumberInput
+          <UsdCostInput
             className={`mt-1 block w-full ${numCls}`}
-            step={0.01}
             value={taxDep}
             onChange={setTaxDep}
           />
         </label>
         <label className="text-xs text-ink-soft">
           返程机场税(¥/座)
-          <NumberInput
+          <UsdCostInput
             className={`mt-1 block w-full ${numCls}`}
-            step={0.01}
             value={taxArr}
             onChange={setTaxArr}
           />
         </label>
         <label className="text-xs text-ink-soft">
           燃油附加(¥/座)
-          <NumberInput
+          <UsdCostInput
             className={`mt-1 block w-full ${numCls}`}
-            step={0.01}
             value={fuel}
             onChange={setFuel}
           />
         </label>
         <label className="text-xs text-ink-soft">
           旺季附加(¥/座)
-          <NumberInput
+          <UsdCostInput
             className={`mt-1 block w-full ${numCls}`}
-            step={0.01}
             value={peak}
             onChange={setPeak}
           />
         </label>
         <label className="text-xs text-ink-soft">
           机型调整(¥/座)
-          <NumberInput
+          <UsdCostInput
             className={`mt-1 block w-full ${numCls}`}
-            step={0.01}
             allowNegative
             value={aircraft}
             onChange={setAircraft}
@@ -713,9 +826,8 @@ function CostPeriodNewForm({
         </label>
         <label className="text-xs text-ink-soft">
           起降折扣(¥/座，机场补贴)
-          <NumberInput
+          <UsdCostInput
             className={`mt-1 block w-full ${numCls}`}
-            step={0.01}
             allowNegative
             value={takeoff}
             onChange={setTakeoff}
@@ -726,6 +838,19 @@ function CostPeriodNewForm({
         提示：「包机总额」是跟航司结算的整包价（一次性）；其余几项都按「每座」填。机型调整/起降折扣可填负数（少收或补贴）。
       </p>
       <div className="mt-3 flex items-center gap-2">
+        <label
+          className="flex items-center gap-1 text-xs text-ink-soft"
+          title={pairedFlight ? `将同步到 ${pairedFlight.flightNumber}` : '未找到当日配对班次'}
+        >
+          <input
+            type="checkbox"
+            checked={syncPair && pairedFlight != null}
+            disabled={pairedFlight == null}
+            onChange={(e) => setSyncPair(e.target.checked)}
+          />
+          同步到配对航班
+        </label>
+        {pairedFlight == null && <span className="text-xs text-amber-600">未找到当日配对班次</span>}
         <button
           type="button"
           onClick={submit}
@@ -749,11 +874,13 @@ function CostPeriodNewForm({
 
 function CostPeriodRow({
   period,
+  periods,
   token,
   onSaved,
   onDelete,
 }: {
   period: CostPeriodDto;
+  periods: CostPeriodDto[];
   token: string;
   onSaved: () => void;
   onDelete: () => void;
@@ -771,6 +898,9 @@ function CostPeriodRow({
   const [note, setNote] = useState<string>(period.note ?? '');
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [syncPair, setSyncPair] = useState(true);
+  const [saveNotice, setSaveNotice] = useState<string | null>(null);
+  const pairedPeriod = reversePeriod(period, periods, from, to);
 
   function reset(): void {
     setFrom(period.effectiveFrom);
@@ -784,13 +914,15 @@ function CostPeriodRow({
     setTakeoff(period.takeoffDiscountCny);
     setNote(period.note ?? '');
     setErr(null);
+    setSaveNotice(null);
   }
 
   async function save(): Promise<void> {
     setSaving(true);
     setErr(null);
+    setSaveNotice(null);
     try {
-      await api.updateCostPeriod(token, period.id, {
+      const body: Partial<Omit<CostPeriodWriteInput, 'flightId'>> = {
         effectiveFrom: from,
         effectiveTo: to,
         charterCostCny: charter,
@@ -801,7 +933,24 @@ function CostPeriodRow({
         aircraftAdjustCny: aircraft,
         takeoffDiscountCny: takeoff,
         note: note.trim() === '' ? null : note.trim(),
-      });
+      };
+      await api.updateCostPeriod(token, period.id, body);
+      if (syncPair && pairedPeriod) {
+        try {
+          await api.updateCostPeriod(token, pairedPeriod.id, body);
+        } catch (e: unknown) {
+          setSaveNotice(
+            '已保存 ' + period.flightNumber + '，同步 ' + pairedPeriod.flightNumber + ' 失败：' +
+              (e instanceof ApiError ? e.message : '保存失败'),
+          );
+          setEditing(false);
+          onSaved();
+          return;
+        }
+        setSaveNotice('已保存 ' + period.flightNumber + '，并同步保存 ' + pairedPeriod.flightNumber);
+      } else {
+        setSaveNotice('已保存 ' + period.flightNumber);
+      }
       setEditing(false);
       onSaved();
     } catch (e: unknown) {
@@ -845,6 +994,7 @@ function CostPeriodRow({
           >
             删
           </button>
+          {saveNotice && <div className={`text-xs mt-0.5 ${saveNotice.includes('失败') ? 'text-rose-600' : 'text-emerald-600'}`}>{saveNotice}</div>}
         </td>
       </tr>
     );
@@ -856,15 +1006,27 @@ function CostPeriodRow({
       <td className="py-2 text-ink-soft">{period.origin} → {period.destination}</td>
       <td className="py-2"><input type="date" value={from} onChange={(e) => setFrom(e.target.value)} className={dateCls} /></td>
       <td className="py-2"><input type="date" value={to} onChange={(e) => setTo(e.target.value)} className={dateCls} /></td>
-      <td className="py-2 text-right"><NumberInput className={numCls} step={1} value={charter} onChange={setCharter} /></td>
-      <td className="py-2 text-right"><NumberInput className={numCls} step={0.01} value={taxDep} onChange={setTaxDep} /></td>
-      <td className="py-2 text-right"><NumberInput className={numCls} step={0.01} value={taxArr} onChange={setTaxArr} /></td>
-      <td className="py-2 text-right"><NumberInput className={numCls} step={0.01} value={fuel} onChange={setFuel} /></td>
-      <td className="py-2 text-right"><NumberInput className={numCls} step={0.01} value={peak} onChange={setPeak} /></td>
-      <td className="py-2 text-right"><NumberInput className={numCls} step={0.01} allowNegative value={aircraft} onChange={setAircraft} /></td>
-      <td className="py-2 text-right"><NumberInput className={numCls} step={0.01} allowNegative value={takeoff} onChange={setTakeoff} /></td>
+      <td className="py-2 text-right"><NumberInput className={numCls} step={0.01} value={charter} onChange={setCharter} /></td>
+      <td className="py-2 text-right"><UsdCostInput className={numCls} value={taxDep} onChange={setTaxDep} /></td>
+      <td className="py-2 text-right"><UsdCostInput className={numCls} value={taxArr} onChange={setTaxArr} /></td>
+      <td className="py-2 text-right"><UsdCostInput className={numCls} value={fuel} onChange={setFuel} /></td>
+      <td className="py-2 text-right"><UsdCostInput className={numCls} value={peak} onChange={setPeak} /></td>
+      <td className="py-2 text-right"><UsdCostInput className={numCls} allowNegative value={aircraft} onChange={setAircraft} /></td>
+      <td className="py-2 text-right"><UsdCostInput className={numCls} allowNegative value={takeoff} onChange={setTakeoff} /></td>
       <td className="py-2"><input type="text" value={note} onChange={(e) => setNote(e.target.value)} className={textCls} placeholder="备注" /></td>
       <td className="py-2 text-right">
+        <label
+          className="mb-1 flex items-center justify-end gap-1 text-xs text-ink-soft"
+          title={pairedPeriod ? '将同步到 ' + pairedPeriod.flightNumber + ' 的同日期段周期' : '未找到配对航班的同日期段周期'}
+        >
+          <input
+            type="checkbox"
+            checked={syncPair && pairedPeriod != null}
+            disabled={pairedPeriod == null}
+            onChange={(e) => setSyncPair(e.target.checked)}
+          />
+          同步到配对航班的同日期段周期
+        </label>
         <button
           type="button"
           onClick={save}
@@ -881,6 +1043,7 @@ function CostPeriodRow({
           取消
         </button>
         {err && <div className="text-xs text-rose-600 mt-0.5">{err}</div>}
+        {saveNotice && <div className={`text-xs mt-0.5 ${saveNotice.includes('失败') ? 'text-rose-600' : 'text-emerald-600'}`}>{saveNotice}</div>}
       </td>
     </tr>
   );
@@ -961,6 +1124,7 @@ function FlightScheduleCostEditors({ token }: { token: string }) {
                 <FlightScheduleCostRow
                   key={r.scheduleId}
                   row={r}
+                  pairedRow={reverseSchedule(r, rows)}
                   token={token}
                   onSaved={load}
                 />
@@ -975,10 +1139,12 @@ function FlightScheduleCostEditors({ token }: { token: string }) {
 
 function FlightScheduleCostRow({
   row,
+  pairedRow,
   token,
   onSaved,
 }: {
   row: FinanceScheduleRow;
+  pairedRow: FinanceScheduleRow | null;
   token: string;
   onSaved: () => void;
 }) {
@@ -991,6 +1157,8 @@ function FlightScheduleCostRow({
   const [takeoff, setTakeoff] = useState<number | null>(row.takeoffDiscountCnyOverride);
   const [saving, setSaving] = useState(false);
   const [saveErr, setSaveErr] = useState<string | null>(null);
+  const [syncPair, setSyncPair] = useState(true);
+  const [saveNotice, setSaveNotice] = useState<string | null>(null);
 
   const inputCls = 'w-20 rounded-lg border border-slate-200 px-1.5 py-0.5 text-right text-xs nums focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20';
 
@@ -998,8 +1166,9 @@ function FlightScheduleCostRow({
     if (!token) return;
     setSaving(true);
     setSaveErr(null);
+    setSaveNotice(null);
     try {
-      await api.patchFlightScheduleCost(token, row.scheduleId, {
+      const body = {
         charterCostCny: charter,
         airportTaxDepCny: taxDep,
         airportTaxArrCny: taxArr,
@@ -1007,7 +1176,23 @@ function FlightScheduleCostRow({
         peakSurchargeCny: peak,
         aircraftAdjustCny: aircraft,
         takeoffDiscountCny: takeoff,
-      });
+      };
+      await api.patchFlightScheduleCost(token, row.scheduleId, body);
+      if (syncPair && pairedRow) {
+        try {
+          await api.patchFlightScheduleCost(token, pairedRow.scheduleId, body);
+        } catch (e: unknown) {
+          setSaveNotice(
+            '已保存 ' + row.flightNumber + '，同步 ' + pairedRow.flightNumber + ' 失败：' +
+              (e instanceof ApiError ? e.message : '保存失败'),
+          );
+          onSaved();
+          return;
+        }
+        setSaveNotice('已保存 ' + row.flightNumber + '，并同步保存 ' + pairedRow.flightNumber);
+      } else {
+        setSaveNotice('已保存 ' + row.flightNumber);
+      }
       onSaved();
     } catch (e: unknown) {
       setSaveErr(e instanceof ApiError ? e.message : '保存失败');
@@ -1040,66 +1225,60 @@ function FlightScheduleCostRow({
       <td className="py-2 text-right">
         <NumberInput
           className={inputCls}
-          step={1}
+          step={0.01}
           value={charter}
           placeholder={ph(row.charterCostCnyPeriod)}
           onChange={(n) => setCharter(n)}
         />
       </td>
       <td className="py-2 text-right">
-        <NumberInput
+        <UsdCostInput
           className={inputCls}
-          step={0.01}
           value={taxDep}
           placeholder={ph(row.airportTaxDepCnyPeriod)}
-          onChange={(n) => setTaxDep(n)}
+          onChange={setTaxDep}
         />
       </td>
       <td className="py-2 text-right">
-        <NumberInput
+        <UsdCostInput
           className={inputCls}
-          step={0.01}
           value={taxArr}
           placeholder={ph(row.airportTaxArrCnyPeriod)}
-          onChange={(n) => setTaxArr(n)}
+          onChange={setTaxArr}
         />
       </td>
       <td className="py-2 text-right">
-        <NumberInput
+        <UsdCostInput
           className={inputCls}
-          step={0.01}
           value={fuel}
           placeholder={ph(row.fuelCostCnyPeriod)}
-          onChange={(n) => setFuel(n)}
+          onChange={setFuel}
         />
       </td>
       <td className="py-2 text-right">
-        <NumberInput
+        <UsdCostInput
           className={inputCls}
-          step={0.01}
           value={peak}
           placeholder={ph(row.peakSurchargeCnyPeriod)}
-          onChange={(n) => setPeak(n)}
+          onChange={setPeak}
         />
       </td>
       <td className="py-2 text-right">
-        <NumberInput
+        <UsdCostInput
           className={inputCls}
-          step={0.01}
           allowNegative
           value={aircraft}
           placeholder={ph(row.aircraftAdjustCnyPeriod)}
-          onChange={(n) => setAircraft(n)}
+          onChange={setAircraft}
         />
       </td>
       <td className="py-2 text-right">
-        <NumberInput
+        <UsdCostInput
           className={inputCls}
-          step={0.01}
           allowNegative
           value={takeoff}
           placeholder={ph(row.takeoffDiscountCnyPeriod)}
-          onChange={(n) => setTakeoff(n)}
+          onChange={setTakeoff}
         />
       </td>
       <td className="py-2 text-right tabular-nums text-slate-600">
@@ -1112,6 +1291,18 @@ function FlightScheduleCostRow({
         {fmtCny(row.perSoldSeatCostCny)}
       </td>
       <td className="py-2 text-right">
+        <label
+          className="mb-1 flex items-center justify-end gap-1 text-xs text-ink-soft"
+          title={pairedRow ? '将同步到 ' + pairedRow.flightNumber : '未找到当日配对班次'}
+        >
+          <input
+            type="checkbox"
+            checked={syncPair && pairedRow != null}
+            disabled={pairedRow == null}
+            onChange={(e) => setSyncPair(e.target.checked)}
+          />
+          同步写入当日配对班次
+        </label>
         <button
           type="button"
           onClick={save}
@@ -1121,6 +1312,8 @@ function FlightScheduleCostRow({
           {saving ? '…' : '保存'}
         </button>
         {saveErr && <div className="text-xs text-rose-600 mt-0.5">{saveErr}</div>}
+        {saveNotice && <div className={`text-xs mt-0.5 ${saveNotice.includes('失败') ? 'text-rose-600' : 'text-emerald-600'}`}>{saveNotice}</div>}
+        {pairedRow == null && <div className="text-xs text-amber-600 mt-0.5">未找到当日配对班次</div>}
       </td>
     </tr>
   );

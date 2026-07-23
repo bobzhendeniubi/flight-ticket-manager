@@ -3543,6 +3543,8 @@ export interface FinanceScheduleRow {
   scheduleId: string;
   flightId: string;
   flightNumber: string;
+  originCode: string;
+  destinationCode: string;
   origin: string;
   destination: string;
   departureTime: string;
