@@ -57,4 +57,24 @@ describe('listSchedulesWithCost — 财务口径：包机费÷全部座位，空
     expect(rows[0]).toMatchObject({ perSeatCostCny: null, emptySeatCostCny: null });
     expect(rows[1]).toMatchObject({ perSeatCostCny: null, emptySeatCostCny: null });
   });
+
+  it('输出航班代码，供前端识别同日反向配对班次', async () => {
+    const rows = await listSchedulesWithCost(
+      undefined,
+      client([
+        {
+          ...schedule({ id: 'schedule-1', charterCostCny: null, seatClasses: [] }),
+          flight: { id: 'flight-1', flightNumber: 'CT100', originCode: 'CAN', destinationCode: 'BKK' },
+        },
+      ]),
+    );
+
+    expect(rows[0]).toMatchObject({
+      flightNumber: 'CT100',
+      originCode: 'CAN',
+      destinationCode: 'BKK',
+      origin: 'CAN',
+      destination: 'BKK',
+    });
+  });
 });

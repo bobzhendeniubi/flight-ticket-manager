@@ -386,6 +386,8 @@ export interface FinanceScheduleRow {
   scheduleId: string;
   flightId: string;
   flightNumber: string;
+  originCode: string;
+  destinationCode: string;
   origin: string;
   destination: string;
   departureTime: string; // ISO
@@ -510,6 +512,8 @@ export async function listSchedulesWithCost(
       scheduleId: s.id,
       flightId: s.flight.id,
       flightNumber: s.flight.flightNumber,
+      originCode: s.flight.originCode,
+      destinationCode: s.flight.destinationCode,
       origin: s.flight.originCode,
       destination: s.flight.destinationCode,
       departureTime: s.departureTime.toISOString(),
