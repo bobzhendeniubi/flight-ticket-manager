@@ -4,6 +4,7 @@
 import { z } from 'zod';
 import { PaymentMethod, ReceiptStatus } from '@prisma/client';
 import { proofUrlSchema } from '../../lib/proof-url.js';
+import { STATEMENT_PLATFORMS, type StatementPlatform } from './receipts.statement.js';
 
 /** 进账金额：> 0，封顶（防手误录入天文数字）。 */
 const amountCnySchema = z.number().positive().max(100_000_000);
@@ -54,6 +55,10 @@ const STATEMENT_FILE_MAX_BASE64 = 12 * 1024 * 1024;
 
 /** 解析流水文件（仅预览，不写库）。 */
 export const parseStatementSchema = z.object({
+  platform: z.enum(STATEMENT_PLATFORMS, {
+    required_error: '请先选择流水平台',
+    invalid_type_error: '请先选择流水平台',
+  }),
   fileBase64: z.string().min(1).max(STATEMENT_FILE_MAX_BASE64),
 });
 export type ParseStatementInput = z.infer<typeof parseStatementSchema>;
@@ -66,6 +71,10 @@ export type ParseStatementInput = z.infer<typeof parseStatementSchema>;
  *   方式，不允许经流水导入伪造（审计发现#1 的可行部分）。
  */
 export const importStatementSchema = z.object({
+  platform: z.enum(STATEMENT_PLATFORMS, {
+    required_error: '请先选择流水平台',
+    invalid_type_error: '请先选择流水平台',
+  }),
   rows: z
     .array(
       z.object({
@@ -83,6 +92,7 @@ export const importStatementSchema = z.object({
     .max(2000),
 });
 export type ImportStatementInput = z.infer<typeof importStatementSchema>;
+export type { StatementPlatform };
 
 /** 流水核对表导出过滤（到账日期闭区间，北京时；缺省全量分页导出）。 */
 export const exportStatementQuerySchema = z

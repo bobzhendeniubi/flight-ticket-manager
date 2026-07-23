@@ -7,7 +7,7 @@
  *
  * 解析容错（与名单导入 roster.ts 同纪律：宽容 ≠ 静默，可疑必 warning）：
  *   - 表头行自动定位（前 10 行内找含「交易流水号」的行），列序按表头名对号，不写死列号。
- *   - 仅「支付成功」行可导入；未支付/订单已关闭行保留在预览里但标记跳过。
+ *   - 仅平台注册表中配置的成功状态（星驿付还需「消费」类型）可导入。
  *   - 文件内流水号重复 → 后出现的行标记跳过（防平台导出叠加时段产生的重复）。
  *   - 金额/时间/流水号任一不可解析 → 该行标 invalid + warning，绝不猜值入库。
  *
@@ -19,10 +19,15 @@ import { PaymentMethod } from '@prisma/client';
 /** 单文件最多解析行数（收单平台单日流水远小于此；防误传超大文件拖垮内存）。 */
 export const STATEMENT_MAX_ROWS = 2000;
 
-/** 收单平台「支付成功」状态原文（其余状态一律不入池）。 */
-const STATUS_SUCCESS = '支付成功';
+/** 支持的平台及其表头/业务规则注册表。 */
+export const STATEMENT_PLATFORMS = [
+  'CMB_QR',
+  'YISHOUBAO',
+  'XINGYIFU',
+] as const;
+export type StatementPlatform = (typeof STATEMENT_PLATFORMS)[number];
 
-/** 解析出的一行流水（未做 DB 去重——那步在 service 里对照现库）。 */
+/** 解析出的一行流水（未做 DB 去重——那步在 service 里对照现库；ID 此处仍为平台原单号）。 */
 export interface StatementParsedRow {
   rowNumber: number;
   externalTxnId: string;
@@ -32,12 +37,14 @@ export interface StatementParsedRow {
   method: PaymentMethod;
   /** 平台原文（微信/支付宝/…），预览展示用。 */
   rawMethod: string;
-  /** 平台交易状态原文（支付成功/未支付/订单已关闭/…）。 */
+  /** 平台交易状态原文（支付成功/交易成功/未支付/订单已关闭/…）。 */
   rawStatus: string;
+  /** 平台交易类型原文（星驿付的消费/退款/撤销等），其它平台为空。 */
+  rawType: string;
   /** 二维码备注 + 付款方备注合并（认款线索）。 */
   payerNote: string | null;
-  /** 行内判定：ok=可导入；skipped_status=非支付成功；dup_in_file=文件内重复；invalid=字段解析失败。 */
-  disposition: 'ok' | 'skipped_status' | 'dup_in_file' | 'invalid';
+  /** 行内判定：ok=可导入；skipped_* = 平台业务条件不满足；dup_in_file=文件内重复；invalid=字段解析失败。 */
+  disposition: 'ok' | 'skipped_status' | 'skipped_type' | 'dup_in_file' | 'invalid';
 }
 
 export interface StatementParseResult {
@@ -59,13 +66,6 @@ function cellText(v: ExcelJS.CellValue): string {
     if ('text' in v && typeof v.text === 'string') return v.text;
   }
   return String(v);
-}
-
-/** 「微信」→ WECHAT_PAY；「支付宝」→ ALIPAY；其余（银行卡/云闪付等）→ BANK_CARD。 */
-function mapMethod(raw: string): PaymentMethod {
-  if (raw.includes('微信')) return PaymentMethod.WECHAT_PAY;
-  if (raw.includes('支付宝')) return PaymentMethod.ALIPAY;
-  return PaymentMethod.BANK_CARD;
 }
 
 /**
@@ -110,62 +110,187 @@ const TXN_ID_MAX = 64;
 // 付款备注入库上限（与 schema payerNote max(500) 对齐；超长截断——备注是线索不是账，截断无资金影响）
 const PAYER_NOTE_MAX = 500;
 
-// 表头名 → 内部键（列序不写死，按名对号；平台改列顺序不影响解析）
-const HEADER_KEYS = {
-  txnId: '交易流水号',
-  time: '交易时间',
-  amount: '交易金额',
-  method: '支付方式',
-  status: '交易状态',
-  qrRemark: '二维码备注',
-  payerRemark: '支付付款方备注',
-} as const;
+type StatementColumnKey =
+  | 'txnId'
+  | 'time'
+  | 'amount'
+  | 'method'
+  | 'status'
+  | 'txnType'
+  | 'payerNote'
+  | 'remark'
+  | 'qrRemark'
+  | 'payerRemark';
+type ColMap = Partial<Record<StatementColumnKey, number>>;
 
-type ColMap = Partial<Record<keyof typeof HEADER_KEYS, number>>;
+interface StatementPlatformConfig {
+  label: string;
+  sheetName?: string;
+  headers: Record<StatementColumnKey, string>;
+  required: StatementColumnKey[];
+  detectBy: StatementColumnKey[];
+  successStatus: string;
+  successType?: string;
+  storagePrefix: string;
+  mapMethod: (raw: string) => PaymentMethod;
+}
 
-/** 前 10 行内找含「交易流水号」的表头行，返回 { headerRowNumber, colMap }；找不到返回 null。 */
-function locateHeader(ws: ExcelJS.Worksheet): { headerRowNumber: number; colMap: ColMap } | null {
+function mapWechatAlipayOrCard(raw: string): PaymentMethod {
+  if (raw.includes('微信')) return PaymentMethod.WECHAT_PAY;
+  if (raw.includes('支付宝')) return PaymentMethod.ALIPAY;
+  return PaymentMethod.BANK_CARD;
+}
+
+/** 平台注册表：表头和业务条件都集中在配置，逐行解析骨架共用。 */
+export const STATEMENT_PLATFORM_CONFIGS: Record<StatementPlatform, StatementPlatformConfig> = {
+  CMB_QR: {
+    label: '招行二维码',
+    headers: {
+      txnId: '交易流水号',
+      time: '交易时间',
+      amount: '交易金额',
+      method: '支付方式',
+      status: '交易状态',
+      txnType: '',
+      qrRemark: '二维码备注',
+      payerRemark: '支付付款方备注',
+      payerNote: '',
+      remark: '',
+    },
+    required: ['txnId', 'time', 'amount'],
+    detectBy: ['txnId', 'time', 'amount'],
+    successStatus: '支付成功',
+    storagePrefix: '',
+    mapMethod: mapWechatAlipayOrCard,
+  },
+  YISHOUBAO: {
+    label: '宜收宝',
+    sheetName: '交易流水',
+    headers: {
+      txnId: '交易单号',
+      time: '日期',
+      amount: '交易金额',
+      method: '交易方式',
+      status: '交易状态',
+      txnType: '',
+      payerNote: '付款人',
+      remark: '备注',
+      qrRemark: '',
+      payerRemark: '',
+    },
+    required: ['txnId', 'time', 'amount', 'method', 'status'],
+    detectBy: ['txnId', 'time', 'amount'],
+    successStatus: '支付成功',
+    storagePrefix: 'YSB:',
+    mapMethod: mapWechatAlipayOrCard,
+  },
+  XINGYIFU: {
+    label: '星驿付',
+    headers: {
+      txnId: '交易流水号',
+      time: '交易时间',
+      amount: '交易金额',
+      method: '支付方式',
+      status: '交易状态',
+      txnType: '交易类型',
+      payerNote: '付款人ID',
+      remark: '备注',
+      qrRemark: '',
+      payerRemark: '',
+    },
+    required: ['txnId', 'time', 'amount', 'method', 'status', 'txnType'],
+    detectBy: ['txnId', 'time', 'amount'],
+    successStatus: '交易成功',
+    successType: '消费',
+    storagePrefix: 'XYF:',
+    mapMethod: mapWechatAlipayOrCard,
+  },
+};
+
+export function statementStorageExternalTxnId(
+  platform: StatementPlatform,
+  externalTxnId: string,
+): string {
+  return `${STATEMENT_PLATFORM_CONFIGS[platform].storagePrefix}${externalTxnId}`;
+}
+
+export function statementPlatformFileError(platform: StatementPlatform): string {
+  const config = STATEMENT_PLATFORM_CONFIGS[platform];
+  if (platform === 'CMB_QR') {
+    return '未找到表头行（需含「交易流水号 / 交易时间 / 交易金额」列），请确认是收单平台导出的流水原表';
+  }
+  const basicHeaders = config.required
+    .slice(0, 3)
+    .map((key) => config.headers[key])
+    .join(' / ');
+  return `未找到${config.label}表头行（需含「${basicHeaders}」列——请上传${config.label}导出的交易流水原表）`;
+}
+
+function locateHeader(
+  ws: ExcelJS.Worksheet,
+  config: StatementPlatformConfig,
+): { headerRowNumber: number; colMap: ColMap; missing: StatementColumnKey[] } | null {
   const scanMax = Math.min(ws.rowCount, 10);
   for (let r = 1; r <= scanMax; r += 1) {
     const row = ws.getRow(r);
     const colMap: ColMap = {};
     row.eachCell({ includeEmpty: false }, (cell, colNumber) => {
       const text = cellText(cell.value).trim();
-      for (const [key, header] of Object.entries(HEADER_KEYS) as Array<
-        [keyof typeof HEADER_KEYS, string]
-      >) {
-        if (text === header) colMap[key] = colNumber;
+      for (const key of Object.keys(config.headers) as StatementColumnKey[]) {
+        const header = config.headers[key];
+        if (header && text === header) colMap[key] = colNumber;
       }
     });
-    if (colMap.txnId != null && colMap.time != null && colMap.amount != null) {
-      return { headerRowNumber: r, colMap };
+    if (config.detectBy.every((key) => colMap[key] != null)) {
+      const missing = config.required.filter((key) => colMap[key] == null);
+      return { headerRowNumber: r, colMap, missing };
     }
   }
   return null;
 }
 
 /** 解析收单平台流水 .xlsx（base64）→ { rows, warnings }。文件损坏/非 xlsx 抛错由路由层转 400。 */
-export async function parseStatementXlsx(fileBase64: string): Promise<StatementParseResult> {
+export async function parseStatementXlsx(
+  fileBase64: string,
+  platform: StatementPlatform = 'CMB_QR',
+): Promise<StatementParseResult> {
   const buf = Buffer.from(fileBase64, 'base64');
   const wb = new ExcelJS.Workbook();
   await wb.xlsx.load(buf as unknown as Parameters<typeof wb.xlsx.load>[0]);
 
   const warnings: string[] = [];
   const rows: StatementParsedRow[] = [];
-  const ws = wb.worksheets[0];
+  const config = STATEMENT_PLATFORM_CONFIGS[platform];
+  if (!config) throw new Error(`Unsupported statement platform: ${platform}`);
+  const ws = (config.sheetName ? wb.getWorksheet(config.sheetName) : undefined) ?? wb.worksheets[0];
   if (!ws) {
     warnings.push('未找到任何工作表');
     return { rows, warnings };
   }
 
-  const header = locateHeader(ws);
+  const header = locateHeader(ws, config);
   if (!header) {
-    warnings.push(
-      '未找到表头行（需含「交易流水号 / 交易时间 / 交易金额」列），请确认是收单平台导出的流水原表',
-    );
+    warnings.push(statementPlatformFileError(platform));
     return { rows, warnings };
   }
-  const { headerRowNumber, colMap } = header;
+  const { headerRowNumber, colMap, missing } = header;
+  if (missing.length > 0) {
+    if (platform === 'CMB_QR') {
+      // 招行历史行为：方式/状态列缺失时保留预览，但显式警告并按旧逻辑处理。
+      if (colMap.status == null) {
+        warnings.push('未找到「交易状态」列：无法确认哪些行支付成功，所有行将标为不可导入');
+      }
+      if (colMap.method == null) {
+        warnings.push('未找到「支付方式」列：无法区分微信/支付宝，导入行将统一记为银行卡');
+      }
+    } else {
+      const missingHeaders = missing.map((key) => config.headers[key]).join('、');
+      warnings.push(
+        `${config.label}流水表头缺少「${missingHeaders}」列——请上传${config.label}导出的交易流水原表`,
+      );
+      return { rows, warnings };
+    }
+  }
   // 状态/方式列缺失不整文件拒（可能是平台改版），但必须显式警告——
   // 缺「交易状态」= 无法确认支付成功，所有行会被按非成功跳过；缺「支付方式」= 全部落银行卡。
   if (colMap.status == null) {
@@ -186,17 +311,22 @@ export async function parseStatementXlsx(fileBase64: string): Promise<StatementP
       return;
     }
 
-    const getCol = (key: keyof typeof HEADER_KEYS): ExcelJS.CellValue =>
+    const getCol = (key: StatementColumnKey): ExcelJS.CellValue =>
       colMap[key] != null ? row.getCell(colMap[key]!).value : null;
 
     const txnId = cellText(getCol('txnId')).trim();
     const rawStatus = cellText(getCol('status')).trim();
     const rawMethod = cellText(getCol('method')).trim();
+    const rawType = cellText(getCol('txnType')).trim();
     const amountCny = parseAmount(getCol('amount'));
     const receivedAt = parseTxnTime(getCol('time'));
+    const payerNoteValue = cellText(getCol('payerNote')).trim();
+    const remarkValue = cellText(getCol('remark')).trim();
     const qrRemark = cellText(getCol('qrRemark')).trim();
     const payerRemark = cellText(getCol('payerRemark')).trim();
-    const joinedNote = [qrRemark, payerRemark].filter(Boolean).join(' / ');
+    const joinedNote = [qrRemark, payerRemark, payerNoteValue, remarkValue]
+      .filter(Boolean)
+      .join(' / ');
     // 超长截断而非拒行：备注是认款线索不是账目，截断无资金影响（与 schema max(500) 对齐）
     const payerNote = joinedNote ? joinedNote.slice(0, PAYER_NOTE_MAX) : null;
 
@@ -220,9 +350,11 @@ export async function parseStatementXlsx(fileBase64: string): Promise<StatementP
             ? '金额不可解析（需 ≥ 0.01 元）'
             : '交易时间不可解析';
       warnings.push(`第 ${rowNumber} 行：${why}，不可导入`);
-    } else if (rawStatus !== STATUS_SUCCESS) {
-      // 平台状态原文非「支付成功」（未支付/订单已关闭/退款…）→ 不入池
+    } else if (rawStatus !== config.successStatus) {
+      // 平台状态原文非成功状态（未支付/订单已关闭/退款…）→ 不入池
       disposition = 'skipped_status';
+    } else if (config.successType && rawType !== config.successType) {
+      disposition = 'skipped_type';
     } else if (seenTxnIds.has(txnId)) {
       disposition = 'dup_in_file';
       warnings.push(`第 ${rowNumber} 行：交易流水号 ${txnId} 在文件内重复，已跳过`);
@@ -234,9 +366,10 @@ export async function parseStatementXlsx(fileBase64: string): Promise<StatementP
       externalTxnId: txnId,
       receivedAt,
       amountCny,
-      method: mapMethod(rawMethod),
+      method: config.mapMethod(rawMethod),
       rawMethod,
       rawStatus,
+      rawType,
       payerNote,
       disposition,
     });

@@ -28,7 +28,7 @@ import {
   refundReceiptSchema,
   registerReceiptSchema,
 } from './receipts.schemas.js';
-import { statementExportFilename } from './receipts.statement.js';
+import { statementExportFilename, statementPlatformFileError } from './receipts.statement.js';
 
 export const receiptRoutes: FastifyPluginAsync = async (app) => {
   const service = new ReceiptsService();
@@ -78,11 +78,11 @@ export const receiptRoutes: FastifyPluginAsync = async (app) => {
     async (req) => {
       const body = parseStatementSchema.parse(req.body);
       try {
-        return await service.previewStatement(body.fileBase64);
+        return await service.previewStatement(body.fileBase64, body.platform);
       } catch (e: unknown) {
         // ExcelJS 对损坏/非 xlsx 文件抛底层错 → 统一转 400（与名单解析同口径）
         if (e instanceof BadRequestError) throw e;
-        throw new BadRequestError('流水文件解析失败：请上传收单平台导出的 .xlsx 原表');
+        throw new BadRequestError(`流水文件解析失败：${statementPlatformFileError(body.platform)}`);
       }
     },
   );

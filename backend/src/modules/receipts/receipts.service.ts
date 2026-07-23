@@ -40,7 +40,9 @@ import type {
 import {
   parseStatementXlsx,
   buildStatementExportWorkbook,
+  statementStorageExternalTxnId,
   type StatementExportEntry,
+  type StatementPlatform,
 } from './receipts.statement.js';
 
 /** 金额保留 2 位小数（CNY，避免浮点累计误差）。 */
@@ -503,9 +505,11 @@ export class ReceiptsService {
    * 行内判定（parseStatementXlsx）之外，再对照现库：已存在同 externalTxnId 的行
    * 标 dup_in_db 并附现有进账号/认款状态——重复导入天然幂等，已认过的行状态不丢。
    */
-  async previewStatement(fileBase64: string) {
-    const { rows, warnings } = await parseStatementXlsx(fileBase64);
-    const okIds = rows.filter((r) => r.disposition === 'ok').map((r) => r.externalTxnId);
+  async previewStatement(fileBase64: string, platform: StatementPlatform = 'CMB_QR') {
+    const { rows, warnings } = await parseStatementXlsx(fileBase64, platform);
+    const okIds = rows
+      .filter((r) => r.disposition === 'ok')
+      .map((r) => statementStorageExternalTxnId(platform, r.externalTxnId));
     const existing = okIds.length
       ? await prisma.receipt.findMany({
           where: { externalTxnId: { in: okIds } },
@@ -515,7 +519,8 @@ export class ReceiptsService {
     const byTxn = new Map(existing.map((e) => [e.externalTxnId as string, e]));
 
     const preview = rows.map((r) => {
-      const dbHit = r.disposition === 'ok' ? byTxn.get(r.externalTxnId) : undefined;
+      const storageTxnId = statementStorageExternalTxnId(platform, r.externalTxnId);
+      const dbHit = r.disposition === 'ok' ? byTxn.get(storageTxnId) : undefined;
       // 同流水号但金额与库中不一致 = 数据冲突（平台改单/人为改表），必须显式亮出来，
       // 不能只报「已存在」让财务误以为无事发生（审计发现#3）
       const amountMismatch =
@@ -553,6 +558,7 @@ export class ReceiptsService {
         dupInDb: count('dup_in_db'),
         dupInFile: count('dup_in_file'),
         skippedStatus: count('skipped_status'),
+        skippedType: count('skipped_type'),
         invalid: count('invalid'),
       },
     };
@@ -567,8 +573,12 @@ export class ReceiptsService {
    * externalTxnId 唯一索引兜底（并发导入也绝不重复入池）。
    */
   async importStatement(input: ImportStatementInput, actor: { userId: string; role: UserRole }) {
+    const rowsWithStorageIds = input.rows.map((r) => ({
+      ...r,
+      externalTxnId: statementStorageExternalTxnId(input.platform, r.externalTxnId),
+    }));
     const seen = new Set<string>();
-    const unique = input.rows.filter((r) =>
+    const unique = rowsWithStorageIds.filter((r) =>
       seen.has(r.externalTxnId) ? false : (seen.add(r.externalTxnId), true),
     );
 
