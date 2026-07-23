@@ -391,6 +391,8 @@ export interface FinanceScheduleRow {
   origin: string;
   destination: string;
   departureTime: string; // ISO
+  /** 出发地时区的当地出发日 YYYY-MM-DD——配对/按天口径一律用它，UTC 切片会跨午夜错天 */
+  localDepartureDate: string;
   // 生效值（override → period → null）—— 给显示用
   charterCostCny: number | null;
   airportTaxDepCny: number | null;
@@ -517,6 +519,7 @@ export async function listSchedulesWithCost(
       origin: s.flight.originCode,
       destination: s.flight.destinationCode,
       departureTime: s.departureTime.toISOString(),
+      localDepartureDate: localDate(s.departureTime, s.departureTz),
       // effective
       charterCostCny: eff.charterCostCny,
       airportTaxDepCny: eff.airportTaxDepCny,

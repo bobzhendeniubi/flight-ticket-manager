@@ -75,6 +75,8 @@ describe('listSchedulesWithCost — 财务口径：包机费÷全部座位，空
       destinationCode: 'BKK',
       origin: 'CAN',
       destination: 'BKK',
+      // departureTz=UTC 时当地出发日 = UTC 日期；配对同录按此字段判定同一天
+      localDepartureDate: '2026-07-22',
     });
   });
 });

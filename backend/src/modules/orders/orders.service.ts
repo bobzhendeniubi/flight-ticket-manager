@@ -7119,8 +7119,9 @@ export function serializeOrder<T extends OrderLike>(
     expectedAmountCny: redact ? undefined : order.expectedAmountCny,
     expectedAmountLocked: redact ? undefined : order.expectedAmountLocked,
     settlementLocked: order.settlementLocked ?? false,
-    settlementLockedAt: undefined,
-    settlementLockedBy: undefined,
+    // 锁定时间/操作人仅内部可见（对代理 redact），条件透传保持与 Prisma payload 类型兼容
+    settlementLockedAt: redact ? undefined : (order.settlementLockedAt ?? null),
+    settlementLockedBy: redact ? undefined : (order.settlementLockedBy ?? null),
     adjustments: redact ? undefined : order.adjustments,
     claimedById: redact ? undefined : order.claimedById,
     claimedBy: redact ? undefined : order.claimedBy,

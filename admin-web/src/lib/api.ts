@@ -3566,6 +3566,8 @@ export interface FinanceScheduleRow {
   origin: string;
   destination: string;
   departureTime: string;
+  /** 出发地时区的当地出发日 YYYY-MM-DD（配对同录按它判定同一天） */
+  localDepartureDate: string;
   // 生效（用于显示）
   charterCostCny: number | null;
   airportTaxDepCny: number | null;

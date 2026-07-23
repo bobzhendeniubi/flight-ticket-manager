@@ -137,18 +137,16 @@ function reverseFlightOption(flightId: string, options: FlightOption[]): FlightO
   return matches.length === 1 ? matches[0]! : null;
 }
 
-function datePart(iso: string): string {
-  return iso.slice(0, 10);
-}
-
 function reverseSchedule(
   row: FinanceScheduleRow,
   rows: FinanceScheduleRow[],
 ): FinanceScheduleRow | null {
+  // 「同一天」按出发地时区的当地出发日比较——本线澳门/岘港航班常在 UTC 午夜附近起飞，
+  // 用 UTC 日期切片会把去/回程劈到两天，配错或配不上。
   const matches = rows.filter(
     (candidate) =>
       candidate.scheduleId !== row.scheduleId &&
-      datePart(candidate.departureTime) === datePart(row.departureTime) &&
+      candidate.localDepartureDate === row.localDepartureDate &&
       candidate.originCode === row.destinationCode &&
       candidate.destinationCode === row.originCode,
   );
@@ -900,7 +898,9 @@ function CostPeriodRow({
   const [err, setErr] = useState<string | null>(null);
   const [syncPair, setSyncPair] = useState(true);
   const [saveNotice, setSaveNotice] = useState<string | null>(null);
-  const pairedPeriod = reversePeriod(period, periods, from, to);
+  // 用周期「原始」日期段找反向配对——若用编辑中的 from/to，对方还是旧日期会配不上，
+  // 同步勾选会静默失效只写单边；保存时把编辑后的日期段同时写进双方。
+  const pairedPeriod = reversePeriod(period, periods);
 
   function reset(): void {
     setFrom(period.effectiveFrom);
