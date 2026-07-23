@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { api, ApiError, duplicatePassengerConflictOrderNumbers, SETTLEMENT_MODE_LABEL, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog } from '../lib/api';
+import { api, ApiError, duplicatePassengerConflictOrderNumbers, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { useFlightSeats } from '../stores/flightSeats';
 import {
@@ -2383,6 +2383,8 @@ function OrderDrawer({
             </p>
           </section>
 
+          <PriceAdjustmentSection order={o} onOrderUpdated={handleOrderUpdated} />
+
           <AdjustmentsSection order={o} />
 
           <OpsToolbar order={o} onAdvance={onAdvance} />
@@ -3417,6 +3419,74 @@ function readIsTeamSettlementPrice(metadata: unknown): boolean {
   return (metadata as { priceOverride?: unknown }).priceOverride === 'TEAM_SETTLEMENT';
 }
 
+// ── 按乘客调价（0722 公测反馈）：金额明细逐人可解释 ─────────────────────────
+/** 读 priceAdjustment 差额行的原因码（backend metadata.priceAdjustment=true 打标；非调价行返回 null）。 */
+function readPriceAdjustmentReason(metadata: unknown): string | null {
+  if (!metadata || typeof metadata !== 'object') return null;
+  const m = metadata as { priceAdjustment?: unknown; reasonCode?: unknown };
+  if (m.priceAdjustment !== true) return null;
+  return typeof m.reasonCode === 'string' ? m.reasonCode : null;
+}
+
+interface OrderAdjLine {
+  itemId: string;
+  amountCny: number;
+  reasonCode: string | null;
+  description: string;
+}
+/**
+ * 把订单里的 priceAdjustment 差额行按 passengerId 分桶（与后端 groupPassengerAdjustments 同口径）：
+ *   byPassenger[pid] = 该乘客名下调整行 + 净额；wholeOrder = 整单调整行（passengerId 空）+ 净额。
+ * 只做展示分组，不改任何金额（这些行本就计入 total）。
+ */
+function groupOrderAdjustments(items: readonly OrderItem[]): {
+  byPassenger: Map<string, { lines: OrderAdjLine[]; netCny: number }>;
+  wholeOrder: { lines: OrderAdjLine[]; netCny: number };
+} {
+  const byPassenger = new Map<string, { lines: OrderAdjLine[]; netCny: number }>();
+  const wholeOrder = { lines: [] as OrderAdjLine[], netCny: 0 };
+  for (const it of items) {
+    if (!isPriceAdjustmentItem(it.metadata)) continue;
+    const reasonCode = readPriceAdjustmentReason(it.metadata);
+    const line: OrderAdjLine = {
+      itemId: it.id,
+      amountCny: Number(it.amount) || 0,
+      reasonCode,
+      description: it.description,
+    };
+    const pid = it.passengerId ?? null;
+    if (pid) {
+      const bucket = byPassenger.get(pid) ?? { lines: [], netCny: 0 };
+      bucket.lines.push(line);
+      bucket.netCny += line.amountCny;
+      byPassenger.set(pid, bucket);
+    } else {
+      wholeOrder.lines.push(line);
+      wholeOrder.netCny += line.amountCny;
+    }
+  }
+  return { byPassenger, wholeOrder };
+}
+/** metadata.priceAdjustment === true（含 SETTLEMENT/ROOM_DIFF 等所有调价行）。 */
+function isPriceAdjustmentItem(metadata: unknown): boolean {
+  return (
+    metadata != null &&
+    typeof metadata === 'object' &&
+    (metadata as { priceAdjustment?: unknown }).priceAdjustment === true
+  );
+}
+/** 调价原因码 → 中文 label（未知码回退，绝不显示 undefined）。 */
+function adjustmentReasonLabel(reasonCode: string | null): string {
+  if (!reasonCode) return '价格调整';
+  const label = (PRICE_ADJUSTMENT_REASON_LABEL as Record<string, string>)[reasonCode];
+  return label ?? '价格调整';
+}
+/** 带符号金额展示：+¥200 / −¥80。 */
+function signedCny(amountCny: number): string {
+  const sign = amountCny < 0 ? '−' : '+';
+  return `${sign}¥${Math.abs(amountCny).toLocaleString()}`;
+}
+
 // ── 产品内容行：FLIGHT 项可「改期」（换班次/日期 + 改舱位 + 改期费）──────
 function OrderItemRow({
   orderId,
@@ -3861,6 +3931,211 @@ function AdjustmentsSection({ order }: { order: OrderSummary }) {
   );
 }
 
+// ── 事后调价（0722 公测反馈「按乘客调价」；ADMIN/STAFF）─────────────────────
+// 一张多人订单内，给「整单」或「指定乘客」挂一笔结算价差额（正=补收/负=优惠）+原因，走后端
+// POST /orders/:id/price-adjustment（与录单调价同路径：追加一条差额行，金额进 total）。
+// 金额明细按乘客分组展示（逐人可解释），下方是录入口。绝不做「手填每人价格」——只走差额通道。
+function PriceAdjustmentSection({
+  order,
+  onOrderUpdated,
+}: {
+  order: OrderSummary;
+  onOrderUpdated?: (order: OrderSummary) => void;
+}) {
+  const role = useAuth((s) => s.user?.role);
+  const token = useAuth((s) => s.tokens)?.accessToken ?? '';
+  const isOps = role === 'ADMIN' || role === 'STAFF';
+
+  const [scope, setScope] = useState<string>('WHOLE'); // 'WHOLE' 或 passengerId
+  const [amount, setAmount] = useState<number | null>(null);
+  const [reasonCode, setReasonCode] = useState<PriceAdjustmentReason>('MISC_FEE');
+  const [reasonText, setReasonText] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [open, setOpen] = useState(false);
+
+  // 金额明细分组（byPassenger + wholeOrder），逐人可解释；纯展示，不改金额。
+  const grouped = useMemo(() => groupOrderAdjustments(order.items ?? []), [order.items]);
+  const passengerById = useMemo(
+    () => new Map(order.passengers.map((p) => [p.id, p.chineseName?.trim() || p.fullName])),
+    [order.passengers],
+  );
+  const hasAnyAdjustment = grouped.wholeOrder.lines.length > 0 || grouped.byPassenger.size > 0;
+
+  // 内部角色才可见（对外脱敏时后端也不下发逐项金额；这里再做一道前端权限门）。
+  if (!isOps) return null;
+
+  async function submit(): Promise<void> {
+    setErr(null);
+    if (amount === null || !Number.isInteger(amount) || amount === 0) {
+      setErr('请输入非 0 的整数金额（正=补收 / 负=优惠）');
+      return;
+    }
+    if (reasonCode === 'OTHER' && !reasonText.trim()) {
+      setErr('选择「其它」时必须填写调整原因说明');
+      return;
+    }
+    const targetName = scope === 'WHOLE' ? '整单' : passengerById.get(scope) ?? '该乘客';
+    if (!window.confirm(`确认给「${targetName}」${signedCny(amount)}（${adjustmentReasonLabel(reasonCode)}）？\n将追加一条价格调整行，计入订单应收/尾款，全程审计留痕。`)) {
+      return;
+    }
+    setBusy(true);
+    try {
+      const res = await api.addOrderPriceAdjustment(token, order.id, {
+        amountCny: amount,
+        reasonCode,
+        reasonText: reasonText.trim() || undefined,
+        passengerId: scope === 'WHOLE' ? undefined : scope,
+      });
+      onOrderUpdated?.(res.order);
+      // 复位录入框（保留作用范围，方便连续给同一人调多笔）
+      setAmount(null);
+      setReasonText('');
+      setOpen(false);
+    } catch (e) {
+      setErr(e instanceof ApiError ? `调价失败：${e.message}` : '调价失败');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section>
+      <h3 className="text-xs font-semibold uppercase tracking-wide text-ink-muted">价格调整（按乘客 / 整单）</h3>
+
+      {/* 金额明细：按乘客分组展示（逐人可解释）+ 整单调整 */}
+      {hasAnyAdjustment && (
+        <div className="mt-2 space-y-2 text-sm">
+          {[...grouped.byPassenger.entries()].map(([pid, bucket]) => (
+            <div key={pid} className="rounded-md border border-slate-200 bg-slate-50/60 p-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-medium text-ink">{passengerById.get(pid) ?? '（已移除乘客）'}</span>
+                <span className={`nums text-sm font-semibold ${bucket.netCny < 0 ? 'text-emerald-700' : 'text-amber-700'}`}>
+                  净 {signedCny(bucket.netCny)}
+                </span>
+              </div>
+              <ul className="mt-1 space-y-0.5">
+                {bucket.lines.map((l) => (
+                  <li key={l.itemId} className="flex items-center justify-between gap-2 text-xs text-ink-muted">
+                    <span>{adjustmentReasonLabel(l.reasonCode)}</span>
+                    <span className="nums">{signedCny(l.amountCny)}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          ))}
+          {grouped.wholeOrder.lines.length > 0 && (
+            <div className="rounded-md border border-slate-200 bg-slate-50/60 p-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="font-medium text-ink">整单调整</span>
+                <span className={`nums text-sm font-semibold ${grouped.wholeOrder.netCny < 0 ? 'text-emerald-700' : 'text-amber-700'}`}>
+                  净 {signedCny(grouped.wholeOrder.netCny)}
+                </span>
+              </div>
+              <ul className="mt-1 space-y-0.5">
+                {grouped.wholeOrder.lines.map((l) => (
+                  <li key={l.itemId} className="flex items-center justify-between gap-2 text-xs text-ink-muted">
+                    <span>{adjustmentReasonLabel(l.reasonCode)}</span>
+                    <span className="nums">{signedCny(l.amountCny)}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* 录入口（默认收起，点开录入一笔差额） */}
+      {!open ? (
+        <button
+          type="button"
+          className="mt-2 text-[11px] font-medium text-brand hover:text-brand-dark"
+          onClick={() => setOpen(true)}
+        >
+          + 添加价格调整
+        </button>
+      ) : (
+        <div className="mt-2 space-y-2 rounded-lg border border-brand/30 bg-brand/5 p-3">
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+            <label className="block">
+              <span className="text-[11px] font-medium text-ink-muted">作用范围</span>
+              <select
+                className="input mt-0.5 w-full"
+                value={scope}
+                onChange={(e) => setScope(e.target.value)}
+              >
+                <option value="WHOLE">整单（所有乘客共担）</option>
+                {order.passengers.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    指定乘客：{p.chineseName?.trim() || p.fullName}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="block">
+              <span className="text-[11px] font-medium text-ink-muted">原因</span>
+              <select
+                className="input mt-0.5 w-full"
+                value={reasonCode}
+                onChange={(e) => setReasonCode(e.target.value as PriceAdjustmentReason)}
+              >
+                {PRICE_ADJUSTMENT_REASON_OPTIONS.map((rc) => (
+                  <option key={rc} value={rc}>
+                    {PRICE_ADJUSTMENT_REASON_LABEL[rc]}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+          <label className="block">
+            <span className="text-[11px] font-medium text-ink-muted">金额（CNY，正=补收 / 负=优惠）</span>
+            <NumberInput
+              value={amount}
+              onChange={setAmount}
+              integerOnly
+              allowNegative
+              placeholder="如 200 或 -80"
+              className="input mt-0.5 w-full"
+            />
+          </label>
+          {reasonCode === 'OTHER' && (
+            <label className="block">
+              <span className="text-[11px] font-medium text-ink-muted">原因说明（「其它」必填）</span>
+              <input
+                className="input mt-0.5 w-full"
+                value={reasonText}
+                onChange={(e) => setReasonText(e.target.value)}
+                maxLength={200}
+                placeholder="简述调整原因"
+              />
+            </label>
+          )}
+          <p className="text-[11px] leading-snug text-ink-muted">
+            只在系统权威价上加减一笔差额并留审计记录；不会改动机票/酒店等基础项价格。订单总额 = 系统价 + Σ调整。
+          </p>
+          {err && <div className="text-[11px] text-red-600">{err}</div>}
+          <div className="flex items-center gap-2">
+            <button type="button" className="btn-primary btn-sm" disabled={busy} onClick={submit}>
+              {busy ? '提交中…' : '确认调价'}
+            </button>
+            <button
+              type="button"
+              className="text-[11px] text-ink-muted hover:text-ink"
+              disabled={busy}
+              onClick={() => {
+                setOpen(false);
+                setErr(null);
+              }}
+            >
+              取消
+            </button>
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
 /** 护照姓名按航司/证件口径显示为「姓/名」斜线格式（大写），无拆分时回退全名 */
 function toSlashName(p: { lastName?: string | null; firstName?: string | null; fullName: string }): string {
   const last = (p.lastName ?? '').trim().toUpperCase();
@@ -3988,12 +4263,19 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
     };
   }, [token, order.id, historyReloadKey]);
 
+  // 按乘客净调价（0722）：读订单调价差额行，给每张乘客卡挂一个醒目净额小标（如「调整 +200」）。
+  const adjustmentByPassenger = useMemo(
+    () => groupOrderAdjustments(order.items ?? []).byPassenger,
+    [order.items],
+  );
+
   return (
     <section>
       <h3 className="text-sm font-medium text-slate-700">乘客 ({order.passengers.length})</h3>
       <ul className="mt-2 space-y-2 text-xs">
         {order.passengers.map((p) => {
           const passDaysLeft = daysUntil(p.passportExpiry);
+          const adjNet = adjustmentByPassenger.get(p.id)?.netCny ?? 0;
           const passWarn = passDaysLeft !== null && passDaysLeft < 180;
           const passBlock = passDaysLeft !== null && passDaysLeft < 90;
           if (visaEditId === p.id) {
@@ -4041,6 +4323,19 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
                     )}
                     {p.visaExempt && (
                       <span className="ml-2 rounded bg-sky-50 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 ring-1 ring-sky-200">自备签</span>
+                    )}
+                    {/* 按乘客净调价小标（0722）：正=补收（琥珀）、负=优惠（绿）；0 不显示。 */}
+                    {adjNet !== 0 && (
+                      <span
+                        className={`ml-2 rounded px-1.5 py-0.5 text-[10px] font-semibold ring-1 ${
+                          adjNet < 0
+                            ? 'bg-emerald-50 text-emerald-700 ring-emerald-200'
+                            : 'bg-amber-50 text-amber-700 ring-amber-200'
+                        }`}
+                        title="该乘客名下的价格调整净额（详见下方「价格调整」区）"
+                      >
+                        调整 {signedCny(adjNet)}
+                      </span>
                     )}
                     <button
                       className="ml-2 text-[11px] font-normal text-brand hover:text-brand-dark"

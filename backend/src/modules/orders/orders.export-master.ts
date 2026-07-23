@@ -28,7 +28,7 @@ import { prisma as defaultPrisma } from '../../db/prisma.js';
 import type { BundleItemJson } from '../../lib/json-types.js';
 import { docKey } from '../travelers/traveler-profiles.aggregate.js';
 import { toAlpha3 } from './nationality.js';
-import { parseRoomGroups } from './orders.export-room-allocation.js';
+import { parseRoomGroups, resolveExportHotelName } from './orders.export-room-allocation.js';
 import { nameWithTitle, pnrName, VISA_REQUIREMENT_LABEL } from './orders.export-templates.js';
 import { filterExportOrdersByDepartDate } from './orders.export-depart-filter.js';
 import { buildOrderFilterWhere } from './orders.service.js';
@@ -139,7 +139,7 @@ export interface MasterRow {
   seq: number;
   agency: string;
   notes: string;
-  hotelName: string; // 酒店中文名称（hotelRoomType.hotel.name 去重）
+  hotelName: string; // 酒店中文名称（乘客行级）：优先分房组实际酒店（房控），回退订单项 hotelRoomType.hotel.name 去重
   chineseName: string;
   passengerName: string; // 拼音/PNR：LAST/FIRST + 称谓（航司口径）
   cleanName: string; // 纯拼音名 LAST/FIRST（无 MR/MS 称谓）— 财务对数/名单匹配用
@@ -425,10 +425,11 @@ export function orderToMasterRows(
     orderType = kind ? ORDER_KIND_LABEL[kind] : '';
   }
 
-  // ── 酒店中文名（去重）──
+  // ── 酒店中文名（订单项口径，去重）──
+  // 作为「酒店中文名称」列的**回退**值（0722 财务反馈）：乘客没有分房记录时用它，保持现状。
   // 任何"关联了酒店房型"的订单行都算（不限 kind）：套餐(BUNDLE)把房型盖在 BUNDLE 行上、
   // 无独立 HOTEL 行，若只认 kind==='HOTEL' 会漏掉套餐单的酒店名。Set 去重防同名重复计。
-  const hotelNames = Array.from(
+  const hotelNamesFallback = Array.from(
     new Set(
       order.items
         .filter((it) => it.hotelRoomType)
@@ -581,7 +582,9 @@ export function orderToMasterRows(
     return {
       agency,
       notes,
-      hotelName: hotelNames,
+      // 酒店中文名称（乘客行级，0722 财务反馈）：优先该乘客分房组的实际酒店（房控排房结果），
+      // 无分房组 → 回退订单项口径 hotelNamesFallback（现状值），绝不留空。
+      hotelName: resolveExportHotelName(group, hotelNamesFallback),
       chineseName: p.chineseName ?? p.fullName,
       // 称谓（MR/MS/MSTR/MISS）按订单去程（最早 FLIGHT 行出发时间，legs 已按出发时间排序）派生年龄。
       passengerName: nameWithTitle(p, legs[0]?.departureTime ?? null),

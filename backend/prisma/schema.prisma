@@ -1125,6 +1125,10 @@ model OrderItem {
   transferId       String?
   visaId           String?
   bundleId         String?
+  // 按乘客调价（0722 公测反馈）：非空 = 本调整行只作用于该乘客的应收份额（金额明细逐人可解释）；
+  // NULL = 整单调价（现行为不变）。仅对 metadata.priceAdjustment 行有意义；其它商品行一律 NULL。
+  // onDelete: SetNull —— 乘客被清除时不丢金额（差额仍留在 total），只失去归属，绝不静默改动订单总额。
+  passengerId      String?
   metadata         Json?
   // 计费/占房间数（允许 0.5，用于拼房：7 人 3.5 间、1 人占半间）。
   // NULL = 老数据/未显式分房 → 房控按容量算法或 metadata.roomsNeeded 回落。
@@ -1139,9 +1143,11 @@ model OrderItem {
   transfer         Transfer?         @relation(fields: [transferId], references: [id])
   visa             Visa?             @relation(fields: [visaId], references: [id])
   bundle           Bundle?           @relation(fields: [bundleId], references: [id])
+  passenger        Passenger?        @relation(fields: [passengerId], references: [id], onDelete: SetNull)
   fulfillmentTasks FulfillmentTask[]
 
   @@index([orderId])
+  @@index([passengerId])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1281,6 +1287,8 @@ model Passenger {
   updatedAt     DateTime @updatedAt
 
   order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  // 按乘客调价行（0722）：本乘客名下的价格调整 OrderItem（SetNull——清人不丢金额，只失归属）。
+  adjustmentItems OrderItem[]
 
   @@index([orderId])
 }

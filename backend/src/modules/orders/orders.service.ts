@@ -76,6 +76,7 @@ import type {
   CreateOrderBody,
   ListOrdersQuery,
   OrderItemInput,
+  OrderPriceAdjustmentBody,
   PassengerInput,
   PriceAdjustmentInput,
   PublicOrderLookupQuery,
@@ -5468,6 +5469,149 @@ export class OrderService {
       },
     };
   }
+
+  // ════════════════════════════════════════════════════════════════════
+  // 事后调价（POST /orders/:id/price-adjustment · 0722 公测反馈「按乘客调价」）
+  //
+  // 一张多人订单内，给「整单」或「指定乘客」挂一笔结算价差额（正=补收、负=优惠）+原因，走
+  // 与录单调价完全同一路径：追加一条独立 priceAdjustment OrderItem（kind FEE/DISCOUNT），
+  // 金额随该行进入 subtotal/total（订单总额 = 系统价 + Σ调整）。passengerId 非空 = 只作用于
+  // 该乘客的应收份额（金额明细逐人可解释）；空 = 整单调价（现行为不变）。
+  //
+  // 服务端权威定价底线：绝不改任何既有明细行价格，只加差额行 + 审计留痕（reasonCode/经手/时间）。
+  // 资金闸：assertOrderAcceptsFunds —— 已取消/已退款/超时/草稿单不许再抬/降 total（防二次退款）。
+  // 并发：FOR UPDATE 锁订单行后再读 items 重算 total（与补房差同款，杜绝丢失更新）。
+  // ════════════════════════════════════════════════════════════════════
+  async addPriceAdjustment(
+    orderId: string,
+    input: OrderPriceAdjustmentBody,
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
+    order: ReturnType<typeof serializeOrder>;
+    audit: {
+      orderNumber: string;
+      itemId: string;
+      amountCny: number;
+      reasonCode: string;
+      passengerId: string | null;
+      passengerName: string | null;
+      before: { subtotal: string; total: string };
+      after: { subtotal: string; total: string };
+    };
+  }> {
+    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+      throw new ForbiddenError('仅运营/管理员可调整订单价格');
+    }
+    const { amountCny, reasonCode, reasonText } = input;
+    const row = buildPriceAdjustmentItem({ amountCny, reasonCode, reasonText });
+
+    const scratch = await prisma.$transaction(async (tx) => {
+      // 行锁：先锁订单行串行化并发调价，避免两个并发请求各读旧 items、各加一条差额行、
+      // 各按「旧合计 + 一次差额」写 total → 丢失更新（两条行，total 只含一条）。
+      await tx.$queryRaw`SELECT id FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+
+      const order = await tx.order.findUnique({
+        where: { id: orderId },
+        select: {
+          id: true,
+          orderNumber: true,
+          status: true,
+          deletedAt: true,
+          subtotal: true,
+          total: true,
+          adjustments: true,
+          items: { select: { id: true, amount: true } },
+        },
+      });
+      if (!order) throw new NotFoundError('订单不存在');
+      // 资金闸：调价新增/降低差额行会改 order.total —— total 是应退额与取消手续费的计算基数。
+      // 死单（已取消/已退款/支付超时/草稿）若还能调价，等于凭空改动死单应收，可被算出二次退款。
+      assertOrderAcceptsFunds(order);
+
+      // passengerId 归属校验：非空必须属于本单，否则 400（不接受跨单/不存在的乘客）。
+      let passengerName: string | null = null;
+      if (input.passengerId) {
+        const pax = await tx.passenger.findUnique({
+          where: { id: input.passengerId },
+          select: { id: true, orderId: true, fullName: true },
+        });
+        if (!pax || pax.orderId !== orderId) {
+          throw new BadRequestError('指定的乘客不存在或不属于本订单');
+        }
+        passengerName = pax.fullName;
+      }
+
+      // ── 1. 追加一条 priceAdjustment 差额行（passengerId 非空 = 该乘客名下；空 = 整单）──
+      const created = await tx.orderItem.create({
+        data: {
+          orderId,
+          kind: row.kind,
+          description: row.description,
+          quantity: 1,
+          unitPrice: new Prisma.Decimal(row.unitPrice),
+          amount: new Prisma.Decimal(row.amount),
+          metadata: row.metadata as Prisma.InputJsonValue,
+          passengerId: input.passengerId ?? null,
+        },
+      });
+
+      // ── 2. 用所有既有行 + 新行重算 subtotal/total（当前无 taxes/discount，total = subtotal）──
+      const newSubtotal = round2(
+        order.items.reduce((sum, it) => sum + Number(it.amount.toString()), 0) + amountCny,
+      );
+      const newTotal = newSubtotal;
+
+      // ── 3. 审计流水（appendAdjustment；仅记录用，钱走上面的 total，不进 adjustmentCny）──
+      const log = appendAdjustment(order.adjustments, {
+        type: 'PRICE_ADJUSTMENT',
+        label: row.description,
+        amountCny,
+        at: new Date().toISOString(),
+        by: actor.userId,
+        reasonCode,
+        note: reasonText?.trim() || undefined,
+        ...(input.passengerId ? { passengerId: input.passengerId } : {}),
+      });
+
+      await tx.order.update({
+        where: { id: orderId },
+        data: {
+          subtotal: new Prisma.Decimal(newSubtotal),
+          total: new Prisma.Decimal(newTotal),
+          adjustments: log,
+        },
+      });
+
+      return {
+        orderNumber: order.orderNumber,
+        itemId: created.id,
+        passengerName,
+        beforeSubtotal: order.subtotal.toString(),
+        beforeTotal: order.total.toString(),
+        afterSubtotal: newSubtotal.toString(),
+        afterTotal: newTotal.toString(),
+      };
+    });
+
+    const finalOrder = await prisma.order.findUniqueOrThrow({
+      where: { id: orderId },
+      include: ORDER_FULL_INCLUDE,
+    });
+
+    return {
+      order: serializeOrder(finalOrder, orderSerializeRoleCtx(actor.role)),
+      audit: {
+        orderNumber: scratch.orderNumber,
+        itemId: scratch.itemId,
+        amountCny,
+        reasonCode,
+        passengerId: input.passengerId ?? null,
+        passengerName: scratch.passengerName,
+        before: { subtotal: scratch.beforeSubtotal, total: scratch.beforeTotal },
+        after: { subtotal: scratch.afterSubtotal, total: scratch.afterTotal },
+      },
+    };
+  }
 }
 
 // 完整 include 给 serializeOrder 用
@@ -6281,14 +6425,76 @@ export async function releaseSeatFloored(
 
 /** 一条售后费用流水（写入 Order.adjustments）。 */
 export interface OrderAdjustmentEntry {
-  type: 'RESCHEDULE_FEE' | 'SWAP_FEE' | 'SWAP_VISA_DEDUCT_REVERSAL' | string;
+  type: 'RESCHEDULE_FEE' | 'SWAP_FEE' | 'SWAP_VISA_DEDUCT_REVERSAL' | 'PRICE_ADJUSTMENT' | string;
   label: string;
   amountCny: number;
   at: string; // ISO 时间
   by: string | null; // 操作人 userId
   note?: string;
-  /** 关联出行人（SWAP_VISA_DEDUCT_REVERSAL 幂等去重用：同一乘客的自备签减免只冲一次）。 */
+  /** 关联出行人（SWAP_VISA_DEDUCT_REVERSAL 幂等去重、PRICE_ADJUSTMENT 按乘客调价用；整单调价为空）。 */
   passengerId?: string;
+  /** 调价原因码（仅 PRICE_ADJUSTMENT 流水带；财务四类 DISCOUNT/MISC_FEE/CHANGE/OTHER）。 */
+  reasonCode?: string;
+}
+
+/**
+ * 按乘客把「价格调整」商品行分组（0722 公测反馈「金额明细逐人可解释」）。纯函数、导出供单测。
+ *
+ * 只认 metadata.priceAdjustment === true 的行（录单调价 / 事后调价 / 结算价差额 / 补房差都打了这个标）；
+ * 其它商品行（机票/酒店/套餐基础价）一律忽略。按行的 passengerId 分桶：
+ *   - byPassenger[pid] = 该乘客名下所有调整行 + 净额（Σamount，可正可负）；
+ *   - wholeOrder       = passengerId 为空的整单调整行 + 净额（现行为不变）。
+ * 「订单总额 = 系统价 + Σ调整」是既有口径（这些行本就计入 subtotal/total）；本函数只做展示层分组，
+ * 不改任何金额，故与整单调价同一真值（把每行金额如实归到某乘客或整单）。
+ */
+export interface AdjustmentLine {
+  itemId: string;
+  amountCny: number;
+  reasonCode: string | null;
+  description: string;
+  passengerId: string | null;
+}
+export function groupPassengerAdjustments(
+  items: ReadonlyArray<{
+    id: string;
+    amount: number;
+    description: string;
+    passengerId?: string | null;
+    metadata?: unknown;
+  }>,
+): {
+  byPassenger: Record<string, { lines: AdjustmentLine[]; netCny: number }>;
+  wholeOrder: { lines: AdjustmentLine[]; netCny: number };
+} {
+  const byPassenger: Record<string, { lines: AdjustmentLine[]; netCny: number }> = {};
+  const wholeOrder = { lines: [] as AdjustmentLine[], netCny: 0 };
+  for (const it of items) {
+    const md = it.metadata;
+    const isAdjust =
+      md != null && typeof md === 'object' && (md as { priceAdjustment?: unknown }).priceAdjustment === true;
+    if (!isAdjust) continue;
+    const reasonCode =
+      md != null && typeof md === 'object' && typeof (md as { reasonCode?: unknown }).reasonCode === 'string'
+        ? ((md as { reasonCode: string }).reasonCode)
+        : null;
+    const line: AdjustmentLine = {
+      itemId: it.id,
+      amountCny: it.amount,
+      reasonCode,
+      description: it.description,
+      passengerId: it.passengerId ?? null,
+    };
+    if (line.passengerId) {
+      const bucket = byPassenger[line.passengerId] ?? { lines: [], netCny: 0 };
+      bucket.lines.push(line);
+      bucket.netCny = round2(bucket.netCny + line.amountCny);
+      byPassenger[line.passengerId] = bucket;
+    } else {
+      wholeOrder.lines.push(line);
+      wholeOrder.netCny = round2(wholeOrder.netCny + line.amountCny);
+    }
+  }
+  return { byPassenger, wholeOrder };
 }
 
 /**

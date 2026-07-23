@@ -701,6 +701,8 @@ export interface OrderItem {
   bundleId?: string | null;
   /** 计费房间数（支持 0.5 间拼房）；未联查/未盖章为 null */
   roomsBilled?: number | null;
+  /** 按乘客调价（0722）：非空 = 本 priceAdjustment 差额行只作用于该乘客；NULL = 整单调价。 */
+  passengerId?: string | null;
   metadata: unknown;
   createdAt: string;
   // 列表带出的履约任务（仅 type+status），用于派生「签证状态」「出票状态」
@@ -2565,6 +2567,29 @@ export const api = {
     },
   ) =>
     apiFetch<{ order: OrderSummary; roomControl: string | null }>(`/orders/${orderId}/room-supplement`, {
+      method: 'POST',
+      token,
+      body,
+    }),
+
+  // 事后调价（0722 公测反馈「按乘客调价」；ADMIN/STAFF）：在系统权威价上加减一笔差额 + 原因。
+  //   passengerId 非空 = 只作用于该乘客的应收份额（金额明细逐人可解释）；空 = 整单调价（现行为不变）。
+  //   走与录单调价同一路径：后端追加一条 priceAdjustment 差额行，金额进 total（订单总额 = 系统价 + Σ调整）。
+  //   返回更新后的订单。
+  addOrderPriceAdjustment: (
+    token: string,
+    orderId: string,
+    body: {
+      /** 整数 CNY，可正（补收）可负（优惠），非 0；|金额| ≤ 100000。 */
+      amountCny: number;
+      reasonCode: PriceAdjustmentReason;
+      /** 「其它」原因必填说明。 */
+      reasonText?: string;
+      /** 指定乘客（属于本单）；不传 = 整单调价。 */
+      passengerId?: string;
+    },
+  ) =>
+    apiFetch<{ order: OrderSummary }>(`/orders/${orderId}/price-adjustment`, {
       method: 'POST',
       token,
       body,

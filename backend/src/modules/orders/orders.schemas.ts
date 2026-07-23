@@ -75,25 +75,45 @@ export const PRICE_ADJUSTMENT_REASON_LABEL: Record<PriceAdjustmentReasonDisplay,
   SETTLEMENT: '代理结算价',
 };
 
+// 调价金额校验（录单调价与「按乘客/整单事后调价」共用同一口径，避免两处漂移）：
+//   可正（加钱）可负（减价），整数 CNY；0 无意义（不调整就别传该字段）；|金额| ≤ 上限。
+const priceAdjustmentAmountSchema = z
+  .number()
+  .int('调整金额必须为整数（CNY）')
+  .refine((v) => v !== 0, { message: '调整金额不能为 0（不调整请勿传该字段）' })
+  .refine((v) => Math.abs(v) <= PRICE_ADJUSTMENT_CAP_CNY, {
+    message: `调整金额超出上限（±${PRICE_ADJUSTMENT_CAP_CNY}）`,
+  });
+
+// 「其它」必须补一句文本，避免出现无从追溯的匿名调价。录单调价与事后调价共用同一 refine。
+const requireReasonTextForOther = (v: { reasonCode: string; reasonText?: string }): boolean =>
+  v.reasonCode !== 'OTHER' || Boolean(v.reasonText?.trim());
+const REASON_TEXT_REQUIRED_MSG: { message: string; path: (string | number)[] } = {
+  message: '选择「其它」时必须填写调整原因说明',
+  path: ['reasonText'],
+};
+
 export const priceAdjustmentSchema = z
   .object({
-    // 可正（加钱）可负（减价），整数 CNY；0 无意义（不调整就别传该字段）。
-    amountCny: z
-      .number()
-      .int('调整金额必须为整数（CNY）')
-      .refine((v) => v !== 0, { message: '调整金额不能为 0（不调整请勿传该字段）' })
-      .refine((v) => Math.abs(v) <= PRICE_ADJUSTMENT_CAP_CNY, {
-        message: `调整金额超出上限（±${PRICE_ADJUSTMENT_CAP_CNY}）`,
-      }),
+    amountCny: priceAdjustmentAmountSchema,
     reasonCode: z.enum(PRICE_ADJUSTMENT_REASON),
     reasonText: z.string().max(200).optional(),
   })
-  // 「其它」必须补一句文本，避免出现无从追溯的匿名调价。
-  .refine((v) => v.reasonCode !== 'OTHER' || Boolean(v.reasonText?.trim()), {
-    message: '选择「其它」时必须填写调整原因说明',
-    path: ['reasonText'],
-  });
+  .refine(requireReasonTextForOther, REASON_TEXT_REQUIRED_MSG);
 export type PriceAdjustmentInput = z.infer<typeof priceAdjustmentSchema>;
+
+// 事后调价（POST /orders/:id/price-adjustment · 0722 公测反馈「按乘客调价」）：
+//   在录单调价四类原因基础上，加一个可空 passengerId —— 非空 = 只作用于该乘客的应收份额，
+//   空 = 整单调价（与录单整单调价同口径）。passengerId 归属本单由 service 层校验（不在此断言）。
+export const orderPriceAdjustmentBodySchema = z
+  .object({
+    amountCny: priceAdjustmentAmountSchema,
+    reasonCode: z.enum(PRICE_ADJUSTMENT_REASON),
+    reasonText: z.string().max(200).optional(),
+    passengerId: z.string().min(1).optional(),
+  })
+  .refine(requireReasonTextForOther, REASON_TEXT_REQUIRED_MSG);
+export type OrderPriceAdjustmentBody = z.infer<typeof orderPriceAdjustmentBodySchema>;
 
 // ── 订单级签证状态 + 结构化备注四栏（录单/编辑共用）─────────────────────────
 // 全部 optional：老客户端不传则字段留空，与旧行为一致。每栏限 ~300 字。

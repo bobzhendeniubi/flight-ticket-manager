@@ -154,6 +154,38 @@ export function parseRoomGroups(roomAssignment: unknown): RoomGroup[] {
   );
 }
 
+/**
+ * 导出「酒店中文名称」列（乘客行级）取数（0722 财务反馈：导出酒店名与房控实际数据相连，
+ * 省去人工匹配客户入住酒店的步骤）。优先级：
+ *   1. 该乘客所在分房组的实际酒店 group.hotelName —— 房控人工排房结果（可能是自由文本），
+ *      原样返回、不做匹配清洗（房控换过酒店时，导出跟房控走）；
+ *   2. 无分房组 / 分房组没填酒店名 → 回退订单项酒店口径 fallbackHotelName（录单时选的房型所属
+ *      酒店，现状值），绝不留空。
+ * group.hotelName 仅用 trim 判空（判它到底填没填），采用时用原值。
+ */
+export function resolveExportHotelName(
+  group: RoomGroup | undefined,
+  fallbackHotelName: string,
+): string {
+  const fromRoomControl = group?.hotelName;
+  return fromRoomControl && fromRoomControl.trim() ? fromRoomControl : fallbackHotelName;
+}
+
+/**
+ * 导出「酒店类型」列（= 酒店名 + 房型，乘客行级）取数。与 resolveExportHotelName 同一优先级，
+ * 但本列含房型：乘客在分房组内时，酒店名与房型**都**取分房组的（group.hotelName + group.roomType，
+ * 房控排房结果，原样不清洗；组内房型为空则只出酒店名）；无分房组 / 分房组没填酒店名 → 回退订单项
+ * 口径 fallbackHotelInfo（现状「酒店名 房型名」拼串），绝不留空。
+ */
+export function resolveExportHotelInfo(
+  group: RoomGroup | undefined,
+  fallbackHotelInfo: string,
+): string {
+  const hotelName = group?.hotelName;
+  if (!hotelName || !hotelName.trim()) return fallbackHotelInfo;
+  return [hotelName, group?.roomType].filter((s): s is string => !!s && !!s.trim()).join(' ');
+}
+
 export type RoomItemForExport = Prisma.OrderItemGetPayload<{
   include: {
     hotelRoomType: {

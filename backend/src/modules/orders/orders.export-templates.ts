@@ -24,7 +24,7 @@ import {
 import { buildOrderFilterWhere } from './orders.service.js';
 import { filterExportOrdersByDepartDate } from './orders.export-depart-filter.js';
 import { determineFlightLegs } from './ticketing-cap.js';
-import { parseRoomGroups } from './orders.export-room-allocation.js';
+import { parseRoomGroups, resolveExportHotelInfo } from './orders.export-room-allocation.js';
 import type { ExportTemplatesQuery } from './orders.schemas.js';
 
 export type OrderExportTemplate = ExportTemplatesQuery['template'];
@@ -516,7 +516,9 @@ export function orderToFullRows(order: OrderForTemplateExport, ctx: OrderContext
     isOriginalOrder: '',
     agency: ctx.agency,
     notes,
-    hotelInfo: ctx.hotelInfo,
+    // 酒店类型（乘客行级，0722 财务反馈）：优先该乘客分房组的酒店名+房型（房控排房结果，
+    // 房型也跟房控），无分房组 → 回退订单项口径 ctx.hotelInfo（现状值），绝不留空。
+    hotelInfo: resolveExportHotelInfo(group, ctx.hotelInfo),
     chineseName: p.chineseName ?? p.fullName,
     passengerName: nameWithTitle(p, departureDate),
     cleanName: pnrName(p),
@@ -680,6 +682,8 @@ export function visaSupplierOf(order: OrderForTemplateExport): string {
 
 export function orderToVisaRows(order: OrderForTemplateExport, ctx: OrderContext): Omit<VisaRow, 'stt'>[] {
   const visaSupplier = visaSupplierOf(order);
+  // 分房组（0722 财务反馈）：酒店类型列按乘客所在分房组的实际酒店取，与《全岗可用》同口径。
+  const roomGroups = parseRoomGroups(order.roomAssignment);
   // 自备签乘客（visaExempt=true）不进送签名单：客人已自行办妥签证，无需送签——与签证台
   // 同口径（backend/src/modules/fulfillment/fulfillment.service.ts 的 listByOrder 同样过滤
   // passengers 时排除 visaExempt=true）。此函数是「签证专用」模板导出 + 签证批量合并名单
@@ -687,10 +691,14 @@ export function orderToVisaRows(order: OrderForTemplateExport, ctx: OrderContext
   // 金额仍按订单全部乘客均摊（ctx.paxCount 不受影响）——只影响谁出现在名单里。
   return order.passengers
     .filter((p) => p.visaExempt !== true)
-    .map<Omit<VisaRow, 'stt'>>((p) => ({
+    .map<Omit<VisaRow, 'stt'>>((p) => {
+    const group = roomGroups.find((g) => g.passengerIds.includes(p.id));
+    return {
     agency: ctx.agency,
     notes: ctx.notes,
-    hotelInfo: ctx.hotelInfo,
+    // 酒店类型（乘客行级，0722 财务反馈）：优先该乘客分房组的酒店名+房型（房控），
+    // 无分房组 → 回退订单项口径 ctx.hotelInfo（现状值），绝不留空。
+    hotelInfo: resolveExportHotelInfo(group, ctx.hotelInfo),
     visaNote: '',
     settlePrice: ctx.settlePerPax,
     paidAmount: ctx.paidPerPax,
@@ -711,7 +719,8 @@ export function orderToVisaRows(order: OrderForTemplateExport, ctx: OrderContext
     issueDate: fmtDateDMYDash(p.passportIssueDate),
     expiryDate: fmtDateDMYDash(p.passportExpiry),
     departDate: ctx.travelDates,
-  }));
+    };
+  });
 }
 
 // ── 主入口 ──────────────────────────────────────────────────────────────

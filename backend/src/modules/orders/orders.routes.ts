@@ -18,6 +18,7 @@ import {
   changeOrderAgentBodySchema,
   changeRequestBodySchema,
   createOrderBodySchema,
+  orderPriceAdjustmentBodySchema,
   roomSupplementBodySchema,
   exportRoomAllocationQuerySchema,
   exportTemplatesQuerySchema,
@@ -1728,6 +1729,45 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       severity: 'WARNING',
     });
     return { order, roomControl: audit.roomControl };
+  });
+
+  // ── 事后调价（0722 公测反馈「按乘客调价」；ADMIN/STAFF）──
+  // POST /orders/:id/price-adjustment
+  //   body: { amountCny: int≠0（正=补收/负=优惠）, reasonCode: DISCOUNT|MISC_FEE|CHANGE|OTHER,
+  //           reasonText?: string, passengerId?: string }
+  //   passengerId 非空 = 只作用于该乘客的应收份额（金额明细逐人可解释）；空 = 整单调价（现行为不变）。
+  //   走与录单调价同一路径：追加一条 priceAdjustment 差额行，金额进 subtotal/total（订单总额 = 系统价 + Σ调整）。
+  app.post('/:id/price-adjustment', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅运营/管理员可调整订单价格' });
+    }
+    const { id } = req.params as { id: string };
+    const body = orderPriceAdjustmentBodySchema.parse(req.body);
+    const { order, audit } = await service.addPriceAdjustment(id, body, {
+      userId: req.user.sub,
+      role,
+    });
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'ADD_ORDER_PRICE_ADJUSTMENT',
+      targetType: 'ORDER',
+      targetId: id,
+      targetLabel: audit.orderNumber,
+      before: { subtotal: audit.before.subtotal, total: audit.before.total },
+      after: {
+        subtotal: audit.after.subtotal,
+        total: audit.after.total,
+        amountCny: audit.amountCny,
+        reasonCode: audit.reasonCode,
+        // 归属乘客（整单调价为 null）；只记 id/姓名用于审计可读，不落证件级敏感数据。
+        passengerId: audit.passengerId,
+        passengerName: audit.passengerName,
+        itemId: audit.itemId,
+      },
+      severity: 'WARNING',
+    });
+    return { order };
   });
 };
 

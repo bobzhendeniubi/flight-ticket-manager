@@ -490,6 +490,41 @@ describe('orderToMasterRows', () => {
   });
 });
 
+// ── 酒店中文名称跟房控实际数据（0722 财务反馈）────────────────────────────────
+// 「酒店中文名称」列改乘客行级：优先该乘客分房组的实际酒店（房控人工排房结果，房控换过酒店
+// 也照房控走），无分房组回退订单项酒店口径（录单时选的房型所属酒店，现状值），绝不留空。
+describe('酒店中文名称跟房控实际数据（乘客行级）', () => {
+  it('乘客有分房组 → 取房控分房组酒店（与订单项酒店不同也跟房控）；无分房组乘客回退订单项酒店', () => {
+    const order = fixtureRoundTripBundle();
+    // 房控把 p1 排到了「椰林湾度假村」；订单项酒店仍是录单时选的「明月酒店」
+    (order as unknown as { roomAssignment: unknown }).roomAssignment = {
+      roomGroups: [
+        { id: 'g1', hotelName: '椰林湾度假村', roomType: '海景大床', passengerIds: ['p1'], notes: '蜜月' },
+      ],
+    };
+    const [r1, r2] = orderToMasterRows(order);
+    expect(r1.hotelName).toBe('椰林湾度假村'); // p1 跟房控
+    expect(r2.hotelName).toBe('明月酒店'); // p2 无分房组 → 回退订单项酒店
+  });
+
+  it('乘客无任何分房记录 → 回退订单项酒店口径（保持现状，绝不留空）', () => {
+    const order = fixtureRoundTripBundle();
+    (order as unknown as { roomAssignment: unknown }).roomAssignment = null;
+    const [r1, r2] = orderToMasterRows(order);
+    expect(r1.hotelName).toBe('明月酒店');
+    expect(r2.hotelName).toBe('明月酒店');
+  });
+
+  it('分房组酒店名为自由文本（房控手输）→ 原样使用不做匹配清洗', () => {
+    const order = fixtureRoundTripBundle();
+    (order as unknown as { roomAssignment: unknown }).roomAssignment = {
+      roomGroups: [{ id: 'g1', hotelName: '岘港 A酒店(待定/换房中)', roomType: '', passengerIds: ['p1'] }],
+    };
+    const [r1] = orderToMasterRows(order);
+    expect(r1.hotelName).toBe('岘港 A酒店(待定/换房中)');
+  });
+});
+
 describe('visibleColumns（role 裁列）', () => {
   it('all（默认）= 全部列，含结算价格/分房情况/订单成本/酒店中文名称', () => {
     const headers = visibleColumns('all').map((c) => c.header);
