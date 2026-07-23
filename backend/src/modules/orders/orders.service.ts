@@ -412,6 +412,7 @@ export function buildPriceAdjustmentItem(adj: PriceAdjustmentInput): {
   quantity: number;
   unitPrice: number;
   amount: number;
+  totalCostCny: number;
   metadata: Record<string, unknown>;
 } {
   const label = PRICE_ADJUSTMENT_REASON_LABEL[adj.reasonCode];
@@ -424,6 +425,9 @@ export function buildPriceAdjustmentItem(adj: PriceAdjustmentInput): {
     quantity: 1,
     unitPrice: adj.amountCny,
     amount: adj.amountCny,
+    // 纯价格调整行无成本侧（优惠/补收杂费/调价都不产生采购成本）→ 显式落 0，不留 NULL。
+    // 留 NULL 会被毛利明细当「缺成本」，把整单毛利拖成「未知」，污染财务视图。
+    totalCostCny: 0,
     metadata: {
       priceAdjustment: true,
       reasonCode: adj.reasonCode,
@@ -452,6 +456,7 @@ export function buildSettlementTotalItem(input: {
   quantity: number;
   unitPrice: number;
   amount: number;
+  totalCostCny: number;
   metadata: Record<string, unknown>;
 } {
   const signed = `${input.diffCny > 0 ? '+' : '−'}¥${Math.abs(input.diffCny)}`;
@@ -461,6 +466,8 @@ export function buildSettlementTotalItem(input: {
     quantity: 1,
     unitPrice: input.diffCny,
     amount: input.diffCny,
+    // 结算价差额行是纯价格调整（把整单收敛到谈定价），无成本侧 → 显式落 0，不留 NULL。
+    totalCostCny: 0,
     metadata: {
       priceAdjustment: true,
       reasonCode: 'SETTLEMENT',
@@ -522,6 +529,67 @@ export function buildRoomSupplementItem(input: {
       nights: input.nights,
       note: note ?? null,
     },
+  };
+}
+
+/** 补房差/换酒店成本口径：每晚成本取值来源（供 metadata.costSource 与审计留痕）。 */
+export type RoomCostSource = 'ITEM_SNAPSHOT' | 'PRODUCT' | 'ZERO';
+
+/**
+ * 补收单房差 FEE 行的成本口径（毛利真账）：新增计费房数 × 每晚成本 × 晚数。
+ *   - 新增计费房数 addedRooms = 新旧 roomsBilled 之差（≤0 = 本次只收差价不增房 → 成本 0）。
+ *   - 晚数 nights 与建行描述「¥X/晚 × N晚」的 N 同源（都来自补收入参）。
+ *   - 每晚成本三级回退：① 该单酒店/套餐行下单时的成本快照 unitCostCny（每间每晚）
+ *     → ② 现行房型产品 costPriceCny → ③ 都没有 = 0（如实报 0，不虚构成本）。
+ *   - costSource 记来源；addedRooms≤0 或无任何成本数据 → 'ZERO'。
+ * 纯函数，导出供单测复用（三级回退 + 增房差 + 无增房归零）。
+ */
+export function resolveRoomSupplementCost(input: {
+  /** 订单行下单时的每间每晚成本快照（HOTEL 行有；BUNDLE 行建单未快照 → null）。 */
+  snapshotUnitCostCny?: number | null;
+  /** 现行房型产品成本价（回退口径）。 */
+  productCostPriceCny?: number | null;
+  nights: number;
+  addedRooms: number;
+}): { totalCostCny: number; costSource: RoomCostSource } {
+  if (input.addedRooms <= 0) return { totalCostCny: 0, costSource: 'ZERO' };
+  let perNight: number;
+  let costSource: RoomCostSource;
+  if (input.snapshotUnitCostCny != null) {
+    perNight = input.snapshotUnitCostCny;
+    costSource = 'ITEM_SNAPSHOT';
+  } else if (input.productCostPriceCny != null) {
+    perNight = input.productCostPriceCny;
+    costSource = 'PRODUCT';
+  } else {
+    perNight = 0;
+    costSource = 'ZERO';
+  }
+  return {
+    totalCostCny: Math.round(perNight * input.nights * input.addedRooms),
+    costSource,
+  };
+}
+
+/**
+ * 换酒店后 HOTEL 行成本重打快照（毛利真账）：按新房型成本价重算，口径对齐建单时的
+ * HOTEL 行快照公式（unitCostCny = 每间每晚成本；totalCostCny = 每间每晚 × 晚数 × 房数）。
+ *   - 新房型未录成本价（costPriceCny 为 NULL）→ 两栏都写 null（真缺数据，如实报缺，不落 0 虚高）。
+ *   - BUNDLE 行不适用（建单时未快照酒店成本，且其 quantity≠晚数、totalCostCny 覆盖整包）——
+ *     由调用方跳过，本函数只服务 HOTEL 行。
+ * 纯函数，导出供单测复用（重算 + null 语义）。
+ */
+export function computeSwapHotelCostSnapshot(input: {
+  newCostPriceCny?: number | null;
+  /** 晚数（HOTEL 行 quantity）。 */
+  nights: number;
+  /** 计费房数（roomsBilled，支持 0.5 间）。 */
+  rooms: number;
+}): { unitCostCny: number | null; totalCostCny: number | null } {
+  if (input.newCostPriceCny == null) return { unitCostCny: null, totalCostCny: null };
+  return {
+    unitCostCny: input.newCostPriceCny,
+    totalCostCny: Math.round(input.newCostPriceCny * input.nights * input.rooms),
   };
 }
 
@@ -1005,7 +1073,7 @@ export class OrderService {
    */
   private async applyPassportExpiryRule(
     body: CreateOrderBody,
-    pricedItems: Array<{ kind: OrderItemKind; description: string; quantity: number; unitPrice: number; amount: number }>,
+    pricedItems: Array<{ kind: OrderItemKind; description: string; quantity: number; unitPrice: number; amount: number; totalCostCny?: number }>,
   ): Promise<void> {
     const scheduleIds = body.items
       .filter((i): i is Extract<OrderItemInput, { kind: 'FLIGHT' }> => i.kind === 'FLIGHT')
@@ -1046,6 +1114,8 @@ export class OrderService {
         quantity: surchargeCount,
         unitPrice: NEAR_EXPIRY_SURCHARGE_CNY,
         amount: NEAR_EXPIRY_SURCHARGE_CNY * surchargeCount,
+        // 纯附加费行，无采购成本 → 显式落 0，不留 NULL（避免拖累毛利明细报「缺成本」）。
+        totalCostCny: 0,
       });
     }
   }
@@ -4912,8 +4982,20 @@ export class OrderService {
     audit: {
       orderNumber: string;
       orderItemId: string;
-      before: { hotelRoomTypeId: string | null; hotelName: string | null; roomTypeName: string | null };
-      after: { hotelRoomTypeId: string; hotelName: string; roomTypeName: string };
+      before: {
+        hotelRoomTypeId: string | null;
+        hotelName: string | null;
+        roomTypeName: string | null;
+        unitCostCny: number | null;
+        totalCostCny: number | null;
+      };
+      after: {
+        hotelRoomTypeId: string;
+        hotelName: string;
+        roomTypeName: string;
+        unitCostCny: number | null;
+        totalCostCny: number | null;
+      };
       feeCny: number;
       untrackedNights: string[];
     };
@@ -4935,6 +5017,9 @@ export class OrderService {
         hotelCheckIn: true,
         hotelCheckOut: true,
         roomsBilled: true,
+        // 换酒店前的成本快照（审计 before / 保留 BUNDLE 行原值不动的依据）。
+        unitCostCny: true,
+        totalCostCny: true,
       },
     });
     if (!item || item.orderId !== orderId) {
@@ -4957,7 +5042,14 @@ export class OrderService {
       }),
       prisma.hotelRoomType.findUnique({
         where: { id: input.newHotelRoomTypeId },
-        select: { id: true, name: true, hotelId: true, hotel: { select: { name: true, isActive: true } } },
+        select: {
+          id: true,
+          name: true,
+          hotelId: true,
+          // 新房型成本价 → 重打 HOTEL 行成本快照（每间每晚 × 晚数 × 房数）。
+          costPriceCny: true,
+          hotel: { select: { name: true, isActive: true } },
+        },
       }),
     ]);
     if (!newRoomType) throw new NotFoundError(`酒店房型 ${input.newHotelRoomTypeId} 不存在`);
@@ -4966,6 +5058,24 @@ export class OrderService {
 
     // ── 逐晚余量校验（仅跨酒店换房时才需要；同酒店换房型净房量不变，不受本单占用影响）──
     const roomsBilled = item.roomsBilled != null ? Number(item.roomsBilled) : 1;
+
+    // ── HOTEL 行成本重打快照（Task B）：按新房型成本价 × 晚数(quantity) × 房数(roomsBilled)，
+    // 口径对齐建单时的 HOTEL 行快照公式。新房型无成本价 → null（真缺数据，如实报缺）。
+    // BUNDLE 行不重算（建单时未快照酒店成本，其 quantity≠晚数、totalCostCny 覆盖整包）→ 原值不动。
+    const swapCost =
+      item.kind === OrderItemKind.HOTEL
+        ? computeSwapHotelCostSnapshot({
+            newCostPriceCny:
+              newRoomType.costPriceCny != null ? Number(newRoomType.costPriceCny.toString()) : null,
+            nights: item.quantity,
+            rooms: roomsBilled,
+          })
+        : null;
+    // 换酒店前后的成本快照（审计留痕）。BUNDLE 行 after === before（不动）。
+    const beforeUnitCostCny = item.unitCostCny != null ? Number(item.unitCostCny.toString()) : null;
+    const beforeTotalCostCny = item.totalCostCny != null ? Number(item.totalCostCny.toString()) : null;
+    const afterUnitCostCny = swapCost ? swapCost.unitCostCny : beforeUnitCostCny;
+    const afterTotalCostCny = swapCost ? swapCost.totalCostCny : beforeTotalCostCny;
     const nightDates =
       item.hotelCheckIn && item.hotelCheckOut
         ? buildStayNightDates(item.hotelCheckIn, item.hotelCheckOut)
@@ -5045,9 +5155,21 @@ export class OrderService {
       }
 
       // ── 1. 更新订单行（只换房型引用 + 重建 description；金额/数量/日期/间数一律冻结）──
+      // 成本快照按新房型重打（仅 HOTEL 行；售价/金额一个字不动，只改成本侧的毛利真账）。
       await tx.orderItem.update({
         where: { id: item.id },
-        data: { hotelRoomTypeId: newRoomType.id, description: newDescription },
+        data: {
+          hotelRoomTypeId: newRoomType.id,
+          description: newDescription,
+          ...(swapCost
+            ? {
+                unitCostCny:
+                  swapCost.unitCostCny != null ? new Prisma.Decimal(swapCost.unitCostCny) : null,
+                totalCostCny:
+                  swapCost.totalCostCny != null ? new Prisma.Decimal(swapCost.totalCostCny) : null,
+              }
+            : {}),
+        },
       });
 
       // ── 2. 可选换酒店差价（adjustmentCny + adjustments 流水，与改期费同机制）──
@@ -5167,11 +5289,15 @@ export class OrderService {
           hotelRoomTypeId: item.hotelRoomTypeId,
           hotelName: oldRoomType.hotel.name,
           roomTypeName: oldRoomType.name,
+          unitCostCny: beforeUnitCostCny,
+          totalCostCny: beforeTotalCostCny,
         },
         after: {
           hotelRoomTypeId: newRoomType.id,
           hotelName: newRoomType.hotel.name,
           roomTypeName: newRoomType.name,
+          unitCostCny: afterUnitCostCny,
+          totalCostCny: afterTotalCostCny,
         },
         feeCny,
         untrackedNights,
@@ -5402,6 +5528,10 @@ export class OrderService {
       // 按权威公式重算。房控销控板/分房/超卖提醒全是派生账（每次现查订单），这两个字段
       // 一更新即自动跟上 —— 房量不够时提醒线会自动亮「该加房」，无需在此另设闸。
       let roomControl: string | null = null;
+      // 补房差 FEE 行的成本口径（毛利真账）：默认 0（无增房 = 只收差价不产生房成本）。
+      // 仅在套餐行计费房数真正上调（新增房间）时，按每晚成本 × 晚数 × 新增房数落实成本。
+      let feeTotalCostCny = 0;
+      let feeCostSource: RoomCostSource = 'ZERO';
       if (input.passengerId) {
         const pax = await tx.passenger.findUnique({
           where: { id: input.passengerId },
@@ -5428,10 +5558,12 @@ export class OrderService {
             id: true,
             metadata: true,
             roomsBilled: true,
+            // 下单时的每间每晚成本快照（BUNDLE 行建单未快照 → null，回退现行房型成本价）。
+            unitCostCny: true,
             bundle: {
               select: {
                 hotelRoomTypeId: true,
-                hotelRoomType: { select: { maxAdults: true, maxChildren: true } },
+                hotelRoomType: { select: { maxAdults: true, maxChildren: true, costPriceCny: true } },
               },
             },
           },
@@ -5456,6 +5588,21 @@ export class OrderService {
               where: { id: bundleItem.id },
               data: { roomsBilled: new Prisma.Decimal(roomsCharged) },
             });
+            // 新增计费房数 = 新旧 roomsBilled 之差（旧值未设时保守取 0，基线未知不虚构成本）。
+            // 每晚成本三级回退：套餐行下单快照 → 现行房型成本价 → 0。晚数与描述里的 N 同源。
+            const addedRooms = before == null ? 0 : Math.max(0, roomsCharged - before);
+            const resolvedCost = resolveRoomSupplementCost({
+              snapshotUnitCostCny:
+                bundleItem.unitCostCny != null ? Number(bundleItem.unitCostCny.toString()) : null,
+              productCostPriceCny:
+                bundleItem.bundle.hotelRoomType?.costPriceCny != null
+                  ? Number(bundleItem.bundle.hotelRoomType.costPriceCny.toString())
+                  : null,
+              nights,
+              addedRooms,
+            });
+            feeTotalCostCny = resolvedCost.totalCostCny;
+            feeCostSource = resolvedCost.costSource;
             roomControl += `；套餐行计费房数 ${before ?? '未设'} → ${roomsCharged}（房控/分房自动跟进）`;
           } else {
             roomControl += `；计费房数维持 ${before}（权威重算 ${roomsCharged} 未超过现值，只升不降）`;
@@ -5465,7 +5612,9 @@ export class OrderService {
         }
       }
 
-      // ── 1. 新增一条 FEE 调整行（描述含 ¥X/晚 × N晚，metadata 记 perNightCny/nights）──
+      // ── 1. 新增一条 FEE 调整行（描述含 ¥X/晚 × N晚，metadata 记 perNightCny/nights + costSource）──
+      // 成本口径（Task A）：新增计费房数 × 每晚成本 × 晚数，随行落 totalCostCny（毛利真账）。
+      // 无增房或无成本数据 → 0，costSource='ZERO'。原酒店/套餐行的成本快照一个字不动。
       const created = await tx.orderItem.create({
         data: {
           orderId,
@@ -5474,7 +5623,8 @@ export class OrderService {
           quantity: 1,
           unitPrice: new Prisma.Decimal(row.unitPrice),
           amount: new Prisma.Decimal(row.amount),
-          metadata: row.metadata as Prisma.InputJsonValue,
+          totalCostCny: new Prisma.Decimal(feeTotalCostCny),
+          metadata: { ...row.metadata, costSource: feeCostSource } as Prisma.InputJsonValue,
           idempotencyKey: input.idempotencyKey ?? null,
         },
       });
@@ -5610,6 +5760,7 @@ export class OrderService {
       }
 
       // ── 1. 追加一条 priceAdjustment 差额行（passengerId 非空 = 该乘客名下；空 = 整单）──
+      // 纯价格调整行（优惠/补收/调价）无采购成本 → totalCostCny 显式落 0（row 已带 0），不留 NULL。
       const created = await tx.orderItem.create({
         data: {
           orderId,
@@ -5618,6 +5769,7 @@ export class OrderService {
           quantity: 1,
           unitPrice: new Prisma.Decimal(row.unitPrice),
           amount: new Prisma.Decimal(row.amount),
+          totalCostCny: new Prisma.Decimal(row.totalCostCny),
           metadata: row.metadata as Prisma.InputJsonValue,
           passengerId: input.passengerId ?? null,
         },

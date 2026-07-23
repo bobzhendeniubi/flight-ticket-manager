@@ -167,6 +167,17 @@ describe('buildSettlementTotalItem', () => {
     expect(row.amount).toBe(300);
     expect(row.description).toBe('价格调整：代理结算价（+¥300）');
   });
+
+  it('成本侧显式落 0（结算差额是纯价格调整，无采购成本，不留 NULL）', () => {
+    expect(
+      buildSettlementTotalItem({ diffCny: -5684, authoritativeTotalCny: 7402, settlementTotalCny: 1718 })
+        .totalCostCny,
+    ).toBe(0);
+    expect(
+      buildSettlementTotalItem({ diffCny: 300, authoritativeTotalCny: 1500, settlementTotalCny: 1800 })
+        .totalCostCny,
+    ).toBe(0);
+  });
 });
 
 describe('createOrderBodySchema.settlementTotalCny 校验', () => {

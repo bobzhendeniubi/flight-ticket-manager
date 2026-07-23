@@ -1,0 +1,11 @@
+-- 存量回填：历史 FEE/DISCOUNT 行（补收单房差 / 各类附加费 / 调价 / 优惠）的成本快照统一按 0 回填。
+--
+-- 背景：毛利口径把 OrderItem.totalCostCny 为 NULL 的行一律计「缺成本」（判定只看 NULL、
+-- 不看 kind——finances.service 概览/订单 P&L/明细三处同口径），任一行缺成本即把整单毛利
+-- 拖成「未知」。纯价格调整/附加费/优惠类行本就无采购成本，其 NULL 是历史遗留而非真缺。
+-- 代码侧此后新增的 FEE/DISCOUNT 行已显式落 0（含补房差按新增房数×每晚成本×晚数落实际成本）；
+-- 存量历史补房差行已无法重构下单时点的每晚成本快照，统一按 0 回填（取舍：宁可低估这部分
+-- 房成本、也不让整单毛利永远「未知」——此类行数量有限，影响可控）。
+--
+-- 产品行（HOTEL/VISA/TRANSFER/BUNDLE/FLIGHT）的 NULL 是真缺成本语义，一律不动。
+UPDATE "OrderItem" SET "totalCostCny" = 0 WHERE "kind" IN ('FEE', 'DISCOUNT') AND "totalCostCny" IS NULL;

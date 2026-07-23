@@ -59,6 +59,12 @@ describe('buildPriceAdjustmentItem', () => {
     expect(row.description).toBe('价格调整：其它（+¥300）：临时加派车');
     expect(row.metadata.reasonText).toBe('临时加派车');
   });
+
+  it('成本侧显式落 0（纯价格调整无采购成本，不留 NULL 拖累毛利明细）', () => {
+    // 正（FEE）/ 负（DISCOUNT）两向都显式 0，避免被毛利明细当「缺成本」。
+    expect(buildPriceAdjustmentItem({ amountCny: 700, reasonCode: 'MISC_FEE' }).totalCostCny).toBe(0);
+    expect(buildPriceAdjustmentItem({ amountCny: -200, reasonCode: 'DISCOUNT' }).totalCostCny).toBe(0);
+  });
 });
 
 describe('priceAdjustmentSchema · 原因收窄为纯财务类（堵运营旁路）', () => {

@@ -22,7 +22,11 @@ const { mockPrisma } = vi.hoisted(() => ({
 
 vi.mock('../../db/prisma.js', () => ({ prisma: mockPrisma }));
 
-import { OrderService, buildRoomSupplementItem } from './orders.service.js';
+import {
+  OrderService,
+  buildRoomSupplementItem,
+  resolveRoomSupplementCost,
+} from './orders.service.js';
 import { BadRequestError, ForbiddenError } from '../../lib/errors.js';
 import { roomSupplementBodySchema, ROOM_SUPPLEMENT_MAX_NIGHTS } from './orders.schemas.js';
 
@@ -59,6 +63,58 @@ describe('buildRoomSupplementItem', () => {
     const row = buildRoomSupplementItem({ perNightCny: 200, nights: 3, note: '客户单房' });
     expect(row.description).toBe('补收单房差 ¥200/晚 × 3晚');
     expect(row.metadata.note).toBe('客户单房');
+  });
+});
+
+describe('resolveRoomSupplementCost · 补房差 FEE 行成本口径（三级回退 + 增房差）', () => {
+  it('① 优先用订单行下单快照 unitCostCny：每晚成本 × 晚数 × 新增房数', () => {
+    const cost = resolveRoomSupplementCost({
+      snapshotUnitCostCny: 400,
+      productCostPriceCny: 999, // 有快照时不看产品价
+      nights: 4,
+      addedRooms: 1,
+    });
+    expect(cost).toEqual({ totalCostCny: 1600, costSource: 'ITEM_SNAPSHOT' });
+  });
+
+  it('② 无快照 → 回退现行房型产品 costPriceCny', () => {
+    const cost = resolveRoomSupplementCost({
+      snapshotUnitCostCny: null,
+      productCostPriceCny: 250,
+      nights: 3,
+      addedRooms: 2,
+    });
+    expect(cost).toEqual({ totalCostCny: 1500, costSource: 'PRODUCT' });
+  });
+
+  it('③ 两者都无 → 成本 0，costSource=ZERO（如实报 0，不虚构成本）', () => {
+    const cost = resolveRoomSupplementCost({
+      snapshotUnitCostCny: null,
+      productCostPriceCny: null,
+      nights: 5,
+      addedRooms: 1,
+    });
+    expect(cost).toEqual({ totalCostCny: 0, costSource: 'ZERO' });
+  });
+
+  it('无增房（addedRooms=0）→ 成本 0，costSource=ZERO（只收差价不增房，无额外房成本）', () => {
+    const cost = resolveRoomSupplementCost({
+      snapshotUnitCostCny: 400,
+      productCostPriceCny: 400,
+      nights: 4,
+      addedRooms: 0,
+    });
+    expect(cost).toEqual({ totalCostCny: 0, costSource: 'ZERO' });
+  });
+
+  it('新增 0.5 间（拼房转单住的半间口径）× 每晚成本 × 晚数，四舍五入', () => {
+    const cost = resolveRoomSupplementCost({
+      snapshotUnitCostCny: 300,
+      productCostPriceCny: null,
+      nights: 3,
+      addedRooms: 0.5,
+    });
+    expect(cost).toEqual({ totalCostCny: 450, costSource: 'ITEM_SNAPSHOT' });
   });
 });
 
