@@ -18,8 +18,10 @@ import {
   parseStatementXlsx,
   buildStatementExportWorkbook,
   STATEMENT_MAX_ROWS,
+  statementStorageExternalTxnId,
   type StatementExportEntry,
 } from './receipts.statement.js';
+import { importStatementSchema, parseStatementSchema } from './receipts.schemas.js';
 
 const HEADERS = [
   '商户名称',
@@ -44,6 +46,19 @@ async function buildStatementBase64(
     ws.addRow(HEADERS.map(() => '订单'));
   }
   ws.addRow(opts.headers ?? HEADERS);
+  for (const r of dataRows) ws.addRow(r);
+  const buf = await wb.xlsx.writeBuffer();
+  return Buffer.from(buf as ArrayBuffer).toString('base64');
+}
+
+async function buildPlatformBase64(
+  sheetName: string,
+  headers: string[],
+  dataRows: Array<Array<string | number>>,
+): Promise<string> {
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet(sheetName);
+  ws.addRow(headers);
   for (const r of dataRows) ws.addRow(r);
   const buf = await wb.xlsx.writeBuffer();
   return Buffer.from(buf as ArrayBuffer).toString('base64');
@@ -212,6 +227,106 @@ describe('parseStatementXlsx', () => {
     expect(rows).toHaveLength(STATEMENT_MAX_ROWS);
     expect(warnings.some((w) => w.includes('仅解析前'))).toBe(true);
   }, 30_000);
+});
+
+describe('statement platform schemas', () => {
+  it('parse/import 缺少平台时提示先选择流水平台', () => {
+    const parseResult = parseStatementSchema.safeParse({ fileBase64: 'synthetic' });
+    const importResult = importStatementSchema.safeParse({ rows: [] });
+    expect(parseResult.success).toBe(false);
+    expect(importResult.success).toBe(false);
+    expect(parseResult.success ? '' : parseResult.error.issues.map((i) => i.message)).toContain(
+      '请先选择流水平台',
+    );
+    expect(importResult.success ? '' : importResult.error.issues.map((i) => i.message)).toContain(
+      '请先选择流水平台',
+    );
+  });
+});
+
+describe('parseStatementXlsx · 宜收宝', () => {
+  const headers = ['交易单号', '日期', '交易方式', '交易状态', '交易金额', '付款人', '备注'];
+
+  it('正常行入池、状态不符跳过、文件内重复，并保留付款备注', async () => {
+    const b64 = await buildPlatformBase64('交易流水', headers, [
+      ['YSB001', '2026-07-21 10:00:00', '微信支付', '支付成功', '1,558.00', '付款人甲', '订单备注'],
+      ['YSB002', '2026-07-21 10:01:00', '支付宝支付', '支付失败', '300.00', '付款人乙', ''],
+      ['YSB001', '2026-07-21 10:02:00', '银行卡', '支付成功', 100, '付款人丙', '重复'],
+    ]);
+    const { rows, warnings } = await parseStatementXlsx(b64, 'YISHOUBAO');
+    expect(rows.map((r) => r.disposition)).toEqual(['ok', 'skipped_status', 'dup_in_file']);
+    expect(rows[0].amountCny).toBe(1558);
+    expect(rows[0].method).toBe('WECHAT_PAY');
+    expect(rows[0].payerNote).toBe('付款人甲 / 订单备注');
+    expect(warnings.some((w) => w.includes('YSB001'))).toBe(true);
+  });
+
+  it('表头缺列给出宜收宝专属报错文案，且不解析数据', async () => {
+    const b64 = await buildPlatformBase64(
+      '交易流水',
+      ['交易单号', '日期', '交易方式', '交易金额'],
+      [['YSB001', '2026-07-21 10:00:00', '微信支付', 100]],
+    );
+    const { rows, warnings } = await parseStatementXlsx(b64, 'YISHOUBAO');
+    expect(rows).toHaveLength(0);
+    expect(warnings[0]).toContain('宜收宝流水表头缺少');
+    expect(warnings[0]).toContain('交易状态');
+    expect(warnings[0]).toContain('请上传宜收宝导出的交易流水原表');
+  });
+
+  it('存储流水号使用 YSB: 前缀，避免跨平台同号碰撞', () => {
+    expect(statementStorageExternalTxnId('YISHOUBAO', 'YSB001')).toBe('YSB:YSB001');
+  });
+});
+
+describe('parseStatementXlsx · 星驿付', () => {
+  const headers = ['交易流水号', '交易时间', '交易金额', '支付方式', '交易状态', '交易类型', '付款人ID', '备注'];
+
+  it('消费成功行入池，状态不符/类型不符跳过，金额支持千分位文本', async () => {
+    const b64 = await buildPlatformBase64('Sheet1', headers, [
+      ['XYF001', '2026-07-21 11:00:00', '2,000.00', '微信', '交易成功', '消费', 'payer-1', '备注一'],
+      ['XYF002', '2026-07-21 11:01:00', 300, '支付宝', '交易失败', '消费', 'payer-2', ''],
+      ['XYF003', '2026-07-21 11:02:00', 400, '银行卡', '交易成功', '退款', 'payer-3', ''],
+      ['XYF001', '2026-07-21 11:03:00', 500, '微信', '交易成功', '消费', 'payer-4', '重复'],
+    ]);
+    const { rows, warnings } = await parseStatementXlsx(b64, 'XINGYIFU');
+    expect(rows.map((r) => r.disposition)).toEqual([
+      'ok',
+      'skipped_status',
+      'skipped_type',
+      'dup_in_file',
+    ]);
+    expect(rows[0].amountCny).toBe(2000);
+    expect(rows[0].method).toBe('WECHAT_PAY');
+    expect(rows[0].payerNote).toBe('payer-1 / 备注一');
+    expect(warnings.some((w) => w.includes('XYF001'))).toBe(true);
+  });
+
+  it('非法金额行标记 invalid 并给出原因', async () => {
+    const b64 = await buildPlatformBase64('Sheet1', headers, [
+      ['XYF004', '2026-07-21 11:04:00', '金额坏了', '微信', '交易成功', '消费', 'payer-4', ''],
+    ]);
+    const { rows, warnings } = await parseStatementXlsx(b64, 'XINGYIFU');
+    expect(rows[0].disposition).toBe('invalid');
+    expect(warnings[0]).toContain('金额不可解析');
+  });
+
+  it('表头缺列给出星驿付专属报错文案', async () => {
+    const b64 = await buildPlatformBase64(
+      'Sheet1',
+      ['交易流水号', '交易时间', '交易金额', '支付方式', '交易状态'],
+      [['XYF005', '2026-07-21 11:05:00', 100, '微信', '交易成功']],
+    );
+    const { rows, warnings } = await parseStatementXlsx(b64, 'XINGYIFU');
+    expect(rows).toHaveLength(0);
+    expect(warnings[0]).toContain('星驿付流水表头缺少');
+    expect(warnings[0]).toContain('交易类型');
+    expect(warnings[0]).toContain('请上传星驿付导出的交易流水原表');
+  });
+
+  it('存储流水号使用 XYF: 前缀，避免跨平台同号碰撞', () => {
+    expect(statementStorageExternalTxnId('XINGYIFU', 'XYF001')).toBe('XYF:XYF001');
+  });
 });
 
 describe('buildStatementExportWorkbook', () => {

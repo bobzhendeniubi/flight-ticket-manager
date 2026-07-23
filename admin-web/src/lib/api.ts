@@ -1880,7 +1880,14 @@ export const RECEIPT_SOURCE_LABEL: Record<ReceiptSource, string> = {
 };
 
 /** 流水预览行处置：ok=可导入；dup_in_db=库里已有；dup_in_file=文件内重复；skipped_status=非支付成功；invalid=解析失败 */
-export type StatementDisposition = 'ok' | 'dup_in_db' | 'dup_in_file' | 'skipped_status' | 'invalid';
+export type StatementPlatform = 'CMB_QR' | 'YISHOUBAO' | 'XINGYIFU';
+export type StatementDisposition =
+  | 'ok'
+  | 'dup_in_db'
+  | 'dup_in_file'
+  | 'skipped_status'
+  | 'skipped_type'
+  | 'invalid';
 
 /** 流水解析预览行（POST /receipts/statement/parse） */
 export interface StatementPreviewRow {
@@ -1891,6 +1898,7 @@ export interface StatementPreviewRow {
   method: PaymentMethod;
   rawMethod: string;
   rawStatus: string;
+  rawType: string;
   payerNote: string | null;
   disposition: StatementDisposition;
   /**
@@ -1909,6 +1917,7 @@ export interface StatementPreviewResult {
     dupInDb: number;
     dupInFile: number;
     skippedStatus: number;
+    skippedType: number;
     invalid: number;
   };
 }
@@ -3388,17 +3397,17 @@ export const api = {
 
   // ── 二维码流水导入 + 认款工作台（ADMIN/STAFF）──
   // 解析收单平台流水 xlsx（base64）→ 预览行 + 处置判定（不写库）
-  parseReceiptStatement: (token: string, fileBase64: string) =>
+  parseReceiptStatement: (token: string, platform: StatementPlatform, fileBase64: string) =>
     apiFetch<StatementPreviewResult>('/receipts/statement/parse', {
       method: 'POST',
       token,
-      body: { fileBase64 },
+      body: { platform, fileBase64 },
     }),
   // 流水入池：预览确认后提交；服务端按交易流水号唯一索引兜底去重（重复导入幂等）
-  importReceiptStatement: (token: string, rows: StatementImportRow[]) =>
+  importReceiptStatement: (token: string, platform: StatementPlatform, rows: StatementImportRow[]) =>
     apiFetch<{ ok: true; requested: number; imported: number; skipped: number }>(
       '/receipts/statement/import',
-      { method: 'POST', token, body: { rows } },
+      { method: 'POST', token, body: { platform, rows } },
     ),
   // 认款工作台：近 400 单里尾款 > 0 的待收款订单候选（最多 200）
   getReceiptMatchCandidates: (token: string) =>

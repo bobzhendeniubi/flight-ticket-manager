@@ -12,7 +12,7 @@
  * 重复导入天然幂等：交易流水号唯一索引，已认过的行状态不丢。
  * 导出核对表：原流水 + 认款状态/认到订单/认款人，替代财务线下勾表。
  */
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   api,
   ApiError,
@@ -22,6 +22,7 @@ import {
   type Receipt,
   type ReceiptMatchCandidate,
   type StatementDisposition,
+  type StatementPlatform,
   type StatementPreviewResult,
 } from '../lib/api';
 import { NumberInput } from './NumberInput';
@@ -58,8 +59,15 @@ const DISPOSITION_META: Record<StatementDisposition, { label: string; cls: strin
   dup_in_db: { label: '已在系统', cls: 'bg-sky-50 text-sky-700' },
   dup_in_file: { label: '文件内重复', cls: 'bg-amber-50 text-amber-700' },
   skipped_status: { label: '非支付成功', cls: 'bg-slate-100 text-slate-500' },
+  skipped_type: { label: '非消费类型', cls: 'bg-slate-100 text-slate-500' },
   invalid: { label: '无法解析', cls: 'bg-rose-50 text-rose-700' },
 };
+
+const STATEMENT_PLATFORM_OPTIONS: Array<{ value: StatementPlatform; label: string }> = [
+  { value: 'CMB_QR', label: '招行二维码' },
+  { value: 'YISHOUBAO', label: '宜收宝' },
+  { value: 'XINGYIFU', label: '星驿付' },
+];
 
 interface StatementReconciliationProps {
   token: string;
@@ -89,6 +97,11 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
   const [preview, setPreview] = useState<StatementPreviewResult | null>(null);
   const [parsing, setParsing] = useState(false);
   const [importing, setImporting] = useState(false);
+  const [platformPickerOpen, setPlatformPickerOpen] = useState(false);
+  const [platformChoice, setPlatformChoice] = useState<StatementPlatform | null>(null);
+  const [statementPlatform, setStatementPlatform] = useState<StatementPlatform | null>(null);
+  const statementPlatformRef = useRef<StatementPlatform | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // 导出
   const [exportFrom, setExportFrom] = useState('');
@@ -207,10 +220,29 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
   }
 
   // ── 导入 ───────────────────────────────────────────────────────────────
+  function openPlatformPicker(): void {
+    if (parsing) return;
+    setPlatformChoice(null);
+    setPlatformPickerOpen(true);
+  }
+
+  function pickStatementFile(): void {
+    if (!platformChoice) return;
+    statementPlatformRef.current = platformChoice;
+    setStatementPlatform(platformChoice);
+    setPlatformPickerOpen(false);
+    fileInputRef.current?.click();
+  }
+
   function onPickFile(e: React.ChangeEvent<HTMLInputElement>): void {
     const f = e.target.files?.[0];
     e.target.value = ''; // 允许再次选择同一文件
     if (!f) return;
+    const platform = statementPlatformRef.current ?? statementPlatform;
+    if (!platform) {
+      setErr('请先选择流水平台');
+      return;
+    }
     setParsing(true);
     setErr(null);
     const reader = new FileReader();
@@ -218,7 +250,7 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
       try {
         const dataUrl = typeof reader.result === 'string' ? reader.result : '';
         const base64 = dataUrl.split(',')[1] ?? '';
-        const result = await api.parseReceiptStatement(token, base64);
+        const result = await api.parseReceiptStatement(token, platform, base64);
         setPreview(result);
       } catch (err2: unknown) {
         setErr(err2 instanceof ApiError ? err2.message : '流水解析失败');
@@ -234,7 +266,7 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
   }
 
   async function confirmImport(): Promise<void> {
-    if (!preview || importing) return;
+    if (!preview || !statementPlatform || importing) return;
     const rows = preview.rows
       .filter((r) => r.disposition === 'ok')
       .map((r) => ({
@@ -251,7 +283,7 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
     setImporting(true);
     setErr(null);
     try {
-      const result = await api.importReceiptStatement(token, rows);
+      const result = await api.importReceiptStatement(token, statementPlatform, rows);
       setNotice(
         `流水导入完成：入池 ${result.imported} 笔${result.skipped > 0 ? `，跳过 ${result.skipped} 笔（已存在）` : ''}`,
       );
@@ -404,18 +436,22 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
       {/* 工具条 */}
       <div className="flex flex-wrap items-end justify-between gap-2">
         <div className="flex flex-wrap items-end gap-2">
-          <label
-            className={`btn-primary inline-flex cursor-pointer items-center gap-1.5 text-sm ${parsing ? 'pointer-events-none opacity-60' : ''}`}
+          <button
+            type="button"
+            className={`btn-primary inline-flex items-center gap-1.5 text-sm ${parsing ? 'pointer-events-none opacity-60' : ''}`}
+            onClick={openPlatformPicker}
+            disabled={parsing}
           >
             📄 {parsing ? '解析中…' : '导入二维码流水'}
-            <input
-              type="file"
-              accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-              className="hidden"
-              onChange={onPickFile}
-              disabled={parsing}
-            />
-          </label>
+          </button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            className="hidden"
+            onChange={onPickFile}
+            disabled={parsing}
+          />
           <label className="inline-flex items-center gap-1.5 text-xs text-ink-soft">
             <input
               type="checkbox"
@@ -559,6 +595,14 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
       </div>
 
       {/* 导入预览弹窗 */}
+      {platformPickerOpen && (
+        <StatementPlatformPickerModal
+          value={platformChoice}
+          onChange={setPlatformChoice}
+          onChooseFile={pickStatementFile}
+          onClose={() => setPlatformPickerOpen(false)}
+        />
+      )}
       {preview && (
         <ImportPreviewModal
           preview={preview}
@@ -625,6 +669,73 @@ function AllocateConfirmInline({
   );
 }
 
+function StatementPlatformPickerModal({
+  value,
+  onChange,
+  onChooseFile,
+  onClose,
+}: {
+  value: StatementPlatform | null;
+  onChange: (value: StatementPlatform) => void;
+  onChooseFile: () => void;
+  onClose: () => void;
+}) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+      <div className="absolute inset-0 bg-ink/40 animate-fade-in" onClick={onClose} aria-hidden />
+      <div className="relative z-10 w-full max-w-md rounded-xl bg-surface p-5 shadow-pop">
+        <div className="flex items-start justify-between">
+          <div>
+            <h2 className="text-base font-semibold text-ink">选择流水平台</h2>
+            <p className="mt-1 text-xs text-ink-muted">请选择平台后，再选择对应的流水文件。</p>
+          </div>
+          <button
+            type="button"
+            className="flex h-8 w-8 items-center justify-center rounded-lg text-lg text-ink-muted hover:bg-slate-100 hover:text-ink"
+            onClick={onClose}
+            aria-label="关闭"
+          >
+            ×
+          </button>
+        </div>
+        <div className="mt-4 space-y-2">
+          {STATEMENT_PLATFORM_OPTIONS.map((option) => (
+            <label
+              key={option.value}
+              className={`flex cursor-pointer items-center gap-3 rounded-lg border px-3 py-2.5 text-sm transition ${
+                value === option.value
+                  ? 'border-brand bg-brand-50 text-brand-700'
+                  : 'border-slate-200 text-ink hover:border-brand/40'
+              }`}
+            >
+              <input
+                type="radio"
+                name="statement-platform"
+                checked={value === option.value}
+                onChange={() => onChange(option.value)}
+              />
+              <span>{option.label}</span>
+            </label>
+          ))}
+        </div>
+        <div className="mt-5 flex justify-end gap-2">
+          <button type="button" className="btn-secondary text-sm" onClick={onClose}>
+            取消
+          </button>
+          <button
+            type="button"
+            className="btn-primary text-sm disabled:cursor-not-allowed disabled:opacity-50"
+            onClick={onChooseFile}
+            disabled={!value}
+          >
+            选择文件
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── 导入预览弹窗 ─────────────────────────────────────────────────────────────
 function ImportPreviewModal({
   preview,
@@ -660,7 +771,10 @@ function ImportPreviewModal({
           {summary.dupInFile > 0 && (
             <span className="badge-warning">文件内重复 {summary.dupInFile}</span>
           )}
-          <span className="badge-neutral">非支付成功 {summary.skippedStatus}</span>
+          <span className="badge-neutral">非成功状态 {summary.skippedStatus}</span>
+          {summary.skippedType > 0 && (
+            <span className="badge-neutral">非消费类型 {summary.skippedType}</span>
+          )}
           {summary.invalid > 0 && <span className="badge-danger">无法解析 {summary.invalid}</span>}
           <span className="text-ink-muted">共 {summary.total} 行</span>
         </div>
