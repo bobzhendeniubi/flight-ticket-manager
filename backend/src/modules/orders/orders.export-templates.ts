@@ -1,7 +1,7 @@
 /**
  * 三模板筛选导出 — 与订单列表共用筛选条件（buildOrderFilterWhere），一行/乘客。
  *
- *   full      《全岗可用》55 列 — 运营/财务/签证全岗位通用台账（53 列旧模版 + 纯拼音名 + 签证公司）
+ *   full      《全岗可用》56 列 — 运营/财务/签证全岗位通用台账（53 列旧模版 + 纯拼音名 + 签证公司 + 订单状态）
  *   ticketing 《票务专用》27 列 — 代理+备注 + 航司 PNR 提交 25 列（仅含机票的订单）
  *   visa      《签证专用》21 列 — 越南签证申请表抬头（含越文表头，含签证公司列）
  *
@@ -71,7 +71,26 @@ export const VISA_REQUIREMENT_LABEL: Record<string, string> = {
 };
 
 // 注：《全岗可用》模版对齐旧系统口径 —— 乘客类型/性别/证件类型均按旧模版原样
-// 输出枚举/代码（ADULT、M、P），订单状态列旧模版不存在，故此处不再需要中文标签表。
+// 输出枚举/代码（ADULT、M、P），不译中文。
+
+/** 订单状态中文标签（数据岗反馈：《全岗可用》需增订单状态列用于筛选）。
+ * 覆盖 OrderStatus 全部 13 值；未知值兜底原文。此处自建完整映射，
+ * 不复用 orders.export.ts 的映射（那份缺项，且另有安排不改动）。*/
+const ORDER_STATUS_LABEL: Record<string, string> = {
+  DRAFT: '草稿',
+  PENDING_PAYMENT: '待支付',
+  PAID: '已支付',
+  PROCESSING: '处理中',
+  TICKETED: '出票完成',
+  COMPLETED: '已完成',
+  PAYMENT_TIMEOUT: '支付超时',
+  CANCELLED: '已取消',
+  REFUND_REQUESTED: '退款中',
+  REFUNDED: '已退款',
+  CHANGE_REQUESTED: '改期中',
+  CHANGED: '已改期',
+  FAILED: '失败',
+};
 
 const CABIN_LABEL: Record<string, string> = {
   ECONOMY: '经济舱',
@@ -308,7 +327,7 @@ export function buildOrderContext(order: OrderForTemplateExport): OrderContext {
   };
 }
 
-// ── 模板一：《全岗可用》54 列（旧模版 53 列同名同序 + 「纯拼音名」对数列）──────
+// ── 模板一：《全岗可用》56 列（旧模版 53 列同名同序 + 「纯拼音名」+「签证公司」+「订单状态」）──────
 // 头部两行：0..49 列为单行表头（纵向合并两行）；末尾「订单成本」为分组表头，
 // 跨「成本类型/子类型/金额」三子列（横向合并首行）。系统暂无数据的列一律留空，绝不编造。
 // 定金组四列（定金/到账金额/到账时间/到账渠道）已移除：系统无定金模型，四列恒空，
@@ -343,6 +362,7 @@ interface FullRow {
   refundAmount: number; // 退款金额（人均）
   refundAt: string; // 退款时间
   refundChannel: string; // 退款渠道 — 留空
+  orderStatus: string; // 订单状态（中文标签，数据岗筛选用）— 与开票/签证状态列聚在一起
   invoiceStatusSys: string; // 系统开票状态（systemInvoiced：是/否）
   invoiceStatusManual: string; // 开票状态 — 按航段已开的组合文本（去程已开/回程已开），都未开则留空
   visaStatus: string; // 签证状态
@@ -401,6 +421,7 @@ export const FULL_COLUMNS: Array<{ header: string; key: keyof FullRow; width: nu
   { header: '退款金额', key: 'refundAmount', width: 10 },
   { header: '退款时间', key: 'refundAt', width: 18 },
   { header: '退款渠道', key: 'refundChannel', width: 10 },
+  { header: '订单状态', key: 'orderStatus', width: 10 },
   { header: '系统开票状态', key: 'invoiceStatusSys', width: 12 },
   { header: '开票状态', key: 'invoiceStatusManual', width: 10 },
   { header: '签证状态', key: 'visaStatus', width: 10 },
@@ -543,6 +564,7 @@ export function orderToFullRows(order: OrderForTemplateExport, ctx: OrderContext
     refundAmount: round2(refundTotal / ctx.paxCount),
     refundAt: fmtDateTimeSec(lastRefundAt),
     refundChannel: '',
+    orderStatus: ORDER_STATUS_LABEL[order.status] ?? order.status,
     invoiceStatusSys,
     invoiceStatusManual,
     visaStatus,

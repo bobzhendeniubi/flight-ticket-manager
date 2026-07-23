@@ -939,6 +939,141 @@ export async function getAlerts(
   return { oversold, surplusSoon, overCapacitySchedules, sharedOddNear };
 }
 
+// ── 近期用房变更（读审计流，不新做事件系统）────────────────────────────────
+/**
+ * 会实际改动酒店用房口径的订单操作 —— 全部由 orders 路由在成功后 writeAudit 落库：
+ *   UPDATE_ROOM_ASSIGNMENT  调整分房（改 roomAssignment / 计费房数 → 直接影响「占」）
+ *   SWAP_ORDER_ITEM_HOTEL   换酒店（改 hotelRoomTypeId → 换一家酒店占房）
+ *   ADD_ROOM_SUPPLEMENT     补收单房差（房数/房态相关的售后补收）
+ * 三者 targetType 均为 ORDER、targetId=订单 id、targetLabel=订单号。
+ * 注：改期（RESCHEDULE_ORDER_ITEM）改的是航班班次/出发日，不落 hotelCheckIn/hotelCheckOut，
+ * 不改变销控板占房口径，故不纳入。
+ */
+export const ROOM_CHANGE_ACTIONS = [
+  'UPDATE_ROOM_ASSIGNMENT',
+  'SWAP_ORDER_ITEM_HOTEL',
+  'ADD_ROOM_SUPPLEMENT',
+] as const;
+
+/** 近期用房变更返回上限（条）。*/
+const ROOM_CHANGE_LIMIT = 100;
+
+const ROOM_CHANGE_ACTION_LABELS: Record<string, string> = {
+  UPDATE_ROOM_ASSIGNMENT: '调整分房',
+  SWAP_ORDER_ITEM_HOTEL: '换酒店',
+  ADD_ROOM_SUPPLEMENT: '补收单房差',
+};
+
+export interface HotelRoomChangeEntry {
+  id: string;
+  action: string;
+  actionLabel: string; // 人类可读中文（不含任何内部人名）
+  orderId: string | null; // = AuditLog.targetId
+  orderNumber: string | null; // = AuditLog.targetLabel
+  actor: string | null; // 操作人（displayName/email/角色，运行期真实数据）
+  summary: string; // 关键字段摘要（房数/酒店等）
+  severity: string;
+  at: string; // ISO8601
+}
+
+export interface HotelRecentRoomChanges {
+  days: number;
+  count: number;
+  changes: HotelRoomChangeEntry[];
+}
+
+function asRecord(v: unknown): Record<string, unknown> {
+  return v && typeof v === 'object' ? (v as Record<string, unknown>) : {};
+}
+function readNum(v: unknown): number | null {
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+}
+function readStr(v: unknown): string | null {
+  return typeof v === 'string' && v.trim() ? v : null;
+}
+
+/** 从 before/after JSON 里挑关键字段拼出一句人类可读的变更摘要。*/
+function summarizeRoomChange(action: string, before: unknown, after: unknown): string {
+  const b = asRecord(before);
+  const a = asRecord(after);
+  if (action === 'UPDATE_ROOM_ASSIGNMENT') {
+    const from = readNum(b.roomsBilled);
+    const to = readNum(a.roomsBilled);
+    if (from != null && to != null && from !== to) return `计费房数 ${from} → ${to} 间`;
+    if (to != null) return `分房调整（计费房数 ${to} 间）`;
+    return '分房调整';
+  }
+  if (action === 'SWAP_ORDER_ITEM_HOTEL') {
+    const fromH = readStr(b.hotelName);
+    const fromR = readStr(b.roomTypeName);
+    const toH = readStr(a.hotelName);
+    const toR = readStr(a.roomTypeName);
+    const fromLabel = fromH ? `${fromH}${fromR ? `·${fromR}` : ''}` : '原酒店';
+    const toLabel = toH ? `${toH}${toR ? `·${toR}` : ''}` : '新酒店';
+    return `换酒店 ${fromLabel} → ${toLabel}`;
+  }
+  if (action === 'ADD_ROOM_SUPPLEMENT') {
+    const perNight = readNum(a.perNightCny);
+    const nights = readNum(a.nights);
+    const amount = readNum(a.amountCny);
+    if (perNight != null && nights != null) {
+      return `补收单房差 ${perNight}元 × ${nights} 晚${amount != null ? ` = ${amount} 元` : ''}`;
+    }
+    return '补收单房差';
+  }
+  return ROOM_CHANGE_ACTION_LABELS[action] ?? action;
+}
+
+/**
+ * 近期用房变更（近 N 天，倒序，上限 100 条）——读 AuditLog 中会影响用房的订单操作。
+ * 给房控看板顶部「近期用房变更」面板做可见性，不做已读态、不建事件系统。
+ */
+export async function getRecentRoomChanges(
+  days: number,
+  client: PrismaClient = defaultPrisma,
+): Promise<HotelRecentRoomChanges> {
+  const since = new Date(Date.now() - days * DAY_MS);
+  const logs = await client.auditLog.findMany({
+    where: {
+      action: { in: [...ROOM_CHANGE_ACTIONS] },
+      createdAt: { gte: since },
+    },
+    orderBy: { createdAt: 'desc' },
+    take: ROOM_CHANGE_LIMIT,
+    select: {
+      id: true,
+      action: true,
+      targetId: true,
+      targetLabel: true,
+      before: true,
+      after: true,
+      severity: true,
+      createdAt: true,
+      actorLabel: true,
+      actorRole: true,
+      actor: { select: { displayName: true, email: true } },
+    },
+  });
+
+  const changes: HotelRoomChangeEntry[] = logs.map((log) => ({
+    id: log.id,
+    action: log.action,
+    actionLabel: ROOM_CHANGE_ACTION_LABELS[log.action] ?? log.action,
+    orderId: log.targetId,
+    orderNumber: log.targetLabel,
+    actor:
+      log.actor?.displayName ??
+      log.actor?.email ??
+      log.actorLabel ??
+      (log.actorRole ? String(log.actorRole) : null),
+    summary: summarizeRoomChange(log.action, log.before, log.after),
+    severity: String(log.severity),
+    at: log.createdAt.toISOString(),
+  }));
+
+  return { days, count: changes.length, changes };
+}
+
 // ── 远期视图（按日期跨酒店合计）──────────────────────────────────────────
 export interface HotelControlForward {
   dates: string[];

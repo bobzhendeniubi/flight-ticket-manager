@@ -1919,6 +1919,14 @@ export class OrderService {
           deletedAt: true,
           // 只取姓名字段（不整对象）：回收站行展示用，供运营按乘客名找回误删单。
           passengers: { select: { fullName: true, chineseName: true } },
+          // 派生「出发日期」列所需的最小字段（deriveOrderDepartDate 同口径，= 订单列表「出发日期」列）：
+          // FLIGHT 行取班次出发时间、酒店行取入住日；恢复误删单前先看清是哪个团期。
+          items: {
+            select: {
+              hotelCheckIn: true,
+              flightSchedule: { select: { departureTime: true } },
+            },
+          },
         },
         orderBy: { deletedAt: 'desc' },
         take: query.pageSize,
@@ -1962,6 +1970,9 @@ export class OrderService {
         status: o.status,
         deletedAt: o.deletedAt,
         deletedBy: deletedByMap.get(o.id) ?? null,
+        // 原出发日期（去程最早航段当地出发日 → 回退最早酒店入住日 → null；与订单列表「出发日期」同口径）：
+        // 恢复误删单前先辨清是哪个团期。items 缺失（形状漂移）时安全落空为 null。
+        departDate: deriveOrderDepartDate(o.items ?? []),
         // 乘客姓名（中文名优先，缺失回退证件姓名）：回收站行展示 + 前端搜索命中辅助定位。
         passengerNames: o.passengers.map((p) => p.chineseName?.trim() || p.fullName),
       })),

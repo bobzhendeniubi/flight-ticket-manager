@@ -5,12 +5,16 @@
  *   1. 姓名兜底拆分——fullName 常见 "CHEN/HAOLIANG" 斜线格式（OCR/OTA/老数据），
  *      兜底切分需同时认空格与斜线；lastName/firstName 为空串也要走兜底（不能只判 null）。
  *   2. PTC 按「出发日 − 出生日期」实足年龄自动推算（<2 INF / 2–<12 CHD / ≥12 ADT），
- *      生日或出发日缺失（纯地面单）时回退录入的 passengerType；
- *      派生为 CHD/INF 且 Title 缺失时按性别给 MSTR/MISS，成人缺失维持原样（留空）。
+ *      生日或出发日缺失（纯地面单）时回退录入的 passengerType。
+ *
+ * Title 自动生成新口径（票务岗）：航司系统只认 MR/MS，人名后带称谓——手录优先，
+ * 否则按性别派生（M→MR、F→MS），所有年龄段一致（儿童/婴儿也 MR/MS，不再出 MSTR/MISS），性别缺失留空。
+ *
+ * 导出文件名 DD/MON 取去程航班出发日；纯地面单（无航班行）回退今天。
  */
 import { describe, it, expect } from 'vitest';
 import type { Passenger } from '@prisma/client';
-import { passengerToRow, derivePtcByAge, earliestFlightDeparture } from './pnr-export.js';
+import { passengerToRow, derivePtcByAge, earliestFlightDeparture, pnrExportFilename } from './pnr-export.js';
 
 const D = (s: string): Date => new Date(`${s}T00:00:00.000Z`);
 
@@ -139,51 +143,73 @@ describe('derivePtcByAge — 按「出发日 − 出生日期」实足年龄推�
   });
 });
 
-describe('passengerToRow — PTC 联动 Title（CHD/INF 缺 Title 按性别给 MSTR/MISS）', () => {
+describe('passengerToRow — Title 自动生成（统一 MR/MS，不分年龄段、无儿童称谓）', () => {
   const departure = D('2026-07-13');
 
-  it('派生为 CHD 且未录入 Title、性别男 → MSTR', () => {
-    const row = passengerToRow(
-      fixturePassenger({ dateOfBirth: D('2020-01-01'), gender: 'M', title: null }),
-      departure,
-    );
-    expect(row.ptc).toBe('CHD');
-    expect(row.title).toBe('MSTR');
-  });
-
-  it('派生为 CHD 且未录入 Title、性别女 → MISS', () => {
-    const row = passengerToRow(
-      fixturePassenger({ dateOfBirth: D('2020-01-01'), gender: 'F', title: null }),
-      departure,
-    );
-    expect(row.ptc).toBe('CHD');
-    expect(row.title).toBe('MISS');
-  });
-
-  it('派生为 INF 且未录入 Title、性别男 → MSTR', () => {
-    const row = passengerToRow(
-      fixturePassenger({ dateOfBirth: D('2025-06-01'), gender: 'M', title: null }),
-      departure,
-    );
-    expect(row.ptc).toBe('INF');
-    expect(row.title).toBe('MSTR');
-  });
-
-  it('已录入 Title 时不覆盖，原样保留', () => {
-    const row = passengerToRow(
-      fixturePassenger({ dateOfBirth: D('2020-01-01'), gender: 'M', title: 'MSTR' }),
-      departure,
-    );
-    expect(row.title).toBe('MSTR');
-  });
-
-  it('成人（ADT）缺 Title 维持现状——留空，不联动派生', () => {
+  it('成人男（ADT）未录入 Title → MR', () => {
     const row = passengerToRow(
       fixturePassenger({ dateOfBirth: D('1990-01-01'), gender: 'M', title: null }),
       departure,
     );
     expect(row.ptc).toBe('ADT');
-    expect(row.title).toBe('');
+    expect(row.title).toBe('MR');
+  });
+
+  it('成人女（ADT）未录入 Title → MS', () => {
+    const row = passengerToRow(
+      fixturePassenger({ dateOfBirth: D('1990-01-01'), gender: 'F', title: null }),
+      departure,
+    );
+    expect(row.ptc).toBe('ADT');
+    expect(row.title).toBe('MS');
+  });
+
+  it('儿童男（CHD）也给 MR（不再出 MSTR）', () => {
+    const row = passengerToRow(
+      fixturePassenger({ dateOfBirth: D('2020-01-01'), gender: 'M', title: null }),
+      departure,
+    );
+    expect(row.ptc).toBe('CHD');
+    expect(row.title).toBe('MR');
+  });
+
+  it('儿童女（CHD）也给 MS（不再出 MISS）', () => {
+    const row = passengerToRow(
+      fixturePassenger({ dateOfBirth: D('2020-01-01'), gender: 'F', title: null }),
+      departure,
+    );
+    expect(row.ptc).toBe('CHD');
+    expect(row.title).toBe('MS');
+  });
+
+  it('婴儿男（INF）也给 MR（不再出 MSTR）', () => {
+    const row = passengerToRow(
+      fixturePassenger({ dateOfBirth: D('2025-06-01'), gender: 'M', title: null }),
+      departure,
+    );
+    expect(row.ptc).toBe('INF');
+    expect(row.title).toBe('MR');
+  });
+
+  it('性别缺失 → Title 留空（任何年龄段一致）', () => {
+    const child = passengerToRow(
+      fixturePassenger({ dateOfBirth: D('2020-01-01'), gender: null, title: null }),
+      departure,
+    );
+    expect(child.title).toBe('');
+    const adult = passengerToRow(
+      fixturePassenger({ dateOfBirth: D('1990-01-01'), gender: null, title: null }),
+      departure,
+    );
+    expect(adult.title).toBe('');
+  });
+
+  it('手录 Title 优先——原样保留，不被性别派生覆盖', () => {
+    const row = passengerToRow(
+      fixturePassenger({ dateOfBirth: D('1990-01-01'), gender: 'F', title: 'DR' }),
+      departure,
+    );
+    expect(row.title).toBe('DR');
   });
 });
 
@@ -217,5 +243,24 @@ describe('passengerToRow — 无出发日时端到端回退（纯地面单场景
       fixturePassenger({ dateOfBirth: D('2020-01-01'), passengerType: 'CHILD' }),
     );
     expect(row.ptc).toBe('CHD');
+  });
+});
+
+describe('pnrExportFilename — DD/MON 取去程出发日，取不到回退今天', () => {
+  it('有出发日 → 用出发日的 DD/MON（UTC，与列内日期一致）', () => {
+    expect(pnrExportFilename('WT2026', D('2026-07-13'))).toBe('13JUL WT2026.xlsx');
+  });
+
+  it('月份边界正确（12 月 → DEC，一位数日补零）', () => {
+    expect(pnrExportFilename('WT2026', D('2026-12-05'))).toBe('05DEC WT2026.xlsx');
+  });
+
+  it('无出发日（null）→ 回退今天并保持原格式 {DD}{MON} {orderNumber}.xlsx', () => {
+    const name = pnrExportFilename('WT2026', null);
+    expect(name).toMatch(/^\d{2}[A-Z]{3} WT2026\.xlsx$/);
+  });
+
+  it('省略 departureDate 参数（旧调用形态）→ 同样回退今天', () => {
+    expect(pnrExportFilename('WT2026')).toMatch(/^\d{2}[A-Z]{3} WT2026\.xlsx$/);
   });
 });

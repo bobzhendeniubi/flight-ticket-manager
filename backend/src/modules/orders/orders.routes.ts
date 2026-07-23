@@ -42,7 +42,7 @@ import { prisma } from '../../db/prisma.js';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
 import { computeCancellationQuote } from '../../lib/cancellation.js';
 import { BadRequestError } from '../../lib/errors.js';
-import { buildPnrWorkbook, pnrExportFilename } from './pnr-export.js';
+import { buildPnrWorkbook, pnrExportFilename, earliestFlightDeparture } from './pnr-export.js';
 import { buildPassportPhotoZip, passportZipFilename } from './passport-zip.js';
 import { buildOrdersBySchedule, ordersExportFilename } from './orders.export.js';
 import {
@@ -550,7 +550,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       )
       .header(
         'Content-Disposition',
-        `attachment; filename="${encodeURIComponent(pnrExportFilename(order.orderNumber))}"`,
+        `attachment; filename="${encodeURIComponent(pnrExportFilename(order.orderNumber, earliestFlightDeparture(order.items)))}"`,
       )
       .send(buf);
   });
@@ -1338,12 +1338,15 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     };
   });
 
-  // ── 预期到账锁定/解锁（仅 ADMIN）──
+  // ── 预期到账锁定/解锁（ADMIN + STAFF/财务）──
   // POST /orders/:id/expected-amount/lock  body: { locked: boolean }
+  // 锁定/解锁开放给财务：财务负责对账，需要能锁住核对无误的预期到账、也能在填错时解锁重来。
+  // 注意：锁定状态下「修改预期到账金额」仍仅 ADMIN 可改（见上方 PATCH 端点）——
+  // 财务能锁/解锁，但不能在锁定态下自行改数，改数仍需管理员，审计照写。
   app.post('/:id/expected-amount/lock', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN) {
-      return reply.status(403).send({ error: '仅管理员可锁定/解锁预期到账' });
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅管理员或财务可锁定/解锁预期到账' });
     }
     const { id } = req.params as { id: string };
     const body = z.object({ locked: z.boolean() }).parse(req.body);

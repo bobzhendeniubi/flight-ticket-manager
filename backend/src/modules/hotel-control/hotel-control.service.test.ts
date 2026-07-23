@@ -31,6 +31,7 @@ import {
   expandAssignedPhysicalByDate,
   checkHotelPhysicalFit,
   assertHotelPhysicalFit,
+  getRecentRoomChanges,
 } from './hotel-control.service.js';
 
 /** 权威分房表 fixture：groupSizes[i] = 第 i 个房间盒子的乘客数（形状同 orders 模块分房保存）。*/
@@ -949,5 +950,131 @@ describe('checkHotelPhysicalFit（物理房间口径前瞻闸）', () => {
     await expect(
       assertHotelPhysicalFit('h1', [dayStr(0)], { wholeRooms: 0, solos: [] }, { allowNonWorsening: true }, client),
     ).resolves.toBeUndefined();
+  });
+});
+
+// ── getRecentRoomChanges（近期用房变更；读审计流）──────────────────────────
+describe('getRecentRoomChanges', () => {
+  /** 造一条审计日志行（形状同 AuditLog.findMany 的 select 结果）。*/
+  const auditRow = (over: Partial<Record<string, unknown>>): Record<string, unknown> => ({
+    id: 'a1',
+    action: 'UPDATE_ROOM_ASSIGNMENT',
+    targetId: 'o1',
+    targetLabel: 'CO250722001',
+    before: null,
+    after: null,
+    severity: 'INFO',
+    createdAt: day(0),
+    actorLabel: null,
+    actorRole: 'STAFF',
+    actor: null,
+    ...over,
+  });
+
+  function auditClient(rows: Array<Record<string, unknown>>): {
+    client: PrismaClient;
+    findMany: ReturnType<typeof vi.fn>;
+  } {
+    const findMany = vi.fn().mockResolvedValue(rows);
+    return { client: { auditLog: { findMany } } as unknown as PrismaClient, findMany };
+  }
+
+  it('查询口径：三类 action + createdAt>=近 N 天 + 倒序 + 上限 100', async () => {
+    const { client, findMany } = auditClient([]);
+    const res = await getRecentRoomChanges(7, client);
+
+    expect(res).toEqual({ days: 7, count: 0, changes: [] });
+    const arg = findMany.mock.calls[0][0];
+    expect(arg.where.action).toEqual({
+      in: ['UPDATE_ROOM_ASSIGNMENT', 'SWAP_ORDER_ITEM_HOTEL', 'ADD_ROOM_SUPPLEMENT'],
+    });
+    expect(arg.orderBy).toEqual({ createdAt: 'desc' });
+    expect(arg.take).toBe(100);
+    // createdAt.gte ≈ 今天 -7 天（容忍执行耗时的小漂移）
+    const since = arg.where.createdAt.gte as Date;
+    const expectedMs = Date.now() - 7 * DAY_MS;
+    expect(Math.abs(since.getTime() - expectedMs)).toBeLessThan(5000);
+  });
+
+  it('调整分房：计费房数 X→Y 摘要', async () => {
+    const { client } = auditClient([
+      auditRow({
+        action: 'UPDATE_ROOM_ASSIGNMENT',
+        before: { roomsBilled: 2 },
+        after: { roomsBilled: 3 },
+      }),
+    ]);
+    const res = await getRecentRoomChanges(7, client);
+    expect(res.changes[0]).toMatchObject({
+      action: 'UPDATE_ROOM_ASSIGNMENT',
+      actionLabel: '调整分房',
+      orderId: 'o1',
+      orderNumber: 'CO250722001',
+      summary: '计费房数 2 → 3 间',
+    });
+    // ISO8601 时间串
+    expect(res.changes[0].at).toBe(day(0).toISOString());
+  });
+
+  it('换酒店：原酒店·房型 → 新酒店·房型 摘要', async () => {
+    const { client } = auditClient([
+      auditRow({
+        action: 'SWAP_ORDER_ITEM_HOTEL',
+        severity: 'WARNING',
+        before: { hotelName: '美溪海滩酒店', roomTypeName: '海景房' },
+        after: { hotelName: '珊瑚湾酒店', roomTypeName: '花园房' },
+      }),
+    ]);
+    const res = await getRecentRoomChanges(7, client);
+    expect(res.changes[0]).toMatchObject({
+      actionLabel: '换酒店',
+      summary: '换酒店 美溪海滩酒店·海景房 → 珊瑚湾酒店·花园房',
+      severity: 'WARNING',
+    });
+  });
+
+  it('补收单房差：单价×晚数=金额 摘要', async () => {
+    const { client } = auditClient([
+      auditRow({
+        action: 'ADD_ROOM_SUPPLEMENT',
+        after: { perNightCny: 300, nights: 2, amountCny: 600 },
+      }),
+    ]);
+    const res = await getRecentRoomChanges(7, client);
+    expect(res.changes[0]).toMatchObject({
+      actionLabel: '补收单房差',
+      summary: '补收单房差 300元 × 2 晚 = 600 元',
+    });
+  });
+
+  it('操作人：优先 displayName → email → actorLabel → 角色', async () => {
+    const { client } = auditClient([
+      auditRow({ id: 'a1', actor: { displayName: '运营小组A', email: 'ops@x.com' } }),
+      auditRow({ id: 'a2', actor: { displayName: null, email: 'ops@x.com' } }),
+      auditRow({ id: 'a3', actor: null, actorLabel: 'label-only' }),
+      auditRow({ id: 'a4', actor: null, actorLabel: null, actorRole: 'ADMIN' }),
+    ]);
+    const res = await getRecentRoomChanges(7, client);
+    expect(res.changes.map((c) => c.actor)).toEqual([
+      '运营小组A',
+      'ops@x.com',
+      'label-only',
+      'ADMIN',
+    ]);
+  });
+
+  it('缺字段降级：before/after 缺关键字段时退回中性摘要，不抛错', async () => {
+    const { client } = auditClient([
+      auditRow({ action: 'UPDATE_ROOM_ASSIGNMENT', before: null, after: null }),
+      auditRow({ id: 'a2', action: 'SWAP_ORDER_ITEM_HOTEL', before: null, after: null }),
+      auditRow({ id: 'a3', action: 'ADD_ROOM_SUPPLEMENT', before: null, after: null }),
+    ]);
+    const res = await getRecentRoomChanges(7, client);
+    expect(res.count).toBe(3);
+    expect(res.changes.map((c) => c.summary)).toEqual([
+      '分房调整',
+      '换酒店 原酒店 → 新酒店',
+      '补收单房差',
+    ]);
   });
 });

@@ -150,6 +150,21 @@ async function readVisaSheet(xlsxBuf: Buffer): Promise<Array<Record<string, stri
 // 表头常量（含换行的越/中双语表头）
 const GENDER_HEADER = 'Giới tính (*)\n性别';
 const NAME_HEADER = 'Họ và tên (*)\n姓名';
+const PASSPORT_HEADER = 'Số hộ chiếu (*)\n护照号';
+
+/** 读取已加载单元格的填充色 argb（无填充返回 undefined）。*/
+const fillArgb = (cell: ExcelJS.Cell): string | undefined =>
+  (cell.fill as ExcelJS.FillPattern | undefined)?.fgColor?.argb;
+
+/**
+ * 从 xlsx Buffer 加载「签证专用」工作表（带样式，供排版断言用）。
+ * 环境 @types/node 的 Buffer 泛型与 exceljs 的 load(Buffer) 定义不一致，在此收口一次 cast。
+ */
+async function loadVisaWorksheet(xlsxBuf: Buffer): Promise<ExcelJS.Worksheet> {
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(xlsxBuf as unknown as Parameters<typeof wb.xlsx.load>[0]);
+  return wb.getWorksheet('签证专用')!;
+}
 
 describe('buildVisaBundleXlsx — 合并签证名单', () => {
   it('跨订单每位乘客一行合并，含性别列与「有无护照图」标注', async () => {
@@ -166,9 +181,9 @@ describe('buildVisaBundleXlsx — 合并签证名单', () => {
     const buf = await buildVisaBundleXlsx(orders);
     const rows = await readVisaSheet(buf);
 
-    // 3 位乘客合并成 3 行，STT 连续
+    // 3 位乘客合并成 3 行，序号连续（首列表头按签证岗样表用「序号」）
     expect(rows).toHaveLength(3);
-    expect(rows.map((r) => r['STT'])).toEqual(['1', '2', '3']);
+    expect(rows.map((r) => r['序号'])).toEqual(['1', '2', '3']);
 
     // 姓名（LAST/FIRST）合并正确，纯拼音名不带性别称谓（签证岗反馈：英文名不需要带性别；
     // 本表另有独立「性别」列 Giới tính）
@@ -227,6 +242,88 @@ describe('buildVisaBundleXlsx — 合并签证名单', () => {
     ws.getRow(1).eachCell((cell, col) => (headers[col] = String(cell.value ?? '')));
     expect(headers).toContain(GENDER_HEADER);
     expect(headers).toContain('有无护照图');
+  });
+});
+
+describe('buildVisaBundleXlsx — 签证岗样表排版（列头/边框/斑马纹/对齐/签证备注）', () => {
+  it('首列表头按样表用「序号」（不再是 STT）', async () => {
+    const ws = await loadVisaWorksheet(
+      await buildVisaBundleXlsx([
+        makeOrder('FTM2026072200001', [pax({ lastName: 'WANG', firstName: 'LIANBO' })]),
+      ]),
+    );
+    expect(String(ws.getRow(1).getCell(1).value)).toBe('序号');
+  });
+
+  it('表头灰底填充；数据区单元格四边细实线边框；数据行隔行斑马纹', async () => {
+    const ws = await loadVisaWorksheet(
+      await buildVisaBundleXlsx([
+        makeOrder('FTM2026072200001', [
+          pax({ id: 'a1', lastName: 'WANG', firstName: 'LIANBO' }),
+          pax({ id: 'a2', lastName: 'LI', firstName: 'SI' }),
+        ]),
+      ]),
+    );
+
+    // 表头灰底
+    expect(fillArgb(ws.getRow(1).getCell(1))).toBe('FFEFEFEF');
+
+    // 数据首行（第 2 行）四边细实线边框
+    const dataCell = ws.getRow(2).getCell(1);
+    expect(dataCell.border?.top?.style).toBe('thin');
+    expect(dataCell.border?.left?.style).toBe('thin');
+    expect(dataCell.border?.bottom?.style).toBe('thin');
+    expect(dataCell.border?.right?.style).toBe('thin');
+
+    // 斑马纹：第 3 行浅色填充；第 2 行不是斑马色
+    expect(fillArgb(ws.getRow(3).getCell(1))).toBe('FFF3F6F9');
+    expect(fillArgb(ws.getRow(2).getCell(1))).not.toBe('FFF3F6F9');
+  });
+
+  it('金额列右对齐、姓名/护照号列左对齐（对齐样表口径）', async () => {
+    const ws = await loadVisaWorksheet(
+      await buildVisaBundleXlsx([
+        makeOrder('FTM2026072200001', [pax({ lastName: 'WANG', firstName: 'LIANBO' })]),
+      ]),
+    );
+    const headerToCol = new Map<string, number>();
+    ws.getRow(1).eachCell((cell, col) => headerToCol.set(String(cell.value ?? ''), col));
+    const colOf = (h: string): number => headerToCol.get(h)!;
+    const dataRow = ws.getRow(2);
+    expect(dataRow.getCell(colOf('结算价格')).alignment?.horizontal).toBe('right');
+    expect(dataRow.getCell(colOf('到账金额')).alignment?.horizontal).toBe('right');
+    expect(dataRow.getCell(colOf(NAME_HEADER)).alignment?.horizontal).toBe('left');
+    expect(dataRow.getCell(colOf(PASSPORT_HEADER)).alignment?.horizontal).toBe('left');
+    // 其余列居中
+    expect(dataRow.getCell(colOf('代理机构')).alignment?.horizontal).toBe('center');
+  });
+
+  it('「签证备注」列取该单签证履约任务(VISA_APPLICATION)的备注文本，无则留空', async () => {
+    const withNote = makeOrder('FTM2026072200002', [pax({ lastName: 'WANG', firstName: 'LIANBO' })], {
+      items: [
+        {
+          kind: 'VISA',
+          amount: '800',
+          description: '越南电子签',
+          flightCabin: null,
+          flightSchedule: null,
+          hotelRoomType: null,
+          visa: { code: 'V1', visaName: '越南电子签', visaType: 'TOURIST', supplier: '某签证行' },
+          transfer: null,
+          bundle: null,
+          fulfillmentTasks: [
+            { type: 'VISA_APPLICATION', status: 'IN_PROGRESS', notes: '材料待补护照复印件' },
+          ],
+        },
+      ],
+    });
+    // 无签证任务备注的单（默认 FLIGHT 项，fulfillmentTasks 空）→ 签证备注留空
+    const withoutNote = makeOrder('FTM2026072200003', [pax({ lastName: 'LI', firstName: 'SI' })]);
+
+    const rows = await readVisaSheet(await buildVisaBundleXlsx([withNote, withoutNote]));
+    const byName = new Map(rows.map((r) => [r[NAME_HEADER], r['签证备注']]));
+    expect(byName.get('WANG/LIANBO')).toBe('材料待补护照复印件');
+    expect(byName.get('LI/SI')).toBe('');
   });
 });
 
@@ -290,8 +387,8 @@ describe('buildVisaRosterXlsx — 仅名单 xlsx（不含护照图）', () => {
     const xlsxBuf = await buildVisaRosterXlsx(['id_B1', 'id_A1'], client);
     const rows = await readVisaSheet(xlsxBuf);
 
-    // 甲代理(A1) 在前、乙代理(B1) 在后；STT 连续 1,2
-    expect(rows.map((r) => r['STT'])).toEqual(['1', '2']);
+    // 甲代理(A1) 在前、乙代理(B1) 在后；序号连续 1,2
+    expect(rows.map((r) => r['序号'])).toEqual(['1', '2']);
     expect(rows.map((r) => r['代理机构'])).toEqual(['甲代理', '乙代理']);
     // 纯拼音名不带性别称谓（签证岗反馈：英文名不需要带性别）
     expect(rows.map((r) => r[NAME_HEADER])).toEqual(['AA/ONE', 'BB/ONE']);

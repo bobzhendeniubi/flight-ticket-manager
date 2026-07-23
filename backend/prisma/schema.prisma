@@ -825,6 +825,20 @@ enum VisaEntryType {
   MULTIPLE // 多次
 }
 
+// 乘客送签进度（按人送签用）——语义与签证台现用任务状态逐字对齐，
+// 成员名取自 FulfillmentStatus 的签证进度子集，使「乘客→任务」派生成为恒等映射：
+//   PENDING     待处理（新录入待送签）
+//   IN_PROGRESS 已送签材料准备
+//   CONFIRMED   已送签
+// 「已签证/出签」不设独立成员：任务级 FulfillmentStatus 无对应态，出签事实由
+// Passenger.visaIssueDate / visaExpiry 记录；若在此再加一态会让派生口径无处落，
+// 故按最小改动只覆盖三档送签进度（复核点：是否需要独立「已签证」态）。
+enum VisaSubmissionStatus {
+  PENDING
+  IN_PROGRESS
+  CONFIRMED
+}
+
 model Visa {
   id                 String              @id @default(cuid())
   // 产品编号（V0001、V0002...）
@@ -1213,6 +1227,14 @@ model FulfillmentTask {
   completedAt    DateTime?
   failureReason  String?
   assigneeUserId String? // 谁负责这条任务
+
+  // ── 签证实际成本（仅 VISA_APPLICATION 任务用；人均口径）──
+  // 签证公司按航班开美金账单，团价/加急价按单不同，产品主数据 Visa.costPriceCny 表达不了。
+  // CNY 为入账权威：填了 USD+汇率则自动折算 CNY 存底，也允许直接填 CNY。三者皆空 = 回退产品主数据成本。
+  visaUnitCostUsd Decimal? @db.Decimal(10, 2) // 人均成本（美金），签证公司账单币种
+  visaFxRate      Decimal? @db.Decimal(12, 6) // 折算汇率（USD→CNY）
+  visaUnitCostCny Decimal? @db.Decimal(10, 2) // 人均成本（人民币，入账权威）
+
   createdAt      DateTime          @default(now())
   updatedAt      DateTime          @updatedAt
 
@@ -1278,6 +1300,10 @@ model Passenger {
   // 均 @default(false) → 旧数据/旧客户端天然回落「随套餐办签 + 拼房」，与扩展前定价完全一致。
   visaExempt       Boolean @default(false)
   singleRoom       Boolean @default(false)
+  // 按人送签进度（部分送签用）——非自备签乘客各自记录；签证台按人标记，
+  // 任务级 FulfillmentStatus 由本字段派生（全部到某档任务才算该档，部分时取最早档）。
+  // @default(PENDING) → 旧数据/旧客户端天然回落「待处理」，与扩展前口径一致。
+  visaSubmissionStatus VisaSubmissionStatus @default(PENDING)
   // 护照照片（OCR 上传或人工补传）
   passportPhotoUrl String?
 

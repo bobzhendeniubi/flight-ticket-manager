@@ -29,6 +29,7 @@ import {
 import { useAuth } from '../stores/auth';
 import { NumberInput } from '../components/NumberInput';
 import { PaymentChannelsManager } from '../components/PaymentChannelsManager';
+import { ProofImageViewer } from '../components/ProofImageViewer';
 import { StatementReconciliation } from '../components/StatementReconciliation';
 
 // 收款方式选项（与订单收款一致）
@@ -382,13 +383,11 @@ function ReceiptRow({
         </td>
         <td>
           {receipt.proofUrl ? (
-            <a href={receipt.proofUrl} target="_blank" rel="noreferrer">
-              <img
-                src={receipt.proofUrl}
-                alt={`${receipt.receiptNo} 截图`}
-                className="h-9 w-9 rounded border border-slate-200 object-cover"
-              />
-            </a>
+            <ProofImageViewer
+              src={receipt.proofUrl}
+              alt={`${receipt.receiptNo} 截图`}
+              thumbClassName="h-9 w-9 rounded border border-slate-200 object-cover"
+            />
           ) : (
             <span className="text-xs text-ink-muted">—</span>
           )}

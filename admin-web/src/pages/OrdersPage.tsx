@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { api, ApiError, duplicatePassengerConflictOrderNumbers, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog } from '../lib/api';
+import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { useFlightSeats } from '../stores/flightSeats';
 import {
@@ -12,6 +12,7 @@ import { NumberInput } from '../components/NumberInput';
 import { parseOtaRoster } from '../lib/parseOtaRoster';
 import type { AgentListItem } from '../lib/api';
 import { OrderFinanceSection } from '../components/OrderFinanceSection';
+import { OrderAuditTrail } from '../components/OrderAuditTrail';
 import { SingleOrderModal } from '../components/SingleOrderModal';
 import { RoomingEditor, type RoomingPassenger } from '../components/RoomingEditor';
 import { HotelSwapModal } from '../components/HotelSwapModal';
@@ -1978,6 +1979,7 @@ export function OrdersPage() {
                     <tr className="border-b border-slate-200 text-left text-xs text-ink-muted">
                       <th className="py-2 pr-3 font-medium">订单号</th>
                       <th className="py-2 pr-3 font-medium">客户 / 乘客</th>
+                      <th className="py-2 pr-3 font-medium">出发日期</th>
                       <th className="py-2 pr-3 font-medium">金额</th>
                       <th className="py-2 pr-3 font-medium">原状态</th>
                       <th className="py-2 pr-3 font-medium">删除时间</th>
@@ -2002,6 +2004,9 @@ export function OrdersPage() {
                                 {shownNames.join('、')}{hasMoreNames ? ` 等${names.length}人` : ''}
                               </div>
                             )}
+                          </td>
+                          <td className="py-2 pr-3 text-xs text-ink-muted">
+                            {o.departDate ?? '—'}
                           </td>
                           <td className="nums py-2 pr-3">¥{Number(o.total).toLocaleString()}</td>
                           <td className="py-2 pr-3">
@@ -2222,6 +2227,14 @@ function OrderDrawer({
                   签证：{VISA_STATUS_LABEL[o.visaStatus]}
                 </span>
               )}
+              {(() => {
+                {/* 签证进度与签证台同源（履约任务派生）——录单级 visaStatus 只表达「要不要签」，
+                    流转进度必须读任务状态，否则签证台标了已送签/已签证这里永远不动。 */}
+                const vs = deriveVisaStatus(o);
+                return vs ? (
+                  <span className={FF_STATUS_COLOR[vs]}>签证进度：{FF_STATUS_LABEL[vs] ?? vs}</span>
+                ) : null;
+              })()}
               <BalanceBadge balance={bal.balance} settlementMode={o.agent?.settlementMode} />
             </div>
           </div>
@@ -2416,6 +2429,9 @@ function OrderDrawer({
           </div>
 
           <RemindersSection order={o} />
+
+          {/* 操作记录（审计轨迹）：什么时间、哪个账号、改了什么。默认收起，展开才拉数据。 */}
+          <OrderAuditTrail orderId={o.id} />
 
           {/* 更多操作：状态流转 + 管理员强制改状态（运营要求收进默认折叠块；展开后行为与权限逻辑不变） */}
           <details className="rounded-xl border border-slate-200 bg-white">
@@ -5008,6 +5024,18 @@ function PassengerEditForm({
   );
 }
 
+/** YYYY-MM-DD → DDMON（如 2026-07-25 → 25JUL）；解析不出返回 null。用于 PNR 导出文件名带出发日。 */
+const MON_ABBR_EN = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
+function formatDdMon(isoDate: string | null | undefined): string | null {
+  if (!isoDate) return null;
+  const m = isoDate.slice(0, 10).match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!m) return null;
+  const month = Number(m[2]);
+  const day = Number(m[3]);
+  if (month < 1 || month > 12 || day < 1 || day > 31) return null;
+  return `${m[3]}${MON_ABBR_EN[month - 1]}`;
+}
+
 function OpsToolbar({ order }: { order: OrderSummary; onAdvance: (next: OrderStatus, reason?: string) => void }) {
   const tokens = useAuth((s) => s.tokens);
   const [busy, setBusy] = useState<string | null>(null);
@@ -5029,7 +5057,10 @@ function OpsToolbar({ order }: { order: OrderSummary; onAdvance: (next: OrderSta
     setBusy('pnr');
     try {
       const blob = await api.exportPnr(tokens.accessToken, order.id);
-      downloadBlob(blob, `PNR_${order.orderNumber}.xlsx`);
+      // 文件名带去程出发日（DDMON）；取不到出发日回退订单号-only。
+      const ddmon = formatDdMon(order.departDate);
+      const filename = ddmon ? `${ddmon}_${order.orderNumber}.xlsx` : `${order.orderNumber}.xlsx`;
+      downloadBlob(blob, filename);
     } catch (e) {
       alert(`导出失败：${e instanceof Error ? e.message : '未知错误'}`);
     } finally {
@@ -5584,7 +5615,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   const [notes, setNotes] = useState('');
 
   // ── 名单 ──────────────────────────────────────────────────────────────────
-  const [rows, setRows] = useState<BatchRow[]>([{ fullName: '', documentNumber: '', dateOfBirth: '' }]);
+  const [rows, setRows] = useState<BatchRow[]>([{ fullName: '', documentNumber: '', dateOfBirth: '', nationality: 'CN' }]);
   const [templateBusy, setTemplateBusy] = useState(false);
   const [rosterBusy, setRosterBusy] = useState(false);
   const [rosterWarnings, setRosterWarnings] = useState<string[]>([]);
@@ -5720,7 +5751,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   function setRow(i: number, patch: Partial<BatchRow>): void {
     setRows((prev) => prev.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
   }
-  function addRow(): void { setRows((prev) => [...prev, { fullName: '', documentNumber: '', dateOfBirth: '' }]); }
+  function addRow(): void { setRows((prev) => [...prev, { fullName: '', documentNumber: '', dateOfBirth: '', nationality: 'CN' }]); }
   function removeRow(i: number): void { setRows((prev) => (prev.length > 1 ? prev.filter((_, idx) => idx !== i) : prev)); }
 
   function pasteRows(text: string): void {
@@ -5728,7 +5759,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
       .split('\n').map((l) => l.trim()).filter(Boolean)
       .map((line) => {
         const cols = line.split(/[,，\t]+|\s{2,}|\s+/).map((c) => c.trim()).filter(Boolean);
-        return { fullName: cols[0] ?? '', documentNumber: cols[1] ?? '', dateOfBirth: cols[2] ?? '' };
+        return { fullName: cols[0] ?? '', documentNumber: cols[1] ?? '', dateOfBirth: cols[2] ?? '', nationality: 'CN' };
       })
       .filter((r) => r.fullName);
     if (parsed.length > 0) setRows(parsed);
@@ -6053,7 +6084,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                 className="btn-secondary text-sm"
                 onClick={() => {
                   setResult(null);
-                  setRows([{ fullName: '', documentNumber: '', dateOfBirth: '' }]);
+                  setRows([{ fullName: '', documentNumber: '', dateOfBirth: '', nationality: 'CN' }]);
                   setRosterWarnings([]);
                   setOtaText('');
                   setManualUnitPriceCny(null);
@@ -6375,12 +6406,13 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                 <button className="text-sm text-brand hover:text-brand-dark" onClick={addRow}>＋ 加一行</button>
               </div>
               <div className="scrollbar-visible max-h-60 overflow-x-auto overflow-y-auto rounded-md border border-slate-200">
-                <table className="min-w-[820px] w-full text-sm">
+                <table className="min-w-[900px] w-full text-sm">
                   <thead className="sticky top-0 bg-slate-50 text-xs text-slate-500">
                     <tr>
                       <th className="min-w-[130px] whitespace-nowrap px-2 py-1.5 text-left font-normal">姓名</th>
                       <th className="min-w-[120px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照号</th>
                       <th className="min-w-[70px] whitespace-nowrap px-2 py-1.5 text-left font-normal">性别</th>
+                      <th className="min-w-[64px] whitespace-nowrap px-2 py-1.5 text-left font-normal">国籍</th>
                       <th className="min-w-[110px] whitespace-nowrap px-2 py-1.5 text-left font-normal">出生日期</th>
                       <th className="min-w-[130px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照有效期</th>
                       <th className="min-w-[130px] whitespace-nowrap px-2 py-1.5 text-left font-normal">备注（选填）</th>
@@ -6409,6 +6441,24 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                             <option value="M">男</option>
                             <option value="F">女</option>
                           </select>
+                        </td>
+                        <td className="px-2 py-1 align-top">
+                          {(() => {
+                            const nat = (r.nationality ?? '').trim();
+                            const natBad = nat.length > 0 && !/^[A-Z]{2}$/.test(nat);
+                            return (
+                              <>
+                                <input
+                                  className={`w-full rounded border px-1.5 py-1 text-sm uppercase ${natBad ? 'border-rose-400 bg-rose-50' : 'border-slate-300'}`}
+                                  maxLength={2}
+                                  placeholder="CN"
+                                  value={r.nationality ?? ''}
+                                  onChange={(e) => setRow(i, { nationality: e.target.value.toUpperCase().replace(/[^A-Z]/g, '') })}
+                                />
+                                {natBad && <span className="mt-0.5 block text-[11px] text-rose-500">2 位国家码</span>}
+                              </>
+                            );
+                          })()}
                         </td>
                         <td className="px-2 py-1 align-top">
                           {(() => {
@@ -6687,7 +6737,7 @@ function ConfirmPaymentSection({
       : `mc-${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
   const [idemKey, setIdemKey] = useState(makeIdemKey);
 
-  async function confirm(): Promise<void> {
+  async function confirm(confirmDuplicate = false): Promise<void> {
     if (!token || submitting) return;
     setErr(null);
     const amt = amount ?? undefined;
@@ -6704,6 +6754,7 @@ function ConfirmPaymentSection({
         proofUrl: proofUrl ?? undefined,
         note: note.trim() || undefined,
         idempotencyKey: idemKey,
+        confirmDuplicate: confirmDuplicate || undefined,
       });
       setPaid(res.paidAmount);
       setProofUrl(null);
@@ -6713,6 +6764,17 @@ function ConfirmPaymentSection({
       setPayments(r.order.payments ?? []);
       onChanged?.();
     } catch (e: unknown) {
+      // 同额软闸：近 windowMinutes 分钟内同订单已录过等额收款 → 二次确认后带 confirmDuplicate 重发。
+      // 硬闸(400 超收) / 其它错误：直接把服务端 message 原样展示在错误条。
+      const dup = duplicateAmountDetails(e);
+      if (dup && !confirmDuplicate) {
+        setSubmitting(false);
+        const okToProceed = window.confirm(
+          `该订单 ${dup.windowMinutes} 分钟内已录过一笔 ¥${dup.amount.toLocaleString()}，确定这是另一笔新收款吗？`,
+        );
+        if (okToProceed) await confirm(true);
+        return;
+      }
       setErr(e instanceof ApiError ? e.message : '确认收款失败');
     } finally {
       setSubmitting(false);
@@ -6921,7 +6983,7 @@ function ConfirmPaymentSection({
               </label>
               <button
                 className="btn-primary text-sm disabled:opacity-50"
-                onClick={confirm}
+                onClick={() => confirm()}
                 disabled={submitting}
               >
                 {submitting ? '确认中…' : '确认收款'}

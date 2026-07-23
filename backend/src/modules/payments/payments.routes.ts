@@ -70,6 +70,9 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
     proofUrl: z.string().max(6_000_000).optional(), // data URL（截图）
     note: z.string().max(500).optional(),
     idempotencyKey: z.string().min(8).max(64).optional(), // 同 key 重试只入账一次
+    // 同额防呆软闸放行：近 10 分钟内该订单已有等额手工收款时，服务端返回 409 + code DUPLICATE_AMOUNT；
+    // 前端弹二次确认后带 confirmDuplicate:true 重提，确认这是另一笔真实到账（超收硬闸不受此放行影响）。
+    confirmDuplicate: z.boolean().optional(),
   });
   app.post('/manual-confirm', { preHandler: [app.authenticate] }, async (req, reply) => {
     if (req.user.role !== UserRole.ADMIN && req.user.role !== UserRole.STAFF) {
@@ -78,7 +81,7 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
     const body = manualConfirmSchema.parse(req.body);
     const result = await service.confirmManualPayment(
       body.orderId,
-      { amount: body.amount, method: body.method, proofUrl: body.proofUrl, note: body.note, idempotencyKey: body.idempotencyKey },
+      { amount: body.amount, method: body.method, proofUrl: body.proofUrl, note: body.note, idempotencyKey: body.idempotencyKey, confirmDuplicate: body.confirmDuplicate },
       { userId: req.user.sub, role: req.user.role },
     );
     void writeAudit({

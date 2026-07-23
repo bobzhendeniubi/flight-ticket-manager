@@ -51,12 +51,14 @@ export function derivePtcByAge(
   return 'ADT';
 }
 
-/** Title 联动：派生为 CHD/INF 且未录入 Title 时按性别给 MSTR（男）/MISS（女）；成人缺失维持现状（留空）。*/
-function deriveTitle(title: string | null | undefined, ptc: string, gender: string | null | undefined): string {
+/**
+ * Title 自动生成（航司系统只认 MR/MS，人名后带称谓，不分年龄段、无儿童称谓）：
+ * 手录 Title 优先原样保留；未录入时按性别派生 —— 男 → MR、女 → MS，所有年龄段一致（含儿童/婴儿）；性别缺失留空。
+ */
+function deriveTitle(title: string | null | undefined, gender: string | null | undefined): string {
   if (title) return title;
-  if (ptc !== 'CHD' && ptc !== 'INF') return '';
-  if (gender === 'M') return 'MSTR';
-  if (gender === 'F') return 'MISS';
+  if (gender === 'M') return 'MR';
+  if (gender === 'F') return 'MS';
   return '';
 }
 
@@ -134,7 +136,7 @@ export function passengerToRow(p: Passenger, departureDate?: Date | null): PnrRo
   const lastName = (p.lastName || autoLast || '').toUpperCase();
   const firstName = (p.firstName || autoFirst || '').toUpperCase();
   const ptc = derivePtcByAge(p.dateOfBirth, departureDate, p.passengerType);
-  const title = deriveTitle(p.title, ptc, p.gender);
+  const title = deriveTitle(p.title, p.gender);
   return {
     lastName,
     firstName,
@@ -198,10 +200,22 @@ export async function buildPnrWorkbook(order: PnrOrderInput): Promise<Buffer> {
   return Buffer.from(buf);
 }
 
-export function pnrExportFilename(orderNumber: string): string {
-  const today = new Date();
-  const day = String(today.getDate()).padStart(2, '0');
+/**
+ * 导出文件名 `{DD}{MON} {orderNumber}.xlsx`（如 `13JUL WT2026...`）。
+ * DD/MON 取该订单去程航班出发日（票务岗口径，UTC 与列内日期一致）；
+ * 取不到出发日（纯地面单/无航班行）→ 回退今天，保持原格式。
+ */
+export function pnrExportFilename(orderNumber: string, departureDate?: Date | null): string {
   const months = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
-  const mon = months[today.getMonth()];
+  let day: string;
+  let mon: string;
+  if (departureDate) {
+    day = String(departureDate.getUTCDate()).padStart(2, '0');
+    mon = months[departureDate.getUTCMonth()];
+  } else {
+    const today = new Date();
+    day = String(today.getDate()).padStart(2, '0');
+    mon = months[today.getMonth()];
+  }
   return `${day}${mon} ${orderNumber}.xlsx`;
 }

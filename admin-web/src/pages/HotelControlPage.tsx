@@ -22,6 +22,7 @@ import {
   type HotelControlAlerts,
   type HotelControlBoard,
   type HotelControlForward,
+  type HotelRecentRoomChanges,
   type HotelNightlyRemainingResult,
   type HotelOccupant,
   type OrderSummary,
@@ -189,6 +190,8 @@ export function HotelControlPage() {
       </section>
 
       {/* ── 提醒线横幅（超卖加房 / 富余退房 / 班次超开票上限）────────── */}
+      <RecentChangesPanel token={token} />
+
       <AlertsBanner token={token} />
 
       {error && (
@@ -1034,6 +1037,103 @@ type SharedOddNear = Array<{
 function readSharedOddNear(alerts: unknown): SharedOddNear {
   const a = alerts as { sharedOddNear?: SharedOddNear };
   return Array.isArray(a.sharedOddNear) ? a.sharedOddNear : [];
+}
+
+// ── 近期用房变更面板（GET /hotel-control/recent-changes；读审计流，不做已读态）──
+// 订单侧改了分房 / 换酒店 / 补收单房差，房控看板会静默反映——这里给一条「变更发生过」的
+// 可见性：默认收起，徽标示条数；点开列出 时间 / 订单号（可点跳订单）/ 操作人 / 变更摘要。
+const RECENT_CHANGES_DAYS = 7;
+
+/** ISO8601 → 本地「M/D HH:mm」。*/
+function fmtChangeTime(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const hh = String(d.getHours()).padStart(2, '0');
+  const mm = String(d.getMinutes()).padStart(2, '0');
+  return `${d.getMonth() + 1}/${d.getDate()} ${hh}:${mm}`;
+}
+
+function RecentChangesPanel({ token }: { token: string }) {
+  const [data, setData] = useState<HotelRecentRoomChanges | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [open, setOpen] = useState(false);
+
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    api
+      .getHotelRecentChanges(token, RECENT_CHANGES_DAYS)
+      .then((d) => {
+        if (!cancelled) setData(d);
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) setErr(e instanceof ApiError ? e.message : '用房变更加载失败');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [token]);
+
+  const count = data?.count ?? 0;
+  const hasChanges = count > 0;
+
+  return (
+    <section className="card">
+      <div className="flex items-center justify-between">
+        <h2 className="flex items-center gap-2 text-sm font-semibold text-ink">
+          近期用房变更
+          <span className="text-xs font-normal text-ink-muted">
+            （订单侧改分房 / 换酒店 / 补房差）
+          </span>
+          {data != null && (
+            <span className={hasChanges ? 'badge-warning' : 'badge-neutral'}>
+              近 {RECENT_CHANGES_DAYS} 天 {count} 条变更
+            </span>
+          )}
+        </h2>
+        <button
+          type="button"
+          onClick={() => setOpen((v) => !v)}
+          className="btn-ghost px-2 py-1 text-xs"
+          disabled={!hasChanges}
+        >
+          {open ? '收起 ▲' : '展开 ▼'}
+        </button>
+      </div>
+      {err ? (
+        <div className="mt-3 text-sm text-rose-600">{err}</div>
+      ) : data == null ? (
+        <div className="mt-3 text-sm text-ink-muted">加载用房变更…</div>
+      ) : !hasChanges ? (
+        <div className="mt-3 text-sm text-ink-muted">近 {RECENT_CHANGES_DAYS} 天暂无用房变更</div>
+      ) : (
+        open && (
+          <ul className="mt-3 divide-y divide-slate-100">
+            {data.changes.map((c) => (
+              <li key={c.id} className="flex flex-wrap items-baseline gap-x-2 gap-y-1 py-2 text-sm">
+                <span className="w-24 shrink-0 text-xs text-ink-muted nums">
+                  {fmtChangeTime(c.at)}
+                </span>
+                <span className="badge-neutral shrink-0">{c.actionLabel}</span>
+                {c.orderNumber ? (
+                  <Link
+                    to={`/orders?q=${encodeURIComponent(c.orderNumber)}`}
+                    className="shrink-0 font-medium text-brand hover:text-brand-dark nums"
+                  >
+                    {c.orderNumber}
+                  </Link>
+                ) : (
+                  <span className="shrink-0 text-ink-muted">—</span>
+                )}
+                <span className="text-ink-soft">{c.summary}</span>
+                <span className="text-xs text-ink-muted">· {c.actor ?? '—'}</span>
+              </li>
+            ))}
+          </ul>
+        )
+      )}
+    </section>
+  );
 }
 
 function AlertsBanner({ token }: { token: string }) {

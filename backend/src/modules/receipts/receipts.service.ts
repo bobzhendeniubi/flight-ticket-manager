@@ -29,6 +29,7 @@ import { BadRequestError, NotFoundError } from '../../lib/errors.js';
 import { FUNDS_CREDIT_BLOCKED_STATUSES } from '../../lib/funds-guard.js';
 import { writeAudit } from '../../lib/audit.js';
 import { PaymentsService } from '../payments/payments.service.js';
+import { earliestFlightDeparture } from '../orders/pnr-export.js';
 import type {
   AllocateReceiptInput,
   ExportStatementQuery,
@@ -45,6 +46,39 @@ import {
 /** 金额保留 2 位小数（CNY，避免浮点累计误差）。 */
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
+}
+
+/**
+ * YYYY-MM-DD（UTC date-only，与订单导出的 fmtDate 同口径）。
+ * @db.Date 过 JSON 会变成完整 ISO 串，这里在后端就切成纯日期，前端直接用。
+ */
+function fmtDateOnly(d: Date | null | undefined): string | null {
+  if (!d) return null;
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+}
+
+/** 订单最早入住日（纯签证/酒店等无航段单的出发日回落）；无 → null。*/
+function earliestHotelCheckIn(
+  items: Array<{ hotelCheckIn?: Date | null }>,
+): Date | null {
+  const dates = items
+    .map((it) => it.hotelCheckIn)
+    .filter((d): d is Date => Boolean(d));
+  if (dates.length === 0) return null;
+  return dates.reduce((min, d) => (d < min ? d : min));
+}
+
+/** 订单去程出发日期（最早 FLIGHT 行出发时间；无航段回落最早入住日；都无 → null）。*/
+function orderDepartDate(
+  items: Array<{
+    kind: string;
+    flightSchedule?: { departureTime: Date } | null;
+    hotelCheckIn?: Date | null;
+  }>,
+): string | null {
+  const flight = earliestFlightDeparture(items);
+  if (flight) return fmtDateOnly(flight);
+  return fmtDateOnly(earliestHotelCheckIn(items));
 }
 
 /**
@@ -609,6 +643,14 @@ export class ReceiptsService {
         prepaymentOffset: true,
         adjustmentCny: true,
         agent: { select: { companyName: true, contactName: true } },
+        // 出发日期展示用：去程 = 最早 FLIGHT 行出发时间，纯签证/酒店单回落最早入住日。
+        items: {
+          select: {
+            kind: true,
+            hotelCheckIn: true,
+            flightSchedule: { select: { departureTime: true } },
+          },
+        },
       },
       orderBy: { createdAt: 'desc' },
       take: 400,
@@ -624,6 +666,7 @@ export class ReceiptsService {
       totalPayable: number;
       paidAmount: number;
       balanceDue: number;
+      departureDate: string | null;
     }> = [];
     for (const o of orders) {
       const totalPayable = round2(Number(o.total) + (o.adjustmentCny ?? 0));
@@ -641,6 +684,7 @@ export class ReceiptsService {
         totalPayable,
         paidAmount: Number(o.paidAmount),
         balanceDue,
+        departureDate: orderDepartDate(o.items),
       });
       if (out.length >= 200) break;
     }

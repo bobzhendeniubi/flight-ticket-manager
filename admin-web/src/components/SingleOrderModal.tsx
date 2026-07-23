@@ -41,6 +41,7 @@ import {
 import { useAuth } from '../stores/auth';
 import { NumberInput } from './NumberInput';
 import { PassengerSuggestInput } from './PassengerSuggestInput';
+import { ProofImageViewer } from './ProofImageViewer';
 import { RoomingEditor, type RoomingPassenger } from './RoomingEditor';
 import { SearchSelect, type SearchSelectOption } from './SearchSelect';
 import { type OcrResult } from '../lib/passportOcr';
@@ -2234,9 +2235,11 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                             ) : p.passportPhotoUrl ? (
                               <div className="flex flex-col items-start gap-1">
                                 <div className="flex items-center gap-1">
-                                  <a href={p.passportPhotoUrl} target="_blank" rel="noreferrer">
-                                    <img src={p.passportPhotoUrl} alt="护照" className="h-7 w-10 rounded object-cover ring-1 ring-slate-200" />
-                                  </a>
+                                  <ProofImageViewer
+                                    src={p.passportPhotoUrl}
+                                    alt="护照"
+                                    thumbClassName="h-7 w-10 rounded object-cover ring-1 ring-slate-200"
+                                  />
                                   <button
                                     type="button"
                                     className="text-[10px] text-slate-400 hover:text-rose-500"

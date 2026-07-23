@@ -9,6 +9,7 @@
  *   GET    /hotel-control/board?from&to            销控板（按酒店×日期：切/占/余）
  *   GET    /hotel-control/forward?from&to          远期视图（按日期跨酒店合计）
  *   GET    /hotel-control/alerts?days=14           提醒线（超卖加房/富余退房/班次超员）
+ *   GET    /hotel-control/recent-changes?days=7    近期用房变更（读审计流：调整分房/换酒店/补房差）
  *   GET    /hotel-control/occupants?hotelId&date   占房下钻（某酒店某晚，谁占的）
  *   GET    /hotel-control/nightly-remaining?hotelRoomTypeId&checkIn&checkOut  当日余量（分房弹窗徽标）
  *   GET    /hotel-control/export?from&to           房态导出（xlsx，销控矩阵原样导出）
@@ -37,6 +38,7 @@ import {
   listBlockPeriodsQuerySchema,
   nightlyRemainingQuerySchema,
   occupantsQuerySchema,
+  recentChangesQuerySchema,
   updateBlockPeriodBodySchema,
 } from './hotel-control.schemas.js';
 import {
@@ -47,6 +49,7 @@ import {
   getForward,
   getNightlyRemainingForRoomType,
   getOccupyingOrders,
+  getRecentRoomChanges,
   listBlockPeriods,
   updateBlockPeriod,
 } from './hotel-control.service.js';
@@ -121,6 +124,12 @@ export const hotelControlRoutes: FastifyPluginAsync = async (app) => {
   app.get('/alerts', requireStaff, async (req) => {
     const q = alertsQuerySchema.parse(req.query);
     return getAlerts(q.days);
+  });
+
+  // ── 近期用房变更（读审计流；订单侧改了分房/换酒店/补房差 → 房控可见性）────
+  app.get('/recent-changes', requireStaff, async (req) => {
+    const q = recentChangesQuerySchema.parse(req.query);
+    return getRecentRoomChanges(q.days);
   });
 
   // ── 占房下钻（某酒店某晚，谁占的；销控矩阵余量格点击用）──────────────────

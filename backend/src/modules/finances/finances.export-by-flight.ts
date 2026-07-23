@@ -25,6 +25,7 @@ import {
   loadPeriodsByFlightIds,
   resolveScheduleCost,
 } from './finances.cost.service.js';
+import { visaItemCostCny } from './finances.service.js';
 
 const COUNTED_STATUSES: OrderStatus[] = [
   OrderStatus.PENDING_PAYMENT,
@@ -155,13 +156,17 @@ export async function buildFinanceExportByFlightWorkbook(
       : await client.order.findMany({
           where: { id: { in: orderIds } },
           include: {
-            passengers: { select: { id: true } },
+            passengers: { select: { id: true, visaExempt: true } },
             costItems: { select: { category: true, amountCny: true } },
             items: {
               include: {
                 hotelRoomType: { select: { costPriceCny: true } },
                 visa: { select: { costPriceCny: true } },
                 transfer: { select: { costPriceCny: true } },
+                fulfillmentTasks: {
+                  where: { type: 'VISA_APPLICATION' },
+                  select: { visaUnitCostCny: true },
+                },
               },
             },
           },
@@ -249,8 +254,19 @@ export async function buildFinanceExportByFlightWorkbook(
             );
           }
           hotelOrder += perNight * nights * it.quantity;
-        } else if (it.kind === 'VISA' && it.visa) {
-          visaOrder += dec(it.visa.costPriceCny) * it.quantity;
+        } else if (it.kind === 'VISA') {
+          // 签证成本与汇总/按乘客导出同口径（visaItemCostCny）：任务实际人均成本 × 需签乘客数
+          // 优先 → 录单快照 → 产品主数据。签证公司按航班开账单，此表是对账主战场，口径必须一致。
+          const taskCny = it.fulfillmentTasks?.[0]?.visaUnitCostCny;
+          const visaPax = o.passengers.filter((p) => !p.visaExempt).length;
+          const { cost } = visaItemCostCny({
+            taskUnitCostCny: taskCny == null ? null : dec(taskCny),
+            visaPax,
+            snapshotCny: it.totalCostCny != null ? dec(it.totalCostCny) : null,
+            productCostPriceCny: it.visa?.costPriceCny != null ? dec(it.visa.costPriceCny) : null,
+            quantity: it.quantity,
+          });
+          visaOrder += cost;
         } else if (it.kind === 'TRANSFER' && it.transfer) {
           transferOrder += dec(it.transfer.costPriceCny) * it.quantity;
         }

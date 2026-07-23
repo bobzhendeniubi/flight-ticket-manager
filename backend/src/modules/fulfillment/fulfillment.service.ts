@@ -20,6 +20,7 @@ import {
   VisaEntryType,
   VisaIssuanceMethod,
   VisaRequirement,
+  VisaSubmissionStatus,
 } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { ConflictError, NotFoundError } from '../../lib/errors.js';
@@ -149,6 +150,91 @@ export function issuanceMethodWhere(
   return { visa: { is: { issuanceMethod: filter } } };
 }
 
+/**
+ * 送签进度的推进次序（低→高）——派生任务级状态时取「最早（最低）」那一档。
+ */
+const VISA_SUBMISSION_RANK: Record<VisaSubmissionStatus, number> = {
+  [VisaSubmissionStatus.PENDING]: 0,
+  [VisaSubmissionStatus.IN_PROGRESS]: 1,
+  [VisaSubmissionStatus.CONFIRMED]: 2,
+};
+
+/**
+ * 乘客送签进度 → 任务级 FulfillmentStatus 的恒等映射（成员同名，语义一致）。
+ * 只覆盖三档送签进度；CANCELLED/FAILED 是任务级独有态，不由乘客派生（见 rederiveVisaTasksForOrder）。
+ */
+const SUBMISSION_TO_TASK: Record<VisaSubmissionStatus, FulfillmentStatus> = {
+  [VisaSubmissionStatus.PENDING]: FulfillmentStatus.PENDING,
+  [VisaSubmissionStatus.IN_PROGRESS]: FulfillmentStatus.IN_PROGRESS,
+  [VisaSubmissionStatus.CONFIRMED]: FulfillmentStatus.CONFIRMED,
+};
+
+/**
+ * 派生口径：全部需签乘客到达某档，任务才算该档；只要有人更早，任务保持较早那一档。
+ *   实现 = 取所有非自备签乘客送签进度里**最低**的一档，再恒等映射到任务级状态。
+ * 无非自备签乘客（空数组）→ PENDING（无人可送，保持待处理）。
+ */
+export function deriveVisaTaskStatus(statuses: VisaSubmissionStatus[]): FulfillmentStatus {
+  if (statuses.length === 0) return FulfillmentStatus.PENDING;
+  let lowest = statuses[0];
+  for (const s of statuses) {
+    if (VISA_SUBMISSION_RANK[s] < VISA_SUBMISSION_RANK[lowest]) lowest = s;
+  }
+  return SUBMISSION_TO_TASK[lowest];
+}
+
+/**
+ * 任务级三档进度状态（可由乘客派生 / 被派生覆盖）——CANCELLED/FAILED 为终态，不在此列，
+ * 派生只在这三档之间流转，永不复活终态。
+ */
+const DERIVABLE_TASK_STATUSES: FulfillmentStatus[] = [
+  FulfillmentStatus.PENDING,
+  FulfillmentStatus.IN_PROGRESS,
+  FulfillmentStatus.CONFIRMED,
+];
+
+/**
+ * 任务级状态是否属于「可映射到乘客送签进度」的三档（成员名与 VisaSubmissionStatus 逐字相同）。
+ * 为真时可安全把该值当作 VisaSubmissionStatus 使用（见 asVisaSubmissionStatus）。
+ */
+function isVisaSubmissionStatus(s: FulfillmentStatus): boolean {
+  return DERIVABLE_TASK_STATUSES.includes(s);
+}
+
+/**
+ * 把已确认属于三档进度的任务级状态转成乘客级 VisaSubmissionStatus（同名枚举值，运行时等值）。
+ * 调用前须 isVisaSubmissionStatus(s) 为真。
+ */
+function asVisaSubmissionStatus(s: FulfillmentStatus): VisaSubmissionStatus {
+  return s as unknown as VisaSubmissionStatus;
+}
+
+/** Prisma.Decimal | number | null → number | null（签证金额序列化用） */
+function decOrNull(v: Prisma.Decimal | number | null | undefined): number | null {
+  if (v == null) return null;
+  return typeof v === 'number' ? v : Number(v.toString());
+}
+
+/**
+ * 解析签证任务的人均成本三字段 —— CNY 为入账权威：
+ *   · 美金单价 + 汇率齐备 → 自动折算 CNY 存底（覆盖任何直填 CNY，保证「$x ×汇率=¥y」自洽）
+ *   · 否则 → 用直填 CNY（美金/汇率各自原样，通常为空）
+ * 三者皆空即回退产品主数据成本（调用方据此清空）。
+ */
+export function resolveVisaUnitCost(input: {
+  visaUnitCostUsd?: number | null;
+  visaFxRate?: number | null;
+  visaUnitCostCny?: number | null;
+}): { usd: number | null; rate: number | null; cny: number | null } {
+  const usd = input.visaUnitCostUsd ?? null;
+  const rate = input.visaFxRate ?? null;
+  const cny =
+    usd != null && rate != null
+      ? Math.round(usd * rate * 100) / 100
+      : (input.visaUnitCostCny ?? null);
+  return { usd, rate, cny };
+}
+
 export class FulfillmentService {
   /**
    * 为订单的每个 item 创建任务（幂等 — 已有则跳过）。
@@ -194,7 +280,14 @@ export class FulfillmentService {
       prisma.passenger.findMany({
         // 自备签证乘客（visaExempt=true）不进签证台：客人自行办妥签证，无需送签。
         where: { orderId, visaExempt: false },
-        select: { id: true, fullName: true, documentNumber: true, passportPhotoUrl: true },
+        select: {
+          id: true,
+          fullName: true,
+          documentNumber: true,
+          passportPhotoUrl: true,
+          passportExpiry: true,
+          visaSubmissionStatus: true,
+        },
       }),
     ]);
     const serializedPassengers = passengers.map(serializePassenger);
@@ -249,7 +342,21 @@ export class FulfillmentService {
    * 所以必须先 `AT TIME ZONE 'UTC'` 还原成 timestamptz，再 `AT TIME ZONE departureTz`
    * 落到出发地本地时刻。少了第一跳会把 UTC 时刻当成本地时刻，日期整体错位。
    */
-  private async departureDateWhere(departureDate: string): Promise<Prisma.OrderItemWhereInput> {
+  private async departureDateWhere(
+    from: string | undefined,
+    to: string | undefined,
+  ): Promise<Prisma.OrderItemWhereInput> {
+    // 最早一段机票出发地本地日，供区间上下界比对（'YYYY-MM-DD' 串按字典序比较即日期序）
+    const localDay = Prisma.sql`to_char(
+      fs."departureTime" AT TIME ZONE 'UTC' AT TIME ZONE fs."departureTz",
+      'YYYY-MM-DD'
+    )`;
+    // 区间边界：from/to 各自可缺省（开区间）；至少有一侧（调用方已保证）
+    const bounds: Prisma.Sql[] = [];
+    if (from) bounds.push(Prisma.sql`${localDay} >= ${from}`);
+    if (to) bounds.push(Prisma.sql`${localDay} <= ${to}`);
+    const boundsSql = Prisma.join(bounds, ' AND ');
+
     const rows = await prisma.$queryRaw<Array<{ orderId: string }>>(Prisma.sql`
       SELECT DISTINCT oi."orderId" AS "orderId"
       FROM "OrderItem" oi
@@ -261,17 +368,14 @@ export class FulfillmentService {
           JOIN "FlightSchedule" fs2 ON fs2."id" = oi2."flightScheduleId"
           WHERE oi2."orderId" = oi."orderId" AND oi2."kind"::text = 'FLIGHT'
         )
-        AND to_char(
-          fs."departureTime" AT TIME ZONE 'UTC' AT TIME ZONE fs."departureTz",
-          'YYYY-MM-DD'
-        ) = ${departureDate}
+        AND ${boundsSql}
     `);
     const orderIds = rows.map((r) => r.orderId);
 
     return {
       order: {
         OR: [
-          // 最早一段机票的出发地本地日 = 所选日期
+          // 最早一段机票的出发地本地日落在所选区间内
           { id: { in: orderIds } },
           // 无航班订单（纯签证单等）→ 保留可见
           { items: { none: { kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } } } },
@@ -295,8 +399,11 @@ export class FulfillmentService {
     // 对不上，并且跨页的匹配项永远凑不齐（签证岗按「待办」翻页会漏单）。
     const orderItemAnd: Prisma.OrderItemWhereInput[] = [];
     if (query.issuanceMethod) orderItemAnd.push(issuanceMethodWhere(query.issuanceMethod));
-    if (query.departureDate) {
-      orderItemAnd.push(await this.departureDateWhere(query.departureDate));
+    // 出发日期筛选：优先区间 from/to（任一侧可缺），向后兼容旧单日参数 departureDate（= from=to=该日）。
+    const depFrom = query.departureDateFrom ?? query.departureDate;
+    const depTo = query.departureDateTo ?? query.departureDate;
+    if (depFrom || depTo) {
+      orderItemAnd.push(await this.departureDateWhere(depFrom, depTo));
     }
     if (orderItemAnd.length) orderItemWhere.AND = orderItemAnd;
 
@@ -363,6 +470,10 @@ export class FulfillmentService {
       gender: string | null;
       documentNumber: string;
       hasPhoto: boolean;
+      // 护照有效期（YYYY-MM-DD，@db.Date 用 to_char 直出，无时区问题）；null=未录入
+      passportExpiry: string | null;
+      // 按人送签进度
+      visaSubmissionStatus: VisaSubmissionStatus;
     };
     type FlightLegRow = {
       orderId: string;
@@ -377,7 +488,9 @@ export class FulfillmentService {
         ? prisma.$queryRaw<PassengerRow[]>(Prisma.sql`
             SELECT "orderId", "id", "fullName", "lastName", "firstName",
                    "chineseName", "gender"::text AS "gender", "documentNumber",
-                   ("passportPhotoUrl" IS NOT NULL AND length("passportPhotoUrl") > 0) AS "hasPhoto"
+                   ("passportPhotoUrl" IS NOT NULL AND length("passportPhotoUrl") > 0) AS "hasPhoto",
+                   to_char("passportExpiry", 'YYYY-MM-DD') AS "passportExpiry",
+                   "visaSubmissionStatus"::text AS "visaSubmissionStatus"
             FROM "Passenger"
             WHERE "orderId" IN (${Prisma.join(visaOrderIds)})
               AND "visaExempt" = false
@@ -458,6 +571,10 @@ export class FulfillmentService {
                   documentNumber: p.documentNumber,
                   passportPhotoUrl: null as string | null,
                   hasPhoto: p.hasPhoto,
+                  // 护照有效期（YYYY-MM-DD / null）→ 签证台按人平铺展示 + 临期标黄
+                  passportExpiry: p.passportExpiry,
+                  // 按人送签进度 → 勾选按人标记 + 订单行「已送 x/y」
+                  visaSubmissionStatus: p.visaSubmissionStatus,
                 })),
               }
             : {}),
@@ -512,11 +629,40 @@ export class FulfillmentService {
     if (body.assigneeUserId !== undefined) data.assigneeUserId = body.assigneeUserId;
     if (body.failureReason !== undefined) data.failureReason = body.failureReason;
 
+    // 签证实际成本（人均口径）：任一字段出现即视为设置。只允许签证任务（其余任务无签证成本语义）。
+    const hasVisaCost =
+      body.visaUnitCostUsd !== undefined ||
+      body.visaFxRate !== undefined ||
+      body.visaUnitCostCny !== undefined;
+    if (hasVisaCost) {
+      if (existing.type !== FulfillmentType.VISA_APPLICATION) {
+        throw new ConflictError('签证金额只能设置在签证任务上');
+      }
+      const resolved = resolveVisaUnitCost(body);
+      data.visaUnitCostUsd = resolved.usd;
+      data.visaFxRate = resolved.rate;
+      data.visaUnitCostCny = resolved.cny;
+    }
+
     const updated = await prisma.fulfillmentTask.update({
       where: { id },
       data,
       include: { orderItem: { include: { order: { select: { id: true, orderNumber: true, contactName: true, contactPhone: true, status: true, notes: true } } } } },
     });
+
+    // 任务级 VISA 流转 = 「作用于该单全部乘客」：把订单所有非自备签乘客的送签进度改写成同一档，
+    // 使派生与直写一致（旧的任务级批量入口由此保持语义：整单一起推进）。只对三档送签进度生效；
+    // CANCELLED/FAILED 是任务级独有终态，不改乘客送签进度。
+    if (
+      updated.type === FulfillmentType.VISA_APPLICATION &&
+      body.status !== undefined &&
+      isVisaSubmissionStatus(body.status)
+    ) {
+      await prisma.passenger.updateMany({
+        where: { orderId: updated.orderItem.orderId, visaExempt: false },
+        data: { visaSubmissionStatus: asVisaSubmissionStatus(body.status) },
+      });
+    }
 
     // FLIGHT 完成时，把 PNR / e-ticket 同步到 Passenger（全订单的乘客都标）
     if (updated.type === FulfillmentType.FLIGHT_TICKETING && updated.status === FulfillmentStatus.CONFIRMED && updated.data) {
@@ -588,6 +734,150 @@ export class FulfillmentService {
       }
     }
     return { successCount, failureCount: failures.length, failures };
+  }
+
+  /**
+   * 批量设置签证任务的人均成本（签证公司按航班开统一单价是常态）。
+   * 逐条复用 update() 的单任务校验（仅签证任务 + 非负 + USD→CNY 折算），不另写规则；
+   * 单条失败不影响其余，返回 failures 明细（镜像 batchUpdateStatus 的返回形状）。
+   */
+  async batchSetVisaCost(
+    taskIds: string[],
+    cost: {
+      visaUnitCostUsd?: number | null;
+      visaFxRate?: number | null;
+      visaUnitCostCny?: number | null;
+    },
+  ): Promise<{
+    successCount: number;
+    failureCount: number;
+    failures: Array<{ id: string; error: string }>;
+  }> {
+    let successCount = 0;
+    const failures: Array<{ id: string; error: string }> = [];
+    for (const id of taskIds) {
+      try {
+        await this.update(id, cost);
+        successCount += 1;
+      } catch (err) {
+        failures.push({ id, error: err instanceof Error ? err.message : '未知错误' });
+      }
+    }
+    return { successCount, failureCount: failures.length, failures };
+  }
+
+  /**
+   * 重新派生某订单签证任务的状态（按人送签用）：
+   * 取该单全部非自备签乘客送签进度里**最早**一档，写回该单所有签证任务的状态。
+   * 只覆盖三档进度中的任务（status in DERIVABLE_TASK_STATUSES）——CANCELLED/FAILED 终态不复活。
+   *
+   * completedAt：派生为「已送签」时置当前时间，否则清空（与任务级 update 的完成时间语义一致）。
+   * startedAt 不在此管理（更新多行无法逐行保留旧值；签证台不展示该字段）。
+   */
+  private async rederiveVisaTasksForOrder(orderId: string): Promise<FulfillmentStatus> {
+    const passengers = await prisma.passenger.findMany({
+      where: { orderId, visaExempt: false },
+      select: { visaSubmissionStatus: true },
+    });
+    const derived = deriveVisaTaskStatus(passengers.map((p) => p.visaSubmissionStatus));
+    await prisma.fulfillmentTask.updateMany({
+      where: {
+        orderItem: { orderId },
+        type: FulfillmentType.VISA_APPLICATION,
+        status: { in: DERIVABLE_TASK_STATUSES },
+      },
+      data: {
+        status: derived,
+        completedAt: derived === FulfillmentStatus.CONFIRMED ? new Date() : null,
+      },
+    });
+    return derived;
+  }
+
+  /**
+   * 按人更新送签进度（批量）——部分送签的核心入口。
+   *
+   * 逐个乘客校验：存在 / 非自备签 / 父订单存活（与任务级 update 同一存活闸）；
+   * 通过者一次性 updateMany 改写送签进度，再对受影响订单逐单重新派生任务级状态。
+   * 单个失败不影响其余，返回 failures 明细（镜像 batchUpdateStatus 的返回形状）。
+   */
+  async batchUpdateVisaPassengerStatus(
+    passengerIds: string[],
+    toStatus: VisaSubmissionStatus,
+  ): Promise<{
+    successCount: number;
+    failureCount: number;
+    failures: Array<{ id: string; error: string }>;
+    affectedOrderIds: string[];
+  }> {
+    const passengers = await prisma.passenger.findMany({
+      where: { id: { in: passengerIds } },
+      select: {
+        id: true,
+        orderId: true,
+        visaExempt: true,
+        order: { select: { status: true, deletedAt: true } },
+      },
+    });
+    const byId = new Map(passengers.map((p) => [p.id, p]));
+
+    const failures: Array<{ id: string; error: string }> = [];
+    const okIds: string[] = [];
+    const affectedOrders = new Set<string>();
+    for (const id of passengerIds) {
+      const p = byId.get(id);
+      if (!p) {
+        failures.push({ id, error: '乘客不存在' });
+        continue;
+      }
+      if (p.visaExempt) {
+        failures.push({ id, error: '该乘客自备签证，无需送签' });
+        continue;
+      }
+      if (p.order.deletedAt || !COUNTED_STATUSES.includes(p.order.status)) {
+        failures.push({
+          id,
+          error: `父订单状态为 ${p.order.status}${p.order.deletedAt ? '（已在回收站）' : ''}，不可标记送签进度`,
+        });
+        continue;
+      }
+      okIds.push(id);
+      affectedOrders.add(p.orderId);
+    }
+
+    if (okIds.length > 0) {
+      await prisma.passenger.updateMany({
+        where: { id: { in: okIds } },
+        data: { visaSubmissionStatus: toStatus },
+      });
+      // 逐单重新派生任务级状态（受影响订单去重后处理）
+      for (const orderId of affectedOrders) {
+        await this.rederiveVisaTasksForOrder(orderId);
+      }
+    }
+
+    return {
+      successCount: okIds.length,
+      failureCount: failures.length,
+      failures,
+      affectedOrderIds: [...affectedOrders],
+    };
+  }
+
+  /**
+   * 按人更新送签进度（单个）——批量的薄封装，失败即抛（乘客不存在 → 404，其余 → 409）。
+   */
+  async updateVisaPassengerStatus(
+    passengerId: string,
+    toStatus: VisaSubmissionStatus,
+  ): Promise<{ passengerId: string; status: VisaSubmissionStatus; orderId: string | null }> {
+    const res = await this.batchUpdateVisaPassengerStatus([passengerId], toStatus);
+    if (res.failureCount > 0) {
+      const msg = res.failures[0].error;
+      if (msg === '乘客不存在') throw new NotFoundError(msg);
+      throw new ConflictError(msg);
+    }
+    return { passengerId, status: toStatus, orderId: res.affectedOrderIds[0] ?? null };
   }
 
   /**
@@ -710,6 +1000,8 @@ function serializePassenger(p: {
   fullName: string;
   documentNumber: string;
   passportPhotoUrl: string | null;
+  passportExpiry: Date | null;
+  visaSubmissionStatus: VisaSubmissionStatus;
 }) {
   return {
     id: p.id,
@@ -717,6 +1009,10 @@ function serializePassenger(p: {
     documentNumber: p.documentNumber,
     passportPhotoUrl: p.passportPhotoUrl,
     hasPhoto: p.passportPhotoUrl !== null && p.passportPhotoUrl.length > 0,
+    // 护照有效期 → YYYY-MM-DD（@db.Date 经 JSON 是完整 ISO 串，这里裁到日）；null=未录入
+    passportExpiry: p.passportExpiry ? p.passportExpiry.toISOString().slice(0, 10) : null,
+    // 按人送签进度（部分送签用）
+    visaSubmissionStatus: p.visaSubmissionStatus,
   };
 }
 
@@ -726,6 +1022,9 @@ function serializeTask(
     data: unknown; notes: string | null; attempts: number;
     scheduledAt: Date | null; startedAt: Date | null; completedAt: Date | null;
     failureReason: string | null; assigneeUserId: string | null;
+    visaUnitCostUsd?: Prisma.Decimal | number | null;
+    visaFxRate?: Prisma.Decimal | number | null;
+    visaUnitCostCny?: Prisma.Decimal | number | null;
     createdAt: Date; updatedAt: Date;
   },
   item: { id: string; kind: OrderItemKind; description: string; quantity: number; orderId: string },
@@ -743,6 +1042,10 @@ function serializeTask(
     completedAt: t.completedAt,
     failureReason: t.failureReason,
     assigneeUserId: t.assigneeUserId,
+    // 签证实际成本（人均口径）；非签证任务/未设置 = null
+    visaUnitCostUsd: decOrNull(t.visaUnitCostUsd),
+    visaFxRate: decOrNull(t.visaFxRate),
+    visaUnitCostCny: decOrNull(t.visaUnitCostCny),
     createdAt: t.createdAt,
     updatedAt: t.updatedAt,
     item: {

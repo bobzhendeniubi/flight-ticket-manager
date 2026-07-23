@@ -17,6 +17,7 @@ import {
   getFinancesSummary,
   getFlightPnl,
   getOrderPnl,
+  getOrderPnlDetail,
   getMonthlyTrend,
 } from './finances.service.js';
 import {
@@ -35,6 +36,10 @@ import {
   buildFinanceExportByFlightWorkbook,
   financeExportByFlightFilename,
 } from './finances.export-by-flight.js';
+import {
+  buildFinanceExportByOrderWorkbook,
+  financeExportByOrderFilename,
+} from './finances.export-orders.js';
 
 const dateStr = z
   .string()
@@ -79,7 +84,7 @@ function defaultRange(): { from: string; to: string } {
 
 function logView(
   req: FastifyRequest,
-  detail: { route: string; range?: { from: string; to: string }; months?: number },
+  detail: { route: string; range?: { from: string; to: string }; months?: number; orderId?: string },
 ): void {
   void writeAudit({
     actor: actorFromRequest(req),
@@ -120,6 +125,15 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
     logView(req, { route: 'orders', range });
     const rows = await getOrderPnl(range, q.limit ?? 100);
     return { range, rows };
+  });
+
+  // ── 单订单收支明细（下钻）：收入逐项 + 成本逐项 + 杂项成本逐条 ──
+  app.get('/orders/:id/pnl-detail', requireAdmin, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    logView(req, { route: 'order-pnl-detail', orderId: id });
+    const detail = await getOrderPnlDetail(id);
+    if (!detail) return reply.status(404).send({ error: '订单不存在或已删除' });
+    return detail;
   });
 
   app.get('/monthly', requireAdmin, async (req) => {
@@ -164,6 +178,25 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
       .header(
         'Content-Disposition',
         `attachment; filename="${encodeURIComponent(financeExportByFlightFilename(range))}"`,
+      )
+      .send(buf);
+  });
+
+  // ── xlsx 导出（一行/订单，订单毛利）──
+  app.get('/export-orders', requireAdmin, async (req, reply) => {
+    const q = rangeSchema.parse(req.query);
+    const def = defaultRange();
+    const range = { from: q.from ?? def.from, to: q.to ?? def.to };
+    logView(req, { route: 'export-orders', range });
+    const buf = await buildFinanceExportByOrderWorkbook(range);
+    return reply
+      .header(
+        'Content-Type',
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      )
+      .header(
+        'Content-Disposition',
+        `attachment; filename="${encodeURIComponent(financeExportByOrderFilename(range))}"`,
       )
       .send(buf);
   });

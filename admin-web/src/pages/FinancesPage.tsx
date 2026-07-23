@@ -18,6 +18,7 @@ import {
   type FinanceSummary,
   type FlightPnlRow,
   type OrderPnlRow,
+  type OrderPnlDetail,
   type MonthlyPoint,
   type Hotel,
   type Visa,
@@ -54,6 +55,21 @@ const STATUS_LABEL: Record<string, string> = {
   CHANGE_REQUESTED: '改期中',
   CHANGED: '已改期',
   FAILED: '失败',
+};
+
+// 订单项类型标签（覆盖收支明细里可能出现的全部 kind，含调价 FEE/DISCOUNT）
+const ITEM_KIND_LABEL: Record<string, string> = {
+  FLIGHT: '机票',
+  HOTEL: '酒店',
+  TRANSFER: '地面服务',
+  VISA: '签证',
+  BUNDLE: '套餐',
+  INSURANCE: '保险',
+  GUIDE: '导游',
+  UPGRADE_CHANGE: '升舱/改期',
+  OVERSALE: '超售',
+  FEE: '加价',
+  DISCOUNT: '优惠',
 };
 
 // ── helpers ────────────────────────────────────────────────────────────────
@@ -1672,6 +1688,7 @@ function OrdersTab({ token, range }: { token: string; range: { from: string; to:
   const [rows, setRows] = useState<OrderPnlRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
+  const [detailOrderId, setDetailOrderId] = useState<string | null>(null);
 
   useEffect(() => {
     if (!token) return;
@@ -1699,10 +1716,15 @@ function OrdersTab({ token, range }: { token: string; range: { from: string; to:
 
   return (
     <section className="card">
-      <h2 className="text-sm font-semibold text-ink">按订单 P&L（最多 100 条）</h2>
-      <p className="mt-1 text-xs text-slate-500">
-        毛利 = 订单总价 − Σ(OrderItem.totalCostCny)。某一条目没填成本则全单跳过成本统计。
-      </p>
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h2 className="text-sm font-semibold text-ink">按订单 P&L（最多 100 条）</h2>
+          <p className="mt-1 text-xs text-slate-500">
+            毛利 = 订单总价 − Σ(OrderItem.totalCostCny)。某一条目没填成本则全单跳过成本统计。点「明细」看逐项收支。
+          </p>
+        </div>
+        <ExportByOrderButton token={token} range={range} />
+      </div>
       <div className="mt-3 overflow-x-auto">
         <table className="w-full text-sm">
           <thead className="text-xs uppercase tracking-wide text-ink-muted">
@@ -1715,12 +1737,13 @@ function OrdersTab({ token, range }: { token: string; range: { from: string; to:
               <th className="py-2 text-right font-normal">成本</th>
               <th className="py-2 text-right font-normal">毛利</th>
               <th className="py-2 text-right font-normal">毛利率</th>
+              <th className="py-2 text-right font-normal">明细</th>
             </tr>
           </thead>
           <tbody>
             {rows.length === 0 && (
               <tr>
-                <td colSpan={8} className="py-4 text-center text-ink-muted">
+                <td colSpan={9} className="py-4 text-center text-ink-muted">
                   区间内没有订单
                 </td>
               </tr>
@@ -1759,13 +1782,315 @@ function OrdersTab({ token, range }: { token: string; range: { from: string; to:
                   <td className="py-2 text-right tabular-nums text-slate-600">
                     {fmtPct(o.marginPct)}
                   </td>
+                  <td className="py-2 text-right">
+                    <button
+                      type="button"
+                      onClick={() => setDetailOrderId(o.orderId)}
+                      className="text-blue-700 hover:underline"
+                    >
+                      明细
+                    </button>
+                  </td>
                 </tr>
               );
             })}
           </tbody>
         </table>
       </div>
+
+      {detailOrderId && (
+        <OrderPnlDetailModal
+          token={token}
+          orderId={detailOrderId}
+          onClose={() => setDetailOrderId(null)}
+        />
+      )}
     </section>
+  );
+}
+
+// ── 按订单导出按钮 ───────────────────────────────────────────────────────────
+function ExportByOrderButton({ token, range }: { token: string; range: { from: string; to: string } }) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function onClick(): Promise<void> {
+    if (!token || busy) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      const blob = await api.downloadFinanceExportByOrder(token, range);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `按订单毛利_${range.from}_${range.to}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e: unknown) {
+      setErr(e instanceof ApiError ? e.message : '导出失败');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="flex flex-col items-end gap-1">
+      <button
+        type="button"
+        onClick={onClick}
+        disabled={busy}
+        className="btn-secondary whitespace-nowrap"
+        title="区间内每张订单一行的毛利汇总"
+      >
+        {busy ? '导出中…' : '⬇ 按订单导出'}
+      </button>
+      {err && <span className="text-xs text-rose-600">{err}</span>}
+    </div>
+  );
+}
+
+// ── 单订单收支明细弹层 ───────────────────────────────────────────────────────
+function OrderPnlDetailModal({
+  token,
+  orderId,
+  onClose,
+}: {
+  token: string;
+  orderId: string;
+  onClose: () => void;
+}) {
+  const [data, setData] = useState<OrderPnlDetail | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setErr(null);
+    api
+      .getFinanceOrderPnlDetail(token, orderId)
+      .then((d) => {
+        if (!cancelled) setData(d);
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) setErr(e instanceof ApiError ? e.message : '加载失败');
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [token, orderId]);
+
+  const marginTone = (v: number | null): string =>
+    v == null ? 'text-slate-400' : v < 0 ? 'text-rose-700' : 'text-emerald-700';
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 p-4"
+      onClick={onClose}
+    >
+      <div
+        className="mt-10 w-full max-w-3xl rounded-lg bg-white p-5 shadow-xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <h3 className="text-base font-semibold text-ink">订单收支明细</h3>
+            {data && (
+              <p className="mt-0.5 text-xs text-slate-500">
+                {data.orderNumber} · {STATUS_LABEL[data.status] ?? data.status} · {data.contactName}
+                {data.agentName ? ` · ${data.agentName}` : ''}
+                {data.departureDate ? ` · 出发 ${data.departureDate}` : ''}
+              </p>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            className="text-slate-400 hover:text-slate-700"
+            aria-label="关闭"
+          >
+            ✕
+          </button>
+        </div>
+
+        {loading && <div className="mt-4 text-sm text-slate-500">加载中…</div>}
+        {err && <div className="mt-4 text-sm text-rose-600">加载失败：{err}</div>}
+
+        {data && !loading && (
+          <div className="mt-4 grid gap-5 md:grid-cols-2">
+            {/* 收入表 */}
+            <div>
+              <h4 className="text-sm font-semibold text-ink">收入构成</h4>
+              <table className="mt-2 w-full text-sm">
+                <thead className="text-xs uppercase tracking-wide text-ink-muted">
+                  <tr className="border-b border-slate-200">
+                    <th className="py-1.5 text-left font-normal">项目</th>
+                    <th className="py-1.5 text-right font-normal">数量</th>
+                    <th className="py-1.5 text-right font-normal">单价</th>
+                    <th className="py-1.5 text-right font-normal">小计</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.income.rows.map((r, i) => (
+                    <tr key={i} className="border-b border-slate-100 last:border-0">
+                      <td className="py-1.5">
+                        <span className={r.isAdjustment ? 'text-violet-700' : 'text-slate-800'}>
+                          {r.label}
+                        </span>
+                        <span className="ml-1 text-xs text-slate-400">
+                          {ITEM_KIND_LABEL[r.kind] ?? r.kind}
+                        </span>
+                      </td>
+                      <td className="py-1.5 text-right tabular-nums text-slate-500">{r.quantity}</td>
+                      <td className="py-1.5 text-right tabular-nums text-slate-500">
+                        {fmtCny(r.unitPriceCny)}
+                      </td>
+                      <td className="py-1.5 text-right tabular-nums">{fmtCny(r.subtotalCny)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+                <tfoot>
+                  <tr className="border-t border-slate-300 font-medium">
+                    <td className="py-1.5" colSpan={3}>
+                      订单总收入
+                    </td>
+                    <td className="py-1.5 text-right tabular-nums">{fmtCny(data.income.totalCny)}</td>
+                  </tr>
+                </tfoot>
+              </table>
+              {Math.abs(data.income.itemsSumCny - data.income.totalCny) > 0.01 && (
+                <p className="mt-1 text-xs text-slate-400">
+                  注：各行小计合计 {fmtCny(data.income.itemsSumCny)}，订单总价以「订单总收入」为准。
+                </p>
+              )}
+            </div>
+
+            {/* 成本表 */}
+            <div>
+              <h4 className="text-sm font-semibold text-ink">成本构成</h4>
+              <table className="mt-2 w-full text-sm">
+                <thead className="text-xs uppercase tracking-wide text-ink-muted">
+                  <tr className="border-b border-slate-200">
+                    <th className="py-1.5 text-left font-normal">项目</th>
+                    <th className="py-1.5 text-right font-normal">数量</th>
+                    <th className="py-1.5 text-right font-normal">成本</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.cost.itemRows.map((r, i) => (
+                    <tr key={i} className="border-b border-slate-100 last:border-0">
+                      <td className="py-1.5">
+                        <span className="text-slate-800">{r.label}</span>
+                        <span className="ml-1 text-xs text-slate-400">
+                          {ITEM_KIND_LABEL[r.kind] ?? r.kind}
+                        </span>
+                      </td>
+                      <td className="py-1.5 text-right tabular-nums text-slate-500">{r.quantity}</td>
+                      <td className="py-1.5 text-right tabular-nums text-slate-600">
+                        {r.totalCostCny == null ? (
+                          <span className="text-amber-600">缺</span>
+                        ) : (
+                          fmtCny(r.totalCostCny)
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                  {data.cost.miscRows.length > 0 && (
+                    <tr>
+                      <td colSpan={3} className="pt-2 text-xs text-ink-muted">
+                        订单杂项成本
+                      </td>
+                    </tr>
+                  )}
+                  {data.cost.miscRows.map((r, i) => (
+                    <tr key={`m${i}`} className="border-b border-slate-100 last:border-0">
+                      <td className="py-1.5">
+                        <span className="text-slate-800">{r.label}</span>
+                        {r.note && <span className="ml-1 text-xs text-slate-400">{r.note}</span>}
+                      </td>
+                      <td className="py-1.5 text-right tabular-nums text-slate-500">—</td>
+                      <td className="py-1.5 text-right tabular-nums text-slate-600">
+                        {fmtCny(r.amountCny)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+                <tfoot>
+                  <tr className="border-t border-slate-200">
+                    <td className="py-1.5 text-slate-500" colSpan={2}>
+                      订单项成本小计
+                    </td>
+                    <td className="py-1.5 text-right tabular-nums text-slate-600">
+                      {data.cost.itemCostCny == null ? (
+                        <span className="text-amber-600">缺 {data.cost.missingCostItemCount}</span>
+                      ) : (
+                        fmtCny(data.cost.itemCostCny)
+                      )}
+                    </td>
+                  </tr>
+                  {data.cost.miscRows.length > 0 && (
+                    <>
+                      <tr>
+                        <td className="py-1.5 text-slate-500" colSpan={2}>
+                          杂项成本小计
+                        </td>
+                        <td className="py-1.5 text-right tabular-nums text-slate-600">
+                          {fmtCny(data.cost.miscCostCny)}
+                        </td>
+                      </tr>
+                      <tr className="border-t border-slate-300 font-medium">
+                        <td className="py-1.5" colSpan={2}>
+                          成本合计（含杂项）
+                        </td>
+                        <td className="py-1.5 text-right tabular-nums">
+                          {data.cost.totalWithMiscCny == null ? (
+                            <span className="text-amber-600">未知</span>
+                          ) : (
+                            fmtCny(data.cost.totalWithMiscCny)
+                          )}
+                        </td>
+                      </tr>
+                    </>
+                  )}
+                </tfoot>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {data && !loading && (
+          <div className="mt-5 rounded-md bg-slate-50 p-3">
+            <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-1 text-sm">
+              <span className="text-slate-600">
+                毛利（订单口径，与列表一致）
+                <span className={`ml-2 font-semibold tabular-nums ${marginTone(data.grossMarginCny)}`}>
+                  {data.grossMarginCny == null ? '未知' : fmtCny(data.grossMarginCny)}
+                </span>
+                <span className="ml-1 text-xs text-slate-400">{fmtPct(data.marginPct)}</span>
+              </span>
+              {data.cost.miscRows.length > 0 && (
+                <span className="text-slate-600">
+                  含杂项毛利（参考）
+                  <span
+                    className={`ml-2 font-semibold tabular-nums ${marginTone(data.grossMarginWithMiscCny)}`}
+                  >
+                    {data.grossMarginWithMiscCny == null ? '未知' : fmtCny(data.grossMarginWithMiscCny)}
+                  </span>
+                </span>
+              )}
+            </div>
+            <p className="mt-1 text-xs text-slate-400">
+              「毛利（订单口径）」= 订单总收入 − 订单项成本，不含杂项成本，与「订单毛利」列表/导出严格一致；杂项成本（导游/操作费等）单列，含杂项毛利仅供参考。
+            </p>
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 

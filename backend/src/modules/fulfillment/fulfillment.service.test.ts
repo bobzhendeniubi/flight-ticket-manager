@@ -15,13 +15,16 @@ import {
   VisaEntryType,
   VisaIssuanceMethod,
   VisaRequirement,
+  VisaSubmissionStatus,
 } from '@prisma/client';
-import { NotFoundError } from '../../lib/errors.js';
+import { ConflictError, NotFoundError } from '../../lib/errors.js';
 import { prisma } from '../../db/prisma.js';
 import {
   FulfillmentService,
+  deriveVisaTaskStatus,
   effectiveVisaClassification,
   issuanceMethodWhere,
+  resolveVisaUnitCost,
 } from './fulfillment.service.js';
 
 describe('FulfillmentService.batchUpdateStatus', () => {
@@ -118,6 +121,101 @@ describe('FulfillmentService.batchUpdateNotes', () => {
   });
 });
 
+describe('resolveVisaUnitCost — 签证人均成本折算（CNY 入账权威）', () => {
+  it('USD + 汇率齐备 → 自动折算 CNY 存底（$31.5 ×7.2 = ¥226.8），四舍五入两位', () => {
+    expect(resolveVisaUnitCost({ visaUnitCostUsd: 31.5, visaFxRate: 7.2 })).toEqual({
+      usd: 31.5,
+      rate: 7.2,
+      cny: 226.8,
+    });
+    // 折算带舍入：39 × 7.23 = 281.97
+    expect(resolveVisaUnitCost({ visaUnitCostUsd: 39, visaFxRate: 7.23 })).toEqual({
+      usd: 39,
+      rate: 7.23,
+      cny: 281.97,
+    });
+  });
+
+  it('只给 CNY（无美金/汇率）→ 直接入账，美金/汇率保持 null', () => {
+    expect(resolveVisaUnitCost({ visaUnitCostCny: 200 })).toEqual({
+      usd: null,
+      rate: null,
+      cny: 200,
+    });
+  });
+
+  it('USD+汇率齐备时覆盖直填 CNY（保证「$x ×汇率=¥y」自洽，不采信矛盾的直填值）', () => {
+    expect(
+      resolveVisaUnitCost({ visaUnitCostUsd: 10, visaFxRate: 7, visaUnitCostCny: 999 }),
+    ).toEqual({ usd: 10, rate: 7, cny: 70 });
+  });
+
+  it('三者皆空 → 全 null（调用方据此清空回退产品主数据成本）', () => {
+    expect(resolveVisaUnitCost({})).toEqual({ usd: null, rate: null, cny: null });
+    expect(
+      resolveVisaUnitCost({ visaUnitCostUsd: null, visaFxRate: null, visaUnitCostCny: null }),
+    ).toEqual({ usd: null, rate: null, cny: null });
+  });
+
+  it('只给美金无汇率 → 无法折算，CNY 回落直填值（此处为 null）', () => {
+    expect(resolveVisaUnitCost({ visaUnitCostUsd: 31.5 })).toEqual({
+      usd: 31.5,
+      rate: null,
+      cny: null,
+    });
+  });
+});
+
+describe('FulfillmentService.batchSetVisaCost — 逐条透传 update()（签证公司按航班统一单价）', () => {
+  it('每个 taskId 用同一份成本参数调 update()，全部成功', async () => {
+    const service = new FulfillmentService();
+    const updateSpy = vi.spyOn(service, 'update').mockResolvedValue({} as never);
+    const cost = { visaUnitCostUsd: 31.5, visaFxRate: 7.2, visaUnitCostCny: null };
+
+    const res = await service.batchSetVisaCost(['t1', 't2'], cost);
+
+    expect(updateSpy).toHaveBeenCalledTimes(2);
+    expect(updateSpy).toHaveBeenNthCalledWith(1, 't1', cost);
+    expect(updateSpy).toHaveBeenNthCalledWith(2, 't2', cost);
+    expect(res).toEqual({ successCount: 2, failureCount: 0, failures: [] });
+  });
+
+  it('部分失败（如非签证任务被拒）不影响其余，failures 带错误信息', async () => {
+    const service = new FulfillmentService();
+    vi.spyOn(service, 'update').mockImplementation(async (id) => {
+      if (id === 'flight') throw new ConflictError('签证金额只能设置在签证任务上');
+      return {} as never;
+    });
+
+    const res = await service.batchSetVisaCost(['visa1', 'flight'], { visaUnitCostCny: 200 });
+
+    expect(res.successCount).toBe(1);
+    expect(res.failureCount).toBe(1);
+    expect(res.failures).toEqual([
+      { id: 'flight', error: '签证金额只能设置在签证任务上' },
+    ]);
+  });
+});
+
+describe('FulfillmentService.update — 签证金额只允许签证任务', () => {
+  it('非签证任务带签证金额 → 抛 ConflictError（不写库）', async () => {
+    const findUnique = vi.fn().mockResolvedValue({
+      id: 't1',
+      type: 'FLIGHT_TICKETING',
+      status: 'PENDING',
+      orderItem: { order: { status: 'PAID', deletedAt: null } },
+    });
+    const update = vi.fn();
+    (prisma as unknown as { fulfillmentTask: unknown }).fulfillmentTask = { findUnique, update };
+    const service = new FulfillmentService();
+
+    await expect(service.update('t1', { visaUnitCostCny: 200 })).rejects.toBeInstanceOf(
+      ConflictError,
+    );
+    expect(update).not.toHaveBeenCalled();
+  });
+});
+
 describe('FulfillmentService.listByOrder — 签证台过滤自备签乘客', () => {
   it('乘客查询排除 visaExempt=true（客人自备签证不进签证台）', async () => {
     const orderItemFindMany = vi.fn().mockResolvedValue([]);
@@ -138,7 +236,14 @@ describe('FulfillmentService.listByOrder — 签证台过滤自备签乘客', ()
 
     expect(passengerFindMany).toHaveBeenCalledWith({
       where: { orderId: 'order-9', visaExempt: false },
-      select: { id: true, fullName: true, documentNumber: true, passportPhotoUrl: true },
+      select: {
+        id: true,
+        fullName: true,
+        documentNumber: true,
+        passportPhotoUrl: true,
+        passportExpiry: true,
+        visaSubmissionStatus: true,
+      },
     });
   });
 
@@ -687,5 +792,189 @@ describe('FulfillmentService.list — 出发日期筛选（纯签证单无航班
     expect(queryRaw).not.toHaveBeenCalled();
     const { where } = findMany.mock.calls[0][0] as { where: { orderItem: { AND?: unknown } } };
     expect(where.orderItem.AND).toBeUndefined();
+  });
+});
+
+// ── 出发日期区间筛选（from/to；兼容旧单日）──────────────────────────────────
+describe('FulfillmentService.list — 出发日期区间（from/to，兼容旧单日）', () => {
+  it('给 from+to：SQL 带上下界（>= from 且 <= to），两个日期都以参数传入', async () => {
+    mockPagedDataset([]);
+    const p = prisma as unknown as { $queryRaw: ReturnType<typeof vi.fn> };
+    const queryRaw = vi.fn().mockResolvedValue([{ orderId: 'ord-a' }]);
+    p.$queryRaw = queryRaw;
+
+    await new FulfillmentService().list({
+      departureDateFrom: '2026-07-01',
+      departureDateTo: '2026-07-31',
+      page: 1,
+      pageSize: 50,
+    });
+
+    const sql = queryRaw.mock.calls[0][0] as { strings: string[]; values: unknown[] };
+    const text = sql.strings.join('?');
+    expect(text).toContain('>=');
+    expect(text).toContain('<=');
+    expect(sql.values).toContain('2026-07-01');
+    expect(sql.values).toContain('2026-07-31');
+  });
+
+  it('只给 from：SQL 只带下界（>= from），无上界', async () => {
+    mockPagedDataset([]);
+    const p = prisma as unknown as { $queryRaw: ReturnType<typeof vi.fn> };
+    const queryRaw = vi.fn().mockResolvedValue([]);
+    p.$queryRaw = queryRaw;
+
+    await new FulfillmentService().list({ departureDateFrom: '2026-07-01', page: 1, pageSize: 50 });
+
+    const sql = queryRaw.mock.calls[0][0] as { strings: string[]; values: unknown[] };
+    const text = sql.strings.join('?');
+    expect(text).toContain('>=');
+    expect(text).not.toContain('<=');
+    expect(sql.values).toContain('2026-07-01');
+  });
+
+  it('旧单日 departureDate 向后兼容：等价于 from=to=该日（上下界同值）', async () => {
+    mockPagedDataset([]);
+    const p = prisma as unknown as { $queryRaw: ReturnType<typeof vi.fn> };
+    const queryRaw = vi.fn().mockResolvedValue([]);
+    p.$queryRaw = queryRaw;
+
+    await new FulfillmentService().list({ departureDate: '2026-07-20', page: 1, pageSize: 50 });
+
+    const sql = queryRaw.mock.calls[0][0] as { strings: string[]; values: unknown[] };
+    const text = sql.strings.join('?');
+    expect(text).toContain('>=');
+    expect(text).toContain('<=');
+    // from=to=该日 → 两个边界参数都是同一天
+    expect(sql.values.filter((v) => v === '2026-07-20')).toHaveLength(2);
+  });
+});
+
+// ── 派生口径：全部到某档任务才算该档，部分取最早档 ──────────────────────────
+describe('deriveVisaTaskStatus — 取最早（最低）一档', () => {
+  it('空乘客 → PENDING（无人可送，保持待处理）', () => {
+    expect(deriveVisaTaskStatus([])).toBe(FulfillmentStatus.PENDING);
+  });
+
+  it('全部已送签 → 任务 CONFIRMED', () => {
+    expect(
+      deriveVisaTaskStatus([VisaSubmissionStatus.CONFIRMED, VisaSubmissionStatus.CONFIRMED]),
+    ).toBe(FulfillmentStatus.CONFIRMED);
+  });
+
+  it('部分已送、部分待处理 → 任务保持最早的 PENDING', () => {
+    expect(
+      deriveVisaTaskStatus([VisaSubmissionStatus.CONFIRMED, VisaSubmissionStatus.PENDING]),
+    ).toBe(FulfillmentStatus.PENDING);
+  });
+
+  it('最早档是材料准备（无人还在待处理） → 任务 IN_PROGRESS', () => {
+    expect(
+      deriveVisaTaskStatus([VisaSubmissionStatus.IN_PROGRESS, VisaSubmissionStatus.CONFIRMED]),
+    ).toBe(FulfillmentStatus.IN_PROGRESS);
+  });
+});
+
+// ── 按人批量标记送签进度（部分送签核心入口）─────────────────────────────────
+describe('FulfillmentService.batchUpdateVisaPassengerStatus', () => {
+  function mockPassengers(rows: Array<{
+    id: string;
+    orderId: string;
+    visaExempt: boolean;
+    status: string;
+    deletedAt?: Date | null;
+  }>) {
+    const findMany = vi.fn().mockResolvedValue(
+      rows.map((r) => ({
+        id: r.id,
+        orderId: r.orderId,
+        visaExempt: r.visaExempt,
+        order: { status: r.status, deletedAt: r.deletedAt ?? null },
+      })),
+    );
+    const updateMany = vi.fn().mockResolvedValue({ count: rows.length });
+    const p = prisma as unknown as {
+      passenger: { findMany: typeof findMany; updateMany: typeof updateMany };
+    };
+    p.passenger = { findMany, updateMany };
+    return { findMany, updateMany };
+  }
+
+  it('全部有效 → updateMany 只改这些乘客，受影响订单去重后各派生一次', async () => {
+    const { updateMany } = mockPassengers([
+      { id: 'p1', orderId: 'o1', visaExempt: false, status: 'PAID' },
+      { id: 'p2', orderId: 'o1', visaExempt: false, status: 'PAID' }, // 同单 → 只派生一次
+    ]);
+    const service = new FulfillmentService();
+    const rederive = vi
+      .spyOn(
+        service as unknown as { rederiveVisaTasksForOrder: (o: string) => Promise<unknown> },
+        'rederiveVisaTasksForOrder',
+      )
+      .mockResolvedValue(FulfillmentStatus.CONFIRMED as never);
+
+    const res = await service.batchUpdateVisaPassengerStatus(
+      ['p1', 'p2'],
+      VisaSubmissionStatus.CONFIRMED,
+    );
+
+    expect(updateMany).toHaveBeenCalledWith({
+      where: { id: { in: ['p1', 'p2'] } },
+      data: { visaSubmissionStatus: VisaSubmissionStatus.CONFIRMED },
+    });
+    expect(rederive).toHaveBeenCalledTimes(1); // o1 去重
+    expect(rederive).toHaveBeenCalledWith('o1');
+    expect(res).toMatchObject({ successCount: 2, failureCount: 0, affectedOrderIds: ['o1'] });
+  });
+
+  it('自备签 / 死单 / 不存在的乘客各自失败，有效乘客照常处理', async () => {
+    const { updateMany } = mockPassengers([
+      { id: 'ok', orderId: 'o1', visaExempt: false, status: 'PAID' },
+      { id: 'exempt', orderId: 'o1', visaExempt: true, status: 'PAID' },
+      { id: 'dead', orderId: 'o2', visaExempt: false, status: 'CANCELLED' },
+      // 'missing' 不在库中返回
+    ]);
+    const service = new FulfillmentService();
+    vi.spyOn(
+      service as unknown as { rederiveVisaTasksForOrder: (o: string) => Promise<unknown> },
+      'rederiveVisaTasksForOrder',
+    ).mockResolvedValue(FulfillmentStatus.IN_PROGRESS as never);
+
+    const res = await service.batchUpdateVisaPassengerStatus(
+      ['ok', 'exempt', 'dead', 'missing'],
+      VisaSubmissionStatus.IN_PROGRESS,
+    );
+
+    // 只改有效乘客
+    expect(updateMany).toHaveBeenCalledWith({
+      where: { id: { in: ['ok'] } },
+      data: { visaSubmissionStatus: VisaSubmissionStatus.IN_PROGRESS },
+    });
+    expect(res.successCount).toBe(1);
+    expect(res.failureCount).toBe(3);
+    const failIds = res.failures.map((f) => f.id).sort();
+    expect(failIds).toEqual(['dead', 'exempt', 'missing']);
+  });
+
+  it('无有效乘客 → 不 updateMany、不派生', async () => {
+    const { updateMany } = mockPassengers([
+      { id: 'exempt', orderId: 'o1', visaExempt: true, status: 'PAID' },
+    ]);
+    const service = new FulfillmentService();
+    const rederive = vi
+      .spyOn(
+        service as unknown as { rederiveVisaTasksForOrder: (o: string) => Promise<unknown> },
+        'rederiveVisaTasksForOrder',
+      )
+      .mockResolvedValue(FulfillmentStatus.PENDING as never);
+
+    const res = await service.batchUpdateVisaPassengerStatus(
+      ['exempt'],
+      VisaSubmissionStatus.CONFIRMED,
+    );
+
+    expect(updateMany).not.toHaveBeenCalled();
+    expect(rederive).not.toHaveBeenCalled();
+    expect(res).toMatchObject({ successCount: 0, failureCount: 1, affectedOrderIds: [] });
   });
 });

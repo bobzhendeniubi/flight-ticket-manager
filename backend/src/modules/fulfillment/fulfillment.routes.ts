@@ -13,8 +13,11 @@ import { FulfillmentService } from './fulfillment.service.js';
 import {
   batchFulfillmentNotesBodySchema,
   batchFulfillmentStatusBodySchema,
+  batchVisaPassengerStatusBodySchema,
+  batchVisaTaskCostBodySchema,
   listFulfillmentQuerySchema,
   updateFulfillmentBodySchema,
+  updateVisaPassengerStatusBodySchema,
 } from './fulfillment.schemas.js';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
 
@@ -50,13 +53,25 @@ export const fulfillmentRoutes: FastifyPluginAsync = async (app) => {
     const body = updateFulfillmentBodySchema.parse(req.body);
     const task = await service.update(id, body);
 
+    // 签证金额变更单列审计动作（与状态/备注变更区分，便于财务追溯成本来源）
+    const isVisaCostChange =
+      body.visaUnitCostUsd !== undefined ||
+      body.visaFxRate !== undefined ||
+      body.visaUnitCostCny !== undefined;
+
     void writeAudit({
       actor: actorFromRequest(req),
-      action: 'UPDATE_FULFILLMENT_TASK',
+      action: isVisaCostChange ? 'UPDATE_VISA_TASK_COST' : 'UPDATE_FULFILLMENT_TASK',
       targetType: 'ORDER',
       targetId: task.order.id,
       targetLabel: `${task.order.orderNumber} / ${task.type}`,
-      after: { status: task.status, data: task.data, notes: task.notes },
+      after: isVisaCostChange
+        ? {
+            visaUnitCostUsd: task.visaUnitCostUsd,
+            visaFxRate: task.visaFxRate,
+            visaUnitCostCny: task.visaUnitCostCny,
+          }
+        : { status: task.status, data: task.data, notes: task.notes },
       severity: body.status === 'FAILED' ? 'WARNING' : 'INFO',
     });
 
@@ -111,6 +126,89 @@ export const fulfillmentRoutes: FastifyPluginAsync = async (app) => {
         requestedCount: body.taskIds.length,
         successCount: result.successCount,
         failureCount: result.failureCount,
+      },
+      severity: result.failureCount > 0 ? 'WARNING' : 'INFO',
+    });
+
+    return result;
+  });
+
+  /**
+   * POST /fulfillment-tasks/visa-cost/batch
+   *
+   * 批量给选中订单的签证任务设同一人均单价（签证公司按航班统一单价是常态）。
+   * 逐条复用单任务 update 的签证成本校验/折算；partial failure 返回 failures 明细。
+   */
+  app.post('/visa-cost/batch', pre, async (req) => {
+    const { taskIds, ...cost } = batchVisaTaskCostBodySchema.parse(req.body);
+    const result = await service.batchSetVisaCost(taskIds, cost);
+
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'BATCH_UPDATE_VISA_TASK_COST',
+      targetType: 'ORDER',
+      targetId: 'batch',
+      targetLabel: `${result.successCount}/${taskIds.length} 签证任务批量设金额`,
+      after: {
+        visaUnitCostUsd: cost.visaUnitCostUsd ?? null,
+        visaFxRate: cost.visaFxRate ?? null,
+        visaUnitCostCny: cost.visaUnitCostCny ?? null,
+        requestedCount: taskIds.length,
+        successCount: result.successCount,
+        failureCount: result.failureCount,
+      },
+      severity: result.failureCount > 0 ? 'WARNING' : 'INFO',
+    });
+
+    return result;
+  });
+
+  /**
+   * PATCH /fulfillment-tasks/visa-passengers/:passengerId/status
+   *
+   * 按人更新送签进度（单个）。权限与其余签证台端点一致（ADMIN/STAFF）。
+   * 内部改写乘客送签进度并重新派生该单签证任务状态。
+   */
+  app.patch('/visa-passengers/:passengerId/status', pre, async (req) => {
+    const { passengerId } = req.params as { passengerId: string };
+    const body = updateVisaPassengerStatusBodySchema.parse(req.body);
+    const result = await service.updateVisaPassengerStatus(passengerId, body.status);
+
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'UPDATE_VISA_PASSENGER_STATUS',
+      targetType: 'ORDER',
+      targetId: result.orderId ?? passengerId,
+      targetLabel: `乘客 ${passengerId.slice(0, 8)}… → ${body.status}`,
+      after: { passengerId, status: body.status },
+      severity: 'INFO',
+    });
+
+    return { result };
+  });
+
+  /**
+   * POST /fulfillment-tasks/visa-passengers/batch-status
+   *
+   * 按人批量标记送签进度（部分送签核心入口）。逐乘客校验（存在/非自备签/父订单存活），
+   * 通过者改写送签进度并按单重新派生任务状态；partial failure 返回 failures 明细。
+   */
+  app.post('/visa-passengers/batch-status', pre, async (req) => {
+    const body = batchVisaPassengerStatusBodySchema.parse(req.body);
+    const result = await service.batchUpdateVisaPassengerStatus(body.passengerIds, body.toStatus);
+
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'BATCH_UPDATE_VISA_PASSENGER_STATUS',
+      targetType: 'ORDER',
+      targetId: 'batch',
+      targetLabel: `${result.successCount}/${body.passengerIds.length} 乘客 → ${body.toStatus}`,
+      after: {
+        toStatus: body.toStatus,
+        requestedCount: body.passengerIds.length,
+        successCount: result.successCount,
+        failureCount: result.failureCount,
+        affectedOrderCount: result.affectedOrderIds.length,
       },
       severity: result.failureCount > 0 ? 'WARNING' : 'INFO',
     });

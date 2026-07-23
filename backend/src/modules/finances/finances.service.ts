@@ -167,6 +167,84 @@ export interface OrderPnlRow {
   missingCostItemCount: number;
 }
 
+/** 订单毛利明细 · 收入构成一行（逐 OrderItem，含调价行 FEE/DISCOUNT） */
+export interface OrderPnlDetailIncomeRow {
+  label: string;      // OrderItem.description（调价行本身已是可读文案）
+  kind: string;       // OrderItemKind
+  quantity: number;
+  unitPriceCny: number;
+  subtotalCny: number; // = OrderItem.amount
+  /** 价格调整行（metadata.priceAdjustment=true，kind=FEE/DISCOUNT） */
+  isAdjustment: boolean;
+}
+
+/** 订单毛利明细 · 成本构成一行（逐 OrderItem 的 totalCostCny 快照） */
+export interface OrderPnlDetailCostRow {
+  label: string;
+  kind: string;
+  quantity: number;
+  /** OrderItem.totalCostCny 快照；null = 该条目未回填成本（缺成本） */
+  totalCostCny: number | null;
+}
+
+/** 订单毛利明细 · 杂项成本一行（逐 OrderCostItem） */
+export interface OrderPnlDetailMiscRow {
+  label: string;    // 类目中文名
+  category: string; // OrderCostCategory
+  amountCny: number;
+  note: string | null;
+}
+
+/**
+ * 单订单收支明细（下钻）。收入逐 OrderItem，成本逐 OrderItem.totalCostCny（与 getOrderPnl 同口径：
+ * 缺任一件成本 → itemCostCny=null「未知」，不造 0）。另把订单杂项成本 OrderCostItem 逐条列出。
+ *
+ * 口径分层（刻意不合并，避免与「订单毛利」列表/导出对不上）：
+ *   grossMarginCny         = totalCny − itemCostCny —— 与订单毛利 tab 行/按订单导出 **严格一致**（不含杂项）
+ *   grossMarginWithMiscCny = totalCny − (itemCostCny + miscCostCny) —— 参考：把订单杂项成本也算进去的完整毛利
+ */
+export interface OrderPnlDetail {
+  orderId: string;
+  orderNumber: string;
+  status: string;
+  contactName: string;
+  agentName: string | null;
+  /** 最早航段出发日期 'YYYY-MM-DD'；无航段则 null */
+  departureDate: string | null;
+  createdAt: string; // ISO
+  income: {
+    rows: OrderPnlDetailIncomeRow[];
+    /** Σ 各行小计（= Σ OrderItem.amount，可能与 totalCny 略有差异，属既有口径） */
+    itemsSumCny: number;
+    /** = Order.total（getOrderPnl 权威收入口径） */
+    totalCny: number;
+  };
+  cost: {
+    itemRows: OrderPnlDetailCostRow[];
+    miscRows: OrderPnlDetailMiscRow[];
+    /** Σ OrderItem.totalCostCny；缺任一件 → null（getOrderPnl 口径） */
+    itemCostCny: number | null;
+    /** Σ OrderCostItem.amountCny */
+    miscCostCny: number;
+    /** itemCostCny==null ? null : itemCostCny + miscCostCny */
+    totalWithMiscCny: number | null;
+    missingCostItemCount: number;
+  };
+  /** = totalCny − itemCostCny；缺成本 → null。与订单毛利 tab 行严格一致（不含杂项） */
+  grossMarginCny: number | null;
+  marginPct: number | null;
+  /** = totalCny − (itemCostCny + miscCostCny)；缺成本 → null。含杂项的完整毛利（参考） */
+  grossMarginWithMiscCny: number | null;
+}
+
+const ORDER_COST_CATEGORY_LABEL: Record<string, string> = {
+  GUIDE_SERVICE: '导游服务费',
+  COMP_GIFT: '赠送费用',
+  HANDLING_FEE: '手续费',
+  OPERATION_FEE: '操作费',
+  OTHER: '其他',
+};
+
 export interface MonthlyPoint {
   /** 'YYYY-MM' */
   month: string;
@@ -230,6 +308,39 @@ function round2(n: number): number {
   return Math.round(n * 100) / 100;
 }
 
+/** Prisma.Decimal | number | null → number | null（保留 null 与 dec() 区分：dec 把 null 折 0） */
+function decOrNull(v: Prisma.Decimal | number | null | undefined): number | null {
+  if (v == null) return null;
+  return typeof v === 'number' ? v : Number(v.toString());
+}
+
+/**
+ * 单条签证 OrderItem 的成本（CNY）取值口径 —— 财务汇总（finances.service）与核对导出
+ * （finances.export）共用同一函数，两处口径逐字一致。优先级：
+ *   1) 该签证任务填了结构化人均成本 visaUnitCostCny → visaUnitCostCny × 需签乘客数
+ *      （新口径：签证公司按航班开的实际按单成本，团价/加急价按单不同）
+ *   2) 未填 → 回退录单成本快照 totalCostCny（若有；导出侧无快照则传 null 跳过）
+ *   3) 再回退 → 签证产品主数据 costPriceCny × quantity（现行口径）
+ *   均无 → 0（缺成本，由调用方另行计数，不在此静默吞掉）
+ * 回退链完整保留，避免把"未填结构化成本"的存量单误算成 0。
+ */
+export function visaItemCostCny(input: {
+  taskUnitCostCny: number | null;
+  visaPax: number;
+  snapshotCny: number | null;
+  productCostPriceCny: number | null;
+  quantity: number;
+}): { cost: number; source: 'TASK' | 'SNAPSHOT' | 'PRODUCT' | 'NONE' } {
+  if (input.taskUnitCostCny != null) {
+    return { cost: input.taskUnitCostCny * input.visaPax, source: 'TASK' };
+  }
+  if (input.snapshotCny != null) return { cost: input.snapshotCny, source: 'SNAPSHOT' };
+  if (input.productCostPriceCny != null) {
+    return { cost: input.productCostPriceCny * input.quantity, source: 'PRODUCT' };
+  }
+  return { cost: 0, source: 'NONE' };
+}
+
 /** 计算财务概览（KPI + 按 OrderItem.kind 粗分 + 按财务口径细分） */
 export async function getFinancesSummary(
   range: DateRange,
@@ -244,7 +355,8 @@ export async function getFinancesSummary(
     select: {
       id: true,
       total: true,
-      passengers: { select: { id: true } },
+      // 需签乘客数（非自备签）用于签证实际成本人均折算；paxCount 仍用全体乘客数
+      passengers: { select: { id: true, visaExempt: true } },
       costItems: { select: { category: true, amountCny: true } },
       items: {
         select: {
@@ -272,6 +384,11 @@ export async function getFinancesSummary(
           hotelRoomType: { select: { costPriceCny: true } },
           visa: { select: { costPriceCny: true } },
           transfer: { select: { costPriceCny: true } },
+          // 签证任务的结构化实际成本（人均 CNY）；每个 VISA item 对应一条 VISA_APPLICATION 任务
+          fulfillmentTasks: {
+            where: { type: 'VISA_APPLICATION' },
+            select: { visaUnitCostCny: true },
+          },
         },
       },
     },
@@ -304,6 +421,8 @@ export async function getFinancesSummary(
 
   for (const o of orders) {
     const paxCount = Math.max(1, o.passengers.length);
+    // 需签乘客数（非自备签）—— 签证实际成本按此人均折算
+    const visaPax = o.passengers.filter((p) => !p.visaExempt).length;
 
     // 旧粗粒度 categoryMap（兼容老 UI）+ 总收入/成本
     for (const item of o.items) {
@@ -400,8 +519,17 @@ export async function getFinancesSummary(
         }
         case 'VISA': {
           rev.visa += amt;
-          if (cSnap != null) cost.visa += cSnap;
-          else if (it.visa?.costPriceCny != null) cost.visa += dec(it.visa.costPriceCny) * it.quantity;
+          // 签证成本口径（与 finances.export 共用 visaItemCostCny）：
+          // 任务结构化人均成本优先 → 录单快照 → 产品主数据；均无则 0（缺成本）。
+          const taskCny = decOrNull(it.fulfillmentTasks?.[0]?.visaUnitCostCny);
+          const { cost: visaCost } = visaItemCostCny({
+            taskUnitCostCny: taskCny,
+            visaPax,
+            snapshotCny: cSnap,
+            productCostPriceCny: it.visa?.costPriceCny != null ? dec(it.visa.costPriceCny) : null,
+            quantity: it.quantity,
+          });
+          cost.visa += visaCost;
           break;
         }
         case 'TRANSFER': {
@@ -651,6 +779,127 @@ export async function getOrderPnl(
       missingCostItemCount: missing,
     };
   });
+}
+
+/**
+ * 单订单收支明细（下钻）。
+ * 成本口径与 getOrderPnl 完全一致：逐 OrderItem.totalCostCny 快照，缺任一件 → itemCostCny=null。
+ * 额外把订单杂项成本 OrderCostItem 逐条列出（分层单列，不并入与列表严格一致的 grossMarginCny）。
+ * 订单不存在 / 已软删 → null（路由据此回 404）。
+ */
+export async function getOrderPnlDetail(
+  orderId: string,
+  client: PrismaClient = defaultPrisma,
+): Promise<OrderPnlDetail | null> {
+  const order = await client.order.findFirst({
+    where: { id: orderId, deletedAt: null },
+    select: {
+      id: true,
+      orderNumber: true,
+      status: true,
+      contactName: true,
+      total: true,
+      createdAt: true,
+      agent: { select: { companyName: true, contactName: true } },
+      costItems: {
+        select: { category: true, amountCny: true, note: true },
+        orderBy: { createdAt: 'asc' },
+      },
+      items: {
+        orderBy: { createdAt: 'asc' },
+        select: {
+          kind: true,
+          description: true,
+          quantity: true,
+          unitPrice: true,
+          amount: true,
+          totalCostCny: true,
+          metadata: true,
+          flightSchedule: { select: { departureTime: true } },
+        },
+      },
+    },
+  });
+  if (!order) return null;
+
+  // ── 收入构成：逐 OrderItem（调价行 kind=FEE/DISCOUNT + metadata.priceAdjustment=true）──
+  const incomeRows = order.items.map<OrderPnlDetailIncomeRow>((it) => {
+    const meta = (it.metadata ?? null) as { priceAdjustment?: unknown } | null;
+    return {
+      label: it.description,
+      kind: it.kind,
+      quantity: it.quantity,
+      unitPriceCny: round2(dec(it.unitPrice)),
+      subtotalCny: round2(dec(it.amount)),
+      isAdjustment: meta?.priceAdjustment === true,
+    };
+  });
+  const itemsSum = order.items.reduce((a, it) => a + dec(it.amount), 0);
+
+  // ── 成本构成：逐 OrderItem.totalCostCny（getOrderPnl 现行口径；缺任一件 → 全单未知）──
+  let itemCostSum = 0;
+  let missing = 0;
+  const costItemRows = order.items.map<OrderPnlDetailCostRow>((it) => {
+    const c = it.totalCostCny == null ? null : dec(it.totalCostCny);
+    if (c == null) missing += 1;
+    else itemCostSum += c;
+    return {
+      label: it.description,
+      kind: it.kind,
+      quantity: it.quantity,
+      totalCostCny: c == null ? null : round2(c),
+    };
+  });
+  const itemCostCny = missing === 0 ? round2(itemCostSum) : null;
+
+  // ── 杂项成本：逐 OrderCostItem ──
+  const miscRows = order.costItems.map<OrderPnlDetailMiscRow>((ci) => ({
+    label: ORDER_COST_CATEGORY_LABEL[ci.category] ?? ci.category,
+    category: ci.category,
+    amountCny: round2(dec(ci.amountCny)),
+    note: ci.note ?? null,
+  }));
+  const miscCostCny = round2(order.costItems.reduce((a, ci) => a + dec(ci.amountCny), 0));
+
+  const totalCny = round2(dec(order.total));
+  const grossMarginCny = itemCostCny == null ? null : round2(totalCny - itemCostCny);
+  const marginPct =
+    grossMarginCny == null || totalCny === 0
+      ? null
+      : Math.round((grossMarginCny / totalCny) * 10000) / 10000;
+  const totalWithMiscCny = itemCostCny == null ? null : round2(itemCostCny + miscCostCny);
+  const grossMarginWithMiscCny =
+    totalWithMiscCny == null ? null : round2(totalCny - totalWithMiscCny);
+
+  // ── 出发日期：最早 FLIGHT 航段（UTC 日期）──
+  const departureTimes = order.items
+    .map((it) => it.flightSchedule?.departureTime)
+    .filter((d): d is Date => d != null)
+    .sort((a, b) => a.getTime() - b.getTime());
+  const departureDate =
+    departureTimes.length > 0 ? departureTimes[0].toISOString().slice(0, 10) : null;
+
+  return {
+    orderId: order.id,
+    orderNumber: order.orderNumber,
+    status: order.status,
+    contactName: order.contactName,
+    agentName: order.agent?.companyName ?? order.agent?.contactName ?? null,
+    departureDate,
+    createdAt: order.createdAt.toISOString(),
+    income: { rows: incomeRows, itemsSumCny: round2(itemsSum), totalCny },
+    cost: {
+      itemRows: costItemRows,
+      miscRows,
+      itemCostCny,
+      miscCostCny,
+      totalWithMiscCny,
+      missingCostItemCount: missing,
+    },
+    grossMarginCny,
+    marginPct,
+    grossMarginWithMiscCny,
+  };
 }
 
 /** 月度趋势（最近 N 个月） */

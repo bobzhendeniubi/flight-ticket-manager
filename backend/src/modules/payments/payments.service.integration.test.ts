@@ -2,10 +2,10 @@
  * PaymentsService.confirmManualPayment / batchConfirmManualPayment · 真 DB 集成测试
  *
  * 覆盖：
- *   - 多付：到账金额可超过应收余额 → paidAmount > total → 尾款（total − paidAmount）为负
- *   - 全额/超额到账自动 PAID
+ *   - 超收硬闸：手工/批量到账使累计已付净额超过应收 → 400 拦下（多付改走对账台挂账池）
+ *   - 同额防呆软闸：近 10 分钟等额手工收款 → 409 + code DUPLICATE_AMOUNT；confirmDuplicate 放行
+ *   - 正常分次凑单到收满 → 自动 PAID（不产生多付）
  *   - 防手误上限：异常偏高金额被拒
- *   - 部分到账累加
  *   - 幂等：同 idempotencyKey 不二次累计
  *   - 批量到账：N 单确认，单坏不连累其余
  *
@@ -70,36 +70,55 @@ async function createPendingOrder(userId: string, total = 1000) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-describe('PaymentsService.confirmManualPayment · 多付与防手误', () => {
+describe('PaymentsService.confirmManualPayment · 超收硬闸与防手误', () => {
   const service = new PaymentsService();
 
-  it('多付：到账金额 > 应收余额 → 记录全额，paidAmount > total，尾款为负', async () => {
+  it('超收硬闸：一次性到账 > 应收 → 400 拦下，订单不被改动（多付改走挂账池）', async () => {
     const ADMIN = await createAdminActor();
     const customer = await createCustomer();
     const order = await createPendingOrder(customer.id, 1000);
 
-    // 应收余额 1000，但到账 1200（结算价≠到账金额，多付 200）
-    const result = await service.confirmManualPayment(
+    // 应收 1000，一次录 1200（超出 200）→ 硬闸拦下
+    await expect(
+      service.confirmManualPayment(
+        order.id,
+        { amount: 1200, method: PaymentMethod.BANK_CARD },
+        ADMIN,
+      ),
+    ).rejects.toThrow(/超出应收|已收满|挂账池/);
+
+    // 订单未被改动：paidAmount 仍 0，状态仍 PENDING_PAYMENT，没有落 Payment
+    const dbOrder = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(Number(dbOrder.paidAmount)).toBe(0);
+    expect(dbOrder.status).toBe(OrderStatus.PENDING_PAYMENT);
+    const payments = await prisma.payment.findMany({ where: { orderId: order.id } });
+    expect(payments).toHaveLength(0);
+  });
+
+  it('超收硬闸：收满后再录任意金额 → 400 拦下（同一笔到账误录两次场景）', async () => {
+    const ADMIN = await createAdminActor();
+    const customer = await createCustomer();
+    const order = await createPendingOrder(customer.id, 1000);
+
+    // 第一笔收满 → PAID
+    const first = await service.confirmManualPayment(
       order.id,
-      { amount: 1200, method: PaymentMethod.BANK_CARD },
+      { amount: 1000, method: PaymentMethod.BANK_CARD },
       ADMIN,
     );
+    expect(first.status).toBe(OrderStatus.PAID);
 
-    expect(result.ok).toBe(true);
-    expect(result.paidAmount).toBe(1200);
-    expect(result.total).toBe(1000);
-    expect(result.fullyPaid).toBe(true);
-    // 尾款 = total − paidAmount = 1000 − 1200 = −200（多付）
-    expect(result.total - result.paidAmount).toBe(-200);
-    expect(result.status).toBe(OrderStatus.PAID);
+    // 第二笔（不同收款方式，等额）→ 超收硬闸拦下（正是本次修复的误录两次事故）
+    await expect(
+      service.confirmManualPayment(
+        order.id,
+        { amount: 1000, method: PaymentMethod.WECHAT_PAY },
+        ADMIN,
+      ),
+    ).rejects.toThrow(/超出应收|已收满|挂账池/);
 
-    // DB 真值：Order.paidAmount 落了 1200，且 Payment.amount = 1200
     const dbOrder = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
-    expect(Number(dbOrder.paidAmount)).toBe(1200);
-    expect(dbOrder.status).toBe(OrderStatus.PAID);
-    const payment = await prisma.payment.findUniqueOrThrow({ where: { id: result.paymentId } });
-    expect(Number(payment.amount)).toBe(1200);
-    expect(payment.status).toBe(PaymentStatus.SUCCEEDED);
+    expect(Number(dbOrder.paidAmount)).toBe(1000); // 没有变成 2000
   });
 
   it('全额到账 → 自动 PAID（auto-flip 仍生效）', async () => {
@@ -117,7 +136,7 @@ describe('PaymentsService.confirmManualPayment · 多付与防手误', () => {
     expect(result.paidAmount).toBe(800);
   });
 
-  it('部分到账累加：先付 300 再付 900 → paidAmount 1200（多付）且 PAID', async () => {
+  it('正常分次凑单不拦：先付 300 再付 700 → 收满 PAID（不产生多付）', async () => {
     const ADMIN = await createAdminActor();
     const customer = await createCustomer();
     const order = await createPendingOrder(customer.id, 1000);
@@ -131,12 +150,13 @@ describe('PaymentsService.confirmManualPayment · 多付与防手误', () => {
     expect(first.fullyPaid).toBe(false);
     expect(first.status).toBe(OrderStatus.PENDING_PAYMENT);
 
+    // 补齐尾款 700（恰好收满，不超收）→ 硬闸不拦，自动 PAID
     const second = await service.confirmManualPayment(
       order.id,
-      { amount: 900, method: PaymentMethod.BANK_CARD },
+      { amount: 700, method: PaymentMethod.WECHAT_PAY },
       ADMIN,
     );
-    expect(second.paidAmount).toBe(1200); // 300 + 900，超额 200
+    expect(second.paidAmount).toBe(1000); // 300 + 700，恰好收满
     expect(second.fullyPaid).toBe(true);
     expect(second.status).toBe(OrderStatus.PAID);
   });
@@ -161,18 +181,21 @@ describe('PaymentsService.confirmManualPayment · 多付与防手误', () => {
     expect(dbOrder.status).toBe(OrderStatus.PENDING_PAYMENT);
   });
 
-  it('小额订单合理多付：总额 10，到账 5000（在绝对上限内）→ 成功', async () => {
+  it('小额订单超收也拦：总额 10，到账 5000（未超防手误上限，但超应收）→ 400', async () => {
     const ADMIN = await createAdminActor();
     const customer = await createCustomer();
     const order = await createPendingOrder(customer.id, 10);
-    // 10 × 10 = 100，但绝对上限 1,000,000 兜底 → 5000 应被允许
-    const result = await service.confirmManualPayment(
-      order.id,
-      { amount: 5000, method: PaymentMethod.BANK_CARD },
-      ADMIN,
-    );
-    expect(result.ok).toBe(true);
-    expect(result.paidAmount).toBe(5000);
+    // 5000 在防手误绝对上限内（不触发「异常偏高」），但远超应收 10 → 超收硬闸拦下
+    await expect(
+      service.confirmManualPayment(
+        order.id,
+        { amount: 5000, method: PaymentMethod.BANK_CARD },
+        ADMIN,
+      ),
+    ).rejects.toThrow(/超出应收|已收满|挂账池/);
+
+    const dbOrder = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(Number(dbOrder.paidAmount)).toBe(0);
   });
 
   it('幂等：同 idempotencyKey 重试只入账一次', async () => {
@@ -183,19 +206,20 @@ describe('PaymentsService.confirmManualPayment · 多付与防手误', () => {
 
     const a = await service.confirmManualPayment(
       order.id,
-      { amount: 1200, method: PaymentMethod.BANK_CARD, idempotencyKey: key },
+      { amount: 1000, method: PaymentMethod.BANK_CARD, idempotencyKey: key },
       ADMIN,
     );
+    // 同 key 重放：走幂等回放分支（在两闸之前短路），不会因「已收满」被超收硬闸误拦
     const b = await service.confirmManualPayment(
       order.id,
-      { amount: 1200, method: PaymentMethod.BANK_CARD, idempotencyKey: key },
+      { amount: 1000, method: PaymentMethod.BANK_CARD, idempotencyKey: key },
       ADMIN,
     );
     expect(a.paymentId).toBe(b.paymentId);
-    expect(b.paidAmount).toBe(1200); // 没有变成 2400
+    expect(b.paidAmount).toBe(1000); // 没有变成 2000
 
     const dbOrder = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
-    expect(Number(dbOrder.paidAmount)).toBe(1200);
+    expect(Number(dbOrder.paidAmount)).toBe(1000);
   });
 });
 
@@ -212,7 +236,7 @@ describe('PaymentsService.batchConfirmManualPayment · 批量到账', () => {
       {
         items: [
           { orderId: o1.id, amount: 1000, method: PaymentMethod.BANK_CARD },
-          { orderId: o2.id, amount: 600 }, // method 省略 → 默认 BANK_CARD；多付 100
+          { orderId: o2.id, amount: 500 }, // method 省略 → 默认 BANK_CARD；恰好收满
         ],
         sharedProofUrl: 'data:image/png;base64,SGVsbG8=',
       },
@@ -226,7 +250,7 @@ describe('PaymentsService.batchConfirmManualPayment · 批量到账', () => {
     expect(r1.paidAmount).toBe(1000);
     expect(r1.status).toBe(OrderStatus.PAID);
     expect(r2.ok).toBe(true);
-    expect(r2.paidAmount).toBe(600); // 多付 100
+    expect(r2.paidAmount).toBe(500); // 恰好收满
     expect(r2.status).toBe(OrderStatus.PAID);
 
     // sharedProofUrl 应落到没有单独 proofUrl 的支付上
@@ -425,7 +449,9 @@ describe('PaymentsService.handleCallback · R4/R5 兄弟 Payment 作废 + 迟到
   it('point 1（并发不丢账）：网关回调 PAID 与人工部分到账并发 → paidAmount 无 lost update', async () => {
     const ADMIN = await createAdminActor();
     const customer = await createCustomer();
-    const order = await createPendingOrder(customer.id, 1000);
+    // 应收 2000：网关 1000 + 人工 200 = 1200 均在应收内，两笔都不触发超收硬闸，
+    // 纯测并发 FOR UPDATE 串行下的 paidAmount 累加不丢账。
+    const order = await createPendingOrder(customer.id, 2000);
     const payA = await createPendingPayment(order.id, 1000);
 
     // 并发：A 回调（PENDING_PAYMENT→PAID，按台账聚合抬 paidAmount）+ 人工确认 200（累加 paidAmount）。
@@ -538,5 +564,118 @@ describe('PaymentsService.confirmManualPayment · 清账口径含改期费与预
     const result = await service.confirmManualPayment(order.id, { amount: 600, method: PaymentMethod.BANK_CARD }, ADMIN);
     expect(result.fullyPaid).toBe(true); // 600 + 400 >= 1000
     expect(result.status).toBe(OrderStatus.PAID);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 同额防呆软闸 · 近 10 分钟等额手工收款 → 409 DUPLICATE_AMOUNT；confirmDuplicate 放行
+//   场景选应收充裕的订单（total 2000），使两笔 500 都不触发超收硬闸，单独测软闸。
+// ══════════════════════════════════════════════════════════════════════════
+describe('PaymentsService.confirmManualPayment · 同额防呆软闸', () => {
+  const service = new PaymentsService();
+
+  it('等额重复无标志 → 被拦（409 + code DUPLICATE_AMOUNT），第二笔不入账', async () => {
+    const ADMIN = await createAdminActor();
+    const customer = await createCustomer();
+    const order = await createPendingOrder(customer.id, 2000);
+
+    // 第一笔 500 正常入账
+    const first = await service.confirmManualPayment(
+      order.id,
+      { amount: 500, method: PaymentMethod.BANK_CARD },
+      ADMIN,
+    );
+    expect(first.paidAmount).toBe(500);
+
+    // 第二笔等额 500（近 10 分钟内、未带 confirmDuplicate）→ 软闸拦下
+    let caught: unknown;
+    try {
+      await service.confirmManualPayment(
+        order.id,
+        { amount: 500, method: PaymentMethod.WECHAT_PAY },
+        ADMIN,
+      );
+    } catch (e) {
+      caught = e;
+    }
+    expect(caught).toBeInstanceOf(Error);
+    // 稳定 code=DUPLICATE_AMOUNT（前端据此弹二次确认，不靠中文文案匹配）
+    expect((caught as { code?: string }).code).toBe('DUPLICATE_AMOUNT');
+    expect((caught as { statusCode?: number }).statusCode).toBe(409);
+
+    // 第二笔未入账：paidAmount 仍 500，只有一笔 Payment
+    const dbOrder = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(Number(dbOrder.paidAmount)).toBe(500);
+    const payments = await prisma.payment.findMany({ where: { orderId: order.id } });
+    expect(payments).toHaveLength(1);
+  });
+
+  it('等额重复带 confirmDuplicate:true → 放行（确系两笔真实到账）', async () => {
+    const ADMIN = await createAdminActor();
+    const customer = await createCustomer();
+    const order = await createPendingOrder(customer.id, 2000);
+
+    await service.confirmManualPayment(
+      order.id,
+      { amount: 500, method: PaymentMethod.BANK_CARD },
+      ADMIN,
+    );
+
+    // 带 confirmDuplicate 放行软闸（超收硬闸仍在：500+500=1000 ≤ 2000，不触发）
+    const second = await service.confirmManualPayment(
+      order.id,
+      { amount: 500, method: PaymentMethod.WECHAT_PAY, confirmDuplicate: true },
+      ADMIN,
+    );
+    expect(second.paidAmount).toBe(1000);
+
+    const payments = await prisma.payment.findMany({ where: { orderId: order.id } });
+    expect(payments).toHaveLength(2);
+  });
+
+  it('两闸叠加超收优先：等额重复且会超收 → 抛超收 400（非 409），不是软闸', async () => {
+    const ADMIN = await createAdminActor();
+    const customer = await createCustomer();
+    const order = await createPendingOrder(customer.id, 1000);
+
+    // 第一笔 1000 收满
+    await service.confirmManualPayment(
+      order.id,
+      { amount: 1000, method: PaymentMethod.BANK_CARD },
+      ADMIN,
+    );
+    // 第二笔等额 1000：既是等额重复、又会超收 → 超收硬闸优先，抛 400（不是 409 软闸）
+    let caught: unknown;
+    try {
+      await service.confirmManualPayment(
+        order.id,
+        { amount: 1000, method: PaymentMethod.WECHAT_PAY },
+        ADMIN,
+      );
+    } catch (e) {
+      caught = e;
+    }
+    expect((caught as { statusCode?: number }).statusCode).toBe(400);
+    expect((caught as { code?: string }).code).not.toBe('DUPLICATE_AMOUNT');
+  });
+
+  it('批量到账跳过软闸：同订单同额两条 batch 项均入账（batchId 去重另管重复提交）', async () => {
+    const ADMIN = await createAdminActor();
+    const customer = await createCustomer();
+    const order = await createPendingOrder(customer.id, 2000);
+
+    // 批量里对同一订单放两条等额 500 → 软闸被 confirmDuplicate:true 跳过，两条都入账（合计 1000 ≤ 2000）
+    const { results } = await service.batchConfirmManualPayment(
+      {
+        items: [
+          { orderId: order.id, amount: 500, method: PaymentMethod.BANK_CARD },
+          { orderId: order.id, amount: 500, method: PaymentMethod.WECHAT_PAY },
+        ],
+      },
+      ADMIN,
+    );
+    expect(results.every((r) => r.ok)).toBe(true);
+    const dbOrder = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(Number(dbOrder.paidAmount)).toBe(1000);
   });
 });

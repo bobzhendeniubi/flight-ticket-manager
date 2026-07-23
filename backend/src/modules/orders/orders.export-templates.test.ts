@@ -33,9 +33,10 @@ import {
 const D = (s: string): Date => new Date(s.length <= 10 ? `${s}T00:00:00.000Z` : `${s}Z`);
 
 /**
- * 《全岗可用》模版 55 列表头（叶子列；末尾三列并入「订单成本」分组）。
+ * 《全岗可用》模版 56 列表头（叶子列；末尾三列并入「订单成本」分组）。
  * 定金组四列已移除：系统无定金模型，四列恒空，且现行模版本身已删除该组。
  * 「纯拼音名」为旧模版之外新增：无 MR/MS 称谓的 LAST/FIRST，财务对数/名单匹配用。
+ * 「订单状态」为新增：中文标签，数据岗筛选用，紧邻开票/签证状态列。
  */
 const FULL_HEADERS = [
   '序号', '是否是原订单', '代理机构', '备注', '酒店类型', '中文名称', '乘客姓名',
@@ -43,7 +44,7 @@ const FULL_HEADERS = [
   '结算价格', '结算价到账金额', '结算价到账时间',
   '结算价到账渠道', '尾款金额', '单房差', '单房差到账金额', '签证金额', '签证到账金额',
   '抵扣金额', '抵扣到账金额', '抵扣人员', '抵扣订单', '是否清账', '退款金额', '退款时间',
-  '退款渠道', '系统开票状态', '开票状态', '签证状态', '签证选项', '签证公司', '签证备注', '护照签发地',
+  '退款渠道', '订单状态', '系统开票状态', '开票状态', '签证状态', '签证选项', '签证公司', '签证备注', '护照签发地',
   '出生地', '订单编号', '舱位等级', '乘客生日', '乘客类型', '分销状态', '性别', '国籍',
   '证件类型', '证件编号', '签发日期', '有效日期', '婴儿随行成员', '录入时间', '录入人员',
   '临时', '成本类型', '子类型', '金额',
@@ -222,13 +223,19 @@ function fixtureRoundTrip(): OrderForTemplateExport {
   } as unknown as OrderForTemplateExport;
 }
 
-describe('《全岗可用》full 模版 — 列定义对齐 55 列', () => {
-  it('FULL_COLUMNS 列名列序与模版 55 列完全一致', () => {
+describe('《全岗可用》full 模版 — 列定义对齐 56 列', () => {
+  it('FULL_COLUMNS 列名列序与模版 56 列完全一致', () => {
     expect(FULL_COLUMNS.map((c) => c.header)).toEqual(FULL_HEADERS);
   });
 
   it('不输出定金组列（系统无定金模型，现行模版已删该组）', () => {
     expect(FULL_COLUMNS.map((c) => c.header).filter((h) => h.startsWith('定金'))).toEqual([]);
+  });
+
+  it('「订单状态」列紧邻状态类列：位于退款渠道之后、系统开票状态之前', () => {
+    const headers = FULL_COLUMNS.map((c) => c.header);
+    expect(headers[headers.indexOf('退款渠道') + 1]).toBe('订单状态');
+    expect(headers[headers.indexOf('订单状态') + 1]).toBe('系统开票状态');
   });
 });
 
@@ -323,6 +330,45 @@ describe('《全岗可用》full 模版 — 逐列取值/格式', () => {
   it('签证状态/选项：填真值', () => {
     expect(r1.visaStatus).toBe('处理中');
     expect(r1.visaOption).toBe('越南电子签');
+  });
+
+  it('订单状态：OrderStatus 映射中文标签（PAID → 已支付）', () => {
+    expect(r1.orderStatus).toBe('已支付');
+    expect(r2.orderStatus).toBe('已支付');
+  });
+});
+
+// ── 订单状态列 · 中文标签映射（数据岗反馈：《全岗可用》增订单状态列用于筛选）──────
+// 覆盖 OrderStatus 全部 13 值 → 中文标签；未知值兜底原文（绝不留空、不抛错）。
+describe('《全岗可用》full 模版 — 订单状态列中文标签', () => {
+  const CASES: Array<[string, string]> = [
+    ['DRAFT', '草稿'],
+    ['PENDING_PAYMENT', '待支付'],
+    ['PAID', '已支付'],
+    ['PROCESSING', '处理中'],
+    ['TICKETED', '出票完成'],
+    ['COMPLETED', '已完成'],
+    ['PAYMENT_TIMEOUT', '支付超时'],
+    ['CANCELLED', '已取消'],
+    ['REFUND_REQUESTED', '退款中'],
+    ['REFUNDED', '已退款'],
+    ['CHANGE_REQUESTED', '改期中'],
+    ['CHANGED', '已改期'],
+    ['FAILED', '失败'],
+  ];
+
+  it.each(CASES)('%s → %s', (status, label) => {
+    const order = fixtureRoundTrip();
+    (order as unknown as { status: string }).status = status;
+    const rows = orderToFullRows(order, buildOrderContext(order));
+    expect(rows[0].orderStatus).toBe(label);
+  });
+
+  it('未知状态 → 兜底原文（不留空、不抛错）', () => {
+    const order = fixtureRoundTrip();
+    (order as unknown as { status: string }).status = 'SOME_NEW_STATUS';
+    const rows = orderToFullRows(order, buildOrderContext(order));
+    expect(rows[0].orderStatus).toBe('SOME_NEW_STATUS');
   });
 });
 
@@ -503,9 +549,9 @@ describe('《票务专用》ticketing 模版 — 27 列 + 格式', () => {
     expect(r2.ptc).toBe('CHD');
   });
 
-  it('PTC 按订单去程（最早 FLIGHT 行出发时间）自动推算，联动 Title：儿童缺 Title 按性别给 MISS', () => {
+  it('PTC 按订单去程（最早 FLIGHT 行出发时间）自动推算；Title 全年龄段按性别给 MR/MS，儿童女缺 Title 给 MS', () => {
     // 订单去程 = 2026-07-13（fixtureRoundTrip 两段航班中较早一段），r2 生日 2019-06-15 → 实足 7 岁 = CHD。
-    expect(r2.title).toBe('MISS');
+    expect(r2.title).toBe('MS');
   });
 
   it('Date of Birth / Passport Expiry：DDMonYY 航司格式', () => {

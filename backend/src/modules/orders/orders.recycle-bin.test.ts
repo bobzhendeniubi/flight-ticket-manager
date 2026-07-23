@@ -78,6 +78,11 @@ describe('listDeletedOrders · 口径与映射', () => {
         status: OrderStatus.CANCELLED,
         deletedAt,
         passengers: [{ fullName: 'ZHANG SAN', chineseName: '张三' }],
+        // 出发日期取最早航段：回程 07-15 在前但被 07-13 去程压过 → departDate=2026-07-13
+        items: [
+          { hotelCheckIn: null, flightSchedule: { departureTime: new Date('2026-07-15T02:00:00Z') } },
+          { hotelCheckIn: null, flightSchedule: { departureTime: new Date('2026-07-13T08:30:00Z') } },
+        ],
       },
       {
         id: 'o2',
@@ -89,6 +94,8 @@ describe('listDeletedOrders · 口径与映射', () => {
         deletedAt,
         // 无中文名 → 回退证件姓名
         passengers: [{ fullName: 'LI SI', chineseName: null }],
+        // 纯酒店单（无航班）→ 回退最早入住日 → departDate=2026-07-20
+        items: [{ hotelCheckIn: new Date('2026-07-20T00:00:00Z'), flightSchedule: null }],
       },
     ]);
     mockPrisma.order.count.mockResolvedValue(2);
@@ -107,6 +114,10 @@ describe('listDeletedOrders · 口径与映射', () => {
     expect(findArg.orderBy).toEqual({ deletedAt: 'desc' });
     // select 只取乘客姓名字段（不整对象）
     expect(findArg.select.passengers).toEqual({ select: { fullName: true, chineseName: true } });
+    // select 联查派生「出发日期」列所需的最小字段（班次出发时间 + 酒店入住日）
+    expect(findArg.select.items).toEqual({
+      select: { hotelCheckIn: true, flightSchedule: { select: { departureTime: true } } },
+    });
     // 审计按目标订单 + 动作查
     const auditArg = mockPrisma.auditLog.findMany.mock.calls[0][0];
     expect(auditArg.where.action).toBe('SOFT_DELETE_ORDER');
@@ -123,10 +134,14 @@ describe('listDeletedOrders · 口径与映射', () => {
       deletedAt,
       deletedBy: 'ops@coco',
       passengerNames: ['张三'],
+      // 最早航段（去程 07-13，压过回程 07-15）
+      departDate: '2026-07-13',
     });
     expect(res.orders[1].deletedBy).toBe('运营小组');
     // 中文名缺失 → 回退证件姓名（fullName）
     expect(res.orders[1].passengerNames).toEqual(['LI SI']);
+    // 纯酒店单无航班 → 回退最早入住日
+    expect(res.orders[1].departDate).toBe('2026-07-20');
   });
 
   it('审计缺失时 deletedBy 置 null（不硬凑）', async () => {
@@ -149,6 +164,8 @@ describe('listDeletedOrders · 口径与映射', () => {
     const res = await service.listDeletedOrders({ page: 1, pageSize: 50 }, ADMIN);
     expect(res.orders[0].deletedBy).toBeNull();
     expect(res.orders[0].passengerNames).toEqual([]);
+    // 无航班无酒店（items 缺失）→ 出发日期安全落空为 null
+    expect(res.orders[0].departDate).toBeNull();
   });
 
   it('无已删订单时不查审计（省一次查询）', async () => {

@@ -28,6 +28,8 @@ import {
   loadPeriodsByFlightIds,
   resolveScheduleCost,
 } from './finances.cost.service.js';
+// 签证成本口径与财务汇总共用同一函数，两处逐字一致（任务实际成本优先 → 产品主数据回退）
+import { visaItemCostCny } from './finances.service.js';
 
 const COUNTED_STATUSES: OrderStatus[] = [
   OrderStatus.PENDING_PAYMENT,
@@ -181,6 +183,7 @@ type OrderForExport = Prisma.OrderGetPayload<{
         hotelRoomType: { select: { name: true; costPriceCny: true } };
         visa: { select: { costPriceCny: true } };
         transfer: { select: { costPriceCny: true } };
+        fulfillmentTasks: { select: { type: true; visaUnitCostCny: true } };
       };
     };
   };
@@ -192,6 +195,8 @@ type PeriodsMap = Awaited<ReturnType<typeof loadPeriodsByFlightIds>>;
 /** 把一张订单展开成 N 行（每位乘客一行）*/
 function orderToRows(order: OrderForExport, periodsMap: PeriodsMap): FinanceRow[] {
   const paxCount = Math.max(1, order.passengers.length);
+  // 需签乘客数（非自备签）—— 签证实际成本按此人均折算
+  const visaPax = order.passengers.filter((p) => !p.visaExempt).length;
 
   // ── 机票：包机单座分摊（charter / 总座位）+ 机场税 + 4 新成本字段，可能去程+回程多段 ──
   // 全部用 cost.service.resolveScheduleCost（override → period → null）取生效值
@@ -266,8 +271,18 @@ function orderToRows(order: OrderForExport, periodsMap: PeriodsMap): FinanceRow[
   let visaCostCnyOrder = 0;
   let transferCostCnyOrder = 0;
   for (const it of order.items) {
-    if (it.kind === 'VISA' && it.visa) {
-      visaCostCnyOrder += dec(it.visa.costPriceCny) * it.quantity;
+    if (it.kind === 'VISA') {
+      // 与 finances.service 共用 visaItemCostCny：任务实际成本(人均×需签数) 优先，否则回退产品主数据×数量。
+      // 导出侧无 totalCostCny 快照 → snapshotCny 传 null（回退口径 = 产品主数据）。
+      const taskCny = it.fulfillmentTasks?.[0]?.visaUnitCostCny;
+      const { cost } = visaItemCostCny({
+        taskUnitCostCny: taskCny == null ? null : dec(taskCny),
+        visaPax,
+        snapshotCny: null,
+        productCostPriceCny: it.visa?.costPriceCny != null ? dec(it.visa.costPriceCny) : null,
+        quantity: it.quantity,
+      });
+      visaCostCnyOrder += cost;
     }
     if (it.kind === 'TRANSFER' && it.transfer) {
       transferCostCnyOrder += dec(it.transfer.costPriceCny) * it.quantity;
@@ -423,6 +438,8 @@ export async function buildFinanceExportWorkbook(
           hotelRoomType: { select: { name: true, costPriceCny: true } },
           visa: { select: { costPriceCny: true } },
           transfer: { select: { costPriceCny: true } },
+          // 签证任务结构化实际成本（人均 CNY）；每个 VISA item 对应一条 VISA_APPLICATION 任务
+          fulfillmentTasks: { where: { type: 'VISA_APPLICATION' }, select: { type: true, visaUnitCostCny: true } },
         },
       },
     },

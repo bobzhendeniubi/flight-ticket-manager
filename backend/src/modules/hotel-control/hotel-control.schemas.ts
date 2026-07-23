@@ -66,6 +66,12 @@ export const alertsQuerySchema = z.object({
 });
 export type AlertsQuery = z.infer<typeof alertsQuerySchema>;
 
+// ── 近期用房变更（读审计流：调整分房 / 换酒店 / 补收单房差）────────────────
+export const recentChangesQuerySchema = z.object({
+  days: z.coerce.number().int().min(1).max(90).default(7),
+});
+export type RecentChangesQuery = z.infer<typeof recentChangesQuerySchema>;
+
 // ── 占房下钻（某酒店某晚，谁占的；销控矩阵红/黄格点击用）────────────────────
 export const occupantsQuerySchema = z.object({
   hotelId: z.string().min(1),

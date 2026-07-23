@@ -21,6 +21,7 @@ import {
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { NumberInput } from './NumberInput';
+import { ProofImageViewer } from './ProofImageViewer';
 
 const KIND_OPTIONS: PaymentChannelKind[] = ['WECHAT', 'ALIPAY', 'BANK'];
 
@@ -274,13 +275,11 @@ export function PaymentChannelsManager() {
                     <td className="font-medium text-ink">{c.label}</td>
                     <td>
                       {c.qrImageUrl ? (
-                        <a href={c.qrImageUrl} target="_blank" rel="noreferrer">
-                          <img
-                            src={c.qrImageUrl}
-                            alt={`${c.label} 收款码`}
-                            className="h-10 w-10 rounded border border-slate-200 object-cover"
-                          />
-                        </a>
+                        <ProofImageViewer
+                          src={c.qrImageUrl}
+                          alt={`${c.label} 收款码`}
+                          thumbClassName="h-10 w-10 rounded border border-slate-200 object-cover"
+                        />
                       ) : (
                         <span className="text-xs text-ink-muted">—</span>
                       )}

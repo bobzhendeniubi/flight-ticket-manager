@@ -15,6 +15,7 @@
 import { OrderStatus, PaymentMethod, PaymentStatus, Prisma, UserRole } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import {
+  AppError,
   BadRequestError,
   ConflictError,
   ForbiddenError,
@@ -40,6 +41,75 @@ const MAX_OVERPAY_MULTIPLE = 10;
 const MAX_SINGLE_PAYMENT_CNY = 1_000_000;
 /** 批量到账单次最多处理的订单数。 */
 const MAX_BATCH_ITEMS = 100;
+/**
+ * 清账/超收判定的一分钱容差：避免浮点误差把「恰好收满」误判成超收。
+ * 与全局清账公式里的 0.001 同源，这里放宽到一分钱（金额均为两位小数），只有严格多收才拦。
+ */
+const OVERPAY_EPSILON_CNY = 0.01;
+/** 同额防呆时间窗（毫秒）：同一订单近 10 分钟内的等额手工收款视为疑似重复录入。 */
+const DUPLICATE_AMOUNT_WINDOW_MS = 10 * 60 * 1000;
+
+/**
+ * 超收硬闸判定（纯函数）：本次到账是否会使订单「累计已付净额 + 预存抵扣」超过应收。
+ *
+ * 口径与全局清账公式（reports/reminders/serializeOrder/confirmManualPayment）一字对齐：
+ *   应收（effectivePayable） = total + adjustmentCny（含改期费/换人费等售后调整行）
+ *   累计已付净额             = paidAmount − 已完成退款（refundedTotal，Refund.status=COMPLETED 之和）
+ *   预存抵扣（prepaymentOffset）视同已付
+ * 收满（净额恰好等于应收，含一分钱容差）不算超收；仅严格超出才返回 true。
+ *
+ * 退款为何要减：退款完成不减 paidAmount（只翻 Refund 状态），已退出去的钱腾出的额度应可再收，
+ * 故净额 = paidAmount − refundedTotal（与 softDeleteOrder 的 netReceived 同一净额口径）。
+ */
+export function wouldOvercharge(args: {
+  effectivePayable: number;
+  alreadyPaid: number;
+  prepaymentOffset: number;
+  refundedTotal: number;
+  amount: number;
+}): boolean {
+  const netEffectiveAfter =
+    args.alreadyPaid + args.amount + args.prepaymentOffset - args.refundedTotal;
+  return netEffectiveAfter > args.effectivePayable + OVERPAY_EPSILON_CNY;
+}
+
+/** 手工收款记录（供同额防呆判定的最小形状）。 */
+export interface ManualPaymentLike {
+  id: string;
+  amount: number;
+  createdAt: Date;
+}
+
+/**
+ * 同额防呆判定（纯函数）：候选到账在「近 windowMs 毫秒」内是否已有等额的手工收款记录。
+ * 命中返回该记录 id，未命中返回 null。传入的 existing 应已过滤为「本订单的 SUCCEEDED 手工收款」。
+ */
+export function findDuplicateManualPayment(
+  candidateAmount: number,
+  existing: ManualPaymentLike[],
+  now: Date,
+  windowMs: number = DUPLICATE_AMOUNT_WINDOW_MS,
+): ManualPaymentLike | null {
+  const cutoff = now.getTime() - windowMs;
+  return (
+    existing.find(
+      (p) =>
+        p.createdAt.getTime() >= cutoff &&
+        Math.abs(p.amount - candidateAmount) < OVERPAY_EPSILON_CNY,
+    ) ?? null
+  );
+}
+
+/**
+ * 同额防呆软闸命中错误：稳定 code=DUPLICATE_AMOUNT（前端据此弹二次确认，不靠中文文案匹配）。
+ * 请求体带 confirmDuplicate:true 放行。details 带命中的已有收款 id 与时间窗，供前端组织确认文案。
+ */
+export class DuplicatePaymentAmountError extends AppError {
+  constructor(message: string, details?: unknown) {
+    super(message, { statusCode: 409, code: 'DUPLICATE_AMOUNT', details });
+    this.name = 'DuplicatePaymentAmountError';
+  }
+}
 
 /**
  * 该 Payment 是否为「订单转 PAID 时被作废的兄弟单」（FAILED + gatewayPayload.supersededByPaid）。
@@ -292,7 +362,15 @@ export class PaymentsService {
    */
   async confirmManualPayment(
     orderId: string,
-    input: { amount?: number; method: PaymentMethod; proofUrl?: string; note?: string; idempotencyKey?: string },
+    input: {
+      amount?: number;
+      method: PaymentMethod;
+      proofUrl?: string;
+      note?: string;
+      idempotencyKey?: string;
+      /** 同额防呆软闸放行：前端二次确认后带 true，跳过「近 10 分钟等额手工收款」拦截（超收硬闸仍生效）。 */
+      confirmDuplicate?: boolean;
+    },
     actor: { userId: string; role: UserRole },
   ): Promise<{
     ok: true;
@@ -364,6 +442,50 @@ export class PaymentsService {
           `收款金额 ¥${amount.toFixed(2)} 异常偏高（订单总额 ¥${total.toFixed(2)}），疑似录入错误，已拒绝。如确需大额到账请分笔录入或核对金额。`,
         );
       }
+
+      // ── 超收硬闸（散客/代理都拦）：本次到账不得使「累计已付净额 + 预存抵扣」超过应收。
+      //    应收 = total + adjustmentCny（= 上方 effectivePayable）；净额 = paidAmount − 已完成退款；
+      //    收满(等于应收)不拦，仅超出拦。多付不再从此路口进账——超出部分改走收款对账台挂账池登记；
+      //    存量多付单仍用多付转余额/挂账池端点处置（那些端点保留不动）。
+      const refundedRows = await tx.$queryRaw<Array<{ sum: Prisma.Decimal | null }>>`
+        SELECT COALESCE(SUM(amount), 0) AS sum FROM "Refund" WHERE "orderId" = ${orderId} AND status = 'COMPLETED'
+      `;
+      const refundedTotal = Number(refundedRows[0]?.sum ?? 0);
+      if (
+        wouldOvercharge({ effectivePayable, alreadyPaid: already, prepaymentOffset, refundedTotal, amount })
+      ) {
+        throw new BadRequestError(
+          '该订单已收满/本笔将超出应收，超出部分请在收款对账台登记挂账池',
+        );
+      }
+
+      // ── 同额防呆软闸（confirmDuplicate 放行；两闸叠加时超收优先，故排在超收之后）：
+      //    同一订单近 10 分钟内已有等额的 SUCCEEDED 手工收款记录 → 疑似把同一笔到账录了两次 → 409。
+      //    仅拦手工收款（gatewayPayload.manual=true），网关到账不参与该判定。
+      if (!input.confirmDuplicate) {
+        const cutoff = new Date(Date.now() - DUPLICATE_AMOUNT_WINDOW_MS);
+        const recentManual = await tx.payment.findMany({
+          where: {
+            orderId,
+            status: PaymentStatus.SUCCEEDED,
+            createdAt: { gte: cutoff },
+            gatewayPayload: { path: ['manual'], equals: true },
+          },
+          select: { id: true, amount: true, createdAt: true },
+        });
+        const dup = findDuplicateManualPayment(
+          amount,
+          recentManual.map((p) => ({ id: p.id, amount: Number(p.amount), createdAt: p.createdAt })),
+          new Date(),
+        );
+        if (dup) {
+          throw new DuplicatePaymentAmountError(
+            `该订单近 10 分钟内已有一笔等额收款 ¥${amount.toFixed(2)}，疑似重复录入。确认这是另一笔真实到账再提交。`,
+            { existingPaymentId: dup.id, amount, windowMinutes: DUPLICATE_AMOUNT_WINDOW_MS / 60000 },
+          );
+        }
+      }
+
       newPaid = already + amount;
       // 清账阈值：paidAmount + prepaymentOffset >= total + adjustmentCny 才算收齐（自动转 PAID）。
       // 有改期费的单要连费一起收齐才自动 PAID——与全局清账口径一致；force→PAID 走别的入口不受此影响。
@@ -591,6 +713,9 @@ export class PaymentsService {
             proofUrl: item.proofUrl ?? input.sharedProofUrl,
             note: item.note,
             idempotencyKey,
+            // 批量到账跳过「同额防呆」软闸：整批共用 batchId 已做重复提交去重，且逐单是运营核对过的清单；
+            // 同额防呆是给单笔交互录入防双击用的。超收硬闸不受此影响，批量到账同样会拦超收。
+            confirmDuplicate: true,
           },
           actor,
         );

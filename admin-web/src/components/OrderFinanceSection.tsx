@@ -184,7 +184,7 @@ function ExpectedAmountCard({
           <div className="text-right">
             <span className="badge-warning">🔒 已锁定</span>
             <p className="mt-1 text-xs text-ink-muted">
-              {isAdmin ? '管理员可解锁/修改；非管理员无法编辑。' : '已由管理员锁定，如需修改请联系管理员。'}
+              {isAdmin ? '可解锁或直接修改金额。' : '金额已锁定，解锁后可修改。'}
             </p>
           </div>
         ) : (
@@ -220,16 +220,14 @@ function ExpectedAmountCard({
           {saving ? '保存中…' : '保存'}
         </button>
 
-        {isAdmin && (
-          <button
-            className="btn-secondary text-sm"
-            onClick={toggleLock}
-            disabled={lockToggling || loading}
-            title={locked ? '解锁后出纳可改' : '锁定后非 admin 无法修改'}
-          >
-            {lockToggling ? '处理中…' : locked ? '🔓 解锁' : '🔒 锁定'}
-          </button>
-        )}
+        <button
+          className="btn-secondary text-sm"
+          onClick={toggleLock}
+          disabled={lockToggling || loading}
+          title={locked ? '解锁后可编辑金额' : '锁定后金额仅管理员可改'}
+        >
+          {lockToggling ? '处理中…' : locked ? '🔓 解锁' : '🔒 锁定'}
+        </button>
 
         {ok && <span className="text-xs font-medium text-emerald-700">{ok}</span>}
       </div>
@@ -250,7 +248,7 @@ function ExpectedAmountCard({
       )}
 
       <p className="mt-2 text-xs text-ink-muted">
-        出纳填客户应付到账金额；admin 锁定后非管理员无法修改。
+        财务填客户应付到账金额；财务与管理员可锁定/解锁，锁定后金额仅管理员可改。
       </p>
     </div>
   );

@@ -128,6 +128,17 @@ function newId(): string {
   return `rg_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
+/** 完整 ISO 串（如 2026-07-13T00:00:00.000Z）或 'YYYY-MM-DD' → 'YYYY-MM-DD'。 */
+function dateOnly(date: string): string {
+  return date.slice(0, 10);
+}
+
+/** 'YYYY-MM-DD'（或完整 ISO 串）→ 'MM-DD'；非法输入回退前 10 位原样。 */
+function toMonthDay(date: string): string {
+  const parts = dateOnly(date).split('-');
+  return parts.length === 3 ? `${parts[1]}-${parts[2]}` : dateOnly(date);
+}
+
 /** 'M'/'男' → 男；'F'/'女' → 女；其余不显示。 */
 function genderBadge(gender?: string | null): string | null {
   if (!gender) return null;
@@ -287,9 +298,17 @@ export function RoomingEditor({
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div>
           <h3 className="text-base font-semibold text-ink">分房（拖名字到房间）</h3>
-          {hotelName ? (
+          {hotelName || (checkIn && checkOut) ? (
             <div className="mt-1 flex flex-wrap items-center gap-2">
-              <span className="text-sm font-medium text-ink">🏨 {hotelName}</span>
+              {hotelName && <span className="text-sm font-medium text-ink">🏨 {hotelName}</span>}
+              {checkIn && checkOut && (
+                <span
+                  className="badge-neutral"
+                  title={`出发~结束（住宿区间 入住~退房）：${dateOnly(checkIn)} ~ ${dateOnly(checkOut)}`}
+                >
+                  🗓 {toMonthDay(checkIn)} ~ {toMonthDay(checkOut)}
+                </span>
+              )}
               {hotelTier && (
                 <span className={`badge ${HOTEL_TIER_BADGE[hotelTier].cls}`}>
                   {HOTEL_TIER_BADGE[hotelTier].label}

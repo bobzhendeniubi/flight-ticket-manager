@@ -1,10 +1,16 @@
 /**
- * 签证台 · ADMIN/STAFF — 签证履约任务批量状态流转（批量标"已送签"）
+ * 签证台 · ADMIN/STAFF — 签证履约按人送签 + 批量状态流转
  *
  * 数据源：backend/src/modules/fulfillment/*
- *   GET  /fulfillment-tasks?type=VISA_APPLICATION&status=   任务列表（含 passengers[]）
- *   POST /fulfillment-tasks/batch-status                    批量改状态（部分失败返回 failures）
- *   GET  /orders/:id/passport-photos.zip                   下载护照包（送签用）
+ *   GET   /fulfillment-tasks?type=VISA_APPLICATION&status=          任务列表（含 passengers[]）
+ *   POST  /fulfillment-tasks/visa-passengers/batch-status          按人批量标记送签进度
+ *   POST  /fulfillment-tasks/batch-notes                           批量改备注（部分失败返回 failures）
+ *   GET   /orders/:id/passport-photos.zip                          下载护照包（送签用）
+ *
+ * 交互要点（签证岗反馈）：
+ *   · 乘客默认平铺展示（姓名 / 护照号 / 护照有效期 / 缺照徽标），不必逐单点开，避免漏/误点。
+ *   · 一单多人可只送其中几人：勾选到「人」，批量标记「材料准备 / 已送签」；订单行显示「已送 x/y」。
+ *   · 全选订单 = 选中其下全部乘客。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
@@ -14,12 +20,14 @@ import {
   type FulfillmentStatus,
   type FulfillmentTask,
   type ListFulfillmentParams,
+  type VisaSubmissionStatus,
+  type VisaTaskCostInput,
   type VisaTaskPassenger,
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { localYmd } from '../lib/airports';
 
-// 签证语境的状态文案（IN_PROGRESS/CONFIRMED 与批量操作下拉一致）
+// 任务级签证状态文案（派生自乘客送签进度）
 const VISA_STATUS_LABEL: Record<FulfillmentStatus, string> = {
   PENDING: '待处理',
   IN_PROGRESS: '已送签材料准备',
@@ -28,7 +36,6 @@ const VISA_STATUS_LABEL: Record<FulfillmentStatus, string> = {
   FAILED: '失败',
 };
 
-// 状态徽章映射到 Console badge-* 体系（克制配色，仅状态用色）
 const VISA_STATUS_BADGE: Record<FulfillmentStatus, string> = {
   PENDING: 'badge-neutral',
   IN_PROGRESS: 'badge-info',
@@ -37,26 +44,36 @@ const VISA_STATUS_BADGE: Record<FulfillmentStatus, string> = {
   FAILED: 'badge-danger',
 };
 
-// 批量流转的目标状态（签证台只做"材料准备 / 已送签"两档）
-const BATCH_TARGETS: Array<{ value: FulfillmentStatus; label: string }> = [
+// 乘客送签进度文案 / 徽章（三档）
+const SUBMISSION_LABEL: Record<VisaSubmissionStatus, string> = {
+  PENDING: '待处理',
+  IN_PROGRESS: '材料准备',
+  CONFIRMED: '已送签',
+};
+const SUBMISSION_BADGE: Record<VisaSubmissionStatus, string> = {
+  PENDING: 'badge-neutral',
+  IN_PROGRESS: 'badge-info',
+  CONFIRMED: 'badge-success',
+};
+
+// 按人批量标记的目标进度（签证台只做「材料准备 / 已送签」两档）
+const BATCH_TARGETS: Array<{ value: VisaSubmissionStatus; label: string }> = [
   { value: 'IN_PROGRESS', label: '已送签材料准备' },
   { value: 'CONFIRMED', label: '已送签' },
 ];
 
-// 后端 batch-status / batch-notes 单次最多 100 条
-const BATCH_LIMIT = 100;
-
-// 列表单页拉取上限（与后端一致）；命中总数超过时列表提示「仅显示前 N 条」，引导用筛选缩小范围
+// 按人批量：一次「全选」可能带出很多乘客，前端上限与后端（500）一致
+const PASSENGER_BATCH_LIMIT = 500;
+// 任务级批量备注上限（与后端 batch-notes 一致）
+const NOTES_BATCH_LIMIT = 100;
+// 列表单页拉取上限（与后端一致）
 const PAGE_SIZE = 200;
+// 护照有效期临期阈值：距今 < 6 个月标黄
+const EXPIRY_SOON_MONTHS = 6;
 
 // 状态筛选：OPEN = 待处理 + 材料准备（默认）；ALL = 全部
 type StatusFilter = 'OPEN' | 'ALL' | FulfillmentStatus;
 
-/**
- * 状态筛选 → 后端 status 参数（逗号分隔多状态）。
- * 「待办」= 待处理 + 材料准备，在**后端**用 status:{in:[...]} 表达，不再拉全量回前端筛；
- * 「全部状态」= 不传该参数 = 不加条件（与旧行为一致）。
- */
 const STATUS_FILTER_PARAM: Record<StatusFilter, string | undefined> = {
   OPEN: 'PENDING,IN_PROGRESS',
   ALL: undefined,
@@ -67,7 +84,6 @@ const STATUS_FILTER_PARAM: Record<StatusFilter, string | undefined> = {
   FAILED: 'FAILED',
 };
 
-// 状态筛选收敛到签证岗真正会用的 4 档（下拉选项不变；每档经 STATUS_FILTER_PARAM 落到后端 status）
 const FILTER_OPTIONS: Array<{ value: StatusFilter; label: string }> = [
   { value: 'OPEN', label: '待办（待处理 + 材料准备，默认）' },
   { value: 'PENDING', label: '仅待处理' },
@@ -78,48 +94,23 @@ const FILTER_OPTIONS: Array<{ value: StatusFilter; label: string }> = [
 // 签证签发方式筛选（走后端 issuanceMethod 参数；'NONE' = 未标注，'' = 全部不筛）
 type IssuanceFilter = '' | 'E_VISA' | 'STICKER' | 'ARRIVAL' | 'NONE';
 
-/**
- * 签证台列表查询参数。
- *
- * 过渡类型：`status`（多状态逗号串）/ `issuanceMethod` / `departureDate` 三个参数后端已支持，
- * 但 api.ts 的 ListFulfillmentParams 还是「单状态、无这两个字段」的旧形状（该文件另有改动在途，
- * 本批不动它）。这里本地声明 + 调用点单次断言过渡；api.ts 的类型补齐后可删掉本类型直接用
- * ListFulfillmentParams。运行时无差别：listFulfillmentTasks 用 Object.entries 泛化拼 query string。
- */
-type VisaTaskQuery = Omit<ListFulfillmentParams, 'status'> & {
-  status?: string;
-  issuanceMethod?: Exclude<IssuanceFilter, ''>;
-  departureDate?: string;
-};
+const ISSUANCE_FILTER_OPTIONS: Array<{ value: IssuanceFilter; label: string }> = [
+  { value: '', label: '全部' },
+  { value: 'E_VISA', label: '电子签' },
+  { value: 'STICKER', label: '贴纸签' },
+  { value: 'ARRIVAL', label: '落地签' },
+  { value: 'NONE', label: '未标注' },
+];
 
 /**
- * 分类值的出处（后端 fulfillment.service 的 VisaClassificationSource 随任务下发）。
- *
- * 过渡类型：api.ts 的 FulfillmentTask 尚无这两个字段（该文件另有改动在途，本批不动它）。
- * 这里本地交叉声明过渡；api.ts 的类型补齐后可删掉 VisaTask 直接用 FulfillmentTask。
- */
-type VisaClassificationSource = 'PRODUCT' | 'ORDER_STATUS';
-type VisaTask = FulfillmentTask & {
-  visaIssuanceSource?: VisaClassificationSource | null;
-  visaEntrySource?: VisaClassificationSource | null;
-};
-
-/**
- * 类型徽章的证据档位 —— 三档统一成一套视觉，让签证岗一眼分得清「这个值有多确凿」：
- *   PRODUCT      签证产品结构化标注   → 实色（确证）
- *   ORDER_STATUS 订单级录单状态回退   → 浅色 +「·录单」（推断）
- *   NAME_GUESS   产品名正则猜测       → 浅色 +「·推测」（猜测）
- *
- * 旧实现的判据是「结构化值是否为空」，而回退值也被塞进了同一个字段 → 推断值渲染得和确证值
- * 一模一样，比正则猜测显得更权威。现改为按 source 判据，出处决定视觉。
+ * 类型徽章的证据档位（后端 visaIssuanceSource/visaEntrySource 随任务下发）：
+ *   PRODUCT      产品结构化标注 → 实色（确证）
+ *   ORDER_STATUS 录单状态回退   → 浅色 +「·录单」（推断）
+ *   NAME_GUESS   产品名正则猜测 → 浅色 +「·推测」（猜测）
  */
 type BadgeEvidence = 'PRODUCT' | 'ORDER_STATUS' | 'NAME_GUESS';
 const EVIDENCE_STYLE: Record<BadgeEvidence, { suffix: string; className: string; title: string }> = {
-  PRODUCT: {
-    suffix: '',
-    className: 'badge-neutral text-[10px]',
-    title: '签证产品已结构化标注',
-  },
+  PRODUCT: { suffix: '', className: 'badge-neutral text-[10px]', title: '签证产品已结构化标注' },
   ORDER_STATUS: {
     suffix: '·录单',
     className: 'badge-neutral text-[10px] opacity-60',
@@ -132,13 +123,24 @@ const EVIDENCE_STYLE: Record<BadgeEvidence, { suffix: string; className: string;
   },
 };
 
-const ISSUANCE_FILTER_OPTIONS: Array<{ value: IssuanceFilter; label: string }> = [
-  { value: '', label: '全部' },
-  { value: 'E_VISA', label: '电子签' },
-  { value: 'STICKER', label: '贴纸签' },
-  { value: 'ARRIVAL', label: '落地签' },
-  { value: 'NONE', label: '未标注' },
-];
+/** 护照有效期临期判定：null=未录入(false)；< 今日 = 已过期；< 今日+6月 = 临期 */
+type ExpiryLevel = 'ok' | 'soon' | 'expired' | 'unknown';
+function expiryLevel(ymd: string | null | undefined): ExpiryLevel {
+  if (!ymd) return 'unknown';
+  const exp = new Date(`${ymd}T00:00:00`);
+  if (Number.isNaN(exp.getTime())) return 'unknown';
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  if (exp < today) return 'expired';
+  const threshold = new Date(today);
+  threshold.setMonth(threshold.getMonth() + EXPIRY_SOON_MONTHS);
+  return exp <= threshold ? 'soon' : 'ok';
+}
+
+/** 乘客送签进度（缺省视为 PENDING，兼容旧后端 payload） */
+function subStatus(p: VisaTaskPassenger): VisaSubmissionStatus {
+  return p.visaSubmissionStatus ?? 'PENDING';
+}
 
 /** 出行人签证日期三项（出签日/生效日/有效期）；null = 该字段未录入 */
 interface PassengerVisaDates {
@@ -147,34 +149,34 @@ interface PassengerVisaDates {
   visaExpiry: string | null;
 }
 
-// ── 乘客行：名称 / 护照号 / 照片缩略图 ─────────────────────────────────────
+// ── 平铺乘客行：勾选 + 姓名 / 护照号 / 护照有效期 / 缺照徽标 + 送签进度 ─────────────
 interface PassengerRowProps {
   passenger: VisaTaskPassenger;
-  /** 展开后按需拉取到的护照大图（覆盖列表里的 null）；未取到则回落到 passenger 上的值 */
+  selected: boolean;
+  onToggleSelect: () => void;
+  /** 展开后按需拉取到的护照大图（覆盖列表里的 null） */
   photoUrl?: string | null;
-  /** 护照图仍在按需加载中 */
   photosLoading?: boolean;
-  /** 点开「护照」时若本单尚未拉图，触发按需拉取（幂等：已加载/加载中则无操作） */
   onRequestPhotos?: () => void;
-  /** 出签日/生效日/有效期当前值；undefined = 尚未拉到（展开时按需加载，见 TaskRow.loadVisaDates） */
+  /** 签证日期编辑区是否显示（订单级「签证日期」开关控制） */
+  showVisaDates?: boolean;
   visaDates?: PassengerVisaDates;
-  /** 签证日期仍在按需加载中（未加载完成前不放开编辑，避免草稿以空值覆盖尚未拉到的真实值） */
   visaDatesLoading?: boolean;
-  /** 出签日/生效日/有效期改由签证台在出签后补录（票务岗反馈：录单时不需要）。
-   *  提供时才展示「编辑」入口；保存调用 PATCH /orders/:id/passengers/:passengerId/visa-dates。 */
   onSaveVisaDates?: (passengerId: string, next: PassengerVisaDates) => Promise<void>;
 }
 function PassengerRow({
   passenger,
+  selected,
+  onToggleSelect,
   photoUrl,
   photosLoading,
   onRequestPhotos,
+  showVisaDates,
   visaDates,
   visaDatesLoading,
   onSaveVisaDates,
 }: PassengerRowProps) {
   const [enlarged, setEnlarged] = useState(false);
-  // 签证日期行内编辑（出签后补录；见票务岗 0715 反馈：录单时不需要，改到签证台录）
   const [editingVisaDates, setEditingVisaDates] = useState(false);
   const [visaDraft, setVisaDraft] = useState<PassengerVisaDates>({
     visaIssueDate: null,
@@ -208,7 +210,6 @@ function PassengerRow({
     }
   };
 
-  // 展示用：出签日/生效日/有效期三项拼一行；均未录入则显示提示语
   const visaDatesParts = visaDates
     ? [
         visaDates.visaIssueDate ? `出签日 ${visaDates.visaIssueDate}` : null,
@@ -216,21 +217,17 @@ function PassengerRow({
         visaDates.visaExpiry ? `有效期 ${visaDates.visaExpiry}` : null,
       ].filter((x): x is string => Boolean(x))
     : [];
-  // 优先用按需加载到的真图；否则回落到列表下发的值（现列表恒为 null）
   const resolvedPhoto = photoUrl ?? passenger.passportPhotoUrl;
 
-  // 打开护照大图：若还没图，先触发本单按需拉取（modal 内展示 loading 态）
   const openPassport = () => {
     if (!resolvedPhoto) onRequestPhotos?.();
     setEnlarged(true);
   };
 
-  // 姓名按护照惯例展示为 姓/名（LAST/FIRST）；缺拆分字段时回退整名
   const displayName =
     passenger.lastName && passenger.firstName
       ? `${passenger.lastName}/${passenger.firstName}`.toUpperCase()
       : passenger.fullName || '—';
-  // 性别徽标：M→男 / F→女 / X→其他；无值显示 —
   const genderLabel =
     passenger.gender === 'M'
       ? '男'
@@ -240,9 +237,23 @@ function PassengerRow({
           ? '其他'
           : null;
 
+  const status = subStatus(passenger);
+  const expLevel = expiryLevel(passenger.passportExpiry);
+
   return (
-    <div className="flex items-center gap-3 py-1 text-xs">
-      {/* 护照照片区 */}
+    <div
+      className={`flex items-center gap-3 py-1.5 text-xs ${selected ? 'bg-brand-50/60 -mx-2 px-2 rounded' : ''}`}
+    >
+      {/* 按人勾选（部分送签） */}
+      <input
+        type="checkbox"
+        className="shrink-0"
+        aria-label={`选择乘客 ${displayName}`}
+        checked={selected}
+        onChange={onToggleSelect}
+      />
+
+      {/* 护照缺照/查看徽标（点击按需拉图） */}
       <div className="w-8 shrink-0">
         {photosLoading && !resolvedPhoto ? (
           <div className="flex h-8 w-8 items-center justify-center rounded border border-slate-200 bg-slate-50">
@@ -255,17 +266,17 @@ function PassengerRow({
             title="点击查看护照大图核对信息"
             className="block h-8 w-8 overflow-hidden rounded border border-slate-200 hover:opacity-80 transition-opacity"
           >
-            <img
-              src={resolvedPhoto}
-              alt={`${passenger.fullName} 护照`}
-              className="h-full w-full object-cover"
-            />
+            <img src={resolvedPhoto} alt={`${passenger.fullName} 护照`} className="h-full w-full object-cover" />
           </button>
         ) : passenger.hasPhoto ? (
-          // 有照片但本次未取到（加载失败）—— 与"缺照"区分，中性占位
-          <div className="flex h-8 w-8 items-center justify-center rounded border border-slate-200 bg-slate-50 text-[9px] text-ink-muted">
-            —
-          </div>
+          <button
+            type="button"
+            onClick={openPassport}
+            title="点击查看护照大图核对信息"
+            className="flex h-8 w-8 items-center justify-center rounded border border-slate-200 bg-slate-50 text-[9px] text-ink-muted hover:opacity-80"
+          >
+            照
+          </button>
         ) : (
           <div className="flex h-8 w-8 items-center justify-center rounded border border-rose-200 bg-rose-50 text-[9px] font-semibold text-rose-600">
             缺
@@ -273,7 +284,7 @@ function PassengerRow({
         )}
       </div>
 
-      {/* 姓名 / 护照号 / 签证日期（若 payload 带了就显示，没带也不报错） */}
+      {/* 姓名 / 护照号 / 护照有效期 */}
       <div className="min-w-0 flex-1">
         <div className="flex items-center gap-1.5">
           <span className="font-medium text-ink truncate">{displayName}</span>
@@ -282,105 +293,114 @@ function PassengerRow({
           )}
           <span className="badge-neutral shrink-0 text-[10px]">{genderLabel ?? '—'}</span>
         </div>
-        <div className="font-mono text-ink-muted truncate">{passenger.documentNumber || '—'}</div>
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-0.5">
+          <span className="font-mono text-ink-muted truncate">{passenger.documentNumber || '—'}</span>
+          {/* 护照有效期：临期<6月标黄，已过期标红，未录入灰 */}
+          {passenger.passportExpiry ? (
+            <span
+              className={
+                expLevel === 'expired'
+                  ? 'text-[11px] font-semibold text-rose-600'
+                  : expLevel === 'soon'
+                    ? 'text-[11px] font-semibold text-amber-600'
+                    : 'text-[11px] text-ink-muted'
+              }
+              title={
+                expLevel === 'expired'
+                  ? '护照已过期'
+                  : expLevel === 'soon'
+                    ? `护照将在 ${EXPIRY_SOON_MONTHS} 个月内到期`
+                    : '护照有效期'
+              }
+            >
+              护照有效期 {passenger.passportExpiry}
+              {expLevel === 'expired' ? '（已过期）' : expLevel === 'soon' ? '（临期）' : ''}
+            </span>
+          ) : (
+            <span className="text-[11px] text-ink-muted">护照有效期未录入</span>
+          )}
+        </div>
 
-        {/* 出签日/生效日/有效期：签证台在出签后于此补录（票务岗反馈：录单时不需要，已从录单表单移除） */}
-        {editingVisaDates ? (
-          <div className="mt-1 flex flex-wrap items-center gap-1.5">
-            <label className="flex items-center gap-1 text-[10px] text-ink-muted">
-              出签日
-              <input
-                type="date"
-                className="input w-[9.5rem] py-0.5 text-[11px]"
-                value={visaDraft.visaIssueDate ?? ''}
-                onChange={(e) =>
-                  setVisaDraft((d) => ({ ...d, visaIssueDate: e.target.value || null }))
-                }
-                disabled={savingVisaDates}
-              />
-            </label>
-            <label className="flex items-center gap-1 text-[10px] text-ink-muted">
-              生效日
-              <input
-                type="date"
-                className="input w-[9.5rem] py-0.5 text-[11px]"
-                value={visaDraft.visaEffectiveDate ?? ''}
-                onChange={(e) =>
-                  setVisaDraft((d) => ({ ...d, visaEffectiveDate: e.target.value || null }))
-                }
-                disabled={savingVisaDates}
-              />
-            </label>
-            <label className="flex items-center gap-1 text-[10px] text-ink-muted">
-              有效期
-              <input
-                type="date"
-                className="input w-[9.5rem] py-0.5 text-[11px]"
-                value={visaDraft.visaExpiry ?? ''}
-                onChange={(e) => setVisaDraft((d) => ({ ...d, visaExpiry: e.target.value || null }))}
-                disabled={savingVisaDates}
-              />
-            </label>
-            <button
-              type="button"
-              className="btn-primary py-0.5 px-2 text-[10px]"
-              onClick={() => void saveVisaDates()}
-              disabled={savingVisaDates}
-            >
-              {savingVisaDates ? '保存中…' : '保存'}
-            </button>
-            <button
-              type="button"
-              className="btn-ghost py-0.5 px-2 text-[10px]"
-              onClick={() => setEditingVisaDates(false)}
-              disabled={savingVisaDates}
-            >
-              取消
-            </button>
-            {visaDatesError && <span className="text-[10px] text-rose-600">{visaDatesError}</span>}
-          </div>
-        ) : (
-          <div className="mt-0.5 flex items-center gap-1.5">
-            {visaDatesLoading && visaDates === undefined ? (
-              <span className="text-[10px] text-ink-muted">签证日期加载中…</span>
-            ) : visaDatesParts.length > 0 ? (
-              <span
-                className="truncate text-[10px] text-ink-muted"
-                title={visaDatesParts.join(' · ')}
-              >
-                {visaDatesParts.join(' · ')}
-              </span>
-            ) : (
-              <span className="text-[10px] text-ink-muted">未录入签证日期</span>
-            )}
-            {onSaveVisaDates && visaDates !== undefined && (
+        {/* 签证日期编辑（订单级开关开启时显示；出签后补录） */}
+        {showVisaDates &&
+          (editingVisaDates ? (
+            <div className="mt-1 flex flex-wrap items-center gap-1.5">
+              <label className="flex items-center gap-1 text-[10px] text-ink-muted">
+                出签日
+                <input
+                  type="date"
+                  className="input w-[9.5rem] py-0.5 text-[11px]"
+                  value={visaDraft.visaIssueDate ?? ''}
+                  onChange={(e) => setVisaDraft((d) => ({ ...d, visaIssueDate: e.target.value || null }))}
+                  disabled={savingVisaDates}
+                />
+              </label>
+              <label className="flex items-center gap-1 text-[10px] text-ink-muted">
+                生效日
+                <input
+                  type="date"
+                  className="input w-[9.5rem] py-0.5 text-[11px]"
+                  value={visaDraft.visaEffectiveDate ?? ''}
+                  onChange={(e) => setVisaDraft((d) => ({ ...d, visaEffectiveDate: e.target.value || null }))}
+                  disabled={savingVisaDates}
+                />
+              </label>
+              <label className="flex items-center gap-1 text-[10px] text-ink-muted">
+                有效期
+                <input
+                  type="date"
+                  className="input w-[9.5rem] py-0.5 text-[11px]"
+                  value={visaDraft.visaExpiry ?? ''}
+                  onChange={(e) => setVisaDraft((d) => ({ ...d, visaExpiry: e.target.value || null }))}
+                  disabled={savingVisaDates}
+                />
+              </label>
               <button
                 type="button"
-                className="shrink-0 text-[10px] text-brand hover:text-brand-dark hover:underline"
-                onClick={startEditVisaDates}
+                className="btn-primary py-0.5 px-2 text-[10px]"
+                onClick={() => void saveVisaDates()}
+                disabled={savingVisaDates}
               >
-                编辑
+                {savingVisaDates ? '保存中…' : '保存'}
               </button>
-            )}
-          </div>
-        )}
+              <button
+                type="button"
+                className="btn-ghost py-0.5 px-2 text-[10px]"
+                onClick={() => setEditingVisaDates(false)}
+                disabled={savingVisaDates}
+              >
+                取消
+              </button>
+              {visaDatesError && <span className="text-[10px] text-rose-600">{visaDatesError}</span>}
+            </div>
+          ) : (
+            <div className="mt-0.5 flex items-center gap-1.5">
+              {visaDatesLoading && visaDates === undefined ? (
+                <span className="text-[10px] text-ink-muted">签证日期加载中…</span>
+              ) : visaDatesParts.length > 0 ? (
+                <span className="truncate text-[10px] text-ink-muted" title={visaDatesParts.join(' · ')}>
+                  {visaDatesParts.join(' · ')}
+                </span>
+              ) : (
+                <span className="text-[10px] text-ink-muted">未录入签证日期</span>
+              )}
+              {onSaveVisaDates && visaDates !== undefined && (
+                <button
+                  type="button"
+                  className="shrink-0 text-[10px] text-brand hover:text-brand-dark hover:underline"
+                  onClick={startEditVisaDates}
+                >
+                  编辑
+                </button>
+              )}
+            </div>
+          ))}
       </div>
 
-      {/* 右侧标识：有图→可点「护照」（点开大图核对姓名）；无图→红「缺护照」 */}
-      {passenger.hasPhoto ? (
-        <button
-          type="button"
-          onClick={openPassport}
-          title="点击查看护照大图核对信息"
-          className="badge-info shrink-0 cursor-pointer text-[10px] hover:opacity-80 transition-opacity"
-        >
-          护照
-        </button>
-      ) : (
-        <span className="badge-danger shrink-0 text-[10px]">缺护照</span>
-      )}
+      {/* 送签进度徽章（按人） */}
+      <span className={`${SUBMISSION_BADGE[status]} shrink-0 text-[10px]`}>{SUBMISSION_LABEL[status]}</span>
 
-      {/* 护照大图查看 —— 标题带乘客姓名，便于核对；图未取到时按需加载/兜底提示 */}
+      {/* 护照大图查看 */}
       {enlarged && (
         <div
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
@@ -437,41 +457,209 @@ function PassengerRow({
   );
 }
 
-// ── 可展开的任务行 ────────────────────────────────────────────────────────────
-interface TaskRowProps {
-  task: VisaTask;
-  selected: boolean;
-  onToggle: () => void;
+// ── 签证金额（人均实际成本）小控件 ─────────────────────────────────────────────
+/** 解析输入框数字：空/非法 → null，有效有限数 → number */
+function parseCostNum(s: string): number | null {
+  const t = s.trim();
+  if (t === '') return null;
+  const n = Number(t);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** 展示态签证金额：$31.5 ×7.2=¥226.8/人 / ¥200/人 / 未设置 */
+function visaCostSummary(task: FulfillmentTask): string {
+  const cny = task.visaUnitCostCny;
+  if (cny == null) return '未设置';
+  if (task.visaUnitCostUsd != null && task.visaFxRate != null) {
+    return `$${task.visaUnitCostUsd} ×${task.visaFxRate}=¥${cny}/人`;
+  }
+  return `¥${cny}/人`;
+}
+
+interface VisaCostControlProps {
+  task: FulfillmentTask;
   token: string;
-  /** 备注保存成功后触发列表刷新 */
+  onSaved: () => void;
+}
+/**
+ * 签证人均成本编辑：美金单价+汇率（自动折人民币）或直填人民币。
+ * 保存即调 setVisaTaskCost；清空三格保存 = 回退产品主数据成本。
+ */
+function VisaCostControl({ task, token, onSaved }: VisaCostControlProps) {
+  const [editing, setEditing] = useState(false);
+  const [usd, setUsd] = useState('');
+  const [rate, setRate] = useState('');
+  const [cny, setCny] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const startEdit = () => {
+    setUsd(task.visaUnitCostUsd != null ? String(task.visaUnitCostUsd) : '');
+    setRate(task.visaFxRate != null ? String(task.visaFxRate) : '');
+    setCny(task.visaUnitCostCny != null ? String(task.visaUnitCostCny) : '');
+    setError(null);
+    setEditing(true);
+  };
+
+  const usdNum = parseCostNum(usd);
+  const rateNum = parseCostNum(rate);
+  // 美金+汇率齐备 → 预览自动折算人民币（与后端口径一致）
+  const autoCny =
+    usdNum != null && rateNum != null ? Math.round(usdNum * rateNum * 100) / 100 : null;
+
+  const save = async () => {
+    let payload: VisaTaskCostInput;
+    if (usdNum != null || rateNum != null) {
+      // 想用美金折算：单价与汇率须同时给
+      if (usdNum == null || rateNum == null) {
+        setError('美金单价与汇率需同时填写');
+        return;
+      }
+      if (usdNum < 0 || rateNum <= 0) {
+        setError('美金单价需 ≥0，汇率需 >0');
+        return;
+      }
+      payload = { visaUnitCostUsd: usdNum, visaFxRate: rateNum, visaUnitCostCny: null };
+    } else {
+      const cnyNum = parseCostNum(cny);
+      if (cnyNum != null && cnyNum < 0) {
+        setError('人民币金额需 ≥0');
+        return;
+      }
+      // cnyNum 为 null（三格全空）= 清空回退产品成本
+      payload = { visaUnitCostUsd: null, visaFxRate: null, visaUnitCostCny: cnyNum };
+    }
+    setSaving(true);
+    setError(null);
+    try {
+      await api.setVisaTaskCost(token, task.id, payload);
+      setEditing(false);
+      onSaved();
+    } catch (e: unknown) {
+      setError(e instanceof ApiError ? e.message : '保存失败');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (!editing) {
+    return (
+      <div className="flex flex-col items-center gap-0.5">
+        <span
+          className={
+            task.visaUnitCostCny != null
+              ? 'text-[11px] font-medium text-ink'
+              : 'text-[11px] text-ink-muted'
+          }
+        >
+          {visaCostSummary(task)}
+        </span>
+        <button type="button" className="btn-ghost py-0.5 px-2 text-[11px]" onClick={startEdit}>
+          {task.visaUnitCostCny != null ? '改金额' : '设金额'}
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col items-stretch gap-1 rounded-md border border-brand-200 bg-white p-2 text-left">
+      <div className="flex items-center gap-1">
+        <span className="text-[11px] text-ink-muted">$</span>
+        <input
+          className="input w-16 py-0.5 text-xs"
+          inputMode="decimal"
+          placeholder="美金"
+          value={usd}
+          disabled={saving}
+          onChange={(e) => setUsd(e.target.value)}
+        />
+        <span className="text-[11px] text-ink-muted">×</span>
+        <input
+          className="input w-16 py-0.5 text-xs"
+          inputMode="decimal"
+          placeholder="汇率"
+          value={rate}
+          disabled={saving}
+          onChange={(e) => setRate(e.target.value)}
+        />
+      </div>
+      {autoCny != null && (
+        <div className="text-[11px] text-emerald-700">= ¥{autoCny}/人（自动折算）</div>
+      )}
+      <div className="flex items-center gap-1">
+        <span className="text-[11px] text-ink-muted">或 直填 ¥</span>
+        <input
+          className="input w-20 py-0.5 text-xs disabled:bg-slate-50"
+          inputMode="decimal"
+          placeholder="人民币"
+          value={cny}
+          // 已用美金折算时直填框失效（避免两套值打架）
+          disabled={saving || usdNum != null || rateNum != null}
+          onChange={(e) => setCny(e.target.value)}
+        />
+      </div>
+      {error && <div className="text-[11px] text-rose-600">{error}</div>}
+      <div className="flex items-center gap-1">
+        <button
+          type="button"
+          className="btn-primary py-0.5 px-2 text-[11px]"
+          onClick={() => void save()}
+          disabled={saving}
+        >
+          {saving ? '保存中…' : '保存'}
+        </button>
+        <button
+          type="button"
+          className="btn-ghost py-0.5 px-2 text-[11px]"
+          onClick={() => setEditing(false)}
+          disabled={saving}
+        >
+          取消
+        </button>
+      </div>
+      <p className="text-[10px] text-ink-muted">三格留空保存 = 清空，财务回退产品成本</p>
+    </div>
+  );
+}
+
+// ── 订单组：订单头行 + 平铺乘客行 ─────────────────────────────────────────────
+interface OrderGroupProps {
+  task: FulfillmentTask;
+  selectedPassengerIds: Set<string>;
+  onTogglePassenger: (passengerId: string) => void;
+  onToggleOrderPassengers: (passengerIds: string[]) => void;
+  token: string;
   onChanged: () => void;
 }
-function TaskRow({ task, selected, onToggle, token, onChanged }: TaskRowProps) {
-  const [expanded, setExpanded] = useState(false);
-  const [downloading, setDownloading] = useState(false);
+function OrderGroup({
+  task,
+  selectedPassengerIds,
+  onTogglePassenger,
+  onToggleOrderPassengers,
+  token,
+  onChanged,
+}: OrderGroupProps) {
+  const passengers = task.passengers ?? [];
+  const orderId = task.item.orderId;
 
-  // 护照大图按需加载：列表已瘦身不带图，展开某单时才拉真图（避免整页数百 MB base64）
+  const [downloading, setDownloading] = useState(false);
+  const [showVisaDates, setShowVisaDates] = useState(false);
+
+  // 护照大图按需加载（点击缺照/照片徽标时才拉真图）
   const [photoMap, setPhotoMap] = useState<Record<string, string | null>>({});
   const [photosLoading, setPhotosLoading] = useState(false);
   const [photosError, setPhotosError] = useState<string | null>(null);
   const photosLoadedRef = useRef(false);
 
-  // 备注 = 任务级 task.notes（可编辑），区别于订单级 order.notes（只读）
+  // 备注 = 任务级 task.notes
   const [noteDraft, setNoteDraft] = useState(task.notes ?? '');
   const [savingNote, setSavingNote] = useState(false);
   const [noteError, setNoteError] = useState<string | null>(null);
-  // 输入框是否聚焦中：刷新时若用户正在输入，别用服务端值覆盖草稿（否则丢键入）
   const noteFocusedRef = useRef(false);
-  // task 刷新后同步草稿（仅在未聚焦时；避免乐观值与服务端不一致，又不打断输入）
   useEffect(() => {
     if (!noteFocusedRef.current) setNoteDraft(task.notes ?? '');
   }, [task.notes]);
 
-  const passengers = task.passengers ?? [];
-  const missingCount = passengers.filter((p) => !p.hasPhoto).length;
-  const orderId = task.item.orderId;
-
-  // 按需拉取本单乘客护照真图（首次展开时；失败允许重试）
   const loadPhotos = useCallback(() => {
     if (!orderId || passengers.length === 0) return;
     photosLoadedRef.current = true;
@@ -485,19 +673,17 @@ function TaskRow({ task, selected, onToggle, token, onChanged }: TaskRowProps) {
         setPhotoMap(m);
       })
       .catch((e: unknown) => {
-        photosLoadedRef.current = false; // 允许重试
+        photosLoadedRef.current = false;
         setPhotosError(e instanceof ApiError ? e.message : '护照图加载失败');
       })
       .finally(() => setPhotosLoading(false));
   }, [orderId, passengers.length, token]);
 
-  // 点开「护照」时的按需拉取：仅在未加载且非加载中时触发（幂等，避免重复请求）
   const ensurePhotos = useCallback(() => {
     if (!photosLoadedRef.current && !photosLoading) loadPhotos();
   }, [loadPhotos, photosLoading]);
 
-  // 出签日/生效日/有效期按需加载：签证任务 payload 不带这三项（履约任务列表接口未联查），
-  // 展开某单时通过 GET /orders/:id 取一次订单详情，从出行人里取权威当前值供编辑表单预填。
+  // 签证日期按需加载（点开「签证日期」时才拉订单详情）
   const [visaDatesMap, setVisaDatesMap] = useState<Record<string, PassengerVisaDates>>({});
   const [visaDatesLoading, setVisaDatesLoading] = useState(false);
   const [visaDatesLoadError, setVisaDatesLoadError] = useState<string | null>(null);
@@ -522,13 +708,12 @@ function TaskRow({ task, selected, onToggle, token, onChanged }: TaskRowProps) {
         setVisaDatesMap(m);
       })
       .catch((e: unknown) => {
-        visaDatesLoadedRef.current = false; // 允许重试（展开态下再次触发）
+        visaDatesLoadedRef.current = false;
         setVisaDatesLoadError(e instanceof ApiError ? e.message : '签证日期加载失败');
       })
       .finally(() => setVisaDatesLoading(false));
   }, [orderId, passengers.length, token]);
 
-  // 保存单个出行人的签证日期（PassengerRow 内表单提交）；成功后局部更新本地 map（不整页刷新）。
   const saveVisaDates = useCallback(
     async (passengerId: string, next: PassengerVisaDates) => {
       if (!orderId) throw new Error('缺少订单号，无法保存');
@@ -538,10 +723,9 @@ function TaskRow({ task, selected, onToggle, token, onChanged }: TaskRowProps) {
     [orderId, token],
   );
 
-  const toggleExpanded = () => {
-    const next = !expanded;
-    setExpanded(next);
-    if (next && !photosLoadedRef.current) loadPhotos();
+  const toggleVisaDates = () => {
+    const next = !showVisaDates;
+    setShowVisaDates(next);
     if (next && !visaDatesLoadedRef.current) loadVisaDates();
   };
 
@@ -551,27 +735,21 @@ function TaskRow({ task, selected, onToggle, token, onChanged }: TaskRowProps) {
       ? localYmd(task.order.departureTime, task.order.departureTz)
       : null;
 
-  // 类型徽章：每档取值都带出处（见 EVIDENCE_STYLE），视觉由出处决定，不由「值是否为空」决定
+  // 类型徽章（签发方式 / 入境次数，带证据出处）
   const visaName = task.visaName ?? '';
   const typeBadges: Array<{ key: string; text: string; evidence: BadgeEvidence }> = [];
-
-  // 入境次数：只认签证产品的结构化字段（后端已不再从录单状态硬编码「多次」）；
-  // 产品未标注 → 退到产品名正则，浅色标「·推测」
   const entryLabel =
     task.visaEntryType === 'SINGLE' ? '单次' : task.visaEntryType === 'MULTIPLE' ? '多次' : null;
   if (entryLabel) {
     typeBadges.push({
       key: 'entry',
       text: entryLabel,
-      // 入境次数无回退来源，有值即来自产品；source 缺省（旧后端）时同样按产品处理
       evidence: task.visaEntrySource === 'ORDER_STATUS' ? 'ORDER_STATUS' : 'PRODUCT',
     });
   } else {
     const guess = /多次/.test(visaName) ? '多次' : /单次/.test(visaName) ? '单次' : null;
     if (guess) typeBadges.push({ key: 'entry', text: guess, evidence: 'NAME_GUESS' });
   }
-
-  // 签发方式：产品结构化字段，或订单级录单「签证状态」回退（回退有据——录单下拉选的就是「电子签」）
   const issuanceLabel =
     task.visaIssuanceMethod === 'E_VISA'
       ? '电子签'
@@ -589,9 +767,9 @@ function TaskRow({ task, selected, onToggle, token, onChanged }: TaskRowProps) {
   }
 
   const saveNote = async () => {
-    if (savingNote) return; // 防重入：Enter→blur 可能重复触发
+    if (savingNote) return;
     const next = noteDraft.trim();
-    if (next === (task.notes ?? '')) return; // 无变化不提交
+    if (next === (task.notes ?? '')) return;
     setSavingNote(true);
     setNoteError(null);
     try {
@@ -624,19 +802,32 @@ function TaskRow({ task, selected, onToggle, token, onChanged }: TaskRowProps) {
     }
   };
 
+  // 进度：已送 x/y（x=已送签，y=乘客总数）；缺照数用于头行提示
+  const total = passengers.length;
+  const sentCount = passengers.filter((p) => subStatus(p) === 'CONFIRMED').length;
+  const prepCount = passengers.filter((p) => subStatus(p) === 'IN_PROGRESS').length;
+  const missingCount = passengers.filter((p) => !p.hasPhoto).length;
+
+  // 订单级勾选：其下全部乘客是否全选 / 部分选
+  const passengerIds = passengers.map((p) => p.id);
+  const allSelected = passengerIds.length > 0 && passengerIds.every((id) => selectedPassengerIds.has(id));
+  const someSelected = !allSelected && passengerIds.some((id) => selectedPassengerIds.has(id));
+
   return (
     <>
-      <tr className={selected ? 'bg-brand-50/70' : ''}>
+      <tr className="border-t-2 border-slate-200 bg-slate-50/60">
         <td className="align-top text-center">
           <input
             type="checkbox"
-            aria-label={`选择订单 ${task.order?.orderNumber ?? task.id}`}
-            checked={selected}
-            onChange={onToggle}
+            aria-label={`选择订单 ${task.order?.orderNumber ?? task.id} 全部乘客`}
+            checked={allSelected}
+            ref={(el) => {
+              if (el) el.indeterminate = someSelected;
+            }}
+            onChange={() => onToggleOrderPassengers(passengerIds)}
           />
         </td>
         <td className="align-top font-mono text-xs text-ink">
-          {/* 订单号深链跳订单管理（?q= 承接搜索 + 唯一命中自动开详情抽屉）；等宽 + 悬浮变色 */}
           <div>
             {task.order?.orderNumber ? (
               <Link
@@ -650,12 +841,17 @@ function TaskRow({ task, selected, onToggle, token, onChanged }: TaskRowProps) {
               '—'
             )}
           </div>
-          {/* 出发日期（不是录入日期）；纯签证单无航班 → — */}
-          <div className="mt-0.5 font-sans text-[10px] text-ink-muted">
-            出发 {departureYmd ?? '—'}
-          </div>
+          <div className="mt-0.5 font-sans text-[10px] text-ink-muted">出发 {departureYmd ?? '—'}</div>
         </td>
-        <td className="align-top text-right nums">{task.item.quantity}</td>
+        {/* 进度：已送 x/y（+ 材料准备数） */}
+        <td className="align-top text-right nums">
+          <div className="text-xs font-semibold text-ink">
+            已送 {sentCount}/{total}
+          </div>
+          {prepCount > 0 && (
+            <div className="mt-0.5 text-[10px] text-sky-600">材料准备 {prepCount}</div>
+          )}
+        </td>
         <td className="align-top text-xs text-ink-muted">
           <input
             className="input max-w-xs py-1 text-xs"
@@ -663,8 +859,13 @@ function TaskRow({ task, selected, onToggle, token, onChanged }: TaskRowProps) {
             placeholder="添加备注…"
             disabled={savingNote}
             onChange={(e) => setNoteDraft(e.target.value)}
-            onFocus={() => { noteFocusedRef.current = true; }}
-            onBlur={() => { noteFocusedRef.current = false; void saveNote(); }}
+            onFocus={() => {
+              noteFocusedRef.current = true;
+            }}
+            onBlur={() => {
+              noteFocusedRef.current = false;
+              void saveNote();
+            }}
             onKeyDown={(e) => {
               if (e.key === 'Enter') e.currentTarget.blur();
             }}
@@ -673,9 +874,7 @@ function TaskRow({ task, selected, onToggle, token, onChanged }: TaskRowProps) {
           {noteError && <div className="mt-0.5 text-[10px] text-rose-600">{noteError}</div>}
         </td>
         <td className="align-top text-center">
-          <span className={VISA_STATUS_BADGE[task.status]}>
-            {VISA_STATUS_LABEL[task.status]}
-          </span>
+          <span className={VISA_STATUS_BADGE[task.status]}>{VISA_STATUS_LABEL[task.status]}</span>
           {typeBadges.length > 0 && (
             <div className="mt-1 flex flex-wrap items-center justify-center gap-1">
               {typeBadges.map((b) => {
@@ -691,80 +890,76 @@ function TaskRow({ task, selected, onToggle, token, onChanged }: TaskRowProps) {
           )}
         </td>
         <td className="align-top text-center">
-          <button
-            type="button"
-            onClick={toggleExpanded}
-            className="btn-ghost py-0.5 px-2 text-xs"
-            title={expanded ? '收起乘客信息' : '查看乘客 / 护照'}
-          >
-            {expanded ? '收起' : `乘客${passengers.length > 0 ? `(${passengers.length})` : ''}`}
-            {missingCount > 0 && (
-              <span className="badge-danger ml-1 text-[10px]">缺 {missingCount}</span>
-            )}
-          </button>
+          <div className="flex flex-col items-center gap-1">
+            <button
+              type="button"
+              className="btn-secondary py-0.5 px-2 text-xs"
+              onClick={() => void handleDownloadZip()}
+              disabled={downloading}
+            >
+              {downloading ? '打包中…' : '下载护照'}
+            </button>
+            <button
+              type="button"
+              className="btn-ghost py-0.5 px-2 text-[11px]"
+              onClick={toggleVisaDates}
+              title="出签后补录签证日期"
+            >
+              {showVisaDates ? '收起签证日期' : '签证日期'}
+            </button>
+            {missingCount > 0 && <span className="badge-danger text-[10px]">缺照 {missingCount}</span>}
+            {/* 签证人均成本（签证公司按航班开美金账单；财务据此核对）*/}
+            <div className="mt-1 border-t border-slate-200 pt-1">
+              <VisaCostControl task={task} token={token} onSaved={onChanged} />
+            </div>
+          </div>
         </td>
       </tr>
 
-      {expanded && (
-        <tr className="bg-slate-50">
-          <td colSpan={6} className="px-4 pb-3 pt-2">
-            {passengers.length === 0 ? (
-              <p className="text-xs text-ink-muted">无乘客数据</p>
-            ) : (
-              <>
-                {photosError && (
-                  <div className="mb-2 flex items-center gap-2 text-xs text-rose-600">
-                    <span>护照图加载失败：{photosError}</span>
-                    <button type="button" className="btn-ghost py-0.5 px-2 text-xs" onClick={loadPhotos}>
-                      重试
-                    </button>
-                  </div>
-                )}
-                {visaDatesLoadError && (
-                  <div className="mb-2 flex items-center gap-2 text-xs text-rose-600">
-                    <span>签证日期加载失败：{visaDatesLoadError}</span>
-                    <button type="button" className="btn-ghost py-0.5 px-2 text-xs" onClick={loadVisaDates}>
-                      重试
-                    </button>
-                  </div>
-                )}
-                <div className="max-w-lg divide-y divide-slate-100">
-                  {passengers.map((p) => (
-                    <PassengerRow
-                      key={p.id}
-                      passenger={p}
-                      photoUrl={photoMap[p.id]}
-                      photosLoading={photosLoading}
-                      onRequestPhotos={ensurePhotos}
-                      visaDates={visaDatesMap[p.id]}
-                      visaDatesLoading={visaDatesLoading}
-                      onSaveVisaDates={saveVisaDates}
-                    />
-                  ))}
+      {/* 平铺乘客行（默认展示，不需点开） */}
+      <tr>
+        <td colSpan={6} className="px-4 pb-3 pt-1">
+          {passengers.length === 0 ? (
+            <p className="text-xs text-ink-muted">无乘客数据</p>
+          ) : (
+            <>
+              {photosError && (
+                <div className="mb-2 flex items-center gap-2 text-xs text-rose-600">
+                  <span>护照图加载失败：{photosError}</span>
+                  <button type="button" className="btn-ghost py-0.5 px-2 text-xs" onClick={loadPhotos}>
+                    重试
+                  </button>
                 </div>
-              </>
-            )}
-
-            {passengers.length > 0 && (
-              <div className="mt-2 flex items-center gap-3">
-                <button
-                  type="button"
-                  className="btn-secondary text-xs py-1.5"
-                  onClick={() => void handleDownloadZip()}
-                  disabled={downloading}
-                >
-                  {downloading ? '打包中…' : '下载护照'}
-                </button>
-                {missingCount > 0 && (
-                  <span className="text-xs text-rose-600">
-                    注意：{missingCount} 名乘客缺少护照照片
-                  </span>
-                )}
+              )}
+              {showVisaDates && visaDatesLoadError && (
+                <div className="mb-2 flex items-center gap-2 text-xs text-rose-600">
+                  <span>签证日期加载失败：{visaDatesLoadError}</span>
+                  <button type="button" className="btn-ghost py-0.5 px-2 text-xs" onClick={loadVisaDates}>
+                    重试
+                  </button>
+                </div>
+              )}
+              <div className="max-w-2xl divide-y divide-slate-100">
+                {passengers.map((p) => (
+                  <PassengerRow
+                    key={p.id}
+                    passenger={p}
+                    selected={selectedPassengerIds.has(p.id)}
+                    onToggleSelect={() => onTogglePassenger(p.id)}
+                    photoUrl={photoMap[p.id]}
+                    photosLoading={photosLoading}
+                    onRequestPhotos={ensurePhotos}
+                    showVisaDates={showVisaDates}
+                    visaDates={visaDatesMap[p.id]}
+                    visaDatesLoading={visaDatesLoading}
+                    onSaveVisaDates={saveVisaDates}
+                  />
+                ))}
               </div>
-            )}
-          </td>
-        </tr>
-      )}
+            </>
+          )}
+        </td>
+      </tr>
     </>
   );
 }
@@ -775,30 +970,29 @@ export function VisaDeskPage() {
   const token = tokens?.accessToken ?? '';
 
   const [tasks, setTasks] = useState<FulfillmentTask[]>([]);
-  // 后端命中总数（pagination.total）；> 已加载条数时列表提示截断，引导用筛选缩小范围
   const [totalCount, setTotalCount] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('OPEN');
-  // 签证签发方式筛选（走后端 issuanceMethod；未标注 = 'NONE'）
   const [issuanceFilter, setIssuanceFilter] = useState<IssuanceFilter>('');
-  // 出发日期筛选（走后端 departureDate，单日 YYYY-MM-DD）；空 = 不按出发日过滤
-  const [departureDate, setDepartureDate] = useState('');
-  // 备注搜索（走后端 notesQuery，避免 200 条截断漏筛）；400ms 防抖
+  // 出发日期区间（走后端 departureDateFrom/To）；空 = 不按出发日过滤
+  const [departureFrom, setDepartureFrom] = useState('');
+  const [departureTo, setDepartureTo] = useState('');
+  // 备注搜索（走后端 notesQuery）；400ms 防抖
   const [notesQueryInput, setNotesQueryInput] = useState('');
   const [debouncedNotesQuery, setDebouncedNotesQuery] = useState('');
   useEffect(() => {
     const t = setTimeout(() => setDebouncedNotesQuery(notesQueryInput.trim()), 400);
     return () => clearTimeout(t);
   }, [notesQueryInput]);
-  // 「下载名单表 / 下载护照包」入口状态（0713 签证岗反馈：拆开分别下载，不再合并 zip）
+
   const [rosterDownloading, setRosterDownloading] = useState(false);
   const [passportsDownloading, setPassportsDownloading] = useState(false);
   const [downloadError, setDownloadError] = useState<string | null>(null);
 
-  // ── 批量选择 / 流转状态 ─────────────────────────────────
-  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  const [batchTarget, setBatchTarget] = useState<FulfillmentStatus>('CONFIRMED');
+  // ── 按人选择 / 流转 ─────────────────────────────────
+  const [selectedPassengerIds, setSelectedPassengerIds] = useState<Set<string>>(new Set());
+  const [batchTarget, setBatchTarget] = useState<VisaSubmissionStatus>('CONFIRMED');
   const [submitting, setSubmitting] = useState(false);
   const [batchResult, setBatchResult] = useState<{
     successCount: number;
@@ -806,29 +1000,30 @@ export function VisaDeskPage() {
     failures: Array<{ id: string; error: string }>;
   } | null>(null);
   const [refreshNonce, setRefreshNonce] = useState(0);
-  // 批量备注（独立于批量改状态）：覆盖所选订单的现有备注，走后端 batch-notes
   const [batchNote, setBatchNote] = useState('');
   const [batchNoteSubmitting, setBatchNoteSubmitting] = useState(false);
+  // 批量设签证金额（签证公司按航班统一单价是常态）
+  const [batchCostUsd, setBatchCostUsd] = useState('');
+  const [batchCostRate, setBatchCostRate] = useState('');
+  const [batchCostCny, setBatchCostCny] = useState('');
+  const [batchCostSubmitting, setBatchCostSubmitting] = useState(false);
 
-  // 拉签证任务 —— 状态 / 签证类型 / 出发日期三个筛选**全部走后端**，前端不再二次过滤。
-  // 这样 pagination.total 与列表实际能翻到的行数才是同一个口径：
-  // 旧实现服务端只筛状态、其余在前端过滤，总数却按服务端全量算 → 显示「共 200 条」但列表只剩 3 行；
-  // 且每页各自过滤，跨页的匹配项永远凑不齐（签证岗按「待办」翻页会漏掉本该处理的单）。
   useEffect(() => {
     if (!token) return;
     let cancelled = false;
     setLoading(true);
     setError(null);
-    const query: VisaTaskQuery = {
+    const query: ListFulfillmentParams = {
       type: 'VISA_APPLICATION',
       status: STATUS_FILTER_PARAM[statusFilter],
       issuanceMethod: issuanceFilter || undefined,
-      departureDate: departureDate || undefined,
+      departureDateFrom: departureFrom || undefined,
+      departureDateTo: departureTo || undefined,
       notesQuery: debouncedNotesQuery || undefined,
       pageSize: PAGE_SIZE,
     };
     api
-      .listFulfillmentTasks(token, query as unknown as ListFulfillmentParams)
+      .listFulfillmentTasks(token, query)
       .then((res) => {
         if (cancelled) return;
         setTasks(res.tasks);
@@ -840,49 +1035,83 @@ export function VisaDeskPage() {
       .finally(() => {
         if (!cancelled) setLoading(false);
       });
-    return () => { cancelled = true; };
-  }, [token, statusFilter, issuanceFilter, departureDate, debouncedNotesQuery, refreshNonce]);
+    return () => {
+      cancelled = true;
+    };
+  }, [token, statusFilter, issuanceFilter, departureFrom, departureTo, debouncedNotesQuery, refreshNonce]);
 
-  // ── 勾选 helpers（镜像 OrdersPage 批量管理）────────────────
-  const visibleIds = useMemo(() => tasks.map((t) => t.id), [tasks]);
-  const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.has(id));
-  const someVisibleSelected = !allVisibleSelected && visibleIds.some((id) => selectedIds.has(id));
+  // 全部可见乘客 id + 乘客→任务/订单映射
+  const allPassengerIds = useMemo(
+    () => tasks.flatMap((t) => (t.passengers ?? []).map((p) => p.id)),
+    [tasks],
+  );
+  const passengerToTask = useMemo(() => {
+    const m = new Map<string, FulfillmentTask>();
+    for (const t of tasks) for (const p of t.passengers ?? []) m.set(p.id, t);
+    return m;
+  }, [tasks]);
 
-  const toggleRow = (id: string) => {
-    setSelectedIds((prev) => {
+  const allVisibleSelected =
+    allPassengerIds.length > 0 && allPassengerIds.every((id) => selectedPassengerIds.has(id));
+  const someVisibleSelected =
+    !allVisibleSelected && allPassengerIds.some((id) => selectedPassengerIds.has(id));
+
+  const togglePassenger = (id: string) => {
+    setSelectedPassengerIds((prev) => {
       const next = new Set(prev);
-      if (next.has(id)) next.delete(id); else next.add(id);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+  // 订单级：切换其下全部乘客（全选/全不选，取决于是否已全选）
+  const toggleOrderPassengers = (ids: string[]) => {
+    setSelectedPassengerIds((prev) => {
+      const next = new Set(prev);
+      const allIn = ids.length > 0 && ids.every((id) => next.has(id));
+      if (allIn) ids.forEach((id) => next.delete(id));
+      else ids.forEach((id) => next.add(id));
       return next;
     });
   };
   const toggleAllVisible = () => {
-    setSelectedIds((prev) => {
+    setSelectedPassengerIds((prev) => {
       const next = new Set(prev);
-      if (allVisibleSelected) visibleIds.forEach((id) => next.delete(id));
-      else visibleIds.forEach((id) => next.add(id));
+      if (allVisibleSelected) allPassengerIds.forEach((id) => next.delete(id));
+      else allPassengerIds.forEach((id) => next.add(id));
       return next;
     });
   };
   const clearSelection = useCallback(() => {
-    setSelectedIds(new Set());
+    setSelectedPassengerIds(new Set());
     setBatchResult(null);
   }, []);
 
-  // 勾选的任务 id → 去重后的订单 id 列表（一单可能有多条签证任务/多位乘客，去重成订单）
+  // 勾选乘客 → 去重订单 id（下载名单/护照用）
   const selectedOrderIds = useMemo(
     () =>
       Array.from(
         new Set(
-          tasks
-            .filter((t) => selectedIds.has(t.id))
-            .map((t) => t.item.orderId)
+          Array.from(selectedPassengerIds)
+            .map((pid) => passengerToTask.get(pid)?.item.orderId)
             .filter((id): id is string => Boolean(id)),
         ),
       ),
-    [tasks, selectedIds],
+    [selectedPassengerIds, passengerToTask],
+  );
+  // 勾选乘客 → 去重任务 id（批量备注用）
+  const selectedTaskIds = useMemo(
+    () =>
+      Array.from(
+        new Set(
+          Array.from(selectedPassengerIds)
+            .map((pid) => passengerToTask.get(pid)?.id)
+            .filter((id): id is string => Boolean(id)),
+        ),
+      ),
+    [selectedPassengerIds, passengerToTask],
   );
 
-  // 下载勾选订单的签证名单表（合并成一张 xlsx，不含护照图）
   const handleDownloadVisaRoster = async () => {
     if (!token || selectedOrderIds.length === 0 || rosterDownloading) return;
     setRosterDownloading(true);
@@ -904,7 +1133,6 @@ export function VisaDeskPage() {
     }
   };
 
-  // 下载勾选订单的护照图打包（不含名单表）
   const handleDownloadVisaPassports = async () => {
     if (!token || selectedOrderIds.length === 0 || passportsDownloading) return;
     setPassportsDownloading(true);
@@ -926,20 +1154,27 @@ export function VisaDeskPage() {
     }
   };
 
+  // 按人批量标记送签进度
   const applyBatch = async () => {
-    if (!token || selectedIds.size === 0) return;
-    if (selectedIds.size > BATCH_LIMIT) {
-      alert(`单次最多批量处理 ${BATCH_LIMIT} 条，请分批操作（当前已选 ${selectedIds.size} 条）`);
+    if (!token || selectedPassengerIds.size === 0) return;
+    if (selectedPassengerIds.size > PASSENGER_BATCH_LIMIT) {
+      alert(
+        `单次最多批量处理 ${PASSENGER_BATCH_LIMIT} 人，请分批操作（当前已选 ${selectedPassengerIds.size} 人）`,
+      );
       return;
     }
-    const targetLabel = VISA_STATUS_LABEL[batchTarget];
-    if (!window.confirm(`将 ${selectedIds.size} 条签证任务标记为「${targetLabel}」？`)) return;
+    const targetLabel = SUBMISSION_LABEL[batchTarget];
+    if (!window.confirm(`将 ${selectedPassengerIds.size} 名乘客标记为「${targetLabel}」？`)) return;
     setSubmitting(true);
     setBatchResult(null);
     try {
-      const res = await api.batchUpdateFulfillmentStatus(token, Array.from(selectedIds), batchTarget);
+      const res = await api.batchUpdateVisaPassengerStatus(
+        token,
+        Array.from(selectedPassengerIds),
+        batchTarget,
+      );
       setBatchResult(res);
-      if (res.failureCount === 0) setSelectedIds(new Set());
+      if (res.failureCount === 0) setSelectedPassengerIds(new Set());
       setRefreshNonce((n) => n + 1);
     } catch (e: unknown) {
       alert(e instanceof ApiError ? `批量操作失败：${e.message}` : '批量操作失败');
@@ -948,24 +1183,24 @@ export function VisaDeskPage() {
     }
   };
 
-  // 批量备注：覆盖所选任务的现有备注（可为空 = 批量清空）；沿用 BATCH_LIMIT 上限
+  // 批量备注：作用于所选乘客所属订单的签证任务（去重后按任务改）
   const applyBatchNote = async () => {
-    if (!token || selectedIds.size === 0 || batchNoteSubmitting) return;
-    if (selectedIds.size > BATCH_LIMIT) {
-      alert(`单次最多批量处理 ${BATCH_LIMIT} 条，请分批操作（当前已选 ${selectedIds.size} 条）`);
+    if (!token || selectedTaskIds.length === 0 || batchNoteSubmitting) return;
+    if (selectedTaskIds.length > NOTES_BATCH_LIMIT) {
+      alert(`单次最多批量备注 ${NOTES_BATCH_LIMIT} 单，请分批操作（当前涉及 ${selectedTaskIds.length} 单）`);
       return;
     }
     const next = batchNote.trim();
     if (
       !window.confirm(
-        `将覆盖所选 ${selectedIds.size} 单的现有备注为「${next || '（空）'}」？此操作不可撤销。`,
+        `将覆盖所选 ${selectedTaskIds.length} 单的现有备注为「${next || '（空）'}」？此操作不可撤销。`,
       )
     )
       return;
     setBatchNoteSubmitting(true);
     setBatchResult(null);
     try {
-      const res = await api.batchUpdateFulfillmentNotes(token, Array.from(selectedIds), next);
+      const res = await api.batchUpdateFulfillmentNotes(token, selectedTaskIds, next);
       setBatchResult(res);
       if (res.failureCount === 0) setBatchNote('');
       setRefreshNonce((n) => n + 1);
@@ -976,17 +1211,78 @@ export function VisaDeskPage() {
     }
   };
 
+  // 批量设签证金额：作用于所选乘客所属订单的签证任务（去重后按任务设同一人均单价）
+  const batchCostUsdNum = parseCostNum(batchCostUsd);
+  const batchCostRateNum = parseCostNum(batchCostRate);
+  const batchCostAutoCny =
+    batchCostUsdNum != null && batchCostRateNum != null
+      ? Math.round(batchCostUsdNum * batchCostRateNum * 100) / 100
+      : null;
+  const applyBatchCost = async () => {
+    if (!token || selectedTaskIds.length === 0 || batchCostSubmitting) return;
+    if (selectedTaskIds.length > NOTES_BATCH_LIMIT) {
+      alert(`单次最多批量处理 ${NOTES_BATCH_LIMIT} 单，请分批操作（当前涉及 ${selectedTaskIds.length} 单）`);
+      return;
+    }
+    let payload: VisaTaskCostInput;
+    let label: string;
+    if (batchCostUsdNum != null || batchCostRateNum != null) {
+      if (batchCostUsdNum == null || batchCostRateNum == null) {
+        alert('美金单价与汇率需同时填写');
+        return;
+      }
+      if (batchCostUsdNum < 0 || batchCostRateNum <= 0) {
+        alert('美金单价需 ≥0，汇率需 >0');
+        return;
+      }
+      payload = {
+        visaUnitCostUsd: batchCostUsdNum,
+        visaFxRate: batchCostRateNum,
+        visaUnitCostCny: null,
+      };
+      label = `$${batchCostUsdNum} ×${batchCostRateNum}=¥${batchCostAutoCny}/人`;
+    } else {
+      const cnyNum = parseCostNum(batchCostCny);
+      if (cnyNum != null && cnyNum < 0) {
+        alert('人民币金额需 ≥0');
+        return;
+      }
+      payload = { visaUnitCostUsd: null, visaFxRate: null, visaUnitCostCny: cnyNum };
+      label = cnyNum != null ? `¥${cnyNum}/人` : '清空（回退产品成本）';
+    }
+    if (
+      !window.confirm(`将所选 ${selectedTaskIds.length} 单的签证金额统一设为「${label}」？`)
+    )
+      return;
+    setBatchCostSubmitting(true);
+    setBatchResult(null);
+    try {
+      const res = await api.batchSetVisaTaskCost(token, selectedTaskIds, payload);
+      setBatchResult(res);
+      if (res.failureCount === 0) {
+        setBatchCostUsd('');
+        setBatchCostRate('');
+        setBatchCostCny('');
+      }
+      setRefreshNonce((n) => n + 1);
+    } catch (e: unknown) {
+      alert(e instanceof ApiError ? `批量设金额失败：${e.message}` : '批量设金额失败');
+    } finally {
+      setBatchCostSubmitting(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
       <section className="flex flex-wrap items-end justify-between gap-3">
         <div>
           <h1 className="page-title">签证台</h1>
           <p className="page-sub">
-            签证履约任务批量流转：勾选订单后一键标记
+            乘客默认平铺展示，勾选到人后可只送其中几位：一键标记
             <span className="badge-info mx-1">已送签材料准备</span>
             或
             <span className="badge-success mx-1">已送签</span>
-            。点击"乘客"可展开护照信息及下载按钮。
+            。订单行显示「已送 x/y」进度。
           </p>
         </div>
         <div className="flex flex-wrap items-start gap-3">
@@ -1001,7 +1297,9 @@ export function VisaDeskPage() {
               }}
             >
               {FILTER_OPTIONS.map((o) => (
-                <option key={o.value} value={o.value}>{o.label}</option>
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
               ))}
             </select>
             <p className="mt-1 text-xs text-ink-muted">新录入的待送签单在『待处理』里</p>
@@ -1017,29 +1315,44 @@ export function VisaDeskPage() {
               }}
             >
               {ISSUANCE_FILTER_OPTIONS.map((o) => (
-                <option key={o.value} value={o.value}>{o.label}</option>
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
               ))}
             </select>
             <p className="mt-1 text-xs text-ink-muted">按签发方式筛选</p>
           </div>
           <div>
-            <label className="label">出发日期</label>
-            <div className="flex items-center gap-2">
+            <label className="label">出发日期区间</label>
+            <div className="flex items-center gap-1.5">
               <input
                 type="date"
-                className="input max-w-[12rem] py-1.5"
-                value={departureDate}
+                className="input max-w-[10rem] py-1.5"
+                value={departureFrom}
+                max={departureTo || undefined}
                 onChange={(e) => {
-                  setDepartureDate(e.target.value);
+                  setDepartureFrom(e.target.value);
                   clearSelection();
                 }}
               />
-              {departureDate && (
+              <span className="text-xs text-ink-muted">至</span>
+              <input
+                type="date"
+                className="input max-w-[10rem] py-1.5"
+                value={departureTo}
+                min={departureFrom || undefined}
+                onChange={(e) => {
+                  setDepartureTo(e.target.value);
+                  clearSelection();
+                }}
+              />
+              {(departureFrom || departureTo) && (
                 <button
                   type="button"
                   className="btn-ghost py-1.5 text-xs"
                   onClick={() => {
-                    setDepartureDate('');
+                    setDepartureFrom('');
+                    setDepartureTo('');
                     clearSelection();
                   }}
                 >
@@ -1047,7 +1360,7 @@ export function VisaDeskPage() {
                 </button>
               )}
             </div>
-            <p className="mt-1 text-xs text-ink-muted">按客户出发日筛选（纯签证单无航班）</p>
+            <p className="mt-1 text-xs text-ink-muted">按客户出发日区间筛选（纯签证单无航班仍保留）</p>
           </div>
           <div>
             <label className="label">备注搜索</label>
@@ -1094,46 +1407,40 @@ export function VisaDeskPage() {
       )}
 
       {/* ── 批量操作工具条 ───────────────────────────────────── */}
-      {selectedIds.size > 0 && (
+      {selectedPassengerIds.size > 0 && (
         <section className="card border-brand-200 bg-brand-50/60">
           <div className="flex flex-wrap items-center gap-3">
             <span className="text-sm font-semibold text-ink">
-              已选 <span className="text-brand">{selectedIds.size}</span> 条签证任务
+              已选 <span className="text-brand">{selectedPassengerIds.size}</span> 名乘客
+              <span className="ml-1 text-ink-muted">（{selectedOrderIds.length} 单）</span>
             </span>
             <span className="text-slate-300">|</span>
             <label className="text-sm text-ink-soft">批量标记为：</label>
             <select
               className="input max-w-[12rem] py-1.5"
               value={batchTarget}
-              onChange={(e) => setBatchTarget(e.target.value as FulfillmentStatus)}
+              onChange={(e) => setBatchTarget(e.target.value as VisaSubmissionStatus)}
               disabled={submitting}
             >
               {BATCH_TARGETS.map((t) => (
-                <option key={t.value} value={t.value}>{t.label}</option>
+                <option key={t.value} value={t.value}>
+                  {t.label}
+                </option>
               ))}
             </select>
-            <button
-              className="btn-primary py-1.5"
-              onClick={() => void applyBatch()}
-              disabled={submitting}
-            >
+            <button className="btn-primary py-1.5" onClick={() => void applyBatch()} disabled={submitting}>
               {submitting ? '处理中…' : '执行'}
             </button>
-            <button
-              className="btn-ghost py-1.5"
-              onClick={clearSelection}
-              disabled={submitting}
-            >
+            <button className="btn-ghost py-1.5" onClick={clearSelection} disabled={submitting}>
               清除选择
             </button>
             <span className="text-slate-300">|</span>
-            {/* 下载勾选订单的签证名单表 / 护照包（0713 签证岗反馈：拆开分别下载，不再合并 zip） */}
             <button
               type="button"
               className="btn-secondary py-1.5"
               onClick={() => void handleDownloadVisaRoster()}
               disabled={selectedOrderIds.length === 0 || rosterDownloading}
-              title="下载勾选订单的合并签证名单表（多条任务/乘客同单会自动去重）"
+              title="下载勾选乘客所属订单的合并签证名单表（同单去重）"
             >
               {rosterDownloading
                 ? '打包中…'
@@ -1144,14 +1451,13 @@ export function VisaDeskPage() {
               className="btn-secondary py-1.5"
               onClick={() => void handleDownloadVisaPassports()}
               disabled={selectedOrderIds.length === 0 || passportsDownloading}
-              title="下载勾选订单的护照图打包（多条任务/乘客同单会自动去重）"
+              title="下载勾选乘客所属订单的护照图打包（同单去重）"
             >
               {passportsDownloading
                 ? '打包中…'
                 : `下载护照包${selectedOrderIds.length > 0 ? `（${selectedOrderIds.length}单）` : ''}`}
             </button>
           </div>
-          {/* 批量备注：覆盖所选订单现有备注（走后端 batch-notes，沿用 100 条上限） */}
           <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-brand-200/60 pt-3">
             <label className="text-sm text-ink-soft">批量备注：</label>
             <input
@@ -1166,13 +1472,67 @@ export function VisaDeskPage() {
               type="button"
               className="btn-secondary py-1.5"
               onClick={() => void applyBatchNote()}
-              disabled={batchNoteSubmitting || submitting}
-              title={`将覆盖所选 ${selectedIds.size} 单的现有备注（上限 ${BATCH_LIMIT} 条）`}
+              disabled={batchNoteSubmitting || submitting || selectedTaskIds.length === 0}
+              title={`将覆盖所选 ${selectedTaskIds.length} 单的现有备注（上限 ${NOTES_BATCH_LIMIT} 单）`}
             >
               {batchNoteSubmitting ? '保存中…' : '应用备注'}
             </button>
             <span className="text-[11px] text-ink-muted">
-              会覆盖所选订单的现有备注（上限 {BATCH_LIMIT} 条）
+              备注按订单级作用于所选乘客所属的 {selectedTaskIds.length} 单（上限 {NOTES_BATCH_LIMIT} 单）
+            </span>
+          </div>
+          {/* 批量设签证金额（签证公司按航班统一单价是常态）*/}
+          <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-brand-200/60 pt-3">
+            <label className="text-sm text-ink-soft">批量设金额：</label>
+            <span className="text-xs text-ink-muted">$</span>
+            <input
+              type="text"
+              inputMode="decimal"
+              className="input w-20 py-1.5 text-sm"
+              value={batchCostUsd}
+              placeholder="美金"
+              disabled={batchCostSubmitting || submitting}
+              onChange={(e) => setBatchCostUsd(e.target.value)}
+            />
+            <span className="text-xs text-ink-muted">×</span>
+            <input
+              type="text"
+              inputMode="decimal"
+              className="input w-20 py-1.5 text-sm"
+              value={batchCostRate}
+              placeholder="汇率"
+              disabled={batchCostSubmitting || submitting}
+              onChange={(e) => setBatchCostRate(e.target.value)}
+            />
+            {batchCostAutoCny != null && (
+              <span className="text-xs text-emerald-700">= ¥{batchCostAutoCny}/人</span>
+            )}
+            <span className="text-xs text-ink-muted">或 直填 ¥</span>
+            <input
+              type="text"
+              inputMode="decimal"
+              className="input w-24 py-1.5 text-sm disabled:bg-slate-50"
+              value={batchCostCny}
+              placeholder="人民币"
+              disabled={
+                batchCostSubmitting ||
+                submitting ||
+                batchCostUsdNum != null ||
+                batchCostRateNum != null
+              }
+              onChange={(e) => setBatchCostCny(e.target.value)}
+            />
+            <button
+              type="button"
+              className="btn-secondary py-1.5"
+              onClick={() => void applyBatchCost()}
+              disabled={batchCostSubmitting || submitting || selectedTaskIds.length === 0}
+              title={`将所选 ${selectedTaskIds.length} 单签证任务统一设成同一人均单价（上限 ${NOTES_BATCH_LIMIT} 单）`}
+            >
+              {batchCostSubmitting ? '设置中…' : '应用金额'}
+            </button>
+            <span className="text-[11px] text-ink-muted">
+              作用于所选 {selectedTaskIds.length} 单签证任务；三格留空 = 清空回退产品成本
             </span>
           </div>
           {downloadError && <p className="mt-2 text-xs text-rose-600">{downloadError}</p>}
@@ -1187,7 +1547,9 @@ export function VisaDeskPage() {
               {batchResult.failures.length > 0 && (
                 <ul className="mt-1 max-h-32 overflow-auto text-rose-600">
                   {batchResult.failures.map((f) => (
-                    <li key={f.id} className="font-mono text-[11px]">· {f.id.slice(0, 8)}…：{f.error}</li>
+                    <li key={f.id} className="font-mono text-[11px]">
+                      · {f.id.slice(0, 8)}…：{f.error}
+                    </li>
                   ))}
                 </ul>
               )}
@@ -1196,16 +1558,13 @@ export function VisaDeskPage() {
         </section>
       )}
 
-      {/* 命中总数 + 截断警示（后端单页最多 PAGE_SIZE 条，超出需用筛选缩小范围） */}
       {!loading && totalCount != null && (
         <div className="flex flex-wrap items-center gap-2 text-xs text-ink-muted">
           <span>
             共 <span className="font-semibold text-ink">{totalCount}</span> 条签证任务
           </span>
           {totalCount > tasks.length && (
-            <span className="badge-warning">
-              仅显示前 {tasks.length} 条，请用筛选缩小范围
-            </span>
+            <span className="badge-warning">仅显示前 {tasks.length} 条，请用筛选缩小范围</span>
           )}
         </div>
       )}
@@ -1219,17 +1578,19 @@ export function VisaDeskPage() {
                 <th className="w-10 text-center">
                   <input
                     type="checkbox"
-                    aria-label="全选当前列表"
+                    aria-label="全选当前列表全部乘客"
                     checked={allVisibleSelected}
-                    ref={(el) => { if (el) el.indeterminate = someVisibleSelected; }}
+                    ref={(el) => {
+                      if (el) el.indeterminate = someVisibleSelected;
+                    }}
                     onChange={toggleAllVisible}
                   />
                 </th>
                 <th>订单号</th>
-                <th className="text-right">乘客数</th>
+                <th className="text-right">送签进度</th>
                 <th>备注</th>
-                <th className="text-center">当前状态</th>
-                <th className="text-center">护照信息</th>
+                <th className="text-center">订单状态</th>
+                <th className="text-center">操作</th>
               </tr>
             </thead>
             <tbody>
@@ -1250,11 +1611,12 @@ export function VisaDeskPage() {
                 </tr>
               ) : (
                 tasks.map((task) => (
-                  <TaskRow
+                  <OrderGroup
                     key={task.id}
                     task={task}
-                    selected={selectedIds.has(task.id)}
-                    onToggle={() => toggleRow(task.id)}
+                    selectedPassengerIds={selectedPassengerIds}
+                    onTogglePassenger={togglePassenger}
+                    onToggleOrderPassengers={toggleOrderPassengers}
                     token={token}
                     onChanged={() => setRefreshNonce((n) => n + 1)}
                   />

@@ -30,6 +30,33 @@ export class ApiError extends Error {
  */
 export const DUPLICATE_PASSENGER_CODE = 'DUPLICATE_PASSENGER';
 
+/**
+ * 手工确认收款「同额软闸」的稳定 code（后端近 windowMinutes 分钟内同订单等额收款拦截）。
+ * 前端按 code 判，命中即弹二次确认，确认后带 confirmDuplicate:true 重试。
+ */
+export const DUPLICATE_AMOUNT_CODE = 'DUPLICATE_AMOUNT';
+
+/** 同额软闸 details 结构（后端保证：existingPaymentId + amount + windowMinutes）。 */
+export interface DuplicateAmountDetails {
+  existingPaymentId: string;
+  amount: number;
+  windowMinutes: number;
+}
+
+/** 从 DUPLICATE_AMOUNT 错误里取 details；非该错误 / 结构异常 → null。 */
+export function duplicateAmountDetails(err: unknown): DuplicateAmountDetails | null {
+  if (!(err instanceof ApiError) || err.code !== DUPLICATE_AMOUNT_CODE) return null;
+  const d = err.details;
+  if (!d || typeof d !== 'object') return null;
+  const { existingPaymentId, amount, windowMinutes } = d as Record<string, unknown>;
+  if (typeof amount !== 'number' || typeof windowMinutes !== 'number') return null;
+  return {
+    existingPaymentId: typeof existingPaymentId === 'string' ? existingPaymentId : '',
+    amount,
+    windowMinutes,
+  };
+}
+
 /** 从 DUPLICATE_PASSENGER 错误的 details 里提取冲突订单号（去重）。非该错误 / 结构异常 → []。 */
 export function duplicatePassengerConflictOrderNumbers(err: unknown): string[] {
   if (!(err instanceof ApiError) || err.code !== DUPLICATE_PASSENGER_CODE) return [];
@@ -937,6 +964,8 @@ export interface DeletedOrderSummary {
   deletedBy: string | null;
   /** 乘客姓名（中文名优先，缺失回退证件姓名） */
   passengerNames: string[];
+  /** 出发日期 YYYY-MM-DD（去程航班，回退酒店入住日；均无 → null） */
+  departDate: string | null;
 }
 
 export interface OrderSummary {
@@ -1279,6 +1308,9 @@ export interface MergeTravelerProfileResult {
 export type FulfillmentType = 'FLIGHT_TICKETING' | 'HOTEL_BOOKING' | 'VISA_APPLICATION' | 'TRANSFER_DISPATCH' | 'BUNDLE_COMPOSITE';
 export type FulfillmentStatus = 'PENDING' | 'IN_PROGRESS' | 'CONFIRMED' | 'CANCELLED' | 'FAILED';
 
+/** 乘客送签进度（按人送签用）——三档，与签证台任务状态语义对齐 */
+export type VisaSubmissionStatus = 'PENDING' | 'IN_PROGRESS' | 'CONFIRMED';
+
 /** 签证台乘客明细（仅 VISA_APPLICATION 任务后端附带）*/
 export interface VisaTaskPassenger {
   id: string;
@@ -1296,6 +1328,10 @@ export interface VisaTaskPassenger {
   passportPhotoUrl: string | null;
   /** passportPhotoUrl 非空 → true；缺照时签证台标红用 */
   hasPhoto: boolean;
+  /** 护照有效期（YYYY-MM-DD）；null = 未录入。签证台平铺展示 + 临期<6月标黄 */
+  passportExpiry?: string | null;
+  /** 按人送签进度；缺省（旧后端）视为 PENDING */
+  visaSubmissionStatus?: VisaSubmissionStatus;
 }
 
 export interface FulfillmentTask {
@@ -1332,8 +1368,25 @@ export interface FulfillmentTask {
   visaIssuanceMethod?: VisaIssuanceMethod | null;
   /** 签证产品入境次数（结构化分类）；非签证任务/未设置/缺失 → null */
   visaEntryType?: VisaEntryType | null;
+  /** 签发方式分类出处：PRODUCT=产品结构化标注 / ORDER_STATUS=录单回退；缺省=按 PRODUCT 处理 */
+  visaIssuanceSource?: 'PRODUCT' | 'ORDER_STATUS' | null;
+  /** 入境次数分类出处（同上）；入境次数无回退来源，有值即 PRODUCT */
+  visaEntrySource?: 'PRODUCT' | 'ORDER_STATUS' | null;
   /** 仅 type=VISA_APPLICATION 时后端附带，其余任务类型无此字段 */
   passengers?: VisaTaskPassenger[];
+  /** 签证人均成本·美金单价（仅签证任务；未设置=null）。签证公司按航班开美金账单 */
+  visaUnitCostUsd?: number | null;
+  /** 签证人均成本·折算汇率（USD→CNY；未设置=null） */
+  visaFxRate?: number | null;
+  /** 签证人均成本·人民币（入账权威；未设置=null → 财务回退产品主数据成本） */
+  visaUnitCostCny?: number | null;
+}
+
+/** 设置/清空签证任务人均成本的入参（三字段独立可空；全 null=清空回退产品成本） */
+export interface VisaTaskCostInput {
+  visaUnitCostUsd?: number | null;
+  visaFxRate?: number | null;
+  visaUnitCostCny?: number | null;
 }
 
 /** GET /fulfillment-tasks 列表查询（与 backend listFulfillmentQuerySchema 对齐） */
@@ -1341,10 +1394,19 @@ export interface ListFulfillmentParams {
   orderId?: string;
   orderItemId?: string;
   type?: FulfillmentType;
-  status?: FulfillmentStatus;
+  /** 单状态或逗号分隔多状态（后端 status:{in:[...]} 表达「待办」等）；省略=全部状态 */
+  status?: FulfillmentStatus | string;
   assigneeUserId?: string;
   /** 备注文本筛选（不区分大小写子串匹配）；省略/空串 = 不筛 */
   notesQuery?: string;
+  /** 签发方式筛选（签证台「签证类型」）；'NONE'=未标注 */
+  issuanceMethod?: VisaIssuanceMethod | 'NONE';
+  /** 出发日期单日筛选（YYYY-MM-DD，向后兼容；新前端用区间 from/to） */
+  departureDate?: string;
+  /** 出发日期区间起（YYYY-MM-DD，含） */
+  departureDateFrom?: string;
+  /** 出发日期区间止（YYYY-MM-DD，含） */
+  departureDateTo?: string;
   page?: number;
   pageSize?: number;
 }
@@ -1663,6 +1725,24 @@ export interface HotelControlAlerts {
   }>;
 }
 
+/** GET /hotel-control/recent-changes — 近期用房变更（读审计流：调整分房/换酒店/补房差） */
+export interface HotelRoomChangeEntry {
+  id: string;
+  action: string;
+  actionLabel: string; // 人类可读中文
+  orderId: string | null;
+  orderNumber: string | null;
+  actor: string | null; // 操作人
+  summary: string; // 变更摘要（房数/酒店等关键字段）
+  severity: string;
+  at: string; // ISO8601
+}
+export interface HotelRecentRoomChanges {
+  days: number;
+  count: number;
+  changes: HotelRoomChangeEntry[];
+}
+
 // ── Dashboard ─────────────────────────────────────────────────────────────
 export interface DashboardKpi {
   todayRevenue: number;
@@ -1852,6 +1932,8 @@ export interface ReceiptMatchCandidate {
   totalPayable: number;
   paidAmount: number;
   balanceDue: number;
+  /** 去程出发日期（YYYY-MM-DD；纯签证/酒店单回落入住日，都无则 null） */
+  departureDate: string | null;
 }
 
 /** 单笔进账的认领分配（嵌在 Receipt.allocations[]；金额为 Decimal→string） */
@@ -2269,9 +2351,20 @@ export const api = {
 
   // 人工确认收款（线下收款 → 标记已付 + 上传截图）ADMIN/STAFF
   // 现已允许多付：amount 可超过尾款（paidAmount 可大于 total）。
+  // 硬闸：净已收超应付（含 1 分容差）→ 400，message 直接展示。
+  // 软闸：同订单近 windowMinutes 分钟内已有等额手工收款 → 409 code=DUPLICATE_AMOUNT；
+  //       二次确认后带 confirmDuplicate:true 放行。
   confirmPayment: (
     token: string,
-    body: { orderId: string; amount?: number; method: PaymentMethod; proofUrl?: string; note?: string; idempotencyKey?: string },
+    body: {
+      orderId: string;
+      amount?: number;
+      method: PaymentMethod;
+      proofUrl?: string;
+      note?: string;
+      idempotencyKey?: string;
+      confirmDuplicate?: boolean;
+    },
   ) =>
     apiFetch<{
       ok: true;
@@ -2903,6 +2996,32 @@ export const api = {
     }),
   updateFulfillmentTask: (token: string, id: string, body: Record<string, unknown>) =>
     apiFetch<{ task: FulfillmentTask }>(`/fulfillment-tasks/${id}`, { method: 'PATCH', token, body }),
+  // 设置单个签证任务的人均成本（美金+汇率自动折 CNY，或直填 CNY；全 null=清空回退产品成本）
+  setVisaTaskCost: (token: string, id: string, cost: VisaTaskCostInput) =>
+    apiFetch<{ task: FulfillmentTask }>(`/fulfillment-tasks/${id}`, { method: 'PATCH', token, body: cost }),
+  // 批量给选中订单的签证任务设同一人均单价（签证公司按航班统一单价是常态）
+  batchSetVisaTaskCost: (token: string, taskIds: string[], cost: VisaTaskCostInput) =>
+    apiFetch<BatchFulfillmentStatusResult>('/fulfillment-tasks/visa-cost/batch', {
+      method: 'POST',
+      token,
+      body: { taskIds, ...cost },
+    }),
+  // 按人更新送签进度（单个）——部分送签用；后端改写乘客进度并重新派生任务状态
+  updateVisaPassengerStatus: (token: string, passengerId: string, status: VisaSubmissionStatus) =>
+    apiFetch<{ result: { passengerId: string; status: VisaSubmissionStatus; orderId: string | null } }>(
+      `/fulfillment-tasks/visa-passengers/${passengerId}/status`,
+      { method: 'PATCH', token, body: { status } },
+    ),
+  // 按人批量标记送签进度（部分送签核心入口；逐乘客校验，部分失败返回 failures）
+  batchUpdateVisaPassengerStatus: (
+    token: string,
+    passengerIds: string[],
+    toStatus: VisaSubmissionStatus,
+  ) =>
+    apiFetch<BatchFulfillmentStatusResult & { affectedOrderIds: string[] }>(
+      '/fulfillment-tasks/visa-passengers/batch-status',
+      { method: 'POST', token, body: { passengerIds, toStatus } },
+    ),
   reissueFulfillmentTask: (token: string, id: string) =>
     apiFetch<{ task: FulfillmentTask }>(`/fulfillment-tasks/${id}/reissue`, { method: 'POST', token }),
   resendItineraryEmail: (token: string, orderId: string) =>
@@ -2974,6 +3093,10 @@ export const api = {
       `/finances/orders?from=${encodeURIComponent(range.from)}&to=${encodeURIComponent(range.to)}&limit=${limit}`,
       { token },
     ),
+  getFinanceOrderPnlDetail: (token: string, orderId: string) =>
+    apiFetch<OrderPnlDetail>(`/finances/orders/${encodeURIComponent(orderId)}/pnl-detail`, {
+      token,
+    }),
   getFinanceMonthly: (token: string, months = 6) =>
     apiFetch<{ months: number; points: MonthlyPoint[] }>(
       `/finances/monthly?months=${months}`,
@@ -3093,6 +3216,19 @@ export const api = {
     return res.blob();
   },
 
+  // 财务对账 xlsx 按订单维度导出（一行一订单，订单毛利）
+  downloadFinanceExportByOrder: async (
+    token: string,
+    range: { from: string; to: string },
+  ): Promise<Blob> => {
+    const res = await fetch(
+      `${API_BASE}/finances/export-orders?from=${encodeURIComponent(range.from)}&to=${encodeURIComponent(range.to)}`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) throw new ApiError(res.status, { code: 'EXPORT_FAILED', message: await res.text() });
+    return res.blob();
+  },
+
   // ── 经营报表（ADMIN-only）— 销售毛利 / 应收账龄 / 代理欠款 ────────────
   getSalesReport: (
     token: string,
@@ -3148,6 +3284,10 @@ export const api = {
   // 提醒线（超卖加房 / 富余退房 / 班次超开票上限；按需计算，无 cron）
   getHotelAlerts: (token: string, days = 14) =>
     apiFetch<HotelControlAlerts>(`/hotel-control/alerts?days=${days}`, { token }),
+
+  // 近期用房变更（读审计流：订单侧改了分房/换酒店/补房差 → 房控可见性；倒序近 N 天，上限 100）
+  getHotelRecentChanges: (token: string, days = 7) =>
+    apiFetch<HotelRecentRoomChanges>(`/hotel-control/recent-changes?days=${days}`, { token }),
 
   // 分房表导出（成都格式：每入住日期一个 sheet；ADMIN/STAFF only）— Blob 直接下载
   //   · { from, to }    按入住日区间选（跨度上限 14 天）
@@ -3515,6 +3655,54 @@ export interface OrderPnlRow {
   marginPct: number | null;
   itemCount: number;
   missingCostItemCount: number;
+}
+// 单订单收支明细（下钻）— 与 backend/finances.service.ts OrderPnlDetail 对齐
+export interface OrderPnlDetailIncomeRow {
+  label: string;
+  kind: string;
+  quantity: number;
+  unitPriceCny: number;
+  subtotalCny: number;
+  isAdjustment: boolean;
+}
+export interface OrderPnlDetailCostRow {
+  label: string;
+  kind: string;
+  quantity: number;
+  totalCostCny: number | null;
+}
+export interface OrderPnlDetailMiscRow {
+  label: string;
+  category: string;
+  amountCny: number;
+  note: string | null;
+}
+export interface OrderPnlDetail {
+  orderId: string;
+  orderNumber: string;
+  status: string;
+  contactName: string;
+  agentName: string | null;
+  departureDate: string | null;
+  createdAt: string;
+  income: {
+    rows: OrderPnlDetailIncomeRow[];
+    itemsSumCny: number;
+    totalCny: number;
+  };
+  cost: {
+    itemRows: OrderPnlDetailCostRow[];
+    miscRows: OrderPnlDetailMiscRow[];
+    itemCostCny: number | null;
+    miscCostCny: number;
+    totalWithMiscCny: number | null;
+    missingCostItemCount: number;
+  };
+  // 与订单毛利 tab 行严格一致（不含杂项）
+  grossMarginCny: number | null;
+  marginPct: number | null;
+  // 含杂项成本的完整毛利（参考）
+  grossMarginWithMiscCny: number | null;
 }
 export interface MonthlyPoint {
   month: string;

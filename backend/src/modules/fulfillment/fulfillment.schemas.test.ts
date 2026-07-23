@@ -7,8 +7,50 @@
 import { describe, it, expect } from 'vitest';
 import {
   batchFulfillmentNotesBodySchema,
+  batchVisaTaskCostBodySchema,
   listFulfillmentQuerySchema,
+  updateFulfillmentBodySchema,
 } from './fulfillment.schemas.js';
+
+describe('updateFulfillmentBodySchema — 签证金额字段', () => {
+  it('接受 USD/汇率/CNY 三字段（含 null 清空）', () => {
+    const parsed = updateFulfillmentBodySchema.parse({
+      visaUnitCostUsd: 31.5,
+      visaFxRate: 7.2,
+      visaUnitCostCny: null,
+    });
+    expect(parsed.visaUnitCostUsd).toBe(31.5);
+    expect(parsed.visaFxRate).toBe(7.2);
+    expect(parsed.visaUnitCostCny).toBeNull();
+  });
+
+  it('拒绝负数单价与非正汇率', () => {
+    expect(updateFulfillmentBodySchema.safeParse({ visaUnitCostUsd: -1 }).success).toBe(false);
+    expect(updateFulfillmentBodySchema.safeParse({ visaFxRate: 0 }).success).toBe(false);
+    expect(updateFulfillmentBodySchema.safeParse({ visaUnitCostCny: -0.01 }).success).toBe(false);
+  });
+});
+
+describe('batchVisaTaskCostBodySchema — 批量设金额', () => {
+  it('接受 taskIds + 成本字段', () => {
+    const parsed = batchVisaTaskCostBodySchema.parse({
+      taskIds: ['t1', 't2'],
+      visaUnitCostCny: 200,
+    });
+    expect(parsed.taskIds).toEqual(['t1', 't2']);
+    expect(parsed.visaUnitCostCny).toBe(200);
+  });
+
+  it('拒绝空 taskIds 与超上限（>100）', () => {
+    expect(batchVisaTaskCostBodySchema.safeParse({ taskIds: [], visaUnitCostCny: 1 }).success).toBe(
+      false,
+    );
+    const tooMany = Array.from({ length: 101 }, (_, i) => `t${i}`);
+    expect(
+      batchVisaTaskCostBodySchema.safeParse({ taskIds: tooMany, visaUnitCostCny: 1 }).success,
+    ).toBe(false);
+  });
+});
 
 describe('batchFulfillmentNotesBodySchema', () => {
   it('接受合法 taskIds + notes', () => {

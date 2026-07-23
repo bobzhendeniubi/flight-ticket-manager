@@ -360,6 +360,9 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
           <div className="flex items-center gap-2">
             <span className="font-mono text-xs font-medium text-ink">{o.orderNumber}</span>
             <span className="text-sm text-ink">{o.contactName}</span>
+            <span className="text-xs text-ink-muted">
+              出发 {o.departureDate ? o.departureDate.slice(5) : '—'}
+            </span>
             {o.agentName && <span className="text-xs text-ink-muted">· {o.agentName}</span>}
             {amountMatch && <span className="badge-success text-[10px]">金额吻合</span>}
           </div>

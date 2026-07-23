@@ -16,7 +16,7 @@
 import ExcelJS from 'exceljs';
 import JSZip from 'jszip';
 import type { PrismaClient } from '@prisma/client';
-import { OrderStatus } from '@prisma/client';
+import { OrderStatus, FulfillmentType } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import {
   buildOrderContext,
@@ -41,6 +41,77 @@ const COUNTED_STATUSES: OrderStatus[] = [
 
 /** 合并签证名单的 xlsx 列 = 《签证专用》全列 + 末尾「有无护照图」（沿用送签表口径）。*/
 const HAS_PHOTO_COLUMN = { header: '有无护照图', key: 'hasPhoto', width: 20 } as const;
+
+// ── 签证岗样表排版口径 ─────────────────────────────────────────────────────
+// 样表特征：首列「序号」、全表细实线边框、表头灰底加粗、数据区隔行斑马纹、行高统一、内容居中
+// （姓名/护照号等文本列左对齐、金额列右对齐）。仅影响签证批量合并名单导出，不动《签证专用》模板。
+const SERIAL_HEADER = '序号'; // 首列表头：样表用「序号」（原 STT）
+const HEADER_ROW_HEIGHT = 30; // 表头行更高，容纳越/中双语换行表头
+const DATA_ROW_HEIGHT = 18; // 数据行统一行高
+const HEADER_FILL_ARGB = 'FFEFEFEF'; // 表头灰底
+const ZEBRA_FILL_ARGB = 'FFF3F6F9'; // 数据区隔行浅色
+const BORDER_ARGB = 'FFBFBFBF'; // 细实线边框（浅灰）
+const THIN_BORDER = {
+  top: { style: 'thin' as const, color: { argb: BORDER_ARGB } },
+  left: { style: 'thin' as const, color: { argb: BORDER_ARGB } },
+  bottom: { style: 'thin' as const, color: { argb: BORDER_ARGB } },
+  right: { style: 'thin' as const, color: { argb: BORDER_ARGB } },
+};
+/** 金额列右对齐；姓名/护照号等关键列左对齐；其余列居中（对齐样表口径）。*/
+const AMOUNT_ALIGN_KEYS = new Set<string>(['settlePrice', 'paidAmount', 'balanceDue']);
+const LEFT_ALIGN_KEYS = new Set<string>(['chineseName', 'name', 'passportNumber']);
+
+function horizontalForKey(key: string): 'left' | 'right' | 'center' {
+  if (AMOUNT_ALIGN_KEYS.has(key)) return 'right';
+  if (LEFT_ALIGN_KEYS.has(key)) return 'left';
+  return 'center';
+}
+
+/** 履约任务里带 notes 的窄类型（queryOrdersByIdsForVisa 已把 notes 补进 select，类型由 cast 收口）。*/
+type VisaFulfillmentTask = { type: FulfillmentType; notes: string | null };
+
+/**
+ * 「签证备注」列取数：该单签证履约任务（VISA_APPLICATION）的备注文本。
+ * 一单可能有多条签证任务，去重后换行拼接；无备注则留空（不造数）。
+ */
+function visaTaskNoteOf(order: OrderForTemplateExport): string {
+  const notes = new Set<string>();
+  for (const item of order.items) {
+    const tasks = item.fulfillmentTasks as unknown as VisaFulfillmentTask[];
+    for (const task of tasks) {
+      const note = task.notes?.trim();
+      if (task.type === FulfillmentType.VISA_APPLICATION && note) notes.add(note);
+    }
+  }
+  return Array.from(notes).join('\n');
+}
+
+/**
+ * 全表加细实线边框、行高统一、内容对齐；数据区隔行斑马纹（表头保留灰底/加粗）。
+ * 用 getCell 逐格设样式（含空值单元格），确保「全表实线边框」不因空单元格而断线。
+ */
+function styleVisaSheet(ws: ExcelJS.Worksheet, columnKeys: string[]): void {
+  const totalCols = columnKeys.length;
+  const totalRows = ws.rowCount;
+  for (let r = 1; r <= totalRows; r += 1) {
+    const row = ws.getRow(r);
+    const isHeader = r === 1;
+    row.height = isHeader ? HEADER_ROW_HEIGHT : DATA_ROW_HEIGHT;
+    const zebra = !isHeader && r % 2 === 1; // 数据行隔行填充（第 3、5、7… 行）
+    for (let c = 1; c <= totalCols; c += 1) {
+      const cell = row.getCell(c);
+      cell.border = THIN_BORDER;
+      cell.alignment = {
+        vertical: 'middle',
+        horizontal: isHeader ? 'center' : horizontalForKey(columnKeys[c - 1]),
+        wrapText: isHeader,
+      };
+      if (zebra) {
+        cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: ZEBRA_FILL_ARGB } };
+      }
+    }
+  }
+}
 
 /**
  * 按勾选的订单 id 列表取单（软删排除；状态过滤放到 partitionOrdersForVisa，以便把「被勾选但状态
@@ -75,7 +146,8 @@ export async function queryOrdersByIdsForVisa(
           visa: { select: { code: true, visaName: true, visaType: true, supplier: true } },
           transfer: { select: { code: true } },
           bundle: { select: { code: true } },
-          fulfillmentTasks: { select: { type: true, status: true } },
+          // notes 用于「签证备注」列（visaTaskNoteOf）；类型经 `as OrderForTemplateExport[]` 收口
+          fulfillmentTasks: { select: { type: true, status: true, notes: true } },
         },
       },
     },
@@ -103,6 +175,8 @@ export function sortOrdersForVisa(orders: OrderForTemplateExport[]): OrderForTem
 
 /**
  * 把订单的乘客合并成一张《签证专用》xlsx（一行一人，含性别、末列「有无护照图」）。
+ * 按签证岗样表排版：首列「序号」（原 STT）、全表细实线边框、表头灰底加粗、数据区隔行斑马纹、
+ * 行高统一、内容居中（姓名/护照号左对齐、金额列右对齐）。「签证备注」列取该单签证履约任务备注。
  * 纯映射，便于单测。空乘客订单自动跳过；全无数据也出带表头的空表。
  */
 export async function buildVisaBundleXlsx(orders: OrderForTemplateExport[]): Promise<Buffer> {
@@ -112,17 +186,25 @@ export async function buildVisaBundleXlsx(orders: OrderForTemplateExport[]): Pro
   const ws = wb.addWorksheet('签证专用');
 
   const columns = [...VISA_COLUMNS, HAS_PHOTO_COLUMN];
-  ws.columns = columns.map((c) => ({ header: c.header, key: c.key, width: c.width }));
+  const columnKeys = columns.map((c) => c.key as string);
+  // 首列表头 STT → 「序号」（签证岗样表口径）；其余列沿用《签证专用》表头
+  ws.columns = columns.map((c) => ({
+    header: c.key === 'stt' ? SERIAL_HEADER : c.header,
+    key: c.key,
+    width: c.width,
+  }));
   const headerRow = ws.getRow(1);
   headerRow.font = { bold: true };
-  headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEFEFEF' } };
-  headerRow.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+  headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: HEADER_FILL_ARGB } };
 
   let stt = 0;
   for (const order of orders) {
     if (order.passengers.length === 0) continue;
     const ctx = buildOrderContext(order);
     const rows = orderToVisaRows(order, ctx);
+    // 「签证备注」列：该单签证履约任务备注。orderToVisaRows 固定把 visaNote 留空（见其注释），
+    // 这里按单算出后在下方覆盖——一单内各乘客共用同一签证备注。
+    const visaNote = visaTaskNoteOf(order);
     // orderToVisaRows 内部已排除自备签乘客（visaExempt=true，见该函数注释 P1-13）——
     // 护照图有无按位对齐同样要用过滤后的乘客列表，否则行数不等长会把图状态错位标给下一位乘客。
     const visaPassengers = order.passengers.filter((p) => p.visaExempt !== true);
@@ -131,10 +213,11 @@ export async function buildVisaBundleXlsx(orders: OrderForTemplateExport[]): Pro
       const hasPhoto = visaPassengers[i]?.passportPhotoUrl
         ? '有护照图'
         : '无护照图（手工录入）';
-      ws.addRow({ stt, ...row, hasPhoto });
+      ws.addRow({ stt, ...row, visaNote, hasPhoto });
     });
   }
 
+  styleVisaSheet(ws, columnKeys);
   ws.views = [{ state: 'frozen', xSplit: 0, ySplit: 1 }];
   const buf = await wb.xlsx.writeBuffer();
   return Buffer.from(buf);
