@@ -1034,6 +1034,7 @@ export interface OrderSummary {
   // Decimal 在 JSON 里是 string；null 表示未设置
   expectedAmountCny?: string | null;
   expectedAmountLocked?: boolean;
+  settlementLocked?: boolean;
 
   // 出行人数（按 Passenger.passengerType 统计；套餐订单详情行程单「人数」板块用）
   adultCount?: number;
@@ -2348,6 +2349,14 @@ export const api = {
         systemInvoiced?: boolean;
       }>;
     }>('/orders/batch-invoice-flags', { method: 'POST', token, body: { orderIds, flags } }),
+
+  // 批量锁定/解锁结算价（ADMIN/STAFF）：不存在或已软删订单计入 skipped。
+  batchSettlementLock: (token: string, orderIds: string[], lock: boolean) =>
+    apiFetch<{ updated: number; skipped: number }>('/orders/batch/settlement-lock', {
+      method: 'POST',
+      token,
+      body: { orderIds, lock },
+    }),
 
   // 人工确认收款（线下收款 → 标记已付 + 上传截图）ADMIN/STAFF
   // 现已允许多付：amount 可超过尾款（paidAmount 可大于 total）。

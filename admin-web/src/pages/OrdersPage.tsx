@@ -804,6 +804,24 @@ export function OrdersPage() {
     }
   };
 
+  const applyBulkSettlementLock = async (lock: boolean) => {
+    if (!tokens?.accessToken || selectedIds.size === 0) return;
+    if (!window.confirm(`将${lock ? '锁定' : '解锁'}所选 ${selectedIds.size} 单的结算价？`)) return;
+    setBulkSubmitting(true);
+    try {
+      const res = await api.batchSettlementLock(tokens.accessToken, Array.from(selectedIds), lock);
+      setRefreshNonce((n) => n + 1);
+      setSelectedIds(new Set());
+      if (res.skipped > 0) {
+        window.alert(`已${lock ? '锁定' : '解锁'} ${res.updated} 单，跳过 ${res.skipped} 单（订单不存在或已在回收站）。`);
+      }
+    } catch (err) {
+      alert(err instanceof ApiError ? `批量${lock ? '锁定' : '解锁'}失败：${err.message}` : `批量${lock ? '锁定' : '解锁'}失败`);
+    } finally {
+      setBulkSubmitting(false);
+    }
+  };
+
   // 三模板筛选导出 — 用当前筛选条件调后端 xlsx，复用 createObjectURL 下载流
   const handleTemplateExport = async () => {
     if (!tokens?.accessToken) return;
@@ -1581,6 +1599,20 @@ export function OrdersPage() {
               }
             >
               💰 批量到账（{payableSelected.length} 条待收）
+            </button>
+            <button
+              className="btn-secondary text-sm py-1.5 disabled:opacity-50"
+              onClick={() => void applyBulkSettlementLock(true)}
+              disabled={bulkSubmitting || bulkInvoiceSubmitting}
+            >
+              锁结算价
+            </button>
+            <button
+              className="btn-secondary text-sm py-1.5 disabled:opacity-50"
+              onClick={() => void applyBulkSettlementLock(false)}
+              disabled={bulkSubmitting || bulkInvoiceSubmitting}
+            >
+              解锁结算价
             </button>
             <button
               className="btn-ghost text-sm"
@@ -2369,6 +2401,7 @@ function OrderDrawer({
                           item={it}
                           onOrderUpdated={handleOrderUpdated}
                           canEditSettlementPrice={isOps}
+                          settlementLocked={o.settlementLocked === true}
                         />
                       ))}
                     </ul>
@@ -2384,6 +2417,7 @@ function OrderDrawer({
                     item={it}
                     onOrderUpdated={handleOrderUpdated}
                     canEditSettlementPrice={isOps}
+                    settlementLocked={o.settlementLocked === true}
                   />
                 ))}
               </ul>
@@ -3509,12 +3543,14 @@ function OrderItemRow({
   item,
   onOrderUpdated,
   canEditSettlementPrice,
+  settlementLocked,
 }: {
   orderId: string;
   item: OrderItem;
   onOrderUpdated?: (order: OrderSummary) => void;
   /** 改结算价：后端 PATCH settlement-price 放行 ADMIN/STAFF，这里同口径（非纯 ADMIN） */
   canEditSettlementPrice?: boolean;
+  settlementLocked?: boolean;
 }) {
   const [rescheduling, setRescheduling] = useState(false);
   const [editingPrice, setEditingPrice] = useState(false);
@@ -3595,12 +3631,17 @@ function OrderItemRow({
             </button>
           )}
           {isFlight && canEditSettlementPrice && !rescheduling && !editingPrice && (
-            <button
-              className="text-[11px] font-medium text-amber-600 hover:text-amber-800"
-              onClick={() => setEditingPrice(true)}
-            >
-              改结算价
-            </button>
+            <>
+              <button
+                className="text-[11px] font-medium text-amber-600 hover:text-amber-800 disabled:cursor-not-allowed disabled:text-slate-400"
+                onClick={() => setEditingPrice(true)}
+                disabled={settlementLocked}
+                title={settlementLocked ? '结算价已锁定，请先解锁再修改' : undefined}
+              >
+                改结算价
+              </button>
+              {settlementLocked && <span className="text-[11px] text-slate-500">已锁定</span>}
+            </>
           )}
           {isHotelRow && (
             <button

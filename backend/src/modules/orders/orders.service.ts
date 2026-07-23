@@ -2955,10 +2955,14 @@ export class OrderService {
           outboundInvoiced: boolean;
           returnInvoiced: boolean;
           systemInvoiced: boolean;
+          settlementLocked: boolean;
         }>
-      >`SELECT id, "orderNumber", status, "deletedAt", subtotal, total, "paidAmount", "outboundInvoiced", "returnInvoiced", "systemInvoiced" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+      >`SELECT id, "orderNumber", status, "deletedAt", subtotal, total, "paidAmount", "outboundInvoiced", "returnInvoiced", "systemInvoiced", "settlementLocked" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
       const order = rows[0];
       if (!order) throw new NotFoundError('订单不存在');
+      if (order.settlementLocked) {
+        throw new ConflictError('结算价已锁定，请先解锁再修改');
+      }
       // 资金处置闸：结算价直接改 item.amount 与 order.total（也是取消手续费基数），
       // 死单/软删单不许改——否则可在退款前偷偷抬价操纵应退额，或改回收站单的应收。
       assertOrderAllowsFundsDisposal(order, '修改结算价');
@@ -3289,6 +3293,59 @@ export class OrderService {
       }
     }
     return { succeeded, failed, results };
+  }
+
+  /**
+   * 批量锁定/解锁订单结算价。不存在或已软删订单不更新并计入 skipped；
+   * 每个有效订单独立更新，便于路由层按成功订单逐条写审计。
+   */
+  async batchSetSettlementLock(
+    ids: string[],
+    lock: boolean,
+    userId: string,
+  ): Promise<{
+    updated: number;
+    skipped: number;
+    results: Array<{
+      id: string;
+      orderNumber: string;
+      beforeLocked: boolean;
+      settlementLockedAt: Date | null;
+    }>;
+  }> {
+    const activeOrders = await prisma.order.findMany({
+      where: { id: { in: ids }, deletedAt: null },
+      select: { id: true, orderNumber: true, settlementLocked: true },
+    });
+    const activeById = new Map(activeOrders.map((order) => [order.id, order]));
+    const results: Array<{
+      id: string;
+      orderNumber: string;
+      beforeLocked: boolean;
+      settlementLockedAt: Date | null;
+    }> = [];
+
+    for (const id of ids) {
+      const order = activeById.get(id);
+      if (!order) continue;
+      const settlementLockedAt = lock ? new Date() : null;
+      await prisma.order.update({
+        where: { id },
+        data: {
+          settlementLocked: lock,
+          settlementLockedAt,
+          settlementLockedBy: lock ? userId : null,
+        },
+      });
+      results.push({
+        id,
+        orderNumber: order.orderNumber,
+        beforeLocked: order.settlementLocked,
+        settlementLockedAt,
+      });
+    }
+
+    return { updated: results.length, skipped: ids.length - results.length, results };
   }
 
   /**
@@ -6629,6 +6686,9 @@ interface OrderLike {
   noteSpecial?: string | null;
   expectedAmountCny?: Prisma.Decimal | null;
   expectedAmountLocked?: boolean;
+  settlementLocked?: boolean;
+  settlementLockedAt?: Date | null;
+  settlementLockedBy?: string | null;
   adjustments?: Prisma.JsonValue;
   claimedById?: string | null;
   claimedBy?: Record<string, unknown> | null;
@@ -7058,6 +7118,9 @@ export function serializeOrder<T extends OrderLike>(
     noteSpecial: redact ? undefined : order.noteSpecial,
     expectedAmountCny: redact ? undefined : order.expectedAmountCny,
     expectedAmountLocked: redact ? undefined : order.expectedAmountLocked,
+    settlementLocked: order.settlementLocked ?? false,
+    settlementLockedAt: undefined,
+    settlementLockedBy: undefined,
     adjustments: redact ? undefined : order.adjustments,
     claimedById: redact ? undefined : order.claimedById,
     claimedBy: redact ? undefined : order.claimedBy,

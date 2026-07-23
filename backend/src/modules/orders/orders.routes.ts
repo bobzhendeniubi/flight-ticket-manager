@@ -13,6 +13,7 @@ import { buildStayNightDates, OrderService, type OrderRequester } from './orders
 import { assertHotelPhysicalFit } from '../hotel-control/hotel-control.service.js';
 import {
   batchCreateOrdersBodySchema,
+  batchSettlementLockBodySchema,
   batchSetInvoiceFlagsBodySchema,
   batchUpdateStatusBodySchema,
   changeOrderAgentBodySchema,
@@ -1292,6 +1293,35 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         });
       }
       return result;
+    },
+  );
+
+  // ── 批量锁定/解锁结算价（ADMIN/STAFF）────────────────────────────────────
+  // POST /orders/batch/settlement-lock  body: { orderIds: string[], lock: boolean }
+  // 不存在或已软删订单跳过；每个成功订单各写一条审计。
+  app.post(
+    '/batch/settlement-lock',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    async (req) => {
+      const body = batchSettlementLockBodySchema.parse(req.body);
+      const result = await service.batchSetSettlementLock(body.orderIds, body.lock, req.user.sub);
+      for (const r of result.results) {
+        void writeAudit({
+          actor: actorFromRequest(req),
+          action: body.lock ? 'LOCK_SETTLEMENT_PRICE' : 'UNLOCK_SETTLEMENT_PRICE',
+          targetType: 'ORDER',
+          targetId: r.id,
+          targetLabel: r.orderNumber,
+          before: { settlementLocked: r.beforeLocked },
+          after: {
+            settlementLocked: body.lock,
+            settlementLockedAt: r.settlementLockedAt?.toISOString() ?? null,
+            settlementLockedBy: body.lock ? req.user.sub : null,
+          },
+          severity: 'WARNING',
+        });
+      }
+      return { updated: result.updated, skipped: result.skipped };
     },
   );
 
