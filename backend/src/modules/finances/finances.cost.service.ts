@@ -10,10 +10,11 @@
  *   effective = schedule.<field>(override) ?? matchedPeriod.<field>(period) ?? null
  *   班次自己的字段为 null 时落回所在日期段的周期默认。日期匹配按航班出发地时区算。
  *
- * 所有写操作由 routes 层负责 ADMIN 鉴权 + 审计日志。
+ * 所有写操作由 routes 层负责鉴权 + 审计日志。
  */
 import { Prisma, type PrismaClient } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
+import { ConflictError, NotFoundError } from '../../lib/errors.js';
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -401,6 +402,9 @@ export interface FinanceScheduleRow {
   peakSurchargeCny: number | null;
   aircraftAdjustCny: number | null;
   takeoffDiscountCny: number | null;
+  costLocked: boolean;
+  costLockedAt: string | null;
+  costLockedBy: string | null;
   // 班次自己存的值（即"覆盖"）—— 给编辑输入框绑定用；null = 不覆盖，用周期
   charterCostCnyOverride: number | null;
   airportTaxDepCnyOverride: number | null;
@@ -528,6 +532,9 @@ export async function listSchedulesWithCost(
       peakSurchargeCny: eff.peakSurchargeCny,
       aircraftAdjustCny: eff.aircraftAdjustCny,
       takeoffDiscountCny: eff.takeoffDiscountCny,
+      costLocked: s.costLocked,
+      costLockedAt: s.costLockedAt?.toISOString() ?? null,
+      costLockedBy: s.costLockedBy,
       // override (schedule own)
       charterCostCnyOverride: r2n(s.charterCostCny),
       airportTaxDepCnyOverride: r2n(s.airportTaxDepCny),
@@ -563,6 +570,200 @@ export async function listSchedulesWithCost(
   });
 }
 
+type CostAuditValues = {
+  charterCostCny: number | null;
+  airportTaxDepCny: number | null;
+  airportTaxArrCny: number | null;
+  fuelCostCny: number | null;
+  peakSurchargeCny: number | null;
+  aircraftAdjustCny: number | null;
+  takeoffDiscountCny: number | null;
+};
+
+export interface CostLockAuditSnapshot {
+  costs: CostAuditValues;
+  costLocked: boolean;
+  costLockedAt: string | null;
+  costLockedBy: string | null;
+}
+
+export interface FlightScheduleCostLockResult {
+  id: string;
+  targetLabel: string;
+  changed: boolean;
+  costLocked: boolean;
+  costLockedAt: Date | null;
+  costLockedBy: string | null;
+  before: CostLockAuditSnapshot;
+  after: CostLockAuditSnapshot;
+}
+
+function costAuditValues(values: {
+  charterCostCny: Prisma.Decimal | number | null;
+  airportTaxDepCny: Prisma.Decimal | number | null;
+  airportTaxArrCny: Prisma.Decimal | number | null;
+  fuelCostCny: Prisma.Decimal | number | null;
+  peakSurchargeCny: Prisma.Decimal | number | null;
+  aircraftAdjustCny: Prisma.Decimal | number | null;
+  takeoffDiscountCny: Prisma.Decimal | number | null;
+}): CostAuditValues {
+  return {
+    charterCostCny: dec(values.charterCostCny),
+    airportTaxDepCny: dec(values.airportTaxDepCny),
+    airportTaxArrCny: dec(values.airportTaxArrCny),
+    fuelCostCny: dec(values.fuelCostCny),
+    peakSurchargeCny: dec(values.peakSurchargeCny),
+    aircraftAdjustCny: dec(values.aircraftAdjustCny),
+    takeoffDiscountCny: dec(values.takeoffDiscountCny),
+  };
+}
+
+function lockAuditSnapshot(
+  values: CostAuditValues,
+  locked: boolean,
+  lockedAt: Date | null,
+  lockedBy: string | null,
+): CostLockAuditSnapshot {
+  return {
+    costs: values,
+    costLocked: locked,
+    costLockedAt: lockedAt?.toISOString() ?? null,
+    costLockedBy: lockedBy,
+  };
+}
+
+/**
+ * 按班次锁定/解锁成本。锁定时在同一事务内把当前生效值固化到班次 override，
+ * 再写入锁定元数据；解锁只清元数据，不回滚已固化的 override。
+ */
+export async function setFlightScheduleCostLock(
+  id: string,
+  lock: boolean,
+  lockedBy: string | null | undefined,
+  client: PrismaClient = defaultPrisma,
+): Promise<FlightScheduleCostLockResult> {
+  return client.$transaction(async (tx) => {
+    const schedule = await tx.flightSchedule.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        flightId: true,
+        departureTime: true,
+        departureTz: true,
+        charterCostCny: true,
+        airportTaxDepCny: true,
+        airportTaxArrCny: true,
+        fuelCostCny: true,
+        peakSurchargeCny: true,
+        aircraftAdjustCny: true,
+        takeoffDiscountCny: true,
+        costLocked: true,
+        costLockedAt: true,
+        costLockedBy: true,
+        flight: { select: { flightNumber: true } },
+      },
+    });
+    if (!schedule) throw new NotFoundError('班次不存在');
+
+    const beforeCosts = costAuditValues(schedule);
+    const before = lockAuditSnapshot(
+      beforeCosts,
+      schedule.costLocked,
+      schedule.costLockedAt,
+      schedule.costLockedBy,
+    );
+    const targetLabel = `${schedule.flight.flightNumber} ${localDate(schedule.departureTime, schedule.departureTz)}`;
+
+    if (!lock) {
+      if (!schedule.costLocked) {
+        return {
+          id,
+          targetLabel,
+          changed: false,
+          costLocked: false,
+          costLockedAt: null,
+          costLockedBy: null,
+          before,
+          after: before,
+        };
+      }
+      await tx.flightSchedule.update({
+        where: { id },
+        data: { costLocked: false, costLockedAt: null, costLockedBy: null },
+      });
+      return {
+        id,
+        targetLabel,
+        changed: true,
+        costLocked: false,
+        costLockedAt: null,
+        costLockedBy: null,
+        before,
+        after: lockAuditSnapshot(beforeCosts, false, null, null),
+      };
+    }
+
+    if (schedule.costLocked) {
+      return {
+        id,
+        targetLabel,
+        changed: false,
+        costLocked: true,
+        costLockedAt: schedule.costLockedAt,
+        costLockedBy: schedule.costLockedBy,
+        before,
+        after: before,
+      };
+    }
+
+    const periods = await tx.flightCostPeriod.findMany({
+      where: { flightId: schedule.flightId },
+      orderBy: { effectiveFrom: 'desc' },
+      select: {
+        effectiveFrom: true,
+        effectiveTo: true,
+        charterCostCny: true,
+        airportTaxDepCny: true,
+        airportTaxArrCny: true,
+        fuelCostCny: true,
+        peakSurchargeCny: true,
+        aircraftAdjustCny: true,
+        takeoffDiscountCny: true,
+      },
+    });
+    const matched = findMatchedPeriod(schedule, periods);
+    const effective = resolveScheduleCost(schedule, matched);
+    const lockedAt = new Date();
+    const lockedByValue = lockedBy ?? null;
+    await tx.flightSchedule.update({
+      where: { id },
+      data: {
+        charterCostCny: effective.charterCostCny,
+        airportTaxDepCny: effective.airportTaxDepCny,
+        airportTaxArrCny: effective.airportTaxArrCny,
+        fuelCostCny: effective.fuelCostCny,
+        peakSurchargeCny: effective.peakSurchargeCny,
+        aircraftAdjustCny: effective.aircraftAdjustCny,
+        takeoffDiscountCny: effective.takeoffDiscountCny,
+        costLocked: true,
+        costLockedAt: lockedAt,
+        costLockedBy: lockedByValue,
+      },
+    });
+    const afterCosts = costAuditValues(effective);
+    return {
+      id,
+      targetLabel,
+      changed: true,
+      costLocked: true,
+      costLockedAt: lockedAt,
+      costLockedBy: lockedByValue,
+      before,
+      after: lockAuditSnapshot(afterCosts, true, lockedAt, lockedByValue),
+    };
+  });
+}
+
 // ── 产品成本 patch（统一 CNY）─────────────────────────────────────────────────
 
 export async function patchFlightScheduleCost(
@@ -578,7 +779,20 @@ export async function patchFlightScheduleCost(
   },
   client: PrismaClient = defaultPrisma,
 ): Promise<{ id: string }> {
-  await client.flightSchedule.update({ where: { id }, data });
+  const updated = await client.flightSchedule.updateMany({
+    where: { id, costLocked: false },
+    data,
+  });
+  if (updated.count === 0) {
+    const schedule = await client.flightSchedule.findUnique({
+      where: { id },
+      select: { costLocked: true },
+    });
+    if (schedule?.costLocked) {
+      throw new ConflictError('该班次成本已锁定，请先解锁再修改');
+    }
+    throw new NotFoundError('班次不存在');
+  }
   return { id };
 }
 

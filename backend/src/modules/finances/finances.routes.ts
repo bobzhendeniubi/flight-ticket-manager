@@ -29,6 +29,7 @@ import {
   patchHotelRoomTypeCost,
   patchVisaCost,
   patchTransferCost,
+  setFlightScheduleCostLock,
   updateCostPeriod,
 } from './finances.cost.service.js';
 import { buildFinanceExportWorkbook, financeExportFilename } from './finances.export.js';
@@ -99,6 +100,9 @@ function logView(
 export const financesRoutes: FastifyPluginAsync = async (app) => {
   const requireAdmin = {
     preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN)],
+  };
+  const requireAdminOrStaff = {
+    preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)],
   };
 
   app.get('/summary', requireAdmin, async (req) => {
@@ -207,6 +211,31 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
     const q = z.object({ from: dateStr.optional(), to: dateStr.optional() }).parse(req.query);
     const schedules = await listSchedulesWithCost(q);
     return { schedules };
+  });
+
+  // ── 班次成本手动锁定（ADMIN/STAFF）────────────────────────────────────────
+  app.post('/schedules/:id/cost-lock', requireAdminOrStaff, async (req) => {
+    const { id } = req.params as { id: string };
+    const { lock } = z.object({ lock: z.boolean() }).parse(req.body);
+    const actor = actorFromRequest(req);
+    const result = await setFlightScheduleCostLock(id, lock, actor.userId);
+    if (result.changed) {
+      void writeAudit({
+        actor,
+        action: lock ? 'LOCK_FLIGHT_SCHEDULE_COST' : 'UNLOCK_FLIGHT_SCHEDULE_COST',
+        targetType: 'FLIGHT',
+        targetId: id,
+        targetLabel: result.targetLabel,
+        before: result.before,
+        after: result.after,
+      });
+    }
+    return {
+      id: result.id,
+      costLocked: result.costLocked,
+      costLockedAt: result.costLockedAt?.toISOString() ?? null,
+      costLockedBy: result.costLockedBy,
+    };
   });
 
   // ── 航班成本周期 CRUD（admin-only）按 (航班, 日期段) 定包机/机场税/4 个新成本字段

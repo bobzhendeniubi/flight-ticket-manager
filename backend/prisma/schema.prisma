@@ -527,6 +527,9 @@ model FlightSchedule {
   peakSurchargeCny   Decimal? @db.Decimal(10, 2)
   aircraftAdjustCny  Decimal? @db.Decimal(10, 2)
   takeoffDiscountCny Decimal? @db.Decimal(10, 2)
+  costLocked         Boolean  @default(false)
+  costLockedAt       DateTime?
+  costLockedBy       String?
   // 开票上限不再是本表上的独立字段：上限 = 该班次座位库存 = Σ FlightSeatClass.capacity
   //（多少商务舱 + 多少经济舱）。卖票与开票共用同一本账，见 ticketing-cap.ts。
   isActive           Boolean  @default(true)
