@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel } from '../lib/api';
 import { useAuth } from '../stores/auth';
@@ -136,6 +136,46 @@ const KIND_LABEL: Record<OrderItemKindLabel, string> = {
 const COMMISSION_RATE: Partial<Record<OrderItemKindLabel, number>> = {
   FLIGHT: 0.10, HOTEL: 0.08, TRANSFER: 0.15, VISA: 0.12,
 };
+
+// 客户端分页每页条数（票务反馈）：默认 50 —— 开票一次最多 50 张的口径，一页正好一批。
+const PAGE_SIZE_OPTIONS = [20, 30, 40, 50] as const;
+const DEFAULT_PAGE_SIZE = 50;
+
+// 列表「签证」列主显（签证岗反馈）：录单时的签证要求 order.visaStatus，而非履约任务进度。
+// NOT_NEEDED → 空白（不需要签证的单不占视觉）；其余映射为短徽标。履约进度改为次要小字附注。
+const VISA_REQUIREMENT_BADGE: Record<VisaStatusInput, { label: string; cls: string } | null> = {
+  NOT_NEEDED: null,
+  NEEDED: { label: '需要签证', cls: 'badge-warning' },
+  E_VISA: { label: '电子签', cls: 'badge-info' },
+  HAS_VISA: { label: '已签证', cls: 'badge-success' },
+};
+
+// 性别小标（列表乘客名后缀）：M→♂ F→♀，其余（X/未录）不标。
+function genderMark(g?: string | null): string {
+  if (g === 'M') return '♂';
+  if (g === 'F') return '♀';
+  return '';
+}
+
+// 备注预览（票务反馈：线上单靠备注判断是否单独编码出票）：取 notes → internalNotes 的首个非空行
+// 做行内截断展示；title 悬浮给两段全文。无备注返回 null。
+function deriveNotesPreview(o: OrderSummary): { firstLine: string; fullText: string } | null {
+  const notes = (o.notes ?? '').trim();
+  const internal = (o.internalNotes ?? '').trim();
+  if (!notes && !internal) return null;
+  const source = notes || internal;
+  const firstLine = source.split('\n').map((l) => l.trim()).find(Boolean) ?? '';
+  if (!firstLine) return null;
+  const fullText = [notes && `备注：${notes}`, internal && `内部备注：${internal}`]
+    .filter(Boolean)
+    .join('\n');
+  return { firstLine, fullText };
+}
+
+// 搜索分词（与后端 search 分词口径一致）：按 空格/半角逗号/中文逗号/顿号 切词，词间 AND。
+function splitSearchTerms(raw: string): string[] {
+  return raw.trim().toLowerCase().split(/[\s,，、]+/).filter(Boolean);
+}
 
 // 六态开票筛选（组合式）：维度(去程/回程/系统) × 已开/未开。
 // value = `${leg}:${invoiced}`，'' = 全部。票务岗「7/10 去程未开」= 'outbound:false'。
@@ -304,6 +344,10 @@ export function OrdersPage() {
   const [search, setSearch] = useState('');
   // 公测反馈：中文名/拼音名搜不到 —— 搜索改接后端（防抖后透传 search，匹配订单号/联系人/乘客中英文名）。
   const [debouncedSearch, setDebouncedSearch] = useState('');
+  // 客户端分页（票务反馈）：数据仍一次拉 200（后端 search/筛选生效），渲染按页切片。
+  // 默认每页 50 = 开票一次最多 50 张的口径；筛选/搜索变化时回到第 1 页（见下方 effect）。
+  const [pageSize, setPageSize] = useState<number>(DEFAULT_PAGE_SIZE);
+  const [page, setPage] = useState(1);
   // 6/16 反馈（业务反馈）：按下单日期(createdAt)筛 — 用于"当天进单多少"的导出
   const [createdFrom, setCreatedFrom] = useState('');
   const [createdTo, setCreatedTo] = useState('');
@@ -320,7 +364,8 @@ export function OrdersPage() {
   const [passengerNameFilter, setPassengerNameFilter] = useState('');
   // 六态开票筛选：组合值 `${leg}:${invoiced}`（如 'outbound:false'=去程未开），''=全部
   const [invoiceLegFilter, setInvoiceLegFilter] = useState('');
-  // 签证办理状态筛选（后端过滤，与列表「签证」列徽标同源）：''=全部 / signed=已签证 / unsigned=未签证
+  // 签证办理状态筛选（后端过滤，与列表「签证」列的**办理进度小字**同源——列主徽标已改为录单签证要求）：
+  // ''=全部 / signed=已签证 / unsigned=未签证
   const [visaFilter, setVisaFilter] = useState<'' | 'signed' | 'unsigned'>('');
   // 文本筛选防抖：停止输入 400ms 后才请求后端，避免每个键击打一次接口
   const [debouncedFlightNumber, setDebouncedFlightNumber] = useState('');
@@ -515,22 +560,55 @@ export function OrdersPage() {
       if (channelFilter === 'agent' && !view.agentName) return false;
       if (agentFilter && view.agentName !== agentFilter) return false;
       if (search.trim()) {
-        const q = search.trim().toLowerCase();
-        // 与后端 search 口径对齐的超集（订单号/客户/联系人/电话/代理/乘客中英文名），
-        // 保证后端召回的单不会被前端二次过滤误藏；并为已加载页补上乘客名的即时匹配。
+        // 与后端 search 口径对齐的超集（订单号/客户/联系人/电话/代理/乘客中英文名+证件号/六段备注），
+        // 保证后端召回的单不会被前端二次过滤误藏；并为已加载页补上即时匹配。
+        // 分词口径与后端一致：空格/逗号/中文逗号/顿号切词，词间 AND（每个词命中任一字段即可）。
+        const terms = splitSearchTerms(search);
         const hay = [
           order.orderNumber,
           view.customerName,
           order.contactName,
           order.contactPhone,
           view.agentName ?? '',
-          ...order.passengers.flatMap((p) => [p.fullName, p.chineseName ?? '']),
-        ];
-        if (!hay.some((s) => s.toLowerCase().includes(q))) return false;
+          order.notes ?? '',
+          order.internalNotes ?? '',
+          order.noteHotel ?? '',
+          order.noteVisa ?? '',
+          order.notePayment ?? '',
+          order.noteSpecial ?? '',
+          ...order.passengers.flatMap((p) => [p.fullName, p.chineseName ?? '', p.documentNumber ?? '']),
+        ].map((s) => s.toLowerCase());
+        // 列表接口目前不回传乘客证件号（窄 select）：按护照号搜索时后端能召回、前端 hay 却看不见。
+        // 该情况下对「后端已核验过的词」（已进防抖 debouncedSearch 的词）放行，宁可短暂多显示，
+        // 绝不把后端召回的单误藏。待列表接口补回 documentNumber 后此回退自然失效（docsKnown=true）。
+        const docsUnknown =
+          order.passengers.length > 0 && order.passengers.every((p) => p.documentNumber === undefined);
+        const backendVetted = docsUnknown ? splitSearchTerms(debouncedSearch) : [];
+        if (
+          !terms.every(
+            (t) => hay.some((s) => s.includes(t)) || (docsUnknown && backendVetted.includes(t)),
+          )
+        ) {
+          return false;
+        }
       }
       return true;
     });
-  }, [ordersView, statusFilter, kindFilter, channelFilter, agentFilter, search]);
+  }, [ordersView, statusFilter, kindFilter, channelFilter, agentFilter, search, debouncedSearch]);
+
+  // 筛选/搜索一变就回第 1 页（含后端筛选 filterQuery：出行日期/航班号/开票状态等）。
+  useEffect(() => {
+    setPage(1);
+  }, [statusFilter, kindFilter, channelFilter, agentFilter, search, filterQuery, pageSize]);
+
+  // 客户端分页切片：page 越界时（筛选后条数变少）钳到最后一页，保证永远有内容可看。
+  const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
+  const currentPage = Math.min(page, totalPages);
+  const pageStart = (currentPage - 1) * pageSize;
+  const paged = useMemo(
+    () => filtered.slice(pageStart, pageStart + pageSize),
+    [filtered, pageStart, pageSize],
+  );
 
   // ── 深链承接（?q=订单号）─────────────────────────────────────
   // 从签证台订单号点入时：先把订单号填进搜索框（前端过滤已支持订单号），
@@ -689,7 +767,9 @@ export function OrdersPage() {
   };
 
   // ── 批量管理 helpers ─────────────────────────────────
-  const visibleIds = useMemo(() => filtered.map(({ order }) => order.id), [filtered]);
+  // 「全选」只作用于**当前页**可见行（客户端分页后语义收窄）：避免批量改状态/开票/到账
+  // 时把翻页后看不见的行一起带进去误伤；跨页多选可翻页后继续勾，勾选集合跨页保留。
+  const visibleIds = useMemo(() => paged.map(({ order }) => order.id), [paged]);
   const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedIds.has(id));
   const someVisibleSelected = !allVisibleSelected && visibleIds.some((id) => selectedIds.has(id));
 
@@ -1723,6 +1803,48 @@ export function OrdersPage() {
       )}
 
       <section className="card p-0 overflow-hidden">
+        {/* 分页工具条（票务反馈）：每页 20/30/40/50（默认 50 = 一次开票上限口径）+ 上一页/下一页
+            + 「第 x-y 条 / 共 N 条」。数据仍一次拉全（≤200），只是渲染分页。 */}
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 px-4 py-2 text-sm text-ink-soft">
+          <div className="flex items-center gap-2">
+            <span>每页</span>
+            <select
+              className="rounded-md border border-slate-200 bg-white px-2 py-1 text-sm"
+              value={pageSize}
+              onChange={(e) => setPageSize(Number(e.target.value))}
+              aria-label="每页条数"
+            >
+              {PAGE_SIZE_OPTIONS.map((n) => (
+                <option key={n} value={n}>{n} 条</option>
+              ))}
+            </select>
+            <span className="text-xs text-ink-muted">表头「全选」只选当前页，翻页后可继续勾选累加</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="nums text-xs text-ink-muted">
+              {filtered.length === 0
+                ? '共 0 条'
+                : `第 ${pageStart + 1}-${Math.min(pageStart + pageSize, filtered.length)} 条 / 共 ${filtered.length} 条`}
+            </span>
+            <button
+              type="button"
+              className="btn-ghost px-2 py-1 text-sm disabled:opacity-40"
+              onClick={() => setPage(Math.max(1, currentPage - 1))}
+              disabled={currentPage <= 1}
+            >
+              上一页
+            </button>
+            <span className="nums text-xs">{currentPage} / {totalPages}</span>
+            <button
+              type="button"
+              className="btn-ghost px-2 py-1 text-sm disabled:opacity-40"
+              onClick={() => setPage(Math.min(totalPages, currentPage + 1))}
+              disabled={currentPage >= totalPages}
+            >
+              下一页
+            </button>
+          </div>
+        </div>
         <div className="overflow-x-auto">
           <table className="table-admin">
             <thead>
@@ -1732,11 +1854,13 @@ export function OrdersPage() {
                     type="checkbox"
                     className="accent-brand"
                     aria-label="全选当前页"
+                    title="全选当前页（不含其它页）"
                     checked={allVisibleSelected}
                     ref={(el) => { if (el) el.indeterminate = someVisibleSelected; }}
                     onChange={toggleAllVisible}
                   />
                 </th>
+                <th className="w-12 text-center">序号</th>
                 <th className="text-left">订单号</th>
                 <th className="text-left">客户 / 代理</th>
                 <th className="text-left">内容</th>
@@ -1751,7 +1875,7 @@ export function OrdersPage() {
               </tr>
             </thead>
             <tbody>
-              {filtered.map(({ order, view }) => (
+              {paged.map(({ order, view }, idx) => (
                 <tr key={order.id} className={selectedIds.has(order.id) ? 'bg-brand-50' : ''}>
                   <td className="text-center">
                     <input
@@ -1762,6 +1886,8 @@ export function OrdersPage() {
                       onChange={() => toggleRow(order.id)}
                     />
                   </td>
+                  {/* 序号随当前排序/筛选跨页连续编号（第 2 页从 pageSize+1 起），方便对照人数/口头沟通 */}
+                  <td className="nums text-center text-xs text-ink-muted">{pageStart + idx + 1}</td>
                   <td className="text-xs">
                     <button
                       type="button"
@@ -1780,6 +1906,18 @@ export function OrdersPage() {
                         {view.agentName}
                       </div>
                     )}
+                    {/* 备注预览（票务反馈）：线上单靠备注判断是否单独编码出票，行内给首行截断，悬浮看全文 */}
+                    {(() => {
+                      const np = deriveNotesPreview(order);
+                      return np ? (
+                        <div
+                          className="mt-0.5 max-w-[11rem] truncate text-[11px] text-amber-700"
+                          title={np.fullText}
+                        >
+                          📝 {np.firstLine}
+                        </div>
+                      ) : null;
+                    })()}
                   </td>
                   <td>
                     <div className="max-w-xs truncate text-ink" title={view.itemSummary}>
@@ -1790,14 +1928,23 @@ export function OrdersPage() {
                       <span><span className="nums font-medium text-ink">{order.passengers.length}</span> 人</span>
                     </div>
                     {order.passengers.length > 0 && (() => {
-                      const names = order.passengers.map((p) => p.chineseName?.trim() || p.fullName);
-                      const q = search.trim().toLowerCase();
+                      // 姓名后缀性别小标（♂/♀；列表接口未回传性别时自然不标，不占位）
+                      const names = order.passengers.map((p) => {
+                        const base = p.chineseName?.trim() || p.fullName;
+                        const g = genderMark(p.gender);
+                        return g ? `${base}${g}` : base;
+                      });
+                      const terms = splitSearchTerms(search);
                       // 搜索命中某乘客时优先展示命中者（「张三 +3 同行」），不再平铺全部同行人。
-                      const hitIdx = q
-                        ? order.passengers.findIndex(
-                            (p) =>
-                              (p.chineseName?.toLowerCase().includes(q) ?? false) ||
-                              p.fullName.toLowerCase().includes(q),
+                      // 分词后任一词命中即算命中（与 filtered 的 AND 口径不同：这里只挑「展示谁」）。
+                      const hitIdx = terms.length
+                        ? order.passengers.findIndex((p) =>
+                            terms.some(
+                              (t) =>
+                                (p.chineseName?.toLowerCase().includes(t) ?? false) ||
+                                p.fullName.toLowerCase().includes(t) ||
+                                (p.documentNumber?.toLowerCase().includes(t) ?? false),
+                            ),
                           )
                         : -1;
                       if (hitIdx >= 0) {
@@ -1834,13 +1981,26 @@ export function OrdersPage() {
                   </td>
                   <td className="text-center">
                     {(() => {
-                      const vs = deriveVisaStatus(order);
-                      return vs ? (
-                        <span className={FF_STATUS_COLOR[vs]}>
-                          {FF_STATUS_LABEL[vs] ?? vs}
-                        </span>
-                      ) : (
-                        <span className="text-xs text-ink-muted">—</span>
+                      // 签证列语义（签证岗反馈）：主显**录单签证要求** order.visaStatus
+                      // （需要签证/电子签/已签证；不需要=空白），签证岗一眼看出哪些单要办签。
+                      // 履约任务进度降为次要小字附注（办理中/已确认…），两层信息主次分明。
+                      const requirement = order.visaStatus ? VISA_REQUIREMENT_BADGE[order.visaStatus] : undefined;
+                      const progress = deriveVisaStatus(order);
+                      if (!requirement && !progress) {
+                        // NOT_NEEDED → 空白（不需要签证的单不占视觉）；未录签证要求的老单 → 维持「—」占位
+                        return order.visaStatus === 'NOT_NEEDED'
+                          ? null
+                          : <span className="text-xs text-ink-muted">—</span>;
+                      }
+                      return (
+                        <div className="flex flex-col items-center gap-0.5">
+                          {requirement && <span className={requirement.cls}>{requirement.label}</span>}
+                          {progress && (
+                            <span className="text-[10px] text-ink-muted" title="签证履约任务进度">
+                              办理：{FF_STATUS_LABEL[progress] ?? progress}
+                            </span>
+                          )}
+                        </div>
                       );
                     })()}
                   </td>
@@ -1893,14 +2053,14 @@ export function OrdersPage() {
               ))}
               {!loading && filtered.length === 0 && (
                 <tr>
-                  <td colSpan={11} className="py-8 text-center text-ink-muted">
+                  <td colSpan={13} className="py-8 text-center text-ink-muted">
                     没有符合条件的订单
                   </td>
                 </tr>
               )}
               {loading && (
                 <tr>
-                  <td colSpan={11} className="py-8 text-center text-ink-muted">加载中…</td>
+                  <td colSpan={13} className="py-8 text-center text-ink-muted">加载中…</td>
                 </tr>
               )}
             </tbody>
@@ -2177,16 +2337,21 @@ function OrderDrawer({
   // 恒显示「—」。抽屉打开时用 getOrder 拉全量详情，之后所有子区块都读 hydrated（拿不到时兜底列表行）。
   const [hydrated, setHydrated] = useState<OrderSummary | null>(null);
   const [hydrating, setHydrating] = useState(false);
-  useEffect(() => {
-    if (!token) return;
+  // 补水失败不能静默吞掉——否则用户对着列表快照（护照/备注等字段陈旧）编辑还以为是最新。
+  // 记一个失败标记，在抽屉里给出轻量提示 + 重试；重试复用同一 loader。
+  const [hydrateFailed, setHydrateFailed] = useState(false);
+  const hydrate = useCallback(() => {
+    if (!token) return () => {};
     let cancelled = false;
     setHydrating(true);
+    setHydrateFailed(false);
     api.getOrder(token, order.id)
       .then((r) => { if (!cancelled) setHydrated(r.order); })
-      .catch(() => { /* 拉详情失败则沿用列表行数据，护照等字段可能仍显示 — */ })
+      .catch(() => { if (!cancelled) setHydrateFailed(true); })
       .finally(() => { if (!cancelled) setHydrating(false); });
     return () => { cancelled = true; };
   }, [token, order.id]);
+  useEffect(() => hydrate(), [hydrate]);
   // 详情各区块统一读 o（详情优先，兜底列表行）。售后改期/换人后用返回的整单同步 hydrated + 列表行。
   const o = hydrated ?? order;
   const view = deriveView(o);
@@ -2275,6 +2440,20 @@ function OrderDrawer({
         </div>
 
         <div className="flex-1 space-y-5 overflow-auto px-6 py-5">
+          {/* 补水失败提示：明确告知展示的是列表快照（可能陈旧），提供重试，避免用户对着旧数据编辑 */}
+          {hydrateFailed && (
+            <div className="flex items-center justify-between gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+              <span>详情加载失败，当前展示的是列表快照，可能不是最新——请重试后再编辑。</span>
+              <button
+                type="button"
+                className="shrink-0 font-medium text-amber-900 underline hover:text-amber-950"
+                onClick={() => hydrate()}
+              >
+                重试
+              </button>
+            </div>
+          )}
+
           {/* 乘客（读 hydrated → 护照号/生日/国籍/类型 真实显示）*/}
           <PassengersSection order={o} onOrderUpdated={handleOrderUpdated} />
 
@@ -2334,8 +2513,13 @@ function OrderDrawer({
             )}
           </section>
 
-          {/* 客户备注 */}
-          <NotesSection order={o} />
+          {/* 客户备注 —— key 含补水态：列表快照→补水完成会重挂载，让备注初值对齐服务端权威值
+              （补水只在抽屉打开时一次性发生，之后 hydrated 值更新不会改变 key、不打断编辑）。 */}
+          <NotesSection
+            key={`${o.id}:${hydrated ? 'h' : 'l'}`}
+            order={o}
+            onOrderUpdated={handleOrderUpdated}
+          />
 
           {/* ── 付款：付款情况卡 + 收款操作（相邻摆放，运营排序需求）── */}
           <section className="space-y-3">
@@ -5565,7 +5749,14 @@ function InvoiceFlagsSection({
   );
 }
 
-function NotesSection({ order }: { order: OrderSummary }) {
+function NotesSection({
+  order,
+  onOrderUpdated,
+}: {
+  order: OrderSummary;
+  /** 保存成功后把回读的整单冒泡给抽屉（同步 hydrated + 列表行），与其它区块一致 */
+  onOrderUpdated?: (order: OrderSummary) => void;
+}) {
   const tokens = useAuth((s) => s.tokens);
   const role = useAuth((s) => s.user?.role);
   const [customerNotes, setCustomerNotes] = useState(order.notes ?? '');
@@ -5592,17 +5783,37 @@ function NotesSection({ order }: { order: OrderSummary }) {
 
   const save = async () => {
     if (!tokens?.accessToken) return;
+    // 只发相对基线（=补水后的权威 order）真正改动的字段，其余字段不传。
+    // 后端 PATCH /orders/:id/notes 对每个字段做 `!== undefined` 的部分更新，因此不传即不动——
+    // 这样本人只改一栏时不会用旧快照盲覆盖别人（或补水后服务端）刚写进去的其它字段。
+    const body: Parameters<typeof api.updateOrderNotes>[2] = {};
+    if (customerNotes !== (order.notes ?? '')) body.notes = customerNotes;
+    if (internalNotes !== (order.internalNotes ?? '')) body.internalNotes = internalNotes;
+    // visaStatus 未改就不发：避免把服务端 null 静默升级成 'NOT_NEEDED'，也不覆盖签证台的进度口径。
+    if (visaStatus !== (order.visaStatus ?? 'NOT_NEEDED')) body.visaStatus = visaStatus;
+    if (structured.noteHotel !== (order.noteHotel ?? '')) body.noteHotel = structured.noteHotel;
+    if (structured.noteVisa !== (order.noteVisa ?? '')) body.noteVisa = structured.noteVisa;
+    if (structured.notePayment !== (order.notePayment ?? '')) body.notePayment = structured.notePayment;
+    if (structured.noteSpecial !== (order.noteSpecial ?? '')) body.noteSpecial = structured.noteSpecial;
+    if (Object.keys(body).length === 0) return; // 无改动，不发空 PATCH
     setSaving(true);
     try {
-      await api.updateOrderNotes(tokens.accessToken, order.id, {
-        notes: customerNotes,
-        internalNotes,
-        visaStatus,
-        noteHotel: structured.noteHotel,
-        noteVisa: structured.noteVisa,
-        notePayment: structured.notePayment,
-        noteSpecial: structured.noteSpecial,
+      await api.updateOrderNotes(tokens.accessToken, order.id, body);
+      // 该 PATCH 只返回 { ok }，故保存成功后回读整单，把基线收敛到服务端真值。
+      const r = await api.getOrder(tokens.accessToken, order.id);
+      // 本地基线也同步到回读值：本人改过的字段=刚存进去的值，未动的字段=服务端最新（含并发同事写入），
+      // 这样 dirty 干净归零，且未动字段不会用本地旧值再次盲覆盖。
+      setCustomerNotes(r.order.notes ?? '');
+      setInternalNotes(r.order.internalNotes ?? '');
+      setVisaStatus(r.order.visaStatus ?? 'NOT_NEEDED');
+      setStructured({
+        noteHotel: r.order.noteHotel ?? '',
+        noteVisa: r.order.noteVisa ?? '',
+        notePayment: r.order.notePayment ?? '',
+        noteSpecial: r.order.noteSpecial ?? '',
       });
+      // 冒泡给抽屉 → 同步 hydrated + 列表行，让其它区块与列表跟着刷新。
+      onOrderUpdated?.(r.order);
       setSaved(true);
       setTimeout(() => setSaved(false), 2000);
     } catch (e) {
@@ -5670,15 +5881,17 @@ function NotesSection({ order }: { order: OrderSummary }) {
             placeholder="跨班次/跨部门的私下备忘"
           />
         </div>
-        {dirty && (
+        {(dirty || saved) && (
           <div className="flex items-center gap-2">
-            <button
-              className="rounded bg-brand px-3 py-1 text-xs text-white disabled:opacity-50"
-              onClick={save}
-              disabled={saving}
-            >
-              {saving ? '保存中…' : '保存备注'}
-            </button>
+            {dirty && (
+              <button
+                className="rounded bg-brand px-3 py-1 text-xs text-white disabled:opacity-50"
+                onClick={save}
+                disabled={saving}
+              >
+                {saving ? '保存中…' : '保存备注'}
+              </button>
+            )}
             {saved && <span className="text-xs text-green-600">✓ 已保存</span>}
           </div>
         )}
@@ -6231,6 +6444,21 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
       return;
     }
 
+    // 护照有效期必填（后端 schema 已必填）：有效行缺填/格式错在前端先拦，指明具体行号，
+    // 免得整批提交被后端逐单打回才发现。
+    const badExpiryLines = rows
+      .map((r, idx) => ({ r, line: idx + 1 }))
+      .filter(
+        ({ r }) =>
+          r.fullName.trim() && r.documentNumber.trim() && parseDob(r.dateOfBirth) &&
+          (!r.passportExpiry?.trim() || !/^\d{4}-\d{2}-\d{2}$/.test(r.passportExpiry.trim())),
+      )
+      .map(({ line }) => line);
+    if (badExpiryLines.length > 0) {
+      setErr(`第 ${badExpiryLines.join('、')} 行护照有效期未填或格式不正确（示例：2030-01-01），批量创单必填`);
+      return;
+    }
+
     let description = '';
     if (productType === 'FLIGHT_ONEWAY') {
       if (!outboundScheduleId || !cabin) { setErr('请选择出港班次和舱位'); return; }
@@ -6728,7 +6956,9 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                       <th className="min-w-[70px] whitespace-nowrap px-2 py-1.5 text-left font-normal">性别</th>
                       <th className="min-w-[64px] whitespace-nowrap px-2 py-1.5 text-left font-normal">国籍</th>
                       <th className="min-w-[110px] whitespace-nowrap px-2 py-1.5 text-left font-normal">出生日期</th>
-                      <th className="min-w-[130px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照有效期</th>
+                      <th className="min-w-[130px] whitespace-nowrap px-2 py-1.5 text-left font-normal">
+                        护照有效期 <span className="text-rose-500">*必填</span>
+                      </th>
                       <th className="min-w-[130px] whitespace-nowrap px-2 py-1.5 text-left font-normal">备注（选填）</th>
                       <th className="min-w-[36px] px-2 py-1.5"></th>
                     </tr>
@@ -6795,12 +7025,31 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                           })()}
                         </td>
                         <td className="px-2 py-1 align-top">
-                          <input
-                            type="date"
-                            className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm"
-                            value={r.passportExpiry ?? ''}
-                            onChange={(e) => setRow(i, { passportExpiry: e.target.value || undefined })}
-                          />
+                          {(() => {
+                            // 护照有效期必填（后端 schema 已必填，这里给行级友好提示）：
+                            // 行基础信息（姓名+护照号+生日）齐了才提示，避免空白新行满屏飘红。
+                            const expiryVal = (r.passportExpiry ?? '').trim();
+                            const rowActive =
+                              r.fullName.trim() && r.documentNumber.trim() && parseDob(r.dateOfBirth) !== null;
+                            const expiryBad =
+                              Boolean(rowActive) &&
+                              (!expiryVal || !/^\d{4}-\d{2}-\d{2}$/.test(expiryVal));
+                            return (
+                              <>
+                                <input
+                                  type="date"
+                                  className={`w-full rounded border px-1.5 py-1 text-sm ${expiryBad ? 'border-rose-400 bg-rose-50' : 'border-slate-300'}`}
+                                  value={r.passportExpiry ?? ''}
+                                  onChange={(e) => setRow(i, { passportExpiry: e.target.value || undefined })}
+                                />
+                                {expiryBad && (
+                                  <span className="mt-0.5 block text-[11px] text-rose-500">
+                                    {expiryVal ? '格式如 2030-01-01' : '必填（如 2030-01-01）'}
+                                  </span>
+                                )}
+                              </>
+                            );
+                          })()}
                         </td>
                         <td className="px-2 py-1 align-top">
                           <input
@@ -7008,6 +7257,9 @@ function ConfirmPaymentSection({
   const [note, setNote] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // 收款复核锁：财务/出纳对账无误后锁定本单收款；锁定态隐藏录款表单并禁止再录。
+  const [paymentsLocked, setPaymentsLocked] = useState(false);
+  const [lockBusy, setLockBusy] = useState(false);
 
   // 尾款 = 应收 − 已付。正=欠款(少付)、0=已结清、负=多付（不再 clamp，多付要看得见）。
   const balance = Math.round((total - paid) * 100) / 100;
@@ -7021,6 +7273,7 @@ function ConfirmPaymentSection({
       .then((r) => {
         if (cancelled) return;
         setPayments(r.order.payments ?? []);
+        setPaymentsLocked(r.order.paymentsLocked ?? false);
         const p = Number(r.order.paidAmount);
         setPaid(p);
         const due = Math.round((total - p) * 100) / 100;
@@ -7053,6 +7306,11 @@ function ConfirmPaymentSection({
 
   async function confirm(confirmDuplicate = false): Promise<void> {
     if (!token || submitting) return;
+    // 锁定态兜底（表单已隐藏，这里再挡一次，防误触）：锁定后不许录新收款。
+    if (paymentsLocked) {
+      setErr('收款已锁定（财务复核完成），请先解锁再录收款');
+      return;
+    }
     setErr(null);
     const amt = amount ?? undefined;
     if (amt !== undefined && (!Number.isFinite(amt) || amt <= 0)) {
@@ -7092,6 +7350,24 @@ function ConfirmPaymentSection({
       setErr(e instanceof ApiError ? e.message : '确认收款失败');
     } finally {
       setSubmitting(false);
+    }
+  }
+
+  // 收款复核锁：财务/出纳对账无误后锁定本单收款（锁定后禁止人工录新收款）；解锁需二次确认。
+  async function toggleLock(): Promise<void> {
+    if (!token || lockBusy) return;
+    const next = !paymentsLocked;
+    if (!next && !window.confirm('解锁后可再次录入收款，确定解锁吗？')) return;
+    setErr(null);
+    setLockBusy(true);
+    try {
+      const res = await api.setOrderPaymentsLock(token, orderId, next);
+      setPaymentsLocked(res.paymentsLocked);
+      onChanged?.();
+    } catch (e: unknown) {
+      setErr(e instanceof ApiError ? e.message : next ? '锁定失败' : '解锁失败');
+    } finally {
+      setLockBusy(false);
     }
   }
 
@@ -7155,7 +7431,24 @@ function ConfirmPaymentSection({
 
   return (
     <section>
-      <h3 className="text-sm font-medium text-slate-700">收款</h3>
+      <div className="flex items-center justify-between">
+        <h3 className="text-sm font-medium text-slate-700">
+          收款
+          {paymentsLocked && (
+            <span className="ml-2 inline-flex items-center rounded bg-slate-200 px-1.5 py-0.5 text-xs font-medium text-slate-600">
+              🔒 已锁定
+            </span>
+          )}
+        </h3>
+        <button
+          className="btn-secondary text-xs px-2 py-1 disabled:opacity-50"
+          onClick={toggleLock}
+          disabled={lockBusy}
+          title={paymentsLocked ? '解锁后可再次录入收款' : '对账复核无误后锁定本单收款'}
+        >
+          {lockBusy ? '处理中…' : paymentsLocked ? '解锁收款' : '锁定收款'}
+        </button>
+      </div>
       <div className="mt-2 rounded-md border border-slate-200 p-3 text-sm">
         <div className="flex items-center justify-between">
           <span className="text-slate-500">已付 / 应收</span>
@@ -7240,6 +7533,16 @@ function ConfirmPaymentSection({
                 <span>{PAYMENT_METHOD_LABEL[p.method] ?? p.method}</span>
                 <span className="font-medium">¥{Number(p.amount).toLocaleString()}</span>
                 <span className="text-slate-400">{p.paidAt ? new Date(p.paidAt).toLocaleDateString('zh-CN') : ''}</span>
+                {p.reconciled ? (
+                  <span
+                    className="inline-flex items-center rounded bg-emerald-100 px-1.5 py-0.5 font-medium text-emerald-700"
+                    title="来自收款对账台认款的进账"
+                  >
+                    已认款{(p.externalTxnId || p.receiptNo) ? ` · 流水${p.externalTxnId || p.receiptNo}` : ''}
+                  </span>
+                ) : (
+                  <span className="text-slate-400">手工确认</span>
+                )}
                 {p.proofUrl && (
                   <a href={p.proofUrl} target="_blank" rel="noreferrer" className="ml-auto">
                     <img src={p.proofUrl} alt="收款截图" className="h-8 w-8 rounded border border-slate-300 object-cover" />
@@ -7250,7 +7553,16 @@ function ConfirmPaymentSection({
           </ul>
         )}
 
-        {/* 确认收款表单（始终可补录：允许多付/追加收款，后端已放开 ≤尾款 限制）*/}
+        {/* 收款已锁定：财务复核完成，隐藏录款表单；要再录需先解锁 */}
+        {paymentsLocked ? (
+          <div className="mt-3 border-t border-slate-100 pt-3">
+            <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">
+              🔒 收款已锁定（财务复核完成），如需继续录入收款请先解锁。
+            </div>
+            {err && <div className="mt-2 rounded bg-rose-50 px-2 py-1 text-xs text-rose-700">{err}</div>}
+          </div>
+        ) : (
+        /* 确认收款表单（始终可补录：允许多付/追加收款，后端已放开 ≤尾款 限制）*/
         <div className="mt-3 space-y-2 border-t border-slate-100 pt-3">
           {settled && (
             <p className="text-xs text-slate-400">已结清；如需追加收款（多付）可继续录入。</p>
@@ -7305,6 +7617,7 @@ function ConfirmPaymentSection({
             </div>
           </div>
         </div>
+        )}
       </div>
     </section>
   );

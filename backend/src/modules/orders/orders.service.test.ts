@@ -113,6 +113,7 @@ import {
   summarizeBundleItems,
   deriveBundlePerAgeUnitPrices,
   buildOrderFilterWhere,
+  splitSearchTerms,
   filterOrderIdsByDepartDate,
   assertDisplayedTotalMatches,
   computeGroundItemAmounts,
@@ -3477,16 +3478,62 @@ describe('toProspectiveOccupancy', () => {
 });
 
 describe('buildOrderFilterWhere · 搜索/乘客姓名含中文名（公测反馈：中文名搜不到）', () => {
-  it('search → OR 含乘客 fullName/chineseName 模糊匹配', () => {
+  /** 从 where.AND 里挑出搜索词生成的 OR 匹配块（区别于 kind/出行日期等 items 维度子句）。 */
+  function searchClauses(where: ReturnType<typeof buildOrderFilterWhere>) {
+    return ((where.AND ?? []) as Array<Record<string, unknown>>).filter((c) => 'OR' in c) as Array<{
+      OR: Array<Record<string, unknown>>;
+    }>;
+  }
+
+  it('单词 search → 一个 OR 匹配块，含乘客 fullName/chineseName/documentNumber 模糊匹配', () => {
     const where = buildOrderFilterWhere({ search: '张伟' });
-    const passengerClause = (where.OR as Array<Record<string, unknown>>).find((c) => 'passengers' in c) as {
+    const clauses = searchClauses(where);
+    expect(clauses).toHaveLength(1);
+    const passengerClause = clauses[0].OR.find((c) => 'passengers' in c) as {
       passengers: { some: { OR: Array<Record<string, unknown>> } };
     };
     expect(passengerClause).toBeDefined();
     expect(passengerClause.passengers.some.OR).toEqual([
       { fullName: { contains: '张伟', mode: 'insensitive' } },
       { chineseName: { contains: '张伟', mode: 'insensitive' } },
+      { documentNumber: { contains: '张伟', mode: 'insensitive' } },
     ]);
+  });
+
+  it('单词 search 保留历史字段语义（订单号/联系人不区分大小写，电话原样 contains）', () => {
+    const where = buildOrderFilterWhere({ search: 'co-123' });
+    const [clause] = searchClauses(where);
+    expect(clause.OR).toContainEqual({ orderNumber: { contains: 'co-123', mode: 'insensitive' } });
+    expect(clause.OR).toContainEqual({ contactName: { contains: 'co-123', mode: 'insensitive' } });
+    expect(clause.OR).toContainEqual({ contactPhone: { contains: 'co-123' } });
+  });
+
+  it('search 覆盖订单级备注六栏（notes/internalNotes/noteHotel/noteVisa/notePayment/noteSpecial）', () => {
+    const where = buildOrderFilterWhere({ search: '改期' });
+    const [clause] = searchClauses(where);
+    for (const field of ['notes', 'internalNotes', 'noteHotel', 'noteVisa', 'notePayment', 'noteSpecial']) {
+      expect(clause.OR).toContainEqual({ [field]: { contains: '改期', mode: 'insensitive' } });
+    }
+  });
+
+  it('多词 search → 每词一个 OR 块、词间 AND（两词分别命中同单两位乘客时订单命中）', () => {
+    const where = buildOrderFilterWhere({ search: '陈志远，林晓梅' });
+    const clauses = searchClauses(where);
+    expect(clauses).toHaveLength(2);
+    const terms = clauses.map(
+      (c) => (c.OR[0] as { orderNumber: { contains: string } }).orderNumber.contains,
+    );
+    expect(terms).toEqual(['陈志远', '林晓梅']);
+    // 词间是 AND：都在 where.AND 里、每词独立成块 —— 其中一词不命中则整单不出。
+    expect(where.OR).toBeUndefined();
+  });
+
+  it('多词 search 与 kind 等 items 维度子句共存互不覆盖', () => {
+    const where = buildOrderFilterWhere({ kind: 'FLIGHT', search: '陈志远 E12345678' });
+    expect(searchClauses(where)).toHaveLength(2);
+    expect(
+      ((where.AND ?? []) as Array<Record<string, unknown>>).filter((c) => 'items' in c),
+    ).toHaveLength(1);
   });
 
   it('passengerName → fullName 与 chineseName 任一命中', () => {
@@ -3499,6 +3546,25 @@ describe('buildOrderFilterWhere · 搜索/乘客姓名含中文名（公测反�
         ],
       },
     });
+  });
+});
+
+describe('splitSearchTerms · 搜索分词', () => {
+  it('空格/英文逗号/中文逗号/顿号均可作分隔符，混用亦可', () => {
+    expect(splitSearchTerms('陈志远 林晓梅')).toEqual(['陈志远', '林晓梅']);
+    expect(splitSearchTerms('陈志远,林晓梅')).toEqual(['陈志远', '林晓梅']);
+    expect(splitSearchTerms('陈志远，林晓梅')).toEqual(['陈志远', '林晓梅']);
+    expect(splitSearchTerms('陈志远、林晓梅')).toEqual(['陈志远', '林晓梅']);
+    expect(splitSearchTerms('陈志远， 林晓梅、E12345678')).toEqual(['陈志远', '林晓梅', 'E12345678']);
+  });
+
+  it('trim + 去空词：首尾分隔符与连续分隔符不产生空词', () => {
+    expect(splitSearchTerms('  ，陈志远，，  ')).toEqual(['陈志远']);
+    expect(splitSearchTerms('   ')).toEqual([]);
+  });
+
+  it('词数上限 5：超出部分截断防滥用', () => {
+    expect(splitSearchTerms('a b c d e f g')).toEqual(['a', 'b', 'c', 'd', 'e']);
   });
 });
 

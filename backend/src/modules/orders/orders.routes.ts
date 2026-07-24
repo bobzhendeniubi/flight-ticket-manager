@@ -1409,6 +1409,54 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     };
   });
 
+  // ── 收款复核锁定/解锁（ADMIN + STAFF/财务）──
+  // POST /orders/:id/payments-lock  body: { locked: boolean }
+  // 口径：业务录收款 → 财务/出纳对账复核无误 → 锁定本单收款。锁定后禁止人工录新收款
+  // （人工确认 / 批量确认在 paymentsLocked 时返回 409）；要再收钱需先解锁（审计留痕）。
+  // 网关到账 / 对账认款是真钱已落库，不受此锁影响（见 payments.service 注释）。
+  app.post('/:id/payments-lock', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅管理员或财务可锁定/解锁收款' });
+    }
+    const { id } = req.params as { id: string };
+    const body = z.object({ locked: z.boolean() }).parse(req.body);
+    const order = await prisma.order.findUnique({
+      where: { id },
+      select: { id: true, orderNumber: true, paymentsLocked: true },
+    });
+    if (!order) return reply.status(404).send({ error: '订单不存在' });
+    const updated = await prisma.order.update({
+      where: { id },
+      data: {
+        paymentsLocked: body.locked,
+        paymentsLockedAt: body.locked ? new Date() : null,
+        paymentsLockedBy: body.locked ? req.user.sub : null,
+      },
+      select: { id: true, paymentsLocked: true, paymentsLockedAt: true, paymentsLockedBy: true },
+    });
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: body.locked ? 'LOCK_PAYMENTS' : 'UNLOCK_PAYMENTS',
+      targetType: 'ORDER',
+      targetId: id,
+      targetLabel: order.orderNumber,
+      before: { paymentsLocked: order.paymentsLocked },
+      after: {
+        paymentsLocked: updated.paymentsLocked,
+        paymentsLockedAt: updated.paymentsLockedAt?.toISOString() ?? null,
+        paymentsLockedBy: updated.paymentsLockedBy,
+      },
+      severity: 'WARNING',
+    });
+    return {
+      id: updated.id,
+      paymentsLocked: updated.paymentsLocked,
+      paymentsLockedAt: updated.paymentsLockedAt,
+      paymentsLockedBy: updated.paymentsLockedBy,
+    };
+  });
+
   // ── 多付存入代理余额（ADMIN/STAFF）──
   // POST /orders/:id/credit-overpay-to-agent
   // 订单多付（paidAmount > total）→ 把多付额转入归属代理的预存余额，订单回压到恰好结清。

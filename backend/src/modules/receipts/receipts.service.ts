@@ -315,8 +315,8 @@ export class ReceiptsService {
     const result = await prisma.$transaction(async (tx) => {
       // 进账行锁 + 事务内读最新 allocated（防并发重复认领把同一笔钱认两次）
       const rows = await tx.$queryRaw<
-        Array<{ id: string; receiptNo: string; amountCny: Prisma.Decimal; allocatedCny: Prisma.Decimal; method: PaymentMethod; status: ReceiptStatus; proofUrl: string | null }>
-      >`SELECT id, "receiptNo", "amountCny", "allocatedCny", method, status, "proofUrl" FROM "Receipt" WHERE id = ${receiptId} FOR UPDATE`;
+        Array<{ id: string; receiptNo: string; amountCny: Prisma.Decimal; allocatedCny: Prisma.Decimal; method: PaymentMethod; status: ReceiptStatus; proofUrl: string | null; externalTxnId: string | null }>
+      >`SELECT id, "receiptNo", "amountCny", "allocatedCny", method, status, "proofUrl", "externalTxnId" FROM "Receipt" WHERE id = ${receiptId} FOR UPDATE`;
       const receipt = rows[0];
       if (!receipt) throw new NotFoundError('进账不存在');
       if (receipt.status === ReceiptStatus.REFUNDED) {
@@ -342,6 +342,9 @@ export class ReceiptsService {
           method: receipt.method,
           proofUrl: receipt.proofUrl,
           note: `对账认领 ${receipt.receiptNo}`,
+          // 结构化认款来源：把进账流水号一并写进收款记录（保留 note 兼容旧数据），
+          // 订单序列化据此标注该行为「已认款 · 流水…」。
+          reconciliation: { receiptNo: receipt.receiptNo, externalTxnId: receipt.externalTxnId },
         },
         actor,
         pendingFulfillmentTaskIds,

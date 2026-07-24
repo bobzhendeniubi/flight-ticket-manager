@@ -679,3 +679,58 @@ describe('PaymentsService.confirmManualPayment · 同额防呆软闸', () => {
     expect(Number(dbOrder.paidAmount)).toBe(1000);
   });
 });
+
+describe('PaymentsService · 收款复核锁守卫（只拦人工录入）', () => {
+  const service = new PaymentsService();
+
+  it('paymentsLocked=true → 人工确认收款被拒（409），订单未被改动', async () => {
+    const ADMIN = await createAdminActor();
+    const customer = await createCustomer();
+    const order = await createPendingOrder(customer.id, 1000);
+    await prisma.order.update({ where: { id: order.id }, data: { paymentsLocked: true } });
+
+    await expect(
+      service.confirmManualPayment(
+        order.id,
+        { amount: 500, method: PaymentMethod.BANK_CARD },
+        ADMIN,
+      ),
+    ).rejects.toThrow(/收款已锁定/);
+
+    const dbOrder = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(Number(dbOrder.paidAmount)).toBe(0);
+    const payments = await prisma.payment.findMany({ where: { orderId: order.id } });
+    expect(payments).toHaveLength(0);
+  });
+
+  it('paymentsLocked=true → 批量确认逐单返回 ok:false（复用同一守卫）', async () => {
+    const ADMIN = await createAdminActor();
+    const customer = await createCustomer();
+    const order = await createPendingOrder(customer.id, 1000);
+    await prisma.order.update({ where: { id: order.id }, data: { paymentsLocked: true } });
+
+    const { results } = await service.batchConfirmManualPayment(
+      { items: [{ orderId: order.id, amount: 500, method: PaymentMethod.BANK_CARD }] },
+      ADMIN,
+    );
+    expect(results[0].ok).toBe(false);
+    expect(results[0].error).toMatch(/收款已锁定/);
+  });
+
+  it('解锁后人工确认恢复正常入账', async () => {
+    const ADMIN = await createAdminActor();
+    const customer = await createCustomer();
+    const order = await createPendingOrder(customer.id, 1000);
+    await prisma.order.update({ where: { id: order.id }, data: { paymentsLocked: true } });
+    await prisma.order.update({ where: { id: order.id }, data: { paymentsLocked: false } });
+
+    const res = await service.confirmManualPayment(
+      order.id,
+      { amount: 1000, method: PaymentMethod.BANK_CARD },
+      ADMIN,
+    );
+    expect(res.status).toBe(OrderStatus.PAID);
+    const dbOrder = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(Number(dbOrder.paidAmount)).toBe(1000);
+  });
+});

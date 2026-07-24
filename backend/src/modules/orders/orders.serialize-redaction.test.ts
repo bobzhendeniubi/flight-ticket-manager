@@ -289,3 +289,102 @@ describe('serializeOrder · balanceDue 纳入 prepaymentOffset', () => {
     expect(out.balanceDue).toBe('200'); // 1200 − 1000 − 0
   });
 });
+
+/**
+ * 收款记录序列化：只透出安全字段 + 认款来源标注（reconciled/receiptNo/externalTxnId），
+ * 绝不外泄 gatewayPayload 原始载荷（confirmedBy / manual 等内部字段）。
+ */
+describe('serializeOrder · 收款记录标注与脱敏', () => {
+  const paymentBase = {
+    id: 'pay_1',
+    method: 'BANK_CARD' as const,
+    amount: dec(500),
+    status: 'SUCCEEDED' as const,
+    proofUrl: null,
+    paidAt: new Date('2026-07-24T00:00:00Z'),
+    createdAt: new Date('2026-07-24T00:00:00Z'),
+  };
+
+  it('结构化认款（source=reconciliation）→ reconciled + 流水号，且不泄露 gatewayPayload', () => {
+    const out = serializeOrder(
+      {
+        ...buildOrder(),
+        payments: [
+          {
+            ...paymentBase,
+            gatewayPayload: {
+              manual: true,
+              note: '对账认领 RCP2026072400001',
+              confirmedBy: 'user_ops_secret',
+              source: 'reconciliation',
+              receiptNo: 'RCP2026072400001',
+              externalTxnId: 'TXN-9988',
+            },
+          },
+        ],
+      },
+      orderSerializeRoleCtx(UserRole.ADMIN),
+    ) as Record<string, any>;
+    const p = out.payments[0];
+    expect(p.reconciled).toBe(true);
+    expect(p.receiptNo).toBe('RCP2026072400001');
+    expect(p.externalTxnId).toBe('TXN-9988');
+    expect(p.amount).toBe('500');
+    // 关键：原始网关载荷不外泄
+    expect(p.gatewayPayload).toBeUndefined();
+    expect(JSON.stringify(p)).not.toContain('user_ops_secret');
+  });
+
+  it('旧数据兼容：仅 note 以「对账认领 」开头 → reconciled 并提取进账单号（无流水号）', () => {
+    const out = serializeOrder(
+      {
+        ...buildOrder(),
+        payments: [
+          {
+            ...paymentBase,
+            gatewayPayload: { manual: true, note: '对账认领 RCP2026061800009', confirmedBy: 'x' },
+          },
+        ],
+      },
+      orderSerializeRoleCtx(UserRole.ADMIN),
+    ) as Record<string, any>;
+    const p = out.payments[0];
+    expect(p.reconciled).toBe(true);
+    expect(p.receiptNo).toBe('RCP2026061800009');
+    expect(p.externalTxnId).toBeNull();
+  });
+
+  it('手工确认收款 → reconciled=false', () => {
+    const out = serializeOrder(
+      {
+        ...buildOrder(),
+        payments: [
+          {
+            ...paymentBase,
+            gatewayPayload: { manual: true, note: '客户微信转账', confirmedBy: 'x' },
+          },
+        ],
+      },
+      orderSerializeRoleCtx(UserRole.ADMIN),
+    ) as Record<string, any>;
+    const p = out.payments[0];
+    expect(p.reconciled).toBe(false);
+    expect(p.receiptNo).toBeNull();
+    expect(p.externalTxnId).toBeNull();
+  });
+
+  it('收款复核锁字段：ADMIN 可见 paymentsLocked，AGENT 脱敏不下发', () => {
+    const locked = {
+      ...buildOrder(),
+      paymentsLocked: true,
+      paymentsLockedAt: new Date('2026-07-24T00:00:00Z'),
+      paymentsLockedBy: 'user_cashier_1',
+    };
+    const adminOut = serializeOrder(locked, orderSerializeRoleCtx(UserRole.ADMIN)) as Record<string, any>;
+    expect(adminOut.paymentsLocked).toBe(true);
+    expect(adminOut.paymentsLockedBy).toBe('user_cashier_1');
+    const agentOut = serializeOrder(locked, orderSerializeRoleCtx(UserRole.AGENT)) as Record<string, any>;
+    expect(agentOut.paymentsLocked).toBeUndefined();
+    expect(agentOut.paymentsLockedBy).toBeUndefined();
+  });
+});

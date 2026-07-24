@@ -413,13 +413,20 @@ export class PaymentsService {
       await prisma.$transaction(async (tx) => {
       // FOR UPDATE 行锁 + 事务内读余额：并发确认不会用旧快照双计 paidAmount
       const rows = await tx.$queryRaw<
-        Array<{ id: string; orderNumber: string; total: Prisma.Decimal; adjustmentCny: number; paidAmount: Prisma.Decimal; prepaymentOffset: Prisma.Decimal; status: OrderStatus; deletedAt: Date | null }>
-      >`SELECT id, "orderNumber", total, "adjustmentCny", "paidAmount", "prepaymentOffset", status, "deletedAt" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+        Array<{ id: string; orderNumber: string; total: Prisma.Decimal; adjustmentCny: number; paidAmount: Prisma.Decimal; prepaymentOffset: Prisma.Decimal; status: OrderStatus; deletedAt: Date | null; paymentsLocked: boolean }>
+      >`SELECT id, "orderNumber", total, "adjustmentCny", "paidAmount", "prepaymentOffset", status, "deletedAt", "paymentsLocked" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
       const order = rows[0];
       if (!order) throw new NotFoundError('订单不存在');
       // 资金闸：已取消/已退款/支付超时/草稿/回收站的单一律拒绝入账——
       // 钱记到死单上没有任何出口，且软删单不进任何统计，实收与报表会永久对不平。
       assertOrderAcceptsFunds(order);
+      // 收款复核锁（准入开关，非金额校验）：财务/出纳复核无误后锁定本单收款，
+      // 锁定态下拒绝一切「人工录入」收款（本方法 = 人工确认；批量确认逐单复用本方法，一并受阻）。
+      // 口径边界：此锁只拦人工录入。网关 webhook / 线上支付回调（handleCallback）与对账认款
+      // （receipts.allocate → _creditOrderPaymentWithinTx）都不走此路径——真钱已到账必须落库，绝不拦。
+      if (order.paymentsLocked) {
+        throw new ConflictError('收款已锁定（财务复核完成），请先解锁再录收款');
+      }
 
       total = Number(order.total);
       const already = Number(order.paidAmount);
@@ -571,7 +578,15 @@ export class PaymentsService {
   async _creditOrderPaymentWithinTx(
     tx: Prisma.TransactionClient,
     orderId: string,
-    input: { amount: number; method: PaymentMethod; proofUrl?: string | null; note?: string | null },
+    input: {
+      amount: number;
+      method: PaymentMethod;
+      proofUrl?: string | null;
+      note?: string | null;
+      // 对账认款来源标注（仅 receipts.allocate 传）：把「这笔收款来自对账认领的进账」结构化写进
+      // gatewayPayload，供订单序列化透出 reconciled/receiptNo/externalTxnId 只读标注（收款列表徽标用）。
+      reconciliation?: { receiptNo: string; externalTxnId?: string | null };
+    },
     actor: { userId: string; role: UserRole },
     pendingFulfillmentTaskIds: string[],
   ): Promise<{
@@ -619,6 +634,15 @@ export class PaymentsService {
           manual: true,
           note: input.note ?? null,
           confirmedBy: actor.userId,
+          // 结构化认款来源（仅对账认领时带）：保留上面的 note 不破坏，额外透出可机读的三元组，
+          // 订单序列化据此把这行收款标注为「已认款 · 流水{externalTxnId 或 receiptNo}」。
+          ...(input.reconciliation
+            ? {
+                source: 'reconciliation',
+                receiptNo: input.reconciliation.receiptNo,
+                externalTxnId: input.reconciliation.externalTxnId ?? null,
+              }
+            : {}),
         } as Prisma.InputJsonValue,
       },
     });

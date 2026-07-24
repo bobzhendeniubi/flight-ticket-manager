@@ -1844,7 +1844,7 @@ export class OrderService {
               flightSchedule: { select: { departureTime: true } },
             },
           },
-          passengers: { select: { id: true, fullName: true, chineseName: true } },
+          passengers: { select: { id: true, fullName: true, chineseName: true, gender: true, documentNumber: true } },
           agent: { select: { id: true, companyName: true, contactName: true, settlementMode: true, prepaymentBalance: true } },
           user: { select: { id: true, displayName: true, email: true } },
           claimedBy: { select: { id: true, displayName: true, email: true } },
@@ -6165,6 +6165,55 @@ function resolveCreatedAtBoundary(value: string, edge: 'from' | 'to'): Date {
     : new Date(`${value}T23:59:59Z`);
 }
 
+// ── 搜索分词（多词 AND 匹配）────────────────────────────────────────
+// 分隔符：空格（含全角/换行）、英文逗号、中文逗号、顿号 —— 覆盖录单员常见的姓名串写法。
+const SEARCH_TERM_SEPARATORS = /[\s,，、]+/;
+// 词数上限：防滥用（每个词都会展开成一组跨表 OR 子查询，词数不设限会被超长输入拖垮查询）。
+const MAX_SEARCH_TERMS = 5;
+
+/** search 输入 → 规整后的词列表（trim、去空词、截断到上限）。导出供单测使用。 */
+export function splitSearchTerms(search: string): string[] {
+  return search
+    .split(SEARCH_TERM_SEPARATORS)
+    .map((term) => term.trim())
+    .filter((term) => term.length > 0)
+    .slice(0, MAX_SEARCH_TERMS);
+}
+
+/**
+ * 单个搜索词 → OR 匹配块。字段口径：
+ * - 订单号 / 联系人 / 联系电话（历史字段，保持原语义）；
+ * - 乘客中/英文名（公测反馈：搜索框要能按乘客姓名搜到订单；与回收站搜索同口径）；
+ * - 乘客护照号 documentNumber（运营需求：按证件号定位订单）；
+ * - 订单级备注六栏 notes/internalNotes/noteHotel/noteVisa/notePayment/noteSpecial。
+ */
+function buildSearchTermClause(term: string): Prisma.OrderWhereInput {
+  return {
+    OR: [
+      { orderNumber: { contains: term, mode: 'insensitive' } },
+      { contactName: { contains: term, mode: 'insensitive' } },
+      { contactPhone: { contains: term } },
+      { notes: { contains: term, mode: 'insensitive' } },
+      { internalNotes: { contains: term, mode: 'insensitive' } },
+      { noteHotel: { contains: term, mode: 'insensitive' } },
+      { noteVisa: { contains: term, mode: 'insensitive' } },
+      { notePayment: { contains: term, mode: 'insensitive' } },
+      { noteSpecial: { contains: term, mode: 'insensitive' } },
+      {
+        passengers: {
+          some: {
+            OR: [
+              { fullName: { contains: term, mode: 'insensitive' } },
+              { chineseName: { contains: term, mode: 'insensitive' } },
+              { documentNumber: { contains: term, mode: 'insensitive' } },
+            ],
+          },
+        },
+      },
+    ],
+  };
+}
+
 /**
  * 把列表/导出共用的筛选参数转成 Prisma where。
  * listOrders 与 orders.export-templates.ts 三模板导出共用，避免两处过滤逻辑漂移。
@@ -6320,23 +6369,14 @@ export function buildOrderFilterWhere(query: OrderListFilters): Prisma.OrderWher
       },
     };
   }
+  // 多词分词 AND 搜索（运营需求：一次输入多位乘客姓名要能定位同一订单）。
+  // 每个词各自生成一个 OR 匹配块（订单号/联系人/电话/乘客名/护照号/各类备注），
+  // 词与词之间 AND —— 两个词分别命中同单的两位乘客时该订单命中；单词输入 = 原语义 + 新增字段。
+  // 走 andClauses 叠加，与 kind / 出行日期 / 航班号等维度组合互不覆盖。
   if (query.search) {
-    where.OR = [
-      { orderNumber: { contains: query.search, mode: 'insensitive' } },
-      { contactName: { contains: query.search, mode: 'insensitive' } },
-      { contactPhone: { contains: query.search } },
-      // 乘客中/英文名（公测反馈：搜索框要能按乘客姓名搜到订单；与回收站搜索同口径）
-      {
-        passengers: {
-          some: {
-            OR: [
-              { fullName: { contains: query.search, mode: 'insensitive' } },
-              { chineseName: { contains: query.search, mode: 'insensitive' } },
-            ],
-          },
-        },
-      },
-    ];
+    for (const term of splitSearchTerms(query.search)) {
+      andClauses.push(buildSearchTermClause(term));
+    }
   }
 
   // 把所有 items 维度的子句一次性 AND 起来（kind / 出行日期 / 航班号可任意组合，互不覆盖）
@@ -7114,6 +7154,22 @@ interface OrderLike {
   settlementLocked?: boolean;
   settlementLockedAt?: Date | null;
   settlementLockedBy?: string | null;
+  // 收款复核锁（出纳/财务对账后写保护）：锁定后禁止人工录新收款。
+  paymentsLocked?: boolean;
+  paymentsLockedAt?: Date | null;
+  paymentsLockedBy?: string | null;
+  // 收款记录（ORDER_FULL_INCLUDE 下 payments: true 时联查）；不同 include 下可能不带。
+  // gatewayPayload 是内部原始载荷，serializeOrder 只透出安全字段 + 认款标注，绝不整段外泄。
+  payments?: Array<{
+    id: string;
+    method: PaymentMethod;
+    amount: Prisma.Decimal;
+    status: PaymentStatus;
+    proofUrl?: string | null;
+    paidAt?: Date | null;
+    createdAt: Date;
+    gatewayPayload?: Prisma.JsonValue;
+  }>;
   adjustments?: Prisma.JsonValue;
   claimedById?: string | null;
   claimedBy?: Record<string, unknown> | null;
@@ -7456,6 +7512,60 @@ function redactItemMetadataForExternal(metadata: unknown): unknown {
   return rest;
 }
 
+/**
+ * 收款记录序列化：只透出安全字段 + 认款来源标注，绝不外泄 gatewayPayload 其余内容
+ *（内部 confirmedBy / 原始网关载荷等一律不下发）。
+ *
+ * 认款标注（reconciled）判定：
+ *   1) 新数据：gatewayPayload.source === 'reconciliation' → 直接取 receiptNo / externalTxnId。
+ *   2) 旧数据兼容：gatewayPayload.note 以「对账认领 」开头 → 视为认款，并从 note 提取 receiptNo。
+ * 其余（手工确认 / 网关到账）reconciled=false，前端标为「手工确认」。
+ */
+const RECONCILE_NOTE_PREFIX = '对账认领 ';
+function serializePaymentRecord(p: NonNullable<OrderLike['payments']>[number]): {
+  id: string;
+  method: PaymentMethod;
+  amount: string;
+  status: PaymentStatus;
+  proofUrl: string | null;
+  paidAt: Date | null;
+  createdAt: Date;
+  reconciled: boolean;
+  receiptNo: string | null;
+  externalTxnId: string | null;
+} {
+  const payload =
+    p.gatewayPayload && typeof p.gatewayPayload === 'object' && !Array.isArray(p.gatewayPayload)
+      ? (p.gatewayPayload as Record<string, unknown>)
+      : null;
+  let reconciled = false;
+  let receiptNo: string | null = null;
+  let externalTxnId: string | null = null;
+  if (payload) {
+    if (payload.source === 'reconciliation') {
+      reconciled = true;
+      receiptNo = typeof payload.receiptNo === 'string' ? payload.receiptNo : null;
+      externalTxnId = typeof payload.externalTxnId === 'string' ? payload.externalTxnId : null;
+    } else if (typeof payload.note === 'string' && payload.note.startsWith(RECONCILE_NOTE_PREFIX)) {
+      // 旧数据：来源信息只留在 note 里，尽力提取进账单号，无流水号。
+      reconciled = true;
+      receiptNo = payload.note.slice(RECONCILE_NOTE_PREFIX.length).trim() || null;
+    }
+  }
+  return {
+    id: p.id,
+    method: p.method,
+    amount: p.amount.toString(),
+    status: p.status,
+    proofUrl: p.proofUrl ?? null,
+    paidAt: p.paidAt ?? null,
+    createdAt: p.createdAt,
+    reconciled,
+    receiptNo,
+    externalTxnId,
+  };
+}
+
 // 导出供单测直接验证脱敏口径（redactForExternal）；运行时仍由本模块内部各读取/流转处调用。
 export function serializeOrder<T extends OrderLike>(
   order: T,
@@ -7547,6 +7657,15 @@ export function serializeOrder<T extends OrderLike>(
     // 锁定时间/操作人仅内部可见（对代理 redact），条件透传保持与 Prisma payload 类型兼容
     settlementLockedAt: redact ? undefined : (order.settlementLockedAt ?? null),
     settlementLockedBy: redact ? undefined : (order.settlementLockedBy ?? null),
+    // 收款复核锁：锁状态是内部收款区功能，对外角色（AGENT/CUSTOMER）一律不下发（收款区本就不对外）。
+    paymentsLocked: redact ? undefined : (order.paymentsLocked ?? false),
+    paymentsLockedAt: redact ? undefined : (order.paymentsLockedAt ?? null),
+    paymentsLockedBy: redact ? undefined : (order.paymentsLockedBy ?? null),
+    // 收款记录：显式重映射，只透出安全字段 + 认款标注（reconciled/receiptNo/externalTxnId），
+    // 剥掉 gatewayPayload 原始载荷（confirmedBy 等内部字段绝不外泄）。未联查 payments 时不加此键。
+    ...(Array.isArray(order.payments)
+      ? { payments: order.payments.map(serializePaymentRecord) }
+      : {}),
     adjustments: redact ? undefined : order.adjustments,
     claimedById: redact ? undefined : order.claimedById,
     claimedBy: redact ? undefined : order.claimedBy,

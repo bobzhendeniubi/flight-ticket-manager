@@ -1036,6 +1036,11 @@ export interface OrderSummary {
   expectedAmountLocked?: boolean;
   settlementLocked?: boolean;
 
+  // 收款复核锁（出纳/财务对账后锁定本单收款；仅 ADMIN/STAFF 看，AGENT 不下发）
+  paymentsLocked?: boolean;
+  paymentsLockedAt?: string | null;
+  paymentsLockedBy?: string | null;
+
   // 出行人数（按 Passenger.passengerType 统计；套餐订单详情行程单「人数」板块用）
   adultCount?: number;
   childCount?: number;
@@ -1114,6 +1119,11 @@ export interface OrderPayment {
   proofUrl: string | null;
   paidAt: string | null;
   createdAt: string;
+  // 认款标注（只读，后端序列化派生）：reconciled=true 表示这笔来自收款对账台认款的进账
+  //（带流水号 externalTxnId / 进账单号 receiptNo）；false = 手工确认 / 网关到账。
+  reconciled?: boolean;
+  receiptNo?: string | null;
+  externalTxnId?: string | null;
 }
 
 // ── Audit / Customers / Travelers / Fulfillment ──────────────────────────
@@ -3249,6 +3259,15 @@ export const api = {
       `/orders/${orderId}/expected-amount/lock`,
       { method: 'POST', token, body: { locked } },
     ),
+
+  // 收款复核锁：财务/出纳对账无误后锁定本单收款（锁定后禁止人工录新收款），解锁才可再录。
+  setOrderPaymentsLock: (token: string, orderId: string, locked: boolean) =>
+    apiFetch<{
+      id: string;
+      paymentsLocked: boolean;
+      paymentsLockedAt: string | null;
+      paymentsLockedBy: string | null;
+    }>(`/orders/${orderId}/payments-lock`, { method: 'POST', token, body: { locked } }),
 
   // 班次成本明细（admin · 用于"航班成本"维护页；带单座成本与空座成本动态指标）
   listFinanceSchedules: (

@@ -1088,6 +1088,11 @@ model Order {
   settlementLocked     Boolean          @default(false)
   settlementLockedAt   DateTime?
   settlementLockedBy   String? // userId
+  // 收款复核锁：财务/出纳对账复核无误后锁定本单收款，锁定后禁止人工录新收款
+  // （人工确认 / 批量确认）；解锁后才可再录。网关到账 / 对账认款（真钱已到）不受此锁影响。
+  paymentsLocked       Boolean          @default(false)
+  paymentsLockedAt     DateTime?
+  paymentsLockedBy     String? // userId
   // 售后费用（改期费 / 换人费等）：累计客户应补付的金额（CNY，整数）。
   // 应付 = total + adjustmentCny；尾款 = total + adjustmentCny − paidAmount。
   // 不改 total/subtotal（机票基础价不重算），只在结清口径上叠加。
