@@ -924,3 +924,26 @@ export const roomSupplementBodySchema = z.object({
   passengerId: z.string().min(1).max(64).optional(),
 });
 export type RoomSupplementBody = z.infer<typeof roomSupplementBodySchema>;
+
+// ── 订单详情补录结构化地面项（POST /orders/:id/items/ground；ADMIN/STAFF）──
+// unitPriceCny 省略时由服务端按产品 costPriceCny 带出，显式传值表示运营手改售价。
+const groundItemCommonSchema = z.object({
+  unitPriceCny: z.number().finite().nonnegative('售价不能为负').optional(),
+  note: z.string().max(500).optional(),
+});
+
+export const addGroundItemBodySchema = z.discriminatedUnion('kind', [
+  groundItemCommonSchema.extend({
+    kind: z.literal('VISA'),
+    visaId: z.string().min(1, 'visaId 必填'),
+    quantity: z.number().int().min(1).max(99).optional(),
+  }),
+  groundItemCommonSchema.extend({
+    kind: z.literal('HOTEL'),
+    hotelRoomTypeId: z.string().min(1, 'hotelRoomTypeId 必填'),
+    nights: z.number().int().min(1, '晚数至少 1'),
+    rooms: z.number().multipleOf(0.5).min(0.5, '间数至少 0.5'),
+    checkIn: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, '入住日期格式应为 YYYY-MM-DD').optional(),
+  }),
+]);
+export type AddGroundItemBody = z.infer<typeof addGroundItemBodySchema>;

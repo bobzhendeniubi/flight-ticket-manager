@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog } from '../lib/api';
+import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { useFlightSeats } from '../stores/flightSeats';
 import {
@@ -2206,6 +2206,7 @@ function OrderDrawer({
   const isOps = role === 'ADMIN' || role === 'STAFF';
   const [agentEditOpen, setAgentEditOpen] = useState(false);
   const [roomSupplementOpen, setRoomSupplementOpen] = useState(false);
+  const [groundItemKind, setGroundItemKind] = useState<'VISA' | 'HOTEL' | null>(null);
 
   const saveRooming = async (groups: RoomGroup[]): Promise<void> => {
     if (!token) return;
@@ -2375,6 +2376,13 @@ function OrderDrawer({
             initialExpectedAmountLocked={o.expectedAmountLocked}
             payableCny={Number(o.total) + Number(o.adjustmentCny ?? 0)}
             onChanged={onChanged}
+          />
+
+          {/* 结构化地面项：收入金额从 VISA/HOTEL 行聚合，录入时售价默认带出产品成本。 */}
+          <GroundItemsCard
+            order={o}
+            canEdit={isOps}
+            onAdd={(kind) => setGroundItemKind(kind)}
           />
 
           {/* 产品内容 */}
@@ -2634,6 +2642,23 @@ function OrderDrawer({
           </div>
         </div>
       )}
+
+      {groundItemKind && (
+        <GroundItemModal
+          kind={groundItemKind}
+          orderId={o.id}
+          passengerCount={o.passengers.length}
+          onCancel={() => setGroundItemKind(null)}
+          onSaved={async () => {
+            if (token) {
+              const r = await api.getOrder(token, o.id);
+              setHydrated(r.order);
+            }
+            setGroundItemKind(null);
+            onChanged?.();
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -2643,6 +2668,254 @@ function Row({ label, value }: { label: string; value: React.ReactNode }) {
     <div className="flex justify-between gap-4">
       <dt className="text-ink-muted">{label}</dt>
       <dd className="text-right text-ink">{value}</dd>
+    </div>
+  );
+}
+
+function GroundItemsCard({
+  order,
+  canEdit,
+  onAdd,
+}: {
+  order: OrderSummary;
+  canEdit: boolean;
+  onAdd: (kind: 'VISA' | 'HOTEL') => void;
+}) {
+  const sum = (kind: 'VISA' | 'HOTEL') => {
+    const rows = (order.items ?? []).filter((item) => item.kind === kind && item.amount != null);
+    return rows.length > 0 ? rows.reduce((total, item) => total + Number(item.amount), 0) : null;
+  };
+  const visaTotal = sum('VISA');
+  const hotelTotal = sum('HOTEL');
+  const money = (value: number | null) => (value == null ? '—' : `¥${value.toLocaleString('zh-CN')}`);
+
+  return (
+    <section className="rounded-xl border border-slate-200 bg-slate-50/60 p-3">
+      <div className="flex items-center justify-between gap-2">
+        <div className="text-xs font-semibold uppercase tracking-wide text-ink-muted">地面项金额</div>
+        {canEdit && (
+          <div className="flex items-center gap-2">
+            <button type="button" className="text-[11px] font-medium text-brand hover:text-brand-dark" onClick={() => onAdd('VISA')}>
+              + 签证
+            </button>
+            <button type="button" className="text-[11px] font-medium text-brand hover:text-brand-dark" onClick={() => onAdd('HOTEL')}>
+              + 房费
+            </button>
+          </div>
+        )}
+      </div>
+      <dl className="mt-2 grid grid-cols-2 gap-3 text-sm">
+        <div className="rounded-lg bg-white px-3 py-2">
+          <dt className="text-xs text-ink-muted">签证金额合计</dt>
+          <dd className="nums mt-0.5 font-semibold text-ink">{money(visaTotal)}</dd>
+        </div>
+        <div className="rounded-lg bg-white px-3 py-2">
+          <dt className="text-xs text-ink-muted">房费金额合计</dt>
+          <dd className="nums mt-0.5 font-semibold text-ink">{money(hotelTotal)}</dd>
+        </div>
+      </dl>
+    </section>
+  );
+}
+
+function GroundItemModal({
+  kind,
+  orderId,
+  passengerCount,
+  onCancel,
+  onSaved,
+}: {
+  kind: 'VISA' | 'HOTEL';
+  orderId: string;
+  passengerCount: number;
+  onCancel: () => void;
+  onSaved: () => Promise<void>;
+}) {
+  const tokens = useAuth((s) => s.tokens);
+  const token = tokens?.accessToken ?? '';
+  const [visas, setVisas] = useState<Visa[]>([]);
+  const [hotels, setHotels] = useState<Hotel[]>([]);
+  const [selectedVisaId, setSelectedVisaId] = useState('');
+  const [selectedRoomTypeId, setSelectedRoomTypeId] = useState('');
+  const [quantity, setQuantity] = useState(Math.max(1, passengerCount));
+  const [nights, setNights] = useState(1);
+  const [rooms, setRooms] = useState(1);
+  const [checkIn, setCheckIn] = useState('');
+  const [unitPrice, setUnitPrice] = useState('');
+  const [note, setNote] = useState('');
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    const request = kind === 'VISA' ? api.listVisas(true, token) : api.listHotels(true, token);
+    request
+      .then((result) => {
+        if (cancelled) return;
+        if (kind === 'VISA') {
+          const list = (result as { visas: Visa[] }).visas;
+          setVisas(list);
+          setSelectedVisaId(list[0]?.id ?? '');
+        } else {
+          const list = (result as { hotels: Hotel[] }).hotels;
+          setHotels(list);
+          const first = list.flatMap((hotel) => hotel.roomTypes)[0];
+          setSelectedRoomTypeId(first?.id ?? '');
+        }
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) setError(err instanceof ApiError ? err.message : '产品加载失败');
+      })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [kind, token]);
+
+  const roomOptions = useMemo(
+    () => hotels.flatMap((hotel) => hotel.roomTypes.map((roomType) => ({ ...roomType, hotelName: hotel.name }))),
+    [hotels],
+  );
+  const selectedVisa = visas.find((visa) => visa.id === selectedVisaId) ?? null;
+  const selectedRoomType = roomOptions.find((roomType) => roomType.id === selectedRoomTypeId) ?? null;
+  const selectedProductKey = kind === 'VISA' ? selectedVisa?.id : selectedRoomType?.id;
+  const selectedCost = kind === 'VISA' ? selectedVisa?.costPriceCny : selectedRoomType?.costPriceCny;
+
+  useEffect(() => {
+    setUnitPrice(selectedCost ?? '');
+  }, [selectedProductKey, selectedCost]);
+
+  const priceNumber = Number(unitPrice);
+  const previewQuantity = kind === 'VISA' ? quantity : nights * rooms;
+  const previewTotal = Number.isFinite(priceNumber) && priceNumber >= 0
+    ? Math.round(priceNumber * previewQuantity)
+    : null;
+
+  const submit = async (event: React.FormEvent) => {
+    event.preventDefault();
+    setError(null);
+    if (!token) return;
+    if (kind === 'VISA' && !selectedVisaId) {
+      setError('请选择签证产品');
+      return;
+    }
+    if (kind === 'HOTEL' && !selectedRoomTypeId) {
+      setError('请选择酒店房型');
+      return;
+    }
+    if (kind === 'VISA' && (!Number.isInteger(quantity) || quantity < 1)) {
+      setError('人数至少为 1');
+      return;
+    }
+    if (kind === 'HOTEL' && (!Number.isInteger(nights) || nights < 1 || !Number.isFinite(rooms) || rooms < 0.5 || Math.round(rooms * 2) !== rooms * 2)) {
+      setError('请填写有效的晚数和间数（间数按 0.5 递增）');
+      return;
+    }
+    if (!Number.isFinite(priceNumber) || priceNumber < 0) {
+      setError('请填写非负售价；产品无成本价时售价为必填');
+      return;
+    }
+    setSaving(true);
+    try {
+      if (kind === 'VISA') {
+        await api.addGroundItem(token, orderId, {
+          kind,
+          visaId: selectedVisaId,
+          quantity,
+          unitPriceCny: priceNumber,
+          note: note.trim() || undefined,
+        });
+      } else {
+        await api.addGroundItem(token, orderId, {
+          kind,
+          hotelRoomTypeId: selectedRoomTypeId,
+          nights,
+          rooms,
+          checkIn: checkIn || undefined,
+          unitPriceCny: priceNumber,
+          note: note.trim() || undefined,
+        });
+      }
+      await onSaved();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : '保存失败');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-900/50 p-4" onClick={onCancel}>
+      <form className="max-h-[90vh] w-full max-w-md overflow-auto rounded-2xl bg-white p-5 shadow-2xl" onClick={(event) => event.stopPropagation()} onSubmit={submit}>
+        <div className="flex items-center justify-between gap-3">
+          <h3 className="text-base font-semibold text-ink">补录{kind === 'VISA' ? '签证' : '房费'}</h3>
+          <button type="button" className="btn-ghost px-2 text-xl leading-none" onClick={onCancel}>×</button>
+        </div>
+        {loading ? (
+          <div className="py-8 text-center text-sm text-ink-muted">加载产品中…</div>
+        ) : (
+          <div className="mt-4 space-y-3">
+            {kind === 'VISA' ? (
+              <label className="block text-sm text-ink-soft">
+                签证产品
+                <select className="input mt-1 w-full" value={selectedVisaId} onChange={(event) => setSelectedVisaId(event.target.value)}>
+                  <option value="">请选择</option>
+                  {visas.map((visa) => <option key={visa.id} value={visa.id}>{visa.visaName ?? visa.visaType} · {visa.country ?? visa.destinationCountry}</option>)}
+                </select>
+              </label>
+            ) : (
+              <label className="block text-sm text-ink-soft">
+                酒店房型
+                <select className="input mt-1 w-full" value={selectedRoomTypeId} onChange={(event) => setSelectedRoomTypeId(event.target.value)}>
+                  <option value="">请选择</option>
+                  {roomOptions.map((roomType) => <option key={roomType.id} value={roomType.id}>{roomType.hotelName} · {roomType.name}</option>)}
+                </select>
+              </label>
+            )}
+            {kind === 'VISA' ? (
+              <label className="block text-sm text-ink-soft">
+                人数
+                <input className="input mt-1 w-full" type="number" min={1} value={quantity} onChange={(event) => setQuantity(Number(event.target.value))} />
+              </label>
+            ) : (
+              <div className="grid grid-cols-2 gap-3">
+                <label className="block text-sm text-ink-soft">
+                  入住晚数
+                  <input className="input mt-1 w-full" type="number" min={1} value={nights} onChange={(event) => setNights(Number(event.target.value))} />
+                </label>
+                <label className="block text-sm text-ink-soft">
+                  房间数
+                  <input className="input mt-1 w-full" type="number" min={0.5} step={0.5} value={rooms} onChange={(event) => setRooms(Number(event.target.value))} />
+                </label>
+              </div>
+            )}
+            {kind === 'HOTEL' && (
+              <label className="block text-sm text-ink-soft">
+                入住日期（可选）
+                <input className="input mt-1 w-full" type="date" value={checkIn} onChange={(event) => setCheckIn(event.target.value)} />
+              </label>
+            )}
+            <label className="block text-sm text-ink-soft">
+              售价（¥{kind === 'VISA' ? '人' : '间/晚'}）
+              <input className="input mt-1 w-full" type="number" min={0} step={0.01} value={unitPrice} placeholder={selectedCost == null ? '产品无成本价，请手动填写' : undefined} onChange={(event) => setUnitPrice(event.target.value)} required />
+            </label>
+            <div className="rounded-lg border border-brand/20 bg-brand/5 px-3 py-2 text-sm text-brand-dark">
+              共 <span className="nums font-semibold">{previewTotal == null ? '—' : `¥${previewTotal.toLocaleString('zh-CN')}`}</span>
+            </div>
+            <label className="block text-sm text-ink-soft">
+              备注（可选）
+              <textarea className="input mt-1 min-h-16 w-full" value={note} onChange={(event) => setNote(event.target.value)} maxLength={500} />
+            </label>
+            {error && <div className="rounded-lg bg-rose-50 px-3 py-2 text-xs text-rose-700">{error}</div>}
+          </div>
+        )}
+        <div className="mt-5 flex justify-end gap-2">
+          <button type="button" className="btn-secondary" onClick={onCancel}>取消</button>
+          <button type="submit" className="btn-primary" disabled={loading || saving}>{saving ? '保存中…' : '确认补录'}</button>
+        </div>
+      </form>
     </div>
   );
 }
