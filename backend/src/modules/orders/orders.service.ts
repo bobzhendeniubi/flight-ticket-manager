@@ -5512,10 +5512,9 @@ export class OrderService {
         },
       });
       if (!order) throw new NotFoundError('订单不存在');
-      if (order.deletedAt) throw new BadRequestError('已软删除的订单不能补录地面项');
-      if (order.status === OrderStatus.CANCELLED) {
-        throw new BadRequestError('已取消的订单不能补录地面项');
-      }
+      // 资金闸与其他改 total 通道同源：已退款/超时/草稿/已取消/回收站单一律拒绝，
+      // 防止终态订单的历史金额被追加地面项改写。
+      assertOrderAcceptsFunds(order);
 
       let productName: string;
       let costPriceCny: number | null;
@@ -5639,6 +5638,13 @@ export class OrderService {
           });
           visaTaskCreated = true;
         }
+      }
+
+      // 已过 PAID 履约生成点的订单（非待付款）：幂等补建新行的履约任务——
+      // 否则付款后补录的房费行没有 HOTEL_BOOKING 任务，履约视图看不见它。
+      // createFulfillmentTasks 按 item×类型跳过已有活动任务，VISA 分支刚建的任务不会重复。
+      if (order.status !== OrderStatus.PENDING_PAYMENT) {
+        await createFulfillmentTasks(tx, orderId);
       }
 
       const newSubtotal = round2(

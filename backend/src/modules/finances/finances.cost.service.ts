@@ -70,6 +70,9 @@ export interface EffectiveCost {
 export interface ScheduleCostInputs {
   departureTime: Date;
   departureTz: string;
+  /** 成本已锁定的班次不再回退周期默认——锁时未固化的 null 字段视为「冻结的缺失」，
+   *  否则事后往周期里补值会让"已锁"班次的报表数字悄悄变（财务锁定语义）。 */
+  costLocked?: boolean;
   charterCostCny: Prisma.Decimal | number | null;
   airportTaxDepCny: Prisma.Decimal | number | null;
   airportTaxArrCny: Prisma.Decimal | number | null;
@@ -96,6 +99,8 @@ export function findMatchedPeriod<P extends PeriodInputs>(
   schedule: ScheduleCostInputs,
   periodsForFlight: P[],
 ): P | null {
+  // 已锁定成本的班次：生效值只看自身 override（锁定时已固化），不再匹配周期。
+  if (schedule.costLocked) return null;
   const dateStr = localDate(schedule.departureTime, schedule.departureTz);
   return (
     periodsForFlight.find(

@@ -67,6 +67,28 @@ describe('resolveFlightItemCost — 订单机票行实时成本', () => {
     ).toBeNull();
   });
 
+  it('已锁定成本的班次不再回退周期默认（锁后往周期补值不得影响已锁班次）', () => {
+    const period = {
+      effectiveFrom: new Date('2026-07-01T00:00:00.000Z'),
+      effectiveTo: new Date('2026-07-31T00:00:00.000Z'),
+      charterCostCny: 5000,
+      airportTaxDepCny: 100,
+      airportTaxArrCny: null,
+      fuelCostCny: null,
+      peakSurchargeCny: null,
+      aircraftAdjustCny: null,
+      takeoffDiscountCny: null,
+    };
+    // 未锁：周期值生效
+    expect(
+      resolveFlightItemCost(itemSchedule({}), [period], 1),
+    ).toBe(600); // 5000÷10 + 100
+    // 已锁且未固化任何 override：周期值被隔离 → 视为缺成本
+    expect(
+      resolveFlightItemCost(itemSchedule({ costLocked: true } as never), [period], 1),
+    ).toBeNull();
+  });
+
   it('多腿订单的两条机票行分别按各自班次和人数计算', () => {
     const outbound = itemSchedule({ charterCostCny: 1000, airportTaxDepCny: 50 });
     const inbound = itemSchedule({ charterCostCny: 2000, airportTaxArrCny: 80 });
