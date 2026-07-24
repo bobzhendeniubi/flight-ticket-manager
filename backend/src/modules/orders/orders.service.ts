@@ -28,6 +28,7 @@ import {
   ReceiptSource,
   RefundStatus,
   SeatLockStatus,
+  type SettlementTier,
   UserRole,
 } from '@prisma/client';
 import { randomInt, randomUUID } from 'node:crypto';
@@ -56,6 +57,7 @@ import {
 } from '../../lib/funds-guard.js';
 import { resolveBundleNights } from '../products/bundle-nights.js';
 import { localDate } from '../finances/finances.cost.service.js';
+import { getSettlementRate } from '../settlement-rates/settlement-rates.service.js';
 import {
   assertHotelPhysicalFit,
   checkHotelPhysicalFit,
@@ -796,16 +798,40 @@ export class OrderService {
       pricedItems.push(buildPriceAdjustmentItem(body.priceAdjustment));
     }
 
-    // 本单结算总价（权限/与 priceAdjustment 的互斥已在入口断言）：按「结算价 − 权威合计」
-    // 自动生成一条 SETTLEMENT 差额行，把 total 收敛到结算价。权威合计取此刻 pricedItems 之和
-    // （含护照临期附加费等系统费行）——结算价语义是「本单最终收多少钱」。
+    // 代理归属判定（提前到结算价日历取价之前——自动取价需要先知道本单是否归属代理）：
+    //   游客 / 直客 → null；AGENT 自助 → 自己的 agentId（忽略 body.agentId）；
+    //   ADMIN·STAFF 录单 → 可显式归属 body.agentId（校验存在且在用），否则 null。
+    const agentId = isGuest
+      ? null
+      : await resolveOrderAgentId(requester, body.agentId);
+
+    // 结算价日历自动取价（已拍板 B）：代理单 + 套餐已配日历键（档次+晚数）→ 按去程出发日期查每人结算价，
+    // 结算总价 = 每人价 × 乘客数，喂给下方既有「结算总价 → SETTLEMENT 差额行」机制落价（服务端权威定价）。
+    //   · 手工 settlementTotalCny（ADMIN/STAFF 通道，已在入口鉴权）优先，日历不覆盖。
+    //   · 已配日历的套餐当日无价 → resolveBundleSettlementCalendarTotal 内抛 400 拒单。
+    //   · 未配日历的套餐 / 非代理单 → 返回 null，现状不变（不进结算收敛）。
+    // 说明：与 0723「结算价锁」不冲突——锁只在核对后写保护改价，日历只在创建时定价，两者时序不重叠。
+    let effectiveSettlementTotalCny = body.settlementTotalCny;
+    let settlementCalendarAudit: Record<string, unknown> | null = null;
+    if (body.settlementTotalCny === undefined && agentId) {
+      const calendar = await this.resolveBundleSettlementCalendarTotal(body);
+      if (calendar) {
+        effectiveSettlementTotalCny = calendar.totalCny;
+        settlementCalendarAudit = calendar.audit;
+      }
+    }
+
+    // 本单结算总价（权限/与 priceAdjustment 的互斥已在入口断言；代理单可由上方日历自动填充）：
+    // 按「结算价 − 权威合计」自动生成一条 SETTLEMENT 差额行，把 total 收敛到结算价。权威合计取此刻
+    // pricedItems 之和（含护照临期附加费等系统费行）——结算价语义是「本单最终收多少钱」。
     // 绝不改各明细行价格；diff=0 不生成行（系统价即结算价）；|diff| 超调价上限 → 400。
     let settlementAuthoritativeTotalCny: number | null = null;
     let settlementDiffCny: number | null = null;
-    if (body.settlementTotalCny !== undefined) {
+    if (effectiveSettlementTotalCny !== undefined) {
       const authoritativeTotalCny = pricedItems.reduce((sum, p) => sum + p.amount, 0);
       // 两位小数取整：结算价最多两位小数（schema 已校验），差额对齐到分，避免浮点尾差。
-      const diffCny = Math.round((body.settlementTotalCny - authoritativeTotalCny) * 100) / 100;
+      const diffCny =
+        Math.round((effectiveSettlementTotalCny - authoritativeTotalCny) * 100) / 100;
       if (Math.abs(diffCny) > PRICE_ADJUSTMENT_CAP_CNY) {
         throw new BadRequestError(
           `结算总价与系统价（¥${authoritativeTotalCny}）差额 ¥${Math.abs(diffCny)} 超出调价上限（±¥${PRICE_ADJUSTMENT_CAP_CNY}），请复核结算价`,
@@ -816,7 +842,7 @@ export class OrderService {
           buildSettlementTotalItem({
             diffCny,
             authoritativeTotalCny,
-            settlementTotalCny: body.settlementTotalCny,
+            settlementTotalCny: effectiveSettlementTotalCny,
           }),
         );
       }
@@ -826,13 +852,6 @@ export class OrderService {
 
     const subtotal = pricedItems.reduce((sum, p) => sum + p.amount, 0);
     const total = subtotal; // 目前没有 taxes / discount，直接等于 subtotal
-
-    // 代理归属判定：
-    //   游客 / 直客 → null；AGENT 自助 → 自己的 agentId（忽略 body.agentId）；
-    //   ADMIN·STAFF 录单 → 可显式归属 body.agentId（校验存在且在用），否则 null。
-    const agentId = isGuest
-      ? null
-      : await resolveOrderAgentId(requester, body.agentId);
 
     // 生成订单号（有极小概率撞 unique，重试 3 次）
     const orderNumber = await generateOrderNumber();
@@ -1054,8 +1073,9 @@ export class OrderService {
       });
     }
 
-    // 本单结算总价审计（权威合计 / 结算价 / 差额 / 操作人）。权限已在入口断言 → 此处必为 ADMIN/STAFF。
-    // WARNING 级：整单收款额被收敛到人工谈定的结算价，是需要留痕复核的财务动作。
+    // 本单结算总价审计（权威合计 / 结算价 / 差额 / 操作人 / 取价来源）。权限已在入口断言。
+    // 来源二选一：手工结算价（ADMIN/STAFF 通道）或结算价日历自动取价（代理单，settlementCalendarAudit 非空）。
+    // WARNING 级：整单收款额被收敛到结算价，是需要留痕复核的财务动作。
     // diff=0（未生成差额行、总额未变）不写审计，避免无操作的 WARNING 噪音淹没真正该警觉的调价。
     // await（非 fire-and-forget）：与录单调价同口径，落审计后再返回，便于对账与追责。
     if (settlementDiffCny !== null && settlementDiffCny !== 0 && !isGuest) {
@@ -1068,10 +1088,12 @@ export class OrderService {
         before: { total: settlementAuthoritativeTotalCny?.toString() ?? null },
         after: {
           total: Number(order.total).toString(),
-          settlementTotalCny: body.settlementTotalCny,
+          settlementTotalCny: effectiveSettlementTotalCny,
           diffCny: settlementDiffCny,
           reasonCode: 'SETTLEMENT',
           reasonLabel: PRICE_ADJUSTMENT_REASON_LABEL.SETTLEMENT,
+          // 结算价日历自动取价来源留痕（档次/晚数/出发日期/每人价/人数）；手工结算价时为 null。
+          settlementCalendar: settlementCalendarAudit,
         },
         severity: AuditSeverity.WARNING,
       });
@@ -1181,6 +1203,113 @@ export class OrderService {
         totalCostCny: 0,
       });
     }
+  }
+
+  /**
+   * 结算价日历取价（已拍板 B）：代理套餐单按去程出发日期 × 档次 × 晚数取每人结算价，返回结算总价。
+   * 仅当本单存在「已配日历键（settlementTier + settlementNights 都非空）」的套餐时才参与：
+   *   · 结算总价 = Σ(每张已配套餐：每人价 × 该套餐乘客数)。
+   *     乘客数取套餐占座模型 headCount（成人 + 占座儿童 + 不占座婴儿，全部同价）。
+   *     ⚠ 婴儿计入人数且暂按每人同价——是否单列婴儿价待运营确认（见任务遗留项）。
+   *   · 去程出发日期 = 本单最早 FLIGHT 航段的出发地本地日（localDate，与班次日期口径一致）。
+   *   · 命中日历返回价；已配日历但当日无价 → 抛 400「该出发日期的结算价未维护，请联系运营」。
+   * 无已配日历套餐 → 返回 null（现状不变，不进结算收敛）。调用方（createOrder）仅在代理单 +
+   * 无手工 settlementTotalCny 时调用，故此处不重复判身份。
+   */
+  private async resolveBundleSettlementCalendarTotal(
+    body: CreateOrderBody,
+  ): Promise<{ totalCny: number; audit: Record<string, unknown> } | null> {
+    const bundleItems = body.items.filter(
+      (it): it is Extract<OrderItemInput, { kind: 'BUNDLE' }> =>
+        it.kind === 'BUNDLE' && !!it.bundleId,
+    );
+    if (bundleItems.length === 0) return null;
+
+    const bundleIds = [...new Set(bundleItems.map((it) => it.bundleId))];
+    const bundles = await prisma.bundle.findMany({
+      where: { id: { in: bundleIds } },
+      select: { id: true, name: true, settlementTier: true, settlementNights: true },
+    });
+    const bundleById = new Map(bundles.map((b) => [b.id, b]));
+
+    // 只处理「档次 + 晚数都配了」的套餐行；未配 → 现状不变（不进结算收敛）。
+    const configured = bundleItems.filter((it) => {
+      const b = bundleById.get(it.bundleId);
+      return b?.settlementTier != null && b?.settlementNights != null;
+    });
+    if (configured.length === 0) return null;
+
+    // 去程出发日期（最早 FLIGHT 航段的出发地本地日）。已配日历却无航段 → 无从取价，明确拒单。
+    const departYmd = await this.resolveDepartureLocalDate(body);
+    if (!departYmd) {
+      throw new BadRequestError(
+        '该套餐已配置结算价日历，但本单无机票航段，无法确定出发日期取价。请确认所选出发日期有可用班次后重试。',
+      );
+    }
+
+    let totalCny = 0;
+    const lines: Array<Record<string, unknown>> = [];
+    for (const it of configured) {
+      const b = bundleById.get(it.bundleId)!;
+      const tier = b.settlementTier as SettlementTier;
+      const nights = b.settlementNights!;
+      // 乘客数：套餐占座模型 headCount（成人 + 占座儿童 + 婴儿），与录单其它按人口径同源。
+      const pax = resolveBundleOccupancy({
+        adultCount: it.adultCount,
+        childCount: it.childCount,
+        infantCount: it.infantCount,
+        quantity: it.quantity,
+        metadata: it.metadata,
+      }).headCount;
+      const rate = await getSettlementRate(tier, nights, departYmd);
+      if (!rate) {
+        throw new BadRequestError('该出发日期的结算价未维护，请联系运营');
+      }
+      const lineTotalCny = rate.pricePerPersonCny * pax;
+      totalCny += lineTotalCny;
+      lines.push({
+        bundleId: b.id,
+        bundleName: b.name,
+        tier,
+        nights,
+        departDate: departYmd,
+        pricePerPersonCny: rate.pricePerPersonCny,
+        pax,
+        lineTotalCny,
+        // 人类可读留痕：「结算价日历自动取价：{档次}{晚数}晚 {日期} ¥X/人×N」
+        note: `结算价日历自动取价：${tier} ${nights}晚 ${departYmd} ¥${rate.pricePerPersonCny}/人×${pax}`,
+      });
+    }
+
+    return {
+      totalCny,
+      audit: { source: 'SETTLEMENT_CALENDAR', departDate: departYmd, lines },
+    };
+  }
+
+  /**
+   * 去程出发地本地日（YYYY-MM-DD）：取本单所有 FLIGHT 航段里最早 departureTime 的班次，
+   * 按其出发地时区折成本地日（localDate，与航班/班次日期展示口径一致）。无 FLIGHT 航段 → null。
+   */
+  private async resolveDepartureLocalDate(body: CreateOrderBody): Promise<string | null> {
+    const scheduleIds = [
+      ...new Set(
+        body.items
+          .filter((i): i is Extract<OrderItemInput, { kind: 'FLIGHT' }> => i.kind === 'FLIGHT')
+          .map((i) => i.flightScheduleId),
+      ),
+    ];
+    if (scheduleIds.length === 0) return null;
+    const scheds = await prisma.flightSchedule.findMany({
+      where: { id: { in: scheduleIds } },
+      select: { departureTime: true, departureTz: true },
+    });
+    if (scheds.length === 0) return null;
+    const earliest = scheds.reduce(
+      (min, s) => (s.departureTime < min.departureTime ? s : min),
+      scheds[0],
+    );
+    return localDate(earliest.departureTime, earliest.departureTz);
   }
 
   /**

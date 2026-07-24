@@ -13,7 +13,7 @@ import {
   type MockBundle,
   type BundleItem,
 } from '../lib/mockData';
-import { api, ApiError, type Hotel, type Transfer as ApiTransfer, type Visa as ApiVisa, type VisaIssuanceMethod, type VisaEntryType, type Bundle as ApiBundle, type AdminFlight, type BundleFlightRef } from '../lib/api';
+import { api, ApiError, type Hotel, type Transfer as ApiTransfer, type Visa as ApiVisa, type VisaIssuanceMethod, type VisaEntryType, type Bundle as ApiBundle, type AdminFlight, type BundleFlightRef, type SettlementTier } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { NumberInput } from '../components/NumberInput';
 import { BundleBlackoutEditor, type BlackoutDateRow } from '../components/BundleBlackoutEditor';
@@ -34,6 +34,17 @@ type MockBundleWithServiceNotes = MockBundle & {
   serviceNotes?: string | null;
   /** 管理端可编辑排序值：数字小的排前面（列表 + 录单套餐下拉同口径）；留空排最后 */
   sortOrder?: number | null;
+  /** 结算价日历取价键：酒店档次 + 住宿晚数（都配了才走日历取价；null = 不走日历） */
+  settlementTier?: SettlementTier | null;
+  settlementNights?: number | null;
+};
+
+// 结算价档次中文标签（前端映射；后端只存枚举值）
+const SETTLEMENT_TIER_LABELS: Record<SettlementTier, string> = {
+  CITY_3STAR: '市区三星',
+  CITY_4STAR: '市区四星',
+  CITY_5STAR: '市区五星',
+  INTL_5STAR: '国际五星',
 };
 // 0702 反馈 3：起价拆解需要房型整间夜价 —— MockBundle.hotelRoomType（lib/mockData.ts）里没声明
 // nightlyPriceCny，但后端 serializeBundle 实际会发（见 products.service.ts BUNDLE_ROOM_INCLUDE /
@@ -192,6 +203,9 @@ function bundleApiToMock(b: ApiBundle): MockBundleWithServiceNotes {
     returnFlight: b.returnFlight ?? null,
     // 管理端可编辑排序值：数字小的排前面（列表 + 录单套餐下拉同口径）；null = 排最后
     sortOrder: b.sortOrder,
+    // 结算价日历取价键（都配了才走日历取价）
+    settlementTier: b.settlementTier ?? null,
+    settlementNights: b.settlementNights ?? null,
   };
 }
 
@@ -534,6 +548,9 @@ export function ProductsPage() {
           returnFlightId: n.returnFlight?.id ?? null,
           // 管理端可编辑排序值（选填）：留空 = 排最后 → 省略字段。
           sortOrder: n.sortOrder ?? undefined,
+          // 结算价日历取价键：档次 + 晚数（表单已保证两者同填/同空）；不走日历 = null。
+          settlementTier: n.settlementTier ?? null,
+          settlementNights: n.settlementNights ?? null,
         });
       }
       for (const n of next) {
@@ -566,6 +583,9 @@ export function ProductsPage() {
             returnFlightId: n.returnFlight?.id ?? null,
             // 留空 = 显式清空排序值为未设（排最后，真·部分更新字段，表单已用现值预填）。
             sortOrder: n.sortOrder ?? null,
+            // 结算价日历取价键：显式 null = 退出日历取价（表单已保证档次+晚数同填/同空）。
+            settlementTier: n.settlementTier ?? null,
+            settlementNights: n.settlementNights ?? null,
             isActive: n.active,
           });
         }
@@ -1216,6 +1236,10 @@ function NewBundleWizard({
   // 不可售日期（blackout，按出发日，单套餐粒度）+ 前台默认出发日
   const [blackoutDates, setBlackoutDates] = useState<BlackoutDateRow[]>(initial?.blackoutDates ?? []);
   const [defaultDepartDate, setDefaultDepartDate] = useState<string>(initial?.defaultDepartDate ?? '');
+  // 结算价日历取价键（选填）：档次 + 晚数都配了，代理下该套餐单才按去程出发日期自动取每人结算价。
+  //   任一为空 = 该套餐不走日历（现状不变，代理单沿用系统权威价）。
+  const [settlementTier, setSettlementTier] = useState<SettlementTier | ''>(initial?.settlementTier ?? '');
+  const [settlementNights, setSettlementNights] = useState<number | null>(initial?.settlementNights ?? null);
   // 绑定航班号（去程/回程）：存 flight.id，空串 = 不指定（按最便宜航班）。编辑时从已绑航班预填。
   const [outboundFlightId, setOutboundFlightId] = useState<string>(initial?.outboundFlight?.id ?? '');
   const [returnFlightId, setReturnFlightId] = useState<string>(initial?.returnFlight?.id ?? '');
@@ -1566,6 +1590,35 @@ function NewBundleWizard({
                 onChange={(e) => setDefaultDepartDate(e.target.value)}
               />
               <p className="mt-1 text-xs text-ink-muted">前台默认带出的出发日，不影响可售判定。留空 = 无默认。</p>
+            </div>
+            {/* 结算价日历取价键：档次 + 晚数都选了，代理下该套餐单才按去程出发日期自动取每人结算价 */}
+            <div>
+              <label className="label">结算价档次（可选）</label>
+              <select
+                className="input"
+                value={settlementTier}
+                onChange={(e) => setSettlementTier((e.target.value as SettlementTier) || '')}
+              >
+                <option value="">不走日历</option>
+                {(Object.keys(SETTLEMENT_TIER_LABELS) as SettlementTier[]).map((t) => (
+                  <option key={t} value={t}>
+                    {SETTLEMENT_TIER_LABELS[t]}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="label">结算价晚数（可选）</label>
+              <NumberInput
+                className="input"
+                placeholder="不走日历"
+                value={settlementNights}
+                onChange={(n) => setSettlementNights(n)}
+                integerOnly
+              />
+              <p className="mt-1 text-[11px] text-ink-muted">
+                档次 + 晚数都选，代理下单按去程日期在「结算价日历」自动取每人价；任一留空 = 不走日历。
+              </p>
             </div>
           </div>
 
@@ -2065,6 +2118,9 @@ function NewBundleWizard({
                       ...(b.reason?.trim() ? { reason: b.reason.trim() } : {}),
                     })),
                   defaultDepartDate: defaultDepartDate || null,
+                  // 结算价日历取价键：档次 + 晚数任一留空 = 不走日历（都置 null）；都填了才纳入日历取价。
+                  settlementTier: settlementTier && settlementNights != null ? settlementTier : null,
+                  settlementNights: settlementTier && settlementNights != null ? settlementNights : null,
                   // 绑定航班号（去程/回程）：回建引用；不选 = null（不指定，按最便宜航班）
                   outboundFlight: resolveFlightRef(outboundFlightId, flightOptions, initial?.outboundFlight),
                   returnFlight: resolveFlightRef(returnFlightId, flightOptions, initial?.returnFlight),

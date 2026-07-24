@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { VisaEntryType, VisaIssuanceMethod } from '@prisma/client';
+import { SettlementTier, VisaEntryType, VisaIssuanceMethod } from '@prisma/client';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -258,6 +258,13 @@ export const createBundleBodySchema = z.object({
   // 管理端可编辑排序值：列表按 sortOrder 升序展示（数字小的排前面），留空排最后。
   // 运营用它把常用套餐置顶（如录单选套餐时）。省略 = 不改；显式 null = 清空（排到最后）。
   sortOrder: z.number().int().min(-100_000).max(100_000).nullable().optional(),
+  // 结算价日历取价键（两者都空 = 该套餐不走日历，现状不变；都配了 = 纳入日历取价）：
+  //   settlementTier   = 酒店档次（对齐 SettlementRate.tier）
+  //   settlementNights = 住宿晚数（对齐 SettlementRate.nights，1–5）
+  // 代理下该套餐单时按去程出发日期 + 本组合查结算价日历得到每人结算价（服务端权威定价）。
+  // 用 !== undefined 区分「不改」与「显式 null 清空」（下方 service 据此写库）。
+  settlementTier: z.nativeEnum(SettlementTier).nullable().optional(),
+  settlementNights: z.number().int().min(1).max(5).nullable().optional(),
   isActive: z.boolean().default(true),
 });
 export type CreateBundleBody = z.infer<typeof createBundleBodySchema>;

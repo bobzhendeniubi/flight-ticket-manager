@@ -1666,6 +1666,10 @@ export interface BundleWriteBody {
   returnFlightId?: string | null;
   /** 管理端可编辑排序值：数字小的排前面（列表 + 录单套餐下拉同口径）；留空排最后；省略 = 不改 */
   sortOrder?: number | null;
+  /** 结算价日历取价键：酒店档次；null 清空（退出日历取价）；省略 = 不改 */
+  settlementTier?: SettlementTier | null;
+  /** 结算价日历取价键：住宿晚数（1–5）；null 清空；省略 = 不改。与 settlementTier 都配了才走日历取价 */
+  settlementNights?: number | null;
   isActive?: boolean;
 }
 
@@ -1730,8 +1734,39 @@ export interface Bundle {
   defaultDepartDate?: string | null;
   /** 管理端可编辑排序值：数字小的排前面（列表 + 录单套餐下拉同口径）；null = 排最后 */
   sortOrder: number | null;
+  /** 结算价日历取价键：酒店档次；null = 不走日历（与 settlementNights 都配了才纳入日历取价） */
+  settlementTier: SettlementTier | null;
+  /** 结算价日历取价键：住宿晚数（1–5）；null = 不走日历 */
+  settlementNights: number | null;
   isActive: boolean;
   createdAt: string;
+}
+
+// ── 结算价日历（ADMIN/STAFF）— 出发日期 × 晚数 × 酒店档次 → 每人结算价 ─────
+// 与 backend/src/modules/settlement-rates/* 对齐
+export type SettlementTier = 'CITY_3STAR' | 'CITY_4STAR' | 'CITY_5STAR' | 'INTL_5STAR';
+
+export interface SettlementRate {
+  id: string;
+  tier: SettlementTier;
+  nights: number;
+  /** 去程出发日期（YYYY-MM-DD） */
+  departDate: string;
+  /** 每人结算价（CNY，整数） */
+  pricePerPersonCny: number;
+  note: string | null;
+  /** 最近更新人 userId */
+  updatedBy: string | null;
+  updatedAt: string;
+}
+
+/** 批量 upsert 一格（网格整批保存 / Excel 粘贴块） */
+export interface SettlementRateWriteEntry {
+  tier: SettlementTier;
+  nights: number;
+  departDate: string;
+  pricePerPersonCny: number;
+  note?: string | null;
 }
 
 // ── 房控（酒店包房周期 + 销控板 / 远期视图）──────────────────────────────
@@ -3472,6 +3507,25 @@ export const api = {
   // 近期用房变更（读审计流：订单侧改了分房/换酒店/补房差 → 房控可见性；倒序近 N 天，上限 100）
   getHotelRecentChanges: (token: string, days = 7) =>
     apiFetch<HotelRecentRoomChanges>(`/hotel-control/recent-changes?days=${days}`, { token }),
+
+  // ── 结算价日历（ADMIN/STAFF）— 出发日期 × 晚数 × 档次网格 ────────────────
+  listSettlementRates: (
+    token: string,
+    params: { from: string; to: string; nights?: number; tier?: SettlementTier },
+  ) => {
+    const qs = new URLSearchParams({ from: params.from, to: params.to });
+    if (params.nights != null) qs.set('nights', String(params.nights));
+    if (params.tier) qs.set('tier', params.tier);
+    return apiFetch<{ rates: SettlementRate[] }>(`/settlement-rates?${qs.toString()}`, { token });
+  },
+  upsertSettlementRates: (token: string, rates: SettlementRateWriteEntry[]) =>
+    apiFetch<{ rates: SettlementRate[] }>('/settlement-rates/batch', {
+      method: 'PUT',
+      token,
+      body: { rates },
+    }),
+  deleteSettlementRate: (token: string, id: string) =>
+    apiFetch<{ ok: true }>(`/settlement-rates/${id}`, { method: 'DELETE', token }),
 
   // 分房表导出（成都格式：每入住日期一个 sheet；ADMIN/STAFF only）— Blob 直接下载
   //   · { from, to }    按入住日区间选（跨度上限 14 天）

@@ -19,6 +19,7 @@ import { seatAllocationRoutes } from './modules/seat-allocation/seat-allocation.
 import { waitlistRoutes } from './modules/waitlist/waitlist.routes.js';
 import { hotelControlRoutes } from './modules/hotel-control/hotel-control.routes.js';
 import { settlementRoutes } from './modules/settlements/settlements.routes.js';
+import { settlementRateRoutes } from './modules/settlement-rates/settlement-rates.routes.js';
 import { productRoutes } from './modules/products/products.routes.js';
 import { dashboardRoutes } from './modules/dashboard/dashboard.routes.js';
 import { auditRoutes } from './modules/audit/audit.routes.js';
@@ -97,6 +98,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(waitlistRoutes, { prefix: '/waitlist' });
   await app.register(hotelControlRoutes, { prefix: '/hotel-control' });
   await app.register(settlementRoutes, { prefix: '/settlements' });
+  await app.register(settlementRateRoutes, { prefix: '/settlement-rates' });
   await app.register(productRoutes, { prefix: '/products' });
   await app.register(dashboardRoutes, { prefix: '/dashboard' });
   await app.register(auditRoutes, { prefix: '/audit-logs' });

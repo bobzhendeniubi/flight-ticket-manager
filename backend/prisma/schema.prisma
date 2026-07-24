@@ -884,6 +884,34 @@ model Visa {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// 结算价日历 — 运营按「出发日期 × 晚数 × 酒店档次」维护的同业结算价（每人 CNY）。
+// 代理下套餐单时按去程出发日期 + 套餐配置的档次/晚数自动取价（服务端权威定价）。
+// 商务舱升舱差价由航班级联动另行解决，不在本表；本表只管地面档次 × 晚数的整包每人价。
+// ─────────────────────────────────────────────────────────────────────────────
+enum SettlementTier {
+  CITY_3STAR // 市区三星
+  CITY_4STAR // 市区四星
+  CITY_5STAR // 市区五星
+  INTL_5STAR // 国际五星
+}
+
+model SettlementRate {
+  id                String         @id @default(cuid())
+  tier              SettlementTier
+  nights            Int // 住宿晚数（1–5）
+  departDate        DateTime       @db.Date // 去程出发日期（date-only）
+  pricePerPersonCny Int // 每人结算价（CNY，整数）
+  // 扩展点：当前单一航线（澳门-岘港），note 可记航线/备注；未来按航线区分时再拆列。
+  note              String?
+  updatedBy         String? // 最近更新人 userId（审计冗余，展示"谁改的"）
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+
+  @@unique([tier, nights, departDate])
+  @@index([departDate])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Products — Bundles (打包套餐)
 // ─────────────────────────────────────────────────────────────────────────────
 model Bundle {
@@ -952,6 +980,12 @@ model Bundle {
   // 管理端可编辑的排序值：列表按 sortOrder 升序展示（数字小的排前面），null 排最后。
   // 运营用它把常用套餐置顶（如录单选套餐时）。
   sortOrder                     Int?
+  // 结算价日历取价键（两者都空 = 该套餐不走日历，现状不变；都配了 = 纳入日历取价）：
+  //   settlementTier   = 酒店档次（对齐 SettlementRate.tier）
+  //   settlementNights = 住宿晚数（对齐 SettlementRate.nights）
+  // 代理下该套餐单时，按去程出发日期 + 本组合查 SettlementRate 得到每人结算价（服务端权威定价）。
+  settlementTier                SettlementTier?
+  settlementNights              Int?
   createdAt                     DateTime @default(now())
   updatedAt                     DateTime @updatedAt
 

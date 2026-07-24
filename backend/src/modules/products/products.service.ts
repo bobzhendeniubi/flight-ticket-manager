@@ -667,6 +667,9 @@ export class ProductsService {
           defaultDepartDate: body.defaultDepartDate ?? null,
           // 管理端可编辑排序值：省略/null = 排最后（DB 默认 null）
           sortOrder: body.sortOrder ?? null,
+          // 结算价日历取价键：省略/null = 不走日历（现状不变）；配了 = 纳入日历取价
+          settlementTier: body.settlementTier ?? null,
+          settlementNights: body.settlementNights ?? null,
           isActive: body.isActive,
         },
         include: BUNDLE_ROOM_INCLUDE,
@@ -750,6 +753,9 @@ export class ProductsService {
     if (body.defaultDepartDate !== undefined) data.defaultDepartDate = body.defaultDepartDate;
     // 管理端可编辑排序值：省略 = 不改；显式 null = 清空（排到最后）。
     if (body.sortOrder !== undefined) data.sortOrder = body.sortOrder;
+    // 结算价日历取价键：省略 = 不改；显式 null = 清空（该套餐退出日历取价，回落现状不变）。
+    if (body.settlementTier !== undefined) data.settlementTier = body.settlementTier;
+    if (body.settlementNights !== undefined) data.settlementNights = body.settlementNights;
     if (body.isActive !== undefined) data.isActive = body.isActive;
     const b = await prisma.bundle.update({
       where: { id },
@@ -935,6 +941,9 @@ function serializeBundle(
     // 运营封盘日（按出发日 D；admin 读回）+ 前台默认出发日（仅影响初始选中）
     blackoutDates: b.blackoutDates,
     defaultDepartDate: b.defaultDepartDate,
+    // 结算价日历取价键（admin 表单读回；两者都空 = 该套餐不走日历）
+    settlementTier: b.settlementTier,
+    settlementNights: b.settlementNights,
     // 组件明细：unitPrice 已是服务端权威产品价（只读展示，非运营手填）；
     // TRANSFER/VISA 行带 transferId/visaId（关联产品 id，供 admin 编辑器回显选中项 + 换产品时重新取价）。
     items: b.items,

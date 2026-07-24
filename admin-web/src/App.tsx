@@ -15,6 +15,7 @@ import { TravelersPage } from './pages/TravelersPage';
 import { AuditLogsPage } from './pages/AuditLogsPage';
 import { StaffRolesPage } from './pages/StaffRolesPage';
 import { SettlementsPage } from './pages/SettlementsPage';
+import { SettlementRatesPage } from './pages/SettlementRatesPage';
 import { CancellationPoliciesPage } from './pages/CancellationPoliciesPage';
 import { FinancesPage } from './pages/FinancesPage';
 import { ReconciliationPage } from './pages/ReconciliationPage';
@@ -154,6 +155,14 @@ export function App() {
           element={
             <Protected adminOnly>
               <ProductsPage />
+            </Protected>
+          }
+        />
+        <Route
+          path="/settlement-rates"
+          element={
+            <Protected adminOnly>
+              <SettlementRatesPage />
             </Protected>
           }
         />
