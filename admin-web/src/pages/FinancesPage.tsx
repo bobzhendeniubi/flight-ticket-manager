@@ -159,12 +159,14 @@ function UsdCostInput({
   placeholder,
   className,
   allowNegative = false,
+  disabled = false,
 }: {
   value: number | null;
   onChange: (n: number | null) => void;
   placeholder?: string;
   className: string;
   allowNegative?: boolean;
+  disabled?: boolean;
 }) {
   const [open, setOpen] = useState(false);
 
@@ -176,6 +178,7 @@ function UsdCostInput({
         value={value}
         placeholder={placeholder}
         allowNegative={allowNegative}
+        disabled={disabled}
         onChange={onChange}
       />
       <button
@@ -183,6 +186,7 @@ function UsdCostInput({
         aria-label="美元换算"
         title="美元 × 汇率"
         className="rounded border border-slate-200 px-1 py-0.5 text-xs font-medium text-brand hover:bg-brand-50"
+        disabled={disabled}
         onClick={() => setOpen((v) => !v)}
       >
         $
@@ -1123,7 +1127,7 @@ function FlightScheduleCostEditors({ token }: { token: string }) {
               )}
               {rows.map((r) => (
                 <FlightScheduleCostRow
-                  key={r.scheduleId}
+                  key={`${r.scheduleId}-${r.costLocked ? 'locked' : 'open'}`}
                   row={r}
                   pairedRow={reverseSchedule(r, rows)}
                   token={token}
@@ -1160,11 +1164,39 @@ function FlightScheduleCostRow({
   const [saveErr, setSaveErr] = useState<string | null>(null);
   const [syncPair, setSyncPair] = useState(true);
   const [saveNotice, setSaveNotice] = useState<string | null>(null);
+  const [lockBusy, setLockBusy] = useState(false);
+  const [lockErr, setLockErr] = useState<string | null>(null);
 
   const inputCls = 'w-20 rounded-lg border border-slate-200 px-1.5 py-0.5 text-right text-xs nums focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20';
 
+  async function toggleCostLock(): Promise<void> {
+    if (!token || lockBusy) return;
+    const nextLocked = !row.costLocked;
+    if (
+      nextLocked &&
+      !window.confirm(
+        `将按当前生效值固化并锁定 ${row.flightNumber} ${row.localDepartureDate} 的成本？锁定后修改需先解锁。`,
+      )
+    ) {
+      return;
+    }
+    if (!nextLocked && !window.confirm(`确定解锁 ${row.flightNumber} ${row.localDepartureDate} 的成本吗？`)) {
+      return;
+    }
+    setLockBusy(true);
+    setLockErr(null);
+    try {
+      await api.setFlightScheduleCostLock(token, row.scheduleId, nextLocked);
+      onSaved();
+    } catch (e: unknown) {
+      setLockErr(e instanceof ApiError ? e.message : '锁定状态更新失败');
+    } finally {
+      setLockBusy(false);
+    }
+  }
+
   async function save(): Promise<void> {
-    if (!token) return;
+    if (!token || row.costLocked) return;
     setSaving(true);
     setSaveErr(null);
     setSaveNotice(null);
@@ -1180,9 +1212,19 @@ function FlightScheduleCostRow({
       };
       await api.patchFlightScheduleCost(token, row.scheduleId, body);
       if (syncPair && pairedRow) {
+        if (pairedRow.costLocked) {
+          setSaveNotice(`已保存 ${row.flightNumber}，配对班次已锁定，未同步`);
+          onSaved();
+          return;
+        }
         try {
           await api.patchFlightScheduleCost(token, pairedRow.scheduleId, body);
         } catch (e: unknown) {
+          if (e instanceof ApiError && e.status === 409) {
+            setSaveNotice(`已保存 ${row.flightNumber}，配对班次已锁定，未同步`);
+            onSaved();
+            return;
+          }
           setSaveNotice(
             '已保存 ' + row.flightNumber + '，同步 ' + pairedRow.flightNumber + ' 失败：' +
               (e instanceof ApiError ? e.message : '保存失败'),
@@ -1207,10 +1249,23 @@ function FlightScheduleCostRow({
     : '';
 
   const ph = (period: number | null): string => (period == null ? '' : String(period));
+  const lockedAtTitle = row.costLockedAt
+    ? `成本已锁定于 ${new Date(row.costLockedAt).toLocaleString('zh-CN')}`
+    : undefined;
 
   return (
     <tr className="border-b border-slate-100 last:border-0">
-      <td className="py-2 font-medium text-slate-900">{row.flightNumber}</td>
+      <td className="py-2 font-medium text-slate-900">
+        {row.flightNumber}
+        {row.costLocked && (
+          <span
+            className="ml-1 inline-flex items-center rounded bg-amber-50 px-1 py-0.5 text-[10px] font-medium text-amber-700"
+            title={lockedAtTitle}
+          >
+            🔒 已锁定
+          </span>
+        )}
+      </td>
       <td className="py-2 text-slate-600">
         {row.origin} → {row.destination}
       </td>
@@ -1229,6 +1284,7 @@ function FlightScheduleCostRow({
           step={0.01}
           value={charter}
           placeholder={ph(row.charterCostCnyPeriod)}
+          disabled={row.costLocked}
           onChange={(n) => setCharter(n)}
         />
       </td>
@@ -1237,6 +1293,7 @@ function FlightScheduleCostRow({
           className={inputCls}
           value={taxDep}
           placeholder={ph(row.airportTaxDepCnyPeriod)}
+          disabled={row.costLocked}
           onChange={setTaxDep}
         />
       </td>
@@ -1245,6 +1302,7 @@ function FlightScheduleCostRow({
           className={inputCls}
           value={taxArr}
           placeholder={ph(row.airportTaxArrCnyPeriod)}
+          disabled={row.costLocked}
           onChange={setTaxArr}
         />
       </td>
@@ -1253,6 +1311,7 @@ function FlightScheduleCostRow({
           className={inputCls}
           value={fuel}
           placeholder={ph(row.fuelCostCnyPeriod)}
+          disabled={row.costLocked}
           onChange={setFuel}
         />
       </td>
@@ -1261,6 +1320,7 @@ function FlightScheduleCostRow({
           className={inputCls}
           value={peak}
           placeholder={ph(row.peakSurchargeCnyPeriod)}
+          disabled={row.costLocked}
           onChange={setPeak}
         />
       </td>
@@ -1270,6 +1330,7 @@ function FlightScheduleCostRow({
           allowNegative
           value={aircraft}
           placeholder={ph(row.aircraftAdjustCnyPeriod)}
+          disabled={row.costLocked}
           onChange={setAircraft}
         />
       </td>
@@ -1279,6 +1340,7 @@ function FlightScheduleCostRow({
           allowNegative
           value={takeoff}
           placeholder={ph(row.takeoffDiscountCnyPeriod)}
+          disabled={row.costLocked}
           onChange={setTakeoff}
         />
       </td>
@@ -1302,20 +1364,30 @@ function FlightScheduleCostRow({
           <input
             type="checkbox"
             checked={syncPair && pairedRow != null}
-            disabled={pairedRow == null}
+            disabled={pairedRow == null || pairedRow.costLocked}
             onChange={(e) => setSyncPair(e.target.checked)}
           />
-          同步写入当日配对班次
+          同步写入当日配对班次{pairedRow?.costLocked ? '（已锁定，保存时跳过）' : ''}
         </label>
         <button
           type="button"
           onClick={save}
-          disabled={saving}
+          disabled={saving || row.costLocked}
           className="btn-secondary px-2 py-1 text-xs"
         >
-          {saving ? '…' : '保存'}
+          {saving ? '…' : row.costLocked ? '已锁定' : '保存'}
+        </button>
+        <button
+          type="button"
+          onClick={toggleCostLock}
+          disabled={lockBusy || saving}
+          className="ml-1 rounded-lg border border-slate-200 px-2 py-1 text-xs text-slate-700 hover:bg-slate-50 disabled:opacity-50"
+          title={lockedAtTitle}
+        >
+          {lockBusy ? '…' : row.costLocked ? '🔓 解锁' : '🔒 锁定成本'}
         </button>
         {saveErr && <div className="text-xs text-rose-600 mt-0.5">{saveErr}</div>}
+        {lockErr && <div className="text-xs text-rose-600 mt-0.5">{lockErr}</div>}
         {saveNotice && <div className={`text-xs mt-0.5 ${saveNotice.includes('失败') ? 'text-rose-600' : 'text-emerald-600'}`}>{saveNotice}</div>}
         {pairedRow == null && <div className="text-xs text-amber-600 mt-0.5">未找到当日配对班次</div>}
       </td>

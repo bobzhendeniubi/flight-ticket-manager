@@ -1,0 +1,4 @@
+ALTER TABLE "FlightSchedule"
+ADD COLUMN "costLocked" BOOLEAN NOT NULL DEFAULT false,
+ADD COLUMN "costLockedAt" TIMESTAMP(3),
+ADD COLUMN "costLockedBy" TEXT;

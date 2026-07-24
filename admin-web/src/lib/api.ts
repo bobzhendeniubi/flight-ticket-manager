@@ -3135,6 +3135,13 @@ export const api = {
       takeoffDiscountCny: number | null;
     }>,
   ) => apiFetch<{ id: string }>(`/finances/cost/flight-schedule/${id}`, { method: 'PATCH', token, body }),
+  setFlightScheduleCostLock: (token: string, id: string, lock: boolean) =>
+    apiFetch<{
+      id: string;
+      costLocked: boolean;
+      costLockedAt: string | null;
+      costLockedBy: string | null;
+    }>(`/finances/schedules/${id}/cost-lock`, { method: 'POST', token, body: { lock } }),
 
   // 航班成本周期 CRUD
   listCostPeriods: (token: string, flightId?: string) => {
@@ -3576,6 +3583,9 @@ export interface FinanceScheduleRow {
   peakSurchargeCny: number | null;
   aircraftAdjustCny: number | null;
   takeoffDiscountCny: number | null;
+  costLocked: boolean;
+  costLockedAt: string | null;
+  costLockedBy: string | null;
   // 班次自己（"覆盖"）—— 编辑框绑这个
   charterCostCnyOverride: number | null;
   airportTaxDepCnyOverride: number | null;

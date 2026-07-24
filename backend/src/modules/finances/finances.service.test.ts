@@ -543,7 +543,7 @@ describe('getOrderPnlDetail — 单订单收支明细', () => {
     expect(detail.cost.miscRows).toHaveLength(2);
     expect(detail.cost.miscRows[0]).toMatchObject({ label: '操作费', category: 'OPERATION_FEE', amountCny: 200 });
     expect(detail.cost.miscCostCny).toBe(500);
-    expect(detail.cost.totalWithMiscCny).toBe(9700);
+    expect(detail.cost.totalWithMiscCny).toBe(2700); // 2200 + 杂项 500
 
     // 与订单毛利 tab 行严格一致：毛利 = total − itemCost（不含杂项）
     expect(detail.grossMarginCny).toBe(10600); // 12800 − 2200
