@@ -647,10 +647,9 @@ export class ProductsService {
           ...(body.singleSupplementCnyPerNight != null
             ? { singleSupplementCnyPerNight: body.singleSupplementCnyPerNight }
             : {}),
-          // 升舱商务：省略/null 时显式写 0（= 不提供升舱），不再落 DB 默认 ¥700 ——
-          // 运营反馈「留空」被误当成默认价 700，还把 700 错当成套餐起价的一部分（0702 反馈）。
-          // updateBundle 保持原逻辑不变（省略 = 保留现值，运营需显式改成 0 才关闭已有套餐的升舱）。
-          businessUpgradeCnyPerLeg: body.businessUpgradeCnyPerLeg ?? 0,
+          // 升舱差价：省略/null 落 null = 「跟随航班」（按绑定航班 Flight.businessUpgradeCnyPerLeg 计价）。
+          // 显式传数值 = 套餐自有覆盖（含 0 = 不提供升舱）。运营留空即随航班浮动，无需在每个套餐里重复填。
+          businessUpgradeCnyPerLeg: body.businessUpgradeCnyPerLeg ?? null,
           // 占座儿童折扣 / 婴儿价：省略时落 DB 默认（30 / 0）
           ...(body.childSeatDiscountCnyPerPerson != null
             ? { childSeatDiscountCnyPerPerson: body.childSeatDiscountCnyPerPerson }
@@ -725,9 +724,10 @@ export class ProductsService {
       data.singleSupplementCnyPerNight =
         body.singleSupplementCnyPerNight ?? DEFAULT_SINGLE_SUPPLEMENT_CNY_PER_NIGHT;
     }
-    // 升舱商务：保持 != null 原口径不变（省略/null=不改）——见 createBundle 处 0702 反馈注释，
-    // 「留空=不提供」由前端显式发 0 达成，本字段不随本次单房差/儿童差价改动。
-    if (body.businessUpgradeCnyPerLeg != null) {
+    // 升舱差价：key 省略（undefined）= 不改，保留现值；key 显式给值则写入 —— 含 null=「跟随航班」、
+    // 数值=套餐自有覆盖（含 0=不提供升舱）。用 !== undefined 区分「没传」与「显式传 null」，让运营能把
+    // 已有套餐改回「跟随航班」。
+    if (body.businessUpgradeCnyPerLeg !== undefined) {
       data.businessUpgradeCnyPerLeg = body.businessUpgradeCnyPerLeg;
     }
     if (body.childSeatDiscountCnyPerPerson !== undefined) {

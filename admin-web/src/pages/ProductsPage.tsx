@@ -519,12 +519,11 @@ export function ProductsPage() {
           hotelRoomTypeId: n.hotelRoomTypeId ?? null,
           hotelNights: persistedHotelNights(n),
           singleSupplementCnyPerNight: n.singleSupplementCnyPerNight ?? null,
-          // 留空 = 0/不提供（0702 反馈）：不能发 null——更新路径把 null 当「不改」，
-          // 存量 700 会清不掉（编辑态的「留空=不提供」就成了谎言）。
-          businessUpgradeCnyPerLeg: n.businessUpgradeCnyPerLeg ?? 0,
+          // 升舱差价：留空 = null =「跟随航班」（计价时取绑定航班的每程差价）；显式数值 = 套餐自有覆盖（含 0=不提供）。
+          businessUpgradeCnyPerLeg: n.businessUpgradeCnyPerLeg ?? null,
           childSeatDiscountCnyPerPerson: n.childSeatDiscountCnyPerPerson ?? null,
           selfVisaDeductCny: n.selfVisaDeductCny ?? null,
-          // 显式发数值（同 businessUpgrade 的教训）：null 会被更新路径当「不改」，改回默认就改不动。
+          // 显式发数值：null 会被更新路径当「不改」，改回默认就改不动。
           operationFeeCny: n.operationFeeCny ?? 20,
           infantPriceCny: n.infantPriceCny ?? null,
           legs: n.legs ?? 2,
@@ -551,12 +550,12 @@ export function ProductsPage() {
             hotelRoomTypeId: n.hotelRoomTypeId ?? null,
             hotelNights: persistedHotelNights(n),
             singleSupplementCnyPerNight: n.singleSupplementCnyPerNight ?? null,
-            // 留空 = 0/不提供（0702 反馈）：不能发 null——更新路径把 null 当「不改」，
-          // 存量 700 会清不掉（编辑态的「留空=不提供」就成了谎言）。
-          businessUpgradeCnyPerLeg: n.businessUpgradeCnyPerLeg ?? 0,
+            // 升舱差价：留空 = null =「跟随航班」；显式数值 = 套餐自有覆盖（含 0=不提供）。更新路径 !==undefined 才写入，
+            // 显式 null 会写入（改回跟随航班），显式 0 会写入（不提供升舱）。
+            businessUpgradeCnyPerLeg: n.businessUpgradeCnyPerLeg ?? null,
             childSeatDiscountCnyPerPerson: n.childSeatDiscountCnyPerPerson ?? null,
             selfVisaDeductCny: n.selfVisaDeductCny ?? null,
-            // 显式发数值（同 businessUpgrade 的教训）：null 会被更新路径当「不改」，改回默认就改不动。
+            // 显式发数值：null 会被更新路径当「不改」，改回默认就改不动。
             operationFeeCny: n.operationFeeCny ?? 20,
             infantPriceCny: n.infantPriceCny ?? null,
             legs: n.legs ?? 2,
@@ -1094,17 +1093,25 @@ function BundleCard({
           不是套餐组件，不计入下方「起价」。0702 反馈：运营把这行里的 700 误读成「升舱默认包含在起价里」，
           明确打标签避免再混淆。升舱 ¥0（= 未设置/不提供）不展示——避免读成「升舱免费」。 */}
       {(bundle.singleSupplementCnyPerNight != null ||
-        (bundle.businessUpgradeCnyPerLeg != null && bundle.businessUpgradeCnyPerLeg > 0)) && (
+        bundle.businessUpgradeCnyPerLeg == null ||
+        bundle.businessUpgradeCnyPerLeg > 0) && (
         <div className="mt-1 text-xs text-ink-soft">
           <span className="mr-1 rounded bg-slate-100 px-1 py-0.5 text-[10px] font-medium text-ink-muted">可选加项 · 不计入起价</span>
           {bundle.singleSupplementCnyPerNight != null && (
             <>🛏️ 单房差 ¥{bundle.singleSupplementCnyPerNight.toLocaleString()}/晚</>
           )}
-          {bundle.singleSupplementCnyPerNight != null && bundle.businessUpgradeCnyPerLeg != null && bundle.businessUpgradeCnyPerLeg > 0 && ' · '}
-          {bundle.businessUpgradeCnyPerLeg != null && bundle.businessUpgradeCnyPerLeg > 0 && (
-            // 只显示单价，不显示「× N 段」——0702 反馈实证：任何乘法样式都会被读成「已计入价格」；
-            // 按段合计只在买家真正选购升舱时（前台加购器/订单）出现。
-            <>💺 升舱 ¥{bundle.businessUpgradeCnyPerLeg.toLocaleString()}/程</>
+          {bundle.singleSupplementCnyPerNight != null &&
+            (bundle.businessUpgradeCnyPerLeg == null || bundle.businessUpgradeCnyPerLeg > 0) &&
+            ' · '}
+          {bundle.businessUpgradeCnyPerLeg == null ? (
+            // null = 跟随航班：升舱差价随绑定航班浮动，不写死在套餐上。
+            <>💺 升舱 跟随航班</>
+          ) : (
+            bundle.businessUpgradeCnyPerLeg > 0 && (
+              // 只显示单价，不显示「× N 段」——任何乘法样式都会被读成「已计入价格」；
+              // 按段合计只在买家真正选购升舱时（前台加购器/订单）出现。
+              <>💺 升舱 ¥{bundle.businessUpgradeCnyPerLeg.toLocaleString()}/程</>
+            )
           )}
         </div>
       )}
@@ -1620,10 +1627,13 @@ function NewBundleWizard({
                 min={0}
                 max={1000000}
                 className="input"
-                placeholder="留空 = 不提供升舱（¥0）"
+                placeholder="留空 = 跟随航班（按绑定航班的升舱差价）"
                 value={businessUpgrade}
                 onChange={(n) => setBusinessUpgrade(n)}
               />
+              <p className="mt-0.5 text-[11px] text-ink-muted">
+                留空 = 跟随航班（取绑定航班的每程升舱差价，一处配置随航班浮动）；填数值 = 本套餐固定覆盖（填 0 = 不提供升舱）。
+              </p>
             </div>
             <div>
               <label className="label">航段数（来回 = 2 / 单程 = 1）</label>

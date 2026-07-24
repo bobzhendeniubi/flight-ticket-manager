@@ -15,6 +15,7 @@ import {
   createFlightBodySchema,
   createScheduleBodySchema,
   flightSearchQuerySchema,
+  updateFlightBodySchema,
   updateScheduleBodySchema,
   upsertBaggagePoliciesBodySchema,
 } from './flights.schemas.js';
@@ -68,6 +69,18 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
     async (req) => {
       const { flightId } = req.params as { flightId: string };
       const flight = await service.deactivateFlight(flightId);
+      return { flight };
+    },
+  );
+
+  // 航班级编辑：升舱差价（¥/程/座，单一配置源）+ 商务舱价格联动开关。仅 ADMIN。
+  app.patch(
+    '/:flightId',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN)] },
+    async (req) => {
+      const { flightId } = req.params as { flightId: string };
+      const body = updateFlightBodySchema.parse(req.body);
+      const flight = await service.updateFlight(flightId, body);
       return { flight };
     },
   );

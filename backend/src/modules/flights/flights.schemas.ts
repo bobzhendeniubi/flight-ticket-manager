@@ -25,6 +25,18 @@ export const createFlightBodySchema = z.object({
 });
 export type CreateFlightBody = z.infer<typeof createFlightBodySchema>;
 
+// ── 航班级编辑（升舱差价单一配置源 + 商务舱价格联动开关）────────────────────
+// 两字段都 optional：只传要改的字段（PATCH 语义）。差价 0–1,000,000 的非负整数。
+export const updateFlightBodySchema = z
+  .object({
+    businessUpgradeCnyPerLeg: z.number().int().nonnegative().max(1_000_000).optional(),
+    businessPriceLinked: z.boolean().optional(),
+  })
+  .refine((b) => b.businessUpgradeCnyPerLeg !== undefined || b.businessPriceLinked !== undefined, {
+    message: '至少提供一个可编辑字段',
+  });
+export type UpdateFlightBody = z.infer<typeof updateFlightBodySchema>;
+
 // ── 行李规则（航班 × 舱等；kg / 件数 / 手提都可单独留空）────────────────
 export const baggagePolicyItemSchema = z.object({
   cabin: z.nativeEnum(CabinClass),

@@ -472,6 +472,14 @@ model Flight {
   destTerminal    String?
   aircraftType    String?
   isActive        Boolean  @default(true)
+  // 升舱差价（¥/程/座）— 单一配置源：经济舱→商务舱每航段的加价。既供本航班「商务舱价格联动」
+  // 派生商务舱现价（见 businessPriceLinked），也供「跟随航班」的套餐升舱计价取值（Bundle.businessUpgradeCnyPerLeg=null）。
+  // 与航司同业表口径一致（升级商务舱 加 700/程；往返 700×2）。
+  businessUpgradeCnyPerLeg Int @default(700)
+  // 商务舱价格联动经济舱：开启后该航班所有班次的商务舱现价 = 该班次经济舱当前售价（含仓位阶梯现价）
+  //   + businessUpgradeCnyPerLeg，商务舱自身 basePrice/fareBuckets 不再参与计价。
+  // 关闭（默认）：行为与历史完全一致（商务舱按自身 basePrice/阶梯定价）。派生在单一计价点 PricingService.calculatePrice 注入。
+  businessPriceLinked      Boolean @default(false)
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
@@ -915,10 +923,13 @@ model Bundle {
   returnFlightId                String?
   // 可选升级加价（CNY，按产品可配置；运营在后台改）— 都是 server-priced add-on：
   //   singleSupplementCnyPerNight = 一个人住酒店（单人入住）/晚 的房差，运营默认 ¥80
-  //   businessUpgradeCnyPerLeg    = 升舱商务 /航段 的加价，运营默认 ¥700
+  //   businessUpgradeCnyPerLeg    = 升舱商务 /航段 的加价（¥/程/座）
   // 注意：豪华/五星套餐（洲际半岛、四季）的单人入住房差远高于平价默认值，故 seed 里按产品上调。
   singleSupplementCnyPerNight   Int      @default(80)
-  businessUpgradeCnyPerLeg      Int      @default(700)
+  // 升舱差价（¥/程/座）：null = 「跟随航班」——升舱计价时按该套餐绑定航班的 Flight.businessUpgradeCnyPerLeg 取值
+  //   （一处配置、两处生效；运营留空即随航班浮动）；非 null = 套餐自有覆盖（含 0 = 显式不提供升舱）。
+  //   存量数据保持原值（多为 700 或 0）不迁移，行为不变。
+  businessUpgradeCnyPerLeg      Int?
   // 占座儿童 / 不占座婴儿定价（按产品可配置；运营在后台改）：
   //   childSeatDiscountCnyPerPerson = 占座儿童比成人每人便宜多少 CNY（运营默认 ¥30，可改）
   //   infantPriceCny                = 不占座婴儿每人价 CNY（默认免费 0，可改）

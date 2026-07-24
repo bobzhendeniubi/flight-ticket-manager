@@ -22,6 +22,7 @@ import type {
   CreateFlightBody,
   CreateScheduleBody,
   FlightSearchQuery,
+  UpdateFlightBody,
   UpdateScheduleBody,
 } from './flights.schemas.js';
 
@@ -383,6 +384,9 @@ export class FlightService {
             let dateRank = 'C';
             let dateMultiplier = 1.0;
             let totalForQty = Number(c.basePrice) * q.passengers;
+            // 展示用「原价」：默认取舱位 basePrice；商务舱价格联动时 basePrice 不参与计价，
+            // 用派生现价当原价，避免前台把（被忽略的）商务舱底价当作划线原价误显示成打折。
+            let displayBasePrice: string = c.basePrice.toString();
             try {
               if (avail >= q.passengers) {
                 const pr = await pricingService.calculatePrice(s.id, c.cabin, q.passengers);
@@ -390,6 +394,7 @@ export class FlightService {
                 dateRank = pr.dateRank;
                 dateMultiplier = pr.dateMultiplier;
                 totalForQty = pr.totalPrice;
+                if (pr.businessLinked) displayBasePrice = pr.averageUnitPrice.toString();
               }
             } catch {
               // fallback to basePrice
@@ -406,7 +411,7 @@ export class FlightService {
               // 公开口径：不输出 capacity/sold/locked，余位数值 ≤9 封顶（档位仍按真值算）
               available: capPublicAvailable(avail),
               availabilityTier: computeAvailabilityTier(avail, c.capacity),
-              basePrice: c.basePrice.toString(),
+              basePrice: displayBasePrice,
               dynamicPrice,
               totalForQty,
               // 行李规则（按 航班×舱等 配置；未配置 = null，前端不展示）
@@ -459,9 +464,30 @@ export class FlightService {
       destinationCode: f.destinationCode,
       aircraftType: f.aircraftType,
       isActive: f.isActive,
+      // 升舱差价单一配置源（¥/程/座）+ 商务舱价格联动开关（前端据此渲染航班级编辑区 & 派生商务舱现价）
+      businessUpgradeCnyPerLeg: f.businessUpgradeCnyPerLeg,
+      businessPriceLinked: f.businessPriceLinked,
       scheduleCount: f._count.schedules,
       createdAt: f.createdAt.toISOString(),
     }));
+  }
+
+  /**
+   * 航班级编辑：升舱差价（¥/程/座，单一配置源）+ 商务舱价格联动开关。
+   * PATCH 语义：只写传入的字段。开启联动后，该航班所有班次的商务舱现价由 PricingService 统一派生
+   *（= 经济舱当前售价 + businessUpgradeCnyPerLeg），无需逐班次改商务舱 basePrice。
+   */
+  async updateFlight(flightId: string, body: UpdateFlightBody) {
+    const flight = await prisma.flight.findUnique({ where: { id: flightId } });
+    if (!flight) throw new NotFoundError('航班不存在');
+    const data: Prisma.FlightUpdateInput = {};
+    if (body.businessUpgradeCnyPerLeg !== undefined) {
+      data.businessUpgradeCnyPerLeg = body.businessUpgradeCnyPerLeg;
+    }
+    if (body.businessPriceLinked !== undefined) {
+      data.businessPriceLinked = body.businessPriceLinked;
+    }
+    return prisma.flight.update({ where: { id: flightId }, data });
   }
 
   async createFlight(body: CreateFlightBody) {

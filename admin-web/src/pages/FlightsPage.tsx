@@ -40,12 +40,13 @@ export function FlightsPage() {
   const [schedulesByFlight, setSchedulesByFlight] = useState<Record<string, AdminSchedule[]>>({});
   const [showNewFlight, setShowNewFlight] = useState(false);
   // 批量删除班次 / +新班次 / 批量加班次 三个内联面板互斥：同一时间全站只允许一个展开。
-  const [activePanel, setActivePanel] = useState<{ id: string; panel: 'bulkDelete' | 'addOne' | 'bulkAdd' } | null>(
-    null,
-  );
+  const [activePanel, setActivePanel] = useState<{
+    id: string;
+    panel: 'bulkDelete' | 'addOne' | 'bulkAdd' | 'businessLink';
+  } | null>(null);
   const [baggageFor, setBaggageFor] = useState<string | null>(null);
 
-  const togglePanel = (id: string, panel: 'bulkDelete' | 'addOne' | 'bulkAdd') => {
+  const togglePanel = (id: string, panel: 'bulkDelete' | 'addOne' | 'bulkAdd' | 'businessLink') => {
     setActivePanel((prev) => (prev && prev.id === id && prev.panel === panel ? null : { id, panel }));
   };
 
@@ -191,6 +192,14 @@ export function FlightsPage() {
                     <button
                       type="button"
                       className="btn-secondary text-sm"
+                      title="设置升舱差价（¥/程/座）与商务舱价格联动经济舱"
+                      onClick={() => togglePanel(f.id, 'businessLink')}
+                    >
+                      💺 升舱/联动{f.businessPriceLinked ? '（已联动）' : ''}
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-secondary text-sm"
                       onClick={() => togglePanel(f.id, 'addOne')}
                     >
                       + 新班次
@@ -254,12 +263,25 @@ export function FlightsPage() {
               />
             )}
 
+            {activePanel?.id === f.id && activePanel.panel === 'businessLink' && (
+              <FlightBusinessLinkEditor
+                flight={f}
+                onCancel={() => setActivePanel(null)}
+                onSaved={async () => {
+                  setActivePanel(null);
+                  await reload();
+                  if (expanded === f.id) await refreshSchedulesAndBump(f.id);
+                }}
+              />
+            )}
+
             {baggageFor === f.id && (
               <BaggagePolicyEditor flight={f} onClose={() => setBaggageFor(null)} />
             )}
 
             {expanded === f.id && (
               <SchedulesList
+                flight={f}
                 schedules={schedulesByFlight[f.id] ?? null}
                 flightNumber={f.flightNumber}
                 originCode={f.originCode}
@@ -359,6 +381,22 @@ function seatCurrentPrice(seat: ScheduleSeat): number {
   return hasLadder(seat.fareBuckets)
     ? currentLadderPrice(seat.fareBuckets, seat.sold)
     : (Number(seat.basePrice) || 0);
+}
+
+// 商务舱价格联动经济舱的派生现价（镜像后端 PricingService.calculatePrice 单一口径）：
+//   航班开了 businessPriceLinked 且本舱位是商务舱时：现价 = 经济舱当前售价 + 航班升舱差价；
+//   经济舱缺价（无经济舱舱位 / 现价 ≤0）→ fallback（回退商务舱自身现价，调用方据此提示）。
+//   非联动 / 非商务舱 → 返回 null，调用方走原有 seatCurrentPrice / basePrice 逻辑。
+function linkedBusinessPrice(
+  flight: AdminFlight,
+  schedule: AdminSchedule,
+  seat: ScheduleSeat,
+): { price: number; fallback: boolean } | null {
+  if (seat.cabin !== 'BUSINESS' || !flight.businessPriceLinked) return null;
+  const econ = getCabin(schedule, 'ECONOMY');
+  const econUnit = econ ? seatCurrentPrice(econ) : 0;
+  if (econUnit > 0) return { price: econUnit + flight.businessUpgradeCnyPerLeg, fallback: false };
+  return { price: seatCurrentPrice(seat), fallback: true };
 }
 
 // 一个班次是否有阶梯（任一舱位设了 fareBuckets 即视为"阶梯"定价）。
@@ -537,6 +575,7 @@ function monthKeyOf(date: Date): string {
 
 // ── 班次：月历库存视图 + 列表（替代原"每天一行"长表）──────────────────
 function SchedulesList({
+  flight,
   schedules,
   flightNumber,
   originCode,
@@ -544,6 +583,7 @@ function SchedulesList({
   canEdit,
   onRefresh,
 }: {
+  flight: AdminFlight;
   schedules: AdminSchedule[] | null;
   flightNumber: string;
   originCode: string;
@@ -671,6 +711,7 @@ function SchedulesList({
 
       {view === 'calendar' ? (
         <MonthCalendar
+          flight={flight}
           schedules={schedules}
           byDay={byDay}
           canEdit={canEdit}
@@ -682,6 +723,7 @@ function SchedulesList({
         />
       ) : (
         <SchedulesTable
+          flight={flight}
           schedules={schedules}
           originCode={originCode}
           destinationCode={destinationCode}
@@ -697,6 +739,7 @@ function SchedulesList({
 
 // ── 列表视图（保留原表格，行为不变）─────────────────────────────────────
 function SchedulesTable({
+  flight,
   schedules,
   originCode,
   destinationCode,
@@ -705,6 +748,7 @@ function SchedulesTable({
   exportingFull,
   onExportFull,
 }: {
+  flight: AdminFlight;
   schedules: AdminSchedule[];
   originCode: string;
   destinationCode: string;
@@ -809,13 +853,33 @@ function SchedulesTable({
                       {(s.seatClasses ?? []).map((c) => {
                         const remaining = c.available;
                         const isLow = isSeatLow(remaining, c.capacity);
+                        const linked = linkedBusinessPrice(flight, s, c);
+                        const priceText = linked
+                          ? `¥${linked.price.toFixed(0)}`
+                          : `¥${(Number(c.basePrice) || 0).toFixed(0)}`;
                         return (
                           <li key={c.id}>
                             {CABIN_LABEL[c.cabin] ?? c.cabin}:{' '}
                             <span className={isLow ? 'font-medium text-rose-600' : 'font-medium text-ink'}>
                               {remaining}
                             </span>
-                            /<span className="font-medium text-ink">{c.capacity}</span> · ¥{(Number(c.basePrice) || 0).toFixed(0)}
+                            /<span className="font-medium text-ink">{c.capacity}</span> · {priceText}
+                            {linked && !linked.fallback && (
+                              <span
+                                className="ml-1 text-[10px] text-brand"
+                                title="商务舱价格联动经济舱：经济舱现价 + 航班升舱差价"
+                              >
+                                联动
+                              </span>
+                            )}
+                            {linked?.fallback && (
+                              <span
+                                className="ml-1 text-[10px] text-amber-600"
+                                title="经济舱缺价，已回退商务舱自身价"
+                              >
+                                联动回退
+                              </span>
+                            )}
                             {isLow && <span className="ml-1 text-xs text-rose-600">余位紧张</span>}
                           </li>
                         );
@@ -872,6 +936,7 @@ function SchedulesTable({
 
 // ── 月历视图（一次一个月，◀ ▶ 切月）─────────────────────────────────────
 function MonthCalendar({
+  flight,
   schedules,
   byDay,
   canEdit,
@@ -881,6 +946,7 @@ function MonthCalendar({
   exportingFull,
   onExportFull,
 }: {
+  flight: AdminFlight;
   schedules: AdminSchedule[];
   byDay: Map<string, AdminSchedule[]>;
   canEdit: boolean;
@@ -1063,6 +1129,7 @@ function MonthCalendar({
 
       {selectedDay && (byDay.get(selectedDay)?.length ?? 0) > 0 && (
         <DayCellEditor
+          flight={flight}
           ymd={selectedDay}
           schedules={byDay.get(selectedDay) ?? []}
           canEdit={canEdit}
@@ -1080,6 +1147,7 @@ function MonthCalendar({
 
 // ── 某一天的内联编辑器（改经济/商务价 + 下架/重新上架 + 导出整班订单）────────
 function DayCellEditor({
+  flight,
   ymd,
   schedules,
   canEdit,
@@ -1090,6 +1158,7 @@ function DayCellEditor({
   exportingFull,
   onExportFull,
 }: {
+  flight: AdminFlight;
   ymd: string;
   schedules: AdminSchedule[];
   canEdit: boolean;
@@ -1112,6 +1181,7 @@ function DayCellEditor({
         {schedules.map((s) => (
           <DaySchedule
             key={s.id}
+            flight={flight}
             schedule={s}
             canEdit={canEdit}
             onSaved={onSaved}
@@ -1127,6 +1197,7 @@ function DayCellEditor({
 }
 
 function DaySchedule({
+  flight,
   schedule,
   canEdit,
   onSaved,
@@ -1135,6 +1206,7 @@ function DaySchedule({
   exportingFull,
   onExportFull,
 }: {
+  flight: AdminFlight;
   schedule: AdminSchedule;
   canEdit: boolean;
   onSaved: () => Promise<void> | void;
@@ -1146,6 +1218,8 @@ function DaySchedule({
   const tokens = useAuth((s) => s.tokens);
   const econ = getCabin(schedule, 'ECONOMY');
   const biz = getCabin(schedule, 'BUSINESS');
+  // 商务舱价格联动经济舱：开启后商务舱 basePrice 不参与计价（派生 = 经济舱现价 + 航班升舱差价）。
+  const bizLinked = biz ? linkedBusinessPrice(flight, schedule, biz) : null;
 
   const [econPrice, setEconPrice] = useState<number | null>(econ ? (Number(econ.basePrice) || 0) : null);
   const [bizPrice, setBizPrice] = useState<number | null>(biz ? (Number(biz.basePrice) || 0) : null);
@@ -1471,25 +1545,42 @@ function DaySchedule({
       {(econ || biz) && (
         <div className="mt-2 flex flex-wrap gap-2">
           {[econ, biz].filter((c): c is ScheduleSeat => Boolean(c)).map((seat) => {
-            const ladder = hasLadder(seat.fareBuckets);
-            const price = seatCurrentPrice(seat);
-            const tierIdx = hasLadder(seat.fareBuckets)
-              ? currentLadderTierIndex(seat.fareBuckets, seat.sold)
-              : -1;
+            // 商务舱联动开启：现价由「经济舱现价 + 航班升舱差价」派生，不看自身阶梯/basePrice。
+            const linked = linkedBusinessPrice(flight, schedule, seat);
+            const ladder = !linked && hasLadder(seat.fareBuckets);
+            const price = linked ? linked.price : seatCurrentPrice(seat);
+            const tierIdx =
+              !linked && hasLadder(seat.fareBuckets)
+                ? currentLadderTierIndex(seat.fareBuckets, seat.sold)
+                : -1;
             return (
               <span
                 key={seat.cabin}
                 className={`inline-flex items-baseline gap-1 rounded-md px-2.5 py-1 text-xs ${
-                  ladder ? 'bg-brand-50 text-brand-800' : 'bg-emerald-50 text-emerald-800'
+                  linked
+                    ? 'bg-indigo-50 text-indigo-800'
+                    : ladder
+                      ? 'bg-brand-50 text-brand-800'
+                      : 'bg-emerald-50 text-emerald-800'
                 }`}
               >
                 <span className="text-ink-muted">{CABIN_LABEL[seat.cabin] ?? seat.cabin}当前售价</span>
                 <span className="text-sm font-bold">¥{price.toFixed(0)}</span>
-                {ladder ? (
-                  <span className="text-[11px] font-medium">· 阶梯第{tierIdx + 1}档</span>
-                ) : (
-                  <span className="text-[11px] font-medium">· 固定价</span>
+                {linked && !linked.fallback && (
+                  <span
+                    className="text-[11px] font-medium"
+                    title={`= 经济舱现价 + 升舱差价 ¥${flight.businessUpgradeCnyPerLeg}`}
+                  >
+                    · 联动经济舱
+                  </span>
                 )}
+                {linked?.fallback && (
+                  <span className="text-[11px] font-medium text-amber-700" title="经济舱缺价，已回退商务舱自身价">
+                    · 联动回退
+                  </span>
+                )}
+                {!linked && ladder && <span className="text-[11px] font-medium">· 阶梯第{tierIdx + 1}档</span>}
+                {!linked && !ladder && <span className="text-[11px] font-medium">· 固定价</span>}
               </span>
             );
           })}
@@ -1529,10 +1620,30 @@ function DaySchedule({
             <div className="space-y-2">
               <div>
                 <label className="label">
-                  {hasLadder(biz.fareBuckets) ? '商务舱基础价（未设阶梯时生效）(¥)' : '商务舱价 (¥)'}
+                  {bizLinked
+                    ? '商务舱价（联动经济舱，只读）(¥)'
+                    : hasLadder(biz.fareBuckets)
+                      ? '商务舱基础价（未设阶梯时生效）(¥)'
+                      : '商务舱价 (¥)'}
                 </label>
-                <NumberInput min={0} className="input" value={bizPrice} onChange={(n) => setBizPrice(n)} />
-                {hasLadder(biz.fareBuckets) && (
+                <NumberInput
+                  min={0}
+                  className="input"
+                  value={bizLinked ? bizLinked.price : bizPrice}
+                  onChange={(n) => setBizPrice(n)}
+                  disabled={Boolean(bizLinked)}
+                />
+                {bizLinked && !bizLinked.fallback && (
+                  <p className="mt-0.5 text-[11px] text-indigo-700">
+                    已联动经济舱：现价 = 经济舱现价 + 升舱差价 ¥{flight.businessUpgradeCnyPerLeg}（在「💺 升舱/联动」里改）。
+                  </p>
+                )}
+                {bizLinked?.fallback && (
+                  <p className="mt-0.5 text-[11px] text-amber-700">
+                    已开联动但经济舱缺价，暂回退商务舱自身价。请先给经济舱设价。
+                  </p>
+                )}
+                {!bizLinked && hasLadder(biz.fareBuckets) && (
                   <p className="mt-0.5 text-[11px] text-ink-muted">
                     当前按阶梯出售，此价仅在清除阶梯后才生效。
                   </p>
@@ -2090,6 +2201,80 @@ function BulkEditPanel({
           <button type="button" className="btn-secondary" onClick={onClose}>取消</button>
           <button type="submit" className="btn-primary" disabled={submitting || matched.length === 0}>
             {submitting ? `处理中 ${progress.done}/${progress.total}...` : `执行（${matched.length} 个班次）`}
+          </button>
+        </div>
+      </form>
+    </section>
+  );
+}
+
+// ── 航班级：升舱差价（单一配置源）+ 商务舱价格联动开关 ──
+function FlightBusinessLinkEditor({
+  flight,
+  onCancel,
+  onSaved,
+}: {
+  flight: AdminFlight;
+  onCancel: () => void;
+  onSaved: () => Promise<void> | void;
+}) {
+  const tokens = useAuth((s) => s.tokens);
+  const [upgrade, setUpgrade] = useState<number | null>(flight.businessUpgradeCnyPerLeg);
+  const [linked, setLinked] = useState<boolean>(flight.businessPriceLinked);
+  const [err, setErr] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+
+  const onSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!tokens || saving) return;
+    setErr(null);
+    setSaving(true);
+    try {
+      await api.updateFlight(tokens.accessToken, flight.id, {
+        businessUpgradeCnyPerLeg: upgrade ?? 0,
+        businessPriceLinked: linked,
+      });
+      await onSaved();
+    } catch (error) {
+      setErr(error instanceof ApiError ? error.message : '保存失败');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <section className="mt-3 rounded-lg border border-brand/30 bg-slate-50 p-4">
+      <div className="flex items-center justify-between">
+        <h3 className="font-medium text-slate-900">升舱差价 / 商务舱价格联动 · {flight.flightNumber}</h3>
+        <button type="button" className="text-slate-400 hover:text-slate-700 text-xl" onClick={onCancel}>
+          ×
+        </button>
+      </div>
+      <form className="mt-3 grid gap-4 sm:grid-cols-2" onSubmit={onSubmit}>
+        <div>
+          <label className="label">升舱差价（¥/程/座）</label>
+          <NumberInput min={0} className="input" value={upgrade} onChange={(n) => setUpgrade(n)} integerOnly />
+          <p className="mt-0.5 text-[11px] text-ink-muted">
+            经济舱→商务舱每航段加价。既用于本航班商务舱价格联动，也是「跟随航班」套餐升舱的取值来源（一处配置、两处生效）。
+          </p>
+        </div>
+        <div>
+          <label className="label">商务舱价格联动经济舱</label>
+          <label className="mt-1 flex items-center gap-2 text-sm text-ink">
+            <input type="checkbox" checked={linked} onChange={(e) => setLinked(e.target.checked)} />
+            开启后，本航班所有班次的商务舱现价 = 经济舱当前售价 + 升舱差价
+          </label>
+          <p className="mt-0.5 text-[11px] text-ink-muted">
+            开启后无需再逐班次改商务舱价；改经济舱价，商务舱自动跟随。经济舱缺价时暂回退商务舱自身价。
+          </p>
+        </div>
+        {err && <div className="sm:col-span-2 rounded-md bg-red-50 px-3 py-2 text-xs text-red-700">{err}</div>}
+        <div className="sm:col-span-2 flex justify-end gap-3">
+          <button type="button" className="btn-secondary" onClick={onCancel} disabled={saving}>
+            取消
+          </button>
+          <button type="submit" className="btn-primary" disabled={saving}>
+            {saving ? '保存中…' : '保存'}
           </button>
         </div>
       </form>

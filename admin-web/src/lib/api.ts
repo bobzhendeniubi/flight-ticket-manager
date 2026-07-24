@@ -172,6 +172,10 @@ export interface AdminFlight {
   destinationCode: string;
   aircraftType: string | null;
   isActive: boolean;
+  // 升舱差价（¥/程/座，单一配置源）：既供本航班「商务舱价格联动」派生，也供「跟随航班」的套餐升舱取值。
+  businessUpgradeCnyPerLeg: number;
+  // 商务舱价格联动经济舱：开启后商务舱现价 = 经济舱当前售价 + businessUpgradeCnyPerLeg（自身 basePrice 不参与）。
+  businessPriceLinked: boolean;
   scheduleCount: number;
   createdAt: string;
 }
@@ -352,6 +356,64 @@ export interface RosterParsedRow {
 export interface ParseRosterResult {
   rows: RosterParsedRow[];
   warnings: string[];
+}
+
+// ── 旧系统表格导入（批量创单预览）：POST /orders/batch-import/parse ────────
+/** 导入表格里的一条航段（去程/返程）+ 班次匹配结果。*/
+export interface OrderImportLeg {
+  kind: 'outbound' | 'inbound';
+  flightNo: string;
+  /** YYYY-MM-DD；解析失败 → null（行级错误已列）。*/
+  date: string | null;
+  /** 唯一匹配到的班次；查无/多班 → null。*/
+  scheduleId: string | null;
+  flightId: string | null;
+}
+/** 导入表格的一行（一位乘客）：标准化字段 + 行级错误/提醒。*/
+export interface OrderImportParsedRow {
+  /** Excel 行号（含表头行，报错定位用）。*/
+  rowNumber: number;
+  agentText: string;
+  cabinText: string;
+  cabin: CabinClass | null;
+  settlementPriceCny: number | null;
+  legs: OrderImportLeg[];
+  passenger: {
+    chineseName?: string;
+    fullName?: string;
+    lastName?: string;
+    firstName?: string;
+    gender?: 'M' | 'F';
+    dateOfBirth?: string;
+    nationality?: string;
+    documentType?: 'PASSPORT' | 'ID_CARD';
+    documentNumber?: string;
+    passportIssueDate?: string;
+    passportExpiry?: string;
+    infantCompanion?: string;
+    note?: string;
+  };
+  errors: string[];
+  warnings: string[];
+}
+export interface OrderImportBatchLeg {
+  flightNo: string;
+  date: string;
+  flightId: string | null;
+  scheduleId: string | null;
+}
+export interface OrderImportParseResult {
+  template: 'ONEWAY' | 'ROUNDTRIP';
+  rows: OrderImportParsedRow[];
+  warnings: string[];
+  /** 批次汇总（以首行为准）：前端据此选中航班/日期/舱位/代理/结算价。*/
+  batch: {
+    outbound: OrderImportBatchLeg | null;
+    inbound: OrderImportBatchLeg | null;
+    cabin: CabinClass | null;
+    agent: { text: string; agentId: string | null; candidates: Array<{ id: string; label: string }> } | null;
+    settlementPriceCny: number | null;
+  };
 }
 export interface BatchCreateOrdersResult {
   successCount: number;
@@ -1650,8 +1712,8 @@ export interface Bundle {
   returnFlight: BundleFlightRef | null;
   /** 自愿升级：一个人住酒店（单人入住）每人每晚加价（CNY/晚，整数） */
   singleSupplementCnyPerNight: number;
-  /** 自愿升级：升舱商务每人每航段加价（CNY/程，整数） */
-  businessUpgradeCnyPerLeg: number;
+  /** 自愿升级：升舱商务每人每航段加价（CNY/程，整数）。null = 跟随航班（取绑定航班的每程差价） */
+  businessUpgradeCnyPerLeg: number | null;
   /** 占座儿童比成人每人便宜多少（CNY/人，整数，默认 30） */
   childSeatDiscountCnyPerPerson: number;
   /** 不占座婴儿每人价（CNY/人，整数，默认 0） */
@@ -2116,6 +2178,12 @@ export const api = {
   ) => apiFetch<{ flight: AdminFlight }>('/flights/', { method: 'POST', token, body }),
   toggleFlight: (token: string, flightId: string) =>
     apiFetch<{ flight: AdminFlight }>(`/flights/${flightId}/toggle`, { method: 'POST', token }),
+  // 航班级编辑：升舱差价（¥/程/座，单一配置源）+ 商务舱价格联动开关。只传要改的字段。
+  updateFlight: (
+    token: string,
+    flightId: string,
+    body: { businessUpgradeCnyPerLeg?: number; businessPriceLinked?: boolean },
+  ) => apiFetch<{ flight: AdminFlight }>(`/flights/${flightId}`, { method: 'PATCH', token, body }),
   listSchedules: (token: string, flightId: string) =>
     apiFetch<{ schedules: AdminSchedule[] }>(`/flights/${flightId}/schedules`, { token }),
   // 跨日期区间拉取所有航班班次（座位统计用）。省略 from/to 则返回全部。
@@ -2371,6 +2439,14 @@ export const api = {
   // 解析上传的名单 Excel（base64）→ 乘客行 + 警告（缺字段/格式问题）；ADMIN/STAFF only。
   parseRoster: (token: string, fileBase64: string) =>
     apiFetch<ParseRosterResult>('/orders/roster/parse', {
+      method: 'POST',
+      token,
+      body: { fileBase64 },
+    }),
+  // 旧系统表格导入解析（.xlsx base64，单程 16 列 / 往返 18 列模版）→ 行级解析 + 班次/代理匹配 + 批次汇总。
+  // 纯预览不落库；创建仍走 batchCreateOrders。ADMIN/STAFF/AGENT（代理上传时结算价/代理列被后端忽略）。
+  parseOrderImport: (token: string, fileBase64: string) =>
+    apiFetch<OrderImportParseResult>('/orders/batch-import/parse', {
       method: 'POST',
       token,
       body: { fileBase64 },

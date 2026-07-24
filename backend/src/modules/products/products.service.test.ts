@@ -522,9 +522,10 @@ describe('ProductsService · 套餐含酒店组件必须关联房型（create + 
   });
 });
 
-describe('ProductsService · businessUpgradeCnyPerLeg 默认值（0702 反馈：留空=不提供升舱，非 DB 默认 ¥700）', () => {
-  // 0702 反馈：运营把「留空」当成「用默认 ¥700」，还把这 700 错当成起价的一部分。
-  // createBundle 现在显式写 0（不再让 DB @default(700) 生效）；updateBundle 保持原「省略=保留现值」不变。
+describe('ProductsService · businessUpgradeCnyPerLeg（留空=跟随航班/null；显式数值=套餐自有覆盖，含 0=不提供升舱）', () => {
+  // 升舱差价单一配置源挪到航班级：套餐留空 → 落 null =「跟随航班」（计价时取绑定航班的每程差价）。
+  // 显式数值 = 套餐自有覆盖（含 0 = 不提供升舱）。createBundle 省略/传 null → null；
+  // updateBundle 省略=保留现值、显式给值（含 null / 0）才写入。
   beforeEach(() => {
     vi.clearAllMocks();
     mockPrisma.flightSeatClass.findMany.mockResolvedValue([]);
@@ -532,7 +533,7 @@ describe('ProductsService · businessUpgradeCnyPerLeg 默认值（0702 反馈：
 
   const flightOnlyItem = { kind: 'FLIGHT' as const, productName: '去程', qty: 1, unitPrice: 0 };
 
-  it('createBundle：省略 businessUpgradeCnyPerLeg → 显式落库 0（不落 DB 默认 700）', async () => {
+  it('createBundle：省略 businessUpgradeCnyPerLeg → 落库 null（跟随航班）', async () => {
     mockPrisma.bundle.findFirst.mockResolvedValueOnce(null);
     mockPrisma.bundle.create.mockImplementationOnce(async ({ data }: { data: Record<string, unknown> }) => ({
       id: 'bundle-1',
@@ -579,13 +580,13 @@ describe('ProductsService · businessUpgradeCnyPerLeg 默认值（0702 反馈：
       // businessUpgradeCnyPerLeg 省略
     });
 
-    expect(result.businessUpgradeCnyPerLeg).toBe(0);
+    expect(result.businessUpgradeCnyPerLeg).toBeNull();
     expect(mockPrisma.bundle.create).toHaveBeenCalledWith(
-      expect.objectContaining({ data: expect.objectContaining({ businessUpgradeCnyPerLeg: 0 }) }),
+      expect.objectContaining({ data: expect.objectContaining({ businessUpgradeCnyPerLeg: null }) }),
     );
   });
 
-  it('createBundle：businessUpgradeCnyPerLeg 显式传 null → 同样落库 0', async () => {
+  it('createBundle：businessUpgradeCnyPerLeg 显式传 null → 落库 null（跟随航班）', async () => {
     mockPrisma.bundle.findFirst.mockResolvedValueOnce(null);
     mockPrisma.bundle.create.mockImplementationOnce(async ({ data }: { data: Record<string, unknown> }) => ({
       id: 'bundle-1',
@@ -632,9 +633,9 @@ describe('ProductsService · businessUpgradeCnyPerLeg 默认值（0702 反馈：
       businessUpgradeCnyPerLeg: null,
     });
 
-    expect(result.businessUpgradeCnyPerLeg).toBe(0);
+    expect(result.businessUpgradeCnyPerLeg).toBeNull();
     expect(mockPrisma.bundle.create).toHaveBeenCalledWith(
-      expect.objectContaining({ data: expect.objectContaining({ businessUpgradeCnyPerLeg: 0 }) }),
+      expect.objectContaining({ data: expect.objectContaining({ businessUpgradeCnyPerLeg: null }) }),
     );
   });
 

@@ -176,6 +176,9 @@ const PRICE_TOLERANCE_CNY = 1.0;
 const PASSPORT_EXPIRY_BLOCK_DAYS = 90; // 不足 90 天禁止下单
 const PASSPORT_EXPIRY_SURCHARGE_DAYS = 180; // 不足 6 个月加收附加费
 const NEAR_EXPIRY_SURCHARGE_CNY = 200; // 每位临期乘客附加费
+// 升舱差价兜底（¥/程/座）：套餐 businessUpgradeCnyPerLeg=null（跟随航班）但两趟都没绑到航班时使用，
+// 与 Flight.businessUpgradeCnyPerLeg 的 schema 默认值一致，绝不让升舱派生出 0/裸价。
+const DEFAULT_BUSINESS_UPGRADE_CNY_PER_LEG = 700;
 
 /**
  * 剥离 FLIGHT 行 metadata 里客户端可能伪造的 businessUpgradeCount（HIGH 修复）。
@@ -1462,7 +1465,11 @@ export class OrderService {
             hotelNights: true,
             // 可选升级加价费率（server-priced，按产品可配置）+ 航段数
             singleSupplementCnyPerNight: true,
+            // 升舱差价：null = 「跟随航班」→ 取绑定航班 Flight.businessUpgradeCnyPerLeg（下方解析）；
+            //           非 null = 套餐自有覆盖（含 0）。
             businessUpgradeCnyPerLeg: true,
+            outboundFlight: { select: { businessUpgradeCnyPerLeg: true } },
+            returnFlight: { select: { businessUpgradeCnyPerLeg: true } },
             // 占座儿童折扣 / 婴儿价（server-priced，按产品可配置）
             childSeatDiscountCnyPerPerson: true,
             infantPriceCny: true,
@@ -1625,8 +1632,13 @@ export class OrderService {
         //   升舱商务加价 = businessCount × businessUpgradeCnyPerLeg × legs
         //     —— 这是客户升舱的「总加价」（不是在全价商务票之上再加 ¥700）。客户机票仍按经济舱套餐价收，
         //        差价由商家补贴；升舱只占用真实商务舱库存（不超售），见下方按经济舱航段拆座逻辑。
+        // 升舱差价单一配置源：套餐 businessUpgradeCnyPerLeg=null → 「跟随航班」，按该套餐绑定航班
+        //   （去程优先、回程次之）的 Flight.businessUpgradeCnyPerLeg 取每程差价（往返同程对称，× legs）；
+        //   两趟都没绑到航班时兜底 DEFAULT_BUSINESS_UPGRADE_CNY_PER_LEG，绝不派生出 0/裸价。
+        //   非 null → 套餐自有覆盖（含 0 = 显式不提供升舱），行为不变。
+        const effectiveBusinessUpgradeCnyPerLeg = resolveBundleBusinessUpgradeRate(bundle);
         const addOn = computeBundleAddOn(
-          bundle,
+          { ...bundle, businessUpgradeCnyPerLeg: effectiveBusinessUpgradeCnyPerLeg },
           hotelStamp,
           derivedSingleCount,
           item.businessCount,
@@ -6734,6 +6746,26 @@ export function derivePerPaxBundleOptions(
     ? (passengers?.filter((px) => px.singleRoom === true).length ?? 0)
     : item.singleCount;
   return { selfProvidedVisaCount, singleCount };
+}
+
+/**
+ * 套餐升舱差价单一配置源解析（¥/程/座；纯函数，导出供单测与 createOrder/quoteOrder 共用）。
+ *   · 套餐 businessUpgradeCnyPerLeg 非 null（含 0）→ 套餐自有覆盖，直接用。
+ *   · null =「跟随航班」→ 取该套餐绑定航班的每程差价：去程优先、回程次之
+ *     （往返同程对称，computeBundleAddOn 再 × legs 得总加价）。
+ *   · 两趟都没绑到航班（或未 include）→ 兜底 DEFAULT_BUSINESS_UPGRADE_CNY_PER_LEG，绝不派生出 0/裸价。
+ */
+export function resolveBundleBusinessUpgradeRate(bundle: {
+  businessUpgradeCnyPerLeg: number | null;
+  outboundFlight?: { businessUpgradeCnyPerLeg: number } | null;
+  returnFlight?: { businessUpgradeCnyPerLeg: number } | null;
+}): number {
+  return (
+    bundle.businessUpgradeCnyPerLeg ??
+    bundle.outboundFlight?.businessUpgradeCnyPerLeg ??
+    bundle.returnFlight?.businessUpgradeCnyPerLeg ??
+    DEFAULT_BUSINESS_UPGRADE_CNY_PER_LEG
+  );
 }
 
 export function computeBundleAddOn(

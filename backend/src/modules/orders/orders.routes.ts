@@ -76,6 +76,12 @@ import {
   parseRosterXlsx,
   rosterTemplateFilename,
 } from './roster.js';
+import {
+  buildOrderImportMatchDeps,
+  OrderImportError,
+  parseOrderImportXlsx,
+  resolveOrderImport,
+} from './orders.import.js';
 
 // ── 出纳「预期到账金额」上限（CNY，整单总额）──────────────────────────────
 // 取 40_000_000 的依据（非拍脑袋）：
@@ -300,6 +306,51 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         targetId: 'roster-parse',
         targetLabel: `名单解析 ${result.rows.length} 行`,
         after: { rowCount: result.rows.length, warningCount: result.warnings.length },
+      });
+      return result;
+    },
+  );
+
+  // ── 旧系统表格导入解析（批量录单预览）────────────────────────────
+  // POST /orders/batch-import/parse — ADMIN/STAFF/AGENT
+  // body { fileBase64 }（旧系统单程 16 列 / 往返 18 列模版 .xlsx）
+  //   → { template, rows（行级解析+班次/代理匹配+错误）, warnings, batch（首行汇总） }
+  // 纯解析预览，不落库；创建仍走 POST /orders/batch。
+  // 代理身份上传：结算价格 / 选择代理两列忽略并提示（结算价由系统按代理价计算，归属自动为本代理）。
+  app.post(
+    '/batch-import/parse',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT)] },
+    async (req) => {
+      const body = z
+        .object({ fileBase64: z.string().min(1, 'fileBase64 必填') })
+        .parse(req.body);
+      const isOpsUpload = req.user.role === UserRole.ADMIN || req.user.role === UserRole.STAFF;
+      let parsed;
+      try {
+        parsed = await parseOrderImportXlsx(body.fileBase64);
+      } catch (e) {
+        // 坏文件/超大/.xls/表头对不上 → 400 带中文原因（绝不 500）
+        throw new BadRequestError(
+          e instanceof OrderImportError
+            ? e.message
+            : '表格文件无法解析，请确认为有效的 .xlsx 文件（旧 .xls 请先另存为 .xlsx）',
+        );
+      }
+      const result = await resolveOrderImport(parsed, buildOrderImportMatchDeps(), {
+        includeSettlement: isOpsUpload,
+        includeAgent: isOpsUpload,
+      });
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'PARSE_ORDER_IMPORT',
+        targetType: 'ORDER',
+        targetId: 'batch-import-parse',
+        targetLabel: `表格导入解析 ${result.rows.length} 行（${result.template === 'ROUNDTRIP' ? '往返' : '单程'}模版）`,
+        after: {
+          rowCount: result.rows.length,
+          errorRowCount: result.rows.filter((r) => r.errors.length > 0).length,
+          warningCount: result.warnings.length,
+        },
       });
       return result;
     },

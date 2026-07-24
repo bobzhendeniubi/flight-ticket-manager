@@ -98,6 +98,7 @@ import {
   assertVisaPassengersHavePassportExpiry,
   resolveBundleHotelStamp,
   computeBundleAddOn,
+  resolveBundleBusinessUpgradeRate,
   computeBundleSeatSplit,
   computeRequiredPassengerCount,
   resolveBundleOccupancy,
@@ -715,6 +716,48 @@ describe('resolveBundleOccupancy', () => {
   it('行字段优先于 metadata（显式 1 大覆盖 metadata.pax=5）', () => {
     const o = resolveBundleOccupancy({ adultCount: 1, metadata: { pax: 5 } });
     expect(o).toMatchObject({ adultCount: 1, seatPax: 1, headCount: 1 });
+  });
+});
+
+// ── 套餐升舱差价单一配置源解析：resolveBundleBusinessUpgradeRate ─────────────
+describe('resolveBundleBusinessUpgradeRate（¥/程/座；null=跟随航班，非 null=套餐覆盖）', () => {
+  it('套餐自有非 null（含 0）→ 直接用套餐值，忽略航班', () => {
+    expect(
+      resolveBundleBusinessUpgradeRate({
+        businessUpgradeCnyPerLeg: 900,
+        outboundFlight: { businessUpgradeCnyPerLeg: 700 },
+        returnFlight: { businessUpgradeCnyPerLeg: 700 },
+      }),
+    ).toBe(900);
+    // 0 = 显式不提供升舱，是有效覆盖，不能被航班值顶替
+    expect(
+      resolveBundleBusinessUpgradeRate({
+        businessUpgradeCnyPerLeg: 0,
+        outboundFlight: { businessUpgradeCnyPerLeg: 700 },
+      }),
+    ).toBe(0);
+  });
+
+  it('套餐 null（跟随航班）→ 去程优先、回程次之', () => {
+    expect(
+      resolveBundleBusinessUpgradeRate({
+        businessUpgradeCnyPerLeg: null,
+        outboundFlight: { businessUpgradeCnyPerLeg: 1400 },
+        returnFlight: { businessUpgradeCnyPerLeg: 800 },
+      }),
+    ).toBe(1400);
+    // 去程未绑 → 回退回程
+    expect(
+      resolveBundleBusinessUpgradeRate({
+        businessUpgradeCnyPerLeg: null,
+        outboundFlight: null,
+        returnFlight: { businessUpgradeCnyPerLeg: 800 },
+      }),
+    ).toBe(800);
+  });
+
+  it('套餐 null 且两趟都没绑航班 → 兜底默认 700（绝不派生 0/裸价）', () => {
+    expect(resolveBundleBusinessUpgradeRate({ businessUpgradeCnyPerLeg: null })).toBe(700);
   });
 });
 

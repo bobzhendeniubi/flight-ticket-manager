@@ -10,7 +10,7 @@ import { exportToCSV } from '../lib/csvExport';
 import { AIRPORTS } from '../lib/airports';
 import { NumberInput } from '../components/NumberInput';
 import { parseOtaRoster } from '../lib/parseOtaRoster';
-import type { AgentListItem } from '../lib/api';
+import type { AgentListItem, OrderImportParseResult } from '../lib/api';
 import { OrderFinanceSection } from '../components/OrderFinanceSection';
 import { OrderAuditTrail } from '../components/OrderAuditTrail';
 import { SingleOrderModal } from '../components/SingleOrderModal';
@@ -6045,6 +6045,11 @@ interface BatchRow {
   passportExpiry?: string;
   /** 订座编码（PNR）：OTA 名单识别到唯一编码时全员同值（一码多人），随提交落 Passenger.pnr。 */
   pnr?: string;
+  // ── 旧系统表格导入带出的补充字段（选填；随提交发给后端）─────────────────
+  /** 中文姓名（表格导入「中文姓名」列；fullName 可能是 PNR 姓名时单独保留） */
+  chineseName?: string;
+  /** 护照签发日期（YYYY-MM-DD，表格导入「签发日期」列） */
+  passportIssueDate?: string;
 }
 
 /**
@@ -6146,6 +6151,13 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   const [templateBusy, setTemplateBusy] = useState(false);
   const [rosterBusy, setRosterBusy] = useState(false);
   const [rosterWarnings, setRosterWarnings] = useState<string[]>([]);
+
+  // ── 旧系统表格导入（单程 16 列 / 往返 18 列模版）─────────────────────────
+  const [importBusy, setImportBusy] = useState(false);
+  // 行级错误（红字）：查无班次 / 缺必填 / 日期歧义等，修正前不宜提交
+  const [importErrors, setImportErrors] = useState<string[]>([]);
+  // 往返模版导入后回程班次自动选中（与出港 pendingSchedDate 同款机制）
+  const [pendingReturnSchedDate, setPendingReturnSchedDate] = useState('');
 
   // ── 提交 ──────────────────────────────────────────────────────────────────
   const [submitting, setSubmitting] = useState(false);
@@ -6258,6 +6270,21 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
     }
     setPendingSchedDate('');
   }, [outboundSchedules, pendingSchedDate, outboundScheduleId]);
+
+  // 表格导入后自动选中当日回程班次（与出港同款：恰 1 班选中 / 多班或无班提示）。
+  useEffect(() => {
+    if (!pendingReturnSchedDate || returnScheduleId) return;
+    if (returnSchedules.length === 0) return; // 班次尚未加载，等下次
+    const sameDay = returnSchedules.filter((s) => s.departureTime.slice(0, 10) === pendingReturnSchedDate);
+    if (sameDay.length === 1) {
+      setReturnScheduleId(sameDay[0].id);
+    } else if (sameDay.length > 1) {
+      setRosterWarnings((prev) => [...prev, `${pendingReturnSchedDate} 回程有多个班次，请手动选择班次`]);
+    } else {
+      setRosterWarnings((prev) => [...prev, `未找到 ${pendingReturnSchedDate} 的回程班次，请换个日期或手动选择`]);
+    }
+    setPendingReturnSchedDate('');
+  }, [returnSchedules, pendingReturnSchedDate, returnScheduleId]);
   const cabinOptions = outboundSchedule?.seatClasses ?? [];
   const selectedBundle = bundles.find((b) => b.id === bundleId);
 
@@ -6430,6 +6457,111 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
     reader.readAsDataURL(f);
   }
 
+  // ── 旧系统表格导入：解析结果 → 灌进批量创单表单（乘客行 + 航班/班次/舱位/代理/结算价）──
+  // 后端只做解析+匹配预览，创建仍走下方 submit 的 POST /orders/batch；行级错误红字展示，
+  // 操作人当场在表格里修正后再提交。
+  function applyOrderImport(res: OrderImportParseResult): void {
+    const warnings = [...res.warnings];
+    const errors: string[] = [];
+    for (const row of res.rows) {
+      for (const msg of row.errors) errors.push(`第 ${row.rowNumber} 行：${msg}`);
+      for (const msg of row.warnings) warnings.push(`第 ${row.rowNumber} 行：${msg}`);
+    }
+
+    // 产品类型：模版决定（单程/往返）；切换会清空旧选择，再由下方逐项填入
+    const pt: BatchProductType = res.template === 'ROUNDTRIP' ? 'FLIGHT_ROUNDTRIP' : 'FLIGHT_ONEWAY';
+    if (productType !== pt) switchProductType(pt);
+
+    // 乘客行：含中文姓名/签发日期/有效期等补充字段；婴儿同行成人并入备注
+    setRows(
+      res.rows.map((r) => ({
+        fullName: r.passenger.fullName ?? '',
+        documentNumber: r.passenger.documentNumber ?? '',
+        dateOfBirth: r.passenger.dateOfBirth ?? '',
+        nationality: r.passenger.nationality ?? 'CN',
+        chineseName: r.passenger.chineseName,
+        lastName: r.passenger.lastName,
+        firstName: r.passenger.firstName,
+        gender: r.passenger.gender,
+        passportIssueDate: r.passenger.passportIssueDate,
+        passportExpiry: r.passenger.passportExpiry,
+        note:
+          [r.passenger.note, r.passenger.infantCompanion ? `婴儿同行成人：${r.passenger.infantCompanion}` : '']
+            .filter(Boolean)
+            .join('；') || undefined,
+      })),
+    );
+
+    // 航班/班次：出港（班次加载后由 pendingSchedDate effect 自动选中当日班次）
+    const ob = res.batch.outbound;
+    if (ob?.flightId) {
+      setOutboundFlightId(ob.flightId);
+      setOutboundScheduleId('');
+      setOutboundDate(ob.date);
+      setPendingSchedDate(ob.date);
+    } else if (ob) {
+      warnings.push(`航班 ${ob.flightNo} ${ob.date} 未在航班库中找到，请手动选择航班与班次`);
+    }
+    // 回程（仅往返模版）
+    const ib = res.batch.inbound;
+    if (pt === 'FLIGHT_ROUNDTRIP') {
+      if (ib?.flightId) {
+        setReturnFlightId(ib.flightId);
+        setReturnScheduleId('');
+        setReturnDate(ib.date);
+        setPendingReturnSchedDate(ib.date);
+      } else if (ib) {
+        warnings.push(`回程航班 ${ib.flightNo} ${ib.date} 未在航班库中找到，请手动选择`);
+      }
+    }
+
+    // 舱位：解析结果；表格未填/未识别 → 默认经济舱（行级提醒已列）
+    setCabin(res.batch.cabin ?? 'ECONOMY');
+
+    // 归属代理：唯一匹配才自动选中（歧义/无匹配只提醒，绝不猜）；仅 ADMIN/STAFF
+    if (isOps && res.batch.agent?.agentId) {
+      setAgentId(res.batch.agent.agentId);
+      warnings.push(`已按表格「选择代理」自动选择归属代理，请确认`);
+    }
+
+    // 结算价：仅 ADMIN/STAFF 灌入团队结算价字段（代理上传时后端已忽略该列并提示）
+    if (isOps && res.batch.settlementPriceCny !== null) {
+      setSettlementPriceCny(res.batch.settlementPriceCny);
+    }
+
+    setImportErrors(errors);
+    setRosterWarnings(warnings);
+  }
+
+  function onImportTemplateFile(e: React.ChangeEvent<HTMLInputElement>): void {
+    const f = e.target.files?.[0];
+    e.target.value = '';
+    if (!f || !token) return;
+    if (/\.xls$/i.test(f.name)) {
+      setErr('旧版 .xls 文件请先在 Excel 里「另存为 .xlsx」再上传');
+      return;
+    }
+    if (f.size > 2 * 1024 * 1024) {
+      setErr('表格文件过大（>2MB），请精简后再传');
+      return;
+    }
+    setErr(null); setRosterWarnings([]); setImportErrors([]); setImportBusy(true);
+    const reader = new FileReader();
+    reader.onload = () => {
+      const dataUrl = typeof reader.result === 'string' ? reader.result : '';
+      const base64 = dataUrl.includes(',') ? dataUrl.slice(dataUrl.indexOf(',') + 1) : dataUrl;
+      if (!base64) { setErr('文件读取失败'); setImportBusy(false); return; }
+      api.parseOrderImport(token, base64)
+        .then((res) => applyOrderImport(res))
+        .catch((e2: unknown) => {
+          setErr(e2 instanceof ApiError ? `表格导入解析失败：${e2.message}` : '表格导入解析失败');
+        })
+        .finally(() => setImportBusy(false));
+    };
+    reader.onerror = () => { setErr('文件读取失败'); setImportBusy(false); };
+    reader.readAsDataURL(f);
+  }
+
   async function submit(): Promise<void> {
     setErr(null);
     if (validRows.length === 0) { setErr('至少要有一位完整乘客（姓名 + 护照号 + 出生日期）'); return; }
@@ -6531,6 +6663,9 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
         ...(r.gender ? { gender: r.gender } : {}),
         ...(r.passportIssueCountry?.trim() ? { passportIssueCountry: r.passportIssueCountry.trim() } : {}),
         ...(r.passportExpiry?.trim() ? { passportExpiry: r.passportExpiry.trim() } : {}),
+        // 表格导入带出的补充字段（手录时通常为空）
+        ...(r.chineseName?.trim() ? { chineseName: r.chineseName.trim() } : {}),
+        ...(r.passportIssueDate?.trim() ? { passportIssueDate: r.passportIssueDate.trim() } : {}),
         ...(r.pnr?.trim() ? { pnr: r.pnr.trim().toUpperCase() } : {}),
         note: r.note?.trim() || undefined,
       })),
@@ -6628,6 +6763,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                   setResult(null);
                   setRows([{ fullName: '', documentNumber: '', dateOfBirth: '', nationality: 'CN' }]);
                   setRosterWarnings([]);
+                  setImportErrors([]);
                   setOtaText('');
                   setManualUnitPriceCny(null);
                 }}
@@ -7069,6 +7205,16 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
               </div>
             </div>
 
+            {/* D 表格导入行级错误（红字）：修正前不宜提交 */}
+            {importErrors.length > 0 && (
+              <div className="rounded-md border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
+                <div className="font-medium">表格导入行级错误（{importErrors.length} 条）——请在上方名单中修正后再提交：</div>
+                <ul className="mt-1 max-h-32 list-disc space-y-0.5 overflow-auto pl-5">
+                  {importErrors.map((w, i) => <li key={i}>{w}</li>)}
+                </ul>
+              </div>
+            )}
+
             {/* D 解析提醒 */}
             {rosterWarnings.length > 0 && (
               <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
@@ -7136,7 +7282,19 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                   disabled={rosterBusy}
                 />
               </label>
-              <span className="text-[11px] text-slate-400">上传后自动填充下方名单；也可手动录入。</span>
+              <label className="btn-secondary cursor-pointer text-sm">
+                {importBusy ? '解析中…' : '导入表格（旧系统模版）'}
+                <input
+                  type="file"
+                  accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                  className="hidden"
+                  onChange={onImportTemplateFile}
+                  disabled={importBusy}
+                />
+              </label>
+              <span className="text-[11px] text-slate-400">
+                上传后自动填充下方名单；也可手动录入。旧系统模版（单程 16 列 / 往返 18 列）自动带出航班/舱位/代理/结算价；旧 .xls 请先在 Excel 里另存为 .xlsx。
+              </span>
             </div>
 
             {/* G 价格（选填）：旅游团结算价 / OTA 线上单结算价 */}

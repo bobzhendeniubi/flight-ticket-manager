@@ -39,6 +39,12 @@ export interface PriceResult {
   perSeatBreakdown: SeatBreakdown[];
   totalPrice: number;
   averageUnitPrice: number; // = round(totalPrice / qty)
+  // 商务舱价格联动经济舱（航班级单一配置源）：true = 本次商务舱价由「经济舱当前售价 + 航班升舱差价」派生
+  //（商务舱自身 basePrice/fareBuckets 不参与）。内部字段，公开端点 toPublicPrice 白名单不透出。
+  businessLinked?: boolean;
+  // true = 该航班开了联动，但经济舱缺价（无经济舱舱位 / 经济舱现价 ≤0）→ 已回退商务舱自身定价。
+  // UI 据此提示（避免前台出现「¥差价」裸价）。内部字段，不透出公开端点。
+  businessLinkFallback?: boolean;
 }
 
 export class PricingService {
@@ -55,7 +61,7 @@ export class PricingService {
     // 1. 查 FlightSeatClass
     const seatClass = await prisma.flightSeatClass.findFirst({
       where: { scheduleId, cabin },
-      include: { schedule: true },
+      include: { schedule: { include: { flight: true } } },
     });
     if (!seatClass) {
       throw new NotFoundError(`班次 ${scheduleId} 的 ${cabin} 舱位不存在`);
@@ -71,6 +77,51 @@ export class PricingService {
         `${cabin} 余票仅 ${available} 张，不够 ${qty} 张。` +
           (available > 0 ? `最多可购 ${available} 张。` : '已售罄。'),
       );
+    }
+
+    // ── 商务舱价格联动经济舱（航班级单一配置源，单一计价点注入）──────────────────────
+    // 航班开了 businessPriceLinked 时：商务舱现价 = 该班次经济舱当前售价（含仓位阶梯现价）+ 航班升舱差价，
+    // 商务舱自身 basePrice/fareBuckets 不参与计价（固定派生价，所见即所得，与 AUTO 同形）。
+    // 护栏：经济舱现价 >0 保证派生价 >0；经济舱缺价（无经济舱舱位 / 现价 ≤0）→ 回退商务舱自身定价并打标记。
+    // 未开联动 / 非商务舱 → 完全走原有逻辑（下方仓位阶梯 / 固定底价），行为与历史一致。
+    let businessLinkFallback = false;
+    const flight = seatClass.schedule.flight;
+    if (cabin === CabinClass.BUSINESS && flight?.businessPriceLinked) {
+      const economyUnit = await this.resolveEconomyCurrentUnit(scheduleId);
+      if (economyUnit != null) {
+        const upgrade = Math.max(0, flight.businessUpgradeCnyPerLeg);
+        const derivedUnit = economyUnit + upgrade; // economyUnit>0 → derivedUnit>0（护栏）
+        const perSeatBreakdown: SeatBreakdown[] = [];
+        let totalPrice = 0;
+        for (let i = 0; i < qty; i++) {
+          const seatIndex = sold + 1 + i; // 1-based
+          perSeatBreakdown.push({ seatIndex, bucket: 0, bucketMultiplier: 1, unitPrice: derivedUnit });
+          totalPrice += derivedUnit;
+        }
+        const dateRank = await this.resolveDateRank(
+          seatClass.schedule.departureTz,
+          seatClass.schedule.departureTime,
+        );
+        return {
+          scheduleId,
+          cabin,
+          qty,
+          pricingMode: 'AUTO', // 派生价即成交价，无阶梯/倍率
+          basePrice,
+          dateRank,
+          dateMultiplier: 1,
+          bucketSize: 0,
+          totalBuckets: 1,
+          currentBucket: 0,
+          currentBucketRemaining: capacity - sold,
+          perSeatBreakdown,
+          totalPrice,
+          averageUnitPrice: Math.round(totalPrice / qty),
+          businessLinked: true,
+        };
+      }
+      // 经济舱缺价 → 回退商务舱自身定价（下方分支），打标记供 UI 提示。
+      businessLinkFallback = true;
     }
 
     // ── 仓位阶梯模式（显式动态加价）─────────────────────────────────────────
@@ -98,6 +149,7 @@ export class PricingService {
         perSeatBreakdown: ladder.breakdown,
         totalPrice: ladder.totalPrice,
         averageUnitPrice: ladder.averageUnitPrice,
+        ...(businessLinkFallback ? { businessLinkFallback: true } : {}),
       };
     }
 
@@ -135,7 +187,31 @@ export class PricingService {
       perSeatBreakdown,
       totalPrice,
       averageUnitPrice,
+      ...(businessLinkFallback ? { businessLinkFallback: true } : {}),
     };
+  }
+
+  /**
+   * 解析某班次经济舱「当前售价」（下一张票 sold+1 的单价，与前台/后台展示口径一致）。
+   * 供商务舱价格联动派生使用（单一口径，避免各消费方各自复制）。
+   *   · 无经济舱舱位 → null（联动方回退商务舱自身定价）。
+   *   · 配了仓位阶梯 → 下一张票所在档价（含阶梯浮动后的现价）。
+   *   · 无阶梯 → round(basePrice)。
+   *   · 现价 ≤0（缺价）→ null，避免派生出「0 + 差价」的裸差价。
+   */
+  private async resolveEconomyCurrentUnit(scheduleId: string): Promise<number | null> {
+    const econ = await prisma.flightSeatClass.findFirst({
+      where: { scheduleId, cabin: CabinClass.ECONOMY },
+    });
+    if (!econ) return null;
+    const econBuckets = parseFareBuckets((econ as { fareBuckets?: unknown }).fareBuckets);
+    if (econBuckets) {
+      const ladder = computeLadderBreakdown({ fareBuckets: econBuckets, sold: econ.sold, qty: 1 });
+      const unit = ladder.breakdown[0]?.unitPrice ?? 0;
+      return unit > 0 ? unit : null;
+    }
+    const unit = Math.round(Number(econ.basePrice));
+    return unit > 0 ? unit : null;
   }
 
   /**
