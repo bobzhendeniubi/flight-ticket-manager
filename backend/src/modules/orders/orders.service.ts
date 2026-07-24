@@ -73,6 +73,7 @@ import {
 import { PRICE_ADJUSTMENT_CAP_CNY, PRICE_ADJUSTMENT_REASON_LABEL } from './orders.schemas.js';
 import type {
   BatchCreateOrdersBody,
+  AddGroundItemBody,
   CreateOrderBody,
   ListOrdersQuery,
   OrderItemInput,
@@ -591,6 +592,43 @@ export function computeSwapHotelCostSnapshot(input: {
     unitCostCny: input.newCostPriceCny,
     totalCostCny: Math.round(input.newCostPriceCny * input.nights * input.rooms),
   };
+}
+
+/**
+ * 订单详情补录 HOTEL/VISA 的收入与成本快照公式。
+ * 售价（unitPriceCny）和成本（costPriceCny）是两条独立数据流：售价可以被运营手改，
+ * 成本始终按产品成本快照计算；产品没有成本时两项成本都保持 null。
+ */
+export function computeGroundItemAmounts(input: {
+  kind: 'VISA' | 'HOTEL';
+  unitPriceCny: number;
+  quantity: number;
+  rooms?: number;
+  costPriceCny: number | null;
+}): { amount: number; unitCostCny: number | null; totalCostCny: number | null } {
+  const multiplier = input.kind === 'HOTEL' ? (input.rooms ?? 1) : 1;
+  const amount = Math.round(input.unitPriceCny * input.quantity * multiplier);
+  if (input.costPriceCny == null) {
+    return { amount, unitCostCny: null, totalCostCny: null };
+  }
+  return {
+    amount,
+    unitCostCny: input.costPriceCny,
+    totalCostCny: Math.round(input.costPriceCny * input.quantity * multiplier),
+  };
+}
+
+/** 录入默认价：有成本就带出成本；无成本必须由录入人显式填写售价。 */
+export function resolveGroundItemUnitPrice(input: {
+  requestedUnitPriceCny?: number;
+  costPriceCny: number | null;
+  label: string;
+}): number {
+  if (input.requestedUnitPriceCny != null) return input.requestedUnitPriceCny;
+  if (input.costPriceCny == null) {
+    throw new BadRequestError(`该${input.label}产品没有成本价，请手动填写售价`);
+  }
+  return input.costPriceCny;
 }
 
 export class OrderService {
@@ -5430,6 +5468,213 @@ export class OrderService {
   // 改期费/换人费的机制），避免与本行重复计钱。order.adjustments 只作审计流水（不参与金额合计）。
   // 仅含 BUNDLE/HOTEL 行的订单可用（纯机票单无住宿 → 400）。
   // ════════════════════════════════════════════════════════════════════
+  /**
+   * 订单详情补录一条结构化 HOTEL/VISA 行。
+   * 产品只负责提供当前成本与展示名称；落库后的收入单价和成本快照互不回写。
+   */
+  async addGroundItem(
+    orderId: string,
+    input: AddGroundItemBody,
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
+    order: ReturnType<typeof serializeOrder>;
+    audit: {
+      orderNumber: string;
+      itemId: string;
+      kind: 'VISA' | 'HOTEL';
+      productId: string;
+      amountCny: number;
+      unitPriceCny: number;
+      unitCostCny: number | null;
+      totalCostCny: number | null;
+      visaTaskCreated: boolean;
+    };
+  }> {
+    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+      throw new ForbiddenError('仅运营/管理员可补录签证或房费');
+    }
+
+    const scratch = await prisma.$transaction(async (tx) => {
+      // 与补房差/调价相同：锁订单后再读取行，避免并发补录丢失订单总额更新。
+      await tx.$queryRaw`SELECT id FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+
+      const order = await tx.order.findUnique({
+        where: { id: orderId },
+        select: {
+          id: true,
+          orderNumber: true,
+          status: true,
+          deletedAt: true,
+          visaStatus: true,
+          subtotal: true,
+          total: true,
+          items: { select: { amount: true } },
+        },
+      });
+      if (!order) throw new NotFoundError('订单不存在');
+      if (order.deletedAt) throw new BadRequestError('已软删除的订单不能补录地面项');
+      if (order.status === OrderStatus.CANCELLED) {
+        throw new BadRequestError('已取消的订单不能补录地面项');
+      }
+
+      let productName: string;
+      let costPriceCny: number | null;
+      let unitPriceCny: number;
+      let quantity: number;
+      let rooms: number | undefined;
+      let description: string;
+      let hotelCheckIn: Date | null = null;
+      let hotelCheckOut: Date | null = null;
+      let visaTaskCreated = false;
+
+      if (input.kind === 'VISA') {
+        const visa = await tx.visa.findUnique({
+          where: { id: input.visaId },
+          select: {
+            id: true,
+            visaName: true,
+            visaType: true,
+            country: true,
+            destinationCountry: true,
+            costPriceCny: true,
+            isActive: true,
+          },
+        });
+        if (!visa) throw new NotFoundError(`签证产品 ${input.visaId} 不存在`);
+        if (!visa.isActive) throw new BadRequestError('签证产品已下架');
+        productName = visa.visaName ?? visa.visaType ?? visa.country ?? visa.destinationCountry;
+        costPriceCny = visa.costPriceCny == null ? null : Number(visa.costPriceCny);
+        unitPriceCny = resolveGroundItemUnitPrice({
+          requestedUnitPriceCny: input.unitPriceCny,
+          costPriceCny,
+          label: '签证',
+        });
+        quantity = input.quantity ?? (await tx.passenger.count({ where: { orderId } }));
+        if (quantity < 1) throw new BadRequestError('该订单没有乘客，无法按人数补录签证');
+        description = `${productName} × ${quantity}人`;
+      } else {
+        const roomType = await tx.hotelRoomType.findUnique({
+          where: { id: input.hotelRoomTypeId },
+          select: {
+            id: true,
+            name: true,
+            costPriceCny: true,
+            hotel: { select: { name: true, isActive: true } },
+          },
+        });
+        if (!roomType) throw new NotFoundError(`酒店房型 ${input.hotelRoomTypeId} 不存在`);
+        if (!roomType.hotel.isActive) throw new BadRequestError('酒店已下架');
+        productName = `${roomType.hotel.name} ${roomType.name}`;
+        costPriceCny = roomType.costPriceCny == null ? null : Number(roomType.costPriceCny);
+        unitPriceCny = resolveGroundItemUnitPrice({
+          requestedUnitPriceCny: input.unitPriceCny,
+          costPriceCny,
+          label: '酒店房型',
+        });
+        quantity = input.nights;
+        rooms = input.rooms;
+        const roomsLabel = Number.isInteger(rooms) ? String(rooms) : rooms.toFixed(1);
+        description = `${productName} × ${quantity}晚 × ${roomsLabel}间`;
+        if (input.checkIn) {
+          hotelCheckIn = new Date(`${input.checkIn}T00:00:00.000Z`);
+          hotelCheckOut = new Date(`${addDaysToYmd(input.checkIn, quantity)}T00:00:00.000Z`);
+          if (
+            Number.isNaN(hotelCheckIn.getTime()) ||
+            Number.isNaN(hotelCheckOut.getTime()) ||
+            hotelCheckIn.toISOString().slice(0, 10) !== input.checkIn
+          ) {
+            throw new BadRequestError('入住日期无效');
+          }
+        }
+      }
+
+      const priced = computeGroundItemAmounts({
+        kind: input.kind,
+        unitPriceCny,
+        quantity,
+        rooms,
+        costPriceCny,
+      });
+      const created = await tx.orderItem.create({
+        data: {
+          orderId,
+          kind: input.kind === 'VISA' ? OrderItemKind.VISA : OrderItemKind.HOTEL,
+          description,
+          quantity,
+          unitPrice: new Prisma.Decimal(unitPriceCny),
+          amount: new Prisma.Decimal(priced.amount),
+          unitCostCny: priced.unitCostCny == null ? null : new Prisma.Decimal(priced.unitCostCny),
+          totalCostCny: priced.totalCostCny == null ? null : new Prisma.Decimal(priced.totalCostCny),
+          hotelRoomTypeId: input.kind === 'HOTEL' ? input.hotelRoomTypeId : null,
+          hotelCheckIn,
+          hotelCheckOut,
+          visaId: input.kind === 'VISA' ? input.visaId : null,
+          roomsBilled: input.kind === 'HOTEL' ? new Prisma.Decimal(rooms!) : null,
+          metadata: {
+            source: 'ORDER_GROUND_ITEM',
+            note: input.note ?? null,
+          } as Prisma.InputJsonValue,
+        },
+      });
+
+      // 新增 VISA 行按建单时相同的乘客级口径补建任务；任务挂在新行上，默认 PENDING。
+      if (input.kind === 'VISA') {
+        const passengers = await tx.passenger.findMany({
+          where: { orderId },
+          select: { visaExempt: true },
+        });
+        if (
+          orderNeedsVisaTask({
+            visaStatus: order.visaStatus,
+            hasVisaScope: true,
+            passengers,
+          })
+        ) {
+          await tx.fulfillmentTask.create({
+            data: {
+              orderItemId: created.id,
+              type: FulfillmentType.VISA_APPLICATION,
+              status: FulfillmentStatus.PENDING,
+            },
+          });
+          visaTaskCreated = true;
+        }
+      }
+
+      const newSubtotal = round2(
+        order.items.reduce((sum, item) => sum + Number(item.amount.toString()), 0) + priced.amount,
+      );
+      await tx.order.update({
+        where: { id: orderId },
+        data: {
+          subtotal: new Prisma.Decimal(newSubtotal),
+          total: new Prisma.Decimal(newSubtotal),
+        },
+      });
+
+      return {
+        orderNumber: order.orderNumber,
+        itemId: created.id,
+        kind: input.kind,
+        productId: input.kind === 'VISA' ? input.visaId : input.hotelRoomTypeId,
+        amountCny: priced.amount,
+        unitPriceCny,
+        unitCostCny: priced.unitCostCny,
+        totalCostCny: priced.totalCostCny,
+        visaTaskCreated,
+      };
+    });
+
+    const finalOrder = await prisma.order.findUniqueOrThrow({
+      where: { id: orderId },
+      include: ORDER_FULL_INCLUDE,
+    });
+    return {
+      order: serializeOrder(finalOrder, orderSerializeRoleCtx(actor.role)),
+      audit: scratch,
+    };
+  }
+
   async addRoomSupplement(
     orderId: string,
     input: {

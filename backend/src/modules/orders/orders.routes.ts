@@ -16,6 +16,7 @@ import {
   batchSettlementLockBodySchema,
   batchSetInvoiceFlagsBodySchema,
   batchUpdateStatusBodySchema,
+  addGroundItemBodySchema,
   changeOrderAgentBodySchema,
   changeRequestBodySchema,
   createOrderBodySchema,
@@ -1762,6 +1763,40 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       severity: 'WARNING',
     });
     return { order, roomControl: audit.roomControl };
+  });
+
+  // ── 订单详情补录结构化地面项（ADMIN/STAFF）──
+  // 售价缺省时由后端按产品 costPriceCny 带出；收入与成本快照分开落库。
+  app.post('/:id/items/ground', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅运营/管理员可补录签证或房费' });
+    }
+    const { id } = req.params as { id: string };
+    const body = addGroundItemBodySchema.parse(req.body);
+    const { order, audit } = await service.addGroundItem(id, body, {
+      userId: req.user.sub,
+      role,
+    });
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'ADD_ORDER_GROUND_ITEM',
+      targetType: 'ORDER',
+      targetId: id,
+      targetLabel: audit.orderNumber,
+      after: {
+        kind: audit.kind,
+        productId: audit.productId,
+        itemId: audit.itemId,
+        amountCny: audit.amountCny,
+        unitPriceCny: audit.unitPriceCny,
+        unitCostCny: audit.unitCostCny,
+        totalCostCny: audit.totalCostCny,
+        visaTaskCreated: audit.visaTaskCreated,
+      },
+      severity: 'WARNING',
+    });
+    return { order };
   });
 
   // ── 事后调价（0722 公测反馈「按乘客调价」；ADMIN/STAFF）──

@@ -115,6 +115,8 @@ import {
   buildOrderFilterWhere,
   filterOrderIdsByDepartDate,
   assertDisplayedTotalMatches,
+  computeGroundItemAmounts,
+  resolveGroundItemUnitPrice,
 } from './orders.service.js';
 import { PriceChangedError } from '../../lib/errors.js';
 import type { OrderItemInput } from './orders.schemas.js';
@@ -3493,5 +3495,53 @@ describe('buildOrderFilterWhere · 搜索/乘客姓名含中文名（公测反�
         ],
       },
     });
+  });
+});
+
+describe('computeGroundItemAmounts · 订单详情地面项收入/成本双字段', () => {
+  it('售价缺省时默认取产品成本价', () => {
+    expect(
+      resolveGroundItemUnitPrice({ costPriceCny: 180, label: '签证' }),
+    ).toBe(180);
+  });
+
+  it('产品无成本价且未手动填写售价时拒绝录入', () => {
+    expect(() => resolveGroundItemUnitPrice({ costPriceCny: null, label: '酒店房型' })).toThrow(
+      '请手动填写售价',
+    );
+  });
+
+  it('售价缺省带出成本价时，HOTEL 按晚数×间数独立计算收入与成本', () => {
+    expect(
+      computeGroundItemAmounts({
+        kind: 'HOTEL',
+        unitPriceCny: 180,
+        quantity: 2,
+        rooms: 0.5,
+        costPriceCny: 180,
+      }),
+    ).toEqual({ amount: 180, unitCostCny: 180, totalCostCny: 180 });
+  });
+
+  it('手改售价不覆盖成本快照', () => {
+    expect(
+      computeGroundItemAmounts({
+        kind: 'VISA',
+        unitPriceCny: 260,
+        quantity: 3,
+        costPriceCny: 180,
+      }),
+    ).toEqual({ amount: 780, unitCostCny: 180, totalCostCny: 540 });
+  });
+
+  it('产品无成本价时成本字段保持 null，收入仍按手动售价计算', () => {
+    expect(
+      computeGroundItemAmounts({
+        kind: 'VISA',
+        unitPriceCny: 200,
+        quantity: 2,
+        costPriceCny: null,
+      }),
+    ).toEqual({ amount: 400, unitCostCny: null, totalCostCny: null });
   });
 });

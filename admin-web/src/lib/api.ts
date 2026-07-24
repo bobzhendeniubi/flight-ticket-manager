@@ -2218,6 +2218,32 @@ export const api = {
   },
   getOrder: (token: string, id: string) =>
     apiFetch<{ order: OrderSummary }>(`/orders/${id}`, { token }),
+  addGroundItem: (
+    token: string,
+    orderId: string,
+    body:
+      | {
+          kind: 'VISA';
+          visaId: string;
+          quantity?: number;
+          unitPriceCny?: number;
+          note?: string;
+        }
+      | {
+          kind: 'HOTEL';
+          hotelRoomTypeId: string;
+          nights: number;
+          rooms: number;
+          checkIn?: string;
+          unitPriceCny?: number;
+          note?: string;
+        },
+  ) =>
+    apiFetch<{ order: OrderSummary }>(`/orders/${orderId}/items/ground`, {
+      method: 'POST',
+      token,
+      body,
+    }),
   updateOrderStatus: (token: string, id: string, toStatus: OrderStatus, reason?: string, force?: boolean) =>
     apiFetch<{ order: OrderSummary }>(`/orders/${id}/status`, {
       method: 'PATCH',
