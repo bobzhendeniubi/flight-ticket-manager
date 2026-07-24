@@ -548,7 +548,7 @@ export async function listSchedulesWithCost(
               p.effectiveFrom.getTime() === matched.effectiveFrom.getTime() &&
               p.effectiveTo.getTime() === matched.effectiveTo.getTime(),
           ) ?? null;
-    const r2n = (v: Prisma.Decimal | null | undefined): number | null => {
+    const r2n = (v: Prisma.Decimal | number | null | undefined): number | null => {
       const d = dec(v ?? null);
       return d == null ? null : round2(d);
     };
