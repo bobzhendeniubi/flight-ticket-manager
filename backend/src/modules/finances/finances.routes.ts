@@ -1,5 +1,6 @@
 /**
- * 财务 API — ADMIN-only 业务财务模块
+ * 财务 API — 业务财务模块
+ * 报表/导出等查询为 ADMIN-only；成本维护（周期/班次/产品成本 + 成本锁定）放开到 ADMIN/STAFF（财务岗）。
  *
  * 路由：
  *   GET /finances/summary?from=YYYY-MM-DD&to=YYYY-MM-DD
@@ -58,7 +59,7 @@ const monthlySchema = z.object({
 
 // 成本字段：number 或 null（清空）；缺省 = 不改（统一 CNY，无汇率）
 const costNum = z.number().nonnegative().nullable().optional();
-// 起降折扣允许负数（航司给我们的减项）
+// 机型调整/起降折扣允许负数（少收或补贴的减项）
 const signedCostNum = z.number().nullable().optional();
 const flightCostSchema = z.object({
   charterCostCny: costNum,
@@ -66,7 +67,7 @@ const flightCostSchema = z.object({
   airportTaxArrCny: costNum,
   fuelCostCny: costNum,
   peakSurchargeCny: costNum,
-  aircraftAdjustCny: costNum,
+  aircraftAdjustCny: signedCostNum,
   takeoffDiscountCny: signedCostNum,
 });
 const hotelCostSchema = z.object({ costPriceCny: costNum });
@@ -205,9 +206,9 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
       .send(buf);
   });
 
-  // ── 航班成本列表（财务页用，admin-only）──
+  // ── 航班成本列表（财务页用，ADMIN/STAFF）──
   // GET /finances/cost/schedules?from=YYYY-MM-DD&to=YYYY-MM-DD
-  app.get('/cost/schedules', requireAdmin, async (req) => {
+  app.get('/cost/schedules', requireAdminOrStaff, async (req) => {
     const q = z.object({ from: dateStr.optional(), to: dateStr.optional() }).parse(req.query);
     const schedules = await listSchedulesWithCost(q);
     return { schedules };
@@ -238,7 +239,7 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
     };
   });
 
-  // ── 航班成本周期 CRUD（admin-only）按 (航班, 日期段) 定包机/机场税/4 个新成本字段
+  // ── 航班成本周期 CRUD（ADMIN/STAFF）按 (航班, 日期段) 定包机/机场税/4 个新成本字段
   const periodWriteSchema = z.object({
     flightId: z.string().min(1),
     effectiveFrom: dateStr,
@@ -248,7 +249,7 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
     airportTaxArrCny: costNum,
     fuelCostCny: costNum,
     peakSurchargeCny: costNum,
-    aircraftAdjustCny: costNum,
+    aircraftAdjustCny: signedCostNum,
     takeoffDiscountCny: signedCostNum,
     // A2 汇率四元组（可空）：包机原币种(ISO 4217)/原币金额/汇率/折算日——审计留痕，CNY 仍是入账口径
     charterSourceCurrency: z.string().regex(/^[A-Z]{3}$/, '币种须为 3 位大写代码，如 USD').nullable().optional(),
@@ -265,7 +266,7 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
     airportTaxArrCny: costNum,
     fuelCostCny: costNum,
     peakSurchargeCny: costNum,
-    aircraftAdjustCny: costNum,
+    aircraftAdjustCny: signedCostNum,
     takeoffDiscountCny: signedCostNum,
     // A2 汇率四元组（可空）：包机原币种(ISO 4217)/原币金额/汇率/折算日——审计留痕，CNY 仍是入账口径
     charterSourceCurrency: z.string().regex(/^[A-Z]{3}$/, '币种须为 3 位大写代码，如 USD').nullable().optional(),
@@ -275,13 +276,13 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
     note: z.string().max(200).nullable().optional(),
   });
 
-  app.get('/cost/periods', requireAdmin, async (req) => {
+  app.get('/cost/periods', requireAdminOrStaff, async (req) => {
     const q = z.object({ flightId: z.string().optional() }).parse(req.query);
     const periods = await listCostPeriods({ flightId: q.flightId });
     return { periods };
   });
 
-  app.post('/cost/periods', requireAdmin, async (req, reply) => {
+  app.post('/cost/periods', requireAdminOrStaff, async (req, reply) => {
     try {
       const body = periodWriteSchema.parse(req.body);
       const period = await createCostPeriod(body);
@@ -300,7 +301,7 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
     }
   });
 
-  app.patch('/cost/periods/:id', requireAdmin, async (req, reply) => {
+  app.patch('/cost/periods/:id', requireAdminOrStaff, async (req, reply) => {
     const { id } = req.params as { id: string };
     try {
       const body = periodPatchSchema.parse(req.body);
@@ -320,7 +321,7 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
     }
   });
 
-  app.delete('/cost/periods/:id', requireAdmin, async (req) => {
+  app.delete('/cost/periods/:id', requireAdminOrStaff, async (req) => {
     const { id } = req.params as { id: string };
     const result = await deleteCostPeriod(id);
     void writeAudit({
@@ -346,7 +347,7 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
     });
   }
 
-  app.patch('/cost/flight-schedule/:id', requireAdmin, async (req) => {
+  app.patch('/cost/flight-schedule/:id', requireAdminOrStaff, async (req) => {
     const { id } = req.params as { id: string };
     const data = flightCostSchema.parse(req.body);
     const result = await patchFlightScheduleCost(id, data);
@@ -354,7 +355,7 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
     return result;
   });
 
-  app.patch('/cost/hotel-room-type/:id', requireAdmin, async (req) => {
+  app.patch('/cost/hotel-room-type/:id', requireAdminOrStaff, async (req) => {
     const { id } = req.params as { id: string };
     const data = hotelCostSchema.parse(req.body);
     const result = await patchHotelRoomTypeCost(id, data);
@@ -362,7 +363,7 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
     return result;
   });
 
-  app.patch('/cost/visa/:id', requireAdmin, async (req) => {
+  app.patch('/cost/visa/:id', requireAdminOrStaff, async (req) => {
     const { id } = req.params as { id: string };
     const data = visaCostSchema.parse(req.body);
     const result = await patchVisaCost(id, data);
@@ -370,7 +371,7 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
     return result;
   });
 
-  app.patch('/cost/transfer/:id', requireAdmin, async (req) => {
+  app.patch('/cost/transfer/:id', requireAdminOrStaff, async (req) => {
     const { id } = req.params as { id: string };
     const data = transferCostSchema.parse(req.body);
     const result = await patchTransferCost(id, data);

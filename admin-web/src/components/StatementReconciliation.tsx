@@ -90,7 +90,16 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
   );
   const [onlyImported, setOnlyImported] = useState(false);
   const [orderQuery, setOrderQuery] = useState('');
-  // 认款请求进行中（防连点：双击「确认认款/一键认款」会重复入账）
+  // 流水池筛选（传后端）：到账日期闭区间 + 关键词（进账号/流水号/付款备注/订单提示）
+  const [poolFrom, setPoolFrom] = useState('');
+  const [poolTo, setPoolTo] = useState('');
+  const [poolQ, setPoolQ] = useState('');
+  // 订单栏筛选（传后端）：下单日期闭区间（关键词复用 orderQuery，服务端过滤）
+  const [orderFrom, setOrderFrom] = useState('');
+  const [orderTo, setOrderTo] = useState('');
+  // 批量认款：勾选的建议组（按 receipt.id 唯一标识，一笔流水在建议里至多出现一次）
+  const [selectedSug, setSelectedSug] = useState<Set<string>>(new Set());
+  // 认款请求进行中（防连点：双击「确认认款/一键认款/批量认款」会重复入账）
   const [allocating, setAllocating] = useState(false);
 
   // 导入流程
@@ -112,10 +121,21 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
     if (!token) return;
     setLoading(true);
     setErr(null);
+    const orderQ = orderQuery.trim();
     // unallocatedOnly：服务端只回未认完的池子，不会被已认款记录挤掉旧 OPEN 流水
     Promise.all([
-      api.listReceipts(token, { unallocatedOnly: '1' }),
-      api.getReceiptMatchCandidates(token),
+      api.listReceipts(token, {
+        unallocatedOnly: '1',
+        ...(poolQ.trim() ? { q: poolQ.trim() } : {}),
+        ...(poolFrom ? { from: poolFrom } : {}),
+        ...(poolTo ? { to: poolTo } : {}),
+      }),
+      // 订单关键词/日期传后端过滤：跨全量候选搜索，不再受「近 400 单」窗口限制
+      api.getReceiptMatchCandidates(token, {
+        ...(orderQ ? { q: orderQ } : {}),
+        ...(orderFrom ? { from: orderFrom } : {}),
+        ...(orderTo ? { to: orderTo } : {}),
+      }),
     ])
       .then(([r, c]) => {
         setReceipts(r.receipts);
@@ -123,10 +143,12 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
       })
       .catch((e: unknown) => setErr(e instanceof ApiError ? e.message : '加载工作台数据失败'))
       .finally(() => setLoading(false));
-  }, [token]);
+  }, [token, poolQ, poolFrom, poolTo, orderQuery, orderFrom, orderTo]);
 
+  // 防抖：筛选输入停 300ms 再打后端，避免每敲一个字都发请求
   useEffect(() => {
-    load();
+    const t = setTimeout(() => load(), 300);
+    return () => clearTimeout(t);
   }, [load]);
 
   // 完整未认款池（服务端已按 OPEN/部分认款过滤）——自动配对唯一性必须基于它计算
@@ -181,6 +203,12 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
     return out.slice(0, 20);
   }, [openPool, candidates]);
 
+  // 勾选中的建议组数（只算当前有效建议里被勾的，重载后失效的旧勾选不计入）
+  const selectedCount = useMemo(
+    () => suggestions.filter((s) => selectedSug.has(s.receipt.id)).length,
+    [suggestions, selectedSug],
+  );
+
   // ── 认款（拖放 / 点选 / 建议一键 共用入口；in-flight 期间拒绝二次提交）──
   async function allocate(receiptId: string, orderId: string, amount: number): Promise<void> {
     if (allocating) return;
@@ -205,6 +233,63 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
       onMutated?.();
     } catch (e: unknown) {
       setErr(e instanceof ApiError ? e.message : '认款失败');
+    } finally {
+      setAllocating(false);
+    }
+  }
+
+  // ── 批量认款（勾选的建议组一键执行；仅金额一对一吻合的组）──────────────────
+  function toggleSug(receiptId: string): void {
+    setSelectedSug((prev) => {
+      const next = new Set(prev);
+      if (next.has(receiptId)) next.delete(receiptId);
+      else next.add(receiptId);
+      return next;
+    });
+  }
+
+  function toggleSelectAll(): void {
+    setSelectedSug((prev) =>
+      prev.size === suggestions.length && suggestions.length > 0
+        ? new Set()
+        : new Set(suggestions.map((s) => s.receipt.id)),
+    );
+  }
+
+  async function runBatch(): Promise<void> {
+    if (allocating) return;
+    // 只认「当前建议里且被勾选」的组——过滤掉重载后已失效的旧勾选
+    const chosen = suggestions.filter((s) => selectedSug.has(s.receipt.id));
+    if (chosen.length === 0) return;
+    if (
+      !window.confirm(
+        `确认批量认款 ${chosen.length} 组？每组把整笔流水认款到金额一对一吻合的订单。`,
+      )
+    )
+      return;
+    setErr(null);
+    setNotice(null);
+    setAllocating(true);
+    try {
+      const items = chosen.map((s) => ({
+        receiptId: s.receipt.id,
+        orderId: s.order.orderId,
+        amountCny: Number(s.receipt.remainingCny),
+      }));
+      const res = await api.allocateReceiptBatch(token, items);
+      const { succeeded, failed } = res.summary;
+      setNotice(`批量认款完成：成功 ${succeeded} 组${failed > 0 ? `，失败 ${failed} 组` : ''}`);
+      if (failed > 0) {
+        const firstFail = res.results.find((r) => !r.ok);
+        if (firstFail && !firstFail.ok) setErr(`有 ${failed} 组未成功，例如：${firstFail.error}`);
+      }
+      setSelectedSug(new Set());
+      setActiveReceiptId(null);
+      setConfirmTarget(null);
+      load();
+      onMutated?.();
+    } catch (e: unknown) {
+      setErr(e instanceof ApiError ? e.message : '批量认款失败');
     } finally {
       setAllocating(false);
     }
@@ -502,11 +587,29 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
         </div>
       )}
 
-      {/* 自动配对建议 */}
+      {/* 自动配对建议（可多选/全选后批量认款；仅金额一对一吻合的组） */}
       {suggestions.length > 0 && (
         <div className="rounded-xl border border-emerald-200 bg-emerald-50/50 p-3">
-          <div className="mb-2 text-xs font-medium uppercase tracking-wide text-emerald-800">
-            自动配对建议（金额一对一吻合）· {suggestions.length} 组
+          <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+            <label className="flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-emerald-800">
+              <input
+                type="checkbox"
+                checked={selectedCount === suggestions.length && suggestions.length > 0}
+                ref={(el) => {
+                  if (el) el.indeterminate = selectedCount > 0 && selectedCount < suggestions.length;
+                }}
+                onChange={toggleSelectAll}
+              />
+              自动配对建议（金额一对一吻合）· {suggestions.length} 组
+            </label>
+            <button
+              type="button"
+              className="btn-primary px-3 py-1 text-xs disabled:opacity-50"
+              disabled={allocating || selectedCount === 0}
+              onClick={() => void runBatch()}
+            >
+              {allocating ? '认款中…' : `批量认款${selectedCount > 0 ? ` ${selectedCount} 组` : ''}`}
+            </button>
           </div>
           <div className="space-y-1.5">
             {suggestions.map(({ receipt, order }) => (
@@ -514,18 +617,25 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
                 key={`${receipt.id}-${order.orderId}`}
                 className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-white px-3 py-1.5 text-sm shadow-sm"
               >
-                <span>
-                  <b className="nums">{fmtCny(Number(receipt.remainingCny))}</b>
-                  <span className="ml-1.5 text-xs text-ink-muted">
-                    {fmtDateTime(receipt.receivedAt)}
-                    {receipt.externalTxnId && (
-                      <span className="ml-1 font-mono">…{receipt.externalTxnId.slice(-8)}</span>
-                    )}
+                <label className="flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    checked={selectedSug.has(receipt.id)}
+                    onChange={() => toggleSug(receipt.id)}
+                  />
+                  <span>
+                    <b className="nums">{fmtCny(Number(receipt.remainingCny))}</b>
+                    <span className="ml-1.5 text-xs text-ink-muted">
+                      {fmtDateTime(receipt.receivedAt)}
+                      {receipt.externalTxnId && (
+                        <span className="ml-1 font-mono">…{receipt.externalTxnId.slice(-8)}</span>
+                      )}
+                    </span>
+                    <span className="mx-2 text-ink-muted">→</span>
+                    <span className="font-mono text-xs">{order.orderNumber}</span>
+                    <span className="ml-1.5">{order.contactName}</span>
                   </span>
-                  <span className="mx-2 text-ink-muted">→</span>
-                  <span className="font-mono text-xs">{order.orderNumber}</span>
-                  <span className="ml-1.5">{order.contactName}</span>
-                </span>
+                </label>
                 <button
                   type="button"
                   className="btn-secondary px-2.5 py-1 text-xs disabled:opacity-50"
@@ -551,6 +661,32 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
             </span>
             <span className="badge-warning">{pool.length}</span>
           </div>
+          {/* 流水池筛选（传后端）：关键词 + 到账日期区间 */}
+          <div className="mb-2 space-y-1.5">
+            <input
+              className="input w-full py-1.5 text-xs"
+              placeholder="筛：进账号 / 流水号 / 付款备注"
+              value={poolQ}
+              onChange={(e) => setPoolQ(e.target.value)}
+            />
+            <div className="flex items-center gap-1 text-[11px] text-ink-muted">
+              <input
+                type="date"
+                className="input min-w-0 flex-1 py-1 text-xs"
+                value={poolFrom}
+                onChange={(e) => setPoolFrom(e.target.value)}
+                aria-label="到账日期从"
+              />
+              <span>~</span>
+              <input
+                type="date"
+                className="input min-w-0 flex-1 py-1 text-xs"
+                value={poolTo}
+                onChange={(e) => setPoolTo(e.target.value)}
+                aria-label="到账日期到"
+              />
+            </div>
+          </div>
           {loading ? (
             <div className="py-8 text-center text-xs text-ink-muted">加载中…</div>
           ) : pool.length === 0 ? (
@@ -565,16 +701,34 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
         </div>
 
         <div className="space-y-2">
-          <div className="flex items-center justify-between gap-2">
+          <div className="flex flex-wrap items-center justify-between gap-2">
             <span className="text-xs font-medium uppercase tracking-wide text-ink-muted">
-              待收款订单（近 400 单内尾款 &gt; 0）
+              待收款订单（尾款 &gt; 0）
             </span>
-            <input
-              className="input w-56 py-1.5 text-sm"
-              placeholder="筛：订单号 / 联系人 / 代理"
-              value={orderQuery}
-              onChange={(e) => setOrderQuery(e.target.value)}
-            />
+            <div className="flex flex-wrap items-center gap-1.5">
+              {/* 下单日期区间（传后端，按订单 createdAt） */}
+              <input
+                type="date"
+                className="input w-36 py-1.5 text-xs"
+                value={orderFrom}
+                onChange={(e) => setOrderFrom(e.target.value)}
+                aria-label="下单日期从"
+              />
+              <span className="text-[11px] text-ink-muted">~</span>
+              <input
+                type="date"
+                className="input w-36 py-1.5 text-xs"
+                value={orderTo}
+                onChange={(e) => setOrderTo(e.target.value)}
+                aria-label="下单日期到"
+              />
+              <input
+                className="input w-56 py-1.5 text-sm"
+                placeholder="筛：订单号 / 联系人 / 代理"
+                value={orderQuery}
+                onChange={(e) => setOrderQuery(e.target.value)}
+              />
+            </div>
           </div>
           {loading ? (
             <div className="py-8 text-center text-xs text-ink-muted">加载中…</div>

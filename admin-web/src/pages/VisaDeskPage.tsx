@@ -651,14 +651,32 @@ function OrderGroup({
   const [photosError, setPhotosError] = useState<string | null>(null);
   const photosLoadedRef = useRef(false);
 
-  // 备注 = 任务级 task.notes
+  // 备注 = 任务级 task.notes。显式保存（公测反馈：blur 自动保存让人「不知道在哪里保存/
+  // 莫名其妙就修改了」）：有改动时出现「保存」按钮（或 Enter 提交），成功短暂显示「✓ 已保存」。
   const [noteDraft, setNoteDraft] = useState(task.notes ?? '');
+  // 草稿的服务端基准值：dirty = 草稿 ≠ 基准。保存成功 / 轮询同步时更新。
+  const [noteBaseline, setNoteBaseline] = useState(task.notes ?? '');
   const [savingNote, setSavingNote] = useState(false);
+  const [noteSaved, setNoteSaved] = useState(false);
   const [noteError, setNoteError] = useState<string | null>(null);
   const noteFocusedRef = useRef(false);
+  const noteSavedTimerRef = useRef<number | null>(null);
+  const noteDirty = noteDraft.trim() !== noteBaseline;
   useEffect(() => {
-    if (!noteFocusedRef.current) setNoteDraft(task.notes ?? '');
-  }, [task.notes]);
+    // 轮询刷新防覆盖：编辑中（聚焦）或有未保存改动时，绝不用服务端值刷掉本地草稿。
+    const incoming = task.notes ?? '';
+    if (incoming === noteBaseline) return;
+    if (!noteFocusedRef.current && noteDraft.trim() === noteBaseline) {
+      setNoteDraft(incoming);
+    }
+    setNoteBaseline(incoming);
+  }, [task.notes, noteBaseline, noteDraft]);
+  useEffect(
+    () => () => {
+      if (noteSavedTimerRef.current !== null) window.clearTimeout(noteSavedTimerRef.current);
+    },
+    [],
+  );
 
   const loadPhotos = useCallback(() => {
     if (!orderId || passengers.length === 0) return;
@@ -769,11 +787,18 @@ function OrderGroup({
   const saveNote = async () => {
     if (savingNote) return;
     const next = noteDraft.trim();
-    if (next === (task.notes ?? '')) return;
+    if (next === noteBaseline) return;
     setSavingNote(true);
     setNoteError(null);
+    setNoteSaved(false);
     try {
       await api.updateFulfillmentTask(token, task.id, { notes: next });
+      // 立即收敛基准值：不等轮询回包就消掉「未保存」标识，并短暂显示成功提示。
+      setNoteBaseline(next);
+      setNoteDraft(next);
+      setNoteSaved(true);
+      if (noteSavedTimerRef.current !== null) window.clearTimeout(noteSavedTimerRef.current);
+      noteSavedTimerRef.current = window.setTimeout(() => setNoteSaved(false), 2500);
       onChanged();
     } catch (e: unknown) {
       setNoteError(e instanceof ApiError ? e.message : '备注保存失败');
@@ -853,24 +878,44 @@ function OrderGroup({
           )}
         </td>
         <td className="align-top text-xs text-ink-muted">
-          <input
-            className="input max-w-xs py-1 text-xs"
-            value={noteDraft}
-            placeholder="添加备注…"
-            disabled={savingNote}
-            onChange={(e) => setNoteDraft(e.target.value)}
-            onFocus={() => {
-              noteFocusedRef.current = true;
-            }}
-            onBlur={() => {
-              noteFocusedRef.current = false;
-              void saveNote();
-            }}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') e.currentTarget.blur();
-            }}
-          />
-          {savingNote && <div className="mt-0.5 text-[10px] text-ink-muted">保存中…</div>}
+          {/* 显式保存：blur 不再自动写库、也不丢输入；有改动时出现「保存」按钮（Enter 同效） */}
+          <div className="flex items-center gap-1.5">
+            <input
+              className="input max-w-xs py-1 text-xs"
+              value={noteDraft}
+              placeholder="添加备注…"
+              disabled={savingNote}
+              onChange={(e) => setNoteDraft(e.target.value)}
+              onFocus={() => {
+                noteFocusedRef.current = true;
+              }}
+              onBlur={() => {
+                noteFocusedRef.current = false;
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault();
+                  void saveNote();
+                }
+              }}
+            />
+            {(noteDirty || savingNote) && (
+              <button
+                type="button"
+                className="btn-secondary whitespace-nowrap py-0.5 px-2 text-xs"
+                onClick={() => void saveNote()}
+                disabled={savingNote}
+              >
+                {savingNote ? '保存中…' : '保存'}
+              </button>
+            )}
+          </div>
+          {noteDirty && !savingNote && (
+            <div className="mt-0.5 text-[10px] text-amber-600">未保存</div>
+          )}
+          {noteSaved && !noteDirty && (
+            <div className="mt-0.5 text-[10px] text-emerald-600">✓ 已保存</div>
+          )}
           {noteError && <div className="mt-0.5 text-[10px] text-rose-600">{noteError}</div>}
         </td>
         <td className="align-top text-center">

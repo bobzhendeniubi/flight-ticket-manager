@@ -251,6 +251,110 @@ describe('ReceiptsService.refund · 退款剩余未认领部分', () => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════
+describe('ReceiptsService.allocateBatch · 批量认款（逐组独立事务）', () => {
+  it('两组金额吻合：全部成功，各自订单入账 + 进账 ALLOCATED', async () => {
+    const ADMIN = await createAdminActor();
+    const orderA = await createGuestOrder({ total: 500, paidAmount: 0 });
+    const orderB = await createGuestOrder({ total: 800, paidAmount: 0 });
+    const rcptA = await registerReceipt(500, ADMIN);
+    const rcptB = await registerReceipt(800, ADMIN);
+
+    const res = await receiptsService.allocateBatch(
+      [
+        { receiptId: rcptA.id, orderId: orderA.id, amountCny: 500 },
+        { receiptId: rcptB.id, orderId: orderB.id, amountCny: 800 },
+      ],
+      ADMIN,
+    );
+
+    expect(res.summary).toEqual({ total: 2, succeeded: 2, failed: 0 });
+    expect(res.results.every((r) => r.ok)).toBe(true);
+
+    const dbA = await prisma.order.findUniqueOrThrow({ where: { id: orderA.id } });
+    const dbB = await prisma.order.findUniqueOrThrow({ where: { id: orderB.id } });
+    expect(Number(dbA.paidAmount)).toBe(500);
+    expect(dbA.status).toBe(OrderStatus.PAID);
+    expect(Number(dbB.paidAmount)).toBe(800);
+    expect(dbB.status).toBe(OrderStatus.PAID);
+
+    const dbRcptA = await prisma.receipt.findUniqueOrThrow({ where: { id: rcptA.id } });
+    const dbRcptB = await prisma.receipt.findUniqueOrThrow({ where: { id: rcptB.id } });
+    expect(dbRcptA.status).toBe(ReceiptStatus.ALLOCATED);
+    expect(dbRcptB.status).toBe(ReceiptStatus.ALLOCATED);
+  });
+
+  it('某组失败（订单不存在）不影响其它组：成功组入账、失败组进账不变', async () => {
+    const ADMIN = await createAdminActor();
+    const orderOk = await createGuestOrder({ total: 500, paidAmount: 0 });
+    const rcptOk = await registerReceipt(500, ADMIN);
+    const rcptBad = await registerReceipt(300, ADMIN);
+
+    const res = await receiptsService.allocateBatch(
+      [
+        { receiptId: rcptOk.id, orderId: orderOk.id, amountCny: 500 },
+        { receiptId: rcptBad.id, orderId: 'no-such-order', amountCny: 300 },
+      ],
+      ADMIN,
+    );
+
+    expect(res.summary).toEqual({ total: 2, succeeded: 1, failed: 1 });
+    const okItem = res.results.find((r) => r.receiptId === rcptOk.id);
+    const badItem = res.results.find((r) => r.receiptId === rcptBad.id);
+    expect(okItem?.ok).toBe(true);
+    expect(badItem?.ok).toBe(false);
+
+    // 成功组：订单入账 + 进账 ALLOCATED
+    const dbOk = await prisma.receipt.findUniqueOrThrow({ where: { id: rcptOk.id } });
+    expect(dbOk.status).toBe(ReceiptStatus.ALLOCATED);
+    const dbOrderOk = await prisma.order.findUniqueOrThrow({ where: { id: orderOk.id } });
+    expect(Number(dbOrderOk.paidAmount)).toBe(500);
+
+    // 失败组：进账原封不动（OPEN，无认领明细）
+    const dbBad = await prisma.receipt.findUniqueOrThrow({ where: { id: rcptBad.id } });
+    expect(dbBad.status).toBe(ReceiptStatus.OPEN);
+    expect(Number(dbBad.allocatedCny)).toBe(0);
+    const badAlloc = await prisma.receiptAllocation.findFirst({ where: { receiptId: rcptBad.id } });
+    expect(badAlloc).toBeNull();
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+describe('ReceiptsService.list · 到账日期筛选（receivedAt）', () => {
+  it('过去区间不含今天登记的进账；含今天的宽区间则包含', async () => {
+    const ADMIN = await createAdminActor();
+    const receipt = await registerReceipt(1000, ADMIN);
+
+    // 纯过去区间：今天登记的进账不应出现
+    const past = await receiptsService.list({ from: '2000-01-01', to: '2000-01-02' });
+    expect(past.some((r) => r.id === receipt.id)).toBe(false);
+
+    // 覆盖今天的宽区间：应出现
+    const wide = await receiptsService.list({ from: '2000-01-01', to: '2999-12-31' });
+    expect(wide.some((r) => r.id === receipt.id)).toBe(true);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+describe('ReceiptsService.matchCandidates · 关键词 + 下单日期筛选', () => {
+  it('关键词命中联系人姓名；不命中则不返回', async () => {
+    const uniqueName = `CONTACTSEARCH${Date.now()}`;
+    const order = await createGuestOrder({ total: 1000, paidAmount: 0, contactName: uniqueName });
+
+    const hit = await receiptsService.matchCandidates({ q: uniqueName });
+    expect(hit.some((o) => o.orderId === order.id)).toBe(true);
+
+    const miss = await receiptsService.matchCandidates({ q: 'NOSUCHCONTACTNAME_XYZ' });
+    expect(miss.some((o) => o.orderId === order.id)).toBe(false);
+  });
+
+  it('纯过去下单日期区间不含今天的订单', async () => {
+    const order = await createGuestOrder({ total: 1000, paidAmount: 0 });
+    const past = await receiptsService.matchCandidates({ from: '2000-01-01', to: '2000-01-02' });
+    expect(past.some((o) => o.orderId === order.id)).toBe(false);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
 describe('公开上传付款凭证 · 门禁 + 仅声明不入账', () => {
   const PROOF = 'data:image/png;base64,SGVsbG8=';
 

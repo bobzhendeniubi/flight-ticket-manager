@@ -1,6 +1,10 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { api, ApiError, registerAuthRefresh, type AuthTokens, type AuthUser } from '../lib/api';
+import { isAccessTokenFresh } from '../lib/token';
+
+/** persist 存储键：storage 事件按此 key 过滤，跨标签同步只认自己这份。 */
+const AUTH_STORAGE_KEY = 'ftm-admin-auth';
 
 /**
  * 单飞行中刷新去重：所有并发 refreshSession 共享同一个 api.refresh。
@@ -69,8 +73,19 @@ export const useAuth = create<AuthState>()(
 
         refreshInFlight = (async () => {
           try {
+            // 取内存 tokens 之前，先从 localStorage 同步一次：后台隐藏标签的轮询用的是
+            // 内存里几分钟前的旧 refreshToken，而兄弟标签可能早已把它轮换掉。若不同步就直接拿
+            // 旧 token 去刷 → 撞后端「很久以前作废」的重放判定 → 撤销该用户全部会话（所有标签
+            // /所有共用该账号的人一起被踢）。rehydrate 先把兄弟标签轮换出的新令牌读进来。
+            await useAuth.persist?.rehydrate?.();
+
             const { tokens } = get();
             if (!tokens?.refreshToken) return false;
+
+            // 同步后 accessToken 仍新鲜（兄弟标签刚轮换过 / 本就没到期）→ 无需再刷，直接放行。
+            // 这一步把「后台标签拿旧 token 去刷」的场景在源头挡掉，只有真的临期才会打 /auth/refresh。
+            if (isAccessTokenFresh(tokens.accessToken)) return true;
+
             try {
               const res = await api.refresh(tokens.refreshToken);
               set({ tokens: res.tokens });
@@ -93,7 +108,7 @@ export const useAuth = create<AuthState>()(
       },
     }),
     {
-      name: 'ftm-admin-auth',
+      name: AUTH_STORAGE_KEY,
       partialize: (state) => ({ user: state.user, tokens: state.tokens }),
     },
   ),
@@ -105,4 +120,22 @@ registerAuthRefresh(async () => {
   const ok = await useAuth.getState().refreshSession();
   return ok ? (useAuth.getState().tokens?.accessToken ?? null) : null;
 });
+
+// ── 跨标签页实时同步（幂等，只在模块首次加载时注册一次）───────────────────────
+// 兄弟标签轮换出新令牌、或登出时，会写入 localStorage 的 AUTH_STORAGE_KEY —— 触发本页
+// storage 事件，立刻 rehydrate 跟上，避免本页继续拿旧令牌请求。
+// · storage 事件只由「其它」标签页的写入触发，本页自己 set 不会触发它；因此不存在「本页刚
+//   set 的新 token 又被自己盖回旧值」的问题。刷新在飞（refreshInFlight）时若收到事件，读到的
+//   也是兄弟页成功轮换后的更新令牌，正是我们想要的；而并发双刷中的失败方会拿到后端
+//   REFRESH_TOKEN_RACE（非 401）不落地任何 token，不会与胜出方的令牌相互覆盖。
+// · 写入相同字符串时浏览器不广播 storage 事件（HTML 规范：值未变即早退），rehydrate 回写同值
+//   不会在标签间形成回声风暴。
+// · 登出同步：兄弟页登出后 tokens=null 落盘，rehydrate 后本页 hasSession 变 false，
+//   App 的 Protected/Navigate 自然把本页导航到登录页。
+if (typeof window !== 'undefined') {
+  window.addEventListener('storage', (e) => {
+    if (e.key !== AUTH_STORAGE_KEY) return;
+    void useAuth.persist?.rehydrate?.();
+  });
+}
 

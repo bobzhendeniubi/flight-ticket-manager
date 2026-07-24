@@ -1984,6 +1984,17 @@ export interface ListReceiptsParams {
   /** '1' = 只回未认完的（OPEN + 部分认款）——认款工作台专用 */
   unallocatedOnly?: '1';
   q?: string; // 匹配 receiptNo / payerNote / orderHintId / externalTxnId
+  /** 到账日期闭区间（YYYY-MM-DD，按流水交易日期 receivedAt，北京时） */
+  from?: string;
+  to?: string;
+}
+
+/** GET /receipts/match-candidates 查询参数（日期按订单下单日期 createdAt） */
+export interface ReceiptMatchCandidatesParams {
+  from?: string;
+  to?: string;
+  /** 匹配 订单号 / 联系人 / 代理名（服务端过滤，跨全量候选） */
+  q?: string;
 }
 
 /** POST /receipts body（后台登记新进账） */
@@ -2026,6 +2037,33 @@ export interface AllocateReceiptResult {
     status: OrderStatus;
     paymentId: string;
   };
+}
+
+/** POST /receipts/allocate-batch 单组入参（金额一对一吻合的建议组） */
+export interface AllocateBatchItem {
+  receiptId: string;
+  orderId: string;
+  amountCny: number;
+}
+
+/** POST /receipts/allocate-batch 单组结果（逐组独立事务，成败各自返回） */
+export type AllocateBatchResultItem =
+  | {
+      ok: true;
+      receiptId: string;
+      orderId: string;
+      receiptNo: string;
+      orderNumber: string;
+      allocatedAmount: number;
+      receiptStatus: ReceiptStatus;
+    }
+  | { ok: false; receiptId: string; orderId: string; error: string };
+
+/** POST /receipts/allocate-batch 返回 */
+export interface AllocateBatchResult {
+  ok: true;
+  results: AllocateBatchResultItem[];
+  summary: { total: number; succeeded: number; failed: number };
 }
 
 /** POST /orders/:id/overpay-to-pool 返回 */
@@ -3421,6 +3459,13 @@ export const api = {
   // 认领：把进账金额分配到某订单（原子；超额/已退款会被拒绝）
   allocateReceipt: (token: string, id: string, body: { orderId: string; amountCny: number }) =>
     apiFetch<AllocateReceiptResult>(`/receipts/${id}/allocate`, { method: 'POST', token, body }),
+  // 批量认款：逐组独立事务复用认领内核，某组失败不影响其它组，逐组回结果
+  allocateReceiptBatch: (token: string, items: AllocateBatchItem[]) =>
+    apiFetch<AllocateBatchResult>('/receipts/allocate-batch', {
+      method: 'POST',
+      token,
+      body: { items },
+    }),
   // 退款：把进账剩余金额标记退款（不可再认领）
   refundReceipt: (token: string, id: string, note: string) =>
     apiFetch<{ ok: true; receiptId: string; receiptNo: string; refundedRemainingCny: string; status: 'REFUNDED' }>(
@@ -3443,8 +3488,19 @@ export const api = {
       { method: 'POST', token, body: { platform, rows } },
     ),
   // 认款工作台：近 400 单里尾款 > 0 的待收款订单候选（最多 200）
-  getReceiptMatchCandidates: (token: string) =>
-    apiFetch<{ orders: ReceiptMatchCandidate[] }>('/receipts/match-candidates', { token }),
+  // 可选 from/to（按订单下单日期）+ q（订单号/联系人/代理名，服务端过滤）收窄
+  getReceiptMatchCandidates: (token: string, query?: ReceiptMatchCandidatesParams) => {
+    const qs = new URLSearchParams();
+    if (query) {
+      for (const [k, v] of Object.entries(query)) {
+        if (v !== undefined && v !== '') qs.set(k, String(v));
+      }
+    }
+    return apiFetch<{ orders: ReceiptMatchCandidate[] }>(
+      `/receipts/match-candidates${qs.toString() ? '?' + qs.toString() : ''}`,
+      { token },
+    );
+  },
   // 流水核对表导出（xlsx；含认款状态/认到订单/认款人列）。返回 Blob 直接下载。
   exportReceiptStatement: async (token: string, query?: { from?: string; to?: string }): Promise<Blob> => {
     const qs = new URLSearchParams();

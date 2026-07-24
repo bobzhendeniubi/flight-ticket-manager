@@ -33,8 +33,13 @@ export interface IssueTokensContext {
  * 若把这种毫秒级并发当成 token 重放去「撤销该用户所有会话」，正常使用会被瞬间踢下线。
  * 因此：只有当旧 token 是「很久以前」被作废（超过本窗口）才判定为真正的重放并全撤销；
  * 窗口内的并发只拒绝这一次请求（REFRESH_TOKEN_RACE，非 401），不牵连整个会话。
+ *
+ * 窗口取 60s：多标签页场景里，后台隐藏标签的轮询会被浏览器节流到分钟级，兄弟标签轮换掉旧
+ * token 后，本标签可能过了几十秒才拿着这份（已作废的）旧 token 来刷。这仍是「正常并发轮换
+ * 竞争」而非重放，宽限窗要覆盖到这个量级，才不会把多标签正常使用误判成重放而全账号踢下线。
+ * 前端已在 refreshSession 里先从存储同步兄弟标签的新令牌来从源头减少这种迟到刷新，此窗口是兜底。
  */
-const REFRESH_REUSE_GRACE_MS = 10_000;
+const REFRESH_REUSE_GRACE_MS = 60_000;
 
 /** 并发刷新竞争：这一次刷新输给了同时发生的另一次轮换。非会话失效，调用方可忽略/重试。 */
 export class RefreshTokenRaceError extends AppError {

@@ -2,15 +2,16 @@
  * 收款对账台 / 挂账池路由（ADMIN/STAFF）。
  *
  * 注册前缀 /receipts：
- *   GET  /receipts?status=&q=     挂账池列表（含 remaining + 认领明细）
+ *   GET  /receipts?status=&q=&from=&to=  挂账池列表（含 remaining + 认领明细；日期按 receivedAt）
  *   GET  /receipts/ledger         总账（合并 Receipts + 近期订单 Payments）
  *   POST /receipts                登记新进账（OPEN）
  *   POST /receipts/:id/allocate   认领到订单（原子）
+ *   POST /receipts/allocate-batch 批量认款（逐组独立事务，某组失败不影响其它组）
  *   POST /receipts/:id/refund     退款剩余未认领部分
  *   POST /receipts/statement/parse    解析二维码流水 xlsx（预览，不写库）
  *   POST /receipts/statement/import   流水入池（externalTxnId 唯一去重）
  *   GET  /receipts/statement/export   流水核对表 xlsx（含认款标识）
- *   GET  /receipts/match-candidates   认款工作台：待收款订单候选
+ *   GET  /receipts/match-candidates?from=&to=&q=  认款工作台：待收款订单候选（日期按订单 createdAt）
  *
  * 审计在 service 层按资金口径写（REGISTER/ALLOCATE/REFUND_RECEIPT/IMPORT_RECEIPT_STATEMENT）。
  */
@@ -20,10 +21,12 @@ import { ReceiptsService } from './receipts.service.js';
 import { BadRequestError } from '../../lib/errors.js';
 import { writeAudit } from '../../lib/audit.js';
 import {
+  allocateBatchSchema,
   allocateReceiptSchema,
   exportStatementQuerySchema,
   importStatementSchema,
   listReceiptsQuerySchema,
+  matchCandidatesQuerySchema,
   parseStatementSchema,
   refundReceiptSchema,
   registerReceiptSchema,
@@ -58,6 +61,12 @@ export const receiptRoutes: FastifyPluginAsync = async (app) => {
     const { id } = req.params as { id: string };
     const body = allocateReceiptSchema.parse(req.body);
     return service.allocate(id, body, { userId: req.user.sub, role: req.user.role });
+  });
+
+  // ── 批量认款（自动配对建议一键执行；逐组独立事务，某组失败不影响其它组） ──
+  app.post('/allocate-batch', { preHandler: [app.authenticate, requireAdminOrStaff] }, async (req) => {
+    const body = allocateBatchSchema.parse(req.body);
+    return service.allocateBatch(body.items, { userId: req.user.sub, role: req.user.role });
   });
 
   // ── 退款剩余未认领部分 ───────────────────────────────
@@ -134,8 +143,9 @@ export const receiptRoutes: FastifyPluginAsync = async (app) => {
   app.get(
     '/match-candidates',
     { preHandler: [app.authenticate, requireAdminOrStaff] },
-    async () => {
-      const orders = await service.matchCandidates();
+    async (req) => {
+      const query = matchCandidatesQuerySchema.parse(req.query);
+      const orders = await service.matchCandidates(query);
       return { orders };
     },
   );

@@ -31,10 +31,12 @@ import { writeAudit } from '../../lib/audit.js';
 import { PaymentsService } from '../payments/payments.service.js';
 import { earliestFlightDeparture } from '../orders/pnr-export.js';
 import type {
+  AllocateBatchInput,
   AllocateReceiptInput,
   ExportStatementQuery,
   ImportStatementInput,
   ListReceiptsQuery,
+  MatchCandidatesQuery,
   RegisterReceiptInput,
 } from './receipts.schemas.js';
 import {
@@ -48,6 +50,22 @@ import {
 /** 金额保留 2 位小数（CNY，避免浮点累计误差）。 */
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
+}
+
+/**
+ * 把 YYYY-MM-DD 闭区间（北京时）换算成 Prisma DateTime 过滤条件。
+ * 与流水核对表导出（exportStatement）同款边界：from 取当日 00:00:00，to 取当日 23:59:59.999。
+ * 都为空 → undefined（调用方据此决定是否加过滤）。
+ */
+function beijingDayRange(
+  from?: string,
+  to?: string,
+): { gte?: Date; lte?: Date } | undefined {
+  if (!from && !to) return undefined;
+  return {
+    ...(from ? { gte: new Date(`${from}T00:00:00+08:00`) } : {}),
+    ...(to ? { lte: new Date(`${to}T23:59:59.999+08:00`) } : {}),
+  };
 }
 
 /**
@@ -190,6 +208,9 @@ export class ReceiptsService {
         { externalTxnId: { contains: query.q, mode: 'insensitive' } },
       ];
     }
+    // 到账日期闭区间（按流水交易日期字段 receivedAt，北京时）
+    const receivedRange = beijingDayRange(query.from, query.to);
+    if (receivedRange) where.receivedAt = receivedRange;
     const rows = await prisma.receipt.findMany({
       where,
       include: { allocations: true },
@@ -402,6 +423,63 @@ export class ReceiptsService {
         status: result.order.status,
         paymentId: result.order.paymentId,
       },
+    };
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  // 批量认款（自动配对建议一键执行）— 纯编排，不改单笔语义
+  // ════════════════════════════════════════════════════════════════════
+  /**
+   * 逐组复用 allocate 内核：每组一次独立事务 + 独立审计，全套校验（行锁/超额/退款拒绝）
+   * 一字不动。某组失败（订单不存在/超额/并发已认完…）只记该组错误，不影响其它组——
+   * 逐组回结果，前端据此提示「成功 N 组、失败 M 组（原因）」。
+   * 不做任意流水↔订单的批量绑定：调用方只把「金额一对一吻合的建议组」传进来。
+   */
+  async allocateBatch(items: AllocateBatchInput['items'], actor: { userId: string; role: UserRole }) {
+    const results: Array<
+      | {
+          ok: true;
+          receiptId: string;
+          orderId: string;
+          receiptNo: string;
+          orderNumber: string;
+          allocatedAmount: number;
+          receiptStatus: ReceiptStatus;
+        }
+      | { ok: false; receiptId: string; orderId: string; error: string }
+    > = [];
+
+    for (const item of items) {
+      try {
+        const r = await this.allocate(
+          item.receiptId,
+          { orderId: item.orderId, amountCny: item.amountCny },
+          actor,
+        );
+        results.push({
+          ok: true,
+          receiptId: item.receiptId,
+          orderId: item.orderId,
+          receiptNo: r.receiptNo,
+          orderNumber: r.order.orderNumber,
+          allocatedAmount: r.allocatedAmount,
+          receiptStatus: r.receiptStatus,
+        });
+      } catch (e: unknown) {
+        results.push({
+          ok: false,
+          receiptId: item.receiptId,
+          orderId: item.orderId,
+          error: e instanceof Error ? e.message : '认款失败',
+        });
+      }
+    }
+
+    const succeeded = results.filter((r) => r.ok).length;
+    return {
+      ok: true as const,
+      results,
+      summary: { total: results.length, succeeded, failed: results.length - succeeded },
     };
   }
 
@@ -633,7 +711,11 @@ export class ReceiptsService {
    * serializeOrder.balanceDue 一字一致）；排除草稿/取消/已退/超时单。
    * 只回轻量字段供工作台配对展示，不含乘客明细。
    */
-  async matchCandidates() {
+  async matchCandidates(query: MatchCandidatesQuery = {}) {
+    // 下单日期闭区间（createdAt，北京时）+ 关键词（订单号 / 联系人 / 代理名）服务端过滤：
+    // 都在 take 400 之前收窄，关键词命中不再受「近 400 单」窗口限制（财务反馈的「搜不到旧单」）。
+    const createdRange = beijingDayRange(query.from, query.to);
+    const q = query.q?.trim();
     const orders = await prisma.order.findMany({
       where: {
         // 与收款资金闸同源（FUNDS_CREDIT_BLOCKED_STATUSES）：候选规则和入账内核
@@ -641,6 +723,17 @@ export class ReceiptsService {
         // 软删单（回收站）同样排除——入账内核会拒，不该出现在候选里。
         status: { notIn: FUNDS_CREDIT_BLOCKED_STATUSES },
         deletedAt: null,
+        ...(createdRange ? { createdAt: createdRange } : {}),
+        ...(q
+          ? {
+              OR: [
+                { orderNumber: { contains: q, mode: 'insensitive' } },
+                { contactName: { contains: q, mode: 'insensitive' } },
+                { agent: { companyName: { contains: q, mode: 'insensitive' } } },
+                { agent: { contactName: { contains: q, mode: 'insensitive' } } },
+              ],
+            }
+          : {}),
       },
       select: {
         id: true,

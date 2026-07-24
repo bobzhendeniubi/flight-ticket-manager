@@ -9,6 +9,9 @@ import { STATEMENT_PLATFORMS, type StatementPlatform } from './receipts.statemen
 /** 进账金额：> 0，封顶（防手误录入天文数字）。 */
 const amountCnySchema = z.number().positive().max(100_000_000);
 
+/** 日期筛选字段：YYYY-MM-DD（闭区间，后端按北京时换算成时间戳边界）。 */
+const dayStrSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
+
 /** 登记新进账（财务后台手动）。 */
 export const registerReceiptSchema = z.object({
   amountCny: amountCnySchema,
@@ -29,6 +32,25 @@ export const allocateReceiptSchema = z.object({
 });
 export type AllocateReceiptInput = z.infer<typeof allocateReceiptSchema>;
 
+/**
+ * 批量认款（自动配对建议一键执行）。
+ * 编排层——不改单笔语义：逐组复用 allocate 内核（各自独立事务、各自审计），
+ * 某组失败不影响其它组，逐组回结果。上限 100 组防一次请求打满。
+ */
+export const allocateBatchSchema = z.object({
+  items: z
+    .array(
+      z.object({
+        receiptId: z.string().min(1).max(64),
+        orderId: z.string().min(1).max(64),
+        amountCny: amountCnySchema,
+      }),
+    )
+    .min(1)
+    .max(100),
+});
+export type AllocateBatchInput = z.infer<typeof allocateBatchSchema>;
+
 /** 退款剩余未认领部分。 */
 export const refundReceiptSchema = z.object({
   note: z.string().min(1).max(500),
@@ -36,15 +58,40 @@ export const refundReceiptSchema = z.object({
 export type RefundReceiptInput = z.infer<typeof refundReceiptSchema>;
 
 /** 挂账池列表过滤。 */
-export const listReceiptsQuerySchema = z.object({
-  status: z.nativeEnum(ReceiptStatus).optional(),
-  // '1' = 只回未认完的（OPEN + PARTIALLY_ALLOCATED）——认款工作台专用，
-  // 防止 take 500 被大量已认款记录占满、把更早的未认款流水挤出池子
-  unallocatedOnly: z.literal('1').optional(),
-  // 关键字：匹配 receiptNo / payerNote / orderHintId / externalTxnId
-  q: z.string().max(120).optional(),
-});
+export const listReceiptsQuerySchema = z
+  .object({
+    status: z.nativeEnum(ReceiptStatus).optional(),
+    // '1' = 只回未认完的（OPEN + PARTIALLY_ALLOCATED）——认款工作台专用，
+    // 防止 take 500 被大量已认款记录占满、把更早的未认款流水挤出池子
+    unallocatedOnly: z.literal('1').optional(),
+    // 关键字：匹配 receiptNo / payerNote / orderHintId / externalTxnId
+    q: z.string().max(120).optional(),
+    // 到账日期闭区间（按流水交易日期字段 receivedAt，北京时）
+    from: dayStrSchema.optional(),
+    to: dayStrSchema.optional(),
+  })
+  .refine((query) => !query.from || !query.to || query.from <= query.to, {
+    message: '日期区间无效：开始日期晚于结束日期',
+  });
 export type ListReceiptsQuery = z.infer<typeof listReceiptsQuerySchema>;
+
+/**
+ * 认款工作台待收款订单候选过滤。
+ * - from/to：按订单下单日期 createdAt（与候选列表本身「近 400 单」排序口径同轴，
+ *   且 createdAt 恒有值——不会像出发日那样对无航段单为空而把待收订单筛没）。
+ * - q：服务端匹配订单号 / 联系人 / 代理名（公司名或代理联系人），
+ *   跨全量候选搜索，不再受前端已加载 200 条限制。
+ */
+export const matchCandidatesQuerySchema = z
+  .object({
+    from: dayStrSchema.optional(),
+    to: dayStrSchema.optional(),
+    q: z.string().max(120).optional(),
+  })
+  .refine((query) => !query.from || !query.to || query.from <= query.to, {
+    message: '日期区间无效：开始日期晚于结束日期',
+  });
+export type MatchCandidatesQuery = z.infer<typeof matchCandidatesQuerySchema>;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 二维码流水导入（收单平台对账单）

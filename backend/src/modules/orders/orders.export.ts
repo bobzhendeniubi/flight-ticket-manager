@@ -63,6 +63,7 @@ interface OrderRow {
   // 航班
   flightNumbers: string;
   departDate: string;
+  returnDate: string;
   route: string;
   // 产品
   bundleName: string;
@@ -94,7 +95,8 @@ const COLUMNS: Array<{ header: string; key: keyof OrderRow; width: number }> = [
   { header: '国籍', key: 'nationality', width: 8 },
   { header: '护照有效期', key: 'passportExpiry', width: 12 },
   { header: '航班号', key: 'flightNumbers', width: 12 },
-  { header: '出发日期', key: 'departDate', width: 12 },
+  { header: '去程日期', key: 'departDate', width: 12 },
+  { header: '回程日期', key: 'returnDate', width: 12 },
   { header: '路线', key: 'route', width: 14 },
   { header: '套餐', key: 'bundleName', width: 18 },
   { header: '酒店名称', key: 'hotelName', width: 20 },
@@ -144,19 +146,24 @@ type OrderForExport = Prisma.OrderGetPayload<{
 /** 把一张订单展开成 N 行（每位乘客一行）— 不含成本/毛利。*/
 function orderToRows(order: OrderForExport): OrderRow[] {
   // ── 航班信息（可能去程+回程多段）──
-  const flightNumbers: string[] = [];
-  const departDates: Date[] = [];
-  const routes: string[] = [];
+  // 按起飞时间升序排序后再拼路线/航班号串：订单行是录入顺序，
+  // 回程先录时不排序会导致路线串倒序（如 "回程 → 去程"）。
+  interface FlightLeg {
+    departureTime: Date;
+    flightNumber: string;
+    route: string;
+  }
+  const legs: FlightLeg[] = [];
   for (const it of order.items) {
     if (it.kind === 'FLIGHT' && it.flightSchedule) {
-      flightNumbers.push(it.flightSchedule.flight.flightNumber);
-      departDates.push(it.flightSchedule.departureTime);
-      routes.push(
-        `${it.flightSchedule.flight.originCode} → ${it.flightSchedule.flight.destinationCode}`,
-      );
+      legs.push({
+        departureTime: it.flightSchedule.departureTime,
+        flightNumber: it.flightSchedule.flight.flightNumber,
+        route: `${it.flightSchedule.flight.originCode} → ${it.flightSchedule.flight.destinationCode}`,
+      });
     }
   }
-  departDates.sort((a, b) => a.getTime() - b.getTime());
+  legs.sort((a, b) => a.departureTime.getTime() - b.departureTime.getTime());
 
   // ── 酒店：房型 + 入住起止（含每行所属酒店名，供 per-passenger 人工分房回落）──
   // 同一房型名（如多团共用 "明月"）不再混淆 —— 优先用人工分房组里的酒店名，
@@ -205,16 +212,18 @@ function orderToRows(order: OrderForExport): OrderRow[] {
 
   const agency = order.agent?.companyName ?? order.agent?.contactName ?? '直销';
   const statusLabel = STATUS_LABEL[order.status] ?? order.status;
-  const flightStr = Array.from(new Set(flightNumbers)).join(' / ');
-  const routeStr = Array.from(new Set(routes)).join(' / ');
-  const departStr = fmtDate(departDates[0]);
+  const flightStr = Array.from(new Set(legs.map((l) => l.flightNumber))).join(' / ');
+  const routeStr = Array.from(new Set(legs.map((l) => l.route))).join(' / ');
+  // 去程 = 最早航段；回程 = 最末航段（单程留空；两段以上取最末段）
+  const departStr = fmtDate(legs[0]?.departureTime);
+  const returnStr = legs.length >= 2 ? fmtDate(legs[legs.length - 1]?.departureTime) : '';
   // 客单金额(人均) = 订单总额 ÷ 乘客数（每行写人均，避免按总额误读为每人都付了全款）
   const orderTotal = dec(order.total) / Math.max(1, order.passengers.length);
   const recordedAt = fmtDateTime(order.createdAt);
 
   return order.passengers.map<OrderRow>((p) => {
-    // 称谓统一 MR/MS（不分年龄，0723 票务口径）；departDates 仅供其他年龄派生场景沿用签名。
-    const pnrName = nameWithTitle(p, departDates[0] ?? null);
+    // 称谓统一 MR/MS（不分年龄，0723 票务口径）；去程日期仅供其他年龄派生场景沿用签名。
+    const pnrName = nameWithTitle(p, legs[0]?.departureTime ?? null);
 
     // 每行酒店名优先用该订单项自带的酒店名（多酒店行程才不会被并成一个酒店）；
     // 仅当订单项没带酒店名时，才回退到该乘客的人工分房组酒店名。
@@ -250,6 +259,7 @@ function orderToRows(order: OrderForExport): OrderRow[] {
       passportExpiry: fmtDate(p.passportExpiry),
       flightNumbers: flightStr,
       departDate: departStr,
+      returnDate: returnStr,
       route: routeStr,
       bundleName: bundleParts.join(' + '),
       hotelName: hotelNames,

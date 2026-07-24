@@ -205,6 +205,8 @@ function passenger(i: number) {
     dateOfBirth: '1990-01-01',
     nationality: 'CN',
     passengerType: 'ADULT' as const,
+    // 批量建单（新建路径）护照有效期必填
+    passportExpiry: '2031-01-01',
   };
 }
 

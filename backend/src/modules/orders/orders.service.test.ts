@@ -316,6 +316,8 @@ describe('OrderService 重复乘客校验', () => {
     dateOfBirth: '1990-01-01',
     nationality: 'CN',
     passengerType: 'ADULT' as const,
+    // 新建路径护照有效期必填（批量 schema / 后台录单 service 校验同口径）
+    passportExpiry: '2031-01-01',
   });
 
   const flightItem = {
@@ -2020,6 +2022,8 @@ describe('订单签证状态 + 结构化备注四栏', () => {
     fullName: '张三',
     documentNumber: 'E12345678',
     dateOfBirth: '1990-01-01',
+    // 批量建单（新建路径）护照有效期必填
+    passportExpiry: '2031-01-01',
   };
   const structured = {
     visaStatus: 'E_VISA' as const,

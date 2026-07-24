@@ -1230,6 +1230,25 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       return;
     }
 
+    // 护照有效期必填（业务口径，与后端创建路径校验同口径）：机票/套餐/签证单（出行人必填的
+    // 产品类型）的每位已填出行人必须有合法有效期；纯酒店/接送出行人选填，不拦。
+    if (passengersRequired) {
+      const expiryMissingRows = passengers
+        .map((p, idx) => ({ ...p, rowNumber: idx + 1 }))
+        .filter(
+          (p) =>
+            p.fullName.trim() &&
+            p.documentNumber.trim() &&
+            parseDob(p.passportExpiry ?? '') === null,
+        );
+      if (expiryMissingRows.length > 0) {
+        setErr(
+          `第 ${expiryMissingRows.map((p) => p.rowNumber).join('、')} 位出行人护照有效期未填写或格式不正确（必填），请完善后再提交`,
+        );
+        return;
+      }
+    }
+
     if (adjustError) {
       setErr(adjustError);
       return;
@@ -1727,7 +1746,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                     份数
                     <NumberInput className={inputCls} value={visaQty} onChange={setVisaQty} integerOnly min={1} placeholder="1" />
                   </label>
-                  <p className="md:col-span-2 text-[11px] text-slate-400">签证含送签材料，下方每位出行人需填护照有效期（详情页补录）。份数应与出行人数一致。</p>
+                  <p className="md:col-span-2 text-[11px] text-slate-400">签证含送签材料，下方每位出行人须填写护照有效期（必填）。份数应与出行人数一致。</p>
                 </div>
               )}
 
@@ -2042,7 +2061,9 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                       </th>
                       <th className="min-w-[120px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照签发日期</th>
                       <th className="min-w-[160px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照签发地点</th>
-                      <th className="min-w-[120px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照有效期</th>
+                      <th className="min-w-[120px] whitespace-nowrap px-2 py-1.5 text-left font-normal">
+                        护照有效期{passengersRequired && <span className="text-rose-500"> *必填</span>}
+                      </th>
                       {/* 签证出签日/生效日/有效期不在此处录入：这三项是签证岗出签后才拿得到的信息，
                           录单时无法预先知道（票务岗反馈：录单时不需要），改由签证台在出签后补录。 */}
                       <th className="min-w-[110px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照图</th>

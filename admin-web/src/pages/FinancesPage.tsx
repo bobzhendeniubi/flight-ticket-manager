@@ -184,7 +184,7 @@ function UsdCostInput({
       <button
         type="button"
         aria-label="美元换算"
-        title="美元 × 汇率"
+        title="按美元×汇率折算填入(¥)"
         className="rounded border border-slate-200 px-1 py-0.5 text-xs font-medium text-brand hover:bg-brand-50"
         disabled={disabled}
         onClick={() => setOpen((v) => !v)}
@@ -580,13 +580,13 @@ function FlightCostPeriodsEditor({ token }: { token: string }) {
                 <th className="py-2 text-left font-normal">路线</th>
                 <th className="py-2 text-left font-normal">起始</th>
                 <th className="py-2 text-left font-normal">结束</th>
-                <th className="py-2 text-right font-normal">包机</th>
-                <th className="py-2 text-right font-normal">机场税去</th>
-                <th className="py-2 text-right font-normal">机场税回</th>
-                <th className="py-2 text-right font-normal">燃油</th>
-                <th className="py-2 text-right font-normal">旺季附加</th>
-                <th className="py-2 text-right font-normal">机型调整</th>
-                <th className="py-2 text-right font-normal">起降折扣（机场补贴）</th>
+                <th className="py-2 text-right font-normal">包机(¥·整包)</th>
+                <th className="py-2 text-right font-normal">机场税去(¥/座)</th>
+                <th className="py-2 text-right font-normal">机场税回(¥/座)</th>
+                <th className="py-2 text-right font-normal">燃油(¥/座)</th>
+                <th className="py-2 text-right font-normal">旺季附加(¥/座)</th>
+                <th className="py-2 text-right font-normal">机型调整(¥/座)</th>
+                <th className="py-2 text-right font-normal">起降折扣/机场补贴(¥/座)</th>
                 <th className="py-2 text-left font-normal">备注</th>
                 <th className="py-2 text-right font-normal"></th>
               </tr>
@@ -777,10 +777,9 @@ function CostPeriodNewForm({
       </div>
       <div className="mt-3 grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-7">
         <label className="text-xs text-ink-soft">
-          包机总额(¥)
-          <NumberInput
+          包机总额(¥·整包)
+          <UsdCostInput
             className={`mt-1 block w-full ${numCls}`}
-            step={0.01}
             value={charter}
             onChange={setCharter}
           />
@@ -1010,7 +1009,7 @@ function CostPeriodRow({
       <td className="py-2 text-ink-soft">{period.origin} → {period.destination}</td>
       <td className="py-2"><input type="date" value={from} onChange={(e) => setFrom(e.target.value)} className={dateCls} /></td>
       <td className="py-2"><input type="date" value={to} onChange={(e) => setTo(e.target.value)} className={dateCls} /></td>
-      <td className="py-2 text-right"><NumberInput className={numCls} step={0.01} value={charter} onChange={setCharter} /></td>
+      <td className="py-2 text-right"><UsdCostInput className={numCls} value={charter} onChange={setCharter} /></td>
       <td className="py-2 text-right"><UsdCostInput className={numCls} value={taxDep} onChange={setTaxDep} /></td>
       <td className="py-2 text-right"><UsdCostInput className={numCls} value={taxArr} onChange={setTaxArr} /></td>
       <td className="py-2 text-right"><UsdCostInput className={numCls} value={fuel} onChange={setFuel} /></td>
@@ -1101,13 +1100,13 @@ function FlightScheduleCostEditors({ token }: { token: string }) {
                 <th className="py-2 text-left font-normal">航班号</th>
                 <th className="py-2 text-left font-normal">路线</th>
                 <th className="py-2 text-left font-normal">出发日期</th>
-                <th className="py-2 text-right font-normal">包机(¥)</th>
-                <th className="py-2 text-right font-normal">机场税去(¥)</th>
-                <th className="py-2 text-right font-normal">机场税回(¥)</th>
-                <th className="py-2 text-right font-normal">燃油(¥)</th>
-                <th className="py-2 text-right font-normal">旺季附加(¥)</th>
-                <th className="py-2 text-right font-normal">机型调整(¥)</th>
-                <th className="py-2 text-right font-normal">起降折扣/机场补贴(¥)</th>
+                <th className="py-2 text-right font-normal">包机(¥·整包)</th>
+                <th className="py-2 text-right font-normal">机场税去(¥/座)</th>
+                <th className="py-2 text-right font-normal">机场税回(¥/座)</th>
+                <th className="py-2 text-right font-normal">燃油(¥/座)</th>
+                <th className="py-2 text-right font-normal">旺季附加(¥/座)</th>
+                <th className="py-2 text-right font-normal">机型调整(¥/座)</th>
+                <th className="py-2 text-right font-normal">起降折扣/机场补贴(¥/座)</th>
                 <th className="py-2 text-right font-normal">已售/总座</th>
                 <th className="py-2 text-right font-normal text-blue-700">
                   单座成本(÷总座)(¥)
@@ -1279,9 +1278,8 @@ function FlightScheduleCostRow({
         })}
       </td>
       <td className="py-2 text-right">
-        <NumberInput
+        <UsdCostInput
           className={inputCls}
-          step={0.01}
           value={charter}
           placeholder={ph(row.charterCostCnyPeriod)}
           disabled={row.costLocked}
@@ -1548,15 +1546,19 @@ function CostRow({
     Object.fromEntries(fields.map((f) => [f.key, f.value == null || f.value === '' ? null : Number(f.value)])),
   );
   const [saving, setSaving] = useState(false);
+  const [saveErr, setSaveErr] = useState<string | null>(null);
 
   async function save(): Promise<void> {
     setSaving(true);
+    setSaveErr(null);
     try {
       const vals: Record<string, number | null> = {};
       for (const f of fields) {
         vals[f.key] = draft[f.key] ?? null;
       }
       await onSave(vals);
+    } catch (e: unknown) {
+      setSaveErr(e instanceof ApiError ? e.message : '保存失败');
     } finally {
       setSaving(false);
     }
@@ -1587,6 +1589,7 @@ function CostRow({
         >
           {saving ? '…' : '保存'}
         </button>
+        {saveErr && <div className="text-xs text-rose-600 mt-0.5">{saveErr}</div>}
       </td>
     </tr>
   );

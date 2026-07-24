@@ -208,6 +208,8 @@ export const passengerInputSchema = z.object({
   passportIssueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),       // 护照签发日期
   passportIssueCountry: countryCodeSchema('护照签发国').optional(),
   passportIssuePlace: z.string().max(120).optional(),                          // 护照签发地点（城市/机关文本，OCR 或手填，选填）
+  // 基座 schema 保持 optional（前台散客/小程序公开下单共用）；后台新建路径的必填口径见
+  // passengerInputWithRequiredExpirySchema（批量/OTA）与 orders.service createOrder（ADMIN/STAFF 录单）。
   passportExpiry: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
 
   // 订座编码（PNR）：录单时可直接带入（如 OTA 名单里的共用编码——多人同一 PNR 各行填同值，
@@ -246,6 +248,17 @@ export const passengerInputSchema = z.object({
   singleRoom: z.boolean().optional(),
 });
 export type PassengerInput = z.infer<typeof passengerInputSchema>;
+
+// ── 新建乘客：护照有效期必填口径（业务拍板，2026-07）──────────────────────
+// 后台新建路径（批量/OTA 入单走本 schema；后台单订单录入在 service 层按 ADMIN/STAFF 身份
+// 校验同口径，因 createOrderBodySchema 与前台散客/小程序公开下单共用，不能在 schema 层一刀切）。
+// 更新/补录路径（selfUpdatePassengerBodySchema、换人 swapPassengerBodySchema 等）保持可空：
+// 存量空值旧单要能继续编辑，护照补录功能不受影响。
+export const passengerInputWithRequiredExpirySchema = passengerInputSchema.extend({
+  passportExpiry: z
+    .string({ required_error: '护照有效期必填', invalid_type_error: '护照有效期必填' })
+    .regex(/^\d{4}-\d{2}-\d{2}$/, '护照有效期格式应为 YYYY-MM-DD'),
+});
 
 // ── 前台自助：出行人护照资料补录（PATCH /orders/:id/passengers/:passengerId，客户/代理侧）──
 // 字段校验规则与 passengerInputSchema 完全同款；全部可选但至少给一个。
@@ -703,8 +716,9 @@ export const batchCreateOrdersBodySchema = z
     // 缺省时后端生成一个同批共享的（仅防同一请求内重复，跨请求重试防不住，故前端应传）。
     batchId: z.string().min(8).max(100).optional(),
     // 每位 → 一单。note 为该乘客个别备注（选填），与整批备注合并写入本人订单 notes。
+    // 批量/OTA 入单是新建路径 → 护照有效期必填（见 passengerInputWithRequiredExpirySchema 注释）。
     passengers: z
-      .array(passengerInputSchema.extend({ note: z.string().max(500).optional() }))
+      .array(passengerInputWithRequiredExpirySchema.extend({ note: z.string().max(500).optional() }))
       .min(1)
       .max(100),
   })

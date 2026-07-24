@@ -127,4 +127,34 @@ describe('班次成本锁定路由', () => {
     expect(res.statusCode).toBe(403);
     expect(setFlightScheduleCostLockMock).not.toHaveBeenCalled();
   });
+
+  it('STAFF 可以保存班次成本（含负数机型调整）', async () => {
+    patchFlightScheduleCostMock.mockResolvedValue({ id: 's1' });
+
+    const res = await app.inject({
+      method: 'PATCH',
+      url: '/finances/cost/flight-schedule/s1',
+      headers: { authorization: `Bearer ${tokenFor('staff-1', UserRole.STAFF)}` },
+      payload: { charterCostCny: 100_000, aircraftAdjustCny: -500, takeoffDiscountCny: -200 },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(patchFlightScheduleCostMock).toHaveBeenCalledWith('s1', {
+      charterCostCny: 100_000,
+      aircraftAdjustCny: -500,
+      takeoffDiscountCny: -200,
+    });
+  });
+
+  it('客户角色不能保存班次成本', async () => {
+    const res = await app.inject({
+      method: 'PATCH',
+      url: '/finances/cost/flight-schedule/s1',
+      headers: { authorization: `Bearer ${tokenFor('customer-1', UserRole.CUSTOMER)}` },
+      payload: { charterCostCny: 100 },
+    });
+
+    expect(res.statusCode).toBe(403);
+    expect(patchFlightScheduleCostMock).not.toHaveBeenCalled();
+  });
 });

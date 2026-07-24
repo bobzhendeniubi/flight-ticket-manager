@@ -94,6 +94,9 @@ export function ReconciliationPage() {
 
   const [tab, setTab] = useState<Tab>('open');
   const [q, setQ] = useState('');
+  // 到账日期闭区间筛选（按流水交易日期 receivedAt，北京时；传后端）
+  const [from, setFrom] = useState('');
+  const [to, setTo] = useState('');
   const [receipts, setReceipts] = useState<Receipt[]>([]);
   const [ledger, setLedger] = useState<LedgerEntry[]>([]);
   const [loading, setLoading] = useState(true);
@@ -105,12 +108,17 @@ export function ReconciliationPage() {
     if (!token) return;
     setLoading(true);
     setErr(null);
+    const params = {
+      ...(q.trim() ? { q: q.trim() } : {}),
+      ...(from ? { from } : {}),
+      ...(to ? { to } : {}),
+    };
     api
-      .listReceipts(token, q.trim() ? { q: q.trim() } : undefined)
+      .listReceipts(token, Object.keys(params).length ? params : undefined)
       .then((r) => setReceipts(r.receipts))
       .catch((e: unknown) => setErr(e instanceof ApiError ? e.message : '加载进账失败'))
       .finally(() => setLoading(false));
-  }, [token, q]);
+  }, [token, q, from, to]);
 
   // 加载全部流水（仅在切到「全部流水」页签时拉）
   const loadLedger = useCallback(() => {
@@ -222,7 +230,23 @@ export function ReconciliationPage() {
         </TabBtn>
 
         {tab !== 'channels' && tab !== 'ledger' && tab !== 'statement' && (
-          <div className="ml-auto">
+          <div className="ml-auto flex flex-wrap items-center gap-1.5">
+            {/* 到账日期区间（传后端，按 receivedAt） */}
+            <input
+              type="date"
+              className="input w-36 py-1.5 text-sm"
+              value={from}
+              onChange={(e) => setFrom(e.target.value)}
+              aria-label="到账日期从"
+            />
+            <span className="text-xs text-ink-muted">~</span>
+            <input
+              type="date"
+              className="input w-36 py-1.5 text-sm"
+              value={to}
+              onChange={(e) => setTo(e.target.value)}
+              aria-label="到账日期到"
+            />
             <input
               className="input py-1.5"
               placeholder="搜进账号 / 流水号 / 付款备注 / 订单提示"

@@ -72,6 +72,8 @@ const passenger = {
   dateOfBirth: '1990-01-01',
   nationality: 'CN',
   passengerType: 'ADULT' as const,
+  // 后台录单（ADMIN/STAFF）新建路径护照有效期必填
+  passportExpiry: '2031-01-01',
 };
 
 const body = {

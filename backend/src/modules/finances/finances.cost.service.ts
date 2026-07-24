@@ -222,7 +222,7 @@ export async function loadPeriodsByFlightIds(
   return map;
 }
 
-// ── 航班成本周期（CRUD，admin-only）─────────────────────────────────────────
+// ── 航班成本周期（CRUD，ADMIN/STAFF）────────────────────────────────────────
 
 export interface CostPeriodDto {
   id: string;
@@ -424,11 +424,19 @@ export async function deleteCostPeriod(
   id: string,
   client: PrismaClient = defaultPrisma,
 ): Promise<{ id: string }> {
-  await client.flightCostPeriod.delete({ where: { id } });
+  try {
+    await client.flightCostPeriod.delete({ where: { id } });
+  } catch (e: unknown) {
+    // P2025 = 记录不存在（已被删或 id 无效）——按 404 返回友好文案，而不是 500
+    if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2025') {
+      throw new NotFoundError('周期不存在或已删除');
+    }
+    throw e;
+  }
   return { id };
 }
 
-// ── 航班成本列表（财务页用，admin-only）──────────────────────────────────────
+// ── 航班成本列表（财务页用，ADMIN/STAFF）─────────────────────────────────────
 
 export interface FinanceScheduleRow {
   scheduleId: string;

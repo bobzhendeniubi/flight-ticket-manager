@@ -91,6 +91,20 @@ describe('AuthService.refresh · 轮换 + 宽限窗', () => {
     expect(prismaMock.refreshToken.create).not.toHaveBeenCalled();
   });
 
+  it('迟到并发（作废于宽限窗内，30s 前）：仍判并发竞争，不撤销整会话', async () => {
+    // 回归多标签场景：后台隐藏标签被节流，兄弟标签轮换后几十秒才拿旧 token 来刷。
+    // 30s 仍在 60s 宽限窗内 → 必须按 REFRESH_TOKEN_RACE 处理（旧 10s 窗会误判成重放而全撤销）。
+    prismaMock.refreshToken.findUnique.mockResolvedValue(
+      makeRecord({ revokedAt: new Date(Date.now() - 30 * 1000) }),
+    );
+
+    await expect(service.refresh('raw-refresh-token')).rejects.toBeInstanceOf(
+      RefreshTokenRaceError,
+    );
+    expect(prismaMock.refreshToken.updateMany).not.toHaveBeenCalled();
+    expect(prismaMock.refreshToken.create).not.toHaveBeenCalled();
+  });
+
   it('真正的重放（很久以前已作废，超过宽限窗）：撤销该用户所有会话 + 401', async () => {
     prismaMock.refreshToken.findUnique.mockResolvedValue(
       makeRecord({ revokedAt: new Date(Date.now() - 60 * 60 * 1000) }), // 1 小时前作废

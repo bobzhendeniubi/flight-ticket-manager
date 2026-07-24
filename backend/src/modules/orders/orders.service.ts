@@ -708,6 +708,28 @@ export class OrderService {
       );
     }
 
+    // 护照有效期必填（业务拍板，2026-07）：后台（ADMIN/STAFF）新建订单且含按人产品
+    // （机票/套餐/签证——出行人必填的产品类型）时，每位出行人必须带护照有效期。
+    // 批量/OTA 入单在 schema 层同口径拦截（passengerInputWithRequiredExpirySchema）。
+    // 不含 AGENT/散客/游客：前台与小程序下单页不采集该字段，有自助补录通道可事后补；
+    // 存量订单编辑走更新/补录路径（selfUpdate/换人），不经过本方法，不受影响。
+    // 纯酒店/接送单的占位出行人（documentNumber='N/A'）不在此列（无按人产品行）。
+    if (requesterRole === UserRole.ADMIN || requesterRole === UserRole.STAFF) {
+      const hasPerPersonTravelItem = body.items.some(
+        (it) => it.kind === 'FLIGHT' || it.kind === 'BUNDLE' || it.kind === 'VISA',
+      );
+      if (hasPerPersonTravelItem) {
+        const missingExpiryRows = body.passengers
+          .map((p, idx) => (p.passportExpiry ? null : idx + 1))
+          .filter((n): n is number => n !== null);
+        if (missingExpiryRows.length > 0) {
+          throw new BadRequestError(
+            `护照有效期必填：第 ${missingExpiryRows.join('、')} 位出行人未填写`,
+          );
+        }
+      }
+    }
+
     // 重复乘客校验：同班次「占座中」订单里已有同证件号乘客 → 拒绝，防同人同航班重复占座
     const flightScheduleIds = [
       ...new Set(

@@ -2,9 +2,10 @@ import { describe, it, expect, vi } from 'vitest';
 
 vi.mock('../../db/prisma.js', () => ({ prisma: {} }));
 
-import type { PrismaClient } from '@prisma/client';
-import { ConflictError } from '../../lib/errors.js';
+import { Prisma, type PrismaClient } from '@prisma/client';
+import { ConflictError, NotFoundError } from '../../lib/errors.js';
 import {
+  deleteCostPeriod,
   listSchedulesWithCost,
   patchFlightScheduleCost,
   resolveFlightItemCost,
@@ -291,5 +292,41 @@ describe('listSchedulesWithCost — 财务口径：包机费÷全部座位，空
       patchFlightScheduleCost('s-locked', { charterCostCny: 123 }, client),
     ).rejects.toThrow('该班次成本已锁定，请先解锁再修改');
     expect(update).not.toHaveBeenCalled();
+  });
+});
+
+describe('deleteCostPeriod — 删除成本周期', () => {
+  it('记录不存在（P2025）时抛 NotFoundError 而非 500', async () => {
+    const client = {
+      flightCostPeriod: {
+        delete: vi.fn().mockRejectedValue(
+          new Prisma.PrismaClientKnownRequestError('Record to delete does not exist.', {
+            code: 'P2025',
+            clientVersion: 'test',
+          }),
+        ),
+      },
+    } as unknown as PrismaClient;
+
+    await expect(deleteCostPeriod('missing-id', client)).rejects.toBeInstanceOf(NotFoundError);
+    await expect(deleteCostPeriod('missing-id', client)).rejects.toThrow('周期不存在或已删除');
+  });
+
+  it('其它数据库错误原样抛出', async () => {
+    const client = {
+      flightCostPeriod: {
+        delete: vi.fn().mockRejectedValue(new Error('db down')),
+      },
+    } as unknown as PrismaClient;
+
+    await expect(deleteCostPeriod('p1', client)).rejects.toThrow('db down');
+  });
+
+  it('删除成功时返回 id', async () => {
+    const client = {
+      flightCostPeriod: { delete: vi.fn().mockResolvedValue({}) },
+    } as unknown as PrismaClient;
+
+    await expect(deleteCostPeriod('p1', client)).resolves.toEqual({ id: 'p1' });
   });
 });
