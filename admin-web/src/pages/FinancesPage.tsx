@@ -1917,7 +1917,7 @@ function OrdersTab({ token, range }: { token: string; range: { from: string; to:
         <div>
           <h2 className="text-sm font-semibold text-ink">按订单 P&L（最多 100 条）</h2>
           <p className="mt-1 text-xs text-slate-500">
-            毛利 = 订单总价 − Σ(OrderItem.totalCostCny)。某一条目没填成本则全单跳过成本统计。点「明细」看逐项收支。
+            毛利 = 订单总价 − 订单项成本；机票成本按班次实时口径计算，其他条目沿用成本快照。某一条目缺成本则全单显示未知。点「明细」看逐项收支。
           </p>
         </div>
         <ExportByOrderButton token={token} range={range} />
@@ -2186,6 +2186,9 @@ function OrderPnlDetailModal({
                         <span className="ml-1 text-xs text-slate-400">
                           {ITEM_KIND_LABEL[r.kind] ?? r.kind}
                         </span>
+                        {r.isRealtime && (
+                          <span className="ml-1 text-[10px] text-blue-600">·实时</span>
+                        )}
                       </td>
                       <td className="py-1.5 text-right tabular-nums text-slate-500">{r.quantity}</td>
                       <td className="py-1.5 text-right tabular-nums text-slate-600">

@@ -3,7 +3,71 @@ import { describe, it, expect, vi } from 'vitest';
 vi.mock('../../db/prisma.js', () => ({ prisma: {} }));
 
 import type { PrismaClient } from '@prisma/client';
-import { listSchedulesWithCost } from './finances.cost.service.js';
+import { listSchedulesWithCost, resolveFlightItemCost } from './finances.cost.service.js';
+
+function itemSchedule(overrides: Partial<{
+  charterCostCny: number | null;
+  airportTaxDepCny: number | null;
+  airportTaxArrCny: number | null;
+  fuelCostCny: number | null;
+  peakSurchargeCny: number | null;
+  aircraftAdjustCny: number | null;
+  takeoffDiscountCny: number | null;
+  seatClasses: { capacity: number }[];
+  departureTime: Date;
+  departureTz: string;
+}>) {
+  return {
+    departureTime: new Date('2026-07-22T10:00:00.000Z'),
+    departureTz: 'UTC',
+    charterCostCny: null,
+    airportTaxDepCny: null,
+    airportTaxArrCny: null,
+    fuelCostCny: null,
+    peakSurchargeCny: null,
+    aircraftAdjustCny: null,
+    takeoffDiscountCny: null,
+    seatClasses: [{ capacity: 10 }],
+    ...overrides,
+  };
+}
+
+describe('resolveFlightItemCost — 订单机票行实时成本', () => {
+  it('按班次生效成本和该行人数计算', () => {
+    expect(
+      resolveFlightItemCost(
+        itemSchedule({
+          charterCostCny: 1000,
+          airportTaxDepCny: 80,
+          airportTaxArrCny: 70,
+          fuelCostCny: 20,
+          peakSurchargeCny: 30,
+          aircraftAdjustCny: 10,
+          takeoffDiscountCny: 5,
+        }),
+        [],
+        2,
+      ),
+    ).toBe(610);
+  });
+
+  it('班次所有成本字段为空时返回 null', () => {
+    expect(resolveFlightItemCost(itemSchedule(), [], 2)).toBeNull();
+  });
+
+  it('包机费存在但总座位为 0 时按除零口径返回 null', () => {
+    expect(
+      resolveFlightItemCost(itemSchedule({ charterCostCny: 1000, seatClasses: [] }), [], 2),
+    ).toBeNull();
+  });
+
+  it('多腿订单的两条机票行分别按各自班次和人数计算', () => {
+    const outbound = itemSchedule({ charterCostCny: 1000, airportTaxDepCny: 50 });
+    const inbound = itemSchedule({ charterCostCny: 2000, airportTaxArrCny: 80 });
+    expect(resolveFlightItemCost(outbound, [], 2)).toBe(300);
+    expect(resolveFlightItemCost(inbound, [], 3)).toBe(840);
+  });
+});
 
 describe('listSchedulesWithCost — 财务口径：包机费÷全部座位，空座成本单列', () => {
   function schedule(opts: {

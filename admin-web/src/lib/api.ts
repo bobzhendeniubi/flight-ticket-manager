@@ -3694,6 +3694,8 @@ export interface OrderPnlDetailCostRow {
   kind: string;
   quantity: number;
   totalCostCny: number | null;
+  /** FLIGHT 行成本按班次实时口径计算 */
+  isRealtime: boolean;
 }
 export interface OrderPnlDetailMiscRow {
   label: string;

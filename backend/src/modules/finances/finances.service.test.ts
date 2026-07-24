@@ -26,6 +26,7 @@ import type { PrismaClient } from '@prisma/client';
 import {
   getFinancesSummary,
   getFlightPnl,
+  getOrderPnl,
   getMonthlyTrend,
   getOrderPnlDetail,
   visaItemCostCny,
@@ -476,6 +477,9 @@ function detailClient(order: DetailOrderFixture | null): PrismaClient {
     order: {
       findFirst: vi.fn(async () => order),
     },
+    flightCostPeriod: {
+      findMany: vi.fn().mockResolvedValue([]),
+    },
   } as unknown as PrismaClient;
 }
 
@@ -501,7 +505,19 @@ describe('getOrderPnlDetail — 单订单收支明细', () => {
           unitPrice: 4900,
           amount: 9800,
           totalCostCny: 7200,
-          flightSchedule: { departureTime: new Date('2026-08-10T01:00:00Z') },
+          flightSchedule: {
+            departureTime: new Date('2026-08-10T01:00:00Z'),
+            departureTz: 'UTC',
+            flightId: 'f-outbound',
+            charterCostCny: 1000,
+            airportTaxDepCny: null,
+            airportTaxArrCny: null,
+            fuelCostCny: null,
+            peakSurchargeCny: null,
+            aircraftAdjustCny: null,
+            takeoffDiscountCny: null,
+            seatClasses: [{ capacity: 10 }],
+          },
         }),
         detailItem({ kind: 'HOTEL', description: '海景房', amount: 3000, totalCostCny: 2000 }),
       ],
@@ -518,8 +534,10 @@ describe('getOrderPnlDetail — 单订单收支明细', () => {
     expect(detail.income.itemsSumCny).toBe(12800);
     expect(detail.income.totalCny).toBe(12800); // = Order.total
 
-    // 成本构成（逐 OrderItem.totalCostCny，getOrderPnl 口径）
-    expect(detail.cost.itemCostCny).toBe(9200); // 7200 + 2000
+    // 成本构成（机票按班次实时成本，其他行逐 OrderItem.totalCostCny）
+    expect(detail.cost.itemRows[0]).toMatchObject({ totalCostCny: 200, isRealtime: true });
+    expect(detail.cost.itemRows[1].isRealtime).toBe(false);
+    expect(detail.cost.itemCostCny).toBe(2200); // 1000 ÷ 10 × 2 + 2000
     expect(detail.cost.missingCostItemCount).toBe(0);
     // 杂项逐条 + 小计
     expect(detail.cost.miscRows).toHaveLength(2);
@@ -528,10 +546,10 @@ describe('getOrderPnlDetail — 单订单收支明细', () => {
     expect(detail.cost.totalWithMiscCny).toBe(9700);
 
     // 与订单毛利 tab 行严格一致：毛利 = total − itemCost（不含杂项）
-    expect(detail.grossMarginCny).toBe(3600); // 12800 − 9200
-    expect(detail.marginPct).toBeCloseTo(0.2813, 3);
+    expect(detail.grossMarginCny).toBe(10600); // 12800 − 2200
+    expect(detail.marginPct).toBeCloseTo(0.8281, 3);
     // 参考：含杂项完整毛利
-    expect(detail.grossMarginWithMiscCny).toBe(3100); // 12800 − 9700
+    expect(detail.grossMarginWithMiscCny).toBe(10100); // 12800 − 2700
 
     expect(detail.agentName).toBe('某旅行社');
     expect(detail.departureDate).toBe('2026-08-10');
@@ -602,5 +620,72 @@ describe('getOrderPnlDetail — 单订单收支明细', () => {
   it('订单不存在 / 已软删 → null', async () => {
     const detail = await getOrderPnlDetail('missing', detailClient(null));
     expect(detail).toBeNull();
+  });
+});
+
+describe('getOrderPnl — 机票实时成本与缺成本计数', () => {
+  it('同一订单多腿分别计算，非机票 null 仍计缺成本', async () => {
+    const client = {
+      order: {
+        findMany: vi.fn().mockResolvedValue([
+          {
+            id: 'o-flight',
+            orderNumber: 'FTM-1',
+            status: 'PAID',
+            contactName: '测试',
+            total: 1000,
+            createdAt: new Date('2026-07-22T00:00:00Z'),
+            items: [
+              { kind: 'FLIGHT', quantity: 2, totalCostCny: null, flightScheduleId: 's-out' },
+              { kind: 'FLIGHT', quantity: 1, totalCostCny: null, flightScheduleId: 's-in' },
+              { kind: 'HOTEL', quantity: 1, totalCostCny: null, flightScheduleId: null },
+            ],
+          },
+        ]),
+      },
+      flightSchedule: {
+        findMany: vi.fn().mockResolvedValue([
+          {
+            id: 's-out',
+            flightId: 'f-out',
+            departureTime: new Date('2026-07-22T00:00:00Z'),
+            departureTz: 'UTC',
+            charterCostCny: 1000,
+            airportTaxDepCny: null,
+            airportTaxArrCny: null,
+            fuelCostCny: null,
+            peakSurchargeCny: null,
+            aircraftAdjustCny: null,
+            takeoffDiscountCny: null,
+            seatClasses: [{ capacity: 10 }],
+          },
+          {
+            id: 's-in',
+            flightId: 'f-in',
+            departureTime: new Date('2026-07-23T00:00:00Z'),
+            departureTz: 'UTC',
+            charterCostCny: 500,
+            airportTaxDepCny: null,
+            airportTaxArrCny: null,
+            fuelCostCny: null,
+            peakSurchargeCny: null,
+            aircraftAdjustCny: null,
+            takeoffDiscountCny: null,
+            seatClasses: [{ capacity: 5 }],
+          },
+        ]),
+      },
+      flightCostPeriod: { findMany: vi.fn().mockResolvedValue([]) },
+    } as unknown as PrismaClient;
+
+    const [row] = await getOrderPnl(
+      { from: '2026-07-22', to: '2026-07-22' },
+      100,
+      client,
+    );
+
+    expect(row).toMatchObject({ costCny: null, grossMarginCny: null, missingCostItemCount: 1 });
+    expect(client.flightSchedule.findMany).toHaveBeenCalledTimes(1);
+    expect(client.flightCostPeriod.findMany).toHaveBeenCalledTimes(1);
   });
 });

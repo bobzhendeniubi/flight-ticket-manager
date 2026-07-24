@@ -25,6 +25,7 @@ import { prisma as defaultPrisma } from '../../db/prisma.js';
 import {
   findMatchedPeriod,
   loadPeriodsByFlightIds,
+  resolveFlightItemCost,
   resolveScheduleCost,
 } from './finances.cost.service.js';
 
@@ -159,7 +160,7 @@ export interface OrderPnlRow {
   contactName: string;
   createdAt: string; // ISO
   totalCny: number; // Order.total
-  costCny: number | null; // sum of OrderItem.totalCostCny；NULL = 有条目缺失
+  costCny: number | null; // FLIGHT 按班次实时成本，其余为快照；NULL = 有条目缺失
   grossMarginCny: number | null;
   marginPct: number | null;
   itemCount: number;
@@ -178,13 +179,15 @@ export interface OrderPnlDetailIncomeRow {
   isAdjustment: boolean;
 }
 
-/** 订单毛利明细 · 成本构成一行（逐 OrderItem 的 totalCostCny 快照） */
+/** 订单毛利明细 · 成本构成一行（非机票为快照，机票为班次实时成本） */
 export interface OrderPnlDetailCostRow {
   label: string;
   kind: string;
   quantity: number;
-  /** OrderItem.totalCostCny 快照；null = 该条目未回填成本（缺成本） */
+  /** 非机票为 OrderItem.totalCostCny 快照；机票为班次实时成本；null = 缺成本 */
   totalCostCny: number | null;
+  /** FLIGHT 行成本来自班次实时口径 */
+  isRealtime: boolean;
 }
 
 /** 订单毛利明细 · 杂项成本一行（逐 OrderCostItem） */
@@ -196,8 +199,9 @@ export interface OrderPnlDetailMiscRow {
 }
 
 /**
- * 单订单收支明细（下钻）。收入逐 OrderItem，成本逐 OrderItem.totalCostCny（与 getOrderPnl 同口径：
- * 缺任一件成本 → itemCostCny=null「未知」，不造 0）。另把订单杂项成本 OrderCostItem 逐条列出。
+ * 单订单收支明细（下钻）。收入逐 OrderItem，FLIGHT 成本按班次实时计算，其他成本逐
+ * OrderItem.totalCostCny 快照（与 getOrderPnl 同口径：缺任一件成本 → itemCostCny=null「未知」，
+ * 不造 0）。另把订单杂项成本 OrderCostItem 逐条列出。
  *
  * 口径分层（刻意不合并，避免与「订单毛利」列表/导出对不上）：
  *   grossMarginCny         = totalCny − itemCostCny —— 与订单毛利 tab 行/按订单导出 **严格一致**（不含杂项）
@@ -222,7 +226,7 @@ export interface OrderPnlDetail {
   cost: {
     itemRows: OrderPnlDetailCostRow[];
     miscRows: OrderPnlDetailMiscRow[];
-    /** Σ OrderItem.totalCostCny；缺任一件 → null（getOrderPnl 口径） */
+    /** Σ 订单项成本（FLIGHT 实时、其他快照）；缺任一件 → null（getOrderPnl 口径） */
     itemCostCny: number | null;
     /** Σ OrderCostItem.amountCny */
     miscCostCny: number;
@@ -749,16 +753,76 @@ export async function getOrderPnl(
       contactName: true,
       total: true,
       createdAt: true,
-      items: { select: { totalCostCny: true } },
+      items: {
+        select: {
+          kind: true,
+          quantity: true,
+          totalCostCny: true,
+          flightScheduleId: true,
+        },
+      },
     },
   });
+
+  // 订单集合内的班次和周期各批量查询一次，避免按订单/订单项 N+1。
+  const flightScheduleIds = Array.from(
+    new Set(
+      orders.flatMap((order) =>
+        order.items
+          .filter((item) => item.kind === 'FLIGHT' && item.flightScheduleId != null)
+          .map((item) => item.flightScheduleId as string),
+      ),
+    ),
+  );
+  const schedules =
+    flightScheduleIds.length === 0
+      ? []
+      : await client.flightSchedule.findMany({
+          where: { id: { in: flightScheduleIds } },
+          select: {
+            id: true,
+            flightId: true,
+            departureTime: true,
+            departureTz: true,
+            charterCostCny: true,
+            airportTaxDepCny: true,
+            airportTaxArrCny: true,
+            fuelCostCny: true,
+            peakSurchargeCny: true,
+            aircraftAdjustCny: true,
+            takeoffDiscountCny: true,
+            seatClasses: { select: { capacity: true } },
+          },
+        });
+  const schedulesMap = new Map(schedules.map((schedule) => [schedule.id, schedule]));
+  const periodsMap = await loadPeriodsByFlightIds(
+    Array.from(new Set(schedules.map((schedule) => schedule.flightId))),
+    client,
+  );
 
   return orders.map<OrderPnlRow>((o) => {
     let costSum = 0;
     let missing = 0;
     for (const it of o.items) {
-      if (it.totalCostCny == null) missing += 1;
-      else costSum += dec(it.totalCostCny);
+      const cost =
+        it.kind === 'FLIGHT'
+          ? (() => {
+              const schedule = it.flightScheduleId
+                ? schedulesMap.get(it.flightScheduleId)
+                : undefined;
+              return schedule == null
+                ? null
+                : resolveFlightItemCost(
+                    schedule,
+                    periodsMap.get(schedule.flightId) ?? [],
+                    it.quantity,
+                  );
+            })()
+          : it.totalCostCny == null
+            ? null
+            : dec(it.totalCostCny);
+      if (cost == null) missing += 1;
+      else costSum += cost;
     }
     const hasFullCost = missing === 0;
     const total = dec(o.total);
@@ -783,7 +847,8 @@ export async function getOrderPnl(
 
 /**
  * 单订单收支明细（下钻）。
- * 成本口径与 getOrderPnl 完全一致：逐 OrderItem.totalCostCny 快照，缺任一件 → itemCostCny=null。
+ * 成本口径与 getOrderPnl 完全一致：FLIGHT 行按班次实时成本，其他 OrderItem 读成本快照，
+ * 缺任一件 → itemCostCny=null。
  * 额外把订单杂项成本 OrderCostItem 逐条列出（分层单列，不并入与列表严格一致的 grossMarginCny）。
  * 订单不存在 / 已软删 → null（路由据此回 404）。
  */
@@ -815,7 +880,21 @@ export async function getOrderPnlDetail(
           amount: true,
           totalCostCny: true,
           metadata: true,
-          flightSchedule: { select: { departureTime: true } },
+          flightSchedule: {
+            select: {
+              flightId: true,
+              departureTime: true,
+              departureTz: true,
+              charterCostCny: true,
+              airportTaxDepCny: true,
+              airportTaxArrCny: true,
+              fuelCostCny: true,
+              peakSurchargeCny: true,
+              aircraftAdjustCny: true,
+              takeoffDiscountCny: true,
+              seatClasses: { select: { capacity: true } },
+            },
+          },
         },
       },
     },
@@ -836,11 +915,30 @@ export async function getOrderPnlDetail(
   });
   const itemsSum = order.items.reduce((a, it) => a + dec(it.amount), 0);
 
-  // ── 成本构成：逐 OrderItem.totalCostCny（getOrderPnl 现行口径；缺任一件 → 全单未知）──
+  // ── 成本构成：FLIGHT 按班次实时成本，其他行读 totalCostCny（缺任一件 → 全单未知）──
+  const flightIds = Array.from(
+    new Set(
+      order.items.flatMap((item) =>
+        item.kind === 'FLIGHT' && item.flightSchedule ? [item.flightSchedule.flightId] : [],
+      ),
+    ),
+  );
+  const periodsMap = await loadPeriodsByFlightIds(flightIds, client);
   let itemCostSum = 0;
   let missing = 0;
   const costItemRows = order.items.map<OrderPnlDetailCostRow>((it) => {
-    const c = it.totalCostCny == null ? null : dec(it.totalCostCny);
+    const c =
+      it.kind === 'FLIGHT'
+        ? it.flightSchedule == null
+          ? null
+          : resolveFlightItemCost(
+              it.flightSchedule,
+              periodsMap.get(it.flightSchedule.flightId) ?? [],
+              it.quantity,
+            )
+        : it.totalCostCny == null
+          ? null
+          : dec(it.totalCostCny);
     if (c == null) missing += 1;
     else itemCostSum += c;
     return {
@@ -848,6 +946,7 @@ export async function getOrderPnlDetail(
       kind: it.kind,
       quantity: it.quantity,
       totalCostCny: c == null ? null : round2(c),
+      isRealtime: it.kind === 'FLIGHT',
     };
   });
   const itemCostCny = missing === 0 ? round2(itemCostSum) : null;

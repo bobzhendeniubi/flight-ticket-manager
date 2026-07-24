@@ -2,8 +2,8 @@
  * 财务对账 xlsx 导出 — 一行一订单（订单毛利）
  *
  * 口径：直接复用 getOrderPnl（订单毛利 tab 同一算法），一行一订单。
- *   收入 = Order.total；成本 = Σ OrderItem.totalCostCny（缺任一件 → 该单成本/毛利/毛利率留空，
- *   并在「缺成本项数」列标数量——照现有口径，绝不把缺失当 0）。
+ *   收入 = Order.total；非机票行成本取 OrderItem.totalCostCny，FLIGHT 行按班次实时口径计算；
+ *   缺任一件 → 该单成本/毛利/毛利率留空，并在「缺成本项数」列标数量——照现有口径，绝不把缺失当 0。
  *   杂项成本 OrderCostItem 不并入本导出（与 getOrderPnl 列表口径一致，见「订单毛利」明细弹层）。
  *
  * 仅比列表多两列上下文：代理 + 出发日期（最早航段）——用二次查询按 orderId 补齐，

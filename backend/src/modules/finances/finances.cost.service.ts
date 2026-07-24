@@ -66,28 +66,28 @@ export interface EffectiveCost {
   takeoffDiscountCnySource: CostSource;
 }
 
-interface ScheduleCostInputs {
+export interface ScheduleCostInputs {
   departureTime: Date;
   departureTz: string;
-  charterCostCny: Prisma.Decimal | null;
-  airportTaxDepCny: Prisma.Decimal | null;
-  airportTaxArrCny: Prisma.Decimal | null;
-  fuelCostCny: Prisma.Decimal | null;
-  peakSurchargeCny: Prisma.Decimal | null;
-  aircraftAdjustCny: Prisma.Decimal | null;
-  takeoffDiscountCny: Prisma.Decimal | null;
+  charterCostCny: Prisma.Decimal | number | null;
+  airportTaxDepCny: Prisma.Decimal | number | null;
+  airportTaxArrCny: Prisma.Decimal | number | null;
+  fuelCostCny: Prisma.Decimal | number | null;
+  peakSurchargeCny: Prisma.Decimal | number | null;
+  aircraftAdjustCny: Prisma.Decimal | number | null;
+  takeoffDiscountCny: Prisma.Decimal | number | null;
 }
 
-interface PeriodInputs {
+export interface PeriodInputs {
   effectiveFrom: Date;
   effectiveTo: Date;
-  charterCostCny: Prisma.Decimal | null;
-  airportTaxDepCny: Prisma.Decimal | null;
-  airportTaxArrCny: Prisma.Decimal | null;
-  fuelCostCny: Prisma.Decimal | null;
-  peakSurchargeCny: Prisma.Decimal | null;
-  aircraftAdjustCny: Prisma.Decimal | null;
-  takeoffDiscountCny: Prisma.Decimal | null;
+  charterCostCny: Prisma.Decimal | number | null;
+  airportTaxDepCny: Prisma.Decimal | number | null;
+  airportTaxArrCny: Prisma.Decimal | number | null;
+  fuelCostCny: Prisma.Decimal | number | null;
+  peakSurchargeCny: Prisma.Decimal | number | null;
+  aircraftAdjustCny: Prisma.Decimal | number | null;
+  takeoffDiscountCny: Prisma.Decimal | number | null;
 }
 
 /** 在给定航班的周期列表里，找覆盖该班次出发日（按航班出发地时区）的那一条。 */
@@ -109,8 +109,8 @@ export function resolveScheduleCost(
   matchedPeriod: PeriodInputs | null,
 ): EffectiveCost {
   const pick = (
-    override: Prisma.Decimal | null,
-    period: Prisma.Decimal | null | undefined,
+    override: Prisma.Decimal | number | null,
+    period: Prisma.Decimal | number | null | undefined,
   ): { value: number | null; source: CostSource } => {
     const o = dec(override);
     if (o != null) return { value: round2(o), source: 'override' };
@@ -141,6 +141,48 @@ export function resolveScheduleCost(
     aircraftAdjustCnySource: adj.source,
     takeoffDiscountCnySource: disc.source,
   };
+}
+
+/**
+ * 计算单条 FLIGHT OrderItem 的实时成本。
+ *
+ * 机票订单行不保存成本快照，成本按班次生效成本实时计算：
+ *   (包机费 ÷ 总座位 + 机场税 + 燃油 + 旺季 + 机型调整 − 起降折扣) × 行人数
+ * 成本字段全部为空，或包机费存在但总座位为 0 无法分摊时，返回 null，
+ * 由调用方按缺成本处理；其余单项为空按财务口径视为 0。
+ */
+export function resolveFlightItemCost(
+  schedule: ScheduleCostInputs & { seatClasses: Array<{ capacity: number }> },
+  periodsForFlight: PeriodInputs[],
+  quantity: number,
+): number | null {
+  const matched = findMatchedPeriod(schedule, periodsForFlight);
+  const effective = resolveScheduleCost(schedule, matched);
+  const values = [
+    effective.charterCostCny,
+    effective.airportTaxDepCny,
+    effective.airportTaxArrCny,
+    effective.fuelCostCny,
+    effective.peakSurchargeCny,
+    effective.aircraftAdjustCny,
+    effective.takeoffDiscountCny,
+  ];
+  if (values.every((value) => value == null)) return null;
+
+  const totalSeats = schedule.seatClasses.reduce((sum, seatClass) => sum + seatClass.capacity, 0);
+  if (effective.charterCostCny != null && totalSeats === 0) return null;
+
+  const perSeatCharter =
+    effective.charterCostCny == null ? 0 : effective.charterCostCny / totalSeats;
+  const unitCost =
+    perSeatCharter +
+    (effective.airportTaxDepCny ?? 0) +
+    (effective.airportTaxArrCny ?? 0) +
+    (effective.fuelCostCny ?? 0) +
+    (effective.peakSurchargeCny ?? 0) +
+    (effective.aircraftAdjustCny ?? 0) -
+    (effective.takeoffDiscountCny ?? 0);
+  return round2(unitCost * quantity);
 }
 
 /** 给一批 flightIds 批量预加载周期，返回 Map<flightId, periods[]>。用 listSchedulesWithCost/getFlightPnl/export 这种批处理。 */
