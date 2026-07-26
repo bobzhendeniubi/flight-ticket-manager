@@ -8,7 +8,7 @@
  * 覆盖：
  *   - 冻结定价：swap 后 amount/unitPrice 不变（HOTEL 行、BUNDLE 行两种 kind）
  *   - 差价：feeCny（正/负）进 adjustmentCny + adjustments 流水 HOTEL_SWAP_FEE
- *   - 逐晚余量校验：目标酒店余房不足 → 拒单并列出夜晚；未配包房（block=0）→ 放行 + 标记 untrackedNights
+ *   - 逐晚余量校验：目标酒店实际房间不足 → 拒单并列出夜晚；未配包房（block=0）→ 放行 + 标记 untrackedNights
  *   - 同酒店换房型跳过余量校验（净房量不变，不受本单自身占用影响）
  *   - Order.roomAssignment.roomGroups 里匹配旧酒店名的组被改名，不匹配的组不动
  *   - 非酒店行 / 房型相同 / 目标酒店下架 / 非 ADMIN·STAFF 调用被拒
@@ -373,7 +373,7 @@ describe('OrderService.swapItemHotel · 真 DB E2E', () => {
     expect(reloaded.adjustmentCny).toBe(5000);
   });
 
-  it('目标酒店余房不足 → 拒单并在错误信息里列出不足的夜晚；订单行不被改动', async () => {
+  it('目标酒店实际房间不足 → 拒单并在错误信息里列出不足的夜晚；订单行不被改动', async () => {
     const actor = await adminActor();
     const src = await createHotelWithRoomType();
     const dest = await createHotelWithRoomType();
@@ -399,7 +399,7 @@ describe('OrderService.swapItemHotel · 真 DB E2E', () => {
 
     await expect(
       service.swapItemHotel(order.id, order.items[0].id, { newHotelRoomTypeId: dest.roomType.id }, actor),
-    ).rejects.toThrow(/目标酒店.*余房不足/);
+    ).rejects.toThrow(/目标酒店.*实际房间不足/);
 
     const item = await prisma.orderItem.findUniqueOrThrow({ where: { id: order.items[0].id } });
     expect(item.hotelRoomTypeId).toBe(src.roomType.id); // 拒单后未被改动

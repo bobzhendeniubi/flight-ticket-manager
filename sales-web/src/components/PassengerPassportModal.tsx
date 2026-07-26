@@ -56,6 +56,23 @@ function toDateInput(v?: string | null): string {
   return v ? v.slice(0, 10) : '';
 }
 
+/** 证件有效期格式：YYYY-MM-DD（与后端同款正则） */
+const DATE_INPUT_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * 证件有效期提醒：不足 6 个月 / 已过期时给一句黄字提示（同结算页口径）。
+ * 只提醒、不拦截 —— 各目的地入境要求不同，交由客服跟进。
+ */
+function expiryNotice(expiry: string): string | null {
+  if (!DATE_INPUT_RE.test(expiry)) return null;
+  const end = new Date(`${expiry}T00:00:00`);
+  if (Number.isNaN(end.getTime())) return null;
+  const days = Math.floor((end.getTime() - Date.now()) / 86_400_000);
+  if (days < 0) return '该证件已过期，请更换为在有效期内的证件';
+  if (days < 180) return '有效期不足 6 个月，多数目的地要求 6 个月以上，建议先换发新证件';
+  return null;
+}
+
 export function PassengerPassportModal({
   token,
   orderId,
@@ -169,6 +186,13 @@ export function PassengerPassportModal({
 
   const save = async () => {
     setError(null);
+
+    // 证件有效期必填：补录本就是为了补齐这一项。已有值的老出行人表单已预填，不会被误伤；
+    // 真正空着的（存量缺失单）必须补上才能保存。后端补录接口仍保持可选（存量单可继续编辑）。
+    if (!DATE_INPUT_RE.test(form.passportExpiry)) {
+      setError('请填写证件有效期（护照资料页「有效期至」），这是出行必需信息');
+      return;
+    }
 
     // 只发「改动过且非空」的字段（后端全可选但至少一个；不发空串防校验失败）
     const body: UpdatePassengerInput = {};
@@ -388,13 +412,19 @@ export function PassengerPassportModal({
             )}
           </div>
           <div>
-            <label className="label text-xs">护照有效期至</label>
+            <label className="label text-xs">证件有效期 *（护照资料页「有效期至」）</label>
             <input
               type="date"
               className="input"
+              required
               value={form.passportExpiry}
               onChange={(e) => setField('passportExpiry', e.target.value)}
             />
+            {expiryNotice(form.passportExpiry) && (
+              <p className="mt-1 text-xs font-medium text-amber-700">
+                {expiryNotice(form.passportExpiry)}
+              </p>
+            )}
           </div>
           <div>
             <label className="label text-xs">护照签发日期</label>

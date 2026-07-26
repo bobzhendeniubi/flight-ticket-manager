@@ -178,8 +178,34 @@ describe('listDeletedOrders · 口径与映射', () => {
   });
 });
 
-describe('listDeletedOrders · search 模糊匹配（订单号/联系人名/乘客姓名含中文名）', () => {
-  it('不传 search 时 where 不含 OR（保持原口径）', async () => {
+describe('listDeletedOrders · search 分词（与主列表同口径：词间 AND，护照号/备注可搜）', () => {
+  /** 主列表口径的单词 OR 块（字面写死，不复用实现——防实现与测试同错）。 */
+  const expectedTermClause = (term: string) => ({
+    OR: [
+      { orderNumber: { contains: term, mode: 'insensitive' } },
+      { contactName: { contains: term, mode: 'insensitive' } },
+      { contactPhone: { contains: term } },
+      { notes: { contains: term, mode: 'insensitive' } },
+      { internalNotes: { contains: term, mode: 'insensitive' } },
+      { noteHotel: { contains: term, mode: 'insensitive' } },
+      { noteVisa: { contains: term, mode: 'insensitive' } },
+      { notePayment: { contains: term, mode: 'insensitive' } },
+      { noteSpecial: { contains: term, mode: 'insensitive' } },
+      {
+        passengers: {
+          some: {
+            OR: [
+              { fullName: { contains: term, mode: 'insensitive' } },
+              { chineseName: { contains: term, mode: 'insensitive' } },
+              { documentNumber: { contains: term, mode: 'insensitive' } },
+            ],
+          },
+        },
+      },
+    ],
+  });
+
+  it('不传 search 时 where 不含 AND/OR（保持原口径）', async () => {
     mockPrisma.order.findMany.mockResolvedValue([]);
     mockPrisma.order.count.mockResolvedValue(0);
 
@@ -189,33 +215,68 @@ describe('listDeletedOrders · search 模糊匹配（订单号/联系人名/乘�
     expect(findArg.where).toEqual({ deletedAt: { not: null } });
   });
 
-  it('传 search 时 where 加 OR：订单号 / 联系人名 / 乘客姓名（含中文名）模糊匹配', async () => {
+  it('单词向后兼容：where.AND 单元素，OR 覆盖订单号/联系人/电话/备注六栏/乘客名', async () => {
     mockPrisma.order.findMany.mockResolvedValue([]);
     mockPrisma.order.count.mockResolvedValue(0);
 
-    await service.listDeletedOrders({ page: 1, pageSize: 50, search: '张三' }, ADMIN);
+    await service.listDeletedOrders({ page: 1, pageSize: 50, search: '陈小雨' }, ADMIN);
 
     const findArg = mockPrisma.order.findMany.mock.calls[0][0];
     expect(findArg.where).toEqual({
       deletedAt: { not: null },
-      OR: [
-        { orderNumber: { contains: '张三', mode: 'insensitive' } },
-        { contactName: { contains: '张三', mode: 'insensitive' } },
-        {
-          passengers: {
-            some: {
-              OR: [
-                { fullName: { contains: '张三', mode: 'insensitive' } },
-                { chineseName: { contains: '张三', mode: 'insensitive' } },
-              ],
-            },
-          },
-        },
-      ],
+      AND: [expectedTermClause('陈小雨')],
     });
     // count 也要用同一个 where（分页 total 与筛选口径一致）
     const countArg = mockPrisma.order.count.mock.calls[0][0];
     expect(countArg.where).toEqual(findArg.where);
+  });
+
+  it('多词跨乘客：空格分词后词间 AND —— 两个乘客名各自命中一词才算中', async () => {
+    mockPrisma.order.findMany.mockResolvedValue([]);
+    mockPrisma.order.count.mockResolvedValue(0);
+
+    await service.listDeletedOrders(
+      { page: 1, pageSize: 50, search: '陈小雨 林大山' },
+      ADMIN,
+    );
+
+    const findArg = mockPrisma.order.findMany.mock.calls[0][0];
+    // 词间 AND：每个词各自独立展开成一组 OR，跨乘客（passengers.some 各词独立）命中同一单
+    expect(findArg.where).toEqual({
+      deletedAt: { not: null },
+      AND: [expectedTermClause('陈小雨'), expectedTermClause('林大山')],
+    });
+  });
+
+  it('护照号可搜：证件号词也展开到 passengers.documentNumber（含于每词 OR 块）', async () => {
+    mockPrisma.order.findMany.mockResolvedValue([]);
+    mockPrisma.order.count.mockResolvedValue(0);
+
+    await service.listDeletedOrders({ page: 1, pageSize: 50, search: 'EA1234567' }, ADMIN);
+
+    const findArg = mockPrisma.order.findMany.mock.calls[0][0];
+    const clause = findArg.where.AND[0];
+    expect(clause.OR).toContainEqual({
+      passengers: {
+        some: {
+          OR: [
+            { fullName: { contains: 'EA1234567', mode: 'insensitive' } },
+            { chineseName: { contains: 'EA1234567', mode: 'insensitive' } },
+            { documentNumber: { contains: 'EA1234567', mode: 'insensitive' } },
+          ],
+        },
+      },
+    });
+  });
+
+  it('纯分隔符 search（如全空格）→ 分词为空，where 不叠加 AND', async () => {
+    mockPrisma.order.findMany.mockResolvedValue([]);
+    mockPrisma.order.count.mockResolvedValue(0);
+
+    await service.listDeletedOrders({ page: 1, pageSize: 50, search: '  、, ' }, ADMIN);
+
+    const findArg = mockPrisma.order.findMany.mock.calls[0][0];
+    expect(findArg.where).toEqual({ deletedAt: { not: null } });
   });
 });
 

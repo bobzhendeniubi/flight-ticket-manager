@@ -560,12 +560,17 @@ export interface CreateOrderInput {
     nationality?: string;
     passengerType?: PassengerType;
     /**
-     * 护照全采集字段（客源地分析）—— 仅在前台 OCR 命中 MRZ 时带出，手填不要求。
-     * 镜像后端 passengerInputSchema：gender enum 'M'|'F'|'X'；passportExpiry/passportIssueCountry
-     * 全 optional，空值请省略（不要发 '' —— passportExpiry 的 YYYY-MM-DD 正则会拒空串）。
+     * 证件有效期 YYYY-MM-DD —— 订单含机票/套餐/签证行时**每位出行人必填**（后端
+     * createOrderBodySchema 同款拦截，缺失一律 400）；纯酒店/接送单选填。
+     * 结算页作必填项采集，OCR 命中 MRZ 时自动带出。空值请省略，不要发 ''（正则会拒空串）。
+     */
+    passportExpiry?: string;
+    /**
+     * 其余护照全采集字段（客源地分析）—— 仅在前台 OCR 命中 MRZ 时带出，手填不要求。
+     * 镜像后端 passengerInputSchema：gender enum 'M'|'F'|'X'；passportIssueCountry 为 ISO-2 码。
+     * 全 optional，空值请省略（不要发 '' —— 后端正则/长度校验会拒空串）。
      */
     gender?: 'M' | 'F' | 'X';
-    passportExpiry?: string; // YYYY-MM-DD
     passportIssueCountry?: string; // ISO-2
     /**
      * 护照签发地点（自由文本，如「广东省广州市」）—— 与 ISO-2 签发国 passportIssueCountry 区分开。

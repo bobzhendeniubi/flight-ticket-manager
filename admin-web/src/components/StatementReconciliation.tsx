@@ -59,14 +59,20 @@ const DISPOSITION_META: Record<StatementDisposition, { label: string; cls: strin
   dup_in_db: { label: '已在系统', cls: 'bg-sky-50 text-sky-700' },
   dup_in_file: { label: '文件内重复', cls: 'bg-amber-50 text-amber-700' },
   skipped_status: { label: '非支付成功', cls: 'bg-slate-100 text-slate-500' },
-  skipped_type: { label: '非消费类型', cls: 'bg-slate-100 text-slate-500' },
+  skipped_type: { label: '非收款/消费类型', cls: 'bg-slate-100 text-slate-500' },
   invalid: { label: '无法解析', cls: 'bg-rose-50 text-rose-700' },
 };
 
-const STATEMENT_PLATFORM_OPTIONS: Array<{ value: StatementPlatform; label: string }> = [
+const STATEMENT_PLATFORM_OPTIONS: Array<{
+  value: StatementPlatform;
+  label: string;
+  /** 平台特殊说明（如导出模板要求），选项下方小字展示 */
+  note?: string;
+}> = [
   { value: 'CMB_QR', label: '招行二维码' },
   { value: 'YISHOUBAO', label: '宜收宝' },
   { value: 'XINGYIFU', label: '星驿付' },
+  { value: 'HUISHENGHUO', label: '会生活', note: '请用逐笔明细模板导出（按日汇总表不支持）' },
 ];
 
 interface StatementReconciliationProps {
@@ -868,7 +874,12 @@ function StatementPlatformPickerModal({
                 checked={value === option.value}
                 onChange={() => onChange(option.value)}
               />
-              <span>{option.label}</span>
+              <span className="flex flex-col">
+                <span>{option.label}</span>
+                {option.note && (
+                  <span className="text-[11px] text-ink-muted">{option.note}</span>
+                )}
+              </span>
             </label>
           ))}
         </div>
@@ -927,7 +938,7 @@ function ImportPreviewModal({
           )}
           <span className="badge-neutral">非成功状态 {summary.skippedStatus}</span>
           {summary.skippedType > 0 && (
-            <span className="badge-neutral">非消费类型 {summary.skippedType}</span>
+            <span className="badge-neutral">非收款/消费类型 {summary.skippedType}</span>
           )}
           {summary.invalid > 0 && <span className="badge-danger">无法解析 {summary.invalid}</span>}
           <span className="text-ink-muted">共 {summary.total} 行</span>

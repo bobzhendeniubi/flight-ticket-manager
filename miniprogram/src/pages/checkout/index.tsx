@@ -18,6 +18,11 @@ interface PassengerForm {
   fullName: string;
   passportNumber: string;
   dateOfBirth: string;
+  /**
+   * 证件有效期 YYYY-MM-DD —— 必填。小程序购物车只提交机票行（按人出行产品），
+   * 后端下单接口对这类单同款拦截，所以这里无条件必填。
+   */
+  passportExpiry: string;
   nationality: string;
 }
 
@@ -25,8 +30,26 @@ const EMPTY: PassengerForm = {
   fullName: '',
   passportNumber: '',
   dateOfBirth: '',
+  passportExpiry: '',
   nationality: 'CN',
 };
+
+/** 日期格式：YYYY-MM-DD（与后端同款正则） */
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * 证件有效期提醒：不足 6 个月 / 已过期给一句黄字提示（同 H5 端口径）。
+ * 只提醒、不拦截 —— 各目的地入境要求不同，交由客服跟进。
+ */
+function expiryNotice(expiry: string): string | null {
+  if (!DATE_RE.test(expiry)) return null;
+  const end = new Date(`${expiry}T00:00:00`);
+  if (Number.isNaN(end.getTime())) return null;
+  const days = Math.floor((end.getTime() - Date.now()) / 86400000);
+  if (days < 0) return '该证件已过期，请更换为在有效期内的证件';
+  if (days < 180) return '有效期不足 6 个月，多数目的地要求 6 个月以上，建议先换发新证件';
+  return null;
+}
 
 export default function CheckoutPage() {
   const { items, hydrate, hydrated, clear, ensureIdempotencyKey } = useCart();
@@ -80,6 +103,15 @@ export default function CheckoutPage() {
       Taro.showToast({ title: '请填写所有乘客信息', icon: 'none' });
       return;
     }
+    // 证件有效期必填：文案指到第几位出行人（后端同款拦截，这里先本地挡一道）
+    const badExpiryIdx = passengers.findIndex((p) => !DATE_RE.test(p.passportExpiry.trim()));
+    if (badExpiryIdx >= 0) {
+      Taro.showToast({
+        title: `请填写第 ${badExpiryIdx + 1} 位出行人的证件有效期（如 2031-01-01）`,
+        icon: 'none',
+      });
+      return;
+    }
 
     setSubmitting(true);
     // 从 store 拿持久化的 key（跨 remount / 导航 / 小程序重启仍稳定）
@@ -110,6 +142,8 @@ export default function CheckoutPage() {
           documentType: 'PASSPORT',
           documentNumber: p.passportNumber,
           dateOfBirth: p.dateOfBirth,
+          // 证件有效期：全渠道必填，提交前已按 YYYY-MM-DD 校验
+          passportExpiry: p.passportExpiry.trim(),
           nationality: p.nationality,
           passengerType: 'ADULT',
         })),
@@ -188,6 +222,11 @@ export default function CheckoutPage() {
             <Input className='input' value={p.passportNumber} onInput={(e) => updatePassenger(idx, { passportNumber: e.detail.value.toUpperCase() })} />
             <Text className='label'>出生日期（YYYY-MM-DD）</Text>
             <Input className='input' value={p.dateOfBirth} placeholder='1990-01-01' onInput={(e) => updatePassenger(idx, { dateOfBirth: e.detail.value })} />
+            <Text className='label'>证件有效期（护照资料页「有效期至」，YYYY-MM-DD）</Text>
+            <Input className='input' value={p.passportExpiry} placeholder='2031-01-01' onInput={(e) => updatePassenger(idx, { passportExpiry: e.detail.value })} />
+            {expiryNotice(p.passportExpiry) && (
+              <View className='warning'>{expiryNotice(p.passportExpiry)}</View>
+            )}
           </View>
         ))}
       </View>

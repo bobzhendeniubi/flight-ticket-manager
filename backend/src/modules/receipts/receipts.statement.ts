@@ -7,7 +7,8 @@
  *
  * 解析容错（与名单导入 roster.ts 同纪律：宽容 ≠ 静默，可疑必 warning）：
  *   - 表头行自动定位（前 10 行内找含「交易流水号」的行），列序按表头名对号，不写死列号。
- *   - 仅平台注册表中配置的成功状态（星驿付还需「消费」类型）可导入。
+ *   - 仅平台注册表中配置的成功状态（星驿付还需「消费」类型；会生活还需「收款」类型
+ *     且「当前状态=正常」，金额取「实付金额」＝客户实付口径）可导入。
  *   - 文件内流水号重复 → 后出现的行标记跳过（防平台导出叠加时段产生的重复）。
  *   - 金额/时间/流水号任一不可解析 → 该行标 invalid + warning，绝不猜值入库。
  *
@@ -24,6 +25,7 @@ export const STATEMENT_PLATFORMS = [
   'CMB_QR',
   'YISHOUBAO',
   'XINGYIFU',
+  'HUISHENGHUO',
 ] as const;
 export type StatementPlatform = (typeof STATEMENT_PLATFORMS)[number];
 
@@ -117,6 +119,7 @@ type StatementColumnKey =
   | 'method'
   | 'status'
   | 'txnType'
+  | 'currentStatus'
   | 'payerNote'
   | 'remark'
   | 'qrRemark'
@@ -131,6 +134,8 @@ interface StatementPlatformConfig {
   detectBy: StatementColumnKey[];
   successStatus: string;
   successType?: string;
+  /** 平台带「当前状态」列时的可导入值（如会生活的「正常」——撤销/冲正行不入池）。 */
+  successCurrentStatus?: string;
   storagePrefix: string;
   mapMethod: (raw: string) => PaymentMethod;
 }
@@ -152,6 +157,7 @@ export const STATEMENT_PLATFORM_CONFIGS: Record<StatementPlatform, StatementPlat
       method: '支付方式',
       status: '交易状态',
       txnType: '',
+      currentStatus: '',
       qrRemark: '二维码备注',
       payerRemark: '支付付款方备注',
       payerNote: '',
@@ -173,6 +179,7 @@ export const STATEMENT_PLATFORM_CONFIGS: Record<StatementPlatform, StatementPlat
       method: '交易方式',
       status: '交易状态',
       txnType: '',
+      currentStatus: '',
       payerNote: '付款人',
       remark: '备注',
       qrRemark: '',
@@ -193,6 +200,7 @@ export const STATEMENT_PLATFORM_CONFIGS: Record<StatementPlatform, StatementPlat
       method: '支付方式',
       status: '交易状态',
       txnType: '交易类型',
+      currentStatus: '',
       payerNote: '付款人ID',
       remark: '备注',
       qrRemark: '',
@@ -203,6 +211,31 @@ export const STATEMENT_PLATFORM_CONFIGS: Record<StatementPlatform, StatementPlat
     successStatus: '交易成功',
     successType: '消费',
     storagePrefix: 'XYF:',
+    mapMethod: mapWechatAlipayOrCard,
+  },
+  HUISHENGHUO: {
+    label: '会生活',
+    headers: {
+      // 金额取「实付金额」（客户实际支付口径，有平台优惠时 ≠「交易金额」）；
+      // 认款对的是客户付了多少，手续费/商户入账金额不参与。
+      txnId: '商户订单号',
+      time: '交易时间',
+      amount: '实付金额',
+      method: '支付方式',
+      status: '交易状态',
+      txnType: '交易类型',
+      currentStatus: '当前状态',
+      payerNote: '收款备注',
+      remark: '',
+      qrRemark: '',
+      payerRemark: '',
+    },
+    required: ['txnId', 'time', 'amount', 'method', 'status', 'txnType', 'currentStatus'],
+    detectBy: ['txnId', 'time', 'amount'],
+    successStatus: '收款成功',
+    successType: '收款',
+    successCurrentStatus: '正常',
+    storagePrefix: 'HSH:',
     mapMethod: mapWechatAlipayOrCard,
   },
 };
@@ -223,6 +256,9 @@ export function statementPlatformFileError(platform: StatementPlatform): string 
     .slice(0, 3)
     .map((key) => config.headers[key])
     .join(' / ');
+  if (platform === 'HUISHENGHUO') {
+    return `未找到会生活表头行（需含「${basicHeaders}」列——请上传会生活导出的逐笔明细模板，按日汇总表不支持）`;
+  }
   return `未找到${config.label}表头行（需含「${basicHeaders}」列——请上传${config.label}导出的交易流水原表）`;
 }
 
@@ -318,6 +354,7 @@ export async function parseStatementXlsx(
     const rawStatus = cellText(getCol('status')).trim();
     const rawMethod = cellText(getCol('method')).trim();
     const rawType = cellText(getCol('txnType')).trim();
+    const rawCurrentStatus = cellText(getCol('currentStatus')).trim();
     const amountCny = parseAmount(getCol('amount'));
     const receivedAt = parseTxnTime(getCol('time'));
     const payerNoteValue = cellText(getCol('payerNote')).trim();
@@ -355,6 +392,9 @@ export async function parseStatementXlsx(
       disposition = 'skipped_status';
     } else if (config.successType && rawType !== config.successType) {
       disposition = 'skipped_type';
+    } else if (config.successCurrentStatus && rawCurrentStatus !== config.successCurrentStatus) {
+      // 「当前状态」非正常（撤销/冲正等）= 钱最终没留住，按非成功处理不入池
+      disposition = 'skipped_status';
     } else if (seenTxnIds.has(txnId)) {
       disposition = 'dup_in_file';
       warnings.push(`第 ${rowNumber} 行：交易流水号 ${txnId} 在文件内重复，已跳过`);

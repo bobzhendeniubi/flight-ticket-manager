@@ -208,8 +208,9 @@ export const passengerInputSchema = z.object({
   passportIssueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),       // 护照签发日期
   passportIssueCountry: countryCodeSchema('护照签发国').optional(),
   passportIssuePlace: z.string().max(120).optional(),                          // 护照签发地点（城市/机关文本，OCR 或手填，选填）
-  // 基座 schema 保持 optional（前台散客/小程序公开下单共用）；后台新建路径的必填口径见
-  // passengerInputWithRequiredExpirySchema（批量/OTA）与 orders.service createOrder（ADMIN/STAFF 录单）。
+  // 基座 schema 保持 optional：更新/补录路径（自助补录、换人等）复用同款字段规则，
+  // 存量空值旧单必须还能继续编辑。**新建路径必填**，口径见
+  // passengerInputWithRequiredExpirySchema（批量/OTA）与 refineRequiredPassportExpiry（下单端点）。
   passportExpiry: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
 
   // 订座编码（PNR）：录单时可直接带入（如 OTA 名单里的共用编码——多人同一 PNR 各行填同值，
@@ -250,15 +251,47 @@ export const passengerInputSchema = z.object({
 export type PassengerInput = z.infer<typeof passengerInputSchema>;
 
 // ── 新建乘客：护照有效期必填口径（业务拍板，2026-07）──────────────────────
-// 后台新建路径（批量/OTA 入单走本 schema；后台单订单录入在 service 层按 ADMIN/STAFF 身份
-// 校验同口径，因 createOrderBodySchema 与前台散客/小程序公开下单共用，不能在 schema 层一刀切）。
-// 更新/补录路径（selfUpdatePassengerBodySchema、换人 swapPassengerBodySchema 等）保持可空：
-// 存量空值旧单要能继续编辑，护照补录功能不受影响。
+// **全渠道强制**：所有新建订单路径（后台单录、批量/OTA 入单、前台散客/游客/代理自助、
+// 小程序）都必须带护照有效期。批量/OTA 走本 schema；POST /orders 走
+// refineRequiredPassportExpiry（文案能指到第几位出行人，且按产品类型划范围）。
+// 更新/补录路径（selfUpdatePassengerBodySchema、签证台补录、换人 swapPassengerBodySchema 等）
+// 保持可空：存量空值旧单要能继续编辑，护照补录功能不受影响。
 export const passengerInputWithRequiredExpirySchema = passengerInputSchema.extend({
   passportExpiry: z
     .string({ required_error: '护照有效期必填', invalid_type_error: '护照有效期必填' })
     .regex(/^\d{4}-\d{2}-\d{2}$/, '护照有效期格式应为 YYYY-MM-DD'),
 });
+
+// 「按人出行」的产品行：含这些行的订单，每位出行人都必须有护照有效期。
+// 纯酒店/接送单不在此列 —— 那类单的出行人可能只是联系人占位（documentNumber='N/A'），
+// 没有护照资料，强制有效期会把正常录单打死。
+const PER_PERSON_TRAVEL_KINDS = new Set(['FLIGHT', 'BUNDLE', 'VISA']);
+
+/**
+ * 公开下单端点（POST /orders）的护照有效期必填校验：**不分渠道**（后台单录、前台散客/
+ * 游客/代理自助、小程序全覆盖），只按产品类型划范围（见 PER_PERSON_TRAVEL_KINDS）。
+ *
+ * 放在 body 级而非乘客 item 级的原因有二：
+ *   ① 要同时看到 items 才能判断本单是否「按人出行」；
+ *   ② item 级 issue 只带 0 基下标路径（passengers.0.passportExpiry），客人看不懂 ——
+ *      这里直接给「第 N 位出行人」的中文文案。
+ * 其余字段规则仍由 passengerInputSchema 逐项校验（不放松任何一项）。
+ */
+function refineRequiredPassportExpiry(
+  body: { items: Array<{ kind: string }>; passengers: Array<{ passportExpiry?: string }> },
+  ctx: z.RefinementCtx,
+): void {
+  if (!body.items.some((it) => PER_PERSON_TRAVEL_KINDS.has(it.kind))) return;
+  body.passengers.forEach((p, i) => {
+    if (!p.passportExpiry) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['passengers', i, 'passportExpiry'],
+        message: `第 ${i + 1} 位出行人：护照有效期必填（格式 YYYY-MM-DD）`,
+      });
+    }
+  });
+}
 
 // ── 前台自助：出行人护照资料补录（PATCH /orders/:id/passengers/:passengerId，客户/代理侧）──
 // 字段校验规则与 passengerInputSchema 完全同款；全部可选但至少给一个。
@@ -416,7 +449,7 @@ export const createOrderBodySchema = z.object({
   contactEmail: z.string().email().optional(),
   paymentMethod: z.nativeEnum(PaymentMethod).optional(),
   items: z.array(orderItemInputSchema).min(1).max(20),
-  passengers: z.array(passengerInputSchema).min(1).max(20),
+  passengers: z.array(passengerInputSchema).min(1, '至少需要 1 位出行人').max(20),
   notes: z.string().max(500).optional(),
   // 签证状态 + 结构化备注四栏（可选；兼容旧客户端）
   ...orderStructuredNotesShape,
@@ -455,7 +488,11 @@ export const createOrderBodySchema = z.object({
   // 后端权威商品价（护照临期费/录单调价之前）与此偏差 > 1 元 → 抛 PRICE_CHANGED（见 createOrder），
   // 防止「展示价与实收价背离」时静默按新价多收（如套餐机票展示 ¥0 实扣真实机票价）。
   expectedTotalCny: z.number().int().positive().optional(),
-});
+})
+  // 护照有效期必填（业务拍板，2026-07）：本 schema 是 POST /orders 的唯一入口，
+  // 前台散客/游客、代理自助、小程序与后台单录全走这里 → 一处收口即全渠道生效。
+  // service 层还有一道 ADMIN/STAFF 同口径校验（createOrder），作双保险保留。
+  .superRefine(refineRequiredPassportExpiry);
 export type CreateOrderBody = z.infer<typeof createOrderBodySchema>;
 
 // ── 录单前试算（quote，只算不落库；ADMIN/STAFF）───────────────────────────

@@ -1725,6 +1725,86 @@ describe('assertVisaPassengersHavePassportExpiry', () => {
   });
 });
 
+// ── 公开下单端点（前台散客/游客/自助代理/小程序共用）：护照有效期必填 ────────
+// 全渠道强制口径：POST /orders 走 createOrderBodySchema，schema 层即拦缺失/格式错，
+// 文案指到第几位出行人（0 基下标路径客人看不懂）。
+describe('createOrderBodySchema · 护照有效期全渠道必填', () => {
+  const passenger = (patch: Record<string, unknown> = {}) => ({
+    fullName: '张三',
+    documentNumber: 'E12345678',
+    dateOfBirth: '1990-01-01',
+    passportExpiry: '2031-01-01',
+    ...patch,
+  });
+  const bodyWith = (passengers: unknown[]) => ({
+    contactName: '联系人',
+    contactPhone: '13800000000',
+    items: [{ kind: 'VISA', description: '泰国签证', quantity: 1, unitPrice: 300 }],
+    passengers,
+  });
+
+  it('全部出行人已填 → 解析通过', () => {
+    const r = createOrderBodySchema.safeParse(bodyWith([passenger(), passenger()]));
+    expect(r.success).toBe(true);
+  });
+
+  it('某位缺护照有效期 → 拒绝，且文案指明第几位出行人', () => {
+    const r = createOrderBodySchema.safeParse(
+      bodyWith([passenger(), passenger({ passportExpiry: undefined })]),
+    );
+    expect(r.success).toBe(false);
+    if (!r.success) {
+      expect(
+        r.error.issues.some(
+          (i) => i.message.includes('第 2 位出行人') && i.message.includes('护照有效期必填'),
+        ),
+      ).toBe(true);
+    }
+  });
+
+  it('空串 / 非 YYYY-MM-DD → 拒绝（格式校验不放松）', () => {
+    expect(createOrderBodySchema.safeParse(bodyWith([passenger({ passportExpiry: '' })])).success)
+      .toBe(false);
+    expect(
+      createOrderBodySchema.safeParse(bodyWith([passenger({ passportExpiry: '2031/01/01' })]))
+        .success,
+    ).toBe(false);
+  });
+
+  it('纯酒店单（无按人出行产品行）→ 出行人缺有效期不拦（占位出行人无护照资料）', () => {
+    const r = createOrderBodySchema.safeParse({
+      contactName: '联系人',
+      contactPhone: '13800000000',
+      items: [{ kind: 'HOTEL', description: '海景房 2 晚', quantity: 2, unitPrice: 600 }],
+      passengers: [
+        { fullName: '联系人', documentNumber: 'N/A', dateOfBirth: '1990-01-01', nationality: 'CN' },
+      ],
+    });
+    expect(r.success).toBe(true);
+  });
+
+  it('机票行 → 同样必填（不分渠道，公开端点与后台单录同一 schema）', () => {
+    const r = createOrderBodySchema.safeParse({
+      contactName: '联系人',
+      contactPhone: '13800000000',
+      items: [
+        {
+          kind: 'FLIGHT',
+          description: 'CZ123',
+          quantity: 1,
+          flightScheduleId: 'fs-1',
+          flightCabin: 'ECONOMY',
+        },
+      ],
+      passengers: [passenger({ passportExpiry: undefined })],
+    });
+    expect(r.success).toBe(false);
+    if (!r.success) {
+      expect(r.error.issues.some((i) => i.message.includes('第 1 位出行人'))).toBe(true);
+    }
+  });
+});
+
 // ── 套餐 fan-out：createFulfillmentTasks 把 BUNDLE 项拆成 per-component 地面岗任务 ──
 // 根因：旧逻辑 BUNDLE→单一 BUNDLE_COMPOSITE，签证/酒店/地面岗永远看不到套餐单。
 // 修复：反查 Bundle.items 组件 kind，fan-out 成 HOTEL_BOOKING / VISA_APPLICATION / TRANSFER_DISPATCH。
@@ -2171,6 +2251,8 @@ describe('乘客护照签发地点 passportIssuePlace', () => {
     fullName: '张三',
     documentNumber: 'E12345678',
     dateOfBirth: '1990-01-01',
+    // 护照有效期全渠道必填（含公开下单端点）→ 基础夹具必须带
+    passportExpiry: '2031-01-01',
   };
 
   it('passengerInputSchema 受理 passportIssuePlace 自由文本（≤120 字）', () => {

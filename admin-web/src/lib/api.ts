@@ -1987,7 +1987,7 @@ export const RECEIPT_SOURCE_LABEL: Record<ReceiptSource, string> = {
 };
 
 /** 流水预览行处置：ok=可导入；dup_in_db=库里已有；dup_in_file=文件内重复；skipped_status=非支付成功；invalid=解析失败 */
-export type StatementPlatform = 'CMB_QR' | 'YISHOUBAO' | 'XINGYIFU';
+export type StatementPlatform = 'CMB_QR' | 'YISHOUBAO' | 'XINGYIFU' | 'HUISHENGHUO';
 export type StatementDisposition =
   | 'ok'
   | 'dup_in_db'

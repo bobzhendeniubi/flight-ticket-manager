@@ -24,6 +24,23 @@ function isLikelyPhone(raw: string): boolean {
   return digits.length >= 7 && digits.length <= 15;
 }
 
+/** 证件有效期格式：YYYY-MM-DD（与后端同款正则；date input 正常输出即为此格式） */
+const DATE_INPUT_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * 证件有效期提醒：不足 6 个月 / 已过期时给一句黄字提示。
+ * 只提醒、不拦截 —— 各目的地入境要求不同，交由客服跟进，不替客人做决定。
+ */
+function expiryNotice(expiry?: string): string | null {
+  if (!expiry || !DATE_INPUT_RE.test(expiry)) return null;
+  const end = new Date(`${expiry}T00:00:00`);
+  if (Number.isNaN(end.getTime())) return null;
+  const days = Math.floor((end.getTime() - Date.now()) / 86_400_000);
+  if (days < 0) return '该证件已过期，请更换为在有效期内的证件';
+  if (days < 180) return '有效期不足 6 个月，多数目的地要求 6 个月以上，建议先换发新证件';
+  return null;
+}
+
 interface PassengerForm {
   fullName: string;
   passportNumber: string;
@@ -36,6 +53,11 @@ interface PassengerForm {
    * 空 = 该出行人没走 OCR 或未命中 MRZ；提交时省略，绝不发 ''。
    */
   gender?: 'M' | 'F' | 'X';
+  /**
+   * 证件有效期 YYYY-MM-DD —— 含机票/套餐/签证的订单**每位出行人必填**（后端
+   * createOrderBodySchema 同款拦截）；纯酒店/接送单选填。
+   * OCR 命中 MRZ 时自动带出，客人也可手填/改；提交前由 onSubmit 校验。
+   */
   passportExpiry?: string; // YYYY-MM-DD
   passportIssueCountry?: string; // ISO-2
   /**
@@ -196,6 +218,11 @@ export function CheckoutPage() {
     .reduce((sum, i) => sum + (Number(i.meta?.passengers) || Number(i.qty) || 0), 0);
   // 混买时取最大值（套餐含机票、签证/接送都是同一批出行人，取 MAX 不取 SUM）
   const effectivePax = Math.max(bundlePaxCount, flightTicketCount, visaPaxCount, transferPaxCount);
+  // 证件有效期必填范围：含机票/套餐/签证（要凭证件出境的产品）时每位出行人必填，
+  // 与后端 createOrderBodySchema 同口径。纯酒店/接送单只作选填，不给客人添堵。
+  const expiryRequired = items.some(
+    (i) => i.kind === 'FLIGHT' || i.kind === 'BUNDLE' || i.kind === 'VISA',
+  );
   const paxMismatch = effectivePax > 0 && passengers.length !== effectivePax;
 
   // 自动把出行人行数补齐到所需人数 —— 避免"少填一位 → 提交键灰着点不动"（前台反馈：下一步走不下去）
@@ -321,6 +348,22 @@ export function CheckoutPage() {
       setErrorMsg('请填写所有出行人的姓名、护照号和出生日期');
       return;
     }
+    // 证件有效期：含机票/套餐/签证时每位必填（同后端口径），文案指到第几位出行人
+    if (expiryRequired) {
+      const missingExpiryIdx = passengers.findIndex((p) => !p.passportExpiry?.trim());
+      if (missingExpiryIdx >= 0) {
+        setErrorMsg(`请填写第 ${missingExpiryIdx + 1} 位出行人的证件有效期`);
+        return;
+      }
+    }
+    // 填了就要合法（纯酒店/接送单选填，填错一样拦，避免脏数据进签证台）
+    const badExpiryIdx = passengers.findIndex(
+      (p) => p.passportExpiry?.trim() && !DATE_INPUT_RE.test(p.passportExpiry.trim()),
+    );
+    if (badExpiryIdx >= 0) {
+      setErrorMsg(`第 ${badExpiryIdx + 1} 位出行人的证件有效期格式不正确，请按年-月-日选择`);
+      return;
+    }
     // 出行人联系电话：必填 + 轻校验（位数 7–15）
     if (passengers.some((p) => !p.phone.trim())) {
       setErrorMsg('请填写每位出行人的联系电话');
@@ -367,10 +410,12 @@ export function CheckoutPage() {
         dateOfBirth: p.dateOfBirth,
         nationality: p.nationality || 'CN',
         passengerType: 'ADULT',
-        // 护照全采集字段（仅 OCR 命中 MRZ 时有值）。空/undefined 一律省略 ——
-        // passportExpiry/passportIssueCountry 后端是严格正则/长度校验，发 '' 会被拒。
+        // 证件有效期：含机票/套餐/签证时必填（提交前已校验，见 onSubmit）；
+        // 纯酒店/接送单选填 —— 空值省略，绝不发 ''（后端 YYYY-MM-DD 正则会拒空串）。
+        ...(p.passportExpiry?.trim() ? { passportExpiry: p.passportExpiry.trim() } : {}),
+        // 其余护照全采集字段（仅 OCR 命中 MRZ 时有值）。空/undefined 一律省略 ——
+        // passportIssueCountry 后端是严格长度校验，发 '' 会被拒。
         ...(p.gender ? { gender: p.gender } : {}),
-        ...(p.passportExpiry ? { passportExpiry: p.passportExpiry } : {}),
         ...(p.passportIssueCountry ? { passportIssueCountry: p.passportIssueCountry } : {}),
         // 护照签发地点（自由文本）：有值才传，空/undefined 省略
         ...(p.passportIssuePlace?.trim() ? { passportIssuePlace: p.passportIssuePlace.trim() } : {}),
@@ -802,6 +847,7 @@ export function CheckoutPage() {
                 key={idx}
                 idx={idx}
                 passenger={p}
+                expiryRequired={expiryRequired}
                 onChange={(patch) => updatePassenger(idx, patch)}
                 onRemove={passengers.length > 1 ? () => removePassenger(idx) : undefined}
               />
@@ -930,11 +976,14 @@ function CheckoutSteps() {
 function PassengerCard({
   idx,
   passenger,
+  expiryRequired,
   onChange,
   onRemove,
 }: {
   idx: number;
   passenger: PassengerForm;
+  /** 证件有效期是否必填（含机票/套餐/签证的单为真；纯酒店/接送单选填） */
+  expiryRequired: boolean;
   onChange: (patch: Partial<PassengerForm>) => void;
   onRemove?: () => void;
 }) {
@@ -1116,6 +1165,23 @@ function PassengerCard({
           />
         </div>
         <div>
+          <label className="label text-xs">
+            证件有效期 {expiryRequired ? '*' : '（选填）'}（护照资料页「有效期至」）
+          </label>
+          <input
+            type="date"
+            className="input"
+            required={expiryRequired}
+            value={passenger.passportExpiry ?? ''}
+            onChange={(e) => onChange({ passportExpiry: e.target.value })}
+          />
+          {expiryNotice(passenger.passportExpiry) && (
+            <p className="mt-1 text-xs font-medium text-amber-700">
+              {expiryNotice(passenger.passportExpiry)}
+            </p>
+          )}
+        </div>
+        <div>
           <label className="label text-xs">国籍 / 地区</label>
           <select
             className="input"
@@ -1138,9 +1204,10 @@ function PassengerCard({
           />
         </div>
       </div>
-      {/* OCR 已识别的护照附加信息（性别 / 有效期 / 签发地）——只读展示，不作必填字段。
-          只在上传护照 OCR 命中 MRZ 时出现；没识别到就不显示，手填用户完全看不到、也不用管。 */}
-      {(passenger.gender || passenger.passportExpiry || passenger.passportIssueCountry || passenger.passportIssuePlace) && (
+      {/* OCR 已识别的护照附加信息（性别 / 签发地）——只读展示，不作必填字段。
+          只在上传护照 OCR 命中 MRZ 时出现；没识别到就不显示，手填用户完全看不到、也不用管。
+          证件有效期已升级为上方可填必填项，这里不再重复展示。 */}
+      {(passenger.gender || passenger.passportIssueCountry || passenger.passportIssuePlace) && (
         <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 rounded-xl border border-brand-200/70 bg-brand-50/50 px-3 py-2 text-xs text-brand-800">
           <span className="inline-flex items-center gap-1 font-medium">
             <Icon name="check" className="h-3.5 w-3.5" /> OCR 已识别
@@ -1148,7 +1215,6 @@ function PassengerCard({
           {passenger.gender && (
             <span>性别 {passenger.gender === 'M' ? '男' : passenger.gender === 'F' ? '女' : '未注明'}</span>
           )}
-          {passenger.passportExpiry && <span className="nums">护照有效期 {passenger.passportExpiry}</span>}
           {(passenger.passportIssuePlace || passenger.passportIssueCountry) && (
             <span>签发地 {passenger.passportIssuePlace || passenger.passportIssueCountry}</span>
           )}

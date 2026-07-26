@@ -329,6 +329,192 @@ describe('parseStatementXlsx · 星驿付', () => {
   });
 });
 
+describe('parseStatementXlsx · 会生活', () => {
+  // 列名取自会生活逐笔明细模板（数据全部虚构）
+  const headers = [
+    '交易时间',
+    '交易完成时间',
+    '交易金额',
+    '优惠金额',
+    '实付金额',
+    '商户入账金额',
+    '交易类型',
+    '支付方式',
+    '交易状态',
+    '收款备注',
+    '商户订单号',
+    '会生活单号',
+    '流水号',
+    '当前状态',
+    '清算日期',
+    '交易来源',
+  ];
+
+  function hshRow(opts: {
+    txnId: string;
+    time?: string;
+    gross?: number | string;
+    discount?: number;
+    paid?: number | string;
+    type?: string;
+    method?: string;
+    status?: string;
+    note?: string;
+    current?: string;
+  }): Array<string | number> {
+    return [
+      opts.time ?? '2026-07-23 22:21:31',
+      '2026-07-23 22:21:44',
+      opts.gross ?? 2000,
+      opts.discount ?? 0,
+      opts.paid ?? 2000,
+      1995,
+      opts.type ?? '收款',
+      opts.method ?? '微信支付',
+      opts.status ?? '收款成功',
+      opts.note ?? '',
+      opts.txnId,
+      '83620990101000000000',
+      'HSHFLOW0001',
+      opts.current ?? '正常',
+      '2026-07-23',
+      '会生活收款',
+    ];
+  }
+
+  it('收款成功且当前状态正常入池；退款/失败/撤销行按类型或状态跳过', async () => {
+    const b64 = await buildPlatformBase64('Sheet1', headers, [
+      hshRow({ txnId: '222099010100000000000000101', note: '付款人甲' }),
+      hshRow({ txnId: '222099010100000000000000102', type: '退款', status: '退款成功' }),
+      hshRow({ txnId: '222099010100000000000000103', status: '收款失败' }),
+      // 类型闸单测：状态成功但类型非收款
+      hshRow({ txnId: '222099010100000000000000104', type: '预授权' }),
+      // 当前状态闸单测：收款成功但已撤销
+      hshRow({ txnId: '222099010100000000000000105', current: '已撤销' }),
+    ]);
+    const { rows, warnings } = await parseStatementXlsx(b64, 'HUISHENGHUO');
+    expect(rows.map((r) => r.disposition)).toEqual([
+      'ok',
+      'skipped_status',
+      'skipped_status',
+      'skipped_type',
+      'skipped_status',
+    ]);
+    expect(rows[0].payerNote).toBe('付款人甲');
+    expect(warnings).toHaveLength(0);
+  });
+
+  it('金额取「实付金额」（有优惠时 ≠ 交易金额），千分位文本也吃', async () => {
+    const b64 = await buildPlatformBase64('Sheet1', headers, [
+      hshRow({
+        txnId: '222099010100000000000000201',
+        gross: 1680,
+        discount: 30,
+        paid: '1,650.00',
+      }),
+    ]);
+    const { rows } = await parseStatementXlsx(b64, 'HUISHENGHUO');
+    expect(rows[0].disposition).toBe('ok');
+    expect(rows[0].amountCny).toBe(1650);
+  });
+
+  it('支付方式映射微信支付/支付宝；交易时间按北京时 +08:00 解释', async () => {
+    const b64 = await buildPlatformBase64('Sheet1', headers, [
+      hshRow({ txnId: '222099010100000000000000301', method: '微信支付' }),
+      hshRow({
+        txnId: '222099010100000000000000302',
+        method: '支付宝',
+        time: '2026-07-23 22:05:42',
+      }),
+    ]);
+    const { rows } = await parseStatementXlsx(b64, 'HUISHENGHUO');
+    expect(rows.map((r) => r.method)).toEqual(['WECHAT_PAY', 'ALIPAY']);
+    // 北京 22:05:42 = UTC 14:05:42
+    expect(rows[1].receivedAt?.toISOString()).toBe('2026-07-23T14:05:42.000Z');
+  });
+
+  it('列序打乱仍按表头名对号解析', async () => {
+    const shuffled = [
+      '当前状态',
+      '实付金额',
+      '商户订单号',
+      '支付方式',
+      '交易时间',
+      '交易状态',
+      '交易类型',
+      '收款备注',
+    ];
+    const b64 = await buildPlatformBase64('Sheet1', shuffled, [
+      [
+        '正常',
+        888,
+        '222099010100000000000000401',
+        '支付宝',
+        '2026-07-23 09:00:00',
+        '收款成功',
+        '收款',
+        '付款人乙',
+      ],
+    ]);
+    const { rows } = await parseStatementXlsx(b64, 'HUISHENGHUO');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].externalTxnId).toBe('222099010100000000000000401');
+    expect(rows[0].amountCny).toBe(888);
+    expect(rows[0].method).toBe('ALIPAY');
+    expect(rows[0].payerNote).toBe('付款人乙');
+    expect(rows[0].disposition).toBe('ok');
+  });
+
+  it('文件内商户订单号重复 → 后行 dup_in_file + warning', async () => {
+    const b64 = await buildPlatformBase64('Sheet1', headers, [
+      hshRow({ txnId: '222099010100000000000000501' }),
+      hshRow({ txnId: '222099010100000000000000501' }),
+    ]);
+    const { rows, warnings } = await parseStatementXlsx(b64, 'HUISHENGHUO');
+    expect(rows.map((r) => r.disposition)).toEqual(['ok', 'dup_in_file']);
+    expect(warnings.some((w) => w.includes('222099010100000000000000501'))).toBe(true);
+  });
+
+  it('表头缺列给出会生活专属报错文案，且不解析数据', async () => {
+    const b64 = await buildPlatformBase64(
+      'Sheet1',
+      ['交易时间', '实付金额', '商户订单号', '支付方式', '交易状态', '交易类型'],
+      [
+        [
+          '2026-07-23 10:00:00',
+          100,
+          '222099010100000000000000601',
+          '微信支付',
+          '收款成功',
+          '收款',
+        ],
+      ],
+    );
+    const { rows, warnings } = await parseStatementXlsx(b64, 'HUISHENGHUO');
+    expect(rows).toHaveLength(0);
+    expect(warnings[0]).toContain('会生活流水表头缺少');
+    expect(warnings[0]).toContain('当前状态');
+  });
+
+  it('整表不匹配（如按日汇总表）→ 报错提示需逐笔明细模板', async () => {
+    const b64 = await buildPlatformBase64(
+      'Sheet1',
+      ['日期', '收款笔数', '收款总额'],
+      [['2026-07-23', 54, 88888]],
+    );
+    const { rows, warnings } = await parseStatementXlsx(b64, 'HUISHENGHUO');
+    expect(rows).toHaveLength(0);
+    expect(warnings[0]).toContain('逐笔明细模板');
+    expect(warnings[0]).toContain('按日汇总表不支持');
+  });
+
+  it('存储流水号使用 HSH: 前缀，避免跨平台同号碰撞（DB 防重沿用唯一索引）', () => {
+    expect(statementStorageExternalTxnId('HUISHENGHUO', '222099010100000000000000701')).toBe(
+      'HSH:222099010100000000000000701',
+    );
+  });
+});
+
 describe('buildStatementExportWorkbook', () => {
   it('列头齐全，认款标识/订单/认款人落到行里', () => {
     const entries: StatementExportEntry[] = [

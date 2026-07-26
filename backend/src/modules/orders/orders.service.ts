@@ -2158,24 +2158,14 @@ export class OrderService {
       throw new ForbiddenError('仅管理员可查看回收站');
     }
     const where: Prisma.OrderWhereInput = { deletedAt: { not: null } };
-    // 搜索：订单号 / 联系人名 / 乘客姓名（含中文名）模糊匹配，任一命中即可。
-    // 只在 search 非空时叠加，避免默认路径的 where 形状变化（单测断言精确匹配）。
+    // 搜索：与主列表同口径，复用 splitSearchTerms + buildSearchTermClause——
+    // 分词（空格/英文逗号/中文逗号/顿号，上限 5 词）后词间 AND，每词 OR 匹配
+    // 订单号/联系人/电话/备注六栏/乘客中英文名+护照号。回收站无自有可搜字段
+    // （deletedBy 来自审计表另查，不在 Order 上），故字段集与主列表完全一致。
+    // 只在分词非空时叠加 AND，避免默认路径的 where 形状变化（单测断言精确匹配）。
     if (query.search) {
-      const term = query.search;
-      where.OR = [
-        { orderNumber: { contains: term, mode: 'insensitive' } },
-        { contactName: { contains: term, mode: 'insensitive' } },
-        {
-          passengers: {
-            some: {
-              OR: [
-                { fullName: { contains: term, mode: 'insensitive' } },
-                { chineseName: { contains: term, mode: 'insensitive' } },
-              ],
-            },
-          },
-        },
-      ];
+      const termClauses = splitSearchTerms(query.search).map(buildSearchTermClause);
+      if (termClauses.length > 0) where.AND = termClauses;
     }
     const [rows, total] = await prisma.$transaction([
       prisma.order.findMany({
@@ -6324,11 +6314,12 @@ export function splitSearchTerms(search: string): string[] {
 /**
  * 单个搜索词 → OR 匹配块。字段口径：
  * - 订单号 / 联系人 / 联系电话（历史字段，保持原语义）；
- * - 乘客中/英文名（公测反馈：搜索框要能按乘客姓名搜到订单；与回收站搜索同口径）；
+ * - 乘客中/英文名（公测反馈：搜索框要能按乘客姓名搜到订单）；
  * - 乘客护照号 documentNumber（运营需求：按证件号定位订单）；
  * - 订单级备注六栏 notes/internalNotes/noteHotel/noteVisa/notePayment/noteSpecial。
+ * 导出：主列表与回收站（listDeletedOrders）共用本口径，另供单测断言 where 形状。
  */
-function buildSearchTermClause(term: string): Prisma.OrderWhereInput {
+export function buildSearchTermClause(term: string): Prisma.OrderWhereInput {
   return {
     OR: [
       { orderNumber: { contains: term, mode: 'insensitive' } },
