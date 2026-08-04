@@ -361,9 +361,15 @@ export const flightItemSchema = baseItemSchema.extend({
   bundleId: z.string().min(1).optional(),
 });
 
+// 注：这里必须保持纯 ZodObject（orderItemInputSchema 是 discriminatedUnion，不接受 ZodEffects），
+// 故「hotelRoomTypeId 与 randomStarTier 互斥 + 随机池行必须有入住区间」的跨字段校验放在
+// service 的 HOTEL 分支（priceAndValidateItems），那里本就是权威定价/校验闸。
 export const hotelItemSchema = baseItemSchema.extend({
   kind: z.literal('HOTEL'),
   hotelRoomTypeId: z.string().min(1).optional(),
+  // 星级随机池行（3=三星随机、4=四星随机）：客人买的是「N 星随机」，下单时不指定酒店，
+  // 占的是房控星级随机池的真库存，之后由房控落到具体酒店。与 hotelRoomTypeId 互斥。
+  randomStarTier: z.union([z.literal(3), z.literal(4)]).optional(),
   checkIn: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   checkOut: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   unitPrice: z.number().nonnegative(),
@@ -600,6 +606,9 @@ export const exportTemplatesQuerySchema = listOrdersQuerySchema
     template: z.enum(['full', 'ticketing', 'visa']),
     // 精确按班次（整班·全岗导出用）；优先于 travelFrom/travelTo，只导该班次订单。
     scheduleId: z.string().min(1).optional(),
+    // 行程类型筛选（票务岗反馈）：oneway=只有去程、roundtrip=有第 2 段（回程）。
+    // 导出内存侧按 determineFlightLegs 判定（Prisma where 表达不了"关联行 ≥ 2 条"）。
+    tripType: z.enum(['oneway', 'roundtrip']).optional(),
     // 勾选导出：给了就以这批 id 为准（忽略其余筛选），无则按上面的筛选条件。
     orderIds: orderIdsQuerySchema,
   });

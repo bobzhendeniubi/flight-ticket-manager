@@ -6,6 +6,7 @@ import { Prisma, type PrismaClient } from '@prisma/client';
 import { ConflictError, NotFoundError } from '../../lib/errors.js';
 import {
   deleteCostPeriod,
+  listCostPeriods,
   listSchedulesWithCost,
   patchFlightScheduleCost,
   resolveFlightItemCost,
@@ -328,5 +329,77 @@ describe('deleteCostPeriod — 删除成本周期', () => {
     } as unknown as PrismaClient;
 
     await expect(deleteCostPeriod('p1', client)).resolves.toEqual({ id: 'p1' });
+  });
+});
+
+describe('listCostPeriods — toDto 回传汇率四元组', () => {
+  it('把 charterSourceCurrency/Amount/FxRate/FxDate 一起序列化回 DTO', async () => {
+    const client = {
+      flightCostPeriod: {
+        findMany: vi.fn().mockResolvedValue([
+          {
+            id: 'p1',
+            flightId: 'f1',
+            effectiveFrom: new Date('2026-01-01T00:00:00.000Z'),
+            effectiveTo: new Date('2026-01-31T00:00:00.000Z'),
+            charterCostCny: new Prisma.Decimal('80000.00'),
+            airportTaxDepCny: null,
+            airportTaxArrCny: null,
+            fuelCostCny: null,
+            peakSurchargeCny: null,
+            aircraftAdjustCny: null,
+            takeoffDiscountCny: null,
+            charterSourceCurrency: 'USD',
+            charterSourceAmount: new Prisma.Decimal('12000.00'),
+            charterFxRate: new Prisma.Decimal('7.123456'),
+            charterFxDate: new Date('2026-01-15T00:00:00.000Z'),
+            note: null,
+            updatedAt: new Date('2026-01-16T00:00:00.000Z'),
+            flight: { flightNumber: 'FT101', originCode: 'HAN', destinationCode: 'PVG' },
+          },
+        ]),
+      },
+    } as unknown as PrismaClient;
+
+    const [dto] = await listCostPeriods({}, client);
+    expect(dto.charterSourceCurrency).toBe('USD');
+    expect(dto.charterSourceAmount).toBe(12000);
+    expect(dto.charterFxRate).toBe(7.123456);
+    expect(dto.charterFxDate).toBe('2026-01-15');
+  });
+
+  it('汇率四字段全为 null 时 DTO 也回传 null（未填写场景）', async () => {
+    const client = {
+      flightCostPeriod: {
+        findMany: vi.fn().mockResolvedValue([
+          {
+            id: 'p2',
+            flightId: 'f1',
+            effectiveFrom: new Date('2026-02-01T00:00:00.000Z'),
+            effectiveTo: new Date('2026-02-28T00:00:00.000Z'),
+            charterCostCny: null,
+            airportTaxDepCny: null,
+            airportTaxArrCny: null,
+            fuelCostCny: null,
+            peakSurchargeCny: null,
+            aircraftAdjustCny: null,
+            takeoffDiscountCny: null,
+            charterSourceCurrency: null,
+            charterSourceAmount: null,
+            charterFxRate: null,
+            charterFxDate: null,
+            note: null,
+            updatedAt: new Date('2026-02-01T00:00:00.000Z'),
+            flight: { flightNumber: 'FT102', originCode: 'HAN', destinationCode: 'PVG' },
+          },
+        ]),
+      },
+    } as unknown as PrismaClient;
+
+    const [dto] = await listCostPeriods({}, client);
+    expect(dto.charterSourceCurrency).toBeNull();
+    expect(dto.charterSourceAmount).toBeNull();
+    expect(dto.charterFxRate).toBeNull();
+    expect(dto.charterFxDate).toBeNull();
   });
 });

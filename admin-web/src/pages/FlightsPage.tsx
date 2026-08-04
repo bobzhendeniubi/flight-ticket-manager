@@ -336,12 +336,23 @@ function isSeatLow(remaining: number, capacity: number): boolean {
 // 舱位余位三档色（红/琥珀/绿）：红门槛与 isSeatLow 同口径，琥珀门槛加宽一倍（同样夹到 < capacity）。
 // 比例在 180~200 座经济舱下约等于旧版固定 20/40（基本不变行为）；
 // 小舱位（商务舱 2~20 座）不再因为绝对数字小而常年误报"紧张"。
+// 余位为负（超售）走更深的红，与"仅仅紧张"区分开。
 function seatTone(remaining: number, capacity: number): { text: string; dot: string } {
+  if (remaining < 0) return { text: 'text-rose-700', dot: 'bg-rose-600' };
   if (isSeatLow(remaining, capacity)) return { text: 'text-rose-600', dot: 'bg-rose-500' };
   const amberCut = Math.min(capacity - 1, Math.max(10, Math.ceil(capacity * 0.2)));
   if (remaining <= amberCut) return { text: 'text-amber-600', dot: 'bg-amber-500' };
   return { text: 'text-emerald-600', dot: 'bg-emerald-500' };
 }
+
+// 余位读数文案：负数不是"负几张票"，而是欠了几座 —— 一律写成「超售 N」。
+// 容量被航司减配/换机型压到已售之下时会出现（销售侧照旧按容量拒卖）。
+function seatRemainingText(remaining: number): string {
+  return remaining < 0 ? `超售 ${-remaining}` : String(remaining);
+}
+
+// 余位为负时的统一悬浮说明（列表 / 月历 / 班次卡共用一句话）。
+const OVERSOLD_HINT = '容量已低于已售 + 锁位，需与航司 / 操作部协调；销售侧照旧不再卖出。';
 
 function getCabin(s: AdminSchedule, cabin: CabinClass): ScheduleSeat | undefined {
   return (s.seatClasses ?? []).find((c) => c.cabin === cabin);
@@ -852,6 +863,7 @@ function SchedulesTable({
                     <ul className="space-y-0.5">
                       {(s.seatClasses ?? []).map((c) => {
                         const remaining = c.available;
+                        const oversold = remaining < 0;
                         const isLow = isSeatLow(remaining, c.capacity);
                         const linked = linkedBusinessPrice(flight, s, c);
                         const priceText = linked
@@ -860,8 +872,17 @@ function SchedulesTable({
                         return (
                           <li key={c.id}>
                             {CABIN_LABEL[c.cabin] ?? c.cabin}:{' '}
-                            <span className={isLow ? 'font-medium text-rose-600' : 'font-medium text-ink'}>
-                              {remaining}
+                            <span
+                              className={
+                                oversold
+                                  ? 'font-bold text-rose-700'
+                                  : isLow
+                                    ? 'font-medium text-rose-600'
+                                    : 'font-medium text-ink'
+                              }
+                              title={oversold ? OVERSOLD_HINT : undefined}
+                            >
+                              {seatRemainingText(remaining)}
                             </span>
                             /<span className="font-medium text-ink">{c.capacity}</span> · {priceText}
                             {linked && !linked.fallback && (
@@ -1099,9 +1120,11 @@ function MonthCalendar({
                   )}
                 </span>
               </div>
-              <div className="mt-1 flex items-center gap-1">
+              <div className="mt-1 flex items-center gap-1" title={remaining < 0 ? OVERSOLD_HINT : undefined}>
                 <span className={`inline-block h-1.5 w-1.5 rounded-full ${tone.dot}`} />
-                <span className={`text-sm font-semibold ${tone.text}`}>{remaining}</span>
+                <span className={`text-sm font-semibold ${tone.text}`}>
+                  {seatRemainingText(remaining)}
+                </span>
                 <span className="text-[10px] text-ink-muted">余位</span>
               </div>
               {/* 售价只取在售班次（已关班次不参与），多班在售取最低～最高 */}
@@ -1260,10 +1283,27 @@ function DaySchedule({
   const isExporting = exportingId === schedule.id;
   const departureDate = utcYmd(schedule.departureTime);
 
-  // 保存价格 + 容量（同一个按钮一次 PATCH）：容量的服务端守卫（不能低于已售）
-  // 命中时会抛 400，err 走下面统一的 catch 分支原样展示后端消息（已经是清楚的中文提示）。
+  // 保存价格 + 容量（同一个按钮一次 PATCH）。
+  // 容量允许低于已售（航司减配 / 换机型的真实场景）：服务端照写并记 WARNING 审计，
+  // 库存变成账面欠座，因此保存前先要一次显式确认，避免手滑把容量打小。
   const onSaveSeatChanges = async () => {
     if (!tokens || saving) return;
+    const oversoldParts: string[] = [];
+    if (econ && econCapacity != null && econCapacity < econ.sold) {
+      oversoldParts.push(`经济舱 ${econCapacity} < 已售 ${econ.sold}（超售 ${econ.sold - econCapacity}）`);
+    }
+    if (biz && bizCapacity != null && bizCapacity < biz.sold) {
+      oversoldParts.push(`商务舱 ${bizCapacity} < 已售 ${biz.sold}（超售 ${biz.sold - bizCapacity}）`);
+    }
+    if (
+      oversoldParts.length > 0 &&
+      !window.confirm(
+        `容量低于已售，保存后该班次将标记超售：\n${oversoldParts.join('\n')}\n\n` +
+          '销售侧照旧不再卖出，但已售出的座位需要与航司 / 操作部协调（加座、改期或退改）。确认保存？',
+      )
+    ) {
+      return;
+    }
     setSaving(true);
     setErr(null);
     setSavedMsg(null);
@@ -1527,14 +1567,22 @@ function DaySchedule({
       {/* 余位/已售（只读）*/}
       <div className="mt-2 flex flex-wrap gap-4 text-xs">
         {econ && (
-          <span>
-            经济舱余位 <span className={`font-semibold ${tone.text}`}>{econRemaining}</span> / {econ.capacity}
+          <span title={econRemaining < 0 ? OVERSOLD_HINT : undefined}>
+            经济舱余位{' '}
+            <span className={`font-semibold ${tone.text}`}>{seatRemainingText(econRemaining)}</span> /{' '}
+            {econ.capacity}
             <span className="ml-1 text-ink-muted">（已售 {econ.sold}）</span>
           </span>
         )}
         {biz && (
-          <span>
-            商务舱余位 <span className="font-semibold text-ink">{biz.available}</span> / {biz.capacity}
+          <span title={biz.available < 0 ? OVERSOLD_HINT : undefined}>
+            商务舱余位{' '}
+            {/* 商务舱这里向来只报数不上色，唯独超售必须扎眼 */}
+            <span className={`font-semibold ${biz.available < 0 ? 'text-rose-700' : 'text-ink'}`}>
+              {seatRemainingText(biz.available)}
+            </span>{' '}
+            /{' '}
+            {biz.capacity}
             <span className="ml-1 text-ink-muted">（已售 {biz.sold}）</span>
           </span>
         )}
@@ -1606,13 +1654,21 @@ function DaySchedule({
               <div>
                 <label className="label">经济舱容量（已售 {econ.sold}）</label>
                 <NumberInput
-                  min={econ.sold}
+                  min={0}
                   className="input"
                   value={econCapacity}
                   onChange={(n) => setEconCapacity(n)}
                   integerOnly
                 />
-                <p className="mt-0.5 text-[11px] text-ink-muted">不能低于已售 {econ.sold} 张。</p>
+                {econCapacity != null && econCapacity < econ.sold ? (
+                  <p className="mt-0.5 text-[11px] font-medium text-rose-700">
+                    低于已售 {econ.sold} 张，保存后将标记超售 {econ.sold - econCapacity}。
+                  </p>
+                ) : (
+                  <p className="mt-0.5 text-[11px] text-ink-muted">
+                    可低于已售（航司减配 / 换机型），保存后按超售标红。
+                  </p>
+                )}
               </div>
             </div>
           )}
@@ -1652,13 +1708,21 @@ function DaySchedule({
               <div>
                 <label className="label">商务舱容量（已售 {biz.sold}）</label>
                 <NumberInput
-                  min={biz.sold}
+                  min={0}
                   className="input"
                   value={bizCapacity}
                   onChange={(n) => setBizCapacity(n)}
                   integerOnly
                 />
-                <p className="mt-0.5 text-[11px] text-ink-muted">不能低于已售 {biz.sold} 张。</p>
+                {bizCapacity != null && bizCapacity < biz.sold ? (
+                  <p className="mt-0.5 text-[11px] font-medium text-rose-700">
+                    低于已售 {biz.sold} 张，保存后将标记超售 {biz.sold - bizCapacity}。
+                  </p>
+                ) : (
+                  <p className="mt-0.5 text-[11px] text-ink-muted">
+                    可低于已售（航司减配 / 换机型），保存后按超售标红。
+                  </p>
+                )}
               </div>
             </div>
           )}
@@ -1912,7 +1976,9 @@ function BulkEditPanel({
       const parts: string[] = [];
       if (capEcon != null) parts.push(`经济舱→${capEcon}`);
       if (capBiz != null) parts.push(`商务舱→${capBiz}`);
-      return parts.length > 0 ? `改容量：${parts.join('，')}（已售超过目标的班次自动跳过）` : '改容量（尚未填目标值）';
+      return parts.length > 0
+        ? `改容量：${parts.join('，')}（低于已售的班次照改并标记超售）`
+        : '改容量（尚未填目标值）';
     }
     return `清除 ${ladderCab} 仓位阶梯（恢复自动定价）`;
   };
@@ -1968,8 +2034,9 @@ function BulkEditPanel({
     setSubmitting(true);
     setProgress({ done: 0, total: matched.length, errors: 0, skipped: 0 });
 
-    // ── 改容量：走专用批量接口（服务端一次事务处理，逐班次守 capacity ≥ sold，
-    //    命中守卫的班次跳过而非整批失败），不是逐班次循环调用。
+    // ── 改容量：走专用批量接口（服务端一次事务处理），不是逐班次循环调用。
+    //    目标容量低于已售的班次照改并回报 oversold 明细（航司减配 / 换机型），
+    //    skipped 只剩"班次不存在 / 没有匹配舱位"这类真的没改成的。
     if (action === 'setCapacity') {
       const seatClasses: Array<{ cabin: CabinClass; capacity: number }> = [];
       if (capEcon != null) seatClasses.push({ cabin: 'ECONOMY', capacity: capEcon });
@@ -1986,12 +2053,19 @@ function BulkEditPanel({
           skipped: capResult.skipped.length,
         });
         const preview = capResult.skipped.slice(0, 3).map((s) => s.reason);
+        // 超售不是失败，但必须当面说清楚：改了几个、其中几个欠座、一共欠多少
+        const oversold = capResult.oversold ?? [];
+        const oversoldSeats = oversold.reduce((sum, o) => sum + o.oversoldBy, 0);
         setResult(
-          `✅ 完成：改了 ${capResult.applied} 个${
+          `${oversold.length > 0 ? '⚠️' : '✅'} 完成：改了 ${capResult.applied} 个${
             capResult.skipped.length > 0
               ? ` · 跳过 ${capResult.skipped.length} 个（${preview.join('；')}${
                   capResult.skipped.length > preview.length ? ' 等' : ''
                 }）`
+              : ''
+          }${
+            oversold.length > 0
+              ? ` · 其中 ${oversold.length} 个舱位容量低于已售，共超售 ${oversoldSeats} 座，请与航司 / 操作部协调`
               : ''
           }`,
         );
@@ -2147,7 +2221,8 @@ function BulkEditPanel({
               />
             </div>
             <div className="md:col-span-4 text-[11px] text-ink-muted">
-              容量不能低于该班次已售张数；超出的班次会自动跳过（不改），下方会显示改了几个、跳过几个。
+              容量可以低于已售（航司减配 / 换机型）：这类班次照改并标记超售，下方会显示改了几个、其中几个超售。
+              销售侧照旧按容量拒卖，超售部分需与航司 / 操作部协调。
             </div>
           </>
         )}

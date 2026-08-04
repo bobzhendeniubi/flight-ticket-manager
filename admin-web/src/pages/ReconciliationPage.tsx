@@ -399,7 +399,9 @@ function ReceiptRow({
         <td className="max-w-[200px] truncate" title={receipt.payerNote ?? ''}>
           {receipt.payerNote || '—'}
           {receipt.orderHintId && (
-            <span className="ml-1 text-xs text-ink-muted">（提示订单 {receipt.orderHintId.slice(0, 8)}）</span>
+            <span className="ml-1 text-xs text-ink-muted" title={`订单 id ${receipt.orderHintId}`}>
+              （提示订单 {receipt.hintOrderNumber ?? receipt.orderHintId.slice(0, 8)}）
+            </span>
           )}
         </td>
         <td>
@@ -453,7 +455,10 @@ function ReceiptRow({
             已认领：
             {receipt.allocations.map((a) => (
               <span key={a.id} className="ml-2 inline-flex items-center gap-1">
-                <span className="font-mono text-ink-muted">{a.orderId.slice(0, 8)}</span>
+                {/* 订单号（财务照着核对账）；服务端 join 不到才回落 id 前 8 位，title 恒为完整 id */}
+                <span className="font-mono text-ink-muted" title={`订单 id ${a.orderId}`}>
+                  {a.orderNumber ?? a.orderId.slice(0, 8)}
+                </span>
                 <span className="font-medium text-emerald-700">{fmtCny(a.amountCny)}</span>
               </span>
             ))}

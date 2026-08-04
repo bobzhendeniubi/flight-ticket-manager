@@ -15,6 +15,10 @@ import {
   ApiError,
   duplicatePassengerConflictOrderNumbers,
   hotelControlOpsApi,
+  randomStarTierLabel,
+  poolOptionValue,
+  poolTierFromOptionValue,
+  RANDOM_STAR_TIERS,
   type AdminFlight,
   type AdminSchedule,
   type AgentListItem,
@@ -391,12 +395,16 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const [returnDate, setReturnDate] = useState('');
 
   // ── 酒店 ──
+  // hotelId 也可以是星级随机池的哨兵值（见 poolOptionValue）——客人买「N 星随机」，
+  // 下单时不指定酒店，占房控的星级随机池库存，之后由房控落到具体酒店。
   const [hotels, setHotels] = useState<Hotel[]>([]);
   const [hotelId, setHotelId] = useState('');
   const [roomTypeId, setRoomTypeId] = useState('');
   const [checkIn, setCheckIn] = useState('');
   const [checkOut, setCheckOut] = useState('');
   const [rooms, setRooms] = useState<number | null>(1);
+  // 星级随机池行没有房型可查价 → 运营手录每间每晚售价（与「无产品 id 的地面行」同一条既有口径）
+  const [poolNightlyPrice, setPoolNightlyPrice] = useState<number | null>(null);
 
   // ── 签证 ──
   const [visas, setVisas] = useState<Visa[]>([]);
@@ -552,6 +560,8 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   );
   const hotel = hotels.find((h) => h.id === hotelId);
   const roomType = hotel?.roomTypes.find((rt) => rt.id === roomTypeId);
+  /** 当前酒店下拉选中的是星级随机池时的档次；选的是真实酒店 → null。 */
+  const poolTier = poolTierFromOptionValue(hotelId);
   const visa = visas.find((v) => v.id === visaId);
   const bundle = bundles.find((b) => b.id === bundleId);
 
@@ -1027,6 +1037,31 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       return { items: [outboundLine, returnLine] };
     }
     if (kind === 'HOTEL') {
+      // ── 星级随机池行：不选酒店/房型，占池库存，之后由房控落到具体酒店 ──
+      if (poolTier != null) {
+        if (!checkIn || !checkOut) return { error: '请填写入住和退房日期' };
+        const poolNights = nightsBetween(checkIn, checkOut);
+        if (poolNights < 1) return { error: '退房日期需晚于入住日期' };
+        if (poolNightlyPrice == null || poolNightlyPrice <= 0) {
+          return { error: `请填写${randomStarTierLabel(poolTier)}的每间每晚售价` };
+        }
+        const poolRoomQty = Math.max(1, rooms ?? 1);
+        return {
+          item: {
+            kind: 'HOTEL',
+            description: `${randomStarTierLabel(poolTier)} · ${checkIn}~${checkOut} · ${poolNights}晚 × ${poolRoomQty}间`,
+            // qty = 晚数（与具体酒店行同构）；金额 = 每间每晚价 × 晚数 × 间数。
+            // 池行显式送 roomsBilled，让「收多少钱」「占几间池库存」是同一个数，不靠 metadata 反推。
+            quantity: poolNights,
+            randomStarTier: poolTier,
+            checkIn,
+            checkOut,
+            unitPrice: poolNightlyPrice,
+            roomsBilled: poolRoomQty,
+            metadata: { rooms: poolRoomQty },
+          },
+        };
+      }
       if (!roomTypeId) return { error: '请选择酒店和房型' };
       if (!checkIn || !checkOut) return { error: '请填写入住和退房日期' };
       const nights = nightsBetween(checkIn, checkOut);
@@ -1697,20 +1732,35 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                     酒店
                     <select className={inputCls} value={hotelId} onChange={(e) => { setHotelId(e.target.value); setRoomTypeId(''); }}>
                       <option value="">选择酒店…</option>
-                      {hotels.map((h) => (
-                        <option key={h.id} value={h.id}>{h.name}（{h.cityCode}）</option>
-                      ))}
+                      {/* 星级随机池：客人只认星级、不指定酒店，先占池库存，之后由房控落到具体酒店 */}
+                      <optgroup label="星级随机（不指定酒店，之后由房控落地）">
+                        {RANDOM_STAR_TIERS.map((tier) => (
+                          <option key={tier} value={poolOptionValue(tier)}>{randomStarTierLabel(tier)}</option>
+                        ))}
+                      </optgroup>
+                      <optgroup label="具体酒店">
+                        {hotels.map((h) => (
+                          <option key={h.id} value={h.id}>{h.name}（{h.cityCode}）</option>
+                        ))}
+                      </optgroup>
                     </select>
                   </label>
-                  <label className="text-xs text-slate-500">
-                    房型
-                    <select className={inputCls} value={roomTypeId} onChange={(e) => setRoomTypeId(e.target.value)} disabled={!hotelId}>
-                      <option value="">选择房型…</option>
-                      {(hotel?.roomTypes ?? []).map((rt) => (
-                        <option key={rt.id} value={rt.id}>{rt.name} ¥{Number(rt.basePrice).toFixed(0)}/晚</option>
-                      ))}
-                    </select>
-                  </label>
+                  {poolTier == null ? (
+                    <label className="text-xs text-slate-500">
+                      房型
+                      <select className={inputCls} value={roomTypeId} onChange={(e) => setRoomTypeId(e.target.value)} disabled={!hotelId}>
+                        <option value="">选择房型…</option>
+                        {(hotel?.roomTypes ?? []).map((rt) => (
+                          <option key={rt.id} value={rt.id}>{rt.name} ¥{Number(rt.basePrice).toFixed(0)}/晚</option>
+                        ))}
+                      </select>
+                    </label>
+                  ) : (
+                    <label className="text-xs text-slate-500">
+                      每间每晚售价(¥)
+                      <NumberInput className={inputCls} value={poolNightlyPrice} onChange={setPoolNightlyPrice} min={0} placeholder="按谈定的随机价填" />
+                    </label>
+                  )}
                   <label className="text-xs text-slate-500">
                     入住日期
                     <input type="date" className={inputCls} value={checkIn} max={checkOut || undefined} onChange={(e) => setCheckIn(e.target.value)} />
@@ -1724,9 +1774,11 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                     <NumberInput className={inputCls} value={rooms} onChange={setRooms} integerOnly min={1} placeholder="1" />
                   </label>
                   <div className="text-xs text-slate-400 self-end pb-1">
-                    {checkIn && checkOut && nightsBetween(checkIn, checkOut) > 0
-                      ? `共 ${nightsBetween(checkIn, checkOut)} 晚 · 价格由系统按房型重算`
-                      : '价格由系统按房型重算'}
+                    {poolTier != null
+                      ? `${checkIn && checkOut && nightsBetween(checkIn, checkOut) > 0 ? `共 ${nightsBetween(checkIn, checkOut)} 晚 · ` : ''}占${randomStarTierLabel(poolTier)}池库存 · 池房量不足会被系统拦下`
+                      : checkIn && checkOut && nightsBetween(checkIn, checkOut) > 0
+                        ? `共 ${nightsBetween(checkIn, checkOut)} 晚 · 价格由系统按房型重算`
+                        : '价格由系统按房型重算'}
                   </div>
                 </div>
               )}

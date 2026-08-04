@@ -23,6 +23,10 @@ import {
 } from './pnr-export.js';
 import { buildOrderFilterWhere } from './orders.service.js';
 import { filterExportOrdersByDepartDate } from './orders.export-depart-filter.js';
+import {
+  excludeOnewayFromReturnLegExport,
+  filterExportOrdersByTripType,
+} from './orders.export-trip-filter.js';
 import { determineFlightLegs } from './ticketing-cap.js';
 import { parseRoomGroups, resolveExportHotelInfo } from './orders.export-room-allocation.js';
 import type { ExportTemplatesQuery } from './orders.schemas.js';
@@ -786,10 +790,22 @@ export async function buildOrderTemplateExportWorkbook(
   // 也捞进来。这里按整单「出发日」（= 列表「出发日期」列同口径）二次过滤到 [travelFrom, travelTo]。
   //   - scheduleId（整班·全岗精确导出）：取数已按班次精确圈定，出发日细筛不适用，原样放行；
   //   - orderIds（勾选导出）：用户勾了哪些就导哪些，travelFrom/travelTo 已被忽略，不再二次筛。
-  const orders =
+  const departFiltered =
     query.scheduleId || (query.orderIds && query.orderIds.length > 0)
       ? fetched
       : filterExportOrdersByDepartDate(fetched, query.travelFrom, query.travelTo);
+
+  // 单程单排除 + 行程类型筛选（票务岗反馈）：查询层的航段守卫排不掉单程单（见
+  // orders.service.ts buildOrderFilterWhere 中该守卫的注释），只能在取回内存后按
+  // determineFlightLegs 二次收口。勾选导出（orderIds）不走这两个过滤——用户勾了哪些就导哪些，
+  // 与 filterExportOrdersByDepartDate 对 orderIds 的处理同一原则。
+  const orders =
+    query.orderIds && query.orderIds.length > 0
+      ? departFiltered
+      : filterExportOrdersByTripType(
+          excludeOnewayFromReturnLegExport(departFiltered, query.invoiceLeg),
+          query.tripType,
+        );
 
   const wb = new ExcelJS.Workbook();
   wb.creator = `Citur Travel · 订单导出（${ORDER_TEMPLATE_LABEL[query.template]}）`;

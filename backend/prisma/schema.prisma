@@ -735,21 +735,32 @@ model Hotel {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 酒店包房周期 — 按日期段向酒店切房（buy-out blocks）；dateFrom/dateTo 闭区间
+//
+// 两种周期，二选一（应用层强制 XOR，见 hotel-control.service.ts createBlockPeriod）：
+//   ① 具体酒店周期：hotelId 非空、randomStarTier 为空 —— 原有语义，切某家酒店的房。
+//   ② 星级随机池周期：hotelId 为空、randomStarTier=3|4 —— 卖「三星/四星随机」套餐用的
+//      真库存池：先按星级切总量，客人下单只占池，之后房控再把这单落到具体酒店（换酒店）。
+//      池与具体酒店**互不扣减**：选明月扣明月，选随机扣池；落地时占用从池转到该酒店。
+//      酒店的星级分类直接取 Hotel.starRating（不另建分类表）。
 // ─────────────────────────────────────────────────────────────────────────────
 model HotelBlockPeriod {
-  id        String   @id @default(cuid())
-  hotelId   String
-  dateFrom  DateTime @db.Date
-  dateTo    DateTime @db.Date // inclusive
-  rooms     Int
-  unitPrice Decimal? @db.Decimal(12, 2) // 切房单价（CNY/间/晚）
-  note      String?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  id String @id @default(cuid())
+  // NULL = 星级随机池周期（此时 randomStarTier 非空）
+  hotelId String?
+  // 星级随机池档次（3=三星随机、4=四星随机）；NULL = 具体酒店周期
+  randomStarTier Int?
+  dateFrom       DateTime @db.Date
+  dateTo         DateTime @db.Date // inclusive
+  rooms          Int
+  unitPrice      Decimal? @db.Decimal(12, 2) // 切房单价（CNY/间/晚）
+  note           String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
 
-  hotel Hotel @relation(fields: [hotelId], references: [id], onDelete: Cascade)
+  hotel Hotel? @relation(fields: [hotelId], references: [id], onDelete: Cascade)
 
   @@index([hotelId, dateFrom, dateTo])
+  @@index([randomStarTier, dateFrom, dateTo])
 }
 
 model HotelRoomType {
@@ -1191,6 +1202,11 @@ model OrderItem {
   flightScheduleId String?
   flightCabin      CabinClass?
   hotelRoomTypeId  String?
+  // 星级随机池占用行（3=三星随机、4=四星随机）：kind=HOTEL 且 hotelRoomTypeId 为空且本列非空 =
+  // 客人买的是「N 星随机」，还没落到具体酒店，占的是星级随机池的库存（见 HotelBlockPeriod 注释）。
+  // 房控把这单落到具体酒店时（换酒店流程）改写 hotelRoomTypeId 并清空本列，占用随之从池转到该酒店。
+  // 入住区间/间数沿用 hotelCheckIn/hotelCheckOut/roomsBilled，与具体酒店行完全同构。
+  randomStarTier   Int?
   hotelCheckIn     DateTime?     @db.Date
   hotelCheckOut    DateTime?     @db.Date
   transferId       String?

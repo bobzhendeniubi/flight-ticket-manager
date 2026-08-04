@@ -4,20 +4,33 @@ const dateStr = z
   .string()
   .regex(/^\d{4}-\d{2}-\d{2}$/u, '日期格式应为 YYYY-MM-DD');
 
+/** 星级随机池档次（3=三星随机、4=四星随机）；口径见 hotel-control.service.ts RANDOM_STAR_TIERS。*/
+const randomStarTierSchema = z.union([z.literal(3), z.literal(4)]);
+
 // ── 包房周期 CRUD ─────────────────────────────────────────────────────────
 export const listBlockPeriodsQuerySchema = z.object({
   hotelId: z.string().optional(),
+  randomStarTier: z.coerce.number().int().pipe(randomStarTierSchema).optional(),
 });
 export type ListBlockPeriodsQuery = z.infer<typeof listBlockPeriodsQuerySchema>;
 
-export const createBlockPeriodBodySchema = z.object({
-  hotelId: z.string().min(1),
-  dateFrom: dateStr,
-  dateTo: dateStr,
-  rooms: z.number().int().min(0),
-  unitPrice: z.number().nonnegative().nullable().optional(), // 切房单价（CNY/间/晚）
-  note: z.string().max(200).nullable().optional(),
-});
+/**
+ * 建包房周期：hotelId（具体酒店）与 randomStarTier（星级随机池）二选一必填。
+ * 这里只做形状校验，权威 XOR 判定在 service（assertBlockPeriodScope），两处口径一致。
+ */
+export const createBlockPeriodBodySchema = z
+  .object({
+    hotelId: z.string().min(1).optional(),
+    randomStarTier: randomStarTierSchema.optional(),
+    dateFrom: dateStr,
+    dateTo: dateStr,
+    rooms: z.number().int().min(0),
+    unitPrice: z.number().nonnegative().nullable().optional(), // 切房单价（CNY/间/晚）
+    note: z.string().max(200).nullable().optional(),
+  })
+  .refine((b) => !!b.hotelId !== (b.randomStarTier != null), {
+    message: '包房周期必须二选一：指定一家酒店，或指定一个星级随机池',
+  });
 export type CreateBlockPeriodBody = z.infer<typeof createBlockPeriodBodySchema>;
 
 export const updateBlockPeriodBodySchema = z.object({
@@ -72,11 +85,17 @@ export const recentChangesQuerySchema = z.object({
 });
 export type RecentChangesQuery = z.infer<typeof recentChangesQuerySchema>;
 
-// ── 占房下钻（某酒店某晚，谁占的；销控矩阵红/黄格点击用）────────────────────
-export const occupantsQuerySchema = z.object({
-  hotelId: z.string().min(1),
-  date: dateStr,
-});
+// ── 占房下钻（某酒店/某星级随机池某晚，谁占的；销控矩阵红/黄格点击用）──────────
+// hotelId 与 randomStarTier 二选一（口径同包房周期）。
+export const occupantsQuerySchema = z
+  .object({
+    hotelId: z.string().min(1).optional(),
+    randomStarTier: z.coerce.number().int().pipe(randomStarTierSchema).optional(),
+    date: dateStr,
+  })
+  .refine((q) => !!q.hotelId !== (q.randomStarTier != null), {
+    message: '请指定一家酒店，或指定一个星级随机池',
+  });
 export type OccupantsQuery = z.infer<typeof occupantsQuerySchema>;
 
 // ── 当日余量（给定房型 + 入住区间逐晚展开；分房弹窗徽标用）───────────────────

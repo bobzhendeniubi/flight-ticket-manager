@@ -10,7 +10,7 @@
  *   GET    /hotel-control/forward?from&to          远期视图（按日期跨酒店合计）
  *   GET    /hotel-control/alerts?days=14           提醒线（超卖加房/富余退房/班次超员）
  *   GET    /hotel-control/recent-changes?days=7    近期用房变更（读审计流：调整分房/换酒店/补房差）
- *   GET    /hotel-control/occupants?hotelId&date   占房下钻（某酒店某晚，谁占的）
+ *   GET    /hotel-control/occupants?hotelId|randomStarTier&date  占房下钻（某酒店/某星级随机池某晚，谁占的）
  *   GET    /hotel-control/nightly-remaining?hotelRoomTypeId&checkIn&checkOut  当日余量（分房弹窗徽标）
  *   GET    /hotel-control/export?from&to           房态导出（xlsx，销控矩阵原样导出）
  *   GET    /hotel-control/passports.zip?hotelId&from&to     按酒店导出护照 zip
@@ -51,6 +51,7 @@ import {
   getOccupyingOrders,
   getRecentRoomChanges,
   listBlockPeriods,
+  randomPoolGroupKey,
   updateBlockPeriod,
 } from './hotel-control.service.js';
 
@@ -62,7 +63,10 @@ export const hotelControlRoutes: FastifyPluginAsync = async (app) => {
   // ── 包房周期 CRUD ──────────────────────────────────────────────────────
   app.get('/block-periods', requireStaff, async (req) => {
     const q = listBlockPeriodsQuerySchema.parse(req.query);
-    const periods = await listBlockPeriods({ hotelId: q.hotelId });
+    const periods = await listBlockPeriods({
+      hotelId: q.hotelId,
+      randomStarTier: q.randomStarTier,
+    });
     return { periods };
   });
 
@@ -73,7 +77,8 @@ export const hotelControlRoutes: FastifyPluginAsync = async (app) => {
       actor: actorFromRequest(req),
       action: 'CREATE_HOTEL_BLOCK_PERIOD',
       targetType: 'PRODUCT',
-      targetId: body.hotelId,
+      // 池周期没有酒店 id，用池分组键留痕（可回溯是哪个星级池）
+      targetId: period.hotelId ?? randomPoolGroupKey(period.randomStarTier ?? 0),
       targetLabel: `${period.hotelName} ${body.dateFrom}→${body.dateTo}`,
       after: body,
     });
@@ -88,7 +93,7 @@ export const hotelControlRoutes: FastifyPluginAsync = async (app) => {
       actor: actorFromRequest(req),
       action: 'UPDATE_HOTEL_BLOCK_PERIOD',
       targetType: 'PRODUCT',
-      targetId: period.hotelId,
+      targetId: period.hotelId ?? randomPoolGroupKey(period.randomStarTier ?? 0),
       targetLabel: `${period.hotelName} ${period.dateFrom}→${period.dateTo}`,
       after: body,
     });
@@ -132,10 +137,13 @@ export const hotelControlRoutes: FastifyPluginAsync = async (app) => {
     return getRecentRoomChanges(q.days);
   });
 
-  // ── 占房下钻（某酒店某晚，谁占的；销控矩阵余量格点击用）──────────────────
+  // ── 占房下钻（某酒店/某星级随机池某晚，谁占的；销控矩阵余量格点击用）──────────
   app.get('/occupants', requireStaff, async (req) => {
     const q = occupantsQuerySchema.parse(req.query);
-    const occupants = await getOccupyingOrders(q.hotelId, q.date);
+    const occupants = await getOccupyingOrders(
+      q.hotelId ? { hotelId: q.hotelId } : { randomStarTier: q.randomStarTier! },
+      q.date,
+    );
     return { occupants };
   });
 

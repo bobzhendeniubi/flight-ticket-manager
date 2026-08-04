@@ -178,10 +178,11 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
     },
   );
 
-  // 批量改容量（按 scheduleId 列表；已售超过目标容量的班次自动跳过，不影响其它班次）。
+  // 批量改容量（按 scheduleId 列表）。容量可以压到已售之下（航司减配/换机型），
+  // 这类舱位照改并在 oversold 里点名，销售侧照旧按 CAS 拒卖。
   // 仅 ADMIN —— 与批量删除同权限口径，批量改动爆炸半径大；操作写审计留痕。
   // body: { scheduleIds, seatClasses: [{cabin, capacity}] }
-  // 返回 { applied, skipped: [{ scheduleId, reason }] }。
+  // 返回 { applied, skipped: [{ scheduleId, reason }], oversold: [{ scheduleId, cabin, sold, capacity, oversoldBy }] }。
   app.post(
     '/schedules/batch-update-capacity',
     { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN)] },

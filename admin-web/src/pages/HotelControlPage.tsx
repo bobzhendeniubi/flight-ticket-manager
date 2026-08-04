@@ -17,6 +17,11 @@ import {
   api,
   ApiError,
   hotelControlOpsApi,
+  randomStarTierLabel,
+  poolOptionValue,
+  poolTierFromOptionValue,
+  RANDOM_STAR_TIERS,
+  type RandomStarTier,
   type BlockPeriodWriteInput,
   type HotelBlockPeriod,
   type HotelControlAlerts,
@@ -124,6 +129,14 @@ function readShared(rows: unknown): SharedRows {
 const STICKY_COL1 = 'sticky left-0 z-10 min-w-[11rem] bg-white';
 const STICKY_COL2 = 'sticky left-[11rem] z-10 min-w-[3.5rem] bg-white';
 
+// ── 星级随机池（三星随机 / 四星随机）─────────────────────────────────────────
+/**
+ * 池是**真库存**：先按星级切总量，客人下单只占池，之后房控再落到具体酒店。
+ * 页面里池只在两处露出：包房周期表单的下拉虚拟项，和销控矩阵/远期里的独立分组。
+ * 判定一律看 `randomStarTier` 非空 —— 池组的 hotelId 是后端合成键，不能当酒店 id 用。
+ * 下拉哨兵值 poolOptionValue / poolTierFromOptionValue 与录单弹窗共用同一份实现（lib/api.ts）。
+ */
+
 export function HotelControlPage() {
   const tokens = useAuth((s) => s.tokens);
   const token = tokens?.accessToken ?? '';
@@ -136,10 +149,12 @@ export function HotelControlPage() {
   const [error, setError] = useState<string | null>(null);
   // 周期 CRUD 后 +1 触发销控板/远期重拉
   const [boardNonce, setBoardNonce] = useState(0);
-  // 余量格点击下钻（某酒店某晚，谁占的）；null = 抽屉关闭
+  // 余量格点击下钻（某酒店/某星级随机池某晚，谁占的）；null = 抽屉关闭
   const [drill, setDrill] = useState<{
     hotelId: string;
     hotelName: string;
+    /** 非空 = 池组下钻（此时 hotelId 是合成键，不能当酒店 id 传给接口） */
+    randomStarTier: RandomStarTier | null;
     date: string;
     block: number;
     used: number;
@@ -248,7 +263,18 @@ export function HotelControlPage() {
                   <Fragment key={h.hotelId}>
                     <tr className="border-t border-slate-200">
                       <td rowSpan={4} className={`${STICKY_COL1} py-2 pr-2 align-top`}>
-                        <div className="font-medium text-ink">{h.hotelName}</div>
+                        <div className="font-medium text-ink">
+                          {h.hotelName}
+                          {/* 池组：独立库存、尚未落到具体酒店，用角标点明，样式与酒店组其余部分一致 */}
+                          {h.randomStarTier != null && (
+                            <span
+                              className="ml-1.5 inline-flex items-center rounded-full bg-indigo-50 px-1.5 text-[10px] font-semibold leading-4 text-indigo-700 ring-1 ring-indigo-200"
+                              title="星级随机池：按星级切的独立库存，客人先占池、之后由房控落到具体酒店；与具体酒店的包房互不扣减"
+                            >
+                              池
+                            </span>
+                          )}
+                        </div>
                         {h.unitPrice != null && (
                           <div className="text-xs text-ink-muted">单价 {fmtCny(h.unitPrice)}/晚</div>
                         )}
@@ -320,7 +346,14 @@ export function HotelControlPage() {
                                 : '余量按物理房间口径（用房行为床位口径）· 点击查看占房订单'
                             }
                             onClick={() =>
-                              setDrill({ hotelId: h.hotelId, hotelName: h.hotelName, date, block, used })
+                              setDrill({
+                                hotelId: h.hotelId,
+                                hotelName: h.hotelName,
+                                randomStarTier: h.randomStarTier,
+                                date,
+                                block,
+                                used,
+                              })
                             }
                           >
                             {unconfigured ? '未配' : physRem}
@@ -414,6 +447,7 @@ export function HotelControlPage() {
           token={token}
           hotelId={drill.hotelId}
           hotelName={drill.hotelName}
+          randomStarTier={drill.randomStarTier}
           date={drill.date}
           block={drill.block}
           used={drill.used}
@@ -430,6 +464,7 @@ function OccupantsDrawer({
   token,
   hotelId,
   hotelName,
+  randomStarTier,
   date,
   block,
   used,
@@ -439,6 +474,8 @@ function OccupantsDrawer({
   token: string;
   hotelId: string;
   hotelName: string;
+  /** 非空 = 星级随机池下钻（hotelId 是合成键，接口按 randomStarTier 查）。 */
+  randomStarTier: RandomStarTier | null;
   date: string;
   block: number;
   used: number;
@@ -456,10 +493,13 @@ function OccupantsDrawer({
     if (!token) return;
     setErr(null);
     hotelControlOpsApi
-      .getHotelOccupants(token, { hotelId, date })
+      .getHotelOccupants(
+        token,
+        randomStarTier != null ? { randomStarTier, date } : { hotelId, date },
+      )
       .then((r) => setOccupants(r.occupants))
       .catch((e: unknown) => setErr(e instanceof ApiError ? e.message : '占房订单加载失败'));
-  }, [token, hotelId, date]);
+  }, [token, hotelId, randomStarTier, date]);
 
   useEffect(() => {
     setOccupants(null);
@@ -543,13 +583,19 @@ function OccupantsDrawer({
                     >
                       {copiedId === o.orderId ? '已复制 ✓' : '复制订单号'}
                     </button>
-                    <button
-                      type="button"
-                      className="text-xs font-medium text-brand hover:text-brand-dark"
-                      onClick={() => setSwapTarget(o)}
-                    >
-                      换酒店
-                    </button>
+                    {/* 池占房行还没落到具体酒店，共享的换酒店弹窗按「原酒店+日期」反查订单行，
+                        对池行无从定位 —— 先如实说明，不给一个点了会报错的按钮。 */}
+                    {randomStarTier != null ? (
+                      <span className="text-xs text-ink-muted">该单尚未落具体酒店</span>
+                    ) : (
+                      <button
+                        type="button"
+                        className="text-xs font-medium text-brand hover:text-brand-dark"
+                        onClick={() => setSwapTarget(o)}
+                      >
+                        换酒店
+                      </button>
+                    )}
                     <Link to="/orders" className="text-xs text-brand hover:text-brand-dark">
                       去订单页 →
                     </Link>
@@ -606,7 +652,8 @@ function BoardExport({ token, board }: { token: string; board: HotelControlBoard
   }
 
   // ── 导出护照 ──
-  const hotelOptions = board?.hotels ?? [];
+  // 护照 zip 按真实酒店导出 —— 星级随机池是虚拟分组（hotelId 是合成键），排除在下拉之外
+  const hotelOptions = (board?.hotels ?? []).filter((h) => h.randomStarTier == null);
   const [passportHotelId, setPassportHotelId] = useState<string>('');
   const [passportFrom, setPassportFrom] = useState<string>(todayStr());
   const [passportTo, setPassportTo] = useState<string>(plusDaysStr(30));
@@ -1040,9 +1087,12 @@ function readSharedOddNear(alerts: unknown): SharedOddNear {
 }
 
 // ── 近期用房变更面板（GET /hotel-control/recent-changes；读审计流，不做已读态）──
-// 订单侧改了分房 / 换酒店 / 补收单房差，房控看板会静默反映——这里给一条「变更发生过」的
-// 可见性：默认收起，徽标示条数；点开列出 时间 / 订单号（可点跳订单）/ 操作人 / 变更摘要。
+// 订单侧改了分房 / 换酒店 / 补收单房差 / 改期，房控看板会静默反映——这里给一条「变更发生过」的
+// 可见性：默认收起，徽标示条数；点开列出 时间 / 订单号（可点跳订单）/ 操作人 / 变更摘要 /
+// 乘客 / 出发返程日期 / 订单金额，方便房控核对是谁、哪天走、多少钱的单动了用房。
 const RECENT_CHANGES_DAYS = 7;
+/** 变更行乘客姓名展示上限——超过则截断为「前 N 个 + 等 M 人」。*/
+const CHANGE_PASSENGER_NAMES_LIMIT = 3;
 
 /** ISO8601 → 本地「M/D HH:mm」。*/
 function fmtChangeTime(iso: string): string {
@@ -1051,6 +1101,27 @@ function fmtChangeTime(iso: string): string {
   const hh = String(d.getHours()).padStart(2, '0');
   const mm = String(d.getMinutes()).padStart(2, '0');
   return `${d.getMonth() + 1}/${d.getDate()} ${hh}:${mm}`;
+}
+
+/** "2026-08-10" → "8/10"（变更行紧凑日期，与提醒线 fmtMonthDay 同风格）。*/
+function fmtChangeDate(date: string): string {
+  const parts = date.split('-');
+  if (parts.length !== 3) return date;
+  const [, m, d] = parts;
+  return `${Number(m)}/${Number(d)}`;
+}
+
+/** 乘客姓名列表 → 「张三、李四、王五 等 5 人」（超过展示上限才带「等 N 人」）。*/
+function fmtChangePassengers(names: string[]): string {
+  if (names.length === 0) return '—';
+  const shown = names.slice(0, CHANGE_PASSENGER_NAMES_LIMIT).join('、');
+  return names.length > CHANGE_PASSENGER_NAMES_LIMIT ? `${shown} 等 ${names.length} 人` : shown;
+}
+
+/** 出发/返程日 → "8/10–8/15"（单程/缺失时只显示出发日或「—」）。*/
+function fmtChangeTrip(departDate: string | null, returnDate: string | null): string {
+  if (!departDate) return '—';
+  return returnDate ? `${fmtChangeDate(departDate)}–${fmtChangeDate(returnDate)}` : fmtChangeDate(departDate);
 }
 
 function RecentChangesPanel({ token }: { token: string }) {
@@ -1125,6 +1196,18 @@ function RecentChangesPanel({ token }: { token: string }) {
                 ) : (
                   <span className="shrink-0 text-ink-muted">—</span>
                 )}
+                <span
+                  className="shrink-0 text-xs text-ink-muted"
+                  title={c.passengerNames.join('、') || undefined}
+                >
+                  {fmtChangePassengers(c.passengerNames)}
+                </span>
+                <span className="shrink-0 text-xs text-ink-muted nums">
+                  {fmtChangeTrip(c.departDate, c.returnDate)}
+                </span>
+                <span className="shrink-0 text-xs text-ink-muted nums">
+                  {c.orderAmountCny != null ? fmtCny(c.orderAmountCny) : '—'}
+                </span>
                 <span className="text-ink-soft">{c.summary}</span>
                 <span className="text-xs text-ink-muted">· {c.actor ?? '—'}</span>
               </li>
@@ -1424,10 +1507,11 @@ function BlockPeriodsEditor({ token, onChanged }: { token: string; onChanged: ()
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div>
           <h2 className="text-sm font-semibold text-ink">
-            包房周期管理（按 酒店 × 日期段 定切房间数 / 单价；周期可叠加）
+            包房周期管理（按 酒店 / 星级随机池 × 日期段 定切房间数 / 单价；周期可叠加）
           </h2>
           <p className="mt-1 text-xs text-ink-muted">
             为某家酒店在某段日期切下固定间数。销控板的「包房」= 当天所有覆盖周期 rooms 之和。
+            也可切「三星随机 / 四星随机」——按星级切总量，客人下单先占池，之后由房控落到具体酒店，与具体酒店的包房互不扣减。
           </p>
         </div>
         <button
@@ -1509,6 +1593,7 @@ function BlockPeriodNewForm({
   onSaved: () => void;
   onCancel: () => void;
 }) {
+  // 下拉选中值：真实酒店 id，或星级随机池的哨兵值 POOL_OPTION_VALUE(tier)
   const [hotelId, setHotelId] = useState<string>(hotelOptions[0]?.id ?? '');
   const [dateFrom, setDateFrom] = useState<string>(todayStr());
   const [dateTo, setDateTo] = useState<string>(todayStr());
@@ -1517,6 +1602,8 @@ function BlockPeriodNewForm({
   const [note, setNote] = useState<string>('');
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+
+  const poolTier = poolTierFromOptionValue(hotelId);
 
   // 默认下拉同步
   useEffect(() => {
@@ -1527,7 +1614,7 @@ function BlockPeriodNewForm({
 
   async function submit(): Promise<void> {
     if (!hotelId) {
-      setErr('请选择酒店');
+      setErr('请选择酒店或星级随机池');
       return;
     }
     if (rooms == null) {
@@ -1537,8 +1624,9 @@ function BlockPeriodNewForm({
     setSaving(true);
     setErr(null);
     try {
+      // 酒店与星级随机池二选一（后端同款 XOR 校验）：选中池哨兵值时只发 randomStarTier
       const body: BlockPeriodWriteInput = {
-        hotelId,
+        ...(poolTier != null ? { randomStarTier: poolTier } : { hotelId }),
         dateFrom,
         dateTo,
         rooms,
@@ -1561,21 +1649,33 @@ function BlockPeriodNewForm({
     <div className="mt-3 rounded-lg border border-slate-200 bg-canvas p-3">
       <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
         <label className="text-xs text-ink-soft">
-          酒店
+          酒店 / 星级随机池
           <select
             value={hotelId}
             onChange={(e) => setHotelId(e.target.value)}
             className={`mt-1 block w-full ${inputCls}`}
           >
-            {hotelOptions.length === 0 && <option value="">（无可用酒店）</option>}
-            {hotelOptions.map((o) => (
-              <option key={o.id} value={o.id}>
-                {o.label}
-              </option>
-            ))}
+            {/* 星级随机池：不是某一家酒店，而是「按星级切的总量」，客人先占池、之后再落酒店 */}
+            <optgroup label="星级随机池（先切总量，之后落酒店）">
+              {RANDOM_STAR_TIERS.map((tier) => (
+                <option key={tier} value={poolOptionValue(tier)}>
+                  {randomStarTierLabel(tier)}
+                </option>
+              ))}
+            </optgroup>
+            <optgroup label="具体酒店">
+              {hotelOptions.length === 0 && <option value="">（无可用酒店）</option>}
+              {hotelOptions.map((o) => (
+                <option key={o.id} value={o.id}>
+                  {o.label}
+                </option>
+              ))}
+            </optgroup>
           </select>
           <span className="mt-1 block font-normal normal-case text-ink-muted">
-            找不到酒店？在 产品管理 › 酒店 里添加/编辑（含介绍、图片、房型）。
+            {poolTier != null
+              ? `${randomStarTierLabel(poolTier)}是独立库存：客人下单先占池，之后由房控落到某家 ${poolTier} 星及以上酒店；与具体酒店的包房互不扣减。`
+              : '找不到酒店？在 产品管理 › 酒店 里添加/编辑（含介绍、图片、房型）。'}
           </span>
         </label>
         <label className="text-xs text-ink-soft">
@@ -1710,7 +1810,17 @@ function BlockPeriodRow({
   if (!editing) {
     return (
       <tr className="border-b border-slate-100 last:border-0 hover:bg-slate-50/60">
-        <td className="py-2 font-medium text-ink">{period.hotelName}</td>
+        <td className="py-2 font-medium text-ink">
+          {period.hotelName}
+          {period.randomStarTier != null && (
+            <span
+              className="ml-1.5 inline-flex items-center rounded-full bg-indigo-50 px-1.5 text-[10px] font-semibold leading-4 text-indigo-700 ring-1 ring-indigo-200"
+              title="星级随机池：按星级切的独立库存，与具体酒店的包房互不扣减"
+            >
+              池
+            </span>
+          )}
+        </td>
         <td className="py-2 text-ink-soft">{period.dateFrom}</td>
         <td className="py-2 text-ink-soft">{period.dateTo}</td>
         <td className="py-2 text-right nums text-ink-soft">{period.rooms}</td>

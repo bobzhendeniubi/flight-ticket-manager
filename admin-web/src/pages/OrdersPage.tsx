@@ -17,7 +17,7 @@ import { SingleOrderModal } from '../components/SingleOrderModal';
 import { RoomingEditor, type RoomingPassenger } from '../components/RoomingEditor';
 import { HotelSwapModal } from '../components/HotelSwapModal';
 import { SearchSelect, type SearchSelectOption } from '../components/SearchSelect';
-import type { RoomGroup } from '../lib/api';
+import type { RoomGroup, Receipt } from '../lib/api';
 import { countryIso3ToIso2 } from '../lib/passportOcr';
 
 // 本地可视化用的状态子集（后端 OrderStatus 更全，这里只列出常用 7 个做 filter）
@@ -420,6 +420,8 @@ export function OrdersPage() {
   const [tkInvoiced, setTkInvoiced] = useState(false); // 开票状态，默认「未开」
   const [tkFlightNumber, setTkFlightNumber] = useState(''); // 航班号（选填，缩小同日多航班范围）
   const [tkKind, setTkKind] = useState<'' | 'FLIGHT' | 'BUNDLE'>(''); // 订单类型（选填：机票单/套餐单，避免同航班混单）
+  // 行程类型（选填：单程/往返，票务岗反馈——回程未开的导出会混进单程单）；导出内存侧按 determineFlightLegs 判定。
+  const [tkTripType, setTkTripType] = useState<'' | 'oneway' | 'roundtrip'>('');
   const [tkExporting, setTkExporting] = useState(false);
   // 票务快捷面板预览（票务反馈 T4）：字段变化时防抖查一次「匹配 N 条」，导出前就能确认范围对不对，
   // 而不是导出完打开表格才发现——面板本身此前不触发任何查询，是「筛了没生效」错觉的另一个来源。
@@ -934,7 +936,13 @@ export function OrdersPage() {
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `订单导出-${TEMPLATE_LABEL[exportTemplate]}-${new Date().toISOString().slice(0, 10)}.xlsx`;
+      // 文件名日期口径（票务岗反馈：文件名应对齐「出发日」而非「今天」，与票务快捷面板入口一致）：
+      // 仅当模板为票务专用且筛选里给了出行日期起点时用该日期；其余模板/无出行日期筛选仍用今天。
+      const templateExportDateLabel =
+        exportTemplate === 'ticketing' && resolvedTravel.travelFrom
+          ? resolvedTravel.travelFrom
+          : new Date().toISOString().slice(0, 10);
+      a.download = `订单导出-${TEMPLATE_LABEL[exportTemplate]}-${templateExportDateLabel}.xlsx`;
       document.body.appendChild(a);
       a.click();
       a.remove();
@@ -966,6 +974,7 @@ export function OrdersPage() {
         invoiced: tkInvoiced, // 未开 / 已开
         flightNumber: trimmedFlightNumber || undefined, // 航班号（选填，缩小同日多航班范围）
         kind: tkKind || undefined, // 订单类型（选填：机票单/套餐单，避免同航班混单）
+        tripType: tkTripType || undefined, // 行程类型（选填：单程/往返，票务岗反馈）
         orderIds: selected.length > 0 ? selected : undefined,
       });
       const url = URL.createObjectURL(blob);
@@ -1274,6 +1283,19 @@ export function OrdersPage() {
                     <option value="">全部</option>
                     <option value="FLIGHT">仅机票单</option>
                     <option value="BUNDLE">仅套餐单</option>
+                  </select>
+                </label>
+                <label className="flex flex-col gap-1 text-xs text-ink-muted">
+                  行程
+                  <select
+                    className="input py-1.5 text-sm"
+                    value={tkTripType}
+                    onChange={(e) => setTkTripType(e.target.value as '' | 'oneway' | 'roundtrip')}
+                    title="单程单不会再混进「回程未开」的导出（票务岗反馈）；此处可再按行程类型缩小范围"
+                  >
+                    <option value="">全部</option>
+                    <option value="oneway">单程</option>
+                    <option value="roundtrip">往返</option>
                   </select>
                 </label>
                 <button
@@ -1871,12 +1893,16 @@ export function OrdersPage() {
                 <th className="text-center">签证</th>
                 <th className="text-center">开票</th>
                 <th className="text-left">下单时间</th>
-                <th className="whitespace-nowrap text-center">操作</th>
+                {/* 「操作」常驻右侧：列多时不用横滑到底才能点详情。
+                    背景必须不透明（表头默认 bg-slate-50/70 半透，横滑时内容会透底）→ 用 ! 覆盖。 */}
+                <th className="sticky right-0 z-10 whitespace-nowrap !bg-slate-50 text-center shadow-[-8px_0_10px_-8px_rgba(15,23,42,0.18)]">
+                  操作
+                </th>
               </tr>
             </thead>
             <tbody>
               {paged.map(({ order, view }, idx) => (
-                <tr key={order.id} className={selectedIds.has(order.id) ? 'bg-brand-50' : ''}>
+                <tr key={order.id} className={`group ${selectedIds.has(order.id) ? 'bg-brand-50' : ''}`}>
                   <td className="text-center">
                     <input
                       type="checkbox"
@@ -2012,7 +2038,13 @@ export function OrdersPage() {
                       month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
                     })}
                   </td>
-                  <td className="whitespace-nowrap">
+                  {/* 常驻右侧的操作列：背景跟随行态（选中=brand-50、否则白，hover 一律 slate-50
+                      与整行 hover 对齐），不能透明——否则横滑时下面的单元格会从背后透出来。 */}
+                  <td
+                    className={`sticky right-0 z-10 whitespace-nowrap shadow-[-8px_0_10px_-8px_rgba(15,23,42,0.18)] group-hover:bg-slate-50 ${
+                      selectedIds.has(order.id) ? 'bg-brand-50' : 'bg-white'
+                    }`}
+                  >
                     <div className="flex items-center justify-end gap-2">
                       <select
                         className="rounded-md border border-slate-200 bg-white px-2 py-1 text-xs text-ink-soft disabled:opacity-50"
@@ -6901,7 +6933,14 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                         <option value="">选择舱位…</option>
                         {cabinOptions.map((c) => (
                           <option key={c.id} value={c.cabin}>
-                            {CABIN_ZH[c.cabin] ?? c.cabin}（余 {c.available}）¥{Number(c.basePrice).toFixed(0)}
+                            {/* 余位可能为负（超售口径不再钳 0）：录单场景绝不能把负数写成「余 -2」误导为可售 */}
+                            {CABIN_ZH[c.cabin] ?? c.cabin}（
+                            {c.available > 0
+                              ? `余 ${c.available}`
+                              : c.available === 0
+                                ? '售罄'
+                                : `超售 ${-c.available}`}
+                            ）¥{Number(c.basePrice).toFixed(0)}
                           </option>
                         ))}
                       </select>
@@ -7418,6 +7457,9 @@ function ConfirmPaymentSection({
   // 收款复核锁：财务/出纳对账无误后锁定本单收款；锁定态隐藏录款表单并禁止再录。
   const [paymentsLocked, setPaymentsLocked] = useState(false);
   const [lockBusy, setLockBusy] = useState(false);
+  // 挂账池里疑似归属本单、且还没认完的进账（财务反馈：锁定收款前得先知道池子里还压着本单的钱）。
+  // 纯信息化提示，不阻断锁定；接口无权限（非 ADMIN/STAFF）时静默留空。
+  const [pendingReceipts, setPendingReceipts] = useState<Receipt[]>([]);
 
   // 尾款 = 应收 − 已付。正=欠款(少付)、0=已结清、负=多付（不再 clamp，多付要看得见）。
   const balance = Math.round((total - paid) * 100) / 100;
@@ -7442,6 +7484,37 @@ function ConfirmPaymentSection({
       cancelled = true;
     };
   }, [token, orderId, total]);
+
+  // 挂账池里疑似本单、还没认完的进账（OPEN + 部分认款）。只读提示，失败静默（不干扰收款主流程）。
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    api
+      .listReceipts(token, { orderHintId: orderId, unallocatedOnly: '1' })
+      .then((r) => {
+        if (cancelled) return;
+        setPendingReceipts(r.receipts);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [token, orderId]);
+
+  // 待认领提示文案：N 笔 / 合计剩余 / 前几个流水号（流水号优先用收单平台交易号）。
+  // 「本单多付转挂账池」的那几笔也带本单 hint，单列出来——否则会被误读成还有笔钱没认到本单。
+  const pendingHint = useMemo(() => {
+    if (pendingReceipts.length === 0) return null;
+    const totalRemaining = pendingReceipts.reduce((s, r) => s + Number(r.remainingCny), 0);
+    const refs = pendingReceipts.map((r) => r.externalTxnId || r.receiptNo);
+    const shown = refs.slice(0, 3).join('、');
+    return {
+      count: pendingReceipts.length,
+      totalRemaining: Math.round(totalRemaining * 100) / 100,
+      refsText: refs.length > 3 ? `${shown} 等 ${refs.length} 笔` : shown,
+      overpayCount: pendingReceipts.filter((r) => r.source === 'ORDER_OVERPAY').length,
+    };
+  }, [pendingReceipts]);
 
   function onFile(e: React.ChangeEvent<HTMLInputElement>): void {
     const f = e.target.files?.[0];
@@ -7516,6 +7589,16 @@ function ConfirmPaymentSection({
     if (!token || lockBusy) return;
     const next = !paymentsLocked;
     if (!next && !window.confirm('解锁后可再次录入收款，确定解锁吗？')) return;
+    // 锁定前把「挂账池还压着本单的钱」摆到台面上：不阻断，但要确认过再锁。
+    if (
+      next &&
+      pendingHint &&
+      !window.confirm(
+        `挂账池还有 ${pendingHint.count} 笔疑似本单待认领（共 ¥${pendingHint.totalRemaining.toLocaleString()}，流水 ${pendingHint.refsText}）。\n\n` +
+          '锁定只拦人工录入收款，对账台认款仍会照常入账。确定现在锁定吗？',
+      )
+    )
+      return;
     setErr(null);
     setLockBusy(true);
     try {
@@ -7618,6 +7701,23 @@ function ConfirmPaymentSection({
             </span>
           </span>
         </div>
+
+        {/* 挂账池疑似本单待认领：财务锁定收款前先看见池子里还压着本单的钱（提示，不阻断） */}
+        {pendingHint && (
+          <div className="mt-2 rounded-md border border-amber-300 bg-amber-50 px-2 py-1.5 text-xs text-amber-800">
+            💰 挂账池有 <b className="nums">{pendingHint.count}</b> 笔疑似本单待认领（共{' '}
+            <b className="nums">¥{pendingHint.totalRemaining.toLocaleString()}</b>，流水{' '}
+            <span className="font-mono">{pendingHint.refsText}</span>）
+            <span className="ml-1 text-amber-700">
+              — 去「收款对账台」认款后才会计入本单已付。
+            </span>
+            {pendingHint.overpayCount > 0 && (
+              <span className="ml-1 text-amber-700">
+                其中 {pendingHint.overpayCount} 笔是本单多付转入的。
+              </span>
+            )}
+          </div>
+        )}
 
         {/* 代理 + 余额 + 结算方式 */}
         {agent && (

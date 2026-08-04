@@ -5,7 +5,9 @@
  *   - 已售 = FlightSeatClass.sold（订单确认占库存的那一刻 +1）
  *   - 余票 = available = capacity − sold − locked（后端权威口径，与前台一致）
  *   - 总座 = capacity
- *   - 占用率 = sold / capacity
+ *   - 占用率 = sold / capacity（超售时 > 100%，进度条封顶显示但标红）
+ *   - 超售 = 余票为负时的欠座数（航司减配 / 换机型把容量压到已售之下）。
+ *     销售侧照旧按容量拒卖，这里标红是提醒去与航司 / 操作部协调。
  *   - 日期区间为闭区间（between 起始/截止），服务端按 from/to 过滤
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
@@ -14,8 +16,22 @@ import { airportLabel, CABIN_LABEL, formatLocalDate, formatLocalTime, localYmd, 
 import { useAuth } from '../stores/auth';
 import { useFlightSeats } from '../stores/flightSeats';
 
-// 余位低于此值标红（方便及时调价 / 关注余位）
-const LOW_SEAT_THRESHOLD = 20;
+// 余位是否"紧张"：按容量比例判断，不用绝对张数——
+// 一个 7 座商务舱剩 6 张不是紧张，一个 186 座经济舱剩 15 张才是。
+// 地板 5 张兜住极小舱位（比例算出 0～1 张这种门槛没意义），门槛夹到 < capacity，
+// 否则地板反超总容量，连"满仓"都会被误判紧张。口径与航班管理页一致。
+function isSeatLow(remaining: number, capacity: number): boolean {
+  const cutoff = Math.min(capacity - 1, Math.max(5, Math.ceil(capacity * 0.1)));
+  return remaining <= cutoff;
+}
+
+// 余位三档色（红/琥珀/绿）：红门槛同 isSeatLow，琥珀门槛加宽一倍（同样夹到 < capacity）。
+function seatTone(remaining: number, capacity: number): { text: string; low: boolean } {
+  if (isSeatLow(remaining, capacity)) return { text: 'text-rose-600', low: true };
+  const amberCut = Math.min(capacity - 1, Math.max(10, Math.ceil(capacity * 0.2)));
+  if (remaining <= amberCut) return { text: 'text-amber-600', low: false };
+  return { text: 'text-emerald-600', low: false };
+}
 
 // 本地日期 YYYY-MM-DD（用 getFullYear/getMonth/getDate，避免 toISOString 的 UTC 偏移）
 function todayStr(): string {
@@ -39,7 +55,11 @@ interface ScheduleStat {
   totalCapacity: number;
   totalSold: number;
   totalAvailable: number;
-  occupancy: number; // 0..1
+  // 各舱位余位为负的部分之和 = 该班次欠了多少座（>0 即超售）。
+  // 逐舱累加而不是看 totalAvailable：一舱超售、另一舱有余时净值可能仍为正，
+  // 那也必须报出来。
+  oversoldSeats: number;
+  occupancy: number; // 0..1（超售时 > 1）
 }
 
 export function SeatStatsPage() {
@@ -81,6 +101,7 @@ export function SeatStatsPage() {
       const totalCapacity = s.seatClasses.reduce((sum, c) => sum + c.capacity, 0);
       const totalSold = s.seatClasses.reduce((sum, c) => sum + c.sold, 0);
       const totalAvailable = s.seatClasses.reduce((sum, c) => sum + c.available, 0);
+      const oversoldSeats = s.seatClasses.reduce((sum, c) => sum + Math.max(0, -c.available), 0);
       return {
         id: s.id,
         flightNumber: s.flightNumber,
@@ -92,6 +113,7 @@ export function SeatStatsPage() {
         totalCapacity,
         totalSold,
         totalAvailable,
+        oversoldSeats,
         occupancy: totalCapacity > 0 ? totalSold / totalCapacity : 0,
       };
     });
@@ -139,6 +161,8 @@ export function SeatStatsPage() {
         <h1 className="page-title">航班座位统计</h1>
         <p className="page-sub">
           实时统计自营航班的座位占用情况。余票口径：capacity − 已售 − 锁位（与前台一致）。
+          余票为负即<strong className="text-rose-700">超售</strong>（容量被调到已售之下，如航司减配 / 换机型），
+          标红提醒协调；销售侧照旧按容量拒卖。
         </p>
       </section>
 
@@ -236,32 +260,54 @@ export function SeatStatsPage() {
                       </div>
                     </td>
                     <td className="text-xs">
-                      {s.seatClasses.map((c) => (
-                        <div key={c.id}>
-                          <span className="text-ink-muted">{CABIN_LABEL[c.cabin] ?? c.cabin}:</span>{' '}
-                          <span className="text-ink">
-                            {c.sold}/{c.capacity}
-                          </span>{' '}
-                          <span className="text-ink-muted">¥{Number(c.basePrice).toFixed(0)}</span>
-                        </div>
-                      ))}
+                      {s.seatClasses.map((c) => {
+                        const cabinOversold = c.available < 0;
+                        return (
+                          <div key={c.id}>
+                            <span className="text-ink-muted">{CABIN_LABEL[c.cabin] ?? c.cabin}:</span>{' '}
+                            <span className={cabinOversold ? 'font-bold text-rose-700' : 'text-ink'}>
+                              {c.sold}/{c.capacity}
+                            </span>{' '}
+                            {cabinOversold && (
+                              <span
+                                className="font-bold text-rose-700"
+                                title="该舱位容量已低于已售 + 锁位，需与航司 / 操作部协调"
+                              >
+                                超售 {-c.available}{' '}
+                              </span>
+                            )}
+                            <span className="text-ink-muted">¥{Number(c.basePrice).toFixed(0)}</span>
+                          </div>
+                        );
+                      })}
                     </td>
                     <td className="text-right nums">{s.totalCapacity}</td>
                     <td className="text-right nums">{s.totalSold}</td>
                     {(() => {
                       const avail = s.totalAvailable;
-                      const low = avail < LOW_SEAT_THRESHOLD;
+                      const oversold = s.oversoldSeats > 0;
+                      const tone = seatTone(avail, s.totalCapacity);
+                      if (oversold) {
+                        return (
+                          <td
+                            className="text-right nums font-bold text-rose-700"
+                            title={`容量已低于已售：欠 ${s.oversoldSeats} 座（各舱位净余票合计 ${avail}）。销售侧照旧不再卖出，请与航司 / 操作部协调。`}
+                          >
+                            🔴 超售 {s.oversoldSeats}
+                          </td>
+                        );
+                      }
                       return (
                         <td
-                          className={`text-right nums ${low ? 'font-bold text-rose-600' : ''}`}
-                          title={low ? `余位不足 ${LOW_SEAT_THRESHOLD}，建议关注/调价` : undefined}
+                          className={`text-right nums ${tone.low ? 'font-bold' : ''} ${tone.text}`}
+                          title={tone.low ? '余位不足总座 10%，建议关注/调价' : undefined}
                         >
-                          {low && '🔴 '}{avail}
+                          {tone.low && '🔴 '}{avail}
                         </td>
                       );
                     })()}
                     <td>
-                      <OccupancyBar occupancy={s.occupancy} />
+                      <OccupancyBar occupancy={s.occupancy} oversold={s.oversoldSeats > 0} />
                     </td>
                   </tr>
                 ))}
@@ -290,15 +336,29 @@ function KpiCard({ label, value, sub }: { label: string; value: string; sub?: st
   );
 }
 
-function OccupancyBar({ occupancy }: { occupancy: number }) {
+// 超售时 occupancy > 1：进度条封顶 100%（条本身没有"超过满"的画法），
+// 但配超售红 + 百分比如实显示 >100%，不把这件事糊过去。
+function OccupancyBar({ occupancy, oversold }: { occupancy: number; oversold: boolean }) {
   const pct = occupancy * 100;
-  const color = occupancy > 0.8 ? 'bg-red-500' : occupancy > 0.6 ? 'bg-amber-500' : 'bg-green-500';
+  const barPct = Math.min(100, Math.max(pct, 2));
+  const color = oversold
+    ? 'bg-rose-600'
+    : occupancy > 0.8
+      ? 'bg-red-500'
+      : occupancy > 0.6
+        ? 'bg-amber-500'
+        : 'bg-green-500';
   return (
     <div className="flex items-center gap-2">
       <div className="flex-1 h-2 bg-slate-100 rounded-full overflow-hidden">
-        <div className={`h-full ${color}`} style={{ width: `${Math.max(pct, 2)}%` }} />
+        <div className={`h-full ${color}`} style={{ width: `${barPct}%` }} />
       </div>
-      <span className="text-xs text-slate-700 tabular-nums w-12 text-right">{pct.toFixed(1)}%</span>
+      <span
+        className={`text-xs tabular-nums w-12 text-right ${oversold ? 'font-bold text-rose-700' : 'text-slate-700'}`}
+        title={pct > 100 ? '已售超过容量，占用率大于 100%' : undefined}
+      >
+        {pct.toFixed(1)}%
+      </span>
     </div>
   );
 }

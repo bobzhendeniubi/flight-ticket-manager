@@ -155,8 +155,31 @@ export async function createOpenReceiptWithinTx(
 
 type ReceiptWithAllocations = Receipt & { allocations: ReceiptAllocation[] };
 
-/** 进账序列化（含 remaining + 认领明细汇总），字段名即前端读取口径。 */
-export function serializeReceipt(r: ReceiptWithAllocations) {
+/**
+ * 批量把订单 id 换成订单号（ReceiptAllocation / orderHintId 都只存 id，无 Prisma relation）。
+ * 一次 IN 查询，不做 N+1；空数组直接返回空表，不打库。
+ */
+export async function loadOrderNumbers(
+  orderIds: ReadonlyArray<string | null | undefined>,
+): Promise<Map<string, string>> {
+  const ids = [...new Set(orderIds.filter((id): id is string => Boolean(id)))];
+  if (ids.length === 0) return new Map();
+  const orders = await prisma.order.findMany({
+    where: { id: { in: ids } },
+    select: { id: true, orderNumber: true },
+  });
+  return new Map(orders.map((o) => [o.id, o.orderNumber]));
+}
+
+/**
+ * 进账序列化（含 remaining + 认领明细汇总），字段名即前端读取口径。
+ * orderNoById：订单 id→订单号映射（调用方批量查好传进来）。查不到 → null，
+ * 前端回落显示 id 前 8 位。财务要的是订单号，光给 id 前 8 位对不上单。
+ */
+export function serializeReceipt(
+  r: ReceiptWithAllocations,
+  orderNoById?: ReadonlyMap<string, string>,
+) {
   const amount = Number(r.amountCny);
   const allocated = Number(r.allocatedCny);
   return {
@@ -170,6 +193,7 @@ export function serializeReceipt(r: ReceiptWithAllocations) {
     payerNote: r.payerNote,
     externalTxnId: r.externalTxnId,
     orderHintId: r.orderHintId,
+    hintOrderNumber: r.orderHintId ? (orderNoById?.get(r.orderHintId) ?? null) : null,
     receivedAt: r.receivedAt,
     source: r.source,
     status: r.status,
@@ -180,6 +204,7 @@ export function serializeReceipt(r: ReceiptWithAllocations) {
     allocations: (r.allocations ?? []).map((a) => ({
       id: a.id,
       orderId: a.orderId,
+      orderNumber: orderNoById?.get(a.orderId) ?? null,
       amountCny: a.amountCny.toString(),
       createdById: a.createdById,
       createdAt: a.createdAt,
@@ -208,6 +233,8 @@ export class ReceiptsService {
         { externalTxnId: { contains: query.q, mode: 'insensitive' } },
       ];
     }
+    // 疑似归属订单精确筛（订单详情「本单待认领」提示专用；与 q 的模糊匹配不同，这里是等值）
+    if (query.orderHintId) where.orderHintId = query.orderHintId;
     // 到账日期闭区间（按流水交易日期字段 receivedAt，北京时）
     const receivedRange = beijingDayRange(query.from, query.to);
     if (receivedRange) where.receivedAt = receivedRange;
@@ -217,7 +244,12 @@ export class ReceiptsService {
       orderBy: { receivedAt: 'desc' },
       take: 500,
     });
-    return rows.map(serializeReceipt);
+    // 认领明细 + 疑似归属订单一次批量换成订单号（不做 N+1）
+    const orderNoById = await loadOrderNumbers([
+      ...rows.flatMap((r) => r.allocations.map((a) => a.orderId)),
+      ...rows.map((r) => r.orderHintId),
+    ]);
+    return rows.map((r) => serializeReceipt(r, orderNoById));
   }
 
   // ════════════════════════════════════════════════════════════════════
@@ -289,7 +321,8 @@ export class ReceiptsService {
       after: { amountCny: receipt.amountCny.toString(), method: receipt.method, source: receipt.source },
       severity: 'WARNING',
     });
-    return serializeReceipt({ ...receipt, allocations: [] });
+    const orderNoById = await loadOrderNumbers([receipt.orderHintId]);
+    return serializeReceipt({ ...receipt, allocations: [] }, orderNoById);
   }
 
   // ════════════════════════════════════════════════════════════════════
@@ -831,14 +864,9 @@ export class ReceiptsService {
       }
     }
 
-    const orderIds = [...new Set(receipts.flatMap((r) => r.allocations.map((a) => a.orderId)))];
-    const orders = orderIds.length
-      ? await prisma.order.findMany({
-          where: { id: { in: orderIds } },
-          select: { id: true, orderNumber: true },
-        })
-      : [];
-    const orderNoById = new Map(orders.map((o) => [o.id, o.orderNumber]));
+    const orderNoById = await loadOrderNumbers(
+      receipts.flatMap((r) => r.allocations.map((a) => a.orderId)),
+    );
 
     const userIds = [
       ...new Set(

@@ -22,6 +22,7 @@ const solo = (gender: Gender | null): { order: { passengers: { gender: Gender | 
 import {
   getAlerts,
   getBoard,
+  getForward,
   getOccupyingOrders,
   getNightlyRemainingForRoomType,
   getHotelNightlyRemaining,
@@ -31,6 +32,9 @@ import {
   expandAssignedPhysicalByDate,
   checkHotelPhysicalFit,
   assertHotelPhysicalFit,
+  checkRoomScopePhysicalFit,
+  assertRoomScopePhysicalFit,
+  createBlockPeriod,
   getRecentRoomChanges,
 } from './hotel-control.service.js';
 
@@ -971,22 +975,36 @@ describe('getRecentRoomChanges', () => {
     ...over,
   });
 
-  function auditClient(rows: Array<Record<string, unknown>>): {
+  function auditClient(
+    rows: Array<Record<string, unknown>>,
+    orderRows: Array<Record<string, unknown>> = [],
+  ): {
     client: PrismaClient;
     findMany: ReturnType<typeof vi.fn>;
+    orderFindMany: ReturnType<typeof vi.fn>;
   } {
     const findMany = vi.fn().mockResolvedValue(rows);
-    return { client: { auditLog: { findMany } } as unknown as PrismaClient, findMany };
+    const orderFindMany = vi.fn().mockResolvedValue(orderRows);
+    return {
+      client: { auditLog: { findMany }, order: { findMany: orderFindMany } } as unknown as PrismaClient,
+      findMany,
+      orderFindMany,
+    };
   }
 
-  it('查询口径：三类 action + createdAt>=近 N 天 + 倒序 + 上限 100', async () => {
+  it('查询口径：四类 action + createdAt>=近 N 天 + 倒序 + 上限 100', async () => {
     const { client, findMany } = auditClient([]);
     const res = await getRecentRoomChanges(7, client);
 
     expect(res).toEqual({ days: 7, count: 0, changes: [] });
     const arg = findMany.mock.calls[0][0];
     expect(arg.where.action).toEqual({
-      in: ['UPDATE_ROOM_ASSIGNMENT', 'SWAP_ORDER_ITEM_HOTEL', 'ADD_ROOM_SUPPLEMENT'],
+      in: [
+        'UPDATE_ROOM_ASSIGNMENT',
+        'SWAP_ORDER_ITEM_HOTEL',
+        'ADD_ROOM_SUPPLEMENT',
+        'RESCHEDULE_ORDER_ITEM',
+      ],
     });
     expect(arg.orderBy).toEqual({ createdAt: 'desc' });
     expect(arg.take).toBe(100);
@@ -1076,5 +1094,318 @@ describe('getRecentRoomChanges', () => {
       '换酒店 原酒店 → 新酒店',
       '补收单房差',
     ]);
+  });
+
+  it('改期纳入动作集：actionLabel「改期」，摘要读 before/after.departure 简述新旧出发日', async () => {
+    const { client, orderFindMany } = auditClient([
+      auditRow({
+        action: 'RESCHEDULE_ORDER_ITEM',
+        before: { orderItemId: 'oi1', scheduleId: 's1', departure: '2026-08-01T03:00:00.000Z' },
+        after: { scheduleId: 's2', departure: '2026-08-05T03:00:00.000Z', feeCny: 200 },
+      }),
+    ]);
+    const res = await getRecentRoomChanges(7, client);
+    expect(res.changes[0]).toMatchObject({
+      action: 'RESCHEDULE_ORDER_ITEM',
+      actionLabel: '改期',
+      summary: '改期 2026-08-01 → 2026-08-05',
+    });
+    // 按 orderId 去重批量查订单
+    expect(orderFindMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: { in: ['o1'] } } }),
+    );
+  });
+
+  it('批量补充乘客/出行日期/订单金额：命中订单时按 FLIGHT 行出发时间升序取去程/回程', async () => {
+    const { client } = auditClient(
+      [auditRow({ id: 'a1', targetId: 'o1' }), auditRow({ id: 'a2', targetId: 'o1' })],
+      [
+        {
+          id: 'o1',
+          total: 3980,
+          passengers: [
+            { documentNumber: 'E12345678', chineseName: '王小明', fullName: 'WANG/XIAOMING' },
+            { documentNumber: 'N/A', chineseName: null, fullName: '占位联系人' }, // 占位联系人不列入
+          ],
+          items: [
+            {
+              flightSchedule: {
+                departureTime: new Date('2026-08-10T02:00:00.000Z'),
+                departureTz: 'Asia/Shanghai',
+              },
+            },
+            {
+              flightSchedule: {
+                departureTime: new Date('2026-08-15T02:00:00.000Z'),
+                departureTz: 'Asia/Shanghai',
+              },
+            },
+          ],
+        },
+      ],
+    );
+    const res = await getRecentRoomChanges(7, client);
+    // 两条 audit 行同指向 o1，各自都拿到同一份订单信息（不因去重批量查而漏填）
+    for (const change of res.changes) {
+      expect(change).toMatchObject({
+        passengerNames: ['王小明'],
+        departDate: '2026-08-10',
+        returnDate: '2026-08-15',
+        orderAmountCny: 3980,
+      });
+    }
+  });
+
+  it('订单查不到（软删/id 失效）：新字段容错置 null/[]，不抛错', async () => {
+    const { client } = auditClient([auditRow({ targetId: 'o-gone' })], []);
+    const res = await getRecentRoomChanges(7, client);
+    expect(res.changes[0]).toMatchObject({
+      passengerNames: [],
+      departDate: null,
+      returnDate: null,
+      orderAmountCny: null,
+    });
+  });
+});
+
+// ── 星级随机池（三星随机 / 四星随机）─────────────────────────────────────────
+/**
+ * 池是**真库存**，不是汇总视图：先按星级切总量，客人下单只占池，之后房控再落到具体酒店。
+ * 核心不变量（下面逐条钉死）：
+ *   1. 池与具体酒店互不扣减 —— 选明月扣明月，选随机扣池，两组的 block/used 不串。
+ *   2. 池组走与酒店组**完全同一套**展开与物理口径（异性不能拼一间），不是第二本账。
+ *   3. 池的超卖/富余同样进提醒线、同样并入远期总量。
+ */
+describe('星级随机池：销控板虚拟组', () => {
+  function poolBoardClient(periods: unknown[], items: unknown[]): PrismaClient {
+    return {
+      hotelBlockPeriod: { findMany: vi.fn().mockResolvedValue(periods) },
+      orderItem: { findMany: vi.fn().mockResolvedValue(items) },
+    } as unknown as PrismaClient;
+  }
+  /** 池周期 fixture：hotelId 为 null、randomStarTier 非空（hotel 关联随之为 null）。*/
+  const poolPeriod = (tier: number, rooms: number, unitPrice: number | null = null) => ({
+    hotelId: null,
+    randomStarTier: tier,
+    dateFrom: day(0),
+    dateTo: day(2),
+    rooms,
+    unitPrice,
+    hotel: null,
+  });
+  /** 池占房行 fixture：无房型（hotelRoomType 为 null）、randomStarTier 非空。*/
+  const poolItem = (tier: number, over: Record<string, unknown> = {}) => ({
+    hotelCheckIn: day(0),
+    hotelCheckOut: day(1),
+    hotelRoomType: null,
+    randomStarTier: tier,
+    ...over,
+  });
+
+  it('池周期 + 池占房行 → 独立虚拟组「三星随机」，包房/用房/余量口径与酒店组一致', async () => {
+    const client = poolBoardClient(
+      [poolPeriod(3, 5, 480)],
+      [poolItem(3), poolItem(3)],
+    );
+    const board = await getBoard({ from: dayStr(0), to: dayStr(1) }, client);
+    expect(board.hotels).toHaveLength(1);
+    const pool = board.hotels[0];
+    expect(pool).toMatchObject({
+      hotelId: 'random-star-3',
+      hotelName: '三星随机',
+      randomStarTier: 3,
+      unitPrice: 480,
+    });
+    expect(pool.rows.block).toEqual([5, 5]);
+    expect(pool.rows.used).toEqual([2, 0]);
+    expect(pool.rows.remaining).toEqual([3, 5]);
+    expect(pool.rows.physicalUsed).toEqual([2, 0]);
+    expect(pool.rows.physicalRemaining).toEqual([3, 5]);
+  });
+
+  it('池与具体酒店互不扣减：明月的占房不吃池的量，池的占房也不吃明月的量', async () => {
+    const client = poolBoardClient(
+      [
+        poolPeriod(4, 6),
+        { hotelId: 'h1', randomStarTier: null, dateFrom: day(0), dateTo: day(2), rooms: 2, unitPrice: null, hotel: { name: '明月酒店' } },
+      ],
+      [
+        poolItem(4),
+        { hotelCheckIn: day(0), hotelCheckOut: day(1), randomStarTier: null, hotelRoomType: { hotelId: 'h1', hotel: { name: '明月酒店' } } },
+      ],
+    );
+    const board = await getBoard({ from: dayStr(0), to: dayStr(0) }, client);
+    // 池组排在最前
+    expect(board.hotels.map((h) => h.hotelName)).toEqual(['四星随机', '明月酒店']);
+    const [pool, hotel] = board.hotels;
+    expect(pool.rows.block).toEqual([6]);
+    expect(pool.rows.used).toEqual([1]);
+    expect(hotel.rows.block).toEqual([2]);
+    expect(hotel.rows.used).toEqual([1]);
+    expect(hotel.randomStarTier).toBeNull();
+  });
+
+  it('池组同样吃「异性不能拼一间」的物理口径：一男一女各半间 → 物理占 2 间（床位口径只算 1）', async () => {
+    const client = poolBoardClient(
+      [poolPeriod(3, 2)],
+      [
+        poolItem(3, { roomsBilled: 0.5, ...solo('M') }),
+        poolItem(3, { roomsBilled: 0.5, ...solo('F') }),
+      ],
+    );
+    const board = await getBoard({ from: dayStr(0), to: dayStr(0) }, client);
+    const pool = board.hotels[0];
+    expect(pool.rows.used).toEqual([1]); // 床位口径 0.5+0.5
+    expect(pool.rows.physicalUsed).toEqual([2]); // 物理口径：异性各独占
+    expect(pool.rows.physicalRemaining).toEqual([0]);
+  });
+
+  it('池超卖进提醒线（hotelName = 池名）；远期总量把池并入合计', async () => {
+    const client = {
+      ...poolBoardClient([poolPeriod(3, 1)], [poolItem(3), poolItem(3)]),
+      flightSchedule: { findMany: vi.fn().mockResolvedValue([]) },
+      passenger: { count: vi.fn() },
+    } as unknown as PrismaClient;
+    const alerts = await getAlerts(2, client);
+    expect(alerts.oversold[0]).toMatchObject({
+      hotelName: '三星随机',
+      date: dayStr(0),
+      block: 1,
+      used: 2,
+      deficit: 1,
+    });
+
+    const forward = await getForward({ from: dayStr(0), to: dayStr(0) }, client);
+    expect(forward.held).toEqual([1]);
+    expect(forward.occupied).toEqual([2]);
+  });
+});
+
+describe('星级随机池：前瞻闸与占房下钻的作用域', () => {
+  it('checkRoomScopePhysicalFit 按池查询：周期按 randomStarTier、占房行按「无房型 + 同档次」', async () => {
+    const client = {
+      hotelBlockPeriod: {
+        findMany: vi.fn().mockResolvedValue([{ dateFrom: day(0), dateTo: day(2), rooms: 1 }]),
+      },
+      orderItem: { findMany: vi.fn().mockResolvedValue([]) },
+    } as unknown as PrismaClient;
+
+    const fit = await checkRoomScopePhysicalFit(
+      { randomStarTier: 4 },
+      [dayStr(0)],
+      { wholeRooms: 2, solos: [] },
+      {},
+      client,
+    );
+    expect(fit.violations).toHaveLength(1);
+    expect(fit.violations[0]).toMatchObject({ block: 1, physicalUsed: 2, shortfall: 1 });
+
+    const periodWhere = (client.hotelBlockPeriod.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0].where;
+    expect(periodWhere.randomStarTier).toBe(4);
+    expect(periodWhere.hotelId).toBeUndefined();
+    const itemWhere = (client.orderItem.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0].where;
+    expect(itemWhere.hotelRoomTypeId).toBeNull();
+    expect(itemWhere.randomStarTier).toBe(4);
+  });
+
+  it('池未配任何周期 → hasBlock=false，assertRoomScopePhysicalFit 不拦截（未配包房 ≠ 售罄）', async () => {
+    const client = {
+      hotelBlockPeriod: { findMany: vi.fn().mockResolvedValue([]) },
+      orderItem: { findMany: vi.fn() },
+    } as unknown as PrismaClient;
+    await expect(
+      assertRoomScopePhysicalFit({ randomStarTier: 3 }, [dayStr(0)], { wholeRooms: 99, solos: [] }, {}, client),
+    ).resolves.toBeUndefined();
+  });
+
+  it('assertRoomScopePhysicalFit 池文案点名池档次，不说成"酒店房间不足"', async () => {
+    const client = {
+      hotelBlockPeriod: {
+        findMany: vi.fn().mockResolvedValue([{ dateFrom: day(0), dateTo: day(0), rooms: 1 }]),
+      },
+      orderItem: { findMany: vi.fn().mockResolvedValue([]) },
+    } as unknown as PrismaClient;
+    await expect(
+      assertRoomScopePhysicalFit({ randomStarTier: 3 }, [dayStr(0)], { wholeRooms: 2, solos: [] }, {}, client),
+    ).rejects.toThrow(/三星随机池房量不足/);
+  });
+
+  it('getOccupyingOrders 支持池作用域：按「无房型 + 同档次」下钻', async () => {
+    const client = {
+      orderItem: {
+        findMany: vi.fn().mockResolvedValue([
+          {
+            roomsBilled: 1,
+            metadata: null,
+            hotelCheckIn: day(0),
+            hotelCheckOut: day(2),
+            order: {
+              id: 'o1',
+              orderNumber: 'CT250001',
+              status: 'PAID',
+              contactName: '李四',
+              roomAssignment: null,
+              agent: null,
+              passengers: [{ documentNumber: 'E1', chineseName: '李四', fullName: 'LI/SI' }],
+            },
+          },
+        ]),
+      },
+    } as unknown as PrismaClient;
+    const occupants = await getOccupyingOrders({ randomStarTier: 4 }, dayStr(0), client);
+    expect(occupants).toHaveLength(1);
+    expect(occupants[0].orderNumber).toBe('CT250001');
+    const where = (client.orderItem.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0].where;
+    expect(where.hotelRoomTypeId).toBeNull();
+    expect(where.randomStarTier).toBe(4);
+  });
+});
+
+describe('createBlockPeriod：酒店 / 星级随机池二选一', () => {
+  const baseBody = { dateFrom: dayStr(0), dateTo: dayStr(3), rooms: 5 };
+  function createClient(): PrismaClient {
+    return {
+      hotel: { findUnique: vi.fn().mockResolvedValue({ id: 'h1' }) },
+      hotelBlockPeriod: {
+        create: vi.fn().mockImplementation(({ data }: { data: Record<string, unknown> }) =>
+          Promise.resolve({
+            id: 'bp1',
+            ...data,
+            note: null,
+            unitPrice: null,
+            updatedAt: new Date('2026-08-01T00:00:00.000Z'),
+            hotel: data.hotelId ? { name: '明月酒店' } : null,
+          }),
+        ),
+      },
+    } as unknown as PrismaClient;
+  }
+
+  it('两者都不给 → 拒（不落孤儿周期）', async () => {
+    await expect(
+      createBlockPeriod({ ...baseBody } as never, createClient()),
+    ).rejects.toThrow(/二选一/);
+  });
+
+  it('两者都给 → 拒（不落归属歧义的周期）', async () => {
+    await expect(
+      createBlockPeriod({ ...baseBody, hotelId: 'h1', randomStarTier: 3 } as never, createClient()),
+    ).rejects.toThrow(/二选一/);
+  });
+
+  it('只给池档次 → 落 hotelId=null 的池周期，DTO 的 hotelName 用池名占位', async () => {
+    const period = await createBlockPeriod(
+      { ...baseBody, randomStarTier: 4 } as never,
+      createClient(),
+    );
+    expect(period).toMatchObject({ hotelId: null, randomStarTier: 4, hotelName: '四星随机', rooms: 5 });
+  });
+
+  it('只给酒店 → 行为与改造前完全一致（randomStarTier 为 null）', async () => {
+    const period = await createBlockPeriod(
+      { ...baseBody, hotelId: 'h1' } as never,
+      createClient(),
+    );
+    expect(period).toMatchObject({ hotelId: 'h1', randomStarTier: null, hotelName: '明月酒店' });
   });
 });

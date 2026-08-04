@@ -18,6 +18,7 @@
 import { OrderItemKind, OrderStatus, Prisma, type Gender, type PrismaClient } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { BadRequestError, NotFoundError } from '../../lib/errors.js';
+import { fmtDepartureLocalDate } from '../orders/passport-zip.js';
 import type { CreateBlockPeriodBody, UpdateBlockPeriodBody } from './hotel-control.schemas.js';
 
 /** 与财务/订单导出一致：草稿 / 已取消 / 已退款 / 支付超时 / 失败 不计入。*/
@@ -36,6 +37,57 @@ export const COUNTED_STATUSES: OrderStatus[] = [
 const MAX_BOARD_DAYS = 120;
 
 const DAY_MS = 24 * 60 * 60 * 1000;
+
+// ── 星级随机池（三星随机 / 四星随机）──────────────────────────────────────
+/**
+ * 「N 星随机」是真库存池，不是汇总视图：先按星级切总量（HotelBlockPeriod.randomStarTier
+ * 的池周期），客人下单只占池（OrderItem.randomStarTier 的占房行），之后房控再把这单落到
+ * 具体酒店（换酒店流程，写 hotelRoomTypeId + 清 randomStarTier）。
+ *
+ * 池与具体酒店**互不扣减**：选明月扣明月，选随机扣池；落地那一刻占用才从池转到该酒店。
+ * 酒店的星级分类直接取 Hotel.starRating（不另建分类表）。
+ */
+export const RANDOM_STAR_TIERS = [3, 4] as const;
+export type RandomStarTier = (typeof RANDOM_STAR_TIERS)[number];
+
+const CN_NUMERALS = ['一', '二', '三', '四', '五'] as const;
+
+/** 池档次的展示名：3 → 「三星随机」。超出 1..5 的异常值回落成数字，不抛错。*/
+export function randomStarTierLabel(tier: number): string {
+  return `${CN_NUMERALS[tier - 1] ?? String(tier)}星随机`;
+}
+
+/**
+ * 销控板里池组的分组键。**不是真实酒店 id** —— 前端据 `randomStarTier` 非空判定池组，
+ * 这个键只用于 React key / 分组归并；把它当 hotelId 传给按酒店的接口不会命中任何酒店。
+ */
+export function randomPoolGroupKey(tier: number): string {
+  return `random-star-${tier}`;
+}
+
+/**
+ * 房量口径的作用域：一家具体酒店，或一个星级随机池。周期与占房行的过滤条件由此派生，
+ * 保证「池」与「酒店」两条线共用同一套展开/物理口径实现，不出现第二本账。
+ */
+export type RoomScope = { hotelId: string } | { randomStarTier: number };
+
+/** 该作用域的包房周期过滤条件（池周期 hotelId 为 NULL，按酒店查天然不会命中，反之亦然）。*/
+function scopePeriodWhere(scope: RoomScope): Prisma.HotelBlockPeriodWhereInput {
+  return 'hotelId' in scope
+    ? { hotelId: scope.hotelId }
+    : { randomStarTier: scope.randomStarTier };
+}
+
+/**
+ * 该作用域的占房行过滤条件。
+ * 池行显式要求 hotelRoomTypeId 为空 —— 与销控板分组「有房型就归该酒店」同优先级，
+ * 万一出现两列都有值的异常行，两边都把它算成具体酒店的占房，不会被重复计两次。
+ */
+function scopeItemWhere(scope: RoomScope): Prisma.OrderItemWhereInput {
+  return 'hotelId' in scope
+    ? { hotelRoomTypeId: { not: null }, hotelRoomType: { hotelId: scope.hotelId } }
+    : { hotelRoomTypeId: null, randomStarTier: scope.randomStarTier };
+}
 
 // ── helpers ──────────────────────────────────────────────────────────────
 function dec(v: Prisma.Decimal | number | null | undefined): number | null {
@@ -59,9 +111,13 @@ function toDateOnly(s: string): Date {
 
 // ── 包房周期 CRUD ─────────────────────────────────────────────────────────
 export interface HotelBlockPeriodDto {
+  /** 池周期为 null（此时 randomStarTier 非空）。*/
+  hotelId: string | null;
   id: string;
-  hotelId: string;
+  /** 具体酒店周期 = 酒店名；池周期 = 「三星随机」/「四星随机」。恒非空，前端直接展示。*/
   hotelName: string;
+  /** 非空 = 星级随机池周期（3=三星随机、4=四星随机）。*/
+  randomStarTier: number | null;
   dateFrom: string; // YYYY-MM-DD
   dateTo: string; // YYYY-MM-DD（闭区间）
   rooms: number;
@@ -79,7 +135,9 @@ function toDto(row: BlockPeriodRow): HotelBlockPeriodDto {
   return {
     id: row.id,
     hotelId: row.hotelId,
-    hotelName: row.hotel.name,
+    // hotel 关联随 hotelId 一起为空（池周期）→ 用池档次名占位，前端无需分支即可展示
+    hotelName: row.hotel?.name ?? randomStarTierLabel(row.randomStarTier ?? 0),
+    randomStarTier: row.randomStarTier,
     dateFrom: fmtDateOnly(row.dateFrom),
     dateTo: fmtDateOnly(row.dateTo),
     rooms: row.rooms,
@@ -89,12 +147,36 @@ function toDto(row: BlockPeriodRow): HotelBlockPeriodDto {
   };
 }
 
+/**
+ * 周期归属的 XOR 校验：具体酒店（hotelId）与星级随机池（randomStarTier）二选一必填。
+ * 库里两列都可空 —— 语义完整性由这里守住，绝不落「两者皆空」的孤儿周期或「两者都有」的歧义周期。
+ */
+function assertBlockPeriodScope(input: {
+  hotelId?: string | null;
+  randomStarTier?: number | null;
+}): void {
+  const hasHotel = !!input.hotelId;
+  const hasTier = input.randomStarTier != null;
+  if (hasHotel === hasTier) {
+    throw new BadRequestError('包房周期必须二选一：指定一家酒店，或指定一个星级随机池');
+  }
+  if (hasTier && !RANDOM_STAR_TIERS.includes(input.randomStarTier as RandomStarTier)) {
+    throw new BadRequestError(
+      `星级随机池仅支持 ${RANDOM_STAR_TIERS.map((t) => randomStarTierLabel(t)).join(' / ')}`,
+    );
+  }
+}
+
 export async function listBlockPeriods(
-  filter: { hotelId?: string } = {},
+  filter: { hotelId?: string; randomStarTier?: number } = {},
   client: PrismaClient = defaultPrisma,
 ): Promise<HotelBlockPeriodDto[]> {
   const rows = await client.hotelBlockPeriod.findMany({
-    where: filter.hotelId ? { hotelId: filter.hotelId } : undefined,
+    where: filter.hotelId
+      ? { hotelId: filter.hotelId }
+      : filter.randomStarTier != null
+        ? { randomStarTier: filter.randomStarTier }
+        : undefined,
     orderBy: [{ hotelId: 'asc' }, { dateFrom: 'desc' }],
     include: { hotel: { select: { name: true } } },
   });
@@ -108,15 +190,19 @@ export async function createBlockPeriod(
   if (input.dateFrom > input.dateTo) {
     throw new BadRequestError('起始日不能晚于结束日');
   }
-  const hotel = await client.hotel.findUnique({
-    where: { id: input.hotelId },
-    select: { id: true },
-  });
-  if (!hotel) throw new NotFoundError('酒店不存在');
+  assertBlockPeriodScope(input);
+  if (input.hotelId) {
+    const hotel = await client.hotel.findUnique({
+      where: { id: input.hotelId },
+      select: { id: true },
+    });
+    if (!hotel) throw new NotFoundError('酒店不存在');
+  }
 
   const row = await client.hotelBlockPeriod.create({
     data: {
-      hotelId: input.hotelId,
+      hotelId: input.hotelId ?? null,
+      randomStarTier: input.randomStarTier ?? null,
       dateFrom: toDateOnly(input.dateFrom),
       dateTo: toDateOnly(input.dateTo),
       rooms: input.rooms,
@@ -550,6 +636,21 @@ export async function checkHotelPhysicalFit(
   opts: { excludeOrderId?: string } = {},
   client: PrismaClient = defaultPrisma,
 ): Promise<PhysicalFitResult> {
+  return checkRoomScopePhysicalFit({ hotelId }, nightDates, prospective, opts, client);
+}
+
+/**
+ * checkHotelPhysicalFit 的作用域通用版：既可判一家具体酒店，也可判一个星级随机池
+ * （池是真库存，与具体酒店互不扣减 —— 见 RoomScope 注释）。判定口径两者完全一致：
+ * 权威分房表直计 + 拼房性别推算，block[i] === 0 视为未管控不拦截。
+ */
+export async function checkRoomScopePhysicalFit(
+  scope: RoomScope,
+  nightDates: readonly string[],
+  prospective: ProspectiveOccupancy,
+  opts: { excludeOrderId?: string } = {},
+  client: PrismaClient = defaultPrisma,
+): Promise<PhysicalFitResult> {
   const empty: PhysicalFitResult = {
     hasBlock: false,
     block: [],
@@ -562,7 +663,7 @@ export async function checkHotelPhysicalFit(
   const fromD = toDateOnly(nightDates[0]);
   const toD = toDateOnly(nightDates[nightDates.length - 1]);
   const periods = await client.hotelBlockPeriod.findMany({
-    where: { hotelId, dateFrom: { lte: toD }, dateTo: { gte: fromD } },
+    where: { ...scopePeriodWhere(scope), dateFrom: { lte: toD }, dateTo: { gte: fromD } },
     select: { dateFrom: true, dateTo: true, rooms: true },
   });
   if (periods.length === 0) return empty;
@@ -570,8 +671,7 @@ export async function checkHotelPhysicalFit(
   // 过滤口径与 getHotelNightlyRemaining / getBoard 的 used 完全一致
   const items = await client.orderItem.findMany({
     where: {
-      hotelRoomTypeId: { not: null },
-      hotelRoomType: { hotelId },
+      ...scopeItemWhere(scope),
       hotelCheckIn: { lte: toD },
       hotelCheckOut: { gt: fromD },
       order: {
@@ -630,8 +730,23 @@ export async function assertHotelPhysicalFit(
   } = {},
   client: PrismaClient = defaultPrisma,
 ): Promise<void> {
-  const fit = await checkHotelPhysicalFit(
-    hotelId,
+  return assertRoomScopePhysicalFit({ hotelId }, nightDates, prospective, opts, client);
+}
+
+/** assertHotelPhysicalFit 的作用域通用版（具体酒店 / 星级随机池共用）。*/
+export async function assertRoomScopePhysicalFit(
+  scope: RoomScope,
+  nightDates: readonly string[],
+  prospective: ProspectiveOccupancy,
+  opts: {
+    excludeOrderId?: string;
+    allowNonWorsening?: boolean;
+    buildMessage?: (violations: readonly PhysicalFitViolation[]) => string;
+  } = {},
+  client: PrismaClient = defaultPrisma,
+): Promise<void> {
+  const fit = await checkRoomScopePhysicalFit(
+    scope,
     nightDates,
     prospective,
     { excludeOrderId: opts.excludeOrderId },
@@ -644,9 +759,11 @@ export async function assertHotelPhysicalFit(
   ) {
     return;
   }
+  const subject =
+    'hotelId' in scope ? '酒店实际房间' : `${randomStarTierLabel(scope.randomStarTier)}池房量`;
   const message = opts.buildMessage
     ? opts.buildMessage(fit.violations)
-    : `酒店实际房间不足（${fit.violations[0].date} 包房 ${fit.violations[0].block} 间，本次操作后需 ${fit.violations[0].physicalUsed} 间）`;
+    : `${subject}不足（${fit.violations[0].date} 包房 ${fit.violations[0].block} 间，本次操作后需 ${fit.violations[0].physicalUsed} 间）`;
   throw new BadRequestError(message);
 }
 
@@ -654,8 +771,16 @@ export async function assertHotelPhysicalFit(
 export interface HotelControlBoard {
   dates: string[];
   hotels: Array<{
+    /**
+     * 分组键。具体酒店 = 真实 Hotel.id；星级随机池 = 合成键 `random-star-{tier}`
+     * （见 randomPoolGroupKey）—— 池组不是酒店，别拿它去调按 hotelId 的接口，
+     * 判定池组一律看 `randomStarTier` 是否非空。
+     */
     hotelId: string;
+    /** 具体酒店 = 酒店名；池组 = 「三星随机」/「四星随机」。*/
     hotelName: string;
+    /** 非空 = 星级随机池虚拟组（3=三星随机、4=四星随机）。*/
+    randomStarTier: number | null;
     /** 最新周期（dateFrom 最晚且有价）的切房单价；都没填则 null */
     unitPrice: number | null;
     rows: {
@@ -719,9 +844,10 @@ export async function getBoard(
 
   // 占房订单行：一次 findMany 拉全范围内相关行，再在 JS 里按天展开（无逐日查询）
   // 入住区间 [checkIn, checkOut) 与 [from, to] 有交集 ⇔ checkIn <= to && checkOut > from
+  // 两类占房行：盖了房型的（归具体酒店）+ 星级随机池行（randomStarTier 非空，归池组）。
   const items = await client.orderItem.findMany({
     where: {
-      hotelRoomTypeId: { not: null },
+      OR: [{ hotelRoomTypeId: { not: null } }, { randomStarTier: { not: null } }],
       hotelCheckIn: { lte: toD },
       hotelCheckOut: { gt: fromD },
       order: { deletedAt: null, status: { in: COUNTED_STATUSES } },
@@ -731,6 +857,7 @@ export async function getBoard(
       hotelCheckOut: true,
       roomsBilled: true,
       metadata: true,
+      randomStarTier: true,
       hotelRoomType: { select: { hotelId: true, hotel: { select: { name: true } } } },
       // roomAssignment = 权威分房表（优先直计物理间数，订单级去重需 id）；
       // passengers.gender = fallback 拼房性别推算（异性不能拼一间）——拼房单恒为
@@ -741,20 +868,53 @@ export async function getBoard(
     },
   });
 
-  // 酒店集合 = 有周期的 ∪ 有占房的
-  const hotelNames = new Map<string, string>();
-  for (const p of periods) hotelNames.set(p.hotelId, p.hotel.name);
+  // 分组集合 = 有周期的 ∪ 有占房的；具体酒店按 hotelId 分组、星级随机池按合成键分组。
+  // 池组与酒店组互不扣减（真库存池语义）：一条周期/占房行只落进其中一组。
+  const groups = new Map<string, { name: string; randomStarTier: number | null }>();
+  for (const p of periods) {
+    if (p.hotelId) groups.set(p.hotelId, { name: p.hotel?.name ?? p.hotelId, randomStarTier: null });
+    else if (p.randomStarTier != null) {
+      groups.set(randomPoolGroupKey(p.randomStarTier), {
+        name: randomStarTierLabel(p.randomStarTier),
+        randomStarTier: p.randomStarTier,
+      });
+    }
+  }
   for (const it of items) {
-    if (it.hotelRoomType && !hotelNames.has(it.hotelRoomType.hotelId)) {
-      hotelNames.set(it.hotelRoomType.hotelId, it.hotelRoomType.hotel.name);
+    if (it.hotelRoomType) {
+      if (!groups.has(it.hotelRoomType.hotelId)) {
+        groups.set(it.hotelRoomType.hotelId, {
+          name: it.hotelRoomType.hotel.name,
+          randomStarTier: null,
+        });
+      }
+    } else if (it.randomStarTier != null) {
+      const key = randomPoolGroupKey(it.randomStarTier);
+      if (!groups.has(key)) {
+        groups.set(key, {
+          name: randomStarTierLabel(it.randomStarTier),
+          randomStarTier: it.randomStarTier,
+        });
+      }
     }
   }
 
-  const hotels = Array.from(hotelNames.entries())
-    .sort((a, b) => a[1].localeCompare(b[1], 'zh-CN'))
-    .map(([hotelId, hotelName]) => {
-      const hotelPeriods = periods.filter((p) => p.hotelId === hotelId);
-      const hotelItems = items.filter((it) => it.hotelRoomType?.hotelId === hotelId);
+  const hotels = Array.from(groups.entries())
+    // 池组排在最前（房控先看「随机池还剩多少没落地」），其余酒店按名称
+    .sort(([, a], [, b]) => {
+      const poolDelta = Number(b.randomStarTier != null) - Number(a.randomStarTier != null);
+      if (poolDelta !== 0) return poolDelta;
+      return a.name.localeCompare(b.name, 'zh-CN');
+    })
+    .map(([hotelId, { name: hotelName, randomStarTier }]) => {
+      const hotelPeriods =
+        randomStarTier != null
+          ? periods.filter((p) => p.hotelId == null && p.randomStarTier === randomStarTier)
+          : periods.filter((p) => p.hotelId === hotelId);
+      const hotelItems =
+        randomStarTier != null
+          ? items.filter((it) => it.hotelRoomType == null && it.randomStarTier === randomStarTier)
+          : items.filter((it) => it.hotelRoomType?.hotelId === hotelId);
       const block = expandBlockByDate(hotelPeriods, dates);
       const used = expandUsedByDate(hotelItems, dates);
       // 权威分房表订单直计物理间数并退出拼房口径；其余行（fallback）按性别推算
@@ -778,6 +938,7 @@ export async function getBoard(
       return {
         hotelId,
         hotelName,
+        randomStarTier,
         unitPrice,
         rows: {
           block,
@@ -839,6 +1000,9 @@ const SHARED_ODD_NEAR_DAYS = 7;
  * 按需计算提醒线（无 cron）：
  *   - 超卖 / 富余直接复用销控板 getBoard 的展开结果，不重复口径；
  *   - 班次乘客数按导出同款 COUNTED_STATUSES 统计，对比 FlightSchedule.ticketingCap（默认 191）。
+ *
+ * 星级随机池同样是 getBoard 的一个分组，因此池的超卖 / 富余 / 拼房落单一并进提醒线；
+ * 此时 hotelName = 「三星随机」/「四星随机」、hotelId = 池合成键（非真实酒店 id，仅供去重）。
  */
 export async function getAlerts(
   days: number,
@@ -941,18 +1105,19 @@ export async function getAlerts(
 
 // ── 近期用房变更（读审计流，不新做事件系统）────────────────────────────────
 /**
- * 会实际改动酒店用房口径的订单操作 —— 全部由 orders 路由在成功后 writeAudit 落库：
+ * 会实际改动酒店用房口径、或影响占房行程日期的订单操作 —— 全部由 orders 路由在成功后 writeAudit 落库：
  *   UPDATE_ROOM_ASSIGNMENT  调整分房（改 roomAssignment / 计费房数 → 直接影响「占」）
  *   SWAP_ORDER_ITEM_HOTEL   换酒店（改 hotelRoomTypeId → 换一家酒店占房）
  *   ADD_ROOM_SUPPLEMENT     补收单房差（房数/房态相关的售后补收）
- * 三者 targetType 均为 ORDER、targetId=订单 id、targetLabel=订单号。
- * 注：改期（RESCHEDULE_ORDER_ITEM）改的是航班班次/出发日，不落 hotelCheckIn/hotelCheckOut，
- * 不改变销控板占房口径，故不纳入。
+ *   RESCHEDULE_ORDER_ITEM   改期（改航班班次/出发日）——不落 hotelCheckIn/hotelCheckOut，
+ *                           不改变销控板占房数字口径，但会改变出行日期，房控需要能看到这单动了。
+ * 四者 targetType 均为 ORDER、targetId=订单 id、targetLabel=订单号。
  */
 export const ROOM_CHANGE_ACTIONS = [
   'UPDATE_ROOM_ASSIGNMENT',
   'SWAP_ORDER_ITEM_HOTEL',
   'ADD_ROOM_SUPPLEMENT',
+  'RESCHEDULE_ORDER_ITEM',
 ] as const;
 
 /** 近期用房变更返回上限（条）。*/
@@ -962,6 +1127,7 @@ const ROOM_CHANGE_ACTION_LABELS: Record<string, string> = {
   UPDATE_ROOM_ASSIGNMENT: '调整分房',
   SWAP_ORDER_ITEM_HOTEL: '换酒店',
   ADD_ROOM_SUPPLEMENT: '补收单房差',
+  RESCHEDULE_ORDER_ITEM: '改期',
 };
 
 export interface HotelRoomChangeEntry {
@@ -974,6 +1140,14 @@ export interface HotelRoomChangeEntry {
   summary: string; // 关键字段摘要（房数/酒店等）
   severity: string;
   at: string; // ISO8601
+  /** 出行人姓名（优先中文名，无则回落护照姓名；占位联系人不列）。订单查不到/已软删 → []。 */
+  passengerNames: string[];
+  /** 出发日（YYYY-MM-DD，按出发地时区折算）——订单 FLIGHT 行按班次 departureTime 升序第 1 段；无航段/查不到订单 → null。 */
+  departDate: string | null;
+  /** 返程日（YYYY-MM-DD）——FLIGHT 行第 2 段；单程/无航段/查不到订单 → null。 */
+  returnDate: string | null;
+  /** 订单总额（CNY）= Order.total；查不到订单 → null。 */
+  orderAmountCny: number | null;
 }
 
 export interface HotelRecentRoomChanges {
@@ -1021,11 +1195,69 @@ function summarizeRoomChange(action: string, before: unknown, after: unknown): s
     }
     return '补收单房差';
   }
+  if (action === 'RESCHEDULE_ORDER_ITEM') {
+    // before/after.departure 是 writeAudit 落库时 Date.toISOString() 的完整 ISO8601 串（非 @db.Date）。
+    const fromDate = readStr(b.departure)?.slice(0, 10) ?? null;
+    const toDate = readStr(a.departure)?.slice(0, 10) ?? null;
+    if (fromDate && toDate && fromDate !== toDate) return `改期 ${fromDate} → ${toDate}`;
+    if (toDate) return `改期至 ${toDate}`;
+    return '改期';
+  }
   return ROOM_CHANGE_ACTION_LABELS[action] ?? action;
 }
 
+interface RoomChangeOrderInfo {
+  passengerNames: string[];
+  departDate: string | null;
+  returnDate: string | null;
+  orderAmountCny: number | null;
+}
+
 /**
- * 近期用房变更（近 N 天，倒序，上限 100 条）——读 AuditLog 中会影响用房的订单操作。
+ * 按 orderId 去重批量查订单，给「近期用房变更」面板补充乘客姓名/出行日期/订单金额。
+ * 查不到的订单（id 已失效等）不在返回的 Map 里——调用方按 undefined 处理，各字段置 null/[]，不抛错。
+ */
+async function buildRoomChangeOrderInfo(
+  orderIds: string[],
+  client: PrismaClient,
+): Promise<Map<string, RoomChangeOrderInfo>> {
+  const map = new Map<string, RoomChangeOrderInfo>();
+  if (orderIds.length === 0) return map;
+
+  const orders = await client.order.findMany({
+    where: { id: { in: orderIds } },
+    select: {
+      id: true,
+      total: true,
+      passengers: { select: { documentNumber: true, chineseName: true, fullName: true } },
+      // 出发/返程日：订单 FLIGHT 行按班次 departureTime 升序，第 1 段=去程、第 2 段=回程（与 Order.outboundInvoiced 注释同口径）。
+      items: {
+        where: { kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
+        orderBy: { flightSchedule: { departureTime: 'asc' } },
+        select: { flightSchedule: { select: { departureTime: true, departureTz: true } } },
+      },
+    },
+  });
+
+  for (const order of orders) {
+    const legs = order.items
+      .map((it) => it.flightSchedule)
+      .filter((fs): fs is NonNullable<typeof fs> => fs != null);
+    map.set(order.id, {
+      passengerNames: order.passengers
+        .filter((p) => p.documentNumber !== 'N/A')
+        .map((p) => p.chineseName?.trim() || p.fullName),
+      departDate: legs[0] ? fmtDepartureLocalDate(legs[0].departureTime, legs[0].departureTz) : null,
+      returnDate: legs[1] ? fmtDepartureLocalDate(legs[1].departureTime, legs[1].departureTz) : null,
+      orderAmountCny: dec(order.total),
+    });
+  }
+  return map;
+}
+
+/**
+ * 近期用房变更（近 N 天，倒序，上限 100 条）——读 AuditLog 中会影响用房的订单操作，
+ * 并批量补充乘客姓名/出行日期/订单金额，方便房控核对是谁、哪天走、多少钱的单动了用房。
  * 给房控看板顶部「近期用房变更」面板做可见性，不做已读态、不建事件系统。
  */
 export async function getRecentRoomChanges(
@@ -1055,21 +1287,33 @@ export async function getRecentRoomChanges(
     },
   });
 
-  const changes: HotelRoomChangeEntry[] = logs.map((log) => ({
-    id: log.id,
-    action: log.action,
-    actionLabel: ROOM_CHANGE_ACTION_LABELS[log.action] ?? log.action,
-    orderId: log.targetId,
-    orderNumber: log.targetLabel,
-    actor:
-      log.actor?.displayName ??
-      log.actor?.email ??
-      log.actorLabel ??
-      (log.actorRole ? String(log.actorRole) : null),
-    summary: summarizeRoomChange(log.action, log.before, log.after),
-    severity: String(log.severity),
-    at: log.createdAt.toISOString(),
-  }));
+  const orderIds = Array.from(
+    new Set(logs.map((log) => log.targetId).filter((id): id is string => !!id)),
+  );
+  const orderInfoById = await buildRoomChangeOrderInfo(orderIds, client);
+
+  const changes: HotelRoomChangeEntry[] = logs.map((log) => {
+    const info = log.targetId ? orderInfoById.get(log.targetId) : undefined;
+    return {
+      id: log.id,
+      action: log.action,
+      actionLabel: ROOM_CHANGE_ACTION_LABELS[log.action] ?? log.action,
+      orderId: log.targetId,
+      orderNumber: log.targetLabel,
+      actor:
+        log.actor?.displayName ??
+        log.actor?.email ??
+        log.actorLabel ??
+        (log.actorRole ? String(log.actorRole) : null),
+      summary: summarizeRoomChange(log.action, log.before, log.after),
+      severity: String(log.severity),
+      at: log.createdAt.toISOString(),
+      passengerNames: info?.passengerNames ?? [],
+      departDate: info?.departDate ?? null,
+      returnDate: info?.returnDate ?? null,
+      orderAmountCny: info?.orderAmountCny ?? null,
+    };
+  });
 
   return { days, count: changes.length, changes };
 }
@@ -1128,15 +1372,16 @@ export interface HotelOccupantDto {
  * 每行对应一次真实占房，避免合并后间数/入住区间失真。
  */
 export async function getOccupyingOrders(
-  hotelId: string,
+  scope: string | RoomScope,
   date: string,
   client: PrismaClient = defaultPrisma,
 ): Promise<HotelOccupantDto[]> {
+  // 兼容既有按 hotelId 字符串调用（分房表导出等）
+  const roomScope: RoomScope = typeof scope === 'string' ? { hotelId: scope } : scope;
   const d = toDateOnly(date);
   const items = await client.orderItem.findMany({
     where: {
-      hotelRoomTypeId: { not: null },
-      hotelRoomType: { hotelId },
+      ...scopeItemWhere(roomScope),
       hotelCheckIn: { lte: d },
       hotelCheckOut: { gt: d },
       order: { deletedAt: null, status: { in: COUNTED_STATUSES } },

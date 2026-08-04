@@ -557,8 +557,10 @@ export class FlightService {
           ...c,
           fareBuckets: parseFareBuckets(c.fareBuckets),
           locked,
-          // 权威余位口径（与前台一致）：capacity − sold − 他人未过期锁位
-          available: Math.max(0, c.capacity - c.sold - locked),
+          // 权威余位口径（与前台一致）：capacity − sold − 他人未过期锁位。
+          // 不夹 0：航司减配/换机型把容量压到已售之下时余位为负 = 超售张数，
+          // 运营端要看见这个负数去协调（前台公开口径另走 capPublicAvailable，仍夹 0）。
+          available: c.capacity - c.sold - locked,
         };
       }),
     }));
@@ -606,7 +608,8 @@ export class FlightService {
           capacity: c.capacity,
           sold: c.sold,
           locked,
-          available: Math.max(0, c.capacity - c.sold - locked),
+          // 与 listSchedules 同口径，不夹 0：负数 = 超售张数（座位统计据此标红）
+          available: c.capacity - c.sold - locked,
           basePrice: c.basePrice.toString(),
         };
       }),
@@ -742,15 +745,31 @@ export class FlightService {
     }
 
     // ── 座位类校验 ───────────────────────────────────────────────────────────
+    // 容量下调不再一刀切拦下「低于已售」：航司减配 / 换机型会把真实容量压到已售之下
+    // （如 186+7 座的机型换成小机型而已售 195），运营必须能录入真实容量、在座位统计里
+    // 看到「超售 N」去协调。销售侧不受影响 —— 下单扣座是 sold+qty+locked ≤ capacity 的
+    // 原子 CAS，容量被压低后只会更早拒卖，不会因为这里放开而多卖出一张票。
+    // 命中超售的舱位收集起来，更新后写一条 WARNING 审计留痕（谁、哪一舱、从多少改到多少）。
+    const oversoldSeatChanges: Array<{
+      cabin: CabinClass;
+      sold: number;
+      capacityBefore: number;
+      capacityAfter: number;
+      oversoldBy: number;
+    }> = [];
     for (const upd of seatUpdates) {
       const current = seatClassByCabin.get(upd.cabin);
       if (!current) {
         throw new BadRequestError(`该班次没有${CABIN_LABEL[upd.cabin]}（${upd.cabin}）`);
       }
       if (upd.capacity !== undefined && upd.capacity < current.sold) {
-        throw new BadRequestError(
-          `${CABIN_LABEL[upd.cabin]}已售 ${current.sold}，容量不能低于 ${current.sold}`,
-        );
+        oversoldSeatChanges.push({
+          cabin: upd.cabin,
+          sold: current.sold,
+          capacityBefore: current.capacity,
+          capacityAfter: upd.capacity,
+          oversoldBy: current.sold - upd.capacity,
+        });
       }
     }
 
@@ -804,6 +823,36 @@ export class FlightService {
           arrivalTime: updated.arrivalTime.toISOString(),
         },
         severity: hasSold ? AuditSeverity.WARNING : AuditSeverity.INFO,
+      });
+    }
+
+    // ── 超售审计：容量被压到已售之下（航司减配/换机型）──────────────────────
+    // 库存变成"账面欠座"，需要人工与航司/操作部协调，必须可追溯到人和时点。
+    if (oversoldSeatChanges.length > 0) {
+      await writeAudit({
+        actor: actor ?? {},
+        action: 'UPDATE_SCHEDULE_CAPACITY_OVERSOLD',
+        targetType: AuditTargetType.FLIGHT,
+        targetId: scheduleId,
+        targetLabel: `班次 ${scheduleId} 容量低于已售（超售 ${oversoldSeatChanges
+          .map((c) => `${CABIN_LABEL[c.cabin]}${c.oversoldBy}`)
+          .join('、')}）`,
+        before: {
+          seatClasses: oversoldSeatChanges.map((c) => ({
+            cabin: c.cabin,
+            capacity: c.capacityBefore,
+            sold: c.sold,
+          })),
+        },
+        after: {
+          seatClasses: oversoldSeatChanges.map((c) => ({
+            cabin: c.cabin,
+            capacity: c.capacityAfter,
+            sold: c.sold,
+            oversoldBy: c.oversoldBy,
+          })),
+        },
+        severity: AuditSeverity.WARNING,
       });
     }
 
@@ -1028,9 +1077,9 @@ export class FlightService {
    * （如经济 180→184、商务 20→7），逐个点太慢。
    * 按 scheduleId 列表逐条处理（scheduleId 由前端按"日期区间 + 星期几"筛出，
    * 复用批量改价面板已有的班次选择范围）：
-   *   - 每条按 cabin 定位舱位，套用与单班次编辑（updateSchedule）同口径的
-   *     "容量不能低于已售"守卫：命中守卫 → 整个班次跳过（不改任何舱位），
-   *     记入 skipped（镜像 batchDeleteSchedules 的响应形状），不是整批失败；
+   *   - 每条按 cabin 定位舱位，套用与单班次编辑（updateSchedule）同口径：容量可以
+   *     压到已售之下（航司减配/换机型的真实场景），这类班次照改并记为「超售」，
+   *     在返回体的 oversold 明细与审计里点名，销售侧照旧按 CAS 拒卖；
    *   - 该班次没有请求里的某个舱位 → 那一项静默跳过（不算失败）；
    *   - 请求的舱位在该班次里一个都不存在 → 整个班次跳过，记入 skipped；
    *   - scheduleId 查无此班次 → 跳过，记入 skipped。
@@ -1047,6 +1096,8 @@ export class FlightService {
     const appliedIds: string[] = [];
     const skipped: Array<{ scheduleId: string; reason: string }> = [];
     const updates: Array<{ seatClassId: string; capacity: number }> = [];
+    // 目标容量低于已售的班次：照改，但单列出来提示运营去协调（返回体 + 审计）
+    const oversold: Array<{ scheduleId: string; cabin: CabinClass; sold: number; capacity: number; oversoldBy: number }> = [];
 
     for (const scheduleId of body.scheduleIds) {
       const schedule = scheduleById.get(scheduleId);
@@ -1056,25 +1107,27 @@ export class FlightService {
       }
       const seatClassByCabin = new Map(schedule.seatClasses.map((c) => [c.cabin, c]));
       const scheduleUpdates: Array<{ seatClassId: string; capacity: number }> = [];
-      let guardReason: string | null = null;
+      const scheduleOversold: typeof oversold = [];
       for (const item of body.seatClasses) {
         const current = seatClassByCabin.get(item.cabin);
         if (!current) continue; // 该班次没有此舱位：这一项静默跳过，不算失败
         if (item.capacity < current.sold) {
-          guardReason = `已售${current.sold}超过目标容量${item.capacity}`;
-          break;
+          scheduleOversold.push({
+            scheduleId,
+            cabin: item.cabin,
+            sold: current.sold,
+            capacity: item.capacity,
+            oversoldBy: current.sold - item.capacity,
+          });
         }
         scheduleUpdates.push({ seatClassId: current.id, capacity: item.capacity });
-      }
-      if (guardReason) {
-        skipped.push({ scheduleId, reason: guardReason });
-        continue;
       }
       if (scheduleUpdates.length === 0) {
         skipped.push({ scheduleId, reason: '该班次没有匹配的舱位' });
         continue;
       }
       updates.push(...scheduleUpdates);
+      oversold.push(...scheduleOversold);
       appliedIds.push(scheduleId);
     }
 
@@ -1090,16 +1143,19 @@ export class FlightService {
         actor: actor ?? {},
         action: 'BATCH_UPDATE_CAPACITY',
         targetType: AuditTargetType.FLIGHT,
-        targetLabel: `批量改容量 ${appliedIds.length} 个班次`,
+        targetLabel: `批量改容量 ${appliedIds.length} 个班次${
+          oversold.length > 0 ? `（其中 ${oversold.length} 个舱位容量低于已售 → 超售）` : ''
+        }`,
         after: {
           appliedScheduleIds: appliedIds,
           skipped,
           seatClasses: body.seatClasses,
+          oversold,
         },
         severity: AuditSeverity.WARNING,
       });
     }
 
-    return { applied: appliedIds.length, skipped };
+    return { applied: appliedIds.length, skipped, oversold };
   }
 }

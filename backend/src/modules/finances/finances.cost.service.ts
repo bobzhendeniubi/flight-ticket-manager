@@ -239,6 +239,11 @@ export interface CostPeriodDto {
   peakSurchargeCny: number | null;
   aircraftAdjustCny: number | null;
   takeoffDiscountCny: number | null;
+  // A2 汇率四元组（可空审计留痕）：包机原币种/原币金额/汇率/折算日；CNY 字段仍是唯一入账口径
+  charterSourceCurrency: string | null;
+  charterSourceAmount: number | null;
+  charterFxRate: number | null;
+  charterFxDate: string | null; // YYYY-MM-DD
   note: string | null;
   updatedAt: string;
 }
@@ -279,6 +284,10 @@ function toDto(row: {
   peakSurchargeCny: Prisma.Decimal | null;
   aircraftAdjustCny: Prisma.Decimal | null;
   takeoffDiscountCny: Prisma.Decimal | null;
+  charterSourceCurrency: string | null;
+  charterSourceAmount: Prisma.Decimal | null;
+  charterFxRate: Prisma.Decimal | null;
+  charterFxDate: Date | null;
   note: string | null;
   updatedAt: Date;
   flight: { flightNumber: string; originCode: string; destinationCode: string };
@@ -302,6 +311,11 @@ function toDto(row: {
     peakSurchargeCny: r2(row.peakSurchargeCny),
     aircraftAdjustCny: r2(row.aircraftAdjustCny),
     takeoffDiscountCny: r2(row.takeoffDiscountCny),
+    charterSourceCurrency: row.charterSourceCurrency,
+    charterSourceAmount: r2(row.charterSourceAmount),
+    // 汇率精度 6 位小数，不走 round2（会截成 2 位）——直接用 dec() 转数保留 Decimal 原始精度
+    charterFxRate: dec(row.charterFxRate),
+    charterFxDate: row.charterFxDate ? fmtDateOnly(row.charterFxDate) : null,
     note: row.note,
     updatedAt: row.updatedAt.toISOString(),
   };

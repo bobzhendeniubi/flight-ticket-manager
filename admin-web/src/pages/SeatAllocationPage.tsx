@@ -205,7 +205,9 @@ export function SeatAllocationPage() {
         sold: c.sold,
         available: c.available,
         allocated: 0,
-        pool: c.available,
+        // 余位可能为负（超售：容量被调到已售之下）。"还能切几座"不存在负数，
+        // 夹到 0 = 一座都不能再切；超售本身在座位统计 / 航班管理里标红。
+        pool: Math.max(0, c.available),
       };
     }
     for (const a of activeAllocations) {

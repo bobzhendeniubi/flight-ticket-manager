@@ -82,6 +82,16 @@ function fmtPct(n: number | null | undefined): string {
   if (n == null || !Number.isFinite(n)) return '—';
   return `${(n * 100).toFixed(1)}%`;
 }
+/** 原币金额+币种合并展示，如 "USD 12,000"；两者都缺时显示 —。 */
+function fmtFxAmount(currency: string | null, amount: number | null): string {
+  if (currency == null && amount == null) return '—';
+  const amt = amount == null ? '—' : amount.toLocaleString('zh-CN', { maximumFractionDigits: 2 });
+  return currency ? `${currency} ${amt}` : amt;
+}
+function fmtFxRate(n: number | null | undefined): string {
+  if (n == null || !Number.isFinite(n)) return '—';
+  return n.toLocaleString('zh-CN', { maximumFractionDigits: 6 });
+}
 function fmtDate(iso: string): string {
   const d = new Date(iso);
   return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
@@ -574,27 +584,30 @@ function FlightCostPeriodsEditor({ token }: { token: string }) {
       ) : (
         <div className="mt-3 overflow-x-auto">
           <table className="w-full text-sm">
-            <thead className="text-xs uppercase tracking-wide text-ink-muted">
+            <thead className="sticky top-14 z-10 bg-surface text-xs uppercase tracking-wide text-ink-muted">
               <tr className="border-b border-slate-200">
-                <th className="py-2 text-left font-normal">航班号</th>
-                <th className="py-2 text-left font-normal">路线</th>
-                <th className="py-2 text-left font-normal">起始</th>
-                <th className="py-2 text-left font-normal">结束</th>
-                <th className="py-2 text-right font-normal">包机(¥·整包)</th>
-                <th className="py-2 text-right font-normal">机场税去(¥/座)</th>
-                <th className="py-2 text-right font-normal">机场税回(¥/座)</th>
-                <th className="py-2 text-right font-normal">燃油(¥/座)</th>
-                <th className="py-2 text-right font-normal">旺季附加(¥/座)</th>
-                <th className="py-2 text-right font-normal">机型调整(¥/座)</th>
-                <th className="py-2 text-right font-normal">起降折扣/机场补贴(¥/座)</th>
-                <th className="py-2 text-left font-normal">备注</th>
-                <th className="py-2 text-right font-normal"></th>
+                <th className="min-w-[76px] py-2 text-left font-normal">航班号</th>
+                <th className="min-w-[104px] py-2 text-left font-normal">路线</th>
+                <th className="min-w-[104px] py-2 text-left font-normal">起始</th>
+                <th className="min-w-[104px] py-2 text-left font-normal">结束</th>
+                <th className="min-w-[104px] py-2 text-right font-normal">包机(¥·整包)</th>
+                <th className="min-w-[104px] py-2 text-right font-normal">机场税去(¥/座)</th>
+                <th className="min-w-[104px] py-2 text-right font-normal">机场税回(¥/座)</th>
+                <th className="min-w-[88px] py-2 text-right font-normal">燃油(¥/座)</th>
+                <th className="min-w-[96px] py-2 text-right font-normal">旺季附加(¥/座)</th>
+                <th className="min-w-[96px] py-2 text-right font-normal">机型调整(¥/座)</th>
+                <th className="min-w-[132px] py-2 text-right font-normal">起降折扣/机场补贴(¥/座)</th>
+                <th className="min-w-[112px] py-2 text-right font-normal">原币金额(币种)</th>
+                <th className="min-w-[88px] py-2 text-right font-normal">汇率</th>
+                <th className="min-w-[104px] py-2 text-left font-normal">折算/付款日</th>
+                <th className="min-w-[132px] py-2 text-left font-normal">备注</th>
+                <th className="min-w-[110px] py-2 text-right font-normal"></th>
               </tr>
             </thead>
             <tbody>
               {periods.length === 0 && (
                 <tr>
-                  <td colSpan={13} className="py-4 text-center text-ink-muted">
+                  <td colSpan={16} className="py-4 text-center text-ink-muted">
                     暂无周期 · 点击右上「+ 新增周期」开始
                   </td>
                 </tr>
@@ -706,7 +719,9 @@ function CostPeriodNewForm({
 
   return (
     <div className="mt-3 rounded-lg border border-slate-200 bg-canvas p-3">
-      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-4">
+      {/* 字段顺序对齐下方表格列序：航班/起始/结束 → 金额组 → 汇率组 → 备注，
+          避免"标题行与选填日期分隔开、看不出下一格填什么"（财务反馈） */}
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
         <label className="text-xs text-ink-soft">
           航班
           <select
@@ -737,40 +752,6 @@ function CostPeriodNewForm({
             type="date"
             value={to}
             onChange={(e) => setTo(e.target.value)}
-            className={`mt-1 block w-full ${inputCls}`}
-          />
-        </label>
-        {/* A2 汇率四元组（选填）：记下包机 CNY 数是按哪天哪个汇率从哪种原币折来的 */}
-        <label className="text-xs text-ink-soft">
-          包机原币种（选填）
-          <input type="text" maxLength={3} placeholder="USD/VND/MOP" value={fxCurrency}
-            onChange={(e) => setFxCurrency(e.target.value.toUpperCase())}
-            className={`mt-1 block w-full ${inputCls}`} />
-        </label>
-        <label className="text-xs text-ink-soft">
-          原币金额（选填）
-          <input type="number" min={0} value={fxAmount ?? ''} placeholder="如 96000"
-            onChange={(e) => setFxAmount(e.target.value === '' ? null : Number(e.target.value))}
-            className={`mt-1 block w-full ${inputCls}`} />
-        </label>
-        <label className="text-xs text-ink-soft">
-          折算汇率（原币→CNY，选填）
-          <input type="number" min={0} step="0.000001" value={fxRate ?? ''} placeholder="如 7.25"
-            onChange={(e) => setFxRate(e.target.value === '' ? null : Number(e.target.value))}
-            className={`mt-1 block w-full ${inputCls}`} />
-        </label>
-        <label className="text-xs text-ink-soft">
-          折算/付款日（选填）
-          <input type="date" value={fxDate} onChange={(e) => setFxDate(e.target.value)}
-            className={`mt-1 block w-full ${inputCls}`} />
-        </label>
-        <label className="text-xs text-ink-soft">
-          备注
-          <input
-            type="text"
-            value={note}
-            onChange={(e) => setNote(e.target.value)}
-            placeholder="可空"
             className={`mt-1 block w-full ${inputCls}`}
           />
         </label>
@@ -838,6 +819,43 @@ function CostPeriodNewForm({
       <p className="mt-2 text-xs text-ink-muted">
         提示：「包机总额」是跟航司结算的整包价（一次性）；其余几项都按「每座」填。机型调整/起降折扣可填负数（少收或补贴）。
       </p>
+      {/* A2 汇率四元组（选填审计留痕）：记下包机 CNY 数是按哪天哪个汇率从哪种原币折来的；
+          CNY 仍是入账口径，这 4 项在下方列表/行内编辑均已回显、可改 */}
+      <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-5">
+        <label className="text-xs text-ink-soft">
+          包机原币种（选填）
+          <input type="text" maxLength={3} placeholder="USD/VND/MOP" value={fxCurrency}
+            onChange={(e) => setFxCurrency(e.target.value.toUpperCase())}
+            className={`mt-1 block w-full ${inputCls}`} />
+        </label>
+        <label className="text-xs text-ink-soft">
+          原币金额（选填）
+          <input type="number" min={0} value={fxAmount ?? ''} placeholder="如 96000"
+            onChange={(e) => setFxAmount(e.target.value === '' ? null : Number(e.target.value))}
+            className={`mt-1 block w-full ${inputCls}`} />
+        </label>
+        <label className="text-xs text-ink-soft">
+          折算汇率（原币→CNY，选填）
+          <input type="number" min={0} step="0.000001" value={fxRate ?? ''} placeholder="如 7.25"
+            onChange={(e) => setFxRate(e.target.value === '' ? null : Number(e.target.value))}
+            className={`mt-1 block w-full ${inputCls}`} />
+        </label>
+        <label className="text-xs text-ink-soft">
+          折算/付款日（选填）
+          <input type="date" value={fxDate} onChange={(e) => setFxDate(e.target.value)}
+            className={`mt-1 block w-full ${inputCls}`} />
+        </label>
+        <label className="text-xs text-ink-soft">
+          备注
+          <input
+            type="text"
+            value={note}
+            onChange={(e) => setNote(e.target.value)}
+            placeholder="可空"
+            className={`mt-1 block w-full ${inputCls}`}
+          />
+        </label>
+      </div>
       <div className="mt-3 flex items-center gap-2">
         <label
           className="flex items-center gap-1 text-xs text-ink-soft"
@@ -896,6 +914,11 @@ function CostPeriodRow({
   const [peak, setPeak] = useState<number | null>(period.peakSurchargeCny);
   const [aircraft, setAircraft] = useState<number | null>(period.aircraftAdjustCny);
   const [takeoff, setTakeoff] = useState<number | null>(period.takeoffDiscountCny);
+  // A2 汇率四元组（选填审计留痕）：包机原币/金额/汇率/折算日；CNY 仍是入账口径
+  const [fxCurrency, setFxCurrency] = useState<string>(period.charterSourceCurrency ?? '');
+  const [fxAmount, setFxAmount] = useState<number | null>(period.charterSourceAmount);
+  const [fxRate, setFxRate] = useState<number | null>(period.charterFxRate);
+  const [fxDate, setFxDate] = useState<string>(period.charterFxDate ?? '');
   const [note, setNote] = useState<string>(period.note ?? '');
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -915,6 +938,10 @@ function CostPeriodRow({
     setPeak(period.peakSurchargeCny);
     setAircraft(period.aircraftAdjustCny);
     setTakeoff(period.takeoffDiscountCny);
+    setFxCurrency(period.charterSourceCurrency ?? '');
+    setFxAmount(period.charterSourceAmount);
+    setFxRate(period.charterFxRate);
+    setFxDate(period.charterFxDate ?? '');
     setNote(period.note ?? '');
     setErr(null);
     setSaveNotice(null);
@@ -935,6 +962,10 @@ function CostPeriodRow({
         peakSurchargeCny: peak,
         aircraftAdjustCny: aircraft,
         takeoffDiscountCny: takeoff,
+        charterSourceCurrency: fxCurrency.trim() === '' ? null : fxCurrency.trim().toUpperCase(),
+        charterSourceAmount: fxAmount,
+        charterFxRate: fxRate,
+        charterFxDate: fxDate === '' ? null : fxDate,
         note: note.trim() === '' ? null : note.trim(),
       };
       await api.updateCostPeriod(token, period.id, body);
@@ -963,9 +994,10 @@ function CostPeriodRow({
     }
   }
 
-  const numCls = 'w-20 rounded-lg border border-slate-200 px-1.5 py-0.5 text-right text-xs nums focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20';
-  const dateCls = 'w-32 rounded-lg border border-slate-200 px-1.5 py-0.5 text-xs focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20';
-  const textCls = 'w-32 rounded-lg border border-slate-200 px-1.5 py-0.5 text-xs focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20';
+  // 宽度与上方 <thead> 各列 min-width 对齐，减少「改」进出编辑态时的列宽跳动
+  const numCls = 'w-[92px] rounded-lg border border-slate-200 px-1.5 py-0.5 text-right text-xs nums focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20';
+  const dateCls = 'w-[96px] rounded-lg border border-slate-200 px-1.5 py-0.5 text-xs focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20';
+  const textCls = 'w-[124px] rounded-lg border border-slate-200 px-1.5 py-0.5 text-xs focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20';
 
   if (!editing) {
     return (
@@ -981,6 +1013,9 @@ function CostPeriodRow({
         <td className="py-2 text-right tabular-nums">{fmtCny(period.peakSurchargeCny)}</td>
         <td className="py-2 text-right tabular-nums">{fmtCny(period.aircraftAdjustCny)}</td>
         <td className="py-2 text-right tabular-nums">{fmtCny(period.takeoffDiscountCny)}</td>
+        <td className="py-2 text-right tabular-nums text-xs">{fmtFxAmount(period.charterSourceCurrency, period.charterSourceAmount)}</td>
+        <td className="py-2 text-right tabular-nums text-xs">{fmtFxRate(period.charterFxRate)}</td>
+        <td className="py-2 text-xs text-ink-muted">{period.charterFxDate ?? '—'}</td>
         <td className="py-2 text-xs text-ink-muted">{period.note ?? '—'}</td>
         <td className="py-2 text-right">
           <button
@@ -1016,6 +1051,40 @@ function CostPeriodRow({
       <td className="py-2 text-right"><UsdCostInput className={numCls} value={peak} onChange={setPeak} /></td>
       <td className="py-2 text-right"><UsdCostInput className={numCls} allowNegative value={aircraft} onChange={setAircraft} /></td>
       <td className="py-2 text-right"><UsdCostInput className={numCls} allowNegative value={takeoff} onChange={setTakeoff} /></td>
+      <td className="py-2 text-right">
+        <div className="flex items-center justify-end gap-1">
+          <input
+            type="text"
+            maxLength={3}
+            value={fxCurrency}
+            onChange={(e) => setFxCurrency(e.target.value.toUpperCase())}
+            placeholder="币种"
+            className="w-12 rounded-lg border border-slate-200 px-1 py-0.5 text-right text-xs uppercase focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20"
+          />
+          <input
+            type="number"
+            min={0}
+            value={fxAmount ?? ''}
+            placeholder="金额"
+            onChange={(e) => setFxAmount(e.target.value === '' ? null : Number(e.target.value))}
+            className={numCls}
+          />
+        </div>
+      </td>
+      <td className="py-2 text-right">
+        <input
+          type="number"
+          min={0}
+          step="0.000001"
+          value={fxRate ?? ''}
+          placeholder="汇率"
+          onChange={(e) => setFxRate(e.target.value === '' ? null : Number(e.target.value))}
+          className={numCls}
+        />
+      </td>
+      <td className="py-2">
+        <input type="date" value={fxDate} onChange={(e) => setFxDate(e.target.value)} className={dateCls} />
+      </td>
       <td className="py-2"><input type="text" value={note} onChange={(e) => setNote(e.target.value)} className={textCls} placeholder="备注" /></td>
       <td className="py-2 text-right">
         <label
@@ -1095,25 +1164,25 @@ function FlightScheduleCostEditors({ token }: { token: string }) {
       ) : (
         <div className="mt-3 overflow-x-auto">
           <table className="w-full text-sm">
-            <thead className="text-xs uppercase tracking-wide text-ink-muted">
+            <thead className="sticky top-14 z-10 bg-surface text-xs uppercase tracking-wide text-ink-muted">
               <tr className="border-b border-slate-200">
-                <th className="py-2 text-left font-normal">航班号</th>
-                <th className="py-2 text-left font-normal">路线</th>
-                <th className="py-2 text-left font-normal">出发日期</th>
-                <th className="py-2 text-right font-normal">包机(¥·整包)</th>
-                <th className="py-2 text-right font-normal">机场税去(¥/座)</th>
-                <th className="py-2 text-right font-normal">机场税回(¥/座)</th>
-                <th className="py-2 text-right font-normal">燃油(¥/座)</th>
-                <th className="py-2 text-right font-normal">旺季附加(¥/座)</th>
-                <th className="py-2 text-right font-normal">机型调整(¥/座)</th>
-                <th className="py-2 text-right font-normal">起降折扣/机场补贴(¥/座)</th>
-                <th className="py-2 text-right font-normal">已售/总座</th>
-                <th className="py-2 text-right font-normal text-blue-700">
+                <th className="min-w-[76px] py-2 text-left font-normal">航班号</th>
+                <th className="min-w-[104px] py-2 text-left font-normal">路线</th>
+                <th className="min-w-[112px] py-2 text-left font-normal">出发日期</th>
+                <th className="min-w-[104px] py-2 text-right font-normal">包机(¥·整包)</th>
+                <th className="min-w-[104px] py-2 text-right font-normal">机场税去(¥/座)</th>
+                <th className="min-w-[104px] py-2 text-right font-normal">机场税回(¥/座)</th>
+                <th className="min-w-[88px] py-2 text-right font-normal">燃油(¥/座)</th>
+                <th className="min-w-[96px] py-2 text-right font-normal">旺季附加(¥/座)</th>
+                <th className="min-w-[96px] py-2 text-right font-normal">机型调整(¥/座)</th>
+                <th className="min-w-[132px] py-2 text-right font-normal">起降折扣/机场补贴(¥/座)</th>
+                <th className="min-w-[88px] py-2 text-right font-normal">已售/总座</th>
+                <th className="min-w-[140px] py-2 text-right font-normal text-blue-700">
                   单座成本(÷总座)(¥)
                   <span className="block font-normal normal-case tracking-normal text-ink-muted">= 包机总额 ÷ 全部座位</span>
                 </th>
-                <th className="py-2 text-right font-normal">空座成本(¥)</th>
-                <th className="py-2 text-right font-normal"></th>
+                <th className="min-w-[104px] py-2 text-right font-normal">空座成本(¥)</th>
+                <th className="min-w-[160px] py-2 text-right font-normal"></th>
               </tr>
             </thead>
             <tbody>
@@ -1166,7 +1235,7 @@ function FlightScheduleCostRow({
   const [lockBusy, setLockBusy] = useState(false);
   const [lockErr, setLockErr] = useState<string | null>(null);
 
-  const inputCls = 'w-20 rounded-lg border border-slate-200 px-1.5 py-0.5 text-right text-xs nums focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20';
+  const inputCls = 'w-[92px] rounded-lg border border-slate-200 px-1.5 py-0.5 text-right text-xs nums focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20';
 
   async function toggleCostLock(): Promise<void> {
     if (!token || lockBusy) return;

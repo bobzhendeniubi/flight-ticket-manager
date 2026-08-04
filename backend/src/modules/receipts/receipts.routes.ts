@@ -2,7 +2,8 @@
  * 收款对账台 / 挂账池路由（ADMIN/STAFF）。
  *
  * 注册前缀 /receipts：
- *   GET  /receipts?status=&q=&from=&to=  挂账池列表（含 remaining + 认领明细；日期按 receivedAt）
+ *   GET  /receipts?status=&q=&orderHintId=&from=&to=  挂账池列表（含 remaining + 认领明细
+ *                        与订单号；日期按 receivedAt；orderHintId 为疑似归属订单 id 精确筛）
  *   GET  /receipts/ledger         总账（合并 Receipts + 近期订单 Payments）
  *   POST /receipts                登记新进账（OPEN）
  *   POST /receipts/:id/allocate   认领到订单（原子）

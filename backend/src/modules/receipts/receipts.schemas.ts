@@ -66,6 +66,8 @@ export const listReceiptsQuerySchema = z
     unallocatedOnly: z.literal('1').optional(),
     // 关键字：匹配 receiptNo / payerNote / orderHintId / externalTxnId
     q: z.string().max(120).optional(),
+    // 疑似归属订单 id 精确筛：订单详情「挂账池里有没有本单待认领流水」提示专用
+    orderHintId: z.string().min(1).max(64).optional(),
     // 到账日期闭区间（按流水交易日期字段 receivedAt，北京时）
     from: dayStrSchema.optional(),
     to: dayStrSchema.optional(),

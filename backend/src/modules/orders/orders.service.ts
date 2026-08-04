@@ -60,7 +60,9 @@ import { localDate } from '../finances/finances.cost.service.js';
 import { getSettlementRate } from '../settlement-rates/settlement-rates.service.js';
 import {
   assertHotelPhysicalFit,
+  assertRoomScopePhysicalFit,
   checkHotelPhysicalFit,
+  randomStarTierLabel,
   type ProspectiveOccupancy,
 } from '../hotel-control/hotel-control.service.js';
 import { PricingService } from '../pricing/pricing.service.js';
@@ -951,6 +953,8 @@ export class OrderService {
               flightScheduleId: p.flightScheduleId ?? null,
               flightCabin: p.flightCabin ?? null,
               hotelRoomTypeId: p.hotelRoomTypeId ?? null,
+              // 星级随机池占用行（未落具体酒店）；落地后由换酒店流程改写并清空本列
+              randomStarTier: p.randomStarTier ?? null,
               hotelCheckIn: p.hotelCheckIn ?? null,
               hotelCheckOut: p.hotelCheckOut ?? null,
               transferId: p.transferId ?? null,
@@ -1405,6 +1409,8 @@ export class OrderService {
       // （扣座时 ECONOMY sold += quantity − businessUpgradeCount，BUSINESS sold += businessUpgradeCount）
       businessUpgradeCount?: number;
       hotelRoomTypeId?: string;
+      // 星级随机池占用行（3=三星随机、4=四星随机）：与 hotelRoomTypeId 互斥
+      randomStarTier?: number;
       hotelCheckIn?: Date;
       hotelCheckOut?: Date;
       transferId?: string;
@@ -1484,6 +1490,34 @@ export class OrderService {
         const rooms = item.roomsBilled ?? 1;
         // 成本快照（每间每晚）：仅有产品 id 时可从 DB 取；无 id 的自由行手录成本未知 → 留空。
         let hotelUnitCost: number | undefined;
+        // ── 星级随机池行（三星随机 / 四星随机）：不指定酒店，占房控池的真库存 ──
+        // 校验放这里而不是 zod：orderItemInputSchema 是 discriminatedUnion，不接受 ZodEffects。
+        if (item.randomStarTier != null) {
+          if (item.hotelRoomTypeId) {
+            throw new BadRequestError('酒店行不能同时指定具体房型和星级随机池');
+          }
+          if (!item.checkIn || !item.checkOut) {
+            throw new BadRequestError('星级随机池房行必须填写入住/退房日期（池库存按晚扣减）');
+          }
+          // 池行没有房型可查价 —— 走与「无产品 id 的地面行」完全相同的权威口径：
+          // 仅后台/代理录单可手录售价，对外角色一律拒（否则公开下单能提交 1 元随机池房行）。
+          if (!allowClientPricedGround) {
+            throw new BadRequestError('星级随机池房行仅支持后台/代理录单');
+          }
+          // 成本快照 = 该池覆盖入住首晚的包房周期切房单价（CNY/间/晚），服务端从 DB 取，
+          // 不信前端 —— 池周期没填单价 / 该晚无周期覆盖 → 留空，毛利显示「未知」，不落 0 虚高。
+          hotelUnitCost = await resolveRandomPoolNightlyCost(item.randomStarTier, item.checkIn);
+          // 前瞻闸：口径与具体酒店完全一致（物理房间、异性不能拼一间），只是作用域换成池。
+          // 池未配任何周期 / 该晚无周期覆盖 → 视为未管控，不拦截（房控哲学：未配包房 ≠ 售罄）。
+          const poolNights = buildStayNightDates(new Date(item.checkIn), new Date(item.checkOut));
+          if (poolNights.length > 0) {
+            await assertRoomScopePhysicalFit(
+              { randomStarTier: item.randomStarTier },
+              poolNights,
+              toProspectiveOccupancy(rooms, passengers),
+            );
+          }
+        }
         if (item.hotelRoomTypeId) {
           const rt = await prisma.hotelRoomType.findUnique({
             where: { id: item.hotelRoomTypeId },
@@ -1509,6 +1543,7 @@ export class OrderService {
           // 单独 HOTEL 行：unitPrice×qty×rooms（rooms 缺省 1 → 与旧版一致）。
           amount: Math.round(unitPrice * item.quantity * rooms),
           hotelRoomTypeId: item.hotelRoomTypeId,
+          randomStarTier: item.randomStarTier,
           hotelCheckIn: item.checkIn ? new Date(item.checkIn) : undefined,
           hotelCheckOut: item.checkOut ? new Date(item.checkOut) : undefined,
           roomsBilled: rooms,
@@ -5147,6 +5182,13 @@ export class OrderService {
    *   - orderItemId 必须属于本订单且 kind=HOTEL，或 kind=BUNDLE 且已盖章 hotelRoomTypeId。
    *   - newHotelRoomTypeId 必须存在、其酒店在架；与当前房型相同 → 400（无意义换房）。
    *
+   * 「落酒店」（星级随机池行 → 具体酒店）走的是同一条通道：kind=HOTEL、无房型、randomStarTier
+   * 非空的行（客人买的是「N 星随机」），本次把它落到具体酒店 —— 写 hotelRoomTypeId + 清
+   * randomStarTier，占用从池转到该酒店（池与酒店互不扣减，不会重复计数）。此时：
+   *   - 目标酒店星级（Hotel.starRating）不得低于池档次（降级交付 → 400；同级/升级放行）；
+   *   - 目标酒店逐晚余量必须校验（落地就是新增占房，没有"同酒店净不变"的豁免）；
+   *   - 审计 before.hotelName = 池名（「三星随机」），摘要渲染成「换酒店 三星随机 → XX酒店·房型」。
+   *
    * 逐晚余量校验（仅当换到不同酒店时才做——同酒店换房型净房量不变，不受本单自身占用影响）：
    *   - block[i] > 0（该晚被房控周期管控）且 remaining[i] < 本行房间数 → 拒单，列出不足的夜晚。
    *   - block[i] === 0，或整段查询范围内一条周期都没有（hasBlock=false）→ 放行，计入
@@ -5205,6 +5247,7 @@ export class OrderService {
         description: true,
         quantity: true,
         hotelRoomTypeId: true,
+        randomStarTier: true,
         hotelCheckIn: true,
         hotelCheckOut: true,
         roomsBilled: true,
@@ -5216,21 +5259,26 @@ export class OrderService {
     if (!item || item.orderId !== orderId) {
       throw new NotFoundError('订单项不存在或不属于该订单');
     }
+    // 「落酒店」：星级随机池行（kind=HOTEL、无房型、randomStarTier 非空）走同一条换酒店通道 ——
+    // 从池落到具体酒店。占用随之从池转到该酒店（写 hotelRoomTypeId + 清 randomStarTier）。
+    const isRandomPoolRow = item.kind === OrderItemKind.HOTEL && item.randomStarTier != null;
     const isHotelRow =
       item.kind === OrderItemKind.HOTEL ||
       (item.kind === OrderItemKind.BUNDLE && item.hotelRoomTypeId != null);
-    if (!isHotelRow || !item.hotelRoomTypeId) {
+    if (!isHotelRow || (!item.hotelRoomTypeId && !isRandomPoolRow)) {
       throw new BadRequestError('该行不含酒店，无法换酒店');
     }
-    if (item.hotelRoomTypeId === input.newHotelRoomTypeId) {
+    if (item.hotelRoomTypeId && item.hotelRoomTypeId === input.newHotelRoomTypeId) {
       throw new BadRequestError('目标房型与当前房型相同，无需更换');
     }
 
     const [oldRoomType, newRoomType] = await Promise.all([
-      prisma.hotelRoomType.findUnique({
-        where: { id: item.hotelRoomTypeId },
-        select: { id: true, name: true, hotelId: true, hotel: { select: { name: true } } },
-      }),
+      item.hotelRoomTypeId
+        ? prisma.hotelRoomType.findUnique({
+            where: { id: item.hotelRoomTypeId },
+            select: { id: true, name: true, hotelId: true, hotel: { select: { name: true } } },
+          })
+        : Promise.resolve(null),
       prisma.hotelRoomType.findUnique({
         where: { id: input.newHotelRoomTypeId },
         select: {
@@ -5239,13 +5287,22 @@ export class OrderService {
           hotelId: true,
           // 新房型成本价 → 重打 HOTEL 行成本快照（每间每晚 × 晚数 × 房数）。
           costPriceCny: true,
-          hotel: { select: { name: true, isActive: true } },
+          hotel: { select: { name: true, isActive: true, starRating: true } },
         },
       }),
     ]);
     if (!newRoomType) throw new NotFoundError(`酒店房型 ${input.newHotelRoomTypeId} 不存在`);
     if (!newRoomType.hotel.isActive) throw new BadRequestError('酒店已下架');
-    if (!oldRoomType) throw new NotFoundError('原酒店房型数据异常，无法换酒店');
+    if (!isRandomPoolRow && !oldRoomType) {
+      throw new NotFoundError('原酒店房型数据异常，无法换酒店');
+    }
+    // 池行落地的星级约束：客人买的是「N 星随机」，落到低于该星级的酒店等于降级交付 ——
+    // 拒绝；同级或更高（升级）放行。星级分类直接取酒店档案 Hotel.starRating。
+    if (isRandomPoolRow && newRoomType.hotel.starRating < item.randomStarTier!) {
+      throw new BadRequestError(
+        `${randomStarTierLabel(item.randomStarTier!)}只能落到 ${item.randomStarTier} 星及以上的酒店（所选酒店为 ${newRoomType.hotel.starRating} 星）`,
+      );
+    }
 
     // ── 逐晚余量校验（仅跨酒店换房时才需要；同酒店换房型净房量不变，不受本单占用影响）──
     const roomsBilled = item.roomsBilled != null ? Number(item.roomsBilled) : 1;
@@ -5272,7 +5329,9 @@ export class OrderService {
         ? buildStayNightDates(item.hotelCheckIn, item.hotelCheckOut)
         : [];
     let untrackedNights: string[] = [];
-    if (oldRoomType.hotelId !== newRoomType.hotelId && nightDates.length > 0) {
+    // 池行落地一律要校验目标酒店（池与酒店互不扣减，落地就是往目标酒店新增占房）；
+    // 具体酒店行只在跨酒店时校验（同酒店换房型净房量不变）。
+    if ((isRandomPoolRow || oldRoomType!.hotelId !== newRoomType.hotelId) && nightDates.length > 0) {
       // 物理房间口径前瞻闸（口径同下单闸 / 销控板看板）：把本单要挪进目标酒店的占房塞进
       // 目标酒店当晚的性别桶里重算物理间数 —— 床位口径看不见「异性不能拼一间」这一维。
       // excludeOrderId：本单当前挂在原酒店，理论上不该被目标酒店的占房查询选中；仍显式排除，
@@ -5351,6 +5410,8 @@ export class OrderService {
         where: { id: item.id },
         data: {
           hotelRoomTypeId: newRoomType.id,
+          // 池行落地：清空池标记 —— 占用从星级随机池转到该酒店，两边不会重复计数
+          randomStarTier: null,
           description: newDescription,
           ...(swapCost
             ? {
@@ -5388,7 +5449,9 @@ export class OrderService {
       // 必然是不同房型（否则本就是同一份预订，误伤后果也无实际差异），比单凭酒店名更贴近"这条订单
       // 行"的身份。同时把 roomType 也一并改写到新房型名（旧版只改 hotelName，遗留一个在目标酒店根本
       // 不存在的旧房型名，分房表看着货不对板）。
-      const roomAssignmentRaw = order.roomAssignment;
+      // 池行落地没有「旧酒店名」可匹配（本就没落过酒店）→ 整段跳过，绝不拿 undefined 去比对
+      // 分房组的 hotelName（那会把所有没填酒店名的组一并误改）。
+      const roomAssignmentRaw = oldRoomType ? order.roomAssignment : null;
       if (roomAssignmentRaw && typeof roomAssignmentRaw === 'object' && !Array.isArray(roomAssignmentRaw)) {
         const groups = (roomAssignmentRaw as { roomGroups?: unknown }).roomGroups;
         if (Array.isArray(groups)) {
@@ -5397,8 +5460,8 @@ export class OrderService {
             if (
               g != null &&
               typeof g === 'object' &&
-              (g as { hotelName?: unknown }).hotelName === oldRoomType.hotel.name &&
-              (g as { roomType?: unknown }).roomType === oldRoomType.name
+              (g as { hotelName?: unknown }).hotelName === oldRoomType!.hotel.name &&
+              (g as { roomType?: unknown }).roomType === oldRoomType!.name
             ) {
               changed = true;
               return {
@@ -5478,8 +5541,12 @@ export class OrderService {
         orderItemId: item.id,
         before: {
           hotelRoomTypeId: item.hotelRoomTypeId,
-          hotelName: oldRoomType.hotel.name,
-          roomTypeName: oldRoomType.name,
+          // 池行落地：before 没有真实酒店 → 写池名（「三星随机」），
+          // 审计摘要自然渲染成「换酒店 三星随机 → XX酒店·XX房型」
+          hotelName: oldRoomType
+            ? oldRoomType.hotel.name
+            : randomStarTierLabel(item.randomStarTier ?? 0),
+          roomTypeName: oldRoomType ? oldRoomType.name : null,
           unitCostCny: beforeUnitCostCny,
           totalCostCny: beforeTotalCostCny,
         },
@@ -6434,11 +6501,14 @@ export function buildOrderFilterWhere(query: OrderListFilters): Prisma.OrderWher
     //   · system：**不加**守卫 —— 系统开票是订单维度、不是航段维度，酒店单/签证单本来就要
     //     系统开票，给它加守卫会错杀（假阴性比假阳性更糟：清单里少了单 = 真活丢了）。
     //
-    // 已知残留（未修，需拍板）：本守卫只能排除「一条航段都没有」的单，排不掉**单程单**——
-    // 单程单有去程、无回程，仍会出现在「回程未开」里。真正判定回程要 determineFlightLegs
-    //（FLIGHT 行按 departureTime 排序取第 2 段），那是内存计算，查询层跑不了；Prisma 的
-    // where 也表达不了「关联行 ≥ 2 条」。彻底修法 = 物化列 Order.hasReturnLeg（下单/改单时随
-    // determineFlightLegs 一起写），需迁移 + 回填，超出本次改动范围。
+    // 已知残留：本守卫只能排除「一条航段都没有」的单，排不掉**单程单**——单程单有去程、
+    // 无回程，仍会命中这里的 where（returnInvoiced 默认 false）。查询层本身排不掉
+    // （Prisma where 表达不了「关联行 ≥ 2 条」，判定回程要 determineFlightLegs 的内存计算）。
+    // **导出路径已修**：orders.export-templates.ts 的 buildOrderTemplateExportWorkbook
+    // 取数后按 determineFlightLegs 做内存二次过滤（见 orders.export-trip-filter.ts 的
+    // excludeOnewayFromReturnLegExport），单程单不会再混进「回程未开」的导出结果。
+    // 订单列表页（走同一个 buildOrderFilterWhere）仍是查询层直出，未做内存侧收口，
+    // 残留依旧在——彻底修法仍是物化列 Order.hasReturnLeg，需迁移 + 回填，超出本次改动范围。
     if (query.invoiceLeg === 'outbound' || query.invoiceLeg === 'return') {
       andClauses.push({
         items: { some: { kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } } },
@@ -6584,6 +6654,36 @@ export function buildStayNightDates(checkIn: Date, checkOut: Date): string[] {
   return Array.from({ length: nights }, (_, i) =>
     new Date(startMs + i * DAY_MS).toISOString().slice(0, 10),
   );
+}
+
+/**
+ * 星级随机池行的成本快照来源：取覆盖入住首晚的池周期切房单价（CNY/间/晚）。
+ * 池行没有具体房型可查价，切房单价就是我们付给酒店的真实每间每晚成本 —— 与具体酒店行
+ * 取 HotelRoomType.costPriceCny 语义一致（都是成本侧，售价另说）。
+ *
+ * 多条周期叠加覆盖同一晚时取有价周期中 dateFrom 最晚的一条（"最新一次切房的价"，
+ * 与销控板 unitPrice 展示口径一致）。查不到 / 都没填价 → undefined（毛利显示「未知」，不落 0 虚高）。
+ */
+async function resolveRandomPoolNightlyCost(
+  randomStarTier: number,
+  checkIn: string,
+): Promise<number | undefined> {
+  const d = new Date(`${checkIn}T00:00:00.000Z`);
+  if (Number.isNaN(d.getTime())) return undefined;
+  const period = await prisma.hotelBlockPeriod.findFirst({
+    where: {
+      hotelId: null,
+      randomStarTier,
+      dateFrom: { lte: d },
+      dateTo: { gte: d },
+      unitPrice: { not: null },
+    },
+    orderBy: { dateFrom: 'desc' },
+    select: { unitPrice: true },
+  });
+  if (!period?.unitPrice) return undefined;
+  const cost = Number(period.unitPrice.toString());
+  return Number.isFinite(cost) ? cost : undefined;
 }
 
 export function resolveBundleHotelStamp(
@@ -7866,7 +7966,14 @@ export function serializeOrder<T extends OrderLike>(
         ...(redact
           ? { metadata: redactItemMetadataForExternal((i as { metadata?: unknown }).metadata) }
           : {}),
-        hotelName: ownHotelName ?? bundleFallback?.hotelRoomType?.hotel?.name ?? null,
+        // 星级随机池行还没落到具体酒店 → 用池名（「四星随机」）当酒店名，让各处「住哪」
+        // 一栏如实显示"买的是随机、待落地"，而不是空白（落地后本列被清空，自然回到真实酒店名）。
+        hotelName:
+          ownHotelName ??
+          bundleFallback?.hotelRoomType?.hotel?.name ??
+          ((i as { randomStarTier?: number | null }).randomStarTier != null
+            ? randomStarTierLabel((i as { randomStarTier?: number | null }).randomStarTier!)
+            : null),
         // 计费房间数（Decimal → number；未联查/未盖章时为 null，原样透出不强行转换）。
         roomsBilled: decimalOrNull((i as { roomsBilled?: Prisma.Decimal | null }).roomsBilled),
         // 行程单渲染字段（ADDITIVE；见 itineraryFieldsForItem 注释——未联查对应关系时安全落 null）。

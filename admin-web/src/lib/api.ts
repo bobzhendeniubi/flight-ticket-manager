@@ -471,6 +471,12 @@ export type CreateOrderItemInput =
   | (OrderItemBase & {
       kind: 'HOTEL';
       hotelRoomTypeId?: string;
+      /**
+       * 星级随机池行（3=三星随机、4=四星随机）：客人买的是「N 星随机」，下单不指定酒店，
+       * 占房控星级随机池的真库存，之后由房控落到具体酒店。与 hotelRoomTypeId 互斥，
+       * 且必须填 checkIn/checkOut（池库存按晚扣减）。仅后台/代理录单可用。
+       */
+      randomStarTier?: RandomStarTier;
       checkIn?: string;
       checkOut?: string;
       unitPrice: number;
@@ -782,6 +788,8 @@ export interface OrderItem {
   flightScheduleId: string | null;
   flightCabin: CabinClass | null;
   hotelRoomTypeId: string | null;
+  /** 非空 = 星级随机池占用行（还没落到具体酒店）；落地后被清空 */
+  randomStarTier?: RandomStarTier | null;
   hotelCheckIn: string | null;
   hotelCheckOut: string | null;
   transferId: string | null;
@@ -1161,6 +1169,8 @@ export interface OrdersTemplateExportParams {
   travelTo?: string;
   /** 精确按班次导出（整班·全岗用）；比 travelFrom/travelTo 精确，只导该班次订单。 */
   scheduleId?: string;
+  /** 行程类型（选填：单程/往返，票务岗反馈）；导出内存侧按 determineFlightLegs 判定。 */
+  tripType?: 'oneway' | 'roundtrip';
   flightNumber?: string;
   passengerName?: string;
   invoiceStatus?: InvoiceStatus;
@@ -1771,10 +1781,41 @@ export interface SettlementRateWriteEntry {
 
 // ── 房控（酒店包房周期 + 销控板 / 远期视图）──────────────────────────────
 // 与 backend/src/modules/hotel-control/hotel-control.service.ts 对齐
+/**
+ * 星级随机池档次：3=三星随机、4=四星随机。
+ * 池是**真库存**（先按星级切总量、客人下单只占池、之后房控落到具体酒店），
+ * 与具体酒店的包房互不扣减 —— 选明月扣明月，选随机扣池。
+ */
+export type RandomStarTier = 3 | 4;
+export const RANDOM_STAR_TIERS: RandomStarTier[] = [3, 4];
+/** 池档次展示名（与后端 randomStarTierLabel 一致）。 */
+export function randomStarTierLabel(tier: number): string {
+  return `${['一', '二', '三', '四', '五'][tier - 1] ?? String(tier)}星随机`;
+}
+
+const POOL_OPTION_PREFIX = 'random-star-tier:';
+/**
+ * 「酒店」下拉里星级随机池选项的哨兵值（房控包房周期表单 + 录单酒店行共用）。
+ * 用带冒号的前缀，与 cuid 形态的真实酒店 id 不会撞。
+ */
+export function poolOptionValue(tier: RandomStarTier): string {
+  return `${POOL_OPTION_PREFIX}${tier}`;
+}
+/** 反解哨兵值；不是池选项 → null（即选中的是真实酒店 id 或空）。 */
+export function poolTierFromOptionValue(value: string): RandomStarTier | null {
+  if (!value.startsWith(POOL_OPTION_PREFIX)) return null;
+  const tier = Number(value.slice(POOL_OPTION_PREFIX.length));
+  return RANDOM_STAR_TIERS.includes(tier as RandomStarTier) ? (tier as RandomStarTier) : null;
+}
+
 export interface HotelBlockPeriod {
   id: string;
-  hotelId: string;
+  /** 池周期为 null（此时 randomStarTier 非空） */
+  hotelId: string | null;
+  /** 具体酒店 = 酒店名；池周期 = 「三星随机」/「四星随机」。恒非空，可直接展示 */
   hotelName: string;
+  /** 非空 = 星级随机池周期 */
+  randomStarTier: RandomStarTier | null;
   dateFrom: string; // YYYY-MM-DD
   dateTo: string; // YYYY-MM-DD（闭区间）
   rooms: number;
@@ -1783,8 +1824,10 @@ export interface HotelBlockPeriod {
   updatedAt: string;
 }
 
+/** 建包房周期：hotelId（具体酒店）与 randomStarTier（星级随机池）二选一必填。 */
 export interface BlockPeriodWriteInput {
-  hotelId: string;
+  hotelId?: string;
+  randomStarTier?: RandomStarTier;
   dateFrom: string;
   dateTo: string;
   rooms: number;
@@ -1793,8 +1836,15 @@ export interface BlockPeriodWriteInput {
 }
 
 export interface HotelControlBoardHotel {
+  /**
+   * 分组键。具体酒店 = 真实酒店 id；星级随机池 = 合成键 `random-star-{tier}`
+   * —— 池组不是酒店，别拿它去调按 hotelId 的接口（护照导出等），判定一律看 randomStarTier。
+   */
   hotelId: string;
+  /** 具体酒店 = 酒店名；池组 = 「三星随机」/「四星随机」 */
   hotelName: string;
+  /** 非空 = 星级随机池虚拟组 */
+  randomStarTier: RandomStarTier | null;
   /** 最新周期（dateFrom 最晚且有价）的切房单价；都没填则 null */
   unitPrice: number | null;
   rows: { block: number[]; used: number[]; remaining: number[] };
@@ -1833,7 +1883,7 @@ export interface HotelControlAlerts {
   }>;
 }
 
-/** GET /hotel-control/recent-changes — 近期用房变更（读审计流：调整分房/换酒店/补房差） */
+/** GET /hotel-control/recent-changes — 近期用房变更（读审计流：调整分房/换酒店/补房差/改期） */
 export interface HotelRoomChangeEntry {
   id: string;
   action: string;
@@ -1844,6 +1894,10 @@ export interface HotelRoomChangeEntry {
   summary: string; // 变更摘要（房数/酒店等关键字段）
   severity: string;
   at: string; // ISO8601
+  passengerNames: string[]; // 出行人姓名；订单查不到（软删等）→ []
+  departDate: string | null; // 出发日 YYYY-MM-DD；查不到订单/无航段 → null
+  returnDate: string | null; // 返程日 YYYY-MM-DD；单程/查不到订单/无航段 → null
+  orderAmountCny: number | null; // 订单总额（CNY）；查不到订单 → null
 }
 export interface HotelRecentRoomChanges {
   days: number;
@@ -2057,6 +2111,8 @@ export interface ReceiptMatchCandidate {
 export interface ReceiptAllocation {
   id: string;
   orderId: string;
+  /** 认领到的订单号（服务端批量 join；订单查不到 → null，前端回落 id 前 8 位） */
+  orderNumber: string | null;
   amountCny: string;
   createdById: string | null;
   createdAt: string;
@@ -2075,6 +2131,8 @@ export interface Receipt {
   /** 收单平台交易流水号（流水导入的进账才有；唯一） */
   externalTxnId: string | null;
   orderHintId: string | null;
+  /** 疑似归属订单的订单号（服务端批量 join；无 hint 或订单查不到 → null） */
+  hintOrderNumber: string | null;
   receivedAt: string;
   source: ReceiptSource;
   status: ReceiptStatus;
@@ -2091,6 +2149,8 @@ export interface ListReceiptsParams {
   /** '1' = 只回未认完的（OPEN + 部分认款）——认款工作台专用 */
   unallocatedOnly?: '1';
   q?: string; // 匹配 receiptNo / payerNote / orderHintId / externalTxnId
+  /** 疑似归属订单 id 精确筛（订单详情「本单待认领流水」提示用；与 q 的模糊匹配不同） */
+  orderHintId?: string;
   /** 到账日期闭区间（YYYY-MM-DD，按流水交易日期 receivedAt，北京时） */
   from?: string;
   to?: string;
@@ -2291,10 +2351,21 @@ export const api = {
     token: string,
     body: { scheduleIds: string[]; seatClasses: Array<{ cabin: CabinClass; capacity: number }> },
   ) =>
-    apiFetch<{ result: { applied: number; skipped: Array<{ scheduleId: string; reason: string }> } }>(
-      '/flights/schedules/batch-update-capacity',
-      { method: 'POST', token, body },
-    ),
+    // oversold：目标容量低于该班次已售的舱位。这类班次照改（航司减配 / 换机型），
+    // 服务端记 WARNING 审计，前端据此提示运营去协调——不是失败，也不进 skipped。
+    apiFetch<{
+      result: {
+        applied: number;
+        skipped: Array<{ scheduleId: string; reason: string }>;
+        oversold: Array<{
+          scheduleId: string;
+          cabin: CabinClass;
+          sold: number;
+          capacity: number;
+          oversoldBy: number;
+        }>;
+      };
+    }>('/flights/schedules/batch-update-capacity', { method: 'POST', token, body }),
   // 行李规则（航班 × 舱等；ADMIN/STAFF 维护）
   getBaggagePolicies: (token: string, flightId: string) =>
     apiFetch<{ policies: FlightBaggagePolicy[] }>(`/flights/${flightId}/baggage-policies`, { token }),
@@ -3870,6 +3941,11 @@ export interface CostPeriodDto {
   peakSurchargeCny: number | null;
   aircraftAdjustCny: number | null;
   takeoffDiscountCny: number | null;
+  /** A2 汇率四元组（可空审计留痕）：包机原币种/原币金额/汇率/折算日 —— CNY 字段仍是入账口径 */
+  charterSourceCurrency: string | null;
+  charterSourceAmount: number | null;
+  charterFxRate: number | null;
+  charterFxDate: string | null;
   note: string | null;
   updatedAt: string;
 }
@@ -4282,12 +4358,23 @@ export const hotelControlOpsApi = {
     return res.blob();
   },
 
-  /** 占房下钻：某酒店某晚是谁占的（销控矩阵余量格点击用）。 */
-  getHotelOccupants: (token: string, params: { hotelId: string; date: string }) =>
-    apiFetch<{ occupants: HotelOccupant[] }>(
-      `/hotel-control/occupants?hotelId=${encodeURIComponent(params.hotelId)}&date=${encodeURIComponent(params.date)}`,
+  /**
+   * 占房下钻：某酒店 / 某星级随机池某晚是谁占的（销控矩阵余量格点击用）。
+   * hotelId 与 randomStarTier 二选一（池组的 hotelId 是合成键，不能当酒店 id 传）。
+   */
+  getHotelOccupants: (
+    token: string,
+    params: { hotelId?: string; randomStarTier?: RandomStarTier; date: string },
+  ) => {
+    const scope =
+      params.randomStarTier != null
+        ? `randomStarTier=${params.randomStarTier}`
+        : `hotelId=${encodeURIComponent(params.hotelId ?? '')}`;
+    return apiFetch<{ occupants: HotelOccupant[] }>(
+      `/hotel-control/occupants?${scope}&date=${encodeURIComponent(params.date)}`,
       { token },
-    ),
+    );
+  },
 
   /** 当日余房：给定房型 + 入住区间，逐晚余量（分房弹窗徽标用；ADMIN/STAFF 回原始数字，与公开端点的档位口径不同）。 */
   getNightlyRemaining: (
