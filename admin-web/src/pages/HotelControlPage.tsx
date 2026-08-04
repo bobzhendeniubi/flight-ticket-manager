@@ -583,19 +583,13 @@ function OccupantsDrawer({
                     >
                       {copiedId === o.orderId ? '已复制 ✓' : '复制订单号'}
                     </button>
-                    {/* 池占房行还没落到具体酒店，共享的换酒店弹窗按「原酒店+日期」反查订单行，
-                        对池行无从定位 —— 先如实说明，不给一个点了会报错的按钮。 */}
-                    {randomStarTier != null ? (
-                      <span className="text-xs text-ink-muted">该单尚未落具体酒店</span>
-                    ) : (
-                      <button
-                        type="button"
-                        className="text-xs font-medium text-brand hover:text-brand-dark"
-                        onClick={() => setSwapTarget(o)}
-                      >
-                        换酒店
-                      </button>
-                    )}
+                    <button
+                      type="button"
+                      className="text-xs font-medium text-brand hover:text-brand-dark"
+                      onClick={() => setSwapTarget(o)}
+                    >
+                      {randomStarTier != null ? '落酒店' : '换酒店'}
+                    </button>
                     <Link to="/orders" className="text-xs text-brand hover:text-brand-dark">
                       去订单页 →
                     </Link>
@@ -610,7 +604,7 @@ function OccupantsDrawer({
       {swapTarget && (
         <HotelSwapModal
           orderId={swapTarget.orderId}
-          locateHint={{ hotelId, checkIn: swapTarget.checkIn, checkOut: swapTarget.checkOut }}
+          locateHint={{ hotelId, checkIn: swapTarget.checkIn, checkOut: swapTarget.checkOut, randomStarTier }}
           onClose={() => setSwapTarget(null)}
           onSwapped={() => {
             setSwapTarget(null);

@@ -10,6 +10,8 @@
  *   - locateHint：只知道「目标酒店 + 该行入住/退房日期」（HotelControlPage 占房下钻——
  *     GET /hotel-control/occupants 的 DTO 不带 orderItemId），组件内部拉整单详情，
  *     按「酒店 + 入住/退房日期」反查具体是哪一行；命中多条则列出来让操作员选。
+ *     locateHint.randomStarTier 非空 = 星级随机池下钻：按「池档次 + 日期」定位池占房行
+ *     （hotelRoomTypeId 为空的 HOTEL 行），换到具体房型即「落酒店」（后端校验目标星级≥池档次）。
  *
  * 确认前用 GET /hotel-control/nightly-remaining 预览目标酒店逐晚余量（同酒店换房型时
  * 后端会跳过余量校验——房量净不变，预览也没有意义，故跳过展示）。
@@ -23,6 +25,8 @@ import {
   type HotelNightlyRemainingResult,
   type OrderItemKind,
   type OrderSummary,
+  type RandomStarTier,
+  randomStarTierLabel,
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { NumberInput } from './NumberInput';
@@ -38,14 +42,19 @@ export interface HotelSwapItemHint {
   quantity: number;
   hotelName?: string | null;
   roomTypeName?: string | null;
+  /** 非空 = 星级随机池占房行（还没落到具体酒店）。 */
+  randomStarTier?: RandomStarTier | null;
 }
 
 export interface HotelSwapModalProps {
   orderId: string;
   /** 已知具体订单行时直接传（OrdersPage 金额明细入口）。 */
   item?: HotelSwapItemHint;
-  /** 只知道「目标酒店 + 该行入住/退房日期」时传（HotelControlPage 占房下钻入口）。 */
-  locateHint?: { hotelId: string; checkIn: string; checkOut: string };
+  /**
+   * 只知道「目标酒店 + 该行入住/退房日期」时传（HotelControlPage 占房下钻入口）。
+   * randomStarTier 非空 = 池下钻（此时 hotelId 是后端合成键，定位只看池档次+日期）。
+   */
+  locateHint?: { hotelId: string; checkIn: string; checkOut: string; randomStarTier?: RandomStarTier | null };
   onClose: () => void;
   /** 换酒店成功后回传更新后的整单；关闭 + 刷新由调用方决定。 */
   onSwapped: (order: OrderSummary) => void;
@@ -129,13 +138,16 @@ export function HotelSwapModal({ orderId, item, locateHint, onClose, onSwapped }
       .then((r) => {
         if (cancelled) return;
         const matches = (r.order.items ?? []).filter((it) => {
+          if (dateOnly(it.hotelCheckIn) !== locateHint.checkIn || dateOnly(it.hotelCheckOut) !== locateHint.checkOut)
+            return false;
+          if (locateHint.randomStarTier != null) {
+            // 池下钻：定位池占房行（无房型、档次匹配）；hotelId 是合成键，不参与判定
+            return it.kind === 'HOTEL' && !it.hotelRoomTypeId && it.randomStarTier === locateHint.randomStarTier;
+          }
           const isHotelRow = it.kind === 'HOTEL' || (it.kind === 'BUNDLE' && Boolean(it.hotelRoomTypeId));
           if (!isHotelRow || !it.hotelRoomTypeId) return false;
           const meta = roomTypeMeta.get(it.hotelRoomTypeId);
-          if (!meta || meta.hotelId !== locateHint.hotelId) return false;
-          return (
-            dateOnly(it.hotelCheckIn) === locateHint.checkIn && dateOnly(it.hotelCheckOut) === locateHint.checkOut
-          );
+          return Boolean(meta && meta.hotelId === locateHint.hotelId);
         });
         const toHint = (it: (typeof matches)[number]): HotelSwapItemHint => ({
           id: it.id,
@@ -145,8 +157,9 @@ export function HotelSwapModal({ orderId, item, locateHint, onClose, onSwapped }
           hotelCheckOut: it.hotelCheckOut,
           roomsBilled: it.roomsBilled,
           quantity: it.quantity,
-          hotelName: it.hotelName,
+          hotelName: it.hotelName ?? (it.randomStarTier != null ? randomStarTierLabel(it.randomStarTier) : null),
           roomTypeName: it.roomTypeName,
+          randomStarTier: it.randomStarTier ?? null,
         });
         if (matches.length === 1) {
           setResolvedItem(toHint(matches[0]));
