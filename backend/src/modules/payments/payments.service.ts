@@ -585,7 +585,11 @@ export class PaymentsService {
       note?: string | null;
       // 对账认款来源标注（仅 receipts.allocate 传）：把「这笔收款来自对账认领的进账」结构化写进
       // gatewayPayload，供订单序列化透出 reconciled/receiptNo/externalTxnId 只读标注（收款列表徽标用）。
-      reconciliation?: { receiptNo: string; externalTxnId?: string | null };
+      //
+      // allocationId 是**撤销认款的定位键**：撤销时靠它一一对应地找回「本次认款生成的就是这一笔收款」，
+      // 不靠金额猜。调用方（receipts.allocate）先建 ReceiptAllocation 再入账，故恒可拿到 id；
+      // 历史数据无此键，撤销侧按 receiptNo + 金额兜底匹配。
+      reconciliation?: { receiptNo: string; externalTxnId?: string | null; allocationId?: string };
     },
     actor: { userId: string; role: UserRole },
     pendingFulfillmentTaskIds: string[],
@@ -641,6 +645,10 @@ export class PaymentsService {
                 source: 'reconciliation',
                 receiptNo: input.reconciliation.receiptNo,
                 externalTxnId: input.reconciliation.externalTxnId ?? null,
+                // 撤销认款的定位键（一笔认领 ↔ 一笔收款）；老数据为 undefined，撤销侧有兜底匹配。
+                ...(input.reconciliation.allocationId
+                  ? { allocationId: input.reconciliation.allocationId }
+                  : {}),
               }
             : {}),
         } as Prisma.InputJsonValue,

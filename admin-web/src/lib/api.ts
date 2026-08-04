@@ -1149,6 +1149,11 @@ export interface ListOrdersParams {
    * signed=已签证（任务已确认）；unsigned=未签证（含 VISA 行但任务未确认）。无 VISA 行订单两者都不命中。
    */
   visaFulfillmentStatus?: 'signed' | 'unsigned';
+  /**
+   * 行程类型 — oneway=只有去程（必须有航段，酒店单/签证单不算）；roundtrip=有回程。
+   * 后端走物化列 Order.hasReturnLeg 判定，与三模板导出的 tripType 同口径。
+   */
+  tripType?: 'oneway' | 'roundtrip';
   page?: number;
   pageSize?: number;
 }
@@ -2206,6 +2211,27 @@ export interface AllocateReceiptResult {
   };
 }
 
+/** POST /receipts/:id/allocations/:allocationId/reverse 返回（撤销认款，认领的逆操作） */
+export interface ReverseAllocationResult {
+  ok: true;
+  receiptId: string;
+  allocationId: string;
+  receiptNo: string;
+  reversedAmount: number;
+  remainingCny: string;
+  receiptStatus: ReceiptStatus;
+  order: {
+    orderId: string;
+    orderNumber: string;
+    paidAmount: number;
+    balanceDue: number;
+    status: OrderStatus;
+    stillFullyPaid: boolean;
+  };
+  /** 撤销后由「已结清」变回「有尾款」时的提示（订单状态/佣金/履约不回退）；否则 null */
+  warning: string | null;
+}
+
 /** POST /receipts/allocate-batch 单组入参（金额一对一吻合的建议组） */
 export interface AllocateBatchItem {
   receiptId: string;
@@ -2530,6 +2556,17 @@ export const api = {
   ) =>
     apiFetch<{ order: OrderSummary; warning?: string | null }>(`/orders/${orderId}/items/${itemId}/settlement-price`, {
       method: 'PATCH',
+      token,
+      body,
+    }),
+
+  // 售后升舱（ADMIN/STAFF）：把某条**经济舱**机票行就地升到商务舱。
+  // POST /orders/:orderId/items/:itemId/upgrade-cabin
+  // 差价由服务端按该航班的升舱差价源 × 人数权威计算——**请求体不接受金额**（不再手填）；
+  // 座位在同一事务里放经济舱、拿商务舱，商务舱余位不足则整单回滚并报错。订单状态不变。
+  upgradeItemCabin: (token: string, orderId: string, itemId: string, body: { note?: string } = {}) =>
+    apiFetch<{ order: OrderSummary }>(`/orders/${orderId}/items/${itemId}/upgrade-cabin`, {
+      method: 'POST',
       token,
       body,
     }),
@@ -3686,6 +3723,12 @@ export const api = {
       token,
       body: { items },
     }),
+  // 撤销认款：把某笔已认领的钱从订单撤回挂账池（原子对称；订单收款锁定/死单/已退款会被拒绝）
+  reverseReceiptAllocation: (token: string, receiptId: string, allocationId: string) =>
+    apiFetch<ReverseAllocationResult>(
+      `/receipts/${receiptId}/allocations/${allocationId}/reverse`,
+      { method: 'POST', token },
+    ),
   // 退款：把进账剩余金额标记退款（不可再认领）
   refundReceipt: (token: string, id: string, note: string) =>
     apiFetch<{ ok: true; receiptId: string; receiptNo: string; refundedRemainingCny: string; status: 'REFUNDED' }>(

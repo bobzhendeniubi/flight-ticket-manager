@@ -17,7 +17,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // ── 在 import OrderService 之前 mock 依赖（vi.mock 会被 hoist） ──
 const { mockPrisma } = vi.hoisted(() => {
   const prisma = {
-    order: { findUnique: vi.fn(), create: vi.fn() },
+    // update：syncOrderHasReturnLeg 在建单事务内回写物化列 hasReturnLeg
+    order: { findUnique: vi.fn(), create: vi.fn(), update: vi.fn() },
     orderItem: { findMany: vi.fn() },
     orderCostItem: { create: vi.fn() },
     user: { findUnique: vi.fn() },

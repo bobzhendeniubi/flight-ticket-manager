@@ -558,6 +558,9 @@ export const listOrdersQuerySchema = z.object({
   // 无 VISA 行的订单（列表签证列显示「—」）两个值都不命中，与徽标保持一致、不引入第三口径。
   // 注：这是履约进度口径，区别于订单录单字段 Order.visaStatus（VisaRequirement 枚举）。
   visaFulfillmentStatus: z.enum(['signed', 'unsigned']).optional(),
+  // 行程类型筛选：oneway=只有去程（且必须有航段，酒店单/签证单不算单程单）；roundtrip=有回程。
+  // 查询层走物化列 Order.hasReturnLeg（Prisma where 表达不了「关联行 ≥ 2 条」）。
+  tripType: z.enum(['oneway', 'roundtrip']).optional(),
   page: z.coerce.number().int().min(1).default(1),
   pageSize: z.coerce.number().int().min(1).max(200).default(50),
 });
@@ -824,6 +827,15 @@ export const rescheduleOrderBodySchema = z.object({
   note: z.string().max(500).optional(),
 });
 export type RescheduleOrderBody = z.infer<typeof rescheduleOrderBodySchema>;
+
+// ── 售后改单：升舱（经济舱 → 商务舱）───────────────────────────────────────
+// POST /orders/:id/items/:itemId/upgrade-cabin（ADMIN/STAFF）：把某条经济舱 FLIGHT 行升到商务舱。
+// 目标舱固定商务舱、差价由服务端按航班的升舱差价源 × 人数权威计算——**请求体里不接受任何金额**，
+// 运营手填差价的老路（借改期表单填「改期费」）到此为止。
+export const upgradeItemCabinBodySchema = z.object({
+  note: z.string().max(500).optional(),
+});
+export type UpgradeItemCabinBody = z.infer<typeof upgradeItemCabinBodySchema>;
 
 // ── 售后改单：换人（passenger swap）─────────────────────────────────────────
 // PATCH /orders/:id/passengers/:passengerId（ADMIN/STAFF）：就地改出行人身份 + 可选重置开票/签证 + 换人费。

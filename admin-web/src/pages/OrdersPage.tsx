@@ -496,7 +496,7 @@ export function OrdersPage() {
   }, [orders]);
 
   // 票务快捷面板预览（票务反馈 T4）：面板打开且未勾选订单时，出发日期/航段/开票状态/航班号/
-  // 订单类型任一变化，400ms 防抖后查一次匹配数——面板本身不参与主列表筛选，之前完全没有反馈。
+  // 订单类型/行程类型任一变化，400ms 防抖后查一次匹配数——面板本身不参与主列表筛选，之前完全没有反馈。
   useEffect(() => {
     if (!showTicketingQuick || !tokens?.accessToken) return;
     if (selectedIds.size > 0) {
@@ -521,6 +521,8 @@ export function OrdersPage() {
       const trimmedFlightNumber = tkFlightNumber.trim();
       if (trimmedFlightNumber) query.flightNumber = trimmedFlightNumber;
       if (tkKind) query.kind = tkKind;
+      // 行程类型也要带上，否则预览数与实际导出数会对不上（导出按 tripType 收口，预览不收口）。
+      if (tkTripType) query.tripType = tkTripType;
       api.listOrders(tokens.accessToken as string, query)
         .then((res) => {
           if (cancelled) return;
@@ -539,7 +541,7 @@ export function OrdersPage() {
         });
     }, 400);
     return () => { cancelled = true; clearTimeout(t); };
-  }, [showTicketingQuick, tokens?.accessToken, tkDate, tkLeg, tkInvoiced, tkFlightNumber, tkKind, selectedIds]);
+  }, [showTicketingQuick, tokens?.accessToken, tkDate, tkLeg, tkInvoiced, tkFlightNumber, tkKind, tkTripType, selectedIds]);
 
   // 视图层把 OrderSummary 映射成便于筛选/展示的数据
   const ordersView = useMemo(
@@ -4044,7 +4046,10 @@ function OrderItemRow({
   const [rescheduling, setRescheduling] = useState(false);
   const [editingPrice, setEditingPrice] = useState(false);
   const [swappingHotel, setSwappingHotel] = useState(false);
+  const [upgradingCabin, setUpgradingCabin] = useState(false);
   const isFlight = item.kind === 'FLIGHT';
+  // 升舱入口：只有**经济舱**机票行能一键升商务舱；套餐机票腿（带 bundleId）走套餐自身的升舱份数模型，后端也会拒。
+  const canUpgradeCabin = isFlight && item.flightCabin === 'ECONOMY' && !item.bundleId;
   // HOTEL 行，或已盖章酒店房型的 BUNDLE 行（套餐没有独立 HOTEL 行，酒店盖在 BUNDLE 行上）
   const isHotelRow = item.kind === 'HOTEL' || (item.kind === 'BUNDLE' && Boolean(item.hotelRoomTypeId));
   // 航变：管理员因航变换过班次的机票行，标红醒目提示，悬浮看原班次→新班次
@@ -4111,12 +4116,21 @@ function OrderItemRow({
           {item.amount != null && (
             <div className="nums text-sm font-medium text-ink">¥{Number(item.amount).toLocaleString()}</div>
           )}
-          {isFlight && !rescheduling && !editingPrice && (
+          {isFlight && !rescheduling && !editingPrice && !upgradingCabin && (
             <button
               className="text-[11px] font-medium text-brand hover:text-brand-dark"
               onClick={() => setRescheduling(true)}
             >
               改期
+            </button>
+          )}
+          {canUpgradeCabin && !rescheduling && !editingPrice && !upgradingCabin && (
+            <button
+              className="text-[11px] font-medium text-indigo-600 hover:text-indigo-800"
+              onClick={() => setUpgradingCabin(true)}
+              title="按航班配置的升舱差价自动计费，无需手填"
+            >
+              升舱
             </button>
           )}
           {isFlight && canEditSettlementPrice && !rescheduling && !editingPrice && (
@@ -4149,6 +4163,17 @@ function OrderItemRow({
           onCancel={() => setRescheduling(false)}
           onSaved={(updated) => {
             setRescheduling(false);
+            onOrderUpdated?.(updated);
+          }}
+        />
+      )}
+      {canUpgradeCabin && upgradingCabin && (
+        <CabinUpgradePanel
+          orderId={orderId}
+          item={item}
+          onCancel={() => setUpgradingCabin(false)}
+          onUpgraded={(updated) => {
+            setUpgradingCabin(false);
             onOrderUpdated?.(updated);
           }}
         />
@@ -4187,6 +4212,123 @@ function OrderItemRow({
         />
       )}
     </li>
+  );
+}
+
+// ── 升舱（经济舱 → 商务舱）：差价由服务端按航班配置 × 人数算，运营不手填 ──────
+function CabinUpgradePanel({
+  orderId,
+  item,
+  onCancel,
+  onUpgraded,
+}: {
+  orderId: string;
+  item: OrderItem;
+  onCancel: () => void;
+  onUpgraded: (order: OrderSummary) => void;
+}) {
+  const tokens = useAuth((s) => s.tokens);
+  const token = tokens?.accessToken ?? '';
+  // 每人每航段差价：从航班列表按航班号 + 航线取（与后端同一个配置源，不为取价新开接口）。
+  // 取不到（老单缺航班号 / 列表加载失败）时只展示「以服务端计算为准」，不猜金额。
+  const [perLegCny, setPerLegCny] = useState<number | null>(null);
+  const [priceLoading, setPriceLoading] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
+  const [note, setNote] = useState('');
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    setPriceLoading(true);
+    api.listAllFlights(token)
+      .then((r) => {
+        if (cancelled) return;
+        const matched = r.flights.find(
+          (f) =>
+            f.flightNumber === item.flightNumber &&
+            (!item.route || `${f.originCode}→${f.destinationCode}` === item.route),
+        );
+        setPerLegCny(matched ? matched.businessUpgradeCnyPerLeg : null);
+      })
+      .catch(() => { if (!cancelled) setPerLegCny(null); })
+      .finally(() => { if (!cancelled) setPriceLoading(false); });
+    return () => { cancelled = true; };
+  }, [token, item.flightNumber, item.route]);
+
+  const pax = item.quantity;
+  const totalCny = perLegCny != null ? perLegCny * pax : null;
+
+  const submit = async () => {
+    if (!token || submitting) return;
+    setErr(null);
+    const amountHint = totalCny != null ? `差价 ¥${totalCny.toLocaleString()}` : '差价以服务端计算为准';
+    if (!confirm(`确认把该航段升为商务舱？${amountHint}，将计入订单应收；座位会从经济舱移到商务舱（余位不足会被拒绝）。`)) return;
+    setSubmitting(true);
+    try {
+      const res = await api.upgradeItemCabin(token, orderId, item.id, {
+        note: note.trim() || undefined,
+      });
+      onUpgraded(res.order);
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : '升舱失败');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="mt-3 space-y-2 rounded-md border border-indigo-300 bg-white p-3 text-xs">
+      <div className="font-medium text-indigo-700">
+        升舱 · 当前：{item.description}
+        {item.flightCabin && ` · ${CABIN_ZH[item.flightCabin] ?? item.flightCabin}`} → 商务舱
+      </div>
+
+      <div className="rounded bg-indigo-50/70 px-2 py-1.5 leading-relaxed text-indigo-900">
+        {priceLoading ? (
+          '正在读取该航班的升舱差价…'
+        ) : totalCny != null && perLegCny != null ? (
+          <>
+            每人每航段 ¥{perLegCny.toLocaleString()} × {pax}人 ={' '}
+            <span className="font-semibold">¥{totalCny.toLocaleString()}</span>
+          </>
+        ) : (
+          <>差价按该航班配置的升舱差价 × {pax}人 计算，<span className="font-semibold">以服务端计算为准</span>。</>
+        )}
+        <div className="mt-0.5 text-[11px] text-indigo-700/80">
+          金额由系统按航班配置自动计算，不需要手填；差价单独记一条「升舱/改期」收入行，订单状态不变。
+        </div>
+      </div>
+
+      <label className="block">
+        <span className="text-slate-500">备注（可选）</span>
+        <input
+          className="mt-0.5 w-full rounded border border-slate-300 px-2 py-1"
+          value={note}
+          onChange={(e) => setNote(e.target.value)}
+          placeholder="如：客户加钱升舱"
+        />
+      </label>
+
+      {err && <div className="rounded bg-red-50 px-2 py-1 text-red-700">{err}</div>}
+
+      <div className="flex gap-2 pt-1">
+        <button
+          className="flex-1 rounded bg-indigo-600 px-2 py-1.5 font-medium text-white disabled:opacity-50"
+          onClick={submit}
+          disabled={submitting}
+        >
+          {submitting ? '升舱中…' : '确认升舱'}
+        </button>
+        <button
+          className="rounded bg-slate-100 px-3 py-1.5 text-slate-700 disabled:opacity-50"
+          onClick={onCancel}
+          disabled={submitting}
+        >
+          取消
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -4308,6 +4450,9 @@ function RescheduleForm({
             <option key={c.id} value={c.cabin}>{CABIN_ZH[c.cabin] ?? c.cabin}</option>
           ))}
         </select>
+        <span className="mt-0.5 block text-[11px] leading-snug text-slate-500">
+          仅升舱请用「升舱」按钮（自动按差价源计费）；这里的舱位用于航变换班次时同步调整舱位。
+        </span>
       </label>
 
       <label className="block">
@@ -7759,17 +7904,23 @@ function ConfirmPaymentSection({
 
         {/* 多付 → 转挂账池（散客 / 代理均可；钱进收款对账台待认领） */}
         {overpaid && (
-          <div className="mt-2 flex items-center justify-between gap-2 rounded-md border border-amber-200 bg-amber-50 px-2 py-1.5 text-xs">
-            <span className="text-amber-800">
-              多付 ¥{Math.abs(balance).toLocaleString()} 可转挂账池（在收款对账台待认领）
-            </span>
-            <button
-              className="btn-secondary text-xs px-2 py-1 disabled:opacity-50"
-              onClick={moveToPool}
-              disabled={submitting}
-            >
-              转挂账池
-            </button>
+          <div className="mt-2 rounded-md border border-amber-200 bg-amber-50 px-2 py-1.5 text-xs">
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-amber-800">
+                多付 ¥{Math.abs(balance).toLocaleString()} 可转挂账池（在收款对账台待认领）
+              </span>
+              <button
+                className="btn-secondary text-xs px-2 py-1 disabled:opacity-50"
+                onClick={moveToPool}
+                disabled={submitting}
+              >
+                转挂账池
+              </button>
+            </div>
+            {/* 「A 单多付抵 B 单少付」的规范走法引导：不在订单上直接加减，走挂账池留痕可撤销 */}
+            <p className="mt-1 text-amber-700">
+              多付可转挂账池，再到收款对账台认领给其他订单（全程留痕，认错了可撤销）。
+            </p>
           </div>
         )}
 
@@ -7787,11 +7938,24 @@ function ConfirmPaymentSection({
         {payments.length > 0 && (
           <ul className="mt-2 space-y-1 border-t border-slate-100 pt-2">
             {payments.map((p) => (
-              <li key={p.id} className="flex items-center gap-2 text-xs text-slate-600">
+              <li
+                key={p.id}
+                className={`flex items-center gap-2 text-xs ${
+                  // 已冲销（撤销认款 / 迟到回调原路退回）：这笔钱不再计入本单实收，划掉以免被当成还在账上
+                  p.status === 'REFUNDED' ? 'text-slate-400 line-through' : 'text-slate-600'
+                }`}
+              >
                 <span>{PAYMENT_METHOD_LABEL[p.method] ?? p.method}</span>
                 <span className="font-medium">¥{Number(p.amount).toLocaleString()}</span>
                 <span className="text-slate-400">{p.paidAt ? new Date(p.paidAt).toLocaleDateString('zh-CN') : ''}</span>
-                {p.reconciled ? (
+                {p.status === 'REFUNDED' ? (
+                  <span
+                    className="inline-flex items-center rounded bg-slate-200 px-1.5 py-0.5 font-medium text-slate-600 no-underline"
+                    title="这笔收款已冲销，不再计入本单已付"
+                  >
+                    已冲销
+                  </span>
+                ) : p.reconciled ? (
                   <span
                     className="inline-flex items-center rounded bg-emerald-100 px-1.5 py-0.5 font-medium text-emerald-700"
                     title="来自收款对账台认款的进账"

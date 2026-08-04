@@ -4,6 +4,7 @@
  * 业务：公司用统一收款码收钱，财务在后台手动对账。
  *   - 登记进账（register）→ OPEN Receipt 进挂账池
  *   - 认领（allocate）→ 把进账的钱记到某订单（复用人工确认收款入账内核，原子）
+ *   - 撤销认款（reverseAllocation）→ 认领的镜像：钱从订单撤回挂账池，留痕可追溯
  *   - 退款（refund）→ 把剩余未认领部分标 REFUNDED
  *   - 总账（ledger）→ 读时合并 Receipts + 近期订单 Payments，一处看所有进账
  *
@@ -25,8 +26,12 @@ import {
 } from '@prisma/client';
 import { randomBytes } from 'node:crypto';
 import { prisma } from '../../db/prisma.js';
-import { BadRequestError, NotFoundError } from '../../lib/errors.js';
-import { FUNDS_CREDIT_BLOCKED_STATUSES } from '../../lib/funds-guard.js';
+import { BadRequestError, ConflictError, NotFoundError } from '../../lib/errors.js';
+import {
+  FUNDS_CREDIT_BLOCKED_STATUSES,
+  assertOrderAllowsFundsDisposal,
+  sumCompletedRefundsWithinTx,
+} from '../../lib/funds-guard.js';
 import { writeAudit } from '../../lib/audit.js';
 import { PaymentsService } from '../payments/payments.service.js';
 import { earliestFlightDeparture } from '../orders/pnr-export.js';
@@ -151,6 +156,74 @@ export async function createOpenReceiptWithinTx(
       externalTxnId: data.externalTxnId ?? null,
     },
   });
+}
+
+/** 认领入账时写进 Payment.note 的前缀（旧数据只有它可作来源线索）。 */
+const RECONCILE_NOTE_PREFIX = '对账认领 ';
+
+/**
+ * 找回「这笔认领当初入账生成的那一笔收款」——撤销认款的定位环节。
+ *
+ *   1) 新数据：gatewayPayload.allocationId 精确命中，一一对应，零歧义。
+ *   2) 历史数据（认领时还没写 allocationId）：同订单 + SUCCEEDED + 金额相等 + 来源是同一张进账
+ *      （gatewayPayload.receiptNo，或旧 note「对账认领 RCP…」），且**本身不带 allocationId**
+ *      （带的属于另一条明确的认领，绝不误冲）。多条候选取入账时间最接近认领时间的一笔——
+ *      同进账同订单同金额的多笔在账面上完全等价，冲哪一笔结果相同。
+ *
+ * 找不到 → null，调用方拒绝撤销。宁可拒绝也不硬扣订单已付。
+ */
+async function findAllocationPaymentWithinTx(
+  tx: Prisma.TransactionClient,
+  key: {
+    allocationId: string;
+    orderId: string;
+    receiptNo: string;
+    amount: number;
+    allocatedAt: Date;
+  },
+): Promise<{ id: string; gatewayPayload: Prisma.JsonValue | null } | null> {
+  const exact = await tx.payment.findFirst({
+    where: {
+      orderId: key.orderId,
+      status: 'SUCCEEDED',
+      gatewayPayload: { path: ['allocationId'], equals: key.allocationId },
+    },
+    select: { id: true, gatewayPayload: true },
+  });
+  if (exact) return exact;
+
+  // 兜底：金额 + 进账流水号匹配（历史认款）
+  const candidates = await tx.payment.findMany({
+    where: {
+      orderId: key.orderId,
+      status: 'SUCCEEDED',
+      amount: new Prisma.Decimal(key.amount),
+    },
+    select: { id: true, gatewayPayload: true, createdAt: true },
+  });
+  const matched = candidates.filter((p) => {
+    const payload =
+      p.gatewayPayload && typeof p.gatewayPayload === 'object' && !Array.isArray(p.gatewayPayload)
+        ? (p.gatewayPayload as Record<string, unknown>)
+        : null;
+    if (!payload) return false;
+    // 已绑定到某条认领的收款不参与兜底匹配（那是别人的钱，只能被它自己的认领撤销）
+    if (typeof payload.allocationId === 'string') return false;
+    if (payload.source === 'reconciliation' && payload.receiptNo === key.receiptNo) return true;
+    return (
+      typeof payload.note === 'string' &&
+      payload.note.startsWith(RECONCILE_NOTE_PREFIX) &&
+      payload.note.slice(RECONCILE_NOTE_PREFIX.length).trim() === key.receiptNo
+    );
+  });
+  if (matched.length === 0) return null;
+  const nearest = matched.reduce((best, p) =>
+    Math.abs(p.createdAt.getTime() - key.allocatedAt.getTime()) <
+    Math.abs(best.createdAt.getTime() - key.allocatedAt.getTime())
+      ? p
+      : best,
+  );
+  return { id: nearest.id, gatewayPayload: nearest.gatewayPayload };
 }
 
 type ReceiptWithAllocations = Receipt & { allocations: ReceiptAllocation[] };
@@ -366,6 +439,18 @@ export class ReceiptsService {
         );
       }
 
+      // 先写认领明细、再入账：这样收款记录的 gatewayPayload 能带上 allocationId，
+      // 「一笔认领 ↔ 一笔收款」一一对应，撤销时精确定位、不靠金额猜。
+      // 两步同在本事务内，入账失败整体回滚，先写不会留下孤儿认领行。
+      const allocation = await tx.receiptAllocation.create({
+        data: {
+          receiptId,
+          orderId: input.orderId,
+          amountCny: new Prisma.Decimal(apply),
+          createdById: actor.userId,
+        },
+      });
+
       // 复用人工确认收款入账内核（同一行锁/上限/累加/PAID 翻转口径）
       const credit = await this.paymentsService._creditOrderPaymentWithinTx(
         tx,
@@ -377,21 +462,15 @@ export class ReceiptsService {
           note: `对账认领 ${receipt.receiptNo}`,
           // 结构化认款来源：把进账流水号一并写进收款记录（保留 note 兼容旧数据），
           // 订单序列化据此标注该行为「已认款 · 流水…」。
-          reconciliation: { receiptNo: receipt.receiptNo, externalTxnId: receipt.externalTxnId },
+          reconciliation: {
+            receiptNo: receipt.receiptNo,
+            externalTxnId: receipt.externalTxnId,
+            allocationId: allocation.id,
+          },
         },
         actor,
         pendingFulfillmentTaskIds,
       );
-
-      // 写认领明细
-      await tx.receiptAllocation.create({
-        data: {
-          receiptId,
-          orderId: input.orderId,
-          amountCny: new Prisma.Decimal(apply),
-          createdById: actor.userId,
-        },
-      });
 
       // 扣减剩余 + 重算状态
       const newAllocated = round2(allocated + apply);
@@ -516,6 +595,205 @@ export class ReceiptsService {
       ok: true as const,
       results,
       summary: { total: results.length, succeeded, failed: results.length - succeeded },
+    };
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  // 撤销认款（认领的逆操作，原子、对称、留痕）
+  // ════════════════════════════════════════════════════════════════════
+  /**
+   * 把一笔已认领的钱从订单上撤回挂账池 —— allocate 的镜像。
+   *
+   * 一个事务里：进账行锁 → 取认领明细 → 订单行锁 + 资金处置闸 → 定位当初入账生成的那笔收款
+   * → 收款 CAS 冲销（SUCCEEDED→REFUNDED，幂等）→ 订单 paidAmount 减回 → 删认领明细
+   * → 进账 allocatedCny 减回 + 状态重算（OPEN / PARTIALLY_ALLOCATED）。任一步失败整体回滚。
+   *
+   * 拒绝（宁可拒绝，也不出脏账）：
+   *   - 进账已退款（REFUNDED）：剩余部分已按退款口径处置，再塞钱回来对不上退款金额。
+   *   - 订单在资金处置闸内（死单 / 回收站 / 退款申请中）—— 与「多付转挂账池」同一道闸，
+   *     撤销认款同样是「把钱从订单上拿走」，口径必须一致。
+   *   - 订单收款已锁定（paymentsLocked）：财务复核已完成，先解锁再撤。
+   *   - 找不到当初那笔收款 / 收款已不是 SUCCEEDED（已撤过）：无法对称回退 → 拒绝（重复撤销天然被此闸挡住）。
+   *   - 撤销后订单已付会变负，或低于该单已完成退款额（账面倒挂）。
+   *
+   * 不动的东西（撤销只回退资金，不回退履约）：订单状态、佣金、履约任务保持原样。
+   * 若撤销后订单由「已结清」变回「有尾款」，返回 warning 告知，由财务据实跟进
+   *（与改期费加价后 PAID 单重新出现尾款是同一种既有状态，不是新脏账）。
+   */
+  async reverseAllocation(
+    receiptId: string,
+    allocationId: string,
+    actor: { userId: string; role: UserRole },
+  ) {
+    const result = await prisma.$transaction(async (tx) => {
+      // 进账行锁：与 allocate / refund 同一把锁，撤销与并发认领串行
+      const rows = await tx.$queryRaw<
+        Array<{ id: string; receiptNo: string; amountCny: Prisma.Decimal; allocatedCny: Prisma.Decimal; status: ReceiptStatus }>
+      >`SELECT id, "receiptNo", "amountCny", "allocatedCny", status FROM "Receipt" WHERE id = ${receiptId} FOR UPDATE`;
+      const receipt = rows[0];
+      if (!receipt) throw new NotFoundError('进账不存在');
+      if (receipt.status === ReceiptStatus.REFUNDED) {
+        throw new BadRequestError(
+          `进账 ${receipt.receiptNo} 已标记退款，剩余部分按退款口径处置过了，不能再撤销认款（撤回的钱与已退金额会对不上）。请人工核对后处理。`,
+        );
+      }
+
+      const allocation = await tx.receiptAllocation.findUnique({ where: { id: allocationId } });
+      // 已撤销的认领明细会被删除，重复撤销落在这里 → 幂等拒绝
+      if (!allocation || allocation.receiptId !== receiptId) {
+        throw new NotFoundError('认款记录不存在或已撤销');
+      }
+      const amount = round2(Number(allocation.amountCny));
+
+      // 订单行锁 + 事务内读最新 paidAmount（与人工收款/认领/抵扣同一并发安全口径）
+      const orderRows = await tx.$queryRaw<
+        Array<{ id: string; orderNumber: string; total: Prisma.Decimal; adjustmentCny: number; paidAmount: Prisma.Decimal; prepaymentOffset: Prisma.Decimal; status: OrderStatus; deletedAt: Date | null; paymentsLocked: boolean }>
+      >`SELECT id, "orderNumber", total, "adjustmentCny", "paidAmount", "prepaymentOffset", status, "deletedAt", "paymentsLocked" FROM "Order" WHERE id = ${allocation.orderId} FOR UPDATE`;
+      const order = orderRows[0];
+      if (!order) throw new NotFoundError('该认款对应的订单不存在');
+      // 资金处置闸：与「多付转挂账池」同源——把钱从订单上拿走，死单/回收站/退款申请中一律不许。
+      assertOrderAllowsFundsDisposal(order, '撤销认款');
+      if (order.paymentsLocked) {
+        throw new ConflictError(
+          `订单 ${order.orderNumber} 收款已锁定（财务复核完成），请先在订单收款区解锁再撤销认款`,
+        );
+      }
+
+      // 定位当初入账生成的那笔收款；找不到 → 拒绝（不猜、不硬扣）
+      const payment = await findAllocationPaymentWithinTx(tx, {
+        allocationId,
+        orderId: allocation.orderId,
+        receiptNo: receipt.receiptNo,
+        amount,
+        allocatedAt: allocation.createdAt,
+      });
+      if (!payment) {
+        throw new BadRequestError(
+          `找不到本次认款在订单 ${order.orderNumber} 上生成的收款记录（可能已被撤销或人工调整过），无法对称撤销。请财务核对订单收款明细后处理。`,
+        );
+      }
+
+      const paid = Number(order.paidAmount);
+      const newPaid = round2(paid - amount);
+      if (newPaid < -0.001) {
+        throw new BadRequestError(
+          `订单 ${order.orderNumber} 当前已付 ¥${paid.toFixed(2)}，不足以撤销本笔认款 ¥${amount.toFixed(2)}（撤销后会变负），已拒绝。`,
+        );
+      }
+      // 已完成退款倒挂闸：撤销后「已付」不得低于「已退给客户」，否则账面上退出去的比收进来的多。
+      const refundedTotal = await sumCompletedRefundsWithinTx(tx, order.id);
+      if (refundedTotal > 0 && newPaid + 0.001 < refundedTotal) {
+        throw new BadRequestError(
+          `订单 ${order.orderNumber} 已完成退款 ¥${refundedTotal.toFixed(2)}，撤销本笔认款后已付将降到 ¥${Math.max(0, newPaid).toFixed(2)}，低于已退金额（账目倒挂），已拒绝。请先处理退款再撤销认款。`,
+        );
+      }
+
+      // 收款冲销：CAS 只动 SUCCEEDED —— 并发重复撤销/已被别处冲销过 → count≠1 直接拒绝。
+      // 用 REFUNDED（枚举内唯一表示「这笔钱不再算这张单的实收」的终态）；总账只统计 SUCCEEDED，
+      // 冲销后自然从订单实收与总账里退出，原始载荷 + 撤销痕迹一并留在 gatewayPayload 里可追溯。
+      const basePayload =
+        payment.gatewayPayload && typeof payment.gatewayPayload === 'object' && !Array.isArray(payment.gatewayPayload)
+          ? (payment.gatewayPayload as Record<string, unknown>)
+          : {};
+      const cas = await tx.payment.updateMany({
+        where: { id: payment.id, status: 'SUCCEEDED' },
+        data: {
+          status: 'REFUNDED',
+          gatewayPayload: {
+            ...basePayload,
+            reversed: true,
+            reversedAt: new Date().toISOString(),
+            reversedBy: actor.userId,
+            reversedAllocationId: allocationId,
+            reversedReceiptNo: receipt.receiptNo,
+          } as Prisma.InputJsonValue,
+        },
+      });
+      if (cas.count !== 1) {
+        throw new ConflictError('该笔认款已被撤销或状态已变更，请刷新后重试');
+      }
+
+      await tx.order.update({
+        where: { id: order.id },
+        data: { paidAmount: new Prisma.Decimal(Math.max(0, newPaid)) },
+      });
+      await tx.receiptAllocation.delete({ where: { id: allocationId } });
+
+      // 进账剩余额回补 + 状态重算（与 allocate 的加法完全对称）
+      const newAllocated = Math.max(0, round2(Number(receipt.allocatedCny) - amount));
+      const newStatus =
+        newAllocated <= 0.001 ? ReceiptStatus.OPEN : ReceiptStatus.PARTIALLY_ALLOCATED;
+      await tx.receipt.update({
+        where: { id: receiptId },
+        data: { allocatedCny: new Prisma.Decimal(newAllocated), status: newStatus },
+      });
+
+      // 清账口径（与 serializeOrder.balanceDue / 收款内核一字一致）
+      const effectivePayable = round2(Number(order.total) + order.adjustmentCny);
+      const prepaymentOffset = Number(order.prepaymentOffset);
+      const wasFullyPaid = paid + prepaymentOffset + 0.001 >= effectivePayable;
+      const stillFullyPaid = newPaid + prepaymentOffset + 0.001 >= effectivePayable;
+
+      return {
+        receiptNo: receipt.receiptNo,
+        reversedAmount: amount,
+        newAllocatedCny: newAllocated,
+        remainingCny: round2(Number(receipt.amountCny) - newAllocated),
+        receiptStatus: newStatus,
+        paymentId: payment.id,
+        orderId: order.id,
+        orderNumber: order.orderNumber,
+        orderStatus: order.status,
+        orderPaidAmount: Math.max(0, newPaid),
+        orderBalanceDue: round2(effectivePayable - newPaid - prepaymentOffset),
+        wasFullyPaid,
+        stillFullyPaid,
+      };
+    });
+
+    void writeAudit({
+      actor: { userId: actor.userId, role: actor.role },
+      action: 'REVERSE_RECEIPT_ALLOCATION',
+      targetType: 'ORDER',
+      targetId: result.orderId,
+      targetLabel: result.orderNumber,
+      after: {
+        receiptId,
+        allocationId,
+        receiptNo: result.receiptNo,
+        reversedAmount: result.reversedAmount,
+        paymentId: result.paymentId,
+        orderPaidAmount: result.orderPaidAmount,
+        orderBalanceDue: result.orderBalanceDue,
+        orderStatus: result.orderStatus,
+        receiptStatus: result.receiptStatus,
+        wasFullyPaid: result.wasFullyPaid,
+        stillFullyPaid: result.stillFullyPaid,
+      },
+      severity: 'CRITICAL',
+    });
+
+    return {
+      ok: true as const,
+      receiptId,
+      allocationId,
+      receiptNo: result.receiptNo,
+      reversedAmount: result.reversedAmount,
+      remainingCny: result.remainingCny.toFixed(2),
+      receiptStatus: result.receiptStatus,
+      order: {
+        orderId: result.orderId,
+        orderNumber: result.orderNumber,
+        paidAmount: result.orderPaidAmount,
+        balanceDue: result.orderBalanceDue,
+        status: result.orderStatus,
+        stillFullyPaid: result.stillFullyPaid,
+      },
+      // 撤销只回退资金，不回退订单状态/佣金/履约。由「已结清」变回「有尾款」时明说，让财务跟进。
+      warning:
+        result.wasFullyPaid && !result.stillFullyPaid
+          ? `订单 ${result.orderNumber} 撤销后重新产生尾款 ¥${result.orderBalanceDue.toFixed(2)}，订单状态仍为原状态（佣金与履约任务不回退），请据实跟进收款。`
+          : null,
     };
   }
 

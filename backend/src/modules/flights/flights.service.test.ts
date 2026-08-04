@@ -699,33 +699,34 @@ describe('FlightService.updateSchedule', () => {
 
   // ── 超售录入：航司减配/换机型把真实容量压到已售之下，运营必须能录进来 ─────────
   // 销售侧不受影响（下单扣座是 sold+qty+locked ≤ capacity 的原子 CAS，只会更早拒卖）。
-  it('容量低于已售：允许写库（账面超售），不再抛 400', async () => {
+  // 上限内（默认 FLIGHT_MAX_OVERSELL_SEATS=5）：容量 26 < 已售 30 → 超售 4 座，放行。
+  it('容量低于已售但超售在上限内：允许写库（账面超售），不再抛 400', async () => {
     prismaMock.flightSchedule.findUnique.mockResolvedValue(baseSchedule()); // sold = 30
     const after = baseSchedule();
-    after.seatClasses[0].capacity = 20;
+    after.seatClasses[0].capacity = 26;
     prismaMock.flightSchedule.findUniqueOrThrow.mockResolvedValue(after);
 
     const result = await service.updateSchedule('sched_1', {
-      seatClasses: [{ cabin: 'ECONOMY', capacity: 20 }],
+      seatClasses: [{ cabin: 'ECONOMY', capacity: 26 }],
     });
 
     expect(prismaMock.flightSeatClass.update).toHaveBeenCalledWith({
       where: { id: 'sc_eco' },
-      data: { capacity: 20 },
+      data: { capacity: 26 },
     });
-    // 容量 20 < 已售 30：账面欠 10 座，返回体如实回报两个数字
-    expect(result.seatClasses[0]).toMatchObject({ cabin: 'ECONOMY', capacity: 20, sold: 30 });
+    // 容量 26 < 已售 30：账面欠 4 座（≤ 上限 5），返回体如实回报两个数字
+    expect(result.seatClasses[0]).toMatchObject({ cabin: 'ECONOMY', capacity: 26, sold: 30 });
   });
 
-  it('容量低于已售：写一条 WARNING 审计（含超售张数），可追溯到人和时点', async () => {
+  it('容量低于已售但超售在上限内：写一条 WARNING 审计（含超售张数），可追溯到人和时点', async () => {
     prismaMock.flightSchedule.findUnique.mockResolvedValue(baseSchedule()); // capacity 200 / sold 30
     const after = baseSchedule();
-    after.seatClasses[0].capacity = 20;
+    after.seatClasses[0].capacity = 26;
     prismaMock.flightSchedule.findUniqueOrThrow.mockResolvedValue(after);
 
     await service.updateSchedule(
       'sched_1',
-      { seatClasses: [{ cabin: 'ECONOMY', capacity: 20 }] },
+      { seatClasses: [{ cabin: 'ECONOMY', capacity: 26 }] },
       { userId: 'u1', label: '运营账号' },
     );
 
@@ -735,9 +736,23 @@ describe('FlightService.updateSchedule', () => {
         severity: 'WARNING',
         actorUserId: 'u1',
         before: { seatClasses: [{ cabin: 'ECONOMY', capacity: 200, sold: 30 }] },
-        after: { seatClasses: [{ cabin: 'ECONOMY', capacity: 20, sold: 30, oversoldBy: 10 }] },
+        after: { seatClasses: [{ cabin: 'ECONOMY', capacity: 26, sold: 30, oversoldBy: 4 }] },
       }),
     });
+  });
+
+  // ── 超售上限守卫（拍板：超售必须有上限，防止手滑，如把 186 敲成 18）─────────
+  it('超售超过上限（默认 5）：拒绝写入（400），不落库、不写审计', async () => {
+    prismaMock.flightSchedule.findUnique.mockResolvedValue(baseSchedule()); // capacity 200 / sold 30
+
+    await expect(
+      service.updateSchedule('sched_1', {
+        seatClasses: [{ cabin: 'ECONOMY', capacity: 20 }], // 超售 10 座 > 上限 5
+      }),
+    ).rejects.toThrow(/超过上限/);
+
+    expect(prismaMock.flightSeatClass.update).not.toHaveBeenCalled();
+    expect(prismaMock.auditLog.create).not.toHaveBeenCalled();
   });
 
   it('容量不低于已售：不写超售审计（正常缩容不该噪声告警）', async () => {
@@ -1341,7 +1356,8 @@ describe('FlightService.batchDeleteSchedules', () => {
 });
 
 // ── batchUpdateCapacity（按 scheduleId 列表批量改容量）───────────────────────
-// 与 updateSchedule 同口径：容量可以压到已售之下，这类舱位照改并进 oversold 明细。
+// 与 updateSchedule 同口径：容量可以压到已售之下，这类舱位照改并进 oversold 明细，
+// 但超售张数超过上限（FLIGHT_MAX_OVERSELL_SEATS，默认 5）的班次整条进 skipped。
 // 不存在的班次 / 没有该舱位都不算失败，只是不产生变更（前者进 skipped，后者对该班次
 // 静默跳过这一项）。
 describe('FlightService.batchUpdateCapacity', () => {
@@ -1463,9 +1479,9 @@ describe('FlightService.batchUpdateCapacity', () => {
     });
   });
 
-  it('整批都超售：全部照改，oversold 逐条列出欠几座（运营据此逐班协调）', async () => {
+  it('整批都超售但都在上限内：全部照改，oversold 逐条列出欠几座（运营据此逐班协调）', async () => {
     prismaMock.flightSchedule.findMany.mockResolvedValue([
-      { id: 'sched_a', seatClasses: [{ id: 'sc_a', cabin: 'BUSINESS', capacity: 20, sold: 15 }] },
+      { id: 'sched_a', seatClasses: [{ id: 'sc_a', cabin: 'BUSINESS', capacity: 20, sold: 12 }] },
       { id: 'sched_b', seatClasses: [{ id: 'sc_b', cabin: 'BUSINESS', capacity: 20, sold: 10 }] },
     ]);
 
@@ -1479,9 +1495,41 @@ describe('FlightService.batchUpdateCapacity', () => {
       applied: 2,
       skipped: [],
       oversold: [
-        { scheduleId: 'sched_a', cabin: 'BUSINESS', sold: 15, capacity: 7, oversoldBy: 8 },
+        { scheduleId: 'sched_a', cabin: 'BUSINESS', sold: 12, capacity: 7, oversoldBy: 5 },
         { scheduleId: 'sched_b', cabin: 'BUSINESS', sold: 10, capacity: 7, oversoldBy: 3 },
       ],
     });
+  });
+
+  // ── 超售上限守卫（批量路径）：超限班次进 skipped，不拖累批次里其它班次 ─────────
+  it('超售超过上限（默认 5）的班次进 skipped 带原因，不整批失败（其它班次照常应用）', async () => {
+    prismaMock.flightSchedule.findMany.mockResolvedValue([
+      // 超售 8 座 > 上限 5 → 整条不改，进 skipped
+      { id: 'sched_over', seatClasses: [{ id: 'sc_over', cabin: 'BUSINESS', capacity: 20, sold: 15 }] },
+      // 超售 3 座 ≤ 上限 5 → 照常应用
+      { id: 'sched_ok', seatClasses: [{ id: 'sc_ok', cabin: 'BUSINESS', capacity: 20, sold: 10 }] },
+    ]);
+
+    const result = await service.batchUpdateCapacity({
+      scheduleIds: ['sched_over', 'sched_ok'],
+      seatClasses: [{ cabin: 'BUSINESS', capacity: 7 }],
+    });
+
+    // 只有未超限的那条真正落库
+    expect(prismaMock.flightSeatClass.update).toHaveBeenCalledTimes(1);
+    expect(prismaMock.flightSeatClass.update).toHaveBeenCalledWith({
+      where: { id: 'sc_ok' },
+      data: { capacity: 7 },
+    });
+    expect(result.applied).toBe(1);
+    expect(result.skipped).toEqual([
+      {
+        scheduleId: 'sched_over',
+        reason: expect.stringContaining('超过上限'),
+      },
+    ]);
+    expect(result.oversold).toEqual([
+      { scheduleId: 'sched_ok', cabin: 'BUSINESS', sold: 10, capacity: 7, oversoldBy: 3 },
+    ]);
   });
 });

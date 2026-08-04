@@ -57,6 +57,7 @@ const ORDER_ACTION_LABELS: Record<string, string> = {
   MINIAPP_PREPAY: '小程序预支付',
   CUSTOMER_UPLOAD_RECEIPT: '客户上传凭证',
   ALLOCATE_RECEIPT: '流水认款',
+  REVERSE_RECEIPT_ALLOCATION: '撤销认款',
   APPLY_AGENT_BALANCE: '代理余额抵扣',
   CREDIT_OVERPAY_TO_AGENT: '多付转代理余额',
   ORDER_OVERPAY_TO_POOL: '多付转公共池',

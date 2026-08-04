@@ -108,6 +108,14 @@ const EnvSchema = z.object({
   SMTP_USER: z.string().optional(),
   SMTP_PASS: z.string().optional(),
   SMTP_FROM: z.string().default('Citur Travel <no-reply@citur.com>'),
+
+  // ═══════════════════════════════════════════════════════════
+  // 航班库存：容量下调守卫
+  // 允许把班次容量改到低于已售（航司减配 / 换机型的真实场景，见 flights.service），
+  // 但超售张数（已售 − 目标容量）超过此上限就拒绝写入——防止手滑输错容量
+  // （如把 186 敲成 18 → 超售 168）。运营确认真要放这么大的超售口子再调大此值。
+  // ═══════════════════════════════════════════════════════════
+  FLIGHT_MAX_OVERSELL_SEATS: z.coerce.number().int().min(0).default(5),
 });
 
 export type Env = z.infer<typeof EnvSchema>;

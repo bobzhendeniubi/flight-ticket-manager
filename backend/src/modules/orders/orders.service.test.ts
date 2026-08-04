@@ -114,6 +114,7 @@ import {
   summarizeBundleItems,
   deriveBundlePerAgeUnitPrices,
   buildOrderFilterWhere,
+  resolveHasReturnLeg,
   splitSearchTerms,
   filterOrderIdsByDepartDate,
   assertDisplayedTotalMatches,
@@ -3499,6 +3500,138 @@ describe('buildOrderFilterWhere · 签证办理状态筛选（与列表徽标同
     const where = buildOrderFilterWhere({ invoiceStatus: 'ISSUED', visaFulfillmentStatus: 'signed' });
     expect(where.invoiceStatus).toBe('ISSUED');
     expect(where.AND).toEqual([CONFIRMED_CLAUSE]);
+  });
+});
+
+// ── 回程物化列 Order.hasReturnLeg：写入口径 + 查询层收口 ─────────────────────
+// 背景：单程单 returnInvoiced 恒为 false，会天然混进「回程未开」的开票清单，但它没有回程票可开。
+// Prisma where 表达不了「关联行 ≥ 2 条」，故把判定物化成列，查询层直接用。
+describe('resolveHasReturnLeg · 物化列写入口径（与 determineFlightLegs 同源）', () => {
+  const leg = (id: string, departure: string) => ({
+    flightScheduleId: id,
+    flightSchedule: { departureTime: new Date(departure) },
+  });
+
+  it('往返单（两条带班次的 FLIGHT 行）→ true', () => {
+    expect(
+      resolveHasReturnLeg([
+        leg('sch_out', '2026-07-10T02:00:00Z'),
+        leg('sch_ret', '2026-07-14T09:00:00Z'),
+      ]),
+    ).toBe(true);
+  });
+
+  it('单程单（只有一条航段）→ false —— 这正是「回程未开」误召回的那类单', () => {
+    expect(resolveHasReturnLeg([leg('sch_out', '2026-07-10T02:00:00Z')])).toBe(false);
+  });
+
+  it('无航段（酒店单/签证单）→ false', () => {
+    expect(resolveHasReturnLeg([])).toBe(false);
+  });
+
+  it('行顺序与判定无关：录入顺序颠倒仍是 true（按 departureTime 升序取第 2 段）', () => {
+    expect(
+      resolveHasReturnLeg([
+        leg('sch_ret', '2026-07-14T09:00:00Z'),
+        leg('sch_out', '2026-07-10T02:00:00Z'),
+      ]),
+    ).toBe(true);
+  });
+
+  it('缺 flightScheduleId 的行不算航段：一条有效 + 一条空 → false（不虚构回程）', () => {
+    expect(
+      resolveHasReturnLeg([
+        leg('sch_out', '2026-07-10T02:00:00Z'),
+        { flightScheduleId: null, flightSchedule: null },
+      ]),
+    ).toBe(false);
+  });
+
+  it('多段（>2）仍是 true —— 有第 2 段即有回程', () => {
+    expect(
+      resolveHasReturnLeg([
+        leg('sch_a', '2026-07-10T02:00:00Z'),
+        leg('sch_b', '2026-07-12T02:00:00Z'),
+        leg('sch_c', '2026-07-14T02:00:00Z'),
+      ]),
+    ).toBe(true);
+  });
+});
+
+describe('buildOrderFilterWhere · 回程守卫与行程类型筛选（物化列 hasReturnLeg）', () => {
+  const HAS_FLIGHT_LEG_CLAUSE = {
+    items: { some: { kind: 'FLIGHT', flightScheduleId: { not: null } } },
+  };
+
+  it('回程未开：AND 同时含「有航段」与 hasReturnLeg=true —— 单程单被彻底排除', () => {
+    const where = buildOrderFilterWhere({ invoiceLeg: 'return', invoiced: false });
+    expect(where.returnInvoiced).toBe(false);
+    expect(where.AND).toEqual([HAS_FLIGHT_LEG_CLAUSE, { hasReturnLeg: true }]);
+  });
+
+  it('去程维度不挂 hasReturnLeg —— 单程单本来就该出现在「去程未开」清单里', () => {
+    const where = buildOrderFilterWhere({ invoiceLeg: 'outbound', invoiced: false });
+    expect(where.outboundInvoiced).toBe(false);
+    expect(where.AND).toEqual([HAS_FLIGHT_LEG_CLAUSE]);
+  });
+
+  it('系统维度既不挂航段守卫也不挂 hasReturnLeg（酒店单/签证单本就要系统开票）', () => {
+    const where = buildOrderFilterWhere({ invoiceLeg: 'system', invoiced: false });
+    expect(where.systemInvoiced).toBe(false);
+    expect(where.AND).toBeUndefined();
+  });
+
+  it('invoiceLeg 缺 invoiced（未成对给出）→ 不产生任何开票/回程子句', () => {
+    const where = buildOrderFilterWhere({ invoiceLeg: 'return' });
+    expect(where.returnInvoiced).toBeUndefined();
+    expect(where.AND).toBeUndefined();
+  });
+
+  it('tripType=roundtrip → hasReturnLeg=true', () => {
+    const where = buildOrderFilterWhere({ tripType: 'roundtrip' });
+    expect(where.AND).toEqual([{ hasReturnLeg: true }]);
+  });
+
+  it('tripType=oneway → hasReturnLeg=false 且必须有航段（酒店单/签证单不算单程单）', () => {
+    const where = buildOrderFilterWhere({ tripType: 'oneway' });
+    expect(where.AND).toEqual([{ hasReturnLeg: false }, HAS_FLIGHT_LEG_CLAUSE]);
+  });
+
+  it('不传 tripType → 不产生 hasReturnLeg 子句（默认不按行程类型收口）', () => {
+    const where = buildOrderFilterWhere({});
+    expect(JSON.stringify(where)).not.toContain('hasReturnLeg');
+  });
+
+  it('往返 + 回程未开可叠加：两条子句各自独立进 AND，互不覆盖', () => {
+    const where = buildOrderFilterWhere({
+      invoiceLeg: 'return',
+      invoiced: false,
+      tripType: 'roundtrip',
+    });
+    expect(where.AND).toEqual([
+      HAS_FLIGHT_LEG_CLAUSE,
+      { hasReturnLeg: true },
+      { hasReturnLeg: true },
+    ]);
+  });
+
+  it('单程 + 回程未开是自相矛盾的组合：两条子句并存 → 诚实返回空集，而非某一边静默失效', () => {
+    const where = buildOrderFilterWhere({
+      invoiceLeg: 'return',
+      invoiced: false,
+      tripType: 'oneway',
+    });
+    expect(where.AND).toEqual([
+      HAS_FLIGHT_LEG_CLAUSE,
+      { hasReturnLeg: true },
+      { hasReturnLeg: false },
+      HAS_FLIGHT_LEG_CLAUSE,
+    ]);
+  });
+
+  it('勾选导出（orderIds）短路：不叠加任何行程类型子句', () => {
+    const where = buildOrderFilterWhere({ orderIds: ['o1', 'o2'], tripType: 'roundtrip' });
+    expect(where).toEqual({ id: { in: ['o1', 'o2'] }, deletedAt: null });
   });
 });
 

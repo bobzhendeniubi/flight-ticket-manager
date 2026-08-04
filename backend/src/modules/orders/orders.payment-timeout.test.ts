@@ -17,6 +17,8 @@ const { mockPrisma, mockScheduleSeatHoldRelease } = vi.hoisted(() => {
       findUnique: vi.fn(),
       // tx.order.create：回显传入的 paymentExpiresAt，供事务后入队判定读取
       create: vi.fn(),
+      // syncOrderHasReturnLeg 在建单事务内回写物化列 hasReturnLeg
+      update: vi.fn(),
     },
     orderCostItem: { create: vi.fn() },
     // createVisaTaskAtCreation（best-effort，事务后调用）会查订单项；返回空 → 直接 return []

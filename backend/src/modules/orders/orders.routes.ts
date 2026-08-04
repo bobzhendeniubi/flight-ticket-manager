@@ -30,6 +30,7 @@ import {
   publicOrderLookupQuerySchema,
   quoteOrderBodySchema,
   rescheduleOrderBodySchema,
+  upgradeItemCabinBodySchema,
   resolvePassengerPatchChannel,
   selfUpdatePassengerBodySchema,
   swapItemHotelBodySchema,
@@ -1627,6 +1628,48 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         departure: fmt(audit.toDeparture),
         feeCny: audit.feeCny,
         statusChanged: audit.statusChanged,
+        note: body.note,
+      },
+      severity: 'WARNING',
+    });
+    return { order };
+  });
+
+  // ── 售后改单：升舱（ADMIN/STAFF）──
+  // POST /orders/:id/items/:itemId/upgrade-cabin  body: { note? }
+  // 把某条**经济舱**机票行就地升到商务舱：座位先放经济舱再原子拿商务舱（余位不足回滚），
+  // 差价由服务端按该航班的升舱差价源 × 人数权威计算（请求体不接受金额），单独记一条
+  // UPGRADE_CHANGE 收入行并抬订单总额；**订单状态不动**（升舱不是改签）。
+  app.post('/:id/items/:itemId/upgrade-cabin', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅运营/管理员可升舱' });
+    }
+    const { id, itemId } = req.params as { id: string; itemId: string };
+    const body = upgradeItemCabinBodySchema.parse(req.body ?? {});
+    const { order, audit } = await service.upgradeOrderItemCabin(id, itemId, body, {
+      userId: req.user.sub,
+      role,
+    });
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'UPGRADE_CABIN_ITEM',
+      targetType: 'ORDER',
+      targetId: id,
+      targetLabel: audit.orderNumber,
+      before: {
+        orderItemId: audit.orderItemId,
+        cabin: audit.fromCabin,
+        scheduleId: audit.scheduleId,
+        subtotalCny: audit.subtotalBefore,
+      },
+      after: {
+        cabin: audit.toCabin,
+        quantity: audit.quantity,
+        upgradeCnyPerLeg: audit.upgradeCnyPerLeg,
+        diffCny: audit.diffCny,
+        upgradeItemId: audit.upgradeItemId,
+        subtotalCny: audit.subtotalAfter,
         note: body.note,
       },
       severity: 'WARNING',

@@ -7,6 +7,7 @@ import {
   WaitlistStatus,
 } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
+import { env } from '../../config/env.js';
 import { BadRequestError, ConflictError, NotFoundError } from '../../lib/errors.js';
 import { writeAudit } from '../../lib/audit.js';
 import type { AuditActor } from '../../lib/audit.js';
@@ -773,6 +774,19 @@ export class FlightService {
       }
     }
 
+    // ── 超售上限守卫（拍板：超售必须有上限，防止手滑，如把 186 敲成 18 → 超售 168）──
+    // 上限可配（FLIGHT_MAX_OVERSELL_SEATS，默认 5）；超过上限直接 400 拒绝整次请求，
+    // 不写库、不写审计——运营核对清楚真实容量后重试或调大上限。
+    const maxOversell = env.FLIGHT_MAX_OVERSELL_SEATS;
+    const overCapChanges = oversoldSeatChanges.filter((c) => c.oversoldBy > maxOversell);
+    if (overCapChanges.length > 0) {
+      throw new BadRequestError(
+        `超售 ${overCapChanges
+          .map((c) => `${CABIN_LABEL[c.cabin]}${c.oversoldBy}`)
+          .join('、')} 座超过上限 ${maxOversell} 座，请核对容量是否输错；上限可调`,
+      );
+    }
+
     await prisma.$transaction(async (tx) => {
       // 时刻 + isActive 一次写（减少 round-trips）
       const scheduleData: Prisma.FlightScheduleUpdateInput = {};
@@ -1080,6 +1094,8 @@ export class FlightService {
    *   - 每条按 cabin 定位舱位，套用与单班次编辑（updateSchedule）同口径：容量可以
    *     压到已售之下（航司减配/换机型的真实场景），这类班次照改并记为「超售」，
    *     在返回体的 oversold 明细与审计里点名，销售侧照旧按 CAS 拒卖；
+   *   - 超售张数超过上限（FLIGHT_MAX_OVERSELL_SEATS，防手滑）→ 该班次整条不改，
+   *     放进 skipped 带原因，不拖累批次里其它班次（不是整批失败）；
    *   - 该班次没有请求里的某个舱位 → 那一项静默跳过（不算失败）；
    *   - 请求的舱位在该班次里一个都不存在 → 整个班次跳过，记入 skipped；
    *   - scheduleId 查无此班次 → 跳过，记入 skipped。
@@ -1098,6 +1114,8 @@ export class FlightService {
     const updates: Array<{ seatClassId: string; capacity: number }> = [];
     // 目标容量低于已售的班次：照改，但单列出来提示运营去协调（返回体 + 审计）
     const oversold: Array<{ scheduleId: string; cabin: CabinClass; sold: number; capacity: number; oversoldBy: number }> = [];
+    // 超售上限守卫（同 updateSchedule 口径，防止批量场景手滑输错容量炸更大的坑）
+    const maxOversell = env.FLIGHT_MAX_OVERSELL_SEATS;
 
     for (const scheduleId of body.scheduleIds) {
       const schedule = scheduleById.get(scheduleId);
@@ -1108,19 +1126,30 @@ export class FlightService {
       const seatClassByCabin = new Map(schedule.seatClasses.map((c) => [c.cabin, c]));
       const scheduleUpdates: Array<{ seatClassId: string; capacity: number }> = [];
       const scheduleOversold: typeof oversold = [];
+      let overCapReason: string | null = null;
       for (const item of body.seatClasses) {
         const current = seatClassByCabin.get(item.cabin);
         if (!current) continue; // 该班次没有此舱位：这一项静默跳过，不算失败
         if (item.capacity < current.sold) {
+          const oversoldBy = current.sold - item.capacity;
+          if (oversoldBy > maxOversell) {
+            // 超过上限：整个班次不改（不部分应用），放进 skipped 带原因，不拖累其它班次
+            overCapReason = `${CABIN_LABEL[item.cabin]}超售 ${oversoldBy} 座超过上限 ${maxOversell} 座，请核对容量是否输错；上限可调`;
+            break;
+          }
           scheduleOversold.push({
             scheduleId,
             cabin: item.cabin,
             sold: current.sold,
             capacity: item.capacity,
-            oversoldBy: current.sold - item.capacity,
+            oversoldBy,
           });
         }
         scheduleUpdates.push({ seatClassId: current.id, capacity: item.capacity });
+      }
+      if (overCapReason) {
+        skipped.push({ scheduleId, reason: overCapReason });
+        continue;
       }
       if (scheduleUpdates.length === 0) {
         skipped.push({ scheduleId, reason: '该班次没有匹配的舱位' });

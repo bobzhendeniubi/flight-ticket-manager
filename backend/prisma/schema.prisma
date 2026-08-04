@@ -1111,6 +1111,12 @@ model Order {
   outboundInvoiced     Boolean          @default(false)
   returnInvoiced       Boolean          @default(false)
   systemInvoiced       Boolean          @default(false)
+  // 「本单有回程航段」物化列 —— 与 determineFlightLegs 同口径（带班次的 FLIGHT 行按
+  // departureTime 升序，存在第 2 段即 true）。Prisma where 表达不了「关联行 ≥ 2 条」，
+  // 而「回程未开」筛选必须排掉单程单（单程单 returnInvoiced 恒为 false，天然误命中）。
+  // 由 syncOrderHasReturnLeg 在所有增删 FLIGHT 行 / 改 flightScheduleId 的事务内同步维护。
+  // 与软删无关：已删订单同样维护本列（列语义是结构，不是可见性）。
+  hasReturnLeg         Boolean          @default(false)
   currency             String           @default("CNY")
   subtotal             Decimal          @db.Decimal(12, 2)
   taxesAndFees         Decimal          @default(0) @db.Decimal(12, 2)

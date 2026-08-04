@@ -9,6 +9,7 @@
  *   GET  /receipts/ledger            - 全部流水（进账 + 订单收款合并，时间倒序）
  *   POST /receipts                   - 登记新进账（后台手动录入）
  *   POST /receipts/:id/allocate      - 认领（金额分配到某订单，原子）
+ *   POST /receipts/:id/allocations/:allocationId/reverse - 撤销认款（认领的逆操作，原子对称）
  *   POST /receipts/:id/refund        - 退款（剩余金额标记退款）
  *
  * 设计：Console 极简（靛蓝 Inter）；金额一律 NumberInput；变更前 confirm()；
@@ -386,8 +387,42 @@ function ReceiptRow({
   onAfterMutation: () => void;
 }) {
   const [action, setAction] = useState<'none' | 'allocate' | 'refund'>('none');
+  // 撤销认款：一次只撤一笔（reversingId = 正在撤的那条明细 id），错误/提示就地展示
+  const [reversingId, setReversingId] = useState<string | null>(null);
+  const [reverseErr, setReverseErr] = useState<string | null>(null);
+  const [reverseWarning, setReverseWarning] = useState<string | null>(null);
   const remaining = Number(receipt.remainingCny);
   const canMutate = receipt.status === 'OPEN' || receipt.status === 'PARTIALLY_ALLOCATED';
+
+  /**
+   * 撤销一笔认款：钱从订单撤回本进账的剩余额，可再认给别的订单。
+   * 二次确认带订单号 + 金额（撤错单就是资金事故）；后端拒绝原因（收款已锁定 / 死单 /
+   * 进账已退款 / 账目倒挂）原样展示，不改写成笼统文案。
+   */
+  async function reverse(a: Receipt['allocations'][number]): Promise<void> {
+    if (!token || reversingId) return;
+    const orderLabel = a.orderNumber ?? a.orderId.slice(0, 8);
+    if (
+      !window.confirm(
+        `确认撤销订单 ${orderLabel} 的这笔认款 ¥${Number(a.amountCny).toLocaleString()}？\n\n` +
+          `撤销后：该订单已付金额减回、这笔收款记录冲销，钱回到进账 ${receipt.receiptNo} 的剩余额里待重新认领。\n` +
+          '注意：订单状态、佣金与履约任务不会回退。',
+      )
+    )
+      return;
+    setReverseErr(null);
+    setReverseWarning(null);
+    setReversingId(a.id);
+    try {
+      const res = await api.reverseReceiptAllocation(token, receipt.id, a.id);
+      if (res.warning) setReverseWarning(res.warning);
+      onAfterMutation();
+    } catch (e: unknown) {
+      setReverseErr(e instanceof ApiError ? e.message : '撤销认款失败');
+    } finally {
+      setReversingId(null);
+    }
+  }
 
   return (
     <>
@@ -448,20 +483,44 @@ function ReceiptRow({
         </td>
       </tr>
 
-      {/* 已认领明细（展开行） */}
+      {/* 已认领明细（展开行）+ 逐笔撤销 */}
       {receipt.allocations.length > 0 && (
         <tr>
           <td colSpan={10} className="bg-slate-50/60 !py-2 text-xs text-ink-soft">
-            已认领：
-            {receipt.allocations.map((a) => (
-              <span key={a.id} className="ml-2 inline-flex items-center gap-1">
-                {/* 订单号（财务照着核对账）；服务端 join 不到才回落 id 前 8 位，title 恒为完整 id */}
-                <span className="font-mono text-ink-muted" title={`订单 id ${a.orderId}`}>
-                  {a.orderNumber ?? a.orderId.slice(0, 8)}
+            <div className="flex flex-wrap items-center gap-x-1 gap-y-1.5">
+              <span>已认领：</span>
+              {receipt.allocations.map((a) => (
+                <span key={a.id} className="ml-1 inline-flex items-center gap-1">
+                  {/* 订单号（财务照着核对账）；服务端 join 不到才回落 id 前 8 位，title 恒为完整 id */}
+                  <span className="font-mono text-ink-muted" title={`订单 id ${a.orderId}`}>
+                    {a.orderNumber ?? a.orderId.slice(0, 8)}
+                  </span>
+                  <span className="font-medium text-emerald-700">{fmtCny(a.amountCny)}</span>
+                  {/* 撤销：把这笔钱从订单撤回挂账池（认领的逆操作，可再认给别的订单） */}
+                  {receipt.status !== 'REFUNDED' && (
+                    <button
+                      type="button"
+                      className="btn-ghost px-1.5 py-0.5 text-xs text-rose-700 hover:bg-rose-50 disabled:opacity-50"
+                      disabled={reversingId !== null}
+                      onClick={() => void reverse(a)}
+                      title="撤销这笔认款：钱回到挂账池待重新认领"
+                    >
+                      {reversingId === a.id ? '撤销中…' : '撤销'}
+                    </button>
+                  )}
                 </span>
-                <span className="font-medium text-emerald-700">{fmtCny(a.amountCny)}</span>
-              </span>
-            ))}
+              ))}
+            </div>
+            {reverseErr && (
+              <div className="mt-1.5 rounded bg-rose-50 px-2 py-1 text-xs text-rose-700">
+                {reverseErr}
+              </div>
+            )}
+            {reverseWarning && (
+              <div className="mt-1.5 rounded bg-amber-50 px-2 py-1 text-xs text-amber-800">
+                {reverseWarning}
+              </div>
+            )}
           </td>
         </tr>
       )}

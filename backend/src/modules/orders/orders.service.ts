@@ -74,6 +74,7 @@ import {
   assertTicketingCap,
   determineFlightLegs,
 } from './ticketing-cap.js';
+import type { FlightLegItem } from './ticketing-cap.js';
 import { PRICE_ADJUSTMENT_CAP_CNY, PRICE_ADJUSTMENT_REASON_LABEL } from './orders.schemas.js';
 import type {
   BatchCreateOrdersBody,
@@ -540,6 +541,45 @@ export function buildRoomSupplementItem(input: {
   };
 }
 
+// ── 售后升舱（经济舱 → 商务舱）辅助 ────────────────────────────────────────
+/** 舱位中文名（升舱拒绝文案 / 描述快照刷新用）。 */
+const CABIN_ZH_LABEL: Record<string, string> = {
+  ECONOMY: '经济舱',
+  PREMIUM_ECONOMY: '超级经济舱',
+  BUSINESS: '商务舱',
+  FIRST: '头等舱',
+};
+
+/**
+ * 升舱差价（CNY，整数）= 每人每航段差价 × 该行人数。
+ * 一条 FLIGHT 行 = 一个航段，故不再乘航段数（往返是两条行，各自升舱各自计价）。
+ * 纯函数，导出供单测复用。
+ */
+export function computeCabinUpgradeDiffCny(upgradeCnyPerLeg: number, quantity: number): number {
+  return Math.max(0, Math.trunc(upgradeCnyPerLeg)) * Math.max(0, Math.trunc(quantity));
+}
+
+/**
+ * 升舱后刷新订单行的描述快照。
+ *
+ * description 是建单时写死的文本（列表/详情/导出都直接显示它），不刷新的话升完舱仍写着「经济舱」。
+ * 口径：把描述里的「经济舱」（含「超级/高端/豪华经济舱」写法，整体吃掉前缀，不留「超级商务舱」）
+ * 替换为「商务舱」；一处都替换不到（描述里本来就没写舱位）则在末尾追加「 · 商务舱」，
+ * 保证结果里一定看得见新舱位。
+ * 纯函数，导出供单测复用。
+ */
+const ECONOMY_CABIN_TEXT_RE = /(?:超级|高端|豪华)?经济舱/g;
+export function buildUpgradedCabinDescription(description: string): string {
+  if (ECONOMY_CABIN_TEXT_RE.test(description)) {
+    // 带 /g 的正则有 lastIndex 状态，test 后必须归零，否则下次调用会从中途开始匹配。
+    ECONOMY_CABIN_TEXT_RE.lastIndex = 0;
+    return description.replace(ECONOMY_CABIN_TEXT_RE, '商务舱');
+  }
+  ECONOMY_CABIN_TEXT_RE.lastIndex = 0;
+  if (description.includes('商务舱')) return description;
+  return `${description} · 商务舱`;
+}
+
 /** 补房差/换酒店成本口径：每晚成本取值来源（供 metadata.costSource 与审计留痕）。 */
 export type RoomCostSource = 'ITEM_SNAPSHOT' | 'PRODUCT' | 'ZERO';
 
@@ -636,6 +676,38 @@ export function resolveGroundItemUnitPrice(input: {
     throw new BadRequestError(`该${input.label}产品没有成本价，请手动填写售价`);
   }
   return input.costPriceCny;
+}
+
+/**
+ * 判定「本单是否有回程航段」——纯函数，与 determineFlightLegs 同一口径
+ *（带班次的 FLIGHT 行按 departureTime 升序，存在第 2 段 = 有回程）。
+ * 抽出来是为了让物化列 Order.hasReturnLeg 的写入口径可单测，不必起库。
+ */
+export function resolveHasReturnLeg(items: ReadonlyArray<FlightLegItem>): boolean {
+  return determineFlightLegs(items).returnScheduleId !== null;
+}
+
+/**
+ * 把 Order.hasReturnLeg 物化列同步到当前订单行的真实结构。
+ *
+ * **必须在同一事务内调用**，且调用点要覆盖所有「增删 FLIGHT 行 / 改 flightScheduleId」的写路径
+ * —— 列一旦与订单行脱钩，「回程未开」筛选与单程/往返筛选就会静默给错清单（漏单比多单更糟）。
+ * 幂等：重复调用只是把同一个值再写一遍，可安全用作自愈。
+ */
+export async function syncOrderHasReturnLeg(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+): Promise<boolean> {
+  const items = await tx.orderItem.findMany({
+    where: { orderId, kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
+    select: {
+      flightScheduleId: true,
+      flightSchedule: { select: { departureTime: true } },
+    },
+  });
+  const hasReturnLeg = resolveHasReturnLeg(items);
+  await tx.order.update({ where: { id: orderId }, data: { hasReturnLeg } });
+  return hasReturnLeg;
 }
 
 export class OrderService {
@@ -1016,6 +1088,10 @@ export class OrderService {
         });
         consumedLockIds.push(...lockIds);
       }
+
+      // 物化列 hasReturnLeg：建单是 FLIGHT 行唯一的产生点（单笔录单 / 前台商城 / 批量建单
+      // 都经此），故在同一事务内按订单行真实结构落列，单程单落 false、往返单落 true。
+      await syncOrderHasReturnLeg(tx, created.id);
 
       // 座位已在订单 create 之前原子扣减；此处无需再动库存
       return created;
@@ -4767,6 +4843,11 @@ export class OrderService {
         },
       });
 
+      // 物化列 hasReturnLeg 自愈：改期只换班次、不增删航段，航段条数恒定，本调用理论上是个
+      // 恒等写。仍然保留 —— 它把「改过期的单」顺手校准回真实结构（含迁移前的存量脏值），
+      // 且未来若改期扩展成能加/删航段，维护点已经在这里，不会漏。
+      await syncOrderHasReturnLeg(tx, orderId);
+
       // ── 4. 加改期费（adjustmentCny + adjustments 流水）──
       if (feeCny > 0) {
         const log = appendAdjustment(order.adjustments, {
@@ -4833,6 +4914,246 @@ export class OrderService {
         feeCny,
         statusChanged: scratch.statusChanged,
       },
+    };
+  }
+
+  /**
+   * 售后升舱：把订单里某条**经济舱**机票行就地升到商务舱，并按单一差价源自动计费。
+   *
+   * 与「改期」的分工：改期解决**航变/换班次**（可顺带改舱位、差价手填进改期费）；本方法解决
+   * **纯升舱**——不换班次、不手填金额，差价由服务端按 `Flight.businessUpgradeCnyPerLeg`
+   * （¥/程/座，与建单加购升舱同一个配置源）× 该行人数权威计算，客户端传不进金额。
+   *
+   * 单事务内：
+   *   1. Order 行 FOR UPDATE（与改期/超时释放/到账入账同一把行锁，座位与金额都要串行）。
+   *   2. 守卫：资金闸（回收站/已取消/已退款/超时单拒绝）+ 收款复核锁 + 占座态 + 行合法性。
+   *   3. 座位对称搬移：ECONOMY 放座（floored）→ BUSINESS 原子 CAS 扣座；商务舱不足 → 抛错整事务回滚。
+   *   4. 该行 flightCabin→BUSINESS，description 刷新舱位字样（快照文本，避免列表仍显示「经济舱」）。
+   *   5. 新增一条 kind=UPGRADE_CHANGE 行（升舱收入科目），amount = 差价；重算 order.subtotal/total。
+   *   6. **订单状态不动**（升舱不是改签，不推 CHANGED）。
+   *
+   * 套餐单（该行带 bundleId / 建单时已拆过商务舱座）本次不支持：套餐升舱有自己的份数与拆座模型，
+   * 走这里会把两套口径搅在一起。返回 400 引导人工处理。
+   */
+  async upgradeOrderItemCabin(
+    orderId: string,
+    orderItemId: string,
+    input: { note?: string },
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
+    order: ReturnType<typeof serializeOrder>;
+    audit: {
+      orderNumber: string;
+      orderItemId: string;
+      upgradeItemId: string;
+      scheduleId: string;
+      fromCabin: CabinClass;
+      toCabin: CabinClass;
+      quantity: number;
+      upgradeCnyPerLeg: number;
+      diffCny: number;
+      subtotalBefore: number;
+      subtotalAfter: number;
+    };
+  }> {
+    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+      throw new ForbiddenError('仅运营/管理员可升舱');
+    }
+
+    const scratch = await prisma.$transaction(async (tx) => {
+      // 与改期/补录地面项同一把 Order 行锁：座位搬移 + 订单总额重算都要与并发写严格串行。
+      const lockRows = await tx.$queryRaw<Array<{ id: string }>>`
+        SELECT id FROM "Order" WHERE id = ${orderId} FOR UPDATE
+      `;
+      if (lockRows.length === 0) throw new NotFoundError('订单不存在');
+
+      const order = await tx.order.findUnique({
+        where: { id: orderId },
+        select: {
+          id: true,
+          orderNumber: true,
+          status: true,
+          deletedAt: true,
+          paymentsLocked: true,
+          subtotal: true,
+          total: true,
+          items: { select: { amount: true } },
+        },
+      });
+      if (!order) throw new NotFoundError('订单不存在');
+
+      // 资金闸：升舱会抬 total，与补录地面项/调价同源守卫——回收站单、已取消/已退款/超时/草稿单一律拒绝。
+      assertOrderAcceptsFunds(order);
+      // 收款复核锁：金额要变，锁定态下拒绝（与人工录收款同口径，解锁需审计留痕）。
+      if (order.paymentsLocked) {
+        throw new ConflictError('收款已锁定（财务复核完成），请先解锁再升舱');
+      }
+      // 占座态守卫：升舱要「放经济舱座 + 拿商务舱座」，只有订单当前真的持有座位时才成立。
+      if (!SEAT_HOLDING_STATUSES.includes(order.status)) {
+        throw new BadRequestError(
+          `订单当前状态（${order.status}）不可升舱：仅占座中的有效订单可升舱`,
+        );
+      }
+
+      const item = await tx.orderItem.findUnique({
+        where: { id: orderItemId },
+        select: {
+          id: true,
+          orderId: true,
+          kind: true,
+          description: true,
+          quantity: true,
+          flightScheduleId: true,
+          flightCabin: true,
+          bundleId: true,
+          metadata: true,
+        },
+      });
+      if (!item || item.orderId !== orderId) {
+        throw new NotFoundError('订单项不存在或不属于该订单');
+      }
+      if (item.kind !== OrderItemKind.FLIGHT || !item.flightScheduleId || !item.flightCabin) {
+        throw new BadRequestError('只能对机票行（FLIGHT）升舱');
+      }
+      // 套餐机票腿：升舱份数/拆座由套餐加购模型管，售后升舱本次不覆盖。
+      const meta = (item.metadata ?? {}) as Record<string, unknown> & { businessUpgradeCount?: unknown };
+      const bundleUpgradeCount = typeof meta.businessUpgradeCount === 'number' ? meta.businessUpgradeCount : 0;
+      if (item.bundleId || bundleUpgradeCount > 0) {
+        throw new BadRequestError('套餐订单的机票行暂不支持一键升舱，请联系技术处理');
+      }
+      if (item.flightCabin !== CabinClass.ECONOMY) {
+        throw new BadRequestError(
+          `该行当前是${CABIN_ZH_LABEL[item.flightCabin] ?? item.flightCabin}，只有经济舱行可升舱到商务舱`,
+        );
+      }
+
+      // 差价源：服务端权威取价（客户端传不进金额）。
+      const schedule = await tx.flightSchedule.findUnique({
+        where: { id: item.flightScheduleId },
+        select: { id: true, flight: { select: { businessUpgradeCnyPerLeg: true } } },
+      });
+      const upgradeCnyPerLeg = schedule?.flight?.businessUpgradeCnyPerLeg ?? 0;
+      if (upgradeCnyPerLeg <= 0) {
+        throw new BadRequestError('该航班未配置商务舱差价，请先在航班管理维护');
+      }
+      const quantity = item.quantity;
+      const diffCny = computeCabinUpgradeDiffCny(upgradeCnyPerLeg, quantity);
+
+      // ── 座位对称搬移（同事务原子；任一步失败整单回滚，绝不出现「经济舱放了、商务舱没拿到」）──
+      // 放座用 floored 版本（与状态机释放同口径，不会把 sold 打成负数）；拿座用 CAS（最终防超售）。
+      await releaseSeatFloored(tx, item.flightScheduleId, CabinClass.ECONOMY, quantity);
+      try {
+        await takeSeatWithinTx(tx, item.flightScheduleId, CabinClass.BUSINESS, quantity, null);
+      } catch (e) {
+        // takeSeatWithinTx 的文案面向改期场景（「改期目标班次售罄」），这里换成升舱语境
+        // ——错误类型不变（仍是 409），余位数字重新取一次，运营看到的就是本班次商务舱实况。
+        if (e instanceof ConflictError) {
+          const [businessSeat, lockedAgg] = await Promise.all([
+            tx.flightSeatClass.findFirst({
+              where: { scheduleId: item.flightScheduleId, cabin: CabinClass.BUSINESS },
+              select: { capacity: true, sold: true },
+            }),
+            // 余位口径与 CAS 一致：他人未过期的 ACTIVE 锁位同样占着位子，不能算作「还剩」。
+            tx.seatLock.aggregate({
+              _sum: { qty: true },
+              where: {
+                seatClass: { scheduleId: item.flightScheduleId, cabin: CabinClass.BUSINESS },
+                status: SeatLockStatus.ACTIVE,
+                expiresAt: { gt: new Date() },
+              },
+            }),
+          ]);
+          const locked = lockedAgg._sum.qty ?? 0;
+          const remain = businessSeat
+            ? Math.max(0, businessSeat.capacity - businessSeat.sold - locked)
+            : 0;
+          throw new ConflictError(
+            `商务舱余位不足：升舱需要 ${quantity} 座，该班次商务舱仅剩 ${remain} 座`,
+          );
+        }
+        throw e;
+      }
+
+      // ── 该行就地改舱 + 刷新描述快照（不改 amount：机票基础价不重算，差价单独成行）──
+      const newDescription = buildUpgradedCabinDescription(item.description);
+      await tx.orderItem.update({
+        where: { id: item.id },
+        data: {
+          flightCabin: CabinClass.BUSINESS,
+          description: newDescription,
+          metadata: {
+            ...meta,
+            cabinUpgrade: {
+              at: new Date().toISOString(),
+              by: actor.userId,
+              fromCabin: CabinClass.ECONOMY,
+              toCabin: CabinClass.BUSINESS,
+              upgradeCnyPerLeg,
+              quantity,
+              diffCny,
+              note: input.note ?? null,
+            },
+          } as Prisma.InputJsonValue,
+        },
+      });
+
+      // ── 差价成一条独立收入行（科目 UPGRADE_CHANGE = 升舱/改期收入）──
+      const created = await tx.orderItem.create({
+        data: {
+          orderId,
+          kind: OrderItemKind.UPGRADE_CHANGE,
+          description: `升舱商务 ×${quantity}人`,
+          quantity,
+          unitPrice: new Prisma.Decimal(upgradeCnyPerLeg),
+          amount: new Prisma.Decimal(diffCny),
+          metadata: {
+            source: 'CABIN_UPGRADE',
+            sourceItemId: item.id,
+            flightScheduleId: item.flightScheduleId,
+            fromCabin: CabinClass.ECONOMY,
+            toCabin: CabinClass.BUSINESS,
+            upgradeCnyPerLeg,
+            note: input.note ?? null,
+          } as Prisma.InputJsonValue,
+        },
+      });
+
+      // ── 订单总额：与补录地面项同一口径（重算商品行合计，不走 adjustmentCny）──
+      const subtotalBefore = round2(
+        order.items.reduce((sum, row) => sum + Number(row.amount.toString()), 0),
+      );
+      const subtotalAfter = round2(subtotalBefore + diffCny);
+      await tx.order.update({
+        where: { id: orderId },
+        data: {
+          subtotal: new Prisma.Decimal(subtotalAfter),
+          total: new Prisma.Decimal(subtotalAfter),
+        },
+      });
+
+      // 订单状态刻意不动：升舱不是改签，推 CHANGED 会污染改签流程与状态统计。
+      return {
+        orderNumber: order.orderNumber,
+        orderItemId: item.id,
+        upgradeItemId: created.id,
+        scheduleId: item.flightScheduleId,
+        fromCabin: CabinClass.ECONOMY,
+        toCabin: CabinClass.BUSINESS,
+        quantity,
+        upgradeCnyPerLeg,
+        diffCny,
+        subtotalBefore,
+        subtotalAfter,
+      };
+    });
+
+    const finalOrder = await prisma.order.findUniqueOrThrow({
+      where: { id: orderId },
+      include: ORDER_FULL_INCLUDE,
+    });
+    return {
+      order: serializeOrder(finalOrder, orderSerializeRoleCtx(actor.role)),
+      audit: scratch,
     };
   }
 
@@ -6335,6 +6656,7 @@ export type OrderListFilters = Pick<
   | 'invoiceLeg'
   | 'invoiced'
   | 'visaFulfillmentStatus'
+  | 'tripType'
 > & {
   /** 精确按班次过滤（整班·全岗导出用）；比 travelFrom/travelTo 更准，不受 ±1 天放宽影响。 */
   scheduleId?: string;
@@ -6500,20 +6822,34 @@ export function buildOrderFilterWhere(query: OrderListFilters): Prisma.OrderWher
     //   · outbound / return：要求本单至少有一条带班次的 FLIGHT 行。
     //   · system：**不加**守卫 —— 系统开票是订单维度、不是航段维度，酒店单/签证单本来就要
     //     系统开票，给它加守卫会错杀（假阴性比假阳性更糟：清单里少了单 = 真活丢了）。
-    //
-    // 已知残留：本守卫只能排除「一条航段都没有」的单，排不掉**单程单**——单程单有去程、
-    // 无回程，仍会命中这里的 where（returnInvoiced 默认 false）。查询层本身排不掉
-    // （Prisma where 表达不了「关联行 ≥ 2 条」，判定回程要 determineFlightLegs 的内存计算）。
-    // **导出路径已修**：orders.export-templates.ts 的 buildOrderTemplateExportWorkbook
-    // 取数后按 determineFlightLegs 做内存二次过滤（见 orders.export-trip-filter.ts 的
-    // excludeOnewayFromReturnLegExport），单程单不会再混进「回程未开」的导出结果。
-    // 订单列表页（走同一个 buildOrderFilterWhere）仍是查询层直出，未做内存侧收口，
-    // 残留依旧在——彻底修法仍是物化列 Order.hasReturnLeg，需迁移 + 回填，超出本次改动范围。
     if (query.invoiceLeg === 'outbound' || query.invoiceLeg === 'return') {
       andClauses.push({
         items: { some: { kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } } },
       });
     }
+    // ── 单程单守卫：回程维度加挂物化列 hasReturnLeg ────────────────────────
+    // 上面的航段守卫只能排除「一条航段都没有」的单，排不掉**单程单**——单程单有去程、无回程，
+    // returnInvoiced 恒为 false，天然命中「回程未开」，但它压根没有回程票可开。
+    // 判定回程要 determineFlightLegs（FLIGHT 行按 departureTime 升序取第 2 段），Prisma where
+    // 表达不了「关联行 ≥ 2 条」，故物化成 Order.hasReturnLeg（建单/改期写路径同步维护）。
+    // 导出路径的内存二次过滤（orders.export-trip-filter.ts 的 excludeOnewayFromReturnLegExport）
+    // 保留不动，作为物化列失准时的双保险。
+    if (query.invoiceLeg === 'return') {
+      andClauses.push({ hasReturnLeg: true });
+    }
+  }
+  // 行程类型筛选（单程/往返）—— 同样走物化列。
+  //   roundtrip：有回程航段。
+  //   oneway   ：无回程航段，且**必须有航段**（否则酒店单/签证单会被当成「单程」捞出来）。
+  // 走 andClauses 而不是直接赋值 where.hasReturnLeg：与上面的回程守卫互不覆盖，
+  // 「单程 + 回程未开」这种自相矛盾的组合会诚实地返回空集，而不是让某一边静默失效。
+  if (query.tripType === 'roundtrip') {
+    andClauses.push({ hasReturnLeg: true });
+  } else if (query.tripType === 'oneway') {
+    andClauses.push({ hasReturnLeg: false });
+    andClauses.push({
+      items: { some: { kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } } },
+    });
   }
   // 签证办理状态筛选 — 与列表「签证」列徽标同源（签证办理履约任务 VISA_APPLICATION 的状态）。
   //   signed  ：订单存在「已确认(CONFIRMED)」的签证办理任务 = 已签证。

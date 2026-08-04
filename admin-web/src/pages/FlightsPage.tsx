@@ -1299,7 +1299,8 @@ function DaySchedule({
       oversoldParts.length > 0 &&
       !window.confirm(
         `容量低于已售，保存后该班次将标记超售：\n${oversoldParts.join('\n')}\n\n` +
-          '销售侧照旧不再卖出，但已售出的座位需要与航司 / 操作部协调（加座、改期或退改）。确认保存？',
+          '销售侧照旧不再卖出，但已售出的座位需要与航司 / 操作部协调（加座、改期或退改）。\n' +
+          '超售张数超过系统设定上限时，保存会被拒绝（上限可调，用于防止手滑输错容量）。确认保存？',
       )
     ) {
       return;
@@ -1662,11 +1663,12 @@ function DaySchedule({
                 />
                 {econCapacity != null && econCapacity < econ.sold ? (
                   <p className="mt-0.5 text-[11px] font-medium text-rose-700">
-                    低于已售 {econ.sold} 张，保存后将标记超售 {econ.sold - econCapacity}。
+                    低于已售 {econ.sold} 张，保存后将标记超售 {econ.sold - econCapacity}
+                    ；超售超过系统上限时保存会被拒绝。
                   </p>
                 ) : (
                   <p className="mt-0.5 text-[11px] text-ink-muted">
-                    可低于已售（航司减配 / 换机型），保存后按超售标红。
+                    可低于已售（航司减配 / 换机型），保存后按超售标红；超售有上限，防止手滑输错容量。
                   </p>
                 )}
               </div>
@@ -1716,11 +1718,12 @@ function DaySchedule({
                 />
                 {bizCapacity != null && bizCapacity < biz.sold ? (
                   <p className="mt-0.5 text-[11px] font-medium text-rose-700">
-                    低于已售 {biz.sold} 张，保存后将标记超售 {biz.sold - bizCapacity}。
+                    低于已售 {biz.sold} 张，保存后将标记超售 {biz.sold - bizCapacity}
+                    ；超售超过系统上限时保存会被拒绝。
                   </p>
                 ) : (
                   <p className="mt-0.5 text-[11px] text-ink-muted">
-                    可低于已售（航司减配 / 换机型），保存后按超售标红。
+                    可低于已售（航司减配 / 换机型），保存后按超售标红；超售有上限，防止手滑输错容量。
                   </p>
                 )}
               </div>
