@@ -6,6 +6,7 @@ import { DetailSkeleton } from './components/LoadingSkeleton';
 import { LoginPage } from './pages/LoginPage';
 import { useAuth } from './stores/auth';
 import type { UserRole } from './lib/api';
+import { REFRESH_SKEW_MS, getAccessTokenExpMs } from './lib/token';
 
 // 路由级代码分割（G1）：每个页面单独 chunk，按需加载，缩小首屏 bundle。
 // Layout 不 lazy（外壳要立即渲染）；LoginPage 保持 eager（独立全屏入口）。
@@ -61,22 +62,6 @@ function Protected({
 // 好处：刚登录 / token 还新时不做无谓轮换 —— 避免多标签/重复挂载并发轮换撞后端一次性轮换判定；
 // 真正过期的那一刻由 apiFetch 的 401 静默续期兜底。
 const SESSION_CHECK_INTERVAL_MS = 60 * 1000;
-const REFRESH_SKEW_MS = 5 * 60 * 1000;
-
-/** 解析 JWT 的 exp（毫秒时间戳）；解析失败/无 exp 返回 null（当作临期，交由续期兜底）。 */
-function getAccessTokenExpMs(token: string | null | undefined): number | null {
-  if (!token) return null;
-  const parts = token.split('.');
-  if (parts.length < 2) return null;
-  try {
-    const payload = JSON.parse(atob(parts[1].replace(/-/g, '+').replace(/_/g, '/'))) as {
-      exp?: number;
-    };
-    return typeof payload.exp === 'number' ? payload.exp * 1000 : null;
-  } catch {
-    return null;
-  }
-}
 
 /** /bundles → /：保留 ?kw= 等查询参数的兼容跳转 */
 function BundlesRedirect() {

@@ -114,6 +114,12 @@ export async function apiFetch<T>(path: string, init: ApiRequestInit = {}): Prom
   return apiFetchWithRetry<T>(path, init, true);
 }
 
+/** 只读请求判定：没写 method 就是 GET。只有只读请求才允许「掉登录后退回游客视角」重试。 */
+function isReadOnly(init: ApiRequestInit): boolean {
+  const method = (init.method ?? 'GET').toUpperCase();
+  return method === 'GET' || method === 'HEAD';
+}
+
 async function apiFetchWithRetry<T>(
   path: string,
   init: ApiRequestInit,
@@ -147,6 +153,13 @@ async function apiFetchWithRetry<T>(
         code: AUTH_REFRESH_UNAVAILABLE_CODE,
         message: '登录状态正在刷新，请稍后重试（会话未失效）',
       });
+    }
+    // 会话确定性失效、且这是个只读请求 → 摘掉 Authorization 头按游客再试一次。
+    // 公开接口（产品列表等）因此仍能正常渲染，浏览不被掉登录打断；需要登录的接口会再吃一个
+    // 401，跟原来一样交给上层登出。写操作（POST/PATCH/DELETE）绝不这样兜底 —— 掉登录后
+    // 以游客身份提交会写出归属错误的数据。
+    if (outcome.status === 'expired' && isReadOnly(init)) {
+      return apiFetchWithRetry<T>(path, { ...init, token: null }, false);
     }
   }
 

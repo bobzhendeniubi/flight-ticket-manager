@@ -2,8 +2,11 @@
  * 产品路由 — 公共 GET（客户浏览）+ 管理员写操作。
  *
  * GET 列表/详情  → 无需登录（含 ?active=1 只看上架的），但走 optionalAuthenticate 做「可选」身份解析：
+ *   不带 Authorization 头     → 游客 200，响应里完全不含 costPriceCny 这个 key；
  *   带有效 ADMIN/STAFF token → 序列化时下发 costPriceCny（内部结算成本）；
- *   匿名/游客/其他角色       → 响应里完全不含 costPriceCny 这个 key（见 isCostVisible + serializeHotel 等）。
+ *   带有效的其他角色 token    → 同游客，不含 costPriceCny（见 isCostVisible + serializeHotel 等）；
+ *   带了但无效/过期的 token   → 401（由 optionalAuthenticate 抛出），客户端续期后自动重试。
+ *     ——不再静默降级为游客：否则运营 token 一过期，成本价会整片消失且永不自愈。
  *   0702 后台反馈 6：修复前此接口不分角色一律下发成本价，任何人 curl 都能拿到进货价。
  * POST/PATCH/DELETE → ADMIN/STAFF（不变）
  *
@@ -28,7 +31,8 @@ import {
   updateVisaBodySchema,
 } from './products.schemas.js';
 
-/** req.user 由 optionalAuthenticate 在带有效 token 时设置；匿名/无效 token 时为 undefined。 */
+/** req.user 由 optionalAuthenticate 在带有效 token 时设置；不带 token（游客）时为 undefined。
+ *  带了但无效/过期的 token 走不到这里 —— optionalAuthenticate 已经抛 401。 */
 function isCostVisible(req: FastifyRequest): boolean {
   const role = req.user?.role;
   return role === UserRole.ADMIN || role === UserRole.STAFF;

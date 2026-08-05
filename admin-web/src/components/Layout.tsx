@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Link, NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../stores/auth';
-import { api, ApiError } from '../lib/api';
+import { api, ApiError, AUTH_REFRESH_UNAVAILABLE_CODE } from '../lib/api';
 import { ErrorBoundary } from './ErrorBoundary';
 
 const ROLE_LABEL: Record<string, string> = {
@@ -65,13 +65,25 @@ export function Layout() {
   /**
    * 启动时向后端验证 token 是否真有效 + 角色是否对得上。
    * 解决"篡改 localStorage 伪造身份进后台壳"的攻击场景。
-   * - 如果 me() 失败（token 不真/过期）→ logout + 跳登录
-   * - 如果后端返回的角色不是 ADMIN/STAFF（不一致）→ 同样登出
+   * - me() 被判会话失效（api 层放行出来的 401/403）→ logout + 跳登录
+   * - 后端返回的角色是 CUSTOMER（不该进后台）→ 同样登出
+   * - 其它错误（续期暂时不可用 / 网络抖动 / 5xx）→ 静默忽略，绝不登出
+   *
+   * ⚠️ 依赖数组用 userId + hasToken 这两个稳定标量，不用 tokens 对象：
+   * 每次静默续期都会换出一个新的 tokens 对象，若直接依赖它，这个体检会随每轮轮换重跑一次
+   * （运营开着后台一整天 ≈ 十几次无谓的 /users/me）。真正需要复验的是「换人登录了」或
+   * 「会话从无到有」，这两件事 userId / hasToken 都能表达。
    */
+  const userId = user?.id ?? null;
+  const hasToken = Boolean(tokens?.accessToken);
   useEffect(() => {
-    if (!tokens || !user) return;
+    if (!userId || !hasToken) return;
     let cancelled = false;
-    api.me(tokens.accessToken)
+    // 取当下最新的令牌（刻意不进依赖数组）：轮换后重跑不是目的，但真跑起来时必须用最新那枚。
+    const accessToken = useAuth.getState().tokens?.accessToken;
+    if (!accessToken) return;
+
+    api.me(accessToken)
       .then((res) => {
         if (cancelled) return;
         // 后台允许 ADMIN/STAFF/AGENT；CUSTOMER 踢出
@@ -81,12 +93,19 @@ export function Layout() {
       })
       .catch((err: unknown) => {
         if (cancelled) return;
-        if (err instanceof ApiError && (err.status === 401 || err.status === 403)) {
+        // 只认「会话确凿失效」：api 层已经把可恢复的失败（并发轮换竞争 / 网络抖动 / 刷新口 5xx）
+        // 翻译成 AUTH_REFRESH_UNAVAILABLE 而不是 401，所以能走到这里的 401/403 才是真该重登录。
+        // 其余一律静默 —— 一次瞬时故障不该把正在编辑的运营弹回登录页。
+        const isSessionDead =
+          err instanceof ApiError &&
+          err.code !== AUTH_REFRESH_UNAVAILABLE_CODE &&
+          (err.status === 401 || err.status === 403);
+        if (isSessionDead) {
           logout().then(() => navigate('/login', { replace: true }));
         }
       });
     return () => { cancelled = true; };
-  }, [tokens, user, logout, navigate]);
+  }, [userId, hasToken, logout, navigate]);
 
   // 切路由时收起抽屉（移动端）
   useEffect(() => { setDrawerOpen(false); }, [location.pathname]);

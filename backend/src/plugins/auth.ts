@@ -16,9 +16,10 @@ declare module 'fastify' {
     /** Verifies the Authorization bearer token and attaches request.user. */
     authenticate: (req: FastifyRequest, reply: FastifyReply) => Promise<void>;
     /**
-     * Best-effort auth: if an Authorization header is present and valid, attaches
-     * request.user; otherwise leaves it undefined and does NOT 401. Use for routes
-     * that work both logged-in and as guest (e.g. guest checkout).
+     * Optional auth for routes that work both logged-in and as guest (e.g. guest checkout).
+     * · 没带 Authorization 头 → 游客，request.user 保持 undefined，绝不 401；
+     * · 带了但无效/过期     → 401（让客户端去续期并自动重试，而不是被静默降级成游客）；
+     * · 带了且有效         → attaches request.user（停用代理除外，见实现）。
      */
     optionalAuthenticate: (req: FastifyRequest, reply: FastifyReply) => Promise<void>;
     /** Factory: returns a preHandler that requires one of the given roles. */
@@ -82,13 +83,18 @@ export const authPlugin = fp(async function authPlugin(app: FastifyInstance) {
     // No Authorization header → treat as guest, do not 401.
     const hasAuthHeader = typeof req.headers.authorization === 'string' && req.headers.authorization.length > 0;
     if (!hasAuthHeader) return;
-    // Header present but invalid/expired → also treat as guest (silently ignore).
+
+    // Header present but invalid/expired → 401（而不是静默降级为游客）。
+    //
+    // 口径变更的理由：静默降级会让「access token 刚过期」的登录用户毫无征兆地拿到游客视角——
+    // 后台产品页的成本价整片消失、下单被当成游客单而丢掉账号归属，且因为响应是 200，
+    // 客户端的 401 续期通道永远不会被触发，坏状态能一直挂着不自愈。
+    // 改成 401 后，客户端会静默续期并自动重试；真正的游客（不带头）路径分毫不动。
     // jwtVerify() populates req.user on success.
     try {
       await req.jwtVerify();
     } catch {
-      // leave req.user undefined; caller branches on its presence
-      return;
+      throw new UnauthorizedError('Invalid or expired access token');
     }
     // 口径：停用代理经 optionalAuthenticate = 降级为匿名，而非硬 401。
     // optionalAuthenticate 语义是「可选登录」，停用代理应等同「未登录」——清空 req.user 后，
