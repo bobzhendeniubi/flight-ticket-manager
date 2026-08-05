@@ -41,6 +41,19 @@ export interface IssueTokensContext {
  */
 const REFRESH_REUSE_GRACE_MS = 60_000;
 
+/**
+ * 「立即失效」时间戳：把 expiresAt 打到过去，让该 token 在 refresh 里走**过期分支（401）**，
+ * 而不是落进上面的并发宽限窗被当成良性竞争（409）。
+ *
+ * 宽限窗只该覆盖「轮换」造成的作废——那是正常使用中的毫秒级并发。而登出、以及重放检测触发的
+ * 全撤销，是**确凿的会话终结**：客户端必须立刻被判死并重新登录，绝不能收到「稍后重试」的 409
+ * ——否则被盗用场景里，其余会话在宽限窗内还能继续按「良性竞争」重试，踢不干净。
+ * 退 1 秒是为了避开同毫秒比较（`expiresAt < new Date()` 用严格小于）。
+ */
+function expireImmediately(): Date {
+  return new Date(Date.now() - 1000);
+}
+
 /** 并发刷新竞争：这一次刷新输给了同时发生的另一次轮换。非会话失效，调用方可忽略/重试。 */
 export class RefreshTokenRaceError extends AppError {
   constructor() {
@@ -128,9 +141,11 @@ export class AuthService {
     if (record.revokedAt) {
       const revokedAgeMs = Date.now() - record.revokedAt.getTime();
       if (revokedAgeMs > REFRESH_REUSE_GRACE_MS) {
+        // 全撤销同时把 expiresAt 打到过去：被撤销的兄弟会话下一次刷新直接吃 401（会话终结），
+        // 而不是在宽限窗里被当成良性并发竞争（409）继续重试——盗用场景必须踢干净。
         await prisma.refreshToken.updateMany({
           where: { userId: record.userId, revokedAt: null },
-          data: { revokedAt: new Date() },
+          data: { revokedAt: new Date(), expiresAt: expireImmediately() },
         });
         throw new UnauthorizedError('Refresh token reuse detected, please login again');
       }
@@ -267,9 +282,11 @@ export class AuthService {
   async logout(refreshToken: string): Promise<void> {
     const tokenHash = hashToken(refreshToken);
     // Idempotent: don't error if the token doesn't exist.
+    // 同时把 expiresAt 打到过去：主动登出是确凿的会话终结，登出后再拿这枚 token 来刷必须是 401，
+    // 而不是落进并发宽限窗被当成「稍后重试」的 409——否则客户端会以为会话还活着而反复重试。
     await prisma.refreshToken.updateMany({
       where: { tokenHash, revokedAt: null },
-      data: { revokedAt: new Date() },
+      data: { revokedAt: new Date(), expiresAt: expireImmediately() },
     });
   }
 

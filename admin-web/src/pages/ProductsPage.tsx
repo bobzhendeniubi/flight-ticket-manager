@@ -333,45 +333,90 @@ export function ProductsPage() {
 
   const tk = tokens?.accessToken ?? '';
 
+  /**
+   * 四类产品各自独立落地（allSettled，不是 all）。
+   *
+   * 旧写法用 Promise.all：任意一个接口失败（哪怕只是令牌续期撞上并发轮换的瞬时故障），
+   * 整个 then 被跳过 → 四个列表一个都不 setState → 每个 tab 计数全是 0，看着像"产品全没了"。
+   * 现在逐个结算：成功的照常落地，失败的**保留该列表已有数据**，只把失败的分类汇总成一条提示。
+   */
   useEffect(() => {
     let cancelled = false;
     setLoading(true);
-    Promise.all([
+    Promise.allSettled([
       // 带 tk：匿名/游客拿不到 costPriceCny（0702 反馈 6·成本泄漏修复），本页是后台运营页，
       // 必须带 ADMIN/STAFF token 才能看到/编辑成本价——否则「成本价进产品表单」的读回路会一直是空的。
       api.listHotels(false, tk),
       api.listTransfers(false, tk),
       api.listVisas(false, tk),
       api.listBundles(false),
-      api.listAllFlights(tk).catch(() => ({ flights: [] as AdminFlight[] })),
+      api.listAllFlights(tk),
     ])
-      .then(([h, t, v, b, f]) => {
+      .then(([hR, tR, vR, bR, fR]) => {
         if (cancelled) return;
-        const activeHotels = activeOnly(h.hotels);
-        setHotels(activeHotels.map(hotelApiToMock));
-        setTransfers(activeOnly(t.transfers).map(transferApiToMock));
-        setVisas(activeOnly(v.visas).map(visaApiToMock));
-        setBundles(activeOnly(b.bundles).map(bundleApiToMock));
-        setRoomTypeOptions(
-          activeHotels.flatMap((ht) =>
-            ht.roomTypes.map((rt) => ({
-              id: rt.id,
-              label: `${ht.name} · ${rt.name}`,
-              // 整间夜价 = 房型自身 basePrice（服务端权威取价源，与 hotelRoomType.nightlyPriceCny 落库口径一致）。
-              nightlyPriceCny: Math.round(Number(rt.basePrice)),
-              costPriceCny: rt.costPriceCny != null ? Number(rt.costPriceCny) : null,
-            })),
-          ),
+        const failed: string[] = [];
+
+        if (hR.status === 'fulfilled') {
+          const activeHotels = activeOnly(hR.value.hotels);
+          setHotels(activeHotels.map(hotelApiToMock));
+          setRoomTypeOptions(
+            activeHotels.flatMap((ht) =>
+              ht.roomTypes.map((rt) => ({
+                id: rt.id,
+                label: `${ht.name} · ${rt.name}`,
+                // 整间夜价 = 房型自身 basePrice（服务端权威取价源，与 hotelRoomType.nightlyPriceCny 落库口径一致）。
+                nightlyPriceCny: Math.round(Number(rt.basePrice)),
+                costPriceCny: rt.costPriceCny != null ? Number(rt.costPriceCny) : null,
+              })),
+            ),
+          );
+        } else failed.push('酒店');
+
+        if (tR.status === 'fulfilled') setTransfers(activeOnly(tR.value.transfers).map(transferApiToMock));
+        else failed.push('地面服务');
+
+        if (vR.status === 'fulfilled') setVisas(activeOnly(vR.value.visas).map(visaApiToMock));
+        else failed.push('签证');
+
+        if (bR.status === 'fulfilled') setBundles(activeOnly(bR.value.bundles).map(bundleApiToMock));
+        else failed.push('套餐');
+
+        // 航班号下拉是套餐表单的辅助项，拉不到就留空，不计入加载失败（沿用原有兜底口径）。
+        if (fR.status === 'fulfilled') setFlightOptions(flightsToOptions(fR.value.flights));
+
+        const firstReason = [hR, tR, vR, bR].find((r) => r.status === 'rejected') as
+          | PromiseRejectedResult
+          | undefined;
+        setError(
+          failed.length === 0
+            ? null
+            : `${failed.join('、')}加载失败（已保留上次数据，可点左侧「产品管理」重试）：${
+                firstReason?.reason instanceof ApiError ? firstReason.reason.message : '网络异常'
+              }`,
         );
-        setFlightOptions(flightsToOptions(f.flights));
-      })
-      .catch((e) => {
-        if (!cancelled) setError(e instanceof ApiError ? e.message : '加载失败');
       })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  /**
+   * 保存失败后的收尾：先以服务端为准重拉一次，拉到就用服务端真值，拉不到才回滚到本地旧值。
+   *
+   * 直接回滚 prev 会说谎 —— 写入其实已经成功、只是收尾的重拉失败时（例如令牌恰好在这一刻过期），
+   * 列表会把刚建好的记录抹掉：运营以为没保存上，于是再建一遍，服务端就多出一条重复记录。
+   */
+  async function refetchOrRollback<T>(
+    refetch: () => Promise<T[]>,
+    apply: (rows: T[]) => void,
+    rollback: () => void,
+  ): Promise<void> {
+    try {
+      apply(await refetch());
+    } catch {
+      rollback();
+    }
+  }
 
   async function persistHotels(next: MockHotelWithCost[]) {
     const prev = hotels;
@@ -421,7 +466,11 @@ export function ProductsPage() {
       setHotels(activeOnly(fresh.hotels).map(hotelApiToMock));
     } catch (e) {
       alert(formatApiError(e, '保存失败'));
-      setHotels(prev);
+      await refetchOrRollback(
+        async () => activeOnly((await api.listHotels(false, tk)).hotels).map(hotelApiToMock),
+        setHotels,
+        () => setHotels(prev),
+      );
     }
   }
 
@@ -463,7 +512,11 @@ export function ProductsPage() {
       setTransfers(activeOnly(fresh.transfers).map(transferApiToMock));
     } catch (e) {
       alert(formatApiError(e, '保存失败'));
-      setTransfers(prev);
+      await refetchOrRollback(
+        async () => activeOnly((await api.listTransfers(false, tk)).transfers).map(transferApiToMock),
+        setTransfers,
+        () => setTransfers(prev),
+      );
     }
   }
 
@@ -514,7 +567,11 @@ export function ProductsPage() {
       setVisas(activeOnly(fresh.visas).map(visaApiToMock));
     } catch (e) {
       alert(formatApiError(e, '保存失败'));
-      setVisas(prev);
+      await refetchOrRollback(
+        async () => activeOnly((await api.listVisas(false, tk)).visas).map(visaApiToMock),
+        setVisas,
+        () => setVisas(prev),
+      );
     }
   }
 
@@ -594,7 +651,11 @@ export function ProductsPage() {
       setBundles(activeOnly(fresh.bundles).map(bundleApiToMock));
     } catch (e) {
       alert(formatApiError(e, '保存失败'));
-      setBundles(prev);
+      await refetchOrRollback(
+        async () => activeOnly((await api.listBundles(false)).bundles).map(bundleApiToMock),
+        setBundles,
+        () => setBundles(prev),
+      );
     }
   }
 

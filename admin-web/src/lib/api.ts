@@ -79,10 +79,32 @@ type ApiRequestInit = Omit<RequestInit, 'body'> & {
   token?: string | null;
 };
 
+/**
+ * 「续期暂时不可用」的稳定 code：并发轮换竞争未收敛 / 网络抖动 / 刷新口 5xx。
+ * 会话仍然有效，只是这一次请求没能拿到可用的 accessToken —— 上层应提示重试，
+ * **绝不能**当成掉登录去清会话。真正的会话失效永远以原始 401 呈现。
+ */
+export const AUTH_REFRESH_UNAVAILABLE_CODE = 'AUTH_REFRESH_UNAVAILABLE';
+
+/**
+ * 续期结果（三态）。把「确凿失效」与「暂时拿不到」分开，是本模块的核心判据：
+ * 旧实现用 `string | null` 表达，两者都塌缩成 null → 一次并发轮换竞争 / 网络抖动被上层
+ * 当成掉登录（Layout 的 me() catch 里 401 → logout → 跳登录页），运营正编辑就被弹走。
+ *
+ * · refreshed   —— 拿到可用 accessToken（本次轮换出的，或兄弟标签刚轮换出、已落存储的那份）
+ * · expired     —— refresh token 确凿失效（401）：会话已清，放行原始 401 → 上层登出
+ * · unavailable —— 暂时不可用：会话保留，请求以 AUTH_REFRESH_UNAVAILABLE 失败，不登出
+ */
+export type RefreshOutcome =
+  | { status: 'refreshed'; accessToken: string }
+  | { status: 'expired' }
+  | { status: 'unavailable' };
+
 // ── Auth 续期桥：让请求层在 401 时静默换新 accessToken 并重试一次 ──────────────
 // 由 auth store 注册，避免 api.ts ↔ store 循环依赖。
-// 返回新的 accessToken；null = 续期失败（refresh token 失效），调用方放行 401 走登出。
-type RefreshAccessTokenFn = () => Promise<string | null>;
+// 入参 staleAccessToken = 刚被服务端判 401 的那枚 token：store 据此判断「本地以为还新鲜」
+// 的那枚是否可信（本机时钟偏差 / 兄弟标签已轮换，都靠它区分），避免原地打转。
+type RefreshAccessTokenFn = (staleAccessToken: string | null) => Promise<RefreshOutcome>;
 let refreshAccessToken: RefreshAccessTokenFn | null = null;
 export function registerAuthRefresh(fn: RefreshAccessTokenFn): void {
   refreshAccessToken = fn;
@@ -110,11 +132,21 @@ async function apiFetchWithRetry<T>(
   if (res.status === 204) return undefined as T;
 
   // access token 过期 → 用 refreshToken 静默换新，带新 token 重试一次（仅一次，避免死循环）。
-  // 只对带 token 的请求生效；续期失败（返回 null）则放行原始 401，由上层走登出。
+  // 只对带 token 的请求生效。三态分流（见 RefreshOutcome）：
+  //   refreshed 且换到了不同的 token → 原样重试原请求，用户操作不丢；
+  //   unavailable（并发轮换竞争未收敛 / 网络抖动 / 刷新口 5xx）→ 抛 AUTH_REFRESH_UNAVAILABLE，
+  //     **不是 401**，因此不会触发任何「401 即登出」的上层分支，会话原地保留；
+  //   expired（refresh token 确凿失效）/ 换回同一枚 token（服务端坚持拒它）→ 放行原始 401 走登出。
   if (res.status === 401 && init.token && allowRefreshRetry && refreshAccessToken) {
-    const newToken = await refreshAccessToken();
-    if (newToken && newToken !== init.token) {
-      return apiFetchWithRetry<T>(path, { ...init, token: newToken }, false);
+    const outcome = await refreshAccessToken(init.token);
+    if (outcome.status === 'refreshed' && outcome.accessToken !== init.token) {
+      return apiFetchWithRetry<T>(path, { ...init, token: outcome.accessToken }, false);
+    }
+    if (outcome.status === 'unavailable') {
+      throw new ApiError(503, {
+        code: AUTH_REFRESH_UNAVAILABLE_CODE,
+        message: '登录状态正在刷新，请稍后重试（会话未失效）',
+      });
     }
   }
 
