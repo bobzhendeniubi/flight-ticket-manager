@@ -300,6 +300,13 @@ function addDays(ymd: string, days: number): string {
   return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, '0')}-${String(dt.getUTCDate()).padStart(2, '0')}`;
 }
 
+/** 余位可能为负（超售口径不再钳 0），负数按「超售 N」展示，避免误读为可售。 */
+function cabinAvailText(available: number): string {
+  if (available > 0) return `余 ${available}`;
+  if (available === 0) return '售罄';
+  return `超售 ${-available}`;
+}
+
 interface SingleOrderModalProps {
   onClose: () => void;
   onCreated: () => void;
@@ -1666,7 +1673,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                           <option value="">选择舱位…</option>
                           {cabinOptions.map((c) => (
                             <option key={c.id} value={c.cabin}>
-                              {CABIN_ZH[c.cabin] ?? c.cabin}（余 {Math.max(0, c.available)}）¥{Number(c.basePrice).toFixed(0)}
+                              {CABIN_ZH[c.cabin] ?? c.cabin}（{cabinAvailText(c.available)}）¥{Number(c.basePrice).toFixed(0)}
                             </option>
                           ))}
                         </select>
@@ -1712,7 +1719,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                             <option value="">选择舱位…</option>
                             {returnCabinOptions.map((c) => (
                               <option key={c.id} value={c.cabin}>
-                                {CABIN_ZH[c.cabin] ?? c.cabin}（余 {Math.max(0, c.available)}）¥{Number(c.basePrice).toFixed(0)}
+                                {CABIN_ZH[c.cabin] ?? c.cabin}（{cabinAvailText(c.available)}）¥{Number(c.basePrice).toFixed(0)}
                               </option>
                             ))}
                           </select>
