@@ -1,0 +1,332 @@
+/**
+ * 机票结算价日历（ADMIN/STAFF）— 运营的机票报价表进系统：行 = 当月每天，列 = 在用航班号
+ * （去程/回程各一列），每格一个每人 OTA 结算价（CNY）。
+ *
+ * 数据源：backend/src/modules/settlement-rates/flight-settlement-rates.*
+ *   GET    /flight-settlement-rates?from&to&flightNumbers   月度网格查询
+ *   PUT    /flight-settlement-rates/batch                   批量 upsert（整批保存 / Excel 粘贴块）
+ *   DELETE /flight-settlement-rates/:id                     删除一格
+ *
+ * 口径：代理下**纯机票单**时，服务端按每条航段的航班号 + 出发地本地日在此表自动取每人价，
+ * 全部航段都命中才自动收敛订单总额；任一航段没维护则照常走动态定价（代理改不了这个价）。
+ */
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import {
+  api,
+  ApiError,
+  type AdminFlight,
+  type FlightSettlementRate,
+  type FlightSettlementRateWriteEntry,
+} from '../lib/api';
+import {
+  WEEKDAYS,
+  currentMonth,
+  daysInMonth,
+  parsePasteBlock,
+  weekdayOf,
+} from '../lib/settlementCalendar';
+import { useAuth } from '../stores/auth';
+
+function cellKey(date: string, flightNumber: string): string {
+  return `${date}__${flightNumber}`;
+}
+
+export function FlightSettlementRatesPanel() {
+  const tokens = useAuth((s) => s.tokens);
+  const token = tokens?.accessToken ?? '';
+
+  const [month, setMonth] = useState<string>(currentMonth());
+  const [flights, setFlights] = useState<AdminFlight[]>([]);
+  const [rates, setRates] = useState<FlightSettlementRate[]>([]);
+  // 编辑草稿：cellKey → 输入框字符串（空串 = 清空该格）。整批保存时与已加载 rates 对比出增删改。
+  const [draft, setDraft] = useState<Map<string, string>>(new Map());
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [pasteWarning, setPasteWarning] = useState<string | null>(null);
+  const [nonce, setNonce] = useState(0);
+
+  const days = useMemo(() => daysInMonth(month), [month]);
+
+  // 列 = 在用航班号（去程/回程都列，按航班号排序，顺序稳定便于对着报价表粘贴）
+  const flightNumbers = useMemo(
+    () =>
+      flights
+        .filter((f) => f.isActive)
+        .map((f) => f.flightNumber)
+        .sort((a, b) => a.localeCompare(b)),
+    [flights],
+  );
+
+  // 航班号 → 航线（列头副标题，让运营一眼看出哪列是去程/回程）
+  const routeOf = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const f of flights) map.set(f.flightNumber, `${f.originCode}→${f.destinationCode}`);
+    return map;
+  }, [flights]);
+
+  const rateByKey = useMemo(() => {
+    const map = new Map<string, FlightSettlementRate>();
+    for (const r of rates) map.set(cellKey(r.departDate, r.flightNumber), r);
+    return map;
+  }, [rates]);
+
+  // 最近更新时间（updatedBy 是 userId，只展示时间避免误露内部账号）
+  const lastUpdated = useMemo(() => {
+    if (rates.length === 0) return null;
+    return rates.reduce((max, r) => (r.updatedAt > max ? r.updatedAt : max), rates[0].updatedAt);
+  }, [rates]);
+
+  useEffect(() => {
+    if (!token) return;
+    api
+      .listAllFlights(token)
+      .then((r) => setFlights(r.flights))
+      .catch((e: unknown) => setError(e instanceof ApiError ? e.message : '航班列表加载失败'));
+  }, [token]);
+
+  const load = useCallback(async () => {
+    if (!token || days.length === 0) return;
+    setLoading(true);
+    setError(null);
+    try {
+      // 不传 flightNumbers：一次拉当月全部航班号的价（含已停用航班的历史价，不至于静默丢数据）
+      const res = await api.listFlightSettlementRates(token, {
+        from: days[0],
+        to: days[days.length - 1],
+      });
+      setRates(res.rates);
+      const next = new Map<string, string>();
+      for (const r of res.rates) {
+        next.set(cellKey(r.departDate, r.flightNumber), String(r.pricePerPersonCny));
+      }
+      setDraft(next);
+    } catch (e: unknown) {
+      setError(e instanceof ApiError ? e.message : '机票结算价加载失败');
+    } finally {
+      setLoading(false);
+    }
+  }, [token, days]);
+
+  useEffect(() => {
+    void load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token, month, nonce]);
+
+  function setCell(date: string, flightNumber: string, value: string) {
+    setDraft((prev) => {
+      const next = new Map(prev);
+      next.set(cellKey(date, flightNumber), value);
+      return next;
+    });
+  }
+
+  /**
+   * Excel 块状粘贴：从命中的格子（startDay × startFlight）向右下铺开填充。
+   * 行按换行、列按 tab 拆分——对应运营报价表「一个日期分几个航班」的列结构。
+   * 超出网格范围（行超出当月天数 / 列超出航班数）的部分静默丢弃，但提示丢了多少格。
+   */
+  function handlePaste(
+    e: React.ClipboardEvent<HTMLInputElement>,
+    startDayIdx: number,
+    startFlightIdx: number,
+  ) {
+    const block = parsePasteBlock(e.clipboardData.getData('text'));
+    if (!block) return; // 单值 → 默认行为
+    e.preventDefault();
+    const updates: Array<[string, string]> = [];
+    let overflow = 0;
+    block.forEach((row, r) => {
+      row.forEach((value, c) => {
+        const dayIdx = startDayIdx + r;
+        const flightIdx = startFlightIdx + c;
+        if (dayIdx >= days.length || flightIdx >= flightNumbers.length) {
+          overflow += 1;
+          return;
+        }
+        updates.push([cellKey(days[dayIdx], flightNumbers[flightIdx]), value]);
+      });
+    });
+    setDraft((prev) => {
+      const next = new Map(prev);
+      for (const [key, value] of updates) next.set(key, value);
+      return next;
+    });
+    setPasteWarning(overflow > 0 ? `粘贴溢出 ${overflow} 格已忽略（超出当月天数或航班列数）` : null);
+  }
+
+  async function save() {
+    if (!token) return;
+    setSaving(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const upserts: FlightSettlementRateWriteEntry[] = [];
+      const deletes: string[] = [];
+      for (const date of days) {
+        for (const flightNumber of flightNumbers) {
+          const key = cellKey(date, flightNumber);
+          const trimmed = (draft.get(key) ?? '').trim();
+          const existing = rateByKey.get(key);
+          if (trimmed === '') {
+            if (existing) deletes.push(existing.id); // 清空已存在的格 → 删除
+            continue;
+          }
+          const v = Number(trimmed);
+          if (!Number.isFinite(v) || !Number.isInteger(v) || v < 0) {
+            throw new Error(`${date} ${flightNumber} 的价格「${trimmed}」不是有效整数`);
+          }
+          // 仅提交新增/改动的格（幂等 upsert 也可，但少发无谓写）
+          if (!existing || existing.pricePerPersonCny !== v) {
+            upserts.push({ flightNumber, departDate: date, pricePerPersonCny: v });
+          }
+        }
+      }
+      if (upserts.length === 0 && deletes.length === 0) {
+        setNotice('没有改动');
+        setSaving(false);
+        return;
+      }
+      if (upserts.length > 0) await api.upsertFlightSettlementRates(token, upserts);
+      for (const id of deletes) await api.deleteFlightSettlementRate(token, id);
+      setNotice(`已保存：更新 ${upserts.length} 格，删除 ${deletes.length} 格`);
+      setNonce((n) => n + 1);
+    } catch (e: unknown) {
+      setError(e instanceof ApiError ? e.message : e instanceof Error ? e.message : '保存失败');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const dirty = useMemo(() => {
+    for (const date of days) {
+      for (const flightNumber of flightNumbers) {
+        const key = cellKey(date, flightNumber);
+        const trimmed = (draft.get(key) ?? '').trim();
+        const existing = rateByKey.get(key);
+        if (trimmed === '' && existing) return true;
+        if (trimmed !== '' && (!existing || String(existing.pricePerPersonCny) !== trimmed)) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }, [draft, days, flightNumbers, rateByKey]);
+
+  return (
+    <section className="card space-y-4">
+      <div className="flex flex-wrap items-end gap-4">
+        <div>
+          <label className="label">月份</label>
+          <input
+            type="month"
+            className="input"
+            value={month}
+            onChange={(e) => setMonth(e.target.value)}
+          />
+        </div>
+        <div className="ml-auto flex items-center gap-3">
+          {lastUpdated && (
+            <span className="text-[11px] text-ink-muted">
+              最近更新：{new Date(lastUpdated).toLocaleString('zh-CN')}
+            </span>
+          )}
+          <button
+            type="button"
+            className="btn-primary"
+            disabled={saving || !dirty}
+            onClick={() => void save()}
+          >
+            {saving ? '保存中…' : '整批保存'}
+          </button>
+        </div>
+      </div>
+
+      {error && (
+        <div className="rounded-md bg-rose-50 px-3 py-2 text-sm text-rose-700 ring-1 ring-rose-200">
+          {error}
+        </div>
+      )}
+      {notice && (
+        <div className="rounded-md bg-emerald-50 px-3 py-2 text-sm text-emerald-700 ring-1 ring-emerald-200">
+          {notice}
+        </div>
+      )}
+      {pasteWarning && (
+        <div className="rounded-md bg-amber-50 px-3 py-2 text-sm text-amber-700 ring-1 ring-amber-200">
+          {pasteWarning}
+        </div>
+      )}
+      <p className="text-[11px] text-ink-muted">
+        提示：行 = 该月每天，列 = 在用航班号（去程 / 回程各一列）。可从 Excel 复制一块「日期 ×
+        航班」区域，选中起始格后直接粘贴（Ctrl/⌘+V）批量填充；清空格子并保存即删除该价。
+        代理下纯机票单时按各航段的航班号 + 出发日在此表自动取每人价（全部航段都有价才自动取，代理改不了）。
+      </p>
+
+      {loading ? (
+        <div className="py-10 text-center text-sm text-ink-muted">加载中…</div>
+      ) : flightNumbers.length === 0 ? (
+        <div className="py-10 text-center text-sm text-ink-muted">
+          暂无在用航班，请先在「航班」页建档后再维护结算价。
+        </div>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="min-w-full border-collapse text-sm">
+            <thead>
+              <tr className="border-b border-slate-200 text-left text-ink-muted">
+                <th className="sticky left-0 z-10 bg-white px-3 py-2 font-medium">出发日期</th>
+                {flightNumbers.map((fn) => (
+                  <th key={fn} className="px-3 py-2 text-center font-medium">
+                    <div className="tabular-nums">{fn}</div>
+                    <div className="text-[10px] font-normal text-ink-muted">
+                      {routeOf.get(fn) ?? ''}
+                    </div>
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {days.map((date, dayIdx) => {
+                const wd = weekdayOf(date);
+                const weekend = wd === 0 || wd === 6;
+                return (
+                  <tr key={date} className="border-b border-slate-100">
+                    <td
+                      className={`sticky left-0 z-10 bg-white px-3 py-1.5 whitespace-nowrap tabular-nums ${
+                        weekend ? 'text-rose-600' : 'text-ink'
+                      }`}
+                    >
+                      {date.slice(5)} 周{WEEKDAYS[wd]}
+                    </td>
+                    {flightNumbers.map((fn, flightIdx) => {
+                      const key = cellKey(date, fn);
+                      const existing = rateByKey.get(key);
+                      return (
+                        <td key={fn} className="px-1 py-1">
+                          <input
+                            inputMode="numeric"
+                            className="input w-full text-right tabular-nums"
+                            placeholder="—"
+                            value={draft.get(key) ?? ''}
+                            title={
+                              existing
+                                ? `最近更新：${new Date(existing.updatedAt).toLocaleString('zh-CN')}`
+                                : undefined
+                            }
+                            onChange={(e) => setCell(date, fn, e.target.value)}
+                            onPaste={(e) => handlePaste(e, dayIdx, flightIdx)}
+                          />
+                        </td>
+                      );
+                    })}
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}

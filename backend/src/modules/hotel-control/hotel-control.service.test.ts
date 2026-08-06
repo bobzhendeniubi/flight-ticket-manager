@@ -35,6 +35,7 @@ import {
   getRandomTierAggregate,
   assertRandomTierFit,
   createBlockPeriod,
+  listBlockPeriods,
   getRecentRoomChanges,
 } from './hotel-control.service.js';
 
@@ -1338,6 +1339,109 @@ describe('星级随机档：销控板聚合组', () => {
     expect(alerts.surplusSoon.some((s) => s.hotelName === '明月酒店')).toBe(true);
   });
 
+  // ── 占位酒店（早期用假酒店承载随机档留下的形态）──────────────────────────
+  /**
+   * 占位酒店 = Hotel.randomTierPlaceholder 非空。它不是真房源：
+   *   1. 不作为酒店组出现在销控板上（否则板面会既有「随机三星」酒店组又有同名聚合组）；
+   *   2. 名下的切房周期不计入包房（否则与同星级真酒店的库存双记一笔账）；
+   *   3. 落在它房型上的订单行 = **未落位**占用，计进该档次聚合组的用房；
+   *   4. 把它落位到真酒店 → 该酒店用房 +1、未落位 −1 ⇒ 聚合合计不变（对账恒等照样成立）。
+   * 判定一律看该列，绝不按酒店名字匹配。
+   */
+  /** 占位酒店的切房周期 fixture（存量数据，读路径一律不认）。*/
+  const placeholderPeriod = (
+    hotelId: string,
+    name: string,
+    tier: number,
+    rooms: number,
+  ) =>
+    hotelPeriod(hotelId, name, tier, rooms, {
+      hotel: { name, starRating: tier, intlFiveStar: false, randomTierPlaceholder: tier },
+    });
+  /** 伪落位行：房型挂在占位酒店上（业务上还没落到任何真酒店）。*/
+  const placeholderItem = (
+    hotelId: string,
+    name: string,
+    tier: number,
+    over: Record<string, unknown> = {},
+  ) =>
+    hotelItem(hotelId, name, tier, {
+      hotelRoomType: {
+        hotelId,
+        hotel: { name, starRating: tier, intlFiveStar: false, randomTierPlaceholder: tier },
+      },
+      ...over,
+    });
+
+  it('占位酒店不作为酒店组出现，名下切房周期一律不计入包房', async () => {
+    const client = poolBoardClient(
+      [
+        hotelPeriod('h1', '明月酒店', 3, 5),
+        placeholderPeriod('ph3', '随机三星', 3, 20),
+      ],
+      [],
+    );
+    const board = await getBoard({ from: dayStr(0), to: dayStr(0) }, client);
+    expect(board.hotels.some((h) => h.hotelId === 'ph3')).toBe(false);
+    const tier = board.hotels.find((h) => h.randomStarTier === 3)!;
+    expect(tier.rows.block).toEqual([5]); // 占位项的 20 间没进来
+    expect(tier.rows.remaining).toEqual([5]);
+  });
+
+  it('落在占位酒店房型上的订单行算「未落位」，计进聚合组的用房', async () => {
+    const client = poolBoardClient(
+      [hotelPeriod('h1', '明月酒店', 3, 5), placeholderPeriod('ph3', '随机三星', 3, 20)],
+      [placeholderItem('ph3', '随机三星', 3), pendingItem(3)],
+    );
+    const board = await getBoard({ from: dayStr(0), to: dayStr(0) }, client);
+    const tier = board.hotels.find((h) => h.randomStarTier === 3)!;
+    // 伪落位 1 间 + 正规未落位随机单 1 间，两类同吃「未落位」这一行
+    expect(tier.rows.used).toEqual([2]);
+    expect(tier.rows.remaining).toEqual([3]);
+    // 占位项没有自己的酒店行，那 1 间不会在别处被重复计一笔
+    expect(board.hotels.filter((h) => h.rows.used[0] > 0)).toHaveLength(1);
+  });
+
+  it('对账恒等：把伪落位行落到真酒店，随机档合计余量不变', async () => {
+    const periods = [hotelPeriod('h1', '明月酒店', 4, 6), placeholderPeriod('ph4', '随机四星', 4, 40)];
+    const before = await getBoard(
+      { from: dayStr(0), to: dayStr(0) },
+      poolBoardClient(periods, [placeholderItem('ph4', '随机四星', 4)]),
+    );
+    const after = await getBoard(
+      { from: dayStr(0), to: dayStr(0) },
+      poolBoardClient(periods, [hotelItem('h1', '明月酒店', 4)]),
+    );
+    const tierOf = (b: typeof before) => b.hotels.find((h) => h.randomStarTier === 4)!;
+    expect(tierOf(before).rows.remaining).toEqual([5]);
+    expect(tierOf(after).rows.remaining).toEqual([5]); // 合计原地不动
+    // 用房从「未落位」转到明月名下
+    expect(tierOf(before).rows.used).toEqual([1]);
+    expect(tierOf(after).rows.used).toEqual([0]);
+    expect(after.hotels.find((h) => h.hotelId === 'h1')!.rows.used).toEqual([1]);
+  });
+
+  it('五星随机聚合组成立，但国际五星仍被排除在合计外', async () => {
+    const client = poolBoardClient(
+      [
+        hotelPeriod('h1', '棕榈五星', 5, 7),
+        hotelPeriod('h2', '洲际酒店', 5, 30, {
+          hotel: { name: '洲际酒店', starRating: 5, intlFiveStar: true, randomTierPlaceholder: null },
+        }),
+        placeholderPeriod('ph5', '随机五星', 5, 50),
+      ],
+      [placeholderItem('ph5', '随机五星', 5)],
+    );
+    const board = await getBoard({ from: dayStr(0), to: dayStr(0) }, client);
+    const tier5 = board.hotels.find((h) => h.randomStarTier === 5)!;
+    expect(tier5.hotelName).toBe('五星随机');
+    expect(tier5.rows.block).toEqual([7]); // 只有棕榈的 7 间：国际五星与占位项都不算
+    expect(tier5.rows.used).toEqual([1]);
+    expect(tier5.rows.remaining).toEqual([6]);
+    // 国际五星仍作为普通酒店组自己列一行（只是不进聚合）
+    expect(board.hotels.some((h) => h.hotelId === 'h2')).toBe(true);
+  });
+
   it('远期总量：控房不含聚合组（否则同一批房算两遍），收客含未落位随机单', async () => {
     const client = poolBoardClient(
       [hotelPeriod('h1', '明月酒店', 3, 5)],
@@ -1377,8 +1481,11 @@ describe('星级随机档：未落位随机单的占房下钻', () => {
     expect(occupants).toHaveLength(1);
     expect(occupants[0].orderNumber).toBe('CT250001');
     const where = (client.orderItem.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0].where;
-    expect(where.hotelRoomTypeId).toBeNull();
-    expect(where.randomStarTier).toBe(4);
+    // 两类未落位行都要下钻得到：正规随机单（无房型 + 档次命中）＋ 挂在占位酒店房型上的伪落位行
+    expect(where.OR).toEqual([
+      { hotelRoomTypeId: null, randomStarTier: 4 },
+      { hotelRoomType: { hotel: { randomTierPlaceholder: 4 } } },
+    ]);
   });
 });
 
@@ -1419,9 +1526,20 @@ describe('星级随机档：下单闸 assertRandomTierFit / getRandomTierAggrega
     const agg = await getRandomTierAggregate(3, [dayStr(0)], {}, client);
     expect(agg).toMatchObject({ hasBlock: true, block: [7], hotelUsed: [2], pendingUsed: [1] });
     expect(agg.remaining).toEqual([4]);
-    // 档次筛选口径：starRating 命中且排除国际五星
+    // 档次筛选口径：starRating 命中，且排除国际五星与占位酒店（两者都不是该档的真房源）
     const hotelWhere = (client.hotel.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0].where;
-    expect(hotelWhere).toMatchObject({ starRating: 3, intlFiveStar: false });
+    expect(hotelWhere).toMatchObject({
+      starRating: 3,
+      intlFiveStar: false,
+      randomTierPlaceholder: null,
+    });
+    // 未落位占用同吃两类行：正规随机单 ＋ 挂在该档占位酒店房型上的伪落位行
+    const pendingWhere = (client.orderItem.findMany as ReturnType<typeof vi.fn>).mock.calls[1][0]
+      .where;
+    expect(pendingWhere.OR).toEqual([
+      { hotelRoomTypeId: null, randomStarTier: 3 },
+      { hotelRoomType: { hotel: { randomTierPlaceholder: 3 } } },
+    ]);
   });
 
   it('余量够 → 放行；不够 → 拦下并点名档次与该晚余量', async () => {
@@ -1462,9 +1580,9 @@ describe('星级随机档：下单闸 assertRandomTierFit / getRandomTierAggrega
 
 describe('createBlockPeriod：只能挂具体酒店（随机档已废建池）', () => {
   const baseBody = { dateFrom: dayStr(0), dateTo: dayStr(3), rooms: 5 };
-  function createClient(): PrismaClient {
+  function createClient(hotel: Record<string, unknown> = { id: 'h1' }): PrismaClient {
     return {
-      hotel: { findUnique: vi.fn().mockResolvedValue({ id: 'h1' }) },
+      hotel: { findUnique: vi.fn().mockResolvedValue(hotel) },
       hotelBlockPeriod: {
         create: vi.fn().mockImplementation(({ data }: { data: Record<string, unknown> }) =>
           Promise.resolve({
@@ -1498,11 +1616,69 @@ describe('createBlockPeriod：只能挂具体酒店（随机档已废建池）',
     ).rejects.toThrow(/无需单独切池/);
   });
 
-  it('只给酒店 → 正常落库（randomStarTier 恒为 null）', async () => {
+  it('只给酒店 → 正常落库（randomStarTier 恒为 null，不打已停用标）', async () => {
     const period = await createBlockPeriod(
       { ...baseBody, hotelId: 'h1' } as never,
       createClient(),
     );
-    expect(period).toMatchObject({ hotelId: 'h1', randomStarTier: null, hotelName: '明月酒店' });
+    expect(period).toMatchObject({
+      hotelId: 'h1',
+      randomStarTier: null,
+      hotelName: '明月酒店',
+      disabled: false,
+    });
+  });
+
+  it('给随机档占位酒店 → 拒（它不是真房源，切房会与同星级真酒店双记一笔账）', async () => {
+    await expect(
+      createBlockPeriod(
+        { ...baseBody, hotelId: 'ph3' } as never,
+        createClient({ id: 'ph3', randomTierPlaceholder: 3 }),
+      ),
+    ).rejects.toThrow(/星级随机档占位项，不能切房/);
+  });
+});
+
+describe('listBlockPeriods：已停用标记（不计入余量的存量周期）', () => {
+  function listClient(rows: unknown[]): PrismaClient {
+    return {
+      hotelBlockPeriod: { findMany: vi.fn().mockResolvedValue(rows) },
+    } as unknown as PrismaClient;
+  }
+  const row = (over: Record<string, unknown>) => ({
+    id: 'bp1',
+    hotelId: 'h1',
+    randomStarTier: null,
+    dateFrom: day(0),
+    dateTo: day(3),
+    rooms: 5,
+    unitPrice: null,
+    note: null,
+    updatedAt: new Date('2026-08-01T00:00:00.000Z'),
+    hotel: { name: '明月酒店', randomTierPlaceholder: null },
+    ...over,
+  });
+
+  it('真酒店周期 → 正常计入（disabled=false）', async () => {
+    const [p] = await listBlockPeriods({}, listClient([row({})]));
+    expect(p.disabled).toBe(false);
+  });
+
+  it('存量随机档池周期 → 已停用', async () => {
+    const [p] = await listBlockPeriods(
+      {},
+      listClient([row({ hotelId: null, randomStarTier: 3, hotel: null })]),
+    );
+    expect(p).toMatchObject({ disabled: true, hotelName: '三星随机' });
+  });
+
+  it('挂在占位酒店名下的周期 → 同款已停用', async () => {
+    const [p] = await listBlockPeriods(
+      {},
+      listClient([
+        row({ hotelId: 'ph3', hotel: { name: '随机三星', randomTierPlaceholder: 3 } }),
+      ]),
+    );
+    expect(p).toMatchObject({ disabled: true, hotelName: '随机三星' });
   });
 });

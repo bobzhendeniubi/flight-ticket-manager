@@ -125,13 +125,17 @@ function readShared(rows: unknown): SharedRows {
 const STICKY_COL1 = 'sticky left-0 z-10 min-w-[11rem] bg-white';
 const STICKY_COL2 = 'sticky left-[11rem] z-10 min-w-[3.5rem] bg-white';
 
-// ── 星级随机档（三星随机 / 四星随机）─────────────────────────────────────────
+// ── 星级随机档（三星随机 / 四星随机 / 五星随机）───────────────────────────────
 /**
  * 随机档**不是**单独切的库存，而是同星级酒店库存的派生聚合：
- *   随机N星余量 = Σ(同星级酒店余量) − 未落位随机单占用
+ *   随机N星余量 = Σ(同星级酒店余量) − 未落位占用
  * 所以页面里没有「建随机档周期」这回事（后端也拒建），它只在销控矩阵/远期里作为一个
  * 聚合分组出现。判定一律看 `randomStarTier` 非空 —— 聚合组的 hotelId 是后端合成键，
  * 不能当酒店 id 用。
+ *
+ * 「未落位占用」还包含仍挂在随机档**占位酒店**（Hotel.randomTierPlaceholder 非空，早期
+ * 用假酒店承载随机档留下的形态）房型上的订单行。占位酒店不作为酒店组出现在销控矩阵里，
+ * 名下的切房周期在下面的周期列表里打「已停用」灰标（后端下发 period.disabled）。
  */
 
 export function HotelControlPage() {
@@ -1472,6 +1476,8 @@ function BlockPeriodsEditor({ token, onChanged }: { token: string; onChanged: ()
       .then((d) => {
         if (cancelled) return;
         const opts = d.hotels
+          // 随机档占位项不是真实酒店，给它切房 = 与同星级真酒店的库存双记一笔账（后端也拒建）
+          .filter((h) => h.randomTierPlaceholder == null)
           .map((h) => ({ id: h.id, label: h.code ? `${h.code} · ${h.name}` : h.name }))
           .sort((a, b) => a.label.localeCompare(b.label, 'zh-CN'));
         setHotelOptions(opts);
@@ -1502,11 +1508,11 @@ function BlockPeriodsEditor({ token, onChanged }: { token: string; onChanged: ()
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div>
           <h2 className="text-sm font-semibold text-ink">
-            包房周期管理（按 酒店 / 星级随机池 × 日期段 定切房间数 / 单价；周期可叠加）
+            包房周期管理（按 酒店 × 日期段 定切房间数 / 单价；周期可叠加）
           </h2>
           <p className="mt-1 text-xs text-ink-muted">
             为某家酒店在某段日期切下固定间数。销控板的「包房」= 当天所有覆盖周期 rooms 之和。
-            也可切「三星随机 / 四星随机」——按星级切总量，客人下单先占池，之后由房控落到具体酒店，与具体酒店的包房互不扣减。
+            星级随机档不用单独切房——它就是同星级各酒店包房的合计；标「已停用」的周期不计入任何余量，仅留作查账。
           </p>
         </div>
         <button
@@ -1794,10 +1800,14 @@ function BlockPeriodRow({
       <tr className="border-b border-slate-100 last:border-0 hover:bg-slate-50/60">
         <td className="py-2 font-medium text-ink">
           {period.hotelName}
-          {period.randomStarTier != null && (
+          {period.disabled && (
             <span
               className="ml-1.5 inline-flex items-center rounded-full bg-slate-100 px-1.5 text-[10px] font-semibold leading-4 text-slate-500 ring-1 ring-slate-300"
-              title="历史遗留的随机档周期：随机档已改为同星级酒店合计，这条周期不再计入任何余量，仅保留供查账；可直接删除"
+              title={
+                period.randomStarTier != null
+                  ? '历史遗留的随机档周期：随机档已改为同星级酒店合计，这条周期不再计入任何余量，仅保留供查账；可直接删除'
+                  : '这家是随机档的占位项，不是真实酒店：它的切房不计入任何余量（否则同一批房算两遍），仅保留供查账；可直接删除'
+              }
             >
               已停用
             </span>

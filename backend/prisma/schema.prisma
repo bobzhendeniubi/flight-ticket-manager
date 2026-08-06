@@ -717,6 +717,24 @@ model Hotel {
   // starRating 仍是纯 1..5 整数语义不变；国际五星 = starRating=5 且本标记为 true。
   // 不参与 hotel-control 随机池分类（RANDOM_STAR_TIERS 只按 3/4 星分池，不受影响）。
   intlFiveStar Boolean @default(false)
+  // 星级随机档的「占位酒店」标记（3/4/5 = 该占位酒店代表哪个随机档；NULL = 真实酒店）。
+  //
+  // 历史包袱：随机档最早是靠建几家假酒店（「随机三星」「随机四星」…）承载的 —— 套餐绑它们的房型、
+  // 订单行落在它们的房型上。随机档改为「同星级真酒店的派生聚合」后，这些假酒店若被当成真酒店参与
+  // 合计，同一批房就会被算两遍，销控板上还会既出现酒店组又出现聚合组的同名两行。
+  //
+  // 因此打上本标记的酒店在房控口径里一律「不是酒店」：
+  //   · 不进 Σ真酒店余量（与 intlFiveStar 的排除并列）；
+  //   · 名下的切房周期不计入任何余量（照存量池周期同款「已停用」处理，也不许新建）；
+  //   · 落在它房型上的订单行 = **未落位**占用，计入对应档次聚合组的「用房（未落位）」。
+  // 落位 = 走换酒店流程把房型换到真酒店（占用从「未落位」转到该酒店，聚合合计不变）。
+  //
+  // 判定一律看本列，**绝不按酒店名字匹配**。存量数据由运维在部署时按 id 回填。
+  randomTierPlaceholder Int?
+  // 指定酒店加价（CNY/人）：套餐按「星级随机」报价，客人点名要住本酒店时按占座人数加收的
+  // 每人差价（业务口径：同业报价基础上按指定酒店加收，各酒店差价不同，运营各配各的）。
+  // 0 = 本酒店指定不加价。仅套餐录单「指定酒店」路径读取；单独 HOTEL 行按房型价成交，不叠加。
+  designationSurchargeCnyPerPerson Int @default(0)
   basePrice   Decimal? @db.Decimal(10, 2) // 起步价（展示用）
   rating      Decimal? @db.Decimal(3, 2) // 客户评分 0-5（兜底展示；真实评分由 Review 聚合覆盖）
   reviewCount Int?
@@ -881,7 +899,12 @@ model Visa {
   photo              String? // 卡片展示图（URL）
   processingDays     Int
   basePrice          Decimal             @db.Decimal(10, 2)
+  // 旧的单值加急费（保留不动，老数据/未配分档的产品仍按它计价与展示）
   expressSurcharge   Decimal?            @db.Decimal(10, 2)
+  // 加急分档（运营自配）：[{ label: "一工", workDays: 1, surchargeCny: 100 }, ...]
+  // 不同加急等级出签天数不同、加价不同。[] = 未配分档 → 回落 expressSurcharge 单值口径。
+  // 定价只认这里的 surchargeCny（服务端按档名查表加价，客户端只传档名不传金额）。
+  expressTiers       Json                @default("[]")
   // 使馆/代办成本（CNY）— NULL 时按 basePrice × 0.55 估算（签证毛利通常更高）
   costPriceCny       Decimal?            @db.Decimal(10, 2)
   validityMonths     Int? // 签证有效期（月）
@@ -923,6 +946,26 @@ model SettlementRate {
   updatedAt         DateTime       @updatedAt
 
   @@unique([tier, nights, departDate])
+  @@index([departDate])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 机票结算价日历 — 运营按「航班号 × 出发日期」维护的同业结算价（每人 CNY）。
+// 对应运营的机票报价表：行 = 日期，列 = 航班（去程 / 回程各一列），每格一个 OTA 结算价/人。
+// 代理下**纯机票单**时按每条航段的班次航班号 + 出发地本地日自动取价（服务端权威定价）。
+// 与 SettlementRate（地面整包价：档次 × 晚数）互不重叠：那张管地面，这张管机票航段。
+// ─────────────────────────────────────────────────────────────────────────────
+model FlightSettlementRate {
+  id                String   @id @default(cuid())
+  flightNumber      String // 航班号（如 QH9589）；不引外键——报价表可先于航班建档维护
+  departDate        DateTime @db.Date // 出发地本地出发日（date-only）
+  pricePerPersonCny Int // 每人结算价（CNY，整数）
+  note              String?
+  updatedBy         String? // 最近更新人 userId（审计冗余，展示"谁改的"）
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@unique([flightNumber, departDate])
   @@index([departDate])
 }
 

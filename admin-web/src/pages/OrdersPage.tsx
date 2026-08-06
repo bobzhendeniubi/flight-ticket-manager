@@ -7,7 +7,7 @@ import {
   type FulfillmentStatus,
 } from '../lib/mockData';
 import { exportToCSV } from '../lib/csvExport';
-import { AIRPORTS } from '../lib/airports';
+import { AIRPORTS, localYmd } from '../lib/airports';
 import { NumberInput } from '../components/NumberInput';
 import { parseOtaRoster } from '../lib/parseOtaRoster';
 import { computePerPaxSettlement } from '../lib/perPaxSettlement';
@@ -890,19 +890,6 @@ export function OrdersPage() {
     () => selectedOrders.reduce((sum, o) => sum + o.passengers.length, 0),
     [selectedOrders],
   );
-  // 已选订单里「未落位随机池行」（orderId → 该单命中的池占房行）——批量选酒店只对这些行生效，
-  // 其余单（没有池占房行的）批量落位时会被跳过。
-  const selectedPoolItems = useMemo(() => {
-    const map = new Map<string, OrderItem[]>();
-    for (const o of selectedOrders) {
-      const poolItems = (o.items ?? []).filter(
-        (it) => it.kind === 'HOTEL' && !it.hotelRoomTypeId && it.randomStarTier != null,
-      );
-      if (poolItems.length > 0) map.set(o.id, poolItems);
-    }
-    return map;
-  }, [selectedOrders]);
-  const selectedPoolOrderCount = selectedPoolItems.size;
   // 批量选酒店用：在架酒店 + 房型列表，选中订单后按需拉一次（避免未用到该功能时空跑请求）。
   useEffect(() => {
     if (!tokens?.accessToken || selectedIds.size === 0 || bulkHotels.length > 0) return;
@@ -913,9 +900,42 @@ export function OrdersPage() {
         /* 加载失败不阻断其它批量操作；房型下拉留空，操作员可重新勾选触发重试 */
       });
   }, [tokens?.accessToken, selectedIds.size, bulkHotels.length]);
+  // 随机档「占位酒店」（Hotel.randomTierPlaceholder 非空）的全部房型 id。占位项不是真酒店：
+  // 挂在它房型上的订单行业务上同样**还没落位**，所以既要能被批量落位选中，又不能当落位目标。
+  // 判定一律看该字段，**不按酒店名字匹配**。
+  const placeholderRoomTypeIds = useMemo(() => {
+    const ids = new Set<string>();
+    for (const h of bulkHotels) {
+      if (h.randomTierPlaceholder == null) continue;
+      for (const rt of h.roomTypes) ids.add(rt.id);
+    }
+    return ids;
+  }, [bulkHotels]);
+  // 已选订单里「未落位的占房行」（orderId → 该单命中的行）——批量选酒店只对这些行生效，
+  // 其余单（没有未落位占房行的）批量落位时会被跳过。两种未落位形态都算：
+  //   a) HOTEL 行无房型 + randomStarTier 非空 —— 正规未落位随机单；
+  //   b) HOTEL/BUNDLE 行的房型挂在占位酒店上 —— 伪落位（换酒店流程同样能把它换到真酒店）。
+  const selectedPoolItems = useMemo(() => {
+    const map = new Map<string, OrderItem[]>();
+    for (const o of selectedOrders) {
+      const poolItems = (o.items ?? []).filter((it) => {
+        if (it.hotelRoomTypeId) {
+          // 换酒店流程受理的行：HOTEL 行，或已盖章房型的 BUNDLE 行
+          if (it.kind !== 'HOTEL' && it.kind !== 'BUNDLE') return false;
+          return placeholderRoomTypeIds.has(it.hotelRoomTypeId);
+        }
+        return it.kind === 'HOTEL' && it.randomStarTier != null;
+      });
+      if (poolItems.length > 0) map.set(o.id, poolItems);
+    }
+    return map;
+  }, [selectedOrders, placeholderRoomTypeIds]);
+  const selectedPoolOrderCount = selectedPoolItems.size;
   const bulkHotelRoomTypeOptions: SearchSelectOption[] = useMemo(() => {
     const opts: SearchSelectOption[] = [];
     for (const h of bulkHotels) {
+      // 占位项不是真房源，不能作为落位目标（落过去等于原地没动）
+      if (h.randomTierPlaceholder != null) continue;
       for (const rt of h.roomTypes) {
         const price = Math.round(Number(rt.basePrice));
         opts.push({ id: rt.id, label: `${h.name} · ${rt.name}`, priceLabel: Number.isFinite(price) ? String(price) : rt.basePrice });
@@ -1085,8 +1105,8 @@ export function OrdersPage() {
     }
   };
 
-  // 批量选酒店（随机池落位）：只对已选订单里「未落位随机池行」生效，逐单（一单可能有多条池行，
-  // 如去程/回程各一间）调用现有「换酒店」端点；没有池行的订单自动跳过，不算失败。
+  // 批量选酒店（随机档落位）：只对已选订单里「未落位占房行」生效（含仍挂在随机档占位项房型上的行），
+  // 逐单（一单可能有多条，如去程/回程各一间）调用现有「换酒店」端点；没有这类行的订单自动跳过，不算失败。
   const applyBulkHotelAssign = async () => {
     if (!tokens?.accessToken || !bulkHotelRoomTypeId || selectedPoolItems.size === 0) return;
     const targetLabel =
@@ -1094,8 +1114,8 @@ export function OrdersPage() {
     const skipped = selectedIds.size - selectedPoolItems.size;
     if (
       !window.confirm(
-        `将已选订单中 ${selectedPoolItems.size} 条「未落位随机池行」批量落位到「${targetLabel}」？` +
-          (skipped > 0 ? `\n\n其余 ${skipped} 条订单没有未落位的池占房行，会被跳过。` : ''),
+        `将已选订单中 ${selectedPoolItems.size} 条「未落位占房行」批量落位到「${targetLabel}」？` +
+          (skipped > 0 ? `\n\n其余 ${skipped} 条订单没有未落位的占房行，会被跳过。` : ''),
       )
     )
       return;
@@ -1106,7 +1126,7 @@ export function OrdersPage() {
     try {
       for (const [orderId, items] of selectedPoolItems) {
         try {
-          // 一单可能有多条未落位池行（如去程/回程各一间）；逐条落位，任一失败整单记为失败。
+          // 一单可能有多条未落位占房行（如去程/回程各一间）；逐条落位，任一失败整单记为失败。
           for (const item of items) {
             await api.swapItemHotel(tokens.accessToken, orderId, item.id, {
               newHotelRoomTypeId: bulkHotelRoomTypeId,
@@ -2020,14 +2040,15 @@ export function OrdersPage() {
               disabled={!bulkHotelRoomTypeId || bulkHotelSubmitting || selectedPoolOrderCount === 0}
               title={
                 selectedPoolOrderCount === 0
-                  ? '已选订单中没有未落位的随机池占房行'
+                  ? '已选订单中没有未落位的占房行'
                   : `落位到 ${selectedPoolOrderCount} 条未落位订单`
               }
             >
               {bulkHotelSubmitting ? '落位中…' : `落位 ${selectedPoolOrderCount} 条`}
             </button>
             <span className="text-xs text-ink-soft">
-              仅对已选订单中「未落位随机池行」生效（命中 {selectedPoolOrderCount}/{selectedIds.size} 条），其余订单会被跳过。
+              仅对已选订单中「未落位占房行」生效（含仍挂在随机档占位项上的行；命中 {selectedPoolOrderCount}/
+              {selectedIds.size} 条），其余订单会被跳过。
             </span>
           </div>
           {bulkHotelResult && (
@@ -6740,6 +6761,14 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   // ── OTA 手动结算单价（仅 ADMIN/STAFF）：不覆盖机票权威价，后端按差额追加调整行调到此价 ──
   const [manualUnitPriceCny, setManualUnitPriceCny] = useState<number | null>(null);
 
+  // ── 机票结算价日历提示（只读展示，不灌值）──────────────────────────────────
+  // 选定航班 + 班次后，把该航段在结算价日历里的每人价查出来给运营看个数：留空即由服务端
+  // 按此价自动收敛代理单总额。**绝不自动填进输入框**——手工价与日历价语义不同（手工价会
+  // 让日历不介入），灌值会让人以为「改一下这个数」还是走日历。
+  const [flightCalendarHint, setFlightCalendarHint] = useState<
+    Array<{ flightNumber: string; departDate: string; pricePerPersonCny: number | null }>
+  >([]);
+
   // ── 归属代理（ADMIN/STAFF 代为录单；'' = 直客/无代理）───────────────────────
   const [agents, setAgents] = useState<AgentListItem[]>([]);
   const [agentId, setAgentId] = useState('');
@@ -6881,6 +6910,73 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
     () => (returnDate ? returnSchedules.filter((s) => s.departureTime.slice(0, 10) === returnDate) : returnSchedules),
     [returnSchedules, returnDate],
   );
+
+  // 本批实际选中的航段（航班号 + 出发地本地日）——机票结算价日历按这两项取价，
+  // 与服务端口径一致（服务端取的是班次出发地本地日，不是 UTC 日）。
+  const selectedLegs = useMemo(() => {
+    if (productType !== 'FLIGHT_ONEWAY' && productType !== 'FLIGHT_ROUNDTRIP') return [];
+    const legs: Array<{ flightNumber: string; departDate: string }> = [];
+    const push = (flightId: string, scheds: AdminSchedule[], schedId: string) => {
+      const flightNumber = flights.find((f) => f.id === flightId)?.flightNumber;
+      const sched = scheds.find((s) => s.id === schedId);
+      if (!flightNumber || !sched) return;
+      legs.push({ flightNumber, departDate: localYmd(sched.departureTime, sched.departureTz) });
+    };
+    push(outboundFlightId, outboundSchedules, outboundScheduleId);
+    if (productType === 'FLIGHT_ROUNDTRIP') push(returnFlightId, returnSchedules, returnScheduleId);
+    return legs;
+  }, [
+    productType,
+    flights,
+    outboundFlightId,
+    outboundSchedules,
+    outboundScheduleId,
+    returnFlightId,
+    returnSchedules,
+    returnScheduleId,
+  ]);
+
+  // 机票结算价日历提示：选定航段后查每人日历价（只展示，不灌值）。查不到/出错静默留空——
+  // 这只是给运营看的参考数，取价权威在服务端，前端拿不到也不影响建单。
+  useEffect(() => {
+    if (!token || selectedLegs.length === 0) {
+      setFlightCalendarHint([]);
+      return;
+    }
+    let cancelled = false;
+    const dates = selectedLegs.map((l) => l.departDate).sort();
+    api
+      .listFlightSettlementRates(token, {
+        from: dates[0],
+        to: dates[dates.length - 1],
+        flightNumbers: [...new Set(selectedLegs.map((l) => l.flightNumber))],
+      })
+      .then((res) => {
+        if (cancelled) return;
+        setFlightCalendarHint(
+          selectedLegs.map((leg) => ({
+            ...leg,
+            pricePerPersonCny:
+              res.rates.find(
+                (r) => r.flightNumber === leg.flightNumber && r.departDate === leg.departDate,
+              )?.pricePerPersonCny ?? null,
+          })),
+        );
+      })
+      .catch(() => {
+        if (!cancelled) setFlightCalendarHint([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [token, selectedLegs]);
+
+  // 日历每人价合计（往返 = 去程 + 回程）。任一航段没维护价 → null，服务端同样不会自动取价。
+  const calendarTotalPerPax = useMemo(() => {
+    if (flightCalendarHint.length === 0) return null;
+    if (flightCalendarHint.some((l) => l.pricePerPersonCny === null)) return null;
+    return flightCalendarHint.reduce((sum, l) => sum + (l.pricePerPersonCny ?? 0), 0);
+  }, [flightCalendarHint]);
 
   // OTA 导入后自动选中当日出港班次：班次异步加载完成后触发一次。
   //   当日恰 1 班 → 直接选中；多班 → 留给运营手动选并提示；无班 → 提示换日期。
@@ -8165,8 +8261,38 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                         min={0}
                         step={1}
                         integerOnly
-                        placeholder="留空 = 按动态定价"
+                        placeholder={
+                          calendarTotalPerPax !== null
+                            ? `留空 = 按日历自动取价（¥${calendarTotalPerPax}/人）`
+                            : '留空 = 按动态定价'
+                        }
                       />
+                      {/* 机票结算价日历参考（只展示，不灌值）：留空即由服务端按日历价收敛代理单 */}
+                      {flightCalendarHint.length > 0 && (
+                        <span className="mt-1 block text-[11px] text-slate-500">
+                          {calendarTotalPerPax !== null ? (
+                            <>
+                              日历价 ¥{calendarTotalPerPax}/人（
+                              {flightCalendarHint
+                                .map(
+                                  (l) =>
+                                    `${l.flightNumber} ${l.departDate} ¥${l.pricePerPersonCny}`,
+                                )
+                                .join(' + ')}
+                              ）；留空 = 代理单按日历自动取价
+                            </>
+                          ) : (
+                            <>
+                              日历未维护本航段价（
+                              {flightCalendarHint
+                                .filter((l) => l.pricePerPersonCny === null)
+                                .map((l) => `${l.flightNumber} ${l.departDate}`)
+                                .join('、')}
+                              ）；留空 = 按动态定价
+                            </>
+                          )}
+                        </span>
+                      )}
                     </label>
                     <label className="text-xs text-slate-500">
                       团期备注

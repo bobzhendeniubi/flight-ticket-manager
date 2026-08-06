@@ -15,6 +15,7 @@ import {
   computeBundleOriginalPerPaxCny,
   type BundleFlightBinding,
 } from './bundle-pricing.js';
+import { parseVisaExpressTiers } from './products.schemas.js';
 import type {
   BundleItemInput,
   CreateBundleBody,
@@ -269,6 +270,7 @@ export class ProductsService {
           address: body.address,
           starRating: body.starRating,
           intlFiveStar: body.intlFiveStar,
+          designationSurchargeCnyPerPerson: body.designationSurchargeCnyPerPerson,
           basePrice: body.basePrice !== undefined ? new Prisma.Decimal(body.basePrice) : null,
           rating: body.rating !== undefined ? new Prisma.Decimal(body.rating) : null,
           reviewCount: body.reviewCount,
@@ -310,6 +312,8 @@ export class ProductsService {
       if (body.address !== undefined) data.address = body.address;
       if (body.starRating !== undefined) data.starRating = body.starRating;
       if (body.intlFiveStar !== undefined) data.intlFiveStar = body.intlFiveStar;
+      if (body.designationSurchargeCnyPerPerson !== undefined)
+        data.designationSurchargeCnyPerPerson = body.designationSurchargeCnyPerPerson;
       if (body.basePrice !== undefined) data.basePrice = new Prisma.Decimal(body.basePrice);
       if (body.rating !== undefined) data.rating = new Prisma.Decimal(body.rating);
       if (body.reviewCount !== undefined) data.reviewCount = body.reviewCount;
@@ -494,6 +498,8 @@ export class ProductsService {
           code,
           basePrice: new Prisma.Decimal(body.basePrice),
           expressSurcharge: body.expressSurcharge !== undefined ? new Prisma.Decimal(body.expressSurcharge) : null,
+          // 加急分档：省略 = 落 DB 默认 []（未配分档 → 回落旧的单值 expressSurcharge 口径）。
+          expressTiers: (body.expressTiers ?? []) satisfies Prisma.InputJsonValue,
           // 使馆/代办成本（仅内部）：省略/null 两种"未录"都落 null（新建无"保留现值"这一说）。
           costPriceCny: body.costPriceCny != null ? new Prisma.Decimal(body.costPriceCny) : null,
         },
@@ -517,6 +523,10 @@ export class ProductsService {
     if (body.processingDays !== undefined) data.processingDays = body.processingDays;
     if (body.basePrice !== undefined) data.basePrice = new Prisma.Decimal(body.basePrice);
     if (body.expressSurcharge !== undefined) data.expressSurcharge = new Prisma.Decimal(body.expressSurcharge);
+    // 加急分档：省略 = 不改（保留现有档位表）；传数组（含 []）= 整表覆盖（[] 即清空分档）。
+    if (body.expressTiers !== undefined) {
+      data.expressTiers = body.expressTiers satisfies Prisma.InputJsonValue;
+    }
     if (body.validityMonths !== undefined) data.validityMonths = body.validityMonths;
     if (body.stayDays !== undefined) data.stayDays = body.stayDays;
     if (body.highlight !== undefined) data.highlight = body.highlight;
@@ -866,6 +876,8 @@ export function serializeVisa(
     ...rest,
     basePrice: v.basePrice.toString(),
     expressSurcharge: v.expressSurcharge?.toString() ?? null,
+    // 加急分档：脏数据/旧行按档解析丢弃，恒下发一个合法数组（[] = 未配分档）。
+    expressTiers: parseVisaExpressTiers(v.expressTiers),
     ...(includeCost ? { costPriceCny: costPriceCny?.toString() ?? null } : {}),
     // 单次入境最多可停留天数（订单详情行程单据此推算签证生效/失效预计日期）
     stayDays: v.stayDays,

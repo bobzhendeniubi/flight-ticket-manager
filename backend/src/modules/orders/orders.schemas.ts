@@ -367,9 +367,9 @@ export const flightItemSchema = baseItemSchema.extend({
 export const hotelItemSchema = baseItemSchema.extend({
   kind: z.literal('HOTEL'),
   hotelRoomTypeId: z.string().min(1).optional(),
-  // 星级随机档行（3=三星随机、4=四星随机）：客人买的是「N 星随机」，下单时不指定酒店，
+  // 星级随机档行（3=三星随机、4=四星随机、5=五星随机）：客人买的是「N 星随机」，下单时不指定酒店，
   // 占的是同星级酒店的合计余量（未落位随机单），之后由房控落到具体酒店。与 hotelRoomTypeId 互斥。
-  randomStarTier: z.union([z.literal(3), z.literal(4)]).optional(),
+  randomStarTier: z.union([z.literal(3), z.literal(4), z.literal(5)]).optional(),
   checkIn: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   checkOut: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   unitPrice: z.number().nonnegative(),
@@ -398,6 +398,11 @@ export const bundleItemSchema = baseItemSchema.extend({
   //   businessCount = 选「升舱商务」的人数 → 每人每航段加 businessUpgradeCnyPerLeg（占用真实商务舱库存）
   singleCount: z.number().int().min(0).max(20).optional(),
   businessCount: z.number().int().min(0).max(20).optional(),
+  // 升舱分程口径（去程 / 回程各自的升舱人数）——同一批客人可以只升去程、或去回程升的人数不同。
+  //   两者任一显式提供 → 以分程口径为权威（单程套餐 legs=1 时回程人数恒按 0 处理）；
+  //   两者都省略 → 回落旧的整程 businessCount（每程同人数，× legs 计价），行为与扩展前完全一致。
+  businessCountOutbound: z.number().int().min(0).max(20).optional(),
+  businessCountReturn: z.number().int().min(0).max(20).optional(),
   // 占座模型（业务需求）：区分成人 / 占座儿童 / 不占座婴儿（都需护照，均为出行人）：
   //   adultCount  = 成人数（占 1 座、计入拼房）
   //   childCount  = 占座儿童数（占 1 座、计入拼房；机票按成人价减 childSeatDiscountCnyPerPerson）
@@ -410,6 +415,10 @@ export const bundleItemSchema = baseItemSchema.extend({
   selfProvidedVisa: z.boolean().optional(),
   // 计费房间数（支持 0.5 间）。缺省 → 按房型容量自动推算 roomsNeeded（旧行为）。
   roomsBilled: z.number().multipleOf(0.5).min(0.5).max(50).optional(),
+  // 指定酒店（可选）：套餐按「星级随机」报价，客人点名要住某家酒店 → 传该店房型 id。
+  // 服务端据此把占房/盖章切到指定房型，并按该酒店配置的「指定酒店加价 ¥/人」×占座人数
+  // 加收（server-priced，客户端不传金额）。缺省 = 不指定，走套餐绑定房型/随机现状。
+  designatedHotelRoomTypeId: z.string().min(1).optional(),
 });
 
 // BUNDLE 行 metadata 里的出行信息（sales-web 购物车带过来，用于推导酒店入住日期）。

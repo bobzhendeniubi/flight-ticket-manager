@@ -117,6 +117,71 @@ describe('星级随机档落位：目标酒店星级守卫', () => {
   });
 });
 
+// ── 伪落位行（房型挂在随机档「占位酒店」上）────────────────────────────────
+/**
+ * 占位酒店 = Hotel.randomTierPlaceholder 非空，是随机档早期用假酒店承载时留下的形态。
+ * 这类行有 hotelRoomTypeId、但业务上**还没落到任何真酒店**，因此与正规未落位随机单同款：
+ *   1. 走同一条换酒店通道把它落到真酒店；
+ *   2. 同吃「不许降级交付」的星级约束（档次取占位酒店的 randomTierPlaceholder）。
+ * 判定一律看该列，绝不按酒店名字匹配。
+ */
+describe('星级随机档落位：占位酒店上的伪落位行', () => {
+  /** 伪落位行 fixture：有房型（挂在占位酒店上）、randomStarTier 为空。*/
+  const placeholderRow = () => ({
+    ...poolItem(4),
+    randomStarTier: null,
+    hotelRoomTypeId: 'rt-placeholder',
+  });
+  /** 占位酒店的房型 fixture（原房型侧的 select 形状）。*/
+  const placeholderRoomType = (tier: number) => ({
+    id: 'rt-placeholder',
+    name: '标准间',
+    hotelId: 'h-placeholder',
+    hotel: { name: '随机四星', randomTierPlaceholder: tier },
+  });
+
+  it('伪落位行落到低星酒店 → 拒（档次取占位酒店的 randomTierPlaceholder）', async () => {
+    mockPrisma.orderItem.findUnique.mockResolvedValue(placeholderRow());
+    mockPrisma.hotelRoomType.findUnique
+      .mockResolvedValueOnce(placeholderRoomType(4))
+      .mockResolvedValueOnce(targetRoomType(3));
+
+    await expect(service.swapItemHotel('order-1', 'item-1', swapBody, admin)).rejects.toThrow(
+      /四星随机只能落到 4 星及以上的酒店/,
+    );
+  });
+
+  it('伪落位行落到同级真酒店 → 放行星级守卫（这就是清算这批伪落位单的通道）', async () => {
+    mockPrisma.orderItem.findUnique.mockResolvedValue(placeholderRow());
+    mockPrisma.hotelRoomType.findUnique
+      .mockResolvedValueOnce(placeholderRoomType(4))
+      .mockResolvedValueOnce(targetRoomType(4));
+
+    await expect(
+      service.swapItemHotel('order-1', 'item-1', swapBody, admin).catch((e: Error) => e.message),
+    ).resolves.not.toMatch(/只能落到/);
+  });
+
+  it('真酒店之间换房不受影响：低星目标也放行星级守卫（不是随机档单）', async () => {
+    mockPrisma.orderItem.findUnique.mockResolvedValue({
+      ...placeholderRow(),
+      hotelRoomTypeId: 'rt-old',
+    });
+    mockPrisma.hotelRoomType.findUnique
+      .mockResolvedValueOnce({
+        id: 'rt-old',
+        name: '标准间',
+        hotelId: 'h-old',
+        hotel: { name: '明月酒店', randomTierPlaceholder: null },
+      })
+      .mockResolvedValueOnce(targetRoomType(2));
+
+    await expect(
+      service.swapItemHotel('order-1', 'item-1', swapBody, admin).catch((e: Error) => e.message),
+    ).resolves.not.toMatch(/只能落到/);
+  });
+});
+
 describe('星级随机档落位：具体酒店行行为不变（回归）', () => {
   it('既无房型又无池档次的 HOTEL 行 → 仍拒「该行不含酒店」', async () => {
     mockPrisma.orderItem.findUnique.mockResolvedValue({ ...poolItem(4), randomStarTier: null });

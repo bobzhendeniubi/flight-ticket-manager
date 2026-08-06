@@ -56,8 +56,10 @@ import {
   sumCompletedRefundsWithinTx,
 } from '../../lib/funds-guard.js';
 import { resolveBundleNights } from '../products/bundle-nights.js';
+import { parseVisaExpressTiers, type VisaExpressTier } from '../products/products.schemas.js';
 import { localDate } from '../finances/finances.cost.service.js';
 import { getSettlementRate } from '../settlement-rates/settlement-rates.service.js';
+import { getFlightSettlementRate } from '../settlement-rates/flight-settlement-rates.service.js';
 import {
   assertHotelPhysicalFit,
   assertRandomTierFit,
@@ -205,6 +207,21 @@ function sanitizeFlightItemMetadata(
   if (!metadata) return {};
   const { businessUpgradeCount: _ignoredClientValue, ...rest } = metadata;
   return rest;
+}
+
+/**
+ * 从 VISA 行 metadata 里取客户端选择的加急档名（`expressTierLabel`）。
+ *
+ * 客户端只传**档名**，加价金额一律由服务端按产品的 expressTiers 查表得出（钱路径服务端权威）。
+ * 非字符串 / 空白 → 视为未选档（回落旧的 express 布尔口径）。档名对不上时由调用处显式拒单。
+ */
+function resolveRequestedExpressTierLabel(
+  metadata: Record<string, unknown> | undefined,
+): string | null {
+  const raw = metadata?.expressTierLabel;
+  if (typeof raw !== 'string') return null;
+  const label = raw.trim();
+  return label.length > 0 ? label : null;
 }
 
 // ── 类型 ────────────────────────────────────────────────────────────────
@@ -888,10 +905,28 @@ export class OrderService {
     let effectiveSettlementTotalCny = body.settlementTotalCny;
     let settlementCalendarAudit: Record<string, unknown> | null = null;
     if (body.settlementTotalCny === undefined && agentId) {
-      const calendar = await this.resolveBundleSettlementCalendarTotal(body);
+      // BUNDLE 行加项净额（与 body.items 的 BUNDLE 行同序）：日历价 + 加项 才是本单结算价，
+      // 否则升舱/单房差/指定酒店加价会被下方 SETTLEMENT 差额行收敛吞掉。
+      const calendar = await this.resolveBundleSettlementCalendarTotal(
+        body,
+        pricedItems.filter((p) => p.kind === 'BUNDLE').map((p) => p.settlementAddOnCny ?? 0),
+      );
       if (calendar) {
         effectiveSettlementTotalCny = calendar.totalCny;
         settlementCalendarAudit = calendar.audit;
+      } else if (
+        // 机票结算价日历（纯机票代理单）：套餐日历没接管时才轮到它。
+        // 任一「手工价通道」在场一律不介入——手工价与日历价二选一，叠加会双重砸价：
+        //   · priceAdjustment：批量的「OTA 结算单价」就是走这条（差额调价行）。
+        //   · flightSettlementPriceCny：批量的「结算价/人（团队议价）」，已直接覆盖机票行单价。
+        body.priceAdjustment === undefined &&
+        body.flightSettlementPriceCny === undefined
+      ) {
+        const flightCalendar = await this.resolveFlightSettlementCalendarTotal(body);
+        if (flightCalendar) {
+          effectiveSettlementTotalCny = flightCalendar.totalCny;
+          settlementCalendarAudit = flightCalendar.audit;
+        }
       }
     }
 
@@ -1298,6 +1333,11 @@ export class OrderService {
    */
   private async resolveBundleSettlementCalendarTotal(
     body: CreateOrderBody,
+    // 与 body.items 里 BUNDLE 行同序一一对应的加项净额（升舱/单房差/婴儿价/儿童折扣/自备签减免/
+    // 指定酒店加价，未打折；来自 priceAndValidateItems 的 settlementAddOnCny）。
+    // 日历价是「基础随机套餐」的每人同业价，加项按报价口径叠加其上——此前日历价裸收敛会把
+    // 加项全部吞掉（代理日历单升舱等于白升），据此修正。
+    bundleAddOnNetsCny: number[] = [],
   ): Promise<{ totalCny: number; audit: Record<string, unknown> } | null> {
     const bundleItems = body.items.filter(
       (it): it is Extract<OrderItemInput, { kind: 'BUNDLE' }> =>
@@ -1329,10 +1369,13 @@ export class OrderService {
 
     let totalCny = 0;
     const lines: Array<Record<string, unknown>> = [];
-    for (const it of configured) {
-      const b = bundleById.get(it.bundleId)!;
+    for (let idx = 0; idx < bundleItems.length; idx++) {
+      const it = bundleItems[idx];
+      const b = bundleById.get(it.bundleId);
+      // 未配日历键的套餐行不参与日历取价（现状不变）；带索引遍历保证加项净额与行一一对应。
+      if (b?.settlementTier == null || b.settlementNights == null) continue;
       const tier = b.settlementTier as SettlementTier;
-      const nights = b.settlementNights!;
+      const nights = b.settlementNights;
       // 乘客数：套餐占座模型 headCount（成人 + 占座儿童 + 婴儿），与录单其它按人口径同源。
       const pax = resolveBundleOccupancy({
         adultCount: it.adultCount,
@@ -1345,8 +1388,10 @@ export class OrderService {
       if (!rate) {
         throw new BadRequestError('该出发日期的结算价未维护，请联系运营');
       }
-      const lineTotalCny = rate.pricePerPersonCny * pax;
-      totalCny += lineTotalCny;
+      // 加项净额叠加在日历价之上（可为负：儿童折扣/自备签减免按报价口径同样从同业价里减）。
+      const addOnCny = round2(bundleAddOnNetsCny[idx] ?? 0);
+      const lineTotalCny = round2(rate.pricePerPersonCny * pax + addOnCny);
+      totalCny = round2(totalCny + lineTotalCny);
       lines.push({
         bundleId: b.id,
         bundleName: b.name,
@@ -1355,15 +1400,88 @@ export class OrderService {
         departDate: departYmd,
         pricePerPersonCny: rate.pricePerPersonCny,
         pax,
+        addOnCny,
         lineTotalCny,
-        // 人类可读留痕：「结算价日历自动取价：{档次}{晚数}晚 {日期} ¥X/人×N」
-        note: `结算价日历自动取价：${tier} ${nights}晚 ${departYmd} ¥${rate.pricePerPersonCny}/人×${pax}`,
+        // 人类可读留痕：「结算价日历自动取价：{档次}{晚数}晚 {日期} ¥X/人×N（加项 ±¥Y）」
+        note: `结算价日历自动取价：${tier} ${nights}晚 ${departYmd} ¥${rate.pricePerPersonCny}/人×${pax}${
+          addOnCny !== 0 ? `，加项 ${addOnCny > 0 ? '+' : '−'}¥${Math.abs(addOnCny)}` : ''
+        }`,
       });
     }
 
     return {
       totalCny,
       audit: { source: 'SETTLEMENT_CALENDAR', departDate: departYmd, lines },
+    };
+  }
+
+  /**
+   * 机票结算价日历取价（A1/E2）：代理的**纯机票单**按每条航段「航班号 × 出发地本地日」
+   * 在机票结算价日历取每人价，返回结算总价，喂给既有「结算总价 → SETTLEMENT 差额行」机制落价。
+   *
+   * 口径（与套餐版对齐，但更保守——不拒单，只在把握十足时才接管）：
+   *   · 结算总价 = Σ(每条 FLIGHT 行：每人价 × 该行人数 quantity)。往返 = 去/回两行各查各的价。
+   *   · 出发日期 = **该航段自己**班次的出发地本地日（localDate），不是整单去程日——
+   *     回程航班在报价表里是独立一列、按回程当天的价，用去程日会取错格。
+   *   · **全命中才参与**：任一航段查不到班次/航班号/当日无价 → 直接返回 null 放弃自动取价，
+   *     走现状（动态定价），绝不做半单收敛。宁可不取，也别把只算了一条腿的价当整单结算价。
+   *   · 含 BUNDLE 行的单一律不参与：套餐单的机票航段是套餐的一部分，用机票价收敛整单会把
+   *     地面部分白送。套餐走上面的地面结算价日历，两张表各管各的。
+   * 调用方（createOrder）仅在「代理单 + 无手工结算价 + 套餐日历未接管」时调用，故此处不重复判身份。
+   */
+  private async resolveFlightSettlementCalendarTotal(
+    body: CreateOrderBody,
+  ): Promise<{ totalCny: number; audit: Record<string, unknown> } | null> {
+    // 含套餐行 → 不是纯机票单，交回套餐日历/现状处理。
+    if (body.items.some((it) => it.kind === 'BUNDLE')) return null;
+
+    const flightItems = body.items.filter(
+      (it): it is Extract<OrderItemInput, { kind: 'FLIGHT' }> => it.kind === 'FLIGHT',
+    );
+    if (flightItems.length === 0) return null;
+
+    const scheduleIds = [...new Set(flightItems.map((it) => it.flightScheduleId))];
+    const scheds = await prisma.flightSchedule.findMany({
+      where: { id: { in: scheduleIds } },
+      select: {
+        id: true,
+        departureTime: true,
+        departureTz: true,
+        flight: { select: { flightNumber: true } },
+      },
+    });
+    const schedById = new Map(scheds.map((s) => [s.id, s]));
+
+    let totalCny = 0;
+    const lines: Array<Record<string, unknown>> = [];
+    for (const it of flightItems) {
+      const sched = schedById.get(it.flightScheduleId);
+      // 班次查不到（理论上定价环节已校验过）→ 放弃自动取价，不猜。
+      if (!sched) return null;
+      const flightNumber = sched.flight.flightNumber;
+      const departYmd = localDate(sched.departureTime, sched.departureTz);
+      const rate = await getFlightSettlementRate(flightNumber, departYmd);
+      // 该航班当日未维护结算价 → 整单放弃自动取价（不做半单收敛）。
+      if (!rate) return null;
+      const pax = it.quantity;
+      const lineTotalCny = rate.pricePerPersonCny * pax;
+      totalCny += lineTotalCny;
+      lines.push({
+        flightScheduleId: it.flightScheduleId,
+        flightNumber,
+        cabin: it.flightCabin,
+        departDate: departYmd,
+        pricePerPersonCny: rate.pricePerPersonCny,
+        pax,
+        lineTotalCny,
+        // 人类可读留痕：「机票结算价日历自动取价：QH9589 2026-08-10 ¥1000/人×2」
+        note: `机票结算价日历自动取价：${flightNumber} ${departYmd} ¥${rate.pricePerPersonCny}/人×${pax}`,
+      });
+    }
+
+    return {
+      totalCny,
+      audit: { source: 'FLIGHT_SETTLEMENT_CALENDAR', lines },
     };
   }
 
@@ -1494,6 +1612,9 @@ export class OrderService {
       bundleId?: string;
       // 解析后的计费房间数（支持 0.5 间）。落到 OrderItem.roomsBilled 供房控读取。
       roomsBilled?: number;
+      // BUNDLE 行加项净额（升级加价/婴儿价/儿童折扣/自备签减免/指定酒店加价，未打折）。
+      // 结算价日历取价时叠加在日历价之上（报价口径：同业价基础上加收/减免），仅内部用，不落库。
+      settlementAddOnCny?: number;
       // 产品类成本快照（房/签/车，下单时已知）。落到 OrderItem.unitCostCny/totalCostCny，
       // 供财务毛利真账。FLIGHT 不写这两栏：包机成本是下单之后才由财务按班次填的，
       // 下单那一刻它根本不存在，且本就是航班级属性 —— 硬快照只会造出永久 NULL。
@@ -1504,9 +1625,13 @@ export class OrderService {
       metadata?: Record<string, unknown>;
     }> = [];
 
-    // 本单所有 BUNDLE 行选「升舱商务」的总人数（多份套餐叠加）。
-    // 循环结束后分摊到本单的经济舱 FLIGHT 航段：每段占用 businessUpgradeCount 个真实商务舱座位。
-    let bundleBusinessUpgradeCount = 0;
+    // 本单所有 BUNDLE 行选「升舱商务」的总人数（多份套餐叠加），去程 / 回程各自一份 ——
+    // 同一批客人可以只升去程、或去回程升的人数不同。循环结束后按航段落到对应 FLIGHT 行：
+    // 第一条经济舱航段 = 去程，其余（回程）取回程人数；每段各占用自己那一份真实商务舱座位。
+    let bundleBusinessUpgradeOutbound = 0;
+    let bundleBusinessUpgradeReturn = 0;
+    // 本单是否有 BUNDLE 行显式用了分程口径（决定下方「回程升舱却没有回程航段」是否硬拒）。
+    let hasSplitBusinessUpgradeInput = false;
 
     // 套餐折扣（bundleId → discountPct 0..100）：循环里从 DB 读，循环后对该套餐的
     // BUNDLE 行 + 关联 FLIGHT 腿逐行 ×(1−pct/100)，使「整个全包价打折」且各行金额诚实
@@ -1655,18 +1780,41 @@ export class OrderService {
       } else if (item.kind === 'VISA') {
         let unitPrice = item.unitPrice;
         let visaUnitCost: number | undefined;
+        // 命中的加急档（快照进订单行 metadata，供审计/明细展示；未选档 → undefined）。
+        let visaExpressTier: VisaExpressTier | undefined;
         if (item.visaId) {
           const v = await prisma.visa.findUnique({
             where: { id: item.visaId },
-            select: { basePrice: true, expressSurcharge: true, costPriceCny: true, isActive: true },
+            select: {
+              basePrice: true,
+              expressSurcharge: true,
+              expressTiers: true,
+              costPriceCny: true,
+              isActive: true,
+            },
           });
           if (!v) throw new NotFoundError(`签证产品 ${item.visaId} 不存在`);
           if (!v.isActive) throw new BadRequestError('签证产品已下架');
           const baseUnitPrice = Number(v.basePrice);
-          const express = Boolean(item.metadata?.express);
-          unitPrice = express && v.expressSurcharge
-            ? baseUnitPrice + Number(v.expressSurcharge)
-            : baseUnitPrice;
+          // 加急分档优先（运营在产品上自配零工/一工/二工…）：客户端只传档名，金额一律服务端查表。
+          // 档名对不上（产品改了档位表 / 伪造档名）→ 显式拒单，绝不静默按不加急成交。
+          const requestedTierLabel = resolveRequestedExpressTierLabel(item.metadata);
+          if (requestedTierLabel) {
+            const tiers = parseVisaExpressTiers(v.expressTiers);
+            visaExpressTier = tiers.find((t) => t.label === requestedTierLabel);
+            if (!visaExpressTier) {
+              throw new BadRequestError(
+                `该签证产品没有「${requestedTierLabel}」加急档（档位可能已被调整），请重新选择加急档位`,
+              );
+            }
+            unitPrice = baseUnitPrice + visaExpressTier.surchargeCny;
+          } else {
+            // 未选分档 → 旧的单值加急口径（未配分档的产品仍按 expressSurcharge 走），行为不变。
+            const express = Boolean(item.metadata?.express);
+            unitPrice = express && v.expressSurcharge
+              ? baseUnitPrice + Number(v.expressSurcharge)
+              : baseUnitPrice;
+          }
           // 成本快照 = 送签成本（costPriceCny），不含加急费：加急是纯毛利（卖的是速度，
           // 送签成本不变），系统尚无独立加急成本字段。加急成本口径待后续单独接入。
           visaUnitCost = v.costPriceCny != null ? Number(v.costPriceCny) : undefined;
@@ -1684,7 +1832,11 @@ export class OrderService {
           unitCostCny: visaUnitCost,
           totalCostCny:
             visaUnitCost != null ? Math.round(visaUnitCost * item.quantity) : undefined,
-          metadata: item.metadata,
+          // 加急档快照（档名 + 工作日 + 服务端权威加价）：运营改档位表后，历史订单仍解释得清这笔钱。
+          // 未选档 → 原样透传 item.metadata（含 undefined），落库形态与扩展前一致。
+          metadata: visaExpressTier
+            ? { ...(item.metadata ?? {}), expressTier: visaExpressTier }
+            : item.metadata,
         });
       } else if (item.kind === 'BUNDLE') {
         // BUNDLE：服务端重算套餐价（items 从 DB 取 + groundDiscount）
@@ -1723,7 +1875,9 @@ export class OrderService {
                 maxChildren: true,
                 basePrice: true,
                 hotelId: true,
-                hotel: { select: { isActive: true } },
+                // randomTierPlaceholder：套餐绑的可能是「随机N星」的占位酒店房型（历史形态）——
+                //   此时房量闸要走随机档聚合闸而不是具体酒店闸（见下方库存校验小节）。
+                hotel: { select: { isActive: true, randomTierPlaceholder: true } },
               },
             },
           },
@@ -1774,6 +1928,54 @@ export class OrderService {
           metadata: item.metadata,
         });
 
+        // ── 指定酒店（0805 反馈）：套餐按「星级随机」报价，客人点名要住某家酒店 ──
+        // 传了 designatedHotelRoomTypeId（且不同于套餐绑定房型）→ 占房/盖章/容量切到指定房型，
+        // 并按该酒店配置的「指定酒店加价 ¥/人」× 占座人数加收（server-priced，不信客户端金额）。
+        // 地面价不换成指定房型价——业务口径是「随机报价基础上加收指定差价」，套餐地面价保持不变。
+        let designatedRoomType: {
+          id: string;
+          hotelId: string;
+          maxAdults: number;
+          maxChildren: number;
+          hotelName: string;
+          designationSurchargeCnyPerPerson: number;
+          /** 非空 = 指到了随机档占位酒店（不是真房源）→ 房量闸走随机档聚合闸。*/
+          randomTierPlaceholder: number | null;
+        } | null = null;
+        if (
+          item.designatedHotelRoomTypeId &&
+          item.designatedHotelRoomTypeId !== bundle.hotelRoomTypeId
+        ) {
+          const rt = await prisma.hotelRoomType.findUnique({
+            where: { id: item.designatedHotelRoomTypeId },
+            select: {
+              id: true,
+              hotelId: true,
+              maxAdults: true,
+              maxChildren: true,
+              hotel: {
+                select: {
+                  name: true,
+                  isActive: true,
+                  designationSurchargeCnyPerPerson: true,
+                  randomTierPlaceholder: true,
+                },
+              },
+            },
+          });
+          if (!rt) throw new NotFoundError(`酒店房型 ${item.designatedHotelRoomTypeId} 不存在`);
+          if (!rt.hotel.isActive) throw new BadRequestError('指定的酒店已下架');
+          designatedRoomType = {
+            id: rt.id,
+            hotelId: rt.hotelId,
+            maxAdults: rt.maxAdults,
+            maxChildren: rt.maxChildren,
+            hotelName: rt.hotel.name,
+            designationSurchargeCnyPerPerson: rt.hotel.designationSurchargeCnyPerPerson,
+            randomTierPlaceholder: rt.hotel.randomTierPlaceholder,
+          };
+        }
+
         // ── 乘客级「住宿方式 + 签证」派生（0713 反馈批：购物车模式，每人各选自己的码）──
         // 单一权威口径由 derivePerPaxBundleOptions 提供（纯函数，单测共用，避免漂移）：
         //   任一乘客显式提供对应布尔 → 以乘客级勾选人数为权威；否则回落 item 级旧聚合口径。
@@ -1789,8 +1991,9 @@ export class OrderService {
         // 单一权威口径由 computeBundleRoomsCharged 提供（单测与本分支共用，避免漂移）。
         const rooms = computeBundleRoomsCharged({
           occupancy,
-          capacity: bundle.hotelRoomType,
-          hotelRoomTypeId: bundle.hotelRoomTypeId,
+          // 指定酒店时容量/间数按指定房型算（几大几小一间装不装得下是指定房型的属性）。
+          capacity: designatedRoomType ?? bundle.hotelRoomType,
+          hotelRoomTypeId: designatedRoomType?.id ?? bundle.hotelRoomTypeId,
           // 单住派生：任一乘客勾了 singleRoom → 该单不是「独自拼房 0.5 间」，按整间收 + 单房差。
           singleCount: derivedSingleCount,
           clientRoomsBilled: item.roomsBilled,
@@ -1833,7 +2036,12 @@ export class OrderService {
         const bundleUnitPrice = Math.max(0, Math.round(groundTotal));
         // 套餐关联酒店 → 把房型+入住日期盖到订单行（房控板自动计入套餐占房）。
         // metadata 缺失/异常时只是不盖章，绝不阻断下单。
-        const hotelStamp = resolveBundleHotelStamp(bundle, item.metadata, nights);
+        const hotelStamp = resolveBundleHotelStamp(
+          // 指定酒店 → 盖指定房型的章（房控/销控板按指定酒店计占房）；否则按套餐绑定房型现状。
+          { hotelRoomTypeId: designatedRoomType?.id ?? bundle.hotelRoomTypeId },
+          item.metadata,
+          nights,
+        );
 
         // ── 出发日期房量库存校验（房量不足不让下单）──────────────────────────
         // 套餐绑了房型 + 能推出入住区间（有 goDate 盖章）时，校验整段每一晚都装得下本单。
@@ -1849,22 +2057,42 @@ export class OrderService {
         //   hasBlock=false（该酒店没配任何包房周期，即未做库存管控）→ 不拦截（与既有 E2E 一致）；
         //   block[i] === 0（该晚未被任何周期覆盖）→ 视为未管控，不据此拦截。
         // 无盖章（缺 goDate）→ 无从确定入住日期，不在此拦截（沿用既有"缺 goDate 不盖章"的宽松口径）。
-        if (hotelStamp && bundle.hotelRoomType) {
+        // 指定酒店 → 库存前瞻闸打到指定酒店头上（占的是指定店的房，不是套餐绑定店/占位店）。
+        //
+        // 例外 —— 房型挂在**随机档占位酒店**上（randomTierPlaceholder 非空）：那不是真房源，
+        // 对它跑具体酒店闸等于拿一份假库存放行/拦截。这种单业务上就是「买了 N 星随机、还没落位」，
+        // 故改走随机档聚合闸 assertRandomTierFit（Σ同星级真酒店余量 − 未落位占用，与销控板同公式）。
+        // 聚合闸是床位口径而非物理口径：随机单还没落到任何一家酒店，拼房能不能配对要等落位
+        // 那一刻由该店当晚性别桶决定，落位走换酒店流程、那里已有物理口径前瞻闸把关。
+        const fitHotelId = designatedRoomType?.hotelId ?? bundle.hotelRoomType?.hotelId ?? null;
+        const fitPlaceholderTier =
+          designatedRoomType != null
+            ? designatedRoomType.randomTierPlaceholder
+            : (bundle.hotelRoomType?.hotel.randomTierPlaceholder ?? null);
+        if (hotelStamp && fitHotelId) {
           const nightDates = buildStayNightDates(hotelStamp.hotelCheckIn, hotelStamp.hotelCheckOut);
           if (nightDates.length > 0) {
-            await assertHotelPhysicalFit(
-              bundle.hotelRoomType.hotelId,
-              nightDates,
-              toProspectiveOccupancy(rooms, passengers),
-              // 对外端点：只回中性话术，不暴露包房间数等内部库存数字。
-              { buildMessage: () => '该出发日期酒店可用房量不足，请更换日期或联系客服' },
-            );
+            if (fitPlaceholderTier != null) {
+              await assertRandomTierFit(fitPlaceholderTier, nightDates, rooms, {
+                // 对外端点：与具体酒店闸同款中性话术，不暴露合计余量等内部库存数字。
+                buildMessage: () => '该出发日期酒店可用房量不足，请更换日期或联系客服',
+              });
+            } else {
+              await assertHotelPhysicalFit(
+                fitHotelId,
+                nightDates,
+                toProspectiveOccupancy(rooms, passengers),
+                // 对外端点：只回中性话术，不暴露包房间数等内部库存数字。
+                { buildMessage: () => '该出发日期酒店可用房量不足，请更换日期或联系客服' },
+              );
+            }
           }
         }
 
         // 可选升级 add-on（server-priced，权威重算；缺省 0 → 与旧版价格完全一致）：
         //   单人入住房差 = singleCount × singleSupplementCnyPerNight × nights
-        //   升舱商务加价 = businessCount × businessUpgradeCnyPerLeg × legs
+        //   升舱商务加价 = (去程升舱人数 + 回程升舱人数) × businessUpgradeCnyPerLeg
+        //     （旧整程入参 businessCount → 沿用 businessCount × businessUpgradeCnyPerLeg × legs，结果等价）
         //     —— 这是客户升舱的「总加价」（不是在全价商务票之上再加 ¥700）。客户机票仍按经济舱套餐价收，
         //        差价由商家补贴；升舱只占用真实商务舱库存（不超售），见下方按经济舱航段拆座逻辑。
         // 升舱差价单一配置源：套餐 businessUpgradeCnyPerLeg=null → 「跟随航班」，按该套餐绑定航班
@@ -1872,18 +2100,36 @@ export class OrderService {
         //   两趟都没绑到航班时兜底 DEFAULT_BUSINESS_UPGRADE_CNY_PER_LEG，绝不派生出 0/裸价。
         //   非 null → 套餐自有覆盖（含 0 = 显式不提供升舱），行为不变。
         const effectiveBusinessUpgradeCnyPerLeg = resolveBundleBusinessUpgradeRate(bundle);
+        const businessUpgradeInput = resolveBundleBusinessUpgradeInput(item);
+        // 本单是否有 BUNDLE 行用了分程口径 —— 只有分程口径才启用「回程升舱却没有回程航段」的硬闸，
+        // 旧整程入参一律沿用扩展前的宽松行为（回程那份人数无处落座时不拒单），历史调用零回归。
+        if (typeof businessUpgradeInput === 'object' && businessUpgradeInput !== null) {
+          hasSplitBusinessUpgradeInput = true;
+        }
         const addOn = computeBundleAddOn(
           { ...bundle, businessUpgradeCnyPerLeg: effectiveBusinessUpgradeCnyPerLeg },
           hotelStamp,
           derivedSingleCount,
-          item.businessCount,
+          // 升舱口径：分程字段任一显式提供 → 去/回程各算；都省略 → 回落旧整程 businessCount。
+          businessUpgradeInput,
           occupancy,
           nights,
           selfProvidedVisaCount,
         );
-        // 累计本单的升舱人数（多份套餐叠加），下方循环结束后统一分摊到经济舱航段并预检商务舱余位。
-        // 注意：addOn.breakdown.businessCount 已夹到占座人数（seatPax）上限，婴儿不计入。
-        bundleBusinessUpgradeCount += addOn.breakdown.businessCount;
+        // 累计本单去/回程各自的升舱人数（多份套餐叠加），下方循环结束后分摊到对应经济舱航段并预检商务舱余位。
+        // 注意：breakdown 里的两个分程人数都已夹到占座人数（seatPax）上限，婴儿不计入。
+        bundleBusinessUpgradeOutbound += addOn.breakdown.businessCountOutbound;
+        bundleBusinessUpgradeReturn += addOn.breakdown.businessCountReturn;
+
+        // 指定酒店加价（server-priced）：该酒店配置的每人差价 × 占座人数（婴儿不占床不收）。
+        // 费率从 DB 读并夹到非负整数；未指定 → 0，价格与现状完全一致。
+        const designationSurchargeRate = designatedRoomType
+          ? Math.max(
+              0,
+              Math.trunc(Number(designatedRoomType.designationSurchargeCnyPerPerson) || 0),
+            )
+          : 0;
+        const designationSurchargeTotal = designationSurchargeRate * occupancy.seatPax;
 
         // 每人操作费（server-authoritative，从 DB 读的 operationFeeCny，绝不信客户端）：
         //   操作费 = operationFeeCny × 占座人数 seatPax（成人 + 占座儿童）。
@@ -1911,22 +2157,43 @@ export class OrderService {
           description: item.description,
           quantity: item.quantity,
           unitPrice: bundleUnitPrice,
-          // 升级加价 + 每人操作费加在套餐行总额上（不摊进 unitPrice，保持基础单价语义不变）。
+          // 升级加价 + 指定酒店加价 + 每人操作费加在套餐行总额上（不摊进 unitPrice，保持基础单价语义不变）。
           // addOn.total 可为负（自备签/儿童折扣减免）——非负保护在此行金额层统一夹到 0：
           //   减免先正常抵扣套餐地面价 + 操作费，只有减免大于地面总价的极端场景才夹到 0（不出现负行金额）。
           // 折扣（percent-off）在此之后另行处理，顺序不变。
-          amount: Math.max(0, bundleUnitPrice * item.quantity + addOn.total + operationFeeTotal),
+          amount: Math.max(
+            0,
+            bundleUnitPrice * item.quantity +
+              addOn.total +
+              designationSurchargeTotal +
+              operationFeeTotal,
+          ),
           bundleId: item.bundleId,
           hotelRoomTypeId: hotelStamp?.hotelRoomTypeId,
           hotelCheckIn: hotelStamp?.hotelCheckIn,
           hotelCheckOut: hotelStamp?.hotelCheckOut,
           // 解析后的计费房间数（支持 0.5 间）落到 OrderItem.roomsBilled，供房控读取。
           roomsBilled: rooms,
-          // 把升级选择 + 重算明细 + roomsNeeded + 操作费 + 签证挂牌价快照落到订单行 metadata。
+          // 加项净额（含指定酒店加价，未打折）：结算价日历取价时叠加在日历价之上（报价口径）。
+          settlementAddOnCny: addOn.total + designationSurchargeTotal,
+          // 把升级选择 + 重算明细 + roomsNeeded + 操作费 + 指定酒店 + 签证挂牌价快照落到订单行 metadata。
           //（admin 内部仍可叫"单房差/升舱"；roomsNeeded 解释酒店部分为何按房价 ×rooms 收费）。
           metadata: {
             ...(item.metadata ?? {}),
             ...(addOn.hasAddOn || rooms > 1 ? { roomsNeeded: rooms, addOns: addOn.breakdown } : {}),
+            // 指定酒店留痕（运营/财务解释这单为什么比随机价贵）：店名/费率/人数/小计。对外脱敏剥离。
+            ...(designatedRoomType
+              ? {
+                  designatedHotel: {
+                    hotelRoomTypeId: designatedRoomType.id,
+                    hotelId: designatedRoomType.hotelId,
+                    hotelName: designatedRoomType.hotelName,
+                    surchargeCnyPerPerson: designationSurchargeRate,
+                    pax: occupancy.seatPax,
+                    totalCny: designationSurchargeTotal,
+                  },
+                }
+              : {}),
             ...(operationFeeTotal > 0
               ? {
                   operationFee: {
@@ -1943,13 +2210,18 @@ export class OrderService {
       }
     }
 
-    // ── 套餐升舱占座：把 businessCount 个座位从经济舱航段「拆」到真实商务舱库存 ──
+    // ── 套餐升舱占座：把各程升舱人数的座位从经济舱航段「拆」到真实商务舱库存 ──
     // 套餐本身不绑班次（bundle.items 里的 FLIGHT 组件只有描述、无 scheduleId），故升舱要占用的
     // 真实座位来自本单的经济舱 FLIGHT 行（前台套餐订单的往返机票就是这些经济舱航段）。
     // 客户机票仍按经济舱收费（FLIGHT 行 amount 不变）；升舱只改变扣座的舱位分布：
-    //   每个经济舱航段：BUSINESS sold += businessUpgradeCount，ECONOMY sold += quantity − businessUpgradeCount。
+    //   每个经济舱航段：BUSINESS sold += 本段升舱人数，ECONOMY sold += quantity − 本段升舱人数。
     // 净占座仍 = quantity（不持有幽灵经济舱座位、不超售商务舱）。
-    if (bundleBusinessUpgradeCount > 0) {
+    //
+    // 分程：第一条经济舱航段 = 去程，其余 = 回程（与 items 数组顺序同源——去程行永远排在回程行之前，
+    // 单笔录单 / 前台商城 / 批量建单三条派生路径都是「去程在前、回程在后」地推 FLIGHT 行）。
+    // 每段各自落自己的 metadata.businessUpgradeCount；取消/超时释放与 admin force 重新占座都读
+    // **每行自己**落库的这个数做镜像还原（见 computeBundleSeatSplit 调用处），故占/释天然逐行对称。
+    if (bundleBusinessUpgradeOutbound > 0 || bundleBusinessUpgradeReturn > 0) {
       const economyLegs = priced.filter(
         (p) => p.kind === 'FLIGHT' && p.flightCabin === 'ECONOMY',
       );
@@ -1957,18 +2229,29 @@ export class OrderService {
         // 没有可升舱的经济舱航段 → 无从占用真实商务舱座位（套餐本身不绑班次）。
         throw new BadRequestError('商务舱余位不足，无法升舱');
       }
-      // 每段经济舱座位数必须 ≥ 升舱人数（不能把比本段乘客还多的人升舱）。
-      for (const leg of economyLegs) {
-        if (leg.quantity < bundleBusinessUpgradeCount) {
+      const legPlan = economyLegs.map((leg, idx) => ({
+        leg,
+        businessCount: idx === 0 ? bundleBusinessUpgradeOutbound : bundleBusinessUpgradeReturn,
+      }));
+      // 分程口径下，回程有人升舱却没有第二条经济舱航段 → 那份钱收了、座却无处占（钱/座对不上），
+      // fail-closed 拒单而不是静默吞掉。旧整程入参不走这个闸（沿用扩展前行为，历史调用零回归）。
+      if (hasSplitBusinessUpgradeInput && bundleBusinessUpgradeReturn > 0 && economyLegs.length < 2) {
+        throw new BadRequestError('本单没有回程航段，无法为回程升舱，请把回程升舱人数改回 0');
+      }
+      // 每段经济舱座位数必须 ≥ 本段升舱人数（不能把比本段乘客还多的人升舱）。
+      for (const { leg, businessCount } of legPlan) {
+        if (leg.quantity < businessCount) {
           throw new BadRequestError('商务舱余位不足，无法升舱');
         }
       }
-      // 逐段预检真实商务舱余位（事务前友好预检，真正扣减由事务里的原子 CAS 完成，最终防超售）。
-      await this.assertBusinessAvailabilityForBundle(economyLegs, bundleBusinessUpgradeCount);
+      // 逐段按本段人数预检真实商务舱余位（事务前友好预检，真正扣减由事务里的原子 CAS 完成，最终防超售）。
+      await this.assertBusinessAvailabilityForBundle(legPlan);
       // 标记每个经济舱航段要拆多少座到商务舱，并落到订单行 metadata（取消退座时按此还原拆座）。
-      for (const leg of economyLegs) {
-        leg.businessUpgradeCount = bundleBusinessUpgradeCount;
-        leg.metadata = { ...(leg.metadata ?? {}), businessUpgradeCount: bundleBusinessUpgradeCount };
+      // 本段 0 人也如实落 0：与「无升舱」等价（computeBundleSeatSplit 视 0 为不拆），但把
+      // 「这条腿没人升舱」写成显式事实，排障时不必猜是漏写还是真的 0。
+      for (const { leg, businessCount } of legPlan) {
+        leg.businessUpgradeCount = businessCount;
+        leg.metadata = { ...(leg.metadata ?? {}), businessUpgradeCount: businessCount };
       }
     }
 
@@ -1994,19 +2277,21 @@ export class OrderService {
    *
    * 套餐升舱的正确模型：客户机票仍按经济舱套餐价收，¥700/程 是升舱的「总加价」（不是在全价商务票上再加）；
    * 升舱要占用的真实商务舱座位来自本单的经济舱 FLIGHT 航段（套餐本身不绑班次）。
-   * 这里逐段按六档余位口径（available = capacity − sold − 他人 ACTIVE 锁位）预检每个经济舱航段对应班次的
-   * 商务舱余位是否够 businessCount：
-   *   - 任一航段班次没有商务舱舱位 / 商务舱余位 < businessCount → 拒单（"商务舱余位不足，无法升舱"）
-   * 真正的扣减（ECONOMY 减 businessCount、BUSINESS 加 businessCount）由事务里的原子 CAS 完成，最终防超售；
+   * 这里**逐段按该段自己的升舱人数**（去程/回程可以不同）按六档余位口径
+   * （available = capacity − sold − 他人 ACTIVE 锁位）预检对应班次的商务舱余位：
+   *   - 该段班次没有商务舱舱位 / 商务舱余位 < 本段升舱人数 → 拒单（"商务舱余位不足，无法升舱"）
+   *   - 本段升舱人数 = 0（如只升去程时的回程腿）→ 不占商务舱，跳过（不能因该班次没开商务舱就拒单）
+   * 真正的扣减（ECONOMY 减本段人数、BUSINESS 加本段人数）由事务里的原子 CAS 完成，最终防超售；
    * 此处只做事务前的友好预检。
    */
   private async assertBusinessAvailabilityForBundle(
-    economyLegs: Array<{ flightScheduleId?: string }>,
-    businessCount: number,
+    legPlan: ReadonlyArray<{ leg: { flightScheduleId?: string }; businessCount: number }>,
   ): Promise<void> {
     const now = new Date();
-    for (const leg of economyLegs) {
+    for (const { leg, businessCount } of legPlan) {
       if (!leg.flightScheduleId) continue;
+      // 本段没人升舱 → 不占用该班次的商务舱，无需（也不该）校验它有没有商务舱位。
+      if (businessCount <= 0) continue;
       const sc = await prisma.flightSeatClass.findFirst({
         where: { scheduleId: leg.flightScheduleId, cabin: 'BUSINESS' },
         select: { capacity: true, sold: true },
@@ -5593,7 +5878,14 @@ export class OrderService {
       item.hotelRoomTypeId
         ? prisma.hotelRoomType.findUnique({
             where: { id: item.hotelRoomTypeId },
-            select: { id: true, name: true, hotelId: true, hotel: { select: { name: true } } },
+            select: {
+              id: true,
+              name: true,
+              hotelId: true,
+              // randomTierPlaceholder：原房型可能挂在随机档「占位酒店」上（伪落位行）——
+              //   这种行业务上等同未落位随机单，落位时同样要吃「不许降级交付」的星级约束。
+              hotel: { select: { name: true, randomTierPlaceholder: true } },
+            },
           })
         : Promise.resolve(null),
       prisma.hotelRoomType.findUnique({
@@ -5615,9 +5907,16 @@ export class OrderService {
     }
     // 随机单落位的星级约束：客人买的是「N 星随机」，落到低于该星级的酒店等于降级交付 ——
     // 拒绝；同级或更高（升级）放行。星级分类直接取酒店档案 Hotel.starRating。
-    if (isRandomPoolRow && newRoomType.hotel.starRating < item.randomStarTier!) {
+    //
+    // 两种「未落位」形态同吃这条约束（档次来源不同，语义完全一样）：
+    //   a) 正规随机单 —— 档次取本行 randomStarTier；
+    //   b) 伪落位行（房型挂在随机档占位酒店上）—— 档次取该占位酒店的 randomTierPlaceholder。
+    const pendingTier = isRandomPoolRow
+      ? item.randomStarTier!
+      : (oldRoomType?.hotel.randomTierPlaceholder ?? null);
+    if (pendingTier != null && newRoomType.hotel.starRating < pendingTier) {
       throw new BadRequestError(
-        `${randomStarTierLabel(item.randomStarTier!)}只能落到 ${item.randomStarTier} 星及以上的酒店（所选酒店为 ${newRoomType.hotel.starRating} 星）`,
+        `${randomStarTierLabel(pendingTier)}只能落到 ${pendingTier} 星及以上的酒店（所选酒店为 ${newRoomType.hotel.starRating} 星）`,
       );
     }
 
@@ -7013,7 +7312,9 @@ async function resolveRandomTierNightlyCost(
   if (Number.isNaN(d.getTime())) return undefined;
   const periods = await prisma.hotelBlockPeriod.findMany({
     where: {
-      hotel: { starRating: randomStarTier, intlFiveStar: false },
+      // 与 hotel-control 的档次口径同源：星级命中、排除国际五星与占位酒店
+      // （占位酒店不是真房源，它名下的切房单价不是任何真实成本）。
+      hotel: { starRating: randomStarTier, intlFiveStar: false, randomTierPlaceholder: null },
       dateFrom: { lte: d },
       dateTo: { gte: d },
       unitPrice: { not: null },
@@ -7059,7 +7360,13 @@ export function resolveBundleHotelStamp(
 /** 写到订单行 metadata.addOns 的升级重算明细（金额单位 CNY，整数）。 */
 export interface BundleAddOnBreakdown {
   singleCount: number; // 选「一个人住酒店（单人入住）」的人数
-  businessCount: number; // 选「升舱商务」的人数
+  /**
+   * 选「升舱商务」的人数（整程口径，= max(去程, 回程)）。
+   * 旧字段保留供既有展示/导出读取；真正的每程人数看下面两个分程字段。
+   */
+  businessCount: number;
+  businessCountOutbound: number; // 去程升舱人数（占去程班次的真实商务舱座位）
+  businessCountReturn: number; // 回程升舱人数（单程套餐 legs=1 时恒为 0）
   // 占座模型（业务需求）：成人 / 占座儿童 / 不占座婴儿
   adultCount: number; // 成人数（占座、占房）
   childCount: number; // 占座儿童数（占座、占房；机票按成人价减折扣）
@@ -7077,7 +7384,8 @@ export interface BundleAddOnBreakdown {
   selfProvidedVisa: boolean; // 是否有自备签证乘客（= selfProvidedVisaCount > 0；向后兼容展示用）
   selfVisaDeductCny: number; // 该套餐配置的自备签证减免/人
   singleSupplementTotal: number; // = singleCount × rate × nights
-  businessUpgradeTotal: number; // = businessCount × rate × legs
+  // 分程口径 = (去程人数 + 回程人数) × rate；旧整程口径 = businessCount × rate × legs
+  businessUpgradeTotal: number;
   childSeatDiscountTotal: number; // = childCount × childSeatDiscountCnyPerPerson（机票折扣，负向计入套餐行）
   infantPriceTotal: number; // = infantCount × infantPriceCny（婴儿机票价，正向计入套餐行）
   selfVisaDeductTotal: number; // = selfProvidedVisaCount × selfVisaDeductCny（自备签证减免，负向计入套餐行）
@@ -7261,9 +7569,14 @@ export function computeBundleRoomsCharged(params: {
  *   nights = stamp 推导的入住晚数（无房型 → hotelNights ?? 1）
  *   legs   = bundle.legs（来回默认 2）
  *   单人入住房差 = singleCount × singleSupplementCnyPerNight × nights
- *   升舱商务加价 = businessCount × businessUpgradeCnyPerLeg × legs
+ *   升舱商务加价 = 分程口径（去程人数 + 回程人数）× businessUpgradeCnyPerLeg
+ *                 旧整程口径（businessCount 为数字）沿用 businessCount × businessUpgradeCnyPerLeg × legs
  *   自备签证减免 = selfProvidedVisaCount × selfVisaDeductCny（自行办妥签证的人数，从套餐行扣减）
  * singleCount / businessCount / selfProvidedVisaCount 缺省 0 → total=0 → 套餐价与旧版完全一致（向后兼容）。
+ *
+ * 升舱分程（去程/回程可以升不同人数）：第 4 个参数传对象 `{ outbound, return }` 即分程口径；
+ * 传数字/缺省 = 旧整程口径（每程同人数，× legs），公式原样保留，历史入参重算结果一分不差。
+ * 单程套餐（legs=1）下回程人数恒按 0 处理 —— 没有回程航段可占座，也就不该收回程升舱费。
  *
  * selfProvidedVisaCount 语义（两种模式，调用处 priceAndValidateItems 决定 count）：
  *   · 旧整单口径：录单勾「客人自备签证」布尔 true → count=1（整单减一次 −selfVisaDeductCny）。
@@ -7334,6 +7647,29 @@ export function resolveBundleBusinessUpgradeRate(bundle: {
   );
 }
 
+/** 升舱分程人数（去程 / 回程各自的升舱人数）。 */
+export interface BundleBusinessUpgradeSplit {
+  outbound?: number;
+  return?: number;
+}
+
+/**
+ * BUNDLE 行入参 → computeBundleAddOn 的升舱口径（纯函数，导出供单测与定价分支共用）。
+ *   · 分程字段任一显式提供（含 0）→ 分程口径 `{ outbound, return }`；
+ *   · 两者都省略 → 回落旧的整程 businessCount（数字/undefined），定价与扩展前完全一致。
+ * 「显式 0」必须走分程分支：只升去程（回程 0）正是本次要支持的场景，落到旧口径会按两程都升收钱。
+ */
+export function resolveBundleBusinessUpgradeInput(item: {
+  businessCount?: number;
+  businessCountOutbound?: number;
+  businessCountReturn?: number;
+}): number | BundleBusinessUpgradeSplit | undefined {
+  if (item.businessCountOutbound !== undefined || item.businessCountReturn !== undefined) {
+    return { outbound: item.businessCountOutbound, return: item.businessCountReturn };
+  }
+  return item.businessCount;
+}
+
 export function computeBundleAddOn(
   bundle: {
     hotelNights: number | null;
@@ -7346,7 +7682,11 @@ export function computeBundleAddOn(
   },
   hotelStamp: { hotelCheckIn: Date; hotelCheckOut: Date } | null,
   singleCount: number | undefined,
-  businessCount: number | undefined,
+  /**
+   * 升舱人数。数字/缺省 = 旧整程口径（每程同人数，× legs 计价）；
+   * 对象 = 分程口径（去程 / 回程各自的人数，合计 × 每程差价）。
+   */
+  businessCount: number | BundleBusinessUpgradeSplit | undefined,
   occupancy: BundleOccupancy,
   /** 调用方按 resolveBundleNights 解析的单一权威晚数（无盖章时的回退口径）。 */
   resolvedNights: number,
@@ -7357,11 +7697,6 @@ export function computeBundleAddOn(
   selfProvidedVisaCount?: number,
 ): { total: number; hasAddOn: boolean; breakdown: BundleAddOnBreakdown } {
   const single = Math.max(0, Math.trunc(singleCount ?? 0));
-  // businessCount 不能超过占座人数（成人 + 占座儿童）；婴儿不占座、不能升舱
-  const business = Math.min(
-    Math.max(0, Math.trunc(businessCount ?? 0)),
-    occupancy.seatPax,
-  );
   // 自备签人数：夹到 [0, headCount]（按人减免，最多全体出行人）。旧整单布尔已在调用处归一化为 0/1。
   const selfVisaCount = Math.min(
     Math.max(0, Math.trunc(selfProvidedVisaCount ?? 0)),
@@ -7381,8 +7716,24 @@ export function computeBundleAddOn(
   const infantRate = Math.max(0, bundle.infantPriceCny);
   const selfVisaRate = Math.max(0, bundle.selfVisaDeductCny);
 
+  // 升舱人数：两种口径共用同一个夹逼（≤ 占座人数；婴儿不占座、不能升舱）。
+  //   · 分程口径（对象）：去/回程各自夹逼，总加价 = (去 + 回) × 每程差价；
+  //     单程套餐 legs=1 → 回程恒 0（没有回程航段可占座，也不该收回程升舱费）。
+  //   · 整程口径（数字/缺省）：**原公式一字不动**（人数 × 每程差价 × legs），历史入参重算结果一分不差；
+  //     分程字段按「每程同人数」派生，供占座拆分与明细文案使用（legs=1 时回程仍为 0）。
+  const clampSeat = (n: number | undefined): number =>
+    Math.min(Math.max(0, Math.trunc(n ?? 0)), occupancy.seatPax);
+  const isSplitInput = typeof businessCount === 'object' && businessCount !== null;
+  const businessOutbound = clampSeat(isSplitInput ? businessCount.outbound : businessCount);
+  const businessReturn =
+    legs >= 2 ? clampSeat(isSplitInput ? businessCount.return : businessCount) : 0;
+  // 旧展示字段（整程口径的「升舱人数」）：取两程较大值 —— 旧入参两程同值时与旧版完全一致。
+  const business = Math.max(businessOutbound, businessReturn);
+
   const singleSupplementTotal = single * singleRate * nights;
-  const businessUpgradeTotal = business * businessRate * legs;
+  const businessUpgradeTotal = isSplitInput
+    ? (businessOutbound + businessReturn) * businessRate
+    : business * businessRate * legs;
   // 占座儿童机票按成人价减折扣 → 套餐行净减 childCount × 折扣
   const childSeatDiscountTotal = occupancy.childCount * childDiscountRate;
   // 不占座婴儿机票收婴儿价（不走经济舱全价）→ 套餐行净加 infantCount × 婴儿价
@@ -7412,6 +7763,8 @@ export function computeBundleAddOn(
     breakdown: {
       singleCount: single,
       businessCount: business,
+      businessCountOutbound: businessOutbound,
+      businessCountReturn: businessReturn,
       adultCount: occupancy.adultCount,
       childCount: occupancy.childCount,
       infantCount: occupancy.infantCount,
@@ -8090,9 +8443,11 @@ function serializePassengerRecord<P extends Record<string, unknown>>(
 const REDACTED_ITEM_METADATA_KEYS: readonly string[] = [
   'perSeatBreakdown', // FLIGHT 逐座定价阶梯（含 unitPrice/bucket，能反推实时销量与档位价）
   'addOns', // BUNDLE 升级重算明细（含单房差/升舱/儿童折扣/婴儿价/自备签费率与各项小计、total）
+  'designatedHotel', // BUNDLE 指定酒店加价明细（每人费率/小计，能反推我方与酒店的差价口径）
   'operationFee', // BUNDLE 每人操作费（perPaxCny/totalCny）
   'bundleDiscountPct', // BUNDLE 套餐折扣百分比
   'perNightCny', // 补收单房差每晚价（售后调价行）
+  'expressTier', // VISA 加急档快照（含该档 surchargeCny，能反推我方加急加价口径）
   'unitPrice', // 任何行级单价明细
 ];
 

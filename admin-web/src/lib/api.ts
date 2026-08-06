@@ -546,7 +546,12 @@ export type CreateOrderItemInput =
       bundleId: string;
       unitPrice: number;
       singleCount?: number;
+      /** 整程升舱人数（旧口径，每程同人数）。分程字段任一存在时以分程为准。 */
       businessCount?: number;
+      /** 去程升舱人数（分程口径；与 businessCountReturn 任一存在即以分程为权威） */
+      businessCountOutbound?: number;
+      /** 回程升舱人数（分程口径；单程套餐由服务端按 0 处理） */
+      businessCountReturn?: number;
       adultCount?: number;
       childCount?: number;
       infantCount?: number;
@@ -554,6 +559,12 @@ export type CreateOrderItemInput =
       selfProvidedVisa?: boolean;
       /** 计费间数（0.5 步进；分房半间用）；缺省 = 按人数推算 */
       roomsBilled?: number;
+      /**
+       * 指定酒店（可选）：套餐按「星级随机」报价，客人点名要住某家酒店 → 传该店房型 id。
+       * 服务端把占房/盖章切到指定房型，并按该酒店配置的「指定酒店加价 ¥/人」×占座人数加收
+       * （server-priced）。缺省 = 不指定，走套餐绑定房型/随机现状。
+       */
+      designatedHotelRoomTypeId?: string;
     });
 
 // 签证状态（录单/详情用）；后端 enum → 中文：
@@ -1628,6 +1639,14 @@ export interface Hotel {
   starRating: number;
   /** 国际五星标记；starRating 仍是 1..5 整数语义，国际五星 = starRating=5 + 本标记 */
   intlFiveStar: boolean;
+  /**
+   * 非空 = 这不是真酒店，而是星级随机档的「占位项」（值 = 它代表的档次 3/4/5）。
+   * 房控口径里它不是酒店：不进余量合计、名下切房周期不计入；落在它房型上的订单行
+   * 算「未落位」，需由房控落位到真酒店。判定一律看本字段，**不按名字匹配**。
+   */
+  randomTierPlaceholder: number | null;
+  /** 指定酒店加价（CNY/人）：套餐录单点名住本酒店时按占座人数加收；0 = 指定不加价 */
+  designationSurchargeCnyPerPerson: number;
   basePrice: string | null;
   /** D3 真实评价聚合（来自 Review 表，非旧手填 Decimal）；恒为对象，无评价时 {average:0,count:0} */
   rating: { average: number; count: number };
@@ -1667,6 +1686,16 @@ export type VisaIssuanceMethod = 'E_VISA' | 'STICKER' | 'ARRIVAL' | 'OTHER';
 /** 签证入境次数 */
 export type VisaEntryType = 'SINGLE' | 'MULTIPLE';
 
+/** 一档签证加急（零工/一工/二工…）：档名是定价查表的键，同产品内唯一。 */
+export interface VisaExpressTier {
+  /** 档名（如「一工」）；录单只传这个，金额由服务端查表 */
+  label: string;
+  /** 该档出签工作日（0 = 当天出签） */
+  workDays: number;
+  /** 该档加价（CNY/份，服务端权威） */
+  surchargeCny: number;
+}
+
 export interface Visa {
   id: string;
   /** 产品编号（服务端生成，如 V0001）；老数据可能为 null */
@@ -1682,7 +1711,13 @@ export interface Visa {
   flag: string | null;
   processingDays: number;
   basePrice: string;
+  /** 旧的单值加急费（未配分档的产品仍按它计价）；未录 = null */
   expressSurcharge: string | null;
+  /**
+   * 加急分档（零工/一工/二工…，运营在产品管理里自配）。空数组 = 未配分档 → 回落 expressSurcharge。
+   * 录单只传所选档名，加价金额一律服务端按本表查出（钱路径服务端权威）。
+   */
+  expressTiers: VisaExpressTier[];
   validityMonths: number | null;
   /** 单次入境最多可停留天数（订单详情行程单「最多可停留 X 天」展示 + 推算生效/失效日期用）；未设置为 null */
   stayDays: number | null;
@@ -1866,6 +1901,31 @@ export interface SettlementRateWriteEntry {
   note?: string | null;
 }
 
+// ── 机票结算价日历（ADMIN/STAFF）— 航班号 × 出发日期 → 每人结算价 ──────────
+// 与 backend/src/modules/settlement-rates/flight-settlement-rates.* 对齐。
+// 对应运营的机票报价表：行 = 日期，列 = 航班（去程/回程各一列），每格一个 OTA 结算价/人。
+export interface FlightSettlementRate {
+  id: string;
+  /** 航班号（统一大写，如 QH9589） */
+  flightNumber: string;
+  /** 出发地本地出发日（YYYY-MM-DD） */
+  departDate: string;
+  /** 每人结算价（CNY，整数） */
+  pricePerPersonCny: number;
+  note: string | null;
+  /** 最近更新人 userId */
+  updatedBy: string | null;
+  updatedAt: string;
+}
+
+/** 批量 upsert 一格（网格整批保存 / Excel 粘贴块） */
+export interface FlightSettlementRateWriteEntry {
+  flightNumber: string;
+  departDate: string;
+  pricePerPersonCny: number;
+  note?: string | null;
+}
+
 // ── 房控（酒店包房周期 + 销控板 / 远期视图）──────────────────────────────
 // 与 backend/src/modules/hotel-control/hotel-control.service.ts 对齐
 /**
@@ -1874,8 +1934,8 @@ export interface SettlementRateWriteEntry {
  *   随机N星余量 = Σ(同星级酒店余量) − 未落位随机单占用
  * 卖具体酒店、卖随机、把随机单落位到具体酒店，三者都保持这个合计对得上账。
  */
-export type RandomStarTier = 3 | 4;
-export const RANDOM_STAR_TIERS: RandomStarTier[] = [3, 4];
+export type RandomStarTier = 3 | 4 | 5;
+export const RANDOM_STAR_TIERS: RandomStarTier[] = [3, 4, 5];
 /** 随机档展示名（与后端 randomStarTierLabel 一致）。 */
 export function randomStarTierLabel(tier: number): string {
   return `${['一', '二', '三', '四', '五'][tier - 1] ?? String(tier)}星随机`;
@@ -1904,6 +1964,11 @@ export interface HotelBlockPeriod {
   hotelName: string;
   /** 非空 = 历史遗留的随机档周期（已停用，仅保留供查账；新周期一律挂具体酒店） */
   randomStarTier: RandomStarTier | null;
+  /**
+   * 已停用：本周期不计入任何余量，仅保留供查账（打灰标，可直接删）。
+   * 两种来源 —— 历史随机档池周期，或挂在随机档「占位酒店」名下的周期。
+   */
+  disabled: boolean;
   dateFrom: string; // YYYY-MM-DD
   dateTo: string; // YYYY-MM-DD（闭区间）
   rooms: number;
@@ -3737,6 +3802,29 @@ export const api = {
     }),
   deleteSettlementRate: (token: string, id: string) =>
     apiFetch<{ ok: true }>(`/settlement-rates/${id}`, { method: 'DELETE', token }),
+
+  // ── 机票结算价日历（ADMIN/STAFF）— 航班号 × 出发日期网格 ─────────────────
+  listFlightSettlementRates: (
+    token: string,
+    params: { from: string; to: string; flightNumbers?: string[] },
+  ) => {
+    const qs = new URLSearchParams({ from: params.from, to: params.to });
+    if (params.flightNumbers && params.flightNumbers.length > 0) {
+      qs.set('flightNumbers', params.flightNumbers.join(','));
+    }
+    return apiFetch<{ rates: FlightSettlementRate[] }>(
+      `/flight-settlement-rates?${qs.toString()}`,
+      { token },
+    );
+  },
+  upsertFlightSettlementRates: (token: string, rates: FlightSettlementRateWriteEntry[]) =>
+    apiFetch<{ rates: FlightSettlementRate[] }>('/flight-settlement-rates/batch', {
+      method: 'PUT',
+      token,
+      body: { rates },
+    }),
+  deleteFlightSettlementRate: (token: string, id: string) =>
+    apiFetch<{ ok: true }>(`/flight-settlement-rates/${id}`, { method: 'DELETE', token }),
 
   // 分房表导出（成都格式：每入住日期一个 sheet；ADMIN/STAFF only）— Blob 直接下载
   //   · { from, to }    按入住日区间选（跨度上限 14 天）

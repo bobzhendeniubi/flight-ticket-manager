@@ -4,8 +4,11 @@ const dateStr = z
   .string()
   .regex(/^\d{4}-\d{2}-\d{2}$/u, '日期格式应为 YYYY-MM-DD');
 
-/** 星级随机池档次（3=三星随机、4=四星随机）；口径见 hotel-control.service.ts RANDOM_STAR_TIERS。*/
-const randomStarTierSchema = z.union([z.literal(3), z.literal(4)]);
+/**
+ * 星级随机档档次（3=三星随机、4=四星随机、5=五星随机）；
+ * 口径见 hotel-control.service.ts RANDOM_STAR_TIERS（五星随机组内仍排除国际五星）。
+ */
+const randomStarTierSchema = z.union([z.literal(3), z.literal(4), z.literal(5)]);
 
 // ── 包房周期 CRUD ─────────────────────────────────────────────────────────
 export const listBlockPeriodsQuerySchema = z.object({

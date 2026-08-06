@@ -49,15 +49,23 @@ const DAY_MS = 24 * 60 * 60 * 1000;
  *   卖随机     → 未落位随机单占用多 → 合计少；
  *   房控把随机单落位到某家酒店 → 该酒店用房 +1、未落位占用 −1 ⇒ **合计不变**。
  *
- * 写路径不变：客人下单仍写 OrderItem.randomStarTier 的「未落位随机单」占房行，
- * 落位仍走换酒店流程（写 hotelRoomTypeId + 清 randomStarTier）。
- * 酒店的星级分类直接取 Hotel.starRating（不另建分类表）；国际五星（Hotel.intlFiveStar）
- * 不进任何随机档聚合 —— 随机档只有 3/4 星，五星另行报价。
+ * 写路径有两种「未落位」形态，读路径一视同仁：
+ *   a) OrderItem.randomStarTier 非空、无房型 —— 正规的未落位随机单；
+ *   b) 房型挂在**占位酒店**（Hotel.randomTierPlaceholder 非空）上的订单行 —— 早期用假酒店
+ *      承载随机档时留下的形态，业务上同样还没落到任何一家真酒店。
+ * 落位都走换酒店流程（把房型换到真酒店；(a) 同时清 randomStarTier）。
+ *
+ * 酒店的星级分类直接取 Hotel.starRating（不另建分类表）。两类酒店**一律排除**在
+ * 「Σ真酒店余量」之外：
+ *   · 国际五星（Hotel.intlFiveStar）—— 与 starRating=5 共用整数星级，另行报价；
+ *   · 占位酒店（Hotel.randomTierPlaceholder 非空）—— 它不是真房源，把它当酒店合计
+ *     就是把同一批房算两遍，销控板上还会既出现酒店组又出现同名聚合组。
  *
  * 历史：随机档曾是 HotelBlockPeriod.randomStarTier 的独立切房周期。该建池入口已废止
- * （createBlockPeriod 拒绝新建），存量周期数据保留供审计，但**所有读路径都不再计入**。
+ * （createBlockPeriod 拒绝新建），存量周期数据保留供审计，但**所有读路径都不再计入**；
+ * 占位酒店名下的切房周期同款处理（不计入、不许新建）。
  */
-export const RANDOM_STAR_TIERS = [3, 4] as const;
+export const RANDOM_STAR_TIERS = [3, 4, 5] as const;
 export type RandomStarTier = (typeof RANDOM_STAR_TIERS)[number];
 
 const CN_NUMERALS = ['一', '二', '三', '四', '五'] as const;
@@ -76,18 +84,33 @@ export function randomPoolGroupKey(tier: number): string {
 }
 
 /**
- * 该酒店归入哪个随机档；不属于任何随机档 → null。
- * 国际五星（intlFiveStar）一律排除 —— 它与 starRating=5 共用整数星级，且随机档只有 3/4 星；
- * 这里把排除写死，避免将来随机档扩到 5 星时把国际五星悄悄卷进合计。
+ * 该**真实酒店**归入哪个随机档；不属于任何随机档 → null。
+ * 两类一律排除（判定看列，不看名字）：
+ *   · 国际五星（intlFiveStar）—— 与 starRating=5 共用整数星级，五星随机档不含它，另行报价；
+ *   · 占位酒店（randomTierPlaceholder 非空）—— 它不是房源，进合计就是同一批房算两遍。
+ *     占位酒店该归哪个聚合组由 `randomTierPlaceholder` 自己说了算（见 placeholderTierOfHotel），
+ *     且只进「用房（未落位）」那一行，绝不进「包房」。
  */
 export function randomTierOfHotel(hotel: {
   starRating: number;
   intlFiveStar?: boolean | null;
+  randomTierPlaceholder?: number | null;
 }): number | null {
   if (hotel.intlFiveStar) return null;
+  if (hotel.randomTierPlaceholder != null) return null;
   return (RANDOM_STAR_TIERS as readonly number[]).includes(hotel.starRating)
     ? hotel.starRating
     : null;
+}
+
+/**
+ * 该酒店是不是随机档的**占位酒店**；是 → 它代表的档次（3/4/5），否 → null。
+ * 落在占位酒店房型上的订单行在房控口径里等同「未落位随机单」，计入该档次聚合组的用房。
+ */
+export function placeholderTierOfHotel(hotel: {
+  randomTierPlaceholder?: number | null;
+}): number | null {
+  return hotel.randomTierPlaceholder ?? null;
 }
 
 /**
@@ -99,13 +122,23 @@ export type RoomScope = { hotelId: string } | { randomStarTier: number };
 
 /**
  * 该作用域的占房行过滤条件。
- * 未落位随机单显式要求 hotelRoomTypeId 为空 —— 与销控板分组「有房型就归该酒店」同优先级，
+ *
+ * 随机档作用域 = 两类「未落位」占房行（与销控板聚合组的用房行同一口径）：
+ *   a) 无房型 + randomStarTier 命中该档 —— 正规未落位随机单；
+ *   b) 房型挂在该档的占位酒店上 —— 早期假酒店承载随机档留下的伪落位行。
+ * (a) 显式要求 hotelRoomTypeId 为空 —— 与销控板分组「有房型就归该酒店」同优先级，
  * 万一出现两列都有值的异常行，两边都把它算成具体酒店的占房，不会被重复计两次。
+ * 具体酒店作用域天然不会命中占位酒店 —— 占位酒店不作为酒店组出现在销控板上。
  */
 function scopeItemWhere(scope: RoomScope): Prisma.OrderItemWhereInput {
   return 'hotelId' in scope
     ? { hotelRoomTypeId: { not: null }, hotelRoomType: { hotelId: scope.hotelId } }
-    : { hotelRoomTypeId: null, randomStarTier: scope.randomStarTier };
+    : {
+        OR: [
+          { hotelRoomTypeId: null, randomStarTier: scope.randomStarTier },
+          { hotelRoomType: { hotel: { randomTierPlaceholder: scope.randomStarTier } } },
+        ],
+      };
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────
@@ -137,6 +170,12 @@ export interface HotelBlockPeriodDto {
   hotelName: string;
   /** 非空 = 星级随机池周期（3=三星随机、4=四星随机）。*/
   randomStarTier: number | null;
+  /**
+   * 已停用：本周期不计入任何余量，仅保留供查账（前端打灰标，可直接删）。
+   * 两种来源同款处理 —— 存量的随机档池周期（randomStarTier 非空），以及挂在**占位酒店**
+   * 名下的周期（占位酒店不是真房源，它的切房进合计就是同一批房算两遍）。
+   */
+  disabled: boolean;
   dateFrom: string; // YYYY-MM-DD
   dateTo: string; // YYYY-MM-DD（闭区间）
   rooms: number;
@@ -146,7 +185,7 @@ export interface HotelBlockPeriodDto {
 }
 
 type BlockPeriodRow = Prisma.HotelBlockPeriodGetPayload<{
-  include: { hotel: { select: { name: true } } };
+  include: { hotel: { select: { name: true; randomTierPlaceholder: true } } };
 }>;
 
 function toDto(row: BlockPeriodRow): HotelBlockPeriodDto {
@@ -157,6 +196,7 @@ function toDto(row: BlockPeriodRow): HotelBlockPeriodDto {
     // hotel 关联随 hotelId 一起为空（池周期）→ 用池档次名占位，前端无需分支即可展示
     hotelName: row.hotel?.name ?? randomStarTierLabel(row.randomStarTier ?? 0),
     randomStarTier: row.randomStarTier,
+    disabled: row.randomStarTier != null || row.hotel?.randomTierPlaceholder != null,
     dateFrom: fmtDateOnly(row.dateFrom),
     dateTo: fmtDateOnly(row.dateTo),
     rooms: row.rooms,
@@ -171,7 +211,7 @@ function toDto(row: BlockPeriodRow): HotelBlockPeriodDto {
  *
  * 随机档周期（randomStarTier 非空）已废止 —— 随机档改为同星级酒店的派生聚合（见本文件
  * 「星级随机档」小节），再单独切一份总量就会与酒店库存双记一笔账。存量周期数据保留供审计，
- * 但既不允许新建、读路径也不再计入。
+ * 但既不允许新建、读路径也不再计入。占位酒店名下的周期同理（在 createBlockPeriod 里查库判定）。
  */
 function assertBlockPeriodScope(input: {
   hotelId?: string | null;
@@ -196,7 +236,7 @@ export async function listBlockPeriods(
         ? { randomStarTier: filter.randomStarTier }
         : undefined,
     orderBy: [{ hotelId: 'asc' }, { dateFrom: 'desc' }],
-    include: { hotel: { select: { name: true } } },
+    include: { hotel: { select: { name: true, randomTierPlaceholder: true } } },
   });
   return rows.map(toDto);
 }
@@ -212,9 +252,13 @@ export async function createBlockPeriod(
   if (input.hotelId) {
     const hotel = await client.hotel.findUnique({
       where: { id: input.hotelId },
-      select: { id: true },
+      select: { id: true, randomTierPlaceholder: true },
     });
     if (!hotel) throw new NotFoundError('酒店不存在');
+    // 占位酒店不是真房源，给它切房 = 与同星级真酒店的库存双记一笔账（同存量池周期同款拒绝）
+    if (hotel.randomTierPlaceholder != null) {
+      throw new BadRequestError('该酒店是星级随机档占位项，不能切房；请为真实酒店设置包房周期');
+    }
   }
 
   const row = await client.hotelBlockPeriod.create({
@@ -228,7 +272,7 @@ export async function createBlockPeriod(
       unitPrice: input.unitPrice ?? null,
       note: input.note ?? null,
     },
-    include: { hotel: { select: { name: true } } },
+    include: { hotel: { select: { name: true, randomTierPlaceholder: true } } },
   });
   return toDto(row);
 }
@@ -257,7 +301,7 @@ export async function updateBlockPeriod(
   const row = await client.hotelBlockPeriod.update({
     where: { id },
     data,
-    include: { hotel: { select: { name: true } } },
+    include: { hotel: { select: { name: true, randomTierPlaceholder: true } } },
   });
   return toDto(row);
 }
@@ -758,9 +802,10 @@ export async function assertHotelPhysicalFit(
 /**
  * 某个随机档在给定夜晚集合上的聚合余量（口径见本文件「星级随机档」小节）：
  *
- *   block(d)      = Σ 同星级酒店当晚包房间数
- *   hotelUsed(d)  = Σ 同星级酒店当晚床位口径用房（已落到具体酒店的占房，含随机单落位后的）
- *   pendingUsed(d)= 当晚**未落位**随机单占用（床位口径，OrderItem.randomStarTier 非空且无房型）
+ *   block(d)      = Σ 同星级**真**酒店当晚包房间数（排除国际五星与占位酒店）
+ *   hotelUsed(d)  = Σ 同星级真酒店当晚床位口径用房（已落到具体酒店的占房，含随机单落位后的）
+ *   pendingUsed(d)= 当晚**未落位**占用（床位口径）= randomStarTier 非空且无房型的行
+ *                   ＋ 房型挂在该档占位酒店上的行（伪落位，业务上同样没落到真酒店）
  *   remaining(d)  = block(d) − hotelUsed(d) − pendingUsed(d)
  *
  * `hasBlock=false` 表示该档次整段没有任何同星级酒店的包房周期 —— 未纳入管控，调用方
@@ -792,9 +837,9 @@ export async function getRandomTierAggregate(
   const fromD = toDateOnly(nightDates[0]);
   const toD = toDateOnly(nightDates[nightDates.length - 1]);
 
-  // 该档次的酒店集合：starRating 命中且非国际五星（randomTierOfHotel 的等价 where）
+  // 该档次的真酒店集合：starRating 命中、非国际五星、非占位酒店（randomTierOfHotel 的等价 where）
   const hotels = await client.hotel.findMany({
-    where: { starRating: tier, intlFiveStar: false },
+    where: { starRating: tier, intlFiveStar: false, randomTierPlaceholder: null },
     select: { id: true },
   });
   const hotelIds = hotels.map((h) => h.id);
@@ -824,8 +869,11 @@ export async function getRandomTierAggregate(
     }),
     client.orderItem.findMany({
       where: {
-        hotelRoomTypeId: null,
-        randomStarTier: tier,
+        // 两类未落位占用：正规随机单（无房型 + 档次命中）＋ 伪落位（房型挂在该档占位酒店上）
+        OR: [
+          { hotelRoomTypeId: null, randomStarTier: tier },
+          { hotelRoomType: { hotel: { randomTierPlaceholder: tier } } },
+        ],
         ...nightWhere,
         order: orderWhere,
       },
@@ -848,12 +896,15 @@ export async function getRandomTierAggregate(
  * 为什么这里用床位口径、不套具体酒店那套「物理房间前瞻闸」：随机单**还没落到任何一家酒店**，
  * 拼房能不能配对要等落位那一刻才由该酒店当晚的性别桶决定 —— 落位走的是换酒店流程，
  * 那里已有物理口径前瞻闸把关。下单这一刻只需保证「同星级还有房可落」。
+ *
+ * `buildMessage`：对外端点（前台下单）传中性话术，别把包房间数/合计余量这些内部库存数字
+ * 回给客人；后台录单不传，用默认的带数字文案，方便运营直接判断差多少间。
  */
 export async function assertRandomTierFit(
   tier: number,
   nightDates: readonly string[],
   rooms: number,
-  opts: { excludeOrderId?: string } = {},
+  opts: { excludeOrderId?: string; buildMessage?: () => string } = {},
   client: PrismaClient = defaultPrisma,
 ): Promise<void> {
   const agg = await getRandomTierAggregate(tier, nightDates, opts, client);
@@ -864,7 +915,8 @@ export async function assertRandomTierFit(
     const after = round2(agg.remaining[i] - rooms);
     if (after < 0) {
       throw new BadRequestError(
-        `${randomStarTierLabel(tier)}余量不足（${nightDates[i]} 同星级酒店合计余量 ${agg.remaining[i]} 间，本次需 ${rooms} 间）`,
+        opts.buildMessage?.() ??
+          `${randomStarTierLabel(tier)}余量不足（${nightDates[i]} 同星级酒店合计余量 ${agg.remaining[i]} 间，本次需 ${rooms} 间）`,
       );
     }
   }
@@ -953,11 +1005,20 @@ export async function getBoard(
   const toD = toDateOnly(dates[dates.length - 1]);
 
   // 周期：与 [from, to] 有交集的全部（按 dateFrom 倒序 → 第一条即"最新周期"）
-  // hotel.starRating / intlFiveStar 随主查带回，供随机档聚合分组，不额外查库。
+  // hotel.starRating / intlFiveStar / randomTierPlaceholder 随主查带回，供随机档聚合分组，不额外查库。
   const periods = await client.hotelBlockPeriod.findMany({
     where: { dateFrom: { lte: toD }, dateTo: { gte: fromD } },
     orderBy: { dateFrom: 'desc' },
-    include: { hotel: { select: { name: true, starRating: true, intlFiveStar: true } } },
+    include: {
+      hotel: {
+        select: {
+          name: true,
+          starRating: true,
+          intlFiveStar: true,
+          randomTierPlaceholder: true,
+        },
+      },
+    },
   });
 
   // 占房订单行：一次 findMany 拉全范围内相关行，再在 JS 里按天展开（无逐日查询）
@@ -979,7 +1040,14 @@ export async function getBoard(
       hotelRoomType: {
         select: {
           hotelId: true,
-          hotel: { select: { name: true, starRating: true, intlFiveStar: true } },
+          hotel: {
+            select: {
+              name: true,
+              starRating: true,
+              intlFiveStar: true,
+              randomTierPlaceholder: true,
+            },
+          },
         },
       },
       // roomAssignment = 权威分房表（优先直计物理间数，订单级去重需 id）；
@@ -991,12 +1059,14 @@ export async function getBoard(
     },
   });
 
-  // 具体酒店分组 = 有周期的 ∪ 有占房的。
-  // 存量随机档周期（hotelId 为 NULL）**一律跳过**：随机档已改为同星级酒店的派生聚合，
-  // 再把它的 rooms 计进来就是第二本账（数据保留供审计，读路径不认）。
+  // 具体酒店分组 = 有周期的 ∪ 有占房的。两类**一律跳过**（随机档已改为同星级酒店的派生聚合，
+  // 再把它们的 rooms 计进来就是第二本账；数据保留供审计，读路径不认）：
+  //   · 存量随机档周期（hotelId 为 NULL）；
+  //   · 占位酒店（randomTierPlaceholder 非空）—— 它不作为酒店组出现，名下周期不计入包房，
+  //     落在它房型上的占房行改由下面的聚合组按「未落位」统计。
   const groups = new Map<string, { name: string; randomTier: number | null }>();
   for (const p of periods) {
-    if (!p.hotelId) continue;
+    if (!p.hotelId || p.hotel?.randomTierPlaceholder != null) continue;
     groups.set(p.hotelId, {
       name: p.hotel?.name ?? p.hotelId,
       randomTier: p.hotel ? randomTierOfHotel(p.hotel) : null,
@@ -1004,6 +1074,7 @@ export async function getBoard(
   }
   for (const it of items) {
     if (!it.hotelRoomType || groups.has(it.hotelRoomType.hotelId)) continue;
+    if (it.hotelRoomType.hotel.randomTierPlaceholder != null) continue;
     groups.set(it.hotelRoomType.hotelId, {
       name: it.hotelRoomType.hotel.name,
       randomTier: randomTierOfHotel(it.hotelRoomType.hotel),
@@ -1058,15 +1129,30 @@ export async function getBoard(
       };
     });
 
-  // ── 随机档聚合组（三星随机 / 四星随机）────────────────────────────────
-  // 包房 = 同星级酒店包房合计；用房 = 未落位随机单占用；
-  // 余量 = Σ(同星级酒店余量) − 未落位随机单占用（见文件头「星级随机档」小节的对账恒等）。
+  // ── 随机档聚合组（三星随机 / 四星随机 / 五星随机）──────────────────────
+  // 包房 = 同星级真酒店包房合计；用房 = 未落位占用；
+  // 余量 = Σ(同星级酒店余量) − 未落位占用（见文件头「星级随机档」小节的对账恒等）。
+  //
+  // 「未落位占用」收两类行（业务上都还没落到真酒店，见文件头小节）：
+  //   a) 无房型 + randomStarTier 非空 —— 正规未落位随机单，档次取 randomStarTier；
+  //   b) 房型挂在占位酒店上 —— 伪落位行，档次取该占位酒店的 randomTierPlaceholder。
+  // 上面的酒店分组已把 (b) 排除在酒店组之外，故两处不会重复计一笔。
   const pendingByTier = new Map<number, typeof items>();
-  for (const it of items) {
-    if (it.hotelRoomType || it.randomStarTier == null) continue;
-    const list = pendingByTier.get(it.randomStarTier) ?? [];
+  const pushPending = (tier: number, it: (typeof items)[number]): void => {
+    const list = pendingByTier.get(tier) ?? [];
     list.push(it);
-    pendingByTier.set(it.randomStarTier, list);
+    pendingByTier.set(tier, list);
+  };
+  for (const it of items) {
+    const placeholderTier = it.hotelRoomType
+      ? placeholderTierOfHotel(it.hotelRoomType.hotel)
+      : null;
+    if (placeholderTier != null) {
+      pushPending(placeholderTier, it);
+      continue;
+    }
+    if (it.hotelRoomType || it.randomStarTier == null) continue;
+    pushPending(it.randomStarTier, it);
   }
   // 出现条件：该档次有同星级酒店进了销控板（有周期或有占房），或有未落位随机单待落地
   const tiers = new Set<number>([

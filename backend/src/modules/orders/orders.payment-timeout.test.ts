@@ -23,6 +23,8 @@ const { mockPrisma, mockScheduleSeatHoldRelease } = vi.hoisted(() => {
     orderCostItem: { create: vi.fn() },
     // createVisaTaskAtCreation（best-effort，事务后调用）会查订单项；返回空 → 直接 return []
     orderItem: { findMany: vi.fn() },
+    // 机票结算价日历取价（代理单）会查航段班次；返回空 → 放弃自动取价，不影响本文件的超时口径断言
+    flightSchedule: { findMany: vi.fn() },
     seatLock: {
       aggregate: vi.fn(),
       findMany: vi.fn(),
@@ -127,6 +129,8 @@ describe('createOrder 支付超时口径 · 身份判定', () => {
     // createVisaTaskAtCreation：无订单项 → 直接 return []（best-effort，另有 try/catch 兜底）
     mockPrisma.order.findUnique.mockResolvedValue({ visaStatus: null });
     mockPrisma.orderItem.findMany.mockResolvedValue([]);
+    // 机票结算价日历：查不到航段班次 → 放弃自动取价（本文件只验超时口径，不涉结算价）
+    mockPrisma.flightSchedule.findMany.mockResolvedValue([]);
     mockPrisma.order.create.mockImplementation(async (args: { data: Record<string, unknown> }) => ({
       id: 'ord1',
       orderNumber: args.data.orderNumber,

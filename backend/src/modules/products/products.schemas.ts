@@ -94,6 +94,9 @@ export const createHotelBodySchema = z.object({
   // 国际五星标记（starRating 仍是 1..5 整数语义；国际五星 = starRating=5 + 本标记）；
   // 省略 = 未设置，DB 列 @default(false) 兜底，与 reviewCount 等其他可选字段同一手法。
   intlFiveStar: z.boolean().optional(),
+  // 指定酒店加价（CNY/人，整数）：套餐录单点名住本酒店时按占座人数加收；0 = 指定不加价。
+  // 省略 = 未设置，DB 列 @default(0) 兜底。
+  designationSurchargeCnyPerPerson: z.number().int().min(0).max(100000).optional(),
   basePrice: z.number().nonnegative().optional(),
   rating: z.number().min(0).max(5).optional(),
   reviewCount: z.number().int().nonnegative().optional(),
@@ -151,6 +154,42 @@ export const updateTransferBodySchema = createTransferBodySchema.partial();
 export type UpdateTransferBody = z.infer<typeof updateTransferBodySchema>;
 
 // ── Visa ─────────────────────────────────────────────────────────────────
+/** 加急档位上限：够用即可，防止运营把档位表写成无限长拖垮下拉框与 JSON 列。 */
+export const VISA_EXPRESS_TIER_MAX = 10;
+
+/**
+ * 一档加急（零工 / 一工 / 二工 …）。label 是档位的**业务主键**：订单行 metadata 只存档名，
+ * 服务端按档名回查本表拿 surchargeCny 定价（客户端永远不传金额）。故 label 必须非空且同产品内唯一。
+ */
+export const visaExpressTierSchema = z.object({
+  label: z.string().trim().min(1).max(20),
+  workDays: z.number().int().min(0).max(365),
+  surchargeCny: z.number().nonnegative().max(1_000_000),
+});
+export type VisaExpressTier = z.infer<typeof visaExpressTierSchema>;
+
+export const visaExpressTiersSchema = z
+  .array(visaExpressTierSchema)
+  .max(VISA_EXPRESS_TIER_MAX, `加急档位最多 ${VISA_EXPRESS_TIER_MAX} 档`)
+  .refine((tiers) => new Set(tiers.map((t) => t.label)).size === tiers.length, {
+    message: '加急档名不能重复（档名是定价查表的键）',
+  });
+
+/**
+ * 把 DB 里的 Visa.expressTiers（Json，可能是旧数据/脏数据）解析成类型化档位表。
+ * 解析失败/非数组/单档不合法 → 该档丢弃，绝不抛错（产品配置脏数据不该炸掉下单与列表）。
+ * 定价路径拿不到某档时会显式 400 拒单，不会静默按 0 加价。
+ */
+export function parseVisaExpressTiers(raw: unknown): VisaExpressTier[] {
+  if (!Array.isArray(raw)) return [];
+  const parsed: VisaExpressTier[] = [];
+  for (const entry of raw) {
+    const result = visaExpressTierSchema.safeParse(entry);
+    if (result.success) parsed.push(result.data);
+  }
+  return parsed;
+}
+
 export const createVisaBodySchema = z.object({
   destinationCountry: z.string().length(2),
   country: z.string().max(50).optional(),
@@ -165,6 +204,9 @@ export const createVisaBodySchema = z.object({
   processingDays: z.number().int().min(0).max(365),
   basePrice: z.number().nonnegative(),
   expressSurcharge: z.number().nonnegative().optional(),
+  // 加急分档（零工/一工/二工…，运营自配）：省略 = 不改（update）/ 落 DB 默认 []（create）；
+  // 传 [] = 显式清空分档（该产品回落旧的单值 expressSurcharge 口径）。
+  expressTiers: visaExpressTiersSchema.optional(),
   validityMonths: z.number().int().min(0).max(120).optional(),
   // 单次入境最多可停留天数（订单详情「最多可停留 X 天」展示 + 推算生效/失效日期用）
   stayDays: z.number().int().min(1).max(365).optional(),

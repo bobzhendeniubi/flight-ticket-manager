@@ -18,7 +18,18 @@ import {
   type SettlementRateWriteEntry,
   type SettlementTier,
 } from '../lib/api';
+import {
+  WEEKDAYS,
+  currentMonth,
+  daysInMonth,
+  parsePasteBlock,
+  weekdayOf,
+} from '../lib/settlementCalendar';
+import { FlightSettlementRatesPanel } from '../components/FlightSettlementRatesPanel';
 import { useAuth } from '../stores/auth';
+
+// 页签：地面整包价（档次 × 晚数）/ 机票结算价（航班号 × 出发日）——两张表各管各的
+type RateTab = 'GROUND' | 'FLIGHT';
 
 // 四档（顶部筛选按钮顺序固定）+ 中文标签（后端只存枚举值）
 const TIERS: SettlementTier[] = ['CITY_3STAR', 'CITY_4STAR', 'CITY_5STAR', 'INTL_5STAR'];
@@ -30,46 +41,16 @@ const TIER_LABELS: Record<SettlementTier, string> = {
 };
 // 晚数（网格列顺序固定，1–5 晚——同业结算表当前只维护到 5 晚）
 const NIGHTS_OPTIONS = [1, 2, 3, 4, 5];
-const WEEKDAYS = ['日', '一', '二', '三', '四', '五', '六'];
-
-function currentMonth(): string {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
-}
-
-/** 某月（YYYY-MM）→ 该月每天的 YMD 列表（UTC 历法，避免时区跨日）。 */
-function daysInMonth(ym: string): string[] {
-  const m = /^(\d{4})-(\d{2})$/u.exec(ym);
-  if (!m) return [];
-  const year = Number(m[1]);
-  const month = Number(m[2]);
-  const last = new Date(Date.UTC(year, month, 0)).getUTCDate();
-  return Array.from(
-    { length: last },
-    (_, i) => `${ym}-${String(i + 1).padStart(2, '0')}`,
-  );
-}
-
-/** YMD → 周几（0=日）；纯 UTC，展示星期列用。 */
-function weekdayOf(ymd: string): number {
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/u.exec(ymd);
-  if (!m) return 0;
-  return new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]))).getUTCDay();
-}
 
 function cellKey(date: string, nights: number): string {
   return `${date}__${nights}`;
-}
-
-/** 粘贴单元格里的数字：去掉 ¥ / 逗号 / 空格，保留纯数字串（空串 = 清空该格）。 */
-function normalizePasteCell(raw: string): string {
-  return raw.replace(/[¥,\s]/gu, '').trim();
 }
 
 export function SettlementRatesPage() {
   const tokens = useAuth((s) => s.tokens);
   const token = tokens?.accessToken ?? '';
 
+  const [tab, setTab] = useState<RateTab>('GROUND');
   const [month, setMonth] = useState<string>(currentMonth());
   const [tier, setTier] = useState<SettlementTier>(TIERS[0]);
   const [rates, setRates] = useState<SettlementRate[]>([]);
@@ -142,24 +123,20 @@ export function SettlementRatesPage() {
     startDayIdx: number,
     startNightIdx: number,
   ) {
-    const text = e.clipboardData.getData('text');
-    if (!text || (!text.includes('\t') && !text.includes('\n'))) return; // 单值 → 默认行为
+    const block = parsePasteBlock(e.clipboardData.getData('text'));
+    if (!block) return; // 单值 → 默认行为
     e.preventDefault();
-    const rows = text
-      .replace(/\r/gu, '')
-      .split('\n')
-      .filter((row, i, arr) => !(i === arr.length - 1 && row === '')); // 去掉末尾空行
     const updates: Array<[string, string]> = [];
     let overflow = 0;
-    rows.forEach((row, r) => {
-      row.split('\t').forEach((raw, c) => {
+    block.forEach((row, r) => {
+      row.forEach((value, c) => {
         const dayIdx = startDayIdx + r;
         const nightIdx = startNightIdx + c;
         if (dayIdx >= days.length || nightIdx >= NIGHTS_OPTIONS.length) {
           overflow += 1;
           return;
         }
-        updates.push([cellKey(days[dayIdx], NIGHTS_OPTIONS[nightIdx]), normalizePasteCell(raw)]);
+        updates.push([cellKey(days[dayIdx], NIGHTS_OPTIONS[nightIdx]), value]);
       });
     });
     setDraft((prev) => {
@@ -233,11 +210,38 @@ export function SettlementRatesPage() {
         <div>
           <h1 className="page-title">结算价日历</h1>
           <p className="mt-1 text-xs text-ink-muted">
-            按「出发日期 × 晚数 × 酒店档次」维护每人同业结算价。代理下配了档次/晚数的套餐单时，
-            系统按去程出发日期在此表自动取每人结算价（代理改不了）。
+            {tab === 'GROUND'
+              ? '按「出发日期 × 晚数 × 酒店档次」维护每人同业结算价。代理下配了档次/晚数的套餐单时，系统按去程出发日期在此表自动取每人结算价（代理改不了）。'
+              : '按「出发日期 × 航班号」维护每人机票同业结算价（运营的机票报价表）。代理下纯机票单时，系统按各航段的航班号 + 出发日在此表自动取每人结算价（代理改不了）。'}
           </p>
         </div>
       </div>
+
+      {/* 页签：地面整包价 / 机票结算价（两张表口径不同，各管各的） */}
+      <div className="flex gap-1 border-b border-slate-200">
+        {(
+          [
+            ['GROUND', '地面结算价'],
+            ['FLIGHT', '机票结算价'],
+          ] as Array<[RateTab, string]>
+        ).map(([value, label]) => (
+          <button
+            key={value}
+            type="button"
+            onClick={() => setTab(value)}
+            className={
+              value === tab
+                ? '-mb-px border-b-2 border-indigo-600 px-4 py-2 text-sm font-semibold text-indigo-700'
+                : '-mb-px border-b-2 border-transparent px-4 py-2 text-sm text-ink-muted hover:text-ink'
+            }
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {tab === 'FLIGHT' && <FlightSettlementRatesPanel />}
+      {tab === 'GROUND' && (
 
       <section className="card space-y-4">
         {/* 控制区：月份 + 档次（档次切换即换一张网格） */}
@@ -365,6 +369,7 @@ export function SettlementRatesPage() {
           </div>
         )}
       </section>
+      )}
     </div>
   );
 }

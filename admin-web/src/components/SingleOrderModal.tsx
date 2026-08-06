@@ -417,6 +417,8 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const [visas, setVisas] = useState<Visa[]>([]);
   const [visaId, setVisaId] = useState('');
   const [visaQty, setVisaQty] = useState<number | null>(1);
+  // 加急档名（'' = 不加急）。只存档名，加价金额一律服务端按产品的加急档位表查出。
+  const [visaExpressTierLabel, setVisaExpressTierLabel] = useState('');
 
   // ── 套餐 ──
   const [bundles, setBundles] = useState<Bundle[]>([]);
@@ -425,9 +427,16 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const [adultCount, setAdultCount] = useState<number | null>(1);
   const [childCount, setChildCount] = useState<number | null>(0);
   const [infantCount, setInfantCount] = useState<number | null>(0);
-  // 商务舱升级人数，范围 0..(成人+儿童)。
+  // 商务舱升级人数，去程 / 回程各一份，各自范围 0..(成人+儿童)。
+  // 拆两程的原因：同一批客人常常只升去程（回程留经济舱），或去回程升的人数不同 ——
+  // 旧的单值口径按「两程同人数」收钱，只升去程的单会多收一程。单程套餐只显示去程。
   // 单住 / 自备签已改为「乘客级」（购物车模式，每人各选，见出行人表的两列）——不再有整单聚合状态。
-  const [businessCount, setBusinessCount] = useState<number | null>(0);
+  const [businessCountOutbound, setBusinessCountOutbound] = useState<number | null>(0);
+  const [businessCountReturn, setBusinessCountReturn] = useState<number | null>(0);
+  // 指定酒店（0805）：套餐按「星级随机」报价，客人点名住某店 → 选该店 + 房型，服务端按该店
+  // 配置的「指定酒店加价 ¥/人」×占座人数加收；'' = 不指定（走套餐绑定房型/随机现状）。
+  const [designatedHotelId, setDesignatedHotelId] = useState('');
+  const [designatedRoomTypeId, setDesignatedRoomTypeId] = useState('');
   // 套餐机票航段：优先按套餐绑定的航班号；未绑定且同路线仅一个在飞航班时自动派生；
   // 未绑定且同路线有多个在飞航班时，由运营手选航班号（下方两个状态）。
   // 均先预拉两个方向的全部班次池，再按航班号 + 本地出发日期匹配去程（MFM→DAD）/回程（DAD→MFM）。
@@ -528,7 +537,8 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
 
   // 酒店列表
   useEffect(() => {
-    if (kind !== 'HOTEL' || hotels.length > 0) return;
+    // 套餐 tab 也要酒店列表：指定酒店下拉（0805）。
+    if ((kind !== 'HOTEL' && kind !== 'BUNDLE') || hotels.length > 0) return;
     api.listHotels(false).then((r) => setHotels(r.hotels)).catch(() => setErr('酒店列表加载失败'));
   }, [kind, hotels.length]);
 
@@ -570,7 +580,14 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   /** 当前酒店下拉选中的是星级随机池时的档次；选的是真实酒店 → null。 */
   const poolTier = poolTierFromOptionValue(hotelId);
   const visa = visas.find((v) => v.id === visaId);
+  // 该签证产品配置的加急档位（未配 = 空数组 → 不显示加急下拉，行为与扩展前一致）。
+  const visaExpressTiers = visa?.expressTiers ?? [];
   const bundle = bundles.find((b) => b.id === bundleId);
+
+  // 换签证产品 → 清掉上一个产品的加急档选择（各产品档位表不同，档名残留会被服务端拒单）。
+  useEffect(() => {
+    setVisaExpressTierLabel('');
+  }, [visaId]);
 
   const transfer = transfers.find((t) => t.id === transferId);
 
@@ -1104,10 +1121,22 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     if (kind === 'VISA') {
       if (!visaId) return { error: '请选择签证产品' };
       const qty = Math.max(1, visaQty ?? 1);
-      const description = `${visa?.visaName ?? visa?.visaType ?? '签证'}（${visa?.destinationCountry ?? ''}）× ${qty}份`;
-      // 单价送签证当前 basePrice（不含加急；v1 不开加急选项）；服务端按 basePrice 校验（±1 元）。
+      // 加急档（运营在产品上配的零工/一工/二工…）：选中的档名随行 metadata 上送，
+      // 加价金额一律由服务端按产品档位表查出（这里带上单价只是为了通过 ±1 元容差校验）。
+      const tier = visaExpressTiers.find((t) => t.label === visaExpressTierLabel);
+      const description =
+        `${visa?.visaName ?? visa?.visaType ?? '签证'}（${visa?.destinationCountry ?? ''}）× ${qty}份` +
+        (tier ? ` · 加急${tier.label}` : '');
+      const unitPrice = Number(visa?.basePrice ?? 0) + (tier?.surchargeCny ?? 0);
       return {
-        item: { kind: 'VISA', description, quantity: qty, visaId, unitPrice: Number(visa?.basePrice ?? 0) },
+        item: {
+          kind: 'VISA',
+          description,
+          quantity: qty,
+          visaId,
+          unitPrice,
+          ...(tier ? { metadata: { expressTierLabel: tier.label } } : {}),
+        },
       };
     }
     if (kind === 'BUNDLE') {
@@ -1139,7 +1168,11 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       // 权威定价由后端按 passengers 数组的 singleRoom/visaExempt 重算；此处仅用于描述/明细展示。
       const singles = validPassengers.filter((p) => p.singleRoom).length;
       const visaExempts = validPassengers.filter((p) => p.visaExempt).length;
-      const businesses = Math.min(Math.max(0, businessCount ?? 0), maxSingleBusiness);
+      // 升舱分程：去/回程各自夹到占座人数；单程套餐没有回程航段 → 回程恒 0（服务端同样按 0 处理）。
+      const businessesOutbound = Math.min(Math.max(0, businessCountOutbound ?? 0), maxSingleBusiness);
+      const businessesReturn = isRoundTrip
+        ? Math.min(Math.max(0, businessCountReturn ?? 0), maxSingleBusiness)
+        : 0;
       // 机票航段：去程 +（往返套餐）回程；占座人数 = 成人 + 儿童（婴儿不占座），舱位固定经济舱。
       const seatPax = Math.max(1, adults + children);
       // 同时派发去程 + 回程两条 FLIGHT 行：后端对每条 FLIGHT 行都扣座，这是「回程没扣」的根因修复。
@@ -1160,12 +1193,20 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       const goDate = departDate;
       const metadata: Record<string, unknown> = { adultCount: adults, childCount: children, infantCount: infants };
       if (goDate) metadata.goDate = goDate;
+      // 指定酒店（可选）：选了酒店必须选到房型，服务端按房型切占房并加收该店指定加价。
+      const designatedHotel = designatedHotelId ? hotels.find((h) => h.id === designatedHotelId) : undefined;
+      if (designatedHotelId && !designatedRoomTypeId) {
+        return { error: '已选择指定酒店，请选择房型（或改回「随机（不指定酒店）」）' };
+      }
       const descParts = [
         `${bundle?.name ?? '套餐'}`,
         departDate ? `${departDate}出发` : null,
         `${adults}成人${children ? `/${children}儿童` : ''}${infants ? `/${infants}婴儿` : ''}`,
+        designatedHotel ? `指定${designatedHotel.name}` : null,
         singles > 0 ? `单住×${singles}` : null,
-        businesses > 0 ? `商务×${businesses}` : null,
+        // 升舱按程分开写清楚（只升去程 / 两程人数不同都要一眼看得出，别再写成一个笼统的「商务×N」）
+        businessesOutbound > 0 ? `去程升舱×${businessesOutbound}` : null,
+        businessesReturn > 0 ? `回程升舱×${businessesReturn}` : null,
         visaExempts > 0 ? `自备签×${visaExempts}` : null,
       ].filter(Boolean).join(' · ');
       // 单住 / 自备签不再落 item 级聚合字段（singleCount/selfProvidedVisa）——
@@ -1179,7 +1220,11 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
         adultCount: adults,
         childCount: children,
         infantCount: infants,
-        businessCount: businesses,
+        // 升舱分程：两个字段一起传（含 0），服务端据此各程分别定价 + 各程分别占商务舱座位。
+        businessCountOutbound: businessesOutbound,
+        businessCountReturn: businessesReturn,
+        // 指定酒店：服务端据此切占房/盖章并按该店「指定酒店加价 ¥/人」×占座人数加收。
+        ...(designatedRoomTypeId ? { designatedHotelRoomTypeId: designatedRoomTypeId } : {}),
         metadata,
       };
       // 机票航段在前 + 地面套餐行在后：与前台商城同结构，服务端按航段扣座、套餐行只算地面。
@@ -1244,8 +1289,10 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     token, kind, flightTripType, scheduleId, cabin, returnScheduleId, returnCabin,
-    roomTypeId, rooms, visaId, visaQty, bundleId, departDate,
-    adultCount, childCount, infantCount, businessCount,
+    roomTypeId, rooms, visaId, visaQty, visaExpressTierLabel, bundleId, departDate,
+    adultCount, childCount, infantCount, businessCountOutbound, businessCountReturn,
+    // 指定酒店变化 → 重新试算（指定加价计入系统价）。
+    designatedRoomTypeId,
     // 乘客级单住/自备签勾选数变化 → 重新试算系统价（购物车模式）。
     singleRoomCount, visaExemptCount,
     transferId, transferQty, validPassengers.length,
@@ -1837,6 +1884,28 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                     份数
                     <NumberInput className={inputCls} value={visaQty} onChange={setVisaQty} integerOnly min={1} placeholder="1" />
                   </label>
+                  {/* 加急档位：仅当该签证产品配了档位表才出现（未配 = 沿用不加急口径，界面不变）。
+                      只选档名，加价由系统按产品配置算——运营改档价，录单这里自动跟着走。 */}
+                  {visaExpressTiers.length > 0 && (
+                    <label className="text-xs text-slate-500 md:col-span-2">
+                      加急档位
+                      <select
+                        className={inputCls}
+                        value={visaExpressTierLabel}
+                        onChange={(e) => setVisaExpressTierLabel(e.target.value)}
+                      >
+                        <option value="">不加急（{visa?.processingDays ?? '—'} 个工作日出签）</option>
+                        {visaExpressTiers.map((t) => (
+                          <option key={t.label} value={t.label}>
+                            {t.label} · {t.workDays} 个工作日 · +¥{t.surchargeCny.toLocaleString()}/份
+                          </option>
+                        ))}
+                      </select>
+                      <span className="mt-0.5 block text-[11px] text-slate-400">
+                        加急费按份收，金额由系统按产品配置算（档位在 产品管理 › 签证 里维护）
+                      </span>
+                    </label>
+                  )}
                   <p className="md:col-span-2 text-[11px] text-slate-400">签证含送签材料，下方每位出行人须填写护照有效期（必填）。份数应与出行人数一致。</p>
                 </div>
               )}
@@ -1961,20 +2030,87 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                       <NumberInput className={inputCls} value={infantCount} onChange={setInfantCount} integerOnly min={0} placeholder="0" />
                     </label>
                   </div>
-                  {/* 商务舱升级（整单人数口径不变）。单住 / 自备签已改为「逐位选择」，见下方出行人表两列。 */}
-                  <label className="text-xs text-slate-500">
-                    商务舱升级人数
-                    <NumberInput
-                      className={inputCls}
-                      value={businessCount}
-                      onChange={setBusinessCount}
-                      integerOnly
-                      min={0}
-                      max={Math.max(0, (adultCount ?? 0) + (childCount ?? 0))}
-                      placeholder="0"
-                    />
-                    <span className="mt-0.5 block text-[11px] text-slate-400">最多 {(adultCount ?? 0) + (childCount ?? 0)} 人</span>
-                  </label>
+                  {/* 商务舱升级：去程 / 回程分开填 —— 只升去程、或两程升的人数不同都很常见，
+                      合成一个数字会按「两程都升」收钱。单程套餐（legs=1）只显示去程。
+                      单住 / 自备签已改为「逐位选择」，见下方出行人表两列。 */}
+                  <div className={`grid gap-2 md:col-span-2 ${(bundle?.legs ?? 2) >= 2 ? 'grid-cols-2' : 'grid-cols-1'}`}>
+                    <label className="text-xs text-slate-500">
+                      去程升舱人数
+                      <NumberInput
+                        className={inputCls}
+                        value={businessCountOutbound}
+                        onChange={setBusinessCountOutbound}
+                        integerOnly
+                        min={0}
+                        max={Math.max(0, (adultCount ?? 0) + (childCount ?? 0))}
+                        placeholder="0"
+                      />
+                      <span className="mt-0.5 block text-[11px] text-slate-400">最多 {(adultCount ?? 0) + (childCount ?? 0)} 人</span>
+                    </label>
+                    {(bundle?.legs ?? 2) >= 2 && (
+                      <label className="text-xs text-slate-500">
+                        回程升舱人数
+                        <NumberInput
+                          className={inputCls}
+                          value={businessCountReturn}
+                          onChange={setBusinessCountReturn}
+                          integerOnly
+                          min={0}
+                          max={Math.max(0, (adultCount ?? 0) + (childCount ?? 0))}
+                          placeholder="0"
+                        />
+                        <span className="mt-0.5 block text-[11px] text-slate-400">只升去程就把这里留 0</span>
+                      </label>
+                    )}
+                  </div>
+                  {/* 指定酒店（0805）：不指定 = 随机（现状）；指定 → 占该店房 + 按该店配置的每人加价收 */}
+                  <div className="grid grid-cols-2 gap-2 md:col-span-2">
+                    <label className="text-xs text-slate-500">
+                      酒店（不选 = 随机）
+                      <select
+                        className={inputCls}
+                        value={designatedHotelId}
+                        onChange={(e) => {
+                          const id = e.target.value;
+                          setDesignatedHotelId(id);
+                          // 换店自动选首个房型（多数店只有一个房型，免一次点击）；清空则回随机。
+                          const h = hotels.find((x) => x.id === id);
+                          setDesignatedRoomTypeId(h?.roomTypes[0]?.id ?? '');
+                        }}
+                      >
+                        <option value="">随机（不指定酒店）</option>
+                        {hotels.map((h) => (
+                          <option key={h.id} value={h.id}>
+                            {h.name}（{'★'.repeat(h.starRating)}
+                            {h.designationSurchargeCnyPerPerson > 0 ? ` · 指定+¥${h.designationSurchargeCnyPerPerson}/人` : ''}）
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    {designatedHotelId && (
+                      <label className="text-xs text-slate-500">
+                        房型
+                        <select className={inputCls} value={designatedRoomTypeId} onChange={(e) => setDesignatedRoomTypeId(e.target.value)}>
+                          <option value="">选择房型…</option>
+                          {hotels.find((h) => h.id === designatedHotelId)?.roomTypes.map((rt) => (
+                            <option key={rt.id} value={rt.id}>{rt.name}</option>
+                          ))}
+                        </select>
+                      </label>
+                    )}
+                    {designatedHotelId && (() => {
+                      const h = hotels.find((x) => x.id === designatedHotelId);
+                      const rate = h?.designationSurchargeCnyPerPerson ?? 0;
+                      const pax = Math.max(0, (adultCount ?? 0) + (childCount ?? 0));
+                      return (
+                        <p className="col-span-2 text-[11px] text-slate-500">
+                          {rate > 0
+                            ? `指定酒店加价 ¥${rate}/人 × ${pax} 人（占座人数）= ¥${rate * pax}，已计入下方系统价试算。`
+                            : '该酒店未配置「指定酒店加价」（按 ¥0 计）；如需加价请先到 产品 · 酒店 里配置。'}
+                        </p>
+                      );
+                    })()}
+                  </div>
                   <p className="md:col-span-2 text-[11px] text-slate-400">
                     成人 + 儿童 + 婴儿都是出行人（都需护照，下方逐位填）。
                     <span className="text-slate-500">住宿（拼房/单住）与签证（随套餐/自备签）在下方出行人表里每人各选</span>，

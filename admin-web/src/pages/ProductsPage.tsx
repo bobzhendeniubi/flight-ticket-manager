@@ -13,7 +13,7 @@ import {
   type MockBundle,
   type BundleItem,
 } from '../lib/mockData';
-import { api, ApiError, type Hotel, type Transfer as ApiTransfer, type Visa as ApiVisa, type VisaIssuanceMethod, type VisaEntryType, type Bundle as ApiBundle, type AdminFlight, type BundleFlightRef, type SettlementTier } from '../lib/api';
+import { api, ApiError, type Hotel, type Transfer as ApiTransfer, type Visa as ApiVisa, type VisaIssuanceMethod, type VisaEntryType, type VisaExpressTier, type Bundle as ApiBundle, type AdminFlight, type BundleFlightRef, type SettlementTier } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { NumberInput } from '../components/NumberInput';
 import { BundleBlackoutEditor, type BlackoutDateRow } from '../components/BundleBlackoutEditor';
@@ -29,6 +29,11 @@ type MockVisaWithStayDays = MockVisa & {
   entryType?: VisaEntryType | null;
   /** 签证公司/代办渠道名（财务对账用——核对某笔签证金额属于哪家供应商的账单）；未录为 null */
   supplier?: string | null;
+  /**
+   * 加急档位（零工/一工/二工…）：各档自己的出签工作日 + 加价。空数组 = 未配分档，
+   * 沿用旧的单值「加急附加费」。录单只选档名，加价金额由服务端按本表算。
+   */
+  expressTiers?: VisaExpressTier[];
 };
 type MockBundleWithServiceNotes = MockBundle & {
   serviceNotes?: string | null;
@@ -38,6 +43,9 @@ type MockBundleWithServiceNotes = MockBundle & {
   settlementTier?: SettlementTier | null;
   settlementNights?: number | null;
 };
+
+/** 加急档位数量上限（与后端 products.schemas VISA_EXPRESS_TIER_MAX 同值）。 */
+const VISA_EXPRESS_TIER_MAX = 10;
 
 // 结算价档次中文标签（前端映射；后端只存枚举值）
 const SETTLEMENT_TIER_LABELS: Record<SettlementTier, string> = {
@@ -60,6 +68,8 @@ type RoomTypeWithCost = HotelRoomType & { costPriceCny?: number | null };
 type MockHotelWithCost = Omit<MockHotel, 'roomTypes'> & {
   roomTypes: RoomTypeWithCost[];
   intlFiveStar?: boolean;
+  // 指定酒店加价（CNY/人）：套餐录单点名住本酒店时按占座人数加收；0 = 指定不加价。
+  designationSurchargeCnyPerPerson?: number;
 };
 type MockTransferWithCost = MockTransfer & { costPriceCny?: number | null };
 
@@ -97,6 +107,7 @@ function hotelApiToMock(h: Hotel): MockHotelWithCost {
     address: h.address ?? '',
     stars: (h.starRating as 3 | 4 | 5) ?? 4,
     intlFiveStar: h.intlFiveStar ?? false,
+    designationSurchargeCnyPerPerson: h.designationSurchargeCnyPerPerson ?? 0,
     basePrice: Number(h.basePrice ?? 0),
     // 0702 反馈 2：serializeHotel 现在发 rating:{average,count} 对象，不是旧 Decimal 字符串——
     // Number(对象) = NaN，写回 create/update 会被 JSON 序列化成 null，后端 z.number() 校验直接拒绝
@@ -164,6 +175,8 @@ function visaApiToMock(v: ApiVisa): MockVisaWithStayDays {
     entryType: v.entryType,
     // 签证公司/代办渠道名（财务对账用）；未录为 null
     supplier: v.supplier,
+    // 加急档位表；后端恒下发数组（[] = 未配分档），?? [] 兜住老版本后端不带该字段的情况。
+    expressTiers: v.expressTiers ?? [],
   };
 }
 
@@ -433,7 +446,8 @@ export function ProductsPage() {
       for (const n of next) if (!prev.find((p) => p.id === n.id)) {
         await api.createHotel(tk, {
           name: n.name, nameEn: n.nameEn, cityCode: n.cityCode, area: n.area,
-          address: n.address || n.area, starRating: n.stars, intlFiveStar: n.intlFiveStar ?? false, basePrice: n.basePrice,
+          address: n.address || n.area, starRating: n.stars, intlFiveStar: n.intlFiveStar ?? false,
+          designationSurchargeCnyPerPerson: n.designationSurchargeCnyPerPerson ?? 0, basePrice: n.basePrice,
           // 0702 反馈 2：rating 不再回传——serializeHotel 现在发 {average,count} 聚合对象，
           // 表单本就没有编辑评分的入口；旧代码 Number(对象)=NaN，JSON 序列化成 null，
           // 后端 z.number() 校验直接拒绝（"酒店编辑全挂"根因）。评分改由 Review 真实评价聚合，
@@ -456,6 +470,7 @@ export function ProductsPage() {
           await api.updateHotel(tk, n.id, {
             name: n.name, nameEn: n.nameEn, cityCode: n.cityCode, area: n.area,
             address: n.address || n.area, starRating: n.stars, intlFiveStar: n.intlFiveStar ?? false,
+            designationSurchargeCnyPerPerson: n.designationSurchargeCnyPerPerson ?? 0,
             basePrice: n.basePrice, reviewCount: n.reviewCount,
             emoji: n.emoji, highlight: n.highlight, amenities: n.amenities,
             photos: hotelPhotos(n),
@@ -547,6 +562,8 @@ export function ProductsPage() {
           entryType: n.entryType ?? undefined,
           // 签证公司/代办渠道名（选填，仅内部，财务对账用）：留空 = 未录 → 省略字段。
           supplier: n.supplier || undefined,
+          // 加急档位表（选填）：空表 = 不提供分档加急（回落单值「加急附加费」）。
+          expressTiers: n.expressTiers ?? [],
         });
       }
       for (const n of next) {
@@ -567,6 +584,8 @@ export function ProductsPage() {
             entryType: n.entryType ?? null,
             // 留空 = 显式清空签证公司为未录（真·部分更新字段，表单已用现值预填）。
             supplier: n.supplier || null,
+            // 加急档位表整表覆盖（表单已用现值预填）：删空 = 传 []，即清掉分档、回落单值加急费。
+            expressTiers: n.expressTiers ?? [],
           });
         }
       }
@@ -835,6 +854,7 @@ function NewHotelForm({
     address: '',
     stars: 4,
     intlFiveStar: false,
+    designationSurchargeCnyPerPerson: 0,
     basePrice: 880,
     rating: 4.5,
     reviewCount: 0,
@@ -2259,6 +2279,10 @@ function HotelEditorForm({
   const [stars, setStars] = useState<3 | 4 | 5>(hotel.stars);
   // 国际五星：与 stars 联动的独立标记（stars 仍是纯 1..5 整数语义，见 MockHotelWithCost 注释）。
   const [intlFiveStar, setIntlFiveStar] = useState(hotel.intlFiveStar ?? false);
+  // 指定酒店加价（CNY/人）：套餐录单点名住本酒店时按占座人数加收；0 = 指定不加价。
+  const [designationSurcharge, setDesignationSurcharge] = useState<number | null>(
+    hotel.designationSurchargeCnyPerPerson ?? 0,
+  );
   const [basePrice, setBasePrice] = useState<number | null>(hotel.basePrice);
   const [emoji, setEmoji] = useState(hotel.emoji);
   const [highlight, setHighlight] = useState(hotel.highlight);
@@ -2289,6 +2313,7 @@ function HotelEditorForm({
       address: address.trim(),
       stars,
       intlFiveStar,
+      designationSurchargeCnyPerPerson: Math.max(0, Math.trunc(designationSurcharge ?? 0)),
       basePrice: basePrice ?? 0,
       emoji: emoji.trim() || '🏨',
       highlight: highlight.trim(),
@@ -2360,6 +2385,11 @@ function HotelEditorForm({
             {/* 0702 反馈 5c：与「成本价（仅内部）」并列时容易混——明确标成前台展示价。 */}
             <label className="label text-xs">每晚起价（前台展示价）</label>
             <NumberInput min={0} className="input" value={basePrice} onChange={(n) => setBasePrice(n)} />
+          </div>
+          <div>
+            {/* 0805：套餐按星级随机报价，客人点名住本酒店时按占座人数加收的每人差价（各店各配）。 */}
+            <label className="label text-xs">指定酒店加价（¥/人，0 = 不加价）</label>
+            <NumberInput min={0} className="input" value={designationSurcharge} onChange={(n) => setDesignationSurcharge(n)} />
           </div>
         </div>
 
@@ -2743,10 +2773,43 @@ function VisaEditorForm({
   // 签证公司/代办渠道名（选填，仅内部，财务对账用——核对某笔签证金额属于哪家供应商的账单）
   const [supplier, setSupplier] = useState(visa.supplier ?? '');
   const [docsText, setDocsText] = useState(visa.requiredDocs.join(', '));
+  // 加急档位表（零工/一工/二工…）：各档自己的出签工作日 + 加价。空表 = 不提供分档加急。
+  // 编辑态里工作日/加价允许暂时为空（null），保存时按 0 兜底 —— 与本表单其它数字字段同款处理。
+  const [tiers, setTiers] = useState<Array<{ label: string; workDays: number | null; surchargeCny: number | null }>>(
+    () => (visa.expressTiers ?? []).map((t) => ({ ...t })),
+  );
+  const [tierError, setTierError] = useState('');
   const [saved, setSaved] = useState(false);
+
+  // 不可变更新：绝不就地改数组元素（React 依赖引用变化重渲染）。
+  const patchTier = (idx: number, patch: Partial<{ label: string; workDays: number | null; surchargeCny: number | null }>) =>
+    setTiers((prev) => prev.map((t, i) => (i === idx ? { ...t, ...patch } : t)));
+  const removeTier = (idx: number) => setTiers((prev) => prev.filter((_, i) => i !== idx));
+  const addTier = () =>
+    setTiers((prev) => (prev.length >= VISA_EXPRESS_TIER_MAX ? prev : [...prev, { label: '', workDays: 1, surchargeCny: 0 }]));
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    // 档位校验（与后端 zod 同口径，提前在前端拦一遍给出可读提示）：
+    // 档名是定价查表的键 —— 空档名/重名会让「这一档到底多少钱」不确定，一律不放行。
+    const normalizedTiers: VisaExpressTier[] = tiers.map((t) => ({
+      label: t.label.trim(),
+      workDays: Math.max(0, Math.trunc(t.workDays ?? 0)),
+      surchargeCny: Math.max(0, t.surchargeCny ?? 0),
+    }));
+    if (normalizedTiers.some((t) => !t.label)) {
+      setTierError('每个加急档都要填档名（如「一工」）');
+      return;
+    }
+    if (new Set(normalizedTiers.map((t) => t.label)).size !== normalizedTiers.length) {
+      setTierError('加急档名不能重复');
+      return;
+    }
+    if (normalizedTiers.length > VISA_EXPRESS_TIER_MAX) {
+      setTierError(`加急档位最多 ${VISA_EXPRESS_TIER_MAX} 档`);
+      return;
+    }
+    setTierError('');
     const updated: MockVisaWithStayDays = {
       ...form,
       basePrice: basePrice ?? 0,
@@ -2760,6 +2823,7 @@ function VisaEditorForm({
       issuanceMethod,
       entryType,
       supplier: supplier.trim() || null,
+      expressTiers: normalizedTiers,
     };
     setSaved(true);
     setTimeout(() => onSave(updated), 800);
@@ -2804,6 +2868,7 @@ function VisaEditorForm({
         <div>
           <label className="label text-xs">加急附加费 (¥)</label>
           <NumberInput min={0} className="input" value={expressSurcharge} onChange={(n) => setExpressSurcharge(n)} />
+          <p className="mt-1 text-[11px] text-ink-muted">未配下方「加急档位」时按这一个价收</p>
         </div>
         <div>
           <label className="label text-xs">成本价（¥，仅内部，前台不展示）</label>
@@ -2865,6 +2930,68 @@ function VisaEditorForm({
           <label className="label text-xs">所需材料（逗号分隔）</label>
           <input className="input" value={docsText} onChange={(e) => setDocsText(e.target.value)} placeholder="护照首页扫描件, 2寸白底照片" />
         </div>
+
+        {/* 加急档位（零工/一工/二工…）：各档自己的出签工作日 + 加价，运营自行增删。
+            配了档位后录单会出现「加急档位」下拉；一档没配 = 沿用上面的单值「加急附加费」。 */}
+        <fieldset className="md:col-span-3 rounded-lg border border-brand-200 bg-white/70 p-3">
+          <legend className="px-1 text-xs font-medium text-ink">加急档位（选填）</legend>
+          <p className="mb-2 text-[11px] text-ink-muted">
+            按加急等级分别配「出签工作日 + 加价」（如 零工 / 一工 / 二工）。档名是录单选档的依据，不能重复。
+            一档都不配 = 不提供分档加急，仍按上面的单值「加急附加费」收。
+          </p>
+          {tiers.length === 0 ? (
+            <p className="text-xs text-ink-muted">尚未配置加急档位</p>
+          ) : (
+            <div className="grid gap-2">
+              {tiers.map((t, idx) => (
+                <div key={idx} className="grid grid-cols-[1.2fr_1fr_1fr_auto] items-end gap-2">
+                  <div>
+                    <label className="label text-[11px]">档名 *</label>
+                    <input
+                      className="input"
+                      value={t.label}
+                      maxLength={20}
+                      placeholder="如 一工"
+                      onChange={(e) => patchTier(idx, { label: e.target.value })}
+                    />
+                  </div>
+                  <div>
+                    <label className="label text-[11px]">出签工作日</label>
+                    <NumberInput
+                      min={0}
+                      max={365}
+                      integerOnly
+                      className="input"
+                      value={t.workDays}
+                      onChange={(n) => patchTier(idx, { workDays: n })}
+                    />
+                  </div>
+                  <div>
+                    <label className="label text-[11px]">加价 (¥/份)</label>
+                    <NumberInput
+                      min={0}
+                      className="input"
+                      value={t.surchargeCny}
+                      onChange={(n) => patchTier(idx, { surchargeCny: n })}
+                    />
+                  </div>
+                  <button type="button" className="btn-ghost mb-1 px-2 py-1 text-xs text-rose-600" onClick={() => removeTier(idx)}>
+                    删除
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+          {tierError && <p className="mt-2 text-xs text-rose-600">{tierError}</p>}
+          <button
+            type="button"
+            className="btn-secondary mt-2 px-3 py-1 text-xs"
+            onClick={addTier}
+            disabled={tiers.length >= VISA_EXPRESS_TIER_MAX}
+          >
+            + 添加档位{tiers.length >= VISA_EXPRESS_TIER_MAX ? `（最多 ${VISA_EXPRESS_TIER_MAX} 档）` : ''}
+          </button>
+        </fieldset>
 
         {saved && <div className="md:col-span-3 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700">保存中…</div>}
 

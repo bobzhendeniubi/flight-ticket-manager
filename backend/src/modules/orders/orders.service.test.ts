@@ -61,6 +61,8 @@ const { mockPrisma, mockComputeQuote, mockGetHotelNightlyRemaining } = vi.hoiste
     // 既有未涉及签证的测试；专门测 visa 板块的用例会显式 mock 这个方法）。
     visa: {
       findMany: vi.fn(),
+      // priceAndValidateItems 的 VISA 分支按产品查权威价 + 加急档位表（expressTiers）。
+      findUnique: vi.fn(),
     },
     // swapPassenger 内部用 prisma.$transaction(async (tx) => {...})；tx 复用同一批 mock 方法
     // （swapPassenger 事务体只碰 order/passenger/fulfillmentTask，这里按需最小补齐）。
@@ -99,6 +101,7 @@ import {
   resolveBundleHotelStamp,
   computeBundleAddOn,
   resolveBundleBusinessUpgradeRate,
+  resolveBundleBusinessUpgradeInput,
   computeBundleSeatSplit,
   computeRequiredPassengerCount,
   resolveBundleOccupancy,
@@ -943,6 +946,151 @@ describe('computeBundleAddOn', () => {
     expect(r.breakdown.selfProvidedVisaCount).toBe(2);
     expect(r.breakdown.selfVisaDeductTotal).toBe(1000);
     expect(r.total).toBe(1800);
+  });
+});
+
+// ── 升舱拆去程/回程：分程人数定价 + 与旧整程入参的等价性 ────────────────────
+// 业务：同一批客人可以只升去程、或去回程升的人数不同（回程留经济舱）。
+// 口径：加价 = (去程人数 + 回程人数) × 每程差价；旧入参（整程 businessCount）沿用 人数 × 差价 × legs。
+describe('computeBundleAddOn · 升舱分程（去程/回程各自人数）', () => {
+  const bundle = {
+    hotelNights: 3,
+    singleSupplementCnyPerNight: 80,
+    businessUpgradeCnyPerLeg: 700,
+    childSeatDiscountCnyPerPerson: 0,
+    infantPriceCny: 0,
+    selfVisaDeductCny: 0,
+    legs: 2,
+  };
+  const stamp = {
+    hotelCheckIn: new Date('2026-07-01'),
+    hotelCheckOut: new Date('2026-07-04'),
+  };
+  const occ = (adultCount: number, childCount = 0, infantCount = 0) =>
+    resolveBundleOccupancy({ adultCount, childCount, infantCount });
+
+  it('新旧入参等价：整程 businessCount=1 与 分程 {去1, 回1} 定价/明细完全一致（往返）', () => {
+    const legacy = computeBundleAddOn(bundle, stamp, 0, 1, occ(2), 3);
+    const split = computeBundleAddOn(bundle, stamp, 0, { outbound: 1, return: 1 }, occ(2), 3);
+    expect(legacy.total).toBe(1400); // 1 人 × 700 × 2 段
+    expect(split.total).toBe(legacy.total);
+    expect(split.breakdown.businessUpgradeTotal).toBe(legacy.breakdown.businessUpgradeTotal);
+    expect(legacy.breakdown.businessCountOutbound).toBe(1);
+    expect(legacy.breakdown.businessCountReturn).toBe(1);
+  });
+
+  it('新旧入参等价（单程 legs=1）：整程 businessCount=2 与 分程 {去2, 回2} 都只收去程一段', () => {
+    const oneWay = { ...bundle, legs: 1 };
+    const legacy = computeBundleAddOn(oneWay, stamp, 0, 2, occ(2), 3);
+    const split = computeBundleAddOn(oneWay, stamp, 0, { outbound: 2, return: 2 }, occ(2), 3);
+    expect(legacy.total).toBe(1400); // 2 人 × 700 × 1 段
+    expect(split.total).toBe(1400);
+    // 单程套餐没有回程航段可占座 → 回程人数恒 0，回程那份钱也不该收
+    expect(split.breakdown.businessCountReturn).toBe(0);
+    expect(legacy.breakdown.businessCountReturn).toBe(0);
+  });
+
+  it('两程不同人数：去 2 回 1 → (2+1) × 700 = 2100', () => {
+    const r = computeBundleAddOn(bundle, stamp, 0, { outbound: 2, return: 1 }, occ(2), 3);
+    expect(r.breakdown.businessCountOutbound).toBe(2);
+    expect(r.breakdown.businessCountReturn).toBe(1);
+    expect(r.breakdown.businessUpgradeTotal).toBe(2100);
+    expect(r.total).toBe(2100);
+  });
+
+  it('只升去程：{去1, 回0} → 只收 1 段 700（不是整程 1400）', () => {
+    const r = computeBundleAddOn(bundle, stamp, 0, { outbound: 1, return: 0 }, occ(2), 3);
+    expect(r.breakdown.businessCountReturn).toBe(0);
+    expect(r.total).toBe(700);
+    expect(r.hasAddOn).toBe(true);
+  });
+
+  it('只升回程：{去0, 回2} → 只收回程 2 × 700 = 1400', () => {
+    const r = computeBundleAddOn(bundle, stamp, 0, { outbound: 0, return: 2 }, occ(2), 3);
+    expect(r.breakdown.businessCountOutbound).toBe(0);
+    expect(r.breakdown.businessCountReturn).toBe(2);
+    expect(r.total).toBe(1400);
+  });
+
+  it('两程各自夹到占座人数上限：2 大 1 婴（seatPax=2），传 {去5, 回5} → 各夹到 2 → 2800', () => {
+    const r = computeBundleAddOn(bundle, stamp, 0, { outbound: 5, return: 5 }, occ(2, 0, 1), 3);
+    expect(r.breakdown.businessCountOutbound).toBe(2);
+    expect(r.breakdown.businessCountReturn).toBe(2);
+    expect(r.breakdown.businessUpgradeTotal).toBe(2800);
+  });
+
+  it('两程都 0（显式）→ 无加项，与不传升舱等价', () => {
+    const r = computeBundleAddOn(bundle, stamp, 0, { outbound: 0, return: 0 }, occ(2), 3);
+    expect(r.total).toBe(0);
+    expect(r.hasAddOn).toBe(false);
+  });
+
+  it('负数/小数入参按整数非负夹逼（不信客户端）', () => {
+    const r = computeBundleAddOn(bundle, stamp, 0, { outbound: -3, return: 1.9 }, occ(2), 3);
+    expect(r.breakdown.businessCountOutbound).toBe(0);
+    expect(r.breakdown.businessCountReturn).toBe(1);
+    expect(r.total).toBe(700);
+  });
+});
+
+// ── BUNDLE 行入参 → 升舱口径解析：resolveBundleBusinessUpgradeInput ────────────
+describe('resolveBundleBusinessUpgradeInput', () => {
+  it('只有旧 businessCount → 回落整程口径（原样返回数字）', () => {
+    expect(resolveBundleBusinessUpgradeInput({ businessCount: 2 })).toBe(2);
+  });
+
+  it('三个字段都没有 → undefined（无升舱）', () => {
+    expect(resolveBundleBusinessUpgradeInput({})).toBeUndefined();
+  });
+
+  it('分程字段任一存在 → 分程口径（旧 businessCount 被忽略，以分程为权威）', () => {
+    expect(
+      resolveBundleBusinessUpgradeInput({ businessCount: 9, businessCountOutbound: 2 }),
+    ).toEqual({ outbound: 2, return: undefined });
+    expect(resolveBundleBusinessUpgradeInput({ businessCountReturn: 1 })).toEqual({
+      outbound: undefined,
+      return: 1,
+    });
+  });
+
+  it('显式 0 也算「提供」：{去1, 回0} 不能退化成整程口径（否则回程会被收钱）', () => {
+    const input = resolveBundleBusinessUpgradeInput({
+      businessCountOutbound: 1,
+      businessCountReturn: 0,
+    });
+    expect(input).toEqual({ outbound: 1, return: 0 });
+  });
+});
+
+// ── 占/释对称（两程升舱人数不同）：扣座与退座逐行必须镜像 ──────────────────────
+// 扣座读 priced 行的类型化 businessUpgradeCount，退座读**同一行**落库的 metadata.businessUpgradeCount，
+// 两者同源 → 每条腿各按自己的人数拆/还，跨腿不串。这里用 computeBundleSeatSplit 逐行验证守恒。
+describe('套餐升舱拆座 · 去/回程人数不同时的占/释对称', () => {
+  it('去程 2 人升舱、回程 1 人升舱（每段 3 座）→ 逐行占座 = 逐行退座，净占座恒为 quantity', () => {
+    const legs = [
+      { label: '去程', quantity: 3, businessUpgradeCount: 2 },
+      { label: '回程', quantity: 3, businessUpgradeCount: 1 },
+    ];
+    for (const leg of legs) {
+      // 下单扣座：用行自己的类型化字段
+      const held = computeBundleSeatSplit('ECONOMY', leg.quantity, leg.businessUpgradeCount);
+      // 取消/超时退座：用**同一行**落库的 metadata.businessUpgradeCount（镜像还原）
+      const metadata: Record<string, unknown> = { businessUpgradeCount: leg.businessUpgradeCount };
+      const raw = typeof metadata.businessUpgradeCount === 'number' ? metadata.businessUpgradeCount : 0;
+      const released = computeBundleSeatSplit('ECONOMY', leg.quantity, raw);
+      expect(released).toEqual(held);
+      expect(held.sameCabin + held.business).toBe(leg.quantity);
+    }
+    // 两条腿的商务舱占用互不相等且各自正确（旧版会把同一个数盖到每程）
+    expect(computeBundleSeatSplit('ECONOMY', 3, legs[0].businessUpgradeCount).business).toBe(2);
+    expect(computeBundleSeatSplit('ECONOMY', 3, legs[1].businessUpgradeCount).business).toBe(1);
+  });
+
+  it('只升去程（回程 0）→ 回程整段仍留经济舱，退座不会去动从未占用的商务舱', () => {
+    const outbound = computeBundleSeatSplit('ECONOMY', 2, 2);
+    const inbound = computeBundleSeatSplit('ECONOMY', 2, 0);
+    expect(outbound).toEqual({ sameCabin: 0, business: 2 });
+    expect(inbound).toEqual({ sameCabin: 2, business: 0 });
   });
 });
 
@@ -3393,6 +3541,137 @@ describe('priceAndValidateItems · 酒店重算价来源 + 下架拦截', () => 
     expect(flight.metadata?.businessUpgradeCount).toBeUndefined();
     expect(flight.metadata?.someClientNote).toBe('keep-me'); // 无关的客户端 metadata 键不受牵连
     expect(flight.metadata?.priceOverride).toBe('TEAM_SETTLEMENT'); // 合法内部写入的键仍正常生效
+  });
+});
+
+// ── 签证加急分档定价（priceAndValidateItems · VISA 分支）────────────────────
+// 运营在签证产品上配「零工/一工/二工」等档位（各自出签工作日 + 加价）；录单选档，
+// 客户端只传档名，加价金额一律服务端按产品档位表查出来（钱路径服务端权威）。
+describe('priceAndValidateItems · 签证加急分档', () => {
+  const service = new OrderService();
+  const dec2 = (n: number) => ({ toString: () => String(n) }) as unknown;
+  const price = (items: OrderItemInput[]) =>
+    (service as unknown as {
+      priceAndValidateItems(i: OrderItemInput[]): Promise<Array<{
+        kind: string;
+        unitPrice: number;
+        amount: number;
+        metadata?: Record<string, unknown>;
+      }>>;
+    }).priceAndValidateItems(items);
+
+  const visaItem = (unitPrice: number, metadata?: Record<string, unknown>) =>
+    ({
+      kind: 'VISA',
+      description: '越南电子签',
+      quantity: 2,
+      visaId: 'visa1',
+      unitPrice,
+      ...(metadata ? { metadata } : {}),
+    }) as OrderItemInput;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('选中加急档 → 单价 = 挂牌价 + 该档 surchargeCny，档位快照落行 metadata', async () => {
+    mockPrisma.visa.findUnique.mockResolvedValue({
+      basePrice: dec2(380),
+      expressSurcharge: dec2(150),
+      expressTiers: [
+        { label: '零工', workDays: 0, surchargeCny: 300 },
+        { label: '一工', workDays: 1, surchargeCny: 100 },
+      ],
+      costPriceCny: dec2(200),
+      isActive: true,
+    });
+    const priced = await price([visaItem(480, { expressTierLabel: '一工' })]);
+    const visa = priced.find((p) => p.kind === 'VISA')!;
+    expect(visa.unitPrice).toBe(480); // 380 + 100
+    expect(visa.amount).toBe(960); // × 2 份
+    expect(visa.metadata?.expressTier).toEqual({ label: '一工', workDays: 1, surchargeCny: 100 });
+  });
+
+  it('不同档不同价：同产品选「零工」→ 380 + 300 = 680', async () => {
+    mockPrisma.visa.findUnique.mockResolvedValue({
+      basePrice: dec2(380),
+      expressSurcharge: null,
+      expressTiers: [
+        { label: '零工', workDays: 0, surchargeCny: 300 },
+        { label: '一工', workDays: 1, surchargeCny: 100 },
+      ],
+      costPriceCny: null,
+      isActive: true,
+    });
+    const priced = await price([visaItem(680, { expressTierLabel: '零工' })]);
+    expect(priced.find((p) => p.kind === 'VISA')!.unitPrice).toBe(680);
+  });
+
+  it('产品没配分档却传档名 → 400 拒单（绝不静默按不加急成交）', async () => {
+    mockPrisma.visa.findUnique.mockResolvedValue({
+      basePrice: dec2(380),
+      expressSurcharge: dec2(150),
+      expressTiers: [],
+      costPriceCny: null,
+      isActive: true,
+    });
+    await expect(price([visaItem(380, { expressTierLabel: '一工' })])).rejects.toThrow(
+      '没有「一工」加急档',
+    );
+  });
+
+  it('档名对不上（运营改了档位表 / 伪造档名）→ 400 拒单', async () => {
+    mockPrisma.visa.findUnique.mockResolvedValue({
+      basePrice: dec2(380),
+      expressSurcharge: null,
+      expressTiers: [{ label: '一工', workDays: 1, surchargeCny: 100 }],
+      costPriceCny: null,
+      isActive: true,
+    });
+    await expect(price([visaItem(380, { expressTierLabel: '三工' })])).rejects.toThrow(
+      '请重新选择加急档位',
+    );
+  });
+
+  it('金额不信客户端：前端传低价 + 合法档名 → 按服务端档价校验后拒单（容差外）', async () => {
+    mockPrisma.visa.findUnique.mockResolvedValue({
+      basePrice: dec2(380),
+      expressSurcharge: null,
+      expressTiers: [{ label: '一工', workDays: 1, surchargeCny: 100 }],
+      costPriceCny: null,
+      isActive: true,
+    });
+    await expect(price([visaItem(380, { expressTierLabel: '一工' })])).rejects.toThrow('签证价格已变动');
+  });
+
+  it('未选档（不传 expressTierLabel）→ 旧的单值 express 口径完全不变', async () => {
+    mockPrisma.visa.findUnique.mockResolvedValue({
+      basePrice: dec2(380),
+      expressSurcharge: dec2(150),
+      expressTiers: [{ label: '一工', workDays: 1, surchargeCny: 100 }],
+      costPriceCny: null,
+      isActive: true,
+    });
+    // 不加急
+    const plain = await price([visaItem(380)]);
+    expect(plain.find((p) => p.kind === 'VISA')!.unitPrice).toBe(380);
+    expect(plain.find((p) => p.kind === 'VISA')!.metadata).toBeUndefined();
+    // 旧的 express 布尔 → 仍走 expressSurcharge 单值
+    const legacyExpress = await price([visaItem(530, { express: true })]);
+    expect(legacyExpress.find((p) => p.kind === 'VISA')!.unitPrice).toBe(530); // 380 + 150
+    expect(legacyExpress.find((p) => p.kind === 'VISA')!.metadata?.expressTier).toBeUndefined();
+  });
+
+  it('空白档名视为未选档（不因误传空串拒单）', async () => {
+    mockPrisma.visa.findUnique.mockResolvedValue({
+      basePrice: dec2(380),
+      expressSurcharge: null,
+      expressTiers: [{ label: '一工', workDays: 1, surchargeCny: 100 }],
+      costPriceCny: null,
+      isActive: true,
+    });
+    const priced = await price([visaItem(380, { expressTierLabel: '   ' })]);
+    expect(priced.find((p) => p.kind === 'VISA')!.unitPrice).toBe(380);
   });
 });
 

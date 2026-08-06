@@ -41,6 +41,12 @@ import {
 } from './products.service.js';
 import type { BundleItemInput } from './products.schemas.js';
 import {
+  VISA_EXPRESS_TIER_MAX,
+  parseVisaExpressTiers,
+  updateVisaBodySchema,
+  visaExpressTiersSchema,
+} from './products.schemas.js';
+import {
   getCheapestRoundTripEconomyCny,
   resetCheapestFlightRefCache,
 } from './bundle-pricing.js';
@@ -1528,5 +1534,98 @@ describe('ProductsService.getTransfer/listTransfers · includeCost 透传（路�
     const service = new ProductsService();
     const [result] = await service.listTransfers(false);
     expect(result).not.toHaveProperty('costPriceCny');
+  });
+});
+
+// ── 签证加急分档（expressTiers）：档位表校验 + 脏数据解析 + 更新写入口径 ────────────
+// 运营自配「零工/一工/二工」等档位（各自出签工作日 + 加价）。label 是定价查表的键，
+// 必须非空且同产品内唯一；金额/天数非负。旧的单值 expressSurcharge 保持不动（未配分档时回落）。
+describe('签证加急分档 · visaExpressTiersSchema 校验', () => {
+  it('合法档位表通过，label 前后空白被 trim', () => {
+    const parsed = visaExpressTiersSchema.parse([
+      { label: ' 零工 ', workDays: 0, surchargeCny: 300 },
+      { label: '一工', workDays: 1, surchargeCny: 100 },
+    ]);
+    expect(parsed[0].label).toBe('零工');
+    expect(parsed).toHaveLength(2);
+  });
+
+  it('空档位表（[]）合法 = 该产品不提供分档加急', () => {
+    expect(visaExpressTiersSchema.parse([])).toEqual([]);
+  });
+
+  it('档名重复 → 拒绝（档名是定价查表的键，重复会让金额不确定）', () => {
+    const result = visaExpressTiersSchema.safeParse([
+      { label: '一工', workDays: 1, surchargeCny: 100 },
+      { label: '一工', workDays: 2, surchargeCny: 200 },
+    ]);
+    expect(result.success).toBe(false);
+  });
+
+  it('trim 后重复也算重复（" 一工" 与 "一工"）', () => {
+    const result = visaExpressTiersSchema.safeParse([
+      { label: '一工', workDays: 1, surchargeCny: 100 },
+      { label: ' 一工 ', workDays: 2, surchargeCny: 200 },
+    ]);
+    expect(result.success).toBe(false);
+  });
+
+  it('档名为空/纯空白 → 拒绝', () => {
+    expect(visaExpressTiersSchema.safeParse([{ label: '', workDays: 1, surchargeCny: 100 }]).success).toBe(false);
+    expect(visaExpressTiersSchema.safeParse([{ label: '   ', workDays: 1, surchargeCny: 100 }]).success).toBe(false);
+  });
+
+  it('工作日/加价为负 → 拒绝；工作日必须整数', () => {
+    expect(visaExpressTiersSchema.safeParse([{ label: '一工', workDays: -1, surchargeCny: 100 }]).success).toBe(false);
+    expect(visaExpressTiersSchema.safeParse([{ label: '一工', workDays: 1, surchargeCny: -1 }]).success).toBe(false);
+    expect(visaExpressTiersSchema.safeParse([{ label: '一工', workDays: 1.5, surchargeCny: 100 }]).success).toBe(false);
+  });
+
+  it('工作日 0（零工/当天出签）合法', () => {
+    expect(visaExpressTiersSchema.safeParse([{ label: '零工', workDays: 0, surchargeCny: 300 }]).success).toBe(true);
+  });
+
+  it(`超过 ${VISA_EXPRESS_TIER_MAX} 档 → 拒绝`, () => {
+    const tooMany = Array.from({ length: VISA_EXPRESS_TIER_MAX + 1 }, (_, i) => ({
+      label: `档${i}`,
+      workDays: i,
+      surchargeCny: i * 10,
+    }));
+    expect(visaExpressTiersSchema.safeParse(tooMany).success).toBe(false);
+    expect(visaExpressTiersSchema.safeParse(tooMany.slice(0, VISA_EXPRESS_TIER_MAX)).success).toBe(true);
+  });
+
+  it('updateVisa body：省略 expressTiers = 不改；传 [] = 显式清空分档', () => {
+    expect(updateVisaBodySchema.parse({ basePrice: 380 }).expressTiers).toBeUndefined();
+    expect(updateVisaBodySchema.parse({ expressTiers: [] }).expressTiers).toEqual([]);
+  });
+});
+
+describe('签证加急分档 · parseVisaExpressTiers（DB Json → 类型化档位表）', () => {
+  it('正常数组 → 原样解析', () => {
+    expect(parseVisaExpressTiers([{ label: '一工', workDays: 1, surchargeCny: 100 }])).toEqual([
+      { label: '一工', workDays: 1, surchargeCny: 100 },
+    ]);
+  });
+
+  it('非数组（null / 旧数据 / 对象）→ 空表，不抛错', () => {
+    expect(parseVisaExpressTiers(null)).toEqual([]);
+    expect(parseVisaExpressTiers(undefined)).toEqual([]);
+    expect(parseVisaExpressTiers({ label: '一工' })).toEqual([]);
+    expect(parseVisaExpressTiers('一工')).toEqual([]);
+  });
+
+  it('数组里混入脏档 → 丢弃脏档、保留合法档（产品脏配置不该炸掉列表与下单）', () => {
+    const parsed = parseVisaExpressTiers([
+      { label: '一工', workDays: 1, surchargeCny: 100 },
+      { label: '', workDays: 2, surchargeCny: 50 },
+      { workDays: 3 },
+      null,
+      { label: '三工', workDays: 3, surchargeCny: 60 },
+    ]);
+    expect(parsed).toEqual([
+      { label: '一工', workDays: 1, surchargeCny: 100 },
+      { label: '三工', workDays: 3, surchargeCny: 60 },
+    ]);
   });
 });
