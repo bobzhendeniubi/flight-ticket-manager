@@ -17,10 +17,6 @@ import {
   api,
   ApiError,
   hotelControlOpsApi,
-  randomStarTierLabel,
-  poolOptionValue,
-  poolTierFromOptionValue,
-  RANDOM_STAR_TIERS,
   type RandomStarTier,
   type BlockPeriodWriteInput,
   type HotelBlockPeriod,
@@ -129,12 +125,13 @@ function readShared(rows: unknown): SharedRows {
 const STICKY_COL1 = 'sticky left-0 z-10 min-w-[11rem] bg-white';
 const STICKY_COL2 = 'sticky left-[11rem] z-10 min-w-[3.5rem] bg-white';
 
-// ── 星级随机池（三星随机 / 四星随机）─────────────────────────────────────────
+// ── 星级随机档（三星随机 / 四星随机）─────────────────────────────────────────
 /**
- * 池是**真库存**：先按星级切总量，客人下单只占池，之后房控再落到具体酒店。
- * 页面里池只在两处露出：包房周期表单的下拉虚拟项，和销控矩阵/远期里的独立分组。
- * 判定一律看 `randomStarTier` 非空 —— 池组的 hotelId 是后端合成键，不能当酒店 id 用。
- * 下拉哨兵值 poolOptionValue / poolTierFromOptionValue 与录单弹窗共用同一份实现（lib/api.ts）。
+ * 随机档**不是**单独切的库存，而是同星级酒店库存的派生聚合：
+ *   随机N星余量 = Σ(同星级酒店余量) − 未落位随机单占用
+ * 所以页面里没有「建随机档周期」这回事（后端也拒建），它只在销控矩阵/远期里作为一个
+ * 聚合分组出现。判定一律看 `randomStarTier` 非空 —— 聚合组的 hotelId 是后端合成键，
+ * 不能当酒店 id 用。
  */
 
 export function HotelControlPage() {
@@ -233,10 +230,11 @@ export function HotelControlPage() {
       <section className="card">
         <h2 className="text-sm font-semibold text-ink">销控矩阵（按酒店 × 日期）</h2>
         <p className="mt-1 text-xs text-ink-muted">
-          每家酒店四行：包房 / 用房（床位口径）/ 物理房间 / 余量（物理房间口径 = 包房 − 物理房间）。横向滚动看更多日期（最长 120 天）。用房格出现
+          每家酒店四行：包房 / 用房（床位口径）/ 物理房间 / 余量（床位口径 = 包房 − 用房）。横向滚动看更多日期（最长 120 天）。用房格出现
           <span className="mx-1 inline-flex h-4 min-w-[1rem] items-center justify-center rounded-full bg-amber-100 px-1 text-[10px] font-semibold leading-none text-amber-700 ring-1 ring-amber-300">拼</span>
           表示当晚有拼房客无法配对（异性不能拼一间、性别未知按每人独占），需补单房差或另行配对。
-          「用房」为床位口径（拼房客各计 0.5，可为小数）；「物理房间」是实际占用的整间数（同性两位拼 1 间、落单或未知各独占 1 间）；「余量」按物理房间口径。
+          「用房」与「余量」为床位口径（拼房客各计 0.5，故余量可出现 .5，如 13.5）；「物理房间」是实际占用的整间数（同性两位拼 1 间、落单或未知各独占 1 间），只作展示，不参与余量判定。
+          「三星随机 / 四星随机」是同星级酒店的合计（= Σ 同星级酒店余量 − 未落位随机单），不是单独一份库存。
         </p>
         {loading ? (
           <div className="mt-3 text-sm text-ink-muted">加载销控板…</div>
@@ -265,13 +263,13 @@ export function HotelControlPage() {
                       <td rowSpan={4} className={`${STICKY_COL1} py-2 pr-2 align-top`}>
                         <div className="font-medium text-ink">
                           {h.hotelName}
-                          {/* 池组：独立库存、尚未落到具体酒店，用角标点明，样式与酒店组其余部分一致 */}
+                          {/* 聚合组：同星级酒店的合计视图，不是一家酒店，用角标点明 */}
                           {h.randomStarTier != null && (
                             <span
                               className="ml-1.5 inline-flex items-center rounded-full bg-indigo-50 px-1.5 text-[10px] font-semibold leading-4 text-indigo-700 ring-1 ring-indigo-200"
-                              title="星级随机池：按星级切的独立库存，客人先占池、之后由房控落到具体酒店；与具体酒店的包房互不扣减"
+                              title="同星级酒店合计：包房 = 同星级各酒店包房之和；用房 = 尚未落到具体酒店的随机单；余量 = 同星级各酒店余量之和 − 未落位随机单（故本行「包房 − 用房」不等于「余量」）"
                             >
-                              池
+                              合计
                             </span>
                           )}
                         </div>
@@ -331,19 +329,18 @@ export function HotelControlPage() {
                       {h.rows.remaining.map((bedRem, i) => {
                         const block = h.rows.block[i];
                         const used = h.rows.used[i];
-                        const shared = readShared(h.rows);
-                        // 余量按物理房间口径（block − physicalUsed）；后端缺省时回落床位余量
-                        const physRem = shared.physicalRemaining?.[i] ?? bedRem;
                         const unconfigured = block === 0 && used > 0;
                         const date = board.dates[i];
                         return (
                           <td
                             key={i}
-                            className={`cursor-pointer px-2 py-1 text-right transition hover:ring-1 hover:ring-brand/50 ${remainingCellCls(physRem, block, used)}`}
+                            className={`cursor-pointer px-2 py-1 text-right transition hover:ring-1 hover:ring-brand/50 ${remainingCellCls(bedRem, block, used)}`}
                             title={
                               unconfigured
                                 ? '未配包房：该晚无包房周期覆盖，此数字非真实超卖 · 点击查看占房订单'
-                                : '余量按物理房间口径（用房行为床位口径）· 点击查看占房订单'
+                                : h.randomStarTier != null
+                                  ? '同星级酒店余量之和 − 未落位随机单（床位口径）· 点击查看未落位的随机单'
+                                  : '余量 = 包房 − 用房（床位口径，可出现 .5）· 点击查看占房订单'
                             }
                             onClick={() =>
                               setDrill({
@@ -356,7 +353,7 @@ export function HotelControlPage() {
                               })
                             }
                           >
-                            {unconfigured ? '未配' : physRem}
+                            {unconfigured ? '未配' : bedRem}
                           </td>
                         );
                       })}
@@ -380,6 +377,10 @@ export function HotelControlPage() {
                 未配包房 · 该晚无包房周期，数字仅供参考
               </span>
               <span>点击任意「余量」格可查看当晚占房订单明细</span>
+              <span className="basis-full">
+                「三星随机 / 四星随机」= 同星级酒店合计：包房 = 同星级各酒店包房之和；用房 = 尚未落到具体酒店的随机单；余量 = 同星级各酒店余量之和 − 未落位随机单。
+                把随机单落位到某家酒店后，该酒店用房 +1、未落位随机单 −1，随机档余量不变。
+              </span>
             </div>
           </div>
         )}
@@ -1587,7 +1588,8 @@ function BlockPeriodNewForm({
   onSaved: () => void;
   onCancel: () => void;
 }) {
-  // 下拉选中值：真实酒店 id，或星级随机池的哨兵值 POOL_OPTION_VALUE(tier)
+  // 下拉选中值 = 真实酒店 id。包房周期只能挂在具体酒店上 —— 「三星/四星随机」是同星级酒店
+  // 的派生合计，不再单独切一份库存（后端 createBlockPeriod 也会拒），故此处没有随机档选项。
   const [hotelId, setHotelId] = useState<string>(hotelOptions[0]?.id ?? '');
   const [dateFrom, setDateFrom] = useState<string>(todayStr());
   const [dateTo, setDateTo] = useState<string>(todayStr());
@@ -1596,8 +1598,6 @@ function BlockPeriodNewForm({
   const [note, setNote] = useState<string>('');
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-
-  const poolTier = poolTierFromOptionValue(hotelId);
 
   // 默认下拉同步
   useEffect(() => {
@@ -1608,7 +1608,7 @@ function BlockPeriodNewForm({
 
   async function submit(): Promise<void> {
     if (!hotelId) {
-      setErr('请选择酒店或星级随机池');
+      setErr('请选择酒店');
       return;
     }
     if (rooms == null) {
@@ -1618,9 +1618,8 @@ function BlockPeriodNewForm({
     setSaving(true);
     setErr(null);
     try {
-      // 酒店与星级随机池二选一（后端同款 XOR 校验）：选中池哨兵值时只发 randomStarTier
       const body: BlockPeriodWriteInput = {
-        ...(poolTier != null ? { randomStarTier: poolTier } : { hotelId }),
+        hotelId,
         dateFrom,
         dateTo,
         rooms,
@@ -1643,33 +1642,22 @@ function BlockPeriodNewForm({
     <div className="mt-3 rounded-lg border border-slate-200 bg-canvas p-3">
       <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
         <label className="text-xs text-ink-soft">
-          酒店 / 星级随机池
+          酒店
           <select
             value={hotelId}
             onChange={(e) => setHotelId(e.target.value)}
             className={`mt-1 block w-full ${inputCls}`}
           >
-            {/* 星级随机池：不是某一家酒店，而是「按星级切的总量」，客人先占池、之后再落酒店 */}
-            <optgroup label="星级随机池（先切总量，之后落酒店）">
-              {RANDOM_STAR_TIERS.map((tier) => (
-                <option key={tier} value={poolOptionValue(tier)}>
-                  {randomStarTierLabel(tier)}
-                </option>
-              ))}
-            </optgroup>
-            <optgroup label="具体酒店">
-              {hotelOptions.length === 0 && <option value="">（无可用酒店）</option>}
-              {hotelOptions.map((o) => (
-                <option key={o.id} value={o.id}>
-                  {o.label}
-                </option>
-              ))}
-            </optgroup>
+            {hotelOptions.length === 0 && <option value="">（无可用酒店）</option>}
+            {hotelOptions.map((o) => (
+              <option key={o.id} value={o.id}>
+                {o.label}
+              </option>
+            ))}
           </select>
           <span className="mt-1 block font-normal normal-case text-ink-muted">
-            {poolTier != null
-              ? `${randomStarTierLabel(poolTier)}是独立库存：客人下单先占池，之后由房控落到某家 ${poolTier} 星及以上酒店；与具体酒店的包房互不扣减。`
-              : '找不到酒店？在 产品管理 › 酒店 里添加/编辑（含介绍、图片、房型）。'}
+            「三星/四星随机」无需单独切房：它就是同星级各酒店余量的合计，按酒店切房即可。
+            找不到酒店？在 产品管理 › 酒店 里添加/编辑（含介绍、图片、房型）。
           </span>
         </label>
         <label className="text-xs text-ink-soft">
@@ -1808,10 +1796,10 @@ function BlockPeriodRow({
           {period.hotelName}
           {period.randomStarTier != null && (
             <span
-              className="ml-1.5 inline-flex items-center rounded-full bg-indigo-50 px-1.5 text-[10px] font-semibold leading-4 text-indigo-700 ring-1 ring-indigo-200"
-              title="星级随机池：按星级切的独立库存，与具体酒店的包房互不扣减"
+              className="ml-1.5 inline-flex items-center rounded-full bg-slate-100 px-1.5 text-[10px] font-semibold leading-4 text-slate-500 ring-1 ring-slate-300"
+              title="历史遗留的随机档周期：随机档已改为同星级酒店合计，这条周期不再计入任何余量，仅保留供查账；可直接删除"
             >
-              池
+              已停用
             </span>
           )}
         </td>

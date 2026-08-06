@@ -33,6 +33,7 @@ import {
   setFlightScheduleCostLock,
   updateCostPeriod,
 } from './finances.cost.service.js';
+import { getUsdFxRate, listUsdFxRates, upsertUsdFxRate } from './finances.fx.service.js';
 import { buildFinanceExportWorkbook, financeExportFilename } from './finances.export.js';
 import {
   buildFinanceExportByFlightWorkbook,
@@ -377,5 +378,41 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
     const result = await patchTransferCost(id, data);
     auditCost(req, `transfer:${id}`, data);
     return result;
+  });
+
+  // ── 美金汇率表（按生效日）────────────────────────────────────────────────────
+  // 财务加一条「某日起 x.xx」，区间由下一条的生效日隐含。签证台设金额时自动带出当日汇率，
+  // 折算值当场固化在任务上 —— 之后改汇率表绝不追溯已入账的旧任务。
+  // 读写都放开到 ADMIN/STAFF：签证岗要读当日汇率，财务岗要维护。
+  const usdFxRateUpsertSchema = z.object({
+    effectiveFrom: dateStr,
+    rate: z.number().positive().max(1000),
+    note: z.string().max(200).nullable().optional(),
+  });
+
+  app.get('/usd-fx-rates', requireAdminOrStaff, async () => {
+    const rates = await listUsdFxRates();
+    return { rates };
+  });
+
+  /** 取某日生效的汇率（≤date 的最新一条）；未维护 → { rate: null }，前端据此让用户手填。 */
+  app.get('/usd-fx-rates/effective', requireAdminOrStaff, async (req) => {
+    const q = z.object({ date: dateStr }).parse(req.query);
+    const rate = await getUsdFxRate(q.date);
+    return { rate };
+  });
+
+  app.put('/usd-fx-rates', requireAdminOrStaff, async (req) => {
+    const body = usdFxRateUpsertSchema.parse(req.body);
+    const rate = await upsertUsdFxRate(body, req.user.sub);
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'UPSERT_USD_FX_RATE',
+      targetType: 'SYSTEM',
+      targetId: rate.id,
+      targetLabel: `美金汇率 ${rate.effectiveFrom} 起 ${rate.rate}`,
+      after: rate,
+    });
+    return { rate };
   });
 };

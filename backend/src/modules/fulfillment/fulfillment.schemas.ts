@@ -72,11 +72,16 @@ export type ListFulfillmentQuery = z.infer<typeof listFulfillmentQuerySchema>;
  *   · visaUnitCostUsd + visaFxRate 齐备 → 后端自动折算 visaUnitCostCny 存底（入账权威）
  *   · 只给 visaUnitCostCny → 直接入账（美金/汇率清空）
  * 校验非负；汇率须为正。
+ *
+ * 另附 visaSupplier（签证公司）——与三个金额字段**互相独立**：只给公司不动金额，
+ * 只给金额不动公司。签证岗的口径就是「记签证公司 + 美金金额」，故两者同处一个入参。
  */
 export const visaTaskCostSchema = z.object({
   visaUnitCostUsd: z.number().nonnegative().nullable().optional(),
   visaFxRate: z.number().positive().nullable().optional(),
   visaUnitCostCny: z.number().nonnegative().nullable().optional(),
+  /** 签证公司（本次送签的供应商名称，财务对账用）；空串/null = 清空 */
+  visaSupplier: z.string().max(100).nullable().optional(),
 });
 export type VisaTaskCost = z.infer<typeof visaTaskCostSchema>;
 
@@ -91,11 +96,14 @@ export const updateFulfillmentBodySchema = z.object({
   visaUnitCostUsd: z.number().nonnegative().nullable().optional(),
   visaFxRate: z.number().positive().nullable().optional(),
   visaUnitCostCny: z.number().nonnegative().nullable().optional(),
+  // 签证公司（仅签证任务生效；与三个金额字段互相独立）
+  visaSupplier: z.string().max(100).nullable().optional(),
 });
 export type UpdateFulfillmentBody = z.infer<typeof updateFulfillmentBodySchema>;
 
-// ── 批量设置签证金额（签证公司按航班统一单价是常态）─────────────────────────
+// ── 批量设置签证金额 / 签证公司（签证公司按航班统一单价是常态）───────────────
 // 沿用批量机制（taskIds + 统一取值），逐条复用单任务 update 的签证成本校验/折算。
+// 金额与签证公司可分别单独提交：只带 visaSupplier 时不动金额，反之亦然。
 export const batchVisaTaskCostBodySchema = z
   .object({
     taskIds: z.array(z.string().min(1)).min(1).max(100),

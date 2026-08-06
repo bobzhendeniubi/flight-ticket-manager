@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel } from '../lib/api';
 import { useAuth } from '../stores/auth';
@@ -18,8 +18,10 @@ import { SingleOrderModal } from '../components/SingleOrderModal';
 import { RoomingEditor, type RoomingPassenger } from '../components/RoomingEditor';
 import { HotelSwapModal } from '../components/HotelSwapModal';
 import { SearchSelect, type SearchSelectOption } from '../components/SearchSelect';
+import { ProofImageViewer } from '../components/ProofImageViewer';
 import type { RoomGroup, Receipt } from '../lib/api';
 import { countryIso3ToIso2 } from '../lib/passportOcr';
+import { runPassportOcr, ocrReviewHintText } from '../lib/passportOcrRunner';
 
 // 本地可视化用的状态子集（后端 OrderStatus 更全，这里只列出常用 7 个做 filter）
 const STATUS_LABEL: Record<OrderStatus, string> = {
@@ -320,6 +322,51 @@ function InvoiceDots({ order }: { order: OrderSummary }) {
   );
 }
 
+/** 批量操作结果面板（批量改签证状态 / 批量选酒店 / 批量删除共用）：绿=全成功，红=有失败，
+ * 失败逐条列出订单号 + 原因；skipped 非空时额外提示跳过条数（如批量选酒店里没有池行的订单）。 */
+function BulkResultPanel({
+  succeeded,
+  failed,
+  skipped,
+  failNote,
+  failures,
+  orders,
+}: {
+  succeeded: number;
+  failed: number;
+  skipped?: number;
+  failNote?: string;
+  failures: Array<{ id: string; error?: string }>;
+  orders: OrderSummary[];
+}) {
+  return (
+    <div
+      className={`mt-3 rounded-lg border-2 px-4 py-3 text-sm ${
+        failed > 0 ? 'border-rose-300 bg-rose-50' : 'border-emerald-200 bg-emerald-50'
+      }`}
+    >
+      <div className={`font-semibold ${failed > 0 ? 'text-rose-700' : 'text-emerald-700'}`}>
+        ✓ 成功 {succeeded} 条
+        {failed > 0 && <span className="ml-3">✗ 失败 {failed} 条</span>}
+        {skipped != null && skipped > 0 && <span className="ml-3 font-normal text-ink-soft">（跳过 {skipped} 条）</span>}
+      </div>
+      {failed > 0 && failNote && <div className="mt-1 text-xs text-rose-700">{failNote}</div>}
+      {failures.length > 0 && (
+        <ul className="mt-2 max-h-40 overflow-auto rounded border border-rose-200 bg-white px-2 py-1.5 text-red-600">
+          {failures.map((f) => {
+            const orderNo = orders.find((o) => o.id === f.id)?.orderNumber ?? `${f.id.slice(0, 8)}…`;
+            return (
+              <li key={f.id} className="py-0.5 text-[11px]">
+                · <span className="font-mono">{orderNo}</span>：{f.error ?? '未知原因'}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 export function OrdersPage() {
   const tokens = useAuth((s) => s.tokens);
   const user = useAuth((s) => s.user);
@@ -451,6 +498,32 @@ export function OrdersPage() {
   // 强制模式默认关：强制把已取消/超时等「非占座」订单拉回 PAID/PROCESSING 等「占座」状态时会
   // 重新占座（余位不足会被拒绝），必须是运营每次主动勾选的动作，不能默认开着让人顺手误触。
   const [forceMode, setForceMode] = useState(false);
+  // 批量改签证状态：无批量端点，逐单调用「改备注」端点（updateOrderNotes）的 visaStatus 字段。
+  const [bulkVisaStatus, setBulkVisaStatus] = useState<VisaStatusInput | ''>('');
+  const [bulkVisaSubmitting, setBulkVisaSubmitting] = useState(false);
+  const [bulkVisaResult, setBulkVisaResult] = useState<{
+    succeeded: number;
+    failed: number;
+    failures: Array<{ id: string; error?: string }>;
+  } | null>(null);
+  // 批量删除（仅 ADMIN）：无批量端点，逐单调用现有软删端点；服务端占座/净收款守卫逐单生效。
+  const [bulkDeleteSubmitting, setBulkDeleteSubmitting] = useState(false);
+  const [bulkDeleteResult, setBulkDeleteResult] = useState<{
+    succeeded: number;
+    failed: number;
+    failures: Array<{ id: string; error?: string }>;
+  } | null>(null);
+  // 批量选酒店（随机池落位）：目标房型 + 逐单调用现有「换酒店」端点，仅作用于已选订单里
+  // 「未落位随机池行」（kind=HOTEL 且 hotelRoomTypeId 为空且 randomStarTier 非空），其余单跳过。
+  const [bulkHotels, setBulkHotels] = useState<Hotel[]>([]);
+  const [bulkHotelRoomTypeId, setBulkHotelRoomTypeId] = useState('');
+  const [bulkHotelSubmitting, setBulkHotelSubmitting] = useState(false);
+  const [bulkHotelResult, setBulkHotelResult] = useState<{
+    succeeded: number;
+    failed: number;
+    skipped: number;
+    failures: Array<{ id: string; error?: string }>;
+  } | null>(null);
   // 批量到账弹窗（选多单 → 逐单录到账金额 + 共享水单）
   const [showBatchPay, setShowBatchPay] = useState(false);
   // 批量创单弹窗 + 单笔录单弹窗 + 列表刷新计数（建单后 +1 触发重新拉单）
@@ -793,7 +866,14 @@ export function OrdersPage() {
       return next;
     });
   };
-  const clearSelection = () => { setSelectedIds(new Set()); setBulkResult(null); setBulkInvoiceResult(null); };
+  const clearSelection = () => {
+    setSelectedIds(new Set());
+    setBulkResult(null);
+    setBulkInvoiceResult(null);
+    setBulkVisaResult(null);
+    setBulkDeleteResult(null);
+    setBulkHotelResult(null);
+  };
 
   // 当前选中的订单对象（批量到账弹窗用）
   const selectedOrders = useMemo(
@@ -810,6 +890,39 @@ export function OrdersPage() {
     () => selectedOrders.reduce((sum, o) => sum + o.passengers.length, 0),
     [selectedOrders],
   );
+  // 已选订单里「未落位随机池行」（orderId → 该单命中的池占房行）——批量选酒店只对这些行生效，
+  // 其余单（没有池占房行的）批量落位时会被跳过。
+  const selectedPoolItems = useMemo(() => {
+    const map = new Map<string, OrderItem[]>();
+    for (const o of selectedOrders) {
+      const poolItems = (o.items ?? []).filter(
+        (it) => it.kind === 'HOTEL' && !it.hotelRoomTypeId && it.randomStarTier != null,
+      );
+      if (poolItems.length > 0) map.set(o.id, poolItems);
+    }
+    return map;
+  }, [selectedOrders]);
+  const selectedPoolOrderCount = selectedPoolItems.size;
+  // 批量选酒店用：在架酒店 + 房型列表，选中订单后按需拉一次（避免未用到该功能时空跑请求）。
+  useEffect(() => {
+    if (!tokens?.accessToken || selectedIds.size === 0 || bulkHotels.length > 0) return;
+    api
+      .listHotels(true, tokens.accessToken)
+      .then((r) => setBulkHotels(r.hotels))
+      .catch(() => {
+        /* 加载失败不阻断其它批量操作；房型下拉留空，操作员可重新勾选触发重试 */
+      });
+  }, [tokens?.accessToken, selectedIds.size, bulkHotels.length]);
+  const bulkHotelRoomTypeOptions: SearchSelectOption[] = useMemo(() => {
+    const opts: SearchSelectOption[] = [];
+    for (const h of bulkHotels) {
+      for (const rt of h.roomTypes) {
+        const price = Math.round(Number(rt.basePrice));
+        opts.push({ id: rt.id, label: `${h.name} · ${rt.name}`, priceLabel: Number.isFinite(price) ? String(price) : rt.basePrice });
+      }
+    }
+    return opts;
+  }, [bulkHotels]);
 
   const applyBulkStatus = async () => {
     if (!tokens?.accessToken || !bulkStatus || selectedIds.size === 0) return;
@@ -904,6 +1017,114 @@ export function OrdersPage() {
       alert(err instanceof ApiError ? `批量${lock ? '锁定' : '解锁'}失败：${err.message}` : `批量${lock ? '锁定' : '解锁'}失败`);
     } finally {
       setBulkSubmitting(false);
+    }
+  };
+
+  // 批量改签证状态：无批量端点，逐单复用「改备注」端点（updateOrderNotes 的 visaStatus 子集），
+  // 单单失败不影响其余单——结果面板同 applyBulkInvoiceFlags 款式（成功/失败汇总 + 失败清单）。
+  const applyBulkVisaStatus = async () => {
+    if (!tokens?.accessToken || !bulkVisaStatus || selectedIds.size === 0) return;
+    if (!window.confirm(`将 ${selectedIds.size} 条订单批量改签证状态为「${VISA_STATUS_LABEL[bulkVisaStatus]}」？`)) return;
+    setBulkVisaSubmitting(true);
+    setBulkVisaResult(null);
+    const ids = Array.from(selectedIds);
+    const failures: Array<{ id: string; error?: string }> = [];
+    let succeeded = 0;
+    try {
+      for (const id of ids) {
+        try {
+          await api.updateOrderNotes(tokens.accessToken, id, { visaStatus: bulkVisaStatus });
+          succeeded++;
+        } catch (e: unknown) {
+          failures.push({ id, error: e instanceof ApiError ? e.message : '改签证状态失败' });
+        }
+      }
+      const updated = await api.listOrders(tokens.accessToken, { pageSize: 200 });
+      setOrders(updated.orders);
+      setBulkVisaResult({ succeeded, failed: failures.length, failures });
+      if (failures.length === 0) {
+        setSelectedIds(new Set());
+        setBulkVisaStatus('');
+      }
+    } finally {
+      setBulkVisaSubmitting(false);
+    }
+  };
+
+  // 批量删除（仅 ADMIN）：无批量端点，逐单调用现有软删端点；服务端占座/净收款守卫逐单生效，
+  // 绝不绕过——失败单（如仍占座、净收款>0）逐条列出原因，只有成功的单从列表移除。
+  const applyBulkDelete = async () => {
+    if (!tokens?.accessToken || selectedIds.size === 0) return;
+    const confirmed = window.confirm(
+      `批量删除已选 ${selectedIds.size} 条订单？\n\n` +
+        `软删除：订单从所有列表/导出/统计里消失，数据保留可追溯（审计记录），不影响座位账；可在回收站恢复。\n` +
+        `注意：仍占座的订单需先取消订单释放座位、净收款＞0 的订单不允许删除——不满足条件的单会失败，原因逐条列在下方。`,
+    );
+    if (!confirmed) return;
+    setBulkDeleteSubmitting(true);
+    setBulkDeleteResult(null);
+    const ids = Array.from(selectedIds);
+    const failures: Array<{ id: string; error?: string }> = [];
+    let succeeded = 0;
+    try {
+      for (const id of ids) {
+        try {
+          await api.deleteOrder(tokens.accessToken, id);
+          succeeded++;
+        } catch (e: unknown) {
+          failures.push({ id, error: e instanceof ApiError ? e.message : '删除失败' });
+        }
+      }
+      const failedIds = new Set(failures.map((f) => f.id));
+      // 只把成功删除的从本地列表移除；失败的仍留着（继续勾选，方便定位处理）。
+      setOrders((prev) => prev.filter((o) => !ids.includes(o.id) || failedIds.has(o.id)));
+      setBulkDeleteResult({ succeeded, failed: failures.length, failures });
+      setSelectedIds(new Set(failures.map((f) => f.id)));
+    } finally {
+      setBulkDeleteSubmitting(false);
+    }
+  };
+
+  // 批量选酒店（随机池落位）：只对已选订单里「未落位随机池行」生效，逐单（一单可能有多条池行，
+  // 如去程/回程各一间）调用现有「换酒店」端点；没有池行的订单自动跳过，不算失败。
+  const applyBulkHotelAssign = async () => {
+    if (!tokens?.accessToken || !bulkHotelRoomTypeId || selectedPoolItems.size === 0) return;
+    const targetLabel =
+      bulkHotelRoomTypeOptions.find((o) => o.id === bulkHotelRoomTypeId)?.label ?? bulkHotelRoomTypeId;
+    const skipped = selectedIds.size - selectedPoolItems.size;
+    if (
+      !window.confirm(
+        `将已选订单中 ${selectedPoolItems.size} 条「未落位随机池行」批量落位到「${targetLabel}」？` +
+          (skipped > 0 ? `\n\n其余 ${skipped} 条订单没有未落位的池占房行，会被跳过。` : ''),
+      )
+    )
+      return;
+    setBulkHotelSubmitting(true);
+    setBulkHotelResult(null);
+    const failures: Array<{ id: string; error?: string }> = [];
+    let succeeded = 0;
+    try {
+      for (const [orderId, items] of selectedPoolItems) {
+        try {
+          // 一单可能有多条未落位池行（如去程/回程各一间）；逐条落位，任一失败整单记为失败。
+          for (const item of items) {
+            await api.swapItemHotel(tokens.accessToken, orderId, item.id, {
+              newHotelRoomTypeId: bulkHotelRoomTypeId,
+            });
+          }
+          succeeded++;
+        } catch (e: unknown) {
+          failures.push({ id: orderId, error: e instanceof ApiError ? e.message : '换酒店失败' });
+        }
+      }
+      const updated = await api.listOrders(tokens.accessToken, { pageSize: 200 });
+      setOrders(updated.orders);
+      setBulkHotelResult({ succeeded, failed: failures.length, skipped, failures });
+      if (failures.length === 0) {
+        setBulkHotelRoomTypeId('');
+      }
+    } finally {
+      setBulkHotelSubmitting(false);
     }
   };
 
@@ -1750,6 +1971,101 @@ export function OrdersPage() {
               {bulkInvoiceSubmitting ? '处理中…' : `应用到 ${selectedIds.size} 条`}
             </button>
           </div>
+
+          {/* 批量改签证状态：无批量端点，逐单复用「改备注」端点的 visaStatus 字段。 */}
+          <div className="mt-3 flex flex-wrap items-center gap-3 border-t border-brand/15 pt-3">
+            <label className="text-sm text-ink-soft">批量改签证状态：</label>
+            <select
+              className="input max-w-[11rem] py-1.5"
+              value={bulkVisaStatus}
+              onChange={(e) => setBulkVisaStatus(e.target.value as VisaStatusInput | '')}
+              disabled={bulkVisaSubmitting}
+            >
+              <option value="">选择目标签证状态…</option>
+              {(Object.keys(VISA_STATUS_LABEL) as VisaStatusInput[]).map((s) => (
+                <option key={s} value={s}>{VISA_STATUS_LABEL[s]}</option>
+              ))}
+            </select>
+            <button
+              className="btn-primary text-sm py-1.5 disabled:opacity-50"
+              onClick={() => void applyBulkVisaStatus()}
+              disabled={!bulkVisaStatus || bulkVisaSubmitting}
+            >
+              {bulkVisaSubmitting ? '处理中…' : `应用到 ${selectedIds.size} 条`}
+            </button>
+          </div>
+          {bulkVisaResult && (
+            <BulkResultPanel
+              succeeded={bulkVisaResult.succeeded}
+              failed={bulkVisaResult.failed}
+              failures={bulkVisaResult.failures}
+              orders={orders}
+            />
+          )}
+
+          {/* 批量选酒店（随机池落位）：仅对已选订单里「未落位随机池行」生效，其余单自动跳过。 */}
+          <div className="mt-3 flex flex-wrap items-center gap-3 border-t border-brand/15 pt-3">
+            <label className="text-sm text-ink-soft">批量选酒店（落随机池）：</label>
+            <SearchSelect
+              options={bulkHotelRoomTypeOptions}
+              value={bulkHotelRoomTypeId || null}
+              onChange={setBulkHotelRoomTypeId}
+              placeholder={bulkHotels.length ? '搜索目标酒店 / 房型…' : '加载中…'}
+              disabled={bulkHotelSubmitting || bulkHotels.length === 0}
+              className="w-64"
+            />
+            <button
+              className="btn-primary text-sm py-1.5 disabled:opacity-50"
+              onClick={() => void applyBulkHotelAssign()}
+              disabled={!bulkHotelRoomTypeId || bulkHotelSubmitting || selectedPoolOrderCount === 0}
+              title={
+                selectedPoolOrderCount === 0
+                  ? '已选订单中没有未落位的随机池占房行'
+                  : `落位到 ${selectedPoolOrderCount} 条未落位订单`
+              }
+            >
+              {bulkHotelSubmitting ? '落位中…' : `落位 ${selectedPoolOrderCount} 条`}
+            </button>
+            <span className="text-xs text-ink-soft">
+              仅对已选订单中「未落位随机池行」生效（命中 {selectedPoolOrderCount}/{selectedIds.size} 条），其余订单会被跳过。
+            </span>
+          </div>
+          {bulkHotelResult && (
+            <BulkResultPanel
+              succeeded={bulkHotelResult.succeeded}
+              failed={bulkHotelResult.failed}
+              skipped={bulkHotelResult.skipped}
+              failNote="失败常见原因：目标房型星级低于池档次，或目标酒店当晚余量不足。"
+              failures={bulkHotelResult.failures}
+              orders={orders}
+            />
+          )}
+
+          {/* 批量删除（仅 ADMIN）：软删除可在回收站恢复；逐单调用现有端点，服务端占座/净收款守卫逐单生效。 */}
+          {isAdmin && (
+            <div className="mt-3 flex flex-wrap items-center gap-3 border-t border-rose-200 pt-3">
+              <button
+                className="rounded-lg border border-rose-300 bg-rose-50 px-3 py-1.5 text-sm font-medium text-rose-700 hover:bg-rose-100 disabled:opacity-50"
+                onClick={() => void applyBulkDelete()}
+                disabled={bulkDeleteSubmitting}
+              >
+                {bulkDeleteSubmitting ? '删除中…' : `🗑 批量删除（${selectedIds.size} 条）`}
+              </button>
+              <span className="text-xs text-rose-500">
+                软删除，可在回收站恢复；仍占座的订单需先取消释放座位，净收款＞0 的订单不允许删除，失败会逐条列出原因。
+              </span>
+            </div>
+          )}
+          {bulkDeleteResult && (
+            <BulkResultPanel
+              succeeded={bulkDeleteResult.succeeded}
+              failed={bulkDeleteResult.failed}
+              failNote="失败常见原因：仍占座需先取消订单释放座位，或净收款＞0 不允许删除。"
+              failures={bulkDeleteResult.failures}
+              orders={orders}
+            />
+          )}
+
           {bulkInvoiceResult && (
             <div
               className={`mt-3 rounded-lg border-2 px-4 py-3 text-sm ${
@@ -6274,7 +6590,8 @@ interface BatchRow {
   // ── OTA 名单解析带出的护照字段（选填；粘贴导入时填充，随提交发给后端）──────
   lastName?: string;
   firstName?: string;
-  gender?: 'M' | 'F';
+  /** 性别（M/F/X；OCR 识别或手选，X=MRZ 第三性别） */
+  gender?: 'M' | 'F' | 'X';
   /** 2 位国家码（如 CN） */
   nationality?: string;
   /** 护照签发国（2 位国家码，如 CN） */
@@ -6288,7 +6605,59 @@ interface BatchRow {
   chineseName?: string;
   /** 护照签发日期（YYYY-MM-DD，表格导入「签发日期」列） */
   passportIssueDate?: string;
+  /** 护照签发地点（自由文本；可选；OCR 识别带出） */
+  passportIssuePlace?: string;
+  // ── 护照 OCR（批量传护照：多选逐张识别回填，同 SingleOrderModal 实现模式）────────
+  /** 护照图 base64 data URL（OCR 识别后存入，随提交发给后端） */
+  passportPhotoUrl?: string;
+  /** OCR 识别进度 0-100；null = 未识别 */
+  ocrPct?: number | null;
+  /** OCR 识别阶段描述 */
+  ocrStage?: string;
+  /** OCR 引擎标签：'ai' | 'local' | 'ai-fallback' | null */
+  ocrEngine?: 'ai' | 'local' | 'ai-fallback' | null;
+  /** AI 识别时使用的模型名 */
+  ocrModel?: string | null;
+  /** AI OCR 校验结果：需要人工核对的字段 */
+  reviewFields?: Array<{ field: string; reason: string }>;
+  /** 护照 MRZ 校验是否通过；undefined/null = 无 MRZ 信息（本地识别） */
+  mrzValid?: boolean | null;
+  /** 本地 Tesseract 兜底识别提示：精度有限，整行核对 */
+  localOcrCaveat?: boolean;
 }
+
+// 护照图上限（一批）：批量创单所有乘客的护照图都在**同一个** POST /orders/batch 请求里
+// （与单笔录单不同，单笔是一单一个请求），后端该路由 bodyLimit 放宽到 25MB——
+// 每张压缩图约 0.7MB，留足余量取 20（与单笔录单同一常量口径）。
+const BATCH_MAX_PHOTO_PASSENGERS = 20;
+// 批量识别并发：一次最多同时打 3 张，避免 OCR 服务商按 key 限流（429）。
+const BATCH_BULK_OCR_CONCURRENCY = 3;
+
+// 批量创单出行人表格里可高亮 AI 核对警示的字段（BatchRow 键名）。
+const BATCH_OCR_HIGHLIGHTABLE_FIELDS = new Set([
+  'fullName',
+  'chineseName',
+  'documentNumber',
+  'dateOfBirth',
+  'gender',
+  'passportIssueDate',
+  'passportIssuePlace',
+  'passportExpiry',
+]);
+
+/** 该行是否有某字段的 AI 核对警示（表格里存在的字段才高亮）。 */
+function batchHasFieldReview(r: BatchRow, field: string): boolean {
+  if (!BATCH_OCR_HIGHLIGHTABLE_FIELDS.has(field)) return false;
+  return Boolean(r.reviewFields?.some((f) => f.field === field));
+}
+
+// 签证状态默认值按产品类型派生（与单笔录单同口径）：批量套餐涉及签证 → 默认「需要」；
+// 批量机票（单程/往返）不涉及签证 → 默认「不需要」。仅作为「未手动改过」时的跟随默认值。
+const DEFAULT_BATCH_VISA_STATUS: Record<BatchProductType, VisaStatusInput> = {
+  FLIGHT_ONEWAY: 'NOT_NEEDED',
+  FLIGHT_ROUNDTRIP: 'NOT_NEEDED',
+  BUNDLE: 'NEEDED',
+};
 
 /**
  * 把宽松输入的生日解析成后端要的 YYYY-MM-DD。
@@ -6384,8 +6753,28 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   // ── 备注 ──────────────────────────────────────────────────────────────────
   const [notes, setNotes] = useState('');
 
+  // ── 签证状态（订单级，写入每张子单）+ 酒店备注（选填，写入每张子单）───────────
+  // 后端 batchCreateOrdersBodySchema 直接 spread 了 orderStructuredNotesShape（含 visaStatus /
+  // noteHotel），批量创单本就支持整批共用这两项——这里只是把已有能力接上前端表单。
+  // 默认值按产品类型派生（与单笔录单同口径，见 DEFAULT_BATCH_VISA_STATUS）；
+  // 由 visaStatusTouchedRef 记住是否手动改过，切换产品类型不会覆盖用户的手动选择。
+  const [visaStatus, setVisaStatus] = useState<VisaStatusInput>(() => DEFAULT_BATCH_VISA_STATUS[productType]);
+  const visaStatusTouchedRef = useRef(false);
+  useEffect(() => {
+    if (visaStatusTouchedRef.current) return;
+    setVisaStatus(DEFAULT_BATCH_VISA_STATUS[productType]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [productType]);
+  const [noteHotel, setNoteHotel] = useState('');
+
   // ── 名单 ──────────────────────────────────────────────────────────────────
   const [rows, setRows] = useState<BatchRow[]>([{ fullName: '', documentNumber: '', dateOfBirth: '', nationality: 'CN' }]);
+  // 并发 OCR 读最新行快照用（setRow 同步写入，避免批量识别时读到陈旧的渲染闭包）。
+  const rowsRef = useRef<BatchRow[]>(rows);
+  // 批量传护照：多选 → 逐张识别（并发 BATCH_BULK_OCR_CONCURRENCY）进度；null = 未在跑。
+  const [bulkOcr, setBulkOcr] = useState<{ done: number; total: number } | null>(null);
+  const bulkOcrInputRef = useRef<HTMLInputElement | null>(null);
+  const ocrInputRefs = useRef<Array<HTMLInputElement | null>>([]);
   const [templateBusy, setTemplateBusy] = useState(false);
   const [rosterBusy, setRosterBusy] = useState(false);
   const [rosterWarnings, setRosterWarnings] = useState<string[]>([]);
@@ -6541,10 +6930,108 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   const validRows = rows.filter((r) => r.fullName.trim() && r.documentNumber.trim() && parseDob(r.dateOfBirth));
 
   function setRow(i: number, patch: Partial<BatchRow>): void {
-    setRows((prev) => prev.map((r, idx) => (idx === i ? { ...r, ...patch } : r)));
+    setRows((prev) => {
+      const next = prev.map((r, idx) => (idx === i ? { ...r, ...patch } : r));
+      rowsRef.current = next; // 即时同步 ref：并发 OCR 的上限计数读最新值
+      return next;
+    });
   }
-  function addRow(): void { setRows((prev) => [...prev, { fullName: '', documentNumber: '', dateOfBirth: '', nationality: 'CN' }]); }
-  function removeRow(i: number): void { setRows((prev) => (prev.length > 1 ? prev.filter((_, idx) => idx !== i) : prev)); }
+  function addRow(): void {
+    setRows((prev) => {
+      const next = [...prev, { fullName: '', documentNumber: '', dateOfBirth: '', nationality: 'CN' }];
+      rowsRef.current = next;
+      return next;
+    });
+  }
+  function removeRow(i: number): void {
+    setRows((prev) => {
+      if (prev.length <= 1) return prev;
+      const next = prev.filter((_, idx) => idx !== i);
+      rowsRef.current = next;
+      return next;
+    });
+  }
+
+  /**
+   * 批量护照：一次多选 → 逐张识别（一次跑 BATCH_BULK_OCR_CONCURRENCY 张）→ 自动生成乘客行。
+   * 实现模式同 SingleOrderModal 的批量传护照：只复用「表尾」连续的空白行，其余追加到末尾——
+   * 上传顺序 == 行顺序，不会把照片塞进中间已填行之间打乱排版。受 BATCH_MAX_PHOTO_PASSENGERS 上限约束。
+   */
+  async function handleBulkOcrFiles(files: File[]): Promise<void> {
+    if (bulkOcr) return; // 已在跑，忽略重复触发
+    if (files.length === 0) return;
+
+    const current = rowsRef.current;
+    const withPhoto = current.filter((r) => r.passportPhotoUrl).length;
+    const slots = Math.max(0, BATCH_MAX_PHOTO_PASSENGERS - withPhoto);
+    if (slots === 0) {
+      setErr(`一批护照图最多 ${BATCH_MAX_PHOTO_PASSENGERS} 张，已达上限；更多请分批录入`);
+      return;
+    }
+    const accepted = files.slice(0, slots);
+    setErr(
+      accepted.length < files.length
+        ? `一批护照图上限 ${BATCH_MAX_PHOTO_PASSENGERS} 张，本次已取前 ${accepted.length} 张，其余请分批录入`
+        : null,
+    );
+
+    // 表尾连续空白行（无姓名/护照号/照片）的起点：只复用末尾这段，保持顺序不被打乱。
+    const isPristine = (r: BatchRow): boolean =>
+      !r.fullName.trim() && !r.documentNumber.trim() && !r.passportPhotoUrl;
+    let trailingStart = current.length;
+    while (trailingStart > 0 && isPristine(current[trailingStart - 1])) trailingStart--;
+    const trailingEmptyCount = current.length - trailingStart;
+
+    const targetIndices: number[] = [];
+    let appendCount = 0;
+    for (let k = 0; k < accepted.length; k++) {
+      if (k < trailingEmptyCount) targetIndices.push(trailingStart + k);
+      else targetIndices.push(current.length + appendCount++);
+    }
+    if (appendCount > 0) {
+      const toAppend = Array.from({ length: appendCount }, () => ({
+        fullName: '',
+        documentNumber: '',
+        dateOfBirth: '',
+        nationality: 'CN',
+      }));
+      setRows((prev) => [...prev, ...toAppend]);
+      rowsRef.current = [...current, ...toAppend]; // ref 同步前置：并发 worker 立即按这些末尾索引写入
+    }
+
+    setBulkOcr({ done: 0, total: accepted.length });
+    let cursor = 0;
+    let done = 0;
+    const worker = async (): Promise<void> => {
+      while (cursor < accepted.length) {
+        const k = cursor++;
+        try {
+          await handleOcrFile(targetIndices[k], accepted[k]);
+        } catch {
+          /* 单张失败不阻断其余；handleOcrFile 内部已容错 */
+        }
+        done++;
+        setBulkOcr({ done, total: accepted.length });
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(BATCH_BULK_OCR_CONCURRENCY, accepted.length) }, () => worker()),
+    );
+    setBulkOcr(null);
+  }
+
+  /** 单张护照 OCR：点按钮 → 触发隐藏 file input → 识别 → 自动填该行。实现模式同 SingleOrderModal。 */
+  async function handleOcrFile(idx: number, file: File): Promise<void> {
+    const snapshot = rowsRef.current;
+    const alreadyHasPhoto = Boolean(snapshot[idx]?.passportPhotoUrl);
+    if (!alreadyHasPhoto && snapshot.filter((r) => r.passportPhotoUrl).length >= BATCH_MAX_PHOTO_PASSENGERS) {
+      setErr(`一批护照图最多 ${BATCH_MAX_PHOTO_PASSENGERS} 张，已达上限；更多请分批录入`);
+      return;
+    }
+    setRow(idx, { ocrPct: 0, ocrStage: '加载中…', ocrEngine: null, ocrModel: null });
+    const patch = await runPassportOcr(token, file, (pct, stage) => setRow(idx, { ocrPct: pct, ocrStage: stage }));
+    setRow(idx, patch);
+  }
 
   function pasteRows(text: string): void {
     const parsed = text
@@ -6888,6 +7375,9 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
           }),
       description,
       notes: notes.trim() || undefined,
+      // 签证状态（订单级，写入每张子单）+ 酒店备注（选填，写入每张子单）。
+      visaStatus,
+      noteHotel: noteHotel.trim() || undefined,
       // 归属代理（ADMIN/STAFF 代为录单；直客留空）。非 ops 不发。
       ...(isOps && agentId ? { agentId } : {}),
       passengers: validRows.map((r) => ({
@@ -6901,9 +7391,11 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
         ...(r.gender ? { gender: r.gender } : {}),
         ...(r.passportIssueCountry?.trim() ? { passportIssueCountry: r.passportIssueCountry.trim() } : {}),
         ...(r.passportExpiry?.trim() ? { passportExpiry: r.passportExpiry.trim() } : {}),
-        // 表格导入带出的补充字段（手录时通常为空）
+        // 表格导入 / 护照 OCR 带出的补充字段（手录时通常为空）
         ...(r.chineseName?.trim() ? { chineseName: r.chineseName.trim() } : {}),
         ...(r.passportIssueDate?.trim() ? { passportIssueDate: r.passportIssueDate.trim() } : {}),
+        ...(r.passportIssuePlace?.trim() ? { passportIssuePlace: r.passportIssuePlace.trim() } : {}),
+        ...(r.passportPhotoUrl ? { passportPhotoUrl: r.passportPhotoUrl } : {}),
         ...(r.pnr?.trim() ? { pnr: r.pnr.trim().toUpperCase() } : {}),
         note: r.note?.trim() || undefined,
       })),
@@ -7217,6 +7709,9 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
             {productType === 'BUNDLE' && (
               <div className="rounded-md border border-slate-200 p-3">
                 <div className="mb-2 text-xs font-medium text-slate-600">套餐</div>
+                <p className="mb-2 rounded-md bg-slate-50 px-2.5 py-1.5 text-[11px] leading-relaxed text-slate-500">
+                  代理套餐单按结算价日历自动取价（档次 × 晚数 × 出发日期），无需也不可手填结算价。
+                </p>
                 <div className="grid gap-3 md:grid-cols-2">
                   <label className="text-xs text-slate-500">
                     选择套餐
@@ -7326,10 +7821,36 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
             <div>
               <div className="mb-1 flex items-center justify-between">
                 <span className="text-sm font-medium text-slate-700">乘客名单（每位一单 · 共 {validRows.length} 位有效）</span>
-                <button className="text-sm text-brand hover:text-brand-dark" onClick={addRow}>＋ 加一行</button>
+                <div className="flex items-center gap-3">
+                  {/* 批量传护照：多选 → 逐张识别（并发 3）→ 自动生成乘客行。实现模式同 SingleOrderModal。 */}
+                  <input
+                    type="file"
+                    accept="image/*"
+                    multiple
+                    className="hidden"
+                    ref={bulkOcrInputRef}
+                    onChange={(e) => {
+                      // 先把 FileList 复制成数组：下一行 e.target.value='' 会清空 e.target.files，
+                      // 若仍持有原 FileList 引用，其 length 立即变 0 → 批量识别"没反应"。
+                      const fs = e.target.files ? Array.from(e.target.files) : [];
+                      e.target.value = '';
+                      if (fs.length) void handleBulkOcrFiles(fs);
+                    }}
+                  />
+                  <button
+                    type="button"
+                    className="text-sm text-brand hover:text-brand-dark disabled:opacity-50"
+                    onClick={() => bulkOcrInputRef.current?.click()}
+                    disabled={bulkOcr !== null}
+                    title={`一次多选护照照片自动识别，最多 ${BATCH_MAX_PHOTO_PASSENGERS} 张/批`}
+                  >
+                    {bulkOcr ? `识别中 ${bulkOcr.done}/${bulkOcr.total}…` : `📷 批量传护照（≤${BATCH_MAX_PHOTO_PASSENGERS}）`}
+                  </button>
+                  <button className="text-sm text-brand hover:text-brand-dark" onClick={addRow}>＋ 加一行</button>
+                </div>
               </div>
               <div className="scrollbar-visible max-h-60 overflow-x-auto overflow-y-auto rounded-md border border-slate-200">
-                <table className="min-w-[900px] w-full text-sm">
+                <table className="min-w-[1030px] w-full text-sm">
                   <thead className="sticky top-0 bg-slate-50 text-xs text-slate-500">
                     <tr>
                       <th className="min-w-[130px] whitespace-nowrap px-2 py-1.5 text-left font-normal">姓名</th>
@@ -7341,30 +7862,48 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                         护照有效期 <span className="text-rose-500">*必填</span>
                       </th>
                       <th className="min-w-[130px] whitespace-nowrap px-2 py-1.5 text-left font-normal">备注（选填）</th>
+                      <th className="min-w-[110px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照 OCR</th>
                       <th className="min-w-[36px] px-2 py-1.5"></th>
                     </tr>
                   </thead>
                   <tbody>
-                    {rows.map((r, i) => (
-                      <tr key={i} className="border-t border-slate-100">
+                    {rows.map((r, i) => {
+                      const isOcring = r.ocrPct !== null && r.ocrPct !== undefined && r.ocrPct < 100;
+                      const reviewHint = ocrReviewHintText({
+                        reviewFields: r.reviewFields,
+                        mrzValid: r.mrzValid,
+                        localOcrCaveat: r.localOcrCaveat,
+                      });
+                      return (
+                      <Fragment key={i}>
+                      <tr className="border-t border-slate-100">
                         <td className="px-2 py-1 align-top">
-                          <input className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm" value={r.fullName} onChange={(e) => setRow(i, { fullName: e.target.value })} />
+                          <input
+                            className={`w-full rounded border px-1.5 py-1 text-sm ${batchHasFieldReview(r, 'fullName') ? 'border-amber-400 bg-amber-50' : 'border-slate-300'}`}
+                            value={r.fullName}
+                            onChange={(e) => setRow(i, { fullName: e.target.value })}
+                          />
                           {r.passportIssueCountry && (
                             <span className="mt-0.5 block text-[10px] text-slate-400">签发国 {r.passportIssueCountry}</span>
                           )}
                         </td>
                         <td className="px-2 py-1 align-top">
-                          <input className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm" value={r.documentNumber} onChange={(e) => setRow(i, { documentNumber: e.target.value })} />
+                          <input
+                            className={`w-full rounded border px-1.5 py-1 text-sm ${batchHasFieldReview(r, 'documentNumber') ? 'border-amber-400 bg-amber-50' : 'border-slate-300'}`}
+                            value={r.documentNumber}
+                            onChange={(e) => setRow(i, { documentNumber: e.target.value })}
+                          />
                         </td>
                         <td className="px-2 py-1 align-top">
                           <select
-                            className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm"
+                            className={`w-full rounded border px-1.5 py-1 text-sm ${batchHasFieldReview(r, 'gender') ? 'border-amber-400 bg-amber-50' : 'border-slate-300'}`}
                             value={r.gender ?? ''}
-                            onChange={(e) => setRow(i, { gender: (e.target.value || undefined) as 'M' | 'F' | undefined })}
+                            onChange={(e) => setRow(i, { gender: (e.target.value || undefined) as 'M' | 'F' | 'X' | undefined })}
                           >
                             <option value="">未选</option>
                             <option value="M">男</option>
                             <option value="F">女</option>
+                            <option value="X">其他</option>
                           </select>
                         </td>
                         <td className="px-2 py-1 align-top">
@@ -7395,7 +7934,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                                 <input
                                   type="text"
                                   inputMode="numeric"
-                                  className={`w-full rounded border px-1.5 py-1 text-sm ${dobBad ? 'border-rose-400 bg-rose-50' : 'border-slate-300'}`}
+                                  className={`w-full rounded border px-1.5 py-1 text-sm ${dobBad ? 'border-rose-400 bg-rose-50' : batchHasFieldReview(r, 'dateOfBirth') ? 'border-amber-400 bg-amber-50' : 'border-slate-300'}`}
                                   placeholder="YYYY-MM-DD"
                                   value={r.dateOfBirth}
                                   onChange={(e) => setRow(i, { dateOfBirth: e.target.value })}
@@ -7419,7 +7958,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                               <>
                                 <input
                                   type="date"
-                                  className={`w-full rounded border px-1.5 py-1 text-sm ${expiryBad ? 'border-rose-400 bg-rose-50' : 'border-slate-300'}`}
+                                  className={`w-full rounded border px-1.5 py-1 text-sm ${expiryBad ? 'border-rose-400 bg-rose-50' : batchHasFieldReview(r, 'passportExpiry') ? 'border-amber-400 bg-amber-50' : 'border-slate-300'}`}
                                   value={r.passportExpiry ?? ''}
                                   onChange={(e) => setRow(i, { passportExpiry: e.target.value || undefined })}
                                 />
@@ -7440,14 +7979,83 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                             onChange={(e) => setRow(i, { note: e.target.value })}
                           />
                         </td>
+                        <td className="px-2 py-1 align-top">
+                          {/* 隐藏单张 file input */}
+                          <input
+                            type="file"
+                            accept="image/*"
+                            className="hidden"
+                            ref={(el) => { ocrInputRefs.current[i] = el; }}
+                            onChange={(e) => {
+                              const f = e.target.files?.[0];
+                              e.target.value = '';
+                              if (f) void handleOcrFile(i, f);
+                            }}
+                          />
+                          {isOcring ? (
+                            <div className="space-y-0.5">
+                              <div className="h-1.5 w-16 overflow-hidden rounded-full bg-slate-200">
+                                <div className="h-full rounded-full bg-brand transition-all" style={{ width: `${r.ocrPct ?? 0}%` }} />
+                              </div>
+                              <span className="block max-w-[6rem] truncate text-[10px] text-slate-400">{r.ocrStage}</span>
+                            </div>
+                          ) : r.passportPhotoUrl ? (
+                            <div className="flex flex-col items-start gap-1">
+                              <div className="flex items-center gap-1">
+                                <ProofImageViewer src={r.passportPhotoUrl} alt="护照" thumbClassName="h-7 w-10 rounded object-cover ring-1 ring-slate-200" />
+                                <button
+                                  type="button"
+                                  className="text-[10px] text-slate-400 hover:text-rose-500"
+                                  onClick={() => setRow(i, { passportPhotoUrl: undefined, ocrPct: null, ocrStage: undefined, ocrEngine: null, ocrModel: null, reviewFields: undefined, mrzValid: null, localOcrCaveat: false })}
+                                  title="移除图片"
+                                >✕</button>
+                              </div>
+                              {r.ocrEngine === 'ai' && (
+                                <span className="block max-w-full truncate rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium leading-tight text-emerald-700 ring-1 ring-emerald-200" title={r.ocrModel ? `AI识别 · ${r.ocrModel}` : 'AI识别'}>
+                                  AI识别{r.ocrModel ? ` · ${r.ocrModel}` : ''}
+                                </span>
+                              )}
+                              {r.ocrEngine === 'local' && (
+                                <span className="block max-w-full truncate rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium leading-tight text-slate-500" title="本地识别(tesseract)">
+                                  本地识别(tesseract)
+                                </span>
+                              )}
+                              {r.ocrEngine === 'ai-fallback' && (
+                                <span className="block max-w-full truncate rounded bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium leading-tight text-amber-700 ring-1 ring-amber-200" title="AI失败已回退本地">
+                                  AI失败已回退本地
+                                </span>
+                              )}
+                            </div>
+                          ) : (
+                            <button
+                              type="button"
+                              className="rounded border border-slate-300 px-1.5 py-0.5 text-[11px] text-slate-600 hover:border-brand hover:text-brand"
+                              onClick={() => ocrInputRefs.current[i]?.click()}
+                            >
+                              OCR
+                            </button>
+                          )}
+                        </td>
                         <td className="px-2 py-1 text-right align-top">
                           <button className="text-xs text-slate-400 hover:text-rose-600" onClick={() => removeRow(i)} disabled={rows.length <= 1}>删</button>
                         </td>
                       </tr>
-                    ))}
+                      {reviewHint && (
+                        <tr className="border-t-0">
+                          <td colSpan={9} className="bg-amber-50 px-2 py-1 text-[11px] text-amber-700">
+                            ⚠️ {reviewHint}
+                          </td>
+                        </tr>
+                      )}
+                      </Fragment>
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
+              <p className="mt-1 text-[11px] text-slate-400">
+                📷「批量传护照」可一次多选，自动逐张识别并生成乘客行；护照图最多 {BATCH_MAX_PHOTO_PASSENGERS} 张/批，超出请分批录入。识别有需人工核对的字段时会在对应行下方标黄提示。
+              </p>
             </div>
 
             {/* D 表格导入行级错误（红字）：修正前不宜提交 */}
@@ -7611,6 +8219,28 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
               <label className="text-xs text-slate-500">
                 整批备注（选填，写入每单）
                 <input className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm" value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="全团共用；每位乘客可在下方名单里单独补充" />
+              </label>
+              <label className="text-xs text-slate-500">
+                酒店情况（选填，写入每单）
+                <input className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm" value={noteHotel} onChange={(e) => setNoteHotel(e.target.value)} maxLength={300} placeholder="全团共用；如有个别差异请在名单备注里说明" />
+              </label>
+              <label className="text-xs text-slate-500">
+                签证状态（写入每单）
+                <select
+                  className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                  value={visaStatus}
+                  onChange={(e) => {
+                    visaStatusTouchedRef.current = true;
+                    setVisaStatus(e.target.value as VisaStatusInput);
+                  }}
+                >
+                  {(Object.keys(VISA_STATUS_LABEL) as VisaStatusInput[]).map((s) => (
+                    <option key={s} value={s}>{VISA_STATUS_LABEL[s]}</option>
+                  ))}
+                </select>
+                <span className="mt-1 block text-[11px] leading-tight text-slate-400">
+                  默认按产品类型：套餐默认「需要」，机票默认「不需要」；手动改过后不再自动跟随。
+                </span>
               </label>
             </div>
 

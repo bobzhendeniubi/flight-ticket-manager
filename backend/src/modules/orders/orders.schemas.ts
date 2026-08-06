@@ -362,13 +362,13 @@ export const flightItemSchema = baseItemSchema.extend({
 });
 
 // 注：这里必须保持纯 ZodObject（orderItemInputSchema 是 discriminatedUnion，不接受 ZodEffects），
-// 故「hotelRoomTypeId 与 randomStarTier 互斥 + 随机池行必须有入住区间」的跨字段校验放在
+// 故「hotelRoomTypeId 与 randomStarTier 互斥 + 随机档行必须有入住区间」的跨字段校验放在
 // service 的 HOTEL 分支（priceAndValidateItems），那里本就是权威定价/校验闸。
 export const hotelItemSchema = baseItemSchema.extend({
   kind: z.literal('HOTEL'),
   hotelRoomTypeId: z.string().min(1).optional(),
-  // 星级随机池行（3=三星随机、4=四星随机）：客人买的是「N 星随机」，下单时不指定酒店，
-  // 占的是房控星级随机池的真库存，之后由房控落到具体酒店。与 hotelRoomTypeId 互斥。
+  // 星级随机档行（3=三星随机、4=四星随机）：客人买的是「N 星随机」，下单时不指定酒店，
+  // 占的是同星级酒店的合计余量（未落位随机单），之后由房控落到具体酒店。与 hotelRoomTypeId 互斥。
   randomStarTier: z.union([z.literal(3), z.literal(4)]).optional(),
   checkIn: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   checkOut: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),

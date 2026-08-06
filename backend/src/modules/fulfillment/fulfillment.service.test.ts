@@ -216,6 +216,108 @@ describe('FulfillmentService.update — 签证金额只允许签证任务', () =
   });
 });
 
+describe('FulfillmentService.update — 签证公司（visaSupplier）持久化', () => {
+  /** 装一个签证任务的 prisma stub，返回 update() 的调用记录 */
+  function stubVisaTask(type = 'VISA_APPLICATION') {
+    const findUnique = vi.fn().mockResolvedValue({
+      id: 't1',
+      type,
+      status: 'PENDING',
+      orderItem: { orderId: 'o1', order: { status: 'PAID', deletedAt: null } },
+    });
+    const update = vi.fn().mockResolvedValue({
+      id: 't1',
+      orderItemId: 'oi1',
+      type,
+      status: 'PENDING',
+      data: null,
+      notes: null,
+      attempts: 0,
+      scheduledAt: null,
+      startedAt: null,
+      completedAt: null,
+      failureReason: null,
+      assigneeUserId: null,
+      visaSupplier: 'XX签证服务',
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      orderItem: {
+        id: 'oi1',
+        kind: 'VISA',
+        description: '签证',
+        quantity: 1,
+        orderId: 'o1',
+        order: { id: 'o1', orderNumber: 'A001' },
+      },
+    });
+    (prisma as unknown as { fulfillmentTask: unknown }).fulfillmentTask = { findUnique, update };
+    return update;
+  }
+
+  it('写入签证公司并 trim（前后空白不入库）', async () => {
+    const update = stubVisaTask();
+    const service = new FulfillmentService();
+
+    await service.update('t1', { visaSupplier: '  XX签证服务  ' });
+
+    expect(update.mock.calls[0][0].data.visaSupplier).toBe('XX签证服务');
+  });
+
+  it('空串 / null 视为清空（回到「未填」，不留空白字符串）', async () => {
+    const service = new FulfillmentService();
+
+    const updateEmpty = stubVisaTask();
+    await service.update('t1', { visaSupplier: '   ' });
+    expect(updateEmpty.mock.calls[0][0].data.visaSupplier).toBeNull();
+
+    const updateNull = stubVisaTask();
+    await service.update('t1', { visaSupplier: null });
+    expect(updateNull.mock.calls[0][0].data.visaSupplier).toBeNull();
+  });
+
+  it('只给签证公司不动金额三字段（互相独立）', async () => {
+    const update = stubVisaTask();
+    const service = new FulfillmentService();
+
+    await service.update('t1', { visaSupplier: 'XX签证服务' });
+
+    const data = update.mock.calls[0][0].data;
+    expect(data).not.toHaveProperty('visaUnitCostUsd');
+    expect(data).not.toHaveProperty('visaFxRate');
+    expect(data).not.toHaveProperty('visaUnitCostCny');
+  });
+
+  it('序列化带出 visaSupplier（列表/详情前端据此展示）', async () => {
+    stubVisaTask();
+    const service = new FulfillmentService();
+
+    const task = await service.update('t1', { visaSupplier: 'XX签证服务' });
+
+    expect(task.visaSupplier).toBe('XX签证服务');
+  });
+
+  it('非签证任务带签证公司 → 抛 ConflictError（不写库）', async () => {
+    const update = stubVisaTask('FLIGHT_TICKETING');
+    const service = new FulfillmentService();
+
+    await expect(service.update('t1', { visaSupplier: 'XX签证服务' })).rejects.toBeInstanceOf(
+      ConflictError,
+    );
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it('批量端点把签证公司原样透传给 update()（不另写规则）', async () => {
+    const service = new FulfillmentService();
+    const updateSpy = vi.spyOn(service, 'update').mockResolvedValue({} as never);
+
+    const res = await service.batchSetVisaCost(['t1', 't2'], { visaSupplier: 'XX签证服务' });
+
+    expect(updateSpy).toHaveBeenNthCalledWith(1, 't1', { visaSupplier: 'XX签证服务' });
+    expect(updateSpy).toHaveBeenNthCalledWith(2, 't2', { visaSupplier: 'XX签证服务' });
+    expect(res).toEqual({ successCount: 2, failureCount: 0, failures: [] });
+  });
+});
+
 describe('FulfillmentService.listByOrder — 签证台过滤自备签乘客', () => {
   it('乘客查询排除 visaExempt=true（客人自备签证不进签证台）', async () => {
     const orderItemFindMany = vi.fn().mockResolvedValue([]);

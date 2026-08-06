@@ -1,10 +1,10 @@
 /**
- * 星级随机池「落酒店」守卫 · 单元测试（vitest）
+ * 星级随机档「落位」守卫 · 单元测试（vitest）
  *
- * 落酒店 = 把「N 星随机」的池占用行（kind=HOTEL、无房型、randomStarTier 非空）落到具体酒店，
+ * 落位 = 把「N 星随机」的未落位随机单（kind=HOTEL、无房型、randomStarTier 非空）落到具体酒店，
  * 走的是与换酒店同一条通道（swapItemHotel）。这里钉死事务之前的三条守卫：
- *   1. 池行可以进换酒店通道（不再被「该行不含酒店」挡掉）——它本来就没有酒店，正是要落一个；
- *   2. 目标酒店星级（Hotel.starRating）低于池档次 = 降级交付 → 拒；同级 / 升级放行；
+ *   1. 未落位随机单可以进换酒店通道（不再被「该行不含酒店」挡掉）——它本来就没有酒店，正是要落一个；
+ *   2. 目标酒店星级（Hotel.starRating）低于随机档档次 = 降级交付 → 拒；同级 / 升级放行；
  *   3. 具体酒店行的既有行为一个字不变（同房型仍拒、非酒店行仍拒、鉴权不放宽）。
  *
  * 只覆盖事务前的守卫（不需要真 DB）；落地后的写入与占用转移由换酒店集成测试覆盖。
@@ -28,7 +28,7 @@ import { OrderService } from './orders.service.js';
 const service = new OrderService();
 const admin = { userId: 'admin-1', role: UserRole.ADMIN };
 
-/** 池占用行 fixture：kind=HOTEL、hotelRoomTypeId 为空、randomStarTier 非空。*/
+/** 未落位随机单 fixture：kind=HOTEL、hotelRoomTypeId 为空、randomStarTier 非空。*/
 function poolItem(tier: number) {
   return {
     id: 'item-1',
@@ -65,7 +65,7 @@ beforeEach(() => {
   mockPrisma.hotelBlockPeriod.findMany.mockResolvedValue([]);
 });
 
-describe('星级随机池落酒店：目标酒店星级守卫', () => {
+describe('星级随机档落位：目标酒店星级守卫', () => {
   it('四星随机落到三星酒店 → 拒（降级交付，客人买的是四星）', async () => {
     mockPrisma.orderItem.findUnique.mockResolvedValue(poolItem(4));
     mockPrisma.hotelRoomType.findUnique.mockResolvedValue(targetRoomType(3));
@@ -117,7 +117,7 @@ describe('星级随机池落酒店：目标酒店星级守卫', () => {
   });
 });
 
-describe('星级随机池落酒店：具体酒店行行为不变（回归）', () => {
+describe('星级随机档落位：具体酒店行行为不变（回归）', () => {
   it('既无房型又无池档次的 HOTEL 行 → 仍拒「该行不含酒店」', async () => {
     mockPrisma.orderItem.findUnique.mockResolvedValue({ ...poolItem(4), randomStarTier: null });
 

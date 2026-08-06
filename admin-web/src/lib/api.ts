@@ -319,14 +319,25 @@ export interface BatchOrderPassenger {
   nationality?: string;
   lastName?: string;
   firstName?: string;
-  gender?: 'M' | 'F';
+  /** 性别（M/F/X；与单笔录单的护照 OCR 同口径，X=MRZ 第三性别） */
+  gender?: 'M' | 'F' | 'X';
   /** 护照签发国（2 位国家码，如 CN）。OTA 名单「签发国」列解析而来。 */
   passportIssueCountry?: string;
   passportExpiry?: string;
+  /** 中文姓名（可选；OCR/表格导入能识别时带出；后端 passengerInputSchema 已支持） */
+  chineseName?: string;
+  /** 护照签发日期 YYYY-MM-DD（可选；OCR/表格导入能识别时带出） */
+  passportIssueDate?: string;
+  /** 护照签发地点（自由文本；可选；OCR 能识别时带出）。区别于 ISO-2 签发国。 */
+  passportIssuePlace?: string;
+  /** 护照图 data URL（OCR 识别后附带，后端持久化为 Passenger.passportPhotoUrl） */
+  passportPhotoUrl?: string;
   /** 该乘客个别备注（选填）：与整批备注合并写入该乘客订单。 */
   note?: string;
 }
-export interface BatchCreateOrdersInput {
+// 批量创单 body 同样支持整批共用的签证状态 + 结构化备注四栏（后端 batchCreateOrdersBodySchema
+// 直接 spread 了 orderStructuredNotesShape，写入每张子单）——与 CreateOrderInput 同款 extends。
+export interface BatchCreateOrdersInput extends OrderStructuredNotes {
   productType?: BatchProductType;
   // FLIGHT_ONEWAY / FLIGHT_ROUNDTRIP
   /** 向后兼容旧字段名；优先用 outboundScheduleId */
@@ -1513,13 +1524,37 @@ export interface FulfillmentTask {
   visaFxRate?: number | null;
   /** 签证人均成本·人民币（入账权威；未设置=null → 财务回退产品主数据成本） */
   visaUnitCostCny?: number | null;
+  /** 签证公司（本次送签的供应商；仅签证任务，未填=null） */
+  visaSupplier?: string | null;
 }
 
-/** 设置/清空签证任务人均成本的入参（三字段独立可空；全 null=清空回退产品成本） */
+/**
+ * 设置/清空签证任务人均成本 + 签证公司的入参。
+ * 金额三字段独立可空（全 null=清空回退产品成本）；visaSupplier 与金额**互相独立**——
+ * 只传 visaSupplier 不动金额，只传金额不动公司。
+ */
 export interface VisaTaskCostInput {
   visaUnitCostUsd?: number | null;
   visaFxRate?: number | null;
   visaUnitCostCny?: number | null;
+  /** 签证公司（空串/null = 清空） */
+  visaSupplier?: string | null;
+}
+
+/**
+ * 美金汇率（按生效日）：财务加一条「某日起 x.xx」，区间由下一条的生效日隐含。
+ * 取数 = 「生效日 ≤ 目标日期的最新一条」；折算值当场固化在任务上，改表不追溯旧任务。
+ */
+export interface UsdFxRateDto {
+  id: string;
+  /** 生效日 YYYY-MM-DD */
+  effectiveFrom: string;
+  /** USD→CNY 汇率 */
+  rate: number;
+  note: string | null;
+  /** 最近更新人 userId */
+  updatedBy: string | null;
+  updatedAt: string;
 }
 
 /** GET /fulfillment-tasks 列表查询（与 backend listFulfillmentQuerySchema 对齐） */
@@ -1834,26 +1869,27 @@ export interface SettlementRateWriteEntry {
 // ── 房控（酒店包房周期 + 销控板 / 远期视图）──────────────────────────────
 // 与 backend/src/modules/hotel-control/hotel-control.service.ts 对齐
 /**
- * 星级随机池档次：3=三星随机、4=四星随机。
- * 池是**真库存**（先按星级切总量、客人下单只占池、之后房控落到具体酒店），
- * 与具体酒店的包房互不扣减 —— 选明月扣明月，选随机扣池。
+ * 星级随机档次：3=三星随机、4=四星随机。
+ * 随机档**不是**单独切的库存，而是同星级酒店库存的派生聚合：
+ *   随机N星余量 = Σ(同星级酒店余量) − 未落位随机单占用
+ * 卖具体酒店、卖随机、把随机单落位到具体酒店，三者都保持这个合计对得上账。
  */
 export type RandomStarTier = 3 | 4;
 export const RANDOM_STAR_TIERS: RandomStarTier[] = [3, 4];
-/** 池档次展示名（与后端 randomStarTierLabel 一致）。 */
+/** 随机档展示名（与后端 randomStarTierLabel 一致）。 */
 export function randomStarTierLabel(tier: number): string {
   return `${['一', '二', '三', '四', '五'][tier - 1] ?? String(tier)}星随机`;
 }
 
 const POOL_OPTION_PREFIX = 'random-star-tier:';
 /**
- * 「酒店」下拉里星级随机池选项的哨兵值（房控包房周期表单 + 录单酒店行共用）。
+ * 录单「酒店」下拉里星级随机档选项的哨兵值（客人只认星级、不指定酒店时选它）。
  * 用带冒号的前缀，与 cuid 形态的真实酒店 id 不会撞。
  */
 export function poolOptionValue(tier: RandomStarTier): string {
   return `${POOL_OPTION_PREFIX}${tier}`;
 }
-/** 反解哨兵值；不是池选项 → null（即选中的是真实酒店 id 或空）。 */
+/** 反解哨兵值；不是随机档选项 → null（即选中的是真实酒店 id 或空）。 */
 export function poolTierFromOptionValue(value: string): RandomStarTier | null {
   if (!value.startsWith(POOL_OPTION_PREFIX)) return null;
   const tier = Number(value.slice(POOL_OPTION_PREFIX.length));
@@ -1862,11 +1898,11 @@ export function poolTierFromOptionValue(value: string): RandomStarTier | null {
 
 export interface HotelBlockPeriod {
   id: string;
-  /** 池周期为 null（此时 randomStarTier 非空） */
+  /** 历史遗留的随机档周期为 null（此时 randomStarTier 非空，已停用不计入任何余量） */
   hotelId: string | null;
-  /** 具体酒店 = 酒店名；池周期 = 「三星随机」/「四星随机」。恒非空，可直接展示 */
+  /** 具体酒店 = 酒店名；历史随机档周期 = 「三星随机」/「四星随机」。恒非空，可直接展示 */
   hotelName: string;
-  /** 非空 = 星级随机池周期 */
+  /** 非空 = 历史遗留的随机档周期（已停用，仅保留供查账；新周期一律挂具体酒店） */
   randomStarTier: RandomStarTier | null;
   dateFrom: string; // YYYY-MM-DD
   dateTo: string; // YYYY-MM-DD（闭区间）
@@ -1876,10 +1912,9 @@ export interface HotelBlockPeriod {
   updatedAt: string;
 }
 
-/** 建包房周期：hotelId（具体酒店）与 randomStarTier（星级随机池）二选一必填。 */
+/** 建包房周期：只能挂在具体酒店上（随机档是同星级合计，后端拒绝为它单独建周期）。 */
 export interface BlockPeriodWriteInput {
-  hotelId?: string;
-  randomStarTier?: RandomStarTier;
+  hotelId: string;
   dateFrom: string;
   dateTo: string;
   rooms: number;
@@ -1889,16 +1924,21 @@ export interface BlockPeriodWriteInput {
 
 export interface HotelControlBoardHotel {
   /**
-   * 分组键。具体酒店 = 真实酒店 id；星级随机池 = 合成键 `random-star-{tier}`
-   * —— 池组不是酒店，别拿它去调按 hotelId 的接口（护照导出等），判定一律看 randomStarTier。
+   * 分组键。具体酒店 = 真实酒店 id；随机档聚合组 = 合成键 `random-star-{tier}`
+   * —— 聚合组不是酒店，别拿它去调按 hotelId 的接口（护照导出等），判定一律看 randomStarTier。
    */
   hotelId: string;
-  /** 具体酒店 = 酒店名；池组 = 「三星随机」/「四星随机」 */
+  /** 具体酒店 = 酒店名；聚合组 = 「三星随机」/「四星随机」 */
   hotelName: string;
-  /** 非空 = 星级随机池虚拟组 */
+  /** 非空 = 随机档聚合组（同星级酒店合计视图） */
   randomStarTier: RandomStarTier | null;
-  /** 最新周期（dateFrom 最晚且有价）的切房单价；都没填则 null */
+  /** 最新周期（dateFrom 最晚且有价）的切房单价；聚合组无单一单价 → null */
   unitPrice: number | null;
+  /**
+   * 逐日数列（床位口径）。聚合组的语义与酒店行不同：
+   *   block = 同星级各酒店包房之和；used = 尚未落到具体酒店的随机单；
+   *   remaining = Σ(同星级酒店余量) − 未落位随机单 ⇒ 该行 block − used ≠ remaining。
+   */
   rows: { block: number[]; used: number[]; remaining: number[] };
 }
 
@@ -3563,6 +3603,22 @@ export const api = {
     id: string,
     body: Partial<{ costPriceCny: number | null }>,
   ) => apiFetch<{ id: string }>(`/finances/cost/transfer/${id}`, { method: 'PATCH', token, body }),
+
+  // ── 美金汇率表（按生效日）────────────────────────────────────────────────────
+  // 列表按生效日倒序（最近生效的在最前）
+  listUsdFxRates: (token: string) =>
+    apiFetch<{ rates: UsdFxRateDto[] }>('/finances/usd-fx-rates', { token }),
+  /** 取某日生效的汇率（≤date 最新一条）；未维护 → { rate: null }，前端让用户手填 */
+  getEffectiveUsdFxRate: (token: string, date: string) =>
+    apiFetch<{ rate: UsdFxRateDto | null }>(
+      `/finances/usd-fx-rates/effective?date=${encodeURIComponent(date)}`,
+      { token },
+    ),
+  /** 按生效日幂等 upsert（同一天重复提交只覆盖不新增） */
+  upsertUsdFxRate: (
+    token: string,
+    body: { effectiveFrom: string; rate: number; note?: string | null },
+  ) => apiFetch<{ rate: UsdFxRateDto }>('/finances/usd-fx-rates', { method: 'PUT', token, body }),
 
   // 财务核对 xlsx 导出（Blob 直接下载）
   downloadFinanceExport: async (

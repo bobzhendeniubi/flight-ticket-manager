@@ -60,7 +60,7 @@ import { localDate } from '../finances/finances.cost.service.js';
 import { getSettlementRate } from '../settlement-rates/settlement-rates.service.js';
 import {
   assertHotelPhysicalFit,
-  assertRoomScopePhysicalFit,
+  assertRandomTierFit,
   checkHotelPhysicalFit,
   randomStarTierLabel,
   type ProspectiveOccupancy,
@@ -1025,7 +1025,7 @@ export class OrderService {
               flightScheduleId: p.flightScheduleId ?? null,
               flightCabin: p.flightCabin ?? null,
               hotelRoomTypeId: p.hotelRoomTypeId ?? null,
-              // 星级随机池占用行（未落具体酒店）；落地后由换酒店流程改写并清空本列
+              // 未落位随机单占房行（未落具体酒店）；落位后由换酒店流程改写并清空本列
               randomStarTier: p.randomStarTier ?? null,
               hotelCheckIn: p.hotelCheckIn ?? null,
               hotelCheckOut: p.hotelCheckOut ?? null,
@@ -1485,7 +1485,7 @@ export class OrderService {
       // （扣座时 ECONOMY sold += quantity − businessUpgradeCount，BUSINESS sold += businessUpgradeCount）
       businessUpgradeCount?: number;
       hotelRoomTypeId?: string;
-      // 星级随机池占用行（3=三星随机、4=四星随机）：与 hotelRoomTypeId 互斥
+      // 未落位随机单占房行（3=三星随机、4=四星随机）：与 hotelRoomTypeId 互斥
       randomStarTier?: number;
       hotelCheckIn?: Date;
       hotelCheckOut?: Date;
@@ -1566,32 +1566,27 @@ export class OrderService {
         const rooms = item.roomsBilled ?? 1;
         // 成本快照（每间每晚）：仅有产品 id 时可从 DB 取；无 id 的自由行手录成本未知 → 留空。
         let hotelUnitCost: number | undefined;
-        // ── 星级随机池行（三星随机 / 四星随机）：不指定酒店，占房控池的真库存 ──
+        // ── 星级随机档行（三星随机 / 四星随机）：不指定酒店，占同星级酒店的合计余量 ──
         // 校验放这里而不是 zod：orderItemInputSchema 是 discriminatedUnion，不接受 ZodEffects。
         if (item.randomStarTier != null) {
           if (item.hotelRoomTypeId) {
-            throw new BadRequestError('酒店行不能同时指定具体房型和星级随机池');
+            throw new BadRequestError('酒店行不能同时指定具体房型和星级随机档');
           }
           if (!item.checkIn || !item.checkOut) {
-            throw new BadRequestError('星级随机池房行必须填写入住/退房日期（池库存按晚扣减）');
+            throw new BadRequestError('星级随机档房行必须填写入住/退房日期（余量按晚扣减）');
           }
-          // 池行没有房型可查价 —— 走与「无产品 id 的地面行」完全相同的权威口径：
-          // 仅后台/代理录单可手录售价，对外角色一律拒（否则公开下单能提交 1 元随机池房行）。
+          // 随机档行没有房型可查价 —— 走与「无产品 id 的地面行」完全相同的权威口径：
+          // 仅后台/代理录单可手录售价，对外角色一律拒（否则公开下单能提交 1 元随机档房行）。
           if (!allowClientPricedGround) {
-            throw new BadRequestError('星级随机池房行仅支持后台/代理录单');
+            throw new BadRequestError('星级随机档房行仅支持后台/代理录单');
           }
-          // 成本快照 = 该池覆盖入住首晚的包房周期切房单价（CNY/间/晚），服务端从 DB 取，
-          // 不信前端 —— 池周期没填单价 / 该晚无周期覆盖 → 留空，毛利显示「未知」，不落 0 虚高。
-          hotelUnitCost = await resolveRandomPoolNightlyCost(item.randomStarTier, item.checkIn);
-          // 前瞻闸：口径与具体酒店完全一致（物理房间、异性不能拼一间），只是作用域换成池。
-          // 池未配任何周期 / 该晚无周期覆盖 → 视为未管控，不拦截（房控哲学：未配包房 ≠ 售罄）。
-          const poolNights = buildStayNightDates(new Date(item.checkIn), new Date(item.checkOut));
-          if (poolNights.length > 0) {
-            await assertRoomScopePhysicalFit(
-              { randomStarTier: item.randomStarTier },
-              poolNights,
-              toProspectiveOccupancy(rooms, passengers),
-            );
+          // 成本快照（每间每晚）：服务端从 DB 取同星级酒店当晚的切房单价，不信前端。
+          hotelUnitCost = await resolveRandomTierNightlyCost(item.randomStarTier, item.checkIn);
+          // 可售判定：同星级酒店合计余量（含已落位与未落位随机单的占用）够不够本次这几间。
+          // 该档次整段无任何同星级包房周期 → 视为未管控，不拦截（房控哲学：未配包房 ≠ 售罄）。
+          const stayNights = buildStayNightDates(new Date(item.checkIn), new Date(item.checkOut));
+          if (stayNights.length > 0) {
+            await assertRandomTierFit(item.randomStarTier, stayNights, rooms);
           }
         }
         if (item.hotelRoomTypeId) {
@@ -5503,12 +5498,13 @@ export class OrderService {
    *   - orderItemId 必须属于本订单且 kind=HOTEL，或 kind=BUNDLE 且已盖章 hotelRoomTypeId。
    *   - newHotelRoomTypeId 必须存在、其酒店在架；与当前房型相同 → 400（无意义换房）。
    *
-   * 「落酒店」（星级随机池行 → 具体酒店）走的是同一条通道：kind=HOTEL、无房型、randomStarTier
+   * 「落位」（未落位随机单 → 具体酒店）走的是同一条通道：kind=HOTEL、无房型、randomStarTier
    * 非空的行（客人买的是「N 星随机」），本次把它落到具体酒店 —— 写 hotelRoomTypeId + 清
-   * randomStarTier，占用从池转到该酒店（池与酒店互不扣减，不会重复计数）。此时：
-   *   - 目标酒店星级（Hotel.starRating）不得低于池档次（降级交付 → 400；同级/升级放行）；
-   *   - 目标酒店逐晚余量必须校验（落地就是新增占房，没有"同酒店净不变"的豁免）；
-   *   - 审计 before.hotelName = 池名（「三星随机」），摘要渲染成「换酒店 三星随机 → XX酒店·房型」。
+   * randomStarTier，占用从「未落位」转到该酒店。随机档余量 = 同星级酒店余量合计 − 未落位占用，
+   * 故这一转：该酒店用房 +1、未落位占用 −1 ⇒ **随机档合计不变**（对账恒等）。此时：
+   *   - 目标酒店星级（Hotel.starRating）不得低于随机档档次（降级交付 → 400；同级/升级放行）；
+   *   - 目标酒店逐晚余量必须校验（落位就是往该酒店新增占房，没有"同酒店净不变"的豁免）；
+   *   - 审计 before.hotelName = 档次名（「三星随机」），摘要渲染成「换酒店 三星随机 → XX酒店·房型」。
    *
    * 逐晚余量校验（仅当换到不同酒店时才做——同酒店换房型净房量不变，不受本单自身占用影响）：
    *   - block[i] > 0（该晚被房控周期管控）且 remaining[i] < 本行房间数 → 拒单，列出不足的夜晚。
@@ -5580,8 +5576,8 @@ export class OrderService {
     if (!item || item.orderId !== orderId) {
       throw new NotFoundError('订单项不存在或不属于该订单');
     }
-    // 「落酒店」：星级随机池行（kind=HOTEL、无房型、randomStarTier 非空）走同一条换酒店通道 ——
-    // 从池落到具体酒店。占用随之从池转到该酒店（写 hotelRoomTypeId + 清 randomStarTier）。
+    // 「落位」：未落位随机单（kind=HOTEL、无房型、randomStarTier 非空）走同一条换酒店通道 ——
+    // 落到具体酒店。占用随之从「未落位」转到该酒店（写 hotelRoomTypeId + 清 randomStarTier）。
     const isRandomPoolRow = item.kind === OrderItemKind.HOTEL && item.randomStarTier != null;
     const isHotelRow =
       item.kind === OrderItemKind.HOTEL ||
@@ -5617,7 +5613,7 @@ export class OrderService {
     if (!isRandomPoolRow && !oldRoomType) {
       throw new NotFoundError('原酒店房型数据异常，无法换酒店');
     }
-    // 池行落地的星级约束：客人买的是「N 星随机」，落到低于该星级的酒店等于降级交付 ——
+    // 随机单落位的星级约束：客人买的是「N 星随机」，落到低于该星级的酒店等于降级交付 ——
     // 拒绝；同级或更高（升级）放行。星级分类直接取酒店档案 Hotel.starRating。
     if (isRandomPoolRow && newRoomType.hotel.starRating < item.randomStarTier!) {
       throw new BadRequestError(
@@ -5650,7 +5646,7 @@ export class OrderService {
         ? buildStayNightDates(item.hotelCheckIn, item.hotelCheckOut)
         : [];
     let untrackedNights: string[] = [];
-    // 池行落地一律要校验目标酒店（池与酒店互不扣减，落地就是往目标酒店新增占房）；
+    // 随机单落位一律要校验目标酒店（落位就是往目标酒店新增占房）；
     // 具体酒店行只在跨酒店时校验（同酒店换房型净房量不变）。
     if ((isRandomPoolRow || oldRoomType!.hotelId !== newRoomType.hotelId) && nightDates.length > 0) {
       // 物理房间口径前瞻闸（口径同下单闸 / 销控板看板）：把本单要挪进目标酒店的占房塞进
@@ -5731,7 +5727,7 @@ export class OrderService {
         where: { id: item.id },
         data: {
           hotelRoomTypeId: newRoomType.id,
-          // 池行落地：清空池标记 —— 占用从星级随机池转到该酒店，两边不会重复计数
+          // 随机单落位：清空随机档标记 —— 占用从「未落位」转到该酒店，随机档合计不变
           randomStarTier: null,
           description: newDescription,
           ...(swapCost
@@ -5770,7 +5766,7 @@ export class OrderService {
       // 必然是不同房型（否则本就是同一份预订，误伤后果也无实际差异），比单凭酒店名更贴近"这条订单
       // 行"的身份。同时把 roomType 也一并改写到新房型名（旧版只改 hotelName，遗留一个在目标酒店根本
       // 不存在的旧房型名，分房表看着货不对板）。
-      // 池行落地没有「旧酒店名」可匹配（本就没落过酒店）→ 整段跳过，绝不拿 undefined 去比对
+      // 随机单落位没有「旧酒店名」可匹配（本就没落过酒店）→ 整段跳过，绝不拿 undefined 去比对
       // 分房组的 hotelName（那会把所有没填酒店名的组一并误改）。
       const roomAssignmentRaw = oldRoomType ? order.roomAssignment : null;
       if (roomAssignmentRaw && typeof roomAssignmentRaw === 'object' && !Array.isArray(roomAssignmentRaw)) {
@@ -5862,7 +5858,7 @@ export class OrderService {
         orderItemId: item.id,
         before: {
           hotelRoomTypeId: item.hotelRoomTypeId,
-          // 池行落地：before 没有真实酒店 → 写池名（「三星随机」），
+          // 随机单落位：before 没有真实酒店 → 写档次名（「三星随机」），
           // 审计摘要自然渲染成「换酒店 三星随机 → XX酒店·XX房型」
           hotelName: oldRoomType
             ? oldRoomType.hotel.name
@@ -6997,33 +6993,43 @@ export function buildStayNightDates(checkIn: Date, checkOut: Date): string[] {
 }
 
 /**
- * 星级随机池行的成本快照来源：取覆盖入住首晚的池周期切房单价（CNY/间/晚）。
- * 池行没有具体房型可查价，切房单价就是我们付给酒店的真实每间每晚成本 —— 与具体酒店行
- * 取 HotelRoomType.costPriceCny 语义一致（都是成本侧，售价另说）。
+ * 星级随机档行的成本快照来源：取**同星级酒店**覆盖入住首晚的包房周期切房单价（CNY/间/晚）里
+ * 的最高价。随机档行没有具体房型可查价，切房单价就是我们付给酒店的真实每间每晚成本
+ * —— 与具体酒店行取 HotelRoomType.costPriceCny 语义一致（都是成本侧，售价另说）。
  *
- * 多条周期叠加覆盖同一晚时取有价周期中 dateFrom 最晚的一条（"最新一次切房的价"，
- * 与销控板 unitPrice 展示口径一致）。查不到 / 都没填价 → undefined（毛利显示「未知」，不落 0 虚高）。
+ * 为什么取**最高**而不是平均/最低：这单最终会被房控落到该星级里的**某一家**酒店，落到哪家
+ * 下单这一刻并不知道。取最高 = 最坏情况成本，毛利宁可报低不报高（与「产品未录成本就留空、
+ * 绝不落 0 虚高」同一取向）。同一家酒店有多条周期覆盖该晚时，取其有价周期中 dateFrom 最晚
+ * 的一条（"最新一次切房的价"，与销控板 unitPrice 展示口径一致）。
+ *
+ * 该星级一家酒店都没切房 / 都没填价 → undefined（毛利显示「未知」，不落 0 虚高）。
+ * 注：不读存量的随机档池周期 —— 随机档已改为同星级酒店的派生聚合，那份数据只留作审计。
  */
-async function resolveRandomPoolNightlyCost(
+async function resolveRandomTierNightlyCost(
   randomStarTier: number,
   checkIn: string,
 ): Promise<number | undefined> {
   const d = new Date(`${checkIn}T00:00:00.000Z`);
   if (Number.isNaN(d.getTime())) return undefined;
-  const period = await prisma.hotelBlockPeriod.findFirst({
+  const periods = await prisma.hotelBlockPeriod.findMany({
     where: {
-      hotelId: null,
-      randomStarTier,
+      hotel: { starRating: randomStarTier, intlFiveStar: false },
       dateFrom: { lte: d },
       dateTo: { gte: d },
       unitPrice: { not: null },
     },
     orderBy: { dateFrom: 'desc' },
-    select: { unitPrice: true },
+    select: { hotelId: true, unitPrice: true },
   });
-  if (!period?.unitPrice) return undefined;
-  const cost = Number(period.unitPrice.toString());
-  return Number.isFinite(cost) ? cost : undefined;
+  // 每家酒店只认其最新一条有价周期（findMany 已按 dateFrom 倒序 → 首次见到的即最新）
+  const latestByHotel = new Map<string, number>();
+  for (const p of periods) {
+    if (!p.hotelId || p.unitPrice == null || latestByHotel.has(p.hotelId)) continue;
+    const price = Number(p.unitPrice.toString());
+    if (Number.isFinite(price)) latestByHotel.set(p.hotelId, price);
+  }
+  if (latestByHotel.size === 0) return undefined;
+  return Math.max(...latestByHotel.values());
 }
 
 export function resolveBundleHotelStamp(
@@ -8306,8 +8312,8 @@ export function serializeOrder<T extends OrderLike>(
         ...(redact
           ? { metadata: redactItemMetadataForExternal((i as { metadata?: unknown }).metadata) }
           : {}),
-        // 星级随机池行还没落到具体酒店 → 用池名（「四星随机」）当酒店名，让各处「住哪」
-        // 一栏如实显示"买的是随机、待落地"，而不是空白（落地后本列被清空，自然回到真实酒店名）。
+        // 未落位随机单还没落到具体酒店 → 用档次名（「四星随机」）当酒店名，让各处「住哪」
+        // 一栏如实显示"买的是随机、待落位"，而不是空白（落位后本列被清空，自然回到真实酒店名）。
         hotelName:
           ownHotelName ??
           bundleFallback?.hotelRoomType?.hotel?.name ??

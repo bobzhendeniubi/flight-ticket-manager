@@ -677,6 +677,16 @@ export class FulfillmentService {
       data.visaUnitCostCny = resolved.cny;
     }
 
+    // 签证公司：与金额三字段互相独立（只改公司不动金额）。同样只允许签证任务。
+    // 空串等同清空——前端清空输入框保存即回到「未填」，不留空白字符串。
+    if (body.visaSupplier !== undefined) {
+      if (existing.type !== FulfillmentType.VISA_APPLICATION) {
+        throw new ConflictError('签证公司只能设置在签证任务上');
+      }
+      const trimmed = body.visaSupplier?.trim() ?? '';
+      data.visaSupplier = trimmed === '' ? null : trimmed;
+    }
+
     const updated = await prisma.fulfillmentTask.update({
       where: { id },
       data,
@@ -770,8 +780,9 @@ export class FulfillmentService {
   }
 
   /**
-   * 批量设置签证任务的人均成本（签证公司按航班开统一单价是常态）。
+   * 批量设置签证任务的人均成本 / 签证公司（签证公司按航班开统一单价是常态）。
    * 逐条复用 update() 的单任务校验（仅签证任务 + 非负 + USD→CNY 折算），不另写规则；
+   * 金额与签证公司互相独立——只带 visaSupplier 的调用不会动金额，反之亦然。
    * 单条失败不影响其余，返回 failures 明细（镜像 batchUpdateStatus 的返回形状）。
    */
   async batchSetVisaCost(
@@ -780,6 +791,7 @@ export class FulfillmentService {
       visaUnitCostUsd?: number | null;
       visaFxRate?: number | null;
       visaUnitCostCny?: number | null;
+      visaSupplier?: string | null;
     },
   ): Promise<{
     successCount: number;
@@ -1058,6 +1070,7 @@ function serializeTask(
     visaUnitCostUsd?: Prisma.Decimal | number | null;
     visaFxRate?: Prisma.Decimal | number | null;
     visaUnitCostCny?: Prisma.Decimal | number | null;
+    visaSupplier?: string | null;
     createdAt: Date; updatedAt: Date;
   },
   item: { id: string; kind: OrderItemKind; description: string; quantity: number; orderId: string },
@@ -1079,6 +1092,8 @@ function serializeTask(
     visaUnitCostUsd: decOrNull(t.visaUnitCostUsd),
     visaFxRate: decOrNull(t.visaFxRate),
     visaUnitCostCny: decOrNull(t.visaUnitCostCny),
+    // 签证公司（本次送签的供应商；非签证任务/未填 = null）
+    visaSupplier: t.visaSupplier ?? null,
     createdAt: t.createdAt,
     updatedAt: t.updatedAt,
     item: {

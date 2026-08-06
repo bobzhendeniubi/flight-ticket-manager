@@ -29,6 +29,16 @@ describe('updateFulfillmentBodySchema — 签证金额字段', () => {
     expect(updateFulfillmentBodySchema.safeParse({ visaFxRate: 0 }).success).toBe(false);
     expect(updateFulfillmentBodySchema.safeParse({ visaUnitCostCny: -0.01 }).success).toBe(false);
   });
+
+  it('接受签证公司（可 null 清空），超长拒绝', () => {
+    expect(updateFulfillmentBodySchema.parse({ visaSupplier: 'XX签证服务' }).visaSupplier).toBe(
+      'XX签证服务',
+    );
+    expect(updateFulfillmentBodySchema.parse({ visaSupplier: null }).visaSupplier).toBeNull();
+    expect(updateFulfillmentBodySchema.safeParse({ visaSupplier: 'x'.repeat(101) }).success).toBe(
+      false,
+    );
+  });
 });
 
 describe('batchVisaTaskCostBodySchema — 批量设金额', () => {
@@ -39,6 +49,15 @@ describe('batchVisaTaskCostBodySchema — 批量设金额', () => {
     });
     expect(parsed.taskIds).toEqual(['t1', 't2']);
     expect(parsed.visaUnitCostCny).toBe(200);
+  });
+
+  it('也接受只带签证公司的批量提交（金额与公司互相独立）', () => {
+    const parsed = batchVisaTaskCostBodySchema.parse({
+      taskIds: ['t1', 't2'],
+      visaSupplier: 'XX签证服务',
+    });
+    expect(parsed.visaSupplier).toBe('XX签证服务');
+    expect(parsed.visaUnitCostCny).toBeUndefined();
   });
 
   it('拒绝空 taskIds 与超上限（>100）', () => {

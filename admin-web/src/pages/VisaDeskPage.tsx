@@ -479,24 +479,38 @@ function visaCostSummary(task: FulfillmentTask): string {
 interface VisaCostControlProps {
   task: FulfillmentTask;
   token: string;
+  /** 当日生效的美金汇率（来自汇率表）；未维护=null，此时汇率格留空由人手填 */
+  defaultFxRate: number | null;
   onSaved: () => void;
 }
 /**
- * 签证人均成本编辑：美金单价+汇率（自动折人民币）或直填人民币。
- * 保存即调 setVisaTaskCost；清空三格保存 = 回退产品主数据成本。
+ * 签证人均成本 + 签证公司编辑：美金单价 × 汇率（自动折人民币）或直填人民币。
+ * 汇率默认带出**当日生效汇率**（仍可手改）；折算值当场固化在任务上，
+ * 之后财务改汇率表不会追溯本条。保存即调 setVisaTaskCost；清空三格保存 = 回退产品主数据成本。
  */
-function VisaCostControl({ task, token, onSaved }: VisaCostControlProps) {
+function VisaCostControl({ task, token, defaultFxRate, onSaved }: VisaCostControlProps) {
   const [editing, setEditing] = useState(false);
   const [usd, setUsd] = useState('');
   const [rate, setRate] = useState('');
   const [cny, setCny] = useState('');
+  const [supplier, setSupplier] = useState('');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // 汇率格是否用了汇率表带出的默认值（给出「当日汇率」提示，避免用户以为是历史值）
+  const [rateFromTable, setRateFromTable] = useState(false);
 
   const startEdit = () => {
     setUsd(task.visaUnitCostUsd != null ? String(task.visaUnitCostUsd) : '');
-    setRate(task.visaFxRate != null ? String(task.visaFxRate) : '');
+    // 本条已固化过汇率 → 原样回显（绝不被新汇率覆盖）；未设置过才带当日生效汇率
+    if (task.visaFxRate != null) {
+      setRate(String(task.visaFxRate));
+      setRateFromTable(false);
+    } else {
+      setRate(defaultFxRate != null ? String(defaultFxRate) : '');
+      setRateFromTable(defaultFxRate != null);
+    }
     setCny(task.visaUnitCostCny != null ? String(task.visaUnitCostCny) : '');
+    setSupplier(task.visaSupplier ?? '');
     setError(null);
     setEditing(true);
   };
@@ -529,6 +543,8 @@ function VisaCostControl({ task, token, onSaved }: VisaCostControlProps) {
       // cnyNum 为 null（三格全空）= 清空回退产品成本
       payload = { visaUnitCostUsd: null, visaFxRate: null, visaUnitCostCny: cnyNum };
     }
+    // 签证公司与金额同一次提交（后端两者互相独立）；空串 = 清空
+    payload.visaSupplier = supplier.trim();
     setSaving(true);
     setError(null);
     try {
@@ -545,6 +561,15 @@ function VisaCostControl({ task, token, onSaved }: VisaCostControlProps) {
   if (!editing) {
     return (
       <div className="flex flex-col items-center gap-0.5">
+        {/* 签证公司（财务对账用）——此前只能塞备注里，现在单列一行 */}
+        <span
+          className={
+            task.visaSupplier ? 'text-[11px] text-ink-soft' : 'text-[11px] text-ink-muted'
+          }
+          title="签证公司（本次送签的供应商）"
+        >
+          {task.visaSupplier ? `签证公司：${task.visaSupplier}` : '签证公司未填'}
+        </span>
         <span
           className={
             task.visaUnitCostCny != null
@@ -555,7 +580,7 @@ function VisaCostControl({ task, token, onSaved }: VisaCostControlProps) {
           {visaCostSummary(task)}
         </span>
         <button type="button" className="btn-ghost py-0.5 px-2 text-[11px]" onClick={startEdit}>
-          {task.visaUnitCostCny != null ? '改金额' : '设金额'}
+          {task.visaUnitCostCny != null || task.visaSupplier ? '改金额/公司' : '设金额/公司'}
         </button>
       </div>
     );
@@ -563,6 +588,16 @@ function VisaCostControl({ task, token, onSaved }: VisaCostControlProps) {
 
   return (
     <div className="flex flex-col items-stretch gap-1 rounded-md border border-brand-200 bg-white p-2 text-left">
+      <div className="flex items-center gap-1">
+        <span className="whitespace-nowrap text-[11px] text-ink-muted">签证公司</span>
+        <input
+          className="input w-32 py-0.5 text-xs"
+          placeholder="如 XX签证服务"
+          value={supplier}
+          disabled={saving}
+          onChange={(e) => setSupplier(e.target.value)}
+        />
+      </div>
       <div className="flex items-center gap-1">
         <span className="text-[11px] text-ink-muted">$</span>
         <input
@@ -583,6 +618,9 @@ function VisaCostControl({ task, token, onSaved }: VisaCostControlProps) {
           onChange={(e) => setRate(e.target.value)}
         />
       </div>
+      {rateFromTable && (
+        <div className="text-[10px] text-ink-muted">汇率已按当日汇率表带出，可手改</div>
+      )}
       {autoCny != null && (
         <div className="text-[11px] text-emerald-700">= ¥{autoCny}/人（自动折算）</div>
       )}
@@ -617,7 +655,9 @@ function VisaCostControl({ task, token, onSaved }: VisaCostControlProps) {
           取消
         </button>
       </div>
-      <p className="text-[10px] text-ink-muted">三格留空保存 = 清空，财务回退产品成本</p>
+      <p className="text-[10px] text-ink-muted">
+        金额三格留空保存 = 清空，财务回退产品成本；签证公司留空 = 清空
+      </p>
     </div>
   );
 }
@@ -629,6 +669,8 @@ interface OrderGroupProps {
   onTogglePassenger: (passengerId: string) => void;
   onToggleOrderPassengers: (passengerIds: string[]) => void;
   token: string;
+  /** 当日生效的美金汇率（透传给签证金额控件做默认值）；未维护=null */
+  defaultFxRate: number | null;
   onChanged: () => void;
 }
 function OrderGroup({
@@ -637,6 +679,7 @@ function OrderGroup({
   onTogglePassenger,
   onToggleOrderPassengers,
   token,
+  defaultFxRate,
   onChanged,
 }: OrderGroupProps) {
   const passengers = task.passengers ?? [];
@@ -953,9 +996,14 @@ function OrderGroup({
               {showVisaDates ? '收起签证日期' : '签证日期'}
             </button>
             {missingCount > 0 && <span className="badge-danger text-[10px]">缺照 {missingCount}</span>}
-            {/* 签证人均成本（签证公司按航班开美金账单；财务据此核对）*/}
+            {/* 签证公司 + 人均成本（签证公司按航班开美金账单；财务据此核对）*/}
             <div className="mt-1 border-t border-slate-200 pt-1">
-              <VisaCostControl task={task} token={token} onSaved={onChanged} />
+              <VisaCostControl
+                task={task}
+                token={token}
+                defaultFxRate={defaultFxRate}
+                onSaved={onChanged}
+              />
             </div>
           </div>
         </td>
@@ -1052,6 +1100,39 @@ export function VisaDeskPage() {
   const [batchCostRate, setBatchCostRate] = useState('');
   const [batchCostCny, setBatchCostCny] = useState('');
   const [batchCostSubmitting, setBatchCostSubmitting] = useState(false);
+  // 批量设签证公司（与金额独立提交：只应用公司不动金额）
+  const [batchSupplier, setBatchSupplier] = useState('');
+  const [batchSupplierSubmitting, setBatchSupplierSubmitting] = useState(false);
+
+  /**
+   * 当日生效的美金汇率（财务在财务页按生效日维护）。
+   * 只做「默认值」：带进汇率输入框，仍可手改；折算值保存时固化在任务上，
+   * 之后财务改汇率表不会追溯已入账的任务。未维护 → null，汇率格留空由人手填。
+   */
+  const [todayFxRate, setTodayFxRate] = useState<number | null>(null);
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    const today = new Date();
+    const ymd = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(
+      today.getDate(),
+    ).padStart(2, '0')}`;
+    api
+      .getEffectiveUsdFxRate(token, ymd)
+      .then((d) => {
+        if (cancelled) return;
+        const rate = d.rate?.rate ?? null;
+        setTodayFxRate(rate);
+        // 汇率表有值且用户还没动过输入框 → 预填批量汇率格（仍可手改）
+        if (rate != null) setBatchCostRate((prev) => (prev === '' ? String(rate) : prev));
+      })
+      .catch(() => {
+        // 静默：取不到汇率就让用户手填，不打断签证台主流程
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [token]);
 
   useEffect(() => {
     if (!token) return;
@@ -1317,6 +1398,36 @@ export function VisaDeskPage() {
     }
   };
 
+  // 批量设签证公司：只带 visaSupplier，后端不会动这批任务的金额
+  const applyBatchSupplier = async () => {
+    if (!token || selectedTaskIds.length === 0 || batchSupplierSubmitting) return;
+    if (selectedTaskIds.length > NOTES_BATCH_LIMIT) {
+      alert(
+        `单次最多批量处理 ${NOTES_BATCH_LIMIT} 单，请分批操作（当前涉及 ${selectedTaskIds.length} 单）`,
+      );
+      return;
+    }
+    const next = batchSupplier.trim();
+    if (
+      !window.confirm(
+        `将所选 ${selectedTaskIds.length} 单的签证公司统一设为「${next || '（清空）'}」？金额不受影响。`,
+      )
+    )
+      return;
+    setBatchSupplierSubmitting(true);
+    setBatchResult(null);
+    try {
+      const res = await api.batchSetVisaTaskCost(token, selectedTaskIds, { visaSupplier: next });
+      setBatchResult(res);
+      if (res.failureCount === 0) setBatchSupplier('');
+      setRefreshNonce((n) => n + 1);
+    } catch (e: unknown) {
+      alert(e instanceof ApiError ? `批量设签证公司失败：${e.message}` : '批量设签证公司失败');
+    } finally {
+      setBatchSupplierSubmitting(false);
+    }
+  };
+
   return (
     <div className="space-y-6">
       <section className="flex flex-wrap items-end justify-between gap-3">
@@ -1526,6 +1637,30 @@ export function VisaDeskPage() {
               备注按订单级作用于所选乘客所属的 {selectedTaskIds.length} 单（上限 {NOTES_BATCH_LIMIT} 单）
             </span>
           </div>
+          {/* 批量设签证公司（与金额独立：只改公司不动金额）*/}
+          <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-brand-200/60 pt-3">
+            <label className="text-sm text-ink-soft">批量签证公司：</label>
+            <input
+              type="text"
+              className="input max-w-xs py-1.5 text-sm"
+              value={batchSupplier}
+              placeholder="如 XX签证服务"
+              disabled={batchSupplierSubmitting || submitting}
+              onChange={(e) => setBatchSupplier(e.target.value)}
+            />
+            <button
+              type="button"
+              className="btn-secondary py-1.5"
+              onClick={() => void applyBatchSupplier()}
+              disabled={batchSupplierSubmitting || submitting || selectedTaskIds.length === 0}
+              title={`将所选 ${selectedTaskIds.length} 单的签证公司统一覆盖（上限 ${NOTES_BATCH_LIMIT} 单）`}
+            >
+              {batchSupplierSubmitting ? '设置中…' : '应用签证公司'}
+            </button>
+            <span className="text-[11px] text-ink-muted">
+              只改签证公司，不影响已设的金额；留空 = 清空
+            </span>
+          </div>
           {/* 批量设签证金额（签证公司按航班统一单价是常态）*/}
           <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-brand-200/60 pt-3">
             <label className="text-sm text-ink-soft">批量设金额：</label>
@@ -1578,6 +1713,7 @@ export function VisaDeskPage() {
             </button>
             <span className="text-[11px] text-ink-muted">
               作用于所选 {selectedTaskIds.length} 单签证任务；三格留空 = 清空回退产品成本
+              {todayFxRate != null && `；汇率已按当日汇率表带出（${todayFxRate}），可手改`}
             </span>
           </div>
           {downloadError && <p className="mt-2 text-xs text-rose-600">{downloadError}</p>}
@@ -1663,6 +1799,7 @@ export function VisaDeskPage() {
                     onTogglePassenger={togglePassenger}
                     onToggleOrderPassengers={toggleOrderPassengers}
                     token={token}
+                    defaultFxRate={todayFxRate}
                     onChanged={() => setRefreshNonce((n) => n + 1)}
                   />
                 ))

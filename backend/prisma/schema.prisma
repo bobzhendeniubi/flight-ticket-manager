@@ -926,6 +926,20 @@ model SettlementRate {
   @@index([departDate])
 }
 
+/// 美金汇率表（按「生效日」维护）——财务加一条「某日起 x.xx」，区间由下一条的生效日隐含，
+/// 因此天然无空洞、无重叠。取数口径 = 「生效日 ≤ 目标日期的最新一条」，无更早记录则取不到。
+/// 折算结果**当场固化**在业务单据上（如签证任务的 visaFxRate / visaUnitCostCny），
+/// 之后改这张表**绝不追溯**已折算的旧单据。
+model UsdFxRate {
+  id            String   @id @default(cuid())
+  effectiveFrom DateTime @unique @db.Date // 生效日（date-only）；同一天只允许一条，upsert 幂等键
+  rate          Decimal  @db.Decimal(12, 6) // USD→CNY 汇率（正数）
+  note          String?
+  updatedBy     String? // 最近更新人 userId（审计冗余，展示"谁改的"）
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Products — Bundles (打包套餐)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1317,6 +1331,9 @@ model FulfillmentTask {
   visaUnitCostUsd Decimal? @db.Decimal(10, 2) // 人均成本（美金），签证公司账单币种
   visaFxRate      Decimal? @db.Decimal(12, 6) // 折算汇率（USD→CNY）
   visaUnitCostCny Decimal? @db.Decimal(10, 2) // 人均成本（人民币，入账权威）
+  // 本次实际送签的签证公司（财务对账用）。产品主数据 Visa.supplier 只是产品默认供应商，
+  // 同一产品不同批次可能换公司，故按任务记录；空 = 未填（此前只能塞在备注文本里）。
+  visaSupplier    String?
 
   createdAt      DateTime          @default(now())
   updatedAt      DateTime          @updatedAt

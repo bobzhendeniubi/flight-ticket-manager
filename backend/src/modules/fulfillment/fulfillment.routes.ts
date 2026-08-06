@@ -53,11 +53,12 @@ export const fulfillmentRoutes: FastifyPluginAsync = async (app) => {
     const body = updateFulfillmentBodySchema.parse(req.body);
     const task = await service.update(id, body);
 
-    // 签证金额变更单列审计动作（与状态/备注变更区分，便于财务追溯成本来源）
+    // 签证金额/签证公司变更单列审计动作（与状态/备注变更区分，便于财务追溯成本来源）
     const isVisaCostChange =
       body.visaUnitCostUsd !== undefined ||
       body.visaFxRate !== undefined ||
-      body.visaUnitCostCny !== undefined;
+      body.visaUnitCostCny !== undefined ||
+      body.visaSupplier !== undefined;
 
     void writeAudit({
       actor: actorFromRequest(req),
@@ -70,6 +71,7 @@ export const fulfillmentRoutes: FastifyPluginAsync = async (app) => {
             visaUnitCostUsd: task.visaUnitCostUsd,
             visaFxRate: task.visaFxRate,
             visaUnitCostCny: task.visaUnitCostCny,
+            visaSupplier: task.visaSupplier,
           }
         : { status: task.status, data: task.data, notes: task.notes },
       severity: body.status === 'FAILED' ? 'WARNING' : 'INFO',
@@ -136,7 +138,8 @@ export const fulfillmentRoutes: FastifyPluginAsync = async (app) => {
   /**
    * POST /fulfillment-tasks/visa-cost/batch
    *
-   * 批量给选中订单的签证任务设同一人均单价（签证公司按航班统一单价是常态）。
+   * 批量给选中订单的签证任务设同一人均单价 / 同一签证公司（按航班统一单价是常态）。
+   * 金额与签证公司互相独立：只带 visaSupplier 的调用不动金额，反之亦然。
    * 逐条复用单任务 update 的签证成本校验/折算；partial failure 返回 failures 明细。
    */
   app.post('/visa-cost/batch', pre, async (req) => {
@@ -148,11 +151,12 @@ export const fulfillmentRoutes: FastifyPluginAsync = async (app) => {
       action: 'BATCH_UPDATE_VISA_TASK_COST',
       targetType: 'ORDER',
       targetId: 'batch',
-      targetLabel: `${result.successCount}/${taskIds.length} 签证任务批量设金额`,
+      targetLabel: `${result.successCount}/${taskIds.length} 签证任务批量设金额/签证公司`,
       after: {
         visaUnitCostUsd: cost.visaUnitCostUsd ?? null,
         visaFxRate: cost.visaFxRate ?? null,
         visaUnitCostCny: cost.visaUnitCostCny ?? null,
+        visaSupplier: cost.visaSupplier ?? null,
         requestedCount: taskIds.length,
         successCount: result.successCount,
         failureCount: result.failureCount,

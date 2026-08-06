@@ -173,16 +173,18 @@ describe('buildHotelControlBoardWorkbook', () => {
     // 海景 remaining=2（正常）+ 山景「未配包房」按 0 计入（不计其误导性 -2）= 2
     expect(ws.getRow(12).getCell(4).value).toBe(2);
 
-    // 图例：标题 + 未配包房说明 + 超卖说明 + 余房累计口径说明
+    // 图例：标题 + 未配包房说明 + 超卖说明 + 三条口径说明（床位口径 / 随机档合计 / 余房累计）
     expect(ws.getRow(14).getCell(1).value).toBe('图例');
     expect(String(ws.getRow(15).getCell(2).value)).toContain('未配包房 = 该晚有客占房');
     expect(ws.getRow(15).getCell(1).fill).toMatchObject({ fgColor: { argb: 'FFFDE68A' } });
     expect(String(ws.getRow(16).getCell(2).value)).toContain('超卖 = 该晚包房周期已设置');
-    expect(String(ws.getRow(17).getCell(2).value)).toContain('当日余房累计');
-    expect(String(ws.getRow(17).getCell(2).value)).toContain('按 0 计入');
+    expect(String(ws.getRow(17).getCell(2).value)).toContain('「余量」为床位口径');
+    expect(String(ws.getRow(18).getCell(2).value)).toContain('同星级酒店的合计');
+    expect(String(ws.getRow(19).getCell(2).value)).toContain('当日余房累计');
+    expect(String(ws.getRow(19).getCell(2).value)).toContain('按 0 计入');
   });
 
-  it('余量行按物理房间口径（异性拼房：床位余 9 但物理余 8）', async () => {
+  it('余量行按床位口径（异性拼房：床位余 9，物理房间行仍如实报 2 间）', async () => {
     const male = { order: { passengers: [{ gender: 'M' }] } };
     const female = { order: { passengers: [{ gender: 'F' }] } };
     const rt = { hotelRoomType: { hotelId: 'h1', hotel: { name: '卢瑟特里' } } };
@@ -202,12 +204,71 @@ describe('buildHotelControlBoardWorkbook', () => {
     // 行序：包房(2)/用房床位(3)/物理房间(4)/余量(5)；日期列 col4=D0
     expect(ws.getRow(3).getCell(4).value).toBe(1); // 用房(床位) = 1.0
     expect(ws.getRow(4).getCell(4).value).toBe(2); // 物理房间 = 2
-    // 余量 = 物理余量 10 − 2 = 8（非床位余量 9），且正常余量无高亮
-    expect(ws.getRow(5).getCell(4).value).toBe(8);
+    // 余量 = 床位余量 10 − 1 = 9（物理房间行照旧报 2，只作展示不参与余量），正常余量无高亮
+    expect(ws.getRow(5).getCell(4).value).toBe(9);
     expect(ws.getRow(5).getCell(4).fill).toBeUndefined();
-    // 当日余房累计（汇总，第 8 行）也按物理口径 = 8
+    // 当日余房累计（汇总，第 8 行）同样按床位口径 = 9
     expect(ws.getRow(8).getCell(3).value).toBe('当日余房累计');
-    expect(ws.getRow(8).getCell(4).value).toBe(8);
+    expect(ws.getRow(8).getCell(4).value).toBe(9);
+  });
+});
+
+describe('buildHotelControlBoardWorkbook · 随机档聚合行', () => {
+  it('聚合行 4 行照常输出；汇总不把聚合行的派生包房算两遍，但计入未落位随机单', async () => {
+    const client = boardClient(
+      [
+        // 明月（三星）已落位 1 间
+        {
+          hotelCheckIn: day(0),
+          hotelCheckOut: day(1),
+          roomsBilled: 1,
+          randomStarTier: null,
+          hotelRoomType: { hotelId: 'h1', hotel: { name: '明月酒店', starRating: 3, intlFiveStar: false } },
+        },
+        // 未落位随机单 1 间
+        {
+          hotelCheckIn: day(0),
+          hotelCheckOut: day(1),
+          roomsBilled: 1,
+          randomStarTier: 3,
+          hotelRoomType: null,
+        },
+      ],
+      [
+        {
+          hotelId: 'h1',
+          randomStarTier: null,
+          dateFrom: day(0),
+          dateTo: day(0),
+          rooms: 5,
+          unitPrice: 300,
+          hotel: { name: '明月酒店', starRating: 3, intlFiveStar: false },
+        },
+      ],
+    );
+
+    const buf = await buildHotelControlBoardWorkbook({ from: dayStr(0), to: dayStr(0) }, client);
+    const wb = await loadWorkbook(buf);
+    const ws = wb.getWorksheet('销控矩阵')!;
+
+    // 聚合行排在最前（行 2-5）：包房 = 同星级合计 5；用房 = 未落位 1；余量 = (5−1) − 1 = 3
+    expect(ws.getCell(2, 1).value).toBe('三星随机');
+    expect(ws.getRow(2).getCell(4).value).toBe(5);
+    expect(ws.getRow(3).getCell(4).value).toBe(1);
+    expect(ws.getRow(5).getCell(3).value).toBe('余量');
+    expect(ws.getRow(5).getCell(4).value).toBe(3);
+    // 明月自己（行 6-9）：余量 5 − 1 = 4
+    expect(ws.getCell(6, 1).value).toBe('明月酒店');
+    expect(ws.getRow(9).getCell(4).value).toBe(4);
+
+    // 汇总（行 10-12）：包房只数明月的 5（聚合行的 5 是派生值，不重复计）
+    expect(ws.getRow(10).getCell(3).value).toBe('当日包房累计');
+    expect(ws.getRow(10).getCell(4).value).toBe(5);
+    // 用房 = 明月 1 + 未落位随机单 1
+    expect(ws.getRow(11).getCell(4).value).toBe(2);
+    // 余房 = 明月余量 4 − 未落位随机单 1 = 3
+    expect(ws.getRow(12).getCell(3).value).toBe('当日余房累计');
+    expect(ws.getRow(12).getCell(4).value).toBe(3);
   });
 });
 
