@@ -6896,14 +6896,18 @@ export function buildOrderFilterWhere(query: OrderListFilters): Prisma.OrderWher
       },
     });
   }
-  // 乘客姓名模糊匹配（公测反馈：中文名搜不到——拼音 fullName 与中文名 chineseName 任一命中即可）
+  // 乘客姓名筛选（词内 OR）：拼音 fullName 与中文名 chineseName 任一命中即可（公测反馈：中文名搜不到）。
+  // 多词间同样 OR（运营需求：姓名框填多个人名要把这些人的订单都列出来——"列出这些乘客的订单"而非
+  // "同一订单里凑齐这些乘客"，故不复用 query.search 的词间 AND 语义）；任一乘客命中任一词即命中该订单。
+  // 单词输入退化为原语义（fullName/chineseName 任一命中该词）。
   if (query.passengerName) {
+    const terms = splitSearchTerms(query.passengerName);
     where.passengers = {
       some: {
-        OR: [
-          { fullName: { contains: query.passengerName, mode: 'insensitive' } },
-          { chineseName: { contains: query.passengerName, mode: 'insensitive' } },
-        ],
+        OR: terms.flatMap((term) => [
+          { fullName: { contains: term, mode: 'insensitive' } },
+          { chineseName: { contains: term, mode: 'insensitive' } },
+        ]),
       },
     };
   }

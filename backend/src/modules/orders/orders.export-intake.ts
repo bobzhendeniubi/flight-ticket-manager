@@ -5,7 +5,8 @@
  * 按「出发日期 × 产品/团期」聚合，一行一组，列：出发日期、产品/团期、订单数、人数；末行总计。
  *
  *   · 出发日期：订单最早 FLIGHT 行出发日（去程）；纯地面单回落最早入住日；都取不到 → 「未设出发日」。
- *   · 产品/团期：套餐订单 = 套餐编码 + 名称（团期口径）；非套餐 = 按品类（机票/酒店/签证/接送/保险）。
+ *   · 产品/团期：套餐订单 = 套餐编码 + 名称（团期口径）；非套餐机票 = 「机票 {航班号}」（多航段按出发时间
+ *     升序去重拼接，如「机票 QH9589+QH9588」；无航班号回退「机票」）；其它品类 = 按品类（酒店/签证/接送/保险）。
  *   · 人数 = 组内各订单乘客数之和；订单数 = 组内订单条数。
  *
  * 与其它导出一致，只统计「计数状态」的订单（草稿/已取消/已退款/超时/失败不计入）。
@@ -55,7 +56,9 @@ export type OrderForIntakeExport = Prisma.OrderGetPayload<{
       select: {
         kind: true;
         hotelCheckIn: true;
-        flightSchedule: { select: { departureTime: true } };
+        flightSchedule: {
+          select: { departureTime: true; flight: { select: { flightNumber: true } } };
+        };
         bundle: { select: { code: true; name: true } };
       };
     };
@@ -79,7 +82,27 @@ export function intakeDepartDate(order: OrderForIntakeExport): string {
   return hotel ? fmtDate(hotel) : '';
 }
 
-/** 订单产品/团期标签：套餐 = 编码+名称；非套餐 = 品类。*/
+/** FLIGHT 订单项按出发时间升序去重的航班号列表（如 ['QH9589', 'QH9588']）；缺航班号的行跳过。*/
+function flightNumbersByDeparture(items: OrderForIntakeExport['items']): string[] {
+  const legs = items
+    .filter((it) => it.kind === OrderItemKind.FLIGHT && it.flightSchedule?.flight?.flightNumber)
+    .map((it) => ({
+      flightNumber: it.flightSchedule!.flight!.flightNumber,
+      departureTime: it.flightSchedule!.departureTime,
+    }))
+    .sort((a, b) => a.departureTime.getTime() - b.departureTime.getTime());
+  const seen = new Set<string>();
+  const numbers: string[] = [];
+  for (const leg of legs) {
+    if (!seen.has(leg.flightNumber)) {
+      seen.add(leg.flightNumber);
+      numbers.push(leg.flightNumber);
+    }
+  }
+  return numbers;
+}
+
+/** 订单产品/团期标签：套餐 = 编码+名称；非套餐机票 = 「机票 {航班号}」；其它品类 = 品类。*/
 export function intakeProductLabel(order: OrderForIntakeExport): string {
   const bundleItem = order.items.find((it) => it.kind === OrderItemKind.BUNDLE && it.bundle);
   if (bundleItem?.bundle) {
@@ -89,6 +112,10 @@ export function intakeProductLabel(order: OrderForIntakeExport): string {
   // 非套餐：取首个订单项品类（订单通常单一品类；机票单程/往返都归「机票」）。
   const first = order.items[0];
   if (!first) return '';
+  if (first.kind === OrderItemKind.FLIGHT) {
+    const numbers = flightNumbersByDeparture(order.items);
+    return numbers.length > 0 ? `机票 ${numbers.join('+')}` : '机票';
+  }
   return KIND_LABEL[first.kind] ?? first.kind;
 }
 
@@ -151,7 +178,9 @@ export async function buildIntakeExportWorkbook(
         select: {
           kind: true,
           hotelCheckIn: true,
-          flightSchedule: { select: { departureTime: true } },
+          flightSchedule: {
+            select: { departureTime: true, flight: { select: { flightNumber: true } } },
+          },
           bundle: { select: { code: true, name: true } },
         },
       },

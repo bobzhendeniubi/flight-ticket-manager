@@ -268,6 +268,7 @@ export class ProductsService {
           area: body.area,
           address: body.address,
           starRating: body.starRating,
+          intlFiveStar: body.intlFiveStar,
           basePrice: body.basePrice !== undefined ? new Prisma.Decimal(body.basePrice) : null,
           rating: body.rating !== undefined ? new Prisma.Decimal(body.rating) : null,
           reviewCount: body.reviewCount,
@@ -308,6 +309,7 @@ export class ProductsService {
       if (body.area !== undefined) data.area = body.area;
       if (body.address !== undefined) data.address = body.address;
       if (body.starRating !== undefined) data.starRating = body.starRating;
+      if (body.intlFiveStar !== undefined) data.intlFiveStar = body.intlFiveStar;
       if (body.basePrice !== undefined) data.basePrice = new Prisma.Decimal(body.basePrice);
       if (body.rating !== undefined) data.rating = new Prisma.Decimal(body.rating);
       if (body.reviewCount !== undefined) data.reviewCount = body.reviewCount;

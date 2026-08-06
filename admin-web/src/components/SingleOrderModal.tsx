@@ -712,6 +712,11 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const singleSupplementPerPax = bundle ? (bundle.singleSupplementCnyPerNight ?? 0) * bundleNightsForHint : 0;
   const selfVisaDeductPerPax = bundle?.selfVisaDeductCny ?? 0;
 
+  // 整单签证「不需要」→ 出行人自备签的单向联动开关（仅套餐单 + 签证列在显示时才生效）。
+  // 单向：只在选中「不需要」时把现有/新增出行人批量置为自备签；订单级改回其它值不做任何反向还原，
+  // 不动用户已经逐位调整过的选择（公测反馈：整单选了不需要还要逐个人再选一遍）。
+  const autoVisaExemptForBundle = kind === 'BUNDLE' && showVisaExemptCol && visaStatus === 'NOT_NEEDED';
+
   // 调价有效性：金额为非 0 整数即视为「要调价」；「其它」原因必须补说明。
   const adjustIsInteger = adjustAmount !== null && Number.isInteger(adjustAmount) && adjustAmount !== 0;
   const adjustNeedsText = adjustReason === 'OTHER' && adjustText.trim().length === 0;
@@ -762,7 +767,9 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   }
   function addPassenger(): void {
     setPassengers((prev) => {
-      const next = [...prev, emptyPassenger()];
+      // 整单「不需要签证」联动生效时，新增行默认也是自备签（与已有行一致，用户仍可逐位改回）。
+      const row = autoVisaExemptForBundle ? { ...emptyPassenger(), visaExempt: true } : emptyPassenger();
+      const next = [...prev, row];
       passengersRef.current = next;
       return next;
     });
@@ -852,7 +859,10 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       else targetIndices.push(current.length + appendCount++);
     }
     if (appendCount > 0) {
-      const toAppend = Array.from({ length: appendCount }, () => emptyPassenger());
+      // 整单「不需要签证」联动生效时，批量识别新增的行同样默认自备签（与手动加一位同口径）。
+      const toAppend = Array.from({ length: appendCount }, () =>
+        autoVisaExemptForBundle ? { ...emptyPassenger(), visaExempt: true } : emptyPassenger(),
+      );
       setPassengers((prev) => [...prev, ...toAppend]);
       // ref 同步前置：并发 worker 会立即按这些末尾索引写入，别等 effect 回灌。
       passengersRef.current = [...current, ...toAppend];
@@ -1291,6 +1301,24 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       }
     }
 
+    // 护照签发日期（选填）：填了但解析不了 → 与有效期同款拦截提交，不静默丢弃脏数据。
+    // 不限定 passengersRequired——该字段在任意产品类型下都选填，一旦填了就要合法。
+    const issueDateInvalidRows = passengers
+      .map((p, idx) => ({ ...p, rowNumber: idx + 1 }))
+      .filter(
+        (p) =>
+          p.fullName.trim() &&
+          p.documentNumber.trim() &&
+          (p.passportIssueDate ?? '').trim() &&
+          parseDob(p.passportIssueDate ?? '') === null,
+      );
+    if (issueDateInvalidRows.length > 0) {
+      setErr(
+        `第 ${issueDateInvalidRows.map((p) => p.rowNumber).join('、')} 位出行人护照签发日期格式不正确，请修正后再提交`,
+      );
+      return;
+    }
+
     if (adjustError) {
       setErr(adjustError);
       return;
@@ -1314,9 +1342,13 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       ...(p.gender ? { gender: p.gender } : {}),
       ...(p.passportPhotoUrl ? { passportPhotoUrl: p.passportPhotoUrl } : {}),
       ...(p.chineseName?.trim() ? { chineseName: p.chineseName.trim() } : {}),
-      ...(p.passportIssueDate?.trim() ? { passportIssueDate: p.passportIssueDate.trim() } : {}),
+      // 签发日期/有效期一律先过 parseDob 规范化（补零成 YYYY-MM-DD）再发，与 dateOfBirth 同口径，
+      // 避免前端宽松格式（2033-8-24）放行、后端 zod 严格格式（^\d{4}-\d{2}-\d{2}$）打回。
+      // 非空但解析失败的行已在上方前置校验拦截，此处 parseDob 对已通过校验的值必定非 null；
+      // ?? 兜底仅为类型收窄，不改变已校验数据的行为。
+      ...(p.passportIssueDate?.trim() ? { passportIssueDate: parseDob(p.passportIssueDate) ?? p.passportIssueDate.trim() } : {}),
       ...(p.passportIssuePlace?.trim() ? { passportIssuePlace: p.passportIssuePlace.trim() } : {}),
-      ...(p.passportExpiry?.trim() ? { passportExpiry: p.passportExpiry.trim() } : {}),
+      ...(p.passportExpiry?.trim() ? { passportExpiry: parseDob(p.passportExpiry) ?? p.passportExpiry.trim() } : {}),
       // 签证出签日/生效日/有效期不在录单时采集：改由签证台在出签后补录（见 PassengerRow 类型定义注释）。
       // 套餐乘客级选项（购物车模式）：仅套餐单显式发送；后端据此逐位派生权威定价 + 签证台过滤。
       ...(kind === 'BUNDLE' ? { visaExempt: !!p.visaExempt, singleRoom: !!p.singleRoom } : {}),
@@ -2032,7 +2064,18 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                     value={visaStatus}
                     onChange={(e) => {
                       visaStatusTouchedRef.current = true;
-                      setVisaStatus(e.target.value as VisaStatusInput);
+                      const next = e.target.value as VisaStatusInput;
+                      setVisaStatus(next);
+                      // 单向联动（公测反馈：整单选了不需要还要逐个人再选一遍）：改成「不需要」时，
+                      // 若当前是套餐单且签证列在显示，把现有出行人一次性批量置为自备签；
+                      // 改回其它值不做任何反向还原，不动用户已经逐位调整过的选择。
+                      if (next === 'NOT_NEEDED' && kind === 'BUNDLE' && showVisaExemptCol) {
+                        setPassengers((prev) => {
+                          const updated = prev.map((r) => ({ ...r, visaExempt: true }));
+                          passengersRef.current = updated;
+                          return updated;
+                        });
+                      }
                     }}
                   >
                     {(Object.keys(VISA_STATUS_LABEL) as VisaStatusInput[]).map((v) => (
@@ -2062,7 +2105,8 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
               </p>
               {showVisaExemptCol && (
                 <p className="mt-1 text-[11px] text-slate-400">
-                  本订单级签证状态与出行人「自备签」互相独立——部分乘客自备签不改变订单级状态；自备签乘客不进签证台、套餐价按人扣减。
+                  选「不需要」会把当前及新增出行人自动设为「自备签」（下方出行人表可逐位改回「随套餐」）；
+                  反向不联动——单个乘客选自备签不会改变本订单级签证状态，自备签乘客不进签证台、套餐价按人扣减。
                 </p>
               )}
             </div>
@@ -2101,6 +2145,11 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                   <button className="text-sm text-brand hover:text-brand-dark" onClick={addPassenger} type="button">＋ 加一位</button>
                 </div>
               </div>
+              {autoVisaExemptForBundle && (
+                <p className="mb-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
+                  整单不需要签证 → 已按每位自备签计价（每人 −¥{selfVisaDeductPerPax.toLocaleString('zh-CN')}），可逐位改回
+                </p>
+              )}
               <div className="scrollbar-visible max-h-[28rem] overflow-x-auto overflow-y-auto rounded-md border border-slate-200">
                 {/* 列宽用固定 min-width 直接标在每个 th/td 上（不用 col min-width——部分浏览器
                     的 auto-layout 表格不认 <col> 上的 min-width，只认 width，等于没生效）。
@@ -2218,6 +2267,11 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                                 setPassenger(i, { dateOfBirth: e.target.value });
                                 clearReviewField(i, 'dateOfBirth');
                               }}
+                              onBlur={() => {
+                                // 失焦即规范化显示值（如 2033/8/24 → 2033-08-24），让录入人看到即将提交的真实格式。
+                                const normalized = parseDob(p.dateOfBirth);
+                                if (normalized && normalized !== p.dateOfBirth) setPassenger(i, { dateOfBirth: normalized });
+                              }}
                             />
                             {dobBad && <span className="mt-0.5 block whitespace-nowrap text-[11px] text-rose-500">格式如 1990-01-01</span>}
                           </td>
@@ -2259,6 +2313,10 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                                 setPassenger(i, { passportIssueDate: e.target.value });
                                 clearReviewField(i, 'passportIssueDate');
                               }}
+                              onBlur={() => {
+                                const normalized = parseDob(p.passportIssueDate ?? '');
+                                if (normalized && normalized !== p.passportIssueDate) setPassenger(i, { passportIssueDate: normalized });
+                              }}
                             />
                             {issueBad && <span className="mt-0.5 block whitespace-nowrap text-[11px] text-rose-500">格式如 2018-01-01</span>}
                           </td>
@@ -2284,6 +2342,10 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                               onChange={(e) => {
                                 setPassenger(i, { passportExpiry: e.target.value });
                                 clearReviewField(i, 'passportExpiry');
+                              }}
+                              onBlur={() => {
+                                const normalized = parseDob(p.passportExpiry ?? '');
+                                if (normalized && normalized !== p.passportExpiry) setPassenger(i, { passportExpiry: normalized });
                               }}
                             />
                             {ppExpiryBad && <span className="mt-0.5 block whitespace-nowrap text-[11px] text-rose-500">格式如 2030-01-01</span>}

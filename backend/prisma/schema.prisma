@@ -713,6 +713,10 @@ model Hotel {
   area        String? // 区域描述（如"美溪海滩"）
   address     String
   starRating  Int // 1..5
+  // 国际五星标记（与结算价日历 SettlementTier.INTL_5STAR「国际五星」对齐口径）：
+  // starRating 仍是纯 1..5 整数语义不变；国际五星 = starRating=5 且本标记为 true。
+  // 不参与 hotel-control 随机池分类（RANDOM_STAR_TIERS 只按 3/4 星分池，不受影响）。
+  intlFiveStar Boolean @default(false)
   basePrice   Decimal? @db.Decimal(10, 2) // 起步价（展示用）
   rating      Decimal? @db.Decimal(3, 2) // 客户评分 0-5（兜底展示；真实评分由 Review 聚合覆盖）
   reviewCount Int?

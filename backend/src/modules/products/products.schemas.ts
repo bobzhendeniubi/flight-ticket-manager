@@ -91,6 +91,9 @@ export const createHotelBodySchema = z.object({
   area: z.string().max(100).optional(),
   address: z.string().min(1).max(500),
   starRating: z.number().int().min(1).max(5),
+  // 国际五星标记（starRating 仍是 1..5 整数语义；国际五星 = starRating=5 + 本标记）；
+  // 省略 = 未设置，DB 列 @default(false) 兜底，与 reviewCount 等其他可选字段同一手法。
+  intlFiveStar: z.boolean().optional(),
   basePrice: z.number().nonnegative().optional(),
   rating: z.number().min(0).max(5).optional(),
   reviewCount: z.number().int().nonnegative().optional(),

@@ -1591,6 +1591,8 @@ export interface Hotel {
   area: string | null;
   address: string;
   starRating: number;
+  /** 国际五星标记；starRating 仍是 1..5 整数语义，国际五星 = starRating=5 + 本标记 */
+  intlFiveStar: boolean;
   basePrice: string | null;
   /** D3 真实评价聚合（来自 Review 表，非旧手填 Decimal）；恒为对象，无评价时 {average:0,count:0} */
   rating: { average: number; count: number };

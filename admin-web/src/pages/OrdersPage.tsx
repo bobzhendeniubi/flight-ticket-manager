@@ -10,6 +10,7 @@ import { exportToCSV } from '../lib/csvExport';
 import { AIRPORTS } from '../lib/airports';
 import { NumberInput } from '../components/NumberInput';
 import { parseOtaRoster } from '../lib/parseOtaRoster';
+import { computePerPaxSettlement } from '../lib/perPaxSettlement';
 import type { AgentListItem, OrderImportParseResult } from '../lib/api';
 import { OrderFinanceSection } from '../components/OrderFinanceSection';
 import { OrderAuditTrail } from '../components/OrderAuditTrail';
@@ -4653,6 +4654,22 @@ function PriceAdjustmentSection({
   );
   const hasAnyAdjustment = grouped.wholeOrder.lines.length > 0 || grouped.byPassenger.size > 0;
 
+  // 每人结算价（D2 派生展示，票务需求：多人同单要看到每人结算价，如某人补签证只多收她 800）。
+  // 纯展示派生：应收总额 = total + adjustmentCny；基准每人 = (应收总额 − Σ按乘客调价净额) / 人数；
+  // 每人结算价 = 基准每人 + 该乘客净额。不接受任何独立输入，不是「手填每人价格」的口子。
+  const perPax = useMemo(() => {
+    if (order.passengers.length < 2) return null;
+    const netByPassenger = new Map<string, number>(
+      [...grouped.byPassenger.entries()].map(([pid, bucket]) => [pid, bucket.netCny]),
+    );
+    return computePerPaxSettlement({
+      totalCny: Number(order.total),
+      adjustmentCny: order.adjustmentCny,
+      passengerIds: order.passengers.map((p) => p.id),
+      netByPassenger,
+    });
+  }, [order.passengers, order.total, order.adjustmentCny, grouped.byPassenger]);
+
   // 内部角色才可见（对外脱敏时后端也不下发逐项金额；这里再做一道前端权限门）。
   if (!isOps) return null;
 
@@ -4733,6 +4750,50 @@ function PriceAdjustmentSection({
               </ul>
             </div>
           )}
+        </div>
+      )}
+
+      {/* 每人结算价（D2）：多人同单时展开，逐人可解释，与上面的调价明细同源派生 */}
+      {perPax && (
+        <div className="mt-3">
+          <p className="text-[11px] leading-snug text-ink-muted">
+            每人结算价 = 应收均摊 + 该乘客调整净额（系统派生，不可手填）
+          </p>
+          <table className="mt-1 w-full text-xs">
+            <thead>
+              <tr className="text-ink-muted">
+                <th className="py-1 text-left font-medium">乘客</th>
+                <th className="py-1 text-right font-medium">调整净额</th>
+                <th className="py-1 text-right font-medium">每人结算价</th>
+              </tr>
+            </thead>
+            <tbody>
+              {perPax.rows.map((row) => (
+                <tr key={row.passengerId} className="border-t border-slate-100">
+                  <td className="py-1 text-ink">{passengerById.get(row.passengerId) ?? '（已移除乘客）'}</td>
+                  <td
+                    className={`nums py-1 text-right ${
+                      row.netCny < 0 ? 'text-emerald-700' : row.netCny > 0 ? 'text-amber-700' : 'text-ink-muted'
+                    }`}
+                  >
+                    {row.netCny === 0 ? '—' : signedCny(row.netCny)}
+                  </td>
+                  <td className="nums py-1 text-right font-medium text-ink">
+                    ¥{row.settlementCny.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+            <tfoot>
+              <tr className="border-t border-slate-200 font-semibold">
+                <td className="py-1 text-ink">合计</td>
+                <td />
+                <td className="nums py-1 text-right text-ink">
+                  ¥{perPax.payableCny.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                </td>
+              </tr>
+            </tfoot>
+          </table>
         </div>
       )}
 

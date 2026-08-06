@@ -37,7 +37,8 @@ export const listFulfillmentQuerySchema = z.object({
   notesQuery: z.string().max(100).optional(),
   /**
    * 签发方式筛选（签证台「签证类型」）；'NONE' = 未标注。
-   * 口径与 effectiveVisaClassification 的**有效签发方式**逐字对齐（含订单级 E_VISA 回退），
+   * 口径与 effectiveVisaClassification 的**有效签发方式**逐字对齐
+   * （含订单级录单回退：E_VISA=电子签 / NEEDED=落地签），
    * 见 fulfillment.service 的 issuanceMethodWhere。
    */
   issuanceMethod: z.union([z.nativeEnum(VisaIssuanceMethod), z.literal('NONE')]).optional(),

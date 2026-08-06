@@ -3,7 +3,7 @@
  *
  * 只测纯函数的聚合口径（不连库）：
  *   - 出发日期取去程最早航段；纯地面单回落入住日；都无 → 「未设出发日」殿后
- *   - 产品/团期：套餐=编码+名称；非套餐按品类
+ *   - 产品/团期：套餐=编码+名称；非套餐机票=「机票 {航班号}」（多航段按出发时间升序去重拼接）；其它品类按品类
  *   - 「出发日期 × 产品/团期」分组：订单数计数、人数求和
  *   - 排序：日期升序（未设出发日排最后），同日期内产品名升序
  *   - 文件名把冒号（带时间窗口）换成短横
@@ -24,17 +24,28 @@ import {
 
 const D = (s: string): Date => new Date(`${s}T00:00:00.000Z`);
 
+/** 单个 FLIGHT 行：出发日字符串，或 { 出发日, 航班号 }。*/
+type FlightLegOpt = string | { date: string; flightNumber?: string };
+
 /** 造一张进单统计所需最小订单（只含 passengers + items 相关字段）。*/
 function order(opts: {
   paxCount: number;
-  flights?: string[]; // 各 FLIGHT 行出发日
+  flights?: FlightLegOpt[]; // 各 FLIGHT 行出发日（可选带航班号）
   hotelCheckIn?: string;
   bundle?: { code: string | null; name: string } | null;
   ground?: 'HOTEL' | 'VISA' | 'TRANSFER' | 'INSURANCE';
 }): OrderForIntakeExport {
   const items: OrderForIntakeExport['items'] = [];
   for (const f of opts.flights ?? []) {
-    items.push({ kind: 'FLIGHT', hotelCheckIn: null, flightSchedule: { departureTime: D(f) }, bundle: null });
+    const { date, flightNumber } = typeof f === 'string' ? { date: f, flightNumber: '' } : f;
+    items.push({
+      kind: 'FLIGHT',
+      hotelCheckIn: null,
+      // flight 关系在 schema 里非空（每个 FlightSchedule 必属一个 Flight）；「无航班号」用空串模拟
+      // 数据缺口（而非 null），与生产代码里 `it.flightSchedule?.flight?.flightNumber` 的假值判断口径一致。
+      flightSchedule: { departureTime: D(date), flight: { flightNumber: flightNumber ?? '' } },
+      bundle: null,
+    });
   }
   if (opts.bundle !== undefined) {
     items.push({
@@ -84,12 +95,58 @@ describe('intakeProductLabel', () => {
     ).toBe('芽庄自由行');
   });
 
-  it('非套餐机票 → 机票', () => {
+  it('非套餐机票（无航班号）→ 机票', () => {
     expect(intakeProductLabel(order({ paxCount: 1, flights: ['2026-07-20'] }))).toBe('机票');
   });
 
   it('非套餐签证 → 签证', () => {
     expect(intakeProductLabel(order({ paxCount: 1, ground: 'VISA' }))).toBe('签证');
+  });
+
+  it('单程带航班号 → 「机票 {航班号}」', () => {
+    expect(
+      intakeProductLabel(order({ paxCount: 1, flights: [{ date: '2026-07-20', flightNumber: 'QH9589' }] })),
+    ).toBe('机票 QH9589');
+  });
+
+  it('往返两段 → 按出发时间升序拼接两个航班号', () => {
+    expect(
+      intakeProductLabel(
+        order({
+          paxCount: 1,
+          flights: [
+            { date: '2026-07-25', flightNumber: 'QH9588' }, // 回程，出发更晚
+            { date: '2026-07-20', flightNumber: 'QH9589' }, // 去程，出发更早
+          ],
+        }),
+      ),
+    ).toBe('机票 QH9589+QH9588');
+  });
+
+  it('多航段相同航班号去重（如经停同号）', () => {
+    expect(
+      intakeProductLabel(
+        order({
+          paxCount: 1,
+          flights: [
+            { date: '2026-07-20', flightNumber: 'QH9589' },
+            { date: '2026-07-20', flightNumber: 'QH9589' },
+          ],
+        }),
+      ),
+    ).toBe('机票 QH9589');
+  });
+
+  it('套餐订单即使含航班行，标签仍是套餐编码+名称（不受航班号影响）', () => {
+    expect(
+      intakeProductLabel(
+        order({
+          paxCount: 1,
+          flights: [{ date: '2026-07-20', flightNumber: 'QH9589' }],
+          bundle: { code: 'DAD5', name: '岘港5日' },
+        }),
+      ),
+    ).toBe('DAD5 岘港5日');
   });
 });
 

@@ -54,7 +54,13 @@ type BundleHotelRoomTypeWithPrice = { id: string; name: string; hotelName: strin
 // 0702 反馈 5：成本价（仅内部，前台不显示）—— mockData 共享类型（HotelRoomType/MockTransfer）未声明
 // costPriceCny，与上面 stayDays 同一手法，局部扩展类型承接，不改共享 mock 类型定义。
 type RoomTypeWithCost = HotelRoomType & { costPriceCny?: number | null };
-type MockHotelWithCost = Omit<MockHotel, 'roomTypes'> & { roomTypes: RoomTypeWithCost[] };
+// 0805 A3：国际五星标记 —— mockData 共享类型（MockHotel）未声明 intlFiveStar，
+// 与上面 costPriceCny 同一手法，局部扩展类型承接，不改共享 mock 类型定义。
+// starRating(stars) 仍是纯 1..5 整数语义；国际五星 = stars=5 且本标记为 true。
+type MockHotelWithCost = Omit<MockHotel, 'roomTypes'> & {
+  roomTypes: RoomTypeWithCost[];
+  intlFiveStar?: boolean;
+};
 type MockTransferWithCost = MockTransfer & { costPriceCny?: number | null };
 
 type Section = 'hotels' | 'transfers' | 'visas' | 'bundles';
@@ -90,6 +96,7 @@ function hotelApiToMock(h: Hotel): MockHotelWithCost {
     area: h.area ?? h.address,
     address: h.address ?? '',
     stars: (h.starRating as 3 | 4 | 5) ?? 4,
+    intlFiveStar: h.intlFiveStar ?? false,
     basePrice: Number(h.basePrice ?? 0),
     // 0702 反馈 2：serializeHotel 现在发 rating:{average,count} 对象，不是旧 Decimal 字符串——
     // Number(对象) = NaN，写回 create/update 会被 JSON 序列化成 null，后端 z.number() 校验直接拒绝
@@ -426,7 +433,7 @@ export function ProductsPage() {
       for (const n of next) if (!prev.find((p) => p.id === n.id)) {
         await api.createHotel(tk, {
           name: n.name, nameEn: n.nameEn, cityCode: n.cityCode, area: n.area,
-          address: n.address || n.area, starRating: n.stars, basePrice: n.basePrice,
+          address: n.address || n.area, starRating: n.stars, intlFiveStar: n.intlFiveStar ?? false, basePrice: n.basePrice,
           // 0702 反馈 2：rating 不再回传——serializeHotel 现在发 {average,count} 聚合对象，
           // 表单本就没有编辑评分的入口；旧代码 Number(对象)=NaN，JSON 序列化成 null，
           // 后端 z.number() 校验直接拒绝（"酒店编辑全挂"根因）。评分改由 Review 真实评价聚合，
@@ -448,7 +455,7 @@ export function ProductsPage() {
         if (old && JSON.stringify(old) !== JSON.stringify(n)) {
           await api.updateHotel(tk, n.id, {
             name: n.name, nameEn: n.nameEn, cityCode: n.cityCode, area: n.area,
-            address: n.address || n.area, starRating: n.stars,
+            address: n.address || n.area, starRating: n.stars, intlFiveStar: n.intlFiveStar ?? false,
             basePrice: n.basePrice, reviewCount: n.reviewCount,
             emoji: n.emoji, highlight: n.highlight, amenities: n.amenities,
             photos: hotelPhotos(n),
@@ -775,7 +782,9 @@ function HotelsSection({ items, onChange }: { items: MockHotelWithCost[]; onChan
             <div className="font-mono text-xs text-ink-muted">编号 {h.code ?? '—'} <span className="font-sans not-italic text-ink-muted">(系统自动生成)</span></div>
             <div className="flex items-start justify-between">
               <div className="text-3xl">{h.emoji}</div>
-              <span className="badge-warning">{'★'.repeat(h.stars)} {h.stars}星</span>
+              <span className="badge-warning">
+                {'★'.repeat(h.stars)} {h.intlFiveStar ? '国际五星' : `${h.stars}星`}
+              </span>
             </div>
             <h3 className="mt-2 font-semibold text-ink">{h.name}</h3>
             <p className="text-xs text-ink-muted">{h.nameEn}</p>
@@ -825,6 +834,7 @@ function NewHotelForm({
     area: '美溪海滩',
     address: '',
     stars: 4,
+    intlFiveStar: false,
     basePrice: 880,
     rating: 4.5,
     reviewCount: 0,
@@ -2247,6 +2257,8 @@ function HotelEditorForm({
   const [area, setArea] = useState(hotel.area);
   const [address, setAddress] = useState(hotel.address ?? '');
   const [stars, setStars] = useState<3 | 4 | 5>(hotel.stars);
+  // 国际五星：与 stars 联动的独立标记（stars 仍是纯 1..5 整数语义，见 MockHotelWithCost 注释）。
+  const [intlFiveStar, setIntlFiveStar] = useState(hotel.intlFiveStar ?? false);
   const [basePrice, setBasePrice] = useState<number | null>(hotel.basePrice);
   const [emoji, setEmoji] = useState(hotel.emoji);
   const [highlight, setHighlight] = useState(hotel.highlight);
@@ -2276,6 +2288,7 @@ function HotelEditorForm({
       area: area.trim(),
       address: address.trim(),
       stars,
+      intlFiveStar,
       basePrice: basePrice ?? 0,
       emoji: emoji.trim() || '🏨',
       highlight: highlight.trim(),
@@ -2323,10 +2336,20 @@ function HotelEditorForm({
           </div>
           <div>
             <label className="label text-xs">星级</label>
-            <select className="input" value={stars} onChange={(e) => setStars(Number(e.target.value) as 3 | 4 | 5)}>
-              <option value={3}>三星</option>
-              <option value={4}>四星</option>
-              <option value={5}>五星</option>
+            {/* 国际五星与五星共用 stars=5，靠 intlFiveStar 标记区分；下拉呈现为独立第四档 */}
+            <select
+              className="input"
+              value={stars === 5 && intlFiveStar ? 'intl5' : String(stars)}
+              onChange={(e) => {
+                const v = e.target.value;
+                if (v === 'intl5') { setStars(5); setIntlFiveStar(true); }
+                else { setStars(Number(v) as 3 | 4 | 5); setIntlFiveStar(false); }
+              }}
+            >
+              <option value="3">三星</option>
+              <option value="4">四星</option>
+              <option value="5">五星</option>
+              <option value="intl5">国际五星</option>
             </select>
           </div>
           <div className="md:col-span-2">
