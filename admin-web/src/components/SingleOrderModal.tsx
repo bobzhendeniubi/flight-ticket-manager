@@ -48,7 +48,6 @@ import { PassengerSuggestInput } from './PassengerSuggestInput';
 import { ProofImageViewer } from './ProofImageViewer';
 import { RoomingEditor, type RoomingPassenger } from './RoomingEditor';
 import { SearchSelect, type SearchSelectOption } from './SearchSelect';
-import { type OcrResult } from '../lib/passportOcr';
 import { formatLocalTime } from '../lib/airports';
 import { composePassengerFullName, normalizePassengerFullName } from '../lib/passengerName';
 
@@ -126,6 +125,8 @@ interface PassengerRow {
   ocrStage?: string;
   /** OCR 引擎标签：'ai' | 'local' | 'ai-fallback' | null */
   ocrEngine?: 'ai' | 'local' | 'ai-fallback' | null;
+  /** true = 本次识别失败，行下显示明确错误提示 */
+  ocrFailed?: boolean;
   /** AI 识别时使用的模型名 */
   ocrModel?: string | null;
   /**
@@ -176,6 +177,7 @@ function hasFieldReview(p: PassengerRow, field: string): boolean {
 
 /** 出行人行下方的紧凑提示文案；无需提示返回 null。 */
 function ocrReviewHint(p: PassengerRow): string | null {
+  if (p.ocrFailed && p.ocrStage) return p.ocrStage;
   if (p.reviewFields && p.reviewFields.length > 0) {
     const prefix =
       p.mrzValid === false ? '护照机读区未能校验，请逐项核对：' : 'AI 识别建议人工核对：';
@@ -911,12 +913,8 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
    * 护照 OCR：点按钮 → 触发隐藏 file input → 读取图片 → 识别 → 自动填表
    *
    * 策略：
-   *   1. 先尝试后端 AI 识别（POST /ocr/passport）。
-   *      configured:true 且 suggested 有结果 → 用 AI 结果（含 chineseName/passportIssueDate），
-   *      显示绿色标签「AI识别 · {model}」。
-   *   2. AI 未配置（configured:false）→ 直接本地 Tesseract，灰色标签「本地识别(tesseract)」。
-   *   3. AI 配了但 suggested 为 null / 有 error → 回退本地 Tesseract，
-   *      黄色标签「AI失败已回退本地」。
+   *   只走后端 AI 识别（POST /ocr/passport）。成功时回填 AI 结果并显示模型；未登录、未配置、
+   *   识别失败或请求异常时写入明确错误，不回填乘客字段。图片仍压缩保存，方便人工核录。
    *
    * 图片压缩：存库图先缩到长边 ≤1600 + JPEG ≤~700KB，OCR 识别用原始 File。
    */
@@ -930,7 +928,13 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       setErr(`护照图最多 ${MAX_PHOTO_PASSENGERS} 张/单，已达上限；更多请分单录入`);
       return;
     }
-    setPassenger(idx, { ocrPct: 0, ocrStage: '加载中…', ocrEngine: null, ocrModel: null });
+    setPassenger(idx, {
+      ocrPct: 0,
+      ocrStage: '加载中…',
+      ocrEngine: null,
+      ocrModel: null,
+      ocrFailed: false,
+    });
 
     // ── 1. 存库图压缩 ──
     let dataUrl = '';
@@ -942,93 +946,69 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     }
     if (dataUrl) setPassenger(idx, { passportPhotoUrl: dataUrl });
 
-    // ── 2. 尝试 AI 识别 ──
-    if (token) {
-      try {
-        setPassenger(idx, { ocrPct: 20, ocrStage: 'AI 识别中…' });
-
-        // 把压缩后（或原始）图片转成 data URL 发给后端
-        const imageDataUrl = dataUrl || await new Promise<string>((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = () => typeof reader.result === 'string' ? resolve(reader.result) : reject(new Error('读取失败'));
-          reader.onerror = () => reject(new Error('读取失败'));
-          reader.readAsDataURL(file);
-        });
-
-        const aiRes: AiOcrPassportResult = await api.ocrPassportAi(token, imageDataUrl);
-
-        if (!aiRes.configured) {
-          // 未配置 AI，直接走本地
-          await runLocalOcr(idx, file, 'local');
-          return;
-        }
-
-        // AI 有结果
-        if (aiRes.suggested) {
-          const s = aiRes.suggested;
-          const patch: Partial<PassengerRow> = {
-            ocrPct: 100,
-            ocrStage: '识别完成',
-            ocrEngine: 'ai',
-            ocrModel: aiRes.model ?? null,
-            // 护照反光等致目视区误读——票务岗反馈：录单人不知道哪里要二次核对。
-            // 后端 verify 直接带回需人工核对的字段列表 + MRZ 校验结果，整行展示提示。
-            reviewFields: aiRes.verify?.reviewFields ?? undefined,
-            mrzValid: aiRes.verify?.mrzValid ?? null,
-            localOcrCaveat: false,
-          };
-          if (s.fullName) patch.fullName = normalizePassengerFullName(s.fullName);
-          if (s.documentNumber) patch.documentNumber = s.documentNumber;
-          if (s.dateOfBirth) patch.dateOfBirth = s.dateOfBirth;
-          if (s.gender) patch.gender = s.gender;
-          if (s.chineseName) patch.chineseName = s.chineseName;
-          if (s.passportIssueDate) patch.passportIssueDate = s.passportIssueDate;
-          if (s.passportIssuePlace) patch.passportIssuePlace = s.passportIssuePlace;
-          if (s.passportExpiry) patch.passportExpiry = s.passportExpiry;
-          setPassenger(idx, patch);
-          return;
-        }
-
-        // AI 配了但识别失败 → 回退本地
-        await runLocalOcr(idx, file, 'ai-fallback');
-        return;
-      } catch {
-        // 网络/后端异常 → 回退本地
-        await runLocalOcr(idx, file, 'ai-fallback');
-        return;
-      }
-    }
-
-    // 无 token（不应出现，保险兜底）→ 本地
-    await runLocalOcr(idx, file, 'local');
-  }
-
-  /** 本地 Tesseract 识别（备用路径） */
-  async function runLocalOcr(idx: number, file: File, engine: 'local' | 'ai-fallback'): Promise<void> {
-    try {
-      const { ocrPassport } = await import('../lib/passportOcr');
-      const result: OcrResult = await ocrPassport(file, (pct, stage) => {
-        setPassenger(idx, { ocrPct: 20 + Math.round(pct * 0.8), ocrStage: stage });
-      });
-
-      const s = result.suggested;
-      const patch: Partial<PassengerRow> = {
-        ocrPct: 100,
-        ocrStage: result.success ? '识别完成' : '识别不完整，请核对',
-        ocrEngine: engine,
+    const setOcrFailure = (stage: string) => {
+      setPassenger(idx, {
+        ocrPct: null,
+        ocrStage: stage,
+        ocrEngine: null,
         ocrModel: null,
-        // 本地 Tesseract 兜底没有 verify（无逐字段核对信息），给整行一条通用提示。
+        ocrFailed: true,
         reviewFields: undefined,
         mrzValid: null,
-        localOcrCaveat: true,
-      };
-      if (s.fullName) patch.fullName = normalizePassengerFullName(s.fullName);
-      if (s.passportNumber) patch.documentNumber = s.passportNumber;
-      if (s.dateOfBirth) patch.dateOfBirth = s.dateOfBirth;
-      if (s.gender) patch.gender = s.gender;
-      setPassenger(idx, patch);
+        localOcrCaveat: false,
+      });
+    };
+
+    // ── 2. 无 token（不应出现，保险兜底）→ 明确报错 ──
+    if (!token) {
+      setOcrFailure('登录态缺失，无法识别，请重新登录');
+      return;
+    }
+
+    // ── 3. AI 识别 ──
+    try {
+      setPassenger(idx, { ocrPct: 20, ocrStage: 'AI 识别中…' });
+      const imageDataUrl = dataUrl || await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => typeof reader.result === 'string' ? resolve(reader.result) : reject(new Error('读取失败'));
+        reader.onerror = () => reject(new Error('读取失败'));
+        reader.readAsDataURL(file);
+      });
+      const aiRes: AiOcrPassportResult = await api.ocrPassportAi(token, imageDataUrl);
+
+      if (!aiRes.configured) {
+        setOcrFailure('AI 识别未配置：请在「设置 → AI 识别」配置密钥后重试');
+        return;
+      }
+
+      if (aiRes.suggested) {
+        const s = aiRes.suggested;
+        const patch: Partial<PassengerRow> = {
+          ocrPct: 100,
+          ocrStage: '识别完成',
+          ocrEngine: 'ai',
+          ocrFailed: false,
+          ocrModel: aiRes.model ?? null,
+          // 后端 verify 直接带回需人工核对的字段列表 + MRZ 校验结果，整行展示提示。
+          reviewFields: aiRes.verify?.reviewFields ?? undefined,
+          mrzValid: aiRes.verify?.mrzValid ?? null,
+          localOcrCaveat: false,
+        };
+        if (s.fullName) patch.fullName = normalizePassengerFullName(s.fullName);
+        if (s.documentNumber) patch.documentNumber = s.documentNumber;
+        if (s.dateOfBirth) patch.dateOfBirth = s.dateOfBirth;
+        if (s.gender) patch.gender = s.gender;
+        if (s.chineseName) patch.chineseName = s.chineseName;
+        if (s.passportIssueDate) patch.passportIssueDate = s.passportIssueDate;
+        if (s.passportIssuePlace) patch.passportIssuePlace = s.passportIssuePlace;
+        if (s.passportExpiry) patch.passportExpiry = s.passportExpiry;
+        setPassenger(idx, patch);
+        return;
+      }
+
+      setOcrFailure(`AI 识别失败：${aiRes.error ?? '请重试或手动填写'}`);
     } catch {
-      setPassenger(idx, { ocrPct: null, ocrStage: undefined, ocrEngine: null, ocrModel: null });
+      setOcrFailure('AI 识别失败：网络或服务异常，请重试');
     }
   }
 
@@ -2521,7 +2501,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                                   <button
                                     type="button"
                                     className="text-[10px] text-slate-400 hover:text-rose-500"
-                                    onClick={() => setPassenger(i, { passportPhotoUrl: undefined, ocrPct: null, ocrStage: undefined, ocrEngine: null, ocrModel: null, reviewFields: undefined, mrzValid: null, localOcrCaveat: false })}
+                                    onClick={() => setPassenger(i, { passportPhotoUrl: undefined, ocrPct: null, ocrStage: undefined, ocrEngine: null, ocrModel: null, ocrFailed: false, reviewFields: undefined, mrzValid: null, localOcrCaveat: false })}
                                     title="移除图片"
                                   >✕</button>
                                 </div>
@@ -2532,22 +2512,6 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                                     title={p.ocrModel ? `AI识别 · ${p.ocrModel}` : 'AI识别'}
                                   >
                                     AI识别{p.ocrModel ? ` · ${p.ocrModel}` : ''}
-                                  </span>
-                                )}
-                                {p.ocrEngine === 'local' && (
-                                  <span
-                                    className="block max-w-full truncate rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium leading-tight text-slate-500"
-                                    title="本地识别(tesseract)"
-                                  >
-                                    本地识别(tesseract)
-                                  </span>
-                                )}
-                                {p.ocrEngine === 'ai-fallback' && (
-                                  <span
-                                    className="block max-w-full truncate rounded bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium leading-tight text-amber-700 ring-1 ring-amber-200"
-                                    title="AI失败已回退本地"
-                                  >
-                                    AI失败已回退本地
                                   </span>
                                 )}
                               </div>
@@ -2567,7 +2531,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                         </tr>
                         {reviewHint && (
                           <tr className="border-t-0">
-                            <td colSpan={passengerColCount} className="bg-amber-50 px-2 py-1 text-[11px] text-amber-700">
+                            <td colSpan={passengerColCount} className={`${p.ocrFailed ? 'bg-rose-50 text-rose-700 ring-1 ring-inset ring-rose-200' : 'bg-amber-50 text-amber-700'} px-2 py-1 text-[11px]`}>
                               ⚠️ {reviewHint}
                             </td>
                           </tr>

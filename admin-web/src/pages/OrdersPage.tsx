@@ -5744,10 +5744,9 @@ function PassengerEditForm({
   const ocrInputRef = useRef<HTMLInputElement | null>(null);
 
   /**
-   * 换人表单护照 OCR：与录单（SingleOrderModal）完全一致的流程与交互——
-   * 先压缩存库图 → 尝试后端 AI 识别（POST /ocr/passport）→ 未配置/失败回退本地 Tesseract。
-   * 识别结果预填 姓/名/全名/中文名/证件号/出生日期/性别/国籍/护照有效期；
-   * 护照图 + 签发日/签发地/签发国 作为「补录资料」随提交（换人后经补录通道写回新人）。
+   * 换人表单护照 OCR：先压缩存库图，再尝试后端 AI 识别（POST /ocr/passport）。
+   * 识别结果预填 姓/名/全名/中文名/证件号/出生日期/性别/国籍/护照有效期；未登录、未配置、
+   * 识别失败或请求异常时写入明确错误，不回填乘客字段。护照图 + 签发资料随提交补录。
    */
   const applyOcrSuggested = (s: {
     lastName?: string;
@@ -5770,7 +5769,7 @@ function PassengerEditForm({
     if (s.documentNumber) setDocumentNumber(s.documentNumber);
     if (s.dateOfBirth) setDob(s.dateOfBirth);
     if (s.gender) setGender(s.gender);
-    // AI 返回 ISO-3 国籍/签发国 → 转 ISO-2（本地 OCR 已是 ISO-2，原样用）
+    // AI 返回 ISO-3 国籍/签发国 → 转 ISO-2
     if (s.nationality) setNationality(iso3 ? countryIso3ToIso2(s.nationality) : s.nationality);
     if (s.passportExpiry) setPassportExpiry(s.passportExpiry);
     if (s.passportIssueDate) setPassportIssueDate(s.passportIssueDate);
@@ -5796,72 +5795,46 @@ function PassengerEditForm({
     }
     if (dataUrl) setPassportPhotoUrl(dataUrl);
 
-    // 本地 Tesseract 兜底
-    const runLocal = async (engine: 'local' | 'ai-fallback') => {
-      try {
-        const { ocrPassport } = await import('../lib/passportOcr');
-        const result = await ocrPassport(file, (pct, stage) => {
-          setOcrPct(20 + Math.round(pct * 0.8));
-          setOcrStage(stage);
-        });
-        const s = result.suggested;
-        applyOcrSuggested(
-          {
-            fullName: s.fullName,
-            documentNumber: s.passportNumber,
-            dateOfBirth: s.dateOfBirth,
-            gender: s.gender,
-            nationality: s.nationality,
-            passportExpiry: s.passportExpiry,
-            passportIssueCountry: s.passportIssueCountry,
-          },
-          false,
-        );
-        setOcrPct(100);
-        setOcrStage(result.success ? '识别完成，请核对' : '识别不完整，请核对');
-        setOcrEngine(engine);
-      } catch {
-        setOcrPct(null);
-        setOcrStage('');
-        setOcrEngine(null);
-        setErr('护照识别失败，请手工填写');
-      }
+    const setOcrFailure = (stage: string) => {
+      setOcrPct(null);
+      setOcrStage(stage);
+      setOcrEngine(null);
+      setErr(stage);
     };
 
-    // 优先后端 AI 识别
-    if (token) {
-      try {
-        setOcrPct(20);
-        setOcrStage('AI 识别中…');
-        const imageDataUrl =
-          dataUrl ||
-          (await new Promise<string>((resolve, reject) => {
-            const reader = new FileReader();
-            reader.onload = () =>
-              typeof reader.result === 'string' ? resolve(reader.result) : reject(new Error('读取失败'));
-            reader.onerror = () => reject(new Error('读取失败'));
-            reader.readAsDataURL(file);
-          }));
-        const aiRes = await api.ocrPassportAi(token, imageDataUrl);
-        if (!aiRes.configured) {
-          await runLocal('local');
-          return;
-        }
-        if (aiRes.suggested) {
-          applyOcrSuggested(aiRes.suggested, true);
-          setOcrPct(100);
-          setOcrStage('识别完成，请核对');
-          setOcrEngine('ai');
-          return;
-        }
-        await runLocal('ai-fallback');
-        return;
-      } catch {
-        await runLocal('ai-fallback');
+    if (!token) {
+      setOcrFailure('登录态缺失，无法识别，请重新登录');
+      return;
+    }
+
+    try {
+      setOcrPct(20);
+      setOcrStage('AI 识别中…');
+      const imageDataUrl =
+        dataUrl ||
+        (await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () =>
+            typeof reader.result === 'string' ? resolve(reader.result) : reject(new Error('读取失败'));
+          reader.onerror = () => reject(new Error('读取失败'));
+          reader.readAsDataURL(file);
+        }));
+      const aiRes = await api.ocrPassportAi(token, imageDataUrl);
+      if (!aiRes.configured) {
+        setOcrFailure('AI 识别未配置：请在「设置 → AI 识别」配置密钥后重试');
         return;
       }
+      if (aiRes.suggested) {
+        applyOcrSuggested(aiRes.suggested, true);
+        setOcrPct(100);
+        setOcrStage('识别完成，请核对');
+        setOcrEngine('ai');
+        return;
+      }
+      setOcrFailure(`AI 识别失败：${aiRes.error ?? '请重试或手动填写'}`);
+    } catch {
+      setOcrFailure('AI 识别失败：网络或服务异常，请重试');
     }
-    await runLocal('local');
   };
 
   const submit = async () => {
