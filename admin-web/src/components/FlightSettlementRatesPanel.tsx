@@ -9,6 +9,11 @@
  *
  * 口径：代理下**纯机票单**时，服务端按每条航段的航班号 + 出发地本地日在此表自动取每人价，
  * 全部航段都命中才自动收敛订单总额；任一航段没维护则照常走动态定价（代理改不了这个价）。
+ *
+ * 两种粘贴并存：
+ *   1. 网格逐格粘贴——选中起始格 Ctrl/⌘+V 铺开填草稿，再「整批保存」；
+ *   2.「📋 粘贴报价表」——整块粘贴运营 OTA 报价表原文，由 lib/quoteSheetParser 解析出
+ *      （出发日 × 航班号）后预览确认，直接走批量 upsert 写库并重拉网格。
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
@@ -25,7 +30,15 @@ import {
   parsePasteBlock,
   weekdayOf,
 } from '../lib/settlementCalendar';
+import {
+  parseOtaQuoteSheet,
+  type OtaQuoteEntry,
+  type QuoteSheetResult,
+} from '../lib/quoteSheetParser';
 import { useAuth } from '../stores/auth';
+
+// 报价表导入分批大小（批量端点单次上限 2000 条）
+const IMPORT_BATCH_SIZE = 500;
 
 function cellKey(date: string, flightNumber: string): string {
   return `${date}__${flightNumber}`;
@@ -45,6 +58,10 @@ export function FlightSettlementRatesPanel() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [pasteWarning, setPasteWarning] = useState<string | null>(null);
+  // 报价表整块粘贴导入（与网格逐格粘贴并存：这里一次吃整张 OTA 表，直接写库）
+  const [sheetText, setSheetText] = useState('');
+  const [sheetParsed, setSheetParsed] = useState<QuoteSheetResult<OtaQuoteEntry> | null>(null);
+  const [importing, setImporting] = useState(false);
   const [nonce, setNonce] = useState(0);
 
   const days = useMemo(() => daysInMonth(month), [month]);
@@ -199,6 +216,33 @@ export function FlightSettlementRatesPanel() {
     }
   }
 
+  /** 报价表整块粘贴 → 解析预览（纯前端，不写库；运营核对无误再点导入）。 */
+  function previewQuoteSheet() {
+    setSheetParsed(parseOtaQuoteSheet(sheetText, month));
+  }
+
+  /** 确认导入：解析出的条目直接走既有批量 upsert，完事重拉网格。 */
+  async function importQuoteSheet() {
+    if (!token || !sheetParsed || sheetParsed.entries.length === 0) return;
+    setImporting(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const entries = sheetParsed.entries;
+      for (let i = 0; i < entries.length; i += IMPORT_BATCH_SIZE) {
+        await api.upsertFlightSettlementRates(token, entries.slice(i, i + IMPORT_BATCH_SIZE));
+      }
+      setNotice(`报价表已导入 ${entries.length} 格机票结算价`);
+      setSheetParsed(null);
+      setSheetText('');
+      setNonce((n) => n + 1);
+    } catch (e: unknown) {
+      setError(e instanceof ApiError ? e.message : '报价表导入失败');
+    } finally {
+      setImporting(false);
+    }
+  }
+
   const dirty = useMemo(() => {
     for (const date of days) {
       for (const flightNumber of flightNumbers) {
@@ -213,6 +257,20 @@ export function FlightSettlementRatesPanel() {
     }
     return false;
   }, [draft, days, flightNumbers, rateByKey]);
+
+  // 解析结果里当前网格看不到的部分（照样入库，但要提示运营去哪儿核对）
+  const sheetOutsideGrid = useMemo(() => {
+    if (!sheetParsed) return { offMonth: 0, unknownFlights: [] as string[] };
+    const known = new Set(flightNumbers);
+    return {
+      offMonth: sheetParsed.entries.filter((e) => !e.departDate.startsWith(`${month}-`)).length,
+      unknownFlights: [
+        ...new Set(
+          sheetParsed.entries.map((e) => e.flightNumber).filter((fn) => !known.has(fn)),
+        ),
+      ],
+    };
+  }, [sheetParsed, month, flightNumbers]);
 
   return (
     <section className="card space-y-4">
@@ -258,6 +316,122 @@ export function FlightSettlementRatesPanel() {
           {pasteWarning}
         </div>
       )}
+      {/* 报价表整块粘贴导入：一次吃整张 OTA 表（左右两张并排表都认），与下方逐格粘贴并存 */}
+      <details className="rounded-md border border-slate-200 bg-slate-50/60 px-3 py-2">
+        <summary className="cursor-pointer text-sm font-semibold text-ink">
+          📋 粘贴报价表（整块导入 OTA 结算价）
+        </summary>
+        <div className="mt-3 space-y-3">
+          <p className="text-[11px] text-ink-muted">
+            从报价表 Excel 里整块复制（含表头也没关系），直接粘贴到下框 →「解析预览」核对 →「确认导入」。
+            左右两张并排表都认，只复制半张也行；价取「OTA结算」列（不取「易达」列），
+            「售罄」「765余7」这类带备注的格不入库，会列在跳过明细里让运营手工确认。
+          </p>
+          <textarea
+            className="input h-40 w-full font-mono text-xs"
+            placeholder="在这里粘贴报价表内容（日期 / 星期 / 航段 / 航班号 / OTA结算…）"
+            value={sheetText}
+            onChange={(e) => {
+              setSheetText(e.target.value);
+              setSheetParsed(null); // 文本一改，旧预览作废，必须重新解析后才能导入
+            }}
+          />
+          <div className="flex flex-wrap items-center gap-2">
+            <button
+              type="button"
+              className="btn-secondary"
+              disabled={sheetText.trim() === ''}
+              onClick={previewQuoteSheet}
+            >
+              解析预览
+            </button>
+            {sheetParsed && sheetParsed.entries.length > 0 && (
+              <button
+                type="button"
+                className="btn-primary"
+                disabled={importing || dirty}
+                onClick={() => void importQuoteSheet()}
+              >
+                {importing ? '导入中…' : `确认导入 ${sheetParsed.entries.length} 条`}
+              </button>
+            )}
+            {sheetParsed && sheetParsed.entries.length > 0 && dirty && (
+              <span className="text-[11px] text-amber-700">
+                网格里有未保存的手工改动，请先「整批保存」再导入（导入后会重拉网格）
+              </span>
+            )}
+          </div>
+
+          {sheetParsed && (
+            <div className="space-y-2">
+              <div className="text-xs text-ink">
+                解析出 <b className="tabular-nums">{sheetParsed.entries.length}</b> 条价格，跳过{' '}
+                <b className="tabular-nums">{sheetParsed.skipped.length}</b> 行
+                {sheetOutsideGrid.offMonth > 0 &&
+                  `；其中 ${sheetOutsideGrid.offMonth} 条不在 ${month}，导入后请切到对应月份查看`}
+              </div>
+
+              {sheetOutsideGrid.unknownFlights.length > 0 && (
+                <div className="rounded-md bg-amber-50 px-3 py-2 text-[11px] text-amber-800 ring-1 ring-amber-200">
+                  报价表里的 {sheetOutsideGrid.unknownFlights.join('、')} 不在当前在用航班列里，
+                  价照样入库，但网格上没有这一列——需要的话先去「航班」页建档/启用。
+                </div>
+              )}
+
+              {sheetParsed.entries.length === 0 && sheetParsed.skipped.length === 0 && (
+                <div className="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800 ring-1 ring-amber-200">
+                  没认出任何价格。请确认复制的是报价表整块内容（要带日期、航班号和「OTA结算」列）。
+                </div>
+              )}
+
+              {sheetParsed.entries.length > 0 && (
+                <div className="max-h-64 overflow-auto rounded-md border border-slate-200 bg-white">
+                  <table className="min-w-full text-xs">
+                    <thead className="sticky top-0 bg-slate-50 text-left text-ink-muted">
+                      <tr>
+                        <th className="px-3 py-1.5 font-medium">出发日期</th>
+                        <th className="px-3 py-1.5 font-medium">航班号</th>
+                        <th className="px-3 py-1.5 text-right font-medium">每人结算价</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {sheetParsed.entries.map((e) => (
+                        <tr
+                          key={`${e.departDate}-${e.flightNumber}`}
+                          className="border-t border-slate-100"
+                        >
+                          <td className="px-3 py-1 tabular-nums">{e.departDate}</td>
+                          <td className="px-3 py-1 tabular-nums">{e.flightNumber}</td>
+                          <td className="px-3 py-1 text-right tabular-nums">
+                            {e.pricePerPersonCny}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+              {sheetParsed.skipped.length > 0 && (
+                <div className="max-h-40 overflow-auto rounded-md bg-amber-50 px-3 py-2 text-[11px] text-amber-800 ring-1 ring-amber-200">
+                  <div className="font-semibold">
+                    以下 {sheetParsed.skipped.length} 行没入库，可回报价表核对：
+                  </div>
+                  <ul className="mt-1 space-y-0.5">
+                    {sheetParsed.skipped.map((s, i) => (
+                      <li key={`${s.line}-${i}`}>
+                        第 {s.line} 行：{s.reason}
+                        {s.raw !== '' && `（${s.raw}）`}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+      </details>
+
       <p className="text-[11px] text-ink-muted">
         提示：行 = 该月每天，列 = 在用航班号（去程 / 回程各一列）。可从 Excel 复制一块「日期 ×
         航班」区域，选中起始格后直接粘贴（Ctrl/⌘+V）批量填充；清空格子并保存即删除该价。

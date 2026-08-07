@@ -9,6 +9,11 @@
  * 口径：选「月份 + 档次」→ 网格（行 = 该月每天，列 = 晚数 1–5）。格子直接编辑、整批保存；
  * 支持从 Excel 复制块状粘贴（tab/换行解析，与运营报价表「一个日期分几晚」逐列对应）；
  * 代理下套餐单时按去程出发日期 + 晚数 + 档次在此表自动取每人价。
+ *
+ * 两种粘贴并存：
+ *   1. 网格逐格粘贴——选中起始格 Ctrl/⌘+V，按当前档次铺开填草稿，再「整批保存」；
+ *   2.「📋 粘贴报价表」——整块粘贴运营报价表原文，由 lib/quoteSheetParser 解析出
+ *      （出发日 × 晚数 × 四个档次）后预览确认，直接走批量 upsert 写库并重拉网格。
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
@@ -25,6 +30,11 @@ import {
   parsePasteBlock,
   weekdayOf,
 } from '../lib/settlementCalendar';
+import {
+  parseGroundQuoteSheet,
+  type GroundQuoteEntry,
+  type QuoteSheetResult,
+} from '../lib/quoteSheetParser';
 import { FlightSettlementRatesPanel } from '../components/FlightSettlementRatesPanel';
 import { useAuth } from '../stores/auth';
 
@@ -41,6 +51,8 @@ const TIER_LABELS: Record<SettlementTier, string> = {
 };
 // 晚数（网格列顺序固定，1–5 晚——同业结算表当前只维护到 5 晚）
 const NIGHTS_OPTIONS = [1, 2, 3, 4, 5];
+// 报价表导入分批大小（批量端点单次上限 2000 条）
+const IMPORT_BATCH_SIZE = 500;
 
 function cellKey(date: string, nights: number): string {
   return `${date}__${nights}`;
@@ -61,6 +73,10 @@ export function SettlementRatesPage() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [pasteWarning, setPasteWarning] = useState<string | null>(null);
+  // 报价表整块粘贴导入（与网格逐格粘贴并存：这里一次吃整张表，直接写库）
+  const [sheetText, setSheetText] = useState('');
+  const [sheetParsed, setSheetParsed] = useState<QuoteSheetResult<GroundQuoteEntry> | null>(null);
+  const [importing, setImporting] = useState(false);
   // 数据变更后 +1 触发重拉
   const [nonce, setNonce] = useState(0);
 
@@ -190,6 +206,37 @@ export function SettlementRatesPage() {
     }
   }
 
+  /** 报价表整块粘贴 → 解析预览（纯前端，不写库；运营核对无误再点导入）。 */
+  function previewQuoteSheet() {
+    setSheetParsed(parseGroundQuoteSheet(sheetText, month));
+  }
+
+  /**
+   * 确认导入：解析出的条目直接走既有批量 upsert（一条一格，含四个档次），完事重拉网格。
+   * 只写解析到的格，报价表里是「/」或空的档次不动既有值。
+   */
+  async function importQuoteSheet() {
+    if (!token || !sheetParsed || sheetParsed.entries.length === 0) return;
+    setImporting(true);
+    setError(null);
+    setNotice(null);
+    try {
+      const entries = sheetParsed.entries;
+      // 批量端点单次上限 2000 条，分批发（整月满打满算 31天×5晚×4档=620 条，留足余量）
+      for (let i = 0; i < entries.length; i += IMPORT_BATCH_SIZE) {
+        await api.upsertSettlementRates(token, entries.slice(i, i + IMPORT_BATCH_SIZE));
+      }
+      setNotice(`报价表已导入 ${entries.length} 格地面结算价`);
+      setSheetParsed(null);
+      setSheetText('');
+      setNonce((n) => n + 1);
+    } catch (e: unknown) {
+      setError(e instanceof ApiError ? e.message : '报价表导入失败');
+    } finally {
+      setImporting(false);
+    }
+  }
+
   const dirty = useMemo(() => {
     // 草稿与已加载态是否有差异（控制保存按钮）
     for (const date of days) {
@@ -203,6 +250,12 @@ export function SettlementRatesPage() {
     }
     return false;
   }, [draft, days, rateByKey]);
+
+  // 解析结果里落在其它月份的条目数（照样入库，但当前网格看不到，需提示运营切月份核对）
+  const sheetOffMonthCount = useMemo(() => {
+    if (!sheetParsed) return 0;
+    return sheetParsed.entries.filter((e) => !e.departDate.startsWith(`${month}-`)).length;
+  }, [sheetParsed, month]);
 
   return (
     <div className="space-y-6">
@@ -306,6 +359,117 @@ export function SettlementRatesPage() {
             {pasteWarning}
           </div>
         )}
+        {/* 报价表整块粘贴导入：一次吃整张套票表（四个档次一起进），与下方逐格粘贴并存 */}
+        <details className="rounded-md border border-slate-200 bg-slate-50/60 px-3 py-2">
+          <summary className="cursor-pointer text-sm font-semibold text-ink">
+            📋 粘贴报价表（整块导入四个档次）
+          </summary>
+          <div className="mt-3 space-y-3">
+            <p className="text-[11px] text-ink-muted">
+              从报价表 Excel 里整块复制（含表头也没关系），直接粘贴到下框 →「解析预览」核对 →「确认导入」。
+              回程行、公告行、以及「/」或空着的档次会自动跳过（不写也不清空既有价）；同一格重复出现取最后一次。
+              日期只写月日（如 8/12）时按上方所选月份的年份补全。
+            </p>
+            <textarea
+              className="input h-40 w-full font-mono text-xs"
+              placeholder="在这里粘贴报价表内容（日期 / 晚数 / 星期 / 时刻 / 航段 / 四档价格…）"
+              value={sheetText}
+              onChange={(e) => {
+                setSheetText(e.target.value);
+                setSheetParsed(null); // 文本一改，旧预览作废，必须重新解析后才能导入
+              }}
+            />
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                className="btn-secondary"
+                disabled={sheetText.trim() === ''}
+                onClick={previewQuoteSheet}
+              >
+                解析预览
+              </button>
+              {sheetParsed && sheetParsed.entries.length > 0 && (
+                <button
+                  type="button"
+                  className="btn-primary"
+                  disabled={importing || dirty}
+                  onClick={() => void importQuoteSheet()}
+                >
+                  {importing ? '导入中…' : `确认导入 ${sheetParsed.entries.length} 条`}
+                </button>
+              )}
+              {sheetParsed && sheetParsed.entries.length > 0 && dirty && (
+                <span className="text-[11px] text-amber-700">
+                  网格里有未保存的手工改动，请先「整批保存」再导入（导入后会重拉网格）
+                </span>
+              )}
+            </div>
+
+            {sheetParsed && (
+              <div className="space-y-2">
+                <div className="text-xs text-ink">
+                  解析出 <b className="tabular-nums">{sheetParsed.entries.length}</b> 条价格，跳过{' '}
+                  <b className="tabular-nums">{sheetParsed.skipped.length}</b> 行
+                  {sheetOffMonthCount > 0 &&
+                    `；其中 ${sheetOffMonthCount} 条不在 ${month}，导入后请切到对应月份查看`}
+                </div>
+
+                {sheetParsed.entries.length === 0 && sheetParsed.skipped.length === 0 && (
+                  <div className="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800 ring-1 ring-amber-200">
+                    没认出任何价格。请确认复制的是报价表整块内容（要带日期、晚数、航段和四档价格列）。
+                  </div>
+                )}
+
+                {sheetParsed.entries.length > 0 && (
+                  <div className="max-h-64 overflow-auto rounded-md border border-slate-200 bg-white">
+                    <table className="min-w-full text-xs">
+                      <thead className="sticky top-0 bg-slate-50 text-left text-ink-muted">
+                        <tr>
+                          <th className="px-3 py-1.5 font-medium">出发日期</th>
+                          <th className="px-3 py-1.5 font-medium">晚数</th>
+                          <th className="px-3 py-1.5 font-medium">档次</th>
+                          <th className="px-3 py-1.5 text-right font-medium">每人结算价</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {sheetParsed.entries.map((e) => (
+                          <tr
+                            key={`${e.departDate}-${e.nights}-${e.tier}`}
+                            className="border-t border-slate-100"
+                          >
+                            <td className="px-3 py-1 tabular-nums">{e.departDate}</td>
+                            <td className="px-3 py-1">{e.nights}晚</td>
+                            <td className="px-3 py-1">{TIER_LABELS[e.tier]}</td>
+                            <td className="px-3 py-1 text-right tabular-nums">
+                              {e.pricePerPersonCny}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+
+                {sheetParsed.skipped.length > 0 && (
+                  <div className="max-h-40 overflow-auto rounded-md bg-amber-50 px-3 py-2 text-[11px] text-amber-800 ring-1 ring-amber-200">
+                    <div className="font-semibold">
+                      以下 {sheetParsed.skipped.length} 行没入库，可回报价表核对：
+                    </div>
+                    <ul className="mt-1 space-y-0.5">
+                      {sheetParsed.skipped.map((s, i) => (
+                        <li key={`${s.line}-${i}`}>
+                          第 {s.line} 行：{s.reason}
+                          {s.raw !== '' && `（${s.raw}）`}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+        </details>
+
         <p className="text-[11px] text-ink-muted">
           提示：行 = 该月每天，列 = 晚数（1–5晚），档次在上方切换。可从 Excel 复制一块「日期 ×
           晚数」区域，选中起始格后直接粘贴（Ctrl/⌘+V）批量填充；清空格子并保存即删除该价。
