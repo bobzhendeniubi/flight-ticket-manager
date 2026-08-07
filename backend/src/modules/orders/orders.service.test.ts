@@ -2361,11 +2361,12 @@ describe('订单签证状态 + 结构化备注四栏', () => {
       flightScheduleId: 'fs1',
       flightCabin: 'ECONOMY',
       description: 'QH9589 澳门→岘港 2026-06-01 经济舱',
-      passengers: [onePassenger],
+      passengers: [{ ...onePassenger, businessUpgrade: true }],
       ...structured,
     });
     expect(parsed.visaStatus).toBe('E_VISA');
     expect(parsed.notePayment).toBe('已付定金 ¥2000');
+    expect(parsed.passengers[0].businessUpgrade).toBe(true);
   });
 
   it('getOrder：serializer 透传 visaStatus + 四栏结构化备注（详情读路径）', async () => {

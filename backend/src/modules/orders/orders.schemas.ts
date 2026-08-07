@@ -243,8 +243,8 @@ export const passengerInputSchema = z.object({
   // ── 套餐乘客级选项（购物车模式：同一订单每人各选住宿方式 + 签证）──
   //   visaExempt = 客人自备签证（无需送签，签证台过滤 + 套餐价按人扣减 selfVisaDeductCny）
   //   singleRoom = 单住（不拼房，按人收单房差）
-  // 均 optional 布尔：向后兼容——不传时 service 回落旧的整单聚合口径（bundleItem.selfProvidedVisa /
-  //   bundleSingleCount）；任一乘客显式提供时以乘客级派生为权威（优先级见 orders.service）。
+  // 均 optional 布尔：向后兼容——不传时 service 回落 bundleItem 的旧整单聚合口径；
+  //   任一乘客显式提供时以乘客级派生为权威（优先级见 orders.service）。
   visaExempt: z.boolean().optional(),
   singleRoom: z.boolean().optional(),
 });
@@ -731,8 +731,6 @@ export const batchCreateOrdersBodySchema = z
     bundleDepartDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
     // 套餐入住晚数 / 占座等（透传给 bundleItemSchema add-on 字段）
     bundleNights: z.number().int().min(1).max(30).optional(),
-    bundleSingleCount: z.number().int().min(0).max(20).optional(),
-    bundleBusinessCount: z.number().int().min(0).max(20).optional(),
 
     // ── 公共字段 ────────────────────────────────────────────────────────────────
     description: z.string().min(1).max(200), // 航段/套餐描述（每张子单写入 item.description）
@@ -776,7 +774,12 @@ export const batchCreateOrdersBodySchema = z
     // 每位 → 一单。note 为该乘客个别备注（选填），与整批备注合并写入本人订单 notes。
     // 批量/OTA 入单是新建路径 → 护照有效期必填（见 passengerInputWithRequiredExpirySchema 注释）。
     passengers: z
-      .array(passengerInputWithRequiredExpirySchema.extend({ note: z.string().max(500).optional() }))
+      .array(
+        passengerInputWithRequiredExpirySchema.extend({
+          note: z.string().max(500).optional(),
+          businessUpgrade: z.boolean().optional(),
+        }),
+      )
       .min(1)
       .max(100),
   })
