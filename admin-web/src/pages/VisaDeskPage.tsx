@@ -283,6 +283,16 @@ function PassengerRow({
           </div>
         )}
       </div>
+      {resolvedPhoto && (
+        <a
+          href={resolvedPhoto}
+          download={`passport-${passenger.documentNumber}.jpg`}
+          className="btn-secondary shrink-0 py-0.5 px-1.5 text-[10px]"
+          onClick={(e) => e.stopPropagation()}
+        >
+          下载护照
+        </a>
+      )}
 
       {/* 姓名 / 护照号 / 护照有效期 */}
       <div className="min-w-0 flex-1">
@@ -665,6 +675,7 @@ function VisaCostControl({ task, token, defaultFxRate, onSaved }: VisaCostContro
 // ── 订单组：订单头行 + 平铺乘客行 ─────────────────────────────────────────────
 interface OrderGroupProps {
   task: FulfillmentTask;
+  rowNumber: number;
   selectedPassengerIds: Set<string>;
   onTogglePassenger: (passengerId: string) => void;
   onToggleOrderPassengers: (passengerIds: string[]) => void;
@@ -675,6 +686,7 @@ interface OrderGroupProps {
 }
 function OrderGroup({
   task,
+  rowNumber,
   selectedPassengerIds,
   onTogglePassenger,
   onToggleOrderPassengers,
@@ -895,6 +907,7 @@ function OrderGroup({
             onChange={() => onToggleOrderPassengers(passengerIds)}
           />
         </td>
+        <td className="nums align-top text-center text-xs text-ink-muted">{rowNumber}</td>
         <td className="align-top font-mono text-xs text-ink">
           <div>
             {task.order?.orderNumber ? (
@@ -1011,7 +1024,7 @@ function OrderGroup({
 
       {/* 平铺乘客行（默认展示，不需点开） */}
       <tr>
-        <td colSpan={6} className="px-4 pb-3 pt-1">
+        <td colSpan={7} className="px-4 pb-3 pt-1">
           {passengers.length === 0 ? (
             <p className="text-xs text-ink-muted">无乘客数据</p>
           ) : (
@@ -1767,6 +1780,7 @@ export function VisaDeskPage() {
                     onChange={toggleAllVisible}
                   />
                 </th>
+                <th className="w-12 text-center">序号</th>
                 <th>订单号</th>
                 <th className="text-right">送签进度</th>
                 <th>备注</th>
@@ -1777,7 +1791,7 @@ export function VisaDeskPage() {
             <tbody>
               {loading ? (
                 <tr>
-                  <td colSpan={6} className="py-10 text-center text-ink-muted">
+                  <td colSpan={7} className="py-10 text-center text-ink-muted">
                     <span className="inline-flex items-center gap-2">
                       <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-brand border-t-transparent" />
                       加载签证任务…
@@ -1786,15 +1800,16 @@ export function VisaDeskPage() {
                 </tr>
               ) : tasks.length === 0 ? (
                 <tr>
-                  <td colSpan={6} className="py-6 text-center text-ink-muted">
+                  <td colSpan={7} className="py-6 text-center text-ink-muted">
                     该筛选条件下暂无签证任务
                   </td>
                 </tr>
               ) : (
-                tasks.map((task) => (
+                tasks.map((task, index) => (
                   <OrderGroup
                     key={task.id}
                     task={task}
+                    rowNumber={index + 1}
                     selectedPassengerIds={selectedPassengerIds}
                     onTogglePassenger={togglePassenger}
                     onToggleOrderPassengers={toggleOrderPassengers}
