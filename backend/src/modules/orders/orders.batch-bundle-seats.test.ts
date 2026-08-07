@@ -170,6 +170,21 @@ describe('batchCreateOrders · BUNDLE 优雅失败（不阻断整批、逐单失
 
 // ── (4) batchCreateOrders BUNDLE 成功路径：注入 FLIGHT 行 + 房控日期同源 ────────
 describe('batchCreateOrders · BUNDLE 成功路径（航段注入 + 房控日期与机票同源）', () => {
+  function configureOneWayBundle(businessUpgradeCnyPerLeg: number | null = null): void {
+    mockPrisma.bundle.findUnique.mockResolvedValue({
+      defaultDepartDate: '2026-09-15',
+      hotelNights: 3,
+      items: [{ kind: 'HOTEL', qty: 3, unitPrice: 600 }],
+      legs: 1,
+      outboundFlightId: 'flight-go',
+      returnFlightId: null,
+      businessUpgradeCnyPerLeg,
+    });
+    mockPrisma.flightSchedule.findMany.mockResolvedValue([
+      { id: 'sch-go', departureTime: new Date('2026-09-15T04:00:00Z'), departureTz: 'Asia/Macau' },
+    ]);
+  }
+
   it('弹窗出发日期匹配去/回程班次 → createOrder 收到去/回程 FLIGHT 行；房控 goDate == 机票去程本地日', async () => {
     mockPrisma.bundle.findUnique.mockResolvedValue({
       defaultDepartDate: '2026-01-01', // 会被弹窗 bundleDepartDate 覆盖
@@ -216,5 +231,143 @@ describe('batchCreateOrders · BUNDLE 成功路径（航段注入 + 房控日期
     // 房控盖章日期与机票去程本地出发日同源（goDate = 弹窗出发日；returnDate = +3 晚）
     const bundleRow = items.find((i) => i.kind === 'BUNDLE') as { metadata?: Record<string, unknown> };
     expect(bundleRow.metadata).toMatchObject({ goDate: '2026-09-15', returnDate: '2026-09-18' });
+  });
+
+  it('逐行套餐选项 + 按出发日生日分类 → 只有第 2 张子单带单住/升舱及对应人数', async () => {
+    mockPrisma.bundle.findUnique.mockResolvedValue({
+      defaultDepartDate: '2026-09-15',
+      hotelNights: 3,
+      items: [{ kind: 'HOTEL', qty: 3, unitPrice: 600 }],
+      legs: 1,
+      outboundFlightId: 'flight-go',
+      returnFlightId: null,
+    });
+    mockPrisma.flightSchedule.findMany.mockResolvedValue([
+      { id: 'sch-go', departureTime: new Date('2026-09-15T04:00:00Z'), departureTz: 'Asia/Macau' },
+    ]);
+
+    const captured: Array<{ items: unknown; passengers: unknown }> = [];
+    vi.spyOn(service as never, 'createOrder').mockImplementation((async (body: { items: unknown; passengers: unknown }) => {
+      captured.push({ items: body.items, passengers: body.passengers });
+      return { id: `o-${captured.length}`, orderNumber: `N-${captured.length}` };
+    }) as never);
+
+    const res = await service.batchCreateOrders(
+      baseBundleBody({
+        bundleDepartDate: '2026-09-15',
+        passengers: [
+          { fullName: 'ADULT ONE', documentNumber: 'P001', dateOfBirth: '1990-01-01', nationality: 'CN' },
+          {
+            fullName: 'CHILD TWO',
+            documentNumber: 'P002',
+            dateOfBirth: '2016-09-15',
+            nationality: 'CN',
+            visaExempt: true,
+            singleRoom: true,
+            businessUpgrade: true,
+          },
+          { fullName: 'ADULT THREE', documentNumber: 'P003', dateOfBirth: '1980-09-15', nationality: 'CN' },
+        ],
+      }),
+      { userId: 'u-admin', role: 'ADMIN' } as never,
+    );
+
+    expect(res).toMatchObject({ successCount: 3, failureCount: 0 });
+    expect(captured).toHaveLength(3);
+    expect(captured.map(({ items }) => {
+      const bundle = (items as Array<Record<string, unknown>>).find((item) => item.kind === 'BUNDLE')!;
+      return {
+        singleCount: bundle.singleCount,
+        businessCount: bundle.businessCount,
+        adultCount: bundle.adultCount,
+        childCount: bundle.childCount,
+        infantCount: bundle.infantCount,
+      };
+    })).toEqual([
+      { singleCount: 0, businessCount: 0, adultCount: 1, childCount: 0, infantCount: 0 },
+      { singleCount: 1, businessCount: 1, adultCount: 0, childCount: 1, infantCount: 0 },
+      { singleCount: 0, businessCount: 0, adultCount: 1, childCount: 0, infantCount: 0 },
+    ]);
+    expect(captured.map(({ passengers }) => (passengers as Array<Record<string, unknown>>)[0])).toEqual([
+      expect.not.objectContaining({ visaExempt: true, singleRoom: true }),
+      expect.objectContaining({ visaExempt: true, singleRoom: true, businessUpgrade: true }),
+      expect.not.objectContaining({ visaExempt: true, singleRoom: true }),
+    ]);
+  });
+
+  it('套餐显式升舱费率为 0 + 行勾选升舱 → 该子单逐单失败且不建单', async () => {
+    configureOneWayBundle(0);
+    const createSpy = vi.spyOn(service as never, 'createOrder').mockImplementation((async () => ({
+      id: 'should-not-create',
+      orderNumber: 'should-not-create',
+    })) as never);
+
+    const res = await service.batchCreateOrders(
+      baseBundleBody({
+        bundleDepartDate: '2026-09-15',
+        passengers: [{
+          fullName: 'ADULT UPGRADE',
+          documentNumber: 'P004',
+          dateOfBirth: '1990-01-01',
+          nationality: 'CN',
+          businessUpgrade: true,
+        }],
+      }),
+      { userId: 'u-admin', role: 'ADMIN' } as never,
+    );
+
+    expect(res).toMatchObject({ successCount: 0, failureCount: 1 });
+    expect(res.results[0].error).toContain('该套餐不提供升舱');
+    expect(createSpy).not.toHaveBeenCalled();
+  });
+
+  it('婴儿单独成单 → 逐单失败并提示需与同行成人同单录入', async () => {
+    configureOneWayBundle(null);
+    const createSpy = vi.spyOn(service as never, 'createOrder').mockImplementation((async () => ({
+      id: 'should-not-create',
+      orderNumber: 'should-not-create',
+    })) as never);
+
+    const res = await service.batchCreateOrders(
+      baseBundleBody({
+        bundleDepartDate: '2026-09-15',
+        passengers: [{
+          fullName: 'INFANT PAX',
+          documentNumber: 'P005',
+          dateOfBirth: '2025-09-15',
+          nationality: 'CN',
+        }],
+      }),
+      { userId: 'u-admin', role: 'ADMIN' } as never,
+    );
+
+    expect(res).toMatchObject({ successCount: 0, failureCount: 1 });
+    expect(res.results[0].error).toContain('婴儿');
+    expect(createSpy).not.toHaveBeenCalled();
+  });
+
+  it('儿童批量套餐子单 → passengerType 显式传 CHILD', async () => {
+    configureOneWayBundle(null);
+    const captured: Array<{ passengers: unknown }> = [];
+    vi.spyOn(service as never, 'createOrder').mockImplementation((async (body: { passengers: unknown }) => {
+      captured.push({ passengers: body.passengers });
+      return { id: 'o-child', orderNumber: 'N-child' };
+    }) as never);
+
+    const res = await service.batchCreateOrders(
+      baseBundleBody({
+        bundleDepartDate: '2026-09-15',
+        passengers: [{
+          fullName: 'CHILD PAX',
+          documentNumber: 'P006',
+          dateOfBirth: '2016-09-15',
+          nationality: 'CN',
+        }],
+      }),
+      { userId: 'u-admin', role: 'ADMIN' } as never,
+    );
+
+    expect(res).toMatchObject({ successCount: 1, failureCount: 0 });
+    expect((captured[0].passengers as Array<Record<string, unknown>>)[0].passengerType).toBe('CHILD');
   });
 });

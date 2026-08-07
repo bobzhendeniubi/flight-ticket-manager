@@ -6618,6 +6618,10 @@ interface BatchRow {
   dateOfBirth: string;
   /** 该乘客的个别备注（选填）：客人各自的特殊要求，随本人订单单独存。留空则只写整批备注。 */
   note?: string;
+  /** 套餐行级选项：只作用于该乘客自己的子单。 */
+  visaExempt?: boolean;
+  singleRoom?: boolean;
+  businessUpgrade?: boolean;
   // ── OTA 名单解析带出的护照字段（选填；粘贴导入时填充，随提交发给后端）──────
   lastName?: string;
   firstName?: string;
@@ -6713,6 +6717,24 @@ function parseDob(raw: string): string | null {
   return `${year}-${mm}-${dd}`;
 }
 
+const BATCH_INFANT_WARNING = '婴儿不占座不占房，请在单笔录单中与同行成人同单录入';
+type BatchAgeGroup = 'ADULT' | 'CHILD' | 'INFANT';
+
+/** 批量套餐表格展示用：与后端按套餐出发日的实足年龄口径保持一致。 */
+function deriveBatchAgeGroup(dateOfBirth: string, departDate: string): BatchAgeGroup | null {
+  const dob = parseDob(dateOfBirth);
+  const depart = parseDob(departDate);
+  if (!dob || !depart) return null;
+  const dobDate = new Date(`${dob}T00:00:00.000Z`);
+  const departDateValue = new Date(`${depart}T00:00:00.000Z`);
+  let age = departDateValue.getUTCFullYear() - dobDate.getUTCFullYear();
+  const monthDiff = departDateValue.getUTCMonth() - dobDate.getUTCMonth();
+  if (monthDiff < 0 || (monthDiff === 0 && departDateValue.getUTCDate() < dobDate.getUTCDate())) age -= 1;
+  if (age < 0 || age >= 12) return 'ADULT';
+  if (age >= 2) return 'CHILD';
+  return 'INFANT';
+}
+
 function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
   const tokens = useAuth((s) => s.tokens);
   const user = useAuth((s) => s.user);
@@ -6755,12 +6777,6 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   // 留空则后端回落套餐默认出发日期；两者都无 → 该批逐单优雅失败（提示配置出发日期/排班）。
   const [bundleDepartDate, setBundleDepartDate] = useState('');
   const [bundleNights, setBundleNights] = useState<number | null>(null);
-  const [bundleSingleCount, setBundleSingleCount] = useState<number | null>(null);
-  const [bundleBusinessCount, setBundleBusinessCount] = useState<number | null>(null);
-  // 人群区分：批量模式每乘客一单，这三个值描述本批整体的人群结构
-  const [bundleAdultCount, setBundleAdultCount] = useState<number | null>(1);
-  const [bundleChildCount, setBundleChildCount] = useState<number | null>(0);
-  const [bundleInfantCount, setBundleInfantCount] = useState<number | null>(0);
   // 仅 ADMIN/STAFF 可用运营专属能力（手动结算单价、代为归属代理）。
   const isOps = user?.role === 'ADMIN' || user?.role === 'STAFF';
 
@@ -6900,8 +6916,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
     setOutboundFlightId(''); setOutboundScheduleId(''); setOutboundSchedules([]); setOutboundDate('');
     setReturnFlightId(''); setReturnScheduleId(''); setReturnSchedules([]); setReturnDate('');
     setCabin('');
-    setBundleId(''); setBundleNights(null); setBundleSingleCount(null); setBundleBusinessCount(null);
-    setBundleAdultCount(1); setBundleChildCount(0); setBundleInfantCount(0);
+    setBundleId(''); setBundleNights(null);
     setSettlementPriceCny(null); setGroupNote('');
     setManualUnitPriceCny(null); setPendingSchedDate('');
     setErr(null);
@@ -7020,6 +7035,24 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   }, [returnSchedules, pendingReturnSchedDate, returnScheduleId]);
   const cabinOptions = outboundSchedule?.seatClasses ?? [];
   const selectedBundle = bundles.find((b) => b.id === bundleId);
+  const canOfferBundleBusiness = Boolean(
+    selectedBundle &&
+      (selectedBundle.businessUpgradeCnyPerLeg == null || selectedBundle.businessUpgradeCnyPerLeg > 0),
+  );
+  const canOfferBundleSingle = Boolean(
+    selectedBundle && selectedBundle.singleSupplementCnyPerNight != null,
+  );
+  const batchBundleDepartDate = bundleDepartDate || selectedBundle?.defaultDepartDate || '';
+
+  // 切换套餐时不能把上一套餐的升舱选择带到新套餐；费率为 0 的套餐也不应残留该勾选。
+  useEffect(() => {
+    setRows((prev) => {
+      if (!prev.some((row) => row.businessUpgrade !== undefined)) return prev;
+      const next = prev.map((row) => ({ ...row, businessUpgrade: undefined }));
+      rowsRef.current = next;
+      return next;
+    });
+  }, [bundleId]);
 
   // 套餐搜索下拉（W3）：套餐多时原生 select 找不到，换 SearchSelect 按名称/编号搜索；
   // priceLabel 用折后起价/人 = originalPerPaxCny ×(1−discountPct/100)，与套餐页卡片口径一致。
@@ -7473,11 +7506,6 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
             bundleId,
             ...(bundleDepartDate ? { bundleDepartDate } : {}),
             ...(bundleNights !== null ? { bundleNights } : {}),
-            ...(bundleSingleCount !== null ? { bundleSingleCount } : {}),
-            ...(bundleBusinessCount !== null ? { bundleBusinessCount } : {}),
-            ...(bundleAdultCount !== null ? { adultCount: bundleAdultCount } : {}),
-            ...(bundleChildCount !== null ? { childCount: bundleChildCount } : {}),
-            ...(bundleInfantCount !== null ? { infantCount: bundleInfantCount } : {}),
           }),
       description,
       notes: notes.trim() || undefined,
@@ -7503,6 +7531,9 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
         ...(r.passportIssuePlace?.trim() ? { passportIssuePlace: r.passportIssuePlace.trim() } : {}),
         ...(r.passportPhotoUrl ? { passportPhotoUrl: r.passportPhotoUrl } : {}),
         ...(r.pnr?.trim() ? { pnr: r.pnr.trim().toUpperCase() } : {}),
+        ...(productType === 'BUNDLE' && r.visaExempt === true ? { visaExempt: true } : {}),
+        ...(productType === 'BUNDLE' && canOfferBundleSingle && r.singleRoom === true ? { singleRoom: true } : {}),
+        ...(productType === 'BUNDLE' && canOfferBundleBusiness && r.businessUpgrade === true ? { businessUpgrade: true } : {}),
         note: r.note?.trim() || undefined,
       })),
       ...(teamPrice !== undefined
@@ -7854,71 +7885,6 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                       placeholder={selectedBundle?.hotelNights ? `默认 ${selectedBundle.hotelNights} 晚` : '晚数'}
                     />
                   </label>
-                  <label className="text-xs text-slate-500">
-                    单人入住人数（选填）
-                    <NumberInput
-                      className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
-                      value={bundleSingleCount}
-                      onChange={setBundleSingleCount}
-                      min={0}
-                      max={20}
-                      step={1}
-                      integerOnly
-                      placeholder="0"
-                    />
-                  </label>
-                  <label className="text-xs text-slate-500">
-                    升舱商务人数（选填）
-                    <NumberInput
-                      className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
-                      value={bundleBusinessCount}
-                      onChange={setBundleBusinessCount}
-                      min={0}
-                      max={20}
-                      step={1}
-                      integerOnly
-                      placeholder="0"
-                    />
-                  </label>
-                  <label className="text-xs text-slate-500">
-                    成人人数
-                    <NumberInput
-                      className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
-                      value={bundleAdultCount}
-                      onChange={setBundleAdultCount}
-                      min={1}
-                      max={50}
-                      step={1}
-                      integerOnly
-                      placeholder="1"
-                    />
-                  </label>
-                  <label className="text-xs text-slate-500">
-                    儿童人数（选填）
-                    <NumberInput
-                      className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
-                      value={bundleChildCount}
-                      onChange={setBundleChildCount}
-                      min={0}
-                      max={20}
-                      step={1}
-                      integerOnly
-                      placeholder="0"
-                    />
-                  </label>
-                  <label className="text-xs text-slate-500">
-                    婴儿人数（选填）
-                    <NumberInput
-                      className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
-                      value={bundleInfantCount}
-                      onChange={setBundleInfantCount}
-                      min={0}
-                      max={10}
-                      step={1}
-                      integerOnly
-                      placeholder="0"
-                    />
-                  </label>
                 </div>
               </div>
             )}
@@ -7926,7 +7892,12 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
             {/* D 乘客名单：乘客表格 */}
             <div>
               <div className="mb-1 flex items-center justify-between">
-                <span className="text-sm font-medium text-slate-700">乘客名单（每位一单 · 共 {validRows.length} 位有效）</span>
+                <div>
+                  <span className="text-sm font-medium text-slate-700">乘客名单（每位一单 · 共 {validRows.length} 位有效）</span>
+                  {productType === 'BUNDLE' && (
+                    <span className="ml-2 text-[11px] text-slate-400">勾选仅作用于该乘客自己的订单，价格由系统按套餐费率自动计算</span>
+                  )}
+                </div>
                 <div className="flex items-center gap-3">
                   {/* 批量传护照：多选 → 逐张识别（并发 3）→ 自动生成乘客行。实现模式同 SingleOrderModal。 */}
                   <input
@@ -7956,7 +7927,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                 </div>
               </div>
               <div className="scrollbar-visible max-h-60 overflow-x-auto overflow-y-auto rounded-md border border-slate-200">
-                <table className="min-w-[1030px] w-full text-sm">
+                <table className={`${productType === 'BUNDLE' ? 'min-w-[1160px]' : 'min-w-[1030px]'} w-full text-sm`}>
                   <thead className="sticky top-0 bg-slate-50 text-xs text-slate-500">
                     <tr>
                       <th className="min-w-[130px] whitespace-nowrap px-2 py-1.5 text-left font-normal">姓名</th>
@@ -7967,6 +7938,9 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                       <th className="min-w-[130px] whitespace-nowrap px-2 py-1.5 text-left font-normal">
                         护照有效期 <span className="text-rose-500">*必填</span>
                       </th>
+                      {productType === 'BUNDLE' && (
+                        <th className="min-w-[130px] whitespace-nowrap px-2 py-1.5 text-left font-normal">套餐选项</th>
+                      )}
                       <th className="min-w-[130px] whitespace-nowrap px-2 py-1.5 text-left font-normal">备注（选填）</th>
                       <th className="min-w-[110px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照 OCR</th>
                       <th className="min-w-[36px] px-2 py-1.5"></th>
@@ -7975,6 +7949,9 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                   <tbody>
                     {rows.map((r, i) => {
                       const isOcring = r.ocrPct !== null && r.ocrPct !== undefined && r.ocrPct < 100;
+                      const ageGroup = productType === 'BUNDLE'
+                        ? deriveBatchAgeGroup(r.dateOfBirth, batchBundleDepartDate)
+                        : null;
                       const reviewHint = ocrReviewHintText({
                         reviewFields: r.reviewFields,
                         mrzValid: r.mrzValid,
@@ -7982,7 +7959,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                       });
                       return (
                       <Fragment key={i}>
-                      <tr className="border-t border-slate-100">
+                      <tr className={`border-t border-slate-100 ${ageGroup === 'INFANT' ? 'bg-amber-50/60' : ''}`}>
                         <td className="px-2 py-1 align-top">
                           <input
                             className={`w-full rounded border px-1.5 py-1 text-sm ${batchHasFieldReview(r, 'fullName') ? 'border-amber-400 bg-amber-50' : 'border-slate-300'}`}
@@ -8046,6 +8023,18 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                                   onChange={(e) => setRow(i, { dateOfBirth: e.target.value })}
                                 />
                                 {dobBad && <span className="mt-0.5 block text-[11px] text-rose-500">格式如 1990-01-01</span>}
+                                {ageGroup && (
+                                  <span className={`mt-0.5 inline-block rounded px-1.5 py-0.5 text-[10px] font-medium ${
+                                    ageGroup === 'INFANT'
+                                      ? 'bg-amber-100 text-amber-800 ring-1 ring-amber-300'
+                                      : 'bg-slate-100 text-slate-600'
+                                  }`}>
+                                    {ageGroup === 'ADULT' ? '成人' : ageGroup === 'CHILD' ? '儿童' : '婴儿'}
+                                  </span>
+                                )}
+                                {ageGroup === 'INFANT' && (
+                                  <span className="mt-0.5 block text-[10px] leading-tight text-amber-700">{BATCH_INFANT_WARNING}</span>
+                                )}
                               </>
                             );
                           })()}
@@ -8077,6 +8066,40 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                             );
                           })()}
                         </td>
+                        {productType === 'BUNDLE' && (
+                          <td className="px-2 py-1 align-top">
+                            <div className="space-y-0.5 text-[11px] text-slate-600">
+                              <label className="flex items-center gap-1 whitespace-nowrap">
+                                <input
+                                  type="checkbox"
+                                  checked={r.visaExempt === true}
+                                  onChange={(e) => setRow(i, { visaExempt: e.target.checked })}
+                                />
+                                自备签
+                              </label>
+                              {canOfferBundleSingle && (
+                                <label className="flex items-center gap-1 whitespace-nowrap">
+                                  <input
+                                    type="checkbox"
+                                    checked={r.singleRoom === true}
+                                    onChange={(e) => setRow(i, { singleRoom: e.target.checked })}
+                                  />
+                                  单住
+                                </label>
+                              )}
+                              {canOfferBundleBusiness && (
+                                <label className="flex items-center gap-1 whitespace-nowrap">
+                                  <input
+                                    type="checkbox"
+                                    checked={r.businessUpgrade === true}
+                                    onChange={(e) => setRow(i, { businessUpgrade: e.target.checked })}
+                                  />
+                                  升舱商务
+                                </label>
+                              )}
+                            </div>
+                          </td>
+                        )}
                         <td className="px-2 py-1 align-top">
                           <input
                             className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm"
@@ -8148,7 +8171,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                       </tr>
                       {reviewHint && (
                         <tr className="border-t-0">
-                          <td colSpan={9} className="bg-amber-50 px-2 py-1 text-[11px] text-amber-700">
+                          <td colSpan={productType === 'BUNDLE' ? 10 : 9} className="bg-amber-50 px-2 py-1 text-[11px] text-amber-700">
                             ⚠️ {reviewHint}
                           </td>
                         </tr>

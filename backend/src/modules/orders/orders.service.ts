@@ -71,6 +71,7 @@ import { PricingService } from '../pricing/pricing.service.js';
 import { createOpenReceiptWithinTx } from '../receipts/receipts.service.js';
 import { OPERATION_FEE_CNY_PER_ORDER } from './order-cost-items.service.js';
 import { bundleItemMetadataSchema } from './orders.schemas.js';
+import { derivePtcByAge } from './pnr-export.js';
 import {
   assertOrderAllowsInvoicing,
   assertTicketingCap,
@@ -324,8 +325,40 @@ export interface BundleFlightLeg {
   label: string; // 「去程」/「回程」
 }
 
+/** 批量套餐单一乘客的行级选项与按出发日推导的人群计数。 */
+export interface BatchBundlePassengerOptions {
+  singleRoom?: boolean;
+  businessUpgrade?: boolean;
+  adultCount: number;
+  childCount: number;
+  infantCount: number;
+}
+
+function parseBatchYmd(value: string | undefined): Date | null {
+  if (!value || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+  const date = new Date(`${value}T00:00:00.000Z`);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toISOString().slice(0, 10) === value ? date : null;
+}
+
 /**
- * 批量散客建单：按 productType 构造每张子单的 items（与具体出行人无关，整批共用一份）。
+ * 批量套餐按乘客生日相对套餐出发日推导三计数。
+ * 复用票务导出的实足年龄/PTC 口径；生日缺失或日期不可用按成人处理。
+ */
+export function deriveBatchBundlePassengerCounts(
+  dateOfBirth: string | undefined,
+  bundleDepartDate: string | undefined,
+): Pick<BatchBundlePassengerOptions, 'adultCount' | 'childCount' | 'infantCount'> {
+  const ptc = derivePtcByAge(parseBatchYmd(dateOfBirth), parseBatchYmd(bundleDepartDate), 'ADULT');
+  return {
+    adultCount: ptc === 'ADT' ? 1 : 0,
+    childCount: ptc === 'CHD' ? 1 : 0,
+    infantCount: ptc === 'INF' ? 1 : 0,
+  };
+}
+
+/**
+ * 批量散客建单：按 productType 构造每张子单的 items；BUNDLE 行级选项由调用方逐人传入。
  * 导出供单测复用。
  *   FLIGHT_ONEWAY    → [FLIGHT(outbound)]
  *   FLIGHT_ROUNDTRIP → [FLIGHT(outbound 去程), FLIGHT(return 返程)]，均同舱位
@@ -347,6 +380,11 @@ export function buildBatchItems(
   outbound: string | undefined,
   bundleDates: { goDate?: string; returnDate?: string } = {},
   bundleFlightLegs: readonly BundleFlightLeg[] = [],
+  bundlePassengerOptions: BatchBundlePassengerOptions = {
+    adultCount: 1,
+    childCount: 0,
+    infantCount: 0,
+  },
 ): OrderItemInput[] {
   if (productType === 'BUNDLE') {
     if (!body.bundleId) throw new BadRequestError('BUNDLE 类型必须提供 bundleId');
@@ -372,9 +410,13 @@ export function buildBatchItems(
         bundleId: body.bundleId,
         // unitPrice 由服务端权威重算（createOrder BUNDLE 分支忽略前端传值，0 仅占位）
         unitPrice: 0,
-        // 可选升级 add-on 份数（缺省 0 = 无升级）
-        singleCount: body.bundleSingleCount ?? 0,
-        businessCount: body.bundleBusinessCount ?? 0,
+        // 可选升级 add-on 份数：批量每张子单只使用本行乘客的勾选结果。
+        singleCount: bundlePassengerOptions.singleRoom === true ? 1 : 0,
+        businessCount: bundlePassengerOptions.businessUpgrade === true ? 1 : 0,
+        // 批量每张子单只有一位乘客，三计数按该乘客生日相对套餐出发日推导。
+        adultCount: bundlePassengerOptions.adultCount,
+        childCount: bundlePassengerOptions.childCount,
+        infantCount: bundlePassengerOptions.infantCount,
         ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
       },
     ];
@@ -3313,6 +3355,7 @@ export class OrderService {
     //   由下方逐单循环让每张子单以该原因失败（座位账诚实：宁可整批失败也不落零座位套餐单）。
     let bundleDates: { goDate?: string; returnDate?: string } = {};
     let bundleFlightLegs: BundleFlightLeg[] = [];
+    let bundleBusinessUpgradeCnyPerLeg: number | null | undefined;
     let bundleLegResolutionError: string | null = null;
     if (productType === 'BUNDLE' && body.bundleId) {
       const resolved = await this.resolveBundleFlightLegs(
@@ -3325,58 +3368,22 @@ export class OrderService {
       } else {
         bundleFlightLegs = resolved.legs;
         bundleDates = resolved.dates;
+        bundleBusinessUpgradeCnyPerLeg = resolved.businessUpgradeCnyPerLeg;
       }
     }
 
-    // 按 productType 构造每张子单的 items（每位出行人都用同一份；与乘客无关，循环外算一次）。
+    // 按 productType 构造非套餐子单的 items（机票项与乘客无关，循环外算一次）。
+    // BUNDLE 的地面行包含单住/升舱/年龄计数，必须在逐人循环内按本行乘客构造。
     //   FLIGHT_ONEWAY   → 1 条 FLIGHT（outbound）
     //   FLIGHT_ROUNDTRIP→ 2 条 FLIGHT（去程 outbound + 返程 return），均同舱位
     //   BUNDLE          → 去/回程 FLIGHT 航段行（扣座 + 进票务）+ 1 条地面 BUNDLE 行（服务端重算地面价 +
     //                      盖酒店房型/入住日期到订单行 → 房控/销控自动计入套餐占房）。
-    // 套餐航段解析失败时 bundleFlightLegs 为空、batchItems 只含地面行 —— 但循环不会用它（下方逐单短路失败），
+    // 套餐航段解析失败时 bundleFlightLegs 为空、构造结果只含地面行 —— 但循环不会用它（下方逐单短路失败），
     // 故此处不因空航段抛错（保持纯函数「按输入拼装」语义）。
-    const batchItems: OrderItemInput[] = buildBatchItems(
-      body,
-      productType,
-      outbound,
-      bundleDates,
-      bundleFlightLegs,
-    );
-
-    // OTA 手动结算单价（权限已在方法顶端按身份收口）：不覆盖机票权威价，而是先算系统权威价，
-    // 再据差额追加一条价格调整行把每单总额调到手动结算价。系统权威价对同批每张子单一致
-    // （同班次/舱位、quantity=1，机票定价与乘客无关），故循环外只算一次。
-    //   差额 = 手动价 − 系统价：正 → MISC_FEE（补收），负 → DISCOUNT（优惠）；0 → 不加调整行。
-    //   reasonText 记「OTA 结算价 ¥X/人」，随 createOrder 的 priceAdjustment 审计路径落库（审计照记）。
-    let manualPriceAdjustment: PriceAdjustmentInput | undefined;
-    // 套餐航段解析失败时跳过系统权威价试算（batchItems 只含地面行、且整批将逐单失败，试算无意义）。
-    if (body.manualUnitPriceCny !== undefined && !bundleLegResolutionError) {
-      // 批量录单为 ADMIN/STAFF 专用路径，允许自由行手录价地面行。
-      const priced = await this.priceAndValidateItems(batchItems, undefined, undefined, true);
-      const systemTotal = priced.reduce((sum, p) => sum + p.amount, 0);
-      // 相对合理性硬闸（A17/A18，2026-07-17 拍板）：手填价 < 系统权威价 10% 一律拒绝——
-      // 这是「¥1000 打成 ¥100 / ¥0」的肥指区间，真实 OTA 成交价不会低到系统价一折以下。
-      // 绝对上限（SETTLEMENT_PRICE_CAP_CNY）挡不住这类少打一个零的错误，审计留痕只能追责不能防损。
-      // 系统价不可得（systemTotal ≤ 0，如纯手录地面行）时跳过比值判断，仍受绝对上限约束。
-      if (systemTotal > 0 && body.manualUnitPriceCny < systemTotal * 0.1) {
-        throw new BadRequestError(
-          `OTA 结算单价 ¥${body.manualUnitPriceCny}/人 低于系统参考价 ¥${Math.round(systemTotal)} 的 10%，` +
-            '疑似录入错误已拒绝。如确为特批价，请先调整产品定价或联系管理员走结算价通道。',
-        );
-      }
-      const diff = Math.round(body.manualUnitPriceCny - systemTotal);
-      if (diff !== 0) {
-        // 偏离度写进审计文本：>±50% 的单在流水里一眼可见，便于财务复核（前端另有确认提示）。
-        const pct = systemTotal > 0 ? Math.round((body.manualUnitPriceCny / systemTotal) * 100) : null;
-        manualPriceAdjustment = {
-          amountCny: diff,
-          reasonCode: diff > 0 ? 'MISC_FEE' : 'DISCOUNT',
-          reasonText:
-            `OTA 结算价 ¥${body.manualUnitPriceCny}/人` +
-            (pct !== null && (pct < 50 || pct > 200) ? `（系统参考价 ¥${Math.round(systemTotal)} 的 ${pct}%，请复核）` : ''),
-        };
-      }
-    }
+    const commonBatchItems: OrderItemInput[] | undefined =
+      productType === 'BUNDLE'
+        ? undefined
+        : buildBatchItems(body, productType, outbound, bundleDates, bundleFlightLegs);
 
     const results: Array<{
       index: number;
@@ -3404,6 +3411,59 @@ export class OrderService {
         continue;
       }
       try {
+        const isBundle = productType === 'BUNDLE';
+        const ageCounts = isBundle
+          ? deriveBatchBundlePassengerCounts(passenger.dateOfBirth, bundleDates.goDate)
+          : { adultCount: 1, childCount: 0, infantCount: 0 };
+        if (isBundle && ageCounts.infantCount === 1) {
+          throw new BadRequestError('婴儿不占座不占房，请在单笔录单中与同行成人同单录入');
+        }
+        if (isBundle && passenger.businessUpgrade === true && bundleBusinessUpgradeCnyPerLeg === 0) {
+          throw new BadRequestError('该套餐不提供升舱');
+        }
+        const passengerForOrder = isBundle
+          ? {
+              ...passenger,
+              passengerType:
+                ageCounts.adultCount === 1
+                  ? PassengerType.ADULT
+                  : ageCounts.childCount === 1
+                    ? PassengerType.CHILD
+                    : PassengerType.INFANT,
+            }
+          : passenger;
+        const batchItems =
+          commonBatchItems ??
+          buildBatchItems(body, productType, outbound, bundleDates, bundleFlightLegs, {
+            ...ageCounts,
+            singleRoom: passenger.singleRoom,
+            businessUpgrade: passenger.businessUpgrade,
+          });
+
+        // OTA 手动结算价按每张子单的实际权威价计算；BUNDLE 的生日/行级选项可能使各子单系统价不同。
+        let manualPriceAdjustment: PriceAdjustmentInput | undefined;
+        if (body.manualUnitPriceCny !== undefined) {
+          const priced = await this.priceAndValidateItems(batchItems, undefined, [passengerForOrder], true);
+          const systemTotal = priced.reduce((sum, p) => sum + p.amount, 0);
+          if (systemTotal > 0 && body.manualUnitPriceCny < systemTotal * 0.1) {
+            throw new BadRequestError(
+              `OTA 结算单价 ¥${body.manualUnitPriceCny}/人 低于系统参考价 ¥${Math.round(systemTotal)} 的 10%，` +
+                '疑似录入错误已拒绝。如确为特批价，请先调整产品定价或联系管理员走结算价通道。',
+            );
+          }
+          const diff = Math.round(body.manualUnitPriceCny - systemTotal);
+          if (diff !== 0) {
+            const pct = systemTotal > 0 ? Math.round((body.manualUnitPriceCny / systemTotal) * 100) : null;
+            manualPriceAdjustment = {
+              amountCny: diff,
+              reasonCode: diff > 0 ? 'MISC_FEE' : 'DISCOUNT',
+              reasonText:
+                `OTA 结算价 ¥${body.manualUnitPriceCny}/人` +
+                (pct !== null && (pct < 50 || pct > 200) ? `（系统参考价 ¥${Math.round(systemTotal)} 的 ${pct}%，请复核）` : ''),
+            };
+          }
+        }
+
         const order = await this.createOrder(
           {
             // 联系人=本单乘客（body 显式传联系人则整批统一用它；录入人仅兜底）。
@@ -3432,7 +3492,7 @@ export class OrderService {
             // R7：稳定幂等键 `batch:{batchId}:{index}` → createOrder 幂等回放（整批重试每子单只建一次）。
             idempotencyKey: `batch:${batchId}:${i}`,
             items: batchItems,
-            passengers: [passenger],
+            passengers: [passengerForOrder],
           },
           requester,
         );
@@ -3479,7 +3539,12 @@ export class OrderService {
     bundleNightsOverride: number | undefined,
   ): Promise<
     | { ok: false; error: string }
-    | { ok: true; legs: BundleFlightLeg[]; dates: { goDate?: string; returnDate?: string } }
+    | {
+        ok: true;
+        legs: BundleFlightLeg[];
+        dates: { goDate?: string; returnDate?: string };
+        businessUpgradeCnyPerLeg: number | null;
+      }
   > {
     const bundle = await prisma.bundle.findUnique({
       where: { id: bundleId },
@@ -3488,6 +3553,7 @@ export class OrderService {
         hotelNights: true,
         items: true,
         legs: true,
+        businessUpgradeCnyPerLeg: true,
         outboundFlightId: true,
         returnFlightId: true,
       },
@@ -3536,7 +3602,12 @@ export class OrderService {
       legs.push({ scheduleId: retScheduleId, label: '回程' });
     }
 
-    return { ok: true, legs, dates: { goDate: departDate, returnDate } };
+    return {
+      ok: true,
+      legs,
+      dates: { goDate: departDate, returnDate },
+      businessUpgradeCnyPerLeg: bundle.businessUpgradeCnyPerLeg,
+    };
   }
 
   /**
@@ -7612,7 +7683,7 @@ export function computeBundleOperationFeeTotal(operationFeeCny: number, seatPax:
  *   · 自备签：passengers 里任一乘客显式提供 visaExempt（true/false 均算「提供」）→ 以勾 true 的人数为权威；
  *            否则回落 item.selfProvidedVisa 布尔（旧整单口径 true → 记 1 次，整单减一次）。
  *   · 单住：  passengers 里任一乘客显式提供 singleRoom → 以勾 true 的人数为权威；
- *            否则回落 item.singleCount（旧 bundleSingleCount 聚合口径）。
+ *            否则回落 item.singleCount（旧 item 级聚合口径）。
  * passengers 缺省（老客户端不传）→ 全部回落旧口径，定价与扩展前完全一致。
  *
  * 导出供单测与 createOrder/quoteOrder 的 priceAndValidateItems BUNDLE 分支共用。
