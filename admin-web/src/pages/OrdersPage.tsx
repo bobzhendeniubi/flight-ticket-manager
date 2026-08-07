@@ -6659,6 +6659,8 @@ interface BatchRow {
   mrzValid?: boolean | null;
   /** 本地 Tesseract 兜底识别提示：精度有限，整行核对 */
   localOcrCaveat?: boolean;
+  /** true = 本次识别失败（AI 未配置/失败/网络异常），行下红色提示 ocrStage 错误文案 */
+  ocrFailed?: boolean;
 }
 
 // 护照图上限（一批）：批量创单所有乘客的护照图都在**同一个** POST /orders/batch 请求里
@@ -7167,7 +7169,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
       setErr(`一批护照图最多 ${BATCH_MAX_PHOTO_PASSENGERS} 张，已达上限；更多请分批录入`);
       return;
     }
-    setRow(idx, { ocrPct: 0, ocrStage: '加载中…', ocrEngine: null, ocrModel: null });
+    setRow(idx, { ocrPct: 0, ocrStage: '加载中…', ocrEngine: null, ocrModel: null, ocrFailed: false });
     const patch = await runPassportOcr(token, file, (pct, stage) => setRow(idx, { ocrPct: pct, ocrStage: stage }));
     setRow(idx, patch);
   }
@@ -7952,7 +7954,9 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                       const ageGroup = productType === 'BUNDLE'
                         ? deriveBatchAgeGroup(r.dateOfBirth, batchBundleDepartDate)
                         : null;
-                      const reviewHint = ocrReviewHintText({
+                      // 识别失败（AI 未配置/失败/网络异常）优先展示错误文案，样式升级为红色
+                      const ocrErrorHint = r.ocrFailed && r.ocrStage ? r.ocrStage : null;
+                      const reviewHint = ocrErrorHint ?? ocrReviewHintText({
                         reviewFields: r.reviewFields,
                         mrzValid: r.mrzValid,
                         localOcrCaveat: r.localOcrCaveat,
@@ -8135,7 +8139,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                                 <button
                                   type="button"
                                   className="text-[10px] text-slate-400 hover:text-rose-500"
-                                  onClick={() => setRow(i, { passportPhotoUrl: undefined, ocrPct: null, ocrStage: undefined, ocrEngine: null, ocrModel: null, reviewFields: undefined, mrzValid: null, localOcrCaveat: false })}
+                                  onClick={() => setRow(i, { passportPhotoUrl: undefined, ocrPct: null, ocrStage: undefined, ocrEngine: null, ocrModel: null, ocrFailed: false, reviewFields: undefined, mrzValid: null, localOcrCaveat: false })}
                                   title="移除图片"
                                 >✕</button>
                               </div>
@@ -8171,7 +8175,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                       </tr>
                       {reviewHint && (
                         <tr className="border-t-0">
-                          <td colSpan={productType === 'BUNDLE' ? 10 : 9} className="bg-amber-50 px-2 py-1 text-[11px] text-amber-700">
+                          <td colSpan={productType === 'BUNDLE' ? 10 : 9} className={`${ocrErrorHint ? 'bg-rose-50 text-rose-700 ring-1 ring-inset ring-rose-200' : 'bg-amber-50 text-amber-700'} px-2 py-1 text-[11px]`}>
                             ⚠️ {reviewHint}
                           </td>
                         </tr>

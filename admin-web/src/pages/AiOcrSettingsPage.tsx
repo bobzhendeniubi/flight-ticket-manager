@@ -112,7 +112,7 @@ export function AiOcrSettingsPage() {
       <div>
         <h1 className="text-xl font-semibold text-ink">AI 识别设置</h1>
         <p className="mt-1 text-sm text-ink-muted">
-          配置护照 OCR 所用的 AI 引擎。当前支持阿里云 DashScope Qwen-VL 系列；未配置时录单自动回退本地 Tesseract。
+          配置护照 OCR 所用的 AI 引擎。当前支持阿里云 DashScope Qwen-VL 系列；未配置或停用时，录单护照识别不可用（点击识别会直接提示错误）。
         </p>
       </div>
 
@@ -128,7 +128,7 @@ export function AiOcrSettingsPage() {
               ) : null}
             </span>
           ) : (
-            <span className="text-amber-600">未配置 API Key（将使用本地 Tesseract）</span>
+            <span className="text-amber-600">未配置 API Key（护照识别不可用）</span>
           )}
           <span
             className={`ml-auto rounded px-2 py-0.5 text-xs font-medium ${
@@ -196,7 +196,7 @@ export function AiOcrSettingsPage() {
           <div className="flex items-center justify-between rounded-md border border-slate-200 px-4 py-3">
             <div>
               <p className="text-sm font-medium text-ink">启用 AI 识别</p>
-              <p className="text-xs text-ink-muted">关闭后录单护照识别将回退至本地 Tesseract</p>
+              <p className="text-xs text-ink-muted">关闭后录单护照识别不可用，点击识别会直接提示错误</p>
             </div>
             <button
               type="button"
@@ -281,7 +281,7 @@ export function AiOcrSettingsPage() {
             「测试连接」发一张纯白 1×1 像素图到 AI 接口，验证 Key 与模型是否有效，消耗极少 token。
           </li>
           <li>
-            停用 AI 识别后，录单界面仍可点击 OCR，但将回退本地 Tesseract 引擎（浏览器内运行，无网络调用）。
+            停用 AI 识别后，录单界面点击识别会直接提示「AI 识别未配置」，不再有本地识别兜底——护照信息需手工录入。
           </li>
         </ul>
       </div>

@@ -677,8 +677,9 @@ export const VISA_COLUMNS: Array<{ header: string; key: keyof VisaRow; width: nu
   { header: '签证公司', key: 'visaSupplier', width: 16 },
   { header: '中文姓名', key: 'chineseName', width: 12 },
   { header: 'Họ và tên (*)\n姓名', key: 'name', width: 20 },
-  { header: 'Ngày, tháng, năm sinh (*)\n出生日期', key: 'dateOfBirth', width: 16 },
+  // 性别列在出生日期之前：送签系统录入顺序要求（签证岗 2026-08 确认；6 月原版模板是旧系统导出顺序）
   { header: 'Giới tính (*)\n性别', key: 'gender', width: 8 },
+  { header: 'Ngày, tháng, năm sinh (*)\n出生日期', key: 'dateOfBirth', width: 16 },
   { header: 'Quốc tịch hiện nay (*)', key: 'nationalityNow', width: 12 },
   { header: 'Quốc tịch gốc', key: 'nationalityOrigin', width: 12 },
   { header: 'Nghề nghiệp (*)\n职业', key: 'occupation', width: 12 },
