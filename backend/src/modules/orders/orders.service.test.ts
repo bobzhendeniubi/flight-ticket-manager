@@ -3780,6 +3780,24 @@ describe('buildOrderFilterWhere · 签证办理状态筛选（与列表徽标同
     expect(where.invoiceStatus).toBe('ISSUED');
     expect(where.AND).toEqual([CONFIRMED_CLAUSE]);
   });
+
+  it.each([
+    ['NEEDED', '需要签证'],
+    ['E_VISA', '电子签'],
+    ['HAS_VISA', '已签证'],
+    ['NOT_NEEDED', '不需要签证'],
+  ] as const)('visaRequirement=%s → 按订单录单要求 Order.visaStatus 筛选（%s）', (visaRequirement, _label) => {
+    const where = buildOrderFilterWhere({ visaRequirement });
+    expect(where.AND).toEqual([{ visaStatus: visaRequirement }]);
+  });
+
+  it('visaRequirement 与 visaFulfillmentStatus 同时给出 → 两个维度分别叠加', () => {
+    const where = buildOrderFilterWhere({ visaRequirement: 'NEEDED', visaFulfillmentStatus: 'signed' });
+    expect(where.AND).toEqual([
+      CONFIRMED_CLAUSE,
+      { visaStatus: 'NEEDED' },
+    ]);
+  });
 });
 
 // ── 回程物化列 Order.hasReturnLeg：写入口径 + 查询层收口 ─────────────────────

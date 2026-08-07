@@ -6951,6 +6951,7 @@ export type OrderListFilters = Pick<
   | 'invoiceLeg'
   | 'invoiced'
   | 'visaFulfillmentStatus'
+  | 'visaRequirement'
   | 'tripType'
 > & {
   /** 精确按班次过滤（整班·全岗导出用）；比 travelFrom/travelTo 更准，不受 ±1 天放宽影响。 */
@@ -7175,6 +7176,10 @@ export function buildOrderFilterWhere(query: OrderListFilters): Prisma.OrderWher
     andClauses.push({
       AND: [HAS_VISA_TASK, { NOT: VISA_APPLICATION_CONFIRMED }],
     });
+  }
+  // 签证录单要求筛选 — 这是订单级 Order.visaStatus 维度，与上面的履约办理进度互不替代。
+  if (query.visaRequirement) {
+    andClauses.push({ visaStatus: query.visaRequirement });
   }
   // 航班号筛选 — 订单需含该航班号的 FLIGHT 行（同样走 AND 叠加，可与 kind/出行日期组合）
   if (query.flightNumber) {

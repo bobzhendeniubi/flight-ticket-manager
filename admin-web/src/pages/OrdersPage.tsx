@@ -413,8 +413,16 @@ export function OrdersPage() {
   // 六态开票筛选：组合值 `${leg}:${invoiced}`（如 'outbound:false'=去程未开），''=全部
   const [invoiceLegFilter, setInvoiceLegFilter] = useState('');
   // 签证办理状态筛选（后端过滤，与列表「签证」列的**办理进度小字**同源——列主徽标已改为录单签证要求）：
-  // ''=全部 / signed=已签证 / unsigned=未签证
-  const [visaFilter, setVisaFilter] = useState<'' | 'signed' | 'unsigned'>('');
+  // ''=全部 / req:* = 录单要求 / ful:* = 办理进度；提交时互斥拆成两个 query 参数。
+  const [visaFilterCode, setVisaFilterCode] = useState<
+    '' | 'req:NEEDED' | 'req:E_VISA' | 'req:HAS_VISA' | 'req:NOT_NEEDED' | 'ful:signed' | 'ful:unsigned'
+  >('');
+  // 兼容既有办理进度字段：从编码状态提取 ful:*；录单要求另由 visaRequirement 透传。
+  const visaFilter: '' | 'signed' | 'unsigned' = visaFilterCode.startsWith('ful:')
+    ? (visaFilterCode.slice(4) as 'signed' | 'unsigned')
+    : '';
+  // 列表行程类型筛选：后端按物化列 hasReturnLeg 收口；票务快捷导出面板另有自己的 tkTripType，不共用。
+  const [tripTypeFilter, setTripTypeFilter] = useState<'' | 'oneway' | 'roundtrip'>('');
   // 文本筛选防抖：停止输入 400ms 后才请求后端，避免每个键击打一次接口
   const [debouncedFlightNumber, setDebouncedFlightNumber] = useState('');
   const [debouncedPassengerName, setDebouncedPassengerName] = useState('');
@@ -450,10 +458,15 @@ export function OrdersPage() {
       q.invoiceLeg = invoiceLegParsed.invoiceLeg;
       q.invoiced = invoiceLegParsed.invoiced;
     }
-    if (visaFilter) q.visaFulfillmentStatus = visaFilter;
+    if (visaFilterCode.startsWith('req:')) {
+      q.visaRequirement = visaFilterCode.slice(4) as NonNullable<ListOrdersParams['visaRequirement']>;
+    } else if (visaFilterCode.startsWith('ful:')) {
+      q.visaFulfillmentStatus = visaFilterCode.slice(4) as NonNullable<ListOrdersParams['visaFulfillmentStatus']>;
+    }
+    if (tripTypeFilter) q.tripType = tripTypeFilter;
     if (debouncedSearch.trim()) q.search = debouncedSearch.trim();
     return q;
-  }, [createdFromParam, createdToParam, travelFrom, travelTo, claimFilter, debouncedFlightNumber, debouncedPassengerName, invoiceLegFilter, visaFilter, debouncedSearch]);
+  }, [createdFromParam, createdToParam, travelFrom, travelTo, claimFilter, debouncedFlightNumber, debouncedPassengerName, invoiceLegFilter, visaFilterCode, tripTypeFilter, debouncedSearch]);
   // 三模板筛选导出（全岗可用/票务专用/签证专用）
   const [exportTemplate, setExportTemplate] = useState<OrderExportTemplate>('full');
   const [exporting, setExporting] = useState(false);
@@ -1175,6 +1188,10 @@ export function OrdersPage() {
         invoiced: parseInvoiceLegFilter(invoiceLegFilter)?.invoiced,
         // 签证办理状态（与列表「签证」筛选同源）——保持「导出=列表所见」一致。
         visaFulfillmentStatus: visaFilter || undefined,
+        visaRequirement: visaFilterCode.startsWith('req:')
+          ? (visaFilterCode.slice(4) as 'NEEDED' | 'E_VISA' | 'HAS_VISA' | 'NOT_NEEDED')
+          : undefined,
+        tripType: tripTypeFilter || undefined,
         orderIds: selected.length > 0 ? selected : undefined,
       });
       const url = URL.createObjectURL(blob);
@@ -1314,7 +1331,7 @@ export function OrdersPage() {
             const hasBackendFilter = Boolean(
               createdFrom || createdTo || travelFrom || travelTo ||
               flightNumberFilter.trim() || passengerNameFilter.trim() ||
-              invoiceLegFilter || visaFilter || claimFilter,
+              invoiceLegFilter || visaFilterCode || tripTypeFilter || claimFilter,
             );
             const hasFrontendFilter = filtered.length !== orders.length;
             const isFiltered = hasBackendFilter || hasFrontendFilter;
@@ -1759,6 +1776,18 @@ export function OrdersPage() {
             </select>
           </div>
           <div>
+            <label className="label">机票行程</label>
+            <select
+              className="input"
+              value={tripTypeFilter}
+              onChange={(e) => setTripTypeFilter(e.target.value as '' | 'oneway' | 'roundtrip')}
+            >
+              <option value="">全部</option>
+              <option value="oneway">单程</option>
+              <option value="roundtrip">往返</option>
+            </select>
+          </div>
+          <div>
             <label className="label">渠道</label>
             <select
               className="input"
@@ -1832,26 +1861,34 @@ export function OrdersPage() {
             <label className="label">签证状态</label>
             <select
               className="input"
-              value={visaFilter}
-              onChange={(e) => setVisaFilter(e.target.value as '' | 'signed' | 'unsigned')}
-              title="按签证办理状态筛选（与列表「签证」列一致）：已签证=签证办理已确认；未签证=含签证但尚未确认。无签证的订单不计入。"
+              value={visaFilterCode}
+              onChange={(e) => setVisaFilterCode(e.target.value as typeof visaFilterCode)}
+              title="签证要求按录单标注筛选；办签状态按履约任务进度筛选。两者是两个维度。"
             >
               <option value="">全部</option>
-              <option value="signed">已签证</option>
-              <option value="unsigned">未签证</option>
+              <optgroup label="按录单要求">
+                <option value="req:NEEDED">需要签证</option>
+                <option value="req:E_VISA">电子签</option>
+                <option value="req:HAS_VISA">已签证（录单标注）</option>
+                <option value="req:NOT_NEEDED">不需要签证</option>
+              </optgroup>
+              <optgroup label="按办理进度">
+                <option value="ful:signed">办签已确认</option>
+                <option value="ful:unsigned">办签未办结</option>
+              </optgroup>
             </select>
           </div>
           <div className="md:col-span-5">
-            <label className="label">搜索（订单号 / 客户 / 乘客中英文名 / 代理）</label>
+            <label className="label">搜索（订单号 / 客户 / 乘客中英文名 / 护照号 / 代理）</label>
             <input
               className="input"
-              placeholder="如 FTM2026 或 张伟 或 总代"
+              placeholder="如 FTM2026 / 张伟 / E12345678 / 总代"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
             />
           </div>
         </div>
-        {(statusFilter || kindFilter || channelFilter || agentFilter || search || flightNumberFilter || passengerNameFilter || invoiceLegFilter || visaFilter || createdFrom || createdTo || travelFrom || travelTo) && (
+        {(statusFilter || kindFilter || tripTypeFilter || channelFilter || agentFilter || search || flightNumberFilter || passengerNameFilter || invoiceLegFilter || visaFilterCode || createdFrom || createdTo || travelFrom || travelTo) && (
           <div className="mt-3 flex items-center justify-between text-xs text-slate-500">
             {/* 日期筛选回显 — 两个框各自独立生效，只填一个就是开区间；把当前生效的条件和命中单数
                 摊开写清楚，填了「从」却看到更晚的订单时一眼就知道为什么，不用猜。 */}
@@ -1880,7 +1917,7 @@ export function OrdersPage() {
               className="text-brand hover:text-brand-dark"
               onClick={() => {
                 setStatusFilter(''); setKindFilter(''); setChannelFilter(''); setAgentFilter(''); setSearch('');
-                setFlightNumberFilter(''); setPassengerNameFilter(''); setInvoiceLegFilter(''); setVisaFilter('');
+                setFlightNumberFilter(''); setPassengerNameFilter(''); setInvoiceLegFilter(''); setVisaFilterCode(''); setTripTypeFilter('');
                 setCreatedFrom(''); setCreatedTo(''); setCreatedFromTime(''); setCreatedToTime(''); setTravelFrom(''); setTravelTo('');
               }}
             >
@@ -2316,7 +2353,7 @@ export function OrdersPage() {
                       if (hitIdx >= 0) {
                         const companions = names.length - 1;
                         return (
-                          <div className="mt-0.5 max-w-xs truncate text-[11px] text-ink-muted" title={names.join('、')}>
+                          <div className="mt-0.5 max-w-xs truncate text-xs text-ink-muted" title={names.join('、')}>
                             <span className="font-medium text-brand">{names[hitIdx]}</span>
                             {companions > 0 ? ` +${companions} 同行` : ''}
                           </div>
@@ -2325,7 +2362,7 @@ export function OrdersPage() {
                       const shown = names.slice(0, 3);
                       const hasMore = names.length > shown.length;
                       return (
-                        <div className="mt-0.5 max-w-xs truncate text-[11px] text-ink-muted" title={names.join('、')}>
+                        <div className="mt-0.5 max-w-xs truncate text-xs text-ink-muted" title={names.join('、')}>
                           {shown.join('、')}{hasMore ? ` 等${names.length}人` : ''}
                         </div>
                       );
