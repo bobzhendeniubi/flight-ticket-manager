@@ -783,6 +783,8 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
           invoiceLeg: true,
           invoiced: true,
           visaFulfillmentStatus: true,
+          visaRequirement: true,
+          tripType: true,
         })
         .extend({ orderIds: orderIdsQuerySchema })
         .parse(req.query);

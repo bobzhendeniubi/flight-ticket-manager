@@ -1216,6 +1216,8 @@ export interface ListOrdersParams {
    * signed=已签证（任务已确认）；unsigned=未签证（含 VISA 行但任务未确认）。无 VISA 行订单两者都不命中。
    */
   visaFulfillmentStatus?: 'signed' | 'unsigned';
+  /** 订单录单时标注的签证要求，与 visaFulfillmentStatus（办理进度）是两个维度。 */
+  visaRequirement?: 'NEEDED' | 'E_VISA' | 'HAS_VISA' | 'NOT_NEEDED';
   /**
    * 行程类型 — oneway=只有去程（必须有航段，酒店单/签证单不算）；roundtrip=有回程。
    * 后端走物化列 Order.hasReturnLeg 判定，与三模板导出的 tripType 同口径。
@@ -1251,6 +1253,8 @@ export interface OrdersTemplateExportParams {
   invoiced?: boolean;
   /** 签证办理状态（signed/unsigned）；与 listOrders 同款，用于「筛选后导出」。 */
   visaFulfillmentStatus?: 'signed' | 'unsigned';
+  /** 订单录单签证要求（NEEDED/E_VISA/HAS_VISA/NOT_NEEDED）；与 listOrders 同款。 */
+  visaRequirement?: 'NEEDED' | 'E_VISA' | 'HAS_VISA' | 'NOT_NEEDED';
   /** 勾选导出：给了就只导这批订单（后端以 id 集合为准，忽略其余筛选）。 */
   orderIds?: string[];
 }

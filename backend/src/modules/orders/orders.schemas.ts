@@ -567,6 +567,8 @@ export const listOrdersQuerySchema = z.object({
   // 无 VISA 行的订单（列表签证列显示「—」）两个值都不命中，与徽标保持一致、不引入第三口径。
   // 注：这是履约进度口径，区别于订单录单字段 Order.visaStatus（VisaRequirement 枚举）。
   visaFulfillmentStatus: z.enum(['signed', 'unsigned']).optional(),
+  // 按订单录单要求（Order.visaStatus）筛选；与 visaFulfillmentStatus（履约任务进度）是两个维度。
+  visaRequirement: z.enum(['NEEDED', 'E_VISA', 'HAS_VISA', 'NOT_NEEDED']).optional(),
   // 行程类型筛选：oneway=只有去程（且必须有航段，酒店单/签证单不算单程单）；roundtrip=有回程。
   // 查询层走物化列 Order.hasReturnLeg（Prisma where 表达不了「关联行 ≥ 2 条」）。
   tripType: z.enum(['oneway', 'roundtrip']).optional(),
@@ -613,6 +615,7 @@ export const exportTemplatesQuerySchema = listOrdersQuerySchema
     invoiceLeg: true,
     invoiced: true,
     visaFulfillmentStatus: true,
+    visaRequirement: true,
   })
   .extend({
     template: z.enum(['full', 'ticketing', 'visa']),
