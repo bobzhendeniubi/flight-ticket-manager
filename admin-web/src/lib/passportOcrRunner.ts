@@ -1,14 +1,10 @@
 /**
- * 护照 OCR 识别 —— 共享 runner（从 SingleOrderModal 同款实现模式抽取，供批量创单等其它录单入口复用）。
+ * 护照 OCR 识别 —— 共享 runner（供批量创单等录单入口复用）。
  *
- * 策略与 SingleOrderModal 一致：
- *   1. 先尝试后端 AI 识别（POST /ocr/passport）。configured:true 且 suggested 有结果 → 用 AI 结果，
- *      引擎标 'ai'（含 model 名 + 逐字段人工核对提示 reviewFields + MRZ 校验结果）。
- *   2. AI 未配置（configured:false）→ 直接本地 Tesseract，引擎标 'local'。
- *   3. AI 配了但识别失败（suggested 为 null / 请求异常）→ 回退本地 Tesseract，引擎标 'ai-fallback'。
+ * 识别只走后端 AI：成功时返回 AI 结果；未登录、未配置、识别失败或请求异常时返回明确的失败状态，
+ * 不回填乘客字段。图片仍会先压缩为存库图，方便运营人工核录。
  *
- * 注意：这里只做识别 + 结果整形，不碰任何 UI 状态——调用方（如批量创单表格）自行决定如何落到自己的
- * 行状态里；SingleOrderModal 保留它自己的内联实现不变，本文件不是它的替代品，只是同款逻辑的复用面。
+ * 注意：这里只做识别 + 结果整形，不碰任何 UI 状态——调用方自行决定如何落到自己的行状态里。
  */
 import { api, type AiOcrPassportResult } from './api';
 import { normalizePassengerFullName } from './passengerName';
@@ -29,12 +25,14 @@ export interface PassportOcrPatch {
   ocrPct: number | null;
   ocrStage?: string;
   ocrEngine: PassportOcrEngine | null;
+  /** true = 本次识别失败，调用方可据此标红提示 */
+  ocrFailed?: boolean;
   ocrModel?: string | null;
   /** AI 识别时需人工核对的字段（后端 verify.reviewFields 透传） */
   reviewFields?: Array<{ field: string; reason: string }>;
-  /** 护照 MRZ 校验是否通过；本地识别路径无此信息 */
+  /** 护照 MRZ 校验是否通过；由 AI verify 返回 */
   mrzValid?: boolean | null;
-  /** 本地 Tesseract 兜底识别提示：精度有限，需整行核对 */
+  /** 兼容旧调用方的提示字段；当前 AI-only 识别流程不会置为 true */
   localOcrCaveat?: boolean;
 }
 
@@ -48,39 +46,8 @@ async function fileToDataUrl(file: File): Promise<string> {
   });
 }
 
-/** 本地 Tesseract 识别（AI 未配置/失败时的兜底路径） */
-async function runLocalOcr(
-  file: File,
-  engine: 'local' | 'ai-fallback',
-  onProgress?: (pct: number, stage: string) => void,
-): Promise<PassportOcrPatch> {
-  try {
-    const { ocrPassport } = await import('./passportOcr');
-    const result = await ocrPassport(file, (pct, stage) => {
-      onProgress?.(20 + Math.round(pct * 0.8), stage);
-    });
-    const s = result.suggested;
-    const patch: PassportOcrPatch = {
-      ocrPct: 100,
-      ocrStage: result.success ? '识别完成' : '识别不完整，请核对',
-      ocrEngine: engine,
-      ocrModel: null,
-      reviewFields: undefined,
-      mrzValid: null,
-      localOcrCaveat: true,
-    };
-    if (s.fullName) patch.fullName = normalizePassengerFullName(s.fullName);
-    if (s.passportNumber) patch.documentNumber = s.passportNumber;
-    if (s.dateOfBirth) patch.dateOfBirth = s.dateOfBirth;
-    if (s.gender) patch.gender = s.gender;
-    return patch;
-  } catch {
-    return { ocrPct: null, ocrStage: undefined, ocrEngine: null, ocrModel: null };
-  }
-}
-
 /**
- * 识别一张护照图片：先压缩出存库图，再走 AI 优先 / 本地兜底识别，返回可直接 patch 到行状态的结果。
+ * 识别一张护照图片：先压缩出存库图，再走后端 AI 识别，返回可直接 patch 到行状态的结果。
  * `onProgress` 仅用于展示识别进度条，不影响识别策略。
  */
 export async function runPassportOcr(
@@ -100,9 +67,15 @@ export async function runPassportOcr(
   }
   const base: Pick<PassportOcrPatch, 'passportPhotoUrl'> = dataUrl ? { passportPhotoUrl: dataUrl } : {};
 
-  // ── 2. 无 token（不应出现，保险兜底）→ 直接本地 ──
+  // ── 2. 无 token（不应出现，保险兜底）→ 明确报错 ──
   if (!token) {
-    return { ...base, ...(await runLocalOcr(file, 'local', onProgress)) };
+    return {
+      ...base,
+      ocrPct: null,
+      ocrStage: '登录态缺失，无法识别，请重新登录',
+      ocrEngine: null,
+      ocrFailed: true,
+    };
   }
 
   // ── 3. 尝试 AI 识别 ──
@@ -112,7 +85,13 @@ export async function runPassportOcr(
     const aiRes: AiOcrPassportResult = await api.ocrPassportAi(token, imageDataUrl);
 
     if (!aiRes.configured) {
-      return { ...base, ...(await runLocalOcr(file, 'local', onProgress)) };
+      return {
+        ...base,
+        ocrPct: null,
+        ocrStage: 'AI 识别未配置：请在「设置 → AI 识别」配置密钥后重试',
+        ocrEngine: null,
+        ocrFailed: true,
+      };
     }
 
     if (aiRes.suggested) {
@@ -122,6 +101,7 @@ export async function runPassportOcr(
         ocrPct: 100,
         ocrStage: '识别完成',
         ocrEngine: 'ai',
+        ocrFailed: false,
         ocrModel: aiRes.model ?? null,
         reviewFields: aiRes.verify?.reviewFields ?? undefined,
         mrzValid: aiRes.verify?.mrzValid ?? null,
@@ -138,11 +118,21 @@ export async function runPassportOcr(
       return patch;
     }
 
-    // AI 配了但识别失败 → 回退本地
-    return { ...base, ...(await runLocalOcr(file, 'ai-fallback', onProgress)) };
+    return {
+      ...base,
+      ocrPct: null,
+      ocrStage: `AI 识别失败：${aiRes.error ?? '请重试或手动填写'}`,
+      ocrEngine: null,
+      ocrFailed: true,
+    };
   } catch {
-    // 网络/后端异常 → 回退本地
-    return { ...base, ...(await runLocalOcr(file, 'ai-fallback', onProgress)) };
+    return {
+      ...base,
+      ocrPct: null,
+      ocrStage: 'AI 识别失败：网络或服务异常，请重试',
+      ocrEngine: null,
+      ocrFailed: true,
+    };
   }
 }
 
