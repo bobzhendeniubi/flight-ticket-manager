@@ -19,6 +19,7 @@ import { UserRole, AuditTargetType } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { env } from '../../config/env.js';
 import { writeAudit, actorFromRequest } from '../../lib/audit.js';
+import { BadRequestError } from '../../lib/errors.js';
 
 // ── 工具函数 ────────────────────────────────────────────────
 
@@ -94,11 +95,25 @@ export const settingsRoutes: FastifyPluginAsync = async (app) => {
         ? body.apiKey.trim()
         : (existing?.apiKey ?? null);
 
+    // 国际版 key 配大陆端点防呆（2026-08 事故根因）：百炼国际版 key 是 sk-ws- 前缀，
+    // 打大陆端点必 401 且难定位。保存时直接拦下并给出正确地址。
+    const effectiveBaseUrl =
+      body.baseUrl !== undefined ? body.baseUrl : (existing?.baseUrl ?? null);
+    const INTL_BASE_URL = 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1';
+    if (
+      newApiKey?.startsWith('sk-ws-') &&
+      (!effectiveBaseUrl || !effectiveBaseUrl.includes('dashscope-intl.'))
+    ) {
+      throw new BadRequestError(
+        `该 API Key 是阿里云百炼国际版密钥（sk-ws- 开头），必须搭配国际版接口地址，否则识别会一直失败。` +
+          `请把接口地址填为：${INTL_BASE_URL}`,
+      );
+    }
+
     const data = {
       provider: 'QWEN',
       apiKey: newApiKey,
-      baseUrl:
-        body.baseUrl !== undefined ? body.baseUrl : (existing?.baseUrl ?? null),
+      baseUrl: effectiveBaseUrl,
       model:
         body.model !== undefined ? body.model : (existing?.model ?? null),
       enabled:

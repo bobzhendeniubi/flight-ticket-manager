@@ -164,7 +164,7 @@ export function AiOcrSettingsPage() {
           <div>
             <label className="block text-sm font-medium text-ink">
               接口地址 Base URL
-              <span className="ml-1 text-xs font-normal text-ink-muted">（留空使用默认值）</span>
+              <span className="ml-1 text-xs font-normal text-ink-muted">（留空保留当前值；国际版 sk-ws- 密钥须配国际版地址）</span>
             </label>
             <input
               type="text"
