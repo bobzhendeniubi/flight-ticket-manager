@@ -99,6 +99,25 @@ import type {
 // ── 状态机：允许的转移 ──────────────────────────────────────────────────
 // 本表是状态机的**唯一真源**：前端不再手抄一份，而是消费 serializeOrder 逐单下发的
 // allowedTransitions（见本文件末 serializeOrder）。改这里 = 前后台同时生效，抄不错、漂移不了。
+
+// 状态中文名（与 admin-web 列表叫法一致）：面向用户的报错一律用中文，不透出枚举名。
+export const ORDER_STATUS_LABEL_ZH: Record<OrderStatus, string> = {
+  DRAFT: '草稿',
+  PENDING_PAYMENT: '待支付',
+  PAID: '已支付',
+  PROCESSING: '处理中',
+  TICKETED: '出票完成',
+  COMPLETED: '已完成',
+  PAYMENT_TIMEOUT: '支付超时',
+  CANCELLED: '已取消',
+  REFUND_REQUESTED: '退款申请中',
+  REFUNDED: '已退款',
+  CHANGE_REQUESTED: '改期申请中',
+  CHANGED: '已改期',
+  FAILED: '出票失败',
+};
+const zhStatus = (s: OrderStatus): string => ORDER_STATUS_LABEL_ZH[s] ?? s;
+
 export const ALLOWED_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
   DRAFT: ['PENDING_PAYMENT', 'CANCELLED'],
   PENDING_PAYMENT: ['PAID', 'PAYMENT_TIMEOUT', 'CANCELLED'],
@@ -3755,7 +3774,7 @@ export class OrderService {
             '请在订单资金区做多付处置（转代理余额 / 转挂账池 / 退款）。';
         } else if (gap > 0 && (order.status === OrderStatus.PAID || order.status === OrderStatus.PROCESSING || order.status === OrderStatus.TICKETED || order.status === OrderStatus.COMPLETED)) {
           warning =
-            `该单状态为已付款族（${order.status}）但改价后新增尾款 ¥${gap}（已收 ¥${paid} / 应收 ¥${newTotal}）。` +
+            `该单状态为已付款族（${zhStatus(order.status)}）但改价后新增尾款 ¥${gap}（已收 ¥${paid} / 应收 ¥${newTotal}）。` +
             '请补收该差额或确认本次改价金额无误。';
         }
       }
@@ -4103,8 +4122,14 @@ export class OrderService {
     // ADMIN 可用 force=true 跳过状态机；其他角色或非 force 调用走标准检查
     const isAdminForce = force === true && requester.role === 'ADMIN';
     if (!allowed.includes(toStatus) && !isAdminForce) {
+      // 高频误操作单独给指引：已收款的单不能一键取消——钱账要走退款通道，退完（已退款）机位自动释放。
+      const cancelPaidHint =
+        toStatus === 'CANCELLED' && allowed.includes('REFUND_REQUESTED')
+          ? '。已收款订单不能直接取消：请改为「退款申请中」，财务退款完成（已退款）后机位自动释放、订单关闭'
+          : '';
       throw new BadRequestError(
-        `不允许从 ${order.status} 转移到 ${toStatus}（允许：${allowed.join(', ') || '无'}）`,
+        `不允许从「${zhStatus(order.status)}」转移到「${zhStatus(toStatus)}」` +
+          `（当前可转：${allowed.map(zhStatus).join('、') || '无'}）${cancelPaidHint}`,
       );
     }
 
@@ -4237,7 +4262,7 @@ export class OrderService {
       data: extraData,
     });
     if (casResult.count !== 1) {
-      throw new ConflictError(`订单状态已被并发修改（期望 ${order.status}，请重试）`);
+      throw new ConflictError(`订单状态已被并发修改（期望「${zhStatus(order.status)}」，请重试）`);
     }
 
     await tx.orderStatusEvent.create({
@@ -4890,7 +4915,7 @@ export class OrderService {
           (order.status === 'PAID' || order.status === 'PROCESSING' || order.status === 'TICKETED'));
       if (!allowed) {
         throw new ForbiddenError(
-          `客户不可将订单 ${order.status} → ${toStatus}（仅允许取消待支付订单 / 申请已支付订单退款或改签）`,
+          `客户不可将订单「${zhStatus(order.status)}」改为「${zhStatus(toStatus)}」（仅允许取消待支付订单 / 申请已支付订单退款或改签）`,
         );
       }
       return;
@@ -5102,7 +5127,7 @@ export class OrderService {
       }
       if (!SEAT_HOLDING_STATUSES.includes(order.status)) {
         throw new BadRequestError(
-          `订单当前状态（${order.status}）不可改期：仅占座中的有效订单可改期（已取消/已退款/超时订单请勿改期）`,
+          `订单当前状态（${zhStatus(order.status)}）不可改期：仅占座中的有效订单可改期（已取消/已退款/超时订单请勿改期）`,
         );
       }
 
@@ -5342,7 +5367,7 @@ export class OrderService {
       // 占座态守卫：升舱要「放经济舱座 + 拿商务舱座」，只有订单当前真的持有座位时才成立。
       if (!SEAT_HOLDING_STATUSES.includes(order.status)) {
         throw new BadRequestError(
-          `订单当前状态（${order.status}）不可升舱：仅占座中的有效订单可升舱`,
+          `订单当前状态（${zhStatus(order.status)}）不可升舱：仅占座中的有效订单可升舱`,
         );
       }
 
