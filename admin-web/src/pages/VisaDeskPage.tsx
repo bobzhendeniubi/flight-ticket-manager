@@ -68,6 +68,8 @@ const PASSENGER_BATCH_LIMIT = 500;
 const NOTES_BATCH_LIMIT = 100;
 // 列表单页拉取上限（与后端一致）
 const PAGE_SIZE = 200;
+const PAGE_SIZE_OPTIONS = [20, 30, 40, 50] as const;
+const DEFAULT_PAGE_SIZE = 50;
 // 护照有效期临期阈值：距今 < 6 个月标黄
 const EXPIRY_SOON_MONTHS = 6;
 
@@ -676,6 +678,7 @@ function VisaCostControl({ task, token, defaultFxRate, onSaved }: VisaCostContro
 interface OrderGroupProps {
   task: FulfillmentTask;
   rowNumber: number;
+  hidden?: boolean;
   selectedPassengerIds: Set<string>;
   onTogglePassenger: (passengerId: string) => void;
   onToggleOrderPassengers: (passengerIds: string[]) => void;
@@ -687,6 +690,7 @@ interface OrderGroupProps {
 function OrderGroup({
   task,
   rowNumber,
+  hidden = false,
   selectedPassengerIds,
   onTogglePassenger,
   onToggleOrderPassengers,
@@ -895,7 +899,7 @@ function OrderGroup({
 
   return (
     <>
-      <tr className="border-t-2 border-slate-200 bg-slate-50/60">
+      <tr className={`${hidden ? 'hidden ' : ''}border-t-2 border-slate-200 bg-slate-50/60`}>
         <td className="align-top text-center">
           <input
             type="checkbox"
@@ -1023,7 +1027,7 @@ function OrderGroup({
       </tr>
 
       {/* 平铺乘客行（默认展示，不需点开） */}
-      <tr>
+      <tr className={hidden ? 'hidden' : ''}>
         <td colSpan={7} className="px-4 pb-3 pt-1">
           {passengers.length === 0 ? (
             <p className="text-xs text-ink-muted">无乘客数据</p>
@@ -1087,6 +1091,8 @@ export function VisaDeskPage() {
   // 备注搜索（走后端 notesQuery）；400ms 防抖
   const [notesQueryInput, setNotesQueryInput] = useState('');
   const [debouncedNotesQuery, setDebouncedNotesQuery] = useState('');
+  const [pageSize, setPageSize] = useState<number>(DEFAULT_PAGE_SIZE);
+  const [currentPage, setCurrentPage] = useState(1);
   useEffect(() => {
     const t = setTimeout(() => setDebouncedNotesQuery(notesQueryInput.trim()), 400);
     return () => clearTimeout(t);
@@ -1179,10 +1185,27 @@ export function VisaDeskPage() {
     };
   }, [token, statusFilter, issuanceFilter, departureFrom, departureTo, debouncedNotesQuery, refreshNonce]);
 
-  // 全部可见乘客 id + 乘客→任务/订单映射
-  const allPassengerIds = useMemo(
-    () => tasks.flatMap((t) => (t.passengers ?? []).map((p) => p.id)),
-    [tasks],
+  // 筛选/每页数变化时回到第 1 页；备注输入变化时立即重置，防抖后也覆盖后端筛选生效的时点。
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [statusFilter, issuanceFilter, departureFrom, departureTo, notesQueryInput, debouncedNotesQuery, pageSize]);
+
+  // 客户端按任务（订单）粒度分页；服务端仍一次最多返回 PAGE_SIZE 条任务。
+  const totalPages = Math.max(1, Math.ceil(tasks.length / pageSize));
+  const effectiveCurrentPage = Math.min(currentPage, totalPages);
+  const pageStart = (effectiveCurrentPage - 1) * pageSize;
+  // 当前页 ids 仍按 pageStart/pageSize 计算。tbody 保留全量 OrderGroup 挂载，仅隐藏非当前页行：
+  // 今天本来就是平铺渲染全部任务（≤200 条），隐藏式分页不增加 DOM 成本；显式保存口径下，
+  // 选择保留草稿不丢优先于虚拟化。
+  const currentPageTasks = useMemo(
+    () => tasks.slice(pageStart, pageStart + pageSize),
+    [tasks, pageStart, pageSize],
+  );
+
+  // 当前页全部乘客 id + 乘客→任务/订单映射
+  const visiblePassengerIds = useMemo(
+    () => currentPageTasks.flatMap((t) => (t.passengers ?? []).map((p) => p.id)),
+    [currentPageTasks],
   );
   const passengerToTask = useMemo(() => {
     const m = new Map<string, FulfillmentTask>();
@@ -1191,9 +1214,9 @@ export function VisaDeskPage() {
   }, [tasks]);
 
   const allVisibleSelected =
-    allPassengerIds.length > 0 && allPassengerIds.every((id) => selectedPassengerIds.has(id));
+    visiblePassengerIds.length > 0 && visiblePassengerIds.every((id) => selectedPassengerIds.has(id));
   const someVisibleSelected =
-    !allVisibleSelected && allPassengerIds.some((id) => selectedPassengerIds.has(id));
+    !allVisibleSelected && visiblePassengerIds.some((id) => selectedPassengerIds.has(id));
 
   const togglePassenger = (id: string) => {
     setSelectedPassengerIds((prev) => {
@@ -1216,8 +1239,8 @@ export function VisaDeskPage() {
   const toggleAllVisible = () => {
     setSelectedPassengerIds((prev) => {
       const next = new Set(prev);
-      if (allVisibleSelected) allPassengerIds.forEach((id) => next.delete(id));
-      else allPassengerIds.forEach((id) => next.add(id));
+      if (allVisibleSelected) visiblePassengerIds.forEach((id) => next.delete(id));
+      else visiblePassengerIds.forEach((id) => next.add(id));
       return next;
     });
   };
@@ -1765,6 +1788,46 @@ export function VisaDeskPage() {
 
       {/* ── 任务列表 ─────────────────────────────────────────── */}
       <section className="card p-0 overflow-hidden">
+        <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 px-4 py-2 text-sm text-ink-soft">
+          <div className="flex items-center gap-2">
+            <span>每页</span>
+            <select
+              className="rounded-md border border-slate-200 bg-white px-2 py-1 text-sm"
+              value={pageSize}
+              onChange={(e) => setPageSize(Number(e.target.value))}
+              aria-label="每页条数"
+            >
+              {PAGE_SIZE_OPTIONS.map((n) => (
+                <option key={n} value={n}>{n} 条</option>
+              ))}
+            </select>
+            <span className="text-xs text-ink-muted">表头「全选」只选当前页，翻页后可继续勾选累加</span>
+          </div>
+          <div className="flex items-center gap-2">
+            <span className="nums text-xs text-ink-muted">
+              {tasks.length === 0
+                ? '共 0 条'
+                : `第 ${pageStart + 1}-${Math.min(pageStart + pageSize, tasks.length)} 条 / 共 ${tasks.length} 条`}
+            </span>
+            <button
+              type="button"
+              className="btn-ghost px-2 py-1 text-sm disabled:opacity-40"
+              onClick={() => setCurrentPage(Math.max(1, effectiveCurrentPage - 1))}
+              disabled={effectiveCurrentPage <= 1}
+            >
+              上一页
+            </button>
+            <span className="nums text-xs">{effectiveCurrentPage} / {totalPages}</span>
+            <button
+              type="button"
+              className="btn-ghost px-2 py-1 text-sm disabled:opacity-40"
+              onClick={() => setCurrentPage(Math.min(totalPages, effectiveCurrentPage + 1))}
+              disabled={effectiveCurrentPage >= totalPages}
+            >
+              下一页
+            </button>
+          </div>
+        </div>
         <div className="overflow-x-auto">
           <table className="table-admin">
             <thead>
@@ -1772,7 +1835,7 @@ export function VisaDeskPage() {
                 <th className="w-10 text-center">
                   <input
                     type="checkbox"
-                    aria-label="全选当前列表全部乘客"
+                    aria-label="全选当前页全部乘客"
                     checked={allVisibleSelected}
                     ref={(el) => {
                       if (el) el.indeterminate = someVisibleSelected;
@@ -1810,6 +1873,7 @@ export function VisaDeskPage() {
                     key={task.id}
                     task={task}
                     rowNumber={index + 1}
+                    hidden={index < pageStart || index >= pageStart + pageSize}
                     selectedPassengerIds={selectedPassengerIds}
                     onTogglePassenger={togglePassenger}
                     onToggleOrderPassengers={toggleOrderPassengers}
