@@ -216,6 +216,83 @@ function makeService(authoritativeTotal: number): OrderService {
   return service;
 }
 
+/** 套餐日历收敛测试：权威套餐行带指定酒店加项，createOrder 仍走真实收敛路径。 */
+function makeGroundService(): OrderService {
+  const service = new OrderService();
+  const anyService = service as unknown as Record<string, unknown>;
+  vi.spyOn(anyService as never, 'assertNoDuplicatePassengersOnFlights' as never).mockResolvedValue(
+    [] as never,
+  );
+  vi.spyOn(anyService as never, 'priceAndValidateItems' as never).mockResolvedValue([
+    {
+      kind: 'FLIGHT' as const,
+      description: 'QH9589 MFM→DAD',
+      quantity: 2,
+      unitPrice: 1300,
+      amount: 2600,
+    },
+    {
+      kind: 'BUNDLE' as const,
+      description: '三星套餐（指定酒店）',
+      quantity: 1,
+      unitPrice: 4000,
+      amount: 4000,
+      bundleId: 'b-1',
+      settlementAddOnCny: 80,
+    },
+  ] as never);
+  vi.spyOn(anyService as never, 'applyPassportExpiryRule' as never).mockResolvedValue(
+    undefined as never,
+  );
+  return service;
+}
+
+function groundOrderBody(priceAdjustment: Record<string, unknown>): CreateOrderBody {
+  return {
+    contactName: '联系人',
+    contactPhone: '13800000000',
+    agentId: 'ag-1',
+    items: [
+      {
+        kind: 'FLIGHT',
+        description: 'QH9589 MFM→DAD',
+        quantity: 2,
+        flightScheduleId: 's-out',
+        flightCabin: 'ECONOMY',
+      },
+      {
+        kind: 'BUNDLE',
+        description: '三星套餐（指定酒店）',
+        quantity: 1,
+        unitPrice: 0,
+        bundleId: 'b-1',
+        adultCount: 2,
+        childCount: 0,
+        infantCount: 0,
+        designatedHotelRoomTypeId: 'rt-designated',
+        metadata: { goDate: '2026-08-10' },
+      },
+    ],
+    passengers: [
+      {
+        fullName: '张三',
+        documentNumber: 'E1234567',
+        dateOfBirth: '1990-01-01',
+        nationality: 'CN',
+        passportExpiry: '2030-01-01',
+      },
+      {
+        fullName: '李四',
+        documentNumber: 'E7654321',
+        dateOfBirth: '1991-01-01',
+        nationality: 'CN',
+        passportExpiry: '2030-01-01',
+      },
+    ],
+    priceAdjustment,
+  } as unknown as CreateOrderBody;
+}
+
 function itemsPassedToCreate(): CreatedItemRow[] {
   const call = mockPrisma.order.create.mock.calls[0];
   return (call[0] as { data: { items: { create: CreatedItemRow[] } } }).data.items.create;
@@ -325,6 +402,7 @@ describe('createOrder · 机票结算价日历收敛', () => {
     const calendar = after.settlementCalendar as Record<string, unknown>;
     expect(calendar.source).toBe('FLIGHT_SETTLEMENT_CALENDAR');
     expect(calendar.lines as unknown[]).toHaveLength(1);
+    expect(calendar).not.toHaveProperty('discountCny');
   });
 
   it('非代理单（无 agentId）→ 日历不介入，不生成差额行', async () => {
@@ -364,6 +442,97 @@ describe('createOrder · 机票日历与手工价互斥（手工价一律优先�
       ADMIN,
     );
 
+    expect(mockGetFlightSettlementRate).not.toHaveBeenCalled();
+    expect(findSettlementRow(itemsPassedToCreate())).toBeUndefined();
+  });
+
+  it('批量同业优惠与日历收敛叠加 → 最终总额 = 日历价 − 优惠', async () => {
+    const service = makeService(2600);
+    await service.createOrder(
+      agentOrderBody({
+        priceAdjustment: {
+          amountCny: -100,
+          reasonCode: 'DISCOUNT',
+          reasonText: '同业优惠 ¥50/人×2',
+          stackWithSettlementCalendar: true,
+        },
+      }),
+      ADMIN,
+    );
+
+    const items = itemsPassedToCreate();
+    expect(items.find((item) => item.metadata?.reasonCode === 'DISCOUNT')?.amount.toString()).toBe('-100');
+    expect(findSettlementRow(items)?.amount.toString()).toBe('-600');
+    expect(totalPassedToCreate()).toBe(1900);
+    const settlementAudit = mockPrisma.auditLog.create.mock.calls
+      .map((c) => (c[0] as { data: Record<string, unknown> }).data)
+      .find((d) => d.action === 'APPLY_SETTLEMENT_TOTAL');
+    const calendar = (settlementAudit!.after as { settlementCalendar: Record<string, unknown> }).settlementCalendar;
+    expect(calendar.discountCny).toBe(100);
+    expect(
+      (calendar.lines as Array<Record<string, unknown>>).reduce(
+        (sum, line) => sum + Number(line.lineTotalCny),
+        0,
+      ) - Number(calendar.discountCny),
+    ).toBe(1900);
+  });
+
+  it('GROUND 套餐日历 + 优惠 + 指定酒店加项并存 → 总额 = 日历价 + 加价×人数 − 优惠×人数', async () => {
+    stubCreateOrderPrisma();
+    mockPrisma.bundle.findMany.mockResolvedValue([
+      { id: 'b-1', name: '三星套餐', settlementTier: 'THREE_STAR', settlementNights: 1 },
+    ]);
+    mockGetSettlementRate.mockResolvedValue({ pricePerPersonCny: 1500 });
+    const service = makeGroundService();
+    await service.createOrder(
+      groundOrderBody({
+        amountCny: -100,
+        reasonCode: 'DISCOUNT',
+        reasonText: '同业优惠 ¥50/人×2',
+        stackWithSettlementCalendar: true,
+      }),
+      ADMIN,
+    );
+
+    // 日历 ¥1500/人×2 + 指定酒店 ¥40/人×2 − 优惠 ¥50/人×2 = ¥2980。
+    expect(totalPassedToCreate()).toBe(2980);
+    const settlementAudit = mockPrisma.auditLog.create.mock.calls
+      .map((c) => (c[0] as { data: Record<string, unknown> }).data)
+      .find((d) => d.action === 'APPLY_SETTLEMENT_TOTAL');
+    const calendar = settlementAudit!.after as { settlementCalendar: Record<string, unknown> };
+    expect(calendar.settlementCalendar.discountCny).toBe(100);
+    const lines = calendar.settlementCalendar.lines as Array<Record<string, unknown>>;
+    expect(lines.reduce((sum, line) => sum + Number(line.lineTotalCny), 0) - Number(calendar.settlementCalendar.discountCny)).toBe(
+      2980,
+    );
+  });
+
+  it('普通 DISCOUNT 无结构化标记：套餐日历吞掉调价，机票日历仍阻断接管', async () => {
+    stubCreateOrderPrisma();
+    mockPrisma.bundle.findMany.mockResolvedValue([
+      { id: 'b-1', name: '三星套餐', settlementTier: 'THREE_STAR', settlementNights: 1 },
+    ]);
+    mockGetSettlementRate.mockResolvedValue({ pricePerPersonCny: 1500 });
+    await makeGroundService().createOrder(
+      groundOrderBody({ amountCny: -100, reasonCode: 'DISCOUNT' }),
+      ADMIN,
+    );
+    expect(totalPassedToCreate()).toBe(3080);
+    expect(
+      (mockPrisma.auditLog.create.mock.calls
+        .map((c) => (c[0] as { data: Record<string, unknown> }).data)
+        .find((d) => d.action === 'APPLY_SETTLEMENT_TOTAL')?.after as Record<string, unknown>)
+        .settlementCalendar,
+    ).not.toHaveProperty('discountCny');
+
+    vi.clearAllMocks();
+    stubCreateOrderPrisma();
+    mockGetSettlementRate.mockResolvedValue(null);
+    const flightService = makeService(2600);
+    await flightService.createOrder(
+      agentOrderBody({ priceAdjustment: { amountCny: -100, reasonCode: 'DISCOUNT' } }),
+      ADMIN,
+    );
     expect(mockGetFlightSettlementRate).not.toHaveBeenCalled();
     expect(findSettlementRow(itemsPassedToCreate())).toBeUndefined();
   });

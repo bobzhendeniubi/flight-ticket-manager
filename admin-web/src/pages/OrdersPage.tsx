@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel } from '../lib/api';
+import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { useFlightSeats } from '../stores/flightSeats';
 import {
@@ -6622,6 +6622,9 @@ interface BatchRow {
   visaExempt?: boolean;
   singleRoom?: boolean;
   businessUpgrade?: boolean;
+  /** 行级指定酒店（前端展示选择）；提交只发送解析后的房型 id。 */
+  designatedHotelId?: string;
+  designatedHotelRoomTypeId?: string;
   // ── OTA 名单解析带出的护照字段（选填；粘贴导入时填充，随提交发给后端）──────
   lastName?: string;
   firstName?: string;
@@ -6779,6 +6782,10 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   // 留空则后端回落套餐默认出发日期；两者都无 → 该批逐单优雅失败（提示配置出发日期/排班）。
   const [bundleDepartDate, setBundleDepartDate] = useState('');
   const [bundleNights, setBundleNights] = useState<number | null>(null);
+  const [bundleHotels, setBundleHotels] = useState<Hotel[]>([]);
+  const [bundleOutboundSchedules, setBundleOutboundSchedules] = useState<AdminSchedule[]>([]);
+  const [bundleReturnSchedules, setBundleReturnSchedules] = useState<AdminSchedule[]>([]);
+  const [bundleQuoteLoading, setBundleQuoteLoading] = useState(false);
   // 仅 ADMIN/STAFF 可用运营专属能力（手动结算单价、代为归属代理）。
   const isOps = user?.role === 'ADMIN' || user?.role === 'STAFF';
 
@@ -6788,6 +6795,9 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
 
   // ── OTA 手动结算单价（仅 ADMIN/STAFF）：不覆盖机票权威价，后端按差额追加调整行调到此价 ──
   const [manualUnitPriceCny, setManualUnitPriceCny] = useState<number | null>(null);
+  const [discountPerPersonCny, setDiscountPerPersonCny] = useState<number | null>(null);
+  const [batchSettlementPreview, setBatchSettlementPreview] = useState<QuoteOrderResult['settlementPreview']>(null);
+  const [batchSettlementQuoting, setBatchSettlementQuoting] = useState(false);
 
   // ── 机票结算价日历提示（只读展示，不灌值）──────────────────────────────────
   // 选定航班 + 班次后，把该航段在结算价日历里的每人价查出来给运营看个数：留空即由服务端
@@ -6919,8 +6929,9 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
     setReturnFlightId(''); setReturnScheduleId(''); setReturnSchedules([]); setReturnDate('');
     setCabin('');
     setBundleId(''); setBundleNights(null);
+    setBundleHotels([]); setBundleOutboundSchedules([]); setBundleReturnSchedules([]);
     setSettlementPriceCny(null); setGroupNote('');
-    setManualUnitPriceCny(null); setPendingSchedDate('');
+    setManualUnitPriceCny(null); setDiscountPerPersonCny(null); setBatchSettlementPreview(null); setPendingSchedDate('');
     setErr(null);
   }
 
@@ -7045,12 +7056,222 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
     selectedBundle && selectedBundle.singleSupplementCnyPerNight != null,
   );
   const batchBundleDepartDate = bundleDepartDate || selectedBundle?.defaultDepartDate || '';
+  const batchBundleNights = Math.max(
+    1,
+    bundleNights ??
+      selectedBundle?.hotelNights ??
+      (selectedBundle?.items.find((item) => item.kind === 'HOTEL')?.qty ?? 1),
+  );
+
+  const batchBundleQuoteLegs = useMemo(() => {
+    if (productType !== 'BUNDLE' || !selectedBundle || !batchBundleDepartDate) {
+      return { go: null as AdminSchedule | null, ret: null as AdminSchedule | null, returnDate: '' };
+    }
+    const go = selectedBundle.outboundFlight
+      ? bundleOutboundSchedules
+          .filter(
+            (schedule) =>
+              schedule.isActive &&
+              schedule.flightId === selectedBundle.outboundFlight?.id &&
+              localYmd(schedule.departureTime, schedule.departureTz) === batchBundleDepartDate,
+          )
+          .sort((a, b) => a.departureTime.localeCompare(b.departureTime))[0] ?? null
+      : null;
+    const returnDate = (selectedBundle.legs ?? 2) >= 2 ? addDaysToDateOnly(batchBundleDepartDate, batchBundleNights) : '';
+    const ret = (selectedBundle.legs ?? 2) >= 2 && selectedBundle.returnFlight
+      ? bundleReturnSchedules
+          .filter(
+            (schedule) =>
+              schedule.isActive &&
+              schedule.flightId === selectedBundle.returnFlight?.id &&
+              localYmd(schedule.departureTime, schedule.departureTz) === returnDate,
+          )
+          .sort((a, b) => a.departureTime.localeCompare(b.departureTime))[0] ?? null
+      : null;
+    return { go, ret, returnDate };
+  }, [productType, selectedBundle, batchBundleDepartDate, batchBundleNights, bundleOutboundSchedules, bundleReturnSchedules]);
+
+  const batchQuoteItems = useMemo<CreateOrderItemInput[]>(() => {
+    if (productType === 'FLIGHT_ONEWAY' && outboundScheduleId && cabin) {
+      return [{
+        kind: 'FLIGHT',
+        description: '批量预览 · 去程',
+        quantity: 1,
+        flightScheduleId: outboundScheduleId,
+        flightCabin: cabin,
+      }];
+    }
+    if (productType === 'FLIGHT_ROUNDTRIP' && outboundScheduleId && returnScheduleId && cabin) {
+      return [
+        {
+          kind: 'FLIGHT',
+          description: '批量预览 · 去程',
+          quantity: 1,
+          flightScheduleId: outboundScheduleId,
+          flightCabin: cabin,
+        },
+        {
+          kind: 'FLIGHT',
+          description: '批量预览 · 回程',
+          quantity: 1,
+          flightScheduleId: returnScheduleId,
+          flightCabin: cabin,
+        },
+      ];
+    }
+    if (productType === 'BUNDLE' && bundleId && batchBundleQuoteLegs.go) {
+      const flightItems: CreateOrderItemInput[] = [{
+        kind: 'FLIGHT',
+        description: '批量预览 · 套餐去程',
+        quantity: 1,
+        flightScheduleId: batchBundleQuoteLegs.go.id,
+        flightCabin: 'ECONOMY',
+        metadata: { batchQuote: true },
+      }];
+      if (batchBundleQuoteLegs.ret) {
+        flightItems.push({
+          kind: 'FLIGHT',
+          description: '批量预览 · 套餐回程',
+          quantity: 1,
+          flightScheduleId: batchBundleQuoteLegs.ret.id,
+          flightCabin: 'ECONOMY',
+          metadata: { batchQuote: true },
+        });
+      } else if ((selectedBundle?.legs ?? 2) >= 2) {
+        return [];
+      }
+      return [
+        ...flightItems.map((item) => ({ ...item, bundleId } as CreateOrderItemInput & { bundleId: string })),
+        {
+          kind: 'BUNDLE',
+          description: '批量预览 · 套餐',
+          quantity: 1,
+          bundleId,
+          unitPrice: 0,
+          adultCount: 1,
+          childCount: 0,
+          infantCount: 0,
+          metadata: {
+            goDate: batchBundleDepartDate,
+            ...(batchBundleQuoteLegs.returnDate ? { returnDate: batchBundleQuoteLegs.returnDate } : {}),
+          },
+        },
+      ];
+    }
+    return [];
+  }, [productType, outboundScheduleId, returnScheduleId, cabin, bundleId, batchBundleDepartDate, batchBundleQuoteLegs, selectedBundle]);
+
+  const validRows = rows.filter((row) => row.fullName.trim() && row.documentNumber.trim() && parseDob(row.dateOfBirth));
+  const hasBatchManualSettlementPrice = manualUnitPriceCny !== null && manualUnitPriceCny > 0;
+  const hasBatchTeamSettlementPrice = settlementPriceCny !== null && settlementPriceCny > 0;
+  const batchSettlementCalendarSuppressed =
+    hasBatchManualSettlementPrice || hasBatchTeamSettlementPrice;
+
+  useEffect(() => {
+    if (!token || !isOps || !agentId || validRows.length === 0 || batchQuoteItems.length === 0) {
+      setBatchSettlementPreview(null);
+      setBatchSettlementQuoting(false);
+      return;
+    }
+    let cancelled = false;
+    setBatchSettlementQuoting(true);
+    const timer = setTimeout(() => {
+      api
+        .quoteOrder(
+          token,
+          {
+            items: batchQuoteItems,
+            ...(productType === 'BUNDLE' ? { passengers: [{ visaExempt: false, singleRoom: false }] } : {}),
+          },
+        )
+        .then((result) => {
+          if (!cancelled) setBatchSettlementPreview(result.settlementPreview);
+        })
+        .catch((error: unknown) => {
+          if (!cancelled) {
+            setBatchSettlementPreview({
+              ok: false,
+              reason: error instanceof ApiError ? error.message : '结算价日历试算失败',
+            });
+          }
+        })
+        .finally(() => {
+          if (!cancelled) setBatchSettlementQuoting(false);
+        });
+    }, 400);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [token, isOps, agentId, validRows.length, batchQuoteItems, productType]);
+
+  // 套餐行级指定酒店与单笔录单共用酒店数据源；选店后前端只解析房型 id，价格/占房仍由服务端权威计算。
+  useEffect(() => {
+    if (!token || productType !== 'BUNDLE') {
+      setBundleHotels([]);
+      return;
+    }
+    let cancelled = false;
+    api.listHotels(false)
+      .then((res) => {
+        if (!cancelled) setBundleHotels(res.hotels);
+      })
+      .catch(() => {
+        if (!cancelled) setErr('酒店列表加载失败');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [token, productType]);
+
+  // 批量套餐不让运营逐单选航班，按套餐绑定航班 + 出发日期取首个当日班次，供结算预览复用。
+  useEffect(() => {
+    const outboundId = selectedBundle?.outboundFlight?.id;
+    const returnId = selectedBundle?.returnFlight?.id;
+    if (!token || productType !== 'BUNDLE' || !selectedBundle || !outboundId) {
+      setBundleOutboundSchedules([]);
+      setBundleReturnSchedules([]);
+      setBundleQuoteLoading(false);
+      return;
+    }
+    let cancelled = false;
+    setBundleQuoteLoading(true);
+    Promise.all([
+      api.listSchedules(token, outboundId),
+      selectedBundle.legs >= 2 && returnId
+        ? api.listSchedules(token, returnId)
+        : Promise.resolve({ schedules: [] as AdminSchedule[] }),
+    ])
+      .then(([outboundResult, returnResult]) => {
+        if (cancelled) return;
+        setBundleOutboundSchedules(outboundResult.schedules);
+        setBundleReturnSchedules(returnResult.schedules);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setBundleOutboundSchedules([]);
+          setBundleReturnSchedules([]);
+          setErr('套餐航班班次加载失败');
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setBundleQuoteLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [token, productType, selectedBundle]);
 
   // 切换套餐时不能把上一套餐的升舱选择带到新套餐；费率为 0 的套餐也不应残留该勾选。
   useEffect(() => {
     setRows((prev) => {
-      if (!prev.some((row) => row.businessUpgrade !== undefined)) return prev;
-      const next = prev.map((row) => ({ ...row, businessUpgrade: undefined }));
+      if (!prev.some((row) => row.businessUpgrade !== undefined || row.designatedHotelId !== undefined)) return prev;
+      const next = prev.map((row) => ({
+        ...row,
+        businessUpgrade: undefined,
+        designatedHotelId: undefined,
+        designatedHotelRoomTypeId: undefined,
+      }));
       rowsRef.current = next;
       return next;
     });
@@ -7068,7 +7289,21 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
     [bundles],
   );
 
-  const validRows = rows.filter((r) => r.fullName.trim() && r.documentNumber.trim() && parseDob(r.dateOfBirth));
+  function resolveBatchDesignatedRoomTypeId(hotel: Hotel): string | undefined {
+    const boundName = selectedBundle?.hotelRoomType?.name?.trim();
+    return (
+      (boundName ? hotel.roomTypes.find((roomType) => roomType.name.trim() === boundName)?.id : undefined) ??
+      hotel.roomTypes[0]?.id
+    );
+  }
+
+  function selectedBatchHotel(row: BatchRow): Hotel | undefined {
+    if (row.designatedHotelId) return bundleHotels.find((hotel) => hotel.id === row.designatedHotelId);
+    if (!row.designatedHotelRoomTypeId) return undefined;
+    return bundleHotels.find((hotel) =>
+      hotel.roomTypes.some((roomType) => roomType.id === row.designatedHotelRoomTypeId),
+    );
+  }
 
   function setRow(i: number, patch: Partial<BatchRow>): void {
     setRows((prev) => {
@@ -7457,6 +7692,17 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
       return;
     }
 
+    if (productType === 'BUNDLE') {
+      const invalidHotelLines = rows
+        .map((row, index) => ({ row, line: index + 1 }))
+        .filter(({ row }) => row.designatedHotelId && !row.designatedHotelRoomTypeId)
+        .map(({ line }) => line);
+      if (invalidHotelLines.length > 0) {
+        setErr(`第 ${invalidHotelLines.join('、')} 行指定酒店没有可匹配房型，请改用随机或单笔录单`);
+        return;
+      }
+    }
+
     let description = '';
     if (productType === 'FLIGHT_ONEWAY') {
       if (!outboundScheduleId || !cabin) { setErr('请选择出港班次和舱位'); return; }
@@ -7482,8 +7728,21 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
       isOps && productType !== 'BUNDLE' &&
       manualUnitPriceCny !== null && Number.isFinite(manualUnitPriceCny) && manualUnitPriceCny > 0
         ? manualUnitPriceCny : undefined;
+    const discountValue =
+      isOps && discountPerPersonCny !== null && Number.isFinite(discountPerPersonCny) &&
+      Number.isInteger(discountPerPersonCny) && discountPerPersonCny > 0
+        ? discountPerPersonCny
+        : undefined;
     if (teamPrice !== undefined && manualPrice !== undefined) {
       setErr('「结算单价（手动）」与「团队议价结算价」二选一，请只填其中一个');
+      return;
+    }
+    if (manualPrice !== undefined && discountValue !== undefined) {
+      setErr('优惠与手动结算单价二选一');
+      return;
+    }
+    if (teamPrice !== undefined && discountValue !== undefined) {
+      setErr('优惠与团队议价结算价二选一');
       return;
     }
     // 手填价复读确认（A17）：肥指错误（¥1000 打成 ¥100/¥0）靠让录单人重读一遍数字拦一道。
@@ -7536,12 +7795,16 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
         ...(productType === 'BUNDLE' && r.visaExempt === true ? { visaExempt: true } : {}),
         ...(productType === 'BUNDLE' && canOfferBundleSingle && r.singleRoom === true ? { singleRoom: true } : {}),
         ...(productType === 'BUNDLE' && canOfferBundleBusiness && r.businessUpgrade === true ? { businessUpgrade: true } : {}),
+        ...(productType === 'BUNDLE' && r.designatedHotelRoomTypeId
+          ? { designatedHotelRoomTypeId: r.designatedHotelRoomTypeId }
+          : {}),
         note: r.note?.trim() || undefined,
       })),
       ...(teamPrice !== undefined
         ? { settlementPriceCny: teamPrice, groupNote: groupNote.trim() || undefined }
         : {}),
       ...(manualPrice !== undefined ? { manualUnitPriceCny: manualPrice } : {}),
+      ...(discountValue !== undefined ? { discountPerPersonCny: discountValue } : {}),
       // 幂等 batchId：整批重试/双击每张子单只建一次（后端派生 `batch:{batchId}:{index}`）。
       batchId,
     };
@@ -7943,6 +8206,9 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                       {productType === 'BUNDLE' && (
                         <th className="min-w-[130px] whitespace-nowrap px-2 py-1.5 text-left font-normal">套餐选项</th>
                       )}
+                      {productType === 'BUNDLE' && (
+                        <th className="min-w-[120px] whitespace-nowrap px-2 py-1.5 text-left font-normal">酒店</th>
+                      )}
                       <th className="min-w-[130px] whitespace-nowrap px-2 py-1.5 text-left font-normal">备注（选填）</th>
                       <th className="min-w-[110px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照 OCR</th>
                       <th className="min-w-[36px] px-2 py-1.5"></th>
@@ -8102,6 +8368,43 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                                 </label>
                               )}
                             </div>
+                          </td>
+                        )}
+                        {productType === 'BUNDLE' && (
+                          <td className="px-2 py-1 align-top">
+                            <select
+                              className="w-[7.5rem] rounded border border-slate-300 px-1.5 py-1 text-xs"
+                              value={r.designatedHotelId ?? ''}
+                              onChange={(e) => {
+                                const hotelId = e.target.value;
+                                const hotel = bundleHotels.find((item) => item.id === hotelId);
+                                setRow(i, {
+                                  designatedHotelId: hotelId || undefined,
+                                  designatedHotelRoomTypeId: hotel ? resolveBatchDesignatedRoomTypeId(hotel) : undefined,
+                                });
+                              }}
+                              disabled={bundleHotels.length === 0}
+                            >
+                              <option value="">随机</option>
+                              {bundleHotels.map((hotel) => (
+                                <option key={hotel.id} value={hotel.id}>
+                                  {hotel.name}
+                                </option>
+                              ))}
+                            </select>
+                            {r.designatedHotelId && (() => {
+                              const hotel = selectedBatchHotel(r);
+                              const roomType = hotel?.roomTypes.find((item) => item.id === r.designatedHotelRoomTypeId);
+                              const rate = hotel?.designationSurchargeCnyPerPerson ?? 0;
+                              if (!r.designatedHotelRoomTypeId || !roomType) {
+                                return <span className="mt-0.5 block text-[10px] text-rose-600">该酒店房型无法自动匹配，请用单笔录单</span>;
+                              }
+                              return (
+                                <span className="mt-0.5 block whitespace-nowrap text-[10px] text-slate-500">
+                                  {roomType.name} · +¥{rate}/人
+                                </span>
+                              );
+                            })()}
                           </td>
                         )}
                         <td className="px-2 py-1 align-top">
@@ -8298,6 +8601,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                         min={0}
                         step={1}
                         integerOnly
+                        disabled={hasBatchManualSettlementPrice || (discountPerPersonCny ?? 0) > 0}
                         placeholder={
                           calendarTotalPerPax !== null
                             ? `留空 = 按日历自动取价（¥${calendarTotalPerPax}/人）`
@@ -8350,24 +8654,58 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                 {isOps && (
                   <div className="rounded-md border border-slate-200 bg-sky-50/50 p-3">
                     <div className="mb-2 text-sm font-medium text-slate-700">OTA 线上单（选填）</div>
-                    <label className="block text-xs text-slate-500 md:w-1/2">
-                      结算单价（¥/人 · 手动录入）
-                      <NumberInput
-                        className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
-                        value={manualUnitPriceCny}
-                        onChange={setManualUnitPriceCny}
-                        min={0}
-                        step={1}
-                        integerOnly
-                        placeholder="OTA 名单结算价，如 1000"
-                      />
-                    </label>
+                    <div className="grid gap-3 md:grid-cols-2">
+                      <label className="text-xs text-slate-500">
+                        结算单价（¥/人 · 手动录入）
+                        <NumberInput
+                          className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm disabled:bg-slate-100"
+                          value={manualUnitPriceCny}
+                          onChange={setManualUnitPriceCny}
+                          min={0}
+                          step={1}
+                          integerOnly
+                          disabled={hasBatchTeamSettlementPrice || (discountPerPersonCny ?? 0) > 0}
+                          placeholder="OTA 名单结算价，如 1000"
+                        />
+                      </label>
+                      <label className="text-xs text-slate-500">
+                        优惠（¥/人，选填）
+                        <NumberInput
+                          className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm disabled:bg-slate-100"
+                          value={discountPerPersonCny}
+                          onChange={setDiscountPerPersonCny}
+                          min={0}
+                          step={1}
+                          integerOnly
+                          disabled={hasBatchTeamSettlementPrice || hasBatchManualSettlementPrice}
+                          placeholder="如 50"
+                        />
+                      </label>
+                    </div>
                     <p className="mt-2 text-[11px] text-sky-700">
-                      ⓘ 不改机票权威价：仍按系统价建单，再按差额自动加一条价格调整行把订单总额调到此结算单价（系统价/差额可追溯、审计留痕）。与上方「团队议价结算价」二选一。
+                      ⓘ 手动结算单价与优惠二选一。填优惠后按每张子单出行人数生成优惠调整行；手动结算单价则按系统价差额调整并留痕。
                     </p>
                   </div>
                 )}
               </>
+            )}
+            {isOps && productType === 'BUNDLE' && (
+              <div className="rounded-md border border-slate-200 bg-sky-50/50 p-3">
+                <div className="mb-2 text-sm font-medium text-slate-700">批量优惠（选填）</div>
+                <label className="block text-xs text-slate-500 md:w-1/2">
+                  优惠（¥/人）
+                  <NumberInput
+                    className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                    value={discountPerPersonCny}
+                    onChange={setDiscountPerPersonCny}
+                    min={0}
+                    step={1}
+                    integerOnly
+                    placeholder="如 50"
+                  />
+                </label>
+                <p className="mt-2 text-[11px] text-sky-700">ⓘ 每张子单按该单出行人数生成「同业优惠」调整行；与手动结算单价二选一。</p>
+              </div>
             )}
 
             {/* H 录入人 + 整批备注 */}
@@ -8406,6 +8744,49 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                 </span>
               </label>
             </div>
+
+            {isOps && agentId && batchSettlementCalendarSuppressed && (
+              <p className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-[11px] text-slate-600">
+                已填手工结算价，结算价日历不生效
+              </p>
+            )}
+            {isOps && agentId && !batchSettlementCalendarSuppressed &&
+              (batchSettlementQuoting || bundleQuoteLoading || batchSettlementPreview !== null) && (
+              <div className={`rounded-md border px-3 py-2 text-xs ${
+                batchSettlementPreview?.ok === false
+                  ? 'border-amber-200 bg-amber-50 text-amber-800'
+                  : 'border-brand-200 bg-brand-50/70 text-brand-800'
+              }`}>
+                {batchSettlementQuoting || bundleQuoteLoading ? (
+                  <span>结算价（日历）试算中…</span>
+                ) : batchSettlementPreview?.ok === true ? (
+                  <>
+                    <div className="font-semibold">
+                      结算价（日历）{batchSettlementPreview.lines.map((line, index) => (
+                        <span key={`${line.note}-${index}`}>
+                          {index > 0 ? ' + ' : ' '}
+                          ¥{line.pricePerPersonCny.toLocaleString('zh-CN')}/人
+                          {line.addOnCny !== undefined && (
+                            <>（加项 {line.addOnCny >= 0 ? '+' : '−'}¥{Math.abs(line.addOnCny).toLocaleString('zh-CN')}）</>
+                          )}
+                        </span>
+                      ))}
+                      {' × '}{validRows.length}人 = ¥{(batchSettlementPreview.totalCny * validRows.length).toLocaleString('zh-CN')}
+                    </div>
+                    {(discountPerPersonCny ?? 0) > 0 && (
+                      <div className="mt-0.5 font-medium">
+                        − 优惠 ¥{discountPerPersonCny}/人 × {validRows.length}人 = 实收 ¥{(
+                          (batchSettlementPreview.totalCny - (discountPerPersonCny ?? 0)) * validRows.length
+                        ).toLocaleString('zh-CN')}
+                      </div>
+                    )}
+                    <div className="mt-0.5 text-[11px] text-brand-700">儿童价/自备签减免及单住/升舱/指定酒店等行级项按人另计</div>
+                  </>
+                ) : batchSettlementPreview?.ok === false ? (
+                  <span className="text-amber-800">{batchSettlementPreview.reason}——提交将被拒，请先维护结算价日历</span>
+                ) : null}
+              </div>
+            )}
 
             <div className="flex items-center justify-between border-t border-slate-200 pt-3">
               <span className="text-xs text-slate-500">将创建 {validRows.length} 张{orderCountLabel}（1/人）</span>

@@ -201,6 +201,13 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         return reply.status(403).send({ error: '客户不可批量建单' });
       }
       const body = batchCreateOrdersBodySchema.parse(req.body);
+      const hasDiscount = body.discountPerPersonCny !== undefined && body.discountPerPersonCny > 0;
+      if (body.manualUnitPriceCny !== undefined && hasDiscount) {
+        return reply.status(400).send({ error: '优惠与手动结算单价二选一' });
+      }
+      if (body.settlementPriceCny !== undefined && hasDiscount) {
+        return reply.status(400).send({ error: '优惠与团队议价结算价二选一' });
+      }
       // 团队议价结算价覆盖机票价：仅 ADMIN/STAFF 可用（AGENT 自助批量建单不得改价）。
       const isOps = req.user.role === UserRole.ADMIN || req.user.role === UserRole.STAFF;
       if (body.settlementPriceCny !== undefined && !isOps) {
@@ -209,6 +216,9 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       // OTA 手动结算单价：仅 ADMIN/STAFF 可用（AGENT 自助批量建单不得手动定价）。
       if (body.manualUnitPriceCny !== undefined && !isOps) {
         return reply.status(403).send({ error: '仅运营/管理员可手动录入结算单价' });
+      }
+      if (hasDiscount && !isOps) {
+        return reply.status(403).send({ error: '仅运营/管理员可录入优惠' });
       }
       // 手动结算单价与团队议价结算价语义冲突（前者保留系统权威价 + 调差，后者直接覆盖机票价）→ 二选一。
       if (body.manualUnitPriceCny !== undefined && body.settlementPriceCny !== undefined) {
@@ -232,6 +242,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
           settlementPriceCny: body.settlementPriceCny ?? null,
           // OTA 手动结算单价（如有）— 保留系统权威价 + 差额调整行，此处记录录入的每人结算单价
           manualUnitPriceCny: body.manualUnitPriceCny ?? null,
+          discountPerPersonCny: hasDiscount ? body.discountPerPersonCny : null,
           priceOverride:
             body.settlementPriceCny !== undefined
               ? 'TEAM_SETTLEMENT'
@@ -244,7 +255,8 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         severity:
           result.failureCount > 0 ||
           body.settlementPriceCny !== undefined ||
-          body.manualUnitPriceCny !== undefined
+          body.manualUnitPriceCny !== undefined ||
+          hasDiscount
             ? 'WARNING'
             : 'INFO',
       });

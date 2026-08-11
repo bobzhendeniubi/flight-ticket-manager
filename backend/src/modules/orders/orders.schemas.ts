@@ -100,7 +100,15 @@ export const priceAdjustmentSchema = z
     reasonText: z.string().max(200).optional(),
   })
   .refine(requireReasonTextForOther, REASON_TEXT_REQUIRED_MSG);
-export type PriceAdjustmentInput = z.infer<typeof priceAdjustmentSchema>;
+type PublicPriceAdjustmentInput = z.infer<typeof priceAdjustmentSchema>;
+/**
+ * 价格调整的服务端内部载荷。
+ * stackWithSettlementCalendar 只允许 batchCreateOrders 的优惠路径注入；它不在
+ * priceAdjustmentSchema 中，因此 createOrderBodySchema 解析外部 HTTP 请求时会 strip 掉。
+ */
+export type PriceAdjustmentInput = PublicPriceAdjustmentInput & {
+  stackWithSettlementCalendar?: boolean;
+};
 
 // 事后调价（POST /orders/:id/price-adjustment · 0722 公测反馈「按乘客调价」）：
 //   在录单调价四类原因基础上，加一个可空 passengerId —— 非空 = 只作用于该乘客的应收份额，
@@ -508,7 +516,31 @@ export const createOrderBodySchema = z.object({
   // 前台散客/游客、代理自助、小程序与后台单录全走这里 → 一处收口即全渠道生效。
   // service 层还有一道 ADMIN/STAFF 同口径校验（createOrder），作双保险保留。
   .superRefine(refineRequiredPassportExpiry);
-export type CreateOrderBody = z.infer<typeof createOrderBodySchema>;
+type ParsedCreateOrderBody = z.infer<typeof createOrderBodySchema>;
+// 内部 batchCreateOrders 可在 priceAdjustment 上附带 stackWithSettlementCalendar；HTTP schema
+// 仍使用公开 priceAdjustmentSchema 并 strip 该字段，不会把内部语义暴露给外部调用方。
+export type CreateOrderBody = Omit<ParsedCreateOrderBody, 'priceAdjustment'> & {
+  priceAdjustment?: PriceAdjustmentInput;
+};
+
+/**
+ * 结算价日历预览的唯一后端类型真源；quote 与 createOrder 共用同一套日历取价结果形状。
+ */
+export type SettlementPreview =
+  | null
+  | {
+      ok: true;
+      source: 'GROUND' | 'FLIGHT';
+      totalCny: number;
+      departDate?: string;
+      lines: Array<{
+        pricePerPersonCny: number;
+        pax: number;
+        addOnCny?: number;
+        note: string;
+      }>;
+    }
+  | { ok: false; reason: string };
 
 // ── 录单前试算（quote，只算不落库；ADMIN/STAFF）───────────────────────────
 // body 为 createOrder items 子集：填完产品/人数即可拿到「系统权威价」，供录单页展示。
@@ -765,6 +797,13 @@ export const batchCreateOrdersBodySchema = z
       .min(0, '结算单价不能为负')
       .max(SETTLEMENT_PRICE_CAP_CNY, `结算单价超出上限（${SETTLEMENT_PRICE_CAP_CNY}）`)
       .optional(),
+    // 批量同业优惠（CNY/人）。服务端按每张子单的真实出行人数生成 DISCOUNT 调整行。
+    discountPerPersonCny: z
+      .number()
+      .int('优惠金额必须为整数（CNY）')
+      .min(0, '优惠金额不能为负')
+      .max(20_000, '单人优惠不能超过 ¥20000')
+      .optional(),
     // 团期备注（写入每张子单 notes + noteSpecial）
     groupNote: z.string().max(500).optional(),
     // 允许重复乘客强录（仅 ADMIN/STAFF 生效；透传给每张子单的 createOrder）。
@@ -781,6 +820,8 @@ export const batchCreateOrdersBodySchema = z
         passengerInputWithRequiredExpirySchema.extend({
           note: z.string().max(500).optional(),
           businessUpgrade: z.boolean().optional(),
+          // 仅 BUNDLE 批量创单有意义：指定酒店后由服务端按房型切占房并计算加价。
+          designatedHotelRoomTypeId: z.string().min(1).optional(),
         }),
       )
       .min(1)
@@ -820,6 +861,31 @@ export const batchCreateOrdersBodySchema = z
           path: ['bundleId'],
         });
       }
+    } else {
+      val.passengers.forEach((passenger, index) => {
+        if (passenger.designatedHotelRoomTypeId) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: '指定酒店仅适用于 BUNDLE 批量创单',
+            path: ['passengers', index, 'designatedHotelRoomTypeId'],
+          });
+        }
+      });
+    }
+    const hasDiscount = val.discountPerPersonCny !== undefined && val.discountPerPersonCny > 0;
+    if (val.manualUnitPriceCny !== undefined && hasDiscount) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: '优惠与手动结算单价二选一',
+        path: ['discountPerPersonCny'],
+      });
+    }
+    if (val.settlementPriceCny !== undefined && hasDiscount) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: '优惠与团队议价结算价二选一',
+        path: ['discountPerPersonCny'],
+      });
     }
   });
 export type BatchCreateOrdersBody = z.infer<typeof batchCreateOrdersBodySchema>;

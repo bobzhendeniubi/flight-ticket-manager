@@ -92,6 +92,7 @@ import type {
   PriceAdjustmentInput,
   PublicOrderLookupQuery,
   QuoteOrderBody,
+  SettlementPreview,
   SelfUpdatePassengerBody,
   SwapItemHotelBody,
   UpdateItemSettlementPriceBody,
@@ -350,6 +351,7 @@ export interface BundleFlightLeg {
 export interface BatchBundlePassengerOptions {
   singleRoom?: boolean;
   businessUpgrade?: boolean;
+  designatedHotelRoomTypeId?: string;
   adultCount: number;
   childCount: number;
   infantCount: number;
@@ -438,6 +440,9 @@ export function buildBatchItems(
         adultCount: bundlePassengerOptions.adultCount,
         childCount: bundlePassengerOptions.childCount,
         infantCount: bundlePassengerOptions.infantCount,
+        ...(bundlePassengerOptions.designatedHotelRoomTypeId
+          ? { designatedHotelRoomTypeId: bundlePassengerOptions.designatedHotelRoomTypeId }
+          : {}),
         ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
       },
     ];
@@ -967,6 +972,9 @@ export class OrderService {
     // 说明：与 0723「结算价锁」不冲突——锁只在核对后写保护改价，日历只在创建时定价，两者时序不重叠。
     let effectiveSettlementTotalCny = body.settlementTotalCny;
     let settlementCalendarAudit: Record<string, unknown> | null = null;
+    // 批量「优惠 ¥/人」是独立的可叠加调整：只有服务端批量优惠路径注入的结构化标记
+    // 才允许日历价与调整行叠加；普通 DISCOUNT 调价保持既有语义。
+    const stackableCalendarAdjustment = body.priceAdjustment?.stackWithSettlementCalendar === true;
     if (body.settlementTotalCny === undefined && agentId) {
       // BUNDLE 行加项净额（与 body.items 的 BUNDLE 行同序）：日历价 + 加项 才是本单结算价，
       // 否则升舱/单房差/指定酒店加价会被下方 SETTLEMENT 差额行收敛吞掉。
@@ -975,22 +983,35 @@ export class OrderService {
         pricedItems.filter((p) => p.kind === 'BUNDLE').map((p) => p.settlementAddOnCny ?? 0),
       );
       if (calendar) {
-        effectiveSettlementTotalCny = calendar.totalCny;
+        effectiveSettlementTotalCny =
+          calendar.totalCny + (stackableCalendarAdjustment ? body.priceAdjustment?.amountCny ?? 0 : 0);
         settlementCalendarAudit = calendar.audit;
       } else if (
         // 机票结算价日历（纯机票代理单）：套餐日历没接管时才轮到它。
         // 任一「手工价通道」在场一律不介入——手工价与日历价二选一，叠加会双重砸价：
         //   · priceAdjustment：批量的「OTA 结算单价」就是走这条（差额调价行）。
         //   · flightSettlementPriceCny：批量的「结算价/人（团队议价）」，已直接覆盖机票行单价。
-        body.priceAdjustment === undefined &&
+        (body.priceAdjustment === undefined || stackableCalendarAdjustment) &&
         body.flightSettlementPriceCny === undefined
       ) {
         const flightCalendar = await this.resolveFlightSettlementCalendarTotal(body);
         if (flightCalendar) {
-          effectiveSettlementTotalCny = flightCalendar.totalCny;
+          effectiveSettlementTotalCny =
+            flightCalendar.totalCny + (stackableCalendarAdjustment ? body.priceAdjustment?.amountCny ?? 0 : 0);
           settlementCalendarAudit = flightCalendar.audit;
         }
       }
+    }
+
+    const calendarDiscountCny = stackableCalendarAdjustment
+      ? Math.max(0, -(body.priceAdjustment?.amountCny ?? 0))
+      : 0;
+    if (settlementCalendarAudit && calendarDiscountCny > 0) {
+      settlementCalendarAudit = { ...settlementCalendarAudit, discountCny: calendarDiscountCny };
+    }
+
+    if (effectiveSettlementTotalCny !== undefined && effectiveSettlementTotalCny < 0) {
+      throw new BadRequestError('优惠金额超过订单应收，请核对');
     }
 
     // 本单结算总价（权限/与 priceAdjustment 的互斥已在入口断言；代理单可由上方日历自动填充）：
@@ -1024,6 +1045,9 @@ export class OrderService {
 
     const subtotal = pricedItems.reduce((sum, p) => sum + p.amount, 0);
     const total = subtotal; // 目前没有 taxes / discount，直接等于 subtotal
+    if (total < 0) {
+      throw new BadRequestError('优惠金额超过订单应收，请核对');
+    }
 
     // 生成订单号（有极小概率撞 unique，重试 3 次）
     const orderNumber = await generateOrderNumber();
@@ -1309,6 +1333,7 @@ export class OrderService {
       unitPrice: number;
       amount: number;
     }>;
+    settlementPreview: SettlementPreview;
   }> {
     // 试算带上乘客级住宿/签证选项（缺省则回落 item 级旧口径），使系统价随每人选择实时变化。
     // quote 仅 ADMIN/STAFF 路由可达，允许自由行手录价试算。
@@ -1321,7 +1346,61 @@ export class OrderService {
       amount: p.amount,
     }));
     const subtotal = items.reduce((sum, p) => sum + p.amount, 0);
-    return { currency: 'CNY', subtotal, total: subtotal, items };
+
+    let settlementPreview: SettlementPreview = null;
+    try {
+      const quoteCreateBody: Pick<CreateOrderBody, 'items'> = { items: body.items };
+      const bundleCalendar = await this.resolveBundleSettlementCalendarTotal(
+        quoteCreateBody,
+        priced.filter((p) => p.kind === 'BUNDLE').map((p) => p.settlementAddOnCny ?? 0),
+      );
+      if (bundleCalendar) {
+        const auditLines = Array.isArray(bundleCalendar.audit.lines)
+          ? bundleCalendar.audit.lines
+          : [];
+        settlementPreview = {
+          ok: true,
+          source: 'GROUND',
+          totalCny: bundleCalendar.totalCny,
+          departDate:
+            typeof bundleCalendar.audit.departDate === 'string'
+              ? bundleCalendar.audit.departDate
+              : undefined,
+          lines: auditLines.map((line) => ({
+            pricePerPersonCny: Number(line.pricePerPersonCny ?? 0),
+            pax: Number(line.pax ?? 0),
+            ...(Number(line.addOnCny ?? 0) !== 0 ? { addOnCny: Number(line.addOnCny) } : {}),
+            note: String(line.note ?? ''),
+          })),
+        };
+      } else {
+        const flightCalendar = await this.resolveFlightSettlementCalendarTotal(quoteCreateBody);
+        if (flightCalendar) {
+          const auditLines = Array.isArray(flightCalendar.audit.lines)
+            ? flightCalendar.audit.lines
+            : [];
+          settlementPreview = {
+            ok: true,
+            source: 'FLIGHT',
+            totalCny: flightCalendar.totalCny,
+            lines: auditLines.map((line) => ({
+              pricePerPersonCny: Number(line.pricePerPersonCny ?? 0),
+              pax: Number(line.pax ?? 0),
+              note: String(line.note ?? ''),
+            })),
+          };
+        }
+      }
+    } catch (error) {
+      if (error instanceof BadRequestError) {
+        settlementPreview = { ok: false, reason: error.message };
+      } else {
+        console.error('[orders] settlement calendar quote failed', error);
+        settlementPreview = null;
+      }
+    }
+
+    return { currency: 'CNY', subtotal, total: subtotal, items, settlementPreview };
   }
 
   // ════════════════════════════════════════════════════════════════════
@@ -1395,7 +1474,7 @@ export class OrderService {
    * 无手工 settlementTotalCny 时调用，故此处不重复判身份。
    */
   private async resolveBundleSettlementCalendarTotal(
-    body: CreateOrderBody,
+    body: Pick<CreateOrderBody, 'items'>,
     // 与 body.items 里 BUNDLE 行同序一一对应的加项净额（升舱/单房差/婴儿价/儿童折扣/自备签减免/
     // 指定酒店加价，未打折；来自 priceAndValidateItems 的 settlementAddOnCny）。
     // 日历价是「基础随机套餐」的每人同业价，加项按报价口径叠加其上——此前日历价裸收敛会把
@@ -1493,7 +1572,7 @@ export class OrderService {
    * 调用方（createOrder）仅在「代理单 + 无手工结算价 + 套餐日历未接管」时调用，故此处不重复判身份。
    */
   private async resolveFlightSettlementCalendarTotal(
-    body: CreateOrderBody,
+    body: Pick<CreateOrderBody, 'items'>,
   ): Promise<{ totalCny: number; audit: Record<string, unknown> } | null> {
     // 含套餐行 → 不是纯机票单，交回套餐日历/现状处理。
     if (body.items.some((it) => it.kind === 'BUNDLE')) return null;
@@ -1552,7 +1631,7 @@ export class OrderService {
    * 去程出发地本地日（YYYY-MM-DD）：取本单所有 FLIGHT 航段里最早 departureTime 的班次，
    * 按其出发地时区折成本地日（localDate，与航班/班次日期展示口径一致）。无 FLIGHT 航段 → null。
    */
-  private async resolveDepartureLocalDate(body: CreateOrderBody): Promise<string | null> {
+  private async resolveDepartureLocalDate(body: Pick<CreateOrderBody, 'items'>): Promise<string | null> {
     const scheduleIds = [
       ...new Set(
         body.items
@@ -3302,6 +3381,16 @@ export class OrderService {
       error?: string;
     }>;
   }> {
+    const hasDiscount = body.discountPerPersonCny !== undefined && body.discountPerPersonCny > 0;
+    if (body.discountPerPersonCny !== undefined && body.discountPerPersonCny > 20_000) {
+      throw new BadRequestError('单人优惠不能超过 ¥20000');
+    }
+    if (body.manualUnitPriceCny !== undefined && hasDiscount) {
+      throw new BadRequestError('优惠与手动结算单价二选一');
+    }
+    if (body.settlementPriceCny !== undefined && hasDiscount) {
+      throw new BadRequestError('优惠与团队议价结算价二选一');
+    }
     // OTA 手动结算单价权限（服务端按认证身份判，不信前端；与 createOrder 的 priceAdjustment 同口径）：
     // 仅 ADMIN/STAFF 可用，散客/AGENT 携带一律 400。放在最顶端（早于任何 prisma 调用）→ 未触库即拒。
     if (
@@ -3310,6 +3399,13 @@ export class OrderService {
       requester.role !== UserRole.STAFF
     ) {
       throw new BadRequestError('无权手动录入结算单价');
+    }
+    if (
+      hasDiscount &&
+      requester.role !== UserRole.ADMIN &&
+      requester.role !== UserRole.STAFF
+    ) {
+      throw new BadRequestError('无权录入优惠');
     }
 
     // R7 批量重试幂等：整批共享一个 batchId（前端每次提交生成；缺省则后端生成一个同批共享）。
@@ -3393,6 +3489,25 @@ export class OrderService {
       }
     }
 
+    // 先按每张子单真实出行人数复核优惠总额，再进入逐单 createOrder，避免前几张已建单后
+    // 才发现后续乘客的优惠超过调价上限。BUNDLE 口径与日历取价一致：成人+儿童+婴儿。
+    if (hasDiscount && !bundleLegResolutionError) {
+      for (const passenger of body.passengers) {
+        const ageCounts =
+          productType === 'BUNDLE'
+            ? deriveBatchBundlePassengerCounts(passenger.dateOfBirth, bundleDates.goDate)
+            : { adultCount: 1, childCount: 0, infantCount: 0 };
+        const travelPax =
+          productType === 'BUNDLE'
+            ? resolveBundleOccupancy({ ...ageCounts, quantity: 1 }).headCount
+            : 1;
+        const discountCny = body.discountPerPersonCny! * travelPax;
+        if (discountCny > PRICE_ADJUSTMENT_CAP_CNY) {
+          throw new BadRequestError('优惠金额超过调整上限，请核对优惠金额');
+        }
+      }
+    }
+
     // 按 productType 构造非套餐子单的 items（机票项与乘客无关，循环外算一次）。
     // BUNDLE 的地面行包含单住/升舱/年龄计数，必须在逐人循环内按本行乘客构造。
     //   FLIGHT_ONEWAY   → 1 条 FLIGHT（outbound）
@@ -3459,6 +3574,7 @@ export class OrderService {
             ...ageCounts,
             singleRoom: passenger.singleRoom,
             businessUpgrade: passenger.businessUpgrade,
+            designatedHotelRoomTypeId: passenger.designatedHotelRoomTypeId,
           });
 
         // OTA 手动结算价按每张子单的实际权威价计算；BUNDLE 的生日/行级选项可能使各子单系统价不同。
@@ -3485,6 +3601,28 @@ export class OrderService {
           }
         }
 
+        // 批量优惠按每张子单的真实出行人数生成独立 DISCOUNT 调整行。
+        // BUNDLE 口径取 headCount（成人 + 儿童 + 婴儿），与结算价日历一致；非套餐批量每张子单一位乘客。
+        let discountAdjustment: PriceAdjustmentInput | undefined;
+        if (hasDiscount) {
+          const bundleItem = batchItems.find(
+            (item): item is Extract<OrderItemInput, { kind: 'BUNDLE' }> => item.kind === 'BUNDLE',
+          );
+          const travelPax = bundleItem
+            ? resolveBundleOccupancy(bundleItem).headCount
+            : 1;
+          const discountCny = body.discountPerPersonCny! * travelPax;
+          if (discountCny > PRICE_ADJUSTMENT_CAP_CNY) {
+            throw new BadRequestError('优惠金额超过调整上限，请核对优惠金额');
+          }
+          discountAdjustment = {
+            amountCny: -discountCny,
+            reasonCode: 'DISCOUNT',
+            reasonText: `同业优惠 ¥${body.discountPerPersonCny}/人×${travelPax}`,
+            stackWithSettlementCalendar: true,
+          };
+        }
+
         const order = await this.createOrder(
           {
             // 联系人=本单乘客（body 显式传联系人则整批统一用它；录入人仅兜底）。
@@ -3507,7 +3645,7 @@ export class OrderService {
             // 仅作用于 FLIGHT 行；BUNDLE 走 createOrder 的 server-priced 套餐定价，此值对其无效。
             flightSettlementPriceCny: body.settlementPriceCny,
             // OTA 手动结算单价 → 差额调整行（每单一致；createOrder 再按身份复核权限 + 审计落库）。
-            priceAdjustment: manualPriceAdjustment,
+            priceAdjustment: manualPriceAdjustment ?? discountAdjustment,
             // 透传重复乘客强录 flag（createOrder 内再按身份收口 + 逐单审计/备注留痕）。
             allowDuplicatePassengers,
             // R7：稳定幂等键 `batch:{batchId}:{index}` → createOrder 幂等回放（整批重试每子单只建一次）。

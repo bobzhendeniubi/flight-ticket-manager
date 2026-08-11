@@ -34,6 +34,7 @@ import {
   type OrderSummary,
   type RoomGroup,
   type PriceAdjustmentReason,
+  type QuoteOrderResult,
   type Transfer,
   type TravelerProfileSuggestion,
   type Visa,
@@ -377,6 +378,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const [quoteTotal, setQuoteTotal] = useState<number | null>(null);
   const [quoting, setQuoting] = useState(false);
   const [quoteErr, setQuoteErr] = useState<string | null>(null);
+  const [settlementPreview, setSettlementPreview] = useState<QuoteOrderResult['settlementPreview']>(null);
   // 调价：金额（CNY，整数，可正可负）+ 原因（下拉）+ 其它说明。空/0 = 不调整（不发该字段）。
   const [adjustAmount, setAdjustAmount] = useState<number | null>(null);
   const [adjustReason, setAdjustReason] = useState<PriceAdjustmentReason>('DISCOUNT');
@@ -1226,12 +1228,14 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   useEffect(() => {
     if (!token) {
       setQuoteTotal(null);
+      setSettlementPreview(null);
       setQuoteErr(null);
       return;
     }
     const built = buildItem();
     if ('error' in built) {
       setQuoteTotal(null);
+      setSettlementPreview(null);
       setQuoteErr(null);
       return;
     }
@@ -1250,11 +1254,13 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
         .then((r) => {
           if (cancelled) return;
           setQuoteTotal(r.total);
+          setSettlementPreview(r.settlementPreview);
           setQuoteErr(null);
         })
         .catch((e: unknown) => {
           if (cancelled) return;
           setQuoteTotal(null);
+          setSettlementPreview(null);
           setQuoteErr(e instanceof ApiError ? e.message : '系统价试算失败');
         })
         .finally(() => {
@@ -2563,6 +2569,33 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                 </span>
               </div>
               {quoteErr && <p className="mt-1 text-[11px] text-rose-500">{quoteErr}</p>}
+              {agentId && settlementPrice === null && settlementPreview?.ok === true && (
+                <div className="mt-2 rounded-md border border-brand-200 bg-brand-50 px-3 py-2 text-xs text-brand-800">
+                  <div className="font-semibold">
+                    结算价（日历）{settlementPreview.lines.map((line, index) => (
+                      <span key={`${line.note}-${index}`}>
+                        {index > 0 ? ' + ' : ' '}
+                        ¥{line.pricePerPersonCny.toLocaleString('zh-CN')}/人 × {line.pax}人
+                        {line.addOnCny !== undefined && (
+                          <>（加项 {line.addOnCny >= 0 ? '+' : '−'}¥{Math.abs(line.addOnCny).toLocaleString('zh-CN')}）</>
+                        )}
+                      </span>
+                    ))}
+                    {' = '}¥{settlementPreview.totalCny.toLocaleString('zh-CN')}
+                  </div>
+                  <div className="mt-0.5 text-[11px] text-brand-700">提交后订单总额按此收敛</div>
+                </div>
+              )}
+              {agentId && settlementPrice === null && settlementPreview?.ok === false && (
+                <p className="mt-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-800">
+                  {settlementPreview.reason}——提交将被拒，请先维护结算价日历
+                </p>
+              )}
+              {agentId && settlementPrice !== null && (
+                <p className="mt-2 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-[11px] text-slate-600">
+                  已填手工结算价，结算价日历不生效
+                </p>
+              )}
               {quoteTotal === null && !quoting && !quoteErr && (
                 <p className="mt-1 text-[11px] text-slate-400">填完产品与人数后自动按系统权威价试算。</p>
               )}

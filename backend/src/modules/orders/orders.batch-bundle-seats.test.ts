@@ -80,6 +80,27 @@ describe('buildBatchItems · BUNDLE 航段注入', () => {
     expect(items.map((i) => i.kind)).toEqual(['FLIGHT', 'BUNDLE']);
   });
 
+  it('行级指定酒店 → 房型 id 只写入该乘客自己的 BUNDLE 行', () => {
+    const items = buildBatchItems(
+      body,
+      'BUNDLE',
+      undefined,
+      { goDate: '2026-09-15' },
+      [{ scheduleId: 'sch-go', label: '去程' }],
+      {
+        adultCount: 1,
+        childCount: 0,
+        infantCount: 0,
+        designatedHotelRoomTypeId: 'room-type-designated',
+      },
+    );
+    const bundleRow = items.find((item) => item.kind === 'BUNDLE') as Extract<
+      (typeof items)[number],
+      { kind: 'BUNDLE' }
+    >;
+    expect(bundleRow.designatedHotelRoomTypeId).toBe('room-type-designated');
+  });
+
   it('无航段（解析失败兜底）→ 仅 [BUNDLE]（循环不会用它，逐单短路失败）', () => {
     const items = buildBatchItems(body, 'BUNDLE', undefined, {}, []);
     expect(items.map((i) => i.kind)).toEqual(['BUNDLE']);
@@ -293,6 +314,76 @@ describe('batchCreateOrders · BUNDLE 成功路径（航段注入 + 房控日期
       expect.objectContaining({ visaExempt: true, singleRoom: true, businessUpgrade: true }),
       expect.not.objectContaining({ visaExempt: true, singleRoom: true }),
     ]);
+  });
+
+  it('行级指定酒店 → 只有对应子单的 BUNDLE 行带房型 id，交由既有定价/占房链路处理', async () => {
+    configureOneWayBundle(null);
+    const captured: Array<{ items: unknown }> = [];
+    vi.spyOn(service as never, 'createOrder').mockImplementation((async (body: { items: unknown }) => {
+      captured.push({ items: body.items });
+      return { id: `o-${captured.length}`, orderNumber: `N-${captured.length}` };
+    }) as never);
+
+    const res = await service.batchCreateOrders(
+      baseBundleBody({
+        bundleDepartDate: '2026-09-15',
+        passengers: [
+          {
+            fullName: 'ADULT ONE',
+            documentNumber: 'P101',
+            dateOfBirth: '1990-01-01',
+            nationality: 'CN',
+            designatedHotelRoomTypeId: 'room-type-designated',
+          },
+          {
+            fullName: 'ADULT TWO',
+            documentNumber: 'P102',
+            dateOfBirth: '1990-01-01',
+            nationality: 'CN',
+          },
+        ],
+      }),
+      { userId: 'u-admin', role: 'ADMIN' } as never,
+    );
+
+    expect(res).toMatchObject({ successCount: 2, failureCount: 0 });
+    const bundleRows = captured.map(({ items }) =>
+      (items as Array<Record<string, unknown>>).find((item) => item.kind === 'BUNDLE')!,
+    );
+    expect(bundleRows[0].designatedHotelRoomTypeId).toBe('room-type-designated');
+    expect(bundleRows[1].designatedHotelRoomTypeId).toBeUndefined();
+  });
+
+  it('套餐批量优惠 → 子单携带优惠调整行，日历收敛时由 createOrder 叠加处理', async () => {
+    configureOneWayBundle(null);
+    const captured: Array<{ priceAdjustment?: unknown }> = [];
+    vi.spyOn(service as never, 'createOrder').mockImplementation((async (body: { priceAdjustment?: unknown }) => {
+      captured.push({ priceAdjustment: body.priceAdjustment });
+      return { id: `o-${captured.length}`, orderNumber: `N-${captured.length}` };
+    }) as never);
+
+    const res = await service.batchCreateOrders(
+      baseBundleBody({
+        agentId: 'agent-1',
+        bundleDepartDate: '2026-09-15',
+        discountPerPersonCny: 50,
+        passengers: [{
+          fullName: 'ADULT DISCOUNT',
+          documentNumber: 'P103',
+          dateOfBirth: '1990-01-01',
+          nationality: 'CN',
+        }],
+      }),
+      { userId: 'u-admin', role: 'ADMIN' } as never,
+    );
+
+    expect(res).toMatchObject({ successCount: 1, failureCount: 0 });
+    expect(captured[0].priceAdjustment).toEqual({
+      amountCny: -50,
+      reasonCode: 'DISCOUNT',
+      reasonText: '同业优惠 ¥50/人×1',
+      stackWithSettlementCalendar: true,
+    });
   });
 
   it('套餐显式升舱费率为 0 + 行勾选升舱 → 该子单逐单失败且不建单', async () => {

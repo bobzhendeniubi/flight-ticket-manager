@@ -334,6 +334,8 @@ export interface BatchOrderPassenger {
   passportPhotoUrl?: string;
   /** 该乘客个别备注（选填）：与整批备注合并写入该乘客订单。 */
   note?: string;
+  /** BUNDLE 批量创单行级指定酒店：传服务端解析出的房型 id。 */
+  designatedHotelRoomTypeId?: string;
 }
 // 批量创单 body 同样支持整批共用的签证状态 + 结构化备注四栏（后端 batchCreateOrdersBodySchema
 // 直接 spread 了 orderStructuredNotesShape，写入每张子单）——与 CreateOrderInput 同款 extends。
@@ -376,6 +378,8 @@ export interface BatchCreateOrdersInput extends OrderStructuredNotes {
    * 把订单总额调到该手动结算价（系统价 / 差额可追溯、审计照记）。
    */
   manualUnitPriceCny?: number;
+  /** 批量同业优惠（CNY/人）；与 manualUnitPriceCny 互斥。 */
+  discountPerPersonCny?: number;
   /** 团期备注（如「2026 春节团 7 日」），写入每单。 */
   groupNote?: string;
   /**
@@ -523,7 +527,7 @@ interface OrderItemBase {
   metadata?: Record<string, unknown>;
 }
 export type CreateOrderItemInput =
-  | (OrderItemBase & { kind: 'FLIGHT'; flightScheduleId: string; flightCabin: CabinClass })
+  | (OrderItemBase & { kind: 'FLIGHT'; flightScheduleId: string; flightCabin: CabinClass; bundleId?: string })
   | (OrderItemBase & {
       kind: 'HOTEL';
       hotelRoomTypeId?: string;
@@ -639,6 +643,26 @@ export interface PriceAdjustmentInput {
   reasonText?: string;
 }
 
+/**
+ * 与 backend/src/modules/orders/orders.schemas.ts 的 SettlementPreview 同构。
+ * 仅用于 quote 响应展示，最终定价仍由服务端 createOrder 决定。
+ */
+export type SettlementPreview =
+  | null
+  | {
+      ok: true;
+      source: 'GROUND' | 'FLIGHT';
+      totalCny: number;
+      departDate?: string;
+      lines: Array<{
+        pricePerPersonCny: number;
+        pax: number;
+        addOnCny?: number;
+        note: string;
+      }>;
+    }
+  | { ok: false; reason: string };
+
 // 录单前试算（系统价）。items 与 createOrder 同结构。
 export interface QuoteOrderResult {
   currency: string;
@@ -651,6 +675,7 @@ export interface QuoteOrderResult {
     unitPrice: number;
     amount: number;
   }>;
+  settlementPreview: SettlementPreview;
 }
 
 export interface CreateOrderInput extends OrderStructuredNotes {

@@ -309,4 +309,14 @@ describe('createOrder · settlementTotalCny 差额行生成（ADMIN，mock 全�
     await expect(service.createOrder(body, ADMIN)).rejects.toThrowError(/超出调价上限/);
     expect(mockPrisma.$transaction).not.toHaveBeenCalled();
   });
+
+  it('优惠调价导致最终总额为负 → 拒绝建单并提示核对优惠金额', async () => {
+    const service = makeService(50);
+    const body = {
+      ...(baseBody as unknown as Record<string, unknown>),
+      priceAdjustment: { amountCny: -100, reasonCode: 'DISCOUNT' },
+    } as unknown as CreateOrderBody;
+    await expect(service.createOrder(body, ADMIN)).rejects.toThrow('优惠金额超过订单应收，请核对');
+    expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+  });
 });
