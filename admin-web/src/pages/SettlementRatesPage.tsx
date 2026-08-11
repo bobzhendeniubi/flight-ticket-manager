@@ -6,7 +6,7 @@
  *   PUT    /settlement-rates/batch            批量 upsert（整批保存 / Excel 粘贴块）
  *   DELETE /settlement-rates/:id              删除一格
  *
- * 口径：选「月份 + 档次」→ 网格（行 = 该月每天，列 = 晚数 1–5）。格子直接编辑、整批保存；
+ * 口径：选「起始日期 + 档次」→ 网格（行 = 起始日期起 31 天，列 = 晚数 1–5）。格子直接编辑、整批保存；
  * 支持从 Excel 复制块状粘贴（tab/换行解析，与运营报价表「一个日期分几晚」逐列对应）；
  * 代理下套餐单时按去程出发日期 + 晚数 + 档次在此表自动取每人价。
  *
@@ -25,9 +25,11 @@ import {
 } from '../lib/api';
 import {
   WEEKDAYS,
-  currentMonth,
-  daysInMonth,
+  WINDOW_DAYS,
+  addDays,
   parsePasteBlock,
+  todayYmd,
+  windowDays,
   weekdayOf,
 } from '../lib/settlementCalendar';
 import {
@@ -63,7 +65,7 @@ export function SettlementRatesPage() {
   const token = tokens?.accessToken ?? '';
 
   const [tab, setTab] = useState<RateTab>('GROUND');
-  const [month, setMonth] = useState<string>(currentMonth());
+  const [windowStart, setWindowStart] = useState<string>(() => todayYmd());
   const [tier, setTier] = useState<SettlementTier>(TIERS[0]);
   const [rates, setRates] = useState<SettlementRate[]>([]);
   // 编辑草稿：cellKey → 输入框字符串（空串 = 清空该格）。整批保存时与已加载 rates 对比出增删改。
@@ -80,7 +82,9 @@ export function SettlementRatesPage() {
   // 数据变更后 +1 触发重拉
   const [nonce, setNonce] = useState(0);
 
-  const days = useMemo(() => daysInMonth(month), [month]);
+  const today = todayYmd();
+  const previousWindowStart = addDays(windowStart, -WINDOW_DAYS);
+  const days = useMemo(() => windowDays(windowStart, WINDOW_DAYS), [windowStart]);
 
   // 已加载 rates 按格键索引（对比增删改 + 单格 tooltip 展示「何时改的」）
   const rateByKey = useMemo(() => {
@@ -102,7 +106,7 @@ export function SettlementRatesPage() {
     try {
       const from = days[0];
       const to = days[days.length - 1];
-      // 不传 nights：一次拉取当月该档次下全部晚数（1–5 晚全列齐）
+      // 不传 nights：一次拉取当前显示范围内该档次下全部晚数（1–5 晚全列齐）
       const res = await api.listSettlementRates(token, { from, to, tier });
       setRates(res.rates);
       const next = new Map<string, string>();
@@ -118,7 +122,7 @@ export function SettlementRatesPage() {
   useEffect(() => {
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token, month, tier, nonce]);
+  }, [token, windowStart, tier, nonce]);
 
   function setCell(date: string, nights: number, value: string) {
     setDraft((prev) => {
@@ -132,7 +136,7 @@ export function SettlementRatesPage() {
    * Excel 块状粘贴：从命中的格子（startDay × startNights）向右下铺开填充。
    * 行按换行、列按 tab 拆分——对应运营报价表「一个日期分几晚」的列结构。
    * 命中多格时接管默认粘贴（preventDefault），单值粘贴走浏览器默认；
-   * 粘贴区域超出网格范围（行超出当月天数 / 列超出 5 晚）时该部分静默丢弃，但会提示丢弃了多少格。
+   * 粘贴区域超出网格范围（行超出显示范围 / 列超出 5 晚）时该部分静默丢弃，但会提示丢弃了多少格。
    */
   function handlePaste(
     e: React.ClipboardEvent<HTMLInputElement>,
@@ -160,7 +164,7 @@ export function SettlementRatesPage() {
       for (const [key, value] of updates) next.set(key, value);
       return next;
     });
-    setPasteWarning(overflow > 0 ? `粘贴溢出 ${overflow} 格已忽略（超出当月天数或超过 5 晚）` : null);
+    setPasteWarning(overflow > 0 ? `粘贴溢出 ${overflow} 格已忽略（超出显示范围（31 天）或超过 5 晚）` : null);
   }
 
   async function save() {
@@ -208,7 +212,7 @@ export function SettlementRatesPage() {
 
   /** 报价表整块粘贴 → 解析预览（纯前端，不写库；运营核对无误再点导入）。 */
   function previewQuoteSheet() {
-    setSheetParsed(parseGroundQuoteSheet(sheetText, month));
+    setSheetParsed(parseGroundQuoteSheet(sheetText, windowStart.slice(0, 7)));
   }
 
   /**
@@ -251,11 +255,20 @@ export function SettlementRatesPage() {
     return false;
   }, [draft, days, rateByKey]);
 
-  // 解析结果里落在其它月份的条目数（照样入库，但当前网格看不到，需提示运营切月份核对）
-  const sheetOffMonthCount = useMemo(() => {
-    if (!sheetParsed) return 0;
-    return sheetParsed.entries.filter((e) => !e.departDate.startsWith(`${month}-`)).length;
-  }, [sheetParsed, month]);
+  const daySet = useMemo(() => new Set(days), [days]);
+
+  // 解析结果里落在当前显示范围外的条目数（照样入库，但当前网格看不到）
+  const sheetOutsideWindow = useMemo(() => {
+    if (!sheetParsed) return { past: 0, outside: 0 };
+    return sheetParsed.entries.reduce(
+      (counts, entry) => {
+        if (entry.departDate < today) counts.past += 1;
+        else if (!daySet.has(entry.departDate)) counts.outside += 1;
+        return counts;
+      },
+      { past: 0, outside: 0 },
+    );
+  }, [daySet, sheetParsed, today]);
 
   return (
     <div className="space-y-6">
@@ -297,16 +310,49 @@ export function SettlementRatesPage() {
       {tab === 'GROUND' && (
 
       <section className="card space-y-4">
-        {/* 控制区：月份 + 档次（档次切换即换一张网格） */}
+        {/* 控制区：起始日期 + 窗口导航 + 档次（档次切换即换一张网格） */}
         <div className="flex flex-wrap items-end gap-4">
           <div>
-            <label className="label">月份</label>
+            <label className="label">起始日期</label>
             <input
-              type="month"
+              type="date"
               className="input"
-              value={month}
-              onChange={(e) => setMonth(e.target.value)}
+              min={today}
+              value={windowStart}
+              disabled={dirty}
+              onChange={(e) => {
+                const next = e.target.value;
+                if (!next) return;
+                setWindowStart(next < today ? today : next);
+              }}
             />
+            {dirty && <p className="mt-1 text-[11px] text-amber-700">有未保存改动，请先整批保存</p>}
+          </div>
+          <div className="flex items-center gap-1">
+            <button
+              type="button"
+              className="btn-secondary"
+              disabled={dirty || windowStart === today}
+              onClick={() => setWindowStart(today)}
+            >
+              今天
+            </button>
+            <button
+              type="button"
+              className="btn-secondary"
+              disabled={dirty || windowStart === today}
+              onClick={() => setWindowStart(previousWindowStart === '' || previousWindowStart < today ? today : previousWindowStart)}
+            >
+              ◀ 前 31 天
+            </button>
+            <button
+              type="button"
+              className="btn-secondary"
+              disabled={dirty}
+              onClick={() => setWindowStart(addDays(windowStart, WINDOW_DAYS))}
+            >
+              后 31 天 ▶
+            </button>
           </div>
           <div>
             <label className="label">酒店档次</label>
@@ -368,7 +414,7 @@ export function SettlementRatesPage() {
             <p className="text-[11px] text-ink-muted">
               从报价表 Excel 里整块复制（含表头也没关系），直接粘贴到下框 →「解析预览」核对 →「确认导入」。
               回程行、公告行、以及「/」或空着的档次会自动跳过（不写也不清空既有价）；同一格重复出现取最后一次。
-              日期只写月日（如 8/12）时按上方所选月份的年份补全。
+              日期只写月日（如 8/12）时按起始日期所在月份的年份补全。
             </p>
             <textarea
               className="input h-40 w-full font-mono text-xs"
@@ -410,8 +456,10 @@ export function SettlementRatesPage() {
                 <div className="text-xs text-ink">
                   解析出 <b className="tabular-nums">{sheetParsed.entries.length}</b> 条价格，跳过{' '}
                   <b className="tabular-nums">{sheetParsed.skipped.length}</b> 行
-                  {sheetOffMonthCount > 0 &&
-                    `；其中 ${sheetOffMonthCount} 条不在 ${month}，导入后请切到对应月份查看`}
+                  {sheetOutsideWindow.past > 0 &&
+                    `；其中 ${sheetOutsideWindow.past} 条为过去日期，已入库但日历不再展示`}
+                  {sheetOutsideWindow.outside > 0 &&
+                    `；${sheetOutsideWindow.past > 0 ? '另有' : '其中'} ${sheetOutsideWindow.outside} 条不在当前显示范围，导入后请调整起始日期查看`}
                 </div>
 
                 {sheetParsed.entries.length === 0 && sheetParsed.skipped.length === 0 && (
@@ -471,11 +519,11 @@ export function SettlementRatesPage() {
         </details>
 
         <p className="text-[11px] text-ink-muted">
-          提示：行 = 该月每天，列 = 晚数（1–5晚），档次在上方切换。可从 Excel 复制一块「日期 ×
+          提示：行 = 起始日期起 31 天，列 = 晚数（1–5晚），档次在上方切换。可从 Excel 复制一块「日期 ×
           晚数」区域，选中起始格后直接粘贴（Ctrl/⌘+V）批量填充；清空格子并保存即删除该价。
         </p>
 
-        {/* 网格：行 = 该月每天，列 = 晚数（1–5晚）；档次由上方筛选器切换 */}
+        {/* 网格：行 = 起始日期起 31 天，列 = 晚数（1–5晚）；档次由上方筛选器切换 */}
         {loading ? (
           <div className="py-10 text-center text-sm text-ink-muted">加载中…</div>
         ) : (

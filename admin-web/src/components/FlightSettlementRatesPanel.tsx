@@ -1,9 +1,9 @@
 /**
- * 机票结算价日历（ADMIN/STAFF）— 运营的机票报价表进系统：行 = 当月每天，列 = 在用航班号
+ * 机票结算价日历（ADMIN/STAFF）— 运营的机票报价表进系统：行 = 起始日期起 31 天，列 = 在用航班号
  * （去程/回程各一列），每格一个每人 OTA 结算价（CNY）。
  *
  * 数据源：backend/src/modules/settlement-rates/flight-settlement-rates.*
- *   GET    /flight-settlement-rates?from&to&flightNumbers   月度网格查询
+ *   GET    /flight-settlement-rates?from&to&flightNumbers   区间网格查询
  *   PUT    /flight-settlement-rates/batch                   批量 upsert（整批保存 / Excel 粘贴块）
  *   DELETE /flight-settlement-rates/:id                     删除一格
  *
@@ -25,9 +25,11 @@ import {
 } from '../lib/api';
 import {
   WEEKDAYS,
-  currentMonth,
-  daysInMonth,
+  WINDOW_DAYS,
+  addDays,
   parsePasteBlock,
+  todayYmd,
+  windowDays,
   weekdayOf,
 } from '../lib/settlementCalendar';
 import {
@@ -48,7 +50,7 @@ export function FlightSettlementRatesPanel() {
   const tokens = useAuth((s) => s.tokens);
   const token = tokens?.accessToken ?? '';
 
-  const [month, setMonth] = useState<string>(currentMonth());
+  const [windowStart, setWindowStart] = useState<string>(() => todayYmd());
   const [flights, setFlights] = useState<AdminFlight[]>([]);
   const [rates, setRates] = useState<FlightSettlementRate[]>([]);
   // 编辑草稿：cellKey → 输入框字符串（空串 = 清空该格）。整批保存时与已加载 rates 对比出增删改。
@@ -64,7 +66,9 @@ export function FlightSettlementRatesPanel() {
   const [importing, setImporting] = useState(false);
   const [nonce, setNonce] = useState(0);
 
-  const days = useMemo(() => daysInMonth(month), [month]);
+  const today = todayYmd();
+  const previousWindowStart = addDays(windowStart, -WINDOW_DAYS);
+  const days = useMemo(() => windowDays(windowStart, WINDOW_DAYS), [windowStart]);
 
   // 列 = 在用航班号（去程/回程都列，按航班号排序，顺序稳定便于对着报价表粘贴）
   const flightNumbers = useMemo(
@@ -108,7 +112,7 @@ export function FlightSettlementRatesPanel() {
     setLoading(true);
     setError(null);
     try {
-      // 不传 flightNumbers：一次拉当月全部航班号的价（含已停用航班的历史价，不至于静默丢数据）
+      // 不传 flightNumbers：一次拉取当前显示范围内全部航班号的价（含已停用航班的历史价，不至于静默丢数据）
       const res = await api.listFlightSettlementRates(token, {
         from: days[0],
         to: days[days.length - 1],
@@ -129,7 +133,7 @@ export function FlightSettlementRatesPanel() {
   useEffect(() => {
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token, month, nonce]);
+  }, [token, windowStart, nonce]);
 
   function setCell(date: string, flightNumber: string, value: string) {
     setDraft((prev) => {
@@ -142,7 +146,7 @@ export function FlightSettlementRatesPanel() {
   /**
    * Excel 块状粘贴：从命中的格子（startDay × startFlight）向右下铺开填充。
    * 行按换行、列按 tab 拆分——对应运营报价表「一个日期分几个航班」的列结构。
-   * 超出网格范围（行超出当月天数 / 列超出航班数）的部分静默丢弃，但提示丢了多少格。
+   * 超出网格范围（行超出显示范围 / 列超出航班数）的部分静默丢弃，但提示丢了多少格。
    */
   function handlePaste(
     e: React.ClipboardEvent<HTMLInputElement>,
@@ -170,7 +174,7 @@ export function FlightSettlementRatesPanel() {
       for (const [key, value] of updates) next.set(key, value);
       return next;
     });
-    setPasteWarning(overflow > 0 ? `粘贴溢出 ${overflow} 格已忽略（超出当月天数或航班列数）` : null);
+    setPasteWarning(overflow > 0 ? `粘贴溢出 ${overflow} 格已忽略（超出显示范围（31 天）或航班列数）` : null);
   }
 
   async function save() {
@@ -218,7 +222,7 @@ export function FlightSettlementRatesPanel() {
 
   /** 报价表整块粘贴 → 解析预览（纯前端，不写库；运营核对无误再点导入）。 */
   function previewQuoteSheet() {
-    setSheetParsed(parseOtaQuoteSheet(sheetText, month));
+    setSheetParsed(parseOtaQuoteSheet(sheetText, windowStart.slice(0, 7)));
   }
 
   /** 确认导入：解析出的条目直接走既有批量 upsert，完事重拉网格。 */
@@ -260,29 +264,71 @@ export function FlightSettlementRatesPanel() {
 
   // 解析结果里当前网格看不到的部分（照样入库，但要提示运营去哪儿核对）
   const sheetOutsideGrid = useMemo(() => {
-    if (!sheetParsed) return { offMonth: 0, unknownFlights: [] as string[] };
+    if (!sheetParsed) return { past: 0, outside: 0, unknownFlights: [] as string[] };
     const known = new Set(flightNumbers);
+    const daySet = new Set(days);
+    const dateCounts = sheetParsed.entries.reduce(
+      (counts, entry) => {
+        if (entry.departDate < today) counts.past += 1;
+        else if (!daySet.has(entry.departDate)) counts.outside += 1;
+        return counts;
+      },
+      { past: 0, outside: 0 },
+    );
     return {
-      offMonth: sheetParsed.entries.filter((e) => !e.departDate.startsWith(`${month}-`)).length,
+      ...dateCounts,
       unknownFlights: [
         ...new Set(
           sheetParsed.entries.map((e) => e.flightNumber).filter((fn) => !known.has(fn)),
         ),
       ],
     };
-  }, [sheetParsed, month, flightNumbers]);
+  }, [days, sheetParsed, flightNumbers, today]);
 
   return (
     <section className="card space-y-4">
       <div className="flex flex-wrap items-end gap-4">
         <div>
-          <label className="label">月份</label>
+          <label className="label">起始日期</label>
           <input
-            type="month"
+            type="date"
             className="input"
-            value={month}
-            onChange={(e) => setMonth(e.target.value)}
+            min={today}
+            value={windowStart}
+            disabled={dirty}
+            onChange={(e) => {
+              const next = e.target.value;
+              if (!next) return;
+              setWindowStart(next < today ? today : next);
+            }}
           />
+          {dirty && <p className="mt-1 text-[11px] text-amber-700">有未保存改动，请先整批保存</p>}
+        </div>
+        <div className="flex items-center gap-1">
+          <button
+            type="button"
+            className="btn-secondary"
+            disabled={dirty || windowStart === today}
+            onClick={() => setWindowStart(today)}
+          >
+            今天
+          </button>
+          <button
+            type="button"
+            className="btn-secondary"
+            disabled={dirty || windowStart === today}
+            onClick={() => setWindowStart(previousWindowStart === '' || previousWindowStart < today ? today : previousWindowStart)}
+          >
+            ◀ 前 31 天
+          </button>
+          <button
+            type="button"
+            className="btn-secondary"
+            disabled={dirty}
+            onClick={() => setWindowStart(addDays(windowStart, WINDOW_DAYS))}
+          >
+            后 31 天 ▶
+          </button>
         </div>
         <div className="ml-auto flex items-center gap-3">
           {lastUpdated && (
@@ -367,8 +413,10 @@ export function FlightSettlementRatesPanel() {
               <div className="text-xs text-ink">
                 解析出 <b className="tabular-nums">{sheetParsed.entries.length}</b> 条价格，跳过{' '}
                 <b className="tabular-nums">{sheetParsed.skipped.length}</b> 行
-                {sheetOutsideGrid.offMonth > 0 &&
-                  `；其中 ${sheetOutsideGrid.offMonth} 条不在 ${month}，导入后请切到对应月份查看`}
+                {sheetOutsideGrid.past > 0 &&
+                  `；其中 ${sheetOutsideGrid.past} 条为过去日期，已入库但日历不再展示`}
+                {sheetOutsideGrid.outside > 0 &&
+                  `；${sheetOutsideGrid.past > 0 ? '另有' : '其中'} ${sheetOutsideGrid.outside} 条不在当前显示范围，导入后请调整起始日期查看`}
               </div>
 
               {sheetOutsideGrid.unknownFlights.length > 0 && (
@@ -433,7 +481,7 @@ export function FlightSettlementRatesPanel() {
       </details>
 
       <p className="text-[11px] text-ink-muted">
-        提示：行 = 该月每天，列 = 在用航班号（去程 / 回程各一列）。可从 Excel 复制一块「日期 ×
+        提示：行 = 起始日期起 31 天，列 = 在用航班号（去程 / 回程各一列）。可从 Excel 复制一块「日期 ×
         航班」区域，选中起始格后直接粘贴（Ctrl/⌘+V）批量填充；清空格子并保存即删除该价。
         代理下纯机票单时按各航段的航班号 + 出发日在此表自动取每人价（全部航段都有价才自动取，代理改不了）。
       </p>
