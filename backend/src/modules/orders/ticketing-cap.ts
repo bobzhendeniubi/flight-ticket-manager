@@ -17,7 +17,7 @@
  *   某班次的已开票乘客数 = Σ(该班次作为订单去程 ? outboundInvoiced : returnInvoiced) 为真的
  *   **且订单状态在 COUNTED_STATUSES 内**的订单乘客数。
  *   即每个班次只被「它自己那段」的开票占额——去程班次看 outboundInvoiced，回程班次看 returnInvoiced；
- *   订单一旦落入取消族（CANCELLED/REFUNDED/PAYMENT_TIMEOUT/FAILED/DRAFT）即释放它占的开票额度，
+ *   订单一旦落入取消族（CANCELLED/REFUND_REQUESTED/REFUNDED/PAYMENT_TIMEOUT/FAILED/DRAFT）即释放它占的开票额度，
  *   不再永久占用班次上限。与房控 alerts 的超上限提醒（hotel-control.service.ts getAlerts）同口径。
  *
  *   口径假设（供后续 review）：这里把 outboundInvoiced/returnInvoiced 当作「内部开票进度位」而非
@@ -35,9 +35,9 @@ import { BadRequestError, UnprocessableEntityError } from '../../lib/errors.js';
 type Db = PrismaClient | Prisma.TransactionClient;
 
 /**
- * 计入开票占额的订单状态：排除取消族（DRAFT/CANCELLED/PAYMENT_TIMEOUT/REFUNDED/FAILED）。
+ * 计入开票占额的订单状态：排除取消族（DRAFT/CANCELLED/REFUND_REQUESTED/PAYMENT_TIMEOUT/REFUNDED/FAILED）。
  * 与订单导出 / 房控销控板 / alerts 超上限提醒同口径（各模块各自本地维护一份，见
- * hotel-control.service.ts、finances.service.ts 等同名常量）。
+ * hotel-control.service.ts 等同名常量）。
  *
  * **本常量同时是「能否标开票」的闸**（见 assertOrderAllowsInvoicing）：
  * 「能标开票」⟺「占额度」——算额度与写标记复用这同一份状态集合，物理上不可能再分叉。
@@ -49,7 +49,6 @@ const COUNTED_STATUSES: OrderStatus[] = [
   OrderStatus.PROCESSING,
   OrderStatus.TICKETED,
   OrderStatus.COMPLETED,
-  OrderStatus.REFUND_REQUESTED,
   OrderStatus.CHANGE_REQUESTED,
   OrderStatus.CHANGED,
 ];

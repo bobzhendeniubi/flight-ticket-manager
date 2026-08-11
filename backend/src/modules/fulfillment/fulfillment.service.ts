@@ -23,8 +23,11 @@ import {
   VisaSubmissionStatus,
 } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
-import { ConflictError, NotFoundError } from '../../lib/errors.js';
+import { BadRequestError, ConflictError, NotFoundError } from '../../lib/errors.js';
 import type { ListFulfillmentQuery, UpdateFulfillmentBody } from './fulfillment.schemas.js';
+
+export const REFUND_REQUESTED_FULFILLMENT_ERROR =
+  '订单退款申请中，库存已释放，不可继续履约；如退款被驳回可恢复操作';
 
 /**
  * 计入履约任务列表 / 签证台的父订单状态——与订单/财务导出的 COUNTED_STATUSES 同一补集口径：
@@ -635,6 +638,9 @@ export class FulfillmentService {
         body.status === FulfillmentStatus.PENDING ||
         body.status === FulfillmentStatus.IN_PROGRESS ||
         body.status === FulfillmentStatus.CONFIRMED;
+      if (body.status === FulfillmentStatus.CONFIRMED && ord.status === OrderStatus.REFUND_REQUESTED) {
+        throw new BadRequestError(REFUND_REQUESTED_FULFILLMENT_ERROR);
+      }
       if (toActive && (ord.deletedAt || !COUNTED_STATUSES.includes(ord.status))) {
         throw new ConflictError(
           `父订单状态为 ${ord.status}${ord.deletedAt ? '（已在回收站）' : ''}，不可将任务改为活动态`,
@@ -687,11 +693,50 @@ export class FulfillmentService {
       data.visaSupplier = trimmed === '' ? null : trimmed;
     }
 
-    const updated = await prisma.fulfillmentTask.update({
-      where: { id },
-      data,
-      include: { orderItem: { include: { order: { select: { id: true, orderNumber: true, contactName: true, contactPhone: true, status: true, notes: true } } } } },
-    });
+    const taskInclude = {
+      orderItem: {
+        include: {
+          order: {
+            select: {
+              id: true,
+              orderNumber: true,
+              contactName: true,
+              contactPhone: true,
+              status: true,
+              notes: true,
+            },
+          },
+        },
+      },
+    } as const;
+
+    let updated;
+    if (body.status === FulfillmentStatus.CONFIRMED) {
+      // 与 worker 的最终 CAS 同口径：不能只信上面的旧快照，必须把父订单状态条件
+      // 放进真正写入的 where，堵住「读到 PAID → 订单变 REFUND_REQUESTED → 再确认」窗口。
+      const guarded = await prisma.fulfillmentTask.updateMany({
+        where: {
+          id,
+          status: existing.status,
+          orderItem: { order: { status: { not: OrderStatus.REFUND_REQUESTED } } },
+        },
+        data,
+      });
+      if (guarded.count !== 1) {
+        const current = await prisma.fulfillmentTask.findUnique({
+          where: { id },
+          include: { orderItem: { include: { order: { select: { status: true } } } } },
+        });
+        if (current?.orderItem.order.status === OrderStatus.REFUND_REQUESTED) {
+          throw new BadRequestError(REFUND_REQUESTED_FULFILLMENT_ERROR);
+        }
+        throw new ConflictError('履约任务状态已被并发修改，请重试');
+      }
+      updated = await prisma.fulfillmentTask.findUnique({ where: { id }, include: taskInclude });
+      if (!updated) throw new NotFoundError('履约任务不存在');
+    } else {
+      updated = await prisma.fulfillmentTask.update({ where: { id }, data, include: taskInclude });
+    }
 
     // 任务级 VISA 流转 = 「作用于该单全部乘客」：把订单所有非自备签乘客的送签进度改写成同一档，
     // 使派生与直写一致（旧的任务级批量入口由此保持语义：整单一起推进）。只对三档送签进度生效；

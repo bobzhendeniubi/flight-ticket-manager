@@ -64,6 +64,8 @@ import {
   assertHotelPhysicalFit,
   assertRandomTierFit,
   checkHotelPhysicalFit,
+  getHotelNightlyRemaining,
+  getRandomTierAggregate,
   randomStarTierLabel,
   type ProspectiveOccupancy,
 } from '../hotel-control/hotel-control.service.js';
@@ -138,7 +140,7 @@ export const ALLOWED_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
 };
 
 // 哪些状态视为"占用座位"（需要扣库存）
-const SEAT_HOLDING_STATUSES: OrderStatus[] = [
+export const SEAT_HOLDING_STATUSES: OrderStatus[] = [
   'PENDING_PAYMENT',
   'PAID',
   'PROCESSING',
@@ -146,7 +148,6 @@ const SEAT_HOLDING_STATUSES: OrderStatus[] = [
   'COMPLETED',
   'CHANGE_REQUESTED',
   'CHANGED',
-  'REFUND_REQUESTED',
 ];
 
 // DRAFT 归类为"释放型"而非"既不占座也不释放"的中间地带（CRITICAL 修复）：
@@ -162,12 +163,13 @@ const SEAT_HOLDING_STATUSES: OrderStatus[] = [
 //     DRAFT→H：wasHolding=false, isNewHolding=true → 走"重新占座"分支，原子 CAS + 余位校验（与从
 //              CANCELLED/PAYMENT_TIMEOUT 拉回占座完全同一套保护，不会超卖）
 //     DRAFT→R（如 CANCELLED）：wasHolding=false → 释放→释放，短路不触碰库存（幂等，不会二次释放）
-const SEAT_RELEASING_STATUSES: OrderStatus[] = [
+export const SEAT_RELEASING_STATUSES: OrderStatus[] = [
   'CANCELLED',
   'PAYMENT_TIMEOUT',
   'REFUNDED',
   'FAILED',
   'DRAFT',
+  'REFUND_REQUESTED',
 ];
 
 // 订单落「取消族」终态 → 履约任务应被终态化（CANCELLED），而非仅靠列表查询过滤隐藏。
@@ -4122,10 +4124,10 @@ export class OrderService {
     // ADMIN 可用 force=true 跳过状态机；其他角色或非 force 调用走标准检查
     const isAdminForce = force === true && requester.role === 'ADMIN';
     if (!allowed.includes(toStatus) && !isAdminForce) {
-      // 高频误操作单独给指引：已收款的单不能一键取消——钱账要走退款通道，退完（已退款）机位自动释放。
+      // 高频误操作单独给指引：已收款的单不能一键取消——钱账要走退款通道，申请后机位立即释放。
       const cancelPaidHint =
         toStatus === 'CANCELLED' && allowed.includes('REFUND_REQUESTED')
-          ? '。已收款订单不能直接取消：请改为「退款申请中」，财务退款完成（已退款）后机位自动释放、订单关闭'
+          ? '。已收款订单不能直接取消：请改为「退款申请中」，提交申请后机位立即释放，财务处理完成后订单关闭'
           : '';
       throw new BadRequestError(
         `不允许从「${zhStatus(order.status)}」转移到「${zhStatus(toStatus)}」` +
@@ -4304,6 +4306,13 @@ export class OrderService {
         await releaseSeat(item.flightScheduleId, item.flightCabin, split.sameCabin);
       }
     } else if (!wasHolding && isNewHolding) {
+      // 驳回退款申请会同时恢复酒店/套餐占房。订单状态 CAS 已在上面完成，
+      // 因而同一事务里的房控查询会把本单重新计入；任一受管控晚变成负余量就整单回滚，
+      // 避免只回座位却静默恢复成超售房单。
+      if (order.status === OrderStatus.REFUND_REQUESTED && toStatus === OrderStatus.PROCESSING) {
+        await this.assertRefundRejectionHotelCapacity(tx, order.items);
+      }
+
       // 释放分支的镜像：订单从「非占座」状态被拉回「占座中」状态（主要是 admin force 路径，
       // 如 PAYMENT_TIMEOUT/CANCELLED/FAILED →(force) PAID/PROCESSING）—— 座位早已在释放时
       // 还给库存，这里必须重新占座，否则订单变成"幽灵持有"：状态显示占座，FlightSeatClass.sold
@@ -4341,8 +4350,13 @@ export class OrderService {
             select: { capacity: true, sold: true },
           });
           const available = sc ? Math.max(0, sc.capacity - sc.sold - lockedByOthers) : 0;
+          if (order.status === OrderStatus.REFUND_REQUESTED && toStatus === OrderStatus.PROCESSING) {
+            throw new BadRequestError(
+              `座位已被售出，无法驳回退款申请，请协调换班次或继续退款。${itemLabel}需要${qty}个座位，当前仅剩${available}个。`,
+            );
+          }
           throw new BadRequestError(
-            `恢复为持有座位状态需重新占座：${itemLabel}（${cabin}）余位不足，无法转换：需要 ${qty} 张，仅剩 ${available} 张`,
+            `恢复为持有座位状态需重新占座：${itemLabel}（${CABIN_ZH_LABEL[cabin] ?? '当前舱位'}）余位不足，无法转换：需要 ${qty} 张，仅剩 ${available} 张`,
           );
         }
       };
@@ -4386,7 +4400,15 @@ export class OrderService {
       newTaskIdsOut.push(...newIds);
     }
 
-    if (isReleasing && wasHolding && order.status !== 'PENDING_PAYMENT') {
+    // REFUND_REQUESTED 只是先释放库存，不代表退款已批准：此时不能冲销佣金，
+    // 否则驳回退款回到 PROCESSING 后无法恢复佣金。REFUND_REQUESTED → REFUNDED
+    // 虽然座位账是「释放 → 释放」，仍需在真正批准退款时执行原有佣金冲销。
+    const shouldReverseCommissions =
+      isReleasing &&
+      toStatus !== OrderStatus.REFUND_REQUESTED &&
+      order.status !== OrderStatus.PENDING_PAYMENT &&
+      (wasHolding || order.status === OrderStatus.REFUND_REQUESTED);
+    if (shouldReverseCommissions) {
       // 退款/取消时按比例冲销佣金（保证会计恒等：座位退了，已退的那部分佣金不能继续欠代理）。
       //
       // 冲销口径（按实退金额比例，分 ProductKind）：
@@ -4527,6 +4549,88 @@ export class OrderService {
         user: { select: { id: true, displayName: true, email: true } },
       },
     });
+  }
+
+  /**
+   * 驳回退款申请前校验本单 HOTEL/BUNDLE 行的逐晚房量。
+   *
+   * 这里复用 hotel-availability / bundle-availability 的床位余量口径：
+   *   - 具体酒店：getHotelNightlyRemaining（酒店级包房周期 + 有效订单占房）；
+   *   - 随机档/占位酒店：getRandomTierAggregate（同星级真酒店合计 − 未落位占用）。
+   * 订单状态已在本事务内 CAS 为 PROCESSING，所以当前订单已经被计入 used；只需检查
+   * 受管控夜晚是否出现负余量。未配置包房周期的日期按既有口径不拦截。
+   */
+  private async assertRefundRejectionHotelCapacity(
+    tx: Prisma.TransactionClient,
+    items: ReadonlyArray<{
+      kind: OrderItemKind;
+      hotelRoomTypeId: string | null;
+      randomStarTier: number | null;
+      hotelCheckIn: Date | null;
+      hotelCheckOut: Date | null;
+    }>,
+  ): Promise<void> {
+    const hotelRows = items.filter(
+      (item) =>
+        (item.kind === OrderItemKind.HOTEL || item.kind === OrderItemKind.BUNDLE) &&
+        item.hotelCheckIn &&
+        item.hotelCheckOut,
+    );
+    if (hotelRows.length === 0) return;
+
+    const roomTypeIds = [
+      ...new Set(
+        hotelRows
+          .map((item) => item.hotelRoomTypeId)
+          .filter((id): id is string => id != null),
+      ),
+    ];
+    const roomTypes =
+      roomTypeIds.length > 0
+        ? await tx.hotelRoomType.findMany({
+            where: { id: { in: roomTypeIds } },
+            select: {
+              id: true,
+              hotelId: true,
+              hotel: { select: { randomTierPlaceholder: true } },
+            },
+          })
+        : [];
+    const roomTypeById = new Map(roomTypes.map((roomType) => [roomType.id, roomType]));
+
+    const shortage = (result: { remaining: number[]; block: number[]; hasBlock: boolean }): boolean =>
+      result.hasBlock &&
+      result.remaining.some((remaining, index) => (result.block[index] ?? 0) > 0 && remaining < 0);
+
+    const checked = new Set<string>();
+    for (const item of hotelRows) {
+      const nightDates = buildStayNightDates(item.hotelCheckIn!, item.hotelCheckOut!);
+      if (nightDates.length === 0) continue;
+
+      let scopeKey: string;
+      let result: { remaining: number[]; block: number[]; hasBlock: boolean };
+      const roomType = item.hotelRoomTypeId ? roomTypeById.get(item.hotelRoomTypeId) : undefined;
+      const randomTier = item.randomStarTier ?? roomType?.hotel.randomTierPlaceholder ?? null;
+      if (randomTier != null) {
+        scopeKey = `random:${randomTier}:${nightDates.join(',')}`;
+        if (checked.has(scopeKey)) continue;
+        checked.add(scopeKey);
+        const aggregate = await getRandomTierAggregate(randomTier, nightDates, {}, tx);
+        result = aggregate;
+      } else if (roomType) {
+        scopeKey = `hotel:${roomType.hotelId}:${nightDates.join(',')}`;
+        if (checked.has(scopeKey)) continue;
+        checked.add(scopeKey);
+        result = await getHotelNightlyRemaining(roomType.hotelId, nightDates, tx);
+      } else {
+        // 异常历史行没有可解析的房型/随机档作用域；保持既有宽松口径，不臆造库存来源。
+        continue;
+      }
+
+      if (shortage(result)) {
+        throw new BadRequestError('房量已被售出，无法驳回退款申请，请协调换房或继续退款');
+      }
+    }
   }
 
   /**
@@ -4958,7 +5062,7 @@ export class OrderService {
    *   1. 算 cancellation quote
    *   2. 创建 Refund 行（amount=应退）；状态 REQUESTED 等管理员审批
    *   3. Order 状态 → REFUND_REQUESTED + 写 OrderStatusEvent
-   *   4. （注意：这里不真退款 / 不释放座位 / 不冲销佣金 — 等 admin approve 后才做）
+   *   4. （注意：这里不真退款 / 不冲销佣金；机位在进入退款申请中时立即释放，等 admin approve 后再完成退款账务）
    *
    * 失败场景：
    *   - 订单状态不可取消 → BadRequestError
@@ -4998,6 +5102,7 @@ export class OrderService {
     }
 
     // 事务：创建 Refund + 流转 Order 状态
+    const releasedSeatClassIds: string[] = [];
     const result = await prisma.$transaction(async (tx) => {
       const refund = await tx.refund.create({
         data: {
@@ -5030,10 +5135,25 @@ export class OrderService {
         requester,
         reason ?? `申请取消（应退 ¥${quote.totalRefund}）`,
         taskIds,
+        false,
+        releasedSeatClassIds,
       );
 
       return { refund };
     });
+
+    // 事务提交后再通知候补，避免 worker 在座位释放提交前读到旧 sold。
+    if (releasedSeatClassIds.length > 0) {
+      try {
+        const { enqueueWaitlistCheck } = await import('../../queues/queue.js');
+        await Promise.all(
+          [...new Set(releasedSeatClassIds)].map((seatClassId) => enqueueWaitlistCheck(seatClassId)),
+        );
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error('[orders] failed to enqueue waitlist-check for', id, err);
+      }
+    }
 
     const finalOrder = await prisma.order.findUniqueOrThrow({
       where: { id },

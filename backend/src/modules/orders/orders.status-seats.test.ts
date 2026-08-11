@@ -17,7 +17,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { CabinClass, FulfillmentStatus, OrderStatus, UserRole } from '@prisma/client';
 
-const { mockPrisma } = vi.hoisted(() => ({
+const { mockPrisma, mockGetHotelNightlyRemaining } = vi.hoisted(() => ({
   mockPrisma: {
     order: {
       findUnique: vi.fn(),
@@ -26,9 +26,10 @@ const { mockPrisma } = vi.hoisted(() => ({
     },
     orderStatusEvent: { create: vi.fn() },
     orderItem: { findMany: vi.fn() },
+    hotelRoomType: { findMany: vi.fn() },
     flightSeatClass: { updateMany: vi.fn(), findFirst: vi.fn() },
     seatLock: { aggregate: vi.fn() },
-    refund: { updateMany: vi.fn() },
+    refund: { aggregate: vi.fn(), findMany: vi.fn(), updateMany: vi.fn() },
     // 转 PAID 时按 SUCCEEDED Payment 台账认实收（不再因转 PAID 这个动作本身凭空补满额）。
     // updateMany：R4 转 PAID 时作废其它 PENDING 兄弟 Payment（FAILED + supersededByPaid）。
     payment: { aggregate: vi.fn(), updateMany: vi.fn() },
@@ -37,7 +38,7 @@ const { mockPrisma } = vi.hoisted(() => ({
     // Bug 6（佣金幂等）用：createCommissionsForOrder 只在 order.agentId 非空且 toStatus===PAID 时触达。
     // findMany 另外还被"释放型流转的佣金冲销"步骤用到（wasHolding&&isReleasing 且非 PENDING_PAYMENT
     // 来源时无条件触达，即便订单没有代理——见 Bug 1 的 H→DRAFT 测试）。
-    commissionRecord: { findFirst: vi.fn(), create: vi.fn(), findMany: vi.fn() },
+    commissionRecord: { findFirst: vi.fn(), create: vi.fn(), findMany: vi.fn(), update: vi.fn() },
     agent: { findUnique: vi.fn() },
     commissionRule: { findMany: vi.fn() },
     $executeRaw: vi.fn(),
@@ -45,13 +46,28 @@ const { mockPrisma } = vi.hoisted(() => ({
     // findUnique 读到的 order.paidAmount，与旧口径完全一致（真 DB FOR UPDATE 主路径由集成测试覆盖）。
     $queryRaw: vi.fn(),
   },
+  mockGetHotelNightlyRemaining: vi.fn(),
 }));
 // _updateStatusWithinTx 直接传 tx 参数，这里的 mockTx 即传入的事务句柄（同一批 vi.fn()）。
 const mockTx = mockPrisma;
 
 vi.mock('../../db/prisma.js', () => ({ prisma: mockPrisma }));
 
-import { OrderService, type OrderRequester } from './orders.service.js';
+vi.mock('../hotel-control/hotel-control.service.js', () => ({
+  assertHotelPhysicalFit: vi.fn(),
+  assertRandomTierFit: vi.fn(),
+  checkHotelPhysicalFit: vi.fn(),
+  getHotelNightlyRemaining: mockGetHotelNightlyRemaining,
+  getRandomTierAggregate: vi.fn(),
+  randomStarTierLabel: vi.fn(),
+}));
+
+import {
+  OrderService,
+  SEAT_HOLDING_STATUSES,
+  SEAT_RELEASING_STATUSES,
+  type OrderRequester,
+} from './orders.service.js';
 import { BadRequestError } from '../../lib/errors.js';
 
 // tx 参数类型是 Prisma.TransactionClient（几十个 delegate），mock 只搭了用得到的几个 —— 借用
@@ -328,6 +344,217 @@ describe('OrderService._updateStatusWithinTx · 既有释放/占座路径不受�
     expect(mockPrisma.flightSeatClass.updateMany).not.toHaveBeenCalled();
     expect(mockPrisma.seatLock.aggregate).not.toHaveBeenCalled();
     expect(mockPrisma.$executeRaw).not.toHaveBeenCalled();
+  });
+});
+
+describe('OrderService._updateStatusWithinTx · 退款申请即时释放与驳回回座', () => {
+  const service = new OrderService();
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+    mockPrisma.payment.aggregate.mockResolvedValue({ _sum: { amount: null } });
+    mockPrisma.fulfillmentTask.updateMany.mockResolvedValue({ count: 0 });
+    mockPrisma.payment.updateMany.mockResolvedValue({ count: 0 });
+    mockPrisma.$queryRaw.mockResolvedValue([]);
+    mockPrisma.refund.aggregate.mockResolvedValue({ _sum: { amount: null } });
+    mockPrisma.refund.findMany.mockResolvedValue([]);
+    mockPrisma.refund.updateMany.mockResolvedValue({ count: 0 });
+    mockPrisma.commissionRecord.findMany.mockResolvedValue([]);
+  });
+
+  it('PAID → REFUND_REQUESTED：立即释放座位，套餐升舱按商务/经济舱镜像释放', async () => {
+    const order = buildOrder({
+      status: OrderStatus.PAID,
+      items: [flightItem({ quantity: 3, metadata: { businessUpgradeCount: 1 } })],
+    });
+    mockPrisma.order.findUnique.mockResolvedValueOnce(order);
+    mockPrisma.order.updateMany.mockResolvedValueOnce({ count: 1 });
+    mockPrisma.orderStatusEvent.create.mockResolvedValueOnce({});
+    mockPrisma.$executeRaw.mockResolvedValue(1);
+    mockPrisma.flightSeatClass.findFirst
+      .mockResolvedValueOnce({ id: 'business-seat-class' })
+      .mockResolvedValueOnce({ id: 'economy-seat-class' });
+    mockPrisma.order.findUniqueOrThrow.mockResolvedValueOnce({
+      ...order,
+      status: OrderStatus.REFUND_REQUESTED,
+    });
+
+    const releasedIds: string[] = [];
+    const result = await service._updateStatusWithinTx(
+      tx,
+      'ord1',
+      OrderStatus.REFUND_REQUESTED,
+      adminRequester,
+      undefined,
+      [],
+      false,
+      releasedIds,
+    );
+
+    expect(result.status).toBe(OrderStatus.REFUND_REQUESTED);
+    expect(mockPrisma.$executeRaw).toHaveBeenCalledTimes(2);
+    expect(mockPrisma.$executeRaw.mock.calls.map((call) => call[1])).toEqual([1, 2]);
+    expect(mockPrisma.$executeRaw.mock.calls.map((call) => call[3])).toEqual([
+      CabinClass.BUSINESS,
+      CabinClass.ECONOMY,
+    ]);
+    expect(releasedIds).toEqual(['business-seat-class', 'economy-seat-class']);
+    // 申请退款不是退款批准：Refund、佣金与履约任务不提前推进。
+    expect(mockPrisma.refund.updateMany).not.toHaveBeenCalled();
+    expect(mockPrisma.commissionRecord.findMany).not.toHaveBeenCalled();
+  });
+
+  it('REFUND_REQUESTED → REFUNDED：释放 → 释放，不二次释放，但在批准退款时保留原有退款同步', async () => {
+    const order = buildOrder({ status: OrderStatus.REFUND_REQUESTED });
+    mockPrisma.order.findUnique.mockResolvedValueOnce(order);
+    mockPrisma.$queryRaw.mockResolvedValueOnce([{ paidAmount: '1000' }]);
+    mockPrisma.order.updateMany.mockResolvedValueOnce({ count: 1 });
+    mockPrisma.orderStatusEvent.create.mockResolvedValueOnce({});
+    mockPrisma.refund.updateMany.mockResolvedValueOnce({ count: 1 });
+    mockPrisma.order.findUniqueOrThrow.mockResolvedValueOnce({
+      ...order,
+      status: OrderStatus.REFUNDED,
+    });
+
+    const releasedIds: string[] = [];
+    const result = await service._updateStatusWithinTx(
+      tx,
+      'ord1',
+      OrderStatus.REFUNDED,
+      adminRequester,
+      undefined,
+      [],
+      false,
+      releasedIds,
+    );
+
+    expect(result.status).toBe(OrderStatus.REFUNDED);
+    expect(mockPrisma.$queryRaw).toHaveBeenCalledTimes(1); // 仅退款批准的 Order 行锁
+    expect(mockPrisma.flightSeatClass.updateMany).not.toHaveBeenCalled();
+    expect(releasedIds).toEqual([]);
+    expect(mockPrisma.refund.updateMany).toHaveBeenCalledWith({
+      where: { orderId: 'ord1', status: 'REQUESTED' },
+      data: expect.objectContaining({ status: 'COMPLETED' }),
+    });
+  });
+
+  it('REFUND_REQUESTED → PROCESSING：驳回且余位足，原子 CAS 加回座位并拒绝 Refund', async () => {
+    const order = buildOrder({ status: OrderStatus.REFUND_REQUESTED });
+    mockPrisma.order.findUnique.mockResolvedValueOnce(order);
+    mockPrisma.order.updateMany.mockResolvedValueOnce({ count: 1 });
+    mockPrisma.orderStatusEvent.create.mockResolvedValueOnce({});
+    mockPrisma.seatLock.aggregate.mockResolvedValueOnce({ _sum: { qty: null } });
+    mockPrisma.$executeRaw.mockResolvedValueOnce(1);
+    mockPrisma.refund.updateMany.mockResolvedValueOnce({ count: 1 });
+    mockPrisma.order.findUniqueOrThrow.mockResolvedValueOnce({
+      ...order,
+      status: OrderStatus.PROCESSING,
+    });
+
+    const result = await service._updateStatusWithinTx(
+      tx,
+      'ord1',
+      OrderStatus.PROCESSING,
+      adminRequester,
+      undefined,
+      [],
+      false,
+      [],
+    );
+
+    expect(result.status).toBe(OrderStatus.PROCESSING);
+    expect(mockPrisma.$executeRaw).toHaveBeenCalledTimes(1);
+    expect(mockPrisma.$executeRaw.mock.calls[0][1]).toBe(1);
+    expect(mockPrisma.$executeRaw.mock.calls[0][3]).toBe(CabinClass.ECONOMY);
+    expect(mockPrisma.refund.updateMany).toHaveBeenCalledWith({
+      where: { orderId: 'ord1', status: 'REQUESTED' },
+      data: expect.objectContaining({ status: 'REJECTED' }),
+    });
+  });
+
+  it('REFUND_REQUESTED → PROCESSING：余位不足时拒绝驳回并给中文协调指引', async () => {
+    const order = buildOrder({
+      status: OrderStatus.REFUND_REQUESTED,
+      items: [flightItem({ quantity: 2 })],
+    });
+    mockPrisma.order.findUnique.mockResolvedValueOnce(order);
+    mockPrisma.order.updateMany.mockResolvedValueOnce({ count: 1 });
+    mockPrisma.orderStatusEvent.create.mockResolvedValueOnce({});
+    mockPrisma.seatLock.aggregate.mockResolvedValueOnce({ _sum: { qty: null } });
+    mockPrisma.$executeRaw.mockResolvedValueOnce(0);
+    mockPrisma.flightSeatClass.findFirst.mockResolvedValueOnce({ capacity: 2, sold: 2 });
+
+    await expect(
+      service._updateStatusWithinTx(
+        tx,
+        'ord1',
+        OrderStatus.PROCESSING,
+        adminRequester,
+        undefined,
+        [],
+        false,
+        [],
+      ),
+    ).rejects.toThrow('座位已被售出，无法驳回退款申请，请协调换班次或继续退款');
+
+    expect(mockPrisma.order.findUniqueOrThrow).not.toHaveBeenCalled();
+    expect(mockPrisma.refund.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('REFUND_REQUESTED → PROCESSING：酒店房量不足时拒绝驳回', async () => {
+    const order = buildOrder({
+      status: OrderStatus.REFUND_REQUESTED,
+      items: [
+        {
+          kind: 'HOTEL',
+          hotelRoomTypeId: 'room-type-1',
+          randomStarTier: null,
+          hotelCheckIn: new Date('2026-09-01T00:00:00.000Z'),
+          hotelCheckOut: new Date('2026-09-02T00:00:00.000Z'),
+        },
+      ],
+    });
+    mockPrisma.order.findUnique.mockResolvedValueOnce(order);
+    mockPrisma.order.updateMany.mockResolvedValueOnce({ count: 1 });
+    mockPrisma.orderStatusEvent.create.mockResolvedValueOnce({});
+    mockPrisma.hotelRoomType.findMany.mockResolvedValueOnce([
+      { id: 'room-type-1', hotelId: 'hotel-1', hotel: { randomTierPlaceholder: null } },
+    ]);
+    mockGetHotelNightlyRemaining.mockResolvedValueOnce({
+      remaining: [-1],
+      block: [1],
+      hasBlock: true,
+      physicalRemaining: [-1],
+    });
+
+    await expect(
+      service._updateStatusWithinTx(
+        tx,
+        'ord1',
+        OrderStatus.PROCESSING,
+        adminRequester,
+        undefined,
+        [],
+        false,
+        [],
+      ),
+    ).rejects.toThrow('房量已被售出，无法驳回退款申请，请协调换房或继续退款');
+
+    expect(mockPrisma.$executeRaw).not.toHaveBeenCalled();
+    expect(mockPrisma.refund.updateMany).not.toHaveBeenCalled();
+  });
+});
+
+describe('座位台账状态集合对称性', () => {
+  it('完整覆盖 OrderStatus 且占座集与释放集不相交', () => {
+    const holding = new Set(SEAT_HOLDING_STATUSES);
+    const releasing = new Set(SEAT_RELEASING_STATUSES);
+    const allStatuses = new Set(Object.values(OrderStatus));
+
+    expect(SEAT_HOLDING_STATUSES).toHaveLength(holding.size);
+    expect(SEAT_RELEASING_STATUSES).toHaveLength(releasing.size);
+    expect(new Set([...holding, ...releasing])).toEqual(allStatuses);
+    expect([...holding].filter((status) => releasing.has(status))).toEqual([]);
   });
 });
 
@@ -698,6 +925,8 @@ describe('OrderService._updateStatusWithinTx · 退款回退 / 任务终态化 /
     mockPrisma.order.findUnique.mockResolvedValueOnce(order);
     mockPrisma.order.updateMany.mockResolvedValueOnce({ count: 1 });
     mockPrisma.orderStatusEvent.create.mockResolvedValueOnce({});
+    mockPrisma.seatLock.aggregate.mockResolvedValueOnce({ _sum: { qty: null } });
+    mockPrisma.$executeRaw.mockResolvedValueOnce(1);
     mockPrisma.refund.updateMany.mockResolvedValueOnce({ count: 1 });
     mockPrisma.order.findUniqueOrThrow.mockResolvedValueOnce({ ...order, status: OrderStatus.PROCESSING });
 

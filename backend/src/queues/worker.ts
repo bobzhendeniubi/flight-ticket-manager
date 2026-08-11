@@ -33,6 +33,7 @@ import {
 import { closeMailer } from '../lib/mailer.js';
 import { sendItineraryEmail } from '../lib/itinerary-email.js';
 import { computeBundleSeatSplit, releaseSeatFloored } from '../modules/orders/orders.service.js';
+import { REFUND_REQUESTED_FULFILLMENT_ERROR } from '../modules/fulfillment/fulfillment.service.js';
 
 /**
  * 超时释放某订单占用的座位——套餐升舱拆座感知 + 下限钳制在 0（MEDIUM 修复）。
@@ -95,9 +96,19 @@ export async function processFulfillmentTask(
 
   const task = await prisma.fulfillmentTask.findUnique({
     where: { id: taskId },
-    include: { orderItem: { include: { order: { select: { orderNumber: true } } } } },
+    include: {
+      orderItem: {
+        include: { order: { select: { orderNumber: true, status: true, deletedAt: true } } },
+      },
+    },
   });
   if (!task) throw new Error(`Task ${taskId} not found`);
+
+  // 退款申请中库存已释放：worker 可以看到任务，但不得开始会落 CONFIRMED 的自动履约。
+  // 保留任务原状态，驳回回 PROCESSING 后仍可由原任务继续操作。
+  if (task.orderItem.order.status === OrderStatus.REFUND_REQUESTED) {
+    return { skipped: true, reason: REFUND_REQUESTED_FULFILLMENT_ERROR };
+  }
 
   // 已完成或取消的任务直接跳过
   if (task.status === FulfillmentStatus.CONFIRMED || task.status === FulfillmentStatus.CANCELLED) {
@@ -107,7 +118,11 @@ export async function processFulfillmentTask(
   // CAS 标 IN_PROGRESS —— 只在当前还是 PENDING 时抢占
   // 防止 reissue 并发、或 BullMQ retry 抖动造成两个 worker 同时执行 → 出双 PNR。
   const claimed = await prisma.fulfillmentTask.updateMany({
-    where: { id: taskId, status: FulfillmentStatus.PENDING },
+    where: {
+      id: taskId,
+      status: FulfillmentStatus.PENDING,
+      orderItem: { order: { status: { not: OrderStatus.REFUND_REQUESTED } } },
+    },
     data: {
       status: FulfillmentStatus.IN_PROGRESS,
       startedAt: task.startedAt ?? new Date(),
@@ -149,7 +164,12 @@ export async function processFulfillmentTask(
   // CAS 标 CONFIRMED —— 只在任务仍 IN_PROGRESS 时落终态。
   // 供应商窗口内订单若被取消（任务已 CANCELLED），此处 count 为 0 → 放弃写回，不覆盖终态。
   const confirmed = await prisma.fulfillmentTask.updateMany({
-    where: { id: taskId, status: FulfillmentStatus.IN_PROGRESS },
+    where: {
+      id: taskId,
+      status: FulfillmentStatus.IN_PROGRESS,
+      // 供应商窗口内若订单进入退款申请中，关系条件使最终 CONFIRMED CAS 直接落空。
+      orderItem: { order: { status: { not: OrderStatus.REFUND_REQUESTED } } },
+    },
     data: {
       status: FulfillmentStatus.CONFIRMED,
       completedAt: new Date(),

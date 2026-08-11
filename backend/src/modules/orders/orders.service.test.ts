@@ -15,7 +15,12 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ── 在 import OrderService 之前 mock 依赖 ──
 // vi.mock 会被 hoist 到文件顶部，所以引用的变量也得 hoist
-const { mockPrisma, mockComputeQuote, mockGetHotelNightlyRemaining } = vi.hoisted(() => ({
+const {
+  mockPrisma,
+  mockComputeQuote,
+  mockGetHotelNightlyRemaining,
+  mockEnqueueWaitlistCheck,
+} = vi.hoisted(() => ({
   mockPrisma: {
     order: {
       findUnique: vi.fn(),
@@ -34,6 +39,7 @@ const { mockPrisma, mockComputeQuote, mockGetHotelNightlyRemaining } = vi.hoiste
     orderItem: {
       findMany: vi.fn(),
     },
+    refund: { create: vi.fn() },
     user: {
       findUnique: vi.fn(),
     },
@@ -76,6 +82,7 @@ const { mockPrisma, mockComputeQuote, mockGetHotelNightlyRemaining } = vi.hoiste
   },
   mockComputeQuote: vi.fn(),
   mockGetHotelNightlyRemaining: vi.fn(),
+  mockEnqueueWaitlistCheck: vi.fn(),
 }));
 
 // tx 对象与 mockPrisma 共享同一批 vi.fn()（swapPassenger 事务内 tx.order/tx.passenger/tx.fulfillmentTask
@@ -92,6 +99,10 @@ vi.mock('../../lib/cancellation.js', () => ({
 
 vi.mock('../hotel-control/hotel-control.service.js', () => ({
   getHotelNightlyRemaining: mockGetHotelNightlyRemaining,
+}));
+
+vi.mock('../../queues/queue.js', () => ({
+  enqueueWaitlistCheck: mockEnqueueWaitlistCheck,
 }));
 
 // 现在才能 import service
@@ -308,6 +319,44 @@ describe('OrderService.requestCancellation', () => {
     expect(r.isNew).toBe(false);
     expect(r.order).toBeDefined();
     expect(r.quote.totalRefund).toBe(70);
+  });
+
+  it('新申请退款释放座位后，事务提交才按去重后的舱位入队候补检查', async () => {
+    const initialOrder = { id: 'ord1', userId: 'me', agentId: null, refunds: [] };
+    const refund = { id: 'ref-new', status: 'REQUESTED', amount: '70' };
+    const finalOrder = fakeFullOrder({ status: 'REFUND_REQUESTED' });
+    mockPrisma.order.findUnique.mockResolvedValueOnce(initialOrder);
+    mockComputeQuote.mockResolvedValue({
+      orderId: 'ord1',
+      orderNumber: 'ORD-001',
+      paidAmount: 100,
+      totalFee: 30,
+      totalRefund: 70,
+      items: [],
+      cancellable: true,
+    });
+    mockPrisma.refund.create.mockResolvedValueOnce(refund);
+    mockPrisma.order.findUniqueOrThrow.mockResolvedValueOnce(finalOrder);
+    mockEnqueueWaitlistCheck.mockResolvedValue(undefined);
+
+    const updateStatusSpy = vi
+      .spyOn(service, '_updateStatusWithinTx')
+      .mockImplementation(async (...args) => {
+        args[7]?.push('seat-class-1', 'seat-class-1', 'seat-class-2');
+        return finalOrder as never;
+      });
+
+    const result = await service.requestCancellation('ord1', '不去了', {
+      userId: 'me',
+      role: 'CUSTOMER',
+      agentId: undefined,
+    });
+
+    expect(result.isNew).toBe(true);
+    expect(mockEnqueueWaitlistCheck).toHaveBeenCalledTimes(2);
+    expect(mockEnqueueWaitlistCheck).toHaveBeenCalledWith('seat-class-1');
+    expect(mockEnqueueWaitlistCheck).toHaveBeenCalledWith('seat-class-2');
+    updateStatusSpy.mockRestore();
   });
 });
 

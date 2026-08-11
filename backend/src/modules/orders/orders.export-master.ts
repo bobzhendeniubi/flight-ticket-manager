@@ -7,7 +7,7 @@
  * 订单成本、单房差、退款金额等），而不是留空占位。
  *
  * 筛选：按出发日期区间（from/to → travelFrom/travelTo 口径，复用 buildOrderFilterWhere），
- * 与整班/全岗导出选单方式一致；同时排除草稿/已取消/超时/失败/已退款。
+ * 与整班/全岗导出选单方式一致；同时排除草稿/已取消/超时/失败/退款申请中/已退款。
  *
  * 可选 role（all|ticketing|visa）：只隐藏与岗位无关的列，默认（不传）= 完整全岗表。
  * 无论 role 如何，都是同一份数据、同一个端点 —— role 仅做列可见性裁剪。
@@ -49,14 +49,13 @@ export interface MasterExportQuery {
   orderIds?: string[];
 }
 
-/** 运营口径：所有「占座中」订单（与财务/整班/分房导出同口径，排除释放型状态）。*/
+/** 运营口径：所有仍占座、应出行的订单；退款申请中的订单已释放库存。*/
 const COUNTED_STATUSES: OrderStatus[] = [
   OrderStatus.PENDING_PAYMENT,
   OrderStatus.PAID,
   OrderStatus.PROCESSING,
   OrderStatus.TICKETED,
   OrderStatus.COMPLETED,
-  OrderStatus.REFUND_REQUESTED,
   OrderStatus.CHANGE_REQUESTED,
   OrderStatus.CHANGED,
 ];

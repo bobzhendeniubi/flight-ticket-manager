@@ -39,14 +39,13 @@ export const ORDER_TEMPLATE_LABEL: Record<OrderExportTemplate, string> = {
   visa: '签证专用',
 };
 
-/** 与财务导出一致：草稿 / 已取消 / 已退款 / 支付超时 / 失败 不计入。*/
+/** 运营导出有效订单：退款申请中的订单已释放库存，不计入。*/
 const COUNTED_STATUSES: OrderStatus[] = [
   OrderStatus.PENDING_PAYMENT,
   OrderStatus.PAID,
   OrderStatus.PROCESSING,
   OrderStatus.TICKETED,
   OrderStatus.COMPLETED,
-  OrderStatus.REFUND_REQUESTED,
   OrderStatus.CHANGE_REQUESTED,
   OrderStatus.CHANGED,
 ];

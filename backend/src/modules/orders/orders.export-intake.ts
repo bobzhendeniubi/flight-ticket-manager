@@ -9,7 +9,7 @@
  *     升序去重拼接，如「机票 QH9589+QH9588」；无航班号回退「机票」）；其它品类 = 按品类（酒店/签证/接送/保险）。
  *   · 人数 = 组内各订单乘客数之和；订单数 = 组内订单条数。
  *
- * 与其它导出一致，只统计「计数状态」的订单（草稿/已取消/已退款/超时/失败不计入）。
+ * 与其它运营导出一致，只统计「计数状态」的订单（退款申请中已释放库存，不计入）。
  */
 import ExcelJS from 'exceljs';
 import type { Prisma, PrismaClient } from '@prisma/client';
@@ -18,14 +18,13 @@ import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { buildOrderFilterWhere, type OrderListFilters } from './orders.service.js';
 import { earliestFlightDeparture } from './pnr-export.js';
 
-/** 与财务/其它导出一致：草稿 / 已取消 / 已退款 / 支付超时 / 失败 不计入。*/
+/** 运营进单统计：退款申请中的订单已释放库存，不再计入。*/
 const COUNTED_STATUSES: OrderStatus[] = [
   OrderStatus.PENDING_PAYMENT,
   OrderStatus.PAID,
   OrderStatus.PROCESSING,
   OrderStatus.TICKETED,
   OrderStatus.COMPLETED,
-  OrderStatus.REFUND_REQUESTED,
   OrderStatus.CHANGE_REQUESTED,
   OrderStatus.CHANGED,
 ];

@@ -27,14 +27,13 @@ import {
 } from './orders.export-templates.js';
 import { extFromUrl, fetchPhoto, sanitize } from './passport-zip.js';
 
-/** 与财务/订单导出一致：草稿 / 已取消 / 已退款 / 支付超时 / 失败 不计入。*/
+/** 签证名单口径：退款申请中的订单已释放应出行名单，不再导出。*/
 const COUNTED_STATUSES: OrderStatus[] = [
   OrderStatus.PENDING_PAYMENT,
   OrderStatus.PAID,
   OrderStatus.PROCESSING,
   OrderStatus.TICKETED,
   OrderStatus.COMPLETED,
-  OrderStatus.REFUND_REQUESTED,
   OrderStatus.CHANGE_REQUESTED,
   OrderStatus.CHANGED,
 ];

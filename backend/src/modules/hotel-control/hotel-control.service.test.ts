@@ -683,6 +683,7 @@ describe('getOccupyingOrders', () => {
     expect(where.hotelCheckOut).toEqual({ gt: new Date('2026-08-01T00:00:00.000Z') });
     expect(where.order.status.in).toContain('PAID');
     expect(where.order.status.in).not.toContain('CANCELLED');
+    expect(where.order.status.in).not.toContain('REFUND_REQUESTED');
   });
 
   it('返回订单/联系人/出行人姓名（中文名优先，无则回落护照名）/间数/入住区间/代理；占位联系人（documentNumber=N/A）不计入人数也不列名', async () => {

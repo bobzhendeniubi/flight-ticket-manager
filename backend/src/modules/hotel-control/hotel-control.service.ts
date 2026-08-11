@@ -21,14 +21,16 @@ import { BadRequestError, NotFoundError } from '../../lib/errors.js';
 import { fmtDepartureLocalDate } from '../orders/passport-zip.js';
 import type { CreateBlockPeriodBody, UpdateBlockPeriodBody } from './hotel-control.schemas.js';
 
-/** 与财务/订单导出一致：草稿 / 已取消 / 已退款 / 支付超时 / 失败 不计入。*/
+// 读模型既可运行在默认 PrismaClient，也可运行在订单状态事务的 TransactionClient 内。
+type HotelControlDbClient = PrismaClient | Prisma.TransactionClient;
+
+/** 房控有效订单：退款申请中的订单已释放占房，不计入销控、分房与名单。*/
 export const COUNTED_STATUSES: OrderStatus[] = [
   OrderStatus.PENDING_PAYMENT,
   OrderStatus.PAID,
   OrderStatus.PROCESSING,
   OrderStatus.TICKETED,
   OrderStatus.COMPLETED,
-  OrderStatus.REFUND_REQUESTED,
   OrderStatus.CHANGE_REQUESTED,
   OrderStatus.CHANGED,
 ];
@@ -565,7 +567,7 @@ export function expandAssignedPhysicalByDate<T extends PhysicalOccupancyItem>(
 export async function getHotelNightlyRemaining(
   hotelId: string,
   nightDates: readonly string[],
-  client: PrismaClient = defaultPrisma,
+  client: HotelControlDbClient = defaultPrisma,
 ): Promise<{ remaining: number[]; hasBlock: boolean; block: number[]; physicalRemaining: number[] }> {
   if (nightDates.length === 0) {
     return { remaining: [], hasBlock: false, block: [], physicalRemaining: [] };
@@ -823,7 +825,7 @@ export async function getRandomTierAggregate(
   tier: number,
   nightDates: readonly string[],
   opts: { excludeOrderId?: string } = {},
-  client: PrismaClient = defaultPrisma,
+  client: HotelControlDbClient = defaultPrisma,
 ): Promise<RandomTierAggregate> {
   const empty: RandomTierAggregate = {
     hasBlock: false,
@@ -905,7 +907,7 @@ export async function assertRandomTierFit(
   nightDates: readonly string[],
   rooms: number,
   opts: { excludeOrderId?: string; buildMessage?: () => string } = {},
-  client: PrismaClient = defaultPrisma,
+  client: HotelControlDbClient = defaultPrisma,
 ): Promise<void> {
   const agg = await getRandomTierAggregate(tier, nightDates, opts, client);
   if (!agg.hasBlock) return;

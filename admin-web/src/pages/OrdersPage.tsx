@@ -773,7 +773,7 @@ export function OrdersPage() {
       const res = await api.updateOrderStatus(tokens.accessToken, order.id, next, reason, force);
       setOrders((prev) => prev.map((o) => (o.id === order.id ? res.order : o)));
       setSelected((prev) => (prev && prev.id === order.id ? res.order : prev));
-      // 状态流转可能占用/释放机位（确认占座、取消/退款回收）→ 广播座位变更。
+      // 状态流转可能占用/释放机位（确认占座、申请退款即时回收）→ 广播座位变更。
       bumpSeats();
     } catch (err) {
       alert(err instanceof ApiError ? `操作失败：${err.message}` : '操作失败');

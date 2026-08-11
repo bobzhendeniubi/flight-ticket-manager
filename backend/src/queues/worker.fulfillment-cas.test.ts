@@ -12,7 +12,7 @@
  * env 读取、import 即执行，全部替换成 no-op 让单测无外部依赖。
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { FulfillmentStatus, FulfillmentType } from '@prisma/client';
+import { FulfillmentStatus, FulfillmentType, OrderStatus } from '@prisma/client';
 
 const { mockPrisma, mockSendItineraryEmail } = vi.hoisted(() => ({
   mockPrisma: {
@@ -60,13 +60,16 @@ import { processFulfillmentTask } from './worker.js';
 
 const job = { data: { taskId: 'task-1', simulateDelay: 0 }, attemptsMade: 0 };
 
-function flightTask() {
+function flightTask(orderStatus = OrderStatus.PAID) {
   return {
     id: 'task-1',
     status: FulfillmentStatus.PENDING,
     type: FulfillmentType.FLIGHT_TICKETING,
     startedAt: null,
-    orderItem: { orderId: 'ord-1', order: { orderNumber: 'CO-1' } },
+    orderItem: {
+      orderId: 'ord-1',
+      order: { orderNumber: 'CO-1', status: orderStatus, deletedAt: null },
+    },
   };
 }
 
@@ -111,7 +114,11 @@ describe('processFulfillmentTask · 取消 vs 出票 CAS（R3）', () => {
     expect(mockPrisma.fulfillmentTask.update).not.toHaveBeenCalled();
     expect(mockPrisma.fulfillmentTask.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({
-        where: { id: 'task-1', status: FulfillmentStatus.IN_PROGRESS },
+        where: expect.objectContaining({
+          id: 'task-1',
+          status: FulfillmentStatus.IN_PROGRESS,
+          orderItem: { order: { status: { not: OrderStatus.REFUND_REQUESTED } } },
+        }),
       }),
     );
     expect(mockPrisma.passenger.updateMany).toHaveBeenCalledWith(
@@ -135,5 +142,19 @@ describe('processFulfillmentTask · 取消 vs 出票 CAS（R3）', () => {
     expect(res).toEqual({ skipped: true, reason: 'claim race lost' });
     expect(mockPrisma.passenger.updateMany).not.toHaveBeenCalled();
     expect(mockSendItineraryEmail).not.toHaveBeenCalled();
+  });
+
+  it('订单退款申请中 → worker 不抢任务、不推进到 CONFIRMED', async () => {
+    mockPrisma.fulfillmentTask.findUnique.mockResolvedValue(
+      flightTask(OrderStatus.REFUND_REQUESTED),
+    );
+
+    const res = await processFulfillmentTask(job);
+
+    expect(res).toEqual({
+      skipped: true,
+      reason: '订单退款申请中，库存已释放，不可继续履约；如退款被驳回可恢复操作',
+    });
+    expect(mockPrisma.fulfillmentTask.updateMany).not.toHaveBeenCalled();
   });
 });

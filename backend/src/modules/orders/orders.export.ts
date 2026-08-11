@@ -16,8 +16,8 @@ import { nameWithTitle } from './orders.export-templates.js';
 
 /**
  * 整班运营导出口径（SEAT_HOLDING）：所有「占座中」订单。
- * 排除：DRAFT / CANCELLED / PAYMENT_TIMEOUT / FAILED / REFUNDED。
- * 与财务导出（finances.export.ts）口径相同，但查询维度不同（班次 vs 时间段）。
+ * 排除：DRAFT / CANCELLED / PAYMENT_TIMEOUT / FAILED / REFUND_REQUESTED / REFUNDED。
+ * 与房控/开票额度的运营库存口径一致，但查询维度不同（班次 vs 时间段）。
  */
 const SEAT_HOLDING_STATUSES: OrderStatus[] = [
   OrderStatus.PENDING_PAYMENT,
@@ -25,7 +25,6 @@ const SEAT_HOLDING_STATUSES: OrderStatus[] = [
   OrderStatus.PROCESSING,
   OrderStatus.TICKETED,
   OrderStatus.COMPLETED,
-  OrderStatus.REFUND_REQUESTED,
   OrderStatus.CHANGE_REQUESTED,
   OrderStatus.CHANGED,
 ];

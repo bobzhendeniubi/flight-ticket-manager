@@ -12,6 +12,8 @@ vi.mock('../../db/prisma.js', () => ({ prisma: {} }));
 
 import {
   FulfillmentStatus,
+  FulfillmentType,
+  OrderStatus,
   VisaEntryType,
   VisaIssuanceMethod,
   VisaRequirement,
@@ -212,6 +214,28 @@ describe('FulfillmentService.update — 签证金额只允许签证任务', () =
     await expect(service.update('t1', { visaUnitCostCny: 200 })).rejects.toBeInstanceOf(
       ConflictError,
     );
+    expect(update).not.toHaveBeenCalled();
+  });
+});
+
+describe('FulfillmentService.update — 退款申请中禁止确认履约', () => {
+  it('订单 REFUND_REQUESTED 时任务不得改为 CONFIRMED，并返回中文操作指引', async () => {
+    const findUnique = vi.fn().mockResolvedValue({
+      id: 't-refund',
+      type: FulfillmentType.FLIGHT_TICKETING,
+      status: FulfillmentStatus.IN_PROGRESS,
+      orderItem: {
+        orderId: 'o-refund',
+        order: { status: OrderStatus.REFUND_REQUESTED, deletedAt: null },
+      },
+    });
+    const update = vi.fn();
+    (prisma as unknown as { fulfillmentTask: unknown }).fulfillmentTask = { findUnique, update };
+
+    const service = new FulfillmentService();
+    await expect(
+      service.update('t-refund', { status: FulfillmentStatus.CONFIRMED }),
+    ).rejects.toThrow('订单退款申请中，库存已释放，不可继续履约；如退款被驳回可恢复操作');
     expect(update).not.toHaveBeenCalled();
   });
 });

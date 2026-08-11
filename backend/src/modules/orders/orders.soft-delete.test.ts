@@ -62,7 +62,6 @@ describe('softDeleteOrder · 前置守卫（占座状态拒删）', () => {
     OrderStatus.COMPLETED,
     OrderStatus.CHANGE_REQUESTED,
     OrderStatus.CHANGED,
-    OrderStatus.REFUND_REQUESTED,
   ];
 
   it.each(SEAT_HOLDING)('占座状态 %s 拒删 → BadRequestError，update 从不被调用', async (status) => {
@@ -86,6 +85,7 @@ describe('softDeleteOrder · 已释放型状态可删（零收款）', () => {
     OrderStatus.REFUNDED,
     OrderStatus.FAILED,
     OrderStatus.DRAFT,
+    OrderStatus.REFUND_REQUESTED,
   ];
 
   it.each(SEAT_RELEASING)('%s 可删：置 deletedAt，返回 before/after 供审计', async (status) => {
