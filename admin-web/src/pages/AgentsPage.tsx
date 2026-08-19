@@ -3,11 +3,17 @@
  */
 import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { api, ApiError, ROSTER_FORMAT_LABEL, SETTLEMENT_MODE_LABEL, type AgentListItem, type CreateChildAgentInput, type CustomerSummary, type RosterFormat, type SettlementMode, type UpdateAgentInput } from '../lib/api';
+import { api, ApiError, ROSTER_FORMAT_LABEL, SETTLEMENT_MODE_LABEL, type AgentListItem, type CreateChildAgentInput, type CustomerSummary, type RosterFormat, type SettlementDiscountRule, type SettlementMode, type SettlementTier, type UpdateAgentInput } from '../lib/api';
 import { useAuth } from '../stores/auth';
 
 const TIER_LABEL = ['', '1级·总代', '2级·区代', '3级·门店', '4级', '5级'];
 const TIER_COLOR = ['', 'bg-red-100 text-red-700', 'bg-amber-100 text-amber-700', 'bg-blue-100 text-blue-700', 'bg-slate-100 text-slate-600', 'bg-slate-100 text-slate-600'];
+const DISCOUNT_TIER_LABEL: Record<SettlementTier, string> = {
+  CITY_3STAR: '市区三星',
+  CITY_4STAR: '市区四星',
+  CITY_5STAR: '市区五星',
+  INTL_5STAR: '国际五星',
+};
 
 type ViewMode = 'table' | 'tree';
 type SortKey = 'tier' | 'balance' | 'orders' | 'children' | 'createdAt';
@@ -475,6 +481,58 @@ function AgentDetailDrawer({
   );
 }
 
+function AgentExclusiveDiscounts({ agent }: { agent: AgentListItem }) {
+  const tokens = useAuth((s) => s.tokens);
+  const [rules, setRules] = useState<SettlementDiscountRule[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!tokens) return;
+    let cancelled = false;
+    setRules(null);
+    setError(null);
+    api.listSettlementDiscounts(tokens.accessToken, { kind: 'AGENT', agentId: agent.id })
+      .then((result) => {
+        if (!cancelled) setRules(result.rules.filter((rule) => rule.isActive));
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) {
+          setRules([]);
+          setError(e instanceof ApiError ? e.message : '专属立减加载失败');
+        }
+      });
+    return () => { cancelled = true; };
+  }, [agent.id, tokens]);
+
+  return (
+    <section className="rounded-md border border-indigo-100 bg-indigo-50/40 p-3">
+      <div className="flex items-center justify-between gap-2">
+        <h3 className="text-sm font-semibold text-indigo-900">专属立减</h3>
+        <Link to={`/settlement-discounts?agentId=${encodeURIComponent(agent.id)}`} className="text-xs font-medium text-brand hover:text-brand-dark">
+          管理规则 →
+        </Link>
+      </div>
+      {error ? (
+        <p className="mt-2 text-xs text-rose-600">{error}</p>
+      ) : rules === null ? (
+        <p className="mt-2 text-xs text-ink-muted">加载中…</p>
+      ) : rules.length === 0 ? (
+        <p className="mt-2 text-xs text-ink-muted">按默认规则</p>
+      ) : (
+        <div className="mt-2 space-y-1.5">
+          {rules.map((rule) => (
+            <div key={rule.id} className="grid grid-cols-[1fr_auto] gap-x-3 text-xs text-slate-700">
+              <span>{DISCOUNT_TIER_LABEL[rule.tier]} · {rule.nights}晚 · {rule.startDate} 至 {rule.endDate}</span>
+              <span className="font-semibold tabular-nums text-indigo-800">−¥{rule.discountPerPersonCny}/人</span>
+            </div>
+          ))}
+          <p className="pt-1 text-[11px] text-ink-muted">仅展示启用中的代理专属规则。</p>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function InfoTab({
   agent,
   isAdmin,
@@ -552,6 +610,7 @@ function InfoTab({
   return (
     <div className="space-y-4">
       <SettlementModeCard agent={agent} isAdmin={isAdmin} onChanged={onChanged} />
+      {isAdmin && <AgentExclusiveDiscounts agent={agent} />}
 
       {canEdit && !editing && (
         <div className="flex justify-end">
@@ -1105,4 +1164,3 @@ function CreateAgentForm({
     </section>
   );
 }
-

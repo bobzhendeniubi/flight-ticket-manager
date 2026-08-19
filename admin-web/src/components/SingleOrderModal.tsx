@@ -1250,7 +1250,11 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     setQuoting(true);
     const timer = setTimeout(() => {
       api
-        .quoteOrder(token, { items, ...(quotePassengers ? { passengers: quotePassengers } : {}) })
+        .quoteOrder(token, {
+          items,
+          ...(quotePassengers ? { passengers: quotePassengers } : {}),
+          ...(agentId ? { agentId } : {}),
+        })
         .then((r) => {
           if (cancelled) return;
           setQuoteTotal(r.total);
@@ -1282,6 +1286,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     // 乘客级单住/自备签勾选数变化 → 重新试算系统价（购物车模式）。
     singleRoomCount, visaExemptCount,
     transferId, transferQty, validPassengers.length,
+    agentId,
   ]);
 
   // 注：结算总价不再回填「调整金额」——settlementTotalCny 直接提交给服务端，由服务端按
@@ -2571,18 +2576,37 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
               {quoteErr && <p className="mt-1 text-[11px] text-rose-500">{quoteErr}</p>}
               {agentId && settlementPrice === null && settlementPreview?.ok === true && (
                 <div className="mt-2 rounded-md border border-brand-200 bg-brand-50 px-3 py-2 text-xs text-brand-800">
-                  <div className="font-semibold">
-                    结算价（日历）{settlementPreview.lines.map((line, index) => (
-                      <span key={`${line.note}-${index}`}>
-                        {index > 0 ? ' + ' : ' '}
-                        ¥{line.pricePerPersonCny.toLocaleString('zh-CN')}/人 × {line.pax}人
-                        {line.addOnCny !== undefined && (
-                          <>（加项 {line.addOnCny >= 0 ? '+' : '−'}¥{Math.abs(line.addOnCny).toLocaleString('zh-CN')}）</>
+                  {(() => {
+                    const autoDiscount = settlementPreview.autoDiscount;
+                    const baseLines = settlementPreview.lines.filter((line) => line.note !== '同业立减');
+                    const baseTotal = settlementPreview.totalCny + (autoDiscount?.totalCny ?? 0);
+                    return (
+                      <>
+                        <div className="font-semibold">
+                          结算价（日历）{baseLines.map((line, index) => (
+                            <span key={`${line.note}-${index}`}>
+                              {index > 0 ? ' + ' : ' '}
+                              ¥{line.pricePerPersonCny.toLocaleString('zh-CN')}/人 × {line.pax}人
+                              {line.addOnCny !== undefined && (
+                                <>（加项 {line.addOnCny >= 0 ? '+' : '−'}¥{Math.abs(line.addOnCny).toLocaleString('zh-CN')}）</>
+                              )}
+                            </span>
+                          ))}
+                          {' = '}¥{baseTotal.toLocaleString('zh-CN')}
+                        </div>
+                        {autoDiscount?.hits.map((hit) => (
+                          <div key={hit.ruleId} className="mt-0.5 font-medium text-emerald-700">
+                            − 同业立减 ¥{hit.perPersonCny.toLocaleString('zh-CN')}/人 × {hit.pax}人
+                          </div>
+                        ))}
+                        {autoDiscount && (
+                          <div className="mt-0.5 font-semibold text-brand-900">
+                            合计 ¥{settlementPreview.totalCny.toLocaleString('zh-CN')}
+                          </div>
                         )}
-                      </span>
-                    ))}
-                    {' = '}¥{settlementPreview.totalCny.toLocaleString('zh-CN')}
-                  </div>
+                      </>
+                    );
+                  })()}
                   <div className="mt-0.5 text-[11px] text-brand-700">提交后订单总额按此收敛</div>
                 </div>
               )}

@@ -310,6 +310,37 @@ describe('orderToMasterRows', () => {
     expect(r1.notes).toContain('蜜月');
   });
 
+  it('立减金额列汇总未撤销快照并按乘客人数均摊，排除 revoked 行', () => {
+    const order = fixtureRoundTripBundle();
+    order.items.push({
+      kind: 'DISCOUNT',
+      amount: -400,
+      metadata: {
+        priceAdjustment: true,
+        settlementDiscount: true,
+        ruleId: 'discount-1',
+      },
+    } as never);
+    order.items.push({
+      kind: 'DISCOUNT',
+      amount: -300,
+      metadata: { settlementDiscount: true, bundleId: 'bundle-2', ruleId: 'discount-2' },
+    } as never);
+    order.items.push({
+      kind: 'DISCOUNT',
+      amount: -999,
+      metadata: {
+        settlementDiscount: true,
+        settlementDiscountRevoked: true,
+        bundleId: 'bundle-3',
+        ruleId: 'discount-3',
+      },
+    } as never);
+    const [row] = orderToMasterRows(order);
+    expect(row.settlementDiscountAmount).toBe(350);
+    expect(visibleColumns('all').map((column) => column.header)).toContain('立减金额');
+  });
+
   it('单程订单 → 订单类型单程票', () => {
     const order = fixtureRoundTripBundle();
     // 去掉回程 → 单程

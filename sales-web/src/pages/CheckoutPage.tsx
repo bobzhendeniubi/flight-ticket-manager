@@ -5,7 +5,7 @@
  */
 import { FormEvent, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { useCart, KIND_INFO, isSelected } from '../stores/cart';
+import { useCart, KIND_INFO, isSelected, type CartItem } from '../stores/cart';
 import { useAuth } from '../stores/auth';
 import { usePassengers } from '../stores/passengers';
 import { ocrPassport } from '../lib/passportOcr';
@@ -96,6 +96,33 @@ function fmt(v: unknown): string {
   return Number.isFinite(n) ? n.toLocaleString() : '0';
 }
 
+/**
+ * 套餐购物车行的散客展示价：percent-off 后再扣公开优惠 × 出行人数。
+ * BundleDetailPage 把 percentTotal/retailDiscountPerPersonCny 快照写入 meta；
+ * 老购物车没有这些字段时沿用原 unitPrice，行为保持不变。
+ */
+function checkoutLineTotal(item: CartItem, retailDiscountOverride?: number): number {
+  const rawPercentTotal = Number(item.meta?.percentTotal);
+  const percentTotal = Number.isFinite(rawPercentTotal)
+    ? rawPercentTotal
+    : item.kind === 'BUNDLE'
+      ? Number(item.unitPrice)
+      : Number.NaN;
+  const rawRetailDiscount = retailDiscountOverride ?? Number(item.meta?.retailDiscountPerPersonCny);
+  if (item.kind !== 'BUNDLE' || !Number.isFinite(percentTotal) || !Number.isFinite(rawRetailDiscount)) {
+    return Number(item.unitPrice) * Number(item.qty) || 0;
+  }
+  const adult = Number(item.meta?.adultCount);
+  const child = Number(item.meta?.childCount);
+  const infant = Number(item.meta?.infantCount);
+  const hasCounts = Number.isFinite(adult) || Number.isFinite(child) || Number.isFinite(infant);
+  const pax = hasCounts
+    ? Math.max(0, (Number.isFinite(adult) ? adult : 0) + (Number.isFinite(child) ? child : 0) + (Number.isFinite(infant) ? infant : 0))
+    : Math.max(1, Number(item.meta?.pax) || 1);
+  const perUnit = Math.max(0, Math.round(percentTotal - rawRetailDiscount * pax));
+  return perUnit * Number(item.qty);
+}
+
 // 护照图压缩（passportFileToDataUrl）已抽到 lib/passportImage.ts，
 // 与订单页护照补录弹窗（PassengerPassportModal）共用。
 
@@ -113,7 +140,42 @@ export function CheckoutPage() {
   // 检查死循环（Maximum update depth exceeded → 整页白屏）。
   const allItems = useCart((s) => s.items);
   const items = useMemo(() => allItems.filter(isSelected), [allItems]);
-  const total = items.reduce((sum, i) => sum + (Number(i.unitPrice) * Number(i.qty) || 0), 0);
+  const [retailDiscountByItemId, setRetailDiscountByItemId] = useState<Record<string, number>>({});
+  useEffect(() => {
+    const bundleItems = items.filter((item) => item.kind === 'BUNDLE' && item.meta?.goDate);
+    if (bundleItems.length === 0) {
+      setRetailDiscountByItemId({});
+      return;
+    }
+    let cancelled = false;
+    api.listBundles().then(async ({ bundles }) => {
+      const entries = await Promise.all(bundleItems.map(async (item) => {
+        const bundle = bundles.find((candidate) => candidate.id === item.productId);
+        if (!bundle?.settlementTier || bundle.settlementNights == null) return [item.id, 0] as const;
+        const result = await api.getRetailSettlementDiscount({
+          tier: bundle.settlementTier,
+          nights: bundle.settlementNights,
+          departDate: String(item.meta?.goDate),
+        });
+        if (!result) return null;
+        return [item.id, result.discountPerPersonCny] as const;
+      }));
+      if (!cancelled) {
+        const successfulEntries = entries.filter(
+          (entry): entry is readonly [string, number] => entry !== null,
+        );
+        setRetailDiscountByItemId(Object.fromEntries(successfulEntries));
+      }
+    }).catch(() => {
+      // 详情页已经写入快照；商品列表拉取失败时保留该快照，不阻塞结账。
+      if (!cancelled) setRetailDiscountByItemId({});
+    });
+    return () => { cancelled = true; };
+  }, [items]);
+  const total = useMemo(
+    () => items.reduce((sum, item) => sum + checkoutLineTotal(item, retailDiscountByItemId[item.id]), 0),
+    [items, retailDiscountByItemId],
+  );
   const removeMany = useCart((s) => s.removeMany);
   const clearPassengers = usePassengers((s) => s.clear);
 
@@ -588,6 +650,7 @@ export function CheckoutPage() {
       idempotencyKey,
       // 前台展示总价兜底（S1）：带上结算页看到的合计，后端权威商品价与之偏差 > 1 元 → 回 PRICE_CHANGED，
       // 防止「展示价与实收价背离」时静默多收（如套餐机票展示 ¥0、下单拆腿按真实机票价实扣）。
+      // 与详情页同口径：round(全包价 × (1−percent-off)) − 散客优惠×出行人数。
       expectedTotalCny: Math.round(total),
     };
 
@@ -1253,4 +1316,3 @@ function HoldCountdown({ expiresAt }: { expiresAt: string }) {
     </div>
   );
 }
-

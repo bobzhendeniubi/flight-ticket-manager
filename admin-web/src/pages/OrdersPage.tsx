@@ -7166,6 +7166,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   const hasBatchTeamSettlementPrice = settlementPriceCny !== null && settlementPriceCny > 0;
   const batchSettlementCalendarSuppressed =
     hasBatchManualSettlementPrice || hasBatchTeamSettlementPrice;
+  const hasBatchManualDiscount = (discountPerPersonCny ?? 0) > 0;
 
   useEffect(() => {
     if (!token || !isOps || !agentId || validRows.length === 0 || batchQuoteItems.length === 0) {
@@ -7182,6 +7183,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
           {
             items: batchQuoteItems,
             ...(productType === 'BUNDLE' ? { passengers: [{ visaExempt: false, singleRoom: false }] } : {}),
+            ...(agentId ? { agentId } : {}),
           },
         )
         .then((result) => {
@@ -8745,7 +8747,12 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
               </label>
             </div>
 
-            {isOps && agentId && batchSettlementCalendarSuppressed && (
+            {isOps && agentId && hasBatchManualDiscount && (
+              <p className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-800">
+                已手填优惠，代理自动立减不生效
+              </p>
+            )}
+            {isOps && agentId && batchSettlementCalendarSuppressed && !hasBatchManualDiscount && (
               <p className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-[11px] text-slate-600">
                 已填手工结算价，结算价日历不生效
               </p>
@@ -8761,25 +8768,45 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                   <span>结算价（日历）试算中…</span>
                 ) : batchSettlementPreview?.ok === true ? (
                   <>
-                    <div className="font-semibold">
-                      结算价（日历）{batchSettlementPreview.lines.map((line, index) => (
-                        <span key={`${line.note}-${index}`}>
-                          {index > 0 ? ' + ' : ' '}
-                          ¥{line.pricePerPersonCny.toLocaleString('zh-CN')}/人
-                          {line.addOnCny !== undefined && (
-                            <>（加项 {line.addOnCny >= 0 ? '+' : '−'}¥{Math.abs(line.addOnCny).toLocaleString('zh-CN')}）</>
+                    {(() => {
+                      const rawAutoDiscount = batchSettlementPreview.autoDiscount;
+                      const autoDiscount = hasBatchManualDiscount ? null : rawAutoDiscount;
+                      const baseLines = batchSettlementPreview.lines.filter((line) => line.note !== '同业立减');
+                      const baseTotal = batchSettlementPreview.totalCny + (rawAutoDiscount?.totalCny ?? 0);
+                      return (
+                        <>
+                          <div className="font-semibold">
+                            结算价（日历）{baseLines.map((line, index) => (
+                              <span key={`${line.note}-${index}`}>
+                                {index > 0 ? ' + ' : ' '}
+                                ¥{line.pricePerPersonCny.toLocaleString('zh-CN')}/人
+                                {line.addOnCny !== undefined && (
+                                  <>（加项 {line.addOnCny >= 0 ? '+' : '−'}¥{Math.abs(line.addOnCny).toLocaleString('zh-CN')}）</>
+                                )}
+                              </span>
+                            ))}
+                            {' × '}{validRows.length}人 = ¥{(baseTotal * validRows.length).toLocaleString('zh-CN')}
+                          </div>
+                          {autoDiscount?.hits.map((hit) => (
+                            <div key={hit.ruleId} className="mt-0.5 font-medium text-emerald-700">
+                              − 同业立减 ¥{hit.perPersonCny.toLocaleString('zh-CN')}/人 × {hit.pax * validRows.length}人
+                            </div>
+                          ))}
+                          {hasBatchManualDiscount && (
+                            <div className="mt-0.5 font-medium text-amber-700">
+                              − 优惠 ¥{(discountPerPersonCny ?? 0).toLocaleString('zh-CN')}/人 × {validRows.length}人 = 实收 ¥{(
+                                (baseTotal - (discountPerPersonCny ?? 0)) * validRows.length
+                              ).toLocaleString('zh-CN')}
+                            </div>
                           )}
-                        </span>
-                      ))}
-                      {' × '}{validRows.length}人 = ¥{(batchSettlementPreview.totalCny * validRows.length).toLocaleString('zh-CN')}
-                    </div>
-                    {(discountPerPersonCny ?? 0) > 0 && (
-                      <div className="mt-0.5 font-medium">
-                        − 优惠 ¥{discountPerPersonCny}/人 × {validRows.length}人 = 实收 ¥{(
-                          (batchSettlementPreview.totalCny - (discountPerPersonCny ?? 0)) * validRows.length
-                        ).toLocaleString('zh-CN')}
-                      </div>
-                    )}
+                          {autoDiscount && (
+                            <div className="mt-0.5 font-semibold text-brand-900">
+                              合计 ¥{(batchSettlementPreview.totalCny * validRows.length).toLocaleString('zh-CN')}
+                            </div>
+                          )}
+                        </>
+                      );
+                    })()}
                     <div className="mt-0.5 text-[11px] text-brand-700">儿童价/自备签减免及单住/升舱/指定酒店等行级项按人另计</div>
                   </>
                 ) : batchSettlementPreview?.ok === false ? (

@@ -289,6 +289,7 @@ model Agent {
   orders                 Order[]
   customers              CustomerProfile[]
   seatAllocations        SeatAllocation[]
+  settlementDiscountRules SettlementDiscountRule[]
 
   @@index([isActive])
   @@index([parentAgentId])
@@ -947,6 +948,37 @@ model SettlementRate {
 
   @@unique([tier, nights, departDate])
   @@index([departDate])
+}
+
+// 结算价立减规则 — 在结算价日历基础上的固定立减（¥/人）。三类互相独立：
+//   AGENT         指定代理专属（agentId 必填）
+//   AGENT_DEFAULT 未配置专属规则的代理兜底
+//   RETAIL        前台散客（与套餐 discountPct 叠加）
+enum SettlementDiscountKind {
+  AGENT
+  AGENT_DEFAULT
+  RETAIL
+}
+
+model SettlementDiscountRule {
+  id                   String                  @id @default(cuid())
+  kind                 SettlementDiscountKind
+  agentId              String? // kind=AGENT 必填；其余必须为 null（服务端校验）
+  tier                 SettlementTier
+  nights               Int
+  startDate            DateTime                @db.Date // 出发日窗口（含）
+  endDate              DateTime                @db.Date // 出发日窗口（含）
+  discountPerPersonCny Int // ¥/人，> 0
+  isActive             Boolean                 @default(true)
+  note                 String?
+  updatedBy            String? // 操作者 user id（沿用 SettlementRate 惯例）
+  createdAt            DateTime                @default(now())
+  updatedAt            DateTime                @updatedAt
+
+  agent Agent? @relation(fields: [agentId], references: [id], onDelete: Cascade)
+
+  @@index([kind, agentId, tier, nights, startDate])
+  @@index([agentId])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

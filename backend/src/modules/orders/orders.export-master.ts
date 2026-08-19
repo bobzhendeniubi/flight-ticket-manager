@@ -150,6 +150,7 @@ export interface MasterRow {
   orderType: string; // 往返票/单程票/品类
   cabin: string; // 舱位等级
   settlePrice: number; // 结算价格（人均）
+  settlementDiscountAmount: number; // 立减金额（人均，订单立减快照行金额绝对值合计）
   balanceDue: number; // 尾款金额（人均）= max(0, total + adjustmentCny − paid − prepaymentOffset) / 人数，含售后调整与预付款抵扣
   settleReceived: number; // 已到账金额（人均）
   singleRoomDiff: number; // 单房差（人均）
@@ -213,6 +214,13 @@ const MASTER_COLUMNS: MasterColumn[] = [
   { header: '订单类型', key: 'orderType', width: 10 },
   { header: '舱位等级', key: 'cabin', width: 10, roles: ['all', 'ticketing'] },
   { header: '结算价格', key: 'settlePrice', width: 10, roles: ['all'] },
+  {
+    header: '立减金额',
+    key: 'settlementDiscountAmount',
+    width: 10,
+    note: '订单中立减快照行金额绝对值合计，按乘客人数均摊。',
+    roles: ['all'],
+  },
   { header: '尾款金额', key: 'balanceDue', width: 10, roles: ['all'] },
   { header: '已到账金额', key: 'settleReceived', width: 12, roles: ['all'] },
   { header: '单房差', key: 'singleRoomDiff', width: 8, roles: ['all'] },
@@ -449,6 +457,20 @@ export function orderToMasterRows(
   const adjustment = order.adjustmentCny ?? 0;
   const prepaymentOffset = dec(order.prepaymentOffset);
   const settlePerPax = round2(total / paxCount);
+  const settlementDiscountTotal = order.items.reduce((sum, item) => {
+    const metadata = item.metadata;
+    if (
+      metadata == null ||
+      typeof metadata !== 'object' ||
+      Array.isArray(metadata) ||
+      (metadata as { settlementDiscount?: unknown }).settlementDiscount !== true ||
+      (metadata as { settlementDiscountRevoked?: unknown }).settlementDiscountRevoked === true
+    ) {
+      return sum;
+    }
+    return sum + Math.abs(dec(item.amount));
+  }, 0);
+  const settlementDiscountPerPax = round2(settlementDiscountTotal / paxCount);
   const paidPerPax = round2(paid / paxCount);
   const balancePerPax = round2(Math.max(0, total + adjustment - paid - prepaymentOffset) / paxCount);
   const settled = paid + prepaymentOffset >= total + adjustment ? '是' : '否';
@@ -594,6 +616,7 @@ export function orderToMasterRows(
       orderType,
       cabin: cabinLabels,
       settlePrice: settlePerPax,
+      settlementDiscountAmount: settlementDiscountPerPax,
       balanceDue: balancePerPax,
       settleReceived: paidPerPax,
       singleRoomDiff: round2(singleRoomDiffOrder / paxCount),

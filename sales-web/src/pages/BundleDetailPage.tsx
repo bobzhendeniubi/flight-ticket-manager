@@ -316,6 +316,25 @@ function BundleDetailContent({
   const [businessCount, setBusinessCount] = useState(navState.businessCount ?? 0); // 升级商务舱
   const dateInputRef = useRef<HTMLInputElement>(null);
 
+  // 公开散客优惠：按选定出发日查询；请求失败由详情页按 0 兜底，不阻塞浏览。
+  const [retailDiscountPerPersonCny, setRetailDiscountPerPersonCny] = useState(0);
+  useEffect(() => {
+    if (!b.settlementTier || b.settlementNights == null || !goDate) {
+      setRetailDiscountPerPersonCny(0);
+      return;
+    }
+    let cancelled = false;
+    setRetailDiscountPerPersonCny(0);
+    api.getRetailSettlementDiscount({
+      tier: b.settlementTier,
+      nights: b.settlementNights,
+      departDate: goDate,
+    }).then((result) => {
+      if (!cancelled) setRetailDiscountPerPersonCny(result?.discountPerPersonCny ?? 0);
+    });
+    return () => { cancelled = true; };
+  }, [b.settlementNights, b.settlementTier, goDate]);
+
   // 套餐 add-on 报价（server-priced，后端返回 number）+ 计费航段数
   const singleSupp = b.singleSupplementCnyPerNight != null ? num(b.singleSupplementCnyPerNight) : null;
   const businessUpg = b.businessUpgradeCnyPerLeg != null ? num(b.businessUpgradeCnyPerLeg) : null;
@@ -451,9 +470,12 @@ function BundleDetailContent({
   // 套餐行（镜像后端 createOrder BUNDLE 行金额）：max(0, round(地面) + 加项净额 + 操作费)。
   const bundleRow = Math.max(0, Math.round(hotelTotal + otherTotal) + addOnNet + operationFeeTotal);
   const factor = (100 - pct) / 100;
-  // 划线原价（未打折全包价）；权威总价逐块取整（机票块 + 套餐行各自 round），与后端逐行 round 偏差 ≤1 元。
+  // 划线原价（未打折全包价）。散客口径：先按套餐 percent-off 取整，再扣按出行人数命中的固定优惠。
   const listTotal = flightTotal + bundleRow;
-  const total = Math.round(flightTotal * factor) + Math.round(bundleRow * factor);
+  const percentDiscountTotal = Math.round(flightTotal * factor) + Math.round(bundleRow * factor);
+  const retailDiscountTotal = retailDiscountPerPersonCny * headCount;
+  const total = Math.max(0, percentDiscountTotal - retailDiscountTotal);
+  const savingsTotal = (listTotal - percentDiscountTotal) + retailDiscountTotal;
   const perPerson = headCount > 0 ? Math.round(total / headCount) : total;
 
   const soldOut = goTier === 'SOLD_OUT' || retTier === 'SOLD_OUT' || hotelTier === 'SOLD_OUT';
@@ -496,6 +518,9 @@ function BundleDetailContent({
         // 兼容旧字段：pax = headCount（出行人总数，含婴儿）
         pax: headCount, rooms: baseRooms,
         flightTotal, hotelTotal, otherTotal, discountPct: pct,
+        listTotal,
+        percentTotal: percentDiscountTotal,
+        retailDiscountPerPersonCny,
         singleCount, businessCount,
         ...(outLeg?.scheduleId ? { goLegScheduleId: outLeg.scheduleId } : {}),
         ...(retLeg?.scheduleId ? { retLegScheduleId: retLeg.scheduleId } : {}),
@@ -964,16 +989,25 @@ function BundleDetailContent({
                   <span className="nums whitespace-nowrap text-slate-600">+¥{operationFeeTotal.toLocaleString()}</span>
                 </div>
               )}
+              {savingsTotal > 0 && (
+                <div className="flex items-center justify-between text-xs">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <span className="rounded bg-emerald-100 px-1.5 py-0.5 font-medium text-emerald-700">优惠</span>
+                    <span className="truncate text-slate-700">本单已省</span>
+                  </div>
+                  <span className="nums whitespace-nowrap font-medium text-emerald-700">−¥{savingsTotal.toLocaleString()}</span>
+                </div>
+              )}
             </div>
 
             {/* 价格 */}
             <div className="rounded-2xl border border-slate-200/70 bg-canvas p-3.5">
               <div className="flex items-end justify-between gap-2">
                 <div className="text-xs text-ink-muted">
-                  {formatOccupancy(adultCount, childCount, infantCount)} · {baseRooms} 间房{pct > 0 && <span className="ml-1 text-deal">已省 {pct}%</span>}
+                  {formatOccupancy(adultCount, childCount, infantCount)} · {baseRooms} 间房{savingsTotal > 0 && <span className="ml-1 text-deal">已省 ¥{savingsTotal.toLocaleString()}</span>}
                 </div>
                 <div className="text-right">
-                  {pct > 0 && <span className="price-old block text-xs">¥{listTotal.toLocaleString()}</span>}
+                  {savingsTotal > 0 && <span className="price-old block text-xs">¥{listTotal.toLocaleString()}</span>}
                   <span className="price text-2xl">¥{total.toLocaleString()}</span>
                   <div className="text-xs text-ink-muted">≈ ¥{perPerson.toLocaleString()} /人</div>
                 </div>

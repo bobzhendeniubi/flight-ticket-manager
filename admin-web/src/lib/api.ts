@@ -660,6 +660,16 @@ export type SettlementPreview =
         addOnCny?: number;
         note: string;
       }>;
+      autoDiscount?: {
+        hits: Array<{
+          ruleId: string;
+          kind: 'AGENT' | 'AGENT_DEFAULT' | 'RETAIL';
+          perPersonCny: number;
+          pax: number;
+        }>;
+        pax: number;
+        totalCny: number;
+      } | null;
     }
   | { ok: false; reason: string };
 
@@ -1930,6 +1940,38 @@ export interface SettlementRateWriteEntry {
   note?: string | null;
 }
 
+// ── 结算价立减规则（ADMIN/STAFF）— 出发日期窗口 × 晚数 × 酒店档次 ────────
+// 与 backend/src/modules/settlement-discounts/* 对齐；金额为 CNY/人整数。
+export type SettlementDiscountKind = 'AGENT' | 'AGENT_DEFAULT' | 'RETAIL';
+
+export interface SettlementDiscountRule {
+  id: string;
+  kind: SettlementDiscountKind;
+  agentId: string | null;
+  tier: SettlementTier;
+  nights: number;
+  startDate: string;
+  endDate: string;
+  discountPerPersonCny: number;
+  isActive: boolean;
+  note: string | null;
+  updatedBy?: string | null;
+  updatedAt?: string;
+}
+
+export interface SettlementDiscountWriteEntry {
+  id?: string;
+  kind: SettlementDiscountKind;
+  agentId?: string;
+  tier: SettlementTier;
+  nights: number;
+  startDate: string;
+  endDate: string;
+  discountPerPersonCny: number;
+  isActive?: boolean;
+  note?: string | null;
+}
+
 // ── 机票结算价日历（ADMIN/STAFF）— 航班号 × 出发日期 → 每人结算价 ──────────
 // 与 backend/src/modules/settlement-rates/flight-settlement-rates.* 对齐。
 // 对应运营的机票报价表：行 = 日期，列 = 航班（去程/回程各一列），每格一个 OTA 结算价/人。
@@ -2787,6 +2829,8 @@ export const api = {
     body: {
       items: CreateOrderItemInput[];
       passengers?: Array<{ visaExempt?: boolean; singleRoom?: boolean }>;
+      /** ADMIN/STAFF 试算代理订单时传入归属代理；不传按散客口径。 */
+      agentId?: string;
     },
   ) => apiFetch<QuoteOrderResult>('/orders/quote', { method: 'POST', token, body }),
 
@@ -3831,6 +3875,38 @@ export const api = {
     }),
   deleteSettlementRate: (token: string, id: string) =>
     apiFetch<{ ok: true }>(`/settlement-rates/${id}`, { method: 'DELETE', token }),
+
+  // ── 结算价立减规则（ADMIN/STAFF 读；ADMIN 写）───────────────────────────
+  listSettlementDiscounts: (
+    token: string,
+    query?: {
+      kind?: SettlementDiscountKind;
+      agentId?: string;
+      tier?: SettlementTier;
+      nights?: number;
+      from?: string;
+      to?: string;
+    },
+  ) => {
+    const qs = new URLSearchParams();
+    if (query) {
+      for (const [key, value] of Object.entries(query)) {
+        if (value !== undefined && value !== '') qs.set(key, String(value));
+      }
+    }
+    return apiFetch<{ rules: SettlementDiscountRule[] }>(
+      `/settlement-discounts${qs.toString() ? `?${qs.toString()}` : ''}`,
+      { token },
+    );
+  },
+  upsertSettlementDiscounts: (token: string, rules: SettlementDiscountWriteEntry[]) =>
+    apiFetch<{ rules: SettlementDiscountRule[] }>('/settlement-discounts/batch', {
+      method: 'PUT',
+      token,
+      body: { rules },
+    }),
+  deleteSettlementDiscount: (token: string, id: string) =>
+    apiFetch<{ ok: true }>(`/settlement-discounts/${id}`, { method: 'DELETE', token }),
 
   // ── 机票结算价日历（ADMIN/STAFF）— 航班号 × 出发日期网格 ─────────────────
   listFlightSettlementRates: (

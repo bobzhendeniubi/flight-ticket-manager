@@ -61,6 +61,11 @@ import { localDate } from '../finances/finances.cost.service.js';
 import { getSettlementRate } from '../settlement-rates/settlement-rates.service.js';
 import { getFlightSettlementRate } from '../settlement-rates/flight-settlement-rates.service.js';
 import {
+  resolveAgentSettlementDiscount,
+  resolveRetailSettlementDiscount,
+  type SettlementDiscountHit,
+} from '../settlement-discounts/settlement-discounts.service.js';
+import {
   assertHotelPhysicalFit,
   assertRandomTierFit,
   checkHotelPhysicalFit,
@@ -531,6 +536,44 @@ export function buildPriceAdjustmentItem(adj: PriceAdjustmentInput): {
 }
 
 /**
+ * 规则命中的固定立减行：金额、规则类型和每人金额都写入 metadata 快照。
+ * 订单展示/售后只认这份快照，不因运营之后修改规则而漂移。
+ */
+export function buildSettlementDiscountItem(input: {
+  hit: SettlementDiscountHit;
+  pax: number;
+  bundleId?: string | null;
+}): {
+  kind: OrderItemKind;
+  description: string;
+  quantity: number;
+  unitPrice: number;
+  amount: number;
+  totalCostCny: number;
+  metadata: Record<string, unknown>;
+} {
+  const totalCny = input.hit.discountPerPersonCny * input.pax;
+  return {
+    kind: OrderItemKind.DISCOUNT,
+    description: `同业立减 ¥${input.hit.discountPerPersonCny}/人 × ${input.pax}人`,
+    quantity: 1,
+    unitPrice: -totalCny,
+    amount: -totalCny,
+    totalCostCny: 0,
+    metadata: {
+      priceAdjustment: true,
+      reasonCode: 'DISCOUNT',
+      settlementDiscount: true,
+      ruleId: input.hit.ruleId,
+      ruleKind: input.hit.kind,
+      discountPerPersonCny: input.hit.discountPerPersonCny,
+      pax: input.pax,
+      bundleId: input.bundleId ?? null,
+    },
+  };
+}
+
+/**
  * 本单结算总价 → 一条系统生成的 SETTLEMENT 差额行（计入 subtotal/total）。
  *   - 业务：代理单与代理谈定整单一口价（结算价），系统照此收钱；服务端权威定价不破坏——
  *     **绝不改各明细行价格**，只按「结算价 − 权威合计」追加一条差额行（原价/差额/原因留痕可审计）。
@@ -795,6 +838,40 @@ export async function syncOrderHasReturnLeg(
   return hasReturnLeg;
 }
 
+type PricedOrderItem = {
+  kind: OrderItemKind;
+  description: string;
+  quantity: number;
+  unitPrice: number;
+  amount: number;
+  flightScheduleId?: string;
+  flightCabin?: import('@prisma/client').CabinClass;
+  businessUpgradeCount?: number;
+  hotelRoomTypeId?: string;
+  randomStarTier?: number;
+  hotelCheckIn?: Date;
+  hotelCheckOut?: Date;
+  transferId?: string;
+  visaId?: string;
+  bundleId?: string;
+  roomsBilled?: number;
+  settlementAddOnCny?: number;
+  unitCostCny?: number;
+  totalCostCny?: number;
+  metadata?: Record<string, unknown>;
+};
+
+type AutoDiscountSummary = {
+  hits: Array<{
+    ruleId: string;
+    kind: SettlementDiscountHit['kind'];
+    perPersonCny: number;
+    pax: number;
+  }>;
+  pax: number;
+  totalCny: number;
+};
+
 export class OrderService {
   private readonly pricing = new PricingService();
 
@@ -924,6 +1001,12 @@ export class OrderService {
       ? [body.notes, duplicateForceNote].filter(Boolean).join(' · ')
       : body.notes;
 
+    // 代理归属判定提前到权威定价之前：散客 RETAIL 立减必须在套餐 percent-off
+    // 后、expectedTotalCny 校验前加入定价结果；代理单则跳过 RETAIL 规则。
+    const agentId = isGuest
+      ? null
+      : await resolveOrderAgentId(requester, body.agentId);
+
     // 先查所有 FLIGHT item 对应的 FlightSeatClass + 计算动态价（在事务外查，避免长事务）
     // body.flightSettlementPriceCny 存在 → 团队议价结算价覆盖机票价（鉴权在路由/批量层完成）。
     const pricedItems = await this.priceAndValidateItems(
@@ -934,6 +1017,14 @@ export class OrderService {
       // 仅后台/代理录单可用「无产品 id 的自定义价地面行」；对外角色（游客/CUSTOMER）一律走系统产品价。
       isStaffEnteredOrder(requester),
     );
+
+    const hasManualSettlementChannel =
+      body.priceAdjustment !== undefined ||
+      body.settlementTotalCny !== undefined ||
+      body.flightSettlementPriceCny !== undefined;
+    if (!agentId && !hasManualSettlementChannel) {
+      await this.applyRetailSettlementDiscount(body, pricedItems);
+    }
 
     // ── 前台展示价兜底校验（S1）：下单前比对「前台展示总价」与「服务端权威商品价」──────────────
     // 基准取 pricedItems 逐行金额之和 —— **在护照临期附加费 / 录单调价之前**：这两项前台展示时并不知道
@@ -957,13 +1048,6 @@ export class OrderService {
       pricedItems.push(buildPriceAdjustmentItem(body.priceAdjustment));
     }
 
-    // 代理归属判定（提前到结算价日历取价之前——自动取价需要先知道本单是否归属代理）：
-    //   游客 / 直客 → null；AGENT 自助 → 自己的 agentId（忽略 body.agentId）；
-    //   ADMIN·STAFF 录单 → 可显式归属 body.agentId（校验存在且在用），否则 null。
-    const agentId = isGuest
-      ? null
-      : await resolveOrderAgentId(requester, body.agentId);
-
     // 结算价日历自动取价（已拍板 B）：代理单 + 套餐已配日历键（档次+晚数）→ 按去程出发日期查每人结算价，
     // 结算总价 = 每人价 × 乘客数，喂给下方既有「结算总价 → SETTLEMENT 差额行」机制落价（服务端权威定价）。
     //   · 手工 settlementTotalCny（ADMIN/STAFF 通道，已在入口鉴权）优先，日历不覆盖。
@@ -975,6 +1059,7 @@ export class OrderService {
     // 批量「优惠 ¥/人」是独立的可叠加调整：只有服务端批量优惠路径注入的结构化标记
     // 才允许日历价与调整行叠加；普通 DISCOUNT 调价保持既有语义。
     const stackableCalendarAdjustment = body.priceAdjustment?.stackWithSettlementCalendar === true;
+    let agentAutoDiscount: AutoDiscountSummary | null = null;
     if (body.settlementTotalCny === undefined && agentId) {
       // BUNDLE 行加项净额（与 body.items 的 BUNDLE 行同序）：日历价 + 加项 才是本单结算价，
       // 否则升舱/单房差/指定酒店加价会被下方 SETTLEMENT 差额行收敛吞掉。
@@ -983,9 +1068,27 @@ export class OrderService {
         pricedItems.filter((p) => p.kind === 'BUNDLE').map((p) => p.settlementAddOnCny ?? 0),
       );
       if (calendar) {
+        // 只有没有任何手工价通道时才自动命中代理立减。手工优惠/团队议价/手动单价
+        // 均视为整体替代，保留现有手工调整与日历价的收敛口径，不与规则叠加。
+        const hasManualSettlementChannel =
+          body.priceAdjustment !== undefined || body.flightSettlementPriceCny !== undefined;
+        if (!hasManualSettlementChannel) {
+          agentAutoDiscount = await this.applyAgentSettlementDiscount(
+            pricedItems,
+            calendar,
+            agentId,
+          );
+        }
         effectiveSettlementTotalCny =
-          calendar.totalCny + (stackableCalendarAdjustment ? body.priceAdjustment?.amountCny ?? 0 : 0);
+          calendar.totalCny - (agentAutoDiscount?.totalCny ?? 0) +
+          (stackableCalendarAdjustment ? body.priceAdjustment?.amountCny ?? 0 : 0);
         settlementCalendarAudit = calendar.audit;
+        if (agentAutoDiscount) {
+          settlementCalendarAudit = {
+            ...settlementCalendarAudit,
+            autoDiscount: agentAutoDiscount,
+          };
+        }
       } else if (
         // 机票结算价日历（纯机票代理单）：套餐日历没接管时才轮到它。
         // 任一「手工价通道」在场一律不介入——手工价与日历价二选一，叠加会双重砸价：
@@ -1010,6 +1113,9 @@ export class OrderService {
       settlementCalendarAudit = { ...settlementCalendarAudit, discountCny: calendarDiscountCny };
     }
 
+    if (agentAutoDiscount && effectiveSettlementTotalCny !== undefined && effectiveSettlementTotalCny <= 0) {
+      throw new BadRequestError('立减规则叠加后结算价异常（≤0），请检查立减规则配置');
+    }
     if (effectiveSettlementTotalCny !== undefined && effectiveSettlementTotalCny < 0) {
       throw new BadRequestError('优惠金额超过订单应收，请核对');
     }
@@ -1278,9 +1384,14 @@ export class OrderService {
     // 本单结算总价审计（权威合计 / 结算价 / 差额 / 操作人 / 取价来源）。权限已在入口断言。
     // 来源二选一：手工结算价（ADMIN/STAFF 通道）或结算价日历自动取价（代理单，settlementCalendarAudit 非空）。
     // WARNING 级：整单收款额被收敛到结算价，是需要留痕复核的财务动作。
-    // diff=0（未生成差额行、总额未变）不写审计，避免无操作的 WARNING 噪音淹没真正该警觉的调价。
+    // diff=0（未生成差额行、总额未变）通常不写审计，避免无操作的 WARNING 噪音；
+    // 但命中自动立减时仍留一条日历审计，确保规则快照命中可追溯。
     // await（非 fire-and-forget）：与录单调价同口径，落审计后再返回，便于对账与追责。
-    if (settlementDiffCny !== null && settlementDiffCny !== 0 && !isGuest) {
+    if (
+      settlementDiffCny !== null &&
+      (settlementDiffCny !== 0 || agentAutoDiscount !== null) &&
+      !isGuest
+    ) {
       await writeAudit({
         actor: { userId: requester.userId, role: requester.role },
         action: 'APPLY_SETTLEMENT_TOTAL',
@@ -1338,14 +1449,11 @@ export class OrderService {
     // 试算带上乘客级住宿/签证选项（缺省则回落 item 级旧口径），使系统价随每人选择实时变化。
     // quote 仅 ADMIN/STAFF 路由可达，允许自由行手录价试算。
     const priced = await this.priceAndValidateItems(body.items, undefined, body.passengers, true);
-    const items = priced.map((p) => ({
-      kind: p.kind,
-      description: p.description,
-      quantity: p.quantity,
-      unitPrice: p.unitPrice,
-      amount: p.amount,
-    }));
-    const subtotal = items.reduce((sum, p) => sum + p.amount, 0);
+    // 散客立减与结算价日历是两条独立规则链：先按每个套餐行命中 RETAIL，
+    // 即使日历价未维护，quote 的商品总价也必须与 createOrder 保持一致。
+    if (!body.agentId) {
+      await this.applyRetailSettlementDiscount({ items: body.items }, priced);
+    }
 
     let settlementPreview: SettlementPreview = null;
     try {
@@ -1355,23 +1463,49 @@ export class OrderService {
         priced.filter((p) => p.kind === 'BUNDLE').map((p) => p.settlementAddOnCny ?? 0),
       );
       if (bundleCalendar) {
+        let autoDiscount: AutoDiscountSummary | null = null;
+        if (body.agentId) {
+          autoDiscount = await this.applyAgentSettlementDiscount(
+            priced,
+            bundleCalendar,
+            body.agentId,
+          );
+        }
         const auditLines = Array.isArray(bundleCalendar.audit.lines)
           ? bundleCalendar.audit.lines
           : [];
         settlementPreview = {
           ok: true,
           source: 'GROUND',
-          totalCny: bundleCalendar.totalCny,
+          totalCny: bundleCalendar.totalCny - (autoDiscount?.totalCny ?? 0),
           departDate:
             typeof bundleCalendar.audit.departDate === 'string'
               ? bundleCalendar.audit.departDate
               : undefined,
-          lines: auditLines.map((line) => ({
-            pricePerPersonCny: Number(line.pricePerPersonCny ?? 0),
-            pax: Number(line.pax ?? 0),
-            ...(Number(line.addOnCny ?? 0) !== 0 ? { addOnCny: Number(line.addOnCny) } : {}),
-            note: String(line.note ?? ''),
-          })),
+          lines: [
+            ...auditLines.map((line) => ({
+              pricePerPersonCny: Number(line.pricePerPersonCny ?? 0),
+              pax: Number(line.pax ?? 0),
+              ...(Number(line.addOnCny ?? 0) !== 0 ? { addOnCny: Number(line.addOnCny) } : {}),
+              note: String(line.note ?? ''),
+            })),
+            ...(autoDiscount
+              ? autoDiscount.hits.map((hit) => ({
+                  pricePerPersonCny: -hit.perPersonCny,
+                  pax: hit.pax,
+                  note: '同业立减',
+                }))
+              : []),
+          ],
+          ...(autoDiscount
+            ? {
+                autoDiscount: {
+                  hits: autoDiscount.hits,
+                  pax: autoDiscount.pax,
+                  totalCny: autoDiscount.totalCny,
+                },
+              }
+            : {}),
         };
       } else {
         const flightCalendar = await this.resolveFlightSettlementCalendarTotal(quoteCreateBody);
@@ -1400,6 +1534,14 @@ export class OrderService {
       }
     }
 
+    const items = priced.map((p) => ({
+      kind: p.kind,
+      description: p.description,
+      quantity: p.quantity,
+      unitPrice: p.unitPrice,
+      amount: p.amount,
+    }));
+    const subtotal = items.reduce((sum, p) => sum + p.amount, 0);
     return { currency: 'CNY', subtotal, total: subtotal, items, settlementPreview };
   }
 
@@ -1460,6 +1602,154 @@ export class OrderService {
         totalCostCny: 0,
       });
     }
+  }
+
+  /**
+   * 把代理套餐地面日历命中的固定立减写成独立 DISCOUNT 行。
+   * 立减行随后参与结算总价收敛，因此「日历价 − 立减」与订单总额保持同一口径。
+   */
+  private async applyAgentSettlementDiscount(
+    pricedItems: PricedOrderItem[],
+    calendar: { totalCny: number; audit: Record<string, unknown> },
+    agentId: string,
+  ): Promise<AutoDiscountSummary | null> {
+    const lines = Array.isArray(calendar.audit.lines)
+      ? (calendar.audit.lines as Array<Record<string, unknown>>)
+      : [];
+    const hits: AutoDiscountSummary['hits'] = [];
+    let totalCny = 0;
+    let totalPax = 0;
+    for (const line of lines) {
+      const tier = line.tier as SettlementTier | undefined;
+      const nights = Number(line.nights);
+      const departDate = typeof line.departDate === 'string' ? line.departDate : null;
+      const pax = Math.max(0, Math.trunc(Number(line.pax) || 0));
+      if (!tier || !departDate || !Number.isInteger(nights) || pax <= 0) continue;
+      const hit = await resolveAgentSettlementDiscount(agentId, tier, nights, departDate);
+      if (!hit) continue;
+      const bundleId = typeof line.bundleId === 'string' ? line.bundleId : null;
+      const item = buildSettlementDiscountItem({ hit, pax, bundleId });
+      pricedItems.push(item);
+      hits.push({
+        ruleId: hit.ruleId,
+        kind: hit.kind,
+        perPersonCny: hit.discountPerPersonCny,
+        pax,
+      });
+      totalCny += hit.discountPerPersonCny * pax;
+      totalPax += pax;
+    }
+    if (hits.length === 0) return null;
+    return {
+      hits,
+      pax: totalPax,
+      totalCny,
+    };
+  }
+
+  /**
+   * 散客套餐在套餐 percent-off 后命中 RETAIL 立减。
+   * 该方法只接受已经完成套餐权威定价和 percent-off 的 pricedItems，确保顺序固定。
+   */
+  private async applyRetailSettlementDiscount(
+    body: Pick<CreateOrderBody, 'items'>,
+    pricedItems: PricedOrderItem[],
+  ): Promise<AutoDiscountSummary | null> {
+    if (
+      typeof (prisma as unknown as { bundle?: { findMany?: unknown } }).bundle?.findMany !==
+      'function'
+    ) {
+      return null;
+    }
+    const bundleItems = body.items.filter(
+      (item): item is Extract<OrderItemInput, { kind: 'BUNDLE' }> =>
+        item.kind === 'BUNDLE' && Boolean(item.bundleId),
+    );
+    if (bundleItems.length === 0) return null;
+
+    const bundles = await prisma.bundle.findMany({
+      where: { id: { in: [...new Set(bundleItems.map((item) => item.bundleId))] } },
+      select: { id: true, name: true, settlementTier: true, settlementNights: true },
+    });
+    const bundleById = new Map(bundles.map((bundle) => [bundle.id, bundle]));
+    const configured = bundleItems.filter((item) => {
+      const bundle = bundleById.get(item.bundleId);
+      return bundle?.settlementTier != null && bundle.settlementNights != null;
+    });
+    if (configured.length === 0) return null;
+
+    const hits: AutoDiscountSummary['hits'] = [];
+    let totalCny = 0;
+    let totalPax = 0;
+    let sameIndustryCalendarTotal = 0;
+    const hitBundleIds: string[] = [];
+    const hitRuleIds: string[] = [];
+
+    for (const item of configured) {
+      const bundle = bundleById.get(item.bundleId);
+      if (!bundle?.settlementTier || bundle.settlementNights == null) continue;
+      const departDate = await this.resolveBundleItemDepartureLocalDate(body, item);
+      if (!departDate) continue;
+      const pax = resolveBundleOccupancy({
+        adultCount: item.adultCount,
+        childCount: item.childCount,
+        infantCount: item.infantCount,
+        quantity: item.quantity,
+        metadata: item.metadata,
+      }).headCount;
+      if (pax <= 0) continue;
+      const hit = await resolveRetailSettlementDiscount(
+        bundle.settlementTier as SettlementTier,
+        bundle.settlementNights,
+        departDate,
+      );
+      if (!hit) continue;
+      pricedItems.push(buildSettlementDiscountItem({ hit, pax, bundleId: bundle.id }));
+      hits.push({
+        ruleId: hit.ruleId,
+        kind: hit.kind,
+        perPersonCny: hit.discountPerPersonCny,
+        pax,
+      });
+      totalCny += hit.discountPerPersonCny * pax;
+      totalPax += pax;
+      hitBundleIds.push(bundle.id);
+      hitRuleIds.push(hit.ruleId);
+
+      // 击穿保护比较只做 warn：真正异常（订单变成 0/负数）才拒单。
+      const rate = await getSettlementRate(
+        bundle.settlementTier as SettlementTier,
+        bundle.settlementNights,
+        departDate,
+      );
+      if (rate) sameIndustryCalendarTotal += rate.pricePerPersonCny * pax;
+    }
+    if (hits.length === 0) return null;
+
+    const afterTotal = pricedItems.reduce((sum, item) => sum + item.amount, 0);
+    if (afterTotal <= 0) {
+      // eslint-disable-next-line no-console
+      console.error('[orders] retail settlement discount made order total non-positive', {
+        bundleIds: hitBundleIds,
+        ruleIds: hitRuleIds,
+        totalCny: afterTotal,
+      });
+      throw new BadRequestError('优惠叠加后金额异常，请联系客服');
+    }
+    if (sameIndustryCalendarTotal > 0 && afterTotal < sameIndustryCalendarTotal) {
+      // eslint-disable-next-line no-console
+      console.warn('[orders] retail settlement discount is below settlement calendar price', {
+        bundleIds: hitBundleIds,
+        ruleIds: hitRuleIds,
+        orderTotalCny: afterTotal,
+        settlementCalendarCny: sameIndustryCalendarTotal,
+      });
+    }
+    return {
+      hits,
+      pax: totalPax,
+      totalCny,
+    };
   }
 
   /**
@@ -1653,6 +1943,44 @@ export class OrderService {
   }
 
   /**
+   * 解析单个 BUNDLE 行自己的去程出发本地日。
+   * 优先使用该行随套餐传入的 goDate（购物车一行对应一个出发日期）；缺失或异常时，
+   * 再从同 bundleId 的 FLIGHT 航段取最早出发日。绝不扫描整单，避免多套餐/散票串日期。
+   */
+  private async resolveBundleItemDepartureLocalDate(
+    body: Pick<CreateOrderBody, 'items'>,
+    bundleItem: Extract<OrderItemInput, { kind: 'BUNDLE' }>,
+  ): Promise<string | null> {
+    const goDate = bundleItem.metadata?.goDate;
+    if (typeof goDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(goDate)) {
+      return goDate;
+    }
+
+    const scheduleIds = [
+      ...new Set(
+        body.items
+          .filter(
+            (item): item is Extract<OrderItemInput, { kind: 'FLIGHT' }> =>
+              item.kind === 'FLIGHT' && item.bundleId === bundleItem.bundleId,
+          )
+          .map((item) => item.flightScheduleId),
+      ),
+    ];
+    if (scheduleIds.length === 0) return null;
+    const schedules = await prisma.flightSchedule.findMany({
+      where: { id: { in: scheduleIds } },
+      select: { departureTime: true, departureTz: true },
+    });
+    if (schedules.length === 0) return null;
+    const earliest = schedules.reduce(
+      (min, schedule) =>
+        schedule.departureTime < min.departureTime ? schedule : min,
+      schedules[0],
+    );
+    return localDate(earliest.departureTime, earliest.departureTz);
+  }
+
+  /**
    * 重复乘客校验：同一航班班次的「占座中」订单（SEAT_HOLDING_STATUSES）里，
    * 同证件号乘客不允许再次下单 —— 已取消/已退款/超时的订单不算占座，可重订。
    *
@@ -1733,39 +2061,7 @@ export class OrderService {
     // 且 expectedTotalCny 兜底以这个被信任的价为基准，形同虚设。
     allowClientPricedGround = false,
   ) {
-    const priced: Array<{
-      kind: OrderItemKind;
-      description: string;
-      quantity: number;
-      unitPrice: number;
-      amount: number;
-      flightScheduleId?: string;
-      flightCabin?: import('@prisma/client').CabinClass;
-      // 套餐升舱：这条经济舱 FLIGHT 行里有多少个座位要占用真实商务舱库存
-      // （扣座时 ECONOMY sold += quantity − businessUpgradeCount，BUSINESS sold += businessUpgradeCount）
-      businessUpgradeCount?: number;
-      hotelRoomTypeId?: string;
-      // 未落位随机单占房行（3=三星随机、4=四星随机）：与 hotelRoomTypeId 互斥
-      randomStarTier?: number;
-      hotelCheckIn?: Date;
-      hotelCheckOut?: Date;
-      transferId?: string;
-      visaId?: string;
-      bundleId?: string;
-      // 解析后的计费房间数（支持 0.5 间）。落到 OrderItem.roomsBilled 供房控读取。
-      roomsBilled?: number;
-      // BUNDLE 行加项净额（升级加价/婴儿价/儿童折扣/自备签减免/指定酒店加价，未打折）。
-      // 结算价日历取价时叠加在日历价之上（报价口径：同业价基础上加收/减免），仅内部用，不落库。
-      settlementAddOnCny?: number;
-      // 产品类成本快照（房/签/车，下单时已知）。落到 OrderItem.unitCostCny/totalCostCny，
-      // 供财务毛利真账。FLIGHT 不写这两栏：包机成本是下单之后才由财务按班次填的，
-      // 下单那一刻它根本不存在，且本就是航班级属性 —— 硬快照只会造出永久 NULL。
-      // 机票毛利永远走班次成本周期重算（见 finances 成本口径），不在此快照。
-      // 产品未录成本（costPriceCny 为 NULL）→ 快照留 undefined → 毛利显示「未知」，不虚高。
-      unitCostCny?: number;
-      totalCostCny?: number;
-      metadata?: Record<string, unknown>;
-    }> = [];
+    const priced: PricedOrderItem[] = [];
 
     // 本单所有 BUNDLE 行选「升舱商务」的总人数（多份套餐叠加），去程 / 回程各自一份 ——
     // 同一批客人可以只升去程、或去回程升的人数不同。循环结束后按航段落到对应 FLIGHT 行：
@@ -5322,7 +5618,7 @@ export class OrderService {
    *   2. 原子拿新座（新班次+新舱位 CAS：sold + qty + 他人锁位 ≤ capacity）
    *      —— 新班次售罄则抛错，事务回滚 → 旧座保持原样（不泄漏）。
    *   3. 更新该行 flightScheduleId/flightCabin（amount/quantity 不变，机票基础价不重算）。
-   *   4. feeCny>0 → order.adjustmentCny += feeCny，并 push 一条 adjustments 流水（RESCHEDULE_FEE）。
+   *   4. 撤销未撤销的立减快照行并按原金额补差；feeCny>0 另 push 一条 RESCHEDULE_FEE 流水。
    *   5. 当前若处于 CHANGE_REQUESTED（状态机允许 → CHANGED）则推进到 CHANGED；其余状态保持不变。
    *
    * 返回更新后的订单（serializeOrder）。
@@ -5396,6 +5692,7 @@ export class OrderService {
           orderId: true,
           kind: true,
           quantity: true,
+          bundleId: true,
           flightScheduleId: true,
           flightCabin: true,
           metadata: true,
@@ -5482,19 +5779,75 @@ export class OrderService {
       // 且未来若改期扩展成能加/删航段，维护点已经在这里，不会漏。
       await syncOrderHasReturnLeg(tx, orderId);
 
-      // ── 4. 加改期费（adjustmentCny + adjustments 流水）──
+      // ── 4. 改期立减取消补差 + 手填改期费（两笔分别留流水）──
+      // 改期后原立减不随新日期重新命中：只撤销订单上尚未撤销的快照行，
+      // 并把等额补差记入 adjustmentCny。行级 revoked 标记保证同单二次改期幂等。
+      let adjustmentDelta = feeCny;
+      let adjustmentLog = order.adjustments;
+      if (!sameSeat) {
+        // 立减只挂在套餐地面价上：纯机票行改期与立减无关。
+        if (item.bundleId) {
+          const discountRows =
+            (await tx.orderItem.findMany({
+              where: { orderId, kind: OrderItemKind.DISCOUNT },
+              select: { id: true, amount: true, metadata: true },
+            })) ?? [];
+          for (const discountRow of discountRows) {
+            const rawMetadata = discountRow.metadata;
+            const metadata =
+              rawMetadata != null && typeof rawMetadata === 'object' && !Array.isArray(rawMetadata)
+                ? (rawMetadata as Record<string, unknown>)
+                : {};
+            if (metadata.settlementDiscount !== true || metadata.settlementDiscountRevoked === true) {
+              continue;
+            }
+            const discountBundleId =
+              typeof metadata.bundleId === 'string' ? metadata.bundleId : null;
+            if (discountBundleId && discountBundleId !== item.bundleId) continue;
+            if (!discountBundleId) {
+              // eslint-disable-next-line no-console
+              console.warn('[orders] settlement discount row missing bundleId snapshot; revoking defensively', {
+                orderId,
+                orderItemId: discountRow.id,
+                targetBundleId: item.bundleId,
+              });
+            }
+            const amountCny = Math.abs(Number(discountRow.amount) || 0);
+            await tx.orderItem.update({
+              where: { id: discountRow.id },
+              data: {
+                metadata: { ...metadata, settlementDiscountRevoked: true } as Prisma.InputJsonValue,
+              },
+            });
+            if (amountCny <= 0) continue;
+            adjustmentDelta += amountCny;
+            adjustmentLog = appendAdjustment(adjustmentLog, {
+              type: 'RESCHEDULE_DISCOUNT_REVOKE',
+              label: `改期立减取消补差 ¥${amountCny}`,
+              amountCny,
+              at: new Date().toISOString(),
+              by: actor.userId,
+            }) as unknown as Prisma.JsonValue;
+          }
+        }
+      }
       if (feeCny > 0) {
-        const log = appendAdjustment(order.adjustments, {
+        adjustmentLog = appendAdjustment(adjustmentLog, {
           type: 'RESCHEDULE_FEE',
           label: input.feeLabel || '改期费',
           amountCny: feeCny,
           at: new Date().toISOString(),
           by: actor.userId,
           note: input.note,
-        });
+        }) as unknown as Prisma.JsonValue;
+      }
+      if (adjustmentDelta > 0) {
         await tx.order.update({
           where: { id: orderId },
-          data: { adjustmentCny: order.adjustmentCny + feeCny, adjustments: log },
+          data: {
+            adjustmentCny: order.adjustmentCny + adjustmentDelta,
+            adjustments: adjustmentLog as unknown as Prisma.InputJsonValue,
+          },
         });
       }
 

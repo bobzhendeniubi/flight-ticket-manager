@@ -267,6 +267,7 @@ export class SettlementService {
       },
       select: { id: true, total: true },
     });
+    // order.total 已含套餐折扣、规则立减等折后净额，因此月结 GMV/佣金基数天然按折后价计算；立减不另改佣金链路。
     const grossRevenue = sellerOrders.reduce((s, o) => s + Number(o.total), 0);
     const orderCount = sellerOrders.length;
 

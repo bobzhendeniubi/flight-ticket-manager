@@ -20,11 +20,17 @@ const {
   mockComputeQuote,
   mockGetHotelNightlyRemaining,
   mockEnqueueWaitlistCheck,
+  mockScheduleSeatHoldRelease,
+  mockResolveAgentSettlementDiscount,
+  mockResolveRetailSettlementDiscount,
+  mockGetSettlementRate,
 } = vi.hoisted(() => ({
   mockPrisma: {
     order: {
       findUnique: vi.fn(),
       findUniqueOrThrow: vi.fn(),
+      create: vi.fn(),
+      update: vi.fn(),
     },
     passenger: {
       findMany: vi.fn(),
@@ -38,6 +44,8 @@ const {
     // swapPassenger 换人重复证件号校验：查本订单 FLIGHT 行的 flightScheduleId（P1-8）。
     orderItem: {
       findMany: vi.fn(),
+      findUnique: vi.fn(),
+      update: vi.fn(),
     },
     refund: { create: vi.fn() },
     user: {
@@ -51,6 +59,7 @@ const {
     },
     bundle: {
       findUnique: vi.fn(),
+      findMany: vi.fn(),
     },
     // priceAndValidateItems 的 FLIGHT 分支走 PricingService.calculatePrice（真实动态定价，非 mock
     // 出来的 stub）——它也是从 '../../db/prisma.js' 拿 prisma 单例，这里的 mock 全局生效。
@@ -58,6 +67,9 @@ const {
     // DateRanking 查询链（固定底价模式：不配仓位阶梯，走 round(basePrice) 分支）。
     flightSeatClass: {
       findFirst: vi.fn(),
+    },
+    flightSchedule: {
+      findUnique: vi.fn(),
     },
     dateRanking: {
       findUnique: vi.fn(),
@@ -75,14 +87,26 @@ const {
     fulfillmentTask: {
       updateMany: vi.fn(),
     },
+    orderCostItem: { create: vi.fn() },
+    auditLog: { create: vi.fn() },
+    seatLock: {
+      aggregate: vi.fn(),
+      findMany: vi.fn(),
+      updateMany: vi.fn(),
+    },
     $transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn(mockTx)),
     // R2：rescheduleOrderItem 事务开头对 Order 行 FOR UPDATE（tx.$queryRaw）。默认返回一行（订单存在）
     // → 锁通过、继续走占座守卫；具体守卫用例仍由 order.findUnique 决定拒绝原因。
     $queryRaw: vi.fn(async () => [{ id: 'ord1' }]),
+    $executeRaw: vi.fn(async () => 1),
   },
   mockComputeQuote: vi.fn(),
   mockGetHotelNightlyRemaining: vi.fn(),
   mockEnqueueWaitlistCheck: vi.fn(),
+  mockScheduleSeatHoldRelease: vi.fn(),
+  mockResolveAgentSettlementDiscount: vi.fn(),
+  mockResolveRetailSettlementDiscount: vi.fn(),
+  mockGetSettlementRate: vi.fn(),
 }));
 
 // tx 对象与 mockPrisma 共享同一批 vi.fn()（swapPassenger 事务内 tx.order/tx.passenger/tx.fulfillmentTask
@@ -103,6 +127,16 @@ vi.mock('../hotel-control/hotel-control.service.js', () => ({
 
 vi.mock('../../queues/queue.js', () => ({
   enqueueWaitlistCheck: mockEnqueueWaitlistCheck,
+  scheduleSeatHoldRelease: mockScheduleSeatHoldRelease,
+}));
+
+vi.mock('../settlement-discounts/settlement-discounts.service.js', () => ({
+  resolveAgentSettlementDiscount: mockResolveAgentSettlementDiscount,
+  resolveRetailSettlementDiscount: mockResolveRetailSettlementDiscount,
+}));
+
+vi.mock('../settlement-rates/settlement-rates.service.js', () => ({
+  getSettlementRate: mockGetSettlementRate,
 }));
 
 // 现在才能 import service
@@ -3186,6 +3220,355 @@ describe('OrderService.rescheduleOrderItem · 占座状态守卫', () => {
       ),
     ).rejects.toMatchObject({ statusCode: 400 });
     expect(mockPrisma.flightSeatClass.findFirst).not.toHaveBeenCalled();
+  });
+
+  it('同班次同舱位仅记改期费 → 不撤销立减，adjustmentCny 只增加 feeCny', async () => {
+    const service = new OrderService();
+    mockPrisma.order.findUnique.mockReset().mockResolvedValue({
+      id: 'ord1',
+      status: 'PAID',
+      deletedAt: null,
+      adjustmentCny: 0,
+      adjustments: [],
+    });
+    mockPrisma.orderItem.findUnique.mockReset().mockResolvedValue({
+      id: 'it1',
+      orderId: 'ord1',
+      kind: 'FLIGHT',
+      quantity: 1,
+      flightScheduleId: 'sched1',
+      flightCabin: 'ECONOMY',
+      metadata: {},
+    });
+    mockPrisma.flightSeatClass.findFirst.mockReset().mockResolvedValue({ id: 'seat1' });
+    mockPrisma.orderItem.findMany.mockImplementation(
+      async (args: { where?: { kind?: string } }) =>
+        args.where?.kind === 'FLIGHT'
+          ? [{ flightScheduleId: 'sched1', flightSchedule: { departureTime: new Date('2026-09-01T00:00:00Z') } }]
+          : [{ id: 'discount1', amount: -200, metadata: { settlementDiscount: true } }],
+    );
+    mockPrisma.orderItem.update.mockReset().mockResolvedValue({});
+    mockPrisma.order.update.mockReset().mockResolvedValue({});
+    mockPrisma.order.findUniqueOrThrow.mockReset().mockResolvedValue(fakeFullOrder({ adjustmentCny: 80 }));
+
+    await service.rescheduleOrderItem(
+      'ord1',
+      { orderItemId: 'it1', newScheduleId: 'sched1', newCabin: 'ECONOMY', feeCny: 80 },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    expect(mockPrisma.orderItem.findMany).not.toHaveBeenCalledWith(
+      expect.objectContaining({ where: { orderId: 'ord1', kind: 'DISCOUNT' } }),
+    );
+    expect(mockPrisma.orderItem.update).toHaveBeenCalledTimes(1);
+    expect(mockPrisma.orderItem.update).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'it1' },
+    }));
+    expect(mockPrisma.order.update).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ adjustmentCny: 80 }),
+    }));
+    expect(mockPrisma.order.update).not.toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ adjustmentCny: 280 }),
+    }));
+  });
+
+  it('真实改期只撤销被改套餐的立减，普通 DISCOUNT 与另一套餐保持不变且二次改期幂等', async () => {
+    const service = new OrderService();
+    const orderState = {
+      id: 'ord1',
+      status: 'PAID',
+      deletedAt: null,
+      adjustmentCny: 0,
+      adjustments: [],
+    };
+    const flightItem = {
+      id: 'it-a-flight',
+      orderId: 'ord1',
+      kind: 'FLIGHT',
+      quantity: 1,
+      bundleId: 'bundle-a',
+      flightScheduleId: 'sched1',
+      flightCabin: 'ECONOMY',
+      metadata: {},
+    };
+    const discountRows = [
+      { id: 'discount-a', amount: -100, metadata: { settlementDiscount: true, bundleId: 'bundle-a' } },
+      { id: 'discount-b', amount: -200, metadata: { settlementDiscount: true, bundleId: 'bundle-b' } },
+      { id: 'ordinary-discount', amount: -50, metadata: { priceAdjustment: true, reasonCode: 'DISCOUNT' } },
+      { id: 'discount-revoked', amount: -80, metadata: { settlementDiscount: true, bundleId: 'bundle-a', settlementDiscountRevoked: true } },
+    ];
+    mockPrisma.order.findUnique.mockReset().mockResolvedValue(orderState);
+    mockPrisma.orderItem.findUnique.mockReset().mockResolvedValue(flightItem);
+    mockPrisma.flightSeatClass.findFirst.mockReset().mockResolvedValue({ id: 'seat1' });
+    mockPrisma.seatLock.aggregate.mockReset().mockResolvedValue({ _sum: { qty: 0 } });
+    mockPrisma.$executeRaw.mockReset().mockResolvedValue(1);
+    mockPrisma.orderItem.findMany.mockReset().mockImplementation(
+      async (args: { where?: { kind?: string } }) =>
+        args.where?.kind === 'FLIGHT'
+          ? [{ flightScheduleId: flightItem.flightScheduleId, flightSchedule: { departureTime: new Date('2026-09-01T00:00:00Z') } }]
+          : discountRows,
+    );
+    mockPrisma.orderItem.update.mockReset().mockImplementation(
+      async (args: { where: { id: string }; data: { metadata?: Record<string, unknown>; flightScheduleId?: string } }) => {
+        if (args.where.id === flightItem.id && args.data.flightScheduleId) {
+          flightItem.flightScheduleId = args.data.flightScheduleId;
+        }
+        const row = discountRows.find((candidate) => candidate.id === args.where.id);
+        if (row && args.data.metadata) row.metadata = args.data.metadata;
+        return {};
+      },
+    );
+    mockPrisma.order.update.mockReset().mockImplementation(
+      async (args: { data?: { adjustmentCny?: number; adjustments?: unknown } }) => {
+        if (args.data?.adjustmentCny !== undefined) orderState.adjustmentCny = args.data.adjustmentCny;
+        if (args.data?.adjustments !== undefined) orderState.adjustments = args.data.adjustments;
+        return {};
+      },
+    );
+    mockPrisma.order.findUniqueOrThrow.mockReset().mockImplementation(async () =>
+      fakeFullOrder({ adjustmentCny: orderState.adjustmentCny, adjustments: orderState.adjustments }),
+    );
+
+    await service.rescheduleOrderItem(
+      'ord1',
+      { orderItemId: 'it-a-flight', newScheduleId: 'sched2' },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    expect(discountRows.find((row) => row.id === 'discount-a')?.metadata).toMatchObject({
+      settlementDiscountRevoked: true,
+    });
+    expect(discountRows.find((row) => row.id === 'discount-b')?.metadata).not.toHaveProperty(
+      'settlementDiscountRevoked',
+    );
+    expect(discountRows.find((row) => row.id === 'ordinary-discount')?.metadata).not.toHaveProperty(
+      'settlementDiscountRevoked',
+    );
+    expect(orderState.adjustmentCny).toBe(100);
+    expect(orderState.adjustments).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'RESCHEDULE_DISCOUNT_REVOKE', amountCny: 100 }),
+    ]));
+
+    await service.rescheduleOrderItem(
+      'ord1',
+      { orderItemId: 'it-a-flight', newScheduleId: 'sched3' },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+    expect(orderState.adjustmentCny).toBe(100);
+    expect(orderState.adjustments.filter((entry) => entry.type === 'RESCHEDULE_DISCOUNT_REVOKE')).toHaveLength(1);
+  });
+});
+
+describe('OrderService.createOrder · settlement discount guardrails', () => {
+  const bundleBody = {
+    contactName: '联系人',
+    contactPhone: '13800000000',
+    items: [
+      {
+        kind: 'FLIGHT' as const,
+        description: '去程',
+        quantity: 1,
+        flightScheduleId: 'sched-a',
+        flightCabin: 'ECONOMY' as const,
+        bundleId: 'bundle-a',
+      },
+      {
+        kind: 'BUNDLE' as const,
+        description: '套餐 A',
+        quantity: 1,
+        bundleId: 'bundle-a',
+        unitPrice: 0,
+        adultCount: 1,
+        childCount: 0,
+        infantCount: 0,
+        metadata: { goDate: '2026-09-01' },
+      },
+    ],
+    passengers: [
+      { fullName: '张三', documentNumber: 'E1234567', dateOfBirth: '1990-01-01', nationality: 'CN', passportExpiry: '2030-01-01' },
+    ],
+  };
+
+  function prepareCreateMocks(): void {
+    mockResolveAgentSettlementDiscount.mockReset().mockResolvedValue(null);
+    mockResolveRetailSettlementDiscount.mockReset().mockResolvedValue(null);
+    mockGetSettlementRate.mockReset().mockResolvedValue(null);
+    mockPrisma.agent.findUnique.mockReset().mockResolvedValue({ id: 'agent-a', isActive: true });
+    mockPrisma.order.findUnique.mockReset().mockResolvedValue(null);
+    mockPrisma.orderCostItem.create.mockReset().mockResolvedValue({});
+    mockPrisma.auditLog.create.mockReset().mockResolvedValue({});
+    mockPrisma.seatLock.aggregate.mockReset().mockResolvedValue({ _sum: { qty: 0 } });
+    mockPrisma.seatLock.findMany.mockReset().mockResolvedValue([]);
+    mockPrisma.seatLock.updateMany.mockReset().mockResolvedValue({ count: 0 });
+    mockPrisma.$executeRaw.mockReset().mockResolvedValue(1);
+    mockPrisma.orderItem.findMany.mockReset().mockImplementation(
+      async (args: { where?: { kind?: string }; select?: Record<string, unknown> }) =>
+        args.where?.kind === 'FLIGHT'
+          ? [{ flightScheduleId: 'sched-a', flightSchedule: { departureTime: new Date('2026-09-01T00:00:00Z') } }]
+          : args.select?.fulfillmentTasks ? [] : [],
+    );
+    mockPrisma.order.create.mockReset().mockImplementation(
+      async (args: {
+        data: {
+          orderNumber: string;
+          total: unknown;
+          paymentExpiresAt: Date | null;
+          items: { create: unknown[] };
+          passengers: { create: unknown[] };
+        };
+      }) => ({
+        id: 'order-settlement-test',
+        orderNumber: args.data.orderNumber,
+        total: args.data.total,
+        paymentExpiresAt: args.data.paymentExpiresAt,
+        items: args.data.items.create,
+        passengers: args.data.passengers.create,
+        statusEvents: [],
+      }),
+    );
+    mockPrisma.$transaction.mockImplementation(
+      async (fn: (tx: unknown) => Promise<unknown>) => fn(mockTx),
+    );
+  }
+
+  function prepareService(options: { authoritativeTotal?: number; calendarTotal?: number } = {}): OrderService {
+    const service = new OrderService();
+    const authoritativeTotal = options.authoritativeTotal ?? 500;
+    const priced = [
+      {
+        kind: 'FLIGHT' as const,
+        description: '去程',
+        quantity: 1,
+        unitPrice: authoritativeTotal / 2,
+        amount: authoritativeTotal / 2,
+        flightScheduleId: 'sched-a',
+        flightCabin: 'ECONOMY' as const,
+        bundleId: 'bundle-a',
+      },
+      {
+        kind: 'BUNDLE' as const,
+        description: '套餐 A',
+        quantity: 1,
+        unitPrice: authoritativeTotal / 2,
+        amount: authoritativeTotal / 2,
+        bundleId: 'bundle-a',
+        settlementAddOnCny: 0,
+      },
+    ];
+    const serviceAny = service as unknown as Record<string, unknown>;
+    vi.spyOn(serviceAny as never, 'assertNoDuplicatePassengersOnFlights' as never).mockResolvedValue([] as never);
+    vi.spyOn(serviceAny as never, 'applyPassportExpiryRule' as never).mockResolvedValue(undefined as never);
+    vi.spyOn(serviceAny as never, 'priceAndValidateItems' as never).mockResolvedValue(priced as never);
+    vi.spyOn(serviceAny as never, 'resolveBundleSettlementCalendarTotal' as never).mockResolvedValue({
+      totalCny: options.calendarTotal ?? 600,
+      audit: {
+        source: 'SETTLEMENT_CALENDAR',
+        departDate: '2026-09-01',
+        lines: [{
+          bundleId: 'bundle-a',
+          tier: 'CITY_3STAR',
+          nights: 3,
+          departDate: '2026-09-01',
+          pax: 1,
+          pricePerPersonCny: 600,
+          addOnCny: 0,
+          lineTotalCny: 600,
+        }],
+      },
+    } as never);
+    return service;
+  }
+
+  function createdItems(): Array<{ kind: string; amount: { toString(): string }; metadata?: Record<string, unknown> }> {
+    const call = mockPrisma.order.create.mock.calls[0][0] as {
+      data: { items: { create: Array<{ kind: string; amount: { toString(): string }; metadata?: Record<string, unknown> }> } };
+    };
+    return call.data.items.create;
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    prepareCreateMocks();
+  });
+
+  it('代理命中日历+规则 → 生成含 bundleId/ruleId 快照的立减行、结算总价扣减并写审计', async () => {
+    const service = prepareService();
+    mockResolveAgentSettlementDiscount.mockResolvedValue({
+      ruleId: 'agent-discount-a',
+      kind: 'AGENT',
+      discountPerPersonCny: 100,
+    });
+
+    await service.createOrder(bundleBody as never, { userId: 'agent-user', role: 'AGENT', agentId: 'agent-a' });
+
+    const discount = createdItems().find((item) => item.metadata?.settlementDiscount === true);
+    expect(discount).toBeDefined();
+    expect(Number(discount!.amount.toString())).toBe(-100);
+    expect(discount!.metadata).toMatchObject({ bundleId: 'bundle-a', ruleId: 'agent-discount-a' });
+    expect(Number((mockPrisma.order.create.mock.calls[0][0] as { data: { total: { toString(): string } } }).data.total.toString())).toBe(500);
+    expect(mockPrisma.auditLog.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({
+        action: 'APPLY_SETTLEMENT_TOTAL',
+        after: expect.objectContaining({
+          settlementCalendar: expect.objectContaining({
+            autoDiscount: expect.objectContaining({
+              hits: [expect.objectContaining({ ruleId: 'agent-discount-a' })],
+            }),
+          }),
+        }),
+      }),
+    }));
+  });
+
+  it.each([
+    ['批量优惠', { priceAdjustment: { amountCny: -50, reasonCode: 'DISCOUNT', stackWithSettlementCalendar: true } }],
+    ['团队议价', { flightSettlementPriceCny: 300 }],
+    ['手填结算总价', { settlementTotalCny: 500 }],
+  ])('代理手工通道（%s）存在 → 不生成自动立减行', async (_label, manual) => {
+    const service = prepareService();
+    mockResolveAgentSettlementDiscount.mockResolvedValue({ ruleId: 'should-not-hit', kind: 'AGENT', discountPerPersonCny: 100 });
+    await service.createOrder({ ...bundleBody, agentId: 'agent-a', ...manual } as never, { userId: 'admin-user', role: 'ADMIN' });
+    expect(createdItems().some((item) => item.metadata?.settlementDiscount === true)).toBe(false);
+  });
+
+  it('散客手动调价 + RETAIL 命中 → 自动立减不叠加', async () => {
+    const service = prepareService({ authoritativeTotal: 500 });
+    mockResolveRetailSettlementDiscount.mockResolvedValue({ ruleId: 'retail-1', kind: 'RETAIL', discountPerPersonCny: 100 });
+    await service.createOrder({ ...bundleBody, priceAdjustment: { amountCny: 50, reasonCode: 'MISC_FEE' } } as never, { userId: 'staff-user', role: 'ADMIN' });
+    expect(createdItems().some((item) => item.metadata?.settlementDiscount === true)).toBe(false);
+  });
+
+  it('代理自动立减后结算价 ≤0 → 拒单', async () => {
+    const service = prepareService({ calendarTotal: 100 });
+    mockResolveAgentSettlementDiscount.mockResolvedValue({ ruleId: 'agent-zero', kind: 'AGENT', discountPerPersonCny: 100 });
+    await expect(service.createOrder(bundleBody as never, { userId: 'agent-user', role: 'AGENT', agentId: 'agent-a' })).rejects.toThrow(
+      '立减规则叠加后结算价异常',
+    );
+    expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('散客 RETAIL 立减叠加后 ≤0 → 拒单', async () => {
+    const service = prepareService({ authoritativeTotal: 100 });
+    mockPrisma.bundle.findMany.mockResolvedValue([{ id: 'bundle-a', name: '套餐 A', settlementTier: 'CITY_3STAR', settlementNights: 3 }]);
+    mockResolveRetailSettlementDiscount.mockResolvedValue({ ruleId: 'retail-zero', kind: 'RETAIL', discountPerPersonCny: 100 });
+    await expect(service.createOrder(bundleBody as never, { userId: 'customer-user', role: 'CUSTOMER' })).rejects.toThrow(
+      '优惠叠加后金额异常，请联系客服',
+    );
+    expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('散客低于同业日历价 → 记录告警但允许下单', async () => {
+    const service = prepareService({ authoritativeTotal: 200 });
+    mockPrisma.bundle.findMany.mockResolvedValue([{ id: 'bundle-a', name: '套餐 A', settlementTier: 'CITY_3STAR', settlementNights: 3 }]);
+    mockResolveRetailSettlementDiscount.mockResolvedValue({ ruleId: 'retail-low', kind: 'RETAIL', discountPerPersonCny: 50 });
+    mockGetSettlementRate.mockResolvedValue({ pricePerPersonCny: 300 });
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    await expect(service.createOrder(bundleBody as never, { userId: 'customer-user', role: 'CUSTOMER' })).resolves.toBeDefined();
+    expect(warnSpy).toHaveBeenCalledWith(
+      '[orders] retail settlement discount is below settlement calendar price',
+      expect.objectContaining({ ruleIds: ['retail-low'] }),
+    );
+    warnSpy.mockRestore();
   });
 });
 

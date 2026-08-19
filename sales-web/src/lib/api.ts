@@ -741,6 +741,9 @@ export interface BundleItemData {
   unitPrice: number;
 }
 
+// 与 admin-web/src/lib/api.ts、backend/src/modules/settlement-rates/* 同步。
+export type SettlementTier = 'CITY_3STAR' | 'CITY_4STAR' | 'CITY_5STAR' | 'INTL_5STAR';
+
 export interface Bundle {
   id: string;
   name: string;
@@ -817,6 +820,9 @@ export interface Bundle {
    * 前台据此初始化出发日期输入框（仍受可售区间约束）。
    */
   defaultDepartDate?: string | null;
+  /** 公开散客立减匹配键；两者都存在时，详情页按出发日查询前台优惠。 */
+  settlementTier?: SettlementTier | null;
+  settlementNights?: number | null;
   /** 评分聚合 + 销量（后端 list/detail 现按 item 返回；全 optional 不破坏老页面） */
   rating?: ProductRating;
   reviewCount?: number;
@@ -1214,6 +1220,28 @@ export const api = {
   listTransfers: () => apiFetch<{ transfers: Transfer[] }>('/products/transfers?active=1'),
   listVisas: () => apiFetch<{ visas: Visa[] }>('/products/visas?active=1'),
   listBundles: () => apiFetch<{ bundles: Bundle[] }>('/products/bundles?active=1'),
+  /** 散客套餐详情按出发日查询的公开优惠金额；失败返回 null，由调用方按场景兜底。 */
+  getRetailSettlementDiscount: async (params: {
+    tier: SettlementTier;
+    nights: number;
+    departDate: string;
+  }): Promise<{ discountPerPersonCny: number } | null> => {
+    const qs = new URLSearchParams({
+      tier: params.tier,
+      nights: String(params.nights),
+      departDate: params.departDate,
+    });
+    try {
+      const result = await apiFetch<{ discountPerPersonCny: number }>(
+        `/settlement-discounts/retail-quote?${qs.toString()}`,
+      );
+      const value = Number(result.discountPerPersonCny);
+      return { discountPerPersonCny: Number.isInteger(value) && value > 0 ? value : 0 };
+    } catch (err) {
+      console.error('[retail-discount] 查询失败', err);
+      return null;
+    }
+  },
 
   // 酒店房量档位（公开；[checkIn, checkOut) 半开区间，只回档位不回数字）
   getHotelAvailability: (params: { hotelRoomTypeId: string; checkIn: string; checkOut: string }) => {

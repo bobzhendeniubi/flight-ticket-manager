@@ -539,6 +539,16 @@ export type SettlementPreview =
         addOnCny?: number;
         note: string;
       }>;
+      autoDiscount?: {
+        hits: Array<{
+          ruleId: string;
+          kind: 'AGENT' | 'AGENT_DEFAULT' | 'RETAIL';
+          perPersonCny: number;
+          pax: number;
+        }>;
+        pax: number;
+        totalCny: number;
+      } | null;
     }
   | { ok: false; reason: string };
 
@@ -558,6 +568,8 @@ export type QuotePassengerOption = z.infer<typeof quotePassengerOptionSchema>;
 export const quoteOrderBodySchema = z.object({
   items: z.array(orderItemInputSchema).min(1).max(20),
   passengers: z.array(quotePassengerOptionSchema).max(20).optional(),
+  // ADMIN/STAFF 试算代理订单时传入归属代理；不传则按散客口径试算。
+  agentId: z.string().min(1).optional(),
 });
 export type QuoteOrderBody = z.infer<typeof quoteOrderBodySchema>;
 
