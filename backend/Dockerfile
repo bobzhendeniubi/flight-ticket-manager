@@ -13,7 +13,7 @@ COPY tsconfig.base.json ./
 RUN cd backend && npm run build
 
 FROM node:${NODE_VERSION} AS runner
-RUN apk add --no-cache tini curl openssl &&     addgroup -g 1001 ftm && adduser -D -u 1001 -G ftm ftm
+RUN apk add --no-cache tini curl openssl font-noto-cjk &&     addgroup -g 1001 ftm && adduser -D -u 1001 -G ftm ftm
 WORKDIR /app
 ENV NODE_ENV=production
 ENV PORT=4000

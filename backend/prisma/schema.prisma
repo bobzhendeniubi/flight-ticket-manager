@@ -90,6 +90,7 @@ model User {
   auditLogs        AuditLog[]
   remindersCreated OperationalReminder[] @relation("ReminderCreator")
   remindersClaimed OperationalReminder[] @relation("ReminderClaimedBy")
+  marketingPosters MarketingPoster[]     @relation("MarketingPosterCreator")
   seatLocks        SeatLock[]
   seatWaitlists    SeatWaitlist[]
 
@@ -215,6 +216,7 @@ enum AuditTargetType {
   SETTLEMENT
   PRODUCT
   AUTH
+  MARKETING
   SYSTEM
 }
 
@@ -493,6 +495,7 @@ model Flight {
 
   @@unique([flightNumber])
   @@index([originCode, destinationCode])
+  marketingPosters MarketingPoster[]
 }
 
 // 行李规则 — 按 航班 × 舱等 配置（公斤 / 件数都可单独留空）
@@ -1851,4 +1854,65 @@ model AiOcrConfig {
   enabled     Boolean  @default(true)
   updatedById String? // 最后修改人 userId
   updatedAt   DateTime @updatedAt
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 营销中心 · 海报 —— AI 生成的航线宣传图 + 配套文案
+//
+// 核心约束：**海报上的硬数据一律来自事实快照，不让模型绘制**。
+// 生图模型只生成无字背景；航班号、时刻、航线、生效日期和行李额由服务端代码叠字，
+// 文案模板中的硬数据也由服务端替换。verifyReport 虽沿用历史字段名，但不再存视觉回读结果。
+// ─────────────────────────────────────────────────────────────────────────────
+enum MarketingPosterKind {
+  FLIGHT_ROUTE // 航线海报：航班号 + 起降时刻 + 行李额
+  CUSTOM // 自由主题（只有文案，无强校验事实）
+}
+
+enum MarketingPosterStatus {
+  GENERATING // 兼容历史默认值；新流程生成期间不落库
+  READY // 背景生成并完成服务端叠字
+  NEEDS_REVIEW // 历史状态，方案 B 不再因校验新写入
+  FAILED // 出图或服务端合成失败
+}
+
+model MarketingPoster {
+  id     String                @id @default(cuid())
+  kind   MarketingPosterKind
+  status MarketingPosterStatus @default(GENERATING)
+  title  String // 运营给的名字，列表里用来认
+
+  // 数据锚点：航线海报关联的航班（删航班不删海报，留档）
+  flightId String?
+
+  // 生成参数（便于「按同样的设定再来一张」）
+  templateKey String // 版式 key，见 marketing.templates
+  size        String @default("1080*1440")
+  imageModel  String
+  prompt      String @db.Text
+
+  // 事实快照 —— 生成当时从库里取的真值，也是服务端叠字与事后追溯依据
+  facts Json
+
+  // 成图。DashScope 返回的 OSS URL 24 小时过期，必须落库转存，不能存外链。
+  imageDataUrl String? @db.Text
+
+  // 生成尝试次数与渲染元信息
+  attempts     Int   @default(0) // 已尝试出图次数（含重试）
+  // 历史字段名为 verifyReport；兼容保留，现存版式、字体、绘制字段、截断及文案丢弃原因
+  verifyReport Json? // 新语义：渲染与文案核验元信息，不再存视觉模型回读结果
+
+  // 配套文案（同一次生成产出，运营直接复制）
+  copyMoments String? @db.Text // 朋友圈
+  copyAgent   String? @db.Text // 发代理群
+  copyXhs     String? @db.Text // 小红书笔记
+
+  createdById String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  flight    Flight? @relation(fields: [flightId], references: [id], onDelete: SetNull)
+  createdBy User    @relation("MarketingPosterCreator", fields: [createdById], references: [id])
+
+  @@index([status, createdAt])
+  @@index([flightId])
 }

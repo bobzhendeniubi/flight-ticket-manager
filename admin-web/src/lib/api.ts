@@ -283,6 +283,83 @@ export interface RangeSchedule {
   seatClasses: RangeScheduleSeat[];
 }
 
+// ── 营销中心 · AI 海报 ─────────────────────────────────────────────────────
+export type MarketingPosterKind = 'FLIGHT_ROUTE' | 'CUSTOM';
+export type MarketingPosterStatus = 'GENERATING' | 'READY' | 'NEEDS_REVIEW' | 'FAILED';
+
+export interface MarketingTemplate {
+  key: string;
+  label: string;
+  hint: string;
+  style: string;
+}
+
+export interface MarketingPosterCreator {
+  id: string;
+  displayName: string | null;
+}
+
+export interface MarketingPosterListItem {
+  id: string;
+  kind: MarketingPosterKind;
+  status: MarketingPosterStatus;
+  title: string;
+  flightId: string | null;
+  templateKey: string;
+  attempts: number;
+  createdAt: string;
+  createdBy: MarketingPosterCreator;
+}
+
+export interface MarketingPosterFact {
+  key: string;
+  label: string;
+  value: string;
+  strict: boolean;
+}
+
+export interface MarketingCopyRejection {
+  kind: 'moments' | 'agent' | 'xhs';
+  reason: string;
+}
+
+/** 服务端叠字与文案核验元信息；字段名沿用 verifyReport 以兼容历史数据。 */
+export interface MarketingRenderReport {
+  schemaVersion?: number;
+  templateKey?: string;
+  fontPath?: string | null;
+  renderedFields?: string[];
+  renderedValues?: Record<string, string>;
+  truncated?: string[];
+  copyRejected?: MarketingCopyRejection[];
+  copyError?: string;
+  error?: string;
+}
+
+export type MarketingRenderReportResult = MarketingRenderReport | null;
+
+export interface MarketingPosterDetail extends MarketingPosterListItem {
+  size: string;
+  imageModel: string;
+  prompt: string;
+  facts: MarketingPosterFact[];
+  imageDataUrl: string | null;
+  verifyReport: MarketingRenderReportResult;
+  copyMoments: string | null;
+  copyAgent: string | null;
+  copyXhs: string | null;
+}
+
+export interface CreateMarketingFlightRoutePosterInput {
+  title: string;
+  outboundScheduleId: string;
+  returnScheduleId?: string;
+  templateKey: string;
+  effectiveFrom?: string;
+  baggageText?: string;
+  extraNote?: string;
+}
+
 // ── 行李规则（航班 × 舱等）── 与 backend flights.service listBaggagePolicies 对齐
 export interface FlightBaggagePolicy {
   id: string;
@@ -2512,6 +2589,44 @@ export const api = {
     }),
   me: (token: string) =>
     apiFetch<{ user: AuthUser & { phone: string | null; createdAt: string; lastLoginAt: string | null } }>('/users/me', { token }),
+
+  // 营销中心
+  marketing: {
+    listTemplates: (token: string) =>
+      apiFetch<{ templates: MarketingTemplate[] }>('/marketing/templates', { token }),
+    listPosters: (
+      token: string,
+      params?: {
+        status?: MarketingPosterStatus;
+        flightId?: string;
+        page?: number;
+        pageSize?: number;
+      },
+    ) => {
+      const search = new URLSearchParams();
+      if (params?.status) search.set('status', params.status);
+      if (params?.flightId) search.set('flightId', params.flightId);
+      if (params?.page !== undefined) search.set('page', String(params.page));
+      if (params?.pageSize !== undefined) search.set('pageSize', String(params.pageSize));
+      const query = search.toString();
+      return apiFetch<{
+        items: MarketingPosterListItem[];
+        total: number;
+        page: number;
+        pageSize: number;
+      }>(`/marketing/posters${query ? `?${query}` : ''}`, { token });
+    },
+    getPoster: (token: string, id: string) =>
+      apiFetch<MarketingPosterDetail>(`/marketing/posters/${id}`, { token }),
+    createFlightRoute: (token: string, body: CreateMarketingFlightRoutePosterInput) =>
+      apiFetch<MarketingPosterDetail>('/marketing/posters/flight-route', {
+        method: 'POST',
+        token,
+        body,
+      }),
+    deletePoster: (token: string, id: string) =>
+      apiFetch<{ ok: true }>(`/marketing/posters/${id}`, { method: 'DELETE', token }),
+  },
 
   // Flights
   listAllFlights: (token: string) =>

@@ -27,6 +27,7 @@ const NAV: Array<{
   { to: '/visa-desk',       label: '签证台',      roles: ['ADMIN', 'STAFF'],          section: '运营' },
   { to: '/reminders',       label: '提醒中心',    roles: ['ADMIN', 'STAFF'],          section: '运营' },
   { to: '/fulfillment-board', label: '工单看板',  roles: ['ADMIN', 'STAFF'],          section: '运营' },
+  { to: '/marketing',       label: '营销中心',    roles: ['ADMIN', 'STAFF'],          section: '运营' },
   { to: '/products',        label: '产品管理',    roles: ['ADMIN', 'STAFF'],          section: '产品' },
   { to: '/settlement-rates', label: '结算价日历',  roles: ['ADMIN', 'STAFF'],          section: '产品' },
   { to: '/settlement-discounts', label: '立减规则', roles: ['ADMIN', 'STAFF'],         section: '产品' },

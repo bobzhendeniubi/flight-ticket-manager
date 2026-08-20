@@ -38,6 +38,7 @@ import { reminderRoutes } from './modules/reminders/reminders.routes.js';
 import { financesRoutes } from './modules/finances/finances.routes.js';
 import { aiRoutes } from './modules/ai/ai.routes.js';
 import { reviewRoutes, orderReviewRoutes } from './modules/reviews/reviews.routes.js';
+import { marketingRoutes } from './modules/marketing/marketing.routes.js';
 import { ocrRoutes } from './modules/ocr/ocr.routes.js';
 import { settingsRoutes } from './modules/settings/settings.routes.js';
 import { reportRoutes } from './modules/reports/reports.routes.js';
@@ -120,6 +121,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(aiRoutes, { prefix: '/ai' });
   await app.register(reviewRoutes, { prefix: '/reviews' });
   await app.register(ocrRoutes, { prefix: '/ocr' });
+  await app.register(marketingRoutes, { prefix: '/marketing' });
   await app.register(settingsRoutes, { prefix: '/settings' });
   await app.register(reportRoutes, { prefix: '/reports' });
 

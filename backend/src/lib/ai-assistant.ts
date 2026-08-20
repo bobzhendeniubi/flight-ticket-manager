@@ -1,7 +1,8 @@
 /**
- * AI 订票助手（beta） — OpenAI Chat Completions + tool use
+ * AI 订票助手（beta） — OpenAI 兼容 Chat Completions + tool use
  *
- * 默认 gpt-5-mini（便宜 + 支持 tool use）；OPENAI_MODEL 可切换。
+ * 默认 qwen3-max（DashScope 国际站，香港可直连；OpenAI 官方对香港返 403）。
+ * OPENAI_MODEL / OPENAI_BASE_URL 可切换到任何 OpenAI 兼容端点。
  *
  * 工具：search_flights, get_flight_price, propose_order
  *

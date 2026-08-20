@@ -26,6 +26,7 @@ import { AiOcrSettingsPage } from './pages/AiOcrSettingsPage';
 import { RemindersPage } from './pages/RemindersPage';
 import { ReportsPage } from './pages/ReportsPage';
 import { FulfillmentBoardPage } from './pages/FulfillmentBoardPage';
+import { MarketingPage } from './pages/MarketingPage';
 import { useAuth } from './stores/auth';
 import { isAccessTokenFresh } from './lib/token';
 
@@ -279,6 +280,14 @@ export function App() {
           element={
             <Protected adminOnly>
               <FulfillmentBoardPage />
+            </Protected>
+          }
+        />
+        <Route
+          path="/marketing"
+          element={
+            <Protected adminOnly>
+              <MarketingPage />
             </Protected>
           }
         />

@@ -72,20 +72,27 @@ const EnvSchema = z.object({
   S3_BUCKET_UPLOADS: z.string().optional(),
 
   // ═══════════════════════════════════════════════════════════
-  // OpenAI API（AI 助手 chat）
-  // 未配时 /ai/chat 走 mock；不影响其他功能
-  // 默认模型 gpt-5-mini（便宜 + 支持 tool use）；可改 OPENAI_MODEL 切到 gpt-5 / gpt-4o / gpt-4.1-mini 等
+  // AI 对话（OpenAI 兼容协议）—— 当前指向阿里云 DashScope / Qwen
+  //
+  // ⚠️ 为什么不是 OpenAI 官方：生产服务器在香港，OpenAI 对该地区返回
+  //    403 unsupported_country_region_territory，直连不可用。DashScope
+  //    国际站香港可直连。对话助手使用 OPENAI_API_KEY；OCR 和营销海报
+  //    使用 AiOcrConfig 表中的 key，表中没有可用 key 时才读 DASHSCOPE_API_KEY。
+  //    如果将来要切回 OpenAI，必须先在支持地区架中转再改 OPENAI_BASE_URL。
+  //
+  // 变量名保留 OPENAI_* 前缀：走的就是 OpenAI 兼容协议，SDK 不变。
+  // 未配 key 时 /ai/chat 走本地启发式 mock（mocked:true）；不影响其他功能。
   // ═══════════════════════════════════════════════════════════
   OPENAI_API_KEY: z.string().optional(),
-  OPENAI_MODEL: z.string().default('gpt-5-mini'),
-  // 可指向 Azure / 代理；空字符串（docker compose ${VAR:-} 默认值）当 undefined 处理
+  OPENAI_MODEL: z.string().default('qwen3-max'),
+  // 空字符串（docker compose ${VAR:-} 默认值）当 undefined 处理后回退默认值
   OPENAI_BASE_URL: z.preprocess(
     (v) => (typeof v === 'string' && v.trim() === '' ? undefined : v),
-    z.string().url().optional(),
+    z.string().url().default('https://dashscope-intl.aliyuncs.com/compatible-mode/v1'),
   ),
 
   // ═══════════════════════════════════════════════════════════
-  // 阿里云 DashScope / Qwen-VL（护照 OCR，OpenAI 兼容端点）
+  // 阿里云 DashScope / Qwen-VL（护照 OCR 等视觉能力，OpenAI 兼容端点）
   // 未配时 /ocr/passport 返回 { configured: false }，前端自动回退浏览器 Tesseract。
   // 在 DashScope 控制台（https://dashscope.console.aliyun.com）→ API-KEY 管理 申请。
   // ═══════════════════════════════════════════════════════════
@@ -94,8 +101,11 @@ const EnvSchema = z.object({
   // 可指向其他兼容端点；空字符串（docker compose ${VAR:-} 默认值）当 undefined 处理后回退默认值
   QWEN_BASE_URL: z.preprocess(
     (v) => (typeof v === 'string' && v.trim() === '' ? undefined : v),
-    z.string().url().default('https://dashscope.aliyuncs.com/compatible-mode/v1'),
+    z.string().url().default('https://dashscope-intl.aliyuncs.com/compatible-mode/v1'),
   ),
+
+  // 营销海报中文字体。未配置时由合成层按容器/macOS 的固定候选路径探测。
+  POSTER_FONT_PATH: z.string().optional(),
 
   // ═══════════════════════════════════════════════════════════
   // 邮件（SMTP，发送电子行程单）
