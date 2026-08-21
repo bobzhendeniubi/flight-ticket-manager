@@ -350,6 +350,10 @@ export async function createFlightRoutePoster(input: CreateFlightRoutePosterInpu
       copyXhs: pipeline.copy?.xhs ?? null,
       createdById: input.createdById,
     },
+    // 必须带上 createdBy：前端拿生成结果直接插进列表渲染，列表列读的是
+    // createdBy.displayName。不 include 的话这里返回的对象与列表接口形状不一致，
+    // 生成成功后页面会当场崩在 undefined 上（海报其实已经存好了，刷新才看得到）。
+    include: { createdBy: { select: { id: true, displayName: true } } },
   });
   await prunePosterImagesBestEffort();
   return poster;
