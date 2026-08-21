@@ -1023,6 +1023,12 @@ export interface OperationalReminder {
   ruleKey?: string | null;
 }
 
+export interface RankedReminder {
+  id: string;
+  rank: number;
+  reason: string;
+}
+
 // ── 经营报表（ADMIN-only）────────────────────────────────────────────────
 export type SalesReportDim = 'kind' | 'channel' | 'agent';
 
@@ -3249,6 +3255,18 @@ export const api = {
       pagination: { page: number; pageSize: number; total: number };
     }>(`/reminders/${qs.toString() ? '?' + qs.toString() : ''}`, { token });
   },
+  rankReminders: (token: string, ids: string[]) =>
+    apiFetch<{ ranked: RankedReminder[] }>('/reminders/rank', {
+      method: 'POST',
+      token,
+      body: { ids },
+    }),
+  draftReminderMessage: (token: string, id: string, audience: 'CUSTOMER' | 'AGENT') =>
+    apiFetch<{ text: string }>(`/reminders/${id}/draft-message`, {
+      method: 'POST',
+      token,
+      body: { audience },
+    }),
   createReminder: (
     token: string,
     body: {

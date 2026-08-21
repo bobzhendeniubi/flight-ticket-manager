@@ -6,11 +6,12 @@
  * - 列表支持 状态/优先级/来源(auto|manual)/只看我认领的 筛选 + 分页
  * - 行操作：认领 / 完成 / 跳过（填原因）/ 释放
  */
-import { useEffect, useMemo, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import {
   api,
   ApiError,
   type OperationalReminder,
+  type RankedReminder,
   type ReminderPriority,
   type ReminderStatus,
 } from '../lib/api';
@@ -83,6 +84,8 @@ interface GenerateResult {
   byRule: Record<string, number>;
 }
 
+type DraftAudience = 'CUSTOMER' | 'AGENT';
+
 export function RemindersPage() {
   const tokens = useAuth((s) => s.tokens);
   const user = useAuth((s) => s.user);
@@ -104,8 +107,28 @@ export function RemindersPage() {
   const [genResult, setGenResult] = useState<GenerateResult | null>(null);
   const [genError, setGenError] = useState<string | null>(null);
 
+  const [aiRanked, setAiRanked] = useState<RankedReminder[] | null>(null);
+  const [aiSorting, setAiSorting] = useState(false);
+  const [aiError, setAiError] = useState<string | null>(null);
+
+  const [draftOpenId, setDraftOpenId] = useState<string | null>(null);
+  const [draftAudience, setDraftAudience] = useState<DraftAudience>('CUSTOMER');
+  const [draftText, setDraftText] = useState<string | null>(null);
+  const [draftLoading, setDraftLoading] = useState(false);
+  const [draftError, setDraftError] = useState<string | null>(null);
+  const [draftCopied, setDraftCopied] = useState(false);
+  const draftRequestSeq = useRef(0);
+  const rankRequestSeq = useRef(0);
+
   // 行操作进行中的提醒 id（防重复点击）
   const [busyId, setBusyId] = useState<string | null>(null);
+
+  const invalidateAiRanking = (): void => {
+    rankRequestSeq.current += 1;
+    setAiRanked(null);
+    setAiError(null);
+    setAiSorting(false);
+  };
 
   useEffect(() => {
     if (!token) return;
@@ -138,7 +161,19 @@ export function RemindersPage() {
     };
   }, [token, statusFilter, priorityFilter, sourceFilter, mineOnly, page, refreshNonce]);
 
-  const refresh = () => setRefreshNonce((n) => n + 1);
+  useEffect(() => {
+    rankRequestSeq.current += 1;
+    setAiRanked(null);
+    setAiError(null);
+    setAiSorting(false);
+    setDraftOpenId(null);
+  }, [statusFilter, priorityFilter, sourceFilter, mineOnly, page, refreshNonce, token]);
+
+  const refresh = () => {
+    invalidateAiRanking();
+    setDraftOpenId(null);
+    setRefreshNonce((n) => n + 1);
+  };
 
   // 统计卡：由当前载入数据计算
   const stats = useMemo(() => {
@@ -202,6 +237,84 @@ export function RemindersPage() {
   const onRelease = (r: OperationalReminder) =>
     runAction(r.id, () => api.releaseReminder(token, r.id));
 
+  async function onRankToggle(): Promise<void> {
+    if (!token || aiSorting || reminders.length === 0) return;
+    if (aiRanked) {
+      setAiRanked(null);
+      setAiError(null);
+      return;
+    }
+    const requestId = rankRequestSeq.current + 1;
+    rankRequestSeq.current = requestId;
+    setAiSorting(true);
+    setAiError(null);
+    try {
+      const result = await api.rankReminders(token, reminders.map((r) => r.id));
+      if (rankRequestSeq.current !== requestId) return;
+      setAiRanked(result.ranked);
+    } catch (e: unknown) {
+      if (rankRequestSeq.current !== requestId) return;
+      setAiError(e instanceof ApiError ? e.message : 'AI 排序失败');
+    } finally {
+      if (rankRequestSeq.current === requestId) setAiSorting(false);
+    }
+  }
+
+  async function loadDraft(id: string, audience: DraftAudience): Promise<void> {
+    const requestSeq = draftRequestSeq.current + 1;
+    draftRequestSeq.current = requestSeq;
+    setDraftAudience(audience);
+    setDraftLoading(true);
+    setDraftError(null);
+    setDraftText(null);
+    setDraftCopied(false);
+    try {
+      const result = await api.draftReminderMessage(token, id, audience);
+      if (draftRequestSeq.current !== requestSeq) return;
+      setDraftText(result.text);
+    } catch (e: unknown) {
+      if (draftRequestSeq.current !== requestSeq) return;
+      setDraftError(e instanceof ApiError ? e.message : '生成话术失败');
+    } finally {
+      if (draftRequestSeq.current === requestSeq) setDraftLoading(false);
+    }
+  }
+
+  function openDraft(id: string): void {
+    setDraftOpenId(id);
+    void loadDraft(id, 'CUSTOMER');
+  }
+
+  function closeDraft(): void {
+    draftRequestSeq.current += 1;
+    setDraftOpenId(null);
+    setDraftText(null);
+    setDraftError(null);
+    setDraftLoading(false);
+  }
+
+  async function copyDraft(): Promise<void> {
+    if (!draftText) return;
+    try {
+      if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(draftText);
+      } else {
+        const textarea = document.createElement('textarea');
+        textarea.value = draftText;
+        textarea.style.position = 'fixed';
+        textarea.style.opacity = '0';
+        document.body.appendChild(textarea);
+        textarea.select();
+        const copied = document.execCommand('copy');
+        document.body.removeChild(textarea);
+        if (!copied) throw new Error('copy failed');
+      }
+      setDraftCopied(true);
+    } catch {
+      alert('复制失败，请手动复制');
+    }
+  }
+
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const today = todayYmd();
 
@@ -213,6 +326,29 @@ export function RemindersPage() {
       .join(' · ');
     return `新增 ${genResult.created} 条提醒${parts ? `（${parts}）` : ''}，跳过 ${genResult.skipped} 条已存在`;
   }, [genResult]);
+
+  const displayReminders = useMemo(() => {
+    if (!aiRanked) return reminders;
+    const byId = new Map(reminders.map((reminder) => [reminder.id, reminder]));
+    const ordered: OperationalReminder[] = [];
+    const included = new Set<string>();
+    for (const item of aiRanked) {
+      const reminder = byId.get(item.id);
+      if (reminder && !included.has(reminder.id)) {
+        ordered.push(reminder);
+        included.add(reminder.id);
+      }
+    }
+    for (const reminder of reminders) {
+      if (!included.has(reminder.id)) ordered.push(reminder);
+    }
+    return ordered;
+  }, [aiRanked, reminders]);
+
+  const aiReasons = useMemo(
+    () => new Map((aiRanked ?? []).map((item) => [item.id, item.reason])),
+    [aiRanked],
+  );
 
   return (
     <div className="space-y-5">
@@ -245,6 +381,11 @@ export function RemindersPage() {
           {genError}
         </div>
       )}
+      {aiError && (
+        <div className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-2.5 text-sm text-rose-700">
+          {aiError}
+        </div>
+      )}
 
       <section className="grid grid-cols-2 gap-4 lg:grid-cols-4">
         <div className="stat-card">
@@ -274,6 +415,7 @@ export function RemindersPage() {
             className="input py-1.5"
             value={statusFilter}
             onChange={(e) => {
+              invalidateAiRanking();
               setStatusFilter(e.target.value as StatusFilter);
               setPage(1);
             }}
@@ -292,6 +434,7 @@ export function RemindersPage() {
             className="input py-1.5"
             value={priorityFilter}
             onChange={(e) => {
+              invalidateAiRanking();
               setPriorityFilter(e.target.value as PriorityFilter);
               setPage(1);
             }}
@@ -310,6 +453,7 @@ export function RemindersPage() {
             className="input py-1.5"
             value={sourceFilter}
             onChange={(e) => {
+              invalidateAiRanking();
               setSourceFilter(e.target.value as SourceFilter);
               setPage(1);
             }}
@@ -324,12 +468,21 @@ export function RemindersPage() {
             type="checkbox"
             checked={mineOnly}
             onChange={(e) => {
+              invalidateAiRanking();
               setMineOnly(e.target.checked);
               setPage(1);
             }}
           />
           只看我认领的
         </label>
+        <button
+          type="button"
+          className="btn-secondary px-3 py-1.5 text-sm"
+          onClick={() => void onRankToggle()}
+          disabled={loading || aiSorting || reminders.length === 0}
+        >
+          {aiRanked ? '恢复默认排序' : aiSorting ? '智能排序中…' : '🤖 智能排序'}
+        </button>
       </section>
 
       <section className="card overflow-x-auto p-0">
@@ -370,81 +523,148 @@ export function RemindersPage() {
             )}
             {!loading &&
               !error &&
-              reminders.map((r) => {
+              displayReminders.map((r) => {
                 const isMine = r.claimedBy?.id === user?.id;
                 const isOpenLike = r.status === 'OPEN' || r.status === 'IN_PROGRESS';
                 const overdue = isOpenLike && r.dueAt !== null && ymd(r.dueAt) < today;
                 const rowBusy = busyId === r.id;
                 return (
-                  <tr key={r.id}>
-                    <td>
-                      <span className={PRIORITY_BADGE[r.priority]}>{PRIORITY_LABEL[r.priority]}</span>
-                    </td>
-                    <td className="max-w-[240px]">
-                      <div className="flex items-center gap-1.5">
-                        <span className="truncate font-medium text-ink" title={r.title}>
-                          {r.title}
+                  <Fragment key={r.id}>
+                    <tr>
+                      <td>
+                        <span className={PRIORITY_BADGE[r.priority]}>{PRIORITY_LABEL[r.priority]}</span>
+                      </td>
+                      <td className="max-w-[240px]">
+                        <div className="flex items-center gap-1.5">
+                          <span className="truncate font-medium text-ink" title={r.title}>
+                            {r.title}
+                          </span>
+                          {r.ruleKey && <span className="badge-neutral shrink-0">自动</span>}
+                        </div>
+                        {aiReasons.get(r.id) && (
+                          <div className="mt-1 text-xs text-ink-muted">AI：{aiReasons.get(r.id)}</div>
+                        )}
+                      </td>
+                      <td className="nums">{r.order?.orderNumber ?? '—'}</td>
+                      <td className="max-w-[280px]">
+                        <span className="block truncate" title={r.body ?? undefined}>
+                          {r.body ?? '—'}
                         </span>
-                        {r.ruleKey && <span className="badge-neutral shrink-0">自动</span>}
-                      </div>
-                    </td>
-                    <td className="nums">{r.order?.orderNumber ?? '—'}</td>
-                    <td className="max-w-[280px]">
-                      <span className="block truncate" title={r.body ?? undefined}>
-                        {r.body ?? '—'}
-                      </span>
-                    </td>
-                    <td className={`nums ${overdue ? 'font-semibold text-rose-600' : ''}`}>
-                      {r.dueAt ? ymd(r.dueAt) : '—'}
-                      {overdue && <span className="ml-1 text-xs">逾期</span>}
-                    </td>
-                    <td>{personLabel(r.claimedBy)}</td>
-                    <td>
-                      <span className={STATUS_BADGE[r.status]}>{STATUS_LABEL[r.status]}</span>
-                    </td>
-                    <td>
-                      <div className="flex justify-end gap-1.5">
-                        {isOpenLike && !r.claimedBy && (
+                      </td>
+                      <td className={`nums ${overdue ? 'font-semibold text-rose-600' : ''}`}>
+                        {r.dueAt ? ymd(r.dueAt) : '—'}
+                        {overdue && <span className="ml-1 text-xs">逾期</span>}
+                      </td>
+                      <td>{personLabel(r.claimedBy)}</td>
+                      <td>
+                        <span className={STATUS_BADGE[r.status]}>{STATUS_LABEL[r.status]}</span>
+                      </td>
+                      <td>
+                        <div className="flex flex-wrap justify-end gap-1.5">
                           <button
                             type="button"
                             className="btn-secondary px-2.5 py-1 text-xs"
                             disabled={rowBusy}
-                            onClick={() => void onClaim(r)}
+                            onClick={() => openDraft(r.id)}
                           >
-                            认领
+                            生成话术
                           </button>
-                        )}
-                        {isOpenLike && isMine && (
-                          <>
-                            <button
-                              type="button"
-                              className="btn-primary px-2.5 py-1 text-xs"
-                              disabled={rowBusy}
-                              onClick={() => void onDone(r)}
-                            >
-                              完成
-                            </button>
+                          {isOpenLike && !r.claimedBy && (
                             <button
                               type="button"
                               className="btn-secondary px-2.5 py-1 text-xs"
                               disabled={rowBusy}
-                              onClick={() => onSkip(r)}
+                              onClick={() => void onClaim(r)}
                             >
-                              跳过
+                              认领
                             </button>
-                            <button
-                              type="button"
-                              className="btn-ghost px-2.5 py-1 text-xs"
-                              disabled={rowBusy}
-                              onClick={() => void onRelease(r)}
-                            >
-                              释放
-                            </button>
-                          </>
-                        )}
-                      </div>
-                    </td>
-                  </tr>
+                          )}
+                          {isOpenLike && isMine && (
+                            <>
+                              <button
+                                type="button"
+                                className="btn-primary px-2.5 py-1 text-xs"
+                                disabled={rowBusy}
+                                onClick={() => void onDone(r)}
+                              >
+                                完成
+                              </button>
+                              <button
+                                type="button"
+                                className="btn-secondary px-2.5 py-1 text-xs"
+                                disabled={rowBusy}
+                                onClick={() => onSkip(r)}
+                              >
+                                跳过
+                              </button>
+                              <button
+                                type="button"
+                                className="btn-ghost px-2.5 py-1 text-xs"
+                                disabled={rowBusy}
+                                onClick={() => void onRelease(r)}
+                              >
+                                释放
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                    {draftOpenId === r.id && (
+                      <tr>
+                        <td colSpan={8}>
+                          <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
+                            <div className="mb-2 flex items-center justify-between gap-3">
+                              <span className="text-sm font-medium text-ink">生成话术</span>
+                              <button
+                                type="button"
+                                className="text-xs text-ink-soft hover:text-ink"
+                                onClick={closeDraft}
+                              >
+                                关闭
+                              </button>
+                            </div>
+                            <div className="mb-3 flex gap-2">
+                              <button
+                                type="button"
+                                className={`${draftAudience === 'CUSTOMER' ? 'btn-primary' : 'btn-secondary'} px-2.5 py-1 text-xs`}
+                                disabled={draftLoading}
+                                onClick={() => void loadDraft(r.id, 'CUSTOMER')}
+                              >
+                                发客户
+                              </button>
+                              <button
+                                type="button"
+                                className={`${draftAudience === 'AGENT' ? 'btn-primary' : 'btn-secondary'} px-2.5 py-1 text-xs`}
+                                disabled={draftLoading}
+                                onClick={() => void loadDraft(r.id, 'AGENT')}
+                              >
+                                发代理
+                              </button>
+                            </div>
+                            {draftLoading && <div className="text-sm text-ink-muted">生成中…</div>}
+                            {draftError && <div className="text-sm text-rose-700">{draftError}</div>}
+                            {draftText && !draftLoading && (
+                              <div className="flex flex-col gap-2 sm:flex-row sm:items-start">
+                                <textarea
+                                  className="input min-h-[96px] flex-1 resize-y text-sm"
+                                  value={draftText}
+                                  readOnly
+                                />
+                                <button
+                                  type="button"
+                                  className="btn-secondary shrink-0 px-3 py-1.5 text-xs"
+                                  onClick={() => void copyDraft()}
+                                >
+                                  {draftCopied ? '已复制 ✓' : '复制'}
+                                </button>
+                              </div>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
                 );
               })}
           </tbody>
@@ -460,7 +680,10 @@ export function RemindersPage() {
             type="button"
             className="btn-secondary px-3 py-1.5 text-xs"
             disabled={page <= 1 || loading}
-            onClick={() => setPage((p) => Math.max(1, p - 1))}
+            onClick={() => {
+              invalidateAiRanking();
+              setPage((p) => Math.max(1, p - 1));
+            }}
           >
             上一页
           </button>
@@ -468,7 +691,10 @@ export function RemindersPage() {
             type="button"
             className="btn-secondary px-3 py-1.5 text-xs"
             disabled={page >= totalPages || loading}
-            onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+            onClick={() => {
+              invalidateAiRanking();
+              setPage((p) => Math.min(totalPages, p + 1));
+            }}
           >
             下一页
           </button>

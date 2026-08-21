@@ -20,16 +20,89 @@ import { prisma } from '../../db/prisma.js';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
 import {
   createReminderSchema,
+  draftMessageSchema,
   listRemindersQuerySchema,
+  rankRemindersSchema,
   resolveReminderSchema,
   updateReminderSchema,
 } from './reminders.schemas.js';
 import { generateRuleReminders } from './reminders.rules.js';
+import {
+  buildDraftMessages,
+  buildDraftHardFacts,
+  buildRankMessages,
+  callQwenText,
+  configuredError,
+  parseJsonContent,
+  parseRankedResponse,
+  renderDraftMessageTemplate,
+  resolveQwenConfig,
+  validateRankedReminders,
+} from './reminders.ai.js';
+import { NotFoundError, AppError } from '../../lib/errors.js';
+
+const REMINDER_AI_RATE_LIMIT = { max: 10, timeWindow: '1 minute' } as const;
+
+const reminderAiSelect = {
+  id: true,
+  title: true,
+  body: true,
+  dueAt: true,
+  priority: true,
+  status: true,
+  order: {
+    select: {
+      id: true,
+      orderNumber: true,
+      contactName: true,
+      total: true,
+      paidAmount: true,
+      prepaymentOffset: true,
+      adjustmentCny: true,
+      _count: { select: { passengers: true } },
+      items: {
+        select: {
+          kind: true,
+          description: true,
+          quantity: true,
+          amount: true,
+          hotelCheckIn: true,
+          hotelCheckOut: true,
+          flightSchedule: {
+            select: {
+              departureTime: true,
+              departureTz: true,
+              flight: { select: { flightNumber: true, originCode: true, destinationCode: true } },
+            },
+          },
+        },
+      },
+    },
+  },
+} as const;
 
 export const reminderRoutes: FastifyPluginAsync = async (app) => {
   const requireOps = {
     preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)],
   };
+  const aiRequireOps = {
+    ...requireOps,
+    config: { rateLimit: REMINDER_AI_RATE_LIMIT },
+  };
+
+  app.post('/rank', aiRequireOps, async (req) => {
+    const body = rankRemindersSchema.parse(req.body);
+    const reminders = await prisma.operationalReminder.findMany({
+      where: { id: { in: body.ids } },
+      select: reminderAiSelect,
+    });
+    const config = await resolveQwenConfig();
+    if (!config) throw configuredError();
+
+    const content = await callQwenText(buildRankMessages(reminders), config);
+    const parsed = parseRankedResponse(parseJsonContent(content));
+    return { ranked: validateRankedReminders(body.ids, parsed) };
+  });
 
   app.get('/', requireOps, async (req) => {
     const q = listRemindersQuerySchema.parse(req.query);
@@ -104,6 +177,38 @@ export const reminderRoutes: FastifyPluginAsync = async (app) => {
       after: { created: result.created, skipped: result.skipped, byRule: result.byRule },
     });
     return result;
+  });
+
+  app.post('/:id/draft-message', aiRequireOps, async (req) => {
+    const { id } = req.params as { id: string };
+    const body = draftMessageSchema.parse(req.body);
+    const reminder = await prisma.operationalReminder.findUnique({
+      where: { id },
+      select: reminderAiSelect,
+    });
+    if (!reminder) throw new NotFoundError('提醒不存在');
+
+    const config = await resolveQwenConfig();
+    if (!config) throw configuredError();
+
+    const facts = buildDraftHardFacts(reminder);
+    const messages = buildDraftMessages(reminder, body.audience);
+    let lastValidationError: AppError | null = null;
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      const content = await callQwenText(messages, config);
+      try {
+        return { text: renderDraftMessageTemplate(content, facts) };
+      } catch (error: unknown) {
+        if (!(error instanceof AppError) || error.code !== 'AI_UNTRUSTED_TEMPLATE') {
+          throw error;
+        }
+        lastValidationError = error;
+      }
+    }
+    throw new AppError(
+      `AI 话术模板两次均未通过安全校验：${lastValidationError?.message ?? '请稍后重试'}`,
+      { statusCode: 502, code: 'AI_UNTRUSTED_TEMPLATE' },
+    );
   });
 
   app.patch('/:id', requireOps, async (req, reply) => {

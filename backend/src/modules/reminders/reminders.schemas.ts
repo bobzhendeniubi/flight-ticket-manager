@@ -23,6 +23,17 @@ export const resolveReminderSchema = z.object({
   resolvedNote: z.string().max(500).optional(),
 });
 
+export const rankRemindersSchema = z.object({
+  ids: z
+    .array(z.string().min(1))
+    .min(1, '至少选择一条提醒')
+    .max(60, '一次最多智能排序 60 条提醒，请先收窄筛选条件'),
+});
+
+export const draftMessageSchema = z.object({
+  audience: z.enum(['CUSTOMER', 'AGENT']),
+});
+
 export const listRemindersQuerySchema = z.object({
   status: z.nativeEnum(ReminderStatus).optional(),
   priority: z.nativeEnum(ReminderPriority).optional(),
@@ -37,4 +48,6 @@ export const listRemindersQuerySchema = z.object({
 export type CreateReminderInput = z.infer<typeof createReminderSchema>;
 export type UpdateReminderInput = z.infer<typeof updateReminderSchema>;
 export type ResolveReminderInput = z.infer<typeof resolveReminderSchema>;
+export type RankRemindersInput = z.infer<typeof rankRemindersSchema>;
+export type DraftMessageInput = z.infer<typeof draftMessageSchema>;
 export type ListRemindersQuery = z.infer<typeof listRemindersQuerySchema>;
