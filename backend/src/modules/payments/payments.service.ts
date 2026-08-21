@@ -24,7 +24,12 @@ import {
 import { getPaymentAdapter } from './payment-adapters.js';
 import { OrderService } from '../orders/orders.service.js';
 import { getDescendantAgentIds } from '../../lib/agent-tree.js';
-import { assertOrderAcceptsFunds } from '../../lib/funds-guard.js';
+import {
+  assertOrderAcceptsFunds,
+  assertOrderAllowsFundsReversal,
+  sumCompletedRefundsWithinTx,
+} from '../../lib/funds-guard.js';
+import { writeAudit } from '../../lib/audit.js';
 
 export interface PaymentRequester {
   userId: string;
@@ -48,6 +53,13 @@ const MAX_BATCH_ITEMS = 100;
 const OVERPAY_EPSILON_CNY = 0.01;
 /** 同额防呆时间窗（毫秒）：同一订单近 10 分钟内的等额手工收款视为疑似重复录入。 */
 const DUPLICATE_AMOUNT_WINDOW_MS = 10 * 60 * 1000;
+/** 认款生成的 Payment 在旧数据中只能靠此备注前缀识别来源。 */
+const RECONCILE_NOTE_PREFIX = '对账认领 ';
+
+/** 金额保留 2 位小数（CNY，避免浮点累计误差）。 */
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
+}
 
 /**
  * 超收硬闸判定（纯函数）：本次到账是否会使订单「累计已付净额 + 预存抵扣」超过应收。
@@ -562,6 +574,201 @@ export class PaymentsService {
   }
 
   /**
+   * 冲销一笔纯手工确认收款（录入错误/重复录入）。
+   *
+   * 这是人工确认收款的逆操作：只在收款复核锁未开启、且订单不在退款义务窗口时，
+   * 将 Payment 以 CAS 方式标记 REFUNDED，并从订单 paidAmount 减回。对账认款必须走
+   * receipts.reverseAllocation，否则不会同步回补 Receipt/ReceiptAllocation。
+   * 订单状态、佣金和履约任务不回退。
+   */
+  async reverseManualPayment(
+    paymentId: string,
+    input: { reason: string },
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
+    ok: true;
+    paymentId: string;
+    reversedAmount: number;
+    order: {
+      orderId: string;
+      orderNumber: string;
+      paidAmount: number;
+      balanceDue: number;
+      status: OrderStatus;
+      stillFullyPaid: boolean;
+    };
+    warning: string | null;
+  }> {
+    const result = await prisma.$transaction(async (tx) => {
+      const payment = await tx.payment.findUnique({ where: { id: paymentId } });
+      if (!payment) throw new NotFoundError('收款记录不存在');
+
+      // 认款生成的收款同样带 manual=true；必须额外排除 reconciliation，避免挂账池对不平。
+      const payload =
+        payment.gatewayPayload &&
+        typeof payment.gatewayPayload === 'object' &&
+        !Array.isArray(payment.gatewayPayload)
+          ? (payment.gatewayPayload as Record<string, unknown>)
+          : null;
+      const isManual = payload?.manual === true;
+      const isReconciliation =
+        (payload !== null &&
+          [
+            'source',
+            'receiptNo',
+            'externalTxnId',
+            'allocationId',
+            'receiptAllocationId',
+          ].some((field) => Object.prototype.hasOwnProperty.call(payload, field))) ||
+        String(payload?.note).trim().startsWith(RECONCILE_NOTE_PREFIX);
+      if (!isManual) {
+        throw new BadRequestError('该笔收款不是人工确认收款（可能来自线上支付网关），不能在此撤销。');
+      }
+      if (isReconciliation) {
+        throw new BadRequestError(
+          '该笔收款来自收款对账台的认款，请到收款对账台撤销该笔认款——那条路径会同时把钱退回挂账池。',
+        );
+      }
+      if (payment.status !== PaymentStatus.SUCCEEDED) {
+        throw new ConflictError(
+          '该笔收款当前不是已入账状态（可能已被撤销），无法撤销。请刷新后确认。',
+        );
+      }
+
+      // 订单行锁 + 事务内读最新 paidAmount，与 confirmManualPayment / reverseAllocation 一致。
+      const orderRows = await tx.$queryRaw<
+        Array<{
+          id: string;
+          orderNumber: string;
+          total: Prisma.Decimal;
+          adjustmentCny: number;
+          paidAmount: Prisma.Decimal;
+          prepaymentOffset: Prisma.Decimal;
+          status: OrderStatus;
+          deletedAt: Date | null;
+          paymentsLocked: boolean;
+        }>
+      >`SELECT id, "orderNumber", total, "adjustmentCny", "paidAmount", "prepaymentOffset", status, "deletedAt", "paymentsLocked" FROM "Order" WHERE id = ${payment.orderId} FOR UPDATE`;
+      const order = orderRows[0];
+      if (!order) throw new NotFoundError('该收款对应的订单不存在');
+      assertOrderAllowsFundsReversal(order, '撤销收款');
+      if (order.paymentsLocked) {
+        throw new ConflictError(
+          `订单 ${order.orderNumber} 收款已锁定（财务复核完成），请先在订单收款区解锁再撤销该笔收款`,
+        );
+      }
+
+      const amount = round2(Number(payment.amount));
+      const paid = Number(order.paidAmount);
+      const newPaid = round2(paid - amount);
+      if (newPaid < -0.001) {
+        throw new BadRequestError(
+          `订单 ${order.orderNumber} 当前已付 ¥${paid.toFixed(2)}，不足以撤销本笔收款 ¥${amount.toFixed(2)}（撤销后会变负），已拒绝。`,
+        );
+      }
+
+      const refundedTotal = await sumCompletedRefundsWithinTx(tx, order.id);
+      if (refundedTotal > 0 && newPaid + 0.001 < refundedTotal) {
+        throw new BadRequestError(
+          `订单 ${order.orderNumber} 已完成退款 ¥${refundedTotal.toFixed(2)}，撤销本笔收款后已付将降到 ¥${Math.max(0, newPaid).toFixed(2)}，低于已退金额（账目倒挂），已拒绝。请先处理退款再撤销收款。`,
+        );
+      }
+
+      const commissionAgg = await tx.commissionRecord.aggregate({
+        where: { orderId: order.id },
+        _sum: { amount: true },
+      });
+      const commissionNet = round2(Number(commissionAgg._sum.amount ?? 0));
+      if (commissionNet > 0.001) {
+        throw new BadRequestError(
+          `订单 ${order.orderNumber} 已计提代理佣金 ¥${commissionNet.toFixed(2)}（尚未冲销），` +
+            `冲销收款会让佣金失去依据。请联系财务按退款流程处理。`,
+        );
+      }
+
+      const basePayload = payload ?? {};
+      const cas = await tx.payment.updateMany({
+        where: { id: paymentId, status: PaymentStatus.SUCCEEDED },
+        data: {
+          status: PaymentStatus.REFUNDED,
+          gatewayPayload: {
+            ...basePayload,
+            reversed: true,
+            reversedAt: new Date().toISOString(),
+            reversedBy: actor.userId,
+            reversedReason: input.reason,
+          } as Prisma.InputJsonValue,
+        },
+      });
+      if (cas.count !== 1) {
+        throw new ConflictError('该笔收款已被撤销或状态已变更，请刷新后重试');
+      }
+
+      await tx.order.update({
+        where: { id: order.id },
+        data: { paidAmount: new Prisma.Decimal(Math.max(0, newPaid)) },
+      });
+
+      const effectivePayable = round2(Number(order.total) + order.adjustmentCny);
+      const prepaymentOffset = Number(order.prepaymentOffset);
+      const wasFullyPaid = paid + prepaymentOffset + 0.001 >= effectivePayable;
+      const stillFullyPaid = newPaid + prepaymentOffset + 0.001 >= effectivePayable;
+      const balanceDue = round2(effectivePayable - newPaid - prepaymentOffset);
+
+      return {
+        paymentId,
+        orderId: order.id,
+        orderNumber: order.orderNumber,
+        orderStatus: order.status,
+        paidAmountBefore: paid,
+        reversedAmount: amount,
+        orderPaidAmount: Math.max(0, newPaid),
+        orderBalanceDue: balanceDue,
+        wasFullyPaid,
+        stillFullyPaid,
+      };
+    });
+
+    void writeAudit({
+      actor: { userId: actor.userId, role: actor.role },
+      action: 'REVERSE_MANUAL_PAYMENT',
+      targetType: 'ORDER',
+      targetId: result.orderId,
+      targetLabel: result.orderNumber,
+      before: { paidAmount: result.paidAmountBefore },
+      after: {
+        paymentId: result.paymentId,
+        reversedAmount: result.reversedAmount,
+        reason: input.reason,
+        orderPaidAmount: result.orderPaidAmount,
+        orderBalanceDue: result.orderBalanceDue,
+        orderStatus: result.orderStatus,
+        wasFullyPaid: result.wasFullyPaid,
+        stillFullyPaid: result.stillFullyPaid,
+      },
+      severity: 'CRITICAL',
+    });
+
+    return {
+      ok: true as const,
+      paymentId: result.paymentId,
+      reversedAmount: result.reversedAmount,
+      order: {
+        orderId: result.orderId,
+        orderNumber: result.orderNumber,
+        paidAmount: result.orderPaidAmount,
+        balanceDue: result.orderBalanceDue,
+        status: result.orderStatus,
+        stillFullyPaid: result.stillFullyPaid,
+      },
+      warning:
+        result.wasFullyPaid && !result.stillFullyPaid
+          ? `订单 ${result.orderNumber} 撤销后重新产生尾款 ¥${result.orderBalanceDue.toFixed(2)}，订单状态仍为原状态（佣金与履约任务不回退），请据实跟进收款。`
+          : null,
+    };
+  }
+
+  /**
    * 在调用方事务内给订单入账 —— confirmManualPayment 入账内核的「事务内」变体。
    *
    * 收款对账台「认领进账到订单」复用此函数：因为认领必须和
@@ -859,4 +1066,3 @@ function adapterSlug(method: PaymentMethod): string {
     case PaymentMethod.AGENT_PREPAYMENT: return 'prepayment';
   }
 }
-

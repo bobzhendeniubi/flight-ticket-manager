@@ -29,7 +29,7 @@ import { prisma } from '../../db/prisma.js';
 import { BadRequestError, ConflictError, NotFoundError } from '../../lib/errors.js';
 import {
   FUNDS_CREDIT_BLOCKED_STATUSES,
-  assertOrderAllowsFundsDisposal,
+  assertOrderAllowsFundsReversal,
   sumCompletedRefundsWithinTx,
 } from '../../lib/funds-guard.js';
 import { writeAudit } from '../../lib/audit.js';
@@ -604,14 +604,14 @@ export class ReceiptsService {
   /**
    * 把一笔已认领的钱从订单上撤回挂账池 —— allocate 的镜像。
    *
-   * 一个事务里：进账行锁 → 取认领明细 → 订单行锁 + 资金处置闸 → 定位当初入账生成的那笔收款
+   * 一个事务里：进账行锁 → 取认领明细 → 订单行锁 + 撤销专用资金闸 → 定位当初入账生成的那笔收款
    * → 收款 CAS 冲销（SUCCEEDED→REFUNDED，幂等）→ 订单 paidAmount 减回 → 删认领明细
    * → 进账 allocatedCny 减回 + 状态重算（OPEN / PARTIALLY_ALLOCATED）。任一步失败整体回滚。
    *
    * 拒绝（宁可拒绝，也不出脏账）：
    *   - 进账已退款（REFUNDED）：剩余部分已按退款口径处置，再塞钱回来对不上退款金额。
-   *   - 订单在资金处置闸内（死单 / 回收站 / 退款申请中）—— 与「多付转挂账池」同一道闸，
-   *     撤销认款同样是「把钱从订单上拿走」，口径必须一致。
+   *   - 订单在撤销专用资金闸内（回收站 / 已退款 / 退款申请中）；取消族放行，
+   *     因为撤销只是把钱退回挂账池，不减少公司总资金。
    *   - 订单收款已锁定（paymentsLocked）：财务复核已完成，先解锁再撤。
    *   - 找不到当初那笔收款 / 收款已不是 SUCCEEDED（已撤过）：无法对称回退 → 拒绝（重复撤销天然被此闸挡住）。
    *   - 撤销后订单已付会变负，或低于该单已完成退款额（账面倒挂）。
@@ -651,8 +651,8 @@ export class ReceiptsService {
       >`SELECT id, "orderNumber", total, "adjustmentCny", "paidAmount", "prepaymentOffset", status, "deletedAt", "paymentsLocked" FROM "Order" WHERE id = ${allocation.orderId} FOR UPDATE`;
       const order = orderRows[0];
       if (!order) throw new NotFoundError('该认款对应的订单不存在');
-      // 资金处置闸：与「多付转挂账池」同源——把钱从订单上拿走，死单/回收站/退款申请中一律不许。
-      assertOrderAllowsFundsDisposal(order, '撤销认款');
+      // 撤销专用闸：取消族放行，因为撤销只是把钱退回挂账池，不减少公司总资金。
+      assertOrderAllowsFundsReversal(order, '撤销认款');
       if (order.paymentsLocked) {
         throw new ConflictError(
           `订单 ${order.orderNumber} 收款已锁定（财务复核完成），请先在订单收款区解锁再撤销认款`,
@@ -685,6 +685,21 @@ export class ReceiptsService {
       if (refundedTotal > 0 && newPaid + 0.001 < refundedTotal) {
         throw new BadRequestError(
           `订单 ${order.orderNumber} 已完成退款 ¥${refundedTotal.toFixed(2)}，撤销本笔认款后已付将降到 ¥${Math.max(0, newPaid).toFixed(2)}，低于已退金额（账目倒挂），已拒绝。请先处理退款再撤销认款。`,
+        );
+      }
+
+      // 已计提佣金闸：认款入账会把订单推到 PAID 并计提整条代理链佣金；撤销认款只减 paidAmount、
+      // 不回退佣金，冲销后佣金会挂在一张已无实收依据的订单上照常结算。与 reverseManualPayment 同口径：
+      // 净佣金 > 0（尚未冲销）即拒绝，请走退款流程让佣金按比例冲销。
+      const commissionAgg = await tx.commissionRecord.aggregate({
+        where: { orderId: order.id },
+        _sum: { amount: true },
+      });
+      const commissionNet = round2(Number(commissionAgg._sum.amount ?? 0));
+      if (commissionNet > 0.001) {
+        throw new BadRequestError(
+          `订单 ${order.orderNumber} 已计提代理佣金 ¥${commissionNet.toFixed(2)}（尚未冲销），` +
+            `冲销认款会让佣金失去依据。请联系财务按退款流程处理。`,
         );
       }
 

@@ -797,7 +797,14 @@ export function OrdersPage() {
       // 软删不触碰库存/座位账，无需广播座位变更。
     } catch (err) {
       // 占座守卫等 4xx 的后端提示（如「请先取消订单释放座位，再删除」）直接透传。
-      alert(err instanceof ApiError ? `删除失败：${err.message}` : '删除失败');
+      if (err instanceof ApiError) {
+        const hint = err.message.includes('未退')
+          ? '\n\n若这笔钱其实并未收到（录单填错/重复录入），不必走退款：请在订单详情的收款区撤销该笔收款，已付金额归零后即可删除。'
+          : '';
+        alert(`删除失败：${err.message}${hint}`);
+      } else {
+        alert('删除失败');
+      }
     }
   };
 
@@ -2115,13 +2122,20 @@ export function OrdersPage() {
             </div>
           )}
           {bulkDeleteResult && (
-            <BulkResultPanel
-              succeeded={bulkDeleteResult.succeeded}
-              failed={bulkDeleteResult.failed}
-              failNote="失败常见原因：仍占座需先取消订单释放座位，或净收款＞0 不允许删除。"
-              failures={bulkDeleteResult.failures}
-              orders={orders}
-            />
+            <>
+              <BulkResultPanel
+                succeeded={bulkDeleteResult.succeeded}
+                failed={bulkDeleteResult.failed}
+                failNote="失败常见原因：仍占座需先取消订单释放座位，或净收款＞0 不允许删除。"
+                failures={bulkDeleteResult.failures}
+                orders={orders}
+              />
+              {bulkDeleteResult.failures.some((f) => f.error?.includes('未退')) && (
+                <p className="mt-2 text-xs text-rose-700">
+                  若这笔钱其实并未收到（录单填错/重复录入），不必走退款：请在订单详情的收款区撤销该笔收款，已付金额归零后即可删除。
+                </p>
+              )}
+            </>
           )}
 
           {bulkInvoiceResult && (
@@ -2954,6 +2968,7 @@ function OrderDrawer({
 
             {/* 收款（确认收款 / 代理余额抵扣 / 多付处理）*/}
             <ConfirmPaymentSection
+              key={o.id}
               orderId={o.id}
               total={view.totalNum + (Number(o.adjustmentCny) || 0)}
               paidAmount={Number(o.paidAmount)}
@@ -8871,26 +8886,36 @@ function ConfirmPaymentSection({
   // 尾款 = 应收 − 已付。正=欠款(少付)、0=已结清、负=多付（不再 clamp，多付要看得见）。
   const balance = Math.round((total - paid) * 100) / 100;
 
-  // 拉订单详情拿现有收款记录 + 最新已付
-  useEffect(() => {
-    if (!token) return;
-    let cancelled = false;
-    api
-      .getOrder(token, orderId)
-      .then((r) => {
-        if (cancelled) return;
-        setPayments(r.order.payments ?? []);
-        setPaymentsLocked(r.order.paymentsLocked ?? false);
-        const p = Number(r.order.paidAmount);
-        setPaid(p);
-        const due = Math.round((total - p) * 100) / 100;
-        setAmount(due > 0 ? due : null);
-      })
-      .catch(() => undefined);
-    return () => {
-      cancelled = true;
-    };
+  const paymentRefreshRef = useRef({ requestId: 0, orderId });
+  paymentRefreshRef.current.orderId = orderId;
+
+  // 拉订单详情拿现有收款记录 + 最新已付；冲销成功后复用这条刷新路径。
+  const refreshPaymentState = useCallback(async (): Promise<boolean> => {
+    if (!token) return false;
+    const requestId = ++paymentRefreshRef.current.requestId;
+    const requestedOrderId = orderId;
+    const r = await api.getOrder(token, orderId);
+    if (
+      requestId !== paymentRefreshRef.current.requestId ||
+      requestedOrderId !== paymentRefreshRef.current.orderId
+    ) {
+      return false;
+    }
+    setPayments(r.order.payments ?? []);
+    setPaymentsLocked(r.order.paymentsLocked ?? false);
+    const p = Number(r.order.paidAmount);
+    setPaid(p);
+    const due = Math.round(Number(r.order.balanceDue) * 100) / 100;
+    setAmount(due > 0 ? due : null);
+    return true;
   }, [token, orderId, total]);
+
+  useEffect(() => {
+    void refreshPaymentState().catch(() => undefined);
+    return () => {
+      paymentRefreshRef.current.requestId += 1;
+    };
+  }, [refreshPaymentState]);
 
   // 挂账池里疑似本单、还没认完的进账（OPEN + 部分认款）。只读提示，失败静默（不干扰收款主流程）。
   useEffect(() => {
@@ -8986,6 +9011,41 @@ function ConfirmPaymentSection({
         return;
       }
       setErr(e instanceof ApiError ? e.message : '确认收款失败');
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  async function reversePayment(p: OrderPayment): Promise<void> {
+    if (!token || submitting || p.status === 'REFUNDED') return;
+    if (p.reconciled === true) {
+      window.alert(
+        `这笔收款来自收款对账台的认款（流水 ${p.externalTxnId || p.receiptNo || '—'}）。请到「收款对账台」找到该笔进账，展开认领明细后撤销——那条路径会同时把钱退回挂账池。`,
+      );
+      return;
+    }
+    const reason = window.prompt(
+      `撤销这笔收款 ¥${Number(p.amount).toLocaleString()}？\n\n` +
+        '仅用于更正「其实没收到这笔钱」的错误录入（录单填错/重复录入）。\n' +
+        '撤销后该笔收款作废、订单已付金额相应减回，操作留痕可追溯。\n\n' +
+        '请填写撤销原因（必填，至少 4 个字）：',
+    );
+    if (reason === null) return;
+    const trimmedReason = reason.trim();
+    if (trimmedReason.length < 4) {
+      window.alert('请填写撤销原因（至少 4 个字）');
+      return;
+    }
+    setErr(null);
+    setSubmitting(true);
+    try {
+      const result = await api.reverseManualPayment(token, p.id, trimmedReason);
+      const refreshed = await refreshPaymentState();
+      if (!refreshed) return;
+      onChanged?.();
+      if (result.warning) window.alert(result.warning);
+    } catch (e: unknown) {
+      setErr(e instanceof ApiError ? e.message : '撤销收款失败');
     } finally {
       setSubmitting(false);
     }
@@ -9227,11 +9287,42 @@ function ConfirmPaymentSection({
                 ) : (
                   <span className="text-slate-400">手工确认</span>
                 )}
-                {p.proofUrl && (
-                  <a href={p.proofUrl} target="_blank" rel="noreferrer" className="ml-auto">
-                    <img src={p.proofUrl} alt="收款截图" className="h-8 w-8 rounded border border-slate-300 object-cover" />
-                  </a>
-                )}
+                <div className="ml-auto flex items-center gap-1 no-underline">
+                  {p.proofUrl && (
+                    <a href={p.proofUrl} target="_blank" rel="noreferrer">
+                      <img src={p.proofUrl} alt="收款截图" className="h-8 w-8 rounded border border-slate-300 object-cover" />
+                    </a>
+                  )}
+                  {p.status === 'SUCCEEDED' && (
+                    paymentsLocked ? (
+                      <button
+                        type="button"
+                        className="btn-secondary px-1.5 py-0.5 text-[11px] disabled:cursor-not-allowed disabled:opacity-50"
+                        disabled
+                        title="收款已锁定（财务复核完成），请先解锁"
+                      >
+                        撤销
+                      </button>
+                    ) : p.reconciled === true ? (
+                      <button
+                        type="button"
+                        className="btn-secondary px-1.5 py-0.5 text-[11px]"
+                        onClick={() => void reversePayment(p)}
+                      >
+                        去对账台撤销
+                      </button>
+                    ) : (
+                      <button
+                        type="button"
+                        className="rounded border border-rose-300 bg-rose-50 px-1.5 py-0.5 text-[11px] text-rose-700 hover:bg-rose-100 disabled:cursor-not-allowed disabled:opacity-50"
+                        onClick={() => void reversePayment(p)}
+                        disabled={submitting}
+                      >
+                        撤销
+                      </button>
+                    )
+                  )}
+                </div>
               </li>
             ))}
           </ul>

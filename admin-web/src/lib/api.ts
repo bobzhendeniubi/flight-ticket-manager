@@ -1239,6 +1239,7 @@ export interface OrderSummary {
   subtotal: string;
   total: string;
   paidAmount: string;
+  balanceDue: string;
   /** 售后费用合计（改期费 + 换人费）；尾款 = total + adjustmentCny − paidAmount。后端未启用时缺省 */
   adjustmentCny?: number;
   /** 售后费用明细（改期费 / 换人费）；列表可能为空，详情带出 */
@@ -2532,6 +2533,22 @@ export interface ReverseAllocationResult {
   warning: string | null;
 }
 
+/** POST /payments/:paymentId/reverse 返回（冲销手工确认收款） */
+export interface ReverseManualPaymentResult {
+  ok: true;
+  paymentId: string;
+  reversedAmount: number;
+  order: {
+    orderId: string;
+    orderNumber: string;
+    paidAmount: number;
+    balanceDue: number;
+    status: OrderStatus;
+    stillFullyPaid: boolean;
+  };
+  warning: string | null;
+}
+
 /** POST /receipts/allocate-batch 单组入参（金额一对一吻合的建议组） */
 export interface AllocateBatchItem {
   receiptId: string;
@@ -3026,6 +3043,14 @@ export const api = {
       orderNumber: string;
       status: OrderStatus;
     }>('/payments/manual-confirm', { method: 'POST', token, body }),
+
+  // 冲销手工确认收款（仅更正录入错误；对账认款必须走收款对账台撤销）ADMIN/STAFF
+  reverseManualPayment: (token: string, paymentId: string, reason: string) =>
+    apiFetch<ReverseManualPaymentResult>(`/payments/${paymentId}/reverse`, {
+      method: 'POST',
+      token,
+      body: { reason },
+    }),
 
   // 批量到账（选多笔订单 → 逐单录入到账金额 + 共享水单）ADMIN/STAFF。
   // 逐单入账：单条失败不影响其它（每条返回 ok / error + 最新 paidAmount/status）。

@@ -95,6 +95,24 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
     return result;
   });
 
+  // ── 撤销手工确认收款（更正录入错误）ADMIN/STAFF ──
+  // POST /payments/:paymentId/reverse
+  const reverseManualPaymentSchema = z.object({
+    reason: z.string().trim().min(4).max(200),
+  });
+  app.post('/:paymentId/reverse', { preHandler: [app.authenticate] }, async (req, reply) => {
+    if (req.user.role !== UserRole.ADMIN && req.user.role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅运营/管理员可撤销收款' });
+    }
+    const { paymentId } = req.params as { paymentId: string };
+    const body = reverseManualPaymentSchema.parse(req.body);
+    return service.reverseManualPayment(
+      paymentId,
+      { reason: body.reason },
+      { userId: req.user.sub, role: req.user.role },
+    );
+  });
+
   // ── 批量确认收款（选多个订单一次到账）ADMIN/STAFF ──
   // POST /payments/batch-confirm
   const batchConfirmSchema = z.object({

@@ -236,6 +236,45 @@ describe('ReceiptsService.reverseAllocation · 撤销认款（认领的逆操作
     expect(reAllocated.receiptStatus).toBe(ReceiptStatus.ALLOCATED);
   });
 
+  it('订单已计提代理佣金（尚未冲销）：拒绝撤销认款，钱与进账都不动', async () => {
+    const ADMIN = await createAdminActor();
+    const order = await createGuestOrder({ total: 1000, paidAmount: 0 });
+    // 直接挂一条 ACCRUED 佣金记录，模拟认款把单推到 PAID 后整条代理链已计提
+    const agentUser = await prisma.user.create({
+      data: { email: `${uniq('agent')}@test.com`, role: UserRole.AGENT },
+    });
+    const agent = await prisma.agent.create({
+      data: { userId: agentUser.id, contactName: '测试代理', contactPhone: '13900000000' },
+    });
+    await prisma.commissionRecord.create({
+      data: {
+        agentId: agent.id,
+        orderId: order.id,
+        productKind: 'FLIGHT',
+        baseAmount: new Prisma.Decimal(1000),
+        rate: new Prisma.Decimal(0.05),
+        amount: new Prisma.Decimal(50),
+      },
+    });
+    const receipt = await registerReceipt(1000, ADMIN);
+    await receiptsService.allocate(receipt.id, { orderId: order.id, amountCny: 1000 }, ADMIN);
+    const alloc = await prisma.receiptAllocation.findFirstOrThrow({
+      where: { receiptId: receipt.id },
+    });
+
+    await expect(
+      receiptsService.reverseAllocation(receipt.id, alloc.id, ADMIN),
+    ).rejects.toThrow(/已计提代理佣金/);
+
+    // 拒绝后一切不动：订单已付、进账认领、认领明细都保持撤销前状态
+    const dbOrder = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(Number(dbOrder.paidAmount)).toBe(1000);
+    const dbReceipt = await prisma.receipt.findUniqueOrThrow({ where: { id: receipt.id } });
+    expect(Number(dbReceipt.allocatedCny)).toBe(1000);
+    expect(dbReceipt.status).toBe(ReceiptStatus.ALLOCATED);
+    expect(await prisma.receiptAllocation.findUnique({ where: { id: alloc.id } })).not.toBeNull();
+  });
+
   it('两笔认领只撤一笔：进账停在 PARTIALLY_ALLOCATED，另一笔订单不受影响', async () => {
     const ADMIN = await createAdminActor();
     const orderA = await createGuestOrder({ total: 1000, paidAmount: 0 });
@@ -337,7 +376,7 @@ describe('ReceiptsService.reverseAllocation · 撤销认款（认领的逆操作
     expect(Number(dbOrder.paidAmount)).toBe(400);
   });
 
-  it('死单（已取消）：拒绝撤销——资金处置闸与「多付转挂账池」同源', async () => {
+  it('订单已取消：仍可撤销认款，钱回挂账池', async () => {
     const ADMIN = await createAdminActor();
     const order = await createGuestOrder({ total: 1000, paidAmount: 0 });
     const receipt = await registerReceipt(300, ADMIN);
@@ -350,9 +389,27 @@ describe('ReceiptsService.reverseAllocation · 撤销认款（认领的逆操作
       where: { id: order.id },
       data: { status: OrderStatus.CANCELLED },
     });
+    const result = await receiptsService.reverseAllocation(receipt.id, alloc.id, ADMIN);
+    expect(result.order.paidAmount).toBe(0);
+    expect(result.receiptStatus).toBe(ReceiptStatus.OPEN);
+  });
+
+  it('退款审批中：仍拒绝撤销认款', async () => {
+    const ADMIN = await createAdminActor();
+    const order = await createGuestOrder({ total: 1000, paidAmount: 0 });
+    const receipt = await registerReceipt(300, ADMIN);
+    await receiptsService.allocate(receipt.id, { orderId: order.id, amountCny: 300 }, ADMIN);
+    const alloc = await prisma.receiptAllocation.findFirstOrThrow({
+      where: { receiptId: receipt.id },
+    });
+
+    await prisma.order.update({
+      where: { id: order.id },
+      data: { status: OrderStatus.REFUND_REQUESTED },
+    });
     await expect(
       receiptsService.reverseAllocation(receipt.id, alloc.id, ADMIN),
-    ).rejects.toThrow(/已取消/);
+    ).rejects.toThrow(/退款申请中/);
   });
 
   it('订单已完成退款且撤销后会倒挂：拒绝（退出去的不能多过收进来的）', async () => {

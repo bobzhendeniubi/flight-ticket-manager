@@ -55,6 +55,21 @@ export const FUNDS_DISPOSE_BLOCKED_STATUSES: OrderStatus[] = [
   OrderStatus.REFUND_REQUESTED,
 ];
 
+/**
+ * 拒绝「撤销/冲销已入账收款」的订单状态。
+ *
+ * 与 FUNDS_DISPOSE_BLOCKED_STATUSES（处置闸）刻意不同：处置是把钱转走或改变应收，
+ * 撤销是把钱送回来源（挂账池 / 抹掉从未发生的入账），公司总资金不变，所以取消族一律放行。
+ * 只拦「钱真的动过」的两种：
+ *   · REFUNDED —— 退款已完成，撤销会让已付低于已退（倒挂）；且此类单净收款通常已归零、
+ *                 本就能删，不需要撤销这条路。
+ *   · REFUND_REQUESTED —— 退款审批中，应退额是按当时 paidAmount 算的快照，撤了会把退款额算错。
+ */
+export const FUNDS_REVERSAL_BLOCKED_STATUSES: OrderStatus[] = [
+  OrderStatus.REFUNDED,
+  OrderStatus.REFUND_REQUESTED,
+];
+
 const STATUS_LABEL: Record<OrderStatus, string> = {
   DRAFT: '草稿',
   PENDING_PAYMENT: '待付款',
@@ -105,6 +120,20 @@ export function assertOrderAllowsFundsDisposal(order: FundsGuardOrder, action: s
   if (FUNDS_DISPOSE_BLOCKED_STATUSES.includes(order.status)) {
     throw new BadRequestError(
       `订单 ${order.orderNumber} 当前状态为「${STATUS_LABEL[order.status]}」，不能${action}。`,
+    );
+  }
+}
+
+/** 撤销闸：订单是否允许撤销/冲销已入账的收款。 */
+export function assertOrderAllowsFundsReversal(order: FundsGuardOrder, action: string): void {
+  // 回收站单不许动钱（与处置闸一致）：已软删的单不进任何统计，动钱会让账实分叉
+  if (order.deletedAt) {
+    throw new BadRequestError(`订单 ${order.orderNumber} 已在回收站，不能${action}。请先恢复订单。`);
+  }
+  if (FUNDS_REVERSAL_BLOCKED_STATUSES.includes(order.status)) {
+    throw new BadRequestError(
+      `订单 ${order.orderNumber} 当前状态为「${STATUS_LABEL[order.status]}」，不能${action}。` +
+        `如需处理这笔钱，请走退款流程。`,
     );
   }
 }

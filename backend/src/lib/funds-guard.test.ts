@@ -4,8 +4,10 @@ import { OrderStatus } from '@prisma/client';
 import {
   assertOrderAcceptsFunds,
   assertOrderAllowsFundsDisposal,
+  assertOrderAllowsFundsReversal,
   FUNDS_CREDIT_BLOCKED_STATUSES,
   FUNDS_DISPOSE_BLOCKED_STATUSES,
+  FUNDS_REVERSAL_BLOCKED_STATUSES,
 } from './funds-guard.js';
 import { BadRequestError } from './errors.js';
 
@@ -82,5 +84,45 @@ describe('funds-guard · 处置闸 assertOrderAllowsFundsDisposal', () => {
         '测试',
       ),
     ).toThrow(BadRequestError);
+  });
+});
+
+describe('funds-guard · 撤销闸 assertOrderAllowsFundsReversal', () => {
+  it('允许取消族及正常状态撤销收款（取消族不减少公司总资金）', () => {
+    for (const s of [
+      OrderStatus.CANCELLED,
+      OrderStatus.PAYMENT_TIMEOUT,
+      OrderStatus.FAILED,
+      OrderStatus.DRAFT,
+      OrderStatus.PENDING_PAYMENT,
+      OrderStatus.PAID,
+    ]) {
+      expect(() => assertOrderAllowsFundsReversal(live(s), '撤销收款')).not.toThrow();
+    }
+  });
+
+  it('仅拒绝已退款和退款审批中的订单', () => {
+    expect(FUNDS_REVERSAL_BLOCKED_STATUSES).toEqual([
+      OrderStatus.REFUNDED,
+      OrderStatus.REFUND_REQUESTED,
+    ]);
+    for (const s of FUNDS_REVERSAL_BLOCKED_STATUSES) {
+      expect(() => assertOrderAllowsFundsReversal(live(s), '撤销收款')).toThrow(BadRequestError);
+    }
+  });
+
+  it('拒绝回收站订单', () => {
+    expect(() =>
+      assertOrderAllowsFundsReversal(
+        { orderNumber: 'T-1', status: OrderStatus.CANCELLED, deletedAt: new Date() },
+        '撤销收款',
+      ),
+    ).toThrow(BadRequestError);
+  });
+
+  it('回归：处置闸仍拒绝 CANCELLED', () => {
+    expect(() => assertOrderAllowsFundsDisposal(live(OrderStatus.CANCELLED), '处置资金')).toThrow(
+      BadRequestError,
+    );
   });
 });
