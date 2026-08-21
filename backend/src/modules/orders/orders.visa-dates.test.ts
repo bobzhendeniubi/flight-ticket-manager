@@ -2,12 +2,12 @@
  * 签证台：出签后补录 出签日/生效日/有效期（M2）· 服务级测试（vitest，vi.mock Prisma，不依赖真 DB）
  *
  * 覆盖：
- *   1. updatePassengerVisaDatesBodySchema：至少一个字段（空 body 拒绝）、YYYY-MM-DD 格式校验、null 允许清空
+ *   1. updatePassengerVisaDatesBodySchema：至少一个字段（空 body 拒绝）、日期格式校验、null 允许清空、签证号长度校验
  *   2. updatePassengerVisaDates（service）：
  *      - 非 ADMIN/STAFF → 403 ForbiddenError
  *      - 订单不存在 → 404 NotFoundError
  *      - 出行人不存在或不属于该订单 → 404 NotFoundError
- *      - happy path：写入三字段，返回 before/after（YYYY-MM-DD）
+ *      - happy path：写入签证号和三字段，返回 before/after（YYYY-MM-DD）
  *      - 清空（null）：字段写为 null
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -56,6 +56,15 @@ describe('updatePassengerVisaDatesBodySchema', () => {
   it('单个字段合法 YYYY-MM-DD → 通过', () => {
     const parsed = updatePassengerVisaDatesBodySchema.parse({ visaIssueDate: '2026-07-01' });
     expect(parsed).toEqual({ visaIssueDate: '2026-07-01' });
+  });
+
+  it('签证号合法 → 通过并保留原文', () => {
+    const parsed = updatePassengerVisaDatesBodySchema.parse({ visaNumber: 'VISA-2026-001' });
+    expect(parsed).toEqual({ visaNumber: 'VISA-2026-001' });
+  });
+
+  it('签证号超过 40 个字符 → 拒绝', () => {
+    expect(() => updatePassengerVisaDatesBodySchema.parse({ visaNumber: 'X'.repeat(41) })).toThrow();
   });
 
   it('null 表示清空 → 通过', () => {
@@ -124,11 +133,12 @@ describe('updatePassengerVisaDates', () => {
     ).rejects.toBeInstanceOf(NotFoundError);
   });
 
-  it('happy path：写入三字段（Date 对象），before/after 以 YYYY-MM-DD 返回', async () => {
+  it('happy path：写入签证号和三字段（Date 对象），before/after 以规范值返回', async () => {
     mockPrisma.order.findUnique.mockResolvedValue(orderRow);
     mockPrisma.passenger.findUnique.mockResolvedValue({
       id: 'p1',
       orderId: 'o1',
+      visaNumber: null,
       visaIssueDate: null,
       visaEffectiveDate: null,
       visaExpiry: null,
@@ -136,6 +146,7 @@ describe('updatePassengerVisaDates', () => {
     mockPrisma.passenger.update.mockResolvedValue({
       id: 'p1',
       fullName: 'ZHANG SAN',
+      visaNumber: 'VISA-2026-001',
       visaIssueDate: new Date('2026-07-01'),
       visaEffectiveDate: new Date('2026-07-05'),
       visaExpiry: new Date('2026-10-01'),
@@ -144,7 +155,12 @@ describe('updatePassengerVisaDates', () => {
     const result = await service.updatePassengerVisaDates(
       'o1',
       'p1',
-      { visaIssueDate: '2026-07-01', visaEffectiveDate: '2026-07-05', visaExpiry: '2026-10-01' },
+      {
+        visaNumber: 'VISA-2026-001',
+        visaIssueDate: '2026-07-01',
+        visaEffectiveDate: '2026-07-05',
+        visaExpiry: '2026-10-01',
+      },
       ADMIN,
     );
 
@@ -153,10 +169,17 @@ describe('updatePassengerVisaDates', () => {
     expect(updateArg.data.visaIssueDate).toBeInstanceOf(Date);
     expect(updateArg.data.visaEffectiveDate).toBeInstanceOf(Date);
     expect(updateArg.data.visaExpiry).toBeInstanceOf(Date);
+    expect(updateArg.data.visaNumber).toBe('VISA-2026-001');
 
     expect(result.orderNumber).toBe('FTM20260709001');
-    expect(result.before).toEqual({ visaIssueDate: null, visaEffectiveDate: null, visaExpiry: null });
+    expect(result.before).toEqual({
+      visaNumber: null,
+      visaIssueDate: null,
+      visaEffectiveDate: null,
+      visaExpiry: null,
+    });
     expect(result.after).toEqual({
+      visaNumber: 'VISA-2026-001',
       visaIssueDate: '2026-07-01',
       visaEffectiveDate: '2026-07-05',
       visaExpiry: '2026-10-01',
@@ -168,6 +191,7 @@ describe('updatePassengerVisaDates', () => {
     mockPrisma.passenger.findUnique.mockResolvedValue({
       id: 'p1',
       orderId: 'o1',
+      visaNumber: 'VISA-OLD',
       visaIssueDate: new Date('2026-07-01'),
       visaEffectiveDate: new Date('2026-07-05'),
       visaExpiry: new Date('2026-10-01'),
@@ -175,6 +199,7 @@ describe('updatePassengerVisaDates', () => {
     mockPrisma.passenger.update.mockResolvedValue({
       id: 'p1',
       fullName: 'ZHANG SAN',
+      visaNumber: 'VISA-OLD',
       visaIssueDate: new Date('2026-07-01'),
       visaEffectiveDate: new Date('2026-07-05'),
       visaExpiry: null,
@@ -185,6 +210,13 @@ describe('updatePassengerVisaDates', () => {
     const updateArg = mockPrisma.passenger.update.mock.calls[0][0];
     expect(Object.keys(updateArg.data)).toEqual(['visaExpiry']);
     expect(updateArg.data.visaExpiry).toBeNull();
+    expect(result.before).toEqual({
+      visaNumber: 'VISA-OLD',
+      visaIssueDate: '2026-07-01',
+      visaEffectiveDate: '2026-07-05',
+      visaExpiry: '2026-10-01',
+    });
+    expect(result.after.visaNumber).toBe('VISA-OLD');
     expect(result.before.visaExpiry).toBe('2026-10-01');
     expect(result.after.visaExpiry).toBeNull();
   });

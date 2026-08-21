@@ -18,8 +18,69 @@ import { prisma } from '../../db/prisma.js';
 import { env } from '../../config/env.js';
 import { dataUrlImageSchema } from '../../lib/proof-url.js';
 import { applyOcrPostProcessing, type RawOcrFields } from './ocr.postprocess.js';
+import { normalizeVisaDate } from './visa-date.js';
 
 const DEFAULT_MODEL = 'qwen3-vl-plus';
+
+type OcrErrorCode =
+  | 'OCR_UPSTREAM_AUTH'
+  | 'OCR_RATE_LIMITED'
+  | 'OCR_UPSTREAM_ERROR'
+  | 'OCR_INVALID_RESPONSE'
+  | 'OCR_REQUEST_FAILED';
+
+class OcrRouteError extends Error {
+  constructor(
+    readonly code: OcrErrorCode,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'OcrRouteError';
+  }
+}
+
+function upstreamOcrError(status: number): OcrRouteError {
+  if (status === 401 || status === 403) {
+    return new OcrRouteError('OCR_UPSTREAM_AUTH', 'AI 识别服务认证失败，请联系运营检查 AI 配置');
+  }
+  if (status === 429) {
+    return new OcrRouteError('OCR_RATE_LIMITED', '请求频率超限，请稍后再试');
+  }
+  return new OcrRouteError('OCR_UPSTREAM_ERROR', 'AI 识别服务暂时不可用，请稍后再试');
+}
+
+function parseOcrContent(content: string): Record<string, unknown> {
+  const cleaned = content.replace(/^```json?\s*/i, '').replace(/\s*```$/, '').trim();
+  try {
+    const parsed: unknown = JSON.parse(cleaned);
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+      throw new Error('OCR response is not an object');
+    }
+    return parsed as Record<string, unknown>;
+  } catch {
+    throw new OcrRouteError('OCR_INVALID_RESPONSE', 'AI 识别返回格式异常，请重试');
+  }
+}
+
+interface OcrApiResponse {
+  choices?: Array<{ message?: { content?: string } }>;
+  error?: { message?: string };
+}
+
+async function readOcrResponse(resp: Response): Promise<OcrApiResponse> {
+  try {
+    return (await resp.json()) as OcrApiResponse;
+  } catch {
+    throw new OcrRouteError('OCR_INVALID_RESPONSE', 'AI 识别返回格式异常，请重试');
+  }
+}
+
+function toOcrFailure(err: unknown): { code: OcrErrorCode; message: string } {
+  if (err instanceof OcrRouteError) {
+    return { code: err.code, message: err.message };
+  }
+  return { code: 'OCR_REQUEST_FAILED', message: 'AI 识别暂时失败，请稍后再试' };
+}
 
 const ocrBodySchema = z.object({
   imageDataUrl: dataUrlImageSchema,
@@ -95,32 +156,99 @@ async function callQwenOcr(
   });
 
   if (!resp.ok) {
-    const text = await resp.text().catch(() => '');
-    const hint = text.slice(0, 200);
-    if (resp.status === 401 || resp.status === 403) {
-      throw new Error('API 密钥无效或无权限，请在设置页更新密钥');
-    }
-    if (resp.status === 429) {
-      throw new Error('请求频率超限，请稍后再试');
-    }
-    throw new Error(`AI 服务返回 ${resp.status}：${hint}`);
+    throw upstreamOcrError(resp.status);
   }
 
-  const json = (await resp.json()) as {
-    choices?: Array<{ message?: { content?: string } }>;
-    error?: { message?: string };
-  };
+  const json = await readOcrResponse(resp);
 
   if (json.error?.message) {
-    throw new Error(`AI 错误：${json.error.message}`);
+    throw upstreamOcrError(resp.status);
   }
 
   const content = json.choices?.[0]?.message?.content ?? '';
-  // 去掉可能的 markdown 代码块包裹
-  const cleaned = content.replace(/^```json?\s*/i, '').replace(/\s*```$/, '').trim();
+  return parseOcrContent(content);
+}
 
-  const parsed = JSON.parse(cleaned) as Record<string, unknown>;
-  return parsed;
+/** 调用 Qwen-VL 识别签证页。签证字段使用独立提示词，避免影响护照识别。 */
+async function callQwenVisaOcr(
+  imageDataUrl: string,
+  cfg: { apiKey: string; baseUrl: string; model: string },
+): Promise<Record<string, unknown>> {
+  const systemPrompt =
+    '你是签证页 OCR 引擎。严格输出 JSON，不要任何注释或 markdown 代码块。' +
+    '字段只有 visaIssueDate、visaEffectiveDate、visaExpiry、visaNumber。' +
+    '三个日期字段尽量抄录签证页原文，日期可为 DD/MM/YYYY、DD-MM-YYYY、YYYY-MM-DD、' +
+    'YYYY/MM/DD 或 DD MON YYYY（MON 为 JAN 到 DEC 的英文缩写）。' +
+    '看不清、找不到或无法确认的字段必须填 null，绝不猜测；不要返回空字符串。';
+
+  const url = `${cfg.baseUrl.replace(/\/$/, '')}/chat/completions`;
+  const resp = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${cfg.apiKey}`,
+    },
+    body: JSON.stringify({
+      model: cfg.model,
+      temperature: 0,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'text', text: systemPrompt },
+            { type: 'image_url', image_url: { url: imageDataUrl } },
+          ],
+        },
+      ],
+    }),
+    // 30 秒超时
+    signal: AbortSignal.timeout(30_000),
+  });
+
+  if (!resp.ok) {
+    throw upstreamOcrError(resp.status);
+  }
+
+  const json = await readOcrResponse(resp);
+
+  if (json.error?.message) {
+    throw upstreamOcrError(resp.status);
+  }
+
+  const content = json.choices?.[0]?.message?.content ?? '';
+  return parseOcrContent(content);
+}
+
+interface VisaOcrSuggested {
+  visaIssueDate: string | null;
+  visaEffectiveDate: string | null;
+  visaExpiry: string | null;
+  visaNumber: string | null;
+}
+
+/** 空值标记不进入表单；其他文本保留给人工核对。 */
+function trimVisaText(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  if (/^(?:null|n\/a|na|unknown|none)$/i.test(trimmed)) return null;
+  if (/^(?:未识别|无法识别|看不清|不详|无)$/u.test(trimmed)) return null;
+  return trimmed;
+}
+
+/** 将模型的宽松输出整理为前端可直接展示的签证建议。 */
+function normalizeVisaOcrSuggested(raw: Record<string, unknown>): VisaOcrSuggested {
+  const rawDate = (key: string): string | null => {
+    const value = trimVisaText(raw[key]);
+    return normalizeVisaDate(value);
+  };
+
+  return {
+    visaIssueDate: rawDate('visaIssueDate'),
+    visaEffectiveDate: rawDate('visaEffectiveDate'),
+    visaExpiry: rawDate('visaExpiry'),
+    visaNumber: trimVisaText(raw.visaNumber),
+  };
 }
 
 export const ocrRoutes: FastifyPluginAsync = async (app) => {
@@ -150,13 +278,55 @@ export const ocrRoutes: FastifyPluginAsync = async (app) => {
           verify,
         };
       } catch (err) {
-        const message =
-          err instanceof Error ? err.message : 'AI 识别失败，请重试或手动填写';
+        const failure = toOcrFailure(err);
+        req.log.warn(
+          { errorCode: failure.code, model: cfg.model },
+          'OCR 上游服务失败',
+        );
         return {
           configured: true,
           engine: 'qwen',
           model: cfg.model,
-          error: message,
+          errorCode: failure.code,
+          error: failure.message,
+          suggested: null,
+        };
+      }
+    },
+  );
+
+  // PII 约束：不记录 imageDataUrl、API key；识别结果不写审计。
+  app.post(
+    '/visa',
+    {
+      preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)],
+    },
+    async (req) => {
+      const body = ocrBodySchema.parse(req.body);
+
+      const cfg = await resolveOcrConfig();
+      if (!cfg) {
+        return { configured: false };
+      }
+
+      try {
+        const raw = await callQwenVisaOcr(body.imageDataUrl, cfg);
+        return {
+          configured: true,
+          model: cfg.model,
+          suggested: normalizeVisaOcrSuggested(raw),
+        };
+      } catch (err) {
+        const failure = toOcrFailure(err);
+        req.log.warn(
+          { errorCode: failure.code, model: cfg.model },
+          'OCR 上游服务失败',
+        );
+        return {
+          configured: true,
+          model: cfg.model,
+          errorCode: failure.code,
+          error: failure.message,
           suggested: null,
         };
       }

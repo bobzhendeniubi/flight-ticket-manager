@@ -325,12 +325,12 @@ export const selfUpdatePassengerBodySchema = z
   });
 export type SelfUpdatePassengerBody = z.infer<typeof selfUpdatePassengerBodySchema>;
 
-// ── 签证台：出签后补录 出签日/生效日/有效期（PATCH /orders/:id/passengers/:passengerId/visa-dates；ADMIN/STAFF）──
-// 这三项是签证岗出签后才拿得到的信息，录单时无法预先知道（票务岗反馈：录单时不需要，
-// 已从录单表单移除），改由签证台在出签后补录。YYYY-MM-DD 字符串；null 表示清空该字段；
-// 三个字段均可选，但至少要提供一个（不然这次调用没有意义）。
+// ── 签证台：出签后补录 签证号/出签日/生效日/有效期（PATCH /orders/:id/passengers/:passengerId/visa-dates；ADMIN/STAFF）──
+// 签证岗在出签后补录这些信息。日期使用 YYYY-MM-DD 字符串；null 表示清空；
+// 四个字段均可选，但至少要提供一个（不然这次调用没有意义）。
 export const updatePassengerVisaDatesBodySchema = z
   .object({
+    visaNumber: z.union([z.string().max(40), z.null()]).optional(),
     visaIssueDate: z.union([z.string().regex(/^\d{4}-\d{2}-\d{2}$/), z.null()]).optional(),
     visaEffectiveDate: z.union([z.string().regex(/^\d{4}-\d{2}-\d{2}$/), z.null()]).optional(),
     visaExpiry: z.union([z.string().regex(/^\d{4}-\d{2}-\d{2}$/), z.null()]).optional(),

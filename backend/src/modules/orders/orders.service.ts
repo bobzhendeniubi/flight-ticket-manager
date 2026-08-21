@@ -5221,13 +5221,12 @@ export class OrderService {
   }
 
   /**
-   * 签证台：出签后补录出行人的 出签日/生效日/有效期（仅 ADMIN/STAFF）。
+   * 签证台：出签后补录出行人的 签证号/出签日/生效日/有效期（仅 ADMIN/STAFF）。
    *
    * 规则：
-   *   - 这三项是签证岗出签后才拿得到的信息，录单时无法预先知道（票务岗反馈：录单时不需要），
-   *     已从录单表单移除；改由签证台在出签后走本方法补录。
+   *   - 这些字段是签证岗出签后才拿得到的信息，改由签证台在出签后走本方法补录。
    *   - passengerId 必须属于该订单，否则 404。
-   *   - 字段值为 YYYY-MM-DD 字符串写入；null 清空该字段；undefined（未传）不动。
+   *   - 日期字段使用 YYYY-MM-DD 字符串写入；签证号为文本；null 清空；undefined（未传）不动。
    *   - 无状态闸——出签后各订单状态（PAID/PROCESSING/TICKETED…）都可能需要补录/更正，不比照
    *     selfUpdatePassenger 的 SELF_EDITABLE_PASSENGER_STATUSES 限制（那是前台自助补护照资料的口径）。
    *
@@ -5241,11 +5240,21 @@ export class OrderService {
   ): Promise<{
     passenger: Record<string, unknown>;
     orderNumber: string;
-    before: { visaIssueDate: string | null; visaEffectiveDate: string | null; visaExpiry: string | null };
-    after: { visaIssueDate: string | null; visaEffectiveDate: string | null; visaExpiry: string | null };
+    before: {
+      visaNumber: string | null;
+      visaIssueDate: string | null;
+      visaEffectiveDate: string | null;
+      visaExpiry: string | null;
+    };
+    after: {
+      visaNumber: string | null;
+      visaIssueDate: string | null;
+      visaEffectiveDate: string | null;
+      visaExpiry: string | null;
+    };
   }> {
     if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
-      throw new ForbiddenError('仅运营/管理员可录入签证日期');
+      throw new ForbiddenError('仅运营/管理员可录入签证信息');
     }
 
     const order = await prisma.order.findUnique({
@@ -5259,6 +5268,7 @@ export class OrderService {
       select: {
         id: true,
         orderId: true,
+        visaNumber: true,
         visaIssueDate: true,
         visaEffectiveDate: true,
         visaExpiry: true,
@@ -5270,6 +5280,7 @@ export class OrderService {
 
     const toYmd = (d: Date | null): string | null => (d ? d.toISOString().slice(0, 10) : null);
     const before = {
+      visaNumber: passenger.visaNumber ?? null,
       visaIssueDate: toYmd(passenger.visaIssueDate),
       visaEffectiveDate: toYmd(passenger.visaEffectiveDate),
       visaExpiry: toYmd(passenger.visaExpiry),
@@ -5278,12 +5289,14 @@ export class OrderService {
     const toDateOrNull = (v: string | null | undefined): Date | null | undefined =>
       v === undefined ? undefined : v === null ? null : new Date(v);
     const data: Prisma.PassengerUpdateInput = {};
+    if (input.visaNumber !== undefined) data.visaNumber = input.visaNumber;
     if (input.visaIssueDate !== undefined) data.visaIssueDate = toDateOrNull(input.visaIssueDate);
     if (input.visaEffectiveDate !== undefined) data.visaEffectiveDate = toDateOrNull(input.visaEffectiveDate);
     if (input.visaExpiry !== undefined) data.visaExpiry = toDateOrNull(input.visaExpiry);
 
     const updated = await prisma.passenger.update({ where: { id: passengerId }, data });
     const after = {
+      visaNumber: updated.visaNumber ?? null,
       visaIssueDate: toYmd(updated.visaIssueDate),
       visaEffectiveDate: toYmd(updated.visaEffectiveDate),
       visaExpiry: toYmd(updated.visaExpiry),

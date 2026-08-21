@@ -1786,19 +1786,18 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     return { order };
   });
 
-  // ── 签证台：出签后补录 出签日/生效日/有效期（ADMIN/STAFF）──
+  // ── 签证台：出签后补录 签证号/出签日/生效日/有效期（ADMIN/STAFF）──
   // PATCH /orders/:id/passengers/:passengerId/visa-dates
-  // body: { visaIssueDate?: string|null, visaEffectiveDate?: string|null, visaExpiry?: string|null }
-  //   （YYYY-MM-DD 或 null=清空该字段；至少提供一个）
-  // 这三项是签证岗出签后才拿得到的信息，录单时无法预先知道（票务岗反馈：录单时不需要，
-  // 已从录单表单移除）——改由签证台在出签后走本端点补录。
+  // body: { visaNumber?: string|null, visaIssueDate?: string|null, visaEffectiveDate?: string|null, visaExpiry?: string|null }
+  //   （日期为 YYYY-MM-DD；null=清空；至少提供一个）
+  // 这些字段由签证岗在出签后补录。
   app.patch(
     '/:id/passengers/:passengerId/visa-dates',
     { preHandler: [app.authenticate] },
     async (req, reply) => {
       const role = req.user.role;
       if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
-        return reply.status(403).send({ error: '仅运营/管理员可录入签证日期' });
+        return reply.status(403).send({ error: '仅运营/管理员可录入签证信息' });
       }
       const { id, passengerId } = req.params as { id: string; passengerId: string };
       const body = updatePassengerVisaDatesBodySchema.parse(req.body);

@@ -3127,15 +3127,14 @@ export const api = {
       body,
     }),
 
-  // 签证台：出签后补录出行人的 出签日/生效日/有效期（仅 ADMIN/STAFF）。
-  // 这三项是签证岗出签后才拿得到的信息，录单时无法预先知道（票务岗反馈：录单时不需要，
-  // 已从录单表单移除），改由签证台在出签后调用本端点补录。
-  // YYYY-MM-DD 字符串写入该字段；null 清空该字段；未传的字段不动。
+  // 签证台：出签后补录出行人的 签证号/出签日/生效日/有效期（仅 ADMIN/STAFF）。
+  // 日期使用 YYYY-MM-DD；null 清空；未传的字段不动。
   updatePassengerVisaDates: (
     token: string,
     orderId: string,
     passengerId: string,
     body: {
+      visaNumber?: string | null;
       visaIssueDate?: string | null;
       visaEffectiveDate?: string | null;
       visaExpiry?: string | null;
@@ -4093,6 +4092,14 @@ export const api = {
       token,
       body: { imageDataUrl },
     }),
+  // ── AI OCR 签证页识别 (ADMIN|STAFF) ───────────────────────────────────────
+  // POST /ocr/visa；日期由后端统一归一为 YYYY-MM-DD，无法确认时为 null。
+  ocrVisaAi: (token: string, imageDataUrl: string) =>
+    apiFetch<AiOcrVisaResult>('/ocr/visa', {
+      method: 'POST',
+      token,
+      body: { imageDataUrl },
+    }),
 
   // ── AI OCR 设置（ADMIN only）────────────────────────────────────────────────
   getAiOcrConfig: (token: string) =>
@@ -4447,6 +4454,13 @@ export interface AiOcrReviewField {
 }
 
 /** POST /ocr/passport 响应 */
+export type AiOcrErrorCode =
+  | 'OCR_UPSTREAM_AUTH'
+  | 'OCR_RATE_LIMITED'
+  | 'OCR_UPSTREAM_ERROR'
+  | 'OCR_INVALID_RESPONSE'
+  | 'OCR_REQUEST_FAILED';
+
 export type AiOcrPassportResult =
   | { configured: false }
   | {
@@ -4454,12 +4468,32 @@ export type AiOcrPassportResult =
       engine: 'qwen';
       model: string;
       suggested: AiOcrSuggested | null;
+      errorCode?: AiOcrErrorCode;
       error?: string;
       /** MRZ 校验 + 需人工核对字段（票务岗反馈：护照反光致目视区误读时提示二次核对） */
       verify?: {
         mrzValid: boolean;
         reviewFields: AiOcrReviewField[];
       };
+    };
+
+/** 后端返回的签证页 OCR 建议字段；日期均为 YYYY-MM-DD。 */
+export interface AiOcrVisaSuggested {
+  visaIssueDate: string | null;
+  visaEffectiveDate: string | null;
+  visaExpiry: string | null;
+  visaNumber: string | null;
+}
+
+/** POST /ocr/visa 响应。 */
+export type AiOcrVisaResult =
+  | { configured: false }
+  | {
+      configured: true;
+      model: string;
+      suggested: AiOcrVisaSuggested | null;
+      errorCode?: AiOcrErrorCode;
+      error?: string;
     };
 
 /** GET /settings/ai-ocr 响应（PUT 同形） */

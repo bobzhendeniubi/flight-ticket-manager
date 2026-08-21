@@ -17,6 +17,7 @@ import { Link } from 'react-router-dom';
 import {
   api,
   ApiError,
+  type AiOcrVisaSuggested,
   type FulfillmentStatus,
   type FulfillmentTask,
   type ListFulfillmentParams,
@@ -24,6 +25,7 @@ import {
   type VisaTaskCostInput,
   type VisaTaskPassenger,
 } from '../lib/api';
+import { passportPhotoToDataUrl } from '../lib/passportOcr';
 import { useAuth } from '../stores/auth';
 import { localYmd } from '../lib/airports';
 
@@ -144,16 +146,160 @@ function subStatus(p: VisaTaskPassenger): VisaSubmissionStatus {
   return p.visaSubmissionStatus ?? 'PENDING';
 }
 
-/** 出行人签证日期三项（出签日/生效日/有效期）；null = 该字段未录入 */
+/** 出行人签证信息；日期和签证号均为 null 表示未录入。 */
 interface PassengerVisaDates {
   visaIssueDate: string | null;
   visaEffectiveDate: string | null;
   visaExpiry: string | null;
+  visaNumber: string | null;
+}
+type PassengerVisaDateValues = Pick<
+  PassengerVisaDates,
+  'visaNumber' | 'visaIssueDate' | 'visaEffectiveDate' | 'visaExpiry'
+>;
+
+/** Prisma 日期字段经 JSON 返回可能带时间部分，签证台输入框只接受 YYYY-MM-DD。 */
+function visaDateOnly(value: string | null | undefined): string | null {
+  return value ? value.slice(0, 10) : null;
+}
+
+type VisaOcrFieldKey = keyof AiOcrVisaSuggested;
+
+const VISA_OCR_FIELDS: Array<{ key: VisaOcrFieldKey; label: string }> = [
+  { key: 'visaIssueDate', label: '出签日' },
+  { key: 'visaEffectiveDate', label: '生效日' },
+  { key: 'visaExpiry', label: '有效期' },
+  { key: 'visaNumber', label: '签证号' },
+];
+
+interface VisaOcrSuggestionRowProps {
+  suggestion: AiOcrVisaSuggested;
+  current: PassengerVisaDates;
+  onFill: (fields: ReadonlySet<VisaOcrFieldKey>) => void;
+}
+
+function VisaOcrSuggestionRow({ suggestion, current, onFill }: VisaOcrSuggestionRowProps) {
+  const [confirming, setConfirming] = useState(false);
+  const [selectedConflicts, setSelectedConflicts] = useState<Set<VisaOcrFieldKey>>(new Set());
+  const [expirySecondConfirmed, setExpirySecondConfirmed] = useState(false);
+  const availableFields = VISA_OCR_FIELDS.filter(
+    ({ key }) => suggestion[key] !== null && suggestion[key] !== undefined,
+  );
+  const conflicts = availableFields.filter(
+    ({ key }) =>
+      current[key] !== null &&
+      current[key] !== '' &&
+      current[key] !== suggestion[key],
+  );
+  const parts = availableFields
+    .map(({ key, label }) => `${label} ${suggestion[key]}`);
+
+  const startFill = () => {
+    if (conflicts.length === 0) {
+      onFill(new Set(availableFields.map(({ key }) => key)));
+      return;
+    }
+    setSelectedConflicts(new Set());
+    setExpirySecondConfirmed(false);
+    setConfirming(true);
+  };
+
+  const toggleConflict = (key: VisaOcrFieldKey) => {
+    setSelectedConflicts((currentSelection) => {
+      const next = new Set(currentSelection);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+    if (key === 'visaExpiry') setExpirySecondConfirmed(false);
+  };
+
+  const expiryNeedsSecondConfirmation = selectedConflicts.has('visaExpiry');
+  const hasAcceptedField = availableFields.some(
+    ({ key }) => !conflicts.some((conflict) => conflict.key === key) || selectedConflicts.has(key),
+  );
+  const canConfirm =
+    hasAcceptedField && (!expiryNeedsSecondConfirmation || expirySecondConfirmed);
+
+  const confirmFill = () => {
+    if (!canConfirm) return;
+    const accepted = new Set(availableFields.map(({ key }) => key));
+    for (const { key } of conflicts) {
+      if (!selectedConflicts.has(key)) accepted.delete(key);
+    }
+    onFill(accepted);
+  };
+
+  return (
+    <div className="basis-full rounded border border-amber-200 bg-amber-50 px-2 py-1 text-[10px] text-amber-800">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <span>识别结果：{parts.join(' · ')}</span>
+        <button type="button" className="btn-primary py-0.5 px-2 text-[10px]" onClick={startFill}>
+          {conflicts.length > 0 ? '检查并填入' : '填入'}
+        </button>
+      </div>
+      {conflicts.length > 0 && !confirming && (
+        <div className="mt-0.5 text-rose-600">存在需确认的覆盖字段，点击后逐项确认</div>
+      )}
+      {confirming && (
+        <div className="mt-1 rounded border border-rose-200 bg-white p-1.5 text-rose-700">
+          <div className="mb-1 font-medium">请逐项确认覆盖内容：</div>
+          <div className="space-y-1">
+            {conflicts.map(({ key, label }) => (
+              <label key={key} className="flex items-start gap-1">
+                <input
+                  type="checkbox"
+                  checked={selectedConflicts.has(key)}
+                  onChange={() => toggleConflict(key)}
+                />
+                <span>
+                  {label}：{current[key] || '未录入'} → {suggestion[key]}
+                </span>
+              </label>
+            ))}
+          </div>
+          {expiryNeedsSecondConfirmation && (
+            <div className="mt-1 border-t border-rose-100 pt-1">
+              {expirySecondConfirmed ? (
+                <span>已二次确认覆盖有效期</span>
+              ) : (
+                <button
+                  type="button"
+                  className="btn-secondary py-0.5 px-2 text-[10px] text-rose-700"
+                  onClick={() => setExpirySecondConfirmed(true)}
+                >
+                  二次确认覆盖有效期
+                </button>
+              )}
+            </div>
+          )}
+          <div className="mt-1 flex items-center gap-1">
+            <button
+              type="button"
+              className="btn-primary py-0.5 px-2 text-[10px]"
+              onClick={confirmFill}
+              disabled={!canConfirm}
+            >
+              确认填入
+            </button>
+            <button
+              type="button"
+              className="btn-ghost py-0.5 px-2 text-[10px]"
+              onClick={() => setConfirming(false)}
+            >
+              取消
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
 
 // ── 平铺乘客行：勾选 + 姓名 / 护照号 / 护照有效期 / 缺照徽标 + 送签进度 ─────────────
 interface PassengerRowProps {
   passenger: VisaTaskPassenger;
+  token: string;
   selected: boolean;
   onToggleSelect: () => void;
   /** 展开后按需拉取到的护照大图（覆盖列表里的 null） */
@@ -168,6 +314,7 @@ interface PassengerRowProps {
 }
 function PassengerRow({
   passenger,
+  token,
   selected,
   onToggleSelect,
   photoUrl,
@@ -184,18 +331,74 @@ function PassengerRow({
     visaIssueDate: null,
     visaEffectiveDate: null,
     visaExpiry: null,
+    visaNumber: null,
   });
   const [savingVisaDates, setSavingVisaDates] = useState(false);
   const [visaDatesError, setVisaDatesError] = useState<string | null>(null);
+  const [visaOcrLoading, setVisaOcrLoading] = useState(false);
+  const [visaOcrError, setVisaOcrError] = useState<string | null>(null);
+  const [visaOcrSuggestion, setVisaOcrSuggestion] = useState<AiOcrVisaSuggested | null>(null);
+  const visaOcrInputRef = useRef<HTMLInputElement | null>(null);
 
   const startEditVisaDates = () => {
     setVisaDraft({
       visaIssueDate: visaDates?.visaIssueDate ?? null,
       visaEffectiveDate: visaDates?.visaEffectiveDate ?? null,
       visaExpiry: visaDates?.visaExpiry ?? null,
+      visaNumber: visaDates?.visaNumber ?? null,
     });
     setVisaDatesError(null);
+    setVisaOcrError(null);
+    setVisaOcrSuggestion(null);
     setEditingVisaDates(true);
+  };
+
+  const runVisaOcr = async (file: File) => {
+    if (visaOcrLoading) return;
+    setVisaOcrLoading(true);
+    setVisaOcrError(null);
+    setVisaOcrSuggestion(null);
+    try {
+      const imageDataUrl = await passportPhotoToDataUrl(file);
+      if (!imageDataUrl) throw new Error('图片读取失败');
+      const result = await api.ocrVisaAi(token, imageDataUrl);
+      if (!result.configured) {
+        setVisaOcrError('未配置 AI 密钥，请到「AI 识别设置」页配置');
+        return;
+      }
+      if (
+        !result.suggested ||
+        !Object.values(result.suggested).some((value) => value !== null && value !== undefined)
+      ) {
+        setVisaOcrError('未能识别，请手动填写');
+        return;
+      }
+      setVisaOcrSuggestion(result.suggested);
+    } catch {
+      setVisaOcrError('未能识别，请手动填写');
+    } finally {
+      setVisaOcrLoading(false);
+    }
+  };
+
+  const fillVisaOcrSuggestion = (acceptedFields: ReadonlySet<VisaOcrFieldKey>) => {
+    if (!visaOcrSuggestion) return;
+    setVisaDraft((current) => ({
+      ...current,
+      ...(acceptedFields.has('visaIssueDate') && visaOcrSuggestion.visaIssueDate !== null
+        ? { visaIssueDate: visaOcrSuggestion.visaIssueDate }
+        : {}),
+      ...(acceptedFields.has('visaEffectiveDate') && visaOcrSuggestion.visaEffectiveDate !== null
+        ? { visaEffectiveDate: visaOcrSuggestion.visaEffectiveDate }
+        : {}),
+      ...(acceptedFields.has('visaExpiry') && visaOcrSuggestion.visaExpiry !== null
+        ? { visaExpiry: visaOcrSuggestion.visaExpiry }
+        : {}),
+      ...(acceptedFields.has('visaNumber') && visaOcrSuggestion.visaNumber !== null
+        ? { visaNumber: visaOcrSuggestion.visaNumber }
+        : {}),
+    }));
+    setVisaOcrSuggestion(null);
   };
 
   const saveVisaDates = async () => {
@@ -217,6 +420,7 @@ function PassengerRow({
         visaDates.visaIssueDate ? `出签日 ${visaDates.visaIssueDate}` : null,
         visaDates.visaEffectiveDate ? `生效日 ${visaDates.visaEffectiveDate}` : null,
         visaDates.visaExpiry ? `有效期 ${visaDates.visaExpiry}` : null,
+        visaDates.visaNumber ? `签证号 ${visaDates.visaNumber}` : null,
       ].filter((x): x is string => Boolean(x))
     : [];
   const resolvedPhoto = photoUrl ?? passenger.passportPhotoUrl;
@@ -338,6 +542,16 @@ function PassengerRow({
           (editingVisaDates ? (
             <div className="mt-1 flex flex-wrap items-center gap-1.5">
               <label className="flex items-center gap-1 text-[10px] text-ink-muted">
+                签证号
+                <input
+                  type="text"
+                  className="input w-[9.5rem] py-0.5 text-[11px]"
+                  value={visaDraft.visaNumber ?? ''}
+                  onChange={(e) => setVisaDraft((d) => ({ ...d, visaNumber: e.target.value || null }))}
+                  disabled={savingVisaDates || visaOcrLoading}
+                />
+              </label>
+              <label className="flex items-center gap-1 text-[10px] text-ink-muted">
                 出签日
                 <input
                   type="date"
@@ -384,6 +598,33 @@ function PassengerRow({
                 取消
               </button>
               {visaDatesError && <span className="text-[10px] text-rose-600">{visaDatesError}</span>}
+              <input
+                ref={visaOcrInputRef}
+                type="file"
+                accept="image/*"
+                className="hidden"
+                onChange={(e) => {
+                  const file = e.currentTarget.files?.[0];
+                  e.currentTarget.value = '';
+                  if (file) void runVisaOcr(file);
+                }}
+              />
+              <button
+                type="button"
+                className="btn-secondary py-0.5 px-2 text-[10px]"
+                onClick={() => visaOcrInputRef.current?.click()}
+                disabled={savingVisaDates || visaOcrLoading}
+              >
+                {visaOcrLoading ? '识别中…' : '📷 拍照识别'}
+              </button>
+              {visaOcrError && <span className="text-[10px] text-rose-600">{visaOcrError}</span>}
+              {visaOcrSuggestion && (
+                <VisaOcrSuggestionRow
+                  suggestion={visaOcrSuggestion}
+                  current={visaDraft}
+                  onFill={fillVisaOcrSuggestion}
+                />
+              )}
             </div>
           ) : (
             <div className="mt-0.5 flex items-center gap-1.5">
@@ -777,9 +1018,10 @@ function OrderGroup({
         const m: Record<string, PassengerVisaDates> = {};
         for (const p of res.order.passengers ?? []) {
           m[p.id] = {
-            visaIssueDate: p.visaIssueDate ?? null,
-            visaEffectiveDate: p.visaEffectiveDate ?? null,
-            visaExpiry: p.visaExpiry ?? null,
+            visaIssueDate: visaDateOnly(p.visaIssueDate),
+            visaEffectiveDate: visaDateOnly(p.visaEffectiveDate),
+            visaExpiry: visaDateOnly(p.visaExpiry),
+            visaNumber: p.visaNumber ?? null,
           };
         }
         setVisaDatesMap(m);
@@ -794,7 +1036,13 @@ function OrderGroup({
   const saveVisaDates = useCallback(
     async (passengerId: string, next: PassengerVisaDates) => {
       if (!orderId) throw new Error('缺少订单号，无法保存');
-      await api.updatePassengerVisaDates(token, orderId, passengerId, next);
+      const dateValues: PassengerVisaDateValues = {
+        visaNumber: next.visaNumber,
+        visaIssueDate: next.visaIssueDate,
+        visaEffectiveDate: next.visaEffectiveDate,
+        visaExpiry: next.visaExpiry,
+      };
+      await api.updatePassengerVisaDates(token, orderId, passengerId, dateValues);
       setVisaDatesMap((prev) => ({ ...prev, [passengerId]: next }));
     },
     [orderId, token],
@@ -1054,6 +1302,7 @@ function OrderGroup({
                   <PassengerRow
                     key={p.id}
                     passenger={p}
+                    token={token}
                     selected={selectedPassengerIds.has(p.id)}
                     onToggleSelect={() => onTogglePassenger(p.id)}
                     photoUrl={photoMap[p.id]}
