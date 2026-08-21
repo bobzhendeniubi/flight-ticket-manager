@@ -918,54 +918,45 @@ export function CheckoutPage() {
           </div>
         </section>
 
-        {/* 支付方式 */}
+        {/* 付款方式
+            这里不提供在线支付入口：本站不做即时在线扣款，所有订单都是提交后由客服联系确认收款。
+            此前展示的「微信支付 / 支付宝 / 信用卡」只是下单时记录的意向标记，点了并不会跳转付款页，
+            会让下单人误以为马上要扣款。改为如实说明流程。 */}
         <section className="card">
-          <h2 className="section-title text-base">支付方式</h2>
-          <div className="mt-4 grid gap-2.5 md:grid-cols-2 lg:grid-cols-4">
-            {[
-              { v: 'WECHAT_PAY', label: '微信支付', emoji: '💚', show: true },
-              { v: 'ALIPAY', label: '支付宝', emoji: '💙', show: true },
-              { v: 'BANK_CARD', label: '信用卡', emoji: '💳', show: true },
-              { v: 'AGENT_PREPAYMENT', label: '代理预付余额', emoji: '💰', show: isAgent },
-            ].filter((p) => p.show).map((p) => (
-              <label
-                key={p.v}
-                className={`cursor-pointer rounded-2xl border-2 p-3 text-center transition-all ${
-                  paymentMethod === p.v
-                    ? 'border-brand bg-brand-50 shadow-card'
-                    : 'border-slate-200 hover:border-brand/40 hover:bg-brand-50/40'
-                }`}
-              >
-                <input
-                  type="radio"
-                  className="sr-only"
-                  name="payment"
-                  value={p.v}
-                  checked={paymentMethod === p.v}
-                  onChange={(e) => setPaymentMethod(e.target.value as CreateOrderInput['paymentMethod'])}
-                />
-                <div className="text-2xl">{p.emoji}</div>
-                <div className={`mt-1 text-sm font-semibold ${paymentMethod === p.v ? 'text-brand-700' : 'text-ink'}`}>{p.label}</div>
-              </label>
-            ))}
-          </div>
-          {paymentMethod === 'AGENT_PREPAYMENT' && isAgent && (
-            <div className="mt-3 rounded-2xl border border-brand-200 bg-brand-50/60 px-4 py-3 text-sm">
-              <div className="flex items-center justify-between">
-                <span className="font-medium text-brand-800">代理预付余额（demo 模拟）</span>
-                <span className="font-bold text-brand-700 nums">¥80,000.00</span>
-              </div>
-              <div className="mt-1.5 flex items-center justify-between text-xs text-brand-700">
-                <span>本单抵扣</span>
-                <span className="nums">−¥{fmt(total)}</span>
-              </div>
-              <div className="mt-1 flex items-center justify-between text-xs text-brand-700">
-                <span>支付后余额</span>
-                <span className="nums">¥{fmt(80000 - total)}</span>
-              </div>
-              {total > 80000 && (
-                <div className="mt-2 text-xs font-medium text-deal">⚠ 余额不足，请联系管理员充值或选择其他支付方式</div>
-              )}
+          <h2 className="section-title text-base">付款方式</h2>
+          {isAgent && (
+            <div className="mt-4 grid gap-2.5 md:grid-cols-2">
+              {[
+                { v: 'AGENT_PREPAYMENT', label: '预付余额结算', hint: '从您的账户余额中扣', emoji: '💰' },
+                { v: 'WECHAT_PAY', label: '转账结算', hint: '按账期线下转账', emoji: '🏦' },
+              ].map((p) => (
+                <label
+                  key={p.v}
+                  className={`cursor-pointer rounded-2xl border-2 p-3 text-center transition-all ${
+                    paymentMethod === p.v
+                      ? 'border-brand bg-brand-50 shadow-card'
+                      : 'border-slate-200 hover:border-brand/40 hover:bg-brand-50/40'
+                  }`}
+                >
+                  <input
+                    type="radio"
+                    className="sr-only"
+                    name="payment"
+                    value={p.v}
+                    checked={paymentMethod === p.v}
+                    onChange={(e) => setPaymentMethod(e.target.value as CreateOrderInput['paymentMethod'])}
+                  />
+                  <div className="text-2xl">{p.emoji}</div>
+                  <div className={`mt-1 text-sm font-semibold ${paymentMethod === p.v ? 'text-brand-700' : 'text-ink'}`}>{p.label}</div>
+                  <div className="mt-0.5 text-xs text-slate-500">{p.hint}</div>
+                </label>
+              ))}
+            </div>
+          )}
+          {/* 余额数字以后台账户为准：前台不展示余额，避免下单人照着一个不准的数字做决定。 */}
+          {isAgent && paymentMethod === 'AGENT_PREPAYMENT' && (
+            <div className="mt-3 rounded-2xl border border-brand-200 bg-brand-50/60 px-4 py-3 text-sm text-brand-800">
+              本单将从您的预付余额中结算，具体抵扣与剩余额度以确认后的账户流水为准；余额不足时我们会与您联系。
             </div>
           )}
 
