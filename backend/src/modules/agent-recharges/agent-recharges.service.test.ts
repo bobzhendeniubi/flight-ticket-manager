@@ -101,6 +101,25 @@ describe('AgentRechargesService', () => {
       expect(mockPrisma.$transaction).not.toHaveBeenCalled();
     });
 
+    it('提交人=确认人（单签）→ ForbiddenError，不加余额、不写流水', async () => {
+      // maker-checker：同一账号既提交又确认 = 凭空造币，必须由第二人确认
+      (mockPrisma.$queryRaw as ReturnType<typeof vi.fn>).mockResolvedValueOnce([
+        {
+          id: 'req-1',
+          agentId: 'agent-1',
+          amountCny: decimal(2_000_000),
+          status: AgentRechargeStatus.PENDING,
+          submittedByUserId: 'admin-1', // 与确认人 ADMIN.userId 相同
+        },
+      ]);
+
+      await expect(service.confirm(ADMIN, 'req-1', {})).rejects.toThrow(/双人复核/);
+      expect((mockPrisma.agent as { update: ReturnType<typeof vi.fn> }).update).not.toHaveBeenCalled();
+      expect(
+        (mockPrisma.prepaymentTransaction as { create: ReturnType<typeof vi.fn> }).create,
+      ).not.toHaveBeenCalled();
+    });
+
     it('happy path：PENDING → CONFIRMED，balanceAfter = 原余额 + 到账额，写 TOP_UP 流水', async () => {
       (mockPrisma.$queryRaw as ReturnType<typeof vi.fn>)
         .mockResolvedValueOnce([

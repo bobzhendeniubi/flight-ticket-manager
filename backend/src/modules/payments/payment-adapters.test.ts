@@ -165,6 +165,24 @@ describe('getPaymentAdapter dispatch', () => {
     process.env.PAYMENT_MODE = 'live';
     expect(() => getPaymentAdapter(PaymentMethod.AGENT_PREPAYMENT)).toThrow();
   });
+
+  it('NODE_ENV=production + 非 live → 抛错（生产绝不启用沙箱验签，fail-closed）', () => {
+    // 纵深防御：即使 PAYMENT_MODE 被误配成 sandbox，生产环境也必须拒绝沙箱适配器，
+    // 否则匿名回调可用硬编码 secret 把订单刷成 PAID。
+    process.env.NODE_ENV = 'production';
+    process.env.PAYMENT_MODE = 'sandbox';
+    expect(() => getPaymentAdapter(PaymentMethod.WECHAT_PAY)).toThrow(/PAYMENT_MODE 必须为 live/);
+    // 未设 PAYMENT_MODE（默认 sandbox）同样拒绝
+    delete process.env.PAYMENT_MODE;
+    expect(() => getPaymentAdapter(PaymentMethod.WECHAT_PAY)).toThrow(/PAYMENT_MODE 必须为 live/);
+  });
+
+  it('NODE_ENV=production + live → 正常返回真适配器（生产正确配置不受影响）', () => {
+    process.env.NODE_ENV = 'production';
+    process.env.PAYMENT_MODE = 'live';
+    const a = getPaymentAdapter(PaymentMethod.WECHAT_PAY);
+    expect(a).not.toBeInstanceOf(SandboxAdapter);
+  });
 });
 
 describe('createMiniappJsapiPayment — fail-closed guard（P1 安全）', () => {

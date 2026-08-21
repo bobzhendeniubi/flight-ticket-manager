@@ -28,14 +28,19 @@ export interface ItemQuote {
   itemId: string;
   kind: string;
   description: string;
-  amount: number;          // 该 item 已支付金额
+  amount: number;          // 该 item 的**毛价**（明细行金额，未扣立减 / SETTLEMENT 差额）
+  /**
+   * 该 item 实际分摊到的已付金额 = amount × feeScale（见 CancellationQuote.feeScale）。
+   * 手续费与应退都以它为基数——「按什么收费」必须与「按什么退钱」同源。
+   */
+  paidShare: number;
   hoursLeft: number | null; // 距出发 / 入住的小时；null = 不适用（如纯地面 / 签证）
   policyId: string | null;
   policyName: string;
   matchedTier: CancellationTier | null;
   feePercent: number;
-  feeAmount: number;       // 手续费 ¥
-  refundAmount: number;    // 应退 ¥ = amount - feeAmount
+  feeAmount: number;       // 手续费 ¥ = paidShare × feePercent%
+  refundAmount: number;    // 应退 ¥ = paidShare - feeAmount
   reason: string;          // 人类可读的"为什么收这个比例"
   fulfilled: boolean;      // 该 item 是否已履约（CONFIRMED）
 }
@@ -43,13 +48,53 @@ export interface ItemQuote {
 export interface CancellationQuote {
   orderId: string;
   orderNumber: string;
+  /** 现金实收（Order.paidAmount） */
   paidAmount: number;
+  /** 代理预存余额抵扣额（Order.prepaymentOffset）——同样是客户付出的钱，必须计入可退基数 */
+  prepaymentOffsetCny: number;
+  /** 改期费 / 换人费（Order.adjustmentCny）——已发生的不可退成本，从可退基数里剔除 */
+  adjustmentCny: number;
+  /** 可退基数 = max(0, paidAmount + prepaymentOffset − adjustmentCny) */
+  refundableBaseCny: number;
+  /** 手续费折算系数 = min(1, 可退基数 ÷ 明细毛价合计)；毛价合计为 0 时为 0 */
+  feeScale: number;
   totalFee: number;
-  totalRefund: number;     // = paidAmount - totalFee
+  totalRefund: number;     // = refundableBaseCny − totalFee
+  /** 应退里退回现金的部分（财务实际打款额） */
+  refundToCashCny: number;
+  /** 应退里退回代理预存余额的部分（由 REFUNDED 流转写 PrepaymentTransaction(REFUND) 回补） */
+  refundToBalanceCny: number;
   items: ItemQuote[];
   /** 是否可取消（PAID / TICKETED 之类才能取消；DRAFT / 已 CANCELLED 不行） */
   cancellable: boolean;
   cancellableReason?: string;
+}
+
+/**
+ * 把「应退总额」拆成 退现金 / 退回代理预存余额 两部分。
+ *
+ * 口径（现金优先）：客户付出的钱由现金（paidAmount）与预存余额抵扣（prepaymentOffset）两段组成，
+ * 其中 adjustmentCny（改期费/换人费）视为**先从现金里消耗掉**的不可退成本。
+ * 于是可退现金上限 = max(0, paidAmount − adjustmentCny)，应退先退现金、退不下的部分回余额。
+ * 现金优先而非余额优先：现金是客户真金白银出去的，优先原路退回；剩余额度回到余额可继续下单。
+ *
+ * 导出供 orders.service 的 REFUNDED 流转复用——退款完成时必须按**同一口径**回补余额，
+ * 否则报价说退 8000（其中 8000 回余额）、落库却按别的比例回补，账目立刻分叉。
+ */
+export function splitRefundBetweenCashAndBalance(input: {
+  totalRefund: number;
+  paidAmount: number;
+  adjustmentCny: number;
+  prepaymentOffsetCny: number;
+}): { refundToCashCny: number; refundToBalanceCny: number } {
+  const totalRefund = Math.max(0, round2(input.totalRefund));
+  const cashCapacity = Math.max(0, round2(input.paidAmount - input.adjustmentCny));
+  const refundToCashCny = round2(Math.min(totalRefund, cashCapacity));
+  // 余额部分再夹一层 prepaymentOffset 上限：绝不回补超过当初抵扣掉的余额（防凭空造币）。
+  const refundToBalanceCny = round2(
+    Math.min(Math.max(0, input.prepaymentOffsetCny), round2(totalRefund - refundToCashCny)),
+  );
+  return { refundToCashCny, refundToBalanceCny };
 }
 
 const CANCELLABLE_STATUSES = new Set([
@@ -93,24 +138,106 @@ export async function computeCancellationQuote(
     where: { isActive: true },
   });
 
-  const items = await Promise.all(
+  const grossItems = await Promise.all(
     order.items.map((it) => quoteItem(it, policies, cancelAt)),
   );
 
-  const totalFee = round2(items.reduce((s, i) => s + i.feeAmount, 0));
-  const paidAmount = Number(order.paidAmount);
-  // 应退硬上限 = 实收金额：绝不退超过客户实际付进来的钱（防负手续费/口径漂移把应退顶穿实收）。
-  const totalRefund = round2(Math.max(0, Math.min(paidAmount, paidAmount - totalFee)));
+  const breakdown = computeRefundBreakdown({
+    paidAmount: Number(order.paidAmount),
+    prepaymentOffsetCny: Number(order.prepaymentOffset ?? 0),
+    adjustmentCny: Number(order.adjustmentCny ?? 0),
+    grossItems,
+  });
 
   return {
     orderId: order.id,
     orderNumber: order.orderNumber,
-    paidAmount,
-    totalFee,
-    totalRefund,
-    items,
+    ...breakdown,
     cancellable,
     cancellableReason,
+  };
+}
+
+/** computeRefundBreakdown 的行级输入：只用到毛价与毛价口径手续费，其余字段原样带过。 */
+export type GrossItemQuote = Omit<ItemQuote, 'paidShare'>;
+
+/**
+ * 退款金额引擎（纯函数，无 IO —— 便于直接单测各种金额组合）。
+ *
+ * ── 口径修正（旧版有两处系统性偏差）────────────────────────────────────
+ * 旧口径：手续费按**明细毛价**逐行算，应退却按 paidAmount 扣 —— 两个基数不同源，于是
+ *   · 立减 / SETTLEMENT 差额行把实收压低后，毛价算出的手续费在实收里占比被放大
+ *     （毛价 12000、收敛后实收 6000、20% 档 → 扣 2400，实际费率 40%，应扣 1200）；
+ *   · adjustmentCny（改期费/换人费）已含在 paidAmount 里却不参与手续费计算，
+ *     取消时被原样退还给客户（公司净损）。
+ *
+ * 新口径：两个基数强制同源。
+ *   可退基数 refundableBaseCny = max(0, paidAmount + prepaymentOffset − adjustmentCny)
+ *     ＋ prepaymentOffset：代理用预存余额抵付的钱同样是客户付出的钱。不计入就会把
+ *        「全额余额抵付单」（paidAmount=0）算成应退 ¥0，客户白丢一整单钱。
+ *     － adjustmentCny：改期费/换人费对应**已发生且不可退**的成本，不进可退基数。
+ *   手续费折算系数 feeScale = min(1, 可退基数 ÷ 明细毛价合计)，逐行折算后再求和。
+ *     · 夹到 ≤1：客户多付（实收 > 毛价）时不把手续费一起放大。
+ *     · 毛价合计为 0（整单只剩优惠行等）→ feeScale=0：不收手续费，可退基数原样退。
+ *   逐行折算而不是只折总额：Refund.gatewayPayload.quoteSnapshot 的行级 feeAmount/refundAmount
+ *     是佣金按比例冲销的输入（ratio = 退款额 ÷ (退款额+退改费)）。同比例缩放后该比值不变，
+ *     佣金冲销口径不受本次修正影响。
+ *
+ * ⚠️ 本函数的输出直接决定退给客户多少钱。改动前请同步复核 orders.service 的
+ *    「批准退款资金守恒断言」（Σ退款 ≤ paidAmount + prepaymentOffset）与余额回补口径。
+ */
+export function computeRefundBreakdown(input: {
+  paidAmount: number;
+  prepaymentOffsetCny: number;
+  adjustmentCny: number;
+  grossItems: GrossItemQuote[];
+}): Pick<
+  CancellationQuote,
+  | 'paidAmount'
+  | 'prepaymentOffsetCny'
+  | 'adjustmentCny'
+  | 'refundableBaseCny'
+  | 'feeScale'
+  | 'totalFee'
+  | 'totalRefund'
+  | 'refundToCashCny'
+  | 'refundToBalanceCny'
+  | 'items'
+> {
+  const { paidAmount, prepaymentOffsetCny, adjustmentCny, grossItems } = input;
+  const refundableBaseCny = round2(
+    Math.max(0, paidAmount + prepaymentOffsetCny - adjustmentCny),
+  );
+  const grossPositiveCny = round2(grossItems.reduce((s, i) => s + Math.max(0, i.amount), 0));
+  const feeScale = grossPositiveCny > 0 ? Math.min(1, refundableBaseCny / grossPositiveCny) : 0;
+
+  const items: ItemQuote[] = grossItems.map((i) => {
+    const paidShare = round2(Math.max(0, i.amount) * feeScale);
+    const feeAmount = round2(i.feeAmount * feeScale);
+    return { ...i, paidShare, feeAmount, refundAmount: round2(paidShare - feeAmount) };
+  });
+
+  const totalFee = round2(items.reduce((s, i) => s + i.feeAmount, 0));
+  // 应退硬上限 = 可退基数：绝不退超过客户实际付进来（现金 + 余额抵扣）的钱。
+  const totalRefund = round2(Math.max(0, Math.min(refundableBaseCny, refundableBaseCny - totalFee)));
+  const { refundToCashCny, refundToBalanceCny } = splitRefundBetweenCashAndBalance({
+    totalRefund,
+    paidAmount,
+    adjustmentCny,
+    prepaymentOffsetCny,
+  });
+
+  return {
+    paidAmount,
+    prepaymentOffsetCny,
+    adjustmentCny,
+    refundableBaseCny,
+    feeScale,
+    totalFee,
+    totalRefund,
+    refundToCashCny,
+    refundToBalanceCny,
+    items,
   };
 }
 
@@ -122,7 +249,7 @@ async function quoteItem(
   },
   policies: { id: string; productKind: string; scope: string | null; name: string; tiers: Prisma.JsonValue; isDefault: boolean }[],
   cancelAt: Date,
-): Promise<ItemQuote> {
+): Promise<GrossItemQuote> {
   const amount = Number(item.amount);
 
   // 非正金额行（优惠/减免 DISCOUNT 等）：不进费率引擎。

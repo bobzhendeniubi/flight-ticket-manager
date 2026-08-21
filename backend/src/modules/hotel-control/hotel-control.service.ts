@@ -692,6 +692,10 @@ function computePhysicalUsedForItems<T extends PhysicalOccupancyItem>(
  *   逐晚拒绝条件：block[i] > 0（该晚确被包房周期管控）且 block[i] − physicalUsedAfter[i] < 0。
  *   block[i] === 0（未被任何周期覆盖）→ 视为未管控，不据此拦截（房控哲学：未配包房 ≠ 售罄）。
  *
+ * ⚠ 这是**只读快照判定**，本身不提供并发互斥：两个请求同时抢最后 1 间，会各自读到
+ * 「还剩 1 间」的旧快照双双通过。要真正互斥，调用方必须在事务里改用
+ * `assertHotelPhysicalFitWithinTx(tx, …)`（它会先对包房周期行加 FOR UPDATE 行锁）。
+ *
  * @param excludeOrderId 改存量单（换酒店 / 重排分房）时排除该单自身的既有占房，避免把自己算两遍。
  */
 export async function checkHotelPhysicalFit(
@@ -699,7 +703,7 @@ export async function checkHotelPhysicalFit(
   nightDates: readonly string[],
   prospective: ProspectiveOccupancy,
   opts: { excludeOrderId?: string } = {},
-  client: PrismaClient = defaultPrisma,
+  client: HotelControlDbClient = defaultPrisma,
 ): Promise<PhysicalFitResult> {
   const empty: PhysicalFitResult = {
     hasBlock: false,
@@ -778,7 +782,7 @@ export async function assertHotelPhysicalFit(
     allowNonWorsening?: boolean;
     buildMessage?: (violations: readonly PhysicalFitViolation[]) => string;
   } = {},
-  client: PrismaClient = defaultPrisma,
+  client: HotelControlDbClient = defaultPrisma,
 ): Promise<void> {
   const fit = await checkHotelPhysicalFit(
     hotelId,
@@ -798,6 +802,70 @@ export async function assertHotelPhysicalFit(
     ? opts.buildMessage(fit.violations)
     : `酒店实际房间不足（${fit.violations[0].date} 包房 ${fit.violations[0].block} 间，本次操作后需 ${fit.violations[0].physicalUsed} 间）`;
   throw new BadRequestError(message);
+}
+
+// ── 事务内互斥版前瞻闸（并发抢最后一间的唯一正解）────────────────────────────
+/**
+ * 把某酒店在 [nightDates 首, nightDates 尾] 区间内的包房周期行 `SELECT … FOR UPDATE`。
+ *
+ * 为什么必须锁：`checkHotelPhysicalFit` 是「两次 findMany + 纯内存推算」的**只读**判定。
+ * 两个请求同时抢最后 1 间时，各自读到的都是「还剩 1 间」的旧快照，于是双双通过、双双落库
+ * —— 闸再准也拦不住，因为它们从来没在同一条时间线上排过队。加了这把行锁，同一酒店同一段
+ * 日期的并发下单会在这里串行：后到的那个要等前一个事务提交，然后**重新读到**它已落库的占房。
+ *
+ * 锁哪一行：包房周期（HotelBlockPeriod）—— 它是「这个酒店这几天有多少间」的权威载体，
+ * 天然是这段库存的共享父记录；顺带也把「房控正在改包房间数」和下单串了起来。
+ * 按 id 排序加锁，避免两个事务以不同顺序锁同一批行造成死锁。
+ *
+ * 该酒店该区间没有任何包房周期 → 无行可锁，直接返回：这种情况本就「未纳入管控」，
+ * 前瞻闸也不会拦（房控哲学：未配包房 ≠ 售罄），没有需要互斥的库存。
+ *
+ * ⚠ 必须在**调用方的事务内**调用，且调用方要在同一事务里完成占房落库 —— 行锁随事务提交
+ * 才释放；在事务外调用等于锁一秒就放，毫无意义。
+ */
+export async function lockHotelBlockPeriodsWithinTx(
+  tx: Prisma.TransactionClient,
+  hotelId: string,
+  nightDates: readonly string[],
+): Promise<void> {
+  if (nightDates.length === 0) return;
+  const fromD = toDateOnly(nightDates[0]);
+  const toD = toDateOnly(nightDates[nightDates.length - 1]);
+  await tx.$queryRaw`
+    SELECT id FROM "HotelBlockPeriod"
+    WHERE "hotelId" = ${hotelId} AND "dateFrom" <= ${toD} AND "dateTo" >= ${fromD}
+    ORDER BY id
+    FOR UPDATE
+  `;
+}
+
+/**
+ * `assertHotelPhysicalFit` 的**事务内互斥**变体：先锁该酒店该区间的包房周期行，
+ * 再在同一事务里跑一遍完全相同的前瞻闸判定。
+ *
+ * 用法（调用方必须满足，否则锁白加）：
+ *   1. 在 `prisma.$transaction(async (tx) => { … })` 里调用，把 `tx` 传进来；
+ *   2. 调用它之后、**同一个事务内**写入本次占房（OrderItem 的 hotelRoomTypeId +
+ *      hotelCheckIn/hotelCheckOut/roomsBilled），事务提交前不得释放；
+ *   3. 事务隔离级别用默认的 READ COMMITTED 即可 —— 后到的事务拿到锁时会重新取快照，
+ *      看得见前一个事务刚提交的占房。
+ *
+ * 判定口径与非事务版一字不差（同一个 checkHotelPhysicalFit），只是多了一把锁：
+ * 语义没变，变的是「两个人同时抢最后一间」时不再双双通过。
+ */
+export async function assertHotelPhysicalFitWithinTx(
+  tx: Prisma.TransactionClient,
+  hotelId: string,
+  nightDates: readonly string[],
+  prospective: ProspectiveOccupancy,
+  opts: {
+    excludeOrderId?: string;
+    allowNonWorsening?: boolean;
+    buildMessage?: (violations: readonly PhysicalFitViolation[]) => string;
+  } = {},
+): Promise<void> {
+  await lockHotelBlockPeriodsWithinTx(tx, hotelId, nightDates);
+  await assertHotelPhysicalFit(hotelId, nightDates, prospective, opts, tx);
 }
 
 // ── 随机档聚合余量（派生视图；下单闸 + 销控板共用同一公式）─────────────────

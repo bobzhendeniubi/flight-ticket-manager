@@ -78,6 +78,9 @@ function CopyBlock({
         </button>
       </div>
       <p className="whitespace-pre-wrap break-words text-sm leading-6 text-ink-soft">{value || '暂无文案'}</p>
+      {disabled && disabledReason && (
+        <p className="mt-2 text-xs leading-5 text-amber-800">{disabledReason}</p>
+      )}
       {!value && rejectionReason && (
         <p className="mt-2 rounded border border-amber-200 bg-amber-50 px-2 py-1.5 text-xs leading-5 text-amber-800">
           该段文案未采用：{rejectionReason}
@@ -98,6 +101,7 @@ export function PosterDetailModal({
 }: PosterDetailModalProps) {
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [copyFailure, setCopyFailure] = useState<{ label: string; value: string } | null>(null);
+  const [reviewConfirmed, setReviewConfirmed] = useState(false);
   const copyTimerRef = useRef<number | null>(null);
   const closeButtonRef = useRef<HTMLButtonElement | null>(null);
   const dialogRef = useRef<HTMLDivElement | null>(null);
@@ -108,6 +112,7 @@ export function PosterDetailModal({
   useEffect(() => {
     setCopiedKey(null);
     setCopyFailure(null);
+    setReviewConfirmed(false);
     if (copyTimerRef.current !== null) { window.clearTimeout(copyTimerRef.current); copyTimerRef.current = null; }
   }, [detail?.id]);
 
@@ -164,7 +169,7 @@ export function PosterDetailModal({
   }
 
   async function handleCopy(key: string, label: string, value: string | null): Promise<void> {
-    if (!value || !detail) return;
+    if (!value || !detail || !reviewConfirmed) return;
     const copied = await copyText(value);
     if (!copied) {
       setCopiedKey(null);
@@ -181,7 +186,7 @@ export function PosterDetailModal({
   }
 
   function downloadPng(): void {
-    if (!detail?.imageDataUrl) return;
+    if (!detail?.imageDataUrl || !reviewConfirmed) return;
     const link = document.createElement('a');
     link.href = detail.imageDataUrl;
     const safeTitle = detail.title.replace(/[\\/:*?"<>|]/gu, '_').trim() || '海报';
@@ -214,9 +219,11 @@ export function PosterDetailModal({
     ? '详情加载中，请稍候'
     : !detail
       ? '暂无详情可分发'
-      : !detail.imageDataUrl
-        ? `未生成图片，无法下载 PNG${renderReport?.error ? `：${renderReport.error}` : ''}`
-        : null;
+        : !detail.imageDataUrl
+          ? `未生成图片，无法下载 PNG${renderReport?.error ? `：${renderReport.error}` : ''}`
+          : !reviewConfirmed
+            ? '请先勾选“我已逐项核对，确认海报内容无误”'
+            : null;
 
   return (
     <div
@@ -280,8 +287,8 @@ export function PosterDetailModal({
                     <span className="font-medium">生成失败：</span>{renderReport?.error ?? '未生成图片，请重试。'}
                   </div>
                 ) : (
-                  <div className="rounded-lg border-2 border-emerald-200 bg-emerald-50 px-3 py-2.5 text-sm leading-6 text-emerald-800">
-                    海报上的文字由系统按订单与航班事实快照直接渲染，不经过生图模型，也不需要人工复核确认。
+                  <div className="rounded-lg border-2 border-amber-200 bg-amber-50 px-3 py-2.5 text-sm leading-6 text-amber-900">
+                    海报文字由 AI 渲染，发布前请对照右侧数据核对航班号与时刻。
                   </div>
                 )}
                 {detail.status !== 'FAILED' && truncated.length > 0 && (
@@ -297,6 +304,17 @@ export function PosterDetailModal({
                     </div>
                   ))}
                 </div>
+                {detail.status !== 'FAILED' && detail.imageDataUrl && (
+                  <label className="mt-3 flex cursor-pointer items-start gap-2 rounded-lg border-2 border-brand-200 bg-brand-50 px-3 py-2.5 text-sm leading-6 text-brand-900">
+                    <input
+                      type="checkbox"
+                      className="mt-1"
+                      checked={reviewConfirmed}
+                      onChange={(event) => setReviewConfirmed(event.target.checked)}
+                    />
+                    <span>我已逐项核对，确认海报内容无误</span>
+                  </label>
+                )}
               </div>
 
               <div>
@@ -306,8 +324,8 @@ export function PosterDetailModal({
                     label="朋友圈"
                     value={detail.copyMoments}
                     copied={copiedKey === 'moments'}
-                    disabled={loading}
-                    disabledReason={loading ? '详情加载中，请稍候' : null}
+                    disabled={loading || !reviewConfirmed || !detail.imageDataUrl}
+                    disabledReason={disabledReason}
                     rejectionReason={copyRejectionReason(renderReport, 'moments')}
                     onCopy={() => void handleCopy('moments', '朋友圈', detail.copyMoments)}
                   />
@@ -315,8 +333,8 @@ export function PosterDetailModal({
                     label="代理群"
                     value={detail.copyAgent}
                     copied={copiedKey === 'agent'}
-                    disabled={loading}
-                    disabledReason={loading ? '详情加载中，请稍候' : null}
+                    disabled={loading || !reviewConfirmed || !detail.imageDataUrl}
+                    disabledReason={disabledReason}
                     rejectionReason={copyRejectionReason(renderReport, 'agent')}
                     onCopy={() => void handleCopy('agent', '代理群', detail.copyAgent)}
                   />
@@ -324,8 +342,8 @@ export function PosterDetailModal({
                     label="小红书"
                     value={detail.copyXhs}
                     copied={copiedKey === 'xhs'}
-                    disabled={loading}
-                    disabledReason={loading ? '详情加载中，请稍候' : null}
+                    disabled={loading || !reviewConfirmed || !detail.imageDataUrl}
+                    disabledReason={disabledReason}
                     rejectionReason={copyRejectionReason(renderReport, 'xhs')}
                     onCopy={() => void handleCopy('xhs', '小红书', detail.copyXhs)}
                   />
@@ -358,7 +376,7 @@ export function PosterDetailModal({
           <button
             type="button"
             className="btn-primary"
-            disabled={!detail?.imageDataUrl || loading}
+            disabled={!detail?.imageDataUrl || loading || !reviewConfirmed}
             title={disabledReason ?? undefined}
             onClick={downloadPng}
           >

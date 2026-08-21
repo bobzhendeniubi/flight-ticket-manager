@@ -323,7 +323,7 @@ export interface MarketingCopyRejection {
   reason: string;
 }
 
-/** 服务端叠字与文案核验元信息；字段名沿用 verifyReport 以兼容历史数据。 */
+/** 整图生图提示词与文案核验元信息；字段名沿用 verifyReport 以兼容历史数据。 */
 export interface MarketingRenderReport {
   schemaVersion?: number;
   templateKey?: string;
@@ -350,11 +350,36 @@ export interface MarketingPosterDetail extends MarketingPosterListItem {
   copyXhs: string | null;
 }
 
+export interface MarketingUsageByModel {
+  model: string;
+  count: number;
+  attempts: number;
+}
+
+export interface MarketingUsage {
+  today: {
+    total: number;
+    mine: number;
+    limitPerUser: number;
+    limitTotal: number;
+  };
+  month: {
+    total: number;
+    byModel: MarketingUsageByModel[];
+  };
+}
+
 export interface CreateMarketingFlightRoutePosterInput {
   title: string;
   outboundScheduleId: string;
   returnScheduleId?: string;
   templateKey: string;
+  headline?: string;
+  subtitle?: string;
+  slogan?: string;
+  highlights?: string[];
+  ctaLine1?: string;
+  ctaLine2?: string;
   effectiveFrom?: string;
   baggageText?: string;
   extraNote?: string;
@@ -1239,8 +1264,18 @@ export interface OrderSummary {
   subtotal: string;
   total: string;
   paidAmount: string;
+  /**
+   * 尾款（后端权威口径，前端唯一真源）：
+   *   balanceDue = effectivePayable − paidAmount − prepaymentOffset
+   * 正=欠款、0=已结清、负=多付。**不要**在前端用「total − paidAmount」自己算——
+   * 那样会漏掉 prepaymentOffset（代理预存抵扣，视同已付），同一张单在列表与收款对账台会出现两个数字。
+   */
   balanceDue: string;
-  /** 售后费用合计（改期费 + 换人费）；尾款 = total + adjustmentCny − paidAmount。后端未启用时缺省 */
+  /** 客户实际应付 = total + adjustmentCny（含改期费/换人费等售后调整）。旧后端缺省 */
+  effectivePayable?: string;
+  /** 代理预存余额抵扣（视同已付，算尾款时必须一并扣减）。旧后端缺省 */
+  prepaymentOffset?: string;
+  /** 售后费用合计（改期费 + 换人费）；应付 = total + adjustmentCny。后端未启用时缺省 */
   adjustmentCny?: number;
   /** 售后费用明细（改期费 / 换人费）；列表可能为空，详情带出 */
   adjustments?: OrderAdjustment[];
@@ -1279,6 +1314,12 @@ export interface OrderSummary {
   reminders?: OperationalReminder[];
   // 订单详情(getOrder)带出的收款记录（列表不含，避免 proof 数据膨胀）
   payments?: OrderPayment[];
+  /**
+   * 订单详情(getOrder)带出的退款记录（列表不含）。
+   * ⚠️ amount 是**申请时冻结的应退总额**，含「会自动退回代理预存余额」的部分——
+   * 不能当成财务要打的现金额。打款金额看退款拆分（GET /orders/:id/refund-quote 的 refundToCashCny）。
+   */
+  refunds?: OrderRefund[];
 
   // 出纳预期到账金额 + 锁定（仅 ADMIN/STAFF 看；AGENT 不看）
   // Decimal 在 JSON 里是 string；null 表示未设置
@@ -1301,6 +1342,77 @@ export interface OrderSummary {
   adultUnitPriceCny?: number | null;
   childUnitPriceCny?: number | null;
   infantUnitPriceCny?: number | null;
+}
+
+/** 退款记录状态（与 backend RefundStatus 对齐） */
+export type RefundRecordStatus = 'REQUESTED' | 'APPROVED' | 'PROCESSING' | 'COMPLETED' | 'REJECTED';
+
+/** 订单详情带出的退款记录（Decimal 在 JSON 里是 string） */
+export interface OrderRefund {
+  id: string;
+  orderId: string;
+  /** 申请时冻结的应退**总额**（含自动退回代理余额的部分），不是打款金额 */
+  amount: string;
+  reason: string | null;
+  status: RefundRecordStatus;
+  processedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+// ── 退款报价（GET /orders/:id/refund-quote）────────────────────────────────
+// 与 backend/src/lib/cancellation.ts 的 CancellationQuote / ItemQuote 一一对齐。
+// ⚠️ 金额一律是 number（后端 computeCancellationQuote 全部走 Number(...) 转换后返回，
+//    不是 Decimal 序列化出的 string）——不要在这里写成 string，也不要在前端二次运算金额。
+
+/** 退款报价里的单行明细（每个 OrderItem 一行） */
+export interface RefundQuoteItem {
+  itemId: string;
+  kind: string;
+  description: string;
+  /** 该行毛价（明细行金额） */
+  amount: number;
+  /** 该行实际分摊到的已付金额（手续费与应退的基数） */
+  paidShare: number;
+  hoursLeft: number | null;
+  policyId: string | null;
+  policyName: string;
+  matchedTier: { hoursBeforeDeparture: number; feePercent: number } | null;
+  feePercent: number;
+  feeAmount: number;
+  refundAmount: number;
+  reason: string;
+  fulfilled: boolean;
+}
+
+export interface RefundQuote {
+  orderId: string;
+  orderNumber: string;
+  /** 现金实收 */
+  paidAmount: number;
+  /** 代理预存余额抵扣额（同样是客户付出的钱，计入可退基数） */
+  prepaymentOffsetCny: number;
+  /** 改期费 / 换人费（已发生的不可退成本，从可退基数里剔除） */
+  adjustmentCny: number;
+  /** 可退基数 = max(0, paidAmount + prepaymentOffset − adjustmentCny) */
+  refundableBaseCny: number;
+  feeScale: number;
+  totalFee: number;
+  /** 应退合计 = refundToCashCny + refundToBalanceCny */
+  totalRefund: number;
+  /**
+   * 应退里**要真的打款出去**的现金部分——财务按这个数字打钱。
+   * 旧后端未下发时可能为 undefined，消费方必须按「拆分不可用」处理，**绝不可自己减出来**。
+   */
+  refundToCashCny: number;
+  /**
+   * 应退里退回代理预存余额的部分：批准退款时后端自动写一笔余额回补流水，**无需人工打款**。
+   * 财务若按 totalRefund 全额打现金，就会和这笔自动回补重复退钱。
+   */
+  refundToBalanceCny: number;
+  items: RefundQuoteItem[];
+  cancellable: boolean;
+  cancellableReason?: string;
 }
 
 /** listOrders 查询参数（与 backend listOrdersQuerySchema 对齐） */
@@ -2611,6 +2723,8 @@ export const api = {
   marketing: {
     listTemplates: (token: string) =>
       apiFetch<{ templates: MarketingTemplate[] }>('/marketing/templates', { token }),
+    getUsage: (token: string) =>
+      apiFetch<MarketingUsage>('/marketing/usage', { token }),
     listPosters: (
       token: string,
       params?: {
@@ -2847,6 +2961,12 @@ export const api = {
       token,
       body,
     }),
+  /**
+   * 退款报价（只读，不改任何状态）：实时按当前取消策略算应退，并给出「退现金 / 退回代理余额」拆分。
+   * 批准退款前必须看这个——Refund.amount 是**含余额部分的总额**，照总额打现金会重复退钱。
+   */
+  refundQuote: (token: string, id: string) =>
+    apiFetch<{ quote: RefundQuote }>(`/orders/${id}/refund-quote`, { token }),
   updateOrderStatus: (token: string, id: string, toStatus: OrderStatus, reason?: string, force?: boolean) =>
     apiFetch<{ order: OrderSummary }>(`/orders/${id}/status`, {
       method: 'PATCH',

@@ -19,6 +19,10 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 const { mockPrisma } = vi.hoisted(() => ({
   mockPrisma: {
     bundle: { findUnique: vi.fn() },
+    // 套餐去程出发日的权威来源（A7）：priceAndValidateItems 会按同 bundle 的 FLIGHT 航段查库，
+    // 用真实出发日覆盖客户端可伪造的 metadata.goDate（房控占房盖章据此）。本用例不关心日期，
+    // 桩成空数组 → 无航段可依，盖章沿用行内 goDate，与本文件断言的座位账口径互不影响。
+    flightSchedule: { findMany: vi.fn() },
   },
 }));
 
@@ -93,6 +97,7 @@ function flightLeg(bundleId?: string): OrderItemInput {
 beforeEach(() => {
   vi.clearAllMocks();
   vi.restoreAllMocks();
+  mockPrisma.flightSchedule.findMany.mockResolvedValue([]);
   // FLIGHT 行动态定价：spy 实例上的 pricing.calculatePrice，返回稳定价（不依赖真 DB / 真定价链路）。
   vi.spyOn(
     (service as unknown as { pricing: { calculatePrice: (...a: unknown[]) => unknown } }).pricing,

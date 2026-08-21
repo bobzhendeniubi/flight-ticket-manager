@@ -69,9 +69,22 @@ describe('funds-guard · 处置闸 assertOrderAllowsFundsDisposal', () => {
     ).toThrow(BadRequestError);
   });
 
-  it('收款闸不拉黑 REFUND_REQUESTED：退款审批中仍可补收（只挡处置，不挡进钱）', () => {
-    expect(FUNDS_CREDIT_BLOCKED_STATUSES).not.toContain(OrderStatus.REFUND_REQUESTED);
-    expect(() => assertOrderAcceptsFunds(live(OrderStatus.REFUND_REQUESTED))).not.toThrow();
+  /**
+   * 三道闸对 REFUND_REQUESTED 的口径必须一致：处置闸/撤销闸都拉黑、唯独收款闸放行时，
+   * 退款审批窗口期进来的钱在订单落 REFUNDED 后既撤不掉、也处置不了、也退不出去（四门全锁）。
+   */
+  it('收款闸同样拉黑 REFUND_REQUESTED：退款审批中不许再进钱（改走挂账池）', () => {
+    expect(FUNDS_CREDIT_BLOCKED_STATUSES).toContain(OrderStatus.REFUND_REQUESTED);
+    expect(() => assertOrderAcceptsFunds(live(OrderStatus.REFUND_REQUESTED))).toThrow(
+      /当前状态为「退款申请中」，不能记录收款/,
+    );
+    // 拒绝文案必须给出出路（挂账池），否则一线只会去改状态绕过闸门
+    expect(() => assertOrderAcceptsFunds(live(OrderStatus.REFUND_REQUESTED))).toThrow(/挂账池/);
+  });
+
+  it('FAILED 仍在收款闸外：出票失败单可继续补款/抵扣（防误伤回归）', () => {
+    expect(FUNDS_CREDIT_BLOCKED_STATUSES).not.toContain(OrderStatus.FAILED);
+    expect(() => assertOrderAcceptsFunds(live(OrderStatus.FAILED))).not.toThrow();
   });
 
   it('拒绝对死单/软删单处置', () => {

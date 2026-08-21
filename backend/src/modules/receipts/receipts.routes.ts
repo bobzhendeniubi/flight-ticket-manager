@@ -41,10 +41,13 @@ export const receiptRoutes: FastifyPluginAsync = async (app) => {
   const requireAdminOrStaff = app.requireRole(UserRole.ADMIN, UserRole.STAFF);
 
   // ── 挂账池列表 ───────────────────────────────────────
+  // 回 { receipts, summary }：summary 是未认领的**服务端全量聚合**（笔数 + 未认余额合计），
+  // 挂账余额 KPI 一律读它——行数组可能被上限截断，聚合不会（见 service.list 注释）。
+  // receipts 字段口径不变，只读 receipts 的老前端行为完全一致。
   app.get('/', { preHandler: [app.authenticate, requireAdminOrStaff] }, async (req) => {
     const query = listReceiptsQuerySchema.parse(req.query);
-    const receipts = await service.list(query);
-    return { receipts };
+    const { receipts, summary } = await service.list(query);
+    return { receipts, summary };
   });
 
   // ── 总账（合并时间线，只读） ──────────────────────────
@@ -103,7 +106,11 @@ export const receiptRoutes: FastifyPluginAsync = async (app) => {
     async (req) => {
       const body = parseStatementSchema.parse(req.body);
       try {
-        return await service.previewStatement(body.fileBase64, body.platform);
+        // 传入操作人：预览会把服务端解析出的可导入行记进短期缓存，
+        // 入库端点只认这些行（见 receipts.service importStatement 的「预览绑定」）。
+        return await service.previewStatement(body.fileBase64, body.platform, {
+          userId: req.user.sub,
+        });
       } catch (e: unknown) {
         // ExcelJS 对损坏/非 xlsx 文件抛底层错 → 统一转 400（与名单解析同口径）
         if (e instanceof BadRequestError) throw e;

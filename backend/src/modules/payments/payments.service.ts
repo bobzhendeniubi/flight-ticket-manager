@@ -776,9 +776,13 @@ export class PaymentsService {
    * 全成功或全回滚——不能出现「订单加了钱但进账没记认领」的资金分叉。
    *
    * 与 confirmManualPayment 的入账口径逐字一致（同一行锁读余额 + 同一防手误上限
-   * + 同一 paidAmount 累加 + 同一全额自动翻 PAID + 同一 _updateStatusWithinTx 生成佣金/履约）。
-   * 差异仅在事务边界：这里不自己开事务，由调用方 tx 统筹；履约任务 id 通过
+   * + 同一超收硬闸 + 同一 paidAmount 累加 + 同一全额自动翻 PAID + 同一 _updateStatusWithinTx
+   * 生成佣金/履约）。差异仅在事务边界：这里不自己开事务，由调用方 tx 统筹；履约任务 id 通过
    * pendingFulfillmentTaskIds 回传，调用方在事务提交后入队。
+   *
+   * 唯一**刻意**的口径差异：不判 `paymentsLocked` 复核锁。锁只拦「人工录入」；本内核服务的是
+   * 对账认款——真钱已经到公司账上，必须如实落库，绝不因复核锁把到账丢掉（见 confirmManualPayment
+   * 上方的口径边界注释）。别给这里补锁；要补对称性请改撤销侧。
    *
    * 注意：此函数本身不写审计——调用方（对账认领）按自己的口径写审计。
    */
@@ -828,10 +832,30 @@ export class PaymentsService {
         `收款金额 ¥${amount.toFixed(2)} 异常偏高（订单总额 ¥${total.toFixed(2)}），疑似录入错误，已拒绝。如确需大额到账请分笔录入或核对金额。`,
       );
     }
-    const newPaid = already + amount;
     // 清账口径（与 confirmManualPayment 一字一致）：paidAmount + prepaymentOffset >= total + adjustmentCny
     const effectivePayable = total + order.adjustmentCny;
-    const fullyPaid = newPaid + Number(order.prepaymentOffset) + 0.001 >= effectivePayable;
+    const prepaymentOffset = Number(order.prepaymentOffset);
+
+    // ── 超收硬闸（与 confirmManualPayment 同一判定函数、同一口径）────────────────
+    // 少了这一闸，认款就是一条能把 paidAmount 无限抬到应收之上的旁路：把一笔大额流水
+    // 反复认到同一张小额订单上，订单账面凭空多付，而多付会继续喂给多付转余额/退款等下游，
+    // 造成真实资金损失。收满不拦，仅严格超出才拦。
+    // 认款场景下钱本来就躺在挂账池里：拒绝这一笔不会丢钱——只认到应收余额为止，
+    // 剩下的留在池子里按挂账处置（退回客户 / 认到别的单），这正是挂账池存在的意义。
+    const refundedTotal = await sumCompletedRefundsWithinTx(tx, orderId);
+    if (wouldOvercharge({ effectivePayable, alreadyPaid: already, prepaymentOffset, refundedTotal, amount })) {
+      const creditable = round2(
+        Math.max(0, effectivePayable - (already - refundedTotal) - prepaymentOffset),
+      );
+      throw new BadRequestError(
+        `订单 ${order.orderNumber} 应收 ¥${round2(effectivePayable).toFixed(2)}、已收净额 ` +
+          `¥${round2(already - refundedTotal).toFixed(2)}，本笔 ¥${round2(amount).toFixed(2)} 会超出应收。` +
+          `最多只能认领 ¥${creditable.toFixed(2)}，超出部分请留在挂账池另行处置。`,
+      );
+    }
+
+    const newPaid = already + amount;
+    const fullyPaid = newPaid + prepaymentOffset + 0.001 >= effectivePayable;
 
     const payment = await tx.payment.create({
       data: {

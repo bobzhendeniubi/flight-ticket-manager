@@ -67,10 +67,12 @@ import {
 } from '../settlement-discounts/settlement-discounts.service.js';
 import {
   assertHotelPhysicalFit,
+  assertHotelPhysicalFitWithinTx,
   assertRandomTierFit,
   checkHotelPhysicalFit,
   getHotelNightlyRemaining,
   getRandomTierAggregate,
+  lockHotelBlockPeriodsWithinTx,
   randomStarTierLabel,
   type ProspectiveOccupancy,
 } from '../hotel-control/hotel-control.service.js';
@@ -884,9 +886,15 @@ export class OrderService {
     const ownerUserId: string | null = isGuest ? null : requester.userId;
     const guest = isGuest ? requester.guest : null;
 
-    // 录单调价/加项 + 本单结算总价：仅 ADMIN/STAFF 录单可用。服务端按认证身份判权限（不信前端）——
-    // 公开散客/客户/代理携带这些字段直接 400，杜绝对外接口被绕过手工改价。
-    if (body.priceAdjustment || body.settlementTotalCny !== undefined) {
+    // 录单调价/加项 + 本单结算总价 + 机票团队议价结算价：仅 ADMIN/STAFF 录单可用。服务端按认证身份
+    // 判权限（不信前端）——公开散客/客户/代理携带这些字段直接 400，杜绝对外接口被绕过手工改价。
+    // flightSettlementPriceCny 会短路机票动态定价（priceAndValidateItems），公开下单口必须与 /orders/batch
+    // 一样收口，否则匿名游客可传 0 以零元买机票并真实扣座。
+    if (
+      body.priceAdjustment ||
+      body.settlementTotalCny !== undefined ||
+      body.flightSettlementPriceCny !== undefined
+    ) {
       const role = isGuest ? undefined : requester.role;
       if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
         throw new BadRequestError('无权调整订单价格');
@@ -1216,6 +1224,19 @@ export class OrderService {
         // 其余人占本行原舱位（经济舱减掉升舱人数；非经济舱行 split.business=0，等于全额扣原舱）
         await decrementSeat(p.flightScheduleId, p.flightCabin, split.sameCabin);
       }
+
+      // ── 酒店房量闸（CRITICAL 修复）：与扣座 CAS 对称的「防超卖」原子闸 ──────────
+      // 座位有 CAS 防超卖，房量此前只有 BUNDLE 分支在**事务外**做了一次只读前瞻判定，
+      // 单独 HOTEL 行（指定房型）更是一道闸都没有 —— 售罄后照样落库占房，销控板变负，
+      // 只在事后超卖提醒里报警。这里在写 OrderItem 的**同一个事务**里，先锁目标酒店该区间的
+      // 包房周期行再判定：判定与落库之间没有窗口，两笔并发下单抢最后一间只会成一笔。
+      // （priceAndValidateItems 里那道事务外的判定保留为「友好预检」：它能在长事务开始前就
+      //  拒掉明显售罄的单，也服务于 quote 试算；权威判定以这里为准。）
+      // 未落位随机档行（无房型）不走这里，它们由 assertRandomTierFit 按同星级聚合余量把关。
+      await assertHotelStaysFitWithinTx(tx, pricedItems, body.passengers, {
+        // 前台散客/游客也走这条路径 → 中性话术，不暴露包房间数等内部库存数字。
+        buildMessage: () => HOTEL_SOLD_OUT_MESSAGE,
+      });
 
       // 初始状态直接 PENDING_PAYMENT（MVP 阶段没有 DRAFT 保存流）
       const created = await tx.order.create({
@@ -1943,41 +1964,80 @@ export class OrderService {
   }
 
   /**
-   * 解析单个 BUNDLE 行自己的去程出发本地日。
-   * 优先使用该行随套餐传入的 goDate（购物车一行对应一个出发日期）；缺失或异常时，
-   * 再从同 bundleId 的 FLIGHT 航段取最早出发日。绝不扫描整单，避免多套餐/散票串日期。
+   * 同 bundleId 的真实 FLIGHT 航段 → 该套餐的**权威**去程出发本地日（bundleId → YYYY-MM-DD）。
+   *
+   * 为什么必须以航段为准（A7 套利口径修正）：
+   * 订单行 metadata.goDate 是**客户端可控**的自由字段，此前只做 /^\d{4}-\d{2}-\d{2}$/ 正则校验，
+   * 从不与真实航段核对，却同时是三件事的取价/盖章依据：结算价日历取价、散客立减规则命中、
+   * 房控占房盖章。于是散客只要把 goDate 改到一个有立减/低价的日期、并同步下调 expectedTotalCny，
+   * 前后端同源校验就一路通过 —— 白拿立减，且占房被盖到伪造日期上（房控账实分叉）。
+   *
+   * 修正：有同 bundle 航段时一律以「最早出发航段的出发地本地日」为权威日期，goDate 只当展示提示。
+   * 航段是服务端按 flightScheduleId 查库得到的，客户端改不了。
+   * 纯地面套餐（本单没有同 bundle 的 FLIGHT 行）没有航段可依，仍回落 goDate —— 见调用处说明。
+   */
+  private async resolveAuthoritativeBundleGoDates(
+    items: ReadonlyArray<OrderItemInput>,
+  ): Promise<Map<string, string>> {
+    const scheduleIdsByBundle = new Map<string, Set<string>>();
+    for (const item of items) {
+      if (item.kind !== 'FLIGHT' || !item.bundleId || !item.flightScheduleId) continue;
+      const set = scheduleIdsByBundle.get(item.bundleId) ?? new Set<string>();
+      set.add(item.flightScheduleId);
+      scheduleIdsByBundle.set(item.bundleId, set);
+    }
+    if (scheduleIdsByBundle.size === 0) return new Map();
+
+    const allScheduleIds = [
+      ...new Set([...scheduleIdsByBundle.values()].flatMap((set) => [...set])),
+    ];
+    const schedules = await prisma.flightSchedule.findMany({
+      where: { id: { in: allScheduleIds } },
+      select: { id: true, departureTime: true, departureTz: true },
+    });
+    const scheduleById = new Map(schedules.map((s) => [s.id, s]));
+
+    const result = new Map<string, string>();
+    for (const [bundleId, ids] of scheduleIdsByBundle) {
+      const rows = [...ids]
+        .map((sid) => scheduleById.get(sid))
+        .filter((s): s is (typeof schedules)[number] => s != null);
+      if (rows.length === 0) continue;
+      const earliest = rows.reduce(
+        (min, s) => (s.departureTime < min.departureTime ? s : min),
+        rows[0],
+      );
+      result.set(bundleId, localDate(earliest.departureTime, earliest.departureTz));
+    }
+    return result;
+  }
+
+  /**
+   * 解析单个 BUNDLE 行自己的去程出发本地日（供结算价日历 / 立减规则取价）。
+   *
+   * 口径（A7 修正后）：
+   *   1. 同 bundleId 的真实 FLIGHT 航段（最早出发）本地日 —— 权威，客户端改不了；
+   *   2. 本单没有同 bundle 航段（纯地面套餐）时才回落该行的 goDate。
+   * 绝不扫描整单的其它航段，避免多套餐 / 散票串日期。
+   *
+   * 修正前是反的（goDate 优先），导致 goDate 这个客户端自由字段直接决定结算价与立减命中。
    */
   private async resolveBundleItemDepartureLocalDate(
     body: Pick<CreateOrderBody, 'items'>,
     bundleItem: Extract<OrderItemInput, { kind: 'BUNDLE' }>,
   ): Promise<string | null> {
+    const authoritative = (await this.resolveAuthoritativeBundleGoDates(body.items)).get(
+      bundleItem.bundleId,
+    );
+    if (authoritative) return authoritative;
+
+    // 纯地面套餐：无航段可依，只能用行内 goDate（仍做格式校验）。
+    // 这条路径没有机票，本身也不进机票结算价日历；地面套餐的日期套利面远小于机票+立减。
     const goDate = bundleItem.metadata?.goDate;
     if (typeof goDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(goDate)) {
       return goDate;
     }
-
-    const scheduleIds = [
-      ...new Set(
-        body.items
-          .filter(
-            (item): item is Extract<OrderItemInput, { kind: 'FLIGHT' }> =>
-              item.kind === 'FLIGHT' && item.bundleId === bundleItem.bundleId,
-          )
-          .map((item) => item.flightScheduleId),
-      ),
-    ];
-    if (scheduleIds.length === 0) return null;
-    const schedules = await prisma.flightSchedule.findMany({
-      where: { id: { in: scheduleIds } },
-      select: { departureTime: true, departureTz: true },
-    });
-    if (schedules.length === 0) return null;
-    const earliest = schedules.reduce(
-      (min, schedule) =>
-        schedule.departureTime < min.departureTime ? schedule : min,
-      schedules[0],
-    );
-    return localDate(earliest.departureTime, earliest.departureTz);
+    return null;
   }
 
   /**
@@ -2063,6 +2123,12 @@ export class OrderService {
   ) {
     const priced: PricedOrderItem[] = [];
 
+    // 套餐去程出发日的权威来源（A7）：同 bundle 的真实 FLIGHT 航段，客户端改不了。
+    // 房控占房盖章（下方 resolveBundleHotelStamp）此前直接吃客户端自由字段 metadata.goDate，
+    // 伪造的日期会把占房盖到错误的夜晚上（房控账实分叉）。有航段时一律用航段日覆盖。
+    // 纯地面套餐（无同 bundle 航段）→ map 里没有该 bundleId，保持原 goDate 现状不变。
+    const authoritativeBundleGoDates = await this.resolveAuthoritativeBundleGoDates(items);
+
     // 本单所有 BUNDLE 行选「升舱商务」的总人数（多份套餐叠加），去程 / 回程各自一份 ——
     // 同一批客人可以只升去程、或去回程升的人数不同。循环结束后按航段落到对应 FLIGHT 行：
     // 第一条经济舱航段 = 去程，其余（回程）取回程人数；每段各占用自己那一份真实商务舱座位。
@@ -2076,17 +2142,38 @@ export class OrderService {
     // （航班行=折后机票收入，财务航班毛利不假高）。pct 只从 DB 取，不信前端。
     const bundleDiscountPct = new Map<string, number>();
 
+    // ── 团队议价结算价的航段分摊（A9 每人翻倍收口）────────────────────────
+    // settlementPriceCny 的语义（UI 文案与 schema 注释均如此）是「每位出行人**整程**价」，
+    // 但此前是逐 FLIGHT 行各写满价：往返单有两条航段行 → 每人被收两遍。
+    //   算例：填 3600、往返、2 人 → 每单 total 7200、两单实收 14400，运营意图是 7200。
+    //   （留空走结算价日历反而正确，因为日历是「去程价 + 回程价求和 = 每人整程价」。）
+    // 修法：把整程价按航段分摊，各段之和恰好等于整程价 —— 与日历口径一致。
+    // 保留逐行覆盖机制（而非改走 SETTLEMENT 差额行）：metadata.priceOverride='TEAM_SETTLEMENT'
+    // 是后台「价格来源」列与审计的既有依据，议价价也不该依赖动态定价成功与调价上限。
+    const flightLegShares =
+      flightSettlementPriceCny === undefined
+        ? []
+        : splitSettlementPriceAcrossLegs(
+            flightSettlementPriceCny,
+            items.filter((it) => it.kind === 'FLIGHT').length,
+          );
+    let flightLegIndex = 0;
+
     for (const item of items) {
       if (item.kind === 'FLIGHT') {
         // 团队议价结算价：整批以谈定的每人结算价覆盖动态/目录机票价。
         // 仅改价格，扣座 quantity / 班次 / 舱位完全不变（CAS 仍按 quantity 执行）。
         if (flightSettlementPriceCny !== undefined) {
+          // 本航段分摊到的每人价（各段之和 = 每人整程议价，见 flightLegShares 处注释）
+          const legShareCny = flightLegShares[flightLegIndex] ?? flightSettlementPriceCny;
+          const legIndex = flightLegIndex;
+          flightLegIndex += 1;
           priced.push({
             kind: 'FLIGHT',
             description: item.description,
             quantity: item.quantity,
-            unitPrice: flightSettlementPriceCny,
-            amount: Math.round(flightSettlementPriceCny * item.quantity),
+            unitPrice: legShareCny,
+            amount: round2(legShareCny * item.quantity),
             flightScheduleId: item.flightScheduleId,
             flightCabin: item.flightCabin,
             bundleId: item.bundleId,
@@ -2094,7 +2181,12 @@ export class OrderService {
               ...sanitizeFlightItemMetadata(item.metadata),
               // 审计：标记本行价格来自团队议价结算价（非动态价）
               priceOverride: 'TEAM_SETTLEMENT',
+              // 谈定的**每人整程**议价（不随航段拆分变化，供后台/导出显示原始口径）
               settlementPriceCny: flightSettlementPriceCny,
+              // 本行分摊：第几段 / 共几段 / 本段每人价（金额可追溯，避免"钱从哪来"说不清）
+              settlementLegIndex: legIndex,
+              settlementLegCount: flightLegShares.length,
+              settlementLegShareCny: legShareCny,
             },
           });
           continue;
@@ -2474,10 +2566,18 @@ export class OrderService {
         const bundleUnitPrice = Math.max(0, Math.round(groundTotal));
         // 套餐关联酒店 → 把房型+入住日期盖到订单行（房控板自动计入套餐占房）。
         // metadata 缺失/异常时只是不盖章，绝不阻断下单。
+        // 出发日以真实航段为准（A7）：有同 bundle 航段时覆盖客户端传来的 goDate，
+        // 否则伪造的 goDate 会把占房盖到错误的夜晚。无航段（纯地面套餐）时原样沿用。
+        const stampGoDate = item.bundleId
+          ? authoritativeBundleGoDates.get(item.bundleId)
+          : undefined;
+        const stampMetadata = stampGoDate
+          ? { ...(item.metadata ?? {}), goDate: stampGoDate }
+          : item.metadata;
         const hotelStamp = resolveBundleHotelStamp(
           // 指定酒店 → 盖指定房型的章（房控/销控板按指定酒店计占房）；否则按套餐绑定房型现状。
           { hotelRoomTypeId: designatedRoomType?.id ?? bundle.hotelRoomTypeId },
-          item.metadata,
+          stampMetadata,
           nights,
         );
 
@@ -3140,9 +3240,73 @@ export class OrderService {
   // ════════════════════════════════════════════════════════════════════
 
   /**
+   * 多付处置的 Payment 台账对冲行（R6：堵死「处置后再进 PAID 把多付灌回」的造币循环）。
+   *
+   * 病灶：多付处置只把钱从 order.paidAmount 移走，Payment 台账里那几笔 SUCCEEDED 原封不动。
+   * 而 _updateStatusWithinTx 的 PAID 分支会按台账 SUCCEEDED 合计把 paidAmount 抬回去
+   * （`if (paymentsSum > currentPaid) paidAmount = paymentsSum`，用于网关回调补记）。
+   * 于是订单每再进一次 PAID（如 CHANGE_REQUESTED→PAID 驳回改签，合法路径、无需 force），
+   * 多付就凭空复活一次，可无限循环每轮白造一笔钱。
+   *
+   * 修法：处置的同时在台账登记等额流出——一条**负金额 SUCCEEDED** Payment。
+   * 这样 SUCCEEDED 合计随之下降，PAID 分支的重写条件自然恒为假，而补记逻辑本身完好保留
+   * （真有迟到的网关回调补记时仍然生效）。
+   *
+   * 为什么是「负金额 SUCCEEDED」而不是别的状态：
+   *   · 只有 SUCCEEDED 进「实收」合计，要抵扣就必须同在 SUCCEEDED 里，否则合计纹丝不动；
+   *   · paidAt 留空 → 导出的「最近一笔成功收款」（按 paidAt 过滤排序）不会把对冲行误当收款；
+   *   · gatewayPayload.source='overpay-disposal' 是自识别标志，与认款行（source='reconciliation'）
+   *     互不相干，不会被冲销/查重/认款回溯等路径误认。
+   *   · 金额为负 → 手工收款查重（按等额匹配）、认款冲销（按 allocationId/等额匹配）天然不命中。
+   */
+  private async _recordOverpayDisposalPayment(
+    tx: Prisma.TransactionClient,
+    input: {
+      orderId: string;
+      amountCny: number;
+      method: PaymentMethod;
+      disposal: 'AGENT_BALANCE' | 'RECEIPT_POOL';
+      description: string;
+    },
+  ): Promise<void> {
+    await tx.payment.create({
+      data: {
+        orderId: input.orderId,
+        method: input.method,
+        amount: new Prisma.Decimal(-round2(input.amountCny)),
+        status: PaymentStatus.SUCCEEDED,
+        paidAt: null,
+        gatewayPayload: {
+          source: 'overpay-disposal',
+          disposal: input.disposal,
+          amountCny: round2(input.amountCny),
+          disposedAt: new Date().toISOString(),
+          note: input.description,
+        } as Prisma.InputJsonValue,
+      },
+    });
+  }
+
+  /**
+   * 取最近一笔**真实收款**的支付方式（对冲行金额为负，必须排除，否则一路取到自己身上）。
+   */
+  private async _latestInboundPaymentMethod(
+    tx: Prisma.TransactionClient,
+    orderId: string,
+  ): Promise<PaymentMethod> {
+    const latest = await tx.payment.findFirst({
+      where: { orderId, amount: { gt: 0 } },
+      orderBy: { createdAt: 'desc' },
+      select: { method: true },
+    });
+    return latest?.method ?? PaymentMethod.WECHAT_PAY;
+  }
+
+  /**
    * 多付存入代理余额。订单有代理且 paidAmount > total（多付）时：
    *   一个事务里：order.paidAmount 回压到 total（消掉多付），代理 prepaymentBalance += 多付额，
-   *   写一条 PrepaymentTransaction（TOP_UP，钱进余额）+ 关联 orderId。
+   *   写一条 PrepaymentTransaction（TOP_UP，钱进余额）+ 一条负金额对冲 Payment（见
+   *   _recordOverpayDisposalPayment）+ 关联 orderId。
    * 无代理 / 无多付 → 拒绝。
    */
   async creditOverpayToAgent(
@@ -3225,6 +3389,14 @@ export class OrderService {
           description: `订单 ${order.orderNumber} 多付转存代理余额`,
           createdById: actor.userId,
         },
+      });
+      // R6：台账同步登记等额流出，否则订单再进一次 PAID 就会按 SUCCEEDED 合计把多付灌回（造币循环）。
+      await this._recordOverpayDisposalPayment(tx, {
+        orderId,
+        amountCny: overpay,
+        method: await this._latestInboundPaymentMethod(tx, orderId),
+        disposal: 'AGENT_BALANCE',
+        description: `订单 ${order.orderNumber} 多付转存代理余额`,
       });
 
       return {
@@ -3433,18 +3605,21 @@ export class OrderService {
         throw new BadRequestError('该订单没有多付金额（已付款扣除已退款 ≤ 应付），无可转入挂账池');
       }
 
-      // method 兜底：取最近一笔 Payment 的 method，否则 WECHAT_PAY
-      const latestPayment = await tx.payment.findFirst({
-        where: { orderId },
-        orderBy: { createdAt: 'desc' },
-        select: { method: true },
-      });
-      const method = latestPayment?.method ?? PaymentMethod.WECHAT_PAY;
+      // method 兜底：取最近一笔**真实收款**的 method（排除负金额对冲行），否则 WECHAT_PAY
+      const method = await this._latestInboundPaymentMethod(tx, orderId);
 
       // 多付回压：paidAmount 只扣掉本次转出的 overpay（无退款时等于降回清账点，与旧行为一致）。
       await tx.order.update({
         where: { id: orderId },
         data: { paidAmount: new Prisma.Decimal(round2(paid - overpay)) },
+      });
+      // R6：台账同步登记等额流出，否则订单再进一次 PAID 就会按 SUCCEEDED 合计把多付灌回（造币循环）。
+      await this._recordOverpayDisposalPayment(tx, {
+        orderId,
+        amountCny: overpay,
+        method,
+        disposal: 'RECEIPT_POOL',
+        description: `订单 ${order.orderNumber} 多付转入挂账池`,
       });
 
       // 建一笔 OPEN 进账（挂账池），来源标记订单超额
@@ -4407,13 +4582,22 @@ export class OrderService {
           await this.updateStatus(
             id,
             OrderStatus.TICKETED,
-            { userId: 'system:auto-ticketed', role: UserRole.ADMIN },
+            // 系统调用者的两个标识都给全（缺一不可，且互为兜底）：
+            //   · actorType:'SYSTEM' —— _updateStatusWithinTx 判定系统调用者的**显式**依据；
+            //   · userId 前缀 'system-' —— 同一处判定的字符串兜底口径（连字符，不是冒号）。
+            // 判定为系统调用者后，OrderStatusEvent.actorUserId 才会写 null。写成非系统调用者
+            // 会拿这个假 userId 去撞 actorUserId → User(id) 外键，P2003 回滚整个推进事务，
+            // 而下方 catch 又把异常吞掉 —— 功能会静默失效（用户完全看不见）。
+            { userId: 'system-auto-ticketed', role: UserRole.ADMIN, actorType: 'SYSTEM' },
             '航段开票标记齐全，自动推进「出票完成」（TICKETED 派生口径）',
           );
         }
       }
-    } catch {
-      /* 自动推进失败不影响开票标记本身（如并发状态变化）；下次翻标记或手动推进即可 */
+    } catch (err) {
+      // 自动推进失败不影响开票标记本身（如并发状态变化），故不回滚、不抛出；
+      // 但必须留痕 —— 静默吞掉会让「标齐后订单会自动推进」这句承诺失效而无人察觉。
+      // eslint-disable-next-line no-console
+      console.error('[orders] failed to auto-advance order to TICKETED for', id, err);
     }
 
     return updated;
@@ -4636,6 +4820,8 @@ export class OrderService {
     // 批准晚了就重算会让客户平白少拿钱 —— 那是业务口径变更，需拍板，不该混进堵漏。
     // 断言则是客观的资金守恒，无需任何业务口径输入，且覆盖所有压低 paidAmount 的路径（不止多付转存）。
     // 触发时 fail-closed：抛错回滚，Refund 留在 REQUESTED 等人工按最新口径重新报价，绝不擅自少退。
+    // 转 REFUNDED 时需要在事务后半段回补的代理预存余额（口径见下方注释）。null = 无需回补。
+    let prepaymentRestore: { agentId: string; amountCny: number } | null = null;
     if (toStatus === 'REFUNDED') {
       // FOR UPDATE 行锁：与多付转存/挂账池/到账入账（均先对 Order 行 FOR UPDATE）串行——
       // 并发的多付处置要么排在本事务前（paidAmount 已降低 → 本断言拦下），
@@ -4644,6 +4830,26 @@ export class OrderService {
         SELECT "paidAmount" FROM "Order" WHERE id = ${id} FOR UPDATE
       `;
       const paidAmount = lockedRows[0]?.paidAmount ?? order.paidAmount;
+
+      // ── 账目完整性闸：落 REFUNDED 必须有对应的 Refund 记录 ────────────────
+      // 下方「Refund 状态同步」用的是 updateMany(status: REQUESTED)：若这张单从未走过
+      // cancel 退款流程（典型：直接 PATCH status FAILED→REFUND_REQUESTED→REFUNDED，
+      // 每一步都在状态机白名单里、无需 force），updateMany 影响 0 行，订单照样落 REFUNDED。
+      // 后果是这笔钱被永久卡死：实收原封挂在单上、佣金却按全额冲销，而撤销认款 / 转挂账池 /
+      // 软删全被资金闸封死（REFUNDED 在三道闸里都是黑名单），谁也对不平。
+      // 所以一律要求先有 Refund（REQUESTED 或 COMPLETED）——**admin force 同样拦**：
+      // 这是账目完整性，不是流程便利性，force 是用来跳状态机的，不是用来跳账的。
+      const refundRecordCount = await tx.refund.count({
+        where: { orderId: id, status: { in: [RefundStatus.REQUESTED, RefundStatus.COMPLETED] } },
+      });
+      if (refundRecordCount === 0) {
+        throw new BadRequestError(
+          `订单 ${order.orderNumber} 没有任何退款记录，不能置为「已退款」——` +
+            `否则实收会永久挂在单上、既退不出去也冲销不掉（已退款是终态，三道资金闸全部封死）。` +
+            `请改走退款流程：POST /orders/${id}/cancel 生成退款申请（含应退报价），再批准退款。`,
+        );
+      }
+
       const pendingAgg = await tx.refund.aggregate({
         where: { orderId: id, status: RefundStatus.REQUESTED },
         _sum: { amount: true },
@@ -4651,13 +4857,44 @@ export class OrderService {
       const pendingSum = pendingAgg._sum.amount ?? new Prisma.Decimal(0);
       const completedSum = new Prisma.Decimal(await sumCompletedRefundsWithinTx(tx, id));
       const totalRefundOut = completedSum.add(pendingSum);
-      if (totalRefundOut.greaterThan(paidAmount)) {
+      // 守恒基数含预存余额抵扣：代理用余额抵付的钱同样是客户付进来的钱（见 lib/cancellation.ts
+      // 的可退基数口径）。只按 paidAmount 断言会把「余额抵付单的正常退款」全部误拦。
+      const prepaymentOffsetCny = round2(Number(order.prepaymentOffset ?? 0));
+      const paidNum = round2(Number(paidAmount.toString()));
+      const fundsInCny = round2(paidNum + prepaymentOffsetCny);
+      const totalRefundOutCny = round2(Number(totalRefundOut.toString()));
+      if (totalRefundOutCny > fundsInCny + 0.001) {
         throw new BadRequestError(
-          `订单 ${order.orderNumber} 应退合计 ¥${totalRefundOut.toString()} 已超过实收 ¥${paidAmount.toString()}，` +
+          `订单 ${order.orderNumber} 应退合计 ¥${totalRefundOutCny.toFixed(2)} 已超过实收 ¥${fundsInCny.toFixed(2)}` +
+            `（现金 ¥${paidNum.toFixed(2)} + 预存余额抵扣 ¥${prepaymentOffsetCny.toFixed(2)}），` +
             `不能批准退款（退出去的钱不能多过收进来的钱）。` +
             `常见原因：申请退款后多付已被转存代理余额或挂账池，或此前已退过款。` +
             `请财务核对实收与已退金额后，驳回本次申请并按最新口径重新发起。`,
         );
+      }
+
+      // ── 预存余额回补（PrepaymentTxType.REFUND，此前是从未被写入的死枚举）────
+      // 拆分口径与 lib/cancellation.ts 的 splitRefundBetweenCashAndBalance 一字一致
+      //（现金优先：改期费先从现金里消耗，应退先退现金、退不下的部分回余额）。
+      // 这里刻意内联而不是 import：orders.service.test.ts 用 vi.mock 整体替换了
+      // '../../lib/cancellation.js'，静态引用会在该测试里变成 undefined。改这段务必同步改那边。
+      // 幂等：扣掉本单已经回补过的 REFUND 流水，多次/分批批准退款不会重复回补。
+      const adjustmentCny = round2(Number(order.adjustmentCny ?? 0));
+      const cashCapacityCny = Math.max(0, round2(paidNum - adjustmentCny));
+      const refundToCashCny = round2(Math.min(totalRefundOutCny, cashCapacityCny));
+      const refundToBalanceCny = round2(
+        Math.min(Math.max(0, prepaymentOffsetCny), round2(totalRefundOutCny - refundToCashCny)),
+      );
+      if (order.agentId && refundToBalanceCny > 0) {
+        const restoredAgg = await tx.prepaymentTransaction.aggregate({
+          where: { orderId: id, type: PrepaymentTxType.REFUND },
+          _sum: { amount: true },
+        });
+        const alreadyRestoredCny = round2(Number((restoredAgg._sum.amount ?? new Prisma.Decimal(0)).toString()));
+        const restoreNowCny = round2(refundToBalanceCny - alreadyRestoredCny);
+        if (restoreNowCny > 0) {
+          prepaymentRestore = { agentId: order.agentId, amountCny: restoreNowCny };
+        }
       }
     }
 
@@ -4939,6 +5176,36 @@ export class OrderService {
         where: { orderId: id, status: 'REQUESTED' },
         data: { status: 'COMPLETED', processedAt: new Date() },
       });
+
+      // 预存余额回补：客户当初用代理余额抵付的那部分，退款完成时必须原路退回余额账户，
+      // 否则这笔钱在系统里凭空消失（订单侧 prepaymentOffset 记着抵扣过、余额侧却永远收不回）。
+      // 金额已在本函数前半段按「现金优先」口径算好并做过幂等去重（见 prepaymentRestore 处注释）。
+      // 锁序与 applyAgentBalanceToOrder 一致（先 Order 后 Agent，两处都 FOR UPDATE）→ 不会死锁。
+      if (prepaymentRestore) {
+        const agentRows = await tx.$queryRaw<Array<{ prepaymentBalance: Prisma.Decimal }>>`
+          SELECT "prepaymentBalance" FROM "Agent" WHERE id = ${prepaymentRestore.agentId} FOR UPDATE
+        `;
+        if (agentRows[0]) {
+          const balanceAfter = round2(
+            Number(agentRows[0].prepaymentBalance.toString()) + prepaymentRestore.amountCny,
+          );
+          await tx.agent.update({
+            where: { id: prepaymentRestore.agentId },
+            data: { prepaymentBalance: new Prisma.Decimal(balanceAfter) },
+          });
+          await tx.prepaymentTransaction.create({
+            data: {
+              agentId: prepaymentRestore.agentId,
+              amount: new Prisma.Decimal(prepaymentRestore.amountCny), // 正数 = 退回余额
+              balanceAfter: new Prisma.Decimal(balanceAfter),
+              type: PrepaymentTxType.REFUND,
+              orderId: id,
+              description: `订单 ${order.orderNumber} 退款：余额抵扣部分 ¥${prepaymentRestore.amountCny.toFixed(2)} 退回预存余额`,
+              createdById: requester.userId,
+            },
+          });
+        }
+      }
     } else if (toStatus === 'CANCELLED') {
       await tx.refund.updateMany({
         where: { orderId: id, status: 'REQUESTED' },
@@ -5708,6 +5975,20 @@ export class OrderService {
       const oldScheduleId = item.flightScheduleId;
       const oldCabin = item.flightCabin;
       const newScheduleId = input.newScheduleId;
+
+      // ── 改期不许改舱（HIGH 修复：免费升舱后门）────────────────────────────
+      // 改期端点只搬班次、不重算金额：amount/quantity 明写「不变」，feeCny 是手填的且可为 0，
+      // 也不会生成 UPGRADE_CHANGE 行。若同时放开改舱，就等于「经济舱搬进商务舱、座位真的搬走、
+      // 一分差价不收、账面无痕」—— 单笔漏收整笔升舱差价。
+      // 升舱有独立端点（POST /orders/:id/items/:itemId/upgrade-cabin）：目标舱固定、差价由服务端
+      // 按航班升舱差价源 × 人数权威计算、请求体不接受任何金额。职责收敛到那里，这里一律拒绝改舱。
+      // 同舱改期（不传 newCabin，或传的就是原舱）是正常路径，不受影响。
+      if (input.newCabin !== undefined && input.newCabin !== oldCabin) {
+        throw new BadRequestError(
+          '改期不能同时更改舱位：改期只搬班次、不重算差价。如需升舱请走「升舱」操作（差价由系统按航班差价源×人数自动计算）。',
+        );
+      }
+      // 过闸后必然等于 oldCabin；保留原表达式，日后若放开改舱也只需改上面那道闸。
       const newCabin = input.newCabin ?? oldCabin;
 
       // 无变化（同班次同舱位）→ 不做座位搬移，避免无意义的放/拿
@@ -6207,10 +6488,30 @@ export class OrderService {
       // Order 行锁（与改期 rescheduleOrderItem / worker 超时释放 / 到账入账同一把 FOR UPDATE 行锁）：
       // 换人要读-改-写 adjustmentCny/adjustments，无锁会与并发改期/换人 lost-update（一方覆盖另一方的流水）。
       const orderRows = await tx.$queryRaw<
-        Array<{ id: string; adjustmentCny: number; adjustments: Prisma.JsonValue }>
-      >`SELECT id, "adjustmentCny", adjustments FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+        Array<{
+          id: string;
+          adjustmentCny: number;
+          adjustments: Prisma.JsonValue;
+          status: OrderStatus;
+          deletedAt: Date | null;
+        }>
+      >`SELECT id, "adjustmentCny", adjustments, status, "deletedAt" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
       const order = orderRows[0];
       if (!order) throw new NotFoundError('订单不存在');
+
+      // ── 有效订单守卫（HIGH 修复）：与改期 / 升舱同款双闸 ────────────────────
+      // 换人不只是改个名字：它会通过 feeCny 往 adjustmentCny 里加收换人费，还会重置开票位与签证任务。
+      // 在已取消 / 已退款 / 超时 / 回收站单上换人 → 这些死单会凭空长出一笔「欠款」并重新进应收报表，
+      // 已结清的退款单账面被改写。所以入口硬性要求：deletedAt=null 且 status ∈ 占座态。
+      // 读的是刚 FOR UPDATE 锁住的那一行，与并发状态流转严格串行（不会读到过期快照）。
+      if (order.deletedAt) {
+        throw new BadRequestError('订单在回收站（已软删），不可换人；如需操作请先恢复');
+      }
+      if (!SEAT_HOLDING_STATUSES.includes(order.status)) {
+        throw new BadRequestError(
+          `订单当前状态（${zhStatus(order.status)}）不可换人：仅占座中的有效订单可换人（已取消/已退款/超时订单请勿换人）`,
+        );
+      }
 
       const passenger = await tx.passenger.findUnique({
         where: { id: passengerId },
@@ -6651,44 +6952,10 @@ export class OrderService {
       item.hotelCheckIn && item.hotelCheckOut
         ? buildStayNightDates(item.hotelCheckIn, item.hotelCheckOut)
         : [];
-    let untrackedNights: string[] = [];
-    // 随机单落位一律要校验目标酒店（落位就是往目标酒店新增占房）；
-    // 具体酒店行只在跨酒店时校验（同酒店换房型净房量不变）。
-    if ((isRandomPoolRow || oldRoomType!.hotelId !== newRoomType.hotelId) && nightDates.length > 0) {
-      // 物理房间口径前瞻闸（口径同下单闸 / 销控板看板）：把本单要挪进目标酒店的占房塞进
-      // 目标酒店当晚的性别桶里重算物理间数 —— 床位口径看不见「异性不能拼一间」这一维。
-      // excludeOrderId：本单当前挂在原酒店，理论上不该被目标酒店的占房查询选中；仍显式排除，
-      // 防御同一单在目标酒店已有其他酒店行时被算两遍。
-      // 拼房单（roomsBilled=0.5）要按性别配对判定 → 取本单出行人性别（口径同房控 pickSoloGender）。
-      const swapPassengers = await prisma.passenger.findMany({
-        where: { orderId },
-        select: { gender: true },
-      });
-      const fit = await checkHotelPhysicalFit(
-        newRoomType.hotelId,
-        nightDates,
-        toProspectiveOccupancy(
-          roomsBilled,
-          swapPassengers.map((p) => ({ gender: p.gender ?? undefined })),
-        ),
-        { excludeOrderId: orderId },
-      );
-      if (fit.hasBlock) {
-        untrackedNights = nightDates.filter((_, i) => fit.block[i] === 0);
-        if (fit.violations.length > 0) {
-          const detail = fit.violations
-            .map(
-              (v) =>
-                `目标酒店 ${formatMonthDay(new Date(`${v.date}T00:00:00.000Z`))}实际房间不足（包房 ${v.block} 间，换过去后需 ${v.physicalUsed} 间）`,
-            )
-            .join('；');
-          throw new BadRequestError(detail);
-        }
-      } else {
-        // 整段查询范围内一条包房周期都没有 → 全部夜晚视为未管控（房控哲学：未配包房≠售罄）
-        untrackedNights = [...nightDates];
-      }
-    }
+    // 是否需要校验目标酒店房量：随机单落位一律要校验（落位就是往目标酒店新增占房）；
+    // 具体酒店行只在跨酒店时校验（同酒店换房型净房量不变）。真正的判定在事务内做（见下方）。
+    const needsHotelFitCheck =
+      (isRandomPoolRow || oldRoomType!.hotelId !== newRoomType.hotelId) && nightDates.length > 0;
 
     // ── HOTEL 行按创建期同款格式重建 description；BUNDLE 行不含酒店名，不用重建 ──
     let newDescription = item.description;
@@ -6701,11 +6968,22 @@ export class OrderService {
     }
 
     const scratch = await prisma.$transaction(async (tx) => {
+      // Order 行锁（HIGH 修复）：换酒店要读-改-写 adjustmentCny/adjustments（差价流水），
+      // 与换人/改期/到账入账是同一份读-改-写。此前这里是全库唯一不加订单行锁的写路径 ——
+      // 并发的「换酒店 +¥300」与「换人费 +¥500」会互相覆盖（lost update，少收一笔）。
+      // 现在与其余写路径一律先 FOR UPDATE，同一订单上的资金调整严格串行。
+      const lockRows = await tx.$queryRaw<Array<{ id: string }>>`
+        SELECT id FROM "Order" WHERE id = ${orderId} FOR UPDATE
+      `;
+      if (lockRows.length === 0) throw new NotFoundError('订单不存在');
+
       const order = await tx.order.findUnique({
         where: { id: orderId },
         select: {
           id: true,
           orderNumber: true,
+          status: true,
+          deletedAt: true,
           adjustmentCny: true,
           adjustments: true,
           roomAssignment: true,
@@ -6713,6 +6991,61 @@ export class OrderService {
         },
       });
       if (!order) throw new NotFoundError('订单不存在');
+
+      // ── 有效订单守卫（HIGH 修复）：与改期 / 升舱同款双闸 ────────────────────
+      // 换酒店会往目标酒店新增占房、并通过 feeCny 改 adjustmentCny（客户应付）。在已取消 /
+      // 已退款 / 超时 / 回收站单上换酒店 → 死单凭空占住真实房量，且长出一笔并不存在的「欠款」。
+      // 读的是刚 FOR UPDATE 锁住的那一行，与并发状态流转严格串行。
+      if (order.deletedAt) {
+        throw new BadRequestError('订单在回收站（已软删），不可换酒店；如需操作请先恢复');
+      }
+      if (!SEAT_HOLDING_STATUSES.includes(order.status)) {
+        throw new BadRequestError(
+          `订单当前状态（${zhStatus(order.status)}）不可换酒店：仅占座中的有效订单可换酒店（已取消/已退款/超时订单请勿换酒店）`,
+        );
+      }
+
+      // ── 0b. 目标酒店逐晚房量前瞻闸（事务内互斥版）────────────────────────────
+      // 物理房间口径（口径同下单闸 / 销控板看板）：把本单要挪进目标酒店的占房塞进目标酒店当晚的
+      // 性别桶里重算物理间数 —— 床位口径看不见「异性不能拼一间」这一维。
+      // 必须在事务内、且先锁目标酒店该区间的包房周期行：判定与占房落库（下方第 1 步写
+      // hotelRoomTypeId）之间不能有窗口，否则两笔并发换酒店会各自读到「还剩 1 间」的旧快照双双通过。
+      // excludeOrderId：本单当前挂在原酒店，理论上不该被目标酒店的占房查询选中；仍显式排除，
+      // 防御同一单在目标酒店已有其他酒店行时被算两遍。
+      // 拼房单（roomsBilled=0.5）要按性别配对判定 → 取本单出行人性别（口径同房控 pickSoloGender）。
+      let untrackedNights: string[] = [];
+      if (needsHotelFitCheck) {
+        await lockHotelBlockPeriodsWithinTx(tx, newRoomType.hotelId, nightDates);
+        const swapPassengers = await tx.passenger.findMany({
+          where: { orderId },
+          select: { gender: true },
+        });
+        const fit = await checkHotelPhysicalFit(
+          newRoomType.hotelId,
+          nightDates,
+          toProspectiveOccupancy(
+            roomsBilled,
+            swapPassengers.map((p) => ({ gender: p.gender ?? undefined })),
+          ),
+          { excludeOrderId: orderId },
+          tx,
+        );
+        if (fit.hasBlock) {
+          untrackedNights = nightDates.filter((_, i) => fit.block[i] === 0);
+          if (fit.violations.length > 0) {
+            const detail = fit.violations
+              .map(
+                (v) =>
+                  `目标酒店 ${formatMonthDay(new Date(`${v.date}T00:00:00.000Z`))}实际房间不足（包房 ${v.block} 间，换过去后需 ${v.physicalUsed} 间）`,
+              )
+              .join('；');
+            throw new BadRequestError(detail);
+          }
+        } else {
+          // 整段查询范围内一条包房周期都没有 → 全部夜晚视为未管控（房控哲学：未配包房≠售罄）
+          untrackedNights = [...nightDates];
+        }
+      }
 
       // ── 0. 减价不能把应付冲成负数（HIGH 修复）──
       // 减价（feeCny<0）是合法操作（"我方缺房挪客不变价"里客人主动少收），但没有下限就能把
@@ -6809,7 +7142,7 @@ export class OrderService {
         }
       }
 
-      return { orderNumber: order.orderNumber };
+      return { orderNumber: order.orderNumber, untrackedNights };
     });
 
     // ── 返回值：与 getOrder 同款富联查，确保 hotelName/roomTypeName 立即正确 ──
@@ -6881,7 +7214,7 @@ export class OrderService {
           totalCostCny: afterTotalCostCny,
         },
         feeCny,
-        untrackedNights,
+        untrackedNights: scratch.untrackedNights,
       },
     };
   }
@@ -7128,6 +7461,33 @@ export class OrderService {
             throw new BadRequestError('入住日期无效');
           }
         }
+      }
+
+      // ── 酒店房量闸（CRITICAL 修复，与建单同一把闸）───────────────────────────
+      // 补录房费与建单一样是「往真实酒店新增占房」，此前同样一道闸都没有：售罄后照样补录，
+      // 销控板直接变负。本调用已在事务内并持有 Order 行锁，这里再锁目标酒店该区间的包房周期行
+      // 后判定，与下方 orderItem.create 落库同一事务，判定与落库之间没有窗口。
+      // 无入住日期（未填 checkIn）→ 无从判定占的是哪几晚，与既有「不盖日期就不进房控」口径一致，跳过。
+      // 后台补录：房量不足要让运营看得见差多少间，故用默认的带数字文案（不套对外中性话术）。
+      if (input.kind === 'HOTEL' && hotelCheckIn && hotelCheckOut) {
+        const orderPassengers = await tx.passenger.findMany({
+          where: { orderId },
+          select: { gender: true },
+        });
+        await assertHotelStaysFitWithinTx(
+          tx,
+          [
+            {
+              hotelRoomTypeId: input.hotelRoomTypeId,
+              hotelCheckIn,
+              hotelCheckOut,
+              roomsBilled: rooms,
+            },
+          ],
+          orderPassengers.map((p) => ({ gender: p.gender ?? undefined })),
+          // 不传 excludeOrderId：本单在该酒店**已有**的占房是真实存量，补录是在它之上再加一笔，
+          // 排除本单等于把自己已占的房当成空房，会放行超卖。
+        );
       }
 
       const priced = computeGroundItemAmounts({
@@ -8003,6 +8363,110 @@ export function buildStayNightDates(checkIn: Date, checkOut: Date): string[] {
   );
 }
 
+// ── 事务内酒店房量闸（新增真实占房的写路径统一入口）─────────────────────────
+/** 对外端点的中性话术：不把包房间数/余量这些内部库存数字回给客人。*/
+export const HOTEL_SOLD_OUT_MESSAGE = '该出发日期酒店可用房量不足，请更换日期或联系客服';
+
+/** 一条「本次打算落库」的酒店占房（口径同 OrderItem 的占房四件套）。*/
+export interface ProspectiveHotelStay {
+  hotelRoomTypeId?: string | null;
+  hotelCheckIn?: Date | null;
+  hotelCheckOut?: Date | null;
+  /** 计费房间数（床位/计费口径，可为 0.5 拼房）；缺省 1，与房控 itemRoomCount 的兜底一致。*/
+  roomsBilled?: number | null;
+}
+
+/**
+ * 事务内酒店房量闸：把本次要落库的占房按「酒店 × 住宿区间」归并，逐组过一遍**带行锁**的
+ * 物理房间前瞻闸（assertHotelPhysicalFitWithinTx）。装不下就抛 BadRequestError，整事务回滚。
+ *
+ * 为什么必须是事务内 + 行锁：前瞻闸本身是「查一遍 + 纯内存推算」的只读判定，两个请求同时抢
+ * 最后 1 间会各自读到「还剩 1 间」的旧快照双双通过。带锁版先把该酒店该区间的包房周期行
+ * `SELECT … FOR UPDATE`，后到的事务要等前一个提交后重新取快照，才真正互斥。
+ *
+ * 调用方必须满足（否则锁白加）：
+ *   1. 在 `prisma.$transaction(async (tx) => { … })` 里调用，把同一个 `tx` 传进来；
+ *   2. 本次占房（OrderItem 的 hotelRoomTypeId + hotelCheckIn/hotelCheckOut/roomsBilled）
+ *      必须在**同一个事务**里写入 —— 行锁随事务提交才释放；
+ *   3. 隔离级别用默认的 READ COMMITTED 即可。
+ *
+ * 归并口径：同一酒店、同一住宿区间的多条行合并成一笔前瞻占房（整间数相加、拼房客性别桶合并）。
+ * 逐行各判一次会让「同单两条行各抢最后一间」双双通过 —— 它们都还没落库，彼此看不见对方。
+ * 加锁顺序按归并键排序，避免并发事务以不同顺序锁同一批酒店造成死锁。
+ *
+ * 跳过两类行（都不是「真酒店的真房量」，不该拿具体酒店的库存去判）：
+ *   · 房型查不到 —— 上游各自有 NotFoundError 负责报错，这里不抢它的活；
+ *   · 房型挂在**随机档占位酒店**上（randomTierPlaceholder 非空）—— 那不是真房源，
+ *     这类行走随机档聚合闸（assertRandomTierFit），与本闸互斥不重叠。
+ */
+export async function assertHotelStaysFitWithinTx(
+  tx: Prisma.TransactionClient,
+  stays: ReadonlyArray<ProspectiveHotelStay>,
+  passengers: ReadonlyArray<{ gender?: 'M' | 'F' | 'X' }> | undefined,
+  opts: { excludeOrderId?: string; buildMessage?: () => string } = {},
+): Promise<void> {
+  const rows = stays.filter(
+    (s): s is ProspectiveHotelStay & {
+      hotelRoomTypeId: string;
+      hotelCheckIn: Date;
+      hotelCheckOut: Date;
+    } => Boolean(s.hotelRoomTypeId && s.hotelCheckIn && s.hotelCheckOut),
+  );
+  if (rows.length === 0) return;
+
+  const roomTypes = await tx.hotelRoomType.findMany({
+    where: { id: { in: [...new Set(rows.map((r) => r.hotelRoomTypeId))] } },
+    select: { id: true, hotelId: true, hotel: { select: { randomTierPlaceholder: true } } },
+  });
+  const roomTypeById = new Map(roomTypes.map((rt) => [rt.id, rt]));
+
+  type FitGroup = {
+    hotelId: string;
+    nightDates: string[];
+    wholeRooms: number;
+    solos: Array<'M' | 'F' | 'U'>;
+  };
+  const groups = new Map<string, FitGroup>();
+  for (const row of rows) {
+    const roomType = roomTypeById.get(row.hotelRoomTypeId);
+    if (!roomType || roomType.hotel.randomTierPlaceholder != null) continue;
+    const nightDates = buildStayNightDates(row.hotelCheckIn, row.hotelCheckOut);
+    // 空 = 区间非法/超长（buildStayNightDates 的防御）→ 无从校验，与既有口径一致不阻断。
+    if (nightDates.length === 0) continue;
+    // 首尾夜唯一确定整段（逐晚连续），可安全用作归并键。
+    const key = `${roomType.hotelId}|${nightDates[0]}|${nightDates[nightDates.length - 1]}`;
+    const prospective = toProspectiveOccupancy(row.roomsBilled ?? 1, passengers);
+    const existing = groups.get(key);
+    if (existing) {
+      existing.wholeRooms += prospective.wholeRooms;
+      existing.solos.push(...prospective.solos);
+    } else {
+      groups.set(key, {
+        hotelId: roomType.hotelId,
+        nightDates,
+        wholeRooms: prospective.wholeRooms,
+        solos: [...prospective.solos],
+      });
+    }
+  }
+
+  for (const key of [...groups.keys()].sort()) {
+    const group = groups.get(key)!;
+    await assertHotelPhysicalFitWithinTx(
+      tx,
+      group.hotelId,
+      group.nightDates,
+      { wholeRooms: group.wholeRooms, solos: group.solos },
+      {
+        excludeOrderId: opts.excludeOrderId,
+        // 不传 → 用 assertHotelPhysicalFit 自带的带数字文案（后台录单要看得见差多少间）；
+        // 对外可达的端点（前台下单）显式传中性话术，别把包房间数回给客人。
+        buildMessage: opts.buildMessage,
+      },
+    );
+  }
+}
+
 /**
  * 星级随机档行的成本快照来源：取**同星级酒店**覆盖入住首晚的包房周期切房单价（CNY/间/晚）里
  * 的最高价。随机档行没有具体房型可查价，切房单价就是我们付给酒店的真实每间每晚成本
@@ -8043,6 +8507,32 @@ async function resolveRandomTierNightlyCost(
   }
   if (latestByHotel.size === 0) return undefined;
   return Math.max(...latestByHotel.values());
+}
+
+/**
+ * 团队议价结算价按航段分摊（A9）。
+ *
+ * `settlementPriceCny` 是「每位出行人**整程**价」，不是「每人每段价」。往返单有两条 FLIGHT 行，
+ * 逐行各写满价会把每人收两遍（填 3600 往返 → 每人实收 7200）。这里把整程价切成各段的每人价，
+ * **各段之和恰好等于整程价**（按分为单位分配，除不尽的余数全部给第一段），
+ * 与结算价日历「去程价 + 回程价求和 = 每人整程价」的口径一致。
+ *
+ * legCount ≤ 1（单程 / 无航段）→ 原样返回整程价，行为与修正前完全一致。
+ * 导出供单测直接断言金额。
+ */
+export function splitSettlementPriceAcrossLegs(
+  pricePerPersonCny: number,
+  legCount: number,
+): number[] {
+  if (!Number.isFinite(pricePerPersonCny) || legCount <= 0) return [];
+  if (legCount === 1) return [round2(pricePerPersonCny)];
+  const totalCents = Math.round(pricePerPersonCny * 100);
+  const baseCents = Math.floor(totalCents / legCount);
+  const remainderCents = totalCents - baseCents * legCount;
+  return Array.from({ length: legCount }, (_, i) =>
+    // 余数全给第一段：合计精确等于整程价，且不会出现「每段都多一分」的累积漂移。
+    ((i === 0 ? baseCents + remainderCents : baseCents) / 100),
+  );
 }
 
 export function resolveBundleHotelStamp(
@@ -9374,6 +9864,11 @@ export function serializeOrder<T extends OrderLike>(
         //   保留 kind / description / quantity / 行程信息（航班号、出发日期等）等非价格字段。
         unitPrice: redact ? undefined : i.unitPrice.toString(),
         amount: redact ? undefined : i.amount.toString(),
+        // 对外脱敏：**我方真实进价**。这两个字段之前随 `...i` 整行展开一起下发了——
+        // CUSTOMER/AGENT 调 GET /orders 就能在浏览器 Network 面板里逐行看到我们的成本，
+        // 拿它和自己付的钱一减就是我方毛利。比行级售价泄露严重得多，必须一并抹掉。
+        unitCostCny: redact ? undefined : (i as { unitCostCny?: unknown }).unitCostCny,
+        totalCostCny: redact ? undefined : (i as { totalCostCny?: unknown }).totalCostCny,
         // 对外脱敏：metadata 里的计价明细（perSeatBreakdown[].unitPrice、addOns、operationFee、
         //   bundleDiscountPct…）同样是我方内部口径——剥离计价键，保留非价格业务键（内部角色原样透传）。
         ...(redact

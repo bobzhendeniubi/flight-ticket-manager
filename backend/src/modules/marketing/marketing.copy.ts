@@ -149,7 +149,9 @@ function allowedHardData(facts: PosterFact[]): { flights: Set<string>; times: Se
     facts.filter((fact) => /\.time$/u.test(fact.key)).flatMap((fact) => extractTimeCandidates(fact.value)),
   );
   const dates = new Set(
-    facts.filter((fact) => fact.key === 'effectiveFrom').flatMap((fact) => extractDateCandidates(fact.value)),
+    facts
+      .filter((fact) => fact.key === 'effectiveFrom' || /\.date$/u.test(fact.key))
+      .flatMap((fact) => extractDateCandidates(fact.value)),
   );
   return { flights, times, dates };
 }

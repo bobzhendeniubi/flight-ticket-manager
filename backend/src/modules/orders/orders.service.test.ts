@@ -70,6 +70,9 @@ const {
     },
     flightSchedule: {
       findUnique: vi.fn(),
+      // A7：套餐去程出发日以真实航段为准（客户端的 metadata.goDate 只当展示提示），
+      // priceAndValidateItems / 立减取价都会走这条查询。
+      findMany: vi.fn(),
     },
     dateRanking: {
       findUnique: vi.fn(),
@@ -97,7 +100,11 @@ const {
     $transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn(mockTx)),
     // R2：rescheduleOrderItem 事务开头对 Order 行 FOR UPDATE（tx.$queryRaw）。默认返回一行（订单存在）
     // → 锁通过、继续走占座守卫；具体守卫用例仍由 order.findUnique 决定拒绝原因。
-    $queryRaw: vi.fn(async () => [{ id: 'ord1' }]),
+    // swapPassenger 的锁行还顺带回 adjustmentCny/adjustments/status/deletedAt（换人的有效订单守卫
+    // 直接读这一行判定），默认给一份「占座中的有效订单」，让既有换人用例走到身份变更逻辑。
+    $queryRaw: vi.fn(async () => [
+      { id: 'ord1', adjustmentCny: 0, adjustments: null, status: 'PAID', deletedAt: null },
+    ]),
     $executeRaw: vi.fn(async () => 1),
   },
   mockComputeQuote: vi.fn(),
@@ -217,6 +224,7 @@ describe('OrderService.requestCancellation', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mockPrisma.flightSchedule.findMany.mockResolvedValue([]);
   });
 
   it('订单不存在 → 抛 NotFoundError', async () => {
@@ -419,6 +427,7 @@ describe('OrderService 重复乘客校验', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mockPrisma.flightSchedule.findMany.mockResolvedValue([]);
   });
 
   it('createOrder：证件号已在同班次占座订单中 → BadRequestError 列出证件号+冲突订单号', async () => {
@@ -2778,6 +2787,7 @@ describe('deriveBundlePerAgeUnitPrices', () => {
 describe('getOrder：产品内容卡片 v2（套餐组件构成 + 按人单价，来自套餐定义而非订单行）', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockPrisma.flightSchedule.findMany.mockResolvedValue([]);
   });
 
   it('BUNDLE 行联查 bundle.items（全组件）→ bundleKinds/bundleTransfers/bundleVisa 来自套餐定义', async () => {
@@ -3676,6 +3686,7 @@ describe('priceAndValidateItems · 酒店重算价来源 + 下架拦截', () => 
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mockPrisma.flightSchedule.findMany.mockResolvedValue([]);
   });
 
   it('HOTEL 行绑房型 → 单价改用 HotelRoomType.basePrice（不信前端 unitPrice）', async () => {
@@ -4005,6 +4016,7 @@ describe('priceAndValidateItems · 签证加急分档', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    mockPrisma.flightSchedule.findMany.mockResolvedValue([]);
   });
 
   it('选中加急档 → 单价 = 挂牌价 + 该档 surchargeCny，档位快照落行 metadata', async () => {

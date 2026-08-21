@@ -32,6 +32,8 @@ import {
   expandAssignedPhysicalByDate,
   checkHotelPhysicalFit,
   assertHotelPhysicalFit,
+  assertHotelPhysicalFitWithinTx,
+  lockHotelBlockPeriodsWithinTx,
   getRandomTierAggregate,
   assertRandomTierFit,
   createBlockPeriod,
@@ -956,6 +958,84 @@ describe('checkHotelPhysicalFit（物理房间口径前瞻闸）', () => {
     await expect(
       assertHotelPhysicalFit('h1', [dayStr(0)], { wholeRooms: 0, solos: [] }, { allowNonWorsening: true }, client),
     ).resolves.toBeUndefined();
+  });
+});
+
+// ── 事务内互斥版前瞻闸：assertHotelPhysicalFitWithinTx ─────────────────────────
+/**
+ * 只读闸拦不住并发：两个请求同时抢最后 1 间，各自读到的都是「还剩 1 间」的旧快照，
+ * 双双通过、双双落库 —— 账面直接超卖。互斥的唯一正解是让它们在数据库里排队，
+ * 所以事务内版本必须先对该酒店该区间的包房周期行 FOR UPDATE 加锁，再跑判定。
+ *
+ * 这些用例钉的是「锁真的发出去了、且在读之前发」——把 lockHotelBlockPeriodsWithinTx
+ * 那一行删掉，下面两条会红。
+ */
+describe('assertHotelPhysicalFitWithinTx（事务内加锁版前瞻闸）', () => {
+  /** 假 tx：$queryRaw 记录被 tag 的 SQL 片段与参数，两个 findMany 复用具体酒店闸的口径。*/
+  function fakeTx(orderItems: unknown[], rooms: number) {
+    const calls: Array<{ sql: string; values: unknown[] }> = [];
+    const tx = {
+      $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) => {
+        calls.push({ sql: strings.join('?'), values });
+        return Promise.resolve([]);
+      }),
+      hotelBlockPeriod: {
+        findMany: vi
+          .fn()
+          .mockResolvedValue([{ hotelId: 'h1', dateFrom: day(0), dateTo: day(2), rooms }]),
+      },
+      orderItem: { findMany: vi.fn().mockResolvedValue(orderItems) },
+    };
+    return { tx, calls };
+  }
+
+  type TxArg = Parameters<typeof assertHotelPhysicalFitWithinTx>[0];
+
+  it('判定之前先对包房周期行 FOR UPDATE 加锁（并发下单在此串行）', async () => {
+    const { tx, calls } = fakeTx([], 10);
+    await assertHotelPhysicalFitWithinTx(
+      tx as unknown as TxArg,
+      'h1',
+      [dayStr(0), dayStr(1)],
+      { wholeRooms: 1, solos: [] },
+    );
+
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
+    const sql = calls[0].sql.replace(/\s+/g, ' ');
+    expect(sql).toContain('"HotelBlockPeriod"');
+    expect(sql).toContain('FOR UPDATE');
+    // 按 id 排序加锁：两个事务锁同一批行的顺序一致，不会互相死锁
+    expect(sql).toContain('ORDER BY id');
+    // 锁的是本酒店 + 本次入住区间（首晚 ~ 末晚），不是全表
+    expect(calls[0].values[0]).toBe('h1');
+    // 锁必须发生在读占房之前 —— 先读后锁等于没锁
+    const lockOrder = tx.$queryRaw.mock.invocationCallOrder[0];
+    const readOrder = tx.orderItem.findMany.mock.invocationCallOrder[0];
+    expect(lockOrder).toBeLessThan(readOrder);
+  });
+
+  it('拿的是同一把判定尺子：装不下照样抛「房间不足」（口径与非事务版一字不差）', async () => {
+    // 包房 1 间 + 已有 1 位男拼房客 → 再来 1 间整房 → 需 2 间 > 1
+    const { tx } = fakeTx(
+      [{ hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 0.5, ...solo('M') }],
+      1,
+    );
+    await expect(
+      assertHotelPhysicalFitWithinTx(tx as unknown as TxArg, 'h1', [dayStr(0)], {
+        wholeRooms: 1,
+        solos: [],
+      }),
+    ).rejects.toThrow(/房间不足/);
+    // 拒绝路径上锁一样要加过（否则并发下「都装得下」的判定仍是脏读）
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
+  });
+
+  it('空 nightDates（无入住区间）→ 不发锁也不判定，安静返回', async () => {
+    const { tx } = fakeTx([], 1);
+    await expect(
+      lockHotelBlockPeriodsWithinTx(tx as unknown as TxArg, 'h1', []),
+    ).resolves.toBeUndefined();
+    expect(tx.$queryRaw).not.toHaveBeenCalled();
   });
 });
 

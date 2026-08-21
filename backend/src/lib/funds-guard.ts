@@ -23,15 +23,29 @@ import { BadRequestError } from './errors.js';
  *   CANCELLED / REFUNDED —— 终态死单：钱进来没有任何出口（退款流程只受理 PAID/PROCESSING/TICKETED）。
  *   PAYMENT_TIMEOUT      —— 座位已释放：先恢复到待付款重新占座，再收款，否则收了钱也没座位。
  *   DRAFT                —— 订单尚未成形（草稿），不应挂真实资金。
+ *   REFUND_REQUESTED     —— 退款审批窗口期，见下。
  *
  * FAILED 不在闸内：出票失败单客户通常已付款、仍在等运营处置（可回 PROCESSING），
  * 补款/抵扣属正常业务，不拦。
+ *
+ * 为什么 REFUND_REQUESTED 必须进收款闸（否则这笔钱永久困死）：
+ * 处置闸与撤销闸**都**拉黑 REFUND_REQUESTED，唯独收款闸此前放行，于是留下一个死角——
+ *   1. 退款审批中仍可认款进钱 → paidAmount 抬高；
+ *   2. 批准退款按「申请那一刻的报价快照」退，多进来的钱不在快照里；
+ *   3. 订单落 REFUNDED（终态）：撤销闸拦住撤销认款、处置闸拦住转存代理余额/转挂账池，
+ *      退款流程又只受理 PAID/PROCESSING/TICKETED，也不能再退一次。
+ * 四门全锁，这笔钱既退不出去也冲销不掉。堵在入口是唯一能一次收口的地方。
+ *
+ * 确有「退款审批中客户又打款进来」的真实场景时，正确做法是把这笔钱登记到挂账池
+ * （Receipt，OPEN 状态）：等退款审批结束、订单回到可收款状态后再认领到订单上——
+ * 钱不丢、账不乱，也不会污染退款报价快照。上面的拒绝文案已经给出这条指引。
  */
 export const FUNDS_CREDIT_BLOCKED_STATUSES: OrderStatus[] = [
   OrderStatus.CANCELLED,
   OrderStatus.REFUNDED,
   OrderStatus.PAYMENT_TIMEOUT,
   OrderStatus.DRAFT,
+  OrderStatus.REFUND_REQUESTED,
 ];
 
 /**

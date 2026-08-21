@@ -7,7 +7,32 @@
  *    一旦把它 export 出来本测试切换到直接 import）
  */
 import { describe, it, expect } from 'vitest';
-import { validateTiers, type CancellationTier } from './cancellation.js';
+import {
+  computeRefundBreakdown,
+  splitRefundBetweenCashAndBalance,
+  validateTiers,
+  type CancellationTier,
+  type GrossItemQuote,
+} from './cancellation.js';
+
+/** 造一条毛价口径的行报价（feeAmount 按毛价 × feePercent，与 quoteItem 的输出一致）。 */
+function grossItem(amount: number, feePercent: number, kind = 'FLIGHT'): GrossItemQuote {
+  return {
+    itemId: `itm-${kind}-${amount}-${feePercent}`,
+    kind,
+    description: `${kind} 行`,
+    amount,
+    hoursLeft: 100,
+    policyId: 'pol-1',
+    policyName: '标准',
+    matchedTier: { hoursBeforeDeparture: 72, feePercent },
+    feePercent,
+    feeAmount: Math.round(amount * (feePercent / 100) * 100) / 100,
+    refundAmount: Math.round(amount * (1 - feePercent / 100) * 100) / 100,
+    reason: '测试',
+    fulfilled: false,
+  };
+}
 
 // ── inline 镜像：cancellation.ts evaluateItem 里 tier 选择逻辑 ──
 // 一旦 export 真版本，删掉本副本
@@ -196,5 +221,213 @@ describe('pickTierForHours — 起飞前刚好踩档边界（重要 off-by-one �
   });
   it('hoursLeft=23.99 → 100%（已过 24h 关键点，必须按 -1 档）', () => {
     expect(pickTierForHours(tiers, 23.99, false).feePercent).toBe(100);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════
+// 退款金额引擎 computeRefundBreakdown
+// 三条已坐实的资金缺陷的守卫（每条断言到具体金额，不只断言"算出来了"）：
+//   ① 预存余额抵付单被算成应退 ¥0
+//   ② 手续费按毛价计、应退按实收扣 → 立减后实际费率被放大
+//   ③ adjustmentCny（改期费/换人费）被全额退还
+// ════════════════════════════════════════════════════════════════════════
+
+describe('computeRefundBreakdown · ① 预存余额抵付单必须能退到钱', () => {
+  it('全额余额抵付（现金 0 / 余额抵 10000，20% 档）→ 应退 8000，全部回余额', () => {
+    // 旧口径只看 paidAmount(=0) → totalRefund = 0，客户白丢一整单钱。
+    const r = computeRefundBreakdown({
+      paidAmount: 0,
+      prepaymentOffsetCny: 10_000,
+      adjustmentCny: 0,
+      grossItems: [grossItem(10_000, 20)],
+    });
+    expect(r.refundableBaseCny).toBe(10_000);
+    expect(r.feeScale).toBe(1);
+    expect(r.totalFee).toBe(2_000);
+    expect(r.totalRefund).toBe(8_000);
+    expect(r.refundToCashCny).toBe(0);
+    expect(r.refundToBalanceCny).toBe(8_000);
+  });
+
+  it('现金 3000 + 余额抵 7000（20% 档）→ 应退 8000 = 现金 3000 + 余额 5000（现金优先）', () => {
+    const r = computeRefundBreakdown({
+      paidAmount: 3_000,
+      prepaymentOffsetCny: 7_000,
+      adjustmentCny: 0,
+      grossItems: [grossItem(10_000, 20)],
+    });
+    expect(r.totalRefund).toBe(8_000);
+    expect(r.refundToCashCny).toBe(3_000);
+    expect(r.refundToBalanceCny).toBe(5_000);
+    // 两段之和必须恰好等于应退，绝不重复退
+    expect(r.refundToCashCny + r.refundToBalanceCny).toBe(r.totalRefund);
+  });
+
+  it('回余额部分永不超过当初抵扣掉的余额（防凭空造币）', () => {
+    const r = computeRefundBreakdown({
+      paidAmount: 0,
+      prepaymentOffsetCny: 1_000,
+      adjustmentCny: 0,
+      // 毛价远小于实付 → feeScale 被夹到 1，可退基数仍是 1000
+      grossItems: [grossItem(100, 0)],
+    });
+    expect(r.totalRefund).toBe(1_000);
+    expect(r.refundToBalanceCny).toBeLessThanOrEqual(1_000);
+    expect(r.refundToBalanceCny).toBe(1_000);
+  });
+});
+
+describe('computeRefundBreakdown · ② 手续费基数与应退基数同源（立减/SETTLEMENT 差额行）', () => {
+  it('毛价 12000、立减收敛后实收 6000、20% 档 → 扣 1200（不是旧口径的 2400）', () => {
+    const r = computeRefundBreakdown({
+      paidAmount: 6_000,
+      prepaymentOffsetCny: 0,
+      adjustmentCny: 0,
+      grossItems: [grossItem(12_000, 20)],
+    });
+    expect(r.feeScale).toBe(0.5);
+    expect(r.totalFee).toBe(1_200);
+    expect(r.totalRefund).toBe(4_800);
+    // 实际费率必须回到 20%，而不是被放大成 40%
+    expect(r.totalFee / r.refundableBaseCny).toBeCloseTo(0.2, 10);
+  });
+
+  it('负金额优惠行不参与毛价合计，也不产生负手续费', () => {
+    const discountRow: GrossItemQuote = {
+      ...grossItem(-4_000, 0, 'DISCOUNT'),
+      feeAmount: 0,
+      refundAmount: 0,
+      policyId: null,
+      policyName: '（优惠/减免行，不计手续费）',
+      matchedTier: null,
+    };
+    const r = computeRefundBreakdown({
+      paidAmount: 6_000,
+      prepaymentOffsetCny: 0,
+      adjustmentCny: 0,
+      grossItems: [grossItem(10_000, 20), discountRow],
+    });
+    // 毛价合计只数正金额行 = 10000 → feeScale = 6000/10000
+    expect(r.feeScale).toBe(0.6);
+    expect(r.totalFee).toBe(1_200);
+    expect(r.totalRefund).toBe(4_800);
+    // 优惠行的分摊已付额为 0，绝不出现负手续费把应退顶高
+    const discount = r.items.find((i) => i.kind === 'DISCOUNT')!;
+    expect(discount.paidShare).toBe(0);
+    expect(discount.feeAmount).toBe(0);
+  });
+
+  it('客户多付时 feeScale 夹到 1：手续费不随多付一起放大', () => {
+    const r = computeRefundBreakdown({
+      paidAmount: 20_000,
+      prepaymentOffsetCny: 0,
+      adjustmentCny: 0,
+      grossItems: [grossItem(10_000, 20)],
+    });
+    expect(r.feeScale).toBe(1);
+    expect(r.totalFee).toBe(2_000); // 而非 4000
+    expect(r.totalRefund).toBe(18_000); // 多付 10000 原样退回 + 8000
+  });
+
+  it('毛价合计为 0（整单只剩优惠行）→ 不收手续费，可退基数原样退', () => {
+    const r = computeRefundBreakdown({
+      paidAmount: 500,
+      prepaymentOffsetCny: 0,
+      adjustmentCny: 0,
+      grossItems: [],
+    });
+    expect(r.feeScale).toBe(0);
+    expect(r.totalFee).toBe(0);
+    expect(r.totalRefund).toBe(500);
+  });
+
+  it('行级 refund/(refund+fee) 比值不随折算改变 → 佣金按比例冲销口径不受影响', () => {
+    const r = computeRefundBreakdown({
+      paidAmount: 6_000,
+      prepaymentOffsetCny: 0,
+      adjustmentCny: 0,
+      grossItems: [grossItem(8_000, 30), grossItem(4_000, 10, 'HOTEL')],
+    });
+    for (const i of r.items) {
+      const ratio = i.refundAmount / (i.refundAmount + i.feeAmount);
+      expect(ratio).toBeCloseTo(1 - i.feePercent / 100, 6);
+    }
+  });
+});
+
+describe('computeRefundBreakdown · ③ 改期费/换人费不可退', () => {
+  it('实收 10500（含 500 改期费）、0% 档 → 只退 10000，改期费留存', () => {
+    const r = computeRefundBreakdown({
+      paidAmount: 10_500,
+      prepaymentOffsetCny: 0,
+      adjustmentCny: 500,
+      grossItems: [grossItem(10_000, 0)],
+    });
+    expect(r.refundableBaseCny).toBe(10_000);
+    expect(r.totalFee).toBe(0);
+    expect(r.totalRefund).toBe(10_000); // 旧口径会退 10500
+    expect(r.refundToCashCny).toBe(10_000);
+    expect(r.refundToBalanceCny).toBe(0);
+  });
+
+  it('改期费从现金侧先扣：现金 1000 + 余额 9000、改期费 1000、0% 档 → 现金 0 / 余额 9000', () => {
+    const r = computeRefundBreakdown({
+      paidAmount: 1_000,
+      prepaymentOffsetCny: 9_000,
+      adjustmentCny: 1_000,
+      grossItems: [grossItem(9_000, 0)],
+    });
+    expect(r.refundableBaseCny).toBe(9_000);
+    expect(r.totalRefund).toBe(9_000);
+    expect(r.refundToCashCny).toBe(0);
+    expect(r.refundToBalanceCny).toBe(9_000);
+  });
+
+  it('改期费超过实收（异常数据）→ 可退基数夹到 0，绝不算出负应退', () => {
+    const r = computeRefundBreakdown({
+      paidAmount: 100,
+      prepaymentOffsetCny: 0,
+      adjustmentCny: 5_000,
+      grossItems: [grossItem(10_000, 20)],
+    });
+    expect(r.refundableBaseCny).toBe(0);
+    expect(r.totalRefund).toBe(0);
+    expect(r.refundToCashCny).toBe(0);
+    expect(r.refundToBalanceCny).toBe(0);
+  });
+});
+
+describe('splitRefundBetweenCashAndBalance · 现金优先且两段互斥', () => {
+  it('应退 ≤ 可退现金 → 全走现金', () => {
+    expect(
+      splitRefundBetweenCashAndBalance({
+        totalRefund: 500,
+        paidAmount: 2_000,
+        adjustmentCny: 0,
+        prepaymentOffsetCny: 3_000,
+      }),
+    ).toEqual({ refundToCashCny: 500, refundToBalanceCny: 0 });
+  });
+
+  it('无现金可退 → 全回余额', () => {
+    expect(
+      splitRefundBetweenCashAndBalance({
+        totalRefund: 800,
+        paidAmount: 0,
+        adjustmentCny: 0,
+        prepaymentOffsetCny: 1_000,
+      }),
+    ).toEqual({ refundToCashCny: 0, refundToBalanceCny: 800 });
+  });
+
+  it('余额侧被 prepaymentOffset 硬夹：抵扣过 0 就绝不回补余额', () => {
+    expect(
+      splitRefundBetweenCashAndBalance({
+        totalRefund: 800,
+        paidAmount: 0,
+        adjustmentCny: 0,
+        prepaymentOffsetCny: 0,
+      }),
+    ).toEqual({ refundToCashCny: 0, refundToBalanceCny: 0 });
   });
 });

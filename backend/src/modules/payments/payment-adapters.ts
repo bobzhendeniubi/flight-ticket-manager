@@ -415,6 +415,15 @@ export function getPaymentAdapter(method: PaymentMethod): PaymentAdapter {
         throw new Error(`No live adapter for ${method} — use AGENT_PREPAYMENT manually`);
     }
   }
+  // 纵深防御：生产环境绝不启用沙箱适配器。沙箱验签退化成与硬编码 secret 的明文比较，
+  // 一旦 PAYMENT_MODE 被误配成非 live，匿名回调即可把订单刷成 PAID。此处 fail-closed，
+  // 与 /payments/sandbox-confirm、createMiniappJsapiPayment 的 NODE_ENV 兜底一致——
+  // 配错时支付直接失败，绝不接受伪造回调。
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error(
+      '生产环境未启用真实支付适配器：PAYMENT_MODE 必须为 live（当前非 live，已拒绝使用沙箱验签）',
+    );
+  }
   // sandbox (dev)
   return new SandboxAdapter(method);
 }

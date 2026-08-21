@@ -174,12 +174,20 @@ export class AgentRechargesService {
           agentId: string;
           amountCny: Prisma.Decimal;
           status: AgentRechargeStatus;
+          submittedByUserId: string;
         }>
-      >`SELECT id, "agentId", "amountCny", status FROM "AgentRechargeRequest" WHERE id = ${id} FOR UPDATE`;
+      >`SELECT id, "agentId", "amountCny", status, "submittedByUserId" FROM "AgentRechargeRequest" WHERE id = ${id} FOR UPDATE`;
       const reqRow = reqRows[0];
       if (!reqRow) throw new NotFoundError('认款申请不存在');
       if (reqRow.status !== AgentRechargeStatus.PENDING) {
         throw new ConflictError(`该申请当前状态为 ${reqRow.status}，不可重复确认`);
+      }
+      // 双人复核（maker-checker）：提交充值申请的人不能同时确认到账，否则单个账号即可凭空给代理
+      // 余额造币。确认必须由另一位运营/管理员完成。
+      if (reqRow.submittedByUserId === actor.userId) {
+        throw new ForbiddenError(
+          '提交充值申请的人不能同时确认到账（需双人复核，请由另一位运营/管理员确认）',
+        );
       }
 
       const confirmedAmount = round2(body.confirmedAmountCny ?? Number(reqRow.amountCny));

@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { api, ApiError, type MarketingPosterDetail, type MarketingPosterListItem, type MarketingPosterStatus, type MarketingTemplate, type RangeSchedule } from '../lib/api';
+import { api, ApiError, type MarketingPosterDetail, type MarketingPosterListItem, type MarketingPosterStatus, type MarketingTemplate, type MarketingUsage, type RangeSchedule } from '../lib/api';
 import { PosterDetailModal } from '../components/PosterDetailModal';
+import { airportLabel } from '../lib/airports';
 import { useAuth } from '../stores/auth';
 
 const PAGE_SIZE = 20;
@@ -63,6 +64,28 @@ function formatSchedule(schedule: RangeSchedule): string {
   return `${schedule.flightNumber} ${schedule.originCode}-${schedule.destinationCode} ${dateText}`;
 }
 
+function localMonthDay(schedule: RangeSchedule | undefined): string {
+  if (!schedule) return '如：8月21日起';
+  try {
+    return `${new Intl.DateTimeFormat('zh-CN', {
+      month: 'numeric',
+      day: 'numeric',
+      timeZone: schedule.departureTz,
+    }).format(new Date(schedule.departureTime))}起`;
+  } catch {
+    return '如：8月21日起';
+  }
+}
+
+function defaultSlogan(schedule: RangeSchedule | undefined): string {
+  if (!schedule) return '选择去程班次后显示默认标语';
+  const destination = airportLabel(schedule.destinationCode).replace(/\s*\([^)]*\)$/u, '');
+  const airline = schedule.flightNumber.trim().slice(0, 2).toUpperCase() === 'QH' ? '越竹' : '';
+  return airline
+    ? `飞${destination}，选${airline}，越飞越值！`
+    : `飞${destination}，享黄金时刻，越飞越值！`;
+}
+
 function posterSummary(detail: MarketingPosterDetail): MarketingPosterListItem {
   return {
     id: detail.id,
@@ -88,9 +111,14 @@ export function MarketingPage() {
   const [returnScheduleId, setReturnScheduleId] = useState('');
   const [templates, setTemplates] = useState<MarketingTemplate[]>([]);
   const [templateKey, setTemplateKey] = useState('');
-  const [effectiveFrom, setEffectiveFrom] = useState('');
+  const [headline, setHeadline] = useState('');
+  const [subtitle, setSubtitle] = useState('');
+  const [slogan, setSlogan] = useState('');
+  const [highlights, setHighlights] = useState(['', '', '']);
+  const [ctaLine1, setCtaLine1] = useState('');
+  const [ctaLine2, setCtaLine2] = useState('');
   const [baggageText, setBaggageText] = useState('');
-  const [extraNote, setExtraNote] = useState('');
+  const [copyTouched, setCopyTouched] = useState<Record<string, boolean>>({});
   const [scheduleLoading, setScheduleLoading] = useState(false);
   const [templateError, setTemplateError] = useState<string | null>(null);
   const [scheduleError, setScheduleError] = useState<string | null>(null);
@@ -105,6 +133,7 @@ export function MarketingPage() {
   const [listLoading, setListLoading] = useState(true);
   const [listError, setListError] = useState<string | null>(null);
   const [listNonce, setListNonce] = useState(0);
+  const [usage, setUsage] = useState<MarketingUsage | null>(null);
   const [deleteId, setDeleteId] = useState<string | null>(null);
   const [detailOpen, setDetailOpen] = useState(false);
   const [detail, setDetail] = useState<MarketingPosterDetail | null>(null);
@@ -192,6 +221,19 @@ export function MarketingPage() {
   }, [token, statusFilter, page, listNonce]);
 
   useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    api.marketing.getUsage(token)
+      .then((result) => {
+        if (!cancelled) setUsage(result);
+      })
+      .catch(() => {
+        if (!cancelled) setUsage(null);
+      });
+    return () => { cancelled = true; };
+  }, [token, listNonce]);
+
+  useEffect(() => {
     if (!generating) return;
     const startedAt = Date.now();
     const timer = window.setInterval(() => {
@@ -199,6 +241,10 @@ export function MarketingPage() {
     }, 1000);
     return () => window.clearInterval(timer);
   }, [generating]);
+
+  function markCopyTouched(field: string): void {
+    setCopyTouched((current) => ({ ...current, [field]: true }));
+  }
 
   async function submitForm(): Promise<void> {
     const trimmedTitle = title.trim();
@@ -216,9 +262,13 @@ export function MarketingPage() {
       outboundScheduleId,
       templateKey,
       ...(returnScheduleId ? { returnScheduleId } : {}),
-      ...(effectiveFrom.trim() ? { effectiveFrom: effectiveFrom.trim() } : {}),
-      ...(baggageText.trim() ? { baggageText: baggageText.trim() } : {}),
-      ...(extraNote.trim() ? { extraNote: extraNote.trim() } : {}),
+      ...(copyTouched.headline ? { headline: headline.trim() } : {}),
+      ...(copyTouched.subtitle ? { subtitle: subtitle.trim() } : {}),
+      ...(copyTouched.slogan ? { slogan: slogan.trim() } : {}),
+      ...(copyTouched.highlights ? { highlights: highlights.map((item) => item.trim()) } : {}),
+      ...(copyTouched.ctaLine1 ? { ctaLine1: ctaLine1.trim() } : {}),
+      ...(copyTouched.ctaLine2 ? { ctaLine2: ctaLine2.trim() } : {}),
+      ...(copyTouched.baggageText ? { baggageText: baggageText.trim() } : {}),
     };
     try {
       const result = await api.marketing.createFlightRoute(token, body);
@@ -281,10 +331,9 @@ export function MarketingPage() {
       setPosters((current) => current.filter((item) => item.id !== poster.id));
       setTotal((current) => Math.max(0, current - 1));
       if (detail?.id === poster.id) closeDetail();
+      setListNonce((current) => current + 1);
       if (pageWillBecomeEmpty) {
         setPage((current) => current - 1);
-      } else {
-        setListNonce((current) => current + 1);
       }
     } catch (error: unknown) {
       if (!mountedRef.current) return;
@@ -295,8 +344,14 @@ export function MarketingPage() {
   }
 
   const selectedTemplate = templates.find((item) => item.key === templateKey);
+  const selectedOutbound = schedules.find((schedule) => schedule.id === outboundScheduleId);
+  const destinationPlaceholder = selectedOutbound ? airportLabel(selectedOutbound.destinationCode) : '目的地';
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
   const rangeInvalid = Boolean(from && to && from > to);
+  const monthAttempts = usage?.month.byModel.reduce((sum, item) => sum + item.attempts, 0) ?? 0;
+  const quotaWarning = usage !== null && (
+    usage.today.mine >= usage.today.limitPerUser || usage.today.total >= usage.today.limitTotal
+  );
 
   return (
     <div className="space-y-5">
@@ -320,7 +375,7 @@ export function MarketingPage() {
           <form className="mt-5 space-y-4" onSubmit={(event) => { event.preventDefault(); void submitForm(); }}>
             {generating && (
               <div className="rounded-lg border border-brand-200 bg-brand-50 px-4 py-3 text-sm text-brand-800">
-                <div className="font-medium">AI 出背景图 + 服务端合成中，最长约 3 分钟，请勿关闭页面</div>
+                <div className="font-medium">AI 正在直接生成整张海报，默认通常约 10 秒；切换其它模型时可能最长 5 分钟，请勿关闭页面</div>
                 <div className="mt-1 text-xs text-brand-700">已耗时 {elapsedSeconds} 秒</div>
               </div>
             )}
@@ -377,19 +432,52 @@ export function MarketingPage() {
                   }).map((schedule) => <option key={schedule.id} value={schedule.id}>{formatSchedule(schedule)}</option>)}
                 </select>
               </div>
-              <div>
-                <label className="label" htmlFor="poster-effective">生效日期文案（选填）</label>
-                <input id="poster-effective" className="input" maxLength={30} value={effectiveFrom} onChange={(event) => setEffectiveFrom(event.target.value)} placeholder="例：8月21日起" />
-              </div>
-              <div>
-                <label className="label" htmlFor="poster-baggage">行李额文案（选填）</label>
-                <input id="poster-baggage" className="input" maxLength={40} value={baggageText} onChange={(event) => setBaggageText(event.target.value)} placeholder="例：20KG+手提7KG" />
-              </div>
-              <div className="md:col-span-2">
-                <label className="label" htmlFor="poster-note">补充要求（选填）</label>
-                <textarea id="poster-note" className="input min-h-24 resize-y" maxLength={200} value={extraNote} onChange={(event) => setExtraNote(event.target.value)} placeholder="补充希望展示的语气、重点或限制" />
-              </div>
             </div>
+            <details className="rounded-lg border border-slate-200 bg-slate-50 px-4 py-3">
+              <summary className="cursor-pointer text-sm font-semibold text-ink">海报文案</summary>
+              <div className="mt-4 grid gap-4 md:grid-cols-2">
+                <div>
+                  <label className="label" htmlFor="poster-headline">主标题（选填）</label>
+                  <input id="poster-headline" className="input" maxLength={20} value={headline} onChange={(event) => { markCopyTouched('headline'); setHeadline(event.target.value); }} placeholder={localMonthDay(selectedOutbound)} />
+                </div>
+                <div>
+                  <label className="label" htmlFor="poster-subtitle">副标题（选填）</label>
+                  <input id="poster-subtitle" className="input" maxLength={20} value={subtitle} onChange={(event) => { markCopyTouched('subtitle'); setSubtitle(event.target.value); }} placeholder="黄金时刻·每天一班" />
+                </div>
+                <div className="md:col-span-2">
+                  <label className="label" htmlFor="poster-slogan">标语（选填）</label>
+                  <input id="poster-slogan" className="input" maxLength={30} value={slogan} onChange={(event) => { markCopyTouched('slogan'); setSlogan(event.target.value); }} placeholder={defaultSlogan(selectedOutbound)} />
+                </div>
+                <div className="md:col-span-2">
+                  <div className="label">三个卖点（选填，每条最多 20 字）</div>
+                  <div className="grid gap-3 md:grid-cols-3">
+                    {highlights.map((value, index) => (
+                      <input
+                        key={`highlight-${index + 1}`}
+                        className="input"
+                        maxLength={20}
+                        value={value}
+                        onChange={(event) => { markCopyTouched('highlights'); setHighlights((current) => current.map((item, itemIndex) => itemIndex === index ? event.target.value : item)); }}
+                        placeholder={['安全出行·严苛保障', '舒适日间·尊享旅程', '高标准飞行保障·贴心服务'][index]}
+                        aria-label={`卖点${index + 1}`}
+                      />
+                    ))}
+                  </div>
+                </div>
+                <div>
+                  <label className="label" htmlFor="poster-cta-1">底部文案一（选填）</label>
+                  <input id="poster-cta-1" className="input" maxLength={30} value={ctaLine1} onChange={(event) => { markCopyTouched('ctaLine1'); setCtaLine1(event.target.value); }} placeholder={`开启您的${destinationPlaceholder}尊享之旅`} />
+                </div>
+                <div>
+                  <label className="label" htmlFor="poster-cta-2">底部文案二（选填）</label>
+                  <input id="poster-cta-2" className="input" maxLength={30} value={ctaLine2} onChange={(event) => { markCopyTouched('ctaLine2'); setCtaLine2(event.target.value); }} placeholder="即刻预订，享黄金时刻优惠" />
+                </div>
+                <div>
+                  <label className="label" htmlFor="poster-baggage">免费托运行李（选填）</label>
+                  <input id="poster-baggage" className="input" maxLength={40} value={baggageText} onChange={(event) => { markCopyTouched('baggageText'); setBaggageText(event.target.value); }} placeholder="例：20KG+手提7KG" />
+                </div>
+              </div>
+            </details>
             {scheduleError && <div className="text-sm text-rose-700">{scheduleError}</div>}
             <div className="flex justify-end">
               <button type="submit" className="btn-primary" disabled={generating || scheduleLoading || rangeInvalid}>
@@ -402,7 +490,18 @@ export function MarketingPage() {
 
       <section className="card p-0">
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-200 px-5 py-4">
-          <div><h2 className="text-base font-semibold text-ink">海报列表</h2><p className="mt-0.5 text-xs text-ink-muted">列表不加载图片，查看详情时再读取大图</p></div>
+          <div>
+            <h2 className="text-base font-semibold text-ink">海报列表</h2>
+            {usage ? (
+              <p className={`mt-0.5 text-xs ${quotaWarning ? 'text-rose-700' : 'text-ink-muted'}`} title="生成海报会消耗 AI 额度，请避免重复生成">
+                今日 {usage.today.mine}/{usage.today.limitPerUser} 张 · 本月共 {usage.month.total} 张（调用 {monthAttempts} 次）
+                <span className="ml-2 text-ink-muted">生成海报会消耗 AI 额度，请避免重复生成</span>
+              </p>
+            ) : (
+              <p className="mt-0.5 text-xs text-ink-muted">用量加载中 · 生成海报会消耗 AI 额度，请避免重复生成</p>
+            )}
+            <p className="mt-0.5 text-xs text-ink-muted">列表不加载图片，查看详情时再读取大图</p>
+          </div>
           <div><label className="sr-only" htmlFor="poster-status">状态筛选</label><select id="poster-status" className="input py-1.5" value={statusFilter} onChange={(event) => { setStatusFilter(event.target.value as StatusFilter); setPage(1); }}><option value="">全部状态</option>{(Object.keys(STATUS_LABEL) as MarketingPosterStatus[]).map((status) => <option key={status} value={status}>{STATUS_LABEL[status]}</option>)}</select></div>
         </div>
         {listError && <div className="mx-5 mt-4 rounded-lg border border-rose-200 bg-rose-50 px-4 py-2 text-sm text-rose-700">{listError}</div>}

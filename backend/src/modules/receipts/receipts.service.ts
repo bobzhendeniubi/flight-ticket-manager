@@ -48,6 +48,7 @@ import {
   parseStatementXlsx,
   buildStatementExportWorkbook,
   statementStorageExternalTxnId,
+  STATEMENT_PLATFORMS,
   type StatementExportEntry,
   type StatementPlatform,
 } from './receipts.statement.js';
@@ -55,6 +56,124 @@ import {
 /** 金额保留 2 位小数（CNY，避免浮点累计误差）。 */
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
+}
+
+/** 「还挂在池子里、等着认款」的状态集合（挂账余额与待认领页签的唯一口径）。 */
+const UNALLOCATED_STATUSES: ReceiptStatus[] = [
+  ReceiptStatus.OPEN,
+  ReceiptStatus.PARTIALLY_ALLOCATED,
+];
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 流水导入：预览 ↔ 入库 绑定（服务端短期记账，客户端提交的行必须是本人刚预览过的行）
+// ─────────────────────────────────────────────────────────────────────────────
+/**
+ * 为什么需要这层绑定：
+ *
+ * 解析层（parseStatementXlsx）承载了**全部**业务规则——交易状态必须是平台的成功状态、
+ * 会生活还要「当前状态=正常」、金额 ≥ 0.01、时间可解析、文件内去重、流水号长度……
+ * 但入库端点收的是客户端提交的裸数组，服务端既不重新读文件、也无从复核这些规则。
+ * 没有绑定的话，任何有后台账号的人都能直接 POST 一组编造的
+ * `{externalTxnId, amountCny, receivedAt}` 凭空生成进账，再认款到订单上——
+ * 那等于给「凭空造钱」开了一个带审计记录的正门。
+ *
+ * 绑定方式：预览时把服务端**自己解析出来**的可导入行记在这里（按操作人 + 平台 + 流水号），
+ * 入库时逐行比对；对不上就整批拒绝，且落库用的是缓存里服务端解析的值，不是客户端提交的值。
+ *
+ * 取舍（诚实说明）：
+ *   - 进程内内存，非持久化。后端重启 / 预览超时（60 分钟）后再点导入会被拒，
+ *     提示重新上传预览即可——**失败方向是拒绝入库**，不会放进任何未经解析的行。
+ *   - 多实例部署时预览与导入必须落到同一实例。当前部署是单后端容器，成立；
+ *     若将来横向扩容，需换成共享存储（Redis）或签名 token，见交付报告。
+ */
+interface StatementPreviewCacheEntry {
+  platform: StatementPlatform;
+  amountCny: number;
+  receivedAtMs: number;
+  method: PaymentMethod;
+  payerNote: string | null;
+  expiresAt: number;
+}
+/** 预览有效期：财务上传→核对→点导入，一小时足够宽裕。 */
+const STATEMENT_PREVIEW_TTL_MS = 60 * 60 * 1000;
+/** 缓存条目硬上限（防长跑进程内存无限增长）；超限按插入顺序淘汰最旧的。 */
+const STATEMENT_PREVIEW_MAX_ENTRIES = 20_000;
+const statementPreviewCache = new Map<string, StatementPreviewCacheEntry>();
+
+/** 缓存键分隔符：控制字符 US，绝不会出现在用户 id / 平台名 / 流水号里，杜绝拼接歧义。 */
+const PREVIEW_KEY_SEP = '\u001f';
+
+/** 缓存键：操作人 + 平台 + 平台原始流水号。 */
+function statementPreviewKey(
+  userId: string,
+  platform: StatementPlatform,
+  externalTxnId: string,
+): string {
+  return [userId, platform, externalTxnId].join(PREVIEW_KEY_SEP);
+}
+
+/** 清掉过期条目；仍超上限则按插入顺序淘汰最旧的。 */
+function pruneStatementPreviewCache(): void {
+  const now = Date.now();
+  for (const [key, entry] of statementPreviewCache) {
+    if (entry.expiresAt <= now) statementPreviewCache.delete(key);
+  }
+  while (statementPreviewCache.size > STATEMENT_PREVIEW_MAX_ENTRIES) {
+    const oldest = statementPreviewCache.keys().next();
+    if (oldest.done) break;
+    statementPreviewCache.delete(oldest.value);
+  }
+}
+
+/** 记下一行「服务端判定可导入」的预览结果（仅 disposition=ok 的行进这里）。 */
+function rememberStatementPreviewRow(
+  userId: string,
+  platform: StatementPlatform,
+  row: { externalTxnId: string; amountCny: number; receivedAt: Date; method: PaymentMethod; payerNote: string | null },
+): void {
+  statementPreviewCache.set(statementPreviewKey(userId, platform, row.externalTxnId), {
+    platform,
+    amountCny: round2(row.amountCny),
+    receivedAtMs: row.receivedAt.getTime(),
+    method: row.method,
+    payerNote: row.payerNote,
+    expiresAt: Date.now() + STATEMENT_PREVIEW_TTL_MS,
+  });
+}
+
+/** 取回某行的预览结果；不存在或已过期 → null（调用方一律拒绝入库）。 */
+function recallStatementPreviewRow(
+  userId: string,
+  platform: StatementPlatform,
+  externalTxnId: string,
+): StatementPreviewCacheEntry | null {
+  const key = statementPreviewKey(userId, platform, externalTxnId);
+  const entry = statementPreviewCache.get(key);
+  if (!entry) return null;
+  if (entry.expiresAt <= Date.now()) {
+    statementPreviewCache.delete(key);
+    return null;
+  }
+  return entry;
+}
+
+/** 仅供测试：清空预览缓存，避免用例间互相看到对方的预览。 */
+export function __resetStatementPreviewCacheForTests(): void {
+  statementPreviewCache.clear();
+}
+
+/**
+ * 同一笔平台流水在**各平台前缀下**的全部可能存储键。
+ *
+ * 存储键 = 平台前缀 + 平台原单号（CMB_QR 前缀为空，YSB:/XYF:/HSH: 各有前缀）。前缀是为了
+ * 避免不同平台的单号偶然撞号，但它带来一个副作用：同一份流水用平台 A 导一次、平台 B 再导一次，
+ * 落库是两个不同的 externalTxnId，唯一索引拦不住 —— 同一笔钱在池子里出现两次，可以被认款两次。
+ * 因此防重必须**跨前缀**查：只要这笔原单号在任何一个平台前缀下已经入过池，就不再入第二次。
+ */
+function statementAllStorageKeys(externalTxnId: string): string[] {
+  return [
+    ...new Set(STATEMENT_PLATFORMS.map((p) => statementStorageExternalTxnId(p, externalTxnId))),
+  ];
 }
 
 /**
@@ -229,6 +348,25 @@ async function findAllocationPaymentWithinTx(
 type ReceiptWithAllocations = Receipt & { allocations: ReceiptAllocation[] };
 
 /**
+ * 一笔进账「还挂在池子里、等着认款」的余额 —— 挂账池的唯一余额口径。
+ *
+ * = amountCny − allocatedCny，但 **REFUNDED 行一律为 0**：剩余部分已经退回客户，
+ * 那笔钱不在公司手上了，绝不能继续算作待认领。refund() 只翻 status 不动 allocatedCny
+ *（allocatedCny 的语义是「认领给订单的钱」，退款不是认领），所以归零必须在读侧做。
+ *
+ * 列表序列化与核对表导出共用本函数：界面 KPI 与导出合计不会再出现「界面排除了已退款、
+ * 导出却把它算进未认余额」的口径分叉——那正是财务把已退掉的钱当成还能认的钱的成因。
+ */
+export function receiptRemainingCny(r: {
+  amountCny: Prisma.Decimal | number;
+  allocatedCny: Prisma.Decimal | number;
+  status: ReceiptStatus;
+}): number {
+  if (r.status === ReceiptStatus.REFUNDED) return 0;
+  return round2(Number(r.amountCny) - Number(r.allocatedCny));
+}
+
+/**
  * 批量把订单 id 换成订单号（ReceiptAllocation / orderHintId 都只存 id，无 Prisma relation）。
  * 一次 IN 查询，不做 N+1；空数组直接返回空表，不打库。
  */
@@ -253,14 +391,13 @@ export function serializeReceipt(
   r: ReceiptWithAllocations,
   orderNoById?: ReadonlyMap<string, string>,
 ) {
-  const amount = Number(r.amountCny);
-  const allocated = Number(r.allocatedCny);
   return {
     id: r.id,
     receiptNo: r.receiptNo,
     amountCny: r.amountCny.toString(),
     allocatedCny: r.allocatedCny.toString(),
-    remainingCny: round2(amount - allocated).toFixed(2),
+    // 已退款行的未认余额恒为 0（钱已退回客户，不再是待认领）——见 receiptRemainingCny
+    remainingCny: receiptRemainingCny(r).toFixed(2),
     method: r.method,
     proofUrl: r.proofUrl,
     payerNote: r.payerNote,
@@ -291,12 +428,31 @@ export class ReceiptsService {
   // ════════════════════════════════════════════════════════════════════
   // 挂账池列表
   // ════════════════════════════════════════════════════════════════════
+  /**
+   * 挂账池列表 + **未认领全量汇总**。
+   *
+   * 为什么不能只回「最近 500 条」：那个窗口按 receivedAt desc 取**任意状态**的记录。
+   * 流水导入每天几百行，已认款记录很快把窗口占满，更早的**未认款**流水会从列表里
+   * 无声消失——财务据此求和出来的「挂账余额」凭空变小，那笔钱就被当作不存在了
+   *（核对表导出为此专门做了全量分页，列表这侧此前没治）。
+   *
+   * 两条口径同时给：
+   *   receipts —— 最近窗口 ∪ **全部未认完**（OPEN/PARTIALLY_ALLOCATED，同一套过滤条件，
+   *               分页取到硬上限）。未认款流水不再因为窗口被占满而消失。
+   *   summary  —— 未认领的**服务端全量聚合**（count + 未认余额合计），不受任何窗口/上限影响。
+   *               KPI 一律读它，别在返回的行上求和——行可能被上限截断，聚合不会。
+   */
   async list(query: ListReceiptsQuery) {
+    /** 列表窗口：最近这么多条（任意状态），供「全部流水」页签浏览。*/
+    const RECENT_WINDOW = 500;
+    /** 未认领行的返回上限（防失控；触顶时 summary.unallocatedTruncated=true 明说，绝不静默）。*/
+    const UNALLOCATED_CAP = 1000;
+
     const where: Prisma.ReceiptWhereInput = {};
     if (query.status) where.status = query.status;
     // 认款工作台专用：只回未认完的，避免 take 500 被已认款记录占满挤出旧 OPEN 流水
     if (query.unallocatedOnly === '1') {
-      where.status = { in: [ReceiptStatus.OPEN, ReceiptStatus.PARTIALLY_ALLOCATED] };
+      where.status = { in: UNALLOCATED_STATUSES };
     }
     if (query.q) {
       where.OR = [
@@ -311,18 +467,79 @@ export class ReceiptsService {
     // 到账日期闭区间（按流水交易日期字段 receivedAt，北京时）
     const receivedRange = beijingDayRange(query.from, query.to);
     if (receivedRange) where.receivedAt = receivedRange;
-    const rows = await prisma.receipt.findMany({
-      where,
-      include: { allocations: true },
-      orderBy: { receivedAt: 'desc' },
-      take: 500,
-    });
+
+    // 未认领子集的 where：同一套过滤条件，只把状态收窄到「未认完」。
+    // 调用方已显式筛了某个非未认完状态（如 ALLOCATED/REFUNDED）→ 不强塞未认领行，尊重筛选。
+    const unallocatedStatuses = query.status
+      ? UNALLOCATED_STATUSES.filter((s) => s === query.status)
+      : UNALLOCATED_STATUSES;
+    const unallocatedWhere: Prisma.ReceiptWhereInput | null =
+      unallocatedStatuses.length > 0 ? { ...where, status: { in: unallocatedStatuses } } : null;
+
+    const [recentRows, unallocatedPage, unallocatedAgg] = await Promise.all([
+      prisma.receipt.findMany({
+        where,
+        include: { allocations: true },
+        orderBy: { receivedAt: 'desc' },
+        take: RECENT_WINDOW,
+      }),
+      unallocatedWhere
+        ? prisma.receipt.findMany({
+            where: unallocatedWhere,
+            include: { allocations: true },
+            orderBy: { receivedAt: 'desc' },
+            // 多取 1 条用于判断是否触顶（触顶要如实告知，不静默截断）
+            take: UNALLOCATED_CAP + 1,
+          })
+        : Promise.resolve([]),
+      unallocatedWhere
+        ? prisma.receipt.aggregate({
+            where: unallocatedWhere,
+            _count: { _all: true },
+            _sum: { amountCny: true, allocatedCny: true },
+          })
+        : Promise.resolve(null),
+    ]);
+
+    const unallocatedTruncated = unallocatedPage.length > UNALLOCATED_CAP;
+    const unallocatedRows = unallocatedTruncated
+      ? unallocatedPage.slice(0, UNALLOCATED_CAP)
+      : unallocatedPage;
+
+    // 合并去重（未认领优先落座，保证它们一定在结果里），再按到账时间倒序还原列表口径
+    const byId = new Map<string, (typeof recentRows)[number]>();
+    for (const r of [...unallocatedRows, ...recentRows]) {
+      if (!byId.has(r.id)) byId.set(r.id, r);
+    }
+    const rows = [...byId.values()].sort(
+      (a, b) => b.receivedAt.getTime() - a.receivedAt.getTime(),
+    );
+
     // 认领明细 + 疑似归属订单一次批量换成订单号（不做 N+1）
     const orderNoById = await loadOrderNumbers([
       ...rows.flatMap((r) => r.allocations.map((a) => a.orderId)),
       ...rows.map((r) => r.orderHintId),
     ]);
-    return rows.map((r) => serializeReceipt(r, orderNoById));
+
+    // 未认余额合计 = Σ金额 − Σ已认（未认完状态不含 REFUNDED，故与 receiptRemainingCny 同口径）
+    const unallocatedRemaining = unallocatedAgg
+      ? round2(
+          Number(unallocatedAgg._sum.amountCny ?? 0) -
+            Number(unallocatedAgg._sum.allocatedCny ?? 0),
+        )
+      : 0;
+
+    return {
+      receipts: rows.map((r) => serializeReceipt(r, orderNoById)),
+      summary: {
+        /** 未认完的进账笔数（服务端全量，不受列表上限影响）*/
+        unallocatedCount: unallocatedAgg?._count._all ?? 0,
+        /** 未认余额合计（挂账余额 KPI 的唯一真值；前端不要再在行上求和）*/
+        unallocatedRemainingCny: unallocatedRemaining.toFixed(2),
+        /** true = 未认领行超过返回上限、列表里只给了前 UNALLOCATED_CAP 条（合计仍是全量）*/
+        unallocatedTruncated,
+      },
+    };
   }
 
   // ════════════════════════════════════════════════════════════════════
@@ -612,9 +829,10 @@ export class ReceiptsService {
    *   - 进账已退款（REFUNDED）：剩余部分已按退款口径处置，再塞钱回来对不上退款金额。
    *   - 订单在撤销专用资金闸内（回收站 / 已退款 / 退款申请中）；取消族放行，
    *     因为撤销只是把钱退回挂账池，不减少公司总资金。
-   *   - 订单收款已锁定（paymentsLocked）：财务复核已完成，先解锁再撤。
    *   - 找不到当初那笔收款 / 收款已不是 SUCCEEDED（已撤过）：无法对称回退 → 拒绝（重复撤销天然被此闸挡住）。
    *   - 撤销后订单已付会变负，或低于该单已完成退款额（账面倒挂）。
+   *
+   * 不受收款复核锁（paymentsLocked）约束 —— 与「认款入账不受锁」对称，详细理由见函数体内注释。
    *
    * 不动的东西（撤销只回退资金，不回退履约）：订单状态、佣金、履约任务保持原样。
    * 若撤销后订单由「已结清」变回「有尾款」，返回 warning 告知，由财务据实跟进
@@ -653,11 +871,18 @@ export class ReceiptsService {
       if (!order) throw new NotFoundError('该认款对应的订单不存在');
       // 撤销专用闸：取消族放行，因为撤销只是把钱退回挂账池，不减少公司总资金。
       assertOrderAllowsFundsReversal(order, '撤销认款');
-      if (order.paymentsLocked) {
-        throw new ConflictError(
-          `订单 ${order.orderNumber} 收款已锁定（财务复核完成），请先在订单收款区解锁再撤销认款`,
-        );
-      }
+      // ⚠ 这里**故意不判** order.paymentsLocked —— 与认款侧对称，理由如下：
+      //
+      // 收款复核锁的口径边界是「只拦人工录入」：认款入账（_creditOrderPaymentWithinTx）
+      // 明确不受锁约束（真钱已到账必须如实落库）。若认款不受锁、撤销却受锁，就出现一个
+      // 单向阀门：订单复核锁定后，仍可能有人把一笔流水误认到这张单上（锁拦不住），
+      // 想撤回时反被锁挡下 409 —— 复核锁反过来保护了错误入账，账面永远错着。
+      //
+      // 因此按「同一条资金通道，进出两侧同一把闸」定口径：
+      //   人工录入收款 confirmManualPayment ↔ 撤销 reverseManualPayment —— 两侧都受锁（未变）。
+      //   对账认款      allocate            ↔ 撤销 reverseAllocation    —— 两侧都不受锁（本处）。
+      // 撤销本身并不因此变松：进账已退款 / 撤销专用资金闸 / 已计提佣金 / 退款倒挂 /
+      // 收款 CAS 冲销这几道闸一个不少，且每次撤销都写 CRITICAL 审计，谁撤的一清二楚。
 
       // 定位当初入账生成的那笔收款；找不到 → 拒绝（不猜、不硬扣）
       const payment = await findAllocationPaymentWithinTx(tx, {
@@ -829,6 +1054,11 @@ export class ReceiptsService {
       if (remaining <= 0) {
         throw new BadRequestError('该进账无剩余未认领部分，无可退款');
       }
+      // 只翻 status、**不动 allocatedCny** —— allocatedCny 的语义是「认领给订单的钱」，
+      // 退款不是认领，把它补到 amountCny 会让核对表「已认金额」列凭空多出从未认领过的钱
+      //（与「认到订单」列自相矛盾）。这笔退掉的钱不再挂在池子里这件事，由
+      // receiptRemainingCny() 统一在读侧把 REFUNDED 行的「未认余额」归零来表达
+      //（列表序列化与核对表导出共用同一个函数，两处口径不可能再打架）。
       await tx.receipt.update({
         where: { id: receiptId },
         data: { status: ReceiptStatus.REFUNDED, refundNote: note },
@@ -911,9 +1141,32 @@ export class ReceiptsService {
    * 解析收单平台流水 xlsx → 预览行 + 处置判定。
    * 行内判定（parseStatementXlsx）之外，再对照现库：已存在同 externalTxnId 的行
    * 标 dup_in_db 并附现有进账号/认款状态——重复导入天然幂等，已认过的行状态不丢。
+   *
+   * 副作用（资金安全的一半）：把服务端判定为 `ok` 的行按「操作人 + 平台 + 流水号」记进
+   * 预览缓存，入库端点只认这些行（见 importStatement）。没有这一步，入库就是一个
+   * 「客户端说什么就落什么」的凭空造钱入口。
    */
-  async previewStatement(fileBase64: string, platform: StatementPlatform = 'CMB_QR') {
+  async previewStatement(
+    fileBase64: string,
+    platform: StatementPlatform = 'CMB_QR',
+    actor?: { userId: string },
+  ) {
     const { rows, warnings } = await parseStatementXlsx(fileBase64, platform);
+    // 先记账再查库：登记的是**服务端解析结果**，与后面 dup_in_db 的展示判定无关
+    //（库里已有的行客户端本来就不会提交；万一提交了，入库侧的三层防重照样拦）。
+    if (actor) {
+      pruneStatementPreviewCache();
+      for (const r of rows) {
+        if (r.disposition !== 'ok' || r.amountCny == null || r.receivedAt == null) continue;
+        rememberStatementPreviewRow(actor.userId, platform, {
+          externalTxnId: r.externalTxnId,
+          amountCny: r.amountCny,
+          receivedAt: r.receivedAt,
+          method: r.method,
+          payerNote: r.payerNote,
+        });
+      }
+    }
     const okIds = rows
       .filter((r) => r.disposition === 'ok')
       .map((r) => statementStorageExternalTxnId(platform, r.externalTxnId));
@@ -976,30 +1229,74 @@ export class ReceiptsService {
   // ════════════════════════════════════════════════════════════════════
   /**
    * 把预览确认后的流水行入池（source=STATEMENT_IMPORT，status=OPEN）。
-   * 防重三层：请求内去重 → 预查现库剔除 → createMany skipDuplicates 靠
-   * externalTxnId 唯一索引兜底（并发导入也绝不重复入池）。
+   *
+   * 入库口径（自上而下）：
+   *   0. **预览绑定**：每一行都必须是本人刚刚预览过、且被服务端解析判定为可导入的行；
+   *      金额/到账时间/收款方式与预览结果不符 → 整批拒绝。落库用的是**预览缓存里服务端
+   *      解析出来的值**，客户端提交的字段只用来定位行，不作为账目来源。
+   *      —— 没有这一步，解析层那一整套业务规则（交易状态=成功、金额 ≥ 0.01、时间可解析、
+   *      文件内去重…）就全被绕过了：任何后台账号都能 POST 编造的流水行凭空造出进账。
+   *   1. 请求内去重（同一批里同号只入一次）。
+   *   2. **跨平台前缀**预查现库剔除：同一原单号只要在任何平台前缀下入过池就不再入
+   *      （见 statementAllStorageKeys —— 防「同一份流水换个平台再导一次」把同一笔钱变两笔）。
+   *   3. createMany skipDuplicates 靠 externalTxnId 唯一索引兜底（并发导入不重复入池）。
    */
   async importStatement(input: ImportStatementInput, actor: { userId: string; role: UserRole }) {
-    const rowsWithStorageIds = input.rows.map((r) => ({
-      ...r,
-      externalTxnId: statementStorageExternalTxnId(input.platform, r.externalTxnId),
-    }));
+    // ── 0. 预览绑定：逐行回到服务端自己的解析结果上核对 ──────────────────────
+    const boundRows = input.rows.map((r, i) => {
+      const previewed = recallStatementPreviewRow(actor.userId, input.platform, r.externalTxnId);
+      if (!previewed) {
+        throw new BadRequestError(
+          `第 ${i + 1} 行（流水号 ${r.externalTxnId}）不在本次预览的可导入结果里，` +
+            `或预览已失效（超过 60 分钟 / 服务重启 / 换了平台）。请重新上传流水文件预览后再导入。`,
+        );
+      }
+      const submittedAt = r.receivedAt.getTime();
+      if (
+        Math.abs(previewed.amountCny - round2(r.amountCny)) >= 0.005 ||
+        submittedAt !== previewed.receivedAtMs ||
+        previewed.method !== r.method
+      ) {
+        throw new BadRequestError(
+          `流水号 ${r.externalTxnId} 提交的金额/到账时间/收款方式与预览结果不一致` +
+            `（预览 ¥${previewed.amountCny.toFixed(2)}，提交 ¥${round2(r.amountCny).toFixed(2)}），` +
+            `已拒绝整批导入。请重新上传流水文件预览后再导入。`,
+        );
+      }
+      // 一律采用预览缓存里服务端解析出来的值入库，客户端提交的字段不作数
+      return {
+        rawTxnId: r.externalTxnId,
+        externalTxnId: statementStorageExternalTxnId(previewed.platform, r.externalTxnId),
+        amountCny: previewed.amountCny,
+        method: previewed.method,
+        receivedAt: new Date(previewed.receivedAtMs),
+        payerNote: previewed.payerNote,
+      };
+    });
+
+    // ── 1. 请求内去重 ────────────────────────────────────────────────────────
     const seen = new Set<string>();
-    const unique = rowsWithStorageIds.filter((r) =>
+    const unique = boundRows.filter((r) =>
       seen.has(r.externalTxnId) ? false : (seen.add(r.externalTxnId), true),
     );
 
-    const existing = await prisma.receipt.findMany({
-      where: { externalTxnId: { in: unique.map((r) => r.externalTxnId) } },
-      select: { externalTxnId: true },
-    });
+    // ── 2. 跨平台前缀预查现库 ────────────────────────────────────────────────
+    const allKeys = [...new Set(unique.flatMap((r) => statementAllStorageKeys(r.rawTxnId)))];
+    const existing = allKeys.length
+      ? await prisma.receipt.findMany({
+          where: { externalTxnId: { in: allKeys } },
+          select: { externalTxnId: true },
+        })
+      : [];
     const existingSet = new Set(existing.map((e) => e.externalTxnId));
-    const fresh = unique.filter((r) => !existingSet.has(r.externalTxnId));
+    const fresh = unique.filter(
+      (r) => !statementAllStorageKeys(r.rawTxnId).some((k) => existingSet.has(k)),
+    );
 
     const data = await Promise.all(
       fresh.map(async (r) => ({
         receiptNo: await generateReceiptNo(),
-        amountCny: new Prisma.Decimal(round2(r.amountCny)),
+        amountCny: new Prisma.Decimal(r.amountCny),
         allocatedCny: new Prisma.Decimal(0),
         method: r.method,
         source: ReceiptSource.STATEMENT_IMPORT,
@@ -1223,7 +1520,8 @@ export class ReceiptsService {
         sourceLabel: SOURCE_LABEL[r.source],
         statusLabel: STATUS_LABEL[r.status],
         allocatedCny: allocated,
-        remainingCny: round2(amount - allocated),
+        // 已退款行归零：核对表「未认余额」列求和 = 挂账池真实待认领余额，与界面 KPI 同口径
+        remainingCny: receiptRemainingCny(r),
         allocationsText,
         lastAllocatedAt: allocs.length > 0 ? allocs[allocs.length - 1].createdAt : null,
         allocatorNames,

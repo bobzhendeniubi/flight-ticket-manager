@@ -170,6 +170,106 @@ describe('ReceiptsService.register + allocate · 登记进账并认领到订单'
     expect(alloc).toBeNull();
   });
 
+  /**
+   * 超收硬闸：认款入账内核与逐单人工确认收款（confirmManualPayment）共用同一条口径。
+   *
+   * 内核此前只有防手误上限（总额×10 / 100 万封顶），没有超收闸 —— 认款于是成了一条
+   * 能把 paidAmount 无限抬到应收之上的旁路：一笔大额流水反复认到同一张小额订单上，
+   * 订单账面凭空多付，多付再往下游喂（多付转余额 / 退款），就是真实资金损失。
+   *
+   * 认款场景下拒绝不会丢钱：钱本来就躺在挂账池里，只认到应收余额为止，
+   * 剩下的留在池子里按挂账处置（退回客户 / 认到别的单）——这正是挂账池存在的意义。
+   */
+  it('认款会让订单超收 → 拒绝，并告知最多可认多少；进账与订单一分未动', async () => {
+    const ADMIN = await createAdminActor();
+    const order = await createGuestOrder({ total: 1000, paidAmount: 0 });
+    const receipt = await registerReceipt(1500, ADMIN);
+
+    await expect(
+      receiptsService.allocate(receipt.id, { orderId: order.id, amountCny: 1500 }, ADMIN),
+    ).rejects.toThrow(/最多只能认领 ¥1000\.00，超出部分请留在挂账池另行处置/);
+
+    // 全有或全无：进账未动、订单未动、无收款记录、无认领明细
+    const dbReceipt = await prisma.receipt.findUniqueOrThrow({ where: { id: receipt.id } });
+    expect(Number(dbReceipt.allocatedCny)).toBe(0);
+    expect(dbReceipt.status).toBe(ReceiptStatus.OPEN);
+    const dbOrder = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(Number(dbOrder.paidAmount)).toBe(0);
+    expect(await prisma.payment.findFirst({ where: { orderId: order.id } })).toBeNull();
+    expect(await prisma.receiptAllocation.findFirst({ where: { receiptId: receipt.id } })).toBeNull();
+  });
+
+  it('已收满的订单再认一分钱 → 拒绝（重复认款不能把同一张单越认越多）', async () => {
+    const ADMIN = await createAdminActor();
+    const order = await createGuestOrder({ total: 1000, paidAmount: 0 });
+    const first = await registerReceipt(1000, ADMIN);
+    await receiptsService.allocate(first.id, { orderId: order.id, amountCny: 1000 }, ADMIN);
+
+    const second = await registerReceipt(1000, ADMIN);
+    await expect(
+      receiptsService.allocate(second.id, { orderId: order.id, amountCny: 1 }, ADMIN),
+    ).rejects.toThrow(/会超出应收/);
+
+    const dbOrder = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(Number(dbOrder.paidAmount)).toBe(1000); // 停在应收，没被越认越多
+  });
+
+  it('收满（恰好等于应收）不拦：只拦严格超出', async () => {
+    const ADMIN = await createAdminActor();
+    const order = await createGuestOrder({ total: 1000, paidAmount: 400 });
+    const receipt = await registerReceipt(600, ADMIN);
+
+    const result = await receiptsService.allocate(
+      receipt.id,
+      { orderId: order.id, amountCny: 600 },
+      ADMIN,
+    );
+    expect(result.order.paidAmount).toBe(1000);
+    expect(result.order.fullyPaid).toBe(true);
+  });
+
+  it('已完成退款腾出的额度可以再收：净额口径（已付 − 已退）不算超收', async () => {
+    const ADMIN = await createAdminActor();
+    const order = await createGuestOrder({ total: 1000, paidAmount: 1000 });
+    // 已退给客户 300：净额 700，还能再收 300（退款不减 paidAmount，只翻 Refund 状态）
+    await prisma.refund.create({
+      data: {
+        orderId: order.id,
+        amount: new Prisma.Decimal(300),
+        status: 'COMPLETED',
+        reason: '部分退款',
+      },
+    });
+    const receipt = await registerReceipt(300, ADMIN);
+
+    const result = await receiptsService.allocate(
+      receipt.id,
+      { orderId: order.id, amountCny: 300 },
+      ADMIN,
+    );
+    expect(result.order.paidAmount).toBe(1300); // 账面 1300 − 已退 300 = 净额 1000 = 应收
+
+    // 再多认一分就超了
+    const extra = await registerReceipt(100, ADMIN);
+    await expect(
+      receiptsService.allocate(extra.id, { orderId: order.id, amountCny: 1 }, ADMIN),
+    ).rejects.toThrow(/会超出应收/);
+  });
+
+  it('改期费加价（adjustmentCny）计入应收：加价后原本超收的金额变得可认', async () => {
+    const ADMIN = await createAdminActor();
+    const order = await createGuestOrder({ total: 1000, paidAmount: 1000 });
+    await prisma.order.update({ where: { id: order.id }, data: { adjustmentCny: 200 } });
+    const receipt = await registerReceipt(200, ADMIN);
+
+    const result = await receiptsService.allocate(
+      receipt.id,
+      { orderId: order.id, amountCny: 200 },
+      ADMIN,
+    );
+    expect(result.order.paidAmount).toBe(1200);
+  });
+
   it('认领到不存在订单：整体回滚（进账不变）', async () => {
     const ADMIN = await createAdminActor();
     const receipt = await registerReceipt(500, ADMIN);
@@ -335,28 +435,47 @@ describe('ReceiptsService.reverseAllocation · 撤销认款（认领的逆操作
     expect(Number(dbReceipt.allocatedCny)).toBe(0);
   });
 
-  it('订单收款已锁定：拒绝撤销并提示先解锁；解锁后可撤', async () => {
+  /**
+   * 收款复核锁在对账认款这条通道上**进出两侧一律不拦**——这是刻意的对称。
+   *
+   * 认款入账（_creditOrderPaymentWithinTx）明确不受锁约束：真钱已经到公司账上，必须如实落库。
+   * 那撤销就不能反过来受锁：否则出现单向阀门——复核锁定后仍可能有人把一笔流水误认到这张单上
+   *（锁拦不住），想撤回时反被 409 挡下，复核锁变成了**保护错误入账**的东西，账面永远错着。
+   *
+   * 对照组是人工录入那条通道：confirmManualPayment ↔ reverseManualPayment 两侧都受锁（未变）。
+   * 同一条通道两侧同一把闸 —— 这才是复核锁该有的样子。
+   */
+  it('订单收款已锁定：认款与撤销都不受锁约束（同一通道两侧对称）', async () => {
     const ADMIN = await createAdminActor();
     const order = await createGuestOrder({ total: 1000, paidAmount: 0 });
     const receipt = await registerReceipt(600, ADMIN);
-    await receiptsService.allocate(receipt.id, { orderId: order.id, amountCny: 600 }, ADMIN);
+
+    // 先锁定，再认款：锁只拦人工录入，对账认款照进（真钱已到账）
+    await prisma.order.update({ where: { id: order.id }, data: { paymentsLocked: true } });
+    const allocated = await receiptsService.allocate(
+      receipt.id,
+      { orderId: order.id, amountCny: 600 },
+      ADMIN,
+    );
+    expect(allocated.order.paidAmount).toBe(600);
+
     const alloc = await prisma.receiptAllocation.findFirstOrThrow({
       where: { receiptId: receipt.id },
     });
 
-    await prisma.order.update({ where: { id: order.id }, data: { paymentsLocked: true } });
-    await expect(
-      receiptsService.reverseAllocation(receipt.id, alloc.id, ADMIN),
-    ).rejects.toThrow(/收款已锁定/);
-    // 拒绝即全无：订单与进账一分未动
-    const lockedOrder = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
-    expect(Number(lockedOrder.paidAmount)).toBe(600);
-    const lockedReceipt = await prisma.receipt.findUniqueOrThrow({ where: { id: receipt.id } });
-    expect(Number(lockedReceipt.allocatedCny)).toBe(600);
-
-    await prisma.order.update({ where: { id: order.id }, data: { paymentsLocked: false } });
+    // 仍在锁定态下撤销：同样放行 —— 认得进来就必须撤得回去
+    const lockedStill = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(lockedStill.paymentsLocked).toBe(true);
     const result = await receiptsService.reverseAllocation(receipt.id, alloc.id, ADMIN);
     expect(result.order.paidAmount).toBe(0);
+
+    // 撤销是真撤：订单已付回 0、进账回 OPEN、认领明细消失
+    const dbOrder = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(Number(dbOrder.paidAmount)).toBe(0);
+    const dbReceipt = await prisma.receipt.findUniqueOrThrow({ where: { id: receipt.id } });
+    expect(Number(dbReceipt.allocatedCny)).toBe(0);
+    expect(dbReceipt.status).toBe(ReceiptStatus.OPEN);
+    expect(await prisma.receiptAllocation.findUnique({ where: { id: alloc.id } })).toBeNull();
   });
 
   it('进账已退款：拒绝撤销（撤回的钱与已退金额会对不上）', async () => {
@@ -526,6 +645,49 @@ describe('ReceiptsService.refund · 退款剩余未认领部分', () => {
     expect(Number(dbOrder.paidAmount)).toBe(400);
   });
 
+  /**
+   * 退款后「未认余额」必须归零，且列表与导出必须同一个口径。
+   *
+   * refund() 只翻 status、不动 allocatedCny（allocatedCny 的语义是「认领给订单的钱」，
+   * 退款不是认领），所以 amount − allocated 仍是正数。这笔钱已经退回客户了，
+   * 继续算作待认领 → 财务对核对表「未认余额」列求和，挂账池余额被虚增。
+   * 界面 KPI 早就排除了 REFUNDED、导出没排除，两处口径还会互相打架。
+   */
+  it('退款后：列表与核对表导出的「未认余额」都归零，且已认金额保持诚实', async () => {
+    const ADMIN = await createAdminActor();
+    const order = await createGuestOrder({ total: 1000, paidAmount: 0 });
+    const receipt = await registerReceipt(1000, ADMIN);
+    await receiptsService.allocate(receipt.id, { orderId: order.id, amountCny: 300 }, ADMIN);
+    await receiptsService.refund(receipt.id, '剩余 700 原路退回', ADMIN);
+
+    // ① 列表口径
+    const { receipts, summary } = await receiptsService.list({});
+    const listed = receipts.find((r) => r.id === receipt.id);
+    expect(listed?.status).toBe(ReceiptStatus.REFUNDED);
+    expect(listed?.remainingCny).toBe('0.00');
+    // 已认金额不被抬成 1000 —— 那会与「认到订单」只有 ¥300 自相矛盾
+    expect(Number(listed?.allocatedCny)).toBe(300);
+    // ② 未认领全量聚合不含已退款这笔（挂账余额 KPI 的真值）
+    expect(Number(summary.unallocatedRemainingCny)).toBe(0);
+    expect(summary.unallocatedCount).toBe(0);
+
+    // ③ 导出口径（此前正是这里把 700 算进「未认余额」合计）
+    const wb = await receiptsService.exportStatement({});
+    const ws = wb.getWorksheet('流水核对表');
+    expect(ws).toBeDefined();
+    let remainingCell: unknown = undefined;
+    let allocatedCell: unknown = undefined;
+    ws!.eachRow((row, rowNumber) => {
+      if (rowNumber === 1) return;
+      if (row.getCell('receiptNo').value === receipt.receiptNo) {
+        remainingCell = row.getCell('remainingCny').value;
+        allocatedCell = row.getCell('allocatedCny').value;
+      }
+    });
+    expect(remainingCell).toBe(0);
+    expect(allocatedCell).toBe(300);
+  });
+
   it('拒绝：无剩余可退（已全部认领）', async () => {
     const ADMIN = await createAdminActor();
     const order = await createGuestOrder({ total: 1000, paidAmount: 0 });
@@ -611,11 +773,15 @@ describe('ReceiptsService.list · 到账日期筛选（receivedAt）', () => {
 
     // 纯过去区间：今天登记的进账不应出现
     const past = await receiptsService.list({ from: '2000-01-01', to: '2000-01-02' });
-    expect(past.some((r) => r.id === receipt.id)).toBe(false);
+    expect(past.receipts.some((r) => r.id === receipt.id)).toBe(false);
 
     // 覆盖今天的宽区间：应出现
     const wide = await receiptsService.list({ from: '2000-01-01', to: '2999-12-31' });
-    expect(wide.some((r) => r.id === receipt.id)).toBe(true);
+    expect(wide.receipts.some((r) => r.id === receipt.id)).toBe(true);
+    // 未认领聚合与日期过滤同轴：过去区间聚合为空，宽区间含这笔
+    expect(past.summary.unallocatedCount).toBe(0);
+    expect(wide.summary.unallocatedCount).toBeGreaterThanOrEqual(1);
+    expect(Number(wide.summary.unallocatedRemainingCny)).toBeGreaterThanOrEqual(1000);
   });
 });
 

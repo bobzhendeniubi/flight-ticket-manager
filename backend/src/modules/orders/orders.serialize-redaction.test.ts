@@ -68,6 +68,9 @@ function buildOrder() {
         quantity: 2,
         unitPrice: dec(500),
         amount: dec(1000),
+        // 我方真实进价（成本快照）——对外角色绝不可见
+        unitCostCny: dec(380),
+        totalCostCny: dec(760),
         // metadata 混合：计价键（perSeatBreakdown 含逐座 unitPrice）+ 业务键（出发日期）
         metadata: {
           perSeatBreakdown: [
@@ -85,6 +88,8 @@ function buildOrder() {
         quantity: 1,
         unitPrice: dec(3000),
         amount: dec(3200),
+        unitCostCny: dec(2100),
+        totalCostCny: dec(2100),
         // metadata 混合：计价键（addOns/operationFee/bundleDiscountPct）+ 业务键（房间/晚数/乘客构成）
         metadata: {
           addOns: {
@@ -186,6 +191,12 @@ describe('serializeOrder · ADMIN/STAFF 视角（不脱敏）', () => {
     expect(out.passengers[0].hasPassportPhoto).toBe(true);
   });
 
+  it('保留成本快照（unitCostCny / totalCostCny）—— 内部角色要看毛利', () => {
+    expect(out.items[0].unitCostCny.toString()).toBe('380');
+    expect(out.items[0].totalCostCny.toString()).toBe('760');
+    expect(out.items[1].unitCostCny.toString()).toBe('2100');
+  });
+
   it('保留订单行 metadata 计价明细（perSeatBreakdown / addOns / operationFee / bundleDiscountPct）', () => {
     expect(out.items[0].metadata.perSeatBreakdown).toHaveLength(2);
     expect(out.items[0].metadata.perSeatBreakdown[0].unitPrice).toBe(480);
@@ -228,6 +239,23 @@ describe('serializeOrder · AGENT/CUSTOMER 视角（脱敏）', () => {
     expect(out.passengers[0].documentNumber).toBe('E12345678');
     expect(out.passengers[0].passportPhotoUrl).toBeUndefined();
     expect(out.passengers[0].hasPassportPhoto).toBe(true);
+  });
+
+  /**
+   * 成本快照 = 我方真实进价。它此前随 `...i` 整行展开一起下发给了 AGENT/CUSTOMER：
+   * 对外角色在浏览器 Network 面板逐行读到成本、和自己付的钱一减就是我方毛利。
+   * 比行级售价泄露严重得多，必须逐行抹掉（两个字段都要，缺一个就够算毛利）。
+   */
+  it('剥离成本快照（unitCostCny / totalCostCny）—— 我方进价绝不下发', () => {
+    for (const item of out.items) {
+      expect(item.unitCostCny).toBeUndefined();
+      expect(item.totalCostCny).toBeUndefined();
+    }
+    // 反向确认：整个响应体里不残留任何成本数字（防将来又从别的键漏出去）
+    const dumped = JSON.stringify(out);
+    expect(dumped).not.toContain('380');
+    expect(dumped).not.toContain('760');
+    expect(dumped).not.toContain('2100');
   });
 
   it('剥离订单行 metadata 计价明细（perSeatBreakdown/addOns/operationFee/bundleDiscountPct），保留非价格业务键', () => {

@@ -10,7 +10,7 @@ import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
 import { InvoiceStatus, Prisma, UserRole, type Passenger } from '@prisma/client';
 import { buildStayNightDates, OrderService, type OrderRequester } from './orders.service.js';
-import { assertHotelPhysicalFit } from '../hotel-control/hotel-control.service.js';
+import { assertHotelPhysicalFitWithinTx } from '../hotel-control/hotel-control.service.js';
 import {
   batchCreateOrdersBodySchema,
   batchSettlementLockBodySchema,
@@ -937,37 +937,51 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   );
 
   // ── 一键打包护照图片 zip ──
-  // GET /orders/:id/passport-photos.zip
-  app.get('/:id/passport-photos.zip', { preHandler: [app.authenticate] }, async (req, reply) => {
-    const { id } = req.params as { id: string };
-    const requester = await buildRequester(req.user.sub, req.user.role);
-    const order = await service.getOrder(id, requester);
-    const passengers = await prisma.passenger.findMany({ where: { orderId: id } });
-    // 空订单（无出行人）→ 友好 400，避免下载到只有空表的 zip
-    if (passengers.length === 0) {
-      return reply
-        .status(400)
-        .send({ error: '该订单暂无出行人信息，无法生成出行人资料表' });
-    }
-    const zipBuf = await buildPassportPhotoZip({ orderNumber: order.orderNumber, passengers });
+  // GET /orders/:id/passport-photos.zip — ADMIN/STAFF only
+  // 这个包的正身就是**护照原图**（passport-zip.ts 逐乘客写入 fetchPhoto(p.passportPhotoUrl)），
+  // 与上面勾选批量导出的 /visa-passports.zip 同一性质 → 同一道角色闸：签证岗/操作岗内部资料，
+  // 代理与客户一律不放行（代理拿到全套护照原图 = 客资无门槛外流）。
+  app.get(
+    '/:id/passport-photos.zip',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    async (req, reply) => {
+      const { id } = req.params as { id: string };
+      const requester = await buildRequester(req.user.sub, req.user.role);
+      const order = await service.getOrder(id, requester);
+      // 出行人一律取 getOrder 已按角色脱敏的 order.passengers —— 绝不另起 prisma.passenger.findMany
+      // 裸查（与 pnr-export 同一纪律）。裸查会绕开 orderSerializeRoleCtx 的
+      // includePassportPhotos = (ADMIN || STAFF) 口径：上面那道角色闸哪天被放宽，裸查会立刻
+      // 把护照大图塞进 zip 交给代理/客户。闸 + 数据源双保险，两处都不给绕。
+      const passengers = order.passengers as unknown as Passenger[];
+      // 空订单（无出行人）→ 友好 400，避免下载到只有空表的 zip
+      if (passengers.length === 0) {
+        return reply
+          .status(400)
+          .send({ error: '该订单暂无出行人信息，无法生成出行人资料表' });
+      }
+      const zipBuf = await buildPassportPhotoZip({ orderNumber: order.orderNumber, passengers });
 
-    void writeAudit({
-      actor: actorFromRequest(req),
-      action: 'DOWNLOAD_PASSPORTS',
-      targetType: 'ORDER',
-      targetId: id,
-      targetLabel: order.orderNumber,
-      after: { passengerCount: passengers.length, photoCount: passengers.filter((p) => p.passportPhotoUrl).length },
-    });
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'DOWNLOAD_PASSPORTS',
+        targetType: 'ORDER',
+        targetId: id,
+        targetLabel: order.orderNumber,
+        after: {
+          passengerCount: passengers.length,
+          photoCount: passengers.filter((p) => p.passportPhotoUrl).length,
+        },
+      });
 
-    reply
-      .header('Content-Type', 'application/zip')
-      .header(
-        'Content-Disposition',
-        `attachment; filename="${encodeURIComponent(passportZipFilename(order.orderNumber))}"`,
-      )
-      .send(zipBuf);
-  });
+      reply
+        .header('Content-Type', 'application/zip')
+        .header(
+          'Content-Disposition',
+          `attachment; filename="${encodeURIComponent(passportZipFilename(order.orderNumber))}"`,
+        )
+        .send(zipBuf);
+    },
+  );
 
   // ── 认领订单（防漏单）──
   // POST /orders/:id/claim — ADMIN/STAFF 点"接单"
@@ -1080,46 +1094,9 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     });
     if (!before) return reply.status(404).send({ error: '订单不存在' });
 
-    // ── 物理房间口径前瞻闸（口径同下单闸 / 销控板看板）────────────────────────
-    // 分房表一旦落库，销控板就按「有乘客的房间盒子数」直计本单物理间数（assignedPhysicalRooms）——
-    // 也就是说分房本身会改变物理占房。多开一个房间盒子 = 多占一间，必须过闸。
-    // 逐酒店判定：本单在该酒店的所有行取住宿区间并集（对齐 expandAssignedPhysicalByDate 的订单级去重）。
-    // allowNonWorsening：存量单可能在切闸前就已物理超卖，房控重排分房去补救时不该被自己造成的
-    // 存量超卖挡住 —— 只拦「改完比改前更差」的操作。
+    // 本次分房的物理间数 = 有乘客的房间盒子数。真正的房量判定在下方写 roomAssignment 的
+    // 那个事务里做（带包房周期行锁），见那里的注释。
     const assignedRooms = body.roomGroups.filter((g) => g.passengerIds.length > 0).length;
-    if (assignedRooms > 0) {
-      const hotelItems = await prisma.orderItem.findMany({
-        where: { orderId: id, hotelRoomTypeId: { not: null } },
-        select: {
-          hotelCheckIn: true,
-          hotelCheckOut: true,
-          hotelRoomType: { select: { hotelId: true } },
-        },
-      });
-      const nightsByHotel = new Map<string, Set<string>>();
-      for (const it of hotelItems) {
-        const hotelId = it.hotelRoomType?.hotelId;
-        if (!hotelId || !it.hotelCheckIn || !it.hotelCheckOut) continue;
-        const nights = nightsByHotel.get(hotelId) ?? new Set<string>();
-        if (!nightsByHotel.has(hotelId)) nightsByHotel.set(hotelId, nights);
-        for (const d of buildStayNightDates(it.hotelCheckIn, it.hotelCheckOut)) nights.add(d);
-      }
-      for (const [hotelId, nights] of nightsByHotel) {
-        await assertHotelPhysicalFit(
-          hotelId,
-          [...nights].sort(),
-          { wholeRooms: assignedRooms, solos: [] },
-          {
-            excludeOrderId: id,
-            allowNonWorsening: true,
-            buildMessage: (violations) =>
-              `分房间数超出该酒店包房量：${violations
-                .map((v) => `${v.date}（包房 ${v.block} 间，分完后需 ${v.physicalUsed} 间）`)
-                .join('；')}。请减少房间数，或联系房控加房 / 换酒店。`,
-          },
-        );
-      }
-    }
 
     // ── B10 提示收集（不阻断，回给前端弹给运营看）───────────────────────────
     const warnings: string[] = [];
@@ -1155,6 +1132,50 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       where: { orderId: id, hotelRoomTypeId: { not: null } },
     });
     await prisma.$transaction(async (tx) => {
+      // ── 物理房间口径前瞻闸（口径同下单闸 / 销控板看板）────────────────────────
+      // 分房表一旦落库，销控板就按「有乘客的房间盒子数」直计本单物理间数（assignedPhysicalRooms）——
+      // 也就是说分房本身会改变物理占房。多开一个房间盒子 = 多占一间，必须过闸。
+      // 逐酒店判定：本单在该酒店的所有行取住宿区间并集（对齐 expandAssignedPhysicalByDate 的订单级去重）。
+      // allowNonWorsening：存量单可能在切闸前就已物理超卖，房控重排分房去补救时不该被自己造成的
+      // 存量超卖挡住 —— 只拦「改完比改前更差」的操作。
+      // **事务内互斥版**：判定与落库同一事务、先锁包房周期行，中间没有窗口 ——
+      // 只读判定 + 事务外执行 = 两个并发分房各自读到旧快照双双通过，闸再准也拦不住。
+      if (assignedRooms > 0) {
+        const hotelItems = await tx.orderItem.findMany({
+          where: { orderId: id, hotelRoomTypeId: { not: null } },
+          select: {
+            hotelCheckIn: true,
+            hotelCheckOut: true,
+            hotelRoomType: { select: { hotelId: true } },
+          },
+        });
+        const nightsByHotel = new Map<string, Set<string>>();
+        for (const it of hotelItems) {
+          const hotelId = it.hotelRoomType?.hotelId;
+          if (!hotelId || !it.hotelCheckIn || !it.hotelCheckOut) continue;
+          const nights = nightsByHotel.get(hotelId) ?? new Set<string>();
+          if (!nightsByHotel.has(hotelId)) nightsByHotel.set(hotelId, nights);
+          for (const d of buildStayNightDates(it.hotelCheckIn, it.hotelCheckOut)) nights.add(d);
+        }
+        // 按酒店 id 排序加锁，避免并发分房以不同顺序锁同一批酒店造成死锁。
+        for (const hotelId of [...nightsByHotel.keys()].sort()) {
+          await assertHotelPhysicalFitWithinTx(
+            tx,
+            hotelId,
+            [...nightsByHotel.get(hotelId)!].sort(),
+            { wholeRooms: assignedRooms, solos: [] },
+            {
+              excludeOrderId: id,
+              allowNonWorsening: true,
+              buildMessage: (violations) =>
+                `分房间数超出该酒店包房量：${violations
+                  .map((v) => `${v.date}（包房 ${v.block} 间，分完后需 ${v.physicalUsed} 间）`)
+                  .join('；')}。请减少房间数，或联系房控加房 / 换酒店。`,
+            },
+          );
+        }
+      }
+
       await tx.order.update({
         where: { id },
         data: { roomAssignment: body as unknown as object },

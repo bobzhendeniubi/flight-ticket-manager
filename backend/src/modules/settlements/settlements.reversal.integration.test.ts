@@ -100,6 +100,21 @@ async function createPaidPendingOrder(agentId: string, total = 1000) {
   });
 }
 
+/**
+ * 建一条全额退款申请（无 quoteSnapshot → 佣金按全额冲销）。
+ * 订单转 REFUNDED 要求必须存在对应 Refund 记录（账目完整性闸：没有退款凭据就落终态，
+ * 会造成实收挂在单上、佣金却已冲销的永久对不平），所以退款类用例都要先建这条。
+ */
+async function craftFullRefund(orderId: string, paidTotal: number) {
+  await prisma.refund.create({
+    data: {
+      orderId,
+      amount: new Prisma.Decimal(paidTotal),
+      status: 'REQUESTED',
+    },
+  });
+}
+
 // ══════════════════════════════════════════════════════════════════════════
 describe('结算佣金冲销 · 穿过 SETTLED 边界（跨期反冲）', () => {
   it('PAID→ACCRUED→结算(SETTLED)→REFUNDED ⇒ 新建负数补偿记录、原快照不动', async () => {
@@ -130,6 +145,7 @@ describe('结算佣金冲销 · 穿过 SETTLED 边界（跨期反冲）', () => 
     expect(settledRecord.settlementId).toBe(settlementId);
 
     // 3) 退款：PAID → REFUND_REQUESTED → REFUNDED（座位释放，触发冲销）
+    await craftFullRefund(order.id, 1000);
     await orderService.updateStatus(order.id, OrderStatus.REFUND_REQUESTED, ADMIN);
     await orderService.updateStatus(order.id, OrderStatus.REFUNDED, ADMIN);
 

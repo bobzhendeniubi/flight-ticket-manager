@@ -2,12 +2,13 @@
  * 营销中心 · 海报 —— ADMIN/STAFF only
  *
  * GET    /marketing/templates          可选版式
+ * GET    /marketing/usage              今日与本月 AI 海报用量（ADMIN/STAFF）
  * GET    /marketing/posters            海报列表（**不含图**，只返元信息）
  * GET    /marketing/posters/:id        海报详情（含图 + 渲染元信息 + 三条文案）
- * POST   /marketing/posters/flight-route  生成航线海报（同步，可能耗时 1-3 分钟）
+ * POST   /marketing/posters/flight-route  生成航线海报（2.0 同步；其它模型可能异步等待）
  * DELETE /marketing/posters/:id        删除
  *
- * ⚠️ 生成接口耗时长（最多 3 轮出图，每轮约 30-60s，极端情况数分钟）。
+ * ⚠️ 生成接口耗时长（每轮异步任务最长等待 5 分钟，失败时最多重试 3 轮）。
  * 当前预发布环境使用 Caddy，reverse_proxy 默认没有响应超时，可直接使用。
  * 若将来改用 nginx 或在前面加了其它网关，需要相应放宽读超时。
  *
@@ -24,7 +25,13 @@ import {
   listPostersQuerySchema,
 } from './marketing.schemas.js';
 import { MarketingInputError } from './marketing.facts.js';
-import { createFlightRoutePoster, MarketingConfigError } from './marketing.service.js';
+import {
+  createFlightRoutePoster,
+  getMarketingUsage,
+  MarketingConfigError,
+  MarketingQuotaError,
+  marketingQuotaErrorBody,
+} from './marketing.service.js';
 
 export const marketingRoutes: FastifyPluginAsync = async (app) => {
   const requireOps = {
@@ -32,6 +39,8 @@ export const marketingRoutes: FastifyPluginAsync = async (app) => {
   };
 
   app.get('/templates', requireOps, async () => ({ templates: POSTER_TEMPLATES }));
+
+  app.get('/usage', requireOps, async (req) => getMarketingUsage(req.user.sub));
 
   app.get('/posters', requireOps, async (req) => {
     const q = listPostersQuerySchema.parse(req.query);
@@ -105,6 +114,9 @@ export const marketingRoutes: FastifyPluginAsync = async (app) => {
           return reply.status(400).send({
             error: { code: 'INVALID_MARKETING_INPUT', message: err.message },
           });
+        }
+        if (err instanceof MarketingQuotaError) {
+          return reply.status(429).send(marketingQuotaErrorBody(err));
         }
         throw err;
       }

@@ -242,6 +242,55 @@ describe('createOrder · settlementTotalCny 权限与互斥（服务端按认证
   });
 });
 
+// flightSettlementPriceCny 会短路机票动态定价，与 settlementTotalCny 同属「改价字段」，
+// 必须走同一道身份闸——否则匿名游客可传 0 以零元买机票并真实扣座。
+describe('createOrder · flightSettlementPriceCny 权限（公开下单口不得绕过动态定价）', () => {
+  const bodyWithFlightPrice = {
+    ...(baseBody as unknown as Record<string, unknown>),
+    flightSettlementPriceCny: 0,
+  } as unknown as CreateOrderBody;
+  const service = new OrderService();
+
+  // 断言必须精确到文案：baseBody 的地面行对外角色本来就会因「无产品 id 不可客户端定价」被拒，
+  // 只断言 BadRequestError 会假绿（守卫删掉也照样通过）。锁死「无权调整订单价格」才真正测到这道闸。
+  it('游客携带 flightSettlementPriceCny=0 → 无权调整订单价格，且未触库（不建单、不扣座）', async () => {
+    await expect(
+      service.createOrder(bodyWithFlightPrice, { guest: { name: '游客', phone: '13800000000' } }),
+    ).rejects.toThrow('无权调整订单价格');
+    expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('CUSTOMER 携带 flightSettlementPriceCny → 无权调整订单价格', async () => {
+    await expect(
+      service.createOrder(bodyWithFlightPrice, { userId: 'u-cust', role: 'CUSTOMER' }),
+    ).rejects.toThrow('无权调整订单价格');
+    expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('AGENT 携带 flightSettlementPriceCny → 无权调整订单价格（代理也不能自定价）', async () => {
+    await expect(
+      service.createOrder(bodyWithFlightPrice, { userId: 'u-agent', role: 'AGENT', agentId: 'a1' }),
+    ).rejects.toThrow('无权调整订单价格');
+    expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('非零值同样拦（不是只挡 0，而是整个字段收口）', async () => {
+    const cheap = {
+      ...(baseBody as unknown as Record<string, unknown>),
+      flightSettlementPriceCny: 1,
+    } as unknown as CreateOrderBody;
+    await expect(
+      service.createOrder(cheap, { guest: { name: '游客', phone: '13800000000' } }),
+    ).rejects.toThrow('无权调整订单价格');
+  });
+
+  it('ADMIN 携带 flightSettlementPriceCny → 放行建单（不误伤后台团队议价录单）', async () => {
+    await expect(service.createOrder(bodyWithFlightPrice, ADMIN)).resolves.toMatchObject({
+      id: 'order-1',
+    });
+  });
+});
+
 describe('createOrder · settlementTotalCny 差额行生成（ADMIN，mock 全链路）', () => {
   it('结算价 < 系统价 → 生成 DISCOUNT 差额行，总额=结算价，审计 WARNING 落库', async () => {
     const service = makeService(7402);

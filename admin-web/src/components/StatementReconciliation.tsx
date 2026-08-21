@@ -123,8 +123,12 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
   const [exportTo, setExportTo] = useState('');
   const [exporting, setExporting] = useState(false);
 
+  // 加载守卫：这是资金操作面板，改筛选后**晚到的旧响应绝不能覆盖新结果**——
+  // 否则运营会把流水拖到一张已经被筛掉的候选单上认款，钱认错单。
+  // load 返回 cancel 函数，由调用方（防抖 effect 的 cleanup）在发起下一次加载前调用。
   const load = useCallback(() => {
-    if (!token) return;
+    if (!token) return () => {};
+    let cancelled = false;
     setLoading(true);
     setErr(null);
     const orderQ = orderQuery.trim();
@@ -144,17 +148,33 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
       }),
     ])
       .then(([r, c]) => {
+        if (cancelled) return;
         setReceipts(r.receipts);
         setCandidates(c.orders);
       })
-      .catch((e: unknown) => setErr(e instanceof ApiError ? e.message : '加载工作台数据失败'))
-      .finally(() => setLoading(false));
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        setErr(e instanceof ApiError ? e.message : '加载工作台数据失败');
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [token, poolQ, poolFrom, poolTo, orderQuery, orderFrom, orderTo]);
 
-  // 防抖：筛选输入停 300ms 再打后端，避免每敲一个字都发请求
+  // 防抖：筛选输入停 300ms 再打后端，避免每敲一个字都发请求。
+  // cleanup 里既清定时器、也作废已在飞的那次请求（筛选连续变化时前一次必被作废）。
   useEffect(() => {
-    const t = setTimeout(() => load(), 300);
-    return () => clearTimeout(t);
+    let cancelLoad: (() => void) | undefined;
+    const t = setTimeout(() => {
+      cancelLoad = load();
+    }, 300);
+    return () => {
+      clearTimeout(t);
+      cancelLoad?.();
+    };
   }, [load]);
 
   // 完整未认款池（服务端已按 OPEN/部分认款过滤）——自动配对唯一性必须基于它计算

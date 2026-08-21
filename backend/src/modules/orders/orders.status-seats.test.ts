@@ -29,7 +29,9 @@ const { mockPrisma, mockGetHotelNightlyRemaining } = vi.hoisted(() => ({
     hotelRoomType: { findMany: vi.fn() },
     flightSeatClass: { updateMany: vi.fn(), findFirst: vi.fn() },
     seatLock: { aggregate: vi.fn() },
-    refund: { aggregate: vi.fn(), findMany: vi.fn(), updateMany: vi.fn() },
+    // count：落 REFUNDED 前的账目完整性闸——必须先有 Refund（REQUESTED/COMPLETED），
+    // 否则实收会永久卡死在单上（三道资金闸对 REFUNDED 全是黑名单）。
+    refund: { aggregate: vi.fn(), count: vi.fn(), findMany: vi.fn(), updateMany: vi.fn() },
     // 转 PAID 时按 SUCCEEDED Payment 台账认实收（不再因转 PAID 这个动作本身凭空补满额）。
     // updateMany：R4 转 PAID 时作废其它 PENDING 兄弟 Payment（FAILED + supersededByPaid）。
     payment: { aggregate: vi.fn(), updateMany: vi.fn() },
@@ -408,6 +410,8 @@ describe('OrderService._updateStatusWithinTx · 退款申请即时释放与驳�
     const order = buildOrder({ status: OrderStatus.REFUND_REQUESTED });
     mockPrisma.order.findUnique.mockResolvedValueOnce(order);
     mockPrisma.$queryRaw.mockResolvedValueOnce([{ paidAmount: '1000' }]);
+    // 走 cancel 流程留下的退款申请：账目完整性闸放行（无此记录一律拒绝落 REFUNDED）
+    mockPrisma.refund.count.mockResolvedValueOnce(1);
     mockPrisma.order.updateMany.mockResolvedValueOnce({ count: 1 });
     mockPrisma.orderStatusEvent.create.mockResolvedValueOnce({});
     mockPrisma.refund.updateMany.mockResolvedValueOnce({ count: 1 });

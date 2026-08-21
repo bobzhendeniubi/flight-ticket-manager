@@ -1,9 +1,9 @@
 /**
  * 海报事实层 —— 决定「海报上哪些字必须是真的」。
  *
- * 这是整个营销中心的地基：生图模型只负责背景，航班号、起降时刻这类硬数据
- * 一律从库里取，快照成 PosterFact[] 存进 MarketingPoster.facts，再由服务端代码绘制。
- * strict 保留用于事实元数据的兼容性与前端展示；它不再触发图片回读或重试。
+ * 这是整个营销中心的地基：航班号、日期、起降时刻这类硬数据一律从库里取，
+ * 快照成 PosterFact[] 存进 MarketingPoster.facts，供提示词和详情页人工核对。
+ * strict 保留用于事实元数据的兼容性与前端展示；它不触发图片回读或重试。
  */
 import { prisma } from '../../db/prisma.js';
 
@@ -21,11 +21,11 @@ export interface PosterFact {
   key: string;
   /** 给运营看的中文名，出现在海报数据来源里 */
   label: string;
-  /** 期望值：服务端叠字时使用的事实值 */
+  /** 期望值：提示词与详情页核对时使用的事实值 */
   value: string;
   /** 历史字段，保留用于兼容既有事实快照 */
   strict: boolean;
-  /** 同一航段的事实归入同一张服务端绘制的卡片；非航段事实归入全局区域。 */
+  /** 同一航段的事实归入同一张信息卡；非航段事实归入全局区域。 */
   group: PosterFactGroup;
 }
 
@@ -38,6 +38,8 @@ export interface LegSummary {
   /** 当地时间 HH:mm */
   departTime: string;
   arriveTime: string;
+  /** 去程/回程出发地当地日期，如「8月21日」；历史测试摘要可不提供。 */
+  departureDate?: string;
 }
 
 /** 航线海报的人类可读摘要，用于拼 prompt 和列表展示。 */
@@ -83,6 +85,17 @@ function formatLocalTime(at: Date, timeZone: string): string {
   }).format(at);
 }
 
+function formatLocalDate(at: Date, timeZone: string): string {
+  const parts = new Intl.DateTimeFormat('zh-CN', {
+    month: 'numeric',
+    day: 'numeric',
+    timeZone,
+  }).formatToParts(at);
+  const month = parts.find((part) => part.type === 'month')?.value;
+  const day = parts.find((part) => part.type === 'day')?.value;
+  return month && day ? `${month}月${day}日` : '';
+}
+
 interface LoadedLeg extends LegSummary {
   departureAt: Date;
   arrivalAt: Date;
@@ -103,6 +116,7 @@ async function loadLegWithInstants(scheduleId: string): Promise<LoadedLeg> {
     destinationName: airportName(s.flight.destinationCode),
     departTime: formatLocalTime(s.departureTime, s.departureTz),
     arriveTime: formatLocalTime(s.arrivalTime, s.arrivalTz),
+    departureDate: formatLocalDate(s.departureTime, s.departureTz),
     departureAt: s.departureTime,
     arrivalAt: s.arrivalTime,
   };
@@ -125,9 +139,9 @@ export interface FlightRouteFactsResult {
   flightId: string;
 }
 
-/** 把一个航段展开成 3 条海报事实（航班号 / 时刻 / 航线）。 */
+/** 把一个航段展开成 4 条海报事实（航班号 / 日期 / 时刻 / 航线）。 */
 function legFacts(leg: LegSummary, prefix: 'outbound' | 'inbound', cn: string): PosterFact[] {
-  return [
+  const facts: PosterFact[] = [
     {
       key: `${prefix}.flightNumber`,
       label: `${cn}航班号`,
@@ -135,6 +149,15 @@ function legFacts(leg: LegSummary, prefix: 'outbound' | 'inbound', cn: string): 
       strict: true,
       group: prefix,
     },
+    ...(leg.departureDate
+      ? [{
+          key: `${prefix}.date`,
+          label: `${cn}日期`,
+          value: leg.departureDate,
+          strict: true,
+          group: prefix,
+        } satisfies PosterFact]
+      : []),
     {
       // 时刻写成「15:45-16:30」连写形式，与海报模板排版一致。
       key: `${prefix}.time`,
@@ -151,6 +174,7 @@ function legFacts(leg: LegSummary, prefix: 'outbound' | 'inbound', cn: string): 
       group: prefix,
     },
   ];
+  return facts;
 }
 
 /** 构造航线海报的事实快照。 */

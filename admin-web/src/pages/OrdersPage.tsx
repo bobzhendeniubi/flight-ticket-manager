@@ -6,13 +6,15 @@ import { useFlightSeats } from '../stores/flightSeats';
 import {
   type FulfillmentStatus,
 } from '../lib/mockData';
-import { exportToCSV } from '../lib/csvExport';
+import { csvNumber, exportToCSV, localDateStamp } from '../lib/csvExport';
 import { AIRPORTS, localYmd } from '../lib/airports';
 import { NumberInput } from '../components/NumberInput';
 import { parseOtaRoster } from '../lib/parseOtaRoster';
 import { computePerPaxSettlement } from '../lib/perPaxSettlement';
 import type { AgentListItem, OrderImportParseResult } from '../lib/api';
 import { OrderFinanceSection } from '../components/OrderFinanceSection';
+import { RefundSplitCard } from '../components/RefundSplitCard';
+import { readRefundSplit, refundApprovalUnknownWarning, refundApprovalWarning } from '../lib/refundSplit';
 import { OrderAuditTrail } from '../components/OrderAuditTrail';
 import { SingleOrderModal } from '../components/SingleOrderModal';
 import { RoomingEditor, type RoomingPassenger } from '../components/RoomingEditor';
@@ -135,14 +137,20 @@ const KIND_LABEL: Record<OrderItemKindLabel, string> = {
   OVERSALE: '超售',
 };
 
-// 佣金率（按产品类型，简化版 — 真实佣金由 CommissionRecord 表算）
-const COMMISSION_RATE: Partial<Record<OrderItemKindLabel, number>> = {
-  FLIGHT: 0.10, HOTEL: 0.08, TRANSFER: 0.15, VISA: 0.12,
-};
+// 本卡片**不展示佣金**：真实佣金由后端 CommissionRecord 逐笔计提（含 rate / 层级 / 上下级净费率），
+// 前端按产品类型拍一个固定费率算出来的数与结算完全无关，运营照着它跟代理对账必然对不上。
+// 需要佣金口径请到结算/报表页看后端算好的数。
 
 // 客户端分页每页条数（票务反馈）：默认 50 —— 开票一次最多 50 张的口径，一页正好一批。
 const PAGE_SIZE_OPTIONS = [20, 30, 40, 50] as const;
 const DEFAULT_PAGE_SIZE = 50;
+
+// 主列表单次拉取上限 —— 后端 listOrdersQuerySchema.pageSize 的硬上限就是 200，本页不翻页。
+// 命中数超过它时列表只是「前 200 条」的窗口，界面必须把这件事说出来（见 ordersTotal）。
+const ORDERS_FETCH_LIMIT = 200;
+// 批量端点单次条数上限 —— 对齐后端 batchUpdateStatusBodySchema / batchSetInvoiceFlagsBodySchema
+// 的 .max(100)。超限时 Zod 整体校验失败返回 400，150 单一条都不会被处理；前置拦下并提示分批。
+const BULK_ORDER_LIMIT = 100;
 
 // 列表「签证」列主显（签证岗反馈）：录单时的签证要求 order.visaStatus，而非履约任务进度。
 // NOT_NEEDED → 空白（不需要签证的单不占视觉）；其余映射为短徽标。履约进度改为次要小字附注。
@@ -258,14 +266,36 @@ function deriveView(o: OrderSummary) {
   return { itemKind, itemSummary, customerName, agentName, totalNum };
 }
 
-// 尾款 = 应收(total + 售后费用 adjustmentCny) − 已到账(paidAmount)。
+// 尾款口径 —— **一律以后端 balanceDue 为准**（serializeOrder 的权威值）：
+//   balanceDue = (total + adjustmentCny) − paidAmount − prepaymentOffset
+// prepaymentOffset（代理预存抵扣）视同已付；前端自己用「total − paidAmount」算会把它漏掉，
+// 于是同一张单在订单列表显示「欠 ¥X」、在收款对账台显示「已结清」，还会把已结清的单
+// 勾进批量到账并把幻影欠款预填成到账金额 → 录成多付。
+// 本地公式只作为老后端（未下发 balanceDue）的兜底。
 // 正=欠款(少付)、0=已结清、负=多付。用 2 位小数四舍五入避免浮点毛刺。
-function deriveBalance(o: OrderSummary): { total: number; adjustment: number; paid: number; balance: number } {
+function deriveBalance(o: OrderSummary): {
+  total: number;
+  adjustment: number;
+  paid: number;
+  /** 代理预存抵扣（视同已付） */
+  prepaid: number;
+  /** 客户应付 = total + adjustment（后端 effectivePayable 优先） */
+  payable: number;
+  balance: number;
+} {
   const total = Number(o.total) || 0;
   const adjustment = Number(o.adjustmentCny) || 0;
   const paid = Number(o.paidAmount) || 0;
-  const balance = Math.round((total + adjustment - paid) * 100) / 100;
-  return { total, adjustment, paid, balance };
+  const prepaid = Number(o.prepaymentOffset) || 0;
+  const backendPayable = Number(o.effectivePayable);
+  const payable = Number.isFinite(backendPayable)
+    ? Math.round(backendPayable * 100) / 100
+    : Math.round((total + adjustment) * 100) / 100;
+  const backendBalance = Number(o.balanceDue);
+  const balance = Number.isFinite(backendBalance)
+    ? Math.round(backendBalance * 100) / 100
+    : Math.round((payable - paid - prepaid) * 100) / 100;
+  return { total, adjustment, paid, prepaid, payable, balance };
 }
 
 // 尾款徽标：少付=琥珀(欠款)、结清=绿、多付=蓝(highlight)。
@@ -375,11 +405,16 @@ export function OrdersPage() {
   // 深链承接：从签证台等页面带 ?q=订单号 跳入时用于填充搜索框并自动开详情抽屉
   const [searchParams] = useSearchParams();
   const [orders, setOrders] = useState<OrderSummary[]>([]);
+  // 后端命中总数（res.pagination.total）。列表一次只拉 ORDERS_FETCH_LIMIT 条且不翻页，
+  // 命中数超过窗口时必须显式告知——否则「共 N 条 / 命中 N 单」是谎报，而且状态/类型/渠道/
+  // 代理/搜索这些客户端二次筛选只在窗口内跑，运营据此报人数会出错。
+  const [ordersTotal, setOrdersTotal] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   // 回收站（仅 ADMIN）：已软删订单弹窗 + 恢复
   const [showRecycleBin, setShowRecycleBin] = useState(false);
   const [deletedOrders, setDeletedOrders] = useState<DeletedOrderSummary[]>([]);
+  const [deletedTotal, setDeletedTotal] = useState<number | null>(null);
   const [recycleLoading, setRecycleLoading] = useState(false);
   const [recycleError, setRecycleError] = useState<string | null>(null);
   const [restoringId, setRestoringId] = useState<string | null>(null);
@@ -550,10 +585,11 @@ export function OrdersPage() {
     let cancelled = false;
     setLoading(true);
     setError(null);
-    api.listOrders(tokens.accessToken, { ...filterQuery, pageSize: 200 })
+    api.listOrders(tokens.accessToken, { ...filterQuery, pageSize: ORDERS_FETCH_LIMIT })
       .then((res) => {
         if (cancelled) return;
         setOrders(res.orders);
+        setOrdersTotal(res.pagination.total);
       })
       .catch((err: unknown) => {
         if (cancelled) return;
@@ -693,6 +729,10 @@ export function OrdersPage() {
   }, [statusFilter, kindFilter, channelFilter, agentFilter, search, filterQuery, pageSize]);
 
   // 客户端分页切片：page 越界时（筛选后条数变少）钳到最后一页，保证永远有内容可看。
+  // 列表被截断（后端命中数 > 本次拉回的条数）——此时页面上的一切计数都只是「窗口内」的数：
+  // filtered.length 不是全量命中数，状态/类型/渠道/代理/搜索这些客户端二次筛选也只在窗口内跑。
+  // 界面必须把这句话说出来，运营才知道要用上方筛选缩小范围，而不是照着数字报人数/订位。
+  const ordersTruncated = ordersTotal !== null && ordersTotal > orders.length;
   const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
   const currentPage = Math.min(page, totalPages);
   const pageStart = (currentPage - 1) * pageSize;
@@ -746,29 +786,51 @@ export function OrdersPage() {
 
   // 代理维度统计
   const agentStats = useMemo(() => {
-    const map = new Map<string, { orders: number; revenue: number; commission: number }>();
-    const directStats = { orders: 0, revenue: 0, commission: 0 };
+    const map = new Map<string, { orders: number; revenue: number }>();
+    const directStats = { orders: 0, revenue: 0 };
     filtered.forEach(({ order, view }) => {
       const paid = order.status === 'PAID' || order.status === 'TICKETED' || order.status === 'COMPLETED';
       if (!paid) return;
-      const rate = COMMISSION_RATE[view.itemKind] ?? 0;
-      const commission = view.totalNum * rate;
       if (view.agentName) {
-        const cur = map.get(view.agentName) ?? { orders: 0, revenue: 0, commission: 0 };
+        const cur = map.get(view.agentName) ?? { orders: 0, revenue: 0 };
         cur.orders++;
         cur.revenue += view.totalNum;
-        cur.commission += commission;
         map.set(view.agentName, cur);
       } else {
         directStats.orders++;
         directStats.revenue += view.totalNum;
       }
     });
-    return { byAgent: map, direct: directStats };
+    // 卡片位只有 2 个 → 按成交额从高到低取前两家。按 Map 插入序取「前两个」拿到的是
+    // 「列表里最先出现的两家」，不是最大的两家，看着像排行榜其实不是。
+    const ranked = Array.from(map.entries()).sort((a, b) => b[1].revenue - a[1].revenue);
+    return { byAgent: map, ranked, direct: directStats };
   }, [filtered]);
+
+  /**
+   * 批准退款前的防重复打款闸（不可逆操作的最后一道防线）。
+   *
+   * 退款金额里可能有一部分是「自动退回代理预存余额」的——批准时后端自己回补，无需人工打款。
+   * 财务照着应退合计打现金 = 重复退钱。所以这里在落 REFUNDED 之前把拆分摊开再确认一次。
+   * 余额部分为 0（散客单，绝大多数）→ 不弹这个框，日常操作零噪音。
+   * 读不到拆分也不静默放行：如实说明风险后让人自己决定。
+   */
+  const confirmRefundApproval = async (order: OrderSummary): Promise<boolean> => {
+    if (!tokens?.accessToken) return false;
+    try {
+      const { quote } = await api.refundQuote(tokens.accessToken, order.id);
+      const warning = refundApprovalWarning(order.orderNumber, readRefundSplit(quote));
+      return warning === null ? true : window.confirm(warning);
+    } catch (err) {
+      const text = err instanceof ApiError ? err.message : '读取失败';
+      return window.confirm(refundApprovalUnknownWarning(order.orderNumber, text));
+    }
+  };
 
   const advance = async (order: OrderSummary, next: OrderStatus, reason?: string, force?: boolean) => {
     if (!tokens?.accessToken) return;
+    // 落「已退款」是不可逆的，且会触发余额自动回补 → 先摊开拆分再确认（含 force 通道）。
+    if (next === 'REFUNDED' && !(await confirmRefundApproval(order))) return;
     try {
       const res = await api.updateOrderStatus(tokens.accessToken, order.id, next, reason, force);
       setOrders((prev) => prev.map((o) => (o.id === order.id ? res.order : o)));
@@ -808,21 +870,28 @@ export function OrdersPage() {
     }
   };
 
+  // 回收站请求序号：防抖重查时晚到的旧响应不能覆盖新搜索结果（否则运营会对着上一次
+  // 搜索的列表点「恢复」）。每次发起 +1，回来时序号对不上就整个丢弃。
+  const recycleReqRef = useRef(0);
   // 拉已软删订单列表；search 非空时走后端模糊匹配（订单号/联系人名/乘客姓名含中文名）。
   const fetchDeletedOrders = async (search: string) => {
     if (!tokens?.accessToken) return;
+    const reqId = ++recycleReqRef.current;
     setRecycleLoading(true);
     setRecycleError(null);
     try {
       const res = await api.listDeletedOrders(tokens.accessToken, {
-        pageSize: 200,
+        pageSize: ORDERS_FETCH_LIMIT,
         search: search.trim() || undefined,
       });
+      if (reqId !== recycleReqRef.current) return;
       setDeletedOrders(res.orders);
+      setDeletedTotal(res.pagination.total);
     } catch (err) {
+      if (reqId !== recycleReqRef.current) return;
       setRecycleError(err instanceof ApiError ? err.message : '加载回收站失败');
     } finally {
-      setRecycleLoading(false);
+      if (reqId === recycleReqRef.current) setRecycleLoading(false);
     }
   };
 
@@ -966,10 +1035,25 @@ export function OrdersPage() {
 
   const applyBulkStatus = async () => {
     if (!tokens?.accessToken || !bulkStatus || selectedIds.size === 0) return;
+    // 后端批量端点单次上限 100（Zod 整体校验，超限则 400、一条都不处理）→ 前置拦下并说清怎么办。
+    if (selectedIds.size > BULK_ORDER_LIMIT) {
+      window.alert(
+        `单次最多批量处理 ${BULK_ORDER_LIMIT} 条订单，请分批操作（当前已选 ${selectedIds.size} 条）。\n\n` +
+          `提示：取消部分勾选后先处理一批，再勾选剩下的。`,
+      );
+      return;
+    }
     const confirmMsg = forceMode
       ? `强制将 ${selectedIds.size} 条订单改为「${STATUS_LABEL[bulkStatus as OrderStatus]}」？此操作绕过状态机校验。\n\n强制把已取消/超时的订单拉回持有状态会重新占座（余位不足会被拒绝，订单状态不变）；此前版本存在不占座的漏洞，请确认余位充足后再操作。`
       : `按标准流转将 ${selectedIds.size} 条订单改为「${STATUS_LABEL[bulkStatus as OrderStatus]}」？不在允许路径的订单会失败。`;
-    if (!window.confirm(confirmMsg)) return;
+    // 批量批准退款不逐单查报价（最多 100 单），但必须把「余额部分自动回补」这件事说清楚：
+    // 照应退合计全额打现金 = 和系统自动回补重复退钱。要看拆分请逐单进详情。
+    const refundNotice =
+      bulkStatus === 'REFUNDED'
+        ? `\n\n⚠️ 批量批准退款：其中若有用代理预存余额抵扣过的订单，余额部分会自动退回代理账户、无需人工打款。\n` +
+          `请勿按退款金额全额打现金——打款金额请逐单在订单详情的「退款拆分」里核对。`
+        : '';
+    if (!window.confirm(confirmMsg + refundNotice)) return;
     setBulkSubmitting(true);
     setBulkResult(null);
     try {
@@ -981,8 +1065,11 @@ export function OrdersPage() {
         undefined,
         forceMode,
       );
-      const updated = await api.listOrders(tokens.accessToken, { pageSize: 200 });
+      // 刷新必须带上当前后端筛选条件——不带的话列表会被换成「全库最新 200 单」，
+      // 而筛选框还显示着条件、徽标还写「已筛选」，随后「导出 CSV」就按这份被污染的列表出。
+      const updated = await api.listOrders(tokens.accessToken, { ...filterQuery, pageSize: ORDERS_FETCH_LIMIT });
       setOrders(updated.orders);
+      setOrdersTotal(updated.pagination.total);
       setBulkResult({
         successCount: res.successCount,
         failureCount: res.failureCount,
@@ -1012,14 +1099,24 @@ export function OrdersPage() {
     if (!tokens?.accessToken || !bulkInvoiceFlag || selectedIds.size === 0) return;
     const opt = BULK_INVOICE_FLAG_OPTIONS.find((o) => o.value === bulkInvoiceFlag);
     if (!opt) return;
+    // 后端 batchSetInvoiceFlagsBodySchema.orderIds 上限 100，超限整批 400 失败。
+    if (selectedIds.size > BULK_ORDER_LIMIT) {
+      window.alert(
+        `单次最多批量开票 ${BULK_ORDER_LIMIT} 条订单，请分批操作（当前已选 ${selectedIds.size} 条）。`,
+      );
+      return;
+    }
     if (!window.confirm(`将 ${selectedIds.size} 条订单批量「${opt.label}」？`)) return;
     setBulkInvoiceSubmitting(true);
     setBulkInvoiceResult(null);
     try {
       const ids = Array.from(selectedIds);
       const res = await api.batchInvoiceFlags(tokens.accessToken, ids, opt.flags);
-      const updated = await api.listOrders(tokens.accessToken, { pageSize: 200 });
+      // 刷新必须带上当前后端筛选条件——不带的话列表会被换成「全库最新 200 单」，
+      // 而筛选框还显示着条件、徽标还写「已筛选」，随后「导出 CSV」就按这份被污染的列表出。
+      const updated = await api.listOrders(tokens.accessToken, { ...filterQuery, pageSize: ORDERS_FETCH_LIMIT });
       setOrders(updated.orders);
+      setOrdersTotal(updated.pagination.total);
       setBulkInvoiceResult({
         succeeded: res.succeeded,
         failed: res.failed,
@@ -1079,8 +1176,11 @@ export function OrdersPage() {
           failures.push({ id, error: e instanceof ApiError ? e.message : '改签证状态失败' });
         }
       }
-      const updated = await api.listOrders(tokens.accessToken, { pageSize: 200 });
+      // 刷新必须带上当前后端筛选条件——不带的话列表会被换成「全库最新 200 单」，
+      // 而筛选框还显示着条件、徽标还写「已筛选」，随后「导出 CSV」就按这份被污染的列表出。
+      const updated = await api.listOrders(tokens.accessToken, { ...filterQuery, pageSize: ORDERS_FETCH_LIMIT });
       setOrders(updated.orders);
+      setOrdersTotal(updated.pagination.total);
       setBulkVisaResult({ succeeded, failed: failures.length, failures });
       if (failures.length === 0) {
         setSelectedIds(new Set());
@@ -1157,8 +1257,11 @@ export function OrdersPage() {
           failures.push({ id: orderId, error: e instanceof ApiError ? e.message : '换酒店失败' });
         }
       }
-      const updated = await api.listOrders(tokens.accessToken, { pageSize: 200 });
+      // 刷新必须带上当前后端筛选条件——不带的话列表会被换成「全库最新 200 单」，
+      // 而筛选框还显示着条件、徽标还写「已筛选」，随后「导出 CSV」就按这份被污染的列表出。
+      const updated = await api.listOrders(tokens.accessToken, { ...filterQuery, pageSize: ORDERS_FETCH_LIMIT });
       setOrders(updated.orders);
+      setOrdersTotal(updated.pagination.total);
       setBulkHotelResult({ succeeded, failed: failures.length, skipped, failures });
       if (failures.length === 0) {
         setBulkHotelRoomTypeId('');
@@ -1209,7 +1312,7 @@ export function OrdersPage() {
       const templateExportDateLabel =
         exportTemplate === 'ticketing' && resolvedTravel.travelFrom
           ? resolvedTravel.travelFrom
-          : new Date().toISOString().slice(0, 10);
+          : localDateStamp();
       a.download = `订单导出-${TEMPLATE_LABEL[exportTemplate]}-${templateExportDateLabel}.xlsx`;
       document.body.appendChild(a);
       a.click();
@@ -1248,7 +1351,7 @@ export function OrdersPage() {
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `订单导出-${TEMPLATE_LABEL.ticketing}-${tkDate || new Date().toISOString().slice(0, 10)}.xlsx`;
+      a.download = `订单导出-${TEMPLATE_LABEL.ticketing}-${tkDate || localDateStamp()}.xlsx`;
       document.body.appendChild(a);
       a.click();
       a.remove();
@@ -1343,13 +1446,24 @@ export function OrdersPage() {
             const hasFrontendFilter = filtered.length !== orders.length;
             const isFiltered = hasBackendFilter || hasFrontendFilter;
             return (
-              <span className={isFiltered ? 'badge-info' : 'badge-neutral'}>
-                {loading
-                  ? '加载中…'
-                  : isFiltered
-                    ? `已筛选 · ${filtered.length} 条`
-                    : `共 ${orders.length} 条`}
-              </span>
+              <>
+                <span className={isFiltered ? 'badge-info' : 'badge-neutral'}>
+                  {loading
+                    ? '加载中…'
+                    : isFiltered
+                      ? `已筛选 · ${filtered.length} 条`
+                      : `共 ${ordersTotal ?? orders.length} 条`}
+                </span>
+                {/* 截断提示：命中数超出单次拉取窗口时，上面的条数只是窗口内的数，必须说清楚。 */}
+                {!loading && ordersTruncated && (
+                  <span
+                    className="badge-warning"
+                    title={`后端命中 ${ordersTotal} 条，本页单次只加载前 ${orders.length} 条；状态/类型/渠道/代理/关键词筛选只在这 ${orders.length} 条内生效。请用上方「出行日期 / 下单时间 / 航班号 / 乘客姓名」等后端筛选缩小范围后再统计或导出。`}
+                  >
+                    仅显示前 {orders.length} 条 / 共 {ordersTotal} 条，请用筛选缩小范围
+                  </span>
+                )}
+              </>
             );
           })()}
           <button
@@ -1380,7 +1494,10 @@ export function OrdersPage() {
                   itemKind: KIND_LABEL[view.itemKind],
                   itemSummary: view.itemSummary,
                   passengerCount: order.passengers.length,
-                  total: view.totalNum,
+                  // 与抽屉「应收」同口径：含售后费（改期费/换人费），不是裸 total。
+                  payable: deriveBalance(order).payable,
+                  paid: deriveBalance(order).paid,
+                  balance: deriveBalance(order).balance,
                   status: STATUS_LABEL[order.status],
                   createdAt: new Date(order.createdAt).toLocaleString('zh-CN'),
                 })),
@@ -1392,7 +1509,10 @@ export function OrdersPage() {
                   { key: 'itemKind', label: '产品类型' },
                   { key: 'itemSummary', label: '订单内容' },
                   { key: 'passengerCount', label: '人数' },
-                  { key: 'total', label: '金额', format: (v) => `¥${Number(v).toLocaleString()}` },
+                  // 金额列输出**裸数字**（不加 ¥、不加千分位）：`¥1,234` 在 Excel 里是文本，无法求和。
+                  { key: 'payable', label: '应收(元)', format: csvNumber },
+                  { key: 'paid', label: '已付(元)', format: csvNumber },
+                  { key: 'balance', label: '尾款(元)', format: csvNumber },
                   { key: 'status', label: '状态' },
                   { key: 'createdAt', label: '下单时间' },
                 ],
@@ -1631,7 +1751,11 @@ export function OrdersPage() {
       <section className="card">
         <div className="flex items-center justify-between mb-3">
           <h2 className="text-sm font-semibold text-ink">代理分销统计（仅含已付款订单）</h2>
-          <span className="text-xs text-ink-muted">点击代理名称可过滤订单</span>
+          <span className="text-xs text-ink-muted">
+            点击代理名称可过滤订单
+            {agentStats.ranked.length > 2 && `　·　共 ${agentStats.ranked.length} 家代理，此处仅显示成交额前 2 家`}
+            {ordersTruncated && '　·　仅统计已加载的订单，非全量'}
+          </span>
         </div>
         <div className="grid gap-2 md:grid-cols-3">
           <button
@@ -1643,9 +1767,9 @@ export function OrdersPage() {
               <span className="text-xs text-ink-muted">{agentStats.direct.orders} 单</span>
             </div>
             <div className="nums mt-1 text-lg font-semibold text-ink">¥{agentStats.direct.revenue.toLocaleString()}</div>
-            <div className="text-xs text-ink-muted">无佣金</div>
+            <div className="text-xs text-ink-muted">直客成交额</div>
           </button>
-          {Array.from(agentStats.byAgent.entries()).slice(0, 2).map(([name, s]) => (
+          {agentStats.ranked.slice(0, 2).map(([name, s]) => (
             <button
               key={name}
               className={`rounded-lg border p-3 text-left transition ${agentFilter === name ? 'border-brand bg-brand-50 ring-1 ring-brand/20' : 'border-slate-200 hover:border-slate-300 hover:bg-slate-50/60'}`}
@@ -1656,7 +1780,7 @@ export function OrdersPage() {
                 <span className="text-xs text-ink-muted">{s.orders} 单</span>
               </div>
               <div className="nums mt-1 text-lg font-semibold text-ink">¥{s.revenue.toLocaleString()}</div>
-              <div className="text-xs text-emerald-700">佣金 ¥{Math.round(s.commission).toLocaleString()}</div>
+              <div className="text-xs text-ink-muted">成交额（佣金以结算页为准）</div>
             </button>
           ))}
         </div>
@@ -1901,6 +2025,11 @@ export function OrdersPage() {
                 摊开写清楚，填了「从」却看到更晚的订单时一眼就知道为什么，不用猜。 */}
             <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
               <span>显示 {filtered.length} 条订单</span>
+              {ordersTruncated && (
+                <span className="rounded bg-amber-100 px-1.5 py-0.5 font-medium text-amber-700">
+                  ⚠ 后端命中 {ordersTotal} 条，只加载了前 {orders.length} 条；这里的条数不是全量，请缩小筛选范围
+                </span>
+              )}
               {(() => {
                 const travelEcho = describeDateRange(travelFrom, travelTo);
                 const createdEcho = describeDateRange(createdFrom, createdTo);
@@ -1908,7 +2037,8 @@ export function OrdersPage() {
                   <>
                     {travelEcho && (
                       <span className="rounded bg-brand-50 px-1.5 py-0.5 font-medium text-brand">
-                        出行日期：{travelEcho} · 命中 {filtered.length} 单
+                        出行日期：{travelEcho} · 命中 {filtered.length}
+                        {ordersTruncated ? '+' : ''} 单
                       </span>
                     )}
                     {createdEcho && (
@@ -2238,6 +2368,9 @@ export function OrdersPage() {
               {filtered.length === 0
                 ? '共 0 条'
                 : `第 ${pageStart + 1}-${Math.min(pageStart + pageSize, filtered.length)} 条 / 共 ${filtered.length} 条`}
+              {ordersTruncated && (
+                <span className="ml-1 text-amber-700">（已加载 {orders.length} / 命中 {ordersTotal}）</span>
+              )}
             </span>
             <button
               type="button"
@@ -2589,6 +2722,13 @@ export function OrdersPage() {
                   {recycleSearch ? '没有匹配的已删除订单' : '回收站为空'}
                 </p>
               ) : (
+                <>
+                {/* 回收站同样单次只拉 ORDERS_FETCH_LIMIT 条且不翻页——超出就明说，别让人以为这是全部。 */}
+                {deletedTotal !== null && deletedTotal > deletedOrders.length && (
+                  <p className="mb-2 rounded bg-amber-50 px-2 py-1 text-xs text-amber-700">
+                    共 {deletedTotal} 条已删除订单，仅显示前 {deletedOrders.length} 条，请用上方搜索缩小范围。
+                  </p>
+                )}
                 <table className="w-full text-sm">
                   <thead>
                     <tr className="border-b border-slate-200 text-left text-xs text-ink-muted">
@@ -2648,6 +2788,7 @@ export function OrdersPage() {
                     })}
                   </tbody>
                 </table>
+                </>
               )}
             </div>
           </div>
@@ -2951,12 +3092,19 @@ function OrderDrawer({
               <div className="text-xs font-semibold uppercase tracking-wide text-ink-muted">付款情况</div>
               <div className="mt-1.5 flex items-baseline gap-1 text-sm">
                 <span className="nums text-lg font-semibold text-emerald-700">¥{bal.paid.toLocaleString()}</span>
-                <span className="text-ink-muted"> / 应收 ¥{(bal.total + bal.adjustment).toLocaleString()}</span>
+                <span className="text-ink-muted"> / 应收 ¥{bal.payable.toLocaleString()}</span>
               </div>
               <div className="mt-1 flex flex-wrap items-center gap-1.5">
                 <BalanceBadge balance={bal.balance} settlementMode={o.agent?.settlementMode} />
                 {bal.adjustment !== 0 && (
                   <span className="rounded bg-amber-100 px-1.5 py-0.5 text-[11px] text-amber-700">含售后费 ¥{bal.adjustment.toLocaleString()}</span>
+                )}
+                {/* 预存抵扣视同已付：不并进上面的「已付」（那是真实到账），单独标出来，
+                    否则「已付 5000 / 应收 12300」配上「已结清」会看着自相矛盾。 */}
+                {bal.prepaid > 0 && (
+                  <span className="rounded bg-sky-100 px-1.5 py-0.5 text-[11px] text-sky-700">
+                    预存抵扣 ¥{bal.prepaid.toLocaleString()}（视同已付）
+                  </span>
                 )}
               </div>
               {o.notePayment && (
@@ -2970,11 +3118,16 @@ function OrderDrawer({
             <ConfirmPaymentSection
               key={o.id}
               orderId={o.id}
-              total={view.totalNum + (Number(o.adjustmentCny) || 0)}
-              paidAmount={Number(o.paidAmount)}
+              total={bal.payable}
+              paidAmount={bal.paid}
+              prepaymentOffset={bal.prepaid}
               agent={o.agent}
               onChanged={onChanged}
             />
+
+            {/* 退款拆分（退款申请中/已退款才出现）：把「要打的现金」和「自动回代理余额」分开摆，
+                防止财务照应退合计全额打款、与系统自动回补重复退钱。 */}
+            <RefundSplitCard order={o} />
           </section>
 
           {/* 财务/出纳：预期到账金额 + 订单杂项成本（仅 ADMIN/STAFF 可见，组件内做权限判断） */}
@@ -4049,11 +4202,18 @@ function FfCard({ icon, label, status, children }: { icon: string; label: string
 // 5/20 反馈新增组件
 // ═══════════════════════════════════════════════════════════════════════════
 
+// 「还剩几天」——两边必须同口径，否则差一天。
+// `@db.Date` 过 JSON 是 `2027-01-15T00:00:00.000Z`，`new Date()` 解析成 **UTC 午夜**；
+// 直接减 `new Date()`（本地当前时刻）在北京时 08:00 之后会被 Math.floor 截掉一天，
+// 护照有效期的 180/90 天告警阈值因此在边界日提前一天触发。
+// 解法：两边都归一到 **UTC 日 00:00**（目标日取字符串前 10 位，今天取本地年月日再当成 UTC 日）。
 function daysUntil(dateStr: string | null | undefined): number | null {
   if (!dateStr) return null;
-  const target = new Date(dateStr);
-  const today = new Date();
-  return Math.floor((target.getTime() - today.getTime()) / 86400_000);
+  const targetDay = Date.parse(`${dateStr.slice(0, 10)}T00:00:00Z`);
+  if (Number.isNaN(targetDay)) return null;
+  const now = new Date();
+  const todayDay = Date.UTC(now.getFullYear(), now.getMonth(), now.getDate());
+  return Math.round((targetDay - todayDay) / 86400_000);
 }
 
 // 本地日期 YYYY-MM-DD（用 getFullYear/getMonth/getDate，避免 toISOString 的 UTC 偏移）
@@ -7536,7 +7696,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
       const blob = await api.downloadRosterTemplate(token);
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
-      a.href = url; a.download = `名单模版-${new Date().toISOString().slice(0, 10)}.xlsx`;
+      a.href = url; a.download = `名单模版-${localDateStamp()}.xlsx`;
       document.body.appendChild(a); a.click(); a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
     } catch (e: unknown) {
@@ -8851,12 +9011,16 @@ function ConfirmPaymentSection({
   orderId,
   total,
   paidAmount,
+  prepaymentOffset,
   agent,
   onChanged,
 }: {
   orderId: string;
+  /** 客户应付（= effectivePayable，含售后费） */
   total: number;
   paidAmount: number;
+  /** 代理预存抵扣（视同已付；算尾款必须扣，否则与后端 balanceDue 对不上） */
+  prepaymentOffset: number;
   agent: OrderSummary['agent'];
   onChanged?: () => void;
 }) {
@@ -8864,6 +9028,8 @@ function ConfirmPaymentSection({
   const token = tokens?.accessToken ?? '';
   const [payments, setPayments] = useState<OrderPayment[]>([]);
   const [paid, setPaid] = useState(paidAmount);
+  // 预存抵扣本地副本（与 paid 同步随详情刷新更新）——尾款口径必须含它。
+  const [prepaid, setPrepaid] = useState(prepaymentOffset);
   // 代理预存余额本地副本（抵扣/存入后即时刷新展示，不必等父级 onChanged 重拉）。
   // 对外脱敏：后端对 AGENT/CUSTOMER 不下发 prepaymentBalance，Number(undefined)=NaN，故用 || 0 兜底避免 ¥NaN。
   const [agentBalance, setAgentBalance] = useState<number>(agent ? Number(agent.prepaymentBalance) || 0 : 0);
@@ -8883,8 +9049,10 @@ function ConfirmPaymentSection({
   // 纯信息化提示，不阻断锁定；接口无权限（非 ADMIN/STAFF）时静默留空。
   const [pendingReceipts, setPendingReceipts] = useState<Receipt[]>([]);
 
-  // 尾款 = 应收 − 已付。正=欠款(少付)、0=已结清、负=多付（不再 clamp，多付要看得见）。
-  const balance = Math.round((total - paid) * 100) / 100;
+  // 尾款 = 应收 − 已付 − 预存抵扣（与后端 serializeOrder.balanceDue 一字一致）。
+  // 漏掉 prepaymentOffset 会让本卡片显示「欠 ¥X」而收款对账台显示「已结清」。
+  // 正=欠款(少付)、0=已结清、负=多付（不再 clamp，多付要看得见）。
+  const balance = Math.round((total - paid - prepaid) * 100) / 100;
 
   const paymentRefreshRef = useRef({ requestId: 0, orderId });
   paymentRefreshRef.current.orderId = orderId;
@@ -8905,6 +9073,7 @@ function ConfirmPaymentSection({
     setPaymentsLocked(r.order.paymentsLocked ?? false);
     const p = Number(r.order.paidAmount);
     setPaid(p);
+    setPrepaid(Number(r.order.prepaymentOffset) || 0);
     const due = Math.round(Number(r.order.balanceDue) * 100) / 100;
     setAmount(due > 0 ? due : null);
     return true;
@@ -9038,17 +9207,29 @@ function ConfirmPaymentSection({
     }
     setErr(null);
     setSubmitting(true);
+    let reversed = false;
+    let reverseWarning: string | null = null;
     try {
+      // 撤销与「撤销后刷新」必须分开报错：撤销的后端事务此刻已提交、钱已经退回去了，
+      // 如果把刷新也放在同一个 try 里，刷新时的网络抖动会落进同一个 catch 显示「撤销收款失败」，
+      // 运营大概率会再撤一次（第二次被后端 CAS 拦下不会重复扣款，但信息完全误导）。
       const result = await api.reverseManualPayment(token, p.id, trimmedReason);
-      const refreshed = await refreshPaymentState();
-      if (!refreshed) return;
-      onChanged?.();
-      if (result.warning) window.alert(result.warning);
+      reversed = true;
+      reverseWarning = result.warning ?? null;
     } catch (e: unknown) {
       setErr(e instanceof ApiError ? e.message : '撤销收款失败');
     } finally {
       setSubmitting(false);
     }
+    if (!reversed) return;
+    try {
+      const refreshed = await refreshPaymentState();
+      if (refreshed) onChanged?.();
+    } catch {
+      setErr('已撤销这笔收款，但页面刷新失败，请手动刷新页面查看最新收款状态（不要重复撤销）。');
+      return;
+    }
+    if (reverseWarning) window.alert(reverseWarning);
   }
 
   // 收款复核锁：财务/出纳对账无误后锁定本单收款（锁定后禁止人工录新收款）；解锁需二次确认。
@@ -9448,8 +9629,12 @@ interface BatchPayRow {
   orderId: string;
   orderNumber: string;
   customerName: string;
-  total: number;
+  /** 客户应付（含售后费；= 后端 effectivePayable） */
+  payable: number;
   paid: number;
+  /** 代理预存抵扣（视同已付） */
+  prepaid: number;
+  /** 尾款（后端 balanceDue 权威值） */
   balance: number;
   /** 本次到账金额（默认 = 尾款）；null = 空 */
   amount: number | null;
@@ -9469,15 +9654,18 @@ function BatchPayModal({
 
   const [rows, setRows] = useState<BatchPayRow[]>(() =>
     orders.map((o) => {
-      const { total, paid, balance } = deriveBalance(o);
+      const { payable, paid, prepaid, balance } = deriveBalance(o);
       const { customerName } = deriveView(o);
       return {
         orderId: o.id,
         orderNumber: o.orderNumber,
         customerName,
-        total,
+        payable,
         paid,
+        prepaid,
         balance,
+        // 预填 = 后端权威尾款（含预存抵扣）。用本地「应收−已付」预填会把预存抵扣当欠款，
+        // 运营一点提交就录成多付。
         amount: balance > 0 ? balance : null,
       };
     }),
@@ -9621,8 +9809,13 @@ function BatchPayModal({
                         <div className="font-mono text-xs text-ink-soft">{r.orderNumber}</div>
                         <div className="text-xs text-ink-muted">{r.customerName}</div>
                       </td>
-                      <td className="nums px-3 py-1.5 text-right text-slate-600">¥{r.total.toLocaleString()}</td>
-                      <td className="nums px-3 py-1.5 text-right text-slate-600">¥{r.paid.toLocaleString()}</td>
+                      <td className="nums px-3 py-1.5 text-right text-slate-600">¥{r.payable.toLocaleString()}</td>
+                      <td className="nums px-3 py-1.5 text-right text-slate-600">
+                        ¥{r.paid.toLocaleString()}
+                        {r.prepaid > 0 && (
+                          <div className="text-[11px] text-sky-700">+预存抵扣 ¥{r.prepaid.toLocaleString()}</div>
+                        )}
+                      </td>
                       <td className="px-3 py-1.5 text-right">
                         <BalanceBadge balance={r.balance} />
                       </td>

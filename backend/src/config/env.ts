@@ -106,6 +106,14 @@ const EnvSchema = z.object({
 
   // 营销海报中文字体。未配置时由合成层按容器/macOS 的固定候选路径探测。
   POSTER_FONT_PATH: z.string().optional(),
+  // 海报生图模型：切换模型属于技术配置，修改 env 后重启服务生效。
+  POSTER_IMAGE_MODEL: z.preprocess(
+    (v) => (typeof v === 'string' && v.trim() === '' ? undefined : v),
+    z.string().trim().min(1).default('qwen-image-2.0-pro'),
+  ),
+  // 海报配额按服务器本地日期统计；0 表示暂时禁止生成。
+  POSTER_DAILY_LIMIT_PER_USER: z.coerce.number().int().min(0).default(10),
+  POSTER_DAILY_LIMIT_TOTAL: z.coerce.number().int().min(0).default(50),
 
   // ═══════════════════════════════════════════════════════════
   // 邮件（SMTP，发送电子行程单）
