@@ -152,7 +152,7 @@ export class AuthService {
     const tokenHash = hashToken(refreshToken);
     const record = await prisma.refreshToken.findUnique({
       where: { tokenHash },
-      include: { user: true },
+      include: { user: { include: { agentProfile: { select: { isActive: true } } } } },
     });
     if (!record || record.expiresAt < new Date()) {
       throw new UnauthorizedError('Invalid or expired refresh token');
@@ -162,6 +162,15 @@ export class AuthService {
     }
     if (record.authVersion !== record.user.authVersion) {
       throw new UnauthorizedError('会话已失效，请重新登录');
+    }
+    // 代理停用同样挡在续期口：与 login 一致。authenticate 中间件虽会逐请求拦截停用代理，
+    // 但只靠那一处是单点防线——续期口不复核的话，停用代理仍能无限刷出新 access token
+    // （每次都被业务请求拒绝，纯属多余攻击面），未来若出现绕过 authenticate 的路由更会被静默放行。
+    if (
+      record.user.role === UserRole.AGENT &&
+      (!record.user.agentProfile || !record.user.agentProfile.isActive)
+    ) {
+      throw new UnauthorizedError('账号已停用，请联系管理员');
     }
 
     // 令牌已被作废：区分「真正的重放」与「客户端毫秒级并发轮换」。
