@@ -86,6 +86,62 @@ export function formatLocalDate(iso: string, tz: string): string {
   }
 }
 
+/** 本地时区 YYYY-MM-DD（含年份）——用于跨月/跨年仍可正确字典序排序。 */
+export function localYmd(iso: string, tz: string): string {
+  try {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: tz,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(new Date(iso));
+  } catch {
+    return new Date(iso).toISOString().slice(0, 10);
+  }
+}
+
+/** 某个瞬间在指定 IANA 时区的 UTC 偏移（毫秒）。tz 不识别时回退 0（=按 UTC 处理）。 */
+function tzOffsetMs(at: Date, tz: string): number {
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: tz,
+      hour12: false,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+    }).formatToParts(at);
+    const get = (type: string) => Number(parts.find((p) => p.type === type)?.value ?? '0');
+    // hour12:false 在部分引擎会把午夜给成 "24"，取模归一到 0。
+    const asUtc = Date.UTC(get('year'), get('month') - 1, get('day'), get('hour') % 24, get('minute'), get('second'));
+    return asUtc - at.getTime();
+  } catch {
+    return 0;
+  }
+}
+
+/**
+ * 当地钟点 → UTC ISO 串。表单里填的永远是**当地时刻**（"当地 16:40 起飞"），
+ * 落库前要按该班次自己的时区折回 UTC——用 `new Date('2026-09-01T16:40')` 走的是
+ * 浏览器时区，运营在国内改一个岘港（+7）起飞的班次就会差 1 小时。
+ * @param dateISO 当地日 'YYYY-MM-DD'
+ * @param hhmm    当地钟点 'HH:mm'
+ */
+export function localToUtcIso(dateISO: string, hhmm: string, tz: string): string {
+  const [y, m, d] = dateISO.split('-').map(Number);
+  const [hh, mi] = hhmm.split(':').map(Number);
+  if (![y, m, d, hh, mi].every(Number.isFinite)) {
+    throw new Error(`无法解析当地时刻：${dateISO} ${hhmm}`);
+  }
+  const wall = Date.UTC(y, m - 1, d, hh, mi);
+  let ts = wall;
+  // 迭代两轮以覆盖 DST 切换日（现役时区均无 DST，为将来扩时区留的余量）
+  for (let i = 0; i < 2; i += 1) ts = wall - tzOffsetMs(new Date(ts), tz);
+  return new Date(ts).toISOString();
+}
+
 export function formatDuration(minutes: number): string {
   const h = Math.floor(minutes / 60);
   const m = minutes % 60;

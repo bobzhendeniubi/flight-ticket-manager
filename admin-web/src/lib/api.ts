@@ -2861,6 +2861,29 @@ export const api = {
         }>;
       };
     }>('/flights/schedules/batch-update-capacity', { method: 'POST', token, body }),
+  // 批量改时刻（ADMIN·航司整段改点）：scheduleIds 同上由前端筛出。
+  // departureLocalTime/arrivalLocalTime 是**当地钟点** HH:mm——后端按每个班次自己的
+  // departureTz/arrivalTz 折回 UTC，各班次的当地出发日保持不变（只换钟点）。
+  // arrivalNextDay：到达跨零点时勾上。批次里有已售班次时后端 400 回报影响面，
+  // 运营确认后带 confirmSoldTimeChange 重试（与单班次「改时刻」同一道闸）。
+  batchUpdateScheduleTimes: (
+    token: string,
+    body: {
+      scheduleIds: string[];
+      departureLocalTime: string;
+      arrivalLocalTime: string;
+      arrivalNextDay: boolean;
+      confirmSoldTimeChange?: boolean;
+    },
+  ) =>
+    apiFetch<{
+      result: {
+        applied: number;
+        skipped: Array<{ scheduleId: string; reason: string }>;
+        soldSchedules: number;
+        soldSeats: number;
+      };
+    }>('/flights/schedules/batch-update-times', { method: 'POST', token, body }),
   // 行李规则（航班 × 舱等；ADMIN/STAFF 维护）
   getBaggagePolicies: (token: string, flightId: string) =>
     apiFetch<{ policies: FlightBaggagePolicy[] }>(`/flights/${flightId}/baggage-policies`, { token }),
@@ -4474,6 +4497,8 @@ export interface FinanceScheduleRow {
   origin: string;
   destination: string;
   departureTime: string;
+  /** 出发地 IANA 时区——起飞时刻按它折算展示 */
+  departureTz: string;
   /** 出发地时区的当地出发日 YYYY-MM-DD（配对同录按它判定同一天） */
   localDepartureDate: string;
   // 生效（用于显示）

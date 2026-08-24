@@ -5,6 +5,7 @@
  * 列定义对齐用户提供的样本文件 (20MAY QH9589 MFM-DAD 1P)。
  */
 import ExcelJS from 'exceljs';
+import { localDateISO } from '../../lib/flight-time.js';
 import type { Passenger } from '@prisma/client';
 import { toAlpha3 } from './nationality.js';
 import { splitPassengerFullName } from '../../lib/passenger-name.js';
@@ -71,6 +72,32 @@ export function earliestFlightDeparture(
     .map((it) => it.flightSchedule!.departureTime);
   if (departures.length === 0) return null;
   return departures.reduce((min, d) => (d < min ? d : min));
+}
+
+/**
+ * 整单「出发日」YYYY-MM-DD —— 最早 FLIGHT 行的**出发地当地日**。
+ * 跟运营在班次日历/订单列表上看到的日期是同一个口径；按 UTC 折会让当地凌晨起飞的
+ * 红眼班次落到前一天，分房表按出发日筛选就会漏单。未联查 tz 时回退 UTC 日。
+ */
+export function earliestFlightDepartureLocalDate(
+  items:
+    | Array<{
+        kind: string;
+        flightSchedule?: { departureTime: Date; departureTz?: string | null } | null;
+      }>
+    | null
+    | undefined,
+): string | null {
+  let earliest: { at: Date; tz: string | null } | null = null;
+  for (const it of items ?? []) {
+    if (it.kind !== 'FLIGHT' || !it.flightSchedule) continue;
+    const at = it.flightSchedule.departureTime;
+    if (earliest === null || at < earliest.at) {
+      earliest = { at, tz: it.flightSchedule.departureTz ?? null };
+    }
+  }
+  if (!earliest) return null;
+  return earliest.tz ? localDateISO(earliest.at, earliest.tz) : earliest.at.toISOString().slice(0, 10);
 }
 
 export interface PnrRow {

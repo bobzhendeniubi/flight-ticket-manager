@@ -45,6 +45,7 @@ import {
 import type { ItineraryData } from '../../lib/itinerary-pdf.js';
 import { writeAudit } from '../../lib/audit.js';
 import { splitPassengerFullName } from '../../lib/passenger-name.js';
+import { localHHMM, localDateISO } from '../../lib/flight-time.js';
 import {
   anyPassengerNeedsVisa,
   orderNeedsVisaTask,
@@ -832,7 +833,7 @@ export async function syncOrderHasReturnLeg(
     where: { orderId, kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
     select: {
       flightScheduleId: true,
-      flightSchedule: { select: { departureTime: true } },
+      flightSchedule: { select: { departureTime: true, departureTz: true } },
     },
   });
   const hasReturnLeg = resolveHasReturnLeg(items);
@@ -2893,7 +2894,7 @@ export class OrderService {
           items: {
             select: {
               hotelCheckIn: true,
-              flightSchedule: { select: { departureTime: true } },
+              flightSchedule: { select: { departureTime: true, departureTz: true } },
             },
           },
         },
@@ -2911,7 +2912,7 @@ export class OrderService {
           items: {
             include: {
               fulfillmentTasks: { select: { type: true, status: true } },
-              flightSchedule: { select: { departureTime: true } },
+              flightSchedule: { select: { departureTime: true, departureTz: true } },
             },
           },
           passengers: { select: { id: true, fullName: true, chineseName: true, gender: true, documentNumber: true } },
@@ -2962,6 +2963,9 @@ export class OrderService {
               select: {
                 departureTime: true,
                 arrivalTime: true,
+                // 当地时区：行程单/订单详情的时刻必须按它折算，否则显示的是 UTC 分量
+                departureTz: true,
+                arrivalTz: true,
                 flight: { select: { flightNumber: true, originCode: true, destinationCode: true } },
               },
             },
@@ -3114,7 +3118,7 @@ export class OrderService {
           items: {
             select: {
               hotelCheckIn: true,
-              flightSchedule: { select: { departureTime: true } },
+              flightSchedule: { select: { departureTime: true, departureTz: true } },
             },
           },
         },
@@ -3658,7 +3662,7 @@ export class OrderService {
     const order = await prisma.order.findUnique({
       where: { orderNumber: query.orderNumber },
       include: {
-        items: { include: { flightSchedule: { select: { departureTime: true } } } },
+        items: { include: { flightSchedule: { select: { departureTime: true, departureTz: true } } } },
         passengers: { select: { fullName: true, firstName: true } },
         payments: { select: { status: true } },
         user: { select: { phone: true, email: true } },
@@ -4511,7 +4515,7 @@ export class OrderService {
             where: { kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
             select: {
               flightScheduleId: true,
-              flightSchedule: { select: { departureTime: true } },
+              flightSchedule: { select: { departureTime: true, departureTz: true } },
             },
           },
         },
@@ -5672,6 +5676,8 @@ export class OrderService {
           destination: i.flightSchedule!.flight.destinationCode,
           departureTime: i.flightSchedule!.departureTime,
           arrivalTime: i.flightSchedule!.arrivalTime,
+          departureTz: i.flightSchedule!.departureTz,
+          arrivalTz: i.flightSchedule!.arrivalTz,
           cabin: i.flightCabin ?? 'ECONOMY',
         })),
         passengers: order.passengers.map((p) => ({
@@ -7156,6 +7162,9 @@ export class OrderService {
               select: {
                 departureTime: true,
                 arrivalTime: true,
+                // 当地时区：行程单/订单详情的时刻必须按它折算，否则显示的是 UTC 分量
+                departureTz: true,
+                arrivalTz: true,
                 flight: { select: { flightNumber: true, originCode: true, destinationCode: true } },
               },
             },
@@ -9338,13 +9347,23 @@ function formatMonthDay(d: Date): string {
   return `${d.getUTCMonth() + 1}月${d.getUTCDate()}日`;
 }
 
-/** HH:MM（24 小时制，UTC 分量——与本仓库其余处按 UTC 存取时间的口径一致）。 */
-function formatHHMM(d: Date): string {
+/**
+ * 航班时刻 HH:MM（24 小时制，**按班次自己的当地时区**折算）。
+ * 班次 departureTime/arrivalTime 存 UTC，当地时区另存在 departureTz/arrivalTz——
+ * 直接取 UTC 分量会少 8 小时（澳门/北京）或 7 小时（越南），订单详情、前台「我的订单」、
+ * 行程单 PDF/邮件全线显示错误时刻。tz 缺失（未联查）时回退 UTC 分量，行为与改动前一致。
+ */
+function formatHHMM(d: Date, tz?: string | null): string {
+  if (tz) return localHHMM(d, tz);
   return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
 }
 
-/** YYYY-MM-DD（date-only）。 */
-function formatDateOnly(d: Date): string {
+/**
+ * YYYY-MM-DD。传入 tz 时按当地日折算（当地凌晨起飞的班次 UTC 还停在前一天，
+ * 不折算会把出发日期写早一天）；不传沿用 UTC 日（date-only 字段本就存 UTC 零点）。
+ */
+function formatDateOnly(d: Date, tz?: string | null): string {
+  if (tz) return localDateISO(d, tz);
   return d.toISOString().slice(0, 10);
 }
 
@@ -9357,13 +9376,20 @@ function formatDateOnly(d: Date): string {
  */
 function deriveOrderDepartDate(items: ReadonlyArray<Record<string, unknown>>): string | null {
   let earliestFlight: Date | null = null;
+  // 最早那段航班的出发地时区——出发日要按它折，不是按 UTC（当地凌晨起飞的红眼班次
+  // UTC 还停在前一天，按 UTC 算会把出发日期写早一天）。未联查 tz 时为 null → 回退 UTC。
+  let earliestFlightTz: string | null = null;
   let earliestHotel: Date | null = null;
   for (const i of items) {
-    const schedule = i.flightSchedule as { departureTime?: Date | string } | null | undefined;
+    const schedule = i.flightSchedule as
+      | { departureTime?: Date | string; departureTz?: string | null }
+      | null
+      | undefined;
     if (schedule?.departureTime) {
       const d = new Date(schedule.departureTime);
       if (!Number.isNaN(d.getTime()) && (earliestFlight === null || d < earliestFlight)) {
         earliestFlight = d;
+        earliestFlightTz = schedule.departureTz ?? null;
       }
     }
     const checkIn = i.hotelCheckIn as Date | string | null | undefined;
@@ -9374,8 +9400,9 @@ function deriveOrderDepartDate(items: ReadonlyArray<Record<string, unknown>>): s
       }
     }
   }
-  const picked = earliestFlight ?? earliestHotel;
-  return picked ? formatDateOnly(picked) : null;
+  // 航班优先按出发地当地日；回退到酒店入住日时用 UTC（@db.Date 存的就是 UTC 零点）
+  if (earliestFlight) return formatDateOnly(earliestFlight, earliestFlightTz);
+  return earliestHotel ? formatDateOnly(earliestHotel) : null;
 }
 
 /**
@@ -9487,6 +9514,9 @@ function itineraryFieldsForItem(
     | {
         departureTime?: Date | string;
         arrivalTime?: Date | string;
+        // 当地时区：未联查时为 undefined，格式化会安全回退 UTC 分量（口径同改动前）。
+        departureTz?: string | null;
+        arrivalTz?: string | null;
         flight?: { flightNumber?: string; originCode?: string; destinationCode?: string } | null;
       }
     | null
@@ -9514,9 +9544,10 @@ function itineraryFieldsForItem(
   return {
     // ── FLIGHT 行（含套餐关联的经济舱腿）──
     flightNumber: flightSchedule?.flight?.flightNumber ?? null,
-    departureDate: departureTime ? formatDateOnly(departureTime) : null,
-    departureTime: departureTime ? formatHHMM(departureTime) : null,
-    arrivalTime: arrivalTime ? formatHHMM(arrivalTime) : null,
+    // 出发日/时刻按出发地时区折算；到达时刻按到达地时区（跨时区航段两头不同）。
+    departureDate: departureTime ? formatDateOnly(departureTime, flightSchedule?.departureTz) : null,
+    departureTime: departureTime ? formatHHMM(departureTime, flightSchedule?.departureTz) : null,
+    arrivalTime: arrivalTime ? formatHHMM(arrivalTime, flightSchedule?.arrivalTz) : null,
     route:
       flightSchedule?.flight?.originCode && flightSchedule?.flight?.destinationCode
         ? `${flightSchedule.flight.originCode}→${flightSchedule.flight.destinationCode}`
@@ -9950,7 +9981,7 @@ export function maskFamilyName(fullName: string): string {
 
 type OrderForMasking = Prisma.OrderGetPayload<{
   include: {
-    items: { include: { flightSchedule: { select: { departureTime: true } } } };
+    items: { include: { flightSchedule: { select: { departureTime: true, departureTz: true } } } };
     passengers: { select: { fullName: true; firstName: true } };
     payments: { select: { status: true } };
   };
@@ -9996,10 +10027,13 @@ function hasFlightChanged(metadata: unknown): boolean {
 /** 行的出行/入住日期（仅日期字符串）；HOTEL→入住日，FLIGHT→出发日，否则 null。 */
 function maskedItemTravelDate(it: {
   hotelCheckIn: Date | null;
-  flightSchedule: { departureTime: Date } | null;
+  flightSchedule: { departureTime: Date; departureTz?: string | null } | null;
 }): string | null {
   if (it.hotelCheckIn) return it.hotelCheckIn.toISOString().slice(0, 10);
-  if (it.flightSchedule) return it.flightSchedule.departureTime.toISOString().slice(0, 10);
+  // 航班出发日按出发地当地日折算；未联查 tz 时回退 UTC 日（口径同改动前）
+  if (it.flightSchedule) {
+    return formatDateOnly(it.flightSchedule.departureTime, it.flightSchedule.departureTz);
+  }
   return null;
 }
 

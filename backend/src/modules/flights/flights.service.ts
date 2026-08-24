@@ -16,10 +16,12 @@ import type { PriceResult } from '../pricing/pricing.service.js';
 import { parseFareBuckets } from '../pricing/pricing.schemas.js';
 import type { FareBucketsInput } from '../pricing/pricing.schemas.js';
 import { localDate } from '../finances/finances.cost.service.js';
+import { localDateISO, localToUtc } from '../../lib/flight-time.js';
 import type { FareBucket } from '../pricing/pricing.calc.js';
 import type {
   BaggagePolicyItem,
   BatchUpdateCapacityBody,
+  BatchUpdateScheduleTimesBody,
   CreateFlightBody,
   CreateScheduleBody,
   FlightSearchQuery,
@@ -1187,4 +1189,130 @@ export class FlightService {
 
     return { applied: appliedIds.length, skipped, oversold };
   }
+
+  /**
+   * 批量改时刻（路由层限 ADMIN）。
+   * 场景：航司整段改点——"8/5 起这批班次都改成当地 16:40 起飞 / 17:35 到达"。
+   * 之前只能一个班次点一次「改时刻」，一百来个班次要点一百来次。
+   *
+   * 口径（关键，别按 UTC 理解）：
+   *   - 运营填的是**当地钟点** HH:mm。每个班次拿自己现有的当地出发日（按 departureTz 折算），
+   *     配上新钟点，再折回 UTC 落库 —— 所以各班次的当地出发日不变，只有钟点变。
+   *     正因为出发日不变，「一个航班号一天只能一班」不可能被这个操作打破，无需再查重。
+   *   - 到达日 = 出发当地日（arrivalNextDay 为 true 时 +1 天），按 arrivalTz 折算成 UTC。
+   *     跨时区航段两头时区不同（澳门 +8 / 越南 +7），必须各按各的折。
+   *   - 到达不晚于出发 → 该班次跳过（不改），记入 skipped，不拖累批次里其它班次。
+   *
+   * 已售闸：与单班次 updateSchedule 同一道 —— 批次里只要有一个已售班次时刻真的会变，
+   * 且没带 confirmSoldTimeChange，就整批拒绝并回报影响面（几个班次、共几座）。
+   * 改点影响存量订单的客人通知 / 签证时点 / 酒店入住 / 已提交航司的名单，不能一改了之。
+   *
+   * 可执行的改动一次事务写入；写 WARNING 审计留痕（批量操作爆炸半径大，必须可追溯）。
+   */
+  async batchUpdateScheduleTimes(body: BatchUpdateScheduleTimesBody, actor?: AuditActor) {
+    const schedules = await prisma.flightSchedule.findMany({
+      where: { id: { in: body.scheduleIds } },
+      include: { seatClasses: { select: { sold: true } } },
+    });
+    const scheduleById = new Map(schedules.map((s) => [s.id, s]));
+
+    const skipped: Array<{ scheduleId: string; reason: string }> = [];
+    const updates: Array<{ scheduleId: string; departureTime: Date; arrivalTime: Date }> = [];
+    // 时刻真的会变、且已售 > 0 的班次——用于二次确认闸的影响面报文
+    let soldSchedules = 0;
+    let soldSeats = 0;
+
+    for (const scheduleId of body.scheduleIds) {
+      const schedule = scheduleById.get(scheduleId);
+      if (!schedule) {
+        skipped.push({ scheduleId, reason: '班次不存在' });
+        continue;
+      }
+
+      // 出发当地日锚定在班次现有值上，只换钟点
+      const depLocalDay = localDateISO(schedule.departureTime, schedule.departureTz);
+      const arrLocalDay = body.arrivalNextDay ? addLocalDays(depLocalDay, 1) : depLocalDay;
+
+      let newDep: Date;
+      let newArr: Date;
+      try {
+        newDep = localToUtc(depLocalDay, body.departureLocalTime, schedule.departureTz);
+        newArr = localToUtc(arrLocalDay, body.arrivalLocalTime, schedule.arrivalTz);
+      } catch {
+        skipped.push({ scheduleId, reason: '时刻折算失败（时区或日期异常）' });
+        continue;
+      }
+
+      if (newArr <= newDep) {
+        skipped.push({
+          scheduleId,
+          reason: '到达不晚于出发（跨零点到达请勾选「到达次日」）',
+        });
+        continue;
+      }
+
+      const changed =
+        newDep.getTime() !== schedule.departureTime.getTime() ||
+        newArr.getTime() !== schedule.arrivalTime.getTime();
+      if (!changed) {
+        skipped.push({ scheduleId, reason: '时刻与现值相同，无需修改' });
+        continue;
+      }
+
+      const sold = schedule.seatClasses.reduce((sum, c) => sum + c.sold, 0);
+      if (sold > 0) {
+        soldSchedules += 1;
+        soldSeats += sold;
+      }
+      updates.push({ scheduleId, departureTime: newDep, arrivalTime: newArr });
+    }
+
+    if (soldSchedules > 0 && body.confirmSoldTimeChange !== true) {
+      throw new BadRequestError(
+        `这批里有 ${soldSchedules} 个班次已售共 ${soldSeats} 座，改时刻将影响存量订单` +
+          '（客人通知/签证时点/酒店入住/已提交航司的名单）。请确认后重试（带确认标志）；' +
+          '改点后请逐项跟进：通知客人、复核护照/签证有效期、核对酒店入住日、重新导出航司名单。',
+      );
+    }
+
+    if (updates.length > 0) {
+      await prisma.$transaction(
+        updates.map((u) =>
+          prisma.flightSchedule.update({
+            where: { id: u.scheduleId },
+            data: { departureTime: u.departureTime, arrivalTime: u.arrivalTime },
+          }),
+        ),
+      );
+
+      await writeAudit({
+        actor: actor ?? {},
+        action: 'BATCH_UPDATE_SCHEDULE_TIMES',
+        targetType: AuditTargetType.FLIGHT,
+        targetLabel:
+          `批量改时刻 ${updates.length} 个班次 → 当地 ${body.departureLocalTime}` +
+          `-${body.arrivalLocalTime}${body.arrivalNextDay ? '(次日到达)' : ''}` +
+          `${soldSchedules > 0 ? `（其中 ${soldSchedules} 个已售共 ${soldSeats} 座）` : ''}`,
+        after: {
+          appliedScheduleIds: updates.map((u) => u.scheduleId),
+          departureLocalTime: body.departureLocalTime,
+          arrivalLocalTime: body.arrivalLocalTime,
+          arrivalNextDay: body.arrivalNextDay,
+          soldSchedules,
+          soldSeats,
+          skipped,
+        },
+        severity: AuditSeverity.WARNING,
+      });
+    }
+
+    return { applied: updates.length, skipped, soldSchedules, soldSeats };
+  }
+}
+
+/** 当地日 'YYYY-MM-DD' 加减天数（纯日历运算，不涉时区偏移）。 */
+function addLocalDays(dateISO: string, days: number): string {
+  const [y, m, d] = dateISO.split('-').map(Number);
+  const shifted = new Date(Date.UTC(y, m - 1, d + days));
+  return shifted.toISOString().slice(0, 10);
 }

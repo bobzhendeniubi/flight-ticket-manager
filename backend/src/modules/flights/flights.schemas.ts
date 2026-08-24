@@ -127,6 +127,22 @@ export const batchUpdateCapacityBodySchema = z.object({
 });
 export type BatchUpdateCapacityBody = z.infer<typeof batchUpdateCapacityBodySchema>;
 
+// ── 批量改时刻（按 scheduleId 列表；航司整段改点）──────────────────────────
+// 运营填的是**当地钟点**（"这批班次改成当地 16:40 起飞 / 17:35 到达"），不是 UTC——
+// 每个班次按自己的 departureTz/arrivalTz 折回 UTC 落库，各班次的当地出发日保持不变。
+// arrivalNextDay：到达跨零点（当地次日）时勾上，到达日 = 出发当地日 + 1。
+// confirmSoldTimeChange：与单班次改时刻同一道闸——批次里有已售班次时必须显式确认，
+// 因为改点影响存量订单的客人通知 / 签证时点 / 酒店入住 / 已提交航司的名单。
+const LOCAL_HHMM = /^([01]\d|2[0-3]):([0-5]\d)$/;
+export const batchUpdateScheduleTimesBodySchema = z.object({
+  scheduleIds: z.array(z.string().min(1)).min(1).max(2000),
+  departureLocalTime: z.string().regex(LOCAL_HHMM, '出发时刻请填 HH:mm（24 小时制）'),
+  arrivalLocalTime: z.string().regex(LOCAL_HHMM, '到达时刻请填 HH:mm（24 小时制）'),
+  arrivalNextDay: z.boolean().default(false),
+  confirmSoldTimeChange: z.boolean().optional(),
+});
+export type BatchUpdateScheduleTimesBody = z.infer<typeof batchUpdateScheduleTimesBodySchema>;
+
 // ── 单班次编辑（月历库存视图：改价 / 改容量 / 停用启用 / 改时刻）────────────
 // 全部可选，但至少给一个；seatClasses 内每条按 cabin 定位，basePrice/capacity 各自可选
 export const updateScheduleBodySchema = z

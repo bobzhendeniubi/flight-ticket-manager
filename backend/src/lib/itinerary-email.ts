@@ -10,6 +10,7 @@
 import { FulfillmentStatus, FulfillmentType } from '@prisma/client';
 import { prisma } from '../db/prisma.js';
 import { renderItineraryPdf } from './itinerary-pdf.js';
+import { localDateTime } from './flight-time.js';
 import { sendMail } from './mailer.js';
 
 /**
@@ -73,6 +74,8 @@ export async function sendItineraryEmail(orderId: string): Promise<ItineraryResu
       destination: i.flightSchedule!.flight.destinationCode,
       departureTime: i.flightSchedule!.departureTime,
       arrivalTime: i.flightSchedule!.arrivalTime,
+      departureTz: i.flightSchedule!.departureTz,
+      arrivalTz: i.flightSchedule!.arrivalTz,
       cabin: i.flightCabin ?? 'ECONOMY',
     }));
 
@@ -108,10 +111,11 @@ export async function sendItineraryEmail(orderId: string): Promise<ItineraryResu
             <tr>
               <td style="padding:6px 12px;border:1px solid #e2e8f0">${f.flightNumber}</td>
               <td style="padding:6px 12px;border:1px solid #e2e8f0">${f.origin} → ${f.destination}</td>
-              <td style="padding:6px 12px;border:1px solid #e2e8f0">${f.departureTime.toISOString().slice(0, 16).replace('T', ' ')} UTC</td>
+              <td style="padding:6px 12px;border:1px solid #e2e8f0">${localDateTime(f.departureTime, f.departureTz)}</td>
             </tr>
           `).join('')}
         </table>
+        <p style="margin-top:8px;color:#94a3b8;font-size:12px">以上时刻均为当地时间。</p>
         <p style="margin-top:20px;color:#64748b;font-size:13px">
           如有疑问请联系椰岛假期客服。
         </p>

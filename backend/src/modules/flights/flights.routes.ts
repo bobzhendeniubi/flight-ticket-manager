@@ -12,6 +12,7 @@ import { priceQuerySchema } from '../pricing/pricing.schemas.js';
 import {
   batchDeleteSchedulesBodySchema,
   batchUpdateCapacityBodySchema,
+  batchUpdateScheduleTimesBodySchema,
   createFlightBodySchema,
   createScheduleBodySchema,
   flightSearchQuerySchema,
@@ -189,6 +190,21 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
     async (req) => {
       const body = batchUpdateCapacityBodySchema.parse(req.body);
       const result = await service.batchUpdateCapacity(body, actorFromRequest(req));
+      return { result };
+    },
+  );
+
+  // 批量改时刻（按 scheduleId 列表）。运营填**当地钟点** HH:mm，各班次按自己的时区折回 UTC，
+  // 当地出发日保持不变。批次里有已售班次时必须带 confirmSoldTimeChange，否则 400 回报影响面。
+  // 仅 ADMIN —— 与批量删除/批量改容量同权限口径；操作写审计留痕。
+  // body: { scheduleIds, departureLocalTime, arrivalLocalTime, arrivalNextDay?, confirmSoldTimeChange? }
+  // 返回 { applied, skipped: [{ scheduleId, reason }], soldSchedules, soldSeats }。
+  app.post(
+    '/schedules/batch-update-times',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN)] },
+    async (req) => {
+      const body = batchUpdateScheduleTimesBodySchema.parse(req.body);
+      const result = await service.batchUpdateScheduleTimes(body, actorFromRequest(req));
       return { result };
     },
   );

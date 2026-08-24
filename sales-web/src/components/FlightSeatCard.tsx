@@ -173,6 +173,8 @@ export function FlightSeatCard({
             qty: 1, // 用 qty=1 + unitPrice=totalForQty 保证精确金额
             meta: {
               departureTime: flight.departureTime,
+              // 出发地时区：购物车行要按它显示当地出发日，切 UTC 串会写早一天
+              departureTz: flight.departureTz,
               cabin: cabin.cabin,
               passengers,
               // dateRank 是内部字段，不放进 cart meta（之前 CartPage 曾把它显示给客户）

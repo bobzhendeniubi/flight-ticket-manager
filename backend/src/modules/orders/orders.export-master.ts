@@ -22,6 +22,7 @@
  *     与《全岗可用》模板同口径，避免按订单总额被误读为每人都付了全款。
  */
 import ExcelJS from 'exceljs';
+import { localDateISO } from '../../lib/flight-time.js';
 import type { DocumentType, Prisma, PrismaClient } from '@prisma/client';
 import { OrderStatus } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
@@ -131,6 +132,16 @@ function fmtDate(d: Date | null | undefined): string {
 function fmtDateTime(d: Date | null | undefined): string {
   if (!d) return '';
   return `${fmtDate(d)} ${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
+}
+
+/**
+ * 航段出发日 YYYY-MM-DD，**按出发地当地时区**折算。
+ * 班次 departureTime 存 UTC——当地凌晨起飞的红眼班次 UTC 还停在前一天，
+ * 直接切 UTC 会把名单上的出发日期写早一天。tz 缺失时回退 UTC（口径同改动前）。
+ */
+function fmtDepartDate(d: Date | null | undefined, tz: string | null | undefined): string {
+  if (!d) return '';
+  return tz ? localDateISO(d, tz) : fmtDate(d);
 }
 
 // ── 一行（每位乘客）───────────────────────────────────────────────────────
@@ -405,6 +416,7 @@ export function orderToMasterRows(
     .filter((it) => it.kind === 'FLIGHT' && it.flightSchedule)
     .map((it) => ({
       departureTime: it.flightSchedule!.departureTime,
+      departureTz: it.flightSchedule!.departureTz ?? null,
       flightNumber: it.flightSchedule!.flight.flightNumber,
       cabin: it.flightCabin,
     }))
@@ -414,8 +426,11 @@ export function orderToMasterRows(
     legs.length === 0
       ? ''
       : legs.length === 1
-        ? fmtDate(legs[0].departureTime)
-        : `${fmtDate(legs[0].departureTime)} / ${fmtDate(legs[legs.length - 1].departureTime)}`;
+        ? fmtDepartDate(legs[0].departureTime, legs[0].departureTz)
+        : `${fmtDepartDate(legs[0].departureTime, legs[0].departureTz)} / ${fmtDepartDate(
+            legs[legs.length - 1].departureTime,
+            legs[legs.length - 1].departureTz,
+          )}`;
   const flightNumbers = legs.map((l) => l.flightNumber).join(' ⇌ ');
   const cabinLabels = Array.from(
     new Set(legs.filter((l) => l.cabin).map((l) => CABIN_LABEL[l.cabin!] ?? l.cabin!)),

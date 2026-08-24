@@ -16,6 +16,7 @@
  * 解析结果只作预览：前端把行灌进批量创单表格供人工复核，创建仍走 POST /orders/batch。
  */
 import ExcelJS from 'exceljs';
+import { localDateISO } from '../../lib/flight-time.js';
 import { CabinClass } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { parseDateCellDetailed, parseGenderCell } from './roster.js';
@@ -559,6 +560,7 @@ export function buildOrderImportMatchDeps(): OrderImportMatchDeps {
           id: true,
           flightId: true,
           departureTime: true,
+          departureTz: true,
           flight: { select: { flightNumber: true } },
         },
       });
@@ -566,7 +568,9 @@ export function buildOrderImportMatchDeps(): OrderImportMatchDeps {
         id: s.id,
         flightId: s.flightId,
         flightNumber: s.flight.flightNumber.toUpperCase(),
-        departureDate: s.departureTime.toISOString().slice(0, 10),
+        // 出发日按出发地当地日：运营在表格里填的是当地出发日期，按 UTC 折会让
+        // 当地凌晨起飞的班次匹配不上（差一天）。
+        departureDate: localDateISO(s.departureTime, s.departureTz),
       }));
     },
   };

@@ -7,6 +7,7 @@
  * PATCH  /orders/:id/status    状态流转（ADMIN/STAFF；客户可取消待支付）
  */
 import type { FastifyPluginAsync } from 'fastify';
+import { localDateISO } from '../../lib/flight-time.js';
 import { z } from 'zod';
 import { InvoiceStatus, Prisma, UserRole, type Passenger } from '@prisma/client';
 import { buildStayNightDates, OrderService, type OrderRequester } from './orders.service.js';
@@ -641,9 +642,8 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         return reply.status(404).send({ error: '班次不存在' });
       }
 
-      const departureDate = `${schedule.departureTime.getUTCFullYear()}-${String(
-        schedule.departureTime.getUTCMonth() + 1,
-      ).padStart(2, '0')}-${String(schedule.departureTime.getUTCDate()).padStart(2, '0')}`;
+      // 出发日按出发地当地时区折算——文件名和审计标签要跟运营在班次日历上看到的日期一致
+      const departureDate = localDateISO(schedule.departureTime, schedule.departureTz);
       const flightNumber = schedule.flight.flightNumber;
 
       const buf = await buildOrdersBySchedule(query.scheduleId);

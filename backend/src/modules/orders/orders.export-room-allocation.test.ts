@@ -599,7 +599,7 @@ function captureClient(): { client: PrismaClient; findMany: ReturnType<typeof vi
 const UTC = (s: string): Date => new Date(`${s}T00:00:00.000Z`);
 
 describe('buildRoomAllocationWorkbook 选单口径', () => {
-  it('按出发日：主口径按 FLIGHT departureTime 落在该 UTC 日选订单，且不按入住日切范围（导全部入住晚）', async () => {
+  it('按出发日：召回窗口按 ±1 天放宽（当地日↔UTC 日差一天），且不按入住日切范围（导全部入住晚）', async () => {
     const { client, findMany } = captureClient();
     await buildRoomAllocationWorkbook({ departDate: '2026-07-10' }, client);
 
@@ -610,12 +610,14 @@ describe('buildRoomAllocationWorkbook 选单口径', () => {
     expect(where.hotelRoomTypeId).toEqual({ not: null });
     expect(where.hotelCheckIn).toBeUndefined();
 
-    // 主口径：该日出发的航班（[dayStart, 次日) 半开区间）
+    // 主口径：召回窗口 [前一日, 次日+1) —— 班次 departureTime 存 UTC，当地出发日与 UTC 日
+    // 最多差一天（当地凌晨起飞的班次 UTC 还在前一天）。窗口只负责别漏，
+    // 精确到底是不是该日出发由 filterRoomItemsByDepartDate 按当地日判定。
     const [flightOr] = where.order.OR;
     expect(flightOr.items.some.kind).toBe('FLIGHT');
     expect(flightOr.items.some.flightSchedule.departureTime).toEqual({
-      gte: UTC('2026-07-10'),
-      lt: UTC('2026-07-11'),
+      gte: UTC('2026-07-09'),
+      lt: UTC('2026-07-12'),
     });
   });
 
@@ -692,5 +694,33 @@ describe('filterRoomItemsByDepartDate（出发日精确细筛）', () => {
     const items = [roomItem('hotel-only', [], '2026-07-22')];
     const kept = filterRoomItemsByDepartDate(items, '2026-07-22');
     expect(kept.map((it) => it.orderId)).toEqual(['hotel-only']);
+  });
+
+  // 红眼班次：澳门当地 7/22 00:30 起飞 = 7/21 16:30Z。按 UTC 日会归到 21 号 →
+  // 房控按 22 号导分房表就漏了这一单。判定必须走出发地当地日。
+  it('当地凌晨起飞（UTC 还在前一天）→ 按当地出发日归入 22 号，不按 UTC 归到 21 号', () => {
+    const redEye = (orderId: string): RoomItemForExport =>
+      ({
+        orderId,
+        hotelCheckIn: D('2026-07-22'),
+        hotelRoomType: { name: '标准双床', bedType: '双床', hotel: { name: 'B酒店' } },
+        order: {
+          items: [
+            {
+              kind: 'FLIGHT',
+              flightSchedule: {
+                departureTime: new Date('2026-07-21T16:30:00.000Z'), // 澳门 7/22 00:30
+                departureTz: 'Asia/Macau',
+              },
+            },
+          ],
+        },
+      }) as unknown as RoomItemForExport;
+
+    expect(filterRoomItemsByDepartDate([redEye('red-eye')], '2026-07-22').map((it) => it.orderId)).toEqual([
+      'red-eye',
+    ]);
+    // 反向：按 21 号导时不该把它算进来
+    expect(filterRoomItemsByDepartDate([redEye('red-eye')], '2026-07-21')).toEqual([]);
   });
 });

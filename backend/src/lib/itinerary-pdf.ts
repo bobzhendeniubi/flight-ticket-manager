@@ -9,6 +9,7 @@
  * TODO: 接入 /fonts/NotoSansSC-Regular.otf 真正解决中文显示。
  */
 import PDFDocument from 'pdfkit';
+import { localDateTime } from './flight-time.js';
 
 export interface ItineraryData {
   orderNumber: string;
@@ -24,6 +25,9 @@ export interface ItineraryData {
     destination: string;
     departureTime: Date;
     arrivalTime: Date;
+    // 起降两地各自的 IANA 时区——时刻按航司口径印当地时间，跨时区航段两头不同
+    departureTz: string;
+    arrivalTz: string;
     cabin: string;
   }>;
   passengers: Array<{
@@ -74,13 +78,17 @@ export async function renderItineraryPdf(data: ItineraryData): Promise<Buffer> {
         doc.fontSize(12).fillColor('#000').text(
           `${f.flightNumber}   ${f.origin}  →  ${f.destination}   [${f.cabin}]`,
         );
-        const dep = f.departureTime.toISOString().replace('T', ' ').slice(0, 16);
-        const arr = f.arrivalTime.toISOString().replace('T', ' ').slice(0, 16);
+        // 航司口径：行程单上的时刻一律印**机场当地时间**（不是 UTC）。
+        const dep = localDateTime(f.departureTime, f.departureTz);
+        const arr = localDateTime(f.arrivalTime, f.arrivalTz);
         doc.fontSize(10).fillColor('#475569').text(
-          `   Dep: ${dep} UTC   →   Arr: ${arr} UTC`,
+          `   Dep: ${dep}   →   Arr: ${arr}`,
         );
         doc.moveDown(0.4);
       }
+      doc.fontSize(8).fillColor('#94a3b8').text(
+        'All times are local to the respective airport. / 以上时刻均为当地时间。',
+      );
       doc.moveDown(0.5);
 
       // ── 乘客表 ───────────────────────────────────────

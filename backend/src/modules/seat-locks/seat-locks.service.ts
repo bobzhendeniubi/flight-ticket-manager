@@ -115,7 +115,8 @@ export class SeatLockService {
       where: { userId, status: SeatLockStatus.ACTIVE, expiresAt: { gt: new Date() } },
       include: {
         flightSchedule: {
-          select: { departureTime: true, flight: { select: { flightNumber: true } } },
+          // departureTz：前台要按出发地当地时区显示起飞时刻（不带就只能按浏览器时区猜）
+          select: { departureTime: true, departureTz: true, flight: { select: { flightNumber: true } } },
         },
         seatClass: { select: { cabin: true } },
       },
@@ -128,6 +129,7 @@ export class SeatLockService {
       seatClassId: l.seatClassId,
       flightNumber: l.flightSchedule.flight.flightNumber,
       departureTime: l.flightSchedule.departureTime.toISOString(),
+      departureTz: l.flightSchedule.departureTz,
       cabin: l.seatClass.cabin,
       qty: l.qty,
       expiresAt: l.expiresAt.toISOString(),

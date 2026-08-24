@@ -77,7 +77,8 @@ export class WaitlistService {
       where: { userId, status: { in: [WaitlistStatus.ACTIVE, WaitlistStatus.NOTIFIED] } },
       include: {
         flightSchedule: {
-          select: { departureTime: true, flight: { select: { flightNumber: true } } },
+          // departureTz：前台要按出发地当地时区显示起飞时刻（不带就只能按浏览器时区猜）
+          select: { departureTime: true, departureTz: true, flight: { select: { flightNumber: true } } },
         },
         seatClass: { select: { cabin: true } },
       },
@@ -90,6 +91,7 @@ export class WaitlistService {
       seatClassId: e.seatClassId,
       flightNumber: e.flightSchedule.flight.flightNumber,
       departureTime: e.flightSchedule.departureTime.toISOString(),
+      departureTz: e.flightSchedule.departureTz,
       cabin: e.seatClass.cabin,
       qty: e.qty,
       status: e.status,

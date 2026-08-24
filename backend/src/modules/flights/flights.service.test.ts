@@ -1533,3 +1533,199 @@ describe('FlightService.batchUpdateCapacity', () => {
     ]);
   });
 });
+
+// ── batchUpdateScheduleTimes（按 scheduleId 列表批量改时刻·航司整段改点）─────
+// 口径要害：运营填的是**当地钟点**，各班次按自己的 departureTz/arrivalTz 折回 UTC，
+// 当地出发日保持不变。已售班次要过二次确认闸（与单班次 updateSchedule 同一道）。
+describe('FlightService.batchUpdateScheduleTimes', () => {
+  const service = new FlightService();
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    prismaMock.$transaction.mockImplementation(async (ops: unknown) =>
+      Array.isArray(ops) ? Promise.all(ops) : ops,
+    );
+    prismaMock.flightSchedule.update.mockResolvedValue({});
+  });
+
+  /** 澳门 +8 的班次：当地 08:00 起飞（= 00:00Z），未售。 */
+  const macauSchedule = (id: string, localDay: string) => ({
+    id,
+    departureTime: new Date(`${localDay}T00:00:00.000Z`),
+    arrivalTime: new Date(`${localDay}T01:00:00.000Z`),
+    departureTz: 'Asia/Macau',
+    arrivalTz: 'Asia/Macau',
+    seatClasses: [{ sold: 0 }],
+  });
+
+  it('业务场景：一批澳门班次统一改成当地 16:40 起飞 / 17:35 到达 → 各自当地日不变', async () => {
+    prismaMock.flightSchedule.findMany.mockResolvedValue([
+      macauSchedule('s1', '2026-08-05'),
+      macauSchedule('s2', '2026-08-06'),
+    ]);
+
+    const result = await service.batchUpdateScheduleTimes({
+      scheduleIds: ['s1', 's2'],
+      departureLocalTime: '16:40',
+      arrivalLocalTime: '17:35',
+      arrivalNextDay: false,
+    });
+
+    expect(result.applied).toBe(2);
+    expect(result.skipped).toEqual([]);
+    // 澳门当地 16:40 = 08:40Z（少 8 小时）——这正是运营看到的那个时刻
+    expect(prismaMock.flightSchedule.update).toHaveBeenCalledWith({
+      where: { id: 's1' },
+      data: {
+        departureTime: new Date('2026-08-05T08:40:00.000Z'),
+        arrivalTime: new Date('2026-08-05T09:35:00.000Z'),
+      },
+    });
+    expect(prismaMock.flightSchedule.update).toHaveBeenCalledWith({
+      where: { id: 's2' },
+      data: {
+        departureTime: new Date('2026-08-06T08:40:00.000Z'),
+        arrivalTime: new Date('2026-08-06T09:35:00.000Z'),
+      },
+    });
+  });
+
+  it('跨时区航段：出发按 departureTz、到达按 arrivalTz 各折各的', async () => {
+    prismaMock.flightSchedule.findMany.mockResolvedValue([
+      {
+        id: 's_mfm_dad',
+        departureTime: new Date('2026-08-05T00:00:00.000Z'),
+        arrivalTime: new Date('2026-08-05T01:00:00.000Z'),
+        departureTz: 'Asia/Macau', // +8
+        arrivalTz: 'Asia/Ho_Chi_Minh', // +7
+        seatClasses: [{ sold: 0 }],
+      },
+    ]);
+
+    await service.batchUpdateScheduleTimes({
+      scheduleIds: ['s_mfm_dad'],
+      departureLocalTime: '16:40',
+      arrivalLocalTime: '17:35',
+      arrivalNextDay: false,
+    });
+
+    expect(prismaMock.flightSchedule.update).toHaveBeenCalledWith({
+      where: { id: 's_mfm_dad' },
+      data: {
+        departureTime: new Date('2026-08-05T08:40:00.000Z'), // 澳门 16:40
+        arrivalTime: new Date('2026-08-05T10:35:00.000Z'), // 岘港 17:35
+      },
+    });
+  });
+
+  it('勾选「到达次日」：到达日 = 出发当地日 + 1（跨零点红眼航班）', async () => {
+    prismaMock.flightSchedule.findMany.mockResolvedValue([macauSchedule('s1', '2026-08-05')]);
+
+    await service.batchUpdateScheduleTimes({
+      scheduleIds: ['s1'],
+      departureLocalTime: '23:30',
+      arrivalLocalTime: '00:35',
+      arrivalNextDay: true,
+    });
+
+    expect(prismaMock.flightSchedule.update).toHaveBeenCalledWith({
+      where: { id: 's1' },
+      data: {
+        departureTime: new Date('2026-08-05T15:30:00.000Z'), // 澳门 8/5 23:30
+        arrivalTime: new Date('2026-08-05T16:35:00.000Z'), // 澳门 8/6 00:35
+      },
+    });
+  });
+
+  it('到达不晚于出发（忘了勾「到达次日」）→ 该班次跳过，不拖累其它班次', async () => {
+    prismaMock.flightSchedule.findMany.mockResolvedValue([
+      macauSchedule('s_bad', '2026-08-05'),
+      macauSchedule('s_ok', '2026-08-06'),
+    ]);
+
+    const result = await service.batchUpdateScheduleTimes({
+      scheduleIds: ['s_bad', 's_ok'],
+      departureLocalTime: '23:30',
+      arrivalLocalTime: '00:35',
+      arrivalNextDay: false,
+    });
+
+    // 两条都算不出合法时刻 → 都跳过，一次 update 都不发
+    expect(result.applied).toBe(0);
+    expect(result.skipped).toHaveLength(2);
+    expect(result.skipped[0].reason).toContain('到达次日');
+    expect(prismaMock.flightSchedule.update).not.toHaveBeenCalled();
+  });
+
+  it('已售班次没带确认标志 → 整批拒绝并回报影响面，一条都不写', async () => {
+    prismaMock.flightSchedule.findMany.mockResolvedValue([
+      { ...macauSchedule('s_sold', '2026-08-05'), seatClasses: [{ sold: 12 }, { sold: 3 }] },
+      macauSchedule('s_free', '2026-08-06'),
+    ]);
+
+    await expect(
+      service.batchUpdateScheduleTimes({
+        scheduleIds: ['s_sold', 's_free'],
+        departureLocalTime: '16:40',
+        arrivalLocalTime: '17:35',
+        arrivalNextDay: false,
+      }),
+    ).rejects.toThrow(/1 个班次已售共 15 座/);
+    expect(prismaMock.flightSchedule.update).not.toHaveBeenCalled();
+  });
+
+  it('带上确认标志 → 已售班次照改，影响面在返回体里点名', async () => {
+    prismaMock.flightSchedule.findMany.mockResolvedValue([
+      { ...macauSchedule('s_sold', '2026-08-05'), seatClasses: [{ sold: 12 }] },
+    ]);
+
+    const result = await service.batchUpdateScheduleTimes({
+      scheduleIds: ['s_sold'],
+      departureLocalTime: '16:40',
+      arrivalLocalTime: '17:35',
+      arrivalNextDay: false,
+      confirmSoldTimeChange: true,
+    });
+
+    expect(result).toEqual({ applied: 1, skipped: [], soldSchedules: 1, soldSeats: 12 });
+    expect(prismaMock.flightSchedule.update).toHaveBeenCalledTimes(1);
+  });
+
+  it('时刻与现值相同的班次跳过（不空写、不触发已售闸）', async () => {
+    prismaMock.flightSchedule.findMany.mockResolvedValue([
+      {
+        id: 's_same',
+        departureTime: new Date('2026-08-05T08:40:00.000Z'), // 澳门 16:40
+        arrivalTime: new Date('2026-08-05T09:35:00.000Z'), // 澳门 17:35
+        departureTz: 'Asia/Macau',
+        arrivalTz: 'Asia/Macau',
+        seatClasses: [{ sold: 30 }], // 已售但时刻没变 → 不该被闸拦
+      },
+    ]);
+
+    const result = await service.batchUpdateScheduleTimes({
+      scheduleIds: ['s_same'],
+      departureLocalTime: '16:40',
+      arrivalLocalTime: '17:35',
+      arrivalNextDay: false,
+    });
+
+    expect(result.applied).toBe(0);
+    expect(result.skipped[0].reason).toContain('与现值相同');
+    expect(prismaMock.flightSchedule.update).not.toHaveBeenCalled();
+  });
+
+  it('scheduleId 查无此班次 → 记入 skipped，不算失败', async () => {
+    prismaMock.flightSchedule.findMany.mockResolvedValue([macauSchedule('s1', '2026-08-05')]);
+
+    const result = await service.batchUpdateScheduleTimes({
+      scheduleIds: ['s1', 's_gone'],
+      departureLocalTime: '16:40',
+      arrivalLocalTime: '17:35',
+      arrivalNextDay: false,
+    });
+
+    expect(result.applied).toBe(1);
+    expect(result.skipped).toEqual([{ scheduleId: 's_gone', reason: '班次不存在' }]);
+  });
+});

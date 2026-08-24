@@ -28,7 +28,7 @@ import {
   type RefundQuote,
   type WaitlistStatus,
 } from '../lib/api';
-import { CABIN_LABEL } from '../lib/airports';
+import { CABIN_LABEL, formatLocalDate, formatLocalTime } from '../lib/airports';
 import { useAuth } from '../stores/auth';
 import { Icon, type IconName } from '../components/Icon';
 import { Modal } from '../components/Modal';
@@ -808,7 +808,8 @@ function SeatLocksSection({ token }: { token: string }) {
               <div className="flex flex-wrap items-center gap-2">
                 <span className="font-mono font-semibold text-ink">{l.flightNumber}</span>
                 <span className="text-ink-muted">
-                  {new Date(l.departureTime).toLocaleString('zh-CN')}
+                  {formatLocalDate(l.departureTime, l.departureTz)}{' '}
+                  {formatLocalTime(l.departureTime, l.departureTz)}
                 </span>
                 <span className="chip">
                   {CABIN_LABEL[l.cabin] ?? l.cabin}
@@ -897,7 +898,8 @@ function WaitlistSection({ token }: { token: string }) {
             <div className="flex flex-wrap items-center gap-2">
               <span className="font-mono font-semibold text-ink">{e.flightNumber}</span>
               <span className="text-ink-muted">
-                {new Date(e.departureTime).toLocaleString('zh-CN')}
+                {formatLocalDate(e.departureTime, e.departureTz)}{' '}
+                {formatLocalTime(e.departureTime, e.departureTz)}
               </span>
               <span className="chip">
                 {CABIN_LABEL[e.cabin] ?? e.cabin}

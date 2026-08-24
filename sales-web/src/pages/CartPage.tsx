@@ -5,6 +5,7 @@ import { Icon, type IconName } from '../components/Icon';
 import { EmptyState } from '../components/EmptyState';
 import { RefundBadge } from '../components/RefundBadge';
 import { TrustBadges } from '../components/TrustBadges';
+import { localYmd } from '../lib/airports';
 
 /** 购物车条目按 kind 映射统一线性图标（取代存储的 emoji 渲染；不改 store 里的 emoji 字段） */
 const CART_KIND_ICON: Record<CartItem['kind'], IconName> = {
@@ -123,7 +124,11 @@ export function CartPage() {
                   {/* 机票: 显示舱等+日期+人数（dateRank 是内部字段，不展示给客户） */}
                   {i.kind === 'FLIGHT' && i.meta && (
                     <div className="mt-1.5 text-xs text-ink-soft">
-                      {String(i.meta?.cabin ?? '') === 'BUSINESS' ? '商务舱' : '经济舱'} · {String(i.meta?.departureTime ?? '').slice(0, 10)} · {Number(i.meta?.passengers) || 0} 人
+                      {String(i.meta?.cabin ?? '') === 'BUSINESS' ? '商务舱' : '经济舱'} ·{' '}
+                      {i.meta?.departureTime
+                        ? localYmd(String(i.meta.departureTime), String(i.meta.departureTz ?? 'Asia/Macau'))
+                        : ''}{' '}
+                      · {Number(i.meta?.passengers) || 0} 人
                     </div>
                   )}
                   <p className="mt-1 text-xs text-ink-muted">

@@ -592,6 +592,8 @@ export async function listSchedulesWithCost(
       origin: s.flight.originCode,
       destination: s.flight.destinationCode,
       departureTime: s.departureTime.toISOString(),
+      // 出发地时区：前端展示起飞时刻要按它折算（裸 UTC 会少 8 小时）
+      departureTz: s.departureTz,
       localDepartureDate: localDate(s.departureTime, s.departureTz),
       // effective
       charterCostCny: eff.charterCostCny,

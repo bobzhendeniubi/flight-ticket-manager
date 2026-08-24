@@ -474,6 +474,8 @@ export interface MySeatLock {
   seatClassId: string;
   flightNumber: string;
   departureTime: string;
+  /** 出发地 IANA 时区——起飞时刻必须按它显示，否则走浏览器时区会差 1 小时（越南 +7） */
+  departureTz: string;
   cabin: CabinClass;
   qty: number;
   expiresAt: string;
@@ -503,6 +505,8 @@ export interface MyWaitlistEntry {
   seatClassId: string;
   flightNumber: string;
   departureTime: string;
+  /** 出发地 IANA 时区——起飞时刻必须按它显示，否则走浏览器时区会差 1 小时（越南 +7） */
+  departureTz: string;
   cabin: CabinClass;
   qty: number;
   status: WaitlistStatus;

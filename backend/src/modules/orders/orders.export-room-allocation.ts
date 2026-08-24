@@ -22,7 +22,8 @@ import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { BadRequestError } from '../../lib/errors.js';
 import { getHotelNightlyRemaining } from '../hotel-control/hotel-control.service.js';
 import { fmtDateDMYDash, pnrName } from './orders.export-templates.js';
-import { earliestFlightDeparture } from './pnr-export.js';
+import { earliestFlightDepartureLocalDate } from './pnr-export.js';
+import { localDateISO } from '../../lib/flight-time.js';
 
 /** 分房口径：退款申请中的订单已释放占房，不进入分房表。*/
 const COUNTED_STATUSES: OrderStatus[] = [
@@ -203,7 +204,7 @@ export type RoomItemForExport = Prisma.OrderItemGetPayload<{
         items: {
           select: {
             kind: true;
-            flightSchedule: { select: { departureTime: true } };
+            flightSchedule: { select: { departureTime: true, departureTz: true } };
           };
         };
       };
@@ -341,7 +342,10 @@ export function buildRoomAllocationSheets(
       new Set(
         order.items
           .filter((x) => x.kind === 'FLIGHT' && x.flightSchedule)
-          .map((x) => fmtDate(x.flightSchedule!.departureTime)),
+          // 出发地当地日（与班次日历 / 出发日筛选同口径）
+          .map((x) =>
+            localDateISO(x.flightSchedule!.departureTime, x.flightSchedule!.departureTz),
+          ),
       ),
     ).sort();
 
@@ -553,7 +557,7 @@ const ROOM_ITEM_INCLUDE = {
       items: {
         select: {
           kind: true,
-          flightSchedule: { select: { departureTime: true } },
+          flightSchedule: { select: { departureTime: true, departureTz: true } },
         },
       },
     },
@@ -590,9 +594,11 @@ async function queryRoomItemsByCheckInRange(
  * 按「出发日」选占房 item（新口径）：先选出该日出发的订单，再导出这些订单的**全部**入住晚
  * （不再按入住日切范围）——一张订单跨几晚就产出几个 sheet 上的行。
  *
- * 「该日出发」判定与 sheet 上「出发(往返)日期」列同口径（都用 UTC 日历日，见 fmtDate）：
- *   - 主口径：订单任一 FLIGHT 行所在班次 departureTime 落在该 UTC 日（[dayStart, 次日) 半开区间；
- *     departureTime 是含时刻的 UTC 时间戳）。
+ * 「该日出发」判定与 sheet 上「出发(往返)日期」列同口径（都用**出发地当地日**）：
+ *   - 主口径：订单任一 FLIGHT 行所在班次的当地出发日 == departDate。
+ *     departureTime 存的是 UTC 时间戳，当地日与 UTC 日最多差一天（澳门 +8 / 越南 +7 的
+ *     当地凌晨班次，UTC 还停在前一天），所以取数窗口按 ±1 天放宽召回，
+ *     再交给 filterRoomItemsByDepartDate 按当地日精确判定 —— 窗口只负责别漏，不负责准。
  *   - 回落：订单**没有任何**挂了班次的 FLIGHT 行（纯酒店/未挂班次的套餐）时，按其占房 item 的
  *     hotelCheckIn == 该日选中（套餐酒店盖章 hotelCheckIn 通常 = 出发日）。这与行映射里
  *     travelDates「有航班用航班日、否则回落入住日」的回落规则一致。
@@ -603,6 +609,10 @@ async function queryRoomItemsByDepartDate(
 ): Promise<RoomItemForExport[]> {
   const dayStart = toDateOnly(departDate);
   const dayEnd = new Date(dayStart.getTime() + 24 * 60 * 60 * 1000);
+  // 航班召回窗口按 ±1 天放宽：当地日 ↔ UTC 日最多差一天，窄窗口会把当地凌晨起飞的
+  // 班次整单漏掉（后面的当地日精筛保证不会多召回错误的单）。
+  const recallStart = new Date(dayStart.getTime() - 24 * 60 * 60 * 1000);
+  const recallEnd = new Date(dayEnd.getTime() + 24 * 60 * 60 * 1000);
   const fetched = (await client.orderItem.findMany({
     where: {
       hotelRoomTypeId: { not: null },
@@ -614,7 +624,7 @@ async function queryRoomItemsByDepartDate(
             items: {
               some: {
                 kind: OrderItemKind.FLIGHT,
-                flightSchedule: { departureTime: { gte: dayStart, lt: dayEnd } },
+                flightSchedule: { departureTime: { gte: recallStart, lt: recallEnd } },
               },
             },
           },
@@ -636,10 +646,11 @@ async function queryRoomItemsByDepartDate(
 /**
  * 出发日精确细筛（0722 房控反馈）：取数 where 的主口径用 `items.some.kind=FLIGHT` 命中**任意**
  * 航段落在该 UTC 日 —— 会把「去程 21 号、回程 22 号」这类整单出发日不在该日的往返单也召回
- * （返程段落在该日）。这里按整单「出发日」= 最早 FLIGHT 行出发日（earliestFlightDeparture，
- * 与 sheet「出发(往返)日期」列同口径，UTC 日历日）二次过滤：
- *   - 含航班的订单：最早航段出发日须 === departDate，否则剔除（去程 21/回程 22 被排除）；
- *   - 无任何 FLIGHT 行的订单（纯酒店/未挂班次套餐）：earliestFlightDeparture 返回 null，
+ * （返程段落在该日），且窗口按 ±1 天放宽后还会多召回相邻日的单。这里按整单「出发日」=
+ * 最早 FLIGHT 行的**出发地当地日**（earliestFlightDepartureLocalDate，与 sheet
+ * 「出发(往返)日期」列同口径）二次过滤：
+ *   - 含航班的订单：最早航段当地出发日须 === departDate，否则剔除（去程 21/回程 22 被排除）；
+ *   - 无任何 FLIGHT 行的订单（纯酒店/未挂班次套餐）：返回 null，
  *     由取数回落分支（hotelCheckIn === 该日）已精确命中，此处一律放行、不动其回落口径。
  * 纯函数（按 item.order.items 判定），导出调用 + 单测复用。
  */
@@ -648,8 +659,8 @@ export function filterRoomItemsByDepartDate(
   departDate: string,
 ): RoomItemForExport[] {
   return items.filter((it) => {
-    const earliest = earliestFlightDeparture(it.order.items);
-    return earliest === null || fmtDate(earliest) === departDate;
+    const earliest = earliestFlightDepartureLocalDate(it.order.items);
+    return earliest === null || earliest === departDate;
   });
 }
 

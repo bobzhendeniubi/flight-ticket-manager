@@ -9,6 +9,7 @@
  * 绝不编造数据 —— 这些列是线下手工台账的占位，等后续字段补齐再填。
  */
 import ExcelJS from 'exceljs';
+import { localDateISO } from '../../lib/flight-time.js';
 import type { Prisma, PrismaClient } from '@prisma/client';
 import { OrderItemKind, OrderStatus } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
@@ -128,6 +129,16 @@ function fmtDate(d: Date | null | undefined): string {
 function fmtDateTime(d: Date | null | undefined): string {
   if (!d) return '';
   return `${fmtDate(d)} ${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
+}
+
+/**
+ * 航段出发日 YYYY-MM-DD，**按出发地当地时区**折算。
+ * 班次 departureTime 存 UTC——当地凌晨起飞的红眼班次 UTC 还停在前一天，
+ * 直接切 UTC 会把名单上的出发日期写早一天。tz 缺失时回退 UTC（口径同改动前）。
+ */
+function fmtDepartDate(d: Date | null | undefined, tz: string | null | undefined): string {
+  if (!d) return '';
+  return tz ? localDateISO(d, tz) : fmtDate(d);
 }
 
 /** YYYY-MM-DD HH:MM:SS（旧《全岗可用》模版录入时间/到账时间含秒）*/
@@ -259,6 +270,7 @@ export function buildOrderContext(order: OrderForTemplateExport): OrderContext {
     .filter((it) => it.kind === 'FLIGHT' && it.flightSchedule)
     .map((it) => ({
       departureTime: it.flightSchedule!.departureTime,
+      departureTz: it.flightSchedule!.departureTz ?? null,
       flightNumber: it.flightSchedule!.flight.flightNumber,
       route: `${it.flightSchedule!.flight.originCode} → ${it.flightSchedule!.flight.destinationCode}`,
       cabin: it.flightCabin,
@@ -268,8 +280,11 @@ export function buildOrderContext(order: OrderForTemplateExport): OrderContext {
     legs.length === 0
       ? ''
       : legs.length === 1
-        ? fmtDate(legs[0].departureTime)
-        : `${fmtDate(legs[0].departureTime)} / ${fmtDate(legs[legs.length - 1].departureTime)}`;
+        ? fmtDepartDate(legs[0].departureTime, legs[0].departureTz)
+        : `${fmtDepartDate(legs[0].departureTime, legs[0].departureTz)} / ${fmtDepartDate(
+            legs[legs.length - 1].departureTime,
+            legs[legs.length - 1].departureTz,
+          )}`;
   const flightNumbers = legs.map((l) => l.flightNumber).join(' ⇌ ');
   const route = Array.from(new Set(legs.map((l) => l.route))).join(' / ');
   const cabinLabels = Array.from(

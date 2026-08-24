@@ -12,6 +12,7 @@
  * 真实生产应由 staff 在 Flights/Hotels/Visa/Transfer 管理页录入。
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { formatLocalTime } from '../lib/airports';
 import {
   api,
   ApiError,
@@ -1526,13 +1527,8 @@ function FlightScheduleCostRow({
         {row.origin} → {row.destination}
       </td>
       <td className="py-2 text-slate-600 text-xs">
-        {new Date(row.departureTime).toLocaleString('zh-CN', {
-          year: 'numeric',
-          month: '2-digit',
-          day: '2-digit',
-          hour: '2-digit',
-          minute: '2-digit',
-        })}
+        {/* 起飞时刻按出发地时区折算（用浏览器时区会让越南航段差 1 小时） */}
+        {row.localDepartureDate} {formatLocalTime(row.departureTime, row.departureTz)}
       </td>
       <td className="py-2 text-right">
         <UsdCostInput

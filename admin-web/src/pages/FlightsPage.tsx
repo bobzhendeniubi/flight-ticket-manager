@@ -1,6 +1,6 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import { api, ApiError, type AdminFlight, type BaggagePolicyInput, type CabinClass, type FareBucket, type FlightBaggagePolicy } from '../lib/api';
-import { AIRPORT_OPTIONS, CABIN_LABEL, airportLabel, formatLocalDate, formatLocalTime, tzLabel } from '../lib/airports';
+import { AIRPORT_OPTIONS, CABIN_LABEL, airportLabel, formatLocalDate, formatLocalTime, localToUtcIso, tzLabel } from '../lib/airports';
 import { useAuth } from '../stores/auth';
 import { useFlightSeats } from '../stores/flightSeats';
 import { NumberInput } from '../components/NumberInput';
@@ -700,7 +700,7 @@ function SchedulesList({
             className="btn-secondary text-sm"
             onClick={() => setShowBulk((v) => !v)}
           >
-            {showBulk ? '收起批量操作' : '⚡ 批量改价 / 仓位阶梯'}
+            {showBulk ? '收起批量操作' : '⚡ 批量改价 / 改时刻 / 仓位阶梯'}
           </button>
         )}
       </div>
@@ -772,7 +772,11 @@ function SchedulesTable({
   // 具体日期筛选（按本地出发日）。非空时优先生效，覆盖"月份"下拉。
   const [dateFilter, setDateFilter] = useState<string>('');
 
-  const months = Array.from(new Set(schedules.map((s) => s.departureTime.slice(0, 7)))).sort();
+  // 月份按**当地出发月**分组：切 UTC 串会把当地月初凌晨/月末深夜的班次归到隔壁月份，
+  // 下拉里选了 8 月却看不到 8/1 那班（或多出一班 7/31）。
+  const months = Array.from(
+    new Set(schedules.map((s) => localYmd(s.departureTime, s.departureTz).slice(0, 7))),
+  ).sort();
   const now = new Date();
   const thirtyDaysLater = new Date(now.getTime() + 30 * 86400000);
 
@@ -784,7 +788,7 @@ function SchedulesTable({
       const d = new Date(s.departureTime);
       return d >= now && d <= thirtyDaysLater;
     }
-    return s.departureTime.startsWith(monthFilter);
+    return localYmd(s.departureTime, s.departureTz).startsWith(monthFilter);
   });
 
   return (
@@ -1422,17 +1426,16 @@ function DaySchedule({
   };
 
   // 将 ISO 字符串转成 datetime-local 输入框的默认值（本地时区，保留到分）。
-  const isoToLocal = (iso: string): string => {
-    if (!iso) return '';
-    const d = new Date(iso);
-    const pad = (n: number) => String(n).padStart(2, '0');
-    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
-  };
+  // ISO(UTC) → datetime-local 值，**按班次自己的起降地时区**折算。
+  // 用浏览器时区（getHours 等）会让越南航段差 1 小时：运营在国内打开一个岘港起飞的班次，
+  // 弹窗预填 +8 的钟点，原样保存就把时刻改错了 1 小时。
+  const isoToLocal = (iso: string, tz: string): string =>
+    `${localYmd(iso, tz)}T${formatLocalTime(iso, tz)}`;
 
   // 打开改时刻弹窗，预填当前值。
   const openTimeEdit = () => {
-    setTimeDep(isoToLocal(schedule.departureTime));
-    setTimeArr(isoToLocal(schedule.arrivalTime));
+    setTimeDep(isoToLocal(schedule.departureTime, schedule.departureTz));
+    setTimeArr(isoToLocal(schedule.arrivalTime, schedule.arrivalTz));
     setTimeErr(null);
     setTimeMsg(null);
     setShowTimeEdit(true);
@@ -1449,9 +1452,16 @@ function DaySchedule({
     setTimeErr(null);
     setTimeMsg(null);
     try {
-      // datetime-local 值形如 "2026-07-01T10:30"，附加系统时区偏移后传给后端。
-      const toIso = (local: string) => new Date(local).toISOString();
-      const body = { departureTime: toIso(timeDep), arrivalTime: toIso(timeArr) };
+      // datetime-local 值形如 "2026-07-01T10:30"，是**当地钟点**——按班次起降地时区折回
+      // UTC 再传后端（不能用 new Date(local) 走浏览器时区，越南航段会差 1 小时）。
+      const toIso = (local: string, tz: string) => {
+        const [day, hhmm] = local.split('T');
+        return localToUtcIso(day, hhmm, tz);
+      };
+      const body = {
+        departureTime: toIso(timeDep, schedule.departureTz),
+        arrivalTime: toIso(timeArr, schedule.arrivalTz),
+      };
       try {
         await api.updateSchedule(tokens.accessToken, schedule.id, body);
       } catch (e) {
@@ -1857,7 +1867,14 @@ function DaySchedule({
 // ── 批量改价 / 批量仓位阶梯（日期范围 + 星期几 + 进度条；镜像 BulkScheduleForm）─
 // 注：批量「售罄/恢复销售」已移除——售罄是余位卖完后自动派生的，从来就没有开关可调。
 // 留下的那个人工开关是「下架/重新上架」(isActive)，是另一件事，按钮保留在 DaySchedule。
-type BulkAction = 'setPrice' | 'addAmount' | 'addPercent' | 'setLadder' | 'clearLadder' | 'setCapacity';
+type BulkAction =
+  | 'setPrice'
+  | 'addAmount'
+  | 'addPercent'
+  | 'setLadder'
+  | 'clearLadder'
+  | 'setCapacity'
+  | 'setTimes';
 type BulkCabinPick = 'ECONOMY' | 'BUSINESS' | 'ALL';
 
 function BulkEditPanel({
@@ -1891,6 +1908,11 @@ function BulkEditPanel({
   // 批量改容量：经济/商务各一个目标值，留空 = 不改该舱位（走专用批量接口，非逐班次循环）
   const [capEcon, setCapEcon] = useState<number | null>(null);
   const [capBiz, setCapBiz] = useState<number | null>(null);
+  // 批量改时刻：填**当地钟点** HH:mm（航司改点公告上写的就是当地时间）。
+  // 各班次按自己的时区折回 UTC，当地出发日不变；到达跨零点时勾「到达次日」。
+  const [bulkDepTime, setBulkDepTime] = useState('');
+  const [bulkArrTime, setBulkArrTime] = useState('');
+  const [bulkArrNextDay, setBulkArrNextDay] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [progress, setProgress] = useState({ done: 0, total: 0, errors: 0, skipped: 0 });
   const [result, setResult] = useState<string | null>(null);
@@ -1899,6 +1921,7 @@ function BulkEditPanel({
   const isPriceAction = action === 'setPrice' || action === 'addAmount' || action === 'addPercent';
   const isLadderAction = action === 'setLadder' || action === 'clearLadder';
   const isCapacityAction = action === 'setCapacity';
+  const isTimeAction = action === 'setTimes';
 
   // 命中的班次：本地出发日 ∈ [start,end] 且 星期几被选中
   const matched = useMemo(() => {
@@ -1975,6 +1998,10 @@ function BulkEditPanel({
     if (action === 'addAmount') return `${cab} 价上调 ¥${amount ?? 0}`;
     if (action === 'addPercent') return `${cab} 价上调 ${amount ?? 0}%`;
     if (action === 'setLadder') return `把 ${ladderCab} 设为 ${ladderDraft.length} 档仓位阶梯`;
+    if (action === 'setTimes') {
+      if (!bulkDepTime || !bulkArrTime) return '改时刻（尚未填时刻）';
+      return `改时刻：当地 ${bulkDepTime} 起飞 → ${bulkArrTime}${bulkArrNextDay ? '（次日）' : ''} 到达`;
+    }
     if (action === 'setCapacity') {
       const parts: string[] = [];
       if (capEcon != null) parts.push(`经济舱→${capEcon}`);
@@ -2003,6 +2030,16 @@ function BulkEditPanel({
     if (action === 'setCapacity' && capEcon == null && capBiz == null) {
       setErrMsg('请至少填一个舱位的目标容量');
       return;
+    }
+    if (action === 'setTimes') {
+      if (!bulkDepTime || !bulkArrTime) {
+        setErrMsg('请填出发和到达时刻（当地时间）');
+        return;
+      }
+      if (!bulkArrNextDay && bulkArrTime <= bulkDepTime) {
+        setErrMsg('到达时刻不晚于出发时刻——跨零点到达请勾选「到达次日」');
+        return;
+      }
     }
     // 改价撞上阶梯班次：先把"有多少个改不动"摆到运营面前，再让他决定要不要对其余的执行。
     if (isPriceAction && priceSplit.ladder.length > 0) {
@@ -2036,6 +2073,68 @@ function BulkEditPanel({
     setResult(null);
     setSubmitting(true);
     setProgress({ done: 0, total: matched.length, errors: 0, skipped: 0 });
+
+    // ── 改时刻：走专用批量接口（服务端一次事务处理）。运营填的是当地钟点，
+    //    后端按每个班次自己的时区折回 UTC，当地出发日不变。
+    //    批次里有已售班次 → 后端先 400 回报影响面，运营确认后带确认标志重试
+    //    （与单班次「改时刻」同一道闸，不能一改了之）。
+    if (action === 'setTimes') {
+      const timeBody = {
+        scheduleIds: matched.map((s) => s.id),
+        departureLocalTime: bulkDepTime,
+        arrivalLocalTime: bulkArrTime,
+        arrivalNextDay: bulkArrNextDay,
+      };
+      const runTimes = async (confirmSold: boolean) =>
+        api.batchUpdateScheduleTimes(tokens.accessToken, {
+          ...timeBody,
+          ...(confirmSold ? { confirmSoldTimeChange: true } : {}),
+        });
+      try {
+        let timeResult;
+        try {
+          ({ result: timeResult } = await runTimes(false));
+        } catch (e2) {
+          // 已售闸：报文里带着影响面（几个班次、共几座）——原样摆给运营，确认后才重试
+          if (e2 instanceof ApiError && e2.message.includes('已售')) {
+            if (!confirm(`${e2.message}\n\n确认仍要批量改时刻？`)) {
+              setSubmitting(false);
+              return;
+            }
+            ({ result: timeResult } = await runTimes(true));
+          } else {
+            throw e2;
+          }
+        }
+        setProgress({
+          done: timeResult.applied,
+          total: matched.length,
+          errors: 0,
+          skipped: timeResult.skipped.length,
+        });
+        const preview = timeResult.skipped.slice(0, 3).map((x) => x.reason);
+        setResult(
+          `✅ 完成：改了 ${timeResult.applied} 个${
+            timeResult.skipped.length > 0
+              ? ` · 跳过 ${timeResult.skipped.length} 个（${preview.join('；')}${
+                  timeResult.skipped.length > preview.length ? ' 等' : ''
+                }）`
+              : ''
+          }${
+            timeResult.soldSchedules > 0
+              ? ` · 其中 ${timeResult.soldSchedules} 个已售共 ${timeResult.soldSeats} 座：` +
+                '请通知客人、复核护照/签证有效期、核对酒店入住日、重新导出航司名单'
+              : ''
+          }`,
+        );
+      } catch (e2) {
+        setErrMsg(e2 instanceof ApiError ? e2.message : '批量改时刻失败');
+      } finally {
+        setSubmitting(false);
+      }
+      await onDone();
+      return;
+    }
 
     // ── 改容量：走专用批量接口（服务端一次事务处理），不是逐班次循环调用。
     //    目标容量低于已售的班次照改并回报 oversold 明细（航司减配 / 换机型），
@@ -2134,7 +2233,7 @@ function BulkEditPanel({
           ×
         </button>
       </div>
-      <p className="text-xs text-slate-500 mt-0.5">按日期范围 + 星期几，批量改价 / 设置或清除仓位阶梯</p>
+      <p className="text-xs text-slate-500 mt-0.5">按日期范围 + 星期几，批量改价 / 改时刻 / 改容量 / 设置或清除仓位阶梯</p>
 
       <form className="mt-4 grid gap-3 md:grid-cols-4" onSubmit={onSubmit}>
         <div>
@@ -2170,6 +2269,7 @@ function BulkEditPanel({
             <option value="setLadder">设置仓位阶梯</option>
             <option value="clearLadder">清除仓位阶梯</option>
             <option value="setCapacity">批量改容量</option>
+            <option value="setTimes">批量改时刻（航司改点）</option>
           </select>
         </div>
         {isPriceAction && (
@@ -2198,6 +2298,45 @@ function BulkEditPanel({
               <option value="BUSINESS">商务舱</option>
             </select>
           </div>
+        )}
+        {isTimeAction && (
+          <>
+            <div>
+              <label className="label">出发时刻（当地）</label>
+              <input
+                type="time"
+                className="input"
+                value={bulkDepTime}
+                onChange={(e) => setBulkDepTime(e.target.value)}
+              />
+            </div>
+            <div>
+              <label className="label">到达时刻（当地）</label>
+              <input
+                type="time"
+                className="input"
+                value={bulkArrTime}
+                onChange={(e) => setBulkArrTime(e.target.value)}
+              />
+            </div>
+            <div className="flex items-end">
+              <label className="flex cursor-pointer items-center gap-2 pb-2 text-sm text-ink-soft">
+                <input
+                  type="checkbox"
+                  checked={bulkArrNextDay}
+                  onChange={(e) => setBulkArrNextDay(e.target.checked)}
+                />
+                到达次日（跨零点）
+              </label>
+            </div>
+            <div className="md:col-span-4 text-[11px] leading-relaxed text-ink-muted">
+              填的是<b>当地时间</b>（航司改点公告上的时刻），每个班次按自己起降地的时区折算入库，
+              各班次的出发日期不变、只换钟点。跨时区航段（澳门 +8 / 岘港 +7）出发按出发地、到达按到达地各折各的。
+              <br />
+              命中班次里若有<b>已售</b>的，会先弹出影响面让你确认——改点会波及存量订单的客人通知、
+              签证时点、酒店入住日和已提交航司的名单。
+            </div>
+          </>
         )}
         {isCapacityAction && (
           <>

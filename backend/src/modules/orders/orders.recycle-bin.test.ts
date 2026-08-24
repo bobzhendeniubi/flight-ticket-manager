@@ -114,9 +114,13 @@ describe('listDeletedOrders · 口径与映射', () => {
     expect(findArg.orderBy).toEqual({ deletedAt: 'desc' });
     // select 只取乘客姓名字段（不整对象）
     expect(findArg.select.passengers).toEqual({ select: { fullName: true, chineseName: true } });
-    // select 联查派生「出发日期」列所需的最小字段（班次出发时间 + 酒店入住日）
+    // select 联查派生「出发日期」列所需的最小字段（班次出发时间 + 出发地时区 + 酒店入住日）。
+    // departureTz 不可省：出发日要按出发地当地日折算，按 UTC 会把当地凌晨起飞的班次写早一天。
     expect(findArg.select.items).toEqual({
-      select: { hotelCheckIn: true, flightSchedule: { select: { departureTime: true } } },
+      select: {
+        hotelCheckIn: true,
+        flightSchedule: { select: { departureTime: true, departureTz: true } },
+      },
     });
     // 审计按目标订单 + 动作查
     const auditArg = mockPrisma.auditLog.findMany.mock.calls[0][0];
