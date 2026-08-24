@@ -83,43 +83,70 @@ export class TravelerBenefitsService {
    * 核销：扣减可用次数，写一条正数流水。
    *
    * tripCount 以订单为真值 —— 先走详情实时重算（顺带把快照回写成最新值），
-   * 再在事务内复核「已核销合计」并插入；Serializable 隔离让并发双扣被数据库判死
-   * （两个并发事务读到同一个 sum 各插一条 ⇒ 后提交的那个序列化冲突回滚）。
+   * 事务内再从 TravelerProfile 重读一次 tripCount 快照并复核「已核销合计」后插入。
+   * Serializable 隔离的保护范围：并发双扣（两个事务读到同一个 sum 各插一条 ⇒ 后提交的
+   * 序列化冲突回滚），以及事务内读到的 tripCount 快照与流水的一致性。它防不住的是
+   * 「订单侧变化尚未触发快照重算」——那属于 tripCount 快照机制本身的时效性，
+   * 允许 availableTrips 为负、如实展示，正是给这类回落兜底的既定口径。
+   *
+   * 序列化冲突（P2034）是本设计**预期会发生**的分支：先自动重试一次（绝大多数并发
+   * 都能在重试后正确判定），仍冲突则抛 409 给前端可读提示，绝不落进裸 500。
    *
    * 传指针行 id（被合并的旧档案）会解析到主档案，流水永远挂在主档案上。
    */
   async redeem(profileId: string, body: CreateRedemptionBody, actor: RedemptionActor) {
     const detail = await this.profiles.getDetail(profileId);
     const masterId = detail.profile.id;
-    const liveTripCount = detail.profile.tripCount;
     const createdByName = await resolveActorName(actor.userId);
 
-    const created = await prisma.$transaction(
-      async (tx) => {
-        const agg = await tx.travelerBenefitRedemption.aggregate({
-          where: { profileId: masterId },
-          _sum: { tripsUsed: true },
-        });
-        const redeemedTrips = agg._sum.tripsUsed ?? 0;
-        const availableTrips = liveTripCount - redeemedTrips;
-        if (body.tripsUsed > availableTrips) {
-          throw new BadRequestError(
-            `可核销次数不足：已飞 ${liveTripCount} 次，已核销 ${redeemedTrips} 次，当前可用 ${availableTrips} 次`,
-          );
-        }
-        return tx.travelerBenefitRedemption.create({
-          data: {
-            profileId: masterId,
-            tripsUsed: body.tripsUsed,
-            benefit: body.benefit,
-            note: body.note ?? null,
-            createdById: actor.userId,
-            createdByName,
-          },
-        });
-      },
-      { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
-    );
+    const runOnce = () =>
+      prisma.$transaction(
+        async (tx) => {
+          // 事务内重读快照：getDetail 已把最新重算值回写，这里读回的就是它；
+          // 事务外捕获的旧值不再参与判定，杜绝「重算与事务开始之间」的快照漂移窗口。
+          const profileRow = await tx.travelerProfile.findUnique({
+            where: { id: masterId },
+            select: { tripCount: true },
+          });
+          if (!profileRow) throw new NotFoundError('常旅客档案不存在');
+          const liveTripCount = profileRow.tripCount;
+          const agg = await tx.travelerBenefitRedemption.aggregate({
+            where: { profileId: masterId },
+            _sum: { tripsUsed: true },
+          });
+          const redeemedTrips = agg._sum.tripsUsed ?? 0;
+          const availableTrips = liveTripCount - redeemedTrips;
+          if (body.tripsUsed > availableTrips) {
+            throw new BadRequestError(
+              `可核销次数不足：已飞 ${liveTripCount} 次，已核销 ${redeemedTrips} 次，当前可用 ${availableTrips} 次`,
+            );
+          }
+          return tx.travelerBenefitRedemption.create({
+            data: {
+              profileId: masterId,
+              tripsUsed: body.tripsUsed,
+              benefit: body.benefit,
+              note: body.note ?? null,
+              createdById: actor.userId,
+              createdByName,
+            },
+          });
+        },
+        { isolationLevel: Prisma.TransactionIsolationLevel.Serializable },
+      );
+
+    let created;
+    try {
+      created = await runOnce();
+    } catch (err) {
+      if (!isSerializationConflict(err)) throw err;
+      try {
+        created = await runOnce();
+      } catch (retryErr) {
+        if (!isSerializationConflict(retryErr)) throw retryErr;
+        throw new ConflictError('有同事正在同时核销该档案，请刷新后重试');
+      }
+    }
 
     return {
       profileId: masterId,
@@ -180,6 +207,11 @@ export class TravelerBenefitsService {
       throw err;
     }
   }
+}
+
+/** Serializable 事务的写冲突（Prisma P2034）：并发核销互相判死时数据库抛出的预期错误。 */
+function isSerializationConflict(err: unknown): boolean {
+  return err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2034';
 }
 
 /** 操作人姓名快照：displayName → email → 兜底角色词（账号后续改名/停用不影响台账可读性） */

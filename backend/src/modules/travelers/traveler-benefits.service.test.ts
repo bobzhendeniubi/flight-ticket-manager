@@ -19,6 +19,7 @@ const prismaMock = vi.hoisted(() => {
       findMany: vi.fn(),
       groupBy: vi.fn(),
     },
+    travelerProfile: { findUnique: vi.fn() },
     user: { findUnique: vi.fn() },
     // $transaction(fn) 直接以同一个 mock 作为 tx 执行回调（隔离级别参数在这里无意义）
     $transaction: vi.fn(async (fn: (tx: unknown) => unknown) => fn(mock)),
@@ -54,6 +55,9 @@ function redemptionRow(over: { id: string } & Partial<Record<string, unknown>>) 
 /** 只桩出 benefits service 真正用到的两个方法：getDetail（实时重算取 tripCount）与 resolveMaster */
 function fakeProfiles(over?: { tripCount?: number; masterId?: string }) {
   const id = over?.masterId ?? 'p1';
+  // 真实流程里 getDetail 会把重算后的 tripCount 回写快照列，事务内重读读到的就是同一个值，
+  // 这里同步桩出 travelerProfile.findUnique 保持两处一致。
+  prismaMock.travelerProfile.findUnique.mockResolvedValue({ tripCount: over?.tripCount ?? 5 });
   return {
     getDetail: vi.fn(async () => ({
       profile: { id, fullName: 'ZHANG SAN', tripCount: over?.tripCount ?? 5 },
@@ -143,6 +147,73 @@ describe('核销：不得透支可用次数', () => {
     expect(prismaMock.travelerBenefitRedemption.create).toHaveBeenCalledWith(
       expect.objectContaining({ data: expect.objectContaining({ profileId: 'master-1' }) }),
     );
+  });
+
+  it('可用次数判定用事务内重读的 tripCount，不用事务外的旧快照', async () => {
+    const svc = new TravelerBenefitsService(fakeProfiles({ tripCount: 5 }));
+    // 模拟快照漂移：事务开始时 tripCount 已从 5 掉到 2（如退单触发重算）
+    prismaMock.travelerProfile.findUnique.mockResolvedValue({ tripCount: 2 });
+    prismaMock.travelerBenefitRedemption.aggregate.mockResolvedValue({ _sum: { tripsUsed: 0 } });
+
+    await expect(svc.redeem('p1', { tripsUsed: 3, benefit: '航司权益兑换' }, ACTOR)).rejects.toThrow(
+      /可核销次数不足/,
+    );
+    expect(prismaMock.travelerBenefitRedemption.create).not.toHaveBeenCalled();
+  });
+
+  it('档案在事务开始前被删除 → 404 而非 TypeError', async () => {
+    const svc = new TravelerBenefitsService(fakeProfiles({ tripCount: 5 }));
+    prismaMock.travelerProfile.findUnique.mockResolvedValue(null);
+
+    await expect(svc.redeem('p1', { tripsUsed: 1, benefit: '航司权益兑换' }, ACTOR)).rejects.toThrow(
+      /常旅客档案不存在/,
+    );
+  });
+});
+
+describe('核销：并发序列化冲突（P2034）的处理', () => {
+  function p2034() {
+    return new Prisma.PrismaClientKnownRequestError('serialization conflict', {
+      code: 'P2034',
+      clientVersion: 'test',
+    });
+  }
+
+  it('首次 P2034 自动重试一次，重试成功则对调用方透明', async () => {
+    const svc = new TravelerBenefitsService(fakeProfiles({ tripCount: 5 }));
+    prismaMock.travelerBenefitRedemption.aggregate.mockResolvedValue({ _sum: { tripsUsed: 0 } });
+    prismaMock.travelerBenefitRedemption.create.mockResolvedValue(redemptionRow({ id: 'r1' }));
+    prismaMock.$transaction
+      .mockRejectedValueOnce(p2034())
+      .mockImplementationOnce(async (fn: (tx: unknown) => unknown) => fn(prismaMock));
+
+    const res = await svc.redeem('p1', { tripsUsed: 1, benefit: '航司权益兑换' }, ACTOR);
+
+    expect(res.redemption.id).toBe('r1');
+    expect(prismaMock.$transaction).toHaveBeenCalledTimes(2);
+  });
+
+  it('重试仍 P2034 → 409 友好提示，不再是裸 500', async () => {
+    const svc = new TravelerBenefitsService(fakeProfiles({ tripCount: 5 }));
+    prismaMock.$transaction.mockRejectedValue(p2034());
+
+    await expect(
+      svc.redeem('p1', { tripsUsed: 1, benefit: '航司权益兑换' }, ACTOR),
+    ).rejects.toMatchObject({
+      statusCode: 409,
+      message: expect.stringContaining('正在同时核销'),
+    });
+    expect(prismaMock.$transaction).toHaveBeenCalledTimes(2);
+  });
+
+  it('非 P2034 的异常原样上抛，不吞错也不重试', async () => {
+    const svc = new TravelerBenefitsService(fakeProfiles({ tripCount: 5 }));
+    prismaMock.$transaction.mockRejectedValue(new Error('db down'));
+
+    await expect(
+      svc.redeem('p1', { tripsUsed: 1, benefit: '航司权益兑换' }, ACTOR),
+    ).rejects.toThrow('db down');
+    expect(prismaMock.$transaction).toHaveBeenCalledTimes(1);
   });
 });
 
