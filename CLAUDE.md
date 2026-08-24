@@ -32,9 +32,19 @@
 
 - **前端真值闸 = `npm run build`**（sales-web 根 tsconfig `files:[]`，裸 `tsc --noEmit` 是**假绿**）。
 - 后端：`npm run build` + `npm test`。
-- **只有一台服务器 `47.83.249.163`，它就是同事日常在用的环境**（`admin/store/api.citurtravel.com`，`NODE_ENV=production`）。
-  历史上文档里管它叫 "staging"，但没有第二套环境——推上去同事立刻就看得到，按生产对待。
-- 主干是 `main`，服务器也跟 `main` 跑（2026-08-23 前整个项目活在 feature 分支上，已快进合回）。
-- 部署：`ssh -i ~/.ssh/ftm_staging root@47.83.249.163` → `cd /opt/ftm && git pull && docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build <svc>`（backend 启动自动 `prisma migrate deploy`）。**部署需用户逐次明确批准（"部署"）。**
-  - `docker compose` 任何子命令（含 `ps`）都要带 `--env-file .env.prod`，否则报 `PAYMENT_MODE is missing`。
-  - `.env.prod` 只在服务器上、未进版本库，切分支/拉代码都不会动它。
+- **一台服务器 `47.83.249.163` 跑两套环境**（2026-08-24 拆分，详见 `infra/README-environments.md`）：
+
+  | | 实测（同事日常在用） | 测试（随便折腾） |
+  |---|---|---|
+  | 目录 / 分支 | `/opt/ftm` · `main` | `/opt/ftm-staging` · 任意分支 |
+  | 域名 | `admin/store/api.citurtravel.com` | `test-admin/test-store/test-api.citurtravel.com` |
+  | 发版 | `/opt/ftm/infra/deploy.sh prod` | `/opt/ftm-staging/infra/deploy.sh staging` |
+
+- **实测环境推上去同事立刻就看得到**，按生产对待；要试什么先上测试环境。
+- 主干是 `main`（2026-08-23 前整个项目活在 feature 分支上，已快进合回）。
+- SSH：`ssh -i ~/.ssh/ftm_staging root@47.83.249.163`（key 名叫 staging 是历史遗留，那台是实测机）。
+- **部署需用户逐次明确批准（"部署"）。**
+- 拷实测数据到测试：`bash /opt/ftm/infra/refresh-staging-db.sh`（单向，对实测只读）。
+- `docker compose` 任何子命令都要带 `--env-file` 和各自的 `-p`（`ftm` / `ftm-staging`），
+  否则报 `PAYMENT_MODE is missing`，或者项目名串了导致两套数据卷混用。
+- `.env.prod` / `.env.staging` 只在服务器上、未进版本库，切分支/拉代码都不会动它们。
