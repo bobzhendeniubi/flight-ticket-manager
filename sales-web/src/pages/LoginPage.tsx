@@ -133,15 +133,19 @@ export function LoginPage() {
             还没有账号？请联系您的销售代理为您开通。
           </p>
 
-          <div className="mt-8 rounded-2xl border border-slate-200/70 bg-canvas p-4 text-xs text-ink-soft">
-            <p className="font-semibold text-ink-soft">
-              演示账号 · 密码均为 <code className="rounded bg-white px-1 py-0.5 text-brand-700">Password123!</code>
-            </p>
-            <div className="mt-2 grid grid-cols-1 gap-1 font-mono text-[11px]">
-              <span>customer@ftm.local · 客户</span>
-              <span>agent1@ftm.local · 一级代理</span>
+          {/* 演示账号提示：**只在本地 dev 出现**（理由同后台登录页）。
+              前台是面向真实客人的，公网上印演示账号密码等于开门。 */}
+          {import.meta.env.DEV && (
+            <div className="mt-8 rounded-2xl border border-slate-200/70 bg-canvas p-4 text-xs text-ink-soft">
+              <p className="font-semibold text-ink-soft">
+                演示账号 · 密码均为 <code className="rounded bg-white px-1 py-0.5 text-brand-700">Password123!</code>
+              </p>
+              <div className="mt-2 grid grid-cols-1 gap-1 font-mono text-[11px]">
+                <span>customer@ftm.local · 客户</span>
+                <span>agent1@ftm.local · 一级代理</span>
+              </div>
             </div>
-          </div>
+          )}
         </div>
       </main>
     </div>

@@ -86,18 +86,33 @@ export function LoginPage() {
             </button>
           </form>
 
-          <div className="mt-5 rounded-lg border border-slate-100 bg-canvas p-3 text-xs text-ink-soft">
-            <p className="font-medium text-ink-soft">
-              开发账号 · 密码 <code className="rounded bg-white px-1 py-0.5 text-brand-700">Password123!</code>
-            </p>
-            <p className="mt-1.5 font-mono text-[11px]">admin@ftm.local · 运营全权限</p>
-            <p className="mt-1 font-mono text-[11px]">agent1@ftm.local · 代理端（只看自己树）</p>
-          </div>
+          {/* 开发账号提示：**只在本地 dev 出现**。
+              这块曾经无条件渲染，等于把运营全权限账号的邮箱和密码印在公网登录页上，
+              任何人打开后台首页就能抄走。import.meta.env.DEV 在 vite build 产物里是
+              false，整块会被 tree-shake 掉，生产构建里连字符串都不存在。 */}
+          {import.meta.env.DEV && (
+            <div className="mt-5 rounded-lg border border-slate-100 bg-canvas p-3 text-xs text-ink-soft">
+              <p className="font-medium text-ink-soft">
+                开发账号 · 密码 <code className="rounded bg-white px-1 py-0.5 text-brand-700">Password123!</code>
+              </p>
+              <p className="mt-1.5 font-mono text-[11px]">admin@ftm.local · 运营全权限</p>
+              <p className="mt-1 font-mono text-[11px]">agent1@ftm.local · 代理端（只看自己树）</p>
+            </div>
+          )}
         </div>
 
+        {/* 前台入口：写死 localhost 在生产上是个死链。用相对于当前域名的前台地址——
+            admin.xxx → store.xxx，测试环境 test-admin.xxx → test-store.xxx 也自动对。 */}
         <p className="mt-4 text-center text-xs text-ink-muted">
           客户购买请前往{' '}
-          <a href="http://localhost:5173" className="font-medium text-brand hover:underline">
+          <a
+            href={
+              import.meta.env.DEV
+                ? 'http://localhost:5173'
+                : window.location.origin.replace('admin', 'store')
+            }
+            className="font-medium text-brand hover:underline"
+          >
             前台商城
           </a>
         </p>
