@@ -7,12 +7,13 @@
  *   3. 座位释放（订单取消/超时、锁位过期）时 notification worker 检查
  *      最早的 ACTIVE 候补，余量够则 CAS 标 NOTIFIED（短信通知后续接入）
  *
- * 可用量口径与锁位一致：capacity - sold - SUM(ACTIVE 且未过期锁位 qty)。
+ * 可用量口径：capacity - sold - SUM(ACTIVE 且未过期锁位 qty) - 占位余座。
  */
 import { SeatLockStatus, UserRole, WaitlistStatus } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { BadRequestError, ConflictError, ForbiddenError, NotFoundError } from '../../lib/errors.js';
 import type { CreateWaitlistBody } from './waitlist.schemas.js';
+import { heldSeatsForSeatClass } from '../hold-orders/held-seats.js';
 
 export interface WaitlistRequester {
   userId: string;
@@ -52,7 +53,8 @@ export class WaitlistService {
         expiresAt: { gt: now },
       },
     });
-    const available = seatClass.capacity - seatClass.sold - (locked._sum.qty ?? 0);
+    const held = await heldSeatsForSeatClass(prisma, body.seatClassId);
+    const available = seatClass.capacity - seatClass.sold - (locked._sum.qty ?? 0) - held;
     if (available >= body.qty) {
       throw new BadRequestError('该舱位当前余票充足，可直接下单，无需候补');
     }

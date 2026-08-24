@@ -29,6 +29,7 @@ const { mockPrisma, mockGetHotelNightlyRemaining } = vi.hoisted(() => ({
     hotelRoomType: { findMany: vi.fn() },
     flightSeatClass: { updateMany: vi.fn(), findFirst: vi.fn() },
     seatLock: { aggregate: vi.fn() },
+    holdOrder: { aggregate: vi.fn() },
     // count：落 REFUNDED 前的账目完整性闸——必须先有 Refund（REQUESTED/COMPLETED），
     // 否则实收会永久卡死在单上（三道资金闸对 REFUNDED 全是黑名单）。
     refund: { aggregate: vi.fn(), count: vi.fn(), findMany: vi.fn(), updateMany: vi.fn() },
@@ -123,6 +124,9 @@ describe('OrderService._updateStatusWithinTx · 非占座 → 占座 重新占�
     vi.resetAllMocks();
     // 默认：无 SUCCEEDED Payment（转 PAID 不抬 paidAmount）+ 履约任务终态化 no-op（用例可覆写）
     mockPrisma.payment.aggregate.mockResolvedValue({ _sum: { amount: null } });
+    mockPrisma.holdOrder.aggregate.mockResolvedValue({
+      _sum: { seats: null, seatsConverted: null, seatsCancelled: null },
+    });
     mockPrisma.fulfillmentTask.updateMany.mockResolvedValue({ count: 0 });
     // 转 PAID 分支 FOR UPDATE 读 paidAmount：mock 返回 [] → 回退到 findUnique 的 order.paidAmount。
     mockPrisma.$queryRaw.mockResolvedValue([]);
@@ -184,8 +188,11 @@ describe('OrderService._updateStatusWithinTx · 非占座 → 占座 重新占�
     mockPrisma.order.updateMany.mockResolvedValueOnce({ count: 1 });
     mockPrisma.orderStatusEvent.create.mockResolvedValueOnce({});
     mockPrisma.seatLock.aggregate.mockResolvedValueOnce({ _sum: { qty: null } });
+    mockPrisma.holdOrder.aggregate.mockResolvedValueOnce({
+      _sum: { seats: 10, seatsConverted: 0, seatsCancelled: 0 },
+    });
     mockPrisma.$executeRaw.mockResolvedValueOnce(0); // CAS 未命中：余位不足
-    mockPrisma.flightSeatClass.findFirst.mockResolvedValueOnce({ capacity: 2, sold: 2 }); // 已售罄
+    mockPrisma.flightSeatClass.findFirst.mockResolvedValueOnce({ capacity: 10, sold: 0 });
 
     let caught: unknown;
     try {
@@ -206,6 +213,7 @@ describe('OrderService._updateStatusWithinTx · 非占座 → 占座 重新占�
     expect(caught).toBeInstanceOf(BadRequestError);
     expect((caught as Error).message).toMatch(/恢复为持有座位状态需重新占座/);
     expect((caught as Error).message).toMatch(/无法转换/);
+    expect((caught as Error).message).toMatch(/仅剩 0 张/);
 
     // 失败必须在拿到"转换后"的最终订单之前中止 —— 函数提前 throw，调用方的 $transaction 才能整体回滚
     // （真实 DB 下单状态 CAS/事件写入会跟着回滚；此处单测职责只到"函数正确抛错"，真实回滚见 live 回归）。
@@ -256,6 +264,9 @@ describe('OrderService._updateStatusWithinTx · 既有释放/占座路径不受�
     vi.resetAllMocks();
     // 默认：无 SUCCEEDED Payment（转 PAID 不抬 paidAmount）+ 履约任务终态化 no-op（用例可覆写）
     mockPrisma.payment.aggregate.mockResolvedValue({ _sum: { amount: null } });
+    mockPrisma.holdOrder.aggregate.mockResolvedValue({
+      _sum: { seats: null, seatsConverted: null, seatsCancelled: null },
+    });
     mockPrisma.fulfillmentTask.updateMany.mockResolvedValue({ count: 0 });
     // 转 PAID 分支 FOR UPDATE 读 paidAmount：mock 返回 [] → 回退到 findUnique 的 order.paidAmount。
     mockPrisma.$queryRaw.mockResolvedValue([]);
@@ -355,6 +366,9 @@ describe('OrderService._updateStatusWithinTx · 退款申请即时释放与驳�
   beforeEach(() => {
     vi.resetAllMocks();
     mockPrisma.payment.aggregate.mockResolvedValue({ _sum: { amount: null } });
+    mockPrisma.holdOrder.aggregate.mockResolvedValue({
+      _sum: { seats: null, seatsConverted: null, seatsCancelled: null },
+    });
     mockPrisma.fulfillmentTask.updateMany.mockResolvedValue({ count: 0 });
     mockPrisma.payment.updateMany.mockResolvedValue({ count: 0 });
     mockPrisma.$queryRaw.mockResolvedValue([]);
@@ -578,6 +592,9 @@ describe('OrderService._updateStatusWithinTx · Bug 1：DRAFT 座位账死区闭
     vi.resetAllMocks();
     // 默认：无 SUCCEEDED Payment（转 PAID 不抬 paidAmount）+ 履约任务终态化 no-op（用例可覆写）
     mockPrisma.payment.aggregate.mockResolvedValue({ _sum: { amount: null } });
+    mockPrisma.holdOrder.aggregate.mockResolvedValue({
+      _sum: { seats: null, seatsConverted: null, seatsCancelled: null },
+    });
     mockPrisma.fulfillmentTask.updateMany.mockResolvedValue({ count: 0 });
     // 转 PAID 分支 FOR UPDATE 读 paidAmount：mock 返回 [] → 回退到 findUnique 的 order.paidAmount。
     mockPrisma.$queryRaw.mockResolvedValue([]);
@@ -729,7 +746,10 @@ describe('OrderService._updateStatusWithinTx · Bug 6：佣金创建幂等', () 
   beforeEach(() => {
     vi.resetAllMocks();
     // 默认：无 SUCCEEDED Payment（转 PAID 不抬 paidAmount）+ 履约任务终态化 no-op（用例可覆写）
-    mockPrisma.payment.aggregate.mockResolvedValue({ _sum: { amount: null } });
+  mockPrisma.payment.aggregate.mockResolvedValue({ _sum: { amount: null } });
+  mockPrisma.holdOrder.aggregate.mockResolvedValue({
+    _sum: { seats: null, seatsConverted: null, seatsCancelled: null },
+  });
     mockPrisma.fulfillmentTask.updateMany.mockResolvedValue({ count: 0 });
     // 转 PAID 分支 FOR UPDATE 读 paidAmount：mock 返回 [] → 回退到 findUnique 的 order.paidAmount。
     mockPrisma.$queryRaw.mockResolvedValue([]);
@@ -843,7 +863,10 @@ describe('OrderService._updateStatusWithinTx · P0-3：转 PAID 按真实到账�
   const service = new OrderService();
   beforeEach(() => {
     vi.resetAllMocks();
-    mockPrisma.payment.aggregate.mockResolvedValue({ _sum: { amount: null } });
+  mockPrisma.payment.aggregate.mockResolvedValue({ _sum: { amount: null } });
+  mockPrisma.holdOrder.aggregate.mockResolvedValue({
+    _sum: { seats: null, seatsConverted: null, seatsCancelled: null },
+  });
     mockPrisma.fulfillmentTask.updateMany.mockResolvedValue({ count: 0 });
     // 转 PAID 分支 FOR UPDATE 读 paidAmount：mock 返回 [] → 回退到 findUnique 的 order.paidAmount。
     mockPrisma.$queryRaw.mockResolvedValue([]);
@@ -916,7 +939,10 @@ describe('OrderService._updateStatusWithinTx · 退款回退 / 任务终态化 /
   const service = new OrderService();
   beforeEach(() => {
     vi.resetAllMocks();
-    mockPrisma.payment.aggregate.mockResolvedValue({ _sum: { amount: null } });
+  mockPrisma.payment.aggregate.mockResolvedValue({ _sum: { amount: null } });
+  mockPrisma.holdOrder.aggregate.mockResolvedValue({
+    _sum: { seats: null, seatsConverted: null, seatsCancelled: null },
+  });
     mockPrisma.fulfillmentTask.updateMany.mockResolvedValue({ count: 0 });
     // 转 PAID 分支 FOR UPDATE 读 paidAmount：mock 返回 [] → 回退到 findUnique 的 order.paidAmount。
     mockPrisma.$queryRaw.mockResolvedValue([]);

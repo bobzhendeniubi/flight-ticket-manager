@@ -7,6 +7,7 @@ import { OrdersPage } from './pages/OrdersPage';
 import { FlightsPage } from './pages/FlightsPage';
 import { SeatStatsPage } from './pages/SeatStatsPage';
 import { SeatAllocationPage } from './pages/SeatAllocationPage';
+import { HoldOrdersPage } from './pages/HoldOrdersPage';
 import { ProductsPage } from './pages/ProductsPage';
 import { AgentsPage } from './pages/AgentsPage';
 import { AgentBalancePage } from './pages/AgentBalancePage';
@@ -158,6 +159,14 @@ export function App() {
           element={
             <Protected adminOnly>
               <SeatAllocationPage />
+            </Protected>
+          }
+        />
+        <Route
+          path="/hold-orders"
+          element={
+            <Protected adminOnly>
+              <HoldOrdersPage />
             </Protected>
           }
         />

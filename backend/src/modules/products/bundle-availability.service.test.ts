@@ -33,6 +33,8 @@ interface FakeOpts {
   schedules?: Array<{ departureTime: Date; capacity: number; sold: number; seatClassId: string }>;
   /** ACTIVE 锁位（seatClassId → qty）。*/
   locks?: Array<{ seatClassId: string; qty: number }>;
+  /** 生效中的占位余座（seatClassId → seats）。*/
+  holds?: Array<{ seatClassId: string; seats: number }>;
   roomType?: { hotelId: string } | null;
   periods?: Array<{ dateFrom: Date; dateTo: Date; rooms: number }>;
   items?: Array<{ hotelCheckIn: Date; hotelCheckOut: Date }>;
@@ -69,6 +71,14 @@ function fakeClient(opts: FakeOpts = {}): PrismaClient {
     seatLock: {
       groupBy: vi.fn().mockResolvedValue(
         (opts.locks ?? []).map((l) => ({ seatClassId: l.seatClassId, _sum: { qty: l.qty } })),
+      ),
+    },
+    holdOrder: {
+      groupBy: vi.fn().mockResolvedValue(
+        (opts.holds ?? []).map((h) => ({
+          seatClassId: h.seatClassId,
+          _sum: { seats: h.seats, seatsConverted: 0, seatsCancelled: 0 },
+        })),
       ),
     },
     hotelRoomType: {
@@ -145,6 +155,19 @@ describe('getBundleSellableDates', () => {
       sellable: true,
       reason: null,
     });
+  });
+
+  it('FLIGHT_SOLD_OUT：占位余座也会压缩套餐日期余量', async () => {
+    const client = fakeClient({
+      bundle: { items: [], blackoutDates: [], hotelNights: 2, hotelRoomTypeId: null },
+      schedules: [
+        sched('2026-07-01', 'go0', 10, 0),
+        sched('2026-07-03', 'ret0', 100, 0),
+      ],
+      holds: [{ seatClassId: 'go0', seats: 10 }],
+    });
+    const res = await getBundleSellableDates('b1', '2026-07-01', '2026-07-01', client);
+    expect(res[0]).toMatchObject({ sellable: false, reason: 'FLIGHT_SOLD_OUT' });
   });
 
   it('FLIGHT_SOLD_OUT：某日无去程班次 → 不可售', async () => {

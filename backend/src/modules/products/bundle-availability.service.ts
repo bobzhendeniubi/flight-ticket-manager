@@ -17,7 +17,7 @@
  *
  * 性能（强约束，绝不逐日跑重查询）：
  *   - 机票：getRouteSeatTiersByDate 一次 flightSchedule.findMany（出发时间窗）+ 一次 seatLock.groupBy，
- *     JS 内按日折算 capacity−sold−locked → 档位。完全跳过动态定价（可售只看档位不看价）。
+ *     JS 内按日折算 capacity−sold−locked−held → 档位。完全跳过动态定价（可售只看档位不看价）。
  *   - 酒店：getHotelNightlyRemaining 一次跨 [from .. to+nights] 拉周期 + 占房，JS 内切每日窗口。
  *   - 总查询数 O(2~3)，与日期跨度无关。
  *
@@ -37,6 +37,7 @@ import {
   computeHotelAvailabilityTier,
   type HotelAvailabilityTier,
 } from './hotel-availability.service.js';
+import { heldSeatsBySeatClass } from '../hold-orders/held-seats.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -145,6 +146,7 @@ export async function getRouteSeatTiersByDate(
         })
       : [];
   const lockedBySeatClass = new Map(lockSums.map((r) => [r.seatClassId, r._sum.qty ?? 0]));
+  const heldBySeatClass = await heldSeatsBySeatClass(client, seatClassIds);
 
   // 按本地日聚合可售量（同日多班次 → 取和；"该日还有座"即可售）
   const availByDate = new Map<string, number>();
@@ -153,7 +155,8 @@ export async function getRouteSeatTiersByDate(
     let dayAvail = availByDate.get(localDate) ?? 0;
     for (const c of s.seatClasses) {
       const locked = lockedBySeatClass.get(c.id) ?? 0;
-      dayAvail += Math.max(0, c.capacity - c.sold - locked);
+      const held = heldBySeatClass.get(c.id) ?? 0;
+      dayAvail += Math.max(0, c.capacity - c.sold - locked - held);
     }
     availByDate.set(localDate, dayAvail);
   }

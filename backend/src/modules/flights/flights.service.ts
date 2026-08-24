@@ -2,6 +2,7 @@ import {
   AuditSeverity,
   AuditTargetType,
   CabinClass,
+  HoldOrderStatus,
   Prisma,
   SeatLockStatus,
   WaitlistStatus,
@@ -17,6 +18,7 @@ import { parseFareBuckets } from '../pricing/pricing.schemas.js';
 import type { FareBucketsInput } from '../pricing/pricing.schemas.js';
 import { localDate } from '../finances/finances.cost.service.js';
 import { localDateISO, localToUtc } from '../../lib/flight-time.js';
+import { heldSeatsBySeatClass } from '../hold-orders/held-seats.js';
 import type { FareBucket } from '../pricing/pricing.calc.js';
 import type {
   BaggagePolicyItem,
@@ -35,6 +37,14 @@ const CABIN_LABEL: Record<CabinClass, string> = {
   [CabinClass.BUSINESS]: '商务舱',
   [CabinClass.FIRST]: '头等舱',
 };
+
+// 删除班次时只拦仍占公共库存的占位状态；历史态允许随班次级联清理。
+const HOLD_ORDER_DELETE_BLOCKING_STATUSES: HoldOrderStatus[] = [
+  HoldOrderStatus.PENDING,
+  HoldOrderStatus.HOLDING,
+  HoldOrderStatus.OVERDUE,
+  HoldOrderStatus.FULLY_PAID,
+];
 
 const pricingService = new PricingService();
 
@@ -364,6 +374,7 @@ export class FlightService {
         })
       : [];
     const lockedBySeatClass = new Map(lockSums.map((r) => [r.seatClassId, r._sum.qty ?? 0]));
+    const heldBySeatClass = await heldSeatsBySeatClass(prisma, seatClassIds);
 
     // 行李规则：视野内所有航班一次性查出（flightId+cabin 定位），避免 N+1
     const flightIds = [...new Set(schedules.map((s) => s.flightId))];
@@ -381,7 +392,8 @@ export class FlightService {
         const availableSeats = await Promise.all(
           seats.map(async (c) => {
             const lockedQty = lockedBySeatClass.get(c.id) ?? 0;
-            const avail = Math.max(0, c.capacity - c.sold - lockedQty);
+            const heldQty = heldBySeatClass.get(c.id) ?? 0;
+            const avail = Math.max(0, c.capacity - c.sold - lockedQty - heldQty);
             // 动态价：为请求人数算平均单价
             let dynamicPrice: string = c.basePrice.toString();
             let dateRank = 'C';
@@ -523,8 +535,8 @@ export class FlightService {
    * 使管理端月历库存视图可直接读/编辑仓位阶梯，basePrice 保留原 Decimal 形态不变更其它消费方。
    */
   /**
-   * 给一组班次的每个 seatClass 算"他人 ACTIVE 未过期锁位"占用量（与前台 search() 同口径）。
-   * 让 admin 的余位 = capacity − sold − locked，消灭"航班管理/座位统计比前台多算锁位张数"的偏差。
+   * 给一组班次的每个 seatClass 算锁位与占位占用量（与前台 search() 同口径）。
+   * 让 admin 的余位 = capacity − sold − locked − held，消灭不同库存页面的口径偏差。
    */
   private async lockedMapForSchedules(
     schedules: { seatClasses: { id: string }[] }[],
@@ -543,6 +555,13 @@ export class FlightService {
     return new Map(lockSums.map((r) => [r.seatClassId, r._sum.qty ?? 0]));
   }
 
+  private async heldMapForSchedules(
+    schedules: { seatClasses: { id: string }[] }[],
+  ): Promise<Map<string, number>> {
+    const seatClassIds = schedules.flatMap((s) => s.seatClasses.map((c) => c.id));
+    return heldSeatsBySeatClass(prisma, seatClassIds);
+  }
+
   async listSchedules(flightId: string) {
     const schedules = await prisma.flightSchedule.findMany({
       where: { flightId },
@@ -551,19 +570,24 @@ export class FlightService {
         seatClasses: true,
       },
     });
-    const lockedMap = await this.lockedMapForSchedules(schedules);
+    const [lockedMap, heldMap] = await Promise.all([
+      this.lockedMapForSchedules(schedules),
+      this.heldMapForSchedules(schedules),
+    ]);
     return schedules.map((s) => ({
       ...s,
       seatClasses: s.seatClasses.map((c) => {
         const locked = lockedMap.get(c.id) ?? 0;
+        const held = heldMap.get(c.id) ?? 0;
         return {
           ...c,
           fareBuckets: parseFareBuckets(c.fareBuckets),
           locked,
-          // 权威余位口径（与前台一致）：capacity − sold − 他人未过期锁位。
+          held,
+          // 权威余位口径（与前台一致）：capacity − sold − 他人未过期锁位 − 占位余座。
           // 不夹 0：航司减配/换机型把容量压到已售之下时余位为负 = 超售张数，
           // 运营端要看见这个负数去协调（前台公开口径另走 capPublicAvailable，仍夹 0）。
-          available: c.capacity - c.sold - locked,
+          available: c.capacity - c.sold - locked - held,
         };
       }),
     }));
@@ -594,7 +618,10 @@ export class FlightService {
         seatClasses: true,
       },
     });
-    const lockedMap = await this.lockedMapForSchedules(schedules);
+    const [lockedMap, heldMap] = await Promise.all([
+      this.lockedMapForSchedules(schedules),
+      this.heldMapForSchedules(schedules),
+    ]);
     return schedules.map((s) => ({
       id: s.id,
       flightId: s.flightId,
@@ -605,14 +632,16 @@ export class FlightService {
       departureTz: s.departureTz,
       seatClasses: s.seatClasses.map((c) => {
         const locked = lockedMap.get(c.id) ?? 0;
+        const held = heldMap.get(c.id) ?? 0;
         return {
           id: c.id,
           cabin: c.cabin,
           capacity: c.capacity,
           sold: c.sold,
           locked,
+          held,
           // 与 listSchedules 同口径，不夹 0：负数 = 超售张数（座位统计据此标红）
-          available: c.capacity - c.sold - locked,
+          available: c.capacity - c.sold - locked - held,
           basePrice: c.basePrice.toString(),
         };
       }),
@@ -748,48 +777,72 @@ export class FlightService {
     }
 
     // ── 座位类校验 ───────────────────────────────────────────────────────────
-    // 容量下调不再一刀切拦下「低于已售」：航司减配 / 换机型会把真实容量压到已售之下
-    // （如 186+7 座的机型换成小机型而已售 195），运营必须能录入真实容量、在座位统计里
-    // 看到「超售 N」去协调。销售侧不受影响 —— 下单扣座是 sold+qty+locked ≤ capacity 的
-    // 原子 CAS，容量被压低后只会更早拒卖，不会因为这里放开而多卖出一张票。
-    // 命中超售的舱位收集起来，更新后写一条 WARNING 审计留痕（谁、哪一舱、从多少改到多少）。
+    // 容量下调不再一刀切拦下「低于已售 + 占位」：航司减配 / 换机型会把真实容量压到
+    // 有效占用之下，运营必须能录入真实容量、在座位统计里看到「超售 N」去协调。
+    // 锁位不计入有效占用：锁位只有 10 分钟，是瞬态库存；计入容量编辑会让结果随锁位
+    // 到期时间随机变化，导致容量调整无故失败。销售侧仍按 sold+qty+locked+held ≤ capacity
+    // 的原子 CAS 防止继续超卖。命中超售的舱位更新后写 WARNING 审计。
     const oversoldSeatChanges: Array<{
       cabin: CabinClass;
       sold: number;
+      held: number;
       capacityBefore: number;
       capacityAfter: number;
       oversoldBy: number;
     }> = [];
-    for (const upd of seatUpdates) {
-      const current = seatClassByCabin.get(upd.cabin);
-      if (!current) {
-        throw new BadRequestError(`该班次没有${CABIN_LABEL[upd.cabin]}（${upd.cabin}）`);
-      }
-      if (upd.capacity !== undefined && upd.capacity < current.sold) {
-        oversoldSeatChanges.push({
-          cabin: upd.cabin,
-          sold: current.sold,
-          capacityBefore: current.capacity,
-          capacityAfter: upd.capacity,
-          oversoldBy: current.sold - upd.capacity,
-        });
-      }
-    }
-
-    // ── 超售上限守卫（拍板：超售必须有上限，防止手滑，如把 186 敲成 18 → 超售 168）──
-    // 上限可配（FLIGHT_MAX_OVERSELL_SEATS，默认 5）；超过上限直接 400 拒绝整次请求，
-    // 不写库、不写审计——运营核对清楚真实容量后重试或调大上限。
-    const maxOversell = env.FLIGHT_MAX_OVERSELL_SEATS;
-    const overCapChanges = oversoldSeatChanges.filter((c) => c.oversoldBy > maxOversell);
-    if (overCapChanges.length > 0) {
-      throw new BadRequestError(
-        `超售 ${overCapChanges
-          .map((c) => `${CABIN_LABEL[c.cabin]}${c.oversoldBy}`)
-          .join('、')} 座超过上限 ${maxOversell} 座，请核对容量是否输错；上限可调`,
-      );
-    }
-
     await prisma.$transaction(async (tx) => {
+      const capacityUpdates = seatUpdates.filter((upd) => upd.capacity !== undefined);
+      if (typeof tx.$queryRaw === 'function') {
+        for (const upd of capacityUpdates) {
+          const current = seatClassByCabin.get(upd.cabin);
+          if (current) {
+            await tx.$queryRaw`
+              SELECT id FROM "FlightSeatClass" WHERE id = ${current.id} FOR UPDATE
+            `;
+          }
+        }
+      }
+
+      // 同一事务读取占位余座，避免容量调整与建占位并发时使用过期数据。
+      const heldBySeatClass = await heldSeatsBySeatClass(
+        tx,
+        capacityUpdates.flatMap((upd) => {
+          const current = seatClassByCabin.get(upd.cabin);
+          return current ? [current.id] : [];
+        }),
+      );
+      for (const upd of seatUpdates) {
+        const current = seatClassByCabin.get(upd.cabin);
+        if (!current) {
+          throw new BadRequestError(`该班次没有${CABIN_LABEL[upd.cabin]}（${upd.cabin}）`);
+        }
+        if (upd.capacity !== undefined) {
+          const held = heldBySeatClass.get(current.id) ?? 0;
+          const oversoldBy = current.sold + held - upd.capacity;
+          if (oversoldBy > 0) {
+            oversoldSeatChanges.push({
+              cabin: upd.cabin,
+              sold: current.sold,
+              held,
+              capacityBefore: current.capacity,
+              capacityAfter: upd.capacity,
+              oversoldBy,
+            });
+          }
+        }
+      }
+
+      // 有效占用 = sold + held；锁位不计入（锁位只有 10 分钟，是瞬态库存）。
+      const maxOversell = env.FLIGHT_MAX_OVERSELL_SEATS;
+      const overCapChanges = oversoldSeatChanges.filter((c) => c.oversoldBy > maxOversell);
+      if (overCapChanges.length > 0) {
+        throw new BadRequestError(
+          `超售 ${overCapChanges
+            .map((c) => `${CABIN_LABEL[c.cabin]}${c.oversoldBy}（已售${c.sold}+占位${c.held}）`)
+            .join('、')} 座超过上限 ${maxOversell} 座，请核对容量是否输错；上限可调`,
+        );
+      }
+
       // 时刻 + isActive 一次写（减少 round-trips）
       const scheduleData: Prisma.FlightScheduleUpdateInput = {};
       if (body.isActive !== undefined) scheduleData.isActive = body.isActive;
@@ -842,7 +895,7 @@ export class FlightService {
       });
     }
 
-    // ── 超售审计：容量被压到已售之下（航司减配/换机型）──────────────────────
+    // ── 超售审计：容量被压到 sold + held 之下（航司减配/换机型）──────────────
     // 库存变成"账面欠座"，需要人工与航司/操作部协调，必须可追溯到人和时点。
     if (oversoldSeatChanges.length > 0) {
       await writeAudit({
@@ -850,7 +903,7 @@ export class FlightService {
         action: 'UPDATE_SCHEDULE_CAPACITY_OVERSOLD',
         targetType: AuditTargetType.FLIGHT,
         targetId: scheduleId,
-        targetLabel: `班次 ${scheduleId} 容量低于已售（超售 ${oversoldSeatChanges
+        targetLabel: `班次 ${scheduleId} 容量低于已售+占位（超售 ${oversoldSeatChanges
           .map((c) => `${CABIN_LABEL[c.cabin]}${c.oversoldBy}`)
           .join('、')}）`,
         before: {
@@ -858,6 +911,7 @@ export class FlightService {
             cabin: c.cabin,
             capacity: c.capacityBefore,
             sold: c.sold,
+            held: c.held,
           })),
         },
         after: {
@@ -865,6 +919,7 @@ export class FlightService {
             cabin: c.cabin,
             capacity: c.capacityAfter,
             sold: c.sold,
+            held: c.held,
             oversoldBy: c.oversoldBy,
           })),
         },
@@ -967,8 +1022,10 @@ export class FlightService {
    * 同理：本班次若有生效中的锁位（SeatLock ACTIVE）或候补（SeatWaitlist ACTIVE），
    * 也禁删 —— 这两张表都是 onDelete: Cascade 挂在 FlightSchedule 上，硬删班次会
    * 把这些生效记录一并静默清空（用户占的位/候补资格无声消失）。
-   * 无销售、无生效锁位/候补才硬删（级联清掉舱位 / 仓位阶梯）。
-   * TODO 切位（SeatAllocation）落地后一并纳入删除守卫
+   * 生效中的占位单（PENDING / HOLDING / OVERDUE / FULLY_PAID）同样拦截；
+   * RELEASED / CANCELLED / CONVERTED 历史态允许随班次级联清理。
+   * 无销售、无生效锁位/候补/占位单才硬删（级联清掉舱位 / 仓位阶梯）。
+   * 占位单已纳入删除守卫；旧切位模块按冻结策略不在本链路改动。
    */
   async deleteSchedule(scheduleId: string) {
     const schedule = await prisma.flightSchedule.findUnique({
@@ -979,6 +1036,11 @@ export class FlightService {
         seatLocks: { where: { status: SeatLockStatus.ACTIVE }, select: { id: true }, take: 1 },
         seatWaitlists: {
           where: { status: WaitlistStatus.ACTIVE },
+          select: { id: true },
+          take: 1,
+        },
+        holdOrders: {
+          where: { status: { in: HOLD_ORDER_DELETE_BLOCKING_STATUSES } },
           select: { id: true },
           take: 1,
         },
@@ -994,8 +1056,11 @@ export class FlightService {
     if (schedule.seatLocks.length > 0 || schedule.seatWaitlists.length > 0) {
       throw new BadRequestError('该班次有生效中的锁位/候补，暂不能删除');
     }
+    if ((schedule.holdOrders?.length ?? 0) > 0) {
+      throw new BadRequestError('该班次有生效中的占位单，暂不能删除');
+    }
 
-    // 无销售、无生效锁位/候补：硬删（onDelete: Cascade 自动清掉 seatClasses 及其 fareBuckets）
+    // 无销售、无生效锁位/候补/占位单：硬删（onDelete: Cascade 自动清掉 seatClasses 及其 fareBuckets）
     await prisma.flightSchedule.delete({ where: { id: scheduleId } });
     return { id: scheduleId, deleted: true };
   }
@@ -1005,10 +1070,10 @@ export class FlightService {
    * 场景：一天两班、整月排期，运营想按出发日区间删掉其中某档班次，又不想逐个点。
    * 出发日区间 [from, to]（出发地当地 UTC+8 日，闭区间）内选出班次；flightId 省略=全部航班。
    * 每个班次沿用 deleteSchedule 同口径的"有销售则禁删"守卫（任一舱位 sold>0，或有订单项关联，
-   * 或有生效中的锁位/候补）：命中守卫 → 跳过（不删），记入 skipped；否则硬删（级联清掉舱位 / 仓位阶梯）。
+   * 或有生效中的锁位/候补/占位单）：命中守卫 → 跳过（不删），记入 skipped；否则硬删（级联清掉舱位 / 仓位阶梯）。
    * 事务内一次删掉本批可删项，保证要么全部落库、要么整体回滚（已跳过项不参与删除，天然安全）。
    * 删除成功后写审计（删除数 + 已删/跳过的 scheduleId），批量删的爆炸半径大，必须留痕可追溯。
-   * TODO 切位（SeatAllocation）落地后一并纳入删除守卫
+   * 占位单已纳入删除守卫；旧切位模块按冻结策略不在本链路改动。
    */
   async batchDeleteSchedules(
     body: { flightId?: string; from: string; to: string },
@@ -1039,20 +1104,28 @@ export class FlightService {
           select: { id: true },
           take: 1,
         },
+        holdOrders: {
+          where: { status: { in: HOLD_ORDER_DELETE_BLOCKING_STATUSES } },
+          select: { id: true },
+          take: 1,
+        },
       },
     });
 
-    // 先分流：哪些可删、哪些因已售/有生效锁位或候补跳过（沿用单删守卫口径）。
+    // 先分流：哪些可删、哪些因已售/有生效锁位、候补或占位单跳过（沿用单删守卫口径）。
     const deletableIds: string[] = [];
     const skipped: Array<{ scheduleId: string; reason: string }> = [];
     for (const s of schedules) {
       const hasSold = s.seatClasses.some((c) => c.sold > 0);
       const hasOrders = s.orderItems.length > 0;
       const hasActiveLockOrWaitlist = s.seatLocks.length > 0 || s.seatWaitlists.length > 0;
+      const hasActiveHoldOrder = (s.holdOrders?.length ?? 0) > 0;
       if (hasSold || hasOrders) {
         skipped.push({ scheduleId: s.id, reason: '已售' });
       } else if (hasActiveLockOrWaitlist) {
         skipped.push({ scheduleId: s.id, reason: '有生效中的锁位/候补' });
+      } else if (hasActiveHoldOrder) {
+        skipped.push({ scheduleId: s.id, reason: '有生效中的占位单' });
       } else {
         deletableIds.push(s.id);
       }
@@ -1093,8 +1166,8 @@ export class FlightService {
    * （如经济 180→184、商务 20→7），逐个点太慢。
    * 按 scheduleId 列表逐条处理（scheduleId 由前端按"日期区间 + 星期几"筛出，
    * 复用批量改价面板已有的班次选择范围）：
-   *   - 每条按 cabin 定位舱位，套用与单班次编辑（updateSchedule）同口径：容量可以
-   *     压到已售之下（航司减配/换机型的真实场景），这类班次照改并记为「超售」，
+   *   - 每条按 cabin 定位舱位，套用与单班次编辑（updateSchedule）同口径：有效占用为
+   *     sold + held（锁位是 10 分钟瞬态，不计入容量调整），容量可以低于有效占用，
    *     在返回体的 oversold 明细与审计里点名，销售侧照旧按 CAS 拒卖；
    *   - 超售张数超过上限（FLIGHT_MAX_OVERSELL_SEATS，防手滑）→ 该班次整条不改，
    *     放进 skipped 带原因，不拖累批次里其它班次（不是整批失败）；
@@ -1110,12 +1183,17 @@ export class FlightService {
       include: { seatClasses: true },
     });
     const scheduleById = new Map(schedules.map((s) => [s.id, s]));
+    const heldBySeatClass = await heldSeatsBySeatClass(
+      prisma,
+      schedules.flatMap((s) => s.seatClasses.map((c) => c.id)),
+    );
 
     const appliedIds: string[] = [];
     const skipped: Array<{ scheduleId: string; reason: string }> = [];
     const updates: Array<{ seatClassId: string; capacity: number }> = [];
-    // 目标容量低于已售的班次：照改，但单列出来提示运营去协调（返回体 + 审计）
-    const oversold: Array<{ scheduleId: string; cabin: CabinClass; sold: number; capacity: number; oversoldBy: number }> = [];
+    // 目标容量低于 sold + held 的班次：照改，但单列出来提示运营去协调（返回体 + 审计）。
+    // 锁位不计入：锁位只有 10 分钟，是瞬态库存，避免容量编辑随机受锁位到期影响。
+    const oversold: Array<{ scheduleId: string; cabin: CabinClass; sold: number; held: number; capacity: number; oversoldBy: number }> = [];
     // 超售上限守卫（同 updateSchedule 口径，防止批量场景手滑输错容量炸更大的坑）
     const maxOversell = env.FLIGHT_MAX_OVERSELL_SEATS;
 
@@ -1132,17 +1210,19 @@ export class FlightService {
       for (const item of body.seatClasses) {
         const current = seatClassByCabin.get(item.cabin);
         if (!current) continue; // 该班次没有此舱位：这一项静默跳过，不算失败
-        if (item.capacity < current.sold) {
-          const oversoldBy = current.sold - item.capacity;
+        const held = heldBySeatClass.get(current.id) ?? 0;
+        const oversoldBy = current.sold + held - item.capacity;
+        if (oversoldBy > 0) {
           if (oversoldBy > maxOversell) {
             // 超过上限：整个班次不改（不部分应用），放进 skipped 带原因，不拖累其它班次
-            overCapReason = `${CABIN_LABEL[item.cabin]}超售 ${oversoldBy} 座超过上限 ${maxOversell} 座，请核对容量是否输错；上限可调`;
+            overCapReason = `${CABIN_LABEL[item.cabin]}超售 ${oversoldBy} 座（已售${current.sold}+占位${held}）超过上限 ${maxOversell} 座，请核对容量是否输错；上限可调`;
             break;
           }
           scheduleOversold.push({
             scheduleId,
             cabin: item.cabin,
             sold: current.sold,
+            held,
             capacity: item.capacity,
             oversoldBy,
           });
@@ -1175,7 +1255,7 @@ export class FlightService {
         action: 'BATCH_UPDATE_CAPACITY',
         targetType: AuditTargetType.FLIGHT,
         targetLabel: `批量改容量 ${appliedIds.length} 个班次${
-          oversold.length > 0 ? `（其中 ${oversold.length} 个舱位容量低于已售 → 超售）` : ''
+          oversold.length > 0 ? `（其中 ${oversold.length} 个舱位容量低于已售+占位 → 超售）` : ''
         }`,
         after: {
           appliedScheduleIds: appliedIds,

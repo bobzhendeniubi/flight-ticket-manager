@@ -238,8 +238,10 @@ export interface AdminScheduleSeat {
   cabin: CabinClass;
   capacity: number;
   sold: number;
-  // 后端权威口径：locked = 锁位占用，available = capacity − sold − locked（与前台一致）。
+  // 后端权威口径：available = capacity − sold − locked − held（与前台一致）。
   locked: number;
+  // ADMIN/STAFF 响应含 held；AGENT 同一端点走白名单序列化，不暴露占位规模。
+  held?: number;
   available: number;
   basePrice: string;
   // 仓位阶梯：有序数组（最便宜在前），自顶向下出售；
@@ -267,7 +269,8 @@ export interface RangeScheduleSeat {
   capacity: number;
   sold: number;
   locked: number;
-  // available = capacity − sold − locked（后端权威口径）。
+  held: number;
+  // available = capacity − sold − locked − held（后端权威口径）。
   available: number;
   basePrice: string;
 }
@@ -949,6 +952,62 @@ export interface SeatAllocationListItem {
   expired: boolean;
   createdAt: string;
   updatedAt: string;
+}
+
+// ── 占位单（无名单库存实体）── 与 backend hold-orders 模块对齐
+export type HoldOrderStatus =
+  | 'PENDING'
+  | 'HOLDING'
+  | 'OVERDUE'
+  | 'FULLY_PAID'
+  | 'CONVERTED'
+  | 'RELEASED'
+  | 'CANCELLED';
+export type HoldOwnerType = 'AGENT' | 'CUSTOMER';
+
+export interface CreateHoldOrderInput {
+  flightScheduleId: string;
+  cabin: CabinClass;
+  seats: number;
+  perSeatPriceCny: number;
+  ownerType: HoldOwnerType;
+  agentId?: string;
+  groupName?: string;
+  freeCancelRatio?: number;
+  notes?: string;
+}
+
+export interface HoldOrderRecord {
+  id: string;
+  holdNo: string;
+  flightScheduleId: string;
+  seatClassId: string;
+  ownerType: HoldOwnerType;
+  agentId: string | null;
+  groupName: string | null;
+  seats: number;
+  seatsConverted: number;
+  seatsCancelled: number;
+  perSeatPriceCny: number;
+  freeCancelRatio: string | null;
+  freeCancelUsed: number;
+  status: HoldOrderStatus;
+  notes: string | null;
+  createdById: string;
+  releasedAt: string | null;
+  cancelledAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface HoldOrderListItem extends HoldOrderRecord {
+  seatClass: { cabin: CabinClass };
+  flightSchedule: {
+    id: string;
+    departureTime: string;
+    flight: { flightNumber: string };
+  };
+  agent: { id: string; companyName: string | null; contactName: string } | null;
 }
 
 // ── Orders ────────────────────────────────────────────────────────────────
@@ -2995,6 +3054,45 @@ export const api = {
       `/seat-allocations/${id}/reclaim`,
       { method: 'POST', token },
     ),
+
+  // 占位单（无名单库存实体）——占座/释放/取消/锁定结算价（ADMIN/STAFF）
+  createHoldOrder: (token: string, body: CreateHoldOrderInput) =>
+    apiFetch<{ holdOrder: HoldOrderRecord }>('/hold-orders/', {
+      method: 'POST',
+      token,
+      body,
+    }),
+  listHoldOrders: (
+    token: string,
+    filter?: { flightScheduleId?: string; status?: HoldOrderStatus; agentId?: string },
+  ) => {
+    const params = new URLSearchParams();
+    if (filter?.flightScheduleId) params.set('flightScheduleId', filter.flightScheduleId);
+    if (filter?.status) params.set('status', filter.status);
+    if (filter?.agentId) params.set('agentId', filter.agentId);
+    const qs = params.toString() ? `?${params.toString()}` : '';
+    return apiFetch<{ holdOrders: HoldOrderListItem[] }>(`/hold-orders/${qs}`, { token });
+  },
+  releaseHoldOrder: (token: string, id: string) =>
+    apiFetch<{ result: { id: string; status: HoldOrderStatus } }>(`/hold-orders/${id}/release`, {
+      method: 'POST',
+      token,
+    }),
+  cancelHoldOrder: (token: string, id: string) =>
+    apiFetch<{ result: { id: string; status: HoldOrderStatus } }>(`/hold-orders/${id}/cancel`, {
+      method: 'POST',
+      token,
+    }),
+  updateHoldOrderPrice: (
+    token: string,
+    id: string,
+    body: { perSeatPriceCny: number; reason: string },
+  ) =>
+    apiFetch<{ result: { id: string; perSeatPriceCny: number } }>(`/hold-orders/${id}/price`, {
+      method: 'PATCH',
+      token,
+      body,
+    }),
 
   // Orders
   listOrders: (token: string, query?: ListOrdersParams) => {

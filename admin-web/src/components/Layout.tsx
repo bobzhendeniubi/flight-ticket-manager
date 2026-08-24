@@ -23,6 +23,7 @@ const NAV: Array<{
   { to: '/flights',         label: '航班管理',    roles: ['ADMIN', 'STAFF'],          section: '运营' },
   { to: '/seat-stats',      label: '座位统计',    roles: ['ADMIN', 'STAFF'],          section: '运营' },
   { to: '/seat-allocation', label: '切位（包位）', roles: ['ADMIN', 'STAFF'],          section: '运营' },
+  { to: '/hold-orders',     label: '占位单',       roles: ['ADMIN', 'STAFF'],          section: '运营' },
   { to: '/hotel-control',   label: '房控',        roles: ['ADMIN', 'STAFF'],          section: '运营' },
   { to: '/visa-desk',       label: '签证台',      roles: ['ADMIN', 'STAFF'],          section: '运营' },
   { to: '/reminders',       label: '提醒中心',    roles: ['ADMIN', 'STAFF'],          section: '运营' },

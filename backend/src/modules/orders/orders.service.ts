@@ -89,6 +89,7 @@ import {
 } from './ticketing-cap.js';
 import type { FlightLegItem } from './ticketing-cap.js';
 import { PRICE_ADJUSTMENT_CAP_CNY, PRICE_ADJUSTMENT_REASON_LABEL } from './orders.schemas.js';
+import { heldSeatsForCabin } from '../hold-orders/held-seats.js';
 import type {
   BatchCreateOrdersBody,
   AddGroundItemBody,
@@ -1172,8 +1173,9 @@ export class OrderService {
     const consumedLockIds: string[] = [];
     const order = await prisma.$transaction(async (tx) => {
       // 用 updateMany 的 where 条件做原子"检查+扣减"一步到位，避免 TOCTOU
-      // where: `sold + qty <= capacity` 等价于 Prisma-expressible `capacity - qty >= sold`
-      // 但 Prisma raw 不支持这种 cross-column where；用 sold + qty <= capacity 需要
+      // where: `sold + qty + lockedByOthers + heldQty <= capacity` 等价于
+      // 可售余量 `capacity - sold - 未过期锁位 - 占位余座 >= qty`
+      // 但 Prisma raw 不支持这种 cross-column where；用上述加法条件需要
       // SQL 函数，改用 raw SQL 保证原子性。
       // 原子扣座（CAS 防超卖）。一行经济舱 FLIGHT 在套餐升舱时会拆成两笔：
       //   ECONOMY  sold += quantity − businessUpgradeCount（剩下没升舱的人）
@@ -1185,6 +1187,13 @@ export class OrderService {
         qty: number,
       ): Promise<void> => {
         if (qty <= 0) return;
+        if (typeof tx.$queryRaw === 'function') {
+          await tx.$queryRaw`
+            SELECT id FROM "FlightSeatClass"
+            WHERE "scheduleId" = ${scheduleId} AND cabin = ${cabin}::"CabinClass"
+            FOR UPDATE
+          `;
+        }
         // 锁位语义：他人的 ACTIVE 未过期锁位占用余票（下单人自己的锁位不挡自己下单）
         const lockedAgg = await tx.seatLock.aggregate({
           _sum: { qty: true },
@@ -1197,12 +1206,13 @@ export class OrderService {
           },
         });
         const lockedByOthers = lockedAgg._sum.qty ?? 0;
+        const heldQty = await heldSeatsForCabin(tx, scheduleId, cabin);
         const affected = await tx.$executeRaw`
           UPDATE "FlightSeatClass"
           SET sold = sold + ${qty}, "updatedAt" = NOW()
           WHERE "scheduleId" = ${scheduleId}
             AND cabin = ${cabin}::"CabinClass"
-            AND sold + ${qty} + ${lockedByOthers} <= capacity
+            AND sold + ${qty} + ${lockedByOthers} + ${heldQty} <= capacity
         `;
         if (affected !== 1) {
           // 查当前库存给更友好的错误消息
@@ -1210,7 +1220,9 @@ export class OrderService {
             where: { scheduleId, cabin },
             select: { capacity: true, sold: true },
           });
-          const available = sc ? Math.max(0, sc.capacity - sc.sold - lockedByOthers) : 0;
+          const available = sc
+            ? Math.max(0, sc.capacity - sc.sold - lockedByOthers - heldQty)
+            : 0;
           throw new ConflictError(
             `${cabin} 余票不足：需要 ${qty} 张，仅剩 ${available} 张（并发抢占）`,
           );
@@ -2817,7 +2829,7 @@ export class OrderService {
    * 套餐升舱的正确模型：客户机票仍按经济舱套餐价收，¥700/程 是升舱的「总加价」（不是在全价商务票上再加）；
    * 升舱要占用的真实商务舱座位来自本单的经济舱 FLIGHT 航段（套餐本身不绑班次）。
    * 这里**逐段按该段自己的升舱人数**（去程/回程可以不同）按六档余位口径
-   * （available = capacity − sold − 他人 ACTIVE 锁位）预检对应班次的商务舱余位：
+   * （available = capacity − sold − 他人 ACTIVE 锁位 − 占位余座）预检对应班次的商务舱余位：
    *   - 该段班次没有商务舱舱位 / 商务舱余位 < 本段升舱人数 → 拒单（"商务舱余位不足，无法升舱"）
    *   - 本段升舱人数 = 0（如只升去程时的回程腿）→ 不占商务舱，跳过（不能因该班次没开商务舱就拒单）
    * 真正的扣减（ECONOMY 减本段人数、BUSINESS 加本段人数）由事务里的原子 CAS 完成，最终防超售；
@@ -2847,7 +2859,8 @@ export class OrderService {
         },
       });
       const locked = lockedAgg._sum.qty ?? 0;
-      const available = Math.max(0, sc.capacity - sc.sold - locked);
+      const held = await heldSeatsForCabin(prisma, leg.flightScheduleId, CabinClass.BUSINESS);
+      const available = Math.max(0, sc.capacity - sc.sold - locked - held);
       if (available < businessCount) {
         throw new BadRequestError('商务舱余位不足，无法升舱');
       }
@@ -5000,6 +5013,13 @@ export class OrderService {
         itemLabel: string,
       ): Promise<void> => {
         if (qty <= 0) return;
+        if (typeof tx.$queryRaw === 'function') {
+          await tx.$queryRaw`
+            SELECT id FROM "FlightSeatClass"
+            WHERE "scheduleId" = ${scheduleId} AND cabin = ${cabin}::"CabinClass"
+            FOR UPDATE
+          `;
+        }
         // 锁位语义与下单/改期时一致：他人的 ACTIVE 未过期锁位占用余票（订单本人的锁位不挡自己；
         // 游客单 order.userId=null → 不排除任何人，所有 ACTIVE 锁位都占余票）
         const lockedAgg = await tx.seatLock.aggregate({
@@ -5012,19 +5032,22 @@ export class OrderService {
           },
         });
         const lockedByOthers = lockedAgg._sum.qty ?? 0;
+        const heldQty = await heldSeatsForCabin(tx, scheduleId, cabin);
         const affected = await tx.$executeRaw`
           UPDATE "FlightSeatClass"
           SET sold = sold + ${qty}, "updatedAt" = NOW()
           WHERE "scheduleId" = ${scheduleId}
             AND cabin = ${cabin}::"CabinClass"
-            AND sold + ${qty} + ${lockedByOthers} <= capacity
+            AND sold + ${qty} + ${lockedByOthers} + ${heldQty} <= capacity
         `;
         if (affected !== 1) {
           const sc = await tx.flightSeatClass.findFirst({
             where: { scheduleId, cabin },
             select: { capacity: true, sold: true },
           });
-          const available = sc ? Math.max(0, sc.capacity - sc.sold - lockedByOthers) : 0;
+          const available = sc
+            ? Math.max(0, sc.capacity - sc.sold - lockedByOthers - heldQty)
+            : 0;
           if (order.status === OrderStatus.REFUND_REQUESTED && toStatus === OrderStatus.PROCESSING) {
             throw new BadRequestError(
               `座位已被售出，无法驳回退款申请，请协调换班次或继续退款。${itemLabel}需要${qty}个座位，当前仅剩${available}个。`,
@@ -5888,7 +5911,7 @@ export class OrderService {
    *
    * 单事务内：
    *   1. 释放旧座（旧班次+旧舱位 sold −= quantity）
-   *   2. 原子拿新座（新班次+新舱位 CAS：sold + qty + 他人锁位 ≤ capacity）
+   *   2. 原子拿新座（新班次+新舱位 CAS：sold + qty + 他人锁位 + 占位余座 ≤ capacity）
    *      —— 新班次售罄则抛错，事务回滚 → 旧座保持原样（不泄漏）。
    *   3. 更新该行 flightScheduleId/flightCabin（amount/quantity 不变，机票基础价不重算）。
    *   4. 撤销未撤销的立减快照行并按原金额补差；feeCny>0 另 push 一条 RESCHEDULE_FEE 流水。
@@ -6345,8 +6368,9 @@ export class OrderService {
             }),
           ]);
           const locked = lockedAgg._sum.qty ?? 0;
+          const held = await heldSeatsForCabin(tx, item.flightScheduleId, CabinClass.BUSINESS);
           const remain = businessSeat
-            ? Math.max(0, businessSeat.capacity - businessSeat.sold - locked)
+            ? Math.max(0, businessSeat.capacity - businessSeat.sold - locked - held)
             : 0;
           throw new ConflictError(
             `商务舱余位不足：升舱需要 ${quantity} 座，该班次商务舱仅剩 ${remain} 座`,
@@ -9057,7 +9081,8 @@ export function computeRequiredPassengerCount(items: OrderItemInput[]): number {
 
 /**
  * 事务内原子「拿座」（CAS，最终防超售）—— 与 createOrder 的 decrementSeat 同款保证。
- *   UPDATE ... SET sold = sold + qty WHERE sold + qty + 他人ACTIVE锁位 ≤ capacity
+ *   UPDATE ... SET sold = sold + qty
+ *   WHERE sold + qty + 他人ACTIVE锁位 + 占位余座 ≤ capacity
  * affected ≠ 1（售罄/并发抢占/无此舱位）→ 抛 ConflictError，调用方的事务随之回滚。
  *
  * @param excludeUserId 排除其本人锁位不挡自己（下单场景用）；改期由运营操作 → 传 null（所有他人锁位都占余票）。
@@ -9070,6 +9095,13 @@ async function takeSeatWithinTx(
   excludeUserId: string | null,
 ): Promise<void> {
   if (qty <= 0) return;
+  if (typeof tx.$queryRaw === 'function') {
+    await tx.$queryRaw`
+      SELECT id FROM "FlightSeatClass"
+      WHERE "scheduleId" = ${scheduleId} AND cabin = ${cabin}::"CabinClass"
+      FOR UPDATE
+    `;
+  }
   const lockedAgg = await tx.seatLock.aggregate({
     _sum: { qty: true },
     where: {
@@ -9080,19 +9112,22 @@ async function takeSeatWithinTx(
     },
   });
   const lockedByOthers = lockedAgg._sum.qty ?? 0;
+  const heldQty = await heldSeatsForCabin(tx, scheduleId, cabin);
   const affected = await tx.$executeRaw`
     UPDATE "FlightSeatClass"
     SET sold = sold + ${qty}, "updatedAt" = NOW()
     WHERE "scheduleId" = ${scheduleId}
       AND cabin = ${cabin}::"CabinClass"
-      AND sold + ${qty} + ${lockedByOthers} <= capacity
+      AND sold + ${qty} + ${lockedByOthers} + ${heldQty} <= capacity
   `;
   if (affected !== 1) {
     const sc = await tx.flightSeatClass.findFirst({
       where: { scheduleId, cabin },
       select: { capacity: true, sold: true },
     });
-    const available = sc ? Math.max(0, sc.capacity - sc.sold - lockedByOthers) : 0;
+    const available = sc
+      ? Math.max(0, sc.capacity - sc.sold - lockedByOthers - heldQty)
+      : 0;
     throw new ConflictError(
       `${cabin} 余票不足：需要 ${qty} 张，仅剩 ${available} 张（改期目标班次售罄/并发抢占）`,
     );

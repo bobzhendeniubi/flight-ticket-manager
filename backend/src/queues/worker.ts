@@ -34,6 +34,7 @@ import { closeMailer } from '../lib/mailer.js';
 import { sendItineraryEmail } from '../lib/itinerary-email.js';
 import { computeBundleSeatSplit, releaseSeatFloored } from '../modules/orders/orders.service.js';
 import { REFUND_REQUESTED_FULFILLMENT_ERROR } from '../modules/fulfillment/fulfillment.service.js';
+import { heldSeatsForSeatClass } from '../modules/hold-orders/held-seats.js';
 
 /**
  * 超时释放某订单占用的座位——套餐升舱拆座感知 + 下限钳制在 0（MEDIUM 修复）。
@@ -435,7 +436,7 @@ const notificationWorker = new Worker<NotificationJobData | WaitlistCheckJobData
 
 /**
  * 候补检查：该舱位最早的 ACTIVE 候补，若当前可售余量（capacity - sold -
- * ACTIVE 未过期锁位）≥ 其登记张数则 CAS 标 NOTIFIED。一次只通知一条 ——
+ * ACTIVE 未过期锁位 - 占位余座）≥ 其登记张数则 CAS 标 NOTIFIED。一次只通知一条 ——
  * 下一次座位释放再检查下一条（先来先到，避免一次放量引发并发抢座纠纷）。
  */
 async function processWaitlistCheck(seatClassId: string) {
@@ -453,7 +454,8 @@ async function processWaitlistCheck(seatClassId: string) {
     _sum: { qty: true },
     where: { seatClassId, status: SeatLockStatus.ACTIVE, expiresAt: { gt: new Date() } },
   });
-  const available = entry.seatClass.capacity - entry.seatClass.sold - (lockedAgg._sum.qty ?? 0);
+  const held = await heldSeatsForSeatClass(prisma, seatClassId);
+  const available = entry.seatClass.capacity - entry.seatClass.sold - (lockedAgg._sum.qty ?? 0) - held;
   if (available < entry.qty) {
     return { seatClassId, skipped: true, reason: `available=${available} < qty=${entry.qty}` };
   }

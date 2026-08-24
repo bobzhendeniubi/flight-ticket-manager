@@ -329,6 +329,7 @@ model Agent {
   orders                 Order[]
   customers              CustomerProfile[]
   seatAllocations        SeatAllocation[]
+  holdOrders             HoldOrder[]
   settlementDiscountRules SettlementDiscountRule[]
 
   @@index([isActive])
@@ -593,6 +594,7 @@ model FlightSchedule {
   seatLocks       SeatLock[]
   seatWaitlists   SeatWaitlist[]
   seatAllocations SeatAllocation[]
+  holdOrders      HoldOrder[]
 
   @@index([flightId, departureTime])
   @@index([departureTime])
@@ -614,6 +616,7 @@ model FlightSeatClass {
   schedule      FlightSchedule @relation(fields: [scheduleId], references: [id], onDelete: Cascade)
   seatLocks     SeatLock[]
   seatWaitlists SeatWaitlist[]
+  holdOrders    HoldOrder[]
 
   @@unique([scheduleId, cabin])
 }
@@ -676,6 +679,57 @@ model SeatAllocation {
   agent          Agent          @relation(fields: [agentId], references: [id], onDelete: Cascade)
 
   @@index([flightScheduleId, cabin, status])
+  @@index([agentId, status])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 占位单（无名单库存实体）— 旅游团留位 / 代理切位 / 散客占位。
+// 可售余量统一为：capacity − sold − 未过期 ACTIVE 锁位 − 占位余座。
+// 本期只维护库存占用、释放/取消和锁定结算价；名单转正与收款计划留待后续阶段。
+// ─────────────────────────────────────────────────────────────────────────────
+enum HoldOrderStatus {
+  PENDING     // 建单未生效（二期切位模式全款才占座）
+  HOLDING     // 占座中
+  OVERDUE     // 有期款逾期仍占座（二期）
+  FULLY_PAID  // 全款已收（二期）
+  CONVERTED   // 已全部转正式订单（三期）
+  RELEASED    // 运营释放，座位回池
+  CANCELLED   // 客户取消，座位回池
+}
+
+enum HoldOwnerType {
+  AGENT
+  CUSTOMER
+}
+
+model HoldOrder {
+  id               String          @id @default(cuid())
+  holdNo           String          @unique
+  flightScheduleId String
+  seatClassId      String
+  ownerType        HoldOwnerType
+  agentId          String?
+  groupName        String?
+  seats            Int
+  seatsConverted   Int             @default(0)
+  seatsCancelled   Int             @default(0)
+  perSeatPriceCny  Int
+  freeCancelRatio  Decimal?        @db.Decimal(4, 3)
+  freeCancelUsed   Int             @default(0)
+  status           HoldOrderStatus @default(HOLDING)
+  notes            String?
+  createdById      String
+  releasedAt       DateTime?
+  cancelledAt      DateTime?
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  flightSchedule FlightSchedule  @relation(fields: [flightScheduleId], references: [id], onDelete: Cascade)
+  seatClass      FlightSeatClass @relation(fields: [seatClassId], references: [id], onDelete: Cascade)
+  agent          Agent?          @relation(fields: [agentId], references: [id], onDelete: SetNull)
+
+  @@index([seatClassId, status])
+  @@index([flightScheduleId, status])
   @@index([agentId, status])
 }
 

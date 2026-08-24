@@ -15,7 +15,8 @@ import OpenAI from 'openai';
 import { env } from '../config/env.js';
 import { prisma } from '../db/prisma.js';
 import { PricingService } from '../modules/pricing/pricing.service.js';
-import { CabinClass } from '@prisma/client';
+import { CabinClass, SeatLockStatus } from '@prisma/client';
+import { heldSeatsBySeatClass } from '../modules/hold-orders/held-seats.js';
 
 const MAX_TOOL_ITERATIONS = 8; // 防止 loop 失控
 
@@ -301,14 +302,32 @@ async function executeSearchFlights(input: Record<string, unknown>): Promise<Too
       take: 20, // AI 上下文友好：最多 20 个班次
     });
 
+    const seatClassIds = schedules.flatMap((s) => s.seatClasses.map((c) => c.id));
+    const lockSums = seatClassIds.length > 0
+      ? await prisma.seatLock.groupBy({
+          by: ['seatClassId'],
+          where: {
+            seatClassId: { in: seatClassIds },
+            status: SeatLockStatus.ACTIVE,
+            expiresAt: { gt: new Date() },
+          },
+          _sum: { qty: true },
+        })
+      : [];
+    const lockedBySeatClass = new Map(lockSums.map((row) => [row.seatClassId, row._sum.qty ?? 0]));
+    const heldBySeatClass = await heldSeatsBySeatClass(prisma, seatClassIds);
+
     const results = await Promise.all(
       schedules.map(async (s) => {
         const seats = cabin ? s.seatClasses.filter((c) => c.cabin === cabin) : s.seatClasses;
         const cabinDetails = await Promise.all(
           seats.map(async (c) => {
+            const locked = lockedBySeatClass.get(c.id) ?? 0;
+            const held = heldBySeatClass.get(c.id) ?? 0;
+            const available = c.capacity - c.sold - locked - held;
             let dynamicPrice = Number(c.basePrice);
             try {
-              if (c.capacity - c.sold >= passengers) {
+              if (available >= passengers) {
                 const pr = await pricingService.calculatePrice(s.id, c.cabin, passengers);
                 dynamicPrice = pr.averageUnitPrice;
                 // 只取动态成交价；pr.dateRank（内部日期分档 A/B/C/D）绝不进模型上下文 ——
@@ -319,7 +338,7 @@ async function executeSearchFlights(input: Record<string, unknown>): Promise<Too
             }
             return {
               cabin: c.cabin,
-              available: c.capacity - c.sold,
+              available,
               basePrice: Number(c.basePrice),
               dynamicPrice,
             };

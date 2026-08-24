@@ -6,7 +6,7 @@
  *   2. 固定 10 分钟有效；到期 BullMQ worker 标 EXPIRED
  *   3. 下单时消费本人锁位（orders.service.createOrder 标 CONSUMED）
  *
- * 可用量口径：capacity - sold - SUM(ACTIVE 且 expiresAt > now 的锁位 qty)。
+ * 可用量口径：capacity - sold - SUM(ACTIVE 且 expiresAt > now 的锁位 qty) - 占位余座。
  * 所有查询都按 status=ACTIVE AND expiresAt > now 惰性过滤，
  * 正确性不依赖 worker 准时执行（worker 只负责把状态落库）。
  */
@@ -14,6 +14,7 @@ import { SeatLockStatus, UserRole } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { ConflictError, ForbiddenError, NotFoundError } from '../../lib/errors.js';
 import type { CreateSeatLockBody } from './seat-locks.schemas.js';
+import { heldSeatsForSeatClass } from '../hold-orders/held-seats.js';
 
 // 单用户同舱位 ACTIVE 锁位总量上限（含本次锁的张数）
 const MAX_ACTIVE_LOCK_QTY_PER_USER = 9;
@@ -65,7 +66,7 @@ export class SeatLockService {
         );
       }
 
-      // 余量检查：capacity - sold - 全部 ACTIVE 未过期锁位 ≥ qty
+      // 余量检查：capacity - sold - 全部 ACTIVE 未过期锁位 - 占位余座 ≥ qty
       const all = await tx.seatLock.aggregate({
         _sum: { qty: true },
         where: {
@@ -75,7 +76,8 @@ export class SeatLockService {
         },
       });
       const lockedQty = all._sum.qty ?? 0;
-      const available = seatClass.capacity - seatClass.sold - lockedQty;
+      const heldQty = await heldSeatsForSeatClass(tx, body.seatClassId);
+      const available = seatClass.capacity - seatClass.sold - lockedQty - heldQty;
       if (available < body.qty) {
         throw new ConflictError(
           `余票不足：需要锁 ${body.qty} 张，仅剩 ${Math.max(0, available)} 张可锁`,
