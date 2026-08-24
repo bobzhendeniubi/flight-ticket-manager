@@ -1489,9 +1489,14 @@ describe('FlightService.batchUpdateCapacity', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
-    // $transaction 的数组形态：直接 resolve 传入的 promise 数组（与 batchDeleteSchedules 同口径）。
+    // 实现已改为交互式事务（回调形态，行锁 + 锁后重读）：以同一个 mock 作为 tx 执行回调；
+    // 数组形态保留兼容（本 describe 之外的路径仍在用）。
     prismaMock.$transaction.mockImplementation(async (ops: unknown) =>
-      Array.isArray(ops) ? Promise.all(ops) : ops,
+      typeof ops === 'function'
+        ? (ops as (tx: unknown) => unknown)(prismaMock)
+        : Array.isArray(ops)
+          ? Promise.all(ops)
+          : ops,
     );
     prismaMock.flightSeatClass.update.mockResolvedValue({});
   });

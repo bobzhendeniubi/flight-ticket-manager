@@ -1177,77 +1177,99 @@ export class FlightService {
    * 写审计留痕（改了几个班次 + 已改/跳过明细），批量操作爆炸半径大，必须可追溯。
    */
   async batchUpdateCapacity(body: BatchUpdateCapacityBody, actor?: AuditActor) {
-    const schedules = await prisma.flightSchedule.findMany({
-      where: { id: { in: body.scheduleIds } },
-      include: { seatClasses: true },
-    });
-    const scheduleById = new Map(schedules.map((s) => [s.id, s]));
-    const heldBySeatClass = await heldSeatsBySeatClass(
-      prisma,
-      schedules.flatMap((s) => s.seatClasses.map((c) => c.id)),
-    );
-
-    const appliedIds: string[] = [];
-    const skipped: Array<{ scheduleId: string; reason: string }> = [];
-    const updates: Array<{ seatClassId: string; capacity: number }> = [];
-    // 目标容量低于 sold + held 的班次：照改，但单列出来提示运营去协调（返回体 + 审计）。
-    // 锁位不计入：锁位只有 10 分钟，是瞬态库存，避免容量编辑随机受锁位到期影响。
-    const oversold: Array<{ scheduleId: string; cabin: CabinClass; sold: number; held: number; capacity: number; oversoldBy: number }> = [];
-    // 超售上限守卫（同 updateSchedule 口径，防止批量场景手滑输错容量炸更大的坑）
-    const maxOversell = env.FLIGHT_MAX_OVERSELL_SEATS;
-
-    for (const scheduleId of body.scheduleIds) {
-      const schedule = scheduleById.get(scheduleId);
-      if (!schedule) {
-        skipped.push({ scheduleId, reason: '班次不存在' });
-        continue;
-      }
-      const seatClassByCabin = new Map(schedule.seatClasses.map((c) => [c.cabin, c]));
-      const scheduleUpdates: Array<{ seatClassId: string; capacity: number }> = [];
-      const scheduleOversold: typeof oversold = [];
-      let overCapReason: string | null = null;
-      for (const item of body.seatClasses) {
-        const current = seatClassByCabin.get(item.cabin);
-        if (!current) continue; // 该班次没有此舱位：这一项静默跳过，不算失败
-        const held = heldBySeatClass.get(current.id) ?? 0;
-        const oversoldBy = current.sold + held - item.capacity;
-        if (oversoldBy > 0) {
-          if (oversoldBy > maxOversell) {
-            // 超过上限：整个班次不改（不部分应用），放进 skipped 带原因，不拖累其它班次
-            overCapReason = `${CABIN_LABEL[item.cabin]}超售 ${oversoldBy} 座（已售${current.sold}+占位${held}）超过上限 ${maxOversell} 座，请核对容量是否输错；上限可调`;
-            break;
-          }
-          scheduleOversold.push({
-            scheduleId,
-            cabin: item.cabin,
-            sold: current.sold,
-            held,
-            capacity: item.capacity,
-            oversoldBy,
-          });
+    // 判定与写入同一事务：先锁涉及的舱位行（FOR UPDATE），锁到手后重读 sold、同事务读 held，
+    // 再算超售/上限。与 updateSchedule 单班次路径同一纪律——否则批处理期间新落地的
+    // 占位单/订单会让超售判定与审计口径用到过期快照（真正的卖票防线仍在 orders/hold-orders
+    // 的 CAS，这里保证的是提示与审计数字的准确）。
+    const { appliedIds, skipped, oversold } = await prisma.$transaction(async (tx) => {
+      // 第一读只为拿锁定目标（舱位行 id），数值以锁后的重读为准。
+      const lockTargets = await tx.flightSchedule.findMany({
+        where: { id: { in: body.scheduleIds } },
+        include: { seatClasses: true },
+      });
+      const seatClassIds = lockTargets.flatMap((s) => s.seatClasses.map((c) => c.id));
+      if (typeof tx.$queryRaw === 'function') {
+        for (const seatClassId of seatClassIds) {
+          await tx.$queryRaw`
+            SELECT id FROM "FlightSeatClass" WHERE id = ${seatClassId} FOR UPDATE
+          `;
         }
-        scheduleUpdates.push({ seatClassId: current.id, capacity: item.capacity });
       }
-      if (overCapReason) {
-        skipped.push({ scheduleId, reason: overCapReason });
-        continue;
-      }
-      if (scheduleUpdates.length === 0) {
-        skipped.push({ scheduleId, reason: '该班次没有匹配的舱位' });
-        continue;
-      }
-      updates.push(...scheduleUpdates);
-      oversold.push(...scheduleOversold);
-      appliedIds.push(scheduleId);
-    }
-
-    if (updates.length > 0) {
-      await prisma.$transaction(
-        updates.map((u) =>
-          prisma.flightSeatClass.update({ where: { id: u.seatClassId }, data: { capacity: u.capacity } }),
-        ),
+      const schedules = await tx.flightSchedule.findMany({
+        where: { id: { in: body.scheduleIds } },
+        include: { seatClasses: true },
+      });
+      const scheduleById = new Map(schedules.map((s) => [s.id, s]));
+      const heldBySeatClass = await heldSeatsBySeatClass(
+        tx,
+        schedules.flatMap((s) => s.seatClasses.map((c) => c.id)),
       );
 
+      const appliedIds: string[] = [];
+      const skipped: Array<{ scheduleId: string; reason: string }> = [];
+      const updates: Array<{ seatClassId: string; capacity: number }> = [];
+      // 目标容量低于 sold + held 的班次：照改，但单列出来提示运营去协调（返回体 + 审计）。
+      // 锁位不计入：锁位只有 10 分钟，是瞬态库存，避免容量编辑随机受锁位到期影响。
+      const oversold: Array<{ scheduleId: string; cabin: CabinClass; sold: number; held: number; capacity: number; oversoldBy: number }> = [];
+      // 超售上限守卫（同 updateSchedule 口径，防止批量场景手滑输错容量炸更大的坑）
+      const maxOversell = env.FLIGHT_MAX_OVERSELL_SEATS;
+
+      for (const scheduleId of body.scheduleIds) {
+        const schedule = scheduleById.get(scheduleId);
+        if (!schedule) {
+          skipped.push({ scheduleId, reason: '班次不存在' });
+          continue;
+        }
+        const seatClassByCabin = new Map(schedule.seatClasses.map((c) => [c.cabin, c]));
+        const scheduleUpdates: Array<{ seatClassId: string; capacity: number }> = [];
+        const scheduleOversold: typeof oversold = [];
+        let overCapReason: string | null = null;
+        for (const item of body.seatClasses) {
+          const current = seatClassByCabin.get(item.cabin);
+          if (!current) continue; // 该班次没有此舱位：这一项静默跳过，不算失败
+          const held = heldBySeatClass.get(current.id) ?? 0;
+          const oversoldBy = current.sold + held - item.capacity;
+          if (oversoldBy > 0) {
+            if (oversoldBy > maxOversell) {
+              // 超过上限：整个班次不改（不部分应用），放进 skipped 带原因，不拖累其它班次
+              overCapReason = `${CABIN_LABEL[item.cabin]}超售 ${oversoldBy} 座（已售${current.sold}+占位${held}）超过上限 ${maxOversell} 座，请核对容量是否输错；上限可调`;
+              break;
+            }
+            scheduleOversold.push({
+              scheduleId,
+              cabin: item.cabin,
+              sold: current.sold,
+              held,
+              capacity: item.capacity,
+              oversoldBy,
+            });
+          }
+          scheduleUpdates.push({ seatClassId: current.id, capacity: item.capacity });
+        }
+        if (overCapReason) {
+          skipped.push({ scheduleId, reason: overCapReason });
+          continue;
+        }
+        if (scheduleUpdates.length === 0) {
+          skipped.push({ scheduleId, reason: '该班次没有匹配的舱位' });
+          continue;
+        }
+        updates.push(...scheduleUpdates);
+        oversold.push(...scheduleOversold);
+        appliedIds.push(scheduleId);
+      }
+
+      for (const u of updates) {
+        await tx.flightSeatClass.update({
+          where: { id: u.seatClassId },
+          data: { capacity: u.capacity },
+        });
+      }
+
+      return { appliedIds, skipped, oversold };
+    });
+
+    if (appliedIds.length > 0) {
       // 批量改动爆炸半径大 —— 写审计留痕（沿用 batchDeleteSchedules 的 fire-and-forget 口径）。
       await writeAudit({
         actor: actor ?? {},
