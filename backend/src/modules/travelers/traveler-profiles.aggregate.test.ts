@@ -132,6 +132,90 @@ describe('buildTravelerAggregates 行程与时间口径', () => {
   });
 });
 
+describe('pendingTripCount 在订未飞口径', () => {
+  it('只数去程未起飞的行程；与 tripCount 互补', () => {
+    const orders: AggOrder[] = [
+      order({
+        id: 'o1', // 已飞
+        passengers: [pax({ documentNumber: 'E12345678' })],
+        items: [flightItem('2026-03-01T02:00:00Z')],
+      }),
+      order({
+        id: 'o2', // 未飞
+        passengers: [pax({ documentNumber: 'E12345678' })],
+        items: [flightItem('2026-08-01T02:00:00Z')],
+      }),
+      order({
+        id: 'o3', // 未飞
+        passengers: [pax({ documentNumber: 'E12345678' })],
+        items: [flightItem('2026-09-01T02:00:00Z')],
+      }),
+    ];
+    const agg = buildTravelerAggregates(orders, NOW).get(KEY)!;
+    expect(agg.tripCount).toBe(1);
+    expect(agg.pendingTripCount).toBe(2);
+    expect(agg.tripCount + agg.pendingTripCount).toBe(agg.orderCount);
+  });
+
+  it('无航段的订单两边都不计（只进 orderCount）', () => {
+    const orders: AggOrder[] = [
+      order({
+        id: 'o1',
+        passengers: [pax({ documentNumber: 'E12345678' })],
+        items: [hotelItem('岘港示例酒店', '2026-09-01T00:00:00Z', '2026-09-05T00:00:00Z')],
+      }),
+    ];
+    const agg = buildTravelerAggregates(orders, NOW).get(KEY)!;
+    expect(agg.orderCount).toBe(1);
+    expect(agg.tripCount).toBe(0);
+    expect(agg.pendingTripCount).toBe(0);
+  });
+
+  it('恰好卡在当下起飞的行程算已飞，不算在订未飞', () => {
+    const orders: AggOrder[] = [
+      order({
+        id: 'o1',
+        passengers: [pax({ documentNumber: 'E12345678' })],
+        items: [flightItem(NOW.toISOString())],
+      }),
+    ];
+    const agg = buildTravelerAggregates(orders, NOW).get(KEY)!;
+    expect(agg.tripCount).toBe(1);
+    expect(agg.pendingTripCount).toBe(0);
+  });
+
+  it('一张往返单只算 1 次在订未飞，不按航段翻倍', () => {
+    const orders: AggOrder[] = [
+      order({
+        id: 'o1',
+        passengers: [pax({ documentNumber: 'E12345678' })],
+        items: [flightItem('2026-08-01T02:00:00Z'), flightItem('2026-08-09T02:00:00Z')],
+      }),
+    ];
+    const agg = buildTravelerAggregates(orders, NOW).get(KEY)!;
+    expect(agg.tripCount).toBe(0);
+    expect(agg.pendingTripCount).toBe(1);
+  });
+
+  it('别名归拢后新旧两证的在订未飞合并计数', () => {
+    const aliasMap = new Map([[docKey('PASSPORT', 'E00000001'), KEY]]);
+    const orders: AggOrder[] = [
+      order({
+        id: 'o1',
+        passengers: [pax({ documentNumber: 'E00000001' })], // 旧证，未飞
+        items: [flightItem('2026-08-01T02:00:00Z')],
+      }),
+      order({
+        id: 'o2',
+        passengers: [pax({ documentNumber: 'E12345678' })], // 新证，未飞
+        items: [flightItem('2026-09-01T02:00:00Z')],
+      }),
+    ];
+    const agg = buildTravelerAggregates(orders, NOW, aliasMap).get(KEY)!;
+    expect(agg.pendingTripCount).toBe(2);
+  });
+});
+
 describe('人均消费口径', () => {
   it('订单实付平摊到每位乘机人（含儿童），跨订单累加', () => {
     const orders: AggOrder[] = [

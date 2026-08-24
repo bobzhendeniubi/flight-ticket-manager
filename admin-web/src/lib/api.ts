@@ -1597,6 +1597,12 @@ export interface TravelerProfile {
   firstTripAt: string | null;
   lastTripAt: string | null;
   nextTripAt: string | null;
+  /** 在订未飞：去程还没起飞的行程数（不计入已飞 tripCount） */
+  pendingTripCount: number;
+  /** 已核销次数：本档案权益台账 sum(tripsUsed) 的净值（冲正条目已抵扣） */
+  redeemedTrips: number;
+  /** 可用次数 = tripCount − redeemedTrips；退改让已飞次数回落时可能为负，后端如实返回不截断 */
+  availableTrips: number;
   totalSpendCny: string; // 人均平摊口径，两位小数字符串
   prefCabin: string | null;
   prefBed: string | null;
@@ -1667,6 +1673,12 @@ export interface TravelerProfileSuggestion {
   documentNumber: string;
   passportExpiry: string | null;
   tripCount: number;
+  /** 在订未飞次数（口径同 TravelerProfile.pendingTripCount） */
+  pendingTripCount: number;
+  /** 已核销次数（权益台账净值） */
+  redeemedTrips: number;
+  /** 可用次数 = tripCount − redeemedTrips，可能为负 */
+  availableTrips: number;
   lastTripAt: string | null;
   prefCabin: string | null;
   prefBed: string | null;
@@ -1674,6 +1686,39 @@ export interface TravelerProfileSuggestion {
   prefSingleRoom: boolean;
   needsWheelchair: boolean;
   fillFields: TravelerProfileFillFields | null;
+}
+
+/**
+ * 权益核销台账条目（append-only，永不删改）。
+ * tripsUsed > 0 = 一次核销；tripsUsed < 0 = 冲正条目，reversalOfId 指向被冲正的原条目。
+ * 一条核销最多被冲正一次（后端唯一约束兜底）。
+ */
+export interface TravelerBenefitRedemption {
+  id: string;
+  profileId: string;
+  /** 扣减的次数；负数 = 冲正 */
+  tripsUsed: number;
+  /** 核销掉的权益内容（如「兑换一张免票」） */
+  benefit: string;
+  note: string | null;
+  /** 非 null = 本条是冲正条目，指向被冲正的原条目 id */
+  reversalOfId: string | null;
+  createdById: string;
+  /** 操作人姓名快照（后端落库时写死，改名不回溯） */
+  createdByName: string;
+  createdAt: string;
+}
+
+/** 按证件批量查档案次数（订单详情乘客区徽章用）；没有档案的证件不会出现在 results 里 */
+export interface TravelerProfileLookupRow {
+  documentType: DocumentType;
+  documentNumber: string;
+  profileId: string;
+  travelerNo: string;
+  tripCount: number;
+  pendingTripCount: number;
+  redeemedTrips: number;
+  availableTrips: number;
 }
 
 /** 合并档案返回：profile/trips = 合并后实时重算的主档案；merged = 被并入的旧档案摘要 */
@@ -3752,10 +3797,12 @@ export const api = {
     );
   },
   getTravelerProfile: (token: string, id: string) =>
-    apiFetch<{ profile: TravelerProfile; trips: TravelerProfileTrip[] }>(
-      `/travelers/profiles/${id}`,
-      { token },
-    ),
+    apiFetch<{
+      profile: TravelerProfile;
+      trips: TravelerProfileTrip[];
+      /** 权益核销台账，createdAt 倒序（最新的核销/冲正在最前） */
+      redemptions: TravelerBenefitRedemption[];
+    }>(`/travelers/profiles/${id}`, { token }),
   updateTravelerProfileNotes: (token: string, id: string, notes: string | null) =>
     apiFetch<{ profile: TravelerProfile }>(`/travelers/profiles/${id}/notes`, {
       method: 'PATCH',
@@ -3788,6 +3835,41 @@ export const api = {
       method: 'POST',
       token,
       body: { intoId },
+    }),
+  /**
+   * 核销权益：扣减 tripsUsed 次可用次数并记一条台账。
+   * 可用次数不足后端返 400（message 已是中文口径，直接展示给操作人）。
+   */
+  createTravelerRedemption: (
+    token: string,
+    id: string,
+    body: { tripsUsed: number; benefit: string; note?: string },
+  ) =>
+    apiFetch<{ redemption: TravelerBenefitRedemption }>(`/travelers/profiles/${id}/redemptions`, {
+      method: 'POST',
+      token,
+      body,
+    }),
+  /**
+   * 冲正：给写错的核销补一条负数流水，原条目原样留存。一条核销只能冲正一次（重复返 409）。
+   * body 必须发对象（哪怕不带 note），空 body 会被后端 400。
+   */
+  reverseTravelerRedemption: (token: string, id: string, redemptionId: string, note?: string) =>
+    apiFetch<{ reversal: TravelerBenefitRedemption; original: TravelerBenefitRedemption }>(
+      `/travelers/profiles/${id}/redemptions/${redemptionId}/reverse`,
+      { method: 'POST', token, body: note ? { note } : {} },
+    ),
+  /** 按证件批量查常旅客次数（单次 ≤100 条）；没建档的证件不会出现在 results 里 */
+  lookupTravelerProfiles: (
+    token: string,
+    documents: Array<{ documentType: DocumentType; documentNumber: string }>,
+    opts?: { signal?: AbortSignal },
+  ) =>
+    apiFetch<{ results: TravelerProfileLookupRow[] }>('/travelers/profiles/lookup', {
+      method: 'POST',
+      token,
+      body: { documents },
+      signal: opts?.signal,
     }),
 
   // Fulfillment

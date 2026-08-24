@@ -17,6 +17,11 @@ import {
   type TravelerAggregate,
   type TripSummary,
 } from './traveler-profiles.aggregate.js';
+import {
+  loadRedeemedTripsByProfile,
+  loadRedemptions,
+  withBenefitTotals,
+} from './traveler-benefits.service.js';
 import type { ListTravelerProfilesQuery } from './travelers.schemas.js';
 
 /** 有效订单口径：排除未成交/已取消/全退（proposal 拍板清单的默认值） */
@@ -49,6 +54,18 @@ interface ProfileRef {
 interface DocPair {
   documentType: DocumentType;
   documentNumber: string;
+}
+
+/** 批量查常旅客次数（lookupByDocuments）的单条结果 —— 订单详情抽屉「已飞/在订/可用」用 */
+export interface TravelerLookupResult {
+  documentType: DocumentType;
+  documentNumber: string;
+  profileId: string;
+  travelerNo: string;
+  tripCount: number;
+  pendingTripCount: number;
+  redeemedTrips: number;
+  availableTrips: number;
 }
 
 const orderSelect = {
@@ -127,6 +144,7 @@ function toProfileData(agg: TravelerAggregate, linkedUserId: string | null) {
     nationality: agg.nationality,
     passportExpiry: agg.passportExpiry,
     tripCount: agg.tripCount,
+    pendingTripCount: agg.pendingTripCount,
     orderCount: agg.orderCount,
     firstTripAt: agg.firstTripAt,
     lastTripAt: agg.lastTripAt,
@@ -199,12 +217,15 @@ export class TravelerProfilesService {
       }),
     ]);
 
+    // 权益台账合计：整页一次 groupBy（不是逐行查，避免 N+1）
+    const redeemedByProfile = await loadRedeemedTripsByProfile(rows.map((r) => r.id));
+
     return {
       // N4（提案 §1.4 隐私口径，2026-07-17 收口）：列表/导出默认脱敏证件号（前2后2）。
       // 前端 CSV 导出直接用列表数据 → 服务端一脱敏，导出自动是脱敏版，不再能批量导全号。
       // 全号只在详情页（getDetail，逐人查看）与录单联想（suggest，定向回填）返回。
       profiles: rows.map((r) => {
-        const p = serializeProfile(r);
+        const p = withBenefitTotals(serializeProfile(r), redeemedByProfile);
         return { ...p, documentNumber: maskDocumentNumber(p.documentNumber) };
       }),
       pagination: { page: query.page, pageSize: query.pageSize, total },
@@ -244,8 +265,13 @@ export class TravelerProfilesService {
     const agg = buildTravelerAggregates(orders, new Date(), aliasMap).get(key);
 
     // 订单已全部失效/删除 → 快照保留旧值展示，不臆造
+    // 台账照常返回：订单没了不等于核销没发生过（此时 availableTrips 可能为负，如实透出）
     if (!agg) {
-      return { profile: serializeProfile(master), trips: [] as TripSummary[] };
+      return {
+        profile: await this.attachBenefitTotals(master),
+        trips: [] as TripSummary[],
+        redemptions: await loadRedemptions(master.id),
+      };
     }
 
     const linkedUserId = await this.resolveLinkedUser(master.documentType, master.documentNumber);
@@ -256,7 +282,23 @@ export class TravelerProfilesService {
       documentNumber: master.documentNumber,
     };
     const updated = await prisma.travelerProfile.update({ where: { id: master.id }, data });
-    return { profile: serializeProfile(updated), trips: agg.trips };
+    return {
+      profile: await this.attachBenefitTotals(updated),
+      trips: agg.trips,
+      redemptions: await loadRedemptions(master.id),
+    };
+  }
+
+  /** 解析到主档案（指针行跟随 mergedIntoId 链）；台账写入前定位归属用，比 getDetail 轻得多 */
+  async resolveMaster(id: string): Promise<ProfileRow> {
+    const row = await prisma.travelerProfile.findUnique({ where: { id } });
+    if (!row) throw new NotFoundError('旅客档案不存在');
+    const refs = await this.loadProfileRefs();
+    const masterRef = resolveMasterRef(refs.get(row.id)!, refs);
+    if (masterRef.id === row.id) return row;
+    const master = await prisma.travelerProfile.findUnique({ where: { id: masterRef.id } });
+    if (!master) throw new NotFoundError('旅客档案不存在');
+    return master;
   }
 
   async updateNotes(id: string, notes: string | null) {
@@ -290,7 +332,13 @@ export class TravelerProfilesService {
         : source.notes
       : target.notes;
 
-    await prisma.$transaction([
+    // 权益台账跟着人走：source 的核销/冲正流水整体 repoint 到主档案，
+    // 与 mergedIntoId 同一个事务 —— 否则中途失败会留下挂在指针行上、谁也算不到的孤儿流水。
+    const [movedRedemptions] = await prisma.$transaction([
+      prisma.travelerBenefitRedemption.updateMany({
+        where: { profileId: source.id },
+        data: { profileId: target.id },
+      }),
       prisma.travelerProfile.update({
         where: { id: source.id },
         data: { mergedIntoId: target.id },
@@ -303,6 +351,8 @@ export class TravelerProfilesService {
     return {
       profile: detail.profile,
       trips: detail.trips,
+      redemptions: detail.redemptions,
+      movedRedemptions: movedRedemptions.count,
       source: {
         id: source.id,
         travelerNo: formatTravelerNo(source.travelerNo),
@@ -372,6 +422,9 @@ export class TravelerProfilesService {
       .sort((a, b) => b.tripCount - a.tripCount)
       .slice(0, limit);
 
+    // 联想条数已被 limit 卡死（≤20），仍走一次 groupBy 汇总，口径与列表/详情一致
+    const redeemedByProfile = await loadRedeemedTripsByProfile(profiles.map((p) => p.id));
+
     return Promise.all(
       profiles.map(async (p) => ({
         id: p.id,
@@ -385,6 +438,9 @@ export class TravelerProfilesService {
         documentNumber: p.documentNumber,
         passportExpiry: p.passportExpiry,
         tripCount: p.tripCount,
+        pendingTripCount: p.pendingTripCount,
+        redeemedTrips: redeemedByProfile.get(p.id) ?? 0,
+        availableTrips: p.tripCount - (redeemedByProfile.get(p.id) ?? 0),
         lastTripAt: p.lastTripAt,
         prefCabin: p.prefCabin,
         prefBed: p.prefBed,
@@ -397,6 +453,74 @@ export class TravelerProfilesService {
         ),
       })),
     );
+  }
+
+  /**
+   * 批量查常旅客次数（按证件号，供订单详情抽屉一次拉「已飞/在订/可用」）。
+   * 只读快照值，不触发重算/重建。命中指针行（mergedIntoId 非空）时取主档案的值——
+   * merge() 只允许并入 canonical 行（不许把档案并进指针行，见该方法），所以 mergedIntoId
+   * 保证最多一跳，这里不必像 getDetail 那样拉全表走 resolveMasterRef 的链解析。
+   * 返回的 documentType/documentNumber 保持请求里的原证件（前端按它对回乘客）；
+   * 没有匹配到档案的证件不出现在结果里。一次 findMany（命中指针行时再补一次主档案 findMany，
+   * 按去重后的主档案 id 数一次性批量查，不随证件数增长）+ 一次 redemption groupBy，无 N+1。
+   */
+  async lookupByDocuments(documents: DocPair[]): Promise<TravelerLookupResult[]> {
+    if (documents.length === 0) return [];
+
+    const hits = await prisma.travelerProfile.findMany({
+      where: {
+        OR: documents.map((d) => ({
+          documentType: d.documentType,
+          documentNumber: d.documentNumber,
+        })),
+      },
+    });
+    if (hits.length === 0) return [];
+
+    const hitByKey = new Map<string, ProfileRow>();
+    const rowById = new Map<string, ProfileRow>();
+    for (const h of hits) {
+      hitByKey.set(docKey(h.documentType, h.documentNumber), h);
+      rowById.set(h.id, h);
+    }
+
+    const missingMasterIds = new Set<string>();
+    for (const h of hits) {
+      if (h.mergedIntoId && !rowById.has(h.mergedIntoId)) missingMasterIds.add(h.mergedIntoId);
+    }
+    if (missingMasterIds.size > 0) {
+      const extraMasters = await prisma.travelerProfile.findMany({
+        where: { id: { in: [...missingMasterIds] } },
+      });
+      for (const m of extraMasters) rowById.set(m.id, m);
+    }
+
+    // 主档案被删导致断链（罕见：全量重建 prune 只保护有订单/有台账的 canonical 行，
+    // 见 doRebuildAll 的注释）时，停在指针行本身兜底展示，不抛错。
+    const masterOf = (row: ProfileRow): ProfileRow =>
+      row.mergedIntoId ? (rowById.get(row.mergedIntoId) ?? row) : row;
+
+    const masterIds = [...new Set(hits.map((h) => masterOf(h).id))];
+    const redeemedByProfile = await loadRedeemedTripsByProfile(masterIds);
+
+    const results: TravelerLookupResult[] = [];
+    for (const doc of documents) {
+      const hit = hitByKey.get(docKey(doc.documentType, doc.documentNumber));
+      if (!hit) continue;
+      const master = masterOf(hit);
+      const redeemedTrips = redeemedByProfile.get(master.id) ?? 0;
+      results.push({
+        documentType: doc.documentType,
+        documentNumber: doc.documentNumber,
+        profileId: master.id,
+        travelerNo: formatTravelerNo(master.travelerNo),
+        tripCount: master.tripCount,
+        pendingTripCount: master.pendingTripCount,
+        redeemedTrips,
+        availableTrips: master.tripCount - redeemedTrips,
+      });
+    }
+    return results;
   }
 
   /**
@@ -457,14 +581,22 @@ export class TravelerProfilesService {
       keptIds.push(row.id);
     }
 
-    // prune 只清 canonical 行：指针行没有对应聚合（订单都归拢进主档案了），必须保留合并关系
+    // prune 只清 canonical 行：指针行没有对应聚合（订单都归拢进主档案了），必须保留合并关系。
+    // 带权益台账的档案一律不清 —— 流水是 append-only 的账，订单被退光也不能把账连人一起抹掉
+    // （数据库那边 profileId 外键是 RESTRICT，这里再挡一道，让重建永远撞不上外键报错）。
     const { count: removed } = await prisma.travelerProfile.deleteMany({
-      where: { id: { notIn: keptIds }, mergedIntoId: null },
+      where: { id: { notIn: keptIds }, mergedIntoId: null, redemptions: { none: {} } },
     });
     return { built: keptIds.length, removed };
   }
 
   // ── private ──
+
+  /** 单档案序列化 + 权益台账合计（availableTrips 可为负，不截断） */
+  private async attachBenefitTotals(row: ProfileRow) {
+    const redeemedByProfile = await loadRedeemedTripsByProfile([row.id]);
+    return withBenefitTotals(serializeProfile(row), redeemedByProfile);
+  }
 
   /** 全表最小行（含指针行），供别名解析；内部量级（千级档案）一次拉全量可接受 */
   private async loadProfileRefs(): Promise<Map<string, ProfileRef>> {
@@ -638,6 +770,7 @@ function serializeProfile(row: ProfileRow) {
     nationality: row.nationality,
     passportExpiry: row.passportExpiry,
     tripCount: row.tripCount,
+    pendingTripCount: row.pendingTripCount,
     orderCount: row.orderCount,
     firstTripAt: row.firstTripAt,
     lastTripAt: row.lastTripAt,

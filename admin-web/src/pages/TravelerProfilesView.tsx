@@ -11,6 +11,7 @@ import {
   api,
   ApiError,
   type ListTravelerProfilesResult,
+  type TravelerBenefitRedemption,
   type TravelerProfile,
   type TravelerProfileSuggestion,
   type TravelerProfileTrip,
@@ -44,6 +45,12 @@ const PASSPORT_EXPIRY_WARN_DAYS = 180;
 
 const PAGE_SIZE = 100;
 
+/** 核销权益默认扣减次数（同本护照飞满 5 次兑换航司权益的常见口径；表单里可改） */
+const DEFAULT_REDEEM_TRIPS = 5;
+
+/** 可用次数为负的说明：不是算错，是订单退改把已飞次数拉回来了 */
+const NEGATIVE_AVAILABLE_HINT = '订单退改导致已飞次数回落，非系统算错';
+
 type SortKey = 'lastTripAt' | 'nextTripAt' | 'tripCount' | 'totalSpendCny';
 
 function fmtDate(iso: string | null): string {
@@ -63,6 +70,11 @@ function calcAge(dobIso: string | null): number | null {
   const m = now.getMonth() - d.getMonth();
   if (m < 0 || (m === 0 && now.getDate() < d.getDate())) age--;
   return age;
+}
+
+function fmtDateTime(iso: string): string {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString('zh-CN');
 }
 
 function passportExpiryDays(iso: string | null): number | null {
@@ -155,6 +167,9 @@ export function TravelerProfilesView() {
       { key: 'documentNumber', label: '证件号' },
       { key: 'dateOfBirth', label: '生日', format: (v) => (v ? String(v).slice(0, 10) : '') },
       { key: 'tripCount', label: '飞行次数' },
+      { key: 'redeemedTrips', label: '已核销' },
+      { key: 'availableTrips', label: '可用次数' },
+      { key: 'pendingTripCount', label: '在订未飞' },
       { key: 'orderCount', label: '订单数' },
       { key: 'firstTripAt', label: '首次出行', format: (v) => (v ? String(v).slice(0, 10) : '') },
       { key: 'lastTripAt', label: '最近出行', format: (v) => (v ? String(v).slice(0, 10) : '') },
@@ -290,6 +305,21 @@ export function TravelerProfilesView() {
                       {p.tripCount >= 2 && (
                         <div className="text-[10px] text-emerald-600 font-medium">回头客</div>
                       )}
+                      {/* 在订/可用只在有内容时露出：在订=0 与「没核销过」的档案保持原样，避免全表噪音 */}
+                      {(p.pendingTripCount > 0 || p.redeemedTrips !== 0) && (
+                        <div className="text-[10px] text-ink-muted nums">
+                          {p.pendingTripCount > 0 && <span>在订 {p.pendingTripCount}</span>}
+                          {p.pendingTripCount > 0 && p.redeemedTrips !== 0 && <span> · </span>}
+                          {p.redeemedTrips !== 0 && (
+                            <span
+                              className={p.availableTrips < 0 ? 'text-red-600 font-medium' : undefined}
+                              title={p.availableTrips < 0 ? NEGATIVE_AVAILABLE_HINT : undefined}
+                            >
+                              可用 {p.availableTrips}
+                            </span>
+                          )}
+                        </div>
+                      )}
                     </td>
                     <td className="text-xs text-ink-soft">{fmtDate(p.lastTripAt)}</td>
                     <td className="text-xs">
@@ -407,11 +437,16 @@ function ProfileDrawer({
   const tokens = useAuth((s) => s.tokens);
   const [profile, setProfile] = useState<TravelerProfile | null>(null);
   const [trips, setTrips] = useState<TravelerProfileTrip[]>([]);
+  const [redemptions, setRedemptions] = useState<TravelerBenefitRedemption[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [notesDraft, setNotesDraft] = useState('');
   const [savingNotes, setSavingNotes] = useState(false);
   const [notesSaved, setNotesSaved] = useState(false);
+  // 核销/冲正后重拉详情：可用次数与台账都由后端算，前端不本地推演
+  const [detailNonce, setDetailNonce] = useState(0);
+  // 备注草稿只在首次打开该档案时灌入：核销后的重拉不能把操作人正在写的备注冲掉
+  const notesLoadedForRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (!tokens?.accessToken) return;
@@ -424,7 +459,11 @@ function ProfileDrawer({
         if (cancelled) return;
         setProfile(r.profile);
         setTrips(r.trips);
-        setNotesDraft(r.profile.notes ?? '');
+        setRedemptions(r.redemptions);
+        if (notesLoadedForRef.current !== profileId) {
+          notesLoadedForRef.current = profileId;
+          setNotesDraft(r.profile.notes ?? '');
+        }
       })
       .catch((e) => {
         if (!cancelled) setError(e instanceof ApiError ? e.message : '加载失败');
@@ -435,7 +474,7 @@ function ProfileDrawer({
     return () => {
       cancelled = true;
     };
-  }, [tokens?.accessToken, profileId]);
+  }, [tokens?.accessToken, profileId, detailNonce]);
 
   const saveNotes = async () => {
     if (!tokens?.accessToken || !profile) return;
@@ -494,12 +533,27 @@ function ProfileDrawer({
               {/* 出行统计 */}
               <section className="grid grid-cols-3 gap-2">
                 <MiniStat label="已飞行程" value={String(profile.tripCount)} />
+                <MiniStat label="在订未飞" value={String(profile.pendingTripCount)} />
                 <MiniStat label="有效订单" value={String(profile.orderCount)} />
+                <MiniStat label="已核销" value={String(profile.redeemedTrips)} />
+                <MiniStat
+                  label="可用次数"
+                  value={String(profile.availableTrips)}
+                  danger={profile.availableTrips < 0}
+                  title={profile.availableTrips < 0 ? NEGATIVE_AVAILABLE_HINT : undefined}
+                />
                 <MiniStat label="累计消费(人均)" value={fmtCny(profile.totalSpendCny)} />
                 <MiniStat label="首次出行" value={fmtDate(profile.firstTripAt)} />
                 <MiniStat label="最近出行" value={fmtDate(profile.lastTripAt)} />
                 <MiniStat label="下次出行" value={fmtDate(profile.nextTripAt)} highlight={Boolean(profile.nextTripAt)} />
               </section>
+
+              {/* 权益核销台账（只增不改：录错走冲正） */}
+              <RedemptionsSection
+                profile={profile}
+                redemptions={redemptions}
+                onChanged={() => setDetailNonce((n) => n + 1)}
+              />
 
               {/* 身份信息 */}
               <section>
@@ -644,6 +698,204 @@ function ProfileDrawer({
         </div>
       </div>
     </div>
+  );
+}
+
+/**
+ * 权益核销台账 —— 只增不改的流水：核销扣可用次数，录错不删改，补一条冲正。
+ * 可用次数一律以后端返回为准（核销/冲正成功后重拉详情），前端不本地推演余额。
+ */
+function RedemptionsSection({
+  profile,
+  redemptions,
+  onChanged,
+}: {
+  profile: TravelerProfile;
+  redemptions: TravelerBenefitRedemption[];
+  /** 台账有变动（核销 / 冲正成功）→ 让抽屉重拉详情 */
+  onChanged: () => void;
+}) {
+  const tokens = useAuth((s) => s.tokens);
+  const [formOpen, setFormOpen] = useState(false);
+  const [tripsUsed, setTripsUsed] = useState(String(DEFAULT_REDEEM_TRIPS));
+  const [benefit, setBenefit] = useState('');
+  const [note, setNote] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [reversingId, setReversingId] = useState<string | null>(null);
+  const [opError, setOpError] = useState<string | null>(null);
+
+  // 已被冲正的原条目 id 集合（冲正条目的 reversalOfId 指回原条目）
+  const reversedIds = useMemo(
+    () => new Set(redemptions.map((r) => r.reversalOfId).filter((id): id is string => Boolean(id))),
+    [redemptions],
+  );
+
+  const resetForm = () => {
+    setFormOpen(false);
+    setTripsUsed(String(DEFAULT_REDEEM_TRIPS));
+    setBenefit('');
+    setNote('');
+    setOpError(null);
+  };
+
+  const submitRedeem = async () => {
+    if (!tokens?.accessToken || submitting) return;
+    const trips = Number(tripsUsed);
+    if (!Number.isInteger(trips) || trips <= 0) {
+      setOpError('扣减次数必须是正整数');
+      return;
+    }
+    if (!benefit.trim()) {
+      setOpError('请填写核销掉的权益内容');
+      return;
+    }
+    setSubmitting(true);
+    setOpError(null);
+    try {
+      await api.createTravelerRedemption(tokens.accessToken, profile.id, {
+        tripsUsed: trips,
+        benefit: benefit.trim(),
+        note: note.trim() || undefined,
+      });
+      resetForm();
+      onChanged();
+    } catch (e) {
+      // 可用次数不足等：后端 message 已是给操作人看的中文口径，原样展示
+      setOpError(e instanceof ApiError ? e.message : '核销失败');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const reverse = async (entry: TravelerBenefitRedemption) => {
+    if (!tokens?.accessToken || reversingId) return;
+    const ok = window.confirm(
+      `确认冲正这条核销？\n\n${fmtDateTime(entry.createdAt)} · 扣 ${entry.tripsUsed} 次 · ${entry.benefit}\n\n` +
+        '冲正会把这 ' +
+        entry.tripsUsed +
+        ' 次退回可用次数，原记录保留不删除，且一条核销只能冲正一次。',
+    );
+    if (!ok) return;
+    setReversingId(entry.id);
+    setOpError(null);
+    try {
+      await api.reverseTravelerRedemption(tokens.accessToken, profile.id, entry.id);
+      onChanged();
+    } catch (e) {
+      // 409 = 已经冲正过；其余按后端 message 展示
+      setOpError(e instanceof ApiError ? e.message : '冲正失败');
+    } finally {
+      setReversingId(null);
+    }
+  };
+
+  return (
+    <section>
+      <div className="mb-2 flex items-center justify-between gap-2">
+        <h3 className="text-xs font-semibold uppercase text-slate-500">
+          权益核销（{redemptions.length} 条）
+        </h3>
+        {!formOpen && (
+          <button className="btn-secondary text-xs" onClick={() => setFormOpen(true)}>
+            核销权益
+          </button>
+        )}
+      </div>
+
+      <p className="mb-2 text-xs text-ink-muted">
+        可用 <span className={profile.availableTrips < 0 ? 'font-medium text-red-600' : 'font-medium text-ink'}>
+          {profile.availableTrips}
+        </span>{' '}
+        次（已飞 {profile.tripCount} − 已核销 {profile.redeemedTrips}）。台账只增不改，录错请冲正。
+      </p>
+
+      {formOpen && (
+        <div className="mb-2 space-y-2 rounded border border-slate-200 p-3">
+          <div className="grid grid-cols-3 gap-2">
+            <div>
+              <label className="label text-xs">扣减次数</label>
+              <input
+                className="input text-sm"
+                type="number"
+                min={1}
+                step={1}
+                value={tripsUsed}
+                onChange={(e) => setTripsUsed(e.target.value)}
+              />
+            </div>
+            <div className="col-span-2">
+              <label className="label text-xs">权益内容（必填）</label>
+              <input
+                className="input text-sm"
+                placeholder="如：兑换航司免票一张 / 升舱一段"
+                value={benefit}
+                onChange={(e) => setBenefit(e.target.value)}
+              />
+            </div>
+          </div>
+          <div>
+            <label className="label text-xs">备注（选填）</label>
+            <input
+              className="input text-sm"
+              placeholder="如：兑换单号 / 客人电话确认"
+              value={note}
+              onChange={(e) => setNote(e.target.value)}
+            />
+          </div>
+          <div className="flex items-center gap-2">
+            <button className="btn-primary text-xs" onClick={submitRedeem} disabled={submitting}>
+              {submitting ? '提交中…' : '确认核销'}
+            </button>
+            <button className="btn-secondary text-xs" onClick={resetForm} disabled={submitting}>
+              取消
+            </button>
+          </div>
+        </div>
+      )}
+
+      {opError && <p className="mb-2 text-xs text-red-600">{opError}</p>}
+
+      <ul className="space-y-1.5">
+        {redemptions.map((r) => {
+          const isReversal = r.tripsUsed < 0;
+          const isReversed = reversedIds.has(r.id);
+          return (
+            <li
+              key={r.id}
+              className={`rounded border p-2.5 text-xs ${
+                isReversal ? 'border-slate-200 bg-slate-50 text-slate-500' : 'border-slate-200'
+              }`}
+            >
+              <div className="flex items-start justify-between gap-2">
+                <div className={isReversed ? 'line-through' : undefined}>
+                  <span className={`font-semibold nums ${isReversal ? 'text-slate-500' : 'text-slate-900'}`}>
+                    {r.tripsUsed > 0 ? `−${r.tripsUsed}` : `+${-r.tripsUsed}`} 次
+                  </span>
+                  <span className="ml-2">{r.benefit}</span>
+                  {isReversal && <span className="badge-neutral ml-2">冲正</span>}
+                  {isReversed && <span className="badge-neutral ml-2">已冲正</span>}
+                </div>
+                {!isReversal && !isReversed && (
+                  <button
+                    className="shrink-0 text-xs font-medium text-red-600 hover:text-red-700 disabled:opacity-50"
+                    onClick={() => reverse(r)}
+                    disabled={reversingId !== null}
+                  >
+                    {reversingId === r.id ? '冲正中…' : '冲正'}
+                  </button>
+                )}
+              </div>
+              <div className="mt-0.5 text-slate-400">
+                {fmtDateTime(r.createdAt)}
+                {r.createdByName && ` · 经手 ${r.createdByName}`}
+              </div>
+              {r.note && <div className="mt-0.5 text-slate-500">📝 {r.note}</div>}
+            </li>
+          );
+        })}
+        {redemptions.length === 0 && <li className="text-xs text-ink-muted">还没有核销记录</li>}
+      </ul>
+    </section>
   );
 }
 
@@ -800,11 +1052,25 @@ function MergeSection({ profile, onMerged }: { profile: TravelerProfile; onMerge
   );
 }
 
-function MiniStat({ label, value, highlight }: { label: string; value: string; highlight?: boolean }) {
+function MiniStat({
+  label,
+  value,
+  highlight,
+  danger,
+  title,
+}: {
+  label: string;
+  value: string;
+  highlight?: boolean;
+  /** 数值异常（如可用次数为负）：红字 + title 说明，别让人以为系统算错 */
+  danger?: boolean;
+  title?: string;
+}) {
+  const tone = danger ? 'text-red-600' : highlight ? 'text-brand' : 'text-slate-900';
   return (
-    <div className="rounded bg-slate-50 p-2 text-center">
+    <div className="rounded bg-slate-50 p-2 text-center" title={title}>
       <div className="text-[10px] text-slate-500">{label}</div>
-      <div className={`mt-0.5 text-sm font-semibold nums ${highlight ? 'text-brand' : 'text-slate-900'}`}>{value}</div>
+      <div className={`mt-0.5 text-sm font-semibold nums ${tone}`}>{value}</div>
     </div>
   );
 }

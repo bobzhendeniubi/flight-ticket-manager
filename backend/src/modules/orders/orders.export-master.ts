@@ -16,8 +16,14 @@
  *   - 飞行次数 = 该乘客的常旅客历史飞行次数（按证件号归拢，只计去程已起飞的行程），
  *     取自 TravelerProfile.tripCount —— 是「这个人跟我们飞过几次」，与本单航段数无关，
  *     故同一订单不同乘客的飞行次数互不相同。匹配不到档案（新客/证件号对不上）→ 留空。
- *     该列读自档案快照表（值是上次重建时的，见 TravelerProfile.refreshedAt）；导出不触发
- *     重建（全量重建太慢，不能挂在导出请求上）。
+ *     该列读自档案快照表（值是上次重建时的，见 TravelerProfile.refreshedAt）；快照表一条
+ *     都没有时（新环境 / 从没人开过档案页）会导致整列全部留空，导出会先同步做一次全量首建
+ *     兜底。非空但过期的快照不归导出管——那由档案页自身访问时的后台重建负责刷新，导出不为
+ *     此额外重建（全量重建太慢，不能挂在每次导出请求上）。
+ *   - 在订未飞 = TravelerProfile.pendingTripCount（同一条快照重算链路回写，快照口径同飞行次数）。
+ *   - 可用次数 = 飞行次数（已飞）− 已核销权益次数（TravelerBenefitRedemption 流水 sum，
+ *     核销/冲正同一档案），可为负——核销后订单又被退改导致已飞回落时如实透出，不截断也不臆造。
+ *     核销流水挂在合并链的主档案上，取值前已沿 mergedIntoId 解析到主档案。
  *   - 金额列（结算价/到账/尾款/单房差/签证/退款/订单成本）均为「每位出行人」均摊，
  *     与《全岗可用》模板同口径，避免按订单总额被误读为每人都付了全款。
  */
@@ -28,6 +34,7 @@ import { OrderStatus } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import type { BundleItemJson } from '../../lib/json-types.js';
 import { docKey } from '../travelers/traveler-profiles.aggregate.js';
+import { TravelerProfilesService } from '../travelers/traveler-profiles.service.js';
 import { toAlpha3 } from './nationality.js';
 import { parseRoomGroups, resolveExportHotelName } from './orders.export-room-allocation.js';
 import { nameWithTitle, pnrName, VISA_REQUIREMENT_LABEL } from './orders.export-templates.js';
@@ -156,6 +163,12 @@ export interface MasterRow {
   // 常旅客历史飞行次数（TravelerProfile.tripCount 快照）：按证件号归拢、只计去程已起飞的行程。
   // 每位乘客各不相同；匹配不到档案 → 留空。与本单航段数无关。
   flightCount: string;
+  // 在订未飞（TravelerProfile.pendingTripCount 快照，同一条重算链路回写）：有去程航班且
+  // 尚未起飞的有效订单数。匹配不到档案 → 留空，口径同飞行次数。
+  pendingTripCount: string;
+  // 可用次数 = 飞行次数（已飞）− 已核销权益次数（TravelerBenefitRedemption 流水 sum）。
+  // 可为负——核销后订单又被退改导致已飞回落时如实透出。匹配不到档案 → 留空。
+  availableTrips: string;
   travelDates: string; // 出发(往返)日期
   flightNumbers: string; // 航班号（去⇌回）
   orderType: string; // 往返票/单程票/品类
@@ -216,6 +229,26 @@ const MASTER_COLUMNS: MasterColumn[] = [
     width: 8,
     note:
       '常旅客历史飞行次数：按证件号归拢，只计去程已起飞的行程（不是本单航段数）。\n' +
+      '匹配不到旅客档案（新客/证件号对不上）留空。\n' +
+      '数据为旅客档案快照，非导出时实时重算。',
+    roles: ['all', 'ticketing'],
+  },
+  {
+    header: '在订未飞',
+    key: 'pendingTripCount',
+    width: 10,
+    note:
+      '已下单但去程尚未起飞的有效订单数（快照口径同飞行次数）。\n' +
+      '匹配不到旅客档案（新客/证件号对不上）留空。\n' +
+      '数据为旅客档案快照，非导出时实时重算。',
+    roles: ['all', 'ticketing'],
+  },
+  {
+    header: '可用次数',
+    key: 'availableTrips',
+    width: 10,
+    note:
+      '= 已飞次数 − 已核销权益次数；负数=核销后订单退改导致已飞回落，请到旅客档案页核对。\n' +
       '匹配不到旅客档案（新客/证件号对不上）留空。\n' +
       '数据为旅客档案快照，非导出时实时重算。',
     roles: ['all', 'ticketing'],
@@ -291,14 +324,21 @@ export const MASTER_EXPORT_INCLUDE = {
 
 export type OrderForMasterExport = Prisma.OrderGetPayload<{ include: typeof MASTER_EXPORT_INCLUDE }>;
 
-// ── 常旅客历史飞行次数（TravelerProfile.tripCount）─────────────────────────────
-/** docKey(证件类型|证件号) → 该旅客历史飞行次数。渲染纯函数只认这张 Map，不碰 DB。*/
-export type TripCountMap = Map<string, number>;
+// ── 常旅客历史飞行次数 / 在订未飞 / 可用次数（TravelerProfile 快照 + 权益核销台账）──────
+/** 一位旅客的三项快照口径数字：飞行次数（已飞）/ 在订未飞 / 可用次数（已飞−已核销，可为负）。*/
+export interface TripStats {
+  tripCount: number;
+  pendingTripCount: number;
+  availableTrips: number;
+}
+
+/** docKey(证件类型|证件号) → 该旅客的三项快照数字。渲染纯函数只认这张 Map，不碰 DB。*/
+export type TripStatsMap = Map<string, TripStats>;
 
 /** 快照新鲜度：本次导出用到的档案里最旧的一条重建时间（null = 一条都没匹配上）。*/
 export interface TripCountLookup {
-  tripCounts: TripCountMap;
-  /** 表头批注用：让读表的人知道这列是快照、有多旧。*/
+  tripStats: TripStatsMap;
+  /** 表头批注用：让读表的人知道这几列是快照、有多旧。*/
   oldestRefreshedAt: Date | null;
 }
 
@@ -308,6 +348,7 @@ interface ProfileRef {
   documentType: DocumentType;
   documentNumber: string;
   tripCount: number;
+  pendingTripCount: number;
   refreshedAt: Date;
   mergedIntoId: string | null;
 }
@@ -316,15 +357,17 @@ interface ProfileRef {
 const MAX_MERGE_HOPS = 4;
 
 /**
- * 拉取本次导出全部乘客的常旅客档案 → docKey → tripCount。
+ * 拉取本次导出全部乘客的常旅客档案 → docKey → { 飞行次数, 在订未飞, 可用次数 }。
  *
  * 无 N+1：先按 (证件类型,证件号) 组合一次 findMany（走 @@unique([documentType, documentNumber])），
  * 再对「命中的档案是指针行（mergedIntoId 非空）」的情况按 id 批量补拉主档案 —— 每一跳一条查询，
- * 实践中最多一跳（合并时禁止把档案并入指针行，链深恒为 1）。几百位乘客也只有 1~2 条查询。
+ * 实践中最多一跳（合并时禁止把档案并入指针行，链深恒为 1）。之后再加一条 groupBy 取回全部命中
+ * 主档案的已核销次数合计（可用次数 = 飞行次数 − 已核销）。几百位乘客也只有 2~3 条查询。
  *
- * mergedIntoId：合并过的档案 tripCount 累积在主档案上，指针行留的是合并前的残值 ——
- * 直读源档案会少算。命中指针行时沿链跟随到主档案取值（防环：记录已访问 id）。
- * 客人报旧护照号下的单，也能因此拿到归一后的真实飞行次数。
+ * mergedIntoId：合并过的档案 tripCount/pendingTripCount 累积在主档案上，指针行留的是合并前的
+ * 残值 —— 直读源档案会少算；核销流水（TravelerBenefitRedemption）同理只挂在主档案上。命中
+ * 指针行时沿链跟随到主档案取值（防环：记录已访问 id）。客人报旧护照号下的单，也能因此拿到
+ * 归一后的真实数字。
  */
 export async function loadTripCountMap(
   passengers: readonly { documentType: DocumentType; documentNumber: string }[],
@@ -335,6 +378,7 @@ export async function loadTripCountMap(
     documentType: true,
     documentNumber: true,
     tripCount: true,
+    pendingTripCount: true,
     refreshedAt: true,
     mergedIntoId: true,
   } as const;
@@ -348,7 +392,7 @@ export async function loadTripCountMap(
       documentNumber: p.documentNumber,
     });
   }
-  if (pairByKey.size === 0) return { tripCounts: new Map(), oldestRefreshedAt: null };
+  if (pairByKey.size === 0) return { tripStats: new Map(), oldestRefreshedAt: null };
 
   const matched = (await client.travelerProfile.findMany({
     where: { OR: [...pairByKey.values()] },
@@ -370,16 +414,45 @@ export async function loadTripCountMap(
     for (const m of masters) byId.set(m.id, m);
   }
 
-  const tripCounts: TripCountMap = new Map();
+  // 已核销次数合计（可用次数 = 飞行次数 − 已核销）：一次 groupBy 覆盖全部命中的主档案，
+  // 与 traveler-benefits.service.ts 的 loadRedeemedTripsByProfile 同口径，
+  // 此处不复用该函数——它内部固定读默认 prisma，本函数需支持注入 client 以便单测。
+  const masterIds = new Set<string>();
+  for (const row of matched) masterIds.add(resolveMaster(row, byId).id);
+  let redeemedByProfile = new Map<string, number>();
+  if (masterIds.size > 0) {
+    // Prisma 5 的 groupBy 条件泛型在注入 PrismaClient 时会把可选 orderBy 推成错误的
+    // 必填交集；这里固定本查询的参数/结果形状，保留编译期字段约束又避免污染业务调用。
+    const groupByRedemptions = client.travelerBenefitRedemption.groupBy as unknown as (args: {
+      by: ['profileId'];
+      where: { profileId: { in: string[] } };
+      orderBy: { profileId: 'asc' };
+      _sum: { tripsUsed: true };
+    }) => Promise<{ profileId: string; _sum: { tripsUsed: number | null } }[]>;
+    const redemptionGroups = await groupByRedemptions({
+      by: ['profileId'],
+      where: { profileId: { in: [...masterIds] } },
+      orderBy: { profileId: 'asc' },
+      _sum: { tripsUsed: true },
+    });
+    redeemedByProfile = new Map(redemptionGroups.map((g) => [g.profileId, g._sum.tripsUsed ?? 0]));
+  }
+
+  const tripStats: TripStatsMap = new Map();
   let oldestRefreshedAt: Date | null = null;
   for (const row of matched) {
     const master = resolveMaster(row, byId);
-    tripCounts.set(docKey(row.documentType, row.documentNumber), master.tripCount);
+    const redeemedTrips = redeemedByProfile.get(master.id) ?? 0;
+    tripStats.set(docKey(row.documentType, row.documentNumber), {
+      tripCount: master.tripCount,
+      pendingTripCount: master.pendingTripCount,
+      availableTrips: master.tripCount - redeemedTrips,
+    });
     if (!oldestRefreshedAt || master.refreshedAt < oldestRefreshedAt) {
       oldestRefreshedAt = master.refreshedAt;
     }
   }
-  return { tripCounts, oldestRefreshedAt };
+  return { tripStats, oldestRefreshedAt };
 }
 
 /**
@@ -400,6 +473,27 @@ function resolveMaster(start: ProfileRef, byId: Map<string, ProfileRef>): Profil
   return current;
 }
 
+/**
+ * 空表首建兜底：若本次导出确实有乘客、但快照表一条记录都没有（新环境 / 从没人开过档案页），
+ * 直接读 loadTripCountMap 只会拿到空 Map → 整列留空。这里同步做一次全量重建把表填起来。
+ *
+ * 只处理「空表」这一种情况——非空但过期的快照不归导出管，那是档案页自身访问时
+ * （traveler-profiles.service.ts 的 ensureFresh）负责的后台刷新；导出依旧不为过期快照
+ * 触发重建（全量重建太慢，不能挂在每次导出请求上，见文件头部口径说明）。
+ *
+ * rebuild 参数化：便于单测在不真正跑全量重建的前提下断言「空表触发/非空不触发」。
+ */
+export async function bootstrapTripCountProfilesIfEmpty(
+  passengerCount: number,
+  client: PrismaClient,
+  rebuild: () => Promise<unknown>,
+): Promise<void> {
+  if (passengerCount === 0) return;
+  const existing = await client.travelerProfile.count();
+  if (existing > 0) return;
+  await rebuild();
+}
+
 // ── 订单 → 每位乘客一行 ─────────────────────────────────────────────────────
 /**
  * 把一张订单展开成 N 行（每位乘客一行），字段尽量填满系统真实存有的数据。
@@ -407,7 +501,7 @@ function resolveMaster(start: ProfileRef, byId: Map<string, ProfileRef>): Profil
  */
 export function orderToMasterRows(
   order: OrderForMasterExport,
-  tripCounts: TripCountMap = new Map(),
+  tripStats: TripStatsMap = new Map(),
 ): Omit<MasterRow, 'seq'>[] {
   const paxCount = Math.max(1, order.passengers.length);
 
@@ -609,10 +703,10 @@ export function orderToMasterRows(
       : '';
     const notes = [baseNotes, groupInfo].filter(Boolean).join(' / ');
 
-    // 飞行次数：按本乘客证件号取常旅客档案的历史飞行次数（每人各不相同）。
-    // 匹配不到档案（新客/证件号对不上）→ 留空，不臆造 0（0 会被读成"从没飞过"的结论）。
-    const tripCount = p.documentNumber
-      ? tripCounts.get(docKey(p.documentType, p.documentNumber))
+    // 飞行次数 / 在订未飞 / 可用次数：按本乘客证件号取常旅客档案的快照（每人各不相同）。
+    // 匹配不到档案（新客/证件号对不上）→ 三项都留空，不臆造 0（0 会被读成"从没飞过"的结论）。
+    const stats = p.documentNumber
+      ? tripStats.get(docKey(p.documentType, p.documentNumber))
       : undefined;
 
     return {
@@ -625,7 +719,9 @@ export function orderToMasterRows(
       // 称谓统一 MR/MS（不分年龄，0723 票务口径）；出发日仅供其他年龄派生场景沿用签名。
       passengerName: nameWithTitle(p, legs[0]?.departureTime ?? null),
       cleanName: pnrName(p),
-      flightCount: tripCount === undefined ? '' : String(tripCount),
+      flightCount: stats === undefined ? '' : String(stats.tripCount),
+      pendingTripCount: stats === undefined ? '' : String(stats.pendingTripCount),
+      availableTrips: stats === undefined ? '' : String(stats.availableTrips),
       travelDates,
       flightNumbers,
       orderType,
@@ -698,13 +794,16 @@ export async function buildMasterExportWorkbook(
       ? fetched
       : filterExportOrdersByDepartDate(fetched, query.from, query.to);
 
-  // 飞行次数：一次性拉回本次导出所有乘客的常旅客档案（无 N+1；几百行也只有 1~2 条查询）。
-  // 刻意不触发档案重建 —— 全量重建太慢，不能挂在导出请求上；读到的是上次重建的快照，
-  // 快照时间随表头批注一起标出，让读表的人知道这列有多旧。
-  const { tripCounts, oldestRefreshedAt } = await loadTripCountMap(
-    orders.flatMap((o) => o.passengers),
-    client,
+  // 飞行次数/在订未飞/可用次数：一次性拉回本次导出所有乘客的常旅客档案（无 N+1；几百行
+  // 也只有 2~3 条查询，见 loadTripCountMap 头部注释）。快照表空表兜底：新环境/从没人开过
+  // 档案页时表是空的，直读会让三列全部留空，故先同步首建一次；非空但过期的情况不管——
+  // 刻意不为过期快照触发重建（全量重建太慢，不能挂在导出请求上），读到的是上次重建的快照，
+  // 快照时间随表头批注一起标出，让读表的人知道这几列有多旧。
+  const allPassengers = orders.flatMap((o) => o.passengers);
+  await bootstrapTripCountProfilesIfEmpty(allPassengers.length, client, () =>
+    new TravelerProfilesService().rebuildAll(),
   );
+  const { tripStats, oldestRefreshedAt } = await loadTripCountMap(allPassengers, client);
 
   const cols = visibleColumns(role);
 
@@ -718,12 +817,18 @@ export async function buildMasterExportWorkbook(
   headerRow.font = { bold: true };
   headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEFEFEF' } };
   headerRow.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
-  // 表头批注（诚实口径说明）。飞行次数额外标出快照时间 —— 该列读自旅客档案快照表，
+  // 表头批注（诚实口径说明）。飞行次数/在订未飞/可用次数三列额外标出快照时间 ——
+  // 都读自旅客档案快照表（+ 可用次数还叠了核销台账现读，但档案侧仍是快照），
   // 导出不重建，所以要让读表的人看到这批数字是什么时候算的。
+  const SNAPSHOT_COLUMN_KEYS: ReadonlySet<keyof MasterRow> = new Set([
+    'flightCount',
+    'pendingTripCount',
+    'availableTrips',
+  ]);
   cols.forEach((c, i) => {
     if (!c.note) return;
     const note =
-      c.key === 'flightCount' && oldestRefreshedAt
+      SNAPSHOT_COLUMN_KEYS.has(c.key) && oldestRefreshedAt
         ? `${c.note}\n档案快照时间：${fmtDateTime(oldestRefreshedAt)}（UTC）`
         : c.note;
     ws.getRow(1).getCell(i + 1).note = note;
@@ -732,7 +837,7 @@ export async function buildMasterExportWorkbook(
   let seq = 0;
   for (const order of orders) {
     if (order.passengers.length === 0) continue;
-    for (const row of orderToMasterRows(order, tripCounts)) {
+    for (const row of orderToMasterRows(order, tripStats)) {
       seq += 1;
       // key-based addRow 只取可见列对应的 key，多余字段忽略 —— role 裁列天然生效
       ws.addRow({ seq, ...row });

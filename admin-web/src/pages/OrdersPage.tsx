@@ -21,7 +21,7 @@ import { RoomingEditor, type RoomingPassenger } from '../components/RoomingEdito
 import { HotelSwapModal } from '../components/HotelSwapModal';
 import { SearchSelect, type SearchSelectOption } from '../components/SearchSelect';
 import { ProofImageViewer } from '../components/ProofImageViewer';
-import type { RoomGroup, Receipt } from '../lib/api';
+import type { RoomGroup, Receipt, DocumentType, TravelerProfileLookupRow } from '../lib/api';
 import { countryIso3ToIso2 } from '../lib/passportOcr';
 import { runPassportOcr, ocrReviewHintText } from '../lib/passportOcrRunner';
 
@@ -5636,6 +5636,98 @@ function PassengerSwapHistory({ entries }: { entries: SwapHistoryEntry[] }) {
   );
 }
 
+// ── 常旅客次数徽章（乘客区）：同本护照飞满 N 次可兑航司权益，票务岗在订单里就能看见 ──
+/** 够权益门槛的已飞次数：达到即高亮提醒票务岗 */
+const TRAVELER_BENEFIT_TRIP_THRESHOLD = 5;
+/** lookup 单次上限（与后端一致）：超出的乘客本次不查，不显示徽章 */
+const TRAVELER_LOOKUP_MAX_DOCS = 100;
+
+/** 证件二元组 → Map key（档案按「证件类型+证件号」归一） */
+function travelerDocKey(documentType: DocumentType, documentNumber: string): string {
+  return `${documentType}|${documentNumber}`;
+}
+
+function PassengerTripsBadge({ row }: { row: TravelerProfileLookupRow }) {
+  const hit = row.tripCount >= TRAVELER_BENEFIT_TRIP_THRESHOLD;
+  const title =
+    `常旅客 ${row.travelerNo}：已飞 ${row.tripCount} 次 · 在订未飞 ${row.pendingTripCount} 次 · ` +
+    `已核销 ${row.redeemedTrips} 次 · 可用 ${row.availableTrips} 次` +
+    (hit ? `\n已飞满 ${TRAVELER_BENEFIT_TRIP_THRESHOLD} 次，够航司权益门槛` : '');
+  return (
+    <span title={title}>
+      <span
+        className={`ml-2 rounded px-1.5 py-0.5 text-[10px] font-medium ring-1 ${
+          hit
+            ? 'bg-emerald-50 text-emerald-700 ring-emerald-200 font-semibold'
+            : 'bg-slate-50 text-slate-600 ring-slate-200'
+        }`}
+      >
+        ✈️ 已飞 {row.tripCount}
+      </span>
+      {/* 可用 ≠ 已飞 ⇒ 有核销（或退改把已飞拉回来了），必须单列，否则会被当成还能兑 */}
+      {row.availableTrips !== row.tripCount && (
+        <span
+          className={`ml-1 rounded px-1.5 py-0.5 text-[10px] font-medium ring-1 ${
+            row.availableTrips < 0
+              ? 'bg-red-50 text-red-700 ring-red-200'
+              : 'bg-slate-50 text-slate-600 ring-slate-200'
+          }`}
+        >
+          可用 {row.availableTrips}
+        </span>
+      )}
+    </span>
+  );
+}
+
+/**
+ * 按本单乘客证件批量查常旅客次数（抽屉打开时一次），返回 证件key → 台账行。
+ * 没建档的证件不在结果里（不显示徽章、不占位）；接口失败静默降级，绝不挡住抽屉。
+ */
+function useTravelerTripsByDoc(
+  passengers: OrderSummary['passengers'],
+): Map<string, TravelerProfileLookupRow> {
+  const token = useAuth((s) => s.tokens)?.accessToken ?? '';
+  const [rows, setRows] = useState<Map<string, TravelerProfileLookupRow>>(new Map());
+
+  // 去重后的证件清单；用稳定字符串做依赖，避免每次渲染新数组触发重查
+  const docs = useMemo(() => {
+    const seen = new Map<string, { documentType: DocumentType; documentNumber: string }>();
+    for (const p of passengers) {
+      const documentNumber = p.documentNumber?.trim();
+      if (!documentNumber) continue;
+      const documentType: DocumentType = p.documentType ?? 'PASSPORT';
+      seen.set(travelerDocKey(documentType, documentNumber), { documentType, documentNumber });
+    }
+    return [...seen.values()].slice(0, TRAVELER_LOOKUP_MAX_DOCS);
+  }, [passengers]);
+  const docsKey = docs.map((d) => travelerDocKey(d.documentType, d.documentNumber)).join(',');
+
+  useEffect(() => {
+    if (!token || docs.length === 0) {
+      setRows(new Map());
+      return;
+    }
+    let cancelled = false;
+    api
+      .lookupTravelerProfiles(token, docs)
+      .then((r) => {
+        if (cancelled) return;
+        setRows(new Map(r.results.map((x) => [travelerDocKey(x.documentType, x.documentNumber), x])));
+      })
+      .catch(() => {
+        /* 常旅客次数是锦上添花：查不到就不显示徽章，不打扰订单详情 */
+      });
+    return () => {
+      cancelled = true;
+    };
+    // docsKey 已完整表达 docs 内容
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [token, docsKey]);
+
+  return rows;
+}
+
 function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onOrderUpdated?: (order: OrderSummary) => void }) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [lightbox, setLightbox] = useState<{ photoUrl: string; title: string } | null>(null);
@@ -5674,6 +5766,9 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
     [order.items],
   );
 
+  // 常旅客次数：按本单乘客证件批量查一次，给每张乘客卡挂「已飞 N / 可用 M」小标
+  const tripsByDoc = useTravelerTripsByDoc(order.passengers);
+
   return (
     <section>
       <h3 className="text-sm font-medium text-slate-700">乘客 ({order.passengers.length})</h3>
@@ -5683,6 +5778,10 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
           const adjNet = adjustmentByPassenger.get(p.id)?.netCny ?? 0;
           const passWarn = passDaysLeft !== null && passDaysLeft < 180;
           const passBlock = passDaysLeft !== null && passDaysLeft < 90;
+          const docNo = p.documentNumber?.trim();
+          const tripsRow = docNo
+            ? tripsByDoc.get(travelerDocKey(p.documentType ?? 'PASSPORT', docNo))
+            : undefined;
           if (visaEditId === p.id) {
             return (
               <li key={p.id} className="rounded-md border border-sky-300 bg-sky-50/50 p-3">
@@ -5722,6 +5821,8 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
                     <span className="font-mono tracking-wide">{toSlashName(p)}</span>
                     {p.chineseName && <span className="ml-2 font-normal text-slate-600">{p.chineseName}</span>}
                     <span className="ml-2 text-xs font-normal text-slate-500">{genderLabel(p.gender)}</span>
+                    {/* 常旅客次数（查不到档案就不显示，不占位） */}
+                    {tripsRow && <PassengerTripsBadge row={tripsRow} />}
                     {/* 套餐乘客级选项徽标（购物车模式：每人各选住宿方式 + 签证） */}
                     {p.singleRoom && (
                       <span className="ml-2 rounded bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-amber-200">单住</span>

@@ -150,6 +150,8 @@ model TravelerProfile {
   nationality     String?
   passportExpiry  DateTime?    @db.Date
   tripCount       Int          @default(0)
+  /// 在订未飞：有去程航班且尚未起飞的有效订单数（快照，与 tripCount 同一条重算链路回写）
+  pendingTripCount Int         @default(0)
   orderCount      Int          @default(0)
   firstTripAt     DateTime?
   lastTripAt      DateTime?
@@ -170,11 +172,40 @@ model TravelerProfile {
   createdAt       DateTime     @default(now())
   updatedAt       DateTime     @updatedAt
 
+  redemptions TravelerBenefitRedemption[]
+
   @@unique([documentType, documentNumber])
   @@index([fullName])
   @@index([lastTripAt])
   @@index([tripCount])
   @@index([mergedIntoId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 常旅客权益核销台账 —— append-only 流水，永不删改。
+//   可用次数 = TravelerProfile.tripCount（已飞）− 本档案流水 sum(tripsUsed)
+//   tripsUsed > 0  核销（扣减可用次数）
+//   tripsUsed < 0  冲正（补回；reversalOfId 指向被冲正的核销条目，一条最多冲正一次）
+// 纯台账记录，不参与任何订单金额 / 定价 / 结算路径。
+// ─────────────────────────────────────────────────────────────────────────────
+model TravelerBenefitRedemption {
+  id            String   @id @default(cuid())
+  profileId     String
+  tripsUsed     Int
+  benefit       String
+  note          String?
+  reversalOfId  String?  @unique
+  createdById   String
+  /// 操作人姓名快照：账号改名/停用后台账仍可读
+  createdByName String
+  createdAt     DateTime @default(now())
+
+  profile    TravelerProfile            @relation(fields: [profileId], references: [id])
+  reversalOf TravelerBenefitRedemption? @relation("BenefitReversal", fields: [reversalOfId], references: [id], onDelete: Restrict)
+  reversedBy TravelerBenefitRedemption? @relation("BenefitReversal")
+
+  @@index([profileId])
+  @@index([createdAt])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

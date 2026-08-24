@@ -50,8 +50,34 @@ export const suggestTravelerProfilesQuerySchema = z.object({
 });
 export type SuggestTravelerProfilesQuery = z.infer<typeof suggestTravelerProfilesQuerySchema>;
 
+// 批量查常旅客次数（按证件号，订单详情抽屉用）：1~100 条，documentNumber trim 后不得为空
+const lookupTravelerDocumentSchema = z.object({
+  documentType: z.nativeEnum(DocumentType),
+  documentNumber: z.string().trim().min(1),
+});
+export const lookupTravelerProfilesBodySchema = z.object({
+  documents: z.array(lookupTravelerDocumentSchema).min(1).max(100),
+});
+export type LookupTravelerProfilesBody = z.infer<typeof lookupTravelerProfilesBodySchema>;
+
 // 档案合并：把 :id 并进 intoId（同人换证归一，不做解除合并）
 export const mergeTravelerProfileBodySchema = z.object({
   intoId: z.string().min(1),
 });
 export type MergeTravelerProfileBody = z.infer<typeof mergeTravelerProfileBodySchema>;
+
+// ── 权益核销台账（append-only，只增不改不删）──
+
+// 核销：tripsUsed 必须是正整数（扣减可用次数）；负数条目只能由冲正接口产生
+export const createRedemptionBodySchema = z.object({
+  tripsUsed: z.coerce.number().int().min(1).max(999),
+  benefit: z.string().trim().min(1).max(200),
+  note: z.string().max(500).optional(),
+});
+export type CreateRedemptionBody = z.infer<typeof createRedemptionBodySchema>;
+
+// 冲正：只带一个说明；补回的次数与权益内容都从被冲正的原条目照抄
+export const reverseRedemptionBodySchema = z.object({
+  note: z.string().max(500).nullable().optional(),
+});
+export type ReverseRedemptionBody = z.infer<typeof reverseRedemptionBodySchema>;

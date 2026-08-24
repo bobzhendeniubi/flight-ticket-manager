@@ -10,11 +10,15 @@ import { UserRole } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { TravelersService } from './travelers.service.js';
 import { TravelerProfilesService } from './traveler-profiles.service.js';
+import { TravelerBenefitsService } from './traveler-benefits.service.js';
 import {
+  createRedemptionBodySchema,
   createTravelerBodySchema,
   listTravelersQuerySchema,
   listTravelerProfilesQuerySchema,
+  lookupTravelerProfilesBodySchema,
   mergeTravelerProfileBodySchema,
+  reverseRedemptionBodySchema,
   suggestTravelerProfilesQuerySchema,
   updateTravelerBodySchema,
   updateTravelerProfileNotesBodySchema,
@@ -26,6 +30,7 @@ import { ForbiddenError, NotFoundError } from '../../lib/errors.js';
 export const travelerRoutes: FastifyPluginAsync = async (app) => {
   const service = new TravelersService();
   const profilesService = new TravelerProfilesService();
+  const benefitsService = new TravelerBenefitsService(profilesService);
   const pre = {
     preHandler: [
       app.authenticate,
@@ -49,6 +54,13 @@ export const travelerRoutes: FastifyPluginAsync = async (app) => {
     const q = suggestTravelerProfilesQuerySchema.parse(req.query);
     const suggestions = await profilesService.suggest(q.q, q.limit);
     return { suggestions };
+  });
+
+  // 批量查常旅客次数（按证件号，订单详情抽屉用）：只读快照，不触发重算，避免 N+1
+  app.post('/profiles/lookup', preStaff, async (req) => {
+    const body = lookupTravelerProfilesBodySchema.parse(req.body);
+    const results = await profilesService.lookupByDocuments(body.documents);
+    return { results };
   });
 
   app.get('/profiles/:id', preStaff, async (req) => {
@@ -90,9 +102,67 @@ export const travelerRoutes: FastifyPluginAsync = async (app) => {
         documentNumber: result.profile.documentNumber,
         mergedTravelerNo: result.source.travelerNo,
         mergedDocumentNumber: result.source.documentNumber,
+        movedRedemptions: result.movedRedemptions, // 跟着人迁到主档案的权益台账条数
       },
     });
-    return { profile: result.profile, trips: result.trips, merged: result.source };
+    return {
+      profile: result.profile,
+      trips: result.trips,
+      redemptions: result.redemptions,
+      merged: result.source,
+      movedRedemptions: result.movedRedemptions,
+    };
+  });
+
+  // ── 权益核销台账（append-only）：核销只增，录错走冲正，永不删改 ──
+
+  // 核销：tripsUsed 正整数，且不得超过当前可用次数（已飞 − 已核销净值）
+  app.post('/profiles/:id/redemptions', preStaff, async (req, reply) => {
+    const { id } = req.params as { id: string };
+    const body = createRedemptionBodySchema.parse(req.body);
+    const result = await benefitsService.redeem(id, body, { userId: req.user.sub });
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'REDEEM_TRAVELER_BENEFIT',
+      targetType: 'TRAVELER',
+      targetId: result.profileId,
+      targetLabel: result.profileName,
+      after: {
+        redemptionId: result.redemption.id,
+        tripsUsed: result.redemption.tripsUsed,
+        benefit: result.redemption.benefit,
+        note: result.redemption.note,
+      },
+    });
+    return reply.status(201).send({ redemption: result.redemption });
+  });
+
+  // 冲正：为写错的核销补一条负数流水；原条目原样留存，一条核销最多冲正一次
+  app.post('/profiles/:id/redemptions/:rid/reverse', preStaff, async (req, reply) => {
+    const { id, rid } = req.params as { id: string; rid: string };
+    const body = reverseRedemptionBodySchema.parse(req.body ?? {});
+    const result = await benefitsService.reverse(id, rid, body.note ?? null, {
+      userId: req.user.sub,
+    });
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'REVERSE_TRAVELER_BENEFIT_REDEMPTION',
+      targetType: 'TRAVELER',
+      targetId: result.profileId,
+      targetLabel: result.profileName,
+      severity: 'WARNING', // 冲正 = 更正已成立的台账，留痕等级同其他不可逆更正
+      before: {
+        redemptionId: result.original.id,
+        tripsUsed: result.original.tripsUsed,
+        benefit: result.original.benefit,
+      },
+      after: {
+        reversalId: result.reversal.id,
+        tripsUsed: result.reversal.tripsUsed,
+        note: result.reversal.note,
+      },
+    });
+    return reply.status(201).send({ reversal: result.reversal, original: result.original });
   });
 
   app.post('/profiles/rebuild', preStaff, async (req) => {
