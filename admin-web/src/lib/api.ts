@@ -2990,6 +2990,18 @@ export const api = {
    */
   refundQuote: (token: string, id: string) =>
     apiFetch<{ quote: RefundQuote }>(`/orders/${id}/refund-quote`, { token }),
+  /**
+   * 发起退款申请（运营代客，与前台「申请取消」同一后端流程）：按取消政策生成应退报价
+   * （Refund 记录，含报价快照），订单转「退款申请中」并立即释放机位/房量。
+   * 已有待处理申请时幂等返回原申请（isNew=false），不会重复创建。
+   * 直接 PATCH status 到 REFUND_REQUESTED 不会生成 Refund 记录，之后「同意退款」会被
+   * 后端账目闸拦下——运营侧发起退款一律走这个端点。
+   */
+  cancelOrder: (token: string, id: string, reason?: string) =>
+    apiFetch<{ order: OrderSummary; refund: OrderRefund; quote: RefundQuote; isNew: boolean }>(
+      `/orders/${id}/cancel`,
+      { method: 'POST', token, body: reason ? { reason } : {} },
+    ),
   updateOrderStatus: (token: string, id: string, toStatus: OrderStatus, reason?: string, force?: boolean) =>
     apiFetch<{ order: OrderSummary }>(`/orders/${id}/status`, {
       method: 'PATCH',

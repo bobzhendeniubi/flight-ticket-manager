@@ -118,6 +118,58 @@ const TRANSITION_LABEL_FROM: Partial<Record<OrderStatus, Partial<Record<OrderSta
   FAILED: { PROCESSING: '重新处理' },
 };
 
+// 可发起退款申请（生成应退报价）的来源状态。与 backend lib/cancellation.ts 的
+// CANCELLABLE_STATUSES 保持一致；即便漂移，后端 quote.cancellable 仍是真源——
+// 这里只决定「申请退款」走哪条路，走错会被后端拒绝并弹出原因，不会静默错账。
+const REFUND_REQUESTABLE_STATUSES = new Set<OrderStatus>([
+  'PAID',
+  'PROCESSING',
+  'TICKETED',
+  'CHANGE_REQUESTED',
+  'CHANGED',
+]);
+
+/**
+ * 发起退款申请（运营代客）：读实时报价 → 摊开应退/退改费确认 → POST /orders/:id/cancel。
+ * 之所以不用 PATCH status 改「退款申请中」：那条路不生成应退报价（Refund 记录），
+ * 之后「同意退款」会被后端账目闸拦下，单子卡死在退款态。
+ * 幂等：已有待处理申请时后端沿用原申请（isNew=false），这里提示但不报错。
+ */
+async function requestRefundFlow(
+  token: string,
+  order: OrderSummary,
+  onUpdated: (updated: OrderSummary) => void,
+): Promise<void> {
+  let quote;
+  try {
+    ({ quote } = await api.refundQuote(token, order.id));
+  } catch (err) {
+    alert(err instanceof ApiError ? `读取退款报价失败：${err.message}` : '读取退款报价失败');
+    return;
+  }
+  if (!quote.cancellable) {
+    alert(`无法发起退款申请：${quote.cancellableReason ?? `订单当前状态（${STATUS_LABEL[order.status]}）不可取消`}`);
+    return;
+  }
+  const reason = window.prompt(
+    `为订单 ${order.orderNumber} 发起退款申请？\n\n` +
+      `按当前取消政策：应退合计 ¥${quote.totalRefund.toLocaleString()}（退改费 ¥${quote.totalFee.toLocaleString()}）。\n` +
+      `提交后订单转「退款申请中」，机位/房量立即释放；系统会留底这份应退报价，` +
+      `财务照「退款拆分」打款后再点「同意退款」关单。\n\n` +
+      `申请原因（选填，直接点确定可留空）：`,
+  );
+  if (reason === null) return;
+  try {
+    const res = await api.cancelOrder(token, order.id, reason.trim() || undefined);
+    onUpdated(res.order);
+    if (!res.isNew) {
+      alert('该订单已有待处理的退款申请，未重复创建（沿用原申请的应退金额）。');
+    }
+  } catch (err) {
+    alert(err instanceof ApiError ? `发起退款申请失败：${err.message}` : '发起退款申请失败');
+  }
+}
+
 function transitionLabel(from: OrderStatus, to: OrderStatus): string {
   return TRANSITION_LABEL_FROM[from]?.[to] ?? TRANSITION_LABEL[to];
 }
@@ -829,6 +881,17 @@ export function OrdersPage() {
 
   const advance = async (order: OrderSummary, next: OrderStatus, reason?: string, force?: boolean) => {
     if (!tokens?.accessToken) return;
+    // 「申请退款」在可取消状态下改走正式退款流程（生成应退报价 + Refund 记录）——
+    // 直接 PATCH 只翻状态不留报价，之后「同意退款」会被后端账目闸拦死。
+    // force / 非可取消来源（如出票失败）不拦，仍走原 PATCH（专家路径，后端照常校验）。
+    if (next === 'REFUND_REQUESTED' && !force && REFUND_REQUESTABLE_STATUSES.has(order.status)) {
+      await requestRefundFlow(tokens.accessToken, order, (updated) => {
+        setOrders((prev) => prev.map((o) => (o.id === updated.id ? updated : o)));
+        setSelected((prev) => (prev && prev.id === updated.id ? updated : prev));
+        bumpSeats();
+      });
+      return;
+    }
     // 落「已退款」是不可逆的，且会触发余额自动回补 → 先摊开拆分再确认（含 force 通道）。
     if (next === 'REFUNDED' && !(await confirmRefundApproval(order))) return;
     try {
@@ -1052,7 +1115,10 @@ export function OrdersPage() {
       bulkStatus === 'REFUNDED'
         ? `\n\n⚠️ 批量批准退款：其中若有用代理预存余额抵扣过的订单，余额部分会自动退回代理账户、无需人工打款。\n` +
           `请勿按退款金额全额打现金——打款金额请逐单在订单详情的「退款拆分」里核对。`
-        : '';
+        : bulkStatus === 'REFUND_REQUESTED'
+          ? `\n\n⚠️ 批量改「退款申请中」只翻状态、不生成应退报价——这样的单之后点「同意退款」会被系统拦下。\n` +
+            `真要退钱给客人的订单，请逐单在订单详情用「申请退款」发起（会按取消政策生成应退报价并留底）。`
+          : '';
     if (!window.confirm(confirmMsg + refundNotice)) return;
     setBulkSubmitting(true);
     setBulkResult(null);
@@ -2916,6 +2982,15 @@ function OrderDrawer({
     return () => { cancelled = true; };
   }, [token, order.id]);
   useEffect(() => hydrate(), [hydrate]);
+  // 父级在状态流转/发起退款申请成功后 setSelected 传回**全量**订单（带 payments/refunds，
+  // 与 getOrder 同一序列化路径）；列表行是精简快照（恒无这两字段）。仅当传入全量订单时
+  // 同步 hydrated，否则保留已补水的详情——不同步的话，从抽屉里点「申请退款/同意退款」
+  // 后抽屉仍显示旧状态（像没反应），关掉重开才对。
+  useEffect(() => {
+    if (order.payments !== undefined || order.refunds !== undefined) {
+      setHydrated(order);
+    }
+  }, [order]);
   // 详情各区块统一读 o（详情优先，兜底列表行）。售后改期/换人后用返回的整单同步 hydrated + 列表行。
   const o = hydrated ?? order;
   const view = deriveView(o);
@@ -3270,6 +3345,19 @@ function OrderDrawer({
             <p className="mt-3 text-xs text-ink-muted">
               ⓘ 状态变更会真实写入数据库并记录操作事件。仅显示当前状态允许的流转；不在此列的目标需管理员强制。
             </p>
+
+            {/* 历史卡单救援提示：直改状态进的「退款申请中」没有应退报价（Refund 记录），
+                「同意退款」必被后端账目闸拦下——在这里把两条出路说清，别让运营反复撞墙。
+                仅在详情已补水（refunds 字段只有 getOrder 带）且确实无有效退款记录时显示。 */}
+            {o.status === 'REFUND_REQUESTED' &&
+              hydrated &&
+              !(hydrated.refunds ?? []).some((r) => r.status === 'REQUESTED' || r.status === 'COMPLETED') && (
+                <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50/70 p-3 text-xs text-amber-800">
+                  ⚠️ 本单没有退款申请记录（多为直接改状态进入退款态的历史单），点「同意退款」会被系统拦下。
+                  <br />· 钱确实要退：先「驳回退款（回退处理）」回到处理中，再点「申请退款」重新发起——新版会按取消政策生成应退报价。
+                  <br />· 钱并未实收（错录/测试单）：由管理员强制改「已取消」后在收款区撤销收款，即可删除。
+                </div>
+              )}
 
             {/* 管理员强制改状态：越过状态机的目标（异常订正用）。被安全规则拦下的操作（如已退款订单
                 拉回占座、余位不足重新占座）后端会拒绝并弹出具体原因，不会静默失败。 */}
