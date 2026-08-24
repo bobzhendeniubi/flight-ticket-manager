@@ -48,3 +48,6 @@
 - `docker compose` 任何子命令都要带 `--env-file` 和各自的 `-p`（`ftm` / `ftm-staging`），
   否则报 `PAYMENT_MODE is missing`，或者项目名串了导致两套数据卷混用。
 - `.env.prod` / `.env.staging` 只在服务器上、未进版本库，切分支/拉代码都不会动它们。
+- **DNS 在阿里云「中国站」账号**（国际站账号看不到这个域名，会白折腾）；6 个站点靠 Caddy
+  按域名分流到不同端口，测试站带 noindex。加解析 / 改 Caddy / 签证书的坑见
+  `infra/README-environments.md` 的「域名与 DNS」。
