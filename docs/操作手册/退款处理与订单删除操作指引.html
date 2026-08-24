@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>退款处理与订单删除操作指引 · 世途旅行运营控制台</title>
+<style>
+  :root{
+    --brand:#4F46E5; --brand-dark:#4338CA; --brand-50:#EEF2FF; --brand-100:#E0E7FF;
+    --ink:#0F172A; --ink-soft:#334155; --ink-muted:#64748B;
+    --bg:#F8FAFC; --card:#FFFFFF; --line:#E2E8F0;
+    --amber:#B45309; --amber-bg:#FEF3C7; --amber-line:#FDE68A;
+    --green:#047857; --green-bg:#D1FAE5; --green-line:#A7F3D0;
+    --blue:#1D4ED8; --blue-bg:#DBEAFE; --blue-line:#BFDBFE;
+    --rose:#BE123C; --rose-bg:#FFE4E6; --rose-line:#FECDD3;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  body{font-family:"Inter","PingFang SC","Microsoft YaHei","Hiragino Sans GB",sans-serif; color:var(--ink); background:var(--bg); line-height:1.75; font-size:15px;}
+  .page{max-width:880px; margin:0 auto; padding:32px 24px 80px;}
+  .cover{background:linear-gradient(135deg,var(--brand) 0%,#6D28D9 100%); color:#fff; border-radius:16px; padding:40px 36px; margin-bottom:28px;}
+  .cover .tag{display:inline-block; background:rgba(255,255,255,.18); border:1px solid rgba(255,255,255,.35); border-radius:999px; padding:2px 14px; font-size:13px; letter-spacing:.05em;}
+  .cover h1{font-size:30px; margin:14px 0 6px; letter-spacing:.02em;}
+  .cover p{color:#E0E7FF; font-size:14px;}
+  h2{font-size:22px; margin:44px 0 6px; padding-left:12px; border-left:5px solid var(--brand);}
+  h2 .no{color:var(--brand); margin-right:6px;}
+  h3{font-size:16.5px; margin:26px 0 8px; color:var(--ink);}
+  h3::before{content:"◆"; color:var(--brand); font-size:11px; margin-right:7px; vertical-align:2px;}
+  p{margin:8px 0;}
+  .sub{color:var(--ink-muted); font-size:13.5px; margin-bottom:14px;}
+  .toc{background:var(--card); border:1px solid var(--line); border-radius:12px; padding:20px 26px;}
+  .toc h2{margin-top:0; border:none; padding-left:0; font-size:18px;}
+  .toc ol{margin:8px 0 0 20px;}
+  .toc li{margin:5px 0;}
+  .toc a{color:var(--brand); text-decoration:none; font-weight:500;}
+  .toc a:hover{text-decoration:underline;}
+  .toc .sm{color:var(--ink-muted); font-size:12.5px; margin-left:6px; font-weight:400;}
+  .card{background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px 20px; margin:14px 0;}
+  .tip{border-left:4px solid var(--brand); background:var(--brand-50); border-radius:8px; padding:10px 16px; margin:12px 0; font-size:14px;}
+  .warn{border-left:4px solid var(--amber); background:var(--amber-bg); border-radius:8px; padding:10px 16px; margin:12px 0; font-size:14px;}
+  .danger{border-left:4px solid var(--rose); background:var(--rose-bg); border-radius:8px; padding:10px 16px; margin:12px 0; font-size:14px;}
+  .steps{counter-reset:step; margin:12px 0; padding:0; list-style:none;}
+  .steps li{position:relative; padding:0 0 14px 44px;}
+  .steps li::before{counter-increment:step; content:counter(step); position:absolute; left:0; top:1px; width:28px; height:28px; border-radius:50%; background:var(--brand); color:#fff; font-weight:700; font-size:14px; display:flex; align-items:center; justify-content:center;}
+  .steps li:not(:last-child)::after{content:""; position:absolute; left:13.5px; top:31px; bottom:2px; width:1.5px; background:var(--brand-100);}
+  table{border-collapse:collapse; width:100%; margin:12px 0; font-size:13.5px; background:#fff;}
+  th{background:var(--brand-50); color:var(--ink-soft); text-align:left; padding:8px 12px; border:1px solid var(--line); font-size:12.5px;}
+  td{padding:8px 12px; border:1px solid var(--line); vertical-align:top;}
+  /* 真实截图 */
+  .shot{border:1px solid var(--line); border-radius:12px; overflow:hidden; margin:16px 0 6px; box-shadow:0 2px 10px rgba(15,23,42,.06); background:#fff; break-inside:avoid;}
+  .shot img{display:block; width:100%; height:auto;}
+  .caption{font-size:12.5px; color:var(--ink-muted); text-align:center; margin:4px 0 18px;}
+  /* 系统弹窗原文 */
+  .sysmsg{border:1px solid var(--line); border-left:4px solid var(--ink-muted); background:#F1F5F9; border-radius:8px; padding:10px 16px; margin:10px 0; font-size:13.5px; color:var(--ink-soft); white-space:pre-line; break-inside:avoid;}
+  .sysmsg .t{display:block; font-size:11.5px; font-weight:700; color:var(--ink-muted); letter-spacing:.05em; margin-bottom:4px;}
+  .sysmsg.err{border-left-color:var(--rose); background:var(--rose-bg);}
+  .badge{display:inline-block; border-radius:6px; padding:1px 8px; font-size:11.5px; font-weight:600; white-space:nowrap;}
+  .b-amber{background:var(--amber-bg); color:var(--amber);}
+  .b-green{background:var(--green-bg); color:var(--green);}
+  .b-rose{background:var(--rose-bg); color:var(--rose);}
+  .b-gray{background:#F1F5F9; color:var(--ink-muted);}
+  /* 流程图 */
+  .flow{display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin:14px 0; font-size:13px;}
+  .fnode{border:1.5px solid var(--line); border-radius:10px; padding:6px 14px; font-weight:600; background:#fff; white-space:nowrap;}
+  .fnode.hold{border-color:var(--blue-line); background:var(--blue-bg); color:var(--blue);}
+  .fnode.rq{border-color:var(--amber-line); background:var(--amber-bg); color:var(--amber);}
+  .fnode.done{border-color:var(--rose-line); background:var(--rose-bg); color:var(--rose);}
+  .fnode.ok{border-color:var(--green-line); background:var(--green-bg); color:var(--green);}
+  .farrow{color:var(--ink-muted); font-weight:700;}
+  .flabel{font-size:11.5px; color:var(--ink-muted);}
+  .faq{border:1px solid var(--line); border-radius:10px; background:#fff; margin:10px 0; padding:12px 18px; break-inside:avoid;}
+  .faq .q{font-weight:700; color:var(--ink);}
+  .faq .q::before{content:"Q"; display:inline-flex; align-items:center; justify-content:center; width:20px; height:20px; border-radius:6px; background:var(--brand); color:#fff; font-size:12px; margin-right:8px;}
+  .faq .a{margin-top:6px; color:var(--ink-soft); font-size:14px;}
+  .faq .a::before{content:"A"; display:inline-flex; align-items:center; justify-content:center; width:20px; height:20px; border-radius:6px; background:var(--green-bg); color:var(--green); font-size:12px; font-weight:700; margin-right:8px;}
+  code{background:#EEF2FF; color:var(--brand-dark); border-radius:4px; padding:1px 6px; font-size:12.5px; font-family:ui-monospace,Menlo,monospace;}
+  strong{color:var(--ink);}
+  ul{margin:6px 0 6px 22px;} li{margin:3px 0;}
+  @media print{
+    body{background:#fff; font-size:12px;}
+    .page{max-width:100%; padding:0;}
+    .cover{border-radius:0; -webkit-print-color-adjust:exact; print-color-adjust:exact;}
+    *{-webkit-print-color-adjust:exact; print-color-adjust:exact;}
+    h2{break-after:avoid; page-break-after:avoid;}
+    .shot,.card,.faq,.sysmsg,table{break-inside:avoid; page-break-inside:avoid;}
+    @page{size:A4; margin:14mm 12mm;}
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+<div class="cover">
+  <span class="tag">运营控制台 · 专项操作指引</span>
+  <h1>退款处理与订单删除</h1>
+  <p>适用读者：财务岗 / 运营岗 / 系统管理员 &nbsp;·&nbsp; 覆盖：退款申请中订单的处理、驳回、批准，以及卡在退款流程的订单如何清理删除 &nbsp;·&nbsp; 截图与报错均取自系统实际界面</p>
+</div>
+
+<div class="toc">
+  <h2>目录</h2>
+  <ol>
+    <li><a href="#s0">先看结论：卡在「退款申请中」删不掉，怎么办</a><span class="sm">三种情形对症下药</span></li>
+    <li><a href="#s1">退款流程全景</a><span class="sm">状态怎么流转、谁做什么</span></li>
+    <li><a href="#s2">订单是怎么进入「退款申请中」的</a><span class="sm">两条路，差别很关键</span></li>
+    <li><a href="#s3">操作入口与财务标准处理</a><span class="sm">核对拆分 → 打款 → 同意退款</span></li>
+    <li><a href="#s4">系统会拦下的三种报错（附原文）</a></li>
+    <li><a href="#s5">删除订单的规则与完整路径</a><span class="sm">两条硬规则 + 分情形步骤 + 回收站</span></li>
+    <li><a href="#s6">别混淆：收款对账台里的「退款」</a></li>
+    <li><a href="#s7">常见问答</a></li>
+    <li><a href="#s8">附录：当前 6 张卡在退款申请中的订单核查</a></li>
+  </ol>
+</div>
+
+<!-- ════════════ 0 先看结论 ════════════ -->
+<h2 id="s0"><span class="no">一、</span>先看结论：卡在「退款申请中」删不掉，怎么办</h2>
+<p class="sub">删除订单有两条硬规则（详见第六章）：<strong>机位必须已释放</strong>（退款申请中的单机位已释放，这条它是过的），以及<strong>净收款必须为零</strong>（已收 − 已退 ≤ 0）。卡住删不掉的，几乎都是卡在第二条——单上还挂着已收款。按下面三种情形选路径：</p>
+
+<table>
+  <tr><th style="width:26%;">你的情形</th><th>处理路径</th><th style="width:15%;">需要的角色</th></tr>
+  <tr>
+    <td><strong>① 这张单「已付」本来就是 ¥0</strong></td>
+    <td>不用改任何状态，直接点「<strong>删除</strong>」即可。</td>
+    <td>仅管理员</td>
+  </tr>
+  <tr>
+    <td><strong>② 收过钱，钱确实要退给客人</strong></td>
+    <td>走完退款流程（见第四章）：核对「退款拆分」→ 线下打款 → 点「<strong>同意退款</strong>」→ 订单变「已退款」→ 若全额退平即可删除。<br><span style="color:var(--ink-muted);font-size:12.5px;">若这张单没有退款申请记录（历史卡单，详情里有黄色提示）：先「驳回退款（回退处理）」，再点「申请退款」重新发起报价。如果扣了退改费（公司留存了一部分钱），这张单删不掉也不该删——它是真实营收记录。</span></td>
+    <td>同意退款：运营/管理员<br>删除：仅管理员</td>
+  </tr>
+  <tr>
+    <td><strong>③ 「已付」有金额，但钱其实没到账</strong><br><span style="color:var(--ink-muted);font-size:12.5px;">录单时误点了确认收款 / 重复录入 / 测试单</span></td>
+    <td><strong>管理员快捷路径（推荐，不动座位）：</strong><br>订单详情「更多操作」→ 强制改状态为「<strong>已取消</strong>」→ 收款区「<strong>撤销</strong>」该笔收款（填原因）→ 已付归零 → 点「<strong>删除</strong>」。<br><br><strong>常规路径（无强制权限时）：</strong><br>「驳回退款（回退处理）」→ 处理中（⚠️ 机位会重新占回）→ 收款区撤销收款 → 改「出票失败」→「已取消」→ 请管理员删除。</td>
+    <td>撤销收款：运营/管理员<br>强制改状态、删除：仅管理员</td>
+  </tr>
+</table>
+
+<div class="danger">🚨 关键次序：<strong>「退款申请中」状态下系统禁止撤销收款</strong>（第五章报错 3）。所以情形 ③ 必须<strong>先离开退款态</strong>（强制改已取消，或驳回退款），才能撤销收款。</div>
+
+<!-- ════════════ 1 全景 ════════════ -->
+<h2 id="s1"><span class="no">二、</span>退款流程全景</h2>
+<p class="sub">核心一句话：<strong>「退款申请中」= 机位已释放、钱还没退；「已退款」= 钱账两清、不可逆。</strong></p>
+
+<div class="card">
+  <div class="flow">
+    <span class="fnode hold">已付款 / 处理中 / 出票完成</span>
+    <span class="farrow">→</span>
+    <span class="fnode rq">退款申请中</span>
+    <span class="farrow">→</span>
+    <span class="fnode done">已退款（终态）</span>
+  </div>
+  <div class="flow" style="margin-top:-4px;">
+    <span class="flabel">申请提交那一刻<strong>机位立即释放</strong>；财务打款完成后点「同意退款」落终态</span>
+  </div>
+  <div class="flow">
+    <span class="fnode rq">退款申请中</span>
+    <span class="farrow">→</span>
+    <span class="fnode hold">处理中</span>
+    <span class="flabel">（「驳回退款（回退处理）」：申请作废、机位重新占回）</span>
+  </div>
+</div>
+
+<table>
+  <tr><th style="width:22%;">环节</th><th style="width:22%;">谁来做</th><th>系统里发生了什么</th></tr>
+  <tr><td>发起退款申请</td><td>客户在前台自助申请，或运营在后台改状态</td><td>订单转「退款申请中」，机位/房量立即释放回库存（客人不再占位，但钱还挂在单上）</td></tr>
+  <tr><td>核对与打款</td><td><strong>财务</strong></td><td>看订单详情「退款拆分」卡确定实际要打的现金金额，在银行/微信人工转账。<strong>系统不会自动打款</strong>，它只记账。</td></tr>
+  <tr><td>同意退款</td><td>财务 / 运营</td><td>订单转「已退款」：退款记录标完成、该单佣金按实退比例自动冲销、代理余额抵扣的部分自动退回代理余额账户</td></tr>
+  <tr><td>驳回退款</td><td>财务 / 运营</td><td>订单回「处理中」：退款申请标记拒绝、机位房量重新占回（余位不足会被拦下并提示）</td></tr>
+</table>
+
+<!-- ════════════ 2 两条进入路径 ════════════ -->
+<h2 id="s2"><span class="no">三、</span>订单是怎么进入「退款申请中」的</h2>
+<p class="sub">两条路看起来结果一样，但差别很关键：<strong>有没有生成「应退报价」（退款申请记录）</strong>。这直接决定后面「同意退款」能不能批得动。</p>
+
+<table>
+  <tr><th style="width:30%;">进入方式</th><th>系统行为</th><th style="width:24%;">后果</th></tr>
+  <tr>
+    <td><strong>路 A：客户/代理在前台自助「申请取消」</strong></td>
+    <td>系统按取消政策自动计算<strong>应退金额与退改费</strong>，生成一条退款申请记录（含报价快照），订单转「退款申请中」</td>
+    <td>✅ 有应退报价，「同意退款」可正常批准</td>
+  </tr>
+  <tr>
+    <td><strong>路 B：后台点「申请退款」</strong><br><span style="color:var(--ink-muted);font-size:12.5px;">订单详情「更多操作」按钮，或列表行改状态下拉（2026-08-23 版起）</span></td>
+    <td>与前台同一流程：先弹出<strong>实时应退报价确认</strong>（应退合计/退改费），确认后生成退款申请记录，订单转「退款申请中」</td>
+    <td>✅ 有应退报价，「同意退款」可正常批准</td>
+  </tr>
+  <tr>
+    <td><strong>路 C：例外通道</strong><br><span style="color:var(--ink-muted);font-size:12.5px;">批量改状态、管理员强制改状态、出票失败单改退款态，以及旧版改出来的历史单</span></td>
+    <td>只改状态、释放机位，<strong>不生成退款申请记录，也没有应退金额</strong></td>
+    <td>⚠️ 之后点「同意退款」会被拦（第五章报错 1）</td>
+  </tr>
+</table>
+
+<div class="tip">💡 所以：<strong>真要退钱的单，用路 A 或路 B 发起</strong>——系统会把应退多少、扣多少退改费自动算好留底。批量改状态只翻状态不留报价，真退钱的订单请逐单在详情里点「申请退款」。</div>
+
+<!-- ════════════ 3 操作入口与财务处理 ════════════ -->
+<h2 id="s3"><span class="no">四、</span>操作入口与财务标准处理</h2>
+
+<h3>1. 操作入口都在哪</h3>
+<p>订单管理列表用状态筛选「退款申请中」可以一眼看到所有待处理退款的单；每行有「改状态」下拉、「详情」和「删除」。</p>
+<div class="shot"><img src="shots-2026-08-23/01-list-refund-requested.png" alt="订单列表筛选退款申请中"></div>
+<p class="caption">订单管理 → 状态筛「退款申请中」。行内「改状态」下拉可直接流转；点「详情」进订单弹窗</p>
+
+<p>点开「详情」，拉到下方展开「<strong>更多操作（状态流转）</strong>」——退款相关的动作按钮都在这里。已支付/处理中等状态下有「<strong>申请退款</strong>」（发起退款申请，弹实时应退报价确认）；退款申请中状态下有「<strong>同意退款</strong>」「<strong>驳回退款（回退处理）</strong>」；管理员还有「强制改状态」和最底部的「删除订单」。</p>
+<div class="shot"><img src="shots-2026-08-23/11-request-refund-entry.png" alt="已支付单的申请退款入口"></div>
+<p class="caption">已支付的单 →「更多操作（状态流转）」里的「申请退款」：点击后弹出实时应退报价（应退合计/退改费）确认，确认即生成退款申请并释放机位</p>
+<div class="shot"><img src="shots-2026-08-23/05-force-status.png" alt="更多操作：同意退款/驳回退款/强制改状态/删除"></div>
+<p class="caption">退款申请中的单 → 同一位置变为「同意退款」「驳回退款（回退处理）」；黄色区「管理员强制改状态」仅管理员可见；最底部红色「删除订单（ADMIN）」</p>
+
+<h3>2. 财务处理三步：核对拆分 → 打款 → 同意退款</h3>
+<div class="shot"><img src="shots-2026-08-23/03-refund-split.png" alt="收款区与退款拆分卡"></div>
+<p class="caption">订单详情下方：收款记录（每笔可「撤销」）＋「退款拆分（打款依据）」卡（按当前退改规则实时计算；本例没有退款申请记录，故应退显示 ¥0）</p>
+
+<ol class="steps">
+  <li><strong>核对拆分。</strong>应退金额里可能有一部分当初是用代理预存余额抵付的——这部分批准时系统<strong>自动退回代理余额账户</strong>，不需要人工打款。<span style="color:var(--rose);"><strong>照「应退合计」全额打现金 = 重复退钱。</strong></span></li>
+  <li><strong>线下打款。</strong>把「需人工打款的现金部分」通过银行/微信转给客人或代理。系统只记账，不碰真钱。</li>
+  <li><strong>回系统点「同意退款」。</strong>订单变「已退款」（不可逆）；系统同时完成：退款记录标完成、佣金按实退比例冲销（退改费留存部分的佣金保留）、余额部分自动回补。</li>
+  <li><strong>不同意就点「驳回退款（回退处理）」。</strong>订单回「处理中」，申请作废，机位房量重新占回。之后可正常继续出票，或按最新口径重新发起退款。</li>
+</ol>
+
+<div class="warn">⚠️ <strong>批量改状态也能批量批准退款</strong>（订单列表勾选多单）。但批量不会逐单展示拆分——其中若有余额抵扣过的单，余额部分同样自动回补。<strong>请勿按列表金额全额打现金</strong>，打款金额务必逐单进详情看「退款拆分」。</div>
+
+<!-- ════════════ 4 三种报错 ════════════ -->
+<h2 id="s4"><span class="no">五、</span>系统会拦下的三种报错（附原文）</h2>
+
+<h3>报错 1：同意退款 →「没有任何退款记录」</h3>
+<div class="sysmsg err"><span class="t">系统弹窗原文</span>操作失败：订单 FTM20260810×××× 没有任何退款记录，不能置为「已退款」——否则实收会永久挂在单上、既退不出去也冲销不掉（已退款是终态，三道资金闸全部封死）。请改走退款流程：POST /orders/…/cancel 生成退款申请（含应退报价），再批准退款。</div>
+<div class="card">
+  <p><strong>为什么拦：</strong>这张单是没经过报价直接进的「退款申请中」（第三章的路 C，多为旧版改状态改出来的历史单），系统里没有应退报价。如果放行，钱会永久挂在单上。</p>
+  <p><strong>怎么处理：</strong>钱确实要退 → 先「驳回退款（回退处理）」回到处理中，再点「<strong>申请退款</strong>」重新发起——会按取消政策生成应退报价，之后正常批准。钱不用退（测试单/错录）→ 按第一章情形 ③ 清理。系统同时会在这类单的详情里显示黄色提示，照提示走即可。</p>
+</div>
+
+<h3>报错 2：删除 →「尚有已收款未退」</h3>
+<div class="sysmsg err"><span class="t">系统弹窗原文</span>删除失败：该订单尚有已收款 ¥×××× 未退，请先完成退款再删除
+
+若这笔钱其实并未收到（录单填错/重复录入），不必走退款：请在订单详情的收款区撤销该笔收款，已付金额归零后即可删除。</div>
+<div class="card">
+  <p><strong>为什么拦：</strong>净收款不为零。删了它，这笔钱就没人追了。</p>
+  <p><strong>怎么处理：</strong>钱真收了 → 完成退款再删；钱没收到 → 撤销收款。<strong>注意：</strong>撤销收款在「退款申请中」状态下会被报错 3 拦住，要先离开退款态（见第一章情形 ③ 的次序）。</p>
+</div>
+
+<h3>报错 3：退款态下撤销收款 →「不能撤销收款」</h3>
+<div class="shot"><img src="shots-2026-08-23/09-reverse-blocked.png" alt="退款申请中不能撤销收款"></div>
+<p class="caption">在「退款申请中」的单上点收款记录的「撤销」：收款区出现红色提示「当前状态为「退款申请中」，不能撤销收款。如需处理这笔钱，请走退款流程。」</p>
+<div class="card">
+  <p><strong>为什么拦：</strong>退款申请上的应退金额是按申请那一刻的已付算的；申请还挂着就把收款撤了，应退金额就算错了。</p>
+  <p><strong>怎么处理：</strong>先「驳回退款（回退处理）」或由管理员强制改「已取消」离开退款态，再撤销收款（需填原因，至少 4 个字，操作留痕可审计）。来自收款对账台认款的收款要去对账台撤销认款，钱会退回挂账池。</p>
+</div>
+
+<!-- ════════════ 5 删除规则 ════════════ -->
+<h2 id="s5"><span class="no">六、</span>删除订单的规则与完整路径</h2>
+<p class="sub">删除是「软删除」：订单从所有列表/导出/统计里消失，数据保留可追溯，不影响座位账；管理员可在<strong>回收站</strong>恢复。</p>
+
+<h3>两条硬规则（都满足才能删）</h3>
+<table>
+  <tr><th style="width:34%;">规则</th><th>说明</th></tr>
+  <tr>
+    <td><strong>1. 机位必须已释放</strong></td>
+    <td>可删状态：<span class="badge b-gray">草稿</span> <span class="badge b-gray">支付超时</span> <span class="badge b-gray">出票失败</span> <span class="badge b-gray">已取消</span> <span class="badge b-amber">退款申请中</span> <span class="badge b-rose">已退款</span>。<br>仍占座的状态（待付款/已付款/处理中/出票完成等）不可删——先取消释放座位。删除本身绝不偷偷动座位账。</td>
+  </tr>
+  <tr>
+    <td><strong>2. 净收款必须为零</strong></td>
+    <td>已收款 − 已完成退款 ≤ 0 才放行，否则弹第五章报错 2。这就是「退款申请中的单删不掉」的真正原因：钱还挂在单上。</td>
+  </tr>
+  <tr><td><strong>权限</strong></td><td>删除、回收站恢复、强制改状态：<strong>仅系统管理员</strong>。改状态、同意/驳回退款、撤销收款：运营/管理员。</td></tr>
+</table>
+
+<h3>完整路径图（对应第一章三种情形）</h3>
+<div class="card">
+  <p style="font-size:13px; color:var(--ink-muted); margin-bottom:2px;">情形 ①（已付 ¥0）：</p>
+  <div class="flow">
+    <span class="fnode rq">退款申请中</span><span class="farrow">→</span>
+    <span class="fnode ok">🗑 直接删除</span>
+  </div>
+  <p style="font-size:13px; color:var(--ink-muted); margin:10px 0 2px;">情形 ②（真退钱）：</p>
+  <div class="flow">
+    <span class="fnode rq">退款申请中</span><span class="farrow">→</span>
+    <span class="flabel">核对拆分 + 打款</span><span class="farrow">→</span>
+    <span class="fnode done">已退款</span><span class="farrow">→</span>
+    <span class="fnode ok">🗑 删除（仅全额退平时）</span>
+  </div>
+  <p style="font-size:13px; color:var(--ink-muted); margin:10px 0 2px;">情形 ③（收款是错录）· 管理员快捷路径，不动座位：</p>
+  <div class="flow">
+    <span class="fnode rq">退款申请中</span><span class="farrow">→</span>
+    <span class="fnode">强制改「已取消」</span><span class="farrow">→</span>
+    <span class="flabel">收款区撤销收款</span><span class="farrow">→</span>
+    <span class="fnode ok">🗑 删除</span>
+  </div>
+  <p style="font-size:13px; color:var(--ink-muted); margin:10px 0 2px;">情形 ③ · 常规路径（无强制权限）：</p>
+  <div class="flow">
+    <span class="fnode rq">退款申请中</span><span class="farrow">→</span>
+    <span class="fnode hold">处理中</span><span class="farrow">→</span>
+    <span class="flabel">撤销收款</span><span class="farrow">→</span>
+    <span class="fnode">出票失败</span><span class="farrow">→</span>
+    <span class="fnode">已取消</span><span class="farrow">→</span>
+    <span class="fnode ok">🗑 删除</span>
+  </div>
+</div>
+
+<div class="warn">⚠️ 常规路径里「驳回退款（回退处理）」会把机位、酒店房量<strong>重新占回来</strong>；如果座位在此期间已被卖掉，系统会拦下并提示「座位已被售出，无法驳回退款申请」。管理员快捷路径（强制改已取消）全程不动座位，没有这个风险。</div>
+
+<h3>回收站：删错了能找回</h3>
+<div class="shot"><img src="shots-2026-08-23/07-recycle-bin.png" alt="订单回收站"></div>
+<p class="caption">订单管理右上角「回收站」：已删订单可按订单号/乘客姓名搜索，点「恢复」回到删除前状态；删除时间与操作人留痕可查</p>
+
+<!-- ════════════ 6 对账台的退款 ════════════ -->
+<h2 id="s6"><span class="no">七、</span>别混淆：收款对账台里的「退款」</h2>
+<div class="shot"><img src="shots-2026-08-23/08-reconciliation.png" alt="收款对账台"></div>
+<p class="caption">收款对账台：待认领 / 流水认款 / 已认领 / 已退款 / 全部流水。这里的「退款」针对的是<b>进账流水</b>，不是订单</p>
+<div class="card">
+  <p>对账台里的「退款」是给<strong>没认领到订单的进账</strong>用的：比如客户重复付款、多付的钱不认领到任何订单、直接原路退回时，把这笔流水标记为已退款（必须填退款备注，标记后不能再认领）。</p>
+  <p><strong>它和本手册讲的订单退款是两回事：</strong>订单退款走订单状态流转（退款申请中 → 已退款），管的是「这张订单收的钱要退」；对账台退款管的是「这笔进账压根不进订单」。两边同样都只是记账——真正把钱打回去都要在银行/微信人工操作。</p>
+</div>
+
+<!-- ════════════ 7 FAQ ════════════ -->
+<h2 id="s7"><span class="no">八、</span>常见问答</h2>
+
+<div class="faq">
+  <p class="q">订单一进「退款申请中」，机位就没了吗？</p>
+  <p class="a">是。提交申请那一刻机位/房量立即释放回库存（客人不再占位）。所以驳回退款时系统要重新占座，余位不足会被拦下。</p>
+</div>
+<div class="faq">
+  <p class="q">点了「同意退款」还能反悔吗？</p>
+  <p class="a">不能。「已退款」是终态、不可逆，且会触发佣金冲销和代理余额回补。所以界面在批准前会弹确认框让你再确认一次——打款完成之前不要点。</p>
+</div>
+<div class="faq">
+  <p class="q">已退款的订单为什么还是删不掉？</p>
+  <p class="a">看报错：若提示「尚有已收款未退」，说明这张单退款时扣了退改费、公司留存了一部分钱——净收款不为零。这是真实营收记录，本就不该删；留着它，报表才对得上。</p>
+</div>
+<div class="faq">
+  <p class="q">删除后座位、报表会受影响吗？</p>
+  <p class="a">不会。能删的单机位都已经释放，删除只是让订单从列表/导出/统计里消失，不碰座位账。误删可让管理员去「回收站」恢复。</p>
+</div>
+<div class="faq">
+  <p class="q">批量勾选能一次处理多张退款申请吗？</p>
+  <p class="a">能：订单列表勾选多单 → 批量改状态「同意退款」。但批量不展示逐单拆分，其中用代理余额抵扣过的单会自动回补余额——打款金额务必逐单进详情核对「退款拆分」，不要照应退合计打现金。</p>
+</div>
+
+<!-- ════════════ 8 附录 ════════════ -->
+<h2 id="s8"><span class="no">九、</span>附录：当前 6 张卡在退款申请中的订单核查</h2>
+<p class="sub">核查时间 2026-08-23。六张单情况完全一致：<strong>已付满额（单笔人工确认的微信收款，非对账台认款）、没有退款申请记录</strong>——即都是「后台改状态」进的退款申请中（第三章路 B）。</p>
+
+<table>
+  <tr><th>订单号</th><th style="width:14%;">代理</th><th style="width:12%;">金额=已付</th><th style="width:13%;">收款日期</th><th>核查结果</th></tr>
+  <tr><td>FTM2026080642018</td><td>澳门欢乐旅行社</td><td>¥20,496</td><td>2026/8/6</td><td rowspan="6" style="vertical-align:middle;">已付满额（人工确认·微信）<br>无退款申请记录<br>→「同意退款」会弹报错 1<br>→「删除」会弹报错 2</td></tr>
+  <tr><td>FTM2026080645651</td><td>易达OTA</td><td>¥880</td><td>2026/8/6</td></tr>
+  <tr><td>FTM2026081085207</td><td>世途1</td><td>¥2,956</td><td>2026/8/10</td></tr>
+  <tr><td>FTM2026081094527</td><td>易达OTA</td><td>¥990</td><td>2026/8/10</td></tr>
+  <tr><td>FTM2026081239064</td><td>世途2</td><td>¥1,478</td><td>2026/8/12</td></tr>
+  <tr><td>FTM2026081842806</td><td>世途1</td><td>¥1,458</td><td>2026/8/18</td></tr>
+</table>
+
+<div class="card">
+  <p><strong>处置建议（先由财务确认这六笔微信收款是否真实到账）：</strong></p>
+  <ul>
+    <li><strong>钱没真到账（测试/错录）</strong>→ 走第一章情形 ③ 的管理员快捷路径：强制改「已取消」→ 收款区撤销收款（填原因）→ 删除。逐单三步，全程不动座位。</li>
+    <li><strong>钱真到账、要退给客人</strong>→ 先「驳回退款（回退处理）」回到处理中（注意：机位会重新占回），再点「<strong>申请退款</strong>」重新发起（生成应退报价），然后按第四章：核对拆分 → 打款 → 同意退款 → 已退款；全额退平后即可删除。</li>
+  </ul>
+</div>
+
+<p style="margin-top:40px; color:var(--ink-muted); font-size:12.5px; text-align:center;">世途旅行 · 运营控制台操作指引 · 2026-08-23 版（含「申请退款」生成应退报价的新流程）· 截图与报错原文取自系统实际界面 · 如与系统最新提示不一致，以系统提示为准</p>
+
+</div>
+</body>
+</html>
