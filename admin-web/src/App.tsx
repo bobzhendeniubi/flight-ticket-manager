@@ -46,10 +46,17 @@ const AGENT_ALLOWED_PATHS = new Set([
 function Protected({
   children,
   adminOnly = false,
+  financeRole = false,
 }: {
   children: React.ReactNode;
   /** 只允许 ADMIN/STAFF；AGENT 重定向到自己的 landing 页 */
   adminOnly?: boolean;
+  /**
+   * 仅 ADMIN 或 STAFF+FINANCE（与 Layout 菜单的 financeRole 同口径）。
+   * 数据保护仍在后端 requireFinanceAccess —— 这里只是让非财务岗 STAFF 直接敲 URL 时
+   * 被路由级重定向回 landing，而不是渲染出一个 API 全 403 的报错空页。
+   */
+  financeRole?: boolean;
 }) {
   const user = useAuth((s) => s.user);
   const tokens = useAuth((s) => s.tokens);
@@ -59,6 +66,13 @@ function Protected({
   // AGENT 禁入 admin-only 页 —— 落到默认 landing (/orders)
   if (adminOnly && user.role === 'AGENT') {
     return <Navigate to="/orders" replace />;
+  }
+  if (financeRole) {
+    if (user.role === 'AGENT') return <Navigate to="/orders" replace />;
+    // 登录瞬间 user 可能还没带 staffRole（等 /users/me 返回）：先放行渲染，数据由后端闸兜底；
+    // staffRole 已知且不是财务岗才重定向，避免误伤刷新/首登场景。
+    const denied = user.role === 'STAFF' && user.staffRole != null && user.staffRole !== 'FINANCE';
+    if (denied) return <Navigate to="/dashboard" replace />;
   }
   return <>{children}</>;
 }
@@ -256,7 +270,7 @@ export function App() {
         <Route
           path="/finances"
           element={
-            <Protected adminOnly>
+            <Protected adminOnly financeRole>
               <FinancesPage />
             </Protected>
           }
@@ -312,7 +326,7 @@ export function App() {
         <Route
           path="/reports"
           element={
-            <Protected adminOnly>
+            <Protected adminOnly financeRole>
               <ReportsPage />
             </Protected>
           }
