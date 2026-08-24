@@ -22,6 +22,7 @@ export const userRoutes: FastifyPluginAsync = async (app) => {
         email: true,
         phone: true,
         role: true,
+        staffRole: true,
         displayName: true,
         emailVerified: true,
         phoneVerified: true,

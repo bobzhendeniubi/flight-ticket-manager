@@ -1,5 +1,5 @@
 /**
- * 经营报表 API — ADMIN-only（财务口径，风格对齐 finances 模块）
+ * 经营报表 API — ADMIN 或 STAFF+财务岗（财务口径，风格对齐 finances 模块）
  *
  * 路由：
  *   GET /reports/sales?from=YYYY-MM-DD&to=YYYY-MM-DD&dim=kind|channel|agent
@@ -10,7 +10,6 @@
  * 所有访问都写审计日志（VIEW_REPORTS）— 报表数据敏感。
  */
 import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
-import { UserRole } from '@prisma/client';
 import { z } from 'zod';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
 import {
@@ -61,12 +60,12 @@ function logView(
 }
 
 export const reportRoutes: FastifyPluginAsync = async (app) => {
-  const requireAdmin = {
-    preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN)],
+  const requireFinance = {
+    preHandler: [app.authenticate, app.requireFinanceAccess],
   };
 
   // ── 销售毛利（按产品线 / 渠道 / 代理）──
-  app.get('/sales', requireAdmin, async (req) => {
+  app.get('/sales', requireFinance, async (req) => {
     const q = salesSchema.parse(req.query);
     const def = defaultRange();
     const range = { from: q.from ?? def.from, to: q.to ?? def.to };
@@ -76,20 +75,20 @@ export const reportRoutes: FastifyPluginAsync = async (app) => {
   });
 
   // ── 应收账龄（余额 > 0 的进行中订单）──
-  app.get('/receivables', requireAdmin, async (req) => {
+  app.get('/receivables', requireFinance, async (req) => {
     logView(req, { route: 'receivables' });
     return getReceivablesReport();
   });
 
   // ── 代理欠款（按代理聚合应收余额 + 预存余额）──
-  app.get('/agent-debts', requireAdmin, async (req) => {
+  app.get('/agent-debts', requireFinance, async (req) => {
     logView(req, { route: 'agent-debts' });
     const rows = await getAgentDebtsReport();
     return { rows };
   });
 
   // ── xlsx 导出（4 sheet：三维度销售毛利 + 应收与代理欠款）──
-  app.get('/export', requireAdmin, async (req, reply) => {
+  app.get('/export', requireFinance, async (req, reply) => {
     const q = rangeSchema.parse(req.query);
     const def = defaultRange();
     const range = { from: q.from ?? def.from, to: q.to ?? def.to };

@@ -1,6 +1,6 @@
 /**
  * 账号管理（仅 ADMIN）。
- * 岗位仍决定 STAFF 导出裁剪；账号本身还负责内部开户、停用/启用与临时密码重置。
+ * 岗位决定部分 STAFF 导出裁剪；财务岗可见财务页与经营报表且导出不裁剪。账号本身还负责内部开户、停用/启用与临时密码重置。
  */
 import { Fragment, useEffect, useState } from 'react';
 import type { FormEvent } from 'react';
@@ -11,7 +11,12 @@ const STAFF_ROLE_LABEL: Record<StaffRole, string> = {
   VISA_DESK: '签证岗',
   TICKETING: '票务岗',
   ROOM_CONTROL: '房控岗',
+  FINANCE: '财务岗',
 };
+
+function staffRoleOptionLabel(value: string, label: string): string {
+  return value === 'FINANCE' ? `${label}（财务页与经营报表）` : label;
+}
 
 const PASSWORD_ALPHABET = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
 
@@ -154,6 +159,7 @@ export function StaffRolesPage() {
         <h1 className="page-title">账号管理</h1>
         <p className="page-sub">
           管理内部 ADMIN/STAFF 账号、岗位与会话状态。新建或重置密码后，对方首次登录必须先修改密码。
+          财务岗可见财务页与经营报表，导出不做岗位裁剪。
         </p>
       </section>
 
@@ -212,7 +218,7 @@ export function StaffRolesPage() {
               >
                 <option value="">通用运营（全模板）</option>
                 {Object.entries(STAFF_ROLE_LABEL).map(([value, label]) => (
-                  <option key={value} value={value}>{label}</option>
+                  <option key={value} value={value}>{staffRoleOptionLabel(value, label)}</option>
                 ))}
               </select>
             </label>
@@ -281,7 +287,7 @@ export function StaffRolesPage() {
                         >
                           <option value="">通用运营（全模板）</option>
                           {Object.entries(STAFF_ROLE_LABEL).map(([value, label]) => (
-                            <option key={value} value={value}>{label}</option>
+                            <option key={value} value={value}>{staffRoleOptionLabel(value, label)}</option>
                           ))}
                         </select>
                       )}

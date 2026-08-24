@@ -1,14 +1,23 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import Fastify, { type FastifyInstance } from 'fastify';
-import { UserRole } from '@prisma/client';
+import { StaffRole, UserRole } from '@prisma/client';
 import { ConflictError } from '../../lib/errors.js';
 
 const prismaMock = vi.hoisted(() => ({
-  user: { findUnique: vi.fn().mockResolvedValue({ disabledAt: null, agentProfile: { isActive: true } }) },
+  user: { findUnique: vi.fn().mockResolvedValue({ disabledAt: null, authVersion: 0, staffRole: null, agentProfile: { isActive: true } }) },
   agent: { findUnique: vi.fn() },
   auditLog: { create: vi.fn().mockResolvedValue({}) },
 }));
 vi.mock('../../db/prisma.js', () => ({ prisma: prismaMock }));
+
+const getFinancesSummaryMock = vi.hoisted(() => vi.fn());
+vi.mock('./finances.service.js', () => ({
+  getFinancesSummary: getFinancesSummaryMock,
+  getFlightPnl: vi.fn(),
+  getOrderPnl: vi.fn(),
+  getOrderPnlDetail: vi.fn(),
+  getMonthlyTrend: vi.fn(),
+}));
 
 const setFlightScheduleCostLockMock = vi.hoisted(() => vi.fn());
 const patchFlightScheduleCostMock = vi.hoisted(() => vi.fn());
@@ -60,6 +69,43 @@ describe('班次成本锁定路由', () => {
   function tokenFor(sub: string, role: UserRole): string {
     return app.jwt.sign({ sub, role });
   }
+
+  it('STAFF+FINANCE 可以访问损益汇总', async () => {
+    prismaMock.user.findUnique.mockResolvedValue({
+      disabledAt: null,
+      authVersion: 0,
+      staffRole: StaffRole.FINANCE,
+      agentProfile: null,
+    });
+    getFinancesSummaryMock.mockResolvedValue({ revenueCny: 0 });
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/finances/summary?from=2026-08-01&to=2026-08-24',
+      headers: { authorization: `Bearer ${tokenFor('finance-1', UserRole.STAFF)}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(getFinancesSummaryMock).toHaveBeenCalledWith({ from: '2026-08-01', to: '2026-08-24' });
+  });
+
+  it('STAFF 通用岗位访问损益汇总 → 403', async () => {
+    prismaMock.user.findUnique.mockResolvedValue({
+      disabledAt: null,
+      authVersion: 0,
+      staffRole: null,
+      agentProfile: null,
+    });
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/finances/summary',
+      headers: { authorization: `Bearer ${tokenFor('staff-1', UserRole.STAFF)}` },
+    });
+
+    expect(res.statusCode).toBe(403);
+    expect(getFinancesSummaryMock).not.toHaveBeenCalled();
+  });
 
   it('STAFF 可以锁定班次并记录固化前后的成本审计', async () => {
     const lockedAt = new Date('2026-07-23T03:00:00.000Z');

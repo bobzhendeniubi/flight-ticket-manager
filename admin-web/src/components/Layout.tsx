@@ -12,11 +12,13 @@ const ROLE_LABEL: Record<string, string> = {
 
 // roles: 允许访问该导航的角色集合
 // section: 侧栏分组标题（用于视觉分组，不影响路由 / 角色过滤）
+// financeRole: 仅 ADMIN 或 STAFF+FINANCE 可见
 const NAV: Array<{
   to: string;
   label: string;
   roles: Array<'ADMIN' | 'STAFF' | 'AGENT'>;
   section: string;
+  financeRole?: boolean;
 }> = [
   { to: '/dashboard',       label: '仪表盘',      roles: ['ADMIN', 'STAFF'],          section: '概览' },
   { to: '/orders',          label: '订单管理',    roles: ['ADMIN', 'STAFF', 'AGENT'], section: '运营' },
@@ -39,8 +41,8 @@ const NAV: Array<{
   { to: '/settlements',     label: '结算单',      roles: ['ADMIN', 'STAFF', 'AGENT'], section: '财务' },
   { to: '/agent-balance',   label: '余额与认款',  roles: ['ADMIN', 'STAFF', 'AGENT'], section: '财务' },
   { to: '/reconciliation',  label: '收款对账台',  roles: ['ADMIN', 'STAFF'],          section: '财务' },
-  { to: '/finances',        label: '财务',        roles: ['ADMIN'],                   section: '财务' },
-  { to: '/reports',         label: '经营报表',    roles: ['ADMIN'],                   section: '财务' },
+  { to: '/finances',        label: '财务',        roles: ['ADMIN'],                   section: '财务', financeRole: true },
+  { to: '/reports',         label: '经营报表',    roles: ['ADMIN'],                   section: '财务', financeRole: true },
   { to: '/audit-logs',      label: '审计日志',    roles: ['ADMIN', 'STAFF'],          section: '系统' },
   { to: '/settings/ai-ocr', label: 'AI 识别设置', roles: ['ADMIN'],                   section: '系统' },
   { to: '/settings/staff-roles', label: '账号管理',    roles: ['ADMIN'],                   section: '系统' },
@@ -118,8 +120,13 @@ export function Layout() {
     return <Navigate to="/change-password" replace />;
   }
 
+  // 登录瞬间 user 还没有 staffRole，需等 /users/me 返回后才显示财务岗菜单；短暂延迟可接受。
   const visibleNav = user
-    ? NAV.filter((n) => n.roles.includes(user.role as 'ADMIN' | 'STAFF' | 'AGENT'))
+    ? NAV.filter((n) =>
+        n.financeRole
+          ? user.role === 'ADMIN' || (user.role === 'STAFF' && user.staffRole === 'FINANCE')
+          : n.roles.includes(user.role as 'ADMIN' | 'STAFF' | 'AGENT'),
+      )
     : [];
 
   // 当前页标题（用于内容区顶栏的上下文）

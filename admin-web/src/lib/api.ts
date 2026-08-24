@@ -195,6 +195,8 @@ export interface AuthUser {
   id: string;
   email: string | null;
   role: UserRole;
+  /** 登录响应暂不带岗位；启动时 /users/me 返回当前逐请求复核的岗位。 */
+  staffRole?: StaffRole | null;
   displayName: string | null;
   mustChangePassword: boolean;
 }
@@ -2828,6 +2830,7 @@ export const api = {
         createdAt: string;
         lastLoginAt: string | null;
         disabledAt: string | null;
+        staffRole: StaffRole | null;
       };
     }>('/users/me', { token }),
 
@@ -4699,8 +4702,8 @@ export interface FlightPnlRow {
 
 export type CostSource = 'override' | 'period' | 'none';
 
-/** 内部岗位（A20）：null=通用运营。专岗账号的全岗总表导出被服务端强制裁到本岗模板。 */
-export type StaffRole = 'VISA_DESK' | 'TICKETING' | 'ROOM_CONTROL';
+/** 内部岗位：null=通用运营；财务岗可见财务页与经营报表，导出不裁剪。 */
+export type StaffRole = 'VISA_DESK' | 'TICKETING' | 'ROOM_CONTROL' | 'FINANCE';
 export interface StaffUser {
   id: string;
   email: string | null;

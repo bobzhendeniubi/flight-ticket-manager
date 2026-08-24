@@ -65,6 +65,47 @@ function request(method: 'GET' | 'POST' | 'PATCH', url: string, body?: TestPaylo
   return app.inject({ method, url, payload: body });
 }
 
+describe('GET /users/me', () => {
+  it('返回当前账号岗位，供前端在登录后刷新财务导航', async () => {
+    prismaMock.user.findUnique.mockResolvedValue({
+      id: 'admin-1',
+      email: 'finance@example.com',
+      phone: null,
+      role: UserRole.STAFF,
+      staffRole: StaffRole.FINANCE,
+      displayName: '财务',
+      emailVerified: true,
+      phoneVerified: false,
+      createdAt: new Date('2026-08-01T00:00:00.000Z'),
+      lastLoginAt: null,
+      disabledAt: null,
+      mustChangePassword: false,
+    });
+
+    const res = await request('GET', '/users/me');
+
+    expect(res.statusCode).toBe(200);
+    expect(res.json().user.staffRole).toBe(StaffRole.FINANCE);
+    expect(prismaMock.user.findUnique).toHaveBeenCalledWith({
+      where: { id: 'admin-1' },
+      select: {
+        id: true,
+        email: true,
+        phone: true,
+        role: true,
+        staffRole: true,
+        displayName: true,
+        emailVerified: true,
+        phoneVerified: true,
+        createdAt: true,
+        lastLoginAt: true,
+        disabledAt: true,
+        mustChangePassword: true,
+      },
+    });
+  });
+});
+
 describe('POST /users/staff', () => {
   it('创建带岗位 STAFF，且审计不接触密码', async () => {
     prismaMock.user.findUnique.mockResolvedValue(null);

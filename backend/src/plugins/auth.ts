@@ -1,7 +1,7 @@
 import fp from 'fastify-plugin';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import fastifyJwt from '@fastify/jwt';
-import { UserRole } from '@prisma/client';
+import { StaffRole, UserRole } from '@prisma/client';
 import { env } from '../config/env.js';
 import { ForbiddenError, UnauthorizedError } from '../lib/errors.js';
 import { prisma } from '../db/prisma.js';
@@ -28,10 +28,14 @@ declare module 'fastify' {
     requireRole: (
       ...roles: UserRole[]
     ) => (req: FastifyRequest, reply: FastifyReply) => Promise<void>;
+    /** Requires ADMIN or STAFF with the finance staff role. */
+    requireFinanceAccess: (req: FastifyRequest, reply: FastifyReply) => Promise<void>;
   }
   interface FastifyRequest {
     /** Set by `authenticate`; may be undefined on `optionalAuthenticate` routes. */
     user: AccessTokenPayload;
+    /** Set from the current User row by authenticate/optionalAuthenticate. */
+    staffRole?: StaffRole | null;
   }
 }
 
@@ -51,23 +55,31 @@ declare module '@fastify/jwt' {
  * User 主键查询——停用后存量 token 立即失效，不必等其自然过期。access token TTL 目前为 1 小时，
  * 这里用每请求一次查询换取停用的即时生效，是有意保留的安全取舍。
  *
- * 返回 true 表示「用户已停用、用户不存在、会话版本已失效，或 AGENT 的 Agent 记录已失效」，由调用方决定拒绝或降级。
+ * 一次查询同时返回停用判定和当前岗位。岗位不放入 token，财务权限因此可以逐请求随 User 表变更即时生效。
+ * deactivated=true 表示「用户已停用、用户不存在、会话版本已失效，或 AGENT 的 Agent 记录已失效」，由调用方决定拒绝或降级。
  * DB 异常向上抛出（不静默放行），保证判定失败时绝不误授予代理身份。
  */
-async function isDeactivatedUser(payload: AccessTokenPayload): Promise<boolean> {
+async function isDeactivatedUser(payload: AccessTokenPayload): Promise<{
+  deactivated: boolean;
+  staffRole: StaffRole | null;
+}> {
   const user = await prisma.user.findUnique({
     where: { id: payload.sub },
     select: {
       disabledAt: true,
       authVersion: true,
+      staffRole: true,
       agentProfile: { select: { isActive: true } },
     },
   });
-  if (!user || user.disabledAt != null) return true;
+  if (!user) return { deactivated: true, staffRole: null };
   // ver 为空代表部署前签发的旧 token；给 access token 最长一个 TTL 的自然消亡宽限，
   // 不因新增版本字段把已登录用户瞬间踢出。新签 token 都带 ver，生命周期变更后立即失效。
-  if (payload.ver != null && payload.ver !== user.authVersion) return true;
-  return payload.role === UserRole.AGENT && (!user.agentProfile || !user.agentProfile.isActive);
+  const deactivated =
+    user.disabledAt != null ||
+    (payload.ver != null && payload.ver !== user.authVersion) ||
+    (payload.role === UserRole.AGENT && (!user.agentProfile || !user.agentProfile.isActive));
+  return { deactivated, staffRole: user.staffRole };
 }
 
 export const authPlugin = fp(async function authPlugin(app: FastifyInstance) {
@@ -83,9 +95,11 @@ export const authPlugin = fp(async function authPlugin(app: FastifyInstance) {
       throw new UnauthorizedError('Invalid or expired access token');
     }
     // 这些路由本就要求登录 → 停用账号的存量 token 硬拒绝（401）。
-    if (await isDeactivatedUser(req.user)) {
+    const check = await isDeactivatedUser(req.user);
+    if (check.deactivated) {
       throw new UnauthorizedError('账号已停用，请联系管理员');
     }
+    req.staffRole = check.staffRole;
   });
 
   app.decorate('optionalAuthenticate', async function optionalAuthenticate(req, _reply) {
@@ -109,9 +123,13 @@ export const authPlugin = fp(async function authPlugin(app: FastifyInstance) {
     // optionalAuthenticate 语义是「可选登录」，停用账号应等同「未登录」——清空 req.user 后，
     // 免登录路由（如游客下单 POST /orders、产品列表定价）继续按匿名/游客处理，绝不再按代理身份
     // 绑定 agentId 或套用代理价。选降级而非 401 是为了不破坏匿名下单路径（硬 401 会连累游客场景）。
-    if (await isDeactivatedUser(req.user)) {
+    const check = await isDeactivatedUser(req.user);
+    if (check.deactivated) {
       // fastify-jwt 成功校验后已给 req.user 赋值；这里清回 undefined，让下游 Boolean(req.user) 判定为游客。
       (req as { user?: AccessTokenPayload }).user = undefined;
+      req.staffRole = undefined;
+    } else {
+      req.staffRole = check.staffRole;
     }
   });
 
@@ -123,5 +141,14 @@ export const authPlugin = fp(async function authPlugin(app: FastifyInstance) {
         throw new ForbiddenError(`Requires role: ${roles.join(' | ')}`);
       }
     };
+  });
+
+  app.decorate('requireFinanceAccess', async function requireFinanceAccess(req, _reply) {
+    // 岗位逐请求从 User 表取回，改岗后下一个请求立即生效，不依赖 access token 内容。
+    if (!req.user) throw new UnauthorizedError();
+    const allowed =
+      req.user.role === UserRole.ADMIN ||
+      (req.user.role === UserRole.STAFF && req.staffRole === StaffRole.FINANCE);
+    if (!allowed) throw new ForbiddenError('需要财务岗权限');
   });
 });

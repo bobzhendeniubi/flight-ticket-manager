@@ -21,6 +21,7 @@ beforeAll(async () => {
     identified: Boolean(req.user),
     role: req.user?.role ?? null,
     sub: req.user?.sub ?? null,
+    staffRole: req.staffRole ?? null,
   }));
   await app.ready();
 });
@@ -43,55 +44,55 @@ async function hitOptional(headers: Record<string, string> = {}) {
 
 describe('optionalAuthenticate · 停用账号降级为匿名', () => {
   it('AGENT 不活跃 → 游客 200', async () => {
-    prismaMock.user.findUnique.mockResolvedValue({ disabledAt: null, agentProfile: { isActive: false } });
+    prismaMock.user.findUnique.mockResolvedValue({ disabledAt: null, authVersion: 0, staffRole: null, agentProfile: { isActive: false } });
     const res = await hitOptional({ authorization: `Bearer ${tokenFor('agent-user-1', UserRole.AGENT)}` });
     expect(res.statusCode).toBe(200);
-    expect(res.json()).toEqual({ identified: false, role: null, sub: null });
+    expect(res.json()).toEqual({ identified: false, role: null, sub: null, staffRole: null });
   });
 
   it('AGENT 画像缺失 → 游客 200', async () => {
-    prismaMock.user.findUnique.mockResolvedValue({ disabledAt: null, agentProfile: null });
+    prismaMock.user.findUnique.mockResolvedValue({ disabledAt: null, authVersion: 0, staffRole: null, agentProfile: null });
     const res = await hitOptional({ authorization: `Bearer ${tokenFor('agent-user-2', UserRole.AGENT)}` });
     expect(res.statusCode).toBe(200);
     expect(res.json().identified).toBe(false);
   });
 
   it('AGENT 活跃 → 保留身份', async () => {
-    prismaMock.user.findUnique.mockResolvedValue({ disabledAt: null, agentProfile: { isActive: true } });
+    prismaMock.user.findUnique.mockResolvedValue({ disabledAt: null, authVersion: 0, staffRole: null, agentProfile: { isActive: true } });
     const res = await hitOptional({ authorization: `Bearer ${tokenFor('agent-user-3', UserRole.AGENT)}` });
     expect(res.statusCode).toBe(200);
-    expect(res.json()).toEqual({ identified: true, role: 'AGENT', sub: 'agent-user-3' });
+    expect(res.json()).toEqual({ identified: true, role: 'AGENT', sub: 'agent-user-3', staffRole: null });
   });
 
   it.each<UserRole>([UserRole.STAFF, UserRole.ADMIN, UserRole.CUSTOMER])(
     '%s 正常用户 → 保留身份',
     async (role) => {
-      prismaMock.user.findUnique.mockResolvedValue({ disabledAt: null, agentProfile: null });
+      prismaMock.user.findUnique.mockResolvedValue({ disabledAt: null, authVersion: 0, staffRole: null, agentProfile: null });
       const res = await hitOptional({ authorization: `Bearer ${tokenFor(`user-${role}`, role)}` });
       expect(res.statusCode).toBe(200);
-      expect(res.json()).toEqual({ identified: true, role, sub: `user-${role}` });
+      expect(res.json()).toEqual({ identified: true, role, sub: `user-${role}`, staffRole: null });
       expect(prismaMock.user.findUnique).toHaveBeenCalled();
     },
   );
 
   it('disabledAt 非空 → 游客 200', async () => {
-    prismaMock.user.findUnique.mockResolvedValue({ disabledAt: new Date(), agentProfile: null });
+    prismaMock.user.findUnique.mockResolvedValue({ disabledAt: new Date(), authVersion: 0, staffRole: null, agentProfile: null });
     const res = await hitOptional({ authorization: `Bearer ${tokenFor('disabled-user', UserRole.CUSTOMER)}` });
     expect(res.statusCode).toBe(200);
-    expect(res.json()).toEqual({ identified: false, role: null, sub: null });
+    expect(res.json()).toEqual({ identified: false, role: null, sub: null, staffRole: null });
   });
 
   it('用户不存在 → 游客 200', async () => {
     prismaMock.user.findUnique.mockResolvedValue(null);
     const res = await hitOptional({ authorization: `Bearer ${tokenFor('missing-user', UserRole.CUSTOMER)}` });
     expect(res.statusCode).toBe(200);
-    expect(res.json().identified).toBe(false);
+    expect(res.json()).toMatchObject({ identified: false, staffRole: null });
   });
 
   it('无 Authorization → 游客放行且不查数据库', async () => {
     const res = await hitOptional();
     expect(res.statusCode).toBe(200);
-    expect(res.json()).toEqual({ identified: false, role: null, sub: null });
+    expect(res.json()).toEqual({ identified: false, role: null, sub: null, staffRole: null });
     expect(prismaMock.user.findUnique).not.toHaveBeenCalled();
   });
 

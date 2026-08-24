@@ -1,6 +1,6 @@
 /**
  * 财务 API — 业务财务模块
- * 报表/导出等查询为 ADMIN-only；成本维护（周期/班次/产品成本 + 成本锁定）放开到 ADMIN/STAFF（财务岗）。
+ * 损益/报表/导出等查询放开到 ADMIN 或 STAFF+财务岗；成本维护（周期/班次/产品成本 + 成本锁定）仍按 ADMIN/STAFF。
  *
  * 路由：
  *   GET /finances/summary?from=YYYY-MM-DD&to=YYYY-MM-DD
@@ -100,14 +100,14 @@ function logView(
 }
 
 export const financesRoutes: FastifyPluginAsync = async (app) => {
-  const requireAdmin = {
-    preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN)],
+  const requireFinance = {
+    preHandler: [app.authenticate, app.requireFinanceAccess],
   };
   const requireAdminOrStaff = {
     preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)],
   };
 
-  app.get('/summary', requireAdmin, async (req) => {
+  app.get('/summary', requireFinance, async (req) => {
     const q = rangeSchema.parse(req.query);
     const def = defaultRange();
     const range = { from: q.from ?? def.from, to: q.to ?? def.to };
@@ -115,7 +115,7 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
     return getFinancesSummary(range);
   });
 
-  app.get('/flights', requireAdmin, async (req) => {
+  app.get('/flights', requireFinance, async (req) => {
     const q = rangeSchema.parse(req.query);
     const def = defaultRange();
     const range = { from: q.from ?? def.from, to: q.to ?? def.to };
@@ -124,7 +124,7 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
     return { range, rows };
   });
 
-  app.get('/orders', requireAdmin, async (req) => {
+  app.get('/orders', requireFinance, async (req) => {
     const q = rangeSchema.parse(req.query);
     const def = defaultRange();
     const range = { from: q.from ?? def.from, to: q.to ?? def.to };
@@ -134,7 +134,7 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
   });
 
   // ── 单订单收支明细（下钻）：收入逐项 + 成本逐项 + 杂项成本逐条 ──
-  app.get('/orders/:id/pnl-detail', requireAdmin, async (req, reply) => {
+  app.get('/orders/:id/pnl-detail', requireFinance, async (req, reply) => {
     const { id } = req.params as { id: string };
     logView(req, { route: 'order-pnl-detail', orderId: id });
     const detail = await getOrderPnlDetail(id);
@@ -142,7 +142,7 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
     return detail;
   });
 
-  app.get('/monthly', requireAdmin, async (req) => {
+  app.get('/monthly', requireFinance, async (req) => {
     const q = monthlySchema.parse(req.query);
     const months = q.months ?? 6;
     logView(req, { route: 'monthly', months });
@@ -151,7 +151,7 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
   });
 
   // ── xlsx 导出（一行/乘客）──
-  app.get('/export', requireAdmin, async (req, reply) => {
+  app.get('/export', requireFinance, async (req, reply) => {
     const q = rangeSchema.parse(req.query);
     const def = defaultRange();
     const range = { from: q.from ?? def.from, to: q.to ?? def.to };
@@ -170,7 +170,7 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
   });
 
   // ── xlsx 导出（一行/班次，整班 P&L）──
-  app.get('/export-by-flight', requireAdmin, async (req, reply) => {
+  app.get('/export-by-flight', requireFinance, async (req, reply) => {
     const q = rangeSchema.parse(req.query);
     const def = defaultRange();
     const range = { from: q.from ?? def.from, to: q.to ?? def.to };
@@ -189,7 +189,7 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
   });
 
   // ── xlsx 导出（一行/订单，订单毛利）──
-  app.get('/export-orders', requireAdmin, async (req, reply) => {
+  app.get('/export-orders', requireFinance, async (req, reply) => {
     const q = rangeSchema.parse(req.query);
     const def = defaultRange();
     const range = { from: q.from ?? def.from, to: q.to ?? def.to };
