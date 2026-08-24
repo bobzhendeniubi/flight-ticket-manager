@@ -144,6 +144,20 @@ describe('serializeReceipt', () => {
     );
     expect(out.remainingCny).toBe('700.00');
   });
+
+  it('占位认款使用 HOLD 判别字段，撤销记录不混入序列化去向', () => {
+    const row = {
+      ...receiptRow({ id: 'r-hold', receiptNo: 'R-HOLD', amountCny: 500, allocatedCny: 300 }),
+      holdAllocations: [
+        { id: 'ha1', holdOrderId: 'h1', holdInstallmentId: 'i1', receiptId: 'r-hold', amountCny: new Prisma.Decimal(200), reversedAt: null, createdById: null, createdAt: new Date() },
+        { id: 'ha2', holdOrderId: 'h1', holdInstallmentId: 'i1', receiptId: 'r-hold', amountCny: new Prisma.Decimal(100), reversedAt: new Date(), createdById: null, createdAt: new Date() },
+      ],
+    } as unknown as Parameters<typeof serializeReceipt>[0];
+    const out = serializeReceipt(row, new Map(), new Map([['h1', 'H20260824AB12']]));
+    expect(out.allocations).toHaveLength(1);
+    expect(out.allocations[0]).toMatchObject({ kind: 'HOLD', holdNo: 'H20260824AB12' });
+    expect('orderId' in out.allocations[0]).toBe(false);
+  });
 });
 
 describe('ReceiptsService.list', () => {

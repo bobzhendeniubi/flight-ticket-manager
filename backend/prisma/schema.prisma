@@ -703,6 +703,26 @@ enum HoldOwnerType {
   CUSTOMER
 }
 
+enum HoldInstallmentStatus {
+  PENDING
+  PAID
+}
+
+enum HoldAmountRule {
+  PER_PERSON_FIXED
+  REMAINDER
+}
+
+enum HoldOverdueAction {
+  REMIND_ONLY
+  AUTO_RELEASE
+}
+
+enum HoldOccupyOn {
+  CREATE
+  FULL_PAYMENT
+}
+
 model HoldOrder {
   id               String          @id @default(cuid())
   holdNo           String          @unique
@@ -717,6 +737,7 @@ model HoldOrder {
   perSeatPriceCny  Int
   freeCancelRatio  Decimal?        @db.Decimal(4, 3)
   freeCancelUsed   Int             @default(0)
+  occupyOn         HoldOccupyOn    @default(CREATE)
   status           HoldOrderStatus @default(HOLDING)
   notes            String?
   createdById      String
@@ -725,13 +746,83 @@ model HoldOrder {
   createdAt        DateTime        @default(now())
   updatedAt        DateTime        @updatedAt
 
-  flightSchedule FlightSchedule  @relation(fields: [flightScheduleId], references: [id], onDelete: Cascade)
-  seatClass      FlightSeatClass @relation(fields: [seatClassId], references: [id], onDelete: Cascade)
+  flightSchedule FlightSchedule  @relation(fields: [flightScheduleId], references: [id], onDelete: Restrict)
+  seatClass      FlightSeatClass @relation(fields: [seatClassId], references: [id], onDelete: Restrict)
   agent          Agent?          @relation(fields: [agentId], references: [id], onDelete: SetNull)
+  installments       HoldInstallment[]
+  receiptAllocations HoldReceiptAllocation[]
+  reductions         HoldReductionRecord[]
 
   @@index([seatClassId, status])
   @@index([flightScheduleId, status])
   @@index([agentId, status])
+}
+
+model HoldInstallment {
+  id              String                @id @default(cuid())
+  holdOrderId     String
+  seq             Int
+  label           String
+  amountRule      HoldAmountRule
+  perPersonCny    Int?
+  amountCny       Int
+  seatsBasis      Int
+  dueDate         DateTime              @db.Date
+  status          HoldInstallmentStatus @default(PENDING)
+  paidAt          DateTime?
+  createdAt       DateTime              @default(now())
+  updatedAt       DateTime              @updatedAt
+
+  holdOrder       HoldOrder             @relation(fields: [holdOrderId], references: [id], onDelete: Cascade)
+  allocations     HoldReceiptAllocation[]
+
+  @@unique([holdOrderId, seq])
+  @@index([status, dueDate])
+}
+
+model HoldReceiptAllocation {
+  id                String          @id @default(cuid())
+  receiptId         String
+  holdOrderId       String
+  holdInstallmentId String
+  amountCny         Decimal         @db.Decimal(14, 2)
+  reversedAt        DateTime?
+  createdById       String?
+  createdAt         DateTime        @default(now())
+
+  receipt         Receipt         @relation(fields: [receiptId], references: [id], onDelete: Cascade)
+  holdOrder       HoldOrder       @relation(fields: [holdOrderId], references: [id], onDelete: Cascade)
+  holdInstallment HoldInstallment @relation(fields: [holdInstallmentId], references: [id], onDelete: Cascade)
+
+  @@index([receiptId])
+  @@index([holdOrderId])
+}
+
+model HoldReductionRecord {
+  id             String   @id @default(cuid())
+  holdOrderId    String
+  seatsReduced   Int
+  freeSeats      Int
+  forfeitSeats   Int
+  perSeatPaidCny Int
+  forfeitCny     Int
+  creditCny      Int
+  surplusCny     Int      @default(0)
+  note           String?
+  createdById    String
+  createdAt      DateTime @default(now())
+
+  holdOrder HoldOrder @relation(fields: [holdOrderId], references: [id], onDelete: Cascade)
+
+  @@index([holdOrderId])
+}
+
+model HoldOrderConfig {
+  id                     String            @id @default(cuid())
+  installments           Json
+  overdueAction          HoldOverdueAction @default(REMIND_ONLY)
+  defaultFreeCancelRatio Decimal           @db.Decimal(4, 3) @default(0.1)
+  updatedAt              DateTime          @updatedAt
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1716,7 +1807,8 @@ model Receipt {
   createdAt    DateTime      @default(now())
   updatedAt    DateTime      @updatedAt
 
-  allocations ReceiptAllocation[]
+  allocations     ReceiptAllocation[]
+  holdAllocations HoldReceiptAllocation[]
 
   @@index([status])
   @@index([receivedAt])

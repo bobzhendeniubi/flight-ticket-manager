@@ -23,6 +23,7 @@ import {
   UserRole,
   type Receipt,
   type ReceiptAllocation,
+  type HoldReceiptAllocation,
 } from '@prisma/client';
 import { randomBytes } from 'node:crypto';
 import { prisma } from '../../db/prisma.js';
@@ -345,12 +346,16 @@ async function findAllocationPaymentWithinTx(
   return { id: nearest.id, gatewayPayload: nearest.gatewayPayload };
 }
 
-type ReceiptWithAllocations = Receipt & { allocations: ReceiptAllocation[] };
+type ReceiptWithAllocations = Receipt & {
+  allocations: ReceiptAllocation[];
+  holdAllocations?: HoldReceiptAllocation[];
+};
 
 /**
  * 一笔进账「还挂在池子里、等着认款」的余额 —— 挂账池的唯一余额口径。
  *
  * = amountCny − allocatedCny，但 **REFUNDED 行一律为 0**：剩余部分已经退回客户，
+ * 占位单认款同样递增 Receipt.allocatedCny，因此与订单认款共用这一余额口径。
  * 那笔钱不在公司手上了，绝不能继续算作待认领。refund() 只翻 status 不动 allocatedCny
  *（allocatedCny 的语义是「认领给订单的钱」，退款不是认领），所以归零必须在读侧做。
  *
@@ -382,6 +387,19 @@ export async function loadOrderNumbers(
   return new Map(orders.map((o) => [o.id, o.orderNumber]));
 }
 
+/** 批量把占位单 id 换成占位单号；与 loadOrderNumbers 对称，避免收款列表 N+1。 */
+export async function loadHoldNos(
+  holdOrderIds: ReadonlyArray<string | null | undefined>,
+): Promise<Map<string, string>> {
+  const ids = [...new Set(holdOrderIds.filter((id): id is string => Boolean(id)))];
+  if (ids.length === 0) return new Map();
+  const holds = await prisma.holdOrder.findMany({
+    where: { id: { in: ids } },
+    select: { id: true, holdNo: true },
+  });
+  return new Map(holds.map((hold) => [hold.id, hold.holdNo]));
+}
+
 /**
  * 进账序列化（含 remaining + 认领明细汇总），字段名即前端读取口径。
  * orderNoById：订单 id→订单号映射（调用方批量查好传进来）。查不到 → null，
@@ -390,7 +408,32 @@ export async function loadOrderNumbers(
 export function serializeReceipt(
   r: ReceiptWithAllocations,
   orderNoById?: ReadonlyMap<string, string>,
+  holdNoById?: ReadonlyMap<string, string>,
 ) {
+  const orderAllocations = (r.allocations ?? []).map((a) => ({
+    kind: 'ORDER' as const,
+    id: a.id,
+    orderId: a.orderId,
+    orderNumber: orderNoById?.get(a.orderId) ?? null,
+    holdOrderId: null,
+    holdNo: null,
+    amountCny: a.amountCny.toString(),
+    reversedAt: null,
+    createdById: a.createdById,
+    createdAt: a.createdAt,
+  }));
+  const holdAllocations = (r.holdAllocations ?? []).filter((a) => !a.reversedAt).map((a) => ({
+    kind: 'HOLD' as const,
+    id: a.id,
+    // 占位单用判别字段与 holdNo 表达去向，不伪造订单 id。
+    orderNumber: holdNoById?.get(a.holdOrderId) ?? null,
+    holdOrderId: a.holdOrderId,
+    holdNo: holdNoById?.get(a.holdOrderId) ?? null,
+    amountCny: a.amountCny.toString(),
+    reversedAt: a.reversedAt,
+    createdById: a.createdById,
+    createdAt: a.createdAt,
+  }));
   return {
     id: r.id,
     receiptNo: r.receiptNo,
@@ -411,14 +454,7 @@ export function serializeReceipt(
     createdById: r.createdById,
     createdAt: r.createdAt,
     updatedAt: r.updatedAt,
-    allocations: (r.allocations ?? []).map((a) => ({
-      id: a.id,
-      orderId: a.orderId,
-      orderNumber: orderNoById?.get(a.orderId) ?? null,
-      amountCny: a.amountCny.toString(),
-      createdById: a.createdById,
-      createdAt: a.createdAt,
-    })),
+    allocations: [...orderAllocations, ...holdAllocations],
   };
 }
 
@@ -479,14 +515,14 @@ export class ReceiptsService {
     const [recentRows, unallocatedPage, unallocatedAgg] = await Promise.all([
       prisma.receipt.findMany({
         where,
-        include: { allocations: true },
+        include: { allocations: true, holdAllocations: true },
         orderBy: { receivedAt: 'desc' },
         take: RECENT_WINDOW,
       }),
       unallocatedWhere
         ? prisma.receipt.findMany({
             where: unallocatedWhere,
-            include: { allocations: true },
+            include: { allocations: true, holdAllocations: true },
             orderBy: { receivedAt: 'desc' },
             // 多取 1 条用于判断是否触顶（触顶要如实告知，不静默截断）
             take: UNALLOCATED_CAP + 1,
@@ -520,6 +556,7 @@ export class ReceiptsService {
       ...rows.flatMap((r) => r.allocations.map((a) => a.orderId)),
       ...rows.map((r) => r.orderHintId),
     ]);
+    const holdNoById = await loadHoldNos(rows.flatMap((r) => (r.holdAllocations ?? []).filter((a) => !a.reversedAt).map((a) => a.holdOrderId)));
 
     // 未认余额合计 = Σ金额 − Σ已认（未认完状态不含 REFUNDED，故与 receiptRemainingCny 同口径）
     const unallocatedRemaining = unallocatedAgg
@@ -530,7 +567,7 @@ export class ReceiptsService {
       : 0;
 
     return {
-      receipts: rows.map((r) => serializeReceipt(r, orderNoById)),
+      receipts: rows.map((r) => serializeReceipt(r, orderNoById, holdNoById)),
       summary: {
         /** 未认完的进账笔数（服务端全量，不受列表上限影响）*/
         unallocatedCount: unallocatedAgg?._count._all ?? 0,
@@ -548,7 +585,7 @@ export class ReceiptsService {
   async ledger() {
     const RECENT_LIMIT = 300;
     const [receipts, payments] = await Promise.all([
-      prisma.receipt.findMany({ orderBy: { receivedAt: 'desc' }, take: RECENT_LIMIT }),
+      prisma.receipt.findMany({ orderBy: { receivedAt: 'desc' }, take: RECENT_LIMIT, include: { allocations: true, holdAllocations: true } }),
       prisma.payment.findMany({
         where: { status: 'SUCCEEDED' },
         include: { order: { select: { orderNumber: true } } },
@@ -557,6 +594,8 @@ export class ReceiptsService {
       }),
     ]);
 
+    const orderNoById = await loadOrderNumbers(receipts.flatMap((r) => r.allocations.map((a) => a.orderId)));
+    const holdNoById = await loadHoldNos(receipts.flatMap((r) => r.holdAllocations.filter((a) => !a.reversedAt).map((a) => a.holdOrderId)));
     const receiptEntries = receipts.map((r) => ({
       kind: 'RECEIPT' as const,
       id: r.id,
@@ -565,7 +604,13 @@ export class ReceiptsService {
       method: r.method,
       status: r.status as string,
       source: r.source as string,
-      orderNo: null as string | null,
+      orderNo: r.holdAllocations.some((a) => !a.reversedAt)
+        ? (holdNoById.get(r.holdAllocations.find((a) => !a.reversedAt)!.holdOrderId) ?? null)
+        : (r.allocations.length > 0 ? (orderNoById.get(r.allocations[0].orderId) ?? null) : null),
+      destinations: [
+        ...r.allocations.map((a) => ({ kind: 'ORDER' as const, orderNo: orderNoById.get(a.orderId) ?? null, amountCny: a.amountCny.toString() })),
+        ...r.holdAllocations.filter((a) => !a.reversedAt).map((a) => ({ kind: 'HOLD' as const, holdNo: holdNoById.get(a.holdOrderId) ?? null, amountCny: a.amountCny.toString() })),
+      ],
       at: r.receivedAt,
     }));
     const paymentEntries = payments.map((p) => ({
@@ -1435,12 +1480,12 @@ export class ReceiptsService {
     // 单页 1000 条循环取完；上限 50000 条纯属防失控（远超当前业务量），触顶报错而非截断。
     const EXPORT_PAGE = 1000;
     const EXPORT_HARD_CAP = 50_000;
-    type ReceiptWithAllocs = Prisma.ReceiptGetPayload<{ include: { allocations: true } }>;
+    type ReceiptWithAllocs = Prisma.ReceiptGetPayload<{ include: { allocations: true; holdAllocations: true } }>;
     const receipts: ReceiptWithAllocs[] = [];
     for (;;) {
       const page = await prisma.receipt.findMany({
         where,
-        include: { allocations: true },
+        include: { allocations: true, holdAllocations: true },
         orderBy: [{ receivedAt: 'desc' }, { id: 'desc' }],
         skip: receipts.length,
         take: EXPORT_PAGE,
@@ -1457,10 +1502,16 @@ export class ReceiptsService {
     const orderNoById = await loadOrderNumbers(
       receipts.flatMap((r) => r.allocations.map((a) => a.orderId)),
     );
+    const holdNoById = await loadHoldNos(
+      receipts.flatMap((r) => r.holdAllocations.filter((a) => !a.reversedAt).map((a) => a.holdOrderId)),
+    );
 
     const userIds = [
       ...new Set(
-        receipts.flatMap((r) => r.allocations.map((a) => a.createdById)).filter(Boolean),
+        [
+          ...receipts.flatMap((r) => r.allocations.map((a) => a.createdById)).filter(Boolean),
+          ...receipts.flatMap((r) => r.holdAllocations.map((a) => a.createdById)).filter(Boolean),
+        ],
       ),
     ] as string[];
     const users = userIds.length
@@ -1493,22 +1544,22 @@ export class ReceiptsService {
     };
 
     const entries: StatementExportEntry[] = receipts.map((r) => {
-      const allocs = [...r.allocations].sort(
+      const orderAllocs = [...r.allocations].sort(
         (a, b) => a.createdAt.getTime() - b.createdAt.getTime(),
       );
-      const allocationsText = allocs
-        .map(
-          (a) =>
-            `${orderNoById.get(a.orderId) ?? a.orderId.slice(0, 8)} ¥${Number(a.amountCny).toFixed(2)}`,
-        )
-        .join('；');
+      const holdAllocs = r.holdAllocations.filter((a) => !a.reversedAt).sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+      const allocationsText = [
+        ...orderAllocs.map((a) => `${orderNoById.get(a.orderId) ?? a.orderId.slice(0, 8)} ¥${Number(a.amountCny).toFixed(2)}`),
+        ...holdAllocs.map((a) => `${holdNoById.get(a.holdOrderId) ?? a.holdOrderId.slice(0, 8)} ¥${Number(a.amountCny).toFixed(2)}`),
+      ].join('；');
       const allocatorNames = [
         ...new Set(
-          allocs
+          [...orderAllocs, ...holdAllocs]
             .map((a) => (a.createdById ? nameById.get(a.createdById) : null))
             .filter(Boolean),
         ),
       ].join('、');
+      const allAllocDates = [...orderAllocs, ...holdAllocs].map((a) => a.createdAt.getTime());
       const amount = Number(r.amountCny);
       const allocated = Number(r.allocatedCny);
       return {
@@ -1523,7 +1574,7 @@ export class ReceiptsService {
         // 已退款行归零：核对表「未认余额」列求和 = 挂账池真实待认领余额，与界面 KPI 同口径
         remainingCny: receiptRemainingCny(r),
         allocationsText,
-        lastAllocatedAt: allocs.length > 0 ? allocs[allocs.length - 1].createdAt : null,
+        lastAllocatedAt: allAllocDates.length > 0 ? new Date(Math.max(...allAllocDates)) : null,
         allocatorNames,
         payerNote: r.payerNote,
         refundNote: r.refundNote,

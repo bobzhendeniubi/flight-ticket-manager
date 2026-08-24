@@ -966,6 +966,54 @@ export type HoldOrderStatus =
   | 'RELEASED'
   | 'CANCELLED';
 export type HoldOwnerType = 'AGENT' | 'CUSTOMER';
+export type HoldInstallmentStatus = 'PENDING' | 'PAID';
+export type HoldAmountRule = 'PER_PERSON_FIXED' | 'REMAINDER';
+export type HoldOverdueAction = 'REMIND_ONLY' | 'AUTO_RELEASE';
+export type HoldOccupyOn = 'CREATE' | 'FULL_PAYMENT';
+
+export interface HoldInstallmentTemplate {
+  label: string;
+  amountRule: HoldAmountRule;
+  perPersonCny?: number;
+  dueOffsetDays: number | null;
+}
+
+export interface HoldInstallment {
+  id: string;
+  seq: number;
+  label: string;
+  amountRule: HoldAmountRule;
+  perPersonCny: number | null;
+  amountCny: number;
+  seatsBasis: number;
+  dueDate: string;
+  status: HoldInstallmentStatus;
+  paidAt: string | null;
+  allocations: HoldReceiptAllocation[];
+}
+
+export interface HoldReceiptAllocation {
+  id: string;
+  receiptId: string;
+  holdOrderId: string;
+  holdInstallmentId: string;
+  amountCny: string;
+  reversedAt: string | null;
+  createdById: string | null;
+  createdAt: string;
+}
+
+export interface HoldReductionPreview {
+  seatsReduced: number;
+  freeSeats: number;
+  forfeitSeats: number;
+  perSeatPaidCny: number;
+  forfeitCny: number;
+  creditCny: number;
+  surplusCny: number;
+  freeQuota: number;
+  installmentUpdates: Array<{ seq: number; amountCny: number; seatsBasis: number; status: HoldInstallmentStatus; creditAppliedCny: number }>;
+}
 
 export interface CreateHoldOrderInput {
   flightScheduleId: string;
@@ -973,10 +1021,26 @@ export interface CreateHoldOrderInput {
   seats: number;
   perSeatPriceCny: number;
   ownerType: HoldOwnerType;
+  mode?: 'RESERVE' | 'ALLOTMENT';
   agentId?: string;
   groupName?: string;
   freeCancelRatio?: number;
   notes?: string;
+  installmentsOverride?: Array<{ label: string; perPersonCny?: number; dueDate: string }>;
+}
+
+export interface HoldPlanPreview {
+  mode: 'RESERVE' | 'ALLOTMENT';
+  occupyOn: HoldOccupyOn;
+  installments: Array<{
+    seq: number;
+    label: string;
+    amountRule: HoldAmountRule;
+    perPersonCny: number | null;
+    amountCny: number;
+    seatsBasis: number;
+    dueDate: string;
+  }>;
 }
 
 export interface HoldOrderRecord {
@@ -993,7 +1057,9 @@ export interface HoldOrderRecord {
   perSeatPriceCny: number;
   freeCancelRatio: string | null;
   freeCancelUsed: number;
+  occupyOn: HoldOccupyOn;
   status: HoldOrderStatus;
+  installments: HoldInstallment[];
   notes: string | null;
   createdById: string;
   releasedAt: string | null;
@@ -1010,6 +1076,13 @@ export interface HoldOrderListItem extends HoldOrderRecord {
     flight: { flightNumber: string };
   };
   agent: { id: string; companyName: string | null; contactName: string } | null;
+}
+
+export interface HoldOrderConfig {
+  id: string | null;
+  installments: HoldInstallmentTemplate[];
+  overdueAction: HoldOverdueAction;
+  defaultFreeCancelRatio: number;
 }
 
 // ── Orders ────────────────────────────────────────────────────────────────
@@ -2635,9 +2708,13 @@ export interface ReceiptMatchCandidate {
 /** 单笔进账的认领分配（嵌在 Receipt.allocations[]；金额为 Decimal→string） */
 export interface ReceiptAllocation {
   id: string;
+  kind: 'ORDER' | 'HOLD';
   orderId: string;
   /** 认领到的订单号（服务端批量 join；订单查不到 → null，前端回落 id 前 8 位） */
   orderNumber: string | null;
+  holdOrderId?: string | null;
+  holdNo?: string | null;
+  reversedAt?: string | null;
   amountCny: string;
   createdById: string | null;
   createdAt: string;
@@ -2709,6 +2786,7 @@ export interface LedgerEntry {
   status: string;
   source: string;
   orderNo: string | null;
+  destinations?: Array<{ kind: 'ORDER' | 'HOLD'; orderNo?: string | null; holdNo?: string | null; amountCny: string; reversedAt?: string | null }>;
   at: string;
 }
 
@@ -3065,6 +3143,8 @@ export const api = {
       token,
       body,
     }),
+  previewHoldPlan: (token: string, body: Omit<CreateHoldOrderInput, 'ownerType' | 'agentId' | 'groupName' | 'freeCancelRatio' | 'notes'>) =>
+    apiFetch<{ plan: HoldPlanPreview }>('/hold-orders/preview-plan', { method: 'POST', token, body }),
   listHoldOrders: (
     token: string,
     filter?: { flightScheduleId?: string; status?: HoldOrderStatus; agentId?: string },
@@ -3076,6 +3156,10 @@ export const api = {
     const qs = params.toString() ? `?${params.toString()}` : '';
     return apiFetch<{ holdOrders: HoldOrderListItem[] }>(`/hold-orders/${qs}`, { token });
   },
+  getHoldOrderConfig: (token: string) =>
+    apiFetch<{ config: HoldOrderConfig }>('/hold-orders/config', { token }),
+  updateHoldOrderConfig: (token: string, body: Omit<HoldOrderConfig, 'id'>) =>
+    apiFetch<{ config: HoldOrderConfig }>('/hold-orders/config', { method: 'PUT', token, body }),
   releaseHoldOrder: (token: string, id: string) =>
     apiFetch<{ result: { id: string; status: HoldOrderStatus } }>(`/hold-orders/${id}/release`, {
       method: 'POST',
@@ -3096,6 +3180,20 @@ export const api = {
       token,
       body,
     }),
+  allocateHoldInstallment: (token: string, holdId: string, installmentId: string, body: { receiptId: string; amountCny: number }) =>
+    apiFetch<{ result: { allocation: HoldReceiptAllocation; receiptNo: string; installmentPaid: boolean; holdStatus: HoldOrderStatus; warning: string | null } }>(
+      `/hold-orders/${holdId}/installments/${installmentId}/allocate`, { method: 'POST', token, body }),
+  reverseHoldInstallmentAllocation: (token: string, holdId: string, installmentId: string, allocationId: string, reason: string) =>
+    apiFetch<{ result: { receiptNo: string; amount: number; holdStatus: HoldOrderStatus; reason: string } }>(
+      `/hold-orders/${holdId}/installments/${installmentId}/allocations/${allocationId}/reverse`, { method: 'POST', token, body: { reason }}),
+  updateHoldInstallmentDueDate: (token: string, holdId: string, installmentId: string, dueDate: string) =>
+    apiFetch<{ result: { id: string; dueDate: string } }>(`/hold-orders/${holdId}/installments/${installmentId}`, { method: 'PATCH', token, body: { dueDate }}),
+  previewHoldReduction: (token: string, holdId: string, body: { seats: number; note?: string }) =>
+    apiFetch<{ preview: HoldReductionPreview }>(`/hold-orders/${holdId}/reduce-seats/preview`, { method: 'POST', token, body }),
+  reduceHoldSeats: (token: string, holdId: string, body: { seats: number; note?: string }) =>
+    apiFetch<{ result: { id: string; status: HoldOrderStatus } & HoldReductionPreview }>(`/hold-orders/${holdId}/reduce-seats`, { method: 'POST', token, body }),
+  retryHoldOccupy: (token: string, holdId: string) =>
+    apiFetch<{ result: { id: string; status: HoldOrderStatus } }>(`/hold-orders/${holdId}/retry-occupy`, { method: 'POST', token }),
 
   // Orders
   listOrders: (token: string, query?: ListOrdersParams) => {

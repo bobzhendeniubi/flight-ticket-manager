@@ -28,6 +28,7 @@ import {
   type NotificationJobData,
   type SeatHoldJobData,
   type SeatLockJobData,
+  type HoldOverdueJobData,
   type WaitlistCheckJobData,
 } from './queue.js';
 import { closeMailer } from '../lib/mailer.js';
@@ -35,6 +36,7 @@ import { sendItineraryEmail } from '../lib/itinerary-email.js';
 import { computeBundleSeatSplit, releaseSeatFloored } from '../modules/orders/orders.service.js';
 import { REFUND_REQUESTED_FULFILLMENT_ERROR } from '../modules/fulfillment/fulfillment.service.js';
 import { heldSeatsForSeatClass } from '../modules/hold-orders/held-seats.js';
+import { markOverdueHolds } from '../modules/hold-orders/hold-overdue.js';
 
 /**
  * 超时释放某订单占用的座位——套餐升舱拆座感知 + 下限钳制在 0（MEDIUM 修复）。
@@ -406,6 +408,28 @@ const seatLockWorker = new Worker<SeatLockJobData>(
   { connection: bullRedis, concurrency: 5 },
 );
 
+const holdOverdueWorker = new Worker<HoldOverdueJobData>(
+  'hold-overdue',
+  async () => markOverdueHolds(prisma),
+  { connection: bullRedis, concurrency: 1 },
+);
+
+holdOverdueWorker.on('failed', (job, err) => {
+  // eslint-disable-next-line no-console
+  console.error(`[worker:hold-overdue] ✗ job ${job?.id} failed:`, err.message);
+});
+
+void (async () => {
+  try {
+    const module = await import('./queue.js');
+    if (!Object.prototype.hasOwnProperty.call(module, 'scheduleHoldOverdueScan')) return;
+    await module.scheduleHoldOverdueScan();
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('[worker:hold-overdue] failed to register repeatable scan:', err);
+  }
+})();
+
 seatLockWorker.on('failed', (job, err) => {
   // eslint-disable-next-line no-console
   console.error(`[worker:seat-lock] ✗ job ${job?.id} failed:`, err.message);
@@ -488,6 +512,7 @@ async function shutdown() {
     fulfillmentWorker.close(),
     seatHoldWorker.close(),
     seatLockWorker.close(),
+    holdOverdueWorker.close(),
     notificationWorker.close(),
   ]);
   await closeMailer();

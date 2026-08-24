@@ -1,11 +1,12 @@
 /**
  * 规则化自动生成提醒 — 扫描订单/乘客/签证任务，按规则生成操作部待办。
  *
- * 四条规则（详见各 build 函数）：
+ * 五条规则（详见各 build 函数）：
  *   1. BALANCE_DUE      催尾款：临近出发仍有尾款未收
  *   2. DEPARTURE_SOON   出行提醒：3 天内出发的已付订单
  *   3. PASSPORT_EXPIRY  护照有效期：距出发不足 6 个月
  *   4. VISA_MISSING     签证缺件：在办签证任务下有乘客缺护照照片（排除自备签乘客，见下）
+ *   5. HOLD_INSTALLMENT_DUE 占位单收款期：截止前三天提醒，逾期标红
  *
  * 各规则与「自备签证」（Passenger.visaExempt=true：客人自行办妥签证，无需送签）的口径：
  *   - 规则 4 签证缺件：按签证台同口径排除自备签乘客（visaExempt=true）——客人自备签证
@@ -13,8 +14,8 @@
  *   - 规则 3 护照有效期：不排除。护照有效期是所有出行乘客的通用要求，与签证是否自备无关。
  *
  * 幂等：每条候选算出确定性 ruleKey（唯一索引），已存在同 key 的跳过；
- * 重复触发生成不会刷屏。所有日期比较用 UTC 日期字符串（YYYY-MM-DD），
- * 因为 dueAt / hotelCheckIn / passportExpiry 都是 @db.Date（UTC 零点）。
+ * 重复触发生成不会刷屏。占位单收款期的“今天”按班次 departureTz 折算，
+ * 其余 dueAt / hotelCheckIn / passportExpiry 仍按 @db.Date 的 UTC 日期口径。
  *
  * 出发时间口径与履约台一致（见 fulfillment.service.ts listTasks）：
  * 订单内最早一段机票的起飞时间（按班次时区取当地日期）；无机票则取最早酒店入住日。
@@ -25,6 +26,8 @@ import {
   OrderStatus,
   Prisma,
   ReminderPriority,
+  HoldOrderStatus,
+  HoldInstallmentStatus,
   type PrismaClient,
 } from '@prisma/client';
 
@@ -159,12 +162,12 @@ export function deriveDepartureDate(items: DepartureSourceItem[]): string | null
 }
 
 // ── 候选构建（纯函数，可单测）───────────────────────────────────────────────
-export type RuleName = 'BALANCE_DUE' | 'DEPARTURE_SOON' | 'PASSPORT_EXPIRY' | 'VISA_MISSING';
+export type RuleName = 'BALANCE_DUE' | 'DEPARTURE_SOON' | 'PASSPORT_EXPIRY' | 'VISA_MISSING' | 'HOLD_INSTALLMENT_DUE';
 
 export interface ReminderCandidate {
   rule: RuleName;
   ruleKey: string;
-  orderId: string;
+  orderId: string | null;
   title: string;
   body: string;
   priority: ReminderPriority;
@@ -192,6 +195,23 @@ export interface RuleVisaTask {
   items: DepartureSourceItem[];
   /** 缺护照照片的乘客姓名（已在库内过滤：不拉大字段 + 排除自备签乘客 visaExempt=true） */
   missingPassengerNames: string[];
+}
+
+export interface RuleHoldInstallment {
+  id: string;
+  label: string;
+  amountCny: number;
+  status: HoldInstallmentStatus;
+  dueDate: Date;
+}
+
+export interface RuleHoldOrder {
+  id: string;
+  holdNo: string;
+  groupName: string | null;
+  status: HoldOrderStatus;
+  installments: RuleHoldInstallment[];
+  flightSchedule?: { departureTz: string | null } | null;
 }
 
 /** 规则 1–3：逐单判定，返回候选（today = UTC 今天 YYYY-MM-DD） */
@@ -278,6 +298,30 @@ export function buildVisaCandidates(task: RuleVisaTask, today: string): Reminder
   ];
 }
 
+/** 规则 5：占位单收款期截止提醒；日期口径与 dueDate（建单时已按起飞地折算）一致。 */
+export function buildHoldInstallmentCandidates(hold: RuleHoldOrder, today: string): ReminderCandidate[] {
+  const activeStatuses: HoldOrderStatus[] = [HoldOrderStatus.PENDING, HoldOrderStatus.HOLDING, HoldOrderStatus.OVERDUE];
+  if (!activeStatuses.includes(hold.status)) return [];
+  const limit = addDaysUtc(today, 3);
+  const out: ReminderCandidate[] = [];
+  for (const item of hold.installments) {
+    if (item.status !== HoldInstallmentStatus.PENDING) continue;
+    const dueDate = utcDateStr(item.dueDate);
+    if (dueDate > limit) continue;
+    const overdue = dueDate < today;
+    out.push({
+        rule: 'HOLD_INSTALLMENT_DUE' as const,
+        ruleKey: `HOLD_DUE:${item.id}:${dueDate}`,
+        orderId: null,
+        title: `【占位单催款】${hold.holdNo} ${hold.groupName ?? ''}${item.label} ¥${item.amountCny}`.trim(),
+        body: `占位单 ${hold.holdNo}（${hold.groupName ?? '未填团名'}）${item.label}应收 ¥${item.amountCny}，截止 ${dueDate}，请及时跟进。`,
+        priority: overdue ? ReminderPriority.CRITICAL : ReminderPriority.HIGH,
+        dueAt: overdue ? today : dueDate,
+      });
+  }
+  return out;
+}
+
 export interface GenerateRuleRemindersResult {
   created: number;
   skipped: number;
@@ -292,10 +336,12 @@ export interface GenerateRuleRemindersResult {
 export async function generateRuleReminders(
   prisma: PrismaClient,
   createdById: string,
+  now = new Date(),
 ): Promise<GenerateRuleRemindersResult> {
-  const today = utcDateStr(new Date());
+  const today = utcDateStr(now);
 
-  const [orders, visaTasks] = await Promise.all([
+  const holdDelegate = (prisma as unknown as { holdOrder?: { findMany: (args: unknown) => Promise<RuleHoldOrder[]> } }).holdOrder;
+  const [orders, visaTasks, holdOrders] = await Promise.all([
     prisma.order.findMany({
       where: { deletedAt: null, status: { in: SCAN_STATUSES } },
       select: {
@@ -358,6 +404,19 @@ export async function generateRuleReminders(
         },
       },
     }),
+    holdDelegate
+      ? holdDelegate.findMany({
+          where: { status: { in: [HoldOrderStatus.PENDING, HoldOrderStatus.HOLDING, HoldOrderStatus.OVERDUE] } },
+          select: {
+            id: true,
+            holdNo: true,
+            groupName: true,
+            status: true,
+            flightSchedule: { select: { departureTz: true } },
+            installments: { where: { status: HoldInstallmentStatus.PENDING }, select: { id: true, label: true, amountCny: true, status: true, dueDate: true } },
+          },
+        })
+      : Promise.resolve([] as RuleHoldOrder[]),
   ]);
 
   const candidates: ReminderCandidate[] = [];
@@ -379,6 +438,10 @@ export async function generateRuleReminders(
         today,
       ),
     );
+  }
+  for (const hold of holdOrders) {
+    const holdToday = dateInTz(now, hold.flightSchedule?.departureTz);
+    candidates.push(...buildHoldInstallmentCandidates(hold, holdToday));
   }
 
   // 批内去重（同一 ruleKey 只留第一条）

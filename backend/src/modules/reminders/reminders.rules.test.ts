@@ -13,14 +13,17 @@ import {
   addDaysUtc,
   addMonthsUtc,
   buildOrderCandidates,
+  buildHoldInstallmentCandidates,
   buildVisaCandidates,
   computeBalance,
+  dateInTz,
   deriveDepartureDate,
   formatAmount,
   generateRuleReminders,
   utcDateStr,
   type RuleOrder,
 } from './reminders.rules.js';
+import { HoldInstallmentStatus, HoldOrderStatus } from '@prisma/client';
 
 // ── 测试数据小工具 ─────────────────────────────────────────────────────────
 const TODAY = '2026-07-09';
@@ -35,6 +38,22 @@ function flightItem(departISO: string, tz: string | null = null) {
 function hotelItem(checkIn: string) {
   return { hotelCheckIn: new Date(`${checkIn}T00:00:00Z`), flightSchedule: null };
 }
+
+describe('HOLD_INSTALLMENT_DUE 提醒规则', () => {
+  it('三天内 HIGH、已逾期 CRITICAL，ruleKey 按期号和截止日幂等', () => {
+    const candidates = buildHoldInstallmentCandidates({
+      id: 'h1', holdNo: 'H20260824AB12', groupName: '春季团', status: HoldOrderStatus.HOLDING,
+      installments: [
+        { id: 'i1', label: '尾款', amountCny: 7000, status: HoldInstallmentStatus.PENDING, dueDate: new Date('2026-07-10T00:00:00Z') },
+        { id: 'i2', label: '二定', amountCny: 3000, status: HoldInstallmentStatus.PENDING, dueDate: new Date('2026-07-05T00:00:00Z') },
+        { id: 'i3', label: '已认', amountCny: 1, status: HoldInstallmentStatus.PAID, dueDate: new Date('2026-07-10T00:00:00Z') },
+      ],
+    }, TODAY);
+    expect(candidates).toHaveLength(2);
+    expect(candidates.find((item) => item.ruleKey.startsWith('HOLD_DUE:i1'))).toMatchObject({ priority: ReminderPriority.HIGH });
+    expect(candidates.find((item) => item.ruleKey.startsWith('HOLD_DUE:i2'))).toMatchObject({ priority: ReminderPriority.CRITICAL, ruleKey: 'HOLD_DUE:i2:2026-07-05' });
+  });
+});
 
 function fakeOrder(overrides: Partial<RuleOrder> = {}): RuleOrder {
   return {
@@ -270,11 +289,12 @@ describe('VISA_MISSING', () => {
 // ── generateRuleReminders：幂等（跑两遍第二遍 created = 0）──────────────────
 describe('generateRuleReminders 幂等', () => {
   /** 带内存态的 mock prisma：createMany 落进 store，findMany 按 ruleKey 查重 */
-  function makeMockPrisma(orders: unknown[], visaTasks: unknown[]) {
+  function makeMockPrisma(orders: unknown[], visaTasks: unknown[], holds: unknown[] = []) {
     const store = new Set<string>();
     const mock = {
       order: { findMany: vi.fn(async () => orders) },
       fulfillmentTask: { findMany: vi.fn(async () => visaTasks) },
+      holdOrder: { findMany: vi.fn(async () => holds) },
       operationalReminder: {
         findMany: vi.fn(async (args: { where: { ruleKey: { in: string[] } } }) =>
           args.where.ruleKey.in.filter((k) => store.has(k)).map((ruleKey) => ({ ruleKey })),
@@ -367,6 +387,21 @@ describe('generateRuleReminders 幂等', () => {
     expect(result).toEqual({ created: 0, skipped: 0, byRule: {} });
     expect(raw.operationalReminder.findMany).not.toHaveBeenCalled();
     expect(raw.operationalReminder.createMany).not.toHaveBeenCalled();
+  });
+
+  it('占位单提醒按班次 departureTz 折算今天，而不是服务器 UTC 日期', async () => {
+    const hold = {
+      id: 'hold_tz',
+      holdNo: 'H20260709TZ01',
+      groupName: '时区团',
+      status: HoldOrderStatus.HOLDING,
+      flightSchedule: { departureTz: 'Pacific/Kiritimati' },
+      installments: [{ id: 'hold_i1', label: '尾款', amountCny: 1000, status: HoldInstallmentStatus.PENDING, dueDate: new Date('2026-07-13T00:00:00Z') }],
+    };
+    const { mock } = makeMockPrisma([], [], [hold]);
+    const result = await generateRuleReminders(mock, 'user_sys', new Date('2026-07-09T23:30:00Z'));
+    expect(dateInTz(new Date('2026-07-09T23:30:00Z'), 'Pacific/Kiritimati')).toBe('2026-07-10');
+    expect(result).toMatchObject({ created: 1, byRule: { HOLD_INSTALLMENT_DUE: 1 } });
   });
 
   it('签证缺件查询按签证台同口径排除自备签乘客（visaExempt: false），自备签乘客缺护照图不触发 VISA_MISSING', async () => {

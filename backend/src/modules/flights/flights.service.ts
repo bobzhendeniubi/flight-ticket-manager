@@ -2,7 +2,6 @@ import {
   AuditSeverity,
   AuditTargetType,
   CabinClass,
-  HoldOrderStatus,
   Prisma,
   SeatLockStatus,
   WaitlistStatus,
@@ -37,14 +36,6 @@ const CABIN_LABEL: Record<CabinClass, string> = {
   [CabinClass.BUSINESS]: '商务舱',
   [CabinClass.FIRST]: '头等舱',
 };
-
-// 删除班次时只拦仍占公共库存的占位状态；历史态允许随班次级联清理。
-const HOLD_ORDER_DELETE_BLOCKING_STATUSES: HoldOrderStatus[] = [
-  HoldOrderStatus.PENDING,
-  HoldOrderStatus.HOLDING,
-  HoldOrderStatus.OVERDUE,
-  HoldOrderStatus.FULLY_PAID,
-];
 
 const pricingService = new PricingService();
 
@@ -1021,8 +1012,7 @@ export class FlightService {
    * 同理：本班次若有生效中的锁位（SeatLock ACTIVE）或候补（SeatWaitlist ACTIVE），
    * 也禁删 —— 这两张表都是 onDelete: Cascade 挂在 FlightSchedule 上，硬删班次会
    * 把这些生效记录一并静默清空（用户占的位/候补资格无声消失）。
-   * 生效中的占位单（PENDING / HOLDING / OVERDUE / FULLY_PAID）同样拦截；
-   * RELEASED / CANCELLED / CONVERTED 历史态允许随班次级联清理。
+   * 任何占位单记录（含 RELEASED / CANCELLED / CONVERTED 历史态）都拦截；
    * 无销售、无生效锁位/候补/占位单才硬删（级联清掉舱位 / 仓位阶梯）。
    * 占位单已纳入删除守卫；旧切位模块按冻结策略不在本链路改动。
    */
@@ -1039,7 +1029,6 @@ export class FlightService {
           take: 1,
         },
         holdOrders: {
-          where: { status: { in: HOLD_ORDER_DELETE_BLOCKING_STATUSES } },
           select: { id: true },
           take: 1,
         },
@@ -1056,7 +1045,7 @@ export class FlightService {
       throw new BadRequestError('该班次有生效中的锁位/候补，暂不能删除');
     }
     if ((schedule.holdOrders?.length ?? 0) > 0) {
-      throw new BadRequestError('该班次有生效中的占位单，暂不能删除');
+      throw new BadRequestError('该班次已有占位单记录，不能删除（请改用停用，保留历史数据）');
     }
 
     // 无销售、无生效锁位/候补/占位单：硬删（onDelete: Cascade 自动清掉 seatClasses 及其 fareBuckets）
@@ -1069,7 +1058,7 @@ export class FlightService {
    * 场景：一天两班、整月排期，运营想按出发日区间删掉其中某档班次，又不想逐个点。
    * 出发日区间 [from, to]（出发地当地 UTC+8 日，闭区间）内选出班次；flightId 省略=全部航班。
    * 每个班次沿用 deleteSchedule 同口径的"有销售则禁删"守卫（任一舱位 sold>0，或有订单项关联，
-   * 或有生效中的锁位/候补/占位单）：命中守卫 → 跳过（不删），记入 skipped；否则硬删（级联清掉舱位 / 仓位阶梯）。
+   * 或有锁位/候补/任何占位单记录）：命中守卫 → 跳过（不删），记入 skipped；否则硬删（级联清掉舱位 / 仓位阶梯）。
    * 事务内一次删掉本批可删项，保证要么全部落库、要么整体回滚（已跳过项不参与删除，天然安全）。
    * 删除成功后写审计（删除数 + 已删/跳过的 scheduleId），批量删的爆炸半径大，必须留痕可追溯。
    * 占位单已纳入删除守卫；旧切位模块按冻结策略不在本链路改动。
@@ -1104,7 +1093,6 @@ export class FlightService {
           take: 1,
         },
         holdOrders: {
-          where: { status: { in: HOLD_ORDER_DELETE_BLOCKING_STATUSES } },
           select: { id: true },
           take: 1,
         },
@@ -1118,13 +1106,13 @@ export class FlightService {
       const hasSold = s.seatClasses.some((c) => c.sold > 0);
       const hasOrders = s.orderItems.length > 0;
       const hasActiveLockOrWaitlist = s.seatLocks.length > 0 || s.seatWaitlists.length > 0;
-      const hasActiveHoldOrder = (s.holdOrders?.length ?? 0) > 0;
+      const hasHoldOrder = (s.holdOrders?.length ?? 0) > 0;
       if (hasSold || hasOrders) {
         skipped.push({ scheduleId: s.id, reason: '已售' });
       } else if (hasActiveLockOrWaitlist) {
         skipped.push({ scheduleId: s.id, reason: '有生效中的锁位/候补' });
-      } else if (hasActiveHoldOrder) {
-        skipped.push({ scheduleId: s.id, reason: '有生效中的占位单' });
+      } else if (hasHoldOrder) {
+        skipped.push({ scheduleId: s.id, reason: '有占位单记录' });
       } else {
         deletableIds.push(s.id);
       }

@@ -99,6 +99,28 @@ export const seatLockQueue = new Queue<SeatLockJobData>('seat-lock', {
   },
 });
 
+// 占位单逾期扫描：每小时运行一次，业务日期在 worker 内按各班次 departureTz 比较。
+export interface HoldOverdueJobData {
+  requestedAt?: string;
+}
+
+export const holdOverdueQueue = new Queue<HoldOverdueJobData>('hold-overdue', {
+  connection: bullRedis,
+  defaultJobOptions: {
+    attempts: 3,
+    backoff: { type: 'exponential', delay: 5000 },
+    removeOnComplete: { age: 7 * 24 * 3600 },
+    removeOnFail: { age: 30 * 24 * 3600 },
+  },
+});
+
+export async function scheduleHoldOverdueScan(): Promise<void> {
+  await holdOverdueQueue.add('scan-hold-overdue', {}, {
+    jobId: 'hold-overdue-hourly',
+    repeat: { every: 60 * 60 * 1000 },
+  });
+}
+
 /**
  * 创建锁位时排队：delay 毫秒后若锁仍 ACTIVE 则标 EXPIRED（座位自动回归可售）。
  * jobId 用 `seatlock-<lockId>`，方便下单消费 / 手动释放时 remove() 取消。
@@ -158,6 +180,7 @@ export async function closeQueues(): Promise<void> {
     notificationQueue.close(),
     seatHoldQueue.close(),
     seatLockQueue.close(),
+    holdOverdueQueue.close(),
     fulfillmentQueueEvents.close(),
   ]);
   await bullRedis.quit();

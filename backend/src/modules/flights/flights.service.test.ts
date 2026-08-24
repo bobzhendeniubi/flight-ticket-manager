@@ -1241,7 +1241,7 @@ describe('FlightService.deleteSchedule', () => {
 
     await expect(service.deleteSchedule('sched_1')).rejects.toMatchObject({
       statusCode: 400,
-      message: '该班次有生效中的占位单，暂不能删除',
+      message: '该班次已有占位单记录，不能删除（请改用停用，保留历史数据）',
     });
     expect(prismaMock.flightSchedule.delete).not.toHaveBeenCalled();
   });
@@ -1387,7 +1387,7 @@ describe('FlightService.batchDeleteSchedules', () => {
     expect(prismaMock.flightSchedule.deleteMany).not.toHaveBeenCalled();
     expect(result).toEqual({
       deleted: 0,
-      skipped: [{ scheduleId: 'sched_hold', reason: '有生效中的占位单' }],
+      skipped: [{ scheduleId: 'sched_hold', reason: '有占位单记录' }],
     });
   });
 

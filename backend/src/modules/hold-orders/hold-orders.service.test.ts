@@ -3,7 +3,7 @@
  * capacity − sold − 未过期 ACTIVE 锁位 − 占位余座。
  */
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { CabinClass, HoldOrderStatus, HoldOwnerType } from '@prisma/client';
+import { CabinClass, HoldAmountRule, HoldInstallmentStatus, HoldOrderStatus, HoldOwnerType } from '@prisma/client';
 
 const { prismaMock, auditMock, enqueueWaitlistCheckMock } = vi.hoisted(() => {
   const mock = {
@@ -14,7 +14,9 @@ const { prismaMock, auditMock, enqueueWaitlistCheckMock } = vi.hoisted(() => {
       findMany: vi.fn(),
       findUnique: vi.fn(),
       updateMany: vi.fn(),
+      update: vi.fn(),
     },
+    holdInstallment: { update: vi.fn(), findMany: vi.fn() },
     seatLock: { aggregate: vi.fn() },
     agent: { findUnique: vi.fn() },
     $queryRaw: vi.fn(),
@@ -57,6 +59,12 @@ function hold(overrides: Record<string, unknown> = {}) {
     cancelledAt: null,
     createdAt: new Date(),
     updatedAt: new Date(),
+    installments: [
+      { id: 'i1', seq: 1, label: '定金', amountRule: HoldAmountRule.PER_PERSON_FIXED, perPersonCny: 300, amountCny: 6000, seatsBasis: 20, status: HoldInstallmentStatus.PENDING, paidAt: null, dueDate: new Date('2026-09-01T00:00:00Z'), allocations: [] },
+      { id: 'i2', seq: 2, label: '尾款', amountRule: HoldAmountRule.REMAINDER, perPersonCny: null, amountCny: 18000, seatsBasis: 20, status: HoldInstallmentStatus.PENDING, paidAt: null, dueDate: new Date('2026-09-10T00:00:00Z'), allocations: [] },
+    ],
+    reductions: [],
+    flightSchedule: { id: 'schedule_1', departureTime: new Date('2026-09-20T00:00:00Z'), departureTz: 'UTC', flight: { flightNumber: 'CA1' } },
     ...overrides,
   };
 }
@@ -73,6 +81,8 @@ beforeEach(() => {
   });
   prismaMock.agent.findUnique.mockResolvedValue({ id: 'agent_1' });
   prismaMock.holdOrder.create.mockResolvedValue(hold());
+  prismaMock.holdOrder.update.mockResolvedValue({});
+  prismaMock.holdInstallment.findMany.mockResolvedValue(hold().installments);
 });
 
 describe('held-seats helper', () => {
@@ -104,6 +114,7 @@ describe('HoldOrderService.create', () => {
         cabin: CabinClass.ECONOMY,
         seats: 60,
         perSeatPriceCny: 1200,
+        mode: 'RESERVE',
         ownerType: HoldOwnerType.AGENT,
         agentId: 'agent_1',
       },
@@ -119,6 +130,7 @@ describe('HoldOrderService.create', () => {
         perSeatPriceCny: 1200,
         status: HoldOrderStatus.HOLDING,
       }),
+      include: { installments: { orderBy: { seq: 'asc' } } },
     });
     expect(auditMock).toHaveBeenCalledWith(expect.objectContaining({ action: 'CREATE_HOLD_ORDER' }));
   });
@@ -135,6 +147,7 @@ describe('HoldOrderService.create', () => {
           cabin: CabinClass.ECONOMY,
           seats: 6,
           perSeatPriceCny: 0,
+          mode: 'RESERVE',
           ownerType: HoldOwnerType.CUSTOMER,
           groupName: '春季团',
         },
@@ -148,14 +161,14 @@ describe('HoldOrderService.create', () => {
 describe('HoldOrderService actions', () => {
   it('释放后状态为 RELEASED，审计状态变化', async () => {
     prismaMock.holdOrder.findUnique.mockResolvedValue(hold());
-    prismaMock.holdOrder.updateMany.mockResolvedValue({ count: 1 });
+    prismaMock.holdOrder.update.mockResolvedValue({});
 
     await expect(service.release('hold_1', { userId: 'user_1' })).resolves.toEqual({
       id: 'hold_1',
       status: HoldOrderStatus.RELEASED,
     });
-    expect(prismaMock.holdOrder.updateMany).toHaveBeenCalledWith({
-      where: { id: 'hold_1', status: HoldOrderStatus.HOLDING },
+    expect(prismaMock.holdOrder.update).toHaveBeenCalledWith({
+      where: { id: 'hold_1' },
       data: expect.objectContaining({ status: HoldOrderStatus.RELEASED, releasedAt: expect.any(Date) }),
     });
     expect(enqueueWaitlistCheckMock).toHaveBeenCalledWith('seat_class_1');
@@ -169,7 +182,7 @@ describe('HoldOrderService actions', () => {
         ? { seats: 20, seatsConverted: 0, seatsCancelled: 0 }
         : { seats: null, seatsConverted: null, seatsCancelled: null },
     }));
-    prismaMock.holdOrder.updateMany.mockImplementation(async () => {
+    prismaMock.holdOrder.update.mockImplementation(async () => {
       holding = false;
       return { count: 1 };
     });
@@ -181,25 +194,25 @@ describe('HoldOrderService actions', () => {
 
   it('非 HOLDING 状态不能释放/取消/改价', async () => {
     prismaMock.holdOrder.findUnique.mockResolvedValue(hold({ status: HoldOrderStatus.RELEASED }));
-    prismaMock.holdOrder.updateMany.mockResolvedValue({ count: 0 });
+    prismaMock.holdOrder.update.mockResolvedValue({});
 
     await expect(service.release('hold_1')).rejects.toThrow('当前状态不可操作');
     await expect(service.cancel('hold_1')).rejects.toThrow('当前状态不可操作');
     await expect(
       service.updatePrice('hold_1', { perSeatPriceCny: 1300, reason: '财务确认改价' }),
     ).rejects.toThrow('当前状态不可改价');
-    expect(prismaMock.holdOrder.updateMany).toHaveBeenCalledTimes(2);
+    expect(prismaMock.holdOrder.update).toHaveBeenCalledTimes(0);
   });
 
   it('改价审计记录 before/after 价格和原因', async () => {
     prismaMock.holdOrder.findUnique.mockResolvedValue(hold());
-    prismaMock.holdOrder.updateMany.mockResolvedValue({ count: 1 });
+    prismaMock.holdOrder.update.mockResolvedValue({});
 
     await service.updatePrice('hold_1', { perSeatPriceCny: 1300, reason: '运营确认成本变化' });
     expect(auditMock).toHaveBeenCalledWith(expect.objectContaining({
       action: 'UPDATE_HOLD_ORDER_PRICE',
       before: { perSeatPriceCny: 1200 },
-      after: { perSeatPriceCny: 1300, reason: '运营确认成本变化' },
+      after: { perSeatPriceCny: 1300, reason: '运营确认成本变化', status: HoldOrderStatus.HOLDING },
     }));
   });
 });
