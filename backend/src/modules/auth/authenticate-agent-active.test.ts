@@ -61,6 +61,7 @@ describe('authenticate · 停用账号存量 token 立即失效', () => {
         disabledAt: true,
         authVersion: true,
         staffRole: true,
+        mustChangePassword: true,
         agentProfile: { select: { isActive: true } },
       },
     });

@@ -3,7 +3,7 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import fastifyJwt from '@fastify/jwt';
 import { StaffRole, UserRole } from '@prisma/client';
 import { env } from '../config/env.js';
-import { ForbiddenError, UnauthorizedError } from '../lib/errors.js';
+import { AppError, ForbiddenError, UnauthorizedError } from '../lib/errors.js';
 import { prisma } from '../db/prisma.js';
 
 export interface AccessTokenPayload {
@@ -62,6 +62,7 @@ declare module '@fastify/jwt' {
 async function isDeactivatedUser(payload: AccessTokenPayload): Promise<{
   deactivated: boolean;
   staffRole: StaffRole | null;
+  mustChangePassword: boolean;
 }> {
   const user = await prisma.user.findUnique({
     where: { id: payload.sub },
@@ -69,18 +70,31 @@ async function isDeactivatedUser(payload: AccessTokenPayload): Promise<{
       disabledAt: true,
       authVersion: true,
       staffRole: true,
+      mustChangePassword: true,
       agentProfile: { select: { isActive: true } },
     },
   });
-  if (!user) return { deactivated: true, staffRole: null };
+  if (!user) return { deactivated: true, staffRole: null, mustChangePassword: false };
   // ver 为空代表部署前签发的旧 token；给 access token 最长一个 TTL 的自然消亡宽限，
   // 不因新增版本字段把已登录用户瞬间踢出。新签 token 都带 ver，生命周期变更后立即失效。
   const deactivated =
     user.disabledAt != null ||
     (payload.ver != null && payload.ver !== user.authVersion) ||
     (payload.role === UserRole.AGENT && (!user.agentProfile || !user.agentProfile.isActive));
-  return { deactivated, staffRole: user.staffRole };
+  return { deactivated, staffRole: user.staffRole, mustChangePassword: user.mustChangePassword };
 }
+
+/**
+ * 首登强制改密的服务端白名单：mustChangePassword=true 的账号只放行「完成改密所需的最小闭环」。
+ * 强制点必须在后端 —— 前端的路由重定向（Layout 里的 Navigate）只是 UX，绕开官方前端
+ * 直接携 token 调 API 的客户端不受它约束；没有这道闸，临时/重置密码可以被无限期使用，
+ * 「首登强制改密」就名存实亡。
+ * 白名单按 Fastify 路由模式（含注册前缀）精确匹配：
+ * - POST /auth/change-password：改密本身；
+ * - GET  /users/me：改密页需要当前用户信息（且响应里携带 mustChangePassword 供前端跳转）。
+ * /auth/login、/auth/refresh、/auth/logout 不挂 authenticate，天然不受影响。
+ */
+const MUST_CHANGE_PASSWORD_ALLOWED_ROUTES = new Set(['/auth/change-password', '/users/me']);
 
 export const authPlugin = fp(async function authPlugin(app: FastifyInstance) {
   await app.register(fastifyJwt, {
@@ -98,6 +112,13 @@ export const authPlugin = fp(async function authPlugin(app: FastifyInstance) {
     const check = await isDeactivatedUser(req.user);
     if (check.deactivated) {
       throw new UnauthorizedError('账号已停用，请联系管理员');
+    }
+    // 首登强制改密：白名单外的业务路由一律 403（稳定 code，前端据此跳改密页，不靠文案匹配）。
+    if (check.mustChangePassword && !MUST_CHANGE_PASSWORD_ALLOWED_ROUTES.has(req.routeOptions?.url ?? '')) {
+      throw new AppError('请先修改初始密码后再继续操作', {
+        statusCode: 403,
+        code: 'FORCE_PASSWORD_CHANGE',
+      });
     }
     req.staffRole = check.staffRole;
   });
