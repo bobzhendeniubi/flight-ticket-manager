@@ -467,11 +467,13 @@ export class TravelerProfilesService {
   async lookupByDocuments(documents: DocPair[]): Promise<TravelerLookupResult[]> {
     if (documents.length === 0) return [];
 
+    // 证件号按 docKey 同口径归一后查询（trim + 忽略大小写）：档案列存的是乘客行原始写法，
+    // 录入时大小写/首尾空格稍有出入不该让「已飞/可用」徽章静默消失——那正是本接口要服务的场景。
     const hits = await prisma.travelerProfile.findMany({
       where: {
         OR: documents.map((d) => ({
           documentType: d.documentType,
-          documentNumber: d.documentNumber,
+          documentNumber: { equals: d.documentNumber.trim(), mode: Prisma.QueryMode.insensitive },
         })),
       },
     });

@@ -29,8 +29,8 @@
  */
 import ExcelJS from 'exceljs';
 import { localDateISO } from '../../lib/flight-time.js';
-import type { DocumentType, Prisma, PrismaClient } from '@prisma/client';
-import { OrderStatus } from '@prisma/client';
+import type { DocumentType, PrismaClient } from '@prisma/client';
+import { OrderStatus, Prisma } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import type { BundleItemJson } from '../../lib/json-types.js';
 import { docKey } from '../travelers/traveler-profiles.aggregate.js';
@@ -394,8 +394,15 @@ export async function loadTripCountMap(
   }
   if (pairByKey.size === 0) return { tripStats: new Map(), oldestRefreshedAt: null };
 
+  // SQL 侧与内存侧 docKey 同口径归一（trim + 忽略大小写）：档案列存的是乘客行原始写法，
+  // 精确匹配会让大小写/空格变体在查询层就漏掉，后面的 docKey 归一根本没机会兜住。
   const matched = (await client.travelerProfile.findMany({
-    where: { OR: [...pairByKey.values()] },
+    where: {
+      OR: [...pairByKey.values()].map((p) => ({
+        documentType: p.documentType,
+        documentNumber: { equals: p.documentNumber.trim(), mode: Prisma.QueryMode.insensitive },
+      })),
+    },
     select,
   })) as ProfileRef[];
 

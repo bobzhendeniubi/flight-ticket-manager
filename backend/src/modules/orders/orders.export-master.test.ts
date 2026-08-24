@@ -663,11 +663,17 @@ describe('loadTripCountMap', () => {
         findMany: vi.fn(async ({ where }: { where: Record<string, unknown> }) => {
           calls.push(where);
           if (Array.isArray(where.OR)) {
-            const pairs = where.OR as { documentType: string; documentNumber: string }[];
+            // 实现侧的证件号条件是 { equals, mode: 'insensitive' }，假 client 按同语义忽略大小写比较
+            const pairs = where.OR as {
+              documentType: string;
+              documentNumber: { equals: string; mode: string };
+            }[];
             return rows.filter((r) =>
               pairs.some(
                 (p) =>
-                  p.documentType === r.documentType && p.documentNumber === r.documentNumber,
+                  p.documentType === r.documentType &&
+                  p.documentNumber.equals.toUpperCase() ===
+                    (r.documentNumber as string).toUpperCase(),
               ),
             );
           }
@@ -725,6 +731,22 @@ describe('loadTripCountMap', () => {
     // 无 N+1：两位乘客只有一条档案查询 + 一条核销 groupBy（无指针行 → 不需要补拉主档案）
     expect(calls).toHaveLength(2);
     expect(oldestRefreshedAt).toEqual(REFRESHED);
+  });
+
+  it('乘客行证件号大小写/空格与档案库存值不一致 → 查询层按归一口径仍命中（不再静默漏配）', async () => {
+    const { client } = fakeClient([
+      profile({ id: 'tp1', documentNumber: 'E12345678', tripCount: 7, pendingTripCount: 2 }),
+    ]);
+    const { tripStats } = await loadTripCountMap(
+      [{ documentType: 'PASSPORT', documentNumber: '  e12345678 ' }],
+      client as never,
+    );
+
+    expect(tripStats.get(docKey('PASSPORT', 'e12345678'))).toEqual({
+      tripCount: 7,
+      pendingTripCount: 2,
+      availableTrips: 7,
+    });
   });
 
   it('几百位乘客（含大量重复证件）档案查询仍只有一条，证件对去重后再查', async () => {
