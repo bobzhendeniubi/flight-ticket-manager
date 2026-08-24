@@ -536,12 +536,17 @@ describe('serializeScheduleForAgent · AGENT 视角班次白名单（防成本�
     expect(result.seatClasses[0]).toMatchObject({
       id: 'sc_eco',
       cabin: 'ECONOMY',
-      capacity: 200,
-      sold: 30,
       fareBuckets: [{ quota: 20, price: 3200 }],
-      locked: 5,
       available: 165,
     });
+  });
+
+  it('库存侧只吐 available：capacity/sold/locked 不下发，防四则运算反推 held/实时销量', () => {
+    const result = serializeScheduleForAgent(fullSchedule());
+    expect(result.seatClasses[0]).not.toHaveProperty('capacity');
+    expect(result.seatClasses[0]).not.toHaveProperty('sold');
+    expect(result.seatClasses[0]).not.toHaveProperty('locked');
+    expect(result.seatClasses[0]).toHaveProperty('available', 165);
   });
 
   it('多班次批量映射（route 层 schedules.map(serializeScheduleForAgent) 的实际用法）', () => {

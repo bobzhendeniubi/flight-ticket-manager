@@ -229,15 +229,17 @@ export function toPublicSeatClass(seat: {
   };
 }
 
-/** AGENT 视角班次的座位舱位——只含余位/售价类字段，不含任何成本字段。 */
+/**
+ * AGENT 视角班次的座位舱位——只含余位/售价类字段，不含任何成本字段。
+ * 库存侧只吐 available 一个数：capacity/sold/locked 任意再多给一个，代理就能用
+ * 四则运算反推出 held（capacity − sold − locked − available）或实时销量——
+ * 其他代理/直客的占位规模与销售进度都是不该给代理看的经营信息。
+ */
 export interface AgentScheduleSeatClassView {
   id: string;
   cabin: CabinClass;
-  capacity: number;
-  sold: number;
   basePrice: Prisma.Decimal;
   fareBuckets: FareBucket[] | null;
-  locked: number;
   available: number;
 }
 
@@ -292,11 +294,8 @@ export function serializeScheduleForAgent(schedule: {
     seatClasses: schedule.seatClasses.map((c) => ({
       id: c.id,
       cabin: c.cabin,
-      capacity: c.capacity,
-      sold: c.sold,
       basePrice: c.basePrice,
       fareBuckets: c.fareBuckets,
-      locked: c.locked,
       available: c.available,
     })),
   };
