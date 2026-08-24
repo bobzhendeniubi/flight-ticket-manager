@@ -1,17 +1,10 @@
-/**
- * authenticate 中间件 · 停用代理存量 token 校验（vitest，mock prisma）
- *
- * 背景：登录时的停用拦截（见 auth.service.test.ts）只挡得住新登录——已签发的 access token
- * 在到期前仍能通过 jwtVerify，持有旧 token 的设备可以继续访问。本测试覆盖修复后的行为：
- * authenticate（plugins/auth.ts）对 role=AGENT 的每次请求都补一次 Agent.isActive 校验，
- * 停用后存量 token 立即被拒（401「账号已停用」），且不影响 ADMIN/STAFF/CUSTOMER 的请求路径。
- */
+/** authenticate · User.disabledAt 与 AGENT.isActive 的逐请求校验。 */
 import { describe, it, expect, vi, beforeAll, afterAll, beforeEach } from 'vitest';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { UserRole } from '@prisma/client';
 
 const prismaMock = vi.hoisted(() => ({
-  agent: { findUnique: vi.fn() },
+  user: { findUnique: vi.fn() },
 }));
 vi.mock('../../db/prisma.js', () => ({ prisma: prismaMock }));
 
@@ -43,6 +36,10 @@ function tokenFor(sub: string, role: UserRole): string {
   return app.jwt.sign({ sub, role });
 }
 
+function tokenWithVersion(sub: string, role: UserRole, ver: number): string {
+  return app.jwt.sign({ sub, role, ver });
+}
+
 async function hitProtected(token: string) {
   return app.inject({
     method: 'GET',
@@ -51,56 +48,72 @@ async function hitProtected(token: string) {
   });
 }
 
-describe('authenticate 中间件 · 停用代理存量 token 立即失效', () => {
-  it('role=AGENT 且 Agent.isActive=false → 401「账号已停用」', async () => {
-    prismaMock.agent.findUnique.mockResolvedValue({ isActive: false });
-    const token = tokenFor('agent-user-1', 'AGENT');
-
-    const res = await hitProtected(token);
-
+describe('authenticate · 停用账号存量 token 立即失效', () => {
+  it('AGENT 不活跃 → 401', async () => {
+    prismaMock.user.findUnique.mockResolvedValue({ disabledAt: null, agentProfile: { isActive: false } });
+    const res = await hitProtected(tokenFor('agent-user-1', UserRole.AGENT));
     expect(res.statusCode).toBe(401);
     expect(res.json().error.message).toMatch(/账号已停用/);
-    expect(prismaMock.agent.findUnique).toHaveBeenCalledWith({
-      where: { userId: 'agent-user-1' },
-      select: { isActive: true },
+    expect(prismaMock.user.findUnique).toHaveBeenCalledWith({
+      where: { id: 'agent-user-1' },
+      select: {
+        disabledAt: true,
+        authVersion: true,
+        agentProfile: { select: { isActive: true } },
+      },
     });
   });
 
-  it('role=AGENT 且 Agent 记录不存在 → 401（不当作放行）', async () => {
-    prismaMock.agent.findUnique.mockResolvedValue(null);
-    const token = tokenFor('agent-user-2', 'AGENT');
-
-    const res = await hitProtected(token);
-
+  it('AGENT 画像缺失 → 401', async () => {
+    prismaMock.user.findUnique.mockResolvedValue({ disabledAt: null, agentProfile: null });
+    const res = await hitProtected(tokenFor('agent-user-2', UserRole.AGENT));
     expect(res.statusCode).toBe(401);
   });
 
-  it('role=AGENT 且 Agent.isActive=true → 放行', async () => {
-    prismaMock.agent.findUnique.mockResolvedValue({ isActive: true });
-    const token = tokenFor('agent-user-3', 'AGENT');
-
-    const res = await hitProtected(token);
-
+  it('AGENT 活跃 → 放行', async () => {
+    prismaMock.user.findUnique.mockResolvedValue({ disabledAt: null, agentProfile: { isActive: true } });
+    const res = await hitProtected(tokenFor('agent-user-3', UserRole.AGENT));
     expect(res.statusCode).toBe(200);
-    expect(res.json()).toEqual({ ok: true, role: 'AGENT' });
   });
 
   it.each<UserRole>([UserRole.STAFF, UserRole.ADMIN, UserRole.CUSTOMER])(
-    'role=%s → 不查 Agent.isActive，直接放行',
+    '%s 正常用户 → 放行',
     async (role) => {
-      const token = tokenFor(`user-${role}`, role);
-
-      const res = await hitProtected(token);
-
+      prismaMock.user.findUnique.mockResolvedValue({ disabledAt: null, agentProfile: null });
+      const res = await hitProtected(tokenFor(`user-${role}`, role));
       expect(res.statusCode).toBe(200);
-      expect(prismaMock.agent.findUnique).not.toHaveBeenCalled();
+      expect(prismaMock.user.findUnique).toHaveBeenCalled();
     },
   );
 
-  it('无效/伪造 token → 401（既有行为不变，不查 Agent.isActive）', async () => {
-    const res = await hitProtected('not-a-real-token');
-
+  it('任意角色 disabledAt 非空 → 401', async () => {
+    prismaMock.user.findUnique.mockResolvedValue({ disabledAt: new Date(), agentProfile: null });
+    const res = await hitProtected(tokenFor('disabled-user', UserRole.STAFF));
     expect(res.statusCode).toBe(401);
-    expect(prismaMock.agent.findUnique).not.toHaveBeenCalled();
+    expect(res.json().error.message).toMatch(/账号已停用/);
+  });
+
+  it('access token ver 与用户 authVersion 不匹配 → 401', async () => {
+    prismaMock.user.findUnique.mockResolvedValue({ disabledAt: null, authVersion: 2, agentProfile: null });
+    const res = await hitProtected(tokenWithVersion('stale-user', UserRole.STAFF, 1));
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('无 ver 的旧 token → 跳过版本检查并放行', async () => {
+    prismaMock.user.findUnique.mockResolvedValue({ disabledAt: null, authVersion: 2, agentProfile: null });
+    const res = await hitProtected(tokenFor('legacy-user', UserRole.STAFF));
+    expect(res.statusCode).toBe(200);
+  });
+
+  it('用户不存在 → 401（fail closed）', async () => {
+    prismaMock.user.findUnique.mockResolvedValue(null);
+    const res = await hitProtected(tokenFor('missing-user', UserRole.STAFF));
+    expect(res.statusCode).toBe(401);
+  });
+
+  it('无效 token → 401，且不查数据库', async () => {
+    const res = await hitProtected('not-a-real-token');
+    expect(res.statusCode).toBe(401);
+    expect(prismaMock.user.findUnique).not.toHaveBeenCalled();
   });
 });

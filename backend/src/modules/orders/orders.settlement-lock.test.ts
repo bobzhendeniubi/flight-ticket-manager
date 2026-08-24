@@ -8,6 +8,7 @@ import { ConflictError } from '../../lib/errors.js';
 import { batchSettlementLockBodySchema } from './orders.schemas.js';
 
 const prismaMock = vi.hoisted(() => ({
+  user: { findUnique: vi.fn().mockResolvedValue({ disabledAt: null, agentProfile: { isActive: true } }) },
   agent: { findUnique: vi.fn() },
   auditLog: { create: vi.fn().mockResolvedValue({}) },
 }));

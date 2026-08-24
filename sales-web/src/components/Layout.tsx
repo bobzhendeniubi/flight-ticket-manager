@@ -1,6 +1,6 @@
 import { Suspense, lazy, useEffect, useState } from 'react';
 import type { FormEvent } from 'react';
-import { Link, NavLink, Outlet, useNavigate, useSearchParams } from 'react-router-dom';
+import { Link, Navigate, NavLink, Outlet, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '../stores/auth';
 import { useCart } from '../stores/cart';
@@ -45,7 +45,9 @@ export function Layout() {
   const user = useAuth((s) => s.user);
   const logout = useAuth((s) => s.logout);
   const navigate = useNavigate();
+  const location = useLocation();
   const [searchParams] = useSearchParams();
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
   // 主导航：用 t() 而不是硬编码文字
   // 排序按运营确认：套餐是主推，排第一（套餐-机票-酒店-用车-签证）
@@ -64,6 +66,10 @@ export function Layout() {
     ? 'http://localhost:5174'
     : window.location.origin.replace('store', 'admin');
 
+  if (user?.mustChangePassword && location.pathname !== '/change-password') {
+    return <Navigate to="/change-password" replace />;
+  }
+
   // ?preview=mobile → 把页面包进 375×812 的手机壳，模拟小程序 UI
   // 在电脑浏览器里开演示 / 录屏 / 给客户展示效果时很方便
   const mobilePreview = searchParams.get('preview') === 'mobile';
@@ -71,8 +77,6 @@ export function Layout() {
     return <MobilePreviewFrame />;
   }
 
-  // 手机端汉堡菜单展开状态
-  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
   const closeMenu = () => setMobileMenuOpen(false);
 
   return (
@@ -182,6 +186,11 @@ export function Layout() {
                     {ROLE_LABEL[user.role] ?? user.role}
                   </span>
                 </Link>
+                {user.email && (
+                  <Link to="/change-password" className="text-sm font-medium text-brand-700 hover:text-brand-800">
+                    修改密码
+                  </Link>
+                )}
                 <button
                   type="button"
                   className="btn-secondary text-sm py-1.5"
@@ -292,6 +301,12 @@ export function Layout() {
                         {ROLE_LABEL[user.role] ?? user.role}
                       </span>
                     </Link>
+                    {user.email && (
+                      <Link to="/change-password" onClick={closeMenu} className="flex items-center gap-2 rounded-xl px-3 py-2.5 text-sm font-medium text-brand-700 transition-colors hover:bg-brand-50/60">
+                        <Icon name="shield" className="h-4 w-4 text-brand-600" />
+                        修改密码
+                      </Link>
+                    )}
                     <button
                       type="button"
                       className="w-full text-left block rounded-xl px-3 py-2.5 text-sm font-semibold text-deal transition-colors hover:bg-deal-light"

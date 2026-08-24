@@ -1,9 +1,16 @@
 import type { FastifyInstance } from 'fastify';
-import { type User, UserRole } from '@prisma/client';
+import { type User, StaffRole, UserRole } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { hashPassword, verifyPassword } from '../../lib/password.js';
 import { generateRefreshToken, hashToken } from '../../lib/tokens.js';
-import { AppError, ConflictError, ForbiddenError, UnauthorizedError } from '../../lib/errors.js';
+import {
+  AppError,
+  BadRequestError,
+  ConflictError,
+  ForbiddenError,
+  NotFoundError,
+  UnauthorizedError,
+} from '../../lib/errors.js';
 import { env } from '../../config/env.js';
 
 export interface AuthTokens {
@@ -14,7 +21,7 @@ export interface AuthTokens {
 }
 
 export interface AuthResult {
-  user: Pick<User, 'id' | 'email' | 'role' | 'displayName'>;
+  user: Pick<User, 'id' | 'email' | 'role' | 'displayName' | 'mustChangePassword'>;
   tokens: AuthTokens;
 }
 
@@ -89,7 +96,13 @@ export class AuthService {
 
     const tokens = await this.issueTokens(user, ctx);
     return {
-      user: { id: user.id, email: user.email, role: user.role, displayName: user.displayName },
+      user: {
+        id: user.id,
+        email: user.email,
+        role: user.role,
+        displayName: user.displayName,
+        mustChangePassword: user.mustChangePassword,
+      },
       tokens,
     };
   }
@@ -102,6 +115,10 @@ export class AuthService {
     }
     const ok = await verifyPassword(user.passwordHash, input.password);
     if (!ok) throw new UnauthorizedError('Invalid email or password');
+
+    if (user.disabledAt) {
+      throw new ForbiddenError('账号已停用，请联系管理员');
+    }
 
     // 代理账号停用拦截（登录时）：提前挡掉，避免给已停用账号签发新 token。
     // 已签发的存量 token 由 authenticate 中间件（plugins/auth.ts）逐请求校验 isActive，
@@ -120,7 +137,13 @@ export class AuthService {
 
     const tokens = await this.issueTokens(user, ctx);
     return {
-      user: { id: user.id, email: user.email, role: user.role, displayName: user.displayName },
+      user: {
+        id: user.id,
+        email: user.email,
+        role: user.role,
+        displayName: user.displayName,
+        mustChangePassword: user.mustChangePassword,
+      },
       tokens,
     };
   }
@@ -133,6 +156,12 @@ export class AuthService {
     });
     if (!record || record.expiresAt < new Date()) {
       throw new UnauthorizedError('Invalid or expired refresh token');
+    }
+    if (record.user.disabledAt != null) {
+      throw new UnauthorizedError('账号已停用，请联系管理员');
+    }
+    if (record.authVersion !== record.user.authVersion) {
+      throw new UnauthorizedError('会话已失效，请重新登录');
     }
 
     // 令牌已被作废：区分「真正的重放」与「客户端毫秒级并发轮换」。
@@ -262,7 +291,13 @@ export class AuthService {
           throw err;
         }
       }
-    } else if (input.userInfo?.nickName && user.displayName !== input.userInfo.nickName) {
+    }
+
+    if (user.disabledAt) {
+      throw new ForbiddenError('账号已停用，请联系管理员');
+    }
+
+    if (input.userInfo?.nickName && user.displayName !== input.userInfo.nickName) {
       // 昵称刷新
       await prisma.user.update({
         where: { id: user.id },
@@ -274,9 +309,120 @@ export class AuthService {
 
     const tokens = await this.issueTokens(user, ctx);
     return {
-      user: { id: user.id, email: user.email, role: user.role, displayName: user.displayName },
+      user: {
+        id: user.id,
+        email: user.email,
+        role: user.role,
+        displayName: user.displayName,
+        mustChangePassword: user.mustChangePassword,
+      },
       tokens,
     };
+  }
+
+  async changePassword(
+    userId: string,
+    currentPassword: string,
+    newPassword: string,
+    ctx: IssueTokensContext = {},
+  ): Promise<AuthResult> {
+    const user = await prisma.user.findUnique({ where: { id: userId } });
+    if (!user) throw new UnauthorizedError('账号不存在');
+    if (!user.passwordHash) {
+      throw new BadRequestError('该账号未设置密码，无法修改');
+    }
+
+    const ok = await verifyPassword(user.passwordHash, currentPassword);
+    if (!ok) throw new UnauthorizedError('当前密码不正确');
+    if (newPassword === currentPassword) {
+      throw new BadRequestError('新密码不能与当前密码相同');
+    }
+
+    const passwordHash = await hashPassword(newPassword);
+    const { updatedUser, tokens } = await prisma.$transaction(async (tx) => {
+      const updated = await tx.user.update({
+        where: { id: userId },
+        data: { passwordHash, mustChangePassword: false, authVersion: { increment: 1 } },
+      });
+      await tx.refreshToken.updateMany({
+        where: { userId, revokedAt: null },
+        data: { revokedAt: new Date(), expiresAt: expireImmediately() },
+      });
+      // 新 refresh token 与密码更新、旧会话撤销共用事务；创建失败时不留下半完成的改密状态。
+      const tokens = await this.issueTokens(updated, ctx, tx);
+      return { updatedUser: updated, tokens };
+    });
+
+    return {
+      user: {
+        id: updatedUser.id,
+        email: updatedUser.email,
+        role: updatedUser.role,
+        displayName: updatedUser.displayName,
+        mustChangePassword: updatedUser.mustChangePassword,
+      },
+      tokens,
+    };
+  }
+
+  async adminResetPassword(
+    targetUserId: string,
+    newPassword: string,
+  ): Promise<Pick<User, 'id' | 'email' | 'displayName'>> {
+    const target = await prisma.user.findUnique({ where: { id: targetUserId } });
+    if (!target) throw new NotFoundError('用户不存在');
+    if (!target.email) {
+      throw new BadRequestError('该账号没有邮箱，无法使用密码登录');
+    }
+
+    const passwordHash = await hashPassword(newPassword);
+    await prisma.$transaction(async (tx) => {
+      await tx.user.update({
+        where: { id: targetUserId },
+        data: { passwordHash, mustChangePassword: true, authVersion: { increment: 1 } },
+      });
+      await tx.refreshToken.updateMany({
+        where: { userId: targetUserId, revokedAt: null },
+        data: { revokedAt: new Date(), expiresAt: expireImmediately() },
+      });
+    });
+
+    return { id: target.id, email: target.email, displayName: target.displayName };
+  }
+
+  async createInternalUser(input: {
+    email: string;
+    password: string;
+    displayName: string;
+    role: Extract<UserRole, 'ADMIN' | 'STAFF'>;
+    staffRole?: StaffRole | null;
+  }): Promise<Pick<User, 'id' | 'email' | 'displayName' | 'role' | 'staffRole'>> {
+    if (input.role !== UserRole.ADMIN && input.role !== UserRole.STAFF) {
+      throw new BadRequestError('内部账号角色无效');
+    }
+    const existing = await prisma.user.findUnique({ where: { email: input.email } });
+    if (existing) throw new ConflictError('邮箱已被占用');
+
+    const passwordHash = await hashPassword(input.password);
+    try {
+      return await prisma.user.create({
+        data: {
+          email: input.email,
+          passwordHash,
+          displayName: input.displayName,
+          role: input.role,
+          staffRole: input.role === UserRole.STAFF ? (input.staffRole ?? null) : null,
+          mustChangePassword: true,
+        },
+        select: { id: true, email: true, displayName: true, role: true, staffRole: true },
+      });
+    } catch (err) {
+      // 并发开户的唯一键冲突也按邮箱占用返回，避免把可理解的业务冲突暴露成 500。
+      if ((err as { code?: string })?.code === 'P2002') {
+        throw new ConflictError('邮箱已被占用');
+      }
+      throw err;
+    }
   }
 
   async logout(refreshToken: string): Promise<void> {
@@ -290,16 +436,21 @@ export class AuthService {
     });
   }
 
-  private async issueTokens(user: User, ctx: IssueTokensContext): Promise<AuthTokens> {
-    const accessToken = this.app.jwt.sign({ sub: user.id, role: user.role });
+  private async issueTokens(
+    user: User,
+    ctx: IssueTokensContext,
+    client: Pick<typeof prisma, 'refreshToken'> = prisma,
+  ): Promise<AuthTokens> {
+    const accessToken = this.app.jwt.sign({ sub: user.id, role: user.role, ver: user.authVersion });
 
     const { token: refreshToken, tokenHash } = generateRefreshToken();
     const expiresAt = new Date(Date.now() + env.JWT_REFRESH_TTL * 1000);
 
-    await prisma.refreshToken.create({
+    await client.refreshToken.create({
       data: {
         userId: user.id,
         tokenHash,
+        authVersion: user.authVersion,
         expiresAt,
         userAgent: ctx.userAgent,
         ipAddress: ctx.ipAddress,

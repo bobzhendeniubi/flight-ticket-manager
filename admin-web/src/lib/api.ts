@@ -196,6 +196,7 @@ export interface AuthUser {
   email: string | null;
   role: UserRole;
   displayName: string | null;
+  mustChangePassword: boolean;
 }
 
 export interface AuthTokens {
@@ -2762,7 +2763,14 @@ export const api = {
       body: { refreshToken },
     }),
   me: (token: string) =>
-    apiFetch<{ user: AuthUser & { phone: string | null; createdAt: string; lastLoginAt: string | null } }>('/users/me', { token }),
+    apiFetch<{
+      user: AuthUser & {
+        phone: string | null;
+        createdAt: string;
+        lastLoginAt: string | null;
+        disabledAt: string | null;
+      };
+    }>('/users/me', { token }),
 
   // 营销中心
   marketing: {
@@ -3957,6 +3965,34 @@ export const api = {
       token,
       body: { staffRole },
     }),
+  changePassword: (token: string, currentPassword: string, newPassword: string) =>
+    apiFetch<AuthResult>('/auth/change-password', {
+      method: 'POST',
+      token,
+      body: { currentPassword, newPassword },
+    }),
+  createStaffUser: (
+    token: string,
+    body: {
+      email: string;
+      password: string;
+      displayName: string;
+      role: 'ADMIN' | 'STAFF';
+      staffRole: StaffRole | null;
+    },
+  ) => apiFetch<{ user: StaffUser }>('/users/staff', { method: 'POST', token, body }),
+  setUserDisabled: (token: string, userId: string, disabled: boolean) =>
+    apiFetch<{ ok: true; disabledAt: string | null }>(`/users/${userId}/disabled`, {
+      method: 'PATCH',
+      token,
+      body: { disabled },
+    }),
+  resetUserPassword: (token: string, userId: string, newPassword: string) =>
+    apiFetch<{ ok: true }>(`/users/${userId}/reset-password`, {
+      method: 'POST',
+      token,
+      body: { newPassword },
+    }),
 
   // 佣金规则（A1）：读=当前生效费率（每产品一条）；写=仅 ADMIN，追加新生效规则（历史保留）
   getCommissionRules: (token: string, agentId: string) =>
@@ -4574,6 +4610,8 @@ export interface StaffUser {
   role: 'ADMIN' | 'STAFF';
   staffRole: StaffRole | null;
   lastLoginAt: string | null;
+  disabledAt: string | null;
+  mustChangePassword: boolean;
 }
 
 /**

@@ -15,6 +15,7 @@ import { UserRole } from '@prisma/client';
 import { batchSetInvoiceFlagsBodySchema } from './orders.schemas.js';
 
 const prismaMock = vi.hoisted(() => ({
+  user: { findUnique: vi.fn().mockResolvedValue({ disabledAt: null, agentProfile: { isActive: true } }) },
   agent: { findUnique: vi.fn() },
   auditLog: { create: vi.fn().mockResolvedValue({}) },
 }));

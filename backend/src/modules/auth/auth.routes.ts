@@ -3,6 +3,7 @@ import { UserRole } from '@prisma/client';
 import { z } from 'zod';
 import {
   loginBodySchema,
+  changePasswordBodySchema,
   logoutBodySchema,
   refreshBodySchema,
   registerBodySchema,
@@ -47,6 +48,21 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
     async (req) => {
       const body = loginBodySchema.parse(req.body);
       return service.login(body, {
+        userAgent: req.headers['user-agent'],
+        ipAddress: req.ip,
+      });
+    },
+  );
+
+  app.post(
+    '/change-password',
+    {
+      preHandler: app.authenticate,
+      config: { rateLimit: { max: 8, timeWindow: '1 minute' } },
+    },
+    async (req) => {
+      const body = changePasswordBodySchema.parse(req.body);
+      return service.changePassword(req.user.sub, body.currentPassword, body.newPassword, {
         userAgent: req.headers['user-agent'],
         ipAddress: req.ip,
       });

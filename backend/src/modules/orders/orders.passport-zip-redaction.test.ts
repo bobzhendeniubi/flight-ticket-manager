@@ -21,6 +21,7 @@ import Fastify, { type FastifyInstance } from 'fastify';
 import { Prisma, UserRole } from '@prisma/client';
 
 const prismaMock = vi.hoisted(() => ({
+  user: { findUnique: vi.fn().mockResolvedValue({ disabledAt: null, agentProfile: { isActive: true } }) },
   agent: { findUnique: vi.fn() },
   order: { findUnique: vi.fn() },
   visa: { findMany: vi.fn() },

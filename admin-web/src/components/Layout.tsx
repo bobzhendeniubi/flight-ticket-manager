@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react';
-import { Link, NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
+import { Link, Navigate, NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../stores/auth';
 import { api, ApiError, AUTH_REFRESH_UNAVAILABLE_CODE } from '../lib/api';
 import { ErrorBoundary } from './ErrorBoundary';
@@ -42,7 +42,7 @@ const NAV: Array<{
   { to: '/reports',         label: '经营报表',    roles: ['ADMIN'],                   section: '财务' },
   { to: '/audit-logs',      label: '审计日志',    roles: ['ADMIN', 'STAFF'],          section: '系统' },
   { to: '/settings/ai-ocr', label: 'AI 识别设置', roles: ['ADMIN'],                   section: '系统' },
-  { to: '/settings/staff-roles', label: '岗位管理',    roles: ['ADMIN'],                   section: '系统' },
+  { to: '/settings/staff-roles', label: '账号管理',    roles: ['ADMIN'],                   section: '系统' },
 ];
 
 // 侧栏分组渲染顺序（NAV 里出现的 section 都在这里列一遍）
@@ -88,6 +88,7 @@ export function Layout() {
     api.me(accessToken)
       .then((res) => {
         if (cancelled) return;
+        useAuth.setState({ user: res.user });
         // 后台允许 ADMIN/STAFF/AGENT；CUSTOMER 踢出
         if (res.user.role === 'CUSTOMER') {
           logout().then(() => navigate('/login', { replace: true }));
@@ -111,6 +112,10 @@ export function Layout() {
 
   // 切路由时收起抽屉（移动端）
   useEffect(() => { setDrawerOpen(false); }, [location.pathname]);
+
+  if (user?.mustChangePassword && location.pathname !== '/change-password') {
+    return <Navigate to="/change-password" replace />;
+  }
 
   const visibleNav = user
     ? NAV.filter((n) => n.roles.includes(user.role as 'ADMIN' | 'STAFF' | 'AGENT'))
@@ -200,6 +205,9 @@ export function Layout() {
                 <p className="truncate text-sm font-medium text-ink">{user.displayName ?? user.email}</p>
                 <p className="text-[11px] text-ink-muted">{ROLE_LABEL[user.role] ?? user.role}</p>
               </div>
+              <Link to="/change-password" className="text-[11px] font-medium text-brand hover:text-brand-dark">
+                修改密码
+              </Link>
             </div>
           </div>
         ) : null}
@@ -252,6 +260,9 @@ export function Layout() {
                   <span className="font-medium text-ink-soft">{user.displayName ?? user.email}</span>
                   <span className="badge-neutral">{ROLE_LABEL[user.role] ?? user.role}</span>
                 </span>
+                <Link to="/change-password" className="text-sm font-medium text-brand hover:text-brand-dark">
+                  修改密码
+                </Link>
                 <button
                   type="button"
                   className="btn-secondary py-1.5"

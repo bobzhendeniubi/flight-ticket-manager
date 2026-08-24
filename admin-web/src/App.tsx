@@ -14,6 +14,7 @@ import { CustomersPage } from './pages/CustomersPage';
 import { TravelersPage } from './pages/TravelersPage';
 import { AuditLogsPage } from './pages/AuditLogsPage';
 import { StaffRolesPage } from './pages/StaffRolesPage';
+import { ChangePasswordPage } from './pages/ChangePasswordPage';
 import { SettlementsPage } from './pages/SettlementsPage';
 import { SettlementRatesPage } from './pages/SettlementRatesPage';
 import { SettlementDiscountsPage } from './pages/SettlementDiscountsPage';
@@ -112,6 +113,14 @@ export function App() {
     <Routes>
       <Route path="/login" element={<LoginPage />} />
       <Route element={<Layout />}>
+        <Route
+          path="/change-password"
+          element={
+            <Protected>
+              <ChangePasswordPage />
+            </Protected>
+          }
+        />
         <Route
           path="/dashboard"
           element={

@@ -45,9 +45,9 @@ const fakeApp = {
 
 const service = new AuthService(fakeApp);
 
-const baseUser = { id: 'user-1', email: 'a@b.c', role: 'STAFF', displayName: 'Op' };
+const baseUser = { id: 'user-1', email: 'a@b.c', role: 'STAFF', displayName: 'Op', authVersion: 0 };
 
-function makeRecord(over: Partial<{ revokedAt: Date | null; expiresAt: Date }> = {}) {
+function makeRecord(over: Partial<{ revokedAt: Date | null; expiresAt: Date; authVersion: number }> = {}) {
   return {
     id: 'rt-1',
     userId: baseUser.id,
@@ -55,6 +55,7 @@ function makeRecord(over: Partial<{ revokedAt: Date | null; expiresAt: Date }> =
     revokedAt: null,
     expiresAt: new Date(Date.now() + 30 * 24 * 3600 * 1000),
     user: baseUser,
+    authVersion: baseUser.authVersion,
     ...over,
   };
 }

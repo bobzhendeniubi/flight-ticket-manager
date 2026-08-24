@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { api, ApiError } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { Icon } from '../components/Icon';
+import { Link } from 'react-router-dom';
 
 interface FullUser {
   id: string;
@@ -66,6 +67,12 @@ export function ProfilePage() {
             </div>
           </div>
         </div>
+
+        {user.email && (
+          <Link to="/change-password" className="btn-secondary mt-5 inline-flex">
+            修改密码
+          </Link>
+        )}
 
         <dl className="mt-5 divide-y divide-slate-100">
           {[

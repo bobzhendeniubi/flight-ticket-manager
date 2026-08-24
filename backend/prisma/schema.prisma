@@ -77,6 +77,12 @@ model User {
   wechatOpenId  String?   @unique
   wechatUnionId String?   @unique
   lastLoginAt   DateTime?
+  /// 账号停用时间；非 null = 已停用（登录/刷新/每请求校验全拦截）。用于封存测试账号与离职回收。
+  disabledAt         DateTime?
+  /// 首登强制改密：管理员开户/重置密码后置 true，自助改密成功后清 false。
+  mustChangePassword Boolean   @default(false)
+  /// 会话版本号；改密、重置密码或停用账号时递增，让存量 access/refresh token 立即失效。
+  authVersion        Int       @default(0)
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
 
@@ -102,6 +108,7 @@ model RefreshToken {
   id        String    @id @default(cuid())
   userId    String
   tokenHash String    @unique // sha256 of the refresh token
+  authVersion Int     @default(0) // 签发时绑定 User.authVersion；账号生命周期变更后拒绝刷新
   expiresAt DateTime
   revokedAt DateTime?
   userAgent String?

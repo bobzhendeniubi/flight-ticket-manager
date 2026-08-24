@@ -147,6 +147,7 @@ export interface AuthUser {
   email: string | null;
   role: UserRole;
   displayName: string | null;
+  mustChangePassword: boolean;
 }
 
 export interface AuthTokens {
@@ -1010,6 +1011,12 @@ export const api = {
     apiFetch<AuthResult>('/auth/login', {
       method: 'POST',
       body: { email, password },
+    }),
+  changePassword: (token: string, currentPassword: string, newPassword: string) =>
+    apiFetch<AuthResult>('/auth/change-password', {
+      method: 'POST',
+      token,
+      body: { currentPassword, newPassword },
     }),
   refresh: (refreshToken: string) =>
     apiFetch<{ tokens: AuthTokens }>('/auth/refresh', {

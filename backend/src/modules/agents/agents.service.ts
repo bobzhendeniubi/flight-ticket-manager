@@ -199,6 +199,7 @@ export class AgentService {
           displayName: body.displayName,
           role: UserRole.AGENT,
           emailVerified: true,
+          mustChangePassword: true,
         },
       });
 

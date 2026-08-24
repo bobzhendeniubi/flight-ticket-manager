@@ -13,6 +13,12 @@ export const loginBodySchema = z.object({
 });
 export type LoginBody = z.infer<typeof loginBodySchema>;
 
+export const changePasswordBodySchema = z.object({
+  currentPassword: z.string().min(1).max(128),
+  newPassword: z.string().min(8).max(128),
+});
+export type ChangePasswordBody = z.infer<typeof changePasswordBodySchema>;
+
 export const refreshBodySchema = z.object({
   refreshToken: z.string().min(1),
 });

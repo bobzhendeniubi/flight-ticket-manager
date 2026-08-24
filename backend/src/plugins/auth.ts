@@ -9,6 +9,8 @@ import { prisma } from '../db/prisma.js';
 export interface AccessTokenPayload {
   sub: string; // user id
   role: UserRole;
+  /** 会话版本号；旧部署签发的 token 没有 ver，按兼容宽限口径跳过版本检查。 */
+  ver?: number;
 }
 
 declare module 'fastify' {
@@ -19,7 +21,7 @@ declare module 'fastify' {
      * Optional auth for routes that work both logged-in and as guest (e.g. guest checkout).
      * · 没带 Authorization 头 → 游客，request.user 保持 undefined，绝不 401；
      * · 带了但无效/过期     → 401（让客户端去续期并自动重试，而不是被静默降级成游客）；
-     * · 带了且有效         → attaches request.user（停用代理除外，见实现）。
+     * · 带了且有效         → attaches request.user（停用账号除外，见实现）。
      */
     optionalAuthenticate: (req: FastifyRequest, reply: FastifyReply) => Promise<void>;
     /** Factory: returns a preHandler that requires one of the given roles. */
@@ -41,24 +43,31 @@ declare module '@fastify/jwt' {
 }
 
 /**
- * 停用代理即时生效的共享判定 —— authenticate 与 optionalAuthenticate 都用它逐请求复核，
- * 避免两处校验漂移（以后改 isActive 口径只改这一处）。
+ * 账号停用即时生效的共享判定 —— authenticate 与 optionalAuthenticate 都用它逐请求复核，
+ * 避免两处校验漂移（以后改账号失效口径只改这一处）。
  *
  * 背景：登录时的停用拦截（auth.service.ts）只挡得住新登录；已签发的 access token 在到期前
- * 仍会通过 jwtVerify，持旧 token 的设备可继续按代理身份访问。因此对每个「携带有效 token 的
- * AGENT 请求」补一次 Agent.isActive 查询——停用后存量 token 立即失效，不必等其自然过期。
+ * 仍会通过 jwtVerify，持旧 token 的设备可继续访问。因此每个「携带有效 token 的请求」都补一次
+ * User 主键查询——停用后存量 token 立即失效，不必等其自然过期。access token TTL 目前为 1 小时，
+ * 这里用每请求一次查询换取停用的即时生效，是有意保留的安全取舍。
  *
- * 仅 role=AGENT 触发一次 DB 查询；ADMIN/STAFF/CUSTOMER 直接返回 false（不查、不受影响）。
- * 返回 true 表示「该 token 的代理已停用（或 Agent 记录缺失）」，由调用方决定拒绝或降级。
+ * 返回 true 表示「用户已停用、用户不存在、会话版本已失效，或 AGENT 的 Agent 记录已失效」，由调用方决定拒绝或降级。
  * DB 异常向上抛出（不静默放行），保证判定失败时绝不误授予代理身份。
  */
-async function isDeactivatedAgent(payload: AccessTokenPayload): Promise<boolean> {
-  if (payload.role !== UserRole.AGENT) return false;
-  const agent = await prisma.agent.findUnique({
-    where: { userId: payload.sub },
-    select: { isActive: true },
+async function isDeactivatedUser(payload: AccessTokenPayload): Promise<boolean> {
+  const user = await prisma.user.findUnique({
+    where: { id: payload.sub },
+    select: {
+      disabledAt: true,
+      authVersion: true,
+      agentProfile: { select: { isActive: true } },
+    },
   });
-  return !agent || !agent.isActive;
+  if (!user || user.disabledAt != null) return true;
+  // ver 为空代表部署前签发的旧 token；给 access token 最长一个 TTL 的自然消亡宽限，
+  // 不因新增版本字段把已登录用户瞬间踢出。新签 token 都带 ver，生命周期变更后立即失效。
+  if (payload.ver != null && payload.ver !== user.authVersion) return true;
+  return payload.role === UserRole.AGENT && (!user.agentProfile || !user.agentProfile.isActive);
 }
 
 export const authPlugin = fp(async function authPlugin(app: FastifyInstance) {
@@ -73,8 +82,8 @@ export const authPlugin = fp(async function authPlugin(app: FastifyInstance) {
     } catch {
       throw new UnauthorizedError('Invalid or expired access token');
     }
-    // 这些路由本就要求登录 → 停用代理的存量 token 硬拒绝（401）。
-    if (await isDeactivatedAgent(req.user)) {
+    // 这些路由本就要求登录 → 停用账号的存量 token 硬拒绝（401）。
+    if (await isDeactivatedUser(req.user)) {
       throw new UnauthorizedError('账号已停用，请联系管理员');
     }
   });
@@ -96,11 +105,11 @@ export const authPlugin = fp(async function authPlugin(app: FastifyInstance) {
     } catch {
       throw new UnauthorizedError('Invalid or expired access token');
     }
-    // 口径：停用代理经 optionalAuthenticate = 降级为匿名，而非硬 401。
-    // optionalAuthenticate 语义是「可选登录」，停用代理应等同「未登录」——清空 req.user 后，
+    // 口径：停用账号经 optionalAuthenticate = 降级为匿名，而非硬 401。
+    // optionalAuthenticate 语义是「可选登录」，停用账号应等同「未登录」——清空 req.user 后，
     // 免登录路由（如游客下单 POST /orders、产品列表定价）继续按匿名/游客处理，绝不再按代理身份
     // 绑定 agentId 或套用代理价。选降级而非 401 是为了不破坏匿名下单路径（硬 401 会连累游客场景）。
-    if (await isDeactivatedAgent(req.user)) {
+    if (await isDeactivatedUser(req.user)) {
       // fastify-jwt 成功校验后已给 req.user 赋值；这里清回 undefined，让下游 Boolean(req.user) 判定为游客。
       (req as { user?: AccessTokenPayload }).user = undefined;
     }

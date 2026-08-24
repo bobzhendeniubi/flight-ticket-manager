@@ -12,6 +12,9 @@ import { REFRESH_SKEW_MS, getAccessTokenExpMs } from './lib/token';
 // Layout 不 lazy（外壳要立即渲染）；LoginPage 保持 eager（独立全屏入口）。
 const HomePage = lazy(() => import('./pages/HomePage').then((m) => ({ default: m.HomePage })));
 const ProfilePage = lazy(() => import('./pages/ProfilePage').then((m) => ({ default: m.ProfilePage })));
+const ChangePasswordPage = lazy(() =>
+  import('./pages/ChangePasswordPage').then((m) => ({ default: m.ChangePasswordPage })),
+);
 const TeamPage = lazy(() => import('./pages/TeamPage').then((m) => ({ default: m.TeamPage })));
 const MyCommissionsPage = lazy(() =>
   import('./pages/MyCommissionsPage').then((m) => ({ default: m.MyCommissionsPage })),
@@ -148,6 +151,14 @@ export function App() {
               element={
                 <Protected>
                   <ProfilePage />
+                </Protected>
+              }
+            />
+            <Route
+              path="change-password"
+              element={
+                <Protected>
+                  <ChangePasswordPage />
                 </Protected>
               }
             />

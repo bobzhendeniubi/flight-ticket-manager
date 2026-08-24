@@ -32,7 +32,10 @@ const serviceMock = vi.hoisted(() => {
 
 vi.mock('./marketing.service.js', () => serviceMock);
 vi.mock('../../db/prisma.js', () => ({
-  prisma: { agent: { findUnique: vi.fn() } },
+  prisma: {
+    user: { findUnique: vi.fn().mockResolvedValue({ disabledAt: null, agentProfile: { isActive: true } }) },
+    agent: { findUnique: vi.fn() },
+  },
 }));
 
 import { authPlugin } from '../../plugins/auth.js';

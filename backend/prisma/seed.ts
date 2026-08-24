@@ -77,6 +77,26 @@ function localToUtc(year: number, month: number, day: number, hour: number, minu
 }
 
 async function main() {
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('拒绝在生产环境执行 seed：它会写入统一弱密码的演示账号。');
+  }
+  if (process.env.ALLOW_DEMO_SEED !== '1') {
+    const databaseUrl = process.env.DATABASE_URL;
+    let host: string | null = null;
+    try {
+      host = databaseUrl ? new URL(databaseUrl).hostname.replace(/^\[|\]$/g, '').toLowerCase() : null;
+    } catch {
+      host = null;
+    }
+    const localDatabaseHosts = new Set(['localhost', '127.0.0.1', '::1', 'db', 'postgres']);
+    if (!host || !localDatabaseHosts.has(host)) {
+      throw new Error(
+        `拒绝执行 seed：DATABASE_URL 的 host（${host ?? '缺失或无效'}）不是本地数据库。` +
+          '仅当 NODE_ENV 非 production 且设置 ALLOW_DEMO_SEED=1 时，才允许绕过本地 host 闸。',
+      );
+    }
+  }
+
   const password = 'Password123!';
   const hash = await argon2.hash(password, { type: argon2.argon2id });
 
