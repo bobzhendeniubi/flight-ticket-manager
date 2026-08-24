@@ -2,16 +2,20 @@
 import {
   AuditSeverity,
   AuditTargetType,
+  CabinClass,
   HoldAmountRule,
   HoldInstallmentStatus,
   HoldOccupyOn,
   HoldOrderStatus,
   HoldOwnerType,
   HoldOverdueAction,
+  OrderStatus,
+  PaymentMethod,
   Prisma,
   ReminderStatus,
   ReceiptStatus,
   SeatLockStatus,
+  UserRole,
 } from '@prisma/client';
 import { randomInt } from 'node:crypto';
 import { prisma } from '../../db/prisma.js';
@@ -19,6 +23,15 @@ import { BadRequestError, ConflictError, NotFoundError } from '../../lib/errors.
 import { writeAudit } from '../../lib/audit.js';
 import type { AuditActor } from '../../lib/audit.js';
 import { heldSeatsForSeatClass } from './held-seats.js';
+import { OrderService } from '../orders/orders.service.js';
+import { PaymentsService } from '../payments/payments.service.js';
+import {
+  attributableReceivedCny,
+  holdLedgerTotals,
+  perSeatAttributableCny,
+  rebaseInstallmentsForRemainingSeats,
+  type HoldLedger,
+} from './hold-settlement.js';
 import {
   buildInstallmentsFromOverride,
   FALLBACK_HOLD_CONFIG,
@@ -38,7 +51,10 @@ import type {
   UpdateHoldOrderConfigBody,
   UpdateHoldOrderPriceBody,
   PreviewHoldPlanBody,
+  ConvertHoldOrderBody,
+  PreviewConvertHoldOrderBody,
 } from './hold-orders.schemas.js';
+import { convertHoldOrderBodySchema } from './hold-orders.schemas.js';
 import { deriveHoldStatus } from './hold-status.js';
 
 const HOLD_NO_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
@@ -129,6 +145,19 @@ async function findHold(tx: Tx | typeof prisma, id: string) {
     include: {
       installments: { orderBy: { seq: 'asc' }, include: { allocations: true } },
       reductions: { select: { id: true, forfeitCny: true, surplusCny: true, createdAt: true } },
+      conversions: {
+        select: {
+          id: true,
+          orderId: true,
+          seats: true,
+          carryCny: true,
+          paymentId: true,
+          requestToken: true,
+          createdAt: true,
+          order: { select: { orderNumber: true } },
+        },
+        orderBy: { createdAt: 'asc' },
+      },
       seatClass: { select: { cabin: true } },
       flightSchedule: {
         select: {
@@ -145,6 +174,11 @@ async function findHold(tx: Tx | typeof prisma, id: string) {
 
 async function lockHold(tx: Tx, id: string): Promise<void> {
   await tx.$queryRaw`SELECT id FROM "HoldOrder" WHERE id = ${id} FOR UPDATE`;
+}
+
+async function lockSeatClass(tx: Tx, id: string): Promise<void> {
+  const rows = await tx.$queryRaw<Array<{ id: string }>>`SELECT id FROM "FlightSeatClass" WHERE id = ${id} FOR UPDATE`;
+  if (!rows[0]) throw new NotFoundError('舱位不存在');
 }
 
 async function seatsAvailableForNewHold(tx: Tx, seatClassId: string, seats: number): Promise<number> {
@@ -222,7 +256,25 @@ async function enqueueWaitlist(seatClassId: string): Promise<void> {
   }
 }
 
+async function enqueueFulfillmentTasks(taskIds: string[]): Promise<void> {
+  if (taskIds.length === 0 || process.env.ENABLE_AUTO_FULFILLMENT !== 'true') return;
+  try {
+    const { fulfillmentQueue } = await import('../../queues/queue.js');
+    for (const taskId of taskIds) {
+      void fulfillmentQueue.add('auto-fulfill', { taskId }, { jobId: taskId, delay: 1000 }).catch((error) => {
+        // eslint-disable-next-line no-console
+        console.error('[hold-orders] failed to enqueue fulfillment task', error);
+      });
+    }
+  } catch (error) {
+    // eslint-disable-next-line no-console
+    console.error('[hold-orders] failed to load fulfillment queue', error);
+  }
+}
+
 export class HoldOrderService {
+  private readonly orderService = new OrderService();
+  private readonly paymentsService = new PaymentsService();
   async create(body: CreateHoldOrderBody, createdById: string, actor?: AuditActor) {
     if (body.ownerType === HoldOwnerType.AGENT && !body.agentId) throw new BadRequestError('代理占位必须选择代理');
     if (body.ownerType === HoldOwnerType.CUSTOMER && !body.groupName?.trim()) throw new BadRequestError('直客占位必须填写团名或客户备注名');
@@ -353,19 +405,303 @@ export class HoldOrderService {
       },
       include: {
         installments: { orderBy: { seq: 'asc' }, include: { allocations: true } },
+        reductions: { orderBy: { createdAt: 'asc' } },
+        conversions: {
+          orderBy: { createdAt: 'asc' },
+          include: { order: { select: { orderNumber: true } } },
+        },
         seatClass: { select: { cabin: true } },
         flightSchedule: { select: { id: true, departureTime: true, departureTz: true, flight: { select: { flightNumber: true } } } },
         agent: { select: { id: true, companyName: true, contactName: true } },
       },
       orderBy: { createdAt: 'desc' },
     });
-    return rows.sort((a, b) => (a.status === HoldOrderStatus.OVERDUE ? -1 : 0) - (b.status === HoldOrderStatus.OVERDUE ? -1 : 0));
+    const normalized = rows.map((row) => ({
+      ...row,
+      conversions: row.conversions.map(({ order, ...conversion }) => ({
+        ...conversion,
+        orderNumber: order.orderNumber,
+      })),
+    }));
+    return normalized.sort((a, b) => (a.status === HoldOrderStatus.OVERDUE ? -1 : 0) - (b.status === HoldOrderStatus.OVERDUE ? -1 : 0));
+  }
+
+  /** 工作台 KPI：一次 SQL 聚合完成，前端不逐单重算收款与余座。 */
+  async summary(query: ListHoldOrdersQuery) {
+    const scheduleId = query.flightScheduleId ?? null;
+    const status = query.status ?? null;
+    const agentId = query.agentId ?? null;
+    const rows = await prisma.$queryRaw<Array<{
+      occupiedOrderCount: bigint | number;
+      occupiedSeats: bigint | number;
+      overdueOrderCount: bigint | number;
+      fullyPaidPendingConversionCount: bigint | number;
+      receivedCny: Prisma.Decimal | number | null;
+    }>>`
+      SELECT
+        COUNT(*) FILTER (WHERE h.status::text IN ('HOLDING', 'OVERDUE', 'FULLY_PAID')) AS "occupiedOrderCount",
+        COALESCE(SUM(h.seats - h."seatsConverted" - h."seatsCancelled")
+          FILTER (WHERE h.status::text IN ('HOLDING', 'OVERDUE', 'FULLY_PAID')), 0) AS "occupiedSeats",
+        COUNT(*) FILTER (WHERE h.status::text = 'OVERDUE') AS "overdueOrderCount",
+        COUNT(*) FILTER (WHERE h.status::text = 'FULLY_PAID') AS "fullyPaidPendingConversionCount",
+        COALESCE(SUM((
+          SELECT COALESCE(SUM(a."amountCny"), 0)
+          FROM "HoldInstallment" i
+          JOIN "HoldReceiptAllocation" a ON a."holdInstallmentId" = i.id
+          WHERE i."holdOrderId" = h.id AND a."reversedAt" IS NULL
+        )), 0) AS "receivedCny"
+      FROM "HoldOrder" h
+      WHERE (${scheduleId}::text IS NULL OR h."flightScheduleId" = ${scheduleId})
+        AND (${agentId}::text IS NULL OR h."agentId" = ${agentId})
+        AND (${status}::text IS NULL OR h.status::text = ${status})
+    `;
+    const row = rows[0] ?? {
+      occupiedOrderCount: 0,
+      occupiedSeats: 0,
+      overdueOrderCount: 0,
+      fullyPaidPendingConversionCount: 0,
+      receivedCny: 0,
+    };
+    return {
+      occupiedOrderCount: Number(row.occupiedOrderCount),
+      occupiedSeats: Number(row.occupiedSeats),
+      overdueOrderCount: Number(row.overdueOrderCount),
+      fullyPaidPendingConversionCount: Number(row.fullyPaidPendingConversionCount),
+      receivedCny: money(row.receivedCny),
+    };
+  }
+
+  /**
+   * 名单导入转正：消费占位单自身余座，订单在同一事务内独立建账并结转人均可归属实收。
+   */
+  async previewConversion(id: string, body: PreviewConvertHoldOrderBody) {
+    const hold = await findHold(prisma, id);
+    if (!hold) throw new NotFoundError('占位单不存在');
+    const convertibleStatuses: HoldOrderStatus[] = [
+      HoldOrderStatus.HOLDING,
+      HoldOrderStatus.OVERDUE,
+      HoldOrderStatus.FULLY_PAID,
+    ];
+    if (!convertibleStatuses.includes(hold.status)) {
+      throw new ConflictError(`占位单当前状态不可转正（${HOLD_STATUS_LABEL[hold.status]}）`);
+    }
+    const availableSeats = hold.seats - hold.seatsConverted - hold.seatsCancelled;
+    if (body.seats > availableSeats) {
+      throw new ConflictError(`转正人数超过占位余座：当前余 ${Math.max(0, availableSeats)} 座，本次 ${body.seats} 人`);
+    }
+    const totalReceived = hold.installments.reduce((sum, item) => sum + activeAllocationTotal(item), 0);
+    const ledger: HoldLedger = { reductions: hold.reductions, conversions: hold.conversions };
+    const perSeatCarry = perSeatAttributableCny(totalReceived, availableSeats, ledger);
+    const carryCny = body.seats * perSeatCarry;
+    const orderDueCny = Math.max(0, body.seats * hold.perSeatPriceCny - carryCny);
+    return { perSeatCarry, carryCny, orderDueCny };
+  }
+
+  async convert(id: string, body: ConvertHoldOrderBody, actor?: AuditActor) {
+    // 路由层已 parse；服务层再守一道边界，保证任何直接调用也在事务开始前完成
+    // 与批量创单完全相同的姓名/证件/出生日期/护照有效期校验，失败不会先消费占位余座。
+    const validatedBody = convertHoldOrderBodySchema.parse(body);
+    const pendingFulfillmentTaskIds: string[] = [];
+    const actorUserId = actor?.userId ?? null;
+    const actorRole = actor?.role === 'STAFF' ? UserRole.STAFF : UserRole.ADMIN;
+    const result = await prisma.$transaction(async (tx) => {
+      await lockHold(tx, id);
+      const existing = await findHold(tx, id);
+      if (!existing) throw new NotFoundError('占位单不存在');
+
+      // 同一占位单上的请求令牌在锁内先查，重试直接回放原订单，绝不再次消费座位或收款。
+      const prior = await tx.holdConversionRecord.findUnique({
+        where: { holdOrderId_requestToken: { holdOrderId: id, requestToken: validatedBody.requestToken } },
+        select: { id: true, orderId: true, seats: true, carryCny: true, requestToken: true },
+      });
+      if (prior) {
+        const priorOrder = await tx.order.findUnique({
+          where: { id: prior.orderId },
+          select: { id: true, orderNumber: true, total: true, paidAmount: true, status: true },
+        });
+        if (!priorOrder) throw new ConflictError('转正记录对应订单不存在，无法安全幂等返回');
+        return {
+          id,
+          holdNo: existing.holdNo,
+          flightScheduleId: existing.flightScheduleId,
+          seatClassId: existing.seatClassId,
+          orderId: priorOrder.id,
+          orderNumber: priorOrder.orderNumber,
+          seats: prior.seats,
+          carryCny: prior.carryCny,
+          remainingSeats: existing.seats - existing.seatsConverted - existing.seatsCancelled,
+          holdStatus: existing.status,
+          orderStatus: priorOrder.status,
+          paidAmount: money(priorOrder.paidAmount),
+          total: money(priorOrder.total),
+          requestToken: prior.requestToken,
+        };
+      }
+      const convertibleStatuses: HoldOrderStatus[] = [
+        HoldOrderStatus.HOLDING,
+        HoldOrderStatus.OVERDUE,
+        HoldOrderStatus.FULLY_PAID,
+      ];
+      if (!convertibleStatuses.includes(existing.status)) {
+        throw new ConflictError(`占位单当前状态不可转正（${HOLD_STATUS_LABEL[existing.status]}）`);
+      }
+
+      const availableSeats = existing.seats - existing.seatsConverted - existing.seatsCancelled;
+      const seatsToConvert = validatedBody.passengers.length;
+      if (seatsToConvert > availableSeats) {
+        throw new ConflictError(`转正人数超过占位余座：当前余 ${Math.max(0, availableSeats)} 座，本次 ${seatsToConvert} 人`);
+      }
+      if (existing.installments.length === 0) throw new BadRequestError('占位单没有收款期，无法结转已收款');
+
+      // 先锁舱位行；随后消费自身占位，CAS 只看到扣除本次占位后的公共净余量。
+      await lockSeatClass(tx, existing.seatClassId);
+      const totalReceived = existing.installments.reduce((sum, item) => sum + activeAllocationTotal(item), 0);
+      const ledger: HoldLedger = { reductions: existing.reductions, conversions: existing.conversions };
+      const perSeatCarry = perSeatAttributableCny(totalReceived, availableSeats, ledger);
+      const carryCny = seatsToConvert * perSeatCarry;
+      const remainingSeats = availableSeats - seatsToConvert;
+
+      await tx.holdOrder.update({
+        where: { id },
+        data: { seatsConverted: { increment: seatsToConvert } },
+      });
+
+      const created = await this.orderService.createHoldConversionOrderWithinTx(tx, {
+        holdOrderId: existing.id,
+        holdNo: existing.holdNo,
+        flightScheduleId: existing.flightScheduleId,
+        cabin: existing.seatClass.cabin as CabinClass,
+        quantity: seatsToConvert,
+        unitPriceCny: existing.perSeatPriceCny,
+        passengers: validatedBody.passengers,
+        contactName: validatedBody.contactName,
+        contactPhone: validatedBody.contactPhone,
+        agentId: existing.agentId,
+        actorUserId,
+        allowDuplicatePassengers: validatedBody.allowDuplicatePassengers === true && (actorRole === UserRole.ADMIN || actorRole === UserRole.STAFF),
+      });
+
+      let paymentId: string | null = null;
+      if (carryCny > 0) {
+        const credited = await this.paymentsService._creditOrderPaymentWithinTx(
+          tx,
+          created.order.id,
+          {
+            amount: carryCny,
+            method: PaymentMethod.BANK_CARD,
+            note: `占位单 ${existing.holdNo} 结转`,
+          },
+          { userId: actorUserId ?? 'system-hold-conversion', role: actorRole },
+          pendingFulfillmentTaskIds,
+        );
+        paymentId = credited.paymentId;
+      }
+
+      // 即使 carryCny=0 也必须走同一套 effectivePayable<=paid 状态机；零价订单按正常订单
+      // 口径推进 PAID，并在同一事务内生成佣金/履约任务。结转款本身不经过 paymentsLocked 闸，
+      // 因为它是占位单已有实收的内部搬账，不是新进账。
+      await this.orderService.advanceOrderToPaidIfClearedWithinTx(
+        tx,
+        created.order.id,
+        { userId: actorUserId ?? 'system-hold-conversion', role: actorRole, actorType: 'USER' },
+        pendingFulfillmentTaskIds,
+      );
+
+      await tx.holdConversionRecord.create({
+        data: {
+          holdOrderId: existing.id,
+          orderId: created.order.id,
+          seats: seatsToConvert,
+          carryCny,
+          paymentId,
+          requestToken: validatedBody.requestToken,
+          createdById: actorUserId ?? 'system',
+        },
+      });
+
+      const attributableAfterCarry = attributableReceivedCny(totalReceived, ledger) - carryCny;
+      const rebased = rebaseInstallmentsForRemainingSeats(
+        existing.installments,
+        remainingSeats,
+        remainingSeats * existing.perSeatPriceCny,
+        attributableAfterCarry,
+        false,
+      );
+      for (const update of rebased.updates) {
+        await tx.holdInstallment.update({
+          where: { holdOrderId_seq: { holdOrderId: id, seq: update.seq } },
+          data: { amountCny: update.amountCny, seatsBasis: update.seatsBasis },
+        });
+      }
+      const syncedInstallments = await syncInstallmentPaidStates(tx, id);
+      for (const installment of syncedInstallments) {
+        if (installment.status === HoldInstallmentStatus.PAID) {
+          await closeOpenHoldDueReminders(tx, installment.id, '转正后本期已结清');
+        }
+      }
+      const derivedStatus = deriveHoldStatus(
+        existing,
+        syncedInstallments,
+        dateInTimezone(new Date(), existing.flightSchedule.departureTz),
+      );
+      const nextStatus = remainingSeats === 0 ? HoldOrderStatus.CONVERTED : derivedStatus;
+      if (nextStatus !== existing.status) {
+        await tx.holdOrder.update({
+          where: { id },
+          data: { status: nextStatus },
+        });
+        if (nextStatus === HoldOrderStatus.CONVERTED) {
+          for (const installment of syncedInstallments) {
+            await closeOpenHoldDueReminders(tx, installment.id, '占位单已全部转正');
+          }
+        }
+      }
+
+      const orderAfter = await tx.order.findUnique({
+        where: { id: created.order.id },
+        select: { id: true, orderNumber: true, total: true, paidAmount: true, status: true },
+      });
+      return {
+        id,
+        holdNo: existing.holdNo,
+        flightScheduleId: existing.flightScheduleId,
+        seatClassId: existing.seatClassId,
+        orderId: created.order.id,
+        orderNumber: orderAfter?.orderNumber ?? created.order.orderNumber,
+        seats: seatsToConvert,
+        carryCny,
+        remainingSeats,
+        holdStatus: nextStatus,
+        orderStatus: orderAfter?.status ?? OrderStatus.PENDING_PAYMENT,
+        paidAmount: money(orderAfter?.paidAmount),
+        total: money(orderAfter?.total),
+        requestToken: validatedBody.requestToken,
+      };
+    });
+
+    await enqueueFulfillmentTasks(pendingFulfillmentTaskIds);
+    auditHold(actor, 'CONVERT_HOLD_ORDER', result, {
+      after: {
+        orderNumber: result.orderNumber,
+        seats: result.seats,
+        carryCny: result.carryCny,
+        remainingSeats: result.remainingSeats,
+        status: result.holdStatus,
+      },
+    });
+    return result;
   }
 
   async getById(id: string) {
     const holdOrder = await findHold(prisma, id);
     if (!holdOrder) throw new NotFoundError('占位单不存在');
-    return holdOrder;
+    return {
+      ...holdOrder,
+      conversions: holdOrder.conversions.map(({ order, ...conversion }) => ({
+        ...conversion,
+        orderNumber: order.orderNumber,
+      })),
+    };
   }
 
   async getConfig() {
@@ -463,11 +799,13 @@ export class HoldOrderService {
         throw new ConflictError('仅存在未认满的尾款期时允许改价；尾款已付请先撤销认款');
       }
       const remainingSeats = existing.seats - existing.seatsConverted - existing.seatsCancelled;
-      const historicalForfeitCny = existing.reductions.reduce((sum, row) => sum + row.forfeitCny, 0);
-      const historicalSurplusCny = existing.reductions.reduce((sum, row) => sum + row.surplusCny, 0);
-      // 计划总额守恒：Σ期应收 = 剩余合同额 + 历史没收 + 历史挂账（历史损益是已实收但
-      // 不再归属剩余人的钱，其所在期金额不随改价缩水，故加回而非扣减——扣减会少收 2L）。
-      const adjustedContractCny = remainingSeats * body.perSeatPriceCny + historicalForfeitCny + historicalSurplusCny;
+      const ledgerTotals = holdLedgerTotals({ reductions: existing.reductions, conversions: existing.conversions });
+      const historicalForfeitCny = ledgerTotals.forfeitCny;
+      const historicalSurplusCny = ledgerTotals.surplusCny;
+      const historicalCarryCny = ledgerTotals.carryCny;
+      // 计划总额守恒：Σ期应收 = 剩余合同额 + 历史没收 + 历史挂账 + 历史结转（这些已实收
+      // 但不再归属剩余人的钱，其所在期金额不随改价缩水，故全部加回而非扣减）。
+      const adjustedContractCny = remainingSeats * body.perSeatPriceCny + historicalForfeitCny + historicalSurplusCny + historicalCarryCny;
       const simulated = existing.installments.map((item) => {
         if (activeAllocationTotal(item) >= item.amountCny) return { ...item };
         if (item.amountRule === HoldAmountRule.PER_PERSON_FIXED) {
@@ -574,6 +912,9 @@ export class HoldOrderService {
       await lockHold(tx, id);
       const hold = await findHold(tx, id);
       if (!hold) throw new NotFoundError('占位单不存在');
+      if (hold.conversions.length > 0) {
+        throw new ConflictError('已有结转到订单的记录，撤销会造成资金重复使用，请先处理订单侧');
+      }
       if (hold.status === HoldOrderStatus.CONVERTED) throw new ConflictError('占位单已转正，不能撤销认款');
       if (hold.reductions.length > 0) throw new ConflictError('占位单已有减员清算记录，不能撤销认款');
       const amount = money(currentAllocation.amountCny);

@@ -752,6 +752,8 @@ model HoldOrder {
   installments       HoldInstallment[]
   receiptAllocations HoldReceiptAllocation[]
   reductions         HoldReductionRecord[]
+  conversions        HoldConversionRecord[]
+  sourceOrders       Order[]              @relation("HoldSourceOrders")
 
   @@index([seatClassId, status])
   @@index([flightScheduleId, status])
@@ -815,6 +817,28 @@ model HoldReductionRecord {
   holdOrder HoldOrder @relation(fields: [holdOrderId], references: [id], onDelete: Cascade)
 
   @@index([holdOrderId])
+}
+
+// 名单导入转正流水：一条记录对应一次从占位单消费若干座位并结转已收款。
+// 订单是独立财务实体；占位单删改不会反向影响订单。
+model HoldConversionRecord {
+  id           String   @id @default(cuid())
+  holdOrderId  String
+  orderId      String
+  seats        Int
+  carryCny     Int
+  paymentId    String?
+  requestToken String
+  createdById  String
+  createdAt    DateTime @default(now())
+
+  holdOrder HoldOrder @relation(fields: [holdOrderId], references: [id], onDelete: Restrict)
+  order     Order     @relation(fields: [orderId], references: [id], onDelete: Restrict)
+
+  @@index([holdOrderId])
+  @@index([orderId])
+  @@index([paymentId])
+  @@unique([holdOrderId, requestToken])
 }
 
 model HoldOrderConfig {
@@ -1376,6 +1400,7 @@ model Order {
   orderNumber          String           @unique // human-friendly, e.g., "FTM2026041400001"
   userId               String? // null for guest (no-login) checkout
   agentId              String? // non-null when placed by an agent
+  sourceHoldOrderId    String? // 由占位单名单转正产生的来源单据
   // 游客下单（免登录）联系人 —— userId=null 时用于公开订单查询匹配 + 履约联系
   guestName            String?
   guestPhone           String?
@@ -1451,6 +1476,7 @@ model Order {
 
   user              User?                 @relation("OrderUser", fields: [userId], references: [id])
   agent             Agent?                @relation(fields: [agentId], references: [id])
+  sourceHoldOrder   HoldOrder?            @relation("HoldSourceOrders", fields: [sourceHoldOrderId], references: [id], onDelete: SetNull)
   claimedBy         User?                 @relation("OrderClaimedBy", fields: [claimedById], references: [id], onDelete: SetNull)
   items             OrderItem[]
   costItems         OrderCostItem[]
@@ -1461,9 +1487,11 @@ model Order {
   commissionRecords CommissionRecord[]
   notifications     NotificationLog[]
   reminders         OperationalReminder[]
+  holdConversions   HoldConversionRecord[]
 
   @@index([userId, createdAt])
   @@index([agentId, createdAt])
+  @@index([sourceHoldOrderId])
   @@index([status])
   @@index([createdAt])
   @@index([claimedById])

@@ -63,6 +63,7 @@ function hold(overrides: Record<string, unknown> = {}) {
     occupyOn: HoldOccupyOn.CREATE,
     status: HoldOrderStatus.HOLDING,
     reductions: [],
+    conversions: [],
     installments: [installment()],
     seatClass: { cabin: 'ECONOMY' },
     flightSchedule: { id: 'schedule_1', departureTime: new Date(), departureTz: 'UTC', flight: { flightNumber: 'CA1' } },
@@ -149,6 +150,23 @@ describe('HoldOrderService installment allocation', () => {
 });
 
 describe('HoldOrderService installment reversal', () => {
+  it('已有转正结转记录时禁止撤销认款，避免同一笔资金被重复使用', async () => {
+    const allocation = { id: 'allocation_1', receiptId: 'receipt_1', holdOrderId: 'hold_1', holdInstallmentId: 'installment_1', amountCny: 100, reversedAt: null };
+    prismaMock.holdReceiptAllocation.findUnique
+      .mockResolvedValueOnce(allocation)
+      .mockResolvedValueOnce(allocation);
+    prismaMock.$queryRaw
+      .mockResolvedValueOnce([receipt({ allocatedCny: 100, status: ReceiptStatus.ALLOCATED })])
+      .mockResolvedValueOnce([{ id: 'hold_1' }]);
+    prismaMock.holdOrder.findUnique.mockResolvedValue(hold({ conversions: [{ carryCny: 100 }] }));
+
+    await expect(
+      service.reverseInstallmentAllocation('hold_1', 'installment_1', 'allocation_1', '挂接错误', { userId: 'user_1' }),
+    ).rejects.toMatchObject({ statusCode: 409, message: expect.stringContaining('资金重复使用') });
+    expect(prismaMock.holdReceiptAllocation.update).not.toHaveBeenCalled();
+    expect(prismaMock.receipt.update).not.toHaveBeenCalled();
+  });
+
   it('撤销认款留痕、扣回 Receipt.allocatedCny，并把期回到 PENDING', async () => {
     const allocation = { id: 'allocation_1', receiptId: 'receipt_1', holdOrderId: 'hold_1', holdInstallmentId: 'installment_1', amountCny: 100, reversedAt: null };
     prismaMock.holdReceiptAllocation.findUnique

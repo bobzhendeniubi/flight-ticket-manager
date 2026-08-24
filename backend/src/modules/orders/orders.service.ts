@@ -93,6 +93,7 @@ import { heldSeatsForCabin } from '../hold-orders/held-seats.js';
 import type {
   BatchCreateOrdersBody,
   AddGroundItemBody,
+  BatchPassengerInput,
   CreateOrderBody,
   ListOrdersQuery,
   OrderItemInput,
@@ -878,6 +879,169 @@ type AutoDiscountSummary = {
 
 export class OrderService {
   private readonly pricing = new PricingService();
+
+  /**
+   * 占位单转正专用的事务内机票建单内核。
+   * 调用方必须先在同一事务里消费 HoldOrder 的余座；本方法只负责复用订单号、订单事件、
+   * 乘客落库、操作费与订单 CAS 扣座，不自行开启嵌套事务，也不改变普通创单路径。
+   */
+  async createHoldConversionOrderWithinTx(
+    tx: Prisma.TransactionClient,
+    input: {
+      holdOrderId: string;
+      holdNo: string;
+      flightScheduleId: string;
+      cabin: CabinClass;
+      quantity: number;
+      unitPriceCny: number;
+      passengers: BatchPassengerInput[];
+      contactName?: string;
+      contactPhone?: string;
+      agentId?: string | null;
+      actorUserId: string | null;
+      allowDuplicatePassengers?: boolean;
+    },
+  ) {
+    if (input.quantity !== input.passengers.length) {
+      throw new BadRequestError(`订单需要 ${input.quantity} 位出行人，当前填了 ${input.passengers.length} 位`);
+    }
+
+    const seenDocuments = new Set<string>();
+    const duplicateDocuments = new Set<string>();
+    for (const passenger of input.passengers) {
+      if (seenDocuments.has(passenger.documentNumber)) duplicateDocuments.add(passenger.documentNumber);
+      seenDocuments.add(passenger.documentNumber);
+    }
+    if (duplicateDocuments.size > 0) {
+      throw new BadRequestError(`名单内证件号重复：${[...duplicateDocuments].join('、')}`);
+    }
+
+    const allowDuplicate = input.allowDuplicatePassengers === true;
+    const conflicts = await tx.passenger.findMany({
+      where: {
+        documentNumber: { in: [...new Set(input.passengers.map((p) => p.documentNumber))] },
+        order: {
+          status: { in: SEAT_HOLDING_STATUSES },
+          items: { some: { flightScheduleId: input.flightScheduleId } },
+        },
+      },
+      select: { documentNumber: true, order: { select: { orderNumber: true } } },
+    });
+    const conflictsByDocument = new Map<string, Set<string>>();
+    for (const conflict of conflicts) {
+      const orderNumbers = conflictsByDocument.get(conflict.documentNumber) ?? new Set<string>();
+      orderNumbers.add(conflict.order.orderNumber);
+      conflictsByDocument.set(conflict.documentNumber, orderNumbers);
+    }
+    const conflictList = [...conflictsByDocument.entries()].map(([documentNumber, orderNumbers]) => ({
+      documentNumber,
+      orderNumbers: [...orderNumbers],
+    }));
+    if (conflictList.length > 0 && !allowDuplicate) {
+      const detail = conflictList
+        .map((item) => `${item.documentNumber}（订单 ${item.orderNumbers.join('、')}）`)
+        .join('；');
+      throw new DuplicatePassengerError(`以下乘客证件号已在同航班的有效订单中，不能重复下单：${detail}`, { conflicts: conflictList });
+    }
+
+    const orderNumber = await generateOrderNumber();
+    const contactName = input.contactName?.trim() || '系统录入';
+    const contactPhone = input.contactPhone?.trim() || '-';
+    const duplicateNote = conflictList.length > 0
+      ? `重复乘客强录：与订单 ${[...new Set(conflictList.flatMap((item) => item.orderNumbers))].join('、')} 同班次同证件号`
+      : null;
+    const order = await tx.order.create({
+      data: {
+        orderNumber,
+        userId: null,
+        agentId: input.agentId ?? null,
+        sourceHoldOrderId: input.holdOrderId,
+        status: OrderStatus.PENDING_PAYMENT,
+        currency: 'CNY',
+        subtotal: new Prisma.Decimal(input.quantity * input.unitPriceCny),
+        total: new Prisma.Decimal(input.quantity * input.unitPriceCny),
+        contactName,
+        contactPhone,
+        notes: [
+          `占位单 ${input.holdNo} 转正`,
+          duplicateNote,
+        ].filter(Boolean).join(' · '),
+        items: {
+          create: {
+            kind: OrderItemKind.FLIGHT,
+            description: `${input.holdNo} 转正机票`,
+            quantity: input.quantity,
+            unitPrice: new Prisma.Decimal(input.unitPriceCny),
+            amount: new Prisma.Decimal(input.quantity * input.unitPriceCny),
+            flightScheduleId: input.flightScheduleId,
+            flightCabin: input.cabin,
+          },
+        },
+        passengers: {
+          create: input.passengers.map((passenger) => passengerToData(passenger)),
+        },
+        statusEvents: {
+          create: {
+            fromStatus: null,
+            toStatus: OrderStatus.PENDING_PAYMENT,
+            actorUserId: input.actorUserId,
+            reason: `占位单 ${input.holdNo} 名单转正创建订单`,
+          },
+        },
+      },
+      include: { items: true, passengers: true, statusEvents: true },
+    });
+
+    await tx.orderCostItem.create({
+      data: {
+        orderId: order.id,
+        category: 'OPERATION_FEE',
+        amountCny: new Prisma.Decimal(OPERATION_FEE_CNY_PER_ORDER),
+        note: '系统自动计提（每单固定操作费）',
+      },
+    });
+
+    // HoldOrder.seatsConverted 已先于此调用增加，heldSeatsForCabin 已扣除本次消费的占位余座。
+    // CAS 失败说明库存账本不变量被破坏，直接抛错让整个转正事务回滚。
+    await takeSeatWithinTx(tx, input.flightScheduleId, input.cabin, input.quantity, null);
+    await syncOrderHasReturnLeg(tx, order.id);
+    // 普通创单在事务内的签证任务内核：转正订单也必须从创建时进入签证台，不能等到
+    // 事务提交后补写，避免订单已可见但履约台漏任务。
+    await createVisaTaskAtCreation(tx, order.id);
+    return { order, duplicateConflicts: conflictList };
+  }
+
+  /**
+   * 转正专用的正常收款状态收口。调用方无论是否实际生成结转 Payment 都必须调用：
+   * carryCny=0 的零价订单同样按 effectivePayable <= paidAmount 推进 PAID。
+   */
+  async advanceOrderToPaidIfClearedWithinTx(
+    tx: Prisma.TransactionClient,
+    orderId: string,
+    requester: OrderRequester,
+    pendingFulfillmentTaskIds: string[],
+  ): Promise<{ fullyPaid: boolean; status: OrderStatus }> {
+    const order = await tx.order.findUnique({
+      where: { id: orderId },
+      select: { status: true, total: true, adjustmentCny: true, paidAmount: true, prepaymentOffset: true },
+    });
+    if (!order) throw new NotFoundError('订单不存在');
+    const effectivePayable = Number(order.total) + order.adjustmentCny;
+    const paid = Number(order.paidAmount) + Number(order.prepaymentOffset);
+    const fullyPaid = paid + 0.001 >= effectivePayable;
+    if (fullyPaid && order.status === OrderStatus.PENDING_PAYMENT) {
+      await this._updateStatusWithinTx(
+        tx,
+        orderId,
+        OrderStatus.PAID,
+        requester,
+        '占位单结转后订单已结清',
+        pendingFulfillmentTaskIds,
+      );
+      return { fullyPaid: true, status: OrderStatus.PAID };
+    }
+    return { fullyPaid, status: order.status };
+  }
 
   // ════════════════════════════════════════════════════════════════════
   // 下单
@@ -9087,7 +9251,7 @@ export function computeRequiredPassengerCount(items: OrderItemInput[]): number {
  *
  * @param excludeUserId 排除其本人锁位不挡自己（下单场景用）；改期由运营操作 → 传 null（所有他人锁位都占余票）。
  */
-async function takeSeatWithinTx(
+export async function takeSeatWithinTx(
   tx: Prisma.TransactionClient,
   scheduleId: string,
   cabin: import('@prisma/client').CabinClass,

@@ -1003,6 +1003,32 @@ export interface HoldReceiptAllocation {
   createdAt: string;
 }
 
+export interface HoldReductionRecord {
+  id: string;
+  seatsReduced: number;
+  freeSeats: number;
+  forfeitSeats: number;
+  perSeatPaidCny: number;
+  forfeitCny: number;
+  creditCny: number;
+  surplusCny: number;
+  note: string | null;
+  createdById: string;
+  createdAt: string;
+}
+
+export interface HoldConversionRecord {
+  id: string;
+  orderId: string;
+  orderNumber: string;
+  seats: number;
+  carryCny: number;
+  paymentId: string | null;
+  requestToken: string;
+  createdById: string;
+  createdAt: string;
+}
+
 export interface HoldReductionPreview {
   seatsReduced: number;
   freeSeats: number;
@@ -1060,6 +1086,8 @@ export interface HoldOrderRecord {
   occupyOn: HoldOccupyOn;
   status: HoldOrderStatus;
   installments: HoldInstallment[];
+  reductions: HoldReductionRecord[];
+  conversions: HoldConversionRecord[];
   notes: string | null;
   createdById: string;
   releasedAt: string | null;
@@ -1083,6 +1111,14 @@ export interface HoldOrderConfig {
   installments: HoldInstallmentTemplate[];
   overdueAction: HoldOverdueAction;
   defaultFreeCancelRatio: number;
+}
+
+export interface HoldOrderSummary {
+  occupiedOrderCount: number;
+  occupiedSeats: number;
+  overdueOrderCount: number;
+  fullyPaidPendingConversionCount: number;
+  receivedCny: number;
 }
 
 // ── Orders ────────────────────────────────────────────────────────────────
@@ -3156,6 +3192,45 @@ export const api = {
     const qs = params.toString() ? `?${params.toString()}` : '';
     return apiFetch<{ holdOrders: HoldOrderListItem[] }>(`/hold-orders/${qs}`, { token });
   },
+  getHoldOrderSummary: (
+    token: string,
+    filter?: { flightScheduleId?: string; status?: HoldOrderStatus; agentId?: string },
+  ) => {
+    const params = new URLSearchParams();
+    if (filter?.flightScheduleId) params.set('flightScheduleId', filter.flightScheduleId);
+    if (filter?.status) params.set('status', filter.status);
+    if (filter?.agentId) params.set('agentId', filter.agentId);
+    const qs = params.toString() ? `?${params.toString()}` : '';
+    return apiFetch<{ summary: HoldOrderSummary }>(`/hold-orders/summary${qs}`, { token });
+  },
+  convertHoldOrder: (
+    token: string,
+    holdId: string,
+    body: {
+      requestToken: string;
+      passengers: BatchOrderPassenger[];
+      contactName?: string;
+      contactPhone?: string;
+      allowDuplicatePassengers?: boolean;
+    },
+  ) => apiFetch<{ result: {
+    id: string;
+    orderId: string;
+    orderNumber: string;
+    seats: number;
+    carryCny: number;
+    remainingSeats: number;
+    holdStatus: HoldOrderStatus;
+    orderStatus: OrderStatus;
+    paidAmount: number;
+    total: number;
+    requestToken: string;
+  } }>(`/hold-orders/${holdId}/convert`, { method: 'POST', token, body }),
+  previewHoldConversion: (token: string, holdId: string, seats: number) =>
+    apiFetch<{ preview: { perSeatCarry: number; carryCny: number; orderDueCny: number } }>(
+      `/hold-orders/${holdId}/convert/preview`,
+      { method: 'POST', token, body: { seats } },
+    ),
   getHoldOrderConfig: (token: string) =>
     apiFetch<{ config: HoldOrderConfig }>('/hold-orders/config', { token }),
   updateHoldOrderConfig: (token: string, body: Omit<HoldOrderConfig, 'id'>) =>

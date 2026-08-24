@@ -17,6 +17,8 @@ import {
   type HoldOrderConfig,
   type HoldInstallment,
   type HoldReductionPreview,
+  type HoldOrderSummary,
+  type BatchOrderPassenger,
   type Receipt,
 } from '../lib/api';
 import { CABIN_LABEL, formatLocalDate, formatLocalTime } from '../lib/airports';
@@ -85,6 +87,24 @@ function ownerLabel(order: HoldOrderListItem): string {
   return order.groupName || '直客';
 }
 
+function KpiCard({ label, value, tone }: { label: string; value: string; tone: 'success' | 'warning' | 'info' | 'neutral' }) {
+  const toneClass = {
+    success: 'border-emerald-200 bg-emerald-50 text-emerald-800',
+    warning: 'border-amber-200 bg-amber-50 text-amber-800',
+    info: 'border-sky-200 bg-sky-50 text-sky-800',
+    neutral: 'border-slate-200 bg-white text-slate-800',
+  }[tone];
+  return <div className={`card border ${toneClass}`}><div className="text-xs text-ink-muted">{label}</div><div className="mt-1 text-xl font-semibold nums">{value}</div></div>;
+}
+
+function newConversionRequestToken(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
+  const hex = Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16));
+  hex[12] = '4';
+  hex[16] = ((Number.parseInt(hex[16], 16) & 0x3) | 0x8).toString(16);
+  return `${hex.slice(0, 8).join('')}-${hex.slice(8, 12).join('')}-${hex.slice(12, 16).join('')}-${hex.slice(16, 20).join('')}-${hex.slice(20).join('')}`;
+}
+
 export function HoldOrdersPage() {
   const tokens = useAuth((s) => s.tokens);
   const user = useAuth((s) => s.user);
@@ -95,6 +115,8 @@ export function HoldOrdersPage() {
   const [selectedFlightId, setSelectedFlightId] = useState('');
   const [selectedScheduleId, setSelectedScheduleId] = useState('');
   const [orders, setOrders] = useState<HoldOrderListItem[]>([]);
+  const [summary, setSummary] = useState<HoldOrderSummary>({ occupiedOrderCount: 0, occupiedSeats: 0, overdueOrderCount: 0, fullyPaidPendingConversionCount: 0, receivedCny: 0 });
+  const [statusFilter, setStatusFilter] = useState<'' | HoldOrderStatus>('');
   const [loading, setLoading] = useState(true);
   const [listLoading, setListLoading] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -103,6 +125,7 @@ export function HoldOrdersPage() {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [reduceOrder, setReduceOrder] = useState<HoldOrderListItem | null>(null);
   const [allocateTarget, setAllocateTarget] = useState<{ order: HoldOrderListItem; installment: HoldInstallment } | null>(null);
+  const [convertOrder, setConvertOrder] = useState<HoldOrderListItem | null>(null);
   const [holdConfig, setHoldConfig] = useState<HoldOrderConfig | null>(null);
   const [showConfig, setShowConfig] = useState(false);
   const [flash, setFlash] = useState<string | null>(null);
@@ -192,14 +215,19 @@ export function HoldOrdersPage() {
     }
     setListLoading(true);
     try {
-      const result = await api.listHoldOrders(tokens.accessToken, { flightScheduleId: selectedScheduleId });
+      const filter = { flightScheduleId: selectedScheduleId, ...(statusFilter ? { status: statusFilter } : {}) };
+      const [result, kpis] = await Promise.all([
+        api.listHoldOrders(tokens.accessToken, filter),
+        api.getHoldOrderSummary(tokens.accessToken, filter),
+      ]);
       setOrders(result.holdOrders);
+      setSummary(kpis.summary);
     } catch (err) {
       setError(err instanceof Error ? err.message : '加载占位单失败');
     } finally {
       setListLoading(false);
     }
-  }, [tokens, selectedScheduleId]);
+  }, [tokens, selectedScheduleId, statusFilter]);
 
   useEffect(() => { void reload(); }, [reload]);
 
@@ -245,8 +273,15 @@ export function HoldOrdersPage() {
         <p className="page-sub">为旅游团、代理或直客临时锁定无名单库存；释放或取消后座位回到公共库存。</p>
       </section>
 
+      <section className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+        <KpiCard label="占座中" value={`${summary.occupiedOrderCount} 单 · ${summary.occupiedSeats} 座`} tone="success" />
+        <KpiCard label="逾期占座" value={`${summary.overdueOrderCount} 单`} tone="warning" />
+        <KpiCard label="全款待转正" value={`${summary.fullyPaidPendingConversionCount} 单`} tone="info" />
+        <KpiCard label="本页合计已收" value={`¥${summary.receivedCny.toLocaleString()}`} tone="neutral" />
+      </section>
+
       <section className="card">
-        <div className="grid gap-3 md:grid-cols-[1fr_1fr_1fr_auto]">
+        <div className="grid gap-3 md:grid-cols-[1fr_1fr_1fr_1fr_auto]">
           <div>
             <label className="label">出发日期</label>
             <select className="input" value={selectedDate} onChange={(e) => setSelectedDate(e.target.value)}>
@@ -263,6 +298,13 @@ export function HoldOrdersPage() {
             <label className="label">班次时刻</label>
             <select className="input" value={selectedScheduleId} onChange={(e) => setSelectedScheduleId(e.target.value)}>
               {daySchedules.map((schedule) => <option key={schedule.id} value={schedule.id}>{formatLocalTime(schedule.departureTime, schedule.departureTz)} 出发</option>)}
+            </select>
+          </div>
+          <div>
+            <label className="label">状态筛选</label>
+            <select className="input" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value as '' | HoldOrderStatus)}>
+              <option value="">全部状态</option>
+              {(Object.keys(STATUS_LABEL) as HoldOrderStatus[]).map((status) => <option key={status} value={status}>{STATUS_LABEL[status]}</option>)}
             </select>
           </div>
           <div className="flex items-end">
@@ -295,9 +337,11 @@ export function HoldOrdersPage() {
               {!listLoading && orders.length === 0 && <tr><td colSpan={8} className="py-5 text-center text-ink-muted">该班次暂无占位单</td></tr>}
               {orders.map((order) => {
                 const holding = order.status === 'HOLDING' || order.status === 'OVERDUE' || order.status === 'FULLY_PAID';
+                const remainingSeats = order.seats - order.seatsConverted - order.seatsCancelled;
                 const canRelease = order.status === 'PENDING' || holding;
                 const canCancel = order.status === 'PENDING' || holding;
                 const canReduce = order.status === 'PENDING' || holding;
+                const canConvert = holding && remainingSeats > 0;
                 const waitingOccupy = order.status === 'PENDING' && order.occupyOn === 'FULL_PAYMENT' && order.installments.length > 0 && order.installments.every((item) => item.amountCny === 0 || item.allocations.filter((allocation) => !allocation.reversedAt).reduce((sum, allocation) => sum + Number(allocation.amountCny), 0) >= item.amountCny);
                 return (
                   <Fragment key={order.id}>
@@ -305,12 +349,13 @@ export function HoldOrdersPage() {
                     <td className="font-mono text-xs">{order.holdNo}</td>
                     <td><div className="font-medium">{ownerLabel(order)}</div><div className="text-xs text-ink-muted">{order.ownerType === 'AGENT' ? '代理' : '直客'}</div></td>
                     <td><span className="badge-neutral">{CABIN_LABEL[order.seatClass.cabin] ?? order.seatClass.cabin}</span></td>
-                    <td className="text-right nums">{order.seats - order.seatsConverted - order.seatsCancelled}/{order.seats}</td>
+                    <td className="text-right nums">{remainingSeats}/{order.seats}</td>
                     <td className="text-right nums">¥{order.perSeatPriceCny}/人</td>
                     <td><button type="button" className={STATUS_BADGE[order.status]} onClick={() => setExpandedId(expandedId === order.id ? null : order.id)}>{STATUS_LABEL[order.status]} · 期表</button>{waitingOccupy && <div className="mt-1 text-xs font-semibold text-amber-700">已收全款，待占座</div>}</td>
                     <td className="text-xs text-ink-muted">{new Date(order.createdAt).toLocaleString('zh-CN')}</td>
                     <td className="whitespace-nowrap text-right">
                       <button className="mr-2 text-xs font-medium text-brand-700 disabled:text-ink-muted" disabled={!holding || busy} onClick={() => setPriceOrder(order)}>改价</button>
+                      {canConvert && <button className={`mr-2 text-xs font-semibold disabled:text-ink-muted ${order.status === 'FULLY_PAID' ? 'btn-primary px-2 py-1' : 'text-brand-700'}`} disabled={busy} onClick={() => setConvertOrder(order)}>导入名单转正</button>}
                       <button className="mr-2 text-xs font-medium text-amber-700 disabled:text-ink-muted" disabled={!canRelease || busy} onClick={() => void runAction(order, 'release')}>释放</button>
                       <button className="mr-2 text-xs font-medium text-brand-700 disabled:text-ink-muted" disabled={!canReduce || busy} onClick={() => setReduceOrder(order)}>减员</button>
                       {waitingOccupy && <button className="mr-2 text-xs font-semibold text-amber-700 disabled:text-ink-muted" disabled={busy} onClick={() => void retryOccupy(order)}>重试占座</button>}
@@ -321,6 +366,7 @@ export function HoldOrdersPage() {
                     <tr className={order.status === 'OVERDUE' ? 'bg-rose-50/70' : 'bg-slate-50/70'}>
                       <td colSpan={8} className="px-5 py-3">
                         <InstallmentTable order={order} onAllocate={(installment) => setAllocateTarget({ order, installment })} onReload={reload} />
+                        <HoldLedgerDetails order={order} />
                       </td>
                     </tr>
                   )}
@@ -372,6 +418,18 @@ export function HoldOrdersPage() {
       )}
       {reduceOrder && tokens && (
         <ReduceModal order={reduceOrder} token={tokens.accessToken} onCancel={() => setReduceOrder(null)} onDone={async () => { setReduceOrder(null); await Promise.all([reload(), reloadSchedules()]); notify('减员清算已完成，座位已回池'); }} />
+      )}
+      {convertOrder && tokens && (
+        <ConvertModal
+          order={convertOrder}
+          token={tokens.accessToken}
+          onCancel={() => setConvertOrder(null)}
+          onDone={async (result) => {
+            setConvertOrder(null);
+            await Promise.all([reload(), reloadSchedules()]);
+            notify(`已转正 ${result.seats} 座，结转 ¥${result.carryCny.toLocaleString()}，订单 ${result.orderNumber}`);
+          }}
+        />
       )}
       {allocateTarget && tokens && (
         <AllocateModal order={allocateTarget.order} installment={allocateTarget.installment} token={tokens.accessToken} onCancel={() => setAllocateTarget(null)} onDone={async (warning) => { setAllocateTarget(null); await reload(); notify(warning ?? '认款已记录'); }} />
@@ -498,6 +556,117 @@ function InstallmentTable({ order, onAllocate, onReload }: { order: HoldOrderLis
       </tbody></table>
     </div>
   );
+}
+
+function HoldLedgerDetails({ order }: { order: HoldOrderListItem }) {
+  const conversions = order.conversions ?? [];
+  const reductions = order.reductions ?? [];
+  return (
+    <div className="mt-4 grid gap-4 border-t border-slate-200 pt-3 text-xs md:grid-cols-2">
+      <div>
+        <div className="mb-1 font-semibold text-ink-soft">转正记录</div>
+        {conversions.length === 0 ? <div className="text-ink-muted">暂无</div> : <ul className="space-y-1 text-ink-muted">
+          {conversions.map((row) => <li key={row.id}>订单 <span className="font-mono text-brand-700">{row.orderNumber}</span> · {row.seats} 座 · 结转 ¥{row.carryCny.toLocaleString()} · {new Date(row.createdAt).toLocaleString('zh-CN')}</li>)}
+        </ul>}
+      </div>
+      <div>
+        <div className="mb-1 font-semibold text-ink-soft">清算记录</div>
+        {reductions.length === 0 ? <div className="text-ink-muted">暂无</div> : <ul className="space-y-1 text-ink-muted">
+          {reductions.map((row) => <li key={row.id}>{row.seatsReduced} 座 · 免损 {row.freeSeats} · 没收 ¥{row.forfeitCny.toLocaleString()} · 挂账 ¥{row.surplusCny.toLocaleString()} · {new Date(row.createdAt).toLocaleString('zh-CN')}</li>)}
+        </ul>}
+      </div>
+    </div>
+  );
+}
+
+type ConversionResult = {
+  orderNumber: string;
+  seats: number;
+  carryCny: number;
+};
+
+function ConvertModal({
+  order,
+  token,
+  onCancel,
+  onDone,
+}: {
+  order: HoldOrderListItem;
+  token: string;
+  onCancel: () => void;
+  onDone: (result: ConversionResult) => Promise<void>;
+}) {
+  const remaining = order.seats - order.seatsConverted - order.seatsCancelled;
+  const [requestToken] = useState(newConversionRequestToken);
+  const [rows, setRows] = useState<BatchOrderPassenger[]>([{ fullName: '', documentNumber: '', dateOfBirth: '', passportExpiry: '', nationality: 'CN' }]);
+  const [contactName, setContactName] = useState(order.groupName ?? '');
+  const [contactPhone, setContactPhone] = useState('');
+  const [allowDuplicate, setAllowDuplicate] = useState(false);
+  const [pasteText, setPasteText] = useState('');
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [preview, setPreview] = useState<{ perSeatCarry: number; carryCny: number; orderDueCny: number } | null>(null);
+  const [previewBusy, setPreviewBusy] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    setPreviewBusy(true);
+    api.previewHoldConversion(token, order.id, rows.length)
+      .then((result) => { if (!cancelled) setPreview(result.preview); })
+      .catch((err) => { if (!cancelled) setError(err instanceof Error ? err.message : '加载转正试算失败'); })
+      .finally(() => { if (!cancelled) setPreviewBusy(false); });
+    return () => { cancelled = true; };
+  }, [token, order.id, rows.length]);
+
+  const carry = preview?.carryCny ?? 0;
+  const orderDue = preview?.orderDueCny ?? 0;
+
+  const setRow = (index: number, patch: Partial<BatchOrderPassenger>) => setRows((old) => old.map((row, i) => i === index ? { ...row, ...patch } : row));
+  const addRow = () => { if (rows.length < remaining) setRows((old) => [...old, { fullName: '', documentNumber: '', dateOfBirth: '', passportExpiry: '', nationality: 'CN' }]); };
+  const removeRow = (index: number) => setRows((old) => old.length <= 1 ? old : old.filter((_, i) => i !== index));
+  const parsePaste = () => {
+    const parsed = pasteText.split('\n').map((line) => line.trim()).filter(Boolean).map((line) => {
+      const cols = line.split(/[,，\t]+|\s{2,}|\s+/).map((col) => col.trim()).filter(Boolean);
+      return { fullName: cols[0] ?? '', documentNumber: cols[1] ?? '', dateOfBirth: cols[2] ?? '', passportExpiry: cols[3] ?? '', nationality: 'CN' };
+    }).filter((row) => row.fullName);
+    if (parsed.length === 0) { setError('没有解析出乘客行'); return; }
+    setRows(parsed.slice(0, remaining));
+    if (parsed.length > remaining) setError(`名单超过余座，已保留前 ${remaining} 行`);
+  };
+
+  const submit = async () => {
+    if (rows.length < 1 || rows.length > remaining) { setError(`本次人数必须在 1 至 ${remaining} 人之间`); return; }
+    const invalid = rows.findIndex((row) => !row.fullName.trim() || !row.documentNumber.trim() || !/^\d{4}-\d{2}-\d{2}$/.test(row.dateOfBirth) || !/^\d{4}-\d{2}-\d{2}$/.test(row.passportExpiry ?? ''));
+    if (invalid >= 0) { setError(`第 ${invalid + 1} 位请填写姓名、证件号、出生日期和护照有效期（YYYY-MM-DD）`); return; }
+    setBusy(true); setError(null);
+    try {
+      const result = await api.convertHoldOrder(token, order.id, {
+        requestToken,
+        passengers: rows,
+        ...(contactName.trim() ? { contactName: contactName.trim() } : {}),
+        ...(contactPhone.trim() ? { contactPhone: contactPhone.trim() } : {}),
+        ...(allowDuplicate ? { allowDuplicatePassengers: true } : {}),
+      });
+      await onDone(result.result);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '转正失败');
+    } finally { setBusy(false); }
+  };
+
+  return <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-slate-900/50 p-4" onClick={onCancel}>
+    <div className="my-8 w-full max-w-5xl rounded-lg bg-white shadow-xl" onClick={(e) => e.stopPropagation()}>
+      <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3"><h2 className="text-lg font-semibold">导入名单转正 · {order.holdNo}</h2><button onClick={onCancel} className="text-xl text-slate-400">×</button></div>
+      <div className="space-y-4 px-5 py-4">
+        <div className="grid gap-3 rounded-lg bg-slate-50 p-3 text-sm sm:grid-cols-3"><div>本次转正 <b>{rows.length}</b> 座</div><div>结转 <b className="text-emerald-700">{previewBusy ? '试算中…' : `¥${carry.toLocaleString()}`}</b></div><div>订单待收 <b className="text-amber-700">{previewBusy ? '试算中…' : `¥${orderDue.toLocaleString()}`}</b></div></div>
+        <div className="flex flex-wrap gap-3"><input className="input max-w-xs" placeholder="联系人（选填）" value={contactName} onChange={(e) => setContactName(e.target.value)} /><input className="input max-w-xs" placeholder="联系电话（选填）" value={contactPhone} onChange={(e) => setContactPhone(e.target.value)} /><label className="flex items-center gap-2 text-sm text-ink-soft"><input type="checkbox" checked={allowDuplicate} onChange={(e) => setAllowDuplicate(e.target.checked)} />确认允许重复乘客</label></div>
+        <div className="overflow-x-auto rounded border border-slate-200"><table className="min-w-[850px] w-full text-xs"><thead className="bg-slate-50 text-ink-muted"><tr><th className="px-2 py-2 text-left">姓名</th><th className="px-2 py-2 text-left">证件号</th><th className="px-2 py-2 text-left">出生日期</th><th className="px-2 py-2 text-left">护照有效期 *</th><th className="px-2 py-2 text-left">国籍</th><th></th></tr></thead><tbody>{rows.map((row, index) => <tr key={index} className="border-t border-slate-100"><td className="px-2 py-1"><input className="input h-8" value={row.fullName} onChange={(e) => setRow(index, { fullName: e.target.value })} /></td><td className="px-2 py-1"><input className="input h-8" value={row.documentNumber} onChange={(e) => setRow(index, { documentNumber: e.target.value })} /></td><td className="px-2 py-1"><input className="input h-8" type="date" value={row.dateOfBirth} onChange={(e) => setRow(index, { dateOfBirth: e.target.value })} /></td><td className="px-2 py-1"><input className="input h-8" type="date" value={row.passportExpiry ?? ''} onChange={(e) => setRow(index, { passportExpiry: e.target.value })} /></td><td className="px-2 py-1"><input className="input h-8 w-20" value={row.nationality ?? 'CN'} onChange={(e) => setRow(index, { nationality: e.target.value.toUpperCase() })} /></td><td className="px-2 py-1"><button className="text-rose-600" onClick={() => removeRow(index)}>删除</button></td></tr>)}</tbody></table></div>
+        <div className="flex flex-wrap items-center gap-3"><button className="btn-secondary text-sm" disabled={rows.length >= remaining} onClick={addRow}>＋ 加一行</button><button className="btn-secondary text-sm" disabled={!pasteText.trim()} onClick={parsePaste}>解析粘贴名单</button><span className="text-xs text-ink-muted">快速粘贴格式：姓名,证件号,出生日期,护照有效期</span></div>
+        <textarea className="input min-h-20 font-mono text-xs" value={pasteText} onChange={(e) => setPasteText(e.target.value)} placeholder="张三,E12345678,1990-01-01,2030-01-01" />
+        {error && <p className="rounded bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p>}
+        <div className="flex justify-end gap-3"><button className="btn-secondary" onClick={onCancel}>取消</button><button className="btn-primary" disabled={busy || rows.length < 1 || rows.length > remaining} onClick={() => void submit()}>{busy ? '转正中…' : '确认导入转正'}</button></div>
+      </div>
+    </div>
+  </div>;
 }
 
 function AllocateModal({ order, installment, token, onCancel, onDone }: { order: HoldOrderListItem; installment: HoldInstallment; token: string; onCancel: () => void; onDone: (warning: string | null) => Promise<void> }) {

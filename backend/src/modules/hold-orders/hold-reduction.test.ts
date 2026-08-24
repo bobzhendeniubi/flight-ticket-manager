@@ -39,6 +39,7 @@ interface FirstPrinciplesExpected {
   forfeitCny: number;
   creditCny: number;
   surplusCny: number;
+  carryCny?: number;
 }
 
 /** 只用输入实收、历史清算记录和合同额验证第一性等式，不复刻清算实现的中间推导。 */
@@ -52,7 +53,8 @@ function assertFirstPrinciples(
   const totalReceived = installments.reduce((sum, item) => sum + activeReceived(item), 0);
   const historicalForfeit = (hold.reductions ?? []).reduce((sum, row) => sum + (row.forfeitCny ?? 0), 0);
   const historicalSurplus = (hold.reductions ?? []).reduce((sum, row) => sum + (row.surplusCny ?? 0), 0);
-  const attributable = totalReceived - historicalForfeit - historicalSurplus - result.forfeitCny - result.surplusCny;
+  const historicalCarry = (hold.conversions ?? []).reduce((sum, row) => sum + (row.carryCny ?? 0), 0);
+  const attributable = totalReceived - historicalForfeit - historicalSurplus - historicalCarry - result.forfeitCny - result.surplusCny;
   const finalInstallments = installments.map((item) => {
     const update = result.installmentUpdates.find((candidate) => candidate.seq === item.seq);
     return { ...item, amountCny: update?.amountCny ?? item.amountCny };
@@ -67,12 +69,13 @@ function assertFirstPrinciples(
   expect(result.forfeitCny).toBe(expected.forfeitCny);
   expect(result.creditCny).toBe(expected.creditCny);
   expect(result.surplusCny).toBe(expected.surplusCny);
+  expect(historicalCarry).toBe(expected.carryCny ?? 0);
   expect(attributable).toBe(expected.attributable);
   expect(unpaidReceivable).toBe(expected.unpaidReceivable);
 
-  // 总实收 = 历史没收 + 历史挂账 + 本次没收 + 本次挂账 + 可归属实收
+  // 总实收 = 没收累计 + 挂账累计 + 结转累计 + 可归属实收
   expect(totalReceived).toBe(
-    historicalForfeit + historicalSurplus + result.forfeitCny + result.surplusCny + attributable,
+    historicalForfeit + historicalSurplus + historicalCarry + result.forfeitCny + result.surplusCny + attributable,
   );
   // Σ未付期（应收−已认） + 可归属实收 = 剩余合同额
   expect(unpaidReceivable + attributable).toBe(remainingContract);
@@ -85,6 +88,7 @@ describe('computeReduction · D2/D3 守恒不变量', () => {
     ['尾款已付全损', baseHold({ freeCancelRatio: 0.5 }), plan([{}, {}, { status: HoldInstallmentStatus.PAID, amountCny: 4000, allocations: [allocation(4000)] }]), 2, { totalReceived: 7000, attributable: 5600, unpaidReceivable: 2400, freeSeats: 0, forfeitSeats: 2, perSeatPaidCny: 700, forfeitCny: 1400, creditCny: 0, surplusCny: 0 }],
     ['非整除尾款', baseHold({ freeCancelRatio: 0, perSeatPriceCny: 100 }), [{ seq: 1, amountRule: HoldAmountRule.REMAINDER, perPersonCny: null, amountCny: 1001, seatsBasis: 10, status: HoldInstallmentStatus.PAID, allocations: [allocation(1001)] }], 1, { totalReceived: 1001, attributable: 900, unpaidReceivable: 0, freeSeats: 0, forfeitSeats: 1, perSeatPaidCny: 100, forfeitCny: 100, creditCny: 0, surplusCny: 1 }],
     ['历史损失后重算', baseHold({ freeCancelRatio: 0, seatsCancelled: 2, freeCancelUsed: 1, reductions: [{ forfeitCny: 200, surplusCny: 100 }] }), plan(), 1, { totalReceived: 3000, attributable: 2363, unpaidReceivable: 4637, freeSeats: 0, forfeitSeats: 1, perSeatPaidCny: 337, forfeitCny: 337, creditCny: 0, surplusCny: 0 }],
+    ['转正后再减员（含结转）', baseHold({ freeCancelRatio: 0, seatsConverted: 2, conversions: [{ carryCny: 600 }] }), plan(), 1, { totalReceived: 3000, attributable: 2100, unpaidReceivable: 4900, freeSeats: 0, forfeitSeats: 1, perSeatPaidCny: 300, forfeitCny: 300, creditCny: 0, surplusCny: 0, carryCny: 600 }],
   ])('%s：第一性等式守恒', (_label, hold, installments, n, expected) => {
     const result = computeReduction(hold, installments, n);
     assertFirstPrinciples(hold, installments, n, result, expected);

@@ -6,6 +6,7 @@ import {
   HoldOwnerType,
 } from '@prisma/client';
 import { z } from 'zod';
+import { batchPassengerInputSchema } from '../orders/orders.schemas.js';
 
 const cabinSchema = z.nativeEnum(CabinClass);
 const ownerTypeSchema = z.nativeEnum(HoldOwnerType);
@@ -69,6 +70,20 @@ export const listHoldOrdersQuerySchema = z.object({
   agentId: z.string().min(1).optional(),
 });
 export type ListHoldOrdersQuery = z.infer<typeof listHoldOrdersQuerySchema>;
+
+export const convertHoldOrderBodySchema = z.object({
+  requestToken: z.string().min(8).max(64).uuid(),
+  passengers: z.array(batchPassengerInputSchema).min(1).max(100),
+  contactName: z.preprocess((v) => (v === '' ? undefined : v), z.string().trim().min(1).max(120).optional()),
+  contactPhone: z.preprocess((v) => (v === '' ? undefined : v), z.string().trim().min(5).max(40).optional()),
+  allowDuplicatePassengers: z.boolean().optional(),
+});
+export type ConvertHoldOrderBody = z.infer<typeof convertHoldOrderBodySchema>;
+
+export const previewConvertHoldOrderBodySchema = z.object({
+  seats: z.number().int().min(1).max(100),
+});
+export type PreviewConvertHoldOrderBody = z.infer<typeof previewConvertHoldOrderBodySchema>;
 
 export const updateHoldOrderPriceBodySchema = z.object({
   perSeatPriceCny: z.number().int().min(0),

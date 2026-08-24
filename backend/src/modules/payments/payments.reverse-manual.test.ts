@@ -7,6 +7,9 @@ const { mockPrisma, mockTx, writeAuditMock } = vi.hoisted(() => {
       findUnique: vi.fn(),
       updateMany: vi.fn(),
     },
+    holdConversionRecord: {
+      findFirst: vi.fn(),
+    },
     order: {
       update: vi.fn(),
     },
@@ -63,6 +66,7 @@ function configure({
     status: paymentStatus,
     gatewayPayload: payload,
   });
+  mockTx.holdConversionRecord.findFirst.mockResolvedValue(null);
   mockTx.$queryRaw.mockResolvedValue([
     {
       id: 'order-1',
@@ -94,6 +98,17 @@ describe('PaymentsService.reverseManualPayment · 手工收款冲销', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+  });
+
+  it('占位单结转款禁止从订单侧冲销', async () => {
+    configure({ payload: { manual: true, note: '占位单结转' } });
+    mockTx.holdConversionRecord.findFirst.mockResolvedValueOnce({ holdOrder: { holdNo: 'H20260824AB12' } });
+
+    await expect(
+      service.reverseManualPayment('payment-1', { reason: '误操作' }, ACTOR),
+    ).rejects.toMatchObject({ statusCode: 409, message: expect.stringContaining('需回占位单侧处理') });
+    expect(mockTx.payment.updateMany).not.toHaveBeenCalled();
+    expect(mockTx.order.update).not.toHaveBeenCalled();
   });
 
   it('纯手工收款冲销成功：Payment 置 REFUNDED、订单已付减回并写审计', async () => {

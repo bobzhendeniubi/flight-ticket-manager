@@ -754,6 +754,15 @@ export const batchProductTypeSchema = z
   .default('FLIGHT_ONEWAY');
 export type BatchProductType = z.infer<typeof batchProductTypeSchema>;
 
+// 批量创单与占位单转正共用的乘客输入口径：姓名规范化、证件字段、护照有效期必填等规则
+// 只在这里维护一份，避免两条名单入口出现漂移。
+export const batchPassengerInputSchema = passengerInputWithRequiredExpirySchema.extend({
+  note: z.string().max(500).optional(),
+  businessUpgrade: z.boolean().optional(),
+  designatedHotelRoomTypeId: z.string().min(1).optional(),
+});
+export type BatchPassengerInput = z.infer<typeof batchPassengerInputSchema>;
+
 export const batchCreateOrdersBodySchema = z
   .object({
     // ── 产品类型（B5 新增）──────────────────────────────────────────────────────
@@ -829,12 +838,7 @@ export const batchCreateOrdersBodySchema = z
     // 批量/OTA 入单是新建路径 → 护照有效期必填（见 passengerInputWithRequiredExpirySchema 注释）。
     passengers: z
       .array(
-        passengerInputWithRequiredExpirySchema.extend({
-          note: z.string().max(500).optional(),
-          businessUpgrade: z.boolean().optional(),
-          // 仅 BUNDLE 批量创单有意义：指定酒店后由服务端按房型切占房并计算加价。
-          designatedHotelRoomTypeId: z.string().min(1).optional(),
-        }),
+        batchPassengerInputSchema,
       )
       .min(1)
       .max(100),

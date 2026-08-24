@@ -603,6 +603,16 @@ export class PaymentsService {
       const payment = await tx.payment.findUnique({ where: { id: paymentId } });
       if (!payment) throw new NotFoundError('收款记录不存在');
 
+      const holdConversion = await tx.holdConversionRecord.findFirst({
+        where: { paymentId },
+        select: { holdOrder: { select: { holdNo: true } } },
+      });
+      if (holdConversion) {
+        throw new ConflictError(
+          `这笔收款是占位单 ${holdConversion.holdOrder.holdNo} 的结转款，需回占位单侧处理，不能直接撤销。`,
+        );
+      }
+
       // 认款生成的收款同样带 manual=true；必须额外排除 reconciliation，避免挂账池对不平。
       const payload =
         payment.gatewayPayload &&

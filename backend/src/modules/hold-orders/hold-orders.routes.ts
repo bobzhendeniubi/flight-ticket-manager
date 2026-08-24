@@ -9,8 +9,10 @@ import { HoldOrderService } from './hold-orders.service.js';
 import {
   allocateHoldInstallmentBodySchema,
   createHoldOrderBodySchema,
+  convertHoldOrderBodySchema,
   listHoldOrdersQuerySchema,
   previewHoldPlanBodySchema,
+  previewConvertHoldOrderBodySchema,
   reduceHoldSeatsBodySchema,
   reverseHoldAllocationBodySchema,
   updateHoldInstallmentBodySchema,
@@ -34,6 +36,11 @@ export const holdOrderRoutes: FastifyPluginAsync = async (app) => {
     return { holdOrders: await service.list(query) };
   });
 
+  app.get('/summary', pre, async (req) => {
+    const query = listHoldOrdersQuerySchema.parse(req.query);
+    return { summary: await service.summary(query) };
+  });
+
   app.get('/config', pre, async () => ({ config: await service.getConfig() }));
 
   app.put('/config', adminOnly, async (req) => {
@@ -49,6 +56,18 @@ export const holdOrderRoutes: FastifyPluginAsync = async (app) => {
   app.get('/:id', pre, async (req) => {
     const { id } = req.params as { id: string };
     return { holdOrder: await service.getById(id) };
+  });
+
+  app.post('/:id/convert/preview', pre, async (req) => {
+    const { id } = req.params as { id: string };
+    const body = previewConvertHoldOrderBodySchema.parse(req.body);
+    return { preview: await service.previewConversion(id, body) };
+  });
+
+  app.post('/:id/convert', pre, async (req) => {
+    const { id } = req.params as { id: string };
+    const body = convertHoldOrderBodySchema.parse(req.body);
+    return { result: await service.convert(id, body, actorFromRequest(req)) };
   });
 
   app.post('/:id/release', pre, async (req) => {
