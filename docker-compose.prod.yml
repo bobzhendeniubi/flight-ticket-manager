@@ -1,6 +1,16 @@
-# 世途旅行 · 生产级 docker-compose
+# 世途旅行 · 生产级 docker-compose（一份文件跑两套环境）
 #
-# 启动：docker-compose -f docker-compose.prod.yml up -d
+# 两套环境共用这一份编排，靠 STACK + 端口变量区分，互不干扰：
+#
+#   实测（同事日常在用）  目录 /opt/ftm        分支 main    STACK=prod（默认）
+#     docker compose -f docker-compose.prod.yml --env-file .env.prod up -d
+#
+#   测试（随便折腾）      目录 /opt/ftm-staging 任意分支   STACK=staging
+#     docker compose -p ftm-staging -f docker-compose.prod.yml --env-file .env.staging up -d
+#
+# 关键：两套必须用**不同的 compose 项目名**（-p），否则数据卷会串。
+# 目录不同 → 项目名默认就不同，但仍显式带 -p 以防手滑。
+# STACK 变量只影响 container_name（避免撞名），默认 prod 保证老命令行为不变。
 #
 # 必填 env（.env.prod）：
 #   POSTGRES_PASSWORD       数据库密码
@@ -21,7 +31,7 @@
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: ftm-postgres-prod
+    container_name: ftm-postgres-${STACK:-prod}
     restart: unless-stopped
     environment:
       POSTGRES_USER: ftm
@@ -44,7 +54,7 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: ftm-redis-prod
+    container_name: ftm-redis-${STACK:-prod}
     restart: unless-stopped
     # noeviction：BullMQ 要求——lru 驱逐会悄悄丢延迟任务（锁位过期/座位超时释放）
     command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy noeviction
@@ -62,7 +72,7 @@ services:
     build:
       context: .
       dockerfile: backend/Dockerfile
-    container_name: ftm-backend-prod
+    container_name: ftm-backend-${STACK:-prod}
     restart: unless-stopped
     depends_on:
       postgres: { condition: service_healthy }
@@ -110,7 +120,8 @@ services:
       - "4000"
     ports:
       # 只绑本机回环：给宿主机 Caddy 反代 api.xxx.com 用，不暴露公网
-      - "127.0.0.1:4000:4000"
+      # 两套环境必须用不同宿主端口（实测 4000 / 测试 4100）
+      - "127.0.0.1:${BACKEND_BIND_PORT:-4000}:4000"
     logging:
       driver: "json-file"
       options: { max-size: "100m", max-file: "5" }
@@ -119,7 +130,7 @@ services:
     build:
       context: .
       dockerfile: backend/Dockerfile
-    container_name: ftm-worker-prod
+    container_name: ftm-worker-${STACK:-prod}
     restart: unless-stopped
     depends_on:
       backend: { condition: service_started }
@@ -154,7 +165,7 @@ services:
       args:
         # 浏览器运行时访问后端的 URL。同域反代保留 /api；独立域名改成完整 URL
         VITE_API_BASE: ${VITE_API_BASE:-/api}
-    container_name: ftm-sales-web-prod
+    container_name: ftm-sales-web-${STACK:-prod}
     restart: unless-stopped
     depends_on:
       backend: { condition: service_started }
@@ -168,7 +179,7 @@ services:
       dockerfile: admin-web/Dockerfile
       args:
         VITE_API_BASE: ${VITE_API_BASE:-/api}
-    container_name: ftm-admin-web-prod
+    container_name: ftm-admin-web-${STACK:-prod}
     restart: unless-stopped
     depends_on:
       backend: { condition: service_started }

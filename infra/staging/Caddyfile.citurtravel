@@ -69,3 +69,41 @@ api.citurtravel.com {
     reverse_proxy 127.0.0.1:4000
     encode gzip zstd
 }
+
+# ══════════════════════════════════════════════════════════════════
+# 测试环境（ftm-staging 栈，/opt/ftm-staging，端口 8180/8181/4100）
+# 实测环境在上面，端口 8080/8081/4000 —— 两套只有端口不同，改的时候看清楚。
+#
+# noindex：测试站绝不能被搜索引擎收录，否则客人搜到测试站下真单。
+# ══════════════════════════════════════════════════════════════════
+test-store.citurtravel.com {
+    header {
+        X-Content-Type-Options "nosniff"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        X-Robots-Tag "noindex, nofollow"
+    }
+    reverse_proxy 127.0.0.1:8181
+    encode gzip zstd
+}
+
+test-admin.citurtravel.com {
+    header {
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        X-Robots-Tag "noindex, nofollow"
+    }
+    reverse_proxy 127.0.0.1:8180
+    encode gzip zstd
+}
+
+test-api.citurtravel.com {
+    header {
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+        X-Robots-Tag "noindex, nofollow"
+    }
+    reverse_proxy 127.0.0.1:4100
+    encode gzip zstd
+}
