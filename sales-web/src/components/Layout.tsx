@@ -59,6 +59,10 @@ export function Layout() {
 
   const isAgent = user?.role === 'AGENT';
   const isAdmin = user?.role === 'ADMIN' || user?.role === 'STAFF';
+  // 后台地址：开发走本地端口，生产按当前域名推导（store.xxx → admin.xxx）
+  const adminUrl = import.meta.env.DEV
+    ? 'http://localhost:5174'
+    : window.location.origin.replace('store', 'admin');
 
   // ?preview=mobile → 把页面包进 375×812 的手机壳，模拟小程序 UI
   // 在电脑浏览器里开演示 / 录屏 / 给客户展示效果时很方便
@@ -310,18 +314,20 @@ export function Layout() {
           </div>
         )}
 
-        {/* 管理员登录在前台时，显示提示去后台 */}
+        {/* 管理员登录在前台时，显示提示去后台。
+            后台地址按当前域名推导，别写死 localhost —— 生产上是死链
+            （store.xxx → admin.xxx，测试环境 test-store.xxx → test-admin.xxx 也对）。 */}
         {isAdmin && (
           <div className="border-t border-sun/25 bg-sun-light">
             <div className="mx-auto max-w-7xl px-4 py-2 text-xs text-amber-800 flex items-center justify-between gap-3">
               <span className="inline-flex items-center gap-1.5">
                 <Icon name="info" className="h-3.5 w-3.5 shrink-0" />
                 您是管理员/运营，前台仅供浏览。后台操作请到{' '}
-                <a href="http://localhost:5174" className="font-semibold underline decoration-sun underline-offset-2 transition-colors hover:text-amber-900" target="_blank" rel="noreferrer">
-                  http://localhost:5174
+                <a href={adminUrl} className="font-semibold underline decoration-sun underline-offset-2 transition-colors hover:text-amber-900" target="_blank" rel="noreferrer">
+                  {adminUrl}
                 </a>
               </span>
-              <a href="http://localhost:5174" target="_blank" rel="noreferrer" className="inline-flex shrink-0 items-center gap-1 rounded-xl bg-sun px-2.5 py-1 font-semibold text-white shadow-card transition-all duration-200 hover:brightness-105 hover:-translate-y-px active:scale-95">
+              <a href={adminUrl} target="_blank" rel="noreferrer" className="inline-flex shrink-0 items-center gap-1 rounded-xl bg-sun px-2.5 py-1 font-semibold text-white shadow-card transition-all duration-200 hover:brightness-105 hover:-translate-y-px active:scale-95">
                 进入后台 <Icon name="arrowRight" className="h-3.5 w-3.5" />
               </a>
             </div>

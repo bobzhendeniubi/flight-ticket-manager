@@ -65,12 +65,17 @@ export const useAuth = create<AuthState>()(
         try {
           const res = await api.login(email, password);
           // 后台允许 ADMIN/STAFF/AGENT（代理可进但只看自己树内数据）
-          // CUSTOMER 仍拒绝 —— 他们有专用前台 5173
+          // CUSTOMER 仍拒绝 —— 他们有专用前台
           if (res.user.role === 'CUSTOMER') {
             api.logout(res.tokens.refreshToken).catch(() => undefined);
+            // 前台地址按当前域名推导，别写死 localhost —— 生产上给客户一个死链
+            // （admin.xxx → store.xxx，测试环境 test-admin.xxx → test-store.xxx 也对）
+            const storefront = import.meta.env.DEV
+              ? 'http://localhost:5173'
+              : window.location.origin.replace('admin', 'store');
             throw new ApiError(403, {
               code: 'WRONG_PORTAL',
-              message: '客户账号请到前台 http://localhost:5173 登录',
+              message: `客户账号请到前台 ${storefront} 登录`,
             });
           }
           set({ user: res.user, tokens: res.tokens, isLoading: false });
