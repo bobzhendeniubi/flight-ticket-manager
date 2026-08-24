@@ -32,4 +32,9 @@
 
 - **前端真值闸 = `npm run build`**（sales-web 根 tsconfig `files:[]`，裸 `tsc --noEmit` 是**假绿**）。
 - 后端：`npm run build` + `npm test`。
-- 部署 staging：`ssh root@47.83.249.163` → `cd /opt/ftm && git pull && docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build <svc>`（backend 启动自动 `prisma migrate deploy`）。**部署需用户逐次明确批准（"部署"）。**
+- **只有一台服务器 `47.83.249.163`，它就是同事日常在用的环境**（`admin/store/api.citurtravel.com`，`NODE_ENV=production`）。
+  历史上文档里管它叫 "staging"，但没有第二套环境——推上去同事立刻就看得到，按生产对待。
+- 主干是 `main`，服务器也跟 `main` 跑（2026-08-23 前整个项目活在 feature 分支上，已快进合回）。
+- 部署：`ssh -i ~/.ssh/ftm_staging root@47.83.249.163` → `cd /opt/ftm && git pull && docker compose -f docker-compose.prod.yml --env-file .env.prod up -d --build <svc>`（backend 启动自动 `prisma migrate deploy`）。**部署需用户逐次明确批准（"部署"）。**
+  - `docker compose` 任何子命令（含 `ps`）都要带 `--env-file .env.prod`，否则报 `PAYMENT_MODE is missing`。
+  - `.env.prod` 只在服务器上、未进版本库，切分支/拉代码都不会动它。
