@@ -6037,13 +6037,20 @@ export class OrderService {
       if (scheduleChanged) {
         const oldSchedInfo = await tx.flightSchedule.findUnique({
           where: { id: oldScheduleId },
-          select: { departureTime: true, flight: { select: { flightNumber: true } } },
+          select: {
+            departureTime: true,
+            departureTz: true,
+            flight: { select: { flightNumber: true } },
+          },
         });
         flightChangedMeta = {
           at: new Date().toISOString(),
           fromScheduleId: oldScheduleId,
           fromFlightNumber: oldSchedInfo?.flight?.flightNumber ?? null,
           fromDeparture: oldSchedInfo?.departureTime?.toISOString() ?? null,
+          // 原班次出发地时区：航变提示要按它显示原起飞时刻。
+          // 本次改动之前盖的旧标记没有这个字段，前端会回退到浏览器时区（见各自注释）。
+          fromDepartureTz: oldSchedInfo?.departureTz ?? null,
           toScheduleId: newScheduleId,
         };
       }

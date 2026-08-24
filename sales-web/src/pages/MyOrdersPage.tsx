@@ -86,7 +86,7 @@ function KindIcon({ kind, className }: { kind: string; className?: string }) {
 }
 
 // 航变标记：我们因航司航变为你调整了航班班次，落在该航段的 metadata.flightChanged。
-type FlightChangedMark = { fromDeparture?: string | null };
+type FlightChangedMark = { fromDeparture?: string | null; fromDepartureTz?: string | null };
 
 /** 从订单项 metadata 读「航变」标记；无标记时返回 null。 */
 function readFlightChanged(metadata: unknown): FlightChangedMark | null {
@@ -96,12 +96,26 @@ function readFlightChanged(metadata: unknown): FlightChangedMark | null {
   return mark as FlightChangedMark;
 }
 
-/** ISO 起飞时间 → "M月D日 HH:MM"（航变提示里展示原起飞时间）。 */
-function formatDepart(iso?: string | null): string | null {
+/**
+ * ISO 起飞时间 → "M月D日 HH:MM"（航变提示里展示原起飞时间）。
+ * 按原班次的出发地时区折算。tz 缺失的是本次修复前盖的旧航变标记——只能回退浏览器时区
+ * （对 +8 出发地正好正确，越南 +7 出发地会差 1 小时；新盖的标记都带 tz，不受影响）。
+ */
+function formatDepart(iso?: string | null, tz?: string | null): string | null {
   if (!iso) return null;
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return null;
-  return d.toLocaleString('zh-CN', { month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  const opts: Intl.DateTimeFormatOptions = {
+    month: 'long',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  };
+  try {
+    return d.toLocaleString('zh-CN', tz ? { ...opts, timeZone: tz } : opts);
+  } catch {
+    return d.toLocaleString('zh-CN', opts);
+  }
 }
 
 const CANCELLABLE = new Set<OrderStatus>(['PAID', 'PROCESSING', 'TICKETED']);
@@ -561,7 +575,9 @@ export function MyOrdersPage() {
                   <ul className="space-y-1.5">
                     {o.items.map((it) => {
                       const changed = readFlightChanged(it.metadata);
-                      const oldDepart = changed ? formatDepart(changed.fromDeparture) : null;
+                      const oldDepart = changed
+                        ? formatDepart(changed.fromDeparture, changed.fromDepartureTz)
+                        : null;
                       const newDepart =
                         it.departureDate && it.departureTime
                           ? `${it.departureDate} ${it.departureTime}`

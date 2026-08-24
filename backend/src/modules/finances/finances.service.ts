@@ -20,6 +20,7 @@
  * revenueBreakdown.refund / revenueCny，避免"先收后退"的订单整单从统计消失、长期对不平。
  */
 import type { Prisma, PrismaClient } from '@prisma/client';
+import { localDate } from './finances.cost.service.js';
 import { OrderStatus } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import {
@@ -974,13 +975,14 @@ export async function getOrderPnlDetail(
   const grossMarginWithMiscCny =
     totalWithMiscCny == null ? null : round2(totalCny - totalWithMiscCny);
 
-  // ── 出发日期：最早 FLIGHT 航段（UTC 日期）──
-  const departureTimes = order.items
-    .map((it) => it.flightSchedule?.departureTime)
-    .filter((d): d is Date => d != null)
-    .sort((a, b) => a.getTime() - b.getTime());
+  // ── 出发日期：最早 FLIGHT 航段的**出发地当地日**（与订单列表/班次日历同口径）──
+  // 按 UTC 折会把当地凌晨起飞的班次写早一天。
+  const departures = order.items
+    .map((it) => it.flightSchedule)
+    .filter((s): s is NonNullable<typeof s> => s != null)
+    .sort((a, b) => a.departureTime.getTime() - b.departureTime.getTime());
   const departureDate =
-    departureTimes.length > 0 ? departureTimes[0].toISOString().slice(0, 10) : null;
+    departures.length > 0 ? localDate(departures[0].departureTime, departures[0].departureTz) : null;
 
   return {
     orderId: order.id,

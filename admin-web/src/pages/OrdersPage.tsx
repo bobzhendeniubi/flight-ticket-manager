@@ -4449,6 +4449,7 @@ type FlightChangedMark = {
   at?: string;
   fromFlightNumber?: string | null;
   fromDeparture?: string | null;
+  fromDepartureTz?: string | null;
   toScheduleId?: string | null;
 };
 
@@ -4461,11 +4462,26 @@ function readFlightChanged(metadata: unknown): FlightChangedMark | null {
 }
 
 /** ISO → "M月D日 HH:MM"（航变悬浮里展示原起飞时间）；无值时返回「原班次」。 */
-function formatChangedDeparture(iso?: string | null): string {
+/**
+ * 航变提示里的原起飞时刻，按原班次的出发地时区折算。
+ * tz 缺失的是本次修复前盖的旧航变标记——只能回退浏览器时区（对 +8 出发地正好正确，
+ * 越南 +7 出发地会差 1 小时；新盖的标记都带 tz，不受影响）。
+ */
+function formatChangedDeparture(iso?: string | null, tz?: string | null): string {
   if (!iso) return '原班次';
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return '原班次';
-  return d.toLocaleString('zh-CN', { month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  const opts: Intl.DateTimeFormatOptions = {
+    month: 'long',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  };
+  try {
+    return d.toLocaleString('zh-CN', tz ? { ...opts, timeZone: tz } : opts);
+  } catch {
+    return d.toLocaleString('zh-CN', opts);
+  }
 }
 
 // ── 金额明细「怎么算出来的」轻量说明：读 metadata 里 backend 落的计价痕迹，字段缺失一律不显示 ──
@@ -4606,6 +4622,7 @@ function OrderItemRow({
   const changedHint = flightChanged
     ? `航变：原 ${flightChanged.fromFlightNumber ?? '班次'}（${formatChangedDeparture(
         flightChanged.fromDeparture,
+        flightChanged.fromDepartureTz,
       )}）→ 现 ${item.flightNumber ?? '新班次'}${
         item.departureDate ? `（${item.departureDate}${item.departureTime ? ` ${item.departureTime}` : ''}）` : ''
       }`
