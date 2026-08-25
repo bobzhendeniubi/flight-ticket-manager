@@ -15,6 +15,8 @@ import {
   type HoldOrderStatus,
   type HoldOwnerType,
   type HoldOrderConfig,
+  type HoldOrderFilter,
+  type CreateHoldGroupInput,
   type HoldInstallment,
   type HoldReductionPreview,
   type HoldOrderSummary,
@@ -28,6 +30,19 @@ import { useDialogA11y } from '../components/Modal';
 import { useConfirm } from '../components/ConfirmDialog';
 
 const CABINS: CabinClass[] = ['ECONOMY', 'PREMIUM_ECONOMY', 'BUSINESS', 'FIRST'];
+/** 建单可选班次与默认筛选窗口都是「今天起 60 天」，与班次拉取的 horizon 一致。 */
+const HOLD_HORIZON_DAYS = 60;
+
+// 本地日期 YYYY-MM-DD（用 getFullYear/getMonth/getDate，避免 toISOString 的 UTC 偏移）
+function todayStr(): string {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+function daysFromTodayStr(n: number): string {
+  const d = new Date();
+  d.setDate(d.getDate() + n);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
 function localDateOf(iso: string, tz: string): string {
   try {
     return new Intl.DateTimeFormat('en-CA', {
@@ -97,9 +112,12 @@ export function HoldOrdersPage() {
   const [flights, setFlights] = useState<AdminFlight[]>([]);
   const [allSchedules, setAllSchedules] = useState<Record<string, AdminSchedule[]>>({});
   const [agents, setAgents] = useState<AgentListItem[]>([]);
-  const [selectedDate, setSelectedDate] = useState('');
-  const [selectedFlightId, setSelectedFlightId] = useState('');
-  const [selectedScheduleId, setSelectedScheduleId] = useState('');
+  // 筛选器是「看哪些占位单」，不再兼任「建到哪一班」——建单目标一律在弹窗里选。
+  const [dateFrom, setDateFrom] = useState(todayStr());
+  const [dateTo, setDateTo] = useState(daysFromTodayStr(HOLD_HORIZON_DAYS));
+  const [filterFlightId, setFilterFlightId] = useState('');
+  const [agentFilter, setAgentFilter] = useState('');
+  const [groupFilter, setGroupFilter] = useState('');
   const [orders, setOrders] = useState<HoldOrderListItem[]>([]);
   const [summary, setSummary] = useState<HoldOrderSummary>({ occupiedOrderCount: 0, occupiedSeats: 0, overdueOrderCount: 0, fullyPaidPendingConversionCount: 0, receivedCny: 0 });
   const [statusFilter, setStatusFilter] = useState<'' | HoldOrderStatus>('');
@@ -135,16 +153,7 @@ export function HoldOrdersPage() {
         if (user?.role === 'ADMIN' || user?.role === 'STAFF') {
           try { setHoldConfig((await api.getHoldOrderConfig(tokens.accessToken)).config); } catch { /* 配置入口仍可稍后重试 */ }
         }
-        const map = await fetchScheduleMap(tokens.accessToken, flightResult.flights);
-        setAllSchedules(map);
-        const first = flightResult.flights
-          .flatMap((flight) => (map[flight.id] ?? []).map((schedule) => ({ flight, schedule })))
-          .sort((a, b) => a.schedule.departureTime.localeCompare(b.schedule.departureTime))[0];
-        if (first) {
-          setSelectedFlightId(first.flight.id);
-          setSelectedDate(localDateOf(first.schedule.departureTime, first.schedule.departureTz));
-          setSelectedScheduleId(first.schedule.id);
-        }
+        setAllSchedules(await fetchScheduleMap(tokens.accessToken, flightResult.flights));
       } catch (err) {
         setError(err instanceof Error ? err.message : '加载航班/代理失败');
       } finally {
@@ -153,41 +162,13 @@ export function HoldOrdersPage() {
     })();
   }, [tokens, user]);
 
-  const dateOptions = useMemo(() => {
-    const dates = new Set<string>();
-    Object.values(allSchedules).forEach((schedules) => {
-      schedules.forEach((s) => dates.add(localDateOf(s.departureTime, s.departureTz)));
-    });
-    return [...dates].sort();
-  }, [allSchedules]);
-
-  const flightOptions = useMemo(
-    () => flights.filter((f) => (allSchedules[f.id] ?? []).some((s) => localDateOf(s.departureTime, s.departureTz) === selectedDate)),
-    [flights, allSchedules, selectedDate],
-  );
-
-  // 日期切换后旧航班可能不在新日期的选项中；同步切到该日期的第一班，避免页面停在空数据状态。
-  useEffect(() => {
-    if (flightOptions.length > 0 && !flightOptions.some((flight) => flight.id === selectedFlightId)) {
-      setSelectedFlightId(flightOptions[0].id);
-    }
-  }, [flightOptions, selectedFlightId]);
-
-  const daySchedules = useMemo(
-    () => (allSchedules[selectedFlightId] ?? [])
-      .filter((s) => localDateOf(s.departureTime, s.departureTz) === selectedDate)
-      .sort((a, b) => a.departureTime.localeCompare(b.departureTime)),
-    [allSchedules, selectedFlightId, selectedDate],
-  );
-
-  useEffect(() => {
-    if (daySchedules.length > 0 && !daySchedules.some((s) => s.id === selectedScheduleId)) {
-      setSelectedScheduleId(daySchedules[0].id);
-    }
-  }, [daySchedules, selectedScheduleId]);
-
-  const selectedSchedule = daySchedules.find((s) => s.id === selectedScheduleId);
-  const selectedFlight = flights.find((f) => f.id === selectedFlightId);
+  // 筛到「某一天 + 某个航班」时，顺带把该班次各舱余量摊开——运营常常筛完就想看这一班还剩多少。
+  const focusedSchedules = useMemo(() => {
+    if (!filterFlightId || dateFrom !== dateTo) return [];
+    return (allSchedules[filterFlightId] ?? [])
+      .filter((s) => localDateOf(s.departureTime, s.departureTz) === dateFrom)
+      .sort((a, b) => a.departureTime.localeCompare(b.departureTime));
+  }, [allSchedules, filterFlightId, dateFrom, dateTo]);
 
   const reloadSchedules = useCallback(async () => {
     if (!tokens || flights.length === 0) return;
@@ -195,13 +176,22 @@ export function HoldOrdersPage() {
   }, [tokens, flights]);
 
   const reload = useCallback(async () => {
-    if (!tokens || !selectedScheduleId) {
+    if (!tokens) {
       setOrders([]);
       return;
     }
     setListLoading(true);
     try {
-      const filter = { flightScheduleId: selectedScheduleId, ...(statusFilter ? { status: statusFilter } : {}) };
+      // 团号筛选是「把这个团的所有航段一次看全」，日期区间会把回程挡在外面，故按团查时不带日期。
+      const filter: HoldOrderFilter = groupFilter
+        ? { groupRef: groupFilter }
+        : {
+            from: dateFrom,
+            to: dateTo,
+            ...(filterFlightId ? { flightId: filterFlightId } : {}),
+            ...(agentFilter ? { agentId: agentFilter } : {}),
+            ...(statusFilter ? { status: statusFilter } : {}),
+          };
       const [result, kpis] = await Promise.all([
         api.listHoldOrders(tokens.accessToken, filter),
         api.getHoldOrderSummary(tokens.accessToken, filter),
@@ -213,11 +203,11 @@ export function HoldOrdersPage() {
     } finally {
       setListLoading(false);
     }
-  }, [tokens, selectedScheduleId, statusFilter]);
+  }, [tokens, dateFrom, dateTo, filterFlightId, agentFilter, statusFilter, groupFilter]);
 
   useEffect(() => { void reload(); }, [reload]);
 
-  const cabinRows = useMemo(() => selectedSchedule?.seatClasses ?? [], [selectedSchedule]);
+
 
   const runAction = async (order: HoldOrderListItem, action: 'release' | 'cancel') => {
     if (!tokens || actionConfirmRef.current) return;
@@ -278,45 +268,66 @@ export function HoldOrdersPage() {
       </section>
 
       <section className="card">
-        <div className="grid gap-3 md:grid-cols-[1fr_1fr_1fr_1fr_auto]">
+        <div className="grid gap-3 md:grid-cols-3 lg:grid-cols-6">
           <div>
-            <label className="label">出发日期</label>
-            <select className="input" value={selectedDate} onChange={(e) => setSelectedDate(e.target.value)}>
-              {dateOptions.map((date) => <option key={date} value={date}>{date}</option>)}
-            </select>
+            <label className="label">出发日期 从</label>
+            <input className="input" type="date" value={dateFrom} onChange={(e) => { setDateFrom(e.target.value); setGroupFilter(''); }} />
+          </div>
+          <div>
+            <label className="label">出发日期 到</label>
+            <input className="input" type="date" value={dateTo} onChange={(e) => { setDateTo(e.target.value); setGroupFilter(''); }} />
           </div>
           <div>
             <label className="label">航班号</label>
-            <select className="input" value={selectedFlightId} onChange={(e) => setSelectedFlightId(e.target.value)}>
-              {flightOptions.map((flight) => <option key={flight.id} value={flight.id}>{flight.flightNumber} · {flight.originCode} → {flight.destinationCode}</option>)}
+            <select className="input" value={filterFlightId} onChange={(e) => { setFilterFlightId(e.target.value); setGroupFilter(''); }}>
+              <option value="">全部航班</option>
+              {flights.map((flight) => <option key={flight.id} value={flight.id}>{flight.flightNumber} · {flight.originCode} → {flight.destinationCode}</option>)}
             </select>
           </div>
           <div>
-            <label className="label">班次时刻</label>
-            <select className="input" value={selectedScheduleId} onChange={(e) => setSelectedScheduleId(e.target.value)}>
-              {daySchedules.map((schedule) => <option key={schedule.id} value={schedule.id}>{formatLocalTime(schedule.departureTime, schedule.departureTz)} 出发</option>)}
+            <label className="label">归属代理</label>
+            <select className="input" value={agentFilter} onChange={(e) => { setAgentFilter(e.target.value); setGroupFilter(''); }}>
+              <option value="">全部归属</option>
+              {agents.map((a) => <option key={a.id} value={a.id}>{agentLabel(a)}</option>)}
             </select>
           </div>
           <div>
             <label className="label">状态筛选</label>
-            <select className="input" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value as '' | HoldOrderStatus)}>
+            <select className="input" value={statusFilter} onChange={(e) => { setStatusFilter(e.target.value as '' | HoldOrderStatus); setGroupFilter(''); }}>
               <option value="">全部状态</option>
               {(Object.keys(HOLD_STATUS_META) as HoldOrderStatus[]).map((status) => <option key={status} value={status}>{holdStatusLabel(status)}</option>)}
             </select>
           </div>
           <div className="flex items-end">
-            <button className="btn-primary text-sm" onClick={() => setShowForm(true)} disabled={!selectedSchedule}>+ 新建占位单</button>
+            <button className="btn-primary w-full text-sm" onClick={() => setShowForm(true)}>+ 新建占位单</button>
           </div>
         </div>
+        {groupFilter ? (
+          <p className="mt-3 rounded bg-brand-50 px-3 py-2 text-sm text-brand-800">
+            正在只看团号 <strong className="font-mono">{groupFilter}</strong> 的全部航段（不受日期区间限制）。
+            <button className="ml-2 font-medium underline" onClick={() => setGroupFilter('')}>回到日期区间</button>
+          </p>
+        ) : (
+          <p className="mt-3 text-xs text-ink-muted">按出发日期看，不是按建单日期。列表里的「出发日期」列就是这张单实际留的那一天。</p>
+        )}
       </section>
 
-      {selectedSchedule && (
-        <section className="grid gap-3 md:grid-cols-2 lg:grid-cols-4">
-          {cabinRows.map((cabin) => (
-            <div key={cabin.id} className="card">
-              <h3 className="font-semibold">{CABIN_LABEL[cabin.cabin] ?? cabin.cabin}</h3>
-              <p className="mt-1 text-sm text-ink-soft">可售余量 <strong>{cabin.available}</strong> 座</p>
-              <p className="mt-1 text-xs text-ink-muted">已售 {cabin.sold} · 锁位 {cabin.locked} · 占位 {cabin.held}</p>
+      {focusedSchedules.length > 0 && (
+        <section className="space-y-3">
+          {focusedSchedules.map((schedule) => (
+            <div key={schedule.id}>
+              <h3 className="text-sm font-semibold text-ink-soft">
+                {formatLocalDate(schedule.departureTime, schedule.departureTz)} {formatLocalTime(schedule.departureTime, schedule.departureTz)} 出发 · 各舱余量
+              </h3>
+              <div className="mt-2 grid gap-3 md:grid-cols-2 lg:grid-cols-4">
+                {schedule.seatClasses.map((cabin) => (
+                  <div key={cabin.id} className="card">
+                    <h4 className="font-semibold">{CABIN_LABEL[cabin.cabin] ?? cabin.cabin}</h4>
+                    <p className="mt-1 text-sm text-ink-soft">可售余量 <strong>{cabin.available}</strong> 座</p>
+                    <p className="mt-1 text-xs text-ink-muted">已售 {cabin.sold} · 锁位 {cabin.locked} · 占位 {cabin.held}</p>
+                  </div>
+                ))}
+              </div>
             </div>
           ))}
         </section>
@@ -324,14 +335,19 @@ export function HoldOrdersPage() {
 
       <section className="card p-0 overflow-hidden">
         <div className="border-b border-slate-200 px-5 py-3">
-          <h3 className="font-semibold">{selectedFlight?.flightNumber} · {selectedSchedule ? `${formatLocalDate(selectedSchedule.departureTime, selectedSchedule.departureTz)} ${formatLocalTime(selectedSchedule.departureTime, selectedSchedule.departureTz)}` : ''} 占位单</h3>
+          <h3 className="font-semibold">
+            占位单
+            <span className="ml-2 text-sm font-normal text-ink-muted">
+              {groupFilter ? `团号 ${groupFilter}` : `${dateFrom} ~ ${dateTo} 出发`} · 共 {orders.length} 单
+            </span>
+          </h3>
         </div>
         <div className="overflow-x-auto">
           <table className="table-admin">
-            <thead><tr><th className="text-left">单号</th><th className="text-left">归属</th><th className="text-left">舱位</th><th className="text-right">占位数</th><th className="text-right">锁价</th><th className="text-left">状态</th><th className="text-left">建单时间</th><th></th></tr></thead>
+            <thead><tr><th className="text-left">出发日期 · 航班</th><th className="text-left">团号 / 团名</th><th className="text-left">单号</th><th className="text-left">归属</th><th className="text-left">舱位</th><th className="text-right">占位数</th><th className="text-right">锁价</th><th className="text-left">状态</th><th className="text-left">建单时间</th><th></th></tr></thead>
             <tbody>
-              {listLoading && <tr><td colSpan={8} className="py-5 text-center text-ink-muted">加载占位单中…</td></tr>}
-              {!listLoading && orders.length === 0 && <tr><td colSpan={8} className="py-5 text-center text-ink-muted">该班次暂无占位单</td></tr>}
+              {listLoading && <tr><td colSpan={10} className="py-5 text-center text-ink-muted">加载占位单中…</td></tr>}
+              {!listLoading && orders.length === 0 && <tr><td colSpan={10} className="py-5 text-center text-ink-muted">该区间没有占位单</td></tr>}
               {orders.map((order) => {
                 const holding = order.status === 'HOLDING' || order.status === 'OVERDUE' || order.status === 'FULLY_PAID';
                 const remainingSeats = order.seats - order.seatsConverted - order.seatsCancelled;
@@ -343,6 +359,20 @@ export function HoldOrdersPage() {
                 return (
                   <Fragment key={order.id}>
                   <tr className={order.status === 'OVERDUE' ? 'bg-rose-50' : undefined}>
+                    <td>
+                      <div className="font-medium">{formatLocalDate(order.flightSchedule.departureTime, order.flightSchedule.departureTz)}</div>
+                      <div className="text-xs text-ink-muted">
+                        {order.flightSchedule.flight.flightNumber} · {order.flightSchedule.flight.originCode} → {order.flightSchedule.flight.destinationCode} · {formatLocalTime(order.flightSchedule.departureTime, order.flightSchedule.departureTz)}
+                      </div>
+                    </td>
+                    <td>
+                      {order.groupRef ? (
+                        <button type="button" className="font-mono text-xs font-medium text-brand-700 underline" title="只看这个团的全部航段" onClick={() => setGroupFilter(order.groupRef!)}>
+                          {order.groupRef}
+                        </button>
+                      ) : <span className="text-xs text-ink-muted">—</span>}
+                      <div className="text-xs text-ink-muted">{order.groupName || ''}</div>
+                    </td>
                     <td className="font-mono text-xs">{order.holdNo}</td>
                     <td><div className="font-medium">{ownerLabel(order)}</div><div className="text-xs text-ink-muted">{order.ownerType === 'AGENT' ? '代理' : '直客'}</div></td>
                     <td><span className="badge-neutral">{CABIN_LABEL[order.seatClass.cabin] ?? order.seatClass.cabin}</span></td>
@@ -361,7 +391,7 @@ export function HoldOrdersPage() {
                   </tr>
                   {expandedId === order.id && (
                     <tr className={order.status === 'OVERDUE' ? 'bg-rose-50/70' : 'bg-slate-50/70'}>
-                      <td colSpan={8} className="px-5 py-3">
+                      <td colSpan={10} className="px-5 py-3">
                         <InstallmentTable order={order} onAllocate={(installment) => setAllocateTarget({ order, installment })} onReload={reload} />
                         <HoldLedgerDetails order={order} />
                       </td>
@@ -376,19 +406,25 @@ export function HoldOrdersPage() {
         {flash && <div className="border-t border-slate-200 bg-green-50 px-5 py-2 text-sm text-green-700">{flash}</div>}
       </section>
 
-      {showForm && selectedSchedule && (
+      {showForm && (
         <CreateHoldModal
-          schedule={selectedSchedule}
+          flights={flights}
+          allSchedules={allSchedules}
           agents={agents}
+          defaultDate={dateFrom}
+          defaultFlightId={filterFlightId}
           onCancel={() => setShowForm(false)}
           onSubmit={async (body) => {
             if (!tokens) return;
             setBusy(true);
             try {
-              await api.createHoldOrder(tokens.accessToken, { ...body, flightScheduleId: selectedSchedule.id });
+              const result = await api.createHoldOrderGroup(tokens.accessToken, body);
               setShowForm(false);
               await Promise.all([reload(), reloadSchedules()]);
-              notify(body.mode === 'ALLOTMENT' ? '切位占位单已创建，付款前不占公共座位' : '占位单已创建，座位已计入占用');
+              const legWord = body.legs.length > 1 ? `${body.legs.length} 个航段` : '1 个航段';
+              notify(body.mode === 'ALLOTMENT'
+                ? `切位占位单已创建（${legWord}，团号 ${result.groupRef}），付款前不占公共座位`
+                : `占位单已创建（${legWord}，团号 ${result.groupRef}），座位已计入占用`);
             } finally {
               setBusy(false);
             }
@@ -438,60 +474,196 @@ export function HoldOrdersPage() {
   );
 }
 
+/** 建单弹窗里的一段航段：日期 → 航班 → 班次 → 舱位 → 锁价，全部在弹窗内选定。 */
+interface LegDraft {
+  key: string;
+  date: string;
+  flightId: string;
+  scheduleId: string;
+  cabin: CabinClass;
+  price: number;
+}
+
+/** 距起飞多少天以内要二次确认出发日期。团队留位极少留明后天的班。 */
+const NEAR_DEPARTURE_DAYS = 3;
+
+function daysUntil(iso: string): number {
+  return Math.floor((new Date(iso).getTime() - Date.now()) / 86400000);
+}
+
+let legSeq = 0;
+function newLegKey(): string {
+  legSeq += 1;
+  return `leg_${legSeq}`;
+}
+
+/**
+ * 新建占位单 / 建团占位。
+ *
+ * 出发日期必须在弹窗里选：此前日期取自页面顶部的筛选器，弹窗里只有一行灰色小字，
+ * 填完表单点确认就把座位留到了页面默认的那一班——留错日期而毫无察觉。
+ * 现在每个航段的日期/航班/班次都在弹窗内显式选定，临近起飞的班次还要再确认一次。
+ */
 function CreateHoldModal({
-  schedule,
+  flights,
+  allSchedules,
   agents,
+  defaultDate,
+  defaultFlightId,
   onCancel,
   onSubmit,
 }: {
-  schedule: AdminSchedule;
+  flights: AdminFlight[];
+  allSchedules: Record<string, AdminSchedule[]>;
   agents: AgentListItem[];
+  defaultDate: string;
+  defaultFlightId: string;
   onCancel: () => void;
-  onSubmit: (body: { cabin: CabinClass; seats: number; perSeatPriceCny: number; ownerType: HoldOwnerType; mode: 'RESERVE' | 'ALLOTMENT'; installmentsOverride?: Array<{ label: string; perPersonCny?: number; dueDate: string }>; agentId?: string; groupName?: string; freeCancelRatio?: number; notes?: string }) => Promise<void>;
+  onSubmit: (body: CreateHoldGroupInput) => Promise<void>;
 }) {
   const dialogRef = useDialogA11y(onCancel);
   const tokens = useAuth((s) => s.tokens);
-  const [cabin, setCabin] = useState<CabinClass>(schedule.seatClasses[0]?.cabin ?? 'ECONOMY');
+
+  const dateOptions = useMemo(() => {
+    const dates = new Set<string>();
+    Object.values(allSchedules).forEach((schedules) => {
+      schedules.forEach((s) => dates.add(localDateOf(s.departureTime, s.departureTz)));
+    });
+    return [...dates].sort();
+  }, [allSchedules]);
+
+  const schedulesOn = useCallback(
+    (date: string, flightId: string) =>
+      (allSchedules[flightId] ?? [])
+        .filter((s) => localDateOf(s.departureTime, s.departureTz) === date)
+        .sort((a, b) => a.departureTime.localeCompare(b.departureTime)),
+    [allSchedules],
+  );
+  const flightsOn = useCallback(
+    (date: string) => flights.filter((f) => (allSchedules[f.id] ?? []).some((s) => localDateOf(s.departureTime, s.departureTz) === date)),
+    [flights, allSchedules],
+  );
+
+  const makeLeg = useCallback(
+    (date: string, flightId: string): LegDraft => {
+      const day = date || dateOptions[0] || '';
+      const flightList = flightsOn(day);
+      const flight = flightList.find((f) => f.id === flightId) ?? flightList[0];
+      const schedule = flight ? schedulesOn(day, flight.id)[0] : undefined;
+      return {
+        key: newLegKey(),
+        date: day,
+        flightId: flight?.id ?? '',
+        scheduleId: schedule?.id ?? '',
+        cabin: schedule?.seatClasses[0]?.cabin ?? 'ECONOMY',
+        price: 0,
+      };
+    },
+    [dateOptions, flightsOn, schedulesOn],
+  );
+
+  const [legs, setLegs] = useState<LegDraft[]>(() => [makeLeg(defaultDate, defaultFlightId)]);
   const [seats, setSeats] = useState(1);
-  const [price, setPrice] = useState(0);
   const [mode, setMode] = useState<'RESERVE' | 'ALLOTMENT'>('RESERVE');
   const [ownerType, setOwnerType] = useState<HoldOwnerType>('AGENT');
   const [agentId, setAgentId] = useState(agents[0]?.id ?? '');
   const [groupName, setGroupName] = useState('');
   const [ratio, setRatio] = useState<number | ''>('');
   const [notes, setNotes] = useState('');
+  const [dateConfirmed, setDateConfirmed] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
   const [planRows, setPlanRows] = useState<Array<{ seq: number; label: string; amountRule: 'PER_PERSON_FIXED' | 'REMAINDER'; perPersonCny: number | null; amountCny: number; dueDate: string }>>([]);
   const [planLoading, setPlanLoading] = useState(false);
-  const seat = schedule.seatClasses.find((c) => c.cabin === cabin);
-  const max = Math.max(0, seat?.available ?? 0);
   const [dueDates, setDueDates] = useState<Record<string, string>>({});
+
+  const scheduleOf = useCallback(
+    (leg: LegDraft) => schedulesOn(leg.date, leg.flightId).find((s) => s.id === leg.scheduleId),
+    [schedulesOn],
+  );
+
+  const patchLeg = (key: string, patch: Partial<LegDraft>) => {
+    setLegs((old) =>
+      old.map((leg) => {
+        if (leg.key !== key) return leg;
+        const next = { ...leg, ...patch };
+        // 日期变了航班可能不飞，航班变了班次可能不存在——逐级回落到该级第一个可选项，
+        // 避免选择器停在一个已经不存在的组合上（这正是留错日期的老路子）。
+        if (patch.date !== undefined) {
+          const flightList = flightsOn(next.date);
+          if (!flightList.some((f) => f.id === next.flightId)) next.flightId = flightList[0]?.id ?? '';
+        }
+        if (patch.date !== undefined || patch.flightId !== undefined) {
+          const list = schedulesOn(next.date, next.flightId);
+          if (!list.some((s) => s.id === next.scheduleId)) next.scheduleId = list[0]?.id ?? '';
+        }
+        if (patch.cabin === undefined) {
+          const schedule = schedulesOn(next.date, next.flightId).find((s) => s.id === next.scheduleId);
+          if (schedule && !schedule.seatClasses.some((c) => c.cabin === next.cabin)) {
+            next.cabin = schedule.seatClasses[0]?.cabin ?? next.cabin;
+          }
+        }
+        return next;
+      }),
+    );
+    setDateConfirmed(false);
+  };
+
+  const availabilityOf = (leg: LegDraft): number => {
+    const schedule = scheduleOf(leg);
+    return Math.max(0, schedule?.seatClasses.find((c) => c.cabin === leg.cabin)?.available ?? 0);
+  };
+
+  const firstLeg = legs[0];
+  const singleLeg = legs.length === 1;
+  // 收款计划按第一段（通常是去程）生成；多航段时各段在服务端各自按同一套期次结构算钱，
+  // 金额用各段自己的锁价。截止日只在单航段时开放手调，多航段建单后可在期表里逐单调整。
   useEffect(() => {
-    if (!tokens || seats < 1 || price < 0) return;
+    if (!tokens || !firstLeg?.scheduleId || seats < 1 || firstLeg.price < 0) return;
     let cancelled = false;
     setPlanLoading(true);
     setFormError(null);
-    api.previewHoldPlan(tokens.accessToken, { flightScheduleId: schedule.id, cabin, seats, perSeatPriceCny: price, mode })
+    api.previewHoldPlan(tokens.accessToken, { flightScheduleId: firstLeg.scheduleId, cabin: firstLeg.cabin, seats, perSeatPriceCny: firstLeg.price, mode })
       .then((result) => { if (!cancelled) { setPlanRows(result.plan.installments); setDueDates({}); } })
       .catch((err) => { if (!cancelled) { setPlanRows([]); setFormError(err instanceof Error ? err.message : '收款计划预览失败'); } })
       .finally(() => { if (!cancelled) setPlanLoading(false); });
     return () => { cancelled = true; };
-  }, [tokens, schedule.id, cabin, seats, price, mode]);
+  }, [tokens, firstLeg?.scheduleId, firstLeg?.cabin, firstLeg?.price, seats, mode]);
+
   const visibleRows = planRows.map((row) => ({ ...row, key: String(row.seq), dueDate: dueDates[String(row.seq)] ?? row.dueDate }));
-  const valid = seats >= 1 && (mode === 'ALLOTMENT' || seats <= max) && price >= 0 && !planLoading && planRows.length > 0 && planRows.every((row) => row.amountCny >= 0) && (ownerType === 'AGENT' ? !!agentId : !!groupName.trim()) && (ratio === '' || (ratio >= 0 && ratio <= 50));
+  const nearDepartureLegs = legs.filter((leg) => {
+    const schedule = scheduleOf(leg);
+    return schedule ? daysUntil(schedule.departureTime) <= NEAR_DEPARTURE_DAYS : false;
+  });
+  const overbookedLegs = mode === 'RESERVE' ? legs.filter((leg) => seats > availabilityOf(leg)) : [];
+  const duplicatedLeg = legs.some((leg, index) => legs.findIndex((other) => other.scheduleId === leg.scheduleId && other.cabin === leg.cabin) !== index);
+  const totalCny = legs.reduce((sum, leg) => sum + leg.price * seats, 0);
+
+  const valid =
+    legs.length > 0 &&
+    legs.every((leg) => leg.scheduleId && leg.price >= 0) &&
+    !duplicatedLeg &&
+    seats >= 1 &&
+    overbookedLegs.length === 0 &&
+    !planLoading &&
+    planRows.length > 0 &&
+    (ownerType === 'AGENT' ? !!agentId : !!groupName.trim()) &&
+    (ratio === '' || (ratio >= 0 && ratio <= 50)) &&
+    (nearDepartureLegs.length === 0 || dateConfirmed);
 
   const submit = async () => {
     if (!valid) return;
     setFormError(null);
     try {
       await onSubmit({
-        cabin,
+        legs: legs.map((leg) => ({ flightScheduleId: leg.scheduleId, cabin: leg.cabin, perSeatPriceCny: leg.price })),
         seats,
-        perSeatPriceCny: price,
-        ownerType,
         mode,
-        ...(mode === 'RESERVE' && Object.keys(dueDates).length > 0 ? { installmentsOverride: visibleRows.map((row) => row.perPersonCny != null ? ({ label: row.label, perPersonCny: row.perPersonCny, dueDate: row.dueDate }) : ({ label: row.label, dueDate: row.dueDate })) } : {}),
-        ...(ownerType === 'AGENT' ? { agentId } : { groupName: groupName.trim() }),
+        ownerType,
+        ...(singleLeg && Object.keys(dueDates).length > 0
+          ? { installmentsOverride: visibleRows.map((row) => row.perPersonCny != null ? ({ label: row.label, perPersonCny: row.perPersonCny, dueDate: row.dueDate }) : ({ label: row.label, dueDate: row.dueDate })) }
+          : {}),
+        ...(ownerType === 'AGENT' ? { agentId } : {}),
+        ...(groupName.trim() ? { groupName: groupName.trim() } : {}),
         ...(ratio !== '' ? { freeCancelRatio: ratio / 100 } : {}),
         ...(notes.trim() ? { notes: notes.trim() } : {}),
       });
@@ -501,22 +673,134 @@ function CreateHoldModal({
   };
 
   return (
-    <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="新建占位单" tabIndex={-1} className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" onClick={onCancel}>
-      <div className="w-full max-w-lg rounded-lg bg-white shadow-xl" onClick={(e) => e.stopPropagation()}>
-        <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3"><h2 className="text-lg font-semibold">新建占位单</h2><button onClick={onCancel} className="text-xl text-slate-400">×</button></div>
+    <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="新建占位单" tabIndex={-1} className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-slate-900/50 p-4" onClick={onCancel}>
+      <div className="my-6 w-full max-w-3xl rounded-lg bg-white shadow-xl" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3">
+          <h2 className="text-lg font-semibold">新建占位单{legs.length > 1 ? `（${legs.length} 个航段，同一个团）` : ''}</h2>
+          <button onClick={onCancel} className="text-xl text-slate-400" aria-label="关闭">×</button>
+        </div>
         <div className="space-y-4 px-5 py-4">
-          <div className="rounded bg-slate-50 px-3 py-2 text-xs text-ink-muted">班次：{formatLocalDate(schedule.departureTime, schedule.departureTz)} {formatLocalTime(schedule.departureTime, schedule.departureTz)}</div>
-          <div className="grid gap-3 sm:grid-cols-2">
-            <div><label className="label">舱位</label><select className="input" value={cabin} onChange={(e) => setCabin(e.target.value as CabinClass)}>{CABINS.filter((c) => schedule.seatClasses.some((s) => s.cabin === c)).map((c) => <option key={c} value={c}>{CABIN_LABEL[c] ?? c}</option>)}</select><p className="mt-1 text-xs text-ink-muted">当前可售余量 {max} 座</p></div>
-            <div><label className="label">占位座位数</label><input className="input" type="number" min={1} max={600} value={seats} onChange={(e) => setSeats(Number(e.target.value))} /></div>
-            <div><label className="label">锁定结算价（元/人）</label><input className="input" type="number" min={0} value={price} onChange={(e) => setPrice(Number(e.target.value))} /></div>
+          <div>
+            <div className="flex items-center justify-between">
+              <p className="label mb-0">留位航段</p>
+              <button type="button" className="btn-secondary px-2 py-1 text-xs" onClick={() => setLegs((old) => [...old, makeLeg(old[old.length - 1]?.date ?? defaultDate, '')])}>
+                + 添加航段（去程 / 回程）
+              </button>
+            </div>
+            <p className="mt-1 text-xs text-ink-muted">出发日期在这里选，选几号就留几号；同一个团的多个航段会拿到同一个团号。</p>
+            <div className="mt-2 space-y-2">
+              {legs.map((leg, index) => {
+                const schedule = scheduleOf(leg);
+                const avail = availabilityOf(leg);
+                const near = schedule ? daysUntil(schedule.departureTime) <= NEAR_DEPARTURE_DAYS : false;
+                return (
+                  <div key={leg.key} className={`rounded border px-3 py-2 ${near ? 'border-amber-300 bg-amber-50' : 'border-slate-200 bg-slate-50'}`}>
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-semibold text-ink-soft">{index === 0 ? '第 1 段（去程）' : `第 ${index + 1} 段`}</span>
+                      {legs.length > 1 && (
+                        <button type="button" className="text-xs font-medium text-rose-600" onClick={() => setLegs((old) => old.filter((item) => item.key !== leg.key))}>移除</button>
+                      )}
+                    </div>
+                    <div className="mt-2 grid gap-2 sm:grid-cols-5">
+                      <div>
+                        <label className="label text-xs">出发日期</label>
+                        <select className="input" value={leg.date} onChange={(e) => patchLeg(leg.key, { date: e.target.value })}>
+                          {dateOptions.map((date) => <option key={date} value={date}>{date}</option>)}
+                        </select>
+                      </div>
+                      <div>
+                        <label className="label text-xs">航班号</label>
+                        <select className="input" value={leg.flightId} onChange={(e) => patchLeg(leg.key, { flightId: e.target.value })}>
+                          {flightsOn(leg.date).map((flight) => <option key={flight.id} value={flight.id}>{flight.flightNumber} · {flight.originCode} → {flight.destinationCode}</option>)}
+                        </select>
+                      </div>
+                      <div>
+                        <label className="label text-xs">班次时刻</label>
+                        <select className="input" value={leg.scheduleId} onChange={(e) => patchLeg(leg.key, { scheduleId: e.target.value })}>
+                          {schedulesOn(leg.date, leg.flightId).map((item) => <option key={item.id} value={item.id}>{formatLocalTime(item.departureTime, item.departureTz)} 出发</option>)}
+                        </select>
+                      </div>
+                      <div>
+                        <label className="label text-xs">舱位</label>
+                        <select className="input" value={leg.cabin} onChange={(e) => patchLeg(leg.key, { cabin: e.target.value as CabinClass })}>
+                          {CABINS.filter((c) => schedule?.seatClasses.some((s) => s.cabin === c)).map((c) => <option key={c} value={c}>{CABIN_LABEL[c] ?? c}</option>)}
+                        </select>
+                      </div>
+                      <div>
+                        <label className="label text-xs">锁价（元/人）</label>
+                        <input className="input" type="number" min={0} value={leg.price} onChange={(e) => patchLeg(leg.key, { price: Number(e.target.value) })} />
+                      </div>
+                    </div>
+                    <p className="mt-1 text-xs text-ink-muted">
+                      {schedule ? `${formatLocalDate(schedule.departureTime, schedule.departureTz)} ${formatLocalTime(schedule.departureTime, schedule.departureTz)} 出发 · ` : ''}
+                      当前可售余量 <strong className={mode === 'RESERVE' && seats > avail ? 'text-rose-600' : ''}>{avail}</strong> 座
+                      {near && <span className="ml-2 font-semibold text-amber-700">距起飞不足 {NEAR_DEPARTURE_DAYS + 1} 天，请确认是不是要留这一天</span>}
+                    </p>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          <div className="grid gap-3 sm:grid-cols-3">
+            <div><label className="label">占位座位数（全团）</label><input className="input" type="number" min={1} max={600} value={seats} onChange={(e) => setSeats(Number(e.target.value))} /></div>
             <div><label className="label">归属</label><select className="input" value={ownerType} onChange={(e) => setOwnerType(e.target.value as HoldOwnerType)}><option value="AGENT">代理</option><option value="CUSTOMER">直客</option></select></div>
             <div><label className="label">占位模式</label><select className="input" value={mode} onChange={(e) => setMode(e.target.value as 'RESERVE' | 'ALLOTMENT')}><option value="RESERVE">留位（建单即占座）</option><option value="ALLOTMENT">切位（全款才占座）</option></select></div>
           </div>
-          {ownerType === 'AGENT' ? <div><label className="label">代理</label><select className="input" value={agentId} onChange={(e) => setAgentId(e.target.value)}>{agents.length === 0 && <option value="">暂无可用代理</option>}{agents.map((a) => <option key={a.id} value={a.id}>{agentLabel(a)}</option>)}</select></div> : <div><label className="label">团名 / 客户备注名</label><input className="input" maxLength={120} value={groupName} onChange={(e) => setGroupName(e.target.value)} placeholder="例如：春季团队" /></div>}
-          <div className="grid gap-3 sm:grid-cols-2"><div><label className="label">免损比例（%，选填）</label><input className="input" type="number" min={0} max={50} step={1} value={ratio} onChange={(e) => setRatio(e.target.value === '' ? '' : Number(e.target.value))} /></div><div><label className="label">备注（选填）</label><input className="input" maxLength={500} value={notes} onChange={(e) => setNotes(e.target.value)} /></div></div>
-          <div><p className="label">收款计划预览（服务端计算，截止日可手调）</p>{planLoading ? <p className="rounded bg-slate-50 px-3 py-2 text-sm text-ink-muted">计算收款计划…</p> : <div className="overflow-x-auto rounded border border-slate-200"><table className="w-full text-xs"><thead><tr className="bg-slate-50"><th className="px-2 py-1 text-left">期</th><th className="px-2 py-1 text-right">应收</th><th className="px-2 py-1 text-left">截止</th></tr></thead><tbody>{visibleRows.map((row) => <tr key={row.key}><td className="px-2 py-1">{row.label}</td><td className="px-2 py-1 text-right">¥{row.amountCny.toLocaleString()}</td><td className="px-2 py-1"><input className="input h-7 py-0 text-xs" type="date" value={row.dueDate} onChange={(e) => setDueDates((old) => ({ ...old, [row.key]: e.target.value }))} /></td></tr>)}</tbody></table></div>}</div>
-          {mode === 'RESERVE' && seats > max && <p className="rounded bg-rose-50 px-3 py-2 text-sm text-rose-700">占位数不能超过当前可售余量 {max} 座</p>}
+
+          <div className="grid gap-3 sm:grid-cols-2">
+            {ownerType === 'AGENT' && (
+              <div><label className="label">代理</label><select className="input" value={agentId} onChange={(e) => setAgentId(e.target.value)}>{agents.length === 0 && <option value="">暂无可用代理</option>}{agents.map((a) => <option key={a.id} value={a.id}>{agentLabel(a)}</option>)}</select></div>
+            )}
+            {/* 团名对代理归属同样开放：代理团也要能按团名找回来，否则列表里只有一串单号 */}
+            <div>
+              <label className="label">团名 / 客户备注名{ownerType === 'CUSTOMER' ? '' : '（选填）'}</label>
+              <input className="input" maxLength={120} value={groupName} onChange={(e) => setGroupName(e.target.value)} placeholder="例如：九月国旅团" />
+            </div>
+          </div>
+
+          <div className="grid gap-3 sm:grid-cols-2">
+            <div><label className="label">免损比例（%，选填）</label><input className="input" type="number" min={0} max={50} step={1} value={ratio} onChange={(e) => setRatio(e.target.value === '' ? '' : Number(e.target.value))} /></div>
+            <div><label className="label">备注（选填）</label><input className="input" maxLength={500} value={notes} onChange={(e) => setNotes(e.target.value)} /></div>
+          </div>
+
+          <div>
+            <p className="label">收款计划预览（服务端计算{singleLeg ? '，截止日可手调' : '，多航段各段按同一套期次结构各算各的金额'}）</p>
+            {planLoading ? <p className="rounded bg-slate-50 px-3 py-2 text-sm text-ink-muted">计算收款计划…</p> : (
+              <div className="overflow-x-auto rounded border border-slate-200">
+                <table className="w-full text-xs">
+                  <thead><tr className="bg-slate-50"><th className="px-2 py-1 text-left">期</th><th className="px-2 py-1 text-right">应收{singleLeg ? '' : '（第 1 段）'}</th><th className="px-2 py-1 text-left">截止</th></tr></thead>
+                  <tbody>
+                    {visibleRows.map((row) => (
+                      <tr key={row.key}>
+                        <td className="px-2 py-1">{row.label}</td>
+                        <td className="px-2 py-1 text-right">¥{row.amountCny.toLocaleString()}</td>
+                        <td className="px-2 py-1">
+                          {singleLeg
+                            ? <input className="input h-7 py-0 text-xs" type="date" value={row.dueDate} onChange={(e) => setDueDates((old) => ({ ...old, [row.key]: e.target.value }))} />
+                            : row.dueDate}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            {legs.length > 1 && <p className="mt-1 text-xs text-ink-muted">全团应收合计 ¥{totalCny.toLocaleString()}（{seats} 座 × {legs.map((leg) => `¥${leg.price}`).join(' + ')}）</p>}
+          </div>
+
+          {nearDepartureLegs.length > 0 && (
+            <label className="flex items-start gap-2 rounded border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+              <input type="checkbox" className="mt-1" checked={dateConfirmed} onChange={(e) => setDateConfirmed(e.target.checked)} />
+              <span>
+                有 {nearDepartureLegs.length} 个航段就在最近几天起飞
+                （{nearDepartureLegs.map((leg) => { const s = scheduleOf(leg); return s ? formatLocalDate(s.departureTime, s.departureTz) : ''; }).filter(Boolean).join('、')}）。
+                我已确认要留的就是这几天。
+              </span>
+            </label>
+          )}
+          {duplicatedLeg && <p className="rounded bg-rose-50 px-3 py-2 text-sm text-rose-700">同一班次同一舱位重复添加了，会把同一批人留两遍</p>}
+          {overbookedLegs.length > 0 && <p className="rounded bg-rose-50 px-3 py-2 text-sm text-rose-700">有航段可售余量不足 {seats} 座，无法留位</p>}
           {formError && <p className="rounded bg-rose-50 px-3 py-2 text-sm text-rose-700">{formError}</p>}
           <div className="flex justify-end gap-3"><button className="btn-secondary" onClick={onCancel}>取消</button><button className="btn-primary" disabled={!valid} onClick={() => void submit()}>确认建单</button></div>
         </div>

@@ -731,6 +731,9 @@ model HoldOrder {
   ownerType        HoldOwnerType
   agentId          String?
   groupName        String?
+  /// 团号：同一个团的多个航段（去程/回程/多段）共享一个团号，建单时统一生成。
+  /// 单航段占位也会有团号，保证「按团查」永远能用一个口径查出全部航段。
+  groupRef         String?
   seats            Int
   seatsConverted   Int             @default(0)
   seatsCancelled   Int             @default(0)
@@ -758,6 +761,7 @@ model HoldOrder {
   @@index([seatClassId, status])
   @@index([flightScheduleId, status])
   @@index([agentId, status])
+  @@index([groupRef])
 }
 
 model HoldInstallment {

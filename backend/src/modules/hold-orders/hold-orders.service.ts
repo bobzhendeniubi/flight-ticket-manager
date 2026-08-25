@@ -44,6 +44,7 @@ import {
 import { computeReduction, type ReductionResult } from './hold-reduction.js';
 import type {
   AllocateHoldInstallmentBody,
+  CreateHoldGroupBody,
   CreateHoldOrderBody,
   ListHoldOrdersQuery,
   ReduceHoldSeatsBody,
@@ -75,6 +76,14 @@ function generateHoldNo(now = new Date()): string {
   let suffix = '';
   for (let i = 0; i < 4; i++) suffix += HOLD_NO_ALPHABET[randomInt(HOLD_NO_ALPHABET.length)];
   return `H${date}${suffix}`;
+}
+
+/** 团号 `G{YYYYMMDD}{4位}`：同一次建团的所有航段共用，用于「按团查/按团核对」。 */
+function generateGroupRef(now = new Date()): string {
+  const date = `${now.getUTCFullYear()}${String(now.getUTCMonth() + 1).padStart(2, '0')}${String(now.getUTCDate()).padStart(2, '0')}`;
+  let suffix = '';
+  for (let i = 0; i < 4; i++) suffix += HOLD_NO_ALPHABET[randomInt(HOLD_NO_ALPHABET.length)];
+  return `G${date}${suffix}`;
 }
 
 function isUniqueViolation(error: unknown): boolean {
@@ -272,94 +281,210 @@ async function enqueueFulfillmentTasks(taskIds: string[]): Promise<void> {
   }
 }
 
+/**
+ * 占位单列表筛选条件。出发日期区间按起飞地当地日折算——先用权威 SQL（双段 AT TIME ZONE）
+ * 解析出区间内的班次 id，再交给 Prisma 过滤；不用「UTC 窗口 ± 1 天」猜，避免跨时区边界漏单。
+ */
+async function holdListWhere(query: ListHoldOrdersQuery): Promise<Prisma.HoldOrderWhereInput> {
+  const where: Prisma.HoldOrderWhereInput = {
+    ...(query.flightScheduleId ? { flightScheduleId: query.flightScheduleId } : {}),
+    ...(query.status ? { status: query.status } : {}),
+    ...(query.agentId ? { agentId: query.agentId } : {}),
+    ...(query.groupRef ? { groupRef: query.groupRef } : {}),
+    ...(query.flightId ? { flightSchedule: { flightId: query.flightId } } : {}),
+  };
+  if (!query.from && !query.to) return where;
+
+  const from = query.from ?? null;
+  const to = query.to ?? null;
+  const rows = await prisma.$queryRaw<Array<{ id: string }>>`
+    SELECT s.id FROM "FlightSchedule" s
+    WHERE (${from}::text IS NULL OR (s."departureTime" AT TIME ZONE 'UTC' AT TIME ZONE s."departureTz")::date >= ${from}::date)
+      AND (${to}::text IS NULL OR (s."departureTime" AT TIME ZONE 'UTC' AT TIME ZONE s."departureTz")::date <= ${to}::date)
+  `;
+  const ids = rows.map((row) => row.id);
+  // 命中的班次与显式指定的班次取交集；区间内没有任何班次时用空集合，宁可返回空也不放行全量。
+  const scoped = query.flightScheduleId ? ids.filter((id) => id === query.flightScheduleId) : ids;
+  return { ...where, flightScheduleId: { in: scoped } };
+}
+
 export class HoldOrderService {
   private readonly orderService = new OrderService();
   private readonly paymentsService = new PaymentsService();
+  /**
+   * 单航段建单的事务体。抽出来是为了让「建团」能把多个航段放进同一个事务：
+   * 要么整团都占上，要么一个都不占——避免去程占住、回程失败留下半个团。
+   */
+  private async createHoldInTx(
+    tx: Tx,
+    leg: { flightScheduleId: string; cabin: CabinClass; perSeatPriceCny: number },
+    shared: {
+      seats: number;
+      mode: 'RESERVE' | 'ALLOTMENT';
+      ownerType: HoldOwnerType;
+      agentId?: string;
+      groupName?: string;
+      freeCancelRatio?: number;
+      notes?: string;
+      installmentsOverride?: CreateHoldOrderBody['installmentsOverride'];
+      groupRef: string | null;
+    },
+    createdById: string,
+    now: Date,
+  ) {
+    const rows = await tx.$queryRaw<Array<{ id: string; scheduleId: string; capacity: number; sold: number }>>`
+      SELECT id, "scheduleId", capacity, sold FROM "FlightSeatClass"
+      WHERE "scheduleId" = ${leg.flightScheduleId} AND cabin = ${leg.cabin}::"CabinClass" FOR UPDATE
+    `;
+    const seatClass = rows[0];
+    if (!seatClass) throw new NotFoundError('舱位不存在');
+    if (shared.ownerType === HoldOwnerType.AGENT) {
+      const agent = await tx.agent.findUnique({ where: { id: shared.agentId! }, select: { id: true } });
+      if (!agent) throw new NotFoundError('代理不存在');
+    }
+
+    const mode = shared.mode ?? 'RESERVE';
+    if (mode === 'RESERVE') {
+      const remaining = await seatsAvailableForNewHold(tx, seatClass.id, shared.seats);
+      if (remaining < 0) throw new ConflictError(`余票不足：需要占位 ${shared.seats} 张，仅剩 ${Math.max(0, remaining + shared.seats)} 张可占`);
+    }
+
+    const scheduleDelegate = (tx as unknown as { flightSchedule?: { findUnique: (args: unknown) => Promise<{ departureTime: Date; departureTz: string } | null> } }).flightSchedule;
+    const schedule = scheduleDelegate
+      ? await scheduleDelegate.findUnique({ where: { id: leg.flightScheduleId }, select: { departureTime: true, departureTz: true } })
+      : { departureTime: now, departureTz: 'UTC' };
+    if (!schedule) throw new NotFoundError('航班班次不存在');
+
+    const config = await readConfig(tx);
+    let installments;
+    let occupyOn: HoldOccupyOn;
+    let status: HoldOrderStatus;
+    if (mode === 'ALLOTMENT') {
+      occupyOn = HoldOccupyOn.FULL_PAYMENT;
+      status = HoldOrderStatus.PENDING;
+      installments = [{ seq: 1, label: '全款', amountRule: HoldAmountRule.REMAINDER, perPersonCny: null, amountCny: shared.seats * leg.perSeatPriceCny, seatsBasis: shared.seats, dueDate: new Date(`${dateInTimezone(now, schedule.departureTz)}T00:00:00Z`) }];
+    } else {
+      occupyOn = HoldOccupyOn.CREATE;
+      status = HoldOrderStatus.HOLDING;
+      installments = shared.installmentsOverride
+        ? buildInstallmentsFromOverride({ seats: shared.seats, perSeatPriceCny: leg.perSeatPriceCny, createdAt: now, departureTz: schedule.departureTz, overrides: shared.installmentsOverride as HoldInstallmentOverride[] })
+        : foldInstallments({ seats: shared.seats, perSeatPriceCny: leg.perSeatPriceCny, createdAt: now, departureTime: schedule.departureTime, departureTz: schedule.departureTz, templates: configTemplates(config.installments) });
+      status = deriveHoldStatus(
+        { status: HoldOrderStatus.HOLDING },
+        installments.map((item) => ({
+          amountCny: item.amountCny,
+          status: item.amountCny === 0 ? HoldInstallmentStatus.PAID : HoldInstallmentStatus.PENDING,
+          dueDate: item.dueDate,
+        })),
+        dateInTimezone(now, schedule.departureTz),
+      );
+    }
+
+    return tx.holdOrder.create({
+      data: {
+        holdNo: generateHoldNo(now),
+        flightScheduleId: leg.flightScheduleId,
+        seatClassId: seatClass.id,
+        ownerType: shared.ownerType,
+        agentId: shared.ownerType === HoldOwnerType.AGENT ? shared.agentId! : null,
+        groupName: shared.groupName?.trim() ?? null,
+        groupRef: shared.groupRef,
+        seats: shared.seats,
+        perSeatPriceCny: leg.perSeatPriceCny,
+        freeCancelRatio: new Prisma.Decimal(shared.freeCancelRatio ?? Number(config.defaultFreeCancelRatio)),
+        occupyOn,
+        notes: shared.notes?.trim() ?? null,
+        createdById,
+        status,
+        installments: {
+          create: installmentCreateData(installments).map((item) => ({
+            ...item,
+            status: item.amountCny === 0 ? HoldInstallmentStatus.PAID : HoldInstallmentStatus.PENDING,
+            paidAt: item.amountCny === 0 ? now : null,
+          })),
+        },
+      },
+      include: { installments: { orderBy: { seq: 'asc' } } },
+    });
+  }
+
   async create(body: CreateHoldOrderBody, createdById: string, actor?: AuditActor) {
     if (body.ownerType === HoldOwnerType.AGENT && !body.agentId) throw new BadRequestError('代理占位必须选择代理');
     if (body.ownerType === HoldOwnerType.CUSTOMER && !body.groupName?.trim()) throw new BadRequestError('直客占位必须填写团名或客户备注名');
 
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        const holdOrder = await prisma.$transaction(async (tx) => {
-          const rows = await tx.$queryRaw<Array<{ id: string; scheduleId: string; capacity: number; sold: number }>>`
-            SELECT id, "scheduleId", capacity, sold FROM "FlightSeatClass"
-            WHERE "scheduleId" = ${body.flightScheduleId} AND cabin = ${body.cabin}::"CabinClass" FOR UPDATE
-          `;
-          const seatClass = rows[0];
-          if (!seatClass) throw new NotFoundError('舱位不存在');
-          if (body.ownerType === HoldOwnerType.AGENT) {
-            const agent = await tx.agent.findUnique({ where: { id: body.agentId! }, select: { id: true } });
-            if (!agent) throw new NotFoundError('代理不存在');
-          }
-
-          const now = new Date();
-          const mode = body.mode ?? 'RESERVE';
-          if (mode === 'RESERVE') {
-            const remaining = await seatsAvailableForNewHold(tx, seatClass.id, body.seats);
-            if (remaining < 0) throw new ConflictError(`余票不足：需要占位 ${body.seats} 张，仅剩 ${Math.max(0, remaining + body.seats)} 张可占`);
-          }
-
-          const scheduleDelegate = (tx as unknown as { flightSchedule?: { findUnique: (args: unknown) => Promise<{ departureTime: Date; departureTz: string } | null> } }).flightSchedule;
-          const schedule = scheduleDelegate
-            ? await scheduleDelegate.findUnique({ where: { id: body.flightScheduleId }, select: { departureTime: true, departureTz: true } })
-            : { departureTime: now, departureTz: 'UTC' };
-          if (!schedule) throw new NotFoundError('航班班次不存在');
-
-          const config = await readConfig(tx);
-          let installments;
-          let occupyOn: HoldOccupyOn;
-          let status: HoldOrderStatus;
-          if (mode === 'ALLOTMENT') {
-            occupyOn = HoldOccupyOn.FULL_PAYMENT;
-            status = HoldOrderStatus.PENDING;
-            installments = [{ seq: 1, label: '全款', amountRule: HoldAmountRule.REMAINDER, perPersonCny: null, amountCny: body.seats * body.perSeatPriceCny, seatsBasis: body.seats, dueDate: new Date(`${dateInTimezone(now, schedule.departureTz)}T00:00:00Z`) }];
-          } else {
-            occupyOn = HoldOccupyOn.CREATE;
-            status = HoldOrderStatus.HOLDING;
-            installments = body.installmentsOverride
-              ? buildInstallmentsFromOverride({ seats: body.seats, perSeatPriceCny: body.perSeatPriceCny, createdAt: now, departureTz: schedule.departureTz, overrides: body.installmentsOverride as HoldInstallmentOverride[] })
-              : foldInstallments({ seats: body.seats, perSeatPriceCny: body.perSeatPriceCny, createdAt: now, departureTime: schedule.departureTime, departureTz: schedule.departureTz, templates: configTemplates(config.installments) });
-            status = deriveHoldStatus(
-              { status: HoldOrderStatus.HOLDING },
-              installments.map((item) => ({
-                amountCny: item.amountCny,
-                status: item.amountCny === 0 ? HoldInstallmentStatus.PAID : HoldInstallmentStatus.PENDING,
-                dueDate: item.dueDate,
-              })),
-              dateInTimezone(now, schedule.departureTz),
-            );
-          }
-
-          const created = await tx.holdOrder.create({
-            data: {
-              holdNo: generateHoldNo(now),
-              flightScheduleId: body.flightScheduleId,
-              seatClassId: seatClass.id,
-              ownerType: body.ownerType,
-              agentId: body.ownerType === HoldOwnerType.AGENT ? body.agentId! : null,
-              groupName: body.groupName?.trim() ?? null,
+        const now = new Date();
+        const holdOrder = await prisma.$transaction(async (tx) =>
+          this.createHoldInTx(
+            tx,
+            { flightScheduleId: body.flightScheduleId, cabin: body.cabin, perSeatPriceCny: body.perSeatPriceCny },
+            {
               seats: body.seats,
-              perSeatPriceCny: body.perSeatPriceCny,
-              freeCancelRatio: new Prisma.Decimal(body.freeCancelRatio ?? Number(config.defaultFreeCancelRatio)),
-              occupyOn,
-              notes: body.notes?.trim() ?? null,
-              createdById,
-              status,
-              installments: {
-                create: installmentCreateData(installments).map((item) => ({
-                  ...item,
-                  status: item.amountCny === 0 ? HoldInstallmentStatus.PAID : HoldInstallmentStatus.PENDING,
-                  paidAt: item.amountCny === 0 ? now : null,
-                })),
-              },
+              mode: body.mode ?? 'RESERVE',
+              ownerType: body.ownerType,
+              agentId: body.agentId,
+              groupName: body.groupName,
+              freeCancelRatio: body.freeCancelRatio,
+              notes: body.notes,
+              installmentsOverride: body.installmentsOverride,
+              groupRef: null,
             },
-            include: { installments: { orderBy: { seq: 'asc' } } },
-          });
-          return created;
-        });
+            createdById,
+            now,
+          ),
+        );
         auditHold(actor, 'CREATE_HOLD_ORDER', holdOrder, { after: { holdNo: holdOrder.holdNo, seats: holdOrder.seats, perSeatPriceCny: holdOrder.perSeatPriceCny, occupyOn: holdOrder.occupyOn, status: holdOrder.status } });
         return holdOrder;
+      } catch (error) {
+        if (!isUniqueViolation(error) || attempt === 2) throw error;
+      }
+    }
+    throw new ConflictError('占位单号生成失败，请稍后重试');
+  }
+
+  /**
+   * 建团占位：一次为同一个团的多个航段建单，落同一个团号，整团同一事务。
+   * 去程占上、回程余票不足这种半成品是运营最难收拾的状态，所以宁可整团失败。
+   */
+  async createGroup(body: CreateHoldGroupBody, createdById: string, actor?: AuditActor) {
+    if (body.ownerType === HoldOwnerType.AGENT && !body.agentId) throw new BadRequestError('代理占位必须选择代理');
+    if (body.ownerType === HoldOwnerType.CUSTOMER && !body.groupName?.trim()) throw new BadRequestError('直客占位必须填写团名或客户备注名');
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const now = new Date();
+      const groupRef = generateGroupRef(now);
+      try {
+        const holdOrders = await prisma.$transaction(async (tx) => {
+          const created = [];
+          // 顺序建单：多段共用一个事务，FlightSeatClass 的 FOR UPDATE 行锁按 leg 顺序累积获取。
+          for (const leg of body.legs) {
+            created.push(
+              await this.createHoldInTx(
+                tx,
+                leg,
+                {
+                  seats: body.seats,
+                  mode: body.mode ?? 'RESERVE',
+                  ownerType: body.ownerType,
+                  agentId: body.agentId,
+                  groupName: body.groupName,
+                  freeCancelRatio: body.freeCancelRatio,
+                  notes: body.notes,
+                  installmentsOverride: body.installmentsOverride,
+                  groupRef,
+                },
+                createdById,
+                now,
+              ),
+            );
+          }
+          return created;
+        });
+        for (const holdOrder of holdOrders) {
+          auditHold(actor, 'CREATE_HOLD_ORDER', holdOrder, { after: { holdNo: holdOrder.holdNo, groupRef, seats: holdOrder.seats, perSeatPriceCny: holdOrder.perSeatPriceCny, occupyOn: holdOrder.occupyOn, status: holdOrder.status } });
+        }
+        return { groupRef, holdOrders };
       } catch (error) {
         if (!isUniqueViolation(error) || attempt === 2) throw error;
       }
@@ -398,11 +523,7 @@ export class HoldOrderService {
 
   async list(query: ListHoldOrdersQuery) {
     const rows = await prisma.holdOrder.findMany({
-      where: {
-        ...(query.flightScheduleId ? { flightScheduleId: query.flightScheduleId } : {}),
-        ...(query.status ? { status: query.status } : {}),
-        ...(query.agentId ? { agentId: query.agentId } : {}),
-      },
+      where: await holdListWhere(query),
       include: {
         installments: { orderBy: { seq: 'asc' }, include: { allocations: true } },
         reductions: { orderBy: { createdAt: 'asc' } },
@@ -411,10 +532,18 @@ export class HoldOrderService {
           include: { order: { select: { orderNumber: true } } },
         },
         seatClass: { select: { cabin: true } },
-        flightSchedule: { select: { id: true, departureTime: true, departureTz: true, flight: { select: { flightNumber: true } } } },
+        flightSchedule: {
+          select: {
+            id: true,
+            departureTime: true,
+            departureTz: true,
+            flight: { select: { id: true, flightNumber: true, originCode: true, destinationCode: true } },
+          },
+        },
         agent: { select: { id: true, companyName: true, contactName: true } },
       },
-      orderBy: { createdAt: 'desc' },
+      // 跨日期视图的主序是出发日期（先飞的排前面），同一天内按建单时间倒序。
+      orderBy: [{ flightSchedule: { departureTime: 'asc' } }, { createdAt: 'desc' }],
     });
     const normalized = rows.map((row) => ({
       ...row,
@@ -431,6 +560,10 @@ export class HoldOrderService {
     const scheduleId = query.flightScheduleId ?? null;
     const status = query.status ?? null;
     const agentId = query.agentId ?? null;
+    const flightId = query.flightId ?? null;
+    const groupRef = query.groupRef ?? null;
+    const from = query.from ?? null;
+    const to = query.to ?? null;
     const rows = await prisma.$queryRaw<Array<{
       occupiedOrderCount: bigint | number;
       occupiedSeats: bigint | number;
@@ -451,9 +584,15 @@ export class HoldOrderService {
           WHERE i."holdOrderId" = h.id AND a."reversedAt" IS NULL
         )), 0) AS "receivedCny"
       FROM "HoldOrder" h
+      JOIN "FlightSchedule" s ON s.id = h."flightScheduleId"
       WHERE (${scheduleId}::text IS NULL OR h."flightScheduleId" = ${scheduleId})
         AND (${agentId}::text IS NULL OR h."agentId" = ${agentId})
         AND (${status}::text IS NULL OR h.status::text = ${status})
+        AND (${flightId}::text IS NULL OR s."flightId" = ${flightId})
+        AND (${groupRef}::text IS NULL OR h."groupRef" = ${groupRef})
+        -- 出发日按起飞地时区折算成当地日，与列表/座位统计同口径（naive timestamp 必须双段折算）
+        AND (${from}::text IS NULL OR (s."departureTime" AT TIME ZONE 'UTC' AT TIME ZONE s."departureTz")::date >= ${from}::date)
+        AND (${to}::text IS NULL OR (s."departureTime" AT TIME ZONE 'UTC' AT TIME ZONE s."departureTz")::date <= ${to}::date)
     `;
     const row = rows[0] ?? {
       occupiedOrderCount: 0,

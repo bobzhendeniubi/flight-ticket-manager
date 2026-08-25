@@ -8,6 +8,7 @@ import { actorFromRequest } from '../../lib/audit.js';
 import { HoldOrderService } from './hold-orders.service.js';
 import {
   allocateHoldInstallmentBodySchema,
+  createHoldGroupBodySchema,
   createHoldOrderBodySchema,
   convertHoldOrderBodySchema,
   listHoldOrdersQuerySchema,
@@ -29,6 +30,13 @@ export const holdOrderRoutes: FastifyPluginAsync = async (app) => {
     const body = createHoldOrderBodySchema.parse(req.body);
     const holdOrder = await service.create(body, req.user.sub, actorFromRequest(req));
     return reply.status(201).send({ holdOrder });
+  });
+
+  // 建团：一次为同一个团的多个航段建单（去程 / 回程 / 多段），落同一个团号，整团同一事务。
+  app.post('/group', pre, async (req, reply) => {
+    const body = createHoldGroupBodySchema.parse(req.body);
+    const result = await service.createGroup(body, req.user.sub, actorFromRequest(req));
+    return reply.code(201).send(result);
   });
 
   app.get('/', pre, async (req) => {

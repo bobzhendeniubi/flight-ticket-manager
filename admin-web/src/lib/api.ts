@@ -1077,6 +1077,8 @@ export interface HoldOrderRecord {
   ownerType: HoldOwnerType;
   agentId: string | null;
   groupName: string | null;
+  /** 团号：同一个团的去程 / 回程共用；加团号之前建的老占位单为 null */
+  groupRef: string | null;
   seats: number;
   seatsConverted: number;
   seatsCancelled: number;
@@ -1101,9 +1103,35 @@ export interface HoldOrderListItem extends HoldOrderRecord {
   flightSchedule: {
     id: string;
     departureTime: string;
-    flight: { flightNumber: string };
+    departureTz: string;
+    flight: { id: string; flightNumber: string; originCode: string; destinationCode: string };
   };
   agent: { id: string; companyName: string | null; contactName: string } | null;
+}
+
+/** 建团占位：多个航段（去程 / 回程 / 多段）一次建单，落同一个团号，整团同一事务。 */
+export interface CreateHoldGroupInput {
+  legs: Array<{ flightScheduleId: string; cabin: CabinClass; perSeatPriceCny: number }>;
+  seats: number;
+  mode: 'RESERVE' | 'ALLOTMENT';
+  ownerType: HoldOwnerType;
+  agentId?: string;
+  groupName?: string;
+  freeCancelRatio?: number;
+  notes?: string;
+}
+
+/** 占位单列表 / KPI 的筛选口径（跨日期视图与按班次视图共用）。 */
+export interface HoldOrderFilter {
+  flightScheduleId?: string;
+  flightId?: string;
+  status?: HoldOrderStatus;
+  agentId?: string;
+  groupRef?: string;
+  /** 出发日期起（含），起飞地当地日 */
+  from?: string;
+  /** 出发日期止（含），起飞地当地日 */
+  to?: string;
 }
 
 export interface HoldOrderConfig {
@@ -3059,6 +3087,17 @@ export interface OverpayToPoolResult {
   receiptNo: string;
 }
 
+/** 占位单筛选 → query string；空值一律不下发，后端把「没传」当作不筛。 */
+function holdOrderQuery(filter?: HoldOrderFilter): string {
+  const params = new URLSearchParams();
+  (Object.keys(filter ?? {}) as Array<keyof HoldOrderFilter>).forEach((key) => {
+    const value = filter?.[key];
+    if (value) params.set(key, value);
+  });
+  const qs = params.toString();
+  return qs ? `?${qs}` : '';
+}
+
 export const api = {
   login: (email: string, password: string) =>
     apiFetch<AuthResult>('/auth/login', {
@@ -3319,28 +3358,16 @@ export const api = {
     }),
   previewHoldPlan: (token: string, body: Omit<CreateHoldOrderInput, 'ownerType' | 'agentId' | 'groupName' | 'freeCancelRatio' | 'notes'>) =>
     apiFetch<{ plan: HoldPlanPreview }>('/hold-orders/preview-plan', { method: 'POST', token, body }),
-  listHoldOrders: (
-    token: string,
-    filter?: { flightScheduleId?: string; status?: HoldOrderStatus; agentId?: string },
-  ) => {
-    const params = new URLSearchParams();
-    if (filter?.flightScheduleId) params.set('flightScheduleId', filter.flightScheduleId);
-    if (filter?.status) params.set('status', filter.status);
-    if (filter?.agentId) params.set('agentId', filter.agentId);
-    const qs = params.toString() ? `?${params.toString()}` : '';
-    return apiFetch<{ holdOrders: HoldOrderListItem[] }>(`/hold-orders/${qs}`, { token });
-  },
-  getHoldOrderSummary: (
-    token: string,
-    filter?: { flightScheduleId?: string; status?: HoldOrderStatus; agentId?: string },
-  ) => {
-    const params = new URLSearchParams();
-    if (filter?.flightScheduleId) params.set('flightScheduleId', filter.flightScheduleId);
-    if (filter?.status) params.set('status', filter.status);
-    if (filter?.agentId) params.set('agentId', filter.agentId);
-    const qs = params.toString() ? `?${params.toString()}` : '';
-    return apiFetch<{ summary: HoldOrderSummary }>(`/hold-orders/summary${qs}`, { token });
-  },
+  createHoldOrderGroup: (token: string, body: CreateHoldGroupInput) =>
+    apiFetch<{ groupRef: string; holdOrders: HoldOrderRecord[] }>('/hold-orders/group', {
+      method: 'POST',
+      token,
+      body,
+    }),
+  listHoldOrders: (token: string, filter?: HoldOrderFilter) =>
+    apiFetch<{ holdOrders: HoldOrderListItem[] }>(`/hold-orders/${holdOrderQuery(filter)}`, { token }),
+  getHoldOrderSummary: (token: string, filter?: HoldOrderFilter) =>
+    apiFetch<{ summary: HoldOrderSummary }>(`/hold-orders/summary${holdOrderQuery(filter)}`, { token }),
   convertHoldOrder: (
     token: string,
     holdId: string,

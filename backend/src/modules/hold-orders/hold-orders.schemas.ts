@@ -54,6 +54,55 @@ export const createHoldOrderBodySchema = z
   });
 export type CreateHoldOrderBody = z.infer<typeof createHoldOrderBodySchema>;
 
+/**
+ * 建团占位：一次为同一个团的多个航段（去程 / 回程 / 多段）建单，落同一个团号。
+ * 座位数、归属、免损比例、备注全团共用；舱位与锁价逐段填（去回程价常常不同）。
+ * legs 只有一段时等价于单航段建单，仍会分配团号。
+ */
+export const createHoldGroupBodySchema = z
+  .object({
+    legs: z
+      .array(
+        z
+          .object({
+            flightScheduleId: z.string().min(1),
+            cabin: cabinSchema,
+            perSeatPriceCny: z.number().int().min(0),
+          })
+          .strict(),
+      )
+      .min(1)
+      .max(8),
+    seats: z.number().int().min(1).max(600),
+    mode: z.enum(['RESERVE', 'ALLOTMENT']).default('RESERVE'),
+    ownerType: ownerTypeSchema,
+    agentId: z.string().min(1).optional(),
+    groupName: z.string().trim().min(1).max(120).optional(),
+    freeCancelRatio: z.number().min(0).max(0.5).optional(),
+    // 手调的收款计划对全团各航段一体适用：一个团只有一套收款节奏，
+    // 金额仍按各段自己的锁价算（每人金额 × 座位数）。
+    installmentsOverride: installmentsOverrideSchema.optional(),
+    notes: z.string().max(500).optional(),
+  })
+  .superRefine((body, ctx) => {
+    if (body.ownerType === HoldOwnerType.AGENT && !body.agentId) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['agentId'], message: '代理占位必须选择代理' });
+    }
+    if (body.ownerType === HoldOwnerType.CUSTOMER && !body.groupName) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['groupName'], message: '直客占位必须填写团名或客户备注名' });
+    }
+    // 同一班次同一舱位重复选：两张单会各自占座，等于把同一批人留两遍。
+    const seen = new Set<string>();
+    body.legs.forEach((leg, index) => {
+      const key = `${leg.flightScheduleId}:${leg.cabin}`;
+      if (seen.has(key)) {
+        ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['legs', index], message: '同一班次同一舱位不能重复添加' });
+      }
+      seen.add(key);
+    });
+  });
+export type CreateHoldGroupBody = z.infer<typeof createHoldGroupBodySchema>;
+
 export const previewHoldPlanBodySchema = z.object({
   flightScheduleId: z.string().min(1),
   cabin: cabinSchema,
@@ -64,10 +113,20 @@ export const previewHoldPlanBodySchema = z.object({
 });
 export type PreviewHoldPlanBody = z.infer<typeof previewHoldPlanBodySchema>;
 
+const ymdSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, '日期格式应为 YYYY-MM-DD');
+
 export const listHoldOrdersQuerySchema = z.object({
   flightScheduleId: z.string().min(1).optional(),
   status: statusSchema.optional(),
   agentId: z.string().min(1).optional(),
+  /** 出发日期起（含），按起飞地当地日折算 */
+  from: ymdSchema.optional(),
+  /** 出发日期止（含），按起飞地当地日折算 */
+  to: ymdSchema.optional(),
+  /** 航班 id：跨日期视图下只看某个航班 */
+  flightId: z.string().min(1).optional(),
+  /** 团号：一次看全这个团的所有航段 */
+  groupRef: z.string().min(1).optional(),
 });
 export type ListHoldOrdersQuery = z.infer<typeof listHoldOrdersQuerySchema>;
 
