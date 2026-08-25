@@ -16,6 +16,56 @@ function moneyText(value: string | null): string {
   return `¥${Number(value).toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
+const DATA_ISSUE_LABELS: Record<string, string> = {
+  'passport:issued-after-order': '护照签发日晚于下单',
+  'passport:expiry-before-issue': '护照有效期早于签发',
+  'passport:expired-at-departure': '乘机时护照已过期',
+  'birth:year-out-of-range': '出生年份异常',
+  'birth:after-order': '出生日期晚于下单',
+  'birth:trimmed': '生日含多余空格(已清理)',
+  'expiryDate:trimmed': '有效期含多余空格(已清理)',
+  'issueDate:trimmed': '签发日含多余空格(已清理)',
+  'date_of_issue:manual-fix': '签发日已人工修正',
+  'birth:manual-fix': '生日已人工修正',
+  'expiry_date:manual-fix': '有效期已人工修正',
+  'hotelPrice:overflow': '单房差金额异常(超限置空)',
+  'issueDate:excel-serial': '签发日为Excel序列号(已转换)',
+  'birth:excel-serial': '生日为Excel序列号(已转换)',
+  'issueDate:invalid': '签发日无法解析',
+  'birth:invalid': '生日无法解析',
+  'expiryDate:invalid': '有效期无法解析',
+  'name:pinyin_mismatch': '拼音与中文名不符',
+  'name:missing_chinese_name': '缺中文姓名',
+  'name:non_han_script_name': '非汉字姓名',
+  'name:corrupted_pinyin_cyrillic_o': '拼音混入西里尔字母',
+  'name:corrupted_both_columns_digits': '姓名列混入数字',
+  'name:corrupted_chinese_zero_width_char': '中文名含不可见字符',
+  'name:honorific_prefix_noise': '姓名带称谓前缀',
+  'name:corrupted_pinyin_digit_zero': '拼音混入数字0',
+  'name:surname_missing_in_pinyin': '拼音缺姓氏',
+  'name:pinyin_col_holds_chinese_char': '拼音列含汉字',
+  'flight:multiple-outbound': '多条去程关联(取最早)',
+  'flight:multiple-return': '多条回程关联(取最早)',
+};
+
+function dataIssueLabel(issue: string): string {
+  const knownLabel = DATA_ISSUE_LABELS[issue];
+  if (knownLabel) return knownLabel;
+  if (issue.startsWith('passport:')) return `护照·${issue}`;
+  if (issue.startsWith('name:')) return `姓名·${issue}`;
+  if (issue.startsWith('birth:')) return `生日·${issue}`;
+  return issue;
+}
+
+function compactCount(value: number): string {
+  const absolute = Math.abs(value);
+  if (absolute < 1_000) return value.toLocaleString('zh-CN');
+  if (absolute < 1_000_000) {
+    return `${(value / 1_000).toFixed(absolute < 10_000 ? 1 : 0).replace(/\.0$/u, '')}k`;
+  }
+  return `${(value / 1_000_000).toFixed(absolute < 10_000_000 ? 1 : 0).replace(/\.0$/u, '')}m`;
+}
+
 export function LegacyArchivePage() {
   const token = useAuth((state) => state.tokens?.accessToken);
   const [searchParams] = useSearchParams();
@@ -144,7 +194,7 @@ export function LegacyArchivePage() {
           <button className="btn-primary" type="submit">查询</button>
           {applied.dataIssue && (
             <span className="flex items-center gap-2 text-xs text-amber-700">
-              数据质量筛选：<span className="badge-warning">{applied.dataIssue}</span>
+              数据质量筛选：<span className="badge-warning" title={applied.dataIssue}>{dataIssueLabel(applied.dataIssue)}</span>
               <button
                 type="button"
                 className="text-brand hover:text-brand-dark"
@@ -253,26 +303,31 @@ function LegacyOverview({
             <OverviewStat label="已重录" value={`${dashboard.superseded.toLocaleString()} 单`} sub={percent(dashboard.superseded, total)} />
           </div>
 
-          <div className="grid gap-4 lg:grid-cols-[1.4fr_1fr_1fr]">
-            <div className="rounded-lg border border-slate-200 bg-white p-3">
+          <div className="grid min-w-0 gap-4 lg:grid-cols-[1.4fr_1fr_1fr]">
+            <div className="min-w-0 overflow-hidden rounded-lg border border-slate-200 bg-white p-3">
               <div className="mb-2 flex items-center justify-between">
                 <h3 className="section-title mb-0">月度单量趋势</h3>
                 <span className="text-[11px] text-ink-muted">按下单月</span>
               </div>
               {dashboard.monthly.length > 0 ? (
-                <div className="flex h-40 items-end gap-1 border-b border-slate-100 px-1 pt-2">
-                  {dashboard.monthly.map((row) => (
-                    <div className="flex h-full min-w-0 flex-1 flex-col items-center justify-end gap-1" key={row.month} title={`${row.month} · ${row.count} 单 · ${moneyText(row.finalPriceSum)}`}>
-                      <span className="text-[10px] text-ink-muted nums">{row.count}</span>
-                      <div
-                        className="w-full max-w-7 rounded-t bg-brand/75 transition-all"
-                        style={{ height: `${Math.max(4, (row.count / maxMonthly) * 100)}%` }}
-                      />
-                      <span className="text-[10px] text-ink-muted">{row.month.slice(2)}</span>
-                    </div>
-                  ))}
+                <div className="overflow-x-auto">
+                  <div className="flex min-w-max items-end gap-2 px-1 pb-1">
+                    {dashboard.monthly.map((row) => {
+                      const chartHeight = 128;
+                      const barHeight = Math.min(chartHeight, Math.max(3, Math.round((row.count / maxMonthly) * chartHeight)));
+                      return (
+                        <div className="flex w-11 shrink-0 flex-col items-center justify-end" key={row.month} title={`${row.month} · ${row.count} 单 · ${moneyText(row.finalPriceSum)}`}>
+                          <span className="h-4 text-[10px] leading-4 text-ink-muted nums">{compactCount(row.count)}</span>
+                          <div className="flex h-32 w-full items-end justify-center border-b border-slate-100">
+                            <div className="w-6 rounded-t bg-brand/75 transition-all" style={{ height: `${barHeight}px` }} />
+                          </div>
+                          <span className="mt-1 h-4 whitespace-nowrap text-[10px] leading-4 text-ink-muted">{row.month.slice(2)}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
                 </div>
-              ) : <div className="flex h-40 items-center justify-center text-xs text-ink-muted">暂无月度数据</div>}
+              ) : <div className="flex h-10 items-center justify-center text-xs text-ink-muted">暂无月度数据</div>}
             </div>
 
             <OverviewRankCard
@@ -298,29 +353,30 @@ function LegacyOverview({
             />
           </div>
 
-          <div className="grid gap-4 lg:grid-cols-[1fr_1fr]">
-            <div className="rounded-lg border border-slate-200 bg-white p-3">
+          <div className="grid min-w-0 gap-4 lg:grid-cols-[1fr_1fr]">
+            <div className="min-w-0 overflow-hidden rounded-lg border border-slate-200 bg-white p-3">
               <div className="mb-2 flex items-center justify-between">
                 <h3 className="section-title mb-0">数据质量</h3>
                 {activeIssue && <span className="text-xs text-amber-700">已筛选</span>}
               </div>
               {dashboard.dataIssues.length > 0 ? (
-                <div className="grid gap-1 sm:grid-cols-2">
+                <div className="grid min-w-0 grid-cols-1 gap-1 md:grid-cols-2">
                   {dashboard.dataIssues.map((row) => (
                     <button
                       type="button"
                       key={row.issue}
                       onClick={() => onSelectIssue(row.issue)}
-                      className={`flex items-center justify-between rounded px-2 py-1.5 text-left text-xs ${activeIssue === row.issue ? 'bg-amber-100 ring-1 ring-amber-300' : 'bg-slate-50 hover:bg-amber-50'}`}
+                      title={row.issue}
+                      className={`flex min-w-0 items-center justify-between gap-2 overflow-hidden rounded px-2 py-1.5 text-left text-xs ${activeIssue === row.issue ? 'bg-amber-100 ring-1 ring-amber-300' : 'bg-slate-50 hover:bg-amber-50'}`}
                     >
-                      <span className="truncate text-ink-soft">{row.issue}</span>
-                      <span className="ml-2 font-semibold nums text-ink">{row.count}</span>
+                      <span className="min-w-0 flex-1 truncate text-ink-soft">{dataIssueLabel(row.issue)}</span>
+                      <span className="shrink-0 text-right font-semibold nums text-ink">{compactCount(row.count)}</span>
                     </button>
                   ))}
                 </div>
               ) : <div className="py-5 text-center text-xs text-ink-muted">暂无数据质量标记</div>}
             </div>
-            <div className="rounded-lg border border-slate-200 bg-white p-3">
+            <div className="min-w-0 overflow-hidden rounded-lg border border-slate-200 bg-white p-3">
               <h3 className="section-title mb-2">认款与重录比例</h3>
               <div className="space-y-3">
                 <RatioRow label="已认款" value={dashboard.payment.confirmed} total={total} tone="bg-emerald-500" />
@@ -357,16 +413,16 @@ function OverviewRankCard({
   maxCount: number;
 }) {
   return (
-    <div className="rounded-lg border border-slate-200 bg-white p-3">
+    <div className="min-w-0 overflow-hidden rounded-lg border border-slate-200 bg-white p-3">
       <h3 className="section-title mb-2">{title}</h3>
       {rows.length > 0 ? rows.map((row) => (
         <div className="mb-2 last:mb-0" key={row.key}>
           <div className="flex items-center justify-between gap-2 text-xs">
-            <span className="truncate text-ink-soft">{row.label}</span>
-            <span className="shrink-0 font-semibold nums text-ink">{row.count} 单</span>
+            <span className="min-w-0 truncate text-ink-soft" title={row.label}>{row.label}</span>
+            <span className="shrink-0 font-semibold nums text-ink">{compactCount(row.count)} 单</span>
           </div>
           <div className="mt-1 h-1.5 overflow-hidden rounded-full bg-slate-100">
-            <div className="h-full rounded-full bg-brand/70" style={{ width: `${Math.max(3, (row.count / maxCount) * 100)}%` }} />
+            <div className="h-full max-w-full rounded-full bg-brand/70" style={{ width: `${Math.min(100, Math.max(3, (row.count / maxCount) * 100))}%` }} />
           </div>
           {row.sub && <div className="mt-0.5 text-right text-[10px] text-ink-muted nums">{row.sub}</div>}
         </div>
@@ -389,8 +445,17 @@ function RatioRow({ label, value, total, tone }: { label: string; value: number;
 }
 
 function LegacyDetailDrawer({ token, id, onClose }: { token: string; id: string; onClose: () => void }) {
+  const dialogRef = useRef<HTMLDivElement>(null);
   const [ticket, setTicket] = useState<LegacyTicketRecord | null>(null);
   const [error, setError] = useState<string | null>(null);
+  useEffect(() => {
+    dialogRef.current?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [onClose]);
   useEffect(() => {
     let cancelled = false;
     setTicket(null);
@@ -408,7 +473,7 @@ function LegacyDetailDrawer({ token, id, onClose }: { token: string; id: string;
   }, [id, token]);
 
   return (
-    <div className="fixed inset-0 z-40">
+    <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="历史档案详情" tabIndex={-1} className="fixed inset-0 z-40">
       <div className="absolute inset-0 bg-ink/30" onClick={onClose} aria-hidden />
       <aside className="absolute inset-y-0 right-0 flex w-full max-w-2xl flex-col bg-surface shadow-pop">
         <div className="flex items-center justify-between border-b border-slate-200 px-5 py-4">
@@ -453,7 +518,7 @@ function LegacyDetail({ ticket }: { ticket: LegacyTicketRecord }) {
       <section><h3 className="section-title">开票与状态</h3><div className="flex flex-wrap gap-2"><StateBadge label="去程" value={ticket.outboundTicketed} /><StateBadge label="回程" value={ticket.returnTicketed} /><StateBadge label="系统" value={ticket.systemTicketed} /><StateBadge label="认款" value={ticket.paymentConfirmed} /></div></section>
       <section><h3 className="section-title">航段</h3><div className="space-y-2">{ticket.flights.map((link) => <div className="rounded-lg border border-slate-200 bg-white p-3" key={link.id}><div className="flex justify-between font-medium text-ink"><span>{link.legType === 0 ? '去程' : '回程'} · {link.flight.flightNo || '—'}</span><span>{dateText(link.flight.departDate)}</span></div><div className="mt-1 text-xs text-ink-soft">{link.flight.originCode || '—'} → {link.flight.destCode || '—'} · {link.flight.departTime || '—'} / {link.flight.arriveTime || '—'}</div></div>)}{ticket.flights.length === 0 && <div className="text-ink-muted">暂无航段关联</div>}</div></section>
       <section><h3 className="section-title">收款流水</h3><div className="overflow-x-auto"><table className="table-admin min-w-[500px]"><thead><tr><th>金额</th><th>时间</th><th>渠道码</th><th>次序</th></tr></thead><tbody>{ticket.receipts.map((receipt) => <tr key={receipt.id}><td>{moneyText(receipt.amount)}</td><td>{dateTimeText(receipt.receivedAt)}</td><td>{receipt.channelCode ?? '—'}</td><td>{receipt.sequence ?? '—'}</td></tr>)}{ticket.receipts.length === 0 && <tr><td colSpan={4} className="py-4 text-center text-ink-muted">暂无收款流水</td></tr>}</tbody></table></div></section>
-      <section><h3 className="section-title">备注与数据质量</h3><div className="rounded-lg border border-slate-200 bg-white p-3 text-ink-soft whitespace-pre-wrap">{ticket.remark || '—'}</div>{ticket.dataIssues.length > 0 && <div className="mt-2 flex flex-wrap gap-1.5">{ticket.dataIssues.map((issue) => <span className="badge-warning" key={issue}>{issue}</span>)}</div>}</section>
+      <section><h3 className="section-title">备注与数据质量</h3><div className="rounded-lg border border-slate-200 bg-white p-3 text-ink-soft whitespace-pre-wrap">{ticket.remark || '—'}</div>{ticket.dataIssues.length > 0 && <div className="mt-2 flex flex-wrap gap-1.5">{ticket.dataIssues.map((issue) => <span className="badge-warning" key={issue} title={issue}>{dataIssueLabel(issue)}</span>)}</div>}</section>
     </div>
   );
 }
