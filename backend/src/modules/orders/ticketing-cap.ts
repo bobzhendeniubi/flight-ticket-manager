@@ -106,8 +106,40 @@ export function assertOrderAllowsInvoicing(order: InvoicingGuardOrder): void {
 
 /** determineFlightLegs 入参：只需班次 id 与出发时刻。 */
 export interface FlightLegItem {
+  id?: string;
   flightScheduleId: string | null;
   flightSchedule?: { departureTime: Date | string } | null;
+}
+
+/**
+ * 与 determineFlightLegs 同源的航段行定位：按同一规则直接返回订单行，
+ * 避免先取 scheduleId 再反查时在脏数据下命中错误的订单行。
+ */
+export function determineFlightLegItems<T extends FlightLegItem>(items: ReadonlyArray<T>): {
+  outbound: T | null;
+  return: T | null;
+} {
+  const legs = items
+    .filter(
+      (i): i is T & { flightScheduleId: string } =>
+        i.flightScheduleId !== null &&
+        i.flightSchedule != null &&
+        i.flightSchedule.departureTime != null,
+    )
+    .slice()
+    .sort(
+      (a, b) => {
+        const departureDiff =
+          new Date(a.flightSchedule!.departureTime).getTime() -
+          new Date(b.flightSchedule!.departureTime).getTime();
+        if (departureDiff !== 0) return departureDiff;
+        // Prisma 行查询在没有 orderBy 时不保证返回顺序。两行同刻时用 id 固化
+        // 选择；旧数据/测试 fixture 缺 id 时返回 0，交给稳定排序保留原相对顺序。
+        if (typeof a.id !== 'string' || typeof b.id !== 'string') return 0;
+        return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+      },
+    );
+  return { outbound: legs[0] ?? null, return: legs[1] ?? null };
 }
 
 /**
@@ -120,21 +152,10 @@ export function determineFlightLegs(items: ReadonlyArray<FlightLegItem>): {
   outboundScheduleId: string | null;
   returnScheduleId: string | null;
 } {
-  const legs = items
-    .filter(
-      (i): i is FlightLegItem & { flightScheduleId: string } =>
-        i.flightScheduleId !== null &&
-        i.flightSchedule != null &&
-        i.flightSchedule.departureTime != null,
-    )
-    .map((i) => ({
-      scheduleId: i.flightScheduleId,
-      depart: new Date(i.flightSchedule!.departureTime).getTime(),
-    }))
-    .sort((a, b) => a.depart - b.depart);
+  const { outbound, return: returnItem } = determineFlightLegItems(items);
   return {
-    outboundScheduleId: legs[0]?.scheduleId ?? null,
-    returnScheduleId: legs[1]?.scheduleId ?? null,
+    outboundScheduleId: outbound?.flightScheduleId ?? null,
+    returnScheduleId: returnItem?.flightScheduleId ?? null,
   };
 }
 

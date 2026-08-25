@@ -14,6 +14,7 @@ import { buildStayNightDates, OrderService, type OrderRequester } from './orders
 import { assertHotelPhysicalFitWithinTx } from '../hotel-control/hotel-control.service.js';
 import {
   batchCreateOrdersBodySchema,
+  batchRescheduleBodySchema,
   batchSettlementLockBodySchema,
   batchSetInvoiceFlagsBodySchema,
   batchUpdateStatusBodySchema,
@@ -1385,6 +1386,93 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     },
   );
 
+  // ── 批量改航班：录入纠错（ADMIN/STAFF）───────────────────────────────
+  // 按订单既有航段排序逐单改期；不收改期费，已出票/已完成单默认拦截。
+  app.post('/batch-reschedule', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅运营/管理员可批量改航班' });
+    }
+    const body = batchRescheduleBodySchema.parse(req.body);
+    const result = await service.batchReschedule(body, {
+      userId: req.user.sub,
+      role,
+    });
+    const fmt = (d: Date | null) => (d ? d.toISOString() : null);
+    for (const r of result.results) {
+      if (r.ok && r.audit) {
+        void writeAudit({
+          actor: actorFromRequest(req),
+          action: 'RESCHEDULE_ORDER_ITEM',
+          targetType: 'ORDER',
+          targetId: r.id,
+          targetLabel: r.audit.orderNumber,
+          before: {
+            orderItemId: r.audit.orderItemId,
+            scheduleId: r.audit.fromScheduleId,
+            cabin: r.audit.fromCabin,
+            departure: fmt(r.audit.fromDeparture),
+          },
+          after: {
+            scheduleId: r.audit.toScheduleId,
+            cabin: r.audit.toCabin,
+            departure: fmt(r.audit.toDeparture),
+            feeCny: r.audit.feeCny,
+            statusChanged: r.audit.statusChanged,
+            note: body.note,
+            ...(r.notice ? { notice: r.notice } : {}),
+          },
+          severity: 'WARNING',
+        });
+        continue;
+      }
+      if (!r.ok) {
+        void writeAudit({
+          actor: actorFromRequest(req),
+          action: 'RESCHEDULE_ORDER_ITEM_FAILED',
+          targetType: 'ORDER',
+          targetId: r.id,
+          targetLabel: r.orderNumber ?? r.id,
+          after: {
+            leg: body.leg,
+            newScheduleId: body.newScheduleId,
+            error: r.error ?? '未知错误',
+          },
+          severity: 'WARNING',
+        });
+      }
+    }
+    const failureDetails = result.results
+      .filter((r) => !r.ok)
+      .map((r) => ({ orderId: r.id, error: r.error ?? '未知错误' }));
+    const failureAuditLimit = 100;
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'BATCH_RESCHEDULE',
+      targetType: 'ORDER',
+      targetId: 'batch',
+      targetLabel: `${result.succeeded}/${body.orderIds.length} orders → ${body.newScheduleId}`,
+      after: {
+        leg: body.leg,
+        newScheduleId: body.newScheduleId,
+        requestedCount: body.orderIds.length,
+        successCount: result.succeeded,
+        failureCount: result.failed,
+        failureDetails: failureDetails.slice(0, failureAuditLimit),
+        failureDetailsTotal: failureDetails.length,
+        failureDetailsTruncated: failureDetails.length > failureAuditLimit,
+        allowTicketed: body.allowTicketed,
+        note: body.note,
+      },
+      severity: result.failed > 0 ? 'WARNING' : 'INFO',
+    });
+    return {
+      succeeded: result.succeeded,
+      failed: result.failed,
+      results: result.results.map(({ audit: _audit, ...publicResult }) => publicResult),
+    };
+  });
+
   // ── 批量锁定/解锁结算价（ADMIN/STAFF）────────────────────────────────────
   // POST /orders/batch/settlement-lock  body: { orderIds: string[], lock: boolean }
   // 不存在或已软删订单跳过；每个成功订单各写一条审计。
@@ -1875,8 +1963,8 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
 
   // ── T5 更改订单归属代理（ADMIN/STAFF）──
   // PATCH /orders/:id/agent  body: { agentId: string | null, reason? }
-  // 口径 C：任何状态都能改，留审计。财务不回溯（已发生的收款/余额抵扣/佣金按原归属，不回滚；
-  // 变更后新产生的按新归属）。若曾用原代理预存余额抵扣，响应带 warning 提醒核对财务归属。
+  // 硬守卫：回收站单、已退款单、曾用原代理预存余额抵扣的订单均拒绝；目标代理必须存在且未停用。
+  // 财务不回溯：已发生的收款/余额抵扣/佣金按原归属保留，变更后新产生的按新归属。warning 保留为空以稳定 API 形状。
   app.patch('/:id/agent', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
     if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {

@@ -3883,6 +3883,26 @@ export const api = {
       token,
       body,
     }),
+  // 批量改航班（录入纠错）：服务端按订单既有航段解析并逐单搬座位，不收改期费。
+  batchRescheduleOrders: (
+    token: string,
+    body: {
+      orderIds: string[];
+      leg: 'OUTBOUND' | 'RETURN';
+      newScheduleId: string;
+      allowTicketed?: boolean;
+      note?: string;
+    },
+  ) =>
+    apiFetch<{
+      succeeded: number;
+      failed: number;
+      results: Array<{ id: string; orderNumber?: string; ok: boolean; error?: string; notice?: string }>;
+    }>('/orders/batch-reschedule', {
+      method: 'POST',
+      token,
+      body,
+    }),
   // 换人/编辑出行人：改姓名/护照/生日/性别/国籍；可选重置开票(→NONE)/签证(→PENDING)；
   // 可选加「换人费」到订单。返回更新后的订单。
   updateOrderPassenger: (
@@ -3973,9 +3993,10 @@ export const api = {
       body,
     }),
 
-  // 更改订单归属代理（T5；ADMIN/STAFF）。agentId=null（或空串归一）= 转直客；任何状态都能改，留审计。
-  // 财务不回溯（已发生的收款/代理余额抵扣/佣金按原归属，不回滚；变更后新产生的按新归属）。
-  // 若订单曾用原代理预存余额抵扣，响应带非空 warning 提醒核对财务归属（不阻断）。
+  // 更改订单归属代理（T5；ADMIN/STAFF）。agentId=null（或空串归一）= 转直客；服务端硬守卫逐单校验。
+  // 回收站单、已退款单、曾用原代理预存余额抵扣的订单会拒绝；目标代理必须存在且未停用。
+  // 财务不回溯（已发生的收款/代理余额抵扣/佣金按原归属保留；变更后新产生的按新归属）。
+  // warning 字段为稳定 API 形状保留，当前恒为 null。
   changeOrderAgent: (
     token: string,
     orderId: string,

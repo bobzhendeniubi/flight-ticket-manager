@@ -730,6 +730,21 @@ export const batchSetInvoiceFlagsBodySchema = z.object({
 });
 export type BatchSetInvoiceFlagsBody = z.infer<typeof batchSetInvoiceFlagsBodySchema>;
 
+// ── 批量改航班（录入纠错，ADMIN/STAFF）────────────────────────────────────
+// 按订单解析去程/回程航段；不接收费用字段，纠错只搬座位、不收改期费。
+export const batchRescheduleBodySchema = z.object({
+  orderIds: z
+    .array(z.string().min(1))
+    .min(1)
+    .max(500)
+    .refine((ids) => new Set(ids).size === ids.length, { message: 'orderIds 不得重复' }),
+  leg: z.enum(['OUTBOUND', 'RETURN']),
+  newScheduleId: z.string().min(1, 'newScheduleId 必填'),
+  allowTicketed: z.boolean().optional().default(false),
+  note: z.string().max(500).optional(),
+});
+export type BatchRescheduleBody = z.infer<typeof batchRescheduleBodySchema>;
+
 // ── 批量锁定/解锁结算价（ADMIN/STAFF）──────────────────────────────────────
 export const batchSettlementLockBodySchema = z.object({
   orderIds: z.array(z.string().min(1)).min(1).max(500),
@@ -1065,7 +1080,7 @@ export const swapItemHotelBodySchema = z.object({
 export type SwapItemHotelBody = z.infer<typeof swapItemHotelBodySchema>;
 
 // ── T5：更改订单归属代理（PATCH /orders/:id/agent；ADMIN/STAFF）─────────────────
-// 口径 C：任何状态都能改，留审计。agentId=null（或空串归一为 null）= 转直客。
+// 服务端硬守卫逐单校验；agentId=null（或空串归一为 null）= 转直客。
 // 财务不回溯：已发生的收款/代理余额抵扣/佣金流水按原归属，不因改归属而回滚；变更后新产生的按新归属。
 export const changeOrderAgentBodySchema = z.object({
   // 空串归一为 null（前端「直客」选项传空串）；非空则须是有效代理 id（服务端再校验存在且在用）。

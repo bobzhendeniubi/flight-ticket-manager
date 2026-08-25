@@ -26,6 +26,7 @@ export function AgentsPage() {
   const isAdmin = user?.role === 'ADMIN' || user?.role === 'STAFF';
 
   const [agents, setAgents] = useState<AgentListItem[] | null>(null);
+  const [agentsLoaded, setAgentsLoaded] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showForm, setShowForm] = useState(false);
   const [parentForAdmin, setParentForAdmin] = useState<string>('');
@@ -44,15 +45,32 @@ export function AgentsPage() {
 
   const reload = useCallback(async () => {
     if (!tokens) return;
+    setError(null);
     try {
       const res = await api.listAgents(tokens.accessToken);
       setAgents(res.agents);
+      // 空数组也是成功结果；不能用 agents.length 代替「请求已完成」状态。
+      setAgentsLoaded(true);
     } catch (err) {
       setError(err instanceof ApiError ? err.message : '加载代理列表失败');
     }
   }, [tokens]);
 
-  useEffect(() => { reload(); }, [reload]);
+  useEffect(() => {
+    if (!agentsLoaded) void reload();
+  }, [agentsLoaded, reload]);
+
+  useEffect(() => {
+    // 登录态切换后允许新 token 首次加载；同一 token 下成功的空列表仍保持已加载。
+    setAgentsLoaded(false);
+    setAgents(null);
+  }, [tokens?.accessToken]);
+
+  const retry = useCallback(() => {
+    setError(null);
+    setAgentsLoaded(false);
+    void reload();
+  }, [reload]);
 
   // ── 过滤 + 排序 ──
   const filtered = useMemo(() => {
@@ -101,7 +119,12 @@ export function AgentsPage() {
 
   const tree = useMemo(() => buildTree(filtered), [filtered]);
 
-  if (error) return <div className="card border-rose-200 bg-rose-50 text-rose-700">{error}</div>;
+  if (error) return (
+    <div className="card border-rose-200 bg-rose-50 text-rose-700">
+      <span>{error}</span>
+      <button type="button" className="ml-3 underline" onClick={retry}>重试</button>
+    </div>
+  );
   if (!agents) return <div className="card text-ink-muted">加载中…</div>;
 
   return (

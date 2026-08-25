@@ -19,6 +19,7 @@ import {
   assertTicketingCap,
   countIssuedPassengers,
   determineFlightLegs,
+  determineFlightLegItems,
   getScheduleSeatCapacity,
 } from './ticketing-cap.js';
 import { UnprocessableEntityError } from '../../lib/errors.js';
@@ -166,6 +167,45 @@ describe('migration 20260715170000_drop_flight_schedule_ticketing_cap', () => {
 
 // ── determineFlightLegs ────────────────────────────────────────────────────
 describe('determineFlightLegs', () => {
+  it('航段行定位与 scheduleId 解耦：同 scheduleId 仍按 departureTime 返回第 2 条回程行', () => {
+    const outbound = {
+      id: 'outbound-item',
+      flightScheduleId: 'same-schedule',
+      flightSchedule: { departureTime: new Date('2026-07-10T02:00:00Z') },
+    };
+    const returned = {
+      id: 'return-item',
+      flightScheduleId: 'same-schedule',
+      flightSchedule: { departureTime: new Date('2026-07-17T05:00:00Z') },
+    };
+
+    expect(determineFlightLegItems([returned, outbound])).toEqual({
+      outbound,
+      return: returned,
+    });
+    expect(determineFlightLegs([returned, outbound])).toEqual({
+      outboundScheduleId: 'same-schedule',
+      returnScheduleId: 'same-schedule',
+    });
+  });
+
+  it('起飞时间相同：无论正序还是反序输入，都按订单行 id 选择同一条', () => {
+    const sameTime = '2026-07-10T02:00:00Z';
+    const first = {
+      id: 'item-a',
+      flightScheduleId: 'schedule-a',
+      flightSchedule: { departureTime: new Date(sameTime) },
+    };
+    const second = {
+      id: 'item-b',
+      flightScheduleId: 'schedule-b',
+      flightSchedule: { departureTime: new Date(sameTime) },
+    };
+
+    expect(determineFlightLegItems([second, first])).toEqual({ outbound: first, return: second });
+    expect(determineFlightLegItems([first, second])).toEqual({ outbound: first, return: second });
+  });
+
   it('单程：只有去程，回程为 null', () => {
     expect(
       determineFlightLegs([

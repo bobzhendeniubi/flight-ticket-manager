@@ -87,12 +87,14 @@ import {
   assertOrderAllowsInvoicing,
   assertTicketingCap,
   determineFlightLegs,
+  determineFlightLegItems,
 } from './ticketing-cap.js';
 import type { FlightLegItem } from './ticketing-cap.js';
 import { PRICE_ADJUSTMENT_CAP_CNY, PRICE_ADJUSTMENT_REASON_LABEL } from './orders.schemas.js';
 import { heldSeatsForCabin } from '../hold-orders/held-seats.js';
 import type {
   BatchCreateOrdersBody,
+  BatchRescheduleBody,
   AddGroundItemBody,
   BatchPassengerInput,
   CreateOrderBody,
@@ -877,6 +879,22 @@ type AutoDiscountSummary = {
   pax: number;
   totalCny: number;
 };
+
+type RescheduleCommittedContext = {
+  orderItemId: string;
+  oldScheduleId: string;
+  oldCabin: import('@prisma/client').CabinClass;
+  newScheduleId: string;
+  newCabin: import('@prisma/client').CabinClass;
+  statusChanged: boolean;
+};
+
+const rescheduleCommittedContexts = new WeakMap<object, RescheduleCommittedContext>();
+
+function rescheduleCommittedContext(err: unknown): RescheduleCommittedContext | null {
+  if (!err || (typeof err !== 'object' && typeof err !== 'function')) return null;
+  return rescheduleCommittedContexts.get(err) ?? null;
+}
 
 export class OrderService {
   private readonly pricing = new PricingService();
@@ -4840,6 +4858,129 @@ export class OrderService {
   }
 
   /**
+   * 批量改航班（录入纠错，ADMIN/STAFF）。
+   * 航段按订单 FLIGHT 行的班次 departureTime 升序解析，逐单复用单条改期事务；
+   * 不传 feeCny / feeLabel，且已出票/已完成订单默认拦截，避免账面班次与真实机票分叉。
+   * 每单独立捕获错误，单个班次售罄只影响当前订单。
+   */
+  async batchReschedule(
+    input: BatchRescheduleBody,
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
+    succeeded: number;
+    failed: number;
+    results: Array<{
+      id: string;
+      orderNumber?: string;
+      ok: boolean;
+      error?: string;
+      notice?: string;
+      audit?: {
+        orderNumber: string;
+        orderItemId: string;
+        fromScheduleId: string;
+        fromCabin: import('@prisma/client').CabinClass;
+        fromDeparture: Date | null;
+        toScheduleId: string;
+        toCabin: import('@prisma/client').CabinClass;
+        toDeparture: Date | null;
+        feeCny: number;
+        statusChanged: boolean;
+      };
+    }>;
+  }> {
+    const results: Array<{
+      id: string;
+      orderNumber?: string;
+      ok: boolean;
+      error?: string;
+      notice?: string;
+      audit?: {
+        orderNumber: string;
+        orderItemId: string;
+        fromScheduleId: string;
+        fromCabin: import('@prisma/client').CabinClass;
+        fromDeparture: Date | null;
+        toScheduleId: string;
+        toCabin: import('@prisma/client').CabinClass;
+        toDeparture: Date | null;
+        feeCny: number;
+        statusChanged: boolean;
+      };
+    }> = [];
+    let succeeded = 0;
+    let failed = 0;
+
+    for (const id of input.orderIds) {
+      try {
+        const { order, audit } = await this.rescheduleOrderItem(
+          id,
+          {
+            leg: input.leg,
+            newScheduleId: input.newScheduleId,
+            note: input.note,
+            guard: { forbidTicketed: !input.allowTicketed, correction: true },
+          },
+          actor,
+        );
+        const orderNumber = (order as unknown as { orderNumber?: string }).orderNumber;
+        results.push({ id, orderNumber, ok: true, audit });
+        succeeded += 1;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : '未知错误';
+        const context = rescheduleCommittedContext(err);
+        let recovered = false;
+        if (context) {
+          try {
+            const currentItem = await prisma.orderItem.findUnique({
+              where: { id: context.orderItemId },
+              select: {
+                orderId: true,
+                flightScheduleId: true,
+                flightCabin: true,
+                order: { select: { orderNumber: true } },
+              },
+            });
+            if (
+              currentItem?.orderId === id &&
+              currentItem.flightScheduleId === input.newScheduleId
+            ) {
+              results.push({
+                id,
+                orderNumber: currentItem.order.orderNumber,
+                ok: true,
+                notice: '已生效（回包异常）',
+                audit: {
+                  orderNumber: currentItem.order.orderNumber,
+                  orderItemId: context.orderItemId,
+                  fromScheduleId: context.oldScheduleId,
+                  fromCabin: context.oldCabin,
+                  fromDeparture: null,
+                  toScheduleId: context.newScheduleId,
+                  toCabin: currentItem.flightCabin ?? context.newCabin,
+                  toDeparture: null,
+                  feeCny: 0,
+                  statusChanged: context.statusChanged,
+                },
+              });
+              succeeded += 1;
+              recovered = true;
+            }
+          } catch {
+            // 回读失败时按失败返回；原始事务外异常仍保留在 error 中。
+          }
+        }
+        if (!recovered) {
+          results.push({ id, ok: false, error: message });
+          failed += 1;
+        }
+      }
+    }
+
+    return { succeeded, failed, results };
+  }
+
+  /**
    * 批量锁定/解锁订单结算价。不存在或已软删订单不更新并计入 skipped；
    * 每个有效订单独立更新，便于路由层按成功订单逐条写审计。
    */
@@ -6093,12 +6234,16 @@ export class OrderService {
   async rescheduleOrderItem(
     orderId: string,
     input: {
-      orderItemId: string;
+      orderItemId?: string;
+      /** 批量改期内部入口：在订单行锁内按真实航段定位订单行。 */
+      leg?: 'OUTBOUND' | 'RETURN';
       newScheduleId: string;
       newCabin?: import('@prisma/client').CabinClass;
       feeCny?: number;
       feeLabel?: string;
       note?: string;
+      /** 仅批量入口使用；省略时保持单条改期路由原有行为。 */
+      guard?: { forbidTicketed?: boolean; correction?: boolean };
     },
     actor: { userId: string; role: UserRole },
   ): Promise<{
@@ -6152,20 +6297,41 @@ export class OrderService {
         );
       }
 
-      const item = await tx.orderItem.findUnique({
-        where: { id: input.orderItemId },
-        select: {
-          id: true,
-          orderId: true,
-          kind: true,
-          quantity: true,
-          bundleId: true,
-          flightScheduleId: true,
-          flightCabin: true,
-          metadata: true,
-        },
-      });
+      if (
+        input.guard?.forbidTicketed &&
+        (order.status === OrderStatus.TICKETED || order.status === OrderStatus.COMPLETED)
+      ) {
+        throw new BadRequestError('订单已出票/已完成，需勾选「同时修改已出票订单」后才能改');
+      }
+
+      const itemSelect = {
+        id: true,
+        orderId: true,
+        kind: true,
+        quantity: true,
+        bundleId: true,
+        flightScheduleId: true,
+        flightCabin: true,
+        metadata: true,
+        flightSchedule: { select: { departureTime: true } },
+      } as const;
+      const item = input.orderItemId
+        ? await tx.orderItem.findUnique({ where: { id: input.orderItemId }, select: itemSelect })
+        : await (() => {
+            if (!input.leg) return Promise.resolve(null);
+            return tx.orderItem.findMany({
+              where: { orderId, kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
+              select: itemSelect,
+              orderBy: [{ flightSchedule: { departureTime: 'asc' } }, { id: 'asc' }],
+            }).then((items) => {
+              const legs = determineFlightLegItems(items);
+              return input.leg === 'OUTBOUND' ? legs.outbound : legs.return;
+            });
+          })();
       if (!item || item.orderId !== orderId) {
+        if (input.leg) {
+          throw new BadRequestError(input.leg === 'RETURN' ? '本单没有回程航段' : '本单没有去程航段');
+        }
         throw new NotFoundError('订单项不存在或不属于该订单');
       }
       if (item.kind !== OrderItemKind.FLIGHT || !item.flightScheduleId || !item.flightCabin) {
@@ -6193,6 +6359,24 @@ export class OrderService {
 
       // 无变化（同班次同舱位）→ 不做座位搬移，避免无意义的放/拿
       const sameSeat = oldScheduleId === newScheduleId && oldCabin === newCabin;
+
+      if (input.guard?.correction && !sameSeat && item.bundleId) {
+        const discountRows = await tx.orderItem.findMany({
+          where: { orderId, kind: OrderItemKind.DISCOUNT },
+          select: { metadata: true },
+        });
+        const hasActiveSettlementDiscount = discountRows.some((discountRow) => {
+          const rawMetadata = discountRow.metadata;
+          const metadata =
+            rawMetadata != null && typeof rawMetadata === 'object' && !Array.isArray(rawMetadata)
+              ? (rawMetadata as Record<string, unknown>)
+              : {};
+          return metadata.settlementDiscount === true && metadata.settlementDiscountRevoked !== true;
+        });
+        if (hasActiveSettlementDiscount) {
+          throw new BadRequestError('本单含套餐立减，批量纠错会产生补差金额，请走单条改期逐单确认');
+        }
+      }
 
       // 新班次必须存在且有该舱位（友好报错；最终防超售仍靠下面的原子 CAS）
       const newSeatClass = await tx.flightSeatClass.findFirst({
@@ -6270,9 +6454,9 @@ export class OrderService {
       // ── 4. 改期立减取消补差 + 手填改期费（两笔分别留流水）──
       // 改期后原立减不随新日期重新命中：只撤销订单上尚未撤销的快照行，
       // 并把等额补差记入 adjustmentCny。行级 revoked 标记保证同单二次改期幂等。
-      let adjustmentDelta = feeCny;
+      let adjustmentDelta = input.guard?.correction ? 0 : feeCny;
       let adjustmentLog = order.adjustments;
-      if (!sameSeat) {
+      if (!sameSeat && !input.guard?.correction) {
         // 立减只挂在套餐地面价上：纯机票行改期与立减无关。
         if (item.bundleId) {
           const discountRows =
@@ -6319,7 +6503,7 @@ export class OrderService {
           }
         }
       }
-      if (feeCny > 0) {
+      if (feeCny > 0 && !input.guard?.correction) {
         adjustmentLog = appendAdjustment(adjustmentLog, {
           type: 'RESCHEDULE_FEE',
           label: input.feeLabel || '改期费',
@@ -6342,6 +6526,7 @@ export class OrderService {
       // ── 5. 仅在状态机允许时推进到 CHANGED（不破坏状态机）──
       let statusChanged = false;
       if (
+        !input.guard?.correction &&
         order.status !== OrderStatus.CHANGED &&
         ALLOWED_TRANSITIONS[order.status].includes(OrderStatus.CHANGED)
       ) {
@@ -6358,38 +6543,46 @@ export class OrderService {
 
       // 把审计需要的「原/新」明细返回到 tx 外（出发时间另查）。
       // 直接 return 而非写模块级单例，避免并发改期互相覆盖。
-      return { oldScheduleId, oldCabin, newScheduleId, newCabin, statusChanged };
+      return { orderItemId: item.id, oldScheduleId, oldCabin, newScheduleId, newCabin, statusChanged };
     });
 
-    // 审计明细：原/新出发时间（事务外查，避免污染事务）
-    const [fromSched, toSched, finalOrder] = await Promise.all([
-      prisma.flightSchedule.findUnique({
-        where: { id: scratch.oldScheduleId },
-        select: { departureTime: true },
-      }),
-      prisma.flightSchedule.findUnique({
-        where: { id: scratch.newScheduleId },
-        select: { departureTime: true },
-      }),
-      prisma.order.findUniqueOrThrow({ where: { id: orderId }, include: ORDER_FULL_INCLUDE }),
-    ]);
+    try {
+      // 审计明细：原/新出发时间（事务外查，避免污染事务）
+      const [fromSched, toSched, finalOrder] = await Promise.all([
+        prisma.flightSchedule.findUnique({
+          where: { id: scratch.oldScheduleId },
+          select: { departureTime: true },
+        }),
+        prisma.flightSchedule.findUnique({
+          where: { id: scratch.newScheduleId },
+          select: { departureTime: true },
+        }),
+        prisma.order.findUniqueOrThrow({ where: { id: orderId }, include: ORDER_FULL_INCLUDE }),
+      ]);
 
-    return {
-      // 对外脱敏：改期（AGENT/CUSTOMER 侧也有入口）的返回按操作者角色脱敏。
-      order: serializeOrder(finalOrder, orderSerializeRoleCtx(actor.role)),
-      audit: {
-        orderNumber: finalOrder.orderNumber,
-        orderItemId: input.orderItemId,
-        fromScheduleId: scratch.oldScheduleId,
-        fromCabin: scratch.oldCabin,
-        fromDeparture: fromSched?.departureTime ?? null,
-        toScheduleId: scratch.newScheduleId,
-        toCabin: scratch.newCabin,
-        toDeparture: toSched?.departureTime ?? null,
-        feeCny,
-        statusChanged: scratch.statusChanged,
-      },
-    };
+      return {
+        // 对外脱敏：改期（AGENT/CUSTOMER 侧也有入口）的返回按操作者角色脱敏。
+        order: serializeOrder(finalOrder, orderSerializeRoleCtx(actor.role)),
+        audit: {
+          orderNumber: finalOrder.orderNumber,
+          orderItemId: scratch.orderItemId,
+          fromScheduleId: scratch.oldScheduleId,
+          fromCabin: scratch.oldCabin,
+          fromDeparture: fromSched?.departureTime ?? null,
+          toScheduleId: scratch.newScheduleId,
+          toCabin: scratch.newCabin,
+          toDeparture: toSched?.departureTime ?? null,
+          feeCny,
+          statusChanged: scratch.statusChanged,
+        },
+      };
+    } catch (err) {
+      // 事务已经提交；为批量入口保留定位上下文，允许它回读确认实际已生效。
+      if (err && (typeof err === 'object' || typeof err === 'function')) {
+        rescheduleCommittedContexts.set(err, scratch);
+      }
+      throw err;
+    }
   }
 
   /**
@@ -7431,13 +7624,13 @@ export class OrderService {
   }
 
   // ════════════════════════════════════════════════════════════════════
-  // T5：更改订单归属代理（口径 C：任何状态都能改，留审计）
+  // T5：更改订单归属代理（硬守卫 + 留审计）
   // 全程 ADMIN/STAFF（路由层 + 服务层双断言）。
   //
   // 财务口径（不回溯）：改归属绝不回滚任何已发生的资金账 —— 已收的款、已用原代理预存余额抵扣、
   // 已计提的佣金流水，一律按「事发时」的归属保留，不因本次改归属而重算或退回；本次变更只影响
-  // 变更之后新产生的佣金/结算按新归属计。若该订单曾用（原代理）预存余额抵扣，返回 warning 提醒
-  // 运营核对财务归属（不阻断改归属——阻断反而会卡住合理的归属订正）。
+  // 变更之后新产生的佣金/结算按新归属计。回收站单、已退款单、曾用原代理预存余额抵扣的订单拒绝，
+  // 目标代理必须存在且在用；warning 字段保留为空以维持 API 形状。
   // ════════════════════════════════════════════════════════════════════
   async changeOrderAgent(
     orderId: string,

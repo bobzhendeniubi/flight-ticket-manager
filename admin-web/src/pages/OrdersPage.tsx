@@ -172,6 +172,7 @@ const ORDERS_FETCH_LIMIT = 200;
 // 批量端点单次条数上限 —— 对齐后端 batchUpdateStatusBodySchema / batchSetInvoiceFlagsBodySchema
 // 的 .max(100)。超限时 Zod 整体校验失败返回 400，150 单一条都不会被处理；前置拦下并提示分批。
 const BULK_ORDER_LIMIT = 100;
+const BATCH_RESCHEDULE_ORDER_LIMIT = 500;
 
 // 列表「签证」列主显（签证岗反馈）：录单时的签证要求 order.visaStatus，而非履约任务进度。
 // NOT_NEEDED → 空白（不需要签证的单不占视觉）；其余映射为短徽标。履约进度改为次要小字附注。
@@ -381,6 +382,7 @@ function BulkResultPanel({
   skipped,
   failNote,
   failures,
+  notices,
   orders,
 }: {
   succeeded: number;
@@ -388,6 +390,7 @@ function BulkResultPanel({
   skipped?: number;
   failNote?: string;
   failures: Array<{ id: string; error?: string }>;
+  notices?: Array<{ id: string; message: string }>;
   orders: OrderSummary[];
 }) {
   return (
@@ -409,6 +412,18 @@ function BulkResultPanel({
             return (
               <li key={f.id} className="py-0.5 text-[11px]">
                 · <span className="font-mono">{orderNo}</span>：{f.error ?? '未知原因'}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      {notices && notices.length > 0 && (
+        <ul className="mt-2 rounded border border-amber-200 bg-amber-50 px-2 py-1.5 text-amber-800">
+          {notices.map((notice) => {
+            const orderNo = orders.find((o) => o.id === notice.id)?.orderNumber ?? `${notice.id.slice(0, 8)}…`;
+            return (
+              <li key={notice.id} className="py-0.5 text-[11px]">
+                · <span className="font-mono">{orderNo}</span>：{notice.message}
               </li>
             );
           })}
@@ -590,6 +605,29 @@ export function OrdersPage() {
     failed: number;
     failures: Array<{ id: string; error?: string }>;
   } | null>(null);
+  // 批量改备注：逐单覆盖 notes；留空表示清空整批备注。
+  const [bulkNotes, setBulkNotes] = useState('');
+  const [bulkNotesSubmitting, setBulkNotesSubmitting] = useState(false);
+  const [bulkNotesResult, setBulkNotesResult] = useState<{
+    succeeded: number;
+    failed: number;
+    failures: Array<{ id: string; error?: string }>;
+  } | null>(null);
+  // 批量改代理：选目标代理后逐单调用现有更改归属端点；失败原因逐条展示。
+  const [bulkAgents, setBulkAgents] = useState<AgentListItem[]>([]);
+  const [bulkAgentsLoading, setBulkAgentsLoading] = useState(false);
+  const [bulkAgentsError, setBulkAgentsError] = useState<string | null>(null);
+  // 「请求已完成」独立于「列表非空」：成功返回空数组也算加载过，否则下面的 effect
+  // 会因为 length 恒为 0 而反复重发请求（成功空列表 → loading/error 双 false → 再触发）。
+  const [bulkAgentsLoaded, setBulkAgentsLoaded] = useState(false);
+  const [bulkAgentId, setBulkAgentId] = useState('');
+  const [bulkAgentReason, setBulkAgentReason] = useState('');
+  const [bulkAgentSubmitting, setBulkAgentSubmitting] = useState(false);
+  const [bulkAgentResult, setBulkAgentResult] = useState<{
+    succeeded: number;
+    failed: number;
+    failures: Array<{ id: string; error?: string }>;
+  } | null>(null);
   // 批量删除（仅 ADMIN）：无批量端点，逐单调用现有软删端点；服务端占座/净收款守卫逐单生效。
   const [bulkDeleteSubmitting, setBulkDeleteSubmitting] = useState(false);
   const [bulkDeleteResult, setBulkDeleteResult] = useState<{
@@ -607,6 +645,19 @@ export function OrdersPage() {
     failed: number;
     skipped: number;
     failures: Array<{ id: string; error?: string }>;
+  } | null>(null);
+  // 批量改航班（录入纠错）：服务端按订单航段排序，前端只做预检提示。
+  const [bulkFlightId, setBulkFlightId] = useState('');
+  const [bulkFlightScheduleId, setBulkFlightScheduleId] = useState('');
+  const [bulkRescheduleLeg, setBulkRescheduleLeg] = useState<'OUTBOUND' | 'RETURN'>('OUTBOUND');
+  const [bulkRescheduleAllowTicketed, setBulkRescheduleAllowTicketed] = useState(false);
+  const [bulkRescheduleNote, setBulkRescheduleNote] = useState('');
+  const [bulkRescheduleSubmitting, setBulkRescheduleSubmitting] = useState(false);
+  const [bulkRescheduleResult, setBulkRescheduleResult] = useState<{
+    succeeded: number;
+    failed: number;
+    failures: Array<{ id: string; error?: string }>;
+    notices: Array<{ id: string; message: string }>;
   } | null>(null);
   // 批量到账弹窗（选多单 → 逐单录到账金额 + 共享水单）
   const [showBatchPay, setShowBatchPay] = useState(false);
@@ -1050,6 +1101,9 @@ export function OrdersPage() {
     setBulkResult(null);
     setBulkInvoiceResult(null);
     setBulkVisaResult(null);
+    setBulkNotesResult(null);
+    setBulkAgentResult(null);
+    setBulkRescheduleResult(null);
     setBulkDeleteResult(null);
     setBulkHotelResult(null);
   };
@@ -1058,6 +1112,28 @@ export function OrdersPage() {
   const selectedOrders = useMemo(
     () => orders.filter((o) => selectedIds.has(o.id)),
     [orders, selectedIds],
+  );
+  const selectedReturnLegOrderCount = useMemo(
+    () => selectedOrders.filter((o) => flightLegCount(o) >= 2).length,
+    [selectedOrders],
+  );
+  const selectedTicketedOrderCount = useMemo(
+    () => selectedOrders.filter((o) => o.status === 'TICKETED' || o.status === 'COMPLETED').length,
+    [selectedOrders],
+  );
+  const {
+    flights: bulkFlightOptions,
+    schedules: bulkFlightSchedules,
+    loadingSchedules: bulkFlightSchedulesLoading,
+    error: bulkFlightOptionsError,
+  } = useFlightScheduleOptions(tokens?.accessToken ?? '', bulkFlightId, selectedIds.size > 0);
+  const bulkAgentOptions: SearchSelectOption[] = useMemo(
+    () => bulkAgents.map((agent) => ({
+      id: agent.id,
+      label: `${agent.companyName ?? '未填写公司名'} · ${agent.contactName}`,
+      priceLabel: '',
+    })),
+    [bulkAgents],
   );
   // 可批量到账的订单 = 还没结清的（尾款 > 0）。已结清/多付的不重复到账。
   const payableSelected = useMemo(
@@ -1069,6 +1145,32 @@ export function OrdersPage() {
     () => selectedOrders.reduce((sum, o) => sum + o.passengers.length, 0),
     [selectedOrders],
   );
+  const loadBulkAgents = useCallback(async () => {
+    if (!tokens?.accessToken) return;
+    setBulkAgentsLoading(true);
+    setBulkAgentsError(null);
+    try {
+      const result = await api.listAgents(tokens.accessToken);
+      setBulkAgents(result.agents);
+      setBulkAgentsLoaded(true);
+    } catch (err: unknown) {
+      setBulkAgentsError(err instanceof ApiError ? err.message : '代理列表加载失败，请重试');
+    } finally {
+      setBulkAgentsLoading(false);
+    }
+  }, [tokens?.accessToken]);
+
+  // 批量代理下拉按需加载，避免订单页初次打开就请求代理列表；失败时保留错误并提供显式重试。
+  useEffect(() => {
+    if (
+      !tokens?.accessToken ||
+      selectedIds.size === 0 ||
+      bulkAgentsLoaded ||
+      bulkAgentsLoading ||
+      bulkAgentsError
+    ) return;
+    void loadBulkAgents();
+  }, [tokens?.accessToken, selectedIds.size, bulkAgentsLoaded, bulkAgentsLoading, bulkAgentsError, loadBulkAgents]);
   // 批量选酒店用：在架酒店 + 房型列表，选中订单后按需拉一次（避免未用到该功能时空跑请求）。
   useEffect(() => {
     if (!tokens?.accessToken || selectedIds.size === 0 || bulkHotels.length > 0) return;
@@ -1299,6 +1401,143 @@ export function OrdersPage() {
 
   // 批量删除（仅 ADMIN）：无批量端点，逐单调用现有软删端点；服务端占座/净收款守卫逐单生效，
   // 绝不绕过——失败单（如仍占座、净收款>0）逐条列出原因，只有成功的单从列表移除。
+  // 批量改备注：逐单覆盖整条 notes，留空就是清空；单单失败不影响其余订单。
+  const applyBulkNotes = async () => {
+    if (!tokens?.accessToken || selectedIds.size === 0) return;
+    const confirmMessage = bulkNotes.length === 0
+      ? `确认将整条覆盖所选 ${selectedIds.size} 条订单的原备注？\n\n留空将清空这些订单的原备注。\n\n这是覆盖，不是追加。`
+      : `确认将整条覆盖所选 ${selectedIds.size} 条订单的原备注？\n\n这是覆盖，不是追加。`;
+    if (!window.confirm(confirmMessage)) return;
+    setBulkNotesSubmitting(true);
+    setBulkNotesResult(null);
+    const ids = Array.from(selectedIds);
+    const failures: Array<{ id: string; error?: string }> = [];
+    let succeeded = 0;
+    try {
+      for (const id of ids) {
+        try {
+          await api.updateOrderNotes(tokens.accessToken, id, { notes: bulkNotes });
+          succeeded++;
+        } catch (e: unknown) {
+          failures.push({ id, error: e instanceof ApiError ? e.message : '修改备注失败' });
+        }
+      }
+      setBulkNotesResult({ succeeded, failed: failures.length, failures });
+      if (failures.length === 0) {
+        setSelectedIds(new Set());
+        setBulkNotes('');
+      }
+      try {
+        const updated = await api.listOrders(tokens.accessToken, { ...filterQuery, pageSize: ORDERS_FETCH_LIMIT });
+        setOrders(updated.orders);
+        setOrdersTotal(updated.pagination.total);
+      } catch (err) {
+        alert(err instanceof ApiError ? `批量改备注已完成，但刷新订单列表失败：${err.message}` : '批量改备注已完成，但刷新订单列表失败');
+      }
+    } finally {
+      setBulkNotesSubmitting(false);
+    }
+  };
+
+  // 批量改代理：服务端硬守卫逐单生效，失败原因逐条展示。
+  const applyBulkAgent = async () => {
+    if (!tokens?.accessToken || !bulkAgentId || selectedIds.size === 0) return;
+    const targetLabel = bulkAgentOptions.find((o) => o.id === bulkAgentId)?.label ?? bulkAgentId;
+    if (!window.confirm(
+      `确认将所选 ${selectedIds.size} 条订单的归属代理改为「${targetLabel}」？\n\n` +
+      '回收站单、已退款单、曾用原代理预存余额抵扣的订单会被拒绝；目标代理不存在或已停用也会失败，原因将逐条列出。\n' +
+      '财务不回溯：已发生的收款 / 代理余额抵扣 / 佣金按原归属保留；变更后新产生的按新归属。',
+    )) return;
+    setBulkAgentSubmitting(true);
+    setBulkAgentResult(null);
+    const ids = Array.from(selectedIds);
+    const failures: Array<{ id: string; error?: string }> = [];
+    let succeeded = 0;
+    try {
+      for (const id of ids) {
+        try {
+          await api.changeOrderAgent(tokens.accessToken, id, {
+            agentId: bulkAgentId,
+            reason: bulkAgentReason.trim() || undefined,
+          });
+          succeeded++;
+        } catch (e: unknown) {
+          failures.push({ id, error: e instanceof ApiError ? e.message : '更改归属代理失败' });
+        }
+      }
+      setBulkAgentResult({ succeeded, failed: failures.length, failures });
+      if (failures.length === 0) {
+        setSelectedIds(new Set());
+        setBulkAgentId('');
+        setBulkAgentReason('');
+      } else {
+        setSelectedIds(new Set(failures.map((f) => f.id)));
+      }
+      try {
+        const updated = await api.listOrders(tokens.accessToken, { ...filterQuery, pageSize: ORDERS_FETCH_LIMIT });
+        setOrders(updated.orders);
+        setOrdersTotal(updated.pagination.total);
+      } catch (err) {
+        alert(err instanceof ApiError ? `批量改代理已完成，但刷新订单列表失败：${err.message}` : '批量改代理已完成，但刷新订单列表失败');
+      }
+    } finally {
+      setBulkAgentSubmitting(false);
+    }
+  };
+
+  // 批量改航班：只把订单 id、航段和目标班次交给后端；航段归属与出票守卫以后端为准。
+  const applyBulkReschedule = async () => {
+    if (!tokens?.accessToken || !bulkFlightScheduleId || selectedIds.size === 0) return;
+    if (selectedIds.size > BATCH_RESCHEDULE_ORDER_LIMIT) {
+      window.alert(`单次最多批量改航班 ${BATCH_RESCHEDULE_ORDER_LIMIT} 条订单，请分批操作。`);
+      return;
+    }
+    if (bulkRescheduleLeg === 'RETURN' && selectedReturnLegOrderCount === 0) return;
+    if (!window.confirm(
+      `确认将所选 ${selectedIds.size} 条订单的${bulkRescheduleLeg === 'OUTBOUND' ? '去程' : '回程'}座位搬到新班次？\n\n` +
+      `新班次余位不足的订单会失败并回滚，其余订单不受影响。本操作不收改期费。` +
+      (bulkRescheduleAllowTicketed
+        ? '\n\n已勾选同时修改已出票/已完成订单：系统里的座位会搬到新班次，但真实机票仍需人工去航司改签。'
+        : ''),
+    )) return;
+    setBulkRescheduleSubmitting(true);
+    setBulkRescheduleResult(null);
+    try {
+      const res = await api.batchRescheduleOrders(tokens.accessToken, {
+        orderIds: Array.from(selectedIds),
+        leg: bulkRescheduleLeg,
+        newScheduleId: bulkFlightScheduleId,
+        allowTicketed: bulkRescheduleAllowTicketed,
+        note: bulkRescheduleNote.trim() || undefined,
+      });
+      setBulkRescheduleResult({
+        succeeded: res.succeeded,
+        failed: res.failed,
+        failures: res.results.filter((r) => !r.ok).map((r) => ({ id: r.id, error: r.error })),
+        notices: res.results
+          .filter((r) => r.ok && r.notice)
+          .map((r) => ({ id: r.id, message: r.notice as string })),
+      });
+      bumpSeats();
+      if (res.failed === 0) {
+        setSelectedIds(new Set());
+        setBulkFlightScheduleId('');
+        setBulkRescheduleNote('');
+      } else {
+        setSelectedIds(new Set(res.results.filter((r) => !r.ok).map((r) => r.id)));
+      }
+      try {
+        const updated = await api.listOrders(tokens.accessToken, { ...filterQuery, pageSize: ORDERS_FETCH_LIMIT });
+        setOrders(updated.orders);
+        setOrdersTotal(updated.pagination.total);
+      } catch (err) {
+        alert(err instanceof ApiError ? `批量改航班已完成，但刷新订单列表失败：${err.message}` : '批量改航班已完成，但刷新订单列表失败');
+      }
+    } finally {
+      setBulkRescheduleSubmitting(false);
+    }
+  };
+
   const applyBulkDelete = async () => {
     if (!tokens?.accessToken || selectedIds.size === 0 || highRiskConfirmRef.current) return;
     highRiskConfirmRef.current = true;
@@ -2328,6 +2567,166 @@ export function OrdersPage() {
             />
           )}
 
+          {/* 批量改备注：整条覆盖，不是追加；留空即清空。 */}
+          <div className="mt-3 space-y-2 border-t border-brand/15 pt-3">
+            <div className="flex flex-wrap items-center gap-3">
+              <label className="text-sm text-ink-soft" htmlFor="bulk-order-notes">批量改备注：</label>
+              <textarea
+                id="bulk-order-notes"
+                className="input min-h-16 min-w-[20rem] flex-1 basis-full py-1.5"
+                value={bulkNotes}
+                onChange={(e) => setBulkNotes(e.target.value)}
+                maxLength={2000}
+                disabled={bulkNotesSubmitting}
+                placeholder="整条覆盖订单备注；留空将清空原备注"
+              />
+              <button
+                className="btn-primary text-sm py-1.5 disabled:opacity-50"
+                onClick={() => void applyBulkNotes()}
+                disabled={bulkNotesSubmitting}
+              >
+                {bulkNotesSubmitting ? '处理中…' : `应用到 ${selectedIds.size} 条`}
+              </button>
+              <span className="text-xs text-ink-soft">覆盖，不是追加；留空 = 清空（{bulkNotes.length}/2000）</span>
+            </div>
+          </div>
+          {/* 批量改代理：服务端有硬守卫，失败原因逐条展示。 */}
+          <div className="mt-3 space-y-2 border-t border-brand/15 pt-3">
+            <div className="flex flex-wrap items-center gap-3">
+              <label className="text-sm text-ink-soft">批量改代理机构：</label>
+              <SearchSelect
+                options={bulkAgentOptions}
+                value={bulkAgentId || null}
+                onChange={setBulkAgentId}
+                placeholder={bulkAgentsLoading ? '加载代理列表…' : bulkAgentsError ? '代理列表加载失败' : bulkAgents.length ? '搜索目标代理机构…' : '暂无可用代理'}
+                disabled={bulkAgentSubmitting || bulkAgentsLoading || !!bulkAgentsError || bulkAgents.length === 0}
+                className="w-64"
+              />
+              {bulkAgentsError && (
+                <button
+                  type="button"
+                  className="btn-secondary text-sm py-1.5"
+                  onClick={() => void loadBulkAgents()}
+                  disabled={bulkAgentsLoading}
+                >
+                  重试加载
+                </button>
+              )}
+              <input
+                className="input w-64 py-1.5"
+                value={bulkAgentReason}
+                onChange={(e) => setBulkAgentReason(e.target.value)}
+                maxLength={500}
+                disabled={bulkAgentSubmitting}
+                placeholder="变更原因（选填）"
+              />
+              <button
+                className="btn-primary text-sm py-1.5 disabled:opacity-50"
+                onClick={() => void applyBulkAgent()}
+                disabled={!bulkAgentId || bulkAgentSubmitting}
+              >
+                {bulkAgentSubmitting ? '处理中…' : `应用到 ${selectedIds.size} 条`}
+              </button>
+            </div>
+            <p className="text-xs text-ink-soft">
+              回收站单、已退款单、曾用原代理预存余额抵扣的订单会失败；目标代理不存在或已停用也会失败，原因逐条列出。财务不回溯：已发生的收款 / 余额抵扣 / 佣金按原归属保留；变更后新产生的按新归属。
+            </p>
+          </div>
+          {/* 批量改航班：纠正录入班次，不收改期费；服务端按真实订单行判定去/回程。 */}
+          <div className="mt-3 space-y-2 border-t border-brand/15 pt-3">
+            <div className="flex flex-wrap items-center gap-3">
+              <label className="text-sm text-ink-soft">批量改航班：</label>
+              <select
+                className="input max-w-[15rem] py-1.5"
+                value={bulkFlightId}
+                onChange={(e) => {
+                  setBulkFlightId(e.target.value);
+                  setBulkFlightScheduleId('');
+                }}
+                disabled={bulkRescheduleSubmitting}
+              >
+                <option value="">选择航班…</option>
+                {bulkFlightOptions.map((flight) => (
+                  <option key={flight.id} value={flight.id}>
+                    {flight.flightNumber} · {flight.originCode}→{flight.destinationCode}
+                  </option>
+                ))}
+              </select>
+              <select
+                className="input max-w-[17rem] py-1.5 disabled:bg-slate-100"
+                value={bulkFlightScheduleId}
+                onChange={(e) => {
+                  setBulkFlightScheduleId(e.target.value);
+                }}
+                disabled={!bulkFlightId || bulkFlightSchedulesLoading || bulkRescheduleSubmitting}
+              >
+                <option value="">{bulkFlightSchedulesLoading ? '班次加载中…' : '选择新班次…'}</option>
+                {bulkFlightSchedules.map((schedule) => (
+                  <option key={schedule.id} value={schedule.id}>{scheduleLabel(schedule)}</option>
+                ))}
+              </select>
+              <label className="flex items-center gap-1.5 text-sm text-ink-soft">
+                <input
+                  type="radio"
+                  name="bulk-reschedule-leg"
+                  checked={bulkRescheduleLeg === 'OUTBOUND'}
+                  onChange={() => setBulkRescheduleLeg('OUTBOUND')}
+                  disabled={bulkRescheduleSubmitting}
+                />
+                改去程
+              </label>
+              <label className="flex items-center gap-1.5 text-sm text-ink-soft">
+                <input
+                  type="radio"
+                  name="bulk-reschedule-leg"
+                  checked={bulkRescheduleLeg === 'RETURN'}
+                  onChange={() => setBulkRescheduleLeg('RETURN')}
+                  disabled={bulkRescheduleSubmitting}
+                />
+                改回程
+              </label>
+            </div>
+            <div className="flex flex-wrap items-center gap-3">
+              <input
+                className="input w-64 py-1.5"
+                value={bulkRescheduleNote}
+                onChange={(e) => setBulkRescheduleNote(e.target.value)}
+                maxLength={500}
+                disabled={bulkRescheduleSubmitting}
+                placeholder="纠错备注（选填）"
+              />
+              <button
+                className="btn-primary text-sm py-1.5 disabled:opacity-50"
+                onClick={() => void applyBulkReschedule()}
+                disabled={
+                  !bulkFlightScheduleId || bulkRescheduleSubmitting ||
+                  (bulkRescheduleLeg === 'RETURN' && selectedReturnLegOrderCount === 0)
+                }
+              >
+                {bulkRescheduleSubmitting ? '处理中…' : `应用到 ${selectedIds.size} 条`}
+              </button>
+            </div>
+            <label className="flex items-start gap-2 text-xs text-ink-soft">
+              <input
+                type="checkbox"
+                className="mt-0.5 accent-brand"
+                checked={bulkRescheduleAllowTicketed}
+                onChange={(e) => setBulkRescheduleAllowTicketed(e.target.checked)}
+                disabled={bulkRescheduleSubmitting}
+              />
+              <span>
+                同时修改已出票 / 已完成的订单
+                <span className="ml-1 text-amber-700">（系统里座位会搬到新班次，但真实机票需要人工去航司改签）</span>
+              </span>
+            </label>
+            <div className="text-xs text-ink-soft">
+              已选 {selectedIds.size} 单 · 含回程航段 {selectedReturnLegOrderCount} 单 · 已出票/已完成 {selectedTicketedOrderCount} 单
+            </div>
+            {bulkRescheduleLeg === 'RETURN' && selectedReturnLegOrderCount === 0 && (
+              <div className="text-xs text-rose-700">所选订单没有回程航段，不能批量改回程。</div>
+            )}
+            {bulkFlightOptionsError && <div className="text-xs text-rose-700">{bulkFlightOptionsError}</div>}
+          </div>
           {/* 批量选酒店（随机池落位）：仅对已选订单里「未落位随机池行」生效，其余单自动跳过。 */}
           <div className="mt-3 flex flex-wrap items-center gap-3 border-t border-brand/15 pt-3">
             <label className="text-sm text-ink-soft">批量选酒店（落随机池）：</label>
@@ -2474,6 +2873,32 @@ export function OrdersPage() {
             </div>
           )}
         </section>
+      )}
+
+      {bulkNotesResult && (
+        <BulkResultPanel
+          succeeded={bulkNotesResult.succeeded}
+          failed={bulkNotesResult.failed}
+          failures={bulkNotesResult.failures}
+          orders={orders}
+        />
+      )}
+      {bulkAgentResult && (
+        <BulkResultPanel
+          succeeded={bulkAgentResult.succeeded}
+          failed={bulkAgentResult.failed}
+          failures={bulkAgentResult.failures}
+          orders={orders}
+        />
+      )}
+      {bulkRescheduleResult && (
+        <BulkResultPanel
+          succeeded={bulkRescheduleResult.succeeded}
+          failed={bulkRescheduleResult.failed}
+          failures={bulkRescheduleResult.failures}
+          notices={bulkRescheduleResult.notices}
+          orders={orders}
+        />
       )}
 
       <section className="card p-0 overflow-hidden">
@@ -3405,7 +3830,7 @@ function OrderDrawer({
             <div className="mt-1.5 text-sm font-medium text-ink">{view.customerName}</div>
             <div className="text-xs text-ink-soft">{o.contactPhone}</div>
             {o.contactEmail && <div className="truncate text-xs text-ink-muted">{o.contactEmail}</div>}
-            {/* 归属代理徽标 + 更改（仅 ADMIN/STAFF；口径 C 任何状态都能改，留审计） */}
+            {/* 归属代理徽标 + 更改（仅 ADMIN/STAFF；服务端硬守卫逐单校验） */}
             <div className="mt-1 flex flex-wrap items-center gap-1.5">
               {view.agentName ? (
                 <span className="badge-info">{view.agentName}</span>
@@ -4495,6 +4920,42 @@ function scheduleLabel(s: AdminSchedule): string {
   return `${dep} → ${arr}`;
 }
 
+/** 改期表单与批量改航班共用的航班/班次加载逻辑。 */
+function useFlightScheduleOptions(token: string, flightId: string, enabled = true) {
+  const [flights, setFlights] = useState<AdminFlight[]>([]);
+  const [schedules, setSchedules] = useState<AdminSchedule[]>([]);
+  const [loadingSchedules, setLoadingSchedules] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!enabled || !token) return;
+    let cancelled = false;
+    setError(null);
+    api.listAllFlights(token)
+      .then((r) => { if (!cancelled) setFlights(r.flights); })
+      .catch(() => { if (!cancelled) setError('航班列表加载失败'); });
+    return () => { cancelled = true; };
+  }, [enabled, token]);
+
+  useEffect(() => {
+    if (!enabled || !token || !flightId) {
+      setSchedules([]);
+      setLoadingSchedules(false);
+      return;
+    }
+    let cancelled = false;
+    setError(null);
+    setLoadingSchedules(true);
+    api.listSchedules(token, flightId)
+      .then((r) => { if (!cancelled) setSchedules(r.schedules.filter((s) => s.isActive)); })
+      .catch(() => { if (!cancelled) setError('班次加载失败'); })
+      .finally(() => { if (!cancelled) setLoadingSchedules(false); });
+    return () => { cancelled = true; };
+  }, [enabled, flightId, token]);
+
+  return { flights, schedules, loadingSchedules, error };
+}
+
 // ── 套餐行程单卡片（订单详情「产品内容」板块，套餐订单专属，展示在原始金额行上方）────
 // 人类可读的行程摘要，方便运营截图发给地接/客人核对，而非逐行读金额。非套餐订单不渲染。
 
@@ -5158,36 +5619,18 @@ function RescheduleForm({
 }) {
   const tokens = useAuth((s) => s.tokens);
   const token = tokens?.accessToken ?? '';
-  const [flights, setFlights] = useState<AdminFlight[]>([]);
   const [flightId, setFlightId] = useState('');
-  const [schedules, setSchedules] = useState<AdminSchedule[]>([]);
   const [newScheduleId, setNewScheduleId] = useState('');
   const [newCabin, setNewCabin] = useState<CabinClass | ''>(item.flightCabin ?? '');
   const [feeCny, setFeeCny] = useState<number | null>(null);
   const [note, setNote] = useState('');
-  const [loadingSchedules, setLoadingSchedules] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const { flights, schedules, loadingSchedules, error: optionsError } = useFlightScheduleOptions(token, flightId);
 
   useEffect(() => {
-    if (!token) return;
-    let cancelled = false;
-    api.listAllFlights(token)
-      .then((r) => { if (!cancelled) setFlights(r.flights); })
-      .catch(() => { if (!cancelled) setErr('航班列表加载失败'); });
-    return () => { cancelled = true; };
-  }, [token]);
-
-  useEffect(() => {
-    if (!token || !flightId) { setSchedules([]); setNewScheduleId(''); return; }
-    let cancelled = false;
-    setLoadingSchedules(true);
-    api.listSchedules(token, flightId)
-      .then((r) => { if (!cancelled) setSchedules(r.schedules.filter((s) => s.isActive)); })
-      .catch(() => { if (!cancelled) setErr('班次加载失败'); })
-      .finally(() => { if (!cancelled) setLoadingSchedules(false); });
-    return () => { cancelled = true; };
-  }, [token, flightId]);
+    if (optionsError) setErr(optionsError);
+  }, [optionsError]);
 
   const selectedSchedule = schedules.find((s) => s.id === newScheduleId);
   const cabinOptions = selectedSchedule?.seatClasses ?? [];
@@ -5224,7 +5667,10 @@ function RescheduleForm({
         <select
           className="mt-0.5 w-full rounded border border-slate-300 px-2 py-1"
           value={flightId}
-          onChange={(e) => setFlightId(e.target.value)}
+          onChange={(e) => {
+            setFlightId(e.target.value);
+            setNewScheduleId('');
+          }}
         >
           <option value="">选择航班…</option>
           {flights.map((f) => (

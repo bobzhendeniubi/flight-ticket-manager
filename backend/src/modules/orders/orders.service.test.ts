@@ -3233,6 +3233,267 @@ describe('OrderService.rescheduleOrderItem · 占座状态守卫', () => {
     expect(mockPrisma.flightSeatClass.findFirst).not.toHaveBeenCalled();
   });
 
+  it('并发状态翻转：事务内读到 TICKETED 时，批量守卫拒绝改期', async () => {
+    const service = new OrderService();
+    mockPrisma.order.findUnique.mockReset().mockResolvedValueOnce({
+      id: 'ord1',
+      status: 'TICKETED',
+      deletedAt: null,
+      adjustmentCny: 0,
+      adjustments: [],
+    });
+
+    await expect(
+      service.rescheduleOrderItem(
+        'ord1',
+        {
+          orderItemId: 'it1',
+          newScheduleId: 'sched2',
+          guard: { forbidTicketed: true },
+        },
+        { userId: 'admin1', role: 'ADMIN' },
+      ),
+    ).rejects.toMatchObject({
+      statusCode: 400,
+      message: '订单已出票/已完成，需勾选「同时修改已出票订单」后才能改',
+    });
+    expect(mockPrisma.orderItem.findUnique).not.toHaveBeenCalled();
+  });
+
+  it('按航段在事务内定位：同 scheduleId 的往返单改回程改第 2 条订单行', async () => {
+    const service = new OrderService();
+    const items = [
+      {
+        id: 'return-item',
+        orderId: 'ord1',
+        kind: 'FLIGHT',
+        quantity: 1,
+        bundleId: null,
+        flightScheduleId: 'same-schedule',
+        flightCabin: 'ECONOMY',
+        metadata: {},
+        flightSchedule: { departureTime: new Date('2026-08-30T01:00:00.000Z') },
+      },
+      {
+        id: 'outbound-item',
+        orderId: 'ord1',
+        kind: 'FLIGHT',
+        quantity: 1,
+        bundleId: null,
+        flightScheduleId: 'same-schedule',
+        flightCabin: 'ECONOMY',
+        metadata: {},
+        flightSchedule: { departureTime: new Date('2026-08-25T01:00:00.000Z') },
+      },
+    ];
+    mockPrisma.order.findUnique.mockReset().mockResolvedValue({
+      id: 'ord1',
+      status: 'PAID',
+      deletedAt: null,
+      adjustmentCny: 0,
+      adjustments: [],
+    });
+    mockPrisma.orderItem.findMany.mockReset().mockImplementation(
+      async (args: { select?: { id?: boolean } }) =>
+        args.select?.id
+          ? items
+          : items.map(({ flightScheduleId, flightSchedule }) => ({ flightScheduleId, flightSchedule })),
+    );
+    mockPrisma.flightSeatClass.findFirst.mockReset().mockResolvedValue({ id: 'target-seat', capacity: 100, sold: 0 });
+    mockPrisma.seatLock.aggregate.mockReset().mockResolvedValue({ _sum: { qty: 0 } });
+    mockPrisma.$queryRaw.mockReset().mockResolvedValue([{ id: 'ord1' }]);
+    mockPrisma.$executeRaw.mockReset().mockResolvedValue(1);
+    mockPrisma.orderItem.update.mockReset().mockResolvedValue({});
+    mockPrisma.order.update.mockReset().mockResolvedValue({});
+    mockPrisma.flightSchedule.findUnique.mockReset().mockResolvedValue({ departureTime: new Date('2026-08-30T01:00:00.000Z') });
+    mockPrisma.order.findUniqueOrThrow.mockReset().mockResolvedValue(fakeFullOrder());
+
+    await service.rescheduleOrderItem(
+      'ord1',
+      { leg: 'RETURN', newScheduleId: 'new-schedule' },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    expect(mockPrisma.orderItem.update).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'return-item' },
+    }));
+    expect(mockPrisma.orderItem.update).not.toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'outbound-item' },
+    }));
+    expect(mockPrisma.orderItem.findMany).toHaveBeenCalledWith(expect.objectContaining({
+      orderBy: [{ flightSchedule: { departureTime: 'asc' } }, { id: 'asc' }],
+    }));
+  });
+
+  it('省略出票 guard 时不拦截已出票订单（guard 生效/省略两路均走真实服务）', async () => {
+    const service = new OrderService();
+    mockPrisma.order.findUnique.mockReset().mockResolvedValue({
+      id: 'ord1',
+      status: 'TICKETED',
+      deletedAt: null,
+      adjustmentCny: 0,
+      adjustments: [],
+    });
+    mockPrisma.orderItem.findUnique.mockReset().mockResolvedValue({
+      id: 'it1',
+      orderId: 'ord1',
+      kind: 'FLIGHT',
+      quantity: 1,
+      bundleId: null,
+      flightScheduleId: 'sched1',
+      flightCabin: 'ECONOMY',
+      metadata: {},
+    });
+    mockPrisma.orderItem.findMany.mockReset().mockResolvedValue([]);
+    mockPrisma.flightSeatClass.findFirst.mockReset().mockResolvedValue({ id: 'seat1' });
+    mockPrisma.seatLock.aggregate.mockReset().mockResolvedValue({ _sum: { qty: 0 } });
+    mockPrisma.$executeRaw.mockReset().mockResolvedValue(1);
+    mockPrisma.orderItem.update.mockReset().mockResolvedValue({});
+    mockPrisma.order.update.mockReset().mockResolvedValue({});
+    mockPrisma.flightSchedule.findUnique.mockReset().mockResolvedValue({ departureTime: new Date() });
+    mockPrisma.order.findUniqueOrThrow.mockReset().mockResolvedValue(fakeFullOrder());
+
+    const result = await service.rescheduleOrderItem(
+      'ord1',
+      { orderItemId: 'it1', newScheduleId: 'sched2' },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    expect(result.audit.statusChanged).toBe(false);
+    expect(mockPrisma.orderItem.update).toHaveBeenCalledWith(expect.objectContaining({ where: { id: 'it1' } }));
+  });
+
+  it('correction 模式下 CHANGE_REQUESTED 不推进状态', async () => {
+    const service = new OrderService();
+    const transition = vi.spyOn(service, '_updateStatusWithinTx').mockResolvedValue(undefined as never);
+    mockPrisma.order.findUnique.mockReset().mockResolvedValue({
+      id: 'ord1',
+      status: 'CHANGE_REQUESTED',
+      deletedAt: null,
+      adjustmentCny: 120,
+      adjustments: [{ type: 'EXISTING', amountCny: 120 }],
+    });
+    mockPrisma.orderItem.findUnique.mockReset().mockResolvedValue({
+      id: 'it1',
+      orderId: 'ord1',
+      kind: 'FLIGHT',
+      quantity: 1,
+      bundleId: null,
+      flightScheduleId: 'sched1',
+      flightCabin: 'ECONOMY',
+      metadata: {},
+    });
+    mockPrisma.orderItem.findMany.mockReset().mockResolvedValue([]);
+    mockPrisma.flightSeatClass.findFirst.mockReset().mockResolvedValue({ id: 'seat1' });
+    mockPrisma.seatLock.aggregate.mockReset().mockResolvedValue({ _sum: { qty: 0 } });
+    mockPrisma.$executeRaw.mockReset().mockResolvedValue(1);
+    mockPrisma.orderItem.update.mockReset().mockResolvedValue({});
+    mockPrisma.order.update.mockReset().mockResolvedValue({});
+    mockPrisma.flightSchedule.findUnique.mockReset().mockResolvedValue({ departureTime: new Date() });
+    mockPrisma.order.findUniqueOrThrow.mockReset().mockResolvedValue(
+      fakeFullOrder({ status: 'CHANGE_REQUESTED', adjustmentCny: 120 }),
+    );
+
+    const result = await service.rescheduleOrderItem(
+      'ord1',
+      { orderItemId: 'it1', newScheduleId: 'sched2', guard: { correction: true } },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    expect(result.audit.statusChanged).toBe(false);
+    expect(transition).not.toHaveBeenCalled();
+    expect(mockPrisma.order.update).not.toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ status: 'CHANGED', adjustmentCny: expect.anything() }),
+    }));
+  });
+
+  it('correction 模式下套餐存在未撤销立减时拒绝，金额保持不变', async () => {
+    const service = new OrderService();
+    const orderState = {
+      id: 'ord1',
+      status: 'PAID',
+      deletedAt: null,
+      adjustmentCny: 120,
+      adjustments: [{ type: 'EXISTING', amountCny: 120 }],
+    };
+    mockPrisma.order.findUnique.mockReset().mockResolvedValue(orderState);
+    mockPrisma.orderItem.findUnique.mockReset().mockResolvedValue({
+      id: 'bundle-flight',
+      orderId: 'ord1',
+      kind: 'FLIGHT',
+      quantity: 1,
+      bundleId: 'bundle-1',
+      flightScheduleId: 'sched1',
+      flightCabin: 'ECONOMY',
+      metadata: {},
+    });
+    mockPrisma.orderItem.findMany.mockReset().mockResolvedValue([
+      { metadata: { settlementDiscount: true, bundleId: 'bundle-1' } },
+    ]);
+
+    await expect(
+      service.rescheduleOrderItem(
+        'ord1',
+        { orderItemId: 'bundle-flight', newScheduleId: 'sched2', guard: { correction: true } },
+        { userId: 'admin1', role: 'ADMIN' },
+      ),
+    ).rejects.toMatchObject({
+      statusCode: 400,
+      message: '本单含套餐立减，批量纠错会产生补差金额，请走单条改期逐单确认',
+    });
+
+    expect(orderState.adjustmentCny).toBe(120);
+    expect(mockPrisma.orderItem.update).not.toHaveBeenCalled();
+    expect(mockPrisma.order.update).not.toHaveBeenCalled();
+  });
+
+  it('省略 correction 时仍按单条改期原行为补差并推进 CHANGE_REQUESTED', async () => {
+    const service = new OrderService();
+    const transition = vi.spyOn(service, '_updateStatusWithinTx').mockResolvedValue(undefined as never);
+    const orderState = {
+      id: 'ord1',
+      status: 'CHANGE_REQUESTED',
+      deletedAt: null,
+      adjustmentCny: 120,
+      adjustments: [],
+    };
+    mockPrisma.order.findUnique.mockReset().mockResolvedValue(orderState);
+    mockPrisma.orderItem.findUnique.mockReset().mockResolvedValue({
+      id: 'bundle-flight',
+      orderId: 'ord1',
+      kind: 'FLIGHT',
+      quantity: 1,
+      bundleId: 'bundle-1',
+      flightScheduleId: 'sched1',
+      flightCabin: 'ECONOMY',
+      metadata: {},
+    });
+    mockPrisma.orderItem.findMany.mockReset().mockImplementation(async (args: { where?: { kind?: string } }) =>
+      args.where?.kind === 'DISCOUNT'
+        ? [{ id: 'discount-1', amount: -80, metadata: { settlementDiscount: true, bundleId: 'bundle-1' } }]
+        : [],
+    );
+    mockPrisma.flightSeatClass.findFirst.mockReset().mockResolvedValue({ id: 'seat1' });
+    mockPrisma.seatLock.aggregate.mockReset().mockResolvedValue({ _sum: { qty: 0 } });
+    mockPrisma.$executeRaw.mockReset().mockResolvedValue(1);
+    mockPrisma.orderItem.update.mockReset().mockResolvedValue({});
+    mockPrisma.order.update.mockReset().mockResolvedValue({});
+    mockPrisma.flightSchedule.findUnique.mockReset().mockResolvedValue({ departureTime: new Date() });
+    mockPrisma.order.findUniqueOrThrow.mockReset().mockResolvedValue(fakeFullOrder({ adjustmentCny: 200 }));
+
+    const result = await service.rescheduleOrderItem(
+      'ord1',
+      { orderItemId: 'bundle-flight', newScheduleId: 'sched2' },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    expect(result.audit.statusChanged).toBe(true);
+    expect(transition).toHaveBeenCalledTimes(1);
+    expect(mockPrisma.order.update).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ adjustmentCny: 200 }),
+    }));
+  });
+
   it('同班次同舱位仅记改期费 → 不撤销立减，adjustmentCny 只增加 feeCny', async () => {
     const service = new OrderService();
     mockPrisma.order.findUnique.mockReset().mockResolvedValue({
