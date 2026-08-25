@@ -2,7 +2,7 @@
  * OrderService.softDeleteOrder + buildOrderFilterWhere 软删除口径 · 服务级测试（vitest）
  *
  * 用 vi.mock 把 Prisma 替换成可控 fixture，不依赖真 DB。覆盖：
- *   1. 权限：非 ADMIN（STAFF/AGENT/CUSTOMER）删单 → ForbiddenError，不落任何写
+ *   1. 权限：非内部员工（AGENT/CUSTOMER）删单 → ForbiddenError，不落任何写；STAFF 放行
  *   2. 前置守卫：仍占座状态（SEAT_HOLDING_STATUSES）拒删 → BadRequestError，且 update 从未被调用
  *      （证明删除绝不偷偷释放座位）
  *   3. 已释放型状态（CANCELLED 等）可删：写 deletedAt，返回 before/after 供路由写审计
@@ -40,8 +40,8 @@ beforeEach(() => {
   mockPrisma.order.update.mockReset();
 });
 
-describe('softDeleteOrder · 权限（仅 ADMIN）', () => {
-  it.each([UserRole.STAFF, UserRole.AGENT, UserRole.CUSTOMER])(
+describe('softDeleteOrder · 权限（ADMIN + STAFF）', () => {
+  it.each([UserRole.AGENT, UserRole.CUSTOMER])(
     '%s 删单 → ForbiddenError，且不查库不写库',
     async (role) => {
       await expect(
@@ -51,6 +51,16 @@ describe('softDeleteOrder · 权限（仅 ADMIN）', () => {
       expect(mockPrisma.order.update).not.toHaveBeenCalled();
     },
   );
+
+  // STAFF 与 ADMIN 同权：过权限闸后走同一套前置守卫（占座/净收款），不因角色分叉。
+  it('STAFF 删单 → 过权限闸，进入前置守卫（此处订单不存在 → NotFoundError）', async () => {
+    mockPrisma.order.findFirst.mockResolvedValue(null);
+    await expect(
+      service.softDeleteOrder('o1', { userId: 'u', role: UserRole.STAFF }),
+    ).rejects.toBeInstanceOf(NotFoundError);
+    expect(mockPrisma.order.findFirst).toHaveBeenCalled();
+    expect(mockPrisma.order.update).not.toHaveBeenCalled();
+  });
 });
 
 describe('softDeleteOrder · 前置守卫（占座状态拒删）', () => {

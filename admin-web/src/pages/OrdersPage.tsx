@@ -421,6 +421,9 @@ export function OrdersPage() {
   const user = useAuth((s) => s.user);
   const bumpSeats = useFlightSeats((s) => s.bumpSeats);
   const isAdmin = user?.role === 'ADMIN';
+  // 删单 / 回收站 = 内部员工（ADMIN + STAFF）共有权限，与 isAdmin 分开：
+  // isAdmin 另外还管「强制改状态」等绕过状态机的口子，不能一起放开。
+  const canManageDeleted = user?.role === 'ADMIN' || user?.role === 'STAFF';
   // 深链承接：从签证台等页面带 ?q=订单号 跳入时用于填充搜索框并自动开详情抽屉
   const [searchParams] = useSearchParams();
   const legacyOrderId = searchParams.get('legacyOrderId')?.trim();
@@ -431,7 +434,7 @@ export function OrdersPage() {
   const [ordersTotal, setOrdersTotal] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  // 回收站（仅 ADMIN）：已软删订单弹窗 + 恢复
+  // 回收站（ADMIN + STAFF）：已软删订单弹窗 + 恢复
   const [showRecycleBin, setShowRecycleBin] = useState(false);
   const [deletedOrders, setDeletedOrders] = useState<DeletedOrderSummary[]>([]);
   const [deletedTotal, setDeletedTotal] = useState<number | null>(null);
@@ -1661,7 +1664,7 @@ export function OrdersPage() {
           >
             <Icon name="ticket" /> 票务开票导出
           </button>
-          {isAdmin && (
+          {canManageDeleted && (
             <button
               type="button"
               className="btn-ghost text-sm"
@@ -2313,8 +2316,8 @@ export function OrdersPage() {
             />
           )}
 
-          {/* 批量删除（仅 ADMIN）：软删除可在回收站恢复；逐单调用现有端点，服务端占座/净收款守卫逐单生效。 */}
-          {isAdmin && (
+          {/* 批量删除（ADMIN + STAFF）：软删除可在回收站恢复；逐单调用现有端点，服务端占座/净收款守卫逐单生效。 */}
+          {canManageDeleted && (
             <div className="mt-3 flex flex-wrap items-center gap-3 border-t border-rose-200 pt-3">
               <button
                 className="btn-danger text-sm disabled:opacity-50"
@@ -2671,10 +2674,10 @@ export function OrdersPage() {
                       <button className="whitespace-nowrap text-sm font-medium text-brand hover:text-brand-dark" onClick={() => setSelected(order)}>
                         详情
                       </button>
-                      {isAdmin && (
+                      {canManageDeleted && (
                         <button
                           className="btn-ghost-danger whitespace-nowrap text-xs"
-                          title="删除订单（ADMIN）"
+                          title="删除订单"
                           onClick={() => void deleteOrder(order)}
                         >
                           <Icon name="trash" /> 删除
@@ -2965,7 +2968,7 @@ function OrderDrawer({
   onChanged?: () => void;
   /** 售后改期/换人后用更新后的订单就地刷新抽屉与列表 */
   onOrderUpdated?: (order: OrderSummary) => void;
-  /** 删除订单（ADMIN 专用） */
+  /** 删除订单（内部员工：ADMIN + STAFF） */
   onDelete?: () => void;
   isAdmin?: boolean;
 }) {
@@ -2974,6 +2977,8 @@ function OrderDrawer({
   const role = useAuth((s) => s.user?.role);
   // 内部角色（ADMIN/STAFF）才看逐项拆价折叠区；AGENT/CUSTOMER 只看「产品内容 + 订单总价」，不露内部金额明细。
   const canSeeInternal = role === 'ADMIN' || role === 'STAFF';
+  // 删单同为内部员工权限；与 isAdmin（强制改状态）分开判断。
+  const canManageDeleted = role === 'ADMIN' || role === 'STAFF';
   // #8 修复：列表行的 passengers 只有 {id, fullName}（后端 listOrders select 精简），护照号/生日/国籍/类型
   // 恒显示「—」。抽屉打开时用 getOrder 拉全量详情，之后所有子区块都读 hydrated（拿不到时兜底列表行）。
   const [hydrated, setHydrated] = useState<OrderSummary | null>(null);
@@ -3407,13 +3412,13 @@ function OrderDrawer({
             </div>
           </details>
 
-          {isAdmin && onDelete && (
+          {canManageDeleted && onDelete && (
             <section className="border-t border-rose-100 pt-3">
               <button
                 className="btn-danger w-full"
                 onClick={onDelete}
               >
-                <Icon name="trash" /> 删除订单（ADMIN）
+                <Icon name="trash" /> 删除订单
               </button>
               <p className="mt-1 text-[11px] text-rose-400">
                 软删除：从列表/导出/统计隐藏，数据可追溯，不影响座位账。仍占座需先取消订单释放座位。

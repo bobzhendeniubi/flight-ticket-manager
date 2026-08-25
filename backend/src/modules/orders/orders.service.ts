@@ -3207,8 +3207,8 @@ export class OrderService {
    * 仅 ADMIN 可删（STAFF 不行）；返回删除前后的最小快照供路由层写审计。
    */
   async softDeleteOrder(id: string, requester: OrderRequester) {
-    if (requester.role !== UserRole.ADMIN) {
-      throw new ForbiddenError('仅管理员可删除订单');
+    if (requester.role !== UserRole.ADMIN && requester.role !== UserRole.STAFF) {
+      throw new ForbiddenError('仅内部员工可删除订单');
     }
     // 只找未删的订单（已删的再次删 → 视为不存在，幂等）
     const order = await prisma.order.findFirst({
@@ -3249,7 +3249,7 @@ export class OrderService {
   }
 
   // ════════════════════════════════════════════════════════════════════
-  // 回收站：列出已软删订单 + 恢复（均仅 ADMIN）
+  // 回收站：列出已软删订单 + 恢复（ADMIN + STAFF）
   // ════════════════════════════════════════════════════════════════════
   /**
    * 回收站列表：分页列出 deletedAt 非空的订单（按删除时间倒序）。
@@ -3264,8 +3264,8 @@ export class OrderService {
     query: { page: number; pageSize: number; search?: string },
     requester: OrderRequester,
   ) {
-    if (requester.role !== UserRole.ADMIN) {
-      throw new ForbiddenError('仅管理员可查看回收站');
+    if (requester.role !== UserRole.ADMIN && requester.role !== UserRole.STAFF) {
+      throw new ForbiddenError('仅内部员工可查看回收站');
     }
     const where: Prisma.OrderWhereInput = { deletedAt: { not: null } };
     // 搜索：与主列表同口径，复用 splitSearchTerms + buildSearchTermClause——
@@ -3363,8 +3363,8 @@ export class OrderService {
    * 未删 / 不存在的订单 → NotFound（findFirst 只匹配 deletedAt 非空，幂等）。
    */
   async restoreOrder(id: string, requester: OrderRequester) {
-    if (requester.role !== UserRole.ADMIN) {
-      throw new ForbiddenError('仅管理员可恢复订单');
+    if (requester.role !== UserRole.ADMIN && requester.role !== UserRole.STAFF) {
+      throw new ForbiddenError('仅内部员工可恢复订单');
     }
     const order = await prisma.order.findFirst({
       where: { id, deletedAt: { not: null } },

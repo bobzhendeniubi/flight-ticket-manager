@@ -3500,7 +3500,7 @@ export const api = {
       method: 'DELETE',
       token,
     }),
-  // 回收站：列出已软删订单（仅 ADMIN）。删除人（deletedBy）来自审计，可能为 null。
+  // 回收站：列出已软删订单（ADMIN + STAFF）。删除人（deletedBy）来自审计，可能为 null。
   // search：模糊匹配订单号/联系人名/乘客姓名（含中文名），透传给后端 query 参数。
   listDeletedOrders: (token: string, query?: { page?: number; pageSize?: number; search?: string }) => {
     const qs = new URLSearchParams();
@@ -3514,7 +3514,7 @@ export const api = {
       pagination: { page: number; pageSize: number; total: number };
     }>(`/orders/deleted${qs.toString() ? '?' + qs.toString() : ''}`, { token });
   },
-  // 从回收站恢复（仅 ADMIN）：deletedAt 置回 null，订单重新可见。软删/恢复都不触碰座位账。
+  // 从回收站恢复（ADMIN + STAFF）：deletedAt 置回 null，订单重新可见。软删/恢复都不触碰座位账。
   restoreOrder: (token: string, id: string) =>
     apiFetch<{ ok: true; id: string; deletedAt: string | null }>(`/orders/${id}/restore`, {
       method: 'POST',

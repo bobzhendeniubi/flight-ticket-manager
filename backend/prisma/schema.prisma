@@ -1468,7 +1468,7 @@ model Order {
   // type ∈ RESCHEDULE_FEE | SWAP_FEE | ...；by = 操作人 userId（无则 null）
   adjustments          Json             @default("[]")
   // 软删除：非空 = 已删。删除 = 从所有列表/导出/统计里消失，但整行数据保留可追溯。
-  // 仅 ADMIN 可删，且只允许删「已释放座位」的订单（守卫见 orders.service.softDeleteOrder），
+  // 仅内部员工（ADMIN/STAFF）可删，且只允许删「已释放座位」的订单（守卫见 orders.service.softDeleteOrder），
   // 删除本身绝不触碰库存/座位账（不偷偷释放）。查询口径统一挂 deletedAt: null 排除。
   deletedAt            DateTime?
   createdAt            DateTime         @default(now())

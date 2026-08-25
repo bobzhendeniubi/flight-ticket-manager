@@ -2,7 +2,7 @@
  * OrderService.listDeletedOrders + restoreOrder 回收站口径 · 服务级测试（vitest）
  *
  * 用 vi.mock 把 Prisma 替换成可控 fixture，不依赖真 DB。覆盖：
- *   1. 权限：非 ADMIN（STAFF/AGENT/CUSTOMER）看回收站 / 恢复 → ForbiddenError，且不查库不写库
+ *   1. 权限：非内部员工（AGENT/CUSTOMER）看回收站 / 恢复 → ForbiddenError，且不查库不写库；STAFF 放行
  *   2. listDeletedOrders：只列 deletedAt 非空、按删除时间倒序；映射订单号/客户/金额/原状态/
  *      删除时间/删除人；删除人从 SOFT_DELETE_ORDER 审计取（actorLabel 优先，回退 actor
  *      displayName/email），取不到置 null（不硬凑）
@@ -52,8 +52,8 @@ beforeEach(() => {
   mockPrisma.$transaction.mockClear();
 });
 
-describe('listDeletedOrders · 权限（仅 ADMIN）', () => {
-  it.each([UserRole.STAFF, UserRole.AGENT, UserRole.CUSTOMER])(
+describe('listDeletedOrders · 权限（ADMIN + STAFF）', () => {
+  it.each([UserRole.AGENT, UserRole.CUSTOMER])(
     '%s 看回收站 → ForbiddenError，且不查库',
     async (role) => {
       await expect(
@@ -284,8 +284,8 @@ describe('listDeletedOrders · search 分词（与主列表同口径：词间 AN
   });
 });
 
-describe('restoreOrder · 权限（仅 ADMIN）', () => {
-  it.each([UserRole.STAFF, UserRole.AGENT, UserRole.CUSTOMER])(
+describe('restoreOrder · 权限（ADMIN + STAFF）', () => {
+  it.each([UserRole.AGENT, UserRole.CUSTOMER])(
     '%s 恢复 → ForbiddenError，且不查库不写库',
     async (role) => {
       await expect(
@@ -295,6 +295,16 @@ describe('restoreOrder · 权限（仅 ADMIN）', () => {
       expect(mockPrisma.order.update).not.toHaveBeenCalled();
     },
   );
+
+  // STAFF 与 ADMIN 同权：过权限闸后走同一条恢复路径（只对已软删单生效）。
+  it('STAFF 恢复 → 过权限闸，进入查库（此处非软删单 → NotFoundError）', async () => {
+    mockPrisma.order.findFirst.mockResolvedValue(null);
+    await expect(
+      service.restoreOrder('o1', { userId: 'u', role: UserRole.STAFF }),
+    ).rejects.toBeInstanceOf(NotFoundError);
+    expect(mockPrisma.order.findFirst).toHaveBeenCalled();
+    expect(mockPrisma.order.update).not.toHaveBeenCalled();
+  });
 });
 
 describe('restoreOrder · 恢复已软删订单', () => {

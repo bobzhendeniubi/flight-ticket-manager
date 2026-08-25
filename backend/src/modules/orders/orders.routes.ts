@@ -381,13 +381,13 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     },
   );
 
-  // ── 回收站：列出已软删订单（仅 ADMIN）──────────────────────────────
+  // ── 回收站：列出已软删订单（ADMIN + STAFF）────────────────────────
   // GET /orders/deleted?page&pageSize&search —— 分页列出 deletedAt 非空的订单（订单号/客户/金额/
   //   原状态/删除时间/删除人）。search 模糊匹配订单号/联系人名/乘客姓名（含中文名）。
   //   静态路由，Fastify 优先于 /:id 匹配，故不会被参数路由吞掉。
   app.get(
     '/deleted',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN)] },
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
     async (req) => {
       const q = z
         .object({
@@ -1016,13 +1016,13 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     return { ok: true, claimedBy: updated.claimedBy };
   });
 
-  // ── 软删除订单（仅 ADMIN）──
+  // ── 软删除订单（ADMIN + STAFF）──
   // DELETE /orders/:id — 软删：从所有列表/导出/统计里消失，数据保留可追溯（审计记录谁删的）。
   //   前置守卫（service.softDeleteOrder）：仍占座的订单拒删（需先取消释放座位），只允许删已释放型
   //   状态（CANCELLED/PAYMENT_TIMEOUT/REFUNDED/FAILED/DRAFT）。删除本身绝不触碰库存/座位账。
   app.delete(
     '/:id',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN)] },
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
     async (req) => {
       const { id } = req.params as { id: string };
       const requester = await buildRequester(req.user.sub, req.user.role);
@@ -1042,11 +1042,11 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   );
 
   // POST /orders/:id/restore — 从回收站恢复：deletedAt 置回 null，订单重新可见。
-  //   仅 ADMIN；只对已软删的订单生效（未删/不存在 → 404）。软删从不改 status，且回收站里
+  //   ADMIN + STAFF；只对已软删的订单生效（未删/不存在 → 404）。软删从不改 status，且回收站里
   //   全是释放型状态，恢复绝不凭空占座（依据见 service.restoreOrder 注释）。审计 RESTORE_ORDER。
   app.post(
     '/:id/restore',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN)] },
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
     async (req) => {
       const { id } = req.params as { id: string };
       const requester = await buildRequester(req.user.sub, req.user.role);
