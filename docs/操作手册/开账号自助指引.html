@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>开账号自助指引 · 世途旅行运营控制台</title>
+<style>
+  :root{
+    --brand:#4F46E5; --brand-dark:#4338CA; --brand-50:#EEF2FF; --brand-100:#E0E7FF;
+    --ink:#0F172A; --ink-soft:#334155; --ink-muted:#64748B;
+    --bg:#F8FAFC; --card:#FFFFFF; --line:#E2E8F0;
+    --amber:#B45309; --amber-bg:#FEF3C7; --amber-line:#FDE68A;
+    --green:#047857; --green-bg:#D1FAE5; --green-line:#A7F3D0;
+    --blue:#1D4ED8; --blue-bg:#DBEAFE; --blue-line:#BFDBFE;
+    --rose:#BE123C; --rose-bg:#FFE4E6; --rose-line:#FECDD3;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  body{font-family:"Inter","PingFang SC","Microsoft YaHei","Hiragino Sans GB",sans-serif; color:var(--ink); background:var(--bg); line-height:1.75; font-size:15px;}
+  .page{max-width:880px; margin:0 auto; padding:32px 24px 80px;}
+  .cover{background:linear-gradient(135deg,var(--brand) 0%,#6D28D9 100%); color:#fff; border-radius:16px; padding:40px 36px; margin-bottom:28px;}
+  .cover .tag{display:inline-block; background:rgba(255,255,255,.18); border:1px solid rgba(255,255,255,.35); border-radius:999px; padding:2px 14px; font-size:13px; letter-spacing:.05em;}
+  .cover h1{font-size:30px; margin:14px 0 6px; letter-spacing:.02em;}
+  .cover p{color:#E0E7FF; font-size:14px;}
+  h2{font-size:22px; margin:44px 0 6px; padding-left:12px; border-left:5px solid var(--brand);}
+  h2 .no{color:var(--brand); margin-right:6px;}
+  h3{font-size:16.5px; margin:26px 0 8px; color:var(--ink);}
+  h3::before{content:"◆"; color:var(--brand); font-size:11px; margin-right:7px; vertical-align:2px;}
+  p{margin:8px 0;}
+  .sub{color:var(--ink-muted); font-size:13.5px; margin-bottom:14px;}
+  .toc{background:var(--card); border:1px solid var(--line); border-radius:12px; padding:20px 26px;}
+  .toc h2{margin-top:0; border:none; padding-left:0; font-size:18px;}
+  .toc ol{margin:8px 0 0 20px;}
+  .toc li{margin:5px 0;}
+  .toc a{color:var(--brand); text-decoration:none; font-weight:500;}
+  .toc a:hover{text-decoration:underline;}
+  .toc .sm{color:var(--ink-muted); font-size:12.5px; margin-left:6px; font-weight:400;}
+  .card{background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px 20px; margin:14px 0;}
+  .tip{border-left:4px solid var(--brand); background:var(--brand-50); border-radius:8px; padding:10px 16px; margin:12px 0; font-size:14px;}
+  .warn{border-left:4px solid var(--amber); background:var(--amber-bg); border-radius:8px; padding:10px 16px; margin:12px 0; font-size:14px;}
+  .danger{border-left:4px solid var(--rose); background:var(--rose-bg); border-radius:8px; padding:10px 16px; margin:12px 0; font-size:14px;}
+  .steps{counter-reset:step; margin:12px 0; padding:0; list-style:none;}
+  .steps li{position:relative; padding:0 0 14px 44px;}
+  .steps li::before{counter-increment:step; content:counter(step); position:absolute; left:0; top:1px; width:28px; height:28px; border-radius:50%; background:var(--brand); color:#fff; font-weight:700; font-size:14px; display:flex; align-items:center; justify-content:center;}
+  .steps li:not(:last-child)::after{content:""; position:absolute; left:13.5px; top:31px; bottom:2px; width:1.5px; background:var(--brand-100);}
+  table{border-collapse:collapse; width:100%; margin:12px 0; font-size:13.5px; background:#fff;}
+  th{background:var(--brand-50); color:var(--ink-soft); text-align:left; padding:8px 12px; border:1px solid var(--line); font-size:12.5px;}
+  td{padding:8px 12px; border:1px solid var(--line); vertical-align:top;}
+  /* 真实截图 */
+  .shot{border:1px solid var(--line); border-radius:12px; overflow:hidden; margin:16px 0 6px; box-shadow:0 2px 10px rgba(15,23,42,.06); background:#fff; break-inside:avoid;}
+  .shot img{display:block; width:100%; height:auto;}
+  .caption{font-size:12.5px; color:var(--ink-muted); text-align:center; margin:4px 0 18px;}
+  /* 系统弹窗原文 */
+  .sysmsg{border:1px solid var(--line); border-left:4px solid var(--ink-muted); background:#F1F5F9; border-radius:8px; padding:10px 16px; margin:10px 0; font-size:13.5px; color:var(--ink-soft); white-space:pre-line; break-inside:avoid;}
+  .sysmsg .t{display:block; font-size:11.5px; font-weight:700; color:var(--ink-muted); letter-spacing:.05em; margin-bottom:4px;}
+  .sysmsg.err{border-left-color:var(--rose); background:var(--rose-bg);}
+  .badge{display:inline-block; border-radius:6px; padding:1px 8px; font-size:11.5px; font-weight:600; white-space:nowrap;}
+  .b-amber{background:var(--amber-bg); color:var(--amber);}
+  .b-green{background:var(--green-bg); color:var(--green);}
+  .b-rose{background:var(--rose-bg); color:var(--rose);}
+  .b-gray{background:#F1F5F9; color:var(--ink-muted);}
+  /* 流程图 */
+  .flow{display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin:14px 0; font-size:13px;}
+  .fnode{border:1.5px solid var(--line); border-radius:10px; padding:6px 14px; font-weight:600; background:#fff; white-space:nowrap;}
+  .fnode.hold{border-color:var(--blue-line); background:var(--blue-bg); color:var(--blue);}
+  .fnode.rq{border-color:var(--amber-line); background:var(--amber-bg); color:var(--amber);}
+  .fnode.done{border-color:var(--rose-line); background:var(--rose-bg); color:var(--rose);}
+  .fnode.ok{border-color:var(--green-line); background:var(--green-bg); color:var(--green);}
+  .farrow{color:var(--ink-muted); font-weight:700;}
+  .flabel{font-size:11.5px; color:var(--ink-muted);}
+  .faq{border:1px solid var(--line); border-radius:10px; background:#fff; margin:10px 0; padding:12px 18px; break-inside:avoid;}
+  .faq .q{font-weight:700; color:var(--ink);}
+  .faq .q::before{content:"Q"; display:inline-flex; align-items:center; justify-content:center; width:20px; height:20px; border-radius:6px; background:var(--brand); color:#fff; font-size:12px; margin-right:8px;}
+  .faq .a{margin-top:6px; color:var(--ink-soft); font-size:14px;}
+  .faq .a::before{content:"A"; display:inline-flex; align-items:center; justify-content:center; width:20px; height:20px; border-radius:6px; background:var(--green-bg); color:var(--green); font-size:12px; font-weight:700; margin-right:8px;}
+  code{background:#EEF2FF; color:var(--brand-dark); border-radius:4px; padding:1px 6px; font-size:12.5px; font-family:ui-monospace,Menlo,monospace;}
+  strong{color:var(--ink);}
+  ul{margin:6px 0 6px 22px;} li{margin:3px 0;}
+  @media print{
+    body{background:#fff; font-size:12px;}
+    .page{max-width:100%; padding:0;}
+    .cover{border-radius:0; -webkit-print-color-adjust:exact; print-color-adjust:exact;}
+    *{-webkit-print-color-adjust:exact; print-color-adjust:exact;}
+    h2{break-after:avoid; page-break-after:avoid;}
+    .shot,.card,.faq,.sysmsg,table{break-inside:avoid; page-break-inside:avoid;}
+    @page{size:A4; margin:14mm 12mm;}
+  }
+</style>
+</head>
+<body>
+
+<div class="page">
+
+<div class="cover">
+  <span class="tag">运营控制台 · 操作指引</span>
+  <h1>开账号自助指引</h1>
+  <p>一人一号 · 实名 · 按岗位配可见范围 —— 2026-08-25</p>
+</div>
+
+<div class="toc">
+  <h2>本手册解决什么</h2>
+  <ol>
+    <li><a href="#s1">开内部账号（录单专员这类，看得到全部订单）</a><span class="sm">管理员操作</span></li>
+    <li><a href="#s2">开代理端账号（天福 / 天盈这类）</a><span class="sm">运营自己就能开</span></li>
+    <li><a href="#s3">停用离职账号 / 重置忘记的密码</a><span class="sm">管理员操作</span></li>
+    <li><a href="#s4">常见疑问</a></li>
+  </ol>
+  <div class="tip"><b>一句话结论：</b>这三件事后台都有现成入口，不用等开发排期。内部账号找管理员开，代理账号运营自己就能开。</div>
+  <div class="danger"><b>开号前先记住一条：账号按<u>人</u>开，不按<u>岗位</u>开。</b>没有「录单专员账号」这种东西——只有「王小美的账号，她的岗位是通用运营」。岗位是账号上的一个属性，随时可改；名字是谁就是谁，一人一个，不共用。</div>
+</div>
+
+<h2 id="s1"><span class="no">1</span>开内部账号</h2>
+<p class="sub">适用：录单、票务、签证、房控、财务等公司内部同事。<b>一位同事一个账号</b>。</p>
+
+<div class="warn"><b>谁能开：</b>只有<b>管理员</b>账号能开内部账号。目前公司里持有管理员权限的是总经理与副总两个账号。需要开号 / 停号 / 重置密码，找他们其中一位即可，不必联系技术。</div>
+
+<h3>入口在哪</h3>
+<p>左侧菜单最下方 <b>系统 → 账号管理</b>。这一栏只有管理员登录时才会显示，用运营号登录是看不到的——看不到不是坏了，是权限如此。</p>
+
+<div class="shot"><img src="shots-2026-08-25/01-账号管理入口.png"></div>
+<div class="caption">图 1 · 账号管理页：上半部分建号，下半部分是现有账号清单</div>
+
+<h3>怎么给一位新同事开号</h3>
+<p>下面以「新来的录单同事王小美」为例。注意这个号叫<b>王小美</b>，不叫「录单专员」——「录单专员」是她的岗位，不是她的账号名。</p>
+<ol class="steps">
+  <li><b>邮箱</b>——一人一个，建议用公司域名邮箱（如 wangxiaomei@citurtravel.com），这就是她登录用的账号名。</li>
+  <li><b>显示名</b>——填<b>本人真实姓名</b>，例如「王小美」。这个名字会直接出现在订单的「录单人」上，也是导出表里「录入人员」那一列的内容。填成「录单专员」的话，她录的每一单在导出表里都写着「录单专员」——等于什么都没记，将来对账查不到人。</li>
+  <li><b>角色</b>——选 <b>STAFF</b>（列表里显示为「运营」）。ADMIN 是管理员，能停别人的号、改佣金费率，除非确实要给管理权限，否则不要选。</li>
+  <li><b>岗位</b>——<b>保持「通用运营（全模板）」不要动</b>。这是关键一步：通用运营看得到全部订单、余位、全部导出模板；一旦选了「票务岗 / 签证岗 / 房控岗」，导出模板会按岗位裁剪，反而看不全。</li>
+  <li><b>初始密码</b>——点「随机生成」，或自己填一个 8 位以上的。</li>
+  <li>点 <b>创建账号</b>，把邮箱和这个初始密码<b>单独发给本人</b>，不要发在群里。</li>
+</ol>
+
+<div class="shot"><img src="shots-2026-08-25/02-新建账号-填好.png"></div>
+<div class="caption">图 2 · 正确填法：显示名 = 本人实名，角色 STAFF，岗位保持「通用运营（全模板）」</div>
+
+<div class="tip"><b>初始密码不用担心泄露：</b>本人第一次登录时，系统会强制他先改密码才能进系统。改完之后这个密码就作废了，只有他自己知道新密码——你不需要、也无法再看到。</div>
+
+<div class="warn"><b>岗位选错的后果：</b>「录单专员要能看所有单、包括余位」——对应的就是<b>岗位留空（通用运营）</b>。如果手滑选了票务岗，他导出名单时会发现少了列，回头又来报障。建完可以在下方清单里核对一眼那一行的岗位。</div>
+
+<h3>「录单专员要开个账号」该怎么翻译</h3>
+<p>业务上说的岗位名，落到系统里要拆成两件事——<b>谁</b>（账号）和<b>能看到什么</b>（岗位）：</p>
+<table>
+  <tr><th>业务上的说法</th><th>系统里怎么落</th></tr>
+  <tr><td>「开个录单专员，能看所有单含余位」</td><td>给<b>那位同事本人</b>开一个实名号，岗位留「通用运营」</td></tr>
+  <tr><td>「录单的有两个人」</td><td>开<b>两个</b>实名号，岗位都留「通用运营」</td></tr>
+  <tr><td>「他调去做票务了」</td><td>不用新建号，把他那行的「岗位」下拉改成票务岗</td></tr>
+  <tr><td>「录单专员离职了，新人接手」</td><td>停用离职那位的号，给新人开新号。<b>不要把老号改个名给新人用</b>——改名之后，老号历史上录的单会全部显示成新人的名字，账就串了</td></tr>
+</table>
+<div class="danger"><b>不要开岗位共用号。</b>系统里现存的「运营录单01 / 运营录单02」是上线初期的过渡账号，正在逐步停用，不要照着它们再开新的。共用号一旦出事——改错状态、删错单、金额录错——审计日志里只查得到那个共用号，查不到具体是谁操作的，责任无从落实。</div>
+
+<h2 id="s2"><span class="no">2</span>开代理端账号</h2>
+<p class="sub">适用：天福、天盈这类外部代理机构，要给他们一个能自己录单的登录号。</p>
+
+<div class="tip"><b>这个不用找管理员</b>——运营账号自己就能建。入口：左侧菜单 <b>客户 → 代理管理</b> → 右上角 <b>＋ 新建代理</b>。</div>
+
+<div class="shot"><img src="shots-2026-08-25/06-新建代理表单.png"></div>
+<div class="caption">图 3 · 新建代理表单：登录邮箱与初始密码就在表单里，建完即是一个可登录的代理账号</div>
+
+<ol class="steps">
+  <li><b>上级代理</b>——通常不选，就是建一个 1 级代理。只有在建某家代理的下级时才需要选。</li>
+  <li><b>登录邮箱 + 初始密码</b>——这两项就是代理登录用的账号密码，建完直接给对方。</li>
+  <li><b>显示昵称 / 公司名 / 联系人 / 联系电话</b>——按实际填，昵称会显示在订单的归属代理上。</li>
+  <li>点 <b>创建代理</b>。</li>
+</ol>
+
+<div class="shot"><img src="shots-2026-08-25/07-新建代理-填好.png"></div>
+<div class="caption">图 4 · 填好的样子（示例数据）</div>
+
+<h3>「只能看自己的单」不用额外配置</h3>
+<p>代理账号<b>天生就只看得到自己家的单</b>——别家代理的订单在他的列表里根本不会出现，这是系统底层隔离的，不是靠勾选项控制的，也没法被误操作打开。所以「只能看自己的单子，其余代理单不可看」这条要求，建完号就已经满足了。</p>
+
+<div class="tip"><b>代理号是「机构号」，不套用一人一号。</b>代理账号代表的是天福、天盈这一<b>家</b>公司，不是某个人，所以显示昵称填公司名或「天福-录单」这类都可以。订单上记的归属代理也是公司，不是个人。</div>
+<div class="danger"><b>一个代理机构 = 一个登录账号。</b>目前系统里一家代理只能有一个登录号。如果需求是「天福已经有账号了，还要再给他们家员工单开一个只录单的子账号」，这个现在做不到，属于新功能，需要单独提出来排期。请先确认是哪一种情况。</div>
+
+<h2 id="s3"><span class="no">3</span>停用账号 / 重置密码</h2>
+<p class="sub">同事离职、或者密码忘了，都在「账号管理」页那张清单上直接操作（管理员权限）。</p>
+
+<table>
+  <tr><th>场景</th><th>操作</th><th>结果</th></tr>
+  <tr><td>同事离职</td><td>该行点 <b>停用</b></td><td>立即无法登录；已登录的会话也会当场失效。历史订单上他的名字保留，账不会乱</td></tr>
+  <tr><td>忘记密码</td><td>该行点 <b>重置密码</b>，设一个临时密码给他</td><td>他用临时密码登录后，系统强制他改成自己的新密码</td></tr>
+  <tr><td>调岗</td><td>该行「岗位」下拉直接改</td><td>即时生效，不用重新建号</td></tr>
+</table>
+
+<div class="warn"><b>不要为了省事共用账号。</b>共用号一旦出问题（改错状态、删错单），审计日志里只能查到那个共用号，查不到具体是谁。这也是我们把原来几个共享号封存、改成一人一号的原因。</div>
+
+<h2 id="s4"><span class="no">4</span>常见疑问</h2>
+
+<div class="faq"><b>Q：我用自己的运营号登录，左边没有「账号管理」这一栏。</b><br>A：正常。这一栏只对管理员显示。开号找总经理或副总。</div>
+
+<div class="faq"><b>Q：新建账号那里「角色」为什么是英文 STAFF / ADMIN？</b><br>A：这是显示上的历史遗留，STAFF = 运营，ADMIN = 管理员，列表里显示的就是中文。选 STAFF 即可。</div>
+
+<div class="faq"><b>Q：录单专员要能看到余位，需要单独开权限吗？</b><br>A：不需要。岗位保持「通用运营」，余位、订单、导出模板全都看得到。</div>
+
+<div class="faq"><b>Q：代理账号能不能限制成「只能录单，别的都不能点」？</b><br>A：目前不能。代理端除了录单，还能看自己的订单、查预付余额、提充值申请——这些是代理端本来的功能，没有细到单项的开关。如果确实需要「纯录单」的受限账号，请单独提需求。</div>
+
+<div class="faq"><b>Q：能不能就开一个「录单专员」账号，几个录单的同事一起用？</b><br>A：不要。订单上的「录单人」和导出表的「录入人员」记的就是账号显示名，共用号会让这两处全部变成同一个名字，出错时查不到人。开号是免费的，有几个人开几个号。</div>
+
+<div class="faq"><b>Q：同事离职，他的号能不能改个名字给新人接着用？</b><br>A：不能。显示名一改，他历史上录过的所有订单，「录单人」都会跟着变成新人的名字，历史记录就被篡改了。正确做法：停用旧号 + 给新人开新号。</div>
+
+<div class="faq"><b>Q：初始密码设简单点行不行？</b><br>A：至少 8 位。反正对方首次登录必须改密，简单的初始密码活不过一次登录，不必纠结。</div>
+
+<hr style="border:none;border-top:1px solid var(--line);margin:40px 0 14px">
+<p class="sub">截图取自测试环境（数据为演示数据），与实测环境界面一致。</p>
+
+</div>
+
+</body>
+</html>
