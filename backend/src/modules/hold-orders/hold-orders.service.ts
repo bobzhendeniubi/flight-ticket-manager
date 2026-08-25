@@ -775,8 +775,11 @@ export class HoldOrderService {
       if (!allowed.includes(existing.status)) throw new ConflictError(`占位单当前状态不可操作（${HOLD_STATUS_LABEL[existing.status]}）`);
       const now = new Date();
       await tx.holdOrder.update({ where: { id }, data: { status: nextStatus, [timestampField]: now } });
-      if (nextStatus === HoldOrderStatus.CANCELLED) {
-        for (const installment of existing.installments) await closeOpenHoldDueReminders(tx, installment.id, '占位单已取消');
+      // 释放与取消一样让座位回池，未结的期款提醒必须一起关掉；
+      // 否则占位单已经不占座了，催款提醒还挂在提醒中心永远关不掉。
+      if (nextStatus === HoldOrderStatus.CANCELLED || nextStatus === HoldOrderStatus.RELEASED) {
+        const note = nextStatus === HoldOrderStatus.CANCELLED ? '占位单已取消' : '占位单已释放';
+        for (const installment of existing.installments) await closeOpenHoldDueReminders(tx, installment.id, note);
       }
       return { id, status: nextStatus, hold: existing };
     });
