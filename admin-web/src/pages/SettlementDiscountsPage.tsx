@@ -63,7 +63,10 @@ export function SettlementDiscountsPage() {
   const tokens = useAuth((s) => s.tokens);
   const user = useAuth((s) => s.user);
   const token = tokens?.accessToken ?? '';
-  const isAdmin = user?.role === 'ADMIN';
+  // 立减规则写权限：ADMIN 与内部岗位（STAFF）都可维护 —— 录单岗要按代理口径自己配立减，
+  // 每次都绕到管理员那边会让规则永远配不齐。AGENT 进不来本页（路由级 adminOnly 已拦），
+  // 故此处只区分内外部；写操作后端仍逐条落审计（UPSERT/DELETE_SETTLEMENT_DISCOUNT）。
+  const canEdit = user?.role === 'ADMIN' || user?.role === 'STAFF';
   const [searchParams] = useSearchParams();
 
   const [kind, setKind] = useState<SettlementDiscountKind>('AGENT');
@@ -128,13 +131,13 @@ export function SettlementDiscountsPage() {
   }
 
   function addRule(): void {
-    if (!isAdmin || (kind === 'AGENT' && !selectedAgentId)) return;
+    if (!canEdit || (kind === 'AGENT' && !selectedAgentId)) return;
     setRules((current) => [...current, blankRule(kind, selectedAgentId || null)]);
     setNotice(null);
   }
 
   async function save(): Promise<void> {
-    if (!token || !isAdmin || rules.length === 0) return;
+    if (!token || !canEdit || rules.length === 0) return;
     setSaving(true);
     setError(null);
     setNotice(null);
@@ -163,7 +166,7 @@ export function SettlementDiscountsPage() {
   }
 
   async function removeRule(index: number): Promise<void> {
-    if (!token || !isAdmin) return;
+    if (!token || !canEdit) return;
     const rule = rules[index];
     if (!rule) return;
     if (!rule.id) {
@@ -217,7 +220,7 @@ export function SettlementDiscountsPage() {
                 className="input mt-1"
                 value={selectedAgentId}
                 onChange={(e) => setSelectedAgentId(e.target.value)}
-                disabled={!isAdmin && agents.length === 0}
+                disabled={!canEdit && agents.length === 0}
               >
                 <option value="">请选择代理…</option>
                 {agents.map((agent) => (
@@ -232,7 +235,7 @@ export function SettlementDiscountsPage() {
 
         <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-ink-muted">
           <span>{activeTab.hint}{selectedAgent ? ` 当前代理：${agentLabel(selectedAgent)}` : ''}</span>
-          {!isAdmin && <span className="rounded bg-slate-100 px-2 py-1 text-slate-600">当前为只读模式</span>}
+          {!canEdit && <span className="rounded bg-slate-100 px-2 py-1 text-slate-600">当前为只读模式</span>}
         </div>
 
         {error && <div className="rounded-md bg-rose-50 px-3 py-2 text-sm text-rose-700 ring-1 ring-rose-200">{error}</div>}
@@ -256,7 +259,7 @@ export function SettlementDiscountsPage() {
                     <th className="px-3 py-2 text-right font-medium">立减 ¥/人</th>
                     <th className="px-3 py-2 text-center font-medium">启用</th>
                     <th className="px-3 py-2 font-medium">备注</th>
-                    {isAdmin && <th className="px-3 py-2 text-right font-medium">操作</th>}
+                    {canEdit && <th className="px-3 py-2 text-right font-medium">操作</th>}
                   </tr>
                 </thead>
                 <tbody>
@@ -267,7 +270,7 @@ export function SettlementDiscountsPage() {
                           className="input min-w-[120px]"
                           value={rule.tier}
                           onChange={(e) => updateRule(index, { tier: e.target.value as SettlementTier })}
-                          disabled={!isAdmin}
+                          disabled={!canEdit}
                         >
                           {TIERS.map((tier) => <option key={tier} value={tier}>{TIER_LABELS[tier]}</option>)}
                         </select>
@@ -277,7 +280,7 @@ export function SettlementDiscountsPage() {
                           className="input w-20"
                           value={rule.nights}
                           onChange={(e) => updateRule(index, { nights: Number(e.target.value) })}
-                          disabled={!isAdmin}
+                          disabled={!canEdit}
                         >
                           {NIGHTS.map((nights) => <option key={nights} value={nights}>{nights}晚</option>)}
                         </select>
@@ -289,7 +292,7 @@ export function SettlementDiscountsPage() {
                             className="input w-[145px]"
                             value={rule.startDate}
                             onChange={(e) => updateRule(index, { startDate: e.target.value })}
-                            disabled={!isAdmin}
+                            disabled={!canEdit}
                           />
                           <span className="text-ink-muted">至</span>
                           <input
@@ -297,7 +300,7 @@ export function SettlementDiscountsPage() {
                             className="input w-[145px]"
                             value={rule.endDate}
                             onChange={(e) => updateRule(index, { endDate: e.target.value })}
-                            disabled={!isAdmin}
+                            disabled={!canEdit}
                           />
                         </div>
                       </td>
@@ -309,7 +312,7 @@ export function SettlementDiscountsPage() {
                           className="input w-28 text-right tabular-nums"
                           value={rule.discountPerPersonCny || ''}
                           onChange={(e) => updateRule(index, { discountPerPersonCny: Number(e.target.value) })}
-                          disabled={!isAdmin}
+                          disabled={!canEdit}
                         />
                       </td>
                       <td className="px-3 py-2 text-center">
@@ -318,7 +321,7 @@ export function SettlementDiscountsPage() {
                           className="h-4 w-4 accent-indigo-600"
                           checked={rule.isActive}
                           onChange={(e) => updateRule(index, { isActive: e.target.checked })}
-                          disabled={!isAdmin}
+                          disabled={!canEdit}
                         />
                       </td>
                       <td className="px-3 py-2">
@@ -327,11 +330,11 @@ export function SettlementDiscountsPage() {
                           maxLength={200}
                           value={rule.note ?? ''}
                           onChange={(e) => updateRule(index, { note: e.target.value })}
-                          disabled={!isAdmin}
+                          disabled={!canEdit}
                           placeholder="选填"
                         />
                       </td>
-                      {isAdmin && (
+                      {canEdit && (
                         <td className="px-3 py-2 text-right">
                           <button type="button" className="text-xs font-medium text-rose-600 hover:text-rose-800" onClick={() => void removeRule(index)}>
                             删除
@@ -342,14 +345,14 @@ export function SettlementDiscountsPage() {
                   ))}
                   {rules.length === 0 && (
                     <tr>
-                      <td colSpan={isAdmin ? 7 : 6} className="px-4 py-10 text-center text-sm text-ink-muted">暂无规则</td>
+                      <td colSpan={canEdit ? 7 : 6} className="px-4 py-10 text-center text-sm text-ink-muted">暂无规则</td>
                     </tr>
                   )}
                 </tbody>
               </table>
             </div>
 
-            {isAdmin && (
+            {canEdit && (
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <button type="button" className="btn-secondary text-sm" onClick={addRule} disabled={kind === 'AGENT' && !selectedAgentId}>
                   + 新增规则
