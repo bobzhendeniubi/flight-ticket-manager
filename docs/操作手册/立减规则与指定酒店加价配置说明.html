@@ -1,0 +1,384 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>立减规则 与 指定酒店加价 配置说明 — 世途旅行·运营控制台</title>
+<style>
+  :root{
+    --indigo:#4F46E5; --indigo-dark:#4338CA; --indigo-50:#EEF2FF;
+    --ink:#0F172A; --ink-soft:#334155; --muted:#64748B;
+    --bg:#F1F5F9; --card:#FFFFFF; --line:#E2E8F0;
+    --amber:#D97706; --amber-bg:#FFFBEB; --amber-line:#FDE68A;
+    --green:#059669; --green-bg:#ECFDF5;
+    --red:#DC2626; --red-bg:#FEF2F2;
+    --blue:#2563EB; --blue-bg:#EFF6FF;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:'Inter','PingFang SC','Hiragino Sans GB','Microsoft YaHei',system-ui,-apple-system,sans-serif;color:var(--ink-soft);background:var(--bg);line-height:1.75;font-size:15px}
+  .page{max-width:900px;margin:0 auto;background:var(--card);padding:40px 44px 72px;box-shadow:0 0 24px rgba(15,23,42,.06)}
+  h1,h2,h3,h4{color:var(--ink);line-height:1.35}
+  h1{font-size:26px;margin:0 0 6px}
+  h2{font-size:20px;margin:44px 0 12px;padding:10px 14px;background:var(--indigo-50);border-left:5px solid var(--indigo);border-radius:0 8px 8px 0}
+  h3{font-size:16.5px;margin:26px 0 8px;color:var(--indigo-dark)}
+  h4{font-size:14.5px;margin:18px 0 6px}
+  p{margin:8px 0}
+  .sub{color:var(--muted);font-size:13.5px;margin:0 0 4px}
+  .cover{border-bottom:3px solid var(--indigo);padding-bottom:18px;margin-bottom:22px}
+  .cover .brand{display:inline-block;background:var(--indigo);color:#fff;font-weight:700;font-size:13px;padding:3px 12px;border-radius:999px;letter-spacing:.5px;margin-bottom:12px}
+  /* 目录 */
+  .toc{background:#F8FAFC;border:1px solid var(--line);border-radius:12px;padding:16px 22px;margin:18px 0 8px}
+  .toc ol{margin:6px 0;padding-left:22px}
+  .toc li{margin:3px 0}
+  .toc a{color:var(--indigo-dark);text-decoration:none}
+  .toc a:hover{text-decoration:underline}
+  /* 步骤列表 */
+  ol.steps{counter-reset:st;list-style:none;padding-left:0;margin:10px 0}
+  ol.steps>li{counter-increment:st;position:relative;padding:4px 0 4px 40px;margin:6px 0}
+  ol.steps>li::before{content:counter(st);position:absolute;left:0;top:7px;width:26px;height:26px;border-radius:50%;background:var(--indigo);color:#fff;font-weight:700;font-size:13.5px;line-height:26px;text-align:center}
+  /* 提示框 */
+  .tip,.warn,.info{border-radius:10px;padding:10px 14px 10px 42px;margin:12px 0;position:relative;font-size:14px}
+  .tip::before,.warn::before,.info::before{position:absolute;left:13px;top:9px;font-size:16px}
+  .tip{background:var(--green-bg);border:1px solid #A7F3D0}.tip::before{content:"💡"}
+  .warn{background:var(--amber-bg);border:1px solid var(--amber-line)}.warn::before{content:"⚠️"}
+  .info{background:var(--blue-bg);border:1px solid #BFDBFE}.info::before{content:"ℹ️"}
+  /* 表格 */
+  table.doc{width:100%;border-collapse:collapse;margin:12px 0;font-size:13.5px}
+  table.doc th{background:var(--indigo-50);color:var(--indigo-dark);text-align:left;padding:8px 10px;border:1px solid var(--line);white-space:nowrap}
+  table.doc td{padding:8px 10px;border:1px solid var(--line);vertical-align:top}
+  table.doc tr:nth-child(even) td{background:#FAFBFF}
+  /* ── 界面示意图（模拟 Console 风格）── */
+  .mock{border:1px solid #CBD5E1;border-radius:12px;overflow:hidden;margin:16px 0;background:#F8FAFC;box-shadow:0 2px 6px rgba(15,23,42,.08);font-size:12.5px;color:#334155}
+  .mock-bar{display:flex;align-items:center;gap:6px;background:#E2E8F0;padding:7px 12px;font-size:11.5px;color:#64748B}
+  .dot{width:9px;height:9px;border-radius:50%;display:inline-block}
+  .mock-body{padding:14px 16px}
+  .mtitle{font-size:15px;font-weight:700;color:#0F172A;margin-bottom:2px}
+  .msub{font-size:11.5px;color:#94A3B8;margin-bottom:10px}
+  .mrow{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:8px 0}
+  .mbtn{display:inline-block;border:1px solid #CBD5E1;background:#fff;border-radius:8px;padding:4px 11px;font-size:12px;color:#334155;white-space:nowrap}
+  .mbtn.primary{background:var(--indigo);border-color:var(--indigo);color:#fff;font-weight:600}
+  .mbtn.ghost{border-style:dashed;color:#64748B}
+  .msel{display:inline-block;border:1px solid #CBD5E1;background:#fff;border-radius:8px;padding:4px 9px;font-size:12px;color:#64748B;white-space:nowrap}
+  .msel::after{content:" ▾";font-size:10px}
+  .minput{display:inline-block;border:1px solid #CBD5E1;background:#fff;border-radius:8px;padding:4px 9px;font-size:12px;color:#94A3B8;white-space:nowrap}
+  .mlabel{font-size:11px;color:#94A3B8;display:block;margin-bottom:2px}
+  .fgroup{display:inline-block;vertical-align:top;margin:3px 6px 3px 0}
+  .badge{display:inline-block;border-radius:999px;padding:1px 9px;font-size:11px;font-weight:600}
+  .b-amber{background:#FEF3C7;color:#B45309}.b-green{background:#D1FAE5;color:#047857}.b-blue{background:#DBEAFE;color:#1D4ED8}.b-red{background:#FEE2E2;color:#B91C1C}.b-gray{background:#E2E8F0;color:#475569}.b-indigo{background:var(--indigo-50);color:var(--indigo-dark)}
+  table.mtab{width:100%;border-collapse:collapse;font-size:11.5px;background:#fff;border-radius:8px;overflow:hidden}
+  table.mtab th{background:#F1F5F9;color:#64748B;font-weight:600;text-align:left;padding:5px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+  table.mtab td{padding:5px 8px;border-bottom:1px solid #F1F5F9;white-space:nowrap}
+  /* 高亮标注 */
+  .hl{position:relative;outline:2.5px solid var(--red);outline-offset:2px;border-radius:8px}
+  .hl.a{outline-color:var(--amber)}
+  .tag{position:absolute;top:-12px;left:-12px;width:21px;height:21px;border-radius:50%;background:var(--red);color:#fff;font-size:12.5px;line-height:21px;text-align:center;font-weight:700;z-index:2;box-shadow:0 1px 3px rgba(0,0,0,.3)}
+  .hl.a>.tag{background:var(--amber)}
+  .legend{background:#FFF;border:1px dashed #CBD5E1;border-radius:10px;padding:8px 14px;margin:8px 0 16px;font-size:13.5px}
+  .legend b.n{display:inline-block;width:19px;height:19px;border-radius:50%;background:var(--red);color:#fff;font-size:11.5px;line-height:19px;text-align:center;margin-right:6px}
+  .legend .row{margin:4px 0}
+  /* 状态流 */
+  .flow{display:flex;flex-wrap:wrap;align-items:center;gap:4px;margin:10px 0;font-size:13px}
+  .pill{display:inline-block;border-radius:999px;padding:3px 13px;font-weight:600;font-size:12.5px;border:1.5px solid var(--line);background:#fff;color:var(--ink-soft)}
+  .pill.main{border-color:var(--indigo);background:var(--indigo-50);color:var(--indigo-dark)}
+  .pill.bad{border-color:#FCA5A5;background:var(--red-bg);color:#B91C1C}
+  .fa{color:#94A3B8;font-weight:700;padding:0 2px}
+  .kbd{display:inline-block;border:1px solid #CBD5E1;border-bottom-width:2px;border-radius:6px;background:#F8FAFC;padding:0 7px;font-size:12.5px;color:var(--ink);font-weight:600;white-space:nowrap}
+  .btnref{display:inline-block;background:var(--indigo);color:#fff;border-radius:7px;padding:0 8px;font-size:12.5px;font-weight:600;white-space:nowrap}
+  .btnref.sec{background:#fff;color:var(--ink-soft);border:1px solid #CBD5E1}
+  /* 抽屉示意 */
+  .drawer{border:1px solid #CBD5E1;border-radius:12px;background:#fff;max-width:430px;margin:14px auto;box-shadow:0 6px 18px rgba(15,23,42,.14);font-size:12px;overflow:hidden}
+  .drawer .dh{background:#F8FAFC;border-bottom:1px solid var(--line);padding:9px 14px;font-weight:700;color:#0F172A;font-size:13px}
+  .drawer .sec{padding:9px 14px;border-bottom:1px solid #F1F5F9}
+  .drawer .sec .st{font-size:10.5px;font-weight:700;color:#94A3B8;letter-spacing:1px;margin-bottom:5px}
+  .marea{display:block;border:1px solid #CBD5E1;border-radius:8px;background:#fff;padding:4px 9px;font-size:11.5px;color:#94A3B8;margin:3px 0}
+  .marea.amber{border-color:var(--amber-line);background:var(--amber-bg)}
+  /* 看板 */
+  .board{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:8px 0}
+  .bcol{background:#F1F5F9;border-radius:10px;padding:8px}
+  .bcol h5{margin:0 0 7px;font-size:12px;color:#0F172A;display:flex;justify-content:space-between}
+  .bcard{background:#fff;border:1px solid var(--line);border-radius:9px;padding:7px 9px;margin-bottom:7px;font-size:11px}
+  .bcard.red{border-color:#FCA5A5}.bcard.amberb{border-color:#FCD34D}
+  .statrow{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:8px 0}
+  .stat{background:#fff;border:1px solid var(--line);border-radius:10px;padding:8px 12px}
+  .stat .sl{font-size:10.5px;color:#94A3B8}.stat .sv{font-size:18px;font-weight:700;color:#0F172A}.stat .sv.red{color:#B91C1C}
+  .faq dt{font-weight:700;color:var(--ink);margin:16px 0 4px}
+  .faq dt::before{content:"Q：";color:var(--indigo)}
+  .faq dd{margin:0 0 4px;padding-left:26px;position:relative}
+  .faq dd::before{content:"答：";position:absolute;left:0;color:var(--muted)}
+  .footer{margin-top:48px;border-top:1px solid var(--line);padding-top:14px;font-size:12.5px;color:var(--muted)}
+  /* 打印 */
+  @media print{
+    body{background:#fff}
+    .page{box-shadow:none;padding:0 8mm;max-width:none}
+    h2{break-after:avoid}
+    .mock,.drawer,table.doc,.tip,.warn,.info,.legend,.board{break-inside:avoid}
+    a{color:inherit;text-decoration:none}
+    @page{size:A4;margin:14mm 12mm}
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+<div class="cover">
+  <span class="brand">世途旅行 · 运营控制台</span>
+  <h1>立减规则 与 指定酒店加价 — 配置说明（图文版）</h1>
+  <p class="sub">适用岗位：运营录单、结算价维护 · 零基础可读</p>
+  <p class="sub">配套页面：产品 · 立减规则　|　产品 · 酒店　|　订单管理 · 录单</p>
+</div>
+
+<div class="info">
+  <b>先说结论：这两件事系统早就能做了，只是规则库和字段还是空的。</b><br>
+  「选代理自动按立减出结算价」和「指定酒店联动结算价加钱」——功能都在，配上就生效，<b>不用等开发改系统</b>。
+  这份说明就是教你把它们配起来，以及配完怎么验证确实生效了。
+</div>
+
+<div class="toc">
+  <b>目录</b>
+  <ol>
+    <li><a href="#s1">一、代理立减规则怎么配</a></li>
+    <li><a href="#s2">二、配完怎么验证真的生效了</a></li>
+    <li><a href="#s3">三、指定酒店加价怎么配</a></li>
+    <li><a href="#s4">四、国际五星档次需要你们确认</a></li>
+    <li><a href="#s5">五、「后返」在系统里叫什么</a></li>
+    <li><a href="#s6">六、常见问题 FAQ</a></li>
+  </ol>
+</div>
+
+<h2 id="s1">一、代理立减规则怎么配</h2>
+
+<p>「结算价日历上的价是对外价，对每家代理还要再减 180～210」——这件事在系统里叫 <b>立减规则</b>。
+配好之后，<b>录单时选中该代理，系统自动在结算价上把这个数减掉</b>，不用手算、也不用下单后再去改价。</p>
+
+<h3>1. 进哪个页面</h3>
+<p>左边菜单 <span class="btnref sec">产品</span> → <span class="btnref sec">立减规则</span>。</p>
+
+<div class="mock">
+  <div class="mock-bar"><span class="dot" style="background:#F87171"></span><span class="dot" style="background:#FBBF24"></span><span class="dot" style="background:#34D399"></span>&nbsp;运营控制台 — 立减规则</div>
+  <div class="mock-body">
+    <div class="mtitle">立减规则</div>
+    <div class="msub">按档次、晚数与出发日窗口维护结算价立减；同组启用窗口不可重叠。</div>
+    <div class="mrow" style="margin-top:10px">
+      <span class="hl"><span class="tag">1</span><span class="mbtn primary">代理专属</span></span>
+      <span class="mbtn">代理默认</span>
+      <span class="mbtn">散客</span>
+      <span style="flex:1"></span>
+      <span class="fgroup"><span class="mlabel">指定代理</span><span class="hl"><span class="tag">2</span><span class="msel">世途3</span></span></span>
+    </div>
+    <table class="doc" style="margin-top:14px">
+      <tr><th>档次</th><th>晚数</th><th>出发日窗口</th><th style="text-align:right">立减 ¥/人</th><th style="text-align:center">启用</th><th>备注</th></tr>
+      <tr><td>市区四星</td><td>2 晚</td><td>2026-01-01 ~ 2029-12-31</td><td style="text-align:right"><b>190</b></td><td style="text-align:center">✓</td><td>常规立减</td></tr>
+      <tr><td>市区五星</td><td>2 晚</td><td>2026-01-01 ~ 2029-12-31</td><td style="text-align:right"><b>190</b></td><td style="text-align:center">✓</td><td>常规立减</td></tr>
+    </table>
+    <div class="mrow"><span class="mbtn ghost">＋ 新增规则</span><span style="flex:1"></span><span class="hl"><span class="tag">3</span><span class="mbtn primary">批量保存</span></span></div>
+  </div>
+</div>
+
+<div class="legend">
+  <div class="row"><b class="n">1</b>三个页签，先选对（下面详解）</div>
+  <div class="row"><b class="n">2</b>选了「代理专属」页签，必须先在这里挑出是哪一家代理，下面的表格才是那家的规则</div>
+  <div class="row"><b class="n">3</b><b>改完一定要点「批量保存」</b>，光改格子不保存等于没改</div>
+</div>
+
+<h3>2. 三个页签分别什么意思</h3>
+<table class="doc">
+  <tr><th style="width:110px">页签</th><th>什么时候用</th></tr>
+  <tr><td><b>代理专属</b></td><td>这一家代理有自己的数。<b>优先级最高</b>，配了就以它为准。<br>例：世途1 / 世途2 减 180，世途3 / 世途9 减 190，TY 减 210 —— 各家不一样，就各配各的。</td></tr>
+  <tr><td><b>代理默认</b></td><td><b>兜底</b>：没配「代理专属」的代理走这一档。不绑定具体代理，配一遍全体通用。</td></tr>
+  <tr><td><b>散客</b></td><td>前台散客用的，和代理无关。<b>这次不用动它。</b></td></tr>
+</table>
+
+<div class="tip">
+  <b>省事顺序：先兜底、再补特殊。</b><br>
+  如果大部分代理是同一个数（比如都 190），先在「<b>代理默认</b>」把 190 铺一遍；
+  然后只给数字不一样的几家（180 的、210 的）在「<b>代理专属</b>」单独配。
+  这样要填的条数少一大半，而且以后新签的代理自动就有兜底值，不会漏配。
+</div>
+
+<h3>3. 一条规则要填的六个格子</h3>
+<table class="doc">
+  <tr><th style="width:120px">格子</th><th>怎么填</th></tr>
+  <tr><td><b>档次</b></td><td>市区三星 / 市区四星 / 市区五星 / 国际五星，四选一。<b>要和套餐的结算档次对上</b>，对不上这条不会命中。</td></tr>
+  <tr><td><b>晚数</b></td><td>1～5 晚。同样要和套餐的结算晚数对上。</td></tr>
+  <tr><td><b>出发日窗口</b></td><td>按<b>客人出发日</b>判定（不是下单日）。<br>长期政策不想天天维护，<b>窗口就开长一点</b>（比如 2026-01-01 ~ 2029-12-31），一次配完省心。</td></tr>
+  <tr><td><b>立减 ¥/人</b></td><td>每人减多少钱。填 <b>190</b> 就是每人减 190。</td></tr>
+  <tr><td><b>启用</b></td><td>打勾才生效。政策暂停时把勾去掉即可，不必删规则。</td></tr>
+  <tr><td><b>备注</b></td><td>选填。建议写清这条是什么政策，以后自己或同事看得懂。</td></tr>
+</table>
+
+<div class="warn">
+  <b>一家代理要配几条？＝ 你们实际在卖的「档次 × 晚数」组合数。</b><br>
+  规则按「档次 + 晚数」精确匹配，所以<b>卖几种组合就配几条</b>。
+  比如只卖「四星2晚」和「五星2晚」，那一家代理配 2 条就够，不用把 4 档次 × 5 晚数全填满。<br>
+  没配到的组合不会命中立减，录单试算里就看不到立减行——<b>这也是自查漏配的办法</b>（见下一章）。
+</div>
+
+<div class="warn">
+  <b>同一组（同档次 + 同晚数）的启用窗口不能重叠。</b><br>
+  比如「市区四星 · 2晚」已经有一条 2026-01-01 ~ 2029-12-31，就不能再加一条 2026-06-01 ~ 2026-08-31。
+  要做旺季特殊价，得把原来那条的窗口<b>先切开</b>（改成 05-31 结束，再新建 09-01 开始的），中间那段单独配。
+</div>
+
+<h2 id="s2">二、配完怎么验证真的生效了</h2>
+
+<p><b>别靠猜，录一单试试就知道。</b>不用真提交，走到试算那一步就能看到。</p>
+
+<ol class="steps">
+  <li>订单管理 → <span class="btnref">＋ 录单</span> → 产品类型选 <b>套餐</b>。</li>
+  <li>选一个<b>已经配了结算档次的套餐</b>，填好出发日期和人数。</li>
+  <li><b>归属代理</b>选中你刚配了立减的那家。</li>
+  <li>看下方的<b>系统价试算</b>。</li>
+</ol>
+
+<div class="mock">
+  <div class="mock-bar"><span class="dot" style="background:#F87171"></span><span class="dot" style="background:#FBBF24"></span><span class="dot" style="background:#34D399"></span>&nbsp;弹窗 — 单笔录单 · 系统价试算</div>
+  <div class="mock-body">
+    <div class="marea">套餐（结算价日历）　市区四星 · 2晚 · 出发 2026-10-01　¥2,860/人 × 2 人　＝ ¥5,720</div>
+    <div class="marea amber"><b>同业立减 ¥190/人 × 2 人　＝ −¥380</b>　← 配对了就会出现这一行</div>
+    <div class="mrow" style="justify-content:flex-end"><b style="font-size:14px;color:#0F172A">合计 ¥5,340</b></div>
+  </div>
+</div>
+
+<div class="tip">
+  <b>看到「同业立减」这一行 = 配对了。</b>金额和人数也一起核一眼。
+</div>
+
+<div class="warn">
+  <b>没出现这一行？按这个顺序自查：</b>
+  <ol style="margin:6px 0 0">
+    <li>代理选对了吗？（选成「直客」不会命中代理立减）</li>
+    <li>这个套餐配了<b>结算档次和晚数</b>吗？没配的套餐不走结算价日历，也就没有立减。去 产品 → 套餐 里检查。</li>
+    <li>规则的<b>档次 / 晚数</b>和套餐的对得上吗？差一档就不命中。</li>
+    <li>客人的<b>出发日</b>落在规则的窗口里吗？</li>
+    <li>规则的<b>「启用」打勾</b>了吗？改完<b>点「批量保存」</b>了吗？</li>
+  </ol>
+</div>
+
+<h2 id="s3">三、指定酒店加价怎么配</h2>
+
+<p>「除随机酒店之外的酒店都是加钱指定酒店，需要联动结算价 +40」——这件事系统也已经能做，
+叫 <b>指定酒店加价</b>。配好后：录单时在套餐里指定某家酒店，系统<b>自动按占座人数加收</b>，
+而且<b>这笔加价会自动叠进结算价</b>，不用你另外再加。</p>
+
+<h3>1. 在哪儿配</h3>
+<p>左边菜单 <span class="btnref sec">产品</span> → <span class="btnref sec">酒店</span> → 找到那家酒店 → <b>编辑</b> → 找到这一格：</p>
+
+<div class="mock">
+  <div class="mock-bar"><span class="dot" style="background:#F87171"></span><span class="dot" style="background:#FBBF24"></span><span class="dot" style="background:#34D399"></span>&nbsp;弹窗 — 编辑酒店</div>
+  <div class="mock-body">
+    <div class="mrow" style="padding-top:10px;gap:28px">
+      <span class="fgroup"><span class="mlabel">每晚起价（前台展示价）</span><span class="minput">680</span></span>
+      <span class="fgroup"><span class="mlabel">指定酒店加价（¥/人，0 = 不加价）</span><span class="hl"><span class="tag">1</span><span class="minput" style="color:#0F172A;font-weight:700">40</span></span></span>
+    </div>
+  </div>
+</div>
+
+<div class="legend">
+  <div class="row"><b class="n">1</b>就是这一格。填 <b>40</b> = 客人点名要住这家，每人加收 40。</div>
+</div>
+
+<div class="warn">
+  <b>这个数是「一店一配」，不是全局统一。</b><br>
+  系统按<b>每家酒店各自</b>配加价——因为各家和我们的差价本来就不一样，豪华店通常远不止 40。<br>
+  <b>所以要逐家去填。</b>如果确认目前所有非随机酒店都是统一加 40，那就每家都填 40；
+  哪天某家谈成了别的价，单独改那一家，不影响别家。<br>
+  <b>没填 = 按 ¥0 处理，指定了也不会加钱。</b>
+</div>
+
+<h3>2. 配完长什么样</h3>
+<p>回到录单（套餐），酒店下拉里会直接把加价标出来，选中后下面还会算给你看：</p>
+
+<div class="mock">
+  <div class="mock-bar"><span class="dot" style="background:#F87171"></span><span class="dot" style="background:#FBBF24"></span><span class="dot" style="background:#34D399"></span>&nbsp;弹窗 — 单笔录单 · 套餐 · 酒店</div>
+  <div class="mock-body">
+    <div class="mrow">
+      <span class="fgroup"><span class="mlabel">酒店（不选 = 随机）</span><span class="msel">海富酒店（★★★★★ · 指定+¥40/人）</span></span>
+      <span class="fgroup"><span class="mlabel">房型</span><span class="msel">标准房</span></span>
+    </div>
+    <div class="marea amber">指定酒店加价 ¥40/人 × 2 人（占座人数）＝ ¥80，已计入下方系统价试算。</div>
+  </div>
+</div>
+
+<div class="tip">
+  <b>如果这里显示的是「该酒店未配置『指定酒店加价』（按 ¥0 计）」</b>，
+  就说明那家酒店的那一格还是空的——回上一步去 产品 → 酒店 里填上。系统会主动提示，不用担心配漏了不知道。
+</div>
+
+<div class="info">
+  <b>「不选 = 随机」是什么意思？</b><br>
+  套餐本身是<b>按星级随机报价</b>的。酒店那一栏<b>留空</b>，就是走随机档、按套餐原价走、不加钱。
+  只有<b>点名要住某一家</b>时才去选具体酒店，这时才加钱。
+</div>
+
+<div class="tip">
+  <b>新增：下拉里现在分成两组了。</b><br>
+  「<b>具体酒店</b>」组是真实酒店；「<b>星级随机档占位</b>」组里那些叫「随机三星 / 随机四星」的<b>不是真实酒店</b>，
+  是随机档的占位记录。套餐要走随机档，<b>正确做法是把酒店留空</b>，不要去选占位那一组。
+  万一选了，下面会有橙字提醒你。<br>
+  同时，如果<b>指定的酒店星级和套餐档次对不上</b>（比如四星套餐指了三星酒店），也会出橙字提醒——<b>只提醒、不拦你提交</b>，确认没选错就照常提交。
+</div>
+
+<h2 id="s4">四、国际五星档次需要你们确认</h2>
+
+<div class="warn">
+  <b>这一条要麻烦你们回一句。</b><br>
+  结算档次有四档：市区三星 / 市区四星 / 市区五星 / <b>国际五星</b>。<br>
+  但「星级随机」目前只有 <b>三星 / 四星 / 五星</b> 三档，<b>没有「国际五星随机」</b>。<br><br>
+  也就是说：国际五星的套餐目前没有对应的随机档可选。<b>请确认你们实际是怎么卖的：</b>
+  <ol style="margin:6px 0 0">
+    <li>国际五星<b>一律指定具体酒店</b>（不做随机）？→ 那现状就够用，录单时直接指定即可，<b>不用改系统</b>。</li>
+    <li>国际五星<b>也要能卖随机</b>？→ 那要开发补一个「国际五星随机」档。</li>
+  </ol>
+  <b>请回一句是哪一种</b>，是第 2 种我们就排进去。
+</div>
+
+<h2 id="s5">五、「后返」在系统里叫什么</h2>
+
+<p>你提到「在这个基础上还有后返」——后返在系统里叫 <b>佣金</b>，是<b>另一条独立的线</b>，和立减不是一回事：</p>
+
+<table class="doc">
+  <tr><th style="width:100px"></th><th>立减</th><th>佣金（后返）</th></tr>
+  <tr><td><b>什么时候发生</b></td><td>下单当场，直接减在结算价上</td><td>事后按规则计提，走结算单</td></tr>
+  <tr><td><b>代理看到的</b></td><td>结算价本身就已经是减完的</td><td>结算价不变，另外返</td></tr>
+  <tr><td><b>在哪儿配</b></td><td>产品 → 立减规则</td><td>代理管理 → 佣金规则</td></tr>
+</table>
+
+<div class="info">
+  两者<b>不会互相顶掉</b>，可以同时存在（先立减，再按规则计提佣金）。
+  如果希望结算单上把「立减 + 后返」合并成一个数展示，<b>请单独提一下</b>，那是另一个改动。
+</div>
+
+<h2 id="s6">六、常见问题 FAQ</h2>
+
+<dl class="faq">
+  <dt>我配了立减，为什么录单时没减？</dt>
+  <dd>照<a href="#s2">第二章</a>那五步自查一遍，九成是「套餐没配结算档次」或者「档次 / 晚数对不上」。</dd>
+
+  <dt>立减是每人减，还是整单减？</dt>
+  <dd><b>每人减。</b>填 190 就是每位出行人减 190，2 个人就是减 380。试算行里会写清楚「¥190/人 × 2 人」。</dd>
+
+  <dt>「出发日窗口」是按下单日还是出发日？</dt>
+  <dd><b>按客人的出发日。</b>今天下的单、明年出发，看的是明年那个日子落在哪条规则的窗口里。</dd>
+
+  <dt>某家代理这个月政策变了，怎么改？</dt>
+  <dd>不要直接把旧规则的金额改掉——那样<b>以前的窗口也跟着变了</b>。正确做法：把旧规则的「出发日窗口」结束日改到政策截止那天，再<b>新增一条</b>从次日开始的新规则。这样历史口径可查。</dd>
+
+  <dt>我是录单岗，能自己改立减规则吗？</dt>
+  <dd><b>可以。</b>内部岗位现在都能改（以前只有管理员能改，已经放开了）。每次保存和删除系统都记审计日志，改了什么、谁改的都查得到。</dd>
+
+  <dt>指定酒店加价要不要也按档次分？</dt>
+  <dd>不用。<b>它跟着酒店走</b>——一家酒店一个数，和档次、晚数、代理都无关。</dd>
+
+  <dt>指定酒店加价会不会被立减抵掉？</dt>
+  <dd>不会。两者是分开的两行：先按日历取结算价、叠上指定酒店加价，再减立减。试算里逐行看得到。</dd>
+</dl>
+
+<div class="footer">
+  世途旅行 · 运营控制台　立减规则 与 指定酒店加价 配置说明<br>
+  配套：《运营录单岗操作说明》《结算价日历使用手册》
+</div>
+
+</div>
+
+</body>
+</html>
