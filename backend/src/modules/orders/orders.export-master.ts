@@ -39,6 +39,7 @@ import { toAlpha3 } from './nationality.js';
 import { parseRoomGroups, resolveExportHotelName } from './orders.export-room-allocation.js';
 import { nameWithTitle, pnrName, VISA_REQUIREMENT_LABEL } from './orders.export-templates.js';
 import { filterExportOrdersByDepartDate } from './orders.export-depart-filter.js';
+import { appendHoldOrderSheet, loadHoldExportRows } from './orders.export-hold-orders.js';
 import { buildOrderFilterWhere, GUEST_RECORDED_BY_LABEL } from './orders.service.js';
 import { determineFlightLegs } from './ticketing-cap.js';
 
@@ -853,6 +854,13 @@ export async function buildMasterExportWorkbook(
   }
 
   ws.views = [{ state: 'frozen', xSplit: 1, ySplit: 1 }];
+
+  // 「占位单」表：占位单不是订单（无名单、无订单号），任何按订单口径导出的表都看不见它，
+  // 而收工时要逐条核对当天「留了哪几个团、几号的、多少座」恰恰只能看这张表。
+  // 勾选导出（orderIds）是「导我勾的这几张订单」，不是按日期盘一天，故不附占位单表。
+  if (!query.orderIds || query.orderIds.length === 0) {
+    appendHoldOrderSheet(wb, await loadHoldExportRows(query.from, query.to, client));
+  }
 
   const buf = await wb.xlsx.writeBuffer();
   return Buffer.from(buf);

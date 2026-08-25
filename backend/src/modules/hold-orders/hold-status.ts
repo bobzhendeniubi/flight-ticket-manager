@@ -1,5 +1,16 @@
 import { HoldInstallmentStatus, HoldOrderStatus } from '@prisma/client';
 
+/** 占位单状态中文名的唯一来源。放在叶子模块，导出/服务/路由都从这里取，避免循环依赖。 */
+export const HOLD_STATUS_LABEL: Record<HoldOrderStatus, string> = {
+  [HoldOrderStatus.PENDING]: '待生效',
+  [HoldOrderStatus.HOLDING]: '占座中',
+  [HoldOrderStatus.OVERDUE]: '逾期占座',
+  [HoldOrderStatus.FULLY_PAID]: '已全款',
+  [HoldOrderStatus.CONVERTED]: '已转正',
+  [HoldOrderStatus.RELEASED]: '已释放',
+  [HoldOrderStatus.CANCELLED]: '已取消',
+};
+
 export interface DeriveHoldInstallment {
   amountCny: number;
   status?: HoldInstallmentStatus;

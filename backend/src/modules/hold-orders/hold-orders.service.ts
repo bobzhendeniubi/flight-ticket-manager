@@ -56,18 +56,9 @@ import type {
   PreviewConvertHoldOrderBody,
 } from './hold-orders.schemas.js';
 import { convertHoldOrderBodySchema } from './hold-orders.schemas.js';
-import { deriveHoldStatus } from './hold-status.js';
+import { deriveHoldStatus, HOLD_STATUS_LABEL } from './hold-status.js';
 
 const HOLD_NO_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
-const HOLD_STATUS_LABEL: Record<HoldOrderStatus, string> = {
-  [HoldOrderStatus.PENDING]: '待生效',
-  [HoldOrderStatus.HOLDING]: '占座中',
-  [HoldOrderStatus.OVERDUE]: '逾期占座',
-  [HoldOrderStatus.FULLY_PAID]: '已全款',
-  [HoldOrderStatus.CONVERTED]: '已转正',
-  [HoldOrderStatus.RELEASED]: '已释放',
-  [HoldOrderStatus.CANCELLED]: '已取消',
-};
 
 type Tx = Prisma.TransactionClient;
 
