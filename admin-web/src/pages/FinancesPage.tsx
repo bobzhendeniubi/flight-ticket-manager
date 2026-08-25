@@ -11,8 +11,9 @@
  * 成本更新：demo 估算回填脚本已删除（2026-07-17 审计 #19：按售价比例伪造成本是给事故写邀请函）——缺成本一律如实留空/标未知；
  * 真实生产应由 staff 在 Flights/Hotels/Visa/Transfer 管理页录入。
  */
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { formatLocalTime } from '../lib/airports';
+import { Icon } from '../components/Icon';
 import {
   api,
   ApiError,
@@ -32,6 +33,8 @@ import {
 import { useAuth } from '../stores/auth';
 import { NumberInput } from '../components/NumberInput';
 import { UsdRateInput } from '../components/UsdRateInput';
+import { useConfirm } from '../components/ConfirmDialog';
+import { useDialogA11y } from '../components/Modal';
 
 type Tab = 'summary' | 'flights' | 'orders' | 'monthly' | 'costs';
 
@@ -292,7 +295,7 @@ export function FinancesPage() {
           <h1 className="page-title">财务</h1>
           <p className="page-sub">
             收入 / 成本 / 毛利按航班和订单实时核算 ·{' '}
-            <span className="text-amber-700">⚠ 财务数据敏感，访问会记录到审计日志</span>
+            <span className="inline-flex items-center gap-1 text-amber-700"><Icon name="alert" /> 财务数据敏感，访问会记录到审计日志</span>
           </p>
         </div>
         <div className="flex items-end gap-2">
@@ -658,6 +661,8 @@ function UsdFxRateEditor({ token }: { token: string }) {
 
 // ── 航班成本周期 ─────────────────────────────────────────────────────────────
 function FlightCostPeriodsEditor({ token }: { token: string }) {
+  const confirm = useConfirm();
+  const confirmLockRef = useRef(false);
   const [periods, setPeriods] = useState<CostPeriodDto[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
@@ -725,12 +730,23 @@ function FlightCostPeriodsEditor({ token }: { token: string }) {
   useEffect(() => load(), [load]);
 
   async function onDelete(id: string): Promise<void> {
-    if (!confirm('确认删除该周期？删除后该航班该日期段会回退到「无默认」。')) return;
+    if (confirmLockRef.current) return;
+    confirmLockRef.current = true;
+    if (!(await confirm({
+      title: '确认删除该周期？',
+      body: '删除后该航班该日期段会回退到「无默认」。',
+      tone: 'danger',
+    }))) {
+      confirmLockRef.current = false;
+      return;
+    }
     try {
       await api.deleteCostPeriod(token, id);
       load();
     } catch (e: unknown) {
       alert(e instanceof ApiError ? e.message : '删除失败');
+    } finally {
+      confirmLockRef.current = false;
     }
   }
 
@@ -1217,7 +1233,7 @@ function CostPeriodRow({
           <button
             type="button"
             onClick={onDelete}
-            className="rounded-lg border border-rose-200 px-2 py-1 text-xs font-medium text-rose-600 transition hover:bg-rose-50"
+            className="btn-ghost-danger px-2 py-1 text-xs"
           >
             删
           </button>
@@ -1519,7 +1535,7 @@ function FlightScheduleCostRow({
             className="ml-1 inline-flex items-center rounded bg-amber-50 px-1 py-0.5 text-[10px] font-medium text-amber-700"
             title={lockedAtTitle}
           >
-            🔒 已锁定
+            <Icon name="lock" /> 已锁定
           </span>
         )}
       </td>
@@ -1635,7 +1651,7 @@ function FlightScheduleCostRow({
           className="ml-1 rounded-lg border border-slate-200 px-2 py-1 text-xs text-slate-700 hover:bg-slate-50 disabled:opacity-50"
           title={lockedAtTitle}
         >
-          {lockBusy ? '…' : row.costLocked ? '🔓 解锁' : '🔒 锁定成本'}
+          {lockBusy ? '…' : row.costLocked ? <><Icon name="unlock" /> 解锁</> : <><Icon name="lock" /> 锁定成本</>}
         </button>
         {saveErr && <div className="text-xs text-rose-600 mt-0.5">{saveErr}</div>}
         {lockErr && <div className="text-xs text-rose-600 mt-0.5">{lockErr}</div>}
@@ -1732,7 +1748,7 @@ function ProductCostEditors({ token }: { token: string }) {
             {visas.map((v) => (
               <CostRow
                 key={v.id}
-                label={`${v.flag ?? ''} ${v.country ?? v.destinationCountry} · ${v.visaName ?? v.visaType}`}
+                label={`${v.country ?? v.destinationCountry} · ${v.visaName ?? v.visaType}`}
                 basePrice={v.basePrice}
                 fields={[
                   { key: 'costPriceCny', value: v.costPriceCny },
@@ -2386,6 +2402,7 @@ function OrderPnlDetailModal({
   orderId: string;
   onClose: () => void;
 }) {
+  const dialogRef = useDialogA11y(onClose);
   const [data, setData] = useState<OrderPnlDetail | null>(null);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
@@ -2415,6 +2432,11 @@ function OrderPnlDetailModal({
 
   return (
     <div
+      ref={dialogRef}
+      role="dialog"
+      aria-modal="true"
+      aria-label="订单收支明细"
+      tabIndex={-1}
       className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 p-4"
       onClick={onClose}
     >
@@ -2439,7 +2461,7 @@ function OrderPnlDetailModal({
             className="text-slate-400 hover:text-slate-700"
             aria-label="关闭"
           >
-            ✕
+            <Icon name="close" />
           </button>
         </div>
 

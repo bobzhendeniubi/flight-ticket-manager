@@ -32,6 +32,7 @@ import { MarketingPage } from './pages/MarketingPage';
 import { LegacyArchivePage } from './pages/LegacyArchivePage';
 import { useAuth } from './stores/auth';
 import { isAccessTokenFresh } from './lib/token';
+import { ConfirmProvider } from './components/ConfirmDialog';
 
 // AGENT 可访问的页面集合（其他页面默认 ADMIN/STAFF 专属）
 // 真实 RBAC 仍由后端 requireRole 兜底 —— 前端只做导航 UX
@@ -126,7 +127,8 @@ export function App() {
   }, [hasSession, refreshSession]);
 
   return (
-    <Routes>
+    <ConfirmProvider>
+      <Routes>
       <Route path="/login" element={<LoginPage />} />
       <Route element={<Layout />}>
         <Route
@@ -358,6 +360,7 @@ export function App() {
         />
       </Route>
       <Route path="*" element={<AgentLanding />} />
-    </Routes>
+      </Routes>
+    </ConfirmProvider>
   );
 }

@@ -12,9 +12,10 @@
  * 批量取消（走状态机 PENDING_PAYMENT→CANCELLED，自动还座）。仍是人工决策：
  * 录单单永不自动过期是拍板口径（"肯定要飞"），这里只是把人工释放从翻订单列表缩短成一次勾选。
  */
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, apiFetch, ApiError } from '../../lib/api';
 import { useAuth } from '../../stores/auth';
+import { useConfirm } from '../ConfirmDialog';
 
 type PendingAgingBucket = 'LT_24H' | 'D1_3' | 'D3_7' | 'GT_7D';
 
@@ -73,6 +74,8 @@ function formatAge(ageHours: number): string {
 }
 
 export function PendingAgingCard() {
+  const confirm = useConfirm();
+  const confirmLockRef = useRef(false);
   const tokens = useAuth((s) => s.tokens);
   const [summary, setSummary] = useState<PendingAgingSummary | null>(null);
   const [summaryError, setSummaryError] = useState<string | null>(null);
@@ -161,14 +164,15 @@ export function PendingAgingCard() {
     });
 
   async function releaseSelected() {
-    if (!token || releasing || selected.size === 0) return;
+    if (!token || releasing || selected.size === 0 || confirmLockRef.current) return;
     const totalSeats = rows.filter((r) => selected.has(r.id)).reduce((sum, r) => sum + r.seats, 0);
-    if (
-      !window.confirm(
-        `确认取消所选 ${selected.size} 单（释放约 ${totalSeats} 个机位）？\n\n` +
-          '订单将转为「已取消」，座位自动归还销售；此操作不可批量撤销（可逐单拉回待支付）。',
-      )
-    ) {
+    confirmLockRef.current = true;
+    if (!(await confirm({
+      title: `确认取消所选 ${selected.size} 单（释放约 ${totalSeats} 个机位）？`,
+      body: '订单将转为「已取消」，座位自动归还销售；此操作不可批量撤销（可逐单拉回待支付）。',
+      tone: 'danger',
+    }))) {
+      confirmLockRef.current = false;
       return;
     }
     setReleasing(true);
@@ -182,8 +186,8 @@ export function PendingAgingCard() {
       );
       setReleaseMsg(
         res.failureCount > 0
-          ? `⚠️ 已取消 ${res.successCount} 单，失败 ${res.failureCount} 单（${res.results.find((r) => !r.success)?.error ?? ''}）`
-          : `✅ 已取消 ${res.successCount} 单，机位已归还销售`,
+          ? `已取消 ${res.successCount} 单，失败 ${res.failureCount} 单（${res.results.find((r) => !r.success)?.error ?? ''}）`
+          : `已取消 ${res.successCount} 单，机位已归还销售`,
       );
       setSelected(new Set());
       if (openBucket) loadRows(openBucket, noClockOnly); // 重拉明细与汇总
@@ -191,6 +195,7 @@ export function PendingAgingCard() {
       setReleaseMsg(e instanceof ApiError ? e.message : '批量取消失败');
     } finally {
       setReleasing(false);
+      confirmLockRef.current = false;
     }
   }
 

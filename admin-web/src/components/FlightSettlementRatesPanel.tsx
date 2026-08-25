@@ -16,6 +16,7 @@
  *      （出发日 × 航班号）后预览确认，直接走批量 upsert 写库并重拉网格。
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { Icon } from './Icon';
 import {
   api,
   ApiError,
@@ -365,7 +366,7 @@ export function FlightSettlementRatesPanel() {
       {/* 报价表整块粘贴导入：一次吃整张 OTA 表（左右两张并排表都认），与下方逐格粘贴并存 */}
       <details className="rounded-md border border-slate-200 bg-slate-50/60 px-3 py-2">
         <summary className="cursor-pointer text-sm font-semibold text-ink">
-          📋 粘贴报价表（整块导入 OTA 结算价）
+          <Icon name="clipboard" /> 粘贴报价表（整块导入 OTA 结算价）
         </summary>
         <div className="mt-3 space-y-3">
           <p className="text-[11px] text-ink-muted">

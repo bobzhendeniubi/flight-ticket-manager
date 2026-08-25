@@ -11,8 +11,9 @@
  *
  * 口径：余量 = 包房（切房）− 用房（占房订单）；余量<0 红、=0 黄。
  */
-import { Fragment, useCallback, useEffect, useMemo, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { Icon } from '../components/Icon';
 import {
   api,
   ApiError,
@@ -33,6 +34,8 @@ import { useAuth } from '../stores/auth';
 import { NumberInput } from '../components/NumberInput';
 import { RoomingEditor, type RoomingPassenger } from '../components/RoomingEditor';
 import { HotelSwapModal } from '../components/HotelSwapModal';
+import { useConfirm } from '../components/ConfirmDialog';
+import { useDialogA11y } from '../components/Modal';
 
 // ── helpers ────────────────────────────────────────────────────────────────
 function todayStr(): string {
@@ -488,6 +491,7 @@ function OccupantsDrawer({
   /** 换酒店成功后通知父级（触发销控板重拉）。 */
   onChanged?: () => void;
 }) {
+  const dialogRef = useDialogA11y(onClose);
   const [occupants, setOccupants] = useState<HotelOccupant[] | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
@@ -528,7 +532,7 @@ function OccupantsDrawer({
         : `包房 ${block} 间 · 已占 ${used} 间`;
 
   return (
-    <div className="fixed inset-0 z-50 flex justify-end bg-slate-900/40" onClick={onClose}>
+    <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="酒店控制详情" tabIndex={-1} className="fixed inset-0 z-50 flex justify-end bg-slate-900/40" onClick={onClose}>
       <div
         className="flex h-full w-full max-w-md flex-col overflow-y-auto bg-white shadow-2xl"
         onClick={(e) => e.stopPropagation()}
@@ -540,8 +544,8 @@ function OccupantsDrawer({
             </h3>
             <p className="mt-1 text-xs text-ink-muted">{headerNote}</p>
           </div>
-          <button type="button" className="text-slate-400 hover:text-slate-700" onClick={onClose}>
-            ✕
+          <button type="button" className="text-slate-400 hover:text-slate-700" onClick={onClose} aria-label="关闭酒店控制详情">
+            <Icon name="close" />
           </button>
         </div>
 
@@ -586,7 +590,7 @@ function OccupantsDrawer({
                       className="btn-secondary px-2 py-1 text-xs"
                       onClick={() => handleCopy(o.orderId, o.orderNumber)}
                     >
-                      {copiedId === o.orderId ? '已复制 ✓' : '复制订单号'}
+                      {copiedId === o.orderId ? '已复制' : '复制订单号'}
                     </button>
                     <button
                       type="button"
@@ -1279,7 +1283,7 @@ function AlertsBanner({ token }: { token: string }) {
                   key={`os-${i}`}
                   className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700"
                 >
-                  <span className="font-semibold">超卖 ⚠</span> {a.hotelName} {fmtMonthDay(a.date)}{' '}
+                  <span className="inline-flex items-center gap-1 font-semibold"><Icon name="alert" /> 超卖</span> {a.hotelName} {fmtMonthDay(a.date)}{' '}
                   <span className="nums">{a.used}/{a.block}</span> 缺 {a.deficit} 间 · 让地接加房
                 </div>
               ))}
@@ -1297,7 +1301,7 @@ function AlertsBanner({ token }: { token: string }) {
                   key={`oc-${i}`}
                   className="rounded-lg border border-violet-200 bg-violet-50 px-3 py-2 text-sm text-violet-700"
                 >
-                  <span className="font-semibold">票务 ⚠</span> {a.flightNumber}{' '}
+                  <span className="inline-flex items-center gap-1 font-semibold"><Icon name="alert" /> 票务</span> {a.flightNumber}{' '}
                   {fmtMonthDay(a.departureDate)} 已收客 {a.paxCount} 人 · 超过开票上限
                 </div>
               ))}
@@ -1306,7 +1310,7 @@ function AlertsBanner({ token }: { token: string }) {
                   key={`so-${i}`}
                   className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700"
                 >
-                  <span className="font-semibold">拼房落单 ⚠</span> {a.hotelName}{' '}
+                  <span className="inline-flex items-center gap-1 font-semibold"><Icon name="alert" /> 拼房落单</span> {a.hotelName}{' '}
                   {fmtMonthDay(a.date)} 有 {a.sharedHalfCount} 位拼房客临近出发仍未配对（异性不能拼一间）·
                   补单房差或另配
                 </div>
@@ -1436,6 +1440,8 @@ function RoomAllocationExport({ token }: { token: string }) {
 
 // ── 包房周期管理（镜像 FinancesPage 的 FlightCostPeriodsEditor 模式）────────
 function BlockPeriodsEditor({ token, onChanged }: { token: string; onChanged: () => void }) {
+  const confirm = useConfirm();
+  const confirmLockRef = useRef(false);
   const [periods, setPeriods] = useState<HotelBlockPeriod[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
@@ -1493,13 +1499,24 @@ function BlockPeriodsEditor({ token, onChanged }: { token: string; onChanged: ()
   useEffect(() => load(), [load]);
 
   async function onDelete(id: string): Promise<void> {
-    if (!confirm('确认删除该包房周期？删除后该酒店该日期段的「包房」会相应减少。')) return;
+    if (confirmLockRef.current) return;
+    confirmLockRef.current = true;
+    if (!(await confirm({
+      title: '确认删除该包房周期？',
+      body: '删除后该酒店该日期段的「包房」会相应减少。',
+      tone: 'danger',
+    }))) {
+      confirmLockRef.current = false;
+      return;
+    }
     try {
       await api.deleteBlockPeriod(token, id);
       load();
       onChanged();
     } catch (e: unknown) {
       alert(e instanceof ApiError ? e.message : '删除失败');
+    } finally {
+      confirmLockRef.current = false;
     }
   }
 
@@ -1829,7 +1846,7 @@ function BlockPeriodRow({
           <button
             type="button"
             onClick={onDelete}
-            className="rounded-lg border border-rose-200 px-2 py-1 text-xs font-medium text-rose-600 transition hover:bg-rose-50"
+            className="btn-ghost-danger px-2 py-1 text-xs"
           >
             删
           </button>

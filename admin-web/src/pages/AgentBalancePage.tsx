@@ -24,6 +24,7 @@ import {
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { NumberInput } from '../components/NumberInput';
+import { Icon } from '../components/Icon';
 
 // ── 凭证图片压缩（与 sales-web PaymentPanel 的算法一致，目标体积调小到 ~1.5MB/张） ──
 const MAX_PROOF_BYTES = 6 * 1024 * 1024;
@@ -507,7 +508,7 @@ function PendingRow({ request, token, onChanged }: { request: AgentRechargeReque
         <td className="text-right">
           <div className="flex justify-end gap-1.5 text-xs font-medium">
             <button type="button" className="btn-secondary px-2.5 py-1 text-xs" onClick={() => setAction(action === 'confirm' ? 'none' : 'confirm')}>确认</button>
-            <button type="button" className="btn-ghost px-2.5 py-1 text-xs text-rose-700 hover:bg-rose-50" onClick={() => setAction(action === 'reject' ? 'none' : 'reject')}>驳回</button>
+            <button type="button" className="btn-ghost-danger px-2.5 py-1 text-xs" onClick={() => setAction(action === 'reject' ? 'none' : 'reject')}><Icon name="close" /> 驳回</button>
           </div>
         </td>
       </tr>

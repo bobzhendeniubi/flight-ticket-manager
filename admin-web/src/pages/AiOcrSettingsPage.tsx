@@ -8,6 +8,7 @@
 import { useEffect, useState } from 'react';
 import { api, ApiError, type AiOcrConfig, type AiOcrConfigInput } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { Icon } from '../components/Icon';
 
 export function AiOcrSettingsPage() {
   const tokens = useAuth((s) => s.tokens);
@@ -246,7 +247,7 @@ export function AiOcrSettingsPage() {
                 : 'border border-rose-200 bg-rose-50 text-rose-700'
             }`}
           >
-            {saveMsg.type === 'ok' ? '✓ ' : '✕ '}
+            <Icon name={saveMsg.type === 'ok' ? 'check' : 'close'} className="mr-1 inline-block align-text-bottom" />
             {saveMsg.text}
           </div>
         )}
@@ -260,7 +261,7 @@ export function AiOcrSettingsPage() {
                 : 'border border-rose-200 bg-rose-50 text-rose-700'
             }`}
           >
-            {testMsg.ok ? '✅ ' : '❌ '}
+            <Icon name={testMsg.ok ? 'check' : 'alert'} className="mr-1 inline-block align-text-bottom" />
             {testMsg.text}
           </div>
         )}

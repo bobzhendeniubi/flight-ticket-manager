@@ -26,6 +26,8 @@ import type { RoomGroup, Receipt, DocumentType, TravelerProfileLookupRow } from 
 import { countryIso3ToIso2 } from '../lib/passportOcr';
 import { runPassportOcr, ocrReviewHintText } from '../lib/passportOcrRunner';
 import { ORDER_STATUS_META, orderStatusBadgeClass, orderStatusLabel } from '../lib/orderStatus';
+import { useConfirm } from '../components/ConfirmDialog';
+import { useDialogA11y } from '../components/Modal';
 
 // 批量开票下拉的六个选项（票务岗 0715 反馈）：按航段/系统三个布尔位各自「标已开/标未开」，
 // 对应逐单调用 setInvoiceFlags 时传的 flags 字段。
@@ -180,10 +182,10 @@ const VISA_REQUIREMENT_BADGE: Record<VisaStatusInput, { label: string; cls: stri
   HAS_VISA: { label: '已签证', cls: 'badge-success' },
 };
 
-// 性别小标（列表乘客名后缀）：M→♂ F→♀，其余（X/未录）不标。
+// 性别小标（列表乘客名后缀）：M→M F→F，其余（X/未录）不标。口径对齐导出/PNR，统一用 M/F 而非中文男女。
 function genderMark(g?: string | null): string {
-  if (g === 'M') return '♂';
-  if (g === 'F') return '♀';
+  if (g === 'M') return 'M';
+  if (g === 'F') return 'F';
   return '';
 }
 
@@ -417,6 +419,8 @@ function BulkResultPanel({
 }
 
 export function OrdersPage() {
+  const confirm = useConfirm();
+  const highRiskConfirmRef = useRef(false);
   const tokens = useAuth((s) => s.tokens);
   const user = useAuth((s) => s.user);
   const bumpSeats = useFlightSeats((s) => s.bumpSeats);
@@ -436,6 +440,7 @@ export function OrdersPage() {
   const [error, setError] = useState<string | null>(null);
   // 回收站（ADMIN + STAFF）：已软删订单弹窗 + 恢复
   const [showRecycleBin, setShowRecycleBin] = useState(false);
+  const recycleDialogRef = useDialogA11y(() => setShowRecycleBin(false), showRecycleBin);
   const [deletedOrders, setDeletedOrders] = useState<DeletedOrderSummary[]>([]);
   const [deletedTotal, setDeletedTotal] = useState<number | null>(null);
   const [recycleLoading, setRecycleLoading] = useState(false);
@@ -868,10 +873,16 @@ export function OrdersPage() {
     try {
       const { quote } = await api.refundQuote(tokens.accessToken, order.id);
       const warning = refundApprovalWarning(order.orderNumber, readRefundSplit(quote));
-      return warning === null ? true : window.confirm(warning);
+      return warning === null
+        ? true
+        : confirm({ title: '确认同意退款？', body: warning, tone: 'danger' });
     } catch (err) {
       const text = err instanceof ApiError ? err.message : '读取失败';
-      return window.confirm(refundApprovalUnknownWarning(order.orderNumber, text));
+      return confirm({
+        title: '无法读取退款拆分，仍要继续？',
+        body: refundApprovalUnknownWarning(order.orderNumber, text),
+        tone: 'danger',
+      });
     }
   };
 
@@ -889,7 +900,17 @@ export function OrdersPage() {
       return;
     }
     // 落「已退款」是不可逆的，且会触发余额自动回补 → 先摊开拆分再确认（含 force 通道）。
-    if (next === 'REFUNDED' && !(await confirmRefundApproval(order))) return;
+    let refundConfirmHeld = false;
+    if (next === 'REFUNDED') {
+      if (!highRiskConfirmRef.current) {
+        highRiskConfirmRef.current = true;
+        refundConfirmHeld = true;
+      }
+      if (!(await confirmRefundApproval(order))) {
+        if (refundConfirmHeld) highRiskConfirmRef.current = false;
+        return;
+      }
+    }
     try {
       const res = await api.updateOrderStatus(tokens.accessToken, order.id, next, reason, force);
       setOrders((prev) => prev.map((o) => (o.id === order.id ? res.order : o)));
@@ -898,18 +919,26 @@ export function OrdersPage() {
       bumpSeats();
     } catch (err) {
       alert(err instanceof ApiError ? `操作失败：${err.message}` : '操作失败');
+    } finally {
+      if (refundConfirmHeld) highRiskConfirmRef.current = false;
     }
   };
 
   // 删除订单（仅 ADMIN）：取消 + 释放机位/酒店库存
   const deleteOrder = async (order: OrderSummary) => {
-    if (!tokens?.accessToken) return;
-    const confirmed = window.confirm(
-      `删除订单 ${order.orderNumber}？\n\n` +
+    if (!tokens?.accessToken || highRiskConfirmRef.current) return;
+    highRiskConfirmRef.current = true;
+    const confirmed = await confirm({
+      title: `删除订单 ${order.orderNumber}？`,
+      body:
         `软删除：订单从所有列表/导出/统计里消失，数据保留可追溯（审计记录），不影响座位账。\n` +
         `注意：仍占座的订单需先取消订单释放座位，才能删除。`,
-    );
-    if (!confirmed) return;
+      tone: 'danger',
+    });
+    if (!confirmed) {
+      highRiskConfirmRef.current = false;
+      return;
+    }
     try {
       await api.deleteOrder(tokens.accessToken, order.id);
       // 软删后该单从列表隐藏 → 从本地列表移除，并关闭抽屉（若打开的是这单）。
@@ -926,6 +955,8 @@ export function OrdersPage() {
       } else {
         alert('删除失败');
       }
+    } finally {
+      highRiskConfirmRef.current = false;
     }
   };
 
@@ -1115,7 +1146,19 @@ export function OrdersPage() {
           ? `\n\n⚠️ 批量改「退款申请中」只翻状态、不生成应退报价——这样的单之后点「同意退款」会被系统拦下。\n` +
             `真要退钱给客人的订单，请逐单在订单详情用「申请退款」发起（会按取消政策生成应退报价并留底）。`
           : '';
-    if (!window.confirm(confirmMsg + refundNotice)) return;
+    const needsDangerConfirm = forceMode || bulkStatus === 'REFUNDED';
+    if (needsDangerConfirm) {
+      if (highRiskConfirmRef.current) return;
+      highRiskConfirmRef.current = true;
+      if (!(await confirm({
+        title: forceMode ? '强制批量改状态？' : '批量批准退款？',
+        body: confirmMsg + refundNotice,
+        tone: 'danger',
+      }))) {
+        highRiskConfirmRef.current = false;
+        return;
+      }
+    } else if (!window.confirm(confirmMsg + refundNotice)) return;
     setBulkSubmitting(true);
     setBulkResult(null);
     try {
@@ -1152,6 +1195,7 @@ export function OrdersPage() {
       alert(err instanceof ApiError ? `批量操作失败：${err.message}` : '批量操作失败');
     } finally {
       setBulkSubmitting(false);
+      if (needsDangerConfirm) highRiskConfirmRef.current = false;
     }
   };
 
@@ -1256,13 +1300,19 @@ export function OrdersPage() {
   // 批量删除（仅 ADMIN）：无批量端点，逐单调用现有软删端点；服务端占座/净收款守卫逐单生效，
   // 绝不绕过——失败单（如仍占座、净收款>0）逐条列出原因，只有成功的单从列表移除。
   const applyBulkDelete = async () => {
-    if (!tokens?.accessToken || selectedIds.size === 0) return;
-    const confirmed = window.confirm(
-      `批量删除已选 ${selectedIds.size} 条订单？\n\n` +
+    if (!tokens?.accessToken || selectedIds.size === 0 || highRiskConfirmRef.current) return;
+    highRiskConfirmRef.current = true;
+    const confirmed = await confirm({
+      title: `批量删除已选 ${selectedIds.size} 条订单？`,
+      body:
         `软删除：订单从所有列表/导出/统计里消失，数据保留可追溯（审计记录），不影响座位账；可在回收站恢复。\n` +
         `注意：仍占座的订单需先取消订单释放座位、净收款＞0 的订单不允许删除——不满足条件的单会失败，原因逐条列在下方。`,
-    );
-    if (!confirmed) return;
+      tone: 'danger',
+    });
+    if (!confirmed) {
+      highRiskConfirmRef.current = false;
+      return;
+    }
     setBulkDeleteSubmitting(true);
     setBulkDeleteResult(null);
     const ids = Array.from(selectedIds);
@@ -1284,6 +1334,7 @@ export function OrdersPage() {
       setSelectedIds(new Set(failures.map((f) => f.id)));
     } finally {
       setBulkDeleteSubmitting(false);
+      highRiskConfirmRef.current = false;
     }
   };
 
@@ -2558,12 +2609,21 @@ export function OrdersPage() {
                       <span><span className="nums font-medium text-ink">{order.passengers.length}</span> 人</span>
                     </div>
                     {order.passengers.length > 0 && (() => {
-                      // 姓名后缀性别小标（♂/♀；列表接口未回传性别时自然不标，不占位）
-                      const names = order.passengers.map((p) => {
-                        const base = p.chineseName?.trim() || p.fullName;
-                        const g = genderMark(p.gender);
-                        return g ? `${base}${g}` : base;
-                      });
+                      // 姓名提亮（录单岗反馈：加粗+正文色，一眼可见）+ 性别小标（M/F；列表接口未回传性别时
+                      // 自然不标，不占位）。字母紧贴姓名会糊成一团（"张三M"），用独立小号淡色 span 隔开。
+                      const names = order.passengers.map((p) => p.chineseName?.trim() || p.fullName);
+                      const genders = order.passengers.map((p) => genderMark(p.gender));
+                      const titleText = names
+                        .map((n, i) => (genders[i] ? `${n}（${genders[i]}）` : n))
+                        .join('、');
+                      const nameNode = (idx: number, emphasized: boolean) => (
+                        <span key={idx} className={emphasized ? 'font-medium text-brand' : 'font-medium text-ink'}>
+                          {names[idx]}
+                          {genders[idx] ? (
+                            <span className="ml-0.5 text-[10px] font-normal text-ink-soft">{genders[idx]}</span>
+                          ) : null}
+                        </span>
+                      );
                       const terms = splitSearchTerms(search);
                       // 搜索命中某乘客时优先展示命中者（「张三 +3 同行」），不再平铺全部同行人。
                       // 分词后任一词命中即算命中（与 filtered 的 AND 口径不同：这里只挑「展示谁」）。
@@ -2580,17 +2640,23 @@ export function OrdersPage() {
                       if (hitIdx >= 0) {
                         const companions = names.length - 1;
                         return (
-                          <div className="mt-0.5 max-w-xs truncate text-xs text-ink-muted" title={names.join('、')}>
-                            <span className="font-medium text-brand">{names[hitIdx]}</span>
-                            {companions > 0 ? ` +${companions} 同行` : ''}
+                          <div className="mt-0.5 max-w-xs truncate text-xs" title={titleText}>
+                            {nameNode(hitIdx, true)}
+                            {companions > 0 ? <span className="text-ink-muted"> +{companions} 同行</span> : null}
                           </div>
                         );
                       }
-                      const shown = names.slice(0, 3);
-                      const hasMore = names.length > shown.length;
+                      const shownCount = Math.min(names.length, 3);
+                      const hasMore = names.length > shownCount;
                       return (
-                        <div className="mt-0.5 max-w-xs truncate text-xs text-ink-muted" title={names.join('、')}>
-                          {shown.join('、')}{hasMore ? ` 等${names.length}人` : ''}
+                        <div className="mt-0.5 max-w-xs truncate text-xs" title={titleText}>
+                          {Array.from({ length: shownCount }, (_, i) => (
+                            <span key={i}>
+                              {i > 0 ? <span className="text-ink-muted">、</span> : null}
+                              {nameNode(i, false)}
+                            </span>
+                          ))}
+                          {hasMore ? <span className="text-ink-muted"> 等{names.length}人</span> : null}
                         </div>
                       );
                     })()}
@@ -2659,7 +2725,28 @@ export function OrdersPage() {
                           const msg = forceMode
                             ? `强制将 ${order.orderNumber} 改为「${orderStatusLabel(next)}」？此操作绕过状态机校验。\n\n强制把已取消/超时的订单拉回持有状态会重新占座（余位不足会被拒绝，订单状态不变）；此前版本存在不占座的漏洞，请确认余位充足后再操作。`
                             : `将 ${order.orderNumber} 改为「${orderStatusLabel(next)}」？`;
-                          if (window.confirm(msg)) void advance(order, next, undefined, forceMode);
+                          if (forceMode) {
+                            if (highRiskConfirmRef.current) {
+                              e.target.value = '';
+                              return;
+                            }
+                            highRiskConfirmRef.current = true;
+                            void confirm({
+                              title: `强制将 ${order.orderNumber} 改为「${orderStatusLabel(next)}」？`,
+                              body: '此操作绕过状态机校验。\n\n强制把已取消/超时的订单拉回持有状态会重新占座（余位不足会被拒绝，订单状态不变）；此前版本存在不占座的漏洞，请确认余位充足后再操作。',
+                              tone: 'danger',
+                            }).then((ok) => {
+                              if (!ok) {
+                                highRiskConfirmRef.current = false;
+                                return;
+                              }
+                              void advance(order, next, undefined, forceMode).finally(() => {
+                                highRiskConfirmRef.current = false;
+                              });
+                            });
+                          } else if (window.confirm(msg)) {
+                            void advance(order, next, undefined, forceMode);
+                          }
                           e.target.value = '';
                         }}
                         title={forceMode ? '管理员强制改状态（绕过状态机）' : '按标准流转改状态'}
@@ -2762,6 +2849,11 @@ export function OrdersPage() {
       {/* 回收站（仅 ADMIN）：已软删订单表 + 每行恢复 */}
       {showRecycleBin && (
         <div
+          ref={recycleDialogRef}
+          role="dialog"
+          aria-modal="true"
+          aria-label="订单回收站"
+          tabIndex={-1}
           className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4"
           onClick={() => setShowRecycleBin(false)}
         >
@@ -2964,7 +3056,7 @@ function OrderDrawer({
 }: {
   order: OrderSummary;
   onClose: () => void;
-  onAdvance: (next: OrderStatus, reason?: string, force?: boolean) => void;
+  onAdvance: (next: OrderStatus, reason?: string, force?: boolean) => Promise<void> | void;
   onChanged?: () => void;
   /** 售后改期/换人后用更新后的订单就地刷新抽屉与列表 */
   onOrderUpdated?: (order: OrderSummary) => void;
@@ -2973,7 +3065,10 @@ function OrderDrawer({
   isAdmin?: boolean;
 }) {
   const tokens = useAuth((s) => s.tokens);
+  const confirm = useConfirm();
+  const highRiskConfirmRef = useRef(false);
   const token = tokens?.accessToken ?? '';
+  const dialogRef = useDialogA11y(onClose);
   const role = useAuth((s) => s.user?.role);
   // 内部角色（ADMIN/STAFF）才看逐项拆价折叠区；AGENT/CUSTOMER 只看「产品内容 + 订单总价」，不露内部金额明细。
   const canSeeInternal = role === 'ADMIN' || role === 'STAFF';
@@ -3027,6 +3122,9 @@ function OrderDrawer({
   const [agentEditOpen, setAgentEditOpen] = useState(false);
   const [roomSupplementOpen, setRoomSupplementOpen] = useState(false);
   const [groundItemKind, setGroundItemKind] = useState<'VISA' | 'HOTEL' | null>(null);
+  const roomingDialogRef = useDialogA11y(() => setRoomingOpen(false), roomingOpen);
+  const agentDialogRef = useDialogA11y(() => setAgentEditOpen(false), agentEditOpen);
+  const roomSupplementDialogRef = useDialogA11y(() => setRoomSupplementOpen(false), roomSupplementOpen);
 
   const saveRooming = async (groups: RoomGroup[]): Promise<void> => {
     if (!token) return;
@@ -3057,6 +3155,11 @@ function OrderDrawer({
 
   return (
     <div
+      ref={dialogRef}
+      role="dialog"
+      aria-modal="true"
+      aria-label="订单详情"
+      tabIndex={-1}
       className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4"
       onClick={onClose}
     >
@@ -3385,16 +3488,28 @@ function OrderDrawer({
                     className="rounded-md border border-amber-300 bg-white px-2 py-1 text-xs text-ink-soft"
                     value=""
                     title="绕过状态机校验，用于异常订正。仍受安全规则约束（如已退款订单不能拉回占座、重新占座需余位充足），被拒时会弹出具体原因。"
-                    onChange={(e) => {
+                    onChange={async (e) => {
                       const to = e.target.value as OrderStatus;
                       e.currentTarget.value = '';
                       if (!to) return;
-                      const ok = window.confirm(
-                        `强制将该订单从「${orderStatusLabel(o.status)}」改为「${orderStatusLabel(to)}」？\n\n` +
+                      if (highRiskConfirmRef.current) return;
+                      highRiskConfirmRef.current = true;
+                      const ok = await confirm({
+                        title: `强制将该订单从「${orderStatusLabel(o.status)}」改为「${orderStatusLabel(to)}」？`,
+                        body:
                           '此操作绕过状态机校验，仅供异常订正。若目标为占座状态（已支付/处理中/出票等），' +
                           '会重新占座（余位不足将被拒绝，状态不变）；被安全规则拦下的操作会弹出具体原因。',
-                      );
-                      if (ok) onAdvance(to, undefined, true);
+                        tone: 'danger',
+                      });
+                      if (!ok) {
+                        highRiskConfirmRef.current = false;
+                        return;
+                      }
+                      try {
+                        await onAdvance(to, undefined, true);
+                      } finally {
+                        highRiskConfirmRef.current = false;
+                      }
                     }}
                   >
                     <option value="">强制改为…</option>
@@ -3431,6 +3546,11 @@ function OrderDrawer({
       {/* #4 分房弹窗：复用房控页同款 RoomingEditor / updateRoomAssignment 路径 */}
       {roomingOpen && (
         <div
+          ref={roomingDialogRef}
+          role="dialog"
+          aria-modal="true"
+          aria-label="分房编辑"
+          tabIndex={-1}
           className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/50 p-4"
           onClick={() => setRoomingOpen(false)}
         >
@@ -3453,6 +3573,11 @@ function OrderDrawer({
       {/* 更改归属代理弹窗（ADMIN/STAFF） */}
       {agentEditOpen && (
         <div
+          ref={agentDialogRef}
+          role="dialog"
+          aria-modal="true"
+          aria-label="更改归属代理"
+          tabIndex={-1}
           className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/50 p-4"
           onClick={() => setAgentEditOpen(false)}
         >
@@ -3478,6 +3603,11 @@ function OrderDrawer({
       {/* 事后补收单房差弹窗（ADMIN/STAFF） */}
       {roomSupplementOpen && (
         <div
+          ref={roomSupplementDialogRef}
+          role="dialog"
+          aria-modal="true"
+          aria-label="补收单房差"
+          tabIndex={-1}
           className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/50 p-4"
           onClick={() => setRoomSupplementOpen(false)}
         >
@@ -3596,6 +3726,7 @@ function GroundItemModal({
   onCancel: () => void;
   onSaved: () => Promise<void>;
 }) {
+  const dialogRef = useDialogA11y(onCancel);
   const tokens = useAuth((s) => s.tokens);
   const token = tokens?.accessToken ?? '';
   const [visas, setVisas] = useState<Visa[]>([]);
@@ -3712,7 +3843,7 @@ function GroundItemModal({
   };
 
   return (
-    <div className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-900/50 p-4" onClick={onCancel}>
+    <div ref={dialogRef} role="dialog" aria-modal="true" aria-label={`补录${kind === 'VISA' ? '签证' : '房费'}`} tabIndex={-1} className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-900/50 p-4" onClick={onCancel}>
       <form className="max-h-[90vh] w-full max-w-md overflow-auto rounded-2xl bg-white p-5 shadow-2xl" onClick={(event) => event.stopPropagation()} onSubmit={submit}>
         <div className="flex items-center justify-between gap-3">
           <h3 className="text-base font-semibold text-ink">补录{kind === 'VISA' ? '签证' : '房费'}</h3>
@@ -4066,6 +4197,8 @@ const FF_TYPE_LABEL: Record<FulfillmentTask['type'], { icon: IconName; label: st
 
 // 履约进度已按运营要求移出订单详情抽屉；组件保留（导出以备后续页面复用，也避免未引用告警）。
 export function FulfillmentSection({ orderId }: { orderId: string }) {
+  const confirm = useConfirm();
+  const highRiskConfirmRef = useRef(false);
   const tokens = useAuth((s) => s.tokens);
   const [tasks, setTasks] = useState<FulfillmentTask[]>([]);
   const [loading, setLoading] = useState(true);
@@ -4205,7 +4338,7 @@ export function FulfillmentSection({ orderId }: { orderId: string }) {
               {!isEditing && (
                 <div className="mt-2 flex flex-wrap gap-1">
                   {t.status === 'PENDING' && (
-                    <button className="text-xs rounded bg-blue-100 px-2 py-0.5 text-blue-700 hover:bg-blue-200" onClick={() => updateStatus(t, 'IN_PROGRESS' as ApiFfStatus)}>▶ 开始处理</button>
+                    <button className="text-xs rounded bg-blue-100 px-2 py-0.5 text-blue-700 hover:bg-blue-200" onClick={() => updateStatus(t, 'IN_PROGRESS' as ApiFfStatus)} aria-label="开始处理"><Icon name="chevronRight" /> 开始处理</button>
                   )}
                   {(t.status === 'PENDING' || t.status === 'IN_PROGRESS') && (
                     <button className="text-xs rounded bg-green-100 px-2 py-0.5 text-green-700 hover:bg-green-200"
@@ -4223,14 +4356,24 @@ export function FulfillmentSection({ orderId }: { orderId: string }) {
                     <button
                       className="text-xs rounded bg-amber-100 px-2 py-0.5 text-amber-700 hover:bg-amber-200"
                       onClick={async () => {
-                        if (!tokens?.accessToken) return;
-                        if (!confirm('强制重新出票？当前 PNR 会清空，任务重新排队执行。')) return;
+                        if (!tokens?.accessToken || highRiskConfirmRef.current) return;
+                        highRiskConfirmRef.current = true;
+                        if (!(await confirm({
+                          title: '强制重新出票？',
+                          body: '当前 PNR 会清空，任务重新排队执行。',
+                          tone: 'danger',
+                        }))) {
+                          highRiskConfirmRef.current = false;
+                          return;
+                        }
                         try {
                           const res = await api.reissueFulfillmentTask(tokens.accessToken, t.id);
                           setTasks((prev) => prev.map((x) => (x.id === t.id ? res.task : x)));
                           alert('已重新排队，稍后刷新查看新 PNR');
                         } catch (e) {
                           alert(e instanceof ApiError ? `重出票失败：${e.message}` : '重出票失败');
+                        } finally {
+                          highRiskConfirmRef.current = false;
                         }
                       }}
                     >
@@ -6092,7 +6235,7 @@ function PassportLightbox({
         >
           下载
         </a>
-        <button type="button" className={btnCls} title="关闭（Esc）" onClick={onClose}>
+        <button type="button" className={btnCls} title="关闭（Esc）" onClick={onClose} aria-label="关闭图片预览">
           <Icon name="close" />
         </button>
       </div>
@@ -6198,6 +6341,8 @@ function PassengerEditForm({
   onSaved: (order: OrderSummary) => void;
 }) {
   const tokens = useAuth((s) => s.tokens);
+  const confirm = useConfirm();
+  const highRiskConfirmRef = useRef(false);
   const token = tokens?.accessToken ?? '';
   const [lastName, setLastName] = useState(passenger.lastName ?? '');
   const [firstName, setFirstName] = useState(passenger.firstName ?? '');
@@ -6322,7 +6467,7 @@ function PassengerEditForm({
   };
 
   const submit = async () => {
-    if (!token || submitting) return;
+    if (!token || submitting || highRiskConfirmRef.current) return;
     setErr(null);
     // 生日填了就必须解析合法
     let dobValue: string | undefined;
@@ -6334,15 +6479,31 @@ function PassengerEditForm({
     // 证件号变化 = 真换人：后端会清除旧出行人残留的护照/签证信息，需显式二次确认防误清。
     const newDoc = documentNumber.trim();
     const isRealSwap = newDoc !== '' && newDoc !== (passenger.documentNumber ?? '');
+    highRiskConfirmRef.current = true;
     if (isRealSwap) {
-      if (!confirm('确认换人？证件号已变更，原出行人的护照/签证信息（护照照片、签发地、有效期、签证号等）将被清除，仅保留本次填写的新值。此操作会记入审计。')) return;
+      if (!(await confirm({
+        title: '确认换人？',
+        body: '证件号已变更，原出行人的护照/签证信息（护照照片、签发地、有效期、签证号等）将被清除，仅保留本次填写的新值。此操作会记入审计。',
+        tone: 'danger',
+      }))) {
+        highRiskConfirmRef.current = false;
+        return;
+      }
     } else {
-      if (!confirm('确认保存出行人改动？如勾选了重置开票/签证将清除对应状态，填了换人费将计入订单尾款。')) return;
+      if (!(await confirm({
+        title: '确认保存出行人改动？',
+        body: '如勾选了重置开票/签证将清除对应状态，填了换人费将计入订单尾款。',
+        tone: 'danger',
+      }))) {
+        highRiskConfirmRef.current = false;
+        return;
+      }
     }
     // 护照有效期填了就要合法（YYYY-MM-DD）
     const expiryValue = passportExpiry.trim();
     if (expiryValue && !/^\d{4}-\d{2}-\d{2}$/.test(expiryValue)) {
       setErr('护照有效期格式不正确（示例：2030-01-01）');
+      highRiskConfirmRef.current = false;
       return;
     }
     setSubmitting(true);
@@ -6401,6 +6562,7 @@ function PassengerEditForm({
       setErr(e instanceof ApiError ? e.message : '保存失败');
     } finally {
       setSubmitting(false);
+      highRiskConfirmRef.current = false;
     }
   };
 
@@ -7188,6 +7350,7 @@ function deriveBatchAgeGroup(dateOfBirth: string, departDate: string): BatchAgeG
 }
 
 function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
+  const dialogRef = useDialogA11y(onClose);
   const tokens = useAuth((s) => s.tokens);
   const user = useAuth((s) => s.user);
   const token = tokens?.accessToken ?? '';
@@ -8315,11 +8478,11 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   const orderCountLabel = productType === 'BUNDLE' ? '套餐订单' : '机票订单';
 
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 p-4">
+    <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="批量创单" tabIndex={-1} className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 p-4">
       <div className="my-8 w-full max-w-3xl rounded-xl bg-white shadow-xl">
         <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3">
           <h2 className="text-lg font-semibold text-slate-900">批量创单（散客 · 每位乘客一单）</h2>
-          <button className="btn-ghost px-2 py-1" onClick={onClose}><Icon name="close" /></button>
+          <button className="btn-ghost px-2 py-1" onClick={onClose} aria-label="关闭批量创单"><Icon name="close" /></button>
         </div>
 
         {result ? (
@@ -8910,7 +9073,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                                   className="btn-ghost-danger px-1 py-0.5 text-[10px]"
                                   onClick={() => setRow(i, { passportPhotoUrl: undefined, ocrPct: null, ocrStage: undefined, ocrEngine: null, ocrModel: null, ocrFailed: false, reviewFields: undefined, mrzValid: null, localOcrCaveat: false })}
                                   title="移除图片"
-                                ><Icon name="close" /></button>
+                                aria-label="移除护照图片"><Icon name="close" /></button>
                               </div>
                               {r.ocrEngine === 'ai' && (
                                 <span className="block max-w-full truncate rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium leading-tight text-emerald-700 ring-1 ring-emerald-200" title={r.ocrModel ? `AI识别 · ${r.ocrModel}` : 'AI识别'}>
@@ -8939,7 +9102,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                           )}
                         </td>
                         <td className="px-2 py-1 text-right align-top">
-                          <button className="btn-ghost-danger px-1 py-0.5 text-xs" onClick={() => removeRow(i)} disabled={rows.length <= 1}><Icon name="trash" /></button>
+                          <button className="btn-ghost-danger px-1 py-0.5 text-xs" onClick={() => removeRow(i)} disabled={rows.length <= 1} aria-label={`删除第 ${i + 1} 位乘客`}><Icon name="trash" /></button>
                         </td>
                       </tr>
                       {reviewHint && (
@@ -9295,6 +9458,10 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   );
 }
 
+// 超收硬闸拦截的错误文案片段（与 payments.service.ts 的 BadRequestError 原文一致）。
+// 命中即说明这不是普通失败，而是「钱是真收到了，只是不能记进这张单」——就地给挂账池登记出口。
+const OVERPAY_GATE_HINT = '超出部分请在收款对账台登记挂账池';
+
 // ── 确认收款（线下收款 → 标记已付 + 上传截图）────────────────────────
 function ConfirmPaymentSection({
   orderId,
@@ -9315,6 +9482,8 @@ function ConfirmPaymentSection({
 }) {
   const tokens = useAuth((s) => s.tokens);
   const token = tokens?.accessToken ?? '';
+  const askConfirm = useConfirm();
+  const highRiskConfirmRef = useRef(false);
   const [payments, setPayments] = useState<OrderPayment[]>([]);
   const [paid, setPaid] = useState(paidAmount);
   // 预存抵扣本地副本（与 paid 同步随详情刷新更新）——尾款口径必须含它。
@@ -9331,6 +9500,9 @@ function ConfirmPaymentSection({
   const [note, setNote] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // 超收硬闸拦下这笔收款时，就地把它登记进挂账池（不绕闸，只是省得跳去对账台重录）。
+  const [poolSubmitting, setPoolSubmitting] = useState(false);
+  const [poolMsg, setPoolMsg] = useState<string | null>(null);
   // 收款复核锁：财务/出纳对账无误后锁定本单收款；锁定态隐藏录款表单并禁止再录。
   const [paymentsLocked, setPaymentsLocked] = useState(false);
   const [lockBusy, setLockBusy] = useState(false);
@@ -9426,13 +9598,14 @@ function ConfirmPaymentSection({
   const [idemKey, setIdemKey] = useState(makeIdemKey);
 
   async function confirm(confirmDuplicate = false): Promise<void> {
-    if (!token || submitting) return;
+    if (!token || submitting || (highRiskConfirmRef.current && !confirmDuplicate)) return;
     // 锁定态兜底（表单已隐藏，这里再挡一次，防误触）：锁定后不许录新收款。
     if (paymentsLocked) {
       setErr('收款已锁定（财务复核完成），请先解锁再录收款');
       return;
     }
     setErr(null);
+    setPoolMsg(null);
     const amt = amount ?? undefined;
     if (amt !== undefined && (!Number.isFinite(amt) || amt <= 0)) {
       setErr('金额需为正数');
@@ -9462,15 +9635,60 @@ function ConfirmPaymentSection({
       const dup = duplicateAmountDetails(e);
       if (dup && !confirmDuplicate) {
         setSubmitting(false);
-        const okToProceed = window.confirm(
-          `该订单 ${dup.windowMinutes} 分钟内已录过一笔 ¥${dup.amount.toLocaleString()}，确定这是另一笔新收款吗？`,
-        );
+        if (highRiskConfirmRef.current) return;
+        highRiskConfirmRef.current = true;
+        const okToProceed = await askConfirm({
+          title: '重复收款确认',
+          body: `该订单 ${dup.windowMinutes} 分钟内已录过一笔 ¥${dup.amount.toLocaleString()}，确定这是另一笔新收款吗？`,
+          tone: 'danger',
+        });
         if (okToProceed) await confirm(true);
+        highRiskConfirmRef.current = false;
         return;
       }
       setErr(e instanceof ApiError ? e.message : '确认收款失败');
     } finally {
       setSubmitting(false);
+    }
+  }
+
+  // 就地把「被超收硬闸拦下的这笔收款」登记进挂账池：闸不拆，只是省得离开订单页去对账台重录。
+  // 金额按用户填的全额登记（不拆分应收/超出部分）——这笔钱本来就要记账，闸只是不让它算进这张单，
+  // 具体怎么分由财务在对账台认领时决定。登记后仍是 OPEN 进账、仍要财务认领才算数，不代表本单已收到钱。
+  async function registerOverpayToPool(): Promise<void> {
+    if (!token || poolSubmitting) return;
+    const amt = amount;
+    if (amt === null || !Number.isFinite(amt) || amt <= 0) {
+      setErr('金额需为正数');
+      return;
+    }
+    setPoolSubmitting(true);
+    try {
+      await api.createReceipt(token, {
+        amountCny: amt,
+        method,
+        proofUrl: proofUrl ?? undefined,
+        payerNote: note.trim() || `订单收款超收转入挂账池（关联订单 ${orderId}）`,
+        orderHintId: orderId,
+      });
+      setErr(null);
+      setPoolMsg(
+        `已把 ¥${amt.toLocaleString()} 登记到挂账池，这笔钱还没算作本单已付——要等财务在「收款对账台」认领后才会入账。`,
+      );
+      setAmount(null);
+      setProofUrl(null);
+      setNote('');
+      // 挂账池疑似本单待认领提示：登记完立刻刷新，让这笔新登记马上可见（失败静默，不影响主流程）。
+      try {
+        const r = await api.listReceipts(token, { orderHintId: orderId, unallocatedOnly: '1' });
+        setPendingReceipts(r.receipts);
+      } catch {
+        /* 只读提示，拉取失败不影响登记结果 */
+      }
+    } catch (e: unknown) {
+      setErr(e instanceof ApiError ? e.message : '登记挂账池失败');
+    } finally {
+      setPoolSubmitting(false);
     }
   }
 
@@ -9574,9 +9792,17 @@ function ConfirmPaymentSection({
   // 订单回到刚好结清。散客 / 代理订单都可用（与「存入代理余额」区别：钱进对账台待认领，
   // 不绑定某个代理）。
   async function moveToPool(): Promise<void> {
-    if (!token || submitting) return;
-    if (!window.confirm(`确认把多付的 ¥${Math.abs(balance).toLocaleString()} 转入挂账池？转入后订单回到刚好结清，这笔钱将在收款对账台待认领。`))
+    if (!token || submitting || highRiskConfirmRef.current) return;
+    highRiskConfirmRef.current = true;
+    const ok = await askConfirm({
+      title: `确认把多付的 ¥${Math.abs(balance).toLocaleString()} 转入挂账池？`,
+      body: '转入后订单回到刚好结清，这笔钱将在收款对账台待认领。',
+      tone: 'danger',
+    });
+    if (!ok) {
+      highRiskConfirmRef.current = false;
       return;
+    }
     setErr(null);
     setSubmitting(true);
     try {
@@ -9587,6 +9813,7 @@ function ConfirmPaymentSection({
       setErr(e instanceof ApiError ? e.message : '转挂账池失败');
     } finally {
       setSubmitting(false);
+      highRiskConfirmRef.current = false;
     }
   }
 
@@ -9813,7 +10040,26 @@ function ConfirmPaymentSection({
             <p className="text-xs text-slate-400">已结清；如需追加收款（多付）可继续录入。</p>
           )}
           <div className="space-y-2">
-            {err && <div className="rounded bg-rose-50 px-2 py-1 text-xs text-rose-700">{err}</div>}
+            {err && (
+              <div className="rounded bg-rose-50 px-2 py-1 text-xs text-rose-700">
+                {err}
+                {err.includes(OVERPAY_GATE_HINT) && amount !== null && amount > 0 && (
+                  <div className="mt-1.5">
+                    <button
+                      type="button"
+                      className="btn-secondary text-xs px-2 py-1 disabled:opacity-50"
+                      onClick={() => void registerOverpayToPool()}
+                      disabled={poolSubmitting}
+                    >
+                      {poolSubmitting ? '登记中…' : `把这 ¥${amount.toLocaleString()} 登记到挂账池`}
+                    </button>
+                  </div>
+                )}
+              </div>
+            )}
+            {poolMsg && (
+              <div className="rounded bg-emerald-50 px-2 py-1 text-xs text-emerald-700">{poolMsg}</div>
+            )}
             <div className="flex gap-2">
               <label className="flex-1 text-xs text-slate-500">
                 收款金额
@@ -9855,7 +10101,7 @@ function ConfirmPaymentSection({
               <button
                 className="btn-primary text-sm disabled:opacity-50"
                 onClick={() => confirm()}
-                disabled={submitting}
+                disabled={submitting || poolSubmitting}
               >
                 {submitting ? '确认中…' : '确认收款'}
               </button>
@@ -9938,6 +10184,7 @@ function BatchPayModal({
   onClose: () => void;
   onDone: (succeededIds: string[]) => void;
 }) {
+  const dialogRef = useDialogA11y(onClose);
   const tokens = useAuth((s) => s.tokens);
   const token = tokens?.accessToken ?? '';
 
@@ -10032,11 +10279,11 @@ function BatchPayModal({
   }, [results]);
 
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 p-4">
+    <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="批量到账" tabIndex={-1} className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 p-4">
       <div className="my-8 w-full max-w-3xl rounded-xl bg-white shadow-xl">
         <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3">
           <h2 className="text-lg font-semibold text-slate-900">批量到账（{rows.length} 笔订单）</h2>
-          <button className="btn-ghost px-2 py-1" onClick={onClose}><Icon name="close" /></button>
+          <button className="btn-ghost px-2 py-1" onClick={onClose} aria-label="关闭批量到账"><Icon name="close" /></button>
         </div>
 
         <div className="space-y-4 p-5">

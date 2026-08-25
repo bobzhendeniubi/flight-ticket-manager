@@ -29,6 +29,8 @@ import {
   randomStarTierLabel,
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { Icon } from './Icon';
+import { useDialogA11y } from './Modal';
 import { NumberInput } from './NumberInput';
 import { SearchSelect, type SearchSelectOption } from './SearchSelect';
 
@@ -79,6 +81,7 @@ function nightlyPriceLabel(basePrice: string): string {
 }
 
 export function HotelSwapModal({ orderId, item, locateHint, onClose, onSwapped }: HotelSwapModalProps) {
+  const dialogRef = useDialogA11y(onClose);
   const tokens = useAuth((s) => s.tokens);
   const token = tokens?.accessToken ?? '';
 
@@ -252,12 +255,12 @@ export function HotelSwapModal({ orderId, item, locateHint, onClose, onSwapped }
       : null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 p-4" onClick={onClose}>
+    <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="换酒店" tabIndex={-1} className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 p-4" onClick={onClose}>
       <div className="my-8 w-full max-w-lg rounded-xl bg-white shadow-xl" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3">
           <h2 className="text-base font-semibold text-ink">换酒店</h2>
-          <button type="button" className="text-slate-400 hover:text-slate-700" onClick={onClose}>
-            ✕
+          <button type="button" className="text-slate-400 hover:text-slate-700" onClick={onClose} aria-label="关闭换酒店">
+            <Icon name="close" />
           </button>
         </div>
 

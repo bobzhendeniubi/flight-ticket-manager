@@ -22,6 +22,8 @@ import {
 import { airportLabel, CABIN_LABEL, formatLocalDate, formatLocalTime } from '../lib/airports';
 import { useAuth } from '../stores/auth';
 import { NumberInput } from '../components/NumberInput';
+import { Icon } from '../components/Icon';
+import { useDialogA11y } from '../components/Modal';
 
 // 切位覆盖的舱位（与 CabinClass 一致；下拉展示全部四个舱等）
 const CABIN_OPTIONS: CabinClass[] = ['ECONOMY', 'PREMIUM_ECONOMY', 'BUSINESS', 'FIRST'];
@@ -285,7 +287,7 @@ export function SeatAllocationPage() {
           在补齐库存联动前禁止新建，避免运营依赖不成立的库存承诺。列表/回收仍可用于清理存量。 */}
       <section className="card border-amber-300 bg-amber-50">
         <p className="text-sm text-amber-800">
-          ⚠ <b>切位新建已暂停。</b>{' '}
+          <Icon name="alert" className="mr-1 inline-block align-text-bottom" /><b>切位新建已暂停。</b>{' '}
           当前切位<b>未接入公共库存</b>：切给代理的座位，散客在前台/下单时<b>仍可照常买走</b>
           （"专卖"并不真正独占）。为避免超卖，已暂停新建切位；已存在的切位<b>仅供查看与回收</b>，
           请勿依赖其余量数字。待库存联动补齐后再重新开放。
@@ -349,7 +351,7 @@ export function SeatAllocationPage() {
               disabled
               title="切位新建已暂停（未接入公共库存，切出的座散客仍可购买）"
             >
-              📦 批量切位
+              <Icon name="package" /> 批量切位
             </button>
             <button
               className="btn-primary text-sm"
@@ -468,7 +470,7 @@ export function SeatAllocationPage() {
                     </td>
                     <td className="text-right">
                       <button
-                        className="text-xs font-medium text-rose-600 hover:text-rose-700 disabled:text-ink-muted"
+                        className="btn-ghost-danger text-xs disabled:text-ink-muted"
                         onClick={() => recycle(a.id)}
                         disabled={!isActive || busy}
                         title={isActive ? '回收该切位，未售部分归还散客池' : '已回收'}
@@ -483,7 +485,7 @@ export function SeatAllocationPage() {
               {cabinRows.map((s) => (
                 <tr key={'pool-' + s.cabin} className="bg-emerald-50/40">
                   <td>
-                    <div className="font-medium text-emerald-700">📦 散客池</div>
+                    <div className="flex items-center gap-1 font-medium text-emerald-700"><Icon name="package" /> 散客池</div>
                     <div className="text-xs text-ink-muted">公共可售</div>
                   </td>
                   <td>
@@ -586,6 +588,7 @@ function NewAllocationForm({
   onCancel: () => void;
   onSubmit: (input: NewAllocationSubmit) => Promise<void>;
 }) {
+  const dialogRef = useDialogA11y(onCancel);
   const cabinChoices = Object.values(cabinSummary).map((c) => c.cabin);
   const [cabin, setCabin] = useState<CabinClass>(cabinChoices[0] ?? 'ECONOMY');
   const [agentId, setAgentId] = useState<string>(agents[0]?.id ?? '');
@@ -621,11 +624,11 @@ function NewAllocationForm({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" onClick={onCancel}>
+    <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="新建切位" tabIndex={-1} className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" onClick={onCancel}>
       <div className="w-full max-w-md rounded-lg bg-white shadow-xl" onClick={(e) => e.stopPropagation()}>
         <div className="border-b border-slate-200 px-5 py-3 flex items-center justify-between">
           <h2 className="text-lg font-semibold text-slate-900">新建切位</h2>
-          <button className="text-slate-400 hover:text-slate-700 text-xl" onClick={onCancel}>×</button>
+          <button className="btn-ghost px-2 py-1 text-xl" onClick={onCancel} aria-label="关闭新建切位"><Icon name="close" /></button>
         </div>
         <div className="px-5 py-4 space-y-4">
           <div className="rounded-md bg-slate-50 px-3 py-2 text-xs text-slate-600">
@@ -666,7 +669,7 @@ function NewAllocationForm({
               onChange={(n) => setSeats(n)}
             />
             {seatsNum > max && (
-              <p className="mt-1 text-xs text-red-600">⚠️ 必须 1 ≤ 切位数 ≤ {max}（散客池上限）</p>
+              <p className="mt-1 flex items-center gap-1 text-xs text-red-600"><Icon name="alert" />必须 1 ≤ 切位数 ≤ {max}（散客池上限）</p>
             )}
           </div>
           <div>
@@ -746,6 +749,7 @@ function BulkAllocationModal({
   onCancel: () => void;
   onApply: (plan: BulkRecordPlan[]) => Promise<{ created: number; failed: string[] }>;
 }) {
+  const dialogRef = useDialogA11y(onCancel);
   const [agentId, setAgentId] = useState<string>(agents[0]?.id ?? '');
   const [flightIds, setFlightIds] = useState<Set<string>>(() => new Set(flights.map((f) => f.id)));
   const todayStr = new Date().toISOString().slice(0, 10);
@@ -818,6 +822,11 @@ function BulkAllocationModal({
 
   return (
     <div
+      ref={dialogRef}
+      role="dialog"
+      aria-modal="true"
+      aria-label="批量切位"
+      tabIndex={-1}
       className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4"
       onClick={onCancel}
     >
@@ -826,10 +835,8 @@ function BulkAllocationModal({
         onClick={(e) => e.stopPropagation()}
       >
         <div className="sticky top-0 border-b border-slate-200 bg-white px-5 py-3 flex items-center justify-between">
-          <h2 className="text-lg font-semibold text-slate-900">📦 批量切位</h2>
-          <button className="text-slate-400 hover:text-slate-700 text-xl" onClick={onCancel}>
-            ×
-          </button>
+          <h2 className="flex items-center gap-1 text-lg font-semibold text-slate-900"><Icon name="package" /> 批量切位</h2>
+          <button className="btn-ghost px-2 py-1 text-xl" onClick={onCancel} aria-label="关闭批量切位"><Icon name="close" /></button>
         </div>
         <div className="px-5 py-4 space-y-4">
           {/* 代理 */}
@@ -1024,7 +1031,7 @@ function BulkAllocationModal({
               </div>
             )}
             {preview.plan.length === 0 && (
-              <div className="mt-1 text-xs text-amber-700">⚠️ 当前条件没有匹配到任何班次/舱位</div>
+              <div className="mt-1 flex items-center gap-1 text-xs text-amber-700"><Icon name="alert" />当前条件没有匹配到任何班次/舱位</div>
             )}
           </div>
 

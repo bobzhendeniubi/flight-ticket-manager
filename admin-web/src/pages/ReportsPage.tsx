@@ -18,24 +18,10 @@ import {
   type SalesReportDim,
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { Icon } from '../components/Icon';
+import { orderStatusBadgeClass, orderStatusLabel } from '../lib/orderStatus';
 
 type Tab = 'sales' | 'receivables' | 'agentDebts';
-
-const ORDER_STATUS_LABEL: Record<string, string> = {
-  DRAFT: '草稿',
-  PENDING_PAYMENT: '待支付',
-  PAID: '已支付',
-  PROCESSING: '处理中',
-  TICKETED: '出票完成',
-  COMPLETED: '已完成',
-  PAYMENT_TIMEOUT: '支付超时',
-  CANCELLED: '已取消',
-  REFUND_REQUESTED: '退款中',
-  REFUNDED: '已退款',
-  CHANGE_REQUESTED: '改期中',
-  CHANGED: '已改期',
-  FAILED: '失败',
-};
 
 const BUCKET_META: Record<ReceivablesBucket, { label: string; badge: string }> = {
   '0-7': { label: '0–7 天', badge: 'badge-info' },
@@ -342,7 +328,7 @@ function SalesTab({ token, range }: { token: string; range: { from: string; to: 
                           className="badge-warning"
                           title="部分成本未录入，毛利率偏高，仅供参考"
                         >
-                          ⚠︎缺{r.missingCostItemCount}项成本
+                          <Icon name="alert" /> 缺{r.missingCostItemCount}项成本
                         </span>
                       )}
                     </span>
@@ -375,7 +361,7 @@ function SalesTab({ token, range }: { token: string; range: { from: string; to: 
                     {fmtPct(report.totals.marginPct)}
                     {report.totals.missingCostItemCount > 0 && (
                       <span className="badge-warning">
-                        ⚠︎缺{report.totals.missingCostItemCount}项成本
+                        <Icon name="alert" /> 缺{report.totals.missingCostItemCount}项成本
                       </span>
                     )}
                   </span>
@@ -477,7 +463,7 @@ function ReceivablesTab({ token }: { token: string }) {
                 <td>{r.contactName}</td>
                 <td>{r.agentLabel}</td>
                 <td>
-                  <span className="badge-neutral">{ORDER_STATUS_LABEL[r.status] ?? r.status}</span>
+                  <span className={orderStatusBadgeClass(r.status)}>{orderStatusLabel(r.status)}</span>
                 </td>
                 <td className="nums text-right">{fmtCny(r.totalCny)}</td>
                 <td className="nums text-right">{fmtCny(r.paidCny)}</td>

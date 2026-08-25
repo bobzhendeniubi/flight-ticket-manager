@@ -6,7 +6,7 @@
  * 权限：仅 ADMIN/STAFF 看；AGENT 完全隐藏。
  * 后端契约见 admin-web/src/lib/api.ts 的对应方法。
  */
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   api,
   ApiError,
@@ -15,6 +15,8 @@ import {
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { NumberInput } from './NumberInput';
+import { Icon } from './Icon';
+import { useConfirm } from './ConfirmDialog';
 
 const CATEGORY_LABEL: Record<OrderCostCategory, string> = {
   GUIDE_SERVICE: '导游服务费',
@@ -182,7 +184,7 @@ function ExpectedAmountCard({
         <h3 className="text-sm font-semibold text-ink">预期到账金额</h3>
         {locked ? (
           <div className="text-right">
-            <span className="badge-warning">🔒 已锁定</span>
+            <span className="badge-warning"><Icon name="lock" /> 已锁定</span>
             <p className="mt-1 text-xs text-ink-muted">
               {isAdmin ? '可解锁或直接修改金额。' : '金额已锁定，解锁后可修改。'}
             </p>
@@ -226,7 +228,7 @@ function ExpectedAmountCard({
           disabled={lockToggling || loading}
           title={locked ? '解锁后可编辑金额' : '锁定后金额仅管理员可改'}
         >
-          {lockToggling ? '处理中…' : locked ? '🔓 解锁' : '🔒 锁定'}
+          {lockToggling ? '处理中…' : locked ? <><Icon name="unlock" /> 解锁</> : <><Icon name="lock" /> 锁定</>}
         </button>
 
         {ok && <span className="text-xs font-medium text-emerald-700">{ok}</span>}
@@ -244,7 +246,7 @@ function ExpectedAmountCard({
         </div>
       )}
       {amount != null && payableCny != null && Math.abs(amount - payableCny) < 0.01 && (
-        <p className="mt-2 text-xs text-emerald-700">✓ 与权威应付一致（¥{payableCny.toLocaleString()}）</p>
+        <p className="mt-2 inline-flex items-center gap-1 text-xs text-emerald-700"><Icon name="check" /> 与权威应付一致（¥{payableCny.toLocaleString()}）</p>
       )}
 
       <p className="mt-2 text-xs text-ink-muted">
@@ -272,6 +274,8 @@ function CostItemsCard({
   orderId: string;
   onChanged?: () => void;
 }) {
+  const confirm = useConfirm();
+  const confirmLockRef = useRef(false);
   const [items, setItems] = useState<OrderCostItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
@@ -378,8 +382,12 @@ function CostItemsCard({
   }
 
   async function removeItem(id: string) {
-    if (!token || deletingId) return;
-    if (!window.confirm('确认删除这条杂项成本？')) return;
+    if (!token || deletingId || confirmLockRef.current) return;
+    confirmLockRef.current = true;
+    if (!(await confirm({ title: '确认删除这条杂项成本？', tone: 'danger' }))) {
+      confirmLockRef.current = false;
+      return;
+    }
     setErr(null);
     setDeletingId(id);
     try {
@@ -390,6 +398,7 @@ function CostItemsCard({
       setErr(e instanceof ApiError ? e.message : '删除失败');
     } finally {
       setDeletingId(null);
+      confirmLockRef.current = false;
     }
   }
 
@@ -508,7 +517,7 @@ function CostItemsCard({
                           改
                         </button>
                         <button
-                          className="btn-ghost px-2.5 py-1 text-xs text-rose-700 hover:bg-rose-50 disabled:opacity-50"
+                          className="btn-ghost-danger px-2.5 py-1 text-xs disabled:opacity-50"
                           onClick={() => removeItem(it.id)}
                           disabled={Boolean(editingId) || deletingId === it.id}
                         >

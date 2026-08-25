@@ -26,6 +26,8 @@ import {
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { localYmd } from '../lib/airports';
+import { useConfirm } from '../components/ConfirmDialog';
+import { useDialogA11y } from '../components/Modal';
 
 // 任务级签证状态文案（派生自乘客送签进度）
 const VISA_STATUS_LABEL: Record<FulfillmentStatus, string> = {
@@ -179,6 +181,7 @@ function PassengerRow({
   onSaveVisaDates,
 }: PassengerRowProps) {
   const [enlarged, setEnlarged] = useState(false);
+  const dialogRef = useDialogA11y(() => setEnlarged(false), enlarged);
   const [editingVisaDates, setEditingVisaDates] = useState(false);
   const [visaDraft, setVisaDraft] = useState<PassengerVisaDates>({
     visaIssueDate: null,
@@ -415,6 +418,11 @@ function PassengerRow({
       {/* 护照大图查看 */}
       {enlarged && (
         <div
+          ref={dialogRef}
+          role="dialog"
+          aria-modal="true"
+          aria-label={`${displayName} 护照预览`}
+          tabIndex={-1}
           className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4"
           onClick={() => setEnlarged(false)}
         >
@@ -974,7 +982,7 @@ function OrderGroup({
             <div className="mt-0.5 text-[10px] text-amber-600">未保存</div>
           )}
           {noteSaved && !noteDirty && (
-            <div className="mt-0.5 text-[10px] text-emerald-600">✓ 已保存</div>
+            <div className="mt-0.5 text-[10px] text-emerald-600">已保存</div>
           )}
           {noteError && <div className="mt-0.5 text-[10px] text-rose-600">{noteError}</div>}
         </td>
@@ -1076,6 +1084,8 @@ function OrderGroup({
 
 // ── 主页面 ────────────────────────────────────────────────────────────────────
 export function VisaDeskPage() {
+  const confirm = useConfirm();
+  const confirmLockRef = useRef(false);
   const tokens = useAuth((s) => s.tokens);
   const token = tokens?.accessToken ?? '';
 
@@ -1353,12 +1363,16 @@ export function VisaDeskPage() {
       return;
     }
     const next = batchNote.trim();
-    if (
-      !window.confirm(
-        `将覆盖所选 ${selectedTaskIds.length} 单的现有备注为「${next || '（空）'}」？此操作不可撤销。`,
-      )
-    )
+    if (confirmLockRef.current) return;
+    confirmLockRef.current = true;
+    if (!(await confirm({
+      title: `将覆盖所选 ${selectedTaskIds.length} 单的现有备注为「${next || '（空）'}」？`,
+      body: '此操作不可撤销。',
+      tone: 'danger',
+    }))) {
+      confirmLockRef.current = false;
       return;
+    }
     setBatchNoteSubmitting(true);
     setBatchResult(null);
     try {
@@ -1370,6 +1384,7 @@ export function VisaDeskPage() {
       alert(e instanceof ApiError ? `批量备注失败：${e.message}` : '批量备注失败');
     } finally {
       setBatchNoteSubmitting(false);
+      confirmLockRef.current = false;
     }
   };
 
@@ -1412,10 +1427,10 @@ export function VisaDeskPage() {
       payload = { visaUnitCostUsd: null, visaFxRate: null, visaUnitCostCny: cnyNum };
       label = cnyNum != null ? `¥${cnyNum}/人` : '清空（回退产品成本）';
     }
-    if (
-      !window.confirm(`将所选 ${selectedTaskIds.length} 单的签证金额统一设为「${label}」？`)
-    )
-      return;
+    if (!(await confirm({
+      title: `将所选 ${selectedTaskIds.length} 单的签证金额统一设为「${label}」？`,
+      tone: label.includes('清空') ? 'danger' : 'default',
+    }))) return;
     setBatchCostSubmitting(true);
     setBatchResult(null);
     try {
@@ -1444,12 +1459,11 @@ export function VisaDeskPage() {
       return;
     }
     const next = batchSupplier.trim();
-    if (
-      !window.confirm(
-        `将所选 ${selectedTaskIds.length} 单的签证公司统一设为「${next || '（清空）'}」？金额不受影响。`,
-      )
-    )
-      return;
+    if (!(await confirm({
+      title: `将所选 ${selectedTaskIds.length} 单的签证公司统一设为「${next || '（清空）'}」？`,
+      body: '金额不受影响。',
+      tone: next ? 'default' : 'danger',
+    }))) return;
     setBatchSupplierSubmitting(true);
     setBatchResult(null);
     try {

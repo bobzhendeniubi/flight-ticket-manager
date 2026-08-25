@@ -15,7 +15,7 @@
  * 设计：Console 极简（靛蓝 Inter）；金额一律 NumberInput；变更前 confirm()；
  * 后端报错就地内联展示。
  */
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   api,
   ApiError,
@@ -32,6 +32,9 @@ import { NumberInput } from '../components/NumberInput';
 import { PaymentChannelsManager } from '../components/PaymentChannelsManager';
 import { ProofImageViewer } from '../components/ProofImageViewer';
 import { StatementReconciliation } from '../components/StatementReconciliation';
+import { Icon } from '../components/Icon';
+import { useConfirm } from '../components/ConfirmDialog';
+import { useDialogA11y } from '../components/Modal';
 
 // 收款方式选项（与订单收款一致）
 const METHOD_OPTIONS: PaymentMethod[] = ['WECHAT_PAY', 'ALIPAY', 'BANK_CARD', 'AGENT_PREPAYMENT'];
@@ -386,6 +389,8 @@ function ReceiptRow({
   token: string;
   onAfterMutation: () => void;
 }) {
+  const confirm = useConfirm();
+  const confirmLockRef = useRef(false);
   const [action, setAction] = useState<'none' | 'allocate' | 'refund'>('none');
   // 撤销认款：一次只撤一笔（reversingId = 正在撤的那条明细 id），错误/提示就地展示
   const [reversingId, setReversingId] = useState<string | null>(null);
@@ -400,16 +405,19 @@ function ReceiptRow({
    * 进账已退款 / 账目倒挂）原样展示，不改写成笼统文案。
    */
   async function reverse(a: Receipt['allocations'][number]): Promise<void> {
-    if (!token || reversingId) return;
+    if (!token || reversingId || confirmLockRef.current) return;
     const orderLabel = a.orderNumber ?? a.orderId.slice(0, 8);
-    if (
-      !window.confirm(
-        `确认撤销订单 ${orderLabel} 的这笔认款 ¥${Number(a.amountCny).toLocaleString()}？\n\n` +
-          `撤销后：该订单已付金额减回、这笔收款记录冲销，钱回到进账 ${receipt.receiptNo} 的剩余额里待重新认领。\n` +
-          '注意：订单状态、佣金与履约任务不会回退。',
-      )
-    )
+    confirmLockRef.current = true;
+    if (!(await confirm({
+      title: `确认撤销订单 ${orderLabel} 的这笔认款 ¥${Number(a.amountCny).toLocaleString()}？`,
+      body:
+        `撤销后：该订单已付金额减回、这笔收款记录冲销，钱回到进账 ${receipt.receiptNo} 的剩余额里待重新认领。\n` +
+        '注意：订单状态、佣金与履约任务不会回退。',
+      tone: 'danger',
+    }))) {
+      confirmLockRef.current = false;
       return;
+    }
     setReverseErr(null);
     setReverseWarning(null);
     setReversingId(a.id);
@@ -421,6 +429,7 @@ function ReceiptRow({
       setReverseErr(e instanceof ApiError ? e.message : '撤销认款失败');
     } finally {
       setReversingId(null);
+      confirmLockRef.current = false;
     }
   }
 
@@ -500,7 +509,7 @@ function ReceiptRow({
                   {receipt.status !== 'REFUNDED' && (
                     <button
                       type="button"
-                      className="btn-ghost px-1.5 py-0.5 text-xs text-rose-700 hover:bg-rose-50 disabled:opacity-50"
+                      className="btn-ghost-danger px-1.5 py-0.5 text-xs disabled:opacity-50"
                       disabled={reversingId !== null}
                       onClick={() => void reverse(a)}
                       title="撤销这笔认款：钱回到挂账池待重新认领"
@@ -691,7 +700,7 @@ function AllocateForm({
       </div>
       {matchedLabel && (
         <div className="rounded-md border border-emerald-200 bg-emerald-50 px-2 py-1 text-xs text-emerald-800">
-          ✓ {matchedLabel}
+          <Icon name="check" /> {matchedLabel}
         </div>
       )}
     </div>
@@ -712,6 +721,8 @@ function RefundForm({
   onDone: () => void;
   onCancel: () => void;
 }) {
+  const confirm = useConfirm();
+  const confirmLockRef = useRef(false);
   const [note, setNote] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -722,8 +733,16 @@ function RefundForm({
       setErr('请填写退款备注');
       return;
     }
-    if (submitting) return;
-    if (!window.confirm(`确认把剩余 ¥${remaining.toLocaleString()} 标记退款？退款后不可再认领。`)) return;
+    if (submitting || confirmLockRef.current) return;
+    confirmLockRef.current = true;
+    if (!(await confirm({
+      title: `确认把剩余 ¥${remaining.toLocaleString()} 标记退款？`,
+      body: '退款后不可再认领。',
+      tone: 'danger',
+    }))) {
+      confirmLockRef.current = false;
+      return;
+    }
     setErr(null);
     setSubmitting(true);
     try {
@@ -733,6 +752,7 @@ function RefundForm({
       setErr(e instanceof ApiError ? e.message : '退款失败');
     } finally {
       setSubmitting(false);
+      confirmLockRef.current = false;
     }
   }
 
@@ -834,6 +854,7 @@ function RegisterReceiptModal({
   onClose: () => void;
   onCreated: () => void;
 }) {
+  const dialogRef = useDialogA11y(onClose);
   const [amount, setAmount] = useState<number | null>(null);
   const [method, setMethod] = useState<PaymentMethod>('WECHAT_PAY');
   const [proofUrl, setProofUrl] = useState<string | null>(null);
@@ -882,7 +903,7 @@ function RegisterReceiptModal({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+    <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="登记新进账" tabIndex={-1} className="fixed inset-0 z-50 flex items-center justify-center p-4">
       <div className="absolute inset-0 bg-ink/40 animate-fade-in" onClick={onClose} aria-hidden />
       <div className="relative z-10 w-full max-w-lg rounded-xl bg-surface p-5 shadow-pop">
         <div className="flex items-start justify-between">
@@ -965,7 +986,7 @@ function RegisterReceiptModal({
             <span className="label">收款截图（≤6MB，选填）</span>
             <div className="mt-1 flex items-center gap-2">
               <label className="inline-flex cursor-pointer items-center gap-1 rounded-md border border-slate-300 px-2 py-1 text-xs text-ink-soft hover:bg-slate-50">
-                📷 上传图片
+                <Icon name="camera" /> 上传图片
                 <input type="file" accept="image/*" className="hidden" onChange={onFile} />
               </label>
               {proofUrl && (
@@ -977,7 +998,7 @@ function RegisterReceiptModal({
                   />
                   <button
                     type="button"
-                    className="text-xs text-rose-700 hover:underline"
+                    className="btn-ghost-danger text-xs"
                     onClick={() => setProofUrl(null)}
                   >
                     移除

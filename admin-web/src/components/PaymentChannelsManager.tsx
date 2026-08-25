@@ -8,7 +8,7 @@
  * 后端契约见 admin-web/src/lib/api.ts：listPaymentChannels / createPaymentChannel /
  * updatePaymentChannel / deletePaymentChannel（serializePaymentChannel 完整形态）。
  */
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import {
   api,
   ApiError,
@@ -20,8 +20,10 @@ import {
   type UpdatePaymentChannelWithAgentInput,
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { Icon } from './Icon';
 import { NumberInput } from './NumberInput';
 import { ProofImageViewer } from './ProofImageViewer';
+import { useConfirm } from './ConfirmDialog';
 
 const KIND_OPTIONS: PaymentChannelKind[] = ['WECHAT', 'ALIPAY', 'BANK'];
 
@@ -65,6 +67,8 @@ function channelToDraft(c: PaymentChannelWithAgent): ChannelDraft {
 }
 
 export function PaymentChannelsManager() {
+  const confirm = useConfirm();
+  const confirmLockRef = useRef(false);
   const tokens = useAuth((s) => s.tokens);
   const token = tokens?.accessToken ?? '';
 
@@ -179,8 +183,12 @@ export function PaymentChannelsManager() {
   }
 
   async function remove(c: PaymentChannelWithAgent) {
-    if (!token || deletingId) return;
-    if (!window.confirm(`确认删除收款渠道「${c.label}」？`)) return;
+    if (!token || deletingId || confirmLockRef.current) return;
+    confirmLockRef.current = true;
+    if (!(await confirm({ title: `确认删除收款渠道「${c.label}」？`, tone: 'danger' }))) {
+      confirmLockRef.current = false;
+      return;
+    }
     setErr(null);
     setDeletingId(c.id);
     try {
@@ -190,6 +198,7 @@ export function PaymentChannelsManager() {
       setErr(e instanceof ApiError ? e.message : '删除失败');
     } finally {
       setDeletingId(null);
+      confirmLockRef.current = false;
     }
   }
 
@@ -313,7 +322,7 @@ export function PaymentChannelsManager() {
                         </button>
                         <button
                           type="button"
-                          className="btn-ghost px-2.5 py-1 text-xs text-rose-700 hover:bg-rose-50 disabled:opacity-50"
+                          className="btn-ghost-danger px-2.5 py-1 text-xs disabled:opacity-50"
                           onClick={() => remove(c)}
                           disabled={editing !== null || deletingId === c.id}
                         >
@@ -432,7 +441,7 @@ function ChannelForm({
           <span className="label">收款码（图片 ≤6MB，选填）</span>
           <div className="mt-1 flex items-center gap-2">
             <label className="inline-flex cursor-pointer items-center gap-1 rounded-md border border-slate-300 px-2 py-1 text-xs text-ink-soft hover:bg-slate-50">
-              📷 上传图片
+              <Icon name="camera" /> 上传图片
               <input type="file" accept="image/*" className="hidden" onChange={onQrFile} />
             </label>
             {draft.qrImageUrl && (
@@ -444,7 +453,7 @@ function ChannelForm({
                 />
                 <button
                   type="button"
-                  className="text-xs text-rose-700 hover:underline"
+                  className="btn-ghost-danger text-xs"
                   onClick={() => setDraft((d) => ({ ...d, qrImageUrl: null }))}
                 >
                   移除

@@ -1,9 +1,12 @@
-import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
+import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, ApiError, type AdminFlight, type BaggagePolicyInput, type CabinClass, type FareBucket, type FlightBaggagePolicy } from '../lib/api';
 import { AIRPORT_OPTIONS, CABIN_LABEL, airportLabel, formatLocalDate, formatLocalTime, localToUtcIso, tzLabel } from '../lib/airports';
 import { useAuth } from '../stores/auth';
 import { useFlightSeats } from '../stores/flightSeats';
 import { NumberInput } from '../components/NumberInput';
+import { Icon } from '../components/Icon';
+import { useConfirm } from '../components/ConfirmDialog';
+import { useDialogA11y } from '../components/Modal';
 
 interface ScheduleSeat {
   id: string;
@@ -177,15 +180,15 @@ export function FlightsPage() {
                   className="btn-secondary text-sm"
                   onClick={() => setBaggageFor((prev) => (prev === f.id ? null : f.id))}
                 >
-                  🧳 行李规则
+                  <Icon name="luggage" /> 行李规则
                 </button>
                 <button
                   type="button"
-                  className="btn-secondary text-sm"
+                  className="btn-danger text-sm"
                   title="按出发日区间批量删除该航班班次（已售班次自动跳过）"
                   onClick={() => togglePanel(f.id, 'bulkDelete')}
                 >
-                  🗑️ 批量删除班次
+                  <Icon name="trash" /> 批量删除班次
                 </button>
                 {user.role === 'ADMIN' && (
                   <>
@@ -195,7 +198,7 @@ export function FlightsPage() {
                       title="设置升舱差价（¥/程/座）与商务舱价格联动经济舱"
                       onClick={() => togglePanel(f.id, 'businessLink')}
                     >
-                      💺 升舱/联动{f.businessPriceLinked ? '（已联动）' : ''}
+                      <Icon name="ticket" /> 升舱/联动{f.businessPriceLinked ? '（已联动）' : ''}
                     </button>
                     <button
                       type="button"
@@ -209,7 +212,7 @@ export function FlightsPage() {
                       className="btn-primary text-sm"
                       onClick={() => togglePanel(f.id, 'bulkAdd')}
                     >
-                      📅 批量加班次
+                      <Icon name="calendar" /> 批量加班次
                     </button>
                     <button
                       type="button"
@@ -530,7 +533,7 @@ function FareLadderEditor({
             />
             <button
               type="button"
-              className="text-rose-500 hover:text-rose-700 disabled:opacity-40"
+              className="btn-ghost-danger text-xs disabled:opacity-40"
               disabled={disabled}
               title="删除该档"
               onClick={() => removeRow(idx)}
@@ -684,14 +687,14 @@ function SchedulesList({
             className={`px-3 py-1 text-sm rounded transition-colors ${view === 'calendar' ? 'bg-brand text-white' : 'text-slate-600 hover:bg-slate-100'}`}
             onClick={() => setView('calendar')}
           >
-            📅 月历
+            <Icon name="calendar" /> 月历
           </button>
           <button
             type="button"
             className={`px-3 py-1 text-sm rounded transition-colors ${view === 'list' ? 'bg-brand text-white' : 'text-slate-600 hover:bg-slate-100'}`}
             onClick={() => setView('list')}
           >
-            📋 列表
+            <Icon name="list" /> 列表
           </button>
         </div>
         {canEdit && (
@@ -700,7 +703,7 @@ function SchedulesList({
             className="btn-secondary text-sm"
             onClick={() => setShowBulk((v) => !v)}
           >
-            {showBulk ? '收起批量操作' : '⚡ 批量改价 / 改时刻 / 仓位阶梯'}
+            {showBulk ? '收起批量操作' : <><Icon name="list" /> 批量改价 / 改时刻 / 仓位阶梯</>}
           </button>
         )}
       </div>
@@ -936,7 +939,7 @@ function SchedulesTable({
                         title="下载该班次的所有订单明细（xlsx，不含成本）"
                         onClick={() => onExport(s.id, departureDate)}
                       >
-                        {isExporting ? '导出中…' : '📋 导出整班订单'}
+                        {isExporting ? '导出中…' : <><Icon name="download" /> 导出整班订单</>}
                       </button>
                       <button
                         type="button"
@@ -945,7 +948,7 @@ function SchedulesTable({
                         title="导出该班次「全岗可用」名单（分人金额 + 票务/签证补列，xlsx）"
                         onClick={() => onExportFull(s.id, departureDate)}
                       >
-                        {exportingFull ? '导出中…' : '📋 导出整班·全岗'}
+                        {exportingFull ? '导出中…' : <><Icon name="download" /> 导出整班·全岗</>}
                       </button>
                     </div>
                   </td>
@@ -1027,8 +1030,9 @@ function MonthCalendar({
             setSelectedDay(null);
             setCursor(new Date(year, month - 1, 1));
           }}
+          aria-label="上个月"
         >
-          ◀
+          <Icon name="chevronLeft" />
         </button>
         <div className="text-center">
           <div className="text-base font-semibold text-ink">
@@ -1043,8 +1047,9 @@ function MonthCalendar({
             setSelectedDay(null);
             setCursor(new Date(year, month + 1, 1));
           }}
+          aria-label="下个月"
         >
-          ▶
+          <Icon name="chevronRight" />
         </button>
       </div>
 
@@ -1114,7 +1119,7 @@ function MonthCalendar({
                   )}
                   {allInactive && (
                     <span className="text-[10px] leading-none text-slate-400" title="当天所有班次均已下架">
-                      ✕
+                      <Icon name="close" />
                     </span>
                   )}
                   {daySchedules.length > 1 && (
@@ -1200,8 +1205,8 @@ function DayCellEditor({
     <section className="rounded-lg border border-brand/30 bg-slate-50 p-4">
       <div className="flex items-center justify-between">
         <h3 className="font-medium text-slate-900">{ymd} · {schedules.length} 个班次</h3>
-        <button type="button" className="text-slate-400 hover:text-slate-700 text-xl" onClick={onClose}>
-          ×
+        <button type="button" className="text-slate-400 hover:text-slate-700 text-xl" onClick={onClose} aria-label="关闭班次详情">
+          <Icon name="close" />
         </button>
       </div>
       <div className="mt-3 space-y-3">
@@ -1243,6 +1248,8 @@ function DaySchedule({
   onExportFull: (scheduleId: string, departureDate: string) => void;
 }) {
   const tokens = useAuth((s) => s.tokens);
+  const confirm = useConfirm();
+  const highRiskConfirmRef = useRef(false);
   const econ = getCabin(schedule, 'ECONOMY');
   const biz = getCabin(schedule, 'BUSINESS');
   // 商务舱价格联动经济舱：开启后商务舱 basePrice 不参与计价（派生 = 经济舱现价 + 航班升舱差价）。
@@ -1265,6 +1272,7 @@ function DaySchedule({
   const [timeSaving, setTimeSaving] = useState(false);
   const [timeErr, setTimeErr] = useState<string | null>(null);
   const [timeMsg, setTimeMsg] = useState<string | null>(null);
+  const timeDialogRef = useDialogA11y(() => setShowTimeEdit(false), showTimeEdit);
 
   // 该班次的总已售（任一舱位 sold>0 即视为"已有销售"，禁止删除）。
   const totalSold = (schedule.seatClasses ?? []).reduce((sum, c) => sum + c.sold, 0);
@@ -1299,15 +1307,23 @@ function DaySchedule({
     if (biz && bizCapacity != null && bizCapacity < biz.sold) {
       oversoldParts.push(`商务舱 ${bizCapacity} < 已售 ${biz.sold}（超售 ${biz.sold - bizCapacity}）`);
     }
-    if (
-      oversoldParts.length > 0 &&
-      !window.confirm(
-        `容量低于已售，保存后该班次将标记超售：\n${oversoldParts.join('\n')}\n\n` +
+    let oversoldConfirmHeld = false;
+    if (oversoldParts.length > 0) {
+      if (highRiskConfirmRef.current) return;
+      highRiskConfirmRef.current = true;
+      oversoldConfirmHeld = true;
+      const ok = await confirm({
+        title: '容量低于已售，保存后该班次将标记超售：',
+        body:
+          `${oversoldParts.join('\n')}\n\n` +
           '销售侧照旧不再卖出，但已售出的座位需要与航司 / 操作部协调（加座、改期或退改）。\n' +
           '超售张数超过系统设定上限时，保存会被拒绝（上限可调，用于防止手滑输错容量）。确认保存？',
-      )
-    ) {
-      return;
+        tone: 'danger',
+      });
+      if (!ok) {
+        highRiskConfirmRef.current = false;
+        return;
+      }
     }
     setSaving(true);
     setErr(null);
@@ -1338,6 +1354,7 @@ function DaySchedule({
       setErr(e instanceof ApiError ? e.message : '保存失败');
     } finally {
       setSaving(false);
+      if (oversoldConfirmHeld) highRiskConfirmRef.current = false;
     }
   };
 
@@ -1365,7 +1382,16 @@ function DaySchedule({
       return;
     }
     const depTime = formatLocalTime(schedule.departureTime, schedule.departureTz);
-    if (!confirm(`确认删除该班次（出发 ${depTime}）？此操作不可恢复。`)) return;
+    if (highRiskConfirmRef.current) return;
+    highRiskConfirmRef.current = true;
+    if (!(await confirm({
+      title: `确认删除该班次（出发 ${depTime}）？`,
+      body: '此操作不可恢复。',
+      tone: 'danger',
+    }))) {
+      highRiskConfirmRef.current = false;
+      return;
+    }
     setDeleting(true);
     setErr(null);
     setSavedMsg(null);
@@ -1377,6 +1403,7 @@ function DaySchedule({
       setErr(e instanceof ApiError ? e.message : '删除失败');
     } finally {
       setDeleting(false);
+      highRiskConfirmRef.current = false;
     }
   };
 
@@ -1467,7 +1494,18 @@ function DaySchedule({
       } catch (e) {
         // A11：已售班次改点被后端拦下（400 报文含影响面）→ 弹确认，确认后带标志重试。
         if (e instanceof ApiError && e.message.includes('已售') && e.message.includes('改时刻')) {
-          if (!window.confirm(`${e.message}\n\n确认仍要修改时刻？`)) {
+          if (highRiskConfirmRef.current) {
+            setTimeSaving(false);
+            return;
+          }
+          highRiskConfirmRef.current = true;
+          const ok = await confirm({
+            title: '已售班次改时刻确认',
+            body: `${e.message}\n\n确认仍要修改时刻？`,
+            tone: 'danger',
+          });
+          if (!ok) {
+            highRiskConfirmRef.current = false;
             setTimeSaving(false);
             return;
           }
@@ -1486,6 +1524,7 @@ function DaySchedule({
       setTimeErr(e instanceof ApiError ? e.message : '保存失败');
     } finally {
       setTimeSaving(false);
+      highRiskConfirmRef.current = false;
     }
   };
 
@@ -1503,7 +1542,7 @@ function DaySchedule({
           </span>
           <button
             type="button"
-            className="text-xs text-ink-muted underline-offset-2 hover:text-rose-600 hover:underline disabled:opacity-40"
+            className="btn-ghost-danger text-xs px-2 py-1 disabled:opacity-40"
             disabled={ladderBusy != null || !hasLadder(seat.fareBuckets)}
             title="清除阶梯，恢复自动定价"
             onClick={() => onClearLadder(cabin)}
@@ -1703,7 +1742,7 @@ function DaySchedule({
                 />
                 {bizLinked && !bizLinked.fallback && (
                   <p className="mt-0.5 text-[11px] text-indigo-700">
-                    已联动经济舱：现价 = 经济舱现价 + 升舱差价 ¥{flight.businessUpgradeCnyPerLeg}（在「💺 升舱/联动」里改）。
+                    已联动经济舱：现价 = 经济舱现价 + 升舱差价 ¥{flight.businessUpgradeCnyPerLeg}（在「升舱/联动」里改）。
                   </p>
                 )}
                 {bizLinked?.fallback && (
@@ -1764,7 +1803,7 @@ function DaySchedule({
           title="下载该班次的所有订单明细（xlsx，不含成本）"
           onClick={() => onExport(schedule.id, departureDate)}
         >
-          {isExporting ? '导出中…' : '📋 导出整班订单'}
+          {isExporting ? '导出中…' : <><Icon name="download" /> 导出整班订单</>}
         </button>
         <button
           type="button"
@@ -1773,18 +1812,18 @@ function DaySchedule({
           title="导出该班次「全岗可用」名单（分人金额 + 票务/签证补列，xlsx）"
           onClick={() => onExportFull(schedule.id, departureDate)}
         >
-          {exportingFull ? '导出中…' : '📋 导出整班·全岗'}
+          {exportingFull ? '导出中…' : <><Icon name="download" /> 导出整班·全岗</>}
         </button>
         {canEdit && (
           <>
             <button
               type="button"
-              className="btn-secondary text-xs text-rose-600 hover:bg-rose-50 disabled:text-slate-300 disabled:hover:bg-transparent"
+              className="btn-ghost-danger text-xs disabled:text-slate-300 disabled:hover:bg-transparent"
               title={totalSold > 0 ? '已有销售，不能删除（请用下架）' : '彻底删除该班次（不可恢复）'}
               disabled={deleting || totalSold > 0}
               onClick={onDelete}
             >
-              {deleting ? '删除中…' : '删除班次'}
+              {deleting ? '删除中…' : <><Icon name="trash" /> 删除班次</>}
             </button>
             <button
               type="button"
@@ -1812,7 +1851,7 @@ function DaySchedule({
 
       {/* 改时刻弹窗 */}
       {showTimeEdit && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+        <div ref={timeDialogRef} role="dialog" aria-modal="true" aria-label="修改班次时刻" tabIndex={-1} className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
           <div className="w-full max-w-sm rounded-lg bg-white p-5 shadow-xl">
             <h3 className="mb-4 text-sm font-semibold text-ink">修改班次时刻</h3>
             <div className="space-y-3">
@@ -1889,6 +1928,8 @@ function BulkEditPanel({
   onDone: () => Promise<void> | void;
 }) {
   const tokens = useAuth((s) => s.tokens);
+  const askConfirm = useConfirm();
+  const highRiskConfirmRef = useRef(false);
 
   function addDays(offset: number): string {
     const d = new Date();
@@ -2042,6 +2083,7 @@ function BulkEditPanel({
       }
     }
     // 改价撞上阶梯班次：先把"有多少个改不动"摆到运营面前，再让他决定要不要对其余的执行。
+    let confirmationBody: string;
     if (isPriceAction && priceSplit.ladder.length > 0) {
       if (priceSplit.fixed.length === 0) {
         setErrMsg(
@@ -2055,24 +2097,26 @@ function BulkEditPanel({
         .map((s) => localYmd(s.departureTime, s.departureTz))
         .join('、');
       const more = priceSplit.ladder.length > 5 ? ` 等 ${priceSplit.ladder.length} 个` : '';
-      if (
-        !confirm(
-          `命中 ${matched.length} 个班次，其中 ${priceSplit.ladder.length} 个在用仓位阶梯，` +
-            `本次改价对它们无效（阶梯班次请用「设置仓位阶梯」）。\n\n` +
-            `将跳过：${names}${more}\n\n` +
-            `要继续对其余 ${priceSplit.fixed.length} 个执行「${actionLabel()}」吗？`,
-        )
-      ) {
-        return;
-      }
-    } else if (!confirm(`将对 ${matched.length} 个班次执行：${actionLabel()}，确认？`)) {
+      confirmationBody =
+        `命中 ${matched.length} 个班次，其中 ${priceSplit.ladder.length} 个在用仓位阶梯，` +
+        `本次改价对它们无效（阶梯班次请用「设置仓位阶梯」）。\n\n` +
+        `将跳过：${names}${more}\n\n` +
+        `要继续对其余 ${priceSplit.fixed.length} 个执行「${actionLabel()}」吗？`;
+    } else {
+      confirmationBody = `将对 ${matched.length} 个班次执行：${actionLabel()}，确认？`;
+    }
+    if (highRiskConfirmRef.current) return;
+    highRiskConfirmRef.current = true;
+    if (!(await askConfirm({ title: '确认批量编辑班次？', body: confirmationBody, tone: 'danger' }))) {
+      highRiskConfirmRef.current = false;
       return;
     }
 
-    setErrMsg(null);
-    setResult(null);
-    setSubmitting(true);
-    setProgress({ done: 0, total: matched.length, errors: 0, skipped: 0 });
+    try {
+      setErrMsg(null);
+      setResult(null);
+      setSubmitting(true);
+      setProgress({ done: 0, total: matched.length, errors: 0, skipped: 0 });
 
     // ── 改时刻：走专用批量接口（服务端一次事务处理）。运营填的是当地钟点，
     //    后端按每个班次自己的时区折回 UTC，当地出发日不变。
@@ -2097,7 +2141,13 @@ function BulkEditPanel({
         } catch (e2) {
           // 已售闸：报文里带着影响面（几个班次、共几座）——原样摆给运营，确认后才重试
           if (e2 instanceof ApiError && e2.message.includes('已售')) {
-            if (!confirm(`${e2.message}\n\n确认仍要批量改时刻？`)) {
+            if (
+              !(await askConfirm({
+                title: '已售班次批量改时刻确认',
+                body: `${e2.message}\n\n确认仍要批量改时刻？`,
+                tone: 'danger',
+              }))
+            ) {
               setSubmitting(false);
               return;
             }
@@ -2220,14 +2270,17 @@ function BulkEditPanel({
     if (skippedNoCabin > 0) parts.push(`跳过 ${skippedNoCabin} 个（无所选舱位）`);
     if (errors > 0) parts.push(`失败 ${errors} 个（${lastError}）`);
     setResult(`${errors > 0 ? '⚠️' : '✅'} 完成：${parts.join(' · ')}`);
-    await onDone();
+      await onDone();
+    } finally {
+      highRiskConfirmRef.current = false;
+    }
   };
 
   return (
     <section className="rounded-lg border-2 border-brand/50 bg-brand/5 p-4">
       <div className="flex items-center justify-between">
         <h3 className="font-semibold text-slate-900">
-          ⚡ 批量操作 <span className="text-brand">{flightNumber}</span> 班次
+            <Icon name="list" /> 批量操作 <span className="text-brand">{flightNumber}</span> 班次
         </h3>
         <button type="button" className="text-slate-400 hover:text-slate-700 text-xl" onClick={onClose}>
           ×
@@ -2851,7 +2904,7 @@ function BulkScheduleForm({
   return (
     <section className="mt-4 rounded-lg border-2 border-brand/50 bg-brand/5 p-4">
       <h3 className="font-semibold text-slate-900">
-        📅 批量添加 <span className="text-brand">{flight.flightNumber}</span> 班次
+        <Icon name="calendar" /> 批量添加 <span className="text-brand">{flight.flightNumber}</span> 班次
       </h3>
       <p className="text-xs text-slate-500 mt-0.5">按日期范围 + 星期几，批量生成相同时刻的班次</p>
 
@@ -2944,6 +2997,8 @@ function BatchDeleteScheduleForm({
   onClose: () => void;
 }) {
   const tokens = useAuth((s) => s.tokens);
+  const confirm = useConfirm();
+  const highRiskConfirmRef = useRef(false);
 
   function addDays(offset: number): string {
     const d = new Date();
@@ -2968,12 +3023,15 @@ function BatchDeleteScheduleForm({
       setErr('结束日期不能早于开始日期');
       return;
     }
-    if (
-      !confirm(
-        `将删除 ${flight.flightNumber} 在 ${from} ~ ${to} 之间的未售班次（已售班次自动跳过），确认？`,
-      )
-    )
+    if (highRiskConfirmRef.current) return;
+    highRiskConfirmRef.current = true;
+    if (!(await confirm({
+      title: `将删除 ${flight.flightNumber} 在 ${from} ~ ${to} 之间的未售班次（已售班次自动跳过），确认？`,
+      tone: 'danger',
+    }))) {
+      highRiskConfirmRef.current = false;
       return;
+    }
 
     setSubmitting(true);
     setErr(null);
@@ -2990,6 +3048,7 @@ function BatchDeleteScheduleForm({
       setErr(error instanceof ApiError ? error.message : '批量删除失败');
     } finally {
       setSubmitting(false);
+      highRiskConfirmRef.current = false;
     }
   };
 
@@ -2997,7 +3056,7 @@ function BatchDeleteScheduleForm({
     <section className="mt-4 rounded-lg border-2 border-rose-300 bg-rose-50/60 p-4">
       <div className="flex items-center justify-between">
         <h3 className="font-semibold text-slate-900">
-          🗑️ 批量删除 <span className="text-brand">{flight.flightNumber}</span> 班次
+          <Icon name="trash" /> 批量删除 <span className="text-brand">{flight.flightNumber}</span> 班次
         </h3>
         <button type="button" className="text-slate-400 hover:text-slate-700 text-xl" onClick={onClose}>
           ×
@@ -3022,7 +3081,7 @@ function BatchDeleteScheduleForm({
         )}
         {result && (
           <div className="md:col-span-4 rounded-md border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700">
-            ✅ 完成：删除 {result.deleted} 班
+            完成：删除 {result.deleted} 班
             {result.skipped > 0 && ` · 跳过 ${result.skipped} 班（已售）`}
           </div>
         )}
@@ -3033,10 +3092,10 @@ function BatchDeleteScheduleForm({
           </button>
           <button
             type="submit"
-            className="btn-primary bg-rose-600 hover:bg-rose-700"
+            className="btn-danger"
             disabled={submitting}
           >
-            {submitting ? '删除中…' : '批量删除'}
+            {submitting ? '删除中…' : <><Icon name="trash" /> 批量删除</>}
           </button>
         </div>
       </form>
@@ -3125,7 +3184,7 @@ function BaggagePolicyEditor({ flight, onClose }: { flight: AdminFlight; onClose
     <section className="mt-4 rounded-lg border border-brand/30 bg-slate-50 p-4">
       <div className="flex items-center justify-between">
         <h3 className="font-medium text-slate-900">
-          🧳 <span className="text-brand">{flight.flightNumber}</span> 行李规则（按舱等配置；kg / 件数 / 手提可分别留空）
+          <Icon name="luggage" /> <span className="text-brand">{flight.flightNumber}</span> 行李规则（按舱等配置；kg / 件数 / 手提可分别留空）
         </h3>
         <button type="button" className="text-slate-400 hover:text-slate-700 text-xl" onClick={onClose}>×</button>
       </div>

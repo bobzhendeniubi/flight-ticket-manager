@@ -5,6 +5,8 @@ import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api, ApiError, ROSTER_FORMAT_LABEL, SETTLEMENT_MODE_LABEL, type AgentListItem, type CreateChildAgentInput, type CustomerSummary, type RosterFormat, type SettlementDiscountRule, type SettlementMode, type SettlementTier, type UpdateAgentInput } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { Icon } from '../components/Icon';
+import { useDialogA11y } from '../components/Modal';
 
 const TIER_LABEL = ['', '1级·总代', '2级·区代', '3级·门店', '4级', '5级'];
 const TIER_COLOR = ['', 'bg-red-100 text-red-700', 'bg-amber-100 text-amber-700', 'bg-blue-100 text-blue-700', 'bg-slate-100 text-slate-600', 'bg-slate-100 text-slate-600'];
@@ -391,6 +393,7 @@ function AgentDetailDrawer({
   onClose: () => void;
   onChanged: (updated: AgentListItem) => void | Promise<void>;
 }) {
+  const dialogRef = useDialogA11y(onClose);
   const user = useAuth((s) => s.user);
   const tokens = useAuth((s) => s.tokens);
   const [tab, setTab] = useState<'info' | 'commission' | 'balance' | 'customers'>('info');
@@ -420,7 +423,7 @@ function AgentDetailDrawer({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex justify-end bg-slate-900/50" onClick={onClose}>
+    <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="代理详情" tabIndex={-1} className="fixed inset-0 z-50 flex justify-end bg-slate-900/50" onClick={onClose}>
       <div className="h-full w-full max-w-lg overflow-auto bg-white shadow-xl" onClick={(e) => e.stopPropagation()}>
         <div className="sticky top-0 bg-white border-b border-slate-200 px-6 py-4">
           <div className="flex items-center justify-between">
@@ -615,7 +618,7 @@ function InfoTab({
       {canEdit && !editing && (
         <div className="flex justify-end">
           <button type="button" className="text-xs font-medium text-brand hover:text-brand-dark" onClick={startEdit}>
-            ✎ 编辑信息
+            <Icon name="edit" /> 编辑信息
           </button>
         </div>
       )}
@@ -693,7 +696,7 @@ function InfoTab({
           <Row label="上级" value={agent.parent ? (agent.parent.companyName ?? agent.parent.contactName) : '无（顶级）'} />
           <Row label="下级数" value={agent.childCount.toString()} />
           <Row label="订单数" value={agent.orderCount.toString()} />
-          <Row label="状态" value={agent.isActive ? '✅ 在用' : '⏸ 停用'} />
+          <Row label="状态" value={agent.isActive ? <><Icon name="check" /> 在用</> : <><Icon name="pause" /> 停用</>} />
           <Row label="注册时间" value={new Date(agent.createdAt).toLocaleString('zh-CN')} />
           <Row label="上次登录" value={agent.lastLoginAt ? new Date(agent.lastLoginAt).toLocaleString('zh-CN') : '从未登录'} />
           <Row label="名单格式" value={agent.rosterFormat ? ROSTER_FORMAT_LABEL[agent.rosterFormat] : '未登记'} />
@@ -742,7 +745,7 @@ function SettlementModeCard({
         <div>
           <div className="text-xs text-slate-500">结算方式</div>
           <div className={`mt-0.5 text-sm font-semibold ${isMonthly ? 'text-blue-700' : 'text-slate-700'}`}>
-            {isMonthly ? '🗓 月结' : '💳 逐单到账'}
+            {isMonthly ? <><Icon name="calendar" /> 月结</> : <><Icon name="wallet" /> 逐单到账</>}
           </div>
         </div>
         {isAdmin ? (
@@ -965,7 +968,7 @@ function CustomersTab({ agent }: { agent: AgentListItem }) {
   return (
     <div className="space-y-3">
       <div className="rounded-md bg-blue-50 border border-blue-200 px-3 py-2 text-xs text-blue-800">
-        💡 <strong>散客账号</strong>下单后可归属到此代理，散客购买时佣金归属此代理
+        <Icon name="info" className="mr-1 inline-block align-text-bottom" /><strong>散客账号</strong>下单后可归属到此代理，散客购买时佣金归属此代理
       </div>
 
       <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2.5 text-sm text-amber-800">
@@ -1066,9 +1069,9 @@ function AgentTreeNode({
             {!node.isActive && <span className="badge-neutral">已停用</span>}
           </div>
           <div className="mt-1 text-sm text-slate-600">
-            <span className="mr-3">👤 {node.contactName}</span>
-            <span className="mr-3">📞 {node.contactPhone}</span>
-            <span>📧 {node.email ?? '—'}</span>
+            <span className="mr-3 inline-flex items-center gap-1"><Icon name="user" /> {node.contactName}</span>
+            <span className="mr-3 inline-flex items-center gap-1"><Icon name="phone" /> {node.contactPhone}</span>
+            <span className="inline-flex items-center gap-1"><Icon name="mail" /> {node.email ?? '—'}</span>
           </div>
           <div className="mt-1 text-xs text-slate-500">
             下级 <strong className="text-indigo-600">{node.childCount}</strong> · 订单 <strong className="text-amber-600">{node.orderCount}</strong> · 余额 <strong className={Number(node.prepaymentBalance) < 1000 ? 'text-red-600' : 'text-green-700'}>¥{Number(node.prepaymentBalance).toLocaleString()}</strong>

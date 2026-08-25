@@ -4,10 +4,13 @@
  * 每个产品 kind 一条「默认」策略；客服可以加针对特定 entity 的覆盖（scope）。
  * 改完前台 GET /orders/:id/refund-quote 立即用新规则。
  */
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, ApiError, type CancellationPolicy, type CancellationTier, type ProductKind } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { NumberInput } from '../components/NumberInput';
+import { Icon } from '../components/Icon';
+import { useConfirm } from '../components/ConfirmDialog';
+import { useDialogA11y } from '../components/Modal';
 
 type DraftTier = { hoursBeforeDeparture: number | null; feePercent: number | null };
 const draftToTier = (t: DraftTier): CancellationTier => ({
@@ -29,6 +32,8 @@ const KIND_LABEL: Record<ProductKind, string> = {
 };
 
 export function CancellationPoliciesPage() {
+  const confirm = useConfirm();
+  const confirmLockRef = useRef(false);
   const tokens = useAuth((s) => s.tokens);
   const [policies, setPolicies] = useState<CancellationPolicy[]>([]);
   const [loading, setLoading] = useState(true);
@@ -62,7 +67,7 @@ export function CancellationPoliciesPage() {
     try {
       await api.updateCancellationPolicy(tokens.accessToken, id, body);
       await load();
-      flash('✓ 已保存（前台 /refund-quote 立即生效）');
+      flash('已保存（前台 /refund-quote 立即生效）');
       setEditingId(null);
     } catch (e) {
       alert(e instanceof ApiError ? e.message : '保存失败');
@@ -70,14 +75,20 @@ export function CancellationPoliciesPage() {
   };
 
   const remove = async (id: string, name: string) => {
-    if (!tokens) return;
-    if (!confirm(`确定删除「${name}」？`)) return;
+    if (!tokens || confirmLockRef.current) return;
+    confirmLockRef.current = true;
+    if (!(await confirm({ title: `确定删除「${name}」？`, tone: 'danger' }))) {
+      confirmLockRef.current = false;
+      return;
+    }
     try {
       await api.deleteCancellationPolicy(tokens.accessToken, id);
       await load();
       flash('已删除');
     } catch (e) {
       alert(e instanceof ApiError ? e.message : '删除失败');
+    } finally {
+      confirmLockRef.current = false;
     }
   };
 
@@ -133,7 +144,7 @@ export function CancellationPoliciesPage() {
               await api.createCancellationPolicy(tokens.accessToken, body);
               await load();
               setShowCreate(false);
-              flash('✓ 已创建');
+              flash('已创建');
             } catch (e) {
               alert(e instanceof ApiError ? e.message : '创建失败');
             }
@@ -271,7 +282,7 @@ function PolicyCard({
                 {editing && (
                   <td className="text-right">
                     <button
-                      className="text-xs text-rose-600 hover:underline"
+                      className="btn-ghost-danger text-xs"
                       onClick={() => setTiers((prev) => prev.filter((_, j) => j !== i))}
                     >
                       删除
@@ -316,7 +327,7 @@ function PolicyCard({
             </label>
           </>
         ) : (
-          policy.notes && <div>📝 {policy.notes}</div>
+          policy.notes && <div className="flex items-center gap-1"><Icon name="clipboard" /> {policy.notes}</div>
         )}
       </div>
 
@@ -350,6 +361,7 @@ function CreatePolicyModal({
   onCancel: () => void;
   onSubmit: (body: Record<string, unknown>) => void;
 }) {
+  const dialogRef = useDialogA11y(onCancel);
   const KIND_OPTIONS: ProductKind[] = ['FLIGHT', 'HOTEL', 'TRANSFER', 'VISA', 'BUNDLE'];
   const firstAvailable = KIND_OPTIONS.find((k) => !existingKinds.has(k)) ?? 'FLIGHT';
   const [productKind, setProductKind] = useState<ProductKind>(firstAvailable);
@@ -365,7 +377,7 @@ function CreatePolicyModal({
   const valid = name.trim().length > 0 && tiers.length > 0;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" onClick={onCancel}>
+    <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="新建取消策略" tabIndex={-1} className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" onClick={onCancel}>
       <div
         className="w-full max-w-lg max-h-[90vh] overflow-auto rounded-lg bg-white shadow-xl"
         onClick={(e) => e.stopPropagation()}
@@ -407,9 +419,9 @@ function CreatePolicyModal({
               placeholder="可选；填 scheduleId / hotelRoomTypeId 限定，不填即默认策略"
             />
             <p className="mt-1 text-xs text-slate-500">
-              {isOverride
-                ? '⚠ 这是一条覆盖策略，针对特定 entity 才生效'
-                : `⚠ 不填 = 该 ${KIND_LABEL[productKind]} 类型的兜底策略`}
+              <Icon name="alert" className="mr-1 inline-block align-text-bottom" />{isOverride
+                ? '这是一条覆盖策略，针对特定 entity 才生效'
+                : `不填 = 该 ${KIND_LABEL[productKind]} 类型的兜底策略`}
             </p>
           </div>
           <div>

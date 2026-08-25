@@ -4,6 +4,7 @@ import { useAuth } from '../stores/auth';
 import { api, ApiError, AUTH_REFRESH_UNAVAILABLE_CODE } from '../lib/api';
 import { ErrorBoundary } from './ErrorBoundary';
 import { Icon } from './Icon';
+import { useDialogA11y } from './Modal';
 
 const ROLE_LABEL: Record<string, string> = {
   STAFF: '运营',
@@ -63,6 +64,7 @@ export function Layout() {
   // 仅用于 <1024px 的侧栏抽屉开合（纯展示用的 chrome 状态）
   const [drawerOpen, setDrawerOpen] = useState(false);
   const closeDrawer = () => setDrawerOpen(false);
+  const drawerDialogRef = useDialogA11y(closeDrawer, drawerOpen);
 
   // 点击"当前所在页"的菜单项时 react-router 不会触发导航（路径未变），
   // 页面组件也就不会重挂、不会重新拉数。这里用一个自增 tick 强制 Outlet
@@ -225,7 +227,7 @@ export function Layout() {
 
       {/* ── 移动端：抽屉（<1024px） ───────────────────────────── */}
       {drawerOpen && (
-        <div className="fixed inset-0 z-50 lg:hidden">
+        <div ref={drawerDialogRef} role="dialog" aria-modal="true" aria-label="导航菜单" tabIndex={-1} className="fixed inset-0 z-50 lg:hidden">
           <div className="absolute inset-0 bg-ink/40 animate-fade-in" onClick={closeDrawer} aria-hidden />
           <div className="absolute inset-y-0 left-0 flex w-[232px] max-w-[80vw] flex-col bg-surface shadow-pop">
             <div className="flex h-14 items-center justify-between border-b border-slate-200 px-4">
@@ -236,7 +238,7 @@ export function Layout() {
                 className="flex h-8 w-8 items-center justify-center rounded-lg text-lg text-ink-muted transition hover:bg-slate-100 hover:text-ink"
                 aria-label="关闭菜单"
               >
-                ×
+                <Icon name="close" />
               </button>
             </div>
             {sidebarNav}

@@ -26,6 +26,9 @@ import {
   type StatementPreviewResult,
 } from '../lib/api';
 import { NumberInput } from './NumberInput';
+import { Icon } from './Icon';
+import { useConfirm } from './ConfirmDialog';
+import { useDialogA11y } from './Modal';
 
 // 金额相等判定容差（分位以下视为相等）
 const AMOUNT_EPS = 0.005;
@@ -82,6 +85,8 @@ interface StatementReconciliationProps {
 }
 
 export function StatementReconciliation({ token, onMutated }: StatementReconciliationProps) {
+  const askConfirm = useConfirm();
+  const allocationConfirmRef = useRef(false);
   const [receipts, setReceipts] = useState<Receipt[]>([]);
   const [candidates, setCandidates] = useState<ReceiptMatchCandidate[]>([]);
   const [loading, setLoading] = useState(true);
@@ -237,16 +242,20 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
 
   // ── 认款（拖放 / 点选 / 建议一键 共用入口；in-flight 期间拒绝二次提交）──
   async function allocate(receiptId: string, orderId: string, amount: number): Promise<void> {
-    if (allocating) return;
+    if (allocating || allocationConfirmRef.current) return;
     const receipt = openPool.find((r) => r.id === receiptId);
     const order = candidates.find((o) => o.orderId === orderId);
     if (!receipt || !order) return;
-    if (
-      !window.confirm(
-        `确认把流水 ${fmtCny(amount)}（${receipt.externalTxnId ? `流水号…${receipt.externalTxnId.slice(-8)}` : receipt.receiptNo}）认款到订单 ${order.orderNumber} · ${order.contactName}？`,
-      )
-    )
+    allocationConfirmRef.current = true;
+    const ok = await askConfirm({
+      title: '确认认款？',
+      body: `确认把流水 ${fmtCny(amount)}（${receipt.externalTxnId ? `流水号…${receipt.externalTxnId.slice(-8)}` : receipt.receiptNo}）认款到订单 ${order.orderNumber} · ${order.contactName}？`,
+      tone: 'danger',
+    });
+    if (!ok) {
+      allocationConfirmRef.current = false;
       return;
+    }
     setErr(null);
     setNotice(null);
     setAllocating(true);
@@ -261,6 +270,7 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
       setErr(e instanceof ApiError ? e.message : '认款失败');
     } finally {
       setAllocating(false);
+      allocationConfirmRef.current = false;
     }
   }
 
@@ -283,16 +293,20 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
   }
 
   async function runBatch(): Promise<void> {
-    if (allocating) return;
+    if (allocating || allocationConfirmRef.current) return;
     // 只认「当前建议里且被勾选」的组——过滤掉重载后已失效的旧勾选
     const chosen = suggestions.filter((s) => selectedSug.has(s.receipt.id));
     if (chosen.length === 0) return;
-    if (
-      !window.confirm(
-        `确认批量认款 ${chosen.length} 组？每组把整笔流水认款到金额一对一吻合的订单。`,
-      )
-    )
+    allocationConfirmRef.current = true;
+    const ok = await askConfirm({
+      title: '确认批量认款？',
+      body: `确认批量认款 ${chosen.length} 组？每组把整笔流水认款到金额一对一吻合的订单。`,
+      tone: 'danger',
+    });
+    if (!ok) {
+      allocationConfirmRef.current = false;
       return;
+    }
     setErr(null);
     setNotice(null);
     setAllocating(true);
@@ -318,6 +332,7 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
       setErr(e instanceof ApiError ? e.message : '批量认款失败');
     } finally {
       setAllocating(false);
+      allocationConfirmRef.current = false;
     }
   }
 
@@ -553,7 +568,7 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
             onClick={openPlatformPicker}
             disabled={parsing}
           >
-            📄 {parsing ? '解析中…' : '导入二维码流水'}
+            <Icon name="file" /> {parsing ? '解析中…' : '导入二维码流水'}
           </button>
           <input
             ref={fileInputRef}
@@ -609,7 +624,7 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
       )}
       {notice && (
         <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800">
-          ✓ {notice}
+          <Icon name="check" /> {notice}
         </div>
       )}
 
@@ -716,7 +731,7 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
           {loading ? (
             <div className="py-8 text-center text-xs text-ink-muted">加载中…</div>
           ) : pool.length === 0 ? (
-            <div className="py-8 text-center text-xs text-ink-muted">池子空了 · 全部认完 🎉</div>
+            <div className="flex items-center justify-center gap-1 py-8 text-center text-xs text-ink-muted">池子空了 · 全部认完 <Icon name="check" /></div>
           ) : (
             <div className="grid max-h-[36rem] gap-1.5 overflow-y-auto pr-1">
               {pool.map((r) => (
@@ -860,8 +875,9 @@ function StatementPlatformPickerModal({
   onChooseFile: () => void;
   onClose: () => void;
 }) {
+  const dialogRef = useDialogA11y(onClose);
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+    <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="选择流水平台" tabIndex={-1} className="fixed inset-0 z-50 flex items-center justify-center p-4">
       <div className="absolute inset-0 bg-ink/40 animate-fade-in" onClick={onClose} aria-hidden />
       <div className="relative z-10 w-full max-w-md rounded-xl bg-surface p-5 shadow-pop">
         <div className="flex items-start justify-between">
@@ -934,8 +950,9 @@ function ImportPreviewModal({
   onClose: () => void;
 }) {
   const { summary } = preview;
+  const dialogRef = useDialogA11y(onClose);
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+    <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="流水导入预览" tabIndex={-1} className="fixed inset-0 z-50 flex items-center justify-center p-4">
       <div className="absolute inset-0 bg-ink/40 animate-fade-in" onClick={onClose} aria-hidden />
       <div className="relative z-10 flex max-h-[85vh] w-full max-w-3xl flex-col rounded-xl bg-surface p-5 shadow-pop">
         <div className="flex items-start justify-between">
@@ -1014,7 +1031,7 @@ function ImportPreviewModal({
                           className="ml-1 rounded bg-rose-50 px-1.5 py-0.5 text-rose-700"
                           title="同一交易流水号，但金额与系统里已存在的进账不一致——请人工核对是平台改单还是表格被改过"
                         >
-                          ⚠ 金额冲突（库 ¥{Number(r.existing.amountCny).toFixed(2)}）
+                          <Icon name="alert" /> 金额冲突（库 ¥{Number(r.existing.amountCny).toFixed(2)}）
                         </span>
                       )}
                     </td>

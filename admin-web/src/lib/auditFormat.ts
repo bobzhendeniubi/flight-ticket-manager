@@ -6,56 +6,58 @@
  * 新增 payload 字段在 FIELD_DICT 加一行。
  */
 
+import type { IconName } from '../components/Icon';
+
 interface ActionEntry {
   label: string;
-  emoji: string;
+  icon: IconName;
 }
 
 const ACTION_DICT: Record<string, ActionEntry> = {
   // ── 订单 ──
-  CREATE_ORDER: { label: '下单', emoji: '🛒' },
-  ADVANCE_ORDER_STATUS: { label: '推进订单状态', emoji: '➡️' },
-  FORCE_ORDER_STATUS: { label: '强制改订单状态', emoji: '⚠️' },
-  BATCH_ADVANCE_ORDER_STATUS: { label: '批量推进订单状态', emoji: '➡️' },
-  BATCH_FORCE_ORDER_STATUS: { label: '批量强制改状态', emoji: '⚠️' },
-  REQUEST_CANCELLATION: { label: '申请取消订单', emoji: '✋' },
-  RESEND_ITINERARY: { label: '重发行程单', emoji: '📧' },
+  CREATE_ORDER: { label: '下单', icon: 'ticket' },
+  ADVANCE_ORDER_STATUS: { label: '推进订单状态', icon: 'refresh' },
+  FORCE_ORDER_STATUS: { label: '强制改订单状态', icon: 'alert' },
+  BATCH_ADVANCE_ORDER_STATUS: { label: '批量推进订单状态', icon: 'refresh' },
+  BATCH_FORCE_ORDER_STATUS: { label: '批量强制改状态', icon: 'alert' },
+  REQUEST_CANCELLATION: { label: '申请取消订单', icon: 'alert' },
+  RESEND_ITINERARY: { label: '重发行程单', icon: 'mail' },
 
   // ── 支付 ──
-  CREATE_PAYMENT: { label: '创建支付', emoji: '💳' },
-  PAYMENT_SUCCEEDED: { label: '支付成功', emoji: '✅' },
-  PAYMENT_CALLBACK_REJECTED: { label: '支付回调被拒', emoji: '🚫' },
-  MINIAPP_PREPAY: { label: '小程序预支付', emoji: '📱' },
+  CREATE_PAYMENT: { label: '创建支付', icon: 'wallet' },
+  PAYMENT_SUCCEEDED: { label: '支付成功', icon: 'check' },
+  PAYMENT_CALLBACK_REJECTED: { label: '支付回调被拒', icon: 'alert' },
+  MINIAPP_PREPAY: { label: '小程序预支付', icon: 'wallet' },
 
   // ── 履约 ──
-  REISSUE_FULFILLMENT_TASK: { label: '重新执行履约任务', emoji: '🔁' },
-  UPDATE_FULFILLMENT_TASK: { label: '更新履约任务', emoji: '🛠️' },
+  REISSUE_FULFILLMENT_TASK: { label: '重新执行履约任务', icon: 'refresh' },
+  UPDATE_FULFILLMENT_TASK: { label: '更新履约任务', icon: 'package' },
 
   // ── 结算 ──
-  ADVANCE_SETTLEMENT_STATUS: { label: '推进结算单状态', emoji: '💼' },
+  ADVANCE_SETTLEMENT_STATUS: { label: '推进结算单状态', icon: 'wallet' },
 
   // ── 代理 ──
-  CREATE_AGENT: { label: '创建代理', emoji: '🤝' },
-  UPDATE_AGENT: { label: '更新代理', emoji: '🤝' },
-  DELETE_AGENT: { label: '删除代理', emoji: '🗑️' },
+  CREATE_AGENT: { label: '创建代理', icon: 'handshake' },
+  UPDATE_AGENT: { label: '更新代理', icon: 'handshake' },
+  DELETE_AGENT: { label: '删除代理', icon: 'trash' },
 
   // ── 出行人 ──
-  CREATE_TRAVELER: { label: '创建出行人', emoji: '👤' },
-  UPDATE_TRAVELER: { label: '更新出行人', emoji: '👤' },
-  DELETE_TRAVELER: { label: '删除出行人', emoji: '🗑️' },
+  CREATE_TRAVELER: { label: '创建出行人', icon: 'user' },
+  UPDATE_TRAVELER: { label: '更新出行人', icon: 'user' },
+  DELETE_TRAVELER: { label: '删除出行人', icon: 'trash' },
 
   // ── 客户 ──
-  UPDATE_CUSTOMER: { label: '更新客户资料', emoji: '👥' },
+  UPDATE_CUSTOMER: { label: '更新客户资料', icon: 'users' },
 
   // ── 定价 ──
-  UPDATE_PRICING: { label: '更新定价规则', emoji: '💰' },
-  OVERRIDE_DATE_RANKING: { label: '覆盖日期等级', emoji: '📅' },
-  RESET_DATE_RANKING: { label: '重置日期等级', emoji: '↩️' },
+  UPDATE_PRICING: { label: '更新定价规则', icon: 'wallet' },
+  OVERRIDE_DATE_RANKING: { label: '覆盖日期等级', icon: 'calendar' },
+  RESET_DATE_RANKING: { label: '重置日期等级', icon: 'refresh' },
 
   // ── 退订政策 ──
-  CREATE_CANCELLATION_POLICY: { label: '新增退订政策', emoji: '📜' },
-  UPDATE_CANCELLATION_POLICY: { label: '更新退订政策', emoji: '📜' },
-  DELETE_CANCELLATION_POLICY: { label: '删除退订政策', emoji: '🗑️' },
+  CREATE_CANCELLATION_POLICY: { label: '新增退订政策', icon: 'clipboard' },
+  UPDATE_CANCELLATION_POLICY: { label: '更新退订政策', icon: 'clipboard' },
+  DELETE_CANCELLATION_POLICY: { label: '删除退订政策', icon: 'trash' },
 };
 
 /** 单字段 → 中文标签 */
@@ -142,7 +144,7 @@ export function formatAction(code: string): ActionEntry {
   if (hit) return hit;
   // 未登记的 action：把 SNAKE_CASE 转成 "Snake case" 兜底
   const fallback = code.toLowerCase().replace(/_/g, ' ');
-  return { label: fallback, emoji: '·' };
+  return { label: fallback, icon: 'info' };
 }
 
 /** 把任意标量值翻译成易读字符串 */

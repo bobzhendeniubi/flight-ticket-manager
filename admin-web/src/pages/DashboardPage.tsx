@@ -1,42 +1,15 @@
 import { useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
-import { api, ApiError, type DashboardKpi, type DashboardWeeklyPoint, type DashboardTopAgent, type OrderSummary } from '../lib/api';
+import { api, ApiError, type DashboardKpi, type DashboardWeeklyPoint, type DashboardTopAgent } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { RealtimeActivity } from '../components/RealtimeActivity';
 import { PendingAgingCard } from '../components/dashboard/PendingAgingCard';
-
-const STATUS_LABEL: Record<string, string> = {
-  DRAFT: '草稿',
-  PENDING_PAYMENT: '待支付',
-  PAID: '已支付',
-  PROCESSING: '处理中',
-  TICKETED: '出票完成',
-  COMPLETED: '已完成',
-  PAYMENT_TIMEOUT: '超时',
-  CANCELLED: '已取消',
-  REFUND_REQUESTED: '退款申请中',
-  REFUNDED: '已退款',
-  CHANGE_REQUESTED: '改期申请中',
-  CHANGED: '已改期',
-  FAILED: '出票失败',
-};
-const STATUS_COLOR: Record<string, string> = {
-  PENDING_PAYMENT: 'badge-warning',
-  PAID: 'badge-info',
-  PROCESSING: 'badge-info',
-  TICKETED: 'badge-success',
-  COMPLETED: 'badge-neutral',
-  CANCELLED: 'badge-neutral',
-  REFUND_REQUESTED: 'badge-danger',
-  REFUNDED: 'badge-danger',
-};
+import { WeeklyRevenueChart } from '../components/dashboard/WeeklyRevenueChart';
 
 export function DashboardPage() {
   const tokens = useAuth((s) => s.tokens);
   const [kpi, setKpi] = useState<DashboardKpi | null>(null);
   const [weekly, setWeekly] = useState<DashboardWeeklyPoint[]>([]);
   const [topAgents, setTopAgents] = useState<DashboardTopAgent[]>([]);
-  const [recent, setRecent] = useState<OrderSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -48,14 +21,12 @@ export function DashboardPage() {
       api.getDashboardKpi(tokens.accessToken),
       api.getDashboardWeekly(tokens.accessToken, 7),
       api.getDashboardTopAgents(tokens.accessToken),
-      api.listOrders(tokens.accessToken, { pageSize: 5 }),
     ])
-      .then(([k, w, t, o]) => {
+      .then(([k, w, t]) => {
         if (cancelled) return;
         setKpi(k.kpi);
         setWeekly(w.series);
         setTopAgents(t.agents);
-        setRecent(o.orders);
       })
       .catch((e) => {
         if (!cancelled) setError(e instanceof ApiError ? e.message : '加载失败');
@@ -63,8 +34,6 @@ export function DashboardPage() {
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
   }, [tokens?.accessToken]);
-
-  const maxRevenue = weekly.length > 0 ? Math.max(...weekly.map((d) => d.revenue), 1) : 1;
 
   return (
     <div className="space-y-6">
@@ -129,23 +98,8 @@ export function DashboardPage() {
               )}
             </span>
           </div>
-          <div className="mt-5 flex items-end gap-2 h-48">
-            {weekly.map((d) => (
-              <div key={d.date} className="flex-1 flex flex-col items-center gap-1">
-                <div className="nums text-xs text-ink-muted">
-                  {d.revenue > 0 ? `¥${(d.revenue / 1000).toFixed(0)}k` : '—'}
-                </div>
-                <div
-                  className="w-full rounded-t bg-brand/70 hover:bg-brand transition"
-                  style={{ height: `${Math.max(2, (d.revenue / maxRevenue) * 80)}%` }}
-                  title={`${d.date}  ¥${d.revenue.toLocaleString()}  (${d.orders} 单)`}
-                />
-                <div className="text-xs text-ink-soft">{d.date}</div>
-              </div>
-            ))}
-            {weekly.length === 0 && (
-              <div className="flex-1 text-center text-sm text-ink-muted">暂无数据</div>
-            )}
+          <div className="mt-5">
+            <WeeklyRevenueChart data={weekly} />
           </div>
         </div>
 
@@ -163,9 +117,16 @@ export function DashboardPage() {
                 <div key={a.agentId}>
                   <div className="flex justify-between text-sm">
                     <span className="truncate text-ink-soft">
-                      {i === 0 && '🥇 '}
-                      {i === 1 && '🥈 '}
-                      {i === 2 && '🥉 '}
+                      {i < 3 && (
+                        <span
+                          className={`mr-1 inline-flex h-5 w-5 items-center justify-center rounded-full border text-[10px] font-semibold ${
+                            i === 0 ? 'border-brand text-brand' : 'border-slate-300 text-slate-500'
+                          }`}
+                          aria-label={`第 ${i + 1} 名`}
+                        >
+                          {i + 1}
+                        </span>
+                      )}
                       {a.companyName ?? a.contactName}
                       <span className="ml-1 text-xs text-ink-muted">T{a.tier}</span>
                     </span>
@@ -183,58 +144,6 @@ export function DashboardPage() {
       </section>
 
       <RealtimeActivity />
-
-      <section className="card">
-        <div className="flex items-center justify-between">
-          <h2 className="text-sm font-semibold text-ink">最新订单</h2>
-          <Link to="/orders" className="text-sm font-medium text-brand hover:text-brand-dark">查看全部 →</Link>
-        </div>
-        <div className="mt-4 overflow-x-auto">
-          <table className="table-admin">
-            <thead>
-              <tr>
-                <th className="text-left">订单号</th>
-                <th className="text-left">客户</th>
-                <th className="text-left">内容</th>
-                <th className="text-right">金额</th>
-                <th className="text-center">状态</th>
-                <th className="text-left">时间</th>
-              </tr>
-            </thead>
-            <tbody>
-              {recent.map((o) => {
-                const summary = (o.items ?? []).map((it) => it.description).join(' + ');
-                return (
-                  <tr key={o.id}>
-                    <td className="font-mono text-xs text-ink-soft">{o.orderNumber}</td>
-                    <td className="text-ink">
-                      {o.user?.displayName ?? o.contactName}
-                      {o.agent && (
-                        <span className="badge-info ml-2">
-                          代理 · {o.agent.companyName ?? o.agent.contactName}
-                        </span>
-                      )}
-                    </td>
-                    <td className="max-w-xs truncate" title={summary}>{summary}</td>
-                    <td className="nums text-right font-medium text-ink">¥{Number(o.total).toLocaleString()}</td>
-                    <td className="text-center">
-                      <span className={STATUS_COLOR[o.status] ?? 'badge-neutral'}>
-                        {STATUS_LABEL[o.status] ?? o.status}
-                      </span>
-                    </td>
-                    <td className="text-xs text-ink-muted">
-                      {new Date(o.createdAt).toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })}
-                    </td>
-                  </tr>
-                );
-              })}
-              {!loading && recent.length === 0 && (
-                <tr><td colSpan={6} className="py-8 text-center text-ink-muted">暂无订单</td></tr>
-              )}
-            </tbody>
-          </table>
-        </div>
-      </section>
     </div>
   );
 }

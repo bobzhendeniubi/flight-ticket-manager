@@ -6,6 +6,7 @@ import { Fragment, useEffect, useState } from 'react';
 import type { FormEvent } from 'react';
 import { api, ApiError, type StaffRole, type StaffUser } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { Icon } from '../components/Icon';
 
 const STAFF_ROLE_LABEL: Record<StaffRole, string> = {
   VISA_DESK: '签证岗',
@@ -164,7 +165,7 @@ export function StaffRolesPage() {
       </section>
 
       {err && <div className="rounded bg-rose-50 px-3 py-2 text-sm text-rose-700">{err}</div>}
-      {ok && <div className="rounded bg-emerald-50 px-3 py-2 text-sm text-emerald-700">✅ {ok}</div>}
+      {ok && <div className="flex items-center gap-1 rounded bg-emerald-50 px-3 py-2 text-sm text-emerald-700"><Icon name="check" /> {ok}</div>}
       {resetSecret && (
         <div className="rounded border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
           本次临时密码（仅在此处展示，请立即转交本人）：<code className="ml-1 font-bold">{resetSecret}</code>

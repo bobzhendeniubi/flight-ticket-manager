@@ -35,6 +35,7 @@ import {
   type RoomGroup,
   type PriceAdjustmentReason,
   type QuoteOrderResult,
+  type SettlementTier,
   type Transfer,
   type TravelerProfileSuggestion,
   type Visa,
@@ -45,22 +46,24 @@ import {
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { NumberInput } from './NumberInput';
+import { Icon, type IconName } from './Icon';
 import { PassengerSuggestInput } from './PassengerSuggestInput';
 import { ProofImageViewer } from './ProofImageViewer';
 import { RoomingEditor, type RoomingPassenger } from './RoomingEditor';
 import { SearchSelect, type SearchSelectOption } from './SearchSelect';
+import { useDialogA11y } from './Modal';
 import { formatLocalTime } from '../lib/airports';
 import { composePassengerFullName, normalizePassengerFullName } from '../lib/passengerName';
 
 // ── 产品类型 ──────────────────────────────────────────────────────────
 type ProductKind = 'FLIGHT' | 'HOTEL' | 'VISA' | 'BUNDLE' | 'TRANSFER';
 
-const KIND_TABS: Array<{ kind: ProductKind; label: string; icon: string }> = [
-  { kind: 'FLIGHT', label: '机票', icon: '✈️' },
-  { kind: 'HOTEL', label: '酒店', icon: '🏨' },
-  { kind: 'VISA', label: '签证', icon: '🛂' },
-  { kind: 'BUNDLE', label: '套餐', icon: '🎁' },
-  { kind: 'TRANSFER', label: '接送', icon: '🚐' },
+const KIND_TABS: Array<{ kind: ProductKind; label: string; icon: IconName }> = [
+  { kind: 'FLIGHT', label: '机票', icon: 'plane' },
+  { kind: 'HOTEL', label: '酒店', icon: 'hotel' },
+  { kind: 'VISA', label: '签证', icon: 'visa' },
+  { kind: 'BUNDLE', label: '套餐', icon: 'gift' },
+  { kind: 'TRANSFER', label: '接送', icon: 'car' },
 ];
 
 const CABIN_ZH: Record<string, string> = {
@@ -68,6 +71,24 @@ const CABIN_ZH: Record<string, string> = {
   PREMIUM_ECONOMY: '超级经济舱',
   BUSINESS: '商务舱',
   FIRST: '头等舱',
+};
+
+// 结算价档次中文名（与 SettlementRatesPage / ProductsPage 同一份口径）。
+const SETTLEMENT_TIER_ZH: Record<SettlementTier, string> = {
+  CITY_3STAR: '市区三星',
+  CITY_4STAR: '市区四星',
+  CITY_5STAR: '市区五星',
+  INTL_5STAR: '国际五星',
+};
+
+// 结算价档次 → 对应星级（用于套餐「指定酒店」星级错配提醒）。
+// ⚠️ INTL_5STAR 与 CITY_5STAR 都对应 5 星——随机档只分 3/4/5 星，没有单独的「国际五星」随机档，
+// 这是已知口径缺口，这里按 5 星比对，不发明新档次。
+const SETTLEMENT_TIER_STAR: Record<SettlementTier, number> = {
+  CITY_3STAR: 3,
+  CITY_4STAR: 4,
+  CITY_5STAR: 5,
+  INTL_5STAR: 5,
 };
 
 // FLIGHT / BUNDLE / VISA 必须填出行人；纯 HOTEL / TRANSFER 出行人选填。
@@ -317,6 +338,7 @@ interface SingleOrderModalProps {
 
 export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) {
   const tokens = useAuth((s) => s.tokens);
+  const dialogRef = useDialogA11y(onClose);
   const user = useAuth((s) => s.user);
   const token = tokens?.accessToken ?? '';
   const recorderLabel = user?.displayName || user?.email || '当前账号';
@@ -587,6 +609,23 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   // 该签证产品配置的加急档位（未配 = 空数组 → 不显示加急下拉，行为与扩展前一致）。
   const visaExpressTiers = visa?.expressTiers ?? [];
   const bundle = bundles.find((b) => b.id === bundleId);
+
+  // 套餐「指定酒店」下拉分组：真实酒店 / 星级随机档占位酒店（randomTierPlaceholder != null）。
+  // 占位酒店不从列表里删——服务端显式支持指到占位酒店（房量闸走随机档聚合闸），删了会弄坏
+  // 存量落位流程；这里只做分组 + 选中时提醒，见下方 designatedHotelIsPlaceholder。
+  const bundleRealHotels = useMemo(() => hotels.filter((h) => h.randomTierPlaceholder == null), [hotels]);
+  const bundlePlaceholderHotels = useMemo(() => hotels.filter((h) => h.randomTierPlaceholder != null), [hotels]);
+  const designatedHotel = hotels.find((h) => h.id === designatedHotelId);
+  const designatedHotelIsPlaceholder = designatedHotel?.randomTierPlaceholder != null;
+  // 套餐结算档次对应的星级（CITY_3STAR→3 / CITY_4STAR→4 / CITY_5STAR→5 / INTL_5STAR→5）；
+  // 套餐不走结算价日历（settlementTier 为空）时为 null，不显示档次、也不比对星级。
+  const bundleSettlementStar = bundle?.settlementTier ? SETTLEMENT_TIER_STAR[bundle.settlementTier] : null;
+  // 指定了真实酒店（非占位）且星级与套餐档次不一致 → 非阻断提醒，不拦提交。
+  const designatedHotelStarMismatch =
+    !designatedHotelIsPlaceholder &&
+    designatedHotel != null &&
+    bundleSettlementStar != null &&
+    designatedHotel.starRating !== bundleSettlementStar;
 
   // 换签证产品 → 清掉上一个产品的加急档选择（各产品档位表不同，档名残留会被服务端拒单）。
   useEffect(() => {
@@ -1591,17 +1630,17 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const inputCls = 'mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm';
 
   return (
-    <div className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 p-4">
+    <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="录单" tabIndex={-1} className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 p-4">
       <div className="my-8 w-full max-w-3xl rounded-xl bg-white shadow-xl xl:max-w-[1400px]">
         <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3">
           <h2 className="text-lg font-semibold text-slate-900">录单（按产品类型 · 单笔）</h2>
-          <button className="text-slate-400 hover:text-slate-700" onClick={onClose}>✕</button>
+          <button className="btn-ghost px-2 py-1" onClick={onClose} aria-label="关闭录单弹窗"><Icon name="close" /></button>
         </div>
 
         {okOrderNumber ? (
           <div className="space-y-4 p-5">
             <div className="rounded-md bg-emerald-50 px-4 py-3 text-sm text-emerald-800">
-              ✓ 录单成功 · 订单号 <b className="font-mono">{okOrderNumber}</b>
+              <Icon name="check" size={14} /> 录单成功 · 订单号 <b className="font-mono">{okOrderNumber}</b>
               {roomingSaved && <span className="ml-2 text-emerald-700">· 分房已保存</span>}
             </div>
 
@@ -1673,7 +1712,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                     }`}
                     onClick={() => switchKind(t.kind)}
                   >
-                    {t.icon} {t.label}
+                    <Icon name={t.icon} /> {t.label}
                   </button>
                 ))}
               </div>
@@ -1960,7 +1999,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                           </div>
                         ) : (
                           <div className="text-[11px] text-rose-600">
-                            ⚠ {departDate} 没有匹配的去程班次（{BUNDLE_GO_ORIGIN}→{BUNDLE_GO_DEST}），请换日期或先建班次
+                            <Icon name="alert" /> {departDate} 没有匹配的去程班次（{BUNDLE_GO_ORIGIN}→{BUNDLE_GO_DEST}），请换日期或先建班次
                           </div>
                         )}
                         {/* 回程（仅往返套餐） */}
@@ -1999,7 +2038,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                               </div>
                             ) : (
                               <div className="text-[11px] text-rose-600">
-                                ⚠ 回程日期 {bundleLegs.returnDate} 没有匹配的回程班次（{BUNDLE_GO_DEST}→{BUNDLE_GO_ORIGIN}），请核对套餐晚数/排班
+                                <Icon name="alert" /> 回程日期 {bundleLegs.returnDate} 没有匹配的回程班次（{BUNDLE_GO_DEST}→{BUNDLE_GO_ORIGIN}），请核对套餐晚数/排班
                               </div>
                             )}
                           </>
@@ -2056,6 +2095,12 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                   </div>
                   {/* 指定酒店（0805）：不指定 = 随机（现状）；指定 → 占该店房 + 按该店配置的每人加价收 */}
                   <div className="grid grid-cols-2 gap-2 md:col-span-2">
+                    {bundle?.settlementTier && (
+                      <p className="col-span-2 text-[11px] text-slate-500">
+                        本套餐档次：{SETTLEMENT_TIER_ZH[bundle.settlementTier]}
+                        {bundle.settlementNights != null ? ` · ${bundle.settlementNights} 晚` : ''}
+                      </p>
+                    )}
                     <label className="text-xs text-slate-500">
                       酒店（不选 = 随机）
                       <select
@@ -2070,12 +2115,25 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                         }}
                       >
                         <option value="">随机（不指定酒店）</option>
-                        {hotels.map((h) => (
-                          <option key={h.id} value={h.id}>
-                            {h.name}（{'★'.repeat(h.starRating)}
-                            {h.designationSurchargeCnyPerPerson > 0 ? ` · 指定+¥${h.designationSurchargeCnyPerPerson}/人` : ''}）
-                          </option>
-                        ))}
+                        <optgroup label="具体酒店">
+                          {bundleRealHotels.map((h) => (
+                            <option key={h.id} value={h.id}>
+                              {h.name}（{'★'.repeat(h.starRating)}
+                              {h.designationSurchargeCnyPerPerson > 0 ? ` · 指定+¥${h.designationSurchargeCnyPerPerson}/人` : ''}）
+                            </option>
+                          ))}
+                        </optgroup>
+                        {/* 星级随机档占位记录（randomTierPlaceholder != null）：不是真酒店，不删/不 disabled——
+                            服务端显式支持指到占位酒店（房量闸走随机档聚合闸）；套餐要走随机档应把上面留空。 */}
+                        {bundlePlaceholderHotels.length > 0 && (
+                          <optgroup label="星级随机档占位（不是真实酒店，走随机档请留空）">
+                            {bundlePlaceholderHotels.map((h) => (
+                              <option key={h.id} value={h.id}>
+                                {h.name}（{'★'.repeat(h.starRating)} · 占位，非真实酒店）
+                              </option>
+                            ))}
+                          </optgroup>
+                        )}
                       </select>
                     </label>
                     {designatedHotelId && (
@@ -2101,6 +2159,16 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                         </p>
                       );
                     })()}
+                    {designatedHotelIsPlaceholder && (
+                      <p className="col-span-2 text-[11px] text-amber-600">
+                        「{designatedHotel?.name}」是星级随机档的占位记录，不是真实酒店，不会真的落到这家店。套餐要走随机档，请把上面的「酒店」清空（选「随机（不指定酒店）」）。
+                      </p>
+                    )}
+                    {designatedHotelStarMismatch && bundle?.settlementTier && (
+                      <p className="col-span-2 text-[11px] text-amber-600">
+                        「{designatedHotel?.name}」是{designatedHotel?.starRating}星，与本套餐档次「{SETTLEMENT_TIER_ZH[bundle.settlementTier]}」（{bundleSettlementStar}星）不一致，确认是否选错酒店。
+                      </p>
+                    )}
                   </div>
                   <p className="md:col-span-2 text-[11px] text-slate-400">
                     成人 + 儿童 + 婴儿都是出行人（都需护照，下方逐位填）。
@@ -2267,7 +2335,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                     disabled={bulkOcr !== null}
                     title={`一次多选护照照片自动识别，最多 ${MAX_PHOTO_PASSENGERS} 张/单`}
                   >
-                    {bulkOcr ? `识别中 ${bulkOcr.done}/${bulkOcr.total}…` : `📷 批量传护照（≤${MAX_PHOTO_PASSENGERS}）`}
+                    {bulkOcr ? `识别中 ${bulkOcr.done}/${bulkOcr.total}…` : <><Icon name="camera" /> 批量传护照（≤{MAX_PHOTO_PASSENGERS}）</>}
                   </button>
                   <button className="text-sm text-brand hover:text-brand-dark" onClick={addPassenger} type="button">＋ 加一位</button>
                 </div>
@@ -2511,10 +2579,10 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                                   />
                                   <button
                                     type="button"
-                                    className="text-[10px] text-slate-400 hover:text-rose-500"
+                                    className="btn-ghost-danger px-1 py-0.5 text-[10px]"
                                     onClick={() => setPassenger(i, { passportPhotoUrl: undefined, ocrPct: null, ocrStage: undefined, ocrEngine: null, ocrModel: null, ocrFailed: false, reviewFields: undefined, mrzValid: null, localOcrCaveat: false })}
                                     title="移除图片"
-                                  >✕</button>
+                                  ><Icon name="close" /></button>
                                 </div>
                                 {/* OCR 引擎标签：max-w-full + truncate，长模型名不撑宽列；完整名进 title */}
                                 {p.ocrEngine === 'ai' && (
@@ -2537,13 +2605,13 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                             )}
                           </td>
                           <td className="px-2 py-1 text-right align-top">
-                            <button className="text-xs text-slate-400 hover:text-rose-600" onClick={() => removePassenger(i)} disabled={passengers.length <= 1} type="button">删</button>
+                            <button className="btn-ghost-danger px-1 py-0.5 text-xs" onClick={() => removePassenger(i)} disabled={passengers.length <= 1} type="button" aria-label={`删除第 ${i + 1} 位乘客`}><Icon name="trash" /></button>
                           </td>
                         </tr>
                         {reviewHint && (
                           <tr className="border-t-0">
                             <td colSpan={passengerColCount} className={`${p.ocrFailed ? 'bg-rose-50 text-rose-700 ring-1 ring-inset ring-rose-200' : 'bg-amber-50 text-amber-700'} px-2 py-1 text-[11px]`}>
-                              ⚠️ {reviewHint}
+                              <Icon name="alert" /> {reviewHint}
                             </td>
                           </tr>
                         )}
@@ -2554,7 +2622,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                 </table>
               </div>
               <p className="mt-1 text-[11px] text-slate-400">
-                📷「批量传护照」可一次多选，自动逐张识别并生成出行人；护照图最多 {MAX_PHOTO_PASSENGERS} 张/单，超出请分单录入。识别有需人工核对的字段时会在对应行下方标黄提示。
+                <Icon name="camera" />「批量传护照」可一次多选，自动逐张识别并生成出行人；护照图最多 {MAX_PHOTO_PASSENGERS} 张/单，超出请分单录入。识别有需人工核对的字段时会在对应行下方标黄提示。
               </p>
               {!passengersRequired && (
                 <p className="mt-1 text-[11px] text-slate-400">纯酒店/接送可不填出行人；留空时系统用联系人占位一位出行人。</p>

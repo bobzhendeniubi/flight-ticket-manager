@@ -4,7 +4,7 @@
  * 数据源：`/products/{hotels,transfers,visas,bundles}` 真后端。
  * 所有 CRUD 操作真写入数据库。删除走软删除（isActive=false）。
  */
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   type MockHotel,
   type HotelRoomType,
@@ -16,8 +16,11 @@ import {
 import { api, ApiError, type Hotel, type Transfer as ApiTransfer, type Visa as ApiVisa, type VisaIssuanceMethod, type VisaEntryType, type VisaExpressTier, type Bundle as ApiBundle, type AdminFlight, type BundleFlightRef, type SettlementTier } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { NumberInput } from '../components/NumberInput';
+import { Icon } from '../components/Icon';
 import { BundleBlackoutEditor, type BlackoutDateRow } from '../components/BundleBlackoutEditor';
 import { SearchSelect, type SearchSelectOption } from '../components/SearchSelect';
+import { useConfirm } from '../components/ConfirmDialog';
+import { useDialogA11y } from '../components/Modal';
 
 // 0702 反馈 1：服务内容 / 单次最多停留天数 —— MockVisa/MockBundle（lib/mockData.ts）暂未声明这两个字段，
 // 用本页局部扩展类型承接，不改共享 mock 类型定义。0702 反馈 5：签证成本价同一批加进来，与 stayDays 挂同一个扩展类型。
@@ -75,11 +78,11 @@ type MockTransferWithCost = MockTransfer & { costPriceCny?: number | null };
 
 type Section = 'hotels' | 'transfers' | 'visas' | 'bundles';
 
-const SECTIONS: { key: Section; label: string; emoji: string }[] = [
-  { key: 'hotels', label: '酒店', emoji: '🏨' },
-  { key: 'transfers', label: '地面服务', emoji: '🚐' },
-  { key: 'visas', label: '签证', emoji: '🛂' },
-  { key: 'bundles', label: '套餐 / Bundle', emoji: '🎁' },
+const SECTIONS: { key: Section; label: string; icon: 'hotel' | 'car' | 'visa' | 'gift' }[] = [
+  { key: 'hotels', label: '酒店', icon: 'hotel' },
+  { key: 'transfers', label: '地面服务', icon: 'car' },
+  { key: 'visas', label: '签证', icon: 'visa' },
+  { key: 'bundles', label: '套餐 / Bundle', icon: 'gift' },
 ];
 
 /** 列表行只保留在售：软删除（isActive=false）后端仍会返回，前端需过滤掉，否则删了又被拉回。 */
@@ -717,7 +720,7 @@ export function ProductsPage() {
                   : 'border-transparent text-ink-soft hover:border-slate-300 hover:text-ink'
               }`}
             >
-              <span className="mr-1.5">{s.emoji}</span>
+              <Icon name={s.icon} className="mr-1.5" />
               {s.label}
               <span className={`ml-2 rounded-md px-1.5 py-0.5 text-xs nums ${isSel ? 'bg-brand-50 text-brand-700' : 'bg-slate-100 text-ink-muted'}`}>{count}</span>
             </button>
@@ -752,6 +755,7 @@ type FormMode<T> = { type: 'closed' } | { type: 'new' } | { type: 'edit'; item: 
 
 /** 新增/编辑表单的弹框外壳：遮罩层 + 居中卡片，点遮罩层或按 Esc 关闭；点表单内部不冒泡关闭。 */
 function FormModal({ onClose, children }: { onClose: () => void; children: React.ReactNode }) {
+  const dialogRef = useDialogA11y(onClose);
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') onClose();
@@ -760,7 +764,7 @@ function FormModal({ onClose, children }: { onClose: () => void; children: React
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [onClose]);
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/40 p-4 backdrop-blur-sm" onClick={onClose}>
+    <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="产品编辑" tabIndex={-1} className="fixed inset-0 z-50 flex items-center justify-center bg-ink/40 p-4 backdrop-blur-sm" onClick={onClose}>
       <div className="w-full max-w-2xl max-h-[90vh] overflow-auto" onClick={(e) => e.stopPropagation()}>
         {children}
       </div>
@@ -770,6 +774,8 @@ function FormModal({ onClose, children }: { onClose: () => void; children: React
 
 // ─── 酒店 ───────────────────────────────────────────────────────────
 function HotelsSection({ items, onChange }: { items: MockHotelWithCost[]; onChange: (v: MockHotelWithCost[]) => void }) {
+  const confirm = useConfirm();
+  const confirmLockRef = useRef(false);
   // 互斥：同一时刻只可能是「关闭」「新增」「编辑某一项」之一，从根上杜绝新增/编辑表单同时出现。
   const [mode, setMode] = useState<FormMode<MockHotelWithCost>>({ type: 'closed' });
   const closeModal = () => setMode({ type: 'closed' });
@@ -800,14 +806,14 @@ function HotelsSection({ items, onChange }: { items: MockHotelWithCost[]; onChan
           <div key={h.id} className="card transition hover:shadow-pop">
             <div className="font-mono text-xs text-ink-muted">编号 {h.code ?? '—'} <span className="font-sans not-italic text-ink-muted">(系统自动生成)</span></div>
             <div className="flex items-start justify-between">
-              <div className="text-3xl">{h.emoji}</div>
+              <div className="text-brand"><Icon name="hotel" size={28} /></div>
               <span className="badge-warning">
                 {'★'.repeat(h.stars)} {h.intlFiveStar ? '国际五星' : `${h.stars}星`}
               </span>
             </div>
             <h3 className="mt-2 font-semibold text-ink">{h.name}</h3>
             <p className="text-xs text-ink-muted">{h.nameEn}</p>
-            <p className="mt-1 text-xs text-ink-muted">📍 {h.area}</p>
+            <p className="mt-1 flex items-center gap-1 text-xs text-ink-muted"><Icon name="mapPin" size={14} /> {h.area}</p>
             <div className="mt-2 flex flex-wrap gap-1">
               {h.amenities.slice(0, 3).map((a) => (
                 <span key={a} className="badge-neutral">
@@ -823,10 +829,20 @@ function HotelsSection({ items, onChange }: { items: MockHotelWithCost[]; onChan
               <div className="flex gap-3 text-xs">
                 <button className="font-medium text-brand hover:text-brand-dark" onClick={() => setMode({ type: 'edit', item: h })}>编辑</button>
                 <button
-                  className="text-ink-muted hover:text-rose-600"
-                  onClick={() => { if (confirm(`删除 ${h.name}？`)) onChange(items.filter((x) => x.id !== h.id)); }}
+                  className="btn-ghost-danger text-xs"
+                  onClick={async () => {
+                    if (confirmLockRef.current) return;
+                    confirmLockRef.current = true;
+                    try {
+                      if (await confirm({ title: `删除 ${h.name}？`, tone: 'danger' })) {
+                        onChange(items.filter((x) => x.id !== h.id));
+                      }
+                    } finally {
+                      confirmLockRef.current = false;
+                    }
+                  }}
                 >
-                  删除
+                  <Icon name="trash" /> 删除
                 </button>
               </div>
             </div>
@@ -872,6 +888,8 @@ function NewHotelForm({
 
 // ─── 接送 ───────────────────────────────────────────────────────────
 function TransfersSection({ items, onChange }: { items: MockTransferWithCost[]; onChange: (v: MockTransferWithCost[]) => void }) {
+  const confirm = useConfirm();
+  const confirmLockRef = useRef(false);
   // 互斥：同一时刻只可能是「关闭」「新增」「编辑某一项」之一，从根上杜绝新增/编辑表单同时出现。
   const [mode, setMode] = useState<FormMode<MockTransferWithCost>>({ type: 'closed' });
   const closeModal = () => setMode({ type: 'closed' });
@@ -900,7 +918,7 @@ function TransfersSection({ items, onChange }: { items: MockTransferWithCost[]; 
       <div className="space-y-3">
         {items.map((t) => (
           <article key={t.id} className="card flex items-center gap-6 transition hover:shadow-pop">
-            <div className="text-4xl">{t.emoji}</div>
+            <div className="text-brand"><Icon name="car" size={32} /></div>
             <div className="flex-1 min-w-0">
               <div className="font-mono text-xs text-ink-muted">编号 {t.code ?? '—'} <span className="font-sans not-italic text-ink-muted">(系统自动生成)</span></div>
               <h3 className="font-semibold text-ink">{t.name}</h3>
@@ -915,10 +933,20 @@ function TransfersSection({ items, onChange }: { items: MockTransferWithCost[]; 
               <div className="mt-1 flex justify-end gap-3 text-xs">
                 <button className="font-medium text-brand hover:text-brand-dark" onClick={() => setMode({ type: 'edit', item: t })}>编辑</button>
                 <button
-                  className="text-ink-muted hover:text-rose-600"
-                  onClick={() => { if (confirm(`删除 ${t.name}？`)) onChange(items.filter((x) => x.id !== t.id)); }}
+                  className="btn-ghost-danger text-xs"
+                  onClick={async () => {
+                    if (confirmLockRef.current) return;
+                    confirmLockRef.current = true;
+                    try {
+                      if (await confirm({ title: `删除 ${t.name}？`, tone: 'danger' })) {
+                        onChange(items.filter((x) => x.id !== t.id));
+                      }
+                    } finally {
+                      confirmLockRef.current = false;
+                    }
+                  }}
                 >
-                  删除
+                  <Icon name="trash" /> 删除
                 </button>
               </div>
             </div>
@@ -931,6 +959,8 @@ function TransfersSection({ items, onChange }: { items: MockTransferWithCost[]; 
 
 // ─── 签证 ───────────────────────────────────────────────────────────
 function VisasSection({ items, onChange }: { items: MockVisaWithStayDays[]; onChange: (v: MockVisaWithStayDays[]) => void }) {
+  const confirm = useConfirm();
+  const confirmLockRef = useRef(false);
   // 互斥：同一时刻只可能是「关闭」「新增」「编辑某一项」之一，从根上杜绝新增/编辑表单同时出现。
   const [mode, setMode] = useState<FormMode<MockVisaWithStayDays>>({ type: 'closed' });
   const closeModal = () => setMode({ type: 'closed' });
@@ -961,7 +991,7 @@ function VisasSection({ items, onChange }: { items: MockVisaWithStayDays[]; onCh
           <div key={v.id} className="card transition hover:shadow-pop">
             <div className="font-mono text-xs text-ink-muted">编号 {v.code ?? '—'} <span className="font-sans not-italic text-ink-muted">(系统自动生成)</span></div>
             <div className="flex items-start justify-between">
-              <span className="text-4xl">{v.flag}</span>
+              <span className="text-brand"><Icon name="visa" size={32} /></span>
               <span className="badge-info">{v.processingDays} 天出签</span>
             </div>
             <h3 className="mt-2 font-semibold text-ink">
@@ -981,10 +1011,20 @@ function VisasSection({ items, onChange }: { items: MockVisaWithStayDays[]; onCh
               <div className="flex gap-3 text-xs">
                 <button className="font-medium text-brand hover:text-brand-dark" onClick={() => setMode({ type: 'edit', item: v })}>编辑</button>
                 <button
-                  className="text-ink-muted hover:text-rose-600"
-                  onClick={() => { if (confirm(`删除 ${v.country} · ${v.type}？`)) onChange(items.filter((x) => x.id !== v.id)); }}
+                  className="btn-ghost-danger text-xs"
+                  onClick={async () => {
+                    if (confirmLockRef.current) return;
+                    confirmLockRef.current = true;
+                    try {
+                      if (await confirm({ title: `删除 ${v.country} · ${v.type}？`, tone: 'danger' })) {
+                        onChange(items.filter((x) => x.id !== v.id));
+                      }
+                    } finally {
+                      confirmLockRef.current = false;
+                    }
+                  }}
                 >
-                  删除
+                  <Icon name="trash" /> 删除
                 </button>
               </div>
             </div>
@@ -1128,7 +1168,7 @@ function BundleCard({
       <div className="font-mono text-xs text-ink-muted">编号 {bundle.code ?? '—'} <span className="font-sans not-italic text-ink-muted">(系统自动生成)</span></div>
       <div className="flex items-start justify-between">
         <div className="flex items-start gap-3">
-          <span className="text-3xl">{bundle.emoji}</span>
+          <span className="text-brand"><Icon name="gift" size={28} /></span>
           <div>
             <h3 className="font-semibold text-ink">{bundle.name}</h3>
             <p className="text-xs text-ink-soft mt-0.5">{bundle.tagline}</p>
@@ -1174,7 +1214,7 @@ function BundleCard({
         // 机票往返口径拆开：去程(单程) + 回程(单程) = 来回×1，避免运营把来回价误当单程。
         <div className="mt-2 rounded-lg border border-sky-100 bg-sky-50/60 px-3 py-2 text-xs">
           <div className="flex items-center justify-between text-sky-800">
-            <span className="font-medium">✈️ 机票 往返 / 人</span>
+            <span className="flex items-center gap-1 font-medium"><Icon name="plane" /> 机票 往返 / 人</span>
             <span className="nums font-semibold">¥{flight.roundTrip.toLocaleString()}</span>
           </div>
           <div className="mt-1 flex items-center justify-between text-sky-700/90">
@@ -1186,14 +1226,14 @@ function BundleCard({
 
       {bundle.hotelRoomType && (
         <div className="mt-2 text-xs text-ink-soft">
-          🏨 关联酒店：{bundle.hotelRoomType.hotelName} · {bundle.hotelRoomType.name}
+          <Icon name="hotel" /> 关联酒店：{bundle.hotelRoomType.hotelName} · {bundle.hotelRoomType.name}
           {bundle.hotelNights ? `（${bundle.hotelNights} 晚）` : ''}
         </div>
       )}
 
       {(bundle.outboundFlight || bundle.returnFlight) && (
         <div className="mt-1 text-xs text-ink-soft">
-          ✈️
+          <Icon name="plane" />
           {bundle.outboundFlight && <> 去程 {flightRefLabel(bundle.outboundFlight)}</>}
           {bundle.outboundFlight && bundle.returnFlight && ' · '}
           {bundle.returnFlight && <> 回程 {flightRefLabel(bundle.returnFlight)}</>}
@@ -1209,19 +1249,19 @@ function BundleCard({
         <div className="mt-1 text-xs text-ink-soft">
           <span className="mr-1 rounded bg-slate-100 px-1 py-0.5 text-[10px] font-medium text-ink-muted">可选加项 · 不计入起价</span>
           {bundle.singleSupplementCnyPerNight != null && (
-            <>🛏️ 单房差 ¥{bundle.singleSupplementCnyPerNight.toLocaleString()}/晚</>
+            <><Icon name="hotel" /> 单房差 ¥{bundle.singleSupplementCnyPerNight.toLocaleString()}/晚</>
           )}
           {bundle.singleSupplementCnyPerNight != null &&
             (bundle.businessUpgradeCnyPerLeg == null || bundle.businessUpgradeCnyPerLeg > 0) &&
             ' · '}
           {bundle.businessUpgradeCnyPerLeg == null ? (
             // null = 跟随航班：升舱差价随绑定航班浮动，不写死在套餐上。
-            <>💺 升舱 跟随航班</>
+            <><Icon name="ticket" /> 升舱 跟随航班</>
           ) : (
             bundle.businessUpgradeCnyPerLeg > 0 && (
               // 只显示单价，不显示「× N 段」——任何乘法样式都会被读成「已计入价格」；
               // 按段合计只在买家真正选购升舱时（前台加购器/订单）出现。
-              <>💺 升舱 ¥{bundle.businessUpgradeCnyPerLeg.toLocaleString()}/程</>
+              <><Icon name="ticket" /> 升舱 ¥{bundle.businessUpgradeCnyPerLeg.toLocaleString()}/程</>
             )
           )}
         </div>
@@ -1231,15 +1271,15 @@ function BundleCard({
         <div className="mt-1 text-xs text-ink-soft">
           <span className="mr-1 rounded bg-slate-100 px-1 py-0.5 text-[10px] font-medium text-ink-muted">可选加项 · 不计入起价</span>
           {bundle.childSeatDiscountCnyPerPerson != null && (
-            <>🧒 占座儿童差价 −¥{bundle.childSeatDiscountCnyPerPerson.toLocaleString()}/人</>
+            <><Icon name="user" /> 占座儿童差价 −¥{bundle.childSeatDiscountCnyPerPerson.toLocaleString()}/人</>
           )}
           {bundle.childSeatDiscountCnyPerPerson != null && bundle.infantPriceCny != null && ' · '}
           {bundle.infantPriceCny != null && (
-            <>👶 婴儿价 ¥{bundle.infantPriceCny.toLocaleString()}/人</>
+            <><Icon name="user" /> 婴儿价 ¥{bundle.infantPriceCny.toLocaleString()}/人</>
           )}
           {(bundle.childSeatDiscountCnyPerPerson != null || bundle.infantPriceCny != null) && bundle.selfVisaDeductCny != null && bundle.selfVisaDeductCny > 0 && ' · '}
           {bundle.selfVisaDeductCny != null && bundle.selfVisaDeductCny > 0 && (
-            <>🛂 自备签证 −¥{bundle.selfVisaDeductCny.toLocaleString()}/单</>
+            <><Icon name="visa" /> 自备签证 −¥{bundle.selfVisaDeductCny.toLocaleString()}/单</>
           )}
         </div>
       )}
@@ -1278,8 +1318,8 @@ function BundleCard({
         <button className="font-medium text-ink-muted hover:text-brand" onClick={onToggle}>
           {bundle.active ? '停用' : '启用'}
         </button>
-        <button className="text-ink-muted hover:text-rose-600" onClick={onDelete}>
-          删除
+        <button className="btn-ghost-danger text-xs" onClick={onDelete}>
+          <Icon name="trash" /> 删除
         </button>
       </div>
     </article>
@@ -1310,6 +1350,7 @@ function NewBundleWizard({
   onCancel: () => void;
   onSubmit: (b: MockBundleWithServiceNotes) => void;
 }) {
+  const dialogRef = useDialogA11y(onCancel);
   const [name, setName] = useState(initial?.name ?? '');
   const [tagline, setTagline] = useState(initial?.tagline ?? '');
   // 服务内容（订单详情行程单「服务内容」板块用；每行一条，选填）
@@ -1618,7 +1659,7 @@ function NewBundleWizard({
   }, [flightOptions, returnSel, outboundFlightId]);
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/40 p-4 backdrop-blur-sm" onClick={onCancel}>
+    <div ref={dialogRef} role="dialog" aria-modal="true" aria-label={initial ? '编辑套餐' : '新建套餐'} tabIndex={-1} className="fixed inset-0 z-50 flex items-center justify-center bg-ink/40 p-4 backdrop-blur-sm" onClick={onCancel}>
       <div
         className="w-full max-w-2xl max-h-[90vh] overflow-auto rounded-xl border border-slate-200 bg-white shadow-pop"
         onClick={(e) => e.stopPropagation()}
@@ -2010,10 +2051,11 @@ function NewBundleWizard({
                     </span>
                     <button
                       type="button"
-                      className="text-xs text-ink-muted hover:text-rose-600"
+                      className="btn-ghost-danger text-xs"
                       onClick={() => setItems(items.filter((_, i) => i !== idx))}
+                      aria-label={`删除第 ${idx + 1} 项`}
                     >
-                      ×
+                      <Icon name="close" />
                     </button>
                   </div>
                   {/* 酒店行已按半间展示（上面 displayUnitPrice/displaySubtotal），这里补一句说明半间口径的来由，
@@ -2029,26 +2071,26 @@ function NewBundleWizard({
             </div>
             {hasHotelItem && !hotelRoomTypeId && (
               <p className="mt-1.5 rounded-md border border-amber-300 bg-amber-50 px-2 py-1 text-xs text-amber-800">
-                ⚠️ 套餐含酒店组件时必须在上方酒店行搜索并关联一个房型，否则起价会漏算酒店（提交会被拦截）。
+                <Icon name="alert" className="mr-1 inline-block align-text-bottom" />套餐含酒店组件时必须在上方酒店行搜索并关联一个房型，否则起价会漏算酒店（提交会被拦截）。
               </p>
             )}
             {nightsHint && (
               <p className="mt-1.5 rounded-md border border-amber-300 bg-amber-50 px-2 py-1 text-xs text-amber-800">
-                ⚠️ 套餐名里写的「{nameNights} 晚」与住宿晚数（{hotelNights} 晚）不一致，请确认。
+                <Icon name="alert" className="mr-1 inline-block align-text-bottom" />套餐名里写的「{nameNights} 晚」与住宿晚数（{hotelNights} 晚）不一致，请确认。
               </p>
             )}
             <p className="mt-1.5 text-[11px] leading-relaxed text-ink-muted">
-              💡 组件价格只读、来自产品：酒店在行内搜索选择房型，数量即住宿晚数（房控按此计入占房）；接送按整车计价，数量=趟数（接机+送机=2
+              <Icon name="alert" className="mr-1 inline-block align-text-bottom" />组件价格只读、来自产品：酒店在行内搜索选择房型，数量即住宿晚数（房控按此计入占房）；接送按整车计价，数量=趟数（接机+送机=2
               趟，只接机填 1）；签证按 1 人计入起价，下单按实际出行人数收；机票已含在起价里，随出发日实时浮动，不用填价。
             </p>
             {transfers.length === 0 && items.some((it) => it.kind === 'TRANSFER') && (
-              <p className="mt-1 text-xs text-amber-700">⚠️ 暂无在售接送产品，请先到 产品管理 › 地面服务 里添加。</p>
+              <p className="mt-1 flex items-center gap-1 text-xs text-amber-700"><Icon name="alert" />暂无在售接送产品，请先到 产品管理 › 地面服务 里添加。</p>
             )}
             {visas.length === 0 && items.some((it) => it.kind === 'VISA') && (
-              <p className="mt-1 text-xs text-amber-700">⚠️ 暂无在售签证产品，请先到 产品管理 › 签证 里添加。</p>
+              <p className="mt-1 flex items-center gap-1 text-xs text-amber-700"><Icon name="alert" />暂无在售签证产品，请先到 产品管理 › 签证 里添加。</p>
             )}
             {roomTypeOptions.length === 0 && hasHotelItem && (
-              <p className="mt-1 text-xs text-amber-700">⚠️ 暂无可选房型，请先到 产品管理 › 酒店 里添加酒店/房型。</p>
+              <p className="mt-1 flex items-center gap-1 text-xs text-amber-700"><Icon name="alert" />暂无可选房型，请先到 产品管理 › 酒店 里添加酒店/房型。</p>
             )}
             {/* 0702 反馈 5d：地面成本估算（仅内部）—— 与上面「起价/人」卖价拆解分开展示，用虚线框 + 「仅内部」
                 标签区隔，避免运营把两套数字混着看。未录成本的组件按「未录」显示，不拿挂牌价打折估算替代。 */}
@@ -2084,7 +2126,7 @@ function NewBundleWizard({
             )}
             {flightRefError && !flightRefLoading && (
               <p className="text-[11px] text-amber-700">
-                ⚠️ 机票参考价获取失败，起价里的机票项可能不准，请稍后重试或检查网络。
+                <Icon name="alert" className="mr-1 inline-block align-text-bottom" />机票参考价获取失败，起价里的机票项可能不准，请稍后重试或检查网络。
               </p>
             )}
             <p className="text-[11px] leading-relaxed text-ink-muted">
@@ -2124,7 +2166,7 @@ function NewBundleWizard({
               </div>
             </div>
             <p className="text-[11px] leading-relaxed text-ink-muted">
-              💡 机票按<strong>航班最便宜那天</strong>做起价（已含在"起价"里，你不用在套餐里填机票价）；酒店按<strong>关联房型整间夜价的一半</strong>（拼房）计入起价。你填
+              <Icon name="alert" className="mr-1 inline-block align-text-bottom" />机票按<strong>航班最便宜那天</strong>做起价（已含在"起价"里，你不用在套餐里填机票价）；酒店按<strong>关联房型整间夜价的一半</strong>（拼房）计入起价。你填
               <strong>想卖的价格</strong>、或直接改<strong>折扣%</strong>都行，两个会自动联动。实际下单：整个全包价按
               <strong>出发日实时机票</strong>浮动 ×(1−{pct}%)，前台买家看到「起价 ¥X/人 → 省 {pct}%」。
             </p>
@@ -2135,12 +2177,12 @@ function NewBundleWizard({
             )}
             {!valid && (
               <p className="text-xs text-rose-600">
-                ⚠️ 请填写套餐名 + 至少 1 个产品 + 套餐价 &gt; 0 + 酒店/接送/签证组件都已选产品
+                <Icon name="alert" className="mr-1 inline-block align-text-bottom" />请填写套餐名 + 至少 1 个产品 + 套餐价 &gt; 0 + 酒店/接送/签证组件都已选产品
                 {hasHotelItem && !hotelRoomTypeId && '（酒店行还没关联房型）'}
               </p>
             )}
             {!nightsValid && (
-              <p className="text-xs text-rose-600">⚠️ 含酒店项时，住宿晚数需为 1–30 的整数</p>
+              <p className="flex items-center gap-1 text-xs text-rose-600"><Icon name="alert" />含酒店项时，住宿晚数需为 1–30 的整数</p>
             )}
           </div>
 
@@ -2456,11 +2498,11 @@ function PhotoListEditor({ photos, onChange }: { photos: string[]; onChange: (v:
             )}
             <button
               type="button"
-              className="shrink-0 text-xs text-ink-muted hover:text-rose-600"
+              className="btn-ghost-danger shrink-0 text-xs"
               onClick={() => removeAt(idx)}
               aria-label="删除图片"
             >
-              ×
+              <Icon name="close" />
             </button>
           </div>
         ))}
@@ -2487,11 +2529,11 @@ function AmenityChipsEditor({ amenities, onChange }: { amenities: string[]; onCh
             {a}
             <button
               type="button"
-              className="text-ink-muted hover:text-rose-600"
+              className="link-danger text-xs"
               onClick={() => onChange(amenities.filter((_, i) => i !== idx))}
               aria-label={`删除 ${a}`}
             >
-              ×
+              <Icon name="close" />
             </button>
           </span>
         ))}
@@ -2572,8 +2614,8 @@ function RoomTypesEditor({ roomTypes, onChange }: { roomTypes: RoomTypeWithCost[
               />
             </div>
             <div className="md:col-span-2 flex items-center justify-end pb-1">
-              <button type="button" className="text-xs text-ink-muted hover:text-rose-600" onClick={() => removeAt(idx)}>
-                删除
+              <button type="button" className="btn-ghost-danger text-xs" onClick={() => removeAt(idx)}>
+                <Icon name="trash" /> 删除
               </button>
             </div>
           </div>
@@ -2975,8 +3017,8 @@ function VisaEditorForm({
                       onChange={(n) => patchTier(idx, { surchargeCny: n })}
                     />
                   </div>
-                  <button type="button" className="btn-ghost mb-1 px-2 py-1 text-xs text-rose-600" onClick={() => removeTier(idx)}>
-                    删除
+                  <button type="button" className="btn-ghost-danger mb-1 px-2 py-1 text-xs" onClick={() => removeTier(idx)}>
+                    <Icon name="trash" /> 删除
                   </button>
                 </div>
               ))}

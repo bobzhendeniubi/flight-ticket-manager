@@ -9,6 +9,8 @@ import { exportToCSV } from '../lib/csvExport';
 import { api, ApiError, type Traveler } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { TravelerProfilesView } from './TravelerProfilesView';
+import { Icon } from '../components/Icon';
+import { useDialogA11y } from '../components/Modal';
 
 export function TravelersPage() {
   const user = useAuth((s) => s.user);
@@ -123,7 +125,7 @@ function SavedTravelersView() {
             从所有订单自动提取的出行人档案。用<strong>姓名 + 生日</strong>精确查找客户（身份核实常用）。
           </p>
         </div>
-        <button className="btn-secondary" onClick={handleExport}>📥 导出 CSV</button>
+        <button className="btn-secondary" onClick={handleExport}><Icon name="download" /> 导出 CSV</button>
       </section>
 
       {error && (
@@ -283,6 +285,7 @@ function TravelerDrawer({
   onSaved: (updated: MockTraveler) => void;
 }) {
   const tokens = useAuth((s) => s.tokens);
+  const dialogRef = useDialogA11y(onClose);
   const [editing, setEditing] = useState(false);
   const [form, setForm] = useState({
     fullName: traveler.fullName,
@@ -323,15 +326,15 @@ function TravelerDrawer({
   const customers = traveler.customerIds.map((id) => ({ id, name: '客户 #' + id.slice(0, 8) }));
 
   return (
-    <div className="fixed inset-0 z-50 flex justify-end bg-slate-900/50" onClick={onClose}>
+    <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="常用旅客详情" tabIndex={-1} className="fixed inset-0 z-50 flex justify-end bg-slate-900/50" onClick={onClose}>
       <div className="h-full w-full max-w-md overflow-auto bg-white shadow-xl" onClick={(e) => e.stopPropagation()}>
         <div className="sticky top-0 bg-white border-b border-slate-200 px-6 py-4 flex items-center justify-between z-10">
           <h2 className="text-lg font-semibold text-slate-900">{traveler.fullName}</h2>
           <div className="flex items-center gap-2">
             {!editing && (
-              <button className="text-sm text-brand hover:text-brand-dark" onClick={() => setEditing(true)}>✏️ 编辑</button>
+              <button className="text-sm text-brand hover:text-brand-dark" onClick={() => setEditing(true)}><Icon name="edit" /> 编辑</button>
             )}
-            <button className="text-slate-400 hover:text-slate-700 text-xl" onClick={onClose}>×</button>
+            <button className="text-slate-400 hover:text-slate-700 text-xl" onClick={onClose} aria-label="关闭旅客详情"><Icon name="close" /></button>
           </div>
         </div>
         <div className="px-6 py-5 space-y-4 text-sm">

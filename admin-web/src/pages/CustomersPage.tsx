@@ -6,6 +6,8 @@ import { type MockCustomer } from '../lib/mockData';
 import { exportToCSV } from '../lib/csvExport';
 import { api, ApiError, type CustomerSummary } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { Icon } from '../components/Icon';
+import { useDialogA11y } from '../components/Modal';
 
 function customerApiToMock(c: CustomerSummary): MockCustomer {
   return {
@@ -106,7 +108,7 @@ export function CustomersPage() {
           <h1 className="page-title">散客管理</h1>
           <p className="page-sub">所有购买过产品的散客，按归属代理、标签等维度筛选</p>
         </div>
-        <button className="btn-secondary" onClick={handleExport}>📥 导出 CSV</button>
+        <button className="btn-secondary" onClick={handleExport}><Icon name="download" /> 导出 CSV</button>
       </section>
 
       {error && (
@@ -183,9 +185,9 @@ export function CustomersPage() {
                   </td>
                   <td className="text-xs">
                     {c.agentName ? (
-                      <span className="badge-warning">🤝 {c.agentName}</span>
+                      <span className="badge-warning"><Icon name="handshake" /> {c.agentName}</span>
                     ) : (
-                      <span className="badge-info">🏢 直销</span>
+                      <span className="badge-info"><Icon name="building" /> 直销</span>
                     )}
                   </td>
                   <td className="text-center">
@@ -258,6 +260,7 @@ function CustomerDrawer({
   onSaved: (updated: MockCustomer) => void;
 }) {
   const tokens = useAuth((s) => s.tokens);
+  const dialogRef = useDialogA11y(onClose);
   const [editing, setEditing] = useState(false);
   const [form, setForm] = useState({
     name: customer.name,
@@ -301,16 +304,16 @@ function CustomerDrawer({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex justify-end bg-slate-900/50" onClick={onClose}>
+    <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="散客详情" tabIndex={-1} className="fixed inset-0 z-50 flex justify-end bg-slate-900/50" onClick={onClose}>
       <div className="h-full w-full max-w-md overflow-auto bg-white shadow-xl" onClick={(e) => e.stopPropagation()}>
         <div className="sticky top-0 bg-white border-b border-slate-200 px-6 py-4 z-10">
           <div className="flex items-center justify-between">
             <h2 className="text-lg font-semibold text-slate-900">{customer.name}</h2>
             <div className="flex items-center gap-2">
               {!editing && (
-                <button className="text-sm text-brand hover:text-brand-dark" onClick={() => setEditing(true)}>✏️ 编辑</button>
+                <button className="text-sm text-brand hover:text-brand-dark" onClick={() => setEditing(true)}><Icon name="edit" /> 编辑</button>
               )}
-              <button className="text-slate-400 hover:text-slate-700 text-xl" onClick={onClose}>×</button>
+              <button className="text-slate-400 hover:text-slate-700 text-xl" onClick={onClose} aria-label="关闭散客详情"><Icon name="close" /></button>
             </div>
           </div>
           <div className="mt-1 flex flex-wrap gap-1">
@@ -335,7 +338,7 @@ function CustomerDrawer({
               <section>
                 <h3 className="text-xs font-semibold text-slate-500 uppercase mb-2">归属</h3>
                 <dl className="space-y-1">
-                  <Row label="销售渠道" value={customer.agentName ? `🤝 ${customer.agentName}` : '🏢 直销'} />
+                  <Row label="销售渠道" value={customer.agentName ? <><Icon name="handshake" /> {customer.agentName}</> : <><Icon name="building" /> 直销</>} />
                   <Row label="注册时间" value={new Date(customer.createdAt).toLocaleString('zh-CN')} />
                 </dl>
               </section>

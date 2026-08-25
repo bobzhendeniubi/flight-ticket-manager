@@ -6,6 +6,8 @@ import { useEffect, useMemo, useState } from 'react';
 import { api, ApiError, type SettlementSummary, type SettlementDetail, type SettlementStatus } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { exportToCSV } from '../lib/csvExport';
+import { Icon, type IconName } from '../components/Icon';
+import { useDialogA11y } from '../components/Modal';
 
 const STATUS_INFO: Record<SettlementStatus, { label: string; color: string }> = {
   DRAFT: { label: '草稿', color: 'badge-neutral' },
@@ -179,12 +181,12 @@ export function SettlementsPage() {
               { key: 'status', label: '状态' },
               { key: 'paidAt', label: '支付时间' },
             ])}
-          >📥 导出 CSV</button>
+          ><Icon name="download" /> 导出 CSV</button>
         </div>
       </section>
 
       {error && (
-        <div className="rounded-md bg-rose-50 border border-rose-200 px-4 py-3 text-sm text-rose-800">❌ {error}</div>
+        <div className="flex items-center gap-1 rounded-md bg-rose-50 border border-rose-200 px-4 py-3 text-sm text-rose-800"><Icon name="alert" /> {error}</div>
       )}
 
       <section className="card">
@@ -281,18 +283,19 @@ function SettlementDrawer({
   onClose: () => void;
   onAdvance: (next: SettlementStatus) => void;
 }) {
-  const nextSteps: Array<{ label: string; to: SettlementStatus; style: string }> = (() => {
+  const dialogRef = useDialogA11y(onClose);
+  const nextSteps: Array<{ label: string; icon?: IconName; to: SettlementStatus; style: string }> = (() => {
     switch (settlement.status) {
       case 'DRAFT': return [
         { label: '提交审核', to: 'PENDING_APPROVAL', style: 'btn-primary' },
-        { label: '作废', to: 'VOIDED', style: 'btn-secondary' },
+        { label: '作废', to: 'VOIDED', style: 'btn-danger' },
       ];
       case 'PENDING_APPROVAL': return [
         { label: '核准', to: 'APPROVED', style: 'btn-primary' },
         { label: '打回草稿', to: 'DRAFT', style: 'btn-secondary' },
       ];
       case 'APPROVED': return [
-        { label: '💰 标记已支付', to: 'PAID', style: 'btn-primary' },
+        { label: '标记已支付', icon: 'wallet', to: 'PAID', style: 'btn-primary' },
         { label: '撤回审核', to: 'PENDING_APPROVAL', style: 'btn-secondary' },
       ];
       default: return [];
@@ -300,11 +303,11 @@ function SettlementDrawer({
   })();
 
   return (
-    <div className="fixed inset-0 z-50 flex justify-end bg-slate-900/50" onClick={onClose}>
+    <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="结算单详情" tabIndex={-1} className="fixed inset-0 z-50 flex justify-end bg-slate-900/50" onClick={onClose}>
       <div className="h-full w-full max-w-md overflow-auto bg-white shadow-xl p-6" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center justify-between mb-4">
           <h2 className="text-lg font-semibold">结算单 #{settlement.id.slice(0, 8)}</h2>
-          <button className="text-xl text-slate-400" onClick={onClose}>×</button>
+          <button className="btn-ghost px-2 py-1 text-xl" onClick={onClose} aria-label="关闭结算单详情"><Icon name="close" /></button>
         </div>
 
         <div className="rounded bg-slate-900 text-white p-4 mb-4">
@@ -371,7 +374,7 @@ function SettlementDrawer({
           <div className="mt-4 space-y-2">
             {nextSteps.map((s) => (
               <button key={s.to} className={`${s.style} text-sm w-full`} onClick={() => onAdvance(s.to)}>
-                {s.label}
+                {s.icon && <Icon name={s.icon} />} {s.label}
               </button>
             ))}
           </div>

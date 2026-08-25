@@ -20,6 +20,8 @@ import {
 import { exportToCSV } from '../lib/csvExport';
 import { useAuth } from '../stores/auth';
 import { Icon } from '../components/Icon';
+import { useConfirm } from '../components/ConfirmDialog';
+import { useDialogA11y } from '../components/Modal';
 
 const CABIN_LABELS: Record<string, string> = {
   ECONOMY: '经济舱',
@@ -437,6 +439,7 @@ function ProfileDrawer({
   onSearchCompanion: (documentNumber: string) => void;
 }) {
   const tokens = useAuth((s) => s.tokens);
+  const dialogRef = useDialogA11y(onClose);
   const user = useAuth((s) => s.user);
   const canReadLegacyHistory = user?.role === 'ADMIN' || user?.role === 'STAFF';
   const [profile, setProfile] = useState<TravelerProfile | null>(null);
@@ -538,7 +541,7 @@ function ProfileDrawer({
   const age = calcAge(profile?.dateOfBirth ?? null);
 
   return (
-    <div className="fixed inset-0 z-50 flex justify-end bg-slate-900/50" onClick={onClose}>
+    <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="旅客详情" tabIndex={-1} className="fixed inset-0 z-50 flex justify-end bg-slate-900/50" onClick={onClose}>
       <div
         className="h-full w-full max-w-lg overflow-auto bg-white shadow-xl"
         onClick={(e) => e.stopPropagation()}
@@ -560,7 +563,7 @@ function ProfileDrawer({
               <span className="text-xs font-medium text-emerald-600">回头客 · 飞过 {profile.tripCount} 次</span>
             )}
           </div>
-          <button className="btn-ghost px-2 py-1 text-xl" onClick={onClose}><Icon name="close" /></button>
+          <button className="btn-ghost px-2 py-1 text-xl" onClick={onClose} aria-label="关闭旅客详情"><Icon name="close" /></button>
         </div>
 
         <div className="space-y-4 px-6 py-5 text-sm">
@@ -785,6 +788,8 @@ function RedemptionsSection({
   onChanged: () => void;
 }) {
   const tokens = useAuth((s) => s.tokens);
+  const confirm = useConfirm();
+  const confirmLockRef = useRef(false);
   const [formOpen, setFormOpen] = useState(false);
   const [tripsUsed, setTripsUsed] = useState(String(DEFAULT_REDEEM_TRIPS));
   const [benefit, setBenefit] = useState('');
@@ -837,14 +842,21 @@ function RedemptionsSection({
   };
 
   const reverse = async (entry: TravelerBenefitRedemption) => {
-    if (!tokens?.accessToken || reversingId) return;
-    const ok = window.confirm(
-      `确认冲正这条核销？\n\n${fmtDateTime(entry.createdAt)} · 扣 ${entry.tripsUsed} 次 · ${entry.benefit}\n\n` +
+    if (!tokens?.accessToken || reversingId || confirmLockRef.current) return;
+    confirmLockRef.current = true;
+    const ok = await confirm({
+      title: '确认冲正这条核销？',
+      body:
+        `${fmtDateTime(entry.createdAt)} · 扣 ${entry.tripsUsed} 次 · ${entry.benefit}\n\n` +
         '冲正会把这 ' +
         entry.tripsUsed +
         ' 次退回可用次数，原记录保留不删除，且一条核销只能冲正一次。',
-    );
-    if (!ok) return;
+      tone: 'danger',
+    });
+    if (!ok) {
+      confirmLockRef.current = false;
+      return;
+    }
     setReversingId(entry.id);
     setOpError(null);
     try {
@@ -855,6 +867,7 @@ function RedemptionsSection({
       setOpError(e instanceof ApiError ? e.message : '冲正失败');
     } finally {
       setReversingId(null);
+      confirmLockRef.current = false;
     }
   };
 

@@ -12,6 +12,7 @@
  */
 import { useMemo, useState } from 'react';
 import type { HotelAvailabilityTier, HotelNightlyRemainingResult, RoomGroup } from '../lib/api';
+import { Icon } from './Icon';
 
 // ── 类型 ─────────────────────────────────────────────────────────────────
 export interface RoomingPassenger {
@@ -300,13 +301,13 @@ export function RoomingEditor({
           <h3 className="text-base font-semibold text-ink">分房（拖名字到房间）</h3>
           {hotelName || (checkIn && checkOut) ? (
             <div className="mt-1 flex flex-wrap items-center gap-2">
-              {hotelName && <span className="text-sm font-medium text-ink">🏨 {hotelName}</span>}
+              {hotelName && <span className="inline-flex items-center gap-1 text-sm font-medium text-ink"><Icon name="hotel" /> {hotelName}</span>}
               {checkIn && checkOut && (
                 <span
                   className="badge-neutral"
                   title={`出发~结束（住宿区间 入住~退房）：${dateOnly(checkIn)} ~ ${dateOnly(checkOut)}`}
                 >
-                  🗓 {toMonthDay(checkIn)} ~ {toMonthDay(checkOut)}
+                  <Icon name="calendar" /> {toMonthDay(checkIn)} ~ {toMonthDay(checkOut)}
                 </span>
               )}
               {hotelTier && (
@@ -365,7 +366,7 @@ export function RoomingEditor({
                   房间 {idx + 1}
                   {hotelName && (
                     <span className="inline-flex items-center gap-1 text-xs font-normal text-ink-soft">
-                      🏨 {hotelName}
+                      <Icon name="hotel" /> {hotelName}
                     </span>
                   )}
                   <NightlyRemainingBadge data={nightlyRemaining} checkIn={checkIn} checkOut={checkOut} compact />
@@ -388,7 +389,7 @@ export function RoomingEditor({
                     type="button"
                     onClick={() => removeBox(b.id)}
                     disabled={boxes.length <= 1 || b.passengerIds.length > 0}
-                    className="rounded-md border border-slate-200 bg-white px-2 py-1 text-xs text-ink-soft transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+                    className="btn-ghost-danger px-2 py-1 text-xs disabled:cursor-not-allowed disabled:opacity-40"
                     title={b.passengerIds.length > 0 ? '先把人移走再删房间' : '删除空房间'}
                   >
                     删房间

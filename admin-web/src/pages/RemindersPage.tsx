@@ -15,6 +15,7 @@ import {
   type ReminderStatus,
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { Icon } from '../components/Icon';
 
 const PAGE_SIZE = 20;
 
@@ -224,7 +225,7 @@ export function RemindersPage() {
           </p>
         </div>
         <button type="button" className="btn-primary" onClick={() => void onGenerate()} disabled={generating}>
-          {generating ? '生成中…' : '⚡ 生成今日提醒'}
+          {generating ? '生成中…' : <><Icon name="bolt" /> 生成今日提醒</>}
         </button>
       </header>
 

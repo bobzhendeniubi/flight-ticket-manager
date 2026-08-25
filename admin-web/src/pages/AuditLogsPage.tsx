@@ -10,6 +10,8 @@ import { exportToCSV } from '../lib/csvExport';
 import { api, ApiError, type AuditLog } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { formatAction, formatPayloadDiff, summarizePayload, type DiffLine } from '../lib/auditFormat';
+import { Icon, type IconName } from '../components/Icon';
+import { useDialogA11y } from '../components/Modal';
 
 type Severity = AuditLog['severity'];
 type TargetType = AuditLog['targetType'];
@@ -26,18 +28,18 @@ const SEVERITY_LABEL: Record<Severity, string> = {
   CRITICAL: '关键',
 };
 
-const TARGET_ICON: Record<TargetType, string> = {
-  AGENT: '🤝',
-  ORDER: '📋',
-  FLIGHT: '✈️',
-  CUSTOMER: '👤',
-  PRICING: '💰',
-  COMMISSION: '💼',
-  TRAVELER: '🧳',
-  PRODUCT: '📦',
-  AUTH: '🔐',
-  SYSTEM: '⚙️',
-  SETTLEMENT: '💳',
+const TARGET_ICON: Record<TargetType, IconName> = {
+  AGENT: 'handshake',
+  ORDER: 'clipboard',
+  FLIGHT: 'plane',
+  CUSTOMER: 'user',
+  PRICING: 'wallet',
+  COMMISSION: 'wallet',
+  TRAVELER: 'luggage',
+  PRODUCT: 'package',
+  AUTH: 'lock',
+  SYSTEM: 'settings',
+  SETTLEMENT: 'wallet',
 };
 
 const TARGET_LABEL: Record<TargetType, string> = {
@@ -62,7 +64,7 @@ interface AuditView {
   ip: string;
   rawAction: string;
   actionLabel: string;
-  actionEmoji: string;
+  actionIcon: IconName;
   targetType: TargetType;
   targetLabel: string;
   diffLines: DiffLine[];
@@ -82,7 +84,7 @@ function toView(l: AuditLog): AuditView {
     ip: l.ipAddress ?? 'system',
     rawAction: l.action,
     actionLabel: a.label,
-    actionEmoji: a.emoji,
+    actionIcon: a.icon,
     targetType: l.targetType,
     targetLabel: l.targetLabel ?? l.targetId ?? '—',
     diffLines: formatPayloadDiff(l.before, l.after),
@@ -103,6 +105,7 @@ export function AuditLogsPage() {
   const [targetFilter, setTargetFilter] = useState<'' | TargetType>('');
   const [severityFilter, setSeverityFilter] = useState<'' | Severity>('');
   const [selected, setSelected] = useState<AuditView | null>(null);
+  const dialogRef = useDialogA11y(() => setSelected(null), selected !== null);
 
   useEffect(() => {
     if (!tokens?.accessToken) return;
@@ -199,7 +202,7 @@ export function AuditLogsPage() {
             )
           }
         >
-          📥 导出 CSV
+          <Icon name="download" /> 导出 CSV
         </button>
       </section>
 
@@ -207,7 +210,7 @@ export function AuditLogsPage() {
         <div className="rounded-md bg-canvas px-3 py-2 text-xs text-ink-muted">加载中…</div>
       )}
       {error && (
-        <div className="rounded-md bg-rose-50 px-3 py-2 text-xs text-rose-700">❌ {error}</div>
+        <div className="flex items-center gap-1 rounded-md bg-rose-50 px-3 py-2 text-xs text-rose-700"><Icon name="alert" /> {error}</div>
       )}
 
       <section className="grid gap-3 md:grid-cols-4">
@@ -249,7 +252,7 @@ export function AuditLogsPage() {
               <option value="">全部</option>
               {(Object.keys(TARGET_LABEL) as TargetType[]).map((t) => (
                 <option key={t} value={t}>
-                  {TARGET_ICON[t]} {TARGET_LABEL[t]}
+                  {TARGET_LABEL[t]}
                 </option>
               ))}
             </select>
@@ -262,9 +265,9 @@ export function AuditLogsPage() {
               onChange={(e) => setSeverityFilter(e.target.value as '' | Severity)}
             >
               <option value="">全部</option>
-              <option value="CRITICAL">🔴 关键</option>
-              <option value="WARNING">🟡 警告</option>
-              <option value="INFO">⚪ 一般</option>
+              <option value="CRITICAL">关键</option>
+              <option value="WARNING">警告</option>
+              <option value="INFO">一般</option>
             </select>
           </div>
         </div>
@@ -302,12 +305,12 @@ export function AuditLogsPage() {
                     </div>
                   </td>
                   <td className="text-sm">
-                    <span className="mr-1.5">{l.actionEmoji}</span>
+                    <Icon name={l.actionIcon} className="mr-1.5 inline-block align-text-bottom" />
                     <span className="font-medium text-ink">{l.actionLabel}</span>
                     <div className="mt-0.5 font-mono text-[10px] text-ink-muted">{l.rawAction}</div>
                   </td>
                   <td className="text-xs">
-                    <span className="mr-1">{TARGET_ICON[l.targetType]}</span>
+                    <Icon name={TARGET_ICON[l.targetType]} className="mr-1 inline-block align-text-bottom" />
                     <span className="text-ink-soft">{l.targetLabel}</span>
                     <div className="mt-0.5 text-[10px] text-ink-muted">{TARGET_LABEL[l.targetType]}</div>
                   </td>
@@ -337,6 +340,11 @@ export function AuditLogsPage() {
 
       {selected && (
         <div
+          ref={dialogRef}
+          role="dialog"
+          aria-modal="true"
+          aria-label="日志详情"
+          tabIndex={-1}
           className="fixed inset-0 z-50 flex justify-end bg-slate-900/50"
           onClick={() => setSelected(null)}
         >
@@ -349,8 +357,9 @@ export function AuditLogsPage() {
               <button
                 className="text-2xl leading-none text-slate-400 hover:text-slate-700"
                 onClick={() => setSelected(null)}
+                aria-label="关闭日志详情"
               >
-                ×
+                <Icon name="close" />
               </button>
             </div>
             <dl className="space-y-3 px-6 py-5 text-sm">
@@ -364,12 +373,12 @@ export function AuditLogsPage() {
                 </div>
               </Field>
               <Field label="动作">
-                <span className="mr-1.5">{selected.actionEmoji}</span>
+                <Icon name={selected.actionIcon} className="mr-1.5 inline-block align-text-bottom" />
                 <span className="font-medium">{selected.actionLabel}</span>
                 <span className="ml-2 font-mono text-[10px] text-slate-400">{selected.rawAction}</span>
               </Field>
               <Field label="对象">
-                <span className="mr-1">{TARGET_ICON[selected.targetType]}</span>
+                <Icon name={TARGET_ICON[selected.targetType]} className="mr-1 inline-block align-text-bottom" />
                 <span>{selected.targetLabel}</span>
                 <span className="ml-2 text-xs text-slate-500">({TARGET_LABEL[selected.targetType]})</span>
               </Field>

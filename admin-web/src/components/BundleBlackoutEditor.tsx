@@ -81,7 +81,7 @@ export function BundleBlackoutEditor({
               />
               <button
                 type="button"
-                className="btn-ghost px-2 py-1 text-rose-600"
+                className="btn-ghost-danger px-2 py-1 text-xs"
                 onClick={() => removeRow(idx)}
                 aria-label="删除该封盘日期"
               >

@@ -14,6 +14,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { api, ApiError, type RangeSchedule } from '../lib/api';
 import { airportLabel, CABIN_LABEL, formatLocalDate, formatLocalTime, localYmd, tzLabel } from '../lib/airports';
 import { useAuth } from '../stores/auth';
+import { Icon } from '../components/Icon';
 import { useFlightSeats } from '../stores/flightSeats';
 
 // 余位是否"紧张"：按容量比例判断，不用绝对张数——
@@ -293,7 +294,7 @@ export function SeatStatsPage() {
                             className="text-right nums font-bold text-rose-700"
                             title={`容量已低于已售：欠 ${s.oversoldSeats} 座（各舱位净余票合计 ${avail}）。销售侧照旧不再卖出，请与航司 / 操作部协调。`}
                           >
-                            🔴 超售 {s.oversoldSeats}
+                            <Icon name="alert" /> 超售 {s.oversoldSeats}
                           </td>
                         );
                       }
@@ -302,7 +303,7 @@ export function SeatStatsPage() {
                           className={`text-right nums ${tone.low ? 'font-bold' : ''} ${tone.text}`}
                           title={tone.low ? '余位不足总座 10%，建议关注/调价' : undefined}
                         >
-                          {tone.low && '🔴 '}{avail}
+                          {tone.low && <Icon name="alert" />}{avail}
                         </td>
                       );
                     })()}

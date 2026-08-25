@@ -13,6 +13,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, type TravelerProfileSuggestion } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { Icon } from './Icon';
 
 const SUGGEST_DEBOUNCE_MS = 300;
 const SUGGEST_LIMIT = 8;
@@ -54,8 +55,13 @@ function passportExpiryDays(iso: string | null): number | null {
   return Math.floor((new Date(iso).getTime() - Date.now()) / 86_400_000);
 }
 
+interface SuggestionSubline {
+  text: string;
+  needsWheelchair: boolean;
+}
+
 /** 候选第二行：证件 + 飞行次数 + 偏好段（没有的偏好不显示） */
-function suggestionSubline(s: TravelerProfileSuggestion): string {
+function suggestionSubline(s: TravelerProfileSuggestion): SuggestionSubline {
   const parts: string[] = [
     `${DOC_LABELS[s.documentType] ?? s.documentType} ${maskDocNumber(s.documentNumber)}`,
     `飞过 ${s.tripCount} 次`,
@@ -64,16 +70,15 @@ function suggestionSubline(s: TravelerProfileSuggestion): string {
   if (s.prefBed) parts.push(BED_LABELS[s.prefBed] ?? s.prefBed);
   if (s.prefMeal) parts.push(s.prefMeal);
   if (s.prefSingleRoom) parts.push('单住');
-  if (s.needsWheelchair) parts.push('♿ 轮椅');
-  return parts.join(' · ');
+  return { text: parts.join(' · '), needsWheelchair: s.needsWheelchair };
 }
 
 /** 护照临期/过期红字；正常返回 null */
-function expiryWarning(s: TravelerProfileSuggestion): string | null {
+function expiryWarning(s: TravelerProfileSuggestion): { text: string } | null {
   const days = passportExpiryDays(s.passportExpiry);
   if (days === null || days >= PASSPORT_EXPIRY_WARN_DAYS) return null;
   const ymd = (s.passportExpiry ?? '').slice(0, 10);
-  return days < 0 ? `⚠️ 护照 ${ymd} 已过期` : `⚠️ 护照 ${ymd} 到期`;
+  return { text: days < 0 ? `护照 ${ymd} 已过期` : `护照 ${ymd} 到期` };
 }
 
 interface PopoverPos {
@@ -230,6 +235,7 @@ export function PassengerSuggestInput({
         >
           {suggestions.map((s) => {
             const warn = expiryWarning(s);
+            const subline = suggestionSubline(s);
             return (
               <button
                 key={s.id}
@@ -247,8 +253,11 @@ export function PassengerSuggestInput({
                   <span className="ml-1.5 font-medium">{s.fullName}</span>
                   {s.chineseName && <span className="text-slate-500">（{s.chineseName}）</span>}
                 </div>
-                <div className="text-xs text-slate-500">{suggestionSubline(s)}</div>
-                {warn && <div className="text-xs text-red-600">{warn}</div>}
+                <div className="text-xs text-slate-500">
+                  {subline.text}
+                  {subline.needsWheelchair && <span className="ml-1 inline-flex items-center gap-1"><Icon name="wheelchair" size={14} /> 轮椅</span>}
+                </div>
+                {warn && <div className="inline-flex items-center gap-1 text-xs text-red-600"><Icon name="alert" size={14} /> {warn.text}</div>}
               </button>
             );
           })}

@@ -16,6 +16,7 @@
  *      （出发日 × 晚数 × 四个档次）后预览确认，直接走批量 upsert 写库并重拉网格。
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { Icon } from '../components/Icon';
 import {
   api,
   ApiError,
@@ -408,7 +409,7 @@ export function SettlementRatesPage() {
         {/* 报价表整块粘贴导入：一次吃整张套票表（四个档次一起进），与下方逐格粘贴并存 */}
         <details className="rounded-md border border-slate-200 bg-slate-50/60 px-3 py-2">
           <summary className="cursor-pointer text-sm font-semibold text-ink">
-            📋 粘贴报价表（整块导入四个档次）
+            <Icon name="clipboard" /> 粘贴报价表（整块导入四个档次）
           </summary>
           <div className="mt-3 space-y-3">
             <p className="text-[11px] text-ink-muted">

@@ -4,6 +4,7 @@ import { api, ApiError, type MarketingPosterDetail, type MarketingPosterListItem
 import { PosterDetailModal } from '../components/PosterDetailModal';
 import { airportLabel } from '../lib/airports';
 import { useAuth } from '../stores/auth';
+import { useConfirm } from '../components/ConfirmDialog';
 
 const PAGE_SIZE = 20;
 const STATUS_LABEL: Record<MarketingPosterStatus, string> = {
@@ -101,6 +102,8 @@ function posterSummary(detail: MarketingPosterDetail): MarketingPosterListItem {
 }
 
 export function MarketingPage() {
+  const confirm = useConfirm();
+  const confirmLockRef = useRef(false);
   const token = useAuth((s) => s.tokens?.accessToken ?? '');
   const [formOpen, setFormOpen] = useState(true);
   const [title, setTitle] = useState('');
@@ -322,7 +325,12 @@ export function MarketingPage() {
   }
 
   async function deletePoster(poster: MarketingPosterListItem): Promise<void> {
-    if (!token || !window.confirm(`确认删除海报「${poster.title}」？`)) return;
+    if (!token || confirmLockRef.current) return;
+    confirmLockRef.current = true;
+    if (!(await confirm({ title: `确认删除海报「${poster.title}」？`, tone: 'danger' }))) {
+      confirmLockRef.current = false;
+      return;
+    }
     setDeleteId(poster.id);
     try {
       await api.marketing.deletePoster(token, poster.id);
@@ -340,6 +348,7 @@ export function MarketingPage() {
       alert(error instanceof ApiError ? `删除失败：${error.message}` : '删除失败');
     } finally {
       if (mountedRef.current) setDeleteId(null);
+      confirmLockRef.current = false;
     }
   }
 
@@ -509,7 +518,7 @@ export function MarketingPage() {
           <table className="table-admin min-w-[800px]">
             <thead><tr><th>名称</th><th>状态</th><th>版式</th><th>出图次数</th><th>创建人</th><th>创建时间</th><th>操作</th></tr></thead>
             <tbody>
-              {listLoading ? <tr><td colSpan={7} className="py-10 text-center text-ink-muted">加载中…</td></tr> : posters.length === 0 ? <tr><td colSpan={7} className="py-10 text-center text-ink-muted">暂无海报</td></tr> : posters.map((poster) => <tr key={poster.id}><td className="font-medium text-ink">{poster.title}</td><td><span className={STATUS_BADGE[poster.status]}>{STATUS_LABEL[poster.status]}</span></td><td>{poster.templateKey}</td><td className="nums">{poster.attempts}</td><td>{poster.createdBy?.displayName ?? '—'}</td><td>{formatDateTime(poster.createdAt)}</td><td><div className="flex gap-2"><button type="button" className="btn-secondary px-2.5 py-1 text-xs" onClick={(event) => { detailTriggerRef.current = event.currentTarget; void openDetail(poster.id); }}>查看</button><button type="button" className="btn-ghost px-2.5 py-1 text-xs text-rose-700 hover:bg-rose-50" disabled={deleteId === poster.id} onClick={() => void deletePoster(poster)}>{deleteId === poster.id ? '删除中…' : '删除'}</button></div></td></tr>)}
+              {listLoading ? <tr><td colSpan={7} className="py-10 text-center text-ink-muted">加载中…</td></tr> : posters.length === 0 ? <tr><td colSpan={7} className="py-10 text-center text-ink-muted">暂无海报</td></tr> : posters.map((poster) => <tr key={poster.id}><td className="font-medium text-ink">{poster.title}</td><td><span className={STATUS_BADGE[poster.status]}>{STATUS_LABEL[poster.status]}</span></td><td>{poster.templateKey}</td><td className="nums">{poster.attempts}</td><td>{poster.createdBy?.displayName ?? '—'}</td><td>{formatDateTime(poster.createdAt)}</td><td><div className="flex gap-2"><button type="button" className="btn-secondary px-2.5 py-1 text-xs" onClick={(event) => { detailTriggerRef.current = event.currentTarget; void openDetail(poster.id); }}>查看</button><button type="button" className="btn-ghost-danger px-2.5 py-1 text-xs" disabled={deleteId === poster.id} onClick={() => void deletePoster(poster)}>{deleteId === poster.id ? '删除中…' : '删除'}</button></div></td></tr>)}
             </tbody>
           </table>
         </div>

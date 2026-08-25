@@ -16,6 +16,7 @@ import { useEffect, useState } from 'react';
 import { api, ApiError, type OrderSummary, type RefundQuote } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { fmtRefundCny, readRefundSplit } from '../lib/refundSplit';
+import { Icon } from './Icon';
 
 /** 只在这些状态下有「要不要打款」的问题；其余状态不占抽屉空间。 */
 const REFUND_VISIBLE_STATUSES = new Set(['REFUND_REQUESTED', 'REFUNDED']);
@@ -137,7 +138,7 @@ export function RefundSplitCard({ order }: { order: OrderSummary }) {
                 </li>
               </ul>
               <p className="mt-1.5 text-[11px] font-medium text-rose-600">
-                ⚠️ 别按应退合计打款：其中 {fmtRefundCny(split.refundToBalanceCny)} 由系统退回代理账户，
+                <Icon name="alert" /> 别按应退合计打款：其中 {fmtRefundCny(split.refundToBalanceCny)} 由系统退回代理账户，
                 人工再打一次就是重复退钱。
               </p>
             </>
