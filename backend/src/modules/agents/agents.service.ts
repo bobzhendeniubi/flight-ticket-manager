@@ -167,7 +167,9 @@ export class AgentService {
       if (parentTier >= 5) {
         throw new ForbiddenError('代理层级最多 5 级');
       }
-    } else if (currentRole === UserRole.ADMIN) {
+    } else if (currentRole === UserRole.ADMIN || currentRole === UserRole.STAFF) {
+      // STAFF 与 ADMIN 同权建代理：建代理不碰钱（余额恒 0，充值走认款通道），
+      // 敏感操作（结算模式/停用/认款）仍为 ADMIN 专属。
       if (parentAgentId) {
         const parent = await prisma.agent.findUnique({ where: { id: parentAgentId } });
         if (!parent) throw new NotFoundError('上级代理不存在');

@@ -37,10 +37,10 @@ export const agentRoutes: FastifyPluginAsync = async (app) => {
 
   // 创建下级代理。
   //  - AGENT: POST /agents/children  (父=自己)
-  //  - ADMIN: POST /agents/children?parentId=xxx  可指定；省略 = 建 1 级代理
+  //  - ADMIN/STAFF: POST /agents/children?parentId=xxx  可指定；省略 = 建 1 级代理
   app.post(
     '/children',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.AGENT)] },
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT)] },
     async (req, reply) => {
       const body = createChildAgentBodySchema.parse(req.body);
       const { parentId } = (req.query as { parentId?: string }) ?? {};
