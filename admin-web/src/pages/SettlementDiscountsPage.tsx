@@ -4,7 +4,7 @@
  * 规则按「档次 × 晚数 × 出发日窗口」匹配；同一层同一组键的启用窗口不能重叠，
  * 冲突信息由后端返回并原样展示给运营。
  */
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 import {
   api,
@@ -16,6 +16,8 @@ import {
   type SettlementTier,
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { Icon } from '../components/Icon';
+import { useConfirm } from '../components/ConfirmDialog';
 
 const TIERS: SettlementTier[] = ['CITY_3STAR', 'CITY_4STAR', 'CITY_5STAR', 'INTL_5STAR'];
 const TIER_LABELS: Record<SettlementTier, string> = {
@@ -60,6 +62,8 @@ function agentLabel(agent: AgentListItem): string {
 }
 
 export function SettlementDiscountsPage() {
+  const confirm = useConfirm();
+  const confirmLockRef = useRef(false);
   const tokens = useAuth((s) => s.tokens);
   const user = useAuth((s) => s.user);
   const token = tokens?.accessToken ?? '';
@@ -173,7 +177,12 @@ export function SettlementDiscountsPage() {
       setRules((current) => current.filter((_, i) => i !== index));
       return;
     }
-    if (!window.confirm('确认删除这条立减规则？')) return;
+    if (confirmLockRef.current) return;
+    confirmLockRef.current = true;
+    if (!(await confirm({ title: '确认删除这条立减规则？', tone: 'danger' }))) {
+      confirmLockRef.current = false;
+      return;
+    }
     setError(null);
     setNotice(null);
     try {
@@ -182,6 +191,8 @@ export function SettlementDiscountsPage() {
       setNotice('已删除');
     } catch (e: unknown) {
       setError(e instanceof ApiError ? e.message : '删除失败');
+    } finally {
+      confirmLockRef.current = false;
     }
   }
 
@@ -336,8 +347,8 @@ export function SettlementDiscountsPage() {
                       </td>
                       {canEdit && (
                         <td className="px-3 py-2 text-right">
-                          <button type="button" className="text-xs font-medium text-rose-600 hover:text-rose-800" onClick={() => void removeRule(index)}>
-                            删除
+                          <button type="button" className="btn-ghost-danger px-2 py-1 text-xs" onClick={() => void removeRule(index)}>
+                            <Icon name="trash" /> 删除
                           </button>
                         </td>
                       )}
