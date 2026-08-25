@@ -22,7 +22,7 @@ import {
   type PnrRow,
   PNR_COLUMNS,
 } from './pnr-export.js';
-import { buildOrderFilterWhere } from './orders.service.js';
+import { buildOrderFilterWhere, GUEST_RECORDED_BY_LABEL } from './orders.service.js';
 import { filterExportOrdersByDepartDate } from './orders.export-depart-filter.js';
 import {
   excludeOnewayFromReturnLegExport,
@@ -603,8 +603,8 @@ export function orderToFullRows(order: OrderForTemplateExport, ctx: OrderContext
     expiryDate: fmtDateDMYDash(p.passportExpiry),
     infantWith: '',
     recordedAt: fmtDateTimeSec(order.createdAt),
-    // 游客单 user=null：回退到游客联系人姓名
-    recordedBy: order.user?.displayName ?? order.user?.email ?? order.guestName ?? '',
+    // 游客单 user=null（前台自助下单无录单账号）：统一记「散客」
+    recordedBy: order.user?.displayName ?? order.user?.email ?? GUEST_RECORDED_BY_LABEL,
     temp: '',
     costType: '',
     costSubType: '',

@@ -593,6 +593,10 @@ export const listOrdersQuerySchema = z.object({
   // ops 确认的三个筛选（航班号 / 乘客姓名 / 开票状态）
   flightNumber: z.string().max(20).optional(),    // 订单含该航班号的 FLIGHT 行（不区分大小写）
   passengerName: z.string().max(120).optional(),  // 乘客姓名模糊匹配
+  // 录入人员模糊匹配 —— 口径与导出「录入人员」列同源（下单账号 user.displayName → email；
+  // 游客单无录单账号，整类记作「散客」，搜该标签即捞出全部游客单）。多词之间 OR：一次填几个
+  // 人名＝列出这几位录入的订单（与 passengerName 同语义，不是 search 的词间 AND）。
+  recordedBy: z.string().max(120).optional(),
   invoiceStatus: z.nativeEnum(InvoiceStatus).optional(),
   // 六态开票筛选（组合式，取代旧的订单级 invoiceStatus 作为主口径）：
   //   invoiceLeg = 维度（去程 outbound / 回程 return / 系统 system）
@@ -655,6 +659,7 @@ export const exportTemplatesQuerySchema = listOrdersQuerySchema
     travelTo: true,
     flightNumber: true,
     passengerName: true,
+    recordedBy: true,
     invoiceStatus: true,
     invoiceLeg: true,
     invoiced: true,

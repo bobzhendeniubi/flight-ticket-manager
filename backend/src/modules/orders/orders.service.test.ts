@@ -169,6 +169,7 @@ import {
   summarizeBundleItems,
   deriveBundlePerAgeUnitPrices,
   buildOrderFilterWhere,
+  GUEST_RECORDED_BY_LABEL,
   resolveHasReturnLeg,
   splitSearchTerms,
   filterOrderIdsByDepartDate,
@@ -4546,6 +4547,37 @@ describe('buildOrderFilterWhere · 搜索/乘客姓名含中文名（公测反�
         ],
       },
     });
+  });
+
+  it('recordedBy → 下单账号显示名/邮箱任一命中；普通人名不牵连游客单', () => {
+    const where = buildOrderFilterWhere({ recordedBy: '王操作' });
+    const clause = ((where.AND ?? []) as Array<Record<string, unknown>>).find((c) => 'OR' in c);
+    expect(clause).toEqual({
+      OR: [
+        { user: { displayName: { contains: '王操作', mode: 'insensitive' } } },
+        { user: { email: { contains: '王操作', mode: 'insensitive' } } },
+      ],
+    });
+  });
+
+  it('recordedBy=散客 → 追加 userId:null，把整批游客单捞出来', () => {
+    const where = buildOrderFilterWhere({ recordedBy: GUEST_RECORDED_BY_LABEL });
+    const clause = ((where.AND ?? []) as Array<{ OR?: unknown[] }>).find((c) => 'OR' in c);
+    expect(clause?.OR).toContainEqual({ userId: null });
+  });
+
+  it('recordedBy 多词之间是 OR：列出这几位录入的订单，而非同时命中', () => {
+    const where = buildOrderFilterWhere({ recordedBy: '王操作 李录单' });
+    const clause = ((where.AND ?? []) as Array<{ OR?: unknown[] }>).find((c) => 'OR' in c);
+    // 2 个词 × 2 个账号字段 = 4 个候选，全在同一个 OR 里（不是两块 AND）
+    expect(clause?.OR).toHaveLength(4);
+  });
+
+  it('recordedBy 与 kind/出行日期等 items 维度子句共存互不覆盖', () => {
+    const where = buildOrderFilterWhere({ kind: 'FLIGHT', recordedBy: '王操作' });
+    const and = (where.AND ?? []) as Array<Record<string, unknown>>;
+    expect(and.filter((c) => 'items' in c)).toHaveLength(1);
+    expect(and.filter((c) => 'OR' in c)).toHaveLength(1);
   });
 });
 

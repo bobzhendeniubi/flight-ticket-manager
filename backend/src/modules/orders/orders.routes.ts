@@ -792,6 +792,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
           travelTo: true,
           flightNumber: true,
           passengerName: true,
+          recordedBy: true,
           invoiceLeg: true,
           invoiced: true,
           visaFulfillmentStatus: true,

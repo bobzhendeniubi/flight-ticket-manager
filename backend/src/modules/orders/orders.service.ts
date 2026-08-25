@@ -8218,6 +8218,7 @@ export type OrderListFilters = Pick<
   | 'travelTo'
   | 'flightNumber'
   | 'passengerName'
+  | 'recordedBy'
   | 'invoiceStatus'
   | 'invoiceLeg'
   | 'invoiced'
@@ -8301,6 +8302,12 @@ export function buildSearchTermClause(term: string): Prisma.OrderWhereInput {
     ],
   };
 }
+
+/**
+ * 游客单（userId=null，前台自助下单无录单账号）在「录入人员」口径下的统一标签。
+ * 列表筛选与各导出的「录入人员」列共用本常量，避免两处各写各的字面量漂移。
+ */
+export const GUEST_RECORDED_BY_LABEL = '散客';
 
 /**
  * 把列表/导出共用的筛选参数转成 Prisma where。
@@ -8481,6 +8488,22 @@ export function buildOrderFilterWhere(query: OrderListFilters): Prisma.OrderWher
         ]),
       },
     };
+  }
+  // 录入人员筛选（词间 OR）：匹配下单账号的显示名 / 邮箱 —— 与总表导出「录入人员」列同源，
+  // 保证「列表筛到的 = 导出那列写的」。
+  // 游客单（userId=null）没有录单账号，整类归到 GUEST_RECORDED_BY_LABEL（散客）：搜「散客」
+  // 把这批单全捞出来，而不是拿客人自己的名字冒充录入人。
+  // 走 andClauses 叠加，可与产品类型 / 出行日期 / 航班号等维度组合而不互相覆盖。
+  if (query.recordedBy) {
+    const terms = splitSearchTerms(query.recordedBy);
+    andClauses.push({
+      OR: terms.flatMap((term) => [
+        { user: { displayName: { contains: term, mode: 'insensitive' as const } } },
+        { user: { email: { contains: term, mode: 'insensitive' as const } } },
+        // 「散客」是固定标签、不是库里的字段：词命中标签本身才把整批游客单纳入（含前缀输入「散」）。
+        ...(GUEST_RECORDED_BY_LABEL.includes(term) ? [{ userId: null }] : []),
+      ]),
+    });
   }
   // 多词分词 AND 搜索（运营需求：一次输入多位乘客姓名要能定位同一订单）。
   // 每个词各自生成一个 OR 匹配块（订单号/联系人/电话/乘客名/护照号/各类备注），

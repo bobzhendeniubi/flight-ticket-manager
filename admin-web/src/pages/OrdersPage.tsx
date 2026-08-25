@@ -497,6 +497,8 @@ export function OrdersPage() {
   // ops 确认的筛选（航班号 / 乘客姓名 / 六态开票）— 后端过滤
   const [flightNumberFilter, setFlightNumberFilter] = useState('');
   const [passengerNameFilter, setPassengerNameFilter] = useState('');
+  // 录入人员筛选（后端过滤）：匹配下单账号显示名/邮箱，与导出「录入人员」列同源。
+  const [recordedByFilter, setRecordedByFilter] = useState('');
   // 六态开票筛选：组合值 `${leg}:${invoiced}`（如 'outbound:false'=去程未开），''=全部
   const [invoiceLegFilter, setInvoiceLegFilter] = useState('');
   // 签证办理状态筛选（后端过滤，与列表「签证」列的**办理进度小字**同源——列主徽标已改为录单签证要求）：
@@ -513,6 +515,7 @@ export function OrdersPage() {
   // 文本筛选防抖：停止输入 400ms 后才请求后端，避免每个键击打一次接口
   const [debouncedFlightNumber, setDebouncedFlightNumber] = useState('');
   const [debouncedPassengerName, setDebouncedPassengerName] = useState('');
+  const [debouncedRecordedBy, setDebouncedRecordedBy] = useState('');
   useEffect(() => {
     const t = setTimeout(() => setDebouncedFlightNumber(flightNumberFilter), 400);
     return () => clearTimeout(t);
@@ -521,6 +524,10 @@ export function OrdersPage() {
     const t = setTimeout(() => setDebouncedPassengerName(passengerNameFilter), 400);
     return () => clearTimeout(t);
   }, [passengerNameFilter]);
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedRecordedBy(recordedByFilter), 400);
+    return () => clearTimeout(t);
+  }, [recordedByFilter]);
   // 搜索防抖 300ms 后透传后端（乘客中英文名可搜）；深链 ?q= 也走这条，命中订单会被后端召回。
   useEffect(() => {
     const t = setTimeout(() => setDebouncedSearch(search), 300);
@@ -540,6 +547,7 @@ export function OrdersPage() {
     if (claimFilter === 'unclaimed') q.unclaimedOnly = '1';
     if (debouncedFlightNumber.trim()) q.flightNumber = debouncedFlightNumber.trim();
     if (debouncedPassengerName.trim()) q.passengerName = debouncedPassengerName.trim();
+    if (debouncedRecordedBy.trim()) q.recordedBy = debouncedRecordedBy.trim();
     const invoiceLegParsed = parseInvoiceLegFilter(invoiceLegFilter);
     if (invoiceLegParsed) {
       q.invoiceLeg = invoiceLegParsed.invoiceLeg;
@@ -553,7 +561,7 @@ export function OrdersPage() {
     if (tripTypeFilter) q.tripType = tripTypeFilter;
     if (debouncedSearch.trim()) q.search = debouncedSearch.trim();
     return q;
-  }, [createdFromParam, createdToParam, travelFrom, travelTo, claimFilter, debouncedFlightNumber, debouncedPassengerName, invoiceLegFilter, visaFilterCode, tripTypeFilter, debouncedSearch]);
+  }, [createdFromParam, createdToParam, travelFrom, travelTo, claimFilter, debouncedFlightNumber, debouncedPassengerName, debouncedRecordedBy, invoiceLegFilter, visaFilterCode, tripTypeFilter, debouncedSearch]);
   // 三模板筛选导出（全岗可用/票务专用/签证专用）
   const [exportTemplate, setExportTemplate] = useState<OrderExportTemplate>('full');
   const [exporting, setExporting] = useState(false);
@@ -1359,6 +1367,7 @@ export function OrdersPage() {
         travelTo: resolvedTravel.travelTo,
         flightNumber: flightNumberFilter.trim() || undefined,
         passengerName: passengerNameFilter.trim() || undefined,
+        recordedBy: recordedByFilter.trim() || undefined,
         // 六态开票筛选（与列表同源）——票务岗「7/10 去程未开 → 导出」就走这条。
         invoiceLeg: parseInvoiceLegFilter(invoiceLegFilter)?.invoiceLeg,
         invoiced: parseInvoiceLegFilter(invoiceLegFilter)?.invoiced,
@@ -1506,7 +1515,7 @@ export function OrdersPage() {
             // 也纳入判定，只要任一条件生效就高亮显示「已筛选」。
             const hasBackendFilter = Boolean(
               createdFrom || createdTo || travelFrom || travelTo ||
-              flightNumberFilter.trim() || passengerNameFilter.trim() ||
+              flightNumberFilter.trim() || passengerNameFilter.trim() || recordedByFilter.trim() ||
               invoiceLegFilter || visaFilterCode || tripTypeFilter || claimFilter,
             );
             const hasFrontendFilter = filtered.length !== orders.length;
@@ -2042,6 +2051,23 @@ export function OrdersPage() {
             </div>
           </div>
           <div>
+            <label className="label">录入人员</label>
+            <div className="relative">
+              <input
+                className="input"
+                placeholder="录单账号名 / 散客"
+                value={recordedByFilter}
+                onChange={(e) => setRecordedByFilter(e.target.value)}
+                title="按录单人筛选：匹配下单账号的姓名/邮箱，与导出表「录入人员」列同一口径。前台自助下单无录单账号，整类记作「散客」——搜「散客」即列出这批单。填多个名字＝列出这几位录入的订单。"
+              />
+              {recordedByFilter !== debouncedRecordedBy && (
+                <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-ink-muted">
+                  搜索中…
+                </span>
+              )}
+            </div>
+          </div>
+          <div>
             <label className="label">开票筛选</label>
             <select
               className="input"
@@ -2085,7 +2111,7 @@ export function OrdersPage() {
             />
           </div>
         </div>
-        {(statusFilter || kindFilter || tripTypeFilter || channelFilter || agentFilter || search || flightNumberFilter || passengerNameFilter || invoiceLegFilter || visaFilterCode || createdFrom || createdTo || travelFrom || travelTo) && (
+        {(statusFilter || kindFilter || tripTypeFilter || channelFilter || agentFilter || search || flightNumberFilter || passengerNameFilter || recordedByFilter || invoiceLegFilter || visaFilterCode || createdFrom || createdTo || travelFrom || travelTo) && (
           <div className="mt-3 flex items-center justify-between text-xs text-slate-500">
             {/* 日期筛选回显 — 两个框各自独立生效，只填一个就是开区间；把当前生效的条件和命中单数
                 摊开写清楚，填了「从」却看到更晚的订单时一眼就知道为什么，不用猜。 */}
@@ -2120,7 +2146,7 @@ export function OrdersPage() {
               className="text-brand hover:text-brand-dark"
               onClick={() => {
                 setStatusFilter(''); setKindFilter(''); setChannelFilter(''); setAgentFilter(''); setSearch('');
-                setFlightNumberFilter(''); setPassengerNameFilter(''); setInvoiceLegFilter(''); setVisaFilterCode(''); setTripTypeFilter('');
+                setFlightNumberFilter(''); setPassengerNameFilter(''); setRecordedByFilter(''); setInvoiceLegFilter(''); setVisaFilterCode(''); setTripTypeFilter('');
                 setCreatedFrom(''); setCreatedTo(''); setCreatedFromTime(''); setCreatedToTime(''); setTravelFrom(''); setTravelTo('');
               }}
             >

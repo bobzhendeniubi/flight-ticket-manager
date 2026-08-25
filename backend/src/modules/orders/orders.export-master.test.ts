@@ -311,6 +311,14 @@ describe('orderToMasterRows', () => {
     expect(r1.notes).toContain('蜜月');
   });
 
+  it('游客单（无录单账号）录入人员记「散客」，不拿客人自己的名字冒充', () => {
+    const order = fixtureRoundTripBundle();
+    order.user = null;
+    order.guestName = '路人甲';
+    const rows = orderToMasterRows(order);
+    expect(rows.every((r) => r.recordedBy === '散客')).toBe(true);
+  });
+
   it('立减金额列汇总未撤销快照并按乘客人数均摊，排除 revoked 行', () => {
     const order = fixtureRoundTripBundle();
     order.items.push({

@@ -39,7 +39,7 @@ import { toAlpha3 } from './nationality.js';
 import { parseRoomGroups, resolveExportHotelName } from './orders.export-room-allocation.js';
 import { nameWithTitle, pnrName, VISA_REQUIREMENT_LABEL } from './orders.export-templates.js';
 import { filterExportOrdersByDepartDate } from './orders.export-depart-filter.js';
-import { buildOrderFilterWhere } from './orders.service.js';
+import { buildOrderFilterWhere, GUEST_RECORDED_BY_LABEL } from './orders.service.js';
 import { determineFlightLegs } from './ticketing-cap.js';
 
 // ── 岗位视图 ──────────────────────────────────────────────────────────────
@@ -679,7 +679,8 @@ export function orderToMasterRows(
   if (order.systemInvoiced) invoicedParts.push('系统已开');
   const invoiceStatus = invoicedParts.length > 0 ? invoicedParts.join('/') : '未开';
   const recordedAt = fmtDateTime(order.createdAt);
-  const recordedBy = order.user?.displayName ?? order.user?.email ?? order.guestName ?? '';
+  // 游客单（user=null）没有录单账号 → 统一记「散客」，不拿客人自己的名字冒充录入人。
+  const recordedBy = order.user?.displayName ?? order.user?.email ?? GUEST_RECORDED_BY_LABEL;
   const roomGroups = parseRoomGroups(order.roomAssignment);
   // 有酒店 = 任何订单行关联了酒店房型（不限 kind）。套餐(BUNDLE)把房型盖在 BUNDLE 行上，
   // 只认 kind==='HOTEL' 会让套餐单永远不显示"未分房"。分房情况据此对未分房乘客回落"未分房"。

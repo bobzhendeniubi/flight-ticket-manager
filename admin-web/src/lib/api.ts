@@ -1600,6 +1600,11 @@ export interface ListOrdersParams {
   unclaimedOnly?: string; // '1' = 只看未接单
   flightNumber?: string; // 订单含该航班号的 FLIGHT 行（不区分大小写）
   passengerName?: string; // 乘客姓名模糊匹配
+  /**
+   * 录入人员模糊匹配 —— 与导出「录入人员」列同源（下单账号 displayName → email；游客单无录单
+   * 账号，整类记作「散客」）。多词之间 OR：填几个人名＝列出这几位录入的订单。
+   */
+  recordedBy?: string;
   invoiceStatus?: InvoiceStatus;
   /**
    * 六态开票筛选（组合式）：invoiceLeg = 维度（去程/回程/系统），invoiced = 已开/未开。
@@ -1643,6 +1648,8 @@ export interface OrdersTemplateExportParams {
   tripType?: 'oneway' | 'roundtrip';
   flightNumber?: string;
   passengerName?: string;
+  /** 录入人员模糊匹配；与 listOrders 同款，保证「导出=列表所见」。 */
+  recordedBy?: string;
   invoiceStatus?: InvoiceStatus;
   /** 六态开票筛选（组合式）；与 listOrders 同款，用于「筛选后导出」。 */
   invoiceLeg?: InvoiceLeg;
