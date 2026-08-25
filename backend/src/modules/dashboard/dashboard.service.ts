@@ -8,6 +8,7 @@
  */
 import { OrderStatus, Prisma } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
+import { businessDateISO, startOfBusinessDayUtc } from '../../lib/business-time.js';
 
 const PAID_LIKE_STATUSES: OrderStatus[] = [
   'PAID', 'PROCESSING', 'TICKETED', 'COMPLETED', 'CHANGE_REQUESTED', 'CHANGED',
@@ -16,12 +17,16 @@ const PAID_LIKE_STATUSES: OrderStatus[] = [
 export class DashboardService {
   async getKpi() {
     const now = new Date();
-    const todayStart = startOfDayUtc(now);
+    const todayStart = startOfBusinessDayUtc(now);
     const tomorrowStart = new Date(todayStart.getTime() + 86400000);
     const yesterdayStart = new Date(todayStart.getTime() - 86400000);
 
-    const thisMonthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
-    const lastMonthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
+    const [businessYear, businessMonth] = businessDateISO(now).split('-').map(Number);
+    const thisMonthStart = localMonthStartUtc(businessYear, businessMonth);
+    const lastMonthStart = localMonthStartUtc(
+      businessMonth === 1 ? businessYear - 1 : businessYear,
+      businessMonth === 1 ? 12 : businessMonth - 1,
+    );
 
     const activeWindow = new Date(now.getTime() - 30 * 86400000);
 
@@ -70,14 +75,15 @@ export class DashboardService {
   /** 最近 N 天时间序列（N 默认 7）— 一次 SQL groupBy 完成，无 N+1 */
   async getDailySeries(days = 7) {
     const now = new Date();
-    const todayStart = startOfDayUtc(now);
+    const todayStart = startOfBusinessDayUtc(now);
     const windowStart = new Date(todayStart.getTime() - (days - 1) * 86400000);
     const windowEnd = new Date(todayStart.getTime() + 86400000);
 
-    // 按 UTC 日期聚合（date_trunc）
+    // createdAt 是按 UTC 存储的 naive timestamp：先按 UTC 解释成 timestamptz，
+    // 再折成上海墙钟 timestamp，最后按上海日聚合。
     const rows = await prisma.$queryRaw<Array<{ day: Date; revenue: string; orders: bigint }>>`
       SELECT
-        date_trunc('day', "createdAt" AT TIME ZONE 'UTC')::date AS day,
+        date_trunc('day', ("createdAt" AT TIME ZONE 'UTC') AT TIME ZONE 'Asia/Shanghai')::date AS day,
         COALESCE(SUM(total), 0)::text AS revenue,
         COUNT(*)::bigint AS orders
       FROM "Order"
@@ -100,11 +106,10 @@ export class DashboardService {
     const series: Array<{ date: string; revenue: number; orders: number }> = [];
     for (let i = days - 1; i >= 0; i--) {
       const dayStart = new Date(todayStart.getTime() - i * 86400000);
-      const iso = dayStart.toISOString().slice(0, 10);
-      const mm = String(dayStart.getUTCMonth() + 1).padStart(2, '0');
-      const dd = String(dayStart.getUTCDate()).padStart(2, '0');
+      const iso = businessDateISO(dayStart);
+      const [, month, day] = iso.split('-');
       const agg = byDate.get(iso) ?? { revenue: 0, orders: 0 };
-      series.push({ date: `${mm}-${dd}`, revenue: agg.revenue, orders: agg.orders });
+      series.push({ date: `${month}-${day}`, revenue: agg.revenue, orders: agg.orders });
     }
     return series;
   }
@@ -112,7 +117,8 @@ export class DashboardService {
   /** Top 5 代理按本月 GMV 排名 */
   async topAgentsThisMonth() {
     const now = new Date();
-    const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+    const [businessYear, businessMonth] = businessDateISO(now).split('-').map(Number);
+    const monthStart = localMonthStartUtc(businessYear, businessMonth);
 
     const rows = await prisma.order.groupBy({
       by: ['agentId'],
@@ -149,8 +155,8 @@ export class DashboardService {
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
-function startOfDayUtc(d: Date): Date {
-  return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+function localMonthStartUtc(year: number, month: number): Date {
+  return new Date(`${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-01T00:00:00.000+08:00`);
 }
 
 function pctChange(cur: number, prev: number): number {

@@ -8,12 +8,17 @@
  *
  * 日期 fixture 全部相对"今天"动态生成，避免用例随日历过期。
  */
-import { describe, it, expect, vi } from 'vitest';
+import { afterAll, describe, it, expect, vi } from 'vitest';
 
 // 默认 prisma 不参与（全部走注入 client）—— 仍需 mock 掉避免真实连接配置
 vi.mock('../../db/prisma.js', () => ({ prisma: {} }));
 
+vi.useFakeTimers();
+vi.setSystemTime(new Date('2026-08-24T17:00:00.000Z'));
+afterAll(() => vi.useRealTimers());
+
 import type { Gender, PrismaClient } from '@prisma/client';
+import { businessDateISO } from '../../lib/business-time.js';
 
 /** 拼房单出行人性别 fixture：单出行人套餐单的 order.passengers 形状（gender 明确类型，避免 string 收窄丢失）。*/
 const solo = (gender: Gender | null): { order: { passengers: { gender: Gender | null }[] } } => ({
@@ -52,7 +57,7 @@ const roomAssignmentOf = (groupSizes: number[]) => ({
 });
 
 const DAY_MS = 24 * 60 * 60 * 1000;
-const todayStr = new Date().toISOString().slice(0, 10);
+const todayStr = businessDateISO(new Date());
 const todayMs = new Date(`${todayStr}T00:00:00.000Z`).getTime();
 
 /** 距今 n 天的 UTC 零点 Date / YYYY-MM-DD。*/
@@ -120,6 +125,12 @@ describe('getAlerts', () => {
   it('超卖 / 富余 / 班次超员三线齐报', async () => {
     const client = fakeClient({ paxCounts: [195, 100] });
     const alerts = await getAlerts(14, client);
+
+    const flightScheduleFindMany = client.flightSchedule.findMany as unknown as ReturnType<typeof vi.fn>;
+    expect(flightScheduleFindMany.mock.calls[0][0].where.departureTime).toEqual({
+      gte: new Date('2026-08-24T16:00:00.000Z'),
+      lt: new Date('2026-09-23T16:00:00.000Z'),
+    });
 
     // 今晚 block=1 used=2 → 超卖 1 间
     expect(alerts.oversold).toEqual([

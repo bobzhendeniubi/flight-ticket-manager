@@ -34,8 +34,8 @@ import {
   sumCompletedRefundsWithinTx,
 } from '../../lib/funds-guard.js';
 import { writeAudit } from '../../lib/audit.js';
+import { localDateISO } from '../../lib/flight-time.js';
 import { PaymentsService } from '../payments/payments.service.js';
-import { earliestFlightDeparture } from '../orders/pnr-export.js';
 import type {
   AllocateBatchInput,
   AllocateReceiptInput,
@@ -217,13 +217,39 @@ function earliestHotelCheckIn(
 function orderDepartDate(
   items: Array<{
     kind: string;
-    flightSchedule?: { departureTime: Date } | null;
+    flightSchedule?: { departureTime: Date; departureTz?: string | null } | null;
     hotelCheckIn?: Date | null;
   }>,
 ): string | null {
-  const flight = earliestFlightDeparture(items);
-  if (flight) return fmtDateOnly(flight);
+  let earliestFlight: { departureTime: Date; departureTz?: string | null } | null = null;
+  for (const item of items) {
+    if (item.kind !== 'FLIGHT' || !item.flightSchedule) continue;
+    if (
+      !earliestFlight
+      || item.flightSchedule.departureTime < earliestFlight.departureTime
+      || (
+        item.flightSchedule.departureTime.getTime() === earliestFlight.departureTime.getTime()
+        && compareFlightTimezones(item.flightSchedule.departureTz, earliestFlight.departureTz) < 0
+      )
+    ) {
+      earliestFlight = item.flightSchedule;
+    }
+  }
+  if (earliestFlight) return localDateISO(earliestFlight.departureTime, earliestFlight.departureTz);
   return fmtDateOnly(earliestHotelCheckIn(items));
+}
+
+/** 同一时刻的班次也要稳定选出一个，避免未排序关系数组导致导出日期漂移。 */
+function compareFlightTimezones(
+  left: string | null | undefined,
+  right: string | null | undefined,
+): number {
+  const leftHasValue = Boolean(left);
+  const rightHasValue = Boolean(right);
+  if (leftHasValue !== rightHasValue) return leftHasValue ? -1 : 1;
+  const leftValue = left ?? '';
+  const rightValue = right ?? '';
+  return leftValue < rightValue ? -1 : leftValue > rightValue ? 1 : 0;
 }
 
 /**
@@ -1422,7 +1448,7 @@ export class ReceiptsService {
           select: {
             kind: true,
             hotelCheckIn: true,
-            flightSchedule: { select: { departureTime: true } },
+            flightSchedule: { select: { departureTime: true, departureTz: true } },
           },
         },
       },

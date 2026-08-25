@@ -17,6 +17,7 @@
  */
 import { OrderItemKind, OrderStatus, Prisma, type Gender, type PrismaClient } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
+import { businessDateISO, startOfBusinessDayUtc } from '../../lib/business-time.js';
 import { BadRequestError, NotFoundError } from '../../lib/errors.js';
 import { fmtDepartureLocalDate } from '../orders/passport-zip.js';
 import type { CreateBlockPeriodBody, UpdateBlockPeriodBody } from './hotel-control.schemas.js';
@@ -1320,7 +1321,8 @@ export async function getAlerts(
   days: number,
   client: PrismaClient = defaultPrisma,
 ): Promise<HotelControlAlerts> {
-  const today = new Date().toISOString().slice(0, 10);
+  const now = new Date();
+  const today = businessDateISO(now);
   const fromMs = toDateOnly(today).getTime();
   // [today, today+days) → 销控板闭区间 [today, today+days-1]
   const to = new Date(fromMs + (days - 1) * DAY_MS).toISOString().slice(0, 10);
@@ -1372,7 +1374,7 @@ export async function getAlerts(
   }
 
   // 班次乘客数 > 开票上限 — 出发日在 [today, today+30d)
-  const fromD = toDateOnly(today);
+  const fromD = startOfBusinessDayUtc(now);
   const horizon = new Date(fromD.getTime() + SCHEDULE_ALERT_WINDOW_DAYS * DAY_MS);
   const schedules = await client.flightSchedule.findMany({
     where: { departureTime: { gte: fromD, lt: horizon } },

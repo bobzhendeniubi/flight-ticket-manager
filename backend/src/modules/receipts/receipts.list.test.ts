@@ -238,6 +238,52 @@ describe('ReceiptsService.list', () => {
   });
 });
 
+describe('ReceiptsService.matchCandidates 出发日期', () => {
+  it('航班出发日期按 departureTz 取当地日，不按 UTC 日切分', async () => {
+    orderFindMany.mockResolvedValue([
+      {
+        id: 'o-flight',
+        orderNumber: 'FT20260824001',
+        contactName: '测试联系人',
+        status: 'PAID',
+        createdAt: new Date('2026-08-24T17:00:00.000Z'),
+        total: new Prisma.Decimal(1000),
+        paidAmount: new Prisma.Decimal(0),
+        prepaymentOffset: new Prisma.Decimal(0),
+        adjustmentCny: 0,
+        agent: null,
+        items: [
+          {
+            kind: 'FLIGHT',
+            hotelCheckIn: null,
+            flightSchedule: {
+              // 同一时刻且缺少时区的候选排在前面；有 departureTz 的候选应稳定胜出。
+              departureTime: new Date('2026-08-24T16:30:00.000Z'),
+              departureTz: null,
+            },
+          },
+          {
+            kind: 'FLIGHT',
+            hotelCheckIn: null,
+            flightSchedule: {
+              // 上海 2026-08-25 00:30；UTC 日期仍是 2026-08-24。
+              departureTime: new Date('2026-08-24T16:30:00.000Z'),
+              departureTz: 'Asia/Shanghai',
+            },
+          },
+        ],
+      },
+    ]);
+
+    const rows = await service.matchCandidates({});
+
+    expect(rows[0].departureDate).toBe('2026-08-25');
+    expect(orderFindMany.mock.calls[0][0].select.items.select.flightSchedule).toEqual({
+      select: { departureTime: true, departureTz: true },
+    });
+  });
+});
+
 /**
  * 挂账池「未认领的钱不许静默消失」——核对表导出早就为此做了全量分页，
  * 列表/KPI 这侧此前还停在「按到账时间倒序取最近 500 条**任意状态**」。
