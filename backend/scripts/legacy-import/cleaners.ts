@@ -131,6 +131,10 @@ export function cleanMoney(raw: unknown, issueKey = 'money'): CleanResult<string
   if (!/^-?\d+(?:\.\d+)?$/u.test(value)) {
     return { value: null, issues: [...issues, `${issueKey}:invalid`] };
   }
+  // 档案表金额列是 Decimal(12,2)；老库实测有把内部 ID 粘进价格框的行（13 位连号），按无效处理。
+  if (Math.abs(Number(value)) >= 1e10) {
+    return { value: null, issues: [...issues, `${issueKey}:overflow`] };
+  }
   return { value, issues };
 }
 

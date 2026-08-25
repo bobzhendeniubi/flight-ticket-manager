@@ -26,6 +26,13 @@ describe('legacy cleaners', () => {
     expect(cleanMoney('12 CNY', 'finalPrice').issues).toContain('finalPrice:invalid');
   });
 
+  it('rejects money magnitudes that overflow the archive decimal column', () => {
+    const overflowed = cleanMoney('7382317174470', 'hotelPrice');
+    expect(overflowed.value).toBeNull();
+    expect(overflowed.issues).toContain('hotelPrice:overflow');
+    expect(cleanMoney('9999999999.99', 'hotelPrice').value).toBe('9999999999.99');
+  });
+
   it('normalizes gender and fills it from a title', () => {
     expect(cleanGender('', 'mr')).toBe('M');
     expect(cleanGender(null, 'MS')).toBe('F');
