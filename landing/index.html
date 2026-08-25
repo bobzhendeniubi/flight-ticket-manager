@@ -9,11 +9,26 @@
   <meta property="og:description" content="专业包机批发商 — 十余年包机运营，连接中国与世界。" />
   <meta property="og:type" content="website" />
   <meta property="og:url" content="https://citurtravel.com/" />
-  <meta property="og:image" content="https://citurtravel.com/assets/img/hero-network.jpg" />
+  <meta property="og:image" content="https://citurtravel.com/assets/img/hero-cloudtop.v2.jpg" />
   <link rel="canonical" href="https://citurtravel.com/" />
   <link rel="icon" type="image/png" href="assets/img/favicon.png" />
-  <link rel="preload" as="image" href="assets/img/hero-network.jpg" fetchpriority="high" />
-  <link rel="stylesheet" href="assets/css/landing.css" />
+  <link
+    rel="preload"
+    as="image"
+    type="image/avif"
+    imagesrcset="assets/img/hero-cloudtop-960.v2.avif 960w, assets/img/hero-cloudtop.v2.avif 1672w"
+    imagesizes="100vw"
+    href="assets/img/hero-cloudtop.v2.avif"
+    fetchpriority="high"
+  />
+  <link
+    rel="preload"
+    href="assets/font/noto-serif-sc-600.v2.woff2"
+    as="font"
+    type="font/woff2"
+    crossorigin
+  />
+  <link rel="stylesheet" href="assets/css/landing.v2.css" />
   <script type="application/ld+json">
   {
     "@context": "https://schema.org",
@@ -47,7 +62,7 @@
         <li><a href="#routes">航线网络</a></li>
         <li><a href="#partners">合作伙伴</a></li>
       </ul>
-      <a class="btn btn-gold nav-cta" href="https://store.citurtravel.com" rel="noopener">在线订票</a>
+      <a class="btn nav-cta" href="https://store.citurtravel.com" rel="noopener">在线订票</a>
     </nav>
   </header>
 
@@ -55,42 +70,76 @@
 
     <!-- ======================= HERO ======================= -->
     <section class="hero" aria-labelledby="hero-heading">
-      <div class="hero-bg" role="presentation"></div>
+      <div class="hero-media" role="presentation">
+        <picture>
+          <source
+            type="image/avif"
+            srcset="assets/img/hero-cloudtop-960.v2.avif 960w, assets/img/hero-cloudtop.v2.avif 1672w"
+            sizes="100vw"
+          />
+          <source
+            type="image/webp"
+            srcset="assets/img/hero-cloudtop-960.v2.webp 960w, assets/img/hero-cloudtop.v2.webp 1672w"
+            sizes="100vw"
+          />
+          <img
+            src="assets/img/hero-cloudtop.v2.jpg"
+            srcset="assets/img/hero-cloudtop-960.v2.jpg 960w, assets/img/hero-cloudtop.v2.jpg 1672w"
+            sizes="100vw"
+            width="1672"
+            height="941"
+            alt="舷窗外的云层与机翼，日出时分"
+            fetchpriority="high"
+            decoding="async"
+          />
+        </picture>
+      </div>
       <div class="hero-content">
-        <p class="kicker reveal">Professional&nbsp;Charter&nbsp;Wholesaler</p>
-        <h1 id="hero-heading" class="reveal d1">世途旅游</h1>
-        <p class="hero-sub reveal d2">专业包机批发商&nbsp;·&nbsp;连接中国与世界</p>
-        <p class="hero-en reveal d2">SICHUAN&nbsp;CITUR&nbsp;TRAVEL&nbsp;CO.,&nbsp;LTD.</p>
-        <div class="hero-actions reveal d3">
-          <a class="btn btn-gold" href="https://store.citurtravel.com" rel="noopener">在线订票</a>
-          <a class="btn btn-ghost" href="#about">了解世途</a>
+        <p class="eyebrow hero-kicker" data-stage="0" style="--stage:0">Professional&nbsp;Charter&nbsp;Wholesaler</p>
+        <h1 id="hero-heading" data-stage="0" style="--stage:0">世途旅游</h1>
+        <p class="hero-sub" data-stage="1" style="--stage:1">专业包机批发商&nbsp;·&nbsp;连接中国与世界</p>
+        <p class="hero-en" data-stage="2" style="--stage:2">SICHUAN&nbsp;CITUR&nbsp;TRAVEL&nbsp;CO.,&nbsp;LTD.</p>
+        <div class="hero-actions" data-stage="2" style="--stage:2">
+          <a class="btn btn-primary" href="https://store.citurtravel.com" rel="noopener">在线订票</a>
+          <a class="btn" href="#about">了解世途</a>
         </div>
       </div>
-      <dl class="hero-stats reveal d4">
-        <div><dt><span data-count="10">0</span><i>+</i></dt><dd>年包机运营经验</dd></div>
-        <div><dt><span data-count="24">0</span></dt><dd>条已执飞包机航线</dd></div>
-        <div><dt><span data-count="700">0</span><i>+</i></dt><dd>家全国合作旅行社</dd></div>
-        <div><dt><span data-count="200000">0</span><i>+</i></dt><dd>单航线服务旅客</dd></div>
+    </section>
+
+    <!-- ======================= 数据条 ======================= -->
+    <section class="stats" aria-label="核心数据">
+      <dl class="stats-grid" data-stage="3" style="--stage:3">
+        <div><dt>10<i>+</i></dt><dd>年包机运营经验</dd></div>
+        <div><dt>24</dt><dd>条已执飞包机航线</dd></div>
+        <div><dt>700<i>+</i></dt><dd>家全国合作旅行社</dd></div>
+        <div><dt>20<i>万+</i></dt><dd>单航线服务旅客</dd></div>
       </dl>
     </section>
 
     <!-- ======================= 公司简介 ======================= -->
     <section class="section about" id="about" aria-labelledby="about-heading">
-      <div class="section-head reveal">
-        <p class="kicker">Company&nbsp;Introduction</p>
+      <div class="section-head">
+        <p class="eyebrow">Company&nbsp;Introduction</p>
         <h2 id="about-heading">公司简介</h2>
       </div>
       <div class="about-grid">
-        <figure class="about-photo reveal">
-          <img src="assets/img/office-reception.jpg" alt="世途旅游成都总部前台" width="1400" height="1050" loading="lazy" />
+        <figure class="about-photo">
+          <img
+            src="assets/img/office-reception.v2.jpg"
+            alt="世途旅游成都总部前台"
+            width="1400"
+            height="1050"
+            loading="lazy"
+            decoding="async"
+          />
           <figcaption>成都总部 · 自有办公区超 1,000㎡</figcaption>
         </figure>
         <div class="about-copy">
-          <p class="lede reveal">自 2013 年起深耕中越包机市场，<br />十余年从未间断。</p>
-          <p class="reveal">四川世途旅游股份有限公司自 2013 年开启中国—越南包机业务，先后开通覆盖华北、华中、西南、华南地区的 <strong>24 条包机航线</strong>。专业团队分工协作，与全球包机业务接轨。</p>
-          <p class="reveal">2016 年起，公司发展进入快车道，成为<strong>越南航空（VN）与太平洋航空（BL）在中国最大的代理商</strong>；2018 年成功将越竹航空（Bamboo&nbsp;Airways）引入中国市场，出任其<strong>中国区总代理（GSA）</strong>。</p>
-          <p class="reveal">作为首家将越南航司引入澳门市场的包机企业，世途率先开拓了澳门—越南旅游航线格局，是该市场公认的先行者。</p>
-          <ul class="about-points reveal">
+          <p class="lede">自 2013 年起深耕中越包机市场，<br />十余年从未间断。</p>
+          <p>四川世途旅游股份有限公司自 2013 年开启中国—越南包机业务，先后开通覆盖华北、华中、西南、华南地区的 <strong>24 条包机航线</strong>。专业团队分工协作，与全球包机业务接轨。</p>
+          <p>2016 年起，公司发展进入快车道，成为<strong>越南航空（VN）与太平洋航空（BL）在中国最大的代理商</strong>；2018 年成功将越竹航空（Bamboo&nbsp;Airways）引入中国市场，出任其<strong>中国区总代理（GSA）</strong>。</p>
+          <p>作为首家将越南航司引入澳门市场的包机企业，世途率先开拓了澳门—越南旅游航线格局，是该市场公认的先行者。</p>
+          <ul class="about-points">
             <li><strong>澳门市场先行者</strong><span>首家引入越南航司，深度机场资源</span></li>
             <li><strong>全链条专业团队</strong><span>市场研究 · 航线规划 · 运营保障</span></li>
             <li><strong>稳定可持续经营</strong><span>专业、稳定、持续、共赢</span></li>
@@ -101,30 +150,32 @@
 
     <!-- ======================= 发展历程 ======================= -->
     <section class="section timeline" id="timeline" aria-labelledby="timeline-heading">
-      <div class="section-head reveal">
-        <p class="kicker">Milestones</p>
-        <h2 id="timeline-heading">发展历程</h2>
+      <div class="timeline-grid">
+        <div class="timeline-head">
+          <p class="eyebrow">Milestones</p>
+          <h2 id="timeline-heading">发展历程</h2>
+        </div>
+        <ol class="timeline-track">
+          <li><time>2013</time><h3>开启中越包机</h3><p>以成都海外旅游有限公司名义首航中国—越南包机，正式进入包机产业。</p></li>
+          <li><time>2016</time><h3>中国最大代理</h3><p>成为越南航空（VN）、太平洋航空（BL）在中国市场最大的代理商。</p></li>
+          <li><time>2018</time><h3>越竹航空中国区 GSA</h3><p>成功将 Bamboo&nbsp;Airways 引入中国市场，出任其中国区总代理。</p></li>
+          <li><time>2017–2023</time><h3>明星航线六年稳飞</h3><p>成都—岘港（CTU–DAD）连续六年稳定运营，累计 800+ 班、20万+ 旅客。</p></li>
+          <li><time>2025</time><h3>六条新航线</h3><p>澳门—万象、河内—济州、胡志明—济州、河内—澳门、芽庄—兰州、普吉—澳门。</p></li>
+          <li><time>未来五年</time><h3>洲际包机布局</h3><p>规划经安克雷奇/澳门中转的中美洲际包机航线，链接亚洲多点直飞。</p></li>
+        </ol>
       </div>
-      <ol class="timeline-track">
-        <li class="reveal"><time>2013</time><h3>开启中越包机</h3><p>以成都海外旅游有限公司名义首航中国—越南包机，正式进入包机产业。</p></li>
-        <li class="reveal"><time>2016</time><h3>中国最大代理</h3><p>成为越南航空（VN）、太平洋航空（BL）在中国市场最大的代理商。</p></li>
-        <li class="reveal"><time>2018</time><h3>越竹航空中国区 GSA</h3><p>成功将 Bamboo&nbsp;Airways 引入中国市场，出任其中国区总代理。</p></li>
-        <li class="reveal"><time>2017–2023</time><h3>明星航线六年稳飞</h3><p>成都—岘港（CTU–DAD）连续六年稳定运营，累计 800+ 班、20万+ 旅客。</p></li>
-        <li class="reveal"><time>2025</time><h3>六条新航线</h3><p>澳门—万象、河内—济州、胡志明—济州、河内—澳门、芽庄—兰州、普吉—澳门。</p></li>
-        <li class="reveal"><time>未来五年</time><h3>洲际包机布局</h3><p>规划经安克雷奇/澳门中转的中美洲际包机航线，链接亚洲多点直飞。</p></li>
-      </ol>
     </section>
 
     <!-- ======================= 业务模式 ======================= -->
     <section class="section model" id="model" aria-labelledby="model-heading">
-      <div class="section-head reveal">
-        <p class="kicker">Business&nbsp;Model</p>
+      <div class="section-head">
+        <p class="eyebrow">Business&nbsp;Model</p>
         <h2 id="model-heading">「一头一尾」业务模式</h2>
         <p class="section-sub">从包机批发到目的地落地服务的旅游产业链闭环，精准、及时、高效地把握出境市场。</p>
       </div>
       <div class="model-grid">
-        <article class="model-card reveal">
-          <span class="model-tag">一头 · FIRST</span>
+        <article class="model-card">
+          <span class="model-tag">一头&nbsp;·&nbsp;FIRST</span>
           <h3>包机批发</h3>
           <p>与各大航司深度合作，整合时刻与运力资源，向全国 700 余家旅行社及 OTA 渠道批发包机座位，软硬包灵活组合、多级运价体系。</p>
           <ul>
@@ -134,8 +185,8 @@
           </ul>
         </article>
         <span class="model-link" aria-hidden="true">&amp;</span>
-        <article class="model-card reveal">
-          <span class="model-tag">一尾 · LAST</span>
+        <article class="model-card model-card--dest">
+          <span class="model-tag">一尾&nbsp;·&nbsp;LAST</span>
           <h3>落地服务</h3>
           <p>在目的地深度绑定优质度假资源，机票 + 酒店 + 景区一站式打包，为渠道提升附加值，为旅客提供高品质度假体验。</p>
           <ul>
@@ -149,31 +200,95 @@
 
     <!-- ======================= 航线网络 ======================= -->
     <section class="section routes" id="routes" aria-labelledby="routes-heading">
-      <div class="section-head reveal">
-        <p class="kicker">Flight&nbsp;Network</p>
+      <div class="section-head">
+        <p class="eyebrow">Flight&nbsp;Network</p>
         <h2 id="routes-heading">航线网络</h2>
         <p class="section-sub">中国—越南 <strong>17</strong> 个通航点 · <strong>23</strong> 条航线，并持续拓展韩国、老挝及洲际市场。</p>
       </div>
 
-      <div class="board reveal" role="table" aria-label="主要包机航线">
-        <div class="board-head" role="row">
-          <span role="columnheader">航线 ROUTE</span>
-          <span role="columnheader">城市对 CITY&nbsp;PAIR</span>
-          <span role="columnheader">状态 STATUS</span>
-        </div>
-        <div class="board-row" role="row"><span class="code" role="cell">CTU&nbsp;⇄&nbsp;DAD</span><span role="cell">成都 — 岘港</span><span class="status on" role="cell">六年稳定运营</span></div>
-        <div class="board-row" role="row"><span class="code" role="cell">CXR&nbsp;⇄&nbsp;MFM</span><span role="cell">芽庄 — 澳门</span><span class="status on" role="cell">客座率 96%</span></div>
-        <div class="board-row" role="row"><span class="code" role="cell">DAD&nbsp;⇄&nbsp;MFM</span><span role="cell">岘港 — 澳门</span><span class="status on" role="cell">客座率 90%</span></div>
-        <div class="board-row" role="row"><span class="code" role="cell">HAN&nbsp;⇄&nbsp;TFU</span><span role="cell">河内 — 成都天府</span><span class="status on" role="cell">运营中</span></div>
-        <div class="board-row" role="row"><span class="code" role="cell">TWU&nbsp;⇄&nbsp;MFM</span><span role="cell">斗湖 — 澳门</span><span class="status on" role="cell">运营中</span></div>
-        <div class="board-row" role="row"><span class="code" role="cell">HKT&nbsp;⇄&nbsp;MFM</span><span role="cell">普吉 — 澳门</span><span class="status new" role="cell">2025 新开</span></div>
-        <div class="board-row" role="row"><span class="code" role="cell">HAN&nbsp;⇄&nbsp;CJU</span><span role="cell">河内 — 济州</span><span class="status new" role="cell">2025 新开</span></div>
-        <div class="board-row" role="row"><span class="code" role="cell">SGN&nbsp;⇄&nbsp;LAX</span><span role="cell">胡志明 — 洛杉矶（经澳门）</span><span class="status plan" role="cell">规划中</span></div>
+      <div class="route-map-wrap">
+        <svg class="route-map" viewBox="0 0 930 480" role="img" aria-label="中国西南与东南亚、东北亚包机航线示意图">
+          <g class="route-grid">
+            <line x1="0" y1="0" x2="0" y2="480" />
+            <line x1="93" y1="0" x2="93" y2="480" />
+            <line x1="186" y1="0" x2="186" y2="480" />
+            <line x1="279" y1="0" x2="279" y2="480" />
+            <line x1="372" y1="0" x2="372" y2="480" />
+            <line x1="465" y1="0" x2="465" y2="480" />
+            <line x1="558" y1="0" x2="558" y2="480" />
+            <line x1="651" y1="0" x2="651" y2="480" />
+            <line x1="744" y1="0" x2="744" y2="480" />
+            <line x1="837" y1="0" x2="837" y2="480" />
+            <line x1="930" y1="0" x2="930" y2="480" />
+            <line x1="0" y1="0" x2="930" y2="0" />
+            <line x1="0" y1="60" x2="930" y2="60" />
+            <line x1="0" y1="120" x2="930" y2="120" />
+            <line x1="0" y1="180" x2="930" y2="180" />
+            <line x1="0" y1="240" x2="930" y2="240" />
+            <line x1="0" y1="300" x2="930" y2="300" />
+            <line x1="0" y1="360" x2="930" y2="360" />
+            <line x1="0" y1="420" x2="930" y2="420" />
+            <line x1="0" y1="480" x2="930" y2="480" />
+          </g>
+
+          <g fill="none" stroke-linecap="round">
+            <path class="route-path is-signature" style="--i:0" pathLength="1" d="M291.1,135.8 Q323.1,226.4 395.2,290.0" />
+            <path class="route-path" style="--i:1" pathLength="1" d="M420.9,330.7 Q491.9,292.5 535.3,224.6" />
+            <path class="route-path" style="--i:2" pathLength="1" d="M395.2,290.0 Q473.8,275.5 535.3,224.6" />
+            <path class="route-path" style="--i:3" pathLength="1" d="M333.1,234.5 Q324.9,179.7 291.1,135.8" />
+            <path class="route-path" style="--i:4" pathLength="1" d="M653.1,415.4 Q619.0,304.7 535.3,224.6" />
+            <path class="route-path is-new" style="--i:5" pathLength="1" d="M138.1,374.8 Q356.2,351.3 535.3,224.6" />
+            <path class="route-path is-new" style="--i:6" pathLength="1" d="M333.1,234.5 Q619.0,238.6 870.7,103.0" />
+            <path class="route-path is-planned" style="--i:7" pathLength="1" d="M355.2,345.8 Q461.0,308.6 535.3,224.6" />
+            <path class="route-path" style="--i:8" pathLength="1" d="M535.3,224.6 Q386.2,209.6 248.6,269.1" />
+            <path class="route-path" style="--i:9" pathLength="1" d="M355.2,345.8 Q644.5,291.4 870.7,103.0" />
+            <path class="route-path" style="--i:10" pathLength="1" d="M333.1,234.5 Q435.5,255.8 535.3,224.6" />
+            <path class="route-path" style="--i:11" pathLength="1" d="M420.9,330.7 Q381.7,184.1 276.1,75.2" />
+          </g>
+
+          <g>
+            <circle class="route-dot" cx="291.1" cy="135.8" r="3.4" /><text class="route-label-code" x="291.1" y="119.8" text-anchor="middle">CTU/TFU</text><text class="route-label-city" x="291.1" y="130.8" text-anchor="middle">成都</text>
+            <circle class="route-dot" cx="276.1" cy="75.2" r="3.4" /><text class="route-label-code" x="276.1" y="59.2" text-anchor="middle">LHW</text><text class="route-label-city" x="276.1" y="70.2" text-anchor="middle">兰州</text>
+            <circle class="route-dot" cx="333.1" cy="234.5" r="3.4" /><text class="route-label-code" x="324.1" y="230.5" text-anchor="end">HAN</text><text class="route-label-city" x="324.1" y="241.5" text-anchor="end">河内</text>
+            <circle class="route-dot" cx="395.2" cy="290.0" r="3.4" /><text class="route-label-code" x="395.2" y="304.0" text-anchor="middle">DAD</text><text class="route-label-city" x="395.2" y="315.0" text-anchor="middle">岘港</text>
+            <circle class="route-dot" cx="420.9" cy="330.7" r="3.4" /><text class="route-label-code" x="429.9" y="326.7">CXR</text><text class="route-label-city" x="429.9" y="337.7">芽庄</text>
+            <circle class="route-dot" cx="355.2" cy="345.8" r="3.4" /><text class="route-label-code" x="355.2" y="359.8" text-anchor="middle">SGN</text><text class="route-label-city" x="355.2" y="370.8" text-anchor="middle">胡志明</text>
+            <circle class="route-dot" cx="535.3" cy="224.6" r="3.4" /><text class="route-label-code" x="544.3" y="220.6">MFM</text><text class="route-label-city" x="544.3" y="231.6">澳门</text>
+            <circle class="route-dot" cx="138.1" cy="374.8" r="3.4" /><text class="route-label-code" x="138.1" y="388.8" text-anchor="middle">HKT</text><text class="route-label-city" x="138.1" y="399.8" text-anchor="middle">普吉</text>
+            <circle class="route-dot" cx="653.1" cy="415.4" r="3.4" /><text class="route-label-code" x="653.1" y="429.4" text-anchor="middle">TWU</text><text class="route-label-city" x="653.1" y="440.4" text-anchor="middle">斗湖</text>
+            <circle class="route-dot" cx="870.7" cy="103.0" r="3.4" /><text class="route-label-code" x="870.7" y="87.0" text-anchor="middle">CJU</text><text class="route-label-city" x="870.7" y="98.0" text-anchor="middle">济州</text>
+            <circle class="route-dot" cx="248.6" cy="269.1" r="3.4" /><text class="route-label-code" x="248.6" y="283.1" text-anchor="middle">VTE</text><text class="route-label-city" x="248.6" y="294.1" text-anchor="middle">万象</text>
+          </g>
+        </svg>
+
+        <ul class="route-legend" aria-hidden="true">
+          <li><span class="legend-swatch legend-swatch--signature"></span>SIGNATURE&nbsp;ROUTE</li>
+          <li><span class="legend-swatch legend-swatch--new"></span>2025&nbsp;NEW</li>
+          <li><span class="legend-swatch legend-swatch--planned"></span>PLANNED</li>
+        </ul>
       </div>
 
-      <aside class="star-route reveal" aria-label="明星航线 成都—岘港">
+      <div class="board-scroll">
+        <div class="board" role="table" aria-label="主要包机航线">
+          <div class="board-head" role="row">
+            <span role="columnheader">航线 ROUTE</span>
+            <span role="columnheader">城市对 CITY&nbsp;PAIR</span>
+            <span role="columnheader">状态 STATUS</span>
+          </div>
+          <div class="board-row" role="row"><span class="code" role="cell">CTU&nbsp;⇄&nbsp;DAD</span><span role="cell">成都 — 岘港</span><span class="status on" role="cell">六年稳定运营</span></div>
+          <div class="board-row" role="row"><span class="code" role="cell">CXR&nbsp;⇄&nbsp;MFM</span><span role="cell">芽庄 — 澳门</span><span class="status on" role="cell">客座率 96%</span></div>
+          <div class="board-row" role="row"><span class="code" role="cell">DAD&nbsp;⇄&nbsp;MFM</span><span role="cell">岘港 — 澳门</span><span class="status on" role="cell">客座率 90%</span></div>
+          <div class="board-row" role="row"><span class="code" role="cell">HAN&nbsp;⇄&nbsp;TFU</span><span role="cell">河内 — 成都天府</span><span class="status on" role="cell">运营中</span></div>
+          <div class="board-row" role="row"><span class="code" role="cell">TWU&nbsp;⇄&nbsp;MFM</span><span role="cell">斗湖 — 澳门</span><span class="status on" role="cell">运营中</span></div>
+          <div class="board-row" role="row"><span class="code" role="cell">HKT&nbsp;⇄&nbsp;MFM</span><span role="cell">普吉 — 澳门</span><span class="status new" role="cell">2025 新开</span></div>
+          <div class="board-row" role="row"><span class="code" role="cell">HAN&nbsp;⇄&nbsp;CJU</span><span role="cell">河内 — 济州</span><span class="status new" role="cell">2025 新开</span></div>
+          <div class="board-row" role="row"><span class="code" role="cell">SGN&nbsp;⇄&nbsp;LAX</span><span role="cell">胡志明 — 洛杉矶（经澳门）</span><span class="status plan" role="cell">规划中</span></div>
+        </div>
+      </div>
+
+      <aside class="star-route" aria-label="明星航线 成都—岘港">
         <div class="star-title">
-          <p class="kicker">Signature&nbsp;Route</p>
+          <p class="eyebrow">Signature&nbsp;Route</p>
           <h3>成都 — 岘港</h3>
           <p class="star-note">世途独家运营 · 连续六年稳定执飞</p>
         </div>
@@ -187,22 +302,22 @@
 
     <!-- ======================= 合作伙伴 ======================= -->
     <section class="section partners" id="partners" aria-labelledby="partners-heading">
-      <div class="section-head reveal">
-        <p class="kicker">Airline&nbsp;Partners</p>
+      <div class="section-head">
+        <p class="eyebrow">Airline&nbsp;Partners</p>
         <h2 id="partners-heading">合作航司</h2>
         <p class="section-sub">与中外多家航司建立长期深度合作，覆盖中国—东南亚核心市场。</p>
       </div>
       <ul class="partner-grid">
-        <li class="reveal"><strong>VN</strong><span>越南航空</span><small>Vietnam Airlines</small></li>
-        <li class="reveal"><strong>QH</strong><span>越竹航空</span><small>Bamboo Airways · 中国区 GSA</small></li>
-        <li class="reveal"><strong>VJ</strong><span>越捷航空</span><small>VietJet Air</small></li>
-        <li class="reveal"><strong>NX</strong><span>澳门航空</span><small>Air Macau</small></li>
-        <li class="reveal"><strong>3U</strong><span>四川航空</span><small>Sichuan Airlines</small></li>
-        <li class="reveal"><strong>BL</strong><span>太平洋航空</span><small>Pacific Airlines</small></li>
-        <li class="reveal"><strong>DD</strong><span>皇雀航空</span><small>Nok Air</small></li>
-        <li class="reveal"><strong>OD</strong><span>马印航空</span><small>Batik Air Malaysia</small></li>
+        <li><strong>VN</strong><span>越南航空</span><small>Vietnam Airlines</small></li>
+        <li><strong>QH</strong><span>越竹航空</span><small>Bamboo Airways · 中国区 GSA</small></li>
+        <li><strong>VJ</strong><span>越捷航空</span><small>VietJet Air</small></li>
+        <li><strong>NX</strong><span>澳门航空</span><small>Air Macau</small></li>
+        <li><strong>3U</strong><span>四川航空</span><small>Sichuan Airlines</small></li>
+        <li><strong>BL</strong><span>太平洋航空</span><small>Pacific Airlines</small></li>
+        <li><strong>DD</strong><span>皇雀航空</span><small>Nok Air</small></li>
+        <li><strong>OD</strong><span>马印航空</span><small>Batik Air Malaysia</small></li>
       </ul>
-      <div class="channel-strip reveal">
+      <div class="channel-strip">
         <div><strong>700+</strong><span>全国合作旅行社</span></div>
         <div><strong>OTA</strong><span>主流在线旅游平台全覆盖</span></div>
         <div><strong>GDS</strong><span>TATA 账户 · 系统全面直连</span></div>
@@ -212,12 +327,12 @@
 
     <!-- ======================= CTA ======================= -->
     <section class="cta-band" aria-labelledby="cta-heading">
-      <div class="cta-inner reveal">
+      <div class="cta-inner">
         <h2 id="cta-heading">与世途一起<br />飞向下一个目的地</h2>
         <p>机票预订、包机合作、目的地资源对接 — 欢迎联系我们。</p>
         <div class="hero-actions">
-          <a class="btn btn-gold" href="https://store.citurtravel.com" rel="noopener">前往订票商城</a>
-          <a class="btn btn-ghost" href="https://store.citurtravel.com" rel="noopener">商务合作</a>
+          <a class="btn btn-primary" href="https://store.citurtravel.com" rel="noopener">前往订票商城</a>
+          <a class="btn" href="https://store.citurtravel.com" rel="noopener">商务合作</a>
         </div>
       </div>
     </section>
@@ -251,6 +366,6 @@
     </div>
   </footer>
 
-  <script src="assets/js/landing.js" defer></script>
+  <script src="assets/js/landing.v2.js" defer></script>
 </body>
 </html>
