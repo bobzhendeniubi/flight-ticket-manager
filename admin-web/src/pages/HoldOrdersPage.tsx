@@ -546,7 +546,9 @@ function CreateHoldModal({
 
   const makeLeg = useCallback(
     (date: string, flightId: string): LegDraft => {
-      const day = date || dateOptions[0] || '';
+      // 带进来的日期可能根本没有航班（筛选器默认「今天」，而最近一班在几天后）——
+      // 那样三级选择器会全空、余量显示 0，看着像坏了。回落到第一个有班次的日期。
+      const day = dateOptions.includes(date) ? date : (dateOptions[0] ?? '');
       const flightList = flightsOn(day);
       const flight = flightList.find((f) => f.id === flightId) ?? flightList[0];
       const schedule = flight ? schedulesOn(day, flight.id)[0] : undefined;
