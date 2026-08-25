@@ -10756,6 +10756,13 @@ async function createCommissionsForOrder(
   orderId: string,
   sellerAgentId: string,
   orderNumber?: string | null,
+  // 唯一的行为开关，只为「一次性补提脚本的 dry-run」而存在（见文件末尾的导出说明）：
+  // dry-run 会把本函数整段跑在一个**最后回滚掉的事务**里，用回滚后作废的写入换取
+  // 「与线上计提逐分钱一致」的预览。但第 4 步的零计提审计走的是全局 prisma（不在 tx 里），
+  // 回滚不掉——dry-run 会往审计表里刷一批 COMMISSION_ACCRUAL_EMPTY 的幽灵记录，
+  // 财务翻审计日志时会以为真发生过计提。故 dry-run 传 false 把它闭掉。
+  // 线上调用方不传 = undefined ≠ false → 行为与改动前完全一致（--apply 同样照常落审计）。
+  options?: { emitEmptyAccrualAudit?: boolean },
 ) {
   // 0. 幂等：粒度是 **(订单, productKind)**，不是「这单有没有任意一条记录」。
   // _updateStatusWithinTx 只在 toStatus==='PAID' 时调用本函数，正常状态机每单只会经过一次
@@ -10968,7 +10975,7 @@ async function createCommissionsForOrder(
   // 也不会因为业务事务回滚而丢/留；severity=WARNING 时它内部 catch 住所有异常只打 console
   // （只有 CRITICAL 才上抛），故审计失败绝不会影响计提本身。用 void 不 await，不让审计的
   // 网络往返把事务多按住一个 RTT。
-  if (createdCount === 0) {
+  if (createdCount === 0 && options?.emitEmptyAccrualAudit !== false) {
     void writeAudit({
       actor: { role: 'SYSTEM' },
       action: 'COMMISSION_ACCRUAL_EMPTY',
@@ -10990,3 +10997,16 @@ async function createCommissionsForOrder(
     });
   }
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// 一次性补提脚本（scripts/backfill-agent-commissions.ts）复用出口。
+//
+// 为什么必须导出、而不是让脚本自己算一遍：计提口径是「按出发日取费率 + 折扣按毛额比例分摊
+// 出净额基数 + 沿代理链取差额费率」三件事的组合，任何一处重写都会与本函数漂移，补出来的钱
+// 就和系统自己算的对不上——钱路径上这种漂移是不可接受的。脚本因此**整段调用本函数**
+// （dry-run 时跑在一个最后回滚的事务里），产出的记录逐分钱都是线上那段代码算的。
+//
+// deriveOrderDepartDate 一并导出只为报表：明细里给财务看的「出发日」必须就是上面 1.5 用作
+// 费率比对基准的那一个日期，另写一份取最早日期的逻辑同样会漂。
+// ────────────────────────────────────────────────────────────────────────────
+export { createCommissionsForOrder, deriveOrderDepartDate };
