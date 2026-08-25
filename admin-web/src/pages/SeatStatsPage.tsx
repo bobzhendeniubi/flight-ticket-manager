@@ -3,7 +3,10 @@
  *
  * 数据口径（demo 时遇到追问可以这样回答）：
  *   - 已售 = FlightSeatClass.sold（订单确认占库存的那一刻 +1）
- *   - 余票 = available = capacity − sold − locked（后端权威口径，与前台一致）
+ *   - 占位 = 占位单余座 Σ(占位数 − 已转正 − 已减员)。占位单是无名单库存实体（团队留位 /
+ *     代理切位），建单即压住座位但不进「已售」——所以只看「已售」会觉得"位置没少"，
+ *     真正少掉的座位在这一列。转正成订单后从占位挪进已售，不会两头重复计。
+ *   - 余票 = available = capacity − sold − locked − held（后端权威口径，与前台一致）
  *   - 总座 = capacity
  *   - 占用率 = sold / capacity（超售时 > 100%，进度条封顶显示但标红）
  *   - 超售 = 余票为负时的欠座数（航司减配 / 换机型把容量压到已售之下）。
@@ -55,6 +58,7 @@ interface ScheduleStat {
   seatClasses: RangeSchedule['seatClasses'];
   totalCapacity: number;
   totalSold: number;
+  totalHeld: number;
   totalAvailable: number;
   // 各舱位余位为负的部分之和 = 该班次欠了多少座（>0 即超售）。
   // 逐舱累加而不是看 totalAvailable：一舱超售、另一舱有余时净值可能仍为正，
@@ -102,6 +106,7 @@ export function SeatStatsPage() {
       const totalCapacity = s.seatClasses.reduce((sum, c) => sum + c.capacity, 0);
       const totalSold = s.seatClasses.reduce((sum, c) => sum + c.sold, 0);
       const totalAvailable = s.seatClasses.reduce((sum, c) => sum + c.available, 0);
+      const totalHeld = s.seatClasses.reduce((sum, c) => sum + c.held, 0);
       const oversoldSeats = s.seatClasses.reduce((sum, c) => sum + Math.max(0, -c.available), 0);
       return {
         id: s.id,
@@ -113,6 +118,7 @@ export function SeatStatsPage() {
         seatClasses: s.seatClasses,
         totalCapacity,
         totalSold,
+        totalHeld,
         totalAvailable,
         oversoldSeats,
         occupancy: totalCapacity > 0 ? totalSold / totalCapacity : 0,
@@ -231,6 +237,7 @@ export function SeatStatsPage() {
                 <th className="text-left">舱位明细</th>
                 <th className="text-right">总座位</th>
                 <th className="text-right">已售</th>
+                <th className="text-right" title="占位单压住的座位：团队留位 / 代理切位，还没转成订单，所以不计入已售">占位</th>
                 <th className="text-right">余票</th>
                 <th className="w-48">占用率</th>
               </tr>
@@ -238,7 +245,7 @@ export function SeatStatsPage() {
             <tbody>
               {loading && (
                 <tr>
-                  <td colSpan={7} className="px-3 py-8 text-center text-ink-muted">
+                  <td colSpan={8} className="px-3 py-8 text-center text-ink-muted">
                     加载中…
                   </td>
                 </tr>
@@ -269,6 +276,11 @@ export function SeatStatsPage() {
                             <span className={cabinOversold ? 'font-bold text-rose-700' : 'text-ink'}>
                               {c.sold}/{c.capacity}
                             </span>{' '}
+                            {c.held > 0 && (
+                              <span className="font-semibold text-amber-700" title="该舱位被占位单压住的座位（团队留位 / 代理切位），不计入已售">
+                                占{c.held}{' '}
+                              </span>
+                            )}
                             {cabinOversold && (
                               <span
                                 className="font-bold text-rose-700"
@@ -284,6 +296,10 @@ export function SeatStatsPage() {
                     </td>
                     <td className="text-right nums">{s.totalCapacity}</td>
                     <td className="text-right nums">{s.totalSold}</td>
+                    {/* 占位：0 用淡色，非 0 加重——「余票少了但已售没动」的答案就在这一列 */}
+                    <td className={`text-right nums ${s.totalHeld > 0 ? 'font-semibold text-amber-700' : 'text-ink-muted'}`}>
+                      {s.totalHeld}
+                    </td>
                     {(() => {
                       const avail = s.totalAvailable;
                       const oversold = s.oversoldSeats > 0;
@@ -314,7 +330,7 @@ export function SeatStatsPage() {
                 ))}
               {!loading && filtered.length === 0 && (
                 <tr>
-                  <td colSpan={7} className="px-3 py-8 text-center text-ink-muted">
+                  <td colSpan={8} className="px-3 py-8 text-center text-ink-muted">
                     没有数据
                   </td>
                 </tr>
