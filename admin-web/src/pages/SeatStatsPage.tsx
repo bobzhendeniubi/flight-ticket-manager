@@ -167,7 +167,9 @@ export function SeatStatsPage() {
       <section>
         <h1 className="page-title">航班座位统计</h1>
         <p className="page-sub">
-          实时统计自营航班的座位占用情况。余票口径：capacity − 已售 − 锁位（与前台一致）。
+          实时统计自营航班的座位占用情况。余票口径：总座位 − 已售 − 锁位 − 占位（与前台一致）。
+          「占位」是占位单压住的座位（团队留位 / 代理切位），建单即占座但不进「已售」——
+          只看已售会以为位置没少，少掉的座位在占位列。
           余票为负即<strong className="text-rose-700">超售</strong>（容量被调到已售之下，如航司减配 / 换机型），
           标红提醒协调；销售侧照旧按容量拒卖。
         </p>

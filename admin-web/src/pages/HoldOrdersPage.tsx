@@ -545,7 +545,7 @@ function CreateHoldModal({
   );
 
   const makeLeg = useCallback(
-    (date: string, flightId: string): LegDraft => {
+    (date: string, flightId: string, preferCabin?: CabinClass): LegDraft => {
       // 带进来的日期可能根本没有航班（筛选器默认「今天」，而最近一班在几天后）——
       // 那样三级选择器会全空、余量显示 0，看着像坏了。回落到第一个有班次的日期。
       const day = dateOptions.includes(date) ? date : (dateOptions[0] ?? '');
@@ -557,7 +557,8 @@ function CreateHoldModal({
         date: day,
         flightId: flight?.id ?? '',
         scheduleId: schedule?.id ?? '',
-        cabin: schedule?.seatClasses[0]?.cabin ?? 'ECONOMY',
+        // 回程通常与去程同舱；班次里排第一的舱位可能是只有几座的商务舱，拿它当默认很容易看岔。
+        cabin: (preferCabin && schedule?.seatClasses.some((c) => c.cabin === preferCabin) ? preferCabin : schedule?.seatClasses[0]?.cabin) ?? 'ECONOMY',
         price: 0,
       };
     },
@@ -685,7 +686,7 @@ function CreateHoldModal({
           <div>
             <div className="flex items-center justify-between">
               <p className="label mb-0">留位航段</p>
-              <button type="button" className="btn-secondary px-2 py-1 text-xs" onClick={() => setLegs((old) => [...old, makeLeg(old[old.length - 1]?.date ?? defaultDate, '')])}>
+              <button type="button" className="btn-secondary px-2 py-1 text-xs" onClick={() => setLegs((old) => [...old, makeLeg(old[old.length - 1]?.date ?? defaultDate, '', old[old.length - 1]?.cabin)])}>
                 + 添加航段（去程 / 回程）
               </button>
             </div>
