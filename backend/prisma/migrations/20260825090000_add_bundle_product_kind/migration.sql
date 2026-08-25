@@ -1,0 +1,11 @@
+-- 套餐（BUNDLE）纳入代理返佣计提：ProductKind 增加独立一档。
+--
+-- 此前 ProductKind 只有 FLIGHT/HOTEL/TRANSFER/VISA，而订单行 OrderItemKind 是有 BUNDLE 的，
+-- 于是计提侧的 kind 映射表查不到 BUNDLE → 套餐行被静默跳过，套餐地面收入一分佣金不计。
+-- 加这一档后套餐可与机票各配各的费率（BUNDLE 行 = 地面+加项收入，FLIGHT 腿 = 机票收入，
+-- 两者金额相加即全包价，互不重叠，不构成重复计佣）。
+--
+-- 纯增枚举值，不改列不改行：既有 CommissionRule / CommissionRecord 数据完全不受影响。
+-- IF NOT EXISTS 保证目标库被人工预加过该枚举值时迁移仍可幂等通过（PG12+ 支持在事务内
+-- ADD VALUE，只要同一事务里不使用该新值——本迁移不使用，故 Prisma 的事务包裹无碍）。
+ALTER TYPE "ProductKind" ADD VALUE IF NOT EXISTS 'BUNDLE';

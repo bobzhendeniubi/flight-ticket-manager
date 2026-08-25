@@ -399,11 +399,16 @@ model AgentRechargeRequest {
   @@index([agentId, createdAt])
 }
 
+// 返佣计提的产品维度（仅 CommissionRule / CommissionRecord 使用）。
+// BUNDLE 是**独立一档费率**，与 FLIGHT 并列、互不覆盖：套餐订单会拆成
+// FLIGHT 行（机票收入，走 FLIGHT 档）+ BUNDLE 行（地面+加项收入，走 BUNDLE 档），
+// 两者金额相加即全包价，所以同时计提不构成重复计佣。
 enum ProductKind {
   FLIGHT
   HOTEL
   TRANSFER
   VISA
+  BUNDLE
 }
 
 model CommissionRule {

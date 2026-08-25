@@ -4453,19 +4453,25 @@ export const api = {
       body: { newPassword },
     }),
 
-  // 佣金规则（A1）：读=当前生效费率（每产品一条）；写=仅 ADMIN，追加新生效规则（历史保留）
+  // 佣金规则（A1）：读=当前生效费率（每产品一条）+ 待生效费率（0825 复审补，每产品取最早的
+  // 未来生效规则——财务刚配的"9/1 起生效"要能在页面上看得见，不然会误以为没存上）；
+  // 写=内部岗位，追加新生效规则（历史保留）
   getCommissionRules: (token: string, agentId: string) =>
     apiFetch<{
-      rules: Record<'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA', { rate: number; effectiveFrom: string } | null>;
+      rules: Record<CommissionKind, { rate: number; effectiveFrom: string } | null>;
+      upcoming: Record<CommissionKind, { rate: number; effectiveFrom: string } | null>;
     }>(`/agents/${agentId}/commission-rules`, { token }),
   setCommissionRules: (
     token: string,
     agentId: string,
-    rates: Partial<Record<'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA', number>>,
+    rates: Partial<Record<CommissionKind, number>>,
+    // 生效日（可选，'YYYY-MM-DD'）：省略 = 此刻生效（原行为不变）；传入则从这天起飞的订单
+    // 开始按新费率计提。
+    effectiveFrom?: string,
   ) =>
     apiFetch<{ ok: boolean; rates: Record<string, number>; effectiveFrom: string }>(
       `/agents/${agentId}/commission-rules`,
-      { method: 'PUT', token, body: { rates } },
+      { method: 'PUT', token, body: effectiveFrom ? { rates, effectiveFrom } : { rates } },
     ),
 
   // Pricing — 日期等级 CRUD 已砍除（2026-07-17 审计 #19）：定价不消费其倍率、无后台页面调用，
@@ -5273,6 +5279,13 @@ export interface MonthlyPoint {
 }
 
 export type ProductKind = 'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA' | 'BUNDLE' | 'INSURANCE';
+
+/**
+ * 返佣计提的产品维度 —— 必须与后端 Prisma `enum ProductKind` 逐字对齐
+ * （后端没有 INSURANCE 这一档，故这里不能直接复用上面的 ProductKind）。
+ * 套餐（BUNDLE）是独立一档费率，与机票并列、各配各的，不是复用机票档。
+ */
+export type CommissionKind = 'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA' | 'BUNDLE';
 
 export interface CancellationTier {
   hoursBeforeDeparture: number;

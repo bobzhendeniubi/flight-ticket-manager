@@ -42,6 +42,9 @@ const { mockPrisma, mockGetHotelNightlyRemaining } = vi.hoisted(() => ({
     // findMany 另外还被"释放型流转的佣金冲销"步骤用到（wasHolding&&isReleasing 且非 PENDING_PAYMENT
     // 来源时无条件触达，即便订单没有代理——见 Bug 1 的 H→DRAFT 测试）。
     commissionRecord: { findFirst: vi.fn(), create: vi.fn(), findMany: vi.fn(), update: vi.fn() },
+    // 零计提审计（writeAudit）走全局 prisma，而全局 prisma 在本文件被整体 mock 掉了；
+    // 不给出 auditLog 桩，写审计会在 writeAudit 内部抛错被吞掉并刷 console.error。
+    auditLog: { create: vi.fn() },
     agent: { findUnique: vi.fn() },
     commissionRule: { findMany: vi.fn() },
     $executeRaw: vi.fn(),
@@ -789,9 +792,12 @@ describe('OrderService._updateStatusWithinTx · Bug 6：佣金创建幂等', () 
       .mockResolvedValueOnce({ visaStatus: null }); // createFulfillmentTasks 内部读
     mockPrisma.order.updateMany.mockResolvedValueOnce({ count: 1 });
     mockPrisma.orderStatusEvent.create.mockResolvedValueOnce({});
-    // 幂等命中：已有佣金记录 → createCommissionsForOrder 直接 return，不查链路/不建新记录。
-    mockPrisma.commissionRecord.findFirst.mockResolvedValueOnce({ id: 'existing-commission' });
-    mockPrisma.orderItem.findMany.mockResolvedValueOnce([]); // createFulfillmentTasks：无行可建任务
+    // 幂等命中：本单的 HOTEL 档已有佣金记录 → 该档跳过；单上再无其它可计提档
+    // → createCommissionsForOrder 提前 return，不查链路/不建新记录。
+    mockPrisma.commissionRecord.findMany.mockResolvedValueOnce([{ productKind: 'HOTEL' }]);
+    mockPrisma.orderItem.findMany
+      .mockResolvedValueOnce([{ id: 'item1', kind: 'HOTEL', amount: 1000 }]) // createCommissionsForOrder 的读
+      .mockResolvedValueOnce([]); // createFulfillmentTasks：无行可建任务
     mockPrisma.order.findUniqueOrThrow.mockResolvedValueOnce({ ...order, status: OrderStatus.PAID });
 
     await service._updateStatusWithinTx(
@@ -805,9 +811,10 @@ describe('OrderService._updateStatusWithinTx · Bug 6：佣金创建幂等', () 
       [],
     );
 
-    expect(mockPrisma.commissionRecord.findFirst).toHaveBeenCalledWith({
+    expect(mockPrisma.commissionRecord.findMany).toHaveBeenCalledWith({
       where: { orderId: 'ord1' },
-      select: { id: true },
+      select: { productKind: true },
+      distinct: ['productKind'],
     });
     expect(mockPrisma.commissionRecord.create).not.toHaveBeenCalled();
     // 幂等提前 return，链路解析（agent.findUnique/commissionRule.findMany）也不该被无谓触达。
@@ -826,7 +833,7 @@ describe('OrderService._updateStatusWithinTx · Bug 6：佣金创建幂等', () 
       .mockResolvedValueOnce({ visaStatus: null });
     mockPrisma.order.updateMany.mockResolvedValueOnce({ count: 1 });
     mockPrisma.orderStatusEvent.create.mockResolvedValueOnce({});
-    mockPrisma.commissionRecord.findFirst.mockResolvedValueOnce(null); // 首次 → 无既有记录
+    mockPrisma.commissionRecord.findMany.mockResolvedValueOnce([]); // 首次 → 一档都没计提过
     mockPrisma.orderItem.findMany
       .mockResolvedValueOnce([{ id: 'item1', kind: 'HOTEL', amount: 1000 }]) // createCommissionsForOrder 的读
       .mockResolvedValueOnce([]); // createFulfillmentTasks 的读

@@ -3,7 +3,7 @@
  */
 import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import { api, ApiError, ROSTER_FORMAT_LABEL, SETTLEMENT_MODE_LABEL, type AgentListItem, type CreateChildAgentInput, type CustomerSummary, type RosterFormat, type SettlementDiscountRule, type SettlementMode, type SettlementTier, type UpdateAgentInput } from '../lib/api';
+import { api, ApiError, ROSTER_FORMAT_LABEL, SETTLEMENT_MODE_LABEL, type AgentListItem, type CommissionKind, type CreateChildAgentInput, type CustomerSummary, type RosterFormat, type SettlementDiscountRule, type SettlementMode, type SettlementTier, type UpdateAgentInput } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { Icon } from '../components/Icon';
 import { useDialogA11y } from '../components/Modal';
@@ -773,54 +773,91 @@ function SettlementModeCard({
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 佣金规则（A1，2026-07-17 上线管理端读写）
+// 佣金规则（A1，2026-07-17 上线管理端读写；0825 复审补"待生效"展示）
 // ───────────────────────────────────────────────────────────────
-// 读：当前生效费率（每产品一条，与计提口径一致）。写：仅 ADMIN，保存即追加
-// 新生效规则（历史保留，旧单不受影响）。无规则 = 计提按 0 —— 醒目标红，不再静默。
+// 读：当前生效费率（每产品一条，与计提口径一致）+ 待生效费率（最早的未来生效规则，
+// 让财务配好"9/1 起生效"的费率后，保存完能立刻在页面上确认存上了，不会误以为没存）。
+// 写：ADMIN + STAFF（内部岗位，返佣口径归财务），保存即追加新生效规则（历史保留，
+// 旧单不受影响）。无规则 = 计提按 0 —— 醒目标红，不再静默。
 // ═══════════════════════════════════════════════════════════════
 
-const COMMISSION_KIND_LABEL: Record<'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA', string> = {
+// 一档费率的一条记录（当前生效 or 待生效，形状相同）。
+type CommissionRuleEntry = { rate: number; effectiveFrom: string } | null;
+
+// 键类型取自 api 的 CommissionKind（＝后端 Prisma ProductKind）：后端加档时这里编译期就会报缺键，
+// 不会再出现「后端能配、页面上没这一行」的半截状态。
+const COMMISSION_KIND_LABEL: Record<CommissionKind, string> = {
   FLIGHT: '机票',
   HOTEL: '酒店',
   TRANSFER: '接送',
   VISA: '签证',
+  BUNDLE: '套餐',
 };
+
+type CommissionTabKind = keyof typeof COMMISSION_KIND_LABEL;
+// 套餐与机票并列成档：套餐单的机票腿仍按机票费率计提，套餐行（地面+加项）按本档，互不重叠。
+const COMMISSION_KINDS: CommissionTabKind[] = ['FLIGHT', 'HOTEL', 'TRANSFER', 'VISA', 'BUNDLE'];
+// 空白编辑态由 COMMISSION_KINDS 派生，不再逐档手写字面量——以前每加一档都要同步改三处
+// （标签表 / 列表 / draft 初值 / 回填），漏一处就是「页面有这一行但填了存不进去」。
+const emptyCommissionDraft = (): Record<CommissionTabKind, string> =>
+  Object.fromEntries(COMMISSION_KINDS.map((k) => [k, ''])) as Record<CommissionTabKind, string>;
 
 function CommissionTab({ agent }: { agent: AgentListItem }) {
   const tokens = useAuth((s) => s.tokens);
   const token = tokens?.accessToken ?? '';
   const role = useAuth((s) => s.user?.role);
-  const canEdit = role === 'ADMIN';
-  type Kind = keyof typeof COMMISSION_KIND_LABEL;
-  const KINDS: Kind[] = ['FLIGHT', 'HOTEL', 'TRANSFER', 'VISA'];
+  // 返佣费率写权限：ADMIN 与内部岗位（STAFF）都可维护——返佣口径归财务，每次都绕管理员配
+  // 会让费率永远配不齐。⚠️ AGENT 是能打开本页签的（/agents 在 App.tsx 的
+  // AGENT_ALLOWED_PATHS 里，代理详情抽屉的「佣金规则」tab 本身没有额外角色门），
+  // 只是 canEdit 落到只读态——AGENT 查看自己/下级的费率是只读展示，不是没入口。
+  // 与后端 PUT /agents/:id/commission-rules 的 requireRole(ADMIN, STAFF) 必须保持同步：
+  // 只放后端不放前端，页面仍渲染只读态，使用者看到的就是「没有权限」（立减规则那次的教训）。
+  const canEdit = role === 'ADMIN' || role === 'STAFF';
+  type Kind = CommissionTabKind;
+  const KINDS = COMMISSION_KINDS;
 
-  const [rules, setRules] = useState<Record<Kind, { rate: number; effectiveFrom: string } | null> | null>(null);
+  const [rules, setRules] = useState<Record<Kind, CommissionRuleEntry> | null>(null);
+  // 待生效费率（每档最早的未来生效规则）：与 rules 分开存，别混进"当前生效"一栏被误读。
+  const [upcoming, setUpcoming] = useState<Record<Kind, CommissionRuleEntry> | null>(null);
   // 编辑值以「百分数」呈现（5 = 5%），提交时 /100 —— 运营口径是百分比，别让人填 0.05。
-  const [draft, setDraft] = useState<Record<Kind, string>>({ FLIGHT: '', HOTEL: '', TRANSFER: '', VISA: '' });
+  const [draft, setDraft] = useState<Record<Kind, string>>(emptyCommissionDraft);
+  // 生效日（YYYY-MM-DD，date input 原生格式）：留空 = 此刻生效，跟改动前行为一致。
+  const [effectiveFromDraft, setEffectiveFromDraft] = useState('');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [ok, setOk] = useState<string | null>(null);
+  // 读取被拒（403/401）与「读到了但没配费率」是两回事，必须分开——见下方提前返回处的说明。
+  const [loadDenied, setLoadDenied] = useState(false);
 
   useEffect(() => {
     if (!token) return;
     let cancelled = false;
     setLoading(true);
     setErr(null);
+    setLoadDenied(false);
     api
       .getCommissionRules(token, agent.id)
       .then((r) => {
         if (cancelled) return;
         setRules(r.rules);
-        setDraft({
-          FLIGHT: r.rules.FLIGHT ? String(r.rules.FLIGHT.rate * 100) : '',
-          HOTEL: r.rules.HOTEL ? String(r.rules.HOTEL.rate * 100) : '',
-          TRANSFER: r.rules.TRANSFER ? String(r.rules.TRANSFER.rate * 100) : '',
-          VISA: r.rules.VISA ? String(r.rules.VISA.rate * 100) : '',
-        });
+        setUpcoming(r.upcoming);
+        setDraft(
+          Object.fromEntries(
+            COMMISSION_KINDS.map((k) => {
+              const hit = r.rules[k];
+              return [k, hit ? String(hit.rate * 100) : ''];
+            }),
+          ) as Record<Kind, string>,
+        );
       })
       .catch((e) => {
-        if (!cancelled) setErr(e instanceof ApiError ? e.message : '加载佣金规则失败');
+        if (cancelled) return;
+        // 读取接口是内部岗位专用（requireRole ADMIN/STAFF），代理打开本页签会拿到 403。
+        // 单独标记出来，下面据此改文案——绝不能让它退化成「无规则 · 计提按 0」。
+        const denied = e instanceof ApiError && (e.status === 403 || e.status === 401);
+        setLoadDenied(denied);
+        setErr(denied ? null : e instanceof ApiError ? e.message : '加载佣金规则失败');
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
@@ -849,13 +886,21 @@ function CommissionTab({ agent }: { agent: AgentListItem }) {
       setErr('请至少填写一个产品的费率');
       return;
     }
-    if (!window.confirm('确认保存佣金费率？保存后立即对新计提生效（历史订单不回溯），并记入审计。')) return;
+    const effectiveFrom = effectiveFromDraft.trim() || undefined;
+    const confirmMsg = effectiveFrom
+      ? `确认保存佣金费率？将于 ${effectiveFrom} 起对该日及以后出发的订单生效（此前已出发/在途的订单不受影响），并记入审计。`
+      : '确认保存佣金费率？保存后立即对新计提生效（历史订单不回溯），并记入审计。';
+    if (!window.confirm(confirmMsg)) return;
     setSaving(true);
     try {
-      await api.setCommissionRules(token, agent.id, rates);
+      const res = await api.setCommissionRules(token, agent.id, rates, effectiveFrom);
+      // 保存后立刻重新拉取——不能直接拿 res 里的 effectiveFrom/rates 兜底更新本地状态，
+      // 因为这次提交可能只改了部分档，rules/upcoming 两栏要跟服务端的"当前/待生效"判定
+      // 重新对齐，否则容易把新配的费率错放进"当前生效"那一栏。
       const r = await api.getCommissionRules(token, agent.id);
       setRules(r.rules);
-      setOk('已保存，新费率立即生效');
+      setUpcoming(r.upcoming);
+      setOk(`已保存，生效自 ${res.effectiveFrom.slice(0, 10)}`);
       window.setTimeout(() => setOk(null), 2500);
     } catch (e) {
       setErr(e instanceof ApiError ? e.message : '保存失败');
@@ -865,6 +910,21 @@ function CommissionTab({ agent }: { agent: AgentListItem }) {
   };
 
   if (loading) return <div className="py-6 text-center text-sm text-slate-400">加载中…</div>;
+
+  // 读取失败时 rules 恒为 null（成功时每档键必然存在，值可能是 null=该档没配）。
+  // 这里必须提前返回，绝不能落到下面的费率表：表格把空值渲染成醒目的「无规则 · 计提按 0」，
+  // 那是「已确认没配费率」的意思。而**代理能打开本页签**，读接口却只给内部岗位（403）——
+  // 一旦退化成那句话，等于系统在跟合作方谎报「你的返佣是 0」，代理截图来问会非常被动。
+  // 读不到数据 ≠ 费率是 0，两者必须在界面上分得干干净净。
+  if (!rules) {
+    return (
+      <div className="rounded border border-slate-200 bg-slate-50 px-4 py-6 text-center text-sm text-ink-muted">
+        {loadDenied
+          ? '你的账号没有查看返佣费率的权限。需要了解自己的费率请联系业务对接人。'
+          : (err ?? '佣金费率加载失败，请刷新页面重试。')}
+      </div>
+    );
+  }
 
   return (
     <div className="space-y-4">
@@ -876,12 +936,14 @@ function CommissionTab({ agent }: { agent: AgentListItem }) {
             <th className="py-2">产品</th>
             <th className="py-2">当前生效费率</th>
             <th className="py-2">生效自</th>
+            <th className="py-2">待生效</th>
             {canEdit && <th className="py-2">新费率（%）</th>}
           </tr>
         </thead>
         <tbody>
           {KINDS.map((k) => {
             const cur = rules?.[k] ?? null;
+            const next = upcoming?.[k] ?? null;
             return (
               <tr key={k} className="border-b border-slate-100">
                 <td className="py-2">{COMMISSION_KIND_LABEL[k]}</td>
@@ -894,6 +956,16 @@ function CommissionTab({ agent }: { agent: AgentListItem }) {
                 </td>
                 <td className="py-2 text-xs text-slate-500">
                   {cur ? cur.effectiveFrom.slice(0, 10) : '—'}
+                </td>
+                <td className="py-2 text-xs nums">
+                  {next ? (
+                    // 用「即将生效」措辞而非单纯一个日期+数字，避免被扫一眼误读成当前费率。
+                    <span className="font-medium text-amber-600">
+                      {next.effectiveFrom.slice(0, 10)} 起 {(next.rate * 100).toFixed(2)}%
+                    </span>
+                  ) : (
+                    <span className="text-slate-400">—</span>
+                  )}
                 </td>
                 {canEdit && (
                   <td className="py-2">
@@ -911,17 +983,38 @@ function CommissionTab({ agent }: { agent: AgentListItem }) {
         </tbody>
       </table>
       {canEdit ? (
-        <div className="flex items-center justify-between gap-3">
-          <p className="text-xs text-slate-500">
-            按百分数填（5 = 5%），留空 = 不改；保存即追加新生效规则，历史订单不回溯。
-            层级不变式（下级 ≤ 上级）由结算侧守护：负价差自动跳过计提。
-          </p>
-          <button className="btn-primary text-sm disabled:opacity-50" onClick={save} disabled={saving}>
-            {saving ? '保存中…' : '保存费率'}
-          </button>
+        <div className="space-y-3">
+          <div className="flex items-center gap-2">
+            <label htmlFor="commission-effective-from" className="text-xs text-slate-500">
+              生效日
+            </label>
+            <input
+              id="commission-effective-from"
+              type="date"
+              className="w-40 rounded-md border border-slate-300 px-2 py-1 text-sm nums"
+              value={effectiveFromDraft}
+              onChange={(e) => setEffectiveFromDraft(e.target.value)}
+              min={new Date().toISOString().slice(0, 10)}
+            />
+            <p className="text-xs text-slate-500">
+              从这一天起飞的订单开始按新费率计佣；留空 = 立即生效。不能填过去的日期。
+            </p>
+          </div>
+          <div className="flex items-center justify-between gap-3">
+            <p className="text-xs text-slate-500">
+              按百分数填（5 = 5%），留空 = 不改；保存即追加新生效规则，历史订单不回溯。
+              层级不变式（下级 ≤ 上级）由结算侧守护：负价差自动跳过计提。
+            </p>
+            <button className="btn-primary text-sm disabled:opacity-50" onClick={save} disabled={saving}>
+              {saving ? '保存中…' : '保存费率'}
+            </button>
+          </div>
         </div>
       ) : (
-        <p className="text-xs text-slate-500">费率由管理员配置；此处只读。</p>
+        // 写权限已放开到 ADMIN+STAFF（内部岗位），本分支只对非内部岗位角色出现——例如代理
+        // 打开自己或下级的「佣金规则」页签时，这里如实说明只读，别再写「由管理员配置」这种
+        // 写权限改了却没跟着更新的说法。
+        <p className="text-xs text-slate-500">佣金费率由内部岗位维护，此处仅供查看。</p>
       )}
     </div>
   );
