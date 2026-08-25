@@ -29,6 +29,7 @@ import { RemindersPage } from './pages/RemindersPage';
 import { ReportsPage } from './pages/ReportsPage';
 import { FulfillmentBoardPage } from './pages/FulfillmentBoardPage';
 import { MarketingPage } from './pages/MarketingPage';
+import { LegacyArchivePage } from './pages/LegacyArchivePage';
 import { useAuth } from './stores/auth';
 import { isAccessTokenFresh } from './lib/token';
 
@@ -328,6 +329,14 @@ export function App() {
           element={
             <Protected adminOnly financeRole>
               <ReportsPage />
+            </Protected>
+          }
+        />
+        <Route
+          path="/legacy-archive"
+          element={
+            <Protected adminOnly>
+              <LegacyArchivePage />
             </Protected>
           }
         />

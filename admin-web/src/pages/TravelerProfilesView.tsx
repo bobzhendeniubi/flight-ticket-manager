@@ -15,9 +15,11 @@ import {
   type TravelerProfile,
   type TravelerProfileSuggestion,
   type TravelerProfileTrip,
+  type LegacyPassengerHistory,
 } from '../lib/api';
 import { exportToCSV } from '../lib/csvExport';
 import { useAuth } from '../stores/auth';
+import { Icon } from '../components/Icon';
 
 const CABIN_LABELS: Record<string, string> = {
   ECONOMY: '经济舱',
@@ -196,9 +198,9 @@ export function TravelerProfilesView() {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <button className="btn-secondary" onClick={handleExport}>📥 导出 CSV</button>
+          <button className="btn-secondary" onClick={handleExport}><Icon name="download" /> 导出 CSV</button>
           <button className="btn-secondary" onClick={handleRebuild} disabled={rebuilding}>
-            {rebuilding ? '重建中…' : '🔄 重建档案'}
+            {rebuilding ? '重建中…' : <><Icon name="refresh" /> 重建档案</>}
           </button>
         </div>
       </section>
@@ -285,14 +287,14 @@ export function TravelerProfilesView() {
                         {p.fullName}
                       </button>
                       {p.chineseName && <div className="text-xs text-ink-muted">{p.chineseName}</div>}
-                      {p.notes && <div className="text-xs text-amber-600 truncate max-w-[16rem]">📝 {p.notes}</div>}
+                      {p.notes && <div className="flex max-w-[16rem] items-center gap-1 truncate text-xs text-amber-600"><Icon name="clipboard" /> {p.notes}</div>}
                     </td>
                     <td className="text-xs">
                       <span className="badge-neutral mr-1">{DOC_LABELS[p.documentType] ?? p.documentType}</span>
                       <span className="font-mono text-ink-soft">{p.documentNumber}</span>
                       {expDays !== null && expDays < PASSPORT_EXPIRY_WARN_DAYS && (
                         <div className={expDays < 0 ? 'text-red-600' : 'text-amber-600'}>
-                          {expDays < 0 ? '⚠️ 护照已过期' : `⚠️ 护照 ${expDays} 天后到期`}
+                          <Icon name="alert" /> {expDays < 0 ? '护照已过期' : `护照 ${expDays} 天后到期`}
                         </div>
                       )}
                     </td>
@@ -411,7 +413,7 @@ function PrefBadges({ profile }: { profile: TravelerProfile }) {
   if (profile.prefBed) badges.push(BED_LABELS[profile.prefBed] ?? profile.prefBed);
   if (profile.prefMeal) badges.push(profile.prefMeal);
   if (profile.prefSingleRoom) badges.push('单住');
-  if (profile.needsWheelchair) badges.push('♿ 轮椅');
+  if (profile.needsWheelchair) badges.push('轮椅');
   if (badges.length === 0) return <span className="text-ink-muted">—</span>;
   return (
     <span className="flex flex-wrap gap-1">
@@ -435,14 +437,21 @@ function ProfileDrawer({
   onSearchCompanion: (documentNumber: string) => void;
 }) {
   const tokens = useAuth((s) => s.tokens);
+  const user = useAuth((s) => s.user);
+  const canReadLegacyHistory = user?.role === 'ADMIN' || user?.role === 'STAFF';
   const [profile, setProfile] = useState<TravelerProfile | null>(null);
   const [trips, setTrips] = useState<TravelerProfileTrip[]>([]);
+  const [legacyHistory, setLegacyHistory] = useState<LegacyPassengerHistory | null>(null);
   const [redemptions, setRedemptions] = useState<TravelerBenefitRedemption[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [notesDraft, setNotesDraft] = useState('');
   const [savingNotes, setSavingNotes] = useState(false);
   const [notesSaved, setNotesSaved] = useState(false);
+  const currentProfileIdRef = useRef<string | null>(null);
+  const selectedProfileIdRef = useRef(profileId);
+  currentProfileIdRef.current = profile?.id ?? null;
+  selectedProfileIdRef.current = profileId;
   // 核销/冲正后重拉详情：可用次数与台账都由后端算，前端不本地推演
   const [detailNonce, setDetailNonce] = useState(0);
   // 备注草稿只在首次打开该档案时灌入：核销后的重拉不能把操作人正在写的备注冲掉
@@ -475,6 +484,36 @@ function ProfileDrawer({
       cancelled = true;
     };
   }, [tokens?.accessToken, profileId, detailNonce]);
+
+  useEffect(() => {
+    setLegacyHistory(null);
+    const requestedProfileId = profile?.id;
+    const documentNumber = profile?.documentNumber?.trim();
+    if (
+      !canReadLegacyHistory ||
+      !tokens?.accessToken ||
+      !documentNumber ||
+      !requestedProfileId ||
+      requestedProfileId !== profileId
+    ) return;
+    let cancelled = false;
+    api.getLegacyPassengerHistory(tokens.accessToken, documentNumber)
+      .then((history) => {
+        if (
+          !cancelled &&
+          currentProfileIdRef.current === requestedProfileId &&
+          selectedProfileIdRef.current === requestedProfileId
+        ) {
+          setLegacyHistory(history);
+        }
+      })
+      .catch(() => {
+        // 历史档案是辅助信息，读取失败时静默隐藏，不影响旅客详情。
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [canReadLegacyHistory, profile?.documentNumber, profile?.id, profileId, tokens?.accessToken]);
 
   const saveNotes = async () => {
     if (!tokens?.accessToken || !profile) return;
@@ -521,7 +560,7 @@ function ProfileDrawer({
               <span className="text-xs font-medium text-emerald-600">回头客 · 飞过 {profile.tripCount} 次</span>
             )}
           </div>
-          <button className="text-xl text-slate-400 hover:text-slate-700" onClick={onClose}>×</button>
+          <button className="btn-ghost px-2 py-1 text-xl" onClick={onClose}><Icon name="close" /></button>
         </div>
 
         <div className="space-y-4 px-6 py-5 text-sm">
@@ -596,6 +635,36 @@ function ProfileDrawer({
                 </dl>
               </section>
 
+              {legacyHistory && legacyHistory.total > 0 && (
+                <section>
+                  <div className="mb-2 flex items-center justify-between">
+                    <h3 className="text-xs font-semibold uppercase text-slate-500">老系统历史</h3>
+                    <span className="text-xs text-ink-muted">共 {Math.max(0, legacyHistory.total - legacyHistory.superseded)} 次（扣除已重录）</span>
+                  </div>
+                  <div className="space-y-2">
+                    {legacyHistory.items.map((item) => (
+                      <Link
+                        key={item.id}
+                        to={`/legacy-archive?q=${encodeURIComponent(profile.documentNumber)}`}
+                        className="block rounded border border-slate-200 p-2.5 text-xs hover:border-brand hover:bg-slate-50"
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="font-medium text-slate-900">
+                            去程 {item.outboundFlightNo || '—'} · {fmtDate(item.outboundDate)}
+                            <span className="ml-2 text-slate-400">返程 {item.returnFlightNo || '—'} · {fmtDate(item.returnDate)}</span>
+                          </span>
+                          {item.supersededByOrderId && <span className="badge-info shrink-0">已重录</span>}
+                        </div>
+                        <div className="mt-1 flex items-center gap-3 text-slate-500">
+                          <span>结算价 {item.finalPrice ? fmtCny(item.finalPrice) : '—'}</span>
+                          {item.paymentConfirmed ? <span className="badge-success">已认款</span> : <span className="badge-neutral">未认款</span>}
+                        </div>
+                      </Link>
+                    ))}
+                  </div>
+                </section>
+              )}
+
               {/* 偏好 */}
               <section>
                 <h3 className="mb-2 text-xs font-semibold uppercase text-slate-500">偏好</h3>
@@ -604,7 +673,7 @@ function ProfileDrawer({
                   <Row label="床型" value={profile.prefBed ? BED_LABELS[profile.prefBed] ?? profile.prefBed : '—'} />
                   <Row label="餐食" value={profile.prefMeal ?? '—'} />
                   <Row label="住宿" value={profile.prefSingleRoom ? '单住（不拼房）' : '可拼房'} />
-                  {profile.needsWheelchair && <Row label="特殊需求" value="♿ 需要轮椅" />}
+                  {profile.needsWheelchair && <Row label="特殊需求" value={<><Icon name="wheelchair" /> 需要轮椅</>} />}
                 </dl>
               </section>
 
@@ -627,14 +696,14 @@ function ProfileDrawer({
                         </span>
                       </div>
                       <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-slate-500">
-                        {t.flightNumbers.length > 0 && <span>✈️ {t.flightNumbers.join(' / ')}</span>}
+                        {t.flightNumbers.length > 0 && <span className="inline-flex items-center gap-1"><Icon name="plane" /> {t.flightNumbers.join(' / ')}</span>}
                         {t.cabin && <span>{CABIN_LABELS[t.cabin] ?? t.cabin}</span>}
                         <span>同行 {t.paxCount} 人</span>
                         <span>人均 {fmtCny(t.spendShareCny)}</span>
                       </div>
                       {t.hotels.map((h, i) => (
                         <div key={i} className="mt-1 text-slate-500">
-                          🏨 {h.hotelName}
+                          <Icon name="hotel" /> {h.hotelName}
                           {h.roomType && ` · ${h.roomType}`}
                           {h.checkIn && ` · ${h.checkIn}${h.checkOut ? `→${h.checkOut}` : ''}`}
                         </div>
@@ -889,7 +958,7 @@ function RedemptionsSection({
                 {fmtDateTime(r.createdAt)}
                 {r.createdByName && ` · 经手 ${r.createdByName}`}
               </div>
-              {r.note && <div className="mt-0.5 text-slate-500">📝 {r.note}</div>}
+              {r.note && <div className="mt-0.5 flex items-center gap-1 text-slate-500"><Icon name="clipboard" /> {r.note}</div>}
             </li>
           );
         })}

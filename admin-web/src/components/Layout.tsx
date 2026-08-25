@@ -3,6 +3,7 @@ import { Link, Navigate, NavLink, Outlet, useLocation, useNavigate } from 'react
 import { useAuth } from '../stores/auth';
 import { api, ApiError, AUTH_REFRESH_UNAVAILABLE_CODE } from '../lib/api';
 import { ErrorBoundary } from './ErrorBoundary';
+import { Icon } from './Icon';
 
 const ROLE_LABEL: Record<string, string> = {
   STAFF: '运营',
@@ -43,6 +44,7 @@ const NAV: Array<{
   { to: '/reconciliation',  label: '收款对账台',  roles: ['ADMIN', 'STAFF'],          section: '财务' },
   { to: '/finances',        label: '财务',        roles: ['ADMIN'],                   section: '财务', financeRole: true },
   { to: '/reports',         label: '经营报表',    roles: ['ADMIN'],                   section: '财务', financeRole: true },
+  { to: '/legacy-archive',  label: '历史档案',    roles: ['ADMIN', 'STAFF'],          section: '系统' },
   { to: '/audit-logs',      label: '审计日志',    roles: ['ADMIN', 'STAFF'],          section: '系统' },
   { to: '/settings/ai-ocr', label: 'AI 识别设置', roles: ['ADMIN'],                   section: '系统' },
   { to: '/settings/staff-roles', label: '账号管理',    roles: ['ADMIN'],                   section: '系统' },
@@ -252,7 +254,7 @@ export function Layout() {
             className="flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-ink-soft transition hover:bg-slate-50 hover:text-ink lg:hidden"
             aria-label="打开菜单"
           >
-            <span className="text-base">☰</span>
+            <Icon name="list" />
           </button>
 
           <div className="min-w-0 flex-1">

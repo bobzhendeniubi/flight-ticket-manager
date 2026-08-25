@@ -2129,3 +2129,113 @@ model MarketingPoster {
   @@index([status, createdAt])
   @@index([flightId])
 }
+
+// ============ 老系统历史档案（只读，2026-08-24 封笔迁入） ============
+
+model LegacyFlight {
+  id                   String   @id
+  flightNo             String?
+  departDate           DateTime? @db.Date
+  departTime           String?
+  arriveTime           String?
+  originCode           String?
+  destCode             String?
+  businessTotal        Int?
+  economyTotal         Int?
+  adultBusinessPrice   Decimal? @db.Decimal(12, 2)
+  adultEconomyPrice    Decimal? @db.Decimal(12, 2)
+  isProduct            Boolean  @default(false)
+
+  tickets LegacyTicketFlight[]
+
+  @@index([flightNo, departDate])
+}
+
+model LegacyTicket {
+  id                   String   @id
+  bookingNo            String?
+  teamNo               String?
+  tripType             Int?
+  cabinLevel           Int?
+  fullName             String?
+  chineseName          String?
+  documentName         String?
+  gender               String?
+  birthDate            DateTime? @db.Date
+  nationality          String?
+  documentTypeRaw      String?
+  documentNumber       String?
+  documentNumberNorm   String?
+  issueDate            DateTime? @db.Date
+  expiryDate           DateTime? @db.Date
+  birthPlace           String?
+  passengerType        String?
+  infantAdultName      String?
+  finalPrice           Decimal? @db.Decimal(12, 2)
+  truePrice            Decimal? @db.Decimal(12, 2)
+  depositPrice         Decimal? @db.Decimal(12, 2)
+  hotelPrice           Decimal? @db.Decimal(12, 2)
+  hotelTruePrice       Decimal? @db.Decimal(12, 2)
+  visaPrice            Decimal? @db.Decimal(12, 2)
+  visaTruePrice        Decimal? @db.Decimal(12, 2)
+  discountPrice        Decimal? @db.Decimal(12, 2)
+  deductionPrice       Decimal? @db.Decimal(12, 2)
+  finalPriceRemark     String?
+  paymentConfirmed    Boolean  @default(false)
+  stateRaw             Int?
+  isDeleted            Boolean  @default(false)
+  outboundTicketed     Boolean  @default(false)
+  returnTicketed       Boolean  @default(false)
+  systemTicketed       Boolean  @default(false)
+  visaStateRaw         Int?
+  hotelTypeName        String?
+  orgId                String?
+  orgName              String?
+  remark               String?
+  fileId               String?
+  paymentFileId        String?
+  legacyCreateTime     DateTime?
+  legacyUpdateTime     DateTime?
+  outboundFlightNo     String?
+  outboundDate         DateTime? @db.Date
+  returnFlightNo       String?
+  returnDate           DateTime? @db.Date
+  supersededByOrderId  String?
+  dataIssues           String[] @default([])
+
+  flights LegacyTicketFlight[]
+
+  @@index([documentNumberNorm])
+  @@index([fullName])
+  @@index([chineseName])
+  @@index([bookingNo])
+  @@index([teamNo])
+  @@index([legacyCreateTime])
+  @@index([outboundDate])
+}
+
+model LegacyTicketFlight {
+  id       String @id
+  ticketId String
+  flightId String
+  legType  Int
+
+  ticket LegacyTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  flight LegacyFlight @relation(fields: [flightId], references: [id], onDelete: Cascade)
+
+  @@index([ticketId])
+  @@index([flightId])
+}
+
+model LegacyReceipt {
+  id                String   @id
+  ticketId          String?
+  sequence          Int?
+  amount            Decimal? @db.Decimal(12, 2)
+  receivedAt        DateTime?
+  channelCode       Int?
+  legacyCreateTime  DateTime?
+
+  @@index([ticketId])
+  @@index([receivedAt])
+}

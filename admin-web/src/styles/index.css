@@ -41,6 +41,12 @@
   .btn-ghost {
     @apply btn text-ink-soft hover:bg-slate-100 hover:text-ink;
   }
+  .btn-ghost-danger {
+    @apply btn text-rose-600 hover:bg-rose-50 hover:text-rose-700 focus-visible:ring-rose-500/50;
+  }
+  .link-danger {
+    @apply rounded text-rose-600 hover:text-rose-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-rose-500/50 focus-visible:ring-offset-1;
+  }
   .btn-danger {
     @apply btn bg-rose-600 text-white hover:bg-rose-700 focus-visible:ring-rose-500/50;
   }
@@ -100,6 +106,13 @@
   }
   .page-sub {
     @apply mt-0.5 text-sm text-ink-soft;
+  }
+
+  .section-title {
+    @apply text-sm font-semibold text-ink;
+  }
+  .detail-grid {
+    @apply mt-2 grid grid-cols-2 gap-x-4 gap-y-2;
   }
 
   /* ── 常显滚动条（弹窗内可滚动表格：macOS 悬浮滚动条不拖动就隐身，

@@ -43,6 +43,7 @@ import { marketingRoutes } from './modules/marketing/marketing.routes.js';
 import { ocrRoutes } from './modules/ocr/ocr.routes.js';
 import { settingsRoutes } from './modules/settings/settings.routes.js';
 import { reportRoutes } from './modules/reports/reports.routes.js';
+import { legacyRoutes } from './modules/legacy/legacy.routes.js';
 import { redis } from './db/redis.js';
 
 export async function buildApp(): Promise<FastifyInstance> {
@@ -126,6 +127,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(marketingRoutes, { prefix: '/marketing' });
   await app.register(settingsRoutes, { prefix: '/settings' });
   await app.register(reportRoutes, { prefix: '/reports' });
+  await app.register(legacyRoutes, { prefix: '/legacy' });
 
   // Root
   app.get('/', async () => ({

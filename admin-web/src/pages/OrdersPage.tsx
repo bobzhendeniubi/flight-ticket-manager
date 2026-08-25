@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useSearchParams } from 'react-router-dom';
-import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput } from '../lib/api';
+import { useSearchParams, useNavigate } from 'react-router-dom';
+import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput, type LegacyPassengerHistory } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { useFlightSeats } from '../stores/flightSeats';
 import {
@@ -9,6 +9,7 @@ import {
 import { csvNumber, exportToCSV, localDateStamp } from '../lib/csvExport';
 import { AIRPORTS, formatLocalTime, localYmd } from '../lib/airports';
 import { NumberInput } from '../components/NumberInput';
+import { Icon, type IconName } from '../components/Icon';
 import { parseOtaRoster } from '../lib/parseOtaRoster';
 import { computePerPaxSettlement } from '../lib/perPaxSettlement';
 import type { AgentListItem, OrderImportParseResult } from '../lib/api';
@@ -24,25 +25,7 @@ import { ProofImageViewer } from '../components/ProofImageViewer';
 import type { RoomGroup, Receipt, DocumentType, TravelerProfileLookupRow } from '../lib/api';
 import { countryIso3ToIso2 } from '../lib/passportOcr';
 import { runPassportOcr, ocrReviewHintText } from '../lib/passportOcrRunner';
-
-// 本地可视化用的状态子集（后端 OrderStatus 更全，这里只列出常用 7 个做 filter）
-const STATUS_LABEL: Record<OrderStatus, string> = {
-  DRAFT: '草稿',
-  PENDING_PAYMENT: '待支付',
-  PAID: '已支付',
-  PROCESSING: '处理中',
-  // 订单履约阶段，与航段级「去程/回程已出票」（开票进度）不是一回事——
-  // 叫「出票完成」以免运营在整单状态里误当成航段开票标记。
-  TICKETED: '出票完成',
-  COMPLETED: '已完成',
-  PAYMENT_TIMEOUT: '超时',
-  CANCELLED: '已取消',
-  REFUND_REQUESTED: '退款申请中',
-  REFUNDED: '已退款',
-  CHANGE_REQUESTED: '改期申请中',
-  CHANGED: '已改期',
-  FAILED: '出票失败',
-};
+import { ORDER_STATUS_META, orderStatusBadgeClass, orderStatusLabel } from '../lib/orderStatus';
 
 // 批量开票下拉的六个选项（票务岗 0715 反馈）：按航段/系统三个布尔位各自「标已开/标未开」，
 // 对应逐单调用 setInvoiceFlags 时传的 flags 字段。
@@ -59,22 +42,6 @@ const BULK_INVOICE_FLAG_OPTIONS: Array<{
   { value: 'SYS_ON', label: '系统标已开', flags: { systemInvoiced: true } },
   { value: 'SYS_OFF', label: '系统标未开', flags: { systemInvoiced: false } },
 ];
-
-const STATUS_COLOR: Record<OrderStatus, string> = {
-  DRAFT: 'badge-neutral',
-  PENDING_PAYMENT: 'badge-warning',
-  PAID: 'badge-info',
-  PROCESSING: 'badge-info',
-  TICKETED: 'badge-success',
-  COMPLETED: 'badge-neutral',
-  PAYMENT_TIMEOUT: 'badge-warning',
-  CANCELLED: 'badge-neutral',
-  REFUND_REQUESTED: 'badge-danger',
-  REFUNDED: 'badge-danger',
-  CHANGE_REQUESTED: 'badge-info',
-  CHANGED: 'badge-info',
-  FAILED: 'badge-danger',
-};
 
 const FILTER_STATUSES: OrderStatus[] = [
   'PENDING_PAYMENT', 'PAID', 'PROCESSING', 'TICKETED', 'COMPLETED', 'CANCELLED', 'REFUND_REQUESTED',
@@ -148,7 +115,7 @@ async function requestRefundFlow(
     return;
   }
   if (!quote.cancellable) {
-    alert(`无法发起退款申请：${quote.cancellableReason ?? `订单当前状态（${STATUS_LABEL[order.status]}）不可取消`}`);
+    alert(`无法发起退款申请：${quote.cancellableReason ?? `订单当前状态（${orderStatusLabel(order.status)}）不可取消`}`);
     return;
   }
   const reason = window.prompt(
@@ -381,7 +348,7 @@ function BalanceBadge({ balance, settlementMode }: { balance: number; settlement
   );
 }
 
-// 列表「开票」列：六态紧凑三点式显示（去 / 回 / 系，✓已开、✗未开）。只读——切换在订单详情里。
+// 列表「开票」列：六态紧凑三点式显示（去 / 回 / 系）。只读——切换在订单详情里。
 // 回程点仅在订单含 ≥2 航段时显示；无机票的订单只显示系统点。
 function InvoiceDots({ order }: { order: OrderSummary }) {
   const legs = flightLegCount(order);
@@ -392,7 +359,7 @@ function InvoiceDots({ order }: { order: OrderSummary }) {
       }`}
     >
       {label}
-      {on ? '✓' : '✗'}
+      <Icon name={on ? 'check' : 'close'} size={12} />
     </span>
   );
   return (
@@ -428,8 +395,8 @@ function BulkResultPanel({
       }`}
     >
       <div className={`font-semibold ${failed > 0 ? 'text-rose-700' : 'text-emerald-700'}`}>
-        ✓ 成功 {succeeded} 条
-        {failed > 0 && <span className="ml-3">✗ 失败 {failed} 条</span>}
+        <Icon name="check" size={14} /> 成功 {succeeded} 条
+        {failed > 0 && <span className="ml-3"><Icon name="close" size={14} /> 失败 {failed} 条</span>}
         {skipped != null && skipped > 0 && <span className="ml-3 font-normal text-ink-soft">（跳过 {skipped} 条）</span>}
       </div>
       {failed > 0 && failNote && <div className="mt-1 text-xs text-rose-700">{failNote}</div>}
@@ -456,6 +423,7 @@ export function OrdersPage() {
   const isAdmin = user?.role === 'ADMIN';
   // 深链承接：从签证台等页面带 ?q=订单号 跳入时用于填充搜索框并自动开详情抽屉
   const [searchParams] = useSearchParams();
+  const legacyOrderId = searchParams.get('legacyOrderId')?.trim();
   const [orders, setOrders] = useState<OrderSummary[]>([]);
   // 后端命中总数（res.pagination.total）。列表一次只拉 ORDERS_FETCH_LIMIT 条且不翻页，
   // 命中数超过窗口时必须显式告知——否则「共 N 条 / 命中 N 单」是谎报，而且状态/类型/渠道/
@@ -806,6 +774,23 @@ export function OrdersPage() {
   // 待列表加载完且过滤后唯一/精确命中时自动打开详情抽屉；命中不在默认查询范围时后端兜底查一次。
   const deepLinkSearchRef = useRef(false); // 只填一次搜索框，之后不覆盖用户输入
   const deepLinkOpenRef = useRef(false); // 只自动开一次抽屉
+  const legacyDeepLinkOpenRef = useRef<string | null>(null);
+  useEffect(() => {
+    const token = tokens?.accessToken;
+    if (!legacyOrderId || !token || legacyDeepLinkOpenRef.current === legacyOrderId) return;
+    legacyDeepLinkOpenRef.current = legacyOrderId;
+    let cancelled = false;
+    api.getOrder(token, legacyOrderId)
+      .then((result) => {
+        if (!cancelled) setSelected(result.order);
+      })
+      .catch(() => {
+        /* 深链失败静默：不打断主列表 */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [legacyOrderId, tokens?.accessToken]);
   useEffect(() => {
     const q = searchParams.get('q')?.trim();
     if (!q || deepLinkSearchRef.current) return;
@@ -989,7 +974,7 @@ export function OrdersPage() {
     if (!tokens?.accessToken) return;
     const confirmed = window.confirm(
       `恢复订单 ${o.orderNumber}？\n\n` +
-        `恢复后订单回到删除前状态（${STATUS_LABEL[o.status]}），重新出现在列表/导出/统计。不影响座位账。`,
+        `恢复后订单回到删除前状态（${orderStatusLabel(o.status)}），重新出现在列表/导出/统计。不影响座位账。`,
     );
     if (!confirmed) return;
     setRestoringId(o.id);
@@ -1115,8 +1100,8 @@ export function OrdersPage() {
       return;
     }
     const confirmMsg = forceMode
-      ? `强制将 ${selectedIds.size} 条订单改为「${STATUS_LABEL[bulkStatus as OrderStatus]}」？此操作绕过状态机校验。\n\n强制把已取消/超时的订单拉回持有状态会重新占座（余位不足会被拒绝，订单状态不变）；此前版本存在不占座的漏洞，请确认余位充足后再操作。`
-      : `按标准流转将 ${selectedIds.size} 条订单改为「${STATUS_LABEL[bulkStatus as OrderStatus]}」？不在允许路径的订单会失败。`;
+      ? `强制将 ${selectedIds.size} 条订单改为「${orderStatusLabel(bulkStatus as OrderStatus)}」？此操作绕过状态机校验。\n\n强制把已取消/超时的订单拉回持有状态会重新占座（余位不足会被拒绝，订单状态不变）；此前版本存在不占座的漏洞，请确认余位充足后再操作。`
+      : `按标准流转将 ${selectedIds.size} 条订单改为「${orderStatusLabel(bulkStatus as OrderStatus)}」？不在允许路径的订单会失败。`;
     // 批量批准退款不逐单查报价（最多 100 单），但必须把「余额部分自动回补」这件事说清楚：
     // 照应退合计全额打现金 = 和系统自动回补重复退钱。要看拆分请逐单进详情。
     const refundNotice =
@@ -1151,7 +1136,7 @@ export function OrdersPage() {
       });
       if (res.failureCount > 0) {
         window.alert(
-          `有 ${res.failureCount} 条订单未能变更为「${STATUS_LABEL[bulkStatus as OrderStatus]}」。\n` +
+          `有 ${res.failureCount} 条订单未能变更为「${orderStatusLabel(bulkStatus as OrderStatus)}」。\n` +
           `原因通常是状态机不允许该跳转（例如"待支付"须先变为"已支付"才能到"出票完成"）。\n` +
           `如确需强制变更，请勾选「强制」后重试。具体失败原因见下方列表。`,
         );
@@ -1573,7 +1558,7 @@ export function OrdersPage() {
                   payable: deriveBalance(order).payable,
                   paid: deriveBalance(order).paid,
                   balance: deriveBalance(order).balance,
-                  status: STATUS_LABEL[order.status],
+                  status: orderStatusLabel(order.status),
                   createdAt: new Date(order.createdAt).toLocaleString('zh-CN'),
                 })),
                 [
@@ -1594,7 +1579,7 @@ export function OrdersPage() {
               )
             }
           >
-            📥 导出 CSV
+            <Icon name="download" /> 导出 CSV
           </button>
           {/* 录入周期快捷预设：一键设上方「下单时间」起止，导出按此周期（佣金/提成/客户统计） */}
           {([
@@ -1640,8 +1625,8 @@ export function OrdersPage() {
             {exporting
               ? '导出中…'
               : selectedIds.size > 0
-                ? `📤 导出（已选 ${selectedIds.size} 条）`
-                : '📤 导出'}
+                ? <><Icon name="upload" /> 导出（已选 {selectedIds.size} 条）</>
+                : <><Icon name="upload" /> 导出</>}
           </button>
           <button
             className="btn-primary text-sm"
@@ -1656,8 +1641,8 @@ export function OrdersPage() {
             {exportingMaster
               ? '导出中…'
               : selectedIds.size > 0
-                ? `📊 导出全岗总表（已选 ${selectedIds.size} 条）`
-                : '📊 导出全岗总表'}
+                ? <><Icon name="list" /> 导出全岗总表（已选 {selectedIds.size} 条）</>
+                : <><Icon name="list" /> 导出全岗总表</>}
           </button>
           <button
             className="btn-secondary text-sm"
@@ -1665,7 +1650,7 @@ export function OrdersPage() {
             onClick={() => void handleIntakeExport()}
             title="进单统计：按当前筛选（尤其上方「下单时间」窗口，可精确到分）导出「出发日期 × 产品/团期」的订单数、人数，末行总计。按筛选统计，不按勾选。"
           >
-            {exportingIntake ? '导出中…' : '📈 进单统计'}
+            {exportingIntake ? '导出中…' : <><Icon name="list" /> 进单统计</>}
           </button>
           <button
             type="button"
@@ -1674,7 +1659,7 @@ export function OrdersPage() {
             onClick={() => setShowTicketingQuick((v) => !v)}
             title="导出某日某航段需开票的订单（航司 PNR 模板）"
           >
-            🎫 票务开票导出
+            <Icon name="ticket" /> 票务开票导出
           </button>
           {isAdmin && (
             <button
@@ -1683,7 +1668,7 @@ export function OrdersPage() {
               onClick={() => void openRecycleBin()}
               title="查看已删除（软删）的订单，可恢复"
             >
-              🗑 回收站
+              <Icon name="trash" /> 回收站
             </button>
           )}
           <p className="w-full text-right text-xs text-ink-muted">
@@ -1775,8 +1760,8 @@ export function OrdersPage() {
                   {tkExporting
                     ? '导出中…'
                     : selectedIds.size > 0
-                      ? `📤 一键导出（已选 ${selectedIds.size} 条）`
-                      : '📤 一键导出'}
+                      ? <><Icon name="upload" /> 一键导出（已选 {selectedIds.size} 条）</>
+                      : <><Icon name="upload" /> 一键导出</>}
                 </button>
               </div>
               <p className="mt-1.5 text-xs text-ink-muted">
@@ -1838,7 +1823,7 @@ export function OrdersPage() {
             onClick={() => { setChannelFilter('direct'); setAgentFilter(''); }}
           >
             <div className="flex items-center justify-between">
-              <span className="text-sm font-medium text-ink-soft">🏢 直销（散客/自营）</span>
+              <span className="inline-flex items-center gap-1 text-sm font-medium text-ink-soft"><Icon name="building" /> 直销（散客/自营）</span>
               <span className="text-xs text-ink-muted">{agentStats.direct.orders} 单</span>
             </div>
             <div className="nums mt-1 text-lg font-semibold text-ink">¥{agentStats.direct.revenue.toLocaleString()}</div>
@@ -1851,7 +1836,7 @@ export function OrdersPage() {
               onClick={() => { setAgentFilter(agentFilter === name ? '' : name); setChannelFilter(''); }}
             >
               <div className="flex items-center justify-between">
-                <span className="truncate text-sm font-medium text-ink-soft">🤝 {name}</span>
+                <span className="inline-flex items-center gap-1 truncate text-sm font-medium text-ink-soft"><Icon name="handshake" /> {name}</span>
                 <span className="text-xs text-ink-muted">{s.orders} 单</span>
               </div>
               <div className="nums mt-1 text-lg font-semibold text-ink">¥{s.revenue.toLocaleString()}</div>
@@ -1872,7 +1857,7 @@ export function OrdersPage() {
             >
               <option value="">全部状态</option>
               {FILTER_STATUSES.map((s) => (
-                <option key={s} value={s}>{STATUS_LABEL[s]}</option>
+                <option key={s} value={s}>{orderStatusLabel(s)}</option>
               ))}
             </select>
           </div>
@@ -2119,7 +2104,7 @@ export function OrdersPage() {
               <span>显示 {filtered.length} 条订单</span>
               {ordersTruncated && (
                 <span className="rounded bg-amber-100 px-1.5 py-0.5 font-medium text-amber-700">
-                  ⚠ 后端命中 {ordersTotal} 条，只加载了前 {orders.length} 条；这里的条数不是全量，请缩小筛选范围
+                  <Icon name="alert" size={14} /> 后端命中 {ordersTotal} 条，只加载了前 {orders.length} 条；这里的条数不是全量，请缩小筛选范围
                 </span>
               )}
               {(() => {
@@ -2176,10 +2161,10 @@ export function OrdersPage() {
               <option value="">选择目标状态…</option>
               {/* 票务按航段批量开票（见下方「批量开票」控件），整单「出票完成」不在批量目标状态里放开——
                   票务岗口径：批量只做"去程/回程已出票"这类航段级标记，整单终态仍走逐单详情页确认。 */}
-              {(Object.keys(STATUS_LABEL) as OrderStatus[])
+              {(Object.keys(ORDER_STATUS_META) as OrderStatus[])
                 .filter((s) => s !== 'TICKETED')
                 .map((s) => (
-                  <option key={s} value={s}>{STATUS_LABEL[s]}</option>
+                  <option key={s} value={s}>{orderStatusLabel(s)}</option>
                 ))}
             </select>
             <label className="flex items-center gap-1.5 text-sm text-ink-soft">
@@ -2210,7 +2195,7 @@ export function OrdersPage() {
                   : '逐单录入到账金额（默认=尾款）+ 共享水单'
               }
             >
-              💰 批量到账（{payableSelected.length} 条待收）
+              <Icon name="wallet" /> 批量到账（{payableSelected.length} 条待收）
             </button>
             <button
               className="btn-secondary text-sm py-1.5 disabled:opacity-50"
@@ -2332,11 +2317,11 @@ export function OrdersPage() {
           {isAdmin && (
             <div className="mt-3 flex flex-wrap items-center gap-3 border-t border-rose-200 pt-3">
               <button
-                className="rounded-lg border border-rose-300 bg-rose-50 px-3 py-1.5 text-sm font-medium text-rose-700 hover:bg-rose-100 disabled:opacity-50"
+                className="btn-danger text-sm disabled:opacity-50"
                 onClick={() => void applyBulkDelete()}
                 disabled={bulkDeleteSubmitting}
               >
-                {bulkDeleteSubmitting ? '删除中…' : `🗑 批量删除（${selectedIds.size} 条）`}
+                {bulkDeleteSubmitting ? '删除中…' : <><Icon name="trash" /> 批量删除（{selectedIds.size} 条）</>}
               </button>
               <span className="text-xs text-rose-500">
                 软删除，可在回收站恢复；仍占座的订单需先取消释放座位，净收款＞0 的订单不允许删除，失败会逐条列出原因。
@@ -2373,9 +2358,9 @@ export function OrdersPage() {
                   bulkInvoiceResult.failed > 0 ? 'text-rose-700' : 'text-emerald-700'
                 }`}
               >
-                ✓ 成功 {bulkInvoiceResult.succeeded} 条
+                <Icon name="check" size={14} /> 成功 {bulkInvoiceResult.succeeded} 条
                 {bulkInvoiceResult.failed > 0 && (
-                  <span className="ml-3">✗ 失败 {bulkInvoiceResult.failed} 条</span>
+                  <span className="ml-3"><Icon name="close" size={14} /> 失败 {bulkInvoiceResult.failed} 条</span>
                 )}
               </div>
               {bulkInvoiceResult.failed > 0 && (
@@ -2410,9 +2395,9 @@ export function OrdersPage() {
                   bulkResult.failureCount > 0 ? 'text-rose-700' : 'text-emerald-700'
                 }`}
               >
-                ✓ 成功 {bulkResult.successCount} 条
+                <Icon name="check" size={14} /> 成功 {bulkResult.successCount} 条
                 {bulkResult.failureCount > 0 && (
-                  <span className="ml-3">✗ 失败 {bulkResult.failureCount} 条</span>
+                  <span className="ml-3"><Icon name="close" size={14} /> 失败 {bulkResult.failureCount} 条</span>
                 )}
               </div>
               {bulkResult.failureCount > 0 && (
@@ -2556,7 +2541,7 @@ export function OrdersPage() {
                           className="mt-0.5 max-w-[11rem] truncate text-[11px] text-amber-700"
                           title={np.fullText}
                         >
-                          📝 {np.firstLine}
+                          <Icon name="clipboard" /> {np.firstLine}
                         </div>
                       ) : null;
                     })()}
@@ -2617,8 +2602,8 @@ export function OrdersPage() {
                     <BalanceBadge balance={deriveBalance(order).balance} />
                   </td>
                   <td className="text-center">
-                    <span className={STATUS_COLOR[order.status]}>
-                      {STATUS_LABEL[order.status]}
+                    <span className={orderStatusBadgeClass(order.status)}>
+                      {orderStatusLabel(order.status)}
                     </span>
                   </td>
                   <td className="text-center">
@@ -2669,18 +2654,18 @@ export function OrdersPage() {
                           const next = e.target.value as OrderStatus;
                           if (!next) return;
                           const msg = forceMode
-                            ? `强制将 ${order.orderNumber} 改为「${STATUS_LABEL[next]}」？此操作绕过状态机校验。\n\n强制把已取消/超时的订单拉回持有状态会重新占座（余位不足会被拒绝，订单状态不变）；此前版本存在不占座的漏洞，请确认余位充足后再操作。`
-                            : `将 ${order.orderNumber} 改为「${STATUS_LABEL[next]}」？`;
+                            ? `强制将 ${order.orderNumber} 改为「${orderStatusLabel(next)}」？此操作绕过状态机校验。\n\n强制把已取消/超时的订单拉回持有状态会重新占座（余位不足会被拒绝，订单状态不变）；此前版本存在不占座的漏洞，请确认余位充足后再操作。`
+                            : `将 ${order.orderNumber} 改为「${orderStatusLabel(next)}」？`;
                           if (window.confirm(msg)) void advance(order, next, undefined, forceMode);
                           e.target.value = '';
                         }}
                         title={forceMode ? '管理员强制改状态（绕过状态机）' : '按标准流转改状态'}
                       >
                         <option value="">改状态…</option>
-                        {(Object.keys(STATUS_LABEL) as OrderStatus[])
+                        {(Object.keys(ORDER_STATUS_META) as OrderStatus[])
                           .filter((s) => s !== order.status)
                           .map((s) => (
-                            <option key={s} value={s}>{STATUS_LABEL[s]}</option>
+                            <option key={s} value={s}>{orderStatusLabel(s)}</option>
                           ))}
                       </select>
                       <button className="whitespace-nowrap text-sm font-medium text-brand hover:text-brand-dark" onClick={() => setSelected(order)}>
@@ -2688,11 +2673,11 @@ export function OrdersPage() {
                       </button>
                       {isAdmin && (
                         <button
-                          className="whitespace-nowrap text-xs text-rose-500 hover:text-rose-700"
+                          className="btn-ghost-danger whitespace-nowrap text-xs"
                           title="删除订单（ADMIN）"
                           onClick={() => void deleteOrder(order)}
                         >
-                          删除
+                          <Icon name="trash" /> 删除
                         </button>
                       )}
                     </div>
@@ -2783,7 +2768,7 @@ export function OrdersPage() {
           >
             <div className="flex items-start justify-between gap-3 border-b border-slate-200 px-6 py-4">
               <div className="min-w-0">
-                <h2 className="text-base font-semibold text-ink">🗑 订单回收站</h2>
+                <h2 className="flex items-center gap-1 text-base font-semibold text-ink"><Icon name="trash" /> 订单回收站</h2>
                 <p className="mt-0.5 text-xs text-ink-muted">
                   已删除的订单（不出现在列表/导出/统计）。恢复后回到删除前状态，重新可见；不影响座位账。
                 </p>
@@ -2857,7 +2842,7 @@ export function OrdersPage() {
                           </td>
                           <td className="nums py-2 pr-3">¥{Number(o.total).toLocaleString()}</td>
                           <td className="py-2 pr-3">
-                            <span className={STATUS_COLOR[o.status]}>{STATUS_LABEL[o.status]}</span>
+                            <span className={orderStatusBadgeClass(o.status)}>{orderStatusLabel(o.status)}</span>
                           </td>
                           <td className="py-2 pr-3 text-xs text-ink-muted">
                             {o.deletedAt ? new Date(o.deletedAt).toLocaleString('zh-CN') : '—'}
@@ -3060,7 +3045,7 @@ function OrderDrawer({
   const isTerminal = allowedNext.length === 0;
   // 管理员强制可选的「越过状态机」目标：所有其它状态里、不在标准流转内的（标准流转已经是普通按钮）。
   const forceTargets: OrderStatus[] = isAdmin
-    ? (Object.keys(STATUS_LABEL) as OrderStatus[]).filter(
+    ? (Object.keys(ORDER_STATUS_META) as OrderStatus[]).filter(
         (s) => s !== o.status && !allowedNext.includes(s),
       )
     : [];
@@ -3083,7 +3068,7 @@ function OrderDrawer({
               {hydrating && <span className="text-[11px] text-ink-muted">· 载入详情…</span>}
             </div>
             <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
-              <span className={STATUS_COLOR[o.status]}>{STATUS_LABEL[o.status]}</span>
+              <span className={orderStatusBadgeClass(o.status)}>{orderStatusLabel(o.status)}</span>
               <span className="badge-neutral">{KIND_LABEL[view.itemKind]}</span>
               {o.visaStatus && (
                 <span className={`rounded px-2 py-0.5 text-[11px] font-medium ${VISA_STATUS_BADGE[o.visaStatus]}`}>
@@ -3158,13 +3143,13 @@ function OrderDrawer({
                           onClick={() => setRoomingOpen(true)}
                           title="该订单含酒店但尚未分房 — 点此分房（拖名字到房间）"
                         >
-                          🛏 分房
+                          <Icon name="hotel" /> 分房
                         </button>
                       )
                     )}
                   </div>
                 </div>
-                <div className="mt-1.5 text-sm font-medium text-ink">🏨 {hotelName ?? '（未识别酒店名）'}</div>
+                <div className="mt-1.5 flex items-center gap-1 text-sm font-medium text-ink"><Icon name="hotel" /> {hotelName ?? '（未识别酒店名）'}</div>
                 <div className={`mt-0.5 text-xs ${hasRooming ? 'text-ink-soft' : 'text-amber-700'}`}>
                   {needsRooming && !hasRooming ? '应分房 · 尚未分房' : roomingSummary(o)}
                 </div>
@@ -3349,10 +3334,10 @@ function OrderDrawer({
               {nextSteps.length === 0 && (
                 <div className="w-full rounded-lg border border-slate-200 bg-slate-50/60 p-3 text-xs text-ink-muted">
                   {isTerminal
-                    ? `当前为终态「${STATUS_LABEL[o.status]}」，没有后续流转。${
+                    ? `当前为终态「${orderStatusLabel(o.status)}」，没有后续流转。${
                         isAdmin ? '如需异常订正，可用下方「管理员强制改状态」。' : ''
                       }`
-                    : `「${STATUS_LABEL[o.status]}」状态下无标准流转操作。${
+                    : `「${orderStatusLabel(o.status)}」状态下无标准流转操作。${
                         isAdmin ? '如需异常订正，可用下方「管理员强制改状态」。' : ''
                       }`}
                 </div>
@@ -3362,7 +3347,7 @@ function OrderDrawer({
                   key={s.to}
                   className={`${s.style} flex-1 text-sm`}
                   onClick={() => onAdvance(s.to)}
-                  title={`按标准流转：${STATUS_LABEL[o.status]} → ${STATUS_LABEL[s.to]}`}
+                  title={`按标准流转：${orderStatusLabel(o.status)} → ${orderStatusLabel(s.to)}`}
                 >
                   {s.label}
                 </button>
@@ -3379,7 +3364,7 @@ function OrderDrawer({
               hydrated &&
               !(hydrated.refunds ?? []).some((r) => r.status === 'REQUESTED' || r.status === 'COMPLETED') && (
                 <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50/70 p-3 text-xs text-amber-800">
-                  ⚠️ 本单没有退款申请记录（多为直接改状态进入退款态的历史单），点「同意退款」会被系统拦下。
+                  <Icon name="alert" size={14} /> 本单没有退款申请记录（多为直接改状态进入退款态的历史单），点「同意退款」会被系统拦下。
                   <br />· 钱确实要退：先「驳回退款（回退处理）」回到处理中，再点「申请退款」重新发起——新版会按取消政策生成应退报价。
                   <br />· 钱并未实收（错录/测试单）：由管理员强制改「已取消」后在收款区撤销收款，即可删除。
                 </div>
@@ -3400,7 +3385,7 @@ function OrderDrawer({
                       e.currentTarget.value = '';
                       if (!to) return;
                       const ok = window.confirm(
-                        `强制将该订单从「${STATUS_LABEL[o.status]}」改为「${STATUS_LABEL[to]}」？\n\n` +
+                        `强制将该订单从「${orderStatusLabel(o.status)}」改为「${orderStatusLabel(to)}」？\n\n` +
                           '此操作绕过状态机校验，仅供异常订正。若目标为占座状态（已支付/处理中/出票等），' +
                           '会重新占座（余位不足将被拒绝，状态不变）；被安全规则拦下的操作会弹出具体原因。',
                       );
@@ -3409,7 +3394,7 @@ function OrderDrawer({
                   >
                     <option value="">强制改为…</option>
                     {forceTargets.map((s) => (
-                      <option key={s} value={s}>{STATUS_LABEL[s]}</option>
+                      <option key={s} value={s}>{orderStatusLabel(s)}</option>
                     ))}
                   </select>
                 </div>
@@ -3425,10 +3410,10 @@ function OrderDrawer({
           {isAdmin && onDelete && (
             <section className="border-t border-rose-100 pt-3">
               <button
-                className="w-full rounded-lg border border-rose-300 bg-rose-50 px-3 py-2 text-sm font-medium text-rose-700 hover:bg-rose-100"
+                className="btn-danger w-full"
                 onClick={onDelete}
               >
-                删除订单（ADMIN）
+                <Icon name="trash" /> 删除订单（ADMIN）
               </button>
               <p className="mt-1 text-[11px] text-rose-400">
                 软删除：从列表/导出/统计隐藏，数据可追溯，不影响座位账。仍占座需先取消订单释放座位。
@@ -4066,12 +4051,12 @@ const FF_STATUS_LABEL: Record<FulfillmentStatus, string> = {
   PENDING: '待处理', IN_PROGRESS: '处理中', CONFIRMED: '已确认', CANCELLED: '已取消', FAILED: '失败',
 };
 
-const FF_TYPE_LABEL: Record<FulfillmentTask['type'], { icon: string; label: string }> = {
-  FLIGHT_TICKETING: { icon: '✈️', label: '机票出票' },
-  HOTEL_BOOKING: { icon: '🏨', label: '酒店确认' },
-  VISA_APPLICATION: { icon: '🛂', label: '签证办理' },
-  TRANSFER_DISPATCH: { icon: '🚐', label: '地面服务调度' },
-  BUNDLE_COMPOSITE: { icon: '🎁', label: '套餐履约' },
+const FF_TYPE_LABEL: Record<FulfillmentTask['type'], { icon: IconName; label: string }> = {
+  FLIGHT_TICKETING: { icon: 'plane', label: '机票出票' },
+  HOTEL_BOOKING: { icon: 'hotel', label: '酒店确认' },
+  VISA_APPLICATION: { icon: 'visa', label: '签证办理' },
+  TRANSFER_DISPATCH: { icon: 'car', label: '地面服务调度' },
+  BUNDLE_COMPOSITE: { icon: 'gift', label: '套餐履约' },
 };
 
 // 履约进度已按运营要求移出订单详情抽屉；组件保留（导出以备后续页面复用，也避免未引用告警）。
@@ -4109,7 +4094,7 @@ export function FulfillmentSection({ orderId }: { orderId: string }) {
   if (loading) {
     return (
       <section>
-        <h3 className="text-xs font-semibold uppercase tracking-wide text-ink-muted">🚚 履约进度</h3>
+        <h3 className="flex items-center gap-1 text-xs font-semibold uppercase tracking-wide text-ink-muted"><Icon name="package" /> 履约进度</h3>
         <div className="mt-2 rounded-lg border border-slate-200 bg-slate-50/60 p-3 text-xs text-ink-muted">加载中…</div>
       </section>
     );
@@ -4117,7 +4102,7 @@ export function FulfillmentSection({ orderId }: { orderId: string }) {
   if (tasks.length === 0) {
     return (
       <section>
-        <h3 className="text-xs font-semibold uppercase tracking-wide text-ink-muted">🚚 履约进度</h3>
+        <h3 className="flex items-center gap-1 text-xs font-semibold uppercase tracking-wide text-ink-muted"><Icon name="package" /> 履约进度</h3>
         <div className="mt-2 rounded-lg border border-slate-200 bg-slate-50/60 p-3 text-xs text-ink-muted">
           暂无履约任务 · 订单转 PAID 时自动生成（按产品类型）
         </div>
@@ -4130,7 +4115,7 @@ export function FulfillmentSection({ orderId }: { orderId: string }) {
   return (
     <section>
       <div className="flex items-center justify-between">
-        <h3 className="text-xs font-semibold uppercase tracking-wide text-ink-muted">🚚 履约进度</h3>
+        <h3 className="flex items-center gap-1 text-xs font-semibold uppercase tracking-wide text-ink-muted"><Icon name="package" /> 履约进度</h3>
         {hasTicketed && (
           <button
             className="text-xs rounded bg-blue-100 px-2 py-0.5 text-blue-700 hover:bg-blue-200"
@@ -4155,7 +4140,7 @@ export function FulfillmentSection({ orderId }: { orderId: string }) {
               }
             }}
           >
-            📧 重发行程单邮件
+            <Icon name="mail" /> 重发行程单邮件
           </button>
         )}
       </div>
@@ -4220,14 +4205,14 @@ export function FulfillmentSection({ orderId }: { orderId: string }) {
                   {(t.status === 'PENDING' || t.status === 'IN_PROGRESS') && (
                     <button className="text-xs rounded bg-green-100 px-2 py-0.5 text-green-700 hover:bg-green-200"
                       onClick={() => { setDraft(data); setEditing(t.id); }}>
-                      ✓ 填数据并确认
+                      <Icon name="check" /> 填数据并确认
                     </button>
                   )}
                   {t.status === 'IN_PROGRESS' && (
                     <button className="text-xs rounded bg-red-100 px-2 py-0.5 text-red-700 hover:bg-red-200" onClick={() => {
                       const reason = prompt('失败原因？');
                       if (reason !== null) updateStatus(t, 'FAILED' as ApiFfStatus);
-                    }}>✗ 失败</button>
+                    }}><Icon name="close" /> 失败</button>
                   )}
                   {t.type === 'FLIGHT_TICKETING' && (t.status === 'CONFIRMED' || t.status === 'FAILED') && (
                     <button
@@ -4244,7 +4229,7 @@ export function FulfillmentSection({ orderId }: { orderId: string }) {
                         }
                       }}
                     >
-                      🔄 重新出票
+                      <Icon name="refresh" /> 重新出票
                     </button>
                   )}
                 </div>
@@ -4295,12 +4280,12 @@ function FfEditForm({ type, initial, onCancel, onSave, draft, setDraft }: {
   );
 }
 
-function FfCard({ icon, label, status, children }: { icon: string; label: string; status: FulfillmentStatus; children: React.ReactNode }) {
+function FfCard({ icon, label, status, children }: { icon: IconName; label: string; status: FulfillmentStatus; children: React.ReactNode }) {
   return (
     <div className="rounded-lg border border-slate-200 bg-white p-3">
       <div className="flex items-center justify-between mb-2">
         <div className="flex items-center gap-2">
-          <span className="text-xl">{icon}</span>
+          <Icon name={icon} size={20} />
           <span className="text-sm font-medium text-ink">{label}</span>
         </div>
         <span className={FF_STATUS_COLOR[status]}>
@@ -4760,7 +4745,7 @@ function OrderItemRow({
                 className="inline-flex items-center gap-0.5 rounded border border-red-300 bg-red-50 px-1.5 py-0.5 text-[11px] font-semibold text-red-600"
                 title={changedHint}
               >
-                ✈ 航变
+                <Icon name="plane" /> 航变
               </span>
             )}
           </div>
@@ -5688,7 +5673,7 @@ function PassengerTripsBadge({ row }: { row: TravelerProfileLookupRow }) {
             : 'bg-slate-50 text-slate-600 ring-slate-200'
         }`}
       >
-        ✈️ 已飞 {row.tripCount}
+        <Icon name="plane" /> 已飞 {row.tripCount}
       </span>
       {/* 可用 ≠ 已飞 ⇒ 有核销（或退改把已飞拉回来了），必须单列，否则会被当成还能兑 */}
       {row.availableTrips !== row.tripCount && (
@@ -5754,7 +5739,45 @@ function useTravelerTripsByDoc(
   return rows;
 }
 
+function useLegacyHistoryByDoc(
+  passengers: OrderSummary['passengers'],
+): Map<string, LegacyPassengerHistory> {
+  const token = useAuth((s) => s.tokens)?.accessToken ?? '';
+  const role = useAuth((s) => s.user?.role);
+  const canReadLegacyHistory = role === 'ADMIN' || role === 'STAFF';
+  const [rows, setRows] = useState<Map<string, LegacyPassengerHistory>>(new Map());
+  const docs = useMemo(
+    () => [...new Set(passengers.map((p) => p.documentNumber?.trim().toUpperCase()).filter((doc): doc is string => Boolean(doc)))].slice(0, 100),
+    [passengers],
+  );
+  const docsKey = docs.join(',');
+
+  useEffect(() => {
+    if (!canReadLegacyHistory || !token || docs.length === 0) {
+      setRows(new Map());
+      return;
+    }
+    let cancelled = false;
+    Promise.all(docs.map(async (doc) => {
+      try {
+        return [doc, await api.getLegacyPassengerHistory(token, doc)] as const;
+      } catch {
+        return null;
+      }
+    })).then((results) => {
+      if (cancelled) return;
+      setRows(new Map(results.filter((result): result is readonly [string, LegacyPassengerHistory] => result !== null)));
+    });
+    return () => { cancelled = true; };
+    // docsKey fully represents the requested passport set.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canReadLegacyHistory, token, docsKey]);
+
+  return rows;
+}
+
 function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onOrderUpdated?: (order: OrderSummary) => void }) {
+  const navigate = useNavigate();
   const [editingId, setEditingId] = useState<string | null>(null);
   const [lightbox, setLightbox] = useState<{ photoUrl: string; title: string } | null>(null);
   // B1：签证日期内联编辑（订单侧入口——HAS_VISA/全员自备签的单进不了签证台，这里是它们唯一可达的录入口）
@@ -5794,6 +5817,7 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
 
   // 常旅客次数：按本单乘客证件批量查一次，给每张乘客卡挂「已飞 N / 可用 M」小标
   const tripsByDoc = useTravelerTripsByDoc(order.passengers);
+  const legacyByDoc = useLegacyHistoryByDoc(order.passengers);
 
   return (
     <section>
@@ -5808,6 +5832,8 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
           const tripsRow = docNo
             ? tripsByDoc.get(travelerDocKey(p.documentType ?? 'PASSPORT', docNo))
             : undefined;
+          const legacyHistory = docNo ? legacyByDoc.get(docNo.toUpperCase()) : undefined;
+          const legacyRemaining = legacyHistory ? legacyHistory.total - legacyHistory.superseded : 0;
           if (visaEditId === p.id) {
             return (
               <li key={p.id} className="rounded-md border border-sky-300 bg-sky-50/50 p-3">
@@ -5849,6 +5875,16 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
                     <span className="ml-2 text-xs font-normal text-slate-500">{genderLabel(p.gender)}</span>
                     {/* 常旅客次数（查不到档案就不显示，不占位） */}
                     {tripsRow && <PassengerTripsBadge row={tripsRow} />}
+                    {legacyRemaining > 0 && (
+                      <button
+                        type="button"
+                        className="ml-2 rounded bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-amber-200 hover:bg-amber-100"
+                        onClick={() => navigate(`/legacy-archive?q=${encodeURIComponent(docNo ?? '')}`)}
+                        title="查看该乘客的老系统历史档案"
+                      >
+                        老系统历史购买 {legacyRemaining} 次
+                      </button>
+                    )}
                     {/* 套餐乘客级选项徽标（购物车模式：每人各选住宿方式 + 签证） */}
                     {p.singleRoom && (
                       <span className="ml-2 rounded bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-amber-200">单住</span>
@@ -6052,7 +6088,7 @@ function PassportLightbox({
           下载
         </a>
         <button type="button" className={btnCls} title="关闭（Esc）" onClick={onClose}>
-          ✕
+          <Icon name="close" />
         </button>
       </div>
       {/* 图片区：溢出可滚动（含旋转后的视觉溢出）；滚轮缩放 */}
@@ -6400,7 +6436,7 @@ function PassengerEditForm({
               onClick={() => ocrInputRef.current?.click()}
               disabled={submitting}
             >
-              📷 上传护照识别
+              <Icon name="camera" /> 上传护照识别
             </button>
             {passportPhotoUrl && (
               <img src={passportPhotoUrl} alt="护照" className="h-8 w-8 rounded object-cover" />
@@ -6592,7 +6628,7 @@ function OpsToolbar({ order }: { order: OrderSummary; onAdvance: (next: OrderSta
             className="text-xs text-slate-600"
             title="该订单已由此人负责跟进（出票/签证/联系客户）"
           >
-            🙋 已接单 · 负责人 {claimed.displayName ?? claimed.email ?? claimed.id}
+            <Icon name="user" /> 已接单 · 负责人 {claimed.displayName ?? claimed.email ?? claimed.id}
           </span>
         ) : (
           <button
@@ -6601,7 +6637,7 @@ function OpsToolbar({ order }: { order: OrderSummary; onAdvance: (next: OrderSta
             disabled={busy !== null}
             title="接下这单，成为负责人跟进出票/签证/联系客户（避免多人重复处理或漏单）"
           >
-            {busy === 'claim' ? '接单中…' : '🙋 我来接单'}
+            {busy === 'claim' ? '接单中…' : <><Icon name="user" /> 我来接单</>}
           </button>
         )}
       </div>
@@ -6611,14 +6647,14 @@ function OpsToolbar({ order }: { order: OrderSummary; onAdvance: (next: OrderSta
           onClick={handlePnr}
           disabled={busy !== null}
         >
-          {busy === 'pnr' ? '生成中…' : '📄 导出 PNR Excel'}
+          {busy === 'pnr' ? '生成中…' : <><Icon name="file" /> 导出 PNR Excel</>}
         </button>
         <button
           className="rounded bg-emerald-600 px-2 py-1.5 text-xs text-white hover:bg-emerald-700 disabled:opacity-50"
           onClick={handleZip}
           disabled={busy !== null}
         >
-          {busy === 'zip' ? '打包中…' : '📦 打包护照图片'}
+          {busy === 'zip' ? '打包中…' : <><Icon name="package" /> 打包护照图片</>}
         </button>
       </div>
       <p className="mt-2 text-[10px] text-slate-500">
@@ -6883,7 +6919,7 @@ function NotesSection({
                 {saving ? '保存中…' : '保存备注'}
               </button>
             )}
-            {saved && <span className="text-xs text-green-600">✓ 已保存</span>}
+            {saved && <span className="inline-flex items-center gap-1 text-xs text-green-600"><Icon name="check" size={14} /> 已保存</span>}
           </div>
         )}
       </div>
@@ -6930,7 +6966,7 @@ function RemindersSection({ order }: { order: OrderSummary }) {
     }
   };
 
-  const PRIORITY_LABEL: Record<string, string> = { LOW: '低', NORMAL: '中', HIGH: '高', CRITICAL: '🔴 紧急' };
+  const PRIORITY_LABEL: Record<string, string> = { LOW: '低', NORMAL: '中', HIGH: '高', CRITICAL: '紧急' };
   const STATUS_LABEL: Record<string, string> = { OPEN: '未处理', IN_PROGRESS: '处理中', DONE: '✓ 完成', SKIPPED: '⊘ 跳过' };
 
   // 运营待办/提醒是内部协作口径，只对内部角色开放；AGENT/CUSTOMER 整块不渲染（后端对其也不下发 reminders）。
@@ -6958,13 +6994,13 @@ function RemindersSection({ order }: { order: OrderSummary }) {
                     className="rounded bg-green-600 px-1.5 py-0.5 text-[10px] text-white hover:bg-green-700"
                     onClick={() => resolve(r.id, 'DONE')}
                   >
-                    ✓ 完成
+                    <Icon name="check" size={12} /> 完成
                   </button>
                   <button
                     className="rounded bg-slate-400 px-1.5 py-0.5 text-[10px] text-white hover:bg-slate-500"
                     onClick={() => resolve(r.id, 'SKIPPED')}
                   >
-                    ⊘ 跳过
+                    <Icon name="pause" size={12} /> 跳过
                   </button>
                 </div>
               )}
@@ -8278,7 +8314,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
       <div className="my-8 w-full max-w-3xl rounded-xl bg-white shadow-xl">
         <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3">
           <h2 className="text-lg font-semibold text-slate-900">批量创单（散客 · 每位乘客一单）</h2>
-          <button className="text-slate-400 hover:text-slate-700" onClick={onClose}>✕</button>
+          <button className="btn-ghost px-2 py-1" onClick={onClose}><Icon name="close" /></button>
         </div>
 
         {result ? (
@@ -8301,9 +8337,9 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                       <td className="py-1.5 text-slate-900">{r.passengerName}</td>
                       <td className="py-1.5">
                         {r.success ? (
-                          <span className="text-emerald-700">✓ {r.orderNumber}</span>
+                          <span className="inline-flex items-center gap-1 text-emerald-700"><Icon name="check" size={14} /> {r.orderNumber}</span>
                         ) : (
-                          <span className="text-rose-600">✕ {r.error}</span>
+                          <span className="inline-flex items-center gap-1 text-rose-600"><Icon name="close" size={14} /> {r.error}</span>
                         )}
                       </td>
                     </tr>
@@ -8611,7 +8647,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                     disabled={bulkOcr !== null}
                     title={`一次多选护照照片自动识别，最多 ${BATCH_MAX_PHOTO_PASSENGERS} 张/批`}
                   >
-                    {bulkOcr ? `识别中 ${bulkOcr.done}/${bulkOcr.total}…` : `📷 批量传护照（≤${BATCH_MAX_PHOTO_PASSENGERS}）`}
+                    {bulkOcr ? `识别中 ${bulkOcr.done}/${bulkOcr.total}…` : <><Icon name="camera" /> 批量传护照（≤{BATCH_MAX_PHOTO_PASSENGERS}）</>}
                   </button>
                   <button className="text-sm text-brand hover:text-brand-dark" onClick={addRow}>＋ 加一行</button>
                 </div>
@@ -8866,10 +8902,10 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                                 <ProofImageViewer src={r.passportPhotoUrl} alt="护照" thumbClassName="h-7 w-10 rounded object-cover ring-1 ring-slate-200" />
                                 <button
                                   type="button"
-                                  className="text-[10px] text-slate-400 hover:text-rose-500"
+                                  className="btn-ghost-danger px-1 py-0.5 text-[10px]"
                                   onClick={() => setRow(i, { passportPhotoUrl: undefined, ocrPct: null, ocrStage: undefined, ocrEngine: null, ocrModel: null, ocrFailed: false, reviewFields: undefined, mrzValid: null, localOcrCaveat: false })}
                                   title="移除图片"
-                                >✕</button>
+                                ><Icon name="close" /></button>
                               </div>
                               {r.ocrEngine === 'ai' && (
                                 <span className="block max-w-full truncate rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium leading-tight text-emerald-700 ring-1 ring-emerald-200" title={r.ocrModel ? `AI识别 · ${r.ocrModel}` : 'AI识别'}>
@@ -8898,13 +8934,13 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                           )}
                         </td>
                         <td className="px-2 py-1 text-right align-top">
-                          <button className="text-xs text-slate-400 hover:text-rose-600" onClick={() => removeRow(i)} disabled={rows.length <= 1}>删</button>
+                          <button className="btn-ghost-danger px-1 py-0.5 text-xs" onClick={() => removeRow(i)} disabled={rows.length <= 1}><Icon name="trash" /></button>
                         </td>
                       </tr>
                       {reviewHint && (
                         <tr className="border-t-0">
                           <td colSpan={productType === 'BUNDLE' ? 10 : 9} className={`${ocrErrorHint ? 'bg-rose-50 text-rose-700 ring-1 ring-inset ring-rose-200' : 'bg-amber-50 text-amber-700'} px-2 py-1 text-[11px]`}>
-                            ⚠️ {reviewHint}
+                            <Icon name="alert" /> {reviewHint}
                           </td>
                         </tr>
                       )}
@@ -8915,7 +8951,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                 </table>
               </div>
               <p className="mt-1 text-[11px] text-slate-400">
-                📷「批量传护照」可一次多选，自动逐张识别并生成乘客行；护照图最多 {BATCH_MAX_PHOTO_PASSENGERS} 张/批，超出请分批录入。识别有需人工核对的字段时会在对应行下方标黄提示。
+                <Icon name="camera" />「批量传护照」可一次多选，自动逐张识别并生成乘客行；护照图最多 {BATCH_MAX_PHOTO_PASSENGERS} 张/批，超出请分批录入。识别有需人工核对的字段时会在对应行下方标黄提示。
               </p>
             </div>
 
@@ -8942,7 +8978,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
             {/* E 📋 OTA 名单粘贴导入：首行航段 + 每位乘客段 + 结算价，一键解析填充 */}
             <div className="rounded-md border border-slate-200 bg-slate-50/60 p-3">
               <div className="mb-1.5 flex items-center justify-between">
-                <span className="text-sm font-medium text-slate-700">📋 粘贴名单导入（OTA 线上单）</span>
+                <span className="inline-flex items-center gap-1 text-sm font-medium text-slate-700"><Icon name="clipboard" /> 粘贴名单导入（OTA 线上单）</span>
                 <button
                   type="button"
                   className="btn-primary text-xs disabled:opacity-50"
@@ -9573,7 +9609,7 @@ function ConfirmPaymentSection({
           收款
           {paymentsLocked && (
             <span className="ml-2 inline-flex items-center rounded bg-slate-200 px-1.5 py-0.5 text-xs font-medium text-slate-600">
-              🔒 已锁定
+              <Icon name="lock" /> 已锁定
             </span>
           )}
         </h3>
@@ -9601,7 +9637,7 @@ function ConfirmPaymentSection({
         {/* 挂账池疑似本单待认领：财务锁定收款前先看见池子里还压着本单的钱（提示，不阻断） */}
         {pendingHint && (
           <div className="mt-2 rounded-md border border-amber-300 bg-amber-50 px-2 py-1.5 text-xs text-amber-800">
-            💰 挂账池有 <b className="nums">{pendingHint.count}</b> 笔疑似本单待认领（共{' '}
+            <Icon name="wallet" /> 挂账池有 <b className="nums">{pendingHint.count}</b> 笔疑似本单待认领（共{' '}
             <b className="nums">¥{pendingHint.totalRemaining.toLocaleString()}</b>，流水{' '}
             <span className="font-mono">{pendingHint.refsText}</span>）
             <span className="ml-1 text-amber-700">
@@ -9635,7 +9671,7 @@ function ConfirmPaymentSection({
         {/* 月结挂账说明（月结代理尾款>0 不催款）*/}
         {agent && isMonthly && balance > 0 && (
           <div className="mt-2 rounded-md border border-blue-200 bg-blue-50 px-2 py-1.5 text-xs text-blue-700">
-            🗓 月结代理：尾款 ¥{balance.toLocaleString()} 计入月结挂账，月末统一对账，无需逐单催款。
+            <Icon name="calendar" /> 月结代理：尾款 ¥{balance.toLocaleString()} 计入月结挂账，月末统一对账，无需逐单催款。
           </div>
         )}
 
@@ -9726,7 +9762,7 @@ function ConfirmPaymentSection({
                     paymentsLocked ? (
                       <button
                         type="button"
-                        className="btn-secondary px-1.5 py-0.5 text-[11px] disabled:cursor-not-allowed disabled:opacity-50"
+                        className="btn-ghost-danger px-1.5 py-0.5 text-[11px] disabled:cursor-not-allowed disabled:opacity-50"
                         disabled
                         title="收款已锁定（财务复核完成），请先解锁"
                       >
@@ -9735,7 +9771,7 @@ function ConfirmPaymentSection({
                     ) : p.reconciled === true ? (
                       <button
                         type="button"
-                        className="btn-secondary px-1.5 py-0.5 text-[11px]"
+                        className="btn-ghost-danger px-1.5 py-0.5 text-[11px]"
                         onClick={() => void reversePayment(p)}
                       >
                         去对账台撤销
@@ -9743,7 +9779,7 @@ function ConfirmPaymentSection({
                     ) : (
                       <button
                         type="button"
-                        className="rounded border border-rose-300 bg-rose-50 px-1.5 py-0.5 text-[11px] text-rose-700 hover:bg-rose-100 disabled:cursor-not-allowed disabled:opacity-50"
+                        className="btn-ghost-danger px-1.5 py-0.5 text-[11px] disabled:cursor-not-allowed disabled:opacity-50"
                         onClick={() => void reversePayment(p)}
                         disabled={submitting}
                       >
@@ -9761,7 +9797,7 @@ function ConfirmPaymentSection({
         {paymentsLocked ? (
           <div className="mt-3 border-t border-slate-100 pt-3">
             <div className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">
-              🔒 收款已锁定（财务复核完成），如需继续录入收款请先解锁。
+              <Icon name="lock" /> 收款已锁定（财务复核完成），如需继续录入收款请先解锁。
             </div>
             {err && <div className="mt-2 rounded bg-rose-50 px-2 py-1 text-xs text-rose-700">{err}</div>}
           </div>
@@ -9807,7 +9843,7 @@ function ConfirmPaymentSection({
             </label>
             <div className="flex items-center justify-between gap-2">
               <label className="flex items-center gap-2 text-xs text-slate-600">
-                <span className="rounded-md border border-slate-300 px-2 py-1 cursor-pointer hover:bg-slate-50">📷 上传收款截图</span>
+              <span className="inline-flex items-center gap-1 rounded-md border border-slate-300 px-2 py-1 cursor-pointer hover:bg-slate-50"><Icon name="camera" /> 上传收款截图</span>
                 <input type="file" accept="image/*" className="hidden" onChange={onFile} />
                 {proofUrl && <img src={proofUrl} alt="预览" className="h-8 w-8 rounded border border-slate-300 object-cover" />}
               </label>
@@ -9995,7 +10031,7 @@ function BatchPayModal({
       <div className="my-8 w-full max-w-3xl rounded-xl bg-white shadow-xl">
         <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3">
           <h2 className="text-lg font-semibold text-slate-900">批量到账（{rows.length} 笔订单）</h2>
-          <button className="text-slate-400 hover:text-slate-700" onClick={onClose}>✕</button>
+          <button className="btn-ghost px-2 py-1" onClick={onClose}><Icon name="close" /></button>
         </div>
 
         <div className="space-y-4 p-5">
@@ -10029,7 +10065,7 @@ function BatchPayModal({
               </label>
             </div>
             <label className="mt-2 flex items-center gap-2 text-xs text-slate-600">
-              <span className="rounded-md border border-slate-300 px-2 py-1 cursor-pointer hover:bg-slate-50">📷 上传共享水单（选填）</span>
+              <span className="inline-flex items-center gap-1 rounded-md border border-slate-300 px-2 py-1 cursor-pointer hover:bg-slate-50"><Icon name="camera" /> 上传共享水单（选填）</span>
               <input type="file" accept="image/*" className="hidden" onChange={onSharedFile} disabled={submitting || results !== null} />
               {sharedProofUrl && <img src={sharedProofUrl} alt="水单预览" className="h-8 w-8 rounded border border-slate-300 object-cover" />}
             </label>
@@ -10081,9 +10117,9 @@ function BatchPayModal({
                         <td className="px-3 py-1.5 text-xs">
                           {res ? (
                             res.ok ? (
-                              <span className="text-emerald-700">✓ 已到账（已付 ¥{res.paidAmount.toLocaleString()}）</span>
+                              <span className="inline-flex items-center gap-1 text-emerald-700"><Icon name="check" size={14} /> 已到账（已付 ¥{res.paidAmount.toLocaleString()}）</span>
                             ) : (
-                              <span className="text-rose-600">✕ {res.error ?? '失败'}</span>
+                              <span className="inline-flex items-center gap-1 text-rose-600"><Icon name="close" size={14} /> {res.error ?? '失败'}</span>
                             )
                           ) : (
                             <span className="text-slate-400">未提交</span>

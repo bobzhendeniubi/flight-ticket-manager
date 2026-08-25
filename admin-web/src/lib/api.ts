@@ -1515,6 +1515,137 @@ export interface OrderSummary {
   infantUnitPriceCny?: number | null;
 }
 
+// ── 老系统历史档案（只读）──────────────────────────────────────────────
+export interface LegacyTicketListItem {
+  id: string;
+  bookingNo: string | null;
+  teamNo: string | null;
+  fullName: string | null;
+  chineseName: string | null;
+  documentNumber: string | null;
+  documentNumberNorm: string | null;
+  outboundFlightNo: string | null;
+  outboundDate: string | null;
+  returnFlightNo: string | null;
+  returnDate: string | null;
+  finalPrice: string | null;
+  truePrice: string | null;
+  paymentConfirmed: boolean;
+  isDeleted: boolean;
+  orgId: string | null;
+  orgName: string | null;
+  legacyCreateTime: string | null;
+  supersededByOrderId: string | null;
+}
+
+export interface LegacyFlightRecord {
+  id: string;
+  flightNo: string | null;
+  departDate: string | null;
+  departTime: string | null;
+  arriveTime: string | null;
+  originCode: string | null;
+  destCode: string | null;
+  businessTotal: number | null;
+  economyTotal: number | null;
+  adultBusinessPrice: string | null;
+  adultEconomyPrice: string | null;
+  isProduct: boolean;
+}
+
+export interface LegacyReceiptRecord {
+  id: string;
+  ticketId: string | null;
+  sequence: number | null;
+  amount: string | null;
+  receivedAt: string | null;
+  channelCode: number | null;
+  legacyCreateTime: string | null;
+}
+
+export interface LegacyTicketRecord extends LegacyTicketListItem {
+  tripType: number | null;
+  cabinLevel: number | null;
+  documentName: string | null;
+  gender: string | null;
+  birthDate: string | null;
+  nationality: string | null;
+  documentTypeRaw: string | null;
+  issueDate: string | null;
+  expiryDate: string | null;
+  birthPlace: string | null;
+  passengerType: string | null;
+  infantAdultName: string | null;
+  depositPrice: string | null;
+  hotelPrice: string | null;
+  hotelTruePrice: string | null;
+  visaPrice: string | null;
+  visaTruePrice: string | null;
+  discountPrice: string | null;
+  deductionPrice: string | null;
+  finalPriceRemark: string | null;
+  stateRaw: number | null;
+  outboundTicketed: boolean;
+  returnTicketed: boolean;
+  systemTicketed: boolean;
+  visaStateRaw: number | null;
+  hotelTypeName: string | null;
+  fileId: string | null;
+  paymentFileId: string | null;
+  remark: string | null;
+  dataIssues: string[];
+  flights: Array<{
+    id: string;
+    ticketId: string;
+    flightId: string;
+    legType: number;
+    flight: LegacyFlightRecord;
+  }>;
+  receipts: LegacyReceiptRecord[];
+}
+
+export interface LegacyPassengerHistory {
+  total: number;
+  superseded: number;
+  items: LegacyTicketListItem[];
+}
+
+export interface LegacyStats {
+  total: number;
+  uniquePassengers: number;
+  dateFrom: string | null;
+  dateTo: string | null;
+  receiptCount: number;
+  superseded: number;
+}
+
+export interface LegacyDashboard {
+  monthly: Array<{ month: string; count: number; finalPriceSum: string }>;
+  payment: { confirmed: number; unconfirmed: number };
+  totals: {
+    finalPriceSum: string;
+    truePriceSum: string;
+    receiptCount: number;
+    receiptAmountSum: string;
+  };
+  topOrgs: Array<{ orgId: string | null; orgName: string | null; count: number; finalPriceSum: string }>;
+  topFlights: Array<{ flightNo: string; count: number }>;
+  dataIssues: Array<{ issue: string; count: number }>;
+  superseded: number;
+}
+
+export interface ListLegacyTicketsParams {
+  q?: string;
+  dateFrom?: string;
+  dateTo?: string;
+  orgId?: string;
+  paymentConfirmed?: boolean;
+  dataIssue?: string;
+  includeDeleted?: boolean;
+  page?: number;
+  pageSize?: number;
+}
+
 /** 退款记录状态（与 backend RefundStatus 对齐） */
 export type RefundRecordStatus = 'REQUESTED' | 'APPROVED' | 'PROCESSING' | 'COMPLETED' | 'REJECTED';
 
@@ -3292,6 +3423,26 @@ export const api = {
   },
   getOrder: (token: string, id: string) =>
     apiFetch<{ order: OrderSummary }>(`/orders/${id}`, { token }),
+
+  // Legacy archive (read-only)
+  listLegacyTickets: (token: string, query?: ListLegacyTicketsParams) => {
+    const qs = new URLSearchParams();
+    if (query) {
+      for (const [key, value] of Object.entries(query)) {
+        if (value !== undefined && value !== '') qs.set(key, String(value));
+      }
+    }
+    return apiFetch<{
+      items: LegacyTicketListItem[];
+      pagination: { page: number; pageSize: number; total: number };
+    }>(`/legacy/tickets${qs.toString() ? `?${qs.toString()}` : ''}`, { token });
+  },
+  getLegacyTicket: (token: string, id: string) =>
+    apiFetch<{ item: LegacyTicketRecord }>(`/legacy/tickets/${encodeURIComponent(id)}`, { token }),
+  getLegacyPassengerHistory: (token: string, documentNumber: string) =>
+    apiFetch<LegacyPassengerHistory>(`/legacy/passenger-history?doc=${encodeURIComponent(documentNumber)}`, { token }),
+  getLegacyStats: (token: string) => apiFetch<LegacyStats>('/legacy/stats', { token }),
+  getLegacyDashboard: (token: string) => apiFetch<LegacyDashboard>('/legacy/dashboard', { token }),
   addGroundItem: (
     token: string,
     orderId: string,
