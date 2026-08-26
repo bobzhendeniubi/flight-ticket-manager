@@ -2741,6 +2741,14 @@ export interface DashboardTopAgent {
 // ── Settlements ──────────────────────────────────────────────────────────
 export type SettlementStatus = 'DRAFT' | 'PENDING_APPROVAL' | 'APPROVED' | 'PAID' | 'VOIDED';
 
+/** 结算单绑定的单条 REVERSED（冲销）记录摘要 —— 不论正负金额都透出，供审批页查看。 */
+export interface SettlementReversedRecord {
+  id: string;
+  orderId: string;
+  orderNumber: string | null;
+  amount: string;
+}
+
 export interface SettlementSummary {
   id: string;
   period: string; // YYYY-MM
@@ -2752,6 +2760,13 @@ export interface SettlementSummary {
   netCommission: string;
   prepaymentOffset: string;
   payableToAgent: string;
+  // 本期退款冲销摘要：reversalCount/reversalAmount 只统计负数补偿记录（真实追回，恒 ≤ 0）；
+  // reversedRecords 把本单绑定的 REVERSED 记录（不论正负）逐条透出，供审批时核对。
+  reversalCount: number;
+  reversalAmount: string;
+  reversedRecords: SettlementReversedRecord[];
+  // 本期净额为负时的结转金额（正数，"已结转下期"的绝对值）；无结转为 '0'。
+  carryForwardAmount: string;
   status: SettlementStatus;
   generatedAt: string;
   approvedAt: string | null;
