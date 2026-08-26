@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- 异地备份拉取：每天 11:00 跑 pull-backups.sh；机器睡过点会在唤醒后补跑。
+     安装：cp 到 ~/Library/LaunchAgents/ 后 launchctl load（见 pull-backups.sh 头注释）。 -->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.ftm.backup-pull</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/bobwang/Documents/Flight Ticket Manager/infra/local/pull-backups.sh</string>
+  </array>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>11</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>/tmp/ftm-backup-pull.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/ftm-backup-pull.log</string>
+</dict>
+</plist>
