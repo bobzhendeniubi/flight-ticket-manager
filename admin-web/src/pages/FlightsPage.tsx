@@ -119,6 +119,14 @@ export function FlightsPage() {
     return <div className="card text-ink-soft">仅管理员/运营可访问此页面。</div>;
   }
 
+  // 航班维护岗 = ADMIN，或 STAFF 里的「运营（未设岗）/ 票务岗」：建航班、加班次、改班次归他们。
+  // 与后端 flights.routes.ts 的 requireFlightMaintenance 同口径。
+  // 登录瞬间 staffRole 可能还没回来（等 /users/me）：此时按放行渲染，数据保护由后端闸兜底——
+  // 与 App.tsx 里 financeRole 的判定同一取舍，避免误伤刷新 / 首登场景。
+  const canManageFlights =
+    user.role === 'ADMIN' ||
+    (user.role === 'STAFF' && (user.staffRole == null || user.staffRole === 'TICKETING'));
+
   if (error) {
     return <div className="card border-rose-200 bg-rose-50 text-rose-700">{error}</div>;
   }
@@ -133,7 +141,7 @@ export function FlightsPage() {
           <h1 className="page-title">航班管理</h1>
           <p className="page-sub">维护自营航班、班次和舱位。</p>
         </div>
-        {user.role === 'ADMIN' && (
+        {canManageFlights && (
           <button type="button" className="btn-primary" onClick={() => setShowNewFlight(true)}>
             + 新建航班
           </button>
@@ -182,24 +190,8 @@ export function FlightsPage() {
                 >
                   <Icon name="luggage" /> 行李规则
                 </button>
-                <button
-                  type="button"
-                  className="btn-danger text-sm"
-                  title="按出发日区间批量删除该航班班次（已售班次自动跳过）"
-                  onClick={() => togglePanel(f.id, 'bulkDelete')}
-                >
-                  <Icon name="trash" /> 批量删除班次
-                </button>
-                {user.role === 'ADMIN' && (
+                {canManageFlights && (
                   <>
-                    <button
-                      type="button"
-                      className="btn-secondary text-sm"
-                      title="设置升舱差价（¥/程/座）与商务舱价格联动经济舱"
-                      onClick={() => togglePanel(f.id, 'businessLink')}
-                    >
-                      <Icon name="ticket" /> 升舱/联动{f.businessPriceLinked ? '（已联动）' : ''}
-                    </button>
                     <button
                       type="button"
                       className="btn-secondary text-sm"
@@ -213,6 +205,27 @@ export function FlightsPage() {
                       onClick={() => togglePanel(f.id, 'bulkAdd')}
                     >
                       <Icon name="calendar" /> 批量加班次
+                    </button>
+                  </>
+                )}
+                {/* 删除不可恢复、升舱差价与整线停售影响整条航线 —— 这三件仅 ADMIN */}
+                {user.role === 'ADMIN' && (
+                  <>
+                    <button
+                      type="button"
+                      className="btn-danger text-sm"
+                      title="按出发日区间批量删除该航班班次（已售班次自动跳过）"
+                      onClick={() => togglePanel(f.id, 'bulkDelete')}
+                    >
+                      <Icon name="trash" /> 批量删除班次
+                    </button>
+                    <button
+                      type="button"
+                      className="btn-secondary text-sm"
+                      title="设置升舱差价（¥/程/座）与商务舱价格联动经济舱"
+                      onClick={() => togglePanel(f.id, 'businessLink')}
+                    >
+                      <Icon name="ticket" /> 升舱/联动{f.businessPriceLinked ? '（已联动）' : ''}
                     </button>
                     <button
                       type="button"
@@ -289,7 +302,7 @@ export function FlightsPage() {
                 flightNumber={f.flightNumber}
                 originCode={f.originCode}
                 destinationCode={f.destinationCode}
-                canEdit={user.role === 'ADMIN'}
+                canEdit={canManageFlights}
                 onRefresh={() => refreshSchedulesAndBump(f.id)}
               />
             )}
@@ -1248,6 +1261,8 @@ function DaySchedule({
   onExportFull: (scheduleId: string, departureDate: string) => void;
 }) {
   const tokens = useAuth((s) => s.tokens);
+  // 删除班次不可恢复，与「批量删除班次」同口径 —— 仅 ADMIN；其余编辑动作跟随 canEdit（航班维护岗）。
+  const isAdmin = useAuth((s) => s.user?.role === 'ADMIN');
   const confirm = useConfirm();
   const highRiskConfirmRef = useRef(false);
   const econ = getCabin(schedule, 'ECONOMY');
@@ -1685,7 +1700,7 @@ function DaySchedule({
         </div>
       )}
 
-      {/* 改价 / 改容量（仅 ADMIN）：有阶梯时基础价不是现售价，标注清楚避免误改 */}
+      {/* 改价 / 改容量（航班维护岗）：有阶梯时基础价不是现售价，标注清楚避免误改 */}
       {canEdit && (
         <div className="mt-3 grid gap-3 sm:grid-cols-2">
           {econ && (
@@ -1781,7 +1796,7 @@ function DaySchedule({
         </div>
       )}
 
-      {/* 仓位阶梯（仅 ADMIN）：每个有座的舱位一个小节 —— 每档几张 + 价格，自顶向下卖 */}
+      {/* 仓位阶梯（航班维护岗）：每个有座的舱位一个小节 —— 每档几张 + 价格，自顶向下卖 */}
       {canEdit && (econ || biz) && (
         <div className="mt-3 space-y-2">
           <div className="text-xs font-medium text-ink-soft">仓位阶梯（按仓位卖：每档几张 + 价格；卖满跳下一档）</div>
@@ -1816,15 +1831,17 @@ function DaySchedule({
         </button>
         {canEdit && (
           <>
-            <button
-              type="button"
-              className="btn-ghost-danger text-xs disabled:text-slate-300 disabled:hover:bg-transparent"
-              title={totalSold > 0 ? '已有销售，不能删除（请用下架）' : '彻底删除该班次（不可恢复）'}
-              disabled={deleting || totalSold > 0}
-              onClick={onDelete}
-            >
-              {deleting ? '删除中…' : <><Icon name="trash" /> 删除班次</>}
-            </button>
+            {isAdmin && (
+              <button
+                type="button"
+                className="btn-ghost-danger text-xs disabled:text-slate-300 disabled:hover:bg-transparent"
+                title={totalSold > 0 ? '已有销售，不能删除（请用下架）' : '彻底删除该班次（不可恢复）'}
+                disabled={deleting || totalSold > 0}
+                onClick={onDelete}
+              >
+                {deleting ? '删除中…' : <><Icon name="trash" /> 删除班次</>}
+              </button>
+            )}
             <button
               type="button"
               className="btn-secondary text-xs"
@@ -1928,6 +1945,9 @@ function BulkEditPanel({
   onDone: () => Promise<void> | void;
 }) {
   const tokens = useAuth((s) => s.tokens);
+  // 批量改容量爆炸半径大（一次能把整月班次改成超售），后端仍限 ADMIN —— 非 ADMIN 不给这个选项，
+  // 免得选了才吃 403。单班次改容量在 DaySchedule 里，航班维护岗照旧可改。
+  const isAdmin = useAuth((s) => s.user?.role === 'ADMIN');
   const askConfirm = useConfirm();
   const highRiskConfirmRef = useRef(false);
 
@@ -2286,7 +2306,7 @@ function BulkEditPanel({
           ×
         </button>
       </div>
-      <p className="text-xs text-slate-500 mt-0.5">按日期范围 + 星期几，批量改价 / 改时刻 / 改容量 / 设置或清除仓位阶梯</p>
+      <p className="text-xs text-slate-500 mt-0.5">按日期范围 + 星期几，批量改价 / 改时刻{isAdmin ? ' / 改容量' : ''} / 设置或清除仓位阶梯</p>
 
       <form className="mt-4 grid gap-3 md:grid-cols-4" onSubmit={onSubmit}>
         <div>
@@ -2321,7 +2341,7 @@ function BulkEditPanel({
             <option value="addPercent">涨 X%</option>
             <option value="setLadder">设置仓位阶梯</option>
             <option value="clearLadder">清除仓位阶梯</option>
-            <option value="setCapacity">批量改容量</option>
+            {isAdmin && <option value="setCapacity">批量改容量</option>}
             <option value="setTimes">批量改时刻（航司改点）</option>
           </select>
         </div>
