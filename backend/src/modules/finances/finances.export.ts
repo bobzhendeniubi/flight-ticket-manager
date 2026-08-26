@@ -11,10 +11,12 @@
  * 收入按 order.total ÷ 人数 均摊到每位乘客。
  *
  * 是否清账（settledStatus）口径：应收合计 = total + adjustmentCny（改期费/换人费等售后费用）；
- * 已收合计 = paidAmount + prepaymentOffset（代理预付款抵扣）；清账 = 已收合计 ≥ 应收合计，
- * 不带"应收合计>0"前置——与 orders.export-master.ts / orders.export-templates.ts /
- * reports.service.ts 三处口径字字对齐，避免"改期费/换人费未收"被误标为已清账，也让零额单
- * （免费单/全减免单，应收=已收=0）正常判"已清账"而非"未清账"。
+ * 已收净额 = paidAmount + prepaymentOffset − Σ COMPLETED Refund（统一口径见 lib/net-received.ts）；
+ * 清账 = 已收净额 ≥ 应收合计，不带"应收合计>0"前置——与 orders.export-master.ts /
+ * orders.export-templates.ts / reports.service.ts 三处口径字字对齐，避免"改期费/换人费未收"
+ * 被误标为已清账，也让零额单（免费单/全减免单，应收=已收=0）正常判"已清账"而非"未清账"。
+ * 已完成退款必须扣：退款完成只翻 Refund 状态、不回冲 paidAmount，不扣就会把"先收后退"的
+ * 订单一直标成已清账（钱其实已经退回客户了）。
  * 注：本导出的"收入"各列（flightRevenue/totalRevenue/客单收入 等）仍只按 order.total /
  * OrderItem.amount 计，不含 adjustmentCny——改期费/换人费目前没有独立的收入列，只在
  * settledStatus 这个应收口径里生效，这是已知的口径局限，不在本次改动范围内。
@@ -28,6 +30,7 @@ import {
   loadPeriodsByFlightIds,
   resolveScheduleCost,
 } from './finances.cost.service.js';
+import { netReceivedCny, sumCompletedRefundCny } from '../../lib/net-received.js';
 // 签证成本口径与财务汇总共用同一函数，两处逐字一致（任务实际成本优先 → 产品主数据回退）
 import { visaItemCostCny } from './finances.service.js';
 
@@ -172,6 +175,7 @@ type OrderForExport = Prisma.OrderGetPayload<{
     agent: { select: { companyName: true; contactName: true } };
     passengers: true;
     costItems: { select: { category: true; amountCny: true } };
+    refunds: { select: { amount: true } };
     items: {
       include: {
         flightSchedule: {
@@ -250,21 +254,30 @@ function orderToRows(order: OrderForExport, periodsMap: PeriodsMap): FinanceRow[
   let hotelName = '';
   let hotelNights = 0;
   for (const it of order.items) {
-    if (it.kind === 'HOTEL' && it.hotelRoomType) {
-      const perNight = dec(it.hotelRoomType.costPriceCny);
-      let nights = 1;
-      if (it.hotelCheckIn && it.hotelCheckOut) {
-        nights = Math.max(
-          1,
-          Math.round(
-            (it.hotelCheckOut.getTime() - it.hotelCheckIn.getTime()) / (1000 * 60 * 60 * 24),
-          ),
-        );
-      }
-      hotelCostCnyOrder += perNight * nights * it.quantity;
-      hotelName = it.hotelRoomType.name;
-      hotelNights = nights;
+    if (it.kind !== 'HOTEL') continue;
+    let nights = 1;
+    if (it.hotelCheckIn && it.hotelCheckOut) {
+      nights = Math.max(
+        1,
+        Math.round(
+          (it.hotelCheckOut.getTime() - it.hotelCheckIn.getTime()) / (1000 * 60 * 60 * 24),
+        ),
+      );
     }
+    // 快照优先：随机档（同星级聚合）行没有 hotelRoomTypeId，房型主数据取不到净房价，
+    // 但建单时已把房费快照写进 totalCostCny。此前只认 hotelRoomType，随机档整行房费算 0，
+    // 房费列凭空少一截、毛利凭空多一截——快照是这类行唯一的成本来源，必须先读。
+    if (it.totalCostCny != null) {
+      hotelCostCnyOrder += dec(it.totalCostCny);
+    } else if (it.hotelRoomType?.costPriceCny != null) {
+      hotelCostCnyOrder += dec(it.hotelRoomType.costPriceCny) * nights * it.quantity;
+    }
+    // 房型名：随机档还没落到具体酒店（hotelRoomTypeId 空 + randomStarTier 非空），
+    // 标成「N 星随机（未落位）」，别让"入住酒店"列空着，看不出这行是哪种房
+    hotelName =
+      it.hotelRoomType?.name ??
+      (it.randomStarTier != null ? `${it.randomStarTier}星随机（未落位）` : '');
+    hotelNights = nights;
   }
 
   // ── 签证 / 车费 ──
@@ -305,12 +318,10 @@ function orderToRows(order: OrderForExport, periodsMap: PeriodsMap): FinanceRow[
 
   const agency = order.agent?.companyName ?? order.agent?.contactName ?? '直销';
   // 是否清账：应收合计 = total + adjustmentCny（改期费/换人费等售后费用，不改 total 本身，
-  // 单独叠加在这笔调整字段上）；已收合计 = paidAmount + prepaymentOffset（代理预付款抵扣）。
-  // 与 reports.service.ts 的应收余额口径（total + adjustmentCny − paidAmount − prepaymentOffset）
-  // 对齐——此前这里只比较 paidAmount 和 total，忽略了 adjustmentCny，导致有未收改期费/换人费
-  // 的订单被错误标为"已清账"。
+  // 单独叠加在这笔调整字段上）；已收净额走 lib/net-received.ts 的统一口径
+  // （paidAmount + prepaymentOffset − Σ COMPLETED Refund），与 reports.service.ts balanceOf 同源。
   const payableCny = round2(totalRevenue + (order.adjustmentCny ?? 0));
-  const receivedCny = round2(dec(order.paidAmount) + dec(order.prepaymentOffset));
+  const receivedCny = netReceivedCny(order, sumCompletedRefundCny(order.refunds));
   const settled = receivedCny >= payableCny ? '是' : '否';
 
   const hotelPerPax = hotelCostCnyOrder / paxCount;
@@ -427,6 +438,8 @@ export async function buildFinanceExportWorkbook(
       agent: { select: { companyName: true, contactName: true } },
       passengers: true,
       costItems: { select: { category: true, amountCny: true } },
+      // 清账口径要扣已完成退款——只取 COMPLETED，在途退款钱还没出去，扣了会误判成已退完
+      refunds: { where: { status: 'COMPLETED' }, select: { amount: true } },
       items: {
         include: {
           flightSchedule: {
