@@ -41,6 +41,51 @@ function expiryNotice(expiry?: string): string | null {
   return null;
 }
 
+/**
+ * 本单「出发日」：机票行/套餐（Bundle）行里最早的出发日期，用于按年龄推算乘客类型。
+ * 纯酒店/接送/签证单没有出发日 → null（derivePassengerTypeByAge 会回退成人）。
+ * 与后端 pnr-export.ts 的 earliestFlightDeparture 同一思路——"最早的一段出发"
+ * 才是决定乘客类型的口径，而不是随便挑一段。
+ */
+function earliestDepartureDate(cartItems: CartItem[]): Date | null {
+  const times: number[] = [];
+  for (const it of cartItems) {
+    if (it.kind === 'FLIGHT' && typeof it.meta?.departureTime === 'string') {
+      const d = new Date(it.meta.departureTime);
+      if (!Number.isNaN(d.getTime())) times.push(d.getTime());
+    } else if (it.kind === 'BUNDLE' && typeof it.meta?.goDate === 'string') {
+      const d = new Date(`${it.meta.goDate}T00:00:00Z`);
+      if (!Number.isNaN(d.getTime())) times.push(d.getTime());
+    }
+  }
+  return times.length > 0 ? new Date(Math.min(...times)) : null;
+}
+
+/**
+ * 乘客类型按「出生日期 + 出发日」推算——年龄阈值口径与后端 pnr-export.ts 的
+ * derivePtcByAge 同源（<2 岁 婴儿 / 2–<12 岁 儿童 / ≥12 岁 成人），
+ * 这里是前端结账页的本地小实现（无法直接 import 后端模块），只决定这一次提交时
+ * 乘客类型的初始取值；服务端建单路径会按同一口径统一重算，不会以这里的结果为准。
+ * 出生日期缺失/格式不对，或本单没有可判定的出发日（纯酒店/接送/签证单）→ 回退成人。
+ */
+function derivePassengerTypeByAge(
+  dateOfBirth: string,
+  departureDate: Date | null,
+): 'ADULT' | 'CHILD' | 'INFANT' {
+  if (!departureDate || !DATE_INPUT_RE.test(dateOfBirth)) return 'ADULT';
+  const dob = new Date(`${dateOfBirth}T00:00:00Z`);
+  if (Number.isNaN(dob.getTime())) return 'ADULT';
+  let age = departureDate.getUTCFullYear() - dob.getUTCFullYear();
+  const monthDiff = departureDate.getUTCMonth() - dob.getUTCMonth();
+  if (monthDiff < 0 || (monthDiff === 0 && departureDate.getUTCDate() < dob.getUTCDate())) {
+    age -= 1;
+  }
+  if (age < 0) return 'ADULT'; // 生日晚于出发日：数据异常，回退成人
+  if (age < 2) return 'INFANT';
+  if (age < 12) return 'CHILD';
+  return 'ADULT';
+}
+
 interface PassengerForm {
   fullName: string;
   passportNumber: string;
@@ -448,6 +493,9 @@ export function CheckoutPage() {
     const submitAsGuest = !isLoggedIn;
     const token = submitAsGuest ? null : tokens!.accessToken;
 
+    // 本单出发日（机票/套餐行里最早一段）：驱动乘客类型按年龄推算，见 derivePassengerTypeByAge。
+    const orderDepartureDate = earliestDepartureDate(items);
+
     // 购物车 → CreateOrderInput.items
     const body: CreateOrderInput = {
       contactName: contactName.trim(),
@@ -471,7 +519,10 @@ export function CheckoutPage() {
         documentNumber: p.passportNumber.trim(),
         dateOfBirth: p.dateOfBirth,
         nationality: p.nationality || 'CN',
-        passengerType: 'ADULT',
+        // 按出生日期 + 本单出发日推算（同后端 derivePtcByAge 阈值口径）；
+        // 服务端建单路径会统一重算，这里只是让首次提交就带上更贴近实际的值，
+        // 不再对婴儿/儿童一律按成人报价、占座（详见文件顶部 derivePassengerTypeByAge 注释）。
+        passengerType: derivePassengerTypeByAge(p.dateOfBirth, orderDepartureDate),
         // 证件有效期：含机票/套餐/签证时必填（提交前已校验，见 onSubmit）；
         // 纯酒店/接送单选填 —— 空值省略，绝不发 ''（后端 YYYY-MM-DD 正则会拒空串）。
         ...(p.passportExpiry?.trim() ? { passportExpiry: p.passportExpiry.trim() } : {}),

@@ -17,10 +17,11 @@
  */
 import ExcelJS from 'exceljs';
 import { localDateISO } from '../../lib/flight-time.js';
-import { CabinClass } from '@prisma/client';
+import { CabinClass, PassengerType } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { parseDateCellDetailed, parseGenderCell } from './roster.js';
 import { SETTLEMENT_PRICE_CAP_CNY } from './orders.schemas.js';
+import { derivePtcByAge } from './pnr-export.js';
 
 // ── 上限 ──────────────────────────────────────────────────────────────────
 /** 上传文件大小上限（解码后字节数）。*/
@@ -64,6 +65,13 @@ export interface OrderImportPassenger {
   passportExpiry?: string;
   infantCompanion?: string;
   note?: string;
+  /**
+   * 乘客类型：按「出生日期 + 出发日」推算（与 pnr-export.ts 的 derivePtcByAge 同一口径，
+   * <2 岁婴儿 / 2–<12 岁儿童 / ≥12 岁成人），而非沿用表格里从未采集过的手录值——
+   * 旧模版名单本就没有 passengerType 列，落库过去一直静默按成人处理（多收钱 + 虚占座）。
+   * 出生日期缺失时不设，建单侧走 schema 默认值（成人）。
+   */
+  passengerType?: PassengerType;
 }
 
 export interface OrderImportRow {
@@ -193,6 +201,20 @@ export function matchCabinText(text: string): CabinClass | null {
     头等舱: CabinClass.FIRST, 头等: CabinClass.FIRST, FIRST: CabinClass.FIRST, F: CabinClass.FIRST,
   };
   return map[t] ?? null;
+}
+
+/**
+ * derivePtcByAge 返回航司 PNR 码（ADT/CHD/INF）；建单落库用的是系统枚举
+ * （ADULT/CHILD/INFANT）。年龄阈值判断已在 derivePtcByAge 里做过，这里只做码值转换，
+ * 不重复实现推算逻辑。
+ */
+function ptcToPassengerType(ptc: string): PassengerType {
+  const map: Record<string, PassengerType> = {
+    ADT: PassengerType.ADULT,
+    CHD: PassengerType.CHILD,
+    INF: PassengerType.INFANT,
+  };
+  return map[ptc] ?? PassengerType.ADULT;
 }
 
 /** 证件类型文本 → 枚举；对不上 → null（调用方按口径默认护照 + 警告）。*/
@@ -489,6 +511,16 @@ export async function parseOrderImportXlsx(fileBase64: string): Promise<OrderImp
     if (infant) passenger.infantCompanion = infant;
     const remarks = cellText(get(row, 'remarks')).trim();
     if (remarks) passenger.note = remarks;
+
+    // 乘客类型：出生日期已知 → 按出生日期 + 出发日（去程航段）推算；未知 → 不设，
+    // 沿用建单侧的默认值（成人）。出发日缺失/未匹配也没关系，derivePtcByAge 自身会
+    // 在拿不到出发日时回退成人，不会抛错也不会误判。
+    if (dob) {
+      const outboundLegDate = legs.find((l) => l.kind === 'outbound')?.date ?? null;
+      const dobDate = new Date(`${dob}T00:00:00Z`);
+      const departureDate = outboundLegDate ? new Date(`${outboundLegDate}T00:00:00Z`) : null;
+      passenger.passengerType = ptcToPassengerType(derivePtcByAge(dobDate, departureDate, 'ADULT'));
+    }
 
     rows.push({
       rowNumber,

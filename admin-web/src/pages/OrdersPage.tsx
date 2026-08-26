@@ -616,6 +616,9 @@ export function OrdersPage() {
     successCount: number;
     failureCount: number;
     failures: Array<{ id: string; error?: string }>;
+    // 取消族恢复时若单张订单开票超限，后端会自动清开票标记并附提示——批量里混几十条
+    // 不能悄悄发生，逐单展示。无此情况时为空数组。
+    warnings: Array<{ id: string; orderNumber?: string; messages: string[] }>;
   } | null>(null);
   // 批量开票（票务岗 0715 反馈）：按航段/系统三个布尔位批量翻转，逐单复用单条开票的上限校验。
   const [bulkInvoiceFlag, setBulkInvoiceFlag] = useState<BulkInvoiceFlagOption | ''>('');
@@ -1002,6 +1005,12 @@ export function OrdersPage() {
       setSelected((prev) => (prev && prev.id === order.id ? res.order : prev));
       // 状态流转可能占用/释放机位（确认占座、申请退款即时回收）→ 广播座位变更。
       bumpSeats();
+      // 取消族恢复若开票超限，后端会自动清开票标记——不弹出来就是静默改数据，票务台无从得知。
+      if (res.order.invoiceCapWarnings && res.order.invoiceCapWarnings.length > 0) {
+        window.alert(
+          `订单 ${order.orderNumber} 的开票标记已被自动清除：\n${res.order.invoiceCapWarnings.join('\n')}\n请票务台重新核对开票。`,
+        );
+      }
     } catch (err) {
       alert(err instanceof ApiError ? `操作失败：${err.message}` : '操作失败');
     } finally {
@@ -1339,6 +1348,9 @@ export function OrdersPage() {
         successCount: res.successCount,
         failureCount: res.failureCount,
         failures: res.results.filter((r) => !r.success).map((r) => ({ id: r.id, error: r.error })),
+        warnings: res.results
+          .filter((r) => r.warnings && r.warnings.length > 0)
+          .map((r) => ({ id: r.id, orderNumber: r.orderNumber, messages: r.warnings as string[] })),
       });
       if (res.failureCount > 0) {
         window.alert(
@@ -2933,6 +2945,23 @@ export function OrdersPage() {
                     );
                   })}
                 </ul>
+              )}
+              {bulkResult.warnings.length > 0 && (
+                <div className="mt-2 rounded border border-amber-300 bg-amber-50 px-2 py-1.5 text-amber-800">
+                  <div className="text-xs font-semibold">
+                    <Icon name="alert" size={14} /> {bulkResult.warnings.length} 条订单的开票标记被自动清除，请票务台重新核对开票
+                  </div>
+                  <ul className="mt-1 max-h-40 overflow-auto text-[11px]">
+                    {bulkResult.warnings.map((w) => {
+                      const orderNo = w.orderNumber ?? orders.find((o) => o.id === w.id)?.orderNumber ?? `${w.id.slice(0, 8)}…`;
+                      return (
+                        <li key={w.id} className="py-0.5">
+                          · <span className="font-mono">{orderNo}</span>：{w.messages.join('；')}
+                        </li>
+                      );
+                    })}
+                  </ul>
+                </div>
               )}
             </div>
           )}

@@ -6,6 +6,12 @@
  * 只收集 warning 而绝不整文件抛错。
  *
  * 复用后端既有依赖 exceljs（与 orders.export-templates.ts / pnr-export.ts 同款）。
+ *
+ * 乘客类型（passengerType）：本模版没有出发日期/航班列（团期名单先于选定航班存在，
+ * 一份名单可能配到不同航班），无法在这一层用 pnr-export.ts 的 derivePtcByAge 按
+ * 「出生日期 + 出发日」推算。这里如实解析出 dateOfBirth 即可——调用方（批量创单表单）
+ * 拿到出生日期后，结合当时已选定的航班出发日自行派生 passengerType；不要在没有出发日
+ * 的情况下猜一个值填进来。
  */
 import ExcelJS from 'exceljs';
 
