@@ -785,6 +785,17 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
 
   // ── 本单结算总价（仅 ADMIN/STAFF）──
   const isStaffUser = user?.role === 'ADMIN' || user?.role === 'STAFF';
+  // 代理录单：只看结算价（业务拍板）。系统价/调价/手工结算总价是运营概念，对代理隐藏；
+  // quote 接口对 AGENT 已在服务端强制归属自家，结算价预览无需先选归属代理。
+  const isAgentUser = user?.role === 'AGENT';
+  // 代理头部金额：结算价日历命中 → 日历合计；日历缺价 → 不给数（下方黄条提示）；
+  // 无日历接管（纯酒店/签证/未配日历）→ 权威价即应付结算额。
+  const agentHeaderTotal =
+    settlementPreview?.ok === true
+      ? settlementPreview.totalCny
+      : settlementPreview?.ok === false
+        ? null
+        : quoteTotal;
   // 差额上限（镜像后端 PRICE_ADJUSTMENT_CAP_CNY）：超出直接前端阻断，省一次必败的提交。
   const SETTLEMENT_DIFF_CAP_CNY = 100_000;
   // 差额 = 结算价 − 系统价（表单当前试算值；对齐到分，避免浮点尾差）。系统价不可用时为 null。
@@ -2220,21 +2231,35 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
             {/* 归属代理 + 录入人 + 备注 */}
             <div className="grid gap-3 md:grid-cols-2">
               <div className="text-xs text-slate-500">
-                归属代理（代为录单；直客留空）
-                <input
-                  className={inputCls}
-                  placeholder="搜索代理：公司名 / 联系人 / 电话"
-                  value={agentSearch}
-                  onChange={(e) => setAgentSearch(e.target.value)}
-                />
-                <select className={`${inputCls} mt-2`} value={agentId} onChange={(e) => setAgentId(e.target.value)}>
-                  <option value="">— 无代理 / 直客 —</option>
-                  {filteredAgents.map((a) => (
-                    <option key={a.id} value={a.id}>
-                      {a.companyName ? `${a.companyName} · ` : ''}{a.contactName}（{a.contactPhone}）
-                    </option>
-                  ))}
-                </select>
+                {isAgentUser ? (
+                  <>
+                    订单归属
+                    {/* 服务端对 AGENT 强制归属本代理（resolveOrderAgentId 无视前端选择），
+                        给下拉只会造成「以为能替子代理记单」的错觉，这里直接展示事实。 */}
+                    <div className="mt-1 flex h-[34px] items-center rounded-md bg-slate-50 px-2.5 text-sm text-slate-700">
+                      本代理
+                      <span className="ml-2 text-xs text-slate-400">（系统自动归属）</span>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    归属代理（代为录单；直客留空）
+                    <input
+                      className={inputCls}
+                      placeholder="搜索代理：公司名 / 联系人 / 电话"
+                      value={agentSearch}
+                      onChange={(e) => setAgentSearch(e.target.value)}
+                    />
+                    <select className={`${inputCls} mt-2`} value={agentId} onChange={(e) => setAgentId(e.target.value)}>
+                      <option value="">— 无代理 / 直客 —</option>
+                      {filteredAgents.map((a) => (
+                        <option key={a.id} value={a.id}>
+                          {a.companyName ? `${a.companyName} · ` : ''}{a.contactName}（{a.contactPhone}）
+                        </option>
+                      ))}
+                    </select>
+                  </>
+                )}
               </div>
               <div className="text-xs text-slate-500">
                 录入人
@@ -2632,17 +2657,17 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
             {/* 系统价（服务端权威试算）+ 录单调价/加项 */}
             <div className="rounded-lg border border-slate-200 p-3">
               <div className="flex items-center justify-between">
-                <span className="text-sm font-medium text-slate-700">系统价（权威）</span>
+                <span className="text-sm font-medium text-slate-700">{isAgentUser ? '结算价' : '系统价（权威）'}</span>
                 <span className="text-sm font-semibold text-slate-900">
                   {quoting
                     ? '试算中…'
-                    : quoteTotal !== null
-                      ? `¥${quoteTotal.toLocaleString('zh-CN')}`
+                    : (isAgentUser ? agentHeaderTotal : quoteTotal) !== null
+                      ? `¥${(isAgentUser ? agentHeaderTotal : quoteTotal)!.toLocaleString('zh-CN')}`
                       : '—'}
                 </span>
               </div>
               {quoteErr && <p className="mt-1 text-[11px] text-rose-500">{quoteErr}</p>}
-              {agentId && settlementPrice === null && settlementPreview?.ok === true && (
+              {(agentId || isAgentUser) && settlementPrice === null && settlementPreview?.ok === true && (
                 <div className="mt-2 rounded-md border border-brand-200 bg-brand-50 px-3 py-2 text-xs text-brand-800">
                   {(() => {
                     const autoDiscount = settlementPreview.autoDiscount;
@@ -2678,9 +2703,9 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                   <div className="mt-0.5 text-[11px] text-brand-700">提交后订单总额按此收敛</div>
                 </div>
               )}
-              {agentId && settlementPrice === null && settlementPreview?.ok === false && (
+              {(agentId || isAgentUser) && settlementPrice === null && settlementPreview?.ok === false && (
                 <p className="mt-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-800">
-                  {settlementPreview.reason}——提交将被拒，请先维护结算价日历
+                  {settlementPreview.reason}——提交将被拒，{isAgentUser ? '请联系运营维护结算价' : '请先维护结算价日历'}
                 </p>
               )}
               {agentId && settlementPrice !== null && (
@@ -2689,10 +2714,12 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                 </p>
               )}
               {quoteTotal === null && !quoting && !quoteErr && (
-                <p className="mt-1 text-[11px] text-slate-400">填完产品与人数后自动按系统权威价试算。</p>
+                <p className="mt-1 text-[11px] text-slate-400">
+                  {isAgentUser ? '填完产品与人数后自动试算结算价。' : '填完产品与人数后自动按系统权威价试算。'}
+                </p>
               )}
 
-              <div className="mt-3 border-t border-slate-100 pt-3">
+              {isStaffUser && <div className="mt-3 border-t border-slate-100 pt-3">
                 <div className="mb-1.5 text-xs font-medium text-slate-600">
                   价格调整（选填）— 优惠 / 补收杂费 / 变更改期费
                 </div>
@@ -2777,11 +2804,15 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                 <p className="mt-1.5 text-[11px] text-slate-400">
                   调价只在系统权威价上加减一笔并留审计记录；不会改动机票/酒店等基础项的权威价。
                 </p>
-              </div>
+              </div>}
             </div>
 
             <div className="flex items-center justify-between border-t border-slate-200 pt-3">
-              <span className="text-xs text-slate-500">价格由系统按所选产品权威计算；如有优惠/加项请用上方「价格调整」。</span>
+              <span className="text-xs text-slate-500">
+                {isAgentUser
+                  ? '结算价由系统按协议价自动计算；价格有疑问请联系运营。'
+                  : '价格由系统按所选产品权威计算；如有优惠/加项请用上方「价格调整」。'}
+              </span>
               <div className="flex gap-2">
                 <button className="btn-secondary text-sm" onClick={onClose} type="button">取消</button>
                 <button className="btn-primary text-sm disabled:opacity-50" onClick={submit} disabled={submitting} type="button">

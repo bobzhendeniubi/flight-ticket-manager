@@ -8065,6 +8065,9 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   const [bundleQuoteLoading, setBundleQuoteLoading] = useState(false);
   // 仅 ADMIN/STAFF 可用运营专属能力（手动结算单价、代为归属代理）。
   const isOps = user?.role === 'ADMIN' || user?.role === 'STAFF';
+  // 代理批量录单也要看得到自家结算价（业务拍板）：quote 对 AGENT 服务端强制归属自家，
+  // 前端不传 agentId、也无需先选归属代理。
+  const isAgentUser = user?.role === 'AGENT';
 
   // ── 结算价（FLIGHT 类型专用）+ 团期备注 ──────────────────────────────────
   const [settlementPriceCny, setSettlementPriceCny] = useState<number | null>(null);
@@ -8456,7 +8459,9 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   const hasBatchManualDiscount = (discountPerPersonCny ?? 0) > 0;
 
   useEffect(() => {
-    if (!token || !isOps || !agentId || validRows.length === 0 || batchQuoteItems.length === 0) {
+    // 运营需先选归属代理；代理本人无需选（服务端按登录身份强制归属自家）。
+    const settlementScoped = isOps ? Boolean(agentId) : isAgentUser;
+    if (!token || !settlementScoped || validRows.length === 0 || batchQuoteItems.length === 0) {
       setBatchSettlementPreview(null);
       setBatchSettlementQuoting(false);
       return;
@@ -8492,7 +8497,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [token, isOps, agentId, validRows.length, batchQuoteItems, productType]);
+  }, [token, isOps, isAgentUser, agentId, validRows.length, batchQuoteItems, productType]);
 
   // 套餐行级指定酒店与单笔录单共用酒店数据源；选店后前端只解析房型 id，价格/占房仍由服务端权威计算。
   useEffect(() => {
@@ -9882,8 +9887,9 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
               </span>
             </div>
 
-            {/* G 价格（选填）：旅游团结算价 / OTA 线上单结算价 */}
-            {(productType === 'FLIGHT_ONEWAY' || productType === 'FLIGHT_ROUNDTRIP') && (
+            {/* G 价格（选填）：旅游团结算价 / OTA 线上单结算价 —— 仅运营。
+                后端对 AGENT 传 settlementPriceCny 一律 403，代理看得到填不了纯属死胡同，整块隐藏。 */}
+            {isOps && (productType === 'FLIGHT_ONEWAY' || productType === 'FLIGHT_ROUNDTRIP') && (
               <>
                 <div className="rounded-md border border-slate-200 bg-slate-50/60 p-3">
                   <div className="mb-2 text-sm font-medium text-slate-700">旅游团（选填）</div>
@@ -10051,7 +10057,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                 已填手工结算价，结算价日历不生效
               </p>
             )}
-            {isOps && agentId && !batchSettlementCalendarSuppressed &&
+            {((isOps && agentId) || isAgentUser) && !batchSettlementCalendarSuppressed &&
               (batchSettlementQuoting || bundleQuoteLoading || batchSettlementPreview !== null) && (
               <div className={`rounded-md border px-3 py-2 text-xs ${
                 batchSettlementPreview?.ok === false
@@ -10104,7 +10110,9 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                     <div className="mt-0.5 text-[11px] text-brand-700">儿童价/自备签减免及单住/升舱/指定酒店等行级项按人另计</div>
                   </>
                 ) : batchSettlementPreview?.ok === false ? (
-                  <span className="text-amber-800">{batchSettlementPreview.reason}——提交将被拒，请先维护结算价日历</span>
+                  <span className="text-amber-800">
+                    {batchSettlementPreview.reason}——提交将被拒，{isAgentUser ? '请联系运营维护结算价' : '请先维护结算价日历'}
+                  </span>
                 ) : null}
               </div>
             )}

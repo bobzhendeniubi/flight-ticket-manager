@@ -10,7 +10,7 @@ import type { FastifyPluginAsync } from 'fastify';
 import { localDateISO } from '../../lib/flight-time.js';
 import { z } from 'zod';
 import { InvoiceStatus, Prisma, UserRole, type Passenger } from '@prisma/client';
-import { buildStayNightDates, OrderService, type OrderRequester } from './orders.service.js';
+import { buildStayNightDates, OrderService, resolveOrderAgentId, type OrderRequester } from './orders.service.js';
 import { assertHotelPhysicalFitWithinTx } from '../hotel-control/hotel-control.service.js';
 import {
   batchCreateOrdersBodySchema,
@@ -155,15 +155,19 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     },
   );
 
-  // ── 录单前试算（quote，只算不落库）— ADMIN/STAFF ──────────────────────
+  // ── 录单前试算（quote，只算不落库）— ADMIN/STAFF/AGENT ────────────────
   // POST /orders/quote：body 为 createOrder items 子集，走同一权威定价 priceAndValidateItems，
   // 只算价格、绝不写库/扣座。录单页填完产品/人数即可拿到「系统价」在提交前展示。
+  // AGENT 只能试算自己家的结算价：归属经 resolveOrderAgentId 收口（AGENT 无视 body.agentId
+  // 强制取本人），与 createOrder 完全同口径，杜绝传别家 agentId 窥探他人结算价。
   app.post(
     '/quote',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT)] },
     async (req, reply) => {
       const body = quoteOrderBodySchema.parse(req.body);
-      const quote = await service.quoteOrder(body);
+      const requester = await buildRequester(req.user.sub, req.user.role);
+      const scopedAgentId = await resolveOrderAgentId(requester, body.agentId);
+      const quote = await service.quoteOrder({ ...body, agentId: scopedAgentId ?? undefined });
       return reply.send(quote);
     },
   );
