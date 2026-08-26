@@ -15,8 +15,19 @@
  *
  * 写操作由 routes 层负责 ADMIN/STAFF 鉴权 + 审计日志（镜像 finances 成本周期风格）。
  */
-import { OrderItemKind, OrderStatus, Prisma, type Gender, type PrismaClient } from '@prisma/client';
+import {
+  AuditSeverity,
+  AuditTargetType,
+  OrderItemKind,
+  OrderStatus,
+  Prisma,
+  type Gender,
+  type PrismaClient,
+} from '@prisma/client';
+import { env } from '../../config/env.js';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
+import type { AuditActor } from '../../lib/audit.js';
+import { writeAudit } from '../../lib/audit.js';
 import { businessDateISO, startOfBusinessDayUtc } from '../../lib/business-time.js';
 import { BadRequestError, NotFoundError } from '../../lib/errors.js';
 import { fmtDepartureLocalDate } from '../orders/passport-zip.js';
@@ -280,12 +291,92 @@ export async function createBlockPeriod(
   return toDto(row);
 }
 
+/** [fromD, toD] 逐日展开为 YYYY-MM-DD 数组（闭区间，含两端）；不做跨度上限截断—— 调用方
+ *  （占用守卫）传入的都是具体包房周期的日期区间，不是用户可任意拉长的查询窗口。*/
+function enumerateDates(fromD: Date, toD: Date): string[] {
+  const days = Math.floor((toD.getTime() - fromD.getTime()) / DAY_MS) + 1;
+  const dates: string[] = [];
+  for (let i = 0; i < days; i++) {
+    dates.push(new Date(fromD.getTime() + i * DAY_MS).toISOString().slice(0, 10));
+  }
+  return dates;
+}
+
+/** 缩减/删除包房周期的占用守卫判定结果：逐晚「已占用（物理间数）> 新包房」的缺口列表。*/
+interface HotelOversellCheck {
+  violations: Array<{ date: string; occupied: number; block: number; shortfall: number }>;
+  maxShortfall: number;
+}
+
+/**
+ * 计算「某酒店的一条包房周期被改动/删除后」逐晚是否形成超占（照抄机票侧
+ * FLIGHT_MAX_OVERSELL_SEATS 的哲学，见 flights.service.updateSchedule）。
+ *
+ * override：
+ *   - 非 null → 该周期改为 override 的 dateFrom/dateTo/rooms（改小/收窄日期场景）；
+ *   - null    → 该周期整段移除（删除场景）。
+ * 占用数复用房控既有的「物理房间口径」（computePhysicalUsedForItems）—— 与销控板
+ * physicalUsed / 前瞻闸 checkHotelPhysicalFit 同一把尺子，不另发明一套计数方式。
+ *
+ * [fromD, toD] 由调用方给：改动场景传「旧区间 ∪ 新区间」的并集（收窄日期腾出来的那几晚
+ * 同样要查，否则日期一改小就绕开了守卫）；删除场景直接传该周期自己的整段区间。
+ */
+async function computeHotelOversellAfterPeriodChange(
+  hotelId: string,
+  excludePeriodId: string,
+  override: { dateFrom: Date; dateTo: Date; rooms: number } | null,
+  fromD: Date,
+  toD: Date,
+  client: PrismaClient,
+): Promise<HotelOversellCheck> {
+  const others = await client.hotelBlockPeriod.findMany({
+    where: { hotelId, id: { not: excludePeriodId }, dateFrom: { lte: toD }, dateTo: { gte: fromD } },
+    select: { dateFrom: true, dateTo: true, rooms: true },
+  });
+  const periods = override ? [...others, override] : others;
+  const dates = enumerateDates(fromD, toD);
+  const newBlock = expandBlockByDate(periods, dates);
+
+  // 占用查询口径与 getHotelNightlyRemaining / checkHotelPhysicalFit 完全一致
+  const items = await client.orderItem.findMany({
+    where: {
+      hotelRoomTypeId: { not: null },
+      hotelRoomType: { hotelId },
+      hotelCheckIn: { lte: toD },
+      hotelCheckOut: { gt: fromD },
+      order: { deletedAt: null, status: { in: COUNTED_STATUSES } },
+    },
+    select: {
+      hotelCheckIn: true,
+      hotelCheckOut: true,
+      roomsBilled: true,
+      metadata: true,
+      order: {
+        select: { id: true, roomAssignment: true, passengers: { select: { gender: true } } },
+      },
+    },
+  });
+  const occupied = computePhysicalUsedForItems(items, dates, null);
+
+  const violations: HotelOversellCheck['violations'] = [];
+  dates.forEach((date, i) => {
+    const shortfall = round2(occupied[i] - newBlock[i]);
+    if (shortfall > 0) violations.push({ date, occupied: occupied[i], block: newBlock[i], shortfall });
+  });
+  const maxShortfall = violations.reduce((m, v) => Math.max(m, v.shortfall), 0);
+  return { violations, maxShortfall };
+}
+
 export async function updateBlockPeriod(
   id: string,
   input: UpdateBlockPeriodBody,
   client: PrismaClient = defaultPrisma,
+  actor?: AuditActor,
 ): Promise<HotelBlockPeriodDto> {
-  const existing = await client.hotelBlockPeriod.findUnique({ where: { id } });
+  const existing = await client.hotelBlockPeriod.findUnique({
+    where: { id },
+    include: { hotel: { select: { name: true, randomTierPlaceholder: true } } },
+  });
   if (!existing) throw new NotFoundError('包房周期不存在');
 
   const from = input.dateFrom ?? fmtDateOnly(existing.dateFrom);
@@ -294,9 +385,57 @@ export async function updateBlockPeriod(
     throw new BadRequestError('起始日不能晚于结束日');
   }
 
+  const newFromD = toDateOnly(from);
+  const newToD = toDateOnly(to);
+  const newRooms = input.rooms ?? existing.rooms;
+  // 只在「缩减」场景（房数变少，或日期区间收窄丢了原覆盖的日子）才需要查库做占用守卫——
+  // 单纯改价/改备注/扩容/日期后移不会让任何一晚的容量变少，不必付这次查询代价。
+  const shrinking =
+    newRooms < existing.rooms ||
+    newFromD.getTime() > existing.dateFrom.getTime() ||
+    newToD.getTime() < existing.dateTo.getTime();
+  // 随机档周期（hotelId 为 null）与占位酒店名下的周期已被读路径全体忽略（见文件头「星级
+  // 随机档」小节）——它们本就不计入任何余量，缩放/占用守卫对它们没有意义，直接跳过。
+  if (shrinking && existing.hotelId && existing.hotel?.randomTierPlaceholder == null) {
+    const unionFromD = existing.dateFrom.getTime() < newFromD.getTime() ? existing.dateFrom : newFromD;
+    const unionToD = existing.dateTo.getTime() > newToD.getTime() ? existing.dateTo : newToD;
+    const { violations, maxShortfall } = await computeHotelOversellAfterPeriodChange(
+      existing.hotelId,
+      id,
+      { dateFrom: newFromD, dateTo: newToD, rooms: newRooms },
+      unionFromD,
+      unionToD,
+      client,
+    );
+    if (violations.length > 0) {
+      if (maxShortfall > env.HOTEL_MAX_OVERSELL_ROOMS) {
+        const v = violations[0];
+        throw new BadRequestError(
+          `该酒店房量下调后 ${v.date} 起将短缺 ${v.shortfall} 间（已占用 ${v.occupied} 间 > 新包房 ${v.block} 间），超过超卖上限 ${env.HOTEL_MAX_OVERSELL_ROOMS} 间，请先处理相关订单再调整`,
+        );
+      }
+      // 未超阈值但确实形成超占（航司/酒店减配的真实场景同款处理）—— 放行但留痕，
+      // 供财务/房控事后追溯是谁在什么时候把哪家酒店的房量调到了占用之下。
+      void writeAudit({
+        actor: actor ?? {},
+        action: 'UPDATE_HOTEL_BLOCK_PERIOD_OVERSOLD',
+        targetType: AuditTargetType.PRODUCT,
+        targetId: existing.hotelId,
+        targetLabel: `${existing.hotel?.name ?? existing.hotelId} 包房下调后短期超占`,
+        before: {
+          rooms: existing.rooms,
+          dateFrom: fmtDateOnly(existing.dateFrom),
+          dateTo: fmtDateOnly(existing.dateTo),
+        },
+        after: { rooms: newRooms, dateFrom: from, dateTo: to, violations },
+        severity: AuditSeverity.WARNING,
+      });
+    }
+  }
+
   const data: Prisma.HotelBlockPeriodUpdateInput = {};
-  if (input.dateFrom) data.dateFrom = toDateOnly(input.dateFrom);
-  if (input.dateTo) data.dateTo = toDateOnly(input.dateTo);
+  if (input.dateFrom) data.dateFrom = newFromD;
+  if (input.dateTo) data.dateTo = newToD;
   if (input.rooms !== undefined) data.rooms = input.rooms;
   if (input.unitPrice !== undefined) data.unitPrice = input.unitPrice ?? null;
   if (input.note !== undefined) data.note = input.note ?? null;
@@ -315,9 +454,31 @@ export async function deleteBlockPeriod(
 ): Promise<{ id: string }> {
   const existing = await client.hotelBlockPeriod.findUnique({
     where: { id },
-    select: { id: true },
+    include: { hotel: { select: { name: true, randomTierPlaceholder: true } } },
   });
   if (!existing) throw new NotFoundError('包房周期不存在');
+
+  // 随机档周期 / 占位酒店周期本就不计入任何余量（见文件头「星级随机档」小节），删除
+  // 它们不影响任何真实库存，跳过占用守卫。
+  if (existing.hotelId && existing.hotel?.randomTierPlaceholder == null) {
+    const { violations } = await computeHotelOversellAfterPeriodChange(
+      existing.hotelId,
+      id,
+      null,
+      existing.dateFrom,
+      existing.dateTo,
+      client,
+    );
+    // 删除不给「改小」那样的超卖阈值豁免——整段周期直接消失比缩容更激进，只要会让
+    // 任何一晚变成「已占用 > 删除后剩余包房」就先拒绝，请运营先处理订单再删。
+    if (violations.length > 0) {
+      const v = violations[0];
+      throw new BadRequestError(
+        `该周期覆盖的日期仍有占用（如 ${v.date} 已占用 ${v.occupied} 间 > 删除后包房 ${v.block} 间），请先处理相关订单再删除`,
+      );
+    }
+  }
+
   await client.hotelBlockPeriod.delete({ where: { id } });
   return { id };
 }
@@ -991,6 +1152,62 @@ export async function assertRandomTierFit(
       );
     }
   }
+}
+
+/**
+ * 把「该随机档全部真酒店、覆盖 nightDates 区间」的包房周期行 `SELECT … FOR UPDATE`。
+ * 是 `lockHotelBlockPeriodsWithinTx` 的聚合档版本 —— 随机档没有自己的周期表，它的库存
+ * 由同星级真酒店（`randomTierOfHotel` 判定，排除国际五星与占位酒店）的周期聚合而来，
+ * 所以要锁的是这批酒店各自名下的周期行，不是单一酒店。
+ *
+ * 该档次一家真酒店都没有 → 无行可锁，直接返回（未纳入管控，见 assertRandomTierFit 同款哲学）。
+ * 按 id 排序加锁，避免两个事务以不同顺序锁同一批行造成死锁（同 lockHotelBlockPeriodsWithinTx）。
+ */
+export async function lockRandomTierBlockPeriodsWithinTx(
+  tx: Prisma.TransactionClient,
+  tier: number,
+  nightDates: readonly string[],
+): Promise<void> {
+  if (nightDates.length === 0) return;
+  const fromD = toDateOnly(nightDates[0]);
+  const toD = toDateOnly(nightDates[nightDates.length - 1]);
+  const hotels = await tx.hotel.findMany({
+    where: { starRating: tier, intlFiveStar: false, randomTierPlaceholder: null },
+    select: { id: true },
+  });
+  const hotelIds = hotels.map((h) => h.id);
+  if (hotelIds.length === 0) return;
+  await tx.$queryRaw`
+    SELECT id FROM "HotelBlockPeriod"
+    WHERE "hotelId" IN (${Prisma.join(hotelIds)})
+      AND "dateFrom" <= ${toD} AND "dateTo" >= ${fromD}
+    ORDER BY id
+    FOR UPDATE
+  `;
+}
+
+/**
+ * `assertRandomTierFit` 的**事务内互斥**变体：先锁该档次全部真酒店在该区间的包房周期行，
+ * 再在同一事务里跑一遍完全相同的聚合判定 —— 解决并发抢随机档最后一间双双通过的问题
+ * （口径与 `assertHotelPhysicalFitWithinTx` 完全一致，只是锁的对象从「一家酒店」换成
+ * 「一整个星级档次的全部酒店」）。
+ *
+ * 用法同 `assertHotelPhysicalFitWithinTx`：必须在 `prisma.$transaction(async (tx) => {…})`
+ * 里调用，且同一事务内完成本次占房落库（写 OrderItem 的 randomStarTier 或占位酒店房型）。
+ *
+ * ⚠ 接线未完成：orders.service 的随机档下单路径目前仍调用只读版 `assertRandomTierFit`
+ * （事务外或非互斥场景），需要下一波把并发下单的调用点切到这个事务内版本，见文件顶部
+ * 任务交接说明。
+ */
+export async function assertRandomTierFitWithinTx(
+  tx: Prisma.TransactionClient,
+  tier: number,
+  nightDates: readonly string[],
+  rooms: number,
+  opts: { excludeOrderId?: string; buildMessage?: () => string } = {},
+): Promise<void> {
+  await lockRandomTierBlockPeriodsWithinTx(tx, tier, nightDates);
+  await assertRandomTierFit(tier, nightDates, rooms, opts, tx);
 }
 
 // ── 销控板（按酒店 × 日期）────────────────────────────────────────────────

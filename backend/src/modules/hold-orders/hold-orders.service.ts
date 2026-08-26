@@ -918,6 +918,19 @@ export class HoldOrderService {
         ? [HoldOrderStatus.PENDING, HoldOrderStatus.HOLDING, HoldOrderStatus.OVERDUE, HoldOrderStatus.FULLY_PAID]
         : [HoldOrderStatus.HOLDING, HoldOrderStatus.OVERDUE, HoldOrderStatus.FULLY_PAID];
       if (!allowed.includes(existing.status)) throw new ConflictError(`占位单当前状态不可操作（${HOLD_STATUS_LABEL[existing.status]}）`);
+      // 释放不同于取消：release() 从不走清算（不写 HoldReductionRecord），也没检查过
+      // 已收款——同款钱闸补在这（见 cancel() 的 hasReceipt && remaining>0 判断）：
+      // 已有实收且座位还没清算完就直接放行释放，会形成「钱收了、账没平，座位却已经
+      // 回池子」的两本账。这里选择直接拒绝、指路取消/清算流程，而不是像 cancel() 那样
+      // 静默转去走清算——「释放」和「取消」在财务上是两件不同的事，应由运营明确选择
+      // 走哪条路，不该由代码替她/他悄悄决定。
+      if (nextStatus === HoldOrderStatus.RELEASED) {
+        const remaining = existing.seats - existing.seatsConverted - existing.seatsCancelled;
+        const hasReceipt = existing.installments.some((item) => activeAllocationTotal(item) > 0);
+        if (hasReceipt && remaining > 0) {
+          throw new BadRequestError('占位单已有实收且座位尚未清算，不能直接释放；请走取消占位单（清算）流程处理');
+        }
+      }
       const now = new Date();
       await tx.holdOrder.update({ where: { id }, data: { status: nextStatus, [timestampField]: now } });
       // 释放与取消一样让座位回池，未结的期款提醒必须一起关掉；

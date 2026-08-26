@@ -192,6 +192,46 @@ describe('HoldOrderService actions', () => {
     expect(await heldSeatsForSeatClass(prismaMock as never, 'seat_class_1')).toBe(0);
   });
 
+  it('release() 钱闸：已有实收且座位未清算 → 拒绝，指路取消/清算流程', async () => {
+    prismaMock.holdOrder.findUnique.mockResolvedValue(
+      hold({
+        installments: [
+          {
+            id: 'i1', seq: 1, label: '定金', amountRule: HoldAmountRule.PER_PERSON_FIXED, perPersonCny: 300,
+            amountCny: 6000, seatsBasis: 20, status: HoldInstallmentStatus.PAID, paidAt: new Date(),
+            dueDate: new Date('2026-09-01T00:00:00Z'), allocations: [{ amountCny: 6000, reversedAt: null }],
+          },
+          {
+            id: 'i2', seq: 2, label: '尾款', amountRule: HoldAmountRule.REMAINDER, perPersonCny: null,
+            amountCny: 18000, seatsBasis: 20, status: HoldInstallmentStatus.PENDING, paidAt: null,
+            dueDate: new Date('2026-09-10T00:00:00Z'), allocations: [],
+          },
+        ],
+      }),
+    );
+
+    await expect(service.release('hold_1')).rejects.toThrow('不能直接释放');
+    expect(prismaMock.holdOrder.update).not.toHaveBeenCalled();
+  });
+
+  it('release() 钱闸：已收款但座位已全部清算完（remaining=0）→ 放行', async () => {
+    prismaMock.holdOrder.findUnique.mockResolvedValue(
+      hold({
+        seatsCancelled: 20,
+        installments: [
+          {
+            id: 'i1', seq: 1, label: '定金', amountRule: HoldAmountRule.PER_PERSON_FIXED, perPersonCny: 300,
+            amountCny: 6000, seatsBasis: 20, status: HoldInstallmentStatus.PAID, paidAt: new Date(),
+            dueDate: new Date('2026-09-01T00:00:00Z'), allocations: [{ amountCny: 6000, reversedAt: null }],
+          },
+        ],
+      }),
+    );
+    prismaMock.holdOrder.update.mockResolvedValue({});
+
+    await expect(service.release('hold_1')).resolves.toEqual({ id: 'hold_1', status: HoldOrderStatus.RELEASED });
+  });
+
   it('非 HOLDING 状态不能释放/取消/改价', async () => {
     prismaMock.holdOrder.findUnique.mockResolvedValue(hold({ status: HoldOrderStatus.RELEASED }));
     prismaMock.holdOrder.update.mockResolvedValue({});

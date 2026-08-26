@@ -24,6 +24,7 @@ export async function markOverdueHolds(client: PrismaClient = prisma, now = new 
   });
   let marked = 0;
   let released = 0;
+  let blockedByReceipt = 0;
   for (const candidate of candidates) {
     const transition = await client.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM "HoldOrder" WHERE id = ${candidate.id} AND status = 'HOLDING'::"HoldOrderStatus" FOR UPDATE`;
@@ -37,19 +38,45 @@ export async function markOverdueHolds(client: PrismaClient = prisma, now = new 
       if (!hold || hold.status !== HoldOrderStatus.HOLDING) return null;
       const today = dateInTimezone(now, hold.flightSchedule.departureTz);
       if (!hold.installments.some((item) => item.dueDate.toISOString().slice(0, 10) < today)) return null;
-      const nextStatus = action === HoldOverdueAction.AUTO_RELEASE ? HoldOrderStatus.RELEASED : HoldOrderStatus.OVERDUE;
+      const wantsAutoRelease = action === HoldOverdueAction.AUTO_RELEASE;
+      // 同 hold-orders.service.ts release() 的钱闸：已有实收且座位还没清算完，
+      // 就不能自动释放（会形成「钱收了、账没平，座位却回池子」的两本账）——
+      // 退回按 OVERDUE 处理，交人工走取消/清算流程，不留自动放行的死口子。
+      const remaining = hold.seats - hold.seatsConverted - hold.seatsCancelled;
+      const receiptBlocksRelease =
+        wantsAutoRelease &&
+        remaining > 0 &&
+        (await tx.holdReceiptAllocation.count({
+          where: { holdOrderId: hold.id, reversedAt: null, amountCny: { gt: 0 } },
+        })) > 0;
+      const nextStatus =
+        wantsAutoRelease && !receiptBlocksRelease ? HoldOrderStatus.RELEASED : HoldOrderStatus.OVERDUE;
       const updated = await tx.holdOrder.updateMany({
         where: { id: hold.id, status: HoldOrderStatus.HOLDING },
-        data: action === HoldOverdueAction.AUTO_RELEASE ? { status: nextStatus, releasedAt: now } : { status: nextStatus },
+        data: nextStatus === HoldOrderStatus.RELEASED ? { status: nextStatus, releasedAt: now } : { status: nextStatus },
       });
-      return updated.count === 1 ? { id: hold.id, holdNo: hold.holdNo, seatClassId: hold.seatClassId, nextStatus, today } : null;
+      return updated.count === 1
+        ? {
+            id: hold.id,
+            holdNo: hold.holdNo,
+            seatClassId: hold.seatClassId,
+            nextStatus,
+            today,
+            blockedByReceipt: receiptBlocksRelease,
+          }
+        : null;
     });
     if (!transition) continue;
     if (transition.nextStatus === HoldOrderStatus.RELEASED) released++;
     else marked++;
+    if (transition.blockedByReceipt) blockedByReceipt++;
     void writeAudit({
       actor: { label: 'system:hold-overdue', role: 'SYSTEM' },
-      action: transition.nextStatus === HoldOrderStatus.RELEASED ? 'AUTO_RELEASE_OVERDUE_HOLD' : 'MARK_HOLD_OVERDUE',
+      action: transition.nextStatus === HoldOrderStatus.RELEASED
+        ? 'AUTO_RELEASE_OVERDUE_HOLD'
+        : transition.blockedByReceipt
+          ? 'HOLD_OVERDUE_AUTO_RELEASE_BLOCKED_RECEIPT'
+          : 'MARK_HOLD_OVERDUE',
       targetType: AuditTargetType.FLIGHT,
       targetId: transition.id,
       targetLabel: `占位单 ${transition.holdNo}`,
@@ -66,7 +93,7 @@ export async function markOverdueHolds(client: PrismaClient = prisma, now = new 
       }
     }
   }
-  return { marked, released, action, today: now.toISOString().slice(0, 10) };
+  return { marked, released, blockedByReceipt, action, today: now.toISOString().slice(0, 10) };
 }
 
 export const DEFAULT_HOLD_OVERDUE_ACTION = FALLBACK_HOLD_CONFIG.overdueAction;
