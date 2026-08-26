@@ -4484,7 +4484,7 @@ export class OrderService {
     actor: { userId: string; role: UserRole },
   ): Promise<{
     order: ReturnType<typeof serializeOrder>;
-    /** B12：已付款单改价的资金后果提示（多付/新尾款）；无后果时 null。*/
+    /** B12：已付款单改价的资金后果提示（多付/新尾款）+ 已计提佣金提示；均无后果时 null。*/
     warning: string | null;
     audit: {
       orderNumber: string;
@@ -4595,6 +4595,25 @@ export class OrderService {
         select: { subtotal: true, total: true },
       });
 
+      // 佣金后果提示：佣金在订单转 PAID 时按当时的价格基数一次性计提，改结算价**不重算佣金**，
+      // 且计提幂等键按（订单, productKind）不区分状态 —— 补提也会被判成"已提过"而永久锁死。
+      // 本次只做可见性：把「已计提多少」明明白白摆到操作者面前 + 留一条 WARNING 审计，
+      // 让财务自己决定要不要人工调整。真正的重算/幂等键收口是独立议题，不在此处顺手改。
+      const accruedCommissions = await tx.commissionRecord.findMany({
+        where: {
+          orderId,
+          status: { in: [CommissionStatus.ACCRUED, CommissionStatus.SETTLED] },
+        },
+        select: { amount: true },
+      });
+      const accruedCommissionCny = round2(
+        accruedCommissions.reduce((s, c) => s + Number(c.amount.toString()), 0),
+      );
+      const commissionWarning =
+        accruedCommissions.length > 0
+          ? `本单已计提佣金 ¥${accruedCommissionCny}，价格基数已变更，请财务确认是否调整。`
+          : null;
+
       // 已付资金后果（B12）：改价后 total 变、paidAmount 不变 —— 把差额算清楚交给运营处置，
       // 不再让「total ≠ 已收」静默存在。多付走既有多付处置（转余额/挂账/退款），欠款去催收。
       const paid = Number(order.paidAmount.toString());
@@ -4611,6 +4630,8 @@ export class OrderService {
             '请补收该差额或确认本次改价金额无误。';
         }
       }
+      // 佣金提示与资金提示并列返回：两件事互不覆盖（可能同时成立）。
+      warning = [warning, commissionWarning].filter(Boolean).join(' ') || null;
 
       return {
         orderNumber: order.orderNumber,
@@ -4623,8 +4644,31 @@ export class OrderService {
         afterSubtotal: updated.subtotal.toString(),
         afterTotal: updated.total.toString(),
         warning,
+        accruedCommissionCny: accruedCommissions.length > 0 ? accruedCommissionCny : null,
       };
     });
+
+    // 改价撞上已计提佣金 → 单独留一条 WARNING 审计（路由层那条改价审计是 INFO 级，
+    // 淹没在日常改价里翻不出来）。await 而非 fire-and-forget：与录单调价/结算总价同口径，
+    // 佣金基数漂移是财务要复核的事，落审计后再返回。
+    if (scratch.accruedCommissionCny !== null) {
+      await writeAudit({
+        actor: { userId: actor.userId, role: actor.role },
+        action: 'SETTLEMENT_PRICE_CHANGED_AFTER_COMMISSION',
+        targetType: 'ORDER',
+        targetId: orderId,
+        targetLabel: scratch.orderNumber,
+        before: { total: scratch.beforeTotal, accruedCommissionCny: scratch.accruedCommissionCny },
+        after: {
+          total: scratch.afterTotal,
+          orderItemId: itemId,
+          // 佣金不随改价重算，这条审计就是「基数已变、佣金没动」的留痕。
+          commissionRecalculated: false,
+          reason: input.reason ?? null,
+        },
+        severity: AuditSeverity.WARNING,
+      });
+    }
 
     const finalOrder = await prisma.order.findUniqueOrThrow({
       where: { id: orderId },
