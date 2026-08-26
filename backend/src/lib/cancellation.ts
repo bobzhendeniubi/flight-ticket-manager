@@ -50,8 +50,15 @@ export interface CancellationQuote {
   orderNumber: string;
   /** 现金实收（Order.paidAmount） */
   paidAmount: number;
-  /** 代理预存余额抵扣额（Order.prepaymentOffset）——同样是客户付出的钱，必须计入可退基数 */
+  /** 代理预存余额抵扣额（旧列 Order.prepaymentOffset）——无生产代码写入，恒为 0，仅为兼容保留 */
   prepaymentOffsetCny: number;
+  /**
+   * 本单预存余额抵扣毛额 = |Σ PrepaymentTransaction(OFFSET).amount|（唯一真源是流水）。
+   * 抵扣当时已累加进 Order.paidAmount（见 applyAgentBalanceToOrder），故它是 paidAmount 的
+   * **内含**部分，绝不再加进可退基数（那等于凭空放宽退款上限）；只用来把应退拆成
+   * 「退现金 / 退回余额」两段 —— 口径与 orders.service 落 REFUNDED 的执行侧同源。
+   */
+  offsetGrossCny: number;
   /** 改期费 / 换人费（Order.adjustmentCny）——已发生的不可退成本，从可退基数里剔除 */
   adjustmentCny: number;
   /** 可退基数 = max(0, paidAmount + prepaymentOffset − adjustmentCny) */
@@ -73,12 +80,17 @@ export interface CancellationQuote {
 /**
  * 把「应退总额」拆成 退现金 / 退回代理预存余额 两部分。
  *
- * 口径（现金优先）：客户付出的钱由现金（paidAmount）与预存余额抵扣（prepaymentOffset）两段组成，
- * 其中 adjustmentCny（改期费/换人费）视为**先从现金里消耗掉**的不可退成本。
- * 于是可退现金上限 = max(0, paidAmount − adjustmentCny)，应退先退现金、退不下的部分回余额。
+ * 口径（现金优先）：客户付出的钱由现金与预存余额抵扣两段组成，其中 adjustmentCny
+ *（改期费/换人费）视为**先从现金里消耗掉**的不可退成本。应退先退现金、退不下的部分回余额。
  * 现金优先而非余额优先：现金是客户真金白银出去的，优先原路退回；剩余额度回到余额可继续下单。
  *
- * 导出供 orders.service 的 REFUNDED 流转复用——退款完成时必须按**同一口径**回补余额，
+ * 两条余额口径（**互斥**，正常只会有 offsetGrossCny 一条）：
+ *   · offsetGrossCny —— 流水口径（唯一真源）：|Σ PrepaymentTransaction(OFFSET)|。这笔钱抵扣当时
+ *     已累加进 paidAmount，所以现金侧上限要先把它扣掉：realCash = max(0, paidAmount − offsetGross)。
+ *   · prepaymentOffsetCny —— 旧列 Order.prepaymentOffset（无生产代码写入，恒为 0）。它按「不含在
+ *     paidAmount 里」的旧口径参与，故不从现金侧扣减。保留只为不破坏既有调用与用例。
+ *
+ * 导出供 orders.service 的 REFUNDED 流转对照——退款完成时必须按**同一口径**回补余额，
  * 否则报价说退 8000（其中 8000 回余额）、落库却按别的比例回补，账目立刻分叉。
  */
 export function splitRefundBetweenCashAndBalance(input: {
@@ -86,18 +98,36 @@ export function splitRefundBetweenCashAndBalance(input: {
   paidAmount: number;
   adjustmentCny: number;
   prepaymentOffsetCny: number;
+  /** 预存余额抵扣毛额（已内含在 paidAmount 里）；缺省 0 = 无余额抵扣流水，行为与旧版逐位一致。 */
+  offsetGrossCny?: number;
 }): { refundToCashCny: number; refundToBalanceCny: number } {
   const totalRefund = Math.max(0, round2(input.totalRefund));
-  const cashCapacity = Math.max(0, round2(input.paidAmount - input.adjustmentCny));
+  const offsetGrossCny = Math.max(0, round2(input.offsetGrossCny ?? 0));
+  // 真·现金 = 实收合计 − 余额抵扣毛额。按**毛额**而非净额（已回补不减 paidAmount，用净额会让
+  // 已回补的部分在下一次分批批准时摇身变成「现金」，同一笔钱退两遍）。
+  const realCash = Math.max(0, round2(input.paidAmount - offsetGrossCny));
+  const cashCapacity = Math.max(0, round2(realCash - input.adjustmentCny));
   const refundToCashCny = round2(Math.min(totalRefund, cashCapacity));
-  // 余额部分再夹一层 prepaymentOffset 上限：绝不回补超过当初抵扣掉的余额（防凭空造币）。
+  // 余额部分再夹一层抵扣毛额上限：绝不回补超过当初抵扣掉的余额（防凭空造币）。
+  const balanceCap = Math.max(0, round2(input.prepaymentOffsetCny)) + offsetGrossCny;
   const refundToBalanceCny = round2(
-    Math.min(Math.max(0, input.prepaymentOffsetCny), round2(totalRefund - refundToCashCny)),
+    Math.min(balanceCap, Math.max(0, round2(totalRefund - refundToCashCny))),
   );
   return { refundToCashCny, refundToBalanceCny };
 }
 
-const CANCELLABLE_STATUSES = new Set([
+/**
+ * 可走「取消 → 退款」流程的订单状态。
+ *
+ * FAILED（出票失败）在列：出票失败恰恰是最该退款的场景，此前漏放导致这类单只能靠 ADMIN
+ * 手动 PATCH 状态硬推 REFUNDED（不生成 Refund、不算退改费，账目直接分叉）。座位账无副作用——
+ * FAILED 属 SEAT_RELEASING_STATUSES，座位在落 FAILED 时就已释放，转 REFUND_REQUESTED 时
+ * wasHolding=false → 释放分支短路，不会二次放座；佣金亦已在落 FAILED 时冲销，且冲销只挑
+ * ACCRUED/SETTLED，重复推进天然幂等。
+ *
+ * PENDING_PAYMENT 的取消走另一条路（直接释放座位 + 0 费用），不走 refund。
+ */
+export const CANCELLABLE_STATUSES = new Set([
   'PAID',
   'PROCESSING',
   'TICKETED',
@@ -105,8 +135,18 @@ const CANCELLABLE_STATUSES = new Set([
   // CHANGE_REQUESTED 亦从占座态发起，quote 层此前漏放导致这两态客户无法自助取消。
   'CHANGE_REQUESTED',
   'CHANGED',
-  // PENDING_PAYMENT 的取消走另一条路（直接释放座位 + 0 费用），不走 refund
+  'FAILED',
 ]);
+
+/** 报错文案里列可取消状态：中文名单一处维护，避免与集合漂移。 */
+const CANCELLABLE_STATUS_LABELS_ZH: Record<string, string> = {
+  PAID: '已支付',
+  PROCESSING: '处理中',
+  TICKETED: '出票完成',
+  CHANGE_REQUESTED: '改期申请中',
+  CHANGED: '已改期',
+  FAILED: '出票失败',
+};
 
 /**
  * 主入口：计算订单的 cancellation quote。只读，不改任何状态。
@@ -130,7 +170,9 @@ export async function computeCancellationQuote(
 
   const cancellable = CANCELLABLE_STATUSES.has(order.status);
   const cancellableReason = !cancellable
-    ? `订单状态 ${order.status} 不可取消（仅 PAID / PROCESSING / TICKETED 可走退款流程）`
+    ? `订单状态 ${order.status} 不可取消（仅 ${[...CANCELLABLE_STATUSES]
+        .map((s) => CANCELLABLE_STATUS_LABELS_ZH[s] ?? s)
+        .join(' / ')} 可走退款流程）`
     : undefined;
 
   // 一次性把所有 active policy 拉出来（一般几条到几十条；不分页）
@@ -142,9 +184,25 @@ export async function computeCancellationQuote(
     order.items.map((it) => quoteItem(it, policies, cancelAt)),
   );
 
+  // ── 预存余额抵扣毛额：按流水现算，绝不读 Order.prepaymentOffset ────────────────
+  // 那一列没有任何生产代码写入（恒为 0），照它算出来的「退回余额」恒为 0 —— 预存抵付过的单
+  // 报价上永远显示「全额退现金」，而落 REFUNDED 的执行侧按流水回补余额，报价与落库当场分叉。
+  // 唯一真源是 PrepaymentTransaction(OFFSET)（负数），口径与 orders.service 的 REFUNDED 分支同源。
+  // 无归属代理的单必然没有 OFFSET 流水（applyAgentBalanceToOrder 硬要求 order.agentId），跳过查询。
+  const offsetRows = order.agentId
+    ? await prisma.prepaymentTransaction.findMany({
+        where: { orderId: order.id, type: 'OFFSET' },
+        select: { amount: true },
+      })
+    : [];
+  const offsetGrossCny = round2(
+    offsetRows.reduce((s, r) => s + Math.abs(Number(r.amount)), 0),
+  );
+
   const breakdown = computeRefundBreakdown({
     paidAmount: Number(order.paidAmount),
     prepaymentOffsetCny: Number(order.prepaymentOffset ?? 0),
+    offsetGrossCny,
     adjustmentCny: Number(order.adjustmentCny ?? 0),
     grossItems,
   });
@@ -173,8 +231,10 @@ export type GrossItemQuote = Omit<ItemQuote, 'paidShare'>;
  *
  * 新口径：两个基数强制同源。
  *   可退基数 refundableBaseCny = max(0, paidAmount + prepaymentOffset − adjustmentCny)
- *     ＋ prepaymentOffset：代理用预存余额抵付的钱同样是客户付出的钱。不计入就会把
- *        「全额余额抵付单」（paidAmount=0）算成应退 ¥0，客户白丢一整单钱。
+ *     ＋ prepaymentOffset：旧列 Order.prepaymentOffset（恒 0，无生产代码写入），保留只为兼容。
+ *        代理用预存余额抵付的钱同样是客户付出的钱，但那笔钱抵扣当时已被累加进 paidAmount
+ *       （见 applyAgentBalanceToOrder），已含在基数里 —— 它只经 offsetGrossCny 参与
+ *        「退现金 / 退回余额」的拆分，**绝不再加一次**（加了等于凭空放宽退款上限）。
  *     － adjustmentCny：改期费/换人费对应**已发生且不可退**的成本，不进可退基数。
  *   手续费折算系数 feeScale = min(1, 可退基数 ÷ 明细毛价合计)，逐行折算后再求和。
  *     · 夹到 ≤1：客户多付（实收 > 毛价）时不把手续费一起放大。
@@ -191,10 +251,16 @@ export function computeRefundBreakdown(input: {
   prepaymentOffsetCny: number;
   adjustmentCny: number;
   grossItems: GrossItemQuote[];
+  /**
+   * 预存余额抵扣毛额（流水口径，**已内含在 paidAmount 里**）。缺省 0 = 无余额抵扣，
+   * 输出与旧版逐位一致。只影响「退现金 / 退回余额」的拆分，不影响可退基数与手续费。
+   */
+  offsetGrossCny?: number;
 }): Pick<
   CancellationQuote,
   | 'paidAmount'
   | 'prepaymentOffsetCny'
+  | 'offsetGrossCny'
   | 'adjustmentCny'
   | 'refundableBaseCny'
   | 'feeScale'
@@ -205,6 +271,7 @@ export function computeRefundBreakdown(input: {
   | 'items'
 > {
   const { paidAmount, prepaymentOffsetCny, adjustmentCny, grossItems } = input;
+  const offsetGrossCny = Math.max(0, round2(input.offsetGrossCny ?? 0));
   const refundableBaseCny = round2(
     Math.max(0, paidAmount + prepaymentOffsetCny - adjustmentCny),
   );
@@ -225,11 +292,13 @@ export function computeRefundBreakdown(input: {
     paidAmount,
     adjustmentCny,
     prepaymentOffsetCny,
+    offsetGrossCny,
   });
 
   return {
     paidAmount,
     prepaymentOffsetCny,
+    offsetGrossCny,
     adjustmentCny,
     refundableBaseCny,
     feeScale,

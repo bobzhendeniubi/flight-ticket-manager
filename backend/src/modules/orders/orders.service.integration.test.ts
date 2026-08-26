@@ -227,4 +227,78 @@ describe('OrderService.requestCancellation · 真 DB E2E', () => {
     expect(result.quote.totalRefund).toBe(0);
     expect(Number(result.refund.amount)).toBe(0);
   });
+
+  // ── 出票失败单必须能走退款（此前 quote 层漏放 FAILED）─────────────────────
+  it('出票失败（FAILED）单可取消 → 建 Refund + 转 REFUND_REQUESTED，座位不二次释放', async () => {
+    const customer = await createUser('CUSTOMER');
+    await createFlightCancellationPolicy();
+    const { order, schedule } = await createPaidOrder(customer.id, { departureHoursFromNow: 100 });
+    // 落 FAILED 时座位已释放：这里直接把订单置 FAILED（模拟出票失败后的状态）。
+    await prisma.order.update({ where: { id: order.id }, data: { status: OrderStatus.FAILED } });
+    const seatClass = await prisma.flightSeatClass.create({
+      data: { scheduleId: schedule.id, cabin: 'ECONOMY', capacity: 100, sold: 0, basePrice: new Prisma.Decimal(1000) },
+    });
+
+    // 走运营侧（ADMIN）：客户自助 RBAC 目前仍只放行 PAID/PROCESSING/TICKETED
+    // （见 assertCanTransition —— 它自带一份状态清单，与 CANCELLABLE_STATUSES 不同源）。
+    const admin = await createUser('ADMIN');
+    const result = await service.requestCancellation(order.id, '出票失败退款', {
+      userId: admin.id,
+      role: 'ADMIN',
+      agentId: undefined,
+    });
+
+    expect(result.isNew).toBe(true);
+    expect(result.refund.status).toBe('REQUESTED');
+    const reloaded = await prisma.order.findUnique({
+      where: { id: order.id },
+      include: { refunds: true },
+    });
+    expect(reloaded!.status).toBe('REFUND_REQUESTED');
+    expect(reloaded!.refunds).toHaveLength(1);
+    // FAILED 已在 SEAT_RELEASING 集合里 → 本次流转不再动库存（不会把 sold 打成负数）
+    const seatAfter = await prisma.flightSeatClass.findUnique({ where: { id: seatClass.id } });
+    expect(seatAfter!.sold).toBe(0);
+  });
+
+  // ── 报价的现金/余额拆分按 PrepaymentTransaction(OFFSET) 流水现算 ───────────
+  it('代理预存余额抵付过的单：报价把应退拆出「退回余额」那一段（不再恒 0）', async () => {
+    const agentUser = await createUser('AGENT');
+    const agent = await prisma.agent.create({
+      data: {
+        userId: agentUser.id,
+        companyName: `测试代理-${Math.random().toString(36).slice(2, 7)}`,
+        contactName: '联系人',
+        contactPhone: '13800138001',
+        isActive: true,
+        prepaymentBalance: new Prisma.Decimal(0),
+      },
+    });
+    await createFlightCancellationPolicy();
+    const { order } = await createPaidOrder(agentUser.id, { departureHoursFromNow: 100 });
+    // 实收 1000 里有 400 是余额抵扣（抵扣当时已累加进 paidAmount）
+    await prisma.order.update({ where: { id: order.id }, data: { agentId: agent.id } });
+    await prisma.prepaymentTransaction.create({
+      data: {
+        agentId: agent.id,
+        amount: new Prisma.Decimal(-400), // 负数 = 抵扣
+        balanceAfter: new Prisma.Decimal(0),
+        type: 'OFFSET',
+        orderId: order.id,
+        description: '测试：余额抵尾款',
+        createdById: agentUser.id,
+      },
+    });
+
+    const { computeCancellationQuote } = await import('../../lib/cancellation.js');
+    const quote = await computeCancellationQuote(order.id);
+
+    // 100h → 0% 手续费 → 全额退 1000：现金优先退真现金 600，余下 400 回余额
+    expect(quote.totalRefund).toBe(1000);
+    expect(quote.offsetGrossCny).toBe(400);
+    expect(quote.refundToCashCny).toBe(600);
+    expect(quote.refundToBalanceCny).toBe(400);
+    // 可退基数不因余额抵扣被加第二次（paidAmount 本就含它）
+    expect(quote.refundableBaseCny).toBe(1000);
+  });
 });

@@ -41,6 +41,7 @@ import {
   ForbiddenError,
   NotFoundError,
   PriceChangedError,
+  UnprocessableEntityError,
 } from '../../lib/errors.js';
 import type { ItineraryData } from '../../lib/itinerary-pdf.js';
 import { writeAudit } from '../../lib/audit.js';
@@ -86,6 +87,7 @@ import { derivePtcByAge } from './pnr-export.js';
 import {
   assertOrderAllowsInvoicing,
   assertTicketingCap,
+  countsTowardTicketingCap,
   determineFlightLegs,
   determineFlightLegItems,
 } from './ticketing-cap.js';
@@ -3948,6 +3950,8 @@ export class OrderService {
     const pendingFulfillmentTaskIds: string[] = [];
     // 收集释放座位的舱位 id，提交后排队候补检查
     const releasedSeatClassIds: string[] = [];
+    // 取消族恢复时被自动清除的开票标记提示（超出班次开票额度 → 清标记，要求票务台重开）
+    const invoiceCapWarnings: string[] = [];
 
     const updated = await prisma.$transaction(async (tx) => {
       return this._updateStatusWithinTx(
@@ -3959,6 +3963,7 @@ export class OrderService {
         pendingFulfillmentTaskIds,
         force,
         releasedSeatClassIds,
+        invoiceCapWarnings,
       );
     });
 
@@ -3999,7 +4004,12 @@ export class OrderService {
     }
 
     // 对外脱敏按请求者角色：AGENT/CUSTOMER 自助改状态的返回也剥离内部字段（getOrder/listOrders 同口径）。
-    return serializeOrder(updated, orderSerializeRoleCtx(requester.role));
+    // invoiceCapWarnings 只在「取消族恢复把开票标记清掉了」时出现，附在订单上带回给操作者
+    //（没清就没有这个键，前端不必处理空数组）。
+    const serialized = serializeOrder(updated, orderSerializeRoleCtx(requester.role));
+    return invoiceCapWarnings.length > 0
+      ? { ...serialized, invoiceCapWarnings: [...new Set(invoiceCapWarnings)] }
+      : serialized;
   }
 
   /**
@@ -4015,15 +4025,36 @@ export class OrderService {
   ): Promise<{
     successCount: number;
     failureCount: number;
-    results: Array<{ id: string; success: boolean; orderNumber?: string; error?: string }>;
+    results: Array<{
+      id: string;
+      success: boolean;
+      orderNumber?: string;
+      error?: string;
+      /** 取消族恢复时被自动清除的开票标记提示（需票务台重开），无则不出现。 */
+      warnings?: string[];
+    }>;
   }> {
-    const results: Array<{ id: string; success: boolean; orderNumber?: string; error?: string }> = [];
+    const results: Array<{
+      id: string;
+      success: boolean;
+      orderNumber?: string;
+      error?: string;
+      warnings?: string[];
+    }> = [];
     let successCount = 0;
     let failureCount = 0;
     for (const id of ids) {
       try {
         const order = await this.updateStatus(id, toStatus, requester, reason, force);
-        results.push({ id, success: true, orderNumber: order.orderNumber });
+        // 逐单把「开票标记被清掉」的提示带回：批量恢复时这类单往往混在几十条里，
+        // 不逐条回显就等于悄悄改了数据。
+        const warnings = (order as { invoiceCapWarnings?: string[] }).invoiceCapWarnings;
+        results.push({
+          id,
+          success: true,
+          orderNumber: order.orderNumber,
+          ...(warnings && warnings.length > 0 ? { warnings } : {}),
+        });
         successCount += 1;
       } catch (err) {
         const message = err instanceof Error ? err.message : '未知错误';
@@ -4699,44 +4730,13 @@ export class OrderService {
     };
   }
 
-  /**
-   * 设置开票状态（路由层限 ADMIN/STAFF）。
-   * 转 ISSUED 前校验班次开票上限（FlightSchedule.ticketingCap，默认 191 张/班次），
-   * 超限抛 422。校验+更新同包一个事务，缩小并发开票越限的窗口。
-   */
-  async setInvoiceStatus(
-    id: string,
-    invoiceStatus: InvoiceStatus,
-  ): Promise<{ id: string; orderNumber: string; invoiceStatus: InvoiceStatus }> {
-    return prisma.$transaction(async (tx) => {
-      const order = await tx.order.findUnique({
-        where: { id },
-        select: {
-          invoiceStatus: true,
-          items: {
-            where: { kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
-            select: { flightScheduleId: true },
-          },
-          _count: { select: { passengers: true } },
-        },
-      });
-      if (!order) throw new NotFoundError('订单不存在');
-
-      // 已是 ISSUED 的订单重复设置不再计数（幂等）；改回 NONE/REQUESTED 不受限
-      if (invoiceStatus === InvoiceStatus.ISSUED && order.invoiceStatus !== InvoiceStatus.ISSUED) {
-        const scheduleIds = order.items
-          .map((it) => it.flightScheduleId)
-          .filter((sid): sid is string => sid !== null);
-        await assertTicketingCap(tx, scheduleIds, order._count.passengers);
-      }
-
-      return tx.order.update({
-        where: { id },
-        data: { invoiceStatus },
-        select: { id: true, orderNumber: true, invoiceStatus: true },
-      });
-    });
-  }
+  // 旧的「订单级开票状态」写入口（setInvoiceStatus / PATCH /orders/:id/invoice-status）已删除
+  // （0716 H11b）：它是六态开票改造前的遗留，与现口径是两本账 ——
+  //   · 不走 assertOrderAllowsInvoicing（取消族/回收站单照样能标开票）；
+  //   · 写进的 Order.invoiceStatus 现在无人读：开票额度（ticketing-cap）、导出、财务口径
+  //     全部改看三个布尔位（outboundInvoiced / returnInvoiced / systemInvoiced）。
+  // 唯一写入口是 setInvoiceFlags（PATCH /orders/:id/invoice-flags）。数据列 invoiceStatus 保留
+  //（存量数据 + 换人 resetInvoice 仍会把它归零），只是不再有单独的写接口。
 
   /**
    * 设置六态开票的三个布尔位（路由层限 ADMIN/STAFF）：去程 / 回程 / 系统 各自独立。
@@ -4772,7 +4772,7 @@ export class OrderService {
           outboundInvoiced: true,
           returnInvoiced: true,
           systemInvoiced: true,
-          _count: { select: { passengers: true } },
+          passengers: { select: { passengerType: true } },
           items: {
             where: { kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
             select: {
@@ -4783,6 +4783,13 @@ export class OrderService {
         },
       });
       if (!order) throw new NotFoundError('订单不存在');
+
+      // 本单要占的开票**座位**数：婴儿有票无座，不占库存 —— 必须与计数侧
+      //（countIssuedPassengers 同样跳过 INFANT）严格同口径。此前这里传的是含婴儿的总人数，
+      // 于是每个带婴儿的订单都比它实际占的座多算一个，班次快满时会把合法开票误判成超限。
+      const seatPassengerCount = order.passengers.filter(
+        (p) => p.passengerType !== PassengerType.INFANT,
+      ).length;
 
       // 开票标记状态闸：只挡「翻成已开」（false → true）——取消族/软删单不占班次额度，
       // 标了开票位对 191 上限完全隐形，却会进导出、让财务口径失真（见 assertOrderAllowsInvoicing）。
@@ -4797,11 +4804,11 @@ export class OrderService {
 
       // 去程：从 false → true 且有去程班次时校验该班次上限
       if (flags.outboundInvoiced === true && !order.outboundInvoiced && outboundScheduleId) {
-        await assertTicketingCap(tx, [outboundScheduleId], order._count.passengers);
+        await assertTicketingCap(tx, [outboundScheduleId], seatPassengerCount);
       }
       // 回程：从 false → true 且有回程班次时校验该班次上限
       if (flags.returnInvoiced === true && !order.returnInvoiced && returnScheduleId) {
-        await assertTicketingCap(tx, [returnScheduleId], order._count.passengers);
+        await assertTicketingCap(tx, [returnScheduleId], seatPassengerCount);
       }
 
       return tx.order.update({
@@ -5112,6 +5119,11 @@ export class OrderService {
     newTaskIdsOut: string[],
     force?: boolean,
     releasedSeatClassIdsOut?: string[],
+    /**
+     * 取消族恢复时被自动清除的开票标记警示语（见下方「取消族恢复：复检班次开票额度」）。
+     * 调用方给了数组就能把提示带回给操作者；不给也照样复检、照样清标记（只是没人看见提示）。
+     */
+    invoiceCapWarningsOut?: string[],
   ) {
     const order = await tx.order.findUnique({
       where: { id },
@@ -5168,6 +5180,58 @@ export class OrderService {
       if (legCount >= 2 && !inv?.returnInvoiced) {
         throw new BadRequestError(
           '回程尚未标记开票，不能推进到「出票完成」。请先在票务台标记回程已开票——标齐后订单会自动推进。',
+        );
+      }
+    }
+
+    // ── REFUND_REQUESTED 账目闸（与下方 →REFUNDED 的账目闸对称）────────────────────
+    // 状态机把 PAID/PROCESSING/TICKETED/CHANGED/FAILED → REFUND_REQUESTED 全部放行且零校验，
+    // 于是「退款申请中」可以是一张**没有任何 Refund 记录**的空壳：座位当场释放、订单从所有
+    // 有效口径里消失，却既没有应退报价、也没有可批准的对象 —— 下一步 →REFUNDED 被账目闸拦死，
+    // 退回 PROCESSING 又要重新抢座位，这单就此卡住，实收与佣金两头挂着谁也对不平。
+    // 口径：进 REFUND_REQUESTED 必须已有一条**未终结**的 Refund（REQUESTED/APPROVED/PROCESSING）。
+    // 唯一正门是 POST /orders/:id/cancel —— 它先按取消策略算出应退报价、建 Refund，再推本状态。
+    // **admin force 同样拦**：与 →REFUNDED 一致，这是账目完整性，force 是用来跳状态机的，不是跳账的。
+    if (toStatus === OrderStatus.REFUND_REQUESTED) {
+      const pendingRefundCount = await tx.refund.count({
+        where: {
+          orderId: id,
+          status: {
+            in: [RefundStatus.REQUESTED, RefundStatus.APPROVED, RefundStatus.PROCESSING],
+          },
+        },
+      });
+      if (!(pendingRefundCount > 0)) {
+        throw new BadRequestError(
+          `订单 ${order.orderNumber} 还没有待处理的退款申请，不能直接置为「退款申请中」——` +
+            `那会让订单座位当场释放却没有任何应退金额可批准，最终既退不出去也回不来。` +
+            `请改用订单详情页的「取消订单」：系统会按取消策略算出应退明细并生成退款申请，` +
+            `再由财务批准退款。`,
+        );
+      }
+    }
+
+    // ── CHANGED 派生闸（与上方 TICKETED 派生闸同构）─────────────────────────────
+    // 「已改期」不是一个可以手点的标签，而是**改期动作真的发生过**的派生：改期端点
+    //（rescheduleOrderItem）搬完座位后会在被改的 FLIGHT 行 metadata 上落 flightChanged 标记，
+    // 并在同一事务里推进本状态。手动 CHANGE_REQUESTED→CHANGED 若不校验，就会出现「订单写着
+    // 已改期、航段还是原班次」——旅客照原班次出行、客服照新状态答复，且改期费/立减补差全部落空。
+    // ADMIN force 可跳过（应急通道，审计照记；也用于放行改期标记出现之前的存量单）。
+    if (toStatus === OrderStatus.CHANGED && !isAdminForce) {
+      const flightRows = await tx.orderItem.findMany({
+        where: { orderId: id, kind: OrderItemKind.FLIGHT },
+        select: { metadata: true },
+      });
+      const hasFlightChangedMark = flightRows.some((row) => {
+        const meta = row.metadata;
+        if (meta == null || typeof meta !== 'object' || Array.isArray(meta)) return false;
+        return (meta as Record<string, unknown>).flightChanged != null;
+      });
+      if (!hasFlightChangedMark) {
+        throw new BadRequestError(
+          `订单 ${order.orderNumber} 没有任何航段被改期过，不能置为「已改期」——` +
+            `否则状态说已改、航段还是原班次，旅客会按原航班出行。` +
+            `请先用订单详情页的「改期」把航段改到新班次（改完订单会自动进入「已改期」）。`,
         );
       }
     }
@@ -5476,6 +5540,69 @@ export class OrderService {
         const split = computeBundleSeatSplit(item.flightCabin, item.quantity, rawUpgrade);
         await retakeSeat(item.flightScheduleId, 'BUSINESS', split.business, item.description);
         await retakeSeat(item.flightScheduleId, item.flightCabin, split.sameCabin, item.description);
+      }
+    }
+
+    // ── 取消族恢复：复检班次开票额度（0716 H11）────────────────────────────────
+    // 开票额度只统计 COUNTED_STATUSES 的订单（见 ticketing-cap.ts）。订单落取消族时它占的
+    // 开票额度当场释放，那份额度随即可能被别的单开走；此后 force 把这张单拉回计数态，
+    // 它带着的开票标记会**凭空补回来**，班次瞬间越过座位库存上限，而全流程无一处会察觉
+    //（写标记的闸只在标记翻开时跑，状态流转从不看开票位）。
+    // 口径：本单已在上方 CAS 成新状态、因而已计入 countIssuedPassengers，故按「新增 0 人」复检
+    //（issued 已含本单）。超限则清掉该航段的开票标记 + 回警示语，让票务台按最新额度重新标 ——
+    // 宁可要求重开，也不留一个把班次撑爆的隐形标记。
+    if (!countsTowardTicketingCap(order.status) && countsTowardTicketingCap(toStatus)) {
+      const inv = await tx.order.findUnique({
+        where: { id },
+        select: {
+          outboundInvoiced: true,
+          returnInvoiced: true,
+          items: {
+            where: { kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
+            select: {
+              flightScheduleId: true,
+              flightSchedule: { select: { departureTime: true } },
+            },
+          },
+        },
+      });
+      if (inv && (inv.outboundInvoiced || inv.returnInvoiced)) {
+        const { outboundScheduleId, returnScheduleId } = determineFlightLegs(inv.items);
+        const legsToRecheck: Array<{
+          scheduleId: string;
+          field: 'outboundInvoiced' | 'returnInvoiced';
+          label: string;
+        }> = [];
+        if (inv.outboundInvoiced && outboundScheduleId) {
+          legsToRecheck.push({
+            scheduleId: outboundScheduleId,
+            field: 'outboundInvoiced',
+            label: '去程',
+          });
+        }
+        if (inv.returnInvoiced && returnScheduleId) {
+          legsToRecheck.push({
+            scheduleId: returnScheduleId,
+            field: 'returnInvoiced',
+            label: '回程',
+          });
+        }
+        const clearedFlags: Partial<Record<'outboundInvoiced' | 'returnInvoiced', boolean>> = {};
+        for (const leg of legsToRecheck) {
+          try {
+            await assertTicketingCap(tx, [leg.scheduleId], 0);
+          } catch (err) {
+            if (!(err instanceof UnprocessableEntityError)) throw err;
+            clearedFlags[leg.field] = false;
+            invoiceCapWarningsOut?.push(
+              `订单 ${order.orderNumber} 恢复为「${zhStatus(toStatus)}」后，${leg.label}班次的开票额度已被占满，` +
+                `已自动清除该航段的开票标记（${err.message}）。请票务台核对后重新标记开票。`,
+            );
+          }
+        }
+        if (Object.keys(clearedFlags).length > 0) {
+          await tx.order.update({ where: { id }, data: clearedFlags });
+        }
       }
     }
 
@@ -6328,7 +6455,11 @@ export class OrderService {
    *   2. 原子拿新座（新班次+新舱位 CAS：sold + qty + 他人锁位 + 占位余座 ≤ capacity）
    *      —— 新班次售罄则抛错，事务回滚 → 旧座保持原样（不泄漏）。
    *   3. 更新该行 flightScheduleId/flightCabin（amount/quantity 不变，机票基础价不重算）。
-   *   4. 撤销未撤销的立减快照行并按原金额补差；feeCny>0 另 push 一条 RESCHEDULE_FEE 流水。
+   *   3b. **换了班次即作废原票**：清空本单乘客的 pnr / eticketNumber，并把被改那一段的
+   *       开票标记（去程 outboundInvoiced / 回程 returnInvoiced）翻回未开 —— 改期后旧票号
+   *       必然作废，留着会让票务台以为已出票、导出与班次开票额度也照旧占着。
+   *   4. 撤销未撤销的立减快照行并按原金额补差；feeCny≠0 另 push 一条 RESCHEDULE_FEE 流水
+   *      （**差价可正可负**：同「换酒店差价 / 酒店改期差价」口径，改到便宜班次要能退差）。
    *   5. 当前若处于 CHANGE_REQUESTED（状态机允许 → CHANGED）则推进到 CHANGED；其余状态保持不变。
    *
    * 返回更新后的订单（serializeOrder）。
@@ -6366,7 +6497,10 @@ export class OrderService {
     if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
       throw new ForbiddenError('仅运营/管理员可改期');
     }
-    const feeCny = Math.max(0, Math.trunc(input.feeCny ?? 0));
+    // 改期差价可正可负（与换酒店差价 / 酒店改期差价同一 adjustmentCny 机制）：改到更便宜的班次
+    // 本来就该退客人钱，旧版 Math.max(0, …) 把负数钳成 0，运营只能另开收款单反向操作。
+    // 上限仍由 schema 的 ±POST_SALE_FEE_CAP_CNY 把关。
+    const feeCny = Math.trunc(input.feeCny ?? 0);
 
     const scratch = await prisma.$transaction(async (tx) => {
       // R2 并发串行（与超时 worker 配对）：先对本订单 Order 行 FOR UPDATE，再往下读 items / 搬座位。
@@ -6553,6 +6687,43 @@ export class OrderService {
       // 且未来若改期扩展成能加/删航段，维护点已经在这里，不会漏。
       await syncOrderHasReturnLeg(tx, orderId);
 
+      // ── 3b. 换班次即作废原票：清票号 + 翻回被改航段的开票标记 ────────────────────
+      // 旧代码只搬座位、不动票务字段，于是改完期订单上仍挂着**原航班的** PNR / 票号，
+      // 开票位也仍是「已开」——票务台看不出要重开，导出发给客人的还是作废票号，
+      // 而那份开票额度还占着新班次的座位库存（额度按航段算，班次已经换人了）。
+      // 只在真的换了班次时做（同班次改舱/无变化不动票）；纠错批量入口（correction）同样适用——
+      // 那正是「录错班次」的场景，原票号更不该留。
+      // 幂等：updateMany + 定值写，重复改期不会出问题。
+      if (scheduleChanged) {
+        await tx.passenger.updateMany({
+          where: { orderId },
+          data: { pnr: null, eticketNumber: null },
+        });
+
+        // 被改的是去程还是回程：按**改期前**的航段顺序判定（此刻订单行已写成新班次，
+        // 再按 departureTime 排序可能已经换位），故用行 id 与改期前那份排序结果比对。
+        const legItemsBefore = await tx.orderItem.findMany({
+          where: { orderId, kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
+          select: { id: true, flightScheduleId: true, flightSchedule: { select: { departureTime: true } } },
+        });
+        const legsBefore = determineFlightLegItems(
+          legItemsBefore.map((row) =>
+            row.id === item.id
+              ? { ...row, flightScheduleId: oldScheduleId, flightSchedule: item.flightSchedule }
+              : row,
+          ),
+        );
+        const invoiceReset =
+          legsBefore.return?.id === item.id
+            ? { returnInvoiced: false }
+            : legsBefore.outbound?.id === item.id
+              ? { outboundInvoiced: false }
+              : null;
+        if (invoiceReset) {
+          await tx.order.update({ where: { id: orderId }, data: invoiceReset });
+        }
+      }
+
       // ── 4. 改期立减取消补差 + 手填改期费（两笔分别留流水）──
       // 改期后原立减不随新日期重新命中：只撤销订单上尚未撤销的快照行，
       // 并把等额补差记入 adjustmentCny。行级 revoked 标记保证同单二次改期幂等。
@@ -6605,17 +6776,22 @@ export class OrderService {
           }
         }
       }
-      if (feeCny > 0 && !input.guard?.correction) {
+      // feeCny 可正可负（改到贵班次补差 / 改到便宜班次退差），故判 !== 0 而不是 > 0。
+      // 默认名从「改期费」改为「改期差价」——它现在两个方向都用。
+      if (feeCny !== 0 && !input.guard?.correction) {
         adjustmentLog = appendAdjustment(adjustmentLog, {
           type: 'RESCHEDULE_FEE',
-          label: input.feeLabel || '改期费',
+          label: input.feeLabel || '改期差价',
           amountCny: feeCny,
           at: new Date().toISOString(),
           by: actor.userId,
           note: input.note,
         }) as unknown as Prisma.JsonValue;
       }
-      if (adjustmentDelta > 0) {
+      // 负差价把 adjustmentCny 往下压（应付随之减少）——不夹 0，与换酒店差价 / 酒店改期差价
+      // 完全同一口径（那两处也是直接 order.adjustmentCny + feeCny）。夹 0 会让「改到便宜班次
+      // 退差」在合计为负时悄悄吞掉一部分，客人对不上账。
+      if (adjustmentDelta !== 0) {
         await tx.order.update({
           where: { id: orderId },
           data: {
@@ -6626,8 +6802,13 @@ export class OrderService {
       }
 
       // ── 5. 仅在状态机允许时推进到 CHANGED（不破坏状态机）──
+      // 追加 scheduleChanged 条件：「已改期」是航段真的换过的派生（_updateStatusWithinTx 的
+      // CHANGED 派生闸认的就是本函数落的 flightChanged 标记）。只收差价、不换班次的调用
+      // 没有航变可言，也没落标记 —— 不推状态，否则会撞上自家的闸、把整笔改期回滚掉，
+      // 运营只会看到一句「请先用改期把航段改到新班次」的自相矛盾报错。
       let statusChanged = false;
       if (
+        scheduleChanged &&
         !input.guard?.correction &&
         order.status !== OrderStatus.CHANGED &&
         ALLOWED_TRANSITIONS[order.status].includes(OrderStatus.CHANGED)

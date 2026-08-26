@@ -564,7 +564,9 @@ describe('OrderService.setInvoiceFlags', () => {
       outboundInvoiced: false,
       returnInvoiced: false,
       systemInvoiced: false,
-      _count: { passengers: 2 },
+      // 座位数按乘客明细算（婴儿不占座）——setInvoiceFlags 传给 assertTicketingCap 的是
+      // 过滤掉 INFANT 后的人数，与 countIssuedPassengers 同口径。
+      passengers: adults(2),
       items: [
         { flightScheduleId: OUT, flightSchedule: { departureTime: new Date(OUT_ISO) } },
         { flightScheduleId: RET, flightSchedule: { departureTime: new Date(RET_ISO) } },
@@ -596,6 +598,31 @@ describe('OrderService.setInvoiceFlags', () => {
     txMock.order.findMany.mockResolvedValue([fakeOrder(190, [[OUT, OUT_ISO]], { out: true })]);
     await expect(service.setInvoiceFlags('ord1', { outboundInvoiced: true })).rejects.toThrow(
       /已开票 190 张，座位库存共 190 张/,
+    );
+    expect(txMock.order.update).not.toHaveBeenCalled();
+  });
+
+  // ── 婴儿不占座：写标记侧与计数侧必须同口径 ────────────────────────────────
+  // 计数侧（countIssuedPassengers）明确跳过 INFANT，写标记侧此前传的却是含婴儿的总人数——
+  // 每张带婴儿的单都比它实际占的座多算一个，班次快满时会把合法开票误判成超限。
+  it('本单带婴儿 → 只按占座人数校验上限（婴儿有票无座，不占额度）', async () => {
+    // 2 成人 + 1 婴儿；该班次已开 188 张，座位库存 190 → 只有按 2（而非 3）算才放行。
+    stubOrder({ passengers: [pax('A1'), pax('A2'), pax('B1', PassengerType.INFANT)] });
+    txMock.order.findMany.mockResolvedValue([fakeOrder(188, [[OUT, OUT_ISO]], { out: true })]);
+
+    await service.setInvoiceFlags('ord1', { outboundInvoiced: true });
+
+    expect(txMock.order.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { outboundInvoiced: true } }),
+    );
+  });
+
+  it('本单带婴儿但成人已把额度撑满 → 照样 422（婴儿豁免不是放宽上限）', async () => {
+    stubOrder({ passengers: [pax('A1'), pax('A2'), pax('B1', PassengerType.INFANT)] });
+    txMock.order.findMany.mockResolvedValue([fakeOrder(189, [[OUT, OUT_ISO]], { out: true })]);
+
+    await expect(service.setInvoiceFlags('ord1', { outboundInvoiced: true })).rejects.toThrow(
+      /已开票 189 张，座位库存共 190 张/,
     );
     expect(txMock.order.update).not.toHaveBeenCalled();
   });
@@ -731,7 +758,9 @@ describe('OrderService.batchSetInvoiceFlags', () => {
       status: OrderStatus.PAID,
       outboundInvoiced: false,
       returnInvoiced: false,
-      _count: { passengers: 2 },
+      // 座位数按乘客明细算（婴儿不占座）——setInvoiceFlags 传给 assertTicketingCap 的是
+      // 过滤掉 INFANT 后的人数，与 countIssuedPassengers 同口径。
+      passengers: adults(2),
       items: [{ flightScheduleId: OUT, flightSchedule: { departureTime: new Date(OUT_ISO) } }],
       ...overrides,
     };
