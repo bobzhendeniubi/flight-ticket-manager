@@ -5,9 +5,10 @@
  *   - 往返单即使回程航段先录入（DB 顺序在前），路线串/航班号串仍按起飞时间升序拼接；
  *   - 「去程日期」= 最早航段日期，「回程日期」= 最末航段日期；
  *   - 单程单「回程日期」留空。
+ *   - 列尾「房号 / 当日余房」两列（房控核对用，口径对齐分房表导出）。
  * prisma 客户端注入假实现；开票进度取数（ticketing-cap）mock 为无座位库存路径。
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import ExcelJS from 'exceljs';
 
 // 顶层引用 prisma —— mock 掉，避免测试触发真实 DB 连接
@@ -16,6 +17,26 @@ vi.mock('../../db/prisma.js', () => ({ prisma: {} }));
 vi.mock('./ticketing-cap.js', () => ({
   getScheduleSeatCapacity: vi.fn(async () => null),
   countIssuedPassengers: vi.fn(async () => 0),
+}));
+// 「当日余房」底层取数（销控口径本身由 hotel-control.service.test.ts 覆盖）——
+// 此处按 hotelId 预置返回，只验证导出端三态展示（数字 / 未配 / —）。
+const nightlyByHotel = vi.hoisted(
+  () => new Map<string, { hasBlock: boolean; block?: number; physicalRemaining?: number }>(),
+);
+vi.mock('../hotel-control/hotel-control.service.js', () => ({
+  getHotelNightlyRemaining: vi.fn(async (hotelId: string, dates: readonly string[]) => {
+    const cfg = nightlyByHotel.get(hotelId);
+    if (!cfg || !cfg.hasBlock) {
+      // 与真实实现一致：该酒店无任何包房周期 → hasBlock=false + 空数组
+      return { remaining: [], hasBlock: false, block: [], physicalRemaining: [] };
+    }
+    return {
+      remaining: dates.map(() => cfg.physicalRemaining ?? 0),
+      hasBlock: true,
+      block: dates.map(() => cfg.block ?? 10),
+      physicalRemaining: dates.map(() => cfg.physicalRemaining ?? 0),
+    };
+  }),
 }));
 
 import { buildOrdersBySchedule } from './orders.export.js';
@@ -49,7 +70,7 @@ function flightItem(input: FlightItemInput): Record<string, unknown> {
   };
 }
 
-function passenger(id: string): Record<string, unknown> {
+function passenger(id: string, overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     id,
     fullName: 'ZHANG/SAN',
@@ -66,10 +87,42 @@ function passenger(id: string): Record<string, unknown> {
     passportIssueCountry: null,
     placeOfBirth: null,
     passportExpiry: D('2030-01-01'),
+    ...overrides,
   };
 }
 
-function order(orderNumber: string, items: Array<Record<string, unknown>>): Record<string, unknown> {
+interface HotelItemInput {
+  hotelId: string;
+  hotelName: string;
+  roomTypeName: string;
+  capacity: number;
+  checkIn: string; // YYYY-MM-DD
+}
+
+function hotelItem(input: HotelItemInput): Record<string, unknown> {
+  return {
+    kind: 'HOTEL',
+    flightSchedule: null,
+    hotelRoomType: {
+      hotelId: input.hotelId,
+      name: input.roomTypeName,
+      bedType: null,
+      capacity: input.capacity,
+      hotel: { name: input.hotelName },
+    },
+    visa: null,
+    transfer: null,
+    bundle: null,
+    hotelCheckIn: D(input.checkIn),
+    hotelCheckOut: D(input.checkIn),
+  };
+}
+
+function order(
+  orderNumber: string,
+  items: Array<Record<string, unknown>>,
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
   return {
     orderNumber,
     status: 'PAID',
@@ -82,6 +135,7 @@ function order(orderNumber: string, items: Array<Record<string, unknown>>): Reco
     roomAssignment: null,
     notes: null,
     createdAt: D('2026-06-01'),
+    ...overrides,
   };
 }
 
@@ -172,5 +226,145 @@ describe('buildOrdersBySchedule · 航段排序与去/回程日期', () => {
     expect(cell(header, row, '路线')).toBe('PVG → DPS');
     expect(cell(header, row, '去程日期')).toBe('2026-06-10');
     expect(cell(header, row, '回程日期')).toBe('');
+  });
+});
+
+describe('buildOrdersBySchedule · 房号 / 当日余房（房控核对列，口径对齐分房表导出）', () => {
+  beforeEach(() => {
+    nightlyByHotel.clear();
+  });
+
+  it('两列追加在现有列尾（不动原列序）', async () => {
+    const client = fakeClient([
+      order('ORD-COL-001', [
+        flightItem({
+          flightNumber: 'ZJ8888',
+          originCode: 'PVG',
+          destinationCode: 'DPS',
+          departureTime: D('2026-06-10'),
+        }),
+      ]),
+    ]);
+
+    const buf = await buildOrdersBySchedule('sched-1', client);
+    const { header } = await parseSheet(buf);
+
+    expect(header[header.length - 2]).toBe('房号');
+    expect(header[header.length - 1]).toBe('当日余房');
+    // 原列尾（备注）仍在两新列之前
+    expect(header[header.length - 3]).toBe('备注');
+  });
+
+  it('有分房组：同 roomGroup 同号，半间/拼房组标 (½)；当日余房为数字余量', async () => {
+    // Arrange：4 位乘客，g1 整间（2 人）+ g2 半间（2 人），同酒店同入住日
+    nightlyByHotel.set('h1', { hasBlock: true, block: 10, physicalRemaining: 5 });
+    const client = fakeClient([
+      order(
+        'ORD-RG-001',
+        [hotelItem({ hotelId: 'h1', hotelName: '椰风酒店', roomTypeName: '双床房', capacity: 2, checkIn: '2026-06-10' })],
+        {
+          passengers: [
+            passenger('pa1'),
+            passenger('pa2', { gender: 'F' }),
+            passenger('pb1'),
+            passenger('pb2', { gender: 'F' }),
+          ],
+          roomAssignment: {
+            roomGroups: [
+              { id: 'g1', hotelName: '椰风酒店', roomType: '双床房', passengerIds: ['pa1', 'pa2'] },
+              {
+                id: 'g2',
+                hotelName: '椰风酒店',
+                roomType: '双床房',
+                passengerIds: ['pb1', 'pb2'],
+                roomFraction: 0.5,
+              },
+            ],
+          },
+        },
+      ),
+    ]);
+
+    // Act
+    const buf = await buildOrdersBySchedule('sched-1', client);
+    const { header, dataRows } = await parseSheet(buf);
+
+    // Assert：同组同号（人工分房不受性别打包影响），半间组标 (½)
+    expect(dataRows).toHaveLength(4);
+    expect(dataRows.map((r) => cell(header, r, '房号'))).toEqual([
+      '房1',
+      '房1',
+      '房2(½)',
+      '房2(½)',
+    ]);
+    for (const r of dataRows) expect(cell(header, r, '当日余房')).toBe('5');
+  });
+
+  it('未分房：按性别 + 房型容量打包（异性不拼房），跨订单同酒店同入住日一起编号', async () => {
+    // Arrange：订单 A（男 1 + 女 1）+ 订单 B（男 1），同酒店同入住日，容量 2/间；
+    // 该酒店无包房周期 → 当日余房 "未配"
+    const h2Item = () =>
+      hotelItem({ hotelId: 'h2', hotelName: '海棠居', roomTypeName: '标间', capacity: 2, checkIn: '2026-06-10' });
+    const client = fakeClient([
+      order('ORD-PK-A', [h2Item()], {
+        passengers: [passenger('pm1'), passenger('pf1', { gender: 'F' })],
+      }),
+      order('ORD-PK-B', [h2Item()], { passengers: [passenger('pm2')] }),
+    ]);
+
+    // Act
+    const buf = await buildOrdersBySchedule('sched-1', client);
+    const { header, dataRows } = await parseSheet(buf);
+
+    // Assert：男 pm1/pm2（跨订单）拼 房1，女 pf1 独开 房2
+    expect(dataRows).toHaveLength(3);
+    expect(dataRows.map((r) => cell(header, r, '房号'))).toEqual(['房1', '房2', '房1']);
+    for (const r of dataRows) expect(cell(header, r, '当日余房')).toBe('未配');
+  });
+
+  it('无酒店行（纯机票乘客）：房号留空，当日余房 "—"', async () => {
+    const client = fakeClient([
+      order('ORD-FL-001', [
+        flightItem({
+          flightNumber: 'ZJ8888',
+          originCode: 'PVG',
+          destinationCode: 'DPS',
+          departureTime: D('2026-06-10'),
+        }),
+      ]),
+    ]);
+
+    const buf = await buildOrdersBySchedule('sched-1', client);
+    const { header, dataRows } = await parseSheet(buf);
+
+    expect(dataRows).toHaveLength(1);
+    expect(cell(header, dataRows[0], '房号')).toBe('');
+    expect(cell(header, dataRows[0], '当日余房')).toBe('—');
+  });
+
+  it('分房组人工酒店名与关联酒店不一致：归属不确定，当日余房 "—"（不瞎标）', async () => {
+    // Arrange：h1 配了包房（余 5），但乘客分房组人工填了别家酒店名 → 不能按 h1 的余量标
+    nightlyByHotel.set('h1', { hasBlock: true, block: 10, physicalRemaining: 5 });
+    const client = fakeClient([
+      order(
+        'ORD-MM-001',
+        [hotelItem({ hotelId: 'h1', hotelName: '椰风酒店', roomTypeName: '双床房', capacity: 2, checkIn: '2026-06-10' })],
+        {
+          passengers: [passenger('px1')],
+          roomAssignment: {
+            roomGroups: [{ id: 'g1', hotelName: '手填别家酒店', roomType: '', passengerIds: ['px1'] }],
+          },
+        },
+      ),
+    ]);
+
+    // Act
+    const buf = await buildOrdersBySchedule('sched-1', client);
+    const { header, dataRows } = await parseSheet(buf);
+
+    // Assert：房号仍按分房组分配；余房因归属不确定标 "—"
+    expect(dataRows).toHaveLength(1);
+    expect(cell(header, dataRows[0], '房号')).toBe('房1');
+    expect(cell(header, dataRows[0], '当日余房')).toBe('—');
   });
 });

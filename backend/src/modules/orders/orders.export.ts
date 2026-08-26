@@ -12,7 +12,14 @@ import { OrderStatus } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { toAlpha3 } from './nationality.js';
 import { countIssuedPassengers, getScheduleSeatCapacity } from './ticketing-cap.js';
-import { parseRoomGroups } from './orders.export-room-allocation.js';
+import {
+  assignRoomNumbers,
+  buildDailyRemainingLookup,
+  correlateItem,
+  formatRoomNo,
+  parseRoomGroups,
+  type RoomNumberEntry,
+} from './orders.export-room-allocation.js';
 import { nameWithTitle } from './orders.export-templates.js';
 
 /**
@@ -76,6 +83,15 @@ interface OrderRow {
   // 元信息
   recordedAt: string;
   notes: string;
+  // 房控核对列（追加在列尾，口径对齐分房表导出，见 orders.export-room-allocation.ts）
+  /** 房号：同分房组同号，半间/拼房标 (½)；未分房按性别+容量打包；无占房行留空。*/
+  roomNo: string;
+  /**
+   * 该乘客入住日、其所在酒店当晚的销控余量（三态同分房表 dailyRemaining）：
+   *   数字 = 正常余量（可能为负）；"未配" = 该晚无包房周期；
+   *   "—" = 无法确定归属酒店（分房组酒店名与 FK 不一致）或无占房行。
+   */
+  dailyRemaining: string;
 }
 
 const COLUMNS: Array<{ header: string; key: keyof OrderRow; width: number }> = [
@@ -106,6 +122,9 @@ const COLUMNS: Array<{ header: string; key: keyof OrderRow; width: number }> = [
   { header: '客单金额(人均)', key: 'orderTotal', width: 14 },
   { header: '录入时间', key: 'recordedAt', width: 18 },
   { header: '备注', key: 'notes', width: 24 },
+  // 房控「当天出发全员核对」两列（0825 房控需求）——只在列尾追加，不动前面列序
+  { header: '房号', key: 'roomNo', width: 10 },
+  { header: '当日余房', key: 'dailyRemaining', width: 12 },
 ];
 
 function dec(v: Prisma.Decimal | number | null | undefined): number {
@@ -144,7 +163,15 @@ type OrderForExport = Prisma.OrderGetPayload<{
             flight: { select: { flightNumber: true; originCode: true; destinationCode: true } };
           };
         };
-        hotelRoomType: { select: { name: true; hotel: { select: { name: true } } } };
+        hotelRoomType: {
+          select: {
+            hotelId: true;
+            name: true;
+            bedType: true;
+            capacity: true;
+            hotel: { select: { name: true } };
+          };
+        };
         visa: { select: { visaName: true; visaType: true; country: true } };
         transfer: { select: { name: true } };
         bundle: { select: { name: true } };
@@ -153,8 +180,100 @@ type OrderForExport = Prisma.OrderGetPayload<{
   };
 }>;
 
+/** 占房 item（hotelCheckIn + hotelRoomType 均非空；口径同分房表 isAllocatable，不限 kind——
+ * 含已盖章酒店明细的 BUNDLE 行，纯机票乘客不产生占房 item）。*/
+type OccupancyItem = OrderForExport['items'][number] & {
+  hotelCheckIn: Date;
+  hotelRoomType: NonNullable<OrderForExport['items'][number]['hotelRoomType']>;
+};
+
+function isOccupancyItem(it: OrderForExport['items'][number]): it is OccupancyItem {
+  return it.hotelCheckIn != null && it.hotelRoomType != null;
+}
+
+/** 乘客行「房号 / 当日余房」两列取值；无占房行的乘客不入 map（回落 空 / "—"）。*/
+interface RoomColumnValues {
+  roomNo: string;
+  dailyRemaining: string;
+}
+
+const NO_HOTEL_ROOM_COLUMNS: RoomColumnValues = { roomNo: '', dailyRemaining: '—' };
+
+/**
+ * 计算每位乘客的「房号 / 当日余房」（房控「当天出发全员核对」用，口径对齐分房表导出）：
+ *   - 乘客 ↔ 占房 item 关联复用 correlateItem（分房组酒店/房型匹配，兜底第一条占房行）；
+ *   - 房号编号维度 = 酒店 × 入住日（同分房表 per-sheet per-hotel），本导出内自洽：
+ *     已分房同 roomGroup 同号（半间标 (½)），未分房按性别+房型容量打包（assignRoomNumbers，
+ *     跨订单同酒店同入住日一起打包，与分房表同口径）；
+ *   - 当日余房三态照搬分房表：数字 / "未配"（该晚无包房周期）/ "—"（分房组人工填的酒店名
+ *     与 FK 关联酒店不一致，归属不确定，绝不瞎标）。
+ * 返回 passengerId → 两列取值（乘客只属于一张订单，passengerId 全局唯一）。
+ */
+function computeRoomColumns(
+  orders: readonly OrderForExport[],
+  remainingLookup: Map<string, string>,
+): Map<string, RoomColumnValues> {
+  interface Entry extends RoomNumberEntry {
+    passengerId: string;
+    dailyRemaining: string;
+  }
+  // 按入住日聚（编号维度：酒店 × 入住日；assignRoomNumbers 内部按酒店维护状态）
+  const byDate = new Map<string, Entry[]>();
+
+  for (const order of orders) {
+    const occupancy = order.items.filter(isOccupancyItem);
+    if (occupancy.length === 0) continue;
+    const roomGroups = parseRoomGroups(order.roomAssignment);
+
+    for (const p of order.passengers) {
+      const group = roomGroups.find((g) => g.passengerIds.includes(p.id));
+      const it = correlateItem(group, occupancy);
+      const checkInStr = fmtDate(it.hotelCheckIn);
+      const fkHotelName = it.hotelRoomType.hotel.name;
+      const hotelName = group?.hotelName || fkHotelName;
+      const capacity =
+        it.hotelRoomType.capacity && it.hotelRoomType.capacity > 0 ? it.hotelRoomType.capacity : 2;
+
+      // 三态口径同分房表：人工分房酒店名与 FK 关联酒店不一致 → 归属不确定，"—"
+      const hotelNameTrusted = !group?.hotelName || group.hotelName === fkHotelName;
+      const dailyRemaining =
+        hotelNameTrusted && it.hotelRoomType.hotelId
+          ? remainingLookup.get(`${it.hotelRoomType.hotelId}|${checkInStr}`) ?? '—'
+          : '—';
+
+      const list = byDate.get(checkInStr) ?? [];
+      list.push({
+        passengerId: p.id,
+        hotelName,
+        groupId: group?.id ?? null,
+        isHalf: !!group && group.roomFraction === 0.5,
+        capacity,
+        gender: p.gender ?? null,
+        roomOrder: 0,
+        dailyRemaining,
+      });
+      byDate.set(checkInStr, list);
+    }
+  }
+
+  const result = new Map<string, RoomColumnValues>();
+  for (const entries of byDate.values()) {
+    assignRoomNumbers(entries);
+    for (const e of entries) {
+      result.set(e.passengerId, {
+        roomNo: formatRoomNo(e.roomOrder, e.isHalf),
+        dailyRemaining: e.dailyRemaining,
+      });
+    }
+  }
+  return result;
+}
+
 /** 把一张订单展开成 N 行（每位乘客一行）— 不含成本/毛利。*/
-function orderToRows(order: OrderForExport): OrderRow[] {
+function orderToRows(
+  order: OrderForExport,
+  roomColumns: Map<string, RoomColumnValues>,
+): OrderRow[] {
   // ── 航班信息（可能去程+回程多段）──
   // 按起飞时间升序排序后再拼路线/航班号串：订单行是录入顺序，
   // 回程先录时不排序会导致路线串倒序（如 "回程 → 去程"）。
@@ -284,6 +403,7 @@ function orderToRows(order: OrderForExport): OrderRow[] {
       orderTotal,
       recordedAt,
       notes: order.notes ?? '',
+      ...(roomColumns.get(p.id) ?? NO_HOTEL_ROOM_COLUMNS),
     };
   });
 }
@@ -328,7 +448,15 @@ export async function buildOrdersBySchedule(
               flight: { select: { flightNumber: true, originCode: true, destinationCode: true } },
             },
           },
-          hotelRoomType: { select: { name: true, hotel: { select: { name: true } } } },
+          hotelRoomType: {
+            select: {
+              hotelId: true,
+              name: true,
+              bedType: true,
+              capacity: true,
+              hotel: { select: { name: true } },
+            },
+          },
           visa: { select: { visaName: true, visaType: true, country: true } },
           transfer: { select: { name: true } },
           bundle: { select: { name: true } },
@@ -337,10 +465,16 @@ export async function buildOrdersBySchedule(
     },
   })) as OrderForExport[];
 
+  // 房号 / 当日余房两列（口径对齐分房表导出）：先按全部占房行批量取各酒店当晚余量，
+  // 再跨订单统一分配房号（同酒店同入住日一起编号/打包）。
+  const occupancyItems = orders.flatMap((o) => o.items.filter(isOccupancyItem));
+  const remainingLookup = await buildDailyRemainingLookup(occupancyItems, client);
+  const roomColumns = computeRoomColumns(orders, remainingLookup);
+
   const rows: OrderRow[] = [];
   for (const o of orders) {
     if (o.passengers.length === 0) continue;
-    rows.push(...orderToRows(o));
+    rows.push(...orderToRows(o, roomColumns));
   }
 
   // 本班实际乘客数 = 所有 SEAT_HOLDING 订单的乘客行数（即已展开的 rows 数量）

@@ -220,8 +220,11 @@ export interface RoomAllocationSheet {
   rows: RoomAllocationRow[];
 }
 
-/** 单条乘客行的中间形态（带分房/容量信息，供分配房间号后再排序编号）。*/
-interface RoomEntry {
+/**
+ * assignRoomNumbers 所需的最小形状（导出供整班机订单导出复用同一套房号分配口径，
+ * 见 orders.export.ts 的「房号」列）。
+ */
+export interface RoomNumberEntry {
   hotelName: string;
   /** 人工分房组 id；未分房为 null（同 id 同房间）。*/
   groupId: string | null;
@@ -237,11 +240,15 @@ interface RoomEntry {
   gender: string | null;
   /** 分配后的房间序号（per hotel；排序用）。*/
   roomOrder: number;
+}
+
+/** 单条乘客行的中间形态（带分房/容量信息，供分配房间号后再排序编号）。*/
+interface RoomEntry extends RoomNumberEntry {
   row: Omit<RoomAllocationRow, 'seq' | 'roomNo'>;
 }
 
 /** 把整数房号转为展示串："房N"，半间组加 (½)。*/
-function formatRoomNo(order: number, isHalf: boolean): string {
+export function formatRoomNo(order: number, isHalf: boolean): string {
   return isHalf ? `房${order}(½)` : `房${order}`;
 }
 
@@ -270,6 +277,13 @@ function isAllocatable(it: RoomItemForExport): it is AllocatableItem {
 }
 
 /**
+ * correlateItem 所需的最小形状（导出供整班机订单导出复用同一套乘客 ↔ 占房 item 关联口径）。
+ */
+export interface CorrelatableRoomItem {
+  hotelRoomType: { name: string; bedType: string | null; hotel: { name: string } };
+}
+
+/**
  * 把一位乘客 correlate 到「他实际占用的那条占房 item」——同订单可能有多条占房 item
  * （如两种房型 / 跨酒店），不能对每条 item 都遍历全部乘客（会产生重复行 + 张冠李戴，
  * 见本文件顶部 JSDoc 的回归说明）。
@@ -280,10 +294,10 @@ function isAllocatable(it: RoomItemForExport): it is AllocatableItem {
  *     无法可靠 correlate，兜底用订单第一条占房 item（保证每位乘客恰好一行，不重复也不丢单；
  *     「归属哪家酒店」在此兜底下是尽力而为，dailyRemaining 会用「—」标出这种不确定性）。
  */
-function correlateItem(
+export function correlateItem<T extends CorrelatableRoomItem>(
   group: RoomGroup | undefined,
-  orderItems: readonly AllocatableItem[],
-): AllocatableItem {
+  orderItems: readonly T[],
+): T {
   if (orderItems.length === 1) return orderItems[0];
   if (group) {
     const exact = orderItems.find(
@@ -444,8 +458,9 @@ function packGenderKeyOf(gender: string | null): PackGenderKey {
  *     性别未知/X 保守视同"潜在异性"，各自单间不与任何人拼房；异性不能拼同一物理房间，
  *     口径与销控物理房间一致（见 hotel-control.service.ts computePhysicalUsed 的 JSDoc）。
  *     未分房房号续在已分房之后。
+ * 导出供整班机订单导出（orders.export.ts）复用——同一套打包口径，不各自实现。
  */
-function assignRoomNumbers(entries: RoomEntry[]): void {
+export function assignRoomNumbers(entries: RoomNumberEntry[]): void {
   // 每个酒店各自的分配状态；未分房乘客按性别分组各自维护「当前开放房间」
   const perHotel = new Map<
     string,
@@ -492,14 +507,22 @@ function assignRoomNumbers(entries: RoomEntry[]): void {
   }
 }
 
+/** buildDailyRemainingLookup 入参的最小形状（RoomItemForExport 与整班机导出占房行都满足）。*/
+export interface RemainingLookupItem {
+  hotelRoomType: { hotelId: string } | null;
+  hotelCheckIn: Date | null;
+}
+
 /**
  * 「当日余房」列取数：按 (hotelId, 入住日) 去重后批量查——同一酒店的多个入住日合并成一次
  * getHotelNightlyRemaining 调用（内部一次 findMany 拉全部周期/占房行），而不是每个 (hotel,date)
  * 各查一次，减少导出跨度内（≤14 天，ROOM_ALLOCATION_MAX_DAYS）的查库次数。
  * 返回 `${hotelId}|${YYYY-MM-DD}` → 展示串（数字 / "未配" block=0 未覆盖 / 缺省未收录）。
+ * 入参形状放宽为最小结构（RemainingLookupItem）——整班机订单导出（orders.export.ts）的
+ * 占房行 include 形状不同，但同样满足此结构，直接复用本函数（口径唯一入口，不各自查询）。
  */
 export async function buildDailyRemainingLookup(
-  items: RoomItemForExport[],
+  items: readonly RemainingLookupItem[],
   client: PrismaClient,
 ): Promise<Map<string, string>> {
   const datesByHotel = new Map<string, Set<string>>();
