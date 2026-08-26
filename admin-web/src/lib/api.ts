@@ -3705,13 +3705,6 @@ export const api = {
     },
   ) => apiFetch<QuoteOrderResult>('/orders/quote', { method: 'POST', token, body }),
 
-  // 设置开票状态（ADMIN/STAFF）— 旧的订单级单值，兼容保留
-  setInvoiceStatus: (token: string, id: string, invoiceStatus: InvoiceStatus) =>
-    apiFetch<{ id: string; orderNumber: string; invoiceStatus: InvoiceStatus }>(
-      `/orders/${id}/invoice-status`,
-      { method: 'PATCH', token, body: { invoiceStatus } },
-    ),
-
   // 设置六态开票的三个布尔位（ADMIN/STAFF）：去程/回程/系统 各自独立。
   // 翻某航段为已开时后端校验对应班次开票上限（超限 422）。
   setInvoiceFlags: (
