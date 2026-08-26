@@ -268,6 +268,65 @@ describe('upsertDiscountRules window validation', () => {
     ).rejects.toThrow('不能绑定代理');
   });
 
+  it('身份列守卫：票务岗改晚数保存 → 拒绝，文案提示改用新增规则', async () => {
+    const findMany = vi.fn().mockResolvedValue([baseRule]);
+    const client = clientWithFindMany(findMany);
+    await expect(
+      upsertDiscountRules([entry({ id: 'rule-1', nights: 4 })], 'user-1', client),
+    ).rejects.toThrow('晚数从「3晚」改为「4晚」——不同晚数请用「新增规则」另建一条');
+  });
+
+  it('身份列守卫：改档次 → 拒绝，文案提示改用新增规则', async () => {
+    const findMany = vi.fn().mockResolvedValue([baseRule]);
+    const client = clientWithFindMany(findMany);
+    await expect(
+      upsertDiscountRules(
+        [entry({ id: 'rule-1', tier: SettlementTier.CITY_4STAR })],
+        'user-1',
+        client,
+      ),
+    ).rejects.toThrow('档次从「CITY_3STAR」改为「CITY_4STAR」——不同档次请用「新增规则」另建一条');
+  });
+
+  it('身份列守卫：改归属代理 → 拒绝，文案提示改用新增规则', async () => {
+    const findMany = vi.fn().mockResolvedValue([baseRule]);
+    const client = clientWithFindMany(findMany);
+    await expect(
+      upsertDiscountRules([entry({ id: 'rule-1', agentId: 'agent-2' })], 'user-1', client),
+    ).rejects.toThrow('归属代理从「agent-1」改为「agent-2」——不同归属请用「新增规则」另建一条');
+  });
+
+  it('身份列守卫：运营只改金额或结束日期 → 放行，正常走 update', async () => {
+    const findMany = vi.fn().mockResolvedValue([baseRule]);
+    const update = vi.fn().mockResolvedValue({ ...baseRule, discountPerPersonCny: 300 });
+    const client = {
+      settlementDiscountRule: { findMany, update, create: vi.fn() },
+      $transaction: vi.fn((operations: Promise<unknown>[]) => Promise.all(operations)),
+    } as unknown as PrismaClient;
+
+    await expect(
+      upsertDiscountRules(
+        [entry({ id: 'rule-1', discountPerPersonCny: 300, endDate: '2026-09-15' })],
+        'user-1',
+        client,
+      ),
+    ).resolves.toHaveLength(1);
+    expect(update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'rule-1' },
+        data: expect.objectContaining({ discountPerPersonCny: 300 }),
+      }),
+    );
+  });
+
+  it('身份列守卫：id 在库里不存在 → 报可读错误，提示刷新页面', async () => {
+    const findMany = vi.fn().mockResolvedValue([]);
+    const client = clientWithFindMany(findMany);
+    await expect(
+      upsertDiscountRules([entry({ id: 'gone-rule' })], 'user-1', client),
+    ).rejects.toThrow('对应的立减规则（id: gone-rule）已不存在，可能已被他人删除——请刷新页面后重新编辑再保存');
+  });
+
   it('并发删除已不存在的规则 → 返回 null，由路由走现有 NotFound 路径', async () => {
     const client = {
       settlementDiscountRule: {

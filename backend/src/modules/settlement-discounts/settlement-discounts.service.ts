@@ -99,6 +99,67 @@ function ruleLabel(rule: { id?: string; kind: SettlementDiscountKind; agentId?: 
   return `${rule.id ? `规则 ${rule.id}` : '本批规则'}（${rule.kind}${rule.agentId ? `/${rule.agentId}` : ''}，${start} 至 ${end}）`;
 }
 
+const KIND_LABELS: Record<SettlementDiscountKind, string> = {
+  [SettlementDiscountKind.AGENT]: '指定代理立减',
+  [SettlementDiscountKind.AGENT_DEFAULT]: '代理兜底立减',
+  [SettlementDiscountKind.RETAIL]: '散客立减',
+};
+
+/**
+ * 身份列守卫：批量保存里带 id 的行，禁止借「保存」把 kind/agentId/tier/nights 这些
+ * 唯一性身份列悄悄改掉——前端行内改晚数/档次/归属后点保存，若不拦，会把库里那条
+ * 规则原地覆盖成另一条规则（票务岗已踩中：改晚数=覆盖旧晚数规则，代理规则被顶掉）。
+ * 金额、日期窗口、isActive、note 允许正常更新，不受此守卫影响。
+ * 一次 findMany 批量取现有行做比对，避免逐行查询（N+1）。
+ */
+async function assertIdentityColumnsUnchanged(
+  rules: DiscountRuleEntry[],
+  client: PrismaLike,
+): Promise<void> {
+  const idRows = rules
+    .map((rule, index) => ({ rule, rowNumber: index + 1 }))
+    .filter((entry): entry is { rule: DiscountRuleEntry & { id: string }; rowNumber: number } =>
+      Boolean(entry.rule.id),
+    );
+  if (idRows.length === 0) return;
+
+  const ids = [...new Set(idRows.map((entry) => entry.rule.id))];
+  const existingRows = await client.settlementDiscountRule.findMany({
+    where: { id: { in: ids } },
+  });
+  const existingById = new Map((existingRows as RuleRow[]).map((row) => [row.id, row]));
+
+  for (const { rule, rowNumber } of idRows) {
+    const existing = existingById.get(rule.id);
+    if (!existing) {
+      throw new BadRequestError(
+        `第 ${rowNumber} 行对应的立减规则（id: ${rule.id}）已不存在，可能已被他人删除——请刷新页面后重新编辑再保存`,
+      );
+    }
+    const incomingAgentId = rule.agentId ?? null;
+    if (existing.kind !== rule.kind) {
+      throw new BadRequestError(
+        `第 ${rowNumber} 行试图把已有规则的类型从「${KIND_LABELS[existing.kind]}」改为「${KIND_LABELS[rule.kind]}」——不同类型请用「新增规则」另建一条，原规则可停用或删除`,
+      );
+    }
+    if (existing.agentId !== incomingAgentId) {
+      throw new BadRequestError(
+        `第 ${rowNumber} 行试图把已有规则的归属代理从「${existing.agentId ?? '无'}」改为「${incomingAgentId ?? '无'}」——不同归属请用「新增规则」另建一条，原规则可停用或删除`,
+      );
+    }
+    if (existing.tier !== rule.tier) {
+      throw new BadRequestError(
+        `第 ${rowNumber} 行试图把已有规则的档次从「${existing.tier}」改为「${rule.tier}」——不同档次请用「新增规则」另建一条，原规则可停用或删除`,
+      );
+    }
+    if (existing.nights !== rule.nights) {
+      throw new BadRequestError(
+        `第 ${rowNumber} 行试图把已有规则的晚数从「${existing.nights}晚」改为「${rule.nights}晚」——不同晚数请用「新增规则」另建一条，原规则可停用或删除`,
+      );
+    }
+  }
+}
+
 async function assertNoWindowOverlap(
   rules: DiscountRuleEntry[],
   client: PrismaLike,
@@ -195,6 +256,7 @@ export async function upsertDiscountRules(
     throw new BadRequestError('每次至少保存 1 条、最多保存 200 条立减规则');
   }
   rules.forEach(validateEntry);
+  await assertIdentityColumnsUnchanged(rules, client);
   await assertNoWindowOverlap(rules, client);
 
   const operations = rules.map((r) => {
@@ -223,6 +285,10 @@ export async function upsertDiscountRules(
       throw new BadRequestError(
         '启用立减规则的出发日期窗口重叠：并发保存检测到已有重叠规则，请拆分日期范围后再保存',
       );
+    }
+    // 身份列守卫查过之后、事务提交之前，规则被并发删除 → Prisma P2025。
+    if (isPrismaCode(error, 'P2025')) {
+      throw new BadRequestError('有规则在保存过程中被他人删除——请刷新页面后重新编辑再保存');
     }
     throw error;
   }
