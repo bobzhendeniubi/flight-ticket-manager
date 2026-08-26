@@ -351,6 +351,15 @@ function BalanceBadge({ balance, settlementMode }: { balance: number; settlement
   );
 }
 
+// 列表「下单时间」列：单行紧凑显示 MM/DD HH:mm（本地时区），比 toLocaleString 默认输出更窄，
+// 避免把「开票」「下单时间」两列挤出常见屏宽的可视区。
+function formatOrderListTime(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '—';
+  const p = (n: number) => String(n).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}/${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
 // 列表「开票」列：六态紧凑三点式显示（去 / 回 / 系）。只读——切换在订单详情里。
 // 回程点仅在订单含 ≥2 航段时显示；无机票的订单只显示系统点。
 function InvoiceDots({ order }: { order: OrderSummary }) {
@@ -2971,11 +2980,13 @@ export function OrdersPage() {
                 <th className="text-center">尾款</th>
                 <th className="text-center">状态</th>
                 <th className="text-center">签证</th>
-                <th className="text-center">开票</th>
-                <th className="text-left">下单时间</th>
+                <th className="whitespace-nowrap text-center">开票</th>
+                <th className="whitespace-nowrap text-left">下单时间</th>
                 {/* 「操作」常驻右侧：列多时不用横滑到底才能点详情。
-                    背景必须不透明（表头默认 bg-slate-50/70 半透，横滑时内容会透底）→ 用 ! 覆盖。 */}
-                <th className="sticky right-0 z-10 whitespace-nowrap !bg-slate-50 text-center shadow-[-8px_0_10px_-8px_rgba(15,23,42,0.18)]">
+                    背景必须不透明（表头默认 bg-slate-50/70 半透，横滑时内容会透底）→ 用 ! 覆盖。
+                    列本身收窄（见对应 tbody 单元格里的下拉/按钮收紧），避免撑宽整张表把「开票」
+                    「下单时间」顶进横向滚动区。 */}
+                <th className="sticky right-0 z-10 whitespace-nowrap !bg-slate-50 !px-2 text-center shadow-[-8px_0_10px_-8px_rgba(15,23,42,0.18)]">
                   操作
                 </th>
               </tr>
@@ -3005,10 +3016,14 @@ export function OrdersPage() {
                     </button>
                   </td>
                   <td>
-                    <div className="font-medium text-ink">{view.customerName}</div>
+                    {/* 客户名 / 代理名都可能很长（尤其代理机构全称），加 max-width + truncate
+                        防止撑宽整表；悬浮看全文。 */}
+                    <div className="max-w-[11rem] truncate font-medium text-ink" title={view.customerName}>
+                      {view.customerName}
+                    </div>
                     <div className="text-xs text-ink-muted">{order.contactPhone}</div>
                     {view.agentName && (
-                      <div className="badge-info mt-0.5">
+                      <div className="badge-info mt-0.5 max-w-[11rem] truncate" title={view.agentName}>
                         {view.agentName}
                       </div>
                     )}
@@ -3128,21 +3143,21 @@ export function OrdersPage() {
                   <td className="text-center">
                     <InvoiceDots order={order} />
                   </td>
-                  <td className="text-xs text-ink-muted">
-                    {new Date(order.createdAt).toLocaleString('zh-CN', {
-                      month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
-                    })}
+                  <td className="whitespace-nowrap text-[11px] text-ink-muted">
+                    {formatOrderListTime(order.createdAt)}
                   </td>
                   {/* 常驻右侧的操作列：背景跟随行态（选中=brand-50、否则白，hover 一律 slate-50
                       与整行 hover 对齐），不能透明——否则横滑时下面的单元格会从背后透出来。 */}
                   <td
-                    className={`sticky right-0 z-10 whitespace-nowrap shadow-[-8px_0_10px_-8px_rgba(15,23,42,0.18)] group-hover:bg-slate-50 ${
+                    className={`sticky right-0 z-10 whitespace-nowrap !px-2 shadow-[-8px_0_10px_-8px_rgba(15,23,42,0.18)] group-hover:bg-slate-50 ${
                       selectedIds.has(order.id) ? 'bg-brand-50' : 'bg-white'
                     }`}
                   >
-                    <div className="flex items-center justify-end gap-2">
+                    <div className="flex items-center justify-end gap-1.5">
+                      {/* 下拉压紧到 w-20（原为自适应宽度，"改状态…" 撑得较宽是撑宽整表、
+                          挤占「开票」「下单时间」可视区的主因之一）；选项文字仍完整，只是触发器变窄。 */}
                       <select
-                        className="rounded-md border border-slate-200 bg-white px-2 py-1 text-xs text-ink-soft disabled:opacity-50"
+                        className="w-20 rounded-md border border-slate-200 bg-white px-1 py-1 text-[11px] text-ink-soft disabled:opacity-50"
                         value=""
                         onChange={(e) => {
                           const next = e.target.value as OrderStatus;
@@ -3183,7 +3198,7 @@ export function OrdersPage() {
                             <option key={s} value={s}>{orderStatusLabel(s)}</option>
                           ))}
                       </select>
-                      <button className="whitespace-nowrap text-sm font-medium text-brand hover:text-brand-dark" onClick={() => setSelected(order)}>
+                      <button className="whitespace-nowrap text-xs font-medium text-brand hover:text-brand-dark" onClick={() => setSelected(order)}>
                         详情
                       </button>
                       {canManageDeleted && (
