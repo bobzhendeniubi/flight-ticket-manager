@@ -926,8 +926,8 @@ export const batchCreateOrdersBodySchema = z
   });
 export type BatchCreateOrdersBody = z.infer<typeof batchCreateOrdersBodySchema>;
 
-// ── 售后改单：改期（reschedule）─────────────────────────────────────────────
-// PATCH /orders/:id/reschedule（ADMIN/STAFF）：把某条 FLIGHT 行就地改到新班次/新舱位 + 可选改期费。
+// ── 售后改单：改期（reschedule）/ 换人（passenger swap）的费用口径 ──────────────
+// PATCH /orders/:id/reschedule（ADMIN/STAFF）：把某条 FLIGHT 行就地改到新班次 + 可选改期差价。
 const postSaleFeeSchema = z
   .number()
   .int('费用必须为整数（CNY）')
@@ -935,12 +935,24 @@ const postSaleFeeSchema = z
   .max(POST_SALE_FEE_CAP_CNY, `费用超出上限（${POST_SALE_FEE_CAP_CNY}）`)
   .optional();
 
+// 改期差价：整数 CNY，**可正可负**（改到贵班次补差 / 改到便宜班次退差），±上限同售后费。
+// 与换人费（postSaleFeeSchema，只增不减）分开：换人是一次性服务收费，改期是两张票的价差，
+// 天然双向。口径与换酒店差价 / 酒店改期差价一致，只是这里仍接受 0 与缺省
+//（= 只搬班次不动钱，改期最常见的用法，不该逼运营在留空与传 0 之间二选一）。
+const rescheduleFeeSchema = z
+  .number()
+  .int('差价必须为整数（CNY）')
+  .refine((v) => Math.abs(v) <= POST_SALE_FEE_CAP_CNY, {
+    message: `差价超出上限（±${POST_SALE_FEE_CAP_CNY}）`,
+  })
+  .optional();
+
 export const rescheduleOrderBodySchema = z.object({
   orderItemId: z.string().min(1, 'orderItemId 必填'),
   newScheduleId: z.string().min(1, 'newScheduleId 必填'),
   newCabin: z.nativeEnum(CabinClass).optional(), // 缺省沿用原舱位
-  feeCny: postSaleFeeSchema, // 改期费（CNY，整数；0/缺省=不收）
-  feeLabel: z.string().max(120).optional(), // 自定义费用名（缺省"改期费"）
+  feeCny: rescheduleFeeSchema, // 改期差价（CNY，整数，可正可负；0/缺省=不调整价格）
+  feeLabel: z.string().max(120).optional(), // 自定义费用名（缺省"改期差价"）
   note: z.string().max(500).optional(),
 });
 export type RescheduleOrderBody = z.infer<typeof rescheduleOrderBodySchema>;

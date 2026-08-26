@@ -9,7 +9,7 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { localDateISO } from '../../lib/flight-time.js';
 import { z } from 'zod';
-import { InvoiceStatus, Prisma, UserRole, type Passenger } from '@prisma/client';
+import { Prisma, UserRole, type Passenger } from '@prisma/client';
 import { buildStayNightDates, OrderService, resolveOrderAgentId, type OrderRequester } from './orders.service.js';
 import { assertHotelPhysicalFitWithinTx } from '../hotel-control/hotel-control.service.js';
 import {
@@ -1305,26 +1305,10 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     return { ok: true };
   });
 
-  // ── 开票状态（ADMIN/STAFF）──
-  // PATCH /orders/:id/invoice-status
-  app.patch('/:id/invoice-status', { preHandler: [app.authenticate] }, async (req, reply) => {
-    const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
-      return reply.status(403).send({ error: '仅运营/管理员可修改开票状态' });
-    }
-    const { id } = req.params as { id: string };
-    const body = z.object({ invoiceStatus: z.nativeEnum(InvoiceStatus) }).parse(req.body);
-    const result = await service.setInvoiceStatus(id, body.invoiceStatus);
-    void writeAudit({
-      actor: actorFromRequest(req),
-      action: 'UPDATE_INVOICE_STATUS',
-      targetType: 'ORDER',
-      targetId: id,
-      targetLabel: result.orderNumber,
-      after: { invoiceStatus: body.invoiceStatus },
-    });
-    return result;
-  });
+  // 旧端点 PATCH /orders/:id/invoice-status 已删除（0716 H11b）：订单级开票状态是六态开票改造
+  // 前的遗留，与现口径是两本账——它不走 assertOrderAllowsInvoicing（取消族/回收站单照样能标），
+  // 写进的 Order.invoiceStatus 也已无人读（开票额度、导出、财务口径全看下面的三个布尔位）。
+  // 开票的唯一写入口就是 PATCH /orders/:id/invoice-flags。
 
   // ── 六态开票：去程/回程/系统 三个布尔位（ADMIN/STAFF）──
   // PATCH /orders/:id/invoice-flags  body: { outboundInvoiced?, returnInvoiced?, systemInvoiced? }

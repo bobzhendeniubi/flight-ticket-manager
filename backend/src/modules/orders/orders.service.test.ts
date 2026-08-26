@@ -40,6 +40,8 @@ const {
       findFirst: vi.fn(),
       update: vi.fn(),
       findUniqueOrThrow: vi.fn(),
+      // updateMany：改期换班次时清本单乘客的 pnr / eticketNumber（旧票号随改期作废）。
+      updateMany: vi.fn(),
     },
     // swapPassenger 换人重复证件号校验：查本订单 FLIGHT 行的 flightScheduleId（P1-8）。
     orderItem: {
@@ -182,6 +184,7 @@ import type { OrderItemInput } from './orders.schemas.js';
 import {
   batchCreateOrdersBodySchema,
   createOrderBodySchema,
+  rescheduleOrderBodySchema,
   swapItemHotelBodySchema,
   swapPassengerBodySchema,
 } from './orders.schemas.js';
@@ -3628,6 +3631,192 @@ describe('OrderService.rescheduleOrderItem · 占座状态守卫', () => {
     );
     expect(orderState.adjustmentCny).toBe(100);
     expect(orderState.adjustments.filter((entry) => entry.type === 'RESCHEDULE_DISCOUNT_REVOKE')).toHaveLength(1);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 改期的票务语义：换班次 = 原票作废（清票号 + 翻回该航段开票位）+ 差价可负
+// ══════════════════════════════════════════════════════════════════════════
+describe('OrderService.rescheduleOrderItem · 换班次即作废原票', () => {
+  const OUT_ISO = '2026-09-01T01:00:00.000Z';
+  const RET_ISO = '2026-09-08T01:00:00.000Z';
+
+  /** 一张往返单：outbound-item（去程）+ return-item（回程）。 */
+  function mountRoundTrip(targetItemId: 'outbound-item' | 'return-item', opts: { adjustmentCny?: number } = {}) {
+    const legs = [
+      {
+        id: 'outbound-item',
+        orderId: 'ord1',
+        kind: 'FLIGHT',
+        quantity: 1,
+        bundleId: null,
+        flightScheduleId: 'schedOut',
+        flightCabin: 'ECONOMY',
+        metadata: {},
+        flightSchedule: { departureTime: new Date(OUT_ISO) },
+      },
+      {
+        id: 'return-item',
+        orderId: 'ord1',
+        kind: 'FLIGHT',
+        quantity: 1,
+        bundleId: null,
+        flightScheduleId: 'schedRet',
+        flightCabin: 'ECONOMY',
+        metadata: {},
+        flightSchedule: { departureTime: new Date(RET_ISO) },
+      },
+    ];
+    mockPrisma.order.findUnique.mockReset().mockResolvedValue({
+      id: 'ord1',
+      status: 'PAID',
+      deletedAt: null,
+      adjustmentCny: opts.adjustmentCny ?? 0,
+      adjustments: [],
+    });
+    mockPrisma.orderItem.findUnique.mockReset().mockResolvedValue(
+      legs.find((l) => l.id === targetItemId),
+    );
+    // 改期后重查航段：被改那条已写成新班次（服务内部会把它换回旧班次再定位去/回程）
+    mockPrisma.orderItem.findMany.mockReset().mockImplementation(
+      async (args: { where?: { kind?: string } }) =>
+        args.where?.kind === 'DISCOUNT'
+          ? []
+          : legs.map((l) =>
+              l.id === targetItemId
+                ? {
+                    id: l.id,
+                    flightScheduleId: 'schedNew',
+                    flightSchedule: { departureTime: new Date('2026-12-31T00:00:00.000Z') },
+                  }
+                : { id: l.id, flightScheduleId: l.flightScheduleId, flightSchedule: l.flightSchedule },
+            ),
+    );
+    mockPrisma.passenger.updateMany.mockReset().mockResolvedValue({ count: 2 });
+    mockPrisma.flightSeatClass.findFirst.mockReset().mockResolvedValue({ id: 'seatNew' });
+    mockPrisma.seatLock.aggregate.mockReset().mockResolvedValue({ _sum: { qty: 0 } });
+    mockPrisma.$queryRaw.mockReset().mockResolvedValue([{ id: 'ord1' }]);
+    mockPrisma.$executeRaw.mockReset().mockResolvedValue(1);
+    mockPrisma.orderItem.update.mockReset().mockResolvedValue({});
+    mockPrisma.order.update.mockReset().mockResolvedValue({});
+    mockPrisma.flightSchedule.findUnique.mockReset().mockResolvedValue({ departureTime: new Date(OUT_ISO) });
+    mockPrisma.order.findUniqueOrThrow.mockReset().mockResolvedValue(fakeFullOrder());
+  }
+
+  it('改去程 → 清全单票号，并只把去程开票位翻回未开', async () => {
+    const service = new OrderService();
+    mountRoundTrip('outbound-item');
+
+    await service.rescheduleOrderItem(
+      'ord1',
+      { orderItemId: 'outbound-item', newScheduleId: 'schedNew' },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    expect(mockPrisma.passenger.updateMany).toHaveBeenCalledWith({
+      where: { orderId: 'ord1' },
+      data: { pnr: null, eticketNumber: null },
+    });
+    expect(mockPrisma.order.update).toHaveBeenCalledWith({
+      where: { id: 'ord1' },
+      data: { outboundInvoiced: false },
+    });
+  });
+
+  it('改回程 → 只把回程开票位翻回未开（不误伤去程）', async () => {
+    const service = new OrderService();
+    mountRoundTrip('return-item');
+
+    await service.rescheduleOrderItem(
+      'ord1',
+      { orderItemId: 'return-item', newScheduleId: 'schedNew' },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    expect(mockPrisma.order.update).toHaveBeenCalledWith({
+      where: { id: 'ord1' },
+      data: { returnInvoiced: false },
+    });
+    expect(mockPrisma.order.update).not.toHaveBeenCalledWith({
+      where: { id: 'ord1' },
+      data: { outboundInvoiced: false },
+    });
+  });
+
+  it('同班次（只收差价、不换航段）→ 票号与开票位一律不动', async () => {
+    const service = new OrderService();
+    mountRoundTrip('outbound-item');
+
+    await service.rescheduleOrderItem(
+      'ord1',
+      { orderItemId: 'outbound-item', newScheduleId: 'schedOut', feeCny: 100 },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    expect(mockPrisma.passenger.updateMany).not.toHaveBeenCalled();
+    expect(mockPrisma.order.update).not.toHaveBeenCalledWith(
+      expect.objectContaining({ data: { outboundInvoiced: false } }),
+    );
+  });
+
+  it('负差价（改到便宜班次要退差）→ adjustmentCny 下调并留一条「改期差价」流水', async () => {
+    const service = new OrderService();
+    mountRoundTrip('outbound-item', { adjustmentCny: 500 });
+
+    await service.rescheduleOrderItem(
+      'ord1',
+      { orderItemId: 'outbound-item', newScheduleId: 'schedNew', feeCny: -300 },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    const moneyWrite = mockPrisma.order.update.mock.calls
+      .map((call) => call[0] as { data: Record<string, unknown> })
+      .find((arg) => arg.data.adjustmentCny !== undefined);
+    expect(moneyWrite?.data.adjustmentCny).toBe(200); // 500 − 300
+    expect(moneyWrite?.data.adjustments).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: 'RESCHEDULE_FEE', label: '改期差价', amountCny: -300 }),
+      ]),
+    );
+  });
+
+  it('CHANGE_REQUESTED 下只收差价不换班次 → 不推 CHANGED（没航变就不是已改期），也不报错', async () => {
+    // 回归：CHANGED 派生闸要求本单有 flightChanged 标记，而同班次调用根本不落标记。
+    // 若这里仍去推状态，就会撞上自家的闸把整笔改期回滚 —— 运营看到的是自相矛盾的报错。
+    const service = new OrderService();
+    const transition = vi.spyOn(service, '_updateStatusWithinTx');
+    mountRoundTrip('outbound-item');
+    mockPrisma.order.findUnique.mockReset().mockResolvedValue({
+      id: 'ord1',
+      status: 'CHANGE_REQUESTED',
+      deletedAt: null,
+      adjustmentCny: 0,
+      adjustments: [],
+    });
+
+    const result = await service.rescheduleOrderItem(
+      'ord1',
+      { orderItemId: 'outbound-item', newScheduleId: 'schedOut', feeCny: 200 },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    expect(result.audit.statusChanged).toBe(false);
+    expect(transition).not.toHaveBeenCalled();
+    transition.mockRestore();
+  });
+
+  it('rescheduleOrderBodySchema 放开负数（前端钳正需同步解除），仍守 ± 上限', () => {
+    expect(rescheduleOrderBodySchema.parse({
+      orderItemId: 'it1',
+      newScheduleId: 'sched2',
+      feeCny: -300,
+    }).feeCny).toBe(-300);
+    expect(() =>
+      rescheduleOrderBodySchema.parse({ orderItemId: 'it1', newScheduleId: 'sched2', feeCny: -100_001 }),
+    ).toThrow();
+    expect(() =>
+      rescheduleOrderBodySchema.parse({ orderItemId: 'it1', newScheduleId: 'sched2', feeCny: -1.5 }),
+    ).toThrow();
   });
 });
 
