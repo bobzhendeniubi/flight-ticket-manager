@@ -3,7 +3,7 @@ import { Prisma, StaffRole, UserRole } from '@prisma/client';
 import { z } from 'zod';
 import { prisma } from '../../db/prisma.js';
 import { AuthService } from '../auth/auth.service.js';
-import { BadRequestError, NotFoundError } from '../../lib/errors.js';
+import { BadRequestError, ForbiddenError, NotFoundError } from '../../lib/errors.js';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
 
 /** 与 auth.service 的登出/全撤销口径一致：打到过去，避开 refresh 并发宽限窗。 */
@@ -197,15 +197,23 @@ export const userRoutes: FastifyPluginAsync = async (app) => {
     return { ok: true, disabledAt: updated.disabledAt };
   });
 
-  app.post('/:id/reset-password', adminOnly, async (req) => {
+  // 重置密码：内部员工（ADMIN/STAFF）都可帮**代理**重置；重置内部账号（ADMIN/STAFF）仍仅 ADMIN，
+  // 否则员工可借重置接管管理员/同事账号（越权）。
+  app.post(
+    '/:id/reset-password',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    async (req) => {
     const { id } = req.params as { id: string };
     const body = z.object({ newPassword: z.string().min(8).max(128) }).parse(req.body);
     if (id === req.user.sub) throw new BadRequestError('不能重置自己的密码，请使用「修改密码」');
     const target = await prisma.user.findUnique({
       where: { id },
-      select: { id: true, email: true, displayName: true, mustChangePassword: true },
+      select: { id: true, email: true, displayName: true, mustChangePassword: true, role: true },
     });
     if (!target) throw new NotFoundError('用户不存在');
+    if (req.user.role !== UserRole.ADMIN && target.role !== UserRole.AGENT) {
+      throw new ForbiddenError('员工只能重置代理账号的密码；内部账号请找管理员');
+    }
 
     await authService.adminResetPassword(id, body.newPassword);
     void writeAudit({

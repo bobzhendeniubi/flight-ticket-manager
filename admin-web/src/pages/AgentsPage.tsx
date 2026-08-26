@@ -26,7 +26,8 @@ export function AgentsPage() {
   const user = useAuth((s) => s.user);
   const isAdmin = user?.role === 'ADMIN' || user?.role === 'STAFF';
   // 重置代理登录密码是敏感操作，只放给 ADMIN——STAFF 仍可看/改代理资料，但不给重置密码入口。
-  const canResetAgentPassword = user?.role === 'ADMIN';
+  // 内部员工（ADMIN/STAFF）都可帮代理重置密码；后端限定 STAFF 只能重置 AGENT 账号
+  const canResetAgentPassword = user?.role === 'ADMIN' || user?.role === 'STAFF';
 
   const [agents, setAgents] = useState<AgentListItem[] | null>(null);
   const [agentsLoaded, setAgentsLoaded] = useState(false);

@@ -195,7 +195,7 @@ describe('PATCH /users/:id/disabled', () => {
     );
   });
 
-  it('STAFF 访问三个账号管理端点均为 403', async () => {
+  it('STAFF 访问开户/停用端点为 403；重置内部账号密码也 403', async () => {
     authenticatedUserId = 'staff-actor';
     authenticatedRole = UserRole.STAFF;
 
@@ -203,11 +203,29 @@ describe('PATCH /users/:id/disabled', () => {
       email: 'staff@example.com', password: 'temporary-password', displayName: '票务', role: 'STAFF',
     });
     const disable = await request('PATCH', '/users/staff-1/disabled', { disabled: true });
+    // 重置密码端点对 STAFF 放行到目标校验层：目标是内部账号（STAFF/ADMIN）仍拒绝
+    prismaMock.user.findUnique.mockResolvedValue({
+      id: 'staff-1', email: 's@example.com', displayName: '运营', mustChangePassword: false, role: UserRole.STAFF,
+    });
     const reset = await request('POST', '/users/staff-1/reset-password', { newPassword: 'temporary-password' });
 
     expect(create.statusCode).toBe(403);
     expect(disable.statusCode).toBe(403);
     expect(reset.statusCode).toBe(403);
+    expect(reset.json().error.message).toBe('员工只能重置代理账号的密码；内部账号请找管理员');
+  });
+
+  it('STAFF 可重置代理（AGENT）账号密码', async () => {
+    authenticatedUserId = 'staff-actor';
+    authenticatedRole = UserRole.STAFF;
+    prismaMock.user.findUnique.mockResolvedValue({
+      id: 'agent-1', email: 'a@example.com', displayName: '代理', mustChangePassword: false, role: UserRole.AGENT,
+    });
+
+    const reset = await request('POST', '/users/agent-1/reset-password', { newPassword: 'temporary-password' });
+
+    expect(reset.statusCode).toBe(200);
+    expect(reset.json()).toEqual({ ok: true });
   });
 
   it('Serializable 冲突 → 400 操作冲突，请重试', async () => {
