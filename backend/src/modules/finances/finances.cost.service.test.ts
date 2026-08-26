@@ -51,7 +51,8 @@ describe('resolveFlightItemCost — 订单机票行实时成本', () => {
           fuelCostCny: 20,
           peakSurchargeCny: 30,
           aircraftAdjustCny: 10,
-          takeoffDiscountCny: 5,
+          // 带符号科目：负数=补贴/减项（与录入、概览、导出同口径）
+          takeoffDiscountCny: -5,
         }),
         [],
         2,
