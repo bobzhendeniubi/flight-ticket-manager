@@ -184,6 +184,7 @@ import type { OrderItemInput } from './orders.schemas.js';
 import {
   batchCreateOrdersBodySchema,
   createOrderBodySchema,
+  quoteOrderBodySchema,
   rescheduleOrderBodySchema,
   swapItemHotelBodySchema,
   swapPassengerBodySchema,
@@ -1482,6 +1483,57 @@ describe('passengerToData — 套餐乘客级选项落库', () => {
     });
     expect(data.lastName).toBe('LI');
     expect(data.firstName).toBe('SI');
+  });
+});
+
+// ── 乘客字段落库映射：passengerToData 出行人类型服务端权威派生（覆盖客户端传值）──────
+// 入口层（前台下单页/批量导入解析层）已尽量按「出生日期 + 出发日」派生 passengerType，
+// passengerToData 收到 authoritativeDepartureDate 时是权威兜底：堵住入口漏派生或被篡改的口子。
+describe('passengerToData — passengerType 服务端权威派生（覆盖客户端传值）', () => {
+  const base = {
+    fullName: 'ZHANG SAN',
+    documentType: 'PASSPORT' as const,
+    documentNumber: 'E12345678',
+    dateOfBirth: '1990-01-01', // 1990 年出生，相对 2026 年出发早已成年
+    nationality: 'CN',
+    passengerType: 'ADULT' as const,
+  };
+  const departureDate = new Date('2026-06-01T00:00:00Z');
+
+  it('成人生日传 INFANT（客户端误传/被篡改）→ 有出发日时被服务端纠正为 ADULT', () => {
+    const data = passengerToData(
+      { ...base, passengerType: 'INFANT' },
+      { authoritativeDepartureDate: departureDate },
+    );
+    expect(data.passengerType).toBe('ADULT');
+  });
+
+  it('未成年生日 + 手选 ADULT → 有出发日时被纠正为按年龄推算的 CHILD/INFANT', () => {
+    const tenYearsOld = { ...base, dateOfBirth: '2018-01-01', passengerType: 'ADULT' as const };
+    const data = passengerToData(tenYearsOld, { authoritativeDepartureDate: departureDate });
+    expect(data.passengerType).toBe('CHILD');
+  });
+
+  it('无出生日期（防御性：dob 缺失/非法）→ 即使传了出发日也保留客户端手选值', () => {
+    const { dateOfBirth: _omit, ...baseNoDob } = base;
+    const data = passengerToData(
+      { ...baseNoDob, passengerType: 'CHILD' } as unknown as Parameters<typeof passengerToData>[0],
+      { authoritativeDepartureDate: departureDate },
+    );
+    expect(data.passengerType).toBe('CHILD');
+  });
+
+  it('未传 opts（无出发日信息）→ 不派生，原样落客户端传值（如占位单转正等旧调用点）', () => {
+    const data = passengerToData({ ...base, passengerType: 'INFANT' });
+    expect(data.passengerType).toBe('INFANT');
+  });
+
+  it('opts.authoritativeDepartureDate 显式为 null（订单定不出出发日，如纯地面单）→ 保留客户端传值', () => {
+    const data = passengerToData(
+      { ...base, passengerType: 'INFANT' },
+      { authoritativeDepartureDate: null },
+    );
+    expect(data.passengerType).toBe('INFANT');
   });
 });
 
@@ -2990,6 +3042,70 @@ describe('getOrder：产品内容卡片 v2（套餐组件构成 + 按人单价�
 });
 
 // ── 0702 反馈 2：换人/编辑接受中文姓名 chineseName ────────────────────────────
+// ── swapPassengerBodySchema · dateOfBirth 必须 YYYY-MM-DD（与建单/自助补录同款正则）──
+// 修复前只校验 z.string()：带时区的完整 ISO 串（如 1990-01-01T00:00:00+08:00）会被
+// new Date() 折成 UTC 前一天，换人/改生日把出生日期悄悄改错一天。
+describe('swapPassengerBodySchema · dateOfBirth 格式校验', () => {
+  it('YYYY-MM-DD → 通过', () => {
+    const parsed = swapPassengerBodySchema.parse({ dateOfBirth: '1990-01-01' });
+    expect(parsed.dateOfBirth).toBe('1990-01-01');
+  });
+
+  it('带时区的完整 ISO 串 → 拒绝（此前会被静默接受，折成前一天）', () => {
+    expect(() =>
+      swapPassengerBodySchema.parse({ dateOfBirth: '1990-01-01T00:00:00+08:00' }),
+    ).toThrow();
+  });
+
+  it('非法格式（如 1990/01/01）→ 拒绝', () => {
+    expect(() => swapPassengerBodySchema.parse({ dateOfBirth: '1990/01/01' })).toThrow();
+  });
+});
+
+// ── quoteOrderBodySchema · 手工价通道字段闭环 ─────────────────────────────
+// 三个字段形状抄 createOrderBodySchema 对应字段：录单页填了这些字段后随试算一起发送，
+// quoteOrder 服务层据此与 createOrder 同口径判定是否存在手工价通道，抑制不会生效的自动立减。
+describe('quoteOrderBodySchema · 手工价通道字段', () => {
+  const items = [
+    {
+      kind: 'FLIGHT' as const,
+      description: '去程',
+      quantity: 1,
+      flightScheduleId: 'sched-1',
+      flightCabin: 'ECONOMY' as const,
+    },
+  ];
+
+  it('缺省不带手工价字段 → 通过，三个字段均为 undefined', () => {
+    const parsed = quoteOrderBodySchema.parse({ items });
+    expect(parsed.priceAdjustment).toBeUndefined();
+    expect(parsed.settlementTotalCny).toBeUndefined();
+    expect(parsed.flightSettlementPriceCny).toBeUndefined();
+  });
+
+  it('priceAdjustment（形状同 createOrderBodySchema）→ 原样保留，不被 parse 剥掉', () => {
+    const parsed = quoteOrderBodySchema.parse({
+      items,
+      priceAdjustment: { amountCny: -100, reasonCode: 'DISCOUNT' },
+    });
+    expect(parsed.priceAdjustment).toEqual({ amountCny: -100, reasonCode: 'DISCOUNT' });
+  });
+
+  it('settlementTotalCny → 原样保留', () => {
+    const parsed = quoteOrderBodySchema.parse({ items, settlementTotalCny: 3000 });
+    expect(parsed.settlementTotalCny).toBe(3000);
+  });
+
+  it('flightSettlementPriceCny → 原样保留', () => {
+    const parsed = quoteOrderBodySchema.parse({ items, flightSettlementPriceCny: 1200 });
+    expect(parsed.flightSettlementPriceCny).toBe(1200);
+  });
+
+  it('settlementTotalCny 为负 → 拒绝（与 createOrderBodySchema 同口径）', () => {
+    expect(() => quoteOrderBodySchema.parse({ items, settlementTotalCny: -1 })).toThrow();
+  });
+});
+
 describe('swapPassengerBodySchema · chineseName', () => {
   it('受理 chineseName（与下单时 passengerInputSchema 同款 ≤120 字约束）', () => {
     const parsed = swapPassengerBodySchema.parse({ chineseName: '庄宇' });
@@ -3182,6 +3298,103 @@ describe('swapPassenger · 证件号变化触发旧护照/签证清洗', () => {
     ).rejects.toMatchObject({ code: 'DUPLICATE_PASSENGER' });
     // 冲突时在 update 之前中止 → 绝不落库
     expect(mockPrisma.passenger.update).not.toHaveBeenCalled();
+  });
+});
+
+// ── swapPassenger · passengerType 服务端权威派生（出生日期变化时重派生，覆盖客户端传值）──
+// 与建单（createOrder → passengerToData）同一口径的权威兜底：入口层已尽量派生，这里堵住
+// 换人/改生日时手选类型不跟着改的口子。
+describe('swapPassenger · passengerType 服务端权威派生（覆盖客户端传值）', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function armMocks(existingPassengerType: string) {
+    mockPrisma.order.findUnique.mockResolvedValueOnce({ id: 'ord1', adjustmentCny: 0, adjustments: [] });
+    mockPrisma.passenger.findUnique.mockResolvedValueOnce({
+      id: 'px1',
+      orderId: 'ord1',
+      fullName: 'ZHANG SAN',
+      documentNumber: 'SAME123',
+      visaExempt: false,
+      passengerType: existingPassengerType,
+    });
+    mockPrisma.passenger.update.mockResolvedValueOnce({});
+    mockPrisma.passenger.findUniqueOrThrow.mockResolvedValueOnce({
+      fullName: 'ZHANG SAN',
+      documentNumber: 'SAME123',
+    });
+    mockPrisma.order.findUniqueOrThrow.mockResolvedValueOnce(fakeFullOrder({ id: 'ord1' }));
+  }
+
+  it('证件号不变、仅订正出生日期 → 有出发日时按新生日重算 passengerType（覆盖存量 ADULT）', async () => {
+    const service = new OrderService();
+    armMocks('ADULT');
+    // 订单一条 FLIGHT 行，出发日 2026-06-01；新生日 2018-01-01 相对出发日 ~8 周岁 → CHILD
+    mockPrisma.orderItem.findMany.mockResolvedValueOnce([
+      { flightSchedule: { departureTime: new Date('2026-06-01T00:00:00Z') } },
+    ]);
+
+    await service.swapPassenger(
+      'ord1',
+      'px1',
+      { dateOfBirth: '2018-01-01' },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    const data = mockPrisma.passenger.update.mock.calls[0][0].data;
+    expect(data.dateOfBirth).toEqual(new Date('2018-01-01'));
+    expect(data.passengerType).toBe('CHILD');
+  });
+
+  it('成人生日 + 客户端手选 INFANT → 有出发日时被服务端纠正为 ADULT', async () => {
+    const service = new OrderService();
+    armMocks('ADULT');
+    mockPrisma.orderItem.findMany.mockResolvedValueOnce([
+      { flightSchedule: { departureTime: new Date('2026-06-01T00:00:00Z') } },
+    ]);
+
+    await service.swapPassenger(
+      'ord1',
+      'px1',
+      { dateOfBirth: '1990-01-01', passengerType: 'INFANT' as never },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    const data = mockPrisma.passenger.update.mock.calls[0][0].data;
+    expect(data.passengerType).toBe('ADULT');
+  });
+
+  it('订单定不出出发日（无 FLIGHT 行）→ 保留客户端传值，不派生', async () => {
+    const service = new OrderService();
+    armMocks('ADULT');
+    mockPrisma.orderItem.findMany.mockResolvedValueOnce([]); // 无 FLIGHT 行 → earliestFlightDeparture 为 null
+
+    await service.swapPassenger(
+      'ord1',
+      'px1',
+      { dateOfBirth: '1990-01-01', passengerType: 'INFANT' as never },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    const data = mockPrisma.passenger.update.mock.calls[0][0].data;
+    expect(data.passengerType).toBe('INFANT');
+  });
+
+  it('本次未改出生日期 → 不查出发日、不重派生 passengerType', async () => {
+    const service = new OrderService();
+    armMocks('CHILD');
+
+    await service.swapPassenger(
+      'ord1',
+      'px1',
+      { chineseName: '张三' },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    expect(mockPrisma.orderItem.findMany).not.toHaveBeenCalled();
+    const data = mockPrisma.passenger.update.mock.calls[0][0].data;
+    expect(data).not.toHaveProperty('passengerType');
   });
 });
 

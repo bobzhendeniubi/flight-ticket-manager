@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
-import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput, type LegacyPassengerHistory } from '../lib/api';
+import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput, type LegacyPassengerHistory, type PassengerType } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { useFlightSeats } from '../stores/flightSeats';
 import {
@@ -8049,6 +8049,12 @@ interface BatchRow {
   passportIssueDate?: string;
   /** 护照签发地点（自由文本；可选；OCR 识别带出） */
   passportIssuePlace?: string;
+  /**
+   * 乘客类型（成人/儿童/婴儿）：旧系统表格导入解析层已按「出生日期 + 出发日」派生
+   * （表格本身没有该列，一直是靠这一步补出来的），随提交发给后端；有值才带，缺省回落
+   * schema 默认（成人）——服务端 createOrder 仍会权威兜底重派生，这里只是不丢入口层的判断。
+   */
+  passengerType?: PassengerType;
   // ── 护照 OCR（批量传护照：多选逐张识别回填，同 SingleOrderModal 实现模式）────────
   /** 护照图 base64 data URL（OCR 识别后存入，随提交发给后端） */
   passportPhotoUrl?: string;
@@ -8596,6 +8602,20 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
     }
     let cancelled = false;
     setBatchSettlementQuoting(true);
+    // 手工价通道字段（与真下单实际发给 createOrder 的字段同源，见 submit() 里 teamPrice/manualPrice/
+    // discountValue 的换算）：填了任一，随试算一起发送——服务端据此与 createOrder 同口径判定是否存在
+    // 手工价通道，抑制一笔真下单时并不会生效的自动立减，试算数字才跟真下单对得上。
+    // 三者互斥（后端 batchCreateOrders 也会拒二填），此处按同一优先级取一个即可。
+    const manualChannelBody: {
+      flightSettlementPriceCny?: number;
+      priceAdjustment?: { amountCny: number; reasonCode: 'MISC_FEE' | 'DISCOUNT' };
+    } = hasBatchTeamSettlementPrice && settlementPriceCny
+      ? { flightSettlementPriceCny: settlementPriceCny }
+      : hasBatchManualSettlementPrice
+        ? { priceAdjustment: { amountCny: 1, reasonCode: 'MISC_FEE' } }
+        : hasBatchManualDiscount
+          ? { priceAdjustment: { amountCny: -(discountPerPersonCny ?? 0), reasonCode: 'DISCOUNT' } }
+          : {};
     const timer = setTimeout(() => {
       api
         .quoteOrder(
@@ -8604,6 +8624,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
             items: batchQuoteItems,
             ...(productType === 'BUNDLE' ? { passengers: [{ visaExempt: false, singleRoom: false }] } : {}),
             ...(agentId ? { agentId } : {}),
+            ...manualChannelBody,
           },
         )
         .then((result) => {
@@ -8625,7 +8646,20 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [token, isOps, isAgentUser, agentId, validRows.length, batchQuoteItems, productType]);
+  }, [
+    token,
+    isOps,
+    isAgentUser,
+    agentId,
+    validRows.length,
+    batchQuoteItems,
+    productType,
+    hasBatchTeamSettlementPrice,
+    hasBatchManualSettlementPrice,
+    hasBatchManualDiscount,
+    settlementPriceCny,
+    discountPerPersonCny,
+  ]);
 
   // 套餐行级指定酒店与单笔录单共用酒店数据源；选店后前端只解析房型 id，价格/占房仍由服务端权威计算。
   useEffect(() => {
@@ -9008,6 +9042,8 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
         gender: r.passenger.gender,
         passportIssueDate: r.passenger.passportIssueDate,
         passportExpiry: r.passenger.passportExpiry,
+        // 解析层已按「出生日期 + 出发日」派生（表格本身没有该列），随行状态带到提交 payload。
+        passengerType: r.passenger.passengerType,
         note:
           [r.passenger.note, r.passenger.infantCompanion ? `婴儿同行成人：${r.passenger.infantCompanion}` : '']
             .filter(Boolean)
@@ -9219,6 +9255,8 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
         ...(r.passportIssuePlace?.trim() ? { passportIssuePlace: r.passportIssuePlace.trim() } : {}),
         ...(r.passportPhotoUrl ? { passportPhotoUrl: r.passportPhotoUrl } : {}),
         ...(r.pnr?.trim() ? { pnr: r.pnr.trim().toUpperCase() } : {}),
+        // 表格导入解析层已按「出生日期 + 出发日」派生（有值才带；缺省回落后端 schema 默认成人）。
+        ...(r.passengerType ? { passengerType: r.passengerType } : {}),
         ...(productType === 'BUNDLE' && r.visaExempt === true ? { visaExempt: true } : {}),
         ...(productType === 'BUNDLE' && canOfferBundleSingle && r.singleRoom === true ? { singleRoom: true } : {}),
         ...(productType === 'BUNDLE' && canOfferBundleBusiness && r.businessUpgrade === true ? { businessUpgrade: true } : {}),

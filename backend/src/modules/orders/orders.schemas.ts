@@ -570,6 +570,21 @@ export const quoteOrderBodySchema = z.object({
   passengers: z.array(quotePassengerOptionSchema).max(20).optional(),
   // ADMIN/STAFF 试算代理订单时传入归属代理；不传则按散客口径试算。
   agentId: z.string().min(1).optional(),
+  // 手工价通道字段（形状抄 createOrderBodySchema 对应字段）：录单页填了这些字段后随试算一起
+  // 发送，quoteOrder 服务层据此与 createOrder 同口径判定「是否存在手工价通道」，抑制一个真下单
+  // 时并不会生效的自动立减（同业/代理）——此前 schema 未暴露这三个字段，路由层 parse 时会被
+  // 静默剥掉，运营在试算里看到的立减和真下单的结果对不上。
+  priceAdjustment: priceAdjustmentSchema.optional(),
+  settlementTotalCny: z
+    .number()
+    .min(0, '结算总价不能为负')
+    .refine((v) => Number(v.toFixed(2)) === v, { message: '结算总价最多两位小数（元）' })
+    .optional(),
+  flightSettlementPriceCny: z
+    .number()
+    .min(0)
+    .max(SETTLEMENT_PRICE_CAP_CNY)
+    .optional(),
 });
 export type QuoteOrderBody = z.infer<typeof quoteOrderBodySchema>;
 
@@ -979,7 +994,10 @@ export const swapPassengerBodySchema = z
     // 中文姓名（护照扩展字段；下单时已支持，此处补录/编辑用同一约束）
     chineseName: z.string().max(120).optional(),
     documentNumber: z.string().max(60).optional(),
-    dateOfBirth: z.string().optional(), // ISO 日期字符串
+    // YYYY-MM-DD（与建单 passengerInputSchema / selfUpdatePassengerBodySchema 同款正则）：
+    // 此前只校验 z.string()，带时区的完整 ISO 串（如 1990-01-01T00:00:00+08:00）会被 new Date()
+    // 折成 UTC 前一天，换人/改生日把出生日期悄悄改错一天。
+    dateOfBirth: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
     gender: z.nativeEnum(Gender).optional(),
     // 国籍：换人时的新出行人国籍。证件号变化（= 真换人）时「建议必填」——新出行人不应沿用旧国籍。
     //   注：Zod superRefine 只能硬性 400，而「建议必填」是软约束（不改现有不传国籍即换人的行为、不误伤既有

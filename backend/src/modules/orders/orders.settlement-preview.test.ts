@@ -202,6 +202,91 @@ describe('OrderService.quoteOrder · settlementPreview', () => {
       : null).toMatchObject({ pricePerPersonCny: -100, pax: 2, note: '同业立减' });
   });
 
+  // 手工价通道（priceAdjustment / settlementTotalCny / flightSettlementPriceCny）在场时，
+  // createOrder 会跳过自动立减（整体替代方案，避免双重砸价）；quoteOrder 此前没有这道闸，
+  // 会一直显示一笔真下单时不会生效的代理立减 —— 与上面同一 fixture，只加一个手工价字段。
+  it('代理套餐命中规则 + 已填 flightSettlementPriceCny（手工价通道）→ 不注入自动立减（与 createOrder 同口径）', async () => {
+    const bundleItem = {
+      kind: 'BUNDLE' as const,
+      description: '套餐',
+      quantity: 1,
+      bundleId: 'bundle-1',
+      unitPrice: 0,
+      adultCount: 2,
+      childCount: 0,
+      infantCount: 0,
+      metadata: { goDate: '2026-09-01' },
+    };
+    mockPrisma.bundle.findMany.mockResolvedValue([
+      { id: 'bundle-1', name: '套餐', settlementTier: 'THREE_STAR', settlementNights: 1 },
+    ]);
+    mockResolveAgentSettlementDiscount.mockResolvedValue({
+      ruleId: 'discount-1',
+      kind: 'AGENT',
+      discountPerPersonCny: 100,
+    });
+    const service = new OrderService();
+    stubPricing(service, [
+      { ...flightItem, bundleId: 'bundle-1', unitPrice: 900, amount: 900 },
+      { ...bundleItem, unitPrice: 700, amount: 740, settlementAddOnCny: 40 },
+    ]);
+
+    const result = await service.quoteOrder({
+      items: [flightItem, bundleItem],
+      agentId: 'agent-1',
+      flightSettlementPriceCny: 1000,
+    });
+
+    expect(result.items).not.toContainEqual(expect.objectContaining({ kind: 'DISCOUNT' }));
+    expect(result.settlementPreview).toMatchObject({ ok: true, source: 'GROUND', totalCny: 3040 });
+    expect(
+      result.settlementPreview && result.settlementPreview.ok
+        ? 'autoDiscount' in result.settlementPreview
+        : true,
+    ).toBe(false);
+  });
+
+  it('代理套餐命中规则 + 已填 priceAdjustment（手工价通道）→ 同样不注入自动立减', async () => {
+    const bundleItem = {
+      kind: 'BUNDLE' as const,
+      description: '套餐',
+      quantity: 1,
+      bundleId: 'bundle-1',
+      unitPrice: 0,
+      adultCount: 2,
+      childCount: 0,
+      infantCount: 0,
+      metadata: { goDate: '2026-09-01' },
+    };
+    mockPrisma.bundle.findMany.mockResolvedValue([
+      { id: 'bundle-1', name: '套餐', settlementTier: 'THREE_STAR', settlementNights: 1 },
+    ]);
+    mockResolveAgentSettlementDiscount.mockResolvedValue({
+      ruleId: 'discount-1',
+      kind: 'AGENT',
+      discountPerPersonCny: 100,
+    });
+    const service = new OrderService();
+    stubPricing(service, [
+      { ...flightItem, bundleId: 'bundle-1', unitPrice: 900, amount: 900 },
+      { ...bundleItem, unitPrice: 700, amount: 740, settlementAddOnCny: 40 },
+    ]);
+
+    const result = await service.quoteOrder({
+      items: [flightItem, bundleItem],
+      agentId: 'agent-1',
+      priceAdjustment: { amountCny: -50, reasonCode: 'DISCOUNT' },
+    });
+
+    expect(result.items).not.toContainEqual(expect.objectContaining({ kind: 'DISCOUNT' }));
+    expect(result.settlementPreview).toMatchObject({ ok: true, source: 'GROUND', totalCny: 3040 });
+    expect(
+      result.settlementPreview && result.settlementPreview.ok
+        ? 'autoDiscount' in result.settlementPreview
+        : true,
+    ).toBe(false);
+  });
+
   it('多个不同出发日的散客套餐行 → 各自按 goDate 命中对应 RETAIL 规则', async () => {
     const bundleItemA = {
       kind: 'BUNDLE' as const,

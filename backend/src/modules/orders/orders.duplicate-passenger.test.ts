@@ -21,6 +21,9 @@ const { mockPrisma } = vi.hoisted(() => {
     orderItem: { findMany: vi.fn() },
     // 真实查重会查这个：造冲突用
     passenger: { findMany: vi.fn() },
+    // 出行人类型服务端权威派生（passengerToData）会查最早出发日；本文件不关心该派生，
+    // 缺省无匹配班次 → 派生跳过（保留 passenger 里手填的 passengerType，不影响本文件断言）。
+    flightSchedule: { findMany: vi.fn().mockResolvedValue([]) },
     seatLock: { aggregate: vi.fn(), findMany: vi.fn(), updateMany: vi.fn() },
     fulfillmentTask: { findFirst: vi.fn(), create: vi.fn() },
     auditLog: { create: vi.fn() },

@@ -444,6 +444,12 @@ export interface BatchOrderPassenger {
   note?: string;
   /** BUNDLE 批量创单行级指定酒店：传服务端解析出的房型 id。 */
   designatedHotelRoomTypeId?: string;
+  /**
+   * 乘客类型（成人/儿童/婴儿）。旧系统表格导入解析层已按「出生日期 + 出发日」派生（见
+   * OrderImportParsedRow.passenger.passengerType）；有值才带，缺省回落后端 schema 默认（成人）
+   * ——服务端 createOrder 仍会按出生日期 + 航班出发日权威兜底重派生，此处只是不丢入口层已有的判断。
+   */
+  passengerType?: PassengerType;
 }
 // 批量创单 body 同样支持整批共用的签证状态 + 结构化备注四栏（后端 batchCreateOrdersBodySchema
 // 直接 spread 了 orderStructuredNotesShape，写入每张子单）——与 CreateOrderInput 同款 extends。
@@ -560,6 +566,11 @@ export interface OrderImportParsedRow {
     passportExpiry?: string;
     infantCompanion?: string;
     note?: string;
+    /**
+     * 乘客类型：按「出生日期 + 出发日」推算（<2 岁婴儿 / 2–<12 岁儿童 / ≥12 岁成人），而非
+     * 表格里从未采集过的手录值。出生日期缺失时不设，前端提交批量创单时回落后端 schema 默认（成人）。
+     */
+    passengerType?: PassengerType;
   };
   errors: string[];
   warnings: string[];
@@ -3714,6 +3725,14 @@ export const api = {
       passengers?: Array<{ visaExempt?: boolean; singleRoom?: boolean }>;
       /** ADMIN/STAFF 试算代理订单时传入归属代理；不传按散客口径。 */
       agentId?: string;
+      /**
+       * 手工价通道字段（形状同 createOrder，已随后端 quoteOrderBodySchema 暴露）：录单页已填
+       * 手工结算价/优惠时随试算一起发送，服务端据此与 createOrder 同口径判定是否存在手工价
+       * 通道，抑制一笔真下单时并不会生效的自动立减（同业/代理）。
+       */
+      priceAdjustment?: PriceAdjustmentInput;
+      settlementTotalCny?: number;
+      flightSettlementPriceCny?: number;
     },
   ) => apiFetch<QuoteOrderResult>('/orders/quote', { method: 'POST', token, body }),
 

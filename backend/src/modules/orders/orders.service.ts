@@ -85,7 +85,7 @@ import { PricingService } from '../pricing/pricing.service.js';
 import { createOpenReceiptWithinTx } from '../receipts/receipts.service.js';
 import { OPERATION_FEE_CNY_PER_ORDER } from './order-cost-items.service.js';
 import { bundleItemMetadataSchema } from './orders.schemas.js';
-import { derivePtcByAge } from './pnr-export.js';
+import { derivePtcByAge, earliestFlightDeparture } from './pnr-export.js';
 import {
   assertOrderAllowsInvoicing,
   assertTicketingCap,
@@ -1265,6 +1265,10 @@ export class OrderService {
     // 护照有效期规则（相对出发日）：<90 天禁止下单；不足 6 个月每人 +200 临期附加费
     await this.applyPassportExpiryRule(body, pricedItems);
 
+    // 出行人类型服务端权威派生（passengerToData）所需的「本单最早出发日」：与护照有效期规则
+    // 同一口径（服务端查 DB，客户端改不了），事务外查一次，供下方写 Passenger 时使用。
+    const authoritativeDepartureDate = await this.resolveEarliestFlightDepartureDate(body.items);
+
     // 录单调价/加项（权限已在上方按认证身份校验）：追加一条独立定价行，计入 subtotal/total。
     if (body.priceAdjustment) {
       pricedItems.push(buildPriceAdjustmentItem(body.priceAdjustment));
@@ -1530,7 +1534,7 @@ export class OrderService {
             })),
           },
           passengers: {
-            create: body.passengers.map((px) => passengerToData(px)),
+            create: body.passengers.map((px) => passengerToData(px, { authoritativeDepartureDate })),
           },
           statusEvents: {
             create: {
@@ -1710,15 +1714,10 @@ export class OrderService {
    * 返回各行明细 + subtotal/total（CNY），供录单页在提交前展示「系统价」。
    */
   async quoteOrder(
-    // 手工价通道字段用 Partial 挂在 QuoteOrderBody 上：试算请求体今天还不带它们（路由 schema 会剥掉），
-    // 但立减判定与 createOrder 已共用同一函数 —— 一旦试算接口开始携带，两边同时收紧，不必再改这里。
-    body: QuoteOrderBody &
-      Partial<
-        Pick<
-          CreateOrderBody,
-          'priceAdjustment' | 'settlementTotalCny' | 'flightSettlementPriceCny'
-        >
-      >,
+    // priceAdjustment / settlementTotalCny / flightSettlementPriceCny 已随 quoteOrderBodySchema
+    // 暴露（形状与 createOrderBodySchema 对应字段一致）——立减判定与 createOrder 共用同一函数，
+    // 录单页填了手工价通道字段后随试算一起发送，两边判定同步收紧。
+    body: QuoteOrderBody,
   ): Promise<{
     currency: string;
     subtotal: number;
@@ -1752,7 +1751,15 @@ export class OrderService {
       );
       if (bundleCalendar) {
         let autoDiscount: AutoDiscountSummary | null = null;
-        if (body.agentId) {
+        // 手工价通道（与 createOrder 的 hasManualSettlementChannel 同口径）：priceAdjustment /
+        // settlementTotalCny / flightSettlementPriceCny 任一在场 → 视为整体替代方案，跳过自动立减
+        // 注入。此前这里只判 body.agentId，没有这道闸——运营填了手工结算价/优惠后，试算仍显示一笔
+        // 代理自动立减，真下单时（createOrder 已收紧）却不生效，两个数字对不上。
+        const hasManualSettlementChannel =
+          body.priceAdjustment !== undefined ||
+          body.settlementTotalCny !== undefined ||
+          body.flightSettlementPriceCny !== undefined;
+        if (body.agentId && !hasManualSettlementChannel) {
           autoDiscount = await this.applyAgentSettlementDiscount(
             priced,
             bundleCalendar,
@@ -1847,6 +1854,23 @@ export class OrderService {
    *   - 距出发日不足 6 个月（180 天）→ 每位 +200 临期附加费（FEE 行）
    * 通过 push 到 pricedItems 让附加费自然进入 subtotal/total/items。
    */
+  /**
+   * 本单最早 FLIGHT 行出发时间（服务端权威来源，直接查 DB，客户端改不了）。
+   * 无 FLIGHT 行（纯地面单）或班次查无 → null。供护照有效期规则、出行人类型服务端权威派生
+   * （passengerToData）共用同一口径的出发日。
+   */
+  private async resolveEarliestFlightDepartureDate(items: OrderItemInput[]): Promise<Date | null> {
+    const scheduleIds = items
+      .filter((i): i is Extract<OrderItemInput, { kind: 'FLIGHT' }> => i.kind === 'FLIGHT')
+      .map((i) => i.flightScheduleId);
+    if (scheduleIds.length === 0) return null;
+    const scheds = await prisma.flightSchedule.findMany({
+      where: { id: { in: scheduleIds } },
+      select: { departureTime: true },
+    });
+    return earliestFlightDeparture(scheds.map((s) => ({ kind: 'FLIGHT', flightSchedule: s })));
+  }
+
   private async applyPassportExpiryRule(
     body: CreateOrderBody,
     pricedItems: Array<{ kind: OrderItemKind; description: string; quantity: number; unitPrice: number; amount: number; totalCostCny?: number }>,
@@ -7326,7 +7350,16 @@ export class OrderService {
       const passenger = await tx.passenger.findUnique({
         where: { id: passengerId },
         // visaExempt：换人价回滚要读旧客的自备签状态（true→false 时把减免加回来，见下方 1d）。
-        select: { id: true, orderId: true, fullName: true, documentNumber: true, visaExempt: true },
+        // passengerType：出生日期变化时权威重派生的回退口径（见下方 1b2）——同一人只是改错生日
+        // 时，不该把已有的儿童/婴儿类型误判丢回默认成人。
+        select: {
+          id: true,
+          orderId: true,
+          fullName: true,
+          documentNumber: true,
+          visaExempt: true,
+          passengerType: true,
+        },
       });
       if (!passenger || passenger.orderId !== orderId) {
         throw new NotFoundError('出行人不存在或不属于该订单');
@@ -7405,6 +7438,32 @@ export class OrderService {
         // 说明：nationality 是必填非空列，无法「置空」；请求带了新值即用新值（上面已赋），
         // 未带时只能保留旧值（不猜默认国籍——猜错会污染出票/签证）。彻底根治需 schema 层在真换人时
         // 强制 nationality，留待拥有 orders.schemas.ts 的下一棒收口。
+      }
+
+      // ── 1b2. 出行人类型服务端权威派生（覆盖客户端传值）：出生日期变化（改错别字或真换人都算）时，
+      //        若订单能定出最早出发日（机票行），按「出发日 − 出生日期」用 derivePtcByAge 重算
+      //        passengerType 并覆盖 —— 与建单（createOrder → passengerToData）同一口径的权威兜底，
+      //        入口层已尽量派生，这里是权威兜底，堵住换人/改生日时手选类型不跟着改的口子。
+      //        无新出生日期（本次未改）或订单定不出出发日 → 保留上面已赋的值（客户端传值 / 换人默认）。
+      if (data.dateOfBirth !== undefined && data.dateOfBirth !== null) {
+        const flightItems = await tx.orderItem.findMany({
+          where: { orderId, kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
+          select: { flightSchedule: { select: { departureTime: true } } },
+        });
+        const departureDate = earliestFlightDeparture(
+          flightItems.map((it) => ({ kind: 'FLIGHT', flightSchedule: it.flightSchedule })),
+        );
+        if (departureDate) {
+          // 回退口径：本次显式给的新值 > 已有的旧值（同一人订正生日不该丢类型）> 兜底成人。
+          const fallbackPassengerType =
+            (data.passengerType as PassengerType | undefined) ??
+            input.passengerType ??
+            passenger.passengerType ??
+            PassengerType.ADULT;
+          data.passengerType = ptcToPassengerType(
+            derivePtcByAge(data.dateOfBirth as Date, departureDate, fallbackPassengerType),
+          );
+        }
       }
 
       // ── 1c. 重复证件号校验（与 createOrder 同口径，swap 之前缺失）：真换人时，换入的证件号
@@ -10637,10 +10696,38 @@ export function computeBundleSeatSplit(
   return { sameCabin: quantity - upgrade, business: upgrade };
 }
 
+/**
+ * PTC 码（ADT/CHD/INF，derivePtcByAge 的返回值）→ 建单落库用的系统枚举
+ * （ADULT/CHILD/INFANT）。年龄阈值判断已在 derivePtcByAge 里做过，这里只做码值转换。
+ */
+function ptcToPassengerType(ptc: string): PassengerType {
+  const map: Record<string, PassengerType> = {
+    ADT: PassengerType.ADULT,
+    CHD: PassengerType.CHILD,
+    INF: PassengerType.INFANT,
+  };
+  return map[ptc] ?? PassengerType.ADULT;
+}
+
 // 导出供单测验证乘客字段落库映射（含 0713 反馈批新增 visaExempt/singleRoom）。
-export function passengerToData(p: PassengerInput) {
+export function passengerToData(
+  p: PassengerInput,
+  // 服务端权威派生 passengerType 所需的「本单最早出发日」（见下方 passengerType 计算注释）。
+  // 省略该参数 = 维持旧行为（不派生，原样落客户端传值）——占位单转正等其它调用点无需改动。
+  opts?: { authoritativeDepartureDate?: Date | null },
+) {
   // 自动拆 fullName → lastName/firstName，如果客户端没传（斜线优先，见 splitPassengerFullName）
   const { lastName: autoLast, firstName: autoFirst } = splitPassengerFullName(p.fullName);
+  const dateOfBirth = new Date(p.dateOfBirth);
+  const hasValidDob = Boolean(p.dateOfBirth) && !Number.isNaN(dateOfBirth.getTime());
+  // 乘客类型服务端权威派生（覆盖客户端传值）：入口层（前台下单页/批量导入解析层）已尽量按
+  // 「出生日期 + 出发日」派生 passengerType，这里是权威兜底 —— 凡是乘客带出生日期、且本单能
+  // 定出最早出发日（机票行/套餐行）时，用 derivePtcByAge 重算并覆盖，堵住入口漏派生或被篡改的口子
+  // （如成人生日误传/篡改成 INFANT）。无出生日期或订单定不出出发日（纯地面单）→ 保留客户端传值/默认。
+  const passengerType =
+    hasValidDob && opts?.authoritativeDepartureDate
+      ? ptcToPassengerType(derivePtcByAge(dateOfBirth, opts.authoritativeDepartureDate, p.passengerType))
+      : p.passengerType;
   return {
     fullName: p.fullName,
     lastName: p.lastName ?? (autoLast || null),
@@ -10649,10 +10736,10 @@ export function passengerToData(p: PassengerInput) {
     gender: p.gender ?? null,
     documentType: p.documentType,
     documentNumber: p.documentNumber,
-    dateOfBirth: new Date(p.dateOfBirth),
+    dateOfBirth,
     placeOfBirth: p.placeOfBirth ?? null,
     nationality: p.nationality,
-    passengerType: p.passengerType,
+    passengerType,
     chineseName: p.chineseName ?? null,
     passportIssueDate: p.passportIssueDate ? new Date(p.passportIssueDate) : null,
     passportIssueCountry: p.passportIssueCountry ?? null,
