@@ -935,6 +935,10 @@ function OrderGroup({
             )}
           </div>
           <div className="mt-0.5 font-sans text-[10px] text-ink-muted">出发 {departureYmd ?? '—'}</div>
+          {/* 所属代理（公测反馈：签证台需直接看到归属，不必点进订单详情）；直客不展示徽章 */}
+          {task.order?.agentName && (
+            <div className="badge-info mt-1 inline-block font-sans text-[10px]">{task.order.agentName}</div>
+          )}
         </td>
         {/* 进度：已送 x/y（+ 材料准备数） */}
         <td className="align-top text-right nums">
@@ -946,6 +950,16 @@ function OrderGroup({
           )}
         </td>
         <td className="align-top text-xs text-ink-muted">
+          {/* 客户备注（订单级 order.notes，只读）——与下方任务备注输入框是两回事，
+              仅公测反馈里客户下单时填写的说明；有内容才展示，长文本截断+悬浮看全文 */}
+          {task.order?.notes && (
+            <div
+              className="mb-1 max-w-[11rem] truncate text-[11px] text-amber-700"
+              title={`客户备注：${task.order.notes}`}
+            >
+              客户备注：{task.order.notes}
+            </div>
+          )}
           {/* 显式保存：blur 不再自动写库、也不丢输入；有改动时出现「保存」按钮（Enter 同效） */}
           <div className="flex items-center gap-1.5">
             <input

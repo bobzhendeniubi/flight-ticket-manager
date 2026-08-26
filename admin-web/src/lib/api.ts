@@ -2123,6 +2123,8 @@ export interface FulfillmentTask {
     contactPhone: string;
     status: OrderStatus;
     notes?: string | null;
+    /** 所属代理名（公司名优先，回退联系人名）；null = 直客（无代理） */
+    agentName?: string | null;
     /** 出发时间（ISO）；纯签证单无航班 → null */
     departureTime?: string | null;
     /** 出发机场时区（IANA）；用于本地化出发日期 */

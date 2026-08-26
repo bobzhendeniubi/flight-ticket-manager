@@ -473,6 +473,9 @@ export class FulfillmentService {
                   notes: true,
                   // 订单级录单签证状态 —— 产品结构化字段缺失时的分类回退来源
                   visaStatus: true,
+                  // 所属代理（公测反馈：签证台需直接看到归属，不必点进订单详情）；
+                  // 走同一主查询的嵌套 select，不新增每行子查询
+                  agent: { select: { companyName: true, contactName: true } },
                 },
               },
             },
@@ -577,6 +580,9 @@ export class FulfillmentService {
         // 签证台「签证类型」筛选/徽章两边口径由此对齐（见 issuanceMethodWhere）；
         // 入境次数只认产品字段，无回退
         const visaClass = effectiveVisaClassification(t.orderItem.visa, order.visaStatus);
+        // 所属代理名（口径与订单模块导出/看板一致：公司名优先，回退联系人名；无代理 = 直客）
+        const { agent, ...orderRest } = order;
+        const agentName = agent ? agent.companyName || agent.contactName : null;
         return {
           ...serializeTask(t, t.orderItem),
           // #7：本签证产品名称（单次/多次签等）置于任务顶层
@@ -588,7 +594,9 @@ export class FulfillmentService {
           visaIssuanceSource: visaClass.issuanceSource,
           visaEntrySource: visaClass.entrySource,
           order: {
-            ...order,
+            ...orderRest,
+            // 所属代理名；null = 直客（无代理）
+            agentName,
             // #6：出发日期 + 时区（ISO 字符串 / null）
             departureTime: firstLeg ? firstLeg.departureTime.toISOString() : null,
             departureTz: firstLeg?.departureTz ?? null,
