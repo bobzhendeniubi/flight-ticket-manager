@@ -62,6 +62,9 @@ vi.mock('../../db/prisma.js', () => ({ prisma: mockPrisma }));
 vi.mock('../hotel-control/hotel-control.service.js', () => ({
   assertHotelPhysicalFit: vi.fn(),
   assertRandomTierFit: vi.fn(),
+  // 事务内带行锁版（建单/改日期的权威判定走它）：桩与真模块导出对齐，
+  // 少一个键会在真走到随机档路径时炸成 "not a function"。
+  assertRandomTierFitWithinTx: vi.fn(),
   checkHotelPhysicalFit: vi.fn(),
   getHotelNightlyRemaining: mockGetHotelNightlyRemaining,
   getRandomTierAggregate: vi.fn(),
