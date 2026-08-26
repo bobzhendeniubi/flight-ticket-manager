@@ -1,0 +1,343 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>代理返佣费率 配置说明 — 世途旅行·运营控制台</title>
+<style>
+  :root{
+    --indigo:#4F46E5; --indigo-dark:#4338CA; --indigo-50:#EEF2FF;
+    --ink:#0F172A; --ink-soft:#334155; --muted:#64748B;
+    --bg:#F1F5F9; --card:#FFFFFF; --line:#E2E8F0;
+    --amber:#D97706; --amber-bg:#FFFBEB; --amber-line:#FDE68A;
+    --green:#059669; --green-bg:#ECFDF5;
+    --red:#DC2626; --red-bg:#FEF2F2;
+    --blue:#2563EB; --blue-bg:#EFF6FF;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:'Inter','PingFang SC','Hiragino Sans GB','Microsoft YaHei',system-ui,-apple-system,sans-serif;color:var(--ink-soft);background:var(--bg);line-height:1.75;font-size:15px}
+  .page{max-width:900px;margin:0 auto;background:var(--card);padding:40px 44px 72px;box-shadow:0 0 24px rgba(15,23,42,.06)}
+  h1,h2,h3,h4{color:var(--ink);line-height:1.35}
+  h1{font-size:26px;margin:0 0 6px}
+  h2{font-size:20px;margin:44px 0 12px;padding:10px 14px;background:var(--indigo-50);border-left:5px solid var(--indigo);border-radius:0 8px 8px 0}
+  h3{font-size:16.5px;margin:26px 0 8px;color:var(--indigo-dark)}
+  h4{font-size:14.5px;margin:18px 0 6px}
+  p{margin:8px 0}
+  .sub{color:var(--muted);font-size:13.5px;margin:0 0 4px}
+  .cover{border-bottom:3px solid var(--indigo);padding-bottom:18px;margin-bottom:22px}
+  .cover .brand{display:inline-block;background:var(--indigo);color:#fff;font-weight:700;font-size:13px;padding:3px 12px;border-radius:999px;letter-spacing:.5px;margin-bottom:12px}
+  /* 目录 */
+  .toc{background:#F8FAFC;border:1px solid var(--line);border-radius:12px;padding:16px 22px;margin:18px 0 8px}
+  .toc ol{margin:6px 0;padding-left:22px}
+  .toc li{margin:3px 0}
+  .toc a{color:var(--indigo-dark);text-decoration:none}
+  .toc a:hover{text-decoration:underline}
+  /* 步骤列表 */
+  ol.steps{counter-reset:st;list-style:none;padding-left:0;margin:10px 0}
+  ol.steps>li{counter-increment:st;position:relative;padding:4px 0 4px 40px;margin:6px 0}
+  ol.steps>li::before{content:counter(st);position:absolute;left:0;top:7px;width:26px;height:26px;border-radius:50%;background:var(--indigo);color:#fff;font-weight:700;font-size:13.5px;line-height:26px;text-align:center}
+  /* 提示框 */
+  .tip,.warn,.info{border-radius:10px;padding:10px 14px 10px 42px;margin:12px 0;position:relative;font-size:14px}
+  .tip::before,.warn::before,.info::before{position:absolute;left:13px;top:9px;font-size:16px}
+  .tip{background:var(--green-bg);border:1px solid #A7F3D0}.tip::before{content:"💡"}
+  .warn{background:var(--amber-bg);border:1px solid var(--amber-line)}.warn::before{content:"⚠️"}
+  .info{background:var(--blue-bg);border:1px solid #BFDBFE}.info::before{content:"ℹ️"}
+  /* 表格 */
+  table.doc{width:100%;border-collapse:collapse;margin:12px 0;font-size:13.5px}
+  table.doc th{background:var(--indigo-50);color:var(--indigo-dark);text-align:left;padding:8px 10px;border:1px solid var(--line);white-space:nowrap}
+  table.doc td{padding:8px 10px;border:1px solid var(--line);vertical-align:top}
+  table.doc tr:nth-child(even) td{background:#FAFBFF}
+  /* ── 界面示意图（模拟 Console 风格）── */
+  .mock{border:1px solid #CBD5E1;border-radius:12px;overflow:hidden;margin:16px 0;background:#F8FAFC;box-shadow:0 2px 6px rgba(15,23,42,.08);font-size:12.5px;color:#334155}
+  .mock-bar{display:flex;align-items:center;gap:6px;background:#E2E8F0;padding:7px 12px;font-size:11.5px;color:#64748B}
+  .dot{width:9px;height:9px;border-radius:50%;display:inline-block}
+  .mock-body{padding:14px 16px}
+  .mtitle{font-size:15px;font-weight:700;color:#0F172A;margin-bottom:2px}
+  .msub{font-size:11.5px;color:#94A3B8;margin-bottom:10px}
+  .mrow{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:8px 0}
+  .mbtn{display:inline-block;border:1px solid #CBD5E1;background:#fff;border-radius:8px;padding:4px 11px;font-size:12px;color:#334155;white-space:nowrap}
+  .mbtn.primary{background:var(--indigo);border-color:var(--indigo);color:#fff;font-weight:600}
+  .mbtn.ghost{border-style:dashed;color:#64748B}
+  .msel{display:inline-block;border:1px solid #CBD5E1;background:#fff;border-radius:8px;padding:4px 9px;font-size:12px;color:#64748B;white-space:nowrap}
+  .msel::after{content:" ▾";font-size:10px}
+  .minput{display:inline-block;border:1px solid #CBD5E1;background:#fff;border-radius:8px;padding:4px 9px;font-size:12px;color:#94A3B8;white-space:nowrap}
+  .mlabel{font-size:11px;color:#94A3B8;display:block;margin-bottom:2px}
+  .fgroup{display:inline-block;vertical-align:top;margin:3px 6px 3px 0}
+  .badge{display:inline-block;border-radius:999px;padding:1px 9px;font-size:11px;font-weight:600}
+  .b-amber{background:#FEF3C7;color:#B45309}.b-green{background:#D1FAE5;color:#047857}.b-blue{background:#DBEAFE;color:#1D4ED8}.b-red{background:#FEE2E2;color:#B91C1C}.b-gray{background:#E2E8F0;color:#475569}.b-indigo{background:var(--indigo-50);color:var(--indigo-dark)}
+  table.mtab{width:100%;border-collapse:collapse;font-size:11.5px;background:#fff;border-radius:8px;overflow:hidden}
+  table.mtab th{background:#F1F5F9;color:#64748B;font-weight:600;text-align:left;padding:5px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+  table.mtab td{padding:5px 8px;border-bottom:1px solid #F1F5F9;white-space:nowrap}
+  /* 高亮标注 */
+  .hl{position:relative;outline:2.5px solid var(--red);outline-offset:2px;border-radius:8px}
+  .hl.a{outline-color:var(--amber)}
+  .tag{position:absolute;top:-12px;left:-12px;width:21px;height:21px;border-radius:50%;background:var(--red);color:#fff;font-size:12.5px;line-height:21px;text-align:center;font-weight:700;z-index:2;box-shadow:0 1px 3px rgba(0,0,0,.3)}
+  .hl.a>.tag{background:var(--amber)}
+  .legend{background:#FFF;border:1px dashed #CBD5E1;border-radius:10px;padding:8px 14px;margin:8px 0 16px;font-size:13.5px}
+  .legend b.n{display:inline-block;width:19px;height:19px;border-radius:50%;background:var(--red);color:#fff;font-size:11.5px;line-height:19px;text-align:center;margin-right:6px}
+  .legend .row{margin:4px 0}
+  /* 状态流 */
+  .flow{display:flex;flex-wrap:wrap;align-items:center;gap:4px;margin:10px 0;font-size:13px}
+  .pill{display:inline-block;border-radius:999px;padding:3px 13px;font-weight:600;font-size:12.5px;border:1.5px solid var(--line);background:#fff;color:var(--ink-soft)}
+  .pill.main{border-color:var(--indigo);background:var(--indigo-50);color:var(--indigo-dark)}
+  .pill.bad{border-color:#FCA5A5;background:var(--red-bg);color:#B91C1C}
+  .fa{color:#94A3B8;font-weight:700;padding:0 2px}
+  .kbd{display:inline-block;border:1px solid #CBD5E1;border-bottom-width:2px;border-radius:6px;background:#F8FAFC;padding:0 7px;font-size:12.5px;color:var(--ink);font-weight:600;white-space:nowrap}
+  .btnref{display:inline-block;background:var(--indigo);color:#fff;border-radius:7px;padding:0 8px;font-size:12.5px;font-weight:600;white-space:nowrap}
+  .btnref.sec{background:#fff;color:var(--ink-soft);border:1px solid #CBD5E1}
+  /* 抽屉示意 */
+  .drawer{border:1px solid #CBD5E1;border-radius:12px;background:#fff;max-width:430px;margin:14px auto;box-shadow:0 6px 18px rgba(15,23,42,.14);font-size:12px;overflow:hidden}
+  .drawer .dh{background:#F8FAFC;border-bottom:1px solid var(--line);padding:9px 14px;font-weight:700;color:#0F172A;font-size:13px}
+  .drawer .sec{padding:9px 14px;border-bottom:1px solid #F1F5F9}
+  .drawer .sec .st{font-size:10.5px;font-weight:700;color:#94A3B8;letter-spacing:1px;margin-bottom:5px}
+  .marea{display:block;border:1px solid #CBD5E1;border-radius:8px;background:#fff;padding:4px 9px;font-size:11.5px;color:#94A3B8;margin:3px 0}
+  .marea.amber{border-color:var(--amber-line);background:var(--amber-bg)}
+  /* 看板 */
+  .board{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:8px 0}
+  .bcol{background:#F1F5F9;border-radius:10px;padding:8px}
+  .bcol h5{margin:0 0 7px;font-size:12px;color:#0F172A;display:flex;justify-content:space-between}
+  .bcard{background:#fff;border:1px solid var(--line);border-radius:9px;padding:7px 9px;margin-bottom:7px;font-size:11px}
+  .bcard.red{border-color:#FCA5A5}.bcard.amberb{border-color:#FCD34D}
+  .statrow{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:8px 0}
+  .stat{background:#fff;border:1px solid var(--line);border-radius:10px;padding:8px 12px}
+  .stat .sl{font-size:10.5px;color:#94A3B8}.stat .sv{font-size:18px;font-weight:700;color:#0F172A}.stat .sv.red{color:#B91C1C}
+  .faq dt{font-weight:700;color:var(--ink);margin:16px 0 4px}
+  .faq dt::before{content:"Q：";color:var(--indigo)}
+  .faq dd{margin:0 0 4px;padding-left:26px;position:relative}
+  .faq dd::before{content:"答：";position:absolute;left:0;color:var(--muted)}
+  .footer{margin-top:48px;border-top:1px solid var(--line);padding-top:14px;font-size:12.5px;color:var(--muted)}
+  /* 打印 */
+  @media print{
+    body{background:#fff}
+    .page{box-shadow:none;padding:0 8mm;max-width:none}
+    h2{break-after:avoid}
+    .mock,.drawer,table.doc,.tip,.warn,.info,.legend,.board{break-inside:avoid}
+    a{color:inherit;text-decoration:none}
+    @page{size:A4;margin:14mm 12mm}
+  }
+
+  .shot{border:1px solid var(--line); border-radius:12px; overflow:hidden; margin:16px 0 6px; box-shadow:0 2px 10px rgba(15,23,42,.06); background:#fff; break-inside:avoid;}
+  .shot img{display:block; width:100%; height:auto;}
+  .cap{font-size:12.5px;color:var(--muted);margin:0 0 18px;text-align:center}
+  .kbd{display:inline-block;border:1px solid #CBD5E1;border-bottom-width:2px;border-radius:6px;padding:0 6px;font-size:12.5px;background:#F8FAFC;color:#334155}
+  @media print{
+    body{background:#fff}
+    .page{box-shadow:none;max-width:none;padding:0 0 24px}
+    .shot,.card,table,.tip,.warn,.info{break-inside:avoid; page-break-inside:avoid;}
+    h2{break-after:avoid; page-break-after:avoid;}
+  }
+</style>
+</head>
+<body>
+<div class="page">
+
+<div class="cover">
+  <span class="brand">世途旅行 · 运营控制台</span>
+  <h1>代理返佣费率 配置说明</h1>
+  <p class="sub">适用岗位：财务 · 运营　|　涉及页面：代理管理 → 代理详情 → 佣金规则</p>
+  <p class="sub">版本：2026-08-26　|　截图取自实际系统界面</p>
+</div>
+
+<div class="warn">
+<strong>为什么现在必须配。</strong>系统只在订单「收到钱、转为已付款」的那一刻算一次佣金，然后写死。
+如果那一刻这个代理的这档产品<strong>还没有费率规则</strong>，系统会按 0 计提、并且<strong>一条佣金记录都不生成</strong>；
+事后再把费率配上，也<strong>不会自动回头补算</strong>。<br>
+目前线上：<strong>费率规则 0 条</strong>、已计提佣金 <strong>0 条</strong>，而已经有 <strong>32 张已付款的代理订单</strong>在等着计佣。
+费率配齐后，我们会用一次性补提把这批单补上——但补提取的还是你配的费率，<strong>配错或漏配，补出来就是错的或 0</strong>。
+</div>
+
+<div class="toc">
+  <strong>目录</strong>
+  <ol>
+    <li><a href="#s1">一分钟看懂：费率怎么变成佣金</a></li>
+    <li><a href="#s2">五档产品分别管什么（全部都要配）</a></li>
+    <li><a href="#s3">在哪里配：进入佣金规则页</a></li>
+    <li><a href="#s4">配置四步</a></li>
+    <li><a href="#s5">生效日 —— 最容易配错的一项</a></li>
+    <li><a href="#s6">多级代理怎么分</a></li>
+    <li><a href="#s7">常见疑问</a></li>
+    <li><a href="#s8">配完之后</a></li>
+  </ol>
+</div>
+
+<h2 id="s1">一、一分钟看懂：费率怎么变成佣金</h2>
+
+<p>一句话：<strong>订单收到钱那一刻，系统把订单拆成一行一行的商品，每行按它自己的产品档去找费率，算出佣金记下来。</strong></p>
+
+<table class="doc">
+  <tr><th style="width:130px">环节</th><th>系统做的事</th></tr>
+  <tr><td>① 订单转「已付款」</td><td>触发计佣。<strong>只触发这一次</strong>，之后订单再怎么变都不会重算。</td></tr>
+  <tr><td>② 拆行</td><td>把订单里的机票行、酒店行、接送行、签证行、套餐行分别取出来。</td></tr>
+  <tr><td>③ 算计佣基数</td><td>按<strong>实收</strong>算：商品行金额合计，再减掉折扣（同业立减、录单让利等）。折扣按各商品行金额比例摊。附加费（机建燃油等代收代付）和保险不计佣、也不参与分摊。</td></tr>
+  <tr><td>④ 取费率</td><td>按<strong>订单的出发日期</strong>去找那一天生效的费率。<span class="hl">不是按下单日、也不是按付款日</span>。</td></tr>
+  <tr><td>⑤ 落佣金记录</td><td>卖出这单的代理拿一条，它的上级各拿一条差额（见第六节）。</td></tr>
+</table>
+
+<div class="tip">
+<strong>没配费率 ≠ 佣金是 0，而是「这单根本没有佣金记录」。</strong>
+差别在于：结算的时候，前者是一张空表——不是「算出来是 0」，是「压根没算过」。这也是为什么必须靠一次性补提来补，而不能等结算时自动补。
+</div>
+
+<h2 id="s2">二、五档产品分别管什么（全部都要配）</h2>
+
+<p>佣金规则页上有五行，对应订单里五种商品行。<strong>每一档都要配</strong>——哪怕现在某类产品还没开始卖，也建议一次配齐，
+否则等哪天卖出第一单，那一单的佣金会静悄悄地变成 0，而且没有任何提示。</p>
+
+<table class="doc">
+  <tr><th style="width:80px">产品档</th><th style="width:210px">对应订单里的哪种行</th><th>说明</th></tr>
+  <tr><td><strong>机票</strong></td><td>单独卖的机票行</td><td>含往返各航段。套餐里的机票腿也走这一档。</td></tr>
+  <tr><td><strong>酒店</strong></td><td>单独卖的酒店行</td><td>按房×晚的金额计。</td></tr>
+  <tr><td><strong>接送</strong></td><td>接送机 / 用车行</td><td></td></tr>
+  <tr><td><strong>签证</strong></td><td>签证行</td><td></td></tr>
+  <tr><td><strong>套餐</strong></td><td>套餐行（地面 + 加项）</td><td>套餐单会拆成「机票腿」+「套餐行」两部分：机票腿走机票档，套餐行走套餐档，两者金额相加正好是全包价，<strong>不会重复计佣</strong>。</td></tr>
+</table>
+
+<div class="info">
+<strong>不计佣的行：</strong>附加费（FEE，机建燃油等代收代付、结算价正差）、保险、折扣行本身。
+其中折扣行虽然不单独计佣，但会<strong>按比例从各商品行的计佣基数里扣掉</strong>——即口径是「按实际收到多少钱返佣」。
+</div>
+
+<h2 id="s3">三、在哪里配：进入佣金规则页</h2>
+
+<ol class="steps">
+  <li>左侧菜单 <span class="kbd">客户</span> → <span class="kbd">代理管理</span></li>
+  <li>在代理列表里找到目标代理，点这一行右侧的 <span class="kbd">详情</span></li>
+  <li>右侧抽屉打开后，切到 <span class="kbd">佣金规则</span> 页签</li>
+</ol>
+
+<div class="shot"><img src="shots-2026-08-26/01-代理管理入口.png"></div>
+<p class="cap">代理管理页。每行右侧的「详情」进入该代理的抽屉。</p>
+
+<h2 id="s4">四、配置四步</h2>
+
+<h3>第 1 步：确认当前状态</h3>
+<p>打开「佣金规则」页签，先看「当前生效费率」这一列。<span style="color:#DC2626;font-weight:600">红字「无规则 · 计提按 0」</span>就是<strong>还没配</strong>。</p>
+
+<div class="shot"><img src="shots-2026-08-26/02-佣金规则-未配.png"></div>
+<p class="cap">佣金规则页签。五档全部显示「无规则 · 计提按 0」＝ 这个代理一分佣金都不会算。</p>
+
+<h3>第 2 步：填五档费率 + 生效日</h3>
+<ol class="steps">
+  <li>在最右侧「新费率（%）」列，按<strong>百分数</strong>填：<code>5</code> 就是 5%（不要填 0.05）。范围 0–50。</li>
+  <li><strong>留空 = 这一档不改</strong>（不是「改成 0」）。第一次配请五档都填。</li>
+  <li>下方「生效日」选一个日期。<strong>这一项非常关键，见第五节。</strong></li>
+</ol>
+
+<div class="shot"><img src="shots-2026-08-26/03-五档费率填好.png"></div>
+<p class="cap">五档都填好、生效日选了 2026-09-01 的样子。（图中数字仅为示意，实际费率以业务口径为准。）</p>
+
+<h3>第 3 步：保存并确认</h3>
+<p>点右下角 <span class="kbd">保存费率</span>，会弹出一个确认框，把「哪天起生效、影响哪些单」再说一遍。看清楚日期再点确定。</p>
+
+<div class="shot"><img src="shots-2026-08-26/04-保存确认.png"></div>
+<p class="cap">浏览器确认框会写明：将于该日起对<strong>该日及以后出发</strong>的订单生效，此前已出发 / 在途的订单不受影响，并记入审计。</p>
+
+<h3>第 4 步：核对存上了没有</h3>
+<p>保存后表格会刷新。如果生效日是<strong>未来</strong>的某一天，费率会出现在「<strong>待生效</strong>」列，显示成
+<span style="color:#D97706;font-weight:600">2026-09-01 起 5.00%</span> 这样；当前生效那一列仍是「无规则」——<strong>这是对的，不是没存上</strong>。
+等到了生效日，它就会自动挪到「当前生效费率」。</p>
+
+<div class="shot"><img src="shots-2026-08-26/05-保存成功-待生效.png"></div>
+<p class="cap">保存成功后的样子：五档都进了「待生效」列，显示「2026-09-01 起 X%」。到了 9 月 1 日会自动挪到「当前生效费率」。</p>
+
+<h2 id="s5">五、生效日 —— 最容易配错的一项</h2>
+
+<div class="warn">
+<strong>费率按订单的「出发日期」取档，不是按下单日、也不是按付款日。</strong><br>
+一张 8 月 24 日下单、9 月 4 日起飞的单，用的是<strong>「9 月 4 日那天生效的费率」</strong>。
+所以生效日要填得比订单的出发日<strong>早或相同</strong>，否则这张单取不到费率，佣金还是 0。
+</div>
+
+<p>结合当前这批待补的订单：</p>
+
+<table class="doc">
+  <tr><th style="width:200px">事实</th><th>结论</th></tr>
+  <tr><td>32 张待补订单的出发日全部落在 <strong>2026-09-01 ～ 2026-10-02</strong></td><td>生效日只要 <strong>≤ 2026-09-01</strong>，这批单就都能取到费率</td></tr>
+  <tr><td>今天是 <strong>2026-08-26</strong>，早于全部出发日</td><td>现在配，生效日填<strong>今天</strong>或 <strong>2026-09-01</strong> 都可以，两种都覆盖得到这 32 张单</td></tr>
+  <tr><td>生效日<strong>留空</strong> = 立即生效</td><td>等同于填今天，这批单同样覆盖得到</td></tr>
+  <tr><td class="hl">如果拖到 9 月 1 日以后才配</td><td class="hl">系统不允许填过去的日期 → 9 月 1 日起飞的那些单<strong>永远取不到费率，补提出来还是 0</strong></td></tr>
+</table>
+
+<div class="warn">
+<strong>结论：越早配越安全，最迟不要晚于 2026 年 9 月 1 日。</strong>
+一旦过了 9 月 1 日，已经起飞或即将起飞的那部分单就再也补不回来了——因为生效日填不到过去。
+</div>
+
+<div class="tip">
+<strong>这次建议统一填 <span style="font-size:16px">2026-09-01</span>。</strong>
+理由：这批单最早的出发日就是 9 月 1 日，用它做生效日，边界最清楚，日后翻账也一眼能对上「这批费率是为哪一段生效的」。
+填今天（2026-08-26）同样有效，只是账面上多出几天没有订单的空档。
+</div>
+
+<h3>其它几条时间上的规矩</h3>
+<table class="doc">
+  <tr><th style="width:150px">规矩</th><th>含义</th></tr>
+  <tr><td>历史不回溯</td><td>保存新费率<strong>不会</strong>改动已经算过佣金的订单。已落账的佣金记录原样保留。</td></tr>
+  <tr><td>保存 = 追加一条新规则</td><td>不是覆盖。旧规则保留在历史里，各管各的生效区间，随时可查。</td></tr>
+  <tr><td>不能填过去的日期</td><td>日期控件本身限制了最早只能选今天。要覆盖更早的出发日，只能靠一次性补提（见第八节）。</td></tr>
+  <tr><td>全部留痕</td><td>谁在什么时候改成了多少，都记进审计日志。</td></tr>
+</table>
+
+<h2 id="s6">六、多级代理怎么分</h2>
+
+<p>代理是分层的（1 级总代 → 2 级 → 3 级门店）。一张单卖出去以后：</p>
+
+<table class="doc">
+  <tr><th style="width:150px">角色</th><th>拿多少</th></tr>
+  <tr><td>卖出这单的代理</td><td>它自己的费率 × 计佣基数</td></tr>
+  <tr><td>它的上级</td><td>（上级费率 − 下级费率）× 计佣基数，即<strong>差额</strong></td></tr>
+  <tr><td>再上级</td><td>（再上级费率 − 上级费率）× 计佣基数，依此类推</td></tr>
+</table>
+
+<div class="info">
+所以整条链拿走的总和 = <strong>最顶层那一级的费率</strong> × 计佣基数。<br>
+这意味着<strong>上级的费率必须 ≥ 下级</strong>。万一配反了（下级比上级高），系统会自动跳过那一段负差额，不会算出负佣金——但那说明费率配错了，请回来改。
+</div>
+
+<div class="tip">
+当前这 32 张待补订单涉及的 4 家代理<strong>都是 1 级、没有上级</strong>，所以这次不用操心层级差额，
+每家配好自己的五档费率即可。
+</div>
+
+<h2 id="s7">七、常见疑问</h2>
+
+<table class="doc">
+  <tr><th style="width:230px">问</th><th>答</th></tr>
+  <tr><td>某一档我不想改，怎么办？</td><td><strong>留空</strong>。留空是「这一档不动」，不是「改成 0」。</td></tr>
+  <tr><td>想把某档改成 0 呢？</td><td>填 <code>0</code>。那是明确的「这档不返佣」，与「没配规则」在系统里是两回事。</td></tr>
+  <tr><td>保存后「当前生效费率」还是红字，是不是没存上？</td><td>不是。看「待生效」列——只要那里出现了日期和百分比，就是存上了，到日子自动生效。</td></tr>
+  <tr><td>填错了怎么办？</td><td>再填一次、再保存一次即可，以最新的一条为准。旧的留在历史里不影响。</td></tr>
+  <tr><td>代理自己能看到费率吗？</td><td>能看，<strong>只读</strong>，改不了。费率维护是内部岗位的权限。</td></tr>
+  <tr><td>改了费率，之前的单会变吗？</td><td>不会。已算过的佣金原样保留。</td></tr>
+</table>
+
+<h2 id="s8">八、配完之后</h2>
+
+<ol class="steps">
+  <li><strong>你这边</strong>：把 4 家代理的五档费率配齐，生效日统一 <strong>2026-09-01</strong>。</li>
+  <li><strong>技术这边</strong>：跑一次「补提预演」，把每张单该补多少、每家代理合计多少列成清单交给你核对。<strong>预演只读，不动账。</strong></li>
+  <li><strong>你核对无误后</strong>：再执行正式补提，把这 32 张单的佣金一次性补进去。</li>
+</ol>
+
+<div class="warn">
+补提用的就是你配的费率，逐张单调用系统正常的计提逻辑——<strong>它算出来的每一分钱，就是这单当初正常付款时系统本该算出来的那一分钱</strong>。
+所以配置这一步的准确性，直接决定补出来的账对不对。请务必确认：<strong>五档都配了、生效日是 2026-09-01 或更早、四家代理一个都没落下。</strong>
+</div>
+
+<table class="doc">
+  <tr><th style="width:180px">代理</th><th style="width:110px">待补订单</th><th>实收金额</th></tr>
+  <tr><td>世途8</td><td>12 张</td><td>¥18,800</td></tr>
+  <tr><td>易达OTA</td><td>14 张</td><td>¥13,690</td></tr>
+  <tr><td>说走就走</td><td>5 张</td><td>¥5,000</td></tr>
+  <tr><td>世途1</td><td>1 张</td><td>¥880</td></tr>
+  <tr><td colspan="3" style="background:#F8FAFC"><strong>合计 32 张 · ¥38,370</strong>（这批单只涉及机票行；其余四档同样要配，是为了以后卖出的单不再归零）</td></tr>
+</table>
+
+<p style="margin-top:40px;color:#94A3B8;font-size:12.5px;border-top:1px solid #E2E8F0;padding-top:12px">
+世途旅行 · 运营控制台　|　代理返佣费率配置说明　|　2026-08-26
+</p>
+
+</div>
+
+</body>
+</html>
