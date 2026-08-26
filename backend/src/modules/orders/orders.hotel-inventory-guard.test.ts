@@ -45,6 +45,7 @@ vi.mock('../../db/prisma.js', () => ({ prisma: mockPrisma }));
 import {
   OrderService,
   assertHotelStaysFitWithinTx,
+  assertRandomTierStaysFitWithinTx,
   HOTEL_SOLD_OUT_MESSAGE,
 } from './orders.service.js';
 import { BadRequestError } from '../../lib/errors.js';
@@ -375,5 +376,186 @@ describe('addGroundItem · 补录房费的房量闸（同源无闸）', () => {
     // 占房查询里不得出现 excludeOrderId 派生的 `id: { not: … }`
     const where = (tx.orderItem.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0].where;
     expect(where.order.id).toBeUndefined();
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 随机档聚合余量闸（事务内带行锁版）
+// 与上面那道真酒店物理闸互补：未落位的随机档行占的是「同星级酒店合计余量」。
+// 此前建单路径只在**事务外**跑只读版聚合判定 —— 两笔并发单抢同星级最后一间会各自读到
+// 「还剩 1 间」的旧快照双双通过，落库后超卖。
+// ══════════════════════════════════════════════════════════════════════════
+type RandomTierFixture = {
+  /** 该档次真酒店该区间每晚包房间数；null = 一条周期都没有（未纳入管控）。*/
+  blockRooms?: number | null;
+  /** 该档次已存在的未落位占用（床位口径，各占整段）。*/
+  pendingRooms?: number[];
+  /** 该档次已落位真酒店的占用。*/
+  hotelRooms?: number[];
+  /** hotelRoomType → 占位档次（非空 = 随机档占位酒店的伪房型）。*/
+  roomTypes?: Array<{ id: string; randomTierPlaceholder: number | null }>;
+};
+
+function buildRandomTierTx(f: RandomTierFixture = {}) {
+  const blockRooms = f.blockRooms === undefined ? 2 : f.blockRooms;
+  const rows = (list: number[] | undefined) =>
+    (list ?? []).map((rooms) => ({
+      hotelCheckIn: new Date('2026-09-01T00:00:00.000Z'),
+      hotelCheckOut: new Date('2026-09-03T00:00:00.000Z'),
+      roomsBilled: new Prisma.Decimal(rooms),
+      metadata: null,
+    }));
+  return {
+    $queryRaw: vi.fn(async (strings: TemplateStringsArray) => {
+      const sql = Array.isArray(strings) ? strings.join('?') : String(strings);
+      if (sql.includes('HotelBlockPeriod')) callTrace.push('LOCK_BLOCK_PERIODS');
+      return [{ id: 'locked-row' }];
+    }),
+    hotel: {
+      findMany: vi.fn(async () => {
+        callTrace.push('READ_TIER_HOTELS');
+        return [{ id: 'hotel-a' }, { id: 'hotel-b' }];
+      }),
+    },
+    hotelRoomType: {
+      findMany: vi.fn(async () =>
+        (f.roomTypes ?? []).map((rt) => ({
+          id: rt.id,
+          hotel: { randomTierPlaceholder: rt.randomTierPlaceholder },
+        })),
+      ),
+    },
+    hotelBlockPeriod: {
+      findMany: vi.fn(async () => {
+        callTrace.push('READ_BLOCK_PERIODS');
+        return blockRooms == null
+          ? []
+          : [
+              {
+                dateFrom: new Date('2026-09-01T00:00:00.000Z'),
+                dateTo: new Date('2026-09-30T00:00:00.000Z'),
+                rooms: blockRooms,
+              },
+            ];
+      }),
+    },
+    orderItem: {
+      // 聚合闸分两次查占用：已落位（where.hotelRoomTypeId.not）与未落位（where.OR）。
+      findMany: vi.fn(async (args: { where: Record<string, unknown> }) => {
+        callTrace.push('READ_OCCUPANCY');
+        return args.where.OR ? rows(f.pendingRooms) : rows(f.hotelRooms);
+      }),
+    },
+  };
+}
+
+/** 一条未落位随机档占房（后台直接录「四星随机」）。*/
+const RANDOM_STAY = {
+  hotelRoomTypeId: null,
+  randomStarTier: 4,
+  hotelCheckIn: new Date('2026-09-01T00:00:00.000Z'),
+  hotelCheckOut: new Date('2026-09-03T00:00:00.000Z'),
+};
+
+describe('assertRandomTierStaysFitWithinTx · 事务内带行锁的随机档聚合闸', () => {
+  it('同星级包房 2 间、已占 1 间，再来 1 间 → 放行（恰好装满不算超卖）', async () => {
+    const tx = buildRandomTierTx({ blockRooms: 2, pendingRooms: [1] });
+
+    await expect(
+      assertRandomTierStaysFitWithinTx(tx as never, [{ ...RANDOM_STAY, roomsBilled: 1 }]),
+    ).resolves.toBeUndefined();
+  });
+
+  it('同星级包房 2 间、已占 1 间，再来 2 间 → 拒，且回中性话术（不泄露合计余量）', async () => {
+    const tx = buildRandomTierTx({ blockRooms: 2, pendingRooms: [1] });
+
+    await expect(
+      assertRandomTierStaysFitWithinTx(tx as never, [{ ...RANDOM_STAY, roomsBilled: 2 }], {
+        buildMessage: () => HOTEL_SOLD_OUT_MESSAGE,
+      }),
+    ).rejects.toThrow(new BadRequestError(HOTEL_SOLD_OUT_MESSAGE));
+  });
+
+  it('该档次整段没有任何包房周期 → 不拦截（未配包房 ≠ 售罄）', async () => {
+    const tx = buildRandomTierTx({ blockRooms: null, pendingRooms: [9] });
+
+    await expect(
+      assertRandomTierStaysFitWithinTx(tx as never, [{ ...RANDOM_STAY, roomsBilled: 5 }]),
+    ).resolves.toBeUndefined();
+  });
+
+  it('必须先 FOR UPDATE 锁该档次全部真酒店的包房周期行、再读余量', async () => {
+    const tx = buildRandomTierTx({ blockRooms: 5 });
+
+    await assertRandomTierStaysFitWithinTx(tx as never, [{ ...RANDOM_STAY, roomsBilled: 1 }]);
+
+    expect(callTrace).toContain('LOCK_BLOCK_PERIODS');
+    expect(callTrace.indexOf('LOCK_BLOCK_PERIODS')).toBeLessThan(
+      callTrace.indexOf('READ_BLOCK_PERIODS'),
+    );
+  });
+
+  it('同单同档次同区间的两条行合并成一笔 —— 逐行各判一次会双双放行', async () => {
+    // 余 1 间；本次要落两条各 1 间的随机档行 → 合并后 2 间 > 1 间 → 拒。
+    const tx = buildRandomTierTx({ blockRooms: 2, pendingRooms: [1] });
+
+    await expect(
+      assertRandomTierStaysFitWithinTx(tx as never, [
+        { ...RANDOM_STAY, roomsBilled: 1 },
+        { ...RANDOM_STAY, roomsBilled: 1 },
+      ]),
+    ).rejects.toThrow(BadRequestError);
+    // 合并后对该档次只加一次锁、只判一次
+    expect(callTrace.filter((c) => c === 'LOCK_BLOCK_PERIODS')).toHaveLength(1);
+  });
+
+  it('房型挂在随机档占位酒店上（套餐绑定占位房型）→ 同样归本闸，档次取 randomTierPlaceholder', async () => {
+    const tx = buildRandomTierTx({
+      blockRooms: 1,
+      pendingRooms: [1],
+      roomTypes: [{ id: 'rt-placeholder', randomTierPlaceholder: 4 }],
+    });
+
+    await expect(
+      assertRandomTierStaysFitWithinTx(tx as never, [
+        {
+          hotelRoomTypeId: 'rt-placeholder',
+          hotelCheckIn: RANDOM_STAY.hotelCheckIn,
+          hotelCheckOut: RANDOM_STAY.hotelCheckOut,
+          roomsBilled: 1,
+        },
+      ]),
+    ).rejects.toThrow(BadRequestError);
+  });
+
+  it('具体真酒店的房型行 → 跳过本闸（走物理房量闸），一条都不锁', async () => {
+    const tx = buildRandomTierTx({
+      blockRooms: 1,
+      pendingRooms: [1],
+      roomTypes: [{ id: 'rt-real', randomTierPlaceholder: null }],
+    });
+
+    await expect(
+      assertRandomTierStaysFitWithinTx(tx as never, [
+        {
+          hotelRoomTypeId: 'rt-real',
+          hotelCheckIn: RANDOM_STAY.hotelCheckIn,
+          hotelCheckOut: RANDOM_STAY.hotelCheckOut,
+          roomsBilled: 9,
+        },
+      ]),
+    ).resolves.toBeUndefined();
+    expect(callTrace).not.toContain('LOCK_BLOCK_PERIODS');
+  });
+
+  it('无入住日期的行（纯机票行等）→ 一条都不查库，直接返回', async () => {
+    const tx = buildRandomTierTx();
+
+    await assertRandomTierStaysFitWithinTx(tx as never, [
+      { hotelRoomTypeId: null, hotelCheckIn: null, hotelCheckOut: null },
+    ]);
+
+    expect(tx.hotelRoomType.findMany).not.toHaveBeenCalled();
+    expect(callTrace).toHaveLength(0);
   });
 });

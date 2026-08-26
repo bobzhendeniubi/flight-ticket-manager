@@ -54,6 +54,8 @@ vi.mock('../hotel-control/hotel-control.service.js', () => ({
   assertHotelPhysicalFit: vi.fn(),
   assertHotelPhysicalFitWithinTx: vi.fn(),
   assertRandomTierFit: vi.fn(),
+  // 事务内带行锁版（建单/改日期的权威判定走它）：桩与真模块导出对齐。
+  assertRandomTierFitWithinTx: vi.fn(),
   checkHotelPhysicalFit: vi.fn(),
   getHotelNightlyRemaining: vi.fn(),
   getRandomTierAggregate: vi.fn(),

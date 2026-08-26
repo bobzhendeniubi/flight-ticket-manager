@@ -93,7 +93,11 @@ function flightBody(roundTrip = false): CreateOrderBody {
   return { items } as unknown as CreateOrderBody;
 }
 
-type CalendarResult = { totalCny: number; audit: Record<string, unknown> } | null;
+type CalendarResult =
+  | { totalCny: number; audit: Record<string, unknown> }
+  // 明确放弃自动取价（如含非经济舱航段）：带人类可读原因，供 createOrder 留痕 / quote 展示。
+  | { totalCny: null; skippedReason: string }
+  | null;
 const resolveFlightCalendar = (
   service: OrderService,
   body: CreateOrderBody,
@@ -169,6 +173,37 @@ describe('resolveFlightSettlementCalendarTotal · 取价口径', () => {
     } as unknown as CreateOrderBody;
     expect(await resolveFlightCalendar(new OrderService(), body)).toBeNull();
     expect(mockGetFlightSettlementRate).not.toHaveBeenCalled();
+  });
+
+  // ── 舱位维度：机票结算价日历的键只有「航班号 × 出发日」，没有舱位 ────────────
+  // 商务舱行拿这张表取到的是**经济舱**同业价，再被 SETTLEMENT 差额行把整单砸到经济舱价
+  // → 一单少收整个舱位差。故含非经济舱航段一律整单放弃自动取价。
+  it('商务舱航段 → 整单放弃自动取价并带原因（绝不按经济舱价收敛）', async () => {
+    const body = {
+      items: [{ ...flightBody().items[0], flightCabin: 'BUSINESS' }],
+    } as unknown as CreateOrderBody;
+    const r = await resolveFlightCalendar(new OrderService(), body);
+    expect(r).not.toBeNull();
+    expect(r!.totalCny).toBeNull();
+    expect((r as { skippedReason: string }).skippedReason).toContain('商务舱');
+    expect((r as { skippedReason: string }).skippedReason).toContain('人工设置');
+    // 连查都不查：不给「查到了经济舱价却没用」留任何误用余地。
+    expect(mockGetFlightSettlementRate).not.toHaveBeenCalled();
+  });
+
+  it('往返只有回程是超级经济舱 → 整单放弃（不做半单收敛）', async () => {
+    const items = flightBody(true).items as Array<Record<string, unknown>>;
+    const body = {
+      items: [items[0], { ...items[1], flightCabin: 'PREMIUM_ECONOMY' }],
+    } as unknown as CreateOrderBody;
+    const r = await resolveFlightCalendar(new OrderService(), body);
+    expect(r!.totalCny).toBeNull();
+    expect((r as { skippedReason: string }).skippedReason).toContain('超级经济舱');
+  });
+
+  it('全经济舱 → 正常取价（本闸不误伤既有主路径）', async () => {
+    const r = await resolveFlightCalendar(new OrderService(), flightBody(true));
+    expect(r!.totalCny).toBe(2000 + 2400);
   });
 
   it('含套餐行 → 不参与（套餐走地面结算价日历，机票表不接管整单）', async () => {
@@ -421,6 +456,25 @@ describe('createOrder · 机票结算价日历收敛', () => {
 
     expect(findSettlementRow(itemsPassedToCreate())).toBeUndefined();
     expect(totalPassedToCreate()).toBe(2600);
+  });
+
+  it('代理单含商务舱航段 → 不收敛（总额=系统权威价）+ 留一条放弃取价的 WARNING 审计', async () => {
+    const service = makeService(2600);
+    const items = flightBody().items as Array<Record<string, unknown>>;
+    await service.createOrder(
+      agentOrderBody({ items: [{ ...items[0], flightCabin: 'BUSINESS' }] }),
+      ADMIN,
+    );
+
+    // 关键：绝不按经济舱价把商务舱单砸到 ¥2000。
+    expect(findSettlementRow(itemsPassedToCreate())).toBeUndefined();
+    expect(totalPassedToCreate()).toBe(2600);
+    const skipAudit = mockPrisma.auditLog.create.mock.calls
+      .map((c) => (c[0] as { data: Record<string, unknown> }).data)
+      .find((d) => d.action === 'FLIGHT_SETTLEMENT_CALENDAR_SKIPPED');
+    expect(skipAudit).toBeDefined();
+    expect(skipAudit!.severity).toBe('WARNING');
+    expect(String((skipAudit!.after as { reason: string }).reason)).toContain('商务舱');
   });
 });
 

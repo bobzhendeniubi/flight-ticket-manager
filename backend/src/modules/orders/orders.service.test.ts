@@ -4018,18 +4018,47 @@ describe('OrderService.createOrder · settlement discount guardrails', () => {
     expect(mockPrisma.$transaction).not.toHaveBeenCalled();
   });
 
-  it('散客低于同业日历价 → 记录告警但允许下单', async () => {
+  // ── 渠道价格倒挂闸：散客价不得低于同业结算价 ──────────────────────────────
+  // 旧行为是「打一条 warn 就放行」，日志没人盯 → 倒挂单照常成交。现改为硬拒。
+  it('散客立减击穿同业日历价 → 拒单（不落库）', async () => {
     const service = prepareService({ authoritativeTotal: 200 });
     mockPrisma.bundle.findMany.mockResolvedValue([{ id: 'bundle-a', name: '套餐 A', settlementTier: 'CITY_3STAR', settlementNights: 3 }]);
     mockResolveRetailSettlementDiscount.mockResolvedValue({ ruleId: 'retail-low', kind: 'RETAIL', discountPerPersonCny: 50 });
+    // 同业价 ¥300/人 × 1人 = 300 > 折后 150 → 击穿。
     mockGetSettlementRate.mockResolvedValue({ pricePerPersonCny: 300 });
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-    await expect(service.createOrder(bundleBody as never, { userId: 'customer-user', role: 'CUSTOMER' })).resolves.toBeDefined();
-    expect(warnSpy).toHaveBeenCalledWith(
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    await expect(
+      service.createOrder(bundleBody as never, { userId: 'customer-user', role: 'CUSTOMER' }),
+    ).rejects.toThrow('低于同业结算价');
+    // 拒单发生在事务之前：不扣座、不落库。
+    expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+    // 内部同业价数字只进日志，不进给客人的报错文案。
+    expect(errorSpy).toHaveBeenCalledWith(
       '[orders] retail settlement discount is below settlement calendar price',
-      expect.objectContaining({ ruleIds: ['retail-low'] }),
+      expect.objectContaining({ ruleIds: ['retail-low'], settlementCalendarCny: 300 }),
     );
-    warnSpy.mockRestore();
+    errorSpy.mockRestore();
+  });
+
+  it('同业价取不到（日历未配）→ 无基准可比，维持放行不误伤', async () => {
+    const service = prepareService({ authoritativeTotal: 200 });
+    mockPrisma.bundle.findMany.mockResolvedValue([{ id: 'bundle-a', name: '套餐 A', settlementTier: 'CITY_3STAR', settlementNights: 3 }]);
+    mockResolveRetailSettlementDiscount.mockResolvedValue({ ruleId: 'retail-low', kind: 'RETAIL', discountPerPersonCny: 50 });
+    mockGetSettlementRate.mockResolvedValue(null);
+    await expect(
+      service.createOrder(bundleBody as never, { userId: 'customer-user', role: 'CUSTOMER' }),
+    ).resolves.toBeDefined();
+  });
+
+  it('散客折后价恰等于同业价 → 不算击穿，放行', async () => {
+    const service = prepareService({ authoritativeTotal: 200 });
+    mockPrisma.bundle.findMany.mockResolvedValue([{ id: 'bundle-a', name: '套餐 A', settlementTier: 'CITY_3STAR', settlementNights: 3 }]);
+    mockResolveRetailSettlementDiscount.mockResolvedValue({ ruleId: 'retail-eq', kind: 'RETAIL', discountPerPersonCny: 50 });
+    // 同业价 ¥150/人 × 1人 = 折后 200 − 50 = 150 → 相等，不拦。
+    mockGetSettlementRate.mockResolvedValue({ pricePerPersonCny: 150 });
+    await expect(
+      service.createOrder(bundleBody as never, { userId: 'customer-user', role: 'CUSTOMER' }),
+    ).resolves.toBeDefined();
   });
 });
 

@@ -34,7 +34,7 @@ vi.mock('../finances/finances.cost.service.js', () => ({
   localDate: vi.fn((date: Date) => date.toISOString().slice(0, 10)),
 }));
 
-import { OrderService } from './orders.service.js';
+import { OrderService, shouldApplyRetailSettlementDiscount } from './orders.service.js';
 
 const flightItem = {
   kind: 'FLIGHT' as const,
@@ -230,6 +230,9 @@ describe('OrderService.quoteOrder · settlementPreview', () => {
       kind: 'RETAIL',
       discountPerPersonCny: departDate === '2026-09-01' ? 80 : 120,
     }));
+    // 同业价压到折后价（3580）以下：本例验的是「每行各按自己的 goDate 命中规则」，
+    // 不是价格倒挂闸。用默认的 ¥1500/人（合计 ¥4500）会命中倒挂闸拒单，与本例无关。
+    mockGetSettlementRate.mockResolvedValue({ pricePerPersonCny: 500 });
     const service = new OrderService();
     stubPricing(service, [
       { ...flightItem, bundleId: 'bundle-a', unitPrice: 900, amount: 900 },
@@ -362,5 +365,99 @@ describe('OrderService.quoteOrder · settlementPreview', () => {
       expect.any(Error),
     );
     errorSpy.mockRestore();
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// 散客立减判定：quote 与 createOrder 必须同口径
+// 此前 quote 只判 !agentId、createOrder 还要求「无手工价通道」——带手工调价试算时
+// 报价里有立减、真下单却没有，运营对着两个数字无从判断。现在两边共用同一个函数。
+// ════════════════════════════════════════════════════════════════════════════
+describe('shouldApplyRetailSettlementDiscount · 下单与试算的同一把尺', () => {
+  it('散客 + 无任何手工价通道 → 加自动立减', () => {
+    expect(shouldApplyRetailSettlementDiscount({})).toBe(true);
+    expect(shouldApplyRetailSettlementDiscount({ agentId: null })).toBe(true);
+  });
+
+  it('有归属代理 → 不加（走 AGENT 立减那条链）', () => {
+    expect(shouldApplyRetailSettlementDiscount({ agentId: 'agent-1' })).toBe(false);
+  });
+
+  it.each([
+    ['手工调价', { priceAdjustment: { amountCny: 50, reasonCode: 'MISC_FEE' } }],
+    ['手填结算总价', { settlementTotalCny: 500 }],
+    ['团队议价', { flightSettlementPriceCny: 300 }],
+  ])('散客 + %s → 不加（手工价视为整体替代，不再叠自动立减）', (_label, manual) => {
+    expect(shouldApplyRetailSettlementDiscount(manual)).toBe(false);
+  });
+
+  it('quote 带手工调价 → 试算明细里没有自动立减行（与 createOrder 同结果）', async () => {
+    const bundleItem = {
+      kind: 'BUNDLE' as const,
+      description: '套餐',
+      quantity: 1,
+      bundleId: 'bundle-1',
+      unitPrice: 0,
+      adultCount: 1,
+      childCount: 0,
+      infantCount: 0,
+      metadata: { goDate: '2026-09-01' },
+    };
+    mockPrisma.bundle.findMany.mockResolvedValue([
+      { id: 'bundle-1', name: '套餐', settlementTier: 'THREE_STAR', settlementNights: 1 },
+    ]);
+    mockResolveRetailSettlementDiscount.mockResolvedValue({
+      ruleId: 'retail-1',
+      kind: 'RETAIL',
+      discountPerPersonCny: 100,
+    });
+    const service = new OrderService();
+    stubPricing(service, [
+      { ...flightItem, bundleId: 'bundle-1', unitPrice: 900, amount: 900 },
+      { ...bundleItem, unitPrice: 700, amount: 700, settlementAddOnCny: 0 },
+    ]);
+
+    const result = await service.quoteOrder({
+      items: [flightItem, bundleItem],
+      priceAdjustment: { amountCny: 50, reasonCode: 'MISC_FEE' },
+    } as never);
+
+    expect(result.items.some((item) => item.kind === 'DISCOUNT')).toBe(false);
+    expect(mockResolveRetailSettlementDiscount).not.toHaveBeenCalled();
+  });
+
+  it('quote 不带手工通道 → 照常有自动立减行（不误伤既有主路径）', async () => {
+    const bundleItem = {
+      kind: 'BUNDLE' as const,
+      description: '套餐',
+      quantity: 1,
+      bundleId: 'bundle-1',
+      unitPrice: 0,
+      adultCount: 1,
+      childCount: 0,
+      infantCount: 0,
+      metadata: { goDate: '2026-09-01' },
+    };
+    mockPrisma.bundle.findMany.mockResolvedValue([
+      { id: 'bundle-1', name: '套餐', settlementTier: 'THREE_STAR', settlementNights: 1 },
+    ]);
+    // 同业价压到折后价（1500）以下，避开渠道倒挂闸——本例验的不是那道闸。
+    mockGetSettlementRate.mockResolvedValue({ pricePerPersonCny: 500 });
+    mockResolveRetailSettlementDiscount.mockResolvedValue({
+      ruleId: 'retail-1',
+      kind: 'RETAIL',
+      discountPerPersonCny: 100,
+    });
+    const service = new OrderService();
+    stubPricing(service, [
+      { ...flightItem, bundleId: 'bundle-1', unitPrice: 900, amount: 900 },
+      { ...bundleItem, unitPrice: 700, amount: 700, settlementAddOnCny: 0 },
+    ]);
+
+    const result = await service.quoteOrder({ items: [flightItem, bundleItem] });
+
+    expect(result.items).toContainEqual(
+      expect.objectContaining({ kind: 'DISCOUNT', amount: -100 }),
+    );
   });
 });
