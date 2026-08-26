@@ -153,7 +153,9 @@ export function resolveScheduleCost(
  * 计算单条 FLIGHT OrderItem 的实时成本。
  *
  * 机票订单行不保存成本快照，成本按班次生效成本实时计算：
- *   (包机费 ÷ 总座位 + 机场税 + 燃油 + 旺季 + 机型调整 − 起降折扣) × 行人数
+ *   (包机费 ÷ 总座位 + 机场税 + 燃油 + 旺季 + 机型调整 + 起降折扣) × 行人数
+ * 起降折扣是带符号科目（负数=补贴/减项，见 docs/财务模块-需求与数据依赖.md Q14）——
+ * 和机型调整同构，直接相加；此前此处独家用减号，与概览/导出/录入口径相反。
  * 成本字段全部为空，或包机费存在但总座位为 0 无法分摊时，返回 null，
  * 由调用方按缺成本处理；其余单项为空按财务口径视为 0。
  */
@@ -186,7 +188,7 @@ export function resolveFlightItemCost(
     (effective.airportTaxArrCny ?? 0) +
     (effective.fuelCostCny ?? 0) +
     (effective.peakSurchargeCny ?? 0) +
-    (effective.aircraftAdjustCny ?? 0) -
+    (effective.aircraftAdjustCny ?? 0) +
     (effective.takeoffDiscountCny ?? 0);
   return round2(unitCost * quantity);
 }
