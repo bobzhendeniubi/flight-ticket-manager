@@ -3,6 +3,7 @@
  */
 import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
+import { localYmd } from '../lib/airports';
 import { api, ApiError, ROSTER_FORMAT_LABEL, SETTLEMENT_MODE_LABEL, type AgentListItem, type CommissionKind, type CreateChildAgentInput, type CustomerSummary, type RosterFormat, type SettlementDiscountRule, type SettlementMode, type SettlementTier, type UpdateAgentInput } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { Icon } from '../components/Icon';
@@ -24,6 +25,8 @@ export function AgentsPage() {
   const tokens = useAuth((s) => s.tokens);
   const user = useAuth((s) => s.user);
   const isAdmin = user?.role === 'ADMIN' || user?.role === 'STAFF';
+  // 重置代理登录密码是敏感操作，只放给 ADMIN——STAFF 仍可看/改代理资料，但不给重置密码入口。
+  const canResetAgentPassword = user?.role === 'ADMIN';
 
   const [agents, setAgents] = useState<AgentListItem[] | null>(null);
   const [agentsLoaded, setAgentsLoaded] = useState(false);
@@ -42,6 +45,8 @@ export function AgentsPage() {
 
   // 选中的代理 (用于详情面板)
   const [selected, setSelected] = useState<AgentListItem | null>(null);
+  // 待重置密码的代理（打开重置密码弹窗）
+  const [resettingPasswordFor, setResettingPasswordFor] = useState<AgentListItem | null>(null);
 
   const reload = useCallback(async () => {
     if (!tokens) return;
@@ -266,6 +271,8 @@ export function AgentsPage() {
             if (isAdmin) return a.tier < 5;
             return a.userId === user?.id && a.tier < 5;
           }}
+          canResetPassword={canResetAgentPassword}
+          onResetPassword={setResettingPasswordFor}
         />
       ) : (
         <section className="space-y-3">
@@ -284,6 +291,8 @@ export function AgentsPage() {
                     if (isAdmin) return a.tier < 5;
                     return a.userId === user?.id && a.tier < 5;
                   }}
+                  canResetPassword={canResetAgentPassword}
+                  onResetPassword={setResettingPasswordFor}
                 />
               ))}
             </ul>
@@ -303,6 +312,14 @@ export function AgentsPage() {
           }}
         />
       )}
+
+      {/* 重置代理登录密码弹窗 */}
+      {resettingPasswordFor && (
+        <ResetAgentPasswordModal
+          agent={resettingPasswordFor}
+          onClose={() => setResettingPasswordFor(null)}
+        />
+      )}
     </div>
   );
 }
@@ -315,11 +332,15 @@ function AgentTableView({
   onSelectAgent,
   onAddChild,
   canAddChildOf,
+  canResetPassword,
+  onResetPassword,
 }: {
   agents: AgentListItem[];
   onSelectAgent: (a: AgentListItem) => void;
   onAddChild: (id: string) => void;
   canAddChildOf: (a: AgentListItem) => boolean;
+  canResetPassword: boolean;
+  onResetPassword: (a: AgentListItem) => void;
 }) {
   return (
     <section className="card p-0 overflow-hidden">
@@ -387,6 +408,9 @@ function AgentTableView({
                     <button className="text-brand hover:text-brand-dark" onClick={() => onSelectAgent(a)}>详情</button>
                     {canAddChildOf(a) && (
                       <button className="text-brand hover:text-brand-dark" onClick={() => onAddChild(a.id)}>+ 下级</button>
+                    )}
+                    {canResetPassword && a.userId && (
+                      <button className="text-brand hover:text-brand-dark" onClick={() => onResetPassword(a)}>重置密码</button>
                     )}
                   </div>
                 </td>
@@ -502,6 +526,98 @@ function AgentDetailDrawer({
           {tab === 'balance' && <BalanceTab agent={agent} />}
           {tab === 'customers' && <CustomersTab agent={agent} />}
         </div>
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 重置代理登录密码（仅 ADMIN 入口）——代理忘密码时管理员在界面上原本无处处理，
+// 只能求助后端手工改库。交互风格参考账号管理页的重置密码弹窗：填新密码 → 提交 →
+// 只在提交成功那一刻把密码明文展示一次，供当面/私聊转交本人。
+// ═══════════════════════════════════════════════════════════════
+function ResetAgentPasswordModal({
+  agent,
+  onClose,
+}: {
+  agent: AgentListItem;
+  onClose: () => void;
+}) {
+  const dialogRef = useDialogA11y(onClose);
+  const tokens = useAuth((s) => s.tokens);
+  const [password, setPassword] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [resetSecret, setResetSecret] = useState<string | null>(null);
+  const label = agent.companyName || agent.contactName;
+
+  const onSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    if (!tokens || saving) return;
+    setSaving(true);
+    setErr(null);
+    try {
+      await api.resetUserPassword(tokens.accessToken, agent.userId, password);
+      setResetSecret(password);
+    } catch (error) {
+      setErr(error instanceof ApiError ? error.message : '重置失败');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div
+      ref={dialogRef}
+      role="dialog"
+      aria-modal="true"
+      aria-label="重置代理登录密码"
+      tabIndex={-1}
+      className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 px-4"
+      onClick={onClose}
+    >
+      <div className="w-full max-w-sm rounded-lg bg-white p-5 shadow-xl" onClick={(e) => e.stopPropagation()}>
+        <h2 className="text-base font-semibold text-slate-900">重置登录密码</h2>
+        <p className="mt-1 text-xs text-slate-500">
+          {label} · {agent.email ?? '无邮箱'}
+        </p>
+
+        {resetSecret ? (
+          <div className="mt-4 space-y-3">
+            <div className="rounded border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-900">
+              已重置，请把新密码交给代理，首次登录需改密。
+              <div className="mt-1">
+                新密码：<code className="font-bold">{resetSecret}</code>
+              </div>
+            </div>
+            <div className="flex justify-end">
+              <button type="button" className="btn-primary text-sm" onClick={onClose}>完成</button>
+            </div>
+          </div>
+        ) : (
+          <form className="mt-4 space-y-3" onSubmit={onSubmit}>
+            <label className="text-sm text-ink-soft">
+              新密码
+              <input
+                className="input mt-1 w-full font-mono"
+                type="text"
+                required
+                minLength={8}
+                maxLength={128}
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                autoFocus
+              />
+            </label>
+            {err && <div className="rounded bg-rose-50 px-2 py-1.5 text-xs text-rose-700">{err}</div>}
+            <div className="flex justify-end gap-2">
+              <button type="button" className="btn-secondary text-sm" onClick={onClose}>取消</button>
+              <button type="submit" className="btn-primary text-sm" disabled={saving}>
+                {saving ? '提交中…' : '确认重置'}
+              </button>
+            </div>
+          </form>
+        )}
       </div>
     </div>
   );
@@ -804,6 +920,12 @@ function SettlementModeCard({
 // 旧单不受影响）。无规则 = 计提按 0 —— 醒目标红，不再静默。
 // ═══════════════════════════════════════════════════════════════
 
+// 生效日一律按**业务时区（北京时间）**折算显示。后端存的是「该日上海零点」对应的 UTC 瞬间
+// （agents.routes.ts 的 localToUtc(date,'00:00',BUSINESS_TZ)），直接对 ISO 串 slice(0,10) 会把
+// 9/1 显示成 8/31 —— 财务填完看回显差一天，会以为存错了。
+const BUSINESS_TZ = 'Asia/Shanghai';
+const effectiveDay = (iso: string): string => localYmd(iso, BUSINESS_TZ);
+
 // 一档费率的一条记录（当前生效 or 待生效，形状相同）。
 type CommissionRuleEntry = { rate: number; effectiveFrom: string } | null;
 
@@ -923,7 +1045,7 @@ function CommissionTab({ agent }: { agent: AgentListItem }) {
       const r = await api.getCommissionRules(token, agent.id);
       setRules(r.rules);
       setUpcoming(r.upcoming);
-      setOk(`已保存，生效自 ${res.effectiveFrom.slice(0, 10)}`);
+      setOk(`已保存，生效自 ${effectiveDay(res.effectiveFrom)}`);
       window.setTimeout(() => setOk(null), 2500);
     } catch (e) {
       setErr(e instanceof ApiError ? e.message : '保存失败');
@@ -978,13 +1100,13 @@ function CommissionTab({ agent }: { agent: AgentListItem }) {
                   )}
                 </td>
                 <td className="py-2 text-xs text-slate-500">
-                  {cur ? cur.effectiveFrom.slice(0, 10) : '—'}
+                  {cur ? effectiveDay(cur.effectiveFrom) : '—'}
                 </td>
                 <td className="py-2 text-xs nums">
                   {next ? (
                     // 用「即将生效」措辞而非单纯一个日期+数字，避免被扫一眼误读成当前费率。
                     <span className="font-medium text-amber-600">
-                      {next.effectiveFrom.slice(0, 10)} 起 {(next.rate * 100).toFixed(2)}%
+                      {effectiveDay(next.effectiveFrom)} 起 {(next.rate * 100).toFixed(2)}%
                     </span>
                   ) : (
                     <span className="text-slate-400">—</span>
@@ -1164,12 +1286,14 @@ function buildTree(flat: AgentListItem[]): AgentNodeData[] {
 }
 
 function AgentTreeNode({
-  node, depth, onAddChild, onSelectAgent, canAddChildOf,
+  node, depth, onAddChild, onSelectAgent, canAddChildOf, canResetPassword, onResetPassword,
 }: {
   node: AgentNodeData; depth: number;
   onAddChild: (parentId: string) => void;
   onSelectAgent: (a: AgentListItem) => void;
   canAddChildOf: (a: AgentListItem) => boolean;
+  canResetPassword: boolean;
+  onResetPassword: (a: AgentListItem) => void;
 }) {
   return (
     <li>
@@ -1198,12 +1322,24 @@ function AgentTreeNode({
           {canAddChildOf(node) && (
             <button type="button" className="btn-secondary text-xs px-3 py-1" onClick={() => onAddChild(node.id)}>+ 添加下级</button>
           )}
+          {canResetPassword && node.userId && (
+            <button type="button" className="btn-secondary text-xs px-3 py-1" onClick={() => onResetPassword(node)}>重置密码</button>
+          )}
         </div>
       </div>
       {node.children.length > 0 && (
         <ul className="mt-3 space-y-3">
           {node.children.map((c) => (
-            <AgentTreeNode key={c.id} node={c} depth={depth + 1} onAddChild={onAddChild} onSelectAgent={onSelectAgent} canAddChildOf={canAddChildOf} />
+            <AgentTreeNode
+              key={c.id}
+              node={c}
+              depth={depth + 1}
+              onAddChild={onAddChild}
+              onSelectAgent={onSelectAgent}
+              canAddChildOf={canAddChildOf}
+              canResetPassword={canResetPassword}
+              onResetPassword={onResetPassword}
+            />
           ))}
         </ul>
       )}
