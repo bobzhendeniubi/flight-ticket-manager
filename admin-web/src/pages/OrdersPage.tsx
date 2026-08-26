@@ -98,6 +98,28 @@ const REFUND_REQUESTABLE_STATUSES = new Set<OrderStatus>([
   'CHANGED',
 ]);
 
+// 理由必填的场景：强制改状态（绕过状态机，需要留痕解释为什么）、或目标态本身是
+// 不可逆/影响资金的（取消、退款）。其余标准流转不强制，避免运营被迫为每次正常
+// 流转编一句无意义的理由。
+const REASON_REQUIRED_TARGET_STATUSES = new Set<OrderStatus>(['CANCELLED', 'REFUNDED']);
+const isReasonRequiredForTransition = (next: OrderStatus, force?: boolean): boolean =>
+  Boolean(force) || REASON_REQUIRED_TARGET_STATUSES.has(next);
+
+/**
+ * 弹出必填理由输入框（复用全站已有的 window.prompt 必填理由约定，见撤销收款）。
+ * 用户点取消 → 返回 undefined，调用方应中止操作；留空提交 → 提示后重新弹窗，
+ * 不允许静默放行一个空理由。
+ */
+function promptRequiredReason(message: string): string | undefined {
+  for (;;) {
+    const input = window.prompt(message);
+    if (input === null) return undefined;
+    const trimmed = input.trim();
+    if (trimmed) return trimmed;
+    window.alert('请填写理由后再提交（不能留空）。');
+  }
+}
+
 /**
  * 发起退款申请（运营代客）：读实时报价 → 摊开应退/退改费确认 → POST /orders/:id/cancel。
  * 之所以不用 PATCH status 改「退款申请中」：那条路不生成应退报价（Refund 记录），
@@ -606,6 +628,9 @@ export function OrdersPage() {
   // 强制模式默认关：强制把已取消/超时等「非占座」订单拉回 PAID/PROCESSING 等「占座」状态时会
   // 重新占座（余位不足会被拒绝），必须是运营每次主动勾选的动作，不能默认开着让人顺手误触。
   const [forceMode, setForceMode] = useState(false);
+  // 强制通道仅管理员可见可用：勾选框本身按 isAdmin 隐藏（见下方渲染），这里再兜底一层——
+  // 即便 forceMode 状态因某种原因残留 true，非管理员在这里读到的永远是 false。
+  const effectiveForceMode = isAdmin && forceMode;
   // 批量改签证状态：无批量端点，逐单调用「改备注」端点（updateOrderNotes）的 visaStatus 字段。
   const [bulkVisaStatus, setBulkVisaStatus] = useState<VisaStatusInput | ''>('');
   const [bulkVisaSubmitting, setBulkVisaSubmitting] = useState(false);
@@ -1149,6 +1174,18 @@ export function OrdersPage() {
     () => selectedOrders.filter((o) => deriveBalance(o).balance > 0),
     [selectedOrders],
   );
+  // 批量改状态下拉的候选目标：所选订单里各自 allowedTransitions 的并集（而非全枚举）。
+  // 所选订单状态不一定相同，选中的目标未必对每一单都合法——提交走 batchUpdateOrderStatus，
+  // 单单不在允许路径内会失败但不影响其余单（见 applyBulkStatus 的成功/失败汇总）。
+  // 整单「出票完成」仍不放进批量目标（见下方票务岗口径注释），标准流转与强制通道都不放开。
+  const bulkAllowedTargets = useMemo(() => {
+    const set = new Set<OrderStatus>();
+    for (const o of selectedOrders) {
+      for (const s of allowedNextOf(o)) set.add(s);
+    }
+    set.delete('TICKETED');
+    return Array.from(set);
+  }, [selectedOrders]);
   // 已选订单的乘客总人数（票务开票凑人数用：套票几十人一起开票，选够 46 人不用手算）。
   const selectedPax = useMemo(
     () => selectedOrders.reduce((sum, o) => sum + o.passengers.length, 0),
@@ -1244,7 +1281,7 @@ export function OrdersPage() {
       );
       return;
     }
-    const confirmMsg = forceMode
+    const confirmMsg = effectiveForceMode
       ? `强制将 ${selectedIds.size} 条订单改为「${orderStatusLabel(bulkStatus as OrderStatus)}」？此操作绕过状态机校验。\n\n强制把已取消/超时的订单拉回持有状态会重新占座（余位不足会被拒绝，订单状态不变）；此前版本存在不占座的漏洞，请确认余位充足后再操作。`
       : `按标准流转将 ${selectedIds.size} 条订单改为「${orderStatusLabel(bulkStatus as OrderStatus)}」？不在允许路径的订单会失败。`;
     // 批量批准退款不逐单查报价（最多 100 单），但必须把「余额部分自动回补」这件事说清楚：
@@ -1257,12 +1294,12 @@ export function OrdersPage() {
           ? `\n\n⚠️ 批量改「退款申请中」只翻状态、不生成应退报价——这样的单之后点「同意退款」会被系统拦下。\n` +
             `真要退钱给客人的订单，请逐单在订单详情用「申请退款」发起（会按取消政策生成应退报价并留底）。`
           : '';
-    const needsDangerConfirm = forceMode || bulkStatus === 'REFUNDED';
+    const needsDangerConfirm = effectiveForceMode || bulkStatus === 'REFUNDED';
     if (needsDangerConfirm) {
       if (highRiskConfirmRef.current) return;
       highRiskConfirmRef.current = true;
       if (!(await confirm({
-        title: forceMode ? '强制批量改状态？' : '批量批准退款？',
+        title: effectiveForceMode ? '强制批量改状态？' : '批量批准退款？',
         body: confirmMsg + refundNotice,
         tone: 'danger',
       }))) {
@@ -1270,6 +1307,18 @@ export function OrdersPage() {
         return;
       }
     } else if (!window.confirm(confirmMsg + refundNotice)) return;
+    // 强制、或目标为取消/退款时理由必填（批量与单条同一口径）；其余标准流转仍选填。
+    let bulkReason: string | undefined;
+    if (isReasonRequiredForTransition(bulkStatus as OrderStatus, effectiveForceMode)) {
+      bulkReason = promptRequiredReason(
+        `请填写理由（必填）：\n\n批量将 ${selectedIds.size} 条订单改为「${orderStatusLabel(bulkStatus as OrderStatus)}」` +
+          `${effectiveForceMode ? '（强制，绕过状态机）' : ''}`,
+      );
+      if (bulkReason === undefined) {
+        if (needsDangerConfirm) highRiskConfirmRef.current = false;
+        return;
+      }
+    }
     setBulkSubmitting(true);
     setBulkResult(null);
     try {
@@ -1278,8 +1327,8 @@ export function OrdersPage() {
         tokens.accessToken,
         ids,
         bulkStatus as OrderStatus,
-        undefined,
-        forceMode,
+        bulkReason,
+        effectiveForceMode,
       );
       // 刷新必须带上当前后端筛选条件——不带的话列表会被换成「全库最新 200 单」，
       // 而筛选框还显示着条件、徽标还写「已筛选」，随后「导出 CSV」就按这份被污染的列表出。
@@ -2462,23 +2511,29 @@ export function OrdersPage() {
             >
               <option value="">选择目标状态…</option>
               {/* 票务按航段批量开票（见下方「批量开票」控件），整单「出票完成」不在批量目标状态里放开——
-                  票务岗口径：批量只做"去程/回程已出票"这类航段级标记，整单终态仍走逐单详情页确认。 */}
-              {(Object.keys(ORDER_STATUS_META) as OrderStatus[])
-                .filter((s) => s !== 'TICKETED')
-                .map((s) => (
-                  <option key={s} value={s}>{orderStatusLabel(s)}</option>
-                ))}
+                  票务岗口径：批量只做"去程/回程已出票"这类航段级标记，整单终态仍走逐单详情页确认。
+                  非强制模式下：选项 = 所选订单 allowedTransitions 的并集（真源，见 bulkAllowedTargets），
+                  不再是全枚举——选中的目标不一定对所选的每一单都合法，逐单容错见 applyBulkStatus。
+                  强制模式（仅管理员可见，见下方勾选框）：保留全枚举，因为这条通道本就是要绕过状态机。 */}
+              {(effectiveForceMode
+                ? (Object.keys(ORDER_STATUS_META) as OrderStatus[]).filter((s) => s !== 'TICKETED')
+                : bulkAllowedTargets
+              ).map((s) => (
+                <option key={s} value={s}>{orderStatusLabel(s)}</option>
+              ))}
             </select>
-            <label className="flex items-center gap-1.5 text-sm text-ink-soft">
-              <input
-                type="checkbox"
-                className="accent-brand"
-                checked={forceMode}
-                onChange={(e) => setForceMode(e.target.checked)}
-                disabled={bulkSubmitting}
-              />
-              <span>强制（绕过状态机校验）</span>
-            </label>
+            {isAdmin && (
+              <label className="flex items-center gap-1.5 text-sm text-ink-soft">
+                <input
+                  type="checkbox"
+                  className="accent-brand"
+                  checked={forceMode}
+                  onChange={(e) => setForceMode(e.target.checked)}
+                  disabled={bulkSubmitting}
+                />
+                <span>强制（绕过状态机校验）</span>
+              </label>
+            )}
             <button
               className="btn-primary text-sm py-1.5 disabled:opacity-50"
               onClick={() => void applyBulkStatus()}
@@ -3162,10 +3217,10 @@ export function OrdersPage() {
                         onChange={(e) => {
                           const next = e.target.value as OrderStatus;
                           if (!next) return;
-                          const msg = forceMode
+                          const msg = effectiveForceMode
                             ? `强制将 ${order.orderNumber} 改为「${orderStatusLabel(next)}」？此操作绕过状态机校验。\n\n强制把已取消/超时的订单拉回持有状态会重新占座（余位不足会被拒绝，订单状态不变）；此前版本存在不占座的漏洞，请确认余位充足后再操作。`
                             : `将 ${order.orderNumber} 改为「${orderStatusLabel(next)}」？`;
-                          if (forceMode) {
+                          if (effectiveForceMode) {
                             if (highRiskConfirmRef.current) {
                               e.target.value = '';
                               return;
@@ -3180,23 +3235,46 @@ export function OrdersPage() {
                                 highRiskConfirmRef.current = false;
                                 return;
                               }
-                              void advance(order, next, undefined, forceMode).finally(() => {
+                              // 强制通道理由必填，留痕解释为什么要绕过状态机。
+                              const reason = promptRequiredReason(
+                                `请填写强制改状态的理由（必填）：\n\n${order.orderNumber}：${orderStatusLabel(order.status)} → ${orderStatusLabel(next)}`,
+                              );
+                              if (reason === undefined) {
+                                highRiskConfirmRef.current = false;
+                                return;
+                              }
+                              void advance(order, next, reason, effectiveForceMode).finally(() => {
                                 highRiskConfirmRef.current = false;
                               });
                             });
                           } else if (window.confirm(msg)) {
-                            void advance(order, next, undefined, forceMode);
+                            // 非强制路径：仅当目标是取消/退款这类不可逆动作时理由必填，其余标准流转选填。
+                            let reason: string | undefined;
+                            if (isReasonRequiredForTransition(next)) {
+                              reason = promptRequiredReason(
+                                `请填写理由（必填）：\n\n将 ${order.orderNumber} 改为「${orderStatusLabel(next)}」`,
+                              );
+                              if (reason === undefined) {
+                                e.target.value = '';
+                                return;
+                              }
+                            }
+                            void advance(order, next, reason, effectiveForceMode);
                           }
                           e.target.value = '';
                         }}
-                        title={forceMode ? '管理员强制改状态（绕过状态机）' : '按标准流转改状态'}
+                        title={effectiveForceMode ? '管理员强制改状态（绕过状态机）' : '按标准流转改状态'}
                       >
                         <option value="">改状态…</option>
-                        {(Object.keys(ORDER_STATUS_META) as OrderStatus[])
-                          .filter((s) => s !== order.status)
-                          .map((s) => (
-                            <option key={s} value={s}>{orderStatusLabel(s)}</option>
-                          ))}
+                        {/* 非强制模式：只列后端下发的合法流转（allowedNextOf，状态机真源），不再是
+                            「除当前态外全枚举」——避免运营选到非法目标、失败提示还要劝人去勾「强制」。
+                            强制模式（仅管理员可见，见批量工具条的勾选框）：保留全枚举，这条通道本就是要绕过状态机。 */}
+                        {(effectiveForceMode
+                          ? (Object.keys(ORDER_STATUS_META) as OrderStatus[]).filter((s) => s !== order.status)
+                          : allowedNextOf(order)
+                        ).map((s) => (
+                          <option key={s} value={s}>{orderStatusLabel(s)}</option>
+                        ))}
                       </select>
                       <button className="whitespace-nowrap text-xs font-medium text-brand hover:text-brand-dark" onClick={() => setSelected(order)}>
                         详情
@@ -3902,7 +3980,18 @@ function OrderDrawer({
                 <button
                   key={s.to}
                   className={`${s.style} flex-1 text-sm`}
-                  onClick={() => onAdvance(s.to)}
+                  onClick={() => {
+                    // 目标为取消/退款时理由必填（与批量、单条下拉同一口径）；其余标准流转不强制。
+                    if (isReasonRequiredForTransition(s.to)) {
+                      const reason = promptRequiredReason(
+                        `请填写理由（必填）：\n\n${o.orderNumber}：${orderStatusLabel(o.status)} → ${orderStatusLabel(s.to)}`,
+                      );
+                      if (reason === undefined) return;
+                      void onAdvance(s.to, reason);
+                      return;
+                    }
+                    void onAdvance(s.to);
+                  }}
                   title={`按标准流转：${orderStatusLabel(o.status)} → ${orderStatusLabel(s.to)}`}
                 >
                   {s.label}
@@ -3953,8 +4042,16 @@ function OrderDrawer({
                         highRiskConfirmRef.current = false;
                         return;
                       }
+                      // 强制通道理由必填，留痕解释为什么要绕过状态机做异常订正。
+                      const reason = promptRequiredReason(
+                        `请填写强制改状态的理由（必填）：\n\n${o.orderNumber}：${orderStatusLabel(o.status)} → ${orderStatusLabel(to)}`,
+                      );
+                      if (reason === undefined) {
+                        highRiskConfirmRef.current = false;
+                        return;
+                      }
                       try {
-                        await onAdvance(to, undefined, true);
+                        await onAdvance(to, reason, true);
                       } finally {
                         highRiskConfirmRef.current = false;
                       }
@@ -5692,15 +5789,16 @@ function RescheduleForm({
     if (!token || submitting) return;
     setErr(null);
     if (!newScheduleId) { setErr('请选择新班次'); return; }
-    if (!confirm('确认改期？座位会移动到新班次（新班次售罄会被拒绝），如填了改期费将计入订单尾款。')) return;
+    if (!confirm('确认改期？座位会移动到新班次（新班次售罄会被拒绝），如填了改期差价将计入订单应收（可正可负）。')) return;
     setSubmitting(true);
     try {
       const res = await api.rescheduleOrder(token, orderId, {
         orderItemId: item.id,
         newScheduleId,
         newCabin: newCabin || undefined,
-        feeCny: feeCny != null && feeCny > 0 ? feeCny : undefined,
-        feeLabel: feeCny != null && feeCny > 0 ? '改期费' : undefined,
+        // 允许负数：新班次比原班次便宜时退差价，不再只能补收（与酒店改期差价同一口径）。
+        feeCny: feeCny != null && feeCny !== 0 ? feeCny : undefined,
+        feeLabel: feeCny != null && feeCny !== 0 ? '改期差价' : undefined,
         note: note.trim() || undefined,
       });
       onSaved(res.order);
@@ -5768,12 +5866,13 @@ function RescheduleForm({
       </label>
 
       <label className="block">
-        <span className="text-slate-500">改期费（¥，可选）</span>
+        <span className="text-slate-500">改期差价（可负，¥）</span>
         <NumberInput
           value={feeCny}
           onChange={setFeeCny}
           integerOnly
-          placeholder="不收改期费则留空"
+          allowNegative
+          placeholder="不调整价格则留空；新班次更便宜可填负数退差价"
           className="mt-0.5 w-full rounded border border-slate-300 px-2 py-1"
         />
       </label>
