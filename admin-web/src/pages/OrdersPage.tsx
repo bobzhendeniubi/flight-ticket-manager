@@ -9794,7 +9794,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                     placeholder="如 50"
                   />
                 </label>
-                <p className="mt-2 text-[11px] text-sky-700">ⓘ 每张子单按该单出行人数生成「同业优惠」调整行；与手动结算单价二选一。</p>
+                <p className="mt-2 text-[11px] text-sky-700">ⓘ 每张子单按该单出行人数生成「同业优惠」调整行；套餐结算价按结算价日历自动取价，无需也不可手填。</p>
               </div>
             )}
 
