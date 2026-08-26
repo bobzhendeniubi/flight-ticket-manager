@@ -332,6 +332,38 @@ function SettlementDrawer({
           <Row label={<strong>应付给代理</strong>} value={<strong className="text-2xl text-brand">¥{Number(settlement.payableToAgent).toLocaleString()}</strong>} />
         </div>
 
+        {Number(settlement.carryForwardAmount) > 0 && (
+          <div className="mt-4 rounded-md bg-amber-50 border border-amber-200 px-3 py-2 text-xs text-amber-800">
+            本期净额为负 ¥{Number(settlement.carryForwardAmount).toLocaleString()}，已结转下期（下次生成结算单会自动追回）。
+          </div>
+        )}
+
+        {settlement.reversedRecords && settlement.reversedRecords.length > 0 && (
+          <div className="mt-4">
+            <h3 className="text-sm font-semibold text-rose-700 mb-2">
+              本单包含已冲销佣金 ({settlement.reversedRecords.length} 笔) —— 审批前请核对
+            </h3>
+            <div className="max-h-40 overflow-auto rounded border border-rose-200">
+              <table className="min-w-full text-xs">
+                <thead className="bg-rose-50 text-rose-700">
+                  <tr>
+                    <th className="px-2 py-1 text-left">订单号</th>
+                    <th className="px-2 py-1 text-right">金额</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-rose-100">
+                  {settlement.reversedRecords.map((r) => (
+                    <tr key={r.id}>
+                      <td className="px-2 py-1 font-mono text-[10px]">{r.orderNumber ?? r.orderId.slice(0, 8)}</td>
+                      <td className="px-2 py-1 text-right">¥{Number(r.amount).toLocaleString()}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
         {settlement.commissions && settlement.commissions.length > 0 && (
           <div className="mt-5">
             <h3 className="text-sm font-semibold text-slate-700 mb-2">
