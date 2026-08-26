@@ -30,6 +30,12 @@ jobs:
 
       - name: Backend tests
         run: npm test --workspace=backend
+        env:
+          # env.ts 启动校验的必填项；单测全走 mock，不会真连库/Redis
+          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
+          REDIS_URL: redis://localhost:6379
+          JWT_ACCESS_SECRET: ci-only-dummy-access-secret-0123456789ab
+          JWT_REFRESH_SECRET: ci-only-dummy-refresh-secret-0123456789a
 
       # 前端真值闸 = npm run build（根 tsconfig files:[]，裸 tsc --noEmit 是假绿）
       - name: Admin-web build
