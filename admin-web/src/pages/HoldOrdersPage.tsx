@@ -579,6 +579,27 @@ function CreateHoldModal({
   const [planLoading, setPlanLoading] = useState(false);
   const [dueDates, setDueDates] = useState<Record<string, string>>({});
 
+  // 表单脏检测：任一字段偏离初始值即视为「已编辑」，用于挂载 beforeunload 兜底——
+  // 触控板横滑会被 Safari 等浏览器识别成「后退」手势，弹窗填到一半会被直接划走、
+  // 内容全丢（公测反馈）。overscroll-behavior-x 在 Chrome/Edge/Firefox 已根治，
+  // 这里给不吃该属性的浏览器再加一道原生「离开确认」。
+  const initialFormSnapshotRef = useRef(
+    JSON.stringify({ legs, seats, mode, ownerType, agentId, groupName, ratio, notes, dateConfirmed, dueDates }),
+  );
+  const isDirty =
+    JSON.stringify({ legs, seats, mode, ownerType, agentId, groupName, ratio, notes, dateConfirmed, dueDates }) !==
+    initialFormSnapshotRef.current;
+
+  useEffect(() => {
+    if (!isDirty) return;
+    const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = '';
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [isDirty]);
+
   const scheduleOf = useCallback(
     (leg: LegDraft) => schedulesOn(leg.date, leg.flightId).find((s) => s.id === leg.scheduleId),
     [schedulesOn],

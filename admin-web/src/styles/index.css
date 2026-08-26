@@ -8,6 +8,11 @@
    ───────────────────────────────────────────────────────────── */
 
 @layer base {
+  /* 触控板横向滑动会被浏览器识别为「后退/前进」手势，弹窗填到一半会被直接划走、内容全丢
+     （公测反馈）。禁用横向 overscroll 链，从根源上不让横滑触发导航。 */
+  html, body {
+    overscroll-behavior-x: none;
+  }
   body {
     text-rendering: optimizeLegibility;
   }
