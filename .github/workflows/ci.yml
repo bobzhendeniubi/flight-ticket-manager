@@ -39,6 +39,8 @@ jobs:
           REDIS_URL: redis://localhost:6379
           JWT_ACCESS_SECRET: ci-only-dummy-access-secret-0123456789ab
           JWT_REFRESH_SECRET: ci-only-dummy-refresh-secret-0123456789a
+          # Ubuntu 的 fonts-noto-cjk 装在 opentype/noto，不在代码的默认候选路径里
+          POSTER_FONT_PATH: /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc
 
       # 前端真值闸 = npm run build（根 tsconfig files:[]，裸 tsc --noEmit 是假绿）
       - name: Admin-web build
