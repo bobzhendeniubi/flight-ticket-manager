@@ -3587,7 +3587,12 @@ export const api = {
       { method: 'POST', token, body: reason ? { reason } : {} },
     ),
   updateOrderStatus: (token: string, id: string, toStatus: OrderStatus, reason?: string, force?: boolean) =>
-    apiFetch<{ order: OrderSummary }>(`/orders/${id}/status`, {
+    apiFetch<{
+      order: OrderSummary & {
+        /** 取消族恢复时若开票超限，后端会自动清开票标记并把提示带回来；没清就没有这个键。 */
+        invoiceCapWarnings?: string[];
+      };
+    }>(`/orders/${id}/status`, {
       method: 'PATCH',
       token,
       body: { toStatus, reason, force },
@@ -3629,7 +3634,14 @@ export const api = {
     apiFetch<{
       successCount: number;
       failureCount: number;
-      results: Array<{ id: string; success: boolean; orderNumber?: string; error?: string }>;
+      results: Array<{
+        id: string;
+        success: boolean;
+        orderNumber?: string;
+        error?: string;
+        /** 该单取消族恢复时若开票超限，后端自动清开票标记并附的提示；没清就没有这个键。 */
+        warnings?: string[];
+      }>;
     }>(`/orders/batch-status`, {
       method: 'POST',
       token,
