@@ -49,6 +49,9 @@ const { mockPrisma, mockWriteAudit } = vi.hoisted(() => ({
     payment: { aggregate: vi.fn(), updateMany: vi.fn() },
     fulfillmentTask: { updateMany: vi.fn() },
     commissionRecord: { findFirst: vi.fn(), create: vi.fn(), findMany: vi.fn(), update: vi.fn() },
+    // 批准退款时会查本单的预存余额抵扣流水（OFFSET/REFUND）来决定回补多少余额；
+    // 本文件只关心佣金冲销，默认喂空流水（= 该单从未用代理余额抵付）。
+    prepaymentTransaction: { findMany: vi.fn() },
     auditLog: { create: vi.fn() },
     agent: { findUnique: vi.fn() },
     commissionRule: { findMany: vi.fn() },
@@ -69,6 +72,8 @@ vi.mock('../../lib/audit.js', () => ({
 vi.mock('../hotel-control/hotel-control.service.js', () => ({
   assertHotelPhysicalFit: vi.fn(),
   assertRandomTierFit: vi.fn(),
+  // 事务内带行锁版（建单/改日期的权威判定走它）：桩与真模块导出对齐。
+  assertRandomTierFitWithinTx: vi.fn(),
   checkHotelPhysicalFit: vi.fn(),
   getHotelNightlyRemaining: vi.fn(),
   getRandomTierAggregate: vi.fn(),
@@ -262,6 +267,7 @@ function commonBeforeEach() {
   mockPrisma.fulfillmentTask.updateMany.mockResolvedValue({ count: 0 });
   mockPrisma.$queryRaw.mockResolvedValue([]);
   mockPrisma.agent.findUnique.mockResolvedValue({ parentAgentId: null }); // 默认单级代理
+  mockPrisma.prepaymentTransaction.findMany.mockResolvedValue([]); // 无余额抵扣流水
   mockWriteAudit.mockResolvedValue(undefined);
 }
 

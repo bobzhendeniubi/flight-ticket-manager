@@ -6,6 +6,8 @@
  *   4. 应收与代理欠款（应收账龄明细 + 桶汇总 + 代理欠款，三块合一）
  *
  * 复用 reports.service 的聚合函数；金额列统一数字格式 '#,##0.00'。
+ * 「成本缺失条目数」> 0 的行，「毛利」「毛利率」两列留空（毛利未知，见 reports.service.ts
+ * SalesRow.grossMarginCny）；此时「成本」列只是已录到的部分成本，不能拿它自己减出毛利。
  * 文件名只用 ASCII（reports-{from}_{to}.xlsx），中文展示名由前端决定。
  */
 import ExcelJS from 'exceljs';
@@ -80,8 +82,9 @@ function addSalesSheet(
       orderCount: r.orderCount,
       revenueCny: r.revenueCny,
       costCny: r.costCny,
-      grossMarginCny: r.grossMarginCny,
-      marginPct: r.marginPct == null ? '' : r.marginPct,
+      // 毛利/毛利率为 null = 该桶有行没录成本，毛利未知：留空单元格，不写 0（0 会被读成"不赚钱"）
+      grossMarginCny: r.grossMarginCny ?? '',
+      marginPct: r.marginPct ?? '',
       missingCostItemCount: r.missingCostItemCount,
     });
   }
@@ -90,8 +93,8 @@ function addSalesSheet(
     orderCount: report.totals.orderCount,
     revenueCny: report.totals.revenueCny,
     costCny: report.totals.costCny,
-    grossMarginCny: report.totals.grossMarginCny,
-    marginPct: report.totals.marginPct == null ? '' : report.totals.marginPct,
+    grossMarginCny: report.totals.grossMarginCny ?? '',
+    marginPct: report.totals.marginPct ?? '',
     missingCostItemCount: report.totals.missingCostItemCount,
   });
   totalRow.font = { bold: true };

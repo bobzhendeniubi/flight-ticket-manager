@@ -85,6 +85,8 @@ export async function sendItineraryEmail(orderId: string): Promise<ItineraryResu
     contactPhone: order.contactPhone,
     contactEmail: order.contactEmail,
     total: order.total.toFixed(2),
+    // 应付含售后调整（改期费/换人费）——与下载版行程单同口径
+    adjustmentCny: Number(order.adjustmentCny ?? 0),
     currency: order.currency,
     createdAt: order.createdAt,
     flights,

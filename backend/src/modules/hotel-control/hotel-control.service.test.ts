@@ -8,10 +8,15 @@
  *
  * 日期 fixture 全部相对"今天"动态生成，避免用例随日历过期。
  */
-import { afterAll, describe, it, expect, vi } from 'vitest';
+import { afterAll, beforeEach, describe, it, expect, vi } from 'vitest';
 
 // 默认 prisma 不参与（全部走注入 client）—— 仍需 mock 掉避免真实连接配置
 vi.mock('../../db/prisma.js', () => ({ prisma: {} }));
+
+// updateBlockPeriod 的超占 WARNING 审计走 writeAudit——mock 掉以断言调用，同时避免
+// 真去碰被 mock 成 {} 的 prisma.auditLog。
+const { auditMock } = vi.hoisted(() => ({ auditMock: vi.fn(async () => undefined) }));
+vi.mock('../../lib/audit.js', () => ({ writeAudit: auditMock }));
 
 vi.useFakeTimers();
 vi.setSystemTime(new Date('2026-08-24T17:00:00.000Z'));
@@ -41,7 +46,11 @@ import {
   lockHotelBlockPeriodsWithinTx,
   getRandomTierAggregate,
   assertRandomTierFit,
+  assertRandomTierFitWithinTx,
+  lockRandomTierBlockPeriodsWithinTx,
   createBlockPeriod,
+  updateBlockPeriod,
+  deleteBlockPeriod,
   listBlockPeriods,
   getRecentRoomChanges,
 } from './hotel-control.service.js';
@@ -1672,6 +1681,86 @@ describe('星级随机档：下单闸 assertRandomTierFit / getRandomTierAggrega
   });
 });
 
+// ── 随机档事务内加锁版下单闸：assertRandomTierFitWithinTx ───────────────────
+/**
+ * 同 assertHotelPhysicalFitWithinTx 的并发漏洞：只读聚合闸两个请求同时抢随机档最后
+ * 一间，各自读到旧快照，双双通过。事务内版本必须先把「该档次全部真酒店」名下、覆盖
+ * 该区间的包房周期行一并 FOR UPDATE，再复用同一把聚合判定尺子。
+ */
+describe('assertRandomTierFitWithinTx（随机档事务内加锁版下单闸）', () => {
+  /** 假 tx：$queryRaw 记录 SQL 片段/参数；orderItem.findMany 按 getRandomTierAggregate
+   *  的调用顺序（先已落位 hotelItems、后未落位 pendingItems）依次返回。 */
+  function fakeTierTx(opts: { hotelIds: string[]; periods: unknown[]; pendingItems?: unknown[] }) {
+    const calls: Array<{ sql: string; values: unknown[] }> = [];
+    const tx = {
+      $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) => {
+        calls.push({ sql: strings.join('?'), values });
+        return Promise.resolve([]);
+      }),
+      hotel: { findMany: vi.fn().mockResolvedValue(opts.hotelIds.map((id) => ({ id }))) },
+      hotelBlockPeriod: { findMany: vi.fn().mockResolvedValue(opts.periods) },
+      orderItem: { findMany: vi.fn().mockResolvedValueOnce([]).mockResolvedValueOnce(opts.pendingItems ?? []) },
+    };
+    return { tx, calls };
+  }
+
+  type TxArg = Parameters<typeof assertRandomTierFitWithinTx>[0];
+
+  it('判定之前先对该档次全部真酒店的包房周期行 FOR UPDATE 加锁（并发抢随机档在此串行）', async () => {
+    const { tx, calls } = fakeTierTx({
+      hotelIds: ['h1', 'h2'],
+      periods: [{ dateFrom: day(0), dateTo: day(1), rooms: 5 }],
+    });
+    await assertRandomTierFitWithinTx(tx as unknown as TxArg, 3, [dayStr(0)], 1);
+
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
+    const sql = calls[0].sql.replace(/\s+/g, ' ');
+    expect(sql).toContain('"HotelBlockPeriod"');
+    expect(sql).toContain('FOR UPDATE');
+    // 按 id 排序加锁：两个事务锁同一批行的顺序一致，不会互相死锁
+    expect(sql).toContain('ORDER BY id');
+    // 锁的是「该档次全部真酒店」的周期行，不是单一酒店——先查了这批酒店 id
+    expect(tx.hotel.findMany).toHaveBeenCalled();
+    expect(tx.hotel.findMany.mock.calls[0][0].where).toMatchObject({
+      starRating: 3,
+      intlFiveStar: false,
+      randomTierPlaceholder: null,
+    });
+    // 锁必须发生在读占房之前 —— 先读后锁等于没锁
+    const lockOrder = tx.$queryRaw.mock.invocationCallOrder[0];
+    const readOrder = tx.orderItem.findMany.mock.invocationCallOrder[0];
+    expect(lockOrder).toBeLessThan(readOrder);
+  });
+
+  it('拿的是同一把判定尺子：装不下照样抛「余量不足」（口径与非事务版一字不差）', async () => {
+    const { tx } = fakeTierTx({
+      hotelIds: ['h1'],
+      periods: [{ dateFrom: day(0), dateTo: day(1), rooms: 3 }],
+      pendingItems: [{ hotelCheckIn: day(0), hotelCheckOut: day(1) }],
+    });
+    await expect(
+      assertRandomTierFitWithinTx(tx as unknown as TxArg, 4, [dayStr(0)], 3),
+    ).rejects.toThrow(/四星随机余量不足/);
+    // 拒绝路径上锁一样要加过（否则并发下「都装得下」的判定仍是脏读）
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
+  });
+
+  it('该档次一家真酒店都没有 → 无行可锁，安静返回（未纳入管控）', async () => {
+    const { tx } = fakeTierTx({ hotelIds: [], periods: [] });
+    await expect(
+      lockRandomTierBlockPeriodsWithinTx(tx as unknown as TxArg, 3, [dayStr(0)]),
+    ).resolves.toBeUndefined();
+    expect(tx.$queryRaw).not.toHaveBeenCalled();
+  });
+
+  it('空 nightDates（无入住区间）→ 连酒店都不查，安静返回', async () => {
+    const { tx } = fakeTierTx({ hotelIds: ['h1'], periods: [] });
+    await expect(lockRandomTierBlockPeriodsWithinTx(tx as unknown as TxArg, 3, [])).resolves.toBeUndefined();
+    expect(tx.hotel.findMany).not.toHaveBeenCalled();
+    expect(tx.$queryRaw).not.toHaveBeenCalled();
+  });
+});
+
 describe('createBlockPeriod：只能挂具体酒店（随机档已废建池）', () => {
   const baseBody = { dateFrom: dayStr(0), dateTo: dayStr(3), rooms: 5 };
   function createClient(hotel: Record<string, unknown> = { id: 'h1' }): PrismaClient {
@@ -1730,6 +1819,161 @@ describe('createBlockPeriod：只能挂具体酒店（随机档已废建池）',
         createClient({ id: 'ph3', randomTierPlaceholder: 3 }),
       ),
     ).rejects.toThrow(/星级随机档占位项，不能切房/);
+  });
+});
+
+// ── updateBlockPeriod / deleteBlockPeriod：缩减/删除占用守卫 ─────────────────
+/**
+ * 照抄机票侧 FLIGHT_MAX_OVERSELL_SEATS 的哲学：允许把包房改小（真实退房场景），但
+ * 缺口（已占用物理间数 − 新包房）超过 HOTEL_MAX_OVERSELL_ROOMS 就拒绝；未超阈值但
+ * 确实形成超占则放行并写 WARNING 审计。删除周期没有这道阈值豁免——只要会让任何一晚
+ * 变成「已占用 > 删除后剩余包房」就直接拒绝，不给「差一点点也算了」的口子。
+ */
+describe('updateBlockPeriod / deleteBlockPeriod：占用守卫', () => {
+  beforeEach(() => auditMock.mockClear());
+
+  const existingPeriod = (over: Record<string, unknown> = {}) => ({
+    id: 'bp1',
+    hotelId: 'h1',
+    randomStarTier: null,
+    dateFrom: day(0),
+    dateTo: day(3),
+    rooms: 5,
+    unitPrice: null,
+    note: null,
+    updatedAt: new Date('2026-08-01T00:00:00.000Z'),
+    hotel: { name: '明月酒店', randomTierPlaceholder: null },
+    ...over,
+  });
+
+  /** 4 个整间占房行（roomsBilled=1，无分房表），逐晚覆盖 day(0)..day(3)：occupied=4/晚。*/
+  const fourWholeRoomItems = () =>
+    Array.from({ length: 4 }, (_, i) => ({
+      hotelCheckIn: day(0),
+      hotelCheckOut: day(4),
+      roomsBilled: 1,
+      metadata: null,
+      order: { id: `o${i + 1}`, roomAssignment: null, passengers: [] },
+    }));
+
+  function guardClient(opts: {
+    existing: Record<string, unknown>;
+    others?: unknown[];
+    items?: unknown[];
+  }): PrismaClient {
+    return {
+      hotelBlockPeriod: {
+        findUnique: vi.fn().mockResolvedValue(opts.existing),
+        findMany: vi.fn().mockResolvedValue(opts.others ?? []),
+        update: vi.fn().mockImplementation(({ data }: { data: Record<string, unknown> }) =>
+          Promise.resolve({ ...opts.existing, ...data, hotel: (opts.existing as { hotel: unknown }).hotel }),
+        ),
+        delete: vi.fn().mockResolvedValue({}),
+      },
+      orderItem: { findMany: vi.fn().mockResolvedValue(opts.items ?? []) },
+    } as unknown as PrismaClient;
+  }
+
+  describe('updateBlockPeriod', () => {
+    it('改小但仍够住（新包房 >= 已占用）→ 直接放行，不写审计', async () => {
+      const client = guardClient({ existing: existingPeriod(), items: fourWholeRoomItems() });
+      const period = await updateBlockPeriod('bp1', { rooms: 4 } as never, client);
+      expect(period.rooms).toBe(4);
+      expect(auditMock).not.toHaveBeenCalled();
+    });
+
+    it('改小到阈值内的超占（缺口 <= HOTEL_MAX_OVERSELL_ROOMS）→ 放行但写 WARNING 审计', async () => {
+      const client = guardClient({ existing: existingPeriod(), items: fourWholeRoomItems() });
+      // occupied=4，新包房=3 → 缺口 1（<= 默认阈值 2）
+      const period = await updateBlockPeriod('bp1', { rooms: 3 } as never, client);
+      expect(period.rooms).toBe(3);
+      expect(auditMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'UPDATE_HOTEL_BLOCK_PERIOD_OVERSOLD',
+          severity: 'WARNING',
+          targetId: 'h1',
+        }),
+      );
+    });
+
+    it('改小超过阈值（缺口 > HOTEL_MAX_OVERSELL_ROOMS）→ 400 拒绝，不落库', async () => {
+      const client = guardClient({ existing: existingPeriod(), items: fourWholeRoomItems() });
+      // occupied=4，新包房=1 → 缺口 3（> 默认阈值 2）
+      await expect(updateBlockPeriod('bp1', { rooms: 1 } as never, client)).rejects.toThrow(
+        /超过超卖上限/,
+      );
+      expect((client.hotelBlockPeriod.update as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();
+    });
+
+    it('单纯改价/改备注（rooms 不变）→ 不查占用、不触发守卫', async () => {
+      const client = guardClient({ existing: existingPeriod(), items: fourWholeRoomItems() });
+      await updateBlockPeriod('bp1', { note: '换个备注' } as never, client);
+      expect(client.orderItem.findMany).not.toHaveBeenCalled();
+    });
+
+    it('扩容（rooms 变大）→ 不触发守卫（增容不可能造成超占）', async () => {
+      const client = guardClient({ existing: existingPeriod(), items: fourWholeRoomItems() });
+      await updateBlockPeriod('bp1', { rooms: 8 } as never, client);
+      expect(client.orderItem.findMany).not.toHaveBeenCalled();
+      expect(auditMock).not.toHaveBeenCalled();
+    });
+
+    it('日期区间收窄丢了原覆盖的日子 → 视同缩减，一并守卫（不只看 rooms 字段）', async () => {
+      // rooms 不变（5），但 dateTo 从 day(3) 收窄到 day(1) → day(2)/day(3) 两晚容量归零
+      const client = guardClient({ existing: existingPeriod(), items: fourWholeRoomItems() });
+      await expect(
+        updateBlockPeriod('bp1', { dateTo: dayStr(1) } as never, client),
+      ).rejects.toThrow(/超过超卖上限/);
+    });
+
+    it('随机档存量周期（hotelId 为 null）→ 跳过守卫（本就不计入任何余量）', async () => {
+      const client = guardClient({
+        existing: existingPeriod({ hotelId: null, randomStarTier: 3, hotel: null }),
+      });
+      const period = await updateBlockPeriod('bp1', { rooms: 0 } as never, client);
+      expect(period.rooms).toBe(0);
+      expect(client.orderItem.findMany).not.toHaveBeenCalled();
+    });
+
+    it('占位酒店名下的周期 → 跳过守卫（不是真房源）', async () => {
+      const client = guardClient({
+        existing: existingPeriod({ hotel: { name: '三星占位', randomTierPlaceholder: 3 } }),
+      });
+      const period = await updateBlockPeriod('bp1', { rooms: 0 } as never, client);
+      expect(period.rooms).toBe(0);
+      expect(client.orderItem.findMany).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('deleteBlockPeriod', () => {
+    it('无占用 → 正常删除', async () => {
+      const client = guardClient({ existing: existingPeriod(), items: [] });
+      await expect(deleteBlockPeriod('bp1', client)).resolves.toEqual({ id: 'bp1' });
+      expect(client.hotelBlockPeriod.delete).toHaveBeenCalledWith({ where: { id: 'bp1' } });
+    });
+
+    it('有占用且删除后会短缺 → 拒绝，不给阈值豁免（零容忍，删除比缩容更激进）', async () => {
+      const client = guardClient({ existing: existingPeriod(), items: fourWholeRoomItems() });
+      await expect(deleteBlockPeriod('bp1', client)).rejects.toThrow(/请先处理相关订单再删除/);
+      expect(client.hotelBlockPeriod.delete).not.toHaveBeenCalled();
+    });
+
+    it('有占用但另有其他周期兜底不短缺 → 放行', async () => {
+      const client = guardClient({
+        existing: existingPeriod(),
+        others: [{ dateFrom: day(0), dateTo: day(3), rooms: 4 }],
+        items: fourWholeRoomItems(),
+      });
+      await expect(deleteBlockPeriod('bp1', client)).resolves.toEqual({ id: 'bp1' });
+    });
+
+    it('随机档存量周期 → 跳过守卫，直接删除', async () => {
+      const client = guardClient({
+        existing: existingPeriod({ hotelId: null, randomStarTier: 3, hotel: null }),
+      });
+      await expect(deleteBlockPeriod('bp1', client)).resolves.toEqual({ id: 'bp1' });
+      expect(client.orderItem.findMany).not.toHaveBeenCalled();
+    });
   });
 });
 

@@ -86,6 +86,20 @@ function TabBtn({
   );
 }
 
+/**
+ * 该桶的毛利是否可信。
+ * 后端口径：桶内只要有一行没录成本（missingCostItemCount > 0），成本就只是「部分成本」，
+ * 据此算的毛利必然虚高（机票/套餐行成本恒空时甚至恒等于 100% 毛利率），此时 grossMarginCny /
+ * marginPct 一律返回 null。前端据此显示「—」+「含 N 行无成本」，不拿虚高数字当结论。
+ * 用 missingCostItemCount 判而不是判 null：它就是后端的判定依据，两边同一条规则。
+ */
+// 类型守卫：成本齐全的行毛利必非 null（服务端口径），收窄后免去逐处判空
+function costKnown<T extends { missingCostItemCount: number; grossMarginCny: number | null; marginPct: number | null }>(
+  row: T,
+): row is T & { grossMarginCny: number; marginPct: number } {
+  return row.missingCostItemCount === 0 && row.grossMarginCny != null && row.marginPct != null;
+}
+
 /** 手写条形（占比 0–1） */
 function ShareBar({ pct, tone }: { pct: number; tone?: 'neg' }) {
   const safe = Math.max(0, Math.min(1, Number.isFinite(pct) ? pct : 0));
@@ -247,10 +261,10 @@ function SalesTab({ token, range }: { token: string; range: { from: string; to: 
     };
   }, [token, range.from, range.to, dim]);
 
-  // 条形基准：正毛利行里的最大值
+  // 条形基准：正毛利行里的最大值；毛利未知的行不参与（见 costKnown）
   const maxMargin = useMemo(() => {
     if (!report) return 0;
-    return report.rows.reduce((m, r) => Math.max(m, r.grossMarginCny), 0);
+    return report.rows.reduce((m, r) => (costKnown(r) ? Math.max(m, r.grossMarginCny) : m), 0);
   }, [report]);
 
   return (
@@ -312,32 +326,40 @@ function SalesTab({ token, range }: { token: string; range: { from: string; to: 
                   <td className="font-medium text-ink">{r.label}</td>
                   <td className="nums text-right">{r.orderCount}</td>
                   <td className="nums text-right">{fmtCny(r.revenueCny)}</td>
-                  <td className="nums text-right">{fmtCny(r.costCny)}</td>
+                  <td className="nums text-right" title={costKnown(r) ? undefined : '仅已录入成本的条目合计，不是全额成本'}>
+                    {fmtCny(r.costCny)}
+                  </td>
                   <td
                     className={`nums text-right font-medium ${
-                      r.grossMarginCny < 0 ? 'text-rose-600' : 'text-emerald-700'
+                      !costKnown(r)
+                        ? 'text-ink-muted'
+                        : r.grossMarginCny < 0
+                          ? 'text-rose-600'
+                          : 'text-emerald-700'
                     }`}
                   >
-                    {fmtCny(r.grossMarginCny)}
+                    {costKnown(r) ? fmtCny(r.grossMarginCny) : '—'}
                   </td>
                   <td className="nums text-right">
                     <span className="inline-flex items-center justify-end gap-1.5">
-                      {fmtPct(r.marginPct)}
+                      {costKnown(r) ? fmtPct(r.marginPct) : '—'}
                       {r.missingCostItemCount > 0 && (
                         <span
                           className="badge-warning"
-                          title="部分成本未录入，毛利率偏高，仅供参考"
+                          title="该行有条目未录成本，毛利未知——补齐成本后才会显示数字"
                         >
-                          <Icon name="alert" /> 缺{r.missingCostItemCount}项成本
+                          <Icon name="alert" /> 含{r.missingCostItemCount}行无成本
                         </span>
                       )}
                     </span>
                   </td>
                   <td>
-                    <ShareBar
-                      pct={maxMargin > 0 ? r.grossMarginCny / maxMargin : 0}
-                      tone={r.grossMarginCny < 0 ? 'neg' : undefined}
-                    />
+                    {costKnown(r) && (
+                      <ShareBar
+                        pct={maxMargin > 0 ? r.grossMarginCny / maxMargin : 0}
+                        tone={r.grossMarginCny < 0 ? 'neg' : undefined}
+                      />
+                    )}
                   </td>
                 </tr>
               ))}
@@ -348,20 +370,36 @@ function SalesTab({ token, range }: { token: string; range: { from: string; to: 
                 <td className="px-3 py-2.5">合计</td>
                 <td className="nums px-3 py-2.5 text-right">{report.totals.orderCount}</td>
                 <td className="nums px-3 py-2.5 text-right">{fmtCny(report.totals.revenueCny)}</td>
-                <td className="nums px-3 py-2.5 text-right">{fmtCny(report.totals.costCny)}</td>
+                <td
+                  className="nums px-3 py-2.5 text-right"
+                  title={
+                    costKnown(report.totals)
+                      ? undefined
+                      : '仅已录入成本的条目合计，不是全额成本'
+                  }
+                >
+                  {fmtCny(report.totals.costCny)}
+                </td>
                 <td
                   className={`nums px-3 py-2.5 text-right ${
-                    report.totals.grossMarginCny < 0 ? 'text-rose-600' : 'text-emerald-700'
+                    !costKnown(report.totals)
+                      ? 'text-ink-muted'
+                      : report.totals.grossMarginCny < 0
+                        ? 'text-rose-600'
+                        : 'text-emerald-700'
                   }`}
                 >
-                  {fmtCny(report.totals.grossMarginCny)}
+                  {costKnown(report.totals) ? fmtCny(report.totals.grossMarginCny) : '—'}
                 </td>
                 <td className="nums px-3 py-2.5 text-right">
                   <span className="inline-flex items-center justify-end gap-1.5">
-                    {fmtPct(report.totals.marginPct)}
+                    {costKnown(report.totals) ? fmtPct(report.totals.marginPct) : '—'}
                     {report.totals.missingCostItemCount > 0 && (
-                      <span className="badge-warning">
-                        <Icon name="alert" /> 缺{report.totals.missingCostItemCount}项成本
+                      <span
+                        className="badge-warning"
+                        title="有条目未录成本，合计毛利未知——补齐成本后才会显示数字"
+                      >
+                        <Icon name="alert" /> 含{report.totals.missingCostItemCount}行无成本
                       </span>
                     )}
                   </span>

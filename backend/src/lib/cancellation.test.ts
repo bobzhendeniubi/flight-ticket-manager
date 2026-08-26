@@ -8,6 +8,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import {
+  CANCELLABLE_STATUSES,
   computeRefundBreakdown,
   splitRefundBetweenCashAndBalance,
   validateTiers,
@@ -429,5 +430,133 @@ describe('splitRefundBetweenCashAndBalance · 现金优先且两段互斥', () =
         prepaymentOffsetCny: 0,
       }),
     ).toEqual({ refundToCashCny: 0, refundToBalanceCny: 0 });
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 可取消状态集合
+// ══════════════════════════════════════════════════════════════════════════
+describe('CANCELLABLE_STATUSES · 出票失败单必须能走退款', () => {
+  it('FAILED 在集合内 —— 出票失败恰是最该退款的场景', () => {
+    // 漏放的后果：这类单只能靠 ADMIN 手动 PATCH 状态硬推 REFUNDED（不生成 Refund、
+    // 不算退改费），账目当场分叉。
+    expect(CANCELLABLE_STATUSES.has('FAILED')).toBe(true);
+  });
+
+  it('占座态与改期态照旧可取消', () => {
+    for (const s of ['PAID', 'PROCESSING', 'TICKETED', 'CHANGE_REQUESTED', 'CHANGED']) {
+      expect(CANCELLABLE_STATUSES.has(s), `${s} 应可取消`).toBe(true);
+    }
+  });
+
+  it('已终结 / 未付款的单不走退款取消', () => {
+    // PENDING_PAYMENT 走另一条路（直接释放座位 + 0 费用）；其余是终态或草稿。
+    for (const s of ['DRAFT', 'PENDING_PAYMENT', 'PAYMENT_TIMEOUT', 'CANCELLED', 'REFUNDED', 'REFUND_REQUESTED', 'COMPLETED']) {
+      expect(CANCELLABLE_STATUSES.has(s), `${s} 不应可取消`).toBe(false);
+    }
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 现金 / 余额拆分：流水口径 offsetGrossCny（报价与落库同源）
+// ══════════════════════════════════════════════════════════════════════════
+describe('splitRefundBetweenCashAndBalance · offsetGrossCny（余额抵扣已内含在 paidAmount 里）', () => {
+  it('全额余额抵付单：paidAmount 全是抵扣 → 应退全部回余额，现金侧 0', () => {
+    // 旧口径（读恒为 0 的 Order.prepaymentOffset）会算成「全退现金」，
+    // 而落 REFUNDED 的执行侧按流水回补余额 —— 报价与落库当场分叉。
+    expect(
+      splitRefundBetweenCashAndBalance({
+        totalRefund: 8_000,
+        paidAmount: 8_000,
+        adjustmentCny: 0,
+        prepaymentOffsetCny: 0,
+        offsetGrossCny: 8_000,
+      }),
+    ).toEqual({ refundToCashCny: 0, refundToBalanceCny: 8_000 });
+  });
+
+  it('半现金半余额：现金优先退，退不下的部分回余额', () => {
+    expect(
+      splitRefundBetweenCashAndBalance({
+        totalRefund: 9_000,
+        paidAmount: 10_000, // 其中 4000 是余额抵扣
+        adjustmentCny: 0,
+        prepaymentOffsetCny: 0,
+        offsetGrossCny: 4_000,
+      }),
+    ).toEqual({ refundToCashCny: 6_000, refundToBalanceCny: 3_000 });
+  });
+
+  it('改期费先从现金里消耗：压低现金上限，溢出的部分回余额', () => {
+    expect(
+      splitRefundBetweenCashAndBalance({
+        totalRefund: 6_000,
+        paidAmount: 10_000, // 其中 4000 是余额抵扣 → 真现金 6000
+        adjustmentCny: 1_000, // 现金上限降到 5000
+        prepaymentOffsetCny: 0,
+        offsetGrossCny: 4_000,
+      }),
+    ).toEqual({ refundToCashCny: 5_000, refundToBalanceCny: 1_000 });
+  });
+
+  it('余额侧绝不超过当初抵扣掉的毛额（防凭空造币）', () => {
+    expect(
+      splitRefundBetweenCashAndBalance({
+        totalRefund: 10_000,
+        paidAmount: 3_000,
+        adjustmentCny: 0,
+        prepaymentOffsetCny: 0,
+        offsetGrossCny: 3_000,
+      }),
+    ).toEqual({ refundToCashCny: 0, refundToBalanceCny: 3_000 });
+  });
+
+  it('缺省 offsetGrossCny → 与旧版逐位一致（无余额抵扣的单不受本次改动影响）', () => {
+    const legacy = splitRefundBetweenCashAndBalance({
+      totalRefund: 700,
+      paidAmount: 1_000,
+      adjustmentCny: 200,
+      prepaymentOffsetCny: 0,
+    });
+    expect(legacy).toEqual({ refundToCashCny: 700, refundToBalanceCny: 0 });
+  });
+});
+
+describe('computeRefundBreakdown · offsetGrossCny 只改拆分、不改可退基数', () => {
+  it('余额抵扣不再被加进可退基数（paidAmount 已含它，加第二次＝放宽退款上限）', () => {
+    const r = computeRefundBreakdown({
+      paidAmount: 10_000, // 现金 6000 + 余额抵扣 4000
+      prepaymentOffsetCny: 0,
+      offsetGrossCny: 4_000,
+      adjustmentCny: 0,
+      grossItems: [grossItem(10_000, 0)],
+    });
+    expect(r.refundableBaseCny).toBe(10_000);
+    expect(r.totalRefund).toBe(10_000);
+    expect(r.refundToCashCny).toBe(6_000);
+    expect(r.refundToBalanceCny).toBe(4_000);
+    expect(r.offsetGrossCny).toBe(4_000);
+  });
+
+  it('手续费口径不受影响：拆分变了，扣多少费不变', () => {
+    const withOffset = computeRefundBreakdown({
+      paidAmount: 10_000,
+      prepaymentOffsetCny: 0,
+      offsetGrossCny: 4_000,
+      adjustmentCny: 0,
+      grossItems: [grossItem(10_000, 30)],
+    });
+    const withoutOffset = computeRefundBreakdown({
+      paidAmount: 10_000,
+      prepaymentOffsetCny: 0,
+      adjustmentCny: 0,
+      grossItems: [grossItem(10_000, 30)],
+    });
+    expect(withOffset.totalFee).toBe(withoutOffset.totalFee);
+    expect(withOffset.totalRefund).toBe(withoutOffset.totalRefund);
+    // 差别只在拆分：现金优先，应退 7000 先退满真现金 6000，余下 1000 回余额
+    expect(withOffset.refundToCashCny).toBe(6_000);
+    expect(withOffset.refundToBalanceCny).toBe(1_000);
+    expect(withoutOffset.refundToBalanceCny).toBe(0);
   });
 });

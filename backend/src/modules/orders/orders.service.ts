@@ -41,6 +41,7 @@ import {
   ForbiddenError,
   NotFoundError,
   PriceChangedError,
+  UnprocessableEntityError,
 } from '../../lib/errors.js';
 import type { ItineraryData } from '../../lib/itinerary-pdf.js';
 import { writeAudit } from '../../lib/audit.js';
@@ -55,6 +56,7 @@ import {
 import {
   assertOrderAcceptsFunds,
   assertOrderAllowsFundsDisposal,
+  FUNDS_DISPOSE_BLOCKED_STATUSES,
   sumCompletedRefundsWithinTx,
 } from '../../lib/funds-guard.js';
 import { resolveBundleNights } from '../products/bundle-nights.js';
@@ -71,6 +73,7 @@ import {
   assertHotelPhysicalFit,
   assertHotelPhysicalFitWithinTx,
   assertRandomTierFit,
+  assertRandomTierFitWithinTx,
   checkHotelPhysicalFit,
   getHotelNightlyRemaining,
   getRandomTierAggregate,
@@ -82,10 +85,11 @@ import { PricingService } from '../pricing/pricing.service.js';
 import { createOpenReceiptWithinTx } from '../receipts/receipts.service.js';
 import { OPERATION_FEE_CNY_PER_ORDER } from './order-cost-items.service.js';
 import { bundleItemMetadataSchema } from './orders.schemas.js';
-import { derivePtcByAge } from './pnr-export.js';
+import { derivePtcByAge, earliestFlightDeparture } from './pnr-export.js';
 import {
   assertOrderAllowsInvoicing,
   assertTicketingCap,
+  countsTowardTicketingCap,
   determineFlightLegs,
   determineFlightLegItems,
 } from './ticketing-cap.js';
@@ -638,6 +642,33 @@ export function assertDisplayedTotalMatches(
   if (Math.abs(productTotalCny - expectedTotalCny) > PRICE_TOLERANCE_CNY) {
     throw new PriceChangedError();
   }
+}
+
+/**
+ * 是否给本单自动加散客 RETAIL 立减。**下单（createOrder）与试算（quoteOrder）必须同一口径**，
+ * 否则录单页看到的系统价里有立减、真下单时却没有（或反过来），运营对着两个数字无从判断。
+ *
+ * 口径：
+ *   · 有归属代理 → 不加（代理走 AGENT 立减那条链）。createOrder 传的是 resolveOrderAgentId
+ *     解析后的权威 agentId，不是 body 里那个原始值。
+ *   · 任一「手工价通道」在场 → 不加：手工优惠/团队议价/手填结算总价都视为整体替代方案，
+ *     再叠自动立减就是双重砸价（与代理侧 hasManualSettlementChannel 判定同哲学）。
+ *
+ * 入参用可选字段而非具体 Body 类型：quote 的请求体目前还不带这三个手工通道字段（缺省 undefined
+ * ⇒ 与今天行为一致），等它带上时两边自动一起收紧，不会再分叉。
+ */
+export function shouldApplyRetailSettlementDiscount(input: {
+  agentId?: string | null;
+  priceAdjustment?: unknown;
+  settlementTotalCny?: number | null;
+  flightSettlementPriceCny?: number | null;
+}): boolean {
+  if (input.agentId) return false;
+  return (
+    input.priceAdjustment === undefined &&
+    input.settlementTotalCny === undefined &&
+    input.flightSettlementPriceCny === undefined
+  );
 }
 
 /**
@@ -1212,11 +1243,8 @@ export class OrderService {
       isStaffEnteredOrder(requester),
     );
 
-    const hasManualSettlementChannel =
-      body.priceAdjustment !== undefined ||
-      body.settlementTotalCny !== undefined ||
-      body.flightSettlementPriceCny !== undefined;
-    if (!agentId && !hasManualSettlementChannel) {
+    // 散客 RETAIL 立减判定与 quote 共用 shouldApplyRetailSettlementDiscount，两边不会再分叉。
+    if (shouldApplyRetailSettlementDiscount({ ...body, agentId })) {
       await this.applyRetailSettlementDiscount(body, pricedItems);
     }
 
@@ -1237,6 +1265,10 @@ export class OrderService {
     // 护照有效期规则（相对出发日）：<90 天禁止下单；不足 6 个月每人 +200 临期附加费
     await this.applyPassportExpiryRule(body, pricedItems);
 
+    // 出行人类型服务端权威派生（passengerToData）所需的「本单最早出发日」：与护照有效期规则
+    // 同一口径（服务端查 DB，客户端改不了），事务外查一次，供下方写 Passenger 时使用。
+    const authoritativeDepartureDate = await this.resolveEarliestFlightDepartureDate(body.items);
+
     // 录单调价/加项（权限已在上方按认证身份校验）：追加一条独立定价行，计入 subtotal/total。
     if (body.priceAdjustment) {
       pricedItems.push(buildPriceAdjustmentItem(body.priceAdjustment));
@@ -1250,6 +1282,9 @@ export class OrderService {
     // 说明：与 0723「结算价锁」不冲突——锁只在核对后写保护改价，日历只在创建时定价，两者时序不重叠。
     let effectiveSettlementTotalCny = body.settlementTotalCny;
     let settlementCalendarAudit: Record<string, unknown> | null = null;
+    // 机票结算价日历**明确放弃**自动取价的原因（如含非经济舱航段）；null = 没发生这回事。
+    // 只留痕不拒单：本单照常按动态价成交，同业价交给人工结算价通道。
+    let flightCalendarSkippedReason: string | null = null;
     // 批量「优惠 ¥/人」是独立的可叠加调整：只有服务端批量优惠路径注入的结构化标记
     // 才允许日历价与调整行叠加；普通 DISCOUNT 调价保持既有语义。
     const stackableCalendarAdjustment = body.priceAdjustment?.stackWithSettlementCalendar === true;
@@ -1292,10 +1327,14 @@ export class OrderService {
         body.flightSettlementPriceCny === undefined
       ) {
         const flightCalendar = await this.resolveFlightSettlementCalendarTotal(body);
-        if (flightCalendar) {
+        if (flightCalendar && flightCalendar.totalCny !== null) {
           effectiveSettlementTotalCny =
             flightCalendar.totalCny + (stackableCalendarAdjustment ? body.priceAdjustment?.amountCny ?? 0 : 0);
           settlementCalendarAudit = flightCalendar.audit;
+        } else if (flightCalendar) {
+          // 明确放弃自动取价（如含非经济舱航段）：不收敛价格（现状 = 动态定价），
+          // 但把原因留痕，免得事后没人说得清「这单为什么没走日历价」。
+          flightCalendarSkippedReason = flightCalendar.skippedReason;
         }
       }
     }
@@ -1429,9 +1468,17 @@ export class OrderService {
       // 包房周期行再判定：判定与落库之间没有窗口，两笔并发下单抢最后一间只会成一笔。
       // （priceAndValidateItems 里那道事务外的判定保留为「友好预检」：它能在长事务开始前就
       //  拒掉明显售罄的单，也服务于 quote 试算；权威判定以这里为准。）
-      // 未落位随机档行（无房型）不走这里，它们由 assertRandomTierFit 按同星级聚合余量把关。
+      // 未落位随机档行（无房型 / 占位酒店房型）不走这里，它们由下面那道随机档聚合闸把关。
       await assertHotelStaysFitWithinTx(tx, pricedItems, body.passengers, {
         // 前台散客/游客也走这条路径 → 中性话术，不暴露包房间数等内部库存数字。
+        buildMessage: () => HOTEL_SOLD_OUT_MESSAGE,
+      });
+
+      // ── 随机档聚合余量闸（同一事务、同一把锁语义）────────────────────────────
+      // 与上面那道真酒店闸互补：未落位的随机档行占的是「同星级酒店合计余量」。
+      // priceAndValidateItems 里那两处事务外判定同样保留为友好预检（也服务于 quote 试算），
+      // 权威判定以这里为准 —— 先锁该档次全部真酒店的包房周期行，判定与落库之间不留窗口。
+      await assertRandomTierStaysFitWithinTx(tx, pricedItems, {
         buildMessage: () => HOTEL_SOLD_OUT_MESSAGE,
       });
 
@@ -1487,7 +1534,7 @@ export class OrderService {
             })),
           },
           passengers: {
-            create: body.passengers.map((px) => passengerToData(px)),
+            create: body.passengers.map((px) => passengerToData(px, { authoritativeDepartureDate })),
           },
           statusEvents: {
             create: {
@@ -1630,6 +1677,21 @@ export class OrderService {
       });
     }
 
+    // 机票结算价日历放弃自动取价的留痕（含非经济舱航段等）：本单没有自动同业价，
+    // 需要运营/财务补人工结算价，否则这单按动态价成交、同业口径缺一块。
+    // WARNING 级：是要有人接手处理的缺口，不是日常噪音。
+    if (flightCalendarSkippedReason && !isGuest) {
+      await writeAudit({
+        actor: { userId: requester.userId, role: requester.role },
+        action: 'FLIGHT_SETTLEMENT_CALENDAR_SKIPPED',
+        targetType: 'ORDER',
+        targetId: order.id,
+        targetLabel: order.orderNumber,
+        after: { reason: flightCalendarSkippedReason },
+        severity: AuditSeverity.WARNING,
+      });
+    }
+
     // 重复乘客强录审计（证件号 + 冲突订单号 + 操作人）。权限已在入口按身份收口 → 此处必为 ADMIN/STAFF。
     // WARNING 级：越过同班次占座校验是需要留痕复核的动作。!isGuest 让 TS 收窄到 OrderRequester。
     if (duplicateConflicts.length > 0 && !isGuest) {
@@ -1651,7 +1713,12 @@ export class OrderService {
    * 录单前试算（quote）：复用权威定价 priceAndValidateItems，只算不落库、不扣座。
    * 返回各行明细 + subtotal/total（CNY），供录单页在提交前展示「系统价」。
    */
-  async quoteOrder(body: QuoteOrderBody): Promise<{
+  async quoteOrder(
+    // priceAdjustment / settlementTotalCny / flightSettlementPriceCny 已随 quoteOrderBodySchema
+    // 暴露（形状与 createOrderBodySchema 对应字段一致）——立减判定与 createOrder 共用同一函数，
+    // 录单页填了手工价通道字段后随试算一起发送，两边判定同步收紧。
+    body: QuoteOrderBody,
+  ): Promise<{
     currency: string;
     subtotal: number;
     total: number;
@@ -1669,7 +1736,9 @@ export class OrderService {
     const priced = await this.priceAndValidateItems(body.items, undefined, body.passengers, true);
     // 散客立减与结算价日历是两条独立规则链：先按每个套餐行命中 RETAIL，
     // 即使日历价未维护，quote 的商品总价也必须与 createOrder 保持一致。
-    if (!body.agentId) {
+    // 判定与 createOrder 共用同一个函数（此前 quote 只判 !agentId、createOrder 还要求无手工价通道，
+    // 带手工调价时报价里有立减、实下单没有 —— 两个数字对不上）。
+    if (shouldApplyRetailSettlementDiscount(body)) {
       await this.applyRetailSettlementDiscount({ items: body.items }, priced);
     }
 
@@ -1682,7 +1751,15 @@ export class OrderService {
       );
       if (bundleCalendar) {
         let autoDiscount: AutoDiscountSummary | null = null;
-        if (body.agentId) {
+        // 手工价通道（与 createOrder 的 hasManualSettlementChannel 同口径）：priceAdjustment /
+        // settlementTotalCny / flightSettlementPriceCny 任一在场 → 视为整体替代方案，跳过自动立减
+        // 注入。此前这里只判 body.agentId，没有这道闸——运营填了手工结算价/优惠后，试算仍显示一笔
+        // 代理自动立减，真下单时（createOrder 已收紧）却不生效，两个数字对不上。
+        const hasManualSettlementChannel =
+          body.priceAdjustment !== undefined ||
+          body.settlementTotalCny !== undefined ||
+          body.flightSettlementPriceCny !== undefined;
+        if (body.agentId && !hasManualSettlementChannel) {
           autoDiscount = await this.applyAgentSettlementDiscount(
             priced,
             bundleCalendar,
@@ -1727,7 +1804,11 @@ export class OrderService {
         };
       } else {
         const flightCalendar = await this.resolveFlightSettlementCalendarTotal(quoteCreateBody);
-        if (flightCalendar) {
+        if (flightCalendar && flightCalendar.totalCny === null) {
+          // 明确放弃自动取价（含非经济舱航段等）→ 试算里直接把原因摆给录单人，
+          // 免得看到「没有同业价」以为是日历没维护、跑去配一格根本不会被用到的价。
+          settlementPreview = { ok: false, reason: flightCalendar.skippedReason };
+        } else if (flightCalendar) {
           const auditLines = Array.isArray(flightCalendar.audit.lines)
             ? flightCalendar.audit.lines
             : [];
@@ -1773,6 +1854,23 @@ export class OrderService {
    *   - 距出发日不足 6 个月（180 天）→ 每位 +200 临期附加费（FEE 行）
    * 通过 push 到 pricedItems 让附加费自然进入 subtotal/total/items。
    */
+  /**
+   * 本单最早 FLIGHT 行出发时间（服务端权威来源，直接查 DB，客户端改不了）。
+   * 无 FLIGHT 行（纯地面单）或班次查无 → null。供护照有效期规则、出行人类型服务端权威派生
+   * （passengerToData）共用同一口径的出发日。
+   */
+  private async resolveEarliestFlightDepartureDate(items: OrderItemInput[]): Promise<Date | null> {
+    const scheduleIds = items
+      .filter((i): i is Extract<OrderItemInput, { kind: 'FLIGHT' }> => i.kind === 'FLIGHT')
+      .map((i) => i.flightScheduleId);
+    if (scheduleIds.length === 0) return null;
+    const scheds = await prisma.flightSchedule.findMany({
+      where: { id: { in: scheduleIds } },
+      select: { departureTime: true },
+    });
+    return earliestFlightDeparture(scheds.map((s) => ({ kind: 'FLIGHT', flightSchedule: s })));
+  }
+
   private async applyPassportExpiryRule(
     body: CreateOrderBody,
     pricedItems: Array<{ kind: OrderItemKind; description: string; quantity: number; unitPrice: number; amount: number; totalCostCny?: number }>,
@@ -1868,6 +1966,10 @@ export class OrderService {
   /**
    * 散客套餐在套餐 percent-off 后命中 RETAIL 立减。
    * 该方法只接受已经完成套餐权威定价和 percent-off 的 pricedItems，确保顺序固定。
+   *
+   * 立减叠加后若把散客价压到**同业结算价以下** → 拒单（渠道价格倒挂：散客比代理还便宜，
+   * 代理会转头去前台自己下单）。取不到同业价（该档次/晚数/出发日未配日历）时维持放行 ——
+   * 没有基准就不做判断，避免误伤未配日历的正常单。
    */
   private async applyRetailSettlementDiscount(
     body: Pick<CreateOrderBody, 'items'>,
@@ -1934,7 +2036,8 @@ export class OrderService {
       hitBundleIds.push(bundle.id);
       hitRuleIds.push(hit.ruleId);
 
-      // 击穿保护比较只做 warn：真正异常（订单变成 0/负数）才拒单。
+      // 同业价基准：命中立减的这几张套餐按同一（档次×晚数×出发日）取同业结算价，
+      // 累加成本单的「同业价合计」，供下方击穿闸比对。取不到价的行不进基准（宁可不判）。
       const rate = await getSettlementRate(
         bundle.settlementTier as SettlementTier,
         bundle.settlementNights,
@@ -1954,14 +2057,24 @@ export class OrderService {
       });
       throw new BadRequestError('优惠叠加后金额异常，请联系客服');
     }
+    // ── 渠道价格倒挂闸：散客价不得低于同业结算价 ────────────────────────────
+    // 旧口径只打一条 warn 就放行 —— 日志没人盯，倒挂的单照常成交：同一份货散客比代理便宜，
+    // 代理只要发现就会绕开自己的账号到前台下单，同业价体系当场作废。改为硬拒。
+    // 只在「同业价取得到（sameIndustryCalendarTotal > 0）且确实被击穿」时触发；
+    // 取不到价（未配日历）→ 无基准可比，维持放行，不误伤。
     if (sameIndustryCalendarTotal > 0 && afterTotal < sameIndustryCalendarTotal) {
       // eslint-disable-next-line no-console
-      console.warn('[orders] retail settlement discount is below settlement calendar price', {
+      console.error('[orders] retail settlement discount is below settlement calendar price', {
         bundleIds: hitBundleIds,
         ruleIds: hitRuleIds,
         orderTotalCny: afterTotal,
         settlementCalendarCny: sameIndustryCalendarTotal,
       });
+      // 文案不带同业价数字：这条闸在前台散客下单路径上也会触发，内部结算价不该回给客人。
+      throw new BadRequestError(
+        '本单优惠后的价格低于同业结算价，不能按此价成交（散客价不得低于同业价）。' +
+          '请调整立减规则，或联系客服走人工通道。',
+      );
     }
     return {
       hits,
@@ -2077,11 +2190,23 @@ export class OrderService {
    *     走现状（动态定价），绝不做半单收敛。宁可不取，也别把只算了一条腿的价当整单结算价。
    *   · 含 BUNDLE 行的单一律不参与：套餐单的机票航段是套餐的一部分，用机票价收敛整单会把
    *     地面部分白送。套餐走上面的地面结算价日历，两张表各管各的。
+   *   · **含非经济舱航段的单一律不参与**：机票结算价日历的键是「航班号 × 出发日」，没有舱位这一维
+   *     （见 FlightSettlementRate）。商务舱/头等/超经的行拿这张表取价，取到的是**经济舱**同业价，
+   *     再被 SETTLEMENT 差额行把整单砸到经济舱价 —— 一单少收整个舱位差。宁可不取：整单返回 null
+   *     （附 skippedReason），走人工结算价通道（手填结算总价 / 团队议价）。
+   *     日历加舱位维度是独立的 schema 迁移议题，不在此处顺手改。
    * 调用方（createOrder）仅在「代理单 + 无手工结算价 + 套餐日历未接管」时调用，故此处不重复判身份。
+   *
+   * 返回 `{ totalCny: null, skippedReason }` = 明确放弃取价并带上人类可读原因（quote 用它显示
+   * 「为什么没有自动价」）；返回 `null` = 本单压根不适用这张表（非纯机票单等），静默走现状。
    */
   private async resolveFlightSettlementCalendarTotal(
     body: Pick<CreateOrderBody, 'items'>,
-  ): Promise<{ totalCny: number; audit: Record<string, unknown> } | null> {
+  ): Promise<
+    | { totalCny: number; audit: Record<string, unknown> }
+    | { totalCny: null; skippedReason: string }
+    | null
+  > {
     // 含套餐行 → 不是纯机票单，交回套餐日历/现状处理。
     if (body.items.some((it) => it.kind === 'BUNDLE')) return null;
 
@@ -2089,6 +2214,25 @@ export class OrderService {
       (it): it is Extract<OrderItemInput, { kind: 'FLIGHT' }> => it.kind === 'FLIGHT',
     );
     if (flightItems.length === 0) return null;
+
+    // 非经济舱航段（含超经/商务/头等）→ 整单放弃自动取价。缺省视为经济舱：schema 里 FLIGHT 行的
+    // flightCabin 必填，null/undefined 只可能来自历史/内部构造，按最保守的既有口径（经济舱）处理。
+    const nonEconomyCabins = [
+      ...new Set(
+        flightItems
+          .map((it) => it.flightCabin)
+          .filter((cabin): cabin is CabinClass => cabin != null && cabin !== CabinClass.ECONOMY),
+      ),
+    ];
+    if (nonEconomyCabins.length > 0) {
+      return {
+        totalCny: null,
+        skippedReason: `本单含非经济舱航段（${nonEconomyCabins
+          .map((cabin) => CABIN_ZH_LABEL[cabin] ?? cabin)
+          .join('、')}），机票结算价日历不分舱位、按此取价会按经济舱价收敛整单。` +
+          '本单同业价请人工设置（手填结算总价 / 团队议价）。',
+      };
+    }
 
     const scheduleIds = [...new Set(flightItems.map((it) => it.flightScheduleId))];
     const scheds = await prisma.flightSchedule.findMany({
@@ -2434,7 +2578,10 @@ export class OrderService {
           }
           // 成本快照（每间每晚）：服务端从 DB 取同星级酒店当晚的切房单价，不信前端。
           hotelUnitCost = await resolveRandomTierNightlyCost(item.randomStarTier, item.checkIn);
-          // 可售判定：同星级酒店合计余量（含已落位与未落位随机单的占用）够不够本次这几间。
+          // 可售判定（**事务外友好预检**）：同星级酒店合计余量够不够本次这几间。
+          // 它能在长事务开始前拒掉明显售罄的单，也服务于 quote 试算；但只读、无锁，
+          // 并发抢最后一间时两笔会双双通过 —— 权威判定在建单事务内的
+          // assertRandomTierStaysFitWithinTx（带 FOR UPDATE 行锁）。
           // 该档次整段无任何同星级包房周期 → 视为未管控，不拦截（房控哲学：未配包房 ≠ 售罄）。
           const stayNights = buildStayNightDates(new Date(item.checkIn), new Date(item.checkOut));
           if (stayNights.length > 0) {
@@ -2797,6 +2944,8 @@ export class OrderService {
         // 例外 —— 房型挂在**随机档占位酒店**上（randomTierPlaceholder 非空）：那不是真房源，
         // 对它跑具体酒店闸等于拿一份假库存放行/拦截。这种单业务上就是「买了 N 星随机、还没落位」，
         // 故改走随机档聚合闸 assertRandomTierFit（Σ同星级真酒店余量 − 未落位占用，与销控板同公式）。
+        // 同上：这里是事务外友好预检（只读无锁，也服务于 quote 试算），
+        // 权威判定在建单事务内的 assertRandomTierStaysFitWithinTx。
         // 聚合闸是床位口径而非物理口径：随机单还没落到任何一家酒店，拼房能不能配对要等落位
         // 那一刻由该店当晚性别桶决定，落位走换酒店流程、那里已有物理口径前瞻闸把关。
         const fitHotelId = designatedRoomType?.hotelId ?? bundle.hotelRoomType?.hotelId ?? null;
@@ -3948,6 +4097,8 @@ export class OrderService {
     const pendingFulfillmentTaskIds: string[] = [];
     // 收集释放座位的舱位 id，提交后排队候补检查
     const releasedSeatClassIds: string[] = [];
+    // 取消族恢复时被自动清除的开票标记提示（超出班次开票额度 → 清标记，要求票务台重开）
+    const invoiceCapWarnings: string[] = [];
 
     const updated = await prisma.$transaction(async (tx) => {
       return this._updateStatusWithinTx(
@@ -3959,6 +4110,7 @@ export class OrderService {
         pendingFulfillmentTaskIds,
         force,
         releasedSeatClassIds,
+        invoiceCapWarnings,
       );
     });
 
@@ -3999,7 +4151,12 @@ export class OrderService {
     }
 
     // 对外脱敏按请求者角色：AGENT/CUSTOMER 自助改状态的返回也剥离内部字段（getOrder/listOrders 同口径）。
-    return serializeOrder(updated, orderSerializeRoleCtx(requester.role));
+    // invoiceCapWarnings 只在「取消族恢复把开票标记清掉了」时出现，附在订单上带回给操作者
+    //（没清就没有这个键，前端不必处理空数组）。
+    const serialized = serializeOrder(updated, orderSerializeRoleCtx(requester.role));
+    return invoiceCapWarnings.length > 0
+      ? { ...serialized, invoiceCapWarnings: [...new Set(invoiceCapWarnings)] }
+      : serialized;
   }
 
   /**
@@ -4015,15 +4172,36 @@ export class OrderService {
   ): Promise<{
     successCount: number;
     failureCount: number;
-    results: Array<{ id: string; success: boolean; orderNumber?: string; error?: string }>;
+    results: Array<{
+      id: string;
+      success: boolean;
+      orderNumber?: string;
+      error?: string;
+      /** 取消族恢复时被自动清除的开票标记提示（需票务台重开），无则不出现。 */
+      warnings?: string[];
+    }>;
   }> {
-    const results: Array<{ id: string; success: boolean; orderNumber?: string; error?: string }> = [];
+    const results: Array<{
+      id: string;
+      success: boolean;
+      orderNumber?: string;
+      error?: string;
+      warnings?: string[];
+    }> = [];
     let successCount = 0;
     let failureCount = 0;
     for (const id of ids) {
       try {
         const order = await this.updateStatus(id, toStatus, requester, reason, force);
-        results.push({ id, success: true, orderNumber: order.orderNumber });
+        // 逐单把「开票标记被清掉」的提示带回：批量恢复时这类单往往混在几十条里，
+        // 不逐条回显就等于悄悄改了数据。
+        const warnings = (order as { invoiceCapWarnings?: string[] }).invoiceCapWarnings;
+        results.push({
+          id,
+          success: true,
+          orderNumber: order.orderNumber,
+          ...(warnings && warnings.length > 0 ? { warnings } : {}),
+        });
         successCount += 1;
       } catch (err) {
         const message = err instanceof Error ? err.message : '未知错误';
@@ -4484,7 +4662,7 @@ export class OrderService {
     actor: { userId: string; role: UserRole },
   ): Promise<{
     order: ReturnType<typeof serializeOrder>;
-    /** B12：已付款单改价的资金后果提示（多付/新尾款）；无后果时 null。*/
+    /** B12：已付款单改价的资金后果提示（多付/新尾款）+ 已计提佣金提示；均无后果时 null。*/
     warning: string | null;
     audit: {
       orderNumber: string;
@@ -4595,6 +4773,25 @@ export class OrderService {
         select: { subtotal: true, total: true },
       });
 
+      // 佣金后果提示：佣金在订单转 PAID 时按当时的价格基数一次性计提，改结算价**不重算佣金**，
+      // 且计提幂等键按（订单, productKind）不区分状态 —— 补提也会被判成"已提过"而永久锁死。
+      // 本次只做可见性：把「已计提多少」明明白白摆到操作者面前 + 留一条 WARNING 审计，
+      // 让财务自己决定要不要人工调整。真正的重算/幂等键收口是独立议题，不在此处顺手改。
+      const accruedCommissions = await tx.commissionRecord.findMany({
+        where: {
+          orderId,
+          status: { in: [CommissionStatus.ACCRUED, CommissionStatus.SETTLED] },
+        },
+        select: { amount: true },
+      });
+      const accruedCommissionCny = round2(
+        accruedCommissions.reduce((s, c) => s + Number(c.amount.toString()), 0),
+      );
+      const commissionWarning =
+        accruedCommissions.length > 0
+          ? `本单已计提佣金 ¥${accruedCommissionCny}，价格基数已变更，请财务确认是否调整。`
+          : null;
+
       // 已付资金后果（B12）：改价后 total 变、paidAmount 不变 —— 把差额算清楚交给运营处置，
       // 不再让「total ≠ 已收」静默存在。多付走既有多付处置（转余额/挂账/退款），欠款去催收。
       const paid = Number(order.paidAmount.toString());
@@ -4611,6 +4808,8 @@ export class OrderService {
             '请补收该差额或确认本次改价金额无误。';
         }
       }
+      // 佣金提示与资金提示并列返回：两件事互不覆盖（可能同时成立）。
+      warning = [warning, commissionWarning].filter(Boolean).join(' ') || null;
 
       return {
         orderNumber: order.orderNumber,
@@ -4623,8 +4822,31 @@ export class OrderService {
         afterSubtotal: updated.subtotal.toString(),
         afterTotal: updated.total.toString(),
         warning,
+        accruedCommissionCny: accruedCommissions.length > 0 ? accruedCommissionCny : null,
       };
     });
+
+    // 改价撞上已计提佣金 → 单独留一条 WARNING 审计（路由层那条改价审计是 INFO 级，
+    // 淹没在日常改价里翻不出来）。await 而非 fire-and-forget：与录单调价/结算总价同口径，
+    // 佣金基数漂移是财务要复核的事，落审计后再返回。
+    if (scratch.accruedCommissionCny !== null) {
+      await writeAudit({
+        actor: { userId: actor.userId, role: actor.role },
+        action: 'SETTLEMENT_PRICE_CHANGED_AFTER_COMMISSION',
+        targetType: 'ORDER',
+        targetId: orderId,
+        targetLabel: scratch.orderNumber,
+        before: { total: scratch.beforeTotal, accruedCommissionCny: scratch.accruedCommissionCny },
+        after: {
+          total: scratch.afterTotal,
+          orderItemId: itemId,
+          // 佣金不随改价重算，这条审计就是「基数已变、佣金没动」的留痕。
+          commissionRecalculated: false,
+          reason: input.reason ?? null,
+        },
+        severity: AuditSeverity.WARNING,
+      });
+    }
 
     const finalOrder = await prisma.order.findUniqueOrThrow({
       where: { id: orderId },
@@ -4655,44 +4877,13 @@ export class OrderService {
     };
   }
 
-  /**
-   * 设置开票状态（路由层限 ADMIN/STAFF）。
-   * 转 ISSUED 前校验班次开票上限（FlightSchedule.ticketingCap，默认 191 张/班次），
-   * 超限抛 422。校验+更新同包一个事务，缩小并发开票越限的窗口。
-   */
-  async setInvoiceStatus(
-    id: string,
-    invoiceStatus: InvoiceStatus,
-  ): Promise<{ id: string; orderNumber: string; invoiceStatus: InvoiceStatus }> {
-    return prisma.$transaction(async (tx) => {
-      const order = await tx.order.findUnique({
-        where: { id },
-        select: {
-          invoiceStatus: true,
-          items: {
-            where: { kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
-            select: { flightScheduleId: true },
-          },
-          _count: { select: { passengers: true } },
-        },
-      });
-      if (!order) throw new NotFoundError('订单不存在');
-
-      // 已是 ISSUED 的订单重复设置不再计数（幂等）；改回 NONE/REQUESTED 不受限
-      if (invoiceStatus === InvoiceStatus.ISSUED && order.invoiceStatus !== InvoiceStatus.ISSUED) {
-        const scheduleIds = order.items
-          .map((it) => it.flightScheduleId)
-          .filter((sid): sid is string => sid !== null);
-        await assertTicketingCap(tx, scheduleIds, order._count.passengers);
-      }
-
-      return tx.order.update({
-        where: { id },
-        data: { invoiceStatus },
-        select: { id: true, orderNumber: true, invoiceStatus: true },
-      });
-    });
-  }
+  // 旧的「订单级开票状态」写入口（setInvoiceStatus / PATCH /orders/:id/invoice-status）已删除
+  // （0716 H11b）：它是六态开票改造前的遗留，与现口径是两本账 ——
+  //   · 不走 assertOrderAllowsInvoicing（取消族/回收站单照样能标开票）；
+  //   · 写进的 Order.invoiceStatus 现在无人读：开票额度（ticketing-cap）、导出、财务口径
+  //     全部改看三个布尔位（outboundInvoiced / returnInvoiced / systemInvoiced）。
+  // 唯一写入口是 setInvoiceFlags（PATCH /orders/:id/invoice-flags）。数据列 invoiceStatus 保留
+  //（存量数据 + 换人 resetInvoice 仍会把它归零），只是不再有单独的写接口。
 
   /**
    * 设置六态开票的三个布尔位（路由层限 ADMIN/STAFF）：去程 / 回程 / 系统 各自独立。
@@ -4728,7 +4919,7 @@ export class OrderService {
           outboundInvoiced: true,
           returnInvoiced: true,
           systemInvoiced: true,
-          _count: { select: { passengers: true } },
+          passengers: { select: { passengerType: true } },
           items: {
             where: { kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
             select: {
@@ -4739,6 +4930,13 @@ export class OrderService {
         },
       });
       if (!order) throw new NotFoundError('订单不存在');
+
+      // 本单要占的开票**座位**数：婴儿有票无座，不占库存 —— 必须与计数侧
+      //（countIssuedPassengers 同样跳过 INFANT）严格同口径。此前这里传的是含婴儿的总人数，
+      // 于是每个带婴儿的订单都比它实际占的座多算一个，班次快满时会把合法开票误判成超限。
+      const seatPassengerCount = order.passengers.filter(
+        (p) => p.passengerType !== PassengerType.INFANT,
+      ).length;
 
       // 开票标记状态闸：只挡「翻成已开」（false → true）——取消族/软删单不占班次额度，
       // 标了开票位对 191 上限完全隐形，却会进导出、让财务口径失真（见 assertOrderAllowsInvoicing）。
@@ -4753,11 +4951,11 @@ export class OrderService {
 
       // 去程：从 false → true 且有去程班次时校验该班次上限
       if (flags.outboundInvoiced === true && !order.outboundInvoiced && outboundScheduleId) {
-        await assertTicketingCap(tx, [outboundScheduleId], order._count.passengers);
+        await assertTicketingCap(tx, [outboundScheduleId], seatPassengerCount);
       }
       // 回程：从 false → true 且有回程班次时校验该班次上限
       if (flags.returnInvoiced === true && !order.returnInvoiced && returnScheduleId) {
-        await assertTicketingCap(tx, [returnScheduleId], order._count.passengers);
+        await assertTicketingCap(tx, [returnScheduleId], seatPassengerCount);
       }
 
       return tx.order.update({
@@ -5068,6 +5266,11 @@ export class OrderService {
     newTaskIdsOut: string[],
     force?: boolean,
     releasedSeatClassIdsOut?: string[],
+    /**
+     * 取消族恢复时被自动清除的开票标记警示语（见下方「取消族恢复：复检班次开票额度」）。
+     * 调用方给了数组就能把提示带回给操作者；不给也照样复检、照样清标记（只是没人看见提示）。
+     */
+    invoiceCapWarningsOut?: string[],
   ) {
     const order = await tx.order.findUnique({
       where: { id },
@@ -5124,6 +5327,58 @@ export class OrderService {
       if (legCount >= 2 && !inv?.returnInvoiced) {
         throw new BadRequestError(
           '回程尚未标记开票，不能推进到「出票完成」。请先在票务台标记回程已开票——标齐后订单会自动推进。',
+        );
+      }
+    }
+
+    // ── REFUND_REQUESTED 账目闸（与下方 →REFUNDED 的账目闸对称）────────────────────
+    // 状态机把 PAID/PROCESSING/TICKETED/CHANGED/FAILED → REFUND_REQUESTED 全部放行且零校验，
+    // 于是「退款申请中」可以是一张**没有任何 Refund 记录**的空壳：座位当场释放、订单从所有
+    // 有效口径里消失，却既没有应退报价、也没有可批准的对象 —— 下一步 →REFUNDED 被账目闸拦死，
+    // 退回 PROCESSING 又要重新抢座位，这单就此卡住，实收与佣金两头挂着谁也对不平。
+    // 口径：进 REFUND_REQUESTED 必须已有一条**未终结**的 Refund（REQUESTED/APPROVED/PROCESSING）。
+    // 唯一正门是 POST /orders/:id/cancel —— 它先按取消策略算出应退报价、建 Refund，再推本状态。
+    // **admin force 同样拦**：与 →REFUNDED 一致，这是账目完整性，force 是用来跳状态机的，不是跳账的。
+    if (toStatus === OrderStatus.REFUND_REQUESTED) {
+      const pendingRefundCount = await tx.refund.count({
+        where: {
+          orderId: id,
+          status: {
+            in: [RefundStatus.REQUESTED, RefundStatus.APPROVED, RefundStatus.PROCESSING],
+          },
+        },
+      });
+      if (!(pendingRefundCount > 0)) {
+        throw new BadRequestError(
+          `订单 ${order.orderNumber} 还没有待处理的退款申请，不能直接置为「退款申请中」——` +
+            `那会让订单座位当场释放却没有任何应退金额可批准，最终既退不出去也回不来。` +
+            `请改用订单详情页的「取消订单」：系统会按取消策略算出应退明细并生成退款申请，` +
+            `再由财务批准退款。`,
+        );
+      }
+    }
+
+    // ── CHANGED 派生闸（与上方 TICKETED 派生闸同构）─────────────────────────────
+    // 「已改期」不是一个可以手点的标签，而是**改期动作真的发生过**的派生：改期端点
+    //（rescheduleOrderItem）搬完座位后会在被改的 FLIGHT 行 metadata 上落 flightChanged 标记，
+    // 并在同一事务里推进本状态。手动 CHANGE_REQUESTED→CHANGED 若不校验，就会出现「订单写着
+    // 已改期、航段还是原班次」——旅客照原班次出行、客服照新状态答复，且改期费/立减补差全部落空。
+    // ADMIN force 可跳过（应急通道，审计照记；也用于放行改期标记出现之前的存量单）。
+    if (toStatus === OrderStatus.CHANGED && !isAdminForce) {
+      const flightRows = await tx.orderItem.findMany({
+        where: { orderId: id, kind: OrderItemKind.FLIGHT },
+        select: { metadata: true },
+      });
+      const hasFlightChangedMark = flightRows.some((row) => {
+        const meta = row.metadata;
+        if (meta == null || typeof meta !== 'object' || Array.isArray(meta)) return false;
+        return (meta as Record<string, unknown>).flightChanged != null;
+      });
+      if (!hasFlightChangedMark) {
+        throw new BadRequestError(
+          `订单 ${order.orderNumber} 没有任何航段被改期过，不能置为「已改期」——` +
+            `否则状态说已改、航段还是原班次，旅客会按原航班出行。` +
+            `请先用订单详情页的「改期」把航段改到新班次（改完订单会自动进入「已改期」）。`,
         );
       }
     }
@@ -5202,16 +5457,48 @@ export class OrderService {
       const pendingSum = pendingAgg._sum.amount ?? new Prisma.Decimal(0);
       const completedSum = new Prisma.Decimal(await sumCompletedRefundsWithinTx(tx, id));
       const totalRefundOut = completedSum.add(pendingSum);
-      // 守恒基数含预存余额抵扣：代理用余额抵付的钱同样是客户付进来的钱（见 lib/cancellation.ts
-      // 的可退基数口径）。只按 paidAmount 断言会把「余额抵付单的正常退款」全部误拦。
-      const prepaymentOffsetCny = round2(Number(order.prepaymentOffset ?? 0));
       const paidNum = round2(Number(paidAmount.toString()));
-      const fundsInCny = round2(paidNum + prepaymentOffsetCny);
       const totalRefundOutCny = round2(Number(totalRefundOut.toString()));
-      if (totalRefundOutCny > fundsInCny + 0.001) {
+
+      // ── 本单的预存余额抵扣额：按 PrepaymentTransaction 流水现算 ─────────────
+      // 绝不读 Order.prepaymentOffset：那一列没有任何生产代码写入（恒为 0），照它算出来的
+      // 「余额部分」恒为 0 —— 预存抵付过的单退款时余额永远回不来（钱在系统里凭空消失）。
+      // 唯一真源是流水：applyAgentBalanceToOrder 每次抵扣写一条 OFFSET（负数），
+      // 本分支每次回补写一条 REFUND（正数）。
+      //   已抵扣毛额 offsetGross     = |Σ OFFSET.amount|
+      //   已回补     alreadyRestored = Σ REFUND.amount（幂等基准：分批批准退款不重复回补）
+      // 关键口径：抵扣当时已经把金额累加进 order.paidAmount（见 applyAgentBalanceToOrder），
+      // 所以 paidAmount 是「现金 + 余额抵扣」的合计，不是纯现金 ——
+      //   · 资金守恒基数就是 paidAmount 本身，绝不能再把 offsetGross 加一次（等于凭空放宽退款上限）；
+      //   · 真·现金 realCash = max(0, paidAmount − offsetGross)，做现金/余额拆分时用它当现金侧上限。
+      // realCash 按**毛额**而非净额算：回补不减 paidAmount，用净额会让已回补的部分在下一次
+      // 分批批准时摇身变成「现金」，同一笔钱退两遍。
+      // 无归属代理的单直接跳过查询：applyAgentBalanceToOrder 硬要求 order.agentId 才能抵扣，
+      // 而有 OFFSET 时改归属被硬阻断（见 changeOrderAgent）—— agentId 为空 ⇒ 必然没有 OFFSET 流水。
+      const balanceLedger = order.agentId
+        ? await tx.prepaymentTransaction.findMany({
+            where: {
+              orderId: id,
+              type: { in: [PrepaymentTxType.OFFSET, PrepaymentTxType.REFUND] },
+            },
+            select: { agentId: true, amount: true, type: true },
+          })
+        : [];
+      const offsetRows = balanceLedger.filter((r) => r.type === PrepaymentTxType.OFFSET);
+      const offsetGrossCny = round2(
+        offsetRows.reduce((s, r) => s + Math.abs(Number(r.amount.toString())), 0),
+      );
+      const alreadyRestoredCny = round2(
+        balanceLedger
+          .filter((r) => r.type === PrepaymentTxType.REFUND)
+          .reduce((s, r) => s + Number(r.amount.toString()), 0),
+      );
+      const realCashCny = Math.max(0, round2(paidNum - offsetGrossCny));
+
+      if (totalRefundOutCny > paidNum + 0.001) {
         throw new BadRequestError(
-          `订单 ${order.orderNumber} 应退合计 ¥${totalRefundOutCny.toFixed(2)} 已超过实收 ¥${fundsInCny.toFixed(2)}` +
-            `（现金 ¥${paidNum.toFixed(2)} + 预存余额抵扣 ¥${prepaymentOffsetCny.toFixed(2)}），` +
+          `订单 ${order.orderNumber} 应退合计 ¥${totalRefundOutCny.toFixed(2)} 已超过实收 ¥${paidNum.toFixed(2)}` +
+            `（现金 ¥${realCashCny.toFixed(2)} + 预存余额抵扣 ¥${offsetGrossCny.toFixed(2)}），` +
             `不能批准退款（退出去的钱不能多过收进来的钱）。` +
             `常见原因：申请退款后多付已被转存代理余额或挂账池，或此前已退过款。` +
             `请财务核对实收与已退金额后，驳回本次申请并按最新口径重新发起。`,
@@ -5219,27 +5506,31 @@ export class OrderService {
       }
 
       // ── 预存余额回补（PrepaymentTxType.REFUND，此前是从未被写入的死枚举）────
-      // 拆分口径与 lib/cancellation.ts 的 splitRefundBetweenCashAndBalance 一字一致
-      //（现金优先：改期费先从现金里消耗，应退先退现金、退不下的部分回余额）。
+      // 拆分口径与 lib/cancellation.ts 的 splitRefundBetweenCashAndBalance 同源
+      //（现金优先：改期费先从现金里消耗，应退先退现金、退不下的部分回余额）；
+      // 差别只在这里的「现金」是扣掉余额抵扣后的 realCash，而那边收到的 paidAmount 是合计值。
       // 这里刻意内联而不是 import：orders.service.test.ts 用 vi.mock 整体替换了
       // '../../lib/cancellation.js'，静态引用会在该测试里变成 undefined。改这段务必同步改那边。
-      // 幂等：扣掉本单已经回补过的 REFUND 流水，多次/分批批准退款不会重复回补。
       const adjustmentCny = round2(Number(order.adjustmentCny ?? 0));
-      const cashCapacityCny = Math.max(0, round2(paidNum - adjustmentCny));
+      const cashCapacityCny = Math.max(0, round2(realCashCny - adjustmentCny));
       const refundToCashCny = round2(Math.min(totalRefundOutCny, cashCapacityCny));
+      // 这是**累计**应回补额（不是本次增量）：夹在 offsetGross 以内，绝不回补超过当初抵扣掉的余额。
       const refundToBalanceCny = round2(
-        Math.min(Math.max(0, prepaymentOffsetCny), round2(totalRefundOutCny - refundToCashCny)),
+        Math.min(offsetGrossCny, Math.max(0, round2(totalRefundOutCny - refundToCashCny))),
       );
-      if (order.agentId && refundToBalanceCny > 0) {
-        const restoredAgg = await tx.prepaymentTransaction.aggregate({
-          where: { orderId: id, type: PrepaymentTxType.REFUND },
-          _sum: { amount: true },
-        });
-        const alreadyRestoredCny = round2(Number((restoredAgg._sum.amount ?? new Prisma.Decimal(0)).toString()));
-        const restoreNowCny = round2(refundToBalanceCny - alreadyRestoredCny);
-        if (restoreNowCny > 0) {
-          prepaymentRestore = { agentId: order.agentId, amountCny: restoreNowCny };
+      const restoreNowCny = round2(refundToBalanceCny - alreadyRestoredCny);
+      if (restoreNowCny > 0) {
+        // 回补对象取流水上的代理，而不是 order.agentId：抵扣掉的是当时那个代理账户的钱。
+        // 有 OFFSET 时改归属已被硬阻断（见 changeOrderAgent），正常不会分叉；真分叉了就
+        // fail-closed 交人工 —— 把 A 的钱补给 B 是比「补不上」更坏的错误。
+        const restoreAgentIds = [...new Set(offsetRows.map((r) => r.agentId))];
+        if (restoreAgentIds.length > 1) {
+          throw new BadRequestError(
+            `订单 ${order.orderNumber} 的预存余额抵扣涉及多个代理账户，无法自动回补余额。` +
+              `请财务先手工冲回各代理的抵扣流水，再批准本次退款。`,
+          );
         }
+        prepaymentRestore = { agentId: restoreAgentIds[0], amountCny: restoreNowCny };
       }
     }
 
@@ -5399,6 +5690,69 @@ export class OrderService {
       }
     }
 
+    // ── 取消族恢复：复检班次开票额度（0716 H11）────────────────────────────────
+    // 开票额度只统计 COUNTED_STATUSES 的订单（见 ticketing-cap.ts）。订单落取消族时它占的
+    // 开票额度当场释放，那份额度随即可能被别的单开走；此后 force 把这张单拉回计数态，
+    // 它带着的开票标记会**凭空补回来**，班次瞬间越过座位库存上限，而全流程无一处会察觉
+    //（写标记的闸只在标记翻开时跑，状态流转从不看开票位）。
+    // 口径：本单已在上方 CAS 成新状态、因而已计入 countIssuedPassengers，故按「新增 0 人」复检
+    //（issued 已含本单）。超限则清掉该航段的开票标记 + 回警示语，让票务台按最新额度重新标 ——
+    // 宁可要求重开，也不留一个把班次撑爆的隐形标记。
+    if (!countsTowardTicketingCap(order.status) && countsTowardTicketingCap(toStatus)) {
+      const inv = await tx.order.findUnique({
+        where: { id },
+        select: {
+          outboundInvoiced: true,
+          returnInvoiced: true,
+          items: {
+            where: { kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
+            select: {
+              flightScheduleId: true,
+              flightSchedule: { select: { departureTime: true } },
+            },
+          },
+        },
+      });
+      if (inv && (inv.outboundInvoiced || inv.returnInvoiced)) {
+        const { outboundScheduleId, returnScheduleId } = determineFlightLegs(inv.items);
+        const legsToRecheck: Array<{
+          scheduleId: string;
+          field: 'outboundInvoiced' | 'returnInvoiced';
+          label: string;
+        }> = [];
+        if (inv.outboundInvoiced && outboundScheduleId) {
+          legsToRecheck.push({
+            scheduleId: outboundScheduleId,
+            field: 'outboundInvoiced',
+            label: '去程',
+          });
+        }
+        if (inv.returnInvoiced && returnScheduleId) {
+          legsToRecheck.push({
+            scheduleId: returnScheduleId,
+            field: 'returnInvoiced',
+            label: '回程',
+          });
+        }
+        const clearedFlags: Partial<Record<'outboundInvoiced' | 'returnInvoiced', boolean>> = {};
+        for (const leg of legsToRecheck) {
+          try {
+            await assertTicketingCap(tx, [leg.scheduleId], 0);
+          } catch (err) {
+            if (!(err instanceof UnprocessableEntityError)) throw err;
+            clearedFlags[leg.field] = false;
+            invoiceCapWarningsOut?.push(
+              `订单 ${order.orderNumber} 恢复为「${zhStatus(toStatus)}」后，${leg.label}班次的开票额度已被占满，` +
+                `已自动清除该航段的开票标记（${err.message}）。请票务台核对后重新标记开票。`,
+            );
+          }
+        }
+        if (Object.keys(clearedFlags).length > 0) {
+          await tx.order.update({ where: { id }, data: clearedFlags });
+        }
+      }
+    }
+
     if (toStatus === 'PAID') {
       // R4（双通道到账账目分叉收口）：订单转 PAID 后，把该订单其它仍 PENDING 的 Payment 作废——
       // 否则它们的回调后续到达仍会被标 SUCCEEDED，而此刻已过了 PAID 分支的聚合点，那笔钱在
@@ -5534,7 +5888,7 @@ export class OrderService {
       });
 
       // 预存余额回补：客户当初用代理余额抵付的那部分，退款完成时必须原路退回余额账户，
-      // 否则这笔钱在系统里凭空消失（订单侧 prepaymentOffset 记着抵扣过、余额侧却永远收不回）。
+      // 否则这笔钱在系统里凭空消失（余额侧扣过一笔 OFFSET，却永远收不回来）。
       // 金额已在本函数前半段按「现金优先」口径算好并做过幂等去重（见 prepaymentRestore 处注释）。
       // 锁序与 applyAgentBalanceToOrder 一致（先 Order 后 Agent，两处都 FOR UPDATE）→ 不会死锁。
       if (prepaymentRestore) {
@@ -6025,6 +6379,9 @@ export class OrderService {
         contactPhone: order.contactPhone,
         contactEmail: order.contactEmail,
         total: order.total.toFixed(2),
+        // 应付 = total + adjustmentCny（改期费/换人费等售后调整），与订单详情「应收」/
+        // effectivePayable 同口径 —— 行程单金额不能漏掉这块（itinerary-pdf.ts 里用它算应付）。
+        adjustmentCny: Number(order.adjustmentCny ?? 0),
         currency: order.currency,
         createdAt: order.createdAt,
         flights: flightItems.map((i) => ({
@@ -6248,7 +6605,11 @@ export class OrderService {
    *   2. 原子拿新座（新班次+新舱位 CAS：sold + qty + 他人锁位 + 占位余座 ≤ capacity）
    *      —— 新班次售罄则抛错，事务回滚 → 旧座保持原样（不泄漏）。
    *   3. 更新该行 flightScheduleId/flightCabin（amount/quantity 不变，机票基础价不重算）。
-   *   4. 撤销未撤销的立减快照行并按原金额补差；feeCny>0 另 push 一条 RESCHEDULE_FEE 流水。
+   *   3b. **换了班次即作废原票**：清空本单乘客的 pnr / eticketNumber，并把被改那一段的
+   *       开票标记（去程 outboundInvoiced / 回程 returnInvoiced）翻回未开 —— 改期后旧票号
+   *       必然作废，留着会让票务台以为已出票、导出与班次开票额度也照旧占着。
+   *   4. 撤销未撤销的立减快照行并按原金额补差；feeCny≠0 另 push 一条 RESCHEDULE_FEE 流水
+   *      （**差价可正可负**：同「换酒店差价 / 酒店改期差价」口径，改到便宜班次要能退差）。
    *   5. 当前若处于 CHANGE_REQUESTED（状态机允许 → CHANGED）则推进到 CHANGED；其余状态保持不变。
    *
    * 返回更新后的订单（serializeOrder）。
@@ -6286,7 +6647,10 @@ export class OrderService {
     if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
       throw new ForbiddenError('仅运营/管理员可改期');
     }
-    const feeCny = Math.max(0, Math.trunc(input.feeCny ?? 0));
+    // 改期差价可正可负（与换酒店差价 / 酒店改期差价同一 adjustmentCny 机制）：改到更便宜的班次
+    // 本来就该退客人钱，旧版 Math.max(0, …) 把负数钳成 0，运营只能另开收款单反向操作。
+    // 上限仍由 schema 的 ±POST_SALE_FEE_CAP_CNY 把关。
+    const feeCny = Math.trunc(input.feeCny ?? 0);
 
     const scratch = await prisma.$transaction(async (tx) => {
       // R2 并发串行（与超时 worker 配对）：先对本订单 Order 行 FOR UPDATE，再往下读 items / 搬座位。
@@ -6473,6 +6837,43 @@ export class OrderService {
       // 且未来若改期扩展成能加/删航段，维护点已经在这里，不会漏。
       await syncOrderHasReturnLeg(tx, orderId);
 
+      // ── 3b. 换班次即作废原票：清票号 + 翻回被改航段的开票标记 ────────────────────
+      // 旧代码只搬座位、不动票务字段，于是改完期订单上仍挂着**原航班的** PNR / 票号，
+      // 开票位也仍是「已开」——票务台看不出要重开，导出发给客人的还是作废票号，
+      // 而那份开票额度还占着新班次的座位库存（额度按航段算，班次已经换人了）。
+      // 只在真的换了班次时做（同班次改舱/无变化不动票）；纠错批量入口（correction）同样适用——
+      // 那正是「录错班次」的场景，原票号更不该留。
+      // 幂等：updateMany + 定值写，重复改期不会出问题。
+      if (scheduleChanged) {
+        await tx.passenger.updateMany({
+          where: { orderId },
+          data: { pnr: null, eticketNumber: null },
+        });
+
+        // 被改的是去程还是回程：按**改期前**的航段顺序判定（此刻订单行已写成新班次，
+        // 再按 departureTime 排序可能已经换位），故用行 id 与改期前那份排序结果比对。
+        const legItemsBefore = await tx.orderItem.findMany({
+          where: { orderId, kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
+          select: { id: true, flightScheduleId: true, flightSchedule: { select: { departureTime: true } } },
+        });
+        const legsBefore = determineFlightLegItems(
+          legItemsBefore.map((row) =>
+            row.id === item.id
+              ? { ...row, flightScheduleId: oldScheduleId, flightSchedule: item.flightSchedule }
+              : row,
+          ),
+        );
+        const invoiceReset =
+          legsBefore.return?.id === item.id
+            ? { returnInvoiced: false }
+            : legsBefore.outbound?.id === item.id
+              ? { outboundInvoiced: false }
+              : null;
+        if (invoiceReset) {
+          await tx.order.update({ where: { id: orderId }, data: invoiceReset });
+        }
+      }
+
       // ── 4. 改期立减取消补差 + 手填改期费（两笔分别留流水）──
       // 改期后原立减不随新日期重新命中：只撤销订单上尚未撤销的快照行，
       // 并把等额补差记入 adjustmentCny。行级 revoked 标记保证同单二次改期幂等。
@@ -6525,17 +6926,22 @@ export class OrderService {
           }
         }
       }
-      if (feeCny > 0 && !input.guard?.correction) {
+      // feeCny 可正可负（改到贵班次补差 / 改到便宜班次退差），故判 !== 0 而不是 > 0。
+      // 默认名从「改期费」改为「改期差价」——它现在两个方向都用。
+      if (feeCny !== 0 && !input.guard?.correction) {
         adjustmentLog = appendAdjustment(adjustmentLog, {
           type: 'RESCHEDULE_FEE',
-          label: input.feeLabel || '改期费',
+          label: input.feeLabel || '改期差价',
           amountCny: feeCny,
           at: new Date().toISOString(),
           by: actor.userId,
           note: input.note,
         }) as unknown as Prisma.JsonValue;
       }
-      if (adjustmentDelta > 0) {
+      // 负差价把 adjustmentCny 往下压（应付随之减少）——不夹 0，与换酒店差价 / 酒店改期差价
+      // 完全同一口径（那两处也是直接 order.adjustmentCny + feeCny）。夹 0 会让「改到便宜班次
+      // 退差」在合计为负时悄悄吞掉一部分，客人对不上账。
+      if (adjustmentDelta !== 0) {
         await tx.order.update({
           where: { id: orderId },
           data: {
@@ -6546,8 +6952,13 @@ export class OrderService {
       }
 
       // ── 5. 仅在状态机允许时推进到 CHANGED（不破坏状态机）──
+      // 追加 scheduleChanged 条件：「已改期」是航段真的换过的派生（_updateStatusWithinTx 的
+      // CHANGED 派生闸认的就是本函数落的 flightChanged 标记）。只收差价、不换班次的调用
+      // 没有航变可言，也没落标记 —— 不推状态，否则会撞上自家的闸、把整笔改期回滚掉，
+      // 运营只会看到一句「请先用改期把航段改到新班次」的自相矛盾报错。
       let statusChanged = false;
       if (
+        scheduleChanged &&
         !input.guard?.correction &&
         order.status !== OrderStatus.CHANGED &&
         ALLOWED_TRANSITIONS[order.status].includes(OrderStatus.CHANGED)
@@ -6939,7 +7350,16 @@ export class OrderService {
       const passenger = await tx.passenger.findUnique({
         where: { id: passengerId },
         // visaExempt：换人价回滚要读旧客的自备签状态（true→false 时把减免加回来，见下方 1d）。
-        select: { id: true, orderId: true, fullName: true, documentNumber: true, visaExempt: true },
+        // passengerType：出生日期变化时权威重派生的回退口径（见下方 1b2）——同一人只是改错生日
+        // 时，不该把已有的儿童/婴儿类型误判丢回默认成人。
+        select: {
+          id: true,
+          orderId: true,
+          fullName: true,
+          documentNumber: true,
+          visaExempt: true,
+          passengerType: true,
+        },
       });
       if (!passenger || passenger.orderId !== orderId) {
         throw new NotFoundError('出行人不存在或不属于该订单');
@@ -7018,6 +7438,32 @@ export class OrderService {
         // 说明：nationality 是必填非空列，无法「置空」；请求带了新值即用新值（上面已赋），
         // 未带时只能保留旧值（不猜默认国籍——猜错会污染出票/签证）。彻底根治需 schema 层在真换人时
         // 强制 nationality，留待拥有 orders.schemas.ts 的下一棒收口。
+      }
+
+      // ── 1b2. 出行人类型服务端权威派生（覆盖客户端传值）：出生日期变化（改错别字或真换人都算）时，
+      //        若订单能定出最早出发日（机票行），按「出发日 − 出生日期」用 derivePtcByAge 重算
+      //        passengerType 并覆盖 —— 与建单（createOrder → passengerToData）同一口径的权威兜底，
+      //        入口层已尽量派生，这里是权威兜底，堵住换人/改生日时手选类型不跟着改的口子。
+      //        无新出生日期（本次未改）或订单定不出出发日 → 保留上面已赋的值（客户端传值 / 换人默认）。
+      if (data.dateOfBirth !== undefined && data.dateOfBirth !== null) {
+        const flightItems = await tx.orderItem.findMany({
+          where: { orderId, kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
+          select: { flightSchedule: { select: { departureTime: true } } },
+        });
+        const departureDate = earliestFlightDeparture(
+          flightItems.map((it) => ({ kind: 'FLIGHT', flightSchedule: it.flightSchedule })),
+        );
+        if (departureDate) {
+          // 回退口径：本次显式给的新值 > 已有的旧值（同一人订正生日不该丢类型）> 兜底成人。
+          const fallbackPassengerType =
+            (data.passengerType as PassengerType | undefined) ??
+            input.passengerType ??
+            passenger.passengerType ??
+            PassengerType.ADULT;
+          data.passengerType = ptcToPassengerType(
+            derivePtcByAge(data.dateOfBirth as Date, departureDate, fallbackPassengerType),
+          );
+        }
       }
 
       // ── 1c. 重复证件号校验（与 createOrder 同口径，swap 之前缺失）：真换人时，换入的证件号
@@ -7849,9 +8295,12 @@ export class OrderService {
         }
       } else {
         // 未落位随机档行：按同星级聚合余量判定（口径同下单/落位）。
-        await assertRandomTierFit(item.randomStarTier!, nightDates, roomsBilled, {
+        // 用带锁版：此前虽已在事务内、传了 tx，但没有 FOR UPDATE —— 只读判定挡不住并发，
+        // 两笔改期同时挤进同一档次的最后一间会双双通过。带锁版先锁该档次全部真酒店在该
+        // 区间的包房周期行，与下方写新日期落库同事务，判定与落库之间不留窗口。
+        await assertRandomTierFitWithinTx(tx, item.randomStarTier!, nightDates, roomsBilled, {
           excludeOrderId: orderId,
-        }, tx);
+        });
       }
 
       // ── 减价不能把应付冲成负数（与换酒店同一道闸）──
@@ -8002,17 +8451,208 @@ export class OrderService {
     }
     const usedAgentBalance = false; // 走到这里必然无 OFFSET（保留字段以稳定 API 形状）
 
-    await prisma.order.update({
-      where: { id: orderId },
-      data: { agentId: newAgentId },
+    // ── 价格纠缠拆解（改归属最小安全动作）────────────────────────────────────
+    // 旧口径只改 agentId：原代理 A 的立减 DISCOUNT 行、按 A 谈定的结算价差额行原样留给 B，
+    // 而佣金之后按 B 的费率计提 —— 一单同时挂着两家代理的价格口径，谁也说不清这单该收多少。
+    // 本次处置分两半：
+    //   · 立减行（规则命中的 DISCOUNT，metadata.ruleId 有值）= 按 A 的规则库算出来的，
+    //     对 B 无效 → **撤销并重算 subtotal/total**，让应收回到未打折的口径，由运营按 B 重新核价。
+    //   · 结算价差额行（metadata.settlementPrice）= 人工与 A 谈定的一口价，撤销它等于替运营
+    //     做价格决定 → **不自动动**，只在 warning 里点名，让运营自己决定改不改。
+    const scratch = await prisma.$transaction(async (tx) => {
+      // 与改结算价/补房差同一把锁：重算 subtotal/total 要「读 items → 聚合 → 写回 Order」，
+      // 无锁时并发改价会各自从陈旧快照重算、后写覆盖前写。
+      const locked = await tx.$queryRaw<
+        Array<{
+          id: string;
+          subtotal: Prisma.Decimal;
+          total: Prisma.Decimal;
+          paidAmount: Prisma.Decimal;
+          settlementLocked: boolean;
+        }>
+      >`SELECT id, subtotal, total, "paidAmount", "settlementLocked" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+      const lockedOrder = locked[0];
+      // 上面已按 id 查到过订单；锁的时候没了 = 并发删单，别拿半份数据继续算钱。
+      if (!lockedOrder) throw new NotFoundError('订单不存在');
+
+      // 锁之后才读行：锁之前那份快照可能已被并发改价写脏。
+      const items = await tx.orderItem.findMany({
+        where: { orderId },
+        select: { id: true, kind: true, description: true, amount: true, metadata: true },
+      });
+
+      const readMetadata = (raw: unknown): Record<string, unknown> =>
+        raw != null && typeof raw === 'object' && !Array.isArray(raw)
+          ? (raw as Record<string, unknown>)
+          : {};
+
+      // 待撤销的立减行：规则命中（有 ruleId 快照）且尚未撤销的 DISCOUNT 行。
+      // 手工 DISCOUNT 调价行没有 ruleId，不在此列 —— 那是运营自己填的，不随代理走。
+      const revocableRows = items.filter((row) => {
+        if (row.kind !== OrderItemKind.DISCOUNT) return false;
+        const metadata = readMetadata(row.metadata);
+        return (
+          metadata.settlementDiscount === true &&
+          metadata.settlementDiscountRevoked !== true &&
+          typeof metadata.ruleId === 'string'
+        );
+      });
+
+      // 结算价差额行（不自动动，只点名）：金额为 0 的不提，没什么可说的。
+      const settlementRows = items.filter((row) => {
+        const metadata = readMetadata(row.metadata);
+        return metadata.settlementPrice === true && Number(row.amount) !== 0;
+      });
+
+      // 资金处置闸：撤立减会改 order.total（也是取消手续费/应退额的基数），取消族/超时/
+      // 退款审批中的单一律不动金额 —— 否则能在批准退款前悄悄抬高应退额。
+      // 但**改归属本身仍放行**（报表归属订正是这类单的正当需求），只是把没撤的立减在 warning 里点名。
+      const canAdjustMoney = !FUNDS_DISPOSE_BLOCKED_STATUSES.includes(order.status);
+
+      // 结算价锁：本次要改的正是订单金额，锁的语义（核对后禁止改价）在这里同样成立。
+      // 没有立减行要撤 → 不改金额 → 与旧口径一样放行，不给日常改归属平添拒绝。
+      if (revocableRows.length > 0 && canAdjustMoney && lockedOrder.settlementLocked) {
+        throw new ConflictError(
+          '该订单结算价已锁定，而本次改归属需要撤销原代理的立减行（会改动应收）。请先解锁结算价再改归属。',
+        );
+      }
+
+      const revoked: Array<{ description: string; amountCny: number }> = [];
+      for (const row of canAdjustMoney ? revocableRows : []) {
+        const metadata = readMetadata(row.metadata);
+        const amountCny = Math.abs(Number(row.amount) || 0);
+        await tx.orderItem.update({
+          where: { id: row.id },
+          data: {
+            // 撤销 = 金额归零 + 打撤销标记，**不删行**：这条立减发生过，留着可查
+            // （与改期撤立减同一套 settlementDiscountRevoked 标记，行级幂等）。
+            unitPrice: new Prisma.Decimal(0),
+            amount: new Prisma.Decimal(0),
+            description: row.description.startsWith('（已撤销）')
+              ? row.description
+              : `（已撤销）${row.description}`,
+            metadata: {
+              ...metadata,
+              settlementDiscountRevoked: true,
+              revokedReason: 'AGENT_CHANGED',
+              revokedAt: new Date().toISOString(),
+              revokedBy: actor.userId,
+              revokedAmountCny: amountCny,
+            } as Prisma.InputJsonValue,
+          },
+        });
+        revoked.push({ description: row.description, amountCny });
+      }
+
+      // 从库里重新聚合最新 items 算 subtotal/total（上面的 update 已落在同一事务内）。
+      // 无立减行可撤时跳过：金额没变，不必平白写一次 Order。
+      let newTotalCny: number | null = null;
+      if (revoked.length > 0) {
+        const sumAgg = await tx.orderItem.aggregate({ where: { orderId }, _sum: { amount: true } });
+        const newSubtotal = round2(
+          Number((sumAgg._sum.amount ?? new Prisma.Decimal(0)).toString()),
+        );
+        newTotalCny = newSubtotal; // 当前无 taxes/discount，total = subtotal
+        await tx.order.update({
+          where: { id: orderId },
+          data: {
+            agentId: newAgentId,
+            subtotal: new Prisma.Decimal(newSubtotal),
+            total: new Prisma.Decimal(newTotalCny),
+          },
+        });
+      } else {
+        await tx.order.update({ where: { id: orderId }, data: { agentId: newAgentId } });
+      }
+
+      // 已计提佣金：按**事发时**的归属和费率提的，改归属不回溯重算（见本方法头部财务口径）。
+      const accruedCommissions = await tx.commissionRecord.findMany({
+        where: { orderId, status: { in: [CommissionStatus.ACCRUED, CommissionStatus.SETTLED] } },
+        select: { amount: true },
+      });
+      const accruedCommissionCny = round2(
+        accruedCommissions.reduce((s, c) => s + Number(c.amount.toString()), 0),
+      );
+
+      return {
+        revoked,
+        revokedTotalCny: round2(revoked.reduce((s, r) => s + r.amountCny, 0)),
+        // 状态不允许动金额时没撤成的立减（只报，不动）。
+        skippedDiscountCount: canAdjustMoney ? 0 : revocableRows.length,
+        skippedDiscountTotalCny: canAdjustMoney
+          ? 0
+          : round2(
+              revocableRows.reduce((s, r) => s + Math.abs(Number(r.amount) || 0), 0),
+            ),
+        settlementRowCount: settlementRows.length,
+        settlementRowTotalCny: round2(
+          settlementRows.reduce((s, r) => s + Number(r.amount), 0),
+        ),
+        beforeTotalCny: round2(Number(lockedOrder.total.toString())),
+        newTotalCny,
+        paidAmountCny: round2(Number(lockedOrder.paidAmount.toString())),
+        accruedCommissionCny: accruedCommissions.length > 0 ? accruedCommissionCny : null,
+      };
     });
+
+    // 撤销立减留一条 WARNING 审计：应收被系统改动过，财务/运营要能翻得出来。
+    if (scratch.revoked.length > 0) {
+      await writeAudit({
+        actor: { userId: actor.userId, role: actor.role },
+        action: 'AGENT_CHANGED_DISCOUNT_REVOKED',
+        targetType: 'ORDER',
+        targetId: orderId,
+        targetLabel: order.orderNumber,
+        before: { total: scratch.beforeTotalCny, agentId: oldAgentId },
+        after: {
+          total: scratch.newTotalCny,
+          agentId: newAgentId,
+          revokedCny: scratch.revokedTotalCny,
+          revokedRows: scratch.revoked,
+          reason: input.reason ?? null,
+        },
+        severity: AuditSeverity.WARNING,
+      });
+    }
 
     const finalOrder = await prisma.order.findUniqueOrThrow({
       where: { id: orderId },
       include: ORDER_FULL_INCLUDE,
     });
 
-    const warning = null;
+    // warning：把「系统替你动了什么 / 还有什么等你决定」一次讲清，别让运营事后才发现金额变了。
+    const warningParts: string[] = [];
+    if (scratch.revoked.length > 0) {
+      warningParts.push(
+        `已撤销原代理口径的立减 ${scratch.revoked.length} 条（合计 ¥${scratch.revokedTotalCny}），` +
+          `订单应收由 ¥${scratch.beforeTotalCny} 调整为 ¥${scratch.newTotalCny}。请按新代理口径重新核价。`,
+      );
+    }
+    if (scratch.skippedDiscountCount > 0) {
+      warningParts.push(
+        `该订单当前状态（${zhStatus(order.status)}）不允许改动金额，` +
+          `原代理口径的立减 ${scratch.skippedDiscountCount} 条（合计 ¥${scratch.skippedDiscountTotalCny}）未撤销，请人工核对处理。`,
+      );
+    }
+    if (scratch.settlementRowCount > 0) {
+      warningParts.push(
+        `本单还有 ${scratch.settlementRowCount} 条结算价差额行（合计 ¥${scratch.settlementRowTotalCny}），` +
+          '是按原代理谈定的一口价，系统未自动改动 —— 请确认新代理是否沿用该结算价。',
+      );
+    }
+    if (scratch.newTotalCny !== null && scratch.paidAmountCny > scratch.newTotalCny) {
+      warningParts.push(
+        `该单已收 ¥${scratch.paidAmountCny}，调整后应收 ¥${scratch.newTotalCny}，` +
+          `形成多付 ¥${round2(scratch.paidAmountCny - scratch.newTotalCny)}。` +
+          '请在订单资金区做多付处置（转代理余额 / 转挂账池 / 退款）。',
+      );
+    }
+    if (scratch.accruedCommissionCny !== null) {
+      warningParts.push(
+        `本单已计提佣金 ¥${scratch.accruedCommissionCny}（按原归属与当时费率），改归属不回溯重算，请财务确认是否调整。`,
+      );
+    }
+    const warning = warningParts.length > 0 ? warningParts.join(' ') : null;
 
     return {
       // 显式按角色推导序列化口径（本入口已断言 ADMIN/STAFF → 保留护照大图，与改归属前的返回一致）。
@@ -9116,6 +9756,90 @@ export interface ProspectiveHotelStay {
   hotelCheckOut?: Date | null;
   /** 计费房间数（床位/计费口径，可为 0.5 拼房）；缺省 1，与房控 itemRoomCount 的兜底一致。*/
   roomsBilled?: number | null;
+  /** 未落位随机档行的档次（3/4）；具体酒店行为空。*/
+  randomStarTier?: number | null;
+}
+
+/**
+ * 事务内**随机档**余量闸：把本次要落库的「未落位随机档占房」按「档次 × 住宿区间」归并，
+ * 逐组过一遍带行锁的聚合闸（assertRandomTierFitWithinTx）。装不下就抛 BadRequestError、整事务回滚。
+ *
+ * 与 assertHotelStaysFitWithinTx 是互斥的两半（合起来覆盖全部占房）：
+ *   · 那一半管**真酒店的真房量**（物理房间口径 + 性别桶）；
+ *   · 这一半管**还没落位的随机档**（同星级聚合的床位口径）—— 随机单没落到任何一家酒店，
+ *     拼房能否配对要等落位那一刻由该店当晚性别桶决定，落位走换酒店流程、那里有物理闸把关。
+ *
+ * 两类行都归到这里（它们占的是同一份聚合余量，必须合并计数）：
+ *   · 单独 HOTEL 行的 `randomStarTier`（后台直接录「三星随机」）；
+ *   · 房型挂在**随机档占位酒店**上的行（套餐绑定占位房型）—— 占位酒店不是真房源，
+ *     tier 取该酒店的 `randomTierPlaceholder`。
+ *
+ * 为什么必须事务内 + 行锁：聚合闸本身是只读判定，两笔并发单抢同星级最后一间会各自读到
+ * 「还剩 1 间」的旧快照双双通过。带锁版先把该档次全部真酒店在该区间的包房周期行
+ * `SELECT … FOR UPDATE`，后到的事务要等前一个提交后重新取快照，才真正互斥。
+ * 调用方必须在 `prisma.$transaction` 内调用，且本次占房在**同一事务**里落库。
+ *
+ * 归并同样是必需的：同一单两条随机档行各判一次会双双通过（它们都还没落库、彼此看不见）。
+ * 加锁顺序按归并键排序，避免并发事务以不同顺序锁同一批档次造成死锁。
+ */
+export async function assertRandomTierStaysFitWithinTx(
+  tx: Prisma.TransactionClient,
+  stays: ReadonlyArray<ProspectiveHotelStay>,
+  opts: { excludeOrderId?: string; buildMessage?: () => string } = {},
+): Promise<void> {
+  const dated = stays.filter(
+    (s): s is ProspectiveHotelStay & { hotelCheckIn: Date; hotelCheckOut: Date } =>
+      Boolean(s.hotelCheckIn && s.hotelCheckOut),
+  );
+  if (dated.length === 0) return;
+
+  // 占位酒店房型 → 档次：只对「有房型 id 且无显式 randomStarTier」的行查一次库。
+  const placeholderLookupIds = [
+    ...new Set(
+      dated
+        .filter((s) => s.randomStarTier == null && s.hotelRoomTypeId)
+        .map((s) => s.hotelRoomTypeId as string),
+    ),
+  ];
+  const placeholderTierByRoomTypeId = new Map<string, number>();
+  if (placeholderLookupIds.length > 0) {
+    const roomTypes = await tx.hotelRoomType.findMany({
+      where: { id: { in: placeholderLookupIds } },
+      select: { id: true, hotel: { select: { randomTierPlaceholder: true } } },
+    });
+    for (const rt of roomTypes) {
+      if (rt.hotel.randomTierPlaceholder != null) {
+        placeholderTierByRoomTypeId.set(rt.id, rt.hotel.randomTierPlaceholder);
+      }
+    }
+  }
+
+  type TierGroup = { tier: number; nightDates: string[]; rooms: number };
+  const groups = new Map<string, TierGroup>();
+  for (const stay of dated) {
+    const tier =
+      stay.randomStarTier ??
+      (stay.hotelRoomTypeId ? placeholderTierByRoomTypeId.get(stay.hotelRoomTypeId) : undefined);
+    // 具体酒店的真房型 → 不归这道闸管（走 assertHotelStaysFitWithinTx）。
+    if (tier == null) continue;
+    const nightDates = buildStayNightDates(stay.hotelCheckIn, stay.hotelCheckOut);
+    // 空 = 区间非法/超长（buildStayNightDates 的防御）→ 无从校验，与既有口径一致不阻断。
+    if (nightDates.length === 0) continue;
+    // 首尾夜唯一确定整段（逐晚连续），可安全用作归并键。
+    const key = `${tier}|${nightDates[0]}|${nightDates[nightDates.length - 1]}`;
+    const rooms = stay.roomsBilled ?? 1;
+    const existing = groups.get(key);
+    if (existing) {
+      existing.rooms = round2(existing.rooms + rooms);
+    } else {
+      groups.set(key, { tier, nightDates, rooms });
+    }
+  }
+
+  for (const key of [...groups.keys()].sort()) {
+    const group = groups.get(key)!;
+    await assertRandomTierFitWithinTx(tx, group.tier, group.nightDates, group.rooms, opts);
+  }
 }
 
 /**
@@ -9972,10 +10696,38 @@ export function computeBundleSeatSplit(
   return { sameCabin: quantity - upgrade, business: upgrade };
 }
 
+/**
+ * PTC 码（ADT/CHD/INF，derivePtcByAge 的返回值）→ 建单落库用的系统枚举
+ * （ADULT/CHILD/INFANT）。年龄阈值判断已在 derivePtcByAge 里做过，这里只做码值转换。
+ */
+function ptcToPassengerType(ptc: string): PassengerType {
+  const map: Record<string, PassengerType> = {
+    ADT: PassengerType.ADULT,
+    CHD: PassengerType.CHILD,
+    INF: PassengerType.INFANT,
+  };
+  return map[ptc] ?? PassengerType.ADULT;
+}
+
 // 导出供单测验证乘客字段落库映射（含 0713 反馈批新增 visaExempt/singleRoom）。
-export function passengerToData(p: PassengerInput) {
+export function passengerToData(
+  p: PassengerInput,
+  // 服务端权威派生 passengerType 所需的「本单最早出发日」（见下方 passengerType 计算注释）。
+  // 省略该参数 = 维持旧行为（不派生，原样落客户端传值）——占位单转正等其它调用点无需改动。
+  opts?: { authoritativeDepartureDate?: Date | null },
+) {
   // 自动拆 fullName → lastName/firstName，如果客户端没传（斜线优先，见 splitPassengerFullName）
   const { lastName: autoLast, firstName: autoFirst } = splitPassengerFullName(p.fullName);
+  const dateOfBirth = new Date(p.dateOfBirth);
+  const hasValidDob = Boolean(p.dateOfBirth) && !Number.isNaN(dateOfBirth.getTime());
+  // 乘客类型服务端权威派生（覆盖客户端传值）：入口层（前台下单页/批量导入解析层）已尽量按
+  // 「出生日期 + 出发日」派生 passengerType，这里是权威兜底 —— 凡是乘客带出生日期、且本单能
+  // 定出最早出发日（机票行/套餐行）时，用 derivePtcByAge 重算并覆盖，堵住入口漏派生或被篡改的口子
+  // （如成人生日误传/篡改成 INFANT）。无出生日期或订单定不出出发日（纯地面单）→ 保留客户端传值/默认。
+  const passengerType =
+    hasValidDob && opts?.authoritativeDepartureDate
+      ? ptcToPassengerType(derivePtcByAge(dateOfBirth, opts.authoritativeDepartureDate, p.passengerType))
+      : p.passengerType;
   return {
     fullName: p.fullName,
     lastName: p.lastName ?? (autoLast || null),
@@ -9984,10 +10736,10 @@ export function passengerToData(p: PassengerInput) {
     gender: p.gender ?? null,
     documentType: p.documentType,
     documentNumber: p.documentNumber,
-    dateOfBirth: new Date(p.dateOfBirth),
+    dateOfBirth,
     placeOfBirth: p.placeOfBirth ?? null,
     nationality: p.nationality,
-    passengerType: p.passengerType,
+    passengerType,
     chineseName: p.chineseName ?? null,
     passportIssueDate: p.passportIssueDate ? new Date(p.passportIssueDate) : null,
     passportIssueCountry: p.passportIssueCountry ?? null,

@@ -239,19 +239,25 @@ export async function buildFinanceExportByFlightWorkbook(
       let visaOrder = 0;
       let transferOrder = 0;
       for (const it of o.items) {
-        if (it.kind === 'HOTEL' && it.hotelRoomType) {
-          const perNight = dec(it.hotelRoomType.costPriceCny);
-          let nights = 1;
-          if (it.hotelCheckIn && it.hotelCheckOut) {
-            nights = Math.max(
-              1,
-              Math.round(
-                (it.hotelCheckOut.getTime() - it.hotelCheckIn.getTime()) /
-                  (1000 * 60 * 60 * 24),
-              ),
-            );
+        if (it.kind === 'HOTEL') {
+          // 快照优先：随机档（同星级聚合）行没有 hotelRoomTypeId，取不到房型净房价，但建单时
+          // 已把房费快照写进 totalCostCny。此前只认 hotelRoomType，随机档行房费整条算 0，
+          // 整班毛利凭空虚高——快照是这类行唯一的成本来源，必须先读。
+          if (it.totalCostCny != null) {
+            hotelOrder += dec(it.totalCostCny);
+          } else if (it.hotelRoomType?.costPriceCny != null) {
+            let nights = 1;
+            if (it.hotelCheckIn && it.hotelCheckOut) {
+              nights = Math.max(
+                1,
+                Math.round(
+                  (it.hotelCheckOut.getTime() - it.hotelCheckIn.getTime()) /
+                    (1000 * 60 * 60 * 24),
+                ),
+              );
+            }
+            hotelOrder += dec(it.hotelRoomType.costPriceCny) * nights * it.quantity;
           }
-          hotelOrder += perNight * nights * it.quantity;
         } else if (it.kind === 'VISA') {
           // 签证成本与汇总/按乘客导出同口径（visaItemCostCny）：任务实际人均成本 × 需签乘客数
           // 优先 → 录单快照 → 产品主数据。签证公司按航班开账单，此表是对账主战场，口径必须一致。

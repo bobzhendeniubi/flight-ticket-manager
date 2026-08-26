@@ -175,4 +175,19 @@ describe('POST /orders/batch-invoice-flags', () => {
       }),
     );
   });
+
+  // ── 旧订单级开票端点已删除（0716 H11b）────────────────────────────────────
+  // 它是六态开票之前的遗留：不走开票状态闸（取消族/回收站单照样能标），写进的
+  // Order.invoiceStatus 也已无人读 —— 两本账。删掉后必须真的没有这条路由，
+  // 否则前端/脚本一旦还在调，就会绕过 invoice-flags 的两道闸悄悄写脏数据。
+  it('PATCH /orders/:id/invoice-status 已删除 → 404（开票唯一入口是 invoice-flags）', async () => {
+    const token = tokenFor('staff-1', UserRole.STAFF);
+    const res = await app.inject({
+      method: 'PATCH',
+      url: '/orders/ord1/invoice-status',
+      headers: { authorization: `Bearer ${token}` },
+      payload: { invoiceStatus: 'ISSUED' },
+    });
+    expect(res.statusCode).toBe(404);
+  });
 });

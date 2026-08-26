@@ -40,6 +40,8 @@ const {
       findFirst: vi.fn(),
       update: vi.fn(),
       findUniqueOrThrow: vi.fn(),
+      // updateMany：改期换班次时清本单乘客的 pnr / eticketNumber（旧票号随改期作废）。
+      updateMany: vi.fn(),
     },
     // swapPassenger 换人重复证件号校验：查本订单 FLIGHT 行的 flightScheduleId（P1-8）。
     orderItem: {
@@ -182,6 +184,8 @@ import type { OrderItemInput } from './orders.schemas.js';
 import {
   batchCreateOrdersBodySchema,
   createOrderBodySchema,
+  quoteOrderBodySchema,
+  rescheduleOrderBodySchema,
   swapItemHotelBodySchema,
   swapPassengerBodySchema,
 } from './orders.schemas.js';
@@ -1479,6 +1483,57 @@ describe('passengerToData — 套餐乘客级选项落库', () => {
     });
     expect(data.lastName).toBe('LI');
     expect(data.firstName).toBe('SI');
+  });
+});
+
+// ── 乘客字段落库映射：passengerToData 出行人类型服务端权威派生（覆盖客户端传值）──────
+// 入口层（前台下单页/批量导入解析层）已尽量按「出生日期 + 出发日」派生 passengerType，
+// passengerToData 收到 authoritativeDepartureDate 时是权威兜底：堵住入口漏派生或被篡改的口子。
+describe('passengerToData — passengerType 服务端权威派生（覆盖客户端传值）', () => {
+  const base = {
+    fullName: 'ZHANG SAN',
+    documentType: 'PASSPORT' as const,
+    documentNumber: 'E12345678',
+    dateOfBirth: '1990-01-01', // 1990 年出生，相对 2026 年出发早已成年
+    nationality: 'CN',
+    passengerType: 'ADULT' as const,
+  };
+  const departureDate = new Date('2026-06-01T00:00:00Z');
+
+  it('成人生日传 INFANT（客户端误传/被篡改）→ 有出发日时被服务端纠正为 ADULT', () => {
+    const data = passengerToData(
+      { ...base, passengerType: 'INFANT' },
+      { authoritativeDepartureDate: departureDate },
+    );
+    expect(data.passengerType).toBe('ADULT');
+  });
+
+  it('未成年生日 + 手选 ADULT → 有出发日时被纠正为按年龄推算的 CHILD/INFANT', () => {
+    const tenYearsOld = { ...base, dateOfBirth: '2018-01-01', passengerType: 'ADULT' as const };
+    const data = passengerToData(tenYearsOld, { authoritativeDepartureDate: departureDate });
+    expect(data.passengerType).toBe('CHILD');
+  });
+
+  it('无出生日期（防御性：dob 缺失/非法）→ 即使传了出发日也保留客户端手选值', () => {
+    const { dateOfBirth: _omit, ...baseNoDob } = base;
+    const data = passengerToData(
+      { ...baseNoDob, passengerType: 'CHILD' } as unknown as Parameters<typeof passengerToData>[0],
+      { authoritativeDepartureDate: departureDate },
+    );
+    expect(data.passengerType).toBe('CHILD');
+  });
+
+  it('未传 opts（无出发日信息）→ 不派生，原样落客户端传值（如占位单转正等旧调用点）', () => {
+    const data = passengerToData({ ...base, passengerType: 'INFANT' });
+    expect(data.passengerType).toBe('INFANT');
+  });
+
+  it('opts.authoritativeDepartureDate 显式为 null（订单定不出出发日，如纯地面单）→ 保留客户端传值', () => {
+    const data = passengerToData(
+      { ...base, passengerType: 'INFANT' },
+      { authoritativeDepartureDate: null },
+    );
+    expect(data.passengerType).toBe('INFANT');
   });
 });
 
@@ -2987,6 +3042,70 @@ describe('getOrder：产品内容卡片 v2（套餐组件构成 + 按人单价�
 });
 
 // ── 0702 反馈 2：换人/编辑接受中文姓名 chineseName ────────────────────────────
+// ── swapPassengerBodySchema · dateOfBirth 必须 YYYY-MM-DD（与建单/自助补录同款正则）──
+// 修复前只校验 z.string()：带时区的完整 ISO 串（如 1990-01-01T00:00:00+08:00）会被
+// new Date() 折成 UTC 前一天，换人/改生日把出生日期悄悄改错一天。
+describe('swapPassengerBodySchema · dateOfBirth 格式校验', () => {
+  it('YYYY-MM-DD → 通过', () => {
+    const parsed = swapPassengerBodySchema.parse({ dateOfBirth: '1990-01-01' });
+    expect(parsed.dateOfBirth).toBe('1990-01-01');
+  });
+
+  it('带时区的完整 ISO 串 → 拒绝（此前会被静默接受，折成前一天）', () => {
+    expect(() =>
+      swapPassengerBodySchema.parse({ dateOfBirth: '1990-01-01T00:00:00+08:00' }),
+    ).toThrow();
+  });
+
+  it('非法格式（如 1990/01/01）→ 拒绝', () => {
+    expect(() => swapPassengerBodySchema.parse({ dateOfBirth: '1990/01/01' })).toThrow();
+  });
+});
+
+// ── quoteOrderBodySchema · 手工价通道字段闭环 ─────────────────────────────
+// 三个字段形状抄 createOrderBodySchema 对应字段：录单页填了这些字段后随试算一起发送，
+// quoteOrder 服务层据此与 createOrder 同口径判定是否存在手工价通道，抑制不会生效的自动立减。
+describe('quoteOrderBodySchema · 手工价通道字段', () => {
+  const items = [
+    {
+      kind: 'FLIGHT' as const,
+      description: '去程',
+      quantity: 1,
+      flightScheduleId: 'sched-1',
+      flightCabin: 'ECONOMY' as const,
+    },
+  ];
+
+  it('缺省不带手工价字段 → 通过，三个字段均为 undefined', () => {
+    const parsed = quoteOrderBodySchema.parse({ items });
+    expect(parsed.priceAdjustment).toBeUndefined();
+    expect(parsed.settlementTotalCny).toBeUndefined();
+    expect(parsed.flightSettlementPriceCny).toBeUndefined();
+  });
+
+  it('priceAdjustment（形状同 createOrderBodySchema）→ 原样保留，不被 parse 剥掉', () => {
+    const parsed = quoteOrderBodySchema.parse({
+      items,
+      priceAdjustment: { amountCny: -100, reasonCode: 'DISCOUNT' },
+    });
+    expect(parsed.priceAdjustment).toEqual({ amountCny: -100, reasonCode: 'DISCOUNT' });
+  });
+
+  it('settlementTotalCny → 原样保留', () => {
+    const parsed = quoteOrderBodySchema.parse({ items, settlementTotalCny: 3000 });
+    expect(parsed.settlementTotalCny).toBe(3000);
+  });
+
+  it('flightSettlementPriceCny → 原样保留', () => {
+    const parsed = quoteOrderBodySchema.parse({ items, flightSettlementPriceCny: 1200 });
+    expect(parsed.flightSettlementPriceCny).toBe(1200);
+  });
+
+  it('settlementTotalCny 为负 → 拒绝（与 createOrderBodySchema 同口径）', () => {
+    expect(() => quoteOrderBodySchema.parse({ items, settlementTotalCny: -1 })).toThrow();
+  });
+});
+
 describe('swapPassengerBodySchema · chineseName', () => {
   it('受理 chineseName（与下单时 passengerInputSchema 同款 ≤120 字约束）', () => {
     const parsed = swapPassengerBodySchema.parse({ chineseName: '庄宇' });
@@ -3179,6 +3298,103 @@ describe('swapPassenger · 证件号变化触发旧护照/签证清洗', () => {
     ).rejects.toMatchObject({ code: 'DUPLICATE_PASSENGER' });
     // 冲突时在 update 之前中止 → 绝不落库
     expect(mockPrisma.passenger.update).not.toHaveBeenCalled();
+  });
+});
+
+// ── swapPassenger · passengerType 服务端权威派生（出生日期变化时重派生，覆盖客户端传值）──
+// 与建单（createOrder → passengerToData）同一口径的权威兜底：入口层已尽量派生，这里堵住
+// 换人/改生日时手选类型不跟着改的口子。
+describe('swapPassenger · passengerType 服务端权威派生（覆盖客户端传值）', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function armMocks(existingPassengerType: string) {
+    mockPrisma.order.findUnique.mockResolvedValueOnce({ id: 'ord1', adjustmentCny: 0, adjustments: [] });
+    mockPrisma.passenger.findUnique.mockResolvedValueOnce({
+      id: 'px1',
+      orderId: 'ord1',
+      fullName: 'ZHANG SAN',
+      documentNumber: 'SAME123',
+      visaExempt: false,
+      passengerType: existingPassengerType,
+    });
+    mockPrisma.passenger.update.mockResolvedValueOnce({});
+    mockPrisma.passenger.findUniqueOrThrow.mockResolvedValueOnce({
+      fullName: 'ZHANG SAN',
+      documentNumber: 'SAME123',
+    });
+    mockPrisma.order.findUniqueOrThrow.mockResolvedValueOnce(fakeFullOrder({ id: 'ord1' }));
+  }
+
+  it('证件号不变、仅订正出生日期 → 有出发日时按新生日重算 passengerType（覆盖存量 ADULT）', async () => {
+    const service = new OrderService();
+    armMocks('ADULT');
+    // 订单一条 FLIGHT 行，出发日 2026-06-01；新生日 2018-01-01 相对出发日 ~8 周岁 → CHILD
+    mockPrisma.orderItem.findMany.mockResolvedValueOnce([
+      { flightSchedule: { departureTime: new Date('2026-06-01T00:00:00Z') } },
+    ]);
+
+    await service.swapPassenger(
+      'ord1',
+      'px1',
+      { dateOfBirth: '2018-01-01' },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    const data = mockPrisma.passenger.update.mock.calls[0][0].data;
+    expect(data.dateOfBirth).toEqual(new Date('2018-01-01'));
+    expect(data.passengerType).toBe('CHILD');
+  });
+
+  it('成人生日 + 客户端手选 INFANT → 有出发日时被服务端纠正为 ADULT', async () => {
+    const service = new OrderService();
+    armMocks('ADULT');
+    mockPrisma.orderItem.findMany.mockResolvedValueOnce([
+      { flightSchedule: { departureTime: new Date('2026-06-01T00:00:00Z') } },
+    ]);
+
+    await service.swapPassenger(
+      'ord1',
+      'px1',
+      { dateOfBirth: '1990-01-01', passengerType: 'INFANT' as never },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    const data = mockPrisma.passenger.update.mock.calls[0][0].data;
+    expect(data.passengerType).toBe('ADULT');
+  });
+
+  it('订单定不出出发日（无 FLIGHT 行）→ 保留客户端传值，不派生', async () => {
+    const service = new OrderService();
+    armMocks('ADULT');
+    mockPrisma.orderItem.findMany.mockResolvedValueOnce([]); // 无 FLIGHT 行 → earliestFlightDeparture 为 null
+
+    await service.swapPassenger(
+      'ord1',
+      'px1',
+      { dateOfBirth: '1990-01-01', passengerType: 'INFANT' as never },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    const data = mockPrisma.passenger.update.mock.calls[0][0].data;
+    expect(data.passengerType).toBe('INFANT');
+  });
+
+  it('本次未改出生日期 → 不查出发日、不重派生 passengerType', async () => {
+    const service = new OrderService();
+    armMocks('CHILD');
+
+    await service.swapPassenger(
+      'ord1',
+      'px1',
+      { chineseName: '张三' },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    expect(mockPrisma.orderItem.findMany).not.toHaveBeenCalled();
+    const data = mockPrisma.passenger.update.mock.calls[0][0].data;
+    expect(data).not.toHaveProperty('passengerType');
   });
 });
 
@@ -3631,6 +3847,192 @@ describe('OrderService.rescheduleOrderItem · 占座状态守卫', () => {
   });
 });
 
+// ══════════════════════════════════════════════════════════════════════════
+// 改期的票务语义：换班次 = 原票作废（清票号 + 翻回该航段开票位）+ 差价可负
+// ══════════════════════════════════════════════════════════════════════════
+describe('OrderService.rescheduleOrderItem · 换班次即作废原票', () => {
+  const OUT_ISO = '2026-09-01T01:00:00.000Z';
+  const RET_ISO = '2026-09-08T01:00:00.000Z';
+
+  /** 一张往返单：outbound-item（去程）+ return-item（回程）。 */
+  function mountRoundTrip(targetItemId: 'outbound-item' | 'return-item', opts: { adjustmentCny?: number } = {}) {
+    const legs = [
+      {
+        id: 'outbound-item',
+        orderId: 'ord1',
+        kind: 'FLIGHT',
+        quantity: 1,
+        bundleId: null,
+        flightScheduleId: 'schedOut',
+        flightCabin: 'ECONOMY',
+        metadata: {},
+        flightSchedule: { departureTime: new Date(OUT_ISO) },
+      },
+      {
+        id: 'return-item',
+        orderId: 'ord1',
+        kind: 'FLIGHT',
+        quantity: 1,
+        bundleId: null,
+        flightScheduleId: 'schedRet',
+        flightCabin: 'ECONOMY',
+        metadata: {},
+        flightSchedule: { departureTime: new Date(RET_ISO) },
+      },
+    ];
+    mockPrisma.order.findUnique.mockReset().mockResolvedValue({
+      id: 'ord1',
+      status: 'PAID',
+      deletedAt: null,
+      adjustmentCny: opts.adjustmentCny ?? 0,
+      adjustments: [],
+    });
+    mockPrisma.orderItem.findUnique.mockReset().mockResolvedValue(
+      legs.find((l) => l.id === targetItemId),
+    );
+    // 改期后重查航段：被改那条已写成新班次（服务内部会把它换回旧班次再定位去/回程）
+    mockPrisma.orderItem.findMany.mockReset().mockImplementation(
+      async (args: { where?: { kind?: string } }) =>
+        args.where?.kind === 'DISCOUNT'
+          ? []
+          : legs.map((l) =>
+              l.id === targetItemId
+                ? {
+                    id: l.id,
+                    flightScheduleId: 'schedNew',
+                    flightSchedule: { departureTime: new Date('2026-12-31T00:00:00.000Z') },
+                  }
+                : { id: l.id, flightScheduleId: l.flightScheduleId, flightSchedule: l.flightSchedule },
+            ),
+    );
+    mockPrisma.passenger.updateMany.mockReset().mockResolvedValue({ count: 2 });
+    mockPrisma.flightSeatClass.findFirst.mockReset().mockResolvedValue({ id: 'seatNew' });
+    mockPrisma.seatLock.aggregate.mockReset().mockResolvedValue({ _sum: { qty: 0 } });
+    mockPrisma.$queryRaw.mockReset().mockResolvedValue([{ id: 'ord1' }]);
+    mockPrisma.$executeRaw.mockReset().mockResolvedValue(1);
+    mockPrisma.orderItem.update.mockReset().mockResolvedValue({});
+    mockPrisma.order.update.mockReset().mockResolvedValue({});
+    mockPrisma.flightSchedule.findUnique.mockReset().mockResolvedValue({ departureTime: new Date(OUT_ISO) });
+    mockPrisma.order.findUniqueOrThrow.mockReset().mockResolvedValue(fakeFullOrder());
+  }
+
+  it('改去程 → 清全单票号，并只把去程开票位翻回未开', async () => {
+    const service = new OrderService();
+    mountRoundTrip('outbound-item');
+
+    await service.rescheduleOrderItem(
+      'ord1',
+      { orderItemId: 'outbound-item', newScheduleId: 'schedNew' },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    expect(mockPrisma.passenger.updateMany).toHaveBeenCalledWith({
+      where: { orderId: 'ord1' },
+      data: { pnr: null, eticketNumber: null },
+    });
+    expect(mockPrisma.order.update).toHaveBeenCalledWith({
+      where: { id: 'ord1' },
+      data: { outboundInvoiced: false },
+    });
+  });
+
+  it('改回程 → 只把回程开票位翻回未开（不误伤去程）', async () => {
+    const service = new OrderService();
+    mountRoundTrip('return-item');
+
+    await service.rescheduleOrderItem(
+      'ord1',
+      { orderItemId: 'return-item', newScheduleId: 'schedNew' },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    expect(mockPrisma.order.update).toHaveBeenCalledWith({
+      where: { id: 'ord1' },
+      data: { returnInvoiced: false },
+    });
+    expect(mockPrisma.order.update).not.toHaveBeenCalledWith({
+      where: { id: 'ord1' },
+      data: { outboundInvoiced: false },
+    });
+  });
+
+  it('同班次（只收差价、不换航段）→ 票号与开票位一律不动', async () => {
+    const service = new OrderService();
+    mountRoundTrip('outbound-item');
+
+    await service.rescheduleOrderItem(
+      'ord1',
+      { orderItemId: 'outbound-item', newScheduleId: 'schedOut', feeCny: 100 },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    expect(mockPrisma.passenger.updateMany).not.toHaveBeenCalled();
+    expect(mockPrisma.order.update).not.toHaveBeenCalledWith(
+      expect.objectContaining({ data: { outboundInvoiced: false } }),
+    );
+  });
+
+  it('负差价（改到便宜班次要退差）→ adjustmentCny 下调并留一条「改期差价」流水', async () => {
+    const service = new OrderService();
+    mountRoundTrip('outbound-item', { adjustmentCny: 500 });
+
+    await service.rescheduleOrderItem(
+      'ord1',
+      { orderItemId: 'outbound-item', newScheduleId: 'schedNew', feeCny: -300 },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    const moneyWrite = mockPrisma.order.update.mock.calls
+      .map((call) => call[0] as { data: Record<string, unknown> })
+      .find((arg) => arg.data.adjustmentCny !== undefined);
+    expect(moneyWrite?.data.adjustmentCny).toBe(200); // 500 − 300
+    expect(moneyWrite?.data.adjustments).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: 'RESCHEDULE_FEE', label: '改期差价', amountCny: -300 }),
+      ]),
+    );
+  });
+
+  it('CHANGE_REQUESTED 下只收差价不换班次 → 不推 CHANGED（没航变就不是已改期），也不报错', async () => {
+    // 回归：CHANGED 派生闸要求本单有 flightChanged 标记，而同班次调用根本不落标记。
+    // 若这里仍去推状态，就会撞上自家的闸把整笔改期回滚 —— 运营看到的是自相矛盾的报错。
+    const service = new OrderService();
+    const transition = vi.spyOn(service, '_updateStatusWithinTx');
+    mountRoundTrip('outbound-item');
+    mockPrisma.order.findUnique.mockReset().mockResolvedValue({
+      id: 'ord1',
+      status: 'CHANGE_REQUESTED',
+      deletedAt: null,
+      adjustmentCny: 0,
+      adjustments: [],
+    });
+
+    const result = await service.rescheduleOrderItem(
+      'ord1',
+      { orderItemId: 'outbound-item', newScheduleId: 'schedOut', feeCny: 200 },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    expect(result.audit.statusChanged).toBe(false);
+    expect(transition).not.toHaveBeenCalled();
+    transition.mockRestore();
+  });
+
+  it('rescheduleOrderBodySchema 放开负数（前端钳正需同步解除），仍守 ± 上限', () => {
+    expect(rescheduleOrderBodySchema.parse({
+      orderItemId: 'it1',
+      newScheduleId: 'sched2',
+      feeCny: -300,
+    }).feeCny).toBe(-300);
+    expect(() =>
+      rescheduleOrderBodySchema.parse({ orderItemId: 'it1', newScheduleId: 'sched2', feeCny: -100_001 }),
+    ).toThrow();
+    expect(() =>
+      rescheduleOrderBodySchema.parse({ orderItemId: 'it1', newScheduleId: 'sched2', feeCny: -1.5 }),
+    ).toThrow();
+  });
+});
+
 describe('OrderService.createOrder · settlement discount guardrails', () => {
   const bundleBody = {
     contactName: '联系人',
@@ -3829,18 +4231,47 @@ describe('OrderService.createOrder · settlement discount guardrails', () => {
     expect(mockPrisma.$transaction).not.toHaveBeenCalled();
   });
 
-  it('散客低于同业日历价 → 记录告警但允许下单', async () => {
+  // ── 渠道价格倒挂闸：散客价不得低于同业结算价 ──────────────────────────────
+  // 旧行为是「打一条 warn 就放行」，日志没人盯 → 倒挂单照常成交。现改为硬拒。
+  it('散客立减击穿同业日历价 → 拒单（不落库）', async () => {
     const service = prepareService({ authoritativeTotal: 200 });
     mockPrisma.bundle.findMany.mockResolvedValue([{ id: 'bundle-a', name: '套餐 A', settlementTier: 'CITY_3STAR', settlementNights: 3 }]);
     mockResolveRetailSettlementDiscount.mockResolvedValue({ ruleId: 'retail-low', kind: 'RETAIL', discountPerPersonCny: 50 });
+    // 同业价 ¥300/人 × 1人 = 300 > 折后 150 → 击穿。
     mockGetSettlementRate.mockResolvedValue({ pricePerPersonCny: 300 });
-    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
-    await expect(service.createOrder(bundleBody as never, { userId: 'customer-user', role: 'CUSTOMER' })).resolves.toBeDefined();
-    expect(warnSpy).toHaveBeenCalledWith(
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    await expect(
+      service.createOrder(bundleBody as never, { userId: 'customer-user', role: 'CUSTOMER' }),
+    ).rejects.toThrow('低于同业结算价');
+    // 拒单发生在事务之前：不扣座、不落库。
+    expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+    // 内部同业价数字只进日志，不进给客人的报错文案。
+    expect(errorSpy).toHaveBeenCalledWith(
       '[orders] retail settlement discount is below settlement calendar price',
-      expect.objectContaining({ ruleIds: ['retail-low'] }),
+      expect.objectContaining({ ruleIds: ['retail-low'], settlementCalendarCny: 300 }),
     );
-    warnSpy.mockRestore();
+    errorSpy.mockRestore();
+  });
+
+  it('同业价取不到（日历未配）→ 无基准可比，维持放行不误伤', async () => {
+    const service = prepareService({ authoritativeTotal: 200 });
+    mockPrisma.bundle.findMany.mockResolvedValue([{ id: 'bundle-a', name: '套餐 A', settlementTier: 'CITY_3STAR', settlementNights: 3 }]);
+    mockResolveRetailSettlementDiscount.mockResolvedValue({ ruleId: 'retail-low', kind: 'RETAIL', discountPerPersonCny: 50 });
+    mockGetSettlementRate.mockResolvedValue(null);
+    await expect(
+      service.createOrder(bundleBody as never, { userId: 'customer-user', role: 'CUSTOMER' }),
+    ).resolves.toBeDefined();
+  });
+
+  it('散客折后价恰等于同业价 → 不算击穿，放行', async () => {
+    const service = prepareService({ authoritativeTotal: 200 });
+    mockPrisma.bundle.findMany.mockResolvedValue([{ id: 'bundle-a', name: '套餐 A', settlementTier: 'CITY_3STAR', settlementNights: 3 }]);
+    mockResolveRetailSettlementDiscount.mockResolvedValue({ ruleId: 'retail-eq', kind: 'RETAIL', discountPerPersonCny: 50 });
+    // 同业价 ¥150/人 × 1人 = 折后 200 − 50 = 150 → 相等，不拦。
+    mockGetSettlementRate.mockResolvedValue({ pricePerPersonCny: 150 });
+    await expect(
+      service.createOrder(bundleBody as never, { userId: 'customer-user', role: 'CUSTOMER' }),
+    ).resolves.toBeDefined();
   });
 });
 

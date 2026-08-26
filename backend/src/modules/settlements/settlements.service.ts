@@ -22,8 +22,22 @@
  *   反向扣减——那不在本次修复范围内。
  *
  * 状态机：DRAFT → PENDING_APPROVAL → APPROVED → PAID
- *   PAID 时：  CommissionRecord.status ACCRUED → SETTLED（不再扣预存款余额、不再写 OFFSET 流水）
- *   VOIDED 时：关联 records 回 ACCRUED（可重算）
+ *   PAID 时：  CommissionRecord.status ACCRUED → SETTLED（不再扣预存款余额、不再写 OFFSET 流水）。
+ *              转 PAID 前会复检：本单绑定的「仍为 ACCRUED」的记录总额若小于生成时存的
+ *              commissionEarned，说明有绑定记录在生成之后被外部翻成了 REVERSED（例如结算单
+ *              审核通过后订单又被退款/取消——orders.service 把 ACCRUED 原地翻 REVERSED，但不清
+ *              settlementId），继续付款会照着过期数字多付 → 400 拒绝，提示先作废重新生成。
+ *              （不是"只要绑了 REVERSED 记录就拒绝"：负数补偿记录、结算前就已取消的正数
+ *              REVERSED 记录，本就是生成时正确算入/正确排除的合法状态，不属于过期，否则会把
+ *              「本期只是净掉一笔退款」的正常结算单也堵死，永远无法转 PAID。）
+ *   VOIDED 时：关联的 ACCRUED / REVERSED 记录一并解绑（settlementId=null，可被下次 generate
+ *              重新扫入）；已 SETTLED 的记录（钱已经付过）绝不解绑。
+ *
+ * 负佣金追回（M3）：若某期 netCommission = commissionEarned + reversalAmount < 0
+ *   （本期退款冲销比本期新赚的佣金还多），payableToAgent 钳 0（本期不倒找代理要钱），
+ *   但造成负差额的那部分负数补偿记录本次不绑定 settlementId——留在"待处理"池子里，
+ *   由下一次 generate（不论哪个自然月，只要还是 settlementId=null 就会被扫到）用未来
+ *   的新佣金去抵消，直到抵完为止。见 serializeSettlement 的 carryForwardAmount 字段。
  */
 import {
   CommissionStatus,
@@ -186,11 +200,13 @@ export class SettlementService {
     accruedRows.forEach((r) => ids.add(r.agentId));
     // 也纳入「本期只有退款冲销、没有新佣金」的代理：跨期反冲的负数补偿记录必须
     // 进入某张结算单去追回，否则永远漏算（净额对不上 = 平台多付）。
+    // 不按 createdAt 限定期次：settlementId=null 才是"待处理"的唯一判据——负差额
+    // 结转（M3）产生的记录可能是很久以前创建的，只要还没被绑定，任何一次 generate
+    // 都该把它纳入候选，否则会因为 createdAt 落在已关闭的旧自然月而永远漏扫。
     const reversedRows = await prisma.commissionRecord.findMany({
       where: {
         status: CommissionStatus.REVERSED,
         settlementId: null,
-        createdAt: { gte: start, lt: end },
       },
       select: { agentId: true },
       distinct: ['agentId'],
@@ -223,17 +239,20 @@ export class SettlementService {
 
     const commissionEarned = earnedRecords.reduce((s, r) => s + Number(r.amount), 0);
 
-    // 1b. 本人当期「退款冲销」records —— 尚未并入任何结算单的 REVERSED 记录
-    // （settlementId=null）。两类来源：
+    // 1b. 本人「退款冲销」records —— 尚未并入任何结算单的 REVERSED 记录
+    // （settlementId=null）。三类来源：
     //   - 同期退款：整单冲销时被翻状态的 ACCRUED→REVERSED 记录（amount 仍为正）。
     //   - 跨期反冲：已结算订单退款时新建的「负数补偿记录」（amount<0）。
-    // 这些必须并入本期 netCommission（追回多付的佣金），不能静默丢弃。
+    //   - 负佣金结转（M3）：上一次 generate 因本期净额为负而未绑定的负数补偿记录，
+    //     留到这一次用新的 commissionEarned 抵消。
+    // 不按 createdAt 限定期次：settlementId=null 才是唯一的"待处理"判据，跟本次
+    // 结算期无关——负差额结转的记录可能创建于更早的自然月（见 findAgentsWithActivity
+    // 同款注释）。这些必须并入本期 netCommission（追回多付的佣金），不能静默丢弃。
     const reversalRecords = await prisma.commissionRecord.findMany({
       where: {
         agentId,
         status: CommissionStatus.REVERSED,
         settlementId: null,
-        createdAt: { gte: start, lt: end },
       },
       select: { id: true, amount: true, orderId: true },
     });
@@ -246,10 +265,6 @@ export class SettlementService {
     const reversalAmount = negativeReversals.reduce((s, r) => s + Number(r.amount), 0);
     const reversalCount = negativeReversals.length;
 
-    const recordIds = [
-      ...earnedRecords.map((r) => r.id),
-      ...reversalRecords.map((r) => r.id),
-    ];
     const relatedOrderIds = Array.from(
       new Set([
         ...earnedRecords.map((r) => r.orderId),
@@ -293,9 +308,22 @@ export class SettlementService {
     const netCommission = commissionEarned + reversalAmount;
 
     // 4. 预付抵扣已停用：预存款是代理自己的资产，不存在可抵的欠款场景（见文件头说明）。
-    // prepaymentOffset 恒为 0；payableToAgent 直接等于净佣金（负数钳 0 是 H2，本次不动）。
+    // prepaymentOffset 恒为 0；payableToAgent 直接等于净佣金，负数钳 0（本期不倒找代理要钱）。
     const prepaymentOffset = 0;
     const payableToAgent = Math.max(0, netCommission - prepaymentOffset);
+
+    // M3（负佣金追回不再蒸发）：netCommission < 0 时，造成负差额的那部分负数补偿记录
+    // 本次不绑定 settlementId——继续留在"待处理"池子里（settlementId 仍为 null），
+    // 交给下一次 generate（不论本期还是下期）用新的 commissionEarned 去抵消，直到抵完
+    // 为止；见 findAgentsWithActivity / 上方 reversalRecords 查询已去掉 createdAt 限制。
+    // 正常记录（本人当期新赚的 earnedRecords、以及同期翻状态等"正数"REVERSED 记录）
+    // 照常绑定——它们不影响净额，留在池子里对账无益、只会让"待处理"名单永远清不空。
+    const boundReversalRecords =
+      netCommission < 0 ? reversalRecords.filter((r) => Number(r.amount) >= 0) : reversalRecords;
+    const recordIds = [
+      ...earnedRecords.map((r) => r.id),
+      ...boundReversalRecords.map((r) => r.id),
+    ];
 
     return {
       orderCount,
@@ -347,8 +375,14 @@ export class SettlementService {
               user: { select: { displayName: true } },
             },
           },
-          // 只取汇总退款冲销所需的最小字段（status + amount），不展开订单
-          commissions: { select: { status: true, amount: true } },
+          // 汇总退款冲销所需的最小字段：status/amount 算金额，id/orderId/订单号让审批页
+          // 能逐条看清"是哪张订单被冲销"（P0：此前列表页完全看不到 REVERSED 记录）。
+          commissions: {
+            select: {
+              id: true, status: true, amount: true, orderId: true,
+              order: { select: { orderNumber: true } },
+            },
+          },
         },
         orderBy: [{ period: 'desc' }, { agent: { tier: 'asc' } }],
         take: query.pageSize,
@@ -441,20 +475,46 @@ export class SettlementService {
       // 不再写 PrepaymentTransaction(OFFSET)——即便本单 prepaymentOffset 是历史遗留的非零值
       // （旧版本生成、尚未走到 PAID 的结算单），转 PAID 时也不再触发任何余额扣减。
       if (toStatus === 'PAID') {
+        // ── P0 复检：转 PAID 前确认绑定记录没有在生成之后被外部翻成 REVERSED ──
+        // orders.service 的退款/取消流程会把 ACCRUED 记录原地翻成 REVERSED（不清
+        // settlementId，见文件头说明）；若本单审核通过后订单才被退款，stored 的
+        // commissionEarned 就是过期数字，照付会多付。用「本单仍为 ACCRUED 的总额」
+        // 与生成时存的 commissionEarned 比较：一旦有绑定记录从 ACCRUED 变走，总额必然
+        // 变小（绑定是 generate 时一次性完成，之后不会再有记录加入），从而检测出过期。
+        // 注意：不是"只要绑了 REVERSED 就拒绝"——负数补偿记录、结算前就已取消的正数
+        // REVERSED 记录，从生成那一刻起就没算进 commissionEarned，总额不会因它们而变小，
+        // 属于合法状态，不应被这条闸拦住（否则任何吸收过退款冲销的正常结算单都会被永久
+        // 堵在 APPROVED，作废重生成也无法解开——见文件头说明）。
+        const stillAccrued = await tx.commissionRecord.aggregate({
+          where: { settlementId: s.id, status: CommissionStatus.ACCRUED },
+          _sum: { amount: true },
+        });
+        const stillAccruedAmount = round2(Number(stillAccrued._sum.amount ?? 0));
+        const storedEarned = round2(Number(s.commissionEarned));
+        if (stillAccruedAmount < storedEarned) {
+          throw new BadRequestError('本结算单包含已冲销佣金，请作废后重新生成');
+        }
+
         await tx.commissionRecord.updateMany({
           where: { settlementId: s.id, status: CommissionStatus.ACCRUED },
           data: { status: CommissionStatus.SETTLED, settledAt: new Date() },
         });
       }
 
-      // VOIDED：records 回 ACCRUED（可重算）。CAS 已抢到本次流转，故这里的 records 回滚
-      // 每单只会执行一次；并发的第二个 VOID（或 PAID 抢跑）已在 CAS 处被挡下回滚。
-      // 解绑 where 额外押 status=ACCRUED：绝不碰已 SETTLED 的记录 —— 那属于已扣 offset 的
-      // 已支付结算单，若被解绑回 unlinked 会被下期 generate 重复计入 → 佣金双付。此过滤与
-      // PAID 分支的 ACCRUED→SETTLED 天然互斥：同一条记录不会同时被两个方向命中。
+      // VOIDED：解绑本单关联的记录，使其回到"待处理"池子（settlementId=null），可被
+      // 下次 generate 重新扫入重算。CAS 已抢到本次流转，故这里的解绑每单只会执行一次；
+      // 并发的第二个 VOID（或 PAID 抢跑）已在 CAS 处被挡下回滚。
+      // 解绑范围 = ACCRUED ∪ REVERSED：REVERSED 记录（同期翻状态 / 负数补偿）此前只解绑
+      // ACCRUED，REVERSED 被永久绑死在废单上——作废后既回不到"待处理"池子被下次 generate
+      // 追回，也不再对任何人可见，等于这笔冲销/追回凭空消失。SETTLED 记录（钱已经付过的）
+      // 绝不在此范围：那是已完成支付的历史快照，解绑会被下期 generate 重复计入 → 佣金双付；
+      // 此过滤与 PAID 分支的 ACCRUED→SETTLED 天然互斥：同一条记录不会同时被两个方向命中。
       if (toStatus === 'VOIDED') {
         await tx.commissionRecord.updateMany({
-          where: { settlementId: s.id, status: CommissionStatus.ACCRUED },
+          where: {
+            settlementId: s.id,
+            status: { in: [CommissionStatus.ACCRUED, CommissionStatus.REVERSED] },
+          },
           data: { settlementId: null, settledAt: null },
         });
       }
@@ -516,18 +576,45 @@ type SettlementWithAgent = Prisma.SettlementGetPayload<{
   };
 }>;
 
-// 从结算单已绑定的佣金记录里汇总「本期退款冲销」摘要：
-//   count = REVERSED 记录条数；amount = 这些记录金额之和（恒 ≤ 0）。
-// 便于财务在结算单上直观看到「本期退款冲销 N 笔 / ¥X」。
-type ReversalSummary = { reversalCount: number; reversalAmount: string };
+// 从结算单已绑定的佣金记录里汇总「本期退款冲销」摘要，两个层次：
+//   1. reversalCount / reversalAmount —— 只统计「负数补偿记录」（真实追回，恒 ≤ 0）；
+//      同期翻状态的正数 REVERSED 不计入，口径与 computeSettlement 的 netCommission 一致。
+//   2. reversedRecords —— 把本单绑定的 REVERSED 记录（不论正负）逐条透出（订单号 + 金额），
+//      让审批页能看见"这张结算单里有没有被冲销的佣金"。P0 修复点：此前只看 reversalAmount
+//      时，同期翻状态的正数 REVERSED（:5477-5480 那种 ACCRUED 原地翻转、不清 settlementId
+//      的记录）完全不可见——金额是正的、被过滤掉了，审批人看不出这单里有一笔已经作废的佣金。
+type ReversedRecordBrief = { id: string; orderId: string; orderNumber: string | null; amount: string };
+type ReversalSummary = {
+  reversalCount: number;
+  reversalAmount: string;
+  reversedRecords: ReversedRecordBrief[];
+};
 function summarizeReversals(
-  commissions: Array<{ status: string; amount: Prisma.Decimal }> | undefined,
+  commissions:
+    | Array<{
+        id?: string;
+        status: string;
+        amount: Prisma.Decimal;
+        orderId?: string;
+        order?: { orderNumber: string } | null;
+      }>
+    | undefined,
 ): ReversalSummary {
-  if (!commissions) return { reversalCount: 0, reversalAmount: '0' };
+  if (!commissions) return { reversalCount: 0, reversalAmount: '0', reversedRecords: [] };
+  const allReversed = commissions.filter((c) => c.status === 'REVERSED');
   // 只统计「负数补偿记录」（真实追回）；同期翻状态的正数 REVERSED 不计入（与 computeSettlement 口径一致）。
-  const reversed = commissions.filter((c) => c.status === 'REVERSED' && Number(c.amount) < 0);
-  const total = reversed.reduce((sum, c) => sum + Number(c.amount), 0);
-  return { reversalCount: reversed.length, reversalAmount: round2(total).toString() };
+  const negative = allReversed.filter((c) => Number(c.amount) < 0);
+  const total = negative.reduce((sum, c) => sum + Number(c.amount), 0);
+  return {
+    reversalCount: negative.length,
+    reversalAmount: round2(total).toString(),
+    reversedRecords: allReversed.map((c) => ({
+      id: c.id ?? '',
+      orderId: c.orderId ?? '',
+      orderNumber: c.order?.orderNumber ?? null,
+      amount: c.amount.toString(),
+    })),
+  };
 }
 
 function serializeSettlement<T extends SettlementWithAgent | (SettlementWithAgent & { commissions?: unknown })>(
@@ -535,9 +622,23 @@ function serializeSettlement<T extends SettlementWithAgent | (SettlementWithAgen
   includeCommissions = false,
 ): unknown {
   const boundCommissions = 'commissions' in s
-    ? (s.commissions as Array<{ status: string; amount: Prisma.Decimal }> | undefined)
+    ? (s.commissions as
+        | Array<{
+            id?: string;
+            status: string;
+            amount: Prisma.Decimal;
+            orderId?: string;
+            order?: { orderNumber: string } | null;
+          }>
+        | undefined)
     : undefined;
   const reversalSummary = summarizeReversals(boundCommissions);
+  // 只读展示字段：本期净额若为负（M3 结转），造成负差额的补偿记录本次没有绑定 settlementId
+  // （见 computeSettlement），不会体现在 reversalSummary（那只统计"实际绑定"的记录）里；
+  // 这里直接从已存的 netCommission 派生，让审批页看得见"这单已结转、下期会继续追回"。
+  const netCommissionNum = Number(s.netCommission);
+  const carryForwardAmount =
+    netCommissionNum < 0 ? round2(Math.abs(netCommissionNum)).toString() : '0';
 
   const base = {
     id: s.id,
@@ -553,6 +654,10 @@ function serializeSettlement<T extends SettlementWithAgent | (SettlementWithAgen
     // 本期退款冲销摘要（amount ≤ 0）。从绑定的 REVERSED 佣金记录汇总；list 与详情均带。
     reversalCount: reversalSummary.reversalCount,
     reversalAmount: reversalSummary.reversalAmount,
+    // 本单绑定的 REVERSED 记录逐条明细（不论正负），供审批页查看；list 与详情均带。
+    reversedRecords: reversalSummary.reversedRecords,
+    // 本期净额为负时的结转金额（正数，"已结转下期"的绝对值）；无结转时为 '0'。
+    carryForwardAmount,
     status: s.status,
     generatedAt: s.generatedAt,
     approvedAt: s.approvedAt,

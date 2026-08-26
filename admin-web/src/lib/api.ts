@@ -444,6 +444,12 @@ export interface BatchOrderPassenger {
   note?: string;
   /** BUNDLE 批量创单行级指定酒店：传服务端解析出的房型 id。 */
   designatedHotelRoomTypeId?: string;
+  /**
+   * 乘客类型（成人/儿童/婴儿）。旧系统表格导入解析层已按「出生日期 + 出发日」派生（见
+   * OrderImportParsedRow.passenger.passengerType）；有值才带，缺省回落后端 schema 默认（成人）
+   * ——服务端 createOrder 仍会按出生日期 + 航班出发日权威兜底重派生，此处只是不丢入口层已有的判断。
+   */
+  passengerType?: PassengerType;
 }
 // 批量创单 body 同样支持整批共用的签证状态 + 结构化备注四栏（后端 batchCreateOrdersBodySchema
 // 直接 spread 了 orderStructuredNotesShape，写入每张子单）——与 CreateOrderInput 同款 extends。
@@ -560,6 +566,11 @@ export interface OrderImportParsedRow {
     passportExpiry?: string;
     infantCompanion?: string;
     note?: string;
+    /**
+     * 乘客类型：按「出生日期 + 出发日」推算（<2 岁婴儿 / 2–<12 岁儿童 / ≥12 岁成人），而非
+     * 表格里从未采集过的手录值。出生日期缺失时不设，前端提交批量创单时回落后端 schema 默认（成人）。
+     */
+    passengerType?: PassengerType;
   };
   errors: string[];
   warnings: string[];
@@ -1335,9 +1346,10 @@ export interface SalesReportRow {
   orderCount: number;
   revenueCny: number;
   costCny: number;
-  grossMarginCny: number;
-  /** 小数分数（0.3456 = 34.56%） */
-  marginPct: number;
+  /** 桶内存在无成本行时为 null（毛利未知，不虚报 100%） */
+  grossMarginCny: number | null;
+  /** 小数分数（0.3456 = 34.56%）；同上，缺成本时 null */
+  marginPct: number | null;
   missingCostItemCount: number;
 }
 
@@ -2741,6 +2753,14 @@ export interface DashboardTopAgent {
 // ── Settlements ──────────────────────────────────────────────────────────
 export type SettlementStatus = 'DRAFT' | 'PENDING_APPROVAL' | 'APPROVED' | 'PAID' | 'VOIDED';
 
+/** 结算单绑定的单条 REVERSED（冲销）记录摘要 —— 不论正负金额都透出，供审批页查看。 */
+export interface SettlementReversedRecord {
+  id: string;
+  orderId: string;
+  orderNumber: string | null;
+  amount: string;
+}
+
 export interface SettlementSummary {
   id: string;
   period: string; // YYYY-MM
@@ -2752,6 +2772,13 @@ export interface SettlementSummary {
   netCommission: string;
   prepaymentOffset: string;
   payableToAgent: string;
+  // 本期退款冲销摘要：reversalCount/reversalAmount 只统计负数补偿记录（真实追回，恒 ≤ 0）；
+  // reversedRecords 把本单绑定的 REVERSED 记录（不论正负）逐条透出，供审批时核对。
+  reversalCount: number;
+  reversalAmount: string;
+  reversedRecords: SettlementReversedRecord[];
+  // 本期净额为负时的结转金额（正数，"已结转下期"的绝对值）；无结转为 '0'。
+  carryForwardAmount: string;
   status: SettlementStatus;
   generatedAt: string;
   approvedAt: string | null;
@@ -3571,7 +3598,12 @@ export const api = {
       { method: 'POST', token, body: reason ? { reason } : {} },
     ),
   updateOrderStatus: (token: string, id: string, toStatus: OrderStatus, reason?: string, force?: boolean) =>
-    apiFetch<{ order: OrderSummary }>(`/orders/${id}/status`, {
+    apiFetch<{
+      order: OrderSummary & {
+        /** 取消族恢复时若开票超限，后端会自动清开票标记并把提示带回来；没清就没有这个键。 */
+        invoiceCapWarnings?: string[];
+      };
+    }>(`/orders/${id}/status`, {
       method: 'PATCH',
       token,
       body: { toStatus, reason, force },
@@ -3613,7 +3645,14 @@ export const api = {
     apiFetch<{
       successCount: number;
       failureCount: number;
-      results: Array<{ id: string; success: boolean; orderNumber?: string; error?: string }>;
+      results: Array<{
+        id: string;
+        success: boolean;
+        orderNumber?: string;
+        error?: string;
+        /** 该单取消族恢复时若开票超限，后端自动清开票标记并附的提示；没清就没有这个键。 */
+        warnings?: string[];
+      }>;
     }>(`/orders/batch-status`, {
       method: 'POST',
       token,
@@ -3686,15 +3725,16 @@ export const api = {
       passengers?: Array<{ visaExempt?: boolean; singleRoom?: boolean }>;
       /** ADMIN/STAFF 试算代理订单时传入归属代理；不传按散客口径。 */
       agentId?: string;
+      /**
+       * 手工价通道字段（形状同 createOrder，已随后端 quoteOrderBodySchema 暴露）：录单页已填
+       * 手工结算价/优惠时随试算一起发送，服务端据此与 createOrder 同口径判定是否存在手工价
+       * 通道，抑制一笔真下单时并不会生效的自动立减（同业/代理）。
+       */
+      priceAdjustment?: PriceAdjustmentInput;
+      settlementTotalCny?: number;
+      flightSettlementPriceCny?: number;
     },
   ) => apiFetch<QuoteOrderResult>('/orders/quote', { method: 'POST', token, body }),
-
-  // 设置开票状态（ADMIN/STAFF）— 旧的订单级单值，兼容保留
-  setInvoiceStatus: (token: string, id: string, invoiceStatus: InvoiceStatus) =>
-    apiFetch<{ id: string; orderNumber: string; invoiceStatus: InvoiceStatus }>(
-      `/orders/${id}/invoice-status`,
-      { method: 'PATCH', token, body: { invoiceStatus } },
-    ),
 
   // 设置六态开票的三个布尔位（ADMIN/STAFF）：去程/回程/系统 各自独立。
   // 翻某航段为已开时后端校验对应班次开票上限（超限 422）。

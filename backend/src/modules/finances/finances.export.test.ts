@@ -9,6 +9,8 @@
  * 2) 清账判定不带 payableCny>0 前置——与 orders.export-master.ts / orders.export-templates.ts /
  *    reports.service.ts 三处口径一致（receivedCny >= payableCny），零额单（免费单/全减免单）
  *    应收=已收=0 时应判"已清账"，而不是因 payableCny 不大于 0 被误标"未清账"。
+ * 3) 已收净额要扣已完成退款（lib/net-received.ts 统一口径）——退款完成只翻 Refund 状态、
+ *    不回冲 paidAmount，不扣就会把"先收后退"的订单一直标成已清账。
  *
  * 注入 fake PrismaClient（buildFinanceExportWorkbook 支持 client 参数），构建 workbook 后
  * 用 ExcelJS 读回校验「是否清账」列（COLUMNS 第 11 列）。
@@ -39,6 +41,8 @@ interface OrderFixture {
   passengers: { id: string; fullName: string; lastName: string | null; firstName: string | null }[];
   costItems: unknown[];
   items: unknown[];
+  /** 查询侧已按 status='COMPLETED' 过滤，fixture 里直接给已完成的那些 */
+  refunds: { amount: number }[];
 }
 
 function makeOrder(overrides: Partial<OrderFixture> & { orderNumber: string }): OrderFixture {
@@ -56,6 +60,7 @@ function makeOrder(overrides: Partial<OrderFixture> & { orderNumber: string }): 
     passengers: [{ id: 'p1', fullName: '张三', lastName: null, firstName: null }],
     costItems: [],
     items: [],
+    refunds: [],
     ...overrides,
   };
 }
@@ -150,6 +155,50 @@ describe('buildFinanceExportWorkbook — 是否清账口径含 adjustmentCny', (
     const buf = await buildFinanceExportWorkbook(RANGE, client);
     const wb = await loadWorkbook(buf);
     const ws = wb.getWorksheet('财务核对收入明细')!;
+
+    expect(ws.getRow(2).getCell(SETTLED_COL).value).toBe('是');
+  });
+});
+
+describe('buildFinanceExportWorkbook — 已收净额扣已完成退款', () => {
+  it('先收后退：已收净额低于应收 → 不应再标"已清账"', async () => {
+    const order = makeOrder({
+      orderNumber: 'FTM0006',
+      total: 1000,
+      paidAmount: 1000, // 退款完成不回冲 paidAmount，账面仍是 1000
+      refunds: [{ amount: 400 }], // 已收净额 = 1000 − 400 = 600 < 应收 1000
+    });
+    const client = fakeClient([order]);
+    const buf = await buildFinanceExportWorkbook(RANGE, client);
+    const ws = (await loadWorkbook(buf)).getWorksheet('财务核对收入明细')!;
+
+    expect(ws.getRow(2).getCell(SETTLED_COL).value).toBe('否');
+  });
+
+  it('多笔已完成退款累加后仍收满：标"已清账"', async () => {
+    const order = makeOrder({
+      orderNumber: 'FTM0007',
+      total: 600,
+      paidAmount: 1000,
+      refunds: [{ amount: 250 }, { amount: 150 }], // 已收净额 = 1000 − 400 = 600 ≥ 应收 600
+    });
+    const client = fakeClient([order]);
+    const buf = await buildFinanceExportWorkbook(RANGE, client);
+    const ws = (await loadWorkbook(buf)).getWorksheet('财务核对收入明细')!;
+
+    expect(ws.getRow(2).getCell(SETTLED_COL).value).toBe('是');
+  });
+
+  it('无退款记录：口径不变（非回归）', async () => {
+    const order = makeOrder({
+      orderNumber: 'FTM0008',
+      total: 1000,
+      paidAmount: 1000,
+      refunds: [],
+    });
+    const client = fakeClient([order]);
+    const buf = await buildFinanceExportWorkbook(RANGE, client);
+    const ws = (await loadWorkbook(buf)).getWorksheet('财务核对收入明细')!;
 
     expect(ws.getRow(2).getCell(SETTLED_COL).value).toBe('是');
   });

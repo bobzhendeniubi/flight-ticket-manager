@@ -88,7 +88,7 @@ export const hotelControlRoutes: FastifyPluginAsync = async (app) => {
   app.patch('/block-periods/:id', requireStaff, async (req) => {
     const { id } = req.params as { id: string };
     const body = updateBlockPeriodBodySchema.parse(req.body);
-    const period = await updateBlockPeriod(id, body);
+    const period = await updateBlockPeriod(id, body, undefined, actorFromRequest(req));
     void writeAudit({
       actor: actorFromRequest(req),
       action: 'UPDATE_HOTEL_BLOCK_PERIOD',

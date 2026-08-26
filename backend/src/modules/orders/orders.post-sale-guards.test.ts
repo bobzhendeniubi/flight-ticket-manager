@@ -260,7 +260,7 @@ describe('setInvoiceFlags · 航段标记翻齐后自动推进「出票完成」
           outboundInvoiced: false,
           returnInvoiced: false,
           systemInvoiced: false,
-          _count: { passengers: 1 },
+          passengers: [{ passengerType: 'ADULT' }],
           items: [
             {
               flightScheduleId: 'sch-1',

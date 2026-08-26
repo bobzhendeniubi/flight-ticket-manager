@@ -24,7 +24,7 @@ vi.mock('../../db/prisma.js', () => ({
   },
 }));
 
-import { Prisma, SettlementStatus, UserRole } from '@prisma/client';
+import { CommissionStatus, Prisma, SettlementStatus, UserRole } from '@prisma/client';
 import { ConflictError } from '../../lib/errors.js';
 import { prisma } from '../../db/prisma.js';
 import { SettlementService } from './settlements.service.js';
@@ -32,6 +32,8 @@ import { SettlementService } from './settlements.service.js';
 const ADMIN = { userId: 'u-admin', role: UserRole.ADMIN };
 
 // 事务内可能被触碰的所有副作用方法都挂 spy —— 用来断言「CAS 落空时它们一次都没被调」
+// commissionRecord.aggregate：P0 复检用的"仍为 ACCRUED 的总额"查询，默认回填与
+// approvedSettlementRow() 的 commissionEarned 一致（=50），代表"没有被外部冲销、可正常放行"。
 function makeTxMock(casCount: number) {
   return {
     settlement: {
@@ -39,7 +41,10 @@ function makeTxMock(casCount: number) {
       findUniqueOrThrow: vi.fn(),
       create: vi.fn(),
     },
-    commissionRecord: { updateMany: vi.fn() },
+    commissionRecord: {
+      updateMany: vi.fn(),
+      aggregate: vi.fn().mockResolvedValue({ _sum: { amount: new Prisma.Decimal(50) } }),
+    },
     agent: { update: vi.fn() },
     prepaymentTransaction: { create: vi.fn() },
     $queryRaw: vi.fn(),
@@ -52,6 +57,7 @@ function approvedSettlementRow() {
     status: SettlementStatus.APPROVED,
     agentId: 'a-1',
     period: '2026-07',
+    commissionEarned: new Prisma.Decimal(50),
     prepaymentOffset: new Prisma.Decimal(50),
     notes: null,
     approvedAt: new Date('2026-07-01T00:00:00Z'),
@@ -129,6 +135,98 @@ describe('SettlementService.updateStatus · 并发 CAS 落空必须整体回滚�
     expect(tx.$queryRaw).not.toHaveBeenCalled();
     expect(tx.agent.update).not.toHaveBeenCalled();
     expect(tx.prepaymentTransaction.create).not.toHaveBeenCalled();
+  });
+});
+
+describe('SettlementService.updateStatus · P0 转 PAID 前复检退款冲销（绑定记录已被外部翻 REVERSED）', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('绑定记录里仍为 ACCRUED 的总额 < 生成时存的 commissionEarned → 400 拒付，且不翻 SETTLED', async () => {
+    const service = new SettlementService();
+    mockedPrisma.settlement.findUnique.mockResolvedValue(approvedSettlementRow()); // commissionEarned=50
+
+    const tx = makeTxMock(1); // CAS 命中
+    // 本单绑定记录里"仍为 ACCRUED"的总额只剩 0：说明原本计入 50 的那条已经被外部
+    // （orders.service 的退款/取消流程）翻成了 REVERSED，但 settlementId 没被清空。
+    tx.commissionRecord.aggregate.mockResolvedValue({ _sum: { amount: null } });
+    mockedPrisma.$transaction.mockImplementation(async (cb: (t: unknown) => unknown) => cb(tx));
+
+    await expect(
+      service.updateStatus('s-1', SettlementStatus.PAID, ADMIN),
+    ).rejects.toMatchObject({ message: expect.stringContaining('已冲销佣金') });
+
+    // 复检先于翻 SETTLED：一旦拒付，绝不再碰 records
+    expect(tx.commissionRecord.aggregate).toHaveBeenCalledWith({
+      where: { settlementId: 's-1', status: CommissionStatus.ACCRUED },
+      _sum: { amount: true },
+    });
+    expect(tx.commissionRecord.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('绑定记录里仍为 ACCRUED 的总额 = commissionEarned（未被冲销）→ 正常放行，翻 SETTLED', async () => {
+    const service = new SettlementService();
+    mockedPrisma.settlement.findUnique.mockResolvedValue(approvedSettlementRow()); // commissionEarned=50
+
+    const tx = makeTxMock(1);
+    tx.commissionRecord.aggregate.mockResolvedValue({ _sum: { amount: new Prisma.Decimal(50) } });
+    tx.commissionRecord.updateMany.mockResolvedValue({ count: 1 });
+    tx.settlement.findUniqueOrThrow.mockResolvedValue(serializableSettlement());
+    mockedPrisma.$transaction.mockImplementation(async (cb: (t: unknown) => unknown) => cb(tx));
+
+    await expect(
+      service.updateStatus('s-1', SettlementStatus.PAID, ADMIN),
+    ).resolves.toBeTruthy();
+
+    expect(tx.commissionRecord.updateMany).toHaveBeenCalledWith({
+      where: { settlementId: 's-1', status: CommissionStatus.ACCRUED },
+      data: { status: CommissionStatus.SETTLED, settledAt: expect.any(Date) },
+    });
+  });
+
+  it('负数补偿记录合法绑定（未曾计入 commissionEarned）不触发拒付——不是"只要绑了 REVERSED 就拒绝"', async () => {
+    // 场景：本单 commissionEarned=50 全部来自仍是 ACCRUED 的记录；另有一条负数补偿记录
+    // （从生成那一刻起就是 REVERSED，从未计入 commissionEarned）也绑在本单上——
+    // 仍为 ACCRUED 的总额（50）与 commissionEarned（50）相等，不应被当成"过期"拦下。
+    const service = new SettlementService();
+    mockedPrisma.settlement.findUnique.mockResolvedValue(approvedSettlementRow());
+
+    const tx = makeTxMock(1);
+    tx.commissionRecord.aggregate.mockResolvedValue({ _sum: { amount: new Prisma.Decimal(50) } });
+    tx.commissionRecord.updateMany.mockResolvedValue({ count: 1 });
+    tx.settlement.findUniqueOrThrow.mockResolvedValue(serializableSettlement());
+    mockedPrisma.$transaction.mockImplementation(async (cb: (t: unknown) => unknown) => cb(tx));
+
+    await expect(
+      service.updateStatus('s-1', SettlementStatus.PAID, ADMIN),
+    ).resolves.toBeTruthy();
+  });
+});
+
+describe('SettlementService.updateStatus · VOIDED 解绑范围覆盖 ACCRUED 与 REVERSED（此前只解绑 ACCRUED）', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('VOIDED 时 commissionRecord.updateMany 的 where 必须同时命中 ACCRUED 与 REVERSED', async () => {
+    const service = new SettlementService();
+    mockedPrisma.settlement.findUnique.mockResolvedValue(approvedSettlementRow());
+
+    const tx = makeTxMock(1);
+    tx.commissionRecord.updateMany.mockResolvedValue({ count: 2 });
+    tx.settlement.findUniqueOrThrow.mockResolvedValue(serializableSettlement());
+    mockedPrisma.$transaction.mockImplementation(async (cb: (t: unknown) => unknown) => cb(tx));
+
+    await service.updateStatus('s-1', SettlementStatus.VOIDED, ADMIN);
+
+    expect(tx.commissionRecord.updateMany).toHaveBeenCalledWith({
+      where: {
+        settlementId: 's-1',
+        status: { in: [CommissionStatus.ACCRUED, CommissionStatus.REVERSED] },
+      },
+      data: { settlementId: null, settledAt: null },
+    });
   });
 });
 

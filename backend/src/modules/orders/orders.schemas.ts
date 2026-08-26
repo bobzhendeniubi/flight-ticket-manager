@@ -570,6 +570,21 @@ export const quoteOrderBodySchema = z.object({
   passengers: z.array(quotePassengerOptionSchema).max(20).optional(),
   // ADMIN/STAFF 试算代理订单时传入归属代理；不传则按散客口径试算。
   agentId: z.string().min(1).optional(),
+  // 手工价通道字段（形状抄 createOrderBodySchema 对应字段）：录单页填了这些字段后随试算一起
+  // 发送，quoteOrder 服务层据此与 createOrder 同口径判定「是否存在手工价通道」，抑制一个真下单
+  // 时并不会生效的自动立减（同业/代理）——此前 schema 未暴露这三个字段，路由层 parse 时会被
+  // 静默剥掉，运营在试算里看到的立减和真下单的结果对不上。
+  priceAdjustment: priceAdjustmentSchema.optional(),
+  settlementTotalCny: z
+    .number()
+    .min(0, '结算总价不能为负')
+    .refine((v) => Number(v.toFixed(2)) === v, { message: '结算总价最多两位小数（元）' })
+    .optional(),
+  flightSettlementPriceCny: z
+    .number()
+    .min(0)
+    .max(SETTLEMENT_PRICE_CAP_CNY)
+    .optional(),
 });
 export type QuoteOrderBody = z.infer<typeof quoteOrderBodySchema>;
 
@@ -926,8 +941,8 @@ export const batchCreateOrdersBodySchema = z
   });
 export type BatchCreateOrdersBody = z.infer<typeof batchCreateOrdersBodySchema>;
 
-// ── 售后改单：改期（reschedule）─────────────────────────────────────────────
-// PATCH /orders/:id/reschedule（ADMIN/STAFF）：把某条 FLIGHT 行就地改到新班次/新舱位 + 可选改期费。
+// ── 售后改单：改期（reschedule）/ 换人（passenger swap）的费用口径 ──────────────
+// PATCH /orders/:id/reschedule（ADMIN/STAFF）：把某条 FLIGHT 行就地改到新班次 + 可选改期差价。
 const postSaleFeeSchema = z
   .number()
   .int('费用必须为整数（CNY）')
@@ -935,12 +950,24 @@ const postSaleFeeSchema = z
   .max(POST_SALE_FEE_CAP_CNY, `费用超出上限（${POST_SALE_FEE_CAP_CNY}）`)
   .optional();
 
+// 改期差价：整数 CNY，**可正可负**（改到贵班次补差 / 改到便宜班次退差），±上限同售后费。
+// 与换人费（postSaleFeeSchema，只增不减）分开：换人是一次性服务收费，改期是两张票的价差，
+// 天然双向。口径与换酒店差价 / 酒店改期差价一致，只是这里仍接受 0 与缺省
+//（= 只搬班次不动钱，改期最常见的用法，不该逼运营在留空与传 0 之间二选一）。
+const rescheduleFeeSchema = z
+  .number()
+  .int('差价必须为整数（CNY）')
+  .refine((v) => Math.abs(v) <= POST_SALE_FEE_CAP_CNY, {
+    message: `差价超出上限（±${POST_SALE_FEE_CAP_CNY}）`,
+  })
+  .optional();
+
 export const rescheduleOrderBodySchema = z.object({
   orderItemId: z.string().min(1, 'orderItemId 必填'),
   newScheduleId: z.string().min(1, 'newScheduleId 必填'),
   newCabin: z.nativeEnum(CabinClass).optional(), // 缺省沿用原舱位
-  feeCny: postSaleFeeSchema, // 改期费（CNY，整数；0/缺省=不收）
-  feeLabel: z.string().max(120).optional(), // 自定义费用名（缺省"改期费"）
+  feeCny: rescheduleFeeSchema, // 改期差价（CNY，整数，可正可负；0/缺省=不调整价格）
+  feeLabel: z.string().max(120).optional(), // 自定义费用名（缺省"改期差价"）
   note: z.string().max(500).optional(),
 });
 export type RescheduleOrderBody = z.infer<typeof rescheduleOrderBodySchema>;
@@ -967,7 +994,10 @@ export const swapPassengerBodySchema = z
     // 中文姓名（护照扩展字段；下单时已支持，此处补录/编辑用同一约束）
     chineseName: z.string().max(120).optional(),
     documentNumber: z.string().max(60).optional(),
-    dateOfBirth: z.string().optional(), // ISO 日期字符串
+    // YYYY-MM-DD（与建单 passengerInputSchema / selfUpdatePassengerBodySchema 同款正则）：
+    // 此前只校验 z.string()，带时区的完整 ISO 串（如 1990-01-01T00:00:00+08:00）会被 new Date()
+    // 折成 UTC 前一天，换人/改生日把出生日期悄悄改错一天。
+    dateOfBirth: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
     gender: z.nativeEnum(Gender).optional(),
     // 国籍：换人时的新出行人国籍。证件号变化（= 真换人）时「建议必填」——新出行人不应沿用旧国籍。
     //   注：Zod superRefine 只能硬性 400，而「建议必填」是软约束（不改现有不传国籍即换人的行为、不误伤既有

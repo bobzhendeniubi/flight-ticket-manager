@@ -62,6 +62,9 @@ vi.mock('../../db/prisma.js', () => ({ prisma: mockPrisma }));
 vi.mock('../hotel-control/hotel-control.service.js', () => ({
   assertHotelPhysicalFit: vi.fn(),
   assertRandomTierFit: vi.fn(),
+  // 事务内带行锁版（建单/改日期的权威判定走它）：桩与真模块导出对齐，
+  // 少一个键会在真走到随机档路径时炸成 "not a function"。
+  assertRandomTierFitWithinTx: vi.fn(),
   checkHotelPhysicalFit: vi.fn(),
   getHotelNightlyRemaining: mockGetHotelNightlyRemaining,
   getRandomTierAggregate: vi.fn(),
@@ -106,6 +109,7 @@ function flightItem(overrides: Record<string, unknown> = {}) {
 function buildOrder(overrides: Record<string, unknown> = {}) {
   return {
     id: 'ord1',
+    orderNumber: 'ORD-001',
     status: OrderStatus.PENDING_PAYMENT,
     userId: 'user1',
     agentId: null,
@@ -378,6 +382,9 @@ describe('OrderService._updateStatusWithinTx · 退款申请即时释放与驳�
     mockPrisma.refund.aggregate.mockResolvedValue({ _sum: { amount: null } });
     mockPrisma.refund.findMany.mockResolvedValue([]);
     mockPrisma.refund.updateMany.mockResolvedValue({ count: 0 });
+    // 进 REFUND_REQUESTED 的账目闸：本组用例都发生在「已经走过取消流程、Refund 已建」之后，
+    // 所以默认给一条待处理退款。闸本身另有专门用例（orders.status-account-guards.test.ts）。
+    mockPrisma.refund.count.mockResolvedValue(1);
     mockPrisma.commissionRecord.findMany.mockResolvedValue([]);
   });
 

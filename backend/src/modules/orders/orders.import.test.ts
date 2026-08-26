@@ -412,6 +412,46 @@ describe('resolveOrderImport · 匹配与批次汇总', () => {
   });
 });
 
+// ── passengerType 派生（按出生日期 + 出发日，同 pnr-export.ts derivePtcByAge 口径）──
+describe('parseOrderImportXlsx · passengerType 按年龄派生', () => {
+  it('出发日与出生日期相差 38 年 → 成人', async () => {
+    const b64 = await rowsToXlsxBase64([
+      ONEWAY_HEADER,
+      onewayRow({ date: '2026-08-15', dob: '15-07-1988', docNumber: 'E00000061' }),
+    ]);
+    const out = await parseOrderImportXlsx(b64);
+    expect(out.rows[0].passenger.passengerType).toBe('ADULT');
+  });
+
+  it('出发日与出生日期相差 6 年 → 儿童', async () => {
+    const b64 = await rowsToXlsxBase64([
+      ONEWAY_HEADER,
+      onewayRow({ date: '2026-08-15', dob: '15-08-2020', docNumber: 'E00000062' }),
+    ]);
+    const out = await parseOrderImportXlsx(b64);
+    expect(out.rows[0].passenger.passengerType).toBe('CHILD');
+  });
+
+  it('出发日与出生日期相差 1 年 → 婴儿（名单导入此前落库一律按成人，多收钱+虚占座）', async () => {
+    const b64 = await rowsToXlsxBase64([
+      ONEWAY_HEADER,
+      onewayRow({ date: '2026-08-15', dob: '15-08-2025', docNumber: 'E00000063' }),
+    ]);
+    const out = await parseOrderImportXlsx(b64);
+    expect(out.rows[0].passenger.passengerType).toBe('INFANT');
+  });
+
+  it('出生日期缺失/无法解析 → 不设 passengerType，沿用建单侧默认值（成人）', async () => {
+    const b64 = await rowsToXlsxBase64([
+      ONEWAY_HEADER,
+      onewayRow({ dob: '05-06-07', docNumber: 'E00000064' }), // 歧义日期，拒收
+    ]);
+    const out = await parseOrderImportXlsx(b64);
+    expect(out.rows[0].passenger.dateOfBirth).toBeUndefined();
+    expect(out.rows[0].passenger.passengerType).toBeUndefined();
+  });
+});
+
 // ── matchCabinText 单点 ───────────────────────────────────────────────────
 describe('matchCabinText', () => {
   it('常见写法全覆盖', () => {

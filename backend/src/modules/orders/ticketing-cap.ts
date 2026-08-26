@@ -53,6 +53,17 @@ const COUNTED_STATUSES: OrderStatus[] = [
   OrderStatus.CHANGED,
 ];
 
+/**
+ * 该订单状态是否占用班次开票额度（= COUNTED_STATUSES 成员）。
+ *
+ * 导出供状态流转复用：订单被 force 从取消族拉回计数态时，它带着的开票标记会凭空补回额度，
+ * 需要在那一刻复检班次上限（见 orders.service `_updateStatusWithinTx` 的「取消族恢复」分支）。
+ * 用函数而不是导出集合：口径判定只有一处实现，外部无从（也无需）自行拼这份状态清单。
+ */
+export function countsTowardTicketingCap(status: OrderStatus): boolean {
+  return COUNTED_STATUSES.includes(status);
+}
+
 const STATUS_LABEL: Record<OrderStatus, string> = {
   DRAFT: '草稿',
   PENDING_PAYMENT: '待付款',
