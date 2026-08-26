@@ -1427,13 +1427,16 @@ export async function getAlerts(
  *   ADD_ROOM_SUPPLEMENT     补收单房差（房数/房态相关的售后补收）
  *   RESCHEDULE_ORDER_ITEM   改期（改航班班次/出发日）——不落 hotelCheckIn/hotelCheckOut，
  *                           不改变销控板占房数字口径，但会改变出行日期，房控需要能看到这单动了。
- * 四者 targetType 均为 ORDER、targetId=订单 id、targetLabel=订单号。
+ *   RESCHEDULE_ORDER_ITEM_HOTEL  酒店改期（改 hotelCheckIn/hotelCheckOut → 占房整段从旧区间
+ *                           挪到新区间）——直接改动销控板逐晚占房，房控必须看得见。
+ * 五者 targetType 均为 ORDER、targetId=订单 id、targetLabel=订单号。
  */
 export const ROOM_CHANGE_ACTIONS = [
   'UPDATE_ROOM_ASSIGNMENT',
   'SWAP_ORDER_ITEM_HOTEL',
   'ADD_ROOM_SUPPLEMENT',
   'RESCHEDULE_ORDER_ITEM',
+  'RESCHEDULE_ORDER_ITEM_HOTEL',
 ] as const;
 
 /** 近期用房变更返回上限（条）。*/
@@ -1444,6 +1447,7 @@ const ROOM_CHANGE_ACTION_LABELS: Record<string, string> = {
   SWAP_ORDER_ITEM_HOTEL: '换酒店',
   ADD_ROOM_SUPPLEMENT: '补收单房差',
   RESCHEDULE_ORDER_ITEM: '改期',
+  RESCHEDULE_ORDER_ITEM_HOTEL: '酒店改期',
 };
 
 export interface HotelRoomChangeEntry {
@@ -1510,6 +1514,19 @@ function summarizeRoomChange(action: string, before: unknown, after: unknown): s
       return `补收单房差 ${perNight}元 × ${nights} 晚${amount != null ? ` = ${amount} 元` : ''}`;
     }
     return '补收单房差';
+  }
+  if (action === 'RESCHEDULE_ORDER_ITEM_HOTEL') {
+    // before/after.checkIn|checkOut 是 YYYY-MM-DD（date-only 字段，writeAudit 落库时已是纯日期串）。
+    const fromIn = readStr(b.checkIn);
+    const fromOut = readStr(b.checkOut);
+    const toIn = readStr(a.checkIn);
+    const toOut = readStr(a.checkOut);
+    const nights = readNum(a.nights);
+    if (fromIn && fromOut && toIn && toOut) {
+      return `酒店改期 ${fromIn}~${fromOut} → ${toIn}~${toOut}${nights != null ? `（${nights} 晚）` : ''}`;
+    }
+    if (toIn && toOut) return `酒店改期至 ${toIn}~${toOut}`;
+    return '酒店改期';
   }
   if (action === 'RESCHEDULE_ORDER_ITEM') {
     // before/after.departure 是 writeAudit 落库时 Date.toISOString() 的完整 ISO8601 串（非 @db.Date）。

@@ -106,6 +106,7 @@ import type {
   PublicOrderLookupQuery,
   QuoteOrderBody,
   SettlementPreview,
+  RescheduleItemHotelBody,
   SelfUpdatePassengerBody,
   SwapItemHotelBody,
   UpdateItemSettlementPriceBody,
@@ -4459,9 +4460,15 @@ export class OrderService {
   }
 
   /**
-   * B4 改结算价（路由层限 ADMIN/STAFF）：建单后订正某条 FLIGHT 行的每张结算价。
-   * 仅允许 kind=FLIGHT；事务内把 item.unitPrice 设为新价、amount=round2(unitPrice×quantity)，
-   * 再用所有订单行重算 order.subtotal/total（taxesAndFees/discountTotal 不动）。
+   * B4 改结算价（路由层限 ADMIN/STAFF）：建单后订正某条 FLIGHT / HOTEL 行的结算价。
+   * 仅允许 kind ∈ {FLIGHT, HOTEL}；事务内把 item.unitPrice 设为新价、按该 kind 的计价口径
+   * 重算 amount，再用所有订单行重算 order.subtotal/total（taxesAndFees/discountTotal 不动）。
+   *
+   * 计价口径（与建单一致，见 computeGroundItemAmounts）：
+   *   - FLIGHT：unitPrice = 每张票价，amount = unitPrice × quantity（quantity=张数）。
+   *   - HOTEL ：unitPrice = 每间每晚价，amount = unitPrice × quantity × roomsBilled
+   *             （quantity=晚数，roomsBilled 可为 0.5 拼房；缺省按 1 间）。
+   *             漏乘房数会让多间/拼房的单订酒店单直接算错金额，故必须带上这个乘数。
    *
    * 这是「基础价订正」，不走 adjustmentCny（那是售后费用，改期费/换人费才用）。
    * 尾款（serializeOrder 的 balanceDue = total + adjustmentCny − paidAmount − prepaymentOffset）随 total 自然更新。
@@ -4531,19 +4538,32 @@ export class OrderService {
       // 锁**之后**才读 items：锁之前读到的快照可能已被并发改价写脏，拿它重算等于锁了个寂寞。
       const items = await tx.orderItem.findMany({
         where: { orderId },
-        select: { id: true, kind: true, quantity: true, unitPrice: true, amount: true },
+        select: {
+          id: true,
+          kind: true,
+          quantity: true,
+          unitPrice: true,
+          amount: true,
+          // HOTEL 行的 amount 乘数（每间每晚价 × 晚数 × 房数）；FLIGHT 行为 null，不参与计算。
+          roomsBilled: true,
+        },
       });
       const target = items.find((it) => it.id === itemId);
       if (!target) {
         throw new NotFoundError('订单项不存在或不属于该订单');
       }
-      if (target.kind !== OrderItemKind.FLIGHT) {
-        throw new BadRequestError('只能对机票行（FLIGHT）改结算价');
+      if (target.kind !== OrderItemKind.FLIGHT && target.kind !== OrderItemKind.HOTEL) {
+        throw new BadRequestError('只能对机票行（FLIGHT）或酒店行（HOTEL）改结算价');
       }
 
       const beforeUnitPrice = target.unitPrice.toString();
       const beforeAmount = target.amount.toString();
-      const newAmount = round2(unitPriceCny * target.quantity);
+      // 房数乘数：仅 HOTEL 行有（roomsBilled 可为 0.5 拼房，缺省按 1 间——与建单同口径）。
+      const roomsMultiplier =
+        target.kind === OrderItemKind.HOTEL && target.roomsBilled != null
+          ? Number(target.roomsBilled.toString())
+          : 1;
+      const newAmount = round2(unitPriceCny * target.quantity * roomsMultiplier);
 
       await tx.orderItem.update({
         where: { id: itemId },
@@ -7362,10 +7382,14 @@ export class OrderService {
     let newDescription = item.description;
     if (item.kind === OrderItemKind.HOTEL && item.hotelCheckIn && item.hotelCheckOut) {
       const roomsLabel = Number.isInteger(roomsBilled) ? String(roomsBilled) : roomsBilled.toFixed(1);
+      // 晚数以住宿区间为准（nightDates 就是 [checkIn, checkOut) 逐晚展开），不用 item.quantity ——
+      // quantity 是**计价乘数**，酒店改期按「行价冻结」不动它，改完期后它可能已不等于真实晚数；
+      // 拿它重建描述会把旧晚数又写回去。区间异常（nightDates 为空）时才回退到 quantity。
+      const nightsLabel = nightDates.length > 0 ? nightDates.length : item.quantity;
       newDescription =
         `${newRoomType.hotel.name} · ${newRoomType.name} · ` +
         `${formatDateOnly(item.hotelCheckIn)}~${formatDateOnly(item.hotelCheckOut)} · ` +
-        `${item.quantity}晚 × ${roomsLabel}间`;
+        `${nightsLabel}晚 × ${roomsLabel}间`;
     }
 
     const scratch = await prisma.$transaction(async (tx) => {
@@ -7617,6 +7641,270 @@ export class OrderService {
           unitCostCny: afterUnitCostCny,
           totalCostCny: afterTotalCostCny,
         },
+        feeCny,
+        untrackedNights: scratch.untrackedNights,
+      },
+    };
+  }
+
+  /**
+   * 酒店改期：把某条 HOTEL 行的入住/退房日期整体挪到新区间。
+   *
+   * 与「换酒店」是一对姊妹能力：换酒店改的是「住哪」，改期改的是「住哪几晚」。房控占房本就
+   * 由订单行的 (hotelRoomTypeId, hotelCheckIn, hotelCheckOut, roomsBilled) 派生 —— 改写日期
+   * 这一步本身就等于「释放旧区间 + 占用新区间」，两件事在同一条 UPDATE 里原子完成，中间不存在
+   * 「旧的放了、新的还没占」的窗口；新区间余量不足则整事务回滚，旧区间的占房分毫未动。
+   *
+   * body：{ newCheckIn, newCheckOut, feeCny?, feeLabel?, note? }
+   *   - itemId 必须属于本订单且 kind=HOTEL（BUNDLE 行的住宿日期由套餐行程决定，不从这里单独挪）。
+   *   - newCheckOut 必须晚于 newCheckIn；跨度超出住宿上限（见 buildStayNightDates）→ 拒绝。
+   *   - 新旧区间完全相同 → 400（无意义改期）。
+   *
+   * 定价哲学（甲案，与换酒店的"价格默认冻结"同一套）：
+   *   **行价与数量一个字不动** —— unitPrice / amount / quantity(晚数计价乘数) / roomsBilled 全部冻结，
+   *   绝不因晚数变化自动加钱或退钱。晚数变了要收/退的差额，由 feeCny 走售后费行
+   *   （adjustmentCny + adjustments 流水，label 缺省「酒店改期差价」），与改期费/换人费/换酒店差价
+   *   同一机制，计入订单应收。这样「系统自动算的钱」和「人工确认的钱」始终泾渭分明。
+   *
+   * 房控库存（新区间必须装得下，否则整体拒绝）：
+   *   - 具体酒店行（有 hotelRoomTypeId）：先锁目标酒店该区间的包房周期行（并发互斥的唯一正解），
+   *     再走物理房间口径前瞻闸。`excludeOrderId` 排除本单自身占房 —— 对同酒店改期而言，这正是
+   *     「先释放旧区间」的效果（口径与换酒店一致；本单在该酒店的其它 HOTEL 行也会被一并排除，
+   *     与换酒店同一已知口径）。
+   *   - 未落位随机档行（randomStarTier 非空、无房型）：走随机档聚合余量闸（Σ同星级真酒店余量 −
+   *     未落位占用），口径与下单/落位一致。
+   *
+   * description 里的日期段与晚数段按新区间就地改写（其余部分原样保留，见 rewriteHotelStayDescription）。
+   */
+  async rescheduleItemHotel(
+    orderId: string,
+    itemId: string,
+    input: RescheduleItemHotelBody,
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
+    order: ReturnType<typeof serializeOrder>;
+    audit: {
+      orderNumber: string;
+      orderItemId: string;
+      before: { checkIn: string; checkOut: string; nights: number };
+      after: { checkIn: string; checkOut: string; nights: number };
+      feeCny: number;
+      untrackedNights: string[];
+    };
+  }> {
+    // 权限口径与机票改期/换酒店完全一致（路由层也断言一次，双闸）。
+    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+      throw new ForbiddenError('仅运营/管理员可改酒店入住日期');
+    }
+    const feeCny = Math.trunc(input.feeCny ?? 0);
+
+    // ── 新区间解析与校验（date-only：与建单/房控同款 UTC 零点口径）──
+    // 逐字回读 ISO 日期：`2026-02-31` 这类不存在的日期会被 Date 悄悄顺延到 3 月，回读能揪出来。
+    const newCheckIn = new Date(`${input.newCheckIn}T00:00:00.000Z`);
+    const newCheckOut = new Date(`${input.newCheckOut}T00:00:00.000Z`);
+    if (
+      Number.isNaN(newCheckIn.getTime()) ||
+      newCheckIn.toISOString().slice(0, 10) !== input.newCheckIn
+    ) {
+      throw new BadRequestError('入住日期无效');
+    }
+    if (
+      Number.isNaN(newCheckOut.getTime()) ||
+      newCheckOut.toISOString().slice(0, 10) !== input.newCheckOut
+    ) {
+      throw new BadRequestError('退房日期无效');
+    }
+    if (newCheckOut.getTime() <= newCheckIn.getTime()) {
+      throw new BadRequestError('退房日期必须晚于入住日期');
+    }
+    const nightDates = buildStayNightDates(newCheckIn, newCheckOut);
+    if (nightDates.length === 0) {
+      throw new BadRequestError(`住宿区间过长（最多 ${MAX_STAY_NIGHTS} 晚），请核对入住/退房日期`);
+    }
+    const newNights = nightDates.length;
+
+    const item = await prisma.orderItem.findUnique({
+      where: { id: itemId },
+      select: {
+        id: true,
+        orderId: true,
+        kind: true,
+        description: true,
+        hotelRoomTypeId: true,
+        randomStarTier: true,
+        hotelCheckIn: true,
+        hotelCheckOut: true,
+        roomsBilled: true,
+      },
+    });
+    if (!item || item.orderId !== orderId) {
+      throw new NotFoundError('订单项不存在或不属于该订单');
+    }
+    // BUNDLE 行的住宿日期跟着套餐行程走（由去/回程日期盖章），单独挪它会与航段脱钩 —— 一律拒绝。
+    if (item.kind !== OrderItemKind.HOTEL) {
+      throw new BadRequestError('只能对酒店行（HOTEL）改期');
+    }
+    if (!item.hotelCheckIn || !item.hotelCheckOut) {
+      throw new BadRequestError('该酒店行没有入住/退房日期，无法改期');
+    }
+    if (!item.hotelRoomTypeId && item.randomStarTier == null) {
+      throw new BadRequestError('该行不含酒店，无法改期');
+    }
+    const beforeCheckIn = formatDateOnly(item.hotelCheckIn);
+    const beforeCheckOut = formatDateOnly(item.hotelCheckOut);
+    if (beforeCheckIn === input.newCheckIn && beforeCheckOut === input.newCheckOut) {
+      throw new BadRequestError('新入住/退房日期与当前相同，无需改期');
+    }
+    const beforeNights = buildStayNightDates(item.hotelCheckIn, item.hotelCheckOut).length;
+
+    const roomsBilled = item.roomsBilled != null ? Number(item.roomsBilled.toString()) : 1;
+    // 具体酒店行要按酒店维度锁包房周期 + 判物理余量；随机档行没有落到酒店，走聚合闸。
+    const roomType = item.hotelRoomTypeId
+      ? await prisma.hotelRoomType.findUnique({
+          where: { id: item.hotelRoomTypeId },
+          select: { id: true, hotelId: true },
+        })
+      : null;
+    if (item.hotelRoomTypeId && !roomType) {
+      throw new NotFoundError('酒店房型数据异常，无法改期');
+    }
+
+    const newDescription = rewriteHotelStayDescription(item.description, {
+      checkIn: input.newCheckIn,
+      checkOut: input.newCheckOut,
+      nights: newNights,
+    });
+
+    const scratch = await prisma.$transaction(async (tx) => {
+      // Order 行锁：与换酒店/机票改期/换人/到账入账同一把锁 —— adjustmentCny 是读-改-写，
+      // 无锁并发会互相覆盖（少收一笔）。同时也让状态流转与本次改期严格串行。
+      const lockRows = await tx.$queryRaw<Array<{ id: string }>>`
+        SELECT id FROM "Order" WHERE id = ${orderId} FOR UPDATE
+      `;
+      if (lockRows.length === 0) throw new NotFoundError('订单不存在');
+
+      const order = await tx.order.findUnique({
+        where: { id: orderId },
+        select: {
+          id: true,
+          orderNumber: true,
+          status: true,
+          deletedAt: true,
+          adjustmentCny: true,
+          adjustments: true,
+          total: true,
+        },
+      });
+      if (!order) throw new NotFoundError('订单不存在');
+
+      // ── 有效订单双闸（与换酒店同款）──
+      // 改期会把占房挪到新区间、并可能通过 feeCny 改客户应付。死单/回收站单上改期 →
+      // 死单凭空占住真实房量，且长出一笔并不存在的「欠款」。
+      if (order.deletedAt) {
+        throw new BadRequestError('订单在回收站（已软删），不可改期；如需操作请先恢复');
+      }
+      if (!SEAT_HOLDING_STATUSES.includes(order.status)) {
+        throw new BadRequestError(
+          `订单当前状态（${zhStatus(order.status)}）不可改期：仅占座中的有效订单可改期（已取消/已退款/超时订单请勿改期）`,
+        );
+      }
+
+      // ── 新区间余量闸（事务内互斥版）──
+      let untrackedNights: string[] = [];
+      if (roomType) {
+        // 先锁目标区间的包房周期行，判定与下方写日期落库之间不留窗口，
+        // 否则两笔并发改期会各自读到「还剩 1 间」的旧快照双双通过。
+        await lockHotelBlockPeriodsWithinTx(tx, roomType.hotelId, nightDates);
+        const orderPassengers = await tx.passenger.findMany({
+          where: { orderId },
+          select: { gender: true },
+        });
+        const fit = await checkHotelPhysicalFit(
+          roomType.hotelId,
+          nightDates,
+          toProspectiveOccupancy(
+            roomsBilled,
+            orderPassengers.map((p) => ({ gender: p.gender ?? undefined })),
+          ),
+          // 排除本单自身占房 = 「先释放旧区间」；随后把本行房量按新区间加回去（prospective）。
+          { excludeOrderId: orderId },
+          tx,
+        );
+        if (fit.hasBlock) {
+          untrackedNights = nightDates.filter((_, i) => fit.block[i] === 0);
+          if (fit.violations.length > 0) {
+            const detail = fit.violations
+              .map(
+                (v) =>
+                  `${formatMonthDay(new Date(`${v.date}T00:00:00.000Z`))}实际房间不足（包房 ${v.block} 间，改到新日期后需 ${v.physicalUsed} 间）`,
+              )
+              .join('；');
+            throw new BadRequestError(detail);
+          }
+        } else {
+          // 整段没有任何包房周期 → 未纳入管控（房控哲学：未配包房 ≠ 售罄）
+          untrackedNights = [...nightDates];
+        }
+      } else {
+        // 未落位随机档行：按同星级聚合余量判定（口径同下单/落位）。
+        await assertRandomTierFit(item.randomStarTier!, nightDates, roomsBilled, {
+          excludeOrderId: orderId,
+        }, tx);
+      }
+
+      // ── 减价不能把应付冲成负数（与换酒店同一道闸）──
+      // 减价是合法操作，但没有下限就能把 effectivePayable（total + adjustmentCny）冲成负数，
+      // 账面上凭空「欠客户钱」，而这笔欠款并没有对应的退款流水。
+      if (feeCny < 0) {
+        const currentPayable = round2(Number(order.total.toString()) + order.adjustmentCny);
+        if (round2(currentPayable + feeCny) < 0) {
+          throw new BadRequestError('减价金额不能超过当前应付（最多减到应付为 0）');
+        }
+      }
+
+      // ── 1. 改写住宿区间 + description（金额/数量/间数/房型一律冻结）──
+      // 这一条 UPDATE 同时完成「释放旧区间」与「占用新区间」：房控占房完全由这几个字段派生。
+      await tx.orderItem.update({
+        where: { id: item.id },
+        data: {
+          hotelCheckIn: newCheckIn,
+          hotelCheckOut: newCheckOut,
+          description: newDescription,
+        },
+      });
+
+      // ── 2. 可选酒店改期差价（与改期费/换酒店差价同一 adjustmentCny 机制）──
+      if (feeCny !== 0) {
+        const log = appendAdjustment(order.adjustments, {
+          type: 'HOTEL_RESCHEDULE_FEE',
+          label: input.feeLabel || '酒店改期差价',
+          amountCny: feeCny,
+          at: new Date().toISOString(),
+          by: actor.userId,
+          note: input.note,
+        });
+        await tx.order.update({
+          where: { id: orderId },
+          data: { adjustmentCny: order.adjustmentCny + feeCny, adjustments: log },
+        });
+      }
+
+      return { orderNumber: order.orderNumber, untrackedNights };
+    });
+
+    const finalOrder = await prisma.order.findUniqueOrThrow({
+      where: { id: orderId },
+      include: ORDER_FULL_INCLUDE,
+    });
+
+    return {
+      // 对外脱敏：按操作者角色脱敏（ADMIN/STAFF 全量，其余剥离内部字段 + 逐项拆价）。
+      order: serializeOrder(finalOrder, orderSerializeRoleCtx(actor.role)),
+      audit: {
+        orderNumber: scratch.orderNumber,
+        orderItemId: item.id,
+        before: { checkIn: beforeCheckIn, checkOut: beforeCheckOut, nights: beforeNights },
+        after: { checkIn: input.newCheckIn, checkOut: input.newCheckOut, nights: newNights },
         feeCny,
         untrackedNights: scratch.untrackedNights,
       },
@@ -8788,6 +9076,31 @@ export function buildStayNightDates(checkIn: Date, checkOut: Date): string[] {
   return Array.from({ length: nights }, (_, i) =>
     new Date(startMs + i * DAY_MS).toISOString().slice(0, 10),
   );
+}
+
+/**
+ * 把 HOTEL 行 description 里的「日期段」与「晚数段」就地改写成新住宿区间，其余部分原样保留。
+ *
+ * 为什么用就地改写而不是整条重建：HOTEL 行的 description 历史上有多种形态 ——
+ *   · 建单/换酒店：`酒店名 · 房型 · 2026-09-01~2026-09-04 · 3晚 × 1间`
+ *   · 后台补录房费：`酒店名 · 房型 × 3晚 × 1间`（没有日期段）
+ *   · 更老的存量单：可能是运营手填的自由文本
+ * 整条重建会把手填信息冲掉，也会强行给本来没有日期段的行硬塞一段。就地改写只动确实存在的
+ * 那两段，其余（酒店名/房型/间数/手填备注）一个字不碰。
+ *
+ * 只替换第一处匹配：日期段与晚数段在这些格式里都只出现一次，全局替换反而会误伤备注里的日期。
+ * 两段都不存在（纯自由文本）→ 原样返回，不报错（描述只是展示，不是权威数据；权威在
+ * hotelCheckIn/hotelCheckOut 字段上）。
+ *
+ * 导出仅供单测使用。
+ */
+export function rewriteHotelStayDescription(
+  description: string,
+  stay: { checkIn: string; checkOut: string; nights: number },
+): string {
+  return description
+    .replace(/\d{4}-\d{2}-\d{2}\s*~\s*\d{4}-\d{2}-\d{2}/, `${stay.checkIn}~${stay.checkOut}`)
+    .replace(/\d+(?:\.\d+)?\s*晚/, `${stay.nights}晚`);
 }
 
 // ── 事务内酒店房量闸（新增真实占房的写路径统一入口）─────────────────────────

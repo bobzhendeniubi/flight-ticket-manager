@@ -35,6 +35,7 @@ import {
   upgradeItemCabinBodySchema,
   resolvePassengerPatchChannel,
   selfUpdatePassengerBodySchema,
+  rescheduleItemHotelBodySchema,
   swapItemHotelBodySchema,
   swapPassengerBodySchema,
   updateItemSettlementPriceBodySchema,
@@ -1803,7 +1804,8 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
 
   // ── B4 改结算价（ADMIN/STAFF）──
   // PATCH /orders/:id/items/:itemId/settlement-price  body: { unitPriceCny, reason? }
-  // 建单后订正某条 FLIGHT 行的每张结算价；事务内重算 order.subtotal/total（不走 adjustmentCny）。
+  // 建单后订正某条 FLIGHT 行（每张票价）或 HOTEL 行（每间每晚价）的结算价；
+  // 事务内按该 kind 的计价口径重算行金额与 order.subtotal/total（不走 adjustmentCny）。
   app.patch('/:id/items/:itemId/settlement-price', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
     if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
@@ -1946,6 +1948,40 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     void writeAudit({
       actor: actorFromRequest(req),
       action: 'SWAP_ORDER_ITEM_HOTEL',
+      targetType: 'ORDER',
+      targetId: id,
+      targetLabel: audit.orderNumber,
+      before: { orderItemId: audit.orderItemId, ...audit.before },
+      after: {
+        ...audit.after,
+        feeCny: audit.feeCny,
+        untrackedNights: audit.untrackedNights,
+        note: body.note,
+      },
+      severity: 'WARNING',
+    });
+    return { order };
+  });
+
+  // ── 售后改单：酒店改期（ADMIN/STAFF）──
+  // PATCH /orders/:id/items/:itemId/hotel-reschedule  body: { newCheckIn, newCheckOut, feeCny?, feeLabel?, note? }
+  // 把某条 HOTEL 行的入住/退房日期整体挪到新区间（占房同一条 UPDATE 里从旧区间转到新区间，
+  // 新区间余量不足则整事务回滚）。行价冻结：晚数变化不重算 unitPrice/amount/quantity，
+  // 差额由可选的 feeCny 走售后费行（缺省名「酒店改期差价」）。
+  app.patch('/:id/items/:itemId/hotel-reschedule', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅运营/管理员可改酒店入住日期' });
+    }
+    const { id, itemId } = req.params as { id: string; itemId: string };
+    const body = rescheduleItemHotelBodySchema.parse(req.body);
+    const { order, audit } = await service.rescheduleItemHotel(id, itemId, body, {
+      userId: req.user.sub,
+      role,
+    });
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'RESCHEDULE_ORDER_ITEM_HOTEL',
       targetType: 'ORDER',
       targetId: id,
       targetLabel: audit.orderNumber,

@@ -38,6 +38,7 @@ const ORDER_ACTION_LABELS: Record<string, string> = {
   // ── 乘客 / 酒店 / 分房 ──
   SWAP_ORDER_PASSENGER: '换人',
   SWAP_ORDER_ITEM_HOTEL: '更换酒店',
+  RESCHEDULE_ORDER_ITEM_HOTEL: '酒店改期',
   UPDATE_ROOM_ASSIGNMENT: '调整分房',
   ADD_ROOM_SUPPLEMENT: '补收单房差',
   FORCE_DUPLICATE_PASSENGERS: '强制放行重复乘客',

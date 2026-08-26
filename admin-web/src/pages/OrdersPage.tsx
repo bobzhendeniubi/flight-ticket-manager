@@ -5334,12 +5334,20 @@ function OrderItemRow({
   const [rescheduling, setRescheduling] = useState(false);
   const [editingPrice, setEditingPrice] = useState(false);
   const [swappingHotel, setSwappingHotel] = useState(false);
+  const [reschedulingHotel, setReschedulingHotel] = useState(false);
   const [upgradingCabin, setUpgradingCabin] = useState(false);
   const isFlight = item.kind === 'FLIGHT';
   // 升舱入口：只有**经济舱**机票行能一键升商务舱；套餐机票腿（带 bundleId）走套餐自身的升舱份数模型，后端也会拒。
   const canUpgradeCabin = isFlight && item.flightCabin === 'ECONOMY' && !item.bundleId;
   // HOTEL 行，或已盖章酒店房型的 BUNDLE 行（套餐没有独立 HOTEL 行，酒店盖在 BUNDLE 行上）
   const isHotelRow = item.kind === 'HOTEL' || (item.kind === 'BUNDLE' && Boolean(item.hotelRoomTypeId));
+  // 单订酒店行（非套餐）：可改结算价（每间每晚价）与改期（挪住宿区间）。
+  // 套餐的住宿日期跟着行程走，不从这里单独挪，故 BUNDLE 行不给这两个入口（后端也会拒）。
+  const isPlainHotelRow = item.kind === 'HOTEL';
+  const canRescheduleHotel =
+    isPlainHotelRow && Boolean(item.hotelCheckIn) && Boolean(item.hotelCheckOut);
+  // 改结算价：机票行改每张票价，单订酒店行改每间每晚价（后端按各自口径重算行金额）。
+  const canEditPrice = Boolean(canEditSettlementPrice) && (isFlight || isPlainHotelRow);
   // 航变：管理员因航变换过班次的机票行，标红醒目提示，悬浮看原班次→新班次
   const flightChanged = readFlightChanged(item.metadata);
   const changedHint = flightChanged
@@ -5422,7 +5430,7 @@ function OrderItemRow({
               升舱
             </button>
           )}
-          {isFlight && canEditSettlementPrice && !rescheduling && !editingPrice && (
+          {canEditPrice && !rescheduling && !editingPrice && (
             <>
               <button
                 className="text-[11px] font-medium text-amber-600 hover:text-amber-800 disabled:cursor-not-allowed disabled:text-slate-400"
@@ -5441,6 +5449,15 @@ function OrderItemRow({
               onClick={() => setSwappingHotel(true)}
             >
               换酒店
+            </button>
+          )}
+          {canRescheduleHotel && !reschedulingHotel && !editingPrice && (
+            <button
+              className="text-[11px] font-medium text-brand hover:text-brand-dark"
+              onClick={() => setReschedulingHotel(true)}
+              title="挪住宿区间；房量不足会被拒绝"
+            >
+              改期
             </button>
           )}
         </div>
@@ -5467,14 +5484,27 @@ function OrderItemRow({
           }}
         />
       )}
-      {isFlight && editingPrice && (
+      {canEditPrice && editingPrice && (
         <SettlementPriceForm
           orderId={orderId}
           itemId={item.id}
           currentPrice={Number(item.unitPrice)}
+          // 机票=每张，单订酒店=每间每晚（后端按各自口径重算行金额，这里只是把口径说清楚）
+          priceUnitLabel={isPlainHotelRow ? '每间每晚' : '每张'}
           onCancel={() => setEditingPrice(false)}
           onSaved={(updated) => {
             setEditingPrice(false);
+            onOrderUpdated?.(updated);
+          }}
+        />
+      )}
+      {canRescheduleHotel && reschedulingHotel && (
+        <HotelRescheduleForm
+          orderId={orderId}
+          item={item}
+          onCancel={() => setReschedulingHotel(false)}
+          onSaved={(updated) => {
+            setReschedulingHotel(false);
             onOrderUpdated?.(updated);
           }}
         />
@@ -5772,17 +5802,20 @@ function RescheduleForm({
   );
 }
 
-// ── 改结算价（ADMIN）: 修订机票行单价 → 后端重算 order.total ────────────
+// ── 改结算价：修订机票行 / 单订酒店行单价 → 后端重算 order.total ────────────
 function SettlementPriceForm({
   orderId,
   itemId,
   currentPrice,
+  priceUnitLabel = '每张',
   onCancel,
   onSaved,
 }: {
   orderId: string;
   itemId: string;
   currentPrice: number;
+  /** 单价口径：机票行「每张」，单订酒店行「每间每晚」。只影响文案，金额口径由后端决定。 */
+  priceUnitLabel?: string;
   onCancel: () => void;
   onSaved: (order: OrderSummary) => void;
 }) {
@@ -5817,9 +5850,11 @@ function SettlementPriceForm({
 
   return (
     <div className="mt-2 space-y-2 rounded border border-amber-200 bg-amber-50/60 p-2 text-xs">
-      <div className="font-medium text-amber-800">改结算价（ADMIN）· 当前 ¥{currentPrice.toLocaleString()}</div>
+      <div className="font-medium text-amber-800">
+        改结算价 · 当前 ¥{currentPrice.toLocaleString()}／{priceUnitLabel}
+      </div>
       <label className="block">
-        <span className="text-slate-500">新单价（¥，必填，大于 0）</span>
+        <span className="text-slate-500">新单价（¥／{priceUnitLabel}，必填，大于 0）</span>
         <NumberInput
           value={newPrice}
           onChange={setNewPrice}
@@ -5860,6 +5895,169 @@ function SettlementPriceForm({
       </p>
     </div>
   );
+}
+
+// ── 酒店改期：把单订酒店行的住宿区间整体挪到新日期 ─────────────────────────
+// 后端「行价冻结」：晚数变了也不会自动改价（订单金额一分不动），要收/退的差额必须在这里手填，
+// 它会作为一条售后费（酒店改期差价）计入订单应收。占房在同一事务里从旧区间转到新区间，
+// 新区间房量不足会被整体拒绝（旧区间的占房不受影响）。
+function HotelRescheduleForm({
+  orderId,
+  item,
+  onCancel,
+  onSaved,
+}: {
+  orderId: string;
+  item: OrderItem;
+  onCancel: () => void;
+  onSaved: (order: OrderSummary) => void;
+}) {
+  const tokens = useAuth((s) => s.tokens);
+  const token = tokens?.accessToken ?? '';
+  // @db.Date 过 JSON 是完整 ISO 串，date input 只吃 YYYY-MM-DD → 一律 slice(0,10)。
+  const currentCheckIn = (item.hotelCheckIn ?? '').slice(0, 10);
+  const currentCheckOut = (item.hotelCheckOut ?? '').slice(0, 10);
+  const [checkIn, setCheckIn] = useState(currentCheckIn);
+  const [checkOut, setCheckOut] = useState(currentCheckOut);
+  const [feeCny, setFeeCny] = useState<number | null>(null);
+  const [note, setNote] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const nights = countNightsBetween(checkIn, checkOut);
+  const currentNights = countNightsBetween(currentCheckIn, currentCheckOut);
+  const unchanged = checkIn === currentCheckIn && checkOut === currentCheckOut;
+
+  async function submit(): Promise<void> {
+    if (!token || submitting) return;
+    setErr(null);
+    if (!checkIn || !checkOut) {
+      setErr('请填写新的入住与退房日期');
+      return;
+    }
+    if (nights === null) {
+      setErr('退房日期必须晚于入住日期');
+      return;
+    }
+    if (unchanged) {
+      setErr('新入住/退房日期与当前相同，无需改期');
+      return;
+    }
+    const feeHint =
+      feeCny != null && feeCny !== 0
+        ? `差价 ${feeCny > 0 ? '+' : '−'}¥${Math.abs(feeCny).toLocaleString()} 将计入订单应收。`
+        : '未填差价：订单金额保持不变（晚数变化不会自动改价）。';
+    if (
+      !confirm(
+        `确认把住宿改到 ${checkIn}~${checkOut}（${nights} 晚）？\n占房会从原区间挪到新区间，新区间房量不足会被拒绝。\n${feeHint}`,
+      )
+    ) {
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const res = await api.rescheduleItemHotel(token, orderId, item.id, {
+        newCheckIn: checkIn,
+        newCheckOut: checkOut,
+        feeCny: feeCny != null && feeCny !== 0 ? feeCny : undefined,
+        feeLabel: feeCny != null && feeCny !== 0 ? '酒店改期差价' : undefined,
+        note: note.trim() || undefined,
+      });
+      onSaved(res.order);
+    } catch (e: unknown) {
+      setErr(e instanceof ApiError ? e.message : '酒店改期失败');
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div className="mt-3 space-y-2 rounded-md border border-brand/40 bg-white p-3 text-xs">
+      <div className="font-medium text-brand">
+        酒店改期 · 当前 {currentCheckIn || '—'}~{currentCheckOut || '—'}
+        {currentNights !== null && `（${currentNights} 晚）`}
+      </div>
+
+      <div className="grid grid-cols-2 gap-2">
+        <label className="block">
+          <span className="text-slate-500">新入住日</span>
+          <input
+            type="date"
+            className="mt-0.5 w-full rounded border border-slate-300 px-2 py-1"
+            value={checkIn}
+            onChange={(e) => setCheckIn(e.target.value)}
+          />
+        </label>
+        <label className="block">
+          <span className="text-slate-500">新退房日</span>
+          <input
+            type="date"
+            className="mt-0.5 w-full rounded border border-slate-300 px-2 py-1"
+            value={checkOut}
+            onChange={(e) => setCheckOut(e.target.value)}
+          />
+        </label>
+      </div>
+      <div className="text-[11px] text-slate-500">
+        {nights === null ? '退房日期必须晚于入住日期' : `新区间 ${nights} 晚`}
+        {nights !== null && currentNights !== null && nights !== currentNights && (
+          <span className="text-amber-700">
+            {' '}
+            · 晚数由 {currentNights} 变为 {nights}，订单金额不会自动调整，请按需填写差价
+          </span>
+        )}
+      </div>
+
+      <label className="block">
+        <span className="text-slate-500">差价（¥，可选；可负，减价填负数）</span>
+        <NumberInput
+          value={feeCny}
+          onChange={setFeeCny}
+          integerOnly
+          placeholder="不调整价格则留空"
+          className="mt-0.5 w-full rounded border border-slate-300 px-2 py-1"
+        />
+      </label>
+
+      <label className="block">
+        <span className="text-slate-500">原因 / 备注（可选）</span>
+        <input
+          className="mt-0.5 w-full rounded border border-slate-300 px-2 py-1"
+          value={note}
+          onChange={(e) => setNote(e.target.value)}
+          placeholder="如：客户改行程 / 我方缺房调整"
+        />
+      </label>
+
+      {err && <div className="rounded bg-rose-50 px-2 py-1 text-rose-700">{err}</div>}
+
+      <div className="flex gap-2 pt-1">
+        <button
+          className="flex-1 rounded bg-brand px-2 py-1.5 font-medium text-white disabled:opacity-50"
+          onClick={submit}
+          disabled={submitting || nights === null || unchanged}
+        >
+          {submitting ? '改期中…' : '确认改期'}
+        </button>
+        <button
+          className="rounded bg-slate-100 px-3 py-1.5 text-slate-700 disabled:opacity-50"
+          onClick={onCancel}
+          disabled={submitting}
+        >
+          取消
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** 两个 YYYY-MM-DD 之间的晚数；非法/退房不晚于入住 → null（调用方据此拦提交）。 */
+function countNightsBetween(checkIn: string, checkOut: string): number | null {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(checkIn) || !/^\d{4}-\d{2}-\d{2}$/.test(checkOut)) return null;
+  const start = Date.parse(`${checkIn}T00:00:00.000Z`);
+  const end = Date.parse(`${checkOut}T00:00:00.000Z`);
+  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null;
+  return Math.round((end - start) / 86_400_000);
 }
 
 // ── 售后费用（改期费 / 换人费 / 换酒店差价）明细展示 ───────────────────────────────

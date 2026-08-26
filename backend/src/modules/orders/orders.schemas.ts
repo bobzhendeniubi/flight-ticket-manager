@@ -1079,6 +1079,21 @@ export const swapItemHotelBodySchema = z.object({
 });
 export type SwapItemHotelBody = z.infer<typeof swapItemHotelBodySchema>;
 
+// ── 售后改单：酒店改期（hotel reschedule）──────────────────────────────────
+// PATCH /orders/:id/items/:itemId/hotel-reschedule（ADMIN/STAFF）：把某条 HOTEL 行的
+// 入住/退房日期整体挪到新区间（房控占房随之从旧区间释放、落到新区间）。
+// 定价哲学与换酒店同一套：**行价冻结** —— 晚数变了也绝不重算 unitPrice/amount/quantity，
+// 差额由 feeCny 走售后费（与改期费/换人费/换酒店差价同一 adjustmentCny 机制）。
+// feeCny 复用换酒店那条（整数、可正可负、±上限、显式拒绝 0）。
+export const rescheduleItemHotelBodySchema = z.object({
+  newCheckIn: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, '入住日期格式应为 YYYY-MM-DD'),
+  newCheckOut: z.string().regex(/^\d{4}-\d{2}-\d{2}$/, '退房日期格式应为 YYYY-MM-DD'),
+  feeCny: hotelSwapFeeSchema, // 酒店改期差价（CNY，整数，可负；不填/不传=不调整价格）
+  feeLabel: z.string().max(60).optional(), // 自定义费用名（缺省"酒店改期差价"）
+  note: z.string().max(200).optional(),
+});
+export type RescheduleItemHotelBody = z.infer<typeof rescheduleItemHotelBodySchema>;
+
 // ── T5：更改订单归属代理（PATCH /orders/:id/agent；ADMIN/STAFF）─────────────────
 // 服务端硬守卫逐单校验；agentId=null（或空串归一为 null）= 转直客。
 // 财务不回溯：已发生的收款/代理余额抵扣/佣金流水按原归属，不因改归属而回滚；变更后新产生的按新归属。

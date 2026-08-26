@@ -1085,7 +1085,7 @@ describe('getRecentRoomChanges', () => {
     };
   }
 
-  it('查询口径：四类 action + createdAt>=近 N 天 + 倒序 + 上限 100', async () => {
+  it('查询口径：五类 action + createdAt>=近 N 天 + 倒序 + 上限 100', async () => {
     const { client, findMany } = auditClient([]);
     const res = await getRecentRoomChanges(7, client);
 
@@ -1097,6 +1097,8 @@ describe('getRecentRoomChanges', () => {
         'SWAP_ORDER_ITEM_HOTEL',
         'ADD_ROOM_SUPPLEMENT',
         'RESCHEDULE_ORDER_ITEM',
+        // 酒店改期直接改动逐晚占房（挪住宿区间），房控面板必须看得见
+        'RESCHEDULE_ORDER_ITEM_HOTEL',
       ],
     });
     expect(arg.orderBy).toEqual({ createdAt: 'desc' });

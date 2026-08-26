@@ -3995,6 +3995,27 @@ export const api = {
       body,
     }),
 
+  // 酒店改期：把某条 HOTEL 行的入住/退房日期整体挪到新区间（占房随之从旧区间转到新区间，
+  // 新区间余量不足会被拒绝）。行价冻结：晚数变化不会自动改价，差额请填 feeCny
+  // （可负，0 会被拒绝——不调整价格就不要传该字段）。返回更新后的订单。
+  rescheduleItemHotel: (
+    token: string,
+    orderId: string,
+    itemId: string,
+    body: {
+      newCheckIn: string; // YYYY-MM-DD
+      newCheckOut: string; // YYYY-MM-DD（须晚于入住日）
+      feeCny?: number;
+      feeLabel?: string;
+      note?: string;
+    },
+  ) =>
+    apiFetch<{ order: OrderSummary }>(`/orders/${orderId}/items/${itemId}/hotel-reschedule`, {
+      method: 'PATCH',
+      token,
+      body,
+    }),
+
   // 更改订单归属代理（T5；ADMIN/STAFF）。agentId=null（或空串归一）= 转直客；服务端硬守卫逐单校验。
   // 回收站单、已退款单、曾用原代理预存余额抵扣的订单会拒绝；目标代理必须存在且未停用。
   // 财务不回溯（已发生的收款/代理余额抵扣/佣金按原归属保留；变更后新产生的按新归属）。
