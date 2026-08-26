@@ -113,6 +113,25 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
     );
   });
 
+  // ── 财务核实一笔人工录入的收款（到账双状态第二段）ADMIN/STAFF ──
+  // POST /payments/:paymentId/verify
+  app.post('/:paymentId/verify', { preHandler: [app.authenticate] }, async (req, reply) => {
+    if (req.user.role !== UserRole.ADMIN && req.user.role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅财务/运营/管理员可核实到账' });
+    }
+    const { paymentId } = req.params as { paymentId: string };
+    return service.verifyManualPayment(paymentId, { userId: req.user.sub, role: req.user.role });
+  });
+
+  // ── 待财务核实的订单收款清单（对账台异常队列）ADMIN/STAFF ──
+  // GET /payments/unverified
+  app.get('/unverified', { preHandler: [app.authenticate] }, async (req, reply) => {
+    if (req.user.role !== UserRole.ADMIN && req.user.role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅财务/运营/管理员可查看待核实清单' });
+    }
+    return { items: await service.listUnverifiedPayments() };
+  });
+
   // ── 批量确认收款（选多个订单一次到账）ADMIN/STAFF ──
   // POST /payments/batch-confirm
   const batchConfirmSchema = z.object({

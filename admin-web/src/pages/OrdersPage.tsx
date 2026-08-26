@@ -3652,6 +3652,14 @@ function OrderDrawer({
             </div>
           )}
 
+          {/* 到账未核实提示（出票闸之一）：人工录入的到账在财务对上流水前只是「业务已收」。
+              出票/付航司是不可逆动作，这里明示金额，让经办人自己决定核实前要不要继续。 */}
+          {canSeeInternal && (o.unverifiedPaidCny ?? 0) > 0 && (
+            <div className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs font-medium text-amber-800">
+              ⚠ 本单已收中 ¥{(o.unverifiedPaidCny ?? 0).toLocaleString()} <b>未经财务核实</b>（人工录入，财务尚未对到流水）。出票、付航司等不可逆操作前请先确认财务核实，或自行评估风险再继续；核实入口在「收款对账台 · 待核实」。
+            </div>
+          )}
+
           {/* 乘客（读 hydrated → 护照号/生日/国籍/类型 真实显示）*/}
           <PassengersSection order={o} onOrderUpdated={handleOrderUpdated} />
 
@@ -10639,6 +10647,13 @@ function ConfirmPaymentSection({
                     title="来自收款对账台认款的进账"
                   >
                     已认款{(p.externalTxnId || p.receiptNo) ? ` · 流水${p.externalTxnId || p.receiptNo}` : ''}
+                  </span>
+                ) : p.verified === false ? (
+                  <span
+                    className="inline-flex items-center rounded bg-amber-100 px-1.5 py-0.5 font-medium text-amber-700"
+                    title="人工录入的到账，财务尚未对到流水；核实入口在收款对账台 · 待核实"
+                  >
+                    手工确认 · 待财务核实
                   </span>
                 ) : (
                   <span className="text-slate-400">手工确认</span>

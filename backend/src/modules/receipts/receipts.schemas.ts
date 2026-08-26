@@ -25,6 +25,12 @@ export const registerReceiptSchema = z.object({
 });
 export type RegisterReceiptInput = z.infer<typeof registerReceiptSchema>;
 
+/** 运营水单登记（OPS_CLAIM）财务核实：可选带收单平台交易流水号（写 externalTxnId，天然防同号流水重复入池）。 */
+export const verifyClaimReceiptSchema = z.object({
+  externalTxnId: z.string().trim().max(128).optional(),
+});
+export type VerifyClaimReceiptInput = z.infer<typeof verifyClaimReceiptSchema>;
+
 /** 认领进账到订单（原子、全有或全无）。 */
 export const allocateReceiptSchema = z.object({
   orderId: z.string().min(1).max(64),

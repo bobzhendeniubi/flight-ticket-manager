@@ -755,6 +755,8 @@ export class ReceiptsService {
             externalTxnId: receipt.externalTxnId,
             allocationId: allocation.id,
           },
+          // 认款 = 财务亲手把流水认到订单上，创建即已核实（到账双状态见 Payment.verifiedAt）。
+          verified: true,
         },
         actor,
         pendingFulfillmentTaskIds,
@@ -1154,6 +1156,118 @@ export class ReceiptsService {
       refundedRemainingCny: result.refundedRemaining.toFixed(2),
       status: ReceiptStatus.REFUNDED,
     };
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  // 运营水单登记（OPS_CLAIM）的财务核实 —— 到账双状态的第二段
+  // ════════════════════════════════════════════════════════════════════
+
+  /**
+   * 财务核实一笔运营水单登记（占位单手工到账建的 OPS_CLAIM 进账）。
+   * 可选带收单平台交易流水号：填了就写 externalTxnId（唯一），此后同号流水再导入会被
+   * 天然去重，不会在池子里冒出第二笔重复的钱。
+   * 防呆：录入人不能核实自己录的账（ADMIN 除外）。
+   */
+  async verifyClaimReceipt(
+    receiptId: string,
+    input: { externalTxnId?: string | null },
+    actor: { userId: string; role: UserRole },
+  ): Promise<{ ok: true; receiptId: string; receiptNo: string; verifiedAt: Date }> {
+    const result = await prisma.$transaction(async (tx) => {
+      const receipt = await tx.receipt.findUnique({ where: { id: receiptId } });
+      if (!receipt) throw new NotFoundError('进账不存在');
+      if (receipt.source !== ReceiptSource.OPS_CLAIM) {
+        throw new BadRequestError('只有运营水单登记的到账需要核实（流水导入/财务登记的进账本身就是核实来源）。');
+      }
+      if (receipt.status === ReceiptStatus.REFUNDED) {
+        throw new ConflictError('该笔登记已作废（认款被撤销），无需核实。');
+      }
+      if (receipt.verifiedAt) throw new ConflictError('该笔到账已经核实过了，请刷新列表。');
+      if (actor.role !== UserRole.ADMIN && receipt.createdById === actor.userId) {
+        throw new ConflictError('不能核实自己录入的到账，请由财务或其他同事核实。');
+      }
+      const externalTxnId = input.externalTxnId?.trim() || null;
+      if (externalTxnId) {
+        const dup = await tx.receipt.findUnique({ where: { externalTxnId }, select: { id: true, receiptNo: true } });
+        if (dup && dup.id !== receiptId) {
+          throw new ConflictError(`交易流水号 ${externalTxnId} 已登记在进账 ${dup.receiptNo} 上——同一笔钱别记两次；若确为该流水，请撤销一边再处理。`);
+        }
+      }
+      const verifiedAt = new Date();
+      await tx.receipt.update({
+        where: { id: receiptId },
+        data: { verifiedAt, verifiedById: actor.userId, ...(externalTxnId ? { externalTxnId } : {}) },
+      });
+      return { receiptNo: receipt.receiptNo, amountCny: Number(receipt.amountCny), verifiedAt, externalTxnId };
+    });
+
+    void writeAudit({
+      actor: { userId: actor.userId, role: actor.role },
+      action: 'VERIFY_CLAIM_RECEIPT',
+      targetType: 'SYSTEM',
+      targetId: receiptId,
+      targetLabel: result.receiptNo,
+      after: { amountCny: result.amountCny, externalTxnId: result.externalTxnId, verifiedAt: result.verifiedAt.toISOString() },
+      severity: 'INFO',
+    });
+
+    return { ok: true as const, receiptId, receiptNo: result.receiptNo, verifiedAt: result.verifiedAt };
+  }
+
+  /**
+   * 待财务核实的运营水单登记清单（异常队列数据源，与订单侧 listUnverifiedPayments 合并展示）。
+   */
+  async listUnverifiedClaims(): Promise<
+    Array<{
+      id: string;
+      receiptNo: string;
+      amountCny: number;
+      method: PaymentMethod;
+      note: string | null;
+      proofUrl: string | null;
+      createdByName: string | null;
+      holdNo: string | null;
+      groupName: string | null;
+      installmentLabel: string | null;
+      receivedAt: Date;
+      createdAt: Date;
+    }>
+  > {
+    const receipts = await prisma.receipt.findMany({
+      where: { source: ReceiptSource.OPS_CLAIM, verifiedAt: null, status: { not: ReceiptStatus.REFUNDED } },
+      orderBy: { createdAt: 'asc' },
+      include: {
+        holdAllocations: {
+          where: { reversedAt: null },
+          include: {
+            holdOrder: { select: { holdNo: true, groupName: true } },
+            holdInstallment: { select: { label: true, seq: true } },
+          },
+        },
+      },
+    });
+    const userIds = [...new Set(receipts.map((r) => r.createdById).filter((v): v is string => !!v))];
+    const users = userIds.length
+      ? await prisma.user.findMany({ where: { id: { in: userIds } }, select: { id: true, displayName: true, email: true } })
+      : [];
+    const nameById = new Map(users.map((u) => [u.id, u.displayName || u.email]));
+    return receipts.map((r) => {
+      const allocation = r.holdAllocations[0] ?? null;
+      return {
+        id: r.id,
+        receiptNo: r.receiptNo,
+        amountCny: Number(r.amountCny),
+        method: r.method,
+        note: r.payerNote ?? null,
+        proofUrl: r.proofUrl ?? null,
+        createdByName: r.createdById ? (nameById.get(r.createdById) ?? null) : null,
+        holdNo: allocation?.holdOrder.holdNo ?? null,
+        groupName: allocation?.holdOrder.groupName ?? null,
+        installmentLabel: allocation ? `${allocation.holdInstallment.label}（第${allocation.holdInstallment.seq}期）` : null,
+        receivedAt: r.receivedAt,
+        createdAt: r.createdAt,
+      };
+    });
   }
 
   // ════════════════════════════════════════════════════════════════════
@@ -1561,6 +1675,7 @@ export class ReceiptsService {
       STAFF_ENTRY: '后台登记',
       ORDER_OVERPAY: '订单多付',
       STATEMENT_IMPORT: '流水导入',
+      OPS_CLAIM: '运营水单登记',
     };
     const STATUS_LABEL: Record<ReceiptStatus, string> = {
       OPEN: '未认款',

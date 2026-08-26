@@ -3477,6 +3477,8 @@ export class OrderService {
         amount: new Prisma.Decimal(-round2(input.amountCny)),
         status: PaymentStatus.SUCCEEDED,
         paidAt: null,
+        // 多付处置是内部记账（负额），不是新钱进账，创建即视同已核实，不进待核实队列。
+        verifiedAt: new Date(),
         gatewayPayload: {
           source: 'overpay-disposal',
           disposal: input.disposal,
@@ -10071,6 +10073,7 @@ interface OrderLike {
     status: PaymentStatus;
     proofUrl?: string | null;
     paidAt?: Date | null;
+    verifiedAt?: Date | null;
     createdAt: Date;
     gatewayPayload?: Prisma.JsonValue;
   }>;
@@ -10461,6 +10464,8 @@ function serializePaymentRecord(p: NonNullable<OrderLike['payments']>[number]): 
   reconciled: boolean;
   receiptNo: string | null;
   externalTxnId: string | null;
+  verified: boolean;
+  verifiedAt: Date | null;
 } {
   const payload =
     p.gatewayPayload && typeof p.gatewayPayload === 'object' && !Array.isArray(p.gatewayPayload)
@@ -10491,6 +10496,9 @@ function serializePaymentRecord(p: NonNullable<OrderLike['payments']>[number]): 
     reconciled,
     receiptNo,
     externalTxnId,
+    // 到账双状态：财务核过流水才算 verified（认款/网关创建即核实；人工录入待财务核实）。
+    verified: p.verifiedAt != null,
+    verifiedAt: p.verifiedAt ?? null,
   };
 }
 
@@ -10592,7 +10600,20 @@ export function serializeOrder<T extends OrderLike>(
     // 收款记录：显式重映射，只透出安全字段 + 认款标注（reconciled/receiptNo/externalTxnId），
     // 剥掉 gatewayPayload 原始载荷（confirmedBy 等内部字段绝不外泄）。未联查 payments 时不加此键。
     ...(Array.isArray(order.payments)
-      ? { payments: order.payments.map(serializePaymentRecord) }
+      ? {
+          payments: order.payments.map(serializePaymentRecord),
+          // 未经财务核实的已收金额（正额 SUCCEEDED 且 verifiedAt 为空之和）。
+          // 出票/推进终态前的界面提示据此显示「这单 ¥xxx 到账未经财务核实」；仅内部可见。
+          ...(redact
+            ? {}
+            : {
+                unverifiedPaidCny: round2(
+                  order.payments
+                    .filter((p) => p.status === PaymentStatus.SUCCEEDED && !p.verifiedAt && Number(p.amount) > 0)
+                    .reduce((sum, p) => sum + Number(p.amount), 0),
+                ),
+              }),
+        }
       : {}),
     adjustments: redact ? undefined : order.adjustments,
     claimedById: redact ? undefined : order.claimedById,

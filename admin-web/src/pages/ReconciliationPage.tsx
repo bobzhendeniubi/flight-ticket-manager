@@ -26,6 +26,8 @@ import {
   type PaymentMethod,
   type Receipt,
   type ReceiptStatus,
+  type UnverifiedPaymentItem,
+  type UnverifiedClaimItem,
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { NumberInput } from '../components/NumberInput';
@@ -42,8 +44,12 @@ const METHOD_OPTIONS: PaymentMethod[] = ['WECHAT_PAY', 'ALIPAY', 'BANK_CARD', 'A
 // 进账截图最大 6MB（与后端 proofUrlSchema 对齐）
 const MAX_PROOF_BYTES = 6 * 1024 * 1024;
 
-// 顶部过滤页签（statement = 流水认款工作台：导入二维码流水 + 分房式拖拽配对）
-type Tab = 'open' | 'statement' | 'allocated' | 'refunded' | 'ledger' | 'channels';
+// 顶部过滤页签（statement = 流水认款工作台：导入二维码流水 + 分房式拖拽配对；
+// unverified = 到账核实异常队列：人工录入的到账等财务对流水后逐笔核实）
+type Tab = 'open' | 'statement' | 'unverified' | 'allocated' | 'refunded' | 'ledger' | 'channels';
+
+// 手工到账超过 N 天财务还没核实 → 标红超期（运营须去跟客户确认）
+const UNVERIFIED_OVERDUE_DAYS = 3;
 
 // 状态徽标 → Console badge
 function statusBadge(status: ReceiptStatus): string {
@@ -103,6 +109,8 @@ export function ReconciliationPage() {
   const [to, setTo] = useState('');
   const [receipts, setReceipts] = useState<Receipt[]>([]);
   const [ledger, setLedger] = useState<LedgerEntry[]>([]);
+  const [unverifiedPayments, setUnverifiedPayments] = useState<UnverifiedPaymentItem[]>([]);
+  const [unverifiedClaims, setUnverifiedClaims] = useState<UnverifiedClaimItem[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [showRegister, setShowRegister] = useState(false);
@@ -136,11 +144,40 @@ export function ReconciliationPage() {
       .finally(() => setLoading(false));
   }, [token]);
 
+  // 加载待核实队列（订单人工收款 + 占位单手工到账，两路并行）
+  const loadUnverified = useCallback(() => {
+    if (!token) return;
+    setLoading(true);
+    setErr(null);
+    Promise.all([api.listUnverifiedPayments(token), api.listUnverifiedClaims(token)])
+      .then(([p, c]) => { setUnverifiedPayments(p.items); setUnverifiedClaims(c.items); })
+      .catch((e: unknown) => setErr(e instanceof ApiError ? e.message : '加载待核实清单失败'))
+      .finally(() => setLoading(false));
+  }, [token]);
+
   useEffect(() => {
     if (tab === 'channels' || tab === 'statement') return; // 渠道管理/流水工作台自带加载
     if (tab === 'ledger') loadLedger();
+    else if (tab === 'unverified') loadUnverified();
     else loadReceipts();
-  }, [tab, loadReceipts, loadLedger]);
+  }, [tab, loadReceipts, loadLedger, loadUnverified]);
+
+  // 页签角标要在任何页签下都可见 → 进页面就拉一次待核实计数
+  useEffect(() => {
+    if (!token) return;
+    Promise.all([api.listUnverifiedPayments(token), api.listUnverifiedClaims(token)])
+      .then(([p, c]) => { setUnverifiedPayments(p.items); setUnverifiedClaims(c.items); })
+      .catch(() => { /* 角标计数拉不到不阻断主流程，切到该页签时会再拉并报错 */ });
+  }, [token]);
+
+  const unverifiedCount = unverifiedPayments.length + unverifiedClaims.length;
+  const unverifiedOverdue = useMemo(() => {
+    const cutoff = Date.now() - UNVERIFIED_OVERDUE_DAYS * 24 * 3600 * 1000;
+    return (
+      unverifiedPayments.filter((p) => new Date(p.createdAt).getTime() < cutoff).length +
+      unverifiedClaims.filter((c) => new Date(c.createdAt).getTime() < cutoff).length
+    );
+  }, [unverifiedPayments, unverifiedClaims]);
 
   // KPI：挂账余额 = 未结进账剩余合计；今日进账 = 今日 receivedAt 金额合计；待认领笔数
   const kpi = useMemo(() => {
@@ -220,6 +257,9 @@ export function ReconciliationPage() {
         <TabBtn active={tab === 'statement'} onClick={() => setTab('statement')}>
           流水认款
         </TabBtn>
+        <TabBtn active={tab === 'unverified'} onClick={() => setTab('unverified')}>
+          待核实{unverifiedCount > 0 ? `（${unverifiedCount}${unverifiedOverdue > 0 ? `，${unverifiedOverdue} 超期` : ''}）` : ''}
+        </TabBtn>
         <TabBtn active={tab === 'allocated'} onClick={() => setTab('allocated')}>
           已认领
         </TabBtn>
@@ -233,7 +273,7 @@ export function ReconciliationPage() {
           收款渠道
         </TabBtn>
 
-        {tab !== 'channels' && tab !== 'ledger' && tab !== 'statement' && (
+        {tab !== 'channels' && tab !== 'ledger' && tab !== 'statement' && tab !== 'unverified' && (
           <div className="ml-auto flex flex-wrap items-center gap-1.5">
             {/* 到账日期区间（传后端，按 receivedAt） */}
             <input
@@ -274,6 +314,14 @@ export function ReconciliationPage() {
         <PaymentChannelsManager />
       ) : tab === 'statement' ? (
         <StatementReconciliation token={token} onMutated={loadReceipts} />
+      ) : tab === 'unverified' ? (
+        <UnverifiedQueue
+          payments={unverifiedPayments}
+          claims={unverifiedClaims}
+          loading={loading}
+          token={token}
+          onAfterMutation={loadUnverified}
+        />
       ) : tab === 'ledger' ? (
         <LedgerTable rows={ledger} loading={loading} />
       ) : (
@@ -295,6 +343,142 @@ export function ReconciliationPage() {
           }}
         />
       )}
+    </div>
+  );
+}
+
+// ── 待核实队列（到账双状态：业务已收 → 财务已核实）─────────────────────────
+// 数据 = 订单人工收款（含批量到账/占位单结转未核实款）+ 占位单手工到账（运营水单登记）。
+// 超期（> UNVERIFIED_OVERDUE_DAYS 天）标红置顶：财务对不到流水的钱，运营必须回头找客户。
+function UnverifiedQueue({
+  payments,
+  claims,
+  loading,
+  token,
+  onAfterMutation,
+}: {
+  payments: UnverifiedPaymentItem[];
+  claims: UnverifiedClaimItem[];
+  loading: boolean;
+  token: string;
+  onAfterMutation: () => void;
+}) {
+  const confirm = useConfirm();
+  const [busyId, setBusyId] = useState<string | null>(null);
+  const [rowErr, setRowErr] = useState<string | null>(null);
+  const ageDays = (iso: string) => Math.floor((Date.now() - new Date(iso).getTime()) / (24 * 3600 * 1000));
+  type Row = {
+    key: string;
+    kind: 'ORDER' | 'HOLD';
+    label: string;
+    detail: string;
+    amountCny: number;
+    method: PaymentMethod;
+    note: string | null;
+    proofUrl: string | null;
+    byName: string | null;
+    createdAt: string;
+  };
+  const rows: Row[] = [
+    ...payments.map((p): Row => ({
+      key: `pay:${p.id}`,
+      kind: 'ORDER',
+      label: p.orderNumber,
+      detail: p.agentName ?? p.contactName ?? '',
+      amountCny: p.amountCny,
+      method: p.method,
+      note: p.note,
+      proofUrl: p.proofUrl,
+      byName: p.confirmedByName,
+      createdAt: p.createdAt,
+    })),
+    ...claims.map((c): Row => ({
+      key: `claim:${c.id}`,
+      kind: 'HOLD',
+      label: c.holdNo ?? c.receiptNo,
+      detail: [c.groupName, c.installmentLabel].filter(Boolean).join(' · '),
+      amountCny: c.amountCny,
+      method: c.method,
+      note: c.note,
+      proofUrl: c.proofUrl,
+      byName: c.createdByName,
+      createdAt: c.createdAt,
+    })),
+  ].sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
+
+  const verify = async (row: Row) => {
+    setRowErr(null);
+    const id = row.key.split(':')[1];
+    if (row.kind === 'ORDER') {
+      const ok = await confirm({
+        title: `核实到账 · ${row.label}`,
+        body: `确认已在银行/收单后台对到这笔 ¥${row.amountCny.toLocaleString()}？核实后本单出票提示解除。`,
+        confirmText: '已对到流水，核实',
+      });
+      if (!ok) return;
+      setBusyId(row.key);
+      try { await api.verifyPayment(token, id); onAfterMutation(); } catch (e) { setRowErr(e instanceof ApiError ? e.message : '核实失败'); } finally { setBusyId(null); }
+    } else {
+      // 占位单手工到账：可顺手补收单平台交易流水号（写 externalTxnId，同号流水此后导入自动去重）
+      const txn = window.prompt(`核实占位单到账 ¥${row.amountCny.toLocaleString()}。\n可填收单平台交易流水号（选填，填了以后同号流水导入会自动去重）：`, '');
+      if (txn === null) return;
+      setBusyId(row.key);
+      try { await api.verifyClaimReceipt(token, id, txn.trim() || undefined); onAfterMutation(); } catch (e) { setRowErr(e instanceof ApiError ? e.message : '核实失败'); } finally { setBusyId(null); }
+    }
+  };
+
+  if (loading) return <div className="rounded-lg border border-slate-200 bg-white p-6 text-sm text-ink-muted">加载中…</div>;
+  if (rows.length === 0) {
+    return <div className="rounded-lg border border-slate-200 bg-white p-6 text-sm text-ink-muted">没有待核实的到账——所有人工录入的钱都已由财务对过流水。</div>;
+  }
+  return (
+    <div className="space-y-2">
+      {rowErr && <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">{rowErr}</div>}
+      <p className="text-xs text-ink-muted">
+        这些是运营/客服凭客户水单录入、财务还没对到流水的钱。逐笔在银行/收单后台核对后点「核实」；超过 {UNVERIFIED_OVERDUE_DAYS} 天仍对不到的标红——请运营回头找客户确认是否真的转了。录入人不能核实自己录的账（管理员除外）。
+      </p>
+      <div className="overflow-x-auto rounded-lg border border-slate-200 bg-white">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="border-b border-slate-200 text-left text-xs text-ink-muted">
+              <th className="px-3 py-2">类型</th>
+              <th className="px-3 py-2">单号</th>
+              <th className="px-3 py-2">归属</th>
+              <th className="px-3 py-2 text-right">金额</th>
+              <th className="px-3 py-2">方式</th>
+              <th className="px-3 py-2">录入人</th>
+              <th className="px-3 py-2">录入时间</th>
+              <th className="px-3 py-2">账龄</th>
+              <th className="px-3 py-2">水单</th>
+              <th className="px-3 py-2 text-right">操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((row) => {
+              const days = ageDays(row.createdAt);
+              const overdue = days >= UNVERIFIED_OVERDUE_DAYS;
+              return (
+                <tr key={row.key} className={`border-b border-slate-100 last:border-0 ${overdue ? 'bg-rose-50/60' : ''}`}>
+                  <td className="px-3 py-2"><span className={row.kind === 'ORDER' ? 'badge-info' : 'badge-warning'}>{row.kind === 'ORDER' ? '订单收款' : '占位单到账'}</span></td>
+                  <td className="px-3 py-2 font-mono text-xs">{row.label}</td>
+                  <td className="px-3 py-2 text-xs text-ink-muted">{row.detail || '—'}</td>
+                  <td className="px-3 py-2 text-right font-medium">¥{row.amountCny.toLocaleString()}</td>
+                  <td className="px-3 py-2 text-xs">{PAYMENT_METHOD_LABEL[row.method] ?? row.method}</td>
+                  <td className="px-3 py-2 text-xs">{row.byName ?? '—'}</td>
+                  <td className="px-3 py-2 text-xs text-ink-muted">{new Date(row.createdAt).toLocaleString('zh-CN')}</td>
+                  <td className="px-3 py-2 text-xs">{overdue ? <span className="font-semibold text-rose-700">{days} 天 · 超期</span> : `${days} 天`}</td>
+                  <td className="px-3 py-2">{row.proofUrl ? <ProofImageViewer src={row.proofUrl} alt="水单截图" /> : <span className="text-xs text-ink-muted">无</span>}</td>
+                  <td className="px-3 py-2 text-right">
+                    <button type="button" className="btn-secondary px-2 py-1 text-xs" disabled={busyId === row.key} onClick={() => void verify(row)}>
+                      {busyId === row.key ? '核实中…' : '核实'}
+                    </button>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }

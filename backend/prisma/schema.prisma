@@ -1764,6 +1764,10 @@ model Payment {
   // 人工确认收款上传的截图（data URL；线下收款凭证）
   proofUrl       String?
   paidAt         DateTime?
+  // 财务核实（到账双状态）：人工录入的到账只是「业务已收」，财务对过银行/收单流水后落 verifiedAt
+  // 才算「已核实」。认款/网关回调等财务侧入口在创建时即核实；存量数据迁移时一次性视同已核实。
+  verifiedAt     DateTime?
+  verifiedById   String?
   createdAt      DateTime      @default(now())
   updatedAt      DateTime      @updatedAt
 
@@ -1771,6 +1775,7 @@ model Payment {
 
   @@index([orderId])
   @@index([status])
+  @@index([status, verifiedAt])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1822,6 +1827,7 @@ enum ReceiptSource {
   STAFF_ENTRY // 财务/客服后台登记
   ORDER_OVERPAY // 订单超额转入挂账池
   STATEMENT_IMPORT // 收单平台二维码流水导入（按交易流水号去重）
+  OPS_CLAIM // 运营凭客户水单手工登记（占位单手工到账；财务对流水后核实）
 }
 
 // 一笔到账（统一收款码收到的钱）。
@@ -1840,6 +1846,9 @@ model Receipt {
   source       ReceiptSource
   status       ReceiptStatus @default(OPEN)
   refundNote   String? // 退款备注（仅 REFUNDED 时）
+  // 财务核实（仅 source=OPS_CLAIM 有意义）：运营凭水单登记的到账，财务对过流水后落 verifiedAt。
+  verifiedAt   DateTime?
+  verifiedById String?
   createdById  String? // 登记人 userId（系统/客户上传时为 null）
   createdAt    DateTime      @default(now())
   updatedAt    DateTime      @updatedAt

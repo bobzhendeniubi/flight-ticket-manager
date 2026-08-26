@@ -129,6 +129,7 @@ export function HoldOrdersPage() {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [reduceOrder, setReduceOrder] = useState<HoldOrderListItem | null>(null);
   const [allocateTarget, setAllocateTarget] = useState<{ order: HoldOrderListItem; installment: HoldInstallment } | null>(null);
+  const [manualReceiptTarget, setManualReceiptTarget] = useState<{ order: HoldOrderListItem; installment: HoldInstallment } | null>(null);
   const [convertOrder, setConvertOrder] = useState<HoldOrderListItem | null>(null);
   const [holdConfig, setHoldConfig] = useState<HoldOrderConfig | null>(null);
   const [showConfig, setShowConfig] = useState(false);
@@ -392,7 +393,7 @@ export function HoldOrdersPage() {
                   {expandedId === order.id && (
                     <tr className={order.status === 'OVERDUE' ? 'bg-rose-50/70' : 'bg-slate-50/70'}>
                       <td colSpan={10} className="px-5 py-3">
-                        <InstallmentTable order={order} onAllocate={(installment) => setAllocateTarget({ order, installment })} onReload={reload} />
+                        <InstallmentTable order={order} onAllocate={(installment) => setAllocateTarget({ order, installment })} onManualReceipt={(installment) => setManualReceiptTarget({ order, installment })} onReload={reload} />
                         <HoldLedgerDetails order={order} />
                       </td>
                     </tr>
@@ -466,6 +467,9 @@ export function HoldOrdersPage() {
       )}
       {allocateTarget && tokens && (
         <AllocateModal order={allocateTarget.order} installment={allocateTarget.installment} token={tokens.accessToken} onCancel={() => setAllocateTarget(null)} onDone={async (warning) => { setAllocateTarget(null); await reload(); notify(warning ?? '认款已记录'); }} />
+      )}
+      {manualReceiptTarget && tokens && (
+        <ManualReceiptModal order={manualReceiptTarget.order} installment={manualReceiptTarget.installment} token={tokens.accessToken} onCancel={() => setManualReceiptTarget(null)} onDone={async (warning) => { setManualReceiptTarget(null); await reload(); notify(warning ?? '到账已记录，待财务核实'); }} />
       )}
       {showConfig && holdConfig && tokens && (
         <ConfigModal config={holdConfig} token={tokens.accessToken} onCancel={() => setShowConfig(false)} onDone={(config) => { setHoldConfig(config); setShowConfig(false); notify('收款模板已保存'); }} />
@@ -833,7 +837,7 @@ function CreateHoldModal({
   );
 }
 
-function InstallmentTable({ order, onAllocate, onReload }: { order: HoldOrderListItem; onAllocate: (installment: HoldInstallment) => void; onReload: () => Promise<void> }) {
+function InstallmentTable({ order, onAllocate, onManualReceipt, onReload }: { order: HoldOrderListItem; onAllocate: (installment: HoldInstallment) => void; onManualReceipt: (installment: HoldInstallment) => void; onReload: () => Promise<void> }) {
   const tokens = useAuth((s) => s.tokens);
   const [busyId, setBusyId] = useState<string | null>(null);
   const rows = order.installments ?? [];
@@ -856,8 +860,12 @@ function InstallmentTable({ order, onAllocate, onReload }: { order: HoldOrderLis
     <div>
       <div className="mb-2 text-xs font-semibold text-ink-soft">收款计划</div>
       <table className="w-full text-xs"><thead><tr className="text-ink-muted"><th className="text-left">期号</th><th className="text-left">期名</th><th className="text-right">应收</th><th className="text-right">已认</th><th className="text-left">截止</th><th className="text-left">状态</th><th></th></tr></thead><tbody>
-        {rows.map((row) => <Fragment key={row.id}><tr className="border-t border-slate-200"><td>{row.seq}</td><td>{row.label}</td><td className="text-right">¥{row.amountCny.toLocaleString()}</td><td className="text-right">¥{activeAmount(row).toLocaleString()}</td><td>{row.dueDate.slice(0, 10)}</td><td><span className={row.status === 'PAID' ? 'badge-success' : 'badge-neutral'}>{row.status === 'PAID' ? '已认满' : '待认款'}</span></td><td className="text-right"><button className="mr-2 text-brand-700 disabled:text-ink-muted" disabled={row.status === 'PAID'} onClick={() => onAllocate(row)}>认款</button><button className="text-amber-700 disabled:text-ink-muted" disabled={row.status === 'PAID' || busyId === row.id} onClick={() => void changeDueDate(row)}>调期</button></td></tr>
-          {row.allocations.filter((a) => !a.reversedAt).map((allocation) => <tr key={allocation.id} className="text-[11px] text-ink-muted"><td></td><td colSpan={4}>挂账认款 ¥{Number(allocation.amountCny).toLocaleString()}</td><td colSpan={2} className="text-right"><button className="link-danger text-xs" disabled={busyId === allocation.id} onClick={() => void reverse(row, allocation.id)}>撤销</button></td></tr>)}
+        {rows.map((row) => <Fragment key={row.id}><tr className="border-t border-slate-200"><td>{row.seq}</td><td>{row.label}</td><td className="text-right">¥{row.amountCny.toLocaleString()}</td><td className="text-right">¥{activeAmount(row).toLocaleString()}</td><td>{row.dueDate.slice(0, 10)}</td><td><span className={row.status === 'PAID' ? 'badge-success' : 'badge-neutral'}>{row.status === 'PAID' ? '已认满' : '待认款'}</span></td><td className="text-right"><button className="mr-2 font-semibold text-emerald-700 disabled:text-ink-muted" disabled={row.status === 'PAID'} onClick={() => onManualReceipt(row)}>手工到账</button><button className="mr-2 text-brand-700 disabled:text-ink-muted" disabled={row.status === 'PAID'} onClick={() => onAllocate(row)}>认款</button><button className="text-amber-700 disabled:text-ink-muted" disabled={row.status === 'PAID' || busyId === row.id} onClick={() => void changeDueDate(row)}>调期</button></td></tr>
+          {row.allocations.filter((a) => !a.reversedAt).map((allocation) => {
+            const isClaim = allocation.receipt?.source === 'OPS_CLAIM';
+            const claimVerified = isClaim && !!allocation.receipt?.verifiedAt;
+            return <tr key={allocation.id} className="text-[11px] text-ink-muted"><td></td><td colSpan={4}>{isClaim ? '手工到账' : '挂账认款'} ¥{Number(allocation.amountCny).toLocaleString()}{isClaim && (claimVerified ? <span className="ml-2 rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700">财务已核实</span> : <span className="ml-2 rounded bg-amber-50 px-1.5 py-0.5 text-[10px] font-semibold text-amber-700">待财务核实</span>)}</td><td colSpan={2} className="text-right"><button className="link-danger text-xs" disabled={busyId === allocation.id} onClick={() => void reverse(row, allocation.id)}>撤销</button></td></tr>;
+          })}
         </Fragment>)}
       </tbody></table>
     </div>
@@ -927,6 +935,10 @@ function ConvertModal({
 
   const carry = preview?.carryCny ?? 0;
   const orderDue = preview?.orderDueCny ?? 0;
+  // 未核实的手工到账金额（运营水单登记、财务还没对上流水）：转正会把这笔钱结转进订单，
+  // 出票是不可逆动作——这里先明示，让经办人自己决定要不要在核实前继续。
+  const unverifiedClaimCny = (order.installments ?? []).reduce((sum, installment) =>
+    sum + installment.allocations.filter((a) => !a.reversedAt && a.receipt?.source === 'OPS_CLAIM' && !a.receipt?.verifiedAt).reduce((s, a) => s + Number(a.amountCny), 0), 0);
 
   const setRow = (index: number, patch: Partial<BatchOrderPassenger>) => setRows((old) => old.map((row, i) => i === index ? { ...row, ...patch } : row));
   const addRow = () => { if (rows.length < remaining) setRows((old) => [...old, { fullName: '', documentNumber: '', dateOfBirth: '', passportExpiry: '', nationality: 'CN' }]); };
@@ -965,6 +977,7 @@ function ConvertModal({
       <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3"><h2 className="text-lg font-semibold">导入名单转正 · {order.holdNo}</h2><button onClick={onCancel} className="text-xl text-slate-400">×</button></div>
       <div className="space-y-4 px-5 py-4">
         <div className="grid gap-3 rounded-lg bg-slate-50 p-3 text-sm sm:grid-cols-3"><div>本次转正 <b>{rows.length}</b> 座</div><div>结转 <b className="text-emerald-700">{previewBusy ? '试算中…' : `¥${carry.toLocaleString()}`}</b></div><div>订单待收 <b className="text-amber-700">{previewBusy ? '试算中…' : `¥${orderDue.toLocaleString()}`}</b></div></div>
+        {unverifiedClaimCny > 0 && <p className="rounded bg-amber-50 px-3 py-2 text-sm font-medium text-amber-800">⚠ 本占位单已收里有 ¥{unverifiedClaimCny.toLocaleString()} 手工到账<b>未经财务核实</b>。转正后这笔钱会结转进订单并保留「待核实」标记——出票前请确认财务已对到流水，或自行评估风险再继续。</p>}
         <div className="flex flex-wrap gap-3"><input className="input max-w-xs" placeholder="联系人（选填）" value={contactName} onChange={(e) => setContactName(e.target.value)} /><input className="input max-w-xs" placeholder="联系电话（选填）" value={contactPhone} onChange={(e) => setContactPhone(e.target.value)} /><label className="flex items-center gap-2 text-sm text-ink-soft"><input type="checkbox" checked={allowDuplicate} onChange={(e) => setAllowDuplicate(e.target.checked)} />确认允许重复乘客</label></div>
         <div className="overflow-x-auto rounded border border-slate-200"><table className="min-w-[850px] w-full text-xs"><thead className="bg-slate-50 text-ink-muted"><tr><th className="px-2 py-2 text-left">姓名</th><th className="px-2 py-2 text-left">证件号</th><th className="px-2 py-2 text-left">出生日期</th><th className="px-2 py-2 text-left">护照有效期 *</th><th className="px-2 py-2 text-left">国籍</th><th></th></tr></thead><tbody>{rows.map((row, index) => <tr key={index} className="border-t border-slate-100"><td className="px-2 py-1"><input className="input h-8" value={row.fullName} onChange={(e) => setRow(index, { fullName: e.target.value })} /></td><td className="px-2 py-1"><input className="input h-8" value={row.documentNumber} onChange={(e) => setRow(index, { documentNumber: e.target.value })} /></td><td className="px-2 py-1"><input className="input h-8" type="date" value={row.dateOfBirth} onChange={(e) => setRow(index, { dateOfBirth: e.target.value })} /></td><td className="px-2 py-1"><input className="input h-8" type="date" value={row.passportExpiry ?? ''} onChange={(e) => setRow(index, { passportExpiry: e.target.value })} /></td><td className="px-2 py-1"><input className="input h-8 w-20" value={row.nationality ?? 'CN'} onChange={(e) => setRow(index, { nationality: e.target.value.toUpperCase() })} /></td><td className="px-2 py-1"><button className="btn-ghost-danger text-xs" onClick={() => removeRow(index)}>删除</button></td></tr>)}</tbody></table></div>
         <div className="flex flex-wrap items-center gap-3"><button className="btn-secondary text-sm" disabled={rows.length >= remaining} onClick={addRow}>＋ 加一行</button><button className="btn-secondary text-sm" disabled={!pasteText.trim()} onClick={parsePaste}>解析粘贴名单</button><span className="text-xs text-ink-muted">快速粘贴格式：姓名,证件号,出生日期,护照有效期</span></div>
@@ -974,6 +987,46 @@ function ConvertModal({
       </div>
     </div>
   </div>;
+}
+
+/** 手工到账：运营凭客户水单直接给某期录钱（不等财务导流水；财务事后在对账台核实）。 */
+function ManualReceiptModal({ order, installment, token, onCancel, onDone }: { order: HoldOrderListItem; installment: HoldInstallment; token: string; onCancel: () => void; onDone: (warning: string | null) => Promise<void> }) {
+  const dialogRef = useDialogA11y(onCancel);
+  const already = installment.allocations.filter((a) => !a.reversedAt).reduce((sum, a) => sum + Number(a.amountCny), 0);
+  const due = Math.max(0, installment.amountCny - already);
+  const [amount, setAmount] = useState(due);
+  const [method, setMethod] = useState<'WECHAT_PAY' | 'ALIPAY' | 'BANK_CARD'>('WECHAT_PAY');
+  const [note, setNote] = useState('');
+  const [proofUrl, setProofUrl] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const onProofFile = (file: File | null) => {
+    if (!file) { setProofUrl(null); return; }
+    if (file.size > 5 * 1024 * 1024) { setError('水单截图不能超过 5MB'); return; }
+    const reader = new FileReader();
+    reader.onload = () => setProofUrl(typeof reader.result === 'string' ? reader.result : null);
+    reader.readAsDataURL(file);
+  };
+  const submit = async () => {
+    if (amount < 1 || amount > due) { setError(`请输入不超过本期未收余额 ¥${due.toLocaleString()} 的金额`); return; }
+    setBusy(true);
+    try {
+      const result = await api.manualReceiptHoldInstallment(token, order.id, installment.id, { amountCny: amount, method, proofUrl: proofUrl ?? undefined, note: note.trim() || undefined });
+      await onDone(result.result.warning);
+    } catch (err) { setError(err instanceof Error ? err.message : '手工到账失败'); setBusy(false); }
+  };
+  return <div ref={dialogRef} role="dialog" aria-modal="true" aria-label={`手工到账 · ${order.holdNo} · ${installment.label}`} tabIndex={-1} className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" onClick={onCancel}><div className="w-full max-w-lg rounded-lg bg-white shadow-xl" onClick={(e) => e.stopPropagation()}><div className="flex items-center justify-between border-b border-slate-200 px-5 py-3"><h2 className="text-lg font-semibold">手工到账 · {order.holdNo} · {installment.label}</h2><button onClick={onCancel} className="text-xl text-slate-400">×</button></div><div className="space-y-4 px-5 py-4">
+    <p className="text-sm text-ink-muted">本期应收 ¥{installment.amountCny.toLocaleString()}，未收 ¥{due.toLocaleString()}</p>
+    <p className="rounded bg-amber-50 px-3 py-2 text-xs text-amber-800">凭客户水单先入账推进流程；这笔钱会标为「待财务核实」，财务对到流水前请保留水单凭证。若客户实际未转账，撤销本笔并跟进客户。</p>
+    <div className="grid gap-3 sm:grid-cols-2">
+      <div><label className="label">到账金额（元）</label><input className="input" type="number" min={1} max={due} value={amount || ''} onChange={(e) => setAmount(Number(e.target.value))} /></div>
+      <div><label className="label">收款方式</label><select className="input" value={method} onChange={(e) => setMethod(e.target.value as 'WECHAT_PAY' | 'ALIPAY' | 'BANK_CARD')}><option value="WECHAT_PAY">微信</option><option value="ALIPAY">支付宝</option><option value="BANK_CARD">银行卡/对公</option></select></div>
+    </div>
+    <div><label className="label">水单截图（建议上传）</label><input className="input" type="file" accept="image/*" onChange={(e) => onProofFile(e.target.files?.[0] ?? null)} />{proofUrl && <img src={proofUrl} alt="水单截图预览" className="mt-2 max-h-32 rounded border border-slate-200" />}</div>
+    <div><label className="label">备注（选填）</label><input className="input" value={note} maxLength={500} onChange={(e) => setNote(e.target.value)} placeholder="客户名/转账尾号/约定说明等" /></div>
+    {error && <p className="rounded bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p>}
+    <div className="flex justify-end gap-3"><button className="btn-secondary" onClick={onCancel}>取消</button><button className="btn-primary" disabled={busy || amount < 1} onClick={() => void submit()}>{busy ? '提交中…' : '确认到账'}</button></div>
+  </div></div></div>;
 }
 
 function AllocateModal({ order, installment, token, onCancel, onDone }: { order: HoldOrderListItem; installment: HoldInstallment; token: string; onCancel: () => void; onDone: (warning: string | null) => Promise<void> }) {

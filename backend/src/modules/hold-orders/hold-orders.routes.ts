@@ -8,6 +8,7 @@ import { actorFromRequest } from '../../lib/audit.js';
 import { HoldOrderService } from './hold-orders.service.js';
 import {
   allocateHoldInstallmentBodySchema,
+  manualReceiptHoldInstallmentBodySchema,
   createHoldGroupBodySchema,
   createHoldOrderBodySchema,
   convertHoldOrderBodySchema,
@@ -92,6 +93,13 @@ export const holdOrderRoutes: FastifyPluginAsync = async (app) => {
     const { id, installmentId } = req.params as { id: string; installmentId: string };
     const body = allocateHoldInstallmentBodySchema.parse(req.body);
     return { result: await service.allocateInstallment(id, installmentId, body, actorFromRequest(req)) };
+  });
+
+  // 手工到账：运营凭客户水单给某期直接录钱（建 OPS_CLAIM 进账并认到本期；财务事后核实）。
+  app.post('/:id/installments/:installmentId/manual-receipt', pre, async (req) => {
+    const { id, installmentId } = req.params as { id: string; installmentId: string };
+    const body = manualReceiptHoldInstallmentBodySchema.parse(req.body);
+    return { result: await service.manualReceiptInstallment(id, installmentId, body, { ...actorFromRequest(req), userId: req.user.sub }) };
   });
 
   app.post('/:id/installments/:installmentId/allocations/:allocationId/reverse', pre, async (req) => {

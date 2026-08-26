@@ -13,6 +13,7 @@ import {
   PaymentMethod,
   Prisma,
   ReminderStatus,
+  ReceiptSource,
   ReceiptStatus,
   SeatLockStatus,
   UserRole,
@@ -25,6 +26,7 @@ import type { AuditActor } from '../../lib/audit.js';
 import { heldSeatsForSeatClass } from './held-seats.js';
 import { OrderService } from '../orders/orders.service.js';
 import { PaymentsService } from '../payments/payments.service.js';
+import { createOpenReceiptWithinTx } from '../receipts/receipts.service.js';
 import {
   attributableReceivedCny,
   holdLedgerTotals,
@@ -516,7 +518,8 @@ export class HoldOrderService {
     const rows = await prisma.holdOrder.findMany({
       where: await holdListWhere(query),
       include: {
-        installments: { orderBy: { seq: 'asc' }, include: { allocations: true } },
+        // 认款行带上进账来源与核实状态：前端据此把 OPS_CLAIM 未核实的行标成「手工到账 · 待财务核实」。
+        installments: { orderBy: { seq: 'asc' }, include: { allocations: { include: { receipt: { select: { receiptNo: true, source: true, verifiedAt: true } } } } } },
         reductions: { orderBy: { createdAt: 'asc' } },
         conversions: {
           orderBy: { createdAt: 'asc' },
@@ -713,6 +716,16 @@ export class HoldOrderService {
 
       let paymentId: string | null = null;
       if (carryCny > 0) {
+        // 结转款的核实状态继承来源：占位单已收里只要还有未核实的运营水单登记（OPS_CLAIM），
+        // 结转生成的订单收款就同样标未核实——钱没被财务对过流水，不因搬到订单侧就洗白，
+        // 订单出票前的未核实提示据此继续生效。
+        const unverifiedClaims = await tx.holdReceiptAllocation.count({
+          where: {
+            holdOrderId: existing.id,
+            reversedAt: null,
+            receipt: { source: ReceiptSource.OPS_CLAIM, verifiedAt: null },
+          },
+        });
         const credited = await this.paymentsService._creditOrderPaymentWithinTx(
           tx,
           created.order.id,
@@ -720,6 +733,7 @@ export class HoldOrderService {
             amount: carryCny,
             method: PaymentMethod.BANK_CARD,
             note: `占位单 ${existing.holdNo} 结转`,
+            verified: unverifiedClaims === 0,
           },
           { userId: actorUserId ?? 'system-hold-conversion', role: actorRole },
           pendingFulfillmentTaskIds,
@@ -977,7 +991,55 @@ export class HoldOrderService {
   }
 
   async allocateInstallment(id: string, installmentId: string, body: AllocateHoldInstallmentBody, actor: AuditActor) {
+    const result = await prisma.$transaction(async (tx) =>
+      this._allocateInstallmentWithinTx(tx, id, installmentId, { receiptId: body.receiptId, amountCny: body.amountCny }, actor),
+    );
+    auditHold(actor, 'ALLOCATE_HOLD_INSTALLMENT', result, { after: { receiptNo: result.receiptNo, installmentId, installmentSeq: result.installmentSeq, amountCny: result.allocated, installmentPaid: result.installmentPaid, holdStatus: result.holdStatus, warning: result.warning } });
+    return result;
+  }
+
+  /**
+   * 占位单手工到账：运营凭客户水单直接给某期录钱，不等财务先导流水。
+   *
+   * 实现 = 同一事务里「建一笔 OPS_CLAIM 进账（未核实）+ 走认款内核认到本期」——
+   * 守恒账本（Receipt → HoldReceiptAllocation → 期次）原样复用，财务侧照常可见可撤。
+   * 这笔钱在财务对上流水前一直是「待核实」（Receipt.verifiedAt 为空），进对账台待核实队列；
+   * 转正结转、出票提示都会带着未核实标记走（见 convert 侧 unverifiedClaims）。
+   */
+  async manualReceiptInstallment(
+    id: string,
+    installmentId: string,
+    body: { amountCny: number; method: PaymentMethod; proofUrl?: string | null; note?: string | null },
+    actor: AuditActor & { userId: string },
+  ) {
     const result = await prisma.$transaction(async (tx) => {
+      const receipt = await createOpenReceiptWithinTx(tx, {
+        amountCny: body.amountCny,
+        method: body.method,
+        source: ReceiptSource.OPS_CLAIM,
+        proofUrl: body.proofUrl ?? null,
+        payerNote: body.note ?? null,
+        createdById: actor.userId,
+      });
+      return this._allocateInstallmentWithinTx(tx, id, installmentId, { receiptId: receipt.id, amountCny: body.amountCny }, actor);
+    });
+    auditHold(actor, 'MANUAL_RECEIPT_HOLD_INSTALLMENT', result, { after: { receiptNo: result.receiptNo, installmentId, installmentSeq: result.installmentSeq, amountCny: result.allocated, installmentPaid: result.installmentPaid, holdStatus: result.holdStatus, unverified: true, note: body.note ?? null } });
+    return result;
+  }
+
+  /**
+   * 认款内核（事务内变体）：把一笔进账的一部分认到占位单某期。
+   * allocateInstallment（挂账池认款）与 manualReceiptInstallment（手工到账）共用，
+   * 口径一字不差：进账 FOR UPDATE → 占位单锁 → 期次余额校验 → 写认款 → 重算进账/期次/单状态。
+   */
+  private async _allocateInstallmentWithinTx(
+    tx: Prisma.TransactionClient,
+    id: string,
+    installmentId: string,
+    body: { receiptId: string; amountCny: number },
+    actor: AuditActor,
+  ) {
+    {
       const receiptRows = await tx.$queryRaw<Array<{ id: string; receiptNo: string; amountCny: Prisma.Decimal; allocatedCny: Prisma.Decimal; status: ReceiptStatus }>>`
         SELECT id, "receiptNo", "amountCny", "allocatedCny", status FROM "Receipt" WHERE id = ${body.receiptId} FOR UPDATE
       `;
@@ -1024,17 +1086,15 @@ export class HoldOrderService {
       }
       if (nextStatus !== hold.status) await tx.holdOrder.update({ where: { id }, data: { status: nextStatus } });
       return { id, allocation, holdNo: hold.holdNo, flightScheduleId: hold.flightScheduleId, receiptNo: receipt.receiptNo, installmentSeq: installment.seq, allocated: body.amountCny, installmentPaid: newlyPaid, holdStatus: nextStatus, warning };
-    });
-    auditHold(actor, 'ALLOCATE_HOLD_INSTALLMENT', result, { after: { receiptNo: result.receiptNo, installmentId, installmentSeq: result.installmentSeq, amountCny: result.allocated, installmentPaid: result.installmentPaid, holdStatus: result.holdStatus, warning: result.warning } });
-    return result;
+    }
   }
 
   async reverseInstallmentAllocation(id: string, installmentId: string, allocationId: string, reason: string, actor: AuditActor) {
     const result = await prisma.$transaction(async (tx) => {
       const allocation = await tx.holdReceiptAllocation.findUnique({ where: { id: allocationId } });
       if (!allocation || allocation.holdOrderId !== id || allocation.holdInstallmentId !== installmentId || allocation.reversedAt) throw new NotFoundError('占位单认款记录不存在或已撤销');
-      const receiptRows = await tx.$queryRaw<Array<{ id: string; receiptNo: string; amountCny: Prisma.Decimal; allocatedCny: Prisma.Decimal; status: ReceiptStatus }>>`
-        SELECT id, "receiptNo", "amountCny", "allocatedCny", status FROM "Receipt" WHERE id = ${allocation.receiptId} FOR UPDATE
+      const receiptRows = await tx.$queryRaw<Array<{ id: string; receiptNo: string; amountCny: Prisma.Decimal; allocatedCny: Prisma.Decimal; status: ReceiptStatus; source: ReceiptSource }>>`
+        SELECT id, "receiptNo", "amountCny", "allocatedCny", status, source FROM "Receipt" WHERE id = ${allocation.receiptId} FOR UPDATE
       `;
       const receipt = receiptRows[0];
       if (!receipt) throw new NotFoundError('进账不存在');
@@ -1053,10 +1113,15 @@ export class HoldOrderService {
       const amount = money(currentAllocation.amountCny);
       const newAllocated = Math.max(0, money(receipt.allocatedCny) - amount);
       await tx.holdReceiptAllocation.update({ where: { id: allocationId }, data: { reversedAt: new Date() } });
-      const receiptStatus = newAllocated <= 0
-        ? ReceiptStatus.OPEN
-        : newAllocated >= money(receipt.amountCny) ? ReceiptStatus.ALLOCATED : ReceiptStatus.PARTIALLY_ALLOCATED;
-      await tx.receipt.update({ where: { id: receipt.id }, data: { allocatedCny: new Prisma.Decimal(newAllocated), status: receiptStatus } });
+      // OPS_CLAIM（运营水单登记）是为这一笔认款而生的：全额撤销后不该以 OPEN 回到挂账池
+      // （池子里会多出一笔并不存在的「进账」等人认领），直接作废并留痕。
+      const claimFullyReversed = receipt.source === ReceiptSource.OPS_CLAIM && newAllocated <= 0;
+      const receiptStatus = claimFullyReversed
+        ? ReceiptStatus.REFUNDED
+        : newAllocated <= 0
+          ? ReceiptStatus.OPEN
+          : newAllocated >= money(receipt.amountCny) ? ReceiptStatus.ALLOCATED : ReceiptStatus.PARTIALLY_ALLOCATED;
+      await tx.receipt.update({ where: { id: receipt.id }, data: { allocatedCny: new Prisma.Decimal(newAllocated), status: receiptStatus, ...(claimFullyReversed ? { refundNote: '运营手工到账撤销，登记作废' } : {}) } });
       const installment = hold.installments.find((item) => item.id === installmentId)!;
       const postInstallments = await syncInstallmentPaidStates(tx, id);
       const nowPaid = postInstallments.find((item) => item.id === installmentId)?.status === HoldInstallmentStatus.PAID;

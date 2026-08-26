@@ -6,6 +6,8 @@ const { prismaMock, orderCreateMock, paymentMock, advancePaidMock, auditMock } =
     holdOrder: { findUnique: vi.fn(), update: vi.fn() },
     holdInstallment: { update: vi.fn(), findMany: vi.fn() },
     holdConversionRecord: { create: vi.fn(), findUnique: vi.fn() },
+    // 结转款核实状态继承：convert 会数一遍未核实的 OPS_CLAIM 认款（默认 0 = 全部已核实）
+    holdReceiptAllocation: { count: vi.fn() },
     order: { findUnique: vi.fn() },
     $queryRaw: vi.fn(),
     $transaction: vi.fn(),
@@ -84,6 +86,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   prismaMock.$transaction.mockImplementation(async (callback: (tx: typeof prismaMock) => unknown) => callback(prismaMock));
   prismaMock.$queryRaw.mockResolvedValue([{ id: 'seat_1' }]);
+  prismaMock.holdReceiptAllocation.count.mockResolvedValue(0);
   prismaMock.holdOrder.findUnique.mockResolvedValue(makeHold());
   prismaMock.holdOrder.update.mockResolvedValue({});
   prismaMock.holdInstallment.update.mockResolvedValue({});

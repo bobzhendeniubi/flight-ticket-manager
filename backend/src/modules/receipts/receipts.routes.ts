@@ -33,6 +33,7 @@ import {
   parseStatementSchema,
   refundReceiptSchema,
   registerReceiptSchema,
+  verifyClaimReceiptSchema,
 } from './receipts.schemas.js';
 import { statementExportFilename, statementPlatformFileError } from './receipts.statement.js';
 
@@ -93,6 +94,17 @@ export const receiptRoutes: FastifyPluginAsync = async (app) => {
     const { id } = req.params as { id: string };
     const body = refundReceiptSchema.parse(req.body);
     return service.refund(id, body.note, { userId: req.user.sub, role: req.user.role });
+  });
+
+  // ── 运营水单登记（OPS_CLAIM）财务核实：待核实清单 + 核实动作 ──
+  app.get('/unverified-claims', { preHandler: [app.authenticate, requireAdminOrStaff] }, async () => {
+    return { items: await service.listUnverifiedClaims() };
+  });
+
+  app.post('/:id/verify-claim', { preHandler: [app.authenticate, requireAdminOrStaff] }, async (req) => {
+    const { id } = req.params as { id: string };
+    const body = verifyClaimReceiptSchema.parse(req.body ?? {});
+    return service.verifyClaimReceipt(id, { externalTxnId: body.externalTxnId ?? null }, { userId: req.user.sub, role: req.user.role });
   });
 
   // ── 二维码流水解析（预览，不写库）─────────────────────

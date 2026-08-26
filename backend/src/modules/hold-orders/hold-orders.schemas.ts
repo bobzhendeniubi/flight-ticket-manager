@@ -4,9 +4,11 @@ import {
   HoldOrderStatus,
   HoldOverdueAction,
   HoldOwnerType,
+  PaymentMethod,
 } from '@prisma/client';
 import { z } from 'zod';
 import { batchPassengerInputSchema } from '../orders/orders.schemas.js';
+import { proofUrlSchema } from '../../lib/proof-url.js';
 
 const cabinSchema = z.nativeEnum(CabinClass);
 const ownerTypeSchema = z.nativeEnum(HoldOwnerType);
@@ -155,6 +157,15 @@ export const allocateHoldInstallmentBodySchema = z.object({
   amountCny: z.number().int().min(1),
 });
 export type AllocateHoldInstallmentBody = z.infer<typeof allocateHoldInstallmentBodySchema>;
+
+// 手工到账：运营凭客户水单直接录钱（不经挂账池认款；财务事后核实）。
+export const manualReceiptHoldInstallmentBodySchema = z.object({
+  amountCny: z.number().int().min(1),
+  method: z.enum([PaymentMethod.WECHAT_PAY, PaymentMethod.ALIPAY, PaymentMethod.BANK_CARD]),
+  proofUrl: proofUrlSchema.optional(),
+  note: z.string().trim().max(500).optional(),
+});
+export type ManualReceiptHoldInstallmentBody = z.infer<typeof manualReceiptHoldInstallmentBodySchema>;
 
 export const reverseHoldAllocationBodySchema = z.object({
   reason: z.string().trim().min(1).max(200),

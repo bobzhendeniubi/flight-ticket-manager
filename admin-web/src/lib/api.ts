@@ -1001,6 +1001,8 @@ export interface HoldReceiptAllocation {
   reversedAt: string | null;
   createdById: string | null;
   createdAt: string;
+  // 进账来源与核实状态（列表联查带出）：source=OPS_CLAIM 且 verifiedAt 空 = 运营手工到账待财务核实。
+  receipt?: { receiptNo: string; source: string; verifiedAt: string | null } | null;
 }
 
 export interface HoldReductionRecord {
@@ -1513,6 +1515,8 @@ export interface OrderSummary {
   reminders?: OperationalReminder[];
   // 订单详情(getOrder)带出的收款记录（列表不含，避免 proof 数据膨胀）
   payments?: OrderPayment[];
+  // 未经财务核实的已收金额（详情联查 payments 时后端派生；出票前提示用，仅内部角色下发）
+  unverifiedPaidCny?: number;
   /**
    * 订单详情(getOrder)带出的退款记录（列表不含）。
    * ⚠️ amount 是**申请时冻结的应退总额**，含「会自动退回代理预存余额」的部分——
@@ -1834,6 +1838,9 @@ export interface OrderPayment {
   reconciled?: boolean;
   receiptNo?: string | null;
   externalTxnId?: string | null;
+  // 到账双状态：财务核过流水才 verified=true（人工录入的到账在核实前为 false，出票前提示用）。
+  verified?: boolean;
+  verifiedAt?: string | null;
 }
 
 // ── Audit / Customers / Travelers / Fulfillment ──────────────────────────
@@ -2827,7 +2834,7 @@ export interface UpdatePaymentChannelInput {
 /** 进账状态：未认领 / 部分认领 / 已认领 / 已退款 */
 export type ReceiptStatus = 'OPEN' | 'PARTIALLY_ALLOCATED' | 'ALLOCATED' | 'REFUNDED';
 /** 进账来源：客户上传 / 后台录入 / 订单超额转入 / 二维码流水导入 */
-export type ReceiptSource = 'CUSTOMER_UPLOAD' | 'STAFF_ENTRY' | 'ORDER_OVERPAY' | 'STATEMENT_IMPORT';
+export type ReceiptSource = 'CUSTOMER_UPLOAD' | 'STAFF_ENTRY' | 'ORDER_OVERPAY' | 'STATEMENT_IMPORT' | 'OPS_CLAIM';
 
 export const RECEIPT_STATUS_LABEL: Record<ReceiptStatus, string> = {
   OPEN: '待认领',
@@ -2840,6 +2847,7 @@ export const RECEIPT_SOURCE_LABEL: Record<ReceiptSource, string> = {
   STAFF_ENTRY: '后台录入',
   ORDER_OVERPAY: '订单超额',
   STATEMENT_IMPORT: '流水导入',
+  OPS_CLAIM: '运营水单登记',
 };
 
 /** 流水预览行处置：ok=可导入；dup_in_db=库里已有；dup_in_file=文件内重复；skipped_status=非支付成功；invalid=解析失败 */
@@ -2981,6 +2989,37 @@ export interface CreateReceiptInput {
 }
 
 /** 全部流水：进账 + 订单收款合并视图（GET /receipts/ledger） */
+// ── 到账核实（待核实队列）──────────────────────────────────────────────
+export interface UnverifiedPaymentItem {
+  id: string;
+  orderId: string;
+  orderNumber: string;
+  agentName: string | null;
+  contactName: string | null;
+  amountCny: number;
+  method: PaymentMethod;
+  note: string | null;
+  proofUrl: string | null;
+  confirmedByName: string | null;
+  paidAt: string | null;
+  createdAt: string;
+}
+
+export interface UnverifiedClaimItem {
+  id: string;
+  receiptNo: string;
+  amountCny: number;
+  method: PaymentMethod;
+  note: string | null;
+  proofUrl: string | null;
+  createdByName: string | null;
+  holdNo: string | null;
+  groupName: string | null;
+  installmentLabel: string | null;
+  receivedAt: string;
+  createdAt: string;
+}
+
 export interface LedgerEntry {
   kind: 'RECEIPT' | 'ORDER_PAYMENT';
   id: string;
@@ -3425,6 +3464,10 @@ export const api = {
   allocateHoldInstallment: (token: string, holdId: string, installmentId: string, body: { receiptId: string; amountCny: number }) =>
     apiFetch<{ result: { allocation: HoldReceiptAllocation; receiptNo: string; installmentPaid: boolean; holdStatus: HoldOrderStatus; warning: string | null } }>(
       `/hold-orders/${holdId}/installments/${installmentId}/allocate`, { method: 'POST', token, body }),
+  // 手工到账：运营凭客户水单直接给某期录钱（建 OPS_CLAIM 进账并认款；财务事后在对账台核实）。
+  manualReceiptHoldInstallment: (token: string, holdId: string, installmentId: string, body: { amountCny: number; method: PaymentMethod; proofUrl?: string; note?: string }) =>
+    apiFetch<{ result: { allocation: HoldReceiptAllocation; receiptNo: string; installmentPaid: boolean; holdStatus: HoldOrderStatus; warning: string | null } }>(
+      `/hold-orders/${holdId}/installments/${installmentId}/manual-receipt`, { method: 'POST', token, body }),
   reverseHoldInstallmentAllocation: (token: string, holdId: string, installmentId: string, allocationId: string, reason: string) =>
     apiFetch<{ result: { receiptNo: string; amount: number; holdStatus: HoldOrderStatus; reason: string } }>(
       `/hold-orders/${holdId}/installments/${installmentId}/allocations/${allocationId}/reverse`, { method: 'POST', token, body: { reason }}),
@@ -4953,6 +4996,23 @@ export const api = {
       `/receipts/${id}/refund`,
       { method: 'POST', token, body: { note } },
     ),
+
+  // ── 到账核实（业务已收 → 财务已核实）ADMIN/STAFF ──
+  // 待核实的订单人工收款（含批量到账、占位单结转的未核实款）
+  listUnverifiedPayments: (token: string) =>
+    apiFetch<{ items: UnverifiedPaymentItem[] }>('/payments/unverified', { token }),
+  // 核实一笔订单人工收款（录入人不能核实自己录的，ADMIN 除外）
+  verifyPayment: (token: string, paymentId: string) =>
+    apiFetch<{ ok: true; paymentId: string; orderNumber: string; verifiedAt: string }>(
+      `/payments/${paymentId}/verify`, { method: 'POST', token, body: {} }),
+  // 待核实的运营水单登记（占位单手工到账）
+  listUnverifiedClaims: (token: string) =>
+    apiFetch<{ items: UnverifiedClaimItem[] }>('/receipts/unverified-claims', { token }),
+  // 核实一笔运营水单登记；可选带收单平台交易流水号（写 externalTxnId，之后同号流水导入自动去重）
+  verifyClaimReceipt: (token: string, receiptId: string, externalTxnId?: string) =>
+    apiFetch<{ ok: true; receiptId: string; receiptNo: string; verifiedAt: string }>(
+      `/receipts/${receiptId}/verify-claim`,
+      { method: 'POST', token, body: externalTxnId ? { externalTxnId } : {} }),
 
   // ── 二维码流水导入 + 认款工作台（ADMIN/STAFF）──
   // 解析收单平台流水 xlsx（base64）→ 预览行 + 处置判定（不写库）

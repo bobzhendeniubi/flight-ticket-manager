@@ -300,6 +300,8 @@ export class PaymentsService {
           data: {
             status: PaymentStatus.SUCCEEDED,
             paidAt: verification.paidAt ?? new Date(),
+            // 网关验签通过 = 收单机构确认真钱到账，创建即已核实（不进待核实队列）。
+            verifiedAt: new Date(),
             transactionId: verification.transactionId ?? payment.transactionId,
             gatewayPayload: (verification.rawPayload ?? null) as Prisma.InputJsonValue,
           },
@@ -779,6 +781,133 @@ export class PaymentsService {
   }
 
   /**
+   * 财务核实一笔人工录入的收款（到账双状态的第二段）。
+   *
+   * 人工确认收款（含批量到账）只是「业务已收」——运营/客服凭客户水单录的账；财务在银行/收单
+   * 后台对到这笔钱后点核实，落 verifiedAt/verifiedById，从待核实队列消失。
+   * 防呆：录入人不能核实自己录的账（ADMIN 除外——小团队里管理员常一人多岗）。
+   */
+  async verifyManualPayment(
+    paymentId: string,
+    actor: { userId: string; role: UserRole },
+  ): Promise<{ ok: true; paymentId: string; orderNumber: string; verifiedAt: Date }> {
+    const result = await prisma.$transaction(async (tx) => {
+      const payment = await tx.payment.findUnique({
+        where: { id: paymentId },
+        include: { order: { select: { orderNumber: true } } },
+      });
+      if (!payment) throw new NotFoundError('收款记录不存在');
+      if (payment.status !== PaymentStatus.SUCCEEDED) {
+        throw new ConflictError('该笔收款不是已入账状态（可能已被撤销），无需核实。');
+      }
+      if (payment.verifiedAt) {
+        throw new ConflictError('该笔收款已经核实过了，请刷新列表。');
+      }
+      const payload =
+        payment.gatewayPayload &&
+        typeof payment.gatewayPayload === 'object' &&
+        !Array.isArray(payment.gatewayPayload)
+          ? (payment.gatewayPayload as Record<string, unknown>)
+          : null;
+      if (
+        actor.role !== UserRole.ADMIN &&
+        typeof payload?.confirmedBy === 'string' &&
+        payload.confirmedBy === actor.userId
+      ) {
+        throw new ConflictError('不能核实自己录入的到账，请由财务或其他同事核实。');
+      }
+      const verifiedAt = new Date();
+      await tx.payment.update({
+        where: { id: paymentId },
+        data: { verifiedAt, verifiedById: actor.userId },
+      });
+      return { paymentId, orderNumber: payment.order.orderNumber, amount: Number(payment.amount), verifiedAt };
+    });
+
+    void writeAudit({
+      actor: { userId: actor.userId, role: actor.role },
+      action: 'VERIFY_MANUAL_PAYMENT',
+      targetType: 'ORDER',
+      targetId: paymentId,
+      targetLabel: result.orderNumber,
+      after: { paymentId, amountCny: result.amount, verifiedAt: result.verifiedAt.toISOString() },
+      severity: 'INFO',
+    });
+
+    return { ok: true as const, paymentId, orderNumber: result.orderNumber, verifiedAt: result.verifiedAt };
+  }
+
+  /**
+   * 待财务核实的订单收款清单（异常队列数据源）。
+   *
+   * 口径：SUCCEEDED、正额、verifiedAt 为空。历史数据在迁移时已回填视同核实；认款/网关/内部
+   * 处置记录创建即核实——所以剩下的恰好是「人工录入后财务还没对上流水」的账。
+   */
+  async listUnverifiedPayments(): Promise<
+    Array<{
+      id: string;
+      orderId: string;
+      orderNumber: string;
+      agentName: string | null;
+      contactName: string | null;
+      amountCny: number;
+      method: PaymentMethod;
+      note: string | null;
+      proofUrl: string | null;
+      confirmedByName: string | null;
+      paidAt: Date | null;
+      createdAt: Date;
+    }>
+  > {
+    const payments = await prisma.payment.findMany({
+      where: { status: PaymentStatus.SUCCEEDED, verifiedAt: null, amount: { gt: 0 } },
+      orderBy: { createdAt: 'asc' },
+      include: {
+        order: {
+          select: {
+            id: true,
+            orderNumber: true,
+            contactName: true,
+            agent: { select: { companyName: true } },
+          },
+        },
+      },
+    });
+    // 录入人名字批量查一次（confirmedBy 埋在 gatewayPayload 里，没外键）。
+    const userIds = new Set<string>();
+    const payloadOf = (p: (typeof payments)[number]): Record<string, unknown> | null =>
+      p.gatewayPayload && typeof p.gatewayPayload === 'object' && !Array.isArray(p.gatewayPayload)
+        ? (p.gatewayPayload as Record<string, unknown>)
+        : null;
+    for (const p of payments) {
+      const confirmedBy = payloadOf(p)?.confirmedBy;
+      if (typeof confirmedBy === 'string') userIds.add(confirmedBy);
+    }
+    const users = userIds.size
+      ? await prisma.user.findMany({ where: { id: { in: [...userIds] } }, select: { id: true, displayName: true, email: true } })
+      : [];
+    const nameById = new Map(users.map((u) => [u.id, u.displayName || u.email]));
+    return payments.map((p) => {
+      const payload = payloadOf(p);
+      const confirmedBy = typeof payload?.confirmedBy === 'string' ? payload.confirmedBy : null;
+      return {
+        id: p.id,
+        orderId: p.order.id,
+        orderNumber: p.order.orderNumber,
+        agentName: p.order.agent?.companyName ?? null,
+        contactName: p.order.contactName ?? null,
+        amountCny: Number(p.amount),
+        method: p.method,
+        note: typeof payload?.note === 'string' ? payload.note : null,
+        proofUrl: p.proofUrl ?? null,
+        confirmedByName: confirmedBy ? (nameById.get(confirmedBy) ?? null) : null,
+        paidAt: p.paidAt,
+        createdAt: p.createdAt,
+      };
+    });
+  }
+
+  /**
    * 在调用方事务内给订单入账 —— confirmManualPayment 入账内核的「事务内」变体。
    *
    * 收款对账台「认领进账到订单」复用此函数：因为认领必须和
@@ -811,6 +940,12 @@ export class PaymentsService {
       // 不靠金额猜。调用方（receipts.allocate）先建 ReceiptAllocation 再入账，故恒可拿到 id；
       // 历史数据无此键，撤销侧按 receiptNo + 金额兜底匹配。
       reconciliation?: { receiptNo: string; externalTxnId?: string | null; allocationId?: string };
+      /**
+       * 财务核实标记（到账双状态）：true = 创建即已核实（对账认款——财务亲手认的；或结转来源
+       * 全部已核实），false = 待财务核实（占位单结转款里含未核实的运营水单登记）。
+       * 必传——每个调用方都要自己决定这笔钱算不算核实过，不给默认值以免新调用方无脑漏标。
+       */
+      verified: boolean;
     },
     actor: { userId: string; role: UserRole },
     pendingFulfillmentTaskIds: string[],
@@ -874,6 +1009,8 @@ export class PaymentsService {
         amount: new Prisma.Decimal(amount),
         status: PaymentStatus.SUCCEEDED,
         paidAt: new Date(),
+        verifiedAt: input.verified ? new Date() : null,
+        verifiedById: input.verified ? actor.userId : null,
         proofUrl: input.proofUrl ?? null,
         gatewayPayload: {
           manual: true,
