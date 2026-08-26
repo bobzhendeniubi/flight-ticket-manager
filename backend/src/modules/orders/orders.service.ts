@@ -6232,6 +6232,9 @@ export class OrderService {
         contactPhone: order.contactPhone,
         contactEmail: order.contactEmail,
         total: order.total.toFixed(2),
+        // 应付 = total + adjustmentCny（改期费/换人费等售后调整），与订单详情「应收」/
+        // effectivePayable 同口径 —— 行程单金额不能漏掉这块（itinerary-pdf.ts 里用它算应付）。
+        adjustmentCny: Number(order.adjustmentCny ?? 0),
         currency: order.currency,
         createdAt: order.createdAt,
         flights: flightItems.map((i) => ({
