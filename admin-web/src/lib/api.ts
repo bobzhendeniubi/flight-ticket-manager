@@ -1335,9 +1335,10 @@ export interface SalesReportRow {
   orderCount: number;
   revenueCny: number;
   costCny: number;
-  grossMarginCny: number;
-  /** 小数分数（0.3456 = 34.56%） */
-  marginPct: number;
+  /** 桶内存在无成本行时为 null（毛利未知，不虚报 100%） */
+  grossMarginCny: number | null;
+  /** 小数分数（0.3456 = 34.56%）；同上，缺成本时 null */
+  marginPct: number | null;
   missingCostItemCount: number;
 }
 

@@ -6,14 +6,21 @@
  *   - 一律排除软删除（deletedAt != null）
  *   - 收入 = OrderItem.amount（行级）；成本 = OrderItem.totalCostCny（下单时锁定的快照）
  *   - 成本快照为 NULL 的行跳过成本累计，计入 missingCostItemCount 提醒补录
+ *   - 该桶只要有一行缺成本，毛利/毛利率就报 null（「未知」），不给虚高的精确数字。
+ *     口径与 finances.service.ts 的 A5 收口一致，见 SalesRow.grossMarginCny 注释。
  *
  * 应收口径：
- *   - 应收余额 = total + adjustmentCny − paidAmount − prepaymentOffset
+ *   - 应收余额 = total + adjustmentCny − 已收净额；已收净额口径见 lib/net-received.ts
  *   - 应收状态集 RECEIVABLE_STATUSES：进行中的六态（不含 COMPLETED / REFUND_REQUESTED）
  */
 import type { Prisma, PrismaClient } from '@prisma/client';
 import { OrderStatus } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
+import {
+  netReceivedCny,
+  sumCompletedRefundCny,
+  type CompletedRefundShape,
+} from '../../lib/net-received.js';
 
 export interface DateRange {
   /** ISO date 'YYYY-MM-DD'，包含 */
@@ -30,9 +37,16 @@ export interface SalesRow {
   /** 该维度涉及的订单数（去重） */
   orderCount: number;
   revenueCny: number;
+  /** 已录到成本的行的合计。缺成本的行不在内——所以缺成本时这是「部分成本」，不是全额成本 */
   costCny: number;
-  grossMarginCny: number;
-  marginPct: number | null; // null = revenue 为 0
+  /** 毛利 = revenue − cost。
+   *  missingCostItemCount > 0 → null（「未知」）：这个桶里有行没录成本，costCny 只是部分成本，
+   *  拿它算出来的毛利必然虚高（机票/套餐行成本恒 NULL 时甚至恒等于 100% 毛利率）。
+   *  缺成本的毛利就是未知，不装知道——与 finances.service.ts 概览/订单毛利页同一哲学。 */
+  grossMarginCny: number | null;
+  /** grossMargin / revenue；revenue 为 0 或毛利未知时为 null */
+  marginPct: number | null;
+  /** 该桶里成本快照为 NULL 的 OrderItem 条数（用于提醒补录 + 解释毛利为何是「—」） */
   missingCostItemCount: number;
 }
 
@@ -40,8 +54,10 @@ export interface SalesTotals {
   /** 区间内订单总数（去重，不随维度重复计） */
   orderCount: number;
   revenueCny: number;
+  /** 同 SalesRow.costCny：缺成本时为部分成本 */
   costCny: number;
-  grossMarginCny: number;
+  /** 同 SalesRow.grossMarginCny：存在缺成本行时为 null */
+  grossMarginCny: number | null;
   marginPct: number | null;
   missingCostItemCount: number;
 }
@@ -62,7 +78,7 @@ export interface ReceivableRow {
   status: string;
   /** 应收合计 = total + adjustmentCny */
   totalCny: number;
-  /** 已收合计 = paidAmount + prepaymentOffset */
+  /** 已收净额 = paidAmount + prepaymentOffset − Σ COMPLETED Refund（见 lib/net-received.ts） */
   paidCny: number;
   /** 应收余额 = totalCny − paidCny */
   balanceCny: number;
@@ -161,9 +177,22 @@ function round2(n: number): number {
   return Math.round(n * 100) / 100;
 }
 
-function marginPctOf(revenue: number, cost: number): number | null {
-  if (revenue <= 0) return null;
-  return Math.round(((revenue - cost) / revenue) * 10000) / 10000;
+/**
+ * 桶级毛利/毛利率。
+ * missingCost > 0 → 双双 null：cost 只是「已录到的部分成本」，据此算的毛利必然虚高。
+ * revenue <= 0 → 毛利率 null（除零），但毛利本身仍是已知的（例如全退款桶的负毛利）。
+ */
+function marginOf(
+  revenue: number,
+  cost: number,
+  missingCost: number,
+): { grossMarginCny: number | null; marginPct: number | null } {
+  if (missingCost > 0) return { grossMarginCny: null, marginPct: null };
+  const margin = round2(revenue - cost);
+  return {
+    grossMarginCny: margin,
+    marginPct: revenue > 0 ? Math.round((margin / revenue) * 10000) / 10000 : null,
+  };
 }
 
 function agentLabelOf(agent: { companyName: string | null; contactName: string } | null): string {
@@ -249,8 +278,7 @@ export async function getSalesReport(
         orderCount: a.orderIds.size,
         revenueCny: revenue,
         costCny: cost,
-        grossMarginCny: round2(revenue - cost),
-        marginPct: marginPctOf(revenue, cost),
+        ...marginOf(revenue, cost, a.missingCostItemCount),
         missingCostItemCount: a.missingCostItemCount,
       };
     })
@@ -262,8 +290,7 @@ export async function getSalesReport(
     orderCount: orders.length,
     revenueCny: revenue,
     costCny: cost,
-    grossMarginCny: round2(revenue - cost),
-    marginPct: marginPctOf(revenue, cost),
+    ...marginOf(revenue, cost, totalMissing),
     missingCostItemCount: totalMissing,
   };
 
@@ -282,11 +309,21 @@ interface ReceivableOrderShape {
   paidAmount: Prisma.Decimal;
   prepaymentOffset: Prisma.Decimal;
   adjustmentCny: number;
+  /** 已完成退款行（查询侧按 status='COMPLETED' 过滤） */
+  refunds: CompletedRefundShape[];
 }
 
-/** 应收余额（单笔）= total + adjustmentCny − paidAmount − prepaymentOffset */
+/**
+ * 应收余额（单笔）= 应收合计 − 已收净额
+ *   应收合计 = total + adjustmentCny（改期费/换人费等售后费用叠加在 adjustment 上，不改 total）
+ *   已收净额 = paidAmount + prepaymentOffset − Σ COMPLETED Refund（见 lib/net-received.ts）
+ *
+ * 已完成退款必须扣：退款完成只翻 Refund 状态、不回冲 paidAmount，不扣的话「先收后退」的订单
+ * 余额会偏小（钱已经退回客户了，账上却还当收着），甚至被误判成没有欠款而从账龄表里消失。
+ */
 function balanceOf(o: ReceivableOrderShape): number {
-  return round2(dec(o.total) + o.adjustmentCny - dec(o.paidAmount) - dec(o.prepaymentOffset));
+  const received = netReceivedCny(o, sumCompletedRefundCny(o.refunds));
+  return round2(dec(o.total) + o.adjustmentCny - received);
 }
 
 /** 应收账龄：所有进行中订单里余额 > 0 的明细 + 账龄桶汇总 */
@@ -306,6 +343,8 @@ export async function getReceivablesReport(
       adjustmentCny: true,
       createdAt: true,
       agent: { select: { companyName: true, contactName: true } },
+      // 已收净额要扣已完成退款——只取 COMPLETED，在途退款（REQUESTED/APPROVED/PROCESSING）钱还没出去
+      refunds: { where: { status: 'COMPLETED' }, select: { amount: true } },
     },
   });
 
@@ -369,6 +408,8 @@ export async function getAgentDebtsReport(
         paidAmount: true,
         prepaymentOffset: true,
         adjustmentCny: true,
+        // 与应收账龄同口径：已收净额扣已完成退款，见 balanceOf
+        refunds: { where: { status: 'COMPLETED' }, select: { amount: true } },
       },
     }),
     client.agent.findMany({
