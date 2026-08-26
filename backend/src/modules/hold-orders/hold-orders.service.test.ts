@@ -216,3 +216,67 @@ describe('HoldOrderService actions', () => {
     }));
   });
 });
+
+describe('HoldOrderService.updateInfo', () => {
+  it('占座中修改团名和备注成功，并写入审计', async () => {
+    prismaMock.holdOrder.findUnique.mockResolvedValue(hold({ groupName: '春季团', notes: '旧备注' }));
+    prismaMock.holdOrder.update.mockResolvedValue({});
+
+    const result = await service.updateInfo('hold_1', { groupName: '夏季团', notes: '新备注' }, { userId: 'user_1' });
+
+    expect(prismaMock.holdOrder.update).toHaveBeenCalledWith({
+      where: { id: 'hold_1' },
+      data: { groupName: '夏季团', notes: '新备注' },
+    });
+    expect(result).toEqual({ id: 'hold_1', groupName: '夏季团', notes: '新备注' });
+    expect(auditMock).toHaveBeenCalledWith(expect.objectContaining({
+      action: 'UPDATE_HOLD_ORDER_INFO',
+      before: { groupName: '春季团', notes: '旧备注' },
+      after: { groupName: '夏季团', notes: '新备注' },
+    }));
+  });
+
+  it('只传备注时团名保持不变，只更新备注', async () => {
+    prismaMock.holdOrder.findUnique.mockResolvedValue(hold({ groupName: '春季团', notes: null }));
+    prismaMock.holdOrder.update.mockResolvedValue({});
+
+    const result = await service.updateInfo('hold_1', { notes: '补充备注' }, { userId: 'user_1' });
+
+    expect(prismaMock.holdOrder.update).toHaveBeenCalledWith({
+      where: { id: 'hold_1' },
+      data: { notes: '补充备注' },
+    });
+    expect(result).toEqual({ id: 'hold_1', groupName: '春季团', notes: '补充备注' });
+  });
+
+  it('直客占位清空团名被拒', async () => {
+    prismaMock.holdOrder.findUnique.mockResolvedValue(hold({ ownerType: HoldOwnerType.CUSTOMER, agentId: null, groupName: '春季团' }));
+    prismaMock.holdOrder.update.mockResolvedValue({});
+
+    await expect(service.updateInfo('hold_1', { groupName: '' }, { userId: 'user_1' })).rejects.toThrow('不能清空');
+    expect(prismaMock.holdOrder.update).not.toHaveBeenCalled();
+  });
+
+  it('代理占位允许清空团名', async () => {
+    prismaMock.holdOrder.findUnique.mockResolvedValue(hold({ ownerType: HoldOwnerType.AGENT, groupName: '临时团名' }));
+    prismaMock.holdOrder.update.mockResolvedValue({});
+
+    const result = await service.updateInfo('hold_1', { groupName: '' }, { userId: 'user_1' });
+
+    expect(prismaMock.holdOrder.update).toHaveBeenCalledWith({
+      where: { id: 'hold_1' },
+      data: { groupName: null },
+    });
+    expect(result.groupName).toBeNull();
+  });
+
+  it('终态占位单（已转正/已释放/已取消）不能改团名备注', async () => {
+    for (const status of [HoldOrderStatus.CONVERTED, HoldOrderStatus.RELEASED, HoldOrderStatus.CANCELLED]) {
+      prismaMock.holdOrder.findUnique.mockResolvedValue(hold({ status }));
+      prismaMock.holdOrder.update.mockResolvedValue({});
+
+      await expect(service.updateInfo('hold_1', { notes: '想改改不了' }, { userId: 'user_1' })).rejects.toThrow('当前状态不可编辑');
+    }
+    expect(prismaMock.holdOrder.update).not.toHaveBeenCalled();
+  });
+});

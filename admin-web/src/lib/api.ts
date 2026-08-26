@@ -3461,6 +3461,17 @@ export const api = {
       token,
       body,
     }),
+  // 改团名 / 备注：groupName/notes 至少传一项；传空串视为清空（直客单团名不允许清空，后端会拒）。
+  updateHoldOrderInfo: (
+    token: string,
+    id: string,
+    body: { groupName?: string; notes?: string },
+  ) =>
+    apiFetch<{ result: { id: string; groupName: string | null; notes: string | null } }>(`/hold-orders/${id}/info`, {
+      method: 'PATCH',
+      token,
+      body,
+    }),
   allocateHoldInstallment: (token: string, holdId: string, installmentId: string, body: { receiptId: string; amountCny: number }) =>
     apiFetch<{ result: { allocation: HoldReceiptAllocation; receiptNo: string; installmentPaid: boolean; holdStatus: HoldOrderStatus; warning: string | null } }>(
       `/hold-orders/${holdId}/installments/${installmentId}/allocate`, { method: 'POST', token, body }),

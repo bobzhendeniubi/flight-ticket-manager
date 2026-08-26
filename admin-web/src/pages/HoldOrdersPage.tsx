@@ -126,6 +126,7 @@ export function HoldOrdersPage() {
   const [busy, setBusy] = useState(false);
   const [showForm, setShowForm] = useState(false);
   const [priceOrder, setPriceOrder] = useState<HoldOrderListItem | null>(null);
+  const [infoOrder, setInfoOrder] = useState<HoldOrderListItem | null>(null);
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [reduceOrder, setReduceOrder] = useState<HoldOrderListItem | null>(null);
   const [allocateTarget, setAllocateTarget] = useState<{ order: HoldOrderListItem; installment: HoldInstallment } | null>(null);
@@ -383,6 +384,7 @@ export function HoldOrdersPage() {
                     <td className="text-xs text-ink-muted">{new Date(order.createdAt).toLocaleString('zh-CN')}</td>
                     <td className="whitespace-nowrap text-right">
                       <button className="mr-2 text-xs font-medium text-brand-700 disabled:text-ink-muted" disabled={!holding || busy} onClick={() => setPriceOrder(order)}>改价</button>
+                      <button className="mr-2 text-xs font-medium text-brand-700 disabled:text-ink-muted" disabled={!holding || busy} onClick={() => setInfoOrder(order)}>编辑</button>
                       {canConvert && <button className={`mr-2 text-xs font-semibold disabled:text-ink-muted ${order.status === 'FULLY_PAID' ? 'btn-primary px-2 py-1' : 'text-brand-700'}`} disabled={busy} onClick={() => setConvertOrder(order)}>导入名单转正</button>}
                       <button className="mr-2 text-xs font-medium text-amber-700 disabled:text-ink-muted" disabled={!canRelease || busy} onClick={() => void runAction(order, 'release')}>释放</button>
                       <button className="mr-2 text-xs font-medium text-brand-700 disabled:text-ink-muted" disabled={!canReduce || busy} onClick={() => setReduceOrder(order)}>减员</button>
@@ -444,6 +446,24 @@ export function HoldOrdersPage() {
               setPriceOrder(null);
               await Promise.all([reload(), reloadSchedules()]);
               notify('锁定结算价已更新，变更已留痕');
+            } finally {
+              setBusy(false);
+            }
+          }}
+        />
+      )}
+      {infoOrder && (
+        <InfoModal
+          order={infoOrder}
+          onCancel={() => setInfoOrder(null)}
+          onSubmit={async (groupName, notes) => {
+            if (!tokens) return;
+            setBusy(true);
+            try {
+              await api.updateHoldOrderInfo(tokens.accessToken, infoOrder.id, { groupName, notes });
+              setInfoOrder(null);
+              await reload();
+              notify('团名 / 备注已更新');
             } finally {
               setBusy(false);
             }
@@ -1089,6 +1109,31 @@ function PriceModal({ order, onCancel, onSubmit }: { order: HoldOrderListItem; o
       <div className="w-full max-w-md rounded-lg bg-white shadow-xl" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3"><h2 className="text-lg font-semibold">调整锁定结算价</h2><button onClick={onCancel} className="text-xl text-slate-400">×</button></div>
         <div className="space-y-4 px-5 py-4"><p className="text-sm text-ink-muted">占位单 {order.holdNo} · 原价 ¥{order.perSeatPriceCny}/人</p><div><label className="label">新价（元/人）</label><input className="input" type="number" min={0} value={price} onChange={(e) => setPrice(Number(e.target.value))} /></div><div><label className="label">改价原因（必填）</label><textarea className="input min-h-24" maxLength={200} value={reason} onChange={(e) => setReason(e.target.value)} /></div>{error && <p className="rounded bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p>}<div className="flex justify-end gap-3"><button className="btn-secondary" onClick={onCancel}>取消</button><button className="btn-primary" onClick={() => void submit()}>保存改价</button></div></div>
+      </div>
+    </div>
+  );
+}
+
+function InfoModal({ order, onCancel, onSubmit }: { order: HoldOrderListItem; onCancel: () => void; onSubmit: (groupName: string, notes: string) => Promise<void> }) {
+  const dialogRef = useDialogA11y(onCancel);
+  const [groupName, setGroupName] = useState(order.groupName ?? '');
+  const [notes, setNotes] = useState(order.notes ?? '');
+  const [error, setError] = useState<string | null>(null);
+  const submit = async () => {
+    if (order.ownerType === 'CUSTOMER' && !groupName.trim()) { setError('直客占位团名不能清空'); return; }
+    try { await onSubmit(groupName.trim(), notes.trim()); } catch (err) { setError(err instanceof Error ? err.message : '保存失败'); }
+  };
+  return (
+    <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="编辑团名 / 备注" tabIndex={-1} className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" onClick={onCancel}>
+      <div className="w-full max-w-md rounded-lg bg-white shadow-xl" onClick={(e) => e.stopPropagation()}>
+        <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3"><h2 className="text-lg font-semibold">编辑团名 / 备注</h2><button onClick={onCancel} className="text-xl text-slate-400">×</button></div>
+        <div className="space-y-4 px-5 py-4">
+          <p className="text-sm text-ink-muted">占位单 {order.holdNo}</p>
+          <div><label className="label">团名{order.ownerType === 'CUSTOMER' ? '（必填）' : ''}</label><input className="input" maxLength={120} value={groupName} onChange={(e) => setGroupName(e.target.value)} /></div>
+          <div><label className="label">备注</label><textarea className="input min-h-24" maxLength={500} value={notes} onChange={(e) => setNotes(e.target.value)} /></div>
+          {error && <p className="rounded bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p>}
+          <div className="flex justify-end gap-3"><button className="btn-secondary" onClick={onCancel}>取消</button><button className="btn-primary" onClick={() => void submit()}>保存</button></div>
+        </div>
       </div>
     </div>
   );

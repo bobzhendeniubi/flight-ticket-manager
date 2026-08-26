@@ -152,6 +152,22 @@ export const updateHoldOrderPriceBodySchema = z.object({
 });
 export type UpdateHoldOrderPriceBody = z.infer<typeof updateHoldOrderPriceBodySchema>;
 
+/**
+ * 改团名 / 备注：建单后临时信息经常要补录或订正（票务反馈）。
+ * groupName 允许清空（直客单在服务层单独拒绝清空）；notes 传空串视为清空。
+ * 至少要传一项，否则调用方等于没改任何东西。
+ */
+export const updateHoldOrderInfoBodySchema = z
+  .object({
+    groupName: z.string().trim().max(120).optional(),
+    notes: z.string().trim().max(500).optional(),
+  })
+  .strict()
+  .refine((body) => body.groupName !== undefined || body.notes !== undefined, {
+    message: '请至少填写团名或备注其中一项',
+  });
+export type UpdateHoldOrderInfoBody = z.infer<typeof updateHoldOrderInfoBodySchema>;
+
 export const allocateHoldInstallmentBodySchema = z.object({
   receiptId: z.string().min(1),
   amountCny: z.number().int().min(1),

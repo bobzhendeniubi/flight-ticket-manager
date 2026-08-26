@@ -52,6 +52,7 @@ import type {
   ReduceHoldSeatsBody,
   UpdateHoldInstallmentBody,
   UpdateHoldOrderConfigBody,
+  UpdateHoldOrderInfoBody,
   UpdateHoldOrderPriceBody,
   PreviewHoldPlanBody,
   ConvertHoldOrderBody,
@@ -988,6 +989,43 @@ export class HoldOrderService {
     });
     auditHold(actor, 'UPDATE_HOLD_ORDER_PRICE', result.hold, { before: { perSeatPriceCny: result.hold.perSeatPriceCny }, after: { perSeatPriceCny: body.perSeatPriceCny, reason: body.reason, status: result.status } });
     return { id, perSeatPriceCny: body.perSeatPriceCny, status: result.status };
+  }
+
+  /**
+   * 改团名 / 备注（票务反馈：建单后录错或需要补录，此前完全没有编辑通道）。
+   * 终态单（已转正/已释放/已取消）拒改；直客占位不允许把团名清空，因为它是这张单唯一的客户标识。
+   */
+  async updateInfo(id: string, body: UpdateHoldOrderInfoBody, actor?: AuditActor) {
+    const result = await prisma.$transaction(async (tx) => {
+      await lockHold(tx, id);
+      const existing = await findHold(tx, id);
+      if (!existing) throw new NotFoundError('占位单不存在');
+      const terminalStatuses: HoldOrderStatus[] = [HoldOrderStatus.CONVERTED, HoldOrderStatus.RELEASED, HoldOrderStatus.CANCELLED];
+      if (terminalStatuses.includes(existing.status)) {
+        throw new ConflictError(`占位单当前状态不可编辑团名/备注（${HOLD_STATUS_LABEL[existing.status]}）`);
+      }
+      const data: { groupName?: string | null; notes?: string | null } = {};
+      if (body.groupName !== undefined) {
+        if (existing.ownerType === HoldOwnerType.CUSTOMER && body.groupName === '') {
+          throw new BadRequestError('直客占位必须填写团名或客户备注名，不能清空');
+        }
+        data.groupName = body.groupName === '' ? null : body.groupName;
+      }
+      if (body.notes !== undefined) {
+        data.notes = body.notes === '' ? null : body.notes;
+      }
+      await tx.holdOrder.update({ where: { id }, data });
+      return { id, hold: existing, data };
+    });
+    auditHold(actor, 'UPDATE_HOLD_ORDER_INFO', result.hold, {
+      before: { groupName: result.hold.groupName, notes: result.hold.notes },
+      after: result.data,
+    });
+    return {
+      id,
+      groupName: result.data.groupName !== undefined ? result.data.groupName : result.hold.groupName,
+      notes: result.data.notes !== undefined ? result.data.notes : result.hold.notes,
+    };
   }
 
   async allocateInstallment(id: string, installmentId: string, body: AllocateHoldInstallmentBody, actor: AuditActor) {

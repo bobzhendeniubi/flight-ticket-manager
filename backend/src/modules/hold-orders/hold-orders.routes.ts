@@ -19,6 +19,7 @@ import {
   reverseHoldAllocationBodySchema,
   updateHoldInstallmentBodySchema,
   updateHoldOrderConfigBodySchema,
+  updateHoldOrderInfoBodySchema,
   updateHoldOrderPriceBodySchema,
 } from './hold-orders.schemas.js';
 
@@ -135,5 +136,12 @@ export const holdOrderRoutes: FastifyPluginAsync = async (app) => {
     const { id } = req.params as { id: string };
     const body = updateHoldOrderPriceBodySchema.parse(req.body);
     return { result: await service.updatePrice(id, body, actorFromRequest(req)) };
+  });
+
+  // 改团名 / 备注：建单后临时信息补录或订正（票务反馈）。
+  app.patch('/:id/info', pre, async (req) => {
+    const { id } = req.params as { id: string };
+    const body = updateHoldOrderInfoBodySchema.parse(req.body);
+    return { result: await service.updateInfo(id, body, actorFromRequest(req)) };
   });
 };
