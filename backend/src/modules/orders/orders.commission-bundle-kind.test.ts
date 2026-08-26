@@ -33,6 +33,9 @@ const { mockPrisma } = vi.hoisted(() => ({
     payment: { aggregate: vi.fn(), updateMany: vi.fn() },
     fulfillmentTask: { updateMany: vi.fn() },
     commissionRecord: { findFirst: vi.fn(), create: vi.fn(), findMany: vi.fn(), update: vi.fn() },
+    // 批准退款时会查本单的预存余额抵扣流水（OFFSET/REFUND）来决定回补多少余额；
+    // 本文件只关心佣金冲销，默认喂空流水（= 该单从未用代理余额抵付）。
+    prepaymentTransaction: { findMany: vi.fn() },
     // 零计提审计（writeAudit）走全局 prisma，而全局 prisma 在本文件被整体 mock 掉了；
     // 不给出 auditLog 桩，写审计会在 writeAudit 内部抛错被吞掉并刷 console.error。
     auditLog: { create: vi.fn() },
@@ -218,6 +221,7 @@ describe('createCommissionsForOrder · 套餐（BUNDLE）纳入返佣计提', ()
     mockPrisma.fulfillmentTask.updateMany.mockResolvedValue({ count: 0 });
     mockPrisma.$queryRaw.mockResolvedValue([]);
     mockPrisma.agent.findUnique.mockResolvedValue({ parentAgentId: null }); // 默认单级代理
+    mockPrisma.prepaymentTransaction.findMany.mockResolvedValue([]); // 无余额抵扣流水
   });
 
   afterEach(() => {
@@ -349,6 +353,7 @@ describe('套餐佣金的冲销对称性 · 取消订单必须把 BUNDLE 佣金�
     mockPrisma.refund.updateMany.mockResolvedValue({ count: 0 });
     mockPrisma.$queryRaw.mockResolvedValue([]);
     mockPrisma.agent.findUnique.mockResolvedValue({ parentAgentId: null });
+    mockPrisma.prepaymentTransaction.findMany.mockResolvedValue([]); // 无余额抵扣流水
   });
 
   afterEach(() => {

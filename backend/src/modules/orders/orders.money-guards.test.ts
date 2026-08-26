@@ -9,6 +9,8 @@
  *     守卫：转 REFUNDED 前断言存在 Refund（REQUESTED/COMPLETED），admin force 同样拦。
  *  C. 预存余额抵付的订单退款后余额永不回补（PrepaymentTxType.REFUND 是死枚举）。
  *     守卫：REFUNDED 流转按「现金优先」拆分，余额部分写 REFUND 流水并回补 Agent.prepaymentBalance。
+ *     ⚠️ 抵扣额一律取 PrepaymentTransaction(OFFSET) 流水，**不是** Order.prepaymentOffset ——
+ *     那一列没有任何生产代码写入（恒为 0），拿它当输入的测试是假绿：真实场景里余额永远补不回来。
  *  D. 团队议价结算价按航段各收一次 → 往返单每人多收一倍。
  *     守卫：整程价按航段分摊，各段之和恰好等于整程价。
  *  E. 套餐去程日取自客户端可伪造的 metadata.goDate → 散客可自助套利结算价立减。
@@ -26,7 +28,7 @@ const { mockPrisma, mockCreateOpenReceiptWithinTx } = vi.hoisted(() => ({
     orderStatusEvent: { create: vi.fn() },
     agent: { update: vi.fn() },
     payment: { create: vi.fn(), findFirst: vi.fn(), aggregate: vi.fn(), updateMany: vi.fn() },
-    prepaymentTransaction: { create: vi.fn(), aggregate: vi.fn() },
+    prepaymentTransaction: { create: vi.fn(), aggregate: vi.fn(), findMany: vi.fn() },
     refund: { aggregate: vi.fn(), count: vi.fn(), findMany: vi.fn(), updateMany: vi.fn() },
     commissionRecord: { findMany: vi.fn(), create: vi.fn(), update: vi.fn() },
     fulfillmentTask: { updateMany: vi.fn() },
@@ -60,8 +62,23 @@ beforeEach(() => {
   mockPrisma.flightSchedule.findMany.mockResolvedValue([]);
   mockPrisma.commissionRecord.findMany.mockResolvedValue([]);
   mockPrisma.refund.findMany.mockResolvedValue([]);
+  // 默认：本单没有任何余额流水（纯现金单）
+  mockPrisma.prepaymentTransaction.findMany.mockResolvedValue([]);
   mockPrisma.prepaymentTransaction.aggregate.mockResolvedValue({ _sum: { amount: null } });
 });
+
+/**
+ * 预存余额流水 mock：抵扣写负数 OFFSET、回补写正数 REFUND —— 与 applyAgentBalanceToOrder /
+ * REFUNDED 流转真实落库的形状一致。测试必须从这里喂数据，**不能**去塞 Order.prepaymentOffset：
+ * 那一列生产环境恒为 0，塞它等于把被测代码的输入换成一个现实中不存在的值。
+ */
+function balanceLedger(rows: Array<{ offset?: number; restored?: number; agentId?: string }>) {
+  return rows.map((r) =>
+    r.offset != null
+      ? { agentId: r.agentId ?? 'agent-1', amount: dec(-r.offset), type: 'OFFSET' as const }
+      : { agentId: r.agentId ?? 'agent-1', amount: dec(r.restored ?? 0), type: 'REFUND' as const },
+  );
+}
 
 // ════════════════════════════════════════════════════════════════════════
 // A. 多付处置 → Payment 台账必须同步对冲
@@ -249,21 +266,23 @@ describe('转 REFUNDED · 账目完整性闸（没有 Refund 记录一律拒绝�
   });
 });
 
-describe('转 REFUNDED · 资金守恒断言把预存余额抵扣计入实收', () => {
+describe('转 REFUNDED · 资金守恒断言（实收 = paidAmount，余额抵扣已含在里面）', () => {
   /**
-   * 守恒基数若只看 paidAmount，余额抵付单（现金 0、余额抵 10000）的**正常退款**会被全部误拦。
+   * 口径要点：applyAgentBalanceToOrder 抵扣时**已经**把金额累加进 order.paidAmount，
+   * 所以 paidAmount 就是「现金 + 余额抵扣」的合计。余额抵付单的正常退款本来就该放行。
    */
-  it('现金 0 + 余额抵 10000、应退 8000 → 放行（只看 paidAmount 的旧基数会误拦）', async () => {
+  it('全额余额抵付（实收 10000 全来自 OFFSET）、应退 8000 → 放行', async () => {
     mockPrisma.order.findUnique.mockResolvedValue(
-      refundOrder({ agentId: 'agent-1', paidAmount: dec(0), prepaymentOffset: dec(10_000) }),
+      refundOrder({ agentId: 'agent-1', paidAmount: dec(10_000) }),
     );
     mockPrisma.$queryRaw
-      .mockResolvedValueOnce([{ paidAmount: dec(0) }]) // 订单行锁
+      .mockResolvedValueOnce([{ paidAmount: dec(10_000) }]) // 订单行锁
       .mockResolvedValueOnce([{ prepaymentBalance: dec(50) }]); // 代理余额行锁
     mockPrisma.refund.count.mockResolvedValue(1);
     mockPrisma.refund.aggregate
       .mockResolvedValueOnce({ _sum: { amount: dec(8_000) } }) // REQUESTED 合计
       .mockResolvedValueOnce({ _sum: { amount: null } }); // 已完成退款合计
+    mockPrisma.prepaymentTransaction.findMany.mockResolvedValue(balanceLedger([{ offset: 10_000 }]));
     mockPrisma.order.updateMany.mockResolvedValue({ count: 1 });
     mockPrisma.order.findUniqueOrThrow.mockResolvedValue({});
 
@@ -272,15 +291,17 @@ describe('转 REFUNDED · 资金守恒断言把预存余额抵扣计入实收', 
     expect(mockPrisma.refund.updateMany).toHaveBeenCalled();
   });
 
-  it('应退超过「现金 + 余额抵扣」→ 拒绝，报错同时点出两段金额', async () => {
+  it('应退超过实收 → 拒绝，报错把实收拆成「现金 + 余额抵扣」两段说清楚', async () => {
+    // 实收 1500 = 现金 1000 + 余额抵扣 500（OFFSET 流水）
     mockPrisma.order.findUnique.mockResolvedValue(
-      refundOrder({ agentId: 'agent-1', paidAmount: dec(1_000), prepaymentOffset: dec(500) }),
+      refundOrder({ agentId: 'agent-1', paidAmount: dec(1_500) }),
     );
-    mockPrisma.$queryRaw.mockResolvedValueOnce([{ paidAmount: dec(1_000) }]);
+    mockPrisma.$queryRaw.mockResolvedValueOnce([{ paidAmount: dec(1_500) }]);
     mockPrisma.refund.count.mockResolvedValue(1);
     mockPrisma.refund.aggregate
       .mockResolvedValueOnce({ _sum: { amount: dec(1_600) } })
       .mockResolvedValueOnce({ _sum: { amount: null } });
+    mockPrisma.prepaymentTransaction.findMany.mockResolvedValue(balanceLedger([{ offset: 500 }]));
 
     await expect(
       service._updateStatusWithinTx(tx, 'ord-r', OrderStatus.REFUNDED, ADMIN, undefined, []),
@@ -289,20 +310,47 @@ describe('转 REFUNDED · 资金守恒断言把预存余额抵扣计入实收', 
     );
     expect(mockPrisma.refund.updateMany).not.toHaveBeenCalled();
   });
+
+  /**
+   * 反向守卫（防"修复"过头）：余额抵扣不能在 paidAmount 之外**再加一次**当退款额度——
+   * 那等于凭空把上限抬到 2 倍实收。实收 1000（全余额抵付）应退 1500 必须拦。
+   */
+  it('余额抵扣不重复计入上限：实收 1000（全余额抵付）应退 1500 → 拒绝', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(
+      refundOrder({ agentId: 'agent-1', paidAmount: dec(1_000) }),
+    );
+    mockPrisma.$queryRaw.mockResolvedValueOnce([{ paidAmount: dec(1_000) }]);
+    mockPrisma.refund.count.mockResolvedValue(1);
+    mockPrisma.refund.aggregate
+      .mockResolvedValueOnce({ _sum: { amount: dec(1_500) } })
+      .mockResolvedValueOnce({ _sum: { amount: null } });
+    mockPrisma.prepaymentTransaction.findMany.mockResolvedValue(balanceLedger([{ offset: 1_000 }]));
+
+    await expect(
+      service._updateStatusWithinTx(tx, 'ord-r', OrderStatus.REFUNDED, ADMIN, undefined, []),
+    ).rejects.toThrow(/已超过实收 ¥1000\.00（现金 ¥0\.00 \+ 预存余额抵扣 ¥1000\.00）/);
+  });
 });
 
 describe('转 REFUNDED · 预存余额回补（PrepaymentTxType.REFUND 不再是死枚举）', () => {
+  /**
+   * ⚠️ 这一条是整组测试的支点：所有订单的 `prepaymentOffset` 都留在生产真值 0 上，
+   * 抵扣额只从 OFFSET 流水来。旧版测试手工把 prepaymentOffset 塞成 10000 才"通过"，
+   * 而生产里没有任何代码会写那一列 —— 于是线上余额一分也回不来，测试却是绿的。
+   */
   it('全额余额抵付单退款 8000 → 余额 50 回补到 8050，写一条 +8000 的 REFUND 流水', async () => {
+    // 实收 10000 全部来自余额抵扣：paidAmount=10000 且 OFFSET 流水 −10000，prepaymentOffset 保持 0
     mockPrisma.order.findUnique.mockResolvedValue(
-      refundOrder({ agentId: 'agent-1', paidAmount: dec(0), prepaymentOffset: dec(10_000) }),
+      refundOrder({ agentId: 'agent-1', paidAmount: dec(10_000) }),
     );
     mockPrisma.$queryRaw
-      .mockResolvedValueOnce([{ paidAmount: dec(0) }])
+      .mockResolvedValueOnce([{ paidAmount: dec(10_000) }])
       .mockResolvedValueOnce([{ prepaymentBalance: dec(50) }]);
     mockPrisma.refund.count.mockResolvedValue(1);
     mockPrisma.refund.aggregate
       .mockResolvedValueOnce({ _sum: { amount: dec(8_000) } })
       .mockResolvedValueOnce({ _sum: { amount: null } });
+    mockPrisma.prepaymentTransaction.findMany.mockResolvedValue(balanceLedger([{ offset: 10_000 }]));
     mockPrisma.order.updateMany.mockResolvedValue({ count: 1 });
     mockPrisma.order.findUniqueOrThrow.mockResolvedValue({});
 
@@ -321,20 +369,47 @@ describe('转 REFUNDED · 预存余额回补（PrepaymentTxType.REFUND 不再是
   });
 
   /**
-   * 现金优先：现金 3000 + 余额抵 7000、应退 8000 → 现金退 3000、余额只回补 5000。
-   * 两段之和必须恰好等于应退，绝不重复退。
+   * 抵扣额只认流水：查 OFFSET 流水时必须按 orderId + type 过滤（别把 TOP_UP/ADJUSTMENT 也算进来，
+   * 那会把代理的充值当成"本单抵扣"退给他）。
+   */
+  it('抵扣额只按本单的 OFFSET/REFUND 流水查（不掺充值与人工调账）', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(
+      refundOrder({ agentId: 'agent-1', paidAmount: dec(10_000) }),
+    );
+    mockPrisma.$queryRaw
+      .mockResolvedValueOnce([{ paidAmount: dec(10_000) }])
+      .mockResolvedValueOnce([{ prepaymentBalance: dec(0) }]);
+    mockPrisma.refund.count.mockResolvedValue(1);
+    mockPrisma.refund.aggregate
+      .mockResolvedValueOnce({ _sum: { amount: dec(1_000) } })
+      .mockResolvedValueOnce({ _sum: { amount: null } });
+    mockPrisma.prepaymentTransaction.findMany.mockResolvedValue(balanceLedger([{ offset: 10_000 }]));
+    mockPrisma.order.updateMany.mockResolvedValue({ count: 1 });
+    mockPrisma.order.findUniqueOrThrow.mockResolvedValue({});
+
+    await service._updateStatusWithinTx(tx, 'ord-r', OrderStatus.REFUNDED, ADMIN, undefined, []);
+
+    const where = mockPrisma.prepaymentTransaction.findMany.mock.calls[0][0].where;
+    expect(where.orderId).toBe('ord-r');
+    expect(where.type).toEqual({ in: ['OFFSET', 'REFUND'] });
+  });
+
+  /**
+   * 现金优先：实收 10000 = 现金 3000 + 余额抵 7000、应退 8000
+   * → 现金退 3000、余额只回补 5000。两段之和必须恰好等于应退，绝不重复退。
    */
   it('现金/余额混合单：只把退不下现金的那部分（5000）回补余额', async () => {
     mockPrisma.order.findUnique.mockResolvedValue(
-      refundOrder({ agentId: 'agent-1', paidAmount: dec(3_000), prepaymentOffset: dec(7_000) }),
+      refundOrder({ agentId: 'agent-1', paidAmount: dec(10_000) }),
     );
     mockPrisma.$queryRaw
-      .mockResolvedValueOnce([{ paidAmount: dec(3_000) }])
+      .mockResolvedValueOnce([{ paidAmount: dec(10_000) }])
       .mockResolvedValueOnce([{ prepaymentBalance: dec(0) }]);
     mockPrisma.refund.count.mockResolvedValue(1);
     mockPrisma.refund.aggregate
       .mockResolvedValueOnce({ _sum: { amount: dec(8_000) } })
       .mockResolvedValueOnce({ _sum: { amount: null } });
+    mockPrisma.prepaymentTransaction.findMany.mockResolvedValue(balanceLedger([{ offset: 7_000 }]));
     mockPrisma.order.updateMany.mockResolvedValue({ count: 1 });
     mockPrisma.order.findUniqueOrThrow.mockResolvedValue({});
 
@@ -344,18 +419,46 @@ describe('转 REFUNDED · 预存余额回补（PrepaymentTxType.REFUND 不再是
     expect(Number(txRow.amount.toString())).toBe(5_000);
   });
 
-  it('幂等：本单已回补过的部分不重复回补（分批批准退款）', async () => {
+  /**
+   * 改期费从现金侧先消耗：实收 10000 = 现金 3000 + 余额抵 7000，改期费 1000、应退 8000
+   * → 现金上限只剩 2000，余额侧要多补 1000（共 6000）。
+   */
+  it('改期费先吃现金：adjustmentCny 1000 → 现金退 2000、余额回补 6000', async () => {
     mockPrisma.order.findUnique.mockResolvedValue(
-      refundOrder({ agentId: 'agent-1', paidAmount: dec(0), prepaymentOffset: dec(10_000) }),
+      refundOrder({ agentId: 'agent-1', paidAmount: dec(10_000), adjustmentCny: 1_000 }),
     );
     mockPrisma.$queryRaw
-      .mockResolvedValueOnce([{ paidAmount: dec(0) }])
+      .mockResolvedValueOnce([{ paidAmount: dec(10_000) }])
+      .mockResolvedValueOnce([{ prepaymentBalance: dec(0) }]);
+    mockPrisma.refund.count.mockResolvedValue(1);
+    mockPrisma.refund.aggregate
+      .mockResolvedValueOnce({ _sum: { amount: dec(8_000) } })
+      .mockResolvedValueOnce({ _sum: { amount: null } });
+    mockPrisma.prepaymentTransaction.findMany.mockResolvedValue(balanceLedger([{ offset: 7_000 }]));
+    mockPrisma.order.updateMany.mockResolvedValue({ count: 1 });
+    mockPrisma.order.findUniqueOrThrow.mockResolvedValue({});
+
+    await service._updateStatusWithinTx(tx, 'ord-r', OrderStatus.REFUNDED, ADMIN, undefined, []);
+
+    const txRow = mockPrisma.prepaymentTransaction.create.mock.calls[0][0].data;
+    expect(Number(txRow.amount.toString())).toBe(6_000);
+  });
+
+  it('幂等：本单已回补过的部分不重复回补（分批批准退款）', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(
+      refundOrder({ agentId: 'agent-1', paidAmount: dec(10_000) }),
+    );
+    mockPrisma.$queryRaw
+      .mockResolvedValueOnce([{ paidAmount: dec(10_000) }])
       .mockResolvedValueOnce([{ prepaymentBalance: dec(0) }]);
     mockPrisma.refund.count.mockResolvedValue(1);
     mockPrisma.refund.aggregate
       .mockResolvedValueOnce({ _sum: { amount: dec(3_000) } }) // 本次批准 3000
       .mockResolvedValueOnce({ _sum: { amount: dec(5_000) } }); // 此前已完成 5000
-    mockPrisma.prepaymentTransaction.aggregate.mockResolvedValue({ _sum: { amount: dec(5_000) } });
+    // 流水：抵扣过 10000、此前已回补 5000
+    mockPrisma.prepaymentTransaction.findMany.mockResolvedValue(
+      balanceLedger([{ offset: 10_000 }, { restored: 5_000 }]),
+    );
     mockPrisma.order.updateMany.mockResolvedValue({ count: 1 });
     mockPrisma.order.findUniqueOrThrow.mockResolvedValue({});
 
@@ -366,7 +469,32 @@ describe('转 REFUNDED · 预存余额回补（PrepaymentTxType.REFUND 不再是
     expect(Number(txRow.amount.toString())).toBe(3_000);
   });
 
-  it('无代理的散客单：不写余额流水（prepaymentOffset=0，无可回补对象）', async () => {
+  /**
+   * 幂等的边界：已回补额度用满后**一分不再补**。
+   * 现金退不下来的部分若已经全额回过余额，重复批准不能再写一条 REFUND。
+   */
+  it('幂等：已补满则完全不写流水、不动余额（重复批准无副作用）', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(
+      refundOrder({ agentId: 'agent-1', paidAmount: dec(10_000) }),
+    );
+    mockPrisma.$queryRaw.mockResolvedValueOnce([{ paidAmount: dec(10_000) }]);
+    mockPrisma.refund.count.mockResolvedValue(1);
+    mockPrisma.refund.aggregate
+      .mockResolvedValueOnce({ _sum: { amount: null } }) // 无新的 REQUESTED
+      .mockResolvedValueOnce({ _sum: { amount: dec(8_000) } }); // 已完成 8000
+    mockPrisma.prepaymentTransaction.findMany.mockResolvedValue(
+      balanceLedger([{ offset: 10_000 }, { restored: 8_000 }]),
+    );
+    mockPrisma.order.updateMany.mockResolvedValue({ count: 1 });
+    mockPrisma.order.findUniqueOrThrow.mockResolvedValue({});
+
+    await service._updateStatusWithinTx(tx, 'ord-r', OrderStatus.REFUNDED, ADMIN, undefined, []);
+
+    expect(mockPrisma.prepaymentTransaction.create).not.toHaveBeenCalled();
+    expect(mockPrisma.agent.update).not.toHaveBeenCalled();
+  });
+
+  it('无代理的散客单：没有 OFFSET 流水 → 不写余额流水、不动任何余额', async () => {
     mockPrisma.order.findUnique.mockResolvedValue(refundOrder());
     mockPrisma.$queryRaw.mockResolvedValueOnce([{ paidAmount: dec(1_000) }]);
     mockPrisma.refund.count.mockResolvedValue(1);
@@ -379,6 +507,33 @@ describe('转 REFUNDED · 预存余额回补（PrepaymentTxType.REFUND 不再是
     await service._updateStatusWithinTx(tx, 'ord-r', OrderStatus.REFUNDED, ADMIN, undefined, []);
 
     expect(mockPrisma.prepaymentTransaction.create).not.toHaveBeenCalled();
+    expect(mockPrisma.agent.update).not.toHaveBeenCalled();
+  });
+
+  /**
+   * 回补对象取流水上的代理，不是 order.agentId —— 抵扣掉的是当时那个代理账户的钱。
+   * 混了两个代理（改归属闸被绕过的历史脏数据）时 fail-closed 交人工：
+   * 把 A 的钱补给 B 比"补不上"更坏。
+   */
+  it('OFFSET 流水跨两个代理 → 拒绝自动回补，报错指向人工冲回', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(
+      refundOrder({ agentId: 'agent-1', paidAmount: dec(10_000) }),
+    );
+    mockPrisma.$queryRaw.mockResolvedValueOnce([{ paidAmount: dec(10_000) }]);
+    mockPrisma.refund.count.mockResolvedValue(1);
+    mockPrisma.refund.aggregate
+      .mockResolvedValueOnce({ _sum: { amount: dec(8_000) } })
+      .mockResolvedValueOnce({ _sum: { amount: null } });
+    mockPrisma.prepaymentTransaction.findMany.mockResolvedValue(
+      balanceLedger([
+        { offset: 6_000, agentId: 'agent-1' },
+        { offset: 4_000, agentId: 'agent-2' },
+      ]),
+    );
+
+    await expect(
+      service._updateStatusWithinTx(tx, 'ord-r', OrderStatus.REFUNDED, ADMIN, undefined, []),
+    ).rejects.toThrow(/涉及多个代理账户，无法自动回补余额/);
     expect(mockPrisma.agent.update).not.toHaveBeenCalled();
   });
 });

@@ -5202,16 +5202,48 @@ export class OrderService {
       const pendingSum = pendingAgg._sum.amount ?? new Prisma.Decimal(0);
       const completedSum = new Prisma.Decimal(await sumCompletedRefundsWithinTx(tx, id));
       const totalRefundOut = completedSum.add(pendingSum);
-      // 守恒基数含预存余额抵扣：代理用余额抵付的钱同样是客户付进来的钱（见 lib/cancellation.ts
-      // 的可退基数口径）。只按 paidAmount 断言会把「余额抵付单的正常退款」全部误拦。
-      const prepaymentOffsetCny = round2(Number(order.prepaymentOffset ?? 0));
       const paidNum = round2(Number(paidAmount.toString()));
-      const fundsInCny = round2(paidNum + prepaymentOffsetCny);
       const totalRefundOutCny = round2(Number(totalRefundOut.toString()));
-      if (totalRefundOutCny > fundsInCny + 0.001) {
+
+      // ── 本单的预存余额抵扣额：按 PrepaymentTransaction 流水现算 ─────────────
+      // 绝不读 Order.prepaymentOffset：那一列没有任何生产代码写入（恒为 0），照它算出来的
+      // 「余额部分」恒为 0 —— 预存抵付过的单退款时余额永远回不来（钱在系统里凭空消失）。
+      // 唯一真源是流水：applyAgentBalanceToOrder 每次抵扣写一条 OFFSET（负数），
+      // 本分支每次回补写一条 REFUND（正数）。
+      //   已抵扣毛额 offsetGross     = |Σ OFFSET.amount|
+      //   已回补     alreadyRestored = Σ REFUND.amount（幂等基准：分批批准退款不重复回补）
+      // 关键口径：抵扣当时已经把金额累加进 order.paidAmount（见 applyAgentBalanceToOrder），
+      // 所以 paidAmount 是「现金 + 余额抵扣」的合计，不是纯现金 ——
+      //   · 资金守恒基数就是 paidAmount 本身，绝不能再把 offsetGross 加一次（等于凭空放宽退款上限）；
+      //   · 真·现金 realCash = max(0, paidAmount − offsetGross)，做现金/余额拆分时用它当现金侧上限。
+      // realCash 按**毛额**而非净额算：回补不减 paidAmount，用净额会让已回补的部分在下一次
+      // 分批批准时摇身变成「现金」，同一笔钱退两遍。
+      // 无归属代理的单直接跳过查询：applyAgentBalanceToOrder 硬要求 order.agentId 才能抵扣，
+      // 而有 OFFSET 时改归属被硬阻断（见 changeOrderAgent）—— agentId 为空 ⇒ 必然没有 OFFSET 流水。
+      const balanceLedger = order.agentId
+        ? await tx.prepaymentTransaction.findMany({
+            where: {
+              orderId: id,
+              type: { in: [PrepaymentTxType.OFFSET, PrepaymentTxType.REFUND] },
+            },
+            select: { agentId: true, amount: true, type: true },
+          })
+        : [];
+      const offsetRows = balanceLedger.filter((r) => r.type === PrepaymentTxType.OFFSET);
+      const offsetGrossCny = round2(
+        offsetRows.reduce((s, r) => s + Math.abs(Number(r.amount.toString())), 0),
+      );
+      const alreadyRestoredCny = round2(
+        balanceLedger
+          .filter((r) => r.type === PrepaymentTxType.REFUND)
+          .reduce((s, r) => s + Number(r.amount.toString()), 0),
+      );
+      const realCashCny = Math.max(0, round2(paidNum - offsetGrossCny));
+
+      if (totalRefundOutCny > paidNum + 0.001) {
         throw new BadRequestError(
-          `订单 ${order.orderNumber} 应退合计 ¥${totalRefundOutCny.toFixed(2)} 已超过实收 ¥${fundsInCny.toFixed(2)}` +
-            `（现金 ¥${paidNum.toFixed(2)} + 预存余额抵扣 ¥${prepaymentOffsetCny.toFixed(2)}），` +
+          `订单 ${order.orderNumber} 应退合计 ¥${totalRefundOutCny.toFixed(2)} 已超过实收 ¥${paidNum.toFixed(2)}` +
+            `（现金 ¥${realCashCny.toFixed(2)} + 预存余额抵扣 ¥${offsetGrossCny.toFixed(2)}），` +
             `不能批准退款（退出去的钱不能多过收进来的钱）。` +
             `常见原因：申请退款后多付已被转存代理余额或挂账池，或此前已退过款。` +
             `请财务核对实收与已退金额后，驳回本次申请并按最新口径重新发起。`,
@@ -5219,27 +5251,31 @@ export class OrderService {
       }
 
       // ── 预存余额回补（PrepaymentTxType.REFUND，此前是从未被写入的死枚举）────
-      // 拆分口径与 lib/cancellation.ts 的 splitRefundBetweenCashAndBalance 一字一致
-      //（现金优先：改期费先从现金里消耗，应退先退现金、退不下的部分回余额）。
+      // 拆分口径与 lib/cancellation.ts 的 splitRefundBetweenCashAndBalance 同源
+      //（现金优先：改期费先从现金里消耗，应退先退现金、退不下的部分回余额）；
+      // 差别只在这里的「现金」是扣掉余额抵扣后的 realCash，而那边收到的 paidAmount 是合计值。
       // 这里刻意内联而不是 import：orders.service.test.ts 用 vi.mock 整体替换了
       // '../../lib/cancellation.js'，静态引用会在该测试里变成 undefined。改这段务必同步改那边。
-      // 幂等：扣掉本单已经回补过的 REFUND 流水，多次/分批批准退款不会重复回补。
       const adjustmentCny = round2(Number(order.adjustmentCny ?? 0));
-      const cashCapacityCny = Math.max(0, round2(paidNum - adjustmentCny));
+      const cashCapacityCny = Math.max(0, round2(realCashCny - adjustmentCny));
       const refundToCashCny = round2(Math.min(totalRefundOutCny, cashCapacityCny));
+      // 这是**累计**应回补额（不是本次增量）：夹在 offsetGross 以内，绝不回补超过当初抵扣掉的余额。
       const refundToBalanceCny = round2(
-        Math.min(Math.max(0, prepaymentOffsetCny), round2(totalRefundOutCny - refundToCashCny)),
+        Math.min(offsetGrossCny, Math.max(0, round2(totalRefundOutCny - refundToCashCny))),
       );
-      if (order.agentId && refundToBalanceCny > 0) {
-        const restoredAgg = await tx.prepaymentTransaction.aggregate({
-          where: { orderId: id, type: PrepaymentTxType.REFUND },
-          _sum: { amount: true },
-        });
-        const alreadyRestoredCny = round2(Number((restoredAgg._sum.amount ?? new Prisma.Decimal(0)).toString()));
-        const restoreNowCny = round2(refundToBalanceCny - alreadyRestoredCny);
-        if (restoreNowCny > 0) {
-          prepaymentRestore = { agentId: order.agentId, amountCny: restoreNowCny };
+      const restoreNowCny = round2(refundToBalanceCny - alreadyRestoredCny);
+      if (restoreNowCny > 0) {
+        // 回补对象取流水上的代理，而不是 order.agentId：抵扣掉的是当时那个代理账户的钱。
+        // 有 OFFSET 时改归属已被硬阻断（见 changeOrderAgent），正常不会分叉；真分叉了就
+        // fail-closed 交人工 —— 把 A 的钱补给 B 是比「补不上」更坏的错误。
+        const restoreAgentIds = [...new Set(offsetRows.map((r) => r.agentId))];
+        if (restoreAgentIds.length > 1) {
+          throw new BadRequestError(
+            `订单 ${order.orderNumber} 的预存余额抵扣涉及多个代理账户，无法自动回补余额。` +
+              `请财务先手工冲回各代理的抵扣流水，再批准本次退款。`,
+          );
         }
+        prepaymentRestore = { agentId: restoreAgentIds[0], amountCny: restoreNowCny };
       }
     }
 
@@ -5534,7 +5570,7 @@ export class OrderService {
       });
 
       // 预存余额回补：客户当初用代理余额抵付的那部分，退款完成时必须原路退回余额账户，
-      // 否则这笔钱在系统里凭空消失（订单侧 prepaymentOffset 记着抵扣过、余额侧却永远收不回）。
+      // 否则这笔钱在系统里凭空消失（余额侧扣过一笔 OFFSET，却永远收不回来）。
       // 金额已在本函数前半段按「现金优先」口径算好并做过幂等去重（见 prepaymentRestore 处注释）。
       // 锁序与 applyAgentBalanceToOrder 一致（先 Order 后 Agent，两处都 FOR UPDATE）→ 不会死锁。
       if (prepaymentRestore) {
