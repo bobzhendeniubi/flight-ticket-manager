@@ -7,10 +7,33 @@ on:
     branches: [main, develop]
 
 jobs:
-  # Placeholder — expand per service as code is added
-  lint-and-test:
+  build-and-test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - name: Placeholder CI
-        run: echo "CI pipeline — add service-specific jobs here"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install (workspaces)
+        run: npm ci
+
+      - name: Prisma generate
+        run: npm run prisma:generate
+
+      # 后端真值闸：build + 单测（集成测试需 Postgres，本地跑，CI 不含）
+      - name: Backend build
+        run: npm run build --workspace=backend
+
+      - name: Backend tests
+        run: npm test --workspace=backend
+
+      # 前端真值闸 = npm run build（根 tsconfig files:[]，裸 tsc --noEmit 是假绿）
+      - name: Admin-web build
+        run: npm run build --workspace=admin-web
+
+      - name: Sales-web build
+        run: npm run build --workspace=sales-web
