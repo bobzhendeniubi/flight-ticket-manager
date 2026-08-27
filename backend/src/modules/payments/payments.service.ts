@@ -255,7 +255,7 @@ export class IdempotencyKeyMismatchError extends AppError {
  * 口径：
  *   - 订单不同 → 一定是撞键，拒。
  *   - 方式不同 → 拒（同一笔钱不会既是转账又是刷卡）。
- *   - 金额不同（差一分以上）→ 拒；requestedAmount 省略（按尾款自动取数）时无从比对，跳过金额这项。
+ *   - 金额不同（折分后不相等）→ 拒；requestedAmount 省略（按尾款自动取数）时无从比对，跳过金额这项。
  *   - originalAmount 传「当初录入的到账全额」（拆分单取 overpaySplit.receivedAmount），
  *     不是记进订单的那半，否则超收拆分过的单重放会被自己误判成不一致。
  * 返回不一致的原因（可直接进错误文案），一致返回 null。
@@ -274,10 +274,9 @@ export function idempotentReplayMismatch(args: {
   if (args.requestedMethod !== args.originalMethod) {
     return `该幂等键当初记的是 ${args.originalMethod} 收款，本次是 ${args.requestedMethod}`;
   }
-  if (
-    args.requestedAmount !== undefined &&
-    Math.abs(args.requestedAmount - args.originalAmount) >= AMOUNT_MATCH_EPSILON_CNY
-  ) {
+  // 按分整数比对：浮点差值判 epsilon 会把 1000.01−1000=0.00999… 误判成「同额重放」，
+  // 差一分的新请求被假成功吞掉——与超收拆分同款口径，统一走 toCents。
+  if (args.requestedAmount !== undefined && toCents(args.requestedAmount) !== toCents(args.originalAmount)) {
     return `该幂等键当初记的是 ¥${args.originalAmount.toFixed(2)}，本次是 ¥${args.requestedAmount.toFixed(2)}`;
   }
   return null;
