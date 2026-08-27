@@ -14,8 +14,13 @@
  *   - 规则 3 护照有效期：不排除。护照有效期是所有出行乘客的通用要求，与签证是否自备无关。
  *
  * 幂等：每条候选算出确定性 ruleKey（唯一索引），已存在同 key 的跳过；
- * 重复触发生成不会刷屏。占位单收款期的“今天”按班次 departureTz 折算，
- * 其余 dueAt / hotelCheckIn / passportExpiry 仍按 @db.Date 的 UTC 日期口径。
+ * 重复触发生成不会刷屏。ruleKey 里只放出发日 / 收款期 / 缺件人数，**不放「今天」**，
+ * 所以调整「今天」的口径不会给存量提醒换键重发。
+ *
+ * 三层时间口径（勿造第四套）：
+ *   - 「今天」= 北京业务日（businessDateISO）——规则 1–4 比出行日、算窗口都用它；
+ *   - 占位单收款期（规则 5）的「今天」另按班次 departureTz 折，与建单时写 dueDate 的口径一致；
+ *   - hotelCheckIn / passportExpiry / installment.dueDate 是 @db.Date，按 UTC 切日（utcDateStr）。
  *
  * 出发时间口径与履约台一致（见 fulfillment.service.ts listTasks）：
  * 订单内最早一段机票的起飞时间（按班次时区取当地日期）；无机票则取最早酒店入住日。
@@ -30,6 +35,8 @@ import {
   HoldInstallmentStatus,
   type PrismaClient,
 } from '@prisma/client';
+import { businessDateISO } from '../../lib/business-time.js';
+import { localDateISO } from '../../lib/flight-time.js';
 
 // ── 状态集合 ────────────────────────────────────────────────────────────────
 /** 催尾款：待付 + 已付未完结（这些状态还会收钱） */
@@ -63,27 +70,22 @@ const DEPARTURE_SOON_WINDOW_DAYS = 3;
 const PASSPORT_MIN_VALID_MONTHS = 6;
 
 // ── 日期纯函数（可单测）────────────────────────────────────────────────────
-/** Date → UTC 日期字符串 YYYY-MM-DD（@db.Date 的正确读法） */
+/**
+ * Date → UTC 日期字符串 YYYY-MM-DD（`@db.Date` 的正确读法：库里存的是 UTC 午夜）。
+ *
+ * ⚠️ 只用于 `@db.Date` 字段（passportExpiry / hotelCheckIn / installment.dueDate）。
+ * 「今天」不能用它算——那是系统时刻，要按北京业务日折，见 businessDateISO。
+ */
 export function utcDateStr(d: Date): string {
   return d.toISOString().slice(0, 10);
 }
 
-/** 起飞时刻在班次时区下的当地日期（YYYY-MM-DD）；时区缺失/非法回落 UTC */
+/**
+ * 起飞时刻在班次时区下的当地日期（YYYY-MM-DD）；时区缺失/非法回落 UTC。
+ * 实现统一走 lib/flight-time.ts，本文件不再自带一份折算（全站只留一套航班时区口径）。
+ */
 export function dateInTz(d: Date, tz: string | null | undefined): string {
-  if (tz) {
-    try {
-      // en-CA 的日期格式恰好是 YYYY-MM-DD
-      return new Intl.DateTimeFormat('en-CA', {
-        timeZone: tz,
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit',
-      }).format(d);
-    } catch {
-      // 非法时区字符串 → 回落 UTC
-    }
-  }
-  return utcDateStr(d);
+  return localDateISO(d, tz);
 }
 
 /** 两个 YYYY-MM-DD 之间的整天差（to − from） */
@@ -214,7 +216,12 @@ export interface RuleHoldOrder {
   flightSchedule?: { departureTz: string | null } | null;
 }
 
-/** 规则 1–3：逐单判定，返回候选（today = UTC 今天 YYYY-MM-DD） */
+/**
+ * 规则 1–3：逐单判定，返回候选。
+ * @param today 「今天」YYYY-MM-DD —— 北京业务日（由 generateRuleReminders 折好传入）。
+ *   出发日 departure 是航段当地日；两者相减得到的 days 是「还有几天出发」的运营口径，
+ *   跨时区严格算是近似值，但窗口本身就是 3/14 天量级，误差一天以内可接受。
+ */
 export function buildOrderCandidates(order: RuleOrder, today: string): ReminderCandidate[] {
   const out: ReminderCandidate[] = [];
   const departure = deriveDepartureDate(order.items);
@@ -338,7 +345,11 @@ export async function generateRuleReminders(
   createdById: string,
   now = new Date(),
 ): Promise<GenerateRuleRemindersResult> {
-  const today = utcDateStr(now);
+  // 「今天」= 北京业务日。以前按 UTC 日切，北京 00:00–08:00 跑这个扫描会拿到昨天：
+  // 今天出发的单被算成「还有 1 天」，昨天已出发的单还会被催尾款。
+  // 注意 ruleKey 不含 today（键里是出发日/收款期/缺件人数），所以这次口径变更
+  // **不会**给存量提醒换键、也就不会重发；只影响窗口边界的判定与新条目的 dueAt。
+  const today = businessDateISO(now);
 
   const holdDelegate = (prisma as unknown as { holdOrder?: { findMany: (args: unknown) => Promise<RuleHoldOrder[]> } }).holdOrder;
   const [orders, visaTasks, holdOrders] = await Promise.all([

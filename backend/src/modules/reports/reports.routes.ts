@@ -12,6 +12,7 @@
 import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
+import { businessDateISO } from '../../lib/business-time.js';
 import {
   getAgentDebtsReport,
   getReceivablesReport,
@@ -34,15 +35,16 @@ const rangeSchema = z.object({
   to: dateStr.optional(),
 });
 
-/** 缺省区间 = 最近 30 天（与 finances 一致） */
+/**
+ * 缺省区间 = 最近 30 天，末端锚在**北京业务日**的今天。
+ * 原先按 UTC 日取「今天」，北京 00:00–08:00 打开报表会拿到只到昨天的区间，
+ * 当天已成交的单看不见。业务日口径统一走 lib/business-time.ts。
+ */
 function defaultRange(): { from: string; to: string } {
-  const now = new Date();
-  const to = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
-  const from = new Date(to);
-  from.setUTCDate(from.getUTCDate() - 29);
-  const fmt = (d: Date): string =>
-    `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
-  return { from: fmt(from), to: fmt(to) };
+  const to = businessDateISO(new Date());
+  const fromDate = new Date(`${to}T00:00:00Z`);
+  fromDate.setUTCDate(fromDate.getUTCDate() - 29);
+  return { from: fromDate.toISOString().slice(0, 10), to };
 }
 
 function logView(

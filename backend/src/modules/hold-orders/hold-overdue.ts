@@ -8,6 +8,7 @@ import {
 } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { writeAudit } from '../../lib/audit.js';
+import { businessDateISO } from '../../lib/business-time.js';
 import { enqueueWaitlistCheck } from '../../queues/queue.js';
 import { FALLBACK_HOLD_CONFIG, dateInTimezone } from './hold-installments.js';
 
@@ -93,7 +94,10 @@ export async function markOverdueHolds(client: PrismaClient = prisma, now = new 
       }
     }
   }
-  return { marked, released, blockedByReceipt, action, today: now.toISOString().slice(0, 10) };
+  // 汇总里的 today = **北京业务日**（这一轮扫描发生在哪个工作日）。逐单的逾期判定另按各自
+  // 班次 departureTz 折（见上面的 dateInTimezone），两者口径不同是有意的：
+  // 前者是「谁什么时候跑的」，后者是「这张单当地到期没有」。
+  return { marked, released, blockedByReceipt, action, today: businessDateISO(now) };
 }
 
 export const DEFAULT_HOLD_OVERDUE_ACTION = FALLBACK_HOLD_CONFIG.overdueAction;

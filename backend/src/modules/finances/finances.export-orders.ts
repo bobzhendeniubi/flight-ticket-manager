@@ -12,6 +12,7 @@
 import ExcelJS from 'exceljs';
 import type { PrismaClient } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
+import { localDateISO } from '../../lib/flight-time.js';
 import { getOrderPnl, type DateRange, type OrderPnlRow } from './finances.service.js';
 
 const STATUS_LABEL: Record<string, string> = {
@@ -61,9 +62,20 @@ interface OrderMeta {
   departDate: string;
 }
 
-function fmtDate(d: Date | null | undefined): string {
-  if (!d) return '';
-  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+interface DepartureLeg {
+  departureTime: Date;
+  departureTz: string;
+}
+
+/**
+ * 出发日期按**班次自己的 departureTz** 折算。
+ * 班次时刻存 UTC，直接取 UTC 分量会让凌晨红眼班次（当地 00:00–08:00 起飞）早一天，
+ * 财务对账和运营看到的出发日对不上。tz 缺失时 localDateISO 自动回退 UTC，
+ * 不落到运行环境默认时区（同一份导出在开发机和线上必须一致）。
+ */
+function fmtDepartDate(sched: DepartureLeg | undefined): string {
+  if (!sched) return '';
+  return localDateISO(sched.departureTime, sched.departureTz);
 }
 
 /** 按 orderId 补齐代理 + 最早航段出发日期 */
@@ -80,18 +92,19 @@ async function loadOrderMeta(
       agent: { select: { companyName: true, contactName: true } },
       items: {
         where: { kind: 'FLIGHT' },
-        select: { flightSchedule: { select: { departureTime: true } } },
+        // departureTz 必须一起取：出发日期要按班次当地时区折，不能切 UTC 分量
+        select: { flightSchedule: { select: { departureTime: true, departureTz: true } } },
       },
     },
   });
   for (const o of orders) {
     const departs = o.items
-      .map((it) => it.flightSchedule?.departureTime)
-      .filter((d): d is Date => d != null)
-      .sort((a, b) => a.getTime() - b.getTime());
+      .map((it) => it.flightSchedule)
+      .filter((s): s is DepartureLeg => s != null)
+      .sort((a, b) => a.departureTime.getTime() - b.departureTime.getTime());
     map.set(o.id, {
       agency: o.agent?.companyName ?? o.agent?.contactName ?? '直销',
-      departDate: fmtDate(departs[0]),
+      departDate: fmtDepartDate(departs[0]),
     });
   }
   return map;

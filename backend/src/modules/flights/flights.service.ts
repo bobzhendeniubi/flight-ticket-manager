@@ -16,7 +16,7 @@ import type { PriceResult } from '../pricing/pricing.service.js';
 import { parseFareBuckets } from '../pricing/pricing.schemas.js';
 import type { FareBucketsInput } from '../pricing/pricing.schemas.js';
 import { localDate } from '../finances/finances.cost.service.js';
-import { localDateISO, localToUtc } from '../../lib/flight-time.js';
+import { localDateISO, localDateTime, localToUtc } from '../../lib/flight-time.js';
 import { heldSeatsBySeatClass } from '../hold-orders/held-seats.js';
 import type { FareBucket } from '../pricing/pricing.calc.js';
 import type {
@@ -872,7 +872,13 @@ export class FlightService {
         action: 'UPDATE_SCHEDULE_TIME',
         targetType: AuditTargetType.FLIGHT,
         targetId: scheduleId,
-        targetLabel: `班次 ${scheduleId}（${schedule.departureTime.toISOString()} → ${updated.departureTime.toISOString()}）`,
+        // 审计页给人看：时刻按本班次 departureTz 折成当地钟点（站内一律用「当地时间」表述）。
+        // 直接拼 toISOString() 会把 UTC 串怼到运营眼前，跟航司改点公告差 7/8 小时。
+        // before/after 里仍留 ISO UTC 原值，机器对账用。
+        targetLabel: `班次 ${scheduleId}（${localDateTime(
+          schedule.departureTime,
+          schedule.departureTz,
+        )} → ${localDateTime(updated.departureTime, schedule.departureTz)}，当地时间）`,
         before: {
           departureTime: schedule.departureTime.toISOString(),
           arrivalTime: schedule.arrivalTime.toISOString(),

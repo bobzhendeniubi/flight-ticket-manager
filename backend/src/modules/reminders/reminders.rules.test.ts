@@ -24,6 +24,7 @@ import {
   type RuleOrder,
 } from './reminders.rules.js';
 import { HoldInstallmentStatus, HoldOrderStatus } from '@prisma/client';
+import { businessDateISO } from '../../lib/business-time.js';
 
 // ── 测试数据小工具 ─────────────────────────────────────────────────────────
 const TODAY = '2026-07-09';
@@ -314,8 +315,9 @@ describe('generateRuleReminders 幂等', () => {
     return { mock: mock as unknown as PrismaClient, raw: mock, store };
   }
 
-  // 相对今天构造，规则窗口不随真实日期漂移
-  const today = utcDateStr(new Date());
+  // 相对今天构造，规则窗口不随真实日期漂移。必须与引擎同口径（北京业务日），
+  // 否则 UTC 16:00 之后跑测试，用例算的「今天」会比引擎早一天。
+  const today = businessDateISO(new Date());
   const departSoon = addDaysUtc(today, 2);
   const dbOrder = {
     id: 'ord_1',
@@ -418,6 +420,62 @@ describe('generateRuleReminders 幂等', () => {
     expect(passengersWhere).toEqual({
       visaExempt: false,
       OR: [{ passportPhotoUrl: null }, { passportPhotoUrl: '' }],
+    });
+  });
+
+  // ── 「今天」= 北京业务日，不是 UTC 日 ────────────────────────────────────
+  // UTC 20:00 时北京已是次日 04:00。按 UTC 切日的老口径会让整个北京 00:00–08:00
+  // 时段用「昨天」跑规则：昨天已起飞的单还在被催尾款，14 天窗口边缘的单反而漏掉。
+  describe('「今天」按北京业务日切', () => {
+    /** 2026-07-09T20:00Z = 北京 2026-07-10 04:00（UTC 日仍是 07-09） */
+    const beijingEarlyMorning = new Date('2026-07-09T20:00:00Z');
+
+    function orderDeparting(departLocalDay: string) {
+      return {
+        id: 'ord_tz',
+        orderNumber: 'FTM2026070900002',
+        contactName: '测试联系人',
+        status: OrderStatus.PAID,
+        total: new Prisma.Decimal('5000'),
+        paidAmount: new Prisma.Decimal('2000'),
+        prepaymentOffset: new Prisma.Decimal('0'),
+        adjustmentCny: 0,
+        items: [flightItem(`${departLocalDay}T02:00:00Z`)],
+        // 护照有效期给到很远，隔离出 BALANCE_DUE / DEPARTURE_SOON 两条规则
+        passengers: [
+          { id: 'pax_tz', fullName: '张三', passportExpiry: new Date('2030-01-01T00:00:00Z') },
+        ],
+      };
+    }
+
+    it('北京已跨到次日：昨天出发的单不再催尾款/发出行提醒', async () => {
+      const { mock } = makeMockPrisma([orderDeparting('2026-07-09')], []);
+      const result = await generateRuleReminders(mock, 'user_sys', beijingEarlyMorning);
+      // 北京今天 = 07-10，出发日 07-09 已过 → days = -1，四条规则全不命中
+      expect(result).toEqual({ created: 0, skipped: 0, byRule: {} });
+    });
+
+    it('北京已跨到次日：14 天窗口边缘的单照常催尾款，且 dueAt 记北京今天', async () => {
+      const { mock, raw } = makeMockPrisma([orderDeparting('2026-07-24')], []);
+      const result = await generateRuleReminders(mock, 'user_sys', beijingEarlyMorning);
+      // 北京今天 07-10 → 距 07-24 正好 14 天，落在窗口内（按 UTC 的 07-09 算是 15 天会漏掉）
+      expect(result.byRule).toEqual({ BALANCE_DUE: 1 });
+      const createArgs = (raw.operationalReminder.createMany.mock.calls[0] as unknown[])[0] as {
+        data: Array<{ ruleKey: string; dueAt: Date }>;
+      };
+      expect(createArgs.data[0].ruleKey).toBe('BALANCE:ord_tz:2026-07-24');
+      expect(createArgs.data[0].dueAt.toISOString()).toBe('2026-07-10T00:00:00.000Z');
+    });
+
+    it('ruleKey 不含「今天」：同一张单跨过北京零点再扫一遍也不会重发', async () => {
+      // 07-23 出发：北京 07-09 距 14 天、07-10 距 13 天，两次都在催尾款窗口内
+      const { mock } = makeMockPrisma([orderDeparting('2026-07-23')], []);
+      // 第一遍：北京 07-09 白天
+      const before = await generateRuleReminders(mock, 'user_sys', new Date('2026-07-09T06:00:00Z'));
+      expect(before).toMatchObject({ created: 1, byRule: { BALANCE_DUE: 1 } });
+      // 第二遍：北京已到 07-10 —— today 变了，但键仍是出发日，命中查重
+      const after = await generateRuleReminders(mock, 'user_sys', beijingEarlyMorning);
+      expect(after).toMatchObject({ created: 0, skipped: 1 });
     });
   });
 });

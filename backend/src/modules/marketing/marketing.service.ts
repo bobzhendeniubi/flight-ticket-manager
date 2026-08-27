@@ -6,6 +6,8 @@
 import { MarketingPosterKind, MarketingPosterStatus, Prisma } from '@prisma/client';
 import { env } from '../../config/env.js';
 import { prisma } from '../../db/prisma.js';
+import { BUSINESS_TZ, businessDateISO, startOfBusinessDayUtc } from '../../lib/business-time.js';
+import { localToUtc } from '../../lib/flight-time.js';
 import { resolveQwenConfig, type QwenConfig } from '../../lib/qwen-config.js';
 import {
   buildFlightRouteFacts,
@@ -135,22 +137,39 @@ export function assertPosterQuota(
   }
 }
 
-interface LocalDateRange {
+interface BusinessRange {
   start: Date;
   end: Date;
 }
 
-function localDayRange(now: Date): LocalDateRange {
-  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-  return { start, end: new Date(now.getFullYear(), now.getMonth(), now.getDate() + 1) };
+const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * 配额窗口按**北京业务日**切，不按服务器本地分量。
+ * 容器 TZ 是 UTC，用 `getFullYear()/getMonth()/getDate()` 会让日额度在北京 08:00
+ * 才重置、月额度也整体晚 8 小时——运营一早出的海报会被算进昨天的额度。
+ * Asia/Shanghai 无夏令时，日窗口直接 +24h 即为次日 00:00。
+ */
+function businessDayRange(now: Date): BusinessRange {
+  const start = startOfBusinessDayUtc(now);
+  return { start, end: new Date(start.getTime() + ONE_DAY_MS) };
 }
 
-function localMonthRange(now: Date): LocalDateRange {
-  const start = new Date(now.getFullYear(), now.getMonth(), 1);
-  return { start, end: new Date(now.getFullYear(), now.getMonth() + 1, 1) };
+/** 北京业务月窗口 [本月 1 日 00:00, 次月 1 日 00:00)。 */
+function businessMonthRange(now: Date): BusinessRange {
+  const [year, month] = businessDateISO(now).split('-').map(Number);
+  const firstDayIso = (y: number, m: number): string => `${y}-${String(m).padStart(2, '0')}-01`;
+  return {
+    start: localToUtc(firstDayIso(year, month), '00:00', BUSINESS_TZ),
+    end: localToUtc(
+      month === 12 ? firstDayIso(year + 1, 1) : firstDayIso(year, month + 1),
+      '00:00',
+      BUSINESS_TZ,
+    ),
+  };
 }
 
-function createdAtIn(range: LocalDateRange): Prisma.MarketingPosterWhereInput {
+function createdAtIn(range: BusinessRange): Prisma.MarketingPosterWhereInput {
   return { createdAt: { gte: range.start, lt: range.end } };
 }
 
@@ -163,7 +182,7 @@ async function countTodayPosters(
   createdById: string,
   now: Date,
 ): Promise<PosterQuotaCounts> {
-  const where = createdAtIn(localDayRange(now));
+  const where = createdAtIn(businessDayRange(now));
   const [mine, total] = await Promise.all([
     tx.marketingPoster.count({ where: { ...where, createdById } }),
     tx.marketingPoster.count({ where }),
@@ -220,8 +239,8 @@ export async function getMarketingUsage(
   now = new Date(),
 ): Promise<MarketingUsage> {
   // 用量同样不筛 status，失败记录也保留在海报数中；attempts 才表示实际模型调用次数。
-  const dayWhere = createdAtIn(localDayRange(now));
-  const monthWhere = createdAtIn(localMonthRange(now));
+  const dayWhere = createdAtIn(businessDayRange(now));
+  const monthWhere = createdAtIn(businessMonthRange(now));
   const [todayTotal, todayMine, monthTotal, grouped] = await prisma.$transaction([
     prisma.marketingPoster.count({ where: dayWhere }),
     prisma.marketingPoster.count({ where: { ...dayWhere, createdById } }),

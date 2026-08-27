@@ -20,6 +20,7 @@ import ExcelJS from 'exceljs';
 import type { Prisma, PrismaClient } from '@prisma/client';
 import { OrderStatus } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
+import { localDateISO } from '../../lib/flight-time.js';
 import {
   findMatchedPeriod,
   loadPeriodsByFlightIds,
@@ -101,8 +102,13 @@ function round2(n: number): number {
   return Math.round(n * 100) / 100;
 }
 
-function fmtDate(d: Date): string {
-  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
+/**
+ * 出发日按**班次自己的 departureTz** 折算。
+ * 班次时刻存 UTC，直接取 UTC 分量会让凌晨红眼班次（当地 00:00–08:00 起飞）早一天，
+ * 与行程单/名单导出对不上。tz 缺失时 localDateISO 回退 UTC，不落到运行环境默认时区。
+ */
+function fmtDepartDate(d: Date, tz: string | null | undefined): string {
+  return localDateISO(d, tz);
 }
 
 /**
@@ -304,7 +310,7 @@ export async function buildFinanceExportByFlightWorkbook(
     return {
       flightNumber: s.flight.flightNumber,
       route: `${s.flight.originCode}→${s.flight.destinationCode}`,
-      departDate: fmtDate(s.departureTime),
+      departDate: fmtDepartDate(s.departureTime, s.departureTz),
       totalSeats,
       soldSeats,
       loadFactor: totalSeats > 0 ? round2(soldSeats / totalSeats) : 0,
