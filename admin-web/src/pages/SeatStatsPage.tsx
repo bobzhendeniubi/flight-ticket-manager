@@ -14,8 +14,8 @@
  *     斜纹琥珀 = 占位，两段相加封顶 100%；超售时百分比如实 > 100%（条封顶但标红）。
  *   - 超售 = 余票为负时的欠座数（航司减配 / 换机型把容量压到已售之下）。
  *     销售侧照旧按容量拒卖，这里标红是提醒去与航司 / 操作部协调。
- *   - 行底色只区分航向（去程 = 澳门出发，默认白底；回程 = 淡靛蓝底），不带状态语义——
- *     状态色（超售红 / 占位琥珀）留给行内文字，底色不去抢它们。
+ *   - 行底色只区分航向（去程 = 澳门出发 = 淡黄底；回程 = 白底），沿用老销售控位表的看法，
+ *     不带状态语义——状态色（超售红 / 占位琥珀）留给行内文字，底色不去抢它们。
  *   - 日期区间为闭区间（between 起始/截止），服务端按 from/to 过滤
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
@@ -257,11 +257,11 @@ export function SeatStatsPage() {
         <p className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-slate-500">
           <span>显示 {filtered.length} 条</span>
           <span className="inline-flex items-center gap-1.5">
-            <span className="inline-block h-3 w-3 rounded-sm border border-slate-300 bg-surface" aria-hidden />
+            <span className="inline-block h-3 w-3 rounded-sm border border-yellow-300 bg-yellow-50" aria-hidden />
             去程（澳门出发）
           </span>
           <span className="inline-flex items-center gap-1.5">
-            <span className="inline-block h-3 w-3 rounded-sm border border-brand-200 bg-brand-50" aria-hidden />
+            <span className="inline-block h-3 w-3 rounded-sm border border-slate-300 bg-surface" aria-hidden />
             回程
           </span>
         </p>
@@ -296,13 +296,14 @@ export function SeatStatsPage() {
               )}
               {!loading &&
                 filtered.map((s) => (
-                  // 回程整行淡靛蓝底（Console 的品牌色系，避免另起一套颜色）。
-                  // 只到 brand-50 这个浓度，行内 rose/amber 语义色照旧压得住；
+                  // 去程整行淡黄底（对齐老销售控位表：澳门出发那一段是黄的），回程留白。
+                  // 只到 yellow-50 这个浓度：既明显浅于占位斜纹的琥珀（amber-400/200），
+                  // 不跟进度条抢眼，行内 rose/amber 语义色也照旧压得住。
                   // hover 用 ! 提权，否则被 .table-admin tbody tr:hover 的 slate 底盖掉、
                   // 鼠标一扫底色就没了。
                   <tr
                     key={s.id}
-                    className={isOutbound(s.origin) ? undefined : 'bg-brand-50/70 hover:!bg-brand-100/60'}
+                    className={isOutbound(s.origin) ? 'bg-yellow-50 hover:!bg-yellow-100/70' : undefined}
                   >
                     <td>
                       <div className="font-medium text-ink">
