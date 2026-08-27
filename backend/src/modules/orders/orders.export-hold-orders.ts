@@ -15,6 +15,7 @@ import ExcelJS from 'exceljs';
 import { HoldOrderStatus, type PrismaClient } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { localDateISO, localHHMM } from '../../lib/flight-time.js';
+import { businessDateTime } from '../../lib/business-time.js';
 import { HOLD_STATUS_LABEL } from '../hold-orders/hold-status.js';
 
 /** 仍需要盯的状态：占座中 / 逾期 / 全款待转正 / 切位待生效。已释放、已取消、已转正不进表。 */
@@ -77,11 +78,6 @@ const COLUMNS: Array<{ header: string; key: keyof HoldExportRow | 'seq'; width: 
   { header: '备注', key: 'notes', width: 24 },
 ];
 
-function fmtDateTime(d: Date): string {
-  const pad = (n: number) => String(n).padStart(2, '0');
-  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}`;
-}
-
 /**
  * 取出发日期区间内的占位单。区间按起飞地当地日折算：先用权威 SQL（双段 AT TIME ZONE）
  * 解出命中的班次，再按班次取单——不用 UTC 窗口猜，避免跨时区边界漏单。
@@ -143,7 +139,8 @@ export async function loadHoldExportRows(
       perSeatPriceCny: hold.perSeatPriceCny,
       status: HOLD_STATUS_LABEL[hold.status] ?? hold.status,
       receivedCny: received,
-      createdAt: fmtDateTime(hold.createdAt),
+      // 建单时间是「动作发生时刻」，按北京时间输出（容器 TZ 是 UTC，直接取 UTC 分量会少 8 小时）
+      createdAt: businessDateTime(hold.createdAt),
       notes: hold.notes ?? '',
     };
   });

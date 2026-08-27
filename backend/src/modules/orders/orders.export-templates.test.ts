@@ -282,8 +282,29 @@ describe('《全岗可用》full 模版 — 逐列取值/格式', () => {
     expect(r2.expiryDate).toBe('');
   });
 
-  it('录入时间：YYYY-MM-DD HH:MM:SS（含秒）', () => {
-    expect(r1.recordedAt).toBe('2026-07-08 15:17:21');
+  it('录入时间：YYYY-MM-DD HH:MM:SS（含秒，北京时间）', () => {
+    // createdAt = 2026-07-08T15:17:21Z → 北京时间 23:17:21（容器 TZ 是 UTC，不折算会少 8 小时）
+    expect(r1.recordedAt).toBe('2026-07-08 23:17:21');
+  });
+
+  it('录入时间跨日：UTC 20:00 → 北京时间次日 04:00，日期进位', () => {
+    const o = { ...fixtureRoundTrip(), createdAt: D('2026-07-08T20:00:00.000') };
+    const [row] = orderToFullRows(o, buildOrderContext(o));
+
+    expect(row.recordedAt).toBe('2026-07-09 04:00:00');
+  });
+
+  it('结算价到账时间同样折北京时间（跨日进位）', () => {
+    const base = fixtureRoundTrip();
+    const o = {
+      ...base,
+      payments: [
+        { status: 'SUCCEEDED', paidAt: D('2026-07-08T20:30:15.000'), method: 'BANK_TRANSFER' },
+      ],
+    } as unknown as OrderForTemplateExport;
+    const [row] = orderToFullRows(o, buildOrderContext(o));
+
+    expect(row.settleReceivedAt).toBe('2026-07-09 04:30:15');
   });
 
   it('乘客类型/性别/证件类型：按旧模版原样枚举/代码', () => {

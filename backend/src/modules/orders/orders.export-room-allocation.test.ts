@@ -169,15 +169,27 @@ describe('buildRoomAllocationSheets', () => {
     expect(r2.notes).toBe('尽量高层');
   });
 
-  it('结算价格 = 订单总价 / 乘客数（人均，同订单每行相同）；录入时间取 order.createdAt 含秒', () => {
+  it('结算价格 = 订单总价 / 乘客数（人均，同订单每行相同）；录入时间取 order.createdAt 含秒（北京时间）', () => {
     const sheets = buildRoomAllocationSheets(fixtureItems());
     const [r1, r2] = sheets[0].rows;
 
     // o1：total=4800，2 位乘客 → 人均 2400，两行相同
     expect(r1.settlePrice).toBe(2400);
     expect(r2.settlePrice).toBe(2400);
-    expect(r1.enteredAt).toBe('2026-07-01 13:04:02');
-    expect(r2.enteredAt).toBe('2026-07-01 13:04:02');
+    // createdAt = 2026-07-01T13:04:02Z → 北京时间 21:04:02（容器 TZ 是 UTC，不折算会少 8 小时）
+    expect(r1.enteredAt).toBe('2026-07-01 21:04:02');
+    expect(r2.enteredAt).toBe('2026-07-01 21:04:02');
+  });
+
+  it('录入时间跨日：UTC 20:00 → 北京时间次日 04:00，日期进位', () => {
+    const items = fixtureItems().map((it) =>
+      it.orderId === 'o1'
+        ? ({ ...it, order: { ...it.order, createdAt: D2('2026-07-01T20:00:00.000Z') } } as typeof it)
+        : it,
+    );
+    const [r1] = buildRoomAllocationSheets(items)[0].rows;
+
+    expect(r1.enteredAt).toBe('2026-07-02 04:00:00');
   });
 
   it('无航班订单出发日期回落入住日；床型缺失时房型留空；代理显示公司名', () => {
@@ -192,7 +204,7 @@ describe('buildRoomAllocationSheets', () => {
     expect(r3.hotelType).toBe('C酒店 · 高级房');
     // o2：total=1000，1 位乘客 → 人均 1000；录入时间取自己订单的 createdAt
     expect(r3.settlePrice).toBe(1000);
-    expect(r3.enteredAt).toBe('2026-07-02 09:30:00');
+    expect(r3.enteredAt).toBe('2026-07-02 17:30:00');
     expect(r3.issueDate).toBe(''); // 王五未录 passportIssueDate
   });
 

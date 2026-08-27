@@ -29,6 +29,7 @@
  */
 import ExcelJS from 'exceljs';
 import { localDateISO } from '../../lib/flight-time.js';
+import { businessDateTime } from '../../lib/business-time.js';
 import type { DocumentType, PrismaClient } from '@prisma/client';
 import { OrderStatus, Prisma } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
@@ -135,11 +136,6 @@ function round2(n: number): number {
 function fmtDate(d: Date | null | undefined): string {
   if (!d) return '';
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
-}
-
-function fmtDateTime(d: Date | null | undefined): string {
-  if (!d) return '';
-  return `${fmtDate(d)} ${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
 }
 
 /**
@@ -679,7 +675,8 @@ export function orderToMasterRows(
   if (returnScheduleId && order.returnInvoiced) invoicedParts.push('回程已开');
   if (order.systemInvoiced) invoicedParts.push('系统已开');
   const invoiceStatus = invoicedParts.length > 0 ? invoicedParts.join('/') : '未开';
-  const recordedAt = fmtDateTime(order.createdAt);
+  // 录入时间是「动作发生时刻」，按北京时间输出（容器 TZ 是 UTC，直接取 UTC 分量会少 8 小时）
+  const recordedAt = businessDateTime(order.createdAt);
   // 游客单（user=null）没有录单账号 → 统一记「散客」，不拿客人自己的名字冒充录入人。
   const recordedBy = order.user?.displayName ?? order.user?.email ?? GUEST_RECORDED_BY_LABEL;
   const roomGroups = parseRoomGroups(order.roomAssignment);
@@ -838,7 +835,7 @@ export async function buildMasterExportWorkbook(
     if (!c.note) return;
     const note =
       SNAPSHOT_COLUMN_KEYS.has(c.key) && oldestRefreshedAt
-        ? `${c.note}\n档案快照时间：${fmtDateTime(oldestRefreshedAt)}（UTC）`
+        ? `${c.note}\n档案快照时间：${businessDateTime(oldestRefreshedAt)}（北京时间）`
         : c.note;
     ws.getRow(1).getCell(i + 1).note = note;
   });

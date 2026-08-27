@@ -31,6 +31,7 @@ import {
   resolveScheduleCost,
 } from './finances.cost.service.js';
 import { netReceivedCny, sumCompletedRefundCny } from '../../lib/net-received.js';
+import { businessDateTime } from '../../lib/business-time.js';
 // 签证成本口径与财务汇总共用同一函数，两处逐字一致（任务实际成本优先 → 产品主数据回退）
 import { visaItemCostCny } from './finances.service.js';
 
@@ -163,11 +164,6 @@ function round2(n: number): number {
 function fmtDate(d: Date | null | undefined): string {
   if (!d) return '';
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
-}
-
-function fmtDateTime(d: Date | null | undefined): string {
-  if (!d) return '';
-  return `${fmtDate(d)} ${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
 }
 
 type OrderForExport = Prisma.OrderGetPayload<{
@@ -369,7 +365,8 @@ function orderToRows(order: OrderForExport, periodsMap: PeriodsMap): FinanceRow[
       paxCount,
       status: STATUS_LABEL[order.status] ?? order.status,
       settledStatus: settled,
-      recordedAt: fmtDateTime(order.createdAt),
+      // 录入时间是「动作发生时刻」，按北京时间输出（容器 TZ 是 UTC，直接取 UTC 分量会少 8 小时）
+      recordedAt: businessDateTime(order.createdAt),
       flightCostCny: round2(flightCostPerSeat),
       airportTaxCny: round2(airportTaxCny),
       peakSurchargeCny: round2(peakSurchargePerPax),

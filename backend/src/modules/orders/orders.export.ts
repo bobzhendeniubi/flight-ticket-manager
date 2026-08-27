@@ -7,6 +7,7 @@
  */
 import ExcelJS from 'exceljs';
 import { localDateISO } from '../../lib/flight-time.js';
+import { businessDateTime } from '../../lib/business-time.js';
 import type { Prisma, PrismaClient } from '@prisma/client';
 import { OrderStatus } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
@@ -135,11 +136,6 @@ function dec(v: Prisma.Decimal | number | null | undefined): number {
 function fmtDate(d: Date | null | undefined): string {
   if (!d) return '';
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
-}
-
-function fmtDateTime(d: Date | null | undefined): string {
-  if (!d) return '';
-  return `${fmtDate(d)} ${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
 }
 
 /**
@@ -353,7 +349,8 @@ function orderToRows(
       : '';
   // 客单金额(人均) = 订单总额 ÷ 乘客数（每行写人均，避免按总额误读为每人都付了全款）
   const orderTotal = dec(order.total) / Math.max(1, order.passengers.length);
-  const recordedAt = fmtDateTime(order.createdAt);
+  // 录入时间是「动作发生时刻」，按北京时间输出（容器 TZ 是 UTC，直接取 UTC 分量会少 8 小时）
+  const recordedAt = businessDateTime(order.createdAt);
 
   return order.passengers.map<OrderRow>((p) => {
     // 称谓统一 MR/MS（不分年龄，0723 票务口径）；去程日期仅供其他年龄派生场景沿用签名。

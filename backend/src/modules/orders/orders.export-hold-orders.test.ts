@@ -72,7 +72,19 @@ describe('loadHoldExportRows', () => {
       occupying: 47,
       status: '占座中',
       receivedCny: 20000,
+      // 建单时间是「动作发生时刻」，按北京时间折算：15:15Z + 8h = 当日 23:15
+      createdAt: '2026-08-25 23:15',
     });
+  });
+
+  it('建单时间跨日：UTC 20:00 → 北京时间次日 04:00，日期进位', async () => {
+    const { client } = clientWith(
+      ['schedule_1'],
+      [holdRow({ createdAt: new Date('2026-08-25T20:00:00Z') })],
+    );
+    const rows = await loadHoldExportRows('2026-09-04', '2026-09-07', client as never);
+
+    expect(rows[0]?.createdAt).toBe('2026-08-26 04:00');
   });
 
   it('只取仍占座 / 仍在流程里的状态——已释放、已取消、已转正不进表', async () => {

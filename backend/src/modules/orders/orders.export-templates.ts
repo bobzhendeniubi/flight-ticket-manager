@@ -10,6 +10,7 @@
  */
 import ExcelJS from 'exceljs';
 import { localDateISO } from '../../lib/flight-time.js';
+import { businessDateISO, businessDateTimeSec } from '../../lib/business-time.js';
 import type { Prisma, PrismaClient } from '@prisma/client';
 import { OrderItemKind, OrderStatus } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
@@ -126,11 +127,6 @@ function fmtDate(d: Date | null | undefined): string {
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
 }
 
-function fmtDateTime(d: Date | null | undefined): string {
-  if (!d) return '';
-  return `${fmtDate(d)} ${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
-}
-
 /**
  * 航段出发日 YYYY-MM-DD，**按出发地当地时区**折算。
  * 班次 departureTime 存 UTC——当地凌晨起飞的红眼班次 UTC 还停在前一天，
@@ -139,12 +135,6 @@ function fmtDateTime(d: Date | null | undefined): string {
 function fmtDepartDate(d: Date | null | undefined, tz: string | null | undefined): string {
   if (!d) return '';
   return tz ? localDateISO(d, tz) : fmtDate(d);
-}
-
-/** YYYY-MM-DD HH:MM:SS（旧《全岗可用》模版录入时间/到账时间含秒）*/
-function fmtDateTimeSec(d: Date | null | undefined): string {
-  if (!d) return '';
-  return `${fmtDateTime(d)}:${String(d.getUTCSeconds()).padStart(2, '0')}`;
 }
 
 /** 证件类型代码（旧模版此列填 'P'=护照，与航司/PNR 同款单字母口径）*/
@@ -563,7 +553,7 @@ export function orderToFullRows(order: OrderForTemplateExport, ctx: OrderContext
     orderType: ctx.orderType,
     settlePrice: ctx.settlePerPax,
     settleReceived: ctx.paidPerPax,
-    settleReceivedAt: lastPayment ? fmtDateTimeSec(lastPayment.paidAt) : '',
+    settleReceivedAt: lastPayment ? businessDateTimeSec(lastPayment.paidAt) : '',
     settleChannel: lastPayment ? PAYMENT_METHOD_LABEL[lastPayment.method] ?? lastPayment.method : '',
     balanceDue: ctx.balancePerPax,
     singleRoomDiff: '',
@@ -576,7 +566,7 @@ export function orderToFullRows(order: OrderForTemplateExport, ctx: OrderContext
     offsetOrder: '',
     settled,
     refundAmount: round2(refundTotal / ctx.paxCount),
-    refundAt: fmtDateTimeSec(lastRefundAt),
+    refundAt: businessDateTimeSec(lastRefundAt),
     refundChannel: '',
     orderStatus: ORDER_STATUS_LABEL[order.status] ?? order.status,
     invoiceStatusSys,
@@ -602,7 +592,7 @@ export function orderToFullRows(order: OrderForTemplateExport, ctx: OrderContext
     issueDate: fmtDateDMYDash(p.passportIssueDate),
     expiryDate: fmtDateDMYDash(p.passportExpiry),
     infantWith: '',
-    recordedAt: fmtDateTimeSec(order.createdAt),
+    recordedAt: businessDateTimeSec(order.createdAt),
     // 游客单 user=null（前台自助下单无录单账号）：统一记「散客」
     recordedBy: order.user?.displayName ?? order.user?.email ?? GUEST_RECORDED_BY_LABEL,
     temp: '',
@@ -875,6 +865,7 @@ export async function buildOrderTemplateExportWorkbook(
 
 /** 文件名：`订单导出_{模板名}_{今天}.xlsx`，如 `订单导出_全岗可用_2026-06-10.xlsx` */
 export function orderTemplateExportFilename(template: OrderExportTemplate): string {
-  const today = fmtDate(new Date());
+  // 「今天」按北京时间取：容器 TZ 是 UTC，北京时间凌晨 0–8 点导出会把文件名写成前一天
+  const today = businessDateISO(new Date());
   return `订单导出_${ORDER_TEMPLATE_LABEL[template]}_${today}.xlsx`;
 }

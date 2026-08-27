@@ -24,6 +24,7 @@ import { getHotelNightlyRemaining } from '../hotel-control/hotel-control.service
 import { fmtDateDMYDash, pnrName } from './orders.export-templates.js';
 import { earliestFlightDepartureLocalDate } from './pnr-export.js';
 import { localDateISO } from '../../lib/flight-time.js';
+import { businessDateTimeSec } from '../../lib/business-time.js';
 
 /** 分房口径：退款申请中的订单已释放占房，不进入分房表。*/
 const COUNTED_STATUSES: OrderStatus[] = [
@@ -110,14 +111,6 @@ export interface RoomGroup {
 function fmtDate(d: Date | null | undefined): string {
   if (!d) return '';
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
-}
-
-/** YYYY-MM-DD HH:MM:SS（录入时间列含秒，与旧系统样例格式一致）。
- * 复制自 orders.export-templates.ts 的同名私有函数（未导出，按约定不改其导出面，就地复制）。*/
-function fmtDateTimeSec(d: Date | null | undefined): string {
-  if (!d) return '';
-  const time = `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}:${String(d.getUTCSeconds()).padStart(2, '0')}`;
-  return `${fmtDate(d)} ${time}`;
 }
 
 /** Prisma.Decimal | number | null → number（与其它导出同款）。*/
@@ -349,7 +342,8 @@ export function buildRoomAllocationSheets(
     // 除零保护 —— 乘客数至少按 1 算，避免空乘客订单除以 0。
     const paxCount = Math.max(1, order.passengers.length);
     const settlePrice = round2(dec(order.total) / paxCount);
-    const enteredAt = fmtDateTimeSec(order.createdAt);
+    // 录入时间是「动作发生时刻」，按北京时间输出（容器 TZ 是 UTC，直接取 UTC 分量会少 8 小时）
+    const enteredAt = businessDateTimeSec(order.createdAt);
 
     // 出发(往返)日期：订单全部 FLIGHT 行的出发日（去重升序）；无航班回落各自入住日
     const flightDates = Array.from(
