@@ -663,7 +663,18 @@ export type CreateOrderItemInput =
       roomsBilled?: number;
     })
   | (OrderItemBase & { kind: 'TRANSFER'; transferId?: string; unitPrice: number })
-  | (OrderItemBase & { kind: 'VISA'; visaId?: string; unitPrice: number })
+  | (OrderItemBase & {
+      kind: 'VISA';
+      visaId?: string;
+      unitPrice: number;
+      /**
+       * 预计出行日期（可选，YYYY-MM-DD）：纯签证单的业务日期锚点。
+       * 签证业务本身既没有航班行也没有酒店入住日，订单「出发日」派生、按出发日期区间
+       * 导出/筛选都要靠它兜底。留空 = 行程尚未定（行为与扩展前一致）。
+       * 回读是完整 ISO 串，展示取 slice(0,10)，不折时区。
+       */
+      visaIntendedDate?: string;
+    })
   | (OrderItemBase & {
       kind: 'BUNDLE';
       bundleId: string;
@@ -688,6 +699,12 @@ export type CreateOrderItemInput =
        * （server-priced）。缺省 = 不指定，走套餐绑定房型/随机现状。
        */
       designatedHotelRoomTypeId?: string;
+      /**
+       * 指定酒店与套餐档次星级不匹配时的放行原因（可选，非空才算填了）。
+       * 服务端硬闸：不匹配组合只有 ADMIN/STAFF 填了非空原因才放行，代理一律 400。
+       * 匹配（或不指定酒店）时不必传。
+       */
+      designatedHotelStarMismatchReason?: string;
     });
 
 // 签证状态（录单/详情用）；后端 enum → 中文：
@@ -3116,6 +3133,51 @@ export interface ReverseManualPaymentResult {
   warning: string | null;
 }
 
+/**
+ * 一笔手工到账被「超收自动拆分」后的明细。
+ * 超收不再被硬闸拦下：应收部分照常核销进本单，超出部分自动落一笔挂账池进账（RCP…），
+ * 由财务在收款对账台核销到真正该收的那张订单上。未触发拆分时整个字段为 null。
+ */
+export interface OverpaySplitDetail {
+  /** 本次录入的到账全额（= creditedAmount + pooledAmount） */
+  receivedAmount: number;
+  /** 核销进本订单的部分（0 = 本单应收已满，整笔进池） */
+  creditedAmount: number;
+  /** 转入挂账池待核销的部分（恒 > 0，否则整个 overpaySplit 为 null） */
+  pooledAmount: number;
+  /** 挂账进账 id */
+  receiptId: string;
+  /** 挂账进账号（RCP…），运营照着它到收款对账台找这笔钱 */
+  receiptNo: string;
+}
+
+/** POST /payments/manual-confirm 返回（人工确认收款） */
+export interface ManualConfirmResult {
+  ok: true;
+  /** 核销进订单的那笔收款 id；应收已为 0、整笔进池时为 null（本次没有任何钱记到订单上） */
+  paymentId: string | null;
+  paidAmount: number;
+  total: number;
+  fullyPaid: boolean;
+  orderNumber: string;
+  status: OrderStatus;
+  /** 超收拆分明细；未触发拆分（全额都核销进订单）时为 null */
+  overpaySplit: OverpaySplitDetail | null;
+}
+
+/** POST /payments/batch-confirm 单条结果（逐单入账，一坏不连累其余） */
+export interface BatchConfirmResultItem {
+  orderId: string;
+  ok: boolean;
+  error?: string;
+  paidAmount?: number;
+  total?: number;
+  status?: OrderStatus;
+  paymentId?: string | null;
+  /** 该单触发超收拆分时带上（应收部分已核销，超出部分已进挂账池）；未拆分为 null */
+  overpaySplit?: OverpaySplitDetail | null;
+}
+
 /** POST /receipts/allocate-batch 单组入参（金额一对一吻合的建议组） */
 export interface AllocateBatchItem {
   receiptId: string;
@@ -3782,7 +3844,7 @@ export const api = {
 
   // 人工确认收款（线下收款 → 标记已付 + 上传截图）ADMIN/STAFF
   // 现已允许多付：amount 可超过尾款（paidAmount 可大于 total）。
-  // 硬闸：净已收超应付（含 1 分容差）→ 400，message 直接展示。
+  // 超收不再报错：应收部分照常核销进本单，超出部分自动拆进挂账池（见 OverpaySplitDetail）。
   // 软闸：同订单近 windowMinutes 分钟内已有等额手工收款 → 409 code=DUPLICATE_AMOUNT；
   //       二次确认后带 confirmDuplicate:true 放行。
   confirmPayment: (
@@ -3796,16 +3858,7 @@ export const api = {
       idempotencyKey?: string;
       confirmDuplicate?: boolean;
     },
-  ) =>
-    apiFetch<{
-      ok: true;
-      paymentId: string;
-      paidAmount: number;
-      total: number;
-      fullyPaid: boolean;
-      orderNumber: string;
-      status: OrderStatus;
-    }>('/payments/manual-confirm', { method: 'POST', token, body }),
+  ) => apiFetch<ManualConfirmResult>('/payments/manual-confirm', { method: 'POST', token, body }),
 
   // 冲销手工确认收款（仅更正录入错误；对账认款必须走收款对账台撤销）ADMIN/STAFF
   reverseManualPayment: (token: string, paymentId: string, reason: string) =>
@@ -3827,15 +3880,11 @@ export const api = {
       batchId?: string;
     },
   ) =>
-    apiFetch<{
-      results: Array<{
-        orderId: string;
-        ok: boolean;
-        error?: string;
-        paidAmount: number;
-        status: OrderStatus;
-      }>;
-    }>('/payments/batch-confirm', { method: 'POST', token, body }),
+    apiFetch<{ results: BatchConfirmResultItem[] }>('/payments/batch-confirm', {
+      method: 'POST',
+      token,
+      body,
+    }),
 
   // ── 5/20 反馈新增 API ──────────────────────────────────────────────────
   // 一键导出 PNR Excel；返回 Blob 直接下载
@@ -4109,6 +4158,16 @@ export const api = {
       token,
       body,
     }),
+
+  // 售后改单：套餐改档（ADMIN/STAFF）。把本单的套餐行换绑到另一张套餐（「档次」在数据模型上
+  // 就是另一条 Bundle 记录），按新档重新计价，差额落一条调价行并写审计。
+  // 机票行/班次/座位一律不动；酒店已落位到真实酒店的单先走换酒店；已取消/同一套餐会被拒（400，文案可读）。
+  // diffCny：新应收 − 原应收（正=补收、负=优惠），已落成一条调价行；warnings=需人工复核的提示（如指定酒店被清除）。
+  changeOrderBundle: (token: string, orderId: string, body: { bundleId: string; note?: string }) =>
+    apiFetch<{ order: OrderSummary; diffCny: number; warnings: string[] }>(
+      `/orders/${orderId}/change-bundle`,
+      { method: 'POST', token, body },
+    ),
 
   // 更改订单归属代理（T5；ADMIN/STAFF）。agentId=null（或空串归一）= 转直客；服务端硬守卫逐单校验。
   // 回收站单、已退款单、曾用原代理预存余额抵扣的订单会拒绝；目标代理必须存在且未停用。

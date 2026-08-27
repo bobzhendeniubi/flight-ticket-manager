@@ -23,7 +23,7 @@ import { RoomingEditor, type RoomingPassenger } from '../components/RoomingEdito
 import { HotelSwapModal } from '../components/HotelSwapModal';
 import { SearchSelect, type SearchSelectOption } from '../components/SearchSelect';
 import { ProofImageViewer } from '../components/ProofImageViewer';
-import type { RoomGroup, Receipt, DocumentType, TravelerProfileLookupRow } from '../lib/api';
+import type { RoomGroup, Receipt, DocumentType, TravelerProfileLookupRow, BatchConfirmResultItem } from '../lib/api';
 import { countryIso3ToIso2 } from '../lib/passportOcr';
 import { runPassportOcr, ocrReviewHintText } from '../lib/passportOcrRunner';
 import { ORDER_STATUS_META, orderStatusBadgeClass, orderStatusLabel } from '../lib/orderStatus';
@@ -181,6 +181,39 @@ const KIND_LABEL: Record<OrderItemKindLabel, string> = {
   OVERSALE: '超售',
 };
 
+// 产品类型徽章（图标 + 语义色 + 文字三件套）——列表内容列与详情抽屉共用的唯一口径，
+// 避免两处各写一套颜色导致「同一种产品在列表是灰、在抽屉是蓝」。
+// 色阶沿用状态徽章的浅底深字风格（见 .badge-*）：机票蓝 / 酒店绿 / 签证紫 / 套餐金 / 接送青 / 其余灰。
+// class 必须写成完整字面量（Tailwind 按源码扫描类名，拼接出来的类名不会被打进产物）。
+export const KIND_BADGE: Record<OrderItemKindLabel, { label: string; cls: string; icon?: IconName }> = {
+  FLIGHT: { label: '机票', cls: 'badge bg-sky-50 text-sky-700', icon: 'plane' },
+  HOTEL: { label: '酒店', cls: 'badge bg-emerald-50 text-emerald-700', icon: 'hotel' },
+  VISA: { label: '签证', cls: 'badge bg-violet-50 text-violet-700', icon: 'visa' },
+  BUNDLE: { label: '套餐', cls: 'badge bg-amber-50 text-amber-700', icon: 'gift' },
+  TRANSFER: { label: '地面服务', cls: 'badge bg-cyan-50 text-cyan-700', icon: 'car' },
+  INSURANCE: { label: '保险', cls: 'badge bg-slate-100 text-slate-600' },
+  FEE: { label: '附加费', cls: 'badge bg-slate-100 text-slate-600' },
+  DISCOUNT: { label: '折扣', cls: 'badge bg-slate-100 text-slate-600' },
+  GUIDE: { label: '导游', cls: 'badge bg-slate-100 text-slate-600' },
+  UPGRADE_CHANGE: { label: '升舱/改期', cls: 'badge bg-slate-100 text-slate-600' },
+  OVERSALE: { label: '超售', cls: 'badge bg-slate-100 text-slate-600' },
+};
+
+/** 产品类型徽章（列表/抽屉共用渲染）。未知 kind 走灰底兜底，不崩。 */
+function KindBadge({ kind }: { kind: OrderItemKindLabel }) {
+  const meta = KIND_BADGE[kind] ?? {
+    label: KIND_LABEL[kind] ?? kind,
+    cls: 'badge bg-slate-100 text-slate-600',
+    icon: undefined,
+  };
+  return (
+    <span className={meta.cls}>
+      {meta.icon ? <Icon name={meta.icon} size={12} /> : null}
+      {meta.label}
+    </span>
+  );
+}
+
 // 本卡片**不展示佣金**：真实佣金由后端 CommissionRecord 逐笔计提（含 rate / 层级 / 上下级净费率），
 // 前端按产品类型拍一个固定费率算出来的数与结算完全无关，运营照着它跟代理对账必然对不上。
 // 需要佣金口径请到结算/报表页看后端算好的数。
@@ -301,6 +334,13 @@ function deriveVisaStatus(o: OrderSummary): ApiFfStatus | null {
 function deriveView(o: OrderSummary) {
   const first = (o.items ?? [])[0];
   const itemKind: OrderItemKindLabel = first?.kind ?? 'FLIGHT';
+  // 全部产品类型（去重保序）——一单多产品混挂（机票+酒店同框）时只显示首行 kind 会漏报，
+  // 列表标签与「产品类型」筛选都按这一串判定，与后端 items.some(kind) 口径一致。
+  const itemKinds: OrderItemKindLabel[] = [];
+  for (const it of o.items ?? []) {
+    if (it.kind && !itemKinds.includes(it.kind)) itemKinds.push(it.kind);
+  }
+  if (itemKinds.length === 0) itemKinds.push(itemKind);
   const summaryParts = (o.items ?? []).map((it) =>
     it.quantity > 1 ? `${it.description} × ${it.quantity}` : it.description,
   );
@@ -308,7 +348,130 @@ function deriveView(o: OrderSummary) {
   const customerName = o.user?.displayName ?? o.contactName;
   const agentName = o.agent?.companyName ?? o.agent?.contactName ?? null;
   const totalNum = Number(o.total);
-  return { itemKind, itemSummary, customerName, agentName, totalNum };
+  return { itemKind, itemKinds, itemSummary, customerName, agentName, totalNum };
+}
+
+// ── 列表内容列 / 出发日期列的派生（全部只吃列表已有字段，不新增后端往返）────────────
+//
+// ⚠️ 列表接口的 items 是扁平联查（只带 flightSchedule 的 departureTime/departureTz），
+// 没有 flight（航班号）也没有 hotelRoomType（酒店名/房型名）——所以航班号与已落位酒店名
+// 在列表里只能从订单行 description 里回捞（录单/批量建单写入的固定格式）。
+// 回捞不到就如实留空，绝不臆造。
+
+/** 从订单行描述里提取航班号（如「去程 NX123 MFM→DAD 2026-09-01 经济舱」→ NX123）。 */
+const FLIGHT_NO_RE = /\b(?:[A-Z][A-Z0-9]|[0-9][A-Z])\d{1,4}\b/;
+function flightNoFromDescription(desc: string | null | undefined): string | null {
+  if (!desc) return null;
+  return FLIGHT_NO_RE.exec(desc)?.[0] ?? null;
+}
+
+/** 出发日期列用的航段摘要：一段 = 航班号（可能为空）+ 当地出发日。按出发日升序。 */
+interface OrderFlightLeg {
+  flightNo: string | null;
+  date: string | null;
+}
+function deriveFlightLegs(o: OrderSummary): OrderFlightLeg[] {
+  const legs = (o.items ?? [])
+    .filter((it) => it.kind === 'FLIGHT' && it.flightScheduleId)
+    .map((it) => ({
+      flightNo: it.flightNumber ?? flightNoFromDescription(it.description),
+      // departureDate 由后端按 departureTz 折算好（列表已联查该字段），是权威当地出发日。
+      date: it.departureDate ?? null,
+    }));
+  // 无出发日的段排在后面，避免 undefined 参与比较把顺序打乱。
+  return legs.sort((a, b) => (a.date ?? '9999').localeCompare(b.date ?? '9999'));
+}
+
+/**
+ * 内容列的住宿摘要：已落位＝酒店名·房型；未落位随机档＝「X星随机（待落位）」。
+ * 取数优先级：后端 hotelName/roomTypeName（联查到才有）→ 套餐行 metadata 的指定酒店留痕
+ * → 订单行 description 的「酒店名 · 房型 · …」前两段。无住宿行返回 null。
+ */
+function deriveHotelLine(o: OrderSummary): string | null {
+  const labels: string[] = [];
+  for (const it of o.items ?? []) {
+    if (it.kind !== 'HOTEL' && it.kind !== 'BUNDLE') continue;
+    let label: string | null = null;
+    if (it.randomStarTier != null) {
+      // 随机档行：后端把档次名（「四星随机」）落在 hotelName 上，落位后该列被清空。
+      label = `${it.hotelName ?? '随机酒店'}（待落位）`;
+    } else if (it.hotelName) {
+      label = it.roomTypeName ? `${it.hotelName} · ${it.roomTypeName}` : it.hotelName;
+    } else {
+      const designated = (it.metadata as { designatedHotel?: { hotelName?: unknown } } | null)
+        ?.designatedHotel?.hotelName;
+      if (typeof designated === 'string' && designated.trim()) {
+        label = designated.trim();
+      } else if (it.kind === 'HOTEL') {
+        // 录单/批量建单的酒店行描述固定为「酒店名 · 房型 · 入住~退房 · N晚 × M间」，
+        // 只取前两段；含 ~ / 晚 / 间 的段是日期与间夜，不是店名/房型，跳过。
+        const parts = it.description.split(' · ').map((s) => s.trim()).filter(Boolean);
+        const isMeta = (s: string) => s.includes('~') || s.includes('晚') || s.includes('间');
+        const name = parts[0] && !isMeta(parts[0]) ? parts[0] : null;
+        const room = parts[1] && !isMeta(parts[1]) ? parts[1] : null;
+        label = name ? (room ? `${name} · ${room}` : name) : null;
+      }
+    }
+    if (label && !labels.includes(label)) labels.push(label);
+  }
+  if (labels.length === 0) return null;
+  return labels.length > 1 ? `${labels[0]} 等 ${labels.length} 处` : labels[0];
+}
+
+/**
+ * 证件号脱敏（列表口径）：保留头 4 位 + 尾 2 位，中段打星（EJ6912324 → EJ69***24）。
+ * 列表是「多人同屏扫读」的场景，看全号请进详情抽屉——PII 只在需要时才完整暴露。
+ */
+function maskDocumentNumber(raw: string | null | undefined): string | null {
+  const s = (raw ?? '').trim();
+  if (!s) return null;
+  if (s.length <= 4) return `${s.slice(0, 1)}${'*'.repeat(Math.max(1, s.length - 1))}`;
+  if (s.length <= 6) return `${s.slice(0, 2)}${'*'.repeat(s.length - 3)}${s.slice(-1)}`;
+  return `${s.slice(0, 4)}${'*'.repeat(s.length - 6)}${s.slice(-2)}`;
+}
+
+/** 性别中文（展开面板用；列表主行仍用 M/F 短标，见 genderMark）。 */
+const GENDER_TEXT: Record<string, string> = { M: '男', F: '女', X: '其他' };
+
+// ── 列显示配置（用户自选列）────────────────────────────────────────────
+// 各岗位关心的列不同（票务不看尾款、财务不看签证、签证岗嫌订单号占地方），与其为谁砍一列，
+// 不如让每个人自己收起用不上的列。勾选存本机 localStorage，不进后端、不影响别人。
+// 「内容」「操作」两列不可隐藏——前者是订单本体、后者是唯一入口，藏了这张表就没用了。
+// 只做显示/隐藏，不做拖拽排序：列序是全岗共识，人各拖一套反而没法互相对着屏幕说「第三列」。
+const ORDER_COLUMN_STORAGE_KEY = 'ftm-orders-columns';
+const ORDER_COLUMNS = [
+  { key: 'orderNumber', label: '订单号' },
+  { key: 'customer', label: '客户 / 代理' },
+  { key: 'departDate', label: '出发日期' },
+  { key: 'amount', label: '金额' },
+  { key: 'balance', label: '尾款' },
+  { key: 'status', label: '状态' },
+  { key: 'visa', label: '签证' },
+  { key: 'invoice', label: '开票' },
+  { key: 'createdAt', label: '下单时间' },
+] as const;
+type OrderColumnKey = (typeof ORDER_COLUMNS)[number]['key'];
+type OrderColumnVisibility = Record<OrderColumnKey, boolean>;
+const ALL_COLUMNS_VISIBLE: OrderColumnVisibility = Object.fromEntries(
+  ORDER_COLUMNS.map((c) => [c.key, true]),
+) as OrderColumnVisibility;
+/** 不可隐藏的固定列数（勾选框 / 序号 / 内容 / 操作），用于空态行 colSpan。 */
+const ORDER_FIXED_COLUMN_COUNT = 4;
+
+/** 读本机列配置；缺字段按「显示」补全，解析失败/无 localStorage 时全显（永远不会把表读空）。 */
+function readColumnVisibility(): OrderColumnVisibility {
+  try {
+    const raw = window.localStorage.getItem(ORDER_COLUMN_STORAGE_KEY);
+    if (!raw) return ALL_COLUMNS_VISIBLE;
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const next = { ...ALL_COLUMNS_VISIBLE };
+    for (const col of ORDER_COLUMNS) {
+      if (parsed[col.key] === false) next[col.key] = false;
+    }
+    return next;
+  } catch {
+    return ALL_COLUMNS_VISIBLE;
+  }
 }
 
 // 尾款口径 —— **一律以后端 balanceDue 为准**（serializeOrder 的权威值）：
@@ -481,12 +644,15 @@ export function OrdersPage() {
   // 删单 / 回收站 = 内部员工（ADMIN + STAFF）共有权限，与 isAdmin 分开：
   // isAdmin 另外还管「强制改状态」等绕过状态机的口子，不能一起放开。
   const canManageDeleted = user?.role === 'ADMIN' || user?.role === 'STAFF';
+  // 运营岗（ADMIN + STAFF）：批量工具条里绝大多数动作是运营权限，代理不该看见一排必然 403 的按钮。
+  // 代理唯一能用的批量动作是「批量改备注」——后端 PATCH /orders/:id/notes 的 notes 字段对其放行。
+  const isOps = user?.role === 'ADMIN' || user?.role === 'STAFF';
   // 深链承接：从签证台等页面带 ?q=订单号 跳入时用于填充搜索框并自动开详情抽屉
   const [searchParams] = useSearchParams();
   const legacyOrderId = searchParams.get('legacyOrderId')?.trim();
   const [orders, setOrders] = useState<OrderSummary[]>([]);
   // 后端命中总数（res.pagination.total）。列表一次只拉 ORDERS_FETCH_LIMIT 条且不翻页，
-  // 命中数超过窗口时必须显式告知——否则「共 N 条 / 命中 N 单」是谎报，而且状态/类型/渠道/
+  // 命中数超过窗口时必须显式告知——否则「共 N 条 / 命中 N 单」是谎报，而且状态/渠道/
   // 代理/搜索这些客户端二次筛选只在窗口内跑，运营据此报人数会出错。
   const [ordersTotal, setOrdersTotal] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
@@ -512,6 +678,29 @@ export function OrdersPage() {
   // 默认每页 50 = 开票一次最多 50 张的口径；筛选/搜索变化时回到第 1 页（见下方 effect）。
   const [pageSize, setPageSize] = useState<number>(DEFAULT_PAGE_SIZE);
   const [page, setPage] = useState(1);
+  // 列显示配置（本机偏好，默认全显）+ 「列设置」弹层开关。
+  const [columnVisibility, setColumnVisibility] = useState<OrderColumnVisibility>(readColumnVisibility);
+  const [showColumnPicker, setShowColumnPicker] = useState(false);
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(ORDER_COLUMN_STORAGE_KEY, JSON.stringify(columnVisibility));
+    } catch {
+      // 隐私模式/存储写满时静默降级：本次会话内配置仍生效，只是下次打开回到默认全显。
+    }
+  }, [columnVisibility]);
+  const visibleColumnCount = ORDER_COLUMNS.filter((c) => columnVisibility[c.key]).length;
+  const hiddenColumnCount = ORDER_COLUMNS.length - visibleColumnCount;
+  const tableColSpan = ORDER_FIXED_COLUMN_COUNT + visibleColumnCount;
+  // 乘客明细展开（列表核对护照用，行内展开、按订单记忆；证件号在列表一律脱敏，看全号请进详情）。
+  const [expandedPassengerOrderIds, setExpandedPassengerOrderIds] = useState<Set<string>>(new Set());
+  const togglePassengerPanel = useCallback((orderId: string) => {
+    setExpandedPassengerOrderIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(orderId)) next.delete(orderId);
+      else next.add(orderId);
+      return next;
+    });
+  }, []);
   // 6/16 反馈（业务反馈）：按下单日期(createdAt)筛 — 用于"当天进单多少"的导出
   const [createdFrom, setCreatedFrom] = useState('');
   const [createdTo, setCreatedTo] = useState('');
@@ -565,9 +754,12 @@ export function OrdersPage() {
   // 下单时间起/止：日期 + 可选时间（HH:mm）→ datetime-local 口径 YYYY-MM-DDTHH:mm；无时间＝纯日期（整天）。
   const createdFromParam = createdFrom ? (createdFromTime ? `${createdFrom}T${createdFromTime}` : createdFrom) : '';
   const createdToParam = createdTo ? (createdToTime ? `${createdTo}T${createdToTime}` : createdTo) : '';
-  // 列表/导出共用的后端筛选（不含仅前端的 status/kind/channel/agent，与三模板/全岗导出口径一致）。
+  // 列表/导出共用的后端筛选（不含仅前端的 status/channel/agent，与三模板/全岗导出口径一致）。
   const filterQuery = useMemo<ListOrdersParams>(() => {
     const q: ListOrdersParams = {};
+    // 产品类型接后端（items.some(kind)）——此前只在已加载的 200 条窗口里前端过滤，
+    // 而「筛选后导出」早就带 kind 走后端，于是同一个「酒店」筛选，列表和导出出来的不是同一批单。
+    if (kindFilter) q.kind = kindFilter;
     if (createdFromParam) q.from = createdFromParam;
     if (createdToParam) q.to = createdToParam;
     const resolvedTravel = travelDateRange(travelFrom, travelTo);
@@ -590,7 +782,7 @@ export function OrdersPage() {
     if (tripTypeFilter) q.tripType = tripTypeFilter;
     if (debouncedSearch.trim()) q.search = debouncedSearch.trim();
     return q;
-  }, [createdFromParam, createdToParam, travelFrom, travelTo, claimFilter, debouncedFlightNumber, debouncedPassengerName, debouncedRecordedBy, invoiceLegFilter, visaFilterCode, tripTypeFilter, debouncedSearch]);
+  }, [kindFilter, createdFromParam, createdToParam, travelFrom, travelTo, claimFilter, debouncedFlightNumber, debouncedPassengerName, debouncedRecordedBy, invoiceLegFilter, visaFilterCode, tripTypeFilter, debouncedSearch]);
   // 三模板筛选导出（全岗可用/票务专用/签证专用）
   const [exportTemplate, setExportTemplate] = useState<OrderExportTemplate>('full');
   const [exporting, setExporting] = useState(false);
@@ -813,7 +1005,9 @@ export function OrdersPage() {
   const filtered = useMemo(() => {
     return ordersView.filter(({ order, view }) => {
       if (statusFilter && order.status !== statusFilter) return false;
-      if (kindFilter && view.itemKind !== kindFilter) return false;
+      // 产品类型已由后端 items.some(kind) 筛过；这里的本地判定必须用同一口径（全部行的 kind），
+      // 否则「机票+酒店」混合单会被后端召回、又被前端按首行 kind 误藏，窗口内外两套结果。
+      if (kindFilter && !view.itemKinds.includes(kindFilter)) return false;
       if (channelFilter === 'direct' && view.agentName) return false;
       if (channelFilter === 'agent' && !view.agentName) return false;
       if (agentFilter && view.agentName !== agentFilter) return false;
@@ -861,7 +1055,7 @@ export function OrdersPage() {
 
   // 客户端分页切片：page 越界时（筛选后条数变少）钳到最后一页，保证永远有内容可看。
   // 列表被截断（后端命中数 > 本次拉回的条数）——此时页面上的一切计数都只是「窗口内」的数：
-  // filtered.length 不是全量命中数，状态/类型/渠道/代理/搜索这些客户端二次筛选也只在窗口内跑。
+  // filtered.length 不是全量命中数，状态/渠道/代理这些客户端二次筛选也只在窗口内跑（产品类型/关键词已接后端整体筛选）。
   // 界面必须把这句话说出来，运营才知道要用上方筛选缩小范围，而不是照着数字报人数/订位。
   const ordersTruncated = ordersTotal !== null && ordersTotal > orders.length;
   const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
@@ -1869,7 +2063,7 @@ export function OrdersPage() {
             // 始终等于 orders.length，徽标误报「未筛选」，让人以为筛选没生效。这里把后端筛选参数
             // 也纳入判定，只要任一条件生效就高亮显示「已筛选」。
             const hasBackendFilter = Boolean(
-              createdFrom || createdTo || travelFrom || travelTo ||
+              kindFilter || createdFrom || createdTo || travelFrom || travelTo ||
               flightNumberFilter.trim() || passengerNameFilter.trim() || recordedByFilter.trim() ||
               invoiceLegFilter || visaFilterCode || tripTypeFilter || claimFilter,
             );
@@ -1888,7 +2082,7 @@ export function OrdersPage() {
                 {!loading && ordersTruncated && (
                   <span
                     className="badge-warning"
-                    title={`后端命中 ${ordersTotal} 条，本页单次只加载前 ${orders.length} 条；状态/类型/渠道/代理/关键词筛选只在这 ${orders.length} 条内生效。请用上方「出行日期 / 下单时间 / 航班号 / 乘客姓名」等后端筛选缩小范围后再统计或导出。`}
+                    title={`后端命中 ${ordersTotal} 条，本页单次只加载前 ${orders.length} 条；状态/渠道/代理筛选只在这 ${orders.length} 条内生效（产品类型已改为后端整体筛选）。请用上方「出行日期 / 下单时间 / 产品类型 / 航班号 / 乘客姓名」等后端筛选缩小范围后再统计或导出。`}
                   >
                     仅显示前 {orders.length} 条 / 共 {ordersTotal} 条，请用筛选缩小范围
                   </span>
@@ -2331,7 +2525,9 @@ export function OrdersPage() {
               onChange={(e) => setKindFilter(e.target.value as '' | OrderItemKindLabel)}
             >
               <option value="">全部类型</option>
-              {(['FLIGHT', 'HOTEL', 'TRANSFER', 'VISA'] as OrderItemKindLabel[]).map((k) => (
+              {/* 走后端 items.some(kind)：订单只要含该类型的行就命中（混合单在「机票」「酒店」下都能看到）。
+                  「套餐」此前漏在选项里——套餐单是量最大的一类，筛不出来只能靠翻页找。 */}
+              {(['FLIGHT', 'HOTEL', 'BUNDLE', 'TRANSFER', 'VISA'] as OrderItemKindLabel[]).map((k) => (
                 <option key={k} value={k}>{KIND_LABEL[k]}</option>
               ))}
             </select>
@@ -2520,6 +2716,9 @@ export function OrdersPage() {
               {' · 共 '}
               <span className="text-brand">{selectedPax}</span> 人
             </span>
+            {/* 批量改状态 → 批量到账 → 锁/解锁结算价：全是运营动作，代理不渲染（点了必被后端 403）。 */}
+            {isOps && (
+              <>
             <span className="text-slate-300">|</span>
             <label className="text-sm text-ink-soft">改为：</label>
             <select
@@ -2587,6 +2786,8 @@ export function OrdersPage() {
             >
               解锁结算价
             </button>
+              </>
+            )}
             <button
               className="btn-ghost text-sm"
               onClick={clearSelection}
@@ -2595,8 +2796,9 @@ export function OrdersPage() {
               清除选择
             </button>
           </div>
-          {/* 批量开票（票务岗 0715 反馈）：单条详情页逐个翻转太麻烦，这里一次给勾选的这批订单
-              统一打航段/系统开票标记；单单超班次开票上限会失败，其余单不受影响。 */}
+          {/* 批量开票（票务岗反馈）：单条详情页逐个翻转太麻烦，这里一次给勾选的这批订单
+              统一打航段/系统开票标记；单单超班次开票上限会失败，其余单不受影响。运营专属。 */}
+          {isOps && (
           <div className="mt-3 flex flex-wrap items-center gap-3 border-t border-brand/15 pt-3">
             <label className="text-sm text-ink-soft">批量开票：</label>
             <select
@@ -2618,8 +2820,10 @@ export function OrdersPage() {
               {bulkInvoiceSubmitting ? '处理中…' : `应用到 ${selectedIds.size} 条`}
             </button>
           </div>
+          )}
 
-          {/* 批量改签证状态：无批量端点，逐单复用「改备注」端点的 visaStatus 字段。 */}
+          {/* 批量改签证状态：无批量端点，逐单复用「改备注」端点的 visaStatus 字段（该字段仅运营可改）。 */}
+          {isOps && (
           <div className="mt-3 flex flex-wrap items-center gap-3 border-t border-brand/15 pt-3">
             <label className="text-sm text-ink-soft">批量改签证状态：</label>
             <select
@@ -2641,7 +2845,8 @@ export function OrdersPage() {
               {bulkVisaSubmitting ? '处理中…' : `应用到 ${selectedIds.size} 条`}
             </button>
           </div>
-          {bulkVisaResult && (
+          )}
+          {isOps && bulkVisaResult && (
             <BulkResultPanel
               succeeded={bulkVisaResult.succeeded}
               failed={bulkVisaResult.failed}
@@ -2673,6 +2878,9 @@ export function OrdersPage() {
               <span className="text-xs text-ink-soft">覆盖，不是追加；留空 = 清空（{bulkNotes.length}/2000）</span>
             </div>
           </div>
+          {/* 批量改代理 / 改航班 / 选酒店：均为运营动作（服务端 ADMIN/STAFF），代理不渲染。 */}
+          {isOps && (
+            <>
           {/* 批量改代理：服务端有硬守卫，失败原因逐条展示。 */}
           <div className="mt-3 space-y-2 border-t border-brand/15 pt-3">
             <div className="flex flex-wrap items-center gap-3">
@@ -2848,6 +3056,8 @@ export function OrdersPage() {
               orders={orders}
             />
           )}
+            </>
+          )}
 
           {/* 批量删除（ADMIN + STAFF）：软删除可在回收站恢复；逐单调用现有端点，服务端占座/净收款守卫逐单生效。 */}
           {canManageDeleted && (
@@ -3017,6 +3227,64 @@ export function OrdersPage() {
                 <option key={n} value={n}>{n} 条</option>
               ))}
             </select>
+            {/* 列设置：各岗位自己收起用不上的列（勾选存本机，不影响别人）。
+                「内容」「操作」不在清单里——订单本体与唯一操作入口不给藏。 */}
+            <div className="relative">
+              <button
+                type="button"
+                className="rounded-md border border-slate-200 bg-white px-2 py-1 text-xs text-ink-soft hover:border-brand hover:text-brand"
+                aria-haspopup="true"
+                aria-expanded={showColumnPicker}
+                title="选择这台电脑上要显示哪些列（内容与操作列固定显示）"
+                onClick={() => setShowColumnPicker((v) => !v)}
+              >
+                <Icon name="settings" size={14} /> 列设置
+                {hiddenColumnCount > 0 ? (
+                  <span className="ml-1 text-brand">已隐藏 {hiddenColumnCount}</span>
+                ) : null}
+              </button>
+              {showColumnPicker && (
+                <>
+                  {/* 点空白处收起（覆盖整屏的透明层，避免弹层一直挂在那儿挡视线） */}
+                  <button
+                    type="button"
+                    className="fixed inset-0 z-20 cursor-default"
+                    aria-label="关闭列设置"
+                    onClick={() => setShowColumnPicker(false)}
+                  />
+                  <div className="absolute left-0 top-full z-30 mt-1 w-52 rounded-lg border border-slate-200 bg-white p-2 shadow-lg">
+                    <div className="px-1 pb-1 text-xs font-medium text-ink">显示的列</div>
+                    {ORDER_COLUMNS.map((col) => (
+                      <label
+                        key={col.key}
+                        className="flex cursor-pointer items-center gap-2 rounded px-1 py-1 text-xs text-ink-soft hover:bg-slate-50"
+                      >
+                        <input
+                          type="checkbox"
+                          className="accent-brand"
+                          checked={columnVisibility[col.key]}
+                          onChange={(e) =>
+                            setColumnVisibility((prev) => ({ ...prev, [col.key]: e.target.checked }))
+                          }
+                        />
+                        {col.label}
+                      </label>
+                    ))}
+                    <div className="mt-1 border-t border-slate-100 pt-1 text-[11px] text-ink-muted">
+                      「内容」「操作」固定显示
+                    </div>
+                    <button
+                      type="button"
+                      className="mt-1 w-full rounded px-1 py-1 text-left text-xs text-brand hover:bg-brand-50 disabled:cursor-not-allowed disabled:text-slate-300"
+                      disabled={hiddenColumnCount === 0}
+                      onClick={() => setColumnVisibility({ ...ALL_COLUMNS_VISIBLE })}
+                    >
+                      恢复全部显示
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
             <span className="text-xs text-ink-muted">表头「全选」只选当前页，翻页后可继续勾选累加</span>
           </div>
           <div className="flex items-center gap-2">
@@ -3063,16 +3331,16 @@ export function OrdersPage() {
                   />
                 </th>
                 <th className="w-12 text-center">序号</th>
-                <th className="text-left">订单号</th>
-                <th className="text-left">客户 / 代理</th>
+                {columnVisibility.orderNumber && <th className="text-left">订单号</th>}
+                {columnVisibility.customer && <th className="text-left">客户 / 代理</th>}
                 <th className="text-left">内容</th>
-                <th className="whitespace-nowrap text-left">出发日期</th>
-                <th className="text-right">金额</th>
-                <th className="text-center">尾款</th>
-                <th className="text-center">状态</th>
-                <th className="text-center">签证</th>
-                <th className="whitespace-nowrap text-center">开票</th>
-                <th className="whitespace-nowrap text-left">下单时间</th>
+                {columnVisibility.departDate && <th className="whitespace-nowrap text-left">出发日期</th>}
+                {columnVisibility.amount && <th className="text-right">金额</th>}
+                {columnVisibility.balance && <th className="text-center">尾款</th>}
+                {columnVisibility.status && <th className="text-center">状态</th>}
+                {columnVisibility.visa && <th className="text-center">签证</th>}
+                {columnVisibility.invoice && <th className="whitespace-nowrap text-center">开票</th>}
+                {columnVisibility.createdAt && <th className="whitespace-nowrap text-left">下单时间</th>}
                 {/* 「操作」常驻右侧：列多时不用横滑到底才能点详情。
                     背景必须不透明（表头默认 bg-slate-50/70 半透，横滑时内容会透底）→ 用 ! 覆盖。
                     列本身收窄（见对应 tbody 单元格里的下拉/按钮收紧），避免撑宽整张表把「开票」
@@ -3096,6 +3364,7 @@ export function OrdersPage() {
                   </td>
                   {/* 序号随当前排序/筛选跨页连续编号（第 2 页从 pageSize+1 起），方便对照人数/口头沟通 */}
                   <td className="nums text-center text-xs text-ink-muted">{pageStart + idx + 1}</td>
+                  {columnVisibility.orderNumber && (
                   <td className="text-xs">
                     <button
                       type="button"
@@ -3106,6 +3375,8 @@ export function OrdersPage() {
                       {order.orderNumber}
                     </button>
                   </td>
+                  )}
+                  {columnVisibility.customer && (
                   <td>
                     {/* 客户名 / 代理名都可能很长（尤其代理机构全称），加 max-width + truncate
                         防止撑宽整表；悬浮看全文。 */}
@@ -3131,14 +3402,45 @@ export function OrdersPage() {
                       ) : null;
                     })()}
                   </td>
+                  )}
                   <td>
                     <div className="max-w-xs truncate text-ink" title={view.itemSummary}>
                       {view.itemSummary}
                     </div>
-                    <div className="mt-0.5 flex items-center gap-2 text-xs text-ink-muted">
-                      <span className="rounded bg-slate-100 px-1.5 py-0.5">{KIND_LABEL[view.itemKind]}</span>
-                      <span><span className="nums font-medium text-ink">{order.passengers.length}</span> 人</span>
+                    <div className="mt-0.5 flex flex-wrap items-center gap-1.5 text-xs text-ink-muted">
+                      {/* 一单多产品（机票+酒店混挂）时全部标出来，不再只显示首行的那一个 */}
+                      {view.itemKinds.map((k) => (
+                        <KindBadge key={k} kind={k} />
+                      ))}
+                      {/* 「N 人 ▾」= 展开乘客明细（列表核对护照用；证件号脱敏，看全号进详情） */}
+                      <button
+                        type="button"
+                        className="rounded px-1 text-xs text-ink-muted hover:bg-slate-100 hover:text-brand"
+                        aria-expanded={expandedPassengerOrderIds.has(order.id)}
+                        title={
+                          expandedPassengerOrderIds.has(order.id)
+                            ? '收起乘客明细'
+                            : '展开乘客明细（姓名/性别/护照号，护照号中段已脱敏）'
+                        }
+                        onClick={() => togglePassengerPanel(order.id)}
+                      >
+                        <span className="nums font-medium text-ink">{order.passengers.length}</span> 人{' '}
+                        {expandedPassengerOrderIds.has(order.id) ? '▴' : '▾'}
+                      </button>
                     </div>
+                    {/* 住宿摘要（房控/操作部反馈：一眼看出住哪）：已落位＝酒店名·房型；
+                        未落位随机档＝「X星随机（待落位）」；无住宿行不占位。 */}
+                    {(() => {
+                      const hotelLine = deriveHotelLine(order);
+                      return hotelLine ? (
+                        <div
+                          className="mt-0.5 max-w-xs truncate text-[11px] text-emerald-700"
+                          title={hotelLine}
+                        >
+                          <Icon name="hotel" size={12} /> {hotelLine}
+                        </div>
+                      ) : null;
+                    })()}
                     {order.passengers.length > 0 && (() => {
                       // 姓名提亮（录单岗反馈：加粗+正文色，一眼可见）+ 性别小标（M/F；列表接口未回传性别时
                       // 自然不标，不占位）。字母紧贴姓名会糊成一团（"张三M"），用独立小号淡色 span 隔开。
@@ -3191,21 +3493,112 @@ export function OrdersPage() {
                         </div>
                       );
                     })()}
+                    {/* 乘客明细展开面板（行内，不撑开表格结构）：列表接口的乘客只带
+                        姓名/中文名/性别/证件号，其余字段（出生日期/国籍/证件类型/护照有效期）
+                        列表本就没有，缺就不显示——不为了凑格子发额外请求，也不臆造空值。
+                        证件号一律脱敏（maskDocumentNumber），看全号请进详情抽屉。 */}
+                    {expandedPassengerOrderIds.has(order.id) && order.passengers.length > 0 && (
+                      <div className="mt-1 rounded-md border border-slate-200 bg-slate-50/70 p-1.5">
+                        <div className="mb-1 flex items-center justify-between text-[10px] text-ink-muted">
+                          <span>乘客明细（护照号已脱敏，完整证件号见订单详情）</span>
+                          <button
+                            type="button"
+                            className="text-brand hover:text-brand-dark"
+                            onClick={() => togglePassengerPanel(order.id)}
+                          >
+                            收起
+                          </button>
+                        </div>
+                        <div className="space-y-1">
+                          {order.passengers.map((p, pIdx) => {
+                            const masked = maskDocumentNumber(p.documentNumber);
+                            const gender = p.gender ? GENDER_TEXT[p.gender] : null;
+                            return (
+                              <div
+                                key={p.id}
+                                className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-[11px] leading-snug"
+                              >
+                                <span className="nums w-4 shrink-0 text-ink-muted">{pIdx + 1}</span>
+                                <span className="font-medium text-ink">{p.fullName}</span>
+                                {p.chineseName ? <span className="text-ink-soft">{p.chineseName}</span> : null}
+                                {gender ? <span className="text-ink-muted">{gender}</span> : null}
+                                {p.dateOfBirth ? (
+                                  <span className="nums text-ink-muted">{p.dateOfBirth}</span>
+                                ) : null}
+                                {p.nationality ? <span className="text-ink-muted">{p.nationality}</span> : null}
+                                {masked ? (
+                                  <span className="nums font-mono text-ink-soft" title="中段已脱敏">
+                                    {masked}
+                                  </span>
+                                ) : null}
+                                {p.passportExpiry ? (
+                                  <span className="nums text-ink-muted" title="护照有效期">
+                                    至 {p.passportExpiry}
+                                  </span>
+                                ) : null}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
                   </td>
+                  {columnVisibility.departDate && (
                   <td className="nums whitespace-nowrap text-left text-xs text-ink-soft">
-                    {order.departDate ?? <span className="text-ink-muted">—</span>}
+                    {(() => {
+                      // 团期（票务/操作部反馈）：往返单把去程/回程各写一行「航班号 + 日期」，
+                      // 不再只显示一个整单出发日——回程哪天在列表上根本看不到。
+                      // 航班号在列表接口里没有独立字段，从订单行描述回捞；捞不到就只显示日期。
+                      const legs = deriveFlightLegs(order);
+                      if (legs.length >= 2) {
+                        const outbound = legs[0];
+                        const inbound = legs[legs.length - 1];
+                        return (
+                          <div className="space-y-0.5">
+                            {([['去', outbound], ['回', inbound]] as const).map(([tag, leg]) => (
+                              <div key={tag} className="flex items-baseline gap-1 text-[11px]">
+                                <span className="text-ink-muted">{tag}</span>
+                                {leg.flightNo ? (
+                                  <span className="font-mono font-medium text-ink">{leg.flightNo}</span>
+                                ) : null}
+                                <span>{leg.date ?? '—'}</span>
+                              </div>
+                            ))}
+                          </div>
+                        );
+                      }
+                      const only = legs[0];
+                      const date = order.departDate ?? only?.date ?? null;
+                      if (!date && !only?.flightNo) return <span className="text-ink-muted">—</span>;
+                      return (
+                        <div className="flex items-baseline gap-1">
+                          {only?.flightNo ? (
+                            <span className="font-mono text-[11px] font-medium text-ink">{only.flightNo}</span>
+                          ) : null}
+                          <span>{date ?? '—'}</span>
+                        </div>
+                      );
+                    })()}
                   </td>
+                  )}
+                  {columnVisibility.amount && (
                   <td className="nums text-right font-medium text-ink">
                     ¥{view.totalNum.toLocaleString()}
                   </td>
+                  )}
+                  {columnVisibility.balance && (
                   <td className="text-center">
                     <BalanceBadge balance={deriveBalance(order).balance} />
                   </td>
+                  )}
+                  {columnVisibility.status && (
                   <td className="text-center">
                     <span className={orderStatusBadgeClass(order.status)}>
                       {orderStatusLabel(order.status)}
                     </span>
                   </td>
+                  )}
+                  {columnVisibility.visa && (
                   <td className="text-center">
                     {(() => {
                       // 签证列语义（签证岗反馈）：主显**录单签证要求** order.visaStatus
@@ -3231,12 +3624,17 @@ export function OrdersPage() {
                       );
                     })()}
                   </td>
+                  )}
+                  {columnVisibility.invoice && (
                   <td className="text-center">
                     <InvoiceDots order={order} />
                   </td>
+                  )}
+                  {columnVisibility.createdAt && (
                   <td className="whitespace-nowrap text-[11px] text-ink-muted">
                     {formatOrderListTime(order.createdAt)}
                   </td>
+                  )}
                   {/* 常驻右侧的操作列：背景跟随行态（选中=brand-50、否则白，hover 一律 slate-50
                       与整行 hover 对齐），不能透明——否则横滑时下面的单元格会从背后透出来。 */}
                   <td
@@ -3330,14 +3728,14 @@ export function OrdersPage() {
               ))}
               {!loading && filtered.length === 0 && (
                 <tr>
-                  <td colSpan={13} className="py-8 text-center text-ink-muted">
+                  <td colSpan={tableColSpan} className="py-8 text-center text-ink-muted">
                     没有符合条件的订单
                   </td>
                 </tr>
               )}
               {loading && (
                 <tr>
-                  <td colSpan={13} className="py-8 text-center text-ink-muted">加载中…</td>
+                  <td colSpan={tableColSpan} className="py-8 text-center text-ink-muted">加载中…</td>
                 </tr>
               )}
             </tbody>
@@ -3694,16 +4092,22 @@ function OrderDrawer({
 
   // 可行的下一步状态：直接消费后端逐单下发的 allowedTransitions（状态机真源），列出当前状态的
   // 全部合法流转，而非手抄一份（抄的会漂移——漂移后合法流转被逼进 force 通道，污染强制审计）。
-  const allowedNext = allowedNextOf(o);
+  // allowedTransitions 不按角色过滤（状态机是全局口径），故代理这里再按角色收一道：
+  // 代理只能发起「申请退款 / 申请改期」，其余流转是运营动作，点了必被后端 403——不如不渲染。
+  const machineNext = allowedNextOf(o);
+  const allowedNext = machineNext.filter(
+    (to) => isOps || to === 'REFUND_REQUESTED' || to === 'CHANGE_REQUESTED',
+  );
   const nextSteps: Array<{ label: string; to: OrderStatus; style: string }> = allowedNext.map(
     (to, i) => ({ label: transitionLabel(o.status, to), to, style: i === 0 ? 'btn-primary' : 'btn-secondary' }),
   );
   // 终态 = 后端下发的合法流转为空（据此说明「为何没有可用操作」，而不是渲染空白工具条）。
-  const isTerminal = allowedNext.length === 0;
+  // 用未按角色收窄的 machineNext 判定：代理看到的空工具条是"这些流转不归你做"，不是"这单走到头了"。
+  const isTerminal = machineNext.length === 0;
   // 管理员强制可选的「越过状态机」目标：所有其它状态里、不在标准流转内的（标准流转已经是普通按钮）。
   const forceTargets: OrderStatus[] = isAdmin
     ? (Object.keys(ORDER_STATUS_META) as OrderStatus[]).filter(
-        (s) => s !== o.status && !allowedNext.includes(s),
+        (s) => s !== o.status && !machineNext.includes(s),
       )
     : [];
 
@@ -3874,6 +4278,7 @@ function OrderDrawer({
             <ConfirmPaymentSection
               key={o.id}
               orderId={o.id}
+              orderNumber={o.orderNumber}
               total={bal.payable}
               paidAmount={bal.paid}
               prepaymentOffset={bal.prepaid}
@@ -3926,6 +4331,7 @@ function OrderDrawer({
                           item={it}
                           onOrderUpdated={handleOrderUpdated}
                           canEditSettlementPrice={isOps}
+                          canChangeBundle={isOps}
                           settlementLocked={o.settlementLocked === true}
                         />
                       ))}
@@ -3942,6 +4348,7 @@ function OrderDrawer({
                     item={it}
                     onOrderUpdated={handleOrderUpdated}
                     canEditSettlementPrice={isOps}
+                    canChangeBundle={isOps}
                     settlementLocked={o.settlementLocked === true}
                   />
                 ))}
@@ -4007,9 +4414,11 @@ function OrderDrawer({
                     ? `当前为终态「${orderStatusLabel(o.status)}」，没有后续流转。${
                         isAdmin ? '如需异常订正，可用下方「管理员强制改状态」。' : ''
                       }`
-                    : `「${orderStatusLabel(o.status)}」状态下无标准流转操作。${
-                        isAdmin ? '如需异常订正，可用下方「管理员强制改状态」。' : ''
-                      }`}
+                    : isOps
+                      ? `「${orderStatusLabel(o.status)}」状态下无标准流转操作。${
+                          isAdmin ? '如需异常订正，可用下方「管理员强制改状态」。' : ''
+                        }`
+                      : `「${orderStatusLabel(o.status)}」状态下暂无可由您发起的操作，如需退款 / 改期请联系我方操作。`}
                 </div>
               )}
               {nextSteps.map((s) => (
@@ -5463,6 +5872,7 @@ function OrderItemRow({
   item,
   onOrderUpdated,
   canEditSettlementPrice,
+  canChangeBundle,
   settlementLocked,
 }: {
   orderId: string;
@@ -5470,6 +5880,8 @@ function OrderItemRow({
   onOrderUpdated?: (order: OrderSummary) => void;
   /** 改结算价：后端 PATCH settlement-price 放行 ADMIN/STAFF，这里同口径（非纯 ADMIN） */
   canEditSettlementPrice?: boolean;
+  /** 套餐改档：后端 POST /orders/:id/change-bundle 仅 ADMIN/STAFF，代理不给入口 */
+  canChangeBundle?: boolean;
   settlementLocked?: boolean;
 }) {
   const [rescheduling, setRescheduling] = useState(false);
@@ -5477,7 +5889,10 @@ function OrderItemRow({
   const [swappingHotel, setSwappingHotel] = useState(false);
   const [reschedulingHotel, setReschedulingHotel] = useState(false);
   const [upgradingCabin, setUpgradingCabin] = useState(false);
+  const [changingBundle, setChangingBundle] = useState(false);
   const isFlight = item.kind === 'FLIGHT';
+  // 套餐改档：换绑到另一张套餐（档次/晚数是 Bundle 自身的属性，改档=换 bundleId）。
+  const isBundleRow = item.kind === 'BUNDLE' && Boolean(item.bundleId);
   // 升舱入口：只有**经济舱**机票行能一键升商务舱；套餐机票腿（带 bundleId）走套餐自身的升舱份数模型，后端也会拒。
   const canUpgradeCabin = isFlight && item.flightCabin === 'ECONOMY' && !item.bundleId;
   // HOTEL 行，或已盖章酒店房型的 BUNDLE 行（套餐没有独立 HOTEL 行，酒店盖在 BUNDLE 行上）
@@ -5601,6 +6016,15 @@ function OrderItemRow({
               改期
             </button>
           )}
+          {isBundleRow && canChangeBundle && (
+            <button
+              className="text-[11px] font-medium text-indigo-600 hover:text-indigo-800"
+              onClick={() => setChangingBundle(true)}
+              title="换到另一档套餐；按新档重新计价，差额计入订单调价"
+            >
+              套餐改档
+            </button>
+          )}
         </div>
       </div>
       {isFlight && rescheduling && (
@@ -5650,6 +6074,18 @@ function OrderItemRow({
           }}
         />
       )}
+      {isBundleRow && canChangeBundle && changingBundle && (
+        <BundleChangeModal
+          orderId={orderId}
+          currentBundleId={item.bundleId ?? null}
+          currentLabel={item.description}
+          onClose={() => setChangingBundle(false)}
+          onChanged={(updated) => {
+            setChangingBundle(false);
+            onOrderUpdated?.(updated);
+          }}
+        />
+      )}
       {isHotelRow && swappingHotel && (
         <HotelSwapModal
           orderId={orderId}
@@ -5672,6 +6108,199 @@ function OrderItemRow({
         />
       )}
     </li>
+  );
+}
+
+// ── 套餐改档：把本单的套餐行换绑到另一档套餐（POST /orders/:id/change-bundle）──────
+// 「档次」在数据模型上就是另一条套餐记录（结算档次 / 晚数是套餐自身的属性），所以改档 = 换套餐。
+// 定价与换酒店同一套：原行金额冻结，「新应收 − 原应收」落一条差额调价行；机票行/班次/座位一律不动。
+// 落位到真实酒店的单、已取消的单、选中同一套餐，后端会拒（400，文案原样展示给运营）。
+function BundleChangeModal({
+  orderId,
+  currentBundleId,
+  currentLabel,
+  onClose,
+  onChanged,
+}: {
+  orderId: string;
+  currentBundleId: string | null;
+  /** 当前套餐行描述，摆在弹窗顶部让运营确认改的是哪一行 */
+  currentLabel: string;
+  onClose: () => void;
+  onChanged: (order: OrderSummary) => void;
+}) {
+  const token = useAuth((s) => s.tokens)?.accessToken ?? '';
+  const dialogRef = useDialogA11y(onClose);
+  const [bundles, setBundles] = useState<Bundle[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [targetId, setTargetId] = useState<string | null>(null);
+  const [note, setNote] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [done, setDone] = useState<{ diffCny: number; warnings: string[] } | null>(null);
+
+  // 只列在售套餐：改档是往「现在还能卖」的档次上换，停售档次不该出现在候选里。
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .listBundles(true)
+      .then((r) => {
+        if (!cancelled) setBundles(r.bundles);
+      })
+      .catch(() => {
+        if (!cancelled) setErr('套餐列表加载失败，请关闭重试');
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // 候选项与批量录单同一构造口径：`[编号] 名称`，priceLabel = 折后起价/人
+  //（originalPerPaxCny ×(1−discountPct/100)，与套餐卡「¥X 起/人」一致）。当前这档排除掉——换成自己后端也会拒。
+  const options: SearchSelectOption[] = useMemo(
+    () =>
+      bundles
+        .filter((b) => b.id !== currentBundleId)
+        .map((b) => ({
+          id: b.id,
+          label: `${b.code ? `[${b.code}] ` : ''}${b.name}`,
+          priceLabel: String(Math.round((b.originalPerPaxCny ?? 0) * (1 - (b.discountPct ?? 0) / 100))),
+        })),
+    [bundles, currentBundleId],
+  );
+
+  async function submit(): Promise<void> {
+    if (!token || !targetId || submitting) return;
+    setErr(null);
+    setSubmitting(true);
+    try {
+      const res = await api.changeOrderBundle(token, orderId, {
+        bundleId: targetId,
+        note: note.trim() || undefined,
+      });
+      setDone({ diffCny: res.diffCny, warnings: res.warnings ?? [] });
+      onChanged(res.order);
+    } catch (e: unknown) {
+      // 后端 400 的中文文案（已落位需先换酒店 / 已取消 / 同一套餐 / 取不到当日结算价）原样展示。
+      setErr(e instanceof ApiError ? e.message : '套餐改档失败');
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  // 成功后不立刻关窗：差额与「需人工复核」提示得让运营看见（尤其指定酒店被清除这条）。
+  if (done) {
+    return (
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label="套餐改档结果"
+        tabIndex={-1}
+        className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/50 p-4"
+      >
+        <div className="w-full max-w-md rounded-xl bg-white p-5 shadow-xl">
+          <h3 className="text-sm font-semibold text-ink">
+            <Icon name="check" size={14} /> 套餐改档已完成
+          </h3>
+          <p className="mt-2 text-sm text-ink-soft">
+            {done.diffCny === 0
+              ? '按新档重新计价后应收未变，未产生差额。'
+              : done.diffCny > 0
+                ? `按新档重新计价，需向客户补收 ¥${done.diffCny.toLocaleString()}（已落一条差额调价行）。`
+                : `按新档重新计价，应收减少 ¥${Math.abs(done.diffCny).toLocaleString()}（已落一条差额调价行）。`}
+          </p>
+          <p className="mt-1 text-xs text-ink-muted">已收款项未做任何变动，尾款/多付按新应收自然浮动。</p>
+          {done.warnings.length > 0 && (
+            <ul className="mt-3 space-y-1 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+              {done.warnings.map((w) => (
+                <li key={w}>· {w}</li>
+              ))}
+            </ul>
+          )}
+          <div className="mt-4 flex justify-end">
+            <button className="btn-primary text-sm" onClick={onClose}>
+              知道了
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      ref={dialogRef}
+      role="dialog"
+      aria-modal="true"
+      aria-label="套餐改档"
+      tabIndex={-1}
+      className="fixed inset-0 z-[60] flex items-center justify-center bg-slate-900/50 p-4"
+    >
+      <div className="w-full max-w-md rounded-xl bg-white p-5 shadow-xl">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <h3 className="text-sm font-semibold text-ink">套餐改档</h3>
+            <p className="mt-0.5 truncate text-xs text-ink-muted" title={currentLabel}>
+              当前：{currentLabel}
+            </p>
+          </div>
+          <button className="btn-ghost px-2 py-1" onClick={onClose} aria-label="关闭套餐改档">
+            <Icon name="close" />
+          </button>
+        </div>
+
+        <div className="mt-3 space-y-3">
+          <div>
+            <label className="text-xs text-slate-500">改到哪一档</label>
+            <SearchSelect
+              options={options}
+              value={targetId}
+              onChange={setTargetId}
+              placeholder={loading ? '加载套餐列表…' : options.length ? '搜索目标套餐…' : '暂无其它在售套餐'}
+              disabled={loading || submitting || options.length === 0}
+              className="mt-1"
+            />
+            <p className="mt-1 text-[11px] text-ink-muted">价格为折后起价 / 人，仅供挑档参考；实际按本单人数与出发日重算。</p>
+          </div>
+
+          <label className="block text-xs text-slate-500">
+            改档原因（选填，进审计与差额行）
+            <input
+              className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+              value={note}
+              maxLength={200}
+              onChange={(e) => setNote(e.target.value)}
+              placeholder="如：客户要求升到更高档次"
+              disabled={submitting}
+            />
+          </label>
+
+          <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+            <Icon name="alert" size={14} /> 改档将按新档次重新计价，差额计入订单调价（可正可负）；
+            指定酒店将被清除，需重新指定。机票行、班次与座位不受影响。
+          </div>
+
+          {err && <div className="rounded bg-rose-50 px-2 py-1.5 text-xs text-rose-700">{err}</div>}
+        </div>
+
+        <div className="mt-4 flex justify-end gap-2">
+          <button className="btn-secondary text-sm" onClick={onClose} disabled={submitting}>
+            取消
+          </button>
+          <button
+            className="btn-primary text-sm disabled:opacity-50"
+            onClick={() => void submit()}
+            disabled={!targetId || submitting}
+          >
+            {submitting ? '改档中…' : '确认改档'}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
@@ -7768,14 +8397,19 @@ function NotesSection({
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
 
+  // 内部口径（签证状态 + 内部备注 + 结构化四栏）只对运营开放；代理只写客户备注那一栏。
+  // 后端 PATCH /orders/:id/notes 也是这个口径：notes 对 AGENT 放行，internalNotes/visaStatus/note* 仅 ops。
+  const canEditInternal = role === 'ADMIN' || role === 'STAFF';
+
   const dirty =
     customerNotes !== (order.notes ?? '') ||
-    internalNotes !== (order.internalNotes ?? '') ||
-    visaStatus !== (order.visaStatus ?? 'NOT_NEEDED') ||
-    structured.noteHotel !== (order.noteHotel ?? '') ||
-    structured.noteVisa !== (order.noteVisa ?? '') ||
-    structured.notePayment !== (order.notePayment ?? '') ||
-    structured.noteSpecial !== (order.noteSpecial ?? '');
+    (canEditInternal &&
+      (internalNotes !== (order.internalNotes ?? '') ||
+        visaStatus !== (order.visaStatus ?? 'NOT_NEEDED') ||
+        structured.noteHotel !== (order.noteHotel ?? '') ||
+        structured.noteVisa !== (order.noteVisa ?? '') ||
+        structured.notePayment !== (order.notePayment ?? '') ||
+        structured.noteSpecial !== (order.noteSpecial ?? '')));
 
   const save = async () => {
     if (!tokens?.accessToken) return;
@@ -7784,13 +8418,16 @@ function NotesSection({
     // 这样本人只改一栏时不会用旧快照盲覆盖别人（或补水后服务端）刚写进去的其它字段。
     const body: Parameters<typeof api.updateOrderNotes>[2] = {};
     if (customerNotes !== (order.notes ?? '')) body.notes = customerNotes;
-    if (internalNotes !== (order.internalNotes ?? '')) body.internalNotes = internalNotes;
-    // visaStatus 未改就不发：避免把服务端 null 静默升级成 'NOT_NEEDED'，也不覆盖签证台的进度口径。
-    if (visaStatus !== (order.visaStatus ?? 'NOT_NEEDED')) body.visaStatus = visaStatus;
-    if (structured.noteHotel !== (order.noteHotel ?? '')) body.noteHotel = structured.noteHotel;
-    if (structured.noteVisa !== (order.noteVisa ?? '')) body.noteVisa = structured.noteVisa;
-    if (structured.notePayment !== (order.notePayment ?? '')) body.notePayment = structured.notePayment;
-    if (structured.noteSpecial !== (order.noteSpecial ?? '')) body.noteSpecial = structured.noteSpecial;
+    // 内部字段只有运营才发：代理那边这些输入根本没渲染，发出去也只会被后端 403。
+    if (canEditInternal) {
+      if (internalNotes !== (order.internalNotes ?? '')) body.internalNotes = internalNotes;
+      // visaStatus 未改就不发：避免把服务端 null 静默升级成 'NOT_NEEDED'，也不覆盖签证台的进度口径。
+      if (visaStatus !== (order.visaStatus ?? 'NOT_NEEDED')) body.visaStatus = visaStatus;
+      if (structured.noteHotel !== (order.noteHotel ?? '')) body.noteHotel = structured.noteHotel;
+      if (structured.noteVisa !== (order.noteVisa ?? '')) body.noteVisa = structured.noteVisa;
+      if (structured.notePayment !== (order.notePayment ?? '')) body.notePayment = structured.notePayment;
+      if (structured.noteSpecial !== (order.noteSpecial ?? '')) body.noteSpecial = structured.noteSpecial;
+    }
     if (Object.keys(body).length === 0) return; // 无改动，不发空 PATCH
     setSaving(true);
     try {
@@ -7819,44 +8456,49 @@ function NotesSection({
     }
   };
 
-  // 签证状态 / 内部备注（含内部备注、结构化四栏）只对内部角色开放；AGENT/CUSTOMER 整块不渲染
-  //（后端对这些角色本就不下发 internalNotes/note* 等字段，前端再挡一层，避免代理误看/误改内部口径）。
-  if (role !== 'ADMIN' && role !== 'STAFF') return null;
+  // 代理（AGENT）能改客户备注——后端 notes 本就对其放行；只是内部口径（签证状态 / 内部备注 /
+  // 结构化四栏）不渲染，那些字段后端也不对代理下发、更不许改。CUSTOMER 整块不渲染。
+  if (!canEditInternal && role !== 'AGENT') return null;
 
   return (
     <section>
       <div className="flex items-center gap-2">
-        <h3 className="text-sm font-medium text-slate-700">签证状态 / 备注</h3>
-        <span className={`rounded px-2 py-0.5 text-[11px] font-medium ${VISA_STATUS_BADGE[visaStatus]}`}>
-          {VISA_STATUS_LABEL[visaStatus]}
-        </span>
+        <h3 className="text-sm font-medium text-slate-700">{canEditInternal ? '签证状态 / 备注' : '备注'}</h3>
+        {canEditInternal && (
+          <span className={`rounded px-2 py-0.5 text-[11px] font-medium ${VISA_STATUS_BADGE[visaStatus]}`}>
+            {VISA_STATUS_LABEL[visaStatus]}
+          </span>
+        )}
       </div>
       <div className="mt-2 space-y-2">
-        <div>
-          <label className="text-xs text-slate-500">签证状态</label>
-          <select
-            className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 text-xs"
-            value={visaStatus}
-            onChange={(e) => setVisaStatus(e.target.value as VisaStatusInput)}
-          >
-            {(Object.keys(VISA_STATUS_LABEL) as VisaStatusInput[]).map((v) => (
-              <option key={v} value={v}>{VISA_STATUS_LABEL[v]}</option>
-            ))}
-          </select>
-        </div>
-        {STRUCTURED_NOTE_FIELDS.map((f) => (
-          <div key={f.key}>
-            <label className="text-xs text-slate-500">{f.label}</label>
-            <textarea
+        {canEditInternal && (
+          <div>
+            <label className="text-xs text-slate-500">签证状态</label>
+            <select
               className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 text-xs"
-              rows={2}
-              value={structured[f.key]}
-              maxLength={300}
-              onChange={(e) => setStructured((prev) => ({ ...prev, [f.key]: e.target.value }))}
-              placeholder={f.placeholder}
-            />
+              value={visaStatus}
+              onChange={(e) => setVisaStatus(e.target.value as VisaStatusInput)}
+            >
+              {(Object.keys(VISA_STATUS_LABEL) as VisaStatusInput[]).map((v) => (
+                <option key={v} value={v}>{VISA_STATUS_LABEL[v]}</option>
+              ))}
+            </select>
           </div>
-        ))}
+        )}
+        {canEditInternal &&
+          STRUCTURED_NOTE_FIELDS.map((f) => (
+            <div key={f.key}>
+              <label className="text-xs text-slate-500">{f.label}</label>
+              <textarea
+                className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 text-xs"
+                rows={2}
+                value={structured[f.key]}
+                maxLength={300}
+                onChange={(e) => setStructured((prev) => ({ ...prev, [f.key]: e.target.value }))}
+                placeholder={f.placeholder}
+              />
+            </div>
+          ))}
         <div>
           <label className="text-xs text-slate-500">客户备注（客户可见）</label>
           <textarea
@@ -7867,16 +8509,18 @@ function NotesSection({
             placeholder="客户的特殊要求（如先发批文、酒店单过海关）"
           />
         </div>
-        <div>
-          <label className="text-xs text-slate-500">内部备注（仅运营可见）</label>
-          <textarea
-            className="mt-1 w-full rounded-md border border-amber-300 bg-amber-50 px-2 py-1.5 text-xs"
-            rows={2}
-            value={internalNotes}
-            onChange={(e) => setInternalNotes(e.target.value)}
-            placeholder="跨班次/跨部门的私下备忘"
-          />
-        </div>
+        {canEditInternal && (
+          <div>
+            <label className="text-xs text-slate-500">内部备注（仅运营可见）</label>
+            <textarea
+              className="mt-1 w-full rounded-md border border-amber-300 bg-amber-50 px-2 py-1.5 text-xs"
+              rows={2}
+              value={internalNotes}
+              onChange={(e) => setInternalNotes(e.target.value)}
+              placeholder="跨班次/跨部门的私下备忘"
+            />
+          </div>
+        )}
         {(dirty || saved) && (
           <div className="flex items-center gap-2">
             {dirty && (
@@ -10340,13 +10984,10 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   );
 }
 
-// 超收硬闸拦截的错误文案片段（与 payments.service.ts 的 BadRequestError 原文一致）。
-// 命中即说明这不是普通失败，而是「钱是真收到了，只是不能记进这张单」——就地给挂账池登记出口。
-const OVERPAY_GATE_HINT = '超出部分请在收款对账台登记挂账池';
-
 // ── 确认收款（线下收款 → 标记已付 + 上传截图）────────────────────────
 function ConfirmPaymentSection({
   orderId,
+  orderNumber,
   total,
   paidAmount,
   prepaymentOffset,
@@ -10354,6 +10995,8 @@ function ConfirmPaymentSection({
   onChanged,
 }: {
   orderId: string;
+  /** 订单号：跳收款对账台时带上（?order=…），让那边直接预填订单搜索框 */
+  orderNumber: string;
   /** 客户应付（= effectivePayable，含售后费） */
   total: number;
   paidAmount: number;
@@ -10364,6 +11007,9 @@ function ConfirmPaymentSection({
 }) {
   const tokens = useAuth((s) => s.tokens);
   const token = tokens?.accessToken ?? '';
+  const navigate = useNavigate();
+  // 跳收款对账台并带上本单订单号，那边据此预填核销表单的订单搜索框。
+  const reconciliationHref = `/reconciliation?order=${encodeURIComponent(orderNumber)}`;
   const askConfirm = useConfirm();
   const highRiskConfirmRef = useRef(false);
   const [payments, setPayments] = useState<OrderPayment[]>([]);
@@ -10382,9 +11028,9 @@ function ConfirmPaymentSection({
   const [note, setNote] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  // 超收硬闸拦下这笔收款时，就地把它登记进挂账池（不绕闸，只是省得跳去对账台重录）。
-  const [poolSubmitting, setPoolSubmitting] = useState(false);
-  const [poolMsg, setPoolMsg] = useState<string | null>(null);
+  // 超收自动拆分的结果提示：录入额 > 本单应收时，后端把应收部分核销进本单、超出部分转挂账池，
+  // 这里把「多少进了本单 / 多少进了池子 / 池子里的进账号」如实摆给运营看。
+  const [splitNotice, setSplitNotice] = useState<string | null>(null);
   // 收款复核锁：财务/出纳对账无误后锁定本单收款；锁定态隐藏录款表单并禁止再录。
   const [paymentsLocked, setPaymentsLocked] = useState(false);
   const [lockBusy, setLockBusy] = useState(false);
@@ -10487,7 +11133,7 @@ function ConfirmPaymentSection({
       return;
     }
     setErr(null);
-    setPoolMsg(null);
+    setSplitNotice(null);
     const amt = amount ?? undefined;
     if (amt !== undefined && (!Number.isFinite(amt) || amt <= 0)) {
       setErr('金额需为正数');
@@ -10508,12 +11154,35 @@ function ConfirmPaymentSection({
       setProofUrl(null);
       setNote('');
       setIdemKey(makeIdemKey());
+      // 超收自动拆分：录入额里只有应收那部分记进了本单，其余已落成挂账池进账（RCP…）。
+      // 这必须如实告诉运营——否则他会以为整笔都算进本单已付了。
+      // creditedAmount=0（本单应收已满、整笔进池，此时 paymentId 也为 null）单独措辞，别说成"已收 ¥0 入本单"。
+      if (res.overpaySplit) {
+        const s = res.overpaySplit;
+        setSplitNotice(
+          s.creditedAmount > 0
+            ? `已收 ¥${s.receivedAmount.toLocaleString()}：其中 ¥${s.creditedAmount.toLocaleString()} 核销进本单，` +
+              `超出的 ¥${s.pooledAmount.toLocaleString()} 已转挂账池（进账号 ${s.receiptNo}），` +
+              `可在「收款对账台」核销到其他订单。`
+            : `本单应收已收满，这笔 ¥${s.receivedAmount.toLocaleString()} 整笔转入挂账池（进账号 ${s.receiptNo}），` +
+              `没有计入本单已付；请到「收款对账台」核销到真正该收的订单。`,
+        );
+      }
       const r = await api.getOrder(token, orderId);
       setPayments(r.order.payments ?? []);
+      // 拆分出的那笔挂账进账带本单 hint，刷新一下「疑似本单待核销」提示让它立刻可见（失败静默）。
+      if (res.overpaySplit) {
+        try {
+          const pool = await api.listReceipts(token, { orderHintId: orderId, unallocatedOnly: '1' });
+          setPendingReceipts(pool.receipts);
+        } catch {
+          /* 只读提示，拉取失败不影响收款结果 */
+        }
+      }
       onChanged?.();
     } catch (e: unknown) {
       // 同额软闸：近 windowMinutes 分钟内同订单已录过等额收款 → 二次确认后带 confirmDuplicate 重发。
-      // 硬闸(400 超收) / 其它错误：直接把服务端 message 原样展示在错误条。
+      // 其它错误：直接把服务端 message 原样展示在错误条（超收已不再报错，由后端自动拆分）。
       const dup = duplicateAmountDetails(e);
       if (dup && !confirmDuplicate) {
         setSubmitting(false);
@@ -10531,46 +11200,6 @@ function ConfirmPaymentSection({
       setErr(e instanceof ApiError ? e.message : '确认收款失败');
     } finally {
       setSubmitting(false);
-    }
-  }
-
-  // 就地把「被超收硬闸拦下的这笔收款」登记进挂账池：闸不拆，只是省得离开订单页去对账台重录。
-  // 金额按用户填的全额登记（不拆分应收/超出部分）——这笔钱本来就要记账，闸只是不让它算进这张单，
-  // 具体怎么分由财务在对账台认领时决定。登记后仍是 OPEN 进账、仍要财务认领才算数，不代表本单已收到钱。
-  async function registerOverpayToPool(): Promise<void> {
-    if (!token || poolSubmitting) return;
-    const amt = amount;
-    if (amt === null || !Number.isFinite(amt) || amt <= 0) {
-      setErr('金额需为正数');
-      return;
-    }
-    setPoolSubmitting(true);
-    try {
-      await api.createReceipt(token, {
-        amountCny: amt,
-        method,
-        proofUrl: proofUrl ?? undefined,
-        payerNote: note.trim() || `订单收款超收转入挂账池（关联订单 ${orderId}）`,
-        orderHintId: orderId,
-      });
-      setErr(null);
-      setPoolMsg(
-        `已把 ¥${amt.toLocaleString()} 登记到挂账池，这笔钱还没算作本单已付——要等财务在「收款对账台」认领后才会入账。`,
-      );
-      setAmount(null);
-      setProofUrl(null);
-      setNote('');
-      // 挂账池疑似本单待认领提示：登记完立刻刷新，让这笔新登记马上可见（失败静默，不影响主流程）。
-      try {
-        const r = await api.listReceipts(token, { orderHintId: orderId, unallocatedOnly: '1' });
-        setPendingReceipts(r.receipts);
-      } catch {
-        /* 只读提示，拉取失败不影响登记结果 */
-      }
-    } catch (e: unknown) {
-      setErr(e instanceof ApiError ? e.message : '登记挂账池失败');
-    } finally {
-      setPoolSubmitting(false);
     }
   }
 
@@ -10631,7 +11260,7 @@ function ConfirmPaymentSection({
       next &&
       pendingHint &&
       !window.confirm(
-        `挂账池还有 ${pendingHint.count} 笔疑似本单待认领（共 ¥${pendingHint.totalRemaining.toLocaleString()}，流水 ${pendingHint.refsText}）。\n\n` +
+        `挂账池还有 ${pendingHint.count} 笔疑似本单待核销（共 ¥${pendingHint.totalRemaining.toLocaleString()}，流水 ${pendingHint.refsText}）。\n\n` +
           '锁定只拦人工录入收款，对账台认款仍会照常入账。确定现在锁定吗？',
       )
     )
@@ -10748,20 +11377,29 @@ function ConfirmPaymentSection({
           </span>
         </div>
 
-        {/* 挂账池疑似本单待认领：财务锁定收款前先看见池子里还压着本单的钱（提示，不阻断） */}
+        {/* 挂账池疑似本单待核销：财务锁定收款前先看见池子里还压着本单的钱（提示，不阻断） */}
         {pendingHint && (
           <div className="mt-2 rounded-md border border-amber-300 bg-amber-50 px-2 py-1.5 text-xs text-amber-800">
-            <Icon name="wallet" /> 挂账池有 <b className="nums">{pendingHint.count}</b> 笔疑似本单待认领（共{' '}
+            <Icon name="wallet" /> 挂账池有 <b className="nums">{pendingHint.count}</b> 笔疑似本单待核销（共{' '}
             <b className="nums">¥{pendingHint.totalRemaining.toLocaleString()}</b>，流水{' '}
             <span className="font-mono">{pendingHint.refsText}</span>）
             <span className="ml-1 text-amber-700">
-              — 去「收款对账台」认款后才会计入本单已付。
+              — 在「收款对账台」核销后才会计入本单已付。
             </span>
             {pendingHint.overpayCount > 0 && (
               <span className="ml-1 text-amber-700">
                 其中 {pendingHint.overpayCount} 笔是本单多付转入的。
               </span>
             )}
+            <div className="mt-1.5">
+              <button
+                type="button"
+                className="btn-secondary text-xs px-2 py-1"
+                onClick={() => navigate(reconciliationHref)}
+              >
+                去收款对账台核销
+              </button>
+            </div>
           </div>
         )}
 
@@ -10929,25 +11567,21 @@ function ConfirmPaymentSection({
             <p className="text-xs text-slate-400">已结清；如需追加收款（多付）可继续录入。</p>
           )}
           <div className="space-y-2">
-            {err && (
-              <div className="rounded bg-rose-50 px-2 py-1 text-xs text-rose-700">
-                {err}
-                {err.includes(OVERPAY_GATE_HINT) && amount !== null && amount > 0 && (
-                  <div className="mt-1.5">
-                    <button
-                      type="button"
-                      className="btn-secondary text-xs px-2 py-1 disabled:opacity-50"
-                      onClick={() => void registerOverpayToPool()}
-                      disabled={poolSubmitting}
-                    >
-                      {poolSubmitting ? '登记中…' : `把这 ¥${amount.toLocaleString()} 登记到挂账池`}
-                    </button>
-                  </div>
-                )}
+            {err && <div className="rounded bg-rose-50 px-2 py-1 text-xs text-rose-700">{err}</div>}
+            {/* 超收自动拆分提示：录入额里有一部分没进本单、而是进了挂账池，给出进账号与下一步去处。 */}
+            {splitNotice && (
+              <div className="rounded border border-amber-200 bg-amber-50 px-2 py-1.5 text-xs text-amber-800">
+                <Icon name="wallet" /> {splitNotice}
+                <div className="mt-1.5">
+                  <button
+                    type="button"
+                    className="btn-secondary text-xs px-2 py-1"
+                    onClick={() => navigate(reconciliationHref)}
+                  >
+                    去收款对账台核销
+                  </button>
+                </div>
               </div>
-            )}
-            {poolMsg && (
-              <div className="rounded bg-emerald-50 px-2 py-1 text-xs text-emerald-700">{poolMsg}</div>
             )}
             <div className="flex gap-2">
               <label className="flex-1 text-xs text-slate-500">
@@ -10990,7 +11624,7 @@ function ConfirmPaymentSection({
               <button
                 className="btn-primary text-sm disabled:opacity-50"
                 onClick={() => confirm()}
-                disabled={submitting || poolSubmitting}
+                disabled={submitting}
               >
                 {submitting ? '确认中…' : '确认收款'}
               </button>
@@ -11100,9 +11734,7 @@ function BatchPayModal({
   const [sharedNote, setSharedNote] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  const [results, setResults] = useState<
-    Array<{ orderId: string; ok: boolean; error?: string; paidAmount: number; status: OrderStatus }> | null
-  >(null);
+  const [results, setResults] = useState<BatchConfirmResultItem[] | null>(null);
 
   // 幂等 batchId：同一次批量提交（含双击/网络重试）只入账一次；成功后换新
   const makeBatchId = () =>
@@ -11162,7 +11794,7 @@ function BatchPayModal({
 
   const totalToReceive = validRows.reduce((sum, r) => sum + (r.amount as number), 0);
   const resultById = useMemo(() => {
-    const m = new Map<string, { ok: boolean; error?: string; paidAmount: number; status: OrderStatus }>();
+    const m = new Map<string, BatchConfirmResultItem>();
     results?.forEach((r) => m.set(r.orderId, r));
     return m;
   }, [results]);
@@ -11258,7 +11890,18 @@ function BatchPayModal({
                         <td className="px-3 py-1.5 text-xs">
                           {res ? (
                             res.ok ? (
-                              <span className="inline-flex items-center gap-1 text-emerald-700"><Icon name="check" size={14} /> 已到账（已付 ¥{res.paidAmount.toLocaleString()}）</span>
+                              <>
+                                <span className="inline-flex items-center gap-1 text-emerald-700"><Icon name="check" size={14} /> 已到账（已付 ¥{(res.paidAmount ?? 0).toLocaleString()}）</span>
+                                {/* 超收自动拆分：这一单只吃下了应收部分，余额已进挂账池待核销，如实标出进账号。 */}
+                                {res.overpaySplit && (
+                                  <div className="mt-0.5 text-[11px] text-amber-700">
+                                    其中 ¥{res.overpaySplit.creditedAmount.toLocaleString()} 入本单，超出的 ¥
+                                    {res.overpaySplit.pooledAmount.toLocaleString()} 已转挂账池（
+                                    <span className="font-mono">{res.overpaySplit.receiptNo}</span>），
+                                    可在收款对账台核销到其他订单。
+                                  </div>
+                                )}
+                              </>
                             ) : (
                               <span className="inline-flex items-center gap-1 text-rose-600"><Icon name="close" size={14} /> {res.error ?? '失败'}</span>
                             )
