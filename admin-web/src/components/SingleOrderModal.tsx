@@ -672,10 +672,14 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   );
 
   // ── 套餐乘客级「住宿方式 + 签证」（购物车模式）──
-  // 住宿列：套餐单都显示；签证列：仅当所选套餐配了自备签减免额（selfVisaDeductCny>0）才显示
-  //   （否则自备签不产生价差，展示无意义，与旧整单勾选框的显示条件一致）。
+  // 住宿列：套餐单都显示；签证列：套餐含签证组件，或配了自备签减免额（selfVisaDeductCny>0）时显示。
+  //   旧口径只看减免额（「无价差 = 展示无意义」），但自备签同时决定该乘客**进不进签证台**——
+  //   含签证组件的套餐即使没配减免额，整单选「不需要」也必须能落到乘客级 visaExempt，
+  //   否则订单照样生成签证任务、签证台挂一条「待处理」（公测反馈）。
   const showRoomingCol = isBundleOrder;
-  const showVisaExemptCol = isBundleOrder && (bundle?.selfVisaDeductCny ?? 0) > 0;
+  const bundleHasVisaComponent = !!bundle?.items?.some((it) => it.kind === 'VISA');
+  const showVisaExemptCol =
+    isBundleOrder && (bundleHasVisaComponent || (bundle?.selfVisaDeductCny ?? 0) > 0);
   // 出行人表格总列数（姓名/护照号/出生日期/中文姓名/性别/签发日期/签发地点/有效期/护照图/操作 10 列 +
   //   可选的住宿/签证列）；AI 核对提示行需要 colSpan 撑满整行。
   const passengerColCount = 10 + (showRoomingCol ? 1 : 0) + (showVisaExemptCol ? 1 : 0);
@@ -1973,7 +1977,8 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
               {showVisaExemptCol && (
                 <p className="mt-1 text-[11px] text-slate-400">
                   选「不需要」会把当前及新增出行人自动设为「自备签」（下方出行人表可逐位改回「随套餐」）；
-                  反向不联动——单个乘客选自备签不会改变本订单级签证状态，自备签乘客不进签证台、套餐价按人扣减。
+                  反向不联动——单个乘客选自备签不会改变本订单级签证状态，自备签乘客不进签证台
+                  {selfVisaDeductPerPax > 0 ? '、套餐价按人扣减' : ''}。
                 </p>
               )}
             </div>
@@ -2014,7 +2019,11 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
               </div>
               {autoVisaExemptForBundle && (
                 <p className="mb-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
-                  整单不需要签证 → 已按每位自备签计价（每人 −¥{selfVisaDeductPerPax.toLocaleString('zh-CN')}），可逐位改回
+                  整单不需要签证 → 每位出行人已标为自备签（不进签证台
+                  {selfVisaDeductPerPax > 0
+                    ? `，每人 −¥${selfVisaDeductPerPax.toLocaleString('zh-CN')}`
+                    : ''}
+                  ），可逐位改回
                 </p>
               )}
               <div className="scrollbar-visible max-h-[28rem] overflow-x-auto overflow-y-auto rounded-md border border-slate-200">
@@ -2098,7 +2107,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                               })()}
                             </td>
                           )}
-                          {/* 套餐乘客级：签证（随套餐默认/自备签）——仅套餐配了自备签减免额时显示 */}
+                          {/* 套餐乘客级：签证（随套餐默认/自备签）——套餐含签证组件或配了自备签减免额时显示 */}
                           {showVisaExemptCol && (
                             <td className="min-w-[120px] px-2 py-1 align-top">
                               <select

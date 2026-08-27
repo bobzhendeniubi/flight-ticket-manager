@@ -8255,6 +8255,17 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   }, [productType]);
   const [noteHotel, setNoteHotel] = useState('');
 
+  // 整批签证「不需要」→ 乘客行自备签的单向联动（与单笔录单 SingleOrderModal 同口径）。
+  // 套餐含签证组件时，订单级「不需要」压不掉商品级涉签——只有乘客级 visaExempt 才能免建签证任务；
+  // 不联动的话整批子单会每张都挂进签证台「待处理」。单向：选中「不需要」时批量置为自备签 +
+  // 新增/导入行默认自备签；改回其它值不做反向还原，不动用户逐行调整过的勾选。
+  const batchAutoVisaExempt = productType === 'BUNDLE' && visaStatus === 'NOT_NEEDED';
+  /** 导入/粘贴整批替换名单时，给未显式带 visaExempt 的行补联动默认值（联动未激活时原样返回）。 */
+  function applyBatchVisaExemptDefault(list: BatchRow[]): BatchRow[] {
+    if (!batchAutoVisaExempt) return list;
+    return list.map((r) => (r.visaExempt === undefined ? { ...r, visaExempt: true } : r));
+  }
+
   // ── 名单 ──────────────────────────────────────────────────────────────────
   const [rows, setRows] = useState<BatchRow[]>([{ fullName: '', documentNumber: '', dateOfBirth: '', nationality: 'CN' }]);
   // 并发 OCR 读最新行快照用（setRow 同步写入，避免批量识别时读到陈旧的渲染闭包）。
@@ -8777,7 +8788,17 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   }
   function addRow(): void {
     setRows((prev) => {
-      const next = [...prev, { fullName: '', documentNumber: '', dateOfBirth: '', nationality: 'CN' }];
+      // 整批「不需要签证」联动生效时，新增行默认自备签（与已有行一致，可逐行改回）。
+      const next = [
+        ...prev,
+        {
+          fullName: '',
+          documentNumber: '',
+          dateOfBirth: '',
+          nationality: 'CN',
+          ...(batchAutoVisaExempt ? { visaExempt: true } : {}),
+        },
+      ];
       rowsRef.current = next;
       return next;
     });
@@ -8833,6 +8854,8 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
         documentNumber: '',
         dateOfBirth: '',
         nationality: 'CN',
+        // 整批「不需要签证」联动生效时，批量识别追加的行同样默认自备签（与手动加一行同口径）。
+        ...(batchAutoVisaExempt ? { visaExempt: true as const } : {}),
       }));
       setRows((prev) => [...prev, ...toAppend]);
       rowsRef.current = [...current, ...toAppend]; // ref 同步前置：并发 worker 立即按这些末尾索引写入
@@ -8880,7 +8903,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
         return { fullName: cols[0] ?? '', documentNumber: cols[1] ?? '', dateOfBirth: cols[2] ?? '', nationality: 'CN' };
       })
       .filter((r) => r.fullName);
-    if (parsed.length > 0) setRows(parsed);
+    if (parsed.length > 0) setRows(applyBatchVisaExemptDefault(parsed));
   }
 
   // 📋 OTA 名单粘贴导入：解析 → 填乘客行（含护照字段）+ 选航班/起飞日 + 预填结算单价 + 展示解析提醒。
@@ -8927,7 +8950,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
 
     if (result.passengers.length > 0) {
       setRows(
-        result.passengers.map((p) => ({
+        applyBatchVisaExemptDefault(result.passengers.map((p) => ({
           fullName: p.fullName,
           documentNumber: p.documentNumber ?? '',
           dateOfBirth: p.dateOfBirth ?? '',
@@ -8939,7 +8962,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
           passportExpiry: p.passportExpiry,
           pnr: p.pnr, // 唯一编码 token → 全员同 PNR（一码多人）
           note: p.note,
-        })),
+        }))),
       );
     }
 
@@ -10207,7 +10230,17 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                   value={visaStatus}
                   onChange={(e) => {
                     visaStatusTouchedRef.current = true;
-                    setVisaStatus(e.target.value as VisaStatusInput);
+                    const next = e.target.value as VisaStatusInput;
+                    setVisaStatus(next);
+                    // 单向联动（与单笔录单同口径）：套餐批改成「不需要」→ 现有乘客行批量置自备签；
+                    // 改回其它值不做反向还原，不动用户逐行调整过的勾选。
+                    if (next === 'NOT_NEEDED' && productType === 'BUNDLE') {
+                      setRows((prev) => {
+                        const updated = prev.map((r) => ({ ...r, visaExempt: true }));
+                        rowsRef.current = updated;
+                        return updated;
+                      });
+                    }
                   }}
                 >
                   {(Object.keys(VISA_STATUS_LABEL) as VisaStatusInput[]).map((s) => (
@@ -10216,6 +10249,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                 </select>
                 <span className="mt-1 block text-[11px] leading-tight text-slate-400">
                   默认按产品类型：套餐默认「需要」，机票默认「不需要」；手动改过后不再自动跟随。
+                  {productType === 'BUNDLE' && '套餐批选「不需要」会把名单全员标为自备签（不进签证台），可逐行改回。'}
                 </span>
               </label>
             </div>
