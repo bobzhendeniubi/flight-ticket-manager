@@ -168,6 +168,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 只算价格、绝不写库/扣座。录单页填完产品/人数即可拿到「系统价」在提交前展示。
   // AGENT 只能试算自己家的结算价：归属经 resolveOrderAgentId 收口（AGENT 无视 body.agentId
   // 强制取本人），与 createOrder 完全同口径，杜绝传别家 agentId 窥探他人结算价。
+  // 指定酒店星级闸同样在此生效（对 AGENT 硬拒 / 对运营不拦）——见 service.quoteOrder。
   app.post(
     '/quote',
     { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT)] },
@@ -175,7 +176,12 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       const body = quoteOrderBodySchema.parse(req.body);
       const requester = await buildRequester(req.user.sub, req.user.role);
       const scopedAgentId = await resolveOrderAgentId(requester, body.agentId);
-      const quote = await service.quoteOrder({ ...body, agentId: scopedAgentId ?? undefined });
+      // 传身份：指定酒店星级闸对 AGENT 当场拒（与 createOrder 同一句文案），
+      // 免得代理选了不匹配档次的酒店照样报价成功、提交才 400。ADMIN/STAFF 试算不拦。
+      const quote = await service.quoteOrder(
+        { ...body, agentId: scopedAgentId ?? undefined },
+        { role: req.user.role },
+      );
       return reply.send(quote);
     },
   );
@@ -1316,8 +1322,12 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     // 签证台上会永远挂着一条办不掉的「待处理」；改回需签则要把任务补回来。
     // 只在 visaStatus 真的变了时才跑（幂等，且不给纯改备注的请求平白加几次查询）；
     // 批量改备注走的是同一个端点逐单调用，因此一并受益。
+    // 放进事务：同步内部是「读现状 → 撤/建」，裸用全局 prisma 时两个并发请求会各建一条任务。
+    // 事务 + 建任务前的同事务 re-check（见 syncVisaTasksForOrder）把并发窗口收到最小。
     if (body.visaStatus !== undefined && body.visaStatus !== before.visaStatus) {
-      await syncVisaTasksForOrder(prisma, id, { userId: req.user.sub, role });
+      await prisma.$transaction((tx) =>
+        syncVisaTasksForOrder(tx, id, { userId: req.user.sub, role }),
+      );
     }
     return { ok: true };
   });
@@ -1847,10 +1857,12 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   //   schema 无护照字段）。归属/状态校验在 service 内（assertCanView 对 ADMIN/STAFF 直接放行；
   //   仅 PENDING_PAYMENT/PAID/PROCESSING 可改，否则 409 ORDER_LOCKED）。返回 { passenger }。
   //
-  // ② 售后改单：换人（仅 ADMIN/STAFF；请求体带 lastName/firstName/fullName/resetInvoice/resetVisa/
-  //   feeCny/feeLabel/note 任一「换人语义字段」即判为换人，见 resolvePassengerPatchChannel）：
+  // ② 售后改单：换人（仅 ADMIN/STAFF；请求体带 lastName/firstName/fullName/title/passengerType/
+  //   visaExempt/singleRoom/resetInvoice/resetVisa/feeCny/feeLabel/note 任一「换人语义字段」
+  //   即判为换人，见 resolvePassengerPatchChannel）：
   //   body: { lastName?, firstName?, fullName?, documentNumber?, dateOfBirth?, gender?,
-  //           nationality?, resetInvoice?, resetVisa?, feeCny?, feeLabel?, note? }
+  //           nationality?, title?, passengerType?, visaExempt?, singleRoom?,
+  //           resetInvoice?, resetVisa?, feeCny?, feeLabel?, note? }
   //   就地把出行人换成新人；resetInvoice→开票 NONE、resetVisa→签证任务 PENDING；可选加换人费。
   app.patch('/:id/passengers/:passengerId', { preHandler: [app.authenticate] }, async (req) => {
     const role = req.user.role;

@@ -1830,12 +1830,21 @@ export class OrderService {
   /**
    * 录单前试算（quote）：复用权威定价 priceAndValidateItems，只算不落库、不扣座。
    * 返回各行明细 + subtotal/total（CNY），供录单页在提交前展示「系统价」。
+   *
+   * @param requester 试算发起人的身份（只用角色）。给了才启用「指定酒店星级闸」，口径与
+   *   createOrder 同一处判定、同一句文案：
+   *     · AGENT / CUSTOMER / 游客（role=null）→ 与提交时一样当场拒（此前报价成功、提交才 400，
+   *       代理选完不匹配的酒店、拿到一个根本下不了的价）；
+   *     · ADMIN / STAFF → 不拦（他们的越档放行是允许的，放行原因在**提交**时才收，
+   *       试算阶段不该逼着填原因，否则运营连看一眼差价都做不到）。
+   *   不传 requester = 内部预算 / 纯算价路径，不判（行为与本次收紧前一致）。
    */
   async quoteOrder(
     // priceAdjustment / settlementTotalCny / flightSettlementPriceCny 已随 quoteOrderBodySchema
     // 暴露（形状与 createOrderBodySchema 对应字段一致）——立减判定与 createOrder 共用同一函数，
     // 录单页填了手工价通道字段后随试算一起发送，两边判定同步收紧。
     body: QuoteOrderBody,
+    requester?: { role: UserRole | null },
   ): Promise<{
     currency: string;
     subtotal: number;
@@ -1849,9 +1858,21 @@ export class OrderService {
     }>;
     settlementPreview: SettlementPreview;
   }> {
+    // 星级闸只对「提交时会被硬拒」的身份启用（AGENT/CUSTOMER/游客），让报价与提交给出同一答案；
+    // ADMIN/STAFF 传 undefined = 不判，试算阶段不索要放行原因（原因在 createOrder 收）。
+    const isOperator =
+      requester?.role === UserRole.ADMIN || requester?.role === UserRole.STAFF;
+    const starGate: DesignatedHotelStarGate | undefined =
+      requester && !isOperator ? { role: requester.role, overrides: [] } : undefined;
     // 试算带上乘客级住宿/签证选项（缺省则回落 item 级旧口径），使系统价随每人选择实时变化。
-    // quote 仅 ADMIN/STAFF 路由可达，允许自由行手录价试算。
-    const priced = await this.priceAndValidateItems(body.items, undefined, body.passengers, true);
+    // 允许自由行手录价试算（quote 仅 ADMIN/STAFF/AGENT 路由可达）。
+    const priced = await this.priceAndValidateItems(
+      body.items,
+      undefined,
+      body.passengers,
+      true,
+      starGate,
+    );
     // 散客立减与结算价日历是两条独立规则链：先按每个套餐行命中 RETAIL，
     // 即使日历价未维护，quote 的商品总价也必须与 createOrder 保持一致。
     // 判定与 createOrder 共用同一个函数（此前 quote 只判 !agentId、createOrder 还要求无手工价通道，
@@ -9627,82 +9648,22 @@ export class OrderService {
     }
     const note = input.note?.trim() || null;
 
-    // ── 0. 事务外只读预取 + 前置校验（长事务只留写操作）────────────────────
-    const order = await prisma.order.findUnique({
+    // ── 0. 事务外只读预检（只为「明显不该改的单别开事务」快速失败）───────────
+    // 这里读到的一切都只是**预检**：状态、明细、总额都可能在开事务前被并发操作改掉。
+    // 权威判定（状态 / 落位 / 计价 / 房量）一律在下面的行锁内、基于锁后重读的快照重做一遍，
+    // 锁外算出来的钱一分都不落库 —— 否则改档窗口期内的并发调价会被差额行静默抵消。
+    const preview = await prisma.order.findUnique({
       where: { id: orderId },
       select: {
         id: true,
-        orderNumber: true,
         status: true,
         deletedAt: true,
-        agentId: true,
-        total: true,
-        items: {
-          select: {
-            id: true,
-            kind: true,
-            quantity: true,
-            amount: true,
-            bundleId: true,
-            hotelRoomTypeId: true,
-            hotelCheckIn: true,
-            hotelCheckOut: true,
-            visaIntendedDate: true,
-            metadata: true,
-            // 「已落位」判定：房型挂在随机档占位酒店上 = 还没落位（业务上仍是随机档）。
-            hotelRoomType: {
-              select: { hotel: { select: { name: true, randomTierPlaceholder: true } } },
-            },
-            // 整单出发日派生（deriveOrderDepartDate 同口径，按出发地当地日折算）。
-            flightSchedule: { select: { departureTime: true, departureTz: true } },
-          },
-        },
+        items: { select: CHANGE_BUNDLE_ITEM_SELECT },
       },
     });
-    if (!order) throw new NotFoundError('订单不存在');
-    if (order.deletedAt) {
-      throw new BadRequestError('订单在回收站（已软删），不可改档；如需操作请先恢复');
-    }
-    // 状态守卫与换酒店 / 酒店改期同一集合：改档会改应收（长出/减掉一笔差额），
-    // 在已取消 / 已退款 / 超时 / 草稿单上做，等于给死单凭空改账、能被算出二次退款。
-    if (!SEAT_HOLDING_STATUSES.includes(order.status)) {
-      throw new BadRequestError(
-        `订单当前状态（${zhStatus(order.status)}）不可改档：仅占座中的有效订单可改档（已取消/已退款/超时订单请勿改档）`,
-      );
-    }
-
-    const bundleRows = order.items.filter((it) => it.kind === OrderItemKind.BUNDLE);
-    if (bundleRows.length === 0) {
-      throw new BadRequestError('本单不含套餐行，无法改档');
-    }
-    if (bundleRows.length > 1) {
-      // 多套餐单改档「改哪一张」无从判定，且差额口径会分叉 —— 明确拒绝，不猜。
-      throw new BadRequestError('本单含多条套餐行，暂不支持自动改档，请联系技术处理');
-    }
-    const bundleRow = bundleRows[0];
-    if (!bundleRow.bundleId) {
-      throw new BadRequestError('该套餐行未关联套餐产品，无法改档');
-    }
-    if (bundleRow.bundleId === input.bundleId) {
-      throw new BadRequestError('目标套餐与当前套餐相同，无需改档');
-    }
-
-    // ── 已落位闸 ───────────────────────────────────────────────────────────
-    // 落位 = 住宿已盖章到**真实**酒店（房型所属酒店不是随机档占位酒店）。此时改档会让
-    // 「客人已经确定住哪」与「新档次该住哪」直接打架 —— 住宿要先走换酒店流程处理掉，
-    // 改档只负责钱与档次。未落位（仍是随机档占位）或无酒店组件才允许。
-    const isSettledRow = (row: {
-      hotelRoomTypeId: string | null;
-      hotelRoomType?: { hotel: { randomTierPlaceholder: number | null } } | null;
-    }): boolean =>
-      row.hotelRoomTypeId != null && row.hotelRoomType?.hotel.randomTierPlaceholder == null;
-    const settledRow =
-      (isSettledRow(bundleRow) ? bundleRow : null) ??
-      order.items.find((it) => it.kind === OrderItemKind.HOTEL && isSettledRow(it)) ??
-      null;
-    if (settledRow) {
-      throw new BadRequestError('本单酒店已落位，请先通过换酒店功能处理住宿再改档');
-    }
+    if (!preview) throw new NotFoundError('订单不存在');
+    assertOrderChangeBundleAllowed(preview);
+    const previewPick = resolveChangeableBundleRow(preview.items, input.bundleId);
 
     const newBundle = await prisma.bundle.findUnique({
       where: { id: input.bundleId },
@@ -9711,113 +9672,11 @@ export class OrderService {
     if (!newBundle) throw new NotFoundError(`套餐 ${input.bundleId} 不存在`);
     if (!newBundle.isActive) throw new BadRequestError('目标套餐已下架');
     const oldBundle = await prisma.bundle.findUnique({
-      where: { id: bundleRow.bundleId },
+      where: { id: previewPick.bundleId },
       select: { id: true, name: true, settlementTier: true, settlementNights: true },
     });
 
-    // ── 计价输入：一律沿用**原单已盖章的快照**，保证差额只反映「档次变了」这一件事 ──
-    // 优先级：行 metadata.addOns（下单时的权威重算快照，含三计数 / 单住 / 分程升舱 / 自备签人数）
-    //        → metadata / quantity 的旧口径回落（老单没有 addOns 快照时）。
-    const rowMetadata = (bundleRow.metadata ?? {}) as Record<string, unknown>;
-    const addOnSnapshot = rowMetadata.addOns as Partial<BundleAddOnBreakdown> | undefined;
-    const occupancy =
-      addOnSnapshot && typeof addOnSnapshot.adultCount === 'number'
-        ? resolveBundleOccupancy({
-            adultCount: addOnSnapshot.adultCount,
-            childCount: addOnSnapshot.childCount ?? 0,
-            infantCount: addOnSnapshot.infantCount ?? 0,
-            quantity: bundleRow.quantity,
-          })
-        : resolveBundleOccupancy({ quantity: bundleRow.quantity, metadata: rowMetadata });
-    const singleCount = Math.max(0, Math.trunc(Number(addOnSnapshot?.singleCount ?? 0) || 0));
-    const selfProvidedVisaCount = Math.max(
-      0,
-      Math.trunc(Number(addOnSnapshot?.selfProvidedVisaCount ?? 0) || 0),
-    );
-    const businessSplit: BundleBusinessUpgradeSplit = {
-      outbound: Math.max(0, Math.trunc(Number(addOnSnapshot?.businessCountOutbound ?? 0) || 0)),
-      return: Math.max(0, Math.trunc(Number(addOnSnapshot?.businessCountReturn ?? 0) || 0)),
-    };
-
-    // 出发日：整单口径（最早航段的出发地当地日 → 酒店入住日 → 签证预计出行日），与列表列同源。
-    const departYmd = deriveOrderDepartDate(order.items as Array<Record<string, unknown>>);
-
-    const priced = computeChangedBundleLine({
-      bundle: newBundle,
-      occupancy,
-      singleCount,
-      businessSplit,
-      selfProvidedVisaCount,
-      quantity: bundleRow.quantity,
-      goDate: departYmd,
-    });
-
-    // ── 新应收 ─────────────────────────────────────────────────────────────
-    const oldTotalCny = Number(order.total.toString());
-    const oldBundleAmountCny = Number(bundleRow.amount.toString());
-    let pricingSource: 'SETTLEMENT_CALENDAR' | 'BUNDLE_PRICE' = 'BUNDLE_PRICE';
-    let newTotalCny = round2(oldTotalCny + (priced.amount - oldBundleAmountCny));
-    if (
-      order.agentId &&
-      newBundle.settlementTier != null &&
-      newBundle.settlementNights != null
-    ) {
-      if (!departYmd) {
-        throw new BadRequestError(
-          '目标套餐已配置结算价日历，但本单无法确定出发日期取价，请先补全航段或联系运营',
-        );
-      }
-      const rate = await getSettlementRate(
-        newBundle.settlementTier,
-        newBundle.settlementNights,
-        departYmd,
-      );
-      if (!rate) {
-        throw new BadRequestError('该出发日期在目标档次下的结算价未维护，请联系运营');
-      }
-      // 日历价是「基础随机套餐」的每人同业价，加项按报价口径叠加其上（与录单 resolveBundleSettlementCalendarTotal
-      // 完全同一公式）。指定酒店加价已随改档清除，故此处加项净额只有 addOn.total。
-      let calendarTotal = round2(
-        rate.pricePerPersonCny * occupancy.headCount + priced.settlementAddOnCny,
-      );
-      const discountHit = await resolveAgentSettlementDiscount(
-        order.agentId,
-        newBundle.settlementTier,
-        newBundle.settlementNights,
-        departYmd,
-      );
-      if (discountHit) {
-        calendarTotal = round2(
-          calendarTotal - discountHit.discountPerPersonCny * occupancy.headCount,
-        );
-      }
-      if (calendarTotal <= 0) {
-        throw new BadRequestError('按目标档次取价后的结算价异常（≤0），请检查结算价日历与立减规则');
-      }
-      pricingSource = 'SETTLEMENT_CALENDAR';
-      newTotalCny = calendarTotal;
-    }
-
-    const diffCny = round2(newTotalCny - oldTotalCny);
-    if (Math.abs(diffCny) > PRICE_ADJUSTMENT_CAP_CNY) {
-      throw new BadRequestError(
-        `改档差额 ¥${Math.abs(diffCny)} 超出调价上限（±¥${PRICE_ADJUSTMENT_CAP_CNY}），请复核目标套餐与结算价`,
-      );
-    }
-
-    // 人工复核提示（不阻断，随响应回给运营）。
-    const warnings: string[] = [];
-    if (rowMetadata.designatedHotel) {
-      warnings.push('原「指定酒店」及其加价已随本次改档清除，请按新档次重新指定酒店');
-    }
-    if ((businessSplit.outbound ?? 0) > 0 || (businessSplit.return ?? 0) > 0) {
-      warnings.push('本单含升舱，升舱行与占座一律未改动，请人工复核升舱差价是否仍适用新档次');
-    }
-    if (!priced.hotelStamp && newBundle.hotelRoomTypeId) {
-      warnings.push('未能推导出新的住宿区间（缺出发日期），住宿日期未盖章，请人工补录');
-    }
-
-    // ── 1. 事务：换绑 + 差额行 + 总额收敛 ───────────────────────────────────
+    // ── 1. 事务：锁 → 重读 → 计价 → 房量闸 → 换绑 + 差额行 + 总额收敛 + 签证任务对齐 ──
     const scratch = await prisma.$transaction(async (tx) => {
       // 行锁：与换酒店/换人/调价同一份读-改-写（total / 差额行），必须串行。
       const lockRows = await tx.$queryRaw<Array<{ id: string }>>`
@@ -9832,35 +9691,180 @@ export class OrderService {
           orderNumber: true,
           status: true,
           deletedAt: true,
+          agentId: true,
           subtotal: true,
           total: true,
           adjustments: true,
-          items: { select: { id: true, amount: true, bundleId: true } },
+          items: { select: CHANGE_BUNDLE_ITEM_SELECT },
         },
       });
       if (!locked) throw new NotFoundError('订单不存在');
       // 锁后复检（读的是刚 FOR UPDATE 的那一行，与并发状态流转严格串行）。
       assertOrderAcceptsFunds(locked);
-      if (!SEAT_HOLDING_STATUSES.includes(locked.status)) {
-        throw new BadRequestError(
-          `订单当前状态（${zhStatus(locked.status)}）不可改档：仅占座中的有效订单可改档`,
-        );
-      }
-      // CAS：锁前读到的套餐行若已被并发改档换掉，本次按旧快照算出的差额就不成立 → 让调用方重试。
-      const lockedRow = locked.items.find((it) => it.id === bundleRow.id);
-      if (!lockedRow || lockedRow.bundleId !== bundleRow.bundleId) {
+      assertOrderChangeBundleAllowed(locked);
+      // 明细同样锁后重挑：并发可能已经改过档、已落位、或加了第二条套餐行。
+      const { row: bundleRow, bundleId: fromBundleId } = resolveChangeableBundleRow(
+        locked.items,
+        input.bundleId,
+      );
+      // CAS：锁前预检看到的那条行若已被并发操作换掉，本次就是在另一张套餐上做决定 → 让调用方重试。
+      if (bundleRow.id !== previewPick.row.id || fromBundleId !== previewPick.bundleId) {
         throw new ConflictError('该订单的套餐行已被其他操作更改，请刷新后重试');
       }
-      // 总额基准同样以锁内值为准（锁前后 total 可能已被并发调价改动）。
+
+      // ── 计价输入：一律沿用**锁内快照**里已盖章的数，保证差额只反映「档次变了」这一件事 ──
+      // 优先级：行 metadata.addOns（下单时的权威重算快照，含三计数 / 单住 / 分程升舱 / 自备签人数）
+      //        → metadata / quantity 的旧口径回落（老单没有 addOns 快照时）。
+      const rowMetadata = (bundleRow.metadata ?? {}) as Record<string, unknown>;
+      const addOnSnapshot = rowMetadata.addOns as Partial<BundleAddOnBreakdown> | undefined;
+      const occupancy =
+        addOnSnapshot && typeof addOnSnapshot.adultCount === 'number'
+          ? resolveBundleOccupancy({
+              adultCount: addOnSnapshot.adultCount,
+              childCount: addOnSnapshot.childCount ?? 0,
+              infantCount: addOnSnapshot.infantCount ?? 0,
+              quantity: bundleRow.quantity,
+            })
+          : resolveBundleOccupancy({ quantity: bundleRow.quantity, metadata: rowMetadata });
+      const singleCount = Math.max(0, Math.trunc(Number(addOnSnapshot?.singleCount ?? 0) || 0));
+      const selfProvidedVisaCount = Math.max(
+        0,
+        Math.trunc(Number(addOnSnapshot?.selfProvidedVisaCount ?? 0) || 0),
+      );
+      const businessSplit: BundleBusinessUpgradeSplit = {
+        outbound: Math.max(0, Math.trunc(Number(addOnSnapshot?.businessCountOutbound ?? 0) || 0)),
+        return: Math.max(0, Math.trunc(Number(addOnSnapshot?.businessCountReturn ?? 0) || 0)),
+      };
+
+      // 出发日：整单口径（最早航段的出发地当地日 → 酒店入住日 → 签证预计出行日），与列表列同源。
+      const departYmd = deriveOrderDepartDate(
+        locked.items as unknown as Array<Record<string, unknown>>,
+      );
+
+      const priced = computeChangedBundleLine({
+        bundle: newBundle,
+        occupancy,
+        singleCount,
+        businessSplit,
+        selfProvidedVisaCount,
+        quantity: bundleRow.quantity,
+        goDate: departYmd,
+      });
+
+      // ── 新应收 ───────────────────────────────────────────────────────────
+      // 旧档的**有效金额** = 冻结的套餐行金额 + 历次改档差额行合计。
+      // 行价冻结意味着套餐行金额永远停在首次录单那一刻，只看它当基线会让第二次改档
+      // 把上一次的差额再算一遍（A→B 留 +200 后，B→C 会按 A 的价算成 C−A，凭空多收 200）。
+      // 把既有差额行加回来，基线才是「这条套餐行现在实际贡献了多少应收」，
+      // 于是任意次改档后的总额恒等于「按当前档从头录单」的应收。
+      const frozenBundleAmountCny = Number(bundleRow.amount.toString());
+      const priorBundleChangeCny = sumBundleChangeDiffCny(locked.items);
+      const effectiveOldBundleCny = round2(frozenBundleAmountCny + priorBundleChangeCny);
+      // 总额基准取锁内值：并发调价改动的那部分留在总额里往前带，绝不被差额行抵消掉。
       const lockedTotalCny = Number(locked.total.toString());
-      const lockedDiffCny = round2(newTotalCny - lockedTotalCny);
-      if (Math.abs(lockedDiffCny) > PRICE_ADJUSTMENT_CAP_CNY) {
+      let pricingSource: 'SETTLEMENT_CALENDAR' | 'BUNDLE_PRICE' = 'BUNDLE_PRICE';
+      let newTotalCny = round2(lockedTotalCny + (priced.amount - effectiveOldBundleCny));
+      if (
+        locked.agentId &&
+        newBundle.settlementTier != null &&
+        newBundle.settlementNights != null
+      ) {
+        if (!departYmd) {
+          throw new BadRequestError(
+            '目标套餐已配置结算价日历，但本单无法确定出发日期取价，请先补全航段或联系运营',
+          );
+        }
+        const rate = await getSettlementRate(
+          newBundle.settlementTier,
+          newBundle.settlementNights,
+          departYmd,
+        );
+        if (!rate) {
+          throw new BadRequestError('该出发日期在目标档次下的结算价未维护，请联系运营');
+        }
+        // 日历价是「基础随机套餐」的每人同业价，加项按报价口径叠加其上（与录单 resolveBundleSettlementCalendarTotal
+        // 完全同一公式）。指定酒店加价已随改档清除，故此处加项净额只有 addOn.total。
+        let calendarTotal = round2(
+          rate.pricePerPersonCny * occupancy.headCount + priced.settlementAddOnCny,
+        );
+        const discountHit = await resolveAgentSettlementDiscount(
+          locked.agentId,
+          newBundle.settlementTier,
+          newBundle.settlementNights,
+          departYmd,
+        );
+        if (discountHit) {
+          calendarTotal = round2(
+            calendarTotal - discountHit.discountPerPersonCny * occupancy.headCount,
+          );
+        }
+        if (calendarTotal <= 0) {
+          throw new BadRequestError('按目标档次取价后的结算价异常（≤0），请检查结算价日历与立减规则');
+        }
+        // 日历通道是**绝对**口径：日历价就是「本单最终收多少钱」（与录单的结算价收敛完全同源），
+        // 因此天然与改档次数无关，重复改档不会叠加差额。
+        pricingSource = 'SETTLEMENT_CALENDAR';
+        newTotalCny = calendarTotal;
+      }
+
+      const diffCny = round2(newTotalCny - lockedTotalCny);
+      if (Math.abs(diffCny) > PRICE_ADJUSTMENT_CAP_CNY) {
         throw new BadRequestError(
-          `改档差额 ¥${Math.abs(lockedDiffCny)} 超出调价上限（±¥${PRICE_ADJUSTMENT_CAP_CNY}），请复核目标套餐与结算价`,
+          `改档差额 ¥${Math.abs(diffCny)} 超出调价上限（±¥${PRICE_ADJUSTMENT_CAP_CNY}），请复核目标套餐与结算价`,
         );
       }
 
-      // 1a. 套餐行换绑（金额冻结；只改「买的是哪张套餐」与随档次派生的住宿字段）。
+      // 人工复核提示（不阻断，随响应回给运营）。
+      const warnings: string[] = [];
+      if (rowMetadata.designatedHotel) {
+        warnings.push('原「指定酒店」及其加价已随本次改档清除，请按新档次重新指定酒店');
+      }
+      if ((businessSplit.outbound ?? 0) > 0 || (businessSplit.return ?? 0) > 0) {
+        warnings.push('本单含升舱，升舱行与占座一律未改动，请人工复核升舱差价是否仍适用新档次');
+      }
+      if (!priced.hotelStamp && newBundle.hotelRoomTypeId) {
+        warnings.push('未能推导出新的住宿区间（缺出发日期），住宿日期未盖章，请人工补录');
+      }
+
+      // ── 1a. 房量闸（与录单同款，事务内带行锁）──────────────────────────────
+      // 改档会把套餐行的占房整体换成新档的房型/区间/间数 —— 那是一笔真真切切的新增占房，
+      // 此前一道闸都没有：新档满房照样落库，销控板直接变负。
+      // 判定口径 = 「先释放本单现有占房，再把改档后的整单占房加回去」：
+      //   · excludeOrderId 排除本单在库的旧占房；
+      //   · prospective 里既有换绑后的套餐行，也有本单其余占房行（被 exclude 排掉了，必须补回来），
+      //     否则等于把自己已占的房当成空房，会放行超卖。
+      // 两道闸互补：真酒店走物理房间闸，未落位随机档走同星级聚合闸，各自跳过不归自己管的行。
+      // 补回来的那几行都是未落位行（真酒店行早被上面的已落位闸拒在门外），按床位口径合计，
+      // 与它们留在库里被算作存量占房时的口径一致。
+      const prospectiveStays: ProspectiveHotelStay[] = [
+        {
+          hotelRoomTypeId: priced.hotelStamp?.hotelRoomTypeId ?? null,
+          hotelCheckIn: priced.hotelStamp?.hotelCheckIn ?? null,
+          hotelCheckOut: priced.hotelStamp?.hotelCheckOut ?? null,
+          roomsBilled: priced.rooms,
+        },
+        ...locked.items
+          .filter((it) => it.id !== bundleRow.id)
+          .map((it) => ({
+            hotelRoomTypeId: it.hotelRoomTypeId,
+            hotelCheckIn: it.hotelCheckIn,
+            hotelCheckOut: it.hotelCheckOut,
+            roomsBilled: it.roomsBilled == null ? null : Number(it.roomsBilled.toString()),
+            randomStarTier: it.randomStarTier,
+          })),
+      ];
+      const orderPassengers = await tx.passenger.findMany({
+        where: { orderId },
+        select: { gender: true },
+      });
+      const passengerGenders = orderPassengers.map((p) => ({ gender: p.gender ?? undefined }));
+      // 后台端点 → 用默认的带数字文案（运营要看得见差多少间），不套对外中性话术。
+      await assertHotelStaysFitWithinTx(tx, prospectiveStays, passengerGenders, {
+        excludeOrderId: orderId,
+      });
+      await assertRandomTierStaysFitWithinTx(tx, prospectiveStays, { excludeOrderId: orderId });
+
+      // 1b. 套餐行换绑（金额冻结；只改「买的是哪张套餐」与随档次派生的住宿字段）。
       //     指定酒店留痕从 metadata 里摘掉 —— 那是旧档次下的选择，新档要重新指定。
       const {
         designatedHotel: _clearedDesignatedHotel,
@@ -9883,7 +9887,7 @@ export class OrderService {
             addOns: priced.addOn.breakdown,
             // 改档留痕（旧档 → 新档、取价来源、差额、原因）：这一行为什么现在长这样，看它就够了。
             bundleChange: {
-              fromBundleId: bundleRow.bundleId,
+              fromBundleId,
               fromBundleName: oldBundle?.name ?? null,
               fromSettlementTier: oldBundle?.settlementTier ?? null,
               fromSettlementNights: oldBundle?.settlementNights ?? null,
@@ -9892,7 +9896,7 @@ export class OrderService {
               toSettlementTier: newBundle.settlementTier ?? null,
               toSettlementNights: newBundle.settlementNights ?? null,
               pricingSource,
-              diffCny: lockedDiffCny,
+              diffCny,
               reasonText: note,
               at: new Date().toISOString(),
               by: actor.userId,
@@ -9901,29 +9905,30 @@ export class OrderService {
         },
       });
 
-      // 1b. 差额行（正=补收 FEE、负=优惠 DISCOUNT）。差额为 0 时不建行（改档本身仍留审计）。
+      // 1c. 差额行（正=补收 FEE、负=优惠 DISCOUNT）。差额为 0 时不建行（改档本身仍留审计）。
       let diffItemId: string | null = null;
-      if (lockedDiffCny !== 0) {
-        const signed = `${lockedDiffCny > 0 ? '+' : '−'}¥${Math.abs(lockedDiffCny)}`;
+      if (diffCny !== 0) {
+        const signed = `${diffCny > 0 ? '+' : '−'}¥${Math.abs(diffCny)}`;
         const created = await tx.orderItem.create({
           data: {
             orderId,
-            kind: lockedDiffCny > 0 ? OrderItemKind.FEE : OrderItemKind.DISCOUNT,
+            kind: diffCny > 0 ? OrderItemKind.FEE : OrderItemKind.DISCOUNT,
             description:
               `套餐改档差额：${oldBundle?.name ?? '原套餐'} → ${newBundle.name}（${signed}）` +
               (note ? `：${note}` : ''),
             quantity: 1,
-            unitPrice: new Prisma.Decimal(lockedDiffCny),
-            amount: new Prisma.Decimal(lockedDiffCny),
+            unitPrice: new Prisma.Decimal(diffCny),
+            amount: new Prisma.Decimal(diffCny),
             // 纯价格调整行无采购成本 → 显式落 0（口径同 buildPriceAdjustmentItem），不留 NULL 污染毛利。
             totalCostCny: new Prisma.Decimal(0),
             metadata: {
               // priceAdjustment 标：让「按乘客/整单调整明细」等既有展示口径认得这一行。
               priceAdjustment: true,
+              // bundleChange: true 是**差额行的身份标**：下一次改档要靠它把历次差额加回基线。
               bundleChange: true,
               reasonCode: 'SETTLEMENT',
               reasonText: note,
-              fromBundleId: bundleRow.bundleId,
+              fromBundleId,
               toBundleId: newBundle.id,
               pricingSource,
             } as Prisma.InputJsonValue,
@@ -9932,7 +9937,7 @@ export class OrderService {
         diffItemId = created.id;
       }
 
-      // 1c. 总额收敛：subtotal/total = Σ 所有行金额（含刚换绑的套餐行与差额行）。
+      // 1d. 总额收敛：subtotal/total = Σ 所有行金额（含刚换绑的套餐行与差额行）。
       //     已收款一分不动 —— 尾款/多收由「应付 − 已收」自然浮动。
       const sumAfter = await tx.orderItem.aggregate({
         where: { orderId },
@@ -9942,7 +9947,7 @@ export class OrderService {
       const log = appendAdjustment(locked.adjustments, {
         type: 'BUNDLE_CHANGE',
         label: `套餐改档：${oldBundle?.name ?? '原套餐'} → ${newBundle.name}`,
-        amountCny: lockedDiffCny,
+        amountCny: diffCny,
         at: new Date().toISOString(),
         by: actor.userId,
         reasonCode: 'SETTLEMENT',
@@ -9957,12 +9962,28 @@ export class OrderService {
         },
       });
 
+      // 1e. 签证任务对齐：含签证套餐 ↔ 不含签证套餐互改后，任务必须跟着增撤。
+      //     任务是需求的派生物 —— 不同步的话，要么签证台上挂着一条永远办不掉的「待处理」，
+      //     要么整单漏掉本该办的签证。放在换绑之后调用，它读到的就是新档。
+      const visaSync = await syncVisaTasksForOrder(tx, orderId, {
+        userId: actor.userId,
+        role: actor.role,
+      });
+      if (visaSync.cancelledTaskIds.length > 0) {
+        warnings.push('新档次不涉及签证，本单原「待处理」签证任务已自动撤销');
+      }
+      if (visaSync.createdTaskIds.length > 0) {
+        warnings.push('新档次含签证，已自动补建一条「待处理」签证任务');
+      }
+
       return {
         orderNumber: locked.orderNumber,
         beforeTotal: locked.total.toString(),
         afterTotal: newSubtotal.toString(),
-        diffCny: lockedDiffCny,
+        diffCny,
         diffItemId,
+        pricingSource,
+        warnings,
       };
     });
 
@@ -9975,9 +9996,9 @@ export class OrderService {
       order: serializeOrder(finalOrder, orderSerializeRoleCtx(actor.role)),
       audit: {
         orderNumber: scratch.orderNumber,
-        orderItemId: bundleRow.id,
+        orderItemId: previewPick.row.id,
         before: {
-          bundleId: bundleRow.bundleId,
+          bundleId: previewPick.bundleId,
           bundleName: oldBundle?.name ?? null,
           settlementTier: oldBundle?.settlementTier ?? null,
           settlementNights: oldBundle?.settlementNights ?? null,
@@ -9992,12 +10013,129 @@ export class OrderService {
         },
         diffCny: scratch.diffCny,
         diffItemId: scratch.diffItemId,
-        pricingSource,
+        pricingSource: scratch.pricingSource,
         note,
-        warnings,
+        warnings: scratch.warnings,
       },
     };
   }
+}
+
+/**
+ * 改档要读的订单明细字段。锁外预检与锁内权威判定**共用同一份 select** ——
+ * 两处各写一套，迟早出现「预检按 A 组字段放行、锁内按 B 组字段算钱」的漂移。
+ * 覆盖四件事：挑套餐行、判已落位、算出发日、算旧档有效金额与占房。
+ */
+const CHANGE_BUNDLE_ITEM_SELECT = {
+  id: true,
+  kind: true,
+  quantity: true,
+  amount: true,
+  bundleId: true,
+  hotelRoomTypeId: true,
+  hotelCheckIn: true,
+  hotelCheckOut: true,
+  roomsBilled: true,
+  randomStarTier: true,
+  visaIntendedDate: true,
+  metadata: true,
+  // 「已落位」判定：房型挂在随机档占位酒店上 = 还没落位（业务上仍是随机档）。
+  hotelRoomType: { select: { hotel: { select: { name: true, randomTierPlaceholder: true } } } },
+  // 整单出发日派生（deriveOrderDepartDate 同口径，按出发地当地日折算）。
+  flightSchedule: { select: { departureTime: true, departureTz: true } },
+} as const;
+
+/** resolveChangeableBundleRow 认得的最小订单项形状（真实入参是上面 select 出来的行）。 */
+interface ChangeBundleCandidateRow {
+  id: string;
+  kind: OrderItemKind;
+  bundleId: string | null;
+  hotelRoomTypeId: string | null;
+  hotelRoomType?: { hotel: { randomTierPlaceholder: number | null } } | null;
+}
+
+/**
+ * 「这单现在还能不能改档」的状态闸。锁外预检与锁内复检共用。
+ * 状态集合与换酒店 / 酒店改期同一份：改档会改应收（长出/减掉一笔差额），
+ * 在已取消 / 已退款 / 超时 / 草稿单上做，等于给死单凭空改账、能被算出二次退款。
+ */
+function assertOrderChangeBundleAllowed(order: {
+  status: OrderStatus;
+  deletedAt: Date | null;
+}): void {
+  if (order.deletedAt) {
+    throw new BadRequestError('订单在回收站（已软删），不可改档；如需操作请先恢复');
+  }
+  if (!SEAT_HOLDING_STATUSES.includes(order.status)) {
+    throw new BadRequestError(
+      `订单当前状态（${zhStatus(order.status)}）不可改档：仅占座中的有效订单可改档（已取消/已退款/超时订单请勿改档）`,
+    );
+  }
+}
+
+/**
+ * 从订单明细里挑出「唯一那条可改档的套餐行」，顺手把不该改的情况一次性拒掉：
+ * 无套餐行 / 多条套餐行 / 未关联产品 / 与目标同档 / 酒店已落位。
+ *
+ * 已落位 = 住宿已盖章到**真实**酒店（房型所属酒店不是随机档占位酒店）。此时改档会让
+ * 「客人已经确定住哪」与「新档次该住哪」直接打架 —— 住宿要先走换酒店流程处理掉，
+ * 改档只负责钱与档次。未落位（仍是随机档占位）或无酒店组件才允许。
+ *
+ * 锁外预检与锁内权威判定共用本函数：并发可能在这两次之间把单改成任一种「不该改」，
+ * 两处各写一套判定必然漂移。
+ */
+function resolveChangeableBundleRow<T extends ChangeBundleCandidateRow>(
+  items: readonly T[],
+  targetBundleId: string,
+): { row: T; bundleId: string } {
+  const bundleRows = items.filter((it) => it.kind === OrderItemKind.BUNDLE);
+  if (bundleRows.length === 0) {
+    throw new BadRequestError('本单不含套餐行，无法改档');
+  }
+  if (bundleRows.length > 1) {
+    // 多套餐单改档「改哪一张」无从判定，且差额口径会分叉 —— 明确拒绝，不猜。
+    throw new BadRequestError('本单含多条套餐行，暂不支持自动改档，请联系技术处理');
+  }
+  const row = bundleRows[0];
+  if (!row.bundleId) {
+    throw new BadRequestError('该套餐行未关联套餐产品，无法改档');
+  }
+  if (row.bundleId === targetBundleId) {
+    throw new BadRequestError('目标套餐与当前套餐相同，无需改档');
+  }
+  const isSettledRow = (candidate: ChangeBundleCandidateRow): boolean =>
+    candidate.hotelRoomTypeId != null &&
+    candidate.hotelRoomType?.hotel.randomTierPlaceholder == null;
+  const settled =
+    (isSettledRow(row) ? row : null) ??
+    items.find((it) => it.kind === OrderItemKind.HOTEL && isSettledRow(it)) ??
+    null;
+  if (settled) {
+    throw new BadRequestError('本单酒店已落位，请先通过换酒店功能处理住宿再改档');
+  }
+  return { row, bundleId: row.bundleId };
+}
+
+/**
+ * 历次「套餐改档差额行」的合计（CNY，正=补收、负=优惠）。
+ *
+ * 用途：套餐行行价冻结（永远停在首次录单那一刻），所以「这条套餐行现在实际贡献了多少应收」
+ * = 冻结金额 + 本函数。第二次改档必须拿这个数当旧档基线，否则会把上一次的差额再算一遍。
+ *
+ * 只认差额行：差额行是 FEE/DISCOUNT 且 `metadata.bundleChange === true`；
+ * 套餐行自己的 `metadata.bundleChange` 是一个留痕**对象**（不是 true），故连 kind 一起卡，
+ * 两者绝不会互相认错。导出供单测使用。
+ */
+export function sumBundleChangeDiffCny(
+  items: ReadonlyArray<{ kind: OrderItemKind; amount: Prisma.Decimal | number; metadata: unknown }>,
+): number {
+  const total = items.reduce((sum, it) => {
+    if (it.kind !== OrderItemKind.FEE && it.kind !== OrderItemKind.DISCOUNT) return sum;
+    const meta = it.metadata as { bundleChange?: unknown } | null;
+    if (meta?.bundleChange !== true) return sum;
+    return sum + Number(it.amount.toString());
+  }, 0);
+  return round2(total);
 }
 
 /**
@@ -10256,8 +10394,9 @@ export const GUEST_RECORDED_BY_LABEL = '散客';
  * listOrders 与 orders.export-templates.ts 三模板导出共用，避免两处过滤逻辑漂移。
  * 注意：不含 RBAC（userId/可见代理集合）、claimedById/unclaimedOnly、分页 —— 由调用方叠加。
  *
- * @param options.includeAnchorless 仅导出路径传 true —— 出行日期筛选时把「一个日期锚点都没有」
- *   的订单也召回（详见下方 travelFrom/travelTo 分支）。列表路径保持默认 false。
+ * @param options.includeAnchorless 仅导出路径传 true —— 出行日期筛选时把「一个日期锚点都没有
+ *   **的签证单**」也召回（详见下方 travelFrom/travelTo 分支；空单/接送单/资料不全的机酒单
+ *   不在豁免之列）。列表路径保持默认 false。
  */
 export function buildOrderFilterWhere(
   query: OrderListFilters,
@@ -10317,32 +10456,51 @@ export function buildOrderFilterWhere(
         },
       },
     };
-    // ── 无锚点单：仅导出路径召回 ────────────────────────────────────────────
+    // ── 无锚点**签证单**：仅导出路径召回 ────────────────────────────────────
     // 「锚点」= 能派生出整单出发日的字段，三选一：航段出发时间 / 酒店入住日 / 签证预计出行日期。
     // 一条锚点都没有的单（典型：还没填预计出行日期的纯签证单）在上面的 some 里必然落空。
     //   导出 —— 要召回：导出是「把这批单交出去办事」，静默漏掉等于签证岗整批看不到自己的单；
-    //     召回后由 orders.export-depart-filter.ts 的内存过滤按「无锚点保留」口径兜底。
+    //     召回后由 orders.export-depart-filter.ts 的内存过滤按同一口径兜底保留。
     //   列表 —— 不召回：列表的日期筛选是「找某天走的单」，无日期单若无条件保留就会出现在
     //     每一个日期区间里，筛选失效（口径详见 filterOrderIdsByDepartDate 注释）。
-    andClauses.push(
-      options?.includeAnchorless
-        ? {
-            OR: [
-              anchoredInWindow,
-              {
-                items: {
-                  none: {
-                    OR: [
-                      { flightScheduleId: { not: null } },
-                      { hotelCheckIn: { not: null } },
-                      { visaIntendedDate: { not: null } },
-                    ],
-                  },
+    //
+    // 例外只给签证单（收窄，P1-7）：这条豁免的**理由**是「签证业务本身没有航班和住宿，
+    // 没填预计出行日期就彻底无处归日」——只有涉签的单才配得上它。此前只判「一个日期锚点都没有」，
+    // 于是空单、纯接送单、资料还没录全的机酒单也跟着被塞进每一个指定日期的导出里。
+    // 涉签判定与签证任务锚点同源（VISA 行 → 含签证组件的 BUNDLE 行）：
+    //   · VISA 行：items.some.kind = VISA；
+    //   · 含签证组件的套餐行：Bundle.items（JSON 数组）含 { kind: 'VISA' } 组件，
+    //     用 array_contains 走 Postgres jsonb 包含（部分匹配：组件的其余字段不影响命中）。
+    const anchorlessVisaOnly: Prisma.OrderWhereInput = {
+      AND: [
+        {
+          items: {
+            none: {
+              OR: [
+                { flightScheduleId: { not: null } },
+                { hotelCheckIn: { not: null } },
+                { visaIntendedDate: { not: null } },
+              ],
+            },
+          },
+        },
+        {
+          items: {
+            some: {
+              OR: [
+                { kind: OrderItemKind.VISA },
+                {
+                  kind: OrderItemKind.BUNDLE,
+                  bundle: { items: { array_contains: [{ kind: 'VISA' }] } },
                 },
-              },
-            ],
-          }
-        : anchoredInWindow,
+              ],
+            },
+          },
+        },
+      ],
+    };
+    andClauses.push(
+      options?.includeAnchorless ? { OR: [anchoredInWindow, anchorlessVisaOnly] } : anchoredInWindow,
     );
   }
   // 精确按班次：订单需含该班次的 FLIGHT 行。整班·全岗导出专用——比 travelFrom/travelTo 精确，
@@ -11815,9 +11973,10 @@ function deriveOrderDepartDate(items: ReadonlyArray<Record<string, unknown>>): s
  * ⚠️ 与导出侧口径**故意不同**，别顺手统一：
  *   本函数（列表筛选）—— 无锚点单**排除**。列表的日期筛选是「找某天走的单」，一张没有任何
  *     日期的单若无条件保留，就会出现在**每一个**日期区间的结果里，等于筛选失效。
- *   filterExportOrdersByDepartDate（导出，见 orders.export-depart-filter.ts）—— 无锚点单**保留**。
- *     导出是「把这批单交出去办事」，宁可多带一张也不能让签证岗的单整批消失；且与签证台看板
- *     （fulfillment.service 对纯签证单的保护）口径一致。
+ *   filterExportOrdersByDepartDate（导出，见 orders.export-depart-filter.ts）—— 无锚点的
+ *     **签证单**保留。导出是「把这批单交出去办事」，宁可多带一张也不能让签证岗的单整批消失；
+ *     且与签证台看板（fulfillment.service 对纯签证单的保护）口径一致。豁免只给涉签单：
+ *     空单/接送单/资料不全的机酒单没有「无处归日」这个理由，导出侧同样剔除。
  */
 export function filterOrderIdsByDepartDate(
   candidates: ReadonlyArray<{ id: string; items: ReadonlyArray<Record<string, unknown>> }>,
@@ -12740,6 +12899,15 @@ async function createVisaTaskAtCreation(
 export interface OrderVisaTaskState {
   orderNumber: string;
   visaStatus: VisaRequirement | null;
+  /** 订单状态（判定时要看：取消族终态一律判「不需要任务」）。 */
+  status: OrderStatus;
+  /** 软删时间戳（非 null = 已进回收站，同样判「不需要任务」）。 */
+  deletedAt: Date | null;
+  /**
+   * 本单是否已「不参与履约」——取消族终态（FULFILLMENT_TERMINATING_STATUSES）或已软删。
+   * 为真时 needed 恒 false，与订单状态流转时把履约任务终态化的口径同源，不另立一套。
+   */
+  inactive: boolean;
   /** 权威判定（visa-need.ts 的 orderNeedsVisaTask）：本单还要不要我方代办签证。 */
   needed: boolean;
   /** 需要建任务时该挂的订单项；null = 无处可挂（如空订单项的单）。 */
@@ -12755,6 +12923,14 @@ export interface OrderVisaTaskState {
  * syncVisaTasksForOrder（写侧）与存量清理脚本的 dry-run 共用本函数：
  * 预览看到的判定，就是 --apply 会依据的那个判定，两边不会各算一套。
  * 订单不存在 → null。
+ *
+ * 「不参与履约」的两类单一律判 needed=false，不看签证口径（P1-6）：
+ *   · 取消族终态（FULFILLMENT_TERMINATING_STATUSES：CANCELLED/REFUNDED/PAYMENT_TIMEOUT/FAILED）——
+ *     订单流转到这些状态时履约任务已被一并终态化，若这里还按签证口径判「需要」，
+ *     一次改备注（改订单级签证状态）就会给已取消的单凭空补出一条 PENDING，签证台上冒出
+ *     根本不用办的活。DRAFT 不在此列：它只是座位账口径上的释放型，不是「订单被取消」。
+ *   · 已软删（deletedAt≠null，回收站单）—— 全站列表/导出都已让它消失，签证台更不该看见。
+ * 反向也成立：这两类单里残留的 PENDING 任务，会被写侧按 needed=false 顺手撤掉（正确的清理）。
  */
 async function evaluateOrderVisaTaskState(
   tx: Prisma.TransactionClient,
@@ -12762,9 +12938,13 @@ async function evaluateOrderVisaTaskState(
 ): Promise<OrderVisaTaskState | null> {
   const order = await tx.order.findUnique({
     where: { id: orderId },
-    select: { visaStatus: true, orderNumber: true },
+    select: { visaStatus: true, orderNumber: true, status: true, deletedAt: true },
   });
   if (!order) return null;
+  // deletedAt 用 Boolean 判空（null/undefined 一并当「未删」）：Date 对象恒为真值，
+  // 调用方少 select 一个字段时按「未删」保守放行，不会把正常单误判成回收站单。
+  const inactive =
+    Boolean(order.deletedAt) || FULFILLMENT_TERMINATING_STATUSES.includes(order.status);
 
   const items = await tx.orderItem.findMany({
     where: { orderId },
@@ -12783,7 +12963,11 @@ async function evaluateOrderVisaTaskState(
   return {
     orderNumber: order.orderNumber,
     visaStatus: order.visaStatus,
-    needed: orderNeedsVisaTask({ visaStatus: order.visaStatus, hasVisaScope, passengers }),
+    status: order.status,
+    deletedAt: order.deletedAt,
+    inactive,
+    needed:
+      !inactive && orderNeedsVisaTask({ visaStatus: order.visaStatus, hasVisaScope, passengers }),
     anchorItemId,
     passengerCount: passengers.length,
     visaTasks: items.flatMap((item) =>
@@ -12869,6 +13053,20 @@ async function syncVisaTasksForOrder(
   // 需求改回来时按锚点重新补建一条 PENDING，而不是去复活终态任务。
   const hasActiveVisaTask = visaTasks.some((t) => t.status !== FulfillmentStatus.CANCELLED);
   if (hasActiveVisaTask || !anchorItemId) return { ...empty, needed: true };
+
+  // 补建前贴身再查一次「活动任务」（同事务内 re-check）：上面那次读发生在整段判定的开头，
+  // 期间的并发同步（两个请求同时改签证状态 / 改备注与换人并发）可能已经补建过一条。
+  // 库上没有唯一约束（迁移成本大），这道 re-check 把「都读到无任务 → 各建一条」的窗口
+  // 收到最小；调用方另把撤/建整段放进一个 $transaction，进一步缩短窗口。
+  const activeNow = await tx.fulfillmentTask.findFirst({
+    where: {
+      type: FulfillmentType.VISA_APPLICATION,
+      status: { not: FulfillmentStatus.CANCELLED },
+      orderItem: { orderId },
+    },
+    select: { id: true },
+  });
+  if (activeNow) return { ...empty, needed: true };
 
   const task = await tx.fulfillmentTask.create({
     data: {

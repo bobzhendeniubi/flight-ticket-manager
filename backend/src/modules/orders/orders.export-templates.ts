@@ -782,9 +782,9 @@ export async function buildOrderTemplateExportWorkbook(
   client: PrismaClient = defaultPrisma,
 ): Promise<Buffer> {
   // 与列表完全一致的筛选 + 强制排除不计数状态（已取消/超时/失败等）。
-  // includeAnchorless：唯一与列表不同的一处——导出要把「一个日期锚点都没有」的单也取回
-  //（纯签证单不能因为没填预计出行日期就整批从岗位手上消失），取回后由下面的
-  // filterExportOrdersByDepartDate 按导出口径「无锚点保留」兜底。
+  // includeAnchorless：唯一与列表不同的一处——导出要把「一个日期锚点都没有的**签证单**」也取回
+  //（纯签证单不能因为没填预计出行日期就整批从岗位手上消失；空单/接送单/资料不全的机酒单
+  // 没有这个理由，不在豁免之列），取回后由下面的 filterExportOrdersByDepartDate 同口径兜底。
   const where = buildOrderFilterWhere(query, { includeAnchorless: true });
   const and = Array.isArray(where.AND) ? where.AND : where.AND ? [where.AND] : [];
   and.push({ status: { in: COUNTED_STATUSES } });

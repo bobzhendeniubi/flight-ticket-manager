@@ -605,8 +605,9 @@ export async function buildMasterExportWorkbook(
   // 按出发日期区间选单：复用 buildOrderFilterWhere 的 travelFrom/travelTo 口径，
   // 再强制排除释放型状态。与整班/全岗导出选单方式一致。
   // 勾选导出：orderIds 给了就以 id 集合为准（buildOrderFilterWhere 内部忽略 from/to）。
-  // includeAnchorless：导出口径要「无锚点单也取回」（没有任何日期的纯签证单同样得交到岗位手上），
-  // 取回后由下面的 filterExportOrdersByDepartDate 按导出口径兜底保留。列表路径不传，维持排除。
+  // includeAnchorless：导出口径要「无锚点的**签证单**也取回」（没有任何日期的纯签证单同样得
+  // 交到岗位手上；空单/接送单/资料不全的机酒单不在豁免之列），取回后由下面的
+  // filterExportOrdersByDepartDate 按同一收窄口径兜底保留。列表路径不传，维持排除。
   const where = buildOrderFilterWhere(
     {
       travelFrom: query.from,

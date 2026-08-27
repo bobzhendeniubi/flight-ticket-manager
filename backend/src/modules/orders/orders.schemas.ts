@@ -1053,11 +1053,20 @@ export type SwapPassengerBody = z.infer<typeof swapPassengerBodySchema>;
  * 补录 schema（selfUpdatePassengerBodySchema）里没有的键。请求体带其中任一，即表达「换成另一个人 /
  * 重置开票或签证 / 收换人费」的意图，唯一指向换人分支。
  * （chineseName/documentNumber/dateOfBirth/gender/nationality 两个 schema 都有，不能用来区分，故不列。）
+ *
+ * 本集合必须与 swapPassengerBodySchema「独有的键」保持一致：漏了哪个，只带该字段提交就会被分流到
+ * 补录通道，而补录 schema 是 .strict() 的 → 400，且换人通道后面挂着的联动（自备签变更 →
+ * 签证任务同步）也整条跑不到。title / passengerType / visaExempt / singleRoom 四项即因此补入。
  */
 export const SWAP_PASSENGER_SEMANTIC_FIELDS: readonly string[] = [
   'lastName',
   'firstName',
   'fullName',
+  // 新出行人属性（补录 schema 里没有 → 可用于分流）
+  'title',
+  'passengerType',
+  'visaExempt',
+  'singleRoom',
   'resetInvoice',
   'resetVisa',
   'feeCny',

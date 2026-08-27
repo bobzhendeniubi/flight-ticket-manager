@@ -9,7 +9,13 @@
  *      行价冻结、已收款不动、机票行/座位不动；酒店已落位的单先走换酒店。
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { OrderItemKind, Prisma, UserRole } from '@prisma/client';
+import {
+  FulfillmentStatus,
+  FulfillmentType,
+  OrderItemKind,
+  Prisma,
+  UserRole,
+} from '@prisma/client';
 
 const { mockPrisma, mockGetSettlementRate, mockAgentDiscount } = vi.hoisted(() => ({
   mockPrisma: {
@@ -19,6 +25,8 @@ const { mockPrisma, mockGetSettlementRate, mockAgentDiscount } = vi.hoisted(() =
     hotelRoomType: { findUnique: vi.fn() },
     flightSchedule: { findMany: vi.fn() },
     passenger: { findMany: vi.fn() },
+    // 签证任务自动增撤会写一条 INFO 审计（fire-and-forget，不进业务事务）。
+    auditLog: { create: vi.fn() },
     $transaction: vi.fn(),
     $queryRaw: vi.fn(),
   },
@@ -225,10 +233,71 @@ describe('录单指定酒店 · 星级不匹配闸', () => {
     await expect(priceItems(bundleRow(), gate)).resolves.toBeTruthy();
   });
 
-  it('不传 starGate（纯试算/内部预算路径）→ 行为与扩展前一致，不判', async () => {
+  it('不传 starGate（内部预算 / 纯算价路径）→ 行为与扩展前一致，不判', async () => {
     mountBundle();
     mountDesignatedHotel({ starRating: 3 });
     await expect(priceItems(bundleRow())).resolves.toBeTruthy();
+  });
+
+  // ── 试算（quote）也过这道闸：此前报价成功、提交才 400 ────────────────────────
+  // 代理选了不匹配档次的酒店，录单页给出一个价，点提交被拒——同一笔业务两个答案。
+  // 收窄后：对外身份在报价阶段就拿到与提交同一句话；运营试算仍不拦（放行原因在提交时才收，
+  // 否则运营连看一眼差价都得先编个理由）。
+  describe('quote 试算 · 星级闸按身份', () => {
+    // 放行的那几条会走完整条试算（立减 / 结算价日历预览），这里只关心星级闸，
+    // 把后续取数喂成「没有可判的套餐」，让它们安静地返回 null。
+    beforeEach(() => {
+      mockPrisma.bundle.findMany.mockResolvedValue([]);
+    });
+
+    it('AGENT 试算不匹配的指定酒店 → 当场拒（与提交同一句文案）', async () => {
+      mountBundle();
+      mountDesignatedHotel({ starRating: 3 });
+      await expect(
+        service.quoteOrder({ items: bundleRow() }, { role: UserRole.AGENT }),
+      ).rejects.toThrow(/该套餐为4星档/);
+    });
+
+    it('AGENT 就算带上放行原因也拒（对外身份没有越权定价的口子）', async () => {
+      mountBundle();
+      mountDesignatedHotel({ starRating: 3 });
+      await expect(
+        service.quoteOrder({ items: bundleRow('客人指定') }, { role: UserRole.AGENT }),
+      ).rejects.toThrow(/请改选对应档次套餐或联系运营/);
+    });
+
+    it('CUSTOMER / 无角色（游客）同样拒', async () => {
+      for (const role of [UserRole.CUSTOMER, null]) {
+        mountBundle();
+        mountDesignatedHotel({ starRating: 3 });
+        await expect(service.quoteOrder({ items: bundleRow() }, { role })).rejects.toThrow(
+          /该套餐为4星档/,
+        );
+      }
+    });
+
+    it.each([UserRole.ADMIN, UserRole.STAFF])(
+      '%s 试算不拦、也不索要放行原因（原因在 createOrder 才收）',
+      async (role) => {
+        mountBundle();
+        mountDesignatedHotel({ starRating: 3 });
+        await expect(service.quoteOrder({ items: bundleRow() }, { role })).resolves.toBeTruthy();
+      },
+    );
+
+    it('AGENT 选的酒店星级对得上 → 正常报价（闸只拦不匹配的）', async () => {
+      mountBundle();
+      mountDesignatedHotel({ starRating: 4 });
+      await expect(
+        service.quoteOrder({ items: bundleRow() }, { role: UserRole.AGENT }),
+      ).resolves.toBeTruthy();
+    });
+
+    it('不传身份（内部预算调用）→ 不判，行为与本次收紧前一致', async () => {
+      mountBundle();
+      mountDesignatedHotel({ starRating: 3 });
+      await expect(service.quoteOrder({ items: bundleRow() })).resolves.toBeTruthy();
+    });
   });
 });
 
@@ -333,6 +402,69 @@ describe('售后换酒店 · 星级不匹配闸（BUNDLE 行）', () => {
 // ══════════════════════════════════════════════════════════════════════════
 
 describe('changeOrderBundle · 套餐改档', () => {
+  /** 锁内重读拿到的订单快照；默认与锁外预检同一份，并发场景显式换成「已经被改过」的那份。 */
+  let lockedSnapshot: Record<string, unknown> | null = null;
+
+  /** 两人套餐行（未落位、不绑房型）：金额 ¥4000，住宿区间给出发日派生用。 */
+  function bundleItem(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 'item-bundle',
+      kind: OrderItemKind.BUNDLE,
+      quantity: 1,
+      amount: new Prisma.Decimal(4000),
+      bundleId: 'b-3star',
+      hotelRoomTypeId: null,
+      hotelCheckIn: new Date('2026-09-01T00:00:00.000Z'),
+      hotelCheckOut: new Date('2026-09-03T00:00:00.000Z'),
+      roomsBilled: null,
+      randomStarTier: null,
+      visaIntendedDate: null,
+      metadata: {
+        addOns: {
+          adultCount: 2,
+          childCount: 0,
+          infantCount: 0,
+          singleCount: 0,
+          businessCountOutbound: 0,
+          businessCountReturn: 0,
+          selfProvidedVisaCount: 0,
+        },
+      },
+      hotelRoomType: null,
+      flightSchedule: null,
+      ...overrides,
+    };
+  }
+
+  /** 上一次改档留下的差额行（身份标 = metadata.bundleChange 为 true）。 */
+  function bundleChangeDiffItem(amountCny: number) {
+    return plainAdjustmentItem(amountCny, {
+      id: `item-diff-${amountCny}`,
+      metadata: { priceAdjustment: true, bundleChange: true },
+    });
+  }
+
+  /** 与改档无关的调价行（手工优惠 / 并发调价都长这样：没有 bundleChange 标）。 */
+  function plainAdjustmentItem(amountCny: number, overrides: Record<string, unknown> = {}) {
+    return {
+      id: 'item-adjust',
+      kind: amountCny > 0 ? OrderItemKind.FEE : OrderItemKind.DISCOUNT,
+      quantity: 1,
+      amount: new Prisma.Decimal(amountCny),
+      bundleId: null,
+      hotelRoomTypeId: null,
+      hotelCheckIn: null,
+      hotelCheckOut: null,
+      roomsBilled: null,
+      randomStarTier: null,
+      visaIntendedDate: null,
+      metadata: { priceAdjustment: true },
+      hotelRoomType: null,
+      flightSchedule: null,
+      ...overrides,
+    };
+  }
+
   /** 未落位的两人套餐单：总额 ¥4000，套餐行 ¥4000，无独立酒店行、无航段（出发日走酒店入住日）。 */
   function orderFixture(overrides: Record<string, unknown> = {}) {
     return {
@@ -341,38 +473,17 @@ describe('changeOrderBundle · 套餐改档', () => {
       status: 'PAID',
       deletedAt: null,
       agentId: null,
+      visaStatus: null,
       total: new Prisma.Decimal(4000),
-      items: [
-        {
-          id: 'item-bundle',
-          kind: OrderItemKind.BUNDLE,
-          quantity: 1,
-          amount: new Prisma.Decimal(4000),
-          bundleId: 'b-3star',
-          hotelRoomTypeId: null,
-          hotelCheckIn: new Date('2026-09-01T00:00:00.000Z'),
-          hotelCheckOut: new Date('2026-09-03T00:00:00.000Z'),
-          visaIntendedDate: null,
-          metadata: {
-            addOns: {
-              adultCount: 2,
-              childCount: 0,
-              infantCount: 0,
-              singleCount: 0,
-              businessCountOutbound: 0,
-              businessCountReturn: 0,
-              selfProvidedVisaCount: 0,
-            },
-          },
-          hotelRoomType: null,
-          flightSchedule: null,
-        },
-      ],
+      items: [bundleItem()],
       ...overrides,
     };
   }
   function mountOrder(overrides: Record<string, unknown> = {}) {
-    mockPrisma.order.findUnique.mockResolvedValue(orderFixture(overrides));
+    const fixture = orderFixture(overrides);
+    mockPrisma.order.findUnique.mockResolvedValue(fixture);
+    lockedSnapshot = fixture;
+    return fixture;
   }
 
   /** 目标四星套餐：地面 2 晚 × ¥2500 = ¥5000（不绑房型 → 1 间，不触发库存闸）。 */
@@ -405,20 +516,40 @@ describe('changeOrderBundle · 套餐改档', () => {
     );
   }
 
-  /** 事务替身：暴露 orderItem.update/create 与 order.update 供断言。 */
-  function mountTx(sumAfterCny: number) {
+  /**
+   * 事务替身：暴露 orderItem.update/create 与 order.update 供断言。
+   * 计价已整体挪进锁内，所以这份替身同时要喂三样东西：
+   *   · 锁后重读的订单快照（默认 = mountOrder 那一份）；
+   *   · 房量闸要读的包房周期 / 他单占房 / 房型；
+   *   · 签证任务同步要读的本单明细与套餐组件。
+   * 房量闸与签证同步用的是**真实**实现（不 mock）—— 要验的正是「改档到底过没过闸」。
+   */
+  interface TxFixture {
+    /** 锁内重读到的订单（并发场景下与预检那份不同）。 */
+    locked?: Record<string, unknown>;
+    /** 该酒店该区间每晚包房间数；null / 省略 = 一条周期都没有（未纳入管控，闸不判）。 */
+    blockRooms?: number | null;
+    /** 他单已有占房（床位口径，各占整段）。 */
+    existingRooms?: number[];
+    /** 房型 → 酒店 / 占位档次。 */
+    roomTypes?: Array<{ id: string; hotelId: string; randomTierPlaceholder?: number | null }>;
+    /** 换绑后签证同步读到的本单明细（含各自的履约任务）。 */
+    visaItems?: Array<Record<string, unknown>>;
+    /** 新档套餐的组件（签证同步据此判断「这档涉不涉及签证」）。 */
+    bundleComponents?: Array<{ kind: string }>;
+    passengers?: Array<Record<string, unknown>>;
+  }
+  function mountTx(sumAfterCny: number, fixture: TxFixture = {}) {
+    const snapshot = fixture.locked ?? lockedSnapshot ?? orderFixture();
     const tx = {
       $queryRaw: vi.fn(async () => [{ id: 'ord-1' }]),
+      $executeRaw: vi.fn(async () => 1),
       order: {
+        // 锁内重读与签证同步都走这里（后者只 select visaStatus/orderNumber）。
         findUnique: vi.fn(async () => ({
-          id: 'ord-1',
-          orderNumber: 'FTM-0001',
-          status: 'PAID',
-          deletedAt: null,
-          subtotal: new Prisma.Decimal(4000),
-          total: new Prisma.Decimal(4000),
+          ...snapshot,
+          subtotal: snapshot.total,
           adjustments: [],
-          items: [{ id: 'item-bundle', amount: new Prisma.Decimal(4000), bundleId: 'b-3star' }],
         })),
         update: vi.fn(async () => ({})),
       },
@@ -426,6 +557,47 @@ describe('changeOrderBundle · 套餐改档', () => {
         update: vi.fn(async () => ({ id: 'item-bundle' })),
         create: vi.fn(async () => ({ id: 'item-diff' })),
         aggregate: vi.fn(async () => ({ _sum: { amount: new Prisma.Decimal(sumAfterCny) } })),
+        // 两个调用方按 select 分流：带 fulfillmentTasks 的是签证同步，其余是房量闸读他单占房。
+        findMany: vi.fn(async (args: { select?: Record<string, unknown> }) => {
+          if (args?.select?.fulfillmentTasks) return fixture.visaItems ?? [];
+          return (fixture.existingRooms ?? []).map((rooms, i) => ({
+            hotelCheckIn: new Date('2026-09-01T00:00:00.000Z'),
+            hotelCheckOut: new Date('2026-09-03T00:00:00.000Z'),
+            roomsBilled: new Prisma.Decimal(rooms),
+            metadata: null,
+            order: { id: `other-order-${i}`, roomAssignment: null, passengers: [] },
+          }));
+        }),
+      },
+      hotelRoomType: {
+        findMany: vi.fn(async () =>
+          (fixture.roomTypes ?? []).map((rt) => ({
+            id: rt.id,
+            hotelId: rt.hotelId,
+            hotel: { randomTierPlaceholder: rt.randomTierPlaceholder ?? null },
+          })),
+        ),
+      },
+      hotelBlockPeriod: {
+        findMany: vi.fn(async () =>
+          fixture.blockRooms == null
+            ? []
+            : [
+                {
+                  dateFrom: new Date('2026-09-01T00:00:00.000Z'),
+                  dateTo: new Date('2026-09-30T00:00:00.000Z'),
+                  rooms: fixture.blockRooms,
+                },
+              ],
+        ),
+      },
+      passenger: { findMany: vi.fn(async () => fixture.passengers ?? []) },
+      bundle: { findUnique: vi.fn(async () => ({ items: fixture.bundleComponents ?? [] })) },
+      fulfillmentTask: {
+        // 补建前的「贴身再查一次活动任务」：默认查无（并发补建的窗口不在本批覆盖范围内）。
+        findFirst: vi.fn(async () => null),
+        updateMany: vi.fn(async () => ({ count: 1 })),
+        create: vi.fn(async () => ({ id: 'task-new' })),
       },
     };
     mockPrisma.$transaction.mockImplementation(async (fn: (t: unknown) => unknown) => fn(tx));
@@ -521,12 +693,170 @@ describe('changeOrderBundle · 套餐改档', () => {
     mountOrder({ agentId: 'ag-1' });
     mountNewBundle({ settlementTier: 'CITY_4STAR', settlementNights: 2 });
     mockGetSettlementRate.mockResolvedValue(null);
-    mountTx(4000);
+    const tx = mountTx(4000);
 
     await expect(service.changeOrderBundle('ord-1', { bundleId: 'b-4star' }, ADMIN)).rejects.toThrow(
       /结算价未维护/,
     );
-    expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+    // 取价在锁内（并发调价不会被抵消），拒单时整事务回滚 —— 一行都没落库。
+    expect(tx.orderItem.update).not.toHaveBeenCalled();
+    expect(tx.orderItem.create).not.toHaveBeenCalled();
+    expect(tx.order.update).not.toHaveBeenCalled();
+  });
+
+  it('二次改档：旧档基线含历次差额行 → 总额恒等于「按当前档从头录单」', async () => {
+    // 首次录单 ¥4000（套餐行价从此冻结）→ 已改过一次档、留下 +¥1000 差额行 → 当前应收 ¥5000。
+    mountOrder({
+      total: new Prisma.Decimal(5000),
+      items: [bundleItem(), bundleChangeDiffItem(1000)],
+    });
+    // 目标档地面价 = 2 晚 × ¥3500 = ¥7000，也就是「直接按这档从头录单」的应收。
+    mountNewBundle({ items: [{ kind: 'HOTEL', qty: 2, unitPrice: 3500 }] });
+    const tx = mountTx(7000);
+
+    await service.changeOrderBundle('ord-1', { bundleId: 'b-4star' }, STAFF).catch(() => undefined);
+
+    // 旧档有效金额 = 冻结行价 4000 + 既有差额 1000 = 5000 → 本次差额 = 7000 − 5000 = +2000。
+    // 若只拿冻结行价当基线，会算成 5000 + (7000 − 4000) = 8000，把上一次的 +1000 又收一遍。
+    const diffRow = tx.orderItem.create.mock.calls[0][0] as { data: Record<string, unknown> };
+    const thisDiffCny = Number(String(diffRow.data.amount));
+    expect(thisDiffCny).toBe(2000);
+    // 恒等式：冻结行价 + 历次差额合计 = 按当前档从头录单的应收。
+    expect(4000 + 1000 + thisDiffCny).toBe(7000);
+  });
+
+  it('改档窗口期内的并发调价不被差额行吞掉（计价在锁内、基准取锁后总额）', async () => {
+    mountOrder(); // 锁外预检看到的：总额 ¥4000
+    mountNewBundle(); // 目标档地面价 ¥5000
+    // 锁内重读拿到的是并发调价之后的单：多一条 +¥500 调价行、总额 ¥4500。
+    const tx = mountTx(5500, {
+      locked: orderFixture({
+        total: new Prisma.Decimal(4500),
+        items: [bundleItem(), plainAdjustmentItem(500)],
+      }),
+    });
+
+    await service.changeOrderBundle('ord-1', { bundleId: 'b-4star' }, STAFF).catch(() => undefined);
+
+    // 差额只反映「档次变了」这一件事：5000 − 4000 = +1000，并发那 ¥500 原样留在总额里往前带。
+    // 若拿锁外总额算，会得出 5000 − 4500 = +500，等于把并发调价悄悄抹平。
+    const diffRow = tx.orderItem.create.mock.calls[0][0] as { data: Record<string, unknown> };
+    expect(diffRow.data.amount).toEqual(new Prisma.Decimal(1000));
+  });
+
+  it('新档绑真实酒店房型、该区间已满房 → 拒单（改档不许绕过房量闸）', async () => {
+    mountOrder();
+    mountNewBundle({
+      hotelRoomTypeId: 'rt-real',
+      hotelRoomType: { maxAdults: 2, maxChildren: 1, basePrice: new Prisma.Decimal(1000) },
+    });
+    // 包房 1 间、他单已占 1 间 → 改档要新增 1 间，装不下。
+    const tx = mountTx(5000, {
+      roomTypes: [{ id: 'rt-real', hotelId: 'h-1' }],
+      blockRooms: 1,
+      existingRooms: [1],
+    });
+
+    await expect(service.changeOrderBundle('ord-1', { bundleId: 'b-4star' }, STAFF)).rejects.toThrow(
+      /实际房间不足/,
+    );
+    // 闸在写之前：拒单时套餐行没换绑、总额没动（整事务回滚）。
+    expect(tx.orderItem.update).not.toHaveBeenCalled();
+    expect(tx.order.update).not.toHaveBeenCalled();
+  });
+
+  it('新档绑真实酒店房型、房量够 → 放行并正常换绑', async () => {
+    mountOrder();
+    mountNewBundle({
+      hotelRoomTypeId: 'rt-real',
+      hotelRoomType: { maxAdults: 2, maxChildren: 1, basePrice: new Prisma.Decimal(1000) },
+    });
+    const tx = mountTx(5000, {
+      roomTypes: [{ id: 'rt-real', hotelId: 'h-1' }],
+      blockRooms: 5,
+      existingRooms: [1],
+    });
+
+    await service.changeOrderBundle('ord-1', { bundleId: 'b-4star' }, STAFF).catch(() => undefined);
+
+    const rowUpdate = tx.orderItem.update.mock.calls[0][0] as { data: Record<string, unknown> };
+    expect(rowUpdate.data.hotelRoomTypeId).toBe('rt-real');
+  });
+
+  it('含签证套餐 → 不含签证套餐：原「待处理」签证任务自动撤销', async () => {
+    mountOrder();
+    mountNewBundle();
+    const tx = mountTx(5000, {
+      // 换绑之后签证同步读到的本单明细：套餐行已是新档（组件里没有签证），却还挂着一条待处理任务。
+      visaItems: [
+        {
+          id: 'item-bundle',
+          kind: OrderItemKind.BUNDLE,
+          bundleId: 'b-4star',
+          fulfillmentTasks: [
+            {
+              id: 'task-visa',
+              type: FulfillmentType.VISA_APPLICATION,
+              status: FulfillmentStatus.PENDING,
+            },
+          ],
+        },
+      ],
+      bundleComponents: [{ kind: 'HOTEL' }],
+      passengers: [{ visaExempt: false }],
+    });
+
+    await service.changeOrderBundle('ord-1', { bundleId: 'b-4star' }, STAFF).catch(() => undefined);
+
+    const call = tx.fulfillmentTask.updateMany.mock.calls[0][0] as {
+      where: { id: { in: string[] }; status: string };
+      data: Record<string, unknown>;
+    };
+    expect(call.where.id).toEqual({ in: ['task-visa'] });
+    // where 里再卡一次 PENDING：判定与写入之间若有签证岗接单，这条 update 自然落空。
+    expect(call.where.status).toBe(FulfillmentStatus.PENDING);
+    expect(call.data).toEqual({ status: FulfillmentStatus.CANCELLED });
+    expect(tx.fulfillmentTask.create).not.toHaveBeenCalled();
+  });
+
+  it('不含签证套餐 → 含签证套餐：自动补建一条「待处理」签证任务', async () => {
+    mountOrder();
+    mountNewBundle();
+    const tx = mountTx(5000, {
+      visaItems: [
+        { id: 'item-bundle', kind: OrderItemKind.BUNDLE, bundleId: 'b-4star', fulfillmentTasks: [] },
+      ],
+      // 新档组件含签证 → 本单重新涉签。
+      bundleComponents: [{ kind: 'HOTEL' }, { kind: 'VISA' }],
+      passengers: [{ visaExempt: false }],
+    });
+
+    await service.changeOrderBundle('ord-1', { bundleId: 'b-4star' }, STAFF).catch(() => undefined);
+
+    const call = tx.fulfillmentTask.create.mock.calls[0][0] as { data: Record<string, unknown> };
+    expect(call.data).toMatchObject({
+      orderItemId: 'item-bundle',
+      type: FulfillmentType.VISA_APPLICATION,
+      status: FulfillmentStatus.PENDING,
+    });
+    expect(tx.fulfillmentTask.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('全员自备签：新档含签证也不建任务（任务只为「要我方代办」的人而建）', async () => {
+    mountOrder();
+    mountNewBundle();
+    const tx = mountTx(5000, {
+      visaItems: [
+        { id: 'item-bundle', kind: OrderItemKind.BUNDLE, bundleId: 'b-4star', fulfillmentTasks: [] },
+      ],
+      bundleComponents: [{ kind: 'VISA' }],
+      passengers: [{ visaExempt: true }, { visaExempt: true }],
+    });
+
+    await service.changeOrderBundle('ord-1', { bundleId: 'b-4star' }, STAFF).catch(() => undefined);
+
+    expect(tx.fulfillmentTask.create).not.toHaveBeenCalled();
+    expect(tx.fulfillmentTask.updateMany).not.toHaveBeenCalled();
   });
 
   it('酒店已落位到真实酒店 → 拒单，提示先走换酒店', async () => {

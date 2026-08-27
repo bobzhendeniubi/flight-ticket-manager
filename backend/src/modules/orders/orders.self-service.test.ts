@@ -34,7 +34,11 @@ vi.mock('../../lib/audit.js', () => ({
 }));
 
 import { OrderService } from './orders.service.js';
-import { resolvePassengerPatchChannel } from './orders.schemas.js';
+import {
+  resolvePassengerPatchChannel,
+  selfUpdatePassengerBodySchema,
+  swapPassengerBodySchema,
+} from './orders.schemas.js';
 import { AppError, ForbiddenError, NotFoundError } from '../../lib/errors.js';
 
 const service = new OrderService();
@@ -176,6 +180,34 @@ describe('resolvePassengerPatchChannel', () => {
     expect(
       resolvePassengerPatchChannel(UserRole.ADMIN, { documentNumber: 'E99', fullName: 'NEW PERSON' }),
     ).toBe('SWAP');
+  });
+
+  // 换人 schema 独有、补录 schema 没有的新出行人属性 —— 漏进分流集合就会被判成补录，
+  // 而补录 schema 是 .strict() 的 → 400；换人通道后面挂着的自备签→签证任务同步也整条跑不到。
+  it.each([
+    ['visaExempt', { visaExempt: true }],
+    ['singleRoom', { singleRoom: true }],
+    ['title', { title: 'MR' }],
+    ['passengerType', { passengerType: 'CHILD' }],
+  ])('运营单独提交 %s → 走换人通道（不被分流到补录后 400）', (_label, body) => {
+    for (const role of [UserRole.ADMIN, UserRole.STAFF]) {
+      expect(resolvePassengerPatchChannel(role, body)).toBe('SWAP');
+    }
+  });
+
+  it('分流集合与换人 schema 独有键保持一致：分流过去后 body 确实过得了换人 schema', () => {
+    expect(resolvePassengerPatchChannel(UserRole.ADMIN, { visaExempt: false })).toBe('SWAP');
+    expect(swapPassengerBodySchema.safeParse({ visaExempt: false }).success).toBe(true);
+    expect(swapPassengerBodySchema.safeParse({ singleRoom: true }).success).toBe(true);
+    // 反向：补录 schema 是 .strict() 的，这些键在它那里必然被拒 —— 分流错了就是 400
+    expect(selfUpdatePassengerBodySchema.safeParse({ visaExempt: false }).success).toBe(false);
+    expect(selfUpdatePassengerBodySchema.safeParse({ singleRoom: true }).success).toBe(false);
+  });
+
+  it('前台角色带这些字段仍走补录（换人只能联系客服，口径不变）', () => {
+    for (const role of [UserRole.CUSTOMER, UserRole.AGENT]) {
+      expect(resolvePassengerPatchChannel(role, { visaExempt: true })).toBe('SELF_UPDATE');
+    }
   });
 });
 

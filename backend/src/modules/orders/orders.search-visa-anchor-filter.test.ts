@@ -87,7 +87,7 @@ describe('buildOrderFilterWhere · 出行日期：签证预计出行日期是第
   });
 });
 
-describe('buildOrderFilterWhere · 无锚点单：仅导出路径取回', () => {
+describe('buildOrderFilterWhere · 无锚点的签证单：仅导出路径取回', () => {
   it('列表路径（默认）→ 只有「锚点落在窗口内」这一支，无锚点单取不回来', () => {
     const where = buildOrderFilterWhere({ travelFrom: '2026-09-15', travelTo: '2026-09-15' });
     const clauses = andClauses(where as Record<string, unknown>);
@@ -95,7 +95,7 @@ describe('buildOrderFilterWhere · 无锚点单：仅导出路径取回', () => 
     expect(clauses.some((c) => 'items' in c)).toBe(true);
   });
 
-  it('导出路径（includeAnchorless）→ OR 上一支 items.none：无航班行、无入住日、无签证预计出行日期', () => {
+  it('导出路径（includeAnchorless）→ OR 上一支「无任何日期锚点 AND 涉签」', () => {
     const where = buildOrderFilterWhere(
       { travelFrom: '2026-09-15', travelTo: '2026-09-15' },
       { includeAnchorless: true },
@@ -111,21 +111,49 @@ describe('buildOrderFilterWhere · 无锚点单：仅导出路径取回', () => 
     );
     expect(anchored).toBeDefined();
 
-    // ② 一个日期锚点都没有
-    const anchorless = branches.find(
-      (b) => (b.items as { none?: unknown } | undefined)?.none !== undefined,
-    );
+    // ② 一个日期锚点都没有 **且** 确实是签证单（收窄：空单/接送单/资料不全的机酒单不豁免）
+    const anchorless = branches.find((b) => 'AND' in b);
     expect(anchorless).toEqual({
-      items: {
-        none: {
-          OR: [
-            { flightScheduleId: { not: null } },
-            { hotelCheckIn: { not: null } },
-            { visaIntendedDate: { not: null } },
-          ],
+      AND: [
+        {
+          items: {
+            none: {
+              OR: [
+                { flightScheduleId: { not: null } },
+                { hotelCheckIn: { not: null } },
+                { visaIntendedDate: { not: null } },
+              ],
+            },
+          },
         },
-      },
+        {
+          items: {
+            some: {
+              OR: [
+                { kind: 'VISA' },
+                { kind: 'BUNDLE', bundle: { items: { array_contains: [{ kind: 'VISA' }] } } },
+              ],
+            },
+          },
+        },
+      ],
     });
+  });
+
+  it('无锚点豁免必须同时满足两条（none + some），不是「只要没日期就放行」', () => {
+    const where = buildOrderFilterWhere(
+      { travelFrom: '2026-09-15', travelTo: '2026-09-15' },
+      { includeAnchorless: true },
+    );
+    const branches = (andClauses(where as Record<string, unknown>).find((c) => 'OR' in c)!.OR ??
+      []) as Array<Record<string, unknown>>;
+    const anchorless = branches.find((b) => 'AND' in b)!;
+    const conds = anchorless.AND as Array<Record<string, unknown>>;
+    // 单独的 items.none 分支（老口径）不复存在——它必须与「涉签」条件成对出现
+    expect(branches.some((b) => (b.items as { none?: unknown } | undefined)?.none)).toBe(false);
+    expect(conds).toHaveLength(2);
+    expect((conds[0].items as { none?: unknown }).none).toBeDefined();
+    expect((conds[1].items as { some?: unknown }).some).toBeDefined();
   });
 
   it('includeAnchorless 只作用于出行日期分支：没传日期时不产生任何多余子句', () => {

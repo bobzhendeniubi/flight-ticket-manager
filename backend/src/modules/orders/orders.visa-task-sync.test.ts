@@ -9,7 +9,10 @@
  *   2. 已经在办 / 已出结果的任务（IN_PROGRESS / CONFIRMED / FAILED）→ 一律不碰；
  *   3. 需求改回「需要」且只剩终态任务 → 按锚点补建一条 PENDING；
  *   4. 幂等：已有活动任务不重复建、没有 PENDING 可撤时零写入；
- *   5. 锚点口径与建单一致：VISA 行 → 含签证组件的套餐行 → 订单级需签时首个订单项。
+ *   5. 锚点口径与建单一致：VISA 行 → 含签证组件的套餐行 → 订单级需签时首个订单项；
+ *   6. 不参与履约的单（取消族终态 / 已软删）一律判「不需要任务」——改备注不会给已取消的单
+ *      凭空补出 PENDING，残留的 PENDING 反被顺手撤掉；
+ *   7. 补建前的同事务 re-check：并发已经补建过一条时不再建第二条。
  *
  * 用 vi.mock 把 Prisma 换成可控 stub，不依赖真 DB（tx 与 prisma 共用同一批 vi.fn()）。
  */
@@ -22,7 +25,7 @@ const { mockPrisma } = vi.hoisted(() => ({
     orderItem: { findMany: vi.fn() },
     passenger: { findMany: vi.fn() },
     bundle: { findUnique: vi.fn() },
-    fulfillmentTask: { updateMany: vi.fn(), create: vi.fn() },
+    fulfillmentTask: { updateMany: vi.fn(), create: vi.fn(), findFirst: vi.fn() },
     // 换人挂接点用：swapPassenger 走 prisma.$transaction(async (tx) => ...)
     $transaction: vi.fn(),
   },
@@ -46,9 +49,13 @@ interface StubItem {
   tasks?: Array<{ id: string; type: string; status: string }>;
 }
 
-/** 装配一单的库存量：订单级签证状态 / 订单项（含既有任务）/ 乘客自备签 / 套餐组件。 */
+/** 装配一单的库存量：订单级签证状态 / 订单状态 / 软删 / 订单项（含既有任务）/ 乘客自备签 / 套餐组件。 */
 function seed(opts: {
   visaStatus?: VisaRequirement | null;
+  /** 订单状态；缺省 PAID（正常在途单）。 */
+  status?: string;
+  /** 软删时间戳；缺省 null（未进回收站）。 */
+  deletedAt?: Date | null;
   items: StubItem[];
   passengers?: Array<{ visaExempt: boolean }>;
   bundleItems?: Array<{ kind: string }> | null;
@@ -56,6 +63,8 @@ function seed(opts: {
   mockPrisma.order.findUnique.mockResolvedValue({
     visaStatus: opts.visaStatus ?? null,
     orderNumber: 'ORD-0001',
+    status: opts.status ?? 'PAID',
+    deletedAt: opts.deletedAt ?? null,
   });
   mockPrisma.orderItem.findMany.mockResolvedValue(
     opts.items.map((it) => ({
@@ -89,6 +98,8 @@ beforeEach(() => {
     async ({ data }: { data: Record<string, unknown> }) => ({ id: 'task_new', ...data }),
   );
   mockPrisma.fulfillmentTask.updateMany.mockResolvedValue({ count: 1 });
+  // 补建前的同事务 re-check：缺省「没有并发建过」，需要模拟并发的用例各自覆盖。
+  mockPrisma.fulfillmentTask.findFirst.mockResolvedValue(null);
 });
 
 describe('syncVisaTasksForOrder · 不再需要签证 → 撤销待处理任务', () => {
@@ -330,6 +341,116 @@ describe('syncVisaTasksForOrder · 需求改回「需要」→ 补建待处理�
 });
 
 // ══════════════════════════════════════════════════════════════════════════
+// 不参与履约的单：取消族终态 / 已软删 → 一律判「不需要任务」
+// 此前只看签证口径：一张已取消的需签单，改一次备注（=改订单级签证状态）就会被补出一条
+// PENDING，签证台上冒出根本不用办的活；回收站里的单同理。
+describe('syncVisaTasksForOrder · 取消族终态 / 已软删 → 不建任务', () => {
+  const TERMINATING = ['CANCELLED', 'REFUNDED', 'PAYMENT_TIMEOUT', 'FAILED'] as const;
+
+  it.each(TERMINATING)('%s 的需签单 → 不补建（不给已终结的单凭空造活）', async (status) => {
+    seed({
+      visaStatus: VisaRequirement.NEEDED,
+      status,
+      items: [{ id: 'itm_visa', kind: 'VISA' }],
+    });
+    const result = await run();
+    expect(result.needed).toBe(false);
+    expect(result.createdTaskIds).toEqual([]);
+    expect(mockPrisma.fulfillmentTask.create).not.toHaveBeenCalled();
+  });
+
+  it.each(TERMINATING)('%s 的单里残留 PENDING 任务 → 顺手撤掉（正确的清理）', async (status) => {
+    seed({
+      visaStatus: VisaRequirement.NEEDED,
+      status,
+      items: [{ id: 'itm_visa', kind: 'VISA', tasks: [pendingVisaTask()] }],
+    });
+    const result = await run();
+    expect(result.needed).toBe(false);
+    expect(result.cancelledTaskIds).toEqual(['task_pending']);
+  });
+
+  it('已软删（回收站）的需签单 → 不补建', async () => {
+    seed({
+      visaStatus: VisaRequirement.NEEDED,
+      deletedAt: new Date('2026-08-27T00:00:00.000Z'),
+      items: [{ id: 'itm_visa', kind: 'VISA' }],
+    });
+    const result = await run();
+    expect(result.needed).toBe(false);
+    expect(mockPrisma.fulfillmentTask.create).not.toHaveBeenCalled();
+  });
+
+  it('已软删的单里残留 PENDING 任务 → 撤掉（回收站单不该还挂在签证台上）', async () => {
+    seed({
+      visaStatus: VisaRequirement.NEEDED,
+      deletedAt: new Date('2026-08-27T00:00:00.000Z'),
+      items: [{ id: 'itm_visa', kind: 'VISA', tasks: [pendingVisaTask()] }],
+    });
+    expect((await run()).cancelledTaskIds).toEqual(['task_pending']);
+  });
+
+  it('DRAFT 不算取消族（只是座位账口径上的释放型）→ 仍按签证口径正常补建', async () => {
+    seed({
+      visaStatus: VisaRequirement.NEEDED,
+      status: 'DRAFT',
+      items: [{ id: 'itm_visa', kind: 'VISA' }],
+    });
+    const result = await run();
+    expect(result.needed).toBe(true);
+    expect(result.createdTaskIds).toEqual(['task_new']);
+  });
+
+  it.each(['PENDING_PAYMENT', 'PAID', 'PROCESSING', 'TICKETED', 'COMPLETED'])(
+    '%s（在途单）→ 行为不变，照常补建',
+    async (status) => {
+      seed({
+        visaStatus: VisaRequirement.NEEDED,
+        status,
+        items: [{ id: 'itm_visa', kind: 'VISA' }],
+      });
+      expect((await run()).createdTaskIds).toEqual(['task_new']);
+    },
+  );
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 并发补建：判定开头那次读与 create 之间，另一路同步可能已经建过一条
+describe('syncVisaTasksForOrder · 补建前的同事务 re-check', () => {
+  it('re-check 查到并发已补建的活动任务 → 不再建第二条', async () => {
+    seed({ visaStatus: VisaRequirement.NEEDED, items: [{ id: 'itm_visa', kind: 'VISA' }] });
+    // 判定开头读到「无任务」，贴身 re-check 时并发那一路已经建好了。
+    mockPrisma.fulfillmentTask.findFirst.mockResolvedValue({ id: 'task_by_other' });
+    const result = await run();
+    expect(result.needed).toBe(true);
+    expect(result.createdTaskIds).toEqual([]);
+    expect(mockPrisma.fulfillmentTask.create).not.toHaveBeenCalled();
+  });
+
+  it('re-check 只认「活动」任务：查询按 type=签证 + status≠CANCELLED + 本单', async () => {
+    seed({ visaStatus: VisaRequirement.NEEDED, items: [{ id: 'itm_visa', kind: 'VISA' }] });
+    await run();
+    expect(mockPrisma.fulfillmentTask.findFirst).toHaveBeenCalledWith({
+      where: {
+        type: FulfillmentType.VISA_APPLICATION,
+        status: { not: FulfillmentStatus.CANCELLED },
+        orderItem: { orderId: 'ord1' },
+      },
+      select: { id: true },
+    });
+  });
+
+  it('撤销路径不做 re-check（updateMany 的 where 二次卡 PENDING 已够）', async () => {
+    seed({
+      visaStatus: VisaRequirement.NOT_NEEDED,
+      items: [{ id: 'itm_visa', kind: 'VISA', tasks: [pendingVisaTask()] }],
+    });
+    await run();
+    expect(mockPrisma.fulfillmentTask.findFirst).not.toHaveBeenCalled();
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
 // 挂接点：换人通道（乘客级自备签在存量订单上的唯一写入口）
 // 改自备签的 PATCH 会被 resolvePassengerPatchChannel 判成换人语义走到 swapPassenger；
 // 真换人（证件号变化）也会把 visaExempt 强制回落 false。两种情形都该触发同步。
@@ -351,6 +472,8 @@ describe('swapPassenger · 自备签变更后触发签证任务同步', () => {
         findUnique: vi.fn(async () => ({
           visaStatus: VisaRequirement.NEEDED,
           orderNumber: 'ORD-0001',
+          status: 'PAID',
+          deletedAt: null,
         })),
         update: vi.fn(),
       },
@@ -390,6 +513,8 @@ describe('swapPassenger · 自备签变更后触发签证任务同步', () => {
           id: 'task_new',
           ...data,
         })),
+        // 补建前的同事务 re-check：换人事务里没有并发，恒为「没建过」。
+        findFirst: vi.fn(async () => null),
       },
     };
     mockPrisma.$transaction.mockImplementation(async (fn: (t: unknown) => unknown) => fn(tx));
