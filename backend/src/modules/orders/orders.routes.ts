@@ -26,6 +26,7 @@ import {
   batchUpdateStatusBodySchema,
   addGroundItemBodySchema,
   changeOrderAgentBodySchema,
+  changeOrderBundleBodySchema,
   changeRequestBodySchema,
   createOrderBodySchema,
   orderPriceAdjustmentBodySchema,
@@ -1964,6 +1965,18 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       },
       severity: 'WARNING',
     });
+    // 越过「套餐档次 ↔ 酒店星级」闸时另记一条：换酒店审计只说换到哪，说不清「档次对不上还放行了」。
+    if (audit.starMismatchOverride) {
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'DESIGNATED_HOTEL_STAR_MISMATCH_OVERRIDE',
+        targetType: 'ORDER',
+        targetId: id,
+        targetLabel: audit.orderNumber,
+        after: { ...audit.starMismatchOverride, orderItemId: audit.orderItemId, source: 'HOTEL_SWAP' },
+        severity: 'WARNING',
+      });
+    }
     return { order };
   });
 
@@ -2000,6 +2013,41 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     });
     return { order };
   });
+
+  // ── 售后改单：套餐改档（ADMIN/STAFF）──
+  // POST /orders/:id/change-bundle  body: { bundleId, note? }
+  // 行业口径 amendment：改档 → 按新档重新计价 → 差价落一条 bundleChange 差额行 → 审计。
+  // 机票行/班次/座位一律不动；酒店已落位到真实酒店的单先走换酒店。AGENT 不可用。
+  app.post(
+    '/:id/change-bundle',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    async (req) => {
+      const { id } = req.params as { id: string };
+      const body = changeOrderBundleBodySchema.parse(req.body);
+      const { order, audit } = await service.changeOrderBundle(id, body, {
+        userId: req.user.sub,
+        role: req.user.role,
+      });
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'CHANGE_ORDER_BUNDLE',
+        targetType: 'ORDER',
+        targetId: id,
+        targetLabel: audit.orderNumber,
+        before: { orderItemId: audit.orderItemId, ...audit.before },
+        after: {
+          ...audit.after,
+          diffCny: audit.diffCny,
+          diffItemId: audit.diffItemId,
+          pricingSource: audit.pricingSource,
+          note: audit.note,
+          warnings: audit.warnings,
+        },
+        severity: 'WARNING',
+      });
+      return { order, diffCny: audit.diffCny, warnings: audit.warnings };
+    },
+  );
 
   // ── T5 更改订单归属代理（ADMIN/STAFF）──
   // PATCH /orders/:id/agent  body: { agentId: string | null, reason? }

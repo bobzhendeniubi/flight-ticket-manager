@@ -101,6 +101,7 @@ import type {
   BatchRescheduleBody,
   AddGroundItemBody,
   BatchPassengerInput,
+  ChangeOrderBundleBody,
   CreateOrderBody,
   ListOrdersQuery,
   OrderItemInput,
@@ -157,6 +158,91 @@ export const ALLOWED_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
   CHANGED: ['PROCESSING', 'TICKETED', 'COMPLETED', 'REFUND_REQUESTED'], // 改签后继续出票流程或直接完结/退款
   FAILED: ['PROCESSING', 'REFUND_REQUESTED', 'CANCELLED'],
 };
+
+// ════════════════════════════════════════════════════════════════════════════
+// 结算档次 ↔ 酒店星级：唯一权威映射
+//
+// 数据模型上这两件事分别记在两处，谁都不是对方的派生字段：
+//   · 套餐档次 = Bundle.settlementTier（SettlementTier 枚举，结算价日历的取价键之一）；
+//   · 酒店星级 = Hotel.starRating（纯 1..5 整数）+ Hotel.intlFiveStar（国际五星标记，
+//     与 starRating=5 共用整数星级，另行报价 —— 口径见 schema.prisma 与 hotel-control.service.ts）。
+// 「四星档的钱住三星店」这类交付降级此前系统完全不知情（只校验房型存在 + 在架），
+// 故在此把两套口径钉成一份映射，录单指定酒店与售后换酒店共用，绝不各推各的。
+// ════════════════════════════════════════════════════════════════════════════
+export const SETTLEMENT_TIER_STAR_RATING: Record<SettlementTier, number> = {
+  CITY_3STAR: 3,
+  CITY_4STAR: 4,
+  CITY_5STAR: 5,
+  INTL_5STAR: 5,
+};
+export const SETTLEMENT_TIER_LABEL: Record<SettlementTier, string> = {
+  CITY_3STAR: '市区三星',
+  CITY_4STAR: '市区四星',
+  CITY_5STAR: '市区五星',
+  INTL_5STAR: '国际五星',
+};
+
+/** 酒店档案 → 结算档次；1/2 星等档次表里没有的星级返回 null（即「对不上任何档」）。 */
+export function resolveHotelSettlementTier(hotel: {
+  starRating?: number | null;
+  intlFiveStar?: boolean | null;
+}): SettlementTier | null {
+  if (hotel.starRating == null) return null;
+  if (hotel.intlFiveStar === true) return hotel.starRating === 5 ? 'INTL_5STAR' : null;
+  if (hotel.starRating === 3) return 'CITY_3STAR';
+  if (hotel.starRating === 4) return 'CITY_4STAR';
+  if (hotel.starRating === 5) return 'CITY_5STAR';
+  return null;
+}
+
+/**
+ * 指定/换入酒店的星级是否与套餐档次不匹配。
+ *
+ * 保守口径（宁可多问一句，也不放行一次沉默的降级交付）：
+ *   · 星级缺失（starRating 为空）→ 视为不匹配；
+ *   · 1/2 星等映射不到任何档次的酒店 → 视为不匹配；
+ *   · 国际五星与市区五星互为不同档（另行报价）→ 视为不匹配。
+ * 「升级」（如三星档住五星店）同样算不匹配 —— 钱与货对不上就该有人签字，方向不改变这一点。
+ */
+export function isSettlementTierStarMismatch(
+  tier: SettlementTier,
+  hotel: { starRating?: number | null; intlFiveStar?: boolean | null },
+): boolean {
+  return resolveHotelSettlementTier(hotel) !== tier;
+}
+
+/** 星级不匹配放行（override）的留痕明细 —— 调用方据此写审计。 */
+export interface DesignatedHotelStarMismatchOverride {
+  bundleId: string;
+  bundleName: string | null;
+  /** 套餐档次（SettlementTier 枚举值）与其对应星级。 */
+  bundleTier: SettlementTier;
+  bundleTierStar: number;
+  hotelRoomTypeId: string;
+  hotelId: string;
+  hotelName: string;
+  hotelStarRating: number | null;
+  hotelIntlFiveStar: boolean;
+  reason: string;
+}
+
+/** 星级闸的调用上下文：role=null 视为对外身份（游客/客户），一律拒单。 */
+export interface DesignatedHotelStarGate {
+  role: UserRole | null;
+  overrides: DesignatedHotelStarMismatchOverride[];
+}
+
+/** 星级不匹配的人眼文案（录单与换酒店共用一句，运营看到的提示不分叉）。 */
+export function buildStarMismatchMessage(
+  tier: SettlementTier,
+  hotel: { starRating?: number | null },
+): string {
+  const hotelStar = hotel.starRating != null ? `${hotel.starRating}星` : '星级未标注';
+  return (
+    `该套餐为${SETTLEMENT_TIER_STAR_RATING[tier]}星档（${SETTLEMENT_TIER_LABEL[tier]}），` +
+    `指定酒店为${hotelStar}；请改选对应档次套餐或联系运营`
+  );
+}
 
 // 哪些状态视为"占用座位"（需要扣库存）
 export const SEAT_HOLDING_STATUSES: OrderStatus[] = [
@@ -370,6 +456,8 @@ export interface BatchBundlePassengerOptions {
   singleRoom?: boolean;
   businessUpgrade?: boolean;
   designatedHotelRoomTypeId?: string;
+  /** 星级不匹配放行原因（该乘客指定酒店与套餐档次对不上时必填，口径同单笔录单）。 */
+  designatedHotelStarMismatchReason?: string;
   adultCount: number;
   childCount: number;
   infantCount: number;
@@ -460,6 +548,12 @@ export function buildBatchItems(
         infantCount: bundlePassengerOptions.infantCount,
         ...(bundlePassengerOptions.designatedHotelRoomTypeId
           ? { designatedHotelRoomTypeId: bundlePassengerOptions.designatedHotelRoomTypeId }
+          : {}),
+        ...(bundlePassengerOptions.designatedHotelStarMismatchReason
+          ? {
+              designatedHotelStarMismatchReason:
+                bundlePassengerOptions.designatedHotelStarMismatchReason,
+            }
           : {}),
         ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
       },
@@ -1236,6 +1330,8 @@ export class OrderService {
 
     // 先查所有 FLIGHT item 对应的 FlightSeatClass + 计算动态价（在事务外查，避免长事务）
     // body.flightSettlementPriceCny 存在 → 团队议价结算价覆盖机票价（鉴权在路由/批量层完成）。
+    // 指定酒店星级不匹配的放行留痕（ADMIN/STAFF 带原因放行时才有内容）→ 建单成功后写审计。
+    const starMismatchOverrides: DesignatedHotelStarMismatchOverride[] = [];
     const pricedItems = await this.priceAndValidateItems(
       body.items,
       body.flightSettlementPriceCny,
@@ -1243,6 +1339,8 @@ export class OrderService {
       body.passengers,
       // 仅后台/代理录单可用「无产品 id 的自定义价地面行」；对外角色（游客/CUSTOMER）一律走系统产品价。
       isStaffEnteredOrder(requester),
+      // 星级闸按认证身份判权限（不信前端）：游客无角色 → null，与 AGENT/CUSTOMER 同样硬拒。
+      { role: requesterRole ?? null, overrides: starMismatchOverrides },
     );
 
     // 散客 RETAIL 立减判定与 quote 共用 shouldApplyRetailSettlementDiscount，两边不会再分叉。
@@ -1706,6 +1804,22 @@ export class OrderService {
         targetId: order.id,
         targetLabel: order.orderNumber,
         after: { conflicts: duplicateConflicts },
+        severity: AuditSeverity.WARNING,
+      });
+    }
+
+    // 指定酒店星级不匹配放行留痕（套餐档次 / 酒店星级 / 原因 / 操作人）。
+    // 权限已在星级闸内按角色收口 → 走到这里必为 ADMIN/STAFF。
+    // WARNING 级：客人付的是 A 档的钱、住的是 B 档的店，是需要有人复核的交付偏差。
+    for (const override of starMismatchOverrides) {
+      if (isGuest) break;
+      await writeAudit({
+        actor: { userId: requester.userId, role: requester.role },
+        action: 'DESIGNATED_HOTEL_STAR_MISMATCH_OVERRIDE',
+        targetType: 'ORDER',
+        targetId: order.id,
+        targetLabel: order.orderNumber,
+        after: override,
         severity: AuditSeverity.WARNING,
       });
     }
@@ -2465,6 +2579,10 @@ export class OrderService {
     // 对外角色（游客 / CUSTOMER）为 false —— 否则公开 POST /orders 可提交 1 元酒店行，
     // 且 expectedTotalCny 兜底以这个被信任的价为基准，形同虚设。
     allowClientPricedGround = false,
+    // 指定酒店星级闸的上下文（缺省 = 不判，供纯试算/内部预算路径使用）：
+    //   传了才启用「套餐档次 ↔ 指定酒店星级」校验，AGENT/CUSTOMER/游客不匹配即拒单，
+    //   ADMIN/STAFF 须带非空放行原因，放行明细推进 overrides 供调用方写审计。
+    starGate?: DesignatedHotelStarGate,
   ) {
     const priced: PricedOrderItem[] = [];
 
@@ -2724,6 +2842,9 @@ export class OrderService {
         const bundle = await prisma.bundle.findUnique({
           where: { id: item.bundleId },
           select: {
+            name: true,
+            // 结算档次：指定酒店星级闸的比对基准（唯一权威映射见 SETTLEMENT_TIER_STAR_RATING）。
+            settlementTier: true,
             items: true,
             groundDiscount: true,
             // 套餐折扣（%）：整个全包价(机票+地面+加项) × (1 − discountPct/100)；下方逐行打折
@@ -2822,6 +2943,9 @@ export class OrderService {
           designationSurchargeCnyPerPerson: number;
           /** 非空 = 指到了随机档占位酒店（不是真房源）→ 房量闸走随机档聚合闸。*/
           randomTierPlaceholder: number | null;
+          /** 星级闸比对用（占位酒店不参与本闸）。*/
+          starRating: number | null;
+          intlFiveStar: boolean;
         } | null = null;
         if (
           item.designatedHotelRoomTypeId &&
@@ -2840,6 +2964,8 @@ export class OrderService {
                   isActive: true,
                   designationSurchargeCnyPerPerson: true,
                   randomTierPlaceholder: true,
+                  starRating: true,
+                  intlFiveStar: true,
                 },
               },
             },
@@ -2854,7 +2980,51 @@ export class OrderService {
             hotelName: rt.hotel.name,
             designationSurchargeCnyPerPerson: rt.hotel.designationSurchargeCnyPerPerson,
             randomTierPlaceholder: rt.hotel.randomTierPlaceholder,
+            starRating: rt.hotel.starRating ?? null,
+            intlFiveStar: rt.hotel.intlFiveStar === true,
           };
+        }
+
+        // ── 星级不匹配闸（block-with-override）────────────────────────────────
+        // 此前只校验「房型存在 + 酒店在架」，价格却全程按 bundle.settlementTier 收 ——
+        // 「四星档的钱住三星店」系统完全不知情。现在把两套口径对上：
+        //   · AGENT / CUSTOMER / 游客 → 直接拒单（对外身份没有越权定价的口子）；
+        //   · ADMIN / STAFF → 必须带非空放行原因才过，放行写 WARNING 审计（谁放的、为什么放）。
+        // 不适用的两种情形（无基准可比，不是「放行」而是「本就不该判」）：
+        //   · 套餐没配 settlementTier（不走结算价日历的老套餐）；
+        //   · 指到的是随机档**占位酒店**（不是真房源，业务上等同未落位随机单）。
+        if (
+          starGate &&
+          designatedRoomType &&
+          designatedRoomType.randomTierPlaceholder == null &&
+          bundle.settlementTier != null &&
+          isSettlementTierStarMismatch(bundle.settlementTier, designatedRoomType)
+        ) {
+          const tier = bundle.settlementTier;
+          const isOperator =
+            starGate.role === UserRole.ADMIN || starGate.role === UserRole.STAFF;
+          const reason = item.designatedHotelStarMismatchReason?.trim();
+          if (!isOperator) {
+            throw new BadRequestError(buildStarMismatchMessage(tier, designatedRoomType));
+          }
+          if (!reason) {
+            throw new BadRequestError(
+              `${buildStarMismatchMessage(tier, designatedRoomType)}。` +
+                '如确需按此酒店成交，请填写放行原因（将留档备查）。',
+            );
+          }
+          starGate.overrides.push({
+            bundleId: item.bundleId,
+            bundleName: bundle.name ?? null,
+            bundleTier: tier,
+            bundleTierStar: SETTLEMENT_TIER_STAR_RATING[tier],
+            hotelRoomTypeId: designatedRoomType.id,
+            hotelId: designatedRoomType.hotelId,
+            hotelName: designatedRoomType.hotelName,
+            hotelStarRating: designatedRoomType.starRating,
+            hotelIntlFiveStar: designatedRoomType.intlFiveStar,
+            reason,
+          });
         }
 
         // ── 乘客级「住宿方式 + 签证」派生（0713 反馈批：购物车模式，每人各选自己的码）──
@@ -2894,27 +3064,17 @@ export class OrderService {
         //   非 HOTEL 地面行（TRANSFER/VISA 等）固定 unitPrice×qty×1（不随房间数变）。
         //   bundleGround = Σ(HOTEL×rooms) + Σ(其它非机票)。折扣不在此扣 —— 改由循环后的
         //   percent-off 后处理对「机票腿 + 套餐行」整体 ×(1−discountPct/100)（旧的固定 groundDiscount 已弃用）。
-        const bundleItems = (bundle.items as Array<{ kind: string; qty: number; unitPrice: number }>) ?? [];
         // 签证按「办签人数」收费（S2）：办签人数 = 出行总人数(headCount，含婴儿，都需护照/签证)
         //   − 自备签人数（自行办妥签证的乘客）。headCount 基数与 computeBundleAddOn 里 selfProvidedVisaCount
         //   的夹逼基数（occupancy.headCount，含婴儿）完全一致，两处同源不漂移。夹到 ≥0（自备签人数超过出行人
         //   时不出现负份）。修复前 VISA 行按模板静态 qty×unitPrice 收（2 成人只收 1 份）→ 真少收。
         const visaHeadCount = Math.max(0, occupancy.headCount - selfProvidedVisaCount);
-        const groundTotal = bundleItems
-          .filter((b) => b.kind !== 'FLIGHT')
-          .reduce((s, b) => {
-            if (b.kind === 'HOTEL') {
-              const nightlyPrice = linkedHotelNightlyPrice ?? b.unitPrice;
-              return s + b.qty * nightlyPrice * rooms;
-            }
-            if (b.kind === 'VISA') {
-              // 每份签证单价（unitPrice 写入时已由 products.service 覆盖为 Visa.basePrice/人）× 办签人数。
-              return s + visaHeadCount * b.unitPrice;
-            }
-            // TRANSFER 等：固定 qty×unitPrice（整车/整趟计价，按趟不按人头，不随人数缩放）。
-            return s + b.qty * b.unitPrice;
-          }, 0);
-        const bundleUnitPrice = Math.max(0, Math.round(groundTotal));
+        const bundleUnitPrice = computeBundleGroundTotal({
+          components: bundle.items,
+          linkedHotelNightlyPrice,
+          rooms,
+          visaHeadCount,
+        });
         // 套餐关联酒店 → 把房型+入住日期盖到订单行（房控板自动计入套餐占房）。
         // metadata 缺失/异常时只是不盖章，绝不阻断下单。
         // 出发日以真实航段为准（A7）：有同 bundle 航段时覆盖客户端传来的 goDate，
@@ -4434,6 +4594,7 @@ export class OrderService {
             singleRoom: passenger.singleRoom,
             businessUpgrade: passenger.businessUpgrade,
             designatedHotelRoomTypeId: passenger.designatedHotelRoomTypeId,
+            designatedHotelStarMismatchReason: passenger.designatedHotelStarMismatchReason,
           });
 
         // OTA 手动结算价按每张子单的实际权威价计算；BUNDLE 的生日/行级选项可能使各子单系统价不同。
@@ -7728,6 +7889,8 @@ export class OrderService {
       };
       feeCny: number;
       untrackedNights: string[];
+      /** 非空 = 本次换酒店越过了「套餐档次 ↔ 酒店星级」闸（调用方据此另写一条 WARNING 审计）。 */
+      starMismatchOverride: DesignatedHotelStarMismatchOverride | null;
     };
   }> {
     if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
@@ -7745,6 +7908,8 @@ export class OrderService {
         quantity: true,
         hotelRoomTypeId: true,
         randomStarTier: true,
+        // BUNDLE 行的套餐归属：换入酒店的星级要与该套餐的结算档次比对（星级不匹配闸）。
+        bundleId: true,
         hotelCheckIn: true,
         hotelCheckOut: true,
         roomsBilled: true,
@@ -7791,7 +7956,17 @@ export class OrderService {
           hotelId: true,
           // 新房型成本价 → 重打 HOTEL 行成本快照（每间每晚 × 晚数 × 房数）。
           costPriceCny: true,
-          hotel: { select: { name: true, isActive: true, starRating: true } },
+          hotel: {
+            select: {
+              name: true,
+              isActive: true,
+              starRating: true,
+              // 星级不匹配闸：国际五星与市区五星是两个档（另行报价），要分得开；
+              // 占位酒店不是真房源，不参与本闸。
+              intlFiveStar: true,
+              randomTierPlaceholder: true,
+            },
+          },
         },
       }),
     ]);
@@ -7813,6 +7988,43 @@ export class OrderService {
       throw new BadRequestError(
         `${randomStarTierLabel(pendingTier)}只能落到 ${pendingTier} 星及以上的酒店（所选酒店为 ${newRoomType.hotel.starRating} 星）`,
       );
+    }
+
+    // ── 套餐行的星级不匹配闸（口径与录单指定酒店同一份映射，见 SETTLEMENT_TIER_STAR_RATING）──
+    // 套餐行的钱是按 Bundle.settlementTier 收的；售后把住宿换到别的档次而系统不知情，
+    // 就等于「四星档的钱住三星店」从售后口子溜进来。本端点只有 ADMIN/STAFF 可达，
+    // 故没有硬拒分支 —— 一律「必须写明原因才放行」，放行写 WARNING 审计。
+    // 已落位低星的存量单不追溯：本闸只在**本次换入**的酒店上判定。
+    let starMismatchOverride: DesignatedHotelStarMismatchOverride | null = null;
+    if (item.kind === OrderItemKind.BUNDLE && item.bundleId && newRoomType.hotel.randomTierPlaceholder == null) {
+      const swapBundle = await prisma.bundle.findUnique({
+        where: { id: item.bundleId },
+        select: { id: true, name: true, settlementTier: true },
+      });
+      if (
+        swapBundle?.settlementTier != null &&
+        isSettlementTierStarMismatch(swapBundle.settlementTier, newRoomType.hotel)
+      ) {
+        const reason = input.designatedHotelStarMismatchReason?.trim();
+        if (!reason) {
+          throw new BadRequestError(
+            `${buildStarMismatchMessage(swapBundle.settlementTier, newRoomType.hotel)}。` +
+              '如确需换到该酒店，请填写放行原因（将留档备查）。',
+          );
+        }
+        starMismatchOverride = {
+          bundleId: swapBundle.id,
+          bundleName: swapBundle.name ?? null,
+          bundleTier: swapBundle.settlementTier,
+          bundleTierStar: SETTLEMENT_TIER_STAR_RATING[swapBundle.settlementTier],
+          hotelRoomTypeId: newRoomType.id,
+          hotelId: newRoomType.hotelId,
+          hotelName: newRoomType.hotel.name,
+          hotelStarRating: newRoomType.hotel.starRating ?? null,
+          hotelIntlFiveStar: newRoomType.hotel.intlFiveStar === true,
+          reason,
+        };
+      }
     }
 
     // ── 逐晚余量校验（仅跨酒店换房时才需要；同酒店换房型净房量不变，不受本单占用影响）──
@@ -8109,6 +8321,7 @@ export class OrderService {
         },
         feeCny,
         untrackedNights: scratch.untrackedNights,
+        starMismatchOverride,
       },
     };
   }
@@ -9352,6 +9565,568 @@ export class OrderService {
       },
     };
   }
+
+  // ════════════════════════════════════════════════════════════════════
+  // 售后改单：套餐改档（POST /orders/:id/change-bundle · ADMIN/STAFF）
+  //
+  // 行业口径 = amendment：**改档 → 按新档重新计价 → 差价入账 → 审计**。
+  // 数据模型上「档次」不是套餐的一个可改字段，而是另一条 Bundle 记录
+  // （settlementTier / settlementNights 都挂在 Bundle 上），所以改档 = 把订单的 BUNDLE 行换绑。
+  // 此前系统没有这个动作：运营只能「换酒店 + 手工调价」拼出来，钱与货各改各的、对不上账。
+  //
+  // 定价哲学（与换酒店 / 酒店改期同一套）：**行价冻结 + 差额入账**。
+  //   · BUNDLE 行只换绑（bundleId / 行描述 / 随档次派生的住宿区间与间数），金额一个字不动；
+  //   · 「新应收 − 原应收」落一条 bundleChange 差额行（正=补收、负=优惠），
+  //     订单 subtotal/total 按 Σ items 收敛；
+  //   · **已收款项一分不动** —— 尾款/多收自然浮动（应付 = total + adjustmentCny，收款账不参与）。
+  //
+  // 新应收的两条取价通道（与录单完全同源，不另起炉灶）：
+  //   a) 代理单 + 新套餐配了结算价日历键（档次 + 晚数）→ 走结算价日历：
+  //      每人价（新档 × 新晚数 × 本单去程出发日）× 人数 + 加项净额 − 命中的代理立减；
+  //      取不到当日价 → 拒单（口径同录单：宁可不改，也不按错价成交）。
+  //   b) 其余 → 本地权威价管道：新套餐地面价 + 加项 + 操作费，再按新套餐 discountPct 打折；
+  //      新应收 = 原应收 + （新套餐行价 − 旧套餐行价）。
+  //
+  // 硬边界（改档不碰的东西）：
+  //   · 机票行 / 班次 / 座位一律不动 —— 改档不改航班，绝不在此触碰任何占座链路；
+  //   · 升舱行若与旧套餐档次绑定，同样保持不动（响应 warnings 提示人工复核）；
+  //   · 指定酒店及其加价随本次改档清除（新档的酒店要重新指定，响应 warnings 提示）。
+  // ════════════════════════════════════════════════════════════════════
+  async changeOrderBundle(
+    orderId: string,
+    input: ChangeOrderBundleBody,
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
+    order: ReturnType<typeof serializeOrder>;
+    audit: {
+      orderNumber: string;
+      orderItemId: string;
+      before: {
+        bundleId: string;
+        bundleName: string | null;
+        settlementTier: SettlementTier | null;
+        settlementNights: number | null;
+        total: string;
+      };
+      after: {
+        bundleId: string;
+        bundleName: string | null;
+        settlementTier: SettlementTier | null;
+        settlementNights: number | null;
+        total: string;
+      };
+      diffCny: number;
+      diffItemId: string | null;
+      pricingSource: 'SETTLEMENT_CALENDAR' | 'BUNDLE_PRICE';
+      note: string | null;
+      warnings: string[];
+    };
+  }> {
+    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+      throw new ForbiddenError('仅运营/管理员可更改套餐档次');
+    }
+    const note = input.note?.trim() || null;
+
+    // ── 0. 事务外只读预取 + 前置校验（长事务只留写操作）────────────────────
+    const order = await prisma.order.findUnique({
+      where: { id: orderId },
+      select: {
+        id: true,
+        orderNumber: true,
+        status: true,
+        deletedAt: true,
+        agentId: true,
+        total: true,
+        items: {
+          select: {
+            id: true,
+            kind: true,
+            quantity: true,
+            amount: true,
+            bundleId: true,
+            hotelRoomTypeId: true,
+            hotelCheckIn: true,
+            hotelCheckOut: true,
+            visaIntendedDate: true,
+            metadata: true,
+            // 「已落位」判定：房型挂在随机档占位酒店上 = 还没落位（业务上仍是随机档）。
+            hotelRoomType: {
+              select: { hotel: { select: { name: true, randomTierPlaceholder: true } } },
+            },
+            // 整单出发日派生（deriveOrderDepartDate 同口径，按出发地当地日折算）。
+            flightSchedule: { select: { departureTime: true, departureTz: true } },
+          },
+        },
+      },
+    });
+    if (!order) throw new NotFoundError('订单不存在');
+    if (order.deletedAt) {
+      throw new BadRequestError('订单在回收站（已软删），不可改档；如需操作请先恢复');
+    }
+    // 状态守卫与换酒店 / 酒店改期同一集合：改档会改应收（长出/减掉一笔差额），
+    // 在已取消 / 已退款 / 超时 / 草稿单上做，等于给死单凭空改账、能被算出二次退款。
+    if (!SEAT_HOLDING_STATUSES.includes(order.status)) {
+      throw new BadRequestError(
+        `订单当前状态（${zhStatus(order.status)}）不可改档：仅占座中的有效订单可改档（已取消/已退款/超时订单请勿改档）`,
+      );
+    }
+
+    const bundleRows = order.items.filter((it) => it.kind === OrderItemKind.BUNDLE);
+    if (bundleRows.length === 0) {
+      throw new BadRequestError('本单不含套餐行，无法改档');
+    }
+    if (bundleRows.length > 1) {
+      // 多套餐单改档「改哪一张」无从判定，且差额口径会分叉 —— 明确拒绝，不猜。
+      throw new BadRequestError('本单含多条套餐行，暂不支持自动改档，请联系技术处理');
+    }
+    const bundleRow = bundleRows[0];
+    if (!bundleRow.bundleId) {
+      throw new BadRequestError('该套餐行未关联套餐产品，无法改档');
+    }
+    if (bundleRow.bundleId === input.bundleId) {
+      throw new BadRequestError('目标套餐与当前套餐相同，无需改档');
+    }
+
+    // ── 已落位闸 ───────────────────────────────────────────────────────────
+    // 落位 = 住宿已盖章到**真实**酒店（房型所属酒店不是随机档占位酒店）。此时改档会让
+    // 「客人已经确定住哪」与「新档次该住哪」直接打架 —— 住宿要先走换酒店流程处理掉，
+    // 改档只负责钱与档次。未落位（仍是随机档占位）或无酒店组件才允许。
+    const isSettledRow = (row: {
+      hotelRoomTypeId: string | null;
+      hotelRoomType?: { hotel: { randomTierPlaceholder: number | null } } | null;
+    }): boolean =>
+      row.hotelRoomTypeId != null && row.hotelRoomType?.hotel.randomTierPlaceholder == null;
+    const settledRow =
+      (isSettledRow(bundleRow) ? bundleRow : null) ??
+      order.items.find((it) => it.kind === OrderItemKind.HOTEL && isSettledRow(it)) ??
+      null;
+    if (settledRow) {
+      throw new BadRequestError('本单酒店已落位，请先通过换酒店功能处理住宿再改档');
+    }
+
+    const newBundle = await prisma.bundle.findUnique({
+      where: { id: input.bundleId },
+      select: CHANGE_BUNDLE_PRICING_SELECT,
+    });
+    if (!newBundle) throw new NotFoundError(`套餐 ${input.bundleId} 不存在`);
+    if (!newBundle.isActive) throw new BadRequestError('目标套餐已下架');
+    const oldBundle = await prisma.bundle.findUnique({
+      where: { id: bundleRow.bundleId },
+      select: { id: true, name: true, settlementTier: true, settlementNights: true },
+    });
+
+    // ── 计价输入：一律沿用**原单已盖章的快照**，保证差额只反映「档次变了」这一件事 ──
+    // 优先级：行 metadata.addOns（下单时的权威重算快照，含三计数 / 单住 / 分程升舱 / 自备签人数）
+    //        → metadata / quantity 的旧口径回落（老单没有 addOns 快照时）。
+    const rowMetadata = (bundleRow.metadata ?? {}) as Record<string, unknown>;
+    const addOnSnapshot = rowMetadata.addOns as Partial<BundleAddOnBreakdown> | undefined;
+    const occupancy =
+      addOnSnapshot && typeof addOnSnapshot.adultCount === 'number'
+        ? resolveBundleOccupancy({
+            adultCount: addOnSnapshot.adultCount,
+            childCount: addOnSnapshot.childCount ?? 0,
+            infantCount: addOnSnapshot.infantCount ?? 0,
+            quantity: bundleRow.quantity,
+          })
+        : resolveBundleOccupancy({ quantity: bundleRow.quantity, metadata: rowMetadata });
+    const singleCount = Math.max(0, Math.trunc(Number(addOnSnapshot?.singleCount ?? 0) || 0));
+    const selfProvidedVisaCount = Math.max(
+      0,
+      Math.trunc(Number(addOnSnapshot?.selfProvidedVisaCount ?? 0) || 0),
+    );
+    const businessSplit: BundleBusinessUpgradeSplit = {
+      outbound: Math.max(0, Math.trunc(Number(addOnSnapshot?.businessCountOutbound ?? 0) || 0)),
+      return: Math.max(0, Math.trunc(Number(addOnSnapshot?.businessCountReturn ?? 0) || 0)),
+    };
+
+    // 出发日：整单口径（最早航段的出发地当地日 → 酒店入住日 → 签证预计出行日），与列表列同源。
+    const departYmd = deriveOrderDepartDate(order.items as Array<Record<string, unknown>>);
+
+    const priced = computeChangedBundleLine({
+      bundle: newBundle,
+      occupancy,
+      singleCount,
+      businessSplit,
+      selfProvidedVisaCount,
+      quantity: bundleRow.quantity,
+      goDate: departYmd,
+    });
+
+    // ── 新应收 ─────────────────────────────────────────────────────────────
+    const oldTotalCny = Number(order.total.toString());
+    const oldBundleAmountCny = Number(bundleRow.amount.toString());
+    let pricingSource: 'SETTLEMENT_CALENDAR' | 'BUNDLE_PRICE' = 'BUNDLE_PRICE';
+    let newTotalCny = round2(oldTotalCny + (priced.amount - oldBundleAmountCny));
+    if (
+      order.agentId &&
+      newBundle.settlementTier != null &&
+      newBundle.settlementNights != null
+    ) {
+      if (!departYmd) {
+        throw new BadRequestError(
+          '目标套餐已配置结算价日历，但本单无法确定出发日期取价，请先补全航段或联系运营',
+        );
+      }
+      const rate = await getSettlementRate(
+        newBundle.settlementTier,
+        newBundle.settlementNights,
+        departYmd,
+      );
+      if (!rate) {
+        throw new BadRequestError('该出发日期在目标档次下的结算价未维护，请联系运营');
+      }
+      // 日历价是「基础随机套餐」的每人同业价，加项按报价口径叠加其上（与录单 resolveBundleSettlementCalendarTotal
+      // 完全同一公式）。指定酒店加价已随改档清除，故此处加项净额只有 addOn.total。
+      let calendarTotal = round2(
+        rate.pricePerPersonCny * occupancy.headCount + priced.settlementAddOnCny,
+      );
+      const discountHit = await resolveAgentSettlementDiscount(
+        order.agentId,
+        newBundle.settlementTier,
+        newBundle.settlementNights,
+        departYmd,
+      );
+      if (discountHit) {
+        calendarTotal = round2(
+          calendarTotal - discountHit.discountPerPersonCny * occupancy.headCount,
+        );
+      }
+      if (calendarTotal <= 0) {
+        throw new BadRequestError('按目标档次取价后的结算价异常（≤0），请检查结算价日历与立减规则');
+      }
+      pricingSource = 'SETTLEMENT_CALENDAR';
+      newTotalCny = calendarTotal;
+    }
+
+    const diffCny = round2(newTotalCny - oldTotalCny);
+    if (Math.abs(diffCny) > PRICE_ADJUSTMENT_CAP_CNY) {
+      throw new BadRequestError(
+        `改档差额 ¥${Math.abs(diffCny)} 超出调价上限（±¥${PRICE_ADJUSTMENT_CAP_CNY}），请复核目标套餐与结算价`,
+      );
+    }
+
+    // 人工复核提示（不阻断，随响应回给运营）。
+    const warnings: string[] = [];
+    if (rowMetadata.designatedHotel) {
+      warnings.push('原「指定酒店」及其加价已随本次改档清除，请按新档次重新指定酒店');
+    }
+    if ((businessSplit.outbound ?? 0) > 0 || (businessSplit.return ?? 0) > 0) {
+      warnings.push('本单含升舱，升舱行与占座一律未改动，请人工复核升舱差价是否仍适用新档次');
+    }
+    if (!priced.hotelStamp && newBundle.hotelRoomTypeId) {
+      warnings.push('未能推导出新的住宿区间（缺出发日期），住宿日期未盖章，请人工补录');
+    }
+
+    // ── 1. 事务：换绑 + 差额行 + 总额收敛 ───────────────────────────────────
+    const scratch = await prisma.$transaction(async (tx) => {
+      // 行锁：与换酒店/换人/调价同一份读-改-写（total / 差额行），必须串行。
+      const lockRows = await tx.$queryRaw<Array<{ id: string }>>`
+        SELECT id FROM "Order" WHERE id = ${orderId} FOR UPDATE
+      `;
+      if (lockRows.length === 0) throw new NotFoundError('订单不存在');
+
+      const locked = await tx.order.findUnique({
+        where: { id: orderId },
+        select: {
+          id: true,
+          orderNumber: true,
+          status: true,
+          deletedAt: true,
+          subtotal: true,
+          total: true,
+          adjustments: true,
+          items: { select: { id: true, amount: true, bundleId: true } },
+        },
+      });
+      if (!locked) throw new NotFoundError('订单不存在');
+      // 锁后复检（读的是刚 FOR UPDATE 的那一行，与并发状态流转严格串行）。
+      assertOrderAcceptsFunds(locked);
+      if (!SEAT_HOLDING_STATUSES.includes(locked.status)) {
+        throw new BadRequestError(
+          `订单当前状态（${zhStatus(locked.status)}）不可改档：仅占座中的有效订单可改档`,
+        );
+      }
+      // CAS：锁前读到的套餐行若已被并发改档换掉，本次按旧快照算出的差额就不成立 → 让调用方重试。
+      const lockedRow = locked.items.find((it) => it.id === bundleRow.id);
+      if (!lockedRow || lockedRow.bundleId !== bundleRow.bundleId) {
+        throw new ConflictError('该订单的套餐行已被其他操作更改，请刷新后重试');
+      }
+      // 总额基准同样以锁内值为准（锁前后 total 可能已被并发调价改动）。
+      const lockedTotalCny = Number(locked.total.toString());
+      const lockedDiffCny = round2(newTotalCny - lockedTotalCny);
+      if (Math.abs(lockedDiffCny) > PRICE_ADJUSTMENT_CAP_CNY) {
+        throw new BadRequestError(
+          `改档差额 ¥${Math.abs(lockedDiffCny)} 超出调价上限（±¥${PRICE_ADJUSTMENT_CAP_CNY}），请复核目标套餐与结算价`,
+        );
+      }
+
+      // 1a. 套餐行换绑（金额冻结；只改「买的是哪张套餐」与随档次派生的住宿字段）。
+      //     指定酒店留痕从 metadata 里摘掉 —— 那是旧档次下的选择，新档要重新指定。
+      const {
+        designatedHotel: _clearedDesignatedHotel,
+        ...metadataWithoutDesignated
+      } = rowMetadata as Record<string, unknown> & { designatedHotel?: unknown };
+      await tx.orderItem.update({
+        where: { id: bundleRow.id },
+        data: {
+          bundleId: newBundle.id,
+          description: newBundle.name,
+          // 未落位随机档：房型跟着新套餐走（新套餐没绑房型 → 清空，等房控落位）。
+          hotelRoomTypeId: priced.hotelStamp?.hotelRoomTypeId ?? null,
+          hotelCheckIn: priced.hotelStamp?.hotelCheckIn ?? null,
+          hotelCheckOut: priced.hotelStamp?.hotelCheckOut ?? null,
+          // 房控是派生账：新档的容量/晚数变了，占房必须跟着变，否则销控板与真账分叉。
+          roomsBilled: new Prisma.Decimal(priced.rooms),
+          metadata: {
+            ...metadataWithoutDesignated,
+            roomsNeeded: priced.rooms,
+            addOns: priced.addOn.breakdown,
+            // 改档留痕（旧档 → 新档、取价来源、差额、原因）：这一行为什么现在长这样，看它就够了。
+            bundleChange: {
+              fromBundleId: bundleRow.bundleId,
+              fromBundleName: oldBundle?.name ?? null,
+              fromSettlementTier: oldBundle?.settlementTier ?? null,
+              fromSettlementNights: oldBundle?.settlementNights ?? null,
+              toBundleId: newBundle.id,
+              toBundleName: newBundle.name,
+              toSettlementTier: newBundle.settlementTier ?? null,
+              toSettlementNights: newBundle.settlementNights ?? null,
+              pricingSource,
+              diffCny: lockedDiffCny,
+              reasonText: note,
+              at: new Date().toISOString(),
+              by: actor.userId,
+            },
+          } as unknown as Prisma.InputJsonValue,
+        },
+      });
+
+      // 1b. 差额行（正=补收 FEE、负=优惠 DISCOUNT）。差额为 0 时不建行（改档本身仍留审计）。
+      let diffItemId: string | null = null;
+      if (lockedDiffCny !== 0) {
+        const signed = `${lockedDiffCny > 0 ? '+' : '−'}¥${Math.abs(lockedDiffCny)}`;
+        const created = await tx.orderItem.create({
+          data: {
+            orderId,
+            kind: lockedDiffCny > 0 ? OrderItemKind.FEE : OrderItemKind.DISCOUNT,
+            description:
+              `套餐改档差额：${oldBundle?.name ?? '原套餐'} → ${newBundle.name}（${signed}）` +
+              (note ? `：${note}` : ''),
+            quantity: 1,
+            unitPrice: new Prisma.Decimal(lockedDiffCny),
+            amount: new Prisma.Decimal(lockedDiffCny),
+            // 纯价格调整行无采购成本 → 显式落 0（口径同 buildPriceAdjustmentItem），不留 NULL 污染毛利。
+            totalCostCny: new Prisma.Decimal(0),
+            metadata: {
+              // priceAdjustment 标：让「按乘客/整单调整明细」等既有展示口径认得这一行。
+              priceAdjustment: true,
+              bundleChange: true,
+              reasonCode: 'SETTLEMENT',
+              reasonText: note,
+              fromBundleId: bundleRow.bundleId,
+              toBundleId: newBundle.id,
+              pricingSource,
+            } as Prisma.InputJsonValue,
+          },
+        });
+        diffItemId = created.id;
+      }
+
+      // 1c. 总额收敛：subtotal/total = Σ 所有行金额（含刚换绑的套餐行与差额行）。
+      //     已收款一分不动 —— 尾款/多收由「应付 − 已收」自然浮动。
+      const sumAfter = await tx.orderItem.aggregate({
+        where: { orderId },
+        _sum: { amount: true },
+      });
+      const newSubtotal = round2(Number(sumAfter._sum.amount?.toString() ?? '0'));
+      const log = appendAdjustment(locked.adjustments, {
+        type: 'BUNDLE_CHANGE',
+        label: `套餐改档：${oldBundle?.name ?? '原套餐'} → ${newBundle.name}`,
+        amountCny: lockedDiffCny,
+        at: new Date().toISOString(),
+        by: actor.userId,
+        reasonCode: 'SETTLEMENT',
+        ...(note ? { note } : {}),
+      });
+      await tx.order.update({
+        where: { id: orderId },
+        data: {
+          subtotal: new Prisma.Decimal(newSubtotal),
+          total: new Prisma.Decimal(newSubtotal),
+          adjustments: log,
+        },
+      });
+
+      return {
+        orderNumber: locked.orderNumber,
+        beforeTotal: locked.total.toString(),
+        afterTotal: newSubtotal.toString(),
+        diffCny: lockedDiffCny,
+        diffItemId,
+      };
+    });
+
+    const finalOrder = await prisma.order.findUniqueOrThrow({
+      where: { id: orderId },
+      include: ORDER_FULL_INCLUDE,
+    });
+
+    return {
+      order: serializeOrder(finalOrder, orderSerializeRoleCtx(actor.role)),
+      audit: {
+        orderNumber: scratch.orderNumber,
+        orderItemId: bundleRow.id,
+        before: {
+          bundleId: bundleRow.bundleId,
+          bundleName: oldBundle?.name ?? null,
+          settlementTier: oldBundle?.settlementTier ?? null,
+          settlementNights: oldBundle?.settlementNights ?? null,
+          total: scratch.beforeTotal,
+        },
+        after: {
+          bundleId: newBundle.id,
+          bundleName: newBundle.name,
+          settlementTier: newBundle.settlementTier ?? null,
+          settlementNights: newBundle.settlementNights ?? null,
+          total: scratch.afterTotal,
+        },
+        diffCny: scratch.diffCny,
+        diffItemId: scratch.diffItemId,
+        pricingSource,
+        note,
+        warnings,
+      },
+    };
+  }
+}
+
+/**
+ * 改档重新计价所需的套餐字段（与录单 priceAndValidateItems 的 BUNDLE 分支同一组，
+ * 少一个字段就会出现「录单算出一个价、改档算出另一个价」的漂移）。
+ */
+const CHANGE_BUNDLE_PRICING_SELECT = {
+  id: true,
+  name: true,
+  isActive: true,
+  items: true,
+  discountPct: true,
+  hotelRoomTypeId: true,
+  hotelNights: true,
+  singleSupplementCnyPerNight: true,
+  businessUpgradeCnyPerLeg: true,
+  outboundFlight: { select: { businessUpgradeCnyPerLeg: true } },
+  returnFlight: { select: { businessUpgradeCnyPerLeg: true } },
+  childSeatDiscountCnyPerPerson: true,
+  infantPriceCny: true,
+  selfVisaDeductCny: true,
+  operationFeeCny: true,
+  legs: true,
+  settlementTier: true,
+  settlementNights: true,
+  hotelRoomType: { select: { maxAdults: true, maxChildren: true, basePrice: true, hotelId: true } },
+} as const;
+
+/**
+ * 套餐改档后的行价重算 —— 与录单 BUNDLE 分支共用同一批权威纯函数
+ * （resolveBundleNights / computeBundleRoomsCharged / computeBundleGroundTotal /
+ *   resolveBundleHotelStamp / computeBundleAddOn / computeBundleOperationFeeTotal），
+ * 只是把「客户端传来的行输入」换成「原单已盖章的快照」。
+ *
+ * 与录单唯一的口径差异：**指定酒店加价恒为 0** —— 指定酒店随改档清除（新档要重新指定），
+ * 这一点在 changeOrderBundle 的响应 warnings 里明确告知运营。
+ *
+ * 导出供单测使用。
+ */
+export function computeChangedBundleLine(input: {
+  bundle: {
+    items: unknown;
+    discountPct: number | null;
+    hotelRoomTypeId: string | null;
+    hotelNights: number | null;
+    singleSupplementCnyPerNight: number;
+    businessUpgradeCnyPerLeg: number | null;
+    outboundFlight?: { businessUpgradeCnyPerLeg: number } | null;
+    returnFlight?: { businessUpgradeCnyPerLeg: number } | null;
+    childSeatDiscountCnyPerPerson: number;
+    infantPriceCny: number;
+    selfVisaDeductCny: number;
+    operationFeeCny: number;
+    legs: number;
+    hotelRoomType?: { maxAdults: number; maxChildren: number; basePrice: Prisma.Decimal | number } | null;
+  };
+  occupancy: BundleOccupancy;
+  singleCount: number;
+  businessSplit: BundleBusinessUpgradeSplit;
+  selfProvidedVisaCount: number;
+  quantity: number;
+  /** 出发日（YYYY-MM-DD）；缺失 → 不盖住宿区间的章。 */
+  goDate: string | null;
+}): {
+  /** 打折后的套餐行金额（CNY，整数，≥0）。 */
+  amount: number;
+  /** 打折后的套餐行单价（地面价口径）。 */
+  unitPrice: number;
+  rooms: number;
+  nights: number;
+  hotelStamp: { hotelRoomTypeId: string; hotelCheckIn: Date; hotelCheckOut: Date } | null;
+  addOn: ReturnType<typeof computeBundleAddOn>;
+  /** 加项净额（未打折）：结算价日历取价时叠加在日历价之上。 */
+  settlementAddOnCny: number;
+} {
+  const { bundle, occupancy, singleCount, businessSplit, selfProvidedVisaCount, quantity } = input;
+  const nights = resolveBundleNights(bundle.items, bundle.hotelNights);
+  const rooms = computeBundleRoomsCharged({
+    occupancy,
+    capacity: bundle.hotelRoomType ?? null,
+    hotelRoomTypeId: bundle.hotelRoomTypeId,
+    singleCount,
+    // 改档不接受客户端间数：新档的容量口径由新套餐房型决定，一律服务端重算。
+    clientRoomsBilled: undefined,
+  });
+  const linkedHotelNightlyPrice =
+    bundle.hotelRoomTypeId && bundle.hotelRoomType
+      ? Number(bundle.hotelRoomType.basePrice.toString())
+      : null;
+  const visaHeadCount = Math.max(0, occupancy.headCount - selfProvidedVisaCount);
+  const groundUnitPrice = computeBundleGroundTotal({
+    components: bundle.items,
+    linkedHotelNightlyPrice,
+    rooms,
+    visaHeadCount,
+  });
+  const hotelStamp = resolveBundleHotelStamp(
+    { hotelRoomTypeId: bundle.hotelRoomTypeId },
+    input.goDate ? { goDate: input.goDate } : undefined,
+    nights,
+  );
+  const addOn = computeBundleAddOn(
+    { ...bundle, businessUpgradeCnyPerLeg: resolveBundleBusinessUpgradeRate(bundle) },
+    hotelStamp,
+    singleCount,
+    businessSplit,
+    occupancy,
+    nights,
+    selfProvidedVisaCount,
+  );
+  const operationFeeTotal = computeBundleOperationFeeTotal(bundle.operationFeeCny, occupancy.seatPax);
+  // 非负保护与录单同一层：减免（自备签/儿童折扣）先抵扣地面价 + 操作费，极端情况才夹到 0。
+  let amount = Math.max(0, groundUnitPrice * quantity + addOn.total + operationFeeTotal);
+  let unitPrice = groundUnitPrice;
+  const pct = bundle.discountPct ?? 0;
+  if (pct > 0) {
+    const factor = (100 - pct) / 100;
+    amount = Math.round(amount * factor);
+    unitPrice = Math.round(unitPrice * factor);
+  }
+  return {
+    amount,
+    unitPrice,
+    rooms,
+    nights,
+    hotelStamp,
+    addOn,
+    settlementAddOnCny: addOn.total,
+  };
 }
 
 // 完整 include 给 serializeOrder 用
@@ -10065,6 +10840,47 @@ export function splitSettlementPriceAcrossLegs(
     // 余数全给第一段：合计精确等于整程价，且不会出现「每段都多一分」的累积漂移。
     ((i === 0 ? baseCents + remainderCents : baseCents) / 100),
   );
+}
+
+/**
+ * 套餐「地面部分」权威价（CNY，整数，≥0）—— 录单与售后改档共用的单一口径。
+ *
+ *   HOTEL 组件（qty=晚数）  = 每间每晚价 × qty × rooms  → 套餐价随房间数涨；
+ *     每间每晚价 = linkedHotelNightlyPrice（套餐绑定房型的 basePrice，服务端权威）优先，
+ *     回退 components JSON 里的 unitPrice（未绑房型的老套餐才会走到）。
+ *     绝不无条件信任 JSON 里的 unitPrice：历史上那可能是占位/过时的畸低值，
+ *     会把套餐酒店部分算成几元、整单总价崩塌。
+ *   VISA 组件           = 每份单价 × 办签人数（visaHeadCount，已扣自备签人数）。
+ *   TRANSFER 等其它组件  = qty × unitPrice（整车/整趟计价，不随人数缩放）。
+ *   FLIGHT 组件不计      = 机票由 FLIGHT 行单独动态定价。
+ *
+ * 套餐折扣（percent-off）不在此扣 —— 由调用方在行金额层统一处理。
+ */
+export function computeBundleGroundTotal(input: {
+  /** Bundle.items（JSON）；非数组一律按空处理，绝不因脏数据抛错。 */
+  components: unknown;
+  linkedHotelNightlyPrice: number | null;
+  rooms: number;
+  visaHeadCount: number;
+}): number {
+  const components = Array.isArray(input.components)
+    ? (input.components as Array<{ kind: string; qty: number; unitPrice: number }>)
+    : [];
+  const groundTotal = components
+    .filter((b) => b && b.kind !== 'FLIGHT')
+    .reduce((s, b) => {
+      if (b.kind === 'HOTEL') {
+        const nightlyPrice = input.linkedHotelNightlyPrice ?? b.unitPrice;
+        return s + b.qty * nightlyPrice * input.rooms;
+      }
+      if (b.kind === 'VISA') {
+        // 每份签证单价（unitPrice 写入时已由 products.service 覆盖为 Visa.basePrice/人）× 办签人数。
+        return s + input.visaHeadCount * b.unitPrice;
+      }
+      // TRANSFER 等：固定 qty×unitPrice（整车/整趟计价，按趟不按人头，不随人数缩放）。
+      return s + b.qty * b.unitPrice;
+    }, 0);
+  return Math.max(0, Math.round(groundTotal));
 }
 
 export function resolveBundleHotelStamp(

@@ -431,6 +431,10 @@ export const bundleItemSchema = baseItemSchema.extend({
   // 服务端据此把占房/盖章切到指定房型，并按该酒店配置的「指定酒店加价 ¥/人」×占座人数
   // 加收（server-priced，客户端不传金额）。缺省 = 不指定，走套餐绑定房型/随机现状。
   designatedHotelRoomTypeId: z.string().min(1).optional(),
+  // 星级不匹配放行原因（仅 ADMIN/STAFF 有效）：指定酒店的星级与套餐结算档次对不上时，
+  // 代理/客户一律拒单；运营必须写明原因才放行，原因随审计留痕（谁放的、为什么放）。
+  // 匹配时传了也无副作用（不写审计）。
+  designatedHotelStarMismatchReason: z.string().trim().min(1).max(200).optional(),
 });
 
 // BUNDLE 行 metadata 里的出行信息（sales-web 购物车带过来，用于推导酒店入住日期）。
@@ -799,6 +803,9 @@ export const batchPassengerInputSchema = passengerInputWithRequiredExpirySchema.
   note: z.string().max(500).optional(),
   businessUpgrade: z.boolean().optional(),
   designatedHotelRoomTypeId: z.string().min(1).optional(),
+  // 星级不匹配放行原因（口径同 bundleItemSchema 同名字段）：批量名单里逐人指定酒店时，
+  // 该人的指定酒店与套餐档次对不上 → 必须写原因才放行（批量入口本就仅 ADMIN/STAFF 可达）。
+  designatedHotelStarMismatchReason: z.string().trim().min(1).max(200).optional(),
 });
 export type BatchPassengerInput = z.infer<typeof batchPassengerInputSchema>;
 
@@ -1110,6 +1117,9 @@ export const swapItemHotelBodySchema = z.object({
   feeCny: hotelSwapFeeSchema, // 换酒店差价（CNY，整数，可负；不填/不传=不调整价格）
   feeLabel: z.string().max(60).optional(), // 自定义费用名（缺省"换酒店差价"）
   note: z.string().max(200).optional(),
+  // 星级不匹配放行原因（字段名与录单口径 bundleItemSchema 一致，前端一套表单复用）：
+  // 换入酒店的星级与该 BUNDLE 行所属套餐的结算档次对不上 → 必须写原因才放行（审计留痕）。
+  designatedHotelStarMismatchReason: z.string().trim().min(1).max(200).optional(),
 });
 export type SwapItemHotelBody = z.infer<typeof swapItemHotelBodySchema>;
 
@@ -1127,6 +1137,19 @@ export const rescheduleItemHotelBodySchema = z.object({
   note: z.string().max(200).optional(),
 });
 export type RescheduleItemHotelBody = z.infer<typeof rescheduleItemHotelBodySchema>;
+
+// ── 售后改单：套餐改档（change bundle）──────────────────────────────────────
+// POST /orders/:id/change-bundle（ADMIN/STAFF）：把本单的套餐行换绑到另一张套餐
+// （行业口径 amendment：改档 → 按新档重新计价 → 差价入账 → 审计）。
+// 「档次」在数据模型上就是另一条 Bundle 记录（settlementTier / settlementNights 是 Bundle 的属性），
+// 故改档 = 换 bundleId，不是改某个字段。
+//   · note 同时进审计与差额行的调价原因（人眼可读地解释这笔差价）。
+//   · 机票行/班次/座位一律不动（改档不改航班）；酒店已落位到真实酒店的单先走换酒店。
+export const changeOrderBundleBodySchema = z.object({
+  bundleId: z.string().min(1, 'bundleId 必填'),
+  note: z.string().max(200).optional(),
+});
+export type ChangeOrderBundleBody = z.infer<typeof changeOrderBundleBodySchema>;
 
 // ── T5：更改订单归属代理（PATCH /orders/:id/agent；ADMIN/STAFF）─────────────────
 // 服务端硬守卫逐单校验；agentId=null（或空串归一为 null）= 转直客。
