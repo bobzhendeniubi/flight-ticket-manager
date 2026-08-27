@@ -2,8 +2,12 @@
  * 分房表导出（成都格式）— 每个入住日期一个 sheet（名 'M-D'，如 '7-10'），
  * sheet 内按酒店分组（自然按酒店名排序，组间不插空行），一行/乘客。
  *
- * 行来源：占房订单行（OrderItem 带 hotelRoomTypeId + hotelCheckIn，含已盖章
- * 酒店明细的 BUNDLE 行）；按订单分组后，每位乘客 correlate 到「他实际占用的那条占房 item」
+ * 行来源：占房订单行（OrderItem 带 hotelCheckIn，且 hotelRoomTypeId 与 randomStarTier 二者之一
+ * 非空，含已盖章酒店明细的 BUNDLE 行）。「星级随机」买了但还没落到具体酒店的行（hotelRoomTypeId
+ * 为空、randomStarTier 非空）同样上表 —— 行业 rooming list 口径：未落位也要上名单，酒店格与房型格
+ * 标「X星随机（待落位）」，一眼与已落位行区分（早先 where 要求 hotelRoomTypeId 非空，把这类整类
+ * 筛掉，运营侧表现为「酒店订单导不出来」）；
+ * 按订单分组后，每位乘客 correlate 到「他实际占用的那条占房 item」
  * （见 correlateItem）—— 一位乘客恰好一行，不对订单每条占房 item 都遍历全部乘客
  * （同订单多条占房 item 时旧实现会做 item × 乘客笛卡尔积，产生重复行 + 张冠李戴的房型/酒店组合，
  * 已修复，回归覆盖见 orders.export-room-allocation.test.ts）。
@@ -49,7 +53,8 @@ export interface RoomAllocationRow {
   seq: number;
   agency: string;
   notes: string;
-  hotelType: string; // 现状拼法：酒店名 · 房型名（口径缓办，维持不动）
+  // 现状拼法：酒店名 · 房型名（口径缓办，维持不动）；未落位的星级随机行 = 「X星随机（待落位）」
+  hotelType: string;
   chineseName: string;
   pnrName: string;
   /**
@@ -140,6 +145,76 @@ function toDateOnly(s: string): Date {
 function sheetNameForDate(date: string): string {
   const [, m, d] = date.split('-');
   return `${Number(m)}-${Number(d)}`;
+}
+
+/** randomStarTier（星级随机档）→ 中文星级；枚举外的档次回落「N星」，绝不丢档次信息。*/
+const STAR_TIER_CN: Record<number, string> = {
+  2: '二星',
+  3: '三星',
+  4: '四星',
+  5: '五星',
+  6: '六星',
+};
+
+/** 未落位行的房型格文案（酒店都没定，房型无从谈起）。*/
+export const PENDING_PLACEMENT_ROOM_TYPE = '待落位';
+
+/**
+ * 「星级随机」未落位行在各张导出表里的酒店格文案：`X星随机（待落位）`。
+ * 口径唯一入口 —— 分房表的酒店分组名与《全岗可用》/《签证专用》的「酒店类型」列共用，
+ * 两处文案必须一致，运营对表时才不会以为是两种东西。
+ * tier 为空 → 返回空串（调用方自行决定回落，本函数不编造档次）。
+ */
+export function randomStarTierLabel(tier: number | null | undefined): string {
+  if (tier == null) return '';
+  return `${STAR_TIER_CN[tier] ?? `${tier}星`}随机（${PENDING_PLACEMENT_ROOM_TYPE}）`;
+}
+
+/** 占房行的酒店/房型呈现口径（已落位取 FK 房型，未落位取星级随机档）。*/
+export interface RoomItemPlacement {
+  /** 酒店分组名：已落位 = FK 酒店名；未落位 = 「X星随机（待落位）」。*/
+  hotelName: string;
+  /** 房型名：已落位 = FK 房型名；未落位 = 「待落位」。*/
+  roomTypeName: string;
+  /** FK 房型床型（未落位为 null）。*/
+  bedType: string | null;
+  /** FK 房型容量（未落位为 null → 打包按缺省 2 人/间）。*/
+  capacity: number | null;
+  /** FK 酒店 id（未落位为 null → 当日余房无从算起，标「—」）。*/
+  hotelId: string | null;
+  /** true = 星级随机档还没落到具体酒店。*/
+  pending: boolean;
+}
+
+/** 占房行 → 酒店/房型呈现（已落位 / 未落位两态的唯一判定入口）。*/
+export function describeRoomItem(it: {
+  hotelRoomType: {
+    hotelId?: string | null;
+    name: string;
+    bedType: string | null;
+    capacity?: number | null;
+    hotel: { name: string };
+  } | null;
+  randomStarTier?: number | null;
+}): RoomItemPlacement {
+  if (it.hotelRoomType) {
+    return {
+      hotelName: it.hotelRoomType.hotel.name,
+      roomTypeName: it.hotelRoomType.name,
+      bedType: it.hotelRoomType.bedType,
+      capacity: it.hotelRoomType.capacity ?? null,
+      hotelId: it.hotelRoomType.hotelId ?? null,
+      pending: false,
+    };
+  }
+  return {
+    hotelName: randomStarTierLabel(it.randomStarTier),
+    roomTypeName: PENDING_PLACEMENT_ROOM_TYPE,
+    bedType: null,
+    capacity: null,
+    hotelId: null,
+    pending: true,
+  };
 }
 
 /** 防御式解析 roomAssignment JSON；形状不符直接当无分配处理。*/
@@ -267,21 +342,25 @@ function resolveChineseName(p: { chineseName?: string | null; fullName: string }
   return '';
 }
 
-/** 占房 item 上 hotelCheckIn / hotelRoomType 均非空后的窄化类型（correlate 阶段用）。*/
+/** 占房 item 上 hotelCheckIn 非空后的窄化类型（correlate 阶段用）。*/
 type AllocatableItem = RoomItemForExport & {
   hotelCheckIn: NonNullable<RoomItemForExport['hotelCheckIn']>;
-  hotelRoomType: NonNullable<RoomItemForExport['hotelRoomType']>;
 };
 
+/**
+ * 上表判定：必须有入住日（否则归不到任何 sheet），房源二选一非空 ——
+ * 具体房型（已落位）或星级随机档（未落位，rooming list 口径照样上名单）。
+ */
 function isAllocatable(it: RoomItemForExport): it is AllocatableItem {
-  return it.hotelCheckIn != null && it.hotelRoomType != null;
+  return it.hotelCheckIn != null && (it.hotelRoomType != null || it.randomStarTier != null);
 }
 
 /**
  * correlateItem 所需的最小形状（导出供整班机订单导出复用同一套乘客 ↔ 占房 item 关联口径）。
  */
 export interface CorrelatableRoomItem {
-  hotelRoomType: { name: string; bedType: string | null; hotel: { name: string } };
+  /** 未落位的星级随机行没有 FK 房型 —— 允许为空，此时按酒店名/房型匹配一律不命中，走兜底。*/
+  hotelRoomType: { name: string; bedType: string | null; hotel: { name: string } } | null;
 }
 
 /**
@@ -303,13 +382,13 @@ export function correlateItem<T extends CorrelatableRoomItem>(
   if (group) {
     const exact = orderItems.find(
       (it) =>
-        it.hotelRoomType.hotel.name === group.hotelName &&
+        it.hotelRoomType?.hotel.name === group.hotelName &&
         (!group.roomType ||
           it.hotelRoomType.name === group.roomType ||
           it.hotelRoomType.bedType === group.roomType),
     );
     if (exact) return exact;
-    const byHotelOnly = orderItems.find((it) => it.hotelRoomType.hotel.name === group.hotelName);
+    const byHotelOnly = orderItems.find((it) => it.hotelRoomType?.hotel.name === group.hotelName);
     if (byHotelOnly) return byHotelOnly;
   }
   return orderItems[0];
@@ -372,17 +451,24 @@ export function buildRoomAllocationSheets(
     for (const p of order.passengers) {
       const group = roomGroups.find((g) => g.passengerIds.includes(p.id));
       const it = correlateItem(group, orderItems);
+      // 已落位 = FK 酒店/房型；未落位（星级随机档）= 「X星随机（待落位）」+ 房型「待落位」
+      const placement = describeRoomItem(it);
       const checkInStr = fmtDate(it.hotelCheckIn);
-      const fkHotelName = it.hotelRoomType.hotel.name;
+      const fkHotelName = placement.hotelName;
       const hotelName = group?.hotelName || fkHotelName;
-      // 房型容量（未分房乘客打包用）；fixture/缺数据回落 2 人/间
-      const capacity =
-        it.hotelRoomType.capacity && it.hotelRoomType.capacity > 0 ? it.hotelRoomType.capacity : 2;
+      // 未落位行仍按分房组酒店名归组（房控已人工排房时以房控为准），只有回落到随机档名时才算待落位
+      const pendingPlacement = placement.pending && !group?.hotelName;
+      // 房型容量（未分房乘客打包用）；fixture/缺数据/未落位随机档回落 2 人/间
+      const capacity = placement.capacity && placement.capacity > 0 ? placement.capacity : 2;
       const travelDates = flightDates.length > 0 ? flightDates.join(' / ') : checkInStr;
 
-      // 分了房用 roomGroup 的房型（回落乘客床型偏好）；没分房回落 correlate 到的 item 房型床型
+      // 分了房用 roomGroup 的房型（回落乘客床型偏好）；没分房回落 correlate 到的 item 房型床型；
+      // 未落位随机档两者都没有 → 标「待落位」，绝不留空让人误以为是普通房型缺数据
       const assignedRoomType = group ? group.roomType || p.bedPref || '' : '';
-      const roomType = assignedRoomType || it.hotelRoomType.bedType || '';
+      const roomType =
+        assignedRoomType ||
+        placement.bedType ||
+        (placement.pending ? PENDING_PLACEMENT_ROOM_TYPE : '');
       const isHalf = !!group && group.roomFraction === 0.5;
       // 半间/拼房标记：roomFraction === 0.5 时在备注里点出（整间/缺省不标）
       const halfRoomNote = isHalf ? '半间/拼房' : '';
@@ -390,16 +476,18 @@ export function buildRoomAllocationSheets(
 
       // 当日余房：分房组人工填的酒店名与 correlate 到的 item FK 关联酒店不一致时，
       // 无法确定该按哪家酒店的余量算——绝不瞎标，直接 "—"（见文件顶部 JSDoc 归属优先级说明）。
+      // 未落位随机档没有具体酒店（hotelId 为 null）→ 同样 "—"：还没定店，谈不上哪家的余量。
       const hotelNameTrusted = !group?.hotelName || group.hotelName === fkHotelName;
       const dailyRemaining =
-        hotelNameTrusted && it.hotelRoomType.hotelId
-          ? (remainingLookup.get(`${it.hotelRoomType.hotelId}|${checkInStr}`) ?? '—')
+        hotelNameTrusted && placement.hotelId
+          ? (remainingLookup.get(`${placement.hotelId}|${checkInStr}`) ?? '—')
           : '—';
 
       const row: Omit<RoomAllocationRow, 'seq' | 'roomNo'> = {
         agency,
         notes,
-        hotelType: `${hotelName} · ${it.hotelRoomType.name}`,
+        // 未落位：「X星随机（待落位）」本身已说明酒店与房型都未定，不再拼「· 待落位」
+        hotelType: pendingPlacement ? hotelName : `${hotelName} · ${placement.roomTypeName}`,
         chineseName: resolveChineseName(p),
         pnrName: pnrName(p),
         flightCount: flightCountCell(p, tripStats),
@@ -568,6 +656,17 @@ export async function buildDailyRemainingLookup(
   return lookup;
 }
 
+/**
+ * 「这是一条占房行」的 where 判定（区间口径 / 出发日口径 / 出发日回落分支三处共用）：
+ * 具体房型（已落位）**或**星级随机档（未落位）二选一非空。
+ * 早先只认 hotelRoomTypeId 非空，把「星级随机」还没落店的行整类筛掉 —— 运营侧表现为
+ * 「酒店订单不能在分房表里导出来」。行业 rooming list 口径是未落位也要上名单。
+ */
+const OCCUPYING_ITEM_OR = [
+  { hotelRoomTypeId: { not: null } },
+  { randomStarTier: { not: null } },
+] satisfies Prisma.OrderItemWhereInput[];
+
 /** 占房 item 取数的统一 include（区间口径 / 按出发日口径共用，保证行映射字段一致）。*/
 const ROOM_ITEM_INCLUDE = {
   hotelRoomType: {
@@ -610,7 +709,8 @@ async function queryRoomItemsByCheckInRange(
   }
   return (await client.orderItem.findMany({
     where: {
-      hotelRoomTypeId: { not: null },
+      // 已落位 or 未落位随机档；入住日区间条件对两者一视同仁
+      OR: OCCUPYING_ITEM_OR,
       hotelCheckIn: { gte: fromD, lte: toD },
       order: { deletedAt: null, status: { in: COUNTED_STATUSES } },
     },
@@ -644,7 +744,8 @@ async function queryRoomItemsByDepartDate(
   const recallEnd = new Date(dayEnd.getTime() + 24 * 60 * 60 * 1000);
   const fetched = (await client.orderItem.findMany({
     where: {
-      hotelRoomTypeId: { not: null },
+      // 已落位 or 未落位随机档（出发日口径不按入住日切区间，要导整段入住晚）
+      OR: OCCUPYING_ITEM_OR,
       order: {
         deletedAt: null, // 排除已软删订单
         status: { in: COUNTED_STATUSES },
@@ -660,7 +761,7 @@ async function queryRoomItemsByDepartDate(
           {
             AND: [
               { items: { none: { kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } } } },
-              { items: { some: { hotelRoomTypeId: { not: null }, hotelCheckIn: dayStart } } },
+              { items: { some: { OR: OCCUPYING_ITEM_OR, hotelCheckIn: dayStart } } },
             ],
           },
         ],

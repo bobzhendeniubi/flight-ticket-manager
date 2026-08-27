@@ -561,6 +561,60 @@ describe('《签证专用》visa 行 — 酒店类型跟房控实际数据（乘
   });
 });
 
+// ── 「星级随机」未落位行的酒店类型列 ──────────────────────────────────────────
+// 该行 hotelRoomTypeId 为空、只有 randomStarTier（还没落到具体酒店）。若只认 hotelRoomType，
+// 这类单的「酒店类型」列整列空白；按 rooming list 口径标「X星随机（待落位）」，
+// 文案与分房表共用同一入口（randomStarTierLabel）。
+describe('酒店类型列 — 星级随机未落位行', () => {
+  /** 把订单项换成一条未落位的随机档 HOTEL 行（保留两段航班）。*/
+  function fixtureRandomTier(tier: number): OrderForTemplateExport {
+    const order = fixtureRoundTrip();
+    const o = order as unknown as { items: unknown[] };
+    o.items = [
+      ...order.items.filter((it) => it.kind === 'FLIGHT'),
+      {
+        kind: 'HOTEL',
+        flightCabin: null,
+        amount: 2000,
+        description: '岘港随机酒店',
+        metadata: null,
+        hotelRoomTypeId: null,
+        randomStarTier: tier,
+        flightSchedule: null,
+        hotelRoomType: null,
+        visa: null,
+        transfer: null,
+        bundle: null,
+        fulfillmentTasks: [],
+      },
+    ];
+    return order;
+  }
+
+  it('《全岗可用》无房型无分房组 → 回退「X星随机（待落位）」，不留空', () => {
+    const order = fixtureRandomTier(4);
+    const rows = orderToFullRows(order, buildOrderContext(order));
+    expect(rows[0].hotelInfo).toBe('四星随机（待落位）');
+    expect(rows[1].hotelInfo).toBe('四星随机（待落位）');
+  });
+
+  it('《签证专用》同口径回退「X星随机（待落位）」', () => {
+    const order = fixtureRandomTier(3);
+    const rows = orderToVisaRows(order, buildOrderContext(order));
+    expect(rows[0].hotelInfo).toBe('三星随机（待落位）');
+  });
+
+  it('有分房组（房控已排房）→ 仍以房控结果为准，不标待落位', () => {
+    const order = fixtureRandomTier(5);
+    (order as unknown as { roomAssignment: unknown }).roomAssignment = {
+      roomGroups: [{ id: 'g1', hotelName: '椰岛湾', roomType: '家庭房', passengerIds: ['p1'] }],
+    };
+    const rows = orderToFullRows(order, buildOrderContext(order));
+    expect(rows[0].hotelInfo).toBe('椰岛湾 家庭房'); // p1 跟房控
+    expect(rows[1].hotelInfo).toBe('五星随机（待落位）'); // p2 无分房组 → 回退未落位标识
+  });
+});
+
 // ── 代理预付款抵扣（prepaymentOffset）· 尾款/清账口径 ──────────────────────────
 // 尾款 = max(0, total + adjustmentCny − paid − prepaymentOffset) / 人数；
 // 已清账 = paid + prepaymentOffset ≥ total + adjustmentCny。与财务/提醒/报表口径一致，

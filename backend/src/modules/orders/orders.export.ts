@@ -17,6 +17,7 @@ import {
   assignRoomNumbers,
   buildDailyRemainingLookup,
   correlateItem,
+  describeRoomItem,
   formatRoomNo,
   parseRoomGroups,
   type RoomNumberEntry,
@@ -176,15 +177,18 @@ type OrderForExport = Prisma.OrderGetPayload<{
   };
 }>;
 
-/** 占房 item（hotelCheckIn + hotelRoomType 均非空；口径同分房表 isAllocatable，不限 kind——
- * 含已盖章酒店明细的 BUNDLE 行，纯机票乘客不产生占房 item）。*/
+/**
+ * 占房 item（口径同分房表 isAllocatable，不限 kind——含已盖章酒店明细的 BUNDLE 行，
+ * 纯机票乘客不产生占房 item）：必须有入住日，且房源二选一非空 ——
+ * 具体房型（已落位）**或**星级随机档（未落位，还没落到具体酒店）。
+ * 早先只认 hotelRoomType 非空，把「星级随机」还没落店的行整类漏在本表之外。
+ */
 type OccupancyItem = OrderForExport['items'][number] & {
   hotelCheckIn: Date;
-  hotelRoomType: NonNullable<OrderForExport['items'][number]['hotelRoomType']>;
 };
 
 function isOccupancyItem(it: OrderForExport['items'][number]): it is OccupancyItem {
-  return it.hotelCheckIn != null && it.hotelRoomType != null;
+  return it.hotelCheckIn != null && (it.hotelRoomType != null || it.randomStarTier != null);
 }
 
 /** 乘客行「房号 / 当日余房」两列取值；无占房行的乘客不入 map（回落 空 / "—"）。*/
@@ -224,17 +228,19 @@ function computeRoomColumns(
     for (const p of order.passengers) {
       const group = roomGroups.find((g) => g.passengerIds.includes(p.id));
       const it = correlateItem(group, occupancy);
+      // 已落位 = FK 酒店/房型；未落位（星级随机档）= 「X星随机（待落位）」，容量回落 2 人/间
+      const placement = describeRoomItem(it);
       const checkInStr = fmtDate(it.hotelCheckIn);
-      const fkHotelName = it.hotelRoomType.hotel.name;
+      const fkHotelName = placement.hotelName;
       const hotelName = group?.hotelName || fkHotelName;
-      const capacity =
-        it.hotelRoomType.capacity && it.hotelRoomType.capacity > 0 ? it.hotelRoomType.capacity : 2;
+      const capacity = placement.capacity && placement.capacity > 0 ? placement.capacity : 2;
 
-      // 三态口径同分房表：人工分房酒店名与 FK 关联酒店不一致 → 归属不确定，"—"
+      // 三态口径同分房表：人工分房酒店名与 FK 关联酒店不一致 → 归属不确定，"—"；
+      // 未落位随机档没有具体酒店（hotelId 为 null）→ 同样 "—"：还没定店，谈不上哪家的余量。
       const hotelNameTrusted = !group?.hotelName || group.hotelName === fkHotelName;
       const dailyRemaining =
-        hotelNameTrusted && it.hotelRoomType.hotelId
-          ? remainingLookup.get(`${it.hotelRoomType.hotelId}|${checkInStr}`) ?? '—'
+        hotelNameTrusted && placement.hotelId
+          ? remainingLookup.get(`${placement.hotelId}|${checkInStr}`) ?? '—'
           : '—';
 
       const list = byDate.get(checkInStr) ?? [];
@@ -295,17 +301,26 @@ function orderToRows(
   // ── 酒店：房型 + 入住起止（含每行所属酒店名，供 per-passenger 人工分房回落）──
   // 同一房型名（如多团共用 "明月"）不再混淆 —— 优先用人工分房组里的酒店名，
   // 缺失才回落到行上酒店名 + 房型名（与分房表导出口径一致）。
-  const hotelRooms: Array<{ hotelName: string; roomType: string; range: string }> = [];
+  // 未落位的「星级随机」行（无 FK 房型，只有 randomStarTier）同样出现在这两列，
+  // 显示「X星随机（待落位）」——房源已卖出、只是还没落到具体酒店，不能整行消失。
+  const hotelRooms: Array<{
+    hotelName: string;
+    roomType: string;
+    range: string;
+    pending: boolean;
+  }> = [];
   for (const it of order.items) {
-    if (it.kind === 'HOTEL' && it.hotelRoomType) {
+    if (it.kind === 'HOTEL' && (it.hotelRoomType || it.randomStarTier != null)) {
       const range =
         it.hotelCheckIn && it.hotelCheckOut
           ? ` (${fmtDate(it.hotelCheckIn)} ~ ${fmtDate(it.hotelCheckOut)})`
           : '';
+      const placement = describeRoomItem(it);
       hotelRooms.push({
-        hotelName: it.hotelRoomType.hotel?.name ?? '',
-        roomType: it.hotelRoomType.name,
+        hotelName: placement.hotelName,
+        roomType: placement.roomTypeName,
         range,
+        pending: placement.pending,
       });
     }
   }
@@ -360,13 +375,20 @@ function orderToRows(
     // 仅当订单项没带酒店名时，才回退到该乘客的人工分房组酒店名。
     const group = roomGroups.find((g) => g.passengerIds.includes(p.id));
     const groupHotelName = group?.hotelName?.trim() || '';
-    // 酒店名称（去重）：每段优先用订单项自带酒店名，缺失才回落到本乘客分房组酒店名。
+    // 每段的展示酒店名：已落位取订单项自带酒店名；未落位随机档没有具体酒店，
+    // 此时房控若已人工排房（分房组填了酒店名）以房控为准，否则才显示「X星随机（待落位）」。
+    const resolveHotelName = (r: (typeof hotelRooms)[number]): string =>
+      r.pending ? groupHotelName || r.hotelName : r.hotelName || groupHotelName;
+    // 酒店名称（去重）
     const hotelNames = Array.from(
-      new Set(hotelRooms.map((r) => r.hotelName || groupHotelName).filter(Boolean)),
+      new Set(hotelRooms.map(resolveHotelName).filter(Boolean)),
     ).join(' / ');
     const hotelInfo = hotelRooms
       .map((r) => {
-        const hotelName = r.hotelName || groupHotelName;
+        const hotelName = resolveHotelName(r);
+        // 未落位且房控也没排房：「X星随机（待落位）」本身已说明酒店与房型都未定，
+        // 不再拼「· 待落位」（口径同分房表）。
+        if (r.pending && !groupHotelName) return `${hotelName}${r.range}`;
         const prefix = hotelName ? `${hotelName} · ` : '';
         return `${prefix}${r.roomType}${r.range}`;
       })

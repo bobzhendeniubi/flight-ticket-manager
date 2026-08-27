@@ -118,6 +118,28 @@ function hotelItem(input: HotelItemInput): Record<string, unknown> {
   };
 }
 
+interface RandomStarItemInput {
+  /** 星级随机档（3 = 三星随机、4 = 四星随机）*/
+  tier: number;
+  checkIn: string; // YYYY-MM-DD
+  checkOut: string; // YYYY-MM-DD
+}
+
+/** 未落位的星级随机占房行：无 hotelRoomType（还没落到具体酒店），只有 randomStarTier。*/
+function randomStarItem(input: RandomStarItemInput): Record<string, unknown> {
+  return {
+    kind: 'HOTEL',
+    flightSchedule: null,
+    hotelRoomType: null,
+    randomStarTier: input.tier,
+    visa: null,
+    transfer: null,
+    bundle: null,
+    hotelCheckIn: D(input.checkIn),
+    hotelCheckOut: D(input.checkOut),
+  };
+}
+
 function order(
   orderNumber: string,
   items: Array<Record<string, unknown>>,
@@ -364,6 +386,69 @@ describe('buildOrdersBySchedule · 房号 / 当日余房（房控核对列，口
 
     // Assert：房号仍按分房组分配；余房因归属不确定标 "—"
     expect(dataRows).toHaveLength(1);
+    expect(cell(header, dataRows[0], '房号')).toBe('房1');
+    expect(cell(header, dataRows[0], '当日余房')).toBe('—');
+  });
+});
+
+describe('buildOrdersBySchedule · 星级随机未落位行（口径对齐分房表导出）', () => {
+  beforeEach(() => {
+    nightlyByHotel.clear();
+  });
+
+  it('未落位随机档行照样上表：酒店列标「三星随机（待落位）」，余房 "—"，容量回落 2 人/间', async () => {
+    // Arrange：三星随机档还没落到具体酒店（无 hotelRoomType，只有 randomStarTier），
+    // 同住 2 位男客；早先这类行被整类筛掉，乘客在整班机导出里酒店列全空。
+    const client = fakeClient([
+      order(
+        'ORD-RANDOM-001',
+        [randomStarItem({ tier: 3, checkIn: '2026-06-10', checkOut: '2026-06-12' })],
+        { passengers: [passenger('pr1'), passenger('pr2')] },
+      ),
+    ]);
+
+    // Act
+    const buf = await buildOrdersBySchedule('sched-1', client);
+    const { header, dataRows } = await parseSheet(buf);
+
+    // Assert
+    expect(dataRows).toHaveLength(2);
+    for (const row of dataRows) {
+      expect(cell(header, row, '酒店名称')).toBe('三星随机（待落位）');
+      // 未落位时不再拼「· 待落位」（酒店名本身已说明房型未定），入住区间照常带上
+      expect(cell(header, row, '酒店房型')).toBe('三星随机（待落位） (2026-06-10 ~ 2026-06-12)');
+      // 没定店 → 谈不上哪家酒店的余量
+      expect(cell(header, row, '当日余房')).toBe('—');
+    }
+    // 容量回落 2 人/间：两位同性客拼一间
+    expect(dataRows.map((r) => cell(header, r, '房号'))).toEqual(['房1', '房1']);
+  });
+
+  it('未落位随机档但房控已人工排房：酒店跟房控走，房型仍标「待落位」', async () => {
+    // Arrange：房控在分房组里填了实际酒店名，随机档行仍未回写 FK
+    const client = fakeClient([
+      order(
+        'ORD-RANDOM-002',
+        [randomStarItem({ tier: 4, checkIn: '2026-06-10', checkOut: '2026-06-11' })],
+        {
+          passengers: [passenger('pr3')],
+          roomAssignment: {
+            roomGroups: [{ id: 'g1', hotelName: '椰风酒店', roomType: '', passengerIds: ['pr3'] }],
+          },
+        },
+      ),
+    ]);
+
+    // Act
+    const buf = await buildOrdersBySchedule('sched-1', client);
+    const { header, dataRows } = await parseSheet(buf);
+
+    // Assert
+    expect(dataRows).toHaveLength(1);
+    expect(cell(header, dataRows[0], '酒店名称')).toBe('椰风酒店');
+    expect(cell(header, dataRows[0], '酒店房型')).toBe(
+      '椰风酒店 · 待落位 (2026-06-10 ~ 2026-06-11)',
+    );
     expect(cell(header, dataRows[0], '房号')).toBe('房1');
     expect(cell(header, dataRows[0], '当日余房')).toBe('—');
   });

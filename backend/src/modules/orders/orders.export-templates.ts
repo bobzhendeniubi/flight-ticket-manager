@@ -32,7 +32,11 @@ import {
   filterExportOrdersByTripType,
 } from './orders.export-trip-filter.js';
 import { determineFlightLegs } from './ticketing-cap.js';
-import { parseRoomGroups, resolveExportHotelInfo } from './orders.export-room-allocation.js';
+import {
+  parseRoomGroups,
+  randomStarTierLabel,
+  resolveExportHotelInfo,
+} from './orders.export-room-allocation.js';
 import { flightCountCell, loadExportTripStats } from './orders.export-trip-stats.js';
 import type { TripStatsMap } from './orders.export-trip-stats.js';
 import type { ExportTemplatesQuery } from './orders.schemas.js';
@@ -239,7 +243,8 @@ interface OrderContext {
   paxCount: number;
   agency: string;
   notes: string;
-  hotelInfo: string; // 酒店类型 = 酒店名 + 房型名
+  // 酒店类型 = 酒店名 + 房型名；未落位的星级随机行 = 「X星随机（待落位）」
+  hotelInfo: string;
   hotelNames: string; // 酒店名称 = 各酒店名去重，' / ' 连接
   travelDates: string; // 'YYYY-MM-DD / YYYY-MM-DD'（单段只有一个日期）
   flightNumbers: string; // ' ⇌ ' 连接
@@ -299,12 +304,18 @@ export function buildOrderContext(order: OrderForTemplateExport): OrderContext {
   // 酒店类型 = 酒店名 + 房型名。任何「关联了酒店房型」的订单行都算（不限 kind）：
   // 套餐(BUNDLE)把房型盖在 BUNDLE 行上、无独立 HOTEL 行，只认 kind==='HOTEL' 会让
   // 套餐单的酒店列整列空白（0720 公测反馈：导出缺酒店信息）。Set 去重防同名重复。
+  // 「星级随机」还没落到具体酒店的行（hotelRoomTypeId 为空、randomStarTier 非空）同样要出内容 ——
+  // 标「X星随机（待落位）」，与分房表共用同一文案（randomStarTierLabel），否则这类单的酒店列整列空白。
   const hotelPartSet = new Set<string>();
   const hotelNameSet = new Set<string>();
   for (const it of order.items) {
     if (it.hotelRoomType) {
       hotelPartSet.add(`${it.hotelRoomType.hotel.name} ${it.hotelRoomType.name}`);
       hotelNameSet.add(it.hotelRoomType.hotel.name);
+    } else if (it.randomStarTier != null) {
+      const pending = randomStarTierLabel(it.randomStarTier);
+      hotelPartSet.add(pending);
+      hotelNameSet.add(pending);
     }
   }
   const hotelNames = Array.from(hotelNameSet).join(' / ');

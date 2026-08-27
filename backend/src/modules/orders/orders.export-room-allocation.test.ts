@@ -604,6 +604,104 @@ describe('buildRoomAllocationSheets 中文名称列取值优先级', () => {
   });
 });
 
+// ── 「星级随机」未落位行照样上分房表（rooming list 口径：未落位也要上名单）────────────────
+// 这类行 hotelRoomTypeId 为空、只有 randomStarTier —— 早先 where + 行映射都要求 hotelRoomTypeId
+// 非空，把它们整类筛掉，运营侧表现为「酒店订单不能在分房表里导出来」。
+/** 未落位随机档 item：无 hotelRoomType，只有 randomStarTier。*/
+function randomTierItem(
+  tier: number,
+  over: { roomAssignment?: unknown; bedPref?: string | null } = {},
+): RoomItemForExport {
+  return {
+    orderId: `order-rand-${tier}`,
+    hotelCheckIn: D('2026-09-01'),
+    hotelRoomTypeId: null,
+    hotelRoomType: null,
+    randomStarTier: tier,
+    order: {
+      notes: null,
+      roomAssignment: over.roomAssignment ?? null,
+      agent: null,
+      total: 2000,
+      createdAt: D2('2026-08-01T10:00:00.000Z'),
+      items: [{ kind: 'HOTEL', flightSchedule: null }],
+      passengers: [
+        {
+          id: 'rp1',
+          fullName: '赵六',
+          chineseName: '赵六',
+          lastName: 'ZHAO',
+          firstName: 'LIU',
+          gender: 'F',
+          dateOfBirth: D('1995-05-05'),
+          documentNumber: 'E55555555',
+          passportIssueDate: null,
+          passportExpiry: null,
+          bedPref: over.bedPref ?? null,
+        },
+      ],
+    },
+  } as unknown as RoomItemForExport;
+}
+
+describe('buildRoomAllocationSheets — 星级随机未落位行', () => {
+  it('未落位行照样出现在分房表里（不再被整类漏掉）', () => {
+    const sheets = buildRoomAllocationSheets([randomTierItem(3)]);
+
+    expect(sheets).toHaveLength(1);
+    expect(sheets[0].name).toBe('9-1');
+    expect(sheets[0].rows).toHaveLength(1);
+    expect(sheets[0].rows[0].chineseName).toBe('赵六');
+  });
+
+  it('酒店格与房型格都带明确的待落位标识，不与已落位行混淆', () => {
+    const [sheet] = buildRoomAllocationSheets([randomTierItem(3)]);
+    const [row] = sheet.rows;
+
+    expect(row.hotelType).toBe('三星随机（待落位）');
+    expect(row.roomType).toBe('待落位');
+    // 还没定店 → 当日余房无从算起，标 "—"，绝不瞎标数字
+    expect(row.dailyRemaining).toBe('—');
+  });
+
+  it('中文星级按 randomStarTier 映射（四星/五星）', () => {
+    const [s4] = buildRoomAllocationSheets([randomTierItem(4)]);
+    const [s5] = buildRoomAllocationSheets([randomTierItem(5)]);
+    expect(s4.rows[0].hotelType).toBe('四星随机（待落位）');
+    expect(s5.rows[0].hotelType).toBe('五星随机（待落位）');
+  });
+
+  it('已落位行与未落位行同表并存，各自成组不串名', () => {
+    const sheets = buildRoomAllocationSheets([
+      randomTierItem(4),
+      {
+        ...chineseNameItem({ fullName: '王小明', chineseName: '王小明' }),
+        hotelCheckIn: D('2026-09-01'),
+      } as RoomItemForExport,
+    ]);
+
+    expect(sheets).toHaveLength(1);
+    const types = sheets[0].rows.map((r) => r.hotelType);
+    expect(types).toContain('四星随机（待落位）');
+    expect(types).toContain('G酒店 · 双床');
+  });
+
+  it('房控已人工排房（分房组填了真实酒店名）→ 跟房控走，不再标待落位', () => {
+    const [sheet] = buildRoomAllocationSheets([
+      randomTierItem(3, {
+        roomAssignment: {
+          roomGroups: [
+            { id: 'g1', hotelName: '椰岛湾度假村', roomType: '海景大床', passengerIds: ['rp1'] },
+          ],
+        },
+      }),
+    ]);
+
+    expect(sheet.rows[0].hotelType).toBe('椰岛湾度假村 · 待落位');
+    expect(sheet.rows[0].roomType).toBe('海景大床');
+  });
+});
+
 describe('roomAllocationExportFilename', () => {
   it('单日 / 区间两种文件名', () => {
     expect(roomAllocationExportFilename('2026-07-10', '2026-07-10')).toBe('分房表_2026-07-10.xlsx');
@@ -683,8 +781,12 @@ describe('buildRoomAllocationWorkbook 选单口径', () => {
     expect(findMany).toHaveBeenCalledTimes(1);
     const where = findMany.mock.calls[0][0].where;
 
-    // 只取占房 item；关键：出发日口径**不**按 hotelCheckIn 切区间（要导整段入住晚）
-    expect(where.hotelRoomTypeId).toEqual({ not: null });
+    // 只取占房 item —— 已落位（hotelRoomTypeId）或未落位随机档（randomStarTier）二选一非空；
+    // 关键：出发日口径**不**按 hotelCheckIn 切区间（要导整段入住晚）
+    expect(where.OR).toEqual([
+      { hotelRoomTypeId: { not: null } },
+      { randomStarTier: { not: null } },
+    ]);
     expect(where.hotelCheckIn).toBeUndefined();
 
     // 主口径：召回窗口 [前一日, 次日+1) —— 班次 departureTime 存 UTC，当地出发日与 UTC 日
@@ -706,8 +808,11 @@ describe('buildRoomAllocationWorkbook 选单口径', () => {
     const fallback = where.order.OR[1].AND;
     // 该订单没有任何挂了班次的 FLIGHT 行
     expect(fallback[0].items.none).toEqual({ kind: 'FLIGHT', flightScheduleId: { not: null } });
-    // 且有一条占房 item 在该日入住
-    expect(fallback[1].items.some.hotelRoomTypeId).toEqual({ not: null });
+    // 且有一条占房 item 在该日入住（占房 = 已落位房型 or 未落位随机档）
+    expect(fallback[1].items.some.OR).toEqual([
+      { hotelRoomTypeId: { not: null } },
+      { randomStarTier: { not: null } },
+    ]);
     expect(fallback[1].items.some.hotelCheckIn).toEqual(UTC('2026-07-10'));
   });
 
@@ -718,6 +823,11 @@ describe('buildRoomAllocationWorkbook 选单口径', () => {
     const where = findMany.mock.calls[0][0].where;
     expect(where.hotelCheckIn).toEqual({ gte: UTC('2026-07-10'), lte: UTC('2026-07-12') });
     expect(where.order.OR).toBeUndefined();
+    // 入住日区间条件对「已落位 / 未落位随机档」一视同仁（OR 只管房源那一维）
+    expect(where.OR).toEqual([
+      { hotelRoomTypeId: { not: null } },
+      { randomStarTier: { not: null } },
+    ]);
   });
 
   it('区间口径跨度超 14 天 → 抛 400，不落库', async () => {
