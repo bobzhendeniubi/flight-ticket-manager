@@ -17,6 +17,7 @@ import { Link } from 'react-router-dom';
 import {
   api,
   ApiError,
+  type BatchFulfillmentStatusResult,
   type FulfillmentStatus,
   type FulfillmentTask,
   type ListFulfillmentParams,
@@ -68,6 +69,33 @@ const BATCH_TARGETS: Array<{ value: VisaSubmissionStatus; label: string }> = [
 const PASSENGER_BATCH_LIMIT = 500;
 // 任务级批量备注上限（与后端 batch-notes 一致）
 const NOTES_BATCH_LIMIT = 100;
+
+/**
+ * 批量工具条的一次「执行」= 把当前填好的每一项都应用出去。
+ * 口径：留空 = 不改（这一项不发请求）；已填的绝不静默丢弃——
+ * 要么进合并确认框逐条列出后发出去，要么在校验阶段整批拦下并提示。
+ */
+type BatchActionKey = 'status' | 'note' | 'supplier' | 'cost';
+
+interface PlannedBatchAction {
+  key: BatchActionKey;
+  /** 结果面板里的短名 */
+  label: string;
+  /** 确认框里的一行：改什么 → 改成什么（影响几人 / 几单） */
+  summary: string;
+  /** 覆盖/清空类动作 → 确认框走危险色 */
+  danger?: boolean;
+  run: () => Promise<BatchFulfillmentStatusResult>;
+  /** 该项完全成功后清掉对应输入框 */
+  clearInput: () => void;
+}
+
+interface BatchActionOutcome extends BatchFulfillmentStatusResult {
+  key: BatchActionKey;
+  label: string;
+  /** 整项请求失败（没拿到逐条结果）时的原因 */
+  error: string | null;
+}
 // 列表单页拉取上限（与后端一致）
 const PAGE_SIZE = 200;
 const PAGE_SIZE_OPTIONS = [20, 30, 40, 50] as const;
@@ -1128,13 +1156,11 @@ export function VisaDeskPage() {
 
   // ── 按人选择 / 流转 ─────────────────────────────────
   const [selectedPassengerIds, setSelectedPassengerIds] = useState<Set<string>>(new Set());
-  const [batchTarget, setBatchTarget] = useState<VisaSubmissionStatus>('CONFIRMED');
+  // '' = 不改送签状态（只应用工具条里其它已填项）
+  const [batchTarget, setBatchTarget] = useState<VisaSubmissionStatus | ''>('CONFIRMED');
   const [submitting, setSubmitting] = useState(false);
-  const [batchResult, setBatchResult] = useState<{
-    successCount: number;
-    failureCount: number;
-    failures: Array<{ id: string; error: string }>;
-  } | null>(null);
+  // 一次执行可能应用多项 → 逐项留痕，部分成功也看得见是哪项挂了
+  const [batchResults, setBatchResults] = useState<BatchActionOutcome[] | null>(null);
   const [refreshNonce, setRefreshNonce] = useState(0);
   const [batchNote, setBatchNote] = useState('');
   const [batchNoteSubmitting, setBatchNoteSubmitting] = useState(false);
@@ -1270,7 +1296,7 @@ export function VisaDeskPage() {
   };
   const clearSelection = useCallback(() => {
     setSelectedPassengerIds(new Set());
-    setBatchResult(null);
+    setBatchResults(null);
   }, []);
 
   // 勾选乘客 → 去重订单 id（下载名单/护照用）
@@ -1340,157 +1366,232 @@ export function VisaDeskPage() {
     }
   };
 
-  // 按人批量标记送签进度
-  const applyBatch = async () => {
-    if (!token || selectedPassengerIds.size === 0) return;
-    if (selectedPassengerIds.size > PASSENGER_BATCH_LIMIT) {
-      alert(
-        `单次最多批量处理 ${PASSENGER_BATCH_LIMIT} 人，请分批操作（当前已选 ${selectedPassengerIds.size} 人）`,
-      );
-      return;
-    }
-    const targetLabel = SUBMISSION_LABEL[batchTarget];
-    if (!window.confirm(`将 ${selectedPassengerIds.size} 名乘客标记为「${targetLabel}」？`)) return;
-    setSubmitting(true);
-    setBatchResult(null);
-    try {
-      const res = await api.batchUpdateVisaPassengerStatus(
-        token,
-        Array.from(selectedPassengerIds),
-        batchTarget,
-      );
-      setBatchResult(res);
-      if (res.failureCount === 0) setSelectedPassengerIds(new Set());
-      setRefreshNonce((n) => n + 1);
-    } catch (e: unknown) {
-      alert(e instanceof ApiError ? `批量操作失败：${e.message}` : '批量操作失败');
-    } finally {
-      setSubmitting(false);
-    }
-  };
-
-  // 批量备注：作用于所选乘客所属订单的签证任务（去重后按任务改）
-  const applyBatchNote = async () => {
-    if (!token || selectedTaskIds.length === 0 || batchNoteSubmitting) return;
-    if (selectedTaskIds.length > NOTES_BATCH_LIMIT) {
-      alert(`单次最多批量备注 ${NOTES_BATCH_LIMIT} 单，请分批操作（当前涉及 ${selectedTaskIds.length} 单）`);
-      return;
-    }
-    const next = batchNote.trim();
-    if (confirmLockRef.current) return;
-    confirmLockRef.current = true;
-    if (!(await confirm({
-      title: `将覆盖所选 ${selectedTaskIds.length} 单的现有备注为「${next || '（空）'}」？`,
-      body: '此操作不可撤销。',
-      tone: 'danger',
-    }))) {
-      confirmLockRef.current = false;
-      return;
-    }
-    setBatchNoteSubmitting(true);
-    setBatchResult(null);
-    try {
-      const res = await api.batchUpdateFulfillmentNotes(token, selectedTaskIds, next);
-      setBatchResult(res);
-      if (res.failureCount === 0) setBatchNote('');
-      setRefreshNonce((n) => n + 1);
-    } catch (e: unknown) {
-      alert(e instanceof ApiError ? `批量备注失败：${e.message}` : '批量备注失败');
-    } finally {
-      setBatchNoteSubmitting(false);
-      confirmLockRef.current = false;
-    }
-  };
-
-  // 批量设签证金额：作用于所选乘客所属订单的签证任务（去重后按任务设同一人均单价）
+  // 批量设签证金额的三格解析（美金×汇率自动折人民币，与后端口径一致）
   const batchCostUsdNum = parseCostNum(batchCostUsd);
   const batchCostRateNum = parseCostNum(batchCostRate);
+  const batchCostCnyNum = parseCostNum(batchCostCny);
   const batchCostAutoCny =
     batchCostUsdNum != null && batchCostRateNum != null
       ? Math.round(batchCostUsdNum * batchCostRateNum * 100) / 100
       : null;
-  const applyBatchCost = async () => {
-    if (!token || selectedTaskIds.length === 0 || batchCostSubmitting) return;
-    if (selectedTaskIds.length > NOTES_BATCH_LIMIT) {
-      alert(`单次最多批量处理 ${NOTES_BATCH_LIMIT} 单，请分批操作（当前涉及 ${selectedTaskIds.length} 单）`);
-      return;
+
+  // 「执行」会应用哪几项：留空的不算（汇率格默认带当日汇率，单有汇率不算填了金额）。
+  // 金额按「格子里有没有字」判定而不是「解析出没解析出数字」——填了乱码要报错拦下，不能当没填。
+  const hasStatusPlan = batchTarget !== '';
+  const hasNotePlan = batchNote.trim() !== '';
+  const hasSupplierPlan = batchSupplier.trim() !== '';
+  const hasCostPlan = batchCostUsd.trim() !== '' || batchCostCny.trim() !== '';
+  const plannedActionCount = [hasStatusPlan, hasNotePlan, hasSupplierPlan, hasCostPlan].filter(
+    Boolean,
+  ).length;
+  // 任一批量请求在飞 → 整条工具条锁住，避免同一批选择被两条请求交叉改写
+  const anyBatchBusy =
+    submitting || batchNoteSubmitting || batchSupplierSubmitting || batchCostSubmitting;
+
+  /**
+   * 把工具条当前的输入编译成待执行动作。
+   * scope='all' 是「执行」：只收已填项，留空 = 不改。
+   * scope=单项 是三个单项「应用」按钮：保留各自原语义（留空 = 清空该字段）。
+   * 校验不过直接整批拦下（返回 error），绝不丢掉一半发一半。
+   */
+  const planBatchActions = (
+    scope: 'all' | BatchActionKey,
+    passengerIds: string[],
+    taskIds: string[],
+  ): { actions: PlannedBatchAction[]; error?: string } => {
+    if (!token) return { actions: [] };
+    const wants = (k: BatchActionKey) => scope === 'all' || scope === k;
+    const isSingle = scope !== 'all';
+    const actions: PlannedBatchAction[] = [];
+    const authToken = token;
+
+    // ① 送签状态：粒度 = 人
+    if (wants('status') && batchTarget !== '') {
+      if (passengerIds.length === 0) return { actions: [], error: '请先勾选乘客' };
+      if (passengerIds.length > PASSENGER_BATCH_LIMIT) {
+        return {
+          actions: [],
+          error: `单次最多批量处理 ${PASSENGER_BATCH_LIMIT} 人，请分批操作（当前已选 ${passengerIds.length} 人）`,
+        };
+      }
+      const target = batchTarget;
+      actions.push({
+        key: 'status',
+        label: '送签状态',
+        summary: `送签状态 → 「${SUBMISSION_LABEL[target]}」（${passengerIds.length} 人）`,
+        run: () => api.batchUpdateVisaPassengerStatus(authToken, passengerIds, target),
+        clearInput: () => {},
+      });
     }
-    let payload: VisaTaskCostInput;
-    let label: string;
-    if (batchCostUsdNum != null || batchCostRateNum != null) {
-      if (batchCostUsdNum == null || batchCostRateNum == null) {
-        alert('美金单价与汇率需同时填写');
-        return;
+
+    // ②③④ 备注 / 签证公司 / 金额：粒度 = 单（乘客所属订单的签证任务，去重）
+    const taskScoped = [
+      wants('note') && (isSingle || hasNotePlan),
+      wants('supplier') && (isSingle || hasSupplierPlan),
+      wants('cost') && (isSingle || hasCostPlan),
+    ].some(Boolean);
+    if (taskScoped) {
+      if (taskIds.length === 0) return { actions: [], error: '请先勾选乘客' };
+      if (taskIds.length > NOTES_BATCH_LIMIT) {
+        return {
+          actions: [],
+          error: `单次最多批量处理 ${NOTES_BATCH_LIMIT} 单，请分批操作（当前涉及 ${taskIds.length} 单）`,
+        };
       }
-      if (batchCostUsdNum < 0 || batchCostRateNum <= 0) {
-        alert('美金单价需 ≥0，汇率需 >0');
-        return;
-      }
-      payload = {
-        visaUnitCostUsd: batchCostUsdNum,
-        visaFxRate: batchCostRateNum,
-        visaUnitCostCny: null,
-      };
-      label = `$${batchCostUsdNum} ×${batchCostRateNum}=¥${batchCostAutoCny}/人`;
-    } else {
-      const cnyNum = parseCostNum(batchCostCny);
-      if (cnyNum != null && cnyNum < 0) {
-        alert('人民币金额需 ≥0');
-        return;
-      }
-      payload = { visaUnitCostUsd: null, visaFxRate: null, visaUnitCostCny: cnyNum };
-      label = cnyNum != null ? `¥${cnyNum}/人` : '清空（回退产品成本）';
     }
-    if (!(await confirm({
-      title: `将所选 ${selectedTaskIds.length} 单的签证金额统一设为「${label}」？`,
-      tone: label.includes('清空') ? 'danger' : 'default',
-    }))) return;
-    setBatchCostSubmitting(true);
-    setBatchResult(null);
+
+    if (wants('note') && (isSingle || hasNotePlan)) {
+      const next = batchNote.trim();
+      actions.push({
+        key: 'note',
+        label: '备注',
+        summary: next
+          ? `备注 → 「${next}」（覆盖 ${taskIds.length} 单的现有备注）`
+          : `备注 → 清空（${taskIds.length} 单）`,
+        danger: true,
+        run: () => api.batchUpdateFulfillmentNotes(authToken, taskIds, next),
+        clearInput: () => setBatchNote(''),
+      });
+    }
+
+    if (wants('supplier') && (isSingle || hasSupplierPlan)) {
+      const next = batchSupplier.trim();
+      actions.push({
+        key: 'supplier',
+        label: '签证公司',
+        summary: next
+          ? `签证公司 → 「${next}」（${taskIds.length} 单，金额不受影响）`
+          : `签证公司 → 清空（${taskIds.length} 单，金额不受影响）`,
+        danger: !next,
+        run: () => api.batchSetVisaTaskCost(authToken, taskIds, { visaSupplier: next }),
+        clearInput: () => setBatchSupplier(''),
+      });
+    }
+
+    if (wants('cost') && (isSingle || hasCostPlan)) {
+      let payload: VisaTaskCostInput;
+      let costLabel: string;
+      let clearing = false;
+      // 填了但不是数字 → 整批拦下，不能当成「留空 = 不改」悄悄跳过
+      if (batchCostUsd.trim() !== '' && batchCostUsdNum == null) {
+        return { actions: [], error: '美金单价请填数字' };
+      }
+      if (batchCostRate.trim() !== '' && batchCostRateNum == null) {
+        return { actions: [], error: '汇率请填数字' };
+      }
+      if (batchCostCny.trim() !== '' && batchCostCnyNum == null) {
+        return { actions: [], error: '人民币金额请填数字' };
+      }
+      if (batchCostUsdNum != null || batchCostRateNum != null) {
+        if (batchCostUsdNum == null || batchCostRateNum == null) {
+          return { actions: [], error: '美金单价与汇率需同时填写' };
+        }
+        if (batchCostUsdNum < 0 || batchCostRateNum <= 0) {
+          return { actions: [], error: '美金单价需 ≥0，汇率需 >0' };
+        }
+        payload = {
+          visaUnitCostUsd: batchCostUsdNum,
+          visaFxRate: batchCostRateNum,
+          visaUnitCostCny: null,
+        };
+        costLabel = `$${batchCostUsdNum} ×${batchCostRateNum}=¥${batchCostAutoCny}/人`;
+      } else {
+        if (batchCostCnyNum != null && batchCostCnyNum < 0) {
+          return { actions: [], error: '人民币金额需 ≥0' };
+        }
+        payload = { visaUnitCostUsd: null, visaFxRate: null, visaUnitCostCny: batchCostCnyNum };
+        clearing = batchCostCnyNum == null;
+        costLabel = clearing ? '清空（回退产品成本）' : `¥${batchCostCnyNum}/人`;
+      }
+      actions.push({
+        key: 'cost',
+        label: '签证金额',
+        summary: `签证金额 → 「${costLabel}」（${taskIds.length} 单，人均单价）`,
+        danger: clearing,
+        run: () => api.batchSetVisaTaskCost(authToken, taskIds, payload),
+        clearInput: () => {
+          setBatchCostUsd('');
+          setBatchCostCny('');
+        },
+      });
+    }
+
+    return { actions };
+  };
+
+  /**
+   * 合并确认框 → 按序发请求 → 逐项如实回报。
+   * 某一项整体失败不吞掉后面的项（每一项都是用户在同一个确认框里点头过的）；
+   * 只有全部干净时才清空勾选，留着失败项好原地重试。
+   */
+  const runBatchActions = async (
+    actions: PlannedBatchAction[],
+    setBusy: (v: boolean) => void,
+  ) => {
+    if (actions.length === 0) return;
+    if (confirmLockRef.current) return;
+    confirmLockRef.current = true;
     try {
-      const res = await api.batchSetVisaTaskCost(token, selectedTaskIds, payload);
-      setBatchResult(res);
-      if (res.failureCount === 0) {
-        setBatchCostUsd('');
-        setBatchCostRate('');
-        setBatchCostCny('');
+      const ok = await confirm({
+        title:
+          actions.length === 1 ? '确认执行以下操作？' : `确认一次执行以下 ${actions.length} 项操作？`,
+        body: (
+          <div className="space-y-2">
+            <ul className="list-disc space-y-1 pl-5">
+              {actions.map((a) => (
+                <li key={a.key}>{a.summary}</li>
+              ))}
+            </ul>
+            <p className="text-xs text-ink-muted">覆盖类操作不可撤销。</p>
+          </div>
+        ),
+        tone: actions.some((a) => a.danger) ? 'danger' : 'default',
+      });
+      if (!ok) return;
+      setBusy(true);
+      setBatchResults(null);
+      const outcomes: BatchActionOutcome[] = [];
+      for (const action of actions) {
+        try {
+          const res = await action.run();
+          outcomes.push({ key: action.key, label: action.label, ...res, error: null });
+          if (res.failureCount === 0) action.clearInput();
+        } catch (e: unknown) {
+          outcomes.push({
+            key: action.key,
+            label: action.label,
+            successCount: 0,
+            failureCount: 0,
+            failures: [],
+            error: e instanceof ApiError ? e.message : '请求失败',
+          });
+        }
       }
+      setBatchResults(outcomes);
+      const allClean = outcomes.every((o) => !o.error && o.failureCount === 0);
+      if (allClean && actions.some((a) => a.key === 'status')) setSelectedPassengerIds(new Set());
       setRefreshNonce((n) => n + 1);
-    } catch (e: unknown) {
-      alert(e instanceof ApiError ? `批量设金额失败：${e.message}` : '批量设金额失败');
     } finally {
-      setBatchCostSubmitting(false);
+      setBusy(false);
+      confirmLockRef.current = false;
     }
   };
 
-  // 批量设签证公司：只带 visaSupplier，后端不会动这批任务的金额
-  const applyBatchSupplier = async () => {
-    if (!token || selectedTaskIds.length === 0 || batchSupplierSubmitting) return;
-    if (selectedTaskIds.length > NOTES_BATCH_LIMIT) {
-      alert(
-        `单次最多批量处理 ${NOTES_BATCH_LIMIT} 单，请分批操作（当前涉及 ${selectedTaskIds.length} 单）`,
-      );
+  const startBatch = async (scope: 'all' | BatchActionKey, setBusy: (v: boolean) => void) => {
+    const passengerIds = Array.from(selectedPassengerIds);
+    const plan = planBatchActions(scope, passengerIds, selectedTaskIds);
+    if (plan.error) {
+      alert(plan.error);
       return;
     }
-    const next = batchSupplier.trim();
-    if (!(await confirm({
-      title: `将所选 ${selectedTaskIds.length} 单的签证公司统一设为「${next || '（清空）'}」？`,
-      body: '金额不受影响。',
-      tone: next ? 'default' : 'danger',
-    }))) return;
-    setBatchSupplierSubmitting(true);
-    setBatchResult(null);
-    try {
-      const res = await api.batchSetVisaTaskCost(token, selectedTaskIds, { visaSupplier: next });
-      setBatchResult(res);
-      if (res.failureCount === 0) setBatchSupplier('');
-      setRefreshNonce((n) => n + 1);
-    } catch (e: unknown) {
-      alert(e instanceof ApiError ? `批量设签证公司失败：${e.message}` : '批量设签证公司失败');
-    } finally {
-      setBatchSupplierSubmitting(false);
-    }
+    await runBatchActions(plan.actions, setBusy);
   };
+
+  // 「执行」= 应用工具条里全部已填项（状态发人，备注/公司/金额发单）
+  const applyBatch = () => startBatch('all', setSubmitting);
+  const applyBatchNote = () => startBatch('note', setBatchNoteSubmitting);
+  const applyBatchSupplier = () => startBatch('supplier', setBatchSupplierSubmitting);
+  const applyBatchCost = () => startBatch('cost', setBatchCostSubmitting);
 
   return (
     <div className="space-y-6">
@@ -1637,21 +1738,31 @@ export function VisaDeskPage() {
             <span className="text-slate-300">|</span>
             <label className="text-sm text-ink-soft">批量标记为：</label>
             <select
-              className="input max-w-[12rem] py-1.5"
+              className="input max-w-[14rem] py-1.5"
               value={batchTarget}
-              onChange={(e) => setBatchTarget(e.target.value as VisaSubmissionStatus)}
-              disabled={submitting}
+              onChange={(e) => setBatchTarget(e.target.value as VisaSubmissionStatus | '')}
+              disabled={anyBatchBusy}
             >
+              <option value="">不改送签状态</option>
               {BATCH_TARGETS.map((t) => (
                 <option key={t.value} value={t.value}>
                   {t.label}
                 </option>
               ))}
             </select>
-            <button className="btn-primary py-1.5" onClick={() => void applyBatch()} disabled={submitting}>
-              {submitting ? '处理中…' : '执行'}
+            <button
+              className="btn-primary py-1.5"
+              onClick={() => void applyBatch()}
+              disabled={anyBatchBusy || plannedActionCount === 0}
+              title="执行 = 把下面填好的每一项一起应用（留空的不改），确认框里会逐条列出"
+            >
+              {submitting
+                ? '处理中…'
+                : plannedActionCount > 1
+                  ? `执行（${plannedActionCount} 项）`
+                  : '执行'}
             </button>
-            <button className="btn-ghost py-1.5" onClick={clearSelection} disabled={submitting}>
+            <button className="btn-ghost py-1.5" onClick={clearSelection} disabled={anyBatchBusy}>
               清除选择
             </button>
             <span className="text-slate-300">|</span>
@@ -1678,6 +1789,11 @@ export function VisaDeskPage() {
                 : `下载护照包${selectedOrderIds.length > 0 ? `（${selectedOrderIds.length}单）` : ''}`}
             </button>
           </div>
+          <p className="mt-2 text-[11px] text-ink-muted">
+            「执行」= 把下面填好的每一项一起应用（送签状态按 {selectedPassengerIds.size} 人，备注 /
+            签证公司 / 金额按 {selectedTaskIds.length} 单）；留空的项不改。
+            单项「应用」按钮仍可只改一项（留空 = 清空该字段）。
+          </p>
           <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-brand-200/60 pt-3">
             <label className="text-sm text-ink-soft">批量备注：</label>
             <input
@@ -1685,17 +1801,17 @@ export function VisaDeskPage() {
               className="input max-w-xs py-1.5 text-sm"
               value={batchNote}
               placeholder="填写后覆盖所选订单备注…"
-              disabled={batchNoteSubmitting || submitting}
+              disabled={anyBatchBusy}
               onChange={(e) => setBatchNote(e.target.value)}
             />
             <button
               type="button"
               className="btn-secondary py-1.5"
               onClick={() => void applyBatchNote()}
-              disabled={batchNoteSubmitting || submitting || selectedTaskIds.length === 0}
-              title={`将覆盖所选 ${selectedTaskIds.length} 单的现有备注（上限 ${NOTES_BATCH_LIMIT} 单）`}
+              disabled={anyBatchBusy || selectedTaskIds.length === 0}
+              title={`只改备注：将覆盖所选 ${selectedTaskIds.length} 单的现有备注（留空 = 清空；上限 ${NOTES_BATCH_LIMIT} 单）`}
             >
-              {batchNoteSubmitting ? '保存中…' : '应用备注'}
+              {batchNoteSubmitting ? '保存中…' : '只应用备注'}
             </button>
             <span className="text-[11px] text-ink-muted">
               备注按订单级作用于所选乘客所属的 {selectedTaskIds.length} 单（上限 {NOTES_BATCH_LIMIT} 单）
@@ -1709,17 +1825,17 @@ export function VisaDeskPage() {
               className="input max-w-xs py-1.5 text-sm"
               value={batchSupplier}
               placeholder="如 XX签证服务"
-              disabled={batchSupplierSubmitting || submitting}
+              disabled={anyBatchBusy}
               onChange={(e) => setBatchSupplier(e.target.value)}
             />
             <button
               type="button"
               className="btn-secondary py-1.5"
               onClick={() => void applyBatchSupplier()}
-              disabled={batchSupplierSubmitting || submitting || selectedTaskIds.length === 0}
-              title={`将所选 ${selectedTaskIds.length} 单的签证公司统一覆盖（上限 ${NOTES_BATCH_LIMIT} 单）`}
+              disabled={anyBatchBusy || selectedTaskIds.length === 0}
+              title={`只改签证公司：将所选 ${selectedTaskIds.length} 单统一覆盖（留空 = 清空；上限 ${NOTES_BATCH_LIMIT} 单）`}
             >
-              {batchSupplierSubmitting ? '设置中…' : '应用签证公司'}
+              {batchSupplierSubmitting ? '设置中…' : '只应用签证公司'}
             </button>
             <span className="text-[11px] text-ink-muted">
               只改签证公司，不影响已设的金额；留空 = 清空
@@ -1735,7 +1851,7 @@ export function VisaDeskPage() {
               className="input w-20 py-1.5 text-sm"
               value={batchCostUsd}
               placeholder="美金"
-              disabled={batchCostSubmitting || submitting}
+              disabled={anyBatchBusy}
               onChange={(e) => setBatchCostUsd(e.target.value)}
             />
             <span className="text-xs text-ink-muted">×</span>
@@ -1745,7 +1861,7 @@ export function VisaDeskPage() {
               className="input w-20 py-1.5 text-sm"
               value={batchCostRate}
               placeholder="汇率"
-              disabled={batchCostSubmitting || submitting}
+              disabled={anyBatchBusy}
               onChange={(e) => setBatchCostRate(e.target.value)}
             />
             {batchCostAutoCny != null && (
@@ -1758,47 +1874,72 @@ export function VisaDeskPage() {
               className="input w-24 py-1.5 text-sm disabled:bg-slate-50"
               value={batchCostCny}
               placeholder="人民币"
-              disabled={
-                batchCostSubmitting ||
-                submitting ||
-                batchCostUsdNum != null ||
-                batchCostRateNum != null
-              }
+              disabled={anyBatchBusy || batchCostUsdNum != null || batchCostRateNum != null}
               onChange={(e) => setBatchCostCny(e.target.value)}
             />
             <button
               type="button"
               className="btn-secondary py-1.5"
               onClick={() => void applyBatchCost()}
-              disabled={batchCostSubmitting || submitting || selectedTaskIds.length === 0}
-              title={`将所选 ${selectedTaskIds.length} 单签证任务统一设成同一人均单价（上限 ${NOTES_BATCH_LIMIT} 单）`}
+              disabled={anyBatchBusy || selectedTaskIds.length === 0}
+              title={`只改金额：将所选 ${selectedTaskIds.length} 单签证任务统一设成同一人均单价（三格留空 = 清空回退产品成本；上限 ${NOTES_BATCH_LIMIT} 单）`}
             >
-              {batchCostSubmitting ? '设置中…' : '应用金额'}
+              {batchCostSubmitting ? '设置中…' : '只应用金额'}
             </button>
             <span className="text-[11px] text-ink-muted">
-              作用于所选 {selectedTaskIds.length} 单签证任务；三格留空 = 清空回退产品成本
+              作用于所选 {selectedTaskIds.length} 单签证任务；三格留空 = 清空回退产品成本（需走「只应用金额」；「执行」对留空的金额一律不改）
               {todayFxRate != null && `；汇率已按当日汇率表带出（${todayFxRate}），可手改`}
             </span>
           </div>
           {downloadError && <p className="mt-2 text-xs text-rose-600">{downloadError}</p>}
-          {batchResult && (
-            <div className="mt-3 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs">
-              <div className="text-ink-soft">
-                成功 {batchResult.successCount} 条
-                {batchResult.failureCount > 0 && (
-                  <span className="ml-3 text-rose-600">失败 {batchResult.failureCount} 条</span>
+        </section>
+      )}
+
+      {/* 批量执行结果：逐项如实回报（放在工具条外，勾选被清掉后依然看得见）*/}
+      {batchResults && batchResults.length > 0 && (
+        <section className="rounded-lg border border-slate-200 bg-white px-4 py-3 text-xs">
+          <div className="flex items-center justify-between gap-3">
+            <span className="text-sm font-semibold text-ink">批量执行结果</span>
+            <button
+              type="button"
+              className="btn-ghost py-1 text-xs"
+              onClick={() => setBatchResults(null)}
+            >
+              知道了
+            </button>
+          </div>
+          <ul className="mt-2 space-y-2">
+            {batchResults.map((r) => (
+              <li key={r.key} className="border-t border-slate-100 pt-2 first:border-t-0 first:pt-0">
+                <div className="text-ink-soft">
+                  <span className="font-medium text-ink">{r.label}</span>
+                  {r.error ? (
+                    <span className="ml-3 text-rose-600">未执行成功：{r.error}</span>
+                  ) : (
+                    <>
+                      <span className="ml-3">成功 {r.successCount} 条</span>
+                      {r.failureCount > 0 && (
+                        <span className="ml-3 text-rose-600">失败 {r.failureCount} 条</span>
+                      )}
+                    </>
+                  )}
+                </div>
+                {r.failures.length > 0 && (
+                  <ul className="mt-1 max-h-32 overflow-auto text-rose-600">
+                    {r.failures.map((f) => (
+                      <li key={f.id} className="font-mono text-[11px]">
+                        · {f.id.slice(0, 8)}…：{f.error}
+                      </li>
+                    ))}
+                  </ul>
                 )}
-              </div>
-              {batchResult.failures.length > 0 && (
-                <ul className="mt-1 max-h-32 overflow-auto text-rose-600">
-                  {batchResult.failures.map((f) => (
-                    <li key={f.id} className="font-mono text-[11px]">
-                      · {f.id.slice(0, 8)}…：{f.error}
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
+              </li>
+            ))}
+          </ul>
+          {batchResults.some((r) => r.error || r.failureCount > 0) && (
+            <p className="mt-2 text-[11px] text-ink-muted">
+              失败项的输入框已保留原值，勾选也没有清空，可以直接重试。
+            </p>
           )}
         </section>
       )}
