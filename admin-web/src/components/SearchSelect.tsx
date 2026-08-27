@@ -2,7 +2,7 @@
  * SearchSelect —— 依赖无关的可搜索下拉选择器（Console 设计系统风格）。
  *
  * 解决套餐向导里「原生 <select> 选项太多找不到」的问题：文本框输入即按 label
- * 做不区分大小写的子串过滤，下方列表点选；已选中时展示 `label · ¥priceLabel`。
+ * 做不区分大小写的子串过滤，下方列表点选；选项展示 `label · ¥priceLabel`（priceLabel 为空则只展示 label）。
  *
  * 交互约定：
  *   - 未选中：输入框显示搜索关键字，下方即时过滤出选项列表。
@@ -19,8 +19,8 @@ export interface SearchSelectOption {
   id: string;
   /** 主展示文本（酒店名·房型名 / 接送产品名 / 签证国家·类型等），搜索按此做子串匹配 */
   label: string;
-  /** 价格展示后缀（不含 ¥ 符号，由组件统一加上），如 "1880"、"280" */
-  priceLabel: string;
+  /** 价格展示后缀（不含 ¥ 符号，由组件统一加上），如 "1880"、"280"；不传或空串 = 该选项不展示价格 */
+  priceLabel?: string;
 }
 
 export interface SearchSelectProps {
@@ -126,7 +126,7 @@ export function SearchSelect({
               }`}
               onClick={() => selectOption(o)}
             >
-              {o.label} · ¥{o.priceLabel}
+              {o.priceLabel ? `${o.label} · ¥${o.priceLabel}` : o.label}
             </button>
           ))}
         </div>

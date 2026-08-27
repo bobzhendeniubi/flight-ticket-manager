@@ -35,6 +35,7 @@ import { useAuth } from '../stores/auth';
 import { NumberInput } from '../components/NumberInput';
 import { RoomingEditor, type RoomingPassenger } from '../components/RoomingEditor';
 import { HotelSwapModal } from '../components/HotelSwapModal';
+import { SearchSelect, type SearchSelectOption } from '../components/SearchSelect';
 import { useConfirm } from '../components/ConfirmDialog';
 import { useDialogA11y } from '../components/Modal';
 
@@ -1451,6 +1452,8 @@ function BlockPeriodsEditor({ token, onChanged }: { token: string; onChanged: ()
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
   const [hotelOptions, setHotelOptions] = useState<{ id: string; label: string }[]>([]);
+  const [hotelsLoading, setHotelsLoading] = useState(true);
+  const [hotelsErr, setHotelsErr] = useState<string | null>(null);
   const [showNew, setShowNew] = useState(false);
 
   const load = useCallback(() => {
@@ -1479,27 +1482,37 @@ function BlockPeriodsEditor({ token, onChanged }: { token: string; onChanged: ()
     };
   }, [token]);
 
-  // 拉酒店下拉（产品 API；含停售酒店便于维护老台账）
-  useEffect(() => {
-    let cancelled = false;
-    api
+  // 拉酒店下拉（产品 API；含停售酒店便于维护老台账）。
+  // 失败不能静默：401/超时时下拉只剩「无可用酒店」，运营会当成「库里没这家店」而不是「没加载出来」。
+  // 也对外暴露重拉入口：在别的标签页新建酒店后，回本页点「刷新」即可看到，不必整页重载。
+  const loadHotels = useCallback(() => {
+    setHotelsLoading(true);
+    setHotelsErr(null);
+    return api
       .listHotels(false)
       .then((d) => {
-        if (cancelled) return;
         const opts = d.hotels
           // 随机档占位项不是真实酒店，给它切房 = 与同星级真酒店的库存双记一笔账（后端也拒建）
           .filter((h) => h.randomTierPlaceholder == null)
-          .map((h) => ({ id: h.id, label: h.code ? `${h.code} · ${h.name}` : h.name }))
+          .map((h) => {
+            const base = h.code ? `${h.code} · ${h.name}` : h.name;
+            // 停售酒店保留在列表里（维护老台账要用），但标出来免得误切新周期
+            return { id: h.id, label: h.isActive ? base : `${base}（停售）` };
+          })
           .sort((a, b) => a.label.localeCompare(b.label, 'zh-CN'));
         setHotelOptions(opts);
       })
-      .catch(() => {
-        // 静默：下拉空时表单按钮会禁用
+      .catch((e: unknown) => {
+        setHotelsErr(e instanceof ApiError ? e.message : '酒店列表加载失败');
+      })
+      .finally(() => {
+        setHotelsLoading(false);
       });
-    return () => {
-      cancelled = true;
-    };
   }, []);
+
+  useEffect(() => {
+    void loadHotels();
+  }, [loadHotels]);
 
   useEffect(() => load(), [load]);
 
@@ -1550,6 +1563,9 @@ function BlockPeriodsEditor({ token, onChanged }: { token: string; onChanged: ()
         <BlockPeriodNewForm
           token={token}
           hotelOptions={hotelOptions}
+          hotelsLoading={hotelsLoading}
+          hotelsErr={hotelsErr}
+          onReloadHotels={loadHotels}
           onSaved={() => {
             setShowNew(false);
             load();
@@ -1608,17 +1624,25 @@ function BlockPeriodsEditor({ token, onChanged }: { token: string; onChanged: ()
 function BlockPeriodNewForm({
   token,
   hotelOptions,
+  hotelsLoading,
+  hotelsErr,
+  onReloadHotels,
   onSaved,
   onCancel,
 }: {
   token: string;
   hotelOptions: { id: string; label: string }[];
+  hotelsLoading: boolean;
+  hotelsErr: string | null;
+  onReloadHotels: () => void;
   onSaved: () => void;
   onCancel: () => void;
 }) {
   // 下拉选中值 = 真实酒店 id。包房周期只能挂在具体酒店上 —— 「三星/四星随机」是同星级酒店
   // 的派生合计，不再单独切一份库存（后端 createBlockPeriod 也会拒），故此处没有随机档选项。
-  const [hotelId, setHotelId] = useState<string>(hotelOptions[0]?.id ?? '');
+  // 默认不选酒店，强制显式挑选：库里酒店上千条（含大量停售/历史条目），
+  // 自动选中排序第一家会让漏看的运营把周期切给错误酒店。
+  const [hotelId, setHotelId] = useState<string>('');
   const [dateFrom, setDateFrom] = useState<string>(todayStr());
   const [dateTo, setDateTo] = useState<string>(todayStr());
   const [rooms, setRooms] = useState<number | null>(null);
@@ -1627,12 +1651,12 @@ function BlockPeriodNewForm({
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  // 默认下拉同步
-  useEffect(() => {
-    if (!hotelId && hotelOptions.length > 0) {
-      setHotelId(hotelOptions[0]!.id);
-    }
-  }, [hotelOptions, hotelId]);
+  // 库里酒店上千条，原生 select 没法搜——换可搜索下拉，按编号/名称子串匹配。
+  // 包房周期不涉及价格，priceLabel 传空串（同 OrdersPage 批量改代理的用法）。
+  const hotelSelectOptions: SearchSelectOption[] = useMemo(
+    () => hotelOptions.map((o) => ({ id: o.id, label: o.label, priceLabel: '' })),
+    [hotelOptions],
+  );
 
   async function submit(): Promise<void> {
     if (!hotelId) {
@@ -1669,25 +1693,54 @@ function BlockPeriodNewForm({
   return (
     <div className="mt-3 rounded-lg border border-slate-200 bg-canvas p-3">
       <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3">
-        <label className="text-xs text-ink-soft">
-          酒店
-          <select
-            value={hotelId}
-            onChange={(e) => setHotelId(e.target.value)}
-            className={`mt-1 block w-full ${inputCls}`}
-          >
-            {hotelOptions.length === 0 && <option value="">（无可用酒店）</option>}
-            {hotelOptions.map((o) => (
-              <option key={o.id} value={o.id}>
-                {o.label}
-              </option>
-            ))}
-          </select>
+        {/* 含「刷新列表」按钮，故用 div 而非 label 包裹（button 在 label 内会被 label 激活行为吃掉点击） */}
+        <div className="text-xs text-ink-soft">
+          <div className="flex items-center justify-between gap-2">
+            <span>酒店</span>
+            <button
+              type="button"
+              className="font-normal text-[11px] text-brand hover:underline disabled:opacity-50"
+              onClick={onReloadHotels}
+              disabled={hotelsLoading}
+            >
+              {hotelsLoading ? '刷新中…' : '刷新列表'}
+            </button>
+          </div>
+          <SearchSelect
+            className="mt-1"
+            options={hotelSelectOptions}
+            value={hotelId || null}
+            onChange={setHotelId}
+            placeholder={
+              hotelsLoading
+                ? '加载酒店列表…'
+                : hotelsErr
+                  ? '酒店列表加载失败'
+                  : hotelOptions.length === 0
+                    ? '（无可用酒店）'
+                    : '搜索酒店（编号 / 名称）…'
+            }
+            disabled={hotelsLoading || !!hotelsErr || hotelOptions.length === 0}
+          />
+          {hotelsErr && (
+            <div className="mt-1 flex flex-wrap items-center gap-2 font-normal text-amber-700">
+              <span>酒店列表加载失败：{hotelsErr}</span>
+              <button
+                type="button"
+                className="rounded border border-amber-300 px-2 py-0.5 text-[11px] hover:bg-amber-50 disabled:opacity-50"
+                onClick={onReloadHotels}
+                disabled={hotelsLoading}
+              >
+                重试
+              </button>
+            </div>
+          )}
           <span className="mt-1 block font-normal normal-case text-ink-muted">
             「三星/四星随机」无需单独切房：它就是同星级各酒店余量的合计，按酒店切房即可。
-            找不到酒店？在 产品管理 › 酒店 里添加/编辑（含介绍、图片、房型）。
+            找不到酒店？在 产品管理 › 酒店 里添加/编辑（含介绍、图片、房型），建好后回来点「刷新列表」。
+            新酒店要先在这里切下第一笔包房周期，才会出现在上方销控板里。
           </span>
-        </label>
+        </div>
         <label className="text-xs text-ink-soft">
           起始日
           <input
