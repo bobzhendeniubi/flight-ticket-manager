@@ -660,7 +660,7 @@ function ReceiptRow({
     if (!(await confirm({
       title: `确认撤销订单 ${orderLabel} 的这笔认款 ¥${Number(a.amountCny).toLocaleString()}？`,
       body:
-        `撤销后：该订单已付金额减回、这笔收款记录冲销，钱回到进账 ${receipt.receiptNo} 的剩余额里待重新认领。\n` +
+        `撤销后：该订单已付金额减回、这笔收款记录冲销，钱回到进账 ${receipt.receiptNo} 的剩余额里待重新核销。\n` +
         '注意：订单状态、佣金与履约任务不会回退。',
       tone: 'danger',
     }))) {
@@ -734,7 +734,7 @@ function ReceiptRow({
                 className="btn-secondary px-2.5 py-1 text-xs"
                 onClick={() => setAction(action === 'allocate' ? 'none' : 'allocate')}
               >
-                认领
+                核销
               </button>
               <button
                 type="button"
@@ -757,7 +757,7 @@ function ReceiptRow({
         <tr>
           <td colSpan={11} className="bg-slate-50/60 !py-2 text-xs text-ink-soft">
             <div className="flex flex-wrap items-center gap-x-1 gap-y-1.5">
-              <span>已认领：</span>
+              <span>已核销：</span>
               {receipt.allocations.map((a) => (
                 <span key={a.id} className="ml-1 inline-flex items-center gap-1">
                   {/* 订单号（照着核对账）；服务端 join 不到才回落 id 前 8 位，title 恒为完整 id */}
@@ -772,7 +772,7 @@ function ReceiptRow({
                       className="btn-ghost-danger px-1.5 py-0.5 text-xs disabled:opacity-50"
                       disabled={reversingId !== null}
                       onClick={() => void reverse(a)}
-                      title="撤销这笔认款：钱回到挂账池待重新认领"
+                      title="撤销这笔认款：钱回到挂账池待重新核销"
                     >
                       {reversingId === a.id ? '撤销中…' : '撤销'}
                     </button>
@@ -918,7 +918,7 @@ function AllocateForm({
       await api.allocateReceipt(token, receiptId, { orderId: matchedOrderId, amountCny: amt });
       onDone();
     } catch (e: unknown) {
-      setErr(e instanceof ApiError ? e.message : '认领失败');
+      setErr(e instanceof ApiError ? e.message : '核销失败');
     } finally {
       setSubmitting(false);
     }
@@ -1018,7 +1018,7 @@ function RefundForm({
     confirmLockRef.current = true;
     if (!(await confirm({
       title: `确认把剩余 ¥${remaining.toLocaleString()} 标记退款？`,
-      body: '退款后不可再认领。',
+      body: '退款后不可再核销。',
       tone: 'danger',
     }))) {
       confirmLockRef.current = false;
@@ -1255,7 +1255,7 @@ function RegisterReceiptModal({
               className="input"
               value={orderHintId}
               onChange={(e) => setOrderHintId(e.target.value)}
-              placeholder="客户自报的订单号，便于认领"
+              placeholder="客户自报的订单号，便于核销"
               maxLength={64}
             />
           </label>

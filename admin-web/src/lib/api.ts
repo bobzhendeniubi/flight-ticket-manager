@@ -2875,15 +2875,15 @@ export interface UpdatePaymentChannelInput {
   sortOrder?: number;
 }
 
-/** 进账状态：未认领 / 部分认领 / 已认领 / 已退款 */
+/** 进账状态：待核销 / 部分核销 / 已核销 / 已退款（对账台统一「核销」口径） */
 export type ReceiptStatus = 'OPEN' | 'PARTIALLY_ALLOCATED' | 'ALLOCATED' | 'REFUNDED';
 /** 进账来源：客户上传 / 后台录入 / 订单超额转入 / 二维码流水导入 */
 export type ReceiptSource = 'CUSTOMER_UPLOAD' | 'STAFF_ENTRY' | 'ORDER_OVERPAY' | 'STATEMENT_IMPORT' | 'OPS_CLAIM';
 
 export const RECEIPT_STATUS_LABEL: Record<ReceiptStatus, string> = {
-  OPEN: '待认领',
-  PARTIALLY_ALLOCATED: '部分认领',
-  ALLOCATED: '已认领',
+  OPEN: '待核销',
+  PARTIALLY_ALLOCATED: '部分核销',
+  ALLOCATED: '已核销',
   REFUNDED: '已退款',
 };
 export const RECEIPT_SOURCE_LABEL: Record<ReceiptSource, string> = {
