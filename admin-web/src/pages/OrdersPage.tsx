@@ -4274,17 +4274,20 @@ function OrderDrawer({
               )}
             </div>
 
-            {/* 收款（确认收款 / 代理余额抵扣 / 多付处理）*/}
-            <ConfirmPaymentSection
-              key={o.id}
-              orderId={o.id}
-              orderNumber={o.orderNumber}
-              total={bal.payable}
-              paidAmount={bal.paid}
-              prepaymentOffset={bal.prepaid}
-              agent={o.agent}
-              onChanged={onChanged}
-            />
+            {/* 收款（确认收款 / 代理余额抵扣 / 多付处理）：后端收款/锁定全部仅 ADMIN/STAFF，
+                代理只看上方「付款情况」只读块，不渲染操作区（点了必 403）。 */}
+            {isOps && (
+              <ConfirmPaymentSection
+                key={o.id}
+                orderId={o.id}
+                orderNumber={o.orderNumber}
+                total={bal.payable}
+                paidAmount={bal.paid}
+                prepaymentOffset={bal.prepaid}
+                agent={o.agent}
+                onChanged={onChanged}
+              />
+            )}
 
             {/* 退款拆分（退款申请中/已退款才出现）：把「要打的现金」和「自动回代理余额」分开摆，
                 防止财务照应退合计全额打款、与系统自动回补重复退钱。 */}
@@ -4332,6 +4335,7 @@ function OrderDrawer({
                           onOrderUpdated={handleOrderUpdated}
                           canEditSettlementPrice={isOps}
                           canChangeBundle={isOps}
+                          canOperate={isOps}
                           settlementLocked={o.settlementLocked === true}
                         />
                       ))}
@@ -4349,6 +4353,7 @@ function OrderDrawer({
                     onOrderUpdated={handleOrderUpdated}
                     canEditSettlementPrice={isOps}
                     canChangeBundle={isOps}
+                    canOperate={isOps}
                     settlementLocked={o.settlementLocked === true}
                   />
                 ))}
@@ -5873,6 +5878,7 @@ function OrderItemRow({
   onOrderUpdated,
   canEditSettlementPrice,
   canChangeBundle,
+  canOperate,
   settlementLocked,
 }: {
   orderId: string;
@@ -5882,6 +5888,8 @@ function OrderItemRow({
   canEditSettlementPrice?: boolean;
   /** 套餐改档：后端 POST /orders/:id/change-bundle 仅 ADMIN/STAFF，代理不给入口 */
   canChangeBundle?: boolean;
+  /** 售后行级操作（改期/升舱/换酒店/酒店改期）：后端全部仅 ADMIN/STAFF，非运营不渲染按钮（点了必 403） */
+  canOperate?: boolean;
   settlementLocked?: boolean;
 }) {
   const [rescheduling, setRescheduling] = useState(false);
@@ -5969,7 +5977,7 @@ function OrderItemRow({
           {item.amount != null && (
             <div className="nums text-sm font-medium text-ink">¥{Number(item.amount).toLocaleString()}</div>
           )}
-          {isFlight && !rescheduling && !editingPrice && !upgradingCabin && (
+          {canOperate && isFlight && !rescheduling && !editingPrice && !upgradingCabin && (
             <button
               className="text-[11px] font-medium text-brand hover:text-brand-dark"
               onClick={() => setRescheduling(true)}
@@ -5977,7 +5985,7 @@ function OrderItemRow({
               改期
             </button>
           )}
-          {canUpgradeCabin && !rescheduling && !editingPrice && !upgradingCabin && (
+          {canOperate && canUpgradeCabin && !rescheduling && !editingPrice && !upgradingCabin && (
             <button
               className="text-[11px] font-medium text-indigo-600 hover:text-indigo-800"
               onClick={() => setUpgradingCabin(true)}
@@ -5999,7 +6007,7 @@ function OrderItemRow({
               {settlementLocked && <span className="text-[11px] text-slate-500">已锁定</span>}
             </>
           )}
-          {isHotelRow && (
+          {canOperate && isHotelRow && (
             <button
               className="text-[11px] font-medium text-brand hover:text-brand-dark"
               onClick={() => setSwappingHotel(true)}
@@ -6007,7 +6015,7 @@ function OrderItemRow({
               换酒店
             </button>
           )}
-          {canRescheduleHotel && !reschedulingHotel && !editingPrice && (
+          {canOperate && canRescheduleHotel && !reschedulingHotel && !editingPrice && (
             <button
               className="text-[11px] font-medium text-brand hover:text-brand-dark"
               onClick={() => setReschedulingHotel(true)}
