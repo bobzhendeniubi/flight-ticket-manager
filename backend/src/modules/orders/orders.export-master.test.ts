@@ -23,6 +23,7 @@ import {
   type OrderForMasterExport,
   type TripStatsMap,
 } from './orders.export-master.js';
+import { flightCountCell } from './orders.export-trip-stats.js';
 import { filterExportOrdersByDepartDate } from './orders.export-depart-filter.js';
 import { docKey } from '../travelers/traveler-profiles.aggregate.js';
 
@@ -442,6 +443,21 @@ describe('orderToMasterRows', () => {
       expect(r2.flightCount).toBe('');
       expect(r2.pendingTripCount).toBe('');
       expect(r2.availableTrips).toBe('');
+    });
+
+    // 三表口径一致性守卫：分房表与《全岗可用》的「飞行次数」列也走 flightCountCell —— 本表
+    // 若哪天自己内联一套判空/取值规则，同一位乘客在三张表里就会出现两个答案，这里立刻红。
+    it('「飞行次数」列走三表共用的渲染入口（分房表 /《全岗可用》同一函数）', () => {
+      const order = fixtureRoundTripBundle();
+      const tripStats: TripStatsMap = new Map([
+        [docKey('PASSPORT', 'E12345678'), { tripCount: 7, pendingTripCount: 2, availableTrips: 5 }],
+      ]);
+      const [r1, r2] = orderToMasterRows(order, tripStats);
+      // 命中档案 / 未命中档案两种情形都与共用渲染函数逐字一致
+      expect(r1.flightCount).toBe(flightCountCell(order.passengers[0], tripStats));
+      expect(r2.flightCount).toBe(flightCountCell(order.passengers[1], tripStats));
+      expect(r1.flightCount).toBe('7');
+      expect(r2.flightCount).toBe('');
     });
   });
 

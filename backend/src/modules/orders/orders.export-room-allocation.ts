@@ -12,8 +12,9 @@
  * 否则回落到 correlate 到的 item 上 hotelRoomType.hotel.name。
  *
  * 列序对齐旧系统（0713 房控反馈）：旧系统 16 列原序 + 当前系统特有 3 列（房间号/升级原因/
- * 当日余房）追加在末尾，见 COLUMNS。仍暂无数据的列（飞行次数/升级原因）保留表头、内容留空 ——
- * 与三模板导出同约定；「酒店类型」列拼法（酒店名 · 房型名）口径同样缓办，维持现状不动。
+ * 当日余房）追加在末尾，见 COLUMNS。「飞行次数」列取常旅客档案快照（口径与全岗总表 /
+ * 《全岗可用》完全一致，见 orders.export-trip-stats.ts）；仍暂无数据的列（升级原因）保留表头、
+ * 内容留空；「酒店类型」列拼法（酒店名 · 房型名）口径缓办，维持现状不动。
  */
 import ExcelJS from 'exceljs';
 import type { Prisma, PrismaClient } from '@prisma/client';
@@ -22,6 +23,8 @@ import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { BadRequestError } from '../../lib/errors.js';
 import { getHotelNightlyRemaining } from '../hotel-control/hotel-control.service.js';
 import { fmtDateDMYDash, pnrName } from './orders.export-templates.js';
+import { flightCountCell, loadExportTripStats } from './orders.export-trip-stats.js';
+import type { TripStatsMap } from './orders.export-trip-stats.js';
 import { earliestFlightDepartureLocalDate } from './pnr-export.js';
 import { localDateISO } from '../../lib/flight-time.js';
 import { businessDateTimeSec } from '../../lib/business-time.js';
@@ -49,7 +52,12 @@ export interface RoomAllocationRow {
   hotelType: string; // 现状拼法：酒店名 · 房型名（口径缓办，维持不动）
   chineseName: string;
   pnrName: string;
-  flightCount: string; // 系统暂无数据 — 留空（口径未定，缓办）
+  /**
+   * 飞行次数 = 该乘客的常旅客历史飞行次数（TravelerProfile.tripCount 快照，按证件号归拢、
+   * 只计去程已起飞的行程）。与全岗总表 /《全岗可用》同一取数与渲染入口，同一位乘客在三张表里
+   * 的数字必然相同；匹配不到档案（新客/证件号对不上）→ 留空，不臆造 0。见 orders.export-trip-stats.ts。
+   */
+  flightCount: string;
   travelDates: string; // 'YYYY-MM-DD / YYYY-MM-DD'
   settlePrice: number; // 结算价格（人均）：round2(order.total / 乘客数)
   dateOfBirth: string; // dd-mm-yyyy
@@ -316,10 +324,14 @@ export function correlateItem<T extends CorrelatableRoomItem>(
  *   - 未分房：按房型容量顺序打包（每满一间开下一间），房号续在已分房之后。
  *
  * 乘客 ↔ item correlate（见 correlateItem）：一位乘客恰好产出一行，不做 item × 乘客笛卡尔积。
+ *
+ * tripStats：「飞行次数」列的档案快照（由 loadExportTripStats 批量拉好后传入——本函数是纯函数，
+ * 绝不在行循环里逐个查库）。缺省空 Map = 该列全部留空。
  */
 export function buildRoomAllocationSheets(
   items: RoomItemForExport[],
   remainingLookup: Map<string, string> = new Map(),
+  tripStats: TripStatsMap = new Map(),
 ): RoomAllocationSheet[] {
   // 先按订单分组占房 item（同订单可能有多条，需要整单一起 correlate 乘客归属）
   const itemsByOrder = new Map<string, AllocatableItem[]>();
@@ -390,7 +402,7 @@ export function buildRoomAllocationSheets(
         hotelType: `${hotelName} · ${it.hotelRoomType.name}`,
         chineseName: resolveChineseName(p),
         pnrName: pnrName(p),
-        flightCount: '',
+        flightCount: flightCountCell(p, tripStats),
         travelDates,
         settlePrice,
         dateOfBirth: fmtDateDMYDash(p.dateOfBirth),
@@ -687,7 +699,14 @@ async function buildWorkbookFromItems(
   client: PrismaClient,
 ): Promise<Buffer> {
   const remainingLookup = await buildDailyRemainingLookup(items, client);
-  const sheets = buildRoomAllocationSheets(items, remainingLookup);
+  // 飞行次数：一次性批量拉回本次导出全部乘客的档案快照（无 N+1，见 orders.export-trip-stats.ts），
+  // 与全岗总表 /《全岗可用》同一入口 → 同一位乘客在三张表里的数字必然相同。
+  // 同一订单跨多条占房 item 时乘客会重复出现，loadExportTripStats 内部按证件对去重，不重复查。
+  const { tripStats } = await loadExportTripStats(
+    items.flatMap((it) => it.order.passengers),
+    client,
+  );
+  const sheets = buildRoomAllocationSheets(items, remainingLookup, tripStats);
 
   const wb = new ExcelJS.Workbook();
   wb.creator = '分房表导出';

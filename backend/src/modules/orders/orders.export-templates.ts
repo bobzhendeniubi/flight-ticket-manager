@@ -5,8 +5,10 @@
  *   ticketing 《票务专用》27 列 — 代理+备注 + 航司 PNR 提交 25 列（仅含机票的订单）
  *   visa      《签证专用》21 列 — 越南签证申请表抬头（含越文表头，含签证公司列）
  *
- * 注意：系统暂无数据的列（飞行次数/单房差/抵扣人员等）保留表头、内容留空，
+ * 注意：系统暂无数据的列（单房差/抵扣人员等）保留表头、内容留空，
  * 绝不编造数据 —— 这些列是线下手工台账的占位，等后续字段补齐再填。
+ * 《全岗可用》的「飞行次数」列已有真实数据：取常旅客档案快照，与全岗总表/分房表同一取数与
+ * 渲染入口（orders.export-trip-stats.ts），同一位乘客在三张表里的数字必然相同。
  */
 import ExcelJS from 'exceljs';
 import { localDateISO } from '../../lib/flight-time.js';
@@ -31,6 +33,8 @@ import {
 } from './orders.export-trip-filter.js';
 import { determineFlightLegs } from './ticketing-cap.js';
 import { parseRoomGroups, resolveExportHotelInfo } from './orders.export-room-allocation.js';
+import { flightCountCell, loadExportTripStats } from './orders.export-trip-stats.js';
+import type { TripStatsMap } from './orders.export-trip-stats.js';
 import type { ExportTemplatesQuery } from './orders.schemas.js';
 
 export type OrderExportTemplate = ExportTemplatesQuery['template'];
@@ -345,7 +349,10 @@ interface FullRow {
   chineseName: string; // 中文名称
   passengerName: string; // 乘客姓名 LAST/FIRST + 称谓（航司口径）
   cleanName: string; // 纯拼音名 LAST/FIRST（无 MR/MS 称谓）— 财务对数/名单匹配用
-  flightCount: string; // 飞行次数 — 暂无数据，留空
+  // 飞行次数 = 该乘客的常旅客历史飞行次数（TravelerProfile.tripCount 快照，按证件号归拢、
+  // 只计去程已起飞的行程）。与全岗总表/分房表同一取数与渲染入口（orders.export-trip-stats.ts），
+  // 同一位乘客在三张表里的数字必然相同；匹配不到档案（新客/证件号对不上）→ 留空，不臆造 0。
+  flightCount: string;
   travelDates: string; // 出发(往返)日期
   flightNumbers: string; // 航班号
   orderType: string; // 订单类型
@@ -459,7 +466,15 @@ export const FULL_COLUMNS: Array<{ header: string; key: keyof FullRow; width: nu
 const FULL_COST_GROUP_HEADER = '订单成本';
 const FULL_COST_GROUP_SPAN = 3;
 
-export function orderToFullRows(order: OrderForTemplateExport, ctx: OrderContext): Omit<FullRow, 'seq'>[] {
+/**
+ * @param tripStats 「飞行次数」列的档案快照（由 loadExportTripStats 批量拉好后传入——本函数是
+ *                  纯函数，绝不在行循环里逐个查库）。缺省空 Map = 该列全部留空。
+ */
+export function orderToFullRows(
+  order: OrderForTemplateExport,
+  ctx: OrderContext,
+  tripStats: TripStatsMap = new Map(),
+): Omit<FullRow, 'seq'>[] {
   // 乘客姓名列称谓统一 MR/MS（不分年龄，0723 票务口径）。
   const departureDate = earliestFlightDeparture(order.items);
 
@@ -547,7 +562,7 @@ export function orderToFullRows(order: OrderForTemplateExport, ctx: OrderContext
     chineseName: p.chineseName ?? p.fullName,
     passengerName: nameWithTitle(p, departureDate),
     cleanName: pnrName(p),
-    flightCount: '',
+    flightCount: flightCountCell(p, tripStats),
     travelDates: ctx.travelDates,
     flightNumbers: ctx.flightNumbers,
     orderType: ctx.orderType,
@@ -812,6 +827,14 @@ export async function buildOrderTemplateExportWorkbook(
           query.tripType,
         );
 
+  // 「飞行次数」列只在《全岗可用》有（票务/签证模板无此列），故只在 full 时才拉档案快照 ——
+  // 一次性批量拉回本次导出全部乘客（无 N+1，见 orders.export-trip-stats.ts），与全岗总表/
+  // 分房表同一入口 → 同一位乘客在三张表里的数字必然相同。
+  const tripStats: TripStatsMap =
+    query.template === 'full'
+      ? (await loadExportTripStats(orders.flatMap((o) => o.passengers), client)).tripStats
+      : new Map();
+
   const wb = new ExcelJS.Workbook();
   wb.creator = `Citur Travel · 订单导出（${ORDER_TEMPLATE_LABEL[query.template]}）`;
   wb.created = new Date();
@@ -840,7 +863,7 @@ export async function buildOrderTemplateExportWorkbook(
     if (order.passengers.length === 0) continue;
     const ctx = buildOrderContext(order);
     if (query.template === 'full') {
-      for (const row of orderToFullRows(order, ctx)) {
+      for (const row of orderToFullRows(order, ctx, tripStats)) {
         seq += 1;
         ws.addRow({ seq, ...row });
       }

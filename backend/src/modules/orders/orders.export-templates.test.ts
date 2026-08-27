@@ -29,6 +29,8 @@ import {
   VISA_COLUMNS,
   type OrderForTemplateExport,
 } from './orders.export-templates.js';
+import type { TripStatsMap } from './orders.export-trip-stats.js';
+import { docKey } from '../travelers/traveler-profiles.aggregate.js';
 
 const D = (s: string): Date => new Date(s.length <= 10 ? `${s}T00:00:00.000Z` : `${s}Z`);
 
@@ -332,7 +334,6 @@ describe('《全岗可用》full 模版 — 逐列取值/格式', () => {
   it('系统暂无数据的列一律留空（绝不编造）', () => {
     for (const r of rows) {
       expect(r.isOriginalOrder).toBe('');
-      expect(r.flightCount).toBe('');
       expect(r.singleRoomDiff).toBe('');
       expect(r.offsetPerson).toBe('');
       expect(r.offsetOrder).toBe('');
@@ -346,6 +347,57 @@ describe('《全岗可用》full 模版 — 逐列取值/格式', () => {
       expect(r.costSubType).toBe('');
       expect(r.costAmount).toBe('');
     }
+  });
+
+  // ── 飞行次数 = 常旅客档案快照（不再是"暂无数据"占位）─────────────────────────────
+  // 该列曾长期留空并挂着「系统暂无数据」的注释，常旅客档案上线后数据早就有了。
+  // 口径与全岗总表 / 分房表完全一致：同一取数（loadExportTripStats）+ 同一渲染
+  // （flightCountCell），同一位乘客在三张表里的数字必然相同。
+  describe('飞行次数 = 常旅客档案快照（与全岗总表/分房表同口径）', () => {
+    it('有档案的乘客出数字，匹配不上的（新客）留空 —— 不臆造 0', () => {
+      const tripStats: TripStatsMap = new Map([
+        [
+          docKey('PASSPORT', 'EN7208993'),
+          { tripCount: 7, pendingTripCount: 2, availableTrips: 5 },
+        ],
+      ]);
+      const [a, b] = orderToFullRows(order, ctx, tripStats);
+      expect(a.flightCount).toBe('7');
+      // 档案里没有 E87654321 → 留空（0 会被读成"从没飞过"的结论）
+      expect(b.flightCount).toBe('');
+    });
+
+    it('同单不同乘客各按本人证件取，不再恒等（旧口径下整列都是空）', () => {
+      const tripStats: TripStatsMap = new Map([
+        [docKey('PASSPORT', 'EN7208993'), { tripCount: 7, pendingTripCount: 0, availableTrips: 7 }],
+        [docKey('PASSPORT', 'E87654321'), { tripCount: 1, pendingTripCount: 0, availableTrips: 1 }],
+      ]);
+      const [a, b] = orderToFullRows(order, ctx, tripStats);
+      expect(a.flightCount).toBe('7');
+      expect(b.flightCount).toBe('1');
+    });
+
+    it('档案里 tripCount=0（已建档但去程都还没起飞）→ 如实写 0，与"匹配不上"区分', () => {
+      const tripStats: TripStatsMap = new Map([
+        [docKey('PASSPORT', 'EN7208993'), { tripCount: 0, pendingTripCount: 3, availableTrips: 0 }],
+      ]);
+      const [a] = orderToFullRows(order, ctx, tripStats);
+      expect(a.flightCount).toBe('0');
+    });
+
+    it('证件号大小写/空格变体 → 仍按 docKey 归一命中（与档案聚合同款归一）', () => {
+      const variant = fixtureRoundTrip();
+      (variant.passengers[0] as { documentNumber: string }).documentNumber = ' en7208993 ';
+      const tripStats: TripStatsMap = new Map([
+        [docKey('PASSPORT', 'EN7208993'), { tripCount: 7, pendingTripCount: 0, availableTrips: 7 }],
+      ]);
+      const [a] = orderToFullRows(variant, buildOrderContext(variant), tripStats);
+      expect(a.flightCount).toBe('7');
+    });
+
+    it('缺省 tripStats（未传）→ 整列留空，绝不回落成航段数', () => {
+      for (const r of orderToFullRows(order, ctx)) expect(r.flightCount).toBe('');
+    });
   });
 
   it('签证状态/选项：填真值', () => {
@@ -856,6 +908,87 @@ describe('导出 · 生日为空（dateOfBirth=null）', () => {
     const rows = orderToTicketingRows(order, ctx);
     expect(rows[0].dob).toBe('');
     expect(rows[1].dob).toBe('15Jun19');
+  });
+});
+
+// ── 飞行次数取数接进 buildOrderTemplateExportWorkbook（取数 → 渲染全链路）───────────
+// 纯映射测试证明「给了快照就出数字」，这里证明导出**确实去拉了**快照 —— 早先该列留空
+// 正是因为链路根本没接上（渲染层写死空串）。同时锁住批量口径：一次 findMany 覆盖全部乘客。
+describe('buildOrderTemplateExportWorkbook 飞行次数取数', () => {
+  interface ProfileRow {
+    id: string;
+    documentType: string;
+    documentNumber: string;
+    tripCount: number;
+    pendingTripCount: number;
+    refreshedAt: Date;
+    mergedIntoId: string | null;
+  }
+
+  function profile(documentNumber: string, tripCount: number): ProfileRow {
+    return {
+      id: `tp-${documentNumber}`,
+      documentType: 'PASSPORT',
+      documentNumber,
+      tripCount,
+      pendingTripCount: 0,
+      refreshedAt: D('2026-07-01T00:00:00.000'),
+      mergedIntoId: null,
+    };
+  }
+
+  function fakeClient(
+    orders: OrderForTemplateExport[],
+    profiles: ProfileRow[],
+  ): { client: PrismaClient; profileFindMany: ReturnType<typeof vi.fn> } {
+    const profileFindMany = vi.fn().mockResolvedValue(profiles);
+    const client = {
+      order: { findMany: vi.fn().mockResolvedValue(orders) },
+      // count > 0 → 不触发空表首建兜底（那是新环境才走的分支）
+      travelerProfile: { count: vi.fn().mockResolvedValue(42), findMany: profileFindMany },
+      travelerBenefitRedemption: { groupBy: vi.fn().mockResolvedValue([]) },
+    } as unknown as PrismaClient;
+    return { client, profileFindMany };
+  }
+
+  /** 读《全岗可用》第 n 条数据行的「飞行次数」单元格（两行表头 → 数据从第 3 行起）。*/
+  async function flightCountCells(buf: Buffer): Promise<unknown[]> {
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(buf as unknown as Parameters<typeof wb.xlsx.load>[0]);
+    const ws = wb.getWorksheet('全岗可用');
+    if (!ws) throw new Error('全岗可用 sheet 不存在');
+    const col = FULL_COLUMNS.findIndex((c) => c.key === 'flightCount') + 1;
+    return [3, 4].map((row) => ws.getRow(row).getCell(col).value);
+  }
+
+  const fullQuery = {
+    template: 'full',
+    travelFrom: '2026-07-13',
+    travelTo: '2026-07-13',
+  } as Parameters<typeof buildOrderTemplateExportWorkbook>[0];
+
+  it('有档案的乘客在 xlsx 里出数字、无档案的留空（此前整列恒空）', async () => {
+    const { client } = fakeClient([fixtureRoundTrip()], [profile('EN7208993', 9)]);
+    const cells = await flightCountCells(await buildOrderTemplateExportWorkbook(fullQuery, client));
+    expect(cells[0]).toBe('9');
+    expect(cells[1] ?? '').toBe(''); // 第二位乘客无档案 → 空单元格
+  });
+
+  it('批量取数：全部乘客一条 findMany 拉回，不在行循环里逐个查库', async () => {
+    const { client, profileFindMany } = fakeClient([fixtureRoundTrip()], []);
+    await buildOrderTemplateExportWorkbook(fullQuery, client);
+    expect(profileFindMany).toHaveBeenCalledTimes(1);
+    const or = profileFindMany.mock.calls[0][0].where.OR as { documentNumber: { equals: string } }[];
+    expect(or.map((c) => c.documentNumber.equals).sort()).toEqual(['E87654321', 'EN7208993']);
+  });
+
+  it('票务/签证模板无「飞行次数」列 → 压根不去拉档案', async () => {
+    const { client, profileFindMany } = fakeClient([fixtureRoundTrip()], []);
+    await buildOrderTemplateExportWorkbook(
+      { template: 'ticketing' } as Parameters<typeof buildOrderTemplateExportWorkbook>[0],
+      client,
+    );
+    expect(profileFindMany).not.toHaveBeenCalled();
   });
 });
 

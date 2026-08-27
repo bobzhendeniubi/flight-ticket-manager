@@ -31,6 +31,8 @@ import {
   COLUMNS,
   type RoomItemForExport,
 } from './orders.export-room-allocation.js';
+import type { TripStatsMap } from './orders.export-trip-stats.js';
+import { docKey } from '../travelers/traveler-profiles.aggregate.js';
 
 const D = (s: string): Date => new Date(`${s}T00:00:00.000Z`);
 /** 带时分秒的完整 ISO 时间戳（录入时间 enteredAt 断言用，D() 只到日粒度）。*/
@@ -62,6 +64,7 @@ function fixtureItems(): RoomItemForExport[] {
         firstName: 'san',
         gender: 'M',
         dateOfBirth: D('1997-12-11'),
+        documentType: 'PASSPORT',
         documentNumber: 'E12345678',
         passportIssueDate: D('2020-06-15'),
         passportExpiry: D('2030-01-05'),
@@ -74,6 +77,7 @@ function fixtureItems(): RoomItemForExport[] {
         firstName: null,
         gender: 'F',
         dateOfBirth: D('2000-01-02'),
+        documentType: 'PASSPORT',
         documentNumber: 'E87654321',
         passportIssueDate: null,
         passportExpiry: null,
@@ -101,6 +105,7 @@ function fixtureItems(): RoomItemForExport[] {
         firstName: 'WU',
         gender: null,
         dateOfBirth: D('1988-03-09'),
+        documentType: 'PASSPORT',
         documentNumber: 'E00000001',
         passportIssueDate: null,
         passportExpiry: D('2031-12-31'),
@@ -149,7 +154,7 @@ describe('buildRoomAllocationSheets', () => {
     expect(r1.agency).toBe('直客');
     expect(r1.chineseName).toBe('张三');
     expect(r1.pnrName).toBe('ZHANG/SAN');
-    expect(r1.flightCount).toBe('');
+    expect(r1.flightCount).toBe(''); // 本用例未传 tripStats → 留空（真值口径见下方 describe）
     expect(r1.travelDates).toBe('2026-07-10 / 2026-07-14');
     expect(r1.dateOfBirth).toBe('11-12-1997');
     expect(r1.gender).toBe('M');
@@ -210,6 +215,66 @@ describe('buildRoomAllocationSheets', () => {
 
   it('空输入 → 无 sheet', () => {
     expect(buildRoomAllocationSheets([])).toEqual([]);
+  });
+});
+
+// ── 飞行次数 = 常旅客档案快照（不再是"暂无数据"占位）───────────────────────────────
+// 该列曾长期留空并挂着「系统暂无数据、口径未定」的注释，常旅客档案上线后数据早就有了。
+// 口径与全岗总表 /《全岗可用》完全一致：同一取数（loadExportTripStats）+ 同一渲染
+// （flightCountCell），同一位乘客在三张表里的数字必然相同。
+describe('飞行次数 = 常旅客档案快照（与全岗总表/《全岗可用》同口径）', () => {
+  /** fixture 第一个 sheet（7-10）两行：p1=E12345678（A酒店）、p2=E87654321（B酒店）。*/
+  function rowsWith(tripStats: TripStatsMap): { flightCount: string; documentNumber: string }[] {
+    return buildRoomAllocationSheets(fixtureItems(), new Map(), tripStats)[0].rows;
+  }
+
+  it('有档案的乘客出数字，匹配不上的（新客）留空 —— 不臆造 0', () => {
+    const [r1, r2] = rowsWith(
+      new Map([
+        [docKey('PASSPORT', 'E12345678'), { tripCount: 7, pendingTripCount: 2, availableTrips: 5 }],
+      ]),
+    );
+    expect(r1.documentNumber).toBe('E12345678');
+    expect(r1.flightCount).toBe('7');
+    // 档案里没有 E87654321 → 留空（0 会被读成"从没飞过"的结论）
+    expect(r2.documentNumber).toBe('E87654321');
+    expect(r2.flightCount).toBe('');
+  });
+
+  it('同一 sheet 内不同乘客各按本人证件取，互不相同', () => {
+    const [r1, r2] = rowsWith(
+      new Map([
+        [docKey('PASSPORT', 'E12345678'), { tripCount: 7, pendingTripCount: 0, availableTrips: 7 }],
+        [docKey('PASSPORT', 'E87654321'), { tripCount: 1, pendingTripCount: 0, availableTrips: 1 }],
+      ]),
+    );
+    expect(r1.flightCount).toBe('7');
+    expect(r2.flightCount).toBe('1');
+  });
+
+  it('档案里 tripCount=0（已建档但去程都还没起飞）→ 如实写 0，与"匹配不上"区分', () => {
+    const [r1] = rowsWith(
+      new Map([
+        [docKey('PASSPORT', 'E12345678'), { tripCount: 0, pendingTripCount: 3, availableTrips: 0 }],
+      ]),
+    );
+    expect(r1.flightCount).toBe('0');
+  });
+
+  it('证件号大小写/空格变体 → 仍按 docKey 归一命中（与档案聚合同款归一）', () => {
+    const items = fixtureItems();
+    (items[0].order.passengers[0] as { documentNumber: string }).documentNumber = ' e12345678 ';
+    const tripStats: TripStatsMap = new Map([
+      [docKey('PASSPORT', 'E12345678'), { tripCount: 7, pendingTripCount: 0, availableTrips: 7 }],
+    ]);
+    const [r1] = buildRoomAllocationSheets(items, new Map(), tripStats)[0].rows;
+    expect(r1.flightCount).toBe('7');
+  });
+
+  it('缺省 tripStats（未传）→ 整列留空，绝不编造', () => {
+    for (const sheet of buildRoomAllocationSheets(fixtureItems())) {
+      for (const r of sheet.rows) expect(r.flightCount).toBe('');
+    }
   });
 });
 
@@ -661,6 +726,45 @@ describe('buildRoomAllocationWorkbook 选单口径', () => {
       buildRoomAllocationWorkbook({ from: '2026-07-01', to: '2026-08-01' }, client),
     ).rejects.toThrow(/14/u);
     expect(findMany).not.toHaveBeenCalled();
+  });
+});
+
+// ── 飞行次数取数接进 buildRoomAllocationWorkbook（取数链路）───────────────────────
+// 纯映射测试证明「给了快照就出数字」，这里证明导出**确实去拉了**快照 —— 早先该列留空
+// 正是因为链路根本没接上（渲染层写死空串）。同时锁住批量口径：一次 findMany 覆盖全部乘客
+// （同一订单跨多条占房 item 时乘客会重复出现，按证件对去重后不重复查）。
+describe('buildRoomAllocationWorkbook 飞行次数取数', () => {
+  function tripStatsClient(items: RoomItemForExport[]): {
+    client: PrismaClient;
+    profileFindMany: ReturnType<typeof vi.fn>;
+  } {
+    const profileFindMany = vi.fn().mockResolvedValue([]);
+    const client = {
+      orderItem: { findMany: vi.fn().mockResolvedValue(items) },
+      // count > 0 → 不触发空表首建兜底（那是新环境才走的分支）
+      travelerProfile: { count: vi.fn().mockResolvedValue(42), findMany: profileFindMany },
+      travelerBenefitRedemption: { groupBy: vi.fn().mockResolvedValue([]) },
+    } as unknown as PrismaClient;
+    return { client, profileFindMany };
+  }
+
+  it('批量取数：本次导出全部乘客一条 findMany 拉回，不在行循环里逐个查库', async () => {
+    const { client, profileFindMany } = tripStatsClient(fixtureItems());
+    await buildRoomAllocationWorkbook({ from: '2026-07-10', to: '2026-07-12' }, client);
+
+    expect(profileFindMany).toHaveBeenCalledTimes(1);
+    const or = profileFindMany.mock.calls[0][0].where.OR as { documentNumber: { equals: string } }[];
+    expect(or.map((c) => c.documentNumber.equals).sort()).toEqual([
+      'E00000001',
+      'E12345678',
+      'E87654321',
+    ]);
+  });
+
+  it('没有任何占房行 → 不去拉档案（空导出不该白查一次库）', async () => {
+    const { client, profileFindMany } = tripStatsClient([]);
+    await buildRoomAllocationWorkbook({ from: '2026-07-10', to: '2026-07-12' }, client);
+    expect(profileFindMany).not.toHaveBeenCalled();
   });
 });
 
