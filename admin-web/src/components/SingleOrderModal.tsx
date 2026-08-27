@@ -1,24 +1,25 @@
 /**
- * 单笔录单弹窗（按产品类型）—— 运营手工录一笔订单。
+ * 手工录单弹窗 —— 运营手工录一笔订单，**一张单可以挂多个产品**。
  *
- * 流程：选产品类型（机票 / 酒店 / 签证 / 套餐 / 接送）→ 填该类型字段
- *      → 选归属代理（或直客）→ 填出行人 + 备注 → 提交 POST /orders。
+ * 流程：选第一个产品类型（机票 / 酒店 / 签证 / 套餐 / 接送）→ 填字段
+ *      →（可选）「＋ 添加产品」再加区块 → 选归属代理（或直客）→ 填出行人 + 备注
+ *      → 提交 POST /orders（各区块的订单行合并进同一张单）。
+ *
+ * 混挂规则：机票 / 酒店 / 签证 / 接送可自由组合、同类型可多条（「往返机票 + 只住一晚酒店」
+ *      不必再拆两张单）；**套餐（BUNDLE）独占一张订单** —— 套餐自带加项 / 指定酒店加价 /
+ *      升舱通道，与其它产品混挂会跟套餐盖章、批量优惠口径打架。
  *
  * 价格：表单只送产品引用 + 数量/占座，服务端按产品权威重算（HOTEL/VISA/TRANSFER 后端定价、
  *      BUNDLE/FLIGHT 后端重算），因此 HOTEL/VISA/TRANSFER/BUNDLE 行的 unitPrice 一律占位 0。
  *
- * 与「批量创单」并存：批量创单服务票务整班散客；本弹窗服务单笔多产品类型录单。
+ * 与「批量创单」并存：批量创单服务票务整班散客；本弹窗服务单笔多产品录单。
  */
-import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   api,
   ApiError,
   duplicatePassengerConflictOrderNumbers,
   hotelControlOpsApi,
-  randomStarTierLabel,
-  poolOptionValue,
-  poolTierFromOptionValue,
-  RANDOM_STAR_TIERS,
   type AdminFlight,
   type AdminSchedule,
   type AgentListItem,
@@ -46,32 +47,35 @@ import {
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { NumberInput } from './NumberInput';
-import { Icon, type IconName } from './Icon';
+import { Icon } from './Icon';
 import { PassengerSuggestInput } from './PassengerSuggestInput';
 import { ProofImageViewer } from './ProofImageViewer';
 import { RoomingEditor, type RoomingPassenger } from './RoomingEditor';
 import { SearchSelect, type SearchSelectOption } from './SearchSelect';
 import { useDialogA11y } from './Modal';
+import {
+  addDays,
+  buildProductBlockItems,
+  createProductBlock,
+  localYmd,
+  BLOCK_PASSENGERS_REQUIRED,
+  PRODUCT_BLOCK_LABEL,
+  PRODUCT_BLOCK_TABS,
+  ProductBlockCard,
+  ProductBlockFields,
+  type MixableBlockKind,
+  type ProductBlock,
+  type ProductBlockBuildContext,
+  type ProductBlockKind,
+} from './SingleOrderProductBlock';
 import { formatLocalTime } from '../lib/airports';
 import { composePassengerFullName, normalizePassengerFullName } from '../lib/passengerName';
 
-// ── 产品类型 ──────────────────────────────────────────────────────────
-type ProductKind = 'FLIGHT' | 'HOTEL' | 'VISA' | 'BUNDLE' | 'TRANSFER';
-
-const KIND_TABS: Array<{ kind: ProductKind; label: string; icon: IconName }> = [
-  { kind: 'FLIGHT', label: '机票', icon: 'plane' },
-  { kind: 'HOTEL', label: '酒店', icon: 'hotel' },
-  { kind: 'VISA', label: '签证', icon: 'visa' },
-  { kind: 'BUNDLE', label: '套餐', icon: 'gift' },
-  { kind: 'TRANSFER', label: '接送', icon: 'car' },
-];
-
-const CABIN_ZH: Record<string, string> = {
-  ECONOMY: '经济舱',
-  PREMIUM_ECONOMY: '超级经济舱',
-  BUSINESS: '商务舱',
-  FIRST: '头等舱',
-};
+/**
+ * 一张订单最多挂几个产品区块。后端 items 上限 20 条，往返机票区块一块就是 2 行，
+ * 再加调价/结算差额行仍有富余 —— 取 8 是「够用且绝不会撞上限」的保守值。
+ */
+const MAX_PRODUCT_BLOCKS = 8;
 
 // 结算价档次中文名（与 SettlementRatesPage / ProductsPage 同一份口径）。
 const SETTLEMENT_TIER_ZH: Record<SettlementTier, string> = {
@@ -91,25 +95,14 @@ const SETTLEMENT_TIER_STAR: Record<SettlementTier, number> = {
   INTL_5STAR: 5,
 };
 
-// FLIGHT / BUNDLE / VISA 必须填出行人；纯 HOTEL / TRANSFER 出行人选填。
-const PASSENGERS_REQUIRED: Record<ProductKind, boolean> = {
-  FLIGHT: true,
-  BUNDLE: true,
-  VISA: true,
-  HOTEL: false,
-  TRANSFER: false,
-};
-
-// 签证状态默认值按产品类型派生（反馈：单机票/纯酒店/纯接送不可能需要签证台跟进）：
-// 签证 / 套餐本身涉及签证 → 默认「需要」；机票 / 酒店 / 接送 → 默认「不需要」。
-// 仅作为「未手动改过」时的跟随默认值，见 visaStatusTouchedRef。
-const DEFAULT_VISA_STATUS: Record<ProductKind, VisaStatusInput> = {
-  FLIGHT: 'NOT_NEEDED',
-  HOTEL: 'NOT_NEEDED',
-  TRANSFER: 'NOT_NEEDED',
-  BUNDLE: 'NEEDED',
-  VISA: 'NEEDED',
-};
+/**
+ * 签证状态默认值按本单产品派生（反馈：单机票/纯酒店/纯接送不可能需要签证台跟进）：
+ * 含签证 / 套餐区块 → 默认「需要」；其余组合 → 默认「不需要」。
+ * 仅作为「未手动改过」时的跟随默认值，见 visaStatusTouchedRef。
+ */
+function defaultVisaStatusFor(kinds: ReadonlyArray<ProductBlockKind>): VisaStatusInput {
+  return kinds.some((k) => k === 'VISA' || k === 'BUNDLE') ? 'NEEDED' : 'NOT_NEEDED';
+}
 
 // 护照图上限（一单）：每张存库 base64 约 0.7–1MB，后端单次请求上限 25MB，留足余量取 20。
 // 既在界面写明，也在「批量传护照 / 单张 OCR」两处强制；超出请分单录入。
@@ -233,14 +226,6 @@ function parseDob(raw: string): string | null {
   return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
 }
 
-/** 入住→退房晚数；非正返回 0。 */
-function nightsBetween(checkIn: string, checkOut: string): number {
-  const a = new Date(checkIn);
-  const b = new Date(checkOut);
-  const diff = Math.round((b.getTime() - a.getTime()) / 86400_000);
-  return diff > 0 ? diff : 0;
-}
-
 // ── 套餐航段自动派生（去程/回程班次按出发日期匹配；时间按澳门时区显示）──────
 // 套餐固定航线：去程 MFM→DAD（澳门→岘港），回程 DAD→MFM（岘港→澳门，QH9588）。
 const BUNDLE_GO_ORIGIN = 'MFM';
@@ -294,43 +279,6 @@ function resolveBundleNights(
   return Math.max(1, raw);
 }
 
-/**
- * 班次 departureTime 是 UTC ISO；departureTz 决定它属于哪一"天"。
- * 用 Intl parts 取本地年月日（en-CA → YYYY-MM-DD），跟 formatLocalDate 同口径，
- * 避免 UTC slice 跨日错位（08:40 vs 16:40 那类时区 bug 的根因）。
- */
-function localYmd(iso: string, tz: string): string {
-  try {
-    const parts = new Intl.DateTimeFormat('en-CA', {
-      timeZone: tz,
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-    }).formatToParts(new Date(iso));
-    const y = parts.find((p) => p.type === 'year')?.value ?? '0000';
-    const m = parts.find((p) => p.type === 'month')?.value ?? '01';
-    const d = parts.find((p) => p.type === 'day')?.value ?? '01';
-    return `${y}-${m}-${d}`;
-  } catch {
-    return iso.slice(0, 10);
-  }
-}
-
-/** departDate（YYYY-MM-DD）+ 晚数 → 退房/回程日期（YYYY-MM-DD）。 */
-function addDays(ymd: string, days: number): string {
-  const [y, m, d] = ymd.split('-').map(Number);
-  const dt = new Date(Date.UTC(y, (m || 1) - 1, d || 1));
-  dt.setUTCDate(dt.getUTCDate() + days);
-  return `${dt.getUTCFullYear()}-${String(dt.getUTCMonth() + 1).padStart(2, '0')}-${String(dt.getUTCDate()).padStart(2, '0')}`;
-}
-
-/** 余位可能为负（超售口径不再钳 0），负数按「超售 N」展示，避免误读为可售。 */
-function cabinAvailText(available: number): string {
-  if (available > 0) return `余 ${available}`;
-  if (available === 0) return '售罄';
-  return `超售 ${-available}`;
-}
-
 interface SingleOrderModalProps {
   onClose: () => void;
   onCreated: () => void;
@@ -343,7 +291,13 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const token = tokens?.accessToken ?? '';
   const recorderLabel = user?.displayName || user?.email || '当前账号';
 
-  const [kind, setKind] = useState<ProductKind>('FLIGHT');
+  /**
+   * 本单的产品区块列表（唯一真源）。首块的类型由顶部「产品类型」标签切换，
+   * 其余块各自带类型下拉 + 删除。不变式：一旦出现套餐区块，列表长度恒为 1（套餐独占）。
+   */
+  const [blocks, setBlocks] = useState<ProductBlock[]>(() => [createProductBlock('FLIGHT')]);
+  const firstKind: ProductBlockKind = blocks[0]?.kind ?? 'FLIGHT';
+  const isBundleOrder = firstKind === 'BUNDLE';
 
   // 联系人（选填；缺省默认=录入人本人，后端缺联系人时也会回退到录入人）
   const [contactName, setContactName] = useState(recorderLabel);
@@ -357,9 +311,9 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
 
   const [notes, setNotes] = useState('');
   // 签证状态 + 结构化备注（酒店/签证/付款/特殊要求）
-  // 默认值按当前产品类型派生（见 DEFAULT_VISA_STATUS）；用户手动改过下拉后，
-  // 由 visaStatusTouchedRef 记住，kind 再切换也不会覆盖用户的手动选择。
-  const [visaStatus, setVisaStatus] = useState<VisaStatusInput>(() => DEFAULT_VISA_STATUS[kind]);
+  // 默认值按本单产品派生（见 defaultVisaStatusFor）；用户手动改过下拉后，
+  // 由 visaStatusTouchedRef 记住，产品再变也不会覆盖用户的手动选择。
+  const [visaStatus, setVisaStatus] = useState<VisaStatusInput>('NOT_NEEDED');
   const visaStatusTouchedRef = useRef(false);
   const [noteHotel, setNoteHotel] = useState('');
   const [noteVisa, setNoteVisa] = useState('');
@@ -410,41 +364,13 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   // 明细行价格，原价/差额留痕可审计。与下方手工「调整金额」互斥（服务端 400，前端也阻断提交）。
   const [settlementPrice, setSettlementPrice] = useState<number | null>(null);
 
-  // ── 机票 ──
-  // 单程 / 往返：往返时出港 + 回程各生成一条 FLIGHT 行（同一批出行人，人数不翻倍）。
-  const [flightTripType, setFlightTripType] = useState<'ONEWAY' | 'ROUNDTRIP'>('ONEWAY');
-  const [flights, setFlights] = useState<AdminFlight[]>([]);
-  const [flightId, setFlightId] = useState('');
-  const [schedules, setSchedules] = useState<AdminSchedule[]>([]);
-  const [scheduleId, setScheduleId] = useState('');
-  const [cabin, setCabin] = useState<CabinClass | ''>('');
-  // 出港「起飞日期（可手输）」：先选/手输日期，再从当日班次里挑，避免班次下拉过长。留空=全部班次。
-  const [flightDate, setFlightDate] = useState('');
-  // 回程航段（仅往返）：可与出港不同航班/日期/舱位，各自生成一条 FLIGHT 行。
-  const [returnFlightId, setReturnFlightId] = useState('');
-  const [returnSchedules, setReturnSchedules] = useState<AdminSchedule[]>([]);
-  const [returnScheduleId, setReturnScheduleId] = useState('');
-  const [returnCabin, setReturnCabin] = useState<CabinClass | ''>('');
-  const [returnDate, setReturnDate] = useState('');
-
-  // ── 酒店 ──
-  // hotelId 也可以是星级随机池的哨兵值（见 poolOptionValue）——客人买「N 星随机」，
+  // ── 产品目录（各区块共用一份，按本单用到的类型按需加载）──
+  // hotels 里的星级随机池是哨兵项（见 poolOptionValue）——客人买「N 星随机」，
   // 下单时不指定酒店，占房控的星级随机池库存，之后由房控落到具体酒店。
+  const [flights, setFlights] = useState<AdminFlight[]>([]);
   const [hotels, setHotels] = useState<Hotel[]>([]);
-  const [hotelId, setHotelId] = useState('');
-  const [roomTypeId, setRoomTypeId] = useState('');
-  const [checkIn, setCheckIn] = useState('');
-  const [checkOut, setCheckOut] = useState('');
-  const [rooms, setRooms] = useState<number | null>(1);
-  // 星级随机池行没有房型可查价 → 运营手录每间每晚售价（与「无产品 id 的地面行」同一条既有口径）
-  const [poolNightlyPrice, setPoolNightlyPrice] = useState<number | null>(null);
-
-  // ── 签证 ──
   const [visas, setVisas] = useState<Visa[]>([]);
-  const [visaId, setVisaId] = useState('');
-  const [visaQty, setVisaQty] = useState<number | null>(1);
-  // 加急档名（'' = 不加急）。只存档名，加价金额一律服务端按产品的加急档位表查出。
-  const [visaExpressTierLabel, setVisaExpressTierLabel] = useState('');
+  const [transfers, setTransfers] = useState<Transfer[]>([]);
 
   // ── 套餐 ──
   const [bundles, setBundles] = useState<Bundle[]>([]);
@@ -472,20 +398,58 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const [bundleGoFlightId, setBundleGoFlightId] = useState('');
   const [bundleRetFlightId, setBundleRetFlightId] = useState('');
 
-  // ── 接送 ──
-  const [transfers, setTransfers] = useState<Transfer[]>([]);
-  const [transferId, setTransferId] = useState('');
-  const [transferDate, setTransferDate] = useState('');
-  const [transferQty, setTransferQty] = useState<number | null>(1);
+  // ── 区块增删改 ──────────────────────────────────────────────────────
+  const blockKinds = useMemo(() => blocks.map((b) => b.kind), [blocks]);
+  /** 目录按需加载：只有本单真的用到该类型才去拉列表（套餐还要酒店/航班列表）。 */
+  const needsFlightCatalog = blockKinds.some((k) => k === 'FLIGHT' || k === 'BUNDLE');
+  const needsHotelCatalog = blockKinds.some((k) => k === 'HOTEL' || k === 'BUNDLE');
+  const needsVisaCatalog = blockKinds.includes('VISA');
+  const needsTransferCatalog = blockKinds.includes('TRANSFER');
+  const canAddBlock = !isBundleOrder && blocks.length < MAX_PRODUCT_BLOCKS;
 
-  // 切换产品类型时，若用户没手动改过签证状态下拉，自动跟随新 kind 的默认值
+  const patchBlock = useCallback((id: string, patch: Partial<ProductBlock>): void => {
+    setBlocks((prev) => prev.map((b) => (b.id === id ? { ...b, ...patch } : b)));
+  }, []);
+
+  /** 顶部标签切换首块类型。切到/切离套餐都整列重置（套餐独占一张单）。 */
+  function switchFirstKind(next: ProductBlockKind): void {
+    setErr(null);
+    setBlocks((prev) => {
+      if (prev[0]?.kind === next) return prev;
+      if (next === 'BUNDLE' || prev[0]?.kind === 'BUNDLE') return [createProductBlock(next)];
+      return prev.map((b, i) => (i === 0 ? createProductBlock(next) : b));
+    });
+  }
+
+  function addBlock(): void {
+    setErr(null);
+    setBlocks((prev) =>
+      prev.some((b) => b.kind === 'BUNDLE') || prev.length >= MAX_PRODUCT_BLOCKS
+        ? prev
+        : [...prev, createProductBlock('HOTEL')],
+    );
+  }
+
+  /** 换类型 = 整块重建（换新 id，让区块内部的班次列表等派生态一并复位）。 */
+  function changeBlockKind(id: string, next: MixableBlockKind): void {
+    setErr(null);
+    setBlocks((prev) => prev.map((b) => (b.id === id ? createProductBlock(next) : b)));
+  }
+
+  function removeBlock(id: string): void {
+    setErr(null);
+    setBlocks((prev) => (prev.length <= 1 ? prev : prev.filter((b) => b.id !== id)));
+  }
+
+  // 产品变化时，若用户没手动改过签证状态下拉，自动跟随新的默认值
   // （如从「套餐」切到「机票」，未手动改过则从「需要」自动回落到「不需要」）；
-  // 一旦用户手动改过下拉，touched 记住这次选择，后续再切 kind 也不会覆盖。
+  // 一旦用户手动改过下拉，touched 记住这次选择，后续产品再变也不会覆盖。
   // 注：乘客级「自备签」是逐位定价项，不再联动订单级签证状态——部分乘客自备签不代表整单不需要送签。
+  const derivedVisaStatus = defaultVisaStatusFor(blockKinds);
   useEffect(() => {
     if (visaStatusTouchedRef.current) return;
-    setVisaStatus(DEFAULT_VISA_STATUS[kind]);
-  }, [kind]);
+    setVisaStatus(derivedVisaStatus);
+  }, [derivedVisaStatus]);
 
   // 代理列表（ADMIN/STAFF/AGENT 都能拉自己可见的代理；用于归属选择）
   useEffect(() => {
@@ -496,31 +460,11 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       .catch(() => undefined); // 无代理可选不致命
   }, [token]);
 
-  // 机票/套餐：航班列表（机票 tab 与套餐机票航段共用）
+  // 机票/套餐：航班列表（机票区块与套餐机票航段共用；各机票区块的班次列表由区块自己拉）
   useEffect(() => {
-    if (!token || (kind !== 'FLIGHT' && kind !== 'BUNDLE') || flights.length > 0) return;
+    if (!token || !needsFlightCatalog || flights.length > 0) return;
     api.listAllFlights(token).then((r) => setFlights(r.flights)).catch(() => setErr('航班列表加载失败'));
-  }, [token, kind, flights.length]);
-
-  // 机票：选航班后拉班次
-  useEffect(() => {
-    if (!token || !flightId) {
-      setSchedules([]);
-      setScheduleId('');
-      return;
-    }
-    api.listSchedules(token, flightId).then((r) => setSchedules(r.schedules)).catch(() => setErr('班次加载失败'));
-  }, [token, flightId]);
-
-  // 机票（往返）：选回程航班后拉回程班次
-  useEffect(() => {
-    if (!token || !returnFlightId) {
-      setReturnSchedules([]);
-      setReturnScheduleId('');
-      return;
-    }
-    api.listSchedules(token, returnFlightId).then((r) => setReturnSchedules(r.schedules)).catch(() => setErr('回程班次加载失败'));
-  }, [token, returnFlightId]);
+  }, [token, needsFlightCatalog, flights.length]);
 
   // 套餐机票航段：选了套餐 + 航班列表就绪后，预拉两个方向（去程 MFM→DAD / 回程 DAD→MFM）
   // 的全部班次池；后续按「出发日期」本地日期匹配派生具体班次。
@@ -528,7 +472,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   // 不能只取第一条命中航班——否则该航线上其余航空公司的班次会被漏查，
   // 出现"某月份明明有班次却提示没有匹配班次"的假阴性（取决于航班列表返回顺序）。
   useEffect(() => {
-    if (!token || kind !== 'BUNDLE' || !bundleId || flights.length === 0) {
+    if (!token || !isBundleOrder || !bundleId || flights.length === 0) {
       setBundleGoSchedulePool([]);
       setBundleRetSchedulePool([]);
       return;
@@ -553,7 +497,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     } else {
       setBundleRetSchedulePool([]);
     }
-  }, [token, kind, bundleId, flights]);
+  }, [token, isBundleOrder, bundleId, flights]);
 
   // 切换套餐后清空运营手选的航班号：不同套餐的绑定/候选航班不同，避免带入上一套餐的选择。
   useEffect(() => {
@@ -563,51 +507,29 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
 
   // 酒店列表
   useEffect(() => {
-    // 套餐 tab 也要酒店列表：指定酒店下拉（0805）。
-    if ((kind !== 'HOTEL' && kind !== 'BUNDLE') || hotels.length > 0) return;
+    // 套餐也要酒店列表：指定酒店下拉。
+    if (!needsHotelCatalog || hotels.length > 0) return;
     api.listHotels(false).then((r) => setHotels(r.hotels)).catch(() => setErr('酒店列表加载失败'));
-  }, [kind, hotels.length]);
+  }, [needsHotelCatalog, hotels.length]);
 
   // 签证列表
   useEffect(() => {
-    if (kind !== 'VISA' || visas.length > 0) return;
+    if (!needsVisaCatalog || visas.length > 0) return;
     api.listVisas(false).then((r) => setVisas(r.visas)).catch(() => setErr('签证列表加载失败'));
-  }, [kind, visas.length]);
+  }, [needsVisaCatalog, visas.length]);
 
   // 套餐列表
   useEffect(() => {
-    if (kind !== 'BUNDLE' || bundles.length > 0) return;
+    if (!isBundleOrder || bundles.length > 0) return;
     api.listBundles(false).then((r) => setBundles(r.bundles)).catch(() => setErr('套餐列表加载失败'));
-  }, [kind, bundles.length]);
+  }, [isBundleOrder, bundles.length]);
 
   // 接送列表
   useEffect(() => {
-    if (kind !== 'TRANSFER' || transfers.length > 0) return;
+    if (!needsTransferCatalog || transfers.length > 0) return;
     api.listTransfers(false).then((r) => setTransfers(r.transfers)).catch(() => setErr('接送列表加载失败'));
-  }, [kind, transfers.length]);
+  }, [needsTransferCatalog, transfers.length]);
 
-  const flight = flights.find((f) => f.id === flightId);
-  const schedule = schedules.find((s) => s.id === scheduleId);
-  const cabinOptions = schedule?.seatClasses ?? [];
-  const returnFlight = flights.find((f) => f.id === returnFlightId);
-  const returnSchedule = returnSchedules.find((s) => s.id === returnScheduleId);
-  const returnCabinOptions = returnSchedule?.seatClasses ?? [];
-  // 按「起飞日期」过滤班次（本地日期与下拉展示口径一致：localYmd）；日期留空则显示全部。
-  const schedulesForDate = useMemo(
-    () => (flightDate ? schedules.filter((s) => localYmd(s.departureTime, s.departureTz) === flightDate) : schedules),
-    [schedules, flightDate],
-  );
-  const returnSchedulesForDate = useMemo(
-    () => (returnDate ? returnSchedules.filter((s) => localYmd(s.departureTime, s.departureTz) === returnDate) : returnSchedules),
-    [returnSchedules, returnDate],
-  );
-  const hotel = hotels.find((h) => h.id === hotelId);
-  const roomType = hotel?.roomTypes.find((rt) => rt.id === roomTypeId);
-  /** 当前酒店下拉选中的是星级随机池时的档次；选的是真实酒店 → null。 */
-  const poolTier = poolTierFromOptionValue(hotelId);
-  const visa = visas.find((v) => v.id === visaId);
-  // 该签证产品配置的加急档位（未配 = 空数组 → 不显示加急下拉，行为与扩展前一致）。
-  const visaExpressTiers = visa?.expressTiers ?? [];
   const bundle = bundles.find((b) => b.id === bundleId);
 
   // 套餐「指定酒店」下拉分组：真实酒店 / 星级随机档占位酒店（randomTierPlaceholder != null）。
@@ -626,13 +548,6 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     designatedHotel != null &&
     bundleSettlementStar != null &&
     designatedHotel.starRating !== bundleSettlementStar;
-
-  // 换签证产品 → 清掉上一个产品的加急档选择（各产品档位表不同，档名残留会被服务端拒单）。
-  useEffect(() => {
-    setVisaExpressTierLabel('');
-  }, [visaId]);
-
-  const transfer = transfers.find((t) => t.id === transferId);
 
   // 套餐 SearchSelect 选项：label 有编号时带 `[code] name`，方便按编号搜；
   // priceLabel 用折后起价/人 = originalPerPaxCny ×(1−discountPct/100)，与套餐页卡片「¥X 起/人」
@@ -653,21 +568,21 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   // 同路线在飞候选航班（去程 MFM→DAD / 回程 DAD→MFM）：用于「未绑定航班号」时判断是否需运营手选。
   const bundleGoFlights = useMemo(
     () =>
-      kind === 'BUNDLE'
+      isBundleOrder
         ? flights.filter(
             (f) => f.isActive && f.originCode === BUNDLE_GO_ORIGIN && f.destinationCode === BUNDLE_GO_DEST,
           )
         : [],
-    [kind, flights],
+    [isBundleOrder, flights],
   );
   const bundleRetFlights = useMemo(
     () =>
-      kind === 'BUNDLE'
+      isBundleOrder
         ? flights.filter(
             (f) => f.isActive && f.originCode === BUNDLE_GO_DEST && f.destinationCode === BUNDLE_GO_ORIGIN,
           )
         : [],
-    [kind, flights],
+    [isBundleOrder, flights],
   );
 
   // 该套餐去程/回程是否需要运营手选航班号：未绑定 + 同路线有 ≥2 个在飞航班时才需要。
@@ -750,7 +665,8 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       .slice(0, 50);
   }, [agents, agentSearch]);
 
-  const passengersRequired = PASSENGERS_REQUIRED[kind];
+  // 混合单取「任一区块要求即必填」：机票+酒店的单仍按机票口径要出行人。
+  const passengersRequired = blockKinds.some((k) => BLOCK_PASSENGERS_REQUIRED[k]);
   const validPassengers = passengers.filter(
     (p) => p.fullName.trim() && p.documentNumber.trim() && parseDob(p.dateOfBirth),
   );
@@ -758,14 +674,13 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   // ── 套餐乘客级「住宿方式 + 签证」（购物车模式）──
   // 住宿列：套餐单都显示；签证列：仅当所选套餐配了自备签减免额（selfVisaDeductCny>0）才显示
   //   （否则自备签不产生价差，展示无意义，与旧整单勾选框的显示条件一致）。
-  const showRoomingCol = kind === 'BUNDLE';
-  const showVisaExemptCol = kind === 'BUNDLE' && (bundle?.selfVisaDeductCny ?? 0) > 0;
+  const showRoomingCol = isBundleOrder;
+  const showVisaExemptCol = isBundleOrder && (bundle?.selfVisaDeductCny ?? 0) > 0;
   // 出行人表格总列数（姓名/护照号/出生日期/中文姓名/性别/签发日期/签发地点/有效期/护照图/操作 10 列 +
   //   可选的住宿/签证列）；AI 核对提示行需要 colSpan 撑满整行。
   const passengerColCount = 10 + (showRoomingCol ? 1 : 0) + (showVisaExemptCol ? 1 : 0);
-  // 派生勾选人数（驱动系统价试算重算 + 描述/明细展示）：以行标记为准。
-  const singleRoomCount = passengers.filter((p) => p.singleRoom).length;
-  const visaExemptCount = passengers.filter((p) => p.visaExempt).length;
+  // 注：单住 / 自备签的勾选人数不再单列派生 —— 试算依赖已改为「请求体指纹」，
+  // 逐位勾选的变化直接体现在 quotePassengersSignature 里（见下方 quote effect）。
   // 每人构成小字用的费率（展示口径，与后端 computeBundleAddOn 一致）：
   //   单房差/人 = singleSupplementCnyPerNight × 套餐晚数；自备签减免/人 = selfVisaDeductCny。
   const bundleNightsForHint = bundle ? resolveBundleNights(bundle.items, bundle.hotelNights) : 0;
@@ -775,7 +690,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   // 整单签证「不需要」→ 出行人自备签的单向联动开关（仅套餐单 + 签证列在显示时才生效）。
   // 单向：只在选中「不需要」时把现有/新增出行人批量置为自备签；订单级改回其它值不做任何反向还原，
   // 不动用户已经逐位调整过的选择（公测反馈：整单选了不需要还要逐个人再选一遍）。
-  const autoVisaExemptForBundle = kind === 'BUNDLE' && showVisaExemptCol && visaStatus === 'NOT_NEEDED';
+  const autoVisaExemptForBundle = showVisaExemptCol && visaStatus === 'NOT_NEEDED';
 
   // 调价有效性：金额为非 0 整数即视为「要调价」；「其它」原因必须补说明。
   const adjustIsInteger = adjustAmount !== null && Number.isInteger(adjustAmount) && adjustAmount !== 0;
@@ -1064,238 +979,161 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     }
   }
 
-  /** 构建当前产品类型的订单行；缺字段返回 { error }。 */
-  function buildItem():
-    | { item: CreateOrderItemInput }
-    | { items: CreateOrderItemInput[] }
-    | { error: string } {
-    if (kind === 'FLIGHT') {
-      if (!scheduleId || !cabin) {
-        return { error: flightTripType === 'ROUNDTRIP' ? '请选择出港航班班次和舱位' : '请选择航班班次和舱位' };
-      }
-      // 往返同一批出行人 → 每条 FLIGHT 行的 quantity 都 = 出行人数（不翻倍）；
-      // unitPrice 占位 0，服务端按班次舱位权威重算（与套餐/批量创单同约定）。
-      const seatPax = Math.max(1, validPassengers.length || 1);
-      const outDateStr = schedule ? localYmd(schedule.departureTime, schedule.departureTz) : '';
-      const outLabel = flightTripType === 'ROUNDTRIP' ? '去程 ' : '';
-      const outboundLine = {
-        kind: 'FLIGHT' as const,
-        description:
-          `${outLabel}${flight?.flightNumber ?? ''} ${flight?.originCode ?? ''}→${flight?.destinationCode ?? ''} ${outDateStr} ${CABIN_ZH[cabin] ?? cabin}`.trim(),
-        quantity: seatPax,
-        flightScheduleId: scheduleId,
-        flightCabin: cabin,
-      };
-      if (flightTripType === 'ONEWAY') {
-        return { item: outboundLine };
-      }
-      // 往返：回程再生成一条 FLIGHT 行（可与出港不同航班/日期/舱位）。
-      if (!returnScheduleId || !returnCabin) return { error: '往返需选择回程航班班次和舱位' };
-      const retDateStr = returnSchedule ? localYmd(returnSchedule.departureTime, returnSchedule.departureTz) : '';
-      const returnLine = {
-        kind: 'FLIGHT' as const,
-        description:
-          `回程 ${returnFlight?.flightNumber ?? ''} ${returnFlight?.originCode ?? ''}→${returnFlight?.destinationCode ?? ''} ${retDateStr} ${CABIN_ZH[returnCabin] ?? returnCabin}`.trim(),
-        quantity: seatPax,
-        flightScheduleId: returnScheduleId,
-        flightCabin: returnCabin,
-      };
-      return { items: [outboundLine, returnLine] };
-    }
-    if (kind === 'HOTEL') {
-      // ── 星级随机池行：不选酒店/房型，占池库存，之后由房控落到具体酒店 ──
-      if (poolTier != null) {
-        if (!checkIn || !checkOut) return { error: '请填写入住和退房日期' };
-        const poolNights = nightsBetween(checkIn, checkOut);
-        if (poolNights < 1) return { error: '退房日期需晚于入住日期' };
-        if (poolNightlyPrice == null || poolNightlyPrice <= 0) {
-          return { error: `请填写${randomStarTierLabel(poolTier)}的每间每晚售价` };
-        }
-        const poolRoomQty = Math.max(1, rooms ?? 1);
-        return {
-          item: {
-            kind: 'HOTEL',
-            description: `${randomStarTierLabel(poolTier)} · ${checkIn}~${checkOut} · ${poolNights}晚 × ${poolRoomQty}间`,
-            // qty = 晚数（与具体酒店行同构）；金额 = 每间每晚价 × 晚数 × 间数。
-            // 池行显式送 roomsBilled，让「收多少钱」「占几间池库存」是同一个数，不靠 metadata 反推。
-            quantity: poolNights,
-            randomStarTier: poolTier,
-            checkIn,
-            checkOut,
-            unitPrice: poolNightlyPrice,
-            roomsBilled: poolRoomQty,
-            metadata: { rooms: poolRoomQty },
-          },
-        };
-      }
-      if (!roomTypeId) return { error: '请选择酒店和房型' };
-      if (!checkIn || !checkOut) return { error: '请填写入住和退房日期' };
-      const nights = nightsBetween(checkIn, checkOut);
-      if (nights < 1) return { error: '退房日期需晚于入住日期' };
-      const roomQty = Math.max(1, rooms ?? 1);
-      const description =
-        `${hotel?.name ?? '酒店'} · ${roomType?.name ?? '房型'} · ${checkIn}~${checkOut} · ${nights}晚 × ${roomQty}间`;
+  /** 产品目录快照：各区块把「选了哪个产品」翻译成订单行时按它查名称/现价。 */
+  const blockBuildCtx: ProductBlockBuildContext = {
+    flights,
+    hotels,
+    visas,
+    transfers,
+    seatPax: Math.max(1, validPassengers.length || 1),
+  };
+
+  /** 套餐区块 → 机票航段行 + 地面套餐行；缺字段返回 { error }。 */
+  function buildBundleItems(): { items: CreateOrderItemInput[] } | { error: string } {
+    if (!bundleId) return { error: '请选择套餐' };
+    const adults = Math.max(0, adultCount ?? 0);
+    const children = Math.max(0, childCount ?? 0);
+    const infants = Math.max(0, infantCount ?? 0);
+    if (adults + children < 1) return { error: '套餐至少需 1 位占座出行人（成人或儿童）' };
+    // 出行人需与人数完全一致（成人+儿童+婴儿），否则服务端拒收（婴儿不占座但也是出行人）。
+    const headCount = adults + children + infants;
+    if (validPassengers.length !== headCount) {
       return {
-        item: {
-          kind: 'HOTEL',
-          description,
-          // qty = 晚数；服务端按「房型每晚 basePrice × 晚数」校验（±1 元）。
-          // 单价送房型当前每晚价（服务端会比对，不一致则拒），房间数透传 metadata 供房控/分房参考。
-          quantity: nights,
-          hotelRoomTypeId: roomTypeId,
-          checkIn,
-          checkOut,
-          unitPrice: Number(roomType?.basePrice ?? 0),
-          metadata: { rooms: roomQty },
-        },
+        error: `套餐出行人数需与人数一致：应填 ${headCount} 位（${adults}成人+${children}儿童+${infants}婴儿），当前 ${validPassengers.length} 位有效`,
       };
     }
-    if (kind === 'VISA') {
-      if (!visaId) return { error: '请选择签证产品' };
-      const qty = Math.max(1, visaQty ?? 1);
-      // 加急档（运营在产品上配的零工/一工/二工…）：选中的档名随行 metadata 上送，
-      // 加价金额一律由服务端按产品档位表查出（这里带上单价只是为了通过 ±1 元容差校验）。
-      const tier = visaExpressTiers.find((t) => t.label === visaExpressTierLabel);
-      const description =
-        `${visa?.visaName ?? visa?.visaType ?? '签证'}（${visa?.destinationCountry ?? ''}）× ${qty}份` +
-        (tier ? ` · 加急${tier.label}` : '');
-      const unitPrice = Number(visa?.basePrice ?? 0) + (tier?.surchargeCny ?? 0);
-      return {
-        item: {
-          kind: 'VISA',
-          description,
-          quantity: qty,
-          visaId,
-          unitPrice,
-          ...(tier ? { metadata: { expressTierLabel: tier.label } } : {}),
-        },
-      };
+    // 出发日期必填：航段按它自动派生（匹配去程/回程班次本地日期）。
+    if (!departDate) return { error: '请选择套餐「出发日期」（用于自动匹配机票航段并扣座）' };
+    // 去程航段必须派生成功，否则该出发日无对应去程班次 → 不能扣座/进票务待办。
+    if (!bundleLegs.go) {
+      return { error: `所选出发日期 ${departDate} 没有匹配的去程班次（${BUNDLE_GO_ORIGIN}→${BUNDLE_GO_DEST}），请换日期或先在航班里建班次` };
     }
-    if (kind === 'BUNDLE') {
-      if (!bundleId) return { error: '请选择套餐' };
-      const adults = Math.max(0, adultCount ?? 0);
-      const children = Math.max(0, childCount ?? 0);
-      const infants = Math.max(0, infantCount ?? 0);
-      if (adults + children < 1) return { error: '套餐至少需 1 位占座出行人（成人或儿童）' };
-      // 出行人需与人数完全一致（成人+儿童+婴儿），否则服务端拒收（婴儿不占座但也是出行人）。
-      const headCount = adults + children + infants;
-      if (validPassengers.length !== headCount) {
-        return {
-          error: `套餐出行人数需与人数一致：应填 ${headCount} 位（${adults}成人+${children}儿童+${infants}婴儿），当前 ${validPassengers.length} 位有效`,
-        };
-      }
-      // 出发日期必填：航段按它自动派生（匹配去程/回程班次本地日期）。
-      if (!departDate) return { error: '请选择套餐「出发日期」（用于自动匹配机票航段并扣座）' };
-      // 去程航段必须派生成功，否则该出发日无对应去程班次 → 不能扣座/进票务待办。
-      if (!bundleLegs.go) {
-        return { error: `所选出发日期 ${departDate} 没有匹配的去程班次（${BUNDLE_GO_ORIGIN}→${BUNDLE_GO_DEST}），请换日期或先在航班里建班次` };
-      }
-      // 往返套餐必须派生出回程；缺回程班次说明回程日期那天没排班。
-      const isRoundTrip = (bundle?.legs ?? 2) >= 2;
-      if (isRoundTrip && !bundleLegs.ret) {
-        return { error: `回程日期 ${bundleLegs.returnDate} 没有匹配的回程班次（${BUNDLE_GO_DEST}→${BUNDLE_GO_ORIGIN}），请核对套餐晚数/排班` };
-      }
-      const maxSingleBusiness = adults + children;
-      // 单住 / 自备签为乘客级派生（购物车模式：每人各选，见出行人表两列）——从行标记统计人数。
-      // 权威定价由后端按 passengers 数组的 singleRoom/visaExempt 重算；此处仅用于描述/明细展示。
-      const singles = validPassengers.filter((p) => p.singleRoom).length;
-      const visaExempts = validPassengers.filter((p) => p.visaExempt).length;
-      // 升舱分程：去/回程各自夹到占座人数；单程套餐没有回程航段 → 回程恒 0（服务端同样按 0 处理）。
-      const businessesOutbound = Math.min(Math.max(0, businessCountOutbound ?? 0), maxSingleBusiness);
-      const businessesReturn = isRoundTrip
-        ? Math.min(Math.max(0, businessCountReturn ?? 0), maxSingleBusiness)
-        : 0;
-      // 机票航段：去程 +（往返套餐）回程；占座人数 = 成人 + 儿童（婴儿不占座），舱位固定经济舱。
-      const seatPax = Math.max(1, adults + children);
-      // 同时派发去程 + 回程两条 FLIGHT 行：后端对每条 FLIGHT 行都扣座，这是「回程没扣」的根因修复。
-      const derivedLegs: Array<{ sched: AdminSchedule; label: string }> = [
-        { sched: bundleLegs.go, label: '去程（经济舱）' },
-      ];
-      if (isRoundTrip && bundleLegs.ret) {
-        derivedLegs.push({ sched: bundleLegs.ret, label: '回程（经济舱）' });
-      }
-      const flightLines = derivedLegs.map(({ sched, label }) => ({
-        kind: 'FLIGHT' as const,
-        description: `${bundle?.name ?? '套餐'} · ${label}`,
-        quantity: seatPax,
-        flightScheduleId: sched.id,
-        flightCabin: 'ECONOMY' as CabinClass,
-      }));
-      // goDate 决定套餐酒店入住日（缺则后端 createOrder 不盖酒店章 → 房控不计套餐占房）。
-      const goDate = departDate;
-      const metadata: Record<string, unknown> = { adultCount: adults, childCount: children, infantCount: infants };
-      if (goDate) metadata.goDate = goDate;
-      // 指定酒店（可选）：选了酒店必须选到房型，服务端按房型切占房并加收该店指定加价。
-      const designatedHotel = designatedHotelId ? hotels.find((h) => h.id === designatedHotelId) : undefined;
-      if (designatedHotelId && !designatedRoomTypeId) {
-        return { error: '已选择指定酒店，请选择房型（或改回「随机（不指定酒店）」）' };
-      }
-      const descParts = [
-        `${bundle?.name ?? '套餐'}`,
-        departDate ? `${departDate}出发` : null,
-        `${adults}成人${children ? `/${children}儿童` : ''}${infants ? `/${infants}婴儿` : ''}`,
-        designatedHotel ? `指定${designatedHotel.name}` : null,
-        singles > 0 ? `单住×${singles}` : null,
-        // 升舱按程分开写清楚（只升去程 / 两程人数不同都要一眼看得出，别再写成一个笼统的「商务×N」）
-        businessesOutbound > 0 ? `去程升舱×${businessesOutbound}` : null,
-        businessesReturn > 0 ? `回程升舱×${businessesReturn}` : null,
-        visaExempts > 0 ? `自备签×${visaExempts}` : null,
-      ].filter(Boolean).join(' · ');
-      // 单住 / 自备签不再落 item 级聚合字段（singleCount/selfProvidedVisa）——
-      // 后端从 passengers 数组的 singleRoom/visaExempt 逐位派生权威定价（购物车模式）。
-      const bundleLine = {
-        kind: 'BUNDLE' as const,
-        description: descParts,
-        quantity: 1,
-        bundleId,
-        unitPrice: 0, // 服务端权威重算（仅地面部分，机票走上面的 FLIGHT 行）
-        adultCount: adults,
-        childCount: children,
-        infantCount: infants,
-        // 升舱分程：两个字段一起传（含 0），服务端据此各程分别定价 + 各程分别占商务舱座位。
-        businessCountOutbound: businessesOutbound,
-        businessCountReturn: businessesReturn,
-        // 指定酒店：服务端据此切占房/盖章并按该店「指定酒店加价 ¥/人」×占座人数加收。
-        ...(designatedRoomTypeId ? { designatedHotelRoomTypeId: designatedRoomTypeId } : {}),
-        metadata,
-      };
-      // 机票航段在前 + 地面套餐行在后：与前台商城同结构，服务端按航段扣座、套餐行只算地面。
-      return { items: [...flightLines, bundleLine] };
+    // 往返套餐必须派生出回程；缺回程班次说明回程日期那天没排班。
+    const isRoundTrip = (bundle?.legs ?? 2) >= 2;
+    if (isRoundTrip && !bundleLegs.ret) {
+      return { error: `回程日期 ${bundleLegs.returnDate} 没有匹配的回程班次（${BUNDLE_GO_DEST}→${BUNDLE_GO_ORIGIN}），请核对套餐晚数/排班` };
     }
-    // TRANSFER —— 单价送接送当前 basePrice；服务端按 basePrice × qty 校验（±1 元）。
-    if (!transferId) return { error: '请选择接送产品' };
-    const qty = Math.max(1, transferQty ?? 1);
-    const description = `${transfer?.name ?? '接送'}${transferDate ? ` · ${transferDate}` : ''} × ${qty}`;
-    const metadata = transferDate ? { date: transferDate } : undefined;
-    return {
-      item: { kind: 'TRANSFER', description, quantity: qty, transferId, unitPrice: Number(transfer?.basePrice ?? 0), metadata },
+    const maxSingleBusiness = adults + children;
+    // 单住 / 自备签为乘客级派生（购物车模式：每人各选，见出行人表两列）——从行标记统计人数。
+    // 权威定价由后端按 passengers 数组的 singleRoom/visaExempt 重算；此处仅用于描述/明细展示。
+    const singles = validPassengers.filter((p) => p.singleRoom).length;
+    const visaExempts = validPassengers.filter((p) => p.visaExempt).length;
+    // 升舱分程：去/回程各自夹到占座人数；单程套餐没有回程航段 → 回程恒 0（服务端同样按 0 处理）。
+    const businessesOutbound = Math.min(Math.max(0, businessCountOutbound ?? 0), maxSingleBusiness);
+    const businessesReturn = isRoundTrip
+      ? Math.min(Math.max(0, businessCountReturn ?? 0), maxSingleBusiness)
+      : 0;
+    // 机票航段：去程 +（往返套餐）回程；占座人数 = 成人 + 儿童（婴儿不占座），舱位固定经济舱。
+    const seatPax = Math.max(1, adults + children);
+    // 同时派发去程 + 回程两条 FLIGHT 行：后端对每条 FLIGHT 行都扣座，这是「回程没扣」的根因修复。
+    const derivedLegs: Array<{ sched: AdminSchedule; label: string }> = [
+      { sched: bundleLegs.go, label: '去程（经济舱）' },
+    ];
+    if (isRoundTrip && bundleLegs.ret) {
+      derivedLegs.push({ sched: bundleLegs.ret, label: '回程（经济舱）' });
+    }
+    const flightLines = derivedLegs.map(({ sched, label }) => ({
+      kind: 'FLIGHT' as const,
+      description: `${bundle?.name ?? '套餐'} · ${label}`,
+      quantity: seatPax,
+      flightScheduleId: sched.id,
+      flightCabin: 'ECONOMY' as CabinClass,
+    }));
+    // goDate 决定套餐酒店入住日（缺则后端 createOrder 不盖酒店章 → 房控不计套餐占房）。
+    const goDate = departDate;
+    const metadata: Record<string, unknown> = { adultCount: adults, childCount: children, infantCount: infants };
+    if (goDate) metadata.goDate = goDate;
+    // 指定酒店（可选）：选了酒店必须选到房型，服务端按房型切占房并加收该店指定加价。
+    const designatedHotel = designatedHotelId ? hotels.find((h) => h.id === designatedHotelId) : undefined;
+    if (designatedHotelId && !designatedRoomTypeId) {
+      return { error: '已选择指定酒店，请选择房型（或改回「随机（不指定酒店）」）' };
+    }
+    const descParts = [
+      `${bundle?.name ?? '套餐'}`,
+      departDate ? `${departDate}出发` : null,
+      `${adults}成人${children ? `/${children}儿童` : ''}${infants ? `/${infants}婴儿` : ''}`,
+      designatedHotel ? `指定${designatedHotel.name}` : null,
+      singles > 0 ? `单住×${singles}` : null,
+      // 升舱按程分开写清楚（只升去程 / 两程人数不同都要一眼看得出，别再写成一个笼统的「商务×N」）
+      businessesOutbound > 0 ? `去程升舱×${businessesOutbound}` : null,
+      businessesReturn > 0 ? `回程升舱×${businessesReturn}` : null,
+      visaExempts > 0 ? `自备签×${visaExempts}` : null,
+    ].filter(Boolean).join(' · ');
+    // 单住 / 自备签不再落 item 级聚合字段（singleCount/selfProvidedVisa）——
+    // 后端从 passengers 数组的 singleRoom/visaExempt 逐位派生权威定价（购物车模式）。
+    const bundleLine = {
+      kind: 'BUNDLE' as const,
+      description: descParts,
+      quantity: 1,
+      bundleId,
+      unitPrice: 0, // 服务端权威重算（仅地面部分，机票走上面的 FLIGHT 行）
+      adultCount: adults,
+      childCount: children,
+      infantCount: infants,
+      // 升舱分程：两个字段一起传（含 0），服务端据此各程分别定价 + 各程分别占商务舱座位。
+      businessCountOutbound: businessesOutbound,
+      businessCountReturn: businessesReturn,
+      // 指定酒店：服务端据此切占房/盖章并按该店「指定酒店加价 ¥/人」×占座人数加收。
+      ...(designatedRoomTypeId ? { designatedHotelRoomTypeId: designatedRoomTypeId } : {}),
+      metadata,
     };
+    // 机票航段在前 + 地面套餐行在后：与前台商城同结构，服务端按航段扣座、套餐行只算地面。
+    return { items: [...flightLines, bundleLine] };
   }
 
+  /**
+   * 全单订单行 = 各产品区块的行按区块顺序拼接；任一区块缺字段就整单不成立。
+   * 多区块时错误消息带上区块序号和类型，运营一眼知道是哪一块没填完。
+   */
+  function buildOrderItems(): { items: CreateOrderItemInput[] } | { error: string } {
+    const merged: CreateOrderItemInput[] = [];
+    for (let i = 0; i < blocks.length; i += 1) {
+      const block = blocks[i];
+      const built =
+        block.kind === 'BUNDLE' ? buildBundleItems() : buildProductBlockItems(block, blockBuildCtx);
+      if ('error' in built) {
+        return {
+          error:
+            blocks.length > 1
+              ? `产品 ${i + 1}（${PRODUCT_BLOCK_LABEL[block.kind]}）：${built.error}`
+              : built.error,
+        };
+      }
+      merged.push(...built.items);
+    }
+    if (merged.length === 0) return { error: '请至少填写一个产品' };
+    // 后端 items 上限 20 条（还要给调价/结算差额行留位），超了先在前端说清楚，别等提交被拒。
+    if (merged.length > 18) {
+      return { error: `本单产品明细已 ${merged.length} 条，超出单张订单上限，请拆单录入` };
+    }
+    return { items: merged };
+  }
+
+  // 试算请求体的「指纹」：订单行 + 套餐乘客级选项各自序列化一次。
+  // 用指纹当 effect 依赖，而不是逐个列举定价相关的表单字段 —— 区块数量可变，逐字段列举
+  // 迟早漏掉某一块的某个字段（漏了就是「改了产品但系统价没跟着变」的静默错价）。
+  const quoteBuilt = buildOrderItems();
+  const quoteItemsSignature = 'error' in quoteBuilt ? '' : JSON.stringify(quoteBuilt.items);
+  // 套餐乘客级住宿/签证选项：让系统价随每人「拼房/单住 · 随套餐/自备签」选择实时变化。
+  // 仅套餐单发送（其余产品与乘客级选项无关，后端也只在 BUNDLE 分支读取）。
+  const quotePassengersSignature = isBundleOrder
+    ? JSON.stringify(validPassengers.map((p) => ({ visaExempt: !!p.visaExempt, singleRoom: !!p.singleRoom })))
+    : '';
+
   // 系统价试算：产品/人数变化后（去抖 400ms）向后端 /orders/quote 拿权威价。
-  // buildItem() 返回 error（选择不完整）时清空系统价，不打后端。调价金额不参与试算——
+  // 订单行不成立（选择不完整）时清空系统价，不打后端。调价金额不参与试算——
   // 系统价是「未调整前」的权威价，最终应付 = 系统价 + 调整额（下方界面单独展示）。
   useEffect(() => {
-    if (!token) {
+    if (!token || !quoteItemsSignature) {
       setQuoteTotal(null);
       setSettlementPreview(null);
       setQuoteErr(null);
       return;
     }
-    const built = buildItem();
-    if ('error' in built) {
-      setQuoteTotal(null);
-      setSettlementPreview(null);
-      setQuoteErr(null);
-      return;
-    }
-    const items = 'items' in built ? built.items : [built.item];
-    // 套餐乘客级住宿/签证选项：让系统价随每人「拼房/单住 · 随套餐/自备签」选择实时变化。
-    // 仅套餐单发送（其余产品与乘客级选项无关，后端也只在 BUNDLE 分支读取）。
-    const quotePassengers =
-      kind === 'BUNDLE'
-        ? validPassengers.map((p) => ({ visaExempt: !!p.visaExempt, singleRoom: !!p.singleRoom }))
-        : undefined;
+    const items = JSON.parse(quoteItemsSignature) as CreateOrderItemInput[];
+    const quotePassengers = quotePassengersSignature
+      ? (JSON.parse(quotePassengersSignature) as Array<{ visaExempt: boolean; singleRoom: boolean }>)
+      : undefined;
     let cancelled = false;
     setQuoting(true);
     const timer = setTimeout(() => {
@@ -1325,19 +1163,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       cancelled = true;
       clearTimeout(timer);
     };
-    // buildItem 读取下列定价相关状态；变化即重新试算（依赖数组显式列出，避免陈旧闭包）。
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    token, kind, flightTripType, scheduleId, cabin, returnScheduleId, returnCabin,
-    roomTypeId, rooms, visaId, visaQty, visaExpressTierLabel, bundleId, departDate,
-    adultCount, childCount, infantCount, businessCountOutbound, businessCountReturn,
-    // 指定酒店变化 → 重新试算（指定加价计入系统价）。
-    designatedRoomTypeId,
-    // 乘客级单住/自备签勾选数变化 → 重新试算系统价（购物车模式）。
-    singleRoomCount, visaExemptCount,
-    transferId, transferQty, validPassengers.length,
-    agentId,
-  ]);
+  }, [token, quoteItemsSignature, quotePassengersSignature, agentId]);
 
   // 注：结算总价不再回填「调整金额」——settlementTotalCny 直接提交给服务端，由服务端按
   // 权威价自动生成差额行（前端只做预览），两个通道互斥。
@@ -1347,13 +1173,13 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     setErr(null);
 
     // 联系人现为选填：后端会回退到登录的录入人。这里不再硬性拦截。
-    const built = buildItem();
+    const built = buildOrderItems();
     if ('error' in built) {
       setErr(built.error);
       return;
     }
-    // 套餐返回多行（机票航段 + 地面套餐）；其余类型返回单行。
-    const orderItems = 'items' in built ? built.items : [built.item];
+    // 各产品区块的订单行已合并成一张单（套餐单本身也是「机票航段 + 地面套餐」多行）。
+    const orderItems = built.items;
 
     if (passengersRequired && validPassengers.length === 0) {
       setErr('该产品类型需至少一位完整出行人（姓名 + 护照号 + 出生日期）');
@@ -1439,7 +1265,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       ...(p.passportExpiry?.trim() ? { passportExpiry: parseDob(p.passportExpiry) ?? p.passportExpiry.trim() } : {}),
       // 签证出签日/生效日/有效期不在录单时采集：改由签证台在出签后补录（见 PassengerRow 类型定义注释）。
       // 套餐乘客级选项（购物车模式）：仅套餐单显式发送；后端据此逐位派生权威定价 + 签证台过滤。
-      ...(kind === 'BUNDLE' ? { visaExempt: !!p.visaExempt, singleRoom: !!p.singleRoom } : {}),
+      ...(isBundleOrder ? { visaExempt: !!p.visaExempt, singleRoom: !!p.singleRoom } : {}),
     }));
     // 纯酒店/接送且未填出行人：后端 passengers 至少 1 条，用联系人（或录入人）占位一位出行人。
     if (passengerPayload.length === 0) {
@@ -1512,12 +1338,6 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     } finally {
       setSubmitting(false);
     }
-  }
-
-  // 切换产品类型时清掉上一类型的报错（保留已填联系人/出行人/备注）
-  function switchKind(next: ProductKind): void {
-    setKind(next);
-    setErr(null);
   }
 
   // ── 录单后分房 ─────────────────────────────────────────────────────────
@@ -1644,7 +1464,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="录单" tabIndex={-1} className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 p-4">
       <div className="my-8 w-full max-w-3xl rounded-xl bg-white shadow-xl xl:max-w-[1400px]">
         <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3">
-          <h2 className="text-lg font-semibold text-slate-900">录单（按产品类型 · 单笔）</h2>
+          <h2 className="text-lg font-semibold text-slate-900">手工录单（一单可含多个产品）</h2>
           <button className="btn-ghost px-2 py-1" onClick={onClose} aria-label="关闭录单弹窗"><Icon name="close" /></button>
         </div>
 
@@ -1708,250 +1528,45 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
           <div className="space-y-4 p-5">
             {err && <div className="rounded-md bg-rose-50 px-4 py-2 text-sm text-rose-700">{err}</div>}
 
-            {/* 产品类型选择 */}
+            {/* 产品类型选择（第一个产品）；套餐独占一张订单，多产品时禁用 */}
             <div>
-              <span className="text-xs text-slate-500">产品类型</span>
+              <span className="text-xs text-slate-500">产品类型{blocks.length > 1 ? '（产品 1）' : ''}</span>
               <div className="mt-1 flex flex-wrap gap-2">
-                {KIND_TABS.map((t) => (
-                  <button
-                    key={t.kind}
-                    type="button"
-                    className={`rounded-lg border px-3 py-1.5 text-sm transition ${
-                      kind === t.kind
-                        ? 'border-brand bg-brand-50 text-brand ring-1 ring-brand/20'
-                        : 'border-slate-200 text-ink-soft hover:border-slate-300 hover:bg-slate-50'
-                    }`}
-                    onClick={() => switchKind(t.kind)}
-                  >
-                    <Icon name={t.icon} /> {t.label}
-                  </button>
-                ))}
+                {PRODUCT_BLOCK_TABS.map((t) => {
+                  const bundleLocked = t.kind === 'BUNDLE' && blocks.length > 1;
+                  return (
+                    <button
+                      key={t.kind}
+                      type="button"
+                      disabled={bundleLocked}
+                      title={bundleLocked ? '套餐要单独占一张订单，请先删除其它产品' : undefined}
+                      className={`rounded-lg border px-3 py-1.5 text-sm transition disabled:cursor-not-allowed disabled:opacity-40 ${
+                        firstKind === t.kind
+                          ? 'border-brand bg-brand-50 text-brand ring-1 ring-brand/20'
+                          : 'border-slate-200 text-ink-soft hover:border-slate-300 hover:bg-slate-50'
+                      }`}
+                      onClick={() => switchFirstKind(t.kind)}
+                    >
+                      <Icon name={t.icon} /> {t.label}
+                    </button>
+                  );
+                })}
               </div>
+              {isBundleOrder ? (
+                <p className="mt-1.5 text-[11px] text-slate-500">
+                  套餐单独占一张订单 —— 套餐自带加项、指定酒店加价与升舱通道，和其它产品混挂会跟套餐盖章、批量优惠口径打架。
+                  客人在套餐之外另买机票 / 酒店，请另录一张单。
+                </p>
+              ) : blocks.length > 1 ? (
+                <p className="mt-1.5 text-[11px] text-slate-500">
+                  本单已含 {blocks.length} 个产品，改成套餐需先删除其它产品（套餐独占一张订单）。
+                </p>
+              ) : null}
             </div>
 
-            {/* 各类型字段 */}
+            {/* 产品 1 字段 */}
             <div className="rounded-lg border border-slate-200 bg-slate-50/50 p-3">
-              {kind === 'FLIGHT' && (
-                <div className="space-y-3">
-                  {/* 单程 / 往返切换 */}
-                  <div>
-                    <span className="text-xs text-slate-500">行程类型</span>
-                    <div className="mt-1 flex gap-2">
-                      {([['ONEWAY', '单程'], ['ROUNDTRIP', '往返']] as const).map(([val, label]) => (
-                        <button
-                          key={val}
-                          type="button"
-                          className={`rounded-lg border px-3 py-1.5 text-sm transition ${
-                            flightTripType === val
-                              ? 'border-brand bg-brand-50 text-brand ring-1 ring-brand/20'
-                              : 'border-slate-200 text-ink-soft hover:border-slate-300 hover:bg-slate-50'
-                          }`}
-                          onClick={() => { setFlightTripType(val); setErr(null); }}
-                        >
-                          {label}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-
-                  {/* 出港航段 */}
-                  <div className="rounded-md border border-slate-200 bg-white/70 p-3">
-                    <div className="mb-2 text-xs font-medium text-slate-600">
-                      {flightTripType === 'ROUNDTRIP' ? '出港航班' : '航班'}
-                    </div>
-                    <div className="grid gap-3 md:grid-cols-4">
-                      <label className="text-xs text-slate-500">
-                        航班
-                        <select className={inputCls} value={flightId} onChange={(e) => { setFlightId(e.target.value); setScheduleId(''); setCabin(''); setFlightDate(''); }}>
-                          <option value="">选择航班…</option>
-                          {flights.map((f) => (
-                            <option key={f.id} value={f.id}>{f.flightNumber} {f.originCode}→{f.destinationCode}</option>
-                          ))}
-                        </select>
-                      </label>
-                      <label className="text-xs text-slate-500">
-                        起飞日期（可手输）
-                        <input type="date" className={inputCls} value={flightDate} onChange={(e) => { setFlightDate(e.target.value); setScheduleId(''); setCabin(''); }} disabled={!flightId} />
-                      </label>
-                      <label className="text-xs text-slate-500">
-                        班次（出发 · 当地时间）
-                        <select className={inputCls} value={scheduleId} onChange={(e) => { setScheduleId(e.target.value); setCabin(''); }} disabled={!flightId}>
-                          <option value="">{flightDate ? '选择当日班次…' : '选择班次…'}</option>
-                          {schedulesForDate.map((s) => (
-                            <option key={s.id} value={s.id}>
-                              {localYmd(s.departureTime, s.departureTz)} {formatLocalTime(s.departureTime, s.departureTz)}
-                            </option>
-                          ))}
-                        </select>
-                        {flightId && flightDate && schedulesForDate.length === 0 && (
-                          <span className="mt-1 block text-[11px] text-amber-600">该日期无班次，请换个日期或清空日期查看全部。</span>
-                        )}
-                      </label>
-                      <label className="text-xs text-slate-500">
-                        舱位
-                        <select className={inputCls} value={cabin} onChange={(e) => setCabin(e.target.value as CabinClass)} disabled={!scheduleId}>
-                          <option value="">选择舱位…</option>
-                          {cabinOptions.map((c) => (
-                            <option key={c.id} value={c.cabin}>
-                              {CABIN_ZH[c.cabin] ?? c.cabin}（{cabinAvailText(c.available)}）¥{Number(c.basePrice).toFixed(0)}
-                            </option>
-                          ))}
-                        </select>
-                      </label>
-                    </div>
-                  </div>
-
-                  {/* 回程航段（仅往返） */}
-                  {flightTripType === 'ROUNDTRIP' && (
-                    <div className="rounded-md border border-slate-200 bg-white/70 p-3">
-                      <div className="mb-2 text-xs font-medium text-slate-600">回程航班</div>
-                      <div className="grid gap-3 md:grid-cols-4">
-                        <label className="text-xs text-slate-500">
-                          航班
-                          <select className={inputCls} value={returnFlightId} onChange={(e) => { setReturnFlightId(e.target.value); setReturnScheduleId(''); setReturnCabin(''); setReturnDate(''); }}>
-                            <option value="">选择航班…</option>
-                            {flights.map((f) => (
-                              <option key={f.id} value={f.id}>{f.flightNumber} {f.originCode}→{f.destinationCode}</option>
-                            ))}
-                          </select>
-                        </label>
-                        <label className="text-xs text-slate-500">
-                          起飞日期（可手输）
-                          <input type="date" className={inputCls} value={returnDate} onChange={(e) => { setReturnDate(e.target.value); setReturnScheduleId(''); setReturnCabin(''); }} disabled={!returnFlightId} />
-                        </label>
-                        <label className="text-xs text-slate-500">
-                          班次（出发 · 当地时间）
-                          <select className={inputCls} value={returnScheduleId} onChange={(e) => { setReturnScheduleId(e.target.value); setReturnCabin(''); }} disabled={!returnFlightId}>
-                            <option value="">{returnDate ? '选择当日班次…' : '选择班次…'}</option>
-                            {returnSchedulesForDate.map((s) => (
-                              <option key={s.id} value={s.id}>
-                                {localYmd(s.departureTime, s.departureTz)} {formatLocalTime(s.departureTime, s.departureTz)}
-                              </option>
-                            ))}
-                          </select>
-                          {returnFlightId && returnDate && returnSchedulesForDate.length === 0 && (
-                            <span className="mt-1 block text-[11px] text-amber-600">该日期无班次，请换个日期或清空日期查看全部。</span>
-                          )}
-                        </label>
-                        <label className="text-xs text-slate-500">
-                          舱位
-                          <select className={inputCls} value={returnCabin} onChange={(e) => setReturnCabin(e.target.value as CabinClass)} disabled={!returnScheduleId}>
-                            <option value="">选择舱位…</option>
-                            {returnCabinOptions.map((c) => (
-                              <option key={c.id} value={c.cabin}>
-                                {CABIN_ZH[c.cabin] ?? c.cabin}（{cabinAvailText(c.available)}）¥{Number(c.basePrice).toFixed(0)}
-                              </option>
-                            ))}
-                          </select>
-                        </label>
-                      </div>
-                      <p className="mt-1.5 text-[11px] text-slate-400">回程与出港可以是不同航班/日期，往返共用同一批出行人（人数不翻倍）。</p>
-                    </div>
-                  )}
-
-                  <p className="text-[11px] text-slate-400">数量按下方有效出行人数自动计（每人 1 张{flightTripType === 'ROUNDTRIP' ? '，去程/回程各一张' : ''}）。</p>
-                </div>
-              )}
-
-              {kind === 'HOTEL' && (
-                <div className="grid gap-3 md:grid-cols-2">
-                  <label className="text-xs text-slate-500">
-                    酒店
-                    <select className={inputCls} value={hotelId} onChange={(e) => { setHotelId(e.target.value); setRoomTypeId(''); }}>
-                      <option value="">选择酒店…</option>
-                      {/* 星级随机档：客人只认星级、不指定酒店，占同星级酒店的合计余量，之后由房控落位 */}
-                      <optgroup label="星级随机（不指定酒店，之后由房控落位）">
-                        {RANDOM_STAR_TIERS.map((tier) => (
-                          <option key={tier} value={poolOptionValue(tier)}>{randomStarTierLabel(tier)}</option>
-                        ))}
-                      </optgroup>
-                      <optgroup label="具体酒店">
-                        {hotels.map((h) => (
-                          <option key={h.id} value={h.id}>{h.name}（{h.cityCode}）</option>
-                        ))}
-                      </optgroup>
-                    </select>
-                  </label>
-                  {poolTier == null ? (
-                    <label className="text-xs text-slate-500">
-                      房型
-                      <select className={inputCls} value={roomTypeId} onChange={(e) => setRoomTypeId(e.target.value)} disabled={!hotelId}>
-                        <option value="">选择房型…</option>
-                        {(hotel?.roomTypes ?? []).map((rt) => (
-                          <option key={rt.id} value={rt.id}>{rt.name} ¥{Number(rt.basePrice).toFixed(0)}/晚</option>
-                        ))}
-                      </select>
-                    </label>
-                  ) : (
-                    <label className="text-xs text-slate-500">
-                      每间每晚售价(¥)
-                      <NumberInput className={inputCls} value={poolNightlyPrice} onChange={setPoolNightlyPrice} min={0} placeholder="按谈定的随机价填" />
-                    </label>
-                  )}
-                  <label className="text-xs text-slate-500">
-                    入住日期
-                    <input type="date" className={inputCls} value={checkIn} max={checkOut || undefined} onChange={(e) => setCheckIn(e.target.value)} />
-                  </label>
-                  <label className="text-xs text-slate-500">
-                    退房日期
-                    <input type="date" className={inputCls} value={checkOut} min={checkIn || undefined} onChange={(e) => setCheckOut(e.target.value)} />
-                  </label>
-                  <label className="text-xs text-slate-500">
-                    间数
-                    <NumberInput className={inputCls} value={rooms} onChange={setRooms} integerOnly min={1} placeholder="1" />
-                  </label>
-                  <div className="text-xs text-slate-400 self-end pb-1">
-                    {poolTier != null
-                      ? `${checkIn && checkOut && nightsBetween(checkIn, checkOut) > 0 ? `共 ${nightsBetween(checkIn, checkOut)} 晚 · ` : ''}占${poolTier} 星酒店的合计余量 · 同星级余量不足会被系统拦下`
-                      : checkIn && checkOut && nightsBetween(checkIn, checkOut) > 0
-                        ? `共 ${nightsBetween(checkIn, checkOut)} 晚 · 价格由系统按房型重算`
-                        : '价格由系统按房型重算'}
-                  </div>
-                </div>
-              )}
-
-              {kind === 'VISA' && (
-                <div className="grid gap-3 md:grid-cols-2">
-                  <label className="text-xs text-slate-500">
-                    签证产品
-                    <select className={inputCls} value={visaId} onChange={(e) => setVisaId(e.target.value)}>
-                      <option value="">选择签证…</option>
-                      {visas.map((v) => (
-                        <option key={v.id} value={v.id}>{v.visaName ?? v.visaType}（{v.destinationCountry}）¥{Number(v.basePrice).toFixed(0)}</option>
-                      ))}
-                    </select>
-                  </label>
-                  <label className="text-xs text-slate-500">
-                    份数
-                    <NumberInput className={inputCls} value={visaQty} onChange={setVisaQty} integerOnly min={1} placeholder="1" />
-                  </label>
-                  {/* 加急档位：仅当该签证产品配了档位表才出现（未配 = 沿用不加急口径，界面不变）。
-                      只选档名，加价由系统按产品配置算——运营改档价，录单这里自动跟着走。 */}
-                  {visaExpressTiers.length > 0 && (
-                    <label className="text-xs text-slate-500 md:col-span-2">
-                      加急档位
-                      <select
-                        className={inputCls}
-                        value={visaExpressTierLabel}
-                        onChange={(e) => setVisaExpressTierLabel(e.target.value)}
-                      >
-                        <option value="">不加急（{visa?.processingDays ?? '—'} 个工作日出签）</option>
-                        {visaExpressTiers.map((t) => (
-                          <option key={t.label} value={t.label}>
-                            {t.label} · {t.workDays} 个工作日 · +¥{t.surchargeCny.toLocaleString()}/份
-                          </option>
-                        ))}
-                      </select>
-                      <span className="mt-0.5 block text-[11px] text-slate-400">
-                        加急费按份收，金额由系统按产品配置算（档位在 产品管理 › 签证 里维护）
-                      </span>
-                    </label>
-                  )}
-                  <p className="md:col-span-2 text-[11px] text-slate-400">签证含送签材料，下方每位出行人须填写护照有效期（必填）。份数应与出行人数一致。</p>
-                </div>
-              )}
-
-              {kind === 'BUNDLE' && (
+              {isBundleOrder ? (
                 <div className="grid gap-3 md:grid-cols-2">
                   <label className="text-xs text-slate-500 md:col-span-2">
                     套餐
@@ -2187,30 +1802,62 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                     机票/房/价格由系统按套餐权威重算。
                   </p>
                 </div>
-              )}
-
-              {kind === 'TRANSFER' && (
-                <div className="grid gap-3 md:grid-cols-3">
-                  <label className="text-xs text-slate-500 md:col-span-2">
-                    接送产品
-                    <select className={inputCls} value={transferId} onChange={(e) => setTransferId(e.target.value)}>
-                      <option value="">选择接送…</option>
-                      {transfers.map((t) => (
-                        <option key={t.id} value={t.id}>{t.name}（{t.originArea}→{t.destArea}）¥{Number(t.basePrice).toFixed(0)}</option>
-                      ))}
-                    </select>
-                  </label>
-                  <label className="text-xs text-slate-500">
-                    数量
-                    <NumberInput className={inputCls} value={transferQty} onChange={setTransferQty} integerOnly min={1} placeholder="1" />
-                  </label>
-                  <label className="text-xs text-slate-500 md:col-span-3">
-                    用车日期
-                    <input type="date" className={inputCls} value={transferDate} onChange={(e) => setTransferDate(e.target.value)} />
-                  </label>
-                </div>
+              ) : (
+                <ProductBlockFields
+                  key={blocks[0].id}
+                  block={blocks[0]}
+                  onPatch={(patch) => patchBlock(blocks[0].id, patch)}
+                  token={token}
+                  flights={flights}
+                  hotels={hotels}
+                  visas={visas}
+                  transfers={transfers}
+                  onLoadError={setErr}
+                  inputCls={inputCls}
+                  seatPax={validPassengers.length}
+                />
               )}
             </div>
+
+            {/* 追加的产品区块（产品 2 起）：各自选类型、填字段、可删除 */}
+            {blocks.slice(1).map((b, i) => (
+              <ProductBlockCard
+                key={b.id}
+                index={i + 2}
+                block={b}
+                onPatch={(patch) => patchBlock(b.id, patch)}
+                onChangeKind={(k) => changeBlockKind(b.id, k)}
+                onRemove={() => removeBlock(b.id)}
+                token={token}
+                flights={flights}
+                hotels={hotels}
+                visas={visas}
+                transfers={transfers}
+                onLoadError={setErr}
+                inputCls={inputCls}
+                seatPax={validPassengers.length}
+              />
+            ))}
+
+            {/* ＋ 添加产品：同一张订单再挂一个产品（套餐单不可再加，见上方说明） */}
+            {!isBundleOrder && (
+              <div className="flex flex-wrap items-center gap-3">
+                <button
+                  type="button"
+                  className="btn-secondary text-sm disabled:opacity-50"
+                  onClick={addBlock}
+                  disabled={!canAddBlock}
+                >
+                  ＋ 添加产品
+                </button>
+                <span className="text-[11px] text-slate-400">
+                  {canAddBlock
+                    ? '机票 / 酒店 / 签证 / 接送可任意组合，同类型也可加多条（如「往返机票 + 只住一晚酒店」录成一张单）。'
+                    : `一张订单最多 ${MAX_PRODUCT_BLOCKS} 个产品，更多请拆单录入。`}
+                </span>
+              </div>
+            )}
+
 
             {/* 联系人（选填；默认=录入人本人，可改） */}
             <div className="grid gap-3 md:grid-cols-3">
@@ -2289,7 +1936,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                       // 单向联动（公测反馈：整单选了不需要还要逐个人再选一遍）：改成「不需要」时，
                       // 若当前是套餐单且签证列在显示，把现有出行人一次性批量置为自备签；
                       // 改回其它值不做任何反向还原，不动用户已经逐位调整过的选择。
-                      if (next === 'NOT_NEEDED' && kind === 'BUNDLE' && showVisaExemptCol) {
+                      if (next === 'NOT_NEEDED' && showVisaExemptCol) {
                         setPassengers((prev) => {
                           const updated = prev.map((r) => ({ ...r, visaExempt: true }));
                           passengersRef.current = updated;
@@ -2321,7 +1968,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                 </label>
               </div>
               <p className="mt-2 text-[11px] text-slate-400">
-                默认按产品类型：签证 / 套餐默认「需要」，机票 / 酒店 / 接送默认「不需要」；切换产品类型后若未手动改过本下拉会自动跟随新默认值，手动选过则不再自动改。
+                默认按本单产品：含签证 / 套餐默认「需要」，只有机票 / 酒店 / 接送默认「不需要」；增删产品后若未手动改过本下拉会自动跟随新默认值，手动选过则不再自动改。
               </p>
               {showVisaExemptCol && (
                 <p className="mt-1 text-[11px] text-slate-400">
