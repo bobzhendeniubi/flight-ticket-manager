@@ -14,6 +14,7 @@ import { Link } from 'react-router-dom';
 import { api, type AuditLog } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { summarizePayload } from '../lib/auditFormat';
+import { businessTzParts } from '../lib/datetime';
 
 /**
  * 订单模块实际写入 targetType=ORDER 的 action 全集 → 中文名。
@@ -93,11 +94,11 @@ function actionLabel(code: string): string {
   return ORDER_ACTION_LABELS[code] ?? code;
 }
 
+/** 审计时刻，固定北京时间（原先用 getHours 等取浏览器时区，境外看会跟导出对不上）。 */
 function fmtTime(iso: string): string {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  const p = (n: number) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  const parts = businessTzParts(iso);
+  if (!parts) return iso;
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;
 }
 
 const PAGE_SIZE = 50;

@@ -10,6 +10,7 @@ import { Link } from 'react-router-dom';
 import { api, ApiError, type OrderSummary } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { orderStatusBadgeClass, orderStatusLabel } from '../lib/orderStatus';
+import { formatDateTimeSecCn } from '../lib/datetime';
 import { Icon } from './Icon';
 
 const POLL_INTERVAL_MS = 15000;
@@ -113,7 +114,7 @@ export function RealtimeActivity() {
                   <td className="max-w-xs truncate" title={summary}>{summary}</td>
                   <td className="nums whitespace-nowrap text-right font-medium text-ink">¥{Number(o.total).toLocaleString()}</td>
                   <td className="text-center"><span className={orderStatusBadgeClass(o.status)}>{orderStatusLabel(o.status)}</span></td>
-                  <td className="whitespace-nowrap text-xs text-ink-muted" title={new Date(o.createdAt).toLocaleString('zh-CN')}>
+                  <td className="whitespace-nowrap text-xs text-ink-muted" title={formatDateTimeSecCn(o.createdAt)}>
                     {relativeTime(o.createdAt)}
                   </td>
                 </tr>

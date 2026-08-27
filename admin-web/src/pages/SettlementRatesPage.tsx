@@ -39,6 +39,7 @@ import {
   type QuoteSheetResult,
 } from '../lib/quoteSheetParser';
 import { FlightSettlementRatesPanel } from '../components/FlightSettlementRatesPanel';
+import { formatDateTimeSecCn } from '../lib/datetime';
 import { useAuth } from '../stores/auth';
 
 // 页签：地面整包价（档次 × 晚数）/ 机票结算价（航班号 × 出发日）——两张表各管各的
@@ -377,7 +378,7 @@ export function SettlementRatesPage() {
           <div className="ml-auto flex items-center gap-3">
             {lastUpdated && (
               <span className="text-[11px] text-ink-muted">
-                最近更新：{new Date(lastUpdated).toLocaleString('zh-CN')}
+                最近更新：{formatDateTimeSecCn(lastUpdated)}
               </span>
             )}
             <button
@@ -565,7 +566,7 @@ export function SettlementRatesPage() {
                               value={draft.get(key) ?? ''}
                               title={
                                 existing
-                                  ? `最近更新：${new Date(existing.updatedAt).toLocaleString('zh-CN')}`
+                                  ? `最近更新：${formatDateTimeSecCn(existing.updatedAt)}`
                                   : undefined
                               }
                               onChange={(e) => setCell(date, nights, e.target.value)}

@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import { api, ApiError, type MarketingPosterDetail, type MarketingPosterListItem, type MarketingPosterStatus, type MarketingTemplate, type MarketingUsage, type RangeSchedule } from '../lib/api';
 import { PosterDetailModal } from '../components/PosterDetailModal';
 import { airportLabel } from '../lib/airports';
+import { formatInBusinessTz } from '../lib/datetime';
 import { useAuth } from '../stores/auth';
 import { useConfirm } from '../components/ConfirmDialog';
 
@@ -34,10 +35,15 @@ function dateAfter(days: number): string {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
 }
 
+/**
+ * 海报创建时间等系统时间戳 —— 固定北京时间。
+ * 也兼作 formatSchedule 里 departureTz 不可用时的兜底（那条 catch 分支拿不到班次时区，
+ * 退到业务时区总好过退到浏览器时区）。
+ */
 function formatDateTime(value: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
-  return date.toLocaleString('zh-CN', {
+  return formatInBusinessTz(date, {
     year: 'numeric',
     month: '2-digit',
     day: '2-digit',

@@ -6,6 +6,7 @@ import { useEffect, useMemo, useState } from 'react';
 import { api, ApiError, type SettlementSummary, type SettlementDetail, type SettlementStatus } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { exportToCSV } from '../lib/csvExport';
+import { formatDateTimeSecCn } from '../lib/datetime';
 import { Icon, type IconName } from '../components/Icon';
 import { useDialogA11y } from '../components/Modal';
 
@@ -166,7 +167,7 @@ export function SettlementsPage() {
               prepaymentOffset: Number(s.prepaymentOffset),
               payable: Number(s.payableToAgent),
               status: STATUS_INFO[s.status].label,
-              paidAt: s.paidAt ? new Date(s.paidAt).toLocaleString('zh-CN') : '—',
+              paidAt: s.paidAt ? formatDateTimeSecCn(s.paidAt) : '—',
             })), [
               { key: 'period', label: '月份' },
               { key: 'agent', label: '代理' },
@@ -397,9 +398,9 @@ function SettlementDrawer({
         )}
 
         <div className="mt-4 text-xs text-slate-500">
-          生成时间: {new Date(settlement.generatedAt).toLocaleString('zh-CN')}
-          {settlement.approvedAt && <><br />核准时间: {new Date(settlement.approvedAt).toLocaleString('zh-CN')}</>}
-          {settlement.paidAt && <><br />支付时间: {new Date(settlement.paidAt).toLocaleString('zh-CN')}</>}
+          生成时间: {formatDateTimeSecCn(settlement.generatedAt)}
+          {settlement.approvedAt && <><br />核准时间: {formatDateTimeSecCn(settlement.approvedAt)}</>}
+          {settlement.paidAt && <><br />支付时间: {formatDateTimeSecCn(settlement.paidAt)}</>}
         </div>
 
         {nextSteps.length > 0 && (

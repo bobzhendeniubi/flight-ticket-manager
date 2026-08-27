@@ -6,7 +6,17 @@ import { Fragment, useEffect, useState } from 'react';
 import type { FormEvent } from 'react';
 import { api, ApiError, type StaffRole, type StaffUser } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { businessTzParts } from '../lib/datetime';
 import { Icon } from '../components/Icon';
+
+/**
+ * 上次登录日期，按北京时间。
+ * 原来直接 slice(0,10) 取的是 ISO 串里的 **UTC** 日期：早上 7 点登录会显示成前一天。
+ */
+function lastLoginDay(iso: string): string {
+  const parts = businessTzParts(iso);
+  return parts ? `${parts.year}-${parts.month}-${parts.day}` : iso.slice(0, 10);
+}
 
 const STAFF_ROLE_LABEL: Record<StaffRole, string> = {
   VISA_DESK: '签证岗',
@@ -302,7 +312,7 @@ export function StaffRolesPage() {
                         <span className="badge-neutral">正常</span>
                       )}
                     </td>
-                    <td className="text-xs text-ink-muted">{u.lastLoginAt ? u.lastLoginAt.slice(0, 10) : '从未'}</td>
+                    <td className="text-xs text-ink-muted">{u.lastLoginAt ? lastLoginDay(u.lastLoginAt) : '从未'}</td>
                     <td>
                       <div className="flex flex-wrap gap-2">
                         {currentUser?.id !== u.id && (

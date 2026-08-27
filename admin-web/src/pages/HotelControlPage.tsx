@@ -14,6 +14,7 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Icon } from '../components/Icon';
+import { formatInBusinessTz } from '../lib/datetime';
 import {
   api,
   ApiError,
@@ -1097,13 +1098,17 @@ const RECENT_CHANGES_DAYS = 7;
 /** 变更行乘客姓名展示上限——超过则截断为「前 N 个 + 等 M 人」。*/
 const CHANGE_PASSENGER_NAMES_LIMIT = 3;
 
-/** ISO8601 → 本地「M/D HH:mm」。*/
+/** ISO8601 → 北京时间「M/D HH:mm」（原先用 getHours 等取浏览器时区，境外看会跟导出对不上）。*/
 function fmtChangeTime(iso: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
-  const hh = String(d.getHours()).padStart(2, '0');
-  const mm = String(d.getMinutes()).padStart(2, '0');
-  return `${d.getMonth() + 1}/${d.getDate()} ${hh}:${mm}`;
+  return formatInBusinessTz(d, {
+    month: 'numeric',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
 }
 
 /** "2026-08-10" → "8/10"（变更行紧凑日期，与提醒线 fmtMonthDay 同风格）。*/

@@ -4,6 +4,7 @@
 import { FormEvent, useCallback, useEffect, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { localYmd } from '../lib/airports';
+import { formatDateTimeSecCn } from '../lib/datetime';
 import { api, ApiError, ROSTER_FORMAT_LABEL, SETTLEMENT_MODE_LABEL, type AgentListItem, type CommissionKind, type CreateChildAgentInput, type CustomerSummary, type RosterFormat, type SettlementDiscountRule, type SettlementMode, type SettlementTier, type UpdateAgentInput } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { Icon } from '../components/Icon';
@@ -837,8 +838,8 @@ function InfoTab({
           <Row label="下级数" value={agent.childCount.toString()} />
           <Row label="订单数" value={agent.orderCount.toString()} />
           <Row label="状态" value={agent.isActive ? <><Icon name="check" /> 在用</> : <><Icon name="pause" /> 停用</>} />
-          <Row label="注册时间" value={new Date(agent.createdAt).toLocaleString('zh-CN')} />
-          <Row label="上次登录" value={agent.lastLoginAt ? new Date(agent.lastLoginAt).toLocaleString('zh-CN') : '从未登录'} />
+          <Row label="注册时间" value={formatDateTimeSecCn(agent.createdAt)} />
+          <Row label="上次登录" value={agent.lastLoginAt ? formatDateTimeSecCn(agent.lastLoginAt) : '从未登录'} />
           <Row label="名单格式" value={agent.rosterFormat ? ROSTER_FORMAT_LABEL[agent.rosterFormat] : '未登记'} />
           {(agent.rosterKeywords?.length ?? 0) > 0 && (
             <Row label="识别词条" value={agent.rosterKeywords.join('、')} />

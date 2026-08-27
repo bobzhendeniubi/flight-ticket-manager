@@ -13,6 +13,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { formatLocalTime } from '../lib/airports';
+import { formatDateTimeSecCn, formatInBusinessTz } from '../lib/datetime';
 import { Icon } from '../components/Icon';
 import {
   api,
@@ -97,9 +98,15 @@ function fmtFxRate(n: number | null | undefined): string {
   if (n == null || !Number.isFinite(n)) return '—';
   return n.toLocaleString('zh-CN', { maximumFractionDigits: 6 });
 }
+/** 录入/更新时刻，固定北京时间（原先用 getHours 等取浏览器时区，境外看会跟导出差几小时）。 */
 function fmtDate(iso: string): string {
-  const d = new Date(iso);
-  return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  return formatInBusinessTz(iso, {
+    month: 'numeric',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
 }
 function fmtMonth(s: string): string {
   const [y, m] = s.split('-');
@@ -1523,7 +1530,7 @@ function FlightScheduleCostRow({
 
   const ph = (period: number | null): string => (period == null ? '' : String(period));
   const lockedAtTitle = row.costLockedAt
-    ? `成本已锁定于 ${new Date(row.costLockedAt).toLocaleString('zh-CN')}`
+    ? `成本已锁定于 ${formatDateTimeSecCn(row.costLockedAt)}`
     : undefined;
 
   return (

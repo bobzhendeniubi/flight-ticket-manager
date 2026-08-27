@@ -10,6 +10,7 @@ import { exportToCSV } from '../lib/csvExport';
 import { api, ApiError, type AuditLog } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { formatAction, formatPayloadDiff, summarizePayload, type DiffLine } from '../lib/auditFormat';
+import { formatDateTimeSecCn, formatInBusinessTz } from '../lib/datetime';
 import { Icon, type IconName } from '../components/Icon';
 import { useDialogA11y } from '../components/Modal';
 
@@ -176,7 +177,7 @@ export function AuditLogsPage() {
             exportToCSV(
               '审计日志',
               filtered.map((l) => ({
-                timestamp: new Date(l.timestamp).toLocaleString('zh-CN'),
+                timestamp: formatDateTimeSecCn(l.timestamp),
                 actor: l.actor,
                 actorRole: l.actorRole,
                 ip: l.ip,
@@ -290,7 +291,7 @@ export function AuditLogsPage() {
               {filtered.map((l) => (
                 <tr key={l.id} className="cursor-pointer" onClick={() => setSelected(l)}>
                   <td className="text-xs font-mono text-ink-soft">
-                    {new Date(l.timestamp).toLocaleString('zh-CN', {
+                    {formatInBusinessTz(l.timestamp, {
                       month: '2-digit',
                       day: '2-digit',
                       hour: '2-digit',
@@ -364,7 +365,7 @@ export function AuditLogsPage() {
             </div>
             <dl className="space-y-3 px-6 py-5 text-sm">
               <Field label="时间">
-                <span className="font-mono text-xs">{new Date(selected.timestamp).toLocaleString('zh-CN')}</span>
+                <span className="font-mono text-xs">{formatDateTimeSecCn(selected.timestamp)}</span>
               </Field>
               <Field label="操作人">
                 <div>{selected.actor}</div>

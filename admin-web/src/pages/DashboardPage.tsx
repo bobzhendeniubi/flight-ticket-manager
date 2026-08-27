@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { api, ApiError, type DashboardKpi, type DashboardWeeklyPoint, type DashboardTopAgent } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { formatInBusinessTz } from '../lib/datetime';
 import { RealtimeActivity } from '../components/RealtimeActivity';
 import { PendingAgingCard } from '../components/dashboard/PendingAgingCard';
 import { WeeklyRevenueChart } from '../components/dashboard/WeeklyRevenueChart';
@@ -41,7 +42,7 @@ export function DashboardPage() {
         <div>
           <h1 className="page-title">运营仪表盘</h1>
           <p className="page-sub">
-            {kpi ? `截至 ${new Date(kpi.asOf).toLocaleString('zh-CN', { hour: '2-digit', minute: '2-digit' })}` : '加载中…'}
+            {kpi ? `截至 ${formatInBusinessTz(kpi.asOf, { hour: '2-digit', minute: '2-digit' })}` : '加载中…'}
             {!loading && !error && kpi && ' · 实时数据'}
           </p>
         </div>

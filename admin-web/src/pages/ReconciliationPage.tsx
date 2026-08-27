@@ -30,6 +30,7 @@ import {
   type UnverifiedClaimItem,
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { businessTzParts, formatDateTimeSecCn, formatInBusinessTz } from '../lib/datetime';
 import { NumberInput } from '../components/NumberInput';
 import { PaymentChannelsManager } from '../components/PaymentChannelsManager';
 import { ProofImageViewer } from '../components/ProofImageViewer';
@@ -74,12 +75,17 @@ function fmtCny(s: string | number | null | undefined): string {
   return `¥${n.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
+/** 到账时刻，固定北京时间（原先用 getHours 等取浏览器时区，境外看会跟导出差几小时）。 */
 function fmtDateTime(iso: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
-  return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(
-    d.getMinutes(),
-  ).padStart(2, '0')}`;
+  return formatInBusinessTz(d, {
+    month: 'numeric',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
 }
 
 // 流水来源标签：进账来源映射成中文，其它（如订单收款的 source）原样回显
@@ -87,14 +93,15 @@ function ledgerSourceLabel(source: string): string {
   return (RECEIPT_SOURCE_LABEL as Record<string, string>)[source] ?? source;
 }
 
+/**
+ * 「今日进账」的今日 = **北京时间的今天**，跟这张表里展示的到账时刻同一口径。
+ * 若按浏览器时区判断，境外同事会看到某笔款明明写着今天、却没算进今日合计。
+ */
 function isToday(iso: string): boolean {
-  const d = new Date(iso);
-  const now = new Date();
-  return (
-    d.getFullYear() === now.getFullYear() &&
-    d.getMonth() === now.getMonth() &&
-    d.getDate() === now.getDate()
-  );
+  const day = businessTzParts(iso);
+  const today = businessTzParts(new Date());
+  if (!day || !today) return false;
+  return day.year === today.year && day.month === today.month && day.day === today.day;
 }
 
 // ── 主页面 ───────────────────────────────────────────────────────────────────
@@ -465,7 +472,7 @@ function UnverifiedQueue({
                   <td className="px-3 py-2 text-right font-medium">¥{row.amountCny.toLocaleString()}</td>
                   <td className="px-3 py-2 text-xs">{PAYMENT_METHOD_LABEL[row.method] ?? row.method}</td>
                   <td className="px-3 py-2 text-xs">{row.byName ?? '—'}</td>
-                  <td className="px-3 py-2 text-xs text-ink-muted">{new Date(row.createdAt).toLocaleString('zh-CN')}</td>
+                  <td className="px-3 py-2 text-xs text-ink-muted">{formatDateTimeSecCn(row.createdAt)}</td>
                   <td className="px-3 py-2 text-xs">{overdue ? <span className="font-semibold text-rose-700">{days} 天 · 超期</span> : `${days} 天`}</td>
                   <td className="px-3 py-2">{row.proofUrl ? <ProofImageViewer src={row.proofUrl} alt="水单截图" /> : <span className="text-xs text-ink-muted">无</span>}</td>
                   <td className="px-3 py-2 text-right">

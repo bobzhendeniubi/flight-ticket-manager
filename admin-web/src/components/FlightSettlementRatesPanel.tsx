@@ -16,6 +16,7 @@
  *      （出发日 × 航班号）后预览确认，直接走批量 upsert 写库并重拉网格。
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { formatDateTimeSecCn } from '../lib/datetime';
 import { Icon } from './Icon';
 import {
   api,
@@ -334,7 +335,7 @@ export function FlightSettlementRatesPanel() {
         <div className="ml-auto flex items-center gap-3">
           {lastUpdated && (
             <span className="text-[11px] text-ink-muted">
-              最近更新：{new Date(lastUpdated).toLocaleString('zh-CN')}
+              最近更新：{formatDateTimeSecCn(lastUpdated)}
             </span>
           )}
           <button
@@ -534,7 +535,7 @@ export function FlightSettlementRatesPanel() {
                             value={draft.get(key) ?? ''}
                             title={
                               existing
-                                ? `最近更新：${new Date(existing.updatedAt).toLocaleString('zh-CN')}`
+                                ? `最近更新：${formatDateTimeSecCn(existing.updatedAt)}`
                                 : undefined
                             }
                             onChange={(e) => setCell(date, fn, e.target.value)}

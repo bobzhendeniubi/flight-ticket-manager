@@ -4,6 +4,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { type MockCustomer } from '../lib/mockData';
 import { exportToCSV } from '../lib/csvExport';
+import { formatDateCn, formatDateTimeSecCn } from '../lib/datetime';
 import { api, ApiError, type CustomerSummary } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { Icon } from '../components/Icon';
@@ -94,9 +95,9 @@ export function CustomersPage() {
       { key: 'agentName', label: '归属代理', format: (v) => String(v ?? '直销') },
       { key: 'totalOrders', label: '订单数' },
       { key: 'totalSpent', label: '累计消费', format: (v) => `¥${Number(v).toLocaleString()}` },
-      { key: 'lastOrderAt', label: '最后下单', format: (v) => v ? new Date(String(v)).toLocaleDateString('zh-CN') : '—' },
+      { key: 'lastOrderAt', label: '最后下单', format: (v) => v ? formatDateCn(String(v)) : '—' },
       { key: 'tags', label: '标签', format: (v) => (v as string[]).join('·') },
-      { key: 'createdAt', label: '注册时间', format: (v) => new Date(String(v)).toLocaleDateString('zh-CN') },
+      { key: 'createdAt', label: '注册时间', format: (v) => formatDateCn(String(v)) },
     ]);
   };
 
@@ -195,7 +196,7 @@ export function CustomersPage() {
                     <div className="text-xs text-ink-muted nums">¥{c.totalSpent.toLocaleString()}</div>
                   </td>
                   <td className="text-xs text-ink-soft">
-                    {c.lastOrderAt ? new Date(c.lastOrderAt).toLocaleDateString('zh-CN') : '—'}
+                    {c.lastOrderAt ? formatDateCn(c.lastOrderAt) : '—'}
                   </td>
                   <td>
                     <div className="flex flex-wrap gap-1">
@@ -339,7 +340,7 @@ function CustomerDrawer({
                 <h3 className="text-xs font-semibold text-slate-500 uppercase mb-2">归属</h3>
                 <dl className="space-y-1">
                   <Row label="销售渠道" value={customer.agentName ? <><Icon name="handshake" /> {customer.agentName}</> : <><Icon name="building" /> 直销</>} />
-                  <Row label="注册时间" value={new Date(customer.createdAt).toLocaleString('zh-CN')} />
+                  <Row label="注册时间" value={formatDateTimeSecCn(customer.createdAt)} />
                 </dl>
               </section>
               <section>
@@ -355,7 +356,7 @@ function CustomerDrawer({
                   </div>
                 </div>
                 <div className="mt-2 text-xs text-slate-500">
-                  最近下单: {customer.lastOrderAt ? new Date(customer.lastOrderAt).toLocaleString('zh-CN') : '—'}
+                  最近下单: {customer.lastOrderAt ? formatDateTimeSecCn(customer.lastOrderAt) : '—'}
                 </div>
               </section>
             </>

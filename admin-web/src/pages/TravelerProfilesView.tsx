@@ -18,6 +18,7 @@ import {
   type LegacyPassengerHistory,
 } from '../lib/api';
 import { exportToCSV } from '../lib/csvExport';
+import { formatDateTimeSecCn } from '../lib/datetime';
 import { useAuth } from '../stores/auth';
 import { Icon } from '../components/Icon';
 import { useConfirm } from '../components/ConfirmDialog';
@@ -78,7 +79,7 @@ function calcAge(dobIso: string | null): number | null {
 
 function fmtDateTime(iso: string): string {
   const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString('zh-CN');
+  return Number.isNaN(d.getTime()) ? iso : formatDateTimeSecCn(d);
 }
 
 function passportExpiryDays(iso: string | null): number | null {
@@ -194,7 +195,7 @@ export function TravelerProfilesView() {
             全量订单乘机人按<strong>证件号</strong>归拢的常旅客画像：飞行次数、消费、酒店与偏好。
             {kpi.refreshedAt && (
               <span className="ml-2 text-xs text-ink-muted">
-                数据截至 {new Date(kpi.refreshedAt).toLocaleString('zh-CN')}
+                数据截至 {formatDateTimeSecCn(kpi.refreshedAt)}
               </span>
             )}
           </p>

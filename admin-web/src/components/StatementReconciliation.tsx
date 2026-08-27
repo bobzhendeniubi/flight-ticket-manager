@@ -25,6 +25,7 @@ import {
   type StatementPlatform,
   type StatementPreviewResult,
 } from '../lib/api';
+import { formatInBusinessTz } from '../lib/datetime';
 import { NumberInput } from './NumberInput';
 import { Icon } from './Icon';
 import { useConfirm } from './ConfirmDialog';
@@ -37,12 +38,17 @@ function fmtCny(n: number): string {
   return `¥${n.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
+/** 到账时刻，固定北京时间（原先用 getHours 等取浏览器时区，境外看会跟导出差几小时）。 */
 function fmtDateTime(iso: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return iso;
-  return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(
-    d.getMinutes(),
-  ).padStart(2, '0')}`;
+  return formatInBusinessTz(d, {
+    month: 'numeric',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
 }
 
 /** 方式徽标（微=绿 / 支=蓝 / 其它=灰），工作台密集展示用单字。 */

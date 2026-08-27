@@ -24,6 +24,7 @@ import {
   type Receipt,
 } from '../lib/api';
 import { CABIN_LABEL, formatLocalDate, formatLocalTime } from '../lib/airports';
+import { formatDateTimeSecCn } from '../lib/datetime';
 import { useAuth } from '../stores/auth';
 import { HOLD_STATUS_META, holdStatusBadgeClass, holdStatusLabel } from '../lib/orderStatus';
 import { useDialogA11y } from '../components/Modal';
@@ -381,7 +382,7 @@ export function HoldOrdersPage() {
                     <td className="text-right nums">{remainingSeats}/{order.seats}</td>
                     <td className="text-right nums">¥{order.perSeatPriceCny}/人</td>
                     <td><button type="button" className={holdStatusBadgeClass(order.status)} onClick={() => setExpandedId(expandedId === order.id ? null : order.id)}>{holdStatusLabel(order.status)} · 期表</button>{waitingOccupy && <div className="mt-1 text-xs font-semibold text-amber-700">已收全款，待占座</div>}</td>
-                    <td className="text-xs text-ink-muted">{new Date(order.createdAt).toLocaleString('zh-CN')}</td>
+                    <td className="text-xs text-ink-muted">{formatDateTimeSecCn(order.createdAt)}</td>
                     <td className="whitespace-nowrap text-right">
                       <button className="mr-2 text-xs font-medium text-brand-700 disabled:text-ink-muted" disabled={!holding || busy} onClick={() => setPriceOrder(order)}>改价</button>
                       <button className="mr-2 text-xs font-medium text-brand-700 disabled:text-ink-muted" disabled={!holding || busy} onClick={() => setInfoOrder(order)}>编辑</button>
@@ -900,13 +901,13 @@ function HoldLedgerDetails({ order }: { order: HoldOrderListItem }) {
       <div>
         <div className="mb-1 font-semibold text-ink-soft">转正记录</div>
         {conversions.length === 0 ? <div className="text-ink-muted">暂无</div> : <ul className="space-y-1 text-ink-muted">
-          {conversions.map((row) => <li key={row.id}>订单 <span className="font-mono text-brand-700">{row.orderNumber}</span> · {row.seats} 座 · 结转 ¥{row.carryCny.toLocaleString()} · {new Date(row.createdAt).toLocaleString('zh-CN')}</li>)}
+          {conversions.map((row) => <li key={row.id}>订单 <span className="font-mono text-brand-700">{row.orderNumber}</span> · {row.seats} 座 · 结转 ¥{row.carryCny.toLocaleString()} · {formatDateTimeSecCn(row.createdAt)}</li>)}
         </ul>}
       </div>
       <div>
         <div className="mb-1 font-semibold text-ink-soft">清算记录</div>
         {reductions.length === 0 ? <div className="text-ink-muted">暂无</div> : <ul className="space-y-1 text-ink-muted">
-          {reductions.map((row) => <li key={row.id}>{row.seatsReduced} 座 · 免损 {row.freeSeats} · 没收 ¥{row.forfeitCny.toLocaleString()} · 挂账 ¥{row.surplusCny.toLocaleString()} · {new Date(row.createdAt).toLocaleString('zh-CN')}</li>)}
+          {reductions.map((row) => <li key={row.id}>{row.seatsReduced} 座 · 免损 {row.freeSeats} · 没收 ¥{row.forfeitCny.toLocaleString()} · 挂账 ¥{row.surplusCny.toLocaleString()} · {formatDateTimeSecCn(row.createdAt)}</li>)}
         </ul>}
       </div>
     </div>
@@ -1069,7 +1070,7 @@ function AllocateModal({ order, installment, token, onCancel, onDone }: { order:
     if (!receiptId || amount < 1 || amount > due) { setError(`请输入不超过本期未认余额 ¥${due.toLocaleString()} 的金额`); return; }
     try { const result = await api.allocateHoldInstallment(token, order.id, installment.id, { receiptId, amountCny: amount }); await onDone(result.result.warning); } catch (err) { setError(err instanceof Error ? err.message : '认款失败'); }
   };
-  return <div ref={dialogRef} role="dialog" aria-modal="true" aria-label={`认款 · ${order.holdNo} · ${installment.label}`} tabIndex={-1} className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" onClick={onCancel}><div className="w-full max-w-lg rounded-lg bg-white shadow-xl" onClick={(e) => e.stopPropagation()}><div className="flex items-center justify-between border-b border-slate-200 px-5 py-3"><h2 className="text-lg font-semibold">认款 · {order.holdNo} · {installment.label}</h2><button onClick={onCancel} className="text-xl text-slate-400">×</button></div><div className="space-y-4 px-5 py-4"><p className="text-sm text-ink-muted">本期应收 ¥{installment.amountCny.toLocaleString()}，未认 ¥{due.toLocaleString()}</p>{loading ? <p className="text-sm text-ink-muted">加载挂账池…</p> : receipts.length === 0 ? <p className="rounded bg-amber-50 px-3 py-2 text-sm text-amber-800">挂账池暂无可认流水——请先在财务 · 流水页登记或导入这笔收款，再回来认款</p> : <select className="input" value={receiptId} onChange={(e) => setReceiptId(e.target.value)}><option value="">选择 OPEN/部分认款流水</option>{receipts.map((r) => <option key={r.id} value={r.id}>{r.receiptNo} · 余额 ¥{Number(r.remainingCny).toLocaleString()} · {new Date(r.receivedAt).toLocaleString('zh-CN')}</option>)}</select>}<input className="input" type="number" min={1} max={due} value={amount || ''} disabled={!receiptId} onChange={(e) => setAmount(Number(e.target.value))} placeholder="认款金额（元）" />{error && <p className="rounded bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p>}<div className="flex justify-end gap-3"><button className="btn-secondary" onClick={onCancel}>取消</button><button className="btn-primary" disabled={loading || !receiptId} title={!loading && !receiptId ? '请先选择流水' : undefined} onClick={() => void submit()}>确认认款</button></div></div></div></div>;
+  return <div ref={dialogRef} role="dialog" aria-modal="true" aria-label={`认款 · ${order.holdNo} · ${installment.label}`} tabIndex={-1} className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" onClick={onCancel}><div className="w-full max-w-lg rounded-lg bg-white shadow-xl" onClick={(e) => e.stopPropagation()}><div className="flex items-center justify-between border-b border-slate-200 px-5 py-3"><h2 className="text-lg font-semibold">认款 · {order.holdNo} · {installment.label}</h2><button onClick={onCancel} className="text-xl text-slate-400">×</button></div><div className="space-y-4 px-5 py-4"><p className="text-sm text-ink-muted">本期应收 ¥{installment.amountCny.toLocaleString()}，未认 ¥{due.toLocaleString()}</p>{loading ? <p className="text-sm text-ink-muted">加载挂账池…</p> : receipts.length === 0 ? <p className="rounded bg-amber-50 px-3 py-2 text-sm text-amber-800">挂账池暂无可认流水——请先在财务 · 流水页登记或导入这笔收款，再回来认款</p> : <select className="input" value={receiptId} onChange={(e) => setReceiptId(e.target.value)}><option value="">选择 OPEN/部分认款流水</option>{receipts.map((r) => <option key={r.id} value={r.id}>{r.receiptNo} · 余额 ¥{Number(r.remainingCny).toLocaleString()} · {formatDateTimeSecCn(r.receivedAt)}</option>)}</select>}<input className="input" type="number" min={1} max={due} value={amount || ''} disabled={!receiptId} onChange={(e) => setAmount(Number(e.target.value))} placeholder="认款金额（元）" />{error && <p className="rounded bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p>}<div className="flex justify-end gap-3"><button className="btn-secondary" onClick={onCancel}>取消</button><button className="btn-primary" disabled={loading || !receiptId} title={!loading && !receiptId ? '请先选择流水' : undefined} onClick={() => void submit()}>确认认款</button></div></div></div></div>;
 }
 
 function ReduceModal({ order, token, onCancel, onDone }: { order: HoldOrderListItem; token: string; onCancel: () => void; onDone: () => Promise<void> }) {

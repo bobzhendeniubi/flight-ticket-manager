@@ -25,6 +25,7 @@ import {
 import { useAuth } from '../stores/auth';
 import { NumberInput } from '../components/NumberInput';
 import { Icon } from '../components/Icon';
+import { formatDateTimeSecCn } from '../lib/datetime';
 
 // ── 凭证图片压缩（与 sales-web PaymentPanel 的算法一致，目标体积调小到 ~1.5MB/张） ──
 const MAX_PROOF_BYTES = 6 * 1024 * 1024;
@@ -364,7 +365,7 @@ function RequestList({ title, requests, showAgentName = false }: { title: string
                   <span className={STATUS_BADGE[r.status]}>{AGENT_RECHARGE_STATUS_LABEL[r.status]}</span>
                 </td>
                 <td className="max-w-[160px] truncate text-ink-soft" title={r.reviewNote ?? ''}>{r.reviewNote || '—'}</td>
-                <td className="text-xs text-ink-muted">{new Date(r.createdAt).toLocaleString('zh-CN')}</td>
+                <td className="text-xs text-ink-muted">{formatDateTimeSecCn(r.createdAt)}</td>
               </tr>
             ))}
           </tbody>
@@ -504,7 +505,7 @@ function PendingRow({ request, token, onChanged }: { request: AgentRechargeReque
             ))}
           </div>
         </td>
-        <td className="text-xs text-ink-muted">{new Date(request.createdAt).toLocaleString('zh-CN')}</td>
+        <td className="text-xs text-ink-muted">{formatDateTimeSecCn(request.createdAt)}</td>
         <td className="text-right">
           <div className="flex justify-end gap-1.5 text-xs font-medium">
             <button type="button" className="btn-secondary px-2.5 py-1 text-xs" onClick={() => setAction(action === 'confirm' ? 'none' : 'confirm')}>确认</button>

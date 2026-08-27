@@ -8,6 +8,7 @@ import {
 } from '../lib/mockData';
 import { csvNumber, exportToCSV, localDateStamp } from '../lib/csvExport';
 import { AIRPORTS, formatLocalTime, localYmd } from '../lib/airports';
+import { businessTzParts, formatDateCn, formatDateTimeSecCn, formatInBusinessTz } from '../lib/datetime';
 import { NumberInput } from '../components/NumberInput';
 import { Icon, type IconName } from '../components/Icon';
 import { parseOtaRoster } from '../lib/parseOtaRoster';
@@ -378,8 +379,14 @@ function BalanceBadge({ balance, settlementMode }: { balance: number; settlement
 function formatOrderListTime(iso: string): string {
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return '—';
-  const p = (n: number) => String(n).padStart(2, '0');
-  return `${p(d.getMonth() + 1)}/${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  // 固定北京时间：原先用 getHours 等取浏览器时区，境外同事看到的下单时间会跟导出对不上。
+  return formatInBusinessTz(d, {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  });
 }
 
 // 列表「开票」列：六态紧凑三点式显示（去 / 回 / 系）。只读——切换在订单详情里。
@@ -1922,7 +1929,7 @@ export function OrdersPage() {
                   paid: deriveBalance(order).paid,
                   balance: deriveBalance(order).balance,
                   status: orderStatusLabel(order.status),
-                  createdAt: new Date(order.createdAt).toLocaleString('zh-CN'),
+                  createdAt: formatDateTimeSecCn(order.createdAt),
                 })),
                 [
                   { key: 'orderNumber', label: '订单号' },
@@ -3487,7 +3494,7 @@ export function OrdersPage() {
                             <span className={orderStatusBadgeClass(o.status)}>{orderStatusLabel(o.status)}</span>
                           </td>
                           <td className="py-2 pr-3 text-xs text-ink-muted">
-                            {o.deletedAt ? new Date(o.deletedAt).toLocaleString('zh-CN') : '—'}
+                            {o.deletedAt ? formatDateTimeSecCn(o.deletedAt) : '—'}
                             {o.deletedBy ? (
                               <span className="block text-[11px]">操作人：{o.deletedBy}</span>
                             ) : null}
@@ -3977,7 +3984,7 @@ function OrderDrawer({
                 </button>
               )}
             </div>
-            <div className="mt-1 text-[11px] text-ink-muted">下单 {new Date(o.createdAt).toLocaleString('zh-CN')}</div>
+            <div className="mt-1 text-[11px] text-ink-muted">下单 {formatDateTimeSecCn(o.createdAt)}</div>
           </div>
 
           <RemindersSection order={o} />
@@ -6217,7 +6224,7 @@ function AdjustmentsSection({ order }: { order: OrderSummary }) {
               <div className="flex-1">
                 <div className="text-ink">{a.label}</div>
                 {a.note && <div className="mt-0.5 text-xs text-ink-muted">{a.note}</div>}
-                <div className="mt-0.5 text-[11px] text-ink-muted">{new Date(a.at).toLocaleString('zh-CN')}</div>
+                <div className="mt-0.5 text-[11px] text-ink-muted">{formatDateTimeSecCn(a.at)}</div>
               </div>
               <div className="nums text-sm font-medium text-amber-700">
                 {sign}¥{Math.abs(amountCny).toLocaleString()}
@@ -6554,11 +6561,11 @@ function auditToSwapHistory(logs: AuditLog[]): SwapHistoryEntry[] {
     });
 }
 
+/** 换人时刻，固定北京时间（原先用 getHours 等取浏览器时区，境外看会跟导出对不上）。 */
 function fmtSwapTime(iso: string): string {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  const p = (n: number) => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+  const parts = businessTzParts(iso);
+  if (!parts) return iso;
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;
 }
 
 // 单个乘客卡下方的换人历史（时间 · 旧人姓名/证件号 → 新人 · 经手；含多次换人，最新在上）
@@ -10807,7 +10814,7 @@ function ConfirmPaymentSection({
               >
                 <span>{PAYMENT_METHOD_LABEL[p.method] ?? p.method}</span>
                 <span className="font-medium">¥{Number(p.amount).toLocaleString()}</span>
-                <span className="text-slate-400">{p.paidAt ? new Date(p.paidAt).toLocaleDateString('zh-CN') : ''}</span>
+                <span className="text-slate-400">{p.paidAt ? formatDateCn(p.paidAt) : ''}</span>
                 {p.status === 'REFUNDED' ? (
                   <span
                     className="inline-flex items-center rounded bg-slate-200 px-1.5 py-0.5 font-medium text-slate-600 no-underline"
