@@ -6,8 +6,8 @@
  *   - 同额防呆软闸：近 10 分钟等额手工收款 → 409 + code DUPLICATE_AMOUNT；confirmDuplicate 放行
  *   - 正常分次凑单到收满 → 自动 PAID（不产生多付）
  *   - 防手误上限：异常偏高金额被拒
- *   - 幂等：同 idempotencyKey 不二次累计
- *   - 批量到账：N 单确认，单坏不连累其余
+ *   - 幂等：同 idempotencyKey 不二次累计；撞键（订单/金额对不上）→ 409 而非假成功重放
+ *   - 批量到账：N 单确认，单坏不连累其余；同批次同一订单重复行 → 整批 400
  *
  * 跑：
  *   1. docker compose -f docker-compose.test.yml up -d
@@ -122,10 +122,12 @@ describe('PaymentsService.confirmManualPayment · 超收拆分与防手误', () 
     expect(first.status).toBe(OrderStatus.PAID);
     expect(first.overpaySplit).toBeNull();
 
-    // 第二笔（不同收款方式，等额）：应收已为 0 → 不生成 Payment，整笔 1000 进挂账池
+    // 第二笔（不同收款方式，等额）：应收已为 0 → 不生成 Payment，整笔 1000 进挂账池。
+    // 等额且在 10 分钟内会先撞同额防呆软闸（另有用例专门锁那条 409），这里要测的是软闸之后的
+    // 拆分口径，所以带 confirmDuplicate 放行——否则本用例和那条 409 用例互相打架。
     const second = await service.confirmManualPayment(
       order.id,
-      { amount: 1000, method: PaymentMethod.WECHAT_PAY },
+      { amount: 1000, method: PaymentMethod.WECHAT_PAY, confirmDuplicate: true },
       ADMIN,
     );
     expect(second.paymentId).toBeNull();
@@ -215,6 +217,31 @@ describe('PaymentsService.confirmManualPayment · 超收拆分与防手误', () 
     expect(Number(dbOrder.paidAmount)).toBe(10);
   });
 
+  it('多收一分也拆：应收 1000、到账 1000.01 → 1000 入账，1 分进挂账池', async () => {
+    const ADMIN = await createAdminActor();
+    const customer = await createCustomer();
+    const order = await createPendingOrder(customer.id, 1000);
+
+    const res = await service.confirmManualPayment(
+      order.id,
+      { amount: 1000.01, method: PaymentMethod.BANK_CARD },
+      ADMIN,
+    );
+    expect(res.paidAmount).toBe(1000);
+    expect(res.status).toBe(OrderStatus.PAID);
+    expect(res.overpaySplit?.creditedAmount).toBe(1000);
+    expect(res.overpaySplit?.pooledAmount).toBe(0.01);
+
+    // 订单账面一分不多：那 1 分躺在挂账池里等认领，不是这张单的钱
+    const dbOrder = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(Number(dbOrder.paidAmount)).toBe(1000);
+    const receipt = await prisma.receipt.findUniqueOrThrow({
+      where: { id: res.overpaySplit!.receiptId },
+    });
+    expect(Number(receipt.amountCny)).toBe(0.01);
+    expect(receipt.status).toBe(ReceiptStatus.OPEN);
+  });
+
   it('幂等：同 idempotencyKey 重试只入账一次', async () => {
     const ADMIN = await createAdminActor();
     const customer = await createCustomer();
@@ -237,6 +264,83 @@ describe('PaymentsService.confirmManualPayment · 超收拆分与防手误', () 
 
     const dbOrder = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
     expect(Number(dbOrder.paidAmount)).toBe(1000);
+  });
+
+  it('幂等键撞了另一张订单 → 409 拒绝，绝不假装重放（钱必须有人管）', async () => {
+    const ADMIN = await createAdminActor();
+    const customer = await createCustomer();
+    const o1 = await createPendingOrder(customer.id, 1000);
+    const o2 = await createPendingOrder(customer.id, 1000);
+    const key = `idem-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    await service.confirmManualPayment(
+      o1.id,
+      { amount: 1000, method: PaymentMethod.BANK_CARD, idempotencyKey: key },
+      ADMIN,
+    );
+
+    await expect(
+      service.confirmManualPayment(
+        o2.id,
+        { amount: 1000, method: PaymentMethod.BANK_CARD, idempotencyKey: key },
+        ADMIN,
+      ),
+    ).rejects.toMatchObject({ statusCode: 409, code: 'IDEMPOTENCY_KEY_MISMATCH' });
+
+    // 第二张单没被动过，也没被"当成收过"
+    const db2 = await prisma.order.findUniqueOrThrow({ where: { id: o2.id } });
+    expect(Number(db2.paidAmount)).toBe(0);
+    expect(db2.status).toBe(OrderStatus.PENDING_PAYMENT);
+  });
+
+  it('幂等键同单但金额不同 → 409 拒绝（这是另一笔真到账，不是重放）', async () => {
+    const ADMIN = await createAdminActor();
+    const customer = await createCustomer();
+    const order = await createPendingOrder(customer.id, 1000);
+    const key = `idem-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    await service.confirmManualPayment(
+      order.id,
+      { amount: 400, method: PaymentMethod.BANK_CARD, idempotencyKey: key },
+      ADMIN,
+    );
+
+    await expect(
+      service.confirmManualPayment(
+        order.id,
+        { amount: 600, method: PaymentMethod.BANK_CARD, idempotencyKey: key },
+        ADMIN,
+      ),
+    ).rejects.toMatchObject({ statusCode: 409, code: 'IDEMPOTENCY_KEY_MISMATCH' });
+
+    const dbOrder = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(Number(dbOrder.paidAmount)).toBe(400); // 600 那笔没被吞成"已收"
+  });
+
+  it('超收拆分过的单重放同 key → 指纹按录入全额比，仍是重放（不误判成金额不符）', async () => {
+    const ADMIN = await createAdminActor();
+    const customer = await createCustomer();
+    const order = await createPendingOrder(customer.id, 1000);
+    const key = `idem-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    const first = await service.confirmManualPayment(
+      order.id,
+      { amount: 1200, method: PaymentMethod.BANK_CARD, idempotencyKey: key },
+      ADMIN,
+    );
+    expect(first.overpaySplit?.pooledAmount).toBe(200);
+
+    const replay = await service.confirmManualPayment(
+      order.id,
+      { amount: 1200, method: PaymentMethod.BANK_CARD, idempotencyKey: key },
+      ADMIN,
+    );
+    expect(replay.paymentId).toBe(first.paymentId);
+    expect(replay.overpaySplit?.receiptNo).toBe(first.overpaySplit?.receiptNo);
+
+    // 挂账池里只有一笔，没有重复建池
+    const receipts = await prisma.receipt.findMany({ where: { orderHintId: order.id } });
+    expect(receipts).toHaveLength(1);
   });
 });
 
@@ -308,6 +412,59 @@ describe('PaymentsService.batchConfirmManualPayment · 批量到账', () => {
     await expect(
       service.batchConfirmManualPayment({ items: [] }, ADMIN),
     ).rejects.toThrow(/不能为空/);
+  });
+
+  it('同批次同一订单两行 + batchId：两行都入账（第二行不会被当成第一行的重放吞掉）', async () => {
+    const ADMIN = await createAdminActor();
+    const customer = await createCustomer();
+    const order = await createPendingOrder(customer.id, 2000);
+    const other = await createPendingOrder(customer.id, 500);
+    const batchId = `batchtest-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    const items = [
+      { orderId: order.id, amount: 400, method: PaymentMethod.BANK_CARD },
+      { orderId: other.id, amount: 500, method: PaymentMethod.BANK_CARD },
+      { orderId: order.id, amount: 600, method: PaymentMethod.WECHAT_PAY },
+    ];
+
+    const first = await service.batchConfirmManualPayment({ items, batchId }, ADMIN);
+    expect(first.results.every((r) => r.ok)).toBe(true);
+
+    // 两行都真的记进了订单：400 + 600 = 1000（旧口径下第二行静默丢失，只有 400）
+    const dbOrder = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(Number(dbOrder.paidAmount)).toBe(1000);
+    expect(await prisma.payment.count({ where: { orderId: order.id } })).toBe(2);
+
+    // 同 batchId 重复提交整批 → 逐行回放，一分钱都不多记
+    const second = await service.batchConfirmManualPayment({ items, batchId }, ADMIN);
+    expect(second.results.every((r) => r.ok)).toBe(true);
+    const dbAfter = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(Number(dbAfter.paidAmount)).toBe(1000);
+    expect(await prisma.payment.count({ where: { orderId: order.id } })).toBe(2);
+    const dbOther = await prisma.order.findUniqueOrThrow({ where: { id: other.id } });
+    expect(Number(dbOther.paidAmount)).toBe(500);
+  });
+
+  it('同 batchId 改了金额再提交 → 该行 409 拒绝（不是重放，也不假成功）', async () => {
+    const ADMIN = await createAdminActor();
+    const customer = await createCustomer();
+    const order = await createPendingOrder(customer.id, 2000);
+    const batchId = `batchtest-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+    await service.batchConfirmManualPayment(
+      { items: [{ orderId: order.id, amount: 400, method: PaymentMethod.BANK_CARD }], batchId },
+      ADMIN,
+    );
+    const retry = await service.batchConfirmManualPayment(
+      { items: [{ orderId: order.id, amount: 900, method: PaymentMethod.BANK_CARD }], batchId },
+      ADMIN,
+    );
+    expect(retry.results[0].ok).toBe(false);
+    expect(retry.results[0].error).toMatch(/幂等键/);
+
+    // 900 那笔既没入账、也没被当成"已收过"——运营会在结果里看到这一行失败
+    const dbOrder = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(Number(dbOrder.paidAmount)).toBe(400);
   });
 
   it('幂等：同 batchId 重复提交整批 → 逐单只入账一次，不双倍', async () => {

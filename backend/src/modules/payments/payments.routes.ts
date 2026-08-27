@@ -14,7 +14,11 @@ import {
   NotFoundError,
 } from '../../lib/errors.js';
 import { PaymentsService } from './payments.service.js';
-import { createPaymentBodySchema, sandboxConfirmBodySchema } from './payments.schemas.js';
+import {
+  cnyAmountSchema,
+  createPaymentBodySchema,
+  sandboxConfirmBodySchema,
+} from './payments.schemas.js';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
 import { appPublicUrl } from '../../config/env.js';
 
@@ -65,7 +69,8 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
   // POST /payments/manual-confirm
   const manualConfirmSchema = z.object({
     orderId: z.string().min(1),
-    amount: z.number().positive().optional(),
+    // 金额到分为止（超两位小数直接 400）：落库是 Decimal(…,2)，静默四舍五入会凭空增减半分。
+    amount: cnyAmountSchema.optional(),
     method: z.nativeEnum(PaymentMethod),
     proofUrl: z.string().max(6_000_000).optional(), // data URL（截图）
     note: z.string().max(500).optional(),
@@ -149,7 +154,7 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
       .array(
         z.object({
           orderId: z.string().min(1),
-          amount: z.number().positive(),
+          amount: cnyAmountSchema,
           method: z.nativeEnum(PaymentMethod).optional(),
           proofUrl: z.string().max(6_000_000).optional(),
           note: z.string().max(500).optional(),
@@ -159,8 +164,10 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
       .max(100),
     sharedProofUrl: z.string().max(6_000_000).optional(),
     // 幂等：前端为「本次提交」生成一个稳定 batchId（表单打开时生成一次，成功后换新）。
-    // 同一 batchId 重复提交（双击/网络重试/表单重发）时，同一 orderId 只入账一次——
-    // 逐单幂等键 = `batch:{batchId}:{orderId}`，复用单笔 manual-confirm 的唯一约束 + 回放逻辑。
+    // 同一 batchId 重复提交（双击/网络重试/表单重发）时，每一行只入账一次——逐行幂等键
+    // = `batch:{batchId}:{orderId}`（同一订单的第 2 行起带 `#n`，一单收两笔的场景不会被
+    // 当成重放吞掉），复用单笔 manual-confirm 的唯一约束 + 回放逻辑。
+    // 回放前会比请求指纹（订单/金额/方式）：同一把 key 换了内容 → 409，绝不假成功。
     batchId: z.string().min(8).max(64).optional(),
   });
   app.post('/batch-confirm', { preHandler: [app.authenticate] }, async (req, reply) => {

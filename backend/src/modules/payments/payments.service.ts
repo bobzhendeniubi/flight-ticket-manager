@@ -58,10 +58,10 @@ const MAX_SINGLE_PAYMENT_CNY = 1_000_000;
 /** 批量到账单次最多处理的订单数。 */
 const MAX_BATCH_ITEMS = 100;
 /**
- * 清账/超收判定的一分钱容差：避免浮点误差把「恰好收满」误判成超收。
- * 与全局清账公式里的 0.001 同源，这里放宽到一分钱（金额均为两位小数），只有严格多收才拦。
+ * 「两笔金额算不算同一个数」的容差（元）：只用于同额防呆、幂等指纹这类**等值判定**，
+ * 不参与超收判定——超收一律按「分」的整数比较，多收一分也是多收。
  */
-const OVERPAY_EPSILON_CNY = 0.01;
+const AMOUNT_MATCH_EPSILON_CNY = 0.01;
 /** 同额防呆时间窗（毫秒）：同一订单近 10 分钟内的等额手工收款视为疑似重复录入。 */
 const DUPLICATE_AMOUNT_WINDOW_MS = 10 * 60 * 1000;
 /** 认款生成的 Payment 在旧数据中只能靠此备注前缀识别来源。 */
@@ -73,13 +73,31 @@ function round2(n: number): number {
 }
 
 /**
+ * 元 → 分（整数）。金额判定一律换算到分再比大小：
+ * 两位小数的钱在 double 里存不精确（0.1+0.2 ≠ 0.3），直接比会把「恰好收满」误判成超收；
+ * 折成分的整数后既没有浮点毛刺、也不需要任何容差，多收一分就是多收一分。
+ * 入参已由接口层限死两位小数，这里的 round 只抹平浮点毛刺，不会凭空增减半分。
+ */
+function toCents(n: number): number {
+  return Math.round(n * 100);
+}
+
+/** 分（整数）→ 元。 */
+function fromCents(cents: number): number {
+  return cents / 100;
+}
+
+/**
  * 超收硬闸判定（纯函数）：本次到账是否会使订单「累计已付净额 + 预存抵扣」超过应收。
  *
  * 口径与全局清账公式（reports/reminders/serializeOrder/confirmManualPayment）一字对齐：
  *   应收（effectivePayable） = total + adjustmentCny（含改期费/换人费等售后调整行）
  *   累计已付净额             = paidAmount − 已完成退款（refundedTotal，Refund.status=COMPLETED 之和）
  *   预存抵扣（prepaymentOffset）视同已付
- * 收满（净额恰好等于应收，含一分钱容差）不算超收；仅严格超出才返回 true。
+ * 收满（净额恰好等于应收）不算超收；严格超出——哪怕只多一分——才返回 true。
+ *
+ * 为什么不留容差：金额一律折成「分」的整数比较，浮点毛刺已在换算时抹平，不需要容差；
+ * 留一分钱容差等于允许每笔精确多收 ¥0.01 静静记进订单，账面多付、挂账池也看不到这笔钱。
  *
  * 退款为何要减：退款完成不减 paidAmount（只翻 Refund 状态），已退出去的钱腾出的额度应可再收，
  * 故净额 = paidAmount − refundedTotal（与 softDeleteOrder 的 netReceived 同一净额口径）。
@@ -91,9 +109,12 @@ export function wouldOvercharge(args: {
   refundedTotal: number;
   amount: number;
 }): boolean {
-  const netEffectiveAfter =
-    args.alreadyPaid + args.amount + args.prepaymentOffset - args.refundedTotal;
-  return netEffectiveAfter > args.effectivePayable + OVERPAY_EPSILON_CNY;
+  const netEffectiveAfterCents =
+    toCents(args.alreadyPaid) +
+    toCents(args.amount) +
+    toCents(args.prepaymentOffset) -
+    toCents(args.refundedTotal);
+  return netEffectiveAfterCents > toCents(args.effectivePayable);
 }
 
 /**
@@ -105,10 +126,10 @@ export function wouldOvercharge(args: {
  *   poolAmount   = amount − creditAmount     → 建 ORDER_OVERPAY 挂账进账（OPEN，待核销）
  *
  * 边界：
- *   - 恰好收满 / 一分钱容差内的浮点毛刺 → wouldOvercharge 为 false → 整笔进订单，
- *     绝不为了几厘钱拆出一笔挂账进账。
+ *   - 恰好收满（含折算到分后归零的浮点毛刺）→ wouldOvercharge 为 false → 整笔进订单。
+ *   - 只多一分也拆：拆出 ¥0.01 进挂账池，好过让它悄悄记成订单多付。
  *   - 应收已为 0（已收满 / 预存已抵完）→ creditable = 0 → 整笔进池。
- * 两半之和恒等于 amount（守恒），钱不会在拆分里消失。
+ * 全程按「分」的整数算，两半之和恒等于 amount（守恒），钱不会在拆分里消失。
  */
 export function splitOverpayment(args: {
   effectivePayable: number;
@@ -117,17 +138,20 @@ export function splitOverpayment(args: {
   refundedTotal: number;
   amount: number;
 }): { creditAmount: number; poolAmount: number } {
-  // 没超出应收（含容差）→ 不拆，整笔正常入账。
+  // 没超出应收 → 不拆，整笔正常入账。
   if (!wouldOvercharge(args)) {
     return { creditAmount: round2(args.amount), poolAmount: 0 };
   }
-  const creditable = Math.max(
+  const amountCents = toCents(args.amount);
+  const creditableCents = Math.max(
     0,
-    args.effectivePayable - (args.alreadyPaid - args.refundedTotal) - args.prepaymentOffset,
+    toCents(args.effectivePayable) -
+      (toCents(args.alreadyPaid) - toCents(args.refundedTotal)) -
+      toCents(args.prepaymentOffset),
   );
-  const creditAmount = round2(Math.min(args.amount, creditable));
-  // poolAmount 由 amount 减出来（不独立四舍五入），保证 credit + pool ≡ amount。
-  return { creditAmount, poolAmount: round2(args.amount - creditAmount) };
+  const creditCents = Math.min(amountCents, creditableCents);
+  // poolAmount 由 amountCents 减出来（不独立取整），保证 credit + pool ≡ amount。
+  return { creditAmount: fromCents(creditCents), poolAmount: fromCents(amountCents - creditCents) };
 }
 
 /**
@@ -195,7 +219,7 @@ export function findDuplicateManualPayment(
     existing.find(
       (p) =>
         p.createdAt.getTime() >= cutoff &&
-        Math.abs(p.amount - candidateAmount) < OVERPAY_EPSILON_CNY,
+        Math.abs(p.amount - candidateAmount) < AMOUNT_MATCH_EPSILON_CNY,
     ) ?? null
   );
 }
@@ -209,6 +233,77 @@ export class DuplicatePaymentAmountError extends AppError {
     super(message, { statusCode: 409, code: 'DUPLICATE_AMOUNT', details });
     this.name = 'DuplicatePaymentAmountError';
   }
+}
+
+/**
+ * 幂等键被另一笔请求用过（订单/金额/方式对不上）：稳定 code=IDEMPOTENCY_KEY_MISMATCH。
+ * 这时绝不能按「重放」返回成功——那笔钱根本没入账，调用方却以为收了。
+ */
+export class IdempotencyKeyMismatchError extends AppError {
+  constructor(message: string, details?: unknown) {
+    super(message, { statusCode: 409, code: 'IDEMPOTENCY_KEY_MISMATCH', details });
+    this.name = 'IdempotencyKeyMismatchError';
+  }
+}
+
+/**
+ * 幂等回放前的请求指纹校验（纯函数）：本次请求和当初用这把 key 入账的那笔是不是同一件事。
+ *
+ * 为什么必须校：幂等回放分支只按 key 找记录，不看请求内容——key 撞了（前端复用、批量里同一
+ * 订单出现两行、人手填的 key）就会把「另一笔真到账」当成重放，返回 ok 却一分钱没记，钱凭空消失。
+ *
+ * 口径：
+ *   - 订单不同 → 一定是撞键，拒。
+ *   - 方式不同 → 拒（同一笔钱不会既是转账又是刷卡）。
+ *   - 金额不同（差一分以上）→ 拒；requestedAmount 省略（按尾款自动取数）时无从比对，跳过金额这项。
+ *   - originalAmount 传「当初录入的到账全额」（拆分单取 overpaySplit.receivedAmount），
+ *     不是记进订单的那半，否则超收拆分过的单重放会被自己误判成不一致。
+ * 返回不一致的原因（可直接进错误文案），一致返回 null。
+ */
+export function idempotentReplayMismatch(args: {
+  requestedOrderId: string;
+  requestedAmount?: number;
+  requestedMethod: PaymentMethod;
+  originalOrderId: string;
+  originalAmount: number;
+  originalMethod: PaymentMethod;
+}): string | null {
+  if (args.requestedOrderId !== args.originalOrderId) {
+    return '该幂等键已用于另一张订单的收款';
+  }
+  if (args.requestedMethod !== args.originalMethod) {
+    return `该幂等键当初记的是 ${args.originalMethod} 收款，本次是 ${args.requestedMethod}`;
+  }
+  if (
+    args.requestedAmount !== undefined &&
+    Math.abs(args.requestedAmount - args.originalAmount) >= AMOUNT_MATCH_EPSILON_CNY
+  ) {
+    return `该幂等键当初记的是 ¥${args.originalAmount.toFixed(2)}，本次是 ¥${args.requestedAmount.toFixed(2)}`;
+  }
+  return null;
+}
+
+/**
+ * 批量到账的逐单幂等键（纯函数）：同一 batchId 重复提交时，第 n 行永远拿到同一把 key。
+ *
+ * 为什么不能只用 `batch:{batchId}:{orderId}`：同一批次允许同一张订单出现多行
+ * （一张单收两笔、两种收款方式、两张水单），此时第二行会撞上第一行的 key，
+ * 被幂等回放当成重放——返回成功却一分钱没入账，钱就这么"收"没了。
+ * 这里给同一订单的第 2 行起加 `#n` 后缀，各行各有各的 key；第 1 行仍是老格式，
+ * 部署前后同一 batchId 的重放不受影响。
+ * 不传 batchId → 全部 undefined（不做批量去重，等价于旧行为）。
+ */
+export function buildBatchIdempotencyKeys(
+  batchId: string | undefined,
+  orderIds: readonly string[],
+): Array<string | undefined> {
+  if (!batchId) return orderIds.map(() => undefined);
+  const occurrence = new Map<string, number>();
+  return orderIds.map((orderId) => {
+    const nth = occurrence.get(orderId) ?? 0;
+    occurrence.set(orderId, nth + 1);
+    return `batch:${batchId}:${orderId}${nth > 0 ? `#${nth}` : ''}`;
+  });
 }
 
 /**
@@ -494,13 +589,30 @@ export class PaymentsService {
     /** 超收拆分明细；未触发拆分（全额都核销进订单）时为 null。 */
     overpaySplit: OverpaySplitDetail | null;
   }> {
-    // 幂等回放：同一 idempotencyKey 已入账（双击/网络重试）→ 返回当时结果，绝不二次累计
+    // 幂等回放：同一 idempotencyKey 已入账（双击/网络重试）→ 返回当时结果，绝不二次累计。
+    // 回放前先比请求指纹（订单/金额/方式）：key 撞了就是两笔不同的钱，必须报错而不是假装收过。
     if (input.idempotencyKey) {
       const existing = await prisma.payment.findUnique({
         where: { idempotencyKey: input.idempotencyKey },
-        select: { id: true, orderId: true, gatewayPayload: true },
+        select: { id: true, orderId: true, amount: true, method: true, gatewayPayload: true },
       });
       if (existing) {
+        const existingSplit = readOverpaySplitFromPayload(existing.gatewayPayload);
+        const mismatch = idempotentReplayMismatch({
+          requestedOrderId: orderId,
+          requestedAmount: input.amount,
+          requestedMethod: input.method,
+          originalOrderId: existing.orderId,
+          // 拆分单的 Payment.amount 只是核销进订单的那半，指纹要比「当初录入的到账全额」。
+          originalAmount: existingSplit?.receivedAmount ?? Number(existing.amount),
+          originalMethod: existing.method,
+        });
+        if (mismatch) {
+          throw new IdempotencyKeyMismatchError(
+            `${mismatch}，这笔钱没有入账。请换一个幂等键重试，或核对是否录错了单/金额。`,
+            { idempotencyKey: input.idempotencyKey, existingPaymentId: existing.id, reason: mismatch },
+          );
+        }
         const o = await prisma.order.findUniqueOrThrow({
           where: { id: existing.orderId },
           select: { orderNumber: true, total: true, adjustmentCny: true, paidAmount: true, prepaymentOffset: true, status: true },
@@ -519,7 +631,7 @@ export class PaymentsService {
           orderNumber: o.orderNumber,
           status: o.status,
           // 首次入账时把拆分明细写进了 gatewayPayload，回放时原样还原（前端两次看到同一个进账号）。
-          overpaySplit: readOverpaySplitFromPayload(existing.gatewayPayload),
+          overpaySplit: existingSplit,
         };
       }
       // 「应收已为 0、整笔进池」的回放：那次没有生成 Payment，幂等键挂在挂账进账的 externalTxnId 上。
@@ -527,9 +639,24 @@ export class PaymentsService {
       // 下方 P2002 分支会递归重试、永远找不到 Payment → 死循环。
       const pooled = await prisma.receipt.findUnique({
         where: { externalTxnId: overpaySplitExternalTxnId(input.idempotencyKey) },
-        select: { id: true, receiptNo: true, amountCny: true, orderHintId: true },
+        select: { id: true, receiptNo: true, amountCny: true, orderHintId: true, method: true },
       });
       if (pooled?.orderHintId) {
+        // 整笔进池时录入全额 = 进账金额，指纹同样要比（撞键的另一笔钱不能被当成重放吞掉）。
+        const pooledMismatch = idempotentReplayMismatch({
+          requestedOrderId: orderId,
+          requestedAmount: input.amount,
+          requestedMethod: input.method,
+          originalOrderId: pooled.orderHintId,
+          originalAmount: Number(pooled.amountCny),
+          originalMethod: pooled.method,
+        });
+        if (pooledMismatch) {
+          throw new IdempotencyKeyMismatchError(
+            `${pooledMismatch}，这笔钱没有入账。请换一个幂等键重试，或核对是否录错了单/金额。`,
+            { idempotencyKey: input.idempotencyKey, existingReceiptNo: pooled.receiptNo, reason: pooledMismatch },
+          );
+        }
         const o = await prisma.order.findUniqueOrThrow({
           where: { id: pooled.orderHintId },
           select: { orderNumber: true, total: true, adjustmentCny: true, paidAmount: true, prepaymentOffset: true, status: true },
@@ -595,7 +722,9 @@ export class PaymentsService {
       const effectivePayable = total + order.adjustmentCny;
       const prepaymentOffset = Number(order.prepaymentOffset);
       const remaining = Math.max(0, effectivePayable - already - prepaymentOffset);
-      const amount = input.amount ?? remaining;
+      // 归一到分：接口层已拒收超两位小数的录入，这里只抹掉尾款相减留下的浮点毛刺，
+      // 保证「拆分两半之和 ≡ 到账全额」与落库金额都干净。
+      const amount = round2(input.amount ?? remaining);
       if (amount <= 0) throw new BadRequestError('收款金额必须大于 0');
       // 允许多付：到账金额可超过应收余额（结算价≠到账金额时常见），paidAmount 据此可超 total，
       // 尾款 = total − paidAmount 变负即为「多付」，后续抵扣/代理余额依赖该记录。
@@ -725,7 +854,8 @@ export class PaymentsService {
       }
       });
     } catch (e) {
-      // 并发同 key 撞唯一索引（P2002）→ 另一请求已入账，走幂等回放
+      // 并发同 key 撞唯一索引（P2002）→ 另一请求已入账，走幂等回放（回放前的指纹校验同样生效：
+      // 并发的是同一件事就返回那一笔，是撞键的另一笔钱则抛 IDEMPOTENCY_KEY_MISMATCH，不假装收过）
       if (input.idempotencyKey && e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2002') {
         return this.confirmManualPayment(orderId, input, actor);
       }
@@ -1270,12 +1400,14 @@ export class PaymentsService {
    * sharedProofUrl 作为没有单独 proofUrl 的订单的回退凭证（如一张合并转账截图）。
    *
    * 幂等：整批共用一个 batchId（前端表单打开时生成一次，成功后换新；不传则不做批量去重，
-   * 等价于旧行为）。逐单幂等键 = `batch:{batchId}:{orderId}`，透传给 confirmManualPayment，
-   * 复用它已有的唯一约束 + 回放逻辑——同一 batchId 重复提交（双击/网络重试/表单重发），
-   * 同一 orderId 只入账一次，回放返回首次入账结果，绝不二次累计。
+   * 等价于旧行为）。逐行幂等键 = `batch:{batchId}:{orderId}`（同一订单的第 2 行起带 `#n`
+   * 后缀，见 buildBatchIdempotencyKeys），透传给 confirmManualPayment，复用它已有的唯一约束
+   * + 回放逻辑——同一 batchId 重复提交（双击/网络重试/表单重发），每一行只入账一次，
+   * 回放返回首次入账结果，绝不二次累计，也绝不把同单的第二行当成第一行的重放吞掉。
    *
    * 超收同样走拆分（逐单复用 confirmManualPayment 的口径）：某一单录多了不再整条失败，
    * 应收部分照常核销、超出部分进挂账池，逐条结果里带 overpaySplit 供前端提示。
+   *
    */
   async batchConfirmManualPayment(
     input: {
@@ -1309,6 +1441,12 @@ export class PaymentsService {
     if (input.items.length > MAX_BATCH_ITEMS) {
       throw new BadRequestError(`单次批量到账最多 ${MAX_BATCH_ITEMS} 笔订单`);
     }
+    // 逐行幂等键一次性算好：同一张订单在批次里出现多行时各行各有各的 key（见
+    // buildBatchIdempotencyKeys），否则第二行会撞上第一行的 key 被当成重放静默吞掉。
+    const idempotencyKeys = buildBatchIdempotencyKeys(
+      input.batchId,
+      input.items.map((i) => i.orderId),
+    );
 
     const results: Array<{
       orderId: string;
@@ -1323,11 +1461,11 @@ export class PaymentsService {
     }> = [];
 
     // 逐单串行处理：每单一个事务/行锁，一坏不连累其余（收集错误而非整体回滚）
-    for (const item of input.items) {
+    for (const [index, item] of input.items.entries()) {
       try {
-        // 同一 batchId 下逐单幂等键固定为 batch:{batchId}:{orderId}，
-        // 重复提交同一批次时 confirmManualPayment 会走回放分支，不会二次入账。
-        const idempotencyKey = input.batchId ? `batch:${input.batchId}:${item.orderId}` : undefined;
+        // 重复提交同一批次时同一行拿到同一把 key，confirmManualPayment 走回放分支不会二次入账；
+        // 回放前还会比请求指纹（订单/金额/方式），撞键的另一笔钱会报 409 而不是被当成收过。
+        const idempotencyKey = idempotencyKeys[index];
         const result = await this.confirmManualPayment(
           item.orderId,
           {
