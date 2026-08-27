@@ -29,6 +29,7 @@
 import JSZip from 'jszip';
 import { OrderItemKind, type PrismaClient } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
+import { businessDateISO, businessDateTimeSec } from '../../lib/business-time.js';
 import { sanitize, extFromUrl, fetchPhoto, fmtDepartureLocalDate } from '../orders/passport-zip.js';
 import { COUNTED_STATUSES } from './hotel-control.service.js';
 
@@ -386,7 +387,7 @@ export async function buildHotelPassportsZip(
   const readme = [
     `酒店：${selection.hotelName ?? meta.hotelId}`,
     `入住区间：${meta.from} ~ ${meta.to}`,
-    `打包时间：${new Date().toISOString()}`,
+    `打包时间：${businessDateTimeSec(new Date())}（北京时间）`,
     `订单数：${selection.groups.length}`,
     `乘客总数：${passengerCount}`,
     `成功打包护照图：${photoCount}`,
@@ -421,7 +422,7 @@ export async function buildPassportsByNamesZip(
   const readme = [
     '按姓名批量导出护照（按出发日期分文件夹）',
     ...(hasRange ? [`出发日期区间：${meta?.from ?? '不限'} ~ ${meta?.to ?? '不限'}（出发地本地日）`] : []),
-    `打包时间：${new Date().toISOString()}`,
+    `打包时间：${businessDateTimeSec(new Date())}（北京时间）`,
     `订单数：${selection.groups.length}`,
     `乘客总数：${passengerCount}`,
     `成功打包护照图：${photoCount}`,
@@ -471,14 +472,14 @@ export function hotelPassportsZipFilename(
 }
 
 /**
- * 文件名：`护照_按姓名_{n}人_{YYYY-MM-DD}.zip`；
+ * 文件名：`护照_按姓名_{n}人_{YYYY-MM-DD}.zip`（末尾日期＝导出当天的北京业务日）；
  * 传了出发日期区间时插入 `_出发{from}至{to}`（单端缺省记「不限」）。
  */
 export function passportsByNamesZipFilename(
   names: string[],
   range?: { from?: string; to?: string },
 ): string {
-  const stamp = new Date().toISOString().slice(0, 10);
+  const stamp = businessDateISO(new Date());
   const rangePart =
     range?.from || range?.to ? `_出发${range?.from ?? '不限'}至${range?.to ?? '不限'}` : '';
   return `护照_按姓名_${names.length}人${rangePart}_${stamp}.zip`;

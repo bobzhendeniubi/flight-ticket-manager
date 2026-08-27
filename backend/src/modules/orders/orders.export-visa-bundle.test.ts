@@ -9,7 +9,7 @@
  *   - xlsx 含性别列，且每位乘客一行合并（跨订单）；名单不再打包进 zip
  *   - 护照图文件名规则：{订单号}-{LASTNAME}_{FIRSTNAME}.{ext}，无图乘客缺文件；zip 内不含 xlsx
  */
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import JSZip from 'jszip';
 import ExcelJS from 'exceljs';
 
@@ -486,5 +486,18 @@ describe('visaRosterXlsxFilename', () => {
 describe('visaPassportsZipFilename', () => {
   it('文件名带订单数与 YYYY-MM-DD 日期', () => {
     expect(visaPassportsZipFilename(3)).toMatch(/^签证护照_3单_\d{4}-\d{2}-\d{2}\.zip$/u);
+  });
+});
+
+describe('导出文件名的日期按北京业务日（容器 TZ=UTC 也不能落到前一天）', () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('UTC 还停在 12 日 16:30、北京已是 13 日 → 文件名写 2026-07-13', () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-12T16:30:00.000Z'));
+    expect(visaRosterXlsxFilename(3)).toBe('签证名单_3单_2026-07-13.xlsx');
+    expect(visaPassportsZipFilename(3)).toBe('签证护照_3单_2026-07-13.zip');
   });
 });

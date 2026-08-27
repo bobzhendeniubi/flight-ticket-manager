@@ -17,6 +17,8 @@ import { prisma } from '../db/prisma.js';
 import { PricingService } from '../modules/pricing/pricing.service.js';
 import { CabinClass, SeatLockStatus } from '@prisma/client';
 import { heldSeatsBySeatClass } from '../modules/hold-orders/held-seats.js';
+import { businessDateISO, businessDateTime } from './business-time.js';
+import { localDateTime } from './flight-time.js';
 
 const MAX_TOOL_ITERATIONS = 8; // 防止 loop 失控
 
@@ -107,6 +109,23 @@ items=[
 - origin: MFM, destination: DAD
 - cabin: ECONOMY
 - passengers: 1`;
+
+/**
+ * 系统提示词 + 当前时间。
+ *
+ * 模型没有时钟，不给它「今天是几号」它就会拿训练时的日期猜，把「明天」算错一天。
+ * 服务器容器 TZ=UTC，所以这里必须显式折成北京时间并标注 —— 模型会把这句话原样
+ * 念给客户听，标注错了等于当着客户面报错时间。航班时刻另有口径（见 search_flights
+ * 返回的 departureLocalTime，按班次自己的时区折），不受这里影响。
+ */
+function buildSystemPrompt(now: Date = new Date()): string {
+  return `${SYSTEM_PROMPT}
+
+# 当前时间
+- 现在是 ${businessDateTime(now)}（北京时间）；今天 = ${businessDateISO(now)}
+- 客户说「今天 / 明天 / 下周三」都按这个日期算，不要凭记忆猜年份
+- 航班时刻一律念工具返回的 departureLocalTime / arrivalLocalTime（机场当地时间），不要念 UTC 的 departureTime`;
+}
 
 // ── 工具定义（OpenAI Chat Completions tool 格式）─────────────
 const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
@@ -351,6 +370,11 @@ async function executeSearchFlights(input: Record<string, unknown>): Promise<Too
           destination: s.flight.destinationCode,
           departureTime: s.departureTime.toISOString(),
           arrivalTime: s.arrivalTime.toISOString(),
+          // 模型会把时刻原样念给客户，只喂 UTC 的 ISO 串它就会报错时刻（澳门/岘港差 1 小时，
+          // 与 UTC 差 8/7 小时）。按班次自己的 departureTz/arrivalTz 折出机场当地时间一并给它，
+          // 系统提示词里点名要念这两个字段。
+          departureLocalTime: localDateTime(s.departureTime, s.departureTz),
+          arrivalLocalTime: localDateTime(s.arrivalTime, s.arrivalTz),
           durationMinutes: Math.round(
             (s.arrivalTime.getTime() - s.departureTime.getTime()) / 60_000,
           ),
@@ -931,7 +955,7 @@ export async function runChatTurn(
   // 第一次进对话时把 system 加上；后续 history 已含
   const hasSystem = history.some((m) => m.role === 'system');
   const messages: ChatMessage[] = [
-    ...(hasSystem ? [] : [{ role: 'system' as const, content: SYSTEM_PROMPT }]),
+    ...(hasSystem ? [] : [{ role: 'system' as const, content: buildSystemPrompt() }]),
     ...history,
     { role: 'user', content: userMessage },
   ];
@@ -1174,9 +1198,15 @@ function parseCabin(msg: string): CabinClass | undefined {
   return undefined;
 }
 
+/**
+ * 自然语言日期 → 'YYYY-MM-DD'。
+ *
+ * 「今天/明天/下周三」一律按**北京业务日**推（服务器容器 TZ=UTC，用本地分量的话
+ * 北京 00:00–08:00 这段时间「明天」会算成今天，客户订到前一天的班次）。
+ */
 function parseDate(msg: string): string | undefined {
-  const now = new Date();
-  const y = now.getFullYear();
+  const now = businessNow();
+  const y = now.getUTCFullYear();
   if (/明天|tomorrow|tmr/i.test(msg)) return offsetDate(now, 1);
   if (/后天|day after tomorrow/i.test(msg)) return offsetDate(now, 2);
   if (/大后天/.test(msg)) return offsetDate(now, 3);
@@ -1189,7 +1219,7 @@ function parseDate(msg: string): string | undefined {
     const key = (nextWeek[1] || nextWeek[2]).toLowerCase();
     const target = weekdayMap[key];
     if (target !== undefined) {
-      const today = now.getDay();
+      const today = now.getUTCDay();
       const diff = (7 - today + target) % 7 || 7;
       return offsetDate(now, diff);
     }
@@ -1203,12 +1233,20 @@ function parseDate(msg: string): string | undefined {
   return undefined;
 }
 
+/**
+ * 北京业务日的「墙钟 Date」：取 UTC 分量即得北京年月日/星期，
+ * 供 parseDate 做纯日期加减用（不参与任何入库/查询）。
+ */
+function businessNow(): Date {
+  return new Date(`${businessDateISO(new Date())}T00:00:00Z`);
+}
+
 function offsetDate(base: Date, days: number): string {
   const d = new Date(base);
-  d.setDate(d.getDate() + days);
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const dd = String(d.getDate()).padStart(2, '0');
+  d.setUTCDate(d.getUTCDate() + days);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(d.getUTCDate()).padStart(2, '0');
   return `${y}-${m}-${dd}`;
 }
 

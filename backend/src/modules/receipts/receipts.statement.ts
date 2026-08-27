@@ -16,6 +16,7 @@
  */
 import ExcelJS from 'exceljs';
 import { PaymentMethod } from '@prisma/client';
+import { businessDateISO, businessDateTime } from '../../lib/business-time.js';
 
 /** 单文件最多解析行数（收单平台单日流水远小于此；防误传超大文件拖垮内存）。 */
 export const STATEMENT_MAX_ROWS = 2000;
@@ -441,16 +442,11 @@ export interface StatementExportEntry {
   refundNote: string | null;
 }
 
-/** Date → 'YYYY-MM-DD HH:mm'（北京时 +08:00 墙钟，与导入解析口径互逆）。 */
-function fmtBeijing(d: Date): string {
-  const t = new Date(d.getTime() + 8 * 3600 * 1000);
-  const y = t.getUTCFullYear();
-  const mo = String(t.getUTCMonth() + 1).padStart(2, '0');
-  const day = String(t.getUTCDate()).padStart(2, '0');
-  const h = String(t.getUTCHours()).padStart(2, '0');
-  const mi = String(t.getUTCMinutes()).padStart(2, '0');
-  return `${y}-${mo}-${day} ${h}:${mi}`;
-}
+/**
+ * Date → 'YYYY-MM-DD HH:mm'（北京时 +08:00 墙钟，与导入解析口径互逆）。
+ * 复用全局的 business-time helper，避免各导出各自维护一份 +8 逻辑而慢慢分叉。
+ */
+const fmtBeijing = (d: Date): string => businessDateTime(d);
 
 const EXPORT_COLUMNS: Array<{ header: string; key: string; width: number }> = [
   { header: '到账时间', key: 'receivedAt', width: 17 },
@@ -503,6 +499,6 @@ export function buildStatementExportWorkbook(entries: StatementExportEntry[]): E
 
 /** 核对表文件名（北京时当天）。 */
 export function statementExportFilename(): string {
-  const today = fmtBeijing(new Date()).slice(0, 10);
+  const today = businessDateISO(new Date());
   return `流水核对表-${today}.xlsx`;
 }

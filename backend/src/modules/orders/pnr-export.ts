@@ -5,6 +5,7 @@
  * 列定义对齐用户提供的样本文件 (20MAY QH9589 MFM-DAD 1P)。
  */
 import ExcelJS from 'exceljs';
+import { businessDateISO } from '../../lib/business-time.js';
 import { localDateISO } from '../../lib/flight-time.js';
 import type { Passenger } from '@prisma/client';
 import { toAlpha3 } from './nationality.js';
@@ -231,6 +232,9 @@ export async function buildPnrWorkbook(order: PnrOrderInput): Promise<Buffer> {
  * 导出文件名 `{DD}{MON} {orderNumber}.xlsx`（如 `13JUL WT2026...`）。
  * DD/MON 取该订单去程航班出发日（票务岗口径，UTC 与列内日期一致）；
  * 取不到出发日（纯地面单/无航班行）→ 回退今天，保持原格式。
+ *
+ * 回退分支按**北京业务日**取（原先用服务器本地分量，容器 TZ=UTC，北京 00:00–08:00
+ * 导出会落到前一天，票务拿到的文件名比实际早一天）。
  */
 export function pnrExportFilename(orderNumber: string, departureDate?: Date | null): string {
   const months = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
@@ -240,9 +244,9 @@ export function pnrExportFilename(orderNumber: string, departureDate?: Date | nu
     day = String(departureDate.getUTCDate()).padStart(2, '0');
     mon = months[departureDate.getUTCMonth()];
   } else {
-    const today = new Date();
-    day = String(today.getDate()).padStart(2, '0');
-    mon = months[today.getMonth()];
+    const [, m, d] = businessDateISO(new Date()).split('-');
+    day = d;
+    mon = months[Number(m) - 1];
   }
   return `${day}${mon} ${orderNumber}.xlsx`;
 }

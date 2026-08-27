@@ -18,6 +18,7 @@ import JSZip from 'jszip';
 import type { PrismaClient } from '@prisma/client';
 import { OrderStatus, FulfillmentType } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
+import { businessDateISO, businessDateTimeSec } from '../../lib/business-time.js';
 import {
   buildOrderContext,
   orderToVisaRows,
@@ -257,9 +258,9 @@ export async function buildVisaRosterXlsx(
   return buildVisaBundleXlsx(qualified);
 }
 
-/** 文件名：`签证名单_{订单数}单_{YYYY-MM-DD}.xlsx`。*/
+/** 文件名：`签证名单_{订单数}单_{YYYY-MM-DD}.xlsx`（日期＝北京业务日）。*/
 export function visaRosterXlsxFilename(orderCount: number): string {
-  const ymd = new Date().toISOString().slice(0, 10);
+  const ymd = businessDateISO(new Date());
   return `签证名单_${orderCount}单_${ymd}.xlsx`;
 }
 
@@ -320,7 +321,7 @@ export async function buildVisaPassportsZip(
 
   const readme = [
     `签证护照打包`,
-    `打包时间：${new Date().toISOString()}`,
+    `打包时间：${businessDateTimeSec(new Date())}（北京时间）`,
     `勾选订单数：${orderIds.length}`,
     `已打包订单数：${orders.length}`,
     `乘客总数：${paxTotal}`,
@@ -349,8 +350,8 @@ export async function buildVisaPassportsZip(
   return out;
 }
 
-/** 文件名：`签证护照_{订单数}单_{YYYY-MM-DD}.zip`。*/
+/** 文件名：`签证护照_{订单数}单_{YYYY-MM-DD}.zip`（日期＝北京业务日）。*/
 export function visaPassportsZipFilename(orderCount: number): string {
-  const ymd = new Date().toISOString().slice(0, 10);
+  const ymd = businessDateISO(new Date());
   return `签证护照_${orderCount}单_${ymd}.zip`;
 }

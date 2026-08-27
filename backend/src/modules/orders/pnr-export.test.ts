@@ -12,7 +12,7 @@
  *
  * 导出文件名 DD/MON 取去程航班出发日；纯地面单（无航班行）回退今天。
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import type { Passenger } from '@prisma/client';
 import { passengerToRow, derivePtcByAge, earliestFlightDeparture, pnrExportFilename } from './pnr-export.js';
 
@@ -262,5 +262,23 @@ describe('pnrExportFilename — DD/MON 取去程出发日，取不到回退今�
 
   it('省略 departureDate 参数（旧调用形态）→ 同样回退今天', () => {
     expect(pnrExportFilename('WT2026')).toMatch(/^\d{2}[A-Z]{3} WT2026\.xlsx$/);
+  });
+
+  describe('回退今天按北京业务日（容器 TZ=UTC 也不能落到前一天）', () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('北京已跨到 13 日凌晨（UTC 还是 12 日 16:30）→ 13JUL 而非 12JUL', () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-07-12T16:30:00.000Z'));
+      expect(pnrExportFilename('WT2026', null)).toBe('13JUL WT2026.xlsx');
+    });
+
+    it('北京与 UTC 同日时口径不变', () => {
+      vi.useFakeTimers();
+      vi.setSystemTime(new Date('2026-07-13T06:00:00.000Z'));
+      expect(pnrExportFilename('WT2026', null)).toBe('13JUL WT2026.xlsx');
+    });
   });
 });

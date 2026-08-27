@@ -19,6 +19,7 @@
  * 进度，票号字段才是唯一真值。
  */
 import PDFDocument from 'pdfkit';
+import { businessDateTimeSec } from './business-time.js';
 import { localDateTime } from './flight-time.js';
 
 export interface ItineraryData {
@@ -124,8 +125,8 @@ export async function renderItineraryPdf(data: ItineraryData): Promise<Buffer> {
       // 「开票时间」只在已出票档显示，且印的是 PDF 生成时间而非真实出票时间（系统目前没有
       // 独立的 invoicedAt 字段）——如实标注为「生成时间」，不冒充开票时间。
       if (tier === 'ticketed') {
-        const generatedAt = new Date().toISOString().replace('T', ' ').slice(0, 19);
-        doc.text(`Generated At / 生成时间:  ${generatedAt} UTC（文档生成时间，非出票时间）`);
+        const generatedAt = businessDateTimeSec(new Date());
+        doc.text(`Generated At / 生成时间:  ${generatedAt}（北京时间，文档生成时间，非出票时间）`);
       }
       doc.text(`Contact / 联系人:  ${data.contactName}  ·  ${data.contactPhone}${data.contactEmail ? '  ·  ' + data.contactEmail : ''}`);
       doc.text(`Total / 应付:  ${data.currency} ${computeEffectivePayable(data.total, data.adjustmentCny ?? 0)}`);

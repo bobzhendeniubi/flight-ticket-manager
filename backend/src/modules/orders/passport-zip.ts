@@ -14,6 +14,7 @@ import ExcelJS from 'exceljs';
 import JSZip from 'jszip';
 import { OrderItemKind, FulfillmentType, type Passenger } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
+import { businessDateTimeSec } from '../../lib/business-time.js';
 import { fetchImageSafely } from '../../lib/safe-fetch.js';
 
 export function sanitize(s: string): string {
@@ -234,7 +235,7 @@ export async function buildPassportPhotoZip(args: {
 
   const readme = [
     `订单：${args.orderNumber}`,
-    `打包时间：${new Date().toISOString()}`,
+    `打包时间：${businessDateTimeSec(new Date())}（北京时间）`,
     `乘客总数：${args.passengers.length}`,
     `成功打包：${ok.length}`,
     `缺失/失败：${missing.length}`,

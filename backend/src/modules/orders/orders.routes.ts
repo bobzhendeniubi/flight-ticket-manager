@@ -46,6 +46,7 @@ import {
 import { renderItineraryPdf } from '../../lib/itinerary-pdf.js';
 import { prisma } from '../../db/prisma.js';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
+import { businessDateISO } from '../../lib/business-time.js';
 import { computeCancellationQuote } from '../../lib/cancellation.js';
 import { BadRequestError } from '../../lib/errors.js';
 import { buildPnrWorkbook, pnrExportFilename, earliestFlightDeparture } from './pnr-export.js';
@@ -852,7 +853,8 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         auditLabel = `分房表 出发日 ${query.departDate}`;
         auditAfter = { departDate: query.departDate };
       } else {
-        const today = new Date().toISOString().slice(0, 10);
+        // 「今天」按北京业务日取：容器 TZ 是 UTC，北京 0–8 点导出会默认成前一天的分房表
+        const today = businessDateISO(new Date());
         const from = query.from ?? today;
         const to = query.to ?? from; // 只给 from 时按单日导出
         buf = await buildRoomAllocationWorkbook({ from, to });
