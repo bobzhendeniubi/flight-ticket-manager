@@ -90,7 +90,17 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
       targetType: 'ORDER',
       targetId: body.orderId,
       targetLabel: result.orderNumber,
-      after: { amount: body.amount ?? null, method: body.method, fullyPaid: result.fullyPaid, hasProof: Boolean(body.proofUrl) },
+      after: {
+        amount: body.amount ?? null,
+        method: body.method,
+        fullyPaid: result.fullyPaid,
+        hasProof: Boolean(body.proofUrl),
+        // 超收拆分时录入金额 ≠ 记进订单的金额，这里同时留下两半的去向（服务层另有
+        // SPLIT_OVERPAY_TO_POOL 一条 WARNING 明细）；未拆分时三个字段都是 null。
+        creditedToOrder: result.overpaySplit?.creditedAmount ?? null,
+        movedToPool: result.overpaySplit?.pooledAmount ?? null,
+        poolReceiptNo: result.overpaySplit?.receiptNo ?? null,
+      },
     });
     return result;
   });

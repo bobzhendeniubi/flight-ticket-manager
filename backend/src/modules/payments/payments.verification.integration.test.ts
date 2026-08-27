@@ -64,20 +64,23 @@ describe('到账双状态 · 订单人工收款', () => {
       { amount: 1000, method: PaymentMethod.WECHAT_PAY },
       staffA,
     );
-    const payment = await prisma.payment.findUniqueOrThrow({ where: { id: confirmed.paymentId } });
+    // 金额未超应收 → 不触发超收拆分，paymentId 必然存在（拆分整笔进池时才会是 null）
+    expect(confirmed.overpaySplit).toBeNull();
+    const paymentId = confirmed.paymentId as string;
+    const payment = await prisma.payment.findUniqueOrThrow({ where: { id: paymentId } });
     expect(payment.verifiedAt).toBeNull();
 
     const queue = await paymentsService.listUnverifiedPayments();
-    expect(queue.some((item) => item.id === confirmed.paymentId)).toBe(true);
+    expect(queue.some((item) => item.id === paymentId)).toBe(true);
 
-    const verified = await paymentsService.verifyManualPayment(confirmed.paymentId, staffB);
+    const verified = await paymentsService.verifyManualPayment(paymentId, staffB);
     expect(verified.ok).toBe(true);
-    const after = await prisma.payment.findUniqueOrThrow({ where: { id: confirmed.paymentId } });
+    const after = await prisma.payment.findUniqueOrThrow({ where: { id: paymentId } });
     expect(after.verifiedAt).not.toBeNull();
     expect(after.verifiedById).toBe(staffB.userId);
 
     const queueAfter = await paymentsService.listUnverifiedPayments();
-    expect(queueAfter.some((item) => item.id === confirmed.paymentId)).toBe(false);
+    expect(queueAfter.some((item) => item.id === paymentId)).toBe(false);
   });
 
   it('录入人不能核实自己录的账（STAFF 拒；ADMIN 例外）；重复核实拒', async () => {
@@ -90,11 +93,12 @@ describe('到账双状态 · 订单人工收款', () => {
       staff,
     );
 
-    await expect(paymentsService.verifyManualPayment(confirmed.paymentId, staff)).rejects.toThrow(/不能核实自己录入/u);
+    const paymentId = confirmed.paymentId as string;
+    await expect(paymentsService.verifyManualPayment(paymentId, staff)).rejects.toThrow(/不能核实自己录入/u);
 
-    const verified = await paymentsService.verifyManualPayment(confirmed.paymentId, admin);
+    const verified = await paymentsService.verifyManualPayment(paymentId, admin);
     expect(verified.ok).toBe(true);
-    await expect(paymentsService.verifyManualPayment(confirmed.paymentId, admin)).rejects.toThrow(/已经核实过/u);
+    await expect(paymentsService.verifyManualPayment(paymentId, admin)).rejects.toThrow(/已经核实过/u);
   });
 
   it('认款生成的收款创建即已核实，不进待核实队列', async () => {

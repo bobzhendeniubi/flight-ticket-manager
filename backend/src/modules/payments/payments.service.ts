@@ -12,7 +12,14 @@
  *   - 金额不匹配：标记 FAILED，审计告警
  *   - 订单已 CANCELLED：标记 REFUNDED（资金原路退回）
  */
-import { OrderStatus, PaymentMethod, PaymentStatus, Prisma, UserRole } from '@prisma/client';
+import {
+  OrderStatus,
+  PaymentMethod,
+  PaymentStatus,
+  Prisma,
+  ReceiptSource,
+  UserRole,
+} from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import {
   AppError,
@@ -30,6 +37,10 @@ import {
   sumCompletedRefundsWithinTx,
 } from '../../lib/funds-guard.js';
 import { writeAudit } from '../../lib/audit.js';
+// 超收拆分要在同一事务里建挂账进账。receipts.service 反向 import 本模块的 PaymentsService，
+// 构成模块环——但两侧都只在「方法体 / 类字段初始化」里用到对方，且 createOpenReceiptWithinTx 是
+// 函数声明（ESM 实例化阶段即提升可用），故静态 import 安全，与 orders.service 的用法一致。
+import { createOpenReceiptWithinTx } from '../receipts/receipts.service.js';
 
 export interface PaymentRequester {
   userId: string;
@@ -83,6 +94,83 @@ export function wouldOvercharge(args: {
   const netEffectiveAfter =
     args.alreadyPaid + args.amount + args.prepaymentOffset - args.refundedTotal;
   return netEffectiveAfter > args.effectivePayable + OVERPAY_EPSILON_CNY;
+}
+
+/**
+ * 超收拆分（纯函数）：把一笔到账按「应收部分 / 超出部分」拆成两半。
+ *
+ * 行业口径（cash application）：收款全额入账 → 先自动核销本单应收 → 核销不掉的余额转挂账池待核销。
+ *   可核销额度 creditable = 应收 − 已付净额（paidAmount − 已完成退款） − 预存抵扣，下限 0
+ *   creditAmount = min(amount, creditable)   → 记进订单 paidAmount（正常收款）
+ *   poolAmount   = amount − creditAmount     → 建 ORDER_OVERPAY 挂账进账（OPEN，待核销）
+ *
+ * 边界：
+ *   - 恰好收满 / 一分钱容差内的浮点毛刺 → wouldOvercharge 为 false → 整笔进订单，
+ *     绝不为了几厘钱拆出一笔挂账进账。
+ *   - 应收已为 0（已收满 / 预存已抵完）→ creditable = 0 → 整笔进池。
+ * 两半之和恒等于 amount（守恒），钱不会在拆分里消失。
+ */
+export function splitOverpayment(args: {
+  effectivePayable: number;
+  alreadyPaid: number;
+  prepaymentOffset: number;
+  refundedTotal: number;
+  amount: number;
+}): { creditAmount: number; poolAmount: number } {
+  // 没超出应收（含容差）→ 不拆，整笔正常入账。
+  if (!wouldOvercharge(args)) {
+    return { creditAmount: round2(args.amount), poolAmount: 0 };
+  }
+  const creditable = Math.max(
+    0,
+    args.effectivePayable - (args.alreadyPaid - args.refundedTotal) - args.prepaymentOffset,
+  );
+  const creditAmount = round2(Math.min(args.amount, creditable));
+  // poolAmount 由 amount 减出来（不独立四舍五入），保证 credit + pool ≡ amount。
+  return { creditAmount, poolAmount: round2(args.amount - creditAmount) };
+}
+
+/**
+ * 超收拆分出的挂账进账，把幂等键写进 Receipt.externalTxnId（与流水导入共用同一把唯一索引）。
+ *
+ * 为什么必须有：拆分后若「应收已为 0、整笔进池」，本次到账不会生成任何 Payment 记录，
+ * idempotencyKey 就没有载体——重复提交（双击 / 批量重发）会建出第二笔挂账进账。
+ * 挂到 externalTxnId 上后，同 key 重提会撞唯一索引，由 confirmManualPayment 顶部的回放分支接住。
+ * 前缀与收单平台真实流水号不可能相同，不会污染流水导入的去重。
+ */
+const OVERPAY_SPLIT_TXN_PREFIX = 'MANUAL-OVERPAY:';
+export function overpaySplitExternalTxnId(idempotencyKey: string): string {
+  return `${OVERPAY_SPLIT_TXN_PREFIX}${idempotencyKey}`;
+}
+
+/** 一笔到账被拆分后的明细（返回体 + Payment.gatewayPayload.overpaySplit 同形状）。 */
+export interface OverpaySplitDetail {
+  /** 本次录入的到账全额（= creditedAmount + pooledAmount）。 */
+  receivedAmount: number;
+  /** 核销进本订单的部分（0 表示本单应收已满，整笔进池）。 */
+  creditedAmount: number;
+  /** 转入挂账池待核销的部分（恒 > 0，否则整个 overpaySplit 为 null）。 */
+  pooledAmount: number;
+  /** 挂账进账 id。 */
+  receiptId: string;
+  /** 挂账进账号（RCP…），运营照着到对账台找这笔钱。 */
+  receiptNo: string;
+}
+
+/** 从 Payment.gatewayPayload 还原拆分明细（幂等回放用）；不是拆分单则 null。 */
+function readOverpaySplitFromPayload(payload: Prisma.JsonValue | null): OverpaySplitDetail | null {
+  if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return null;
+  const raw = (payload as Record<string, unknown>).overpaySplit;
+  if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;
+  const d = raw as Record<string, unknown>;
+  if (typeof d.receiptId !== 'string' || typeof d.receiptNo !== 'string') return null;
+  return {
+    receivedAmount: Number(d.receivedAmount ?? 0),
+    creditedAmount: Number(d.creditedAmount ?? 0),
+    pooledAmount: Number(d.pooledAmount ?? 0),
+    receiptId: d.receiptId,
+    receiptNo: d.receiptNo,
+  };
 }
 
 /** 手工收款记录（供同额防呆判定的最小形状）。 */
@@ -373,6 +461,14 @@ export class PaymentsService {
    * 人工确认收款（线下收款 → 后台标记）。ADMIN/STAFF 用。
    * 建 Payment(SUCCEEDED, proofUrl) → 累加 paidAmount → 全额则 Order→PAID
    * （同一事务，复用 _updateStatusWithinTx 生成佣金/履约任务）。
+   *
+   * 超收拆分（cash application 口径）：到账金额超过本单应收时**不再拒收**——
+   * 同一事务内拆成两笔：应收部分正常核销进订单，超出部分建一笔 ORDER_OVERPAY 挂账进账（OPEN），
+   * 留在挂账池等运营/财务认领到别的单或退回客户。应收已为 0 时整笔进池（不生成 Payment）。
+   * 拆分明细在返回体 overpaySplit 里，并写审计（订单入账 X / 转池 Y）。
+   *
+   * 注意：对账台「认领进账到订单」的入账内核 _creditOrderPaymentWithinTx 不走这条拆分路径——
+   * 那里钱本来就躺在池子里，超认必须继续拒绝（认到应收为止，余额留在池里），别把这里的拆分抄过去。
    */
   async confirmManualPayment(
     orderId: string,
@@ -388,18 +484,21 @@ export class PaymentsService {
     actor: { userId: string; role: UserRole },
   ): Promise<{
     ok: true;
-    paymentId: string;
+    /** 核销进订单的那笔收款 id；应收已为 0、整笔进池时为 null（本次没有任何钱记到订单上）。 */
+    paymentId: string | null;
     paidAmount: number;
     total: number;
     fullyPaid: boolean;
     orderNumber: string;
     status: OrderStatus;
+    /** 超收拆分明细；未触发拆分（全额都核销进订单）时为 null。 */
+    overpaySplit: OverpaySplitDetail | null;
   }> {
     // 幂等回放：同一 idempotencyKey 已入账（双击/网络重试）→ 返回当时结果，绝不二次累计
     if (input.idempotencyKey) {
       const existing = await prisma.payment.findUnique({
         where: { idempotencyKey: input.idempotencyKey },
-        select: { id: true, orderId: true },
+        select: { id: true, orderId: true, gatewayPayload: true },
       });
       if (existing) {
         const o = await prisma.order.findUniqueOrThrow({
@@ -411,24 +510,69 @@ export class PaymentsService {
         // 清账口径：fullyPaid = paidAmount + prepaymentOffset >= total + adjustmentCny
         //（与 reports/reminders/serializeOrder 全局清账公式一字一致，含改期费与预存抵扣）。
         const fullyPaid = p + Number(o.prepaymentOffset) + 0.001 >= t + o.adjustmentCny;
-        return { ok: true, paymentId: existing.id, paidAmount: p, total: t, fullyPaid, orderNumber: o.orderNumber, status: o.status };
+        return {
+          ok: true,
+          paymentId: existing.id,
+          paidAmount: p,
+          total: t,
+          fullyPaid,
+          orderNumber: o.orderNumber,
+          status: o.status,
+          // 首次入账时把拆分明细写进了 gatewayPayload，回放时原样还原（前端两次看到同一个进账号）。
+          overpaySplit: readOverpaySplitFromPayload(existing.gatewayPayload),
+        };
+      }
+      // 「应收已为 0、整笔进池」的回放：那次没有生成 Payment，幂等键挂在挂账进账的 externalTxnId 上。
+      // 少了这一支，同 key 重提会再建一笔挂账进账（池子里凭空多一笔钱），且事务里撞唯一索引后
+      // 下方 P2002 分支会递归重试、永远找不到 Payment → 死循环。
+      const pooled = await prisma.receipt.findUnique({
+        where: { externalTxnId: overpaySplitExternalTxnId(input.idempotencyKey) },
+        select: { id: true, receiptNo: true, amountCny: true, orderHintId: true },
+      });
+      if (pooled?.orderHintId) {
+        const o = await prisma.order.findUniqueOrThrow({
+          where: { id: pooled.orderHintId },
+          select: { orderNumber: true, total: true, adjustmentCny: true, paidAmount: true, prepaymentOffset: true, status: true },
+        });
+        const t = Number(o.total);
+        const p = Number(o.paidAmount);
+        const fullyPaid = p + Number(o.prepaymentOffset) + 0.001 >= t + o.adjustmentCny;
+        const pooledAmount = Number(pooled.amountCny);
+        return {
+          ok: true,
+          paymentId: null,
+          paidAmount: p,
+          total: t,
+          fullyPaid,
+          orderNumber: o.orderNumber,
+          status: o.status,
+          overpaySplit: {
+            receivedAmount: pooledAmount,
+            creditedAmount: 0,
+            pooledAmount,
+            receiptId: pooled.id,
+            receiptNo: pooled.receiptNo,
+          },
+        };
       }
     }
 
     const pendingFulfillmentTaskIds: string[] = [];
-    let paymentId = '';
+    let paymentId: string | null = null;
     let newPaid = 0;
     let total = 0;
     let fullyPaid = false;
     let orderNumber = '';
     let statusBefore: OrderStatus = OrderStatus.PENDING_PAYMENT;
+    let creditedAmount = 0;
+    let overpaySplit: OverpaySplitDetail | null = null;
 
     try {
       await prisma.$transaction(async (tx) => {
       // FOR UPDATE 行锁 + 事务内读余额：并发确认不会用旧快照双计 paidAmount
       const rows = await tx.$queryRaw<
-        Array<{ id: string; orderNumber: string; total: Prisma.Decimal; adjustmentCny: number; paidAmount: Prisma.Decimal; prepaymentOffset: Prisma.Decimal; status: OrderStatus; deletedAt: Date | null; paymentsLocked: boolean }>
-      >`SELECT id, "orderNumber", total, "adjustmentCny", "paidAmount", "prepaymentOffset", status, "deletedAt", "paymentsLocked" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+        Array<{ id: string; orderNumber: string; contactName: string | null; total: Prisma.Decimal; adjustmentCny: number; paidAmount: Prisma.Decimal; prepaymentOffset: Prisma.Decimal; status: OrderStatus; deletedAt: Date | null; paymentsLocked: boolean }>
+      >`SELECT id, "orderNumber", "contactName", total, "adjustmentCny", "paidAmount", "prepaymentOffset", status, "deletedAt", "paymentsLocked" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
       const order = rows[0];
       if (!order) throw new NotFoundError('订单不存在');
       // 资金闸：已取消/已退款/支付超时/草稿/回收站的单一律拒绝入账——
@@ -464,21 +608,21 @@ export class PaymentsService {
         );
       }
 
-      // ── 超收硬闸（散客/代理都拦）：本次到账不得使「累计已付净额 + 预存抵扣」超过应收。
+      // ── 超收拆分（不再拒收）：收款按全额入账，先自动核销本单应收，核销不掉的转挂账池。
       //    应收 = total + adjustmentCny（= 上方 effectivePayable）；净额 = paidAmount − 已完成退款；
-      //    收满(等于应收)不拦，仅超出拦。多付不再从此路口进账——超出部分改走收款对账台挂账池登记；
-      //    存量多付单仍用多付转余额/挂账池端点处置（那些端点保留不动）。
+      //    creditAmount 记进订单 paidAmount，poolAmount 建 ORDER_OVERPAY 挂账进账（下方同事务内落库）。
+      //    收满 / 一分钱容差内 → 不拆，整笔正常入账；应收已为 0 → creditAmount=0，整笔进池。
       const refundedRows = await tx.$queryRaw<Array<{ sum: Prisma.Decimal | null }>>`
         SELECT COALESCE(SUM(amount), 0) AS sum FROM "Refund" WHERE "orderId" = ${orderId} AND status = 'COMPLETED'
       `;
       const refundedTotal = Number(refundedRows[0]?.sum ?? 0);
-      if (
-        wouldOvercharge({ effectivePayable, alreadyPaid: already, prepaymentOffset, refundedTotal, amount })
-      ) {
-        throw new BadRequestError(
-          '该订单已收满/本笔将超出应收，超出部分请在收款对账台登记挂账池',
-        );
-      }
+      const split = splitOverpayment({
+        effectivePayable,
+        alreadyPaid: already,
+        prepaymentOffset,
+        refundedTotal,
+        amount,
+      });
 
       // ── 同额防呆软闸（confirmDuplicate 放行；两闸叠加时超收优先，故排在超收之后）：
       //    同一订单近 10 分钟内已有等额的 SUCCEEDED 手工收款记录 → 疑似把同一笔到账录了两次 → 409。
@@ -507,43 +651,77 @@ export class PaymentsService {
         }
       }
 
-      newPaid = already + amount;
+      creditedAmount = split.creditAmount;
+      newPaid = round2(already + creditedAmount);
       // 清账阈值：paidAmount + prepaymentOffset >= total + adjustmentCny 才算收齐（自动转 PAID）。
       // 有改期费的单要连费一起收齐才自动 PAID——与全局清账口径一致；force→PAID 走别的入口不受此影响。
       fullyPaid = newPaid + prepaymentOffset + 0.001 >= effectivePayable;
       orderNumber = order.orderNumber;
       statusBefore = order.status;
 
-      const payment = await tx.payment.create({
-        data: {
-          orderId,
+      // ① 超出应收的部分先落挂账池：先建才拿得到进账号，好一并写进收款记录的拆分留痕。
+      //    这笔钱是 OPEN（未认领）——它不算这张单已收到的钱，要运营/财务在对账台认领或退回客户。
+      if (split.poolAmount > 0) {
+        const receipt = await createOpenReceiptWithinTx(tx, {
+          amountCny: split.poolAmount,
           method: input.method,
-          amount: new Prisma.Decimal(amount),
-          status: PaymentStatus.SUCCEEDED,
-          paidAt: new Date(),
-          idempotencyKey: input.idempotencyKey ?? null,
+          source: ReceiptSource.ORDER_OVERPAY,
           proofUrl: input.proofUrl ?? null,
-          gatewayPayload: {
-            manual: true,
-            note: input.note ?? null,
-            confirmedBy: actor.userId,
-          } as Prisma.InputJsonValue,
-        },
-      });
-      paymentId = payment.id;
-      await tx.order.update({
-        where: { id: orderId },
-        data: { paidAmount: new Prisma.Decimal(newPaid) },
-      });
-      if (fullyPaid && order.status === OrderStatus.PENDING_PAYMENT) {
-        await this.orderService._updateStatusWithinTx(
-          tx,
-          orderId,
-          OrderStatus.PAID,
-          { userId: actor.userId, role: actor.role, actorType: 'USER' },
-          `人工确认收款（${input.method}，¥${amount.toFixed(2)}）`,
-          pendingFulfillmentTaskIds,
-        );
+          payerNote:
+            `超收自动拆分 · 订单 ${order.orderNumber}` +
+            (order.contactName ? ` · 付款人 ${order.contactName}` : ''),
+          orderHintId: orderId,
+          createdById: actor.userId,
+          // 幂等载体：整笔进池时没有 Payment 承接 idempotencyKey，靠这把唯一索引防重复建池。
+          externalTxnId: input.idempotencyKey
+            ? overpaySplitExternalTxnId(input.idempotencyKey)
+            : null,
+        });
+        overpaySplit = {
+          receivedAmount: round2(amount),
+          creditedAmount,
+          pooledAmount: split.poolAmount,
+          receiptId: receipt.id,
+          receiptNo: receipt.receiptNo,
+        };
+      }
+
+      // ② 应收部分正常核销进订单。creditedAmount 为 0（本单应收已满）时整笔都进了池，
+      //    这里不建 Payment、不动 paidAmount——订单账面一分不变，才不会凭空多付。
+      if (creditedAmount > 0) {
+        const payment = await tx.payment.create({
+          data: {
+            orderId,
+            method: input.method,
+            amount: new Prisma.Decimal(creditedAmount),
+            status: PaymentStatus.SUCCEEDED,
+            paidAt: new Date(),
+            idempotencyKey: input.idempotencyKey ?? null,
+            proofUrl: input.proofUrl ?? null,
+            gatewayPayload: {
+              manual: true,
+              note: input.note ?? null,
+              confirmedBy: actor.userId,
+              // 拆分留痕：这笔收款金额小于运营录入的到账全额时，据此说明差额去了哪张进账。
+              ...(overpaySplit ? { overpaySplit } : {}),
+            } as unknown as Prisma.InputJsonValue,
+          },
+        });
+        paymentId = payment.id;
+        await tx.order.update({
+          where: { id: orderId },
+          data: { paidAmount: new Prisma.Decimal(newPaid) },
+        });
+        if (fullyPaid && order.status === OrderStatus.PENDING_PAYMENT) {
+          await this.orderService._updateStatusWithinTx(
+            tx,
+            orderId,
+            OrderStatus.PAID,
+            { userId: actor.userId, role: actor.role, actorType: 'USER' },
+            `人工确认收款（${input.method}，¥${creditedAmount.toFixed(2)}）`,
+            pendingFulfillmentTaskIds,
+          );
+        }
       }
       });
     } catch (e) {
@@ -564,6 +742,32 @@ export class PaymentsService {
       }
     }
 
+    // 拆分留痕：审计单独记一条，把「录入全额 / 订单入账 / 转池」三个数和进账号写清楚——
+    // 路由层的 CONFIRM_MANUAL_PAYMENT 只记运营录入的金额，对不上账时要靠这条还原钱去了哪。
+    // overpaySplit 只在上面的 $transaction 回调里赋值。TS 的控制流分析不跟进闭包写入，
+    // 会认定它仍是初始化时的 null（再判真就成 never）。这里显式断回声明类型，运行时语义不变。
+    const splitDetail = overpaySplit as OverpaySplitDetail | null;
+    if (splitDetail) {
+      void writeAudit({
+        actor: { userId: actor.userId, role: actor.role },
+        action: 'SPLIT_OVERPAY_TO_POOL',
+        targetType: 'ORDER',
+        targetId: orderId,
+        targetLabel: orderNumber,
+        after: {
+          receivedAmount: splitDetail.receivedAmount,
+          creditedToOrder: splitDetail.creditedAmount,
+          movedToPool: splitDetail.pooledAmount,
+          receiptNo: splitDetail.receiptNo,
+          receiptId: splitDetail.receiptId,
+          paymentId,
+          method: input.method,
+          orderPaidAmount: newPaid,
+        },
+        severity: 'WARNING',
+      });
+    }
+
     return {
       ok: true,
       paymentId,
@@ -571,7 +775,9 @@ export class PaymentsService {
       total,
       fullyPaid,
       orderNumber,
-      status: fullyPaid ? OrderStatus.PAID : statusBefore,
+      // creditedAmount 为 0 时本次没往订单里记钱，状态自然不会被本次推进。
+      status: creditedAmount > 0 && fullyPaid ? OrderStatus.PAID : statusBefore,
+      overpaySplit: splitDetail,
     };
   }
 
@@ -1067,6 +1273,9 @@ export class PaymentsService {
    * 等价于旧行为）。逐单幂等键 = `batch:{batchId}:{orderId}`，透传给 confirmManualPayment，
    * 复用它已有的唯一约束 + 回放逻辑——同一 batchId 重复提交（双击/网络重试/表单重发），
    * 同一 orderId 只入账一次，回放返回首次入账结果，绝不二次累计。
+   *
+   * 超收同样走拆分（逐单复用 confirmManualPayment 的口径）：某一单录多了不再整条失败，
+   * 应收部分照常核销、超出部分进挂账池，逐条结果里带 overpaySplit 供前端提示。
    */
   async batchConfirmManualPayment(
     input: {
@@ -1089,7 +1298,9 @@ export class PaymentsService {
       paidAmount?: number;
       total?: number;
       status?: OrderStatus;
-      paymentId?: string;
+      paymentId?: string | null;
+      /** 该单触发超收拆分时带上（应收部分已核销，超出部分已进挂账池）；未拆分为 null。 */
+      overpaySplit?: OverpaySplitDetail | null;
     }>;
   }> {
     if (!Array.isArray(input.items) || input.items.length === 0) {
@@ -1106,7 +1317,9 @@ export class PaymentsService {
       paidAmount?: number;
       total?: number;
       status?: OrderStatus;
-      paymentId?: string;
+      paymentId?: string | null;
+      /** 该单触发超收拆分时带上（应收部分已核销，超出部分已进挂账池）；未拆分为 null。 */
+      overpaySplit?: OverpaySplitDetail | null;
     }> = [];
 
     // 逐单串行处理：每单一个事务/行锁，一坏不连累其余（收集错误而非整体回滚）
@@ -1136,6 +1349,7 @@ export class PaymentsService {
           total: result.total,
           status: result.status,
           paymentId: result.paymentId,
+          overpaySplit: result.overpaySplit,
         });
       } catch (e) {
         results.push({

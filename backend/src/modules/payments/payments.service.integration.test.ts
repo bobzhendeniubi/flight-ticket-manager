@@ -2,7 +2,7 @@
  * PaymentsService.confirmManualPayment / batchConfirmManualPayment · 真 DB 集成测试
  *
  * 覆盖：
- *   - 超收硬闸：手工/批量到账使累计已付净额超过应收 → 400 拦下（多付改走对账台挂账池）
+ *   - 超收拆分：手工/批量到账超过应收 → 应收部分核销进订单、超出部分建 ORDER_OVERPAY 挂账进账
  *   - 同额防呆软闸：近 10 分钟等额手工收款 → 409 + code DUPLICATE_AMOUNT；confirmDuplicate 放行
  *   - 正常分次凑单到收满 → 自动 PAID（不产生多付）
  *   - 防手误上限：异常偏高金额被拒
@@ -14,7 +14,7 @@
  *   2. npm run test:integration
  */
 import { describe, it, expect } from 'vitest';
-import { OrderStatus, PaymentMethod, Prisma, UserRole, PaymentStatus } from '@prisma/client';
+import { OrderStatus, PaymentMethod, Prisma, ReceiptSource, ReceiptStatus, UserRole, PaymentStatus } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { PaymentsService } from './payments.service.js';
 
@@ -70,32 +70,45 @@ async function createPendingOrder(userId: string, total = 1000) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════
-describe('PaymentsService.confirmManualPayment · 超收硬闸与防手误', () => {
+describe('PaymentsService.confirmManualPayment · 超收拆分与防手误', () => {
   const service = new PaymentsService();
 
-  it('超收硬闸：一次性到账 > 应收 → 400 拦下，订单不被改动（多付改走挂账池）', async () => {
+  it('超收拆分：一次性到账 > 应收 → 应收部分入账、超出部分建 OPEN 挂账进账', async () => {
     const ADMIN = await createAdminActor();
     const customer = await createCustomer();
     const order = await createPendingOrder(customer.id, 1000);
 
-    // 应收 1000，一次录 1200（超出 200）→ 硬闸拦下
-    await expect(
-      service.confirmManualPayment(
-        order.id,
-        { amount: 1200, method: PaymentMethod.BANK_CARD },
-        ADMIN,
-      ),
-    ).rejects.toThrow(/超出应收|已收满|挂账池/);
+    // 应收 1000，一次录 1200 → 1000 核销进订单（收满自动 PAID），200 转挂账池
+    const res = await service.confirmManualPayment(
+      order.id,
+      { amount: 1200, method: PaymentMethod.BANK_CARD },
+      ADMIN,
+    );
+    expect(res.paidAmount).toBe(1000);
+    expect(res.status).toBe(OrderStatus.PAID);
+    expect(res.overpaySplit).not.toBeNull();
+    expect(res.overpaySplit?.receivedAmount).toBe(1200);
+    expect(res.overpaySplit?.creditedAmount).toBe(1000);
+    expect(res.overpaySplit?.pooledAmount).toBe(200);
 
-    // 订单未被改动：paidAmount 仍 0，状态仍 PENDING_PAYMENT，没有落 Payment
+    // 订单只加了应收部分，绝不出现账面多付
     const dbOrder = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
-    expect(Number(dbOrder.paidAmount)).toBe(0);
-    expect(dbOrder.status).toBe(OrderStatus.PENDING_PAYMENT);
+    expect(Number(dbOrder.paidAmount)).toBe(1000);
     const payments = await prisma.payment.findMany({ where: { orderId: order.id } });
-    expect(payments).toHaveLength(0);
+    expect(payments).toHaveLength(1);
+    expect(Number(payments[0].amount)).toBe(1000);
+
+    // 超出部分躺在挂账池里等认领
+    const receipt = await prisma.receipt.findUniqueOrThrow({
+      where: { id: res.overpaySplit!.receiptId },
+    });
+    expect(receipt.source).toBe(ReceiptSource.ORDER_OVERPAY);
+    expect(receipt.status).toBe(ReceiptStatus.OPEN);
+    expect(Number(receipt.amountCny)).toBe(200);
+    expect(receipt.orderHintId).toBe(order.id);
   });
 
-  it('超收硬闸：收满后再录任意金额 → 400 拦下（同一笔到账误录两次场景）', async () => {
+  it('超收拆分：收满后再录任意金额 → 整笔进池，订单账面一分不动', async () => {
     const ADMIN = await createAdminActor();
     const customer = await createCustomer();
     const order = await createPendingOrder(customer.id, 1000);
@@ -107,18 +120,22 @@ describe('PaymentsService.confirmManualPayment · 超收硬闸与防手误', () 
       ADMIN,
     );
     expect(first.status).toBe(OrderStatus.PAID);
+    expect(first.overpaySplit).toBeNull();
 
-    // 第二笔（不同收款方式，等额）→ 超收硬闸拦下（正是本次修复的误录两次事故）
-    await expect(
-      service.confirmManualPayment(
-        order.id,
-        { amount: 1000, method: PaymentMethod.WECHAT_PAY },
-        ADMIN,
-      ),
-    ).rejects.toThrow(/超出应收|已收满|挂账池/);
+    // 第二笔（不同收款方式，等额）：应收已为 0 → 不生成 Payment，整笔 1000 进挂账池
+    const second = await service.confirmManualPayment(
+      order.id,
+      { amount: 1000, method: PaymentMethod.WECHAT_PAY },
+      ADMIN,
+    );
+    expect(second.paymentId).toBeNull();
+    expect(second.overpaySplit?.creditedAmount).toBe(0);
+    expect(second.overpaySplit?.pooledAmount).toBe(1000);
 
     const dbOrder = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
     expect(Number(dbOrder.paidAmount)).toBe(1000); // 没有变成 2000
+    const payments = await prisma.payment.findMany({ where: { orderId: order.id } });
+    expect(payments).toHaveLength(1); // 第二笔没有落 Payment
   });
 
   it('全额到账 → 自动 PAID（auto-flip 仍生效）', async () => {
@@ -181,21 +198,21 @@ describe('PaymentsService.confirmManualPayment · 超收硬闸与防手误', () 
     expect(dbOrder.status).toBe(OrderStatus.PENDING_PAYMENT);
   });
 
-  it('小额订单超收也拦：总额 10，到账 5000（未超防手误上限，但超应收）→ 400', async () => {
+  it('小额订单超收也拆：总额 10、到账 5000 → 订单只收 10，4990 进挂账池', async () => {
     const ADMIN = await createAdminActor();
     const customer = await createCustomer();
     const order = await createPendingOrder(customer.id, 10);
-    // 5000 在防手误绝对上限内（不触发「异常偏高」），但远超应收 10 → 超收硬闸拦下
-    await expect(
-      service.confirmManualPayment(
-        order.id,
-        { amount: 5000, method: PaymentMethod.BANK_CARD },
-        ADMIN,
-      ),
-    ).rejects.toThrow(/超出应收|已收满|挂账池/);
+    // 5000 在防手误绝对上限内（不触发「异常偏高」），超出应收 10 的部分走拆分
+    const res = await service.confirmManualPayment(
+      order.id,
+      { amount: 5000, method: PaymentMethod.BANK_CARD },
+      ADMIN,
+    );
+    expect(res.overpaySplit?.creditedAmount).toBe(10);
+    expect(res.overpaySplit?.pooledAmount).toBe(4990);
 
     const dbOrder = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
-    expect(Number(dbOrder.paidAmount)).toBe(0);
+    expect(Number(dbOrder.paidAmount)).toBe(10);
   });
 
   it('幂等：同 idempotencyKey 重试只入账一次', async () => {
@@ -633,7 +650,7 @@ describe('PaymentsService.confirmManualPayment · 同额防呆软闸', () => {
     expect(payments).toHaveLength(2);
   });
 
-  it('两闸叠加超收优先：等额重复且会超收 → 抛超收 400（非 409），不是软闸', async () => {
+  it('收满后等额重录仍先撞同额防呆软闸（409），确认后才整笔进池', async () => {
     const ADMIN = await createAdminActor();
     const customer = await createCustomer();
     const order = await createPendingOrder(customer.id, 1000);
@@ -644,7 +661,7 @@ describe('PaymentsService.confirmManualPayment · 同额防呆软闸', () => {
       { amount: 1000, method: PaymentMethod.BANK_CARD },
       ADMIN,
     );
-    // 第二笔等额 1000：既是等额重复、又会超收 → 超收硬闸优先，抛 400（不是 409 软闸）
+    // 第二笔等额 1000：超收不再拒收，但「近 10 分钟等额」仍是重复录入的强信号 → 409 要二次确认
     let caught: unknown;
     try {
       await service.confirmManualPayment(
@@ -655,8 +672,17 @@ describe('PaymentsService.confirmManualPayment · 同额防呆软闸', () => {
     } catch (e) {
       caught = e;
     }
-    expect((caught as { statusCode?: number }).statusCode).toBe(400);
-    expect((caught as { code?: string }).code).not.toBe('DUPLICATE_AMOUNT');
+    expect((caught as { code?: string }).code).toBe('DUPLICATE_AMOUNT');
+
+    // 确认确是另一笔真实到账后放行 → 应收已满，整笔进挂账池
+    const res = await service.confirmManualPayment(
+      order.id,
+      { amount: 1000, method: PaymentMethod.WECHAT_PAY, confirmDuplicate: true },
+      ADMIN,
+    );
+    expect(res.overpaySplit?.pooledAmount).toBe(1000);
+    const dbOrder = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(Number(dbOrder.paidAmount)).toBe(1000);
   });
 
   it('批量到账跳过软闸：同订单同额两条 batch 项均入账（batchId 去重另管重复提交）', async () => {

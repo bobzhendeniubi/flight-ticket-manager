@@ -1,8 +1,11 @@
 /**
  * 收款对账台 · ADMIN/STAFF
  *
- * 客服/财务一处看所有进账，把「挂账/超额/认不出的钱」认领到订单或退款；
+ * 运营 / 客服 / 财务共用：一处看所有进账，把「挂账 / 超收 / 认不出的钱」核销到订单或退回客户；
  * 还能配置统一收款码（收款渠道管理）。
+ *
+ * 挂账池口径（cash application）：收到的钱一律全额入账 —— 能核销的先核销到订单应收，
+ * 核销不掉的余额留在池子里挂账、带账龄，任何岗位都可以认领处置，不必等某个人来批。
  *
  * 数据源（backend receipts + payment-channels；契约见 admin-web/src/lib/api.ts）：
  *   GET  /receipts?status=&q=        - 进账列表（每条带 remainingCny + allocations[]）
@@ -16,6 +19,7 @@
  * 后端报错就地内联展示。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import {
   api,
   ApiError,
@@ -46,11 +50,26 @@ const METHOD_OPTIONS: PaymentMethod[] = ['WECHAT_PAY', 'ALIPAY', 'BANK_CARD', 'A
 const MAX_PROOF_BYTES = 6 * 1024 * 1024;
 
 // 顶部过滤页签（statement = 流水认款工作台：导入二维码流水 + 分房式拖拽配对；
-// unverified = 到账核实异常队列：人工录入的到账等财务对流水后逐笔核实）
+// unverified = 到账核实异常队列：人工录入的到账要逐笔对上流水才算核实）
 type Tab = 'open' | 'statement' | 'unverified' | 'allocated' | 'refunded' | 'ledger' | 'channels';
 
-// 手工到账超过 N 天财务还没核实 → 标红超期（运营须去跟客户确认）
+// 手工到账超过 N 天还没核实 → 标红超期（须回头跟客户确认）
 const UNVERIFIED_OVERDUE_DAYS = 3;
+
+// 进账挂在池子里超过 N 天还没核销完 → 标红超期（账龄口径，与待核实同一把尺子）
+const UNCLAIMED_OVERDUE_DAYS = 3;
+
+/** 账龄（天）：从登记进池到现在，向下取整。 */
+function ageDaysOf(iso: string): number {
+  const t = new Date(iso).getTime();
+  if (Number.isNaN(t)) return 0;
+  return Math.floor((Date.now() - t) / (24 * 3600 * 1000));
+}
+
+/** 这条进账是否还挂在池子里（未认领 / 部分认领）——超期判定与 KPI 都按这个口径。 */
+function isUnclaimed(status: ReceiptStatus): boolean {
+  return status === 'OPEN' || status === 'PARTIALLY_ALLOCATED';
+}
 
 // 状态徽标 → Console badge
 function statusBadge(status: ReceiptStatus): string {
@@ -110,6 +129,9 @@ export function ReconciliationPage() {
   const token = tokens?.accessToken ?? '';
 
   const [tab, setTab] = useState<Tab>('open');
+  // 订单详情收款区「去收款对账台核销」带过来的订单号（?order=…）；只用于提示 + 预填核销表单。
+  const [pageSearchParams] = useSearchParams();
+  const deepLinkOrderNo = pageSearchParams.get('order')?.trim() ?? '';
   const [q, setQ] = useState('');
   // 到账日期闭区间筛选（按流水交易日期 receivedAt，北京时；传后端）
   const [from, setFrom] = useState('');
@@ -122,7 +144,7 @@ export function ReconciliationPage() {
   const [err, setErr] = useState<string | null>(null);
   const [showRegister, setShowRegister] = useState(false);
 
-  // 加载进账列表（用于待认领/已认领/已退款 + KPI 计算）
+  // 加载进账列表（用于待核销/已核销/已退款 + KPI 计算）
   const loadReceipts = useCallback(() => {
     if (!token) return;
     setLoading(true);
@@ -186,30 +208,34 @@ export function ReconciliationPage() {
     );
   }, [unverifiedPayments, unverifiedClaims]);
 
-  // KPI：挂账余额 = 未结进账剩余合计；今日进账 = 今日 receivedAt 金额合计；待认领笔数
+  // KPI：挂账余额 = 未结进账剩余合计；今日进账 = 今日 receivedAt 金额合计；
+  //      待核销笔数 + 其中账龄超 UNCLAIMED_OVERDUE_DAYS 天的笔数（钱在池子里躺久了要盯）
   const kpi = useMemo(() => {
     let poolRemaining = 0;
     let todayIn = 0;
     let unclaimedCount = 0;
+    let unclaimedOverdueCount = 0;
     for (const r of receipts) {
       const remaining = Number(r.remainingCny);
-      if (r.status === 'OPEN' || r.status === 'PARTIALLY_ALLOCATED') {
+      if (isUnclaimed(r.status)) {
         if (Number.isFinite(remaining)) poolRemaining += remaining;
         unclaimedCount += 1;
+        // 账龄按登记进池时间算（createdAt），与行内标红同一口径
+        if (ageDaysOf(r.createdAt) >= UNCLAIMED_OVERDUE_DAYS) unclaimedOverdueCount += 1;
       }
       if (isToday(r.receivedAt)) {
         const amt = Number(r.amountCny);
         if (Number.isFinite(amt)) todayIn += amt;
       }
     }
-    return { poolRemaining, todayIn, unclaimedCount };
+    return { poolRemaining, todayIn, unclaimedCount, unclaimedOverdueCount };
   }, [receipts]);
 
   // 按页签过滤进账
   const filtered = useMemo(() => {
     switch (tab) {
       case 'open':
-        return receipts.filter((r) => r.status === 'OPEN' || r.status === 'PARTIALLY_ALLOCATED');
+        return receipts.filter((r) => isUnclaimed(r.status));
       case 'allocated':
         return receipts.filter((r) => r.status === 'ALLOCATED');
       case 'refunded':
@@ -230,7 +256,7 @@ export function ReconciliationPage() {
         <div>
           <h1 className="page-title">收款对账台</h1>
           <p className="page-sub">
-            一处看所有进账 · 把挂账 / 超额 / 认不出的钱认领到订单或退款 · 配置统一收款码
+            一处看所有进账 · 把挂账 / 超收 / 认不出的钱核销到订单或退回客户 · 配置统一收款码
           </p>
         </div>
         {tab !== 'channels' && tab !== 'statement' && (
@@ -240,10 +266,19 @@ export function ReconciliationPage() {
         )}
       </header>
 
+      {/* 深链承接：从订单详情收款区跳过来时带 ?order=<订单号>，摆出来说明这趟是来核销哪张单的
+          （展开某笔待核销进账后，核销表单的订单搜索框已按它预填）。 */}
+      {deepLinkOrderNo && (
+        <div className="rounded-lg border border-brand/30 bg-brand-50 px-3 py-2 text-sm text-ink-soft">
+          <Icon name="wallet" /> 来自订单 <span className="font-mono font-medium text-ink">{deepLinkOrderNo}</span>
+          ：展开下方待核销进账，核销表单已预填该订单号。
+        </div>
+      )}
+
       {/* KPI 条 */}
       <div className="grid gap-3 sm:grid-cols-3">
         <div className="stat-card">
-          <div className="stat-label">挂账余额（待认领剩余）</div>
+          <div className="stat-label">挂账余额（待核销剩余）</div>
           <div className="stat-value text-amber-700">{fmtCny(kpi.poolRemaining)}</div>
         </div>
         <div className="stat-card">
@@ -251,15 +286,22 @@ export function ReconciliationPage() {
           <div className="stat-value text-emerald-700">{fmtCny(kpi.todayIn)}</div>
         </div>
         <div className="stat-card">
-          <div className="stat-label">待认领笔数</div>
-          <div className="stat-value">{kpi.unclaimedCount}</div>
+          <div className="stat-label">待核销笔数</div>
+          <div className="stat-value">
+            {kpi.unclaimedCount}
+            {kpi.unclaimedOverdueCount > 0 && (
+              <span className="ml-2 align-middle text-sm font-semibold text-rose-700">
+                其中超 {UNCLAIMED_OVERDUE_DAYS} 天 {kpi.unclaimedOverdueCount} 笔
+              </span>
+            )}
+          </div>
         </div>
       </div>
 
       {/* 页签 */}
       <nav className="flex flex-wrap items-center gap-2">
         <TabBtn active={tab === 'open'} onClick={() => setTab('open')}>
-          待认领
+          待核销
         </TabBtn>
         <TabBtn active={tab === 'statement'} onClick={() => setTab('statement')}>
           流水认款
@@ -268,7 +310,7 @@ export function ReconciliationPage() {
           待核实{unverifiedCount > 0 ? `（${unverifiedCount}${unverifiedOverdue > 0 ? `，${unverifiedOverdue} 超期` : ''}）` : ''}
         </TabBtn>
         <TabBtn active={tab === 'allocated'} onClick={() => setTab('allocated')}>
-          已认领
+          已核销
         </TabBtn>
         <TabBtn active={tab === 'refunded'} onClick={() => setTab('refunded')}>
           已退款
@@ -336,6 +378,7 @@ export function ReconciliationPage() {
           rows={filtered}
           loading={loading}
           token={token}
+          showPoolHint={tab === 'open'}
           onAfterMutation={onAfterMutation}
         />
       )}
@@ -354,9 +397,9 @@ export function ReconciliationPage() {
   );
 }
 
-// ── 待核实队列（到账双状态：业务已收 → 财务已核实）─────────────────────────
+// ── 待核实队列（到账双状态：业务已收 → 已对上流水）─────────────────────────
 // 数据 = 订单人工收款（含批量到账/占位单结转未核实款）+ 占位单手工到账（运营水单登记）。
-// 超期（> UNVERIFIED_OVERDUE_DAYS 天）标红置顶：财务对不到流水的钱，运营必须回头找客户。
+// 超期（> UNVERIFIED_OVERDUE_DAYS 天）标红置顶：对不到流水的钱，必须回头找客户确认。
 function UnverifiedQueue({
   payments,
   claims,
@@ -436,13 +479,13 @@ function UnverifiedQueue({
 
   if (loading) return <div className="rounded-lg border border-slate-200 bg-white p-6 text-sm text-ink-muted">加载中…</div>;
   if (rows.length === 0) {
-    return <div className="rounded-lg border border-slate-200 bg-white p-6 text-sm text-ink-muted">没有待核实的到账——所有人工录入的钱都已由财务对过流水。</div>;
+    return <div className="rounded-lg border border-slate-200 bg-white p-6 text-sm text-ink-muted">没有待核实的到账——所有人工录入的钱都已对过流水。</div>;
   }
   return (
     <div className="space-y-2">
       {rowErr && <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-sm text-rose-700">{rowErr}</div>}
       <p className="text-xs text-ink-muted">
-        这些是运营/客服凭客户水单录入、财务还没对到流水的钱。逐笔在银行/收单后台核对后点「核实」；超过 {UNVERIFIED_OVERDUE_DAYS} 天仍对不到的标红——请运营回头找客户确认是否真的转了。录入人不能核实自己录的账（管理员除外）。
+        这些是凭客户水单录入、还没在银行/收单后台对到流水的钱。谁手上有流水就谁去核对，逐笔核对无误后点「核实」；超过 {UNVERIFIED_OVERDUE_DAYS} 天仍对不到的标红——请回头找客户确认是否真的转了。录入人不能核实自己录的账（管理员除外）。
       </p>
       <div className="overflow-x-auto rounded-lg border border-slate-200 bg-white">
         <table className="w-full text-sm">
@@ -515,20 +558,30 @@ function TabBtn({
   );
 }
 
-// ── 进账表（待认领 / 已认领 / 已退款） ───────────────────────────────────────
+// ── 进账表（待核销 / 已核销 / 已退款） ───────────────────────────────────────
 function ReceiptTable({
   rows,
   loading,
   token,
+  showPoolHint = false,
   onAfterMutation,
 }: {
   rows: Receipt[];
   loading: boolean;
   token: string;
+  /** 待核销页签才提示挂账池口径（已核销 / 已退款页签不需要）。 */
+  showPoolHint?: boolean;
   onAfterMutation: () => void;
 }) {
   return (
     <div className="card p-0">
+      {showPoolHint && (
+        <p className="border-b border-slate-200 px-4 py-2.5 text-xs text-ink-muted">
+          池子里的钱有两个来路：手工「登记新进账」，以及订单页录收款时超出该单尾款、被自动拆出来的部分
+          （来源显示「订单超额」，备注里带原订单号）。逐笔核销到订单或退回客户；账龄超{' '}
+          {UNCLAIMED_OVERDUE_DAYS} 天仍没处置完的整行标红——钱挂太久对不上账，谁看到谁跟进。
+        </p>
+      )}
       <div className="overflow-x-auto">
         <table className="table-admin">
           <thead>
@@ -541,6 +594,7 @@ function ReceiptTable({
               <th>来源</th>
               <th>截图</th>
               <th>状态</th>
+              <th>账龄</th>
               <th>时间</th>
               <th className="text-right">操作</th>
             </tr>
@@ -548,14 +602,14 @@ function ReceiptTable({
           <tbody>
             {loading && (
               <tr>
-                <td colSpan={10} className="py-6 text-center text-sm text-ink-muted">
+                <td colSpan={11} className="py-6 text-center text-sm text-ink-muted">
                   加载中…
                 </td>
               </tr>
             )}
             {!loading && rows.length === 0 && (
               <tr>
-                <td colSpan={10} className="py-6 text-center text-sm text-ink-muted">
+                <td colSpan={11} className="py-6 text-center text-sm text-ink-muted">
                   暂无进账。
                 </td>
               </tr>
@@ -588,7 +642,11 @@ function ReceiptRow({
   const [reverseErr, setReverseErr] = useState<string | null>(null);
   const [reverseWarning, setReverseWarning] = useState<string | null>(null);
   const remaining = Number(receipt.remainingCny);
-  const canMutate = receipt.status === 'OPEN' || receipt.status === 'PARTIALLY_ALLOCATED';
+  const canMutate = isUnclaimed(receipt.status);
+  // 账龄：钱在池子里躺了几天。还没核销完且超过 UNCLAIMED_OVERDUE_DAYS 天 → 整行标红，
+  // 与「待核实」队列同一把尺子：挂太久的钱要么赶紧核销到订单，要么退回客户。
+  const ageDays = ageDaysOf(receipt.createdAt);
+  const overdue = canMutate && ageDays >= UNCLAIMED_OVERDUE_DAYS;
 
   /**
    * 撤销一笔认款：钱从订单撤回本进账的剩余额，可再认给别的订单。
@@ -626,7 +684,7 @@ function ReceiptRow({
 
   return (
     <>
-      <tr>
+      <tr className={overdue ? 'bg-rose-50/60' : undefined}>
         <td className="font-mono text-xs text-ink">{receipt.receiptNo}</td>
         <td className="nums text-right text-ink">{fmtCny(receipt.amountCny)}</td>
         <td className="nums text-right font-medium text-amber-700">{fmtCny(receipt.remainingCny)}</td>
@@ -655,6 +713,17 @@ function ReceiptRow({
         </td>
         <td>
           <span className={statusBadge(receipt.status)}>{RECEIPT_STATUS_LABEL[receipt.status]}</span>
+        </td>
+        <td className="whitespace-nowrap text-xs">
+          {canMutate ? (
+            overdue ? (
+              <span className="font-semibold text-rose-700">{ageDays} 天 · 超期</span>
+            ) : (
+              <span className="text-ink-muted">{ageDays} 天</span>
+            )
+          ) : (
+            <span className="text-ink-muted">—</span>
+          )}
         </td>
         <td className="whitespace-nowrap text-xs text-ink-muted">{fmtDateTime(receipt.receivedAt)}</td>
         <td className="text-right">
@@ -686,12 +755,12 @@ function ReceiptRow({
       {/* 已认领明细（展开行）+ 逐笔撤销 */}
       {receipt.allocations.length > 0 && (
         <tr>
-          <td colSpan={10} className="bg-slate-50/60 !py-2 text-xs text-ink-soft">
+          <td colSpan={11} className="bg-slate-50/60 !py-2 text-xs text-ink-soft">
             <div className="flex flex-wrap items-center gap-x-1 gap-y-1.5">
               <span>已认领：</span>
               {receipt.allocations.map((a) => (
                 <span key={a.id} className="ml-1 inline-flex items-center gap-1">
-                  {/* 订单号（财务照着核对账）；服务端 join 不到才回落 id 前 8 位，title 恒为完整 id */}
+                  {/* 订单号（照着核对账）；服务端 join 不到才回落 id 前 8 位，title 恒为完整 id */}
                   <span className="font-mono text-ink-muted" title={`订单 id ${a.orderId}`}>
                     {a.orderNumber ?? a.orderId.slice(0, 8)}
                   </span>
@@ -728,7 +797,7 @@ function ReceiptRow({
       {/* 认领表单 */}
       {action === 'allocate' && (
         <tr>
-          <td colSpan={10} className="bg-brand-50/40 !py-3">
+          <td colSpan={11} className="bg-brand-50/40 !py-3">
             <AllocateForm
               token={token}
               receiptId={receipt.id}
@@ -746,7 +815,7 @@ function ReceiptRow({
       {/* 退款表单 */}
       {action === 'refund' && (
         <tr>
-          <td colSpan={10} className="bg-rose-50/40 !py-3">
+          <td colSpan={11} className="bg-rose-50/40 !py-3">
             <RefundForm
               token={token}
               receiptId={receipt.id}
@@ -778,7 +847,10 @@ function AllocateForm({
   onDone: () => void;
   onCancel: () => void;
 }) {
-  const [orderNo, setOrderNo] = useState('');
+  // 深链承接：订单详情收款区「去收款对账台核销」跳过来时带 ?order=<订单号>，
+  // 这里预填订单搜索框，省得财务再手抄一遍单号（只填不自动提交，认款仍需人工点搜索+确认）。
+  const [searchParams] = useSearchParams();
+  const [orderNo, setOrderNo] = useState(() => searchParams.get('order')?.trim() ?? '');
   const [matchedOrderId, setMatchedOrderId] = useState<string | null>(null);
   const [matchedLabel, setMatchedLabel] = useState<string | null>(null);
   const [searching, setSearching] = useState(false);
@@ -803,9 +875,23 @@ function AllocateForm({
         return;
       }
       setMatchedOrderId(pick.id);
-      const due = Math.round((Number(pick.total) - Number(pick.paidAmount)) * 100) / 100;
+      // 尾款用后端权威口径 balanceDue（= total + adjustmentCny − paidAmount − prepaymentOffset）。
+      // 之前这里自己按「total − paidAmount」算，漏掉售后调整行与代理预存抵扣——
+      // 同一张单在订单页和这里会显示两个不一样的尾款，认款金额就照着错的数填。
+      // 旧后端没下发 balanceDue 时才回落到应付减已付（仍带上 adjustmentCny/prepaymentOffset）。
+      const payable =
+        pick.effectivePayable != null
+          ? Number(pick.effectivePayable)
+          : Number(pick.total) + (pick.adjustmentCny ?? 0);
+      const due =
+        pick.balanceDue != null
+          ? Number(pick.balanceDue)
+          : Math.round((payable - Number(pick.paidAmount) - Number(pick.prepaymentOffset ?? 0)) * 100) / 100;
       setMatchedLabel(
-        `${pick.orderNumber} · ${pick.contactName} · 应收 ¥${Number(pick.total).toLocaleString()} · 尾款 ¥${due.toLocaleString()}`,
+        `${pick.orderNumber} · ${pick.contactName} · 应收 ¥${payable.toLocaleString()} · ` +
+          (due < 0
+            ? `已多收 ¥${Math.abs(due).toLocaleString()}`
+            : `尾款 ¥${due.toLocaleString()}`),
       );
     } catch (e: unknown) {
       setErr(e instanceof ApiError ? e.message : '查订单失败');
@@ -818,14 +904,14 @@ function AllocateForm({
     if (!matchedOrderId || submitting) return;
     const amt = amount ?? 0;
     if (!Number.isFinite(amt) || amt <= 0) {
-      setErr('认领金额需为正数');
+      setErr('核销金额需为正数');
       return;
     }
     if (amt > remaining + 1e-6) {
-      setErr(`认领金额不能超过剩余 ¥${remaining.toLocaleString()}`);
+      setErr(`核销金额不能超过本笔剩余 ¥${remaining.toLocaleString()}`);
       return;
     }
-    if (!window.confirm(`确认把 ¥${amt.toLocaleString()} 认领到订单 ${matchedLabel ?? matchedOrderId}？`)) return;
+    if (!window.confirm(`确认把 ¥${amt.toLocaleString()} 核销到订单 ${matchedLabel ?? matchedOrderId}？`)) return;
     setErr(null);
     setSubmitting(true);
     try {
@@ -840,7 +926,11 @@ function AllocateForm({
 
   return (
     <div className="space-y-2">
-      <div className="text-sm font-medium text-ink">认领到订单（剩余 ¥{remaining.toLocaleString()}）</div>
+      <div className="text-sm font-medium text-ink">核销到订单（本笔剩余 ¥{remaining.toLocaleString()}）</div>
+      <p className="text-xs text-ink-muted">
+        只能核销到订单尾款为止；核销不完的余额留在池子里继续挂账，可以再核销给别的订单，或退回客户。
+        订单页那边直接录收款时则相反：超过尾款的部分会自动拆出来进这个池子。
+      </p>
       {err && <div className="rounded bg-rose-50 px-2 py-1 text-xs text-rose-700">{err}</div>}
       <div className="flex flex-wrap items-end gap-2">
         <label className="text-xs text-ink-soft">
@@ -866,7 +956,7 @@ function AllocateForm({
           </div>
         </label>
         <label className="text-xs text-ink-soft">
-          认领金额
+          核销金额
           <NumberInput
             step={0.01}
             min={0}
@@ -883,7 +973,7 @@ function AllocateForm({
           onClick={submit}
           disabled={submitting || !matchedOrderId}
         >
-          {submitting ? '认领中…' : '确认认领'}
+          {submitting ? '核销中…' : '确认核销'}
         </button>
         <button type="button" className="btn-ghost px-2.5 py-1.5 text-xs" onClick={onCancel}>
           取消
@@ -1098,7 +1188,13 @@ function RegisterReceiptModal({
       <div className="absolute inset-0 bg-ink/40 animate-fade-in" onClick={onClose} aria-hidden />
       <div className="relative z-10 w-full max-w-lg rounded-xl bg-surface p-5 shadow-pop">
         <div className="flex items-start justify-between">
-          <h2 className="text-base font-semibold text-ink">登记新进账</h2>
+          <div>
+            <h2 className="text-base font-semibold text-ink">登记新进账</h2>
+            <p className="mt-0.5 text-xs text-ink-muted">
+              把一笔收到但还没归属订单的钱记进挂账池。登记后是「待核销」，带账龄，
+              谁有空谁都可以核销到订单或退回客户。
+            </p>
+          </div>
           <button
             type="button"
             className="flex h-8 w-8 items-center justify-center rounded-lg text-lg text-ink-muted hover:bg-slate-100 hover:text-ink"
